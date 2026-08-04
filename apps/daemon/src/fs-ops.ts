@@ -15,9 +15,11 @@ import {
   mkdir,
   open,
   readdir,
-  readFile,
   realpath,
+  rename,
+  rmdir,
   stat,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import path from "node:path";
@@ -219,4 +221,58 @@ export async function rootUsable(root: string): Promise<boolean> {
   return access(root, constants.R_OK)
     .then(() => true)
     .catch(() => false);
+}
+
+export async function makeDir(root: string, rel: string): Promise<void> {
+  const dir = await resolveWithin(root, rel);
+  if (await stat(dir).then(() => true).catch(() => false)) {
+    throw new FsError("already exists", "denied");
+  }
+  await mkdir(dir).catch(() => {
+    throw new FsError("cannot create directory", "denied");
+  });
+}
+
+/**
+ * 删除文件或【空】目录。
+ * 不做递归删除:手机上一次误触就能抹掉整棵目录树,而这个面板既没有回收站
+ * 也没有 undo。要删整个目录,让用户回 Mac 上做。
+ */
+export async function removeEntry(root: string, rel: string): Promise<void> {
+  if (rel === "") throw new FsError("refusing to remove the session root", "denied");
+  const target = await resolveWithin(root, rel);
+  const st = await stat(target).catch(() => {
+    throw new FsError("not found", "not_found");
+  });
+  if (st.isDirectory()) {
+    const left = await readdir(target).catch(() => {
+      throw new FsError("cannot read directory", "denied");
+    });
+    if (left.length > 0) {
+      throw new FsError("目录非空 —— 请先清空,或在 Mac 上删除", "denied");
+    }
+    await rmdir(target).catch(() => {
+      throw new FsError("cannot remove directory", "denied");
+    });
+    return;
+  }
+  await unlink(target).catch(() => {
+    throw new FsError("cannot remove file", "denied");
+  });
+}
+
+/** 重命名 / 移动。两端都过根约束,否则可以借重命名把文件挪到根外。 */
+export async function renameEntry(root: string, rel: string, to: string): Promise<void> {
+  if (rel === "" || to === "") throw new FsError("path required", "denied");
+  const from = await resolveWithin(root, rel);
+  const dest = await resolveWithin(root, to);
+  await stat(from).catch(() => {
+    throw new FsError("not found", "not_found");
+  });
+  if (await stat(dest).then(() => true).catch(() => false)) {
+    throw new FsError("destination already exists", "denied");
+  }
+  await rename(from, dest).catch(() => {
+    throw new FsError("cannot rename", "denied");
+  });
 }

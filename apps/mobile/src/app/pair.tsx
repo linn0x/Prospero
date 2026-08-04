@@ -29,6 +29,9 @@ export default function PairScreen() {
     try {
       const payload = decodePairingQR(text.trim());
       const host = await upsertHostFromPairing(payload);
+      // 深链每次都会把 /pair 压进栈,replace 只换掉这一层 —— 反复扫码/点深链
+      // 会攒出一摞 host 页,返回要点很多下。先退回根再进。
+      if (router.canDismiss()) router.dismissAll();
       router.replace(`/host/${host.id}`);
     } catch (e) {
       scannedRef.current = false;

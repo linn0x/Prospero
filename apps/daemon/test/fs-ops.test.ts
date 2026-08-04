@@ -4,6 +4,9 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   FsError,
+  makeDir,
+  removeEntry,
+  renameEntry,
   MAX_EDIT_BYTES,
   listDir,
   readChunk,
@@ -184,5 +187,61 @@ describe("传输", () => {
     await expect(writeChunk(root, "../evil.bin", 0, Buffer.from("x"))).rejects.toThrow(
       /escapes/,
     );
+  });
+});
+
+describe("新建 / 删除 / 重命名", () => {
+  it("新建目录后能列出来", async () => {
+    const { root } = fixture();
+    await makeDir(root, "src/newdir");
+    const entries = await listDir(root, "src");
+    expect(entries.some((e) => e.name === "newdir" && e.kind === "dir")).toBe(true);
+  });
+
+  it("目录已存在时拒绝,不静默覆盖", async () => {
+    const { root } = fixture();
+    await expect(makeDir(root, "src")).rejects.toThrow(/already exists/);
+  });
+
+  it("删除文件", async () => {
+    const { root } = fixture();
+    await removeEntry(root, "README.md");
+    expect((await listDir(root, "")).some((e) => e.name === "README.md")).toBe(false);
+  });
+
+  it("非空目录不删 —— 手机上没有回收站也没有 undo", async () => {
+    const { root } = fixture();
+    await expect(removeEntry(root, "src")).rejects.toThrow(/非空/);
+    // 里面的文件必须还在
+    expect((await listDir(root, "src")).length).toBe(1);
+  });
+
+  it("拒绝删除会话根本身", async () => {
+    const { root } = fixture();
+    await expect(removeEntry(root, "")).rejects.toThrow(/refusing/);
+  });
+
+  it("删除不能越界", async () => {
+    const { root, outside } = fixture();
+    await expect(removeEntry(root, "../secret.txt")).rejects.toThrow(/escapes/);
+    const { existsSync } = await import("node:fs");
+    expect(existsSync(outside)).toBe(true);
+  });
+
+  it("重命名并移动到子目录", async () => {
+    const { root } = fixture();
+    await renameEntry(root, "README.md", "src/README.md");
+    expect((await listDir(root, "src")).some((e) => e.name === "README.md")).toBe(true);
+    expect((await listDir(root, "")).some((e) => e.name === "README.md")).toBe(false);
+  });
+
+  it("目标已存在时拒绝,不覆盖", async () => {
+    const { root } = fixture();
+    await expect(renameEntry(root, "README.md", "src/main.ts")).rejects.toThrow(/already exists/);
+  });
+
+  it("重命名的【目标】也要过根约束,否则能借它把文件挪出去", async () => {
+    const { root } = fixture();
+    await expect(renameEntry(root, "README.md", "../stolen.md")).rejects.toThrow(/escapes/);
   });
 });

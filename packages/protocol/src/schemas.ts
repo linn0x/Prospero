@@ -220,6 +220,28 @@ export const C2SFsPutSchema = z.object({
   final: z.boolean(),
 });
 
+/** 新建目录(父目录须已存在) */
+export const C2SFsMkdirSchema = z.object({
+  type: z.literal("fs.mkdir"),
+  sid,
+  path: relPath,
+});
+
+/** 删除文件或空目录。非空目录不递归删 —— 手机上误触代价太大 */
+export const C2SFsRemoveSchema = z.object({
+  type: z.literal("fs.remove"),
+  sid,
+  path: relPath,
+});
+
+/** 重命名 / 移动;两端都必须在会话根内 */
+export const C2SFsRenameSchema = z.object({
+  type: z.literal("fs.rename"),
+  sid,
+  path: relPath,
+  to: relPath,
+});
+
 export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SHelloSchema,
   C2SSessionCreateSchema,
@@ -237,6 +259,9 @@ export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SFsWriteSchema,
   C2SFsGetSchema,
   C2SFsPutSchema,
+  C2SFsMkdirSchema,
+  C2SFsRemoveSchema,
+  C2SFsRenameSchema,
 ]);
 
 // ---------------------------------------------------------------- S → C
@@ -478,6 +503,14 @@ export const S2CFsChunkSchema = z.object({
   eof: z.boolean(),
 });
 
+/** 变更类操作的通用应答;客户端据此刷新列表 */
+export const S2CFsDoneSchema = z.object({
+  type: z.literal("fs.done"),
+  sid,
+  path: z.string(),
+  op: z.enum(["mkdir", "remove", "rename"]),
+});
+
 export const S2CMessageSchema = z.discriminatedUnion("type", [
   S2CHelloOkSchema,
   S2CSessionStateSchema,
@@ -492,6 +525,7 @@ export const S2CMessageSchema = z.discriminatedUnion("type", [
   S2CFsContentSchema,
   S2CFsWrittenSchema,
   S2CFsChunkSchema,
+  S2CFsDoneSchema,
 ]);
 
 // ---------------------------------------------------------------- 配对 QR 载荷
