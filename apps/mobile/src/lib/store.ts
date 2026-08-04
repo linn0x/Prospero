@@ -14,6 +14,8 @@ export interface HostRuntime {
   hostInfo: HostInfo | null;
   activeAddr: string | null;
   lastError: string | null;
+  /** 握手往返耗时,用于显示连接质量 */
+  rttMs: number | null;
   sessions: Record<string, SessionInfo>;
 }
 
@@ -22,6 +24,7 @@ export const emptyRuntime: HostRuntime = {
   hostInfo: null,
   activeAddr: null,
   lastError: null,
+  rttMs: null,
   sessions: {},
 };
 

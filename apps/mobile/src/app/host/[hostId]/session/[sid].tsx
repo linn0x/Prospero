@@ -9,6 +9,7 @@ import {
   TextInput,
   View,
 } from "react-native";
+import * as Haptics from "expo-haptics";
 import { Stack, router, useLocalSearchParams } from "expo-router";
 import type { SessionInfo } from "@prospero/protocol";
 import { ChatView } from "@/components/ChatView";
@@ -59,6 +60,7 @@ export default function SessionScreen() {
     (text: string): void => {
       const t = text.trim();
       if (!conn || !sid || t.length === 0) return;
+      void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
       if (isStructured) conn.chatSend(sid, t);
       else conn.inputText(sid, t + "\r");
       setDraft("");

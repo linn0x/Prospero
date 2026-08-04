@@ -18,6 +18,8 @@ export interface StoredHost {
   token: string;
   daemonPub: string;
   pairedAt: number;
+  /** 上次成功连上的地址,下次优先尝试(切网后通常仍是它) */
+  lastGoodAddr?: string;
 }
 
 export async function getHosts(): Promise<StoredHost[]> {
@@ -59,6 +61,25 @@ export async function upsertHostFromPairing(p: PairingPayload): Promise<StoredHo
 
 export async function removeHost(id: string): Promise<void> {
   await saveHosts((await getHosts()).filter((h) => h.id !== id));
+}
+
+/** 地址学习:记住成功连上的地址,并把它并入候选表 */
+export async function rememberGoodAddr(hostId: string, addr: string): Promise<void> {
+  const hosts = await getHosts();
+  const h = hosts.find((x) => x.id === hostId);
+  if (!h || h.lastGoodAddr === addr) return;
+  h.lastGoodAddr = addr;
+  if (!h.addrs.includes(addr)) h.addrs = [addr, ...h.addrs];
+  await saveHosts(hosts);
+}
+
+/** 发现或手动添加的新地址并入候选(如 mDNS 发现到的新 IP) */
+export async function addHostAddr(hostId: string, addr: string): Promise<void> {
+  const hosts = await getHosts();
+  const h = hosts.find((x) => x.id === hostId);
+  if (!h || h.addrs.includes(addr)) return;
+  h.addrs = [...h.addrs, addr];
+  await saveHosts(hosts);
 }
 
 /** 设备身份密钥:首次生成后固定(daemon 侧 TOFU 绑定,换了会被拒) */
