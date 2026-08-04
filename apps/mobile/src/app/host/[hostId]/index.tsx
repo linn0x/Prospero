@@ -2,12 +2,14 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   FlatList,
   Pressable,
+  RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
   TextInput,
   View,
 } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Stack, router, useLocalSearchParams } from "expo-router";
 import type { AgentKind, SessionInfo } from "@prospero/protocol";
 import { sortSessions } from "@/lib/store";
@@ -49,6 +51,7 @@ export default function HostScreen() {
   const [composing, setComposing] = useState(false);
   const pendingCreateRef = useRef(false);
   const deepLinkCreateRef = useRef<string | null>(null);
+  const insets = useSafeAreaInsets();
 
   // 深链 prospero://host/<id>?create=shell&cmd=…:连上后自动建会话(自动化测试/快捷指令用)
   useEffect(() => {
@@ -102,15 +105,19 @@ export default function HostScreen() {
     [all],
   );
 
+  const quality =
+    runtime.rttMs === null
+      ? ""
+      : ` · ${runtime.activeAddr ?? ""} ${String(runtime.rttMs)}ms`;
   const connText =
     runtime.status === "connected"
-      ? `${runningCount} 个运行中 · ${String(all.length)} 个会话`
+      ? `${runningCount} 个运行中 · ${String(all.length)} 个会话${quality}`
       : runtime.status === "connecting"
         ? "连接中…"
         : runtime.status === "reconnecting"
           ? "重连中…"
           : runtime.status === "failed"
-            ? `连接失败:${runtime.lastError ?? "未知错误"}`
+            ? (runtime.lastError ?? "连接失败")
             : "未连接";
 
   return (
@@ -129,7 +136,7 @@ export default function HostScreen() {
       <View style={styles.statusBar}>
         <Text
           style={[styles.statusText, runtime.status === "failed" && styles.statusFailed]}
-          numberOfLines={1}
+          numberOfLines={runtime.status === "failed" ? 3 : 1}
         >
           {connText}
         </Text>
@@ -208,7 +215,14 @@ export default function HostScreen() {
       <FlatList
         data={sessions}
         keyExtractor={(s) => s.id}
-        contentContainerStyle={styles.list}
+        contentContainerStyle={[styles.list, { paddingBottom: insets.bottom + 32 }]}
+        refreshControl={
+          <RefreshControl
+            refreshing={runtime.status === "connecting" || runtime.status === "reconnecting"}
+            onRefresh={() => conn?.kick()}
+            tintColor="#7aa2f7"
+          />
+        }
         ListEmptyComponent={
           <Text style={styles.emptyText}>
             {all.length === 0 ? "还没有会话,点右上角 ＋ 新建。" : "该筛选下没有会话。"}
