@@ -109,6 +109,24 @@ export function mintDevice(
 }
 
 /**
+ * 换一把新的 daemon 身份密钥。
+ *
+ * 旧密钥能解开【已录下的】历史流量吗?不能 —— 协议 v1 起会话密钥来自双方临时密钥,
+ * 静态密钥只做身份证明。所以轮换防的是另一件事:静态密钥泄漏后攻击者可以冒充这台
+ * daemon 骗手机连上去。换掉即让泄漏的那把作废。
+ *
+ * 代价是所有设备的配对都失效(QR 里带的是旧公钥),所以一并清空设备表 ——
+ * 留着它们只会让手机连上来后卡在"无法确认身份",还不如逼一次重新配对。
+ */
+export function rotateIdentity(home: string): KeyPairB64 {
+  ensureHome(home);
+  const fresh = generateKeyPairB64();
+  writeJsonPrivate(path.join(home, "identity.json"), fresh);
+  saveDevices(home, []);
+  return fresh;
+}
+
+/**
  * 撤销设备。名字可能重复(mintDevice 不去重),所以全部同名一起撤 ——
  * 撤销要么彻底要么别做,留一条同名记录还能连上是最糟的结果。
  * 返回被撤掉的记录,便于 CLI 如实报告撤了几台。

@@ -12,10 +12,19 @@ import { ClaudeAdapter } from "../src/adapters/claude.js";
 import { StructuredSession } from "../src/structured-session.js";
 import { SessionManager } from "../src/session-manager.js";
 
+/**
+ * 光看 `--version` 不够:二进制装着、但没登录或额度用尽时,
+ * 这套端到端用例会跑到超时才失败,而失败原因和代码无关。
+ * 所以探一次真实往返 —— 能拿到非空输出才算可用。
+ */
 function hasClaude(): boolean {
   try {
     execFileSync("claude", ["--version"], { stdio: "ignore", timeout: 15_000 });
-    return true;
+    const out = execFileSync("claude", ["-p", "reply with OK"], {
+      encoding: "utf8",
+      timeout: 120_000,
+    });
+    return out.trim().length > 0;
   } catch {
     return false;
   }
