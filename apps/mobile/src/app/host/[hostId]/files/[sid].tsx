@@ -18,6 +18,7 @@ import * as DocumentPicker from "expo-document-picker";
 import * as Haptics from "expo-haptics";
 import type { FsEntry } from "@prospero/protocol";
 import { Icon } from "@/components/Icon";
+import { SwipeRow, type SwipeAction } from "@/components/SwipeRow";
 import { useHostConnection } from "@/lib/use-host-connection";
 
 /** 一次传 256KB;协议单块上限是 1MB,留足编码膨胀余量 */
@@ -284,33 +285,44 @@ export default function FilesScreen(): React.ReactElement {
         ListEmptyComponent={
           loading ? null : <Text style={styles.empty}>这个目录是空的</Text>
         }
-        renderItem={({ item }) => (
-          <Pressable
-            style={({ pressed }) => [styles.row, pressed && styles.rowPressed]}
-            onPress={() => void openEntry(item)}
-            onLongPress={() => {
-              if (item.kind === "dir") return;
-              void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-              Alert.alert(item.name, humanSize(item.size), [
-                { text: "取消", style: "cancel" },
-                { text: "下载", onPress: () => void download(item) },
-              ]);
-            }}
-          >
-            <Icon name={iconFor(item)} size={17} color={item.kind === "dir" ? "#7aa2f7" : "#8a8a96"} />
-            <Text style={styles.name} numberOfLines={1}>
-              {item.name}
-              {item.kind === "dir" ? "/" : ""}
-            </Text>
-            {busy === item.name ? (
-              <ActivityIndicator size="small" color="#7aa2f7" />
-            ) : (
-              item.kind === "file" && <Text style={styles.size}>{humanSize(item.size)}</Text>
-            )}
-          </Pressable>
-        )}
+        renderItem={({ item }) => {
+          // 目录没什么可下载的,只有文件给左滑操作
+          const actions: SwipeAction[] =
+            item.kind === "file"
+              ? [
+                  {
+                    label: "下载",
+                    symbol: "arrow.up",
+                    color: "#3a6ea5",
+                    onPress: () => void download(item),
+                  },
+                ]
+              : [];
+          const row = (
+            <Pressable
+              style={({ pressed }) => [styles.row, pressed && styles.rowPressed]}
+              onPress={() => void openEntry(item)}
+            >
+              <Icon
+                name={iconFor(item)}
+                size={17}
+                color={item.kind === "dir" ? "#7aa2f7" : "#8a8a96"}
+              />
+              <Text style={styles.name} numberOfLines={1}>
+                {item.name}
+                {item.kind === "dir" ? "/" : ""}
+              </Text>
+              {busy === item.name ? (
+                <ActivityIndicator size="small" color="#7aa2f7" />
+              ) : (
+                item.kind === "file" && <Text style={styles.size}>{humanSize(item.size)}</Text>
+              )}
+            </Pressable>
+          );
+          return actions.length > 0 ? <SwipeRow actions={actions}>{row}</SwipeRow> : row;
+        }}
       />
-      <Text style={styles.hint}>长按文件可下载 · 右上角 ＋ 上传到当前目录</Text>
+      <Text style={styles.hint}>左滑文件下载 · 右上角 ＋ 上传到当前目录</Text>
     </View>
   );
 }
