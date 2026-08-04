@@ -37,8 +37,9 @@ program
   )
   .option("--dev", "开发模式:提供浏览器调试页,loopback 允许明文协议", false)
   .option("--no-bonjour", "不做 mDNS 广播(交给菜单栏壳,由它承担本地网络 TCC)")
+  .option("--tmux", "会话跑在 tmux 里,daemon 重启后进程与画面都还在(需已装 tmux)", false)
   .option("--name <name>", "对外显示的主机名")
-  .action(async (opts: { port?: number; bind?: string; dev: boolean; bonjour: boolean; name?: string }) => {
+  .action(async (opts: { port?: number; bind?: string; dev: boolean; bonjour: boolean; tmux: boolean; name?: string }) => {
     const home = prosperoHome();
     const config = loadConfig(home);
     const port = opts.port ?? config.port;
@@ -58,6 +59,7 @@ program
       home,
       port,
       bindAddr,
+      useTmux: opts.tmux,
       devMode: opts.dev,
       hostName: opts.name,
       notify: config.notify ?? null,
@@ -81,6 +83,16 @@ program
     }
     if (opts.dev) {
       console.log(`开发调试页: http://127.0.0.1:${server.port}/`);
+    }
+    if (opts.tmux && server.restoredSessions > 0) {
+      console.log(`已从 tmux 接管 ${server.restoredSessions} 个上次遗留的会话`);
+    }
+    if (opts.tmux) {
+      console.log(
+        server.manager.tmuxEnabled
+          ? "会话托管: tmux(daemon 重启后会话进程存活)"
+          : "会话托管: 已请求 tmux 但未找到 tmux,已退回直接 spawn(daemon 退出会杀掉会话)",
+      );
     }
     console.log(
       server.notifier.enabled

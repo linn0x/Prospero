@@ -61,6 +61,8 @@ export interface DaemonServerOptions {
   port: number;
   /** 监听地址;省略 = 0.0.0.0(全部网卡) */
   bindAddr?: string | undefined;
+  /** tmux 托管:会话进程活过 daemon 重启 */
+  useTmux?: boolean | undefined;
   devMode?: boolean;
   hostName?: string | undefined;
   /** 推送通道配置;省略则不推送 */
@@ -69,6 +71,8 @@ export interface DaemonServerOptions {
 
 export interface DaemonServer {
   port: number;
+  /** 本次启动从 tmux 接管回来的会话数 */
+  restoredSessions: number;
   httpServer: Server;
   manager: SessionManager;
   notifier: Notifier;
@@ -101,7 +105,7 @@ export async function createDaemonServer(
   opts: DaemonServerOptions,
 ): Promise<DaemonServer> {
   const identity = loadIdentity(opts.home);
-  const manager = new SessionManager();
+  const manager = new SessionManager(opts.useTmux ? { tmux: { home: opts.home } } : {});
   // 菜单栏壳靠这个文件看会话列表(WS 协议要过 E2E 握手,壳没必要实现一遍)
   const statusFile = new StatusFile(opts.home, manager, {
     port: opts.port,
@@ -502,10 +506,14 @@ export async function createDaemonServer(
   });
   const address = httpServer.address();
   const port = typeof address === "object" && address !== null ? address.port : opts.port;
+  // 接管上一轮留下的 tmux 会话。必须在 statusFile.start 之前,
+  // 否则壳会先看到一份"零会话"的快照。
+  const restored = manager.restoreFromTmux();
   statusFile.start(port);
 
   return {
     port,
+    restoredSessions: restored.length,
     httpServer,
     manager,
     notifier,
