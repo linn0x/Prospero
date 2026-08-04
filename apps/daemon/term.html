@@ -68,6 +68,31 @@
     }, 50);
   }
 
+  // 性能打点(W4 spike):有输出流量的秒窗上报 fps 与吞吐
+  let perfBytes = 0;
+  let perfFrames = 0;
+  let perfLast = performance.now();
+  (function perfLoop() {
+    requestAnimationFrame(() => {
+      perfFrames++;
+      const now = performance.now();
+      if (now - perfLast >= 1000) {
+        if (perfBytes > 0) {
+          post({
+            kind: "perf",
+            fps: Math.round((perfFrames * 1000) / (now - perfLast)),
+            kb: Math.round(perfBytes / 1024),
+            renderer,
+          });
+        }
+        perfFrames = 0;
+        perfBytes = 0;
+        perfLast = now;
+      }
+      perfLoop();
+    });
+  })();
+
   window.__rx = (jsonStr) => {
     const m = JSON.parse(jsonStr);
     if (m.kind === "snapshot") {
@@ -76,8 +101,11 @@
         term.resize(m.cols, m.rows);
       }
       term.write(m.ansi);
+      perfBytes += m.ansi.length;
     } else if (m.kind === "output") {
-      term.write(b64ToBytes(m.dataB64));
+      const bytes = b64ToBytes(m.dataB64);
+      term.write(bytes);
+      perfBytes += bytes.length;
     } else if (m.kind === "fit") {
       doFit();
     }

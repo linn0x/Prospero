@@ -14,11 +14,13 @@ interface Props {
 }
 
 interface BridgeUp {
-  kind: "ready" | "resized" | "input";
+  kind: "ready" | "resized" | "input" | "perf";
   renderer?: string;
   cols?: number;
   rows?: number;
   data?: string;
+  fps?: number;
+  kb?: number;
 }
 
 export function Terminal({ conn, sid }: Props) {
@@ -98,6 +100,12 @@ export function Terminal({ conn, sid }: Props) {
           break;
         case "input":
           if (typeof msg.data === "string") conn.inputB64(sid, msg.data);
+          break;
+        case "perf":
+          // W4 spike:Metro 控制台可直接观测洪峰时的渲染帧率与吞吐
+          console.log(
+            `[term-perf] sid=${sid.slice(0, 8)} renderer=${msg.renderer} fps=${msg.fps} throughput=${msg.kb}KB/s`,
+          );
           break;
       }
     },
