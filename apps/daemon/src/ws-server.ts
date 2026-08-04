@@ -358,6 +358,17 @@ export async function createDaemonServer(
       case "chat.send":
         await manager.requireStructured(msg.sid).send(msg.text);
         return;
+      case "tool.output.get": {
+        const full = manager.requireStructured(msg.sid).toolOutput(msg.callId);
+        send(conn, {
+          type: "tool.output",
+          sid: msg.sid,
+          callId: msg.callId,
+          output: full?.output ?? "(输出已不可用)",
+          ...(full?.truncated === true ? { truncated: true } : {}),
+        });
+        return;
+      }
       case "permission.respond":
         await manager.requireStructured(msg.sid).respondPermission(msg.reqId, msg.reply);
         return;

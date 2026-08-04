@@ -18,6 +18,10 @@ import type { AgentAdapter } from "./adapters/types.js";
 const MAX_EVENTS = 4000;
 /** 会话列表预览的截断长度 */
 const PREVIEW_CHARS = 140;
+/** 单次工具输出保留上限(按需拉取时) */
+const MAX_TOOL_OUTPUT = 200_000;
+/** 保留完整输出的工具调用条数 */
+const MAX_TOOL_ENTRIES = 200;
 
 export interface StructuredSessionOptions {
   id: string;
@@ -50,6 +54,10 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
   private previewRaw = "";
   private previewMsgId = "";
   private busySince: number | undefined;
+  /** 累计用量:每轮 turn.end 汇总 */
+  private totals = { costUsd: 0, inputTokens: 0, outputTokens: 0 };
+  /** callId → 完整工具输出,供 tool.output.get 按需拉取 */
+  private readonly toolOutputs = new Map<string, string>();
 
   constructor(opts: StructuredSessionOptions) {
     super();
@@ -64,6 +72,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     await this.adapter.start({
       cwd: this.cwd,
       emit: (body) => this.record(body),
+      recordOutput: (callId, output) => this.recordToolOutput(callId, output),
     });
     this.setStatus("idle");
   }
@@ -82,7 +91,28 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
       pendingPermissions: this.pending.size,
       ...(this.preview ? { preview: this.preview } : {}),
       ...(this.busySince !== undefined ? { busySince: this.busySince } : {}),
+      ...(this.totals.outputTokens > 0 || this.totals.costUsd > 0
+        ? { totals: { ...this.totals } }
+        : {}),
     };
+  }
+
+  /** 完整工具输出(应答 tool.output.get) */
+  toolOutput(callId: string): { output: string; truncated: boolean } | null {
+    const full = this.toolOutputs.get(callId);
+    if (full === undefined) return null;
+    return full.length > MAX_TOOL_OUTPUT
+      ? { output: full.slice(0, MAX_TOOL_OUTPUT), truncated: true }
+      : { output: full, truncated: false };
+  }
+
+  /** 适配器登记完整输出;摘要仍走事件,全文按需拉取 */
+  recordToolOutput(callId: string, output: string): void {
+    if (this.toolOutputs.size > MAX_TOOL_ENTRIES) {
+      const oldest = this.toolOutputs.keys().next().value;
+      if (oldest !== undefined) this.toolOutputs.delete(oldest);
+    }
+    this.toolOutputs.set(callId, output);
   }
 
   /** attach 用:全量事件历史 + 当前 evSeq */
@@ -127,6 +157,9 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
         this.setStatus("running");
       }
     } else if (body.kind === "turn.end") {
+      this.totals.costUsd += body.costUsd ?? 0;
+      this.totals.inputTokens += body.inputTokens ?? 0;
+      this.totals.outputTokens += body.outputTokens ?? 0;
       if (this.pending.size === 0) this.setStatus("idle");
     } else if (body.kind === "agent.error") {
       if (this.pending.size === 0) this.setStatus("idle");

@@ -64,6 +64,14 @@ export const SessionInfoSchema = z.object({
   preview: z.string().optional(),
   /** 本轮开始时间戳,客户端据此显示"运行 12s" */
   busySince: z.number().int().nonnegative().optional(),
+  /** 会话累计用量(所有轮次之和) */
+  totals: z
+    .object({
+      costUsd: z.number().nonnegative(),
+      inputTokens: z.number().int().nonnegative(),
+      outputTokens: z.number().int().nonnegative(),
+    })
+    .optional(),
 });
 
 export const HostInfoSchema = z.object({
@@ -102,6 +110,13 @@ export const C2SChatSendSchema = z.object({
   type: z.literal("chat.send"),
   sid,
   text: z.string().min(1),
+});
+
+/** 按需拉取某次工具调用的完整输出(卡片展开时) */
+export const C2SToolOutputGetSchema = z.object({
+  type: z.literal("tool.output.get"),
+  sid,
+  callId: z.string().min(1),
 });
 
 export const C2SSessionAttachSchema = z.object({
@@ -154,6 +169,7 @@ export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SSessionCreateSchema,
   C2SSessionAttachSchema,
   C2SChatSendSchema,
+  C2SToolOutputGetSchema,
   C2STermInputSchema,
   C2STermResizeSchema,
   C2STermAckSchema,
@@ -217,6 +233,20 @@ export const AgentReasoningDeltaSchema = z.object({
   delta: z.string(),
 });
 
+/**
+ * 文件改动的 diff。
+ * 手机上审批"改文件"时,只给路径等于让用户盲批 —— 必须能看到改了哪几行。
+ */
+export const FileDiffSchema = z.object({
+  path: z.string(),
+  /** unified diff 正文(不含 ---/+++ 文件头),行首为 ' ' / '+' / '-' */
+  patch: z.string(),
+  additions: z.number().int().nonnegative(),
+  deletions: z.number().int().nonnegative(),
+  /** patch 因过大被截断 */
+  truncated: z.boolean().optional(),
+});
+
 export const AgentToolStartSchema = z.object({
   kind: z.literal("tool.start"),
   msgId: z.string(),
@@ -224,6 +254,8 @@ export const AgentToolStartSchema = z.object({
   tool: z.string(),
   /** 参数摘要(适配器裁剪过,避免大 payload 过网) */
   summary: z.string(),
+  /** 文件类工具:改动内容 */
+  diff: FileDiffSchema.optional(),
 });
 
 export const AgentToolEndSchema = z.object({
@@ -232,6 +264,9 @@ export const AgentToolEndSchema = z.object({
   state: ToolStateSchema,
   /** 结果摘要或错误信息 */
   summary: z.string(),
+  /** 完整输出比摘要长,可用 tool.output.get 按需拉取 */
+  hasMore: z.boolean().optional(),
+  diff: FileDiffSchema.optional(),
 });
 
 export const AgentPermissionRequestSchema = z.object({
@@ -242,6 +277,8 @@ export const AgentPermissionRequestSchema = z.object({
   /** 涉及的资源(命令行、文件路径…) */
   resources: z.array(z.string()),
   summary: z.string(),
+  /** 改文件类审批:待应用的改动,让用户看清再决定 */
+  diff: FileDiffSchema.optional(),
 });
 
 export const AgentPermissionResolvedSchema = z.object({
@@ -297,6 +334,16 @@ export const S2CChatSnapshotSchema = z.object({
   events: z.array(AgentEventBodySchema),
 });
 
+/** 工具完整输出(应 tool.output.get) */
+export const S2CToolOutputSchema = z.object({
+  type: z.literal("tool.output"),
+  sid,
+  callId: z.string(),
+  output: z.string(),
+  /** 即便完整输出也可能被上限截断 */
+  truncated: z.boolean().optional(),
+});
+
 export const S2CPermissionRequestSchema = z.object({
   type: z.literal("permission.request"),
   sid,
@@ -326,6 +373,7 @@ export const S2CMessageSchema = z.discriminatedUnion("type", [
   S2CTermOutputSchema,
   S2CAgentEventSchema,
   S2CChatSnapshotSchema,
+  S2CToolOutputSchema,
   S2CPermissionRequestSchema,
   S2CErrorSchema,
 ]);
@@ -355,6 +403,9 @@ export type C2SHello = z.infer<typeof C2SHelloSchema>;
 export type C2SSessionCreate = z.infer<typeof C2SSessionCreateSchema>;
 export type C2SSessionAttach = z.infer<typeof C2SSessionAttachSchema>;
 export type C2SChatSend = z.infer<typeof C2SChatSendSchema>;
+export type C2SToolOutputGet = z.infer<typeof C2SToolOutputGetSchema>;
+export type FileDiff = z.infer<typeof FileDiffSchema>;
+export type S2CToolOutput = z.infer<typeof S2CToolOutputSchema>;
 export type C2STermInput = z.infer<typeof C2STermInputSchema>;
 export type C2STermResize = z.infer<typeof C2STermResizeSchema>;
 export type C2STermAck = z.infer<typeof C2STermAckSchema>;

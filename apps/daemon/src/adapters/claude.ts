@@ -20,6 +20,7 @@ import type {
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { AgentEventBody, PermissionReply } from "@prospero/protocol";
+import { diffFromToolInput } from "./diff.js";
 import { AdapterError, summarize, type AdapterContext, type AgentAdapter } from "./types.js";
 
 interface PendingPermission {
@@ -27,6 +28,21 @@ interface PendingPermission {
   /** 供 "始终允许" 使用:SDK 给出的规则建议 */
   suggestions: PermissionUpdate[];
   toolName: string;
+}
+
+/** tool_result 的 content 可能是字符串或 block 数组,取其纯文本 */
+function plainText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((b) =>
+        b && typeof b === "object" && typeof (b as { text?: unknown }).text === "string"
+          ? (b as { text: string }).text
+          : "",
+      )
+      .join("");
+  }
+  return "";
 }
 
 /** 用户消息队列:把 send() 的调用喂给 SDK 的 AsyncIterable 输入 */
@@ -127,12 +143,16 @@ export class ClaudeAdapter implements AgentAdapter {
       if (cmd !== undefined) resources.push(summarize(cmd, 400));
       else resources.push(summarize(input, 400));
 
+      // 改文件类审批必须能看到改动本身,否则手机上只能盲批
+      const diff = diffFromToolInput(toolName, input);
+
       this.emit({
         kind: "permission.request",
         reqId,
         action: options.displayName ?? toolName,
         resources,
         summary: options.title ?? `${toolName}: ${resources[0] ?? ""}`,
+        ...(diff ? { diff } : {}),
       });
     });
 
@@ -183,12 +203,17 @@ export class ClaudeAdapter implements AgentAdapter {
         // 工具调用在完整消息里出现(增量流只给文本)
         for (const block of msg.message.content) {
           if (typeof block === "object" && block.type === "tool_use") {
+            const diff = diffFromToolInput(
+              block.name,
+              (block.input ?? {}) as Record<string, unknown>,
+            );
             this.emit({
               kind: "tool.start",
               msgId: msg.message.id,
               callId: block.id,
               tool: block.name,
               summary: summarize(block.input),
+              ...(diff ? { diff } : {}),
             });
           }
         }
@@ -200,11 +225,16 @@ export class ClaudeAdapter implements AgentAdapter {
         if (typeof content === "string") return;
         for (const block of content) {
           if (typeof block === "object" && block.type === "tool_result") {
+            const full = plainText(block.content);
+            // 全文留在 daemon,事件只带摘要;用户展开卡片时再拉
+            if (full.length > 0) this.ctx?.recordOutput?.(block.tool_use_id, full);
+            const summary = summarize(block.content ?? "完成");
             this.emit({
               kind: "tool.end",
               callId: block.tool_use_id,
               state: block.is_error === true ? "failed" : "success",
-              summary: summarize(block.content ?? "完成"),
+              summary,
+              ...(full.length > summary.length ? { hasMore: true } : {}),
             });
           }
         }

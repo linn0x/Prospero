@@ -15,6 +15,7 @@ export {
   HostInfoSchema,
   PermissionReplySchema,
   AgentEventBodySchema,
+  FileDiffSchema,
   C2SMessageSchema,
   S2CMessageSchema,
   PairingPayloadSchema,
