@@ -27,6 +27,7 @@ import {
   type S2CMessage,
   type S2CTermOutput,
   type S2CTermSnapshot,
+  type S2CToolOutput,
   type SecureChannel,
   type SessionKind,
 } from "@prospero/protocol";
@@ -60,6 +61,7 @@ export interface ConnEvents extends Record<string, unknown> {
   output: S2CTermOutput;
   chatSnapshot: S2CChatSnapshot;
   agentEvent: S2CAgentEvent;
+  toolOutput: S2CToolOutput;
   serverError: S2CError;
 }
 
@@ -350,6 +352,9 @@ export class HostConnection {
       case "agent.event":
         this.events.emit("agentEvent", msg);
         return;
+      case "tool.output":
+        this.events.emit("toolOutput", msg);
+        return;
       case "error":
         this.events.emit("serverError", msg);
         return;
@@ -431,6 +436,11 @@ export class HostConnection {
 
   chatSend(sid: string, text: string): void {
     this.send({ type: "chat.send", sid, text }, true);
+  }
+
+  /** 拉取某次工具调用的完整输出(卡片展开时) */
+  getToolOutput(sid: string, callId: string): void {
+    this.send({ type: "tool.output.get", sid, callId });
   }
 
   respondPermission(sid: string, reqId: string, reply: PermissionReply): void {

@@ -8,6 +8,7 @@ import {
   View,
 } from "react-native";
 import { Stack, router, useFocusEffect } from "expo-router";
+import { Icon } from "@/components/Icon";
 import { getHosts, removeHost, type StoredHost } from "@/lib/hosts";
 import { useApp, type ConnStatus } from "@/lib/store";
 
@@ -54,19 +55,19 @@ export default function HostsScreen() {
       <Stack.Screen
         options={{
           title: "Prospero",
+          headerLargeTitle: true,
           headerRight: () => (
             <Pressable onPress={() => router.push("/pair")} hitSlop={8}>
-              <Text style={styles.link}>＋ 配对</Text>
+              <Icon name="qrcode.viewfinder" size={21} color="#7aa2f7" />
             </Pressable>
           ),
         }}
       />
       {hosts.length === 0 ? (
         <View style={styles.empty}>
+          <Icon name="desktopcomputer" size={52} color="#3a3a46" />
           <Text style={styles.emptyTitle}>还没有配对的 Mac</Text>
-          <Text style={styles.emptyText}>
-            在 Mac 上运行 prosperod 并生成配对码:
-          </Text>
+          <Text style={styles.emptyText}>在 Mac 上运行 prosperod 并生成配对码:</Text>
           <Text style={styles.code}>prosperod start{"\n"}prosperod pair</Text>
           <Pressable style={styles.primaryBtn} onPress={() => router.push("/pair")}>
             <Text style={styles.primaryBtnText}>扫码配对</Text>
