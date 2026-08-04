@@ -11,12 +11,16 @@ import {
   type AgentKind,
   type C2SMessage,
   type KeyPairB64,
+  type PermissionReply,
+  type S2CAgentEvent,
+  type S2CChatSnapshot,
   type S2CError,
   type S2CHelloOk,
   type S2CMessage,
   type S2CTermOutput,
   type S2CTermSnapshot,
   type SecureChannel,
+  type SessionKind,
 } from "@prospero/protocol";
 import { Emitter } from "./emitter";
 import type { StoredHost } from "./hosts";
@@ -43,6 +47,8 @@ export interface ConnEvents extends Record<string, unknown> {
   disconnected: { willRetry: boolean };
   snapshot: S2CTermSnapshot;
   output: S2CTermOutput;
+  chatSnapshot: S2CChatSnapshot;
+  agentEvent: S2CAgentEvent;
   serverError: S2CError;
 }
 
@@ -236,11 +242,17 @@ export class HostConnection {
       case "term.output":
         this.events.emit("output", msg);
         return;
+      case "chat.snapshot":
+        this.events.emit("chatSnapshot", msg);
+        return;
+      case "agent.event":
+        this.events.emit("agentEvent", msg);
+        return;
       case "error":
         this.events.emit("serverError", msg);
         return;
       case "hello.ok":
-      case "permission.request": // M2
+      case "permission.request":
         return;
     }
   }
@@ -274,15 +286,31 @@ export class HostConnection {
     return true;
   }
 
-  createSession(agent: AgentKind, cwd?: string, command?: string, cols = 80, rows = 24): void {
+  createSession(
+    agent: AgentKind,
+    cwd?: string,
+    command?: string,
+    kind?: SessionKind,
+    cols = 80,
+    rows = 24,
+  ): void {
     this.send({
       type: "session.create",
       agent,
+      ...(kind ? { kind } : {}),
       ...(cwd ? { cwd } : {}),
       ...(command ? { command } : {}),
       cols,
       rows,
     });
+  }
+
+  chatSend(sid: string, text: string): void {
+    this.send({ type: "chat.send", sid, text });
+  }
+
+  respondPermission(sid: string, reqId: string, reply: PermissionReply): void {
+    this.send({ type: "permission.respond", sid, reqId, reply });
   }
 
   attach(sid: string, lastSeq?: number): void {

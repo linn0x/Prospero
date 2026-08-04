@@ -29,7 +29,8 @@
   },
   "devDependencies": {
     "@types/react": "~19.2.2",
-    "typescript": "~6.0.3"
+    "typescript": "~6.0.3",
+    "vitest": "^4.1.10"
   },
   "scripts": {
     "start": "expo start",
@@ -37,7 +38,8 @@
     "ios": "expo run:ios",
     "web": "expo start --web",
     "lint": "expo lint",
-    "build:terminal": "node scripts/build-terminal-html.mjs"
+    "build:terminal": "node scripts/build-terminal-html.mjs",
+    "test": "vitest run"
   },
   "private": true
 }

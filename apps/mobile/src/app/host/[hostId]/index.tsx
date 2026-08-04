@@ -61,20 +61,24 @@ export default function HostScreen() {
     );
   }, [conn, create, cmd, runtime.status]);
 
-  // 新建会话:创建后 daemon 自动 attach 并发快照 → 以快照的 sid 进入会话页
+  // 新建会话:创建后 daemon 自动 attach 并发快照(PTY 发 term.snapshot,
+  // 结构化发 chat.snapshot)→ 以快照的 sid 进入会话页
   useEffect(() => {
     if (!conn) return;
-    const offSnap = conn.events.on("snapshot", (m) => {
+    const enter = (sid: string): void => {
       if (!pendingCreateRef.current || !hostId) return;
       pendingCreateRef.current = false;
-      router.push(`/host/${hostId}/session/${m.sid}`);
-    });
+      router.push(`/host/${hostId}/session/${sid}`);
+    };
+    const offSnap = conn.events.on("snapshot", (m) => enter(m.sid));
+    const offChat = conn.events.on("chatSnapshot", (m) => enter(m.sid));
     const offErr = conn.events.on("serverError", (m) => {
       pendingCreateRef.current = false;
       setBanner(`${m.code}: ${m.message}`);
     });
     return () => {
       offSnap();
+      offChat();
       offErr();
     };
   }, [conn, hostId]);
@@ -169,9 +173,16 @@ export default function HostScreen() {
           >
             <View style={[styles.dot, { backgroundColor: statusColor[item.status] }]} />
             <View style={styles.cardBody}>
-              <Text style={styles.cardTitle}>{item.title}</Text>
+              <View style={styles.cardTitleRow}>
+                <Text style={styles.cardTitle}>{item.title}</Text>
+                <Text style={styles.kindTag}>
+                  {item.kind === "structured" ? "对话" : "终端"}
+                </Text>
+              </View>
               <Text style={styles.cardSub}>
-                {statusLabel[item.status]} · {item.cwd}
+                {statusLabel[item.status]}
+                {item.pendingPermissions ? ` · ${String(item.pendingPermissions)} 项待批` : ""} ·{" "}
+                {item.cwd}
               </Text>
             </View>
           </Pressable>
@@ -242,6 +253,16 @@ const styles = StyleSheet.create({
   cardPressed: { backgroundColor: "#1f1f27" },
   dot: { width: 10, height: 10, borderRadius: 5 },
   cardBody: { flex: 1, gap: 2 },
+  cardTitleRow: { flexDirection: "row", alignItems: "center", gap: 8 },
   cardTitle: { color: "#e8e8ee", fontSize: 15, fontWeight: "600" },
+  kindTag: {
+    color: "#7aa2f7",
+    fontSize: 10,
+    backgroundColor: "#1b2233",
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+    overflow: "hidden",
+  },
   cardSub: { color: "#8a8a96", fontSize: 12 },
 });
