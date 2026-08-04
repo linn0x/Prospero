@@ -180,6 +180,72 @@ export default function FilesScreen(): React.ReactElement {
     }
   };
 
+  const remove = async (entry: FsEntry): Promise<void> => {
+    if (!conn) return;
+    const rel = dir === "" ? entry.name : `${dir}/${entry.name}`;
+    try {
+      await conn.fsRemove(sid, rel);
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      void load(dir);
+    } catch (e) {
+      Alert.alert("删除失败", e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const promptRename = (entry: FsEntry): void => {
+    Alert.prompt(
+      "重命名",
+      `「${entry.name}」的新名字`,
+      [
+        { text: "取消", style: "cancel" },
+        {
+          text: "确定",
+          onPress: (next?: string) => {
+            const name = next?.trim();
+            if (!name || name === entry.name || !conn) return;
+            if (name.includes("/")) {
+              Alert.alert("名字不能含 /", "只支持在当前目录内重命名。");
+              return;
+            }
+            const from = dir === "" ? entry.name : `${dir}/${entry.name}`;
+            const to = dir === "" ? name : `${dir}/${name}`;
+            void conn
+              .fsRename(sid, from, to)
+              .then(() => {
+                void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+                void load(dir);
+              })
+              .catch((e: unknown) => {
+                Alert.alert("重命名失败", e instanceof Error ? e.message : String(e));
+              });
+          },
+        },
+      ],
+      "plain-text",
+      entry.name,
+    );
+  };
+
+  const promptMkdir = (): void => {
+    Alert.prompt("新建文件夹", "名字", [
+      { text: "取消", style: "cancel" },
+      {
+        text: "创建",
+        onPress: (name?: string) => {
+          const n = name?.trim();
+          if (!n || !conn) return;
+          const rel = dir === "" ? n : `${dir}/${n}`;
+          void conn
+            .fsMkdir(sid, rel)
+            .then(() => void load(dir))
+            .catch((e: unknown) => {
+              Alert.alert("创建失败", e instanceof Error ? e.message : String(e));
+            });
+        },
+      },
+    ]);
+  };
+
   const goUp = (): void => {
     const parent = dir.includes("/") ? dir.slice(0, dir.lastIndexOf("/")) : "";
     void load(parent);
@@ -257,10 +323,15 @@ export default function FilesScreen(): React.ReactElement {
                   </Pressable>
                 ),
           headerRight: () => (
-            <Pressable onPress={() => void upload()} hitSlop={8}>
-              {/* ＋ 会被读成"新建文件";这里只做上传,就直说 */}
-              <Text style={styles.headerAction}>上传</Text>
-            </Pressable>
+            <View style={styles.headerActions}>
+              <Pressable onPress={promptMkdir} hitSlop={8}>
+                <Text style={styles.headerAction}>新建夹</Text>
+              </Pressable>
+              <Pressable onPress={() => void upload()} hitSlop={8}>
+                {/* ＋ 会被读成"新建文件";这里只做上传,就直说 */}
+                <Text style={styles.headerAction}>上传</Text>
+              </Pressable>
+            </View>
           ),
         }}
       />
@@ -288,17 +359,35 @@ export default function FilesScreen(): React.ReactElement {
         }
         renderItem={({ item }) => {
           // 目录没什么可下载的,只有文件给左滑操作
-          const actions: SwipeAction[] =
-            item.kind === "file"
-              ? [
-                  {
-                    label: "下载",
-                    symbol: "arrow.up",
-                    color: "#3a6ea5",
-                    onPress: () => void download(item),
-                  },
-                ]
-              : [];
+          const actions: SwipeAction[] = [];
+          if (item.kind === "file") {
+            actions.push({
+              label: "下载",
+              symbol: "arrow.up",
+              color: "#3a6ea5",
+              onPress: () => void download(item),
+            });
+          }
+          actions.push({
+            label: "重命名",
+            symbol: "doc.on.doc",
+            color: "#5a5a66",
+            onPress: () => promptRename(item),
+          });
+          actions.push({
+            label: "删除",
+            symbol: "trash",
+            color: "#e5534b",
+            onPress: () => void remove(item),
+            confirm: {
+              title: `删除「${item.name}」?`,
+              message:
+                item.kind === "dir"
+                  ? "只能删空目录。此操作不可撤销,也没有回收站。"
+                  : "此操作不可撤销,也没有回收站。",
+              confirmLabel: "删除",
+            },
+          });
           const row = (
             <Pressable
               style={({ pressed }) => [styles.row, pressed && styles.rowPressed]}
@@ -323,7 +412,7 @@ export default function FilesScreen(): React.ReactElement {
           return actions.length > 0 ? <SwipeRow actions={actions}>{row}</SwipeRow> : row;
         }}
       />
-      <Text style={styles.hint}>左滑文件下载 · 右上角 ＋ 上传到当前目录</Text>
+      <Text style={styles.hint}>左滑可下载 / 重命名 / 删除 · 右上角新建文件夹或上传</Text>
     </View>
   );
 }
@@ -405,6 +494,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     paddingVertical: 8,
   },
+  headerActions: { flexDirection: "row", gap: 16, alignItems: "center" },
   headerAction: { color: "#7aa2f7", fontSize: 16 },
   headerActionOff: { color: "#3a3a44" },
 });
