@@ -13,6 +13,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Stack, router, useLocalSearchParams } from "expo-router";
 import type { AgentKind, SessionInfo } from "@prospero/protocol";
 import { Icon } from "@/components/Icon";
+import { SwipeRow, type SwipeAction } from "@/components/SwipeRow";
 import { sortSessions } from "@/lib/store";
 import { useHostConnection } from "@/lib/use-host-connection";
 
@@ -233,7 +234,34 @@ export default function HostScreen() {
             {all.length === 0 ? "还没有会话,点右上角 ＋ 新建。" : "该筛选下没有会话。"}
           </Text>
         }
-        renderItem={({ item }) => (
+        renderItem={({ item }) => {
+          const done = item.status === "done" || item.status === "died";
+          const actions: SwipeAction[] = [];
+          // 还在跑的先给"中断"—— 多数时候用户只是想停掉当前这一轮,而不是丢掉整个会话
+          if (!done) {
+            actions.push({
+              label: "中断",
+              symbol: "stop.circle",
+              color: "#d9a441",
+              onPress: () => conn?.interrupt(item.id),
+            });
+          }
+          actions.push({
+            label: done ? "移除" : "结束",
+            symbol: "trash",
+            color: "#e5534b",
+            onPress: () => conn?.kill(item.id),
+            // 会话里可能跑着没保存的东西,误滑代价太大,一律二次确认
+            confirm: {
+              title: done ? `移除「${item.title}」?` : `结束「${item.title}」?`,
+              message: done
+                ? "会话已结束,这会把它从列表移除。"
+                : "会话进程会被终止,未完成的工作会丢失。",
+              confirmLabel: done ? "移除" : "结束",
+            },
+          });
+          return (
+            <SwipeRow actions={actions}>
           <Pressable
             style={({ pressed }) => [
               styles.card,
@@ -262,7 +290,9 @@ export default function HostScreen() {
               {item.cwd}
             </Text>
           </Pressable>
-        )}
+            </SwipeRow>
+          );
+        }}
       />
     </View>
   );
