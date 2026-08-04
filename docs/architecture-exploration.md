@@ -123,7 +123,10 @@ PTY 轨对"任意 CLI"的支持里天然包含 **spawn `$SHELL`(zsh)**——即�
 
 ### 安全模型
 
-- **应用层 E2E(NaCl/libsodium):QR 交换密钥,ws 之上全消息加密。** 不用自签证书 WSS —— RN 对自签 WSS 支持差(调研提示,需绕),而 Happy 的 TweetNaCl E2E 层是 MIT 现成实现,与任意传输兼容(WG 内双重加密无妨,LAN 上则是唯一保护)。
+- **应用层 E2E(NaCl/libsodium):QR 交换密钥,ws 之上全消息加密。协议 v1 起带前向保密** ——
+  握手三帧,会话密钥由【双方临时密钥】DH 得出,daemon 静态密钥只用于身份证明(证明里绑定客户端临时公钥,防重放)。
+  故 `identity.json` 日后泄漏也解不开已录下的历史流量,token 亦不暴露(它在会话密钥之下才发出)。
+  v0 曾用「客户端临时 × daemon 静态」直接作会话密钥,静态密钥泄漏即历史全失守,已废弃且不兼容。 不用自签证书 WSS —— RN 对自签 WSS 支持差(调研提示,需绕),而 Happy 的 TweetNaCl E2E 层是 MIT 现成实现,与任意传输兼容(WG 内双重加密无妨,LAN 上则是唯一保护)。
 - 每客户端独立 token,可撤销;daemon 端审计日志。Token 存储:`@napi-rs/keyring`(keytar 已死)或 0600 文件(MVP 够用)。
 
 ## 5. 统一会话协议(Prospero Protocol v0)

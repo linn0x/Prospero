@@ -10,7 +10,9 @@
  * - term.ack 用于背压:daemon 依据未确认字节数暂停 PTY 读取。
  */
 
-export const PROTOCOL_VERSION = 0;
+// v1:握手改为双方临时密钥,静态密钥只用于身份证明(前向保密)。
+// 与 v0 不兼容 —— 旧客户端会在版本校验处被拒,而不是悄悄降级。
+export const PROTOCOL_VERSION = 1;
 
 export type {
   AgentKind,
