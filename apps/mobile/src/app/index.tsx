@@ -55,7 +55,9 @@ export default function HostsScreen() {
       <Stack.Screen
         options={{
           title: "Prospero",
-          headerLargeTitle: true,
+          // 不用 headerLargeTitle:大标题要求可滚动组件是屏幕直接子级并设置
+          // contentInsetAdjustmentBehavior,而这些屏幕上方还有状态条/筛选条。
+          // 强行开启会给内容加上大幅内边距,把列表整个推出可视区(实测白屏)。
           headerRight: () => (
             <Pressable onPress={() => router.push("/pair")} hitSlop={8}>
               <Icon name="qrcode.viewfinder" size={21} color="#7aa2f7" />
