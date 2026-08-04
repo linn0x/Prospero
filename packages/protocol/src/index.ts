@@ -16,7 +16,9 @@ export {
   PermissionReplySchema,
   AgentEventBodySchema,
   FileDiffSchema,
+  FsEntrySchema,
   C2SMessageSchema,
   S2CMessageSchema,
   PairingPayloadSchema,
 } from "./schemas.js";
+export type { FsEntry } from "./schemas.js";

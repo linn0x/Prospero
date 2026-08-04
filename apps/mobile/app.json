@@ -13,7 +13,9 @@
       "supportsTablet": true,
       "infoPlist": {
         "NSLocalNetworkUsageDescription": "Prospero 通过本地网络直连你 Mac 上的 prosperod,以控制 code agent 会话。",
-        "NSBonjourServices": ["_prospero._tcp"],
+        "NSBonjourServices": [
+          "_prospero._tcp"
+        ],
         "NSCameraUsageDescription": "用于扫描 Mac 上的 Prospero 配对二维码。",
         "NSAppTransportSecurity": {
           "NSAllowsLocalNetworking": true
@@ -45,7 +47,8 @@
         {
           "cameraPermission": "用于扫描 Mac 上的 Prospero 配对二维码。"
         }
-      ]
+      ],
+      "expo-sharing"
     ],
     "experiments": {
       "typedRoutes": false,
