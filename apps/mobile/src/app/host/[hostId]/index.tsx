@@ -126,7 +126,6 @@ export default function HostScreen() {
       <Stack.Screen
         options={{
           title: host?.name ?? "主机",
-          headerLargeTitle: true,
           headerRight: () =>
             composing ? (
               <Pressable onPress={() => setComposing(false)} hitSlop={8}>
