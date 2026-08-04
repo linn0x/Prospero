@@ -16,7 +16,7 @@ import {
   type KeyPairB64,
   type PairingPayload,
 } from "@prospero/protocol";
-import { candidateAddrs } from "./discovery.js";
+import { candidateAddrs, resolveBindAddr } from "./discovery.js";
 
 export const DEFAULT_PORT = 7423;
 
@@ -36,6 +36,8 @@ interface DevicesFile {
 
 export interface DaemonConfig {
   port: number;
+  /** 监听地址;省略 = 0.0.0.0(全部网卡)。可存网卡名或 IP */
+  bind?: string;
   /** 推送通道(Bark / ntfy);未配置则不推送 */
   notify?: {
     url: string;
@@ -131,13 +133,20 @@ export function authenticate(home: string, hello: C2SHello): DeviceRecord | null
 
 export function buildPairingPayload(
   home: string,
-  opts: { token: string; port: number; name?: string | undefined },
+  opts: {
+    token: string;
+    port: number;
+    name?: string | undefined;
+    /** 已绑定到某个地址时,二维码只带这一个 —— 其余地址连不上,带了只会让客户端白试 */
+    bind?: string | undefined;
+  },
 ): PairingPayload {
   const identity = loadIdentity(home);
+  const bound = opts.bind && opts.bind !== "0.0.0.0" ? resolveBindAddr(opts.bind) : null;
   return {
     v: PROTOCOL_VERSION,
     name: opts.name ?? os.hostname(),
-    addrs: candidateAddrs(),
+    addrs: bound ? [bound] : candidateAddrs(),
     port: opts.port,
     token: opts.token,
     pubKey: identity.publicKey,

@@ -28,6 +28,39 @@ export function candidateAddrs(): string[] {
   return [...en, ...utun, ...other];
 }
 
+/**
+ * 把 `--bind` 的值解析成一个 IPv4 地址。
+ * 接受网卡名(`utun10`、`en0`)或地址本身;网卡名更好记,但 WireGuard 重连后
+ * utun 编号会变,所以地址才是稳的 —— 两种都收。
+ */
+export function resolveBindAddr(spec: string): string {
+  if (spec === "0.0.0.0" || spec === "::") return spec;
+
+  const ifaces = os.networkInterfaces();
+  const named = ifaces[spec];
+  if (named) {
+    const v4 = named.find((a) => a.family === "IPv4" && !a.internal);
+    if (v4) return v4.address;
+    throw new Error(`网卡 ${spec} 上没有可用的 IPv4 地址(没连上?)`);
+  }
+
+  for (const addrs of Object.values(ifaces)) {
+    for (const a of addrs ?? []) {
+      if (a.family === "IPv4" && a.address === spec) return spec;
+    }
+  }
+  throw new Error(
+    `本机没有地址或网卡叫 "${spec}"。当前可用:\n` +
+      Object.entries(ifaces)
+        .flatMap(([name, addrs]) =>
+          (addrs ?? [])
+            .filter((a) => a.family === "IPv4" && !a.internal)
+            .map((a) => `  ${name.padEnd(8)} ${a.address}`),
+        )
+        .join("\n"),
+  );
+}
+
 /** 广播 _prospero._tcp;返回停止函数。失败静默降级(仅日志)。 */
 export function advertise(port: number, name: string): () => void {
   try {
