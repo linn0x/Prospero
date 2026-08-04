@@ -109,7 +109,12 @@ export default function HostScreen() {
 
   // 只报延迟,不报地址 —— 地址是内网拓扑,截图分享时不该跟着出去,
   // 而且连哪条线路是竞速自动决定的,用户无从干预
-  const quality = runtime.rttMs === null ? "" : ` · ${String(runtime.rttMs)}ms`;
+  // 验收期要能直接读到 A1/A5 的数,不然只能填"主观秒开"
+  const metrics: string[] = [];
+  if (runtime.rttMs !== null) metrics.push(`${String(runtime.rttMs)}ms`);
+  if (conn?.lastAttachMs != null) metrics.push(`上屏 ${String(conn.lastAttachMs)}ms`);
+  if (conn?.lastResumeMs != null) metrics.push(`恢复 ${String(conn.lastResumeMs)}ms`);
+  const quality = metrics.length > 0 ? ` · ${metrics.join(" · ")}` : "";
   const connText =
     runtime.status === "connected"
       ? `${runningCount} 个运行中 · ${String(all.length)} 个会话${quality}`
@@ -241,6 +246,9 @@ export default function HostScreen() {
         }
         renderItem={({ item }) => {
           const done = item.status === "done" || item.status === "died";
+          // 断线后列表还挂着最后一次收到的状态。不标出来的话,"运行中"会被当成
+          // 此刻的事实 —— 而它可能早就结束了。
+          const stale = runtime.status !== "connected";
           const actions: SwipeAction[] = [
             {
               label: "文件",
@@ -283,13 +291,24 @@ export default function HostScreen() {
             onPress={() => router.push(`/host/${hostId}/session/${item.id}`)}
           >
             <View style={styles.cardTop}>
-              <View style={[styles.dot, { backgroundColor: statusColor[item.status] }]} />
+              <View
+                style={[
+                  styles.dot,
+                  { backgroundColor: stale ? "#3a3a44" : statusColor[item.status] },
+                ]}
+              />
               <Text style={styles.cardTitle} numberOfLines={1}>
                 {item.title}
               </Text>
               <Text style={styles.kindTag}>{item.kind === "structured" ? "对话" : "终端"}</Text>
-              <Text style={[styles.cardStatus, { color: statusColor[item.status] }]}>
+              <Text
+                style={[
+                  styles.cardStatus,
+                  { color: stale ? "#5a5a66" : statusColor[item.status] },
+                ]}
+              >
                 {statusLabel[item.status]}
+                {stale ? "(离线前)" : ""}
               </Text>
             </View>
             {item.preview !== undefined && item.preview.length > 0 && (
