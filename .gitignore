@@ -11,6 +11,10 @@ apps/mobile/ios/
 apps/mobile/android/
 apps/mobile/expo-env.d.ts
 
+# swift 菜单栏壳
+apps/shell/.build/
+apps/shell/build/
+
 # env & local
 .env
 .env.*
