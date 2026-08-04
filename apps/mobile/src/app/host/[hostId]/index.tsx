@@ -234,6 +234,11 @@ export default function HostScreen() {
             {all.length === 0 ? "还没有会话,点右上角 ＋ 新建。" : "该筛选下没有会话。"}
           </Text>
         }
+        ListFooterComponent={
+          all.length > 0 ? (
+            <Text style={styles.swipeHint}>左滑会话可查看文件、中断或结束</Text>
+          ) : null
+        }
         renderItem={({ item }) => {
           const done = item.status === "done" || item.status === "died";
           const actions: SwipeAction[] = [
@@ -386,6 +391,12 @@ const styles = StyleSheet.create({
   filterChipText: { color: "#9a9aa6", fontSize: 12 },
   filterChipTextActive: { color: "#0b0b0e", fontWeight: "600" },
   list: { padding: 12, gap: 10, paddingBottom: 32 },
+  swipeHint: {
+    color: "#5a5a66",
+    fontSize: 11,
+    textAlign: "center",
+    paddingVertical: 14,
+  },
   emptyText: { color: "#5a5a66", textAlign: "center", marginTop: 24, fontSize: 13 },
   card: { backgroundColor: "#17171d", borderRadius: 12, padding: 14, gap: 6 },
   cardPressed: { backgroundColor: "#1f1f27" },

@@ -144,11 +144,10 @@ export default function SessionScreen() {
               )}
               {isStructured && (
                 <Pressable onPress={() => setShowTty((v) => !v)} hitSlop={8}>
-                  <Icon
-                    name={showTty ? "bubble.left.and.text.bubble.right" : "terminal"}
-                    size={19}
-                    color={showTty ? "#7aa2f7" : "#9a9aa6"}
-                  />
+                  {/* 标签写的是"点了会切到哪",不是"现在是什么" */}
+                  <Text style={[styles.ttyBtn, showTty && styles.ttyBtnActive]}>
+                    {showTty ? "看对话" : "看终端"}
+                  </Text>
                 </Pressable>
               )}
               {busy && (
