@@ -246,7 +246,16 @@ $(tail -5 "$OUTPUT_DIR/install.log" | sed 's/^/    /')
 
   if (( DO_LAUNCH )); then
     step "启动"
-    xcrun devicectl device process launch --device "$DEVICE_UDID" "$BUNDLE_ID" 2>&1 | grep -E 'Launched|error' || true
+    # 启动失败不算构建失败 —— 装都装上了,手动点一下图标就行。
+    if xcrun devicectl device process launch --device "$DEVICE_UDID" "$BUNDLE_ID" \
+         > "$OUTPUT_DIR/launch.log" 2>&1; then
+      info "已启动"
+    elif grep -q "unlocked" "$OUTPUT_DIR/launch.log"; then
+      info "启动跳过:手机锁屏了。解锁后手动点图标,或重跑本命令加 --no-prebuild。"
+    else
+      info "启动失败(已安装,可手动点图标):"
+      tail -3 "$OUTPUT_DIR/launch.log" | sed 's/^/      /'
+    fi
   fi
 fi
 
