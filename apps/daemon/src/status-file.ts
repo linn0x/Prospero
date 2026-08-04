@@ -5,7 +5,8 @@
  * 而 daemon 已经在往 `~/.prospero` 写 config/devices 了,再多一个文件是最小增量,
  * 且天然带 0600 的文件权限边界 —— 状态里有 cwd 和会话标题,不该对同机其他用户可读。
  */
-import { chmodSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import path from "node:path";
 import type { SessionInfo } from "@prospero/protocol";
 import type { SessionManager } from "./session-manager.js";
@@ -25,12 +26,30 @@ export interface StatusSession {
 export interface StatusSnapshot {
   pid: number;
   startedAt: number;
+  /** 本进程加载的代码的构建时间 —— 壳拿它和磁盘上的 dist 比,发现"daemon 比代码旧" */
+  builtAt: number;
   port: number;
   bind: string | null;
   sessions: StatusSession[];
 }
 
 const FILE = "status.json";
+
+/**
+ * 本模块文件的 mtime,作为"这份代码何时编译出来"的近似。
+ * 改完 daemon 忘记重启是个很难查的坑 —— 手机侧有新功能、Mac 侧没有,
+ * 表现是消息被当成非法而拒绝,错误信息完全指不到真正的原因。
+ */
+let cachedBuiltAt: number | null = null;
+function buildTimestamp(): number {
+  if (cachedBuiltAt !== null) return cachedBuiltAt;
+  try {
+    cachedBuiltAt = Math.floor(statSync(fileURLToPath(import.meta.url)).mtimeMs);
+  } catch {
+    cachedBuiltAt = 0;
+  }
+  return cachedBuiltAt;
+}
 
 export class StatusFile {
   private readonly filePath: string;
@@ -71,6 +90,7 @@ export class StatusFile {
     const snapshot: StatusSnapshot = {
       pid: process.pid,
       startedAt: this.meta.startedAt ?? Date.now(),
+      builtAt: buildTimestamp(),
       port: this.meta.port,
       bind: this.meta.bind,
       sessions: this.manager.list().map(toStatusSession),

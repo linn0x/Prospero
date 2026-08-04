@@ -72,10 +72,13 @@
   const sendMsg = (m) => ws.readyState === 1 && ws.send(JSON.stringify(m));
 
   ws.onopen = () => {
-    // dev 明文 hello(仅 --dev + loopback 下 daemon 接受)
+    // dev 明文 hello(仅 --dev + loopback 下 daemon 接受)。
+    // 口令由 daemon 在返回本页时注入,和终端里打印的是同一个。
+    // eslint-disable-next-line no-undef
+    const DEV_TOKEN = window.__PROSPERO_DEV_TOKEN__ ?? "";
     sendMsg({
       type: "hello",
-      token: "dev-local-plaintext",
+      token: DEV_TOKEN,
       clientPubKey: bytesToB64(new Uint8Array(32)),
       clientInfo: { platform: "ios", appVersion: "dev-client" },
     });

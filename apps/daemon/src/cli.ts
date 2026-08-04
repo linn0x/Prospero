@@ -16,6 +16,7 @@ import {
   loadDevices,
   loadIdentity,
   revokeDevices,
+  rotateIdentity,
   mintDevice,
   prosperoHome,
   saveConfig,
@@ -84,6 +85,8 @@ program
     }
     if (opts.dev) {
       console.log(`开发调试页: http://127.0.0.1:${server.port}/`);
+      console.log(`dev 明文口令: ${server.devToken}`);
+      console.log("  ⚠︎ 该口令等同完整 shell 权限,每次启动都会更换,请勿外传");
     }
     if (opts.tmux && server.restoredSessions > 0) {
       console.log(`已从 tmux 接管 ${server.restoredSessions} 个上次遗留的会话`);
@@ -171,6 +174,25 @@ program
       });
       console.log(ok ? "测试推送已发出 ✓" : "测试推送失败 ✗(检查端点与网络)");
     }
+  });
+
+program
+  .command("rotate-key")
+  .description("更换 daemon 身份密钥(所有设备需重新配对)")
+  .option("-y, --yes", "跳过确认")
+  .action((opts: { yes?: boolean }) => {
+    const home = prosperoHome();
+    const devices = loadDevices(home);
+    if (opts.yes !== true) {
+      console.log("这会更换 daemon 的身份密钥,并清空已配对设备。");
+      console.log(`当前已配对 ${String(devices.length)} 台,全部需要重新扫码。`);
+      console.log("确认请加 --yes 重跑:prosperod rotate-key --yes");
+      return;
+    }
+    const fresh = rotateIdentity(home);
+    console.log(`已更换身份密钥,新公钥 ${fresh.publicKey.slice(0, 12)}…`);
+    console.log(`已清空 ${String(devices.length)} 台设备的配对,请重新运行 prosperod pair。`);
+    console.log("正在运行的 daemon 需要重启才会使用新密钥。");
   });
 
 program

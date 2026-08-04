@@ -97,10 +97,20 @@ export class GrokAdapter implements AgentAdapter {
     });
   }
 
+  private lastUsage: { inputTokens: number; outputTokens: number } | null = null;
+  private lastCostUsd: number | null = null;
+
   private endTurn(): void {
     if (!this.turnStarted) return;
     this.turnStarted = false;
-    this.emit({ kind: "turn.end", msgId: this.msgId });
+    this.emit({
+      kind: "turn.end",
+      msgId: this.msgId,
+      ...(this.lastUsage ?? {}),
+      ...(this.lastCostUsd !== null ? { costUsd: this.lastCostUsd } : {}),
+    });
+    this.lastUsage = null;
+    this.lastCostUsd = null;
   }
 
   private onStdout(chunk: string): void {
@@ -136,15 +146,20 @@ export class GrokAdapter implements AgentAdapter {
       case "assistant_message_chunk":
       case "message_delta":
       case "text": {
-        const delta = extractText(update["content"] ?? update["text"] ?? update["delta"]);
+        const delta = extractText(
+          update["data"] ?? update["content"] ?? update["text"] ?? update["delta"],
+        );
         if (delta) {
           this.emit({ kind: "text.delta", msgId: this.msgId, textId: this.msgId, delta });
         }
         return;
       }
       case "agent_thought_chunk":
-      case "reasoning": {
-        const delta = extractText(update["content"] ?? update["text"] ?? update["delta"]);
+      case "reasoning":
+      case "thought": {
+        const delta = extractText(
+          update["data"] ?? update["content"] ?? update["text"] ?? update["delta"],
+        );
         if (delta) this.emit({ kind: "reasoning.delta", msgId: this.msgId, delta });
         return;
       }
@@ -180,9 +195,22 @@ export class GrokAdapter implements AgentAdapter {
         });
         return;
       }
+      case "end":
       case "result":
-      case "turn_complete":
-        return; // 由进程退出统一收尾,避免重复 turn.end
+      case "turn_complete": {
+        // 真实字段:{"type":"end","stopReason":...,"usage":{...},"total_cost_usd":...}
+        // 用量只在这一帧里出现,进程退出时拿不到,所以在这里记下来给 turn.end 用。
+        const usage = update["usage"] as Record<string, unknown> | undefined;
+        if (usage) {
+          this.lastUsage = {
+            inputTokens: Number(usage["input_tokens"] ?? 0),
+            outputTokens: Number(usage["output_tokens"] ?? 0),
+          };
+        }
+        const cost = update["total_cost_usd"];
+        if (typeof cost === "number") this.lastCostUsd = cost;
+        return; // 仍由进程退出统一收尾,避免重复 turn.end
+      }
       default:
         return;
     }
