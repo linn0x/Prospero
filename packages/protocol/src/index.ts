@@ -1,1 +1,18 @@
 export * from "./messages.js";
+export * from "./errors.js";
+export * from "./b64.js";
+export * from "./utf8.js";
+export * from "./crypto.js";
+export * from "./qr.js";
+export * from "./ring.js";
+export {
+  parseC2S,
+  parseS2C,
+  AgentKindSchema,
+  SessionStatusSchema,
+  SessionInfoSchema,
+  HostInfoSchema,
+  C2SMessageSchema,
+  S2CMessageSchema,
+  PairingPayloadSchema,
+} from "./schemas.js";
