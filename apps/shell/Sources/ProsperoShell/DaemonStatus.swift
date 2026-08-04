@@ -37,8 +37,12 @@ struct DaemonStatus: Sendable, Equatable {
       }
     }
 
+    // devices.json 是 { "devices": [...] },不是裸数组 —— 按裸数组读会永远得到 0 台,
+    // 而"配对成功"提示正是靠设备列表变化触发的,所以这里错了整个功能都是哑的。
     if let data = try? Data(contentsOf: home.appendingPathComponent("devices.json")),
-       let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+       let root = try? JSONSerialization.jsonObject(with: data),
+       let arr = (root as? [String: Any])?["devices"] as? [[String: Any]]
+                 ?? root as? [[String: Any]] {
       status.devices = arr.map { d in
         Device(
           name: d["name"] as? String ?? "(未命名)",

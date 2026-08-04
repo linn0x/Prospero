@@ -25,6 +25,7 @@ import {
 import { authenticate, loadIdentity, type DeviceRecord } from "./pairing.js";
 import { Notifier, type NotifyConfig } from "./notify.js";
 import { SessionError, SessionManager } from "./session-manager.js";
+import { StatusFile } from "./status-file.js";
 import type { PtySession } from "./pty-session.js";
 
 const DAEMON_VERSION = "0.0.1";
@@ -101,6 +102,11 @@ export async function createDaemonServer(
 ): Promise<DaemonServer> {
   const identity = loadIdentity(opts.home);
   const manager = new SessionManager();
+  // 菜单栏壳靠这个文件看会话列表(WS 协议要过 E2E 握手,壳没必要实现一遍)
+  const statusFile = new StatusFile(opts.home, manager, {
+    port: opts.port,
+    bind: opts.bindAddr ?? null,
+  });
   const conns = new Set<Conn>();
   const devMode = opts.devMode ?? false;
   const notifier = new Notifier(opts.notify ?? null);
@@ -496,6 +502,7 @@ export async function createDaemonServer(
   });
   const address = httpServer.address();
   const port = typeof address === "object" && address !== null ? address.port : opts.port;
+  statusFile.start(port);
 
   return {
     port,
@@ -506,6 +513,7 @@ export async function createDaemonServer(
       clearInterval(catchupTimer);
       clearInterval(pingTimer);
       for (const conn of conns) conn.ws.terminate();
+      statusFile.stop();
       wss.close();
       manager.disposeAll();
       await new Promise<void>((resolve) => httpServer.close(() => resolve()));
