@@ -43,7 +43,7 @@ export function requiresShellCapability(agent: AgentKind): boolean {
  * 其余 agent 回落 PTY 轨,功能不减、只是形态是终端镜像。
  */
 export function structuredCapable(agent: AgentKind): boolean {
-  return agent === "opencode" || agent === "claude";
+  return agent === "opencode" || agent === "claude" || agent === "codex";
 }
 
 export function spawnEnv(): Record<string, string> {

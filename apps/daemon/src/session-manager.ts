@@ -12,6 +12,7 @@ import { commandFor, requiresShellCapability, spawnEnv, structuredCapable } from
 import { PtySession } from "./pty-session.js";
 import { StructuredSession, titleFor } from "./structured-session.js";
 import { ClaudeAdapter } from "./adapters/claude.js";
+import { CodexAdapter } from "./adapters/codex.js";
 import { OpencodeAdapter } from "./adapters/opencode.js";
 import type { AgentAdapter } from "./adapters/types.js";
 
@@ -54,6 +55,8 @@ function makeAdapter(agent: AgentKind): AgentAdapter {
       return new OpencodeAdapter();
     case "claude":
       return new ClaudeAdapter();
+    case "codex":
+      return new CodexAdapter();
     default:
       throw new SessionError(`agent "${agent}" 暂无结构化适配器`, "agent_unavailable");
   }
