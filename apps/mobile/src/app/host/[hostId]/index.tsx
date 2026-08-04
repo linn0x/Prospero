@@ -33,23 +33,33 @@ const statusColor: Record<SessionInfo["status"], string> = {
 };
 
 export default function HostScreen() {
-  const { hostId, create } = useLocalSearchParams<{ hostId: string; create?: string }>();
+  const { hostId, create, cmd } = useLocalSearchParams<{
+    hostId: string;
+    create?: string;
+    cmd?: string;
+  }>();
   const { host, conn, runtime } = useHostConnection(hostId);
   const [agent, setAgent] = useState<AgentKind>("claude");
   const [cwd, setCwd] = useState("");
   const [banner, setBanner] = useState<string | null>(null);
   const pendingCreateRef = useRef(false);
-  const deepLinkCreateRef = useRef(false);
+  const deepLinkCreateRef = useRef<string | null>(null);
 
-  // 深链 prospero://host/<id>?create=shell:连上后自动建会话(自动化测试/快捷指令用)
+  // 深链 prospero://host/<id>?create=shell&cmd=…:连上后自动建会话(自动化测试/快捷指令用)
   useEffect(() => {
-    if (!conn || !create || deepLinkCreateRef.current) return;
+    if (!conn || !create) return;
+    const fireKey = `${create}:${typeof cmd === "string" ? cmd : ""}`;
+    if (deepLinkCreateRef.current === fireKey) return;
     if (runtime.status !== "connected") return;
-    if (!AGENTS.includes(create as AgentKind)) return;
-    deepLinkCreateRef.current = true;
+    if (!AGENTS.includes(create as AgentKind) && create !== "custom") return;
+    deepLinkCreateRef.current = fireKey;
     pendingCreateRef.current = true;
-    conn.createSession(create as AgentKind);
-  }, [conn, create, runtime.status]);
+    conn.createSession(
+      create as AgentKind,
+      undefined,
+      typeof cmd === "string" && cmd.length > 0 ? cmd : undefined,
+    );
+  }, [conn, create, cmd, runtime.status]);
 
   // 新建会话:创建后 daemon 自动 attach 并发快照 → 以快照的 sid 进入会话页
   useEffect(() => {

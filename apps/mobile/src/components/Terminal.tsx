@@ -7,6 +7,7 @@ import { useCallback, useEffect, useRef } from "react";
 import { StyleSheet, View } from "react-native";
 import { WebView, type WebViewMessageEvent } from "react-native-webview";
 import type { HostConnection } from "@/lib/connection";
+import { TERMINAL_HTML } from "./terminal-html";
 
 interface Props {
   conn: HostConnection;
@@ -112,15 +113,11 @@ export function Terminal({ conn, sid }: Props) {
     [conn, sid, tryAttach],
   );
 
-  const addr = conn.activeAddr ?? conn.host.addrs[0] ?? "127.0.0.1";
-  const uri = `http://${addr}:${conn.host.port}/term.html`;
-
   return (
     <View style={styles.wrap}>
       <WebView
-        key={uri}
         ref={webRef}
-        source={{ uri }}
+        source={{ html: TERMINAL_HTML }}
         onMessage={onMessage}
         style={styles.web}
         keyboardDisplayRequiresUserAction={false}
