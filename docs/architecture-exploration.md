@@ -66,12 +66,36 @@ flowchart LR
 
 | Agent | 结构化通道 | 审批回传 | 会话恢复 | 备注 |
 |---|---|---|---|---|
-| **opencode** | `opencode serve` HTTP + SSE(`/event`),OpenAPI 3.1 在 `/doc`,官方 `@opencode-ai/sdk` | `POST /session/:id/permissions/:permissionID` `{response, remember?}` | 原生多会话 | **完整度最高**,TUI 自己就是这个 server 的客户端;适配成本最低,第一个做 |
-| **Claude Code** | `@anthropic-ai/claude-agent-sdk` 的 `query()`(等价 `claude -p --output-format stream-json --input-format stream-json --include-partial-messages`) | SDK `canUseTool` 回调(evaluate 顺序 hooks→deny→ask→mode→allow→canUseTool);CLI 侧另有 `--permission-prompt-tool` | `--resume <id>` / `--fork-session` | 官方 2026 明确推荐 SDK 而非解析 CLI;事件为 NDJSON(`system/init`→`assistant`/`stream_event`→`result` 含 cost/usage) |
+| **opencode** ✅已实现 | `opencode serve` HTTP + SSE(`/api/event`),OpenAPI 3.1 在 `/doc` | `POST /api/session/:id/permission/:reqId/reply` `{reply}` | 原生多会话 | **完整度最高**;实测坑见下方「实现记录」 |
+| **Claude Code** ✅已实现 | `@anthropic-ai/claude-agent-sdk` 0.3.x 的 `query()`,流式输入(AsyncIterable) | SDK `canUseTool` 回调 —— 挂起 promise 等手机回复 | `interrupt()`;`--resume` 待接 | 官方推荐 SDK 而非解析 CLI;实测坑见下方「实现记录」 |
 | **Codex CLI** | `codex app-server`:JSON-RPC 2.0 newline/stdio(实验性 `--listen ws://`),IDE 扩展同款;`codex app-server generate-ts` 可生成类型 | server→client 请求 `item/commandApproval` / `item/patchApproval`,客户端回执即裁决 | `thread/resume` / `thread/fork` | 另有 `codex exec --json`(无交互审批,靠 sandbox);app-server 标实验性,版本随 CLI 漂移 |
 | **Grok Build**(xAI 官方 CLI,2026-05 beta) | `grok -p --output-format streaming-json`(`session/update` 分片,形似 ACP) | 仅 `--always-approve`(粗粒度,无逐条回调,待验证) | `-r/--resume <id>`、`-c` | 精细审批做不到 → 交互审批场景回落 PTY 轨 |
 | **trae-agent**(开源) | 无流式 API;`trae-cli run --trajectory-file traj.json` 事后 JSON,可 tail 近似流式 | 无 | 无 | roadmap 已列 Programmatic API;当前=子进程 + trajectory tail |
 | **Trae SOLO / 其他任意 CLI** | 无 | — | — | **纯 PTY 轨** |
+
+### 实现记录:适配器踩到的真实差异(2026-08-04,M2 落地)
+
+文档/spec 与实际行为不一致的地方,都是实跑才发现的:
+
+**opencode 1.18.12**
+- SSE 事件负载在 `data` 字段,而非 OpenAPI spec 里写的 `properties`
+- 响应体统一包在 `{data: ...}` 里
+- **服务端口先于模型 catalog 就绪(约 1.4s)**;在此窗口内发的 prompt 会被
+  `admitted` 但**永不调度**——表现为"发了消息没反应"且无任何报错。适配器以
+  `GET /api/model` 返回非空作为就绪信号
+- 创建会话必须显式带 model(从 `GET /config` 的 `model` 字段读,格式
+  `providerID/model-id`,id 本身可含斜杠)
+
+**Claude Code 2.1 / Agent SDK 0.3.x**
+- 审批不是事件而是 `canUseTool` 回调:必须挂起 promise 等手机回复。
+  `always` 要回传 SDK 给的 `suggestions` 作为 `updatedPermissions`
+- **安全命令分类器会自动放行只读/无害操作**(`echo`、cwd 内 Read),不走
+  `canUseTool`——测试审批链路必须用写操作,否则会误判为"审批没触发"
+- 工具调用只在完整 assistant 消息里出现;增量流(`stream_event`)只给文本与 thinking
+- 输入必须用流式(AsyncIterable)才能支持 `interrupt()` 与多轮
+
+**测试工程**:两个适配器的集成测试都会拉起真实 agent 子进程,并行跑会资源
+抢占导致偶发超时 → daemon 测试串行执行(`vitest.config.ts`)。
 
 ### 远程 Shell 会话(内置的 SSH 平替)
 

@@ -154,3 +154,18 @@ monorepo + TS 配置 + protocol/daemon 骨架。DoD:`npm install`、`tsc --noEmi
 ### 真机验收(W5,待做)
 
 _待填:A1/A3/A5/A7 精确数据、软键盘 resize 与 IME、WireGuard 切换。_
+
+## 9. M2 进展(2026-08-04)
+
+M2 主体已完成并在模拟器验证:
+
+| 项 | 状态 |
+|---|---|
+| 协议结构化轨(agent.event / chat.snapshot / 审批) | ✅ |
+| opencode 适配器(HTTP + SSE) | ✅ 实测一轮对话 3.5s |
+| Claude Code 适配器(Agent SDK + canUseTool) | ✅ 审批链路含拒绝/允许双向验证 |
+| Chat UI(气泡/推理折叠/工具卡片/审批卡片/用量) | ✅ 模拟器截图验证 |
+| 测试 | 47 个全绿(protocol 30 / daemon 12 / mobile 11 中的对应部分) |
+
+**剩余**:Codex app-server 适配器、Grok headless 适配器、Bark 推送通道、
+`--resume` 会话恢复、真机验收。
