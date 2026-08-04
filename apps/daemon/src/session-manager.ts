@@ -8,11 +8,18 @@ import type {
   SessionInfo,
   SessionKind,
 } from "@prospero/protocol";
-import { commandFor, requiresShellCapability, spawnEnv, structuredCapable } from "./agents.js";
+import {
+  commandFor,
+  defaultKindFor,
+  requiresShellCapability,
+  spawnEnv,
+  structuredCapable,
+} from "./agents.js";
 import { PtySession } from "./pty-session.js";
 import { StructuredSession, titleFor } from "./structured-session.js";
 import { ClaudeAdapter } from "./adapters/claude.js";
 import { CodexAdapter } from "./adapters/codex.js";
+import { GrokAdapter } from "./adapters/grok.js";
 import { OpencodeAdapter } from "./adapters/opencode.js";
 import type { AgentAdapter } from "./adapters/types.js";
 
@@ -57,6 +64,8 @@ function makeAdapter(agent: AgentKind): AgentAdapter {
       return new ClaudeAdapter();
     case "codex":
       return new CodexAdapter();
+    case "grok":
+      return new GrokAdapter();
     default:
       throw new SessionError(`agent "${agent}" 暂无结构化适配器`, "agent_unavailable");
   }
@@ -75,8 +84,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       );
     }
     const cwd = input.cwd ?? os.homedir();
-    const kind: SessionKind =
-      input.kind ?? (structuredCapable(input.agent) ? "structured" : "pty");
+    const kind: SessionKind = input.kind ?? defaultKindFor(input.agent);
     if (kind === "structured" && !structuredCapable(input.agent)) {
       throw new SessionError(`agent "${input.agent}" 暂无结构化适配器`, "agent_unavailable");
     }
