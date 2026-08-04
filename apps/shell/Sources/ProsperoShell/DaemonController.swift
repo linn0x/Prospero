@@ -20,14 +20,22 @@ final class DaemonController {
 
   private(set) var state: State = .stopped
   private(set) var status: DaemonStatus = .load()
+  private(set) var running: RunningStatus?
   private(set) var recentLog: [String] = []
+  private(set) var bonjourNote: String?
+
+  /// 有设备完成配对(客户端公钥落库)时回调,带设备名。配对窗口据此给出成功提示。
+  var onDeviceBound: ((String) -> Void)?
 
   private var process: Process?
   private var refreshTimer: Timer?
+  private let bonjour = BonjourAdvertiser()
+  private var boundDeviceNames: Set<String> = []
 
   var logURL: URL { DaemonStatus.home.appendingPathComponent("shell.log") }
 
   init() {
+    boundDeviceNames = Set(DaemonStatus.load().devices.filter(\.bound).map(\.name))
     refresh()
     refreshTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
       Task { @MainActor in self?.refresh() }
@@ -37,10 +45,41 @@ final class DaemonController {
   /// 刷新状态。壳没在管进程时,也要认出别处跑着的 daemon(终端里手动起的)。
   func refresh() {
     status = .load()
+    running = RunningStatus.load().flatMap { $0.processAlive ? $0 : nil }
+
+    // 新绑定的设备 = 刚刚配对成功。这是唯一能观察到"手机那边连上了"的信号:
+    // daemon 在握手时把客户端公钥写进 devices.json。
+    let nowBound = Set(status.devices.filter(\.bound).map(\.name))
+    for name in nowBound.subtracting(boundDeviceNames) {
+      onDeviceBound?(name)
+    }
+    boundDeviceNames = nowBound
+
+    syncBonjour()
+
     if case .running = state { return }
     if case .starting = state { return }
     let host = status.bind ?? "127.0.0.1"
     state = Self.portInUse(host: host, port: status.port) ? .externallyRunning : .stopped
+  }
+
+  /// daemon 在跑就广播,停了就撤。端口以 status.json 里的实际值为准。
+  private func syncBonjour() {
+    let port = running?.port ?? status.port
+    let alive = running != nil || {
+      if case .running = state { return true }
+      if case .externallyRunning = state { return true }
+      return false
+    }()
+
+    if alive {
+      if !bonjour.isPublished {
+        bonjour.start(port: port, name: "Prospero @ \(Host.current().localizedName ?? "Mac")")
+      }
+    } else {
+      bonjour.stop()
+    }
+    bonjourNote = bonjour.lastError
   }
 
   func start() {
@@ -65,7 +104,8 @@ final class DaemonController {
 
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: node)
-    proc.arguments = [cli, "start"]
+    // 广播交给壳自己做(TCC 归属 app bundle),daemon 让位
+    proc.arguments = [cli, "start", "--no-bonjour"]
     // 登录 shell 的 PATH 传下去,agent CLI(claude/codex/…)才找得到
     var env = ProcessInfo.processInfo.environment
     if let shellPath = Self.loginPath() { env["PATH"] = shellPath }
@@ -104,6 +144,7 @@ final class DaemonController {
   }
 
   func stop() {
+    bonjour.stop()
     guard let proc = process else {
       state = .stopped
       refresh()

@@ -36,8 +36,9 @@ program
     "只监听这个网卡/地址(如 utun10 或 10.0.0.2);默认全部网卡",
   )
   .option("--dev", "开发模式:提供浏览器调试页,loopback 允许明文协议", false)
+  .option("--no-bonjour", "不做 mDNS 广播(交给菜单栏壳,由它承担本地网络 TCC)")
   .option("--name <name>", "对外显示的主机名")
-  .action(async (opts: { port?: number; bind?: string; dev: boolean; name?: string }) => {
+  .action(async (opts: { port?: number; bind?: string; dev: boolean; bonjour: boolean; name?: string }) => {
     const home = prosperoHome();
     const config = loadConfig(home);
     const port = opts.port ?? config.port;
@@ -61,7 +62,9 @@ program
       hostName: opts.name,
       notify: config.notify ?? null,
     });
-    const stopAdvertise = advertise(server.port, `Prospero @ ${opts.name ?? os.hostname()}`);
+    const stopAdvertise = opts.bonjour
+      ? advertise(server.port, `Prospero @ ${opts.name ?? os.hostname()}`)
+      : () => {};
 
     const devices = loadDevices(home);
     console.log(`prosperod v0.0.1 已启动(home: ${home})`);

@@ -13,6 +13,8 @@ final class PairingModel {
     case idle
     case generating
     case ready(url: String, addrs: String, port: Int)
+    /// 手机真的连上了 —— 不只是二维码生成好了
+    case paired(deviceName: String)
     case failed(String)
   }
 
@@ -49,6 +51,14 @@ final class PairingModel {
   }
 
   func reset() { phase = .idle }
+
+  /// 配对握手完成。只在配对窗口正在等这台设备时才切画面 ——
+  /// 平时手机重连也会刷新 lastSeen,不该弹出"配对成功"。
+  func deviceDidPair(_ name: String) {
+    guard case .ready = phase else { return }
+    phase = .paired(deviceName: name)
+    NSSound(named: "Glass")?.play()
+  }
 
   // CLI 打印的是 `prospero://pair?d=<base64>`,夹在二维码字符画和说明文字之间。
   nonisolated static func extractPairingURL(from output: String) -> String? {

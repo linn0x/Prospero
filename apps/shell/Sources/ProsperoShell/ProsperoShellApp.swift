@@ -29,6 +29,16 @@ struct ProsperoShellApp: App {
     let host = status.bind ?? "127.0.0.1"
     let up = DaemonController.portInUse(host: host, port: status.port)
     print("  daemon:   \(up ? "端口上有服务在跑" : "未运行")")
+    print("  开机自启: \(LoginItem.statusLabel)")
+    if let running = RunningStatus.load() {
+      print("  status:   pid \(running.pid) \(running.processAlive ? "存活" : "❌ 已死(陈旧文件)")·端口 \(running.port)")
+      print("  会话:     \(running.sessions.count) 个,待审批 \(running.pendingApprovals)")
+      for session in running.sessions {
+        print("    - \(session.agent) · \(session.title) — \(session.statusLabel)")
+      }
+    } else {
+      print("  status:   无 status.json(daemon 未运行,或版本过旧)")
+    }
     if node == nil || cli == nil {
       print("\n定位失败时,在菜单里手动指定,或设 UserDefaults:")
       print("  defaults write com.linn0x.prospero.shell nodePath /opt/homebrew/bin/node")
@@ -39,6 +49,10 @@ struct ProsperoShellApp: App {
   var body: some Scene {
     MenuBarExtra {
       MenuContent(daemon: daemon, pairing: pairing)
+        .task {
+          // 配对成功的唯一可观察信号:daemon 握手时把客户端公钥写进 devices.json
+          daemon.onDeviceBound = { name in pairing.deviceDidPair(name) }
+        }
     } label: {
       Image(systemName: daemon.symbolName)
     }
@@ -58,12 +72,14 @@ struct ProsperoShellApp: App {
 extension DaemonController {
   /// 菜单栏图标直接反映状态 —— 这是壳最主要的信息输出,不用点开就能看见。
   var symbolName: String {
+    // 有待审批时图标就该不一样 —— 审批是最高频的远程操作,值得占用这个位置
+    if let running, running.pendingApprovals > 0 { return "hand.raised.fill" }
     switch state {
-    case .running: "wand.and.stars"
-    case .externallyRunning: "wand.and.stars.inverse"
-    case .starting: "hourglass"
-    case .failed: "exclamationmark.triangle"
-    case .stopped: "wand.and.rays.inverse"
+    case .running: return "wand.and.stars"
+    case .externallyRunning: return "wand.and.stars.inverse"
+    case .starting: return "hourglass"
+    case .failed: return "exclamationmark.triangle"
+    case .stopped: return "wand.and.rays.inverse"
     }
   }
 
@@ -127,6 +143,18 @@ struct MenuContent: View {
 
     Divider()
 
+    SessionsSection(running: daemon.running)
+
+    Divider()
+
+    LoginItemToggle()
+
+    if let note = daemon.bonjourNote {
+      Text("Bonjour:\(note)")
+    }
+
+    Divider()
+
     Button("查看日志…") {
       openWindow(id: "log")
       NSApp.activate(ignoringOtherApps: true)
@@ -139,6 +167,42 @@ struct MenuContent: View {
       NSApp.terminate(nil)
     }
     .keyboardShortcut("q")
+  }
+}
+
+/// 菜单里的运行中会话。数据来自 daemon 写的 status.json —— 壳不碰 WS 协议。
+struct SessionsSection: View {
+  let running: RunningStatus?
+
+  var body: some View {
+    if let running, !running.sessions.isEmpty {
+      let pending = running.pendingApprovals
+      Text(pending > 0
+        ? "会话(\(running.sessions.count))· 待审批 \(pending)"
+        : "会话(\(running.sessions.count))")
+      ForEach(running.sessions) { session in
+        // 会话不可在壳里操作(那是手机的活),这里只做一眼可见的总览
+        Text("  \(session.agent) · \(session.title) — \(session.statusLabel)")
+      }
+    } else if running != nil {
+      Text("没有运行中的会话")
+    } else {
+      Text("会话列表需 daemon 运行")
+    }
+  }
+}
+
+/// 开机自启。SMAppService 的状态是系统在管,每次展开菜单重新读,别缓存。
+struct LoginItemToggle: View {
+  @State private var error: String?
+
+  var body: some View {
+    Button(LoginItem.isEnabled ? "✓ 开机自启" : "开机自启") {
+      error = LoginItem.setEnabled(!LoginItem.isEnabled)
+    }
+    if let error {
+      Text(error)
+    }
   }
 }
 
@@ -173,6 +237,11 @@ struct PairingView: View {
             .font(.caption).foregroundStyle(.secondary)
           Text("二维码含访问凭证,请勿截图外传")
             .font(.caption2).foregroundStyle(.orange)
+          HStack(spacing: 6) {
+            ProgressView().controlSize(.small)
+            Text("等待手机扫码…").font(.caption).foregroundStyle(.secondary)
+          }
+          .padding(.top, 4)
         }
         HStack {
           Button("复制配对串") {
@@ -181,6 +250,18 @@ struct PairingView: View {
           }
           Button("再配一台") { pairing.reset() }
         }
+
+      case .paired(let deviceName):
+        VStack(spacing: 12) {
+          Image(systemName: "checkmark.circle.fill")
+            .font(.system(size: 52))
+            .foregroundStyle(.green)
+          Text("「\(deviceName)」配对成功").font(.headline)
+          Text("手机已完成握手,可以关掉这个窗口了")
+            .font(.caption).foregroundStyle(.secondary)
+          Button("再配一台") { pairing.reset() }
+        }
+        .padding(.vertical, 20)
 
       case .failed(let message):
         VStack(spacing: 8) {
