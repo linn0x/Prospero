@@ -395,7 +395,15 @@ export class HostConnection {
       case "tool.output":
         this.events.emit("toolOutput", msg);
         return;
+      case "fs.listing":
+      case "fs.content":
+      case "fs.written":
+      case "fs.chunk":
+        this.resolveFs(msg);
+        return;
       case "error":
+        // 文件请求在等应答时,错误要回到那个 Promise,而不是只飘一个全局提示
+        if (msg.sid !== undefined && this.rejectFsFor(msg.sid, msg.message)) return;
         this.events.emit("serverError", msg);
         return;
       case "hello.ok":
@@ -404,8 +412,113 @@ export class HostConnection {
     }
   }
 
+  // ---------------------------------------------------------------- 文件操作
+  //
+  // 协议没有请求 id,应答靠 (sid, path) 配对。同一路径的并发请求会互相顶掉,
+  // 对文件面板来说够用 —— 用户一次只看一个文件。
+
+  private fsWaiters = new Map<
+    string,
+    { resolve: (m: S2CMessage) => void; reject: (e: Error) => void }
+  >();
+
+  private fsKey(sid: string, path: string): string {
+    return `${sid}\u0000${path}`;
+  }
+
+  private resolveFs(msg: S2CMessage & { sid: string; path: string }): void {
+    const key = this.fsKey(msg.sid, msg.path);
+    const waiter = this.fsWaiters.get(key);
+    if (!waiter) return;
+    this.fsWaiters.delete(key);
+    waiter.resolve(msg);
+  }
+
+  /** 把服务端错误交给正在等这个会话应答的请求。返回是否有人接手。 */
+  private rejectFsFor(sid: string, message: string): boolean {
+    let handled = false;
+    for (const [key, waiter] of [...this.fsWaiters]) {
+      if (!key.startsWith(`${sid}\u0000`)) continue;
+      this.fsWaiters.delete(key);
+      waiter.reject(new Error(message));
+      handled = true;
+    }
+    return handled;
+  }
+
+  private fsRequest<T extends S2CMessage>(
+    sid: string,
+    path: string,
+    msg: C2SMessage,
+    timeoutMs = 15000,
+  ): Promise<T> {
+    if (!this.isConnected) return Promise.reject(new Error("未连接"));
+    const key = this.fsKey(sid, path);
+    this.fsWaiters.get(key)?.reject(new Error("被新的请求取代"));
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.fsWaiters.delete(key);
+        reject(new Error("请求超时"));
+      }, timeoutMs);
+      this.fsWaiters.set(key, {
+        resolve: (m) => {
+          clearTimeout(timer);
+          resolve(m as T);
+        },
+        reject: (e) => {
+          clearTimeout(timer);
+          reject(e);
+        },
+      });
+      this.send(msg, true);
+    });
+  }
+
+  fsList(sid: string, path: string): Promise<Extract<S2CMessage, { type: "fs.listing" }>> {
+    return this.fsRequest(sid, path, { type: "fs.list", sid, path });
+  }
+
+  fsRead(sid: string, path: string): Promise<Extract<S2CMessage, { type: "fs.content" }>> {
+    return this.fsRequest(sid, path, { type: "fs.read", sid, path });
+  }
+
+  fsWrite(
+    sid: string,
+    path: string,
+    contentB64: string,
+  ): Promise<Extract<S2CMessage, { type: "fs.written" }>> {
+    return this.fsRequest(sid, path, { type: "fs.write", sid, path, contentB64 });
+  }
+
+  fsGetChunk(
+    sid: string,
+    path: string,
+    offset: number,
+    length: number,
+  ): Promise<Extract<S2CMessage, { type: "fs.chunk" }>> {
+    return this.fsRequest(sid, path, { type: "fs.get", sid, path, offset, length });
+  }
+
+  fsPutChunk(
+    sid: string,
+    path: string,
+    offset: number,
+    dataB64: string,
+    final: boolean,
+  ): Promise<Extract<S2CMessage, { type: "fs.written" }> | null> {
+    if (!final) {
+      // 非末块没有应答,直接发
+      this.send({ type: "fs.put", sid, path, offset, dataB64, final }, true);
+      return Promise.resolve(null);
+    }
+    return this.fsRequest(sid, path, { type: "fs.put", sid, path, offset, dataB64, final });
+  }
+
   private onClose(): void {
     const wasConnected = this.isConnected;
+    // 断线时挂起的文件请求永远等不到应答了,立刻失败好过等超时
+    for (const [, waiter] of this.fsWaiters) waiter.reject(new Error("连接已断开"));
+    this.fsWaiters.clear();
     this.clearTimers();
     this.ws = null;
     this.channel = null;

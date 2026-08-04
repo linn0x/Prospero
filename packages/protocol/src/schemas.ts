@@ -164,6 +164,62 @@ export const C2SSessionKillSchema = z.object({
   sid,
 });
 
+// ---------------------------------------------------------------- 文件操作
+//
+// 全部路径都相对于会话的 cwd,由 daemon 侧解析并强制约束在该根之下。
+// 客户端永远不发绝对路径 —— 那等于把"能访问哪里"的判断交给客户端,
+// 而客户端是不可信的一侧。
+
+/** 相对路径;拒绝绝对路径与 ".." 段(daemon 会再校验一次,这里只是早失败) */
+const relPath = z
+  .string()
+  .max(4096)
+  .refine((p) => !p.startsWith("/") && !p.split("/").includes(".."), {
+    message: "path must be relative and must not contain '..'",
+  });
+
+/** 列目录 */
+export const C2SFsListSchema = z.object({
+  type: z.literal("fs.list"),
+  sid,
+  /** "" 表示会话根目录 */
+  path: relPath,
+});
+
+/** 读文件(用于编辑;超过上限会被截断并置 truncated) */
+export const C2SFsReadSchema = z.object({
+  type: z.literal("fs.read"),
+  sid,
+  path: relPath,
+});
+
+/** 写回文件(编辑保存) */
+export const C2SFsWriteSchema = z.object({
+  type: z.literal("fs.write"),
+  sid,
+  path: relPath,
+  contentB64: z.string(),
+});
+
+/** 分块下载:任意文件(含二进制)按 offset/length 取 */
+export const C2SFsGetSchema = z.object({
+  type: z.literal("fs.get"),
+  sid,
+  path: relPath,
+  offset: z.number().int().nonnegative(),
+  length: z.number().int().min(1).max(1024 * 1024),
+});
+
+/** 分块上传;offset 为 0 时截断重建,final 时收尾 */
+export const C2SFsPutSchema = z.object({
+  type: z.literal("fs.put"),
+  sid,
+  path: relPath,
+  offset: z.number().int().nonnegative(),
+  dataB64: z.string(),
+  final: z.boolean(),
+});
+
 export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SHelloSchema,
   C2SSessionCreateSchema,
@@ -176,6 +232,11 @@ export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SPermissionRespondSchema,
   C2SSessionInterruptSchema,
   C2SSessionKillSchema,
+  C2SFsListSchema,
+  C2SFsReadSchema,
+  C2SFsWriteSchema,
+  C2SFsGetSchema,
+  C2SFsPutSchema,
 ]);
 
 // ---------------------------------------------------------------- S → C
@@ -361,9 +422,60 @@ export const S2CErrorSchema = z.object({
     "session_not_found",
     "agent_unavailable",
     "bad_message",
+    /** 文件操作:路径越界或权限不足 */
+    "denied",
+    /** 文件操作:其余失败(不存在、不是文件、过大、IO) */
+    "fs_error",
   ]),
   message: z.string(),
   sid: sid.optional(),
+});
+
+// ---------------------------------------------------------------- 文件操作应答
+
+export const FsEntrySchema = z.object({
+  name: z.string(),
+  /** 目录 / 普通文件 / 符号链接(链接不跟随,避免绕过根约束) */
+  kind: z.enum(["dir", "file", "symlink", "other"]),
+  size: z.number().int().nonnegative(),
+  mtime: z.number().int().nonnegative(),
+});
+
+export const S2CFsListingSchema = z.object({
+  type: z.literal("fs.listing"),
+  sid,
+  path: z.string(),
+  entries: z.array(FsEntrySchema),
+});
+
+export const S2CFsContentSchema = z.object({
+  type: z.literal("fs.content"),
+  sid,
+  path: z.string(),
+  contentB64: z.string(),
+  size: z.number().int().nonnegative(),
+  /** 超过可编辑上限被截断:此时不允许保存,否则会截断原文件 */
+  truncated: z.boolean(),
+  /** 含 NUL 字节等,不能当文本编辑 */
+  binary: z.boolean(),
+});
+
+export const S2CFsWrittenSchema = z.object({
+  type: z.literal("fs.written"),
+  sid,
+  path: z.string(),
+  size: z.number().int().nonnegative(),
+});
+
+export const S2CFsChunkSchema = z.object({
+  type: z.literal("fs.chunk"),
+  sid,
+  path: z.string(),
+  offset: z.number().int().nonnegative(),
+  dataB64: z.string(),
+  /** 整个文件的大小,客户端据此算进度 */
+  total: z.number().int().nonnegative(),
+  eof: z.boolean(),
 });
 
 export const S2CMessageSchema = z.discriminatedUnion("type", [
@@ -376,6 +488,10 @@ export const S2CMessageSchema = z.discriminatedUnion("type", [
   S2CToolOutputSchema,
   S2CPermissionRequestSchema,
   S2CErrorSchema,
+  S2CFsListingSchema,
+  S2CFsContentSchema,
+  S2CFsWrittenSchema,
+  S2CFsChunkSchema,
 ]);
 
 // ---------------------------------------------------------------- 配对 QR 载荷
@@ -411,6 +527,7 @@ export type C2STermResize = z.infer<typeof C2STermResizeSchema>;
 export type C2STermAck = z.infer<typeof C2STermAckSchema>;
 export type C2SPermissionRespond = z.infer<typeof C2SPermissionRespondSchema>;
 export type C2SMessage = z.infer<typeof C2SMessageSchema>;
+export type FsEntry = z.infer<typeof FsEntrySchema>;
 export type ChatRole = z.infer<typeof ChatRoleSchema>;
 export type ToolState = z.infer<typeof ToolStateSchema>;
 export type AgentEventBody = z.infer<typeof AgentEventBodySchema>;
