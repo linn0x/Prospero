@@ -24,7 +24,7 @@ function fakeInterfaces(): ReturnType<typeof os.networkInterfaces> {
   };
   return {
     lo0: [v4("127.0.0.1", true)],
-    en0: [v4("192.168.31.101")],
+    en0: [v4("192.168.1.10")],
     utun10: [v4("10.0.0.2")],
     utun99: [v6],
   };
@@ -38,7 +38,7 @@ describe("resolveBindAddr", () => {
   it("网卡名解析成该网卡的 IPv4", () => {
     vi.spyOn(os, "networkInterfaces").mockReturnValue(fakeInterfaces());
     expect(resolveBindAddr("utun10")).toBe("10.0.0.2");
-    expect(resolveBindAddr("en0")).toBe("192.168.31.101");
+    expect(resolveBindAddr("en0")).toBe("192.168.1.10");
     vi.restoreAllMocks();
   });
 
