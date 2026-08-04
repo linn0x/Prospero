@@ -290,6 +290,11 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     return this.structuredSessions.get(sid);
   }
 
+  /** 会话的 cwd —— 文件面板以此为根;会话不存在返回 null */
+  cwdOf(sid: string): string | null {
+    return this.list().find((s) => s.id === sid)?.cwd ?? null;
+  }
+
   requirePty(sid: string): PtySession {
     const s = this.ptySessions.get(sid);
     if (!s) {
