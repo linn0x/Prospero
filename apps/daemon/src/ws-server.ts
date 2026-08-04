@@ -58,6 +58,8 @@ interface Conn {
 export interface DaemonServerOptions {
   home: string;
   port: number;
+  /** 监听地址;省略 = 0.0.0.0(全部网卡) */
+  bindAddr?: string | undefined;
   devMode?: boolean;
   hostName?: string | undefined;
   /** 推送通道配置;省略则不推送 */
@@ -490,7 +492,7 @@ export async function createDaemonServer(
 
   await new Promise<void>((resolve, reject) => {
     httpServer.once("error", reject);
-    httpServer.listen(opts.port, "0.0.0.0", () => resolve());
+    httpServer.listen(opts.port, opts.bindAddr ?? "0.0.0.0", () => resolve());
   });
   const address = httpServer.address();
   const port = typeof address === "object" && address !== null ? address.port : opts.port;
