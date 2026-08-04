@@ -6,6 +6,7 @@
 
 - 架构探索与技术选型:[docs/architecture-exploration.md](docs/architecture-exploration.md)
 - M1 实施计划(执行中):[docs/m1-plan.md](docs/m1-plan.md)
+- M3 计划:[Android 端](docs/android-plan.md) · [语音输入](docs/voice-input-plan.md)
 
 ## 快速开始(M1)
 
