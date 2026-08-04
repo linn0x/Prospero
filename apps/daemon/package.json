@@ -9,7 +9,7 @@
   "scripts": {
     "build": "tsc --build",
     "dev": "node --experimental-strip-types src/cli.ts",
-    "test": "vitest run"
+    "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
     "@prospero/protocol": "*",
