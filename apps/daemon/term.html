@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<title>Prospero Terminal</title>
+<link rel="stylesheet" href="/assets/xterm.css" />
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #0b0b0e; overflow: hidden; }
+  #term { height: 100%; width: 100%; padding: 2px 0 2px 6px; box-sizing: border-box; }
+  .xterm .xterm-viewport { overflow-y: auto !important; -webkit-overflow-scrolling: touch; }
+</style>
+</head>
+<body>
+<div id="term"></div>
+<script src="/assets/xterm.js"></script>
+<script src="/assets/fit.js"></script>
+<script src="/assets/webgl.js"></script>
+<script>
+  const post = (o) => window.ReactNativeWebView && window.ReactNativeWebView.postMessage(JSON.stringify(o));
+
+  const term = new window.Terminal({
+    scrollback: 3000,
+    fontSize: 12,
+    fontFamily: "Menlo, Monaco, monospace",
+    theme: { background: "#0b0b0e" },
+    allowProposedApi: true,
+    cursorBlink: true,
+  });
+  const fit = new window.FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(document.getElementById("term"));
+
+  let renderer = "dom";
+  try {
+    const gl = new window.WebglAddon.WebglAddon();
+    gl.onContextLoss(() => gl.dispose());
+    term.loadAddon(gl);
+    renderer = "webgl";
+  } catch (e) {
+    // WebGL 不可用则回退 DOM 渲染(spike 会记录)
+  }
+
+  const te = new TextEncoder();
+  function bytesToB64(bytes) {
+    let bin = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    }
+    return btoa(bin);
+  }
+  function b64ToBytes(b64) {
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  term.onData((d) => post({ kind: "input", data: bytesToB64(te.encode(d)) }));
+
+  let fitTimer = null;
+  function doFit() {
+    if (fitTimer) return;
+    fitTimer = setTimeout(() => {
+      fitTimer = null;
+      try { fit.fit(); } catch (e) {}
+      post({ kind: "resized", cols: term.cols, rows: term.rows });
+    }, 50);
+  }
+
+  window.__rx = (jsonStr) => {
+    const m = JSON.parse(jsonStr);
+    if (m.kind === "snapshot") {
+      term.reset();
+      if (m.cols && m.rows && (m.cols !== term.cols || m.rows !== term.rows)) {
+        term.resize(m.cols, m.rows);
+      }
+      term.write(m.ansi);
+    } else if (m.kind === "output") {
+      term.write(b64ToBytes(m.dataB64));
+    } else if (m.kind === "fit") {
+      doFit();
+    }
+  };
+
+  new ResizeObserver(() => doFit()).observe(document.body);
+  window.addEventListener("load", () => {
+    post({ kind: "ready", renderer });
+    doFit();
+  });
+</script>
+</body>
+</html>

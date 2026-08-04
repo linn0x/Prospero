@@ -368,15 +368,13 @@ export async function createDaemonServer(
   const req2 = createRequire(import.meta.url);
   const pkgRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 
+  // term.html 与 xterm 资产始终提供(App 的 WebView 终端依赖;纯静态无敏感信息,
+  // 会话数据只走鉴权+加密的 WS)。dev-client.html 仅 --dev。
   function handleHttp(req: IncomingMessage, res: ServerResponse): void {
-    if (!devMode) {
-      res.writeHead(404).end("prosperod");
-      return;
-    }
     try {
-      if (req.url === "/" || req.url === "/index.html") {
+      if (req.url === "/term.html") {
         res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-        res.end(readFileSync(path.join(pkgRoot, "dev-client.html")));
+        res.end(readFileSync(path.join(pkgRoot, "term.html")));
       } else if (req.url === "/assets/xterm.js") {
         res.writeHead(200, { "content-type": "text/javascript" });
         res.end(readFileSync(req2.resolve("@xterm/xterm")));
@@ -390,8 +388,14 @@ export async function createDaemonServer(
       } else if (req.url === "/assets/fit.js") {
         res.writeHead(200, { "content-type": "text/javascript" });
         res.end(readFileSync(req2.resolve("@xterm/addon-fit")));
+      } else if (req.url === "/assets/webgl.js") {
+        res.writeHead(200, { "content-type": "text/javascript" });
+        res.end(readFileSync(req2.resolve("@xterm/addon-webgl")));
+      } else if (devMode && (req.url === "/" || req.url === "/index.html")) {
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+        res.end(readFileSync(path.join(pkgRoot, "dev-client.html")));
       } else {
-        res.writeHead(404).end("not found");
+        res.writeHead(404).end(devMode ? "not found" : "prosperod");
       }
     } catch (e) {
       res.writeHead(500).end(String(e));
