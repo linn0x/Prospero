@@ -1,9 +1,14 @@
+import nacl from "tweetnacl";
 import { describe, expect, it } from "vitest";
 import {
   ProtocolError,
-  clientHandshake,
+  SecureChannel,
+  clientHandshakeFinish,
+  clientHandshakeStart,
+  fromB64,
   generateKeyPairB64,
-  serverAcceptHandshake,
+  serverHandshakeAccept,
+  serverHandshakeRespond,
   type C2SHello,
 } from "../src/index.js";
 
@@ -16,16 +21,27 @@ function makeHello(): C2SHello {
   };
 }
 
+/** 跑完三帧握手,返回两端通道与沿途的帧(测试要检查线上内容)。 */
+function handshake(daemon = generateKeyPairB64(), hello = makeHello()) {
+  const start = clientHandshakeStart();
+  const responded = serverHandshakeRespond(start.frame, daemon.secretKey);
+  const finished = clientHandshakeFinish(start.state, responded.frame, daemon.publicKey, hello);
+  const accepted = serverHandshakeAccept(responded.state, finished.frame);
+  return {
+    daemon,
+    hello,
+    client: finished.channel,
+    server: accepted.channel,
+    accepted,
+    start,
+    responded,
+  };
+}
+
 describe("handshake + SecureChannel", () => {
   it("完成握手并双向收发", () => {
-    const daemon = generateKeyPairB64();
-    const hello = makeHello();
-    const { frame, channel: client } = clientHandshake(daemon.publicKey, hello);
-    const { hello: got, channel: server } = serverAcceptHandshake(
-      frame,
-      daemon.secretKey,
-    );
-    expect(got).toEqual(hello);
+    const { hello, accepted, client, server } = handshake();
+    expect(accepted.hello).toEqual(hello);
 
     // S→C 与 C→S 各连发多条,顺序解密
     for (let i = 0; i < 5; i++) {
@@ -37,46 +53,95 @@ describe("handshake + SecureChannel", () => {
   });
 
   it("拒绝重放(计数器前移后同帧解密失败)", () => {
-    const daemon = generateKeyPairB64();
-    const { frame, channel: client } = clientHandshake(daemon.publicKey, makeHello());
-    const { channel: server } = serverAcceptHandshake(frame, daemon.secretKey);
+    const { client, server } = handshake();
     const f = client.seal({ a: 1 });
     expect(server.open(f)).toEqual({ a: 1 });
     expect(() => server.open(f)).toThrowError(ProtocolError);
   });
 
   it("拒绝篡改的密文", () => {
-    const daemon = generateKeyPairB64();
-    const { frame, channel: client } = clientHandshake(daemon.publicKey, makeHello());
-    const { channel: server } = serverAcceptHandshake(frame, daemon.secretKey);
+    const { client, server } = handshake();
     const parsed = JSON.parse(client.seal({ secret: true })) as { c: string };
     const i = 3;
     const flipped =
       parsed.c.slice(0, i) + (parsed.c[i] === "A" ? "B" : "A") + parsed.c.slice(i + 1);
-    expect(() => server.open(JSON.stringify({ c: flipped }))).toThrowError(
+    expect(() => server.open(JSON.stringify({ c: flipped }))).toThrowError(/decrypt failed/);
+  });
+
+  it("冒充 daemon 的中间人过不了身份证明", () => {
+    const real = generateKeyPairB64();
+    const impostor = generateKeyPairB64();
+    const start = clientHandshakeStart();
+    // 攻击者用自己的密钥回应,客户端却是拿 real 的公钥去验
+    const responded = serverHandshakeRespond(start.frame, impostor.secretKey);
+    expect(() =>
+      clientHandshakeFinish(start.state, responded.frame, real.publicKey, makeHello()),
+    ).toThrowError(/identity proof failed/);
+  });
+
+  it("身份证明绑定本次客户端临时公钥,旧响应无法重放到新连接", () => {
+    const daemon = generateKeyPairB64();
+    const first = clientHandshakeStart();
+    const respondedToFirst = serverHandshakeRespond(first.frame, daemon.secretKey);
+
+    const second = clientHandshakeStart();
+    expect(() =>
+      clientHandshakeFinish(second.state, respondedToFirst.frame, daemon.publicKey, makeHello()),
+    ).toThrowError(/identity proof failed/);
+  });
+
+  it("hello 不再出现在静态密钥保护的帧里 —— token 不随静态密钥泄漏而暴露", () => {
+    const { start, responded } = handshake();
+    // 前两帧线上只有临时公钥和证明,没有任何密文承载 hello
+    const f1 = JSON.parse(start.frame) as Record<string, unknown>;
+    expect(Object.keys(f1).sort()).toEqual(["eph", "v"]);
+    const f2 = JSON.parse(responded.frame) as Record<string, unknown>;
+    expect(Object.keys(f2).sort()).toEqual(["p", "seph"]);
+  });
+
+  it("前向保密:静态私钥泄漏也解不开已录下的历史会话", () => {
+    const daemon = generateKeyPairB64();
+    const { client, start, responded } = handshake(daemon);
+    const recorded = client.seal({ 机密: "历史流量" });
+
+    // 攻击者事后拿到 identity.json,且录下了全部握手帧
+    const clientEph = fromB64((JSON.parse(start.frame) as { eph: string }).eph);
+    const serverEph = fromB64((JSON.parse(responded.frame) as { seph: string }).seph);
+
+    // 静态密钥能重算出「证明密钥」—— 在 v0 里这就是会话密钥,历史流量当场沦陷
+    const proofKey = nacl.box.before(clientEph, fromB64(daemon.secretKey));
+    expect(() => new SecureChannel(proofKey, 2, 0, 0).open(recorded)).toThrowError(
+      /decrypt failed/,
+    );
+
+    // 静态密钥与服务端临时公钥的组合同样无用:会话密钥要某一侧的临时【私钥】,
+    // 而两侧用完即弃,磁盘上没有留下
+    const staticToServerEph = nacl.box.before(serverEph, fromB64(daemon.secretKey));
+    expect(() => new SecureChannel(staticToServerEph, 2, 0, 0).open(recorded)).toThrowError(
       /decrypt failed/,
     );
   });
 
-  it("拒绝版本不匹配的握手", () => {
+  it("拒绝版本不匹配的握手,不降级", () => {
     const daemon = generateKeyPairB64();
-    const { frame } = clientHandshake(daemon.publicKey, makeHello());
+    const { frame } = clientHandshakeStart();
     const f = JSON.parse(frame) as { v: number };
-    f.v = 99;
+    f.v = 0; // v0 旧客户端
     try {
-      serverAcceptHandshake(JSON.stringify(f), daemon.secretKey);
+      serverHandshakeRespond(JSON.stringify(f), daemon.secretKey);
       expect.unreachable();
     } catch (e) {
       expect((e as ProtocolError).code).toBe("version");
     }
   });
 
-  it("拒绝错误的 daemon 私钥(密钥不匹配)", () => {
+  it("用错 daemon 私钥时客户端验不过证明", () => {
     const daemon = generateKeyPairB64();
     const other = generateKeyPairB64();
-    const { frame } = clientHandshake(daemon.publicKey, makeHello());
+    const start = clientHandshakeStart();
+    const responded = serverHandshakeRespond(start.frame, other.secretKey);
     try {
-      serverAcceptHandshake(frame, other.secretKey);
+      clientHandshakeFinish(start.state, responded.frame, daemon.publicKey, makeHello());
       expect.unreachable();
     } catch (e) {
       expect((e as ProtocolError).code).toBe("crypto");
@@ -85,10 +150,10 @@ describe("handshake + SecureChannel", () => {
 
   it("拒绝垃圾输入", () => {
     const daemon = generateKeyPairB64();
-    expect(() => serverAcceptHandshake("not json", daemon.secretKey)).toThrowError(
+    expect(() => serverHandshakeRespond("not json", daemon.secretKey)).toThrowError(
       ProtocolError,
     );
-    expect(() => serverAcceptHandshake('{"x":1}', daemon.secretKey)).toThrowError(
+    expect(() => serverHandshakeRespond('{"x":1}', daemon.secretKey)).toThrowError(
       ProtocolError,
     );
   });

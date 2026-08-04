@@ -1,16 +1,30 @@
 /**
- * E2E 加密通道(NaCl / tweetnacl)。
+ * E2E 加密通道(NaCl / tweetnacl),带前向保密。
  *
  * 信任模型:配对 QR 携带 daemon 静态 X25519 公钥 + token。
- * 每次连接客户端生成【临时】密钥对 → 与 daemon 静态公钥做 DH 得到本连接共享密钥,
- * 因此计数器 nonce 不会跨连接复用(临时密钥保证共享密钥每连接新鲜)。
  *
- * 帧格式(WebSocket 文本帧):
- * - 首帧 C→S(握手):{"v":0,"eph":"<b64 临时公钥>","c":"<b64 密文>"}
- *   密文 = box(hello JSON, nonce(C→S, 0), daemonPub, ephSecret)
- * - 之后双向:{"c":"<b64 密文>"},nonce 为隐式计数器(方向字节 + 8 字节 BE 计数),
- *   TCP/WS 保序,无需传输 nonce;计数器错位/篡改 → open 失败即断连。
- *   顺带获得防重放:同一帧重放会因计数器前移而解密失败。
+ * 【为什么是三帧】v0 用「客户端临时密钥 × daemon 静态密钥」直接当会话密钥。
+ * 那样只要 identity.json 泄漏,任何被录下的历史流量都能解密 —— 连 hello 里的
+ * token 也一起暴露。静态密钥是长期存在磁盘上的,这个假设不该被依赖。
+ *
+ * 现在会话密钥由【双方临时密钥】的 DH 得出,静态密钥只用来【证明身份】:
+ *
+ *   1. C→S  {v, eph}                    客户端临时公钥(明文 —— 公钥本就是公开的)
+ *   2. S→C  {seph, p}                   daemon 临时公钥 + 身份证明
+ *                                       p = box(seph‖eph, 静态密钥 × eph)
+ *                                       只有持有 daemon 静态私钥的才造得出;
+ *                                       证明里绑了 eph,旧响应无法重放。
+ *   3. C→S  {c}                         此后全部走会话密钥,首帧是 hello(含 token)
+ *
+ *   会话密钥 = DH(客户端临时私钥, daemon 临时公钥)
+ *
+ * 于是静态私钥泄漏后,攻击者能伪造【将来】的身份证明(所以仍要保管好),
+ * 但推不出【过去】任一会话的密钥 —— 那需要某一侧的临时私钥,而它们用完即弃。
+ * token 也因此不再暴露于历史流量。
+ *
+ * 数据帧:{"c":"<b64 密文>"},nonce 为隐式计数器(方向字节 + 8 字节 BE 计数),
+ * TCP/WS 保序,无需传输 nonce;计数器错位/篡改 → open 失败即断连。
+ * 顺带获得防重放:同一帧重放会因计数器前移而解密失败。
  */
 import nacl from "tweetnacl";
 import { fromB64, toB64 } from "./b64.js";
@@ -45,10 +59,35 @@ function nonceFor(dir: Dir, counter: number): Uint8Array {
   return n;
 }
 
-interface HandshakeFrame {
+/**
+ * 身份证明用的 nonce。它用的是「静态密钥 × 客户端临时密钥」派生的密钥,
+ * 而客户端临时密钥每次连接都是新的,所以这把密钥只加密这一条消息,
+ * 固定 nonce 不构成复用。
+ */
+const PROOF_NONCE = new Uint8Array(nacl.box.nonceLength).fill(0);
+
+function proofPayload(serverEph: Uint8Array, clientEph: Uint8Array): Uint8Array {
+  const out = new Uint8Array(serverEph.length + clientEph.length);
+  out.set(serverEph, 0);
+  out.set(clientEph, serverEph.length);
+  return out;
+}
+
+function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i]! ^ b[i]!;
+  return diff === 0;
+}
+
+interface ClientHelloFrame {
   v: number;
   eph: string;
-  c: string;
+}
+
+interface ServerProofFrame {
+  seph: string;
+  p: string;
 }
 
 interface DataFrame {
@@ -71,11 +110,7 @@ export class SecureChannel {
 
   seal(obj: unknown): string {
     const nonce = nonceFor(this.sendDir, this.sendCount++);
-    const boxed = nacl.box.after(
-      utf8Encode(JSON.stringify(obj)),
-      nonce,
-      this.sharedKey,
-    );
+    const boxed = nacl.box.after(utf8Encode(JSON.stringify(obj)), nonce, this.sharedKey);
     const frame: DataFrame = { c: toB64(boxed) };
     return JSON.stringify(frame);
   }
@@ -108,54 +143,100 @@ export class SecureChannel {
   }
 }
 
-export interface ClientHandshakeResult {
+// ---------------------------------------------------------------- 客户端
+
+export interface ClientHandshakeState {
+  ephPublic: Uint8Array;
+  ephSecret: Uint8Array;
+}
+
+export interface ClientHandshakeStart {
   /** 作为 WS 首帧原样发送 */
+  frame: string;
+  state: ClientHandshakeState;
+}
+
+/** 第 1 步:发出客户端临时公钥。 */
+export function clientHandshakeStart(): ClientHandshakeStart {
+  const eph = nacl.box.keyPair();
+  const frame: ClientHelloFrame = { v: PROTOCOL_VERSION, eph: toB64(eph.publicKey) };
+  return {
+    frame: JSON.stringify(frame),
+    state: { ephPublic: eph.publicKey, ephSecret: eph.secretKey },
+  };
+}
+
+export interface ClientHandshakeFinish {
+  /** 加密后的 hello,作为第 3 帧发送 */
   frame: string;
   channel: SecureChannel;
 }
 
-/** 客户端:生成临时密钥对并封装加密的 hello 首帧 */
-export function clientHandshake(
+/**
+ * 第 3 步:校验 daemon 身份证明,派生会话密钥,封装 hello。
+ * 证明验不过就必须断连 —— 那意味着对面不持有配对时记下的静态私钥(中间人)。
+ */
+export function clientHandshakeFinish(
+  state: ClientHandshakeState,
+  serverFrameText: string,
   daemonPubKeyB64: string,
   hello: C2SHello,
-): ClientHandshakeResult {
-  const eph = nacl.box.keyPair();
-  const shared = nacl.box.before(fromB64(daemonPubKeyB64), eph.secretKey);
-  const boxed = nacl.box.after(
-    utf8Encode(JSON.stringify(hello)),
-    nonceFor(DIR_C2S, 0),
-    shared,
-  );
-  const frame: HandshakeFrame = {
-    v: PROTOCOL_VERSION,
-    eph: toB64(eph.publicKey),
-    c: toB64(boxed),
-  };
-  // hello 用掉了 C→S 计数 0,后续从 1 起
-  return {
-    frame: JSON.stringify(frame),
-    channel: new SecureChannel(shared, DIR_C2S, 1, 0),
-  };
-}
-
-export interface ServerHandshakeResult {
-  hello: C2SHello;
-  channel: SecureChannel;
-}
-
-/** daemon:接受首帧,校验版本与 hello 结构,建立通道 */
-export function serverAcceptHandshake(
-  frameText: string,
-  daemonSecretKeyB64: string,
-): ServerHandshakeResult {
+): ClientHandshakeFinish {
   let frame: unknown;
   try {
-    frame = JSON.parse(frameText);
+    frame = JSON.parse(serverFrameText);
+  } catch {
+    throw new ProtocolError("server handshake frame is not JSON", "format");
+  }
+  const f = frame as Partial<ServerProofFrame> | null;
+  if (typeof f?.seph !== "string" || typeof f?.p !== "string") {
+    throw new ProtocolError("server handshake frame missing fields", "format");
+  }
+  const serverEph = fromB64(f.seph);
+  if (serverEph.length !== nacl.box.publicKeyLength) {
+    throw new ProtocolError("bad server ephemeral key length", "format");
+  }
+
+  // 用「daemon 静态公钥 × 自己的临时私钥」验证证明
+  const proofKey = nacl.box.before(fromB64(daemonPubKeyB64), state.ephSecret);
+  const opened = nacl.box.open.after(fromB64(f.p), PROOF_NONCE, proofKey);
+  if (!opened || !equalBytes(opened, proofPayload(serverEph, state.ephPublic))) {
+    throw new ProtocolError(
+      "daemon identity proof failed — wrong host, or man in the middle",
+      "crypto",
+    );
+  }
+
+  const sessionKey = nacl.box.before(serverEph, state.ephSecret);
+  const channel = new SecureChannel(sessionKey, DIR_C2S, 0, 0);
+  return { frame: channel.seal(hello), channel };
+}
+
+// ---------------------------------------------------------------- 服务端
+
+export interface ServerHandshakeState {
+  sessionKey: Uint8Array;
+}
+
+export interface ServerHandshakeRespond {
+  /** 回给客户端的第 2 帧 */
+  frame: string;
+  state: ServerHandshakeState;
+}
+
+/** 第 2 步:校验版本,生成自己的临时密钥,回临时公钥 + 身份证明。 */
+export function serverHandshakeRespond(
+  clientFrameText: string,
+  daemonSecretKeyB64: string,
+): ServerHandshakeRespond {
+  let frame: unknown;
+  try {
+    frame = JSON.parse(clientFrameText);
   } catch {
     throw new ProtocolError("handshake frame is not JSON", "format");
   }
-  const f = frame as Partial<HandshakeFrame> | null;
-  if (typeof f?.eph !== "string" || typeof f?.c !== "string") {
+  const f = frame as Partial<ClientHelloFrame> | null;
+  if (typeof f?.eph !== "string") {
     throw new ProtocolError("handshake frame missing fields", "format");
   }
   if (f.v !== PROTOCOL_VERSION) {
@@ -164,31 +245,46 @@ export function serverAcceptHandshake(
       "version",
     );
   }
-  const eph = fromB64(f.eph);
-  if (eph.length !== nacl.box.publicKeyLength) {
+  const clientEph = fromB64(f.eph);
+  if (clientEph.length !== nacl.box.publicKeyLength) {
     throw new ProtocolError("bad ephemeral key length", "format");
   }
-  const shared = nacl.box.before(eph, fromB64(daemonSecretKeyB64));
-  const opened = nacl.box.open.after(
-    fromB64(f.c),
-    nonceFor(DIR_C2S, 0),
-    shared,
+
+  const serverEph = nacl.box.keyPair();
+  // 证明绑定了客户端临时公钥,旧连接的响应因此无法被重放到新连接上
+  const proofKey = nacl.box.before(clientEph, fromB64(daemonSecretKeyB64));
+  const proof = nacl.box.after(
+    proofPayload(serverEph.publicKey, clientEph),
+    PROOF_NONCE,
+    proofKey,
   );
-  if (!opened) {
-    throw new ProtocolError("handshake decrypt failed", "crypto");
-  }
+
+  const sessionKey = nacl.box.before(clientEph, serverEph.secretKey);
+  const out: ServerProofFrame = { seph: toB64(serverEph.publicKey), p: toB64(proof) };
+  return { frame: JSON.stringify(out), state: { sessionKey } };
+}
+
+export interface ServerHandshakeResult {
+  hello: C2SHello;
+  channel: SecureChannel;
+}
+
+/** 第 4 步:用会话密钥解开 hello 并校验结构。token 的比对在 pairing 层。 */
+export function serverHandshakeAccept(
+  state: ServerHandshakeState,
+  helloFrameText: string,
+): ServerHandshakeResult {
+  const channel = new SecureChannel(state.sessionKey, DIR_S2C, 0, 0);
   let helloRaw: unknown;
   try {
-    helloRaw = JSON.parse(utf8Decode(opened));
-  } catch {
-    throw new ProtocolError("hello payload is not JSON", "format");
+    helloRaw = channel.open(helloFrameText);
+  } catch (e) {
+    if (e instanceof ProtocolError) throw e;
+    throw new ProtocolError("hello frame could not be opened", "crypto");
   }
   const parsed = C2SHelloSchema.safeParse(helloRaw);
   if (!parsed.success) {
     throw new ProtocolError("hello payload failed validation", "format");
   }
-  return {
-    hello: parsed.data,
-    channel: new SecureChannel(shared, DIR_S2C, 0, 1),
-  };
+  return { hello: parsed.data, channel };
 }

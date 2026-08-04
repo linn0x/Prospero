@@ -11,7 +11,8 @@
  */
 import { AppState, Platform } from "react-native";
 import {
-  clientHandshake,
+  clientHandshakeStart,
+  clientHandshakeFinish,
   parseS2C,
   toB64,
   utf8Encode,
@@ -208,15 +209,10 @@ export class HostConnection {
           if (--pending === 0) finishFailure();
           continue;
         }
-        const { frame, channel } = clientHandshake(this.host.daemonPub, {
-          type: "hello",
-          token: this.host.token,
-          clientPubKey: this.keys.publicKey,
-          clientInfo: {
-            platform: Platform.OS === "android" ? "android" : "ios",
-            appVersion: APP_VERSION,
-          },
-        });
+        // v1 握手三帧:发临时公钥 → 收 daemon 临时公钥+身份证明 → 发加密 hello。
+        // 会话密钥来自双方临时密钥,daemon 静态私钥日后泄漏也解不开今天的流量。
+        const { frame, state: hsState } = clientHandshakeStart();
+        let channel: SecureChannel | null = null;
 
         const fail = (failure: AttemptResult["failure"], detail?: string): void => {
           clearTimeout(timer);
@@ -248,6 +244,26 @@ export class HostConnection {
         ws.onclose = () => fail(opened ? "handshake" : "unreachable");
         ws.onmessage = (ev) => {
           try {
+            // 第 2 帧:验 daemon 身份证明,派生会话密钥,再把 hello 发出去
+            if (channel === null) {
+              const finished = clientHandshakeFinish(
+                hsState,
+                String(ev.data),
+                this.host.daemonPub,
+                {
+                  type: "hello",
+                  token: this.host.token,
+                  clientPubKey: this.keys.publicKey,
+                  clientInfo: {
+                    platform: Platform.OS === "android" ? "android" : "ios",
+                    appVersion: APP_VERSION,
+                  },
+                },
+              );
+              channel = finished.channel;
+              ws.send(finished.frame);
+              return;
+            }
             const msg = parseS2C(channel.open(String(ev.data)));
             if (msg.type === "error" && msg.code === "auth_failed") {
               fail("auth", msg.message);
