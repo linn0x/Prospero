@@ -7,6 +7,20 @@
 - 架构探索与技术选型:[docs/architecture-exploration.md](docs/architecture-exploration.md)
 - M1 实施计划(执行中):[docs/m1-plan.md](docs/m1-plan.md)
 
+## 快速开始(M1)
+
+```bash
+npm install && npm run typecheck        # 构建 protocol/daemon
+
+# Mac 侧
+node apps/daemon/dist/cli.js start      # 启动 daemon(加 --dev 可用浏览器调试页)
+node apps/daemon/dist/cli.js pair       # 生成手机配对二维码
+
+# iPhone 侧(需 Xcode + 真机)
+cd apps/mobile && npx expo run:ios --device
+# App 内「扫码配对」→ 允许本地网络权限 → 新建会话
+```
+
 ## 规划形态
 
 - **prosperod** — macOS 常驻 daemon(Node 22 / TypeScript):PTY 通用轨 + 各 agent 结构化适配(Agent SDK / opencode serve / codex app-server),WebSocket 统一协议,mDNS + QR 配对
