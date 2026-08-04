@@ -35,8 +35,11 @@ import { StatusFile } from "./status-file.js";
 import {
   FsError,
   listDir,
+  makeDir,
   readChunk,
   readForEdit,
+  removeEntry,
+  renameEntry,
   writeChunk,
   writeFileAt,
 } from "./fs-ops.js";
@@ -450,6 +453,9 @@ export async function createDaemonServer(
       case "fs.write":
       case "fs.get":
       case "fs.put":
+      case "fs.mkdir":
+      case "fs.remove":
+      case "fs.rename":
         await handleFs(conn, msg);
         return;
     }
@@ -509,6 +515,21 @@ export async function createDaemonServer(
             total: c.total,
             eof: c.eof,
           });
+          return;
+        }
+        case "fs.mkdir": {
+          await makeDir(root, msg.path);
+          send(conn, { type: "fs.done", sid: msg.sid, path: msg.path, op: "mkdir" });
+          return;
+        }
+        case "fs.remove": {
+          await removeEntry(root, msg.path);
+          send(conn, { type: "fs.done", sid: msg.sid, path: msg.path, op: "remove" });
+          return;
+        }
+        case "fs.rename": {
+          await renameEntry(root, msg.path, msg.to);
+          send(conn, { type: "fs.done", sid: msg.sid, path: msg.path, op: "rename" });
           return;
         }
         case "fs.put": {

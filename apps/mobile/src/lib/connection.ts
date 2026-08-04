@@ -66,6 +66,8 @@ export interface ConnEvents extends Record<string, unknown> {
   agentEvent: S2CAgentEvent;
   toolOutput: S2CToolOutput;
   serverError: S2CError;
+  /** 验收打点:A1 attach 上屏、A5 回前台恢复 */
+  metric: { name: "attach" | "resume"; sid?: string; ms: number };
 }
 
 export class HostConnection {
@@ -316,6 +318,13 @@ export class HostConnection {
   }
 
   private adopt(won: Won): void {
+    if (this.foregroundAt !== null) {
+      // A5 验收:iOS 挂起会掐断 socket,回前台后重连完成才算恢复
+      const ms = Date.now() - this.foregroundAt;
+      this.foregroundAt = null;
+      this.lastResumeMs = ms;
+      this.events.emit("metric", { name: "resume", ms });
+    }
     this.connecting = false;
     this.backoff = BACKOFF_MIN;
     this.everConnected = true;
@@ -380,9 +389,18 @@ export class HostConnection {
       case "session.state":
         useApp.getState().upsertSession(this.host.id, msg.session);
         return;
-      case "term.snapshot":
+      case "term.snapshot": {
+        // A1 验收:attach → 快照到达。真机上没有别的办法拿到这个数,
+        // 靠"主观秒开"是填不了验收表的。
+        const started = this.attachStartedAt.get(msg.sid);
+        if (started !== undefined) {
+          this.attachStartedAt.delete(msg.sid);
+          this.lastAttachMs = Date.now() - started;
+          this.events.emit("metric", { name: "attach", sid: msg.sid, ms: this.lastAttachMs });
+        }
         this.events.emit("snapshot", msg);
         return;
+      }
       case "term.output":
         this.events.emit("output", msg);
         return;
@@ -399,6 +417,7 @@ export class HostConnection {
       case "fs.content":
       case "fs.written":
       case "fs.chunk":
+      case "fs.done":
         this.resolveFs(msg);
         return;
       case "error":
@@ -499,6 +518,22 @@ export class HostConnection {
     return this.fsRequest(sid, path, { type: "fs.get", sid, path, offset, length });
   }
 
+  fsMkdir(sid: string, path: string): Promise<Extract<S2CMessage, { type: "fs.done" }>> {
+    return this.fsRequest(sid, path, { type: "fs.mkdir", sid, path });
+  }
+
+  fsRemove(sid: string, path: string): Promise<Extract<S2CMessage, { type: "fs.done" }>> {
+    return this.fsRequest(sid, path, { type: "fs.remove", sid, path });
+  }
+
+  fsRename(
+    sid: string,
+    path: string,
+    to: string,
+  ): Promise<Extract<S2CMessage, { type: "fs.done" }>> {
+    return this.fsRequest(sid, path, { type: "fs.rename", sid, path, to });
+  }
+
   fsPutChunk(
     sid: string,
     path: string,
@@ -583,7 +618,20 @@ export class HostConnection {
     );
   }
 
+  /** 最近一次 attach 到快照上屏的耗时(ms);A1 验收指标 */
+  lastAttachMs: number | null = null;
+  /** 供 AppState 标记回前台时刻 */
+  markForeground(at: number): void {
+    if (!this.isConnected) this.foregroundAt = at;
+  }
+
+  /** 最近一次"回前台 → 重新连上"的耗时(ms);A5 验收指标 */
+  lastResumeMs: number | null = null;
+  private foregroundAt: number | null = null;
+  private attachStartedAt = new Map<string, number>();
+
   attach(sid: string, lastSeq?: number): void {
+    this.attachStartedAt.set(sid, Date.now());
     this.send({ type: "session.attach", sid, ...(lastSeq !== undefined ? { lastSeq } : {}) });
   }
 
@@ -659,7 +707,13 @@ export function wireAppStateReconnect(): void {
   appStateWired = true;
   AppState.addEventListener("change", (state) => {
     if (state === "active") {
-      for (const conn of connections.values()) conn.kick();
+      // A5 的计时起点是"回到前台的那一刻",不是重连开始的那一刻 ——
+      // 用户感知的等待从看到屏幕就开始了
+      const now = Date.now();
+      for (const conn of connections.values()) {
+        conn.markForeground(now);
+        conn.kick();
+      }
     }
   });
 }
