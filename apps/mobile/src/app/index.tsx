@@ -9,6 +9,7 @@ import {
 } from "react-native";
 import { Stack, router, useFocusEffect } from "expo-router";
 import { Icon } from "@/components/Icon";
+import { SwipeRow } from "@/components/SwipeRow";
 import { getHosts, removeHost, type StoredHost } from "@/lib/hosts";
 import { useApp, type ConnStatus } from "@/lib/store";
 
@@ -43,19 +44,12 @@ export default function HostsScreen() {
   );
 
   const onDelete = (h: StoredHost): void => {
-    Alert.alert("删除主机", `移除「${h.name}」的配对?`, [
-      { text: "取消", style: "cancel" },
-      {
-        text: "删除",
-        style: "destructive",
-        onPress: () => {
-          void removeHost(h.id).then(() => getHosts()).then((rest) => {
-            setLocal(rest);
-            setHosts(rest);
-          });
-        },
-      },
-    ]);
+    void removeHost(h.id)
+      .then(() => getHosts())
+      .then((rest) => {
+        setLocal(rest);
+        setHosts(rest);
+      });
   };
 
   return (
@@ -88,13 +82,32 @@ export default function HostsScreen() {
           data={hosts}
           keyExtractor={(h) => h.id}
           contentContainerStyle={styles.list}
+          ListFooterComponent={
+            hosts.length > 0 ? (
+              <Text style={styles.swipeHint}>左滑主机可删除配对</Text>
+            ) : null
+          }
           renderItem={({ item }) => {
             const status = runtimes[item.id]?.status ?? "idle";
             return (
+              <SwipeRow
+                actions={[
+                  {
+                    label: "删除",
+                    symbol: "trash",
+                    color: "#e5534b",
+                    onPress: () => onDelete(item),
+                    confirm: {
+                      title: `移除「${item.name}」的配对?`,
+                      message: "凭证会从这台手机删除,要再用得重新扫码配对。",
+                      confirmLabel: "删除",
+                    },
+                  },
+                ]}
+              >
               <Pressable
                 style={({ pressed }) => [styles.card, pressed && styles.cardPressed]}
                 onPress={() => router.push(`/host/${item.id}`)}
-                onLongPress={() => onDelete(item)}
               >
                 <View style={[styles.dot, { backgroundColor: statusColor[status] }]} />
                 <View style={styles.cardBody}>
@@ -105,6 +118,7 @@ export default function HostsScreen() {
                   </Text>
                 </View>
               </Pressable>
+              </SwipeRow>
             );
           }}
         />
@@ -149,5 +163,11 @@ const styles = StyleSheet.create({
   dot: { width: 10, height: 10, borderRadius: 5 },
   cardBody: { flex: 1, gap: 2 },
   cardTitle: { color: "#e8e8ee", fontSize: 16, fontWeight: "600" },
+  swipeHint: {
+    color: "#5a5a66",
+    fontSize: 11,
+    textAlign: "center",
+    paddingVertical: 14,
+  },
   cardSub: { color: "#8a8a96", fontSize: 12 },
 });
