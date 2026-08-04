@@ -11,6 +11,8 @@
  */
 import { AppState, Platform } from "react-native";
 import {
+  CLOSE_AUTH_FAILED,
+  CLOSE_REVOKED,
   clientHandshakeStart,
   clientHandshakeFinish,
   parseS2C,
@@ -241,7 +243,20 @@ export class HostConnection {
           ws.send(frame);
         };
         ws.onerror = () => fail(opened ? "handshake" : "unreachable");
-        ws.onclose = () => fail(opened ? "handshake" : "unreachable");
+        // 关闭码是 daemon 唯一能在断开时留下的话。以前这里把它整个丢掉,
+        // 于是"设备被撤销""版本不符"都显示成含糊的「握手失败」。
+        ws.onclose = (ev) => {
+          if (!opened) {
+            fail("unreachable");
+            return;
+          }
+          const code = (ev as { code?: number } | undefined)?.code;
+          const reason = String((ev as { reason?: unknown } | undefined)?.reason ?? "");
+          if (code === CLOSE_AUTH_FAILED) fail("auth", reason || undefined);
+          else if (code === CLOSE_REVOKED) fail("revoked", reason || undefined);
+          else if (reason === "version") fail("version");
+          else fail("handshake", reason || undefined);
+        };
         ws.onmessage = (ev) => {
           try {
             // 第 2 帧:验 daemon 身份证明,派生会话密钥,再把 hello 发出去
@@ -284,6 +299,15 @@ export class HostConnection {
             ws.onerror = null;
             resolve({ ws, channel, helloOk: msg, addr, rttMs: Date.now() - startedAt });
           } catch (e) {
+            // 身份证明失败是安全事件,不是普通握手错误
+            if (e instanceof ProtocolError && e.code === "untrusted") {
+              fail("untrusted", e.message);
+              return;
+            }
+            if (e instanceof ProtocolError && e.code === "version") {
+              fail("version");
+              return;
+            }
             fail("handshake", e instanceof ProtocolError ? e.code : undefined);
           }
         };

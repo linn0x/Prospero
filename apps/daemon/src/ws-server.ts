@@ -14,6 +14,9 @@ import {
   ProtocolError,
   fromB64,
   parseC2S,
+  CLOSE_AUTH_FAILED,
+  CLOSE_PROTOCOL,
+  CLOSE_REVOKED,
   serverHandshakeAccept,
   serverHandshakeRespond,
   type ServerHandshakeState,
@@ -311,7 +314,7 @@ export async function createDaemonServer(
         message: "invalid token, or device key changed",
       });
       conn.channel = null;
-      conn.ws.close(4001, "auth failed");
+      conn.ws.close(CLOSE_AUTH_FAILED, "auth failed");
       return;
     }
     conn.channel = channel;
@@ -430,11 +433,11 @@ export async function createDaemonServer(
     } catch (e) {
       if (conn.device === null) {
         // 握手阶段的任何失败直接断开(无法安全回话)
-        conn.ws.close(4003, e instanceof ProtocolError ? e.code : "handshake error");
+        conn.ws.close(CLOSE_PROTOCOL, e instanceof ProtocolError ? e.code : "handshake error");
         return;
       }
       if (e instanceof ProtocolError && e.code === "crypto") {
-        conn.ws.close(4003, "crypto"); // 计数器错位/篡改,通道不可信
+        conn.ws.close(CLOSE_PROTOCOL, "crypto"); // 计数器错位/篡改,通道不可信
         return;
       }
       if (e instanceof ProtocolError) {
@@ -538,7 +541,7 @@ export async function createDaemonServer(
       }
       conn.device = null;
       // 4003 是握手/加密错误,撤销要能被客户端区分开(前者重试有意义,后者必须重新配对)
-      conn.ws.close(4004, "revoked");
+      conn.ws.close(CLOSE_REVOKED, "revoked");
     }
   }
 

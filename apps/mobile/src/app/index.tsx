@@ -12,6 +12,14 @@ import { Icon } from "@/components/Icon";
 import { getHosts, removeHost, type StoredHost } from "@/lib/hosts";
 import { useApp, type ConnStatus } from "@/lib/store";
 
+const statusLabel: Record<ConnStatus, string> = {
+  idle: "未连接",
+  connecting: "连接中…",
+  reconnecting: "重连中…",
+  connected: "已连接",
+  failed: "连接失败",
+};
+
 const statusColor: Record<ConnStatus, string> = {
   idle: "#5a5a66",
   connecting: "#d9a441",
@@ -92,7 +100,8 @@ export default function HostsScreen() {
                 <View style={styles.cardBody}>
                   <Text style={styles.cardTitle}>{item.name}</Text>
                   <Text style={styles.cardSub}>
-                    {item.addrs.join(" · ")} : {item.port}
+                    {statusLabel[status]}
+                    {item.addrs.length > 1 ? ` · ${String(item.addrs.length)} 条线路` : ""}
                   </Text>
                 </View>
               </Pressable>
