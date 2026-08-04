@@ -149,6 +149,11 @@ struct MenuContent: View {
 
     Divider()
 
+    if daemon.running?.isStale(cliPath: Locator.findCLI()) == true {
+      Text("⚠︎ daemon 比磁盘上的代码旧 —— 改过代码就重启它")
+      Button("重启 daemon 以加载新代码") { daemon.restart() }
+    }
+
     SessionsSection(running: daemon.running)
 
     Divider()

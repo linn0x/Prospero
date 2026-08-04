@@ -4,6 +4,8 @@ import Foundation
 struct RunningStatus: Sendable, Equatable {
   var pid: Int32
   var startedAt: Double
+  /// daemon 加载的代码的构建时间;和磁盘上的 dist 比,能发现"忘了重启"
+  var builtAt: Double
   var port: Int
   var bind: String?
   var sessions: [Session]
@@ -62,6 +64,7 @@ struct RunningStatus: Sendable, Equatable {
     return RunningStatus(
       pid: Int32(pid),
       startedAt: obj["startedAt"] as? Double ?? 0,
+      builtAt: obj["builtAt"] as? Double ?? 0,
       port: obj["port"] as? Int ?? 7423,
       bind: obj["bind"] as? String,
       sessions: rawSessions.compactMap { s in
@@ -84,4 +87,18 @@ struct RunningStatus: Sendable, Equatable {
   var processAlive: Bool { kill(pid, 0) == 0 || errno == EPERM }
 
   var pendingApprovals: Int { sessions.reduce(0) { $0 + $1.pendingPermissions } }
+
+  /// 磁盘上的 daemon 代码是否比正在跑的这份新。
+  /// 改完代码忘记重启会让手机侧的新功能被当成非法消息拒掉,而错误信息指不到原因。
+  func isStale(cliPath: String?) -> Bool {
+    guard builtAt > 0, let cliPath else { return false }
+    let dir = URL(fileURLWithPath: cliPath).deletingLastPathComponent()
+    let marker = dir.appendingPathComponent("status-file.js")
+    guard
+      let attrs = try? FileManager.default.attributesOfItem(atPath: marker.path),
+      let mtime = attrs[.modificationDate] as? Date
+    else { return false }
+    // 留 2 秒容差,避免同一次构建里的写入顺序造成误报
+    return mtime.timeIntervalSince1970 * 1000 > builtAt + 2000
+  }
 }

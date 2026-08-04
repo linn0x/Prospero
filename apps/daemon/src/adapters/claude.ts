@@ -25,6 +25,8 @@ import { AdapterError, summarize, type AdapterContext, type AgentAdapter } from 
 
 interface PendingPermission {
   resolve(result: PermissionResult): void;
+  /** 原始入参;允许时原样回传给 SDK */
+  input: Record<string, unknown>;
   /** 供 "始终允许" 使用:SDK 给出的规则建议 */
   suggestions: PermissionUpdate[];
   toolName: string;
@@ -129,6 +131,7 @@ export class ClaudeAdapter implements AgentAdapter {
       const reqId = randomUUID();
       this.pending.set(reqId, {
         resolve,
+        input,
         suggestions: options.suggestions ?? [],
         toolName,
       });
@@ -278,9 +281,15 @@ export class ClaudeAdapter implements AgentAdapter {
       p.resolve({ behavior: "deny", message: "用户在手机上拒绝了此操作" });
     } else if (reply === "always") {
       // 把 SDK 给的规则建议一并回传,后续同类操作不再询问
-      p.resolve({ behavior: "allow", updatedPermissions: p.suggestions });
+      p.resolve({
+        behavior: "allow",
+        updatedInput: p.input,
+        updatedPermissions: p.suggestions,
+      });
     } else {
-      p.resolve({ behavior: "allow" });
+      // updatedInput 类型上可选,但要显式把原始入参回传 —— 省略它时工具拿不到参数,
+      // 表现为工具"执行了"却什么也没做,模型反复重试直到 turn 永远不结束。
+      p.resolve({ behavior: "allow", updatedInput: p.input });
     }
     this.emit({ kind: "permission.resolved", reqId, reply });
   }
