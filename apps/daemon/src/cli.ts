@@ -7,7 +7,7 @@ import { createRequire } from "node:module";
 import os from "node:os";
 import { Command } from "commander";
 import { encodePairingQR } from "@prospero/protocol";
-import { advertise, candidateAddrs } from "./discovery.js";
+import { advertise, candidateAddrs, resolveBindAddr } from "./discovery.js";
 import { Notifier } from "./notify.js";
 import {
   DEFAULT_PORT,
@@ -31,18 +31,32 @@ program
   .command("start", { isDefault: true })
   .description("启动 daemon(WS 服务 + Bonjour 广播)")
   .option("-p, --port <port>", "监听端口", (v) => parseInt(v, 10))
+  .option(
+    "-b, --bind <addr>",
+    "只监听这个网卡/地址(如 utun10 或 10.0.0.2);默认全部网卡",
+  )
   .option("--dev", "开发模式:提供浏览器调试页,loopback 允许明文协议", false)
   .option("--name <name>", "对外显示的主机名")
-  .action(async (opts: { port?: number; dev: boolean; name?: string }) => {
+  .action(async (opts: { port?: number; bind?: string; dev: boolean; name?: string }) => {
     const home = prosperoHome();
     const config = loadConfig(home);
     const port = opts.port ?? config.port;
-    if (opts.port !== undefined && opts.port !== config.port) {
-      saveConfig(home, { ...config, port: opts.port }); // 记住端口,pair 命令要用同一个
+    // 0.0.0.0 是"取消绑定"的写法,不是一个要绑的地址
+    const rawBind = opts.bind ?? config.bind;
+    const bindSpec = rawBind && rawBind !== "0.0.0.0" ? rawBind : undefined;
+    // 记住端口与绑定,pair 命令要用同一份
+    if (
+      (opts.port !== undefined && opts.port !== config.port) ||
+      (opts.bind !== undefined && opts.bind !== config.bind)
+    ) {
+      const { bind: _dropped, ...rest } = config;
+      saveConfig(home, { ...rest, port, ...(bindSpec ? { bind: bindSpec } : {}) });
     }
+    const bindAddr = bindSpec ? resolveBindAddr(bindSpec) : undefined;
     const server = await createDaemonServer({
       home,
       port,
+      bindAddr,
       devMode: opts.dev,
       hostName: opts.name,
       notify: config.notify ?? null,
@@ -52,9 +66,15 @@ program
     const devices = loadDevices(home);
     console.log(`prosperod v0.0.1 已启动(home: ${home})`);
     console.log(`已配对设备: ${devices.length} 台${devices.length === 0 ? " —— 运行 `prosperod pair` 生成配对二维码" : ""}`);
-    console.log("监听地址(候选,客户端并发竞速):");
-    for (const addr of candidateAddrs()) {
-      console.log(`  ws://${addr}:${server.port}/ws`);
+    if (bindAddr) {
+      console.log(`监听地址(已绑定 ${bindSpec}${bindSpec === bindAddr ? "" : ` → ${bindAddr}`}):`);
+      console.log(`  ws://${bindAddr}:${server.port}/ws`);
+      console.log("  其余网卡不监听 —— 配对二维码也只会带这一个地址");
+    } else {
+      console.log("监听地址(候选,客户端并发竞速):");
+      for (const addr of candidateAddrs()) {
+        console.log(`  ws://${addr}:${server.port}/ws`);
+      }
     }
     if (opts.dev) {
       console.log(`开发调试页: http://127.0.0.1:${server.port}/`);
@@ -84,7 +104,11 @@ program
     const home = prosperoHome();
     const config = loadConfig(home);
     const device = mintDevice(home, { name: opts.name, allowShell: opts.shell });
-    const payload = buildPairingPayload(home, { token: device.token, port: config.port });
+    const payload = buildPairingPayload(home, {
+      token: device.token,
+      port: config.port,
+      bind: config.bind,
+    });
     if (payload.addrs.length === 0) {
       console.error("警告:未发现可用网卡地址(WiFi/WG 均未连接?),二维码不可用。");
     }
@@ -145,6 +169,7 @@ program
     console.log(`身份公钥:  ${identity.publicKey.slice(0, 12)}…`);
     console.log(`端口:      ${config.port}(默认 ${DEFAULT_PORT})`);
     console.log(`推送:      ${config.notify ? config.notify.url : "未配置"}`);
+    console.log(`监听:      ${config.bind ?? "0.0.0.0(全部网卡)"}`);
     console.log(`候选地址:  ${candidateAddrs().join(", ") || "(无)"}`);
     console.log(`设备(${devices.length}):`);
     for (const d of devices) {
