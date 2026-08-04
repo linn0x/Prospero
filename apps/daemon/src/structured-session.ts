@@ -16,6 +16,8 @@ import type { AgentAdapter } from "./adapters/types.js";
 
 /** 事件日志上限:超出后丢弃最旧的(快照会带 truncated 标记) */
 const MAX_EVENTS = 4000;
+/** 会话列表预览的截断长度 */
+const PREVIEW_CHARS = 140;
 
 export interface StructuredSessionOptions {
   id: string;
@@ -43,6 +45,11 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
   private status: SessionStatus = "starting";
   private readonly pending = new Set<string>();
   private disposed = false;
+  /** 会话列表预览:最后一条助手文本的开头(已剥掉 Markdown 标记) */
+  private preview = "";
+  private previewRaw = "";
+  private previewMsgId = "";
+  private busySince: number | undefined;
 
   constructor(opts: StructuredSessionOptions) {
     super();
@@ -73,6 +80,8 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
       cols: 80,
       rows: 24,
       pendingPermissions: this.pending.size,
+      ...(this.preview ? { preview: this.preview } : {}),
+      ...(this.busySince !== undefined ? { busySince: this.busySince } : {}),
     };
   }
 
@@ -95,6 +104,18 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     this.evSeq++;
     this.log.push(body);
     if (this.log.length > MAX_EVENTS) this.log.shift();
+
+    // 维护列表预览:累积当前助手消息的开头,新消息则重置
+    if (body.kind === "text.delta") {
+      if (body.msgId !== this.previewMsgId) {
+        this.previewMsgId = body.msgId;
+        this.previewRaw = "";
+      }
+      if (this.previewRaw.length < PREVIEW_CHARS * 2) {
+        this.previewRaw += body.delta;
+        this.preview = stripMarkdown(this.previewRaw).slice(0, PREVIEW_CHARS);
+      }
+    }
 
     // 审批状态直接驱动会话状态,列表里才能把"待审批"置顶
     if (body.kind === "permission.request") {
@@ -119,12 +140,16 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
   private setStatus(s: SessionStatus): void {
     if (this.status === s) return;
     this.status = s;
+    // running/waiting_approval 期间才计时,回到 idle 就清掉
+    this.busySince =
+      s === "running" || s === "waiting_approval" ? (this.busySince ?? Date.now()) : undefined;
     this.emit("state", this.info());
   }
 
   async send(text: string): Promise<void> {
     // 用户消息本地登记,保证 attach 快照里能看到自己发过什么
     this.record({ kind: "user.message", msgId: `u_${String(this.evSeq + 1)}`, text });
+    this.busySince = Date.now(); // 新一轮开始重新计时
     this.setStatus("running");
     await this.adapter.send(text);
   }
@@ -149,4 +174,20 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
 
 export function titleFor(agent: AgentKind, cwd: string): string {
   return `${agent} · ${path.basename(cwd)}`;
+}
+
+/** 列表预览里不该出现 Markdown 标记,剥成朴素文本 */
+export function stripMarkdown(src: string): string {
+  return src
+    .replace(/```[\s\S]*?(?:```|$)/g, " ") // 代码块整体去掉
+    .replace(/`([^`]*)`/g, "$1") // 行内代码保留内容
+    .replace(/^\s{0,3}#{1,6}\s+/gm, "") // 标题标记
+    .replace(/^\s*[-*+]\s+/gm, "") // 无序列表标记
+    .replace(/^\s*\d+[.)]\s+/gm, "") // 有序列表标记
+    .replace(/^\s*>\s?/gm, "") // 引用标记
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, "$1")
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1") // 链接留文字
+    .replace(/\s+/g, " ")
+    .trim();
 }

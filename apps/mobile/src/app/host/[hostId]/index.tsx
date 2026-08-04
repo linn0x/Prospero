@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   FlatList,
   Pressable,
+  ScrollView,
   StyleSheet,
   Text,
   TextInput,
@@ -13,12 +14,14 @@ import { sortSessions } from "@/lib/store";
 import { useHostConnection } from "@/lib/use-host-connection";
 
 const AGENTS: AgentKind[] = ["claude", "codex", "opencode", "grok", "trae", "shell"];
+/** 有结构化适配器的 agent(会话会以对话形态呈现) */
+const STRUCTURED: AgentKind[] = ["claude", "codex", "opencode"];
 
 const statusLabel: Record<SessionInfo["status"], string> = {
   starting: "启动中",
   running: "运行中",
   waiting_approval: "待审批",
-  idle: "空闲",
+  idle: "就绪",
   done: "已完成",
   died: "已退出",
 };
@@ -42,6 +45,8 @@ export default function HostScreen() {
   const [agent, setAgent] = useState<AgentKind>("claude");
   const [cwd, setCwd] = useState("");
   const [banner, setBanner] = useState<string | null>(null);
+  const [filter, setFilter] = useState<"all" | AgentKind>("all");
+  const [composing, setComposing] = useState(false);
   const pendingCreateRef = useRef(false);
   const deepLinkCreateRef = useRef<string | null>(null);
 
@@ -68,6 +73,7 @@ export default function HostScreen() {
     const enter = (sid: string): void => {
       if (!pendingCreateRef.current || !hostId) return;
       pendingCreateRef.current = false;
+      setComposing(false);
       router.push(`/host/${hostId}/session/${sid}`);
     };
     const offSnap = conn.events.on("snapshot", (m) => enter(m.sid));
@@ -83,10 +89,22 @@ export default function HostScreen() {
     };
   }, [conn, hostId]);
 
-  const sessions = sortSessions(runtime.sessions);
-  const statusText =
+  const all = sortSessions(runtime.sessions);
+  const sessions = useMemo(
+    () => (filter === "all" ? all : all.filter((s) => s.agent === filter)),
+    [all, filter],
+  );
+  const runningCount = all.filter(
+    (s) => s.status === "running" || s.status === "starting",
+  ).length;
+  const usedAgents = useMemo(
+    () => [...new Set(all.map((s) => s.agent))],
+    [all],
+  );
+
+  const connText =
     runtime.status === "connected"
-      ? `已连接 · ${runtime.activeAddr ?? ""}`
+      ? `${runningCount} 个运行中 · ${String(all.length)} 个会话`
       : runtime.status === "connecting"
         ? "连接中…"
         : runtime.status === "reconnecting"
@@ -97,17 +115,23 @@ export default function HostScreen() {
 
   return (
     <View style={styles.container}>
-      <Stack.Screen options={{ title: host?.name ?? "主机" }} />
+      <Stack.Screen
+        options={{
+          title: host?.name ?? "主机",
+          headerRight: () => (
+            <Pressable onPress={() => setComposing((v) => !v)} hitSlop={8}>
+              <Text style={styles.headerAdd}>{composing ? "取消" : "＋"}</Text>
+            </Pressable>
+          ),
+        }}
+      />
 
       <View style={styles.statusBar}>
         <Text
-          style={[
-            styles.statusText,
-            runtime.status === "failed" && styles.statusFailed,
-          ]}
-          numberOfLines={2}
+          style={[styles.statusText, runtime.status === "failed" && styles.statusFailed]}
+          numberOfLines={1}
         >
-          {statusText}
+          {connText}
         </Text>
         {(runtime.status === "failed" || runtime.status === "reconnecting") && (
           <Pressable onPress={() => conn?.kick()} hitSlop={8}>
@@ -122,69 +146,102 @@ export default function HostScreen() {
         </Pressable>
       )}
 
-      <View style={styles.newBox}>
-        <View style={styles.chips}>
-          {AGENTS.map((a) => (
+      {composing ? (
+        <View style={styles.newBox}>
+          <View style={styles.chips}>
+            {AGENTS.map((a) => (
+              <Pressable
+                key={a}
+                onPress={() => setAgent(a)}
+                style={[styles.chip, agent === a && styles.chipActive]}
+              >
+                <Text style={[styles.chipText, agent === a && styles.chipTextActive]}>
+                  {a}
+                  {STRUCTURED.includes(a) ? " 💬" : ""}
+                </Text>
+              </Pressable>
+            ))}
+          </View>
+          <View style={styles.newRow}>
+            <TextInput
+              style={styles.cwdInput}
+              placeholder="工作目录(默认 ~)"
+              placeholderTextColor="#5a5a66"
+              value={cwd}
+              onChangeText={setCwd}
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
             <Pressable
-              key={a}
-              onPress={() => setAgent(a)}
-              style={[styles.chip, agent === a && styles.chipActive]}
+              style={[styles.createBtn, runtime.status !== "connected" && styles.btnDisabled]}
+              disabled={runtime.status !== "connected"}
+              onPress={() => {
+                pendingCreateRef.current = true;
+                conn?.createSession(agent, cwd.trim() || undefined);
+              }}
             >
-              <Text style={[styles.chipText, agent === a && styles.chipTextActive]}>
-                {a}
-              </Text>
+              <Text style={styles.createBtnText}>新建</Text>
             </Pressable>
-          ))}
+          </View>
         </View>
-        <View style={styles.newRow}>
-          <TextInput
-            style={styles.cwdInput}
-            placeholder="工作目录(默认 ~)"
-            placeholderTextColor="#5a5a66"
-            value={cwd}
-            onChangeText={setCwd}
-            autoCapitalize="none"
-            autoCorrect={false}
-          />
-          <Pressable
-            style={[styles.createBtn, runtime.status !== "connected" && styles.btnDisabled]}
-            disabled={runtime.status !== "connected"}
-            onPress={() => {
-              pendingCreateRef.current = true;
-              conn?.createSession(agent, cwd.trim() || undefined);
-            }}
+      ) : (
+        usedAgents.length > 1 && (
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            style={styles.filterBar}
+            contentContainerStyle={styles.filterContent}
           >
-            <Text style={styles.createBtnText}>新建</Text>
-          </Pressable>
-        </View>
-      </View>
+            <FilterChip label="全部" active={filter === "all"} onPress={() => setFilter("all")} />
+            {usedAgents.map((a) => (
+              <FilterChip
+                key={a}
+                label={a}
+                active={filter === a}
+                onPress={() => setFilter(a)}
+              />
+            ))}
+          </ScrollView>
+        )
+      )}
 
       <FlatList
         data={sessions}
         keyExtractor={(s) => s.id}
         contentContainerStyle={styles.list}
         ListEmptyComponent={
-          <Text style={styles.emptyText}>还没有会话,选择 agent 后点「新建」。</Text>
+          <Text style={styles.emptyText}>
+            {all.length === 0 ? "还没有会话,点右上角 ＋ 新建。" : "该筛选下没有会话。"}
+          </Text>
         }
         renderItem={({ item }) => (
           <Pressable
-            style={({ pressed }) => [styles.card, pressed && styles.cardPressed]}
+            style={({ pressed }) => [
+              styles.card,
+              pressed && styles.cardPressed,
+              item.status === "waiting_approval" && styles.cardAttention,
+            ]}
             onPress={() => router.push(`/host/${hostId}/session/${item.id}`)}
           >
-            <View style={[styles.dot, { backgroundColor: statusColor[item.status] }]} />
-            <View style={styles.cardBody}>
-              <View style={styles.cardTitleRow}>
-                <Text style={styles.cardTitle}>{item.title}</Text>
-                <Text style={styles.kindTag}>
-                  {item.kind === "structured" ? "对话" : "终端"}
-                </Text>
-              </View>
-              <Text style={styles.cardSub}>
+            <View style={styles.cardTop}>
+              <View style={[styles.dot, { backgroundColor: statusColor[item.status] }]} />
+              <Text style={styles.cardTitle} numberOfLines={1}>
+                {item.title}
+              </Text>
+              <Text style={styles.kindTag}>{item.kind === "structured" ? "对话" : "终端"}</Text>
+              <Text style={[styles.cardStatus, { color: statusColor[item.status] }]}>
                 {statusLabel[item.status]}
-                {item.pendingPermissions ? ` · ${String(item.pendingPermissions)} 项待批` : ""} ·{" "}
-                {item.cwd}
               </Text>
             </View>
+            {item.preview !== undefined && item.preview.length > 0 && (
+              <Text style={styles.preview} numberOfLines={2}>
+                {item.preview}
+              </Text>
+            )}
+            <Text style={styles.cardSub} numberOfLines={1}>
+              {item.pendingPermissions ? `⚠︎ ${String(item.pendingPermissions)} 项待批 · ` : ""}
+              {item.cwd}
+            </Text>
           </Pressable>
         )}
       />
@@ -192,8 +249,27 @@ export default function HostScreen() {
   );
 }
 
+function FilterChip({
+  label,
+  active,
+  onPress,
+}: {
+  label: string;
+  active: boolean;
+  onPress: () => void;
+}) {
+  return (
+    <Pressable onPress={onPress} style={[styles.filterChip, active && styles.filterChipActive]}>
+      <Text style={[styles.filterChipText, active && styles.filterChipTextActive]}>
+        {label}
+      </Text>
+    </Pressable>
+  );
+}
+
 const styles = StyleSheet.create({
   container: { flex: 1 },
+  headerAdd: { color: "#7aa2f7", fontSize: 20, fontWeight: "600" },
   statusBar: {
     flexDirection: "row",
     alignItems: "center",
@@ -211,7 +287,7 @@ const styles = StyleSheet.create({
     padding: 10,
   },
   bannerText: { color: "#f0b0ab", fontSize: 12 },
-  newBox: { paddingHorizontal: 12, gap: 8, paddingBottom: 4 },
+  newBox: { paddingHorizontal: 12, gap: 8, paddingBottom: 6 },
   chips: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
   chip: {
     backgroundColor: "#1c1c24",
@@ -240,21 +316,27 @@ const styles = StyleSheet.create({
   },
   btnDisabled: { opacity: 0.4 },
   createBtnText: { color: "#fff", fontWeight: "600" },
+  filterBar: { flexGrow: 0 },
+  filterContent: { paddingHorizontal: 12, paddingBottom: 6, gap: 6 },
+  filterChip: {
+    backgroundColor: "#17171d",
+    borderRadius: 13,
+    paddingHorizontal: 12,
+    paddingVertical: 5,
+    borderWidth: 1,
+    borderColor: "#26262e",
+  },
+  filterChipActive: { backgroundColor: "#e8e8ee", borderColor: "#e8e8ee" },
+  filterChipText: { color: "#9a9aa6", fontSize: 12 },
+  filterChipTextActive: { color: "#0b0b0e", fontWeight: "600" },
   list: { padding: 12, gap: 10, paddingBottom: 32 },
   emptyText: { color: "#5a5a66", textAlign: "center", marginTop: 24, fontSize: 13 },
-  card: {
-    flexDirection: "row",
-    alignItems: "center",
-    backgroundColor: "#17171d",
-    borderRadius: 12,
-    padding: 14,
-    gap: 12,
-  },
+  card: { backgroundColor: "#17171d", borderRadius: 12, padding: 14, gap: 6 },
   cardPressed: { backgroundColor: "#1f1f27" },
-  dot: { width: 10, height: 10, borderRadius: 5 },
-  cardBody: { flex: 1, gap: 2 },
-  cardTitleRow: { flexDirection: "row", alignItems: "center", gap: 8 },
-  cardTitle: { color: "#e8e8ee", fontSize: 15, fontWeight: "600" },
+  cardAttention: { borderWidth: 1, borderColor: "#5a2f2b" },
+  cardTop: { flexDirection: "row", alignItems: "center", gap: 8 },
+  dot: { width: 8, height: 8, borderRadius: 4 },
+  cardTitle: { color: "#e8e8ee", fontSize: 15, fontWeight: "600", flexShrink: 1 },
   kindTag: {
     color: "#7aa2f7",
     fontSize: 10,
@@ -264,5 +346,7 @@ const styles = StyleSheet.create({
     borderRadius: 4,
     overflow: "hidden",
   },
-  cardSub: { color: "#8a8a96", fontSize: 12 },
+  cardStatus: { fontSize: 11, marginLeft: "auto" },
+  preview: { color: "#9a9aa6", fontSize: 13, lineHeight: 18 },
+  cardSub: { color: "#6a6a76", fontSize: 11 },
 });

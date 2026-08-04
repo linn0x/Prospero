@@ -3,12 +3,15 @@
  * 事件→条目的折叠逻辑在 lib/chat-model,这里只负责渲染与交互。
  */
 import { useCallback, useEffect, useRef, useState } from "react";
+import * as Clipboard from "expo-clipboard";
 import { FlatList, Pressable, StyleSheet, Text, View } from "react-native";
 import type { PermissionReply } from "@prospero/protocol";
+import { Markdown } from "@/components/Markdown";
 import type { HostConnection } from "@/lib/connection";
 import {
   applyEvent,
   applyEvents,
+  pendingPermissions,
   type AssistantItem,
   type ChatItem,
   type ErrorItem,
@@ -20,9 +23,11 @@ import {
 interface Props {
   conn: HostConnection;
   sid: string;
+  /** 上报给会话页,用于显示"N 项待批"与快捷回复的忙碌态 */
+  onPendingChange?: (count: number) => void;
 }
 
-export function ChatView({ conn, sid }: Props) {
+export function ChatView({ conn, sid, onPendingChange }: Props) {
   const [items, setItems] = useState<ChatItem[]>([]);
   const listRef = useRef<FlatList<ChatItem>>(null);
   const evSeqRef = useRef(0);
@@ -55,7 +60,8 @@ export function ChatView({ conn, sid }: Props) {
     if (atBottomRef.current && items.length > 0) {
       listRef.current?.scrollToEnd({ animated: true });
     }
-  }, [items]);
+    onPendingChange?.(pendingPermissions(items).length);
+  }, [items, onPendingChange]);
 
   const respond = useCallback(
     (reqId: string, reply: PermissionReply) => {
@@ -98,22 +104,43 @@ export function ChatView({ conn, sid }: Props) {
   );
 }
 
+/** 长按复制:手机上把 agent 输出拷走的唯一顺手方式 */
+function useCopy(): (text: string, label: string) => void {
+  const [, force] = useState(0);
+  return useCallback((text: string) => {
+    void Clipboard.setStringAsync(text);
+    force((n) => n + 1);
+  }, []);
+}
+
 function UserBubble({ item }: { item: UserItem }) {
+  const copy = useCopy();
   return (
     <View style={styles.userRow}>
-      <View style={styles.userBubble}>
-        <Text style={styles.userText}>{item.text}</Text>
-      </View>
+      <Pressable
+        style={styles.userBubble}
+        onLongPress={() => copy(item.text, "消息")}
+        delayLongPress={350}
+      >
+        <Text style={styles.userText} selectable>
+          {item.text}
+        </Text>
+      </Pressable>
     </View>
   );
 }
 
 function AssistantBubble({ item }: { item: AssistantItem }) {
   const [showReasoning, setShowReasoning] = useState(false);
+  const copy = useCopy();
   const cost = item.finish?.costUsd;
   const out = item.finish?.outputTokens;
   return (
-    <View style={styles.assistantRow}>
+    <Pressable
+      style={styles.assistantRow}
+      onLongPress={() => copy(item.text, "回复")}
+      delayLongPress={350}
+    >
       {item.reasoning.length > 0 && (
         <Pressable onPress={() => setShowReasoning((v) => !v)} style={styles.reasoningToggle}>
           <Text style={styles.reasoningToggleText}>
@@ -122,7 +149,7 @@ function AssistantBubble({ item }: { item: AssistantItem }) {
         </Pressable>
       )}
       {showReasoning && <Text style={styles.reasoningText}>{item.reasoning}</Text>}
-      {item.text.length > 0 && <Text style={styles.assistantText}>{item.text}</Text>}
+      {item.text.length > 0 && <Markdown source={item.text} />}
       {!item.done && item.text.length === 0 && item.reasoning.length === 0 && (
         <Text style={styles.thinking}>思考中…</Text>
       )}
@@ -132,7 +159,7 @@ function AssistantBubble({ item }: { item: AssistantItem }) {
           {cost !== undefined && cost > 0 ? ` · $${cost.toFixed(4)}` : ""}
         </Text>
       )}
-    </View>
+    </Pressable>
   );
 }
 
@@ -141,12 +168,21 @@ const stateColor = { running: "#d9a441", success: "#4dbd74", failed: "#e5534b" }
 
 function ToolCard({ item }: { item: ToolItem }) {
   const [expanded, setExpanded] = useState(false);
+  const copy = useCopy();
   return (
-    <Pressable style={styles.toolCard} onPress={() => setExpanded((v) => !v)}>
+    <Pressable
+      style={styles.toolCard}
+      onPress={() => setExpanded((v) => !v)}
+      onLongPress={() => copy(`${item.tool}\n${item.input}\n${item.result ?? ""}`, "工具详情")}
+      delayLongPress={350}
+    >
       <View style={styles.toolHeader}>
         <View style={[styles.toolDot, { backgroundColor: stateColor[item.state] }]} />
         <Text style={styles.toolName}>{item.tool}</Text>
-        <Text style={styles.toolState}>{stateLabel[item.state]}</Text>
+        <Text style={styles.toolState}>
+          {stateLabel[item.state]}
+          {item.result !== undefined && item.result.length > 0 ? (expanded ? " ▾" : " ▸") : ""}
+        </Text>
       </View>
       {item.input.length > 0 && (
         <Text style={styles.toolInput} numberOfLines={expanded ? undefined : 2}>
@@ -154,7 +190,9 @@ function ToolCard({ item }: { item: ToolItem }) {
         </Text>
       )}
       {expanded && item.result !== undefined && item.result.length > 0 && (
-        <Text style={styles.toolResult}>{item.result}</Text>
+        <Text style={styles.toolResult} selectable>
+          {item.result}
+        </Text>
       )}
     </Pressable>
   );

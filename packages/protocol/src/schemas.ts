@@ -60,6 +60,10 @@ export const SessionInfoSchema = z.object({
   rows,
   /** 结构化会话:当前是否有待处理审批 */
   pendingPermissions: z.number().int().nonnegative().optional(),
+  /** 最后一条助手消息的摘要,用于会话列表预览 */
+  preview: z.string().optional(),
+  /** 本轮开始时间戳,客户端据此显示"运行 12s" */
+  busySince: z.number().int().nonnegative().optional(),
 });
 
 export const HostInfoSchema = z.object({
