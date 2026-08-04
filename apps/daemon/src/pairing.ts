@@ -36,6 +36,12 @@ interface DevicesFile {
 
 export interface DaemonConfig {
   port: number;
+  /** 推送通道(Bark / ntfy);未配置则不推送 */
+  notify?: {
+    url: string;
+    deepLink?: string;
+    throttleMs?: number;
+  };
 }
 
 export function prosperoHome(): string {

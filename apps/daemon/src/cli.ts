@@ -8,6 +8,7 @@ import os from "node:os";
 import { Command } from "commander";
 import { encodePairingQR } from "@prospero/protocol";
 import { advertise, candidateAddrs } from "./discovery.js";
+import { Notifier } from "./notify.js";
 import {
   DEFAULT_PORT,
   buildPairingPayload,
@@ -44,6 +45,7 @@ program
       port,
       devMode: opts.dev,
       hostName: opts.name,
+      notify: config.notify ?? null,
     });
     const stopAdvertise = advertise(server.port, `Prospero @ ${opts.name ?? os.hostname()}`);
 
@@ -57,6 +59,11 @@ program
     if (opts.dev) {
       console.log(`开发调试页: http://127.0.0.1:${server.port}/`);
     }
+    console.log(
+      server.notifier.enabled
+        ? "推送: 已启用(App 未在线时,待审批会推到锁屏)"
+        : "推送: 未配置(运行 `prosperod notify --url <bark/ntfy 地址>` 开启)",
+    );
 
     const shutdown = async (): Promise<void> => {
       console.log("\n[prosperod] 正在退出(会话进程将随之终止)…");
@@ -90,6 +97,43 @@ program
   });
 
 program
+  .command("notify")
+  .description("配置推送通道(App 未在线时把待审批推到锁屏)")
+  .option("--url <url>", "Bark 或 ntfy 端点,如 https://api.day.app/<key> 或 https://ntfy.sh/<topic>")
+  .option("--off", "关闭推送")
+  .option("--test", "发一条测试推送")
+  .action(async (opts: { url?: string; off?: boolean; test?: boolean }) => {
+    const home = prosperoHome();
+    const config = loadConfig(home);
+    if (opts.off) {
+      const { notify: _dropped, ...rest } = config;
+      saveConfig(home, rest);
+      console.log("推送已关闭");
+      return;
+    }
+    if (opts.url) {
+      saveConfig(home, { ...config, notify: { url: opts.url } });
+      console.log(`推送端点已保存:${opts.url}`);
+    }
+    const current = loadConfig(home).notify;
+    if (!current) {
+      console.log("推送未配置。示例:");
+      console.log("  prosperod notify --url https://api.day.app/你的设备key   # Bark(iOS)");
+      console.log("  prosperod notify --url https://ntfy.sh/你的topic          # ntfy(Android)");
+      return;
+    }
+    console.log(`当前端点:${current.url}`);
+    if (opts.test) {
+      const ok = await new Notifier(current).send({
+        title: "Prospero 测试推送",
+        body: "如果你看到这条,推送通道已打通。",
+        url: "prospero://",
+      });
+      console.log(ok ? "测试推送已发出 ✓" : "测试推送失败 ✗(检查端点与网络)");
+    }
+  });
+
+program
   .command("status")
   .description("查看身份、配置与已配对设备")
   .action(() => {
@@ -100,6 +144,7 @@ program
     console.log(`home:      ${home}`);
     console.log(`身份公钥:  ${identity.publicKey.slice(0, 12)}…`);
     console.log(`端口:      ${config.port}(默认 ${DEFAULT_PORT})`);
+    console.log(`推送:      ${config.notify ? config.notify.url : "未配置"}`);
     console.log(`候选地址:  ${candidateAddrs().join(", ") || "(无)"}`);
     console.log(`设备(${devices.length}):`);
     for (const d of devices) {
