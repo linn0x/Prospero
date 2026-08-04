@@ -12,6 +12,7 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Stack, router, useLocalSearchParams } from "expo-router";
 import type { AgentKind, SessionInfo } from "@prospero/protocol";
+import { Icon } from "@/components/Icon";
 import { sortSessions } from "@/lib/store";
 import { useHostConnection } from "@/lib/use-host-connection";
 
@@ -125,11 +126,17 @@ export default function HostScreen() {
       <Stack.Screen
         options={{
           title: host?.name ?? "主机",
-          headerRight: () => (
-            <Pressable onPress={() => setComposing((v) => !v)} hitSlop={8}>
-              <Text style={styles.headerAdd}>{composing ? "取消" : "＋"}</Text>
-            </Pressable>
-          ),
+          headerLargeTitle: true,
+          headerRight: () =>
+            composing ? (
+              <Pressable onPress={() => setComposing(false)} hitSlop={8}>
+                <Text style={styles.headerCancel}>取消</Text>
+              </Pressable>
+            ) : (
+              <Pressable onPress={() => setComposing(true)} hitSlop={8}>
+                <Icon name="plus" size={19} color="#7aa2f7" weight="semibold" />
+              </Pressable>
+            ),
         }}
       />
 
@@ -283,7 +290,7 @@ function FilterChip({
 
 const styles = StyleSheet.create({
   container: { flex: 1 },
-  headerAdd: { color: "#7aa2f7", fontSize: 20, fontWeight: "600" },
+  headerCancel: { color: "#7aa2f7", fontSize: 16 },
   statusBar: {
     flexDirection: "row",
     alignItems: "center",

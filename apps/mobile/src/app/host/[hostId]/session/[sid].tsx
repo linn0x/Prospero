@@ -13,9 +13,11 @@ import * as Haptics from "expo-haptics";
 import { Stack, router, useLocalSearchParams } from "expo-router";
 import type { SessionInfo } from "@prospero/protocol";
 import { ChatView } from "@/components/ChatView";
+import { Icon } from "@/components/Icon";
 import { KeyBar } from "@/components/KeyBar";
 import { QuickReplies } from "@/components/QuickReplies";
 import { Terminal } from "@/components/Terminal";
+import { matchCommands } from "@/lib/slash-commands";
 import { useHostConnection } from "@/lib/use-host-connection";
 
 const statusText: Record<SessionInfo["status"], string> = {
@@ -49,6 +51,7 @@ export default function SessionScreen() {
   const [pending, setPending] = useState(0);
   /** 结构化会话可切到 TTY 视图查看底层终端 */
   const [showTty, setShowTty] = useState(false);
+  const [search, setSearch] = useState<string | null>(null);
 
   const session = sid ? runtime.sessions[sid] : undefined;
   const isStructured = session?.kind === "structured";
@@ -92,11 +95,18 @@ export default function SessionScreen() {
     );
   }
 
+  const totals = session?.totals;
   const subtitle = session
     ? `${session.agent} · ${statusText[session.status]}${elapsed ? ` · ${elapsed}` : ""}${
         pending > 0 ? ` · ${String(pending)} 项待批` : ""
+      }${
+        totals && totals.costUsd > 0 ? ` · 共 $${totals.costUsd.toFixed(3)}` : ""
       }`
     : "";
+
+  // 输入以 / 开头时给命令候选
+  const commandHints =
+    isChat && session ? matchCommands(session.agent, draft.trim()) : [];
 
   return (
     <KeyboardAvoidingView
@@ -120,20 +130,34 @@ export default function SessionScreen() {
           ),
           headerRight: () => (
             <View style={styles.headerRight}>
+              {isChat && (
+                <Pressable
+                  onPress={() => setSearch((s) => (s === null ? "" : null))}
+                  hitSlop={8}
+                >
+                  <Icon
+                    name="magnifyingglass"
+                    size={19}
+                    color={search !== null ? "#7aa2f7" : "#9a9aa6"}
+                  />
+                </Pressable>
+              )}
               {isStructured && (
                 <Pressable onPress={() => setShowTty((v) => !v)} hitSlop={8}>
-                  <Text style={[styles.ttyBtn, showTty && styles.ttyBtnActive]}>
-                    {showTty ? "对话" : "TTY"}
-                  </Text>
+                  <Icon
+                    name={showTty ? "bubble.left.and.text.bubble.right" : "terminal"}
+                    size={19}
+                    color={showTty ? "#7aa2f7" : "#9a9aa6"}
+                  />
                 </Pressable>
               )}
               {busy && (
                 <Pressable onPress={() => conn.interrupt(sid)} hitSlop={8}>
-                  <Text style={styles.stopText}>停止</Text>
+                  <Icon name="stop.circle" size={20} color="#d9a441" />
                 </Pressable>
               )}
               <Pressable onPress={confirmKill} hitSlop={8}>
-                <Text style={styles.killText}>终止</Text>
+                <Icon name="trash" size={18} color="#e5534b" />
               </Pressable>
             </View>
           ),
@@ -149,8 +173,33 @@ export default function SessionScreen() {
         </View>
       )}
 
+      {isChat && search !== null && (
+        <View style={styles.searchBar}>
+          <TextInput
+            style={styles.searchInput}
+            placeholder="在本会话中搜索…"
+            placeholderTextColor="#5a5a66"
+            value={search}
+            onChangeText={setSearch}
+            autoFocus
+            autoCapitalize="none"
+            autoCorrect={false}
+            returnKeyType="search"
+          />
+          <Pressable onPress={() => setSearch(null)} hitSlop={8}>
+            <Text style={styles.searchCancel}>取消</Text>
+          </Pressable>
+        </View>
+      )}
+
       {isChat ? (
-        <ChatView conn={conn} sid={sid} onPendingChange={setPending} />
+        <ChatView
+          conn={conn}
+          sid={sid}
+          onPendingChange={setPending}
+          {...(search !== null ? { search } : {})}
+          onRetry={send}
+        />
       ) : (
         <>
           {isStructured && showTty && (
@@ -165,7 +214,18 @@ export default function SessionScreen() {
         </>
       )}
 
-      {isChat && <QuickReplies busy={busy} onPick={send} />}
+      {isChat && commandHints.length > 0 && (
+        <View style={styles.cmdBox}>
+          {commandHints.slice(0, 5).map((c) => (
+            <Pressable key={c.cmd} style={styles.cmdRow} onPress={() => setDraft(c.cmd)}>
+              <Text style={styles.cmdName}>{c.cmd}</Text>
+              <Text style={styles.cmdDesc}>{c.desc}</Text>
+            </Pressable>
+          ))}
+        </View>
+      )}
+
+      {isChat && commandHints.length === 0 && <QuickReplies busy={busy} onPick={send} />}
 
       <View style={styles.composer}>
         <TextInput
@@ -184,8 +244,9 @@ export default function SessionScreen() {
         <Pressable
           style={[styles.sendBtn, draft.trim().length === 0 && styles.sendBtnDim]}
           onPress={() => send(draft)}
+          disabled={draft.trim().length === 0}
         >
-          <Text style={styles.sendText}>↑</Text>
+          <Icon name="arrow.up" size={17} color="#fff" weight="semibold" />
         </Pressable>
       </View>
     </KeyboardAvoidingView>
@@ -215,6 +276,36 @@ const styles = StyleSheet.create({
   killText: { color: "#e5534b", fontSize: 15 },
   reconnBar: { backgroundColor: "#3a2f1f", paddingHorizontal: 12, paddingVertical: 6 },
   reconnText: { color: "#e8c98a", fontSize: 12 },
+  searchBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    backgroundColor: "#141419",
+  },
+  searchInput: {
+    flex: 1,
+    backgroundColor: "#1c1c24",
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    color: "#e8e8ee",
+    fontSize: 15,
+  },
+  searchCancel: { color: "#7aa2f7", fontSize: 15 },
+  cmdBox: { backgroundColor: "#0b0b0e", paddingHorizontal: 10, paddingBottom: 4, gap: 2 },
+  cmdRow: {
+    flexDirection: "row",
+    alignItems: "baseline",
+    gap: 10,
+    paddingVertical: 7,
+    paddingHorizontal: 8,
+    backgroundColor: "#15151b",
+    borderRadius: 8,
+  },
+  cmdName: { color: "#7aa2f7", fontSize: 14, fontFamily: "Menlo" },
+  cmdDesc: { color: "#8a8a96", fontSize: 12, flex: 1 },
   ttyNotice: { backgroundColor: "#16202b", paddingHorizontal: 12, paddingVertical: 6 },
   ttyNoticeText: { color: "#8fb0d0", fontSize: 11 },
   composer: {

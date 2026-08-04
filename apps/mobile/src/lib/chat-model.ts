@@ -4,7 +4,12 @@
  * 事件是增量的(text.delta 一片片来、tool.end 要回填 tool.start),
  * UI 需要的是稳定有序的条目列表 —— 这里做这层转换,纯函数便于测试。
  */
-import type { AgentEventBody, PermissionReply, ToolState } from "@prospero/protocol";
+import type {
+  AgentEventBody,
+  FileDiff,
+  PermissionReply,
+  ToolState,
+} from "@prospero/protocol";
 
 export interface UserItem {
   type: "user";
@@ -31,6 +36,11 @@ export interface ToolItem {
   input: string;
   state: ToolState;
   result?: string;
+  diff?: FileDiff;
+  /** 服务端还有完整输出可拉取 */
+  hasMore?: boolean;
+  /** 已拉取的完整输出 */
+  fullOutput?: string;
 }
 
 export interface PermissionItem {
@@ -40,6 +50,7 @@ export interface PermissionItem {
   action: string;
   resources: string[];
   summary: string;
+  diff?: FileDiff;
   /** 已回应则记录结果,卡片转为只读 */
   resolved?: PermissionReply;
 }
@@ -101,6 +112,7 @@ export function applyEvent(items: ChatItem[], ev: AgentEventBody): ChatItem[] {
           tool: ev.tool,
           input: ev.summary,
           state: "running",
+          ...(ev.diff ? { diff: ev.diff } : {}),
         },
       ];
 
@@ -121,11 +133,20 @@ export function applyEvent(items: ChatItem[], ev: AgentEventBody): ChatItem[] {
             input: "",
             state: ev.state,
             result: ev.summary,
+            ...(ev.hasMore === true ? { hasMore: true } : {}),
+            ...(ev.diff ? { diff: ev.diff } : {}),
           },
         ];
       }
       const prev = items[idx] as ToolItem;
-      return replaceAt(items, idx, { ...prev, state: ev.state, result: ev.summary });
+      return replaceAt(items, idx, {
+        ...prev,
+        state: ev.state,
+        result: ev.summary,
+        ...(ev.hasMore === true ? { hasMore: true } : {}),
+        // tool.end 的 diff 更权威(实际应用的改动);没有则保留 start 时的预览
+        ...(ev.diff ? { diff: ev.diff } : {}),
+      });
     }
 
     case "permission.request":
@@ -138,6 +159,7 @@ export function applyEvent(items: ChatItem[], ev: AgentEventBody): ChatItem[] {
           action: ev.action,
           resources: ev.resources,
           summary: ev.summary,
+          ...(ev.diff ? { diff: ev.diff } : {}),
         },
       ];
 
@@ -173,6 +195,18 @@ export function applyEvent(items: ChatItem[], ev: AgentEventBody): ChatItem[] {
 
 export function applyEvents(items: ChatItem[], events: AgentEventBody[]): ChatItem[] {
   return events.reduce(applyEvent, items);
+}
+
+/** 按需拉取的完整工具输出到达后,填回对应卡片 */
+export function applyToolOutput(
+  items: ChatItem[],
+  callId: string,
+  output: string,
+): ChatItem[] {
+  const idx = findLastIndex(items, (i) => i.type === "tool" && i.callId === callId);
+  if (idx < 0) return items;
+  const prev = items[idx] as ToolItem;
+  return replaceAt(items, idx, { ...prev, fullOutput: output });
 }
 
 /** 是否有待回应的审批(驱动列表徽标与输入区提示) */

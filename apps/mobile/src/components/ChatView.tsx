@@ -2,16 +2,18 @@
  * 结构化会话视图:消息流 + 工具卡片 + 审批卡片。
  * 事件→条目的折叠逻辑在 lib/chat-model,这里只负责渲染与交互。
  */
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as Clipboard from "expo-clipboard";
 import * as Haptics from "expo-haptics";
 import { FlatList, Pressable, StyleSheet, Text, View } from "react-native";
 import type { PermissionReply } from "@prospero/protocol";
+import { DiffView } from "@/components/DiffView";
 import { Markdown } from "@/components/Markdown";
 import type { HostConnection } from "@/lib/connection";
 import {
   applyEvent,
   applyEvents,
+  applyToolOutput,
   pendingPermissions,
   type AssistantItem,
   type ChatItem,
@@ -26,13 +28,18 @@ interface Props {
   sid: string;
   /** 上报给会话页,用于显示"N 项待批"与快捷回复的忙碌态 */
   onPendingChange?: (count: number) => void;
+  /** 搜索关键词;非空时只显示命中的条目 */
+  search?: string;
+  /** 出错时可重发上一条用户消息 */
+  onRetry?: (text: string) => void;
 }
 
-export function ChatView({ conn, sid, onPendingChange }: Props) {
+export function ChatView({ conn, sid, onPendingChange, search, onRetry }: Props) {
   const [items, setItems] = useState<ChatItem[]>([]);
   const listRef = useRef<FlatList<ChatItem>>(null);
   const evSeqRef = useRef(0);
   const atBottomRef = useRef(true);
+  const [unread, setUnread] = useState(0);
 
   useEffect(() => {
     // 快照重建整个列表(attach / 重连后的权威状态)
@@ -45,6 +52,11 @@ export function ChatView({ conn, sid, onPendingChange }: Props) {
       if (m.sid !== sid) return;
       evSeqRef.current = m.evSeq;
       setItems((prev) => applyEvent(prev, m.body));
+      if (!atBottomRef.current) setUnread((n) => n + 1);
+    });
+    const offOut = conn.events.on("toolOutput", (m) => {
+      if (m.sid !== sid) return;
+      setItems((prev) => applyToolOutput(prev, m.callId, m.output));
     });
     const attach = (): void => conn.attach(sid, evSeqRef.current || undefined);
     const offConn = conn.events.on("connected", attach);
@@ -52,6 +64,7 @@ export function ChatView({ conn, sid, onPendingChange }: Props) {
     return () => {
       offSnap();
       offEv();
+      offOut();
       offConn();
     };
   }, [conn, sid]);
@@ -77,44 +90,98 @@ export function ChatView({ conn, sid, onPendingChange }: Props) {
     [conn, sid],
   );
 
-  return (
-    <FlatList
-      ref={listRef}
-      data={items}
-      keyExtractor={(i) => i.key}
-      style={styles.list}
-      contentContainerStyle={styles.content}
-      onScroll={(e) => {
-        const { layoutMeasurement, contentOffset, contentSize } = e.nativeEvent;
-        atBottomRef.current =
-          layoutMeasurement.height + contentOffset.y >= contentSize.height - 60;
-      }}
-      scrollEventThrottle={200}
-      keyboardShouldPersistTaps="handled"
-      keyboardDismissMode="interactive"
-      removeClippedSubviews
-      initialNumToRender={12}
-      maxToRenderPerBatch={8}
-      windowSize={11}
-      ListEmptyComponent={
-        <Text style={styles.empty}>会话已就绪,发一条消息开始。</Text>
-      }
-      renderItem={({ item }) => {
-        switch (item.type) {
-          case "user":
-            return <UserBubble item={item} />;
-          case "assistant":
-            return <AssistantBubble item={item} />;
-          case "tool":
-            return <ToolCard item={item} />;
-          case "permission":
-            return <PermissionCard item={item} onRespond={respond} />;
-          case "error":
-            return <ErrorCard item={item} />;
-        }
-      }}
-    />
+  const fetchOutput = useCallback(
+    (callId: string) => conn.getToolOutput(sid, callId),
+    [conn, sid],
   );
+
+  const retry = useCallback(() => {
+    // 找最后一条用户消息重发
+    for (let i = items.length - 1; i >= 0; i--) {
+      const it = items[i]!;
+      if (it.type === "user") {
+        onRetry?.(it.text);
+        return;
+      }
+    }
+  }, [items, onRetry]);
+
+  const visible = useMemo(() => {
+    const q = search?.trim().toLowerCase() ?? "";
+    if (q.length === 0) return items;
+    return items.filter((i) => itemText(i).toLowerCase().includes(q));
+  }, [items, search]);
+
+  const jumpToBottom = useCallback(() => {
+    atBottomRef.current = true;
+    setUnread(0);
+    listRef.current?.scrollToEnd({ animated: true });
+  }, []);
+
+  return (
+    <View style={styles.root}>
+      <FlatList
+        ref={listRef}
+        data={visible}
+        keyExtractor={(i) => i.key}
+        style={styles.list}
+        contentContainerStyle={styles.content}
+        onScroll={(e) => {
+          const { layoutMeasurement, contentOffset, contentSize } = e.nativeEvent;
+          const bottom =
+            layoutMeasurement.height + contentOffset.y >= contentSize.height - 60;
+          atBottomRef.current = bottom;
+          if (bottom && unread > 0) setUnread(0);
+        }}
+        scrollEventThrottle={200}
+        keyboardShouldPersistTaps="handled"
+        keyboardDismissMode="interactive"
+        removeClippedSubviews
+        initialNumToRender={12}
+        maxToRenderPerBatch={8}
+        windowSize={11}
+        ListEmptyComponent={
+          <Text style={styles.empty}>
+            {search ? "没有匹配的消息。" : "会话已就绪,发一条消息开始。"}
+          </Text>
+        }
+        renderItem={({ item }) => {
+          switch (item.type) {
+            case "user":
+              return <UserBubble item={item} />;
+            case "assistant":
+              return <AssistantBubble item={item} />;
+            case "tool":
+              return <ToolCard item={item} onFetchOutput={fetchOutput} />;
+            case "permission":
+              return <PermissionCard item={item} onRespond={respond} />;
+            case "error":
+              return <ErrorCard item={item} onRetry={onRetry ? retry : undefined} />;
+          }
+        }}
+      />
+      {unread > 0 && (
+        <Pressable style={styles.jumpBtn} onPress={jumpToBottom}>
+          <Text style={styles.jumpText}>↓ {unread} 条新消息</Text>
+        </Pressable>
+      )}
+    </View>
+  );
+}
+
+function itemText(i: ChatItem): string {
+  switch (i.type) {
+    case "user":
+      return i.text;
+    case "assistant":
+      return i.text + i.reasoning;
+    case "tool":
+      return `${i.tool} ${i.input} ${i.result ?? ""}`;
+    case "permission":
+      return `${i.action} ${i.resources.join(" ")}`;
+    case "error":
+      return i.message;
+  }
 }
 
 /** 长按复制:手机上把 agent 输出拷走的唯一顺手方式,附触觉确认 */
@@ -182,35 +249,60 @@ const AssistantBubble = memo(function AssistantBubble({ item }: { item: Assistan
 const stateLabel = { running: "运行中", success: "完成", failed: "失败" } as const;
 const stateColor = { running: "#d9a441", success: "#4dbd74", failed: "#e5534b" } as const;
 
-const ToolCard = memo(function ToolCard({ item }: { item: ToolItem }) {
+const ToolCard = memo(function ToolCard({
+  item,
+  onFetchOutput,
+}: {
+  item: ToolItem;
+  onFetchOutput: (callId: string) => void;
+}) {
   const [expanded, setExpanded] = useState(false);
   const copy = useCopy();
+
+  const toggle = (): void => {
+    const next = !expanded;
+    setExpanded(next);
+    // 展开时才去拉全文,避免把大量输出提前灌到手机上
+    if (next && item.hasMore === true && item.fullOutput === undefined) {
+      onFetchOutput(item.callId);
+    }
+  };
+
+  const body = item.fullOutput ?? item.result;
   return (
-    <Pressable
-      style={styles.toolCard}
-      onPress={() => setExpanded((v) => !v)}
-      onLongPress={() => copy(`${item.tool}\n${item.input}\n${item.result ?? ""}`)}
-      delayLongPress={350}
-    >
-      <View style={styles.toolHeader}>
-        <View style={[styles.toolDot, { backgroundColor: stateColor[item.state] }]} />
-        <Text style={styles.toolName}>{item.tool}</Text>
-        <Text style={styles.toolState}>
-          {stateLabel[item.state]}
-          {item.result !== undefined && item.result.length > 0 ? (expanded ? " ▾" : " ▸") : ""}
-        </Text>
-      </View>
-      {item.input.length > 0 && (
-        <Text style={styles.toolInput} numberOfLines={expanded ? undefined : 2}>
-          {item.input}
-        </Text>
-      )}
-      {expanded && item.result !== undefined && item.result.length > 0 && (
+    <View style={styles.toolCard}>
+      <Pressable
+        onPress={toggle}
+        onLongPress={() => copy(`${item.tool}\n${item.input}\n${body ?? ""}`)}
+        delayLongPress={350}
+      >
+        <View style={styles.toolHeader}>
+          <View style={[styles.toolDot, { backgroundColor: stateColor[item.state] }]} />
+          <Text style={styles.toolName}>{item.tool}</Text>
+          {item.diff && (
+            <Text style={styles.diffBadge}>
+              +{item.diff.additions} −{item.diff.deletions}
+            </Text>
+          )}
+          <Text style={styles.toolState}>
+            {stateLabel[item.state]}
+            {body !== undefined && body.length > 0 ? (expanded ? " ▾" : " ▸") : ""}
+          </Text>
+        </View>
+        {item.input.length > 0 && !item.diff && (
+          <Text style={styles.toolInput} numberOfLines={expanded ? undefined : 2}>
+            {item.input}
+          </Text>
+        )}
+      </Pressable>
+      {item.diff && <DiffView diff={item.diff} />}
+      {expanded && body !== undefined && body.length > 0 && (
         <Text style={styles.toolResult} selectable>
-          {item.result}
+          {body}
+          {item.hasMore === true && item.fullOutput === undefined ? "\n(正在拉取完整输出…)" : ""}
         </Text>
       )}
-    </Pressable>
+    </View>
   );
 });
 
@@ -231,11 +323,15 @@ const PermissionCard = memo(function PermissionCard({
   return (
     <View style={[styles.permCard, resolved !== undefined && styles.permCardResolved]}>
       <Text style={styles.permTitle}>需要你的批准 · {item.action}</Text>
-      {item.resources.map((r, i) => (
-        <Text key={`${item.reqId}:${String(i)}`} style={styles.permResource} numberOfLines={4}>
-          {r}
-        </Text>
-      ))}
+      {item.diff ? (
+        <DiffView diff={item.diff} />
+      ) : (
+        item.resources.map((r, i) => (
+          <Text key={`${item.reqId}:${String(i)}`} style={styles.permResource} numberOfLines={4}>
+            {r}
+          </Text>
+        ))
+      )}
       {resolved === undefined ? (
         <View style={styles.permButtons}>
           <Pressable
@@ -264,20 +360,43 @@ const PermissionCard = memo(function PermissionCard({
   );
 });
 
-const ErrorCard = memo(function ErrorCard({ item }: { item: ErrorItem }) {
+const ErrorCard = memo(function ErrorCard({
+  item,
+  onRetry,
+}: {
+  item: ErrorItem;
+  onRetry?: () => void;
+}) {
   return (
     <View style={styles.errorCard}>
       <Text style={styles.errorText} selectable>
         {item.message}
       </Text>
+      {onRetry && (
+        <Pressable onPress={onRetry} hitSlop={6} style={styles.retryBtn}>
+          <Text style={styles.retryText}>重发上一条</Text>
+        </Pressable>
+      )}
     </View>
   );
 });
 
 const styles = StyleSheet.create({
+  root: { flex: 1 },
   list: { flex: 1, backgroundColor: "#0b0b0e" },
   content: { padding: 12, gap: 10, paddingBottom: 24 },
   empty: { color: "#5a5a66", textAlign: "center", marginTop: 40, fontSize: 13 },
+
+  jumpBtn: {
+    position: "absolute",
+    bottom: 12,
+    alignSelf: "center",
+    backgroundColor: "#3557b7",
+    borderRadius: 16,
+    paddingHorizontal: 14,
+    paddingVertical: 7,
+  },
+  jumpText: { color: "#fff", fontSize: 13, fontWeight: "600" },
 
   userRow: { alignItems: "flex-end" },
   userBubble: {
@@ -291,7 +410,6 @@ const styles = StyleSheet.create({
   userText: { color: "#fff", fontSize: 15, lineHeight: 21 },
 
   assistantRow: { gap: 6 },
-  assistantText: { color: "#e8e8ee", fontSize: 15, lineHeight: 22 },
   thinking: { color: "#6a6a76", fontSize: 14, fontStyle: "italic" },
   reasoningToggle: { alignSelf: "flex-start" },
   reasoningToggleText: { color: "#7aa2f7", fontSize: 12 },
@@ -309,6 +427,7 @@ const styles = StyleSheet.create({
   toolHeader: { flexDirection: "row", alignItems: "center", gap: 8 },
   toolDot: { width: 8, height: 8, borderRadius: 4 },
   toolName: { color: "#c8c8d4", fontSize: 13, fontWeight: "600", flex: 1 },
+  diffBadge: { color: "#7a9a7a", fontSize: 11, fontVariant: ["tabular-nums"] },
   toolState: { color: "#6a6a76", fontSize: 11 },
   toolInput: { color: "#8a8a96", fontSize: 12, fontFamily: "Menlo", lineHeight: 17 },
   toolResult: {
@@ -347,6 +466,8 @@ const styles = StyleSheet.create({
   permBtnText: { color: "#fff", fontSize: 13, fontWeight: "600" },
   permResolved: { color: "#9a9aa6", fontSize: 12 },
 
-  errorCard: { backgroundColor: "#2b1a1a", borderRadius: 10, padding: 10 },
+  errorCard: { backgroundColor: "#2b1a1a", borderRadius: 10, padding: 10, gap: 6 },
   errorText: { color: "#f0b0ab", fontSize: 13 },
+  retryBtn: { alignSelf: "flex-start" },
+  retryText: { color: "#7aa2f7", fontSize: 12, fontWeight: "600" },
 });
