@@ -244,6 +244,17 @@ export default function FilesScreen(): React.ReactElement {
       <Stack.Screen
         options={{
           title: "文件",
+          // 必须显式给回 headerLeft:导航选项是合并而非重置的,
+          // 编辑态设过的那个会残留下来,点了只调用 setEditing(null) —— 看起来就是"返回失效"。
+          // 顺便让它在子目录里表现为"上一级",这也更符合层级浏览的直觉。
+          headerLeft:
+            dir === ""
+              ? undefined
+              : () => (
+                  <Pressable onPress={goUp} hitSlop={8}>
+                    <Text style={styles.headerAction}>上一级</Text>
+                  </Pressable>
+                ),
           headerRight: () => (
             <Pressable onPress={() => void upload()} hitSlop={8}>
               <Icon name="plus" size={20} color="#7aa2f7" />
