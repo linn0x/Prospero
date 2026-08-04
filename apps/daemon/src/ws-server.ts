@@ -20,8 +20,10 @@ import {
   type C2SMessage,
   type S2CMessage,
   type SecureChannel,
+  type SessionInfo,
 } from "@prospero/protocol";
 import { authenticate, loadIdentity, type DeviceRecord } from "./pairing.js";
+import { Notifier, type NotifyConfig } from "./notify.js";
 import { SessionError, SessionManager } from "./session-manager.js";
 import type { PtySession } from "./pty-session.js";
 
@@ -58,12 +60,15 @@ export interface DaemonServerOptions {
   port: number;
   devMode?: boolean;
   hostName?: string | undefined;
+  /** 推送通道配置;省略则不推送 */
+  notify?: NotifyConfig | null;
 }
 
 export interface DaemonServer {
   port: number;
   httpServer: Server;
   manager: SessionManager;
+  notifier: Notifier;
   close(): Promise<void>;
 }
 
@@ -96,6 +101,7 @@ export async function createDaemonServer(
   const manager = new SessionManager();
   const conns = new Set<Conn>();
   const devMode = opts.devMode ?? false;
+  const notifier = new Notifier(opts.notify ?? null);
 
   const httpServer = createServer((req, res) => handleHttp(req, res));
   const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
@@ -120,13 +126,32 @@ export async function createDaemonServer(
   });
 
   manager.on("agentEvent", (sid, body, evSeq) => {
+    let delivered = 0;
     for (const conn of conns) {
       const att = conn.chatAttachments.get(sid);
       if (!conn.device || !att) continue;
       send(conn, { type: "agent.event", sid, evSeq, body });
       att.lastEvSeq = evSeq;
+      delivered++;
     }
+    // 没有客户端在看这个会话(App 被挂起/切走)且需要人决策 → 推到锁屏。
+    // 这是 iOS 上唯一能在 App 挂起时把审批送达的路径(WebSocket 已断)。
+    if (body.kind === "permission.request" && delivered === 0 && notifier.enabled) {
+      const info = safeInfo(sid);
+      if (info) {
+        void notifier.notifyPermission(sid, info, body.action, body.resources[0] ?? "");
+      }
+    }
+    if (body.kind === "permission.resolved") notifier.clear(sid);
   });
+
+  function safeInfo(sid: string): SessionInfo | null {
+    try {
+      return manager.infoOf(sid);
+    } catch {
+      return null; // 会话在事件与查询之间被销毁
+    }
+  }
 
   manager.on("state", (session) => {
     for (const conn of conns) {
@@ -463,6 +488,7 @@ export async function createDaemonServer(
     port,
     httpServer,
     manager,
+    notifier,
     close: async () => {
       clearInterval(catchupTimer);
       clearInterval(pingTimer);
