@@ -10,6 +10,7 @@ import {
   View,
 } from "react-native";
 import { Stack, router, useLocalSearchParams } from "expo-router";
+import { ChatView } from "@/components/ChatView";
 import { KeyBar } from "@/components/KeyBar";
 import { Terminal } from "@/components/Terminal";
 import { useHostConnection } from "@/lib/use-host-connection";
@@ -19,10 +20,12 @@ export default function SessionScreen() {
   const { conn, runtime } = useHostConnection(hostId);
   const [draft, setDraft] = useState("");
   const session = sid ? runtime.sessions[sid] : undefined;
+  const isChat = session?.kind === "structured";
 
   const sendDraft = (): void => {
-    if (!conn || !sid || draft.length === 0) return;
-    conn.inputText(sid, draft + "\r");
+    if (!conn || !sid || draft.trim().length === 0) return;
+    if (isChat) conn.chatSend(sid, draft.trim());
+    else conn.inputText(sid, draft + "\r");
     setDraft("");
   };
 
@@ -60,9 +63,16 @@ export default function SessionScreen() {
         options={{
           title: session?.title ?? "会话",
           headerRight: () => (
-            <Pressable onPress={confirmKill} hitSlop={8}>
-              <Text style={styles.killText}>终止</Text>
-            </Pressable>
+            <View style={styles.headerRight}>
+              {isChat && session?.status === "running" && (
+                <Pressable onPress={() => conn.interrupt(sid)} hitSlop={8}>
+                  <Text style={styles.stopText}>停止</Text>
+                </Pressable>
+              )}
+              <Pressable onPress={confirmKill} hitSlop={8}>
+                <Text style={styles.killText}>终止</Text>
+              </Pressable>
+            </View>
           ),
         }}
       />
@@ -71,25 +81,33 @@ export default function SessionScreen() {
           <Text style={styles.reconnText}>
             {runtime.status === "failed"
               ? `连接失败:${runtime.lastError ?? ""}`
-              : "连接断开,重连中…(画面将自动恢复)"}
+              : "连接断开,重连中…(内容将自动恢复)"}
           </Text>
         </View>
       )}
-      <Terminal conn={conn} sid={sid} />
-      <KeyBar onKey={(seq) => conn.inputText(sid, seq)} />
+
+      {isChat ? (
+        <ChatView conn={conn} sid={sid} />
+      ) : (
+        <>
+          <Terminal conn={conn} sid={sid} />
+          <KeyBar onKey={(seq) => conn.inputText(sid, seq)} />
+        </>
+      )}
+
       <View style={styles.composer}>
         <TextInput
-          style={styles.input}
-          placeholder="输入后发送(自动回车)"
+          style={[styles.input, isChat && styles.inputChat]}
+          placeholder={isChat ? "给 agent 发消息…" : "输入后发送(自动回车)"}
           placeholderTextColor="#5a5a66"
           value={draft}
           onChangeText={setDraft}
           onSubmitEditing={sendDraft}
-          submitBehavior="submit"
-          returnKeyType="send"
+          submitBehavior={isChat ? "newline" : "submit"}
+          returnKeyType={isChat ? "default" : "send"}
           autoCapitalize="none"
           autoCorrect={false}
-          multiline={false}
+          multiline={isChat}
         />
         <Pressable style={styles.sendBtn} onPress={sendDraft}>
           <Text style={styles.sendText}>发送</Text>
@@ -103,6 +121,8 @@ const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#0b0b0e" },
   center: { flex: 1, alignItems: "center", justifyContent: "center" },
   dim: { color: "#5a5a66" },
+  headerRight: { flexDirection: "row", gap: 14, alignItems: "center" },
+  stopText: { color: "#d9a441", fontSize: 15 },
   killText: { color: "#e5534b", fontSize: 15 },
   reconnBar: { backgroundColor: "#3a2f1f", paddingHorizontal: 12, paddingVertical: 6 },
   reconnText: { color: "#e8c98a", fontSize: 12 },
@@ -111,6 +131,7 @@ const styles = StyleSheet.create({
     gap: 8,
     padding: 8,
     backgroundColor: "#141419",
+    alignItems: "flex-end",
   },
   input: {
     flex: 1,
@@ -121,11 +142,12 @@ const styles = StyleSheet.create({
     color: "#e8e8ee",
     fontSize: 14,
   },
+  inputChat: { maxHeight: 120, minHeight: 38 },
   sendBtn: {
     backgroundColor: "#3557b7",
     borderRadius: 8,
     paddingHorizontal: 16,
-    justifyContent: "center",
+    paddingVertical: 10,
   },
   sendText: { color: "#fff", fontWeight: "600" },
 });
