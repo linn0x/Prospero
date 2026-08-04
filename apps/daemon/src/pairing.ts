@@ -108,6 +108,22 @@ export function mintDevice(
   return device;
 }
 
+/**
+ * 撤销设备。名字可能重复(mintDevice 不去重),所以全部同名一起撤 ——
+ * 撤销要么彻底要么别做,留一条同名记录还能连上是最糟的结果。
+ * 返回被撤掉的记录,便于 CLI 如实报告撤了几台。
+ */
+export function revokeDevices(home: string, name: string): DeviceRecord[] {
+  const devices = loadDevices(home);
+  const removed = devices.filter((d) => d.name === name);
+  if (removed.length === 0) return [];
+  saveDevices(
+    home,
+    devices.filter((d) => d.name !== name),
+  );
+  return removed;
+}
+
 function tokenEqual(a: string, b: string): boolean {
   const ab = Buffer.from(a);
   const bb = Buffer.from(b);
