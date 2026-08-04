@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { chmodSync, readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -16,6 +17,7 @@ import {
   structuredCapable,
 } from "./agents.js";
 import { PtySession } from "./pty-session.js";
+import * as tmux from "./tmux.js";
 import { StructuredSession, titleFor } from "./structured-session.js";
 import { ClaudeAdapter } from "./adapters/claude.js";
 import { CodexAdapter } from "./adapters/codex.js";
@@ -71,9 +73,99 @@ function makeAdapter(agent: AgentKind): AgentAdapter {
   }
 }
 
+/** 恢复 tmux 会话所需的最小元数据(tmux 只记得会话名) */
+interface PtyMeta {
+  id: string;
+  agent: AgentKind;
+  title: string;
+  cwd: string;
+  cols: number;
+  rows: number;
+}
+
+export interface SessionManagerOptions {
+  /** tmux 托管:agent 跑在 tmux 里,daemon 重启后进程与画面都还在 */
+  tmux?: { home: string } | undefined;
+}
+
 export class SessionManager extends EventEmitter<SessionManagerEvents> {
   private readonly ptySessions = new Map<string, PtySession>();
   private readonly structuredSessions = new Map<string, StructuredSession>();
+  private readonly tmuxConfigFile: string | null;
+  private readonly tmuxBin: string | null;
+
+  private readonly metaFile: string | null;
+
+  constructor(opts: SessionManagerOptions = {}) {
+    super();
+    // 没装 tmux 就静默退回直接 spawn —— 托管是增强,不该变成硬依赖
+    this.tmuxBin = opts.tmux ? tmux.tmuxPath() : null;
+    this.tmuxConfigFile = this.tmuxBin && opts.tmux ? tmux.writeConfig(opts.tmux.home) : null;
+    this.metaFile = opts.tmux ? path.join(opts.tmux.home, "pty-sessions.json") : null;
+  }
+
+  /**
+   * 重新接管上一轮 daemon 留下的 tmux 会话。
+   * tmux 只记得会话名,agent/title/cwd 这些是我们自己存的;两边取交集 ——
+   * 元数据里有但 tmux 没有的是已经结束的,tmux 有但元数据没有的不归我们管。
+   */
+  restoreFromTmux(): SessionInfo[] {
+    if (!this.tmuxEnabled || !this.metaFile) return [];
+    const alive = new Set(tmux.listSessions());
+    if (alive.size === 0) {
+      this.persistMeta();
+      return [];
+    }
+    const restored: SessionInfo[] = [];
+    for (const meta of this.loadMeta()) {
+      if (!alive.has(meta.id) || this.ptySessions.has(meta.id)) continue;
+      try {
+        // `new-session -A` 存在即 attach,所以恢复和新建走同一条命令
+        restored.push(this.spawnPty(meta.id, meta.agent, meta.title, meta.cwd, meta.cols, meta.rows, undefined));
+      } catch {
+        // 单个恢复失败不该拖垮启动
+      }
+    }
+    this.persistMeta();
+    return restored;
+  }
+
+  private loadMeta(): PtyMeta[] {
+    if (!this.metaFile) return [];
+    try {
+      const raw = readFileSync(this.metaFile, "utf8");
+      const parsed: unknown = JSON.parse(raw);
+      return Array.isArray(parsed) ? (parsed as PtyMeta[]) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  private persistMeta(): void {
+    if (!this.metaFile) return;
+    const meta: PtyMeta[] = [...this.ptySessions.values()].map((s) => {
+      const info = s.info();
+      return {
+        id: info.id,
+        agent: info.agent,
+        title: info.title,
+        cwd: info.cwd,
+        cols: info.cols,
+        rows: info.rows,
+      };
+    });
+    try {
+      writeFileSync(this.metaFile, JSON.stringify(meta, null, 2));
+      chmodSync(this.metaFile, 0o600);
+    } catch {
+      // 记不下来只影响下次恢复,不影响当前会话
+    }
+  }
+
+  /** tmux 托管是否真正生效(装了 tmux 且开了开关) */
+  get tmuxEnabled(): boolean {
+    return this.tmuxBin !== null && this.tmuxConfigFile !== null;
+  }
 
   /** 结构化会话需要异步启动后端,故整体为 async */
   async create(input: CreateSessionInput): Promise<SessionInfo> {
@@ -104,23 +196,56 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       );
     }
     const id = randomUUID();
+    const info = this.spawnPty(
+      id,
+      input.agent,
+      `${input.agent} · ${path.basename(cwd)}`,
+      cwd,
+      input.cols,
+      input.rows,
+      spec,
+    );
+    this.persistMeta();
+    return info;
+  }
+
+  /**
+   * 建 PtySession。新建与 tmux 恢复共用 —— 恢复时 spec 省略,
+   * 因为 `new-session -A` 遇到已存在的会话会直接 attach 并忽略命令参数。
+   */
+  private spawnPty(
+    id: string,
+    agent: AgentKind,
+    title: string,
+    cwd: string,
+    cols: number,
+    rows: number,
+    spec: { file: string; args: string[] } | undefined,
+  ): SessionInfo {
+    const base = spec ?? { file: "/bin/true", args: [] };
+    const launch =
+      this.tmuxBin && this.tmuxConfigFile
+        ? tmux.wrapSpawn(base, {
+            id,
+            cwd,
+            cols,
+            rows,
+            configFile: this.tmuxConfigFile,
+            tmux: this.tmuxBin,
+          })
+        : base;
     let session: PtySession;
     try {
       session = new PtySession({
-        id,
-        agent: input.agent,
-        title: `${input.agent} · ${path.basename(cwd)}`,
-        cwd,
-        cols: input.cols,
-        rows: input.rows,
-        file: spec.file,
-        args: spec.args,
+        id, agent, title, cwd, cols, rows,
+        file: launch.file,
+        args: launch.args,
         env: spawnEnv(),
       });
     } catch (e) {
       // node-pty 对不存在的可执行文件同步抛 posix_spawnp failed
       throw new SessionError(
-        `failed to spawn "${spec.file}" — is ${input.agent} installed? (${e instanceof Error ? e.message : String(e)})`,
+        `failed to spawn "${base.file}" — is ${agent} installed? (${e instanceof Error ? e.message : String(e)})`,
         "agent_unavailable",
       );
     }
@@ -226,13 +351,20 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     const pty = this.requirePty(sid);
     const info = pty.info();
     pty.dispose();
+    // tmux 下 dispose 只是断开 client,进程还在 server 里活着 —— kill 得说到做到
+    if (this.tmuxEnabled) tmux.killSession(sid);
     this.ptySessions.delete(sid);
+    this.persistMeta();
     this.emit("state", {
       ...info,
       status: info.status === "done" ? "done" : "died",
     });
   }
 
+  /**
+   * daemon 退出时只断开自己这一侧。tmux 托管下会话进程留在 tmux server 里,
+   * 下次启动再 attach 回来 —— 这正是托管的意义,所以这里绝不能 killSession。
+   */
   disposeAll(): void {
     for (const s of this.ptySessions.values()) s.dispose();
     this.ptySessions.clear();
