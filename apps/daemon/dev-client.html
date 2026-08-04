@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>Prospero dev client</title>
+<link rel="stylesheet" href="/assets/xterm.css" />
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #111; color: #ddd; font: 13px/1.5 -apple-system, sans-serif; display: flex; flex-direction: column; height: 100vh; }
+  #bar { display: flex; gap: 8px; align-items: center; padding: 8px; background: #1b1b1b; flex-wrap: wrap; }
+  #bar select, #bar input, #bar button { background: #2a2a2a; color: #ddd; border: 1px solid #444; border-radius: 4px; padding: 4px 8px; font-size: 13px; }
+  #bar button { cursor: pointer; }
+  #bar button:hover { background: #383838; }
+  #status { margin-left: auto; font-size: 12px; color: #888; }
+  #term { flex: 1; padding: 4px; min-height: 0; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <select id="agent">
+    <option value="shell">shell</option>
+    <option value="claude">claude</option>
+    <option value="codex">codex</option>
+    <option value="opencode">opencode</option>
+    <option value="grok">grok</option>
+    <option value="trae">trae</option>
+    <option value="custom">custom…</option>
+  </select>
+  <input id="cwd" placeholder="cwd(默认 ~)" size="24" />
+  <input id="cmd" placeholder="custom 命令" size="24" style="display:none" />
+  <button id="create">新建会话</button>
+  <select id="sessions"><option value="">— 会话 —</option></select>
+  <button id="interrupt" title="Ctrl-C">⎋ 中断</button>
+  <button id="kill">终止</button>
+  <span id="status">连接中…</span>
+</div>
+<div id="term"></div>
+<script src="/assets/xterm.js"></script>
+<script src="/assets/fit.js"></script>
+<script>
+  const { Terminal } = window;
+  const { FitAddon } = window.FitAddon;
+  const term = new Terminal({ scrollback: 5000, fontSize: 13, theme: { background: "#111111" } });
+  const fit = new FitAddon();
+  term.loadAddon(fit);
+  term.open(document.getElementById("term"));
+  fit.fit();
+
+  const $ = (id) => document.getElementById(id);
+  const sessions = new Map(); // sid -> info
+  let currentSid = null;
+  let lastSeq = 0;
+  let ackTimer = null;
+
+  const te = new TextEncoder();
+  const td = new TextDecoder();
+  function bytesToB64(bytes) {
+    let bin = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    }
+    return btoa(bin);
+  }
+  function b64ToBytes(b64) {
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  const ws = new WebSocket(`ws://${location.host}/ws`);
+  const sendMsg = (m) => ws.readyState === 1 && ws.send(JSON.stringify(m));
+
+  ws.onopen = () => {
+    // dev 明文 hello(仅 --dev + loopback 下 daemon 接受)
+    sendMsg({
+      type: "hello",
+      token: "dev-local-plaintext",
+      clientPubKey: bytesToB64(new Uint8Array(32)),
+      clientInfo: { platform: "ios", appVersion: "dev-client" },
+    });
+  };
+  ws.onclose = () => { $("status").textContent = "连接已断开(刷新重连)"; };
+
+  function refreshSessionSelect() {
+    const sel = $("sessions");
+    sel.innerHTML = "";
+    const opt0 = document.createElement("option");
+    opt0.value = ""; opt0.textContent = "— 会话 —";
+    sel.appendChild(opt0);
+    for (const [sid, info] of sessions) {
+      const o = document.createElement("option");
+      o.value = sid;
+      o.textContent = `${info.title} [${info.status}]`;
+      if (sid === currentSid) o.selected = true;
+      sel.appendChild(o);
+    }
+  }
+
+  ws.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    switch (msg.type) {
+      case "hello.ok":
+        $("status").textContent = `已连接 ${msg.host.name} (daemon ${msg.host.daemonVersion})`;
+        for (const s of msg.sessions) sessions.set(s.id, s);
+        refreshSessionSelect();
+        break;
+      case "session.state":
+        sessions.set(msg.session.id, msg.session);
+        if (msg.session.status === "done" || msg.session.status === "died") {
+          if (!("__keep" in msg.session)) sessions.set(msg.session.id, msg.session);
+        }
+        refreshSessionSelect();
+        break;
+      case "term.snapshot":
+        if (currentSid === null) currentSid = msg.sid; // 新建会话的自动 attach
+        if (msg.sid !== currentSid) break;
+        term.reset();
+        term.resize(msg.cols, msg.rows);
+        term.write(msg.ansi);
+        lastSeq = msg.seq;
+        refreshSessionSelect();
+        break;
+      case "term.output":
+        if (msg.sid !== currentSid) break;
+        term.write(b64ToBytes(msg.dataB64));
+        lastSeq = msg.seq;
+        if (!ackTimer) {
+          ackTimer = setTimeout(() => {
+            ackTimer = null;
+            if (currentSid) sendMsg({ type: "term.ack", sid: currentSid, seq: lastSeq });
+          }, 250);
+        }
+        break;
+      case "error":
+        term.write(`\r\n\x1b[31m[error ${msg.code}] ${msg.message}\x1b[0m\r\n`);
+        break;
+    }
+  };
+
+  term.onData((data) => {
+    if (!currentSid) return;
+    sendMsg({ type: "term.input", sid: currentSid, dataB64: bytesToB64(te.encode(data)) });
+  });
+
+  $("agent").onchange = () => {
+    $("cmd").style.display = $("agent").value === "custom" ? "" : "none";
+  };
+  $("create").onclick = () => {
+    fit.fit();
+    currentSid = null; // 下一个 snapshot 即新会话
+    sendMsg({
+      type: "session.create",
+      agent: $("agent").value,
+      cwd: $("cwd").value || undefined,
+      command: $("agent").value === "custom" ? $("cmd").value : undefined,
+      cols: term.cols,
+      rows: term.rows,
+    });
+  };
+  $("sessions").onchange = () => {
+    const sid = $("sessions").value;
+    if (!sid) return;
+    currentSid = sid;
+    lastSeq = 0;
+    fit.fit();
+    sendMsg({ type: "session.attach", sid });
+    sendMsg({ type: "term.resize", sid, cols: term.cols, rows: term.rows });
+  };
+  $("interrupt").onclick = () => currentSid && sendMsg({ type: "session.interrupt", sid: currentSid });
+  $("kill").onclick = () => {
+    if (!currentSid) return;
+    sendMsg({ type: "session.kill", sid: currentSid });
+    sessions.delete(currentSid);
+    currentSid = null;
+    term.reset();
+    refreshSessionSelect();
+  };
+  window.addEventListener("resize", () => {
+    fit.fit();
+    if (currentSid) sendMsg({ type: "term.resize", sid: currentSid, cols: term.cols, rows: term.rows });
+  });
+</script>
+</body>
+</html>
