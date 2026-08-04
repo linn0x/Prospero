@@ -13,6 +13,20 @@ const { Bonjour } = require("bonjour-service") as {
   Bonjour: typeof BonjourType;
 };
 
+/**
+ * 手机连不上的地址。带进配对二维码只会让客户端在竞速时白试几条死路,
+ * 还会把连接诊断搅浑(某个地址"超时"其实是它根本不该在列表里)。
+ */
+function unusable(addr: string): boolean {
+  // 198.18/15 是 RFC2544 基准测试段,Surge/Clash 这类工具拿它做 TUN
+  if (addr.startsWith("198.18.") || addr.startsWith("198.19.")) return true;
+  // 169.254/16 link-local:没拿到 DHCP 时的自赋地址,不可路由
+  if (addr.startsWith("169.254.")) return true;
+  // 以 .0 结尾的通常是网段地址而非主机地址(/24 下必然如此)
+  if (addr.endsWith(".0")) return true;
+  return false;
+}
+
 export function candidateAddrs(): string[] {
   const en: string[] = [];
   const utun: string[] = [];
@@ -20,6 +34,7 @@ export function candidateAddrs(): string[] {
   for (const [name, addrs] of Object.entries(os.networkInterfaces())) {
     for (const a of addrs ?? []) {
       if (a.internal || a.family !== "IPv4") continue;
+      if (unusable(a.address)) continue;
       if (name.startsWith("en")) en.push(a.address);
       else if (name.startsWith("utun")) utun.push(a.address);
       else other.push(a.address);

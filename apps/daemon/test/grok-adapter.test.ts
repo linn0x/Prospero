@@ -14,13 +14,17 @@ import { GrokAdapter } from "../src/adapters/grok.js";
 import { defaultKindFor, structuredCapable } from "../src/agents.js";
 import { StructuredSession } from "../src/structured-session.js";
 
+/**
+ * 只排除 "Not signed in" 是不够的:未登录时 grok 也可能什么都不输出,
+ * 于是判定为"已登录"、跑下去、再超时失败。要求输出真的有内容才算可用。
+ */
 function grokSignedIn(): boolean {
   try {
     const out = execFileSync("grok", ["-p", "hi", "--output-format", "json"], {
       encoding: "utf8",
       timeout: 30_000,
     });
-    return !out.includes("Not signed in");
+    return out.trim().length > 0 && !out.includes("Not signed in");
   } catch {
     return false;
   }
@@ -78,10 +82,24 @@ describe("Grok 事件解析", () => {
     expect(events.map((e) => (e.kind === "text.delta" ? e.delta : ""))).toEqual(["PO", "NG"]);
   });
 
-  it("扁平 type 形态同样识别", () => {
+  // 下面这几条是从已登录的 grok 真实抓包来的,不再是猜的形状
+  it("真实 streaming-json:文本增量在 data 字段", () => {
     const events = feed(new GrokAdapter(), [
-      JSON.stringify({ type: "text", text: "hello" }),
+      JSON.stringify({ type: "text", data: "P" }),
+      JSON.stringify({ type: "text", data: "ONG" }),
     ]);
+    expect(events.map((e) => (e.kind === "text.delta" ? e.delta : ""))).toEqual(["P", "ONG"]);
+  });
+
+  it("真实 streaming-json:thought 是推理增量", () => {
+    const events = feed(new GrokAdapter(), [
+      JSON.stringify({ type: "thought", data: "思考中" }),
+    ]);
+    expect(events[0]).toMatchObject({ kind: "reasoning.delta", delta: "思考中" });
+  });
+
+  it("旧猜测的 text 字段仍兼容(万一版本间有差异)", () => {
+    const events = feed(new GrokAdapter(), [JSON.stringify({ type: "text", text: "hello" })]);
     expect(events[0]).toMatchObject({ kind: "text.delta", delta: "hello" });
   });
 

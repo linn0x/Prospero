@@ -3,6 +3,7 @@
  * --dev 模式额外提供浏览器调试页(仅 loopback 可用明文协议)。
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { readFileSync, watch } from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
@@ -86,6 +87,8 @@ export interface DaemonServerOptions {
 
 export interface DaemonServer {
   port: number;
+  /** --dev 的一次性明文口令(仅 devMode 有意义) */
+  devToken: string;
   /** 本次启动从 tmux 接管回来的会话数 */
   restoredSessions: number;
   httpServer: Server;
@@ -120,6 +123,14 @@ export async function createDaemonServer(
   opts: DaemonServerOptions,
 ): Promise<DaemonServer> {
   const identity = loadIdentity(opts.home);
+  // --dev 的一次性口令:每次启动重新生成,只存在内存里,只打印到启动它的终端。
+  // 这样"能看到终端输出"就成了使用明文通道的前提,而不是"恰好在本机跑着"。
+  const devToken = randomBytes(18).toString("base64url");
+  const devTokenEqual = (supplied: string): boolean => {
+    const a = Buffer.from(supplied);
+    const b = Buffer.from(devToken);
+    return a.length === b.length && timingSafeEqual(a, b);
+  };
   const manager = new SessionManager(opts.useTmux ? { tmux: { home: opts.home } } : {});
   // 菜单栏壳靠这个文件看会话列表(WS 协议要过 E2E 握手,壳没必要实现一遍)
   const statusFile = new StatusFile(opts.home, manager, {
@@ -292,14 +303,23 @@ export async function createDaemonServer(
         typeof plain === "object" &&
         (plain as { type?: unknown }).type === "hello"
       ) {
+        // 曾经这里不校验任何凭证 —— 于是 --dev 期间本机任意进程(含其他用户)
+        // 都能无条件拿到 allowShell 的完整会话。回环来源不是授权,只是位置。
+        // 现在要求每次启动新生成的一次性口令,它只打印在启动 daemon 的那个终端里。
+        const supplied = (plain as { token?: unknown }).token;
+        if (typeof supplied !== "string" || !devTokenEqual(supplied)) {
+          console.warn("[prosperod] 拒绝 dev 明文连接:口令不符");
+          conn.ws.close(CLOSE_AUTH_FAILED, "dev token required");
+          return;
+        }
         conn.channel = null;
         conn.device = {
           name: "dev-local",
-          token: "dev",
+          token: devToken,
           allowShell: true,
           createdAt: Date.now(),
         };
-        console.log("[prosperod] dev 明文连接(loopback)");
+        console.log("[prosperod] dev 明文连接(loopback,口令已校验)");
         sendHelloOk(conn);
         return;
       }
@@ -602,8 +622,14 @@ export async function createDaemonServer(
         res.writeHead(200, { "content-type": "text/javascript" });
         res.end(readFileSync(req2.resolve("@xterm/addon-webgl")));
       } else if (devMode && (req.url === "/" || req.url === "/index.html")) {
+        // 页面本身只在 --dev 且回环时可取,所以把口令注进去不会扩大暴露面:
+        // 能拿到这个页面的,已经能看到终端里打印的同一个口令。
+        const page = readFileSync(path.join(pkgRoot, "dev-client.html"), "utf8").replace(
+          "</head>",
+          `<script>window.__PROSPERO_DEV_TOKEN__=${JSON.stringify(devToken)}</script></head>`,
+        );
         res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-        res.end(readFileSync(path.join(pkgRoot, "dev-client.html")));
+        res.end(page);
       } else {
         res.writeHead(404).end(devMode ? "not found" : "prosperod");
       }
@@ -669,6 +695,7 @@ export async function createDaemonServer(
 
   return {
     port,
+    devToken,
     restoredSessions: restored.length,
     httpServer,
     manager,
