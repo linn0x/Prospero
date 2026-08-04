@@ -1,0 +1,23 @@
+# deps
+node_modules/
+
+# build
+dist/
+*.tsbuildinfo
+
+# expo / ios / android
+apps/mobile/.expo/
+apps/mobile/ios/
+apps/mobile/android/
+apps/mobile/expo-env.d.ts
+
+# env & local
+.env
+.env.*
+*.local
+
+# macOS
+.DS_Store
+
+# logs
+*.log

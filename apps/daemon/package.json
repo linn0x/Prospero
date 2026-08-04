@@ -1,0 +1,30 @@
+{
+  "name": "@prospero/daemon",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "prosperod": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc --build",
+    "dev": "node --experimental-strip-types src/cli.ts",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@prospero/protocol": "*",
+    "@xterm/addon-serialize": "^0.14.0",
+    "@xterm/headless": "^6.0.0",
+    "bonjour-service": "^1.4.0",
+    "commander": "^13.0.0",
+    "node-pty": "^1.1.0",
+    "qrcode-terminal": "^0.12.0",
+    "tweetnacl": "^1.0.3",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/qrcode-terminal": "^0.12.2",
+    "@types/ws": "^8.5.13",
+    "vitest": "^3.0.0"
+  }
+}
