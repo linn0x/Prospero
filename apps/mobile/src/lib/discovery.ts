@@ -1,0 +1,102 @@
+/**
+ * 局域网发现(Bonjour / mDNS,_prospero._tcp)。
+ *
+ * 用途有二:
+ * 1. 配对前:让用户看到"附近有哪台 Mac 在跑 prosperod",确认不是白扫码;
+ * 2. 配对后:Mac 换了 IP(换网/DHCP 续约)时自动学到新地址 —— 否则地址簿会过期。
+ *
+ * 注意:mDNS 组播不穿 WireGuard 隧道,所以 WG 场景永远发现不到,
+ * 那条路径靠 QR 里带的静态地址。这也是发现只是"锦上添花"、不是必需品的原因。
+ */
+import { useEffect, useRef, useState } from "react";
+import { Platform } from "react-native";
+
+export interface DiscoveredHost {
+  name: string;
+  addresses: string[];
+  port: number;
+}
+
+type ZeroconfService = {
+  name?: string;
+  port?: number;
+  addresses?: string[];
+  host?: string;
+};
+
+interface ZeroconfLike {
+  scan(type: string, protocol: string, domain: string): void;
+  stop(): void;
+  removeAllListeners?: () => void;
+  on(event: string, cb: (service: ZeroconfService) => void): void;
+}
+
+/**
+ * 扫描同网段的 prosperod。
+ * 原生模块缺失(Expo Go / 未重新构建)时静默返回空列表,不影响手动配对。
+ */
+export function useDiscovery(enabled: boolean): {
+  hosts: DiscoveredHost[];
+  scanning: boolean;
+  unavailable: boolean;
+} {
+  const [hosts, setHosts] = useState<DiscoveredHost[]>([]);
+  const [scanning, setScanning] = useState(false);
+  const [unavailable, setUnavailable] = useState(false);
+  const zcRef = useRef<ZeroconfLike | null>(null);
+
+  useEffect(() => {
+    if (!enabled) return;
+    let cancelled = false;
+    let zc: ZeroconfLike | null = null;
+
+    try {
+      // 动态 require:模块不存在时不至于让整个屏幕崩掉
+
+      const Zeroconf = require("react-native-zeroconf").default as new () => ZeroconfLike;
+      zc = new Zeroconf();
+      zcRef.current = zc;
+    } catch {
+      setUnavailable(true);
+      return;
+    }
+
+    const onResolved = (service: ZeroconfService): void => {
+      if (cancelled) return;
+      const addresses = (service.addresses ?? []).filter((a) => a.includes("."));
+      if (addresses.length === 0 || typeof service.port !== "number") return;
+      setHosts((prev) => {
+        const name = service.name ?? service.host ?? addresses[0]!;
+        const rest = prev.filter((h) => h.name !== name);
+        return [...rest, { name, addresses, port: service.port! }];
+      });
+    };
+
+    zc.on("resolved", onResolved);
+    zc.on("error", () => {
+      if (!cancelled) setUnavailable(true);
+    });
+
+    try {
+      setScanning(true);
+      zc.scan("prospero", "tcp", "local.");
+    } catch {
+      setUnavailable(true);
+      setScanning(false);
+    }
+
+    return () => {
+      cancelled = true;
+      setScanning(false);
+      try {
+        zc?.stop();
+        zc?.removeAllListeners?.();
+      } catch {
+        // 忽略清理错误
+      }
+    };
+  }, [enabled]);
+
+  // iOS 上未授予本地网络权限时会静默无结果 —— 由调用方结合超时给出引导
+  return { hosts, scanning, unavailable: unavailable || Platform.OS === "web" };
+}

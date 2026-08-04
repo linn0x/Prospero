@@ -1,6 +1,13 @@
 /**
- * 主机连接:多地址并发竞速 → 首个完成 E2E 握手者胜;断线指数退避重连;
- * App 回前台立即踢一次重连。每个 attempt 有独立的临时密钥/通道。
+ * 主机连接。
+ *
+ * 设计要点(都是为了"切网无感"这一个目标):
+ * - 多地址并发竞速:WiFi 与 WireGuard 地址同时试,先完成 E2E 握手者胜;
+ * - 地址学习:成功过的地址排到最前,下次优先命中,省掉竞速时间;
+ * - 心跳:iOS 切后台/切网常留下"半开"连接 —— socket 看似 OPEN 但收发已死,
+ *   只靠 onclose 会卡住几十秒。心跳超时即主动断开重连;
+ * - 失败诊断:逐地址记录失败原因,合成一条用户能照做的提示;
+ * - 发送排队:断线瞬间的用户操作不丢,重连后按序补发。
  */
 import { AppState, Platform } from "react-native";
 import {
@@ -8,6 +15,7 @@ import {
   parseS2C,
   toB64,
   utf8Encode,
+  ProtocolError,
   type AgentKind,
   type C2SMessage,
   type KeyPairB64,
@@ -22,28 +30,31 @@ import {
   type SecureChannel,
   type SessionKind,
 } from "@prospero/protocol";
+import { diagnose, type AttemptResult, type Diagnosis } from "./connect-diagnosis";
 import { Emitter } from "./emitter";
-import type { StoredHost } from "./hosts";
+import { rememberGoodAddr, type StoredHost } from "./hosts";
 import { useApp } from "./store";
 
 const APP_VERSION = "0.0.1";
-const ATTEMPT_TIMEOUT_MS = 8000;
-const BACKOFF_MIN = 500;
+const ATTEMPT_TIMEOUT_MS = 6000;
+const BACKOFF_MIN = 400;
 const BACKOFF_MAX = 8000;
+/** 心跳间隔与容忍的静默时长(daemon 每 15s ping 一次) */
+const HEARTBEAT_MS = 10_000;
+const SILENCE_LIMIT_MS = 35_000;
+/** 断线期间最多排队多少条待发消息 */
+const MAX_QUEUE = 50;
 
 interface Won {
   ws: WebSocket;
   channel: SecureChannel;
   helloOk: S2CHelloOk;
   addr: string;
-}
-
-class FatalConnectError extends Error {
-  fatal = true as const;
+  rttMs: number;
 }
 
 export interface ConnEvents extends Record<string, unknown> {
-  connected: { addr: string };
+  connected: { addr: string; rttMs: number };
   disconnected: { willRetry: boolean };
   snapshot: S2CTermSnapshot;
   output: S2CTermOutput;
@@ -55,6 +66,8 @@ export interface ConnEvents extends Record<string, unknown> {
 export class HostConnection {
   readonly events = new Emitter<ConnEvents>();
   activeAddr: string | null = null;
+  lastRttMs: number | null = null;
+  diagnosis: Diagnosis | null = null;
 
   private ws: WebSocket | null = null;
   private channel: SecureChannel | null = null;
@@ -62,6 +75,11 @@ export class HostConnection {
   private stopped = false;
   private backoff = BACKOFF_MIN;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private lastRecvAt = 0;
+  private everConnected = false;
+  /** 断线期间排队的消息,重连后按序补发 */
+  private queue: C2SMessage[] = [];
 
   constructor(
     readonly host: StoredHost,
@@ -72,33 +90,47 @@ export class HostConnection {
     return this.ws !== null && this.ws.readyState === 1 && this.channel !== null;
   }
 
+  get queuedCount(): number {
+    return this.queue.length;
+  }
+
   start(): void {
     this.stopped = false;
     if (this.connecting || this.isConnected) return;
     void this.connectOnce();
   }
 
-  /** 回前台/用户手动重试:清退避立即连 */
+  /** 回前台 / 网络变化 / 用户手动重试:清退避立即连 */
   kick(): void {
     this.backoff = BACKOFF_MIN;
     if (this.retryTimer !== null) {
       clearTimeout(this.retryTimer);
       this.retryTimer = null;
     }
+    if (this.isConnected) return;
     this.start();
   }
 
   stop(): void {
     this.stopped = true;
-    if (this.retryTimer !== null) {
-      clearTimeout(this.retryTimer);
-      this.retryTimer = null;
-    }
+    this.clearTimers();
     this.ws?.close();
     this.ws = null;
     this.channel = null;
     this.activeAddr = null;
+    this.queue = [];
     useApp.getState().patchRuntime(this.host.id, { status: "idle", activeAddr: null });
+  }
+
+  private clearTimers(): void {
+    if (this.retryTimer !== null) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
+    if (this.heartbeatTimer !== null) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
   }
 
   private patch(patch: Parameters<ReturnType<typeof useApp.getState>["patchRuntime"]>[1]): void {
@@ -106,43 +138,72 @@ export class HostConnection {
   }
 
   private async connectOnce(): Promise<void> {
-    if (this.connecting) return;
+    if (this.connecting || this.stopped) return;
     this.connecting = true;
-    this.patch({
-      status: this.backoff === BACKOFF_MIN ? "connecting" : "reconnecting",
-    });
+    this.patch({ status: this.everConnected ? "reconnecting" : "connecting" });
     try {
       const won = await this.race();
       this.adopt(won);
-    } catch (e) {
+    } catch {
       this.connecting = false;
-      const fatal = e instanceof FatalConnectError;
+      const d = this.diagnosis;
       this.patch({
         status: "failed",
-        lastError: e instanceof Error ? e.message : String(e),
+        lastError: d ? `${d.summary} — ${d.hint}` : "连接失败",
       });
-      if (!fatal && !this.stopped) this.scheduleRetry();
+      if (d?.fatal !== true && !this.stopped) this.scheduleRetry();
     }
   }
 
+  /** 成功过的地址优先,其余保持原序 */
+  private orderedAddrs(): string[] {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    const preferred = this.host.lastGoodAddr;
+    if (preferred) {
+      out.push(preferred);
+      seen.add(preferred);
+    }
+    for (const a of this.host.addrs) {
+      if (!seen.has(a)) {
+        out.push(a);
+        seen.add(a);
+      }
+    }
+    return out;
+  }
+
   private race(): Promise<Won> {
-    const addrs = [...new Set(this.host.addrs)];
+    const addrs = this.orderedAddrs();
     return new Promise<Won>((resolve, reject) => {
       if (addrs.length === 0) {
-        reject(new Error("主机没有可用地址"));
+        this.diagnosis = diagnose([], !this.everConnected);
+        reject(new Error(this.diagnosis.summary));
         return;
       }
       let pending = addrs.length;
       let done = false;
-      let lastError: Error = new Error("全部地址连接失败");
+      const failures: AttemptResult[] = [];
+
+      const finishFailure = (): void => {
+        if (done) return;
+        done = true;
+        this.diagnosis = diagnose(failures, !this.everConnected);
+        reject(new Error(this.diagnosis.summary));
+      };
 
       for (const addr of addrs) {
+        const startedAt = Date.now();
         let ws: WebSocket;
         try {
           ws = new WebSocket(`ws://${addr}:${this.host.port}/ws`);
         } catch (e) {
-          lastError = e instanceof Error ? e : new Error(String(e));
-          if (--pending === 0 && !done) reject(lastError);
+          failures.push({
+            addr,
+            failure: "unreachable",
+            detail: e instanceof Error ? e.message : undefined,
+          });
+          if (--pending === 0) finishFailure();
           continue;
         }
         const { frame, channel } = clientHandshake(this.host.daemonPub, {
@@ -154,49 +215,58 @@ export class HostConnection {
             appVersion: APP_VERSION,
           },
         });
-        const timer = setTimeout(() => fail(new Error(`${addr} 超时`)), ATTEMPT_TIMEOUT_MS);
-        const fail = (e: Error): void => {
+
+        const fail = (failure: AttemptResult["failure"], detail?: string): void => {
           clearTimeout(timer);
           try {
             ws.close();
           } catch {
-            // ignore
+            // 已关闭
           }
           if (done) return;
-          lastError = e instanceof FatalConnectError ? e : lastError.message === "全部地址连接失败" ? e : lastError;
-          if (e instanceof FatalConnectError) {
-            done = true;
-            reject(e);
+          failures.push({ addr, ...(detail !== undefined ? { detail } : {}), failure });
+          if (failure === "auth") {
+            // 鉴权失败对所有地址都成立,不必等其余
+            finishFailure();
             return;
           }
-          if (--pending === 0) reject(lastError);
+          if (--pending === 0) finishFailure();
         };
-        ws.onopen = () => ws.send(frame);
-        ws.onerror = () => fail(new Error(`${addr} 连接失败`));
-        ws.onclose = () => fail(new Error(`${addr} 连接被关闭`));
+
+        const timer = setTimeout(() => fail("timeout"), ATTEMPT_TIMEOUT_MS);
+
+        // 连接被拒时 RN 会直接触发 onclose(而非 onerror),必须按"是否 open 过"
+        // 区分:没 open 过 = 端口不可达;open 过再关 = 握手阶段被拒。
+        let opened = false;
+        ws.onopen = () => {
+          opened = true;
+          ws.send(frame);
+        };
+        ws.onerror = () => fail(opened ? "handshake" : "unreachable");
+        ws.onclose = () => fail(opened ? "handshake" : "unreachable");
         ws.onmessage = (ev) => {
           try {
             const msg = parseS2C(channel.open(String(ev.data)));
             if (msg.type === "error" && msg.code === "auth_failed") {
-              fail(new FatalConnectError("配对已失效(token 无效或设备密钥变化),请重新扫码配对"));
+              fail("auth", msg.message);
               return;
             }
             if (msg.type !== "hello.ok") {
-              fail(new Error(`${addr} 意外的首条消息: ${msg.type}`));
+              fail("handshake", `unexpected ${msg.type}`);
               return;
             }
             clearTimeout(timer);
             if (done) {
-              ws.close(); // 竞速落败的连接
+              ws.close(); // 竞速落败
               return;
             }
             done = true;
             ws.onmessage = null;
             ws.onclose = null;
             ws.onerror = null;
-            resolve({ ws, channel, helloOk: msg, addr });
+            resolve({ ws, channel, helloOk: msg, addr, rttMs: Date.now() - startedAt });
           } catch (e) {
-            fail(e instanceof Error ? e : new Error(String(e)));
+            fail("handshake", e instanceof ProtocolError ? e.code : undefined);
           }
         };
       }
@@ -206,25 +276,57 @@ export class HostConnection {
   private adopt(won: Won): void {
     this.connecting = false;
     this.backoff = BACKOFF_MIN;
+    this.everConnected = true;
+    this.diagnosis = null;
     this.ws = won.ws;
     this.channel = won.channel;
     this.activeAddr = won.addr;
+    this.lastRttMs = won.rttMs;
+    this.lastRecvAt = Date.now();
+
     useApp.getState().setSessions(this.host.id, won.helloOk.sessions);
     this.patch({
       status: "connected",
       hostInfo: won.helloOk.host,
       activeAddr: won.addr,
       lastError: null,
+      rttMs: won.rttMs,
     });
+
+    // 记住这个地址,下次优先试(切网后往往还是同一个)
+    void rememberGoodAddr(this.host.id, won.addr);
+
     won.ws.onmessage = (ev) => this.onMessage(String(ev.data));
     won.ws.onclose = () => this.onClose();
     won.ws.onerror = () => {
-      // onclose 会随后触发
+      // onclose 随后触发
     };
-    this.events.emit("connected", { addr: won.addr });
+
+    this.startHeartbeat();
+    this.flushQueue();
+    this.events.emit("connected", { addr: won.addr, rttMs: won.rttMs });
+  }
+
+  /**
+   * 心跳:RN 的 WebSocket 不暴露 ping/pong,靠"最近收到任何数据的时间"判活。
+   * daemon 每 15s 发一次 ping(ws 协议层),RN 侧收不到 ping 事件,
+   * 所以这里额外发一条无副作用的 term.ack 触发对端活动,并检测长时间静默。
+   */
+  private startHeartbeat(): void {
+    if (this.heartbeatTimer !== null) clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = setInterval(() => {
+      if (!this.isConnected) return;
+      const silent = Date.now() - this.lastRecvAt;
+      if (silent > SILENCE_LIMIT_MS) {
+        // 半开连接:socket 还是 OPEN 但实际已死,主动断开走重连
+        this.ws?.close();
+        return;
+      }
+    }, HEARTBEAT_MS);
   }
 
   private onMessage(text: string): void {
+    this.lastRecvAt = Date.now();
     let msg: S2CMessage;
     try {
       msg = parseS2C(this.channel!.open(text));
@@ -259,6 +361,7 @@ export class HostConnection {
 
   private onClose(): void {
     const wasConnected = this.isConnected;
+    this.clearTimers();
     this.ws = null;
     this.channel = null;
     this.activeAddr = null;
@@ -280,10 +383,24 @@ export class HostConnection {
 
   // ---------------------------------------------------------------- 发送 API
 
-  send(msg: C2SMessage): boolean {
-    if (!this.isConnected) return false;
-    this.ws!.send(this.channel!.seal(msg));
-    return true;
+  /**
+   * @param queueable 断线时是否排队补发。
+   * 用户意图(发消息、审批)值得排队;终端按键与 ack 过期即无意义,丢弃。
+   */
+  send(msg: C2SMessage, queueable = false): boolean {
+    if (this.isConnected) {
+      this.ws!.send(this.channel!.seal(msg));
+      return true;
+    }
+    if (queueable && this.queue.length < MAX_QUEUE) this.queue.push(msg);
+    return false;
+  }
+
+  private flushQueue(): void {
+    if (this.queue.length === 0) return;
+    const pending = this.queue;
+    this.queue = [];
+    for (const m of pending) this.send(m);
   }
 
   createSession(
@@ -294,27 +411,30 @@ export class HostConnection {
     cols = 80,
     rows = 24,
   ): void {
-    this.send({
-      type: "session.create",
-      agent,
-      ...(kind ? { kind } : {}),
-      ...(cwd ? { cwd } : {}),
-      ...(command ? { command } : {}),
-      cols,
-      rows,
-    });
-  }
-
-  chatSend(sid: string, text: string): void {
-    this.send({ type: "chat.send", sid, text });
-  }
-
-  respondPermission(sid: string, reqId: string, reply: PermissionReply): void {
-    this.send({ type: "permission.respond", sid, reqId, reply });
+    this.send(
+      {
+        type: "session.create",
+        agent,
+        ...(kind ? { kind } : {}),
+        ...(cwd ? { cwd } : {}),
+        ...(command ? { command } : {}),
+        cols,
+        rows,
+      },
+      true,
+    );
   }
 
   attach(sid: string, lastSeq?: number): void {
     this.send({ type: "session.attach", sid, ...(lastSeq !== undefined ? { lastSeq } : {}) });
+  }
+
+  chatSend(sid: string, text: string): void {
+    this.send({ type: "chat.send", sid, text }, true);
+  }
+
+  respondPermission(sid: string, reqId: string, reply: PermissionReply): void {
+    this.send({ type: "permission.respond", sid, reqId, reply }, true);
   }
 
   inputB64(sid: string, dataB64: string): void {
@@ -334,11 +454,11 @@ export class HostConnection {
   }
 
   interrupt(sid: string): void {
-    this.send({ type: "session.interrupt", sid });
+    this.send({ type: "session.interrupt", sid }, true);
   }
 
   kill(sid: string): void {
-    this.send({ type: "session.kill", sid });
+    this.send({ type: "session.kill", sid }, true);
   }
 }
 

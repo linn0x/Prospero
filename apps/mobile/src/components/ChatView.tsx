@@ -2,8 +2,9 @@
  * 结构化会话视图:消息流 + 工具卡片 + 审批卡片。
  * 事件→条目的折叠逻辑在 lib/chat-model,这里只负责渲染与交互。
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import * as Clipboard from "expo-clipboard";
+import * as Haptics from "expo-haptics";
 import { FlatList, Pressable, StyleSheet, Text, View } from "react-native";
 import type { PermissionReply } from "@prospero/protocol";
 import { Markdown } from "@/components/Markdown";
@@ -65,6 +66,12 @@ export function ChatView({ conn, sid, onPendingChange }: Props) {
 
   const respond = useCallback(
     (reqId: string, reply: PermissionReply) => {
+      // 审批是全 App 最高风险的点击,给一次触觉确认
+      void Haptics.notificationAsync(
+        reply === "reject"
+          ? Haptics.NotificationFeedbackType.Warning
+          : Haptics.NotificationFeedbackType.Success,
+      );
       conn.respondPermission(sid, reqId, reply);
     },
     [conn, sid],
@@ -83,6 +90,12 @@ export function ChatView({ conn, sid, onPendingChange }: Props) {
           layoutMeasurement.height + contentOffset.y >= contentSize.height - 60;
       }}
       scrollEventThrottle={200}
+      keyboardShouldPersistTaps="handled"
+      keyboardDismissMode="interactive"
+      removeClippedSubviews
+      initialNumToRender={12}
+      maxToRenderPerBatch={8}
+      windowSize={11}
       ListEmptyComponent={
         <Text style={styles.empty}>会话已就绪,发一条消息开始。</Text>
       }
@@ -104,22 +117,21 @@ export function ChatView({ conn, sid, onPendingChange }: Props) {
   );
 }
 
-/** 长按复制:手机上把 agent 输出拷走的唯一顺手方式 */
-function useCopy(): (text: string, label: string) => void {
-  const [, force] = useState(0);
+/** 长按复制:手机上把 agent 输出拷走的唯一顺手方式,附触觉确认 */
+function useCopy(): (text: string) => void {
   return useCallback((text: string) => {
     void Clipboard.setStringAsync(text);
-    force((n) => n + 1);
+    void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
   }, []);
 }
 
-function UserBubble({ item }: { item: UserItem }) {
+const UserBubble = memo(function UserBubble({ item }: { item: UserItem }) {
   const copy = useCopy();
   return (
     <View style={styles.userRow}>
       <Pressable
         style={styles.userBubble}
-        onLongPress={() => copy(item.text, "消息")}
+        onLongPress={() => copy(item.text)}
         delayLongPress={350}
       >
         <Text style={styles.userText} selectable>
@@ -128,9 +140,13 @@ function UserBubble({ item }: { item: UserItem }) {
       </Pressable>
     </View>
   );
-}
+});
 
-function AssistantBubble({ item }: { item: AssistantItem }) {
+/**
+ * memo 化:流式输出时列表每收到一个 delta 就重渲染,
+ * 不做记忆化的话历史消息(可能上百条)会跟着一起重算。
+ */
+const AssistantBubble = memo(function AssistantBubble({ item }: { item: AssistantItem }) {
   const [showReasoning, setShowReasoning] = useState(false);
   const copy = useCopy();
   const cost = item.finish?.costUsd;
@@ -138,7 +154,7 @@ function AssistantBubble({ item }: { item: AssistantItem }) {
   return (
     <Pressable
       style={styles.assistantRow}
-      onLongPress={() => copy(item.text, "回复")}
+      onLongPress={() => copy(item.text)}
       delayLongPress={350}
     >
       {item.reasoning.length > 0 && (
@@ -161,19 +177,19 @@ function AssistantBubble({ item }: { item: AssistantItem }) {
       )}
     </Pressable>
   );
-}
+});
 
 const stateLabel = { running: "运行中", success: "完成", failed: "失败" } as const;
 const stateColor = { running: "#d9a441", success: "#4dbd74", failed: "#e5534b" } as const;
 
-function ToolCard({ item }: { item: ToolItem }) {
+const ToolCard = memo(function ToolCard({ item }: { item: ToolItem }) {
   const [expanded, setExpanded] = useState(false);
   const copy = useCopy();
   return (
     <Pressable
       style={styles.toolCard}
       onPress={() => setExpanded((v) => !v)}
-      onLongPress={() => copy(`${item.tool}\n${item.input}\n${item.result ?? ""}`, "工具详情")}
+      onLongPress={() => copy(`${item.tool}\n${item.input}\n${item.result ?? ""}`)}
       delayLongPress={350}
     >
       <View style={styles.toolHeader}>
@@ -196,7 +212,7 @@ function ToolCard({ item }: { item: ToolItem }) {
       )}
     </Pressable>
   );
-}
+});
 
 const replyLabel: Record<PermissionReply, string> = {
   once: "已允许一次",
@@ -204,7 +220,7 @@ const replyLabel: Record<PermissionReply, string> = {
   reject: "已拒绝",
 };
 
-function PermissionCard({
+const PermissionCard = memo(function PermissionCard({
   item,
   onRespond,
 }: {
@@ -246,15 +262,17 @@ function PermissionCard({
       )}
     </View>
   );
-}
+});
 
-function ErrorCard({ item }: { item: ErrorItem }) {
+const ErrorCard = memo(function ErrorCard({ item }: { item: ErrorItem }) {
   return (
     <View style={styles.errorCard}>
-      <Text style={styles.errorText}>{item.message}</Text>
+      <Text style={styles.errorText} selectable>
+        {item.message}
+      </Text>
     </View>
   );
-}
+});
 
 const styles = StyleSheet.create({
   list: { flex: 1, backgroundColor: "#0b0b0e" },

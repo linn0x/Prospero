@@ -12,6 +12,7 @@ import {
 import { Stack, router, useLocalSearchParams } from "expo-router";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import { decodePairingQR } from "@prospero/protocol";
+import { useDiscovery } from "@/lib/discovery";
 import { upsertHostFromPairing } from "@/lib/hosts";
 
 export default function PairScreen() {
@@ -19,6 +20,8 @@ export default function PairScreen() {
   const [manual, setManual] = useState("");
   const scannedRef = useRef(false);
   const { d } = useLocalSearchParams<{ d?: string }>();
+  // 扫描同网段的 prosperod:让用户确认"这台 Mac 确实在跑",再去扫码
+  const { hosts: discovered } = useDiscovery(true);
 
   const handle = useCallback(async (text: string): Promise<void> => {
     if (scannedRef.current) return;
@@ -73,7 +76,13 @@ export default function PairScreen() {
           </View>
         )}
         <View style={styles.hintWrap} pointerEvents="none">
-          <Text style={styles.hint}>对准 Mac 终端里 prosperod pair 打印的二维码</Text>
+          <Text style={styles.hint}>
+            {discovered.length > 0
+              ? `已在本网络发现 ${String(discovered.length)} 台:${discovered
+                  .map((h) => h.name)
+                  .join("、")} —— 扫描它的配对码`
+              : "对准 Mac 终端里 prosperod pair 打印的二维码"}
+          </Text>
         </View>
       </View>
       <View style={styles.manual}>
