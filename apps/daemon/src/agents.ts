@@ -39,11 +39,25 @@ export function requiresShellCapability(agent: AgentKind): boolean {
 }
 
 /**
- * 是否有结构化适配器(聊天 UI + 一键审批)。
+ * 是否有结构化适配器(聊天 UI)。
  * 其余 agent 回落 PTY 轨,功能不减、只是形态是终端镜像。
  */
 export function structuredCapable(agent: AgentKind): boolean {
-  return agent === "opencode" || agent === "claude" || agent === "codex";
+  return (
+    agent === "opencode" || agent === "claude" || agent === "codex" || agent === "grok"
+  );
+}
+
+/**
+ * 未指定 kind 时的默认轨道。
+ *
+ * Grok 有适配器但默认仍走 PTY:它的 headless 模式只有粗粒度审批
+ * (--always-approve),无法把审批请求送到手机;而 TUI 里用户能看到并回答。
+ * 想要聊天形态可显式指定 kind:"structured",此时等同自动批准。
+ */
+export function defaultKindFor(agent: AgentKind): "pty" | "structured" {
+  if (agent === "grok") return "pty";
+  return structuredCapable(agent) ? "structured" : "pty";
 }
 
 export function spawnEnv(): Record<string, string> {

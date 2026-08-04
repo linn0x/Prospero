@@ -129,8 +129,9 @@ describeIf("opencode 结构化会话", () => {
 describe("适配器能力查询", () => {
   it("无适配器的 agent 请求 structured 会被拒", async () => {
     const m = new SessionManager();
+    // trae 尚无结构化适配器(grok 已有,仅默认走 PTY)
     await expect(
-      m.create({ agent: "grok", kind: "structured", cwd, cols: 80, rows: 24, allowShell: false }),
+      m.create({ agent: "trae", kind: "structured", cwd, cols: 80, rows: 24, allowShell: false }),
     ).rejects.toThrow(/结构化适配器/);
   });
 });
