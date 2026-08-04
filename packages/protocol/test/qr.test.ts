@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  PROTOCOL_VERSION,
   ProtocolError,
   decodePairingQR,
   encodePairingQR,
@@ -7,7 +8,7 @@ import {
   type PairingPayload,
 } from "../src/index.js";
 
-function makePayload(v = 0): PairingPayload {
+function makePayload(v = PROTOCOL_VERSION): PairingPayload {
   return {
     v,
     name: "MacBook-Pro",
@@ -33,7 +34,7 @@ describe("pairing QR", () => {
   });
 
   it("拒绝不支持的版本", () => {
-    const qr = encodePairingQR(makePayload(1));
+    const qr = encodePairingQR(makePayload(PROTOCOL_VERSION + 1));
     try {
       decodePairingQR(qr);
       expect.unreachable();
