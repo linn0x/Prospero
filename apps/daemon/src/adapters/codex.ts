@@ -17,7 +17,8 @@
  * - 决定值 ReviewDecision:"approved" | "approved_for_session" | {denied:{rejection}} | "abort"
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import type { AgentEventBody, PermissionReply } from "@prospero/protocol";
+import type { AgentEventBody, FileDiff, PermissionReply } from "@prospero/protocol";
+import { fromUnifiedPatch } from "./diff.js";
 import { AdapterError, summarize, type AdapterContext, type AgentAdapter } from "./types.js";
 
 const START_TIMEOUT_MS = 30_000;
@@ -36,6 +37,32 @@ interface PendingApproval {
   itemId: string;
 }
 
+/** 从 Codex 的通知参数里找 unified patch(字段名随版本有出入,尽力而为) */
+function extractDiff(p: Record<string, unknown>): FileDiff | null {
+  const path =
+    typeof p["path"] === "string"
+      ? p["path"]
+      : typeof p["file"] === "string"
+        ? p["file"]
+        : "";
+  const patch = p["patch"] ?? p["unifiedDiff"] ?? p["diff"];
+  if (typeof patch === "string" && patch.length > 0) {
+    return fromUnifiedPatch(path, patch);
+  }
+  // changes: { "<path>": { patch | unifiedDiff } }
+  const changes = p["changes"];
+  if (changes && typeof changes === "object" && !Array.isArray(changes)) {
+    for (const [k, v] of Object.entries(changes as Record<string, unknown>)) {
+      if (v && typeof v === "object") {
+        const inner = v as Record<string, unknown>;
+        const ip = inner["patch"] ?? inner["unifiedDiff"] ?? inner["diff"];
+        if (typeof ip === "string" && ip.length > 0) return fromUnifiedPatch(k, ip);
+      }
+    }
+  }
+  return null;
+}
+
 export class CodexAdapter implements AgentAdapter {
   private proc: ChildProcess | null = null;
   private ctx: AdapterContext | null = null;
@@ -47,6 +74,8 @@ export class CodexAdapter implements AgentAdapter {
   /** itemId → 工具名,用于 item/completed 时回填 tool.end */
   private readonly toolItems = new Map<string, string>();
   private currentTurnMsgId = "";
+  /** itemId → 已收到的 patch,审批与 item 完成时取用 */
+  private readonly pendingDiffs = new Map<string, FileDiff>();
   /**
    * 最近一条助手文本的 itemId。turn/completed 只带 turnId,与文本 item 的 id
    * 不同;若拿 turnId 当 msgId,客户端会把用量挂到一条不存在的消息上。
@@ -148,12 +177,15 @@ export class CodexAdapter implements AgentAdapter {
       case "item/permissions/requestApproval": {
         this.approvals.set(itemId, { rpcId: msg.id!, itemId });
         const reason = p["reason"] ?? p["grantRoot"] ?? p["changes"] ?? "修改文件";
+        // Codex 会通过 patchUpdated 先行给出 patch,这里取用
+        const diff = this.pendingDiffs.get(itemId) ?? extractDiff(p);
         this.emit({
           kind: "permission.request",
           reqId: itemId,
           action: "修改文件",
-          resources: [summarize(reason, 400)],
-          summary: `修改文件:${summarize(reason, 200)}`,
+          resources: [summarize(diff?.path ?? reason, 400)],
+          summary: `修改文件:${summarize(diff?.path ?? reason, 200)}`,
+          ...(diff ? { diff } : {}),
         });
         return;
       }
@@ -217,17 +249,31 @@ export class CodexAdapter implements AgentAdapter {
         }
         return;
       }
+      case "item/fileChange/patchUpdated": {
+        // Codex 原生给出 patch,无需合成
+        const diff = extractDiff(p);
+        if (diff) this.pendingDiffs.set(String(p["itemId"] ?? ""), diff);
+        return;
+      }
       case "item/completed": {
         const item = (p["item"] ?? {}) as Record<string, unknown>;
         const itemId = String(item["id"] ?? p["itemId"] ?? "");
         if (!this.toolItems.has(itemId)) return;
         this.toolItems.delete(itemId);
         const status = String(item["status"] ?? "completed");
+        const raw = item["output"] ?? item["result"] ?? status;
+        const full = typeof raw === "string" ? raw : JSON.stringify(raw, null, 2);
+        if (full.length > 0) this.ctx?.recordOutput?.(itemId, full);
+        const summary = summarize(raw);
+        const diff = this.pendingDiffs.get(itemId);
+        this.pendingDiffs.delete(itemId);
         this.emit({
           kind: "tool.end",
           callId: itemId,
           state: status === "failed" || status === "error" ? "failed" : "success",
-          summary: summarize(item["output"] ?? item["result"] ?? status),
+          summary,
+          ...(full.length > summary.length ? { hasMore: true } : {}),
+          ...(diff ? { diff } : {}),
         });
         return;
       }

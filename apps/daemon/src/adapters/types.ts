@@ -11,6 +11,12 @@ export interface AdapterContext {
   cwd: string;
   /** 适配器产出一条归一化事件 */
   emit(body: AgentEventBody): void;
+  /**
+   * 登记某次工具调用的完整输出。
+   * 事件里只带摘要(手机上没必要一次性收下 100KB 的测试日志),
+   * 用户展开卡片时再按需拉全文。
+   */
+  recordOutput?(callId: string, output: string): void;
 }
 
 export interface AgentAdapter {
