@@ -31,6 +31,14 @@ import { authenticate, loadDevices, loadIdentity, type DeviceRecord } from "./pa
 import { Notifier, type NotifyConfig } from "./notify.js";
 import { SessionError, SessionManager } from "./session-manager.js";
 import { StatusFile } from "./status-file.js";
+import {
+  FsError,
+  listDir,
+  readChunk,
+  readForEdit,
+  writeChunk,
+  writeFileAt,
+} from "./fs-ops.js";
 import type { PtySession } from "./pty-session.js";
 
 const DAEMON_VERSION = "0.0.1";
@@ -416,6 +424,94 @@ export async function createDaemonServer(
       case "session.kill":
         await manager.kill(msg.sid);
         return;
+
+      case "fs.list":
+      case "fs.read":
+      case "fs.write":
+      case "fs.get":
+      case "fs.put":
+        await handleFs(conn, msg);
+        return;
+    }
+  }
+
+  /**
+   * 文件操作。根 = 会话 cwd,越界由 fs-ops 拒绝。
+   * 错误统一转成 error 消息而不是断开连接 —— 找不到文件是日常情况,不是协议违规。
+   */
+  async function handleFs(
+    conn: Conn,
+    msg: Extract<C2SMessage, { type: `fs.${string}` }>,
+  ): Promise<void> {
+    const root = manager.cwdOf(msg.sid);
+    if (root === null) {
+      send(conn, {
+        type: "error",
+        code: "session_not_found",
+        message: `no such session: ${msg.sid}`,
+        sid: msg.sid,
+      });
+      return;
+    }
+    try {
+      switch (msg.type) {
+        case "fs.list": {
+          const entries = await listDir(root, msg.path);
+          send(conn, { type: "fs.listing", sid: msg.sid, path: msg.path, entries });
+          return;
+        }
+        case "fs.read": {
+          const r = await readForEdit(root, msg.path);
+          send(conn, {
+            type: "fs.content",
+            sid: msg.sid,
+            path: msg.path,
+            contentB64: r.content.toString("base64"),
+            size: r.size,
+            truncated: r.truncated,
+            binary: r.binary,
+          });
+          return;
+        }
+        case "fs.write": {
+          const size = await writeFileAt(root, msg.path, Buffer.from(msg.contentB64, "base64"));
+          send(conn, { type: "fs.written", sid: msg.sid, path: msg.path, size });
+          return;
+        }
+        case "fs.get": {
+          const c = await readChunk(root, msg.path, msg.offset, msg.length);
+          send(conn, {
+            type: "fs.chunk",
+            sid: msg.sid,
+            path: msg.path,
+            offset: msg.offset,
+            dataB64: c.data.toString("base64"),
+            total: c.total,
+            eof: c.eof,
+          });
+          return;
+        }
+        case "fs.put": {
+          const size = await writeChunk(
+            root,
+            msg.path,
+            msg.offset,
+            Buffer.from(msg.dataB64, "base64"),
+          );
+          if (msg.final) {
+            send(conn, { type: "fs.written", sid: msg.sid, path: msg.path, size });
+          }
+          return;
+        }
+      }
+    } catch (e) {
+      const code = e instanceof FsError ? e.code : "io";
+      send(conn, {
+        type: "error",
+        code: code === "denied" ? "denied" : "fs_error",
+        message: e instanceof Error ? e.message : String(e),
+        sid: msg.sid,
+      });
     }
   }
 

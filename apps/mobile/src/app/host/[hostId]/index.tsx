@@ -236,7 +236,14 @@ export default function HostScreen() {
         }
         renderItem={({ item }) => {
           const done = item.status === "done" || item.status === "died";
-          const actions: SwipeAction[] = [];
+          const actions: SwipeAction[] = [
+            {
+              label: "文件",
+              symbol: "doc.on.doc",
+              color: "#3a6ea5",
+              onPress: () => router.push(`/host/${hostId}/files/${item.id}`),
+            },
+          ];
           // 还在跑的先给"中断"—— 多数时候用户只是想停掉当前这一轮,而不是丢掉整个会话
           if (!done) {
             actions.push({
