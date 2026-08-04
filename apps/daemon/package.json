@@ -13,8 +13,10 @@
   },
   "dependencies": {
     "@prospero/protocol": "*",
+    "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-serialize": "^0.14.0",
     "@xterm/headless": "^6.0.0",
+    "@xterm/xterm": "^6.0.0",
     "bonjour-service": "^1.4.0",
     "commander": "^13.0.0",
     "node-pty": "^1.1.0",

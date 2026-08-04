@@ -1,0 +1,50 @@
+/**
+ * 各 agent 的 PTY 启动配置。M1 全部走 PTY 通用轨;
+ * M2 起 claude/opencode/codex 迁移到结构化适配(Agent SDK / HTTP / app-server)。
+ */
+import type { AgentKind } from "@prospero/protocol";
+
+export interface SpawnSpec {
+  file: string;
+  args: string[];
+}
+
+export function commandFor(agent: AgentKind, customCommand?: string): SpawnSpec {
+  const shell = process.env["SHELL"] ?? "/bin/zsh";
+  switch (agent) {
+    case "shell":
+      return { file: shell, args: ["-il"] };
+    case "claude":
+      return { file: "claude", args: [] };
+    case "codex":
+      return { file: "codex", args: [] };
+    case "opencode":
+      return { file: "opencode", args: [] };
+    case "grok":
+      return { file: "grok", args: [] };
+    case "trae":
+      return { file: "trae-cli", args: ["interactive"] };
+    case "custom": {
+      if (!customCommand || customCommand.trim() === "") {
+        throw new Error("custom agent requires a command");
+      }
+      return { file: shell, args: ["-c", customCommand] };
+    }
+  }
+}
+
+/** 需要 allowShell 能力的会话类型(完整用户权限) */
+export function requiresShellCapability(agent: AgentKind): boolean {
+  return agent === "shell" || agent === "custom";
+}
+
+export function spawnEnv(): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v !== undefined) env[k] = v;
+  }
+  env["TERM"] = "xterm-256color";
+  env["COLORTERM"] = "truecolor";
+  env["LANG"] = env["LANG"] ?? "en_US.UTF-8";
+  return env;
+}
