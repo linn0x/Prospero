@@ -259,11 +259,16 @@ export class OpencodeAdapter implements AgentAdapter {
       case "session.next.tool.success": {
         const callId = String(d["callID"] ?? "");
         this.toolNames.delete(callId);
+        const raw = d["structured"] ?? d["result"] ?? d["content"] ?? "完成";
+        const full = typeof raw === "string" ? raw : JSON.stringify(raw, null, 2);
+        if (full.length > 0) this.ctx?.recordOutput?.(callId, full);
+        const summary = summarize(raw);
         this.emit({
           kind: "tool.end",
           callId,
           state: "success",
-          summary: summarize(d["structured"] ?? d["result"] ?? d["content"] ?? "完成"),
+          summary,
+          ...(full.length > summary.length ? { hasMore: true } : {}),
         });
         return;
       }
