@@ -2,9 +2,17 @@ import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import type { AgentKind, SessionInfo } from "@prospero/protocol";
-import { commandFor, requiresShellCapability, spawnEnv } from "./agents.js";
+import type {
+  AgentEventBody,
+  AgentKind,
+  SessionInfo,
+  SessionKind,
+} from "@prospero/protocol";
+import { commandFor, requiresShellCapability, spawnEnv, structuredCapable } from "./agents.js";
 import { PtySession } from "./pty-session.js";
+import { StructuredSession, titleFor } from "./structured-session.js";
+import { OpencodeAdapter } from "./adapters/opencode.js";
+import type { AgentAdapter } from "./adapters/types.js";
 
 export type SessionErrorCode =
   | "shell_not_allowed"
@@ -23,6 +31,8 @@ export class SessionError extends Error {
 
 export interface CreateSessionInput {
   agent: AgentKind;
+  /** 省略时按 agent 能力决定:有适配器的走 structured */
+  kind?: SessionKind | undefined;
   cwd?: string | undefined;
   command?: string | undefined;
   cols: number;
@@ -33,19 +43,43 @@ export interface CreateSessionInput {
 
 export interface SessionManagerEvents {
   output: [sid: string, dataB64: string, seq: number];
+  agentEvent: [sid: string, body: AgentEventBody, evSeq: number];
   state: [info: SessionInfo];
 }
 
-export class SessionManager extends EventEmitter<SessionManagerEvents> {
-  private readonly sessions = new Map<string, PtySession>();
+function makeAdapter(agent: AgentKind): AgentAdapter {
+  switch (agent) {
+    case "opencode":
+      return new OpencodeAdapter();
+    default:
+      throw new SessionError(`agent "${agent}" 暂无结构化适配器`, "agent_unavailable");
+  }
+}
 
-  create(input: CreateSessionInput): PtySession {
+export class SessionManager extends EventEmitter<SessionManagerEvents> {
+  private readonly ptySessions = new Map<string, PtySession>();
+  private readonly structuredSessions = new Map<string, StructuredSession>();
+
+  /** 结构化会话需要异步启动后端,故整体为 async */
+  async create(input: CreateSessionInput): Promise<SessionInfo> {
     if (requiresShellCapability(input.agent) && !input.allowShell) {
       throw new SessionError(
         `device is not allowed to start "${input.agent}" sessions`,
         "shell_not_allowed",
       );
     }
+    const cwd = input.cwd ?? os.homedir();
+    const kind: SessionKind =
+      input.kind ?? (structuredCapable(input.agent) ? "structured" : "pty");
+    if (kind === "structured" && !structuredCapable(input.agent)) {
+      throw new SessionError(`agent "${input.agent}" 暂无结构化适配器`, "agent_unavailable");
+    }
+    return kind === "structured"
+      ? this.createStructured(input.agent, cwd)
+      : this.createPty(input, cwd);
+  }
+
+  private createPty(input: CreateSessionInput, cwd: string): SessionInfo {
     let spec;
     try {
       spec = commandFor(input.agent, input.command);
@@ -55,15 +89,13 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
         "agent_unavailable",
       );
     }
-    const cwd = input.cwd ?? os.homedir();
     const id = randomUUID();
-    const title = `${input.agent} · ${path.basename(cwd)}`;
     let session: PtySession;
     try {
       session = new PtySession({
         id,
         agent: input.agent,
-        title,
+        title: `${input.agent} · ${path.basename(cwd)}`,
         cwd,
         cols: input.cols,
         rows: input.rows,
@@ -78,35 +110,109 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
         "agent_unavailable",
       );
     }
-    this.sessions.set(id, session);
+    this.ptySessions.set(id, session);
     session.on("output", (dataB64, seq) => this.emit("output", id, dataB64, seq));
     session.on("state", (info) => this.emit("state", info));
     this.emit("state", session.info());
-    return session;
+    return session.info();
   }
 
-  get(sid: string): PtySession | undefined {
-    return this.sessions.get(sid);
+  private async createStructured(agent: AgentKind, cwd: string): Promise<SessionInfo> {
+    const id = randomUUID();
+    const session = new StructuredSession({
+      id,
+      agent,
+      title: titleFor(agent, cwd),
+      cwd,
+      adapter: makeAdapter(agent),
+    });
+    session.on("event", (body, evSeq) => this.emit("agentEvent", id, body, evSeq));
+    session.on("state", (info) => this.emit("state", info));
+    this.structuredSessions.set(id, session);
+    try {
+      await session.start();
+    } catch (e) {
+      this.structuredSessions.delete(id);
+      await session.dispose().catch(() => {});
+      throw new SessionError(
+        `无法启动 ${agent} 会话:${e instanceof Error ? e.message : String(e)}`,
+        "agent_unavailable",
+      );
+    }
+    this.emit("state", session.info());
+    return session.info();
   }
 
-  require(sid: string): PtySession {
-    const s = this.sessions.get(sid);
-    if (!s) throw new SessionError(`no such session: ${sid}`, "session_not_found");
+  getPty(sid: string): PtySession | undefined {
+    return this.ptySessions.get(sid);
+  }
+
+  getStructured(sid: string): StructuredSession | undefined {
+    return this.structuredSessions.get(sid);
+  }
+
+  requirePty(sid: string): PtySession {
+    const s = this.ptySessions.get(sid);
+    if (!s) {
+      throw new SessionError(
+        this.structuredSessions.has(sid)
+          ? `session ${sid} 是结构化会话,不接受终端输入`
+          : `no such session: ${sid}`,
+        "session_not_found",
+      );
+    }
     return s;
   }
 
+  requireStructured(sid: string): StructuredSession {
+    const s = this.structuredSessions.get(sid);
+    if (!s) {
+      throw new SessionError(
+        this.ptySessions.has(sid)
+          ? `session ${sid} 是终端会话,不接受聊天消息`
+          : `no such session: ${sid}`,
+        "session_not_found",
+      );
+    }
+    return s;
+  }
+
+  infoOf(sid: string): SessionInfo {
+    const s = this.ptySessions.get(sid) ?? this.structuredSessions.get(sid);
+    if (!s) throw new SessionError(`no such session: ${sid}`, "session_not_found");
+    return s.info();
+  }
+
   list(): SessionInfo[] {
-    return [...this.sessions.values()]
-      .map((s) => s.info())
-      .sort((a, b) => a.createdAt - b.createdAt);
+    return [
+      ...[...this.ptySessions.values()].map((s) => s.info()),
+      ...[...this.structuredSessions.values()].map((s) => s.info()),
+    ].sort((a, b) => a.createdAt - b.createdAt);
+  }
+
+  async interrupt(sid: string): Promise<void> {
+    const structured = this.structuredSessions.get(sid);
+    if (structured) {
+      await structured.interrupt();
+      return;
+    }
+    this.requirePty(sid).interrupt();
   }
 
   /** 终止并移除会话 */
-  kill(sid: string): void {
-    const s = this.require(sid);
-    const info = s.info();
-    s.dispose();
-    this.sessions.delete(sid);
+  async kill(sid: string): Promise<void> {
+    const structured = this.structuredSessions.get(sid);
+    if (structured) {
+      const info = structured.info();
+      await structured.dispose();
+      this.structuredSessions.delete(sid);
+      this.emit("state", { ...info, status: "done" });
+      return;
+    }
+    const pty = this.requirePty(sid);
+    const info = pty.info();
+    pty.dispose();
+    this.ptySessions.delete(sid);
     this.emit("state", {
       ...info,
       status: info.status === "done" ? "done" : "died",
@@ -114,7 +220,9 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   }
 
   disposeAll(): void {
-    for (const s of this.sessions.values()) s.dispose();
-    this.sessions.clear();
+    for (const s of this.ptySessions.values()) s.dispose();
+    this.ptySessions.clear();
+    for (const s of this.structuredSessions.values()) void s.dispose();
+    this.structuredSessions.clear();
   }
 }

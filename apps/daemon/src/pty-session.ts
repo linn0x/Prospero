@@ -125,6 +125,7 @@ export class PtySession extends EventEmitter<PtySessionEvents> {
     return {
       id: this.id,
       agent: this.agent,
+      kind: "pty",
       title: this.title,
       cwd: this.cwd,
       status: this.status,
