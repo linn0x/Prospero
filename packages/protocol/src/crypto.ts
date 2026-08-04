@@ -203,7 +203,7 @@ export function clientHandshakeFinish(
   if (!opened || !equalBytes(opened, proofPayload(serverEph, state.ephPublic))) {
     throw new ProtocolError(
       "daemon identity proof failed — wrong host, or man in the middle",
-      "crypto",
+      "untrusted",
     );
   }
 

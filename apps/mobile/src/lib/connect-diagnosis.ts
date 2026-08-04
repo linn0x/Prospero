@@ -13,7 +13,13 @@ export type AttemptFailure =
   /** 超时:地址存在但没人应答(Mac 睡眠 / daemon 未运行 / 防火墙丢包) */
   | "timeout"
   /** 鉴权失败:token 失效或设备密钥变化 */
-  | "auth";
+  | "auth"
+  /** 协议版本不符:App 与 daemon 有一端旧了 */
+  | "version"
+  /** 这台设备已在 Mac 上被移除 */
+  | "revoked"
+  /** 对面证明不了自己是配对时那台 Mac(换了密钥,或有中间人) */
+  | "untrusted";
 
 export interface AttemptResult {
   addr: string;
@@ -35,6 +41,37 @@ export function diagnose(results: AttemptResult[], isFirstEver: boolean): Diagno
     return {
       summary: "没有可用地址",
       hint: "这台 Mac 的配对信息里没有地址,请重新扫码配对。",
+      fatal: true,
+    };
+  }
+
+  // 以下几类对所有候选地址都成立,重试没有意义 —— 早于"哪个地址通"的判断。
+
+  // 安全性最高优先:证明失败意味着对面不是配对时那台 Mac,不该被淹没在网络问题里
+  if (results.some((r) => r.failure === "untrusted")) {
+    return {
+      summary: "无法确认这台 Mac 的身份",
+      hint:
+        "对方没能证明自己持有配对时记录的密钥。可能是 Mac 上的 prosperod 重置过身份(~/.prospero/identity.json 被删)," +
+        "也可能有人在中间冒充。确认无误后重新扫码配对;若你没做过重置,先别连。",
+      fatal: true,
+    };
+  }
+
+  if (results.some((r) => r.failure === "revoked")) {
+    return {
+      summary: "此设备已被移除",
+      hint: "你在 Mac 上撤销了这台设备。要恢复使用,请运行 prosperod pair 重新扫码配对。",
+      fatal: true,
+    };
+  }
+
+  if (results.some((r) => r.failure === "version")) {
+    return {
+      summary: "App 与 daemon 版本不符",
+      hint:
+        "两端协议版本不一致,通常是 App 比 Mac 上的 prosperod 旧。请重新构建并安装 App" +
+        "(apps/mobile/scripts/build-ipa.sh),然后重新扫码配对。",
       fatal: true,
     };
   }

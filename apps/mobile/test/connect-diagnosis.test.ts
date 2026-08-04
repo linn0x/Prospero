@@ -36,9 +36,33 @@ describe("连接失败诊断", () => {
     expect(d.hint).toContain("prosperod");
   });
 
-  it("协议版本不一致给出明确指引", () => {
-    const d = diagnose([at("10.0.0.1", "handshake", "version")], false);
-    expect(d.hint).toContain("协议版本");
+  it("版本不符是终局:指向重装 App,且不再重试", () => {
+    const d = diagnose([at("10.0.0.1", "version")], false);
+    expect(d.summary).toContain("版本不符");
+    expect(d.hint).toContain("build-ipa");
+    expect(d.fatal).toBe(true);
+  });
+
+  it("设备被撤销时说清要重新配对,而不是含糊的握手失败", () => {
+    const d = diagnose([at("10.0.0.1", "revoked")], false);
+    expect(d.summary).toContain("已被移除");
+    expect(d.hint).toContain("pair");
+    expect(d.fatal).toBe(true);
+  });
+
+  it("身份证明失败优先于网络问题呈现,并提示先别连", () => {
+    const d = diagnose(
+      [at("a", "unreachable"), at("b", "untrusted"), at("c", "timeout")],
+      false,
+    );
+    expect(d.summary).toContain("身份");
+    expect(d.hint).toContain("冒充");
+    expect(d.fatal).toBe(true);
+  });
+
+  it("撤销与版本不符都排在普通鉴权失败之前", () => {
+    expect(diagnose([at("a", "auth"), at("b", "revoked")], false).summary).toContain("已被移除");
+    expect(diagnose([at("a", "auth"), at("b", "version")], false).summary).toContain("版本不符");
   });
 
   it("混合失败时超时优先(说明至少有地址可达)", () => {
@@ -52,6 +76,9 @@ describe("连接失败诊断", () => {
       [at("a", "timeout")],
       [at("a", "handshake")],
       [at("a", "auth")],
+      [at("a", "version")],
+      [at("a", "revoked")],
+      [at("a", "untrusted")],
     ];
     for (const c of cases) {
       const d = diagnose(c, false);

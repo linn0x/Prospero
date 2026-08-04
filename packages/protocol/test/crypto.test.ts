@@ -144,7 +144,7 @@ describe("handshake + SecureChannel", () => {
       clientHandshakeFinish(start.state, responded.frame, daemon.publicKey, makeHello());
       expect.unreachable();
     } catch (e) {
-      expect((e as ProtocolError).code).toBe("crypto");
+      expect((e as ProtocolError).code).toBe("untrusted");
     }
   });
 
