@@ -1,5 +1,6 @@
 import { memo, useMemo } from "react";
-import { ScrollView, StyleSheet, Text, View } from "react-native";
+import { StyleSheet, Text, View } from "react-native";
+import { CodeBlock } from "@/components/CodeBlock";
 import { parseMarkdown, type InlineSpan, type MdBlock } from "@/lib/markdown";
 
 /** agent 输出的 Markdown 渲染(标题/列表/引用/行内代码/代码块) */
@@ -32,16 +33,7 @@ function Block({ block }: { block: MdBlock }) {
         </View>
       );
     case "code":
-      return (
-        <ScrollView
-          horizontal
-          showsHorizontalScrollIndicator={false}
-          style={styles.codeBlock}
-          contentContainerStyle={styles.codeBlockContent}
-        >
-          <Text style={styles.codeText}>{block.code}</Text>
-        </ScrollView>
-      );
+      return <CodeBlock code={block.code} lang={block.lang} />;
     case "quote":
       return (
         <View style={styles.quote}>
@@ -95,9 +87,6 @@ const styles = StyleSheet.create({
     color: "#9ad0a5",
     backgroundColor: "#1a1f1b",
   },
-  codeBlock: { backgroundColor: "#15151b", borderRadius: 8, maxHeight: 260 },
-  codeBlockContent: { padding: 10 },
-  codeText: { fontFamily: "Menlo", fontSize: 12, color: "#c8c8d4", lineHeight: 18 },
   quote: { borderLeftWidth: 3, borderLeftColor: "#3a3a46", paddingLeft: 10 },
   quoteText: { color: "#a8a8b4", fontSize: 14, lineHeight: 21 },
   rule: { height: 1, backgroundColor: "#26262e", marginVertical: 4 },
