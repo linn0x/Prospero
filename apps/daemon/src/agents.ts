@@ -38,6 +38,14 @@ export function requiresShellCapability(agent: AgentKind): boolean {
   return agent === "shell" || agent === "custom";
 }
 
+/**
+ * 是否有结构化适配器(聊天 UI + 一键审批)。
+ * 其余 agent 回落 PTY 轨,功能不减、只是形态是终端镜像。
+ */
+export function structuredCapable(agent: AgentKind): boolean {
+  return agent === "opencode";
+}
+
 export function spawnEnv(): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {

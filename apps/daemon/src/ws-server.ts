@@ -38,12 +38,18 @@ interface AttachState {
   snapshotInflight?: boolean;
 }
 
+/** 结构化会话的订阅状态:只需记录已下发到哪个 evSeq */
+interface ChatAttachState {
+  lastEvSeq: number;
+}
+
 interface Conn {
   ws: WebSocket;
   /** null = dev 明文连接(仅 --dev + loopback) */
   channel: SecureChannel | null;
   device: DeviceRecord | null;
   attachments: Map<string, AttachState>;
+  chatAttachments: Map<string, ChatAttachState>;
   alive: boolean;
 }
 
@@ -113,6 +119,15 @@ export async function createDaemonServer(
     }
   });
 
+  manager.on("agentEvent", (sid, body, evSeq) => {
+    for (const conn of conns) {
+      const att = conn.chatAttachments.get(sid);
+      if (!conn.device || !att) continue;
+      send(conn, { type: "agent.event", sid, evSeq, body });
+      att.lastEvSeq = evSeq;
+    }
+  });
+
   manager.on("state", (session) => {
     for (const conn of conns) {
       if (conn.device) send(conn, { type: "session.state", session });
@@ -141,11 +156,31 @@ export async function createDaemonServer(
     }
   }
 
+  /**
+   * 结构化会话 attach:能增量续传就发增量,否则全量重放事件历史。
+   * 同步路径(事件日志在内存),不会与流式事件乱序。
+   */
+  function attachChat(conn: Conn, sid: string, lastEvSeq?: number): void {
+    const session = manager.requireStructured(sid);
+    const incremental = lastEvSeq !== undefined ? session.since(lastEvSeq) : null;
+    if (incremental !== null && lastEvSeq !== undefined) {
+      conn.chatAttachments.set(sid, { lastEvSeq: session.snapshot().evSeq });
+      let seq = lastEvSeq;
+      for (const body of incremental) {
+        send(conn, { type: "agent.event", sid, evSeq: ++seq, body });
+      }
+      return;
+    }
+    const snap = session.snapshot();
+    conn.chatAttachments.set(sid, { lastEvSeq: snap.evSeq });
+    send(conn, { type: "chat.snapshot", sid, evSeq: snap.evSeq, events: snap.events });
+  }
+
   const catchupTimer = setInterval(() => {
     for (const conn of conns) {
       for (const [sid, att] of conn.attachments) {
         if (!att.paused || conn.ws.bufferedAmount > LOW_WATER) continue;
-        const session = manager.get(sid);
+        const session = manager.getPty(sid);
         if (!session) {
           conn.attachments.delete(sid);
           continue;
@@ -244,22 +279,32 @@ export async function createDaemonServer(
         send(conn, { type: "error", code: "bad_message", message: "already authenticated" });
         return;
       case "session.create": {
-        const session = manager.create({
+        const info = await manager.create({
           agent: msg.agent,
+          kind: msg.kind,
           cwd: msg.cwd,
           command: msg.command,
           cols: msg.cols,
           rows: msg.rows,
           allowShell: device.allowShell,
         });
-        // 创建者自动 attach(空画面快照,锚定 seq 基线)
+        // 创建者自动 attach:结构化会话发 chat.snapshot,PTY 发画面快照(锚定 seq 基线)
+        if (info.kind === "structured") {
+          attachChat(conn, info.id);
+          return;
+        }
+        const session = manager.requirePty(info.id);
         const att: AttachState = { lastSentSeq: 0, lastAckSeq: 0, paused: false };
-        conn.attachments.set(session.id, att);
-        await sendSnapshot(conn, session.id, session, att);
+        conn.attachments.set(info.id, att);
+        await sendSnapshot(conn, info.id, session, att);
         return;
       }
       case "session.attach": {
-        const session = manager.require(msg.sid);
+        if (manager.getStructured(msg.sid)) {
+          attachChat(conn, msg.sid, msg.lastSeq);
+          return;
+        }
+        const session = manager.requirePty(msg.sid);
         const att: AttachState = {
           lastSentSeq: msg.lastSeq ?? 0,
           lastAckSeq: msg.lastSeq ?? 0,
@@ -285,11 +330,17 @@ export async function createDaemonServer(
         await sendSnapshot(conn, msg.sid, session, att);
         return;
       }
+      case "chat.send":
+        await manager.requireStructured(msg.sid).send(msg.text);
+        return;
+      case "permission.respond":
+        await manager.requireStructured(msg.sid).respondPermission(msg.reqId, msg.reply);
+        return;
       case "term.input":
-        manager.require(msg.sid).writeInput(utf8Decode(fromB64(msg.dataB64)));
+        manager.requirePty(msg.sid).writeInput(utf8Decode(fromB64(msg.dataB64)));
         return;
       case "term.resize":
-        manager.require(msg.sid).resize(msg.cols, msg.rows);
+        manager.requirePty(msg.sid).resize(msg.cols, msg.rows);
         return;
       case "term.ack": {
         const att = conn.attachments.get(msg.sid);
@@ -297,13 +348,11 @@ export async function createDaemonServer(
         return;
       }
       case "session.interrupt":
-        manager.require(msg.sid).interrupt();
+        await manager.interrupt(msg.sid);
         return;
       case "session.kill":
-        manager.kill(msg.sid);
+        await manager.kill(msg.sid);
         return;
-      case "permission.respond":
-        return; // M2 结构化轨
     }
   }
 
@@ -347,6 +396,7 @@ export async function createDaemonServer(
       channel: null,
       device: null,
       attachments: new Map(),
+      chatAttachments: new Map(),
       alive: true,
     };
     conns.add(conn);
