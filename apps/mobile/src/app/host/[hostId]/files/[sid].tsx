@@ -258,7 +258,8 @@ export default function FilesScreen(): React.ReactElement {
                 ),
           headerRight: () => (
             <Pressable onPress={() => void upload()} hitSlop={8}>
-              <Icon name="plus" size={20} color="#7aa2f7" />
+              {/* ＋ 会被读成"新建文件";这里只做上传,就直说 */}
+              <Text style={styles.headerAction}>上传</Text>
             </Pressable>
           ),
         }}

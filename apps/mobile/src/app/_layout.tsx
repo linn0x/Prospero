@@ -3,6 +3,7 @@ import "@/lib/polyfills";
 import { DarkTheme, Stack, ThemeProvider } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
+import { ToastHost } from "@/components/Toast";
 
 export default function RootLayout() {
   return (
@@ -17,6 +18,7 @@ export default function RootLayout() {
             contentStyle: { backgroundColor: "#0b0b0e" },
           }}
         />
+        <ToastHost />
       </ThemeProvider>
     </GestureHandlerRootView>
   );

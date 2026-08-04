@@ -9,6 +9,7 @@ import { FlatList, Pressable, StyleSheet, Text, View } from "react-native";
 import type { PermissionReply } from "@prospero/protocol";
 import { DiffView } from "@/components/DiffView";
 import { Markdown } from "@/components/Markdown";
+import { toast } from "@/components/Toast";
 import type { HostConnection } from "@/lib/connection";
 import {
   applyEvent,
@@ -185,10 +186,12 @@ function itemText(i: ChatItem): string {
 }
 
 /** 长按复制:手机上把 agent 输出拷走的唯一顺手方式,附触觉确认 */
-function useCopy(): (text: string) => void {
-  return useCallback((text: string) => {
+function useCopy(): (text: string, what?: string) => void {
+  return useCallback((text: string, what = "内容") => {
     void Clipboard.setStringAsync(text);
     void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    // 只给触感等于没反馈 —— 静音/关掉触感的手机上完全看不出来复制成功了
+    toast(`已复制${what}`);
   }, []);
 }
 
@@ -198,7 +201,7 @@ const UserBubble = memo(function UserBubble({ item }: { item: UserItem }) {
     <View style={styles.userRow}>
       <Pressable
         style={styles.userBubble}
-        onLongPress={() => copy(item.text)}
+        onLongPress={() => copy(item.text, "这条消息")}
         delayLongPress={350}
       >
         <Text style={styles.userText} selectable>
@@ -221,7 +224,7 @@ const AssistantBubble = memo(function AssistantBubble({ item }: { item: Assistan
   return (
     <Pressable
       style={styles.assistantRow}
-      onLongPress={() => copy(item.text)}
+      onLongPress={() => copy(item.text, "回复")}
       delayLongPress={350}
     >
       {item.reasoning.length > 0 && (
@@ -273,7 +276,7 @@ const ToolCard = memo(function ToolCard({
     <View style={styles.toolCard}>
       <Pressable
         onPress={toggle}
-        onLongPress={() => copy(`${item.tool}\n${item.input}\n${body ?? ""}`)}
+        onLongPress={() => copy(`${item.tool}\n${item.input}\n${body ?? ""}`, "工具卡片")}
         delayLongPress={350}
       >
         <View style={styles.toolHeader}>
