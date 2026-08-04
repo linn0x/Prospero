@@ -52,3 +52,14 @@ export type {
   S2CMessage,
   PairingPayload,
 } from "./schemas.js";
+
+/**
+ * WebSocket 关闭码。断开时这是 daemon 唯一还能传达的信息,
+ * 所以每种"客户端该怎么办"都要有独立的码 —— 混用会让 App 只能给出含糊提示。
+ * 4000-4999 是应用私有区间。
+ */
+export const CLOSE_AUTH_FAILED = 4001;
+/** 握手/加密层出错(格式、版本、解密失败) */
+export const CLOSE_PROTOCOL = 4003;
+/** 设备被撤销:重试永远无用,必须重新配对 */
+export const CLOSE_REVOKED = 4004;

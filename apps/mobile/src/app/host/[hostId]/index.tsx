@@ -106,10 +106,9 @@ export default function HostScreen() {
     [all],
   );
 
-  const quality =
-    runtime.rttMs === null
-      ? ""
-      : ` · ${runtime.activeAddr ?? ""} ${String(runtime.rttMs)}ms`;
+  // 只报延迟,不报地址 —— 地址是内网拓扑,截图分享时不该跟着出去,
+  // 而且连哪条线路是竞速自动决定的,用户无从干预
+  const quality = runtime.rttMs === null ? "" : ` · ${String(runtime.rttMs)}ms`;
   const connText =
     runtime.status === "connected"
       ? `${runningCount} 个运行中 · ${String(all.length)} 个会话${quality}`
