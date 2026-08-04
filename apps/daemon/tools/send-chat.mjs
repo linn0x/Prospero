@@ -10,7 +10,12 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import WebSocket from "ws";
-import { clientHandshake, generateKeyPairB64, parseS2C } from "@prospero/protocol";
+import {
+  clientHandshakeFinish,
+  clientHandshakeStart,
+  generateKeyPairB64,
+  parseS2C,
+} from "@prospero/protocol";
 
 const home = process.env.PROSPERO_HOME ?? path.join(process.env.HOME, ".prospero");
 const read = (f, fallback) => {
@@ -58,12 +63,24 @@ await new Promise((resolve, reject) => {
   ws.once("error", reject);
 });
 
-const { frame, channel } = clientHandshake(identity.publicKey, {
-  type: "hello",
-  token: dev.token,
-  clientPubKey: keys.publicKey,
-  clientInfo: { platform: "ios", appVersion: "probe" },
+// v1 三帧握手:先发临时公钥,收到 daemon 的证明后再发加密 hello
+const hsStart = clientHandshakeStart();
+ws.send(hsStart.frame);
+const serverFrame = await new Promise((resolve, reject) => {
+  ws.once("message", (raw) => resolve(raw.toString()));
+  ws.once("error", reject);
 });
+const { frame, channel } = clientHandshakeFinish(
+  hsStart.state,
+  serverFrame,
+  identity.publicKey,
+  {
+    type: "hello",
+    token: dev.token,
+    clientPubKey: keys.publicKey,
+    clientInfo: { platform: "ios", appVersion: "probe" },
+  },
+);
 
 ws.on("close", (code, reason) => {
   console.error(`连接被关闭 code=${code} ${reason.toString()}`);

@@ -14,7 +14,9 @@ import {
   ProtocolError,
   fromB64,
   parseC2S,
-  serverAcceptHandshake,
+  serverHandshakeAccept,
+  serverHandshakeRespond,
+  type ServerHandshakeState,
   toB64,
   utf8Decode,
   type C2SMessage,
@@ -50,6 +52,8 @@ interface Conn {
   ws: WebSocket;
   /** null = dev 明文连接(仅 --dev + loopback) */
   channel: SecureChannel | null;
+  /** 握手中间态:已回过临时公钥、还在等 hello。收到 hello 后清空 */
+  handshake: ServerHandshakeState | null;
   device: DeviceRecord | null;
   attachments: Map<string, AttachState>;
   chatAttachments: Map<string, ChatAttachState>;
@@ -289,7 +293,15 @@ export async function createDaemonServer(
         return;
       }
     }
-    const { hello, channel } = serverAcceptHandshake(text, identity.secretKey);
+    // 第 1 帧只有客户端临时公钥;回自己的临时公钥 + 身份证明,等第 2 帧才拿到 hello
+    if (conn.handshake === null) {
+      const { frame, state } = serverHandshakeRespond(text, identity.secretKey);
+      conn.handshake = state;
+      conn.ws.send(frame);
+      return;
+    }
+    const { hello, channel } = serverHandshakeAccept(conn.handshake, text);
+    conn.handshake = null;
     const device = authenticate(opts.home, hello);
     if (!device) {
       conn.channel = channel;
@@ -442,6 +454,7 @@ export async function createDaemonServer(
     const conn: Conn = {
       ws,
       channel: null,
+      handshake: null,
       device: null,
       attachments: new Map(),
       chatAttachments: new Map(),

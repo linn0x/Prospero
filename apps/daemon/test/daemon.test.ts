@@ -7,7 +7,9 @@ import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { WebSocket } from "ws";
 import {
-  clientHandshake,
+  clientHandshakeFinish,
+  clientHandshakeStart,
+  type SecureChannel,
   fromB64,
   generateKeyPairB64,
   parseS2C,
@@ -32,7 +34,7 @@ class TestClient {
 
   private constructor(
     private readonly ws: WebSocket,
-    private readonly channel: ReturnType<typeof clientHandshake>["channel"],
+    private readonly channel: SecureChannel,
   ) {}
 
   static async connect(token: string, keys: KeyPairB64): Promise<TestClient> {
@@ -41,12 +43,24 @@ class TestClient {
       ws.once("open", () => resolve());
       ws.once("error", reject);
     });
-    const { frame, channel } = clientHandshake(daemonPub, {
-      type: "hello",
-      token,
-      clientPubKey: keys.publicKey,
-      clientInfo: { platform: "ios", appVersion: "test" },
+    // v1 三帧握手:临时公钥 → daemon 临时公钥+证明 → 加密 hello
+    const start = clientHandshakeStart();
+    ws.send(start.frame);
+    const serverFrame = await new Promise<string>((resolve, reject) => {
+      ws.once("message", (raw: Buffer) => resolve(raw.toString()));
+      ws.once("error", reject);
     });
+    const { frame: helloFrame, channel } = clientHandshakeFinish(
+      start.state,
+      serverFrame,
+      daemonPub,
+      {
+        type: "hello",
+        token,
+        clientPubKey: keys.publicKey,
+        clientInfo: { platform: "ios", appVersion: "test" },
+      },
+    );
     const client = new TestClient(ws, channel);
     ws.on("message", (raw) => {
       client.queue.push(parseS2C(channel.open(raw.toString())));
@@ -54,7 +68,7 @@ class TestClient {
     ws.on("close", () => {
       client.closed = true;
     });
-    ws.send(frame);
+    ws.send(helloFrame);
     return client;
   }
 
