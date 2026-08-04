@@ -143,6 +143,33 @@ final class DaemonController {
     state = .running(pid: proc.processIdentifier)
   }
 
+  /// 撤销设备。交给 CLI 做,壳不碰 devices.json ——
+  /// 存储格式只该有一处实现,何况正在跑的 daemon 靠监视该文件来立刻踢掉连接。
+  @discardableResult
+  func revokeDevice(named name: String) -> String? {
+    guard let node = Locator.findNode(), let cli = Locator.findCLI() else {
+      return "找不到 node 或 prosperod"
+    }
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: node)
+    proc.arguments = [cli, "revoke", name]
+    let pipe = Pipe()
+    proc.standardOutput = pipe
+    proc.standardError = pipe
+    do {
+      try proc.run()
+    } catch {
+      return error.localizedDescription
+    }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    proc.waitUntilExit()
+    refresh()
+    guard proc.terminationStatus == 0 else {
+      return String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    return nil
+  }
+
   func stop() {
     bonjour.stop()
     guard let proc = process else {

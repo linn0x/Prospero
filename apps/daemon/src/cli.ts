@@ -15,6 +15,7 @@ import {
   loadConfig,
   loadDevices,
   loadIdentity,
+  revokeDevices,
   mintDevice,
   prosperoHome,
   saveConfig,
@@ -170,6 +171,27 @@ program
       });
       console.log(ok ? "测试推送已发出 ✓" : "测试推送失败 ✗(检查端点与网络)");
     }
+  });
+
+program
+  .command("revoke")
+  .argument("<name>", "要撤销的设备名(见 `prosperod status`)")
+  .description("撤销设备:删除凭证,并立刻断开它当前的连接")
+  .action((name: string) => {
+    const home = prosperoHome();
+    const removed = revokeDevices(home, name);
+    if (removed.length === 0) {
+      const names = loadDevices(home).map((d) => d.name);
+      console.error(
+        names.length === 0
+          ? `没有名为「${name}」的设备(当前一台都没配对)`
+          : `没有名为「${name}」的设备。已配对:${names.join(", ")}`,
+      );
+      process.exitCode = 1;
+      return;
+    }
+    console.log(`已撤销 ${removed.length} 台名为「${name}」的设备`);
+    console.log("运行中的 daemon 会立刻断开它;手机需要重新扫码才能再连。");
   });
 
 program

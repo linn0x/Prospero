@@ -136,7 +136,13 @@ struct MenuContent: View {
     } else {
       Menu("已配对设备(\(daemon.status.devices.count))") {
         ForEach(daemon.status.devices) { device in
-          Text("\(device.name)\(device.allowShell ? "" : " · 禁 shell")\(device.bound ? "" : " · 未绑定")")
+          Menu("\(device.name)\(device.allowShell ? "" : " · 禁 shell")\(device.bound ? "" : " · 未绑定")") {
+            Text(device.bound ? "已绑定客户端公钥" : "尚未连接过")
+            Divider()
+            Button("移除「\(device.name)」") {
+              confirmRevoke(device.name)
+            }
+          }
         }
       }
     }
@@ -167,6 +173,26 @@ struct MenuContent: View {
       NSApp.terminate(nil)
     }
     .keyboardShortcut("q")
+  }
+
+  /// 撤销不可逆(手机必须重新扫码),值得一次确认。
+  private func confirmRevoke(_ name: String) {
+    let alert = NSAlert()
+    alert.messageText = "移除设备「\(name)」?"
+    alert.informativeText = "该设备的凭证会被删除,当前连接立刻断开。要再用得重新扫码配对。"
+    alert.alertStyle = .warning
+    alert.addButton(withTitle: "移除")
+    alert.addButton(withTitle: "取消")
+    NSApp.activate(ignoringOtherApps: true)
+    guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+    if let error = daemon.revokeDevice(named: name) {
+      let failure = NSAlert()
+      failure.messageText = "移除失败"
+      failure.informativeText = error
+      failure.alertStyle = .critical
+      failure.runModal()
+    }
   }
 }
 
