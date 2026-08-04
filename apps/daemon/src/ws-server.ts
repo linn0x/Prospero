@@ -3,7 +3,7 @@
  * --dev 模式额外提供浏览器调试页(仅 loopback 可用明文协议)。
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { readFileSync } from "node:fs";
+import { readFileSync, watch } from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
@@ -22,7 +22,7 @@ import {
   type SecureChannel,
   type SessionInfo,
 } from "@prospero/protocol";
-import { authenticate, loadIdentity, type DeviceRecord } from "./pairing.js";
+import { authenticate, loadDevices, loadIdentity, type DeviceRecord } from "./pairing.js";
 import { Notifier, type NotifyConfig } from "./notify.js";
 import { SessionError, SessionManager } from "./session-manager.js";
 import { StatusFile } from "./status-file.js";
@@ -506,6 +506,50 @@ export async function createDaemonServer(
   });
   const address = httpServer.address();
   const port = typeof address === "object" && address !== null ? address.port : opts.port;
+  /**
+   * 撤销要立刻生效,否则"已撤销"的设备还能一直用着当前连接 —— 撤销就没意义了。
+   * CLI 是另一个进程,只能靠盯 devices.json 变化来发现。
+   */
+  function dropRevokedConnections(): void {
+    const liveTokens = new Set(loadDevices(opts.home).map((d) => d.token));
+    for (const conn of conns) {
+      const device = conn.device;
+      // dev 明文连接没有真实设备记录,不受撤销影响
+      if (!device || device.token === "dev") continue;
+      if (liveTokens.has(device.token)) continue;
+      console.log(`[prosperod] 设备已撤销,断开连接: ${device.name}`);
+      try {
+        send(conn, { type: "error", code: "auth_failed", message: "device revoked" });
+      } catch {
+        // 连接可能已经坏了,断开才是重点
+      }
+      conn.device = null;
+      // 4003 是握手/加密错误,撤销要能被客户端区分开(前者重试有意义,后者必须重新配对)
+      conn.ws.close(4004, "revoked");
+    }
+  }
+
+  let revokeWatcher: { close(): void } | null = null;
+  let revokeTimer: NodeJS.Timeout | null = null;
+  try {
+    // 盯目录而不是 devices.json 本身:daemon 常在首次 pair 之前就启动了,
+    // 那时文件还不存在,watch 会抛 ENOENT —— 撤销就永远不会生效。
+    // 盯目录还顺带扛住了"写临时文件再改名"这种替换方式(watch 文件会跟丢 inode)。
+    revokeWatcher = watch(opts.home, (_event, filename) => {
+      if (filename !== null && filename !== "devices.json") return;
+      // authenticate() 自己也写这个文件(更新 lastSeen),会有无害的自触发;
+      // 合并一下,避免一次写入触发多次扫描。
+      if (revokeTimer) return;
+      revokeTimer = setTimeout(() => {
+        revokeTimer = null;
+        dropRevokedConnections();
+      }, 150);
+      revokeTimer.unref?.();
+    });
+  } catch {
+    // 连 home 目录都监视不了(极少见);撤销退化为"下次连接时生效"
+  }
+
   // 接管上一轮留下的 tmux 会话。必须在 statusFile.start 之前,
   // 否则壳会先看到一份"零会话"的快照。
   const restored = manager.restoreFromTmux();
@@ -522,6 +566,8 @@ export async function createDaemonServer(
       clearInterval(pingTimer);
       for (const conn of conns) conn.ws.terminate();
       statusFile.stop();
+      if (revokeTimer) clearTimeout(revokeTimer);
+      revokeWatcher?.close();
       wss.close();
       manager.disposeAll();
       await new Promise<void>((resolve) => httpServer.close(() => resolve()));
