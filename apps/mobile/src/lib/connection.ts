@@ -20,6 +20,7 @@ import {
   utf8Encode,
   ProtocolError,
   type AgentKind,
+  type ApprovalPolicy,
   type C2SMessage,
   type KeyPairB64,
   type PermissionReply,
@@ -666,6 +667,10 @@ export class HostConnection {
 
   interrupt(sid: string): void {
     this.send({ type: "session.interrupt", sid }, true);
+  }
+
+  setApprovalPolicy(sid: string, policy: ApprovalPolicy): void {
+    this.send({ type: "approval.policy.set", sid, policy }, true);
   }
 
   kill(sid: string): void {

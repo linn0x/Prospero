@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import type {
+  ApprovalPolicy,
   AgentEventBody,
   AgentKind,
   SessionInfo,
@@ -332,6 +333,13 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       ...[...this.ptySessions.values()].map((s) => s.info()),
       ...[...this.structuredSessions.values()].map((s) => s.info()),
     ].sort((a, b) => a.createdAt - b.createdAt);
+  }
+
+  /** 改某个结构化会话的审批策略 */
+  setApprovalPolicy(sid: string, policy: ApprovalPolicy): void {
+    const s = this.structuredSessions.get(sid);
+    if (!s) throw new SessionError(`no structured session: ${sid}`, "session_not_found");
+    s.setApprovalPolicy(policy);
   }
 
   async interrupt(sid: string): Promise<void> {

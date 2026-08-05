@@ -20,6 +20,7 @@ import type {
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { AgentEventBody, PermissionReply } from "@prospero/protocol";
+import { needsApproval } from "../approval-policy.js";
 import { diffFromToolInput } from "./diff.js";
 import { AdapterError, summarize, type AdapterContext, type AgentAdapter } from "./types.js";
 
@@ -129,6 +130,21 @@ export class ClaudeAdapter implements AgentAdapter {
   private readonly canUseTool: CanUseTool = (toolName, input, options) =>
     new Promise<PermissionResult>((resolve) => {
       const reqId = randomUUID();
+      const policy = this.ctx?.approvalPolicy?.() ?? "strict";
+
+      // 策略放行:不等人,但把"这一步被自动批准了"照常发出去。
+      // 不打断 ≠ 不告知 —— 聊天里仍要出现这次调用,事后能翻。
+      if (!needsApproval(policy, toolName)) {
+        this.emit({
+          kind: "permission.auto",
+          reqId,
+          action: options.displayName ?? toolName,
+          policy,
+          summary: options.title ?? toolName,
+        });
+        resolve({ behavior: "allow", updatedInput: input });
+        return;
+      }
       this.pending.set(reqId, {
         resolve,
         input,
