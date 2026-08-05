@@ -56,7 +56,20 @@
     return out;
   }
 
-  term.onData((d) => post({ kind: "input", data: bytesToB64(te.encode(d)) }));
+  /**
+   * 写快照期间屏蔽上行输入。
+   *
+   * xterm 会自动应答终端查询(DA / DSR 等)—— 这在正常输出流上是必须的,
+   * Claude Code 那类 Ink 应用不回答就会挂住。但 attach 时重放快照,
+   * 快照里若含查询序列,xterm 会【再答一次】,而那次应答会被当成用户
+   * 敲的键送进 shell:实测表现是命令行上凭空多出 "1;2c",把命令打乱。
+   * 重放产生的应答不是用户意图,丢掉。
+   */
+  let replaying = false;
+  term.onData((d) => {
+    if (replaying) return;
+    post({ kind: "input", data: bytesToB64(te.encode(d)) });
+  });
 
   let fitTimer = null;
   function doFit() {
@@ -95,11 +108,13 @@
 
   function handle(m) {
     if (m.kind === "snapshot") {
+      replaying = true;
       term.reset();
       if (m.cols && m.rows && (m.cols !== term.cols || m.rows !== term.rows)) {
         term.resize(m.cols, m.rows);
       }
-      term.write(m.ansi);
+      // 回调里放开:xterm 的应答是异步发出的,同步清标志会漏掉
+      term.write(m.ansi, () => { replaying = false; });
       perfBytes += m.ansi.length;
     } else if (m.kind === "output") {
       const bytes = b64ToBytes(m.dataB64);

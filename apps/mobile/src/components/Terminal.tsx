@@ -14,6 +14,8 @@ interface Props {
   sid: string;
   /** 捏合缩放后回报,让 A+/A− 的基准与终端保持一致 */
   onFontSize?: (size: number) => void;
+  /** 洪峰时的渲染帧率与吞吐;Release 构建里 console 是哑的,只能走 UI */
+  onPerf?: (p: { fps: number; kb: number; renderer: string }) => void;
 }
 
 export interface TerminalHandle {
@@ -35,7 +37,7 @@ interface BridgeUp {
 }
 
 export const Terminal = forwardRef<TerminalHandle, Props>(function Terminal(
-  { conn, sid, onFontSize },
+  { conn, sid, onFontSize, onPerf },
   ref,
 ) {
   const webRef = useRef<WebView>(null);
@@ -146,14 +148,14 @@ export const Terminal = forwardRef<TerminalHandle, Props>(function Terminal(
           if (typeof msg.size === "number") onFontSize?.(msg.size);
           break;
         case "perf":
-          // W4 spike:Metro 控制台可直接观测洪峰时的渲染帧率与吞吐
-          console.log(
-            `[term-perf] sid=${sid.slice(0, 8)} renderer=${msg.renderer} fps=${msg.fps} throughput=${msg.kb}KB/s`,
-          );
+          // Release 构建里 console.log 被剥掉,验收要看数就必须走 UI
+          if (typeof msg.fps === "number" && typeof msg.kb === "number") {
+            onPerf?.({ fps: msg.fps, kb: msg.kb, renderer: msg.renderer ?? "?" });
+          }
           break;
       }
     },
-    [conn, sid, tryAttach, rx, onFontSize],
+    [conn, sid, tryAttach, rx, onFontSize, onPerf],
   );
 
   useImperativeHandle(ref, () => ({
