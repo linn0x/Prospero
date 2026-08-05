@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import type {
   ApprovalPolicy,
+  Attachment,
   AgentEventBody,
   AgentKind,
   SessionInfo,
@@ -333,6 +334,13 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       ...[...this.ptySessions.values()].map((s) => s.info()),
       ...[...this.structuredSessions.values()].map((s) => s.info()),
     ].sort((a, b) => a.createdAt - b.createdAt);
+  }
+
+  /** 转发一条用户消息(可带附件) */
+  async chatSend(sid: string, text: string, attachments?: Attachment[]): Promise<void> {
+    const s = this.structuredSessions.get(sid);
+    if (!s) throw new SessionError(`no structured session: ${sid}`, "session_not_found");
+    await s.send(text, attachments);
   }
 
   /** 改某个结构化会话的审批策略 */

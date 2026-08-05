@@ -7,6 +7,7 @@
  */
 import type {
   AgentEventBody,
+  Attachment,
   ApprovalPolicy,
   PermissionReply,
 } from "@prospero/protocol";
@@ -26,10 +27,16 @@ export interface AdapterContext {
 }
 
 export interface AgentAdapter {
+  /** 是否能直接吃图;false 时由上层落盘降级 */
+  readonly acceptsImages?: boolean;
   /** 启动后端并准备接收消息;抛错表示会话创建失败 */
   start(ctx: AdapterContext): Promise<void>;
-  /** 发送一条用户消息 */
-  send(text: string): Promise<void>;
+  /**
+   * 发送一条用户消息。
+   * 附件由适配器决定怎么用:能原生收图的(Claude)走图片块,
+   * 其余的由 StructuredSession 落盘成文件、把路径并进文本。
+   */
+  send(text: string, attachments?: Attachment[]): Promise<void>;
   /** 回应审批请求 */
   respondPermission(reqId: string, reply: PermissionReply): Promise<void>;
   /** 中断当前轮次 */

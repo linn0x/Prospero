@@ -16,10 +16,11 @@
         "NSBonjourServices": [
           "_prospero._tcp"
         ],
-        "NSCameraUsageDescription": "用于扫描 Mac 上的 Prospero 配对二维码。",
+        "NSCameraUsageDescription": "用于扫描配对二维码,以及拍照作为附件发给 agent。",
         "NSAppTransportSecurity": {
           "NSAllowsLocalNetworking": true
-        }
+        },
+        "NSPhotoLibraryUsageDescription": "用于把截图或照片作为附件发给 agent。"
       }
     },
     "android": {
@@ -48,7 +49,14 @@
           "cameraPermission": "用于扫描 Mac 上的 Prospero 配对二维码。"
         }
       ],
-      "expo-sharing"
+      "expo-sharing",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "用于把截图或照片作为附件发给 agent。",
+          "cameraPermission": "用于拍照作为附件发给 agent。"
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": false,

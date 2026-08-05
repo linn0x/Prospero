@@ -19,10 +19,31 @@ describe("结构化轨协议", () => {
     expect(() =>
       parseC2S({ type: "permission.respond", sid: "s1", reqId: "p1", reply: "yes" }),
     ).toThrowError(ProtocolError);
-    // 空文本拒绝
+    // 既没字也没图 —— 拒绝
     expect(() => parseC2S({ type: "chat.send", sid: "s1", text: "" })).toThrowError(
       ProtocolError,
     );
+    expect(() => parseC2S({ type: "chat.send", sid: "s1", text: "   " })).toThrowError(
+      ProtocolError,
+    );
+    // 只发图不带字是合理的:一张报错截图本身就是问题
+    expect(
+      parseC2S({
+        type: "chat.send",
+        sid: "s1",
+        text: "",
+        attachments: [{ mimeType: "image/jpeg", dataB64: "AAAA" }],
+      }),
+    ).toMatchObject({ attachments: [{ mimeType: "image/jpeg" }] });
+    // 不认的图片格式被拒(iOS 的 HEIC 必须在客户端先转)
+    expect(() =>
+      parseC2S({
+        type: "chat.send",
+        sid: "s1",
+        text: "x",
+        attachments: [{ mimeType: "image/heic", dataB64: "AAAA" }],
+      }),
+    ).toThrowError(ProtocolError);
   });
 
   it("session.create 可指定 kind,省略则由 daemon 决定", () => {
