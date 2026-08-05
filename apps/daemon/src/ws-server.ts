@@ -457,9 +457,7 @@ export async function createDaemonServer(
             type: "usage.result",
             sid: msg.sid,
             available: false,
-            // 说清楚为什么没有,免得用户以为是坏了
-            reason: "该后端没有暴露用量数据(用 API key / Bedrock / Vertex 时套餐限流也不适用)",
-            ...(s.info().totals ? { costUsd: s.info().totals?.costUsd } : {}),
+            reason: "这个会话还没产生用量 —— 发一条消息后再看。",
           });
           return;
         }
@@ -469,7 +467,12 @@ export async function createDaemonServer(
           available: true,
           subscription: report.subscription ?? null,
           ...(report.costUsd !== undefined ? { costUsd: report.costUsd } : {}),
+          ...(report.inputTokens !== undefined ? { inputTokens: report.inputTokens } : {}),
+          ...(report.outputTokens !== undefined ? { outputTokens: report.outputTokens } : {}),
           windows: report.windows,
+          ...(report.windows.length === 0
+            ? { reason: "这个后端不提供套餐限流窗口(只有 claude.ai 订阅会话有)。" }
+            : {}),
         });
         return;
       }

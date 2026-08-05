@@ -29,10 +29,27 @@ async function session(adapter: AgentAdapter): Promise<StructuredSession> {
 }
 
 describe("用量与限流", () => {
-  it("适配器没实现 usage 时返回 null,而不是抛错", async () => {
-    // 多数 agent 压根不暴露这个,不能因此变成错误
+  it("没有任何用量时返回 null(会话还没跑过)", async () => {
     const s = await session(makeAdapter());
     expect(await s.usage()).toBeNull();
+  });
+
+  it("适配器不实现 usage,但会话有 token 累计时仍要报出来", async () => {
+    // codex / opencode / grok 都不暴露套餐限流,却都在 turn.end 上报 token。
+    // 曾经因为"没有窗口"就整个判为不可用,用量明明有却看不到。
+    const s = await session(makeAdapter());
+    s["record"]({
+      kind: "turn.end",
+      msgId: "m1",
+      costUsd: 0.02,
+      inputTokens: 1200,
+      outputTokens: 340,
+    });
+    const r = await s.usage();
+    expect(r).not.toBeNull();
+    expect(r?.costUsd).toBeCloseTo(0.02);
+    expect(r?.inputTokens).toBe(1200);
+    expect(r?.windows).toEqual([]);
   });
 
   it("适配器抛错时也返回 null —— 用量取不到不该影响会话", async () => {

@@ -53,6 +53,9 @@ export interface AgentAdapter {
 export interface UsageReport {
   subscription?: string | null;
   costUsd?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  /** 套餐限流窗口;没有不代表没有用量 */
   windows: { label: string; utilization: number; resetsAt?: string }[];
 }
 

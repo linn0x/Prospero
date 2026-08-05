@@ -668,9 +668,9 @@ export const UsageWindowSchema = z.object({
 /**
  * 用量与限流。
  *
- * `available` 为假的情况比想象中多:用 API key / Bedrock / Vertex 的会话根本
- * 没有套餐限流,后端也可能没暴露。UI 必须能优雅地显示"这里没有数据",
- * 而不是把它当成错误。
+ * 【available 只回答"有没有东西可看"】曾经把它和"有没有套餐限流窗口"混为一谈,
+ * 结果 codex 明明报了 token 和花费,却因为没有窗口而整个显示成"不可用"。
+ * 用量和限流是两件事:几乎所有 agent 都有前者,只有 claude.ai 订阅会话有后者。
  */
 export const S2CUsageSchema = z.object({
   type: z.literal("usage.result"),
@@ -680,8 +680,11 @@ export const S2CUsageSchema = z.object({
   subscription: z.string().nullable().optional(),
   /** 本会话累计花费 */
   costUsd: z.number().nonnegative().optional(),
+  inputTokens: z.number().int().nonnegative().optional(),
+  outputTokens: z.number().int().nonnegative().optional(),
+  /** 套餐限流窗口;只有 claude.ai 订阅会话才有 */
   windows: z.array(UsageWindowSchema).optional(),
-  /** available 为假时说明原因,直接显示给用户 */
+  /** 没有窗口时说明原因(不代表没有用量数据) */
   reason: z.string().optional(),
 });
 

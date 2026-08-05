@@ -182,6 +182,47 @@ export default function SessionScreen() {
   const [perf, setPerf] = useState<{ fps: number; kb: number; renderer: string } | null>(null);
 
   const policy: ApprovalPolicy = session?.approvalPolicy ?? "strict";
+  const policyLabel: Record<ApprovalPolicy, string> = {
+    strict: "逐条批准",
+    standard: "半自动",
+    yolo: "YOLO",
+  };
+
+  /**
+   * 溢出菜单。
+   *
+   * 头部原本并排塞了搜索、终端切换、用量、审批策略、停止、结束六个入口 ——
+   * 手机顶栏放不下这么多,几个文字胶囊挤在一起也难看。除了"停止"(唯一
+   * 分秒必争的),其余都收进这里;当前状态直接写在菜单项上,不必点开才知道。
+   */
+  const openMenu = (): void => {
+    const items: { text: string; style?: "destructive" | "cancel"; onPress?: () => void }[] = [];
+    if (isChat) {
+      items.push({
+        text: search === null ? "搜索消息" : "退出搜索",
+        onPress: () => setSearch((v) => (v === null ? "" : null)),
+      });
+    }
+    if (isStructured) {
+      items.push({
+        text: showTty ? "切到对话" : "切到终端",
+        onPress: () => setShowTty((v) => !v),
+      });
+      items.push({
+        text: tightest
+          ? `用量与限流(${tightest.label} ${String(Math.round(tightest.utilization))}%)`
+          : "用量与限流",
+        onPress: showUsage,
+      });
+      items.push({
+        text: `审批策略:${policyLabel[policy]}`,
+        onPress: choosePolicy,
+      });
+    }
+    items.push({ text: "结束会话", style: "destructive", onPress: confirmKill });
+    items.push({ text: "取消", style: "cancel" });
+    Alert.alert(session?.title ?? "会话", undefined, items);
+  };
 
   const choosePolicy = (): void => {
     Alert.alert(
@@ -259,57 +300,14 @@ export default function SessionScreen() {
           ),
           headerRight: () => (
             <View style={styles.headerRight}>
-              {isChat && (
-                <Pressable
-                  onPress={() => setSearch((s) => (s === null ? "" : null))}
-                  hitSlop={8}
-                >
-                  <Icon
-                    name="magnifyingglass"
-                    size={19}
-                    color={search !== null ? "#7aa2f7" : "#9a9aa6"}
-                  />
-                </Pressable>
-              )}
-              {isStructured && (
-                <Pressable onPress={() => setShowTty((v) => !v)} hitSlop={8}>
-                  {/* 标签写的是"点了会切到哪",不是"现在是什么" */}
-                  <Text style={[styles.ttyBtn, showTty && styles.ttyBtnActive]}>
-                    {showTty ? "看对话" : "看终端"}
-                  </Text>
-                </Pressable>
-              )}
-              {isStructured && (
-                <Pressable onPress={showUsage} hitSlop={8}>
-                  <Text
-                    style={[
-                      styles.ttyBtn,
-                      tightest && tightest.utilization >= 80 && styles.usageHot,
-                    ]}
-                  >
-                    用量
-                  </Text>
-                </Pressable>
-              )}
-              {isStructured && (
-                <Pressable onPress={choosePolicy} hitSlop={8}>
-                  <Text
-                    style={[
-                      styles.ttyBtn,
-                      policy !== "strict" && styles.policyRelaxed,
-                    ]}
-                  >
-                    {policy === "yolo" ? "YOLO" : policy === "standard" ? "半自动" : "逐条批"}
-                  </Text>
-                </Pressable>
-              )}
+              {/* 只有"停止"留在外面 —— 它是唯一分秒必争的操作 */}
               {busy && (
                 <Pressable onPress={() => conn.interrupt(sid)} hitSlop={8}>
-                  <Icon name="stop.circle" size={20} color="#d9a441" />
+                  <Icon name="stop.circle" size={21} color={color.warn} />
                 </Pressable>
               )}
-              <Pressable onPress={confirmKill} hitSlop={8}>
-                <Icon name="trash" size={18} color="#e5534b" />
+              <Pressable onPress={openMenu} hitSlop={8}>
+                <Icon name="ellipsis.circle" size={21} color={color.accent} />
               </Pressable>
             </View>
           ),
@@ -417,6 +415,12 @@ export default function SessionScreen() {
             {usage.subscription ? <Row label="套餐" value={usage.subscription} /> : null}
             {usage.costUsd !== undefined ? (
               <Row label="本会话花费" value={`$${usage.costUsd.toFixed(4)}`} />
+            ) : null}
+            {usage.inputTokens !== undefined ? (
+              <Row label="输入 token" value={usage.inputTokens.toLocaleString()} />
+            ) : null}
+            {usage.outputTokens !== undefined ? (
+              <Row label="输出 token" value={usage.outputTokens.toLocaleString()} />
             ) : null}
 
             {(usage.windows ?? []).map((w) => (

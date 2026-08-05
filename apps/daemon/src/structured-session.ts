@@ -246,14 +246,36 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     return out;
   }
 
-  /** 用量与限流;适配器没实现或取不到都返回 null */
+  /**
+   * 用量与限流。
+   *
+   * 适配器能给就用它的(带套餐窗口);给不了就用会话自己累计的 token 与花费 ——
+   * 那是每个结构化后端都会在 turn.end 上报的东西。没有窗口 ≠ 没有用量。
+   */
   async usage(): Promise<UsageReport | null> {
-    if (!this.adapter.usage) return null;
-    try {
-      return await this.adapter.usage();
-    } catch {
-      return null;
+    if (this.adapter.usage) {
+      try {
+        const r = await this.adapter.usage();
+        if (r) {
+          // 适配器没报花费时用会话累计的补上
+          return {
+            ...r,
+            costUsd: r.costUsd ?? this.totals.costUsd,
+            inputTokens: r.inputTokens ?? this.totals.inputTokens,
+            outputTokens: r.outputTokens ?? this.totals.outputTokens,
+          };
+        }
+      } catch {
+        // 落到下面的会话累计
+      }
     }
+    if (this.totals.outputTokens === 0 && this.totals.costUsd === 0) return null;
+    return {
+      costUsd: this.totals.costUsd,
+      inputTokens: this.totals.inputTokens,
+      outputTokens: this.totals.outputTokens,
+      windows: [],
+    };
   }
 
   async respondPermission(reqId: string, reply: PermissionReply): Promise<void> {
