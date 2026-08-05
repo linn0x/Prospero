@@ -1,6 +1,33 @@
 # 语音输入计划(M3)
 
-> 状态:未开工。
+> 状态:方案 A 代码已完成(2026-08-04);真机隐私、延迟与中文准确率验收待执行。
+
+## 0. 实施结果
+
+已落地:
+
+- 使用维护中的 `expo-speech-recognition` 56.0.1,通过 Expo config plugin 写入
+  iOS 麦克风/语音识别说明和 Android `RECORD_AUDIO`。
+- `VoiceButton`:长按启动、松开转写、上滑取消、音量指示、转写阶段点按取消、
+  权限拒绝后的系统设置入口。
+- 转写只追加到结构化聊天的当前草稿,不覆盖、不自动发送;TTY/终端会话不显示按钮。
+- Android 仅允许 API 33+,先检查 `zh-CN` 已安装离线模型;缺失时引导系统下载,
+  检测失败或不支持时禁用,没有在线回退。
+- iOS 依赖补丁在创建识别任务前按当前 locale 检查
+  `supportsOnDeviceRecognition`,并无条件写入
+  `requiresOnDeviceRecognition = true`;不支持时失败关闭,不会启动可能联网的任务。
+- 自动验证:移动端 TypeScript 检查通过,45 项测试通过,Expo Doctor 20/20 通过,
+  prebuild 配置已确认包含两项 iOS usage description 与 Android `RECORD_AUDIO`。
+
+仍须在真机完成(这些指标无法由当前无 iOS 真机/Xcode 的环境代验):
+
+1. iOS 开发构建安装到真机,先在联网状态下载/确认中文离线模型。
+2. 用 Proxyman/Charles 或路由器抓包,按住说 10 秒常用指令;允许 Prospero 的局域网
+   daemon 流量,但不得出现发往 Apple/Google 或其他公网转写服务的音频请求。
+3. 断开公网但保留与 Mac 的局域网连接,重复语音输入;仍能出文字才通过 V-A。
+4. 计时 10 秒内语音从松手到草稿出现的耗时,目标 `<2s`;连续测 5 次。
+5. 跑 20 句包含文件名、Git、TypeScript、Codex/Claude 等词的中文指令,
+   记录可接受率,同时验证上滑取消、转写中取消、权限拒绝和草稿追加。
 
 ## 1. 为什么值得做
 
@@ -38,7 +65,7 @@ Prospero 的整个卖点是**零云中转 + 端到端加密**([architecture-expl
 
 ### 为什么 A 先行
 
-`@jamsch/expo-speech-recognition` 封装了 iOS `SFSpeechRecognizer` /
+`expo-speech-recognition`(仓库仍由 jamsch 维护)封装了 iOS `SFSpeechRecognizer` /
 Android `SpeechRecognizer` / Web,并支持 `requiresOnDeviceRecognition`
 强制本地识别。双平台一套 API,和现有 Expo 栈同构。
 
@@ -81,7 +108,7 @@ daemon 已经在 Mac 上跑着,而 Mac 的算力远超手机。音频经**已有
 ## 5. 任务分解
 
 ### V1 技术验证(0.5 天)
-- 装 `@jamsch/expo-speech-recognition`,在 iOS 真机上跑通 `requiresOnDeviceRecognition: true`。
+- 装 `expo-speech-recognition`,在 iOS 真机上跑通 `requiresOnDeviceRecognition: true`。
 - **验证要点**:强制离线时是否真的不发网络请求(抓包确认,不信文档);
   中文识别质量是否可用。
 - 若离线中文质量不可接受 → 直接跳到方案 B,不在 A 上浪费时间。
@@ -128,6 +155,6 @@ daemon 已经在 Mac 上跑着,而 Mac 的算力远超手机。音频经**已有
 
 ## 9. 参考
 
-- [`@jamsch/expo-speech-recognition`](https://github.com/jamsch/expo-speech-recognition) — iOS SFSpeechRecognizer / Android SpeechRecognizer / Web 封装,支持 `requiresOnDeviceRecognition`
+- [`expo-speech-recognition`](https://github.com/jamsch/expo-speech-recognition) — iOS SFSpeechRecognizer / Android SpeechRecognizer / Web 封装,支持 `requiresOnDeviceRecognition`
 - [expo-speech(SDK 57)](https://docs.expo.dev/versions/v57.0.0/sdk/speech/) — **仅 TTS,不含识别**,别搞混
 - [whisper.cpp](https://github.com/ggerganov/whisper.cpp) — 方案 B 的 Mac 侧转写

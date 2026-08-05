@@ -18,9 +18,11 @@ import { Icon } from "@/components/Icon";
 import { KeyBar } from "@/components/KeyBar";
 import { QuickReplies } from "@/components/QuickReplies";
 import { Terminal } from "@/components/Terminal";
+import { VoiceButton } from "@/components/VoiceButton";
 import { matchCommands } from "@/lib/slash-commands";
 import { MONOSPACE_FONT } from "@/lib/theme";
 import { useHostConnection } from "@/lib/use-host-connection";
+import { appendVoiceTranscript } from "@/lib/voice-input";
 
 const statusText: Record<SessionInfo["status"], string> = {
   starting: "启动中",
@@ -73,6 +75,11 @@ export default function SessionScreen() {
     },
     [conn, sid, isStructured],
   );
+
+  const appendTranscript = useCallback((text: string): void => {
+    // 使用函数式更新，转写期间用户新打的字也不会被旧闭包覆盖。
+    setDraft((current) => appendVoiceTranscript(current, text));
+  }, []);
 
   const confirmKill = (): void => {
     if (!conn || !sid) return;
@@ -245,6 +252,7 @@ export default function SessionScreen() {
           autoCorrect={false}
           multiline={isChat}
         />
+        {isChat && <VoiceButton onTranscript={appendTranscript} />}
         <Pressable
           style={[styles.sendBtn, draft.trim().length === 0 && styles.sendBtnDim]}
           onPress={() => send(draft)}
