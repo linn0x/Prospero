@@ -13,7 +13,19 @@ import {
 } from "react-native";
 import * as Haptics from "expo-haptics";
 import { Stack, router, useLocalSearchParams } from "expo-router";
-import type { ApprovalPolicy, SessionInfo } from "@prospero/protocol";
+import type { ApprovalPolicy, SessionInfo, UsageWindow } from "@prospero/protocol";
+import type { S2CMessage } from "@prospero/protocol";
+
+type UsageResult = Extract<S2CMessage, { type: "usage.result" }>;
+
+/** 把 ISO 时间说成人话:「14:30」或「明天 09:00」 */
+function formatReset(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const now = new Date();
+  const hhmm = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  return d.toDateString() === now.toDateString() ? hhmm : `${String(d.getMonth() + 1)}/${String(d.getDate())} ${hhmm}`;
+}
 import { ChatView } from "@/components/ChatView";
 import { Icon } from "@/components/Icon";
 import { KeyBar } from "@/components/KeyBar";
@@ -60,6 +72,14 @@ export default function SessionScreen() {
   const isStructured = session?.kind === "structured";
   const isChat = isStructured && !showTty;
   const busy = session?.status === "running" || session?.status === "starting";
+  const [usage, setUsage] = useState<UsageResult | null>(null);
+
+  // 只显示最吃紧的那个窗口 —— 头部塞不下三个,而你关心的永远是先撞上的那个
+  const tightest = (usage?.windows ?? []).reduce<UsageWindow | null>(
+    (best, w) => (best === null || w.utilization > best.utilization ? w : best),
+    null,
+  );
+
   const elapsed = useElapsed(busy || session?.status === "waiting_approval" ? session?.busySince : undefined);
 
   const [images, setImages] = useState<PickedImage[]>([]);
@@ -84,6 +104,50 @@ export default function SessionScreen() {
     },
     [conn, sid, isStructured, images],
   );
+
+  // 会话打开时取一次;不轮询 —— 限流窗口是小时级的,盯着刷没意义
+  useEffect(() => {
+    if (!conn || !sid || !isStructured) return;
+    let alive = true;
+    void conn
+      .usageGet(sid)
+      .then((r) => {
+        if (alive) setUsage(r);
+      })
+      .catch(() => {
+        // 取不到就是没有,不打扰用户
+      });
+    return () => {
+      alive = false;
+    };
+  }, [conn, sid, isStructured]);
+
+  const showUsage = (): void => {
+    if (!conn || !sid) return;
+    void conn
+      .usageGet(sid)
+      .then((r) => {
+        setUsage(r);
+        if (!r.available) {
+          Alert.alert("用量", r.reason ?? "这个后端没有暴露用量数据。");
+          return;
+        }
+        const lines: string[] = [];
+        if (r.subscription) lines.push(`套餐:${r.subscription}`);
+        if (r.costUsd !== undefined) lines.push(`本会话花费:$${r.costUsd.toFixed(4)}`);
+        for (const w of r.windows ?? []) {
+          const reset = w.resetsAt ? ` · ${formatReset(w.resetsAt)}重置` : "";
+          lines.push(`${w.label}:已用 ${String(Math.round(w.utilization))}%${reset}`);
+        }
+        if ((r.windows ?? []).length === 0) {
+          lines.push("这个账号不适用套餐限流(API key / Bedrock / Vertex)。");
+        }
+        Alert.alert("用量与限流", lines.join("\n"));
+      })
+      .catch((e: unknown) => {
+        Alert.alert("读取失败", e instanceof Error ? e.message : String(e));
+      });
+  };
 
   const attach = (): void => {
     const room = MAX_IMAGES - images.length;
@@ -176,7 +240,7 @@ export default function SessionScreen() {
       }${
         // 洪峰时才有值。A4 验收线是 30fps,平时没输出就不显示,免得占位置
         perf ? ` · ${String(perf.fps)}fps ${String(perf.kb)}KB/s` : ""
-      }`
+      }${tightest ? ` · ${tightest.label} ${String(Math.round(tightest.utilization))}%` : ""}`
     : "";
 
   // 输入以 / 开头时给命令候选
@@ -222,6 +286,18 @@ export default function SessionScreen() {
                   {/* 标签写的是"点了会切到哪",不是"现在是什么" */}
                   <Text style={[styles.ttyBtn, showTty && styles.ttyBtnActive]}>
                     {showTty ? "看对话" : "看终端"}
+                  </Text>
+                </Pressable>
+              )}
+              {isStructured && (
+                <Pressable onPress={showUsage} hitSlop={8}>
+                  <Text
+                    style={[
+                      styles.ttyBtn,
+                      tightest && tightest.utilization >= 80 && styles.usageHot,
+                    ]}
+                  >
+                    用量
                   </Text>
                 </Pressable>
               )}
@@ -416,6 +492,8 @@ const styles = StyleSheet.create({
   ttyBtnActive: { color: "#7aa2f7", borderColor: "#3557b7" },
   // 放宽后必须显眼 —— 用户要能一眼看出这个会话没在逐条把关
   policyRelaxed: { color: "#e5a341", borderColor: "#7a5a1a" },
+  // 用掉 80% 以上就变色 —— 到那时你该知道自己快撞墙了
+  usageHot: { color: "#e5534b", borderColor: "#7a2a2a" },
   stopText: { color: "#d9a441", fontSize: 15 },
   killText: { color: "#e5534b", fontSize: 15 },
   reconnBar: { backgroundColor: "#3a2f1f", paddingHorizontal: 12, paddingVertical: 6 },

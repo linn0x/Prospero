@@ -423,6 +423,7 @@ export class HostConnection {
       case "git.status.result":
       case "git.diff.result":
       case "git.done":
+      case "usage.result":
         this.resolveFs(msg);
         return;
       case "error":
@@ -522,6 +523,10 @@ export class HostConnection {
     length: number,
   ): Promise<Extract<S2CMessage, { type: "fs.chunk" }>> {
     return this.fsRequest(sid, path, { type: "fs.get", sid, path, offset, length });
+  }
+
+  usageGet(sid: string): Promise<Extract<S2CMessage, { type: "usage.result" }>> {
+    return this.fsRequest(sid, "#usage.result", { type: "usage.get", sid });
   }
 
   gitStatus(sid: string): Promise<Extract<S2CMessage, { type: "git.status.result" }>> {
