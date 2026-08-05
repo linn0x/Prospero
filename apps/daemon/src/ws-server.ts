@@ -43,6 +43,7 @@ import {
   writeChunk,
   writeFileAt,
 } from "./fs-ops.js";
+import * as gitOps from "./git-ops.js";
 import type { PtySession } from "./pty-session.js";
 
 const DAEMON_VERSION = "0.0.1";
@@ -462,6 +463,73 @@ export async function createDaemonServer(
       case "fs.rename":
         await handleFs(conn, msg);
         return;
+
+      case "git.status":
+      case "git.diff":
+      case "git.stage":
+      case "git.discard":
+      case "git.commit":
+        await handleGit(conn, msg);
+        return;
+    }
+  }
+
+  /** git 操作。根同样是会话 cwd,路径经 fs-ops 校验后才交给 git。 */
+  async function handleGit(
+    conn: Conn,
+    msg: Extract<C2SMessage, { type: `git.${string}` }>,
+  ): Promise<void> {
+    const root = manager.cwdOf(msg.sid);
+    if (root === null) {
+      send(conn, {
+        type: "error",
+        code: "session_not_found",
+        message: `no such session: ${msg.sid}`,
+        sid: msg.sid,
+      });
+      return;
+    }
+    try {
+      switch (msg.type) {
+        case "git.status": {
+          const st = await gitOps.status(root);
+          send(conn, { type: "git.status.result", sid: msg.sid, ...st });
+          return;
+        }
+        case "git.diff": {
+          const patch = await gitOps.diff(root, msg.path, msg.staged);
+          send(conn, { type: "git.diff.result", sid: msg.sid, path: msg.path, patch });
+          return;
+        }
+        case "git.stage": {
+          if (msg.unstage) await gitOps.unstage(root, msg.paths);
+          else await gitOps.stage(root, msg.paths);
+          send(conn, {
+            type: "git.done",
+            sid: msg.sid,
+            op: msg.unstage ? "unstage" : "stage",
+          });
+          return;
+        }
+        case "git.discard": {
+          await gitOps.discard(root, msg.path);
+          send(conn, { type: "git.done", sid: msg.sid, op: "discard" });
+          return;
+        }
+        case "git.commit": {
+          const hash = await gitOps.commit(root, msg.message);
+          send(conn, { type: "git.done", sid: msg.sid, op: "commit", detail: hash });
+          return;
+        }
+      }
+    } catch (e) {
+      const code = e instanceof FsError ? e.code : "io";
+      send(conn, {
+        type: "error",
+        code: code === "denied" ? "denied" : "fs_error",
+        message: e instanceof Error ? e.message : String(e),
+        sid: msg.sid,
+      });
     }
   }
 

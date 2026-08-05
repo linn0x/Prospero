@@ -419,6 +419,9 @@ export class HostConnection {
       case "fs.written":
       case "fs.chunk":
       case "fs.done":
+      case "git.status.result":
+      case "git.diff.result":
+      case "git.done":
         this.resolveFs(msg);
         return;
       case "error":
@@ -446,8 +449,9 @@ export class HostConnection {
     return `${sid}\u0000${path}`;
   }
 
-  private resolveFs(msg: S2CMessage & { sid: string; path: string }): void {
-    const key = this.fsKey(msg.sid, msg.path);
+  private resolveFs(msg: S2CMessage & { sid: string; path?: string }): void {
+    // git.status / git.done 没有 path,用消息类型当 key 的一部分
+    const key = this.fsKey(msg.sid, msg.path ?? `#${msg.type}`);
     const waiter = this.fsWaiters.get(key);
     if (!waiter) return;
     this.fsWaiters.delete(key);
@@ -517,6 +521,34 @@ export class HostConnection {
     length: number,
   ): Promise<Extract<S2CMessage, { type: "fs.chunk" }>> {
     return this.fsRequest(sid, path, { type: "fs.get", sid, path, offset, length });
+  }
+
+  gitStatus(sid: string): Promise<Extract<S2CMessage, { type: "git.status.result" }>> {
+    return this.fsRequest(sid, "#git.status.result", { type: "git.status", sid });
+  }
+
+  gitDiff(
+    sid: string,
+    path: string,
+    staged: boolean,
+  ): Promise<Extract<S2CMessage, { type: "git.diff.result" }>> {
+    return this.fsRequest(sid, path, { type: "git.diff", sid, path, staged });
+  }
+
+  gitStage(
+    sid: string,
+    paths: string[],
+    unstage: boolean,
+  ): Promise<Extract<S2CMessage, { type: "git.done" }>> {
+    return this.fsRequest(sid, "#git.done", { type: "git.stage", sid, paths, unstage });
+  }
+
+  gitDiscard(sid: string, path: string): Promise<Extract<S2CMessage, { type: "git.done" }>> {
+    return this.fsRequest(sid, "#git.done", { type: "git.discard", sid, path });
+  }
+
+  gitCommit(sid: string, message: string): Promise<Extract<S2CMessage, { type: "git.done" }>> {
+    return this.fsRequest(sid, "#git.done", { type: "git.commit", sid, message });
   }
 
   fsMkdir(sid: string, path: string): Promise<Extract<S2CMessage, { type: "fs.done" }>> {
