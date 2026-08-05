@@ -22,7 +22,13 @@ import type {
 import type { AgentEventBody, Attachment, PermissionReply } from "@prospero/protocol";
 import { needsApproval } from "../approval-policy.js";
 import { diffFromToolInput } from "./diff.js";
-import { AdapterError, summarize, type AdapterContext, type AgentAdapter } from "./types.js";
+import {
+  AdapterError,
+  summarize,
+  type AdapterContext,
+  type AgentAdapter,
+  type UsageReport,
+} from "./types.js";
 
 interface PendingPermission {
   resolve(result: PermissionResult): void;
@@ -327,6 +333,58 @@ export class ClaudeAdapter implements AgentAdapter {
       p.resolve({ behavior: "allow", updatedInput: p.input });
     }
     this.emit({ kind: "permission.resolved", reqId, reply });
+  }
+
+  /**
+   * 用量与限流。
+   *
+   * SDK 上这个方法叫 usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET ——
+   * 名字本身就是警告,任何一次发版都可能改名或消失。数据确实有用(知道自己
+   * 用掉了 5 小时窗口的 95%,能解释 agent 为什么突然变慢),所以接,
+   * 但一切失败都当成"没有数据",绝不让它影响会话本身。
+   */
+  async usage(): Promise<UsageReport | null> {
+    const q = this.q as unknown as {
+      usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET?: () => Promise<unknown>;
+    } | null;
+    const fn = q?.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET;
+    if (typeof fn !== "function") return null;
+
+    let raw: unknown;
+    try {
+      raw = await fn.call(q);
+    } catch {
+      return null; // SDK 换了实现或后端不通,都不是会话的问题
+    }
+    const r = raw as {
+      session?: { total_cost_usd?: number };
+      subscription_type?: string | null;
+      rate_limits_available?: boolean;
+      rate_limits?: Record<string, { utilization?: number | null; resets_at?: string | null } | null>;
+    } | null;
+    if (!r) return null;
+
+    const labels: Record<string, string> = {
+      five_hour: "5 小时",
+      seven_day: "7 天",
+      seven_day_oauth_apps: "7 天(应用)",
+    };
+    const windows: UsageReport["windows"] = [];
+    for (const [key, win] of Object.entries(r.rate_limits ?? {})) {
+      if (!win || typeof win.utilization !== "number") continue;
+      windows.push({
+        label: labels[key] ?? key,
+        utilization: Math.max(0, Math.min(100, win.utilization)),
+        ...(win.resets_at ? { resetsAt: win.resets_at } : {}),
+      });
+    }
+    return {
+      subscription: r.subscription_type ?? null,
+      ...(typeof r.session?.total_cost_usd === "number"
+        ? { costUsd: r.session.total_cost_usd }
+        : {}),
+      windows,
+    };
   }
 
   async interrupt(): Promise<void> {

@@ -18,10 +18,12 @@ export {
   AgentEventBodySchema,
   FileDiffSchema,
   AttachmentSchema,
+  S2CUsageSchema,
+  UsageWindowSchema,
   FsEntrySchema,
   GitFileSchema,
   C2SMessageSchema,
   S2CMessageSchema,
   PairingPayloadSchema,
 } from "./schemas.js";
-export type { ApprovalPolicy, Attachment, FsEntry, GitFile } from "./schemas.js";
+export type { ApprovalPolicy, Attachment, FsEntry, GitFile, UsageWindow } from "./schemas.js";
