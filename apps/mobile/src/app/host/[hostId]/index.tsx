@@ -12,6 +12,7 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Stack, router, useLocalSearchParams } from "expo-router";
 import type { AgentKind, SessionInfo } from "@prospero/protocol";
+import { AgentIcon } from "@/components/AgentIcon";
 import { HostSummary } from "@/components/HostSummary";
 import { Icon } from "@/components/Icon";
 import { SwipeRow, type SwipeAction } from "@/components/SwipeRow";
@@ -178,10 +179,18 @@ export default function HostScreen() {
                 onPress={() => setAgent(a)}
                 style={[styles.chip, agent === a && styles.chipActive]}
               >
-                <Text style={[styles.chipText, agent === a && styles.chipTextActive]}>
-                  {a}
-                  {STRUCTURED.includes(a) ? " 💬" : ""}
-                </Text>
+                <AgentIcon agent={a} size={14} />
+                <Text style={[styles.chipText, agent === a && styles.chipTextActive]}>{a}</Text>
+                {/* 对话/终端决定进去看到的是消息流还是一块终端屏,建之前就该知道。
+                    原来这里挂个 💬 emoji —— 和满屏 SF Symbols 摆在一起像块补丁 */}
+                {STRUCTURED.includes(a) && (
+                  <Icon
+                    name="bubble.left.and.text.bubble.right"
+                    size={11}
+                    /* 选中时底色变蓝,弱灰会糊在上面看不见 */
+                    color={agent === a ? color.textDim : color.textFaint}
+                  />
+                )}
               </Pressable>
             ))}
           </View>
@@ -407,6 +416,9 @@ const styles = StyleSheet.create({
   connText: font.sub,
   filterRow: { gap: space.sm, paddingHorizontal: space.lg, paddingVertical: space.md },
   chip: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
     paddingHorizontal: space.md,
     paddingVertical: 7,
     borderRadius: 999,
