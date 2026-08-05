@@ -18,8 +18,9 @@ export {
   AgentEventBodySchema,
   FileDiffSchema,
   FsEntrySchema,
+  GitFileSchema,
   C2SMessageSchema,
   S2CMessageSchema,
   PairingPayloadSchema,
 } from "./schemas.js";
-export type { ApprovalPolicy, FsEntry } from "./schemas.js";
+export type { ApprovalPolicy, FsEntry, GitFile } from "./schemas.js";

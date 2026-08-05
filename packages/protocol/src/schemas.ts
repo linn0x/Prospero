@@ -270,6 +270,40 @@ export const C2SFsRenameSchema = z.object({
   to: relPath,
 });
 
+// ---------------------------------------------------------------- git
+//
+// 只暴露固定的几种操作,不接受客户端传任意 git 参数 —— 那等于开一个命令执行口子。
+
+export const C2SGitStatusSchema = z.object({ type: z.literal("git.status"), sid });
+
+export const C2SGitDiffSchema = z.object({
+  type: z.literal("git.diff"),
+  sid,
+  path: relPath,
+  /** true = 看暂存区与 HEAD 的差异 */
+  staged: z.boolean(),
+});
+
+export const C2SGitStageSchema = z.object({
+  type: z.literal("git.stage"),
+  sid,
+  paths: z.array(relPath).min(1).max(500),
+  /** true = 取消暂存 */
+  unstage: z.boolean(),
+});
+
+export const C2SGitDiscardSchema = z.object({
+  type: z.literal("git.discard"),
+  sid,
+  path: relPath,
+});
+
+export const C2SGitCommitSchema = z.object({
+  type: z.literal("git.commit"),
+  sid,
+  message: z.string().min(1).max(10000),
+});
+
 export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SHelloSchema,
   C2SSessionCreateSchema,
@@ -291,6 +325,11 @@ export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SFsMkdirSchema,
   C2SFsRemoveSchema,
   C2SFsRenameSchema,
+  C2SGitStatusSchema,
+  C2SGitDiffSchema,
+  C2SGitStageSchema,
+  C2SGitDiscardSchema,
+  C2SGitCommitSchema,
 ]);
 
 // ---------------------------------------------------------------- S → C
@@ -555,6 +594,41 @@ export const S2CFsDoneSchema = z.object({
   op: z.enum(["mkdir", "remove", "rename"]),
 });
 
+export const GitFileSchema = z.object({
+  path: z.string(),
+  /** porcelain 的 X 位(暂存区) */
+  index: z.string(),
+  /** porcelain 的 Y 位(工作区) */
+  worktree: z.string(),
+  untracked: z.boolean(),
+});
+
+export const S2CGitStatusSchema = z.object({
+  type: z.literal("git.status.result"),
+  sid,
+  /** 不是 git 仓库时为 null */
+  branch: z.string().nullable(),
+  ahead: z.number().int().nonnegative(),
+  behind: z.number().int().nonnegative(),
+  files: z.array(GitFileSchema),
+  staged: z.boolean(),
+});
+
+export const S2CGitDiffSchema = z.object({
+  type: z.literal("git.diff.result"),
+  sid,
+  path: z.string(),
+  patch: z.string(),
+});
+
+export const S2CGitDoneSchema = z.object({
+  type: z.literal("git.done"),
+  sid,
+  op: z.enum(["stage", "unstage", "discard", "commit"]),
+  /** commit 时带短 hash */
+  detail: z.string().optional(),
+});
+
 export const S2CMessageSchema = z.discriminatedUnion("type", [
   S2CHelloOkSchema,
   S2CSessionStateSchema,
@@ -570,6 +644,9 @@ export const S2CMessageSchema = z.discriminatedUnion("type", [
   S2CFsWrittenSchema,
   S2CFsChunkSchema,
   S2CFsDoneSchema,
+  S2CGitStatusSchema,
+  S2CGitDiffSchema,
+  S2CGitDoneSchema,
 ]);
 
 // ---------------------------------------------------------------- 配对 QR 载荷
@@ -607,6 +684,7 @@ export type C2STermAck = z.infer<typeof C2STermAckSchema>;
 export type C2SPermissionRespond = z.infer<typeof C2SPermissionRespondSchema>;
 export type C2SMessage = z.infer<typeof C2SMessageSchema>;
 export type FsEntry = z.infer<typeof FsEntrySchema>;
+export type GitFile = z.infer<typeof GitFileSchema>;
 export type ChatRole = z.infer<typeof ChatRoleSchema>;
 export type ToolState = z.infer<typeof ToolStateSchema>;
 export type AgentEventBody = z.infer<typeof AgentEventBodySchema>;
