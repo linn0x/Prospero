@@ -11,6 +11,11 @@ import { utf8Decode, utf8Encode } from "./utf8.js";
 
 const PREFIX = "prospero://pair?d=";
 
+/** App 路由与 daemon 推送共用的稳定主机 ID。 */
+export function hostIdForDaemonPublicKey(publicKey: string): string {
+  return publicKey.slice(0, 16).replace(/[^a-zA-Z0-9]/g, "");
+}
+
 export function encodePairingQR(payload: PairingPayload): string {
   const p = PairingPayloadSchema.parse(payload);
   return PREFIX + toB64Url(utf8Encode(JSON.stringify(p)));
