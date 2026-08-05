@@ -24,12 +24,7 @@ export type IconName =
   | "checkmark.circle.fill"
   | "xmark.circle.fill"
   | "exclamationmark.triangle.fill"
-  // agent 标识(见 AgentIcon)—— 取各家的气质而非商标
-  | "asterisk"
-  | "chevron.left.forwardslash.chevron.right"
-  | "curlybraces"
-  | "bolt.fill"
-  | "wand.and.stars"
+  // shell / custom 用系统符号 —— 它们不是产品,没有标(见 AgentIcon)
   | "terminal.fill"
   | "command";
 
@@ -50,11 +45,6 @@ const FALLBACK: Record<IconName, string> = {
   "checkmark.circle.fill": "✓",
   "xmark.circle.fill": "✕",
   "exclamationmark.triangle.fill": "⚠︎",
-  asterisk: "✳",
-  "chevron.left.forwardslash.chevron.right": "</>",
-  curlybraces: "{}",
-  "bolt.fill": "⚡",
-  "wand.and.stars": "✨",
   "terminal.fill": "TTY",
   command: "⌘",
 };
