@@ -240,4 +240,40 @@ describe("daemon 全链路", () => {
     }
     expect(closed).toBe(true);
   }, 20000);
+  it("hello.ok 带上机器信息 —— 手机上要能看到那台 Mac 的状态", async () => {
+    // 主机页的概览卡全靠这一帧。字段是 optional 的,漏发不会报错、只会静默空着,
+    // 所以这里逐个断言"确实发了",而不是断言"能解析"
+    const c = await TestClient.connect(deviceToken, deviceKeys);
+    const ok = await c.waitFor((m) => m.type === "hello.ok", "hello.ok");
+    const info = (ok as Extract<S2CMessage, { type: "hello.ok" }>).host;
+    // 发的是人能读的名字,不是 process.platform —— 手机上"darwin 25.5.0"没人认
+    expect(info.platform).not.toBe(process.platform);
+    if (process.platform === "darwin") expect(info.platform).toBe("macOS");
+    expect(info.cpus).toBeGreaterThan(0);
+    expect(info.memTotal).toBeGreaterThan(0);
+    expect(info.memFree).toBeGreaterThan(0);
+    expect(info.uptimeSec).toBeGreaterThan(0);
+    expect(info.loadAvg).toHaveLength(3);
+    expect(info.daemonStartedAt).toBeGreaterThan(0);
+    expect(typeof info.tmuxManaged).toBe("boolean");
+    c.close();
+  }, 20000);
+
+  it("usage.get 不带 sid 也要有应答 —— 限流是账号级的", async () => {
+    // 主机页在进任何会话之前就要显示额度。以前 sid 是必填,导致"想看用量
+    // 得先随便开一个会话",而开会话本身就在烧额度。
+    const c = await TestClient.connect(deviceToken, deviceKeys);
+    await c.waitFor((m) => m.type === "hello.ok", "hello.ok");
+    c.send({ type: "usage.get" });
+    const r = await c.waitFor((m) => m.type === "usage.result", "usage.result");
+    const u = r as Extract<S2CMessage, { type: "usage.result" }>;
+    // 一个结构化会话都没有时,答"没有可用数据"而不是报错关连接
+    expect(u.available).toBe(false);
+    expect(u.sid).toBeUndefined();
+    expect(typeof u.reason).toBe("string");
+    // accounts 一定要在(哪怕是空数组):手机按它渲染订阅列表,
+    // 缺字段和"没有订阅"在 UI 上是两种东西
+    expect(u.accounts).toEqual([]);
+    c.close();
+  }, 20000);
 });

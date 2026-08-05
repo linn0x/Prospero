@@ -26,4 +26,11 @@ export {
   S2CMessageSchema,
   PairingPayloadSchema,
 } from "./schemas.js";
-export type { ApprovalPolicy, Attachment, FsEntry, GitFile, UsageWindow } from "./schemas.js";
+export type {
+  ApprovalPolicy,
+  Attachment,
+  FsEntry,
+  GitFile,
+  UsageAccount,
+  UsageWindow,
+} from "./schemas.js";

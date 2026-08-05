@@ -341,6 +341,20 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     return this.structuredSessions.values().next().value ?? null;
   }
 
+  /**
+   * 每个 agent 各挑一个结构化会话 —— 限流按账号走,而账号按 agent 分,
+   * 所以 claude 问一次、codex 问一次就够了,同一个 agent 开十个会话
+   * 拿到的是同一份额度。
+   */
+  structuredPerAgent(): StructuredSession[] {
+    const byAgent = new Map<AgentKind, StructuredSession>();
+    for (const s of this.structuredSessions.values()) {
+      // 后来的覆盖先前的:新会话更可能刚从服务端拿到过限流推送
+      byAgent.set(s.agent, s);
+    }
+    return [...byAgent.values()];
+  }
+
   /** 转发一条用户消息(可带附件) */
   async chatSend(sid: string, text: string, attachments?: Attachment[]): Promise<void> {
     const s = this.structuredSessions.get(sid);
