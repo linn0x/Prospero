@@ -213,6 +213,10 @@ mkdir -p "$OUTPUT_DIR"
 ARCHIVE="$OUTPUT_DIR/$SCHEME.xcarchive"
 
 step "归档($SCHEME,Release)"
+# 和下面导出前删 IPA 是同一个道理,而且更隐蔽:归档失败时上一次的 .xcarchive
+# 还在,-d 检查照样通过,于是脚本拿着【上一版的代码】继续导出并报"完成"。
+# 实际踩过 —— 装到手机上的是几小时前的构建,界面上什么都没变。
+rm -rf "$ARCHIVE"
 if [[ -n "$TEAM" ]]; then
   xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" \
     -configuration Release -destination 'generic/platform=iOS' \
