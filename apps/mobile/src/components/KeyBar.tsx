@@ -49,10 +49,12 @@ export function KeyBar({
   onKey,
   onFontSize,
   onScrollBottom,
+  onDismissKeyboard,
 }: {
   onKey: (seq: string) => void;
   onFontSize?: (delta: number) => void;
   onScrollBottom?: () => void;
+  onDismissKeyboard?: () => void;
 }) {
   const [ctrl, setCtrl] = useState(false);
 
@@ -148,6 +150,14 @@ export function KeyBar({
               <Text style={styles.keyText}>A+</Text>
             </Pressable>
           </>
+        )}
+        {onDismissKeyboard && (
+          <Pressable
+            onPress={onDismissKeyboard}
+            style={({ pressed }) => [styles.key, pressed && styles.keyPressed]}
+          >
+            <Text style={styles.keyText}>⌄收起</Text>
+          </Pressable>
         )}
         {onScrollBottom && (
           <Pressable
