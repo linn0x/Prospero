@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import type { AgentKind, HostInfo, S2CMessage, UsageAccount } from "@prospero/protocol";
+import { AgentIcon } from "@/components/AgentIcon";
 import type { HostConnection } from "@/lib/connection";
 import { bytes, duration, untilLabel } from "@/lib/format";
 import { Row, Sheet } from "@/components/Sheet";
@@ -10,14 +11,6 @@ type UsageResult = Extract<S2CMessage, { type: "usage.result" }>;
 
 /** 用量取一次的间隔。限流窗口以小时计,一分钟一刷已经远快过它的变化 */
 const POLL_MS = 60_000;
-
-/** 各家 agent 的识别色 —— 颜色即身份,不必每行都读文字才知道是谁 */
-const agentTint: Partial<Record<AgentKind, string>> = {
-  claude: "#D98A5E",
-  codex: "#7AA2F7",
-  opencode: "#5BC98C",
-  grok: "#B48EAD",
-};
 
 /**
  * 主机概览卡。
@@ -138,7 +131,7 @@ export function HostSummary({
             <Gauge
               key={a.agent}
               label={a.agent}
-              dot={agentTint[a.agent] ?? color.textDim}
+              agent={a.agent}
               badge={a.subscription ?? undefined}
               value={
                 w
@@ -204,9 +197,7 @@ export function HostSummary({
           accounts.map((a) => (
             <View key={a.agent} style={styles.account}>
               <View style={styles.accountHead}>
-                <View
-                  style={[styles.dot, { backgroundColor: agentTint[a.agent] ?? color.textDim }]}
-                />
+                <AgentIcon agent={a.agent} size={17} badge />
                 <Text style={font.body}>{a.agent}</Text>
                 {a.subscription != null && <Text style={styles.badge}>{a.subscription}</Text>}
               </View>
@@ -256,20 +247,20 @@ function Gauge({
   value,
   pct,
   tint,
-  dot,
+  agent,
   badge,
 }: {
   label: string;
   value: string;
   pct: number;
   tint: string;
-  dot?: string;
+  agent?: AgentKind;
   badge?: string;
 }) {
   return (
     <View style={styles.gauge}>
       <View style={styles.gaugeHead}>
-        {dot !== undefined && <View style={[styles.dot, { backgroundColor: dot }]} />}
+        {agent !== undefined && <AgentIcon agent={agent} size={13} />}
         <Text style={font.meta}>{label}</Text>
         {badge !== undefined && <Text style={styles.badge}>{badge}</Text>}
         <Text style={[styles.gaugeValue, styles.gaugeValueRight]}>{value}</Text>

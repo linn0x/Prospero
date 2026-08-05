@@ -23,7 +23,15 @@ export type IconName =
   | "desktopcomputer"
   | "checkmark.circle.fill"
   | "xmark.circle.fill"
-  | "exclamationmark.triangle.fill";
+  | "exclamationmark.triangle.fill"
+  // agent 标识(见 AgentIcon)—— 取各家的气质而非商标
+  | "asterisk"
+  | "chevron.left.forwardslash.chevron.right"
+  | "curlybraces"
+  | "bolt.fill"
+  | "wand.and.stars"
+  | "terminal.fill"
+  | "command";
 
 const FALLBACK: Record<IconName, string> = {
   magnifyingglass: "🔍",
@@ -42,6 +50,13 @@ const FALLBACK: Record<IconName, string> = {
   "checkmark.circle.fill": "✓",
   "xmark.circle.fill": "✕",
   "exclamationmark.triangle.fill": "⚠︎",
+  asterisk: "✳",
+  "chevron.left.forwardslash.chevron.right": "</>",
+  curlybraces: "{}",
+  "bolt.fill": "⚡",
+  "wand.and.stars": "✨",
+  "terminal.fill": "TTY",
+  command: "⌘",
 };
 
 export function Icon({
