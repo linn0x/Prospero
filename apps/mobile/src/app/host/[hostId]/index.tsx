@@ -12,6 +12,7 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Stack, router, useLocalSearchParams } from "expo-router";
 import type { AgentKind, SessionInfo } from "@prospero/protocol";
+import { HostSummary } from "@/components/HostSummary";
 import { Icon } from "@/components/Icon";
 import { SwipeRow, type SwipeAction } from "@/components/SwipeRow";
 import { sortSessions } from "@/lib/store";
@@ -144,19 +145,23 @@ export default function HostScreen() {
         }}
       />
 
-      <View style={styles.statusBar}>
-        <Text
-          style={[styles.statusText, runtime.status === "failed" && styles.statusFailed]}
-          numberOfLines={runtime.status === "failed" ? 3 : 1}
-        >
-          {connText}
-        </Text>
-        {(runtime.status === "failed" || runtime.status === "reconnecting") && (
-          <Pressable onPress={() => conn?.kick()} hitSlop={8}>
-            <Text style={styles.retry}>重试</Text>
-          </Pressable>
-        )}
-      </View>
+      {/* 连上时状态并进主机卡片 —— 一行灰字和卡片说的是同一件事,分开摆只是
+          让屏幕上多一条横线。出问题时才需要独立一条,因为那时要给"重试"按钮 */}
+      {runtime.status !== "connected" && (
+        <View style={styles.statusBar}>
+          <Text
+            style={[styles.statusText, runtime.status === "failed" && styles.statusFailed]}
+            numberOfLines={runtime.status === "failed" ? 3 : 1}
+          >
+            {connText}
+          </Text>
+          {(runtime.status === "failed" || runtime.status === "reconnecting") && (
+            <Pressable onPress={() => conn?.kick()} hitSlop={8}>
+              <Text style={styles.retry}>重试</Text>
+            </Pressable>
+          )}
+        </View>
+      )}
 
       {banner !== null && (
         <Pressable style={styles.banner} onPress={() => setBanner(null)}>
@@ -232,6 +237,16 @@ export default function HostScreen() {
             refreshing={runtime.status === "connecting" || runtime.status === "reconnecting"}
             onRefresh={() => conn?.kick()}
             tintColor="#7aa2f7"
+          />
+        }
+        ListHeaderComponent={
+          <HostSummary
+            info={runtime.hostInfo}
+            conn={conn}
+            connected={runtime.status === "connected"}
+            rttMs={runtime.rttMs}
+            sessionCount={all.length}
+            runningCount={runningCount}
           />
         }
         ListEmptyComponent={

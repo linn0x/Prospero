@@ -148,16 +148,35 @@ function tokenEqual(a: string, b: string): boolean {
   return ab.length === bb.length && timingSafeEqual(ab, bb);
 }
 
+/** 认证失败的原因。两种情况处理方式完全不同,不能都笼统说"配对失效" */
+export type AuthFailure =
+  /** token 根本不在设备表里 —— 多半是配对码过期,或手机连的是另一台 daemon */
+  | "unknown_token"
+  /** token 对得上但公钥变了 —— 要么重装过 App,要么 token 被别人拿去用了 */
+  | "key_mismatch";
+
 /**
  * 校验 hello:token 匹配 + TOFU 公钥绑定。
  * 成功返回设备记录(已更新 lastSeen / 绑定公钥),失败返回 null。
+ *
+ * 失败原因通过 `onFail` 回调给出,而不是塞进返回值 —— 调用方拿到 null 就该拒绝,
+ * 原因只用来记日志。发给客户端的错误文案仍然是模糊的:告诉对面"token 存在但
+ * 公钥不对"就是在帮它猜。
  */
-export function authenticate(home: string, hello: C2SHello): DeviceRecord | null {
+export function authenticate(
+  home: string,
+  hello: C2SHello,
+  onFail?: (reason: AuthFailure) => void,
+): DeviceRecord | null {
   const devices = loadDevices(home);
   const device = devices.find((d) => tokenEqual(d.token, hello.token));
-  if (!device) return null;
+  if (!device) {
+    onFail?.("unknown_token");
+    return null;
+  }
   if (device.clientPubKey && device.clientPubKey !== hello.clientPubKey) {
-    return null; // 公钥变化:可能是 token 泄漏被他人使用
+    onFail?.("key_mismatch"); // 公钥变化:可能是 token 泄漏被他人使用
+    return null;
   }
   device.clientPubKey = hello.clientPubKey;
   device.lastSeenAt = Date.now();
