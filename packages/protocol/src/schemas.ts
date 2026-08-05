@@ -97,6 +97,22 @@ export const HostInfoSchema = z.object({
   name: z.string(),
   daemonVersion: z.string(),
   protocolVersion: z.number().int().nonnegative(),
+  /** 系统与硬件 —— 手机上想知道"我那台 Mac 现在怎么样" */
+  platform: z.string().optional(),
+  osVersion: z.string().optional(),
+  arch: z.string().optional(),
+  cpus: z.number().int().positive().optional(),
+  /** 内存总量 / 可用,字节 */
+  memTotal: z.number().nonnegative().optional(),
+  memFree: z.number().nonnegative().optional(),
+  /** 系统已运行秒数 */
+  uptimeSec: z.number().nonnegative().optional(),
+  /** 1/5/15 分钟平均负载 */
+  loadAvg: z.array(z.number()).optional(),
+  /** daemon 自身启动时间戳,判断它跑了多久 */
+  daemonStartedAt: z.number().int().nonnegative().optional(),
+  /** 会话是否托管在 tmux(决定 daemon 重启会不会丢会话) */
+  tmuxManaged: z.boolean().optional(),
 });
 
 // ---------------------------------------------------------------- C → S
@@ -323,10 +339,15 @@ export const C2SGitCommitSchema = z.object({
   message: z.string().min(1).max(10000),
 });
 
-/** 取用量与限流。数据来源不稳定,拿不到时返回 available=false 而不是报错 */
+/**
+ * 取用量与限流。
+ *
+ * sid 可省略:套餐限流是【账号级】的,五小时窗口在所有会话之间共享,
+ * 所以主机页也该看得到。省略时由 daemon 挑一个结构化会话去问。
+ */
 export const C2SUsageGetSchema = z.object({
   type: z.literal("usage.get"),
-  sid,
+  sid: sid.optional(),
 });
 
 export const C2SMessageSchema = z.discriminatedUnion("type", [
@@ -674,7 +695,7 @@ export const UsageWindowSchema = z.object({
  */
 export const S2CUsageSchema = z.object({
   type: z.literal("usage.result"),
-  sid,
+  sid: sid.optional(),
   available: z.boolean(),
   /** 套餐类型(pro / max / team / enterprise),API key 会话为 null */
   subscription: z.string().nullable().optional(),

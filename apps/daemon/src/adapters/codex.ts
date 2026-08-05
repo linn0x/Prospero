@@ -19,7 +19,20 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import type { AgentEventBody, FileDiff, PermissionReply } from "@prospero/protocol";
 import { fromUnifiedPatch } from "./diff.js";
-import { AdapterError, summarize, type AdapterContext, type AgentAdapter } from "./types.js";
+import {
+  AdapterError,
+  summarize,
+  type AdapterContext,
+  type AgentAdapter,
+  type UsageReport,
+} from "./types.js";
+
+/** 把窗口时长说成人话:300 分钟 → 「5 小时」 */
+function describeWindow(mins: number): string {
+  if (mins % (60 * 24) === 0) return `${String(mins / (60 * 24))} 天`;
+  if (mins % 60 === 0) return `${String(mins / 60)} 小时`;
+  return `${String(mins)} 分钟`;
+}
 
 const START_TIMEOUT_MS = 30_000;
 
@@ -71,6 +84,24 @@ export class CodexAdapter implements AgentAdapter {
   private buf = "";
   private readonly pendingRpc = new Map<number | string, (m: RpcMessage) => void>();
   private readonly approvals = new Map<string, PendingApproval>();
+  /** 本轮 token(来自 thread/tokenUsage/updated,turn/completed 时随事件带出) */
+  private lastTurnTokens: { input?: number | undefined; output?: number | undefined } = {};
+  /** 会话累计 token */
+  private totalTokens: { input?: number | undefined; output?: number | undefined } = {};
+  /** 账号级限流快照 */
+  private rateLimits: { windows: UsageReport["windows"]; plan: string | null } | null = null;
+
+  /** codex 原生支持用量与限流,不必退回会话累计 */
+  async usage(): Promise<UsageReport | null> {
+    if (!this.rateLimits && this.totalTokens.output === undefined) return null;
+    return {
+      subscription: this.rateLimits?.plan ?? null,
+      ...(this.totalTokens.input !== undefined ? { inputTokens: this.totalTokens.input } : {}),
+      ...(this.totalTokens.output !== undefined ? { outputTokens: this.totalTokens.output } : {}),
+      windows: this.rateLimits?.windows ?? [],
+    };
+  }
+
   /** itemId → 工具名,用于 item/completed 时回填 tool.end */
   private readonly toolItems = new Map<string, string>();
   private currentTurnMsgId = "";
@@ -277,19 +308,67 @@ export class CodexAdapter implements AgentAdapter {
         });
         return;
       }
-      case "turn/completed": {
-        const usage = (p["usage"] ?? {}) as Record<string, unknown>;
+      /**
+       * 用量在【单独的通知】里,不在 turn/completed 上。
+       * TurnCompletedNotification 的形状是 { threadId, turn },压根没有 usage 字段 ——
+       * 早先按 `p.usage` 读,于是 token 永远是 0,界面上 codex 看起来"没有用量"。
+       * 官方 schema(codex app-server generate-ts)是唯一可靠的来源。
+       */
+      case "thread/tokenUsage/updated": {
+        const tu = (p["tokenUsage"] ?? {}) as Record<string, unknown>;
+        const last = (tu["last"] ?? {}) as Record<string, unknown>;
+        const total = (tu["total"] ?? {}) as Record<string, unknown>;
         const num = (v: unknown): number | undefined =>
           typeof v === "number" && Number.isFinite(v) ? v : undefined;
-        const input = num(usage["inputTokens"] ?? usage["input_tokens"]);
-        const output = num(usage["outputTokens"] ?? usage["output_tokens"]);
+        this.lastTurnTokens = {
+          input: num(last["inputTokens"]),
+          output: num(last["outputTokens"]),
+        };
+        this.totalTokens = {
+          input: num(total["inputTokens"]),
+          output: num(total["outputTokens"]),
+        };
+        return;
+      }
+
+      /** 账号级限流。窗口是 usedPercent + resetsAt(秒级时间戳) */
+      case "account/rateLimits/updated": {
+        const rl = (p["rateLimits"] ?? {}) as Record<string, unknown>;
+        const win = (v: unknown, label: string): UsageReport["windows"][number] | null => {
+          const w = v as { usedPercent?: unknown; windowDurationMins?: unknown; resetsAt?: unknown } | null;
+          if (!w || typeof w.usedPercent !== "number") return null;
+          const mins = typeof w.windowDurationMins === "number" ? w.windowDurationMins : null;
+          return {
+            label: mins ? describeWindow(mins) : label,
+            utilization: w.usedPercent,
+            ...(typeof w.resetsAt === "number"
+              ? { resetsAt: new Date(w.resetsAt * 1000).toISOString() }
+              : {}),
+          };
+        };
+        const windows = [win(rl["primary"], "主窗口"), win(rl["secondary"], "次窗口")].filter(
+          (w): w is UsageReport["windows"][number] => w !== null,
+        );
+        this.rateLimits = {
+          windows,
+          plan: typeof rl["planType"] === "string" ? rl["planType"] : null,
+        };
+        return;
+      }
+
+      case "turn/completed": {
         this.emit({
           kind: "turn.end",
           msgId: this.lastTextMsgId || this.currentTurnMsgId || String(p["turnId"] ?? ""),
           ...(typeof p["status"] === "string" ? { finish: p["status"] } : {}),
-          ...(input !== undefined ? { inputTokens: input } : {}),
-          ...(output !== undefined ? { outputTokens: output } : {}),
+          ...(this.lastTurnTokens.input !== undefined
+            ? { inputTokens: this.lastTurnTokens.input }
+            : {}),
+          ...(this.lastTurnTokens.output !== undefined
+            ? { outputTokens: this.lastTurnTokens.output }
+            : {}),
         });
+        this.lastTurnTokens = {};
         return;
       }
       case "error": {
