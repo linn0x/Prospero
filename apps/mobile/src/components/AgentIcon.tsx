@@ -1,26 +1,28 @@
 import { StyleSheet, View } from "react-native";
+import Svg, { Path } from "react-native-svg";
 import type { AgentKind } from "@prospero/protocol";
+import { agentLogoPath } from "@/components/agent-logos";
 import { Icon, type IconName } from "@/components/Icon";
 import { color, radius } from "@/lib/theme";
 
 /**
- * agent 的图标与识别色。
+ * agent 的标识与识别色。
  *
- * 用的是 SF Symbols 而不是各家的品牌 logo:一来手里没有那些矢量文件,二来
- * 混进一堆来路不同的位图会把这套界面的质感拉掉 —— 系统符号和 App 里其余图标
- * 共用同一套字形与光学重心,这是"看起来像原生"最省力的一步。
+ * 有官方标的用官方标(claude / codex / opencode / grok / trae),没有的用系统符号
+ * —— shell 和 custom 不是产品,是"随便跑个命令",给它们编一个标反而是在暗示
+ * 那儿有个不存在的东西。
  *
- * 所以符号取的是各家的【气质】而非商标:claude 是那个星芒,codex 是代码尖括号,
- * opencode 是花括号,grok 是闪电。颜色才是真正的身份 —— 扫一眼认色,不必读字。
+ * 颜色取各家品牌色,但压过一道:原色是给白底做主视觉用的,直接摆到深色界面上
+ * 会亮得跳出来,六个并排更是一片吵。识别靠色相,不靠饱和度。
  */
-const AGENTS: Record<AgentKind, { symbol: IconName; tint: string }> = {
-  claude: { symbol: "asterisk", tint: "#D98A5E" },
-  codex: { symbol: "chevron.left.forwardslash.chevron.right", tint: "#7AA2F7" },
-  opencode: { symbol: "curlybraces", tint: "#5BC98C" },
-  grok: { symbol: "bolt.fill", tint: "#B48EAD" },
-  trae: { symbol: "wand.and.stars", tint: "#E5A341" },
-  shell: { symbol: "terminal.fill", tint: "#9B9BA6" },
-  custom: { symbol: "command", tint: "#9B9BA6" },
+const AGENTS: Record<AgentKind, { tint: string; symbol?: IconName }> = {
+  claude: { tint: "#D97757" },
+  codex: { tint: "#8AB4F8" },
+  opencode: { tint: "#5BC98C" },
+  grok: { tint: "#C9C9D4" },
+  trae: { tint: "#3ED592" },
+  shell: { tint: "#9B9BA6", symbol: "terminal.fill" },
+  custom: { tint: "#9B9BA6", symbol: "command" },
 };
 
 export function agentTint(agent: AgentKind): string {
@@ -28,8 +30,8 @@ export function agentTint(agent: AgentKind): string {
 }
 
 /**
- * `badge` 给图标加一块同色的浅底 —— 在选项这种需要点的地方,色块能撑出
- * 可点面积;在列表行里就不必了,那儿只是标识,不是按钮。
+ * `badge` 给标识加一块同色浅底 —— 在需要点的地方,色块能撑出可点面积;
+ * 列表行里就不必了,那儿只是标识,不是按钮。
  */
 export function AgentIcon({
   agent,
@@ -40,8 +42,16 @@ export function AgentIcon({
   size?: number;
   badge?: boolean;
 }) {
-  const { symbol, tint } = AGENTS[agent];
-  const glyph = <Icon name={symbol} size={size} color={tint} weight="semibold" />;
+  const { tint, symbol } = AGENTS[agent];
+  const path = agentLogoPath[agent];
+  const glyph =
+    path !== undefined ? (
+      <Svg width={size} height={size} viewBox="0 0 24 24">
+        <Path d={path} fill={tint} fillRule="evenodd" clipRule="evenodd" />
+      </Svg>
+    ) : (
+      <Icon name={symbol ?? "terminal.fill"} size={size} color={tint} weight="semibold" />
+    );
   if (!badge) return glyph;
   return (
     <View
@@ -60,7 +70,6 @@ const styles = StyleSheet.create({
     borderRadius: radius.sm,
     alignItems: "center",
     justifyContent: "center",
-    // 底色是 agent 色的 13% 透明版;深色界面上再压一层卡片色,免得发灰
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: color.border,
   },
