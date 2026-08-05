@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  ActivityIndicator,
   Alert,
   Image,
   KeyboardAvoidingView,
@@ -32,6 +33,8 @@ import { KeyBar } from "@/components/KeyBar";
 import { QuickReplies } from "@/components/QuickReplies";
 import { Terminal, type TerminalHandle } from "@/components/Terminal";
 import { pickFromCamera, pickFromLibrary, type PickedImage } from "@/lib/attach";
+import { Meter, Row, Sheet } from "@/components/Sheet";
+import { color, font, utilizationColor } from "@/lib/theme";
 import { matchCommands } from "@/lib/slash-commands";
 import { useHostConnection } from "@/lib/use-host-connection";
 
@@ -73,6 +76,8 @@ export default function SessionScreen() {
   const isChat = isStructured && !showTty;
   const busy = session?.status === "running" || session?.status === "starting";
   const [usage, setUsage] = useState<UsageResult | null>(null);
+  const [usageOpen, setUsageOpen] = useState(false);
+  const [usageError, setUsageError] = useState<string | null>(null);
 
   // 只显示最吃紧的那个窗口 —— 头部塞不下三个,而你关心的永远是先撞上的那个
   const tightest = (usage?.windows ?? []).reduce<UsageWindow | null>(
@@ -124,28 +129,13 @@ export default function SessionScreen() {
 
   const showUsage = (): void => {
     if (!conn || !sid) return;
+    setUsageOpen(true);
+    setUsageError(null);
     void conn
       .usageGet(sid)
-      .then((r) => {
-        setUsage(r);
-        if (!r.available) {
-          Alert.alert("用量", r.reason ?? "这个后端没有暴露用量数据。");
-          return;
-        }
-        const lines: string[] = [];
-        if (r.subscription) lines.push(`套餐:${r.subscription}`);
-        if (r.costUsd !== undefined) lines.push(`本会话花费:$${r.costUsd.toFixed(4)}`);
-        for (const w of r.windows ?? []) {
-          const reset = w.resetsAt ? ` · ${formatReset(w.resetsAt)}重置` : "";
-          lines.push(`${w.label}:已用 ${String(Math.round(w.utilization))}%${reset}`);
-        }
-        if ((r.windows ?? []).length === 0) {
-          lines.push("这个账号不适用套餐限流(API key / Bedrock / Vertex)。");
-        }
-        Alert.alert("用量与限流", lines.join("\n"));
-      })
+      .then(setUsage)
       .catch((e: unknown) => {
-        Alert.alert("读取失败", e instanceof Error ? e.message : String(e));
+        setUsageError(e instanceof Error ? e.message : String(e));
       });
   };
 
@@ -417,6 +407,42 @@ export default function SessionScreen() {
         </ScrollView>
       )}
 
+      <Sheet visible={usageOpen} title="用量与限流" onClose={() => setUsageOpen(false)}>
+        {usageError !== null ? (
+          <Text style={styles.sheetNote}>{usageError}</Text>
+        ) : usage === null ? (
+          <ActivityIndicator style={styles.sheetLoading} color={color.accent} />
+        ) : (
+          <>
+            {usage.subscription ? <Row label="套餐" value={usage.subscription} /> : null}
+            {usage.costUsd !== undefined ? (
+              <Row label="本会话花费" value={`$${usage.costUsd.toFixed(4)}`} />
+            ) : null}
+
+            {(usage.windows ?? []).map((w) => (
+              <View key={w.label} style={styles.window}>
+                <View style={styles.windowHead}>
+                  <Text style={font.body}>{w.label}</Text>
+                  <Text style={[styles.windowPct, { color: utilizationColor(w.utilization) }]}>
+                    {String(Math.round(w.utilization))}%
+                  </Text>
+                </View>
+                <Meter value={w.utilization} tint={utilizationColor(w.utilization)} />
+                {w.resetsAt ? (
+                  <Text style={font.meta}>{formatReset(w.resetsAt)} 重置</Text>
+                ) : null}
+              </View>
+            ))}
+
+            {!usage.available || (usage.windows ?? []).length === 0 ? (
+              <Text style={styles.sheetNote}>
+                {usage.reason ?? "这个账号不适用套餐限流(API key / Bedrock / Vertex)。"}
+              </Text>
+            ) : null}
+          </>
+        )}
+      </Sheet>
+
       <View style={styles.composer}>
         {isChat && (
           <Pressable style={styles.attachBtn} onPress={attach} hitSlop={6}>
@@ -479,6 +505,11 @@ const styles = StyleSheet.create({
   headerName: { color: "#e8e8ee", fontSize: 16, fontWeight: "600" },
   headerSub: { color: "#7a7a86", fontSize: 11, marginTop: 1 },
   headerRight: { flexDirection: "row", gap: 12, alignItems: "center" },
+  sheetLoading: { paddingVertical: 32 },
+  sheetNote: { color: color.textDim, fontSize: 13, lineHeight: 19, paddingVertical: 12 },
+  window: { gap: 6, paddingVertical: 14 },
+  windowHead: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  windowPct: { fontSize: 15, fontWeight: "600", fontVariant: ["tabular-nums"] },
   ttyBtn: {
     color: "#8a8a96",
     fontSize: 12,
