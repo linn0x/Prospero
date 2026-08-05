@@ -8,10 +8,12 @@ import {
   View,
 } from "react-native";
 import { Stack, router, useFocusEffect } from "expo-router";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Icon } from "@/components/Icon";
 import { SwipeRow } from "@/components/SwipeRow";
 import { getHosts, removeHost, type StoredHost } from "@/lib/hosts";
 import { useApp, type ConnStatus } from "@/lib/store";
+import { MONOSPACE_FONT } from "@/lib/theme";
 
 const statusLabel: Record<ConnStatus, string> = {
   idle: "未连接",
@@ -30,6 +32,7 @@ const statusColor: Record<ConnStatus, string> = {
 };
 
 export default function HostsScreen() {
+  const insets = useSafeAreaInsets();
   const [hosts, setLocal] = useState<StoredHost[]>([]);
   const setHosts = useApp((s) => s.setHosts);
   const runtimes = useApp((s) => s.runtimes);
@@ -68,7 +71,7 @@ export default function HostsScreen() {
         }}
       />
       {hosts.length === 0 ? (
-        <View style={styles.empty}>
+        <View style={[styles.empty, { paddingBottom: insets.bottom + 32 }]}>
           <Icon name="desktopcomputer" size={52} color="#3a3a46" />
           <Text style={styles.emptyTitle}>还没有配对的 Mac</Text>
           <Text style={styles.emptyText}>在 Mac 上运行 prosperod 并生成配对码:</Text>
@@ -81,7 +84,7 @@ export default function HostsScreen() {
         <FlatList
           data={hosts}
           keyExtractor={(h) => h.id}
-          contentContainerStyle={styles.list}
+          contentContainerStyle={[styles.list, { paddingBottom: insets.bottom + 20 }]}
           ListFooterComponent={
             hosts.length > 0 ? (
               <Text style={styles.swipeHint}>左滑主机可删除配对</Text>
@@ -135,7 +138,7 @@ const styles = StyleSheet.create({
   emptyText: { color: "#9a9aa6", fontSize: 14, textAlign: "center" },
   code: {
     color: "#b7c7ff",
-    fontFamily: "Menlo",
+    fontFamily: MONOSPACE_FONT,
     fontSize: 13,
     backgroundColor: "#17171d",
     padding: 12,

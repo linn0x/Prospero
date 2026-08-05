@@ -3,6 +3,8 @@ import {
   ActivityIndicator,
   Alert,
   FlatList,
+  KeyboardAvoidingView,
+  Platform,
   Pressable,
   RefreshControl,
   StyleSheet,
@@ -11,18 +13,25 @@ import {
   View,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { Stack, useLocalSearchParams } from "expo-router";
+import { Stack, useLocalSearchParams, useNavigation } from "expo-router";
 import { File, Paths } from "expo-file-system";
 import * as Sharing from "expo-sharing";
 import * as DocumentPicker from "expo-document-picker";
 import * as Haptics from "expo-haptics";
 import type { FsEntry } from "@prospero/protocol";
 import { Icon } from "@/components/Icon";
+import { PromptDialog } from "@/components/PromptDialog";
 import { SwipeRow, type SwipeAction } from "@/components/SwipeRow";
+import { validateFileName } from "@/lib/file-names";
+import { MONOSPACE_FONT } from "@/lib/theme";
 import { useHostConnection } from "@/lib/use-host-connection";
 
 /** 一次传 256KB;协议单块上限是 1MB,留足编码膨胀余量 */
 const CHUNK = 256 * 1024;
+
+type NamePrompt =
+  | { kind: "rename"; entry: FsEntry; value: string }
+  | { kind: "mkdir"; value: string };
 
 function humanSize(bytes: number): string {
   if (bytes < 1024) return `${String(bytes)} B`;
@@ -37,6 +46,7 @@ function iconFor(entry: FsEntry): "doc.on.doc" | "terminal" | "desktopcomputer" 
 }
 
 export default function FilesScreen(): React.ReactElement {
+  const navigation = useNavigation();
   const { hostId, sid } = useLocalSearchParams<{ hostId: string; sid: string }>();
   const { conn } = useHostConnection(hostId);
   const insets = useSafeAreaInsets();
@@ -55,6 +65,7 @@ export default function FilesScreen(): React.ReactElement {
   } | null>(null);
   const [saving, setSaving] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
+  const [namePrompt, setNamePrompt] = useState<NamePrompt | null>(null);
 
   const load = useCallback(
     async (path: string) => {
@@ -77,6 +88,30 @@ export default function FilesScreen(): React.ReactElement {
   useEffect(() => {
     void load("");
   }, [load]);
+
+  const leaveEditor = useCallback((): void => {
+    if (!editing) return;
+    if (editing.text === editing.original) {
+      setEditing(null);
+      return;
+    }
+    Alert.alert("放弃修改?", "未保存的改动会丢失。", [
+      { text: "继续编辑", style: "cancel" },
+      { text: "放弃", style: "destructive", onPress: () => setEditing(null) },
+    ]);
+  }, [editing]);
+
+  // 必须使用 expo-router 导出的导航对象；SDK 57 内置了自己的 React Navigation，
+  // 从外部 @react-navigation/native 取 hook 会拿到另一份 Context。beforeRemove
+  // 覆盖 Android 硬件返回、系统手势和导航栈重置：编辑态先退回文件浏览，有修改
+  // 时必须明确确认，不能直接退出屏幕。
+  useEffect(() => {
+    if (editing === null) return;
+    return navigation.addListener("beforeRemove", (event) => {
+      event.preventDefault();
+      leaveEditor();
+    });
+  }, [editing, leaveEditor, navigation]);
 
   const openEntry = async (entry: FsEntry): Promise<void> => {
     const next = dir === "" ? entry.name : `${dir}/${entry.name}`;
@@ -193,57 +228,29 @@ export default function FilesScreen(): React.ReactElement {
   };
 
   const promptRename = (entry: FsEntry): void => {
-    Alert.prompt(
-      "重命名",
-      `「${entry.name}」的新名字`,
-      [
-        { text: "取消", style: "cancel" },
-        {
-          text: "确定",
-          onPress: (next?: string) => {
-            const name = next?.trim();
-            if (!name || name === entry.name || !conn) return;
-            if (name.includes("/")) {
-              Alert.alert("名字不能含 /", "只支持在当前目录内重命名。");
-              return;
-            }
-            const from = dir === "" ? entry.name : `${dir}/${entry.name}`;
-            const to = dir === "" ? name : `${dir}/${name}`;
-            void conn
-              .fsRename(sid, from, to)
-              .then(() => {
-                void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-                void load(dir);
-              })
-              .catch((e: unknown) => {
-                Alert.alert("重命名失败", e instanceof Error ? e.message : String(e));
-              });
-          },
-        },
-      ],
-      "plain-text",
-      entry.name,
-    );
+    setNamePrompt({ kind: "rename", entry, value: entry.name });
   };
 
   const promptMkdir = (): void => {
-    Alert.prompt("新建文件夹", "名字", [
-      { text: "取消", style: "cancel" },
-      {
-        text: "创建",
-        onPress: (name?: string) => {
-          const n = name?.trim();
-          if (!n || !conn) return;
-          const rel = dir === "" ? n : `${dir}/${n}`;
-          void conn
-            .fsMkdir(sid, rel)
-            .then(() => void load(dir))
-            .catch((e: unknown) => {
-              Alert.alert("创建失败", e instanceof Error ? e.message : String(e));
-            });
-        },
-      },
-    ]);
+    setNamePrompt({ kind: "mkdir", value: "" });
+  };
+
+  const submitNamePrompt = async (raw: string): Promise<void> => {
+    const prompt = namePrompt;
+    if (!prompt) return;
+    if (!conn) throw new Error("连接已断开，请重连后再试");
+    const name = raw.trim();
+    if (prompt.kind === "rename") {
+      const from = dir === "" ? prompt.entry.name : `${dir}/${prompt.entry.name}`;
+      const to = dir === "" ? name : `${dir}/${name}`;
+      await conn.fsRename(sid, from, to);
+    } else {
+      const rel = dir === "" ? name : `${dir}/${name}`;
+      await conn.fsMkdir(sid, rel);
+    }
+    void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    setNamePrompt(null);
+    await load(dir);
   };
 
   const goUp = (): void => {
@@ -256,7 +263,11 @@ export default function FilesScreen(): React.ReactElement {
   if (editing) {
     const dirty = editing.text !== editing.original;
     return (
-      <View style={styles.screen}>
+      <KeyboardAvoidingView
+        style={styles.screen}
+        behavior={Platform.OS === "ios" ? "padding" : "height"}
+        keyboardVerticalOffset={Platform.OS === "ios" ? 88 : 0}
+      >
         <Stack.Screen
           options={{
             title: editing.path.split("/").pop() ?? editing.path,
@@ -270,18 +281,7 @@ export default function FilesScreen(): React.ReactElement {
               </Pressable>
             ),
             headerLeft: () => (
-              <Pressable
-                onPress={() => {
-                  if (!dirty) {
-                    setEditing(null);
-                    return;
-                  }
-                  Alert.alert("放弃修改?", "未保存的改动会丢失。", [
-                    { text: "继续编辑", style: "cancel" },
-                    { text: "放弃", style: "destructive", onPress: () => setEditing(null) },
-                  ]);
-                }}
-              >
+              <Pressable onPress={leaveEditor}>
                 <Text style={styles.headerAction}>返回</Text>
               </Pressable>
             ),
@@ -291,7 +291,7 @@ export default function FilesScreen(): React.ReactElement {
           <Text style={styles.warnBar}>文件超过 1MB,只显示前 1MB —— 只读,保存已禁用</Text>
         )}
         <TextInput
-          style={styles.editor}
+          style={[styles.editor, { paddingBottom: insets.bottom + 14 }]}
           value={editing.text}
           onChangeText={(text) => setEditing({ ...editing, text })}
           multiline
@@ -300,7 +300,7 @@ export default function FilesScreen(): React.ReactElement {
           spellCheck={false}
           editable={!editing.truncated}
         />
-      </View>
+      </KeyboardAvoidingView>
     );
   }
 
@@ -413,6 +413,30 @@ export default function FilesScreen(): React.ReactElement {
         }}
       />
       <Text style={styles.hint}>左滑可下载 / 重命名 / 删除 · 右上角新建文件夹或上传</Text>
+      <PromptDialog
+        visible={namePrompt !== null}
+        title={namePrompt?.kind === "rename" ? "重命名" : "新建文件夹"}
+        message={
+          namePrompt?.kind === "rename"
+            ? `「${namePrompt.entry.name}」的新名字`
+            : "在当前目录中创建文件夹"
+        }
+        value={namePrompt?.value ?? ""}
+        confirmLabel={namePrompt?.kind === "rename" ? "重命名" : "创建"}
+        onChangeText={(value) =>
+          setNamePrompt((current) => (current === null ? null : { ...current, value }))
+        }
+        onCancel={() => setNamePrompt(null)}
+        onSubmit={submitNamePrompt}
+        validate={(value) =>
+          validateFileName(value, {
+            ...(namePrompt?.kind === "rename"
+              ? { originalName: namePrompt.entry.name }
+              : {}),
+            existingNames: entries.map((entry) => entry.name),
+          })
+        }
+      />
     </View>
   );
 }
@@ -482,7 +506,7 @@ const styles = StyleSheet.create({
   editor: {
     flex: 1,
     color: "#e8e8ee",
-    fontFamily: "Menlo",
+    fontFamily: MONOSPACE_FONT,
     fontSize: 13,
     padding: 14,
     textAlignVertical: "top",

@@ -11,17 +11,32 @@ import {
 } from "react-native";
 import { Stack, router, useLocalSearchParams } from "expo-router";
 import { CameraView, useCameraPermissions } from "expo-camera";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { decodePairingQR } from "@prospero/protocol";
 import { useDiscovery } from "@/lib/discovery";
 import { upsertHostFromPairing } from "@/lib/hosts";
 
 export default function PairScreen() {
   const [permission, requestPermission] = useCameraPermissions();
+  const insets = useSafeAreaInsets();
   const [manual, setManual] = useState("");
   const scannedRef = useRef(false);
   const { d } = useLocalSearchParams<{ d?: string }>();
   // 扫描同网段的 prosperod:让用户确认"这台 Mac 确实在跑",再去扫码
-  const { hosts: discovered } = useDiscovery(true);
+  const { hosts: discovered, scanning, unavailable, timedOut } = useDiscovery(true);
+
+  const discoveryHint =
+    discovered.length > 0
+      ? `已在本网络发现 ${String(discovered.length)} 台：${discovered
+          .map((h) => h.name)
+          .join("、")} —— 扫描它的配对码`
+      : unavailable
+        ? "局域网发现不可用；仍可直接扫码或粘贴配对串"
+        : timedOut
+          ? "未发现附近的 Mac；部分 Android ROM 会限制 mDNS，直接扫码不受影响"
+          : scanning
+            ? "正在发现同一网络里的 Mac…也可以直接扫描配对码"
+            : "对准 Mac 终端里 prosperod pair 打印的二维码";
 
   const handle = useCallback(async (text: string): Promise<void> => {
     if (scannedRef.current) return;
@@ -47,15 +62,16 @@ export default function PairScreen() {
   }, [d, handle]);
 
   useEffect(() => {
-    if (permission && !permission.granted && permission.canAskAgain) {
+    // 外部相机/配对链接已经带了完整 payload，不应再弹内部相机权限遮住跳转。
+    if (typeof d !== "string" && permission && !permission.granted && permission.canAskAgain) {
       void requestPermission();
     }
-  }, [permission, requestPermission]);
+  }, [d, permission, requestPermission]);
 
   return (
     <KeyboardAvoidingView
       style={styles.container}
-      behavior={Platform.OS === "ios" ? "padding" : undefined}
+      behavior={Platform.OS === "ios" ? "padding" : "height"}
     >
       <Stack.Screen options={{ title: "配对 Mac" }} />
       <View style={styles.cameraWrap}>
@@ -80,11 +96,7 @@ export default function PairScreen() {
         )}
         <View style={styles.hintWrap} pointerEvents="none">
           <Text style={styles.hint}>
-            {discovered.length > 0
-              ? `已在本网络发现 ${String(discovered.length)} 台:${discovered
-                  .map((h) => h.name)
-                  .join("、")} —— 扫描它的配对码`
-              : "对准 Mac 终端里 prosperod pair 打印的二维码"}
+            {discoveryHint}
           </Text>
         </View>
       </View>
@@ -102,8 +114,10 @@ export default function PairScreen() {
           <Text style={styles.btnText}>添加</Text>
         </Pressable>
       </View>
-      <Text style={styles.note}>
-        首次连接时 iOS 会请求「本地网络」权限,请务必允许,否则无法发现/连接 Mac。
+      <Text style={[styles.note, { paddingBottom: Math.max(insets.bottom, 16) }]}>
+        {Platform.OS === "ios"
+          ? "首次连接时 iOS 会请求「本地网络」权限，请允许，否则无法发现或连接 Mac。"
+          : "Android 的 mDNS 发现可能受 ROM 或 VPN 限制；发现失败时直接扫码即可，配对与连接不依赖发现。"}
       </Text>
     </KeyboardAvoidingView>
   );
@@ -123,6 +137,8 @@ const styles = StyleSheet.create({
     paddingVertical: 6,
     borderRadius: 8,
     fontSize: 12,
+    textAlign: "center",
+    maxWidth: "92%",
     overflow: "hidden",
   },
   manual: { flexDirection: "row", gap: 8, padding: 12 },
@@ -143,5 +159,5 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
   },
   btnText: { color: "#fff", fontWeight: "600" },
-  note: { color: "#6a6a76", fontSize: 12, paddingHorizontal: 12, paddingBottom: 16 },
+  note: { color: "#6a6a76", fontSize: 12, lineHeight: 17, paddingHorizontal: 12 },
 });

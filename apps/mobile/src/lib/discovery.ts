@@ -8,8 +8,10 @@
  * 注意:mDNS 组播不穿 WireGuard 隧道,所以 WG 场景永远发现不到,
  * 那条路径靠 QR 里带的静态地址。这也是发现只是"锦上添花"、不是必需品的原因。
  */
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { Platform } from "react-native";
+
+const SCAN_TIMEOUT_MS = 8_000;
 
 export interface DiscoveredHost {
   name: string;
@@ -39,23 +41,29 @@ export function useDiscovery(enabled: boolean): {
   hosts: DiscoveredHost[];
   scanning: boolean;
   unavailable: boolean;
+  timedOut: boolean;
 } {
   const [hosts, setHosts] = useState<DiscoveredHost[]>([]);
   const [scanning, setScanning] = useState(false);
   const [unavailable, setUnavailable] = useState(false);
-  const zcRef = useRef<ZeroconfLike | null>(null);
+  const [timedOut, setTimedOut] = useState(false);
 
   useEffect(() => {
     if (!enabled) return;
     let cancelled = false;
+    let found = false;
     let zc: ZeroconfLike | null = null;
+    let scanTimer: ReturnType<typeof setTimeout> | null = null;
+
+    setHosts([]);
+    setUnavailable(false);
+    setTimedOut(false);
 
     try {
       // 动态 require:模块不存在时不至于让整个屏幕崩掉
 
       const Zeroconf = require("react-native-zeroconf").default as new () => ZeroconfLike;
       zc = new Zeroconf();
-      zcRef.current = zc;
     } catch {
       setUnavailable(true);
       return;
@@ -65,6 +73,7 @@ export function useDiscovery(enabled: boolean): {
       if (cancelled) return;
       const addresses = (service.addresses ?? []).filter((a) => a.includes("."));
       if (addresses.length === 0 || typeof service.port !== "number") return;
+      found = true;
       setHosts((prev) => {
         const name = service.name ?? service.host ?? addresses[0]!;
         const rest = prev.filter((h) => h.name !== name);
@@ -74,12 +83,25 @@ export function useDiscovery(enabled: boolean): {
 
     zc.on("resolved", onResolved);
     zc.on("error", () => {
-      if (!cancelled) setUnavailable(true);
+      if (!cancelled) {
+        setUnavailable(true);
+        setScanning(false);
+      }
     });
 
     try {
       setScanning(true);
       zc.scan("prospero", "tcp", "local.");
+      scanTimer = setTimeout(() => {
+        if (cancelled) return;
+        setScanning(false);
+        if (!found) setTimedOut(true);
+        try {
+          zc?.stop();
+        } catch {
+          // 已停止或 ROM 的 NSD 实现抛错都不影响手动配对路径
+        }
+      }, SCAN_TIMEOUT_MS);
     } catch {
       setUnavailable(true);
       setScanning(false);
@@ -88,6 +110,7 @@ export function useDiscovery(enabled: boolean): {
     return () => {
       cancelled = true;
       setScanning(false);
+      if (scanTimer !== null) clearTimeout(scanTimer);
       try {
         zc?.stop();
         zc?.removeAllListeners?.();
@@ -97,6 +120,10 @@ export function useDiscovery(enabled: boolean): {
     };
   }, [enabled]);
 
-  // iOS 上未授予本地网络权限时会静默无结果 —— 由调用方结合超时给出引导
-  return { hosts, scanning, unavailable: unavailable || Platform.OS === "web" };
+  return {
+    hosts,
+    scanning,
+    unavailable: unavailable || Platform.OS === "web",
+    timedOut,
+  };
 }

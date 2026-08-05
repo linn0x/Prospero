@@ -36,7 +36,13 @@ export interface Diagnosis {
   fatal: boolean;
 }
 
-export function diagnose(results: AttemptResult[], isFirstEver: boolean): Diagnosis {
+export type ClientPlatform = "ios" | "android";
+
+export function diagnose(
+  results: AttemptResult[],
+  isFirstEver: boolean,
+  platform: ClientPlatform = "ios",
+): Diagnosis {
   if (results.length === 0) {
     return {
       summary: "没有可用地址",
@@ -71,7 +77,7 @@ export function diagnose(results: AttemptResult[], isFirstEver: boolean): Diagno
       summary: "App 与 daemon 版本不符",
       hint:
         "两端协议版本不一致,通常是 App 比 Mac 上的 prosperod 旧。请重新构建并安装 App" +
-        "(apps/mobile/scripts/build-ipa.sh),然后重新扫码配对。",
+        `(apps/mobile/scripts/${platform === "android" ? "build-apk.sh" : "build-ipa.sh"}),然后重新扫码配对。`,
       fatal: true,
     };
   }
@@ -90,7 +96,9 @@ export function diagnose(results: AttemptResult[], isFirstEver: boolean): Diagno
     return {
       summary: "无法连接到任何地址",
       hint: isFirstEver
-        ? "首次连接通常是「本地网络」权限被拒。请到 设置 › Prospero › 本地网络 打开开关,再重试。"
+        ? platform === "ios"
+          ? "首次连接通常是「本地网络」权限被拒。请到 设置 › Prospero › 本地网络 打开开关,再重试。"
+          : "Android 不需要单独的本地网络运行时权限。请确认手机与 Mac 在同一网络(或 WireGuard 已连接),并重新扫码刷新地址。"
         : "请确认手机与 Mac 在同一网络(或 WireGuard 已连接),且 Mac 未休眠。",
       fatal: false,
     };

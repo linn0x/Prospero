@@ -124,7 +124,8 @@ export function Terminal({ conn, sid }: Props) {
         hideKeyboardAccessoryView
         setSupportMultipleWindows={false}
         allowsLinkPreview={false}
-        webviewDebuggingEnabled
+        webviewDebuggingEnabled={__DEV__}
+        androidLayerType="hardware"
         originWhitelist={["*"]}
         bounces={false}
         overScrollMode="never"

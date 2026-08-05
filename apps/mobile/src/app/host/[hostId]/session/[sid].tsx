@@ -11,6 +11,7 @@ import {
 } from "react-native";
 import * as Haptics from "expo-haptics";
 import { Stack, router, useLocalSearchParams } from "expo-router";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import type { SessionInfo } from "@prospero/protocol";
 import { ChatView } from "@/components/ChatView";
 import { Icon } from "@/components/Icon";
@@ -18,6 +19,7 @@ import { KeyBar } from "@/components/KeyBar";
 import { QuickReplies } from "@/components/QuickReplies";
 import { Terminal } from "@/components/Terminal";
 import { matchCommands } from "@/lib/slash-commands";
+import { MONOSPACE_FONT } from "@/lib/theme";
 import { useHostConnection } from "@/lib/use-host-connection";
 
 const statusText: Record<SessionInfo["status"], string> = {
@@ -45,6 +47,7 @@ function useElapsed(since: number | undefined): string {
 }
 
 export default function SessionScreen() {
+  const insets = useSafeAreaInsets();
   const { hostId, sid } = useLocalSearchParams<{ hostId: string; sid: string }>();
   const { conn, runtime } = useHostConnection(hostId);
   const [draft, setDraft] = useState("");
@@ -111,7 +114,9 @@ export default function SessionScreen() {
   return (
     <KeyboardAvoidingView
       style={styles.container}
-      behavior={Platform.OS === "ios" ? "padding" : undefined}
+      // targetSdk 35+ 的 edge-to-edge 窗口上，adjustResize 仍可能只让 IME 覆盖
+      // ReactRootView；Android 需显式按键盘高度缩短这一层，保证输入栏留在键盘上方。
+      behavior={Platform.OS === "ios" ? "padding" : "height"}
       keyboardVerticalOffset={Platform.OS === "ios" ? 88 : 0}
     >
       <Stack.Screen
@@ -226,7 +231,7 @@ export default function SessionScreen() {
 
       {isChat && commandHints.length === 0 && <QuickReplies busy={busy} onPick={send} />}
 
-      <View style={styles.composer}>
+      <View style={[styles.composer, { paddingBottom: Math.max(insets.bottom, 8) }]}>
         <TextInput
           style={[styles.input, isChat && styles.inputChat]}
           placeholder={isChat ? `给 ${session?.agent ?? "agent"} 发消息…` : "输入后发送(自动回车)"}
@@ -303,7 +308,7 @@ const styles = StyleSheet.create({
     backgroundColor: "#15151b",
     borderRadius: 8,
   },
-  cmdName: { color: "#7aa2f7", fontSize: 14, fontFamily: "Menlo" },
+  cmdName: { color: "#7aa2f7", fontSize: 14, fontFamily: MONOSPACE_FONT },
   cmdDesc: { color: "#8a8a96", fontSize: 12, flex: 1 },
   ttyNotice: { backgroundColor: "#16202b", paddingHorizontal: 12, paddingVertical: 6 },
   ttyNoticeText: { color: "#8fb0d0", fontSize: 11 },

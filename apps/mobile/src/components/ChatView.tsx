@@ -11,6 +11,7 @@ import { DiffView } from "@/components/DiffView";
 import { Markdown } from "@/components/Markdown";
 import { toast } from "@/components/Toast";
 import type { HostConnection } from "@/lib/connection";
+import { MONOSPACE_FONT } from "@/lib/theme";
 import {
   applyEvent,
   applyEvents,
@@ -432,11 +433,11 @@ const styles = StyleSheet.create({
   toolName: { color: "#c8c8d4", fontSize: 13, fontWeight: "600", flex: 1 },
   diffBadge: { color: "#7a9a7a", fontSize: 11, fontVariant: ["tabular-nums"] },
   toolState: { color: "#6a6a76", fontSize: 11 },
-  toolInput: { color: "#8a8a96", fontSize: 12, fontFamily: "Menlo", lineHeight: 17 },
+  toolInput: { color: "#8a8a96", fontSize: 12, fontFamily: MONOSPACE_FONT, lineHeight: 17 },
   toolResult: {
     color: "#7a8a7a",
     fontSize: 12,
-    fontFamily: "Menlo",
+    fontFamily: MONOSPACE_FONT,
     lineHeight: 17,
     borderTopWidth: 1,
     borderTopColor: "#22222a",
@@ -456,7 +457,7 @@ const styles = StyleSheet.create({
   permResource: {
     color: "#d8d8e2",
     fontSize: 12,
-    fontFamily: "Menlo",
+    fontFamily: MONOSPACE_FONT,
     backgroundColor: "#171319",
     borderRadius: 6,
     padding: 8,
