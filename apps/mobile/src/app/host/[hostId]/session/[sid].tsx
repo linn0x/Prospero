@@ -264,7 +264,7 @@ export default function SessionScreen() {
               </Text>
             </View>
           )}
-          <Terminal ref={termRef} conn={conn} sid={sid} />
+          <Terminal ref={termRef} conn={conn} sid={sid} onFontSize={setFontSize} />
           {!isStructured && (
             <KeyBar
               onKey={(seq) => conn.inputText(sid, seq)}
