@@ -241,7 +241,7 @@ export default function HostScreen() {
         }
         ListFooterComponent={
           all.length > 0 ? (
-            <Text style={styles.swipeHint}>左滑会话可查看文件、中断或结束</Text>
+            <Text style={styles.swipeHint}>左滑会话可看改动 / 文件、中断或结束</Text>
           ) : null
         }
         renderItem={({ item }) => {
@@ -250,6 +250,12 @@ export default function HostScreen() {
           // 此刻的事实 —— 而它可能早就结束了。
           const stale = runtime.status !== "connected";
           const actions: SwipeAction[] = [
+            {
+              label: "改动",
+              symbol: "arrow.clockwise",
+              color: "#2f6b4f",
+              onPress: () => router.push(`/host/${hostId}/git/${item.id}`),
+            },
             {
               label: "文件",
               symbol: "doc.on.doc",
