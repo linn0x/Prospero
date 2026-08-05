@@ -3,7 +3,7 @@
  * WS 保持在 RN 侧单连接,WebView 只做渲染与输入采集。
  * attach 流程:page ready → 上报 fit 尺寸 → resize → attach(带 lastSeq 续传)。
  */
-import { useCallback, useEffect, useRef } from "react";
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef } from "react";
 import { StyleSheet, View } from "react-native";
 import { WebView, type WebViewMessageEvent } from "react-native-webview";
 import type { HostConnection } from "@/lib/connection";
@@ -12,6 +12,11 @@ import { TERMINAL_HTML } from "./terminal-html";
 interface Props {
   conn: HostConnection;
   sid: string;
+}
+
+export interface TerminalHandle {
+  setFontSize(size: number): void;
+  scrollToBottom(): void;
 }
 
 interface BridgeUp {
@@ -24,7 +29,10 @@ interface BridgeUp {
   kb?: number;
 }
 
-export function Terminal({ conn, sid }: Props) {
+export const Terminal = forwardRef<TerminalHandle, Props>(function Terminal(
+  { conn, sid },
+  ref,
+) {
   const webRef = useRef<WebView>(null);
   const readyRef = useRef(false);
   const attachedRef = useRef(false);
@@ -33,15 +41,35 @@ export function Terminal({ conn, sid }: Props) {
   const sizeRef = useRef<{ cols: number; rows: number } | null>(null);
   const ackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const rx = useCallback((obj: object) => {
-    if (!readyRef.current) {
-      queueRef.current.push(obj);
-      return;
-    }
-    webRef.current?.injectJavaScript(
-      `window.__rx(${JSON.stringify(JSON.stringify(obj))});true;`,
-    );
+  const batchRef = useRef<object[]>([]);
+  const flushRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  /**
+   * 把同一 tick 内到达的消息合并成一批再过桥。
+   *
+   * 每次跨桥的固定开销不小,洪峰下几十条/秒逐条过是纯浪费。用 setTimeout(0)
+   * 而不是固定间隔,是因为【打字回显】不能被批处理拖慢 —— 单独一条消息
+   * 会在当前 tick 结束就立刻发出,只有真正堆积时才会合并。
+   */
+  const flush = useCallback(() => {
+    flushRef.current = null;
+    const batch = batchRef.current;
+    if (batch.length === 0) return;
+    batchRef.current = [];
+    webRef.current?.postMessage(JSON.stringify(batch));
   }, []);
+
+  const rx = useCallback(
+    (obj: object) => {
+      if (!readyRef.current) {
+        queueRef.current.push(obj);
+        return;
+      }
+      batchRef.current.push(obj);
+      if (flushRef.current === null) flushRef.current = setTimeout(flush, 0);
+    },
+    [flush],
+  );
 
   const tryAttach = useCallback(() => {
     if (!readyRef.current || !conn.isConnected || !sizeRef.current) return;
@@ -74,6 +102,7 @@ export function Terminal({ conn, sid }: Props) {
       offOut();
       offConn();
       if (ackTimerRef.current) clearTimeout(ackTimerRef.current);
+      if (flushRef.current) clearTimeout(flushRef.current);
     };
   }, [conn, sid, rx, tryAttach]);
 
@@ -91,7 +120,13 @@ export function Terminal({ conn, sid }: Props) {
           readyRef.current = true;
           attachedRef.current = false;
           lastSeqRef.current = 0;
-          queueRef.current = [];
+          // 之前这里直接清空队列 —— 页面就绪前到达的消息被丢掉了。
+          // 现在补发,后续的全量快照会覆盖它们,但丢弃从来不是对的默认。
+          if (queueRef.current.length > 0) {
+            const pending = queueRef.current;
+            queueRef.current = [];
+            for (const obj of pending) rx(obj);
+          }
           break;
         case "resized":
           if (typeof msg.cols !== "number" || typeof msg.rows !== "number") return;
@@ -110,8 +145,13 @@ export function Terminal({ conn, sid }: Props) {
           break;
       }
     },
-    [conn, sid, tryAttach],
+    [conn, sid, tryAttach, rx],
   );
+
+  useImperativeHandle(ref, () => ({
+    setFontSize: (size: number) => rx({ kind: "font", size }),
+    scrollToBottom: () => rx({ kind: "scrollBottom" }),
+  }), [rx]);
 
   return (
     <View style={styles.wrap}>
@@ -131,7 +171,7 @@ export function Terminal({ conn, sid }: Props) {
       />
     </View>
   );
-}
+});
 
 const styles = StyleSheet.create({
   wrap: { flex: 1, backgroundColor: "#0b0b0e" },

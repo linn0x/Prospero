@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Alert,
   KeyboardAvoidingView,
@@ -16,7 +16,7 @@ import { ChatView } from "@/components/ChatView";
 import { Icon } from "@/components/Icon";
 import { KeyBar } from "@/components/KeyBar";
 import { QuickReplies } from "@/components/QuickReplies";
-import { Terminal } from "@/components/Terminal";
+import { Terminal, type TerminalHandle } from "@/components/Terminal";
 import { matchCommands } from "@/lib/slash-commands";
 import { useHostConnection } from "@/lib/use-host-connection";
 
@@ -94,6 +94,10 @@ export default function SessionScreen() {
       </View>
     );
   }
+
+  const termRef = useRef<TerminalHandle>(null);
+  // 字号存在会话页而不是终端内部:切走再回来不该重置成默认值
+  const [fontSize, setFontSize] = useState(12);
 
   const policy: ApprovalPolicy = session?.approvalPolicy ?? "strict";
 
@@ -260,8 +264,18 @@ export default function SessionScreen() {
               </Text>
             </View>
           )}
-          <Terminal conn={conn} sid={sid} />
-          {!isStructured && <KeyBar onKey={(seq) => conn.inputText(sid, seq)} />}
+          <Terminal ref={termRef} conn={conn} sid={sid} />
+          {!isStructured && (
+            <KeyBar
+              onKey={(seq) => conn.inputText(sid, seq)}
+              onFontSize={(delta) => {
+                const next = Math.min(20, Math.max(8, fontSize + delta));
+                setFontSize(next);
+                termRef.current?.setFontSize(next);
+              }}
+              onScrollBottom={() => termRef.current?.scrollToBottom()}
+            />
+          )}
         </>
       )}
 
