@@ -127,6 +127,7 @@ export async function createDaemonServer(
   opts: DaemonServerOptions,
 ): Promise<DaemonServer> {
   const identity = loadIdentity(opts.home);
+  const DAEMON_STARTED_AT = Date.now();
   // --dev 的一次性口令:每次启动重新生成,只存在内存里,只打印到启动它的终端。
   // 这样"能看到终端输出"就成了使用明文通道的前提,而不是"恰好在本机跑着"。
   const devToken = randomBytes(18).toString("base64url");
@@ -289,6 +290,16 @@ export async function createDaemonServer(
         name: opts.hostName ?? os.hostname(),
         daemonVersion: DAEMON_VERSION,
         protocolVersion: PROTOCOL_VERSION,
+        platform: process.platform,
+        osVersion: os.release(),
+        arch: process.arch,
+        cpus: os.cpus().length,
+        memTotal: os.totalmem(),
+        memFree: os.freemem(),
+        uptimeSec: Math.floor(os.uptime()),
+        loadAvg: os.loadavg(),
+        daemonStartedAt: DAEMON_STARTED_AT,
+        tmuxManaged: manager.tmuxEnabled,
       },
       sessions: manager.list(),
     });
@@ -450,12 +461,26 @@ export async function createDaemonServer(
         return;
 
       case "usage.get": {
-        const s = manager.requireStructured(msg.sid);
+        // 没给 sid 就自己挑一个结构化会话 —— 限流是账号级的,问谁都一样
+        const target =
+          msg.sid !== undefined
+            ? manager.requireStructured(msg.sid)
+            : manager.anyStructured();
+        if (!target) {
+          send(conn, {
+            type: "usage.result",
+            available: false,
+            reason: "还没有对话型会话 —— 用量要有会话才问得到。",
+            ...(msg.sid !== undefined ? { sid: msg.sid } : {}),
+          });
+          return;
+        }
+        const s = target;
         const report = await s.usage();
         if (!report) {
           send(conn, {
             type: "usage.result",
-            sid: msg.sid,
+            ...(msg.sid !== undefined ? { sid: msg.sid } : {}),
             available: false,
             reason: "这个会话还没产生用量 —— 发一条消息后再看。",
           });
@@ -463,7 +488,7 @@ export async function createDaemonServer(
         }
         send(conn, {
           type: "usage.result",
-          sid: msg.sid,
+          ...(msg.sid !== undefined ? { sid: msg.sid } : {}),
           available: true,
           subscription: report.subscription ?? null,
           ...(report.costUsd !== undefined ? { costUsd: report.costUsd } : {}),

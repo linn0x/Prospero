@@ -336,6 +336,11 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     ].sort((a, b) => a.createdAt - b.createdAt);
   }
 
+  /** 任意一个结构化会话;账号级查询(用量/限流)用它当入口 */
+  anyStructured(): StructuredSession | null {
+    return this.structuredSessions.values().next().value ?? null;
+  }
+
   /** 转发一条用户消息(可带附件) */
   async chatSend(sid: string, text: string, attachments?: Attachment[]): Promise<void> {
     const s = this.structuredSessions.get(sid);
