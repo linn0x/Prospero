@@ -2,7 +2,8 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { sessionName, wrapSpawn, writeConfig } from "../src/tmux.js";
+import { spawnSync } from "node:child_process";
+import { sessionName, tmuxPath, wrapSpawn, writeConfig } from "../src/tmux.js";
 
 const temps: string[] = [];
 function tempHome(): string {
@@ -47,13 +48,31 @@ describe("tmux 托管", () => {
     expect(afterSeparator).toEqual(["/bin/zsh", "-c", "sleep 600"]);
   });
 
-  it("配置关掉状态栏、让出 Ctrl-B、且不销毁未接管的会话", () => {
+  it("tmux 自己认这份配置 —— 断言字符串存在抓不到语法错", () => {
+    // 之前 prefix 的转义多写了一层,生成出 'C-\\\\',tmux 每次启动都在终端顶上
+    // 打一行 "bad key"。原有的测试只检查"配置里有没有这行字",tmux 认不认
+    // 它一无所知,所以那个 bug 一路活到了模拟器上肉眼看见。
+    const tmux = tmuxPath();
+    if (!tmux) return; // 没装 tmux 就跳过,不让环境差异变成红灯
+    const home = tempHome();
+    const conf = writeConfig(home);
+    const name = `prospero-conftest-${String(Date.now())}`;
+    const r = spawnSync(tmux, ["-f", conf, "new-session", "-d", "-s", name, "true"], {
+      encoding: "utf8",
+    });
+    spawnSync(tmux, ["kill-session", "-t", name], { stdio: "ignore" });
+    const noise = `${r.stderr ?? ""}${r.stdout ?? ""}`;
+    expect(noise).not.toMatch(/bad key|unknown option|invalid|error/i);
+  });
+
+  it("配置关掉状态栏、不占用任何前缀键、且不销毁未接管的会话", () => {
     const home = tempHome();
     const conf = readFileSync(writeConfig(home), "utf8");
     // 状态栏在手机上是纯噪音,还占一行
     expect(conf).toContain("status off");
-    // Ctrl-B 要传给 agent(readline 后退一字符),不能被 tmux 当前缀吃掉
+    // 前缀整个去掉:手机上没人管理 tmux 窗口,留着只会从 agent 手里偷键
     expect(conf).toContain("unbind C-b");
+    expect(conf).toContain("prefix None");
     // 这条错了整个托管就失去意义:daemon 断开即销毁会话
     expect(conf).toContain("destroy-unattached off");
   });
