@@ -7,6 +7,7 @@ import { EventEmitter } from "node:events";
 import path from "node:path";
 import { mkdir, writeFile } from "node:fs/promises";
 import { DEFAULT_POLICY } from "./approval-policy.js";
+import type { UsageReport } from "./adapters/types.js";
 import { prosperoHome } from "./pairing.js";
 import type {
   ApprovalPolicy,
@@ -243,6 +244,16 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
       out.push(file);
     }
     return out;
+  }
+
+  /** 用量与限流;适配器没实现或取不到都返回 null */
+  async usage(): Promise<UsageReport | null> {
+    if (!this.adapter.usage) return null;
+    try {
+      return await this.adapter.usage();
+    } catch {
+      return null;
+    }
   }
 
   async respondPermission(reqId: string, reply: PermissionReply): Promise<void> {
