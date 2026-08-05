@@ -10,13 +10,11 @@
     "userInterfaceStyle": "dark",
     "ios": {
       "icon": "./assets/expo.icon",
-      "bundleIdentifier": "com.linn0x.prospero",
+      "bundleIdentifier": "com.linn0x.prospero.remote",
       "supportsTablet": true,
       "infoPlist": {
         "NSLocalNetworkUsageDescription": "Prospero 通过本地网络直连你 Mac 上的 prosperod,以控制 code agent 会话。",
-        "NSBonjourServices": [
-          "_prospero._tcp"
-        ],
+        "NSBonjourServices": ["_prospero._tcp"],
         "NSCameraUsageDescription": "用于扫描 Mac 上的 Prospero 配对二维码。",
         "NSAppTransportSecurity": {
           "NSAllowsLocalNetworking": true
@@ -75,6 +73,14 @@
         "expo-camera",
         {
           "cameraPermission": "用于扫描 Mac 上的 Prospero 配对二维码。"
+        }
+      ],
+      [
+        "expo-speech-recognition",
+        {
+          "microphonePermission": "Prospero 仅在你按住麦克风按钮时使用麦克风，并在设备上完成语音转写。",
+          "speechRecognitionPermission": "Prospero 使用设备端语音识别把口述内容填入聊天草稿，不会自动发送。",
+          "androidSpeechServicePackages": ["com.google.android.as"]
         }
       ],
       "expo-sharing"
