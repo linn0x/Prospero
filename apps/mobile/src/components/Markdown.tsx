@@ -2,6 +2,7 @@ import { memo, useMemo } from "react";
 import { StyleSheet, Text, View } from "react-native";
 import { CodeBlock } from "@/components/CodeBlock";
 import { parseMarkdown, type InlineSpan, type MdBlock } from "@/lib/markdown";
+import { MONOSPACE_FONT } from "@/lib/theme";
 
 /** agent 输出的 Markdown 渲染(标题/列表/引用/行内代码/代码块) */
 export const Markdown = memo(function Markdown({ source }: { source: string }) {
@@ -82,7 +83,7 @@ const styles = StyleSheet.create({
   bulletRow: { flexDirection: "row", gap: 8, paddingLeft: 2 },
   bulletMark: { color: "#7aa2f7", fontSize: 15, lineHeight: 22, minWidth: 14 },
   inlineCode: {
-    fontFamily: "Menlo",
+    fontFamily: MONOSPACE_FONT,
     fontSize: 13,
     color: "#9ad0a5",
     backgroundColor: "#1a1f1b",

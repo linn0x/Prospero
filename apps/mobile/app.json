@@ -5,6 +5,7 @@
     "version": "0.0.1",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
+    "backgroundColor": "#0B0B0E",
     "scheme": "prospero",
     "userInterfaceStyle": "dark",
     "ios": {
@@ -24,6 +25,18 @@
     },
     "android": {
       "package": "com.linn0x.prospero",
+      "versionCode": 1,
+      "backgroundColor": "#0B0B0E",
+      "userInterfaceStyle": "dark",
+      "softwareKeyboardLayoutMode": "resize",
+      "allowBackup": false,
+      "permissions": [
+        "android.permission.INTERNET",
+        "android.permission.ACCESS_NETWORK_STATE",
+        "android.permission.ACCESS_WIFI_STATE",
+        "android.permission.CHANGE_WIFI_MULTICAST_STATE"
+      ],
+      "blockedPermissions": ["android.permission.POST_NOTIFICATIONS"],
       "adaptiveIcon": {
         "backgroundColor": "#0B0B0E",
         "foregroundImage": "./assets/images/android-icon-foreground.png",
@@ -34,6 +47,22 @@
     },
     "plugins": [
       "expo-router",
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "usesCleartextTraffic": true
+          }
+        }
+      ],
+      [
+        "expo-navigation-bar",
+        {
+          "enforceContrast": false,
+          "hidden": false,
+          "style": "dark"
+        }
+      ],
       [
         "expo-splash-screen",
         {

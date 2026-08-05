@@ -5,6 +5,7 @@ import {
   decodePairingQR,
   encodePairingQR,
   generateKeyPairB64,
+  hostIdForDaemonPublicKey,
   type PairingPayload,
 } from "../src/index.js";
 
@@ -25,6 +26,14 @@ describe("pairing QR", () => {
     const qr = encodePairingQR(p);
     expect(qr.startsWith("prospero://pair?d=")).toBe(true);
     expect(decodePairingQR(qr)).toEqual(p);
+  });
+
+  it("daemon 与 App 可从同一公钥得到深链主机 ID", () => {
+    const p = makePayload();
+    const id = hostIdForDaemonPublicKey(p.pubKey);
+    expect(id.length).toBeGreaterThan(0);
+    expect(id).toMatch(/^[a-zA-Z0-9]+$/);
+    expect(hostIdForDaemonPublicKey(p.pubKey)).toBe(id);
   });
 
   it("拒绝非 Prospero QR", () => {
