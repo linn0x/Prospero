@@ -323,6 +323,12 @@ export const C2SGitCommitSchema = z.object({
   message: z.string().min(1).max(10000),
 });
 
+/** 取用量与限流。数据来源不稳定,拿不到时返回 available=false 而不是报错 */
+export const C2SUsageGetSchema = z.object({
+  type: z.literal("usage.get"),
+  sid,
+});
+
 export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SHelloSchema,
   C2SSessionCreateSchema,
@@ -349,6 +355,7 @@ export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SGitStageSchema,
   C2SGitDiscardSchema,
   C2SGitCommitSchema,
+  C2SUsageGetSchema,
 ]);
 
 // ---------------------------------------------------------------- S → C
@@ -648,6 +655,36 @@ export const S2CGitDoneSchema = z.object({
   detail: z.string().optional(),
 });
 
+/** 一个限流窗口的使用情况 */
+export const UsageWindowSchema = z.object({
+  /** 给人看的窗口名,如「5 小时」「7 天」 */
+  label: z.string(),
+  /** 已用百分比 0–100 */
+  utilization: z.number().min(0).max(100),
+  /** 窗口重置时间(ISO);拿不到则省略 */
+  resetsAt: z.string().optional(),
+});
+
+/**
+ * 用量与限流。
+ *
+ * `available` 为假的情况比想象中多:用 API key / Bedrock / Vertex 的会话根本
+ * 没有套餐限流,后端也可能没暴露。UI 必须能优雅地显示"这里没有数据",
+ * 而不是把它当成错误。
+ */
+export const S2CUsageSchema = z.object({
+  type: z.literal("usage.result"),
+  sid,
+  available: z.boolean(),
+  /** 套餐类型(pro / max / team / enterprise),API key 会话为 null */
+  subscription: z.string().nullable().optional(),
+  /** 本会话累计花费 */
+  costUsd: z.number().nonnegative().optional(),
+  windows: z.array(UsageWindowSchema).optional(),
+  /** available 为假时说明原因,直接显示给用户 */
+  reason: z.string().optional(),
+});
+
 export const S2CMessageSchema = z.discriminatedUnion("type", [
   S2CHelloOkSchema,
   S2CSessionStateSchema,
@@ -666,6 +703,7 @@ export const S2CMessageSchema = z.discriminatedUnion("type", [
   S2CGitStatusSchema,
   S2CGitDiffSchema,
   S2CGitDoneSchema,
+  S2CUsageSchema,
 ]);
 
 // ---------------------------------------------------------------- 配对 QR 载荷
@@ -703,6 +741,7 @@ export type C2STermAck = z.infer<typeof C2STermAckSchema>;
 export type C2SPermissionRespond = z.infer<typeof C2SPermissionRespondSchema>;
 export type C2SMessage = z.infer<typeof C2SMessageSchema>;
 export type Attachment = z.infer<typeof AttachmentSchema>;
+export type UsageWindow = z.infer<typeof UsageWindowSchema>;
 export type FsEntry = z.infer<typeof FsEntrySchema>;
 export type GitFile = z.infer<typeof GitFileSchema>;
 export type ChatRole = z.infer<typeof ChatRoleSchema>;

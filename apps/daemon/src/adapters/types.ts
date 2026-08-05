@@ -39,10 +39,21 @@ export interface AgentAdapter {
   send(text: string, attachments?: Attachment[]): Promise<void>;
   /** 回应审批请求 */
   respondPermission(reqId: string, reply: PermissionReply): Promise<void>;
+  /**
+   * 用量与限流。后端拿不到就返回 null —— 大多数 agent 压根不暴露这个,
+   * 所以这是可选实现,不是所有适配器都要装样子。
+   */
+  usage?(): Promise<UsageReport | null>;
   /** 中断当前轮次 */
   interrupt(): Promise<void>;
   /** 关闭并释放资源 */
   dispose(): Promise<void>;
+}
+
+export interface UsageReport {
+  subscription?: string | null;
+  costUsd?: number;
+  windows: { label: string; utilization: number; resetsAt?: string }[];
 }
 
 export class AdapterError extends Error {

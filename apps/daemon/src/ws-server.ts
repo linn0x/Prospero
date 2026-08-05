@@ -449,6 +449,31 @@ export async function createDaemonServer(
         await manager.kill(msg.sid);
         return;
 
+      case "usage.get": {
+        const s = manager.requireStructured(msg.sid);
+        const report = await s.usage();
+        if (!report) {
+          send(conn, {
+            type: "usage.result",
+            sid: msg.sid,
+            available: false,
+            // 说清楚为什么没有,免得用户以为是坏了
+            reason: "该后端没有暴露用量数据(用 API key / Bedrock / Vertex 时套餐限流也不适用)",
+            ...(s.info().totals ? { costUsd: s.info().totals?.costUsd } : {}),
+          });
+          return;
+        }
+        send(conn, {
+          type: "usage.result",
+          sid: msg.sid,
+          available: true,
+          subscription: report.subscription ?? null,
+          ...(report.costUsd !== undefined ? { costUsd: report.costUsd } : {}),
+          windows: report.windows,
+        });
+        return;
+      }
+
       case "approval.policy.set":
         manager.setApprovalPolicy(msg.sid, msg.policy);
         return;
