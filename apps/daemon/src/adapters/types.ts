@@ -5,10 +5,16 @@
  * 事件流归一化成 protocol 的 AgentEventBody,客户端只认这一套。
  * 适配器不关心网络/加密/多客户端广播 —— 那是 StructuredSession 与 ws-server 的事。
  */
-import type { AgentEventBody, PermissionReply } from "@prospero/protocol";
+import type {
+  AgentEventBody,
+  ApprovalPolicy,
+  PermissionReply,
+} from "@prospero/protocol";
 
 export interface AdapterContext {
   cwd: string;
+  /** 当前审批策略;适配器据此决定是否绕过人工确认 */
+  approvalPolicy?: () => ApprovalPolicy;
   /** 适配器产出一条归一化事件 */
   emit(body: AgentEventBody): void;
   /**

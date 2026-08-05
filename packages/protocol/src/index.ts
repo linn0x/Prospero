@@ -14,6 +14,7 @@ export {
   SessionInfoSchema,
   HostInfoSchema,
   PermissionReplySchema,
+  ApprovalPolicySchema,
   AgentEventBodySchema,
   FileDiffSchema,
   FsEntrySchema,
@@ -21,4 +22,4 @@ export {
   S2CMessageSchema,
   PairingPayloadSchema,
 } from "./schemas.js";
-export type { FsEntry } from "./schemas.js";
+export type { ApprovalPolicy, FsEntry } from "./schemas.js";

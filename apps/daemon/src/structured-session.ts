@@ -5,7 +5,9 @@
  */
 import { EventEmitter } from "node:events";
 import path from "node:path";
+import { DEFAULT_POLICY } from "./approval-policy.js";
 import type {
+  ApprovalPolicy,
   AgentEventBody,
   AgentKind,
   PermissionReply,
@@ -73,13 +75,28 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
       cwd: this.cwd,
       emit: (body) => this.record(body),
       recordOutput: (callId, output) => this.recordToolOutput(callId, output),
+      // 取函数而非取值:策略可在会话进行中改,适配器每次调用都要读到当下的值
+      approvalPolicy: () => this.policy,
     });
     this.setStatus("idle");
+  }
+
+  /** 当前审批策略;可在会话进行中修改 */
+  private policy: ApprovalPolicy = DEFAULT_POLICY;
+
+  setApprovalPolicy(policy: ApprovalPolicy): void {
+    this.policy = policy;
+    this.emit("state", this.info());
+  }
+
+  get approvalPolicy(): ApprovalPolicy {
+    return this.policy;
   }
 
   info(): SessionInfo {
     return {
       id: this.id,
+      approvalPolicy: this.policy,
       agent: this.agent,
       kind: "structured",
       title: this.title,

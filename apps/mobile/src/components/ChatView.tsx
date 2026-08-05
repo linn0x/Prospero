@@ -323,6 +323,18 @@ const PermissionCard = memo(function PermissionCard({
   onRespond: (reqId: string, reply: PermissionReply) => void;
 }) {
   const resolved = item.resolved;
+  // 自动批准的卡片刻意做得低调但可见:不该抢注意力(它没在等你),
+  // 但必须能在回滚聊天时一眼认出"这条没经过我"。
+  if (item.auto !== undefined) {
+    return (
+      <View style={styles.permAutoCard}>
+        <Text style={styles.permAutoText} numberOfLines={2}>
+          自动放行 · {item.action}
+          {item.auto === "yolo" ? "(YOLO)" : ""}
+        </Text>
+      </View>
+    );
+  }
   return (
     <View style={[styles.permCard, resolved !== undefined && styles.permCardResolved]}>
       <Text style={styles.permTitle}>需要你的批准 · {item.action}</Text>
@@ -451,6 +463,17 @@ const styles = StyleSheet.create({
     padding: 12,
     gap: 8,
   },
+  permAutoCard: {
+    marginHorizontal: 12,
+    marginVertical: 3,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    backgroundColor: "#15151b",
+    borderLeftWidth: 2,
+    borderLeftColor: "#3a3a44",
+  },
+  permAutoText: { color: "#6a6a76", fontSize: 11 },
   permCardResolved: { opacity: 0.55, borderColor: "#33333d" },
   permTitle: { color: "#e8c98a", fontSize: 14, fontWeight: "600" },
   permResource: {

@@ -5,6 +5,7 @@
  * UI 需要的是稳定有序的条目列表 —— 这里做这层转换,纯函数便于测试。
  */
 import type {
+  ApprovalPolicy,
   AgentEventBody,
   FileDiff,
   PermissionReply,
@@ -53,6 +54,8 @@ export interface PermissionItem {
   diff?: FileDiff;
   /** 已回应则记录结果,卡片转为只读 */
   resolved?: PermissionReply;
+  /** 被策略自动批准(没问过人);卡片以此区别于"你批过的" */
+  auto?: ApprovalPolicy;
 }
 
 export interface ErrorItem {
@@ -148,6 +151,22 @@ export function applyEvent(items: ChatItem[], ev: AgentEventBody): ChatItem[] {
         ...(ev.diff ? { diff: ev.diff } : {}),
       });
     }
+
+    // 自动批准的调用同样进聊天流。不打断不等于不留痕 ——
+    // 事后要能翻出"那 20 分钟它到底动了什么"。
+    case "permission.auto":
+      return [
+        ...items,
+        {
+          type: "permission",
+          key: `p:${ev.reqId}`,
+          reqId: ev.reqId,
+          action: ev.action,
+          resources: [],
+          summary: ev.summary,
+          auto: ev.policy,
+        },
+      ];
 
     case "permission.request":
       return [

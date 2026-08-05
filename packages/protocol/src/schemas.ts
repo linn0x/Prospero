@@ -48,6 +48,23 @@ const seq = z.number().int().nonnegative();
  */
 export const SessionKindSchema = z.enum(["pty", "structured"]);
 
+/**
+ * 审批策略。
+ *
+ * - strict:每次工具调用都问(最初的行为)
+ * - standard:只读工具自动放行,改文件/执行命令/联网仍然问
+ * - yolo:全部自动批准
+ *
+ * 为什么不是布尔开关:实际的痛点是"读操作太多、把人训练成盲批",
+ * 而不是"审批本身多余"。standard 才是大多数时候真正想要的,
+ * yolo 是明确知道自己在干什么时的选择。
+ *
+ * 三档都在【我们这一层】放行,不使用后端的 bypass 模式 —— 那会让工具调用
+ * 完全不经过 canUseTool,聊天里也就看不到 agent 做了什么。
+ * 自动批准的目的是不打断,不是不告知。
+ */
+export const ApprovalPolicySchema = z.enum(["strict", "standard", "yolo"]);
+
 export const SessionInfoSchema = z.object({
   id: sid,
   agent: AgentKindSchema,
@@ -60,6 +77,8 @@ export const SessionInfoSchema = z.object({
   rows,
   /** 结构化会话:当前是否有待处理审批 */
   pendingPermissions: z.number().int().nonnegative().optional(),
+  /** 当前审批策略;放宽时 UI 必须显著提示 */
+  approvalPolicy: ApprovalPolicySchema.optional(),
   /** 最后一条助手消息的摘要,用于会话列表预览 */
   preview: z.string().optional(),
   /** 本轮开始时间戳,客户端据此显示"运行 12s" */
@@ -96,6 +115,8 @@ export const C2SHelloSchema = z.object({
 export const C2SSessionCreateSchema = z.object({
   type: z.literal("session.create"),
   agent: AgentKindSchema,
+  /** 省略 = strict */
+  approvalPolicy: ApprovalPolicySchema.optional(),
   /** 省略时由 daemon 按 agent 能力决定(有适配器的走 structured) */
   kind: SessionKindSchema.optional(),
   cwd: z.string().optional(),
@@ -152,6 +173,13 @@ export const C2SPermissionRespondSchema = z.object({
   sid,
   reqId: z.string().min(1),
   reply: PermissionReplySchema,
+});
+
+/** 会话中途改审批策略 */
+export const C2SApprovalPolicySetSchema = z.object({
+  type: z.literal("approval.policy.set"),
+  sid,
+  policy: ApprovalPolicySchema,
 });
 
 export const C2SSessionInterruptSchema = z.object({
@@ -254,6 +282,7 @@ export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SPermissionRespondSchema,
   C2SSessionInterruptSchema,
   C2SSessionKillSchema,
+  C2SApprovalPolicySetSchema,
   C2SFsListSchema,
   C2SFsReadSchema,
   C2SFsWriteSchema,
@@ -367,6 +396,20 @@ export const AgentPermissionRequestSchema = z.object({
   diff: FileDiffSchema.optional(),
 });
 
+/**
+ * 被策略自动批准的一次调用。
+ * 之所以还要发这条:自动批准是为了不打断,不是为了瞒着用户 ——
+ * 聊天里必须留下痕迹,事后能翻出"那 20 分钟它到底动了什么"。
+ */
+export const AgentPermissionAutoSchema = z.object({
+  kind: z.literal("permission.auto"),
+  reqId: z.string(),
+  action: z.string(),
+  summary: z.string(),
+  /** 当时生效的策略,便于回溯是哪一档放的行 */
+  policy: ApprovalPolicySchema,
+});
+
 export const AgentPermissionResolvedSchema = z.object({
   kind: z.literal("permission.resolved"),
   reqId: z.string(),
@@ -400,6 +443,7 @@ export const AgentEventBodySchema = z.discriminatedUnion("kind", [
   AgentToolStartSchema,
   AgentToolEndSchema,
   AgentPermissionRequestSchema,
+  AgentPermissionAutoSchema,
   AgentPermissionResolvedSchema,
   AgentTurnEndSchema,
   AgentErrorSchema,
@@ -549,6 +593,7 @@ export type SessionStatus = z.infer<typeof SessionStatusSchema>;
 export type SessionInfo = z.infer<typeof SessionInfoSchema>;
 export type HostInfo = z.infer<typeof HostInfoSchema>;
 export type PermissionReply = z.infer<typeof PermissionReplySchema>;
+export type ApprovalPolicy = z.infer<typeof ApprovalPolicySchema>;
 export type C2SHello = z.infer<typeof C2SHelloSchema>;
 export type C2SSessionCreate = z.infer<typeof C2SSessionCreateSchema>;
 export type C2SSessionAttach = z.infer<typeof C2SSessionAttachSchema>;

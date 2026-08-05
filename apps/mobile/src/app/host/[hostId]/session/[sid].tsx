@@ -11,7 +11,7 @@ import {
 } from "react-native";
 import * as Haptics from "expo-haptics";
 import { Stack, router, useLocalSearchParams } from "expo-router";
-import type { SessionInfo } from "@prospero/protocol";
+import type { ApprovalPolicy, SessionInfo } from "@prospero/protocol";
 import { ChatView } from "@/components/ChatView";
 import { Icon } from "@/components/Icon";
 import { KeyBar } from "@/components/KeyBar";
@@ -95,6 +95,46 @@ export default function SessionScreen() {
     );
   }
 
+  const policy: ApprovalPolicy = session?.approvalPolicy ?? "strict";
+
+  const choosePolicy = (): void => {
+    Alert.alert(
+      "审批策略",
+      "决定哪些操作需要你点头。",
+      [
+        {
+          text: "逐条批准(最安全)",
+          onPress: () => conn.setApprovalPolicy(sid, "strict"),
+        },
+        {
+          text: "半自动:只读放行",
+          onPress: () => conn.setApprovalPolicy(sid, "standard"),
+        },
+        {
+          // YOLO 要单独再确认一次。它允许 agent 无提示地改文件、跑命令,
+          // 一次误点的代价远大于多点一次的成本。
+          text: "YOLO:全部自动批准",
+          style: "destructive",
+          onPress: () => {
+            Alert.alert(
+              "确认开启 YOLO?",
+              "这个会话里,agent 改文件、执行命令、联网都不再询问你。操作仍会记录在聊天里,但不会等你。",
+              [
+                { text: "取消", style: "cancel" },
+                {
+                  text: "我明白,开启",
+                  style: "destructive",
+                  onPress: () => conn.setApprovalPolicy(sid, "yolo"),
+                },
+              ],
+            );
+          },
+        },
+        { text: "取消", style: "cancel" },
+      ],
+    );
+  };
+
   const totals = session?.totals;
   const subtitle = session
     ? `${session.agent} · ${statusText[session.status]}${elapsed ? ` · ${elapsed}` : ""}${
@@ -147,6 +187,18 @@ export default function SessionScreen() {
                   {/* 标签写的是"点了会切到哪",不是"现在是什么" */}
                   <Text style={[styles.ttyBtn, showTty && styles.ttyBtnActive]}>
                     {showTty ? "看对话" : "看终端"}
+                  </Text>
+                </Pressable>
+              )}
+              {isStructured && (
+                <Pressable onPress={choosePolicy} hitSlop={8}>
+                  <Text
+                    style={[
+                      styles.ttyBtn,
+                      policy !== "strict" && styles.policyRelaxed,
+                    ]}
+                  >
+                    {policy === "yolo" ? "YOLO" : policy === "standard" ? "半自动" : "逐条批"}
                   </Text>
                 </Pressable>
               )}
@@ -271,6 +323,8 @@ const styles = StyleSheet.create({
     overflow: "hidden",
   },
   ttyBtnActive: { color: "#7aa2f7", borderColor: "#3557b7" },
+  // 放宽后必须显眼 —— 用户要能一眼看出这个会话没在逐条把关
+  policyRelaxed: { color: "#e5a341", borderColor: "#7a5a1a" },
   stopText: { color: "#d9a441", fontSize: 15 },
   killText: { color: "#e5534b", fontSize: 15 },
   reconnBar: { backgroundColor: "#3a2f1f", paddingHorizontal: 12, paddingVertical: 6 },
