@@ -11,6 +11,8 @@ export type IconName =
   | "magnifyingglass"
   | "plus"
   | "arrow.up"
+  | "mic.fill"
+  | "xmark"
   | "stop.circle"
   | "trash"
   | "terminal"
@@ -29,6 +31,8 @@ const FALLBACK: Record<IconName, string> = {
   magnifyingglass: "🔍",
   plus: "＋",
   "arrow.up": "↑",
+  "mic.fill": "🎙",
+  xmark: "×",
   "stop.circle": "■",
   trash: "🗑",
   terminal: "TTY",

@@ -11,12 +11,13 @@
     "node": ">=22"
   },
   "scripts": {
-    "postinstall": "chmod +x node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper 2>/dev/null || true",
+    "postinstall": "patch-package && (chmod +x node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper 2>/dev/null || true)",
     "typecheck": "tsc --build --force packages/protocol apps/daemon",
     "test": "npm run test --workspaces --if-present"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",
+    "patch-package": "^8.0.1",
     "typescript": "^5.6.0"
   }
 }
