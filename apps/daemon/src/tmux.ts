@@ -55,8 +55,7 @@ export function sessionName(id: string): string {
 
 /**
  * 写一份最小 tmux 配置。
- * 状态栏必须关掉 —— 手机上那一行是纯噪音,而且会吃掉一行高度;
- * 前缀键也要挪开,不然用户在会话里按 Ctrl-B 会被 tmux 吞掉而不是传给 agent。
+ * 状态栏必须关掉 —— 手机上那一行是纯噪音,而且会吃掉一行高度。
  */
 export function writeConfig(home: string): string {
   const dir = path.join(home, "tmux");
@@ -67,9 +66,11 @@ export function writeConfig(home: string): string {
     [
       "set -g status off",
       "set -g default-terminal 'xterm-256color'",
-      // Ctrl-B 要留给 agent(readline 的后退一字符),前缀换成基本没人用的 Ctrl-\\
+      // 前缀键整个去掉。手机上没人从这里管理 tmux 窗口,留着任何前缀都只是
+      // 从 agent 手里偷走一个键 —— Ctrl-B 本身就是 readline 的后退一字符。
+      // (曾经改成 C-\\,但转义多写了一层,生成出 'C-\\\\',tmux 每次启动都报 bad key)
       "unbind C-b",
-      "set -g prefix 'C-\\\\'",
+      "set -g prefix None",
       "set -g escape-time 0",
       "set -g history-limit 10000",
       // daemon 断开时不要销毁会话 —— 整件事的重点

@@ -98,6 +98,7 @@ export default function SessionScreen() {
   const termRef = useRef<TerminalHandle>(null);
   // 字号存在会话页而不是终端内部:切走再回来不该重置成默认值
   const [fontSize, setFontSize] = useState(12);
+  const [perf, setPerf] = useState<{ fps: number; kb: number; renderer: string } | null>(null);
 
   const policy: ApprovalPolicy = session?.approvalPolicy ?? "strict";
 
@@ -145,6 +146,9 @@ export default function SessionScreen() {
         pending > 0 ? ` · ${String(pending)} 项待批` : ""
       }${
         totals && totals.costUsd > 0 ? ` · 共 $${totals.costUsd.toFixed(3)}` : ""
+      }${
+        // 洪峰时才有值。A4 验收线是 30fps,平时没输出就不显示,免得占位置
+        perf ? ` · ${String(perf.fps)}fps ${String(perf.kb)}KB/s` : ""
       }`
     : "";
 
@@ -264,7 +268,7 @@ export default function SessionScreen() {
               </Text>
             </View>
           )}
-          <Terminal ref={termRef} conn={conn} sid={sid} onFontSize={setFontSize} />
+          <Terminal ref={termRef} conn={conn} sid={sid} onFontSize={setFontSize} onPerf={setPerf} />
           {!isStructured && (
             <KeyBar
               onKey={(seq) => conn.inputText(sid, seq)}
