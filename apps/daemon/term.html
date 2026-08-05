@@ -112,6 +112,8 @@
       doFit();
     } else if (m.kind === "focus") {
       term.focus();
+    } else if (m.kind === "blur") {
+      term.blur();
     } else if (m.kind === "scrollBottom") {
       term.scrollToBottom();
     }
@@ -134,8 +136,27 @@
   window.__rx = (jsonStr) => handle(JSON.parse(jsonStr));
 
   new ResizeObserver(() => doFit()).observe(document.body);
-  // 点终端即取得焦点并唤起键盘 —— 否则要先点一下再等系统决定
-  document.getElementById("term").addEventListener("touchend", () => term.focus());
+  // 点终端取得焦点唤起键盘。
+  //
+  // 必须区分"点"和"划":早先版本对任何 touchend 都 focus(),结果是收起键盘后
+  // 一滚动就又被拉回来 —— 根本关不掉。只有位移很小、时长很短的才算点击。
+  (function tapToFocus() {
+    const el = document.getElementById("term");
+    let sx = 0, sy = 0, st = 0, moved = false;
+    el.addEventListener("touchstart", (e) => {
+      const t = e.touches[0];
+      if (!t) return;
+      sx = t.clientX; sy = t.clientY; st = Date.now(); moved = false;
+    }, { passive: true });
+    el.addEventListener("touchmove", (e) => {
+      const t = e.touches[0];
+      if (!t) return;
+      if (Math.abs(t.clientX - sx) > 10 || Math.abs(t.clientY - sy) > 10) moved = true;
+    }, { passive: true });
+    el.addEventListener("touchend", () => {
+      if (!moved && Date.now() - st < 500) term.focus();
+    }, { passive: true });
+  })();
   window.addEventListener("load", () => {
     post({ kind: "ready", renderer });
     doFit();
