@@ -687,6 +687,24 @@ export const UsageWindowSchema = z.object({
 });
 
 /**
+ * 一个 agent 账号的用量。
+ *
+ * 限流是按【账号】走的,而账号是按 agent 分的 —— claude 的 5 小时窗口和 codex
+ * 的 7 天窗口互不相干,各自有各自的套餐。主机页要同时回答"我这几个订阅还剩多少",
+ * 所以得是一组,而不是随便挑一个会话去问。
+ */
+export const UsageAccountSchema = z.object({
+  agent: AgentKindSchema,
+  available: z.boolean(),
+  subscription: z.string().nullable().optional(),
+  costUsd: z.number().nonnegative().optional(),
+  inputTokens: z.number().int().nonnegative().optional(),
+  outputTokens: z.number().int().nonnegative().optional(),
+  windows: z.array(UsageWindowSchema),
+  reason: z.string().optional(),
+});
+
+/**
  * 用量与限流。
  *
  * 【available 只回答"有没有东西可看"】曾经把它和"有没有套餐限流窗口"混为一谈,
@@ -707,6 +725,11 @@ export const S2CUsageSchema = z.object({
   windows: z.array(UsageWindowSchema).optional(),
   /** 没有窗口时说明原因(不代表没有用量数据) */
   reason: z.string().optional(),
+  /**
+   * 按 agent 分开的账号用量;只有账号级查询(usage.get 不带 sid)才有。
+   * 顶层那几个字段仍是"其中一个"的值,为的是老客户端不至于什么都看不到。
+   */
+  accounts: z.array(UsageAccountSchema).optional(),
 });
 
 export const S2CMessageSchema = z.discriminatedUnion("type", [
@@ -766,6 +789,7 @@ export type C2SPermissionRespond = z.infer<typeof C2SPermissionRespondSchema>;
 export type C2SMessage = z.infer<typeof C2SMessageSchema>;
 export type Attachment = z.infer<typeof AttachmentSchema>;
 export type UsageWindow = z.infer<typeof UsageWindowSchema>;
+export type UsageAccount = z.infer<typeof UsageAccountSchema>;
 export type FsEntry = z.infer<typeof FsEntrySchema>;
 export type GitFile = z.infer<typeof GitFileSchema>;
 export type ChatRole = z.infer<typeof ChatRoleSchema>;

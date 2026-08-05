@@ -451,9 +451,10 @@ export class HostConnection {
     return `${sid}\u0000${path}`;
   }
 
-  private resolveFs(msg: S2CMessage & { sid: string; path?: string }): void {
+  private resolveFs(msg: S2CMessage & { sid?: string; path?: string }): void {
     // git.status / git.done 没有 path,用消息类型当 key 的一部分
-    const key = this.fsKey(msg.sid, msg.path ?? `#${msg.type}`);
+    // 账号级应答不带 sid,用固定键配对(与 usageGet 省略 sid 时一致)
+    const key = this.fsKey(msg.sid ?? "#account", msg.path ?? `#${msg.type}`);
     const waiter = this.fsWaiters.get(key);
     if (!waiter) return;
     this.fsWaiters.delete(key);
@@ -525,8 +526,16 @@ export class HostConnection {
     return this.fsRequest(sid, path, { type: "fs.get", sid, path, offset, length });
   }
 
-  usageGet(sid: string): Promise<Extract<S2CMessage, { type: "usage.result" }>> {
-    return this.fsRequest(sid, "#usage.result", { type: "usage.get", sid });
+  /**
+   * 用量与限流。省略 sid 就是问账号级的 —— 限流窗口在所有会话之间共享,
+   * 主机页也该看得到,不必先进某个会话。
+   */
+  usageGet(sid?: string): Promise<Extract<S2CMessage, { type: "usage.result" }>> {
+    return this.fsRequest(
+      sid ?? "#account",
+      "#usage.result",
+      sid !== undefined ? { type: "usage.get", sid } : { type: "usage.get" },
+    );
   }
 
   gitStatus(sid: string): Promise<Extract<S2CMessage, { type: "git.status.result" }>> {

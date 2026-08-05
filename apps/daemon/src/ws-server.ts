@@ -27,7 +27,9 @@ import {
   type S2CMessage,
   type SecureChannel,
   type SessionInfo,
+  type UsageAccount,
 } from "@prospero/protocol";
+import { availableMemory, osIdentity } from "./host-stats.js";
 import { authenticate, loadDevices, loadIdentity, type DeviceRecord } from "./pairing.js";
 import { Notifier, type NotifyConfig } from "./notify.js";
 import { SessionError, SessionManager } from "./session-manager.js";
@@ -290,12 +292,12 @@ export async function createDaemonServer(
         name: opts.hostName ?? os.hostname(),
         daemonVersion: DAEMON_VERSION,
         protocolVersion: PROTOCOL_VERSION,
-        platform: process.platform,
-        osVersion: os.release(),
+        platform: osIdentity().platform,
+        osVersion: osIdentity().version,
         arch: process.arch,
         cpus: os.cpus().length,
         memTotal: os.totalmem(),
-        memFree: os.freemem(),
+        memFree: availableMemory(),
         uptimeSec: Math.floor(os.uptime()),
         loadAvg: os.loadavg(),
         daemonStartedAt: DAEMON_STARTED_AT,
@@ -348,7 +350,15 @@ export async function createDaemonServer(
     }
     const { hello, channel } = serverHandshakeAccept(conn.handshake, text);
     conn.handshake = null;
-    const device = authenticate(opts.home, hello);
+    // 拒绝必须在 Mac 这边留下痕迹:手机上只会看到一句模糊的"配对已失效",
+    // 而 daemon 完全静默的话,排查就只剩下猜(已经为此白花过一次时间)
+    const device = authenticate(opts.home, hello, (reason) => {
+      console.warn(
+        reason === "unknown_token"
+          ? `[prosperod] 拒绝连接:token 不在设备表里(${hello.token.slice(0, 6)}…)—— 配对码过期,或手机连的是另一台 daemon`
+          : `[prosperod] 拒绝连接:token ${hello.token.slice(0, 6)}… 的公钥与首次配对时不符 —— App 重装过就重新配对,否则这个 token 可能已泄漏`,
+      );
+    });
     if (!device) {
       conn.channel = channel;
       send(conn, {
@@ -461,26 +471,73 @@ export async function createDaemonServer(
         return;
 
       case "usage.get": {
-        // 没给 sid 就自己挑一个结构化会话 —— 限流是账号级的,问谁都一样
-        const target =
-          msg.sid !== undefined
-            ? manager.requireStructured(msg.sid)
-            : manager.anyStructured();
-        if (!target) {
+        // 不带 sid = 账号级:每个 agent 各问一份。限流按账号走,而账号按 agent 分,
+        // 随便挑一个会话只能答出其中一家的额度,另外几家的订阅就看不见了。
+        if (msg.sid === undefined) {
+          const sessions = manager.structuredPerAgent();
+          if (sessions.length === 0) {
+            send(conn, {
+              type: "usage.result",
+              available: false,
+              reason: "还没有对话型会话 —— 用量要有会话才问得到。",
+              accounts: [],
+            });
+            return;
+          }
+          const accounts = await Promise.all(
+            sessions.map(async (s): Promise<UsageAccount> => {
+              const r = await s.usage();
+              if (!r) {
+                return {
+                  agent: s.agent,
+                  available: false,
+                  windows: [],
+                  reason: "还没产生用量 —— 发一条消息后再看。",
+                };
+              }
+              return {
+                agent: s.agent,
+                available: true,
+                subscription: r.subscription ?? null,
+                ...(r.costUsd !== undefined ? { costUsd: r.costUsd } : {}),
+                ...(r.inputTokens !== undefined ? { inputTokens: r.inputTokens } : {}),
+                ...(r.outputTokens !== undefined ? { outputTokens: r.outputTokens } : {}),
+                windows: r.windows,
+                ...(r.windows.length === 0
+                  ? { reason: "这个后端不提供套餐限流窗口。" }
+                  : {}),
+              };
+            }),
+          );
+          // 顶层字段挑压力最大的那家:老客户端只认这几个字段,给它最该看见的一份
+          const lead =
+            [...accounts]
+              .filter((a) => a.available)
+              .sort(
+                (a, b) =>
+                  Math.max(0, ...b.windows.map((w) => w.utilization)) -
+                  Math.max(0, ...a.windows.map((w) => w.utilization)),
+              )[0] ?? accounts[0];
           send(conn, {
             type: "usage.result",
-            available: false,
-            reason: "还没有对话型会话 —— 用量要有会话才问得到。",
-            ...(msg.sid !== undefined ? { sid: msg.sid } : {}),
+            available: accounts.some((a) => a.available),
+            ...(lead?.subscription !== undefined ? { subscription: lead.subscription } : {}),
+            ...(lead?.costUsd !== undefined ? { costUsd: lead.costUsd } : {}),
+            ...(lead?.inputTokens !== undefined ? { inputTokens: lead.inputTokens } : {}),
+            ...(lead?.outputTokens !== undefined ? { outputTokens: lead.outputTokens } : {}),
+            windows: lead?.windows ?? [],
+            ...(lead?.reason !== undefined ? { reason: lead.reason } : {}),
+            accounts,
           });
           return;
         }
-        const s = target;
+
+        const s = manager.requireStructured(msg.sid);
         const report = await s.usage();
         if (!report) {
           send(conn, {
             type: "usage.result",
-            ...(msg.sid !== undefined ? { sid: msg.sid } : {}),
+            sid: msg.sid,
             available: false,
             reason: "这个会话还没产生用量 —— 发一条消息后再看。",
           });
@@ -488,7 +545,7 @@ export async function createDaemonServer(
         }
         send(conn, {
           type: "usage.result",
-          ...(msg.sid !== undefined ? { sid: msg.sid } : {}),
+          sid: msg.sid,
           available: true,
           subscription: report.subscription ?? null,
           ...(report.costUsd !== undefined ? { costUsd: report.costUsd } : {}),
