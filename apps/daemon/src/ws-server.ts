@@ -415,7 +415,7 @@ export async function createDaemonServer(
         return;
       }
       case "chat.send":
-        await manager.requireStructured(msg.sid).send(msg.text);
+        await manager.requireStructured(msg.sid).send(msg.text, msg.attachments);
         return;
       case "tool.output.get": {
         const full = manager.requireStructured(msg.sid).toolOutput(msg.callId);

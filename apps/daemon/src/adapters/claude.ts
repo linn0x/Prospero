@@ -19,7 +19,7 @@ import type {
   SDKMessage,
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { AgentEventBody, PermissionReply } from "@prospero/protocol";
+import type { AgentEventBody, Attachment, PermissionReply } from "@prospero/protocol";
 import { needsApproval } from "../approval-policy.js";
 import { diffFromToolInput } from "./diff.js";
 import { AdapterError, summarize, type AdapterContext, type AgentAdapter } from "./types.js";
@@ -279,11 +279,30 @@ export class ClaudeAdapter implements AgentAdapter {
     }
   }
 
-  async send(text: string): Promise<void> {
+  /** SDK 原生收图,不必落盘再让模型去读 */
+  readonly acceptsImages = true;
+
+  async send(text: string, attachments?: Attachment[]): Promise<void> {
     if (!this.q) throw new AdapterError("Claude 会话尚未就绪");
+    // 无附件时保持纯字符串 content —— 不必为了统一而把简单情况复杂化
+    const content =
+      attachments && attachments.length > 0
+        ? [
+            ...attachments.map((a) => ({
+              type: "image" as const,
+              source: {
+                type: "base64" as const,
+                media_type: a.mimeType,
+                data: a.dataB64,
+              },
+            })),
+            // 图在前、字在后:模型先看到图,再读围绕它的问题
+            ...(text.length > 0 ? [{ type: "text" as const, text }] : []),
+          ]
+        : text;
     this.input.push({
       type: "user",
-      message: { role: "user", content: text },
+      message: { role: "user", content },
       parent_tool_use_id: null,
       session_id: "",
     } as SDKUserMessage);
