@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Alert,
+  Image,
   KeyboardAvoidingView,
   Platform,
   Pressable,
+  ScrollView,
   StyleSheet,
   Text,
   TextInput,
@@ -17,6 +19,7 @@ import { Icon } from "@/components/Icon";
 import { KeyBar } from "@/components/KeyBar";
 import { QuickReplies } from "@/components/QuickReplies";
 import { Terminal, type TerminalHandle } from "@/components/Terminal";
+import { pickFromCamera, pickFromLibrary, type PickedImage } from "@/lib/attach";
 import { matchCommands } from "@/lib/slash-commands";
 import { useHostConnection } from "@/lib/use-host-connection";
 
@@ -59,17 +62,41 @@ export default function SessionScreen() {
   const busy = session?.status === "running" || session?.status === "starting";
   const elapsed = useElapsed(busy || session?.status === "waiting_approval" ? session?.busySince : undefined);
 
+  const [images, setImages] = useState<PickedImage[]>([]);
+
   const send = useCallback(
     (text: string): void => {
       const t = text.trim();
-      if (!conn || !sid || t.length === 0) return;
+      // 只带图不带字是合理的:一张报错截图本身就是问题
+      if (!conn || !sid || (t.length === 0 && images.length === 0)) return;
       void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-      if (isStructured) conn.chatSend(sid, t);
-      else conn.inputText(sid, t + "\r");
+      if (isStructured) {
+        conn.chatSend(
+          sid,
+          t,
+          images.map(({ mimeType, dataB64, name }) => ({ mimeType, dataB64, ...(name ? { name } : {}) })),
+        );
+        setImages([]);
+      } else {
+        conn.inputText(sid, t + "\r");
+      }
       setDraft("");
     },
-    [conn, sid, isStructured],
+    [conn, sid, isStructured, images],
   );
+
+  const attach = (): void => {
+    const room = MAX_IMAGES - images.length;
+    if (room <= 0) {
+      Alert.alert("最多 6 张", "先移除几张再添加。");
+      return;
+    }
+    Alert.alert("添加图片", undefined, [
+      { text: "从相册选", onPress: () => void pickFromLibrary(room).then((p) => setImages((v) => [...v, ...p])) },
+      { text: "拍一张", onPress: () => void pickFromCamera().then((p) => setImages((v) => [...v, ...p])) },
+      { text: "取消", style: "cancel" },
+    ]);
+  };
 
   const confirmKill = (): void => {
     if (!conn || !sid) return;
@@ -297,7 +324,29 @@ export default function SessionScreen() {
 
       {isChat && commandHints.length === 0 && <QuickReplies busy={busy} onPick={send} />}
 
+      {images.length > 0 && (
+        <ScrollView horizontal style={styles.thumbs} contentContainerStyle={styles.thumbsRow}>
+          {images.map((img, i) => (
+            <View key={img.uri} style={styles.thumbWrap}>
+              <Image source={{ uri: img.uri }} style={styles.thumb} />
+              <Pressable
+                style={styles.thumbX}
+                hitSlop={6}
+                onPress={() => setImages((v) => v.filter((_, j) => j !== i))}
+              >
+                <Text style={styles.thumbXText}>×</Text>
+              </Pressable>
+            </View>
+          ))}
+        </ScrollView>
+      )}
+
       <View style={styles.composer}>
+        {isChat && (
+          <Pressable style={styles.attachBtn} onPress={attach} hitSlop={6}>
+            <Icon name="doc.on.doc" size={17} color="#7aa2f7" />
+          </Pressable>
+        )}
         <TextInput
           style={[styles.input, isChat && styles.inputChat]}
           placeholder={isChat ? `给 ${session?.agent ?? "agent"} 发消息…` : "输入后发送(自动回车)"}
@@ -312,9 +361,12 @@ export default function SessionScreen() {
           multiline={isChat}
         />
         <Pressable
-          style={[styles.sendBtn, draft.trim().length === 0 && styles.sendBtnDim]}
+          style={[
+            styles.sendBtn,
+            draft.trim().length === 0 && images.length === 0 && styles.sendBtnDim,
+          ]}
           onPress={() => send(draft)}
-          disabled={draft.trim().length === 0}
+          disabled={draft.trim().length === 0 && images.length === 0}
         >
           <Icon name="arrow.up" size={17} color="#fff" weight="semibold" />
         </Pressable>
@@ -323,8 +375,28 @@ export default function SessionScreen() {
   );
 }
 
+/** 与协议里的上限一致 */
+const MAX_IMAGES = 6;
+
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#0b0b0e" },
+  thumbs: { flexGrow: 0, backgroundColor: "#141419" },
+  thumbsRow: { gap: 8, paddingHorizontal: 12, paddingVertical: 8 },
+  thumbWrap: { width: 56, height: 56 },
+  thumb: { width: 56, height: 56, borderRadius: 8, backgroundColor: "#26262e" },
+  thumbX: {
+    position: "absolute",
+    top: -5,
+    right: -5,
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    backgroundColor: "#2a2a33",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  thumbXText: { color: "#e8e8ee", fontSize: 13, lineHeight: 15 },
+  attachBtn: { paddingHorizontal: 6, paddingVertical: 10 },
   center: { flex: 1, alignItems: "center", justifyContent: "center" },
   dim: { color: "#5a5a66" },
   headerTitle: { alignItems: "center", maxWidth: 220 },

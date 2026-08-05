@@ -126,11 +126,30 @@ export const C2SSessionCreateSchema = z.object({
   rows,
 });
 
-/** 结构化轨:发送一条用户消息 */
+/**
+ * 消息附件(目前只有图片)。
+ *
+ * mime 限定在 Claude 接受的四种 —— iOS 相册常给 HEIC,客户端必须先转,
+ * 与其让 daemon 收下再拒,不如在协议层就说清楚。
+ * 单张 6MB(base64 后约 8MB),够一张压过的照片,又不至于让一条 WS 消息失控。
+ */
+export const AttachmentSchema = z.object({
+  mimeType: z.enum(["image/jpeg", "image/png", "image/gif", "image/webp"]),
+  dataB64: z.string().max(8 * 1024 * 1024),
+  name: z.string().max(200).optional(),
+});
+
+/**
+ * 结构化轨:发送一条用户消息。
+ *
+ * text 不再要求非空 —— 只发一张报错截图是完全合理的。但"既没字也没图"
+ * 依然无意义,所以约束从"文本非空"改成"至少得有点内容"。
+ */
 export const C2SChatSendSchema = z.object({
   type: z.literal("chat.send"),
   sid,
-  text: z.string().min(1),
+  text: z.string(),
+  attachments: z.array(AttachmentSchema).max(6).optional(),
 });
 
 /** 按需拉取某次工具调用的完整输出(卡片展开时) */
@@ -683,6 +702,7 @@ export type C2STermResize = z.infer<typeof C2STermResizeSchema>;
 export type C2STermAck = z.infer<typeof C2STermAckSchema>;
 export type C2SPermissionRespond = z.infer<typeof C2SPermissionRespondSchema>;
 export type C2SMessage = z.infer<typeof C2SMessageSchema>;
+export type Attachment = z.infer<typeof AttachmentSchema>;
 export type FsEntry = z.infer<typeof FsEntrySchema>;
 export type GitFile = z.infer<typeof GitFileSchema>;
 export type ChatRole = z.infer<typeof ChatRoleSchema>;
@@ -715,6 +735,16 @@ export function parseC2S(v: unknown): C2SMessage {
   const r = C2SMessageSchema.safeParse(v);
   if (!r.success) {
     throw new ProtocolError(`bad C2S message: ${summarizeZodError(r.error)}`, "format");
+  }
+  // "文本或附件至少有一样"这条跨字段约束不能写成 .refine —— 那会把成员变成
+  // ZodEffects,而 discriminatedUnion 只接受纯对象(整个联合会塌成 never)。
+  // 所以放在这里,仍然只有协议层一处实现。
+  if (
+    r.data.type === "chat.send" &&
+    r.data.text.trim().length === 0 &&
+    (r.data.attachments?.length ?? 0) === 0
+  ) {
+    throw new ProtocolError("chat.send needs text or at least one attachment", "format");
   }
   return r.data;
 }
