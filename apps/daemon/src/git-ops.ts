@@ -137,6 +137,45 @@ export async function status(cwd: string): Promise<GitStatus> {
   };
 }
 
+/**
+ * 把 `git diff` 的原始输出裁成协议约定的「补丁正文」。
+ *
+ * 客户端的 DiffView 按"首字符即符号"渲染,所以 `diff --git` / `index` /
+ * `---` / `+++` 这些头部行会被削掉第一个字符变成乱码,而 `---`/`+++`
+ * 还会被误染成删除/新增。hunk 头换成裸 `@@`,那是 DiffView 认的折叠标记。
+ */
+function toPatchBody(raw: string): string {
+  const out: string[] = [];
+  for (const line of raw.split("\n")) {
+    if (
+      line.startsWith("diff --git") ||
+      line.startsWith("index ") ||
+      line.startsWith("--- ") ||
+      line.startsWith("+++ ") ||
+      line.startsWith("new file mode") ||
+      line.startsWith("deleted file mode") ||
+      line.startsWith("old mode") ||
+      line.startsWith("new mode") ||
+      line.startsWith("similarity index") ||
+      line.startsWith("rename from") ||
+      line.startsWith("rename to")
+    ) {
+      continue;
+    }
+    if (line.startsWith("@@")) {
+      // 只在中间出现时才需要折叠标记;开头那个是多余的
+      if (out.length > 0) out.push("@@");
+      continue;
+    }
+    if (line.startsWith("Binary files")) {
+      out.push(" (二进制文件,无法显示差异)");
+      continue;
+    }
+    if (line.length > 0) out.push(line);
+  }
+  return out.join("\n");
+}
+
 /** 单个文件的 diff。staged 为 true 时看暂存区与 HEAD 的差异。 */
 export async function diff(cwd: string, rel: string, staged: boolean): Promise<string> {
   await resolveWithin(cwd, rel); // 根约束;越界直接抛
@@ -144,13 +183,15 @@ export async function diff(cwd: string, rel: string, staged: boolean): Promise<s
   if (staged) args.push("--cached");
   args.push("--", rel);
   const out = await git(cwd, args);
-  if (out.trim().length > 0) return out;
+  if (out.trim().length > 0) return toPatchBody(out);
 
   // 未跟踪文件没有 diff,构造一个"全是新增"的视图,否则点开是空白
   if (!staged) {
     const untracked = await git(cwd, ["ls-files", "--others", "--exclude-standard", "-z", "--", rel]);
     if (untracked.split("\0").some((p) => p === rel)) {
-      return await gitTolerant(cwd, ["diff", "--no-index", "--no-color", "--", "/dev/null", rel]);
+      return toPatchBody(
+        await gitTolerant(cwd, ["diff", "--no-index", "--no-color", "--", "/dev/null", rel]),
+      );
     }
   }
   return "";

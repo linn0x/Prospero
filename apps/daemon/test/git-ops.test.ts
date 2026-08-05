@@ -126,6 +126,37 @@ describe("diff", () => {
   });
 });
 
+describe("补丁正文格式", () => {
+  it("剥掉 git 头部行 —— 否则客户端按首字符取符号会把它们削成乱码", async () => {
+    const dir = repo();
+    writeFileSync(path.join(dir, "README.md"), "# hello\nmore\n");
+    const patch = await diff(dir, "README.md", false);
+    for (const line of patch.split("\n")) {
+      expect(line.startsWith("diff --git")).toBe(false);
+      expect(line.startsWith("index ")).toBe(false);
+      expect(line.startsWith("--- ")).toBe(false);
+      expect(line.startsWith("+++ ")).toBe(false);
+    }
+  });
+
+  it("每一行的首字符都是 ' ' / '+' / '-',或是折叠标记 @@", async () => {
+    const dir = repo();
+    writeFileSync(path.join(dir, "README.md"), "# hello\nmore\n");
+    const patch = await diff(dir, "README.md", false);
+    expect(patch.length).toBeGreaterThan(0);
+    for (const line of patch.split("\n")) {
+      if (line === "@@") continue;
+      expect([" ", "+", "-"]).toContain(line.charAt(0));
+    }
+  });
+
+  it("开头不留多余的折叠标记", async () => {
+    const dir = repo();
+    writeFileSync(path.join(dir, "README.md"), "# hello\nmore\n");
+    expect((await diff(dir, "README.md", false)).startsWith("@@")).toBe(false);
+  });
+});
+
 describe("丢弃", () => {
   it("恢复单个文件的工作区改动", async () => {
     const dir = repo();

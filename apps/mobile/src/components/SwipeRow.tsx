@@ -82,7 +82,8 @@ export function SwipeRow({
 const styles = StyleSheet.create({
   actions: { flexDirection: "row", alignItems: "stretch" },
   action: {
-    width: 78,
+    // 窄一点:一行三个操作时,行内容还得留得下标题
+    width: 68,
     alignItems: "center",
     justifyContent: "center",
     gap: 4,

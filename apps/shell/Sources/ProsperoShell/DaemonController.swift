@@ -66,13 +66,15 @@ final class DaemonController {
   /// daemon 在跑就广播,停了就撤。端口以 status.json 里的实际值为准。
   private func syncBonjour() {
     let port = running?.port ?? status.port
-    let alive = running != nil || {
+    // 只在【壳自己启动】daemon 时广播 —— 那种情况我们传了 --no-bonjour,
+    // daemon 不会自己播。别人在终端里起的 daemon 会自己广播,壳再播一次
+    // 会让同一台 Mac 在配对页出现两次(模拟器上实测到了)。
+    let shellManaged: Bool = {
       if case .running = state { return true }
-      if case .externallyRunning = state { return true }
       return false
     }()
 
-    if alive {
+    if shellManaged {
       if !bonjour.isPublished {
         bonjour.start(port: port, name: "Prospero @ \(Host.current().localizedName ?? "Mac")")
       }
