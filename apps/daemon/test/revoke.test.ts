@@ -2,7 +2,13 @@ import { mkdtempSync, rmSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { authenticate, loadDevices, mintDevice, revokeDevices } from "../src/pairing.js";
+import {
+  authenticate,
+  loadDevices,
+  mintDevice,
+  revokeDevices,
+  type AuthFailure,
+} from "../src/pairing.js";
 
 const temps: string[] = [];
 function tempHome(): string {
@@ -71,5 +77,22 @@ describe("设备撤销", () => {
     const mode = statSync(path.join(home, "devices.json")).mode & 0o777;
     expect(mode).toBe(0o600);
   });
-});
 
+  it("拒绝时能说出到底是哪一种失败 —— 两种的处理方式完全不同", () => {
+    // 手机上只会看到一句模糊的"配对已失效",Mac 这边必须留下能定位的痕迹:
+    // token 不认识是配对码过期,公钥不符是重装或 token 泄漏
+    const home = tempHome();
+    const d = mintDevice(home, { name: "reason", allowShell: false });
+    const seen: AuthFailure[] = [];
+    const fail = (r: AuthFailure): void => { seen.push(r); };
+
+    authenticate(home, { type: "hello", token: "nope", clientPubKey, clientInfo }, fail);
+    expect(seen).toEqual(["unknown_token"]);
+
+    // 先正常连一次完成 TOFU 绑定,再换一把公钥来
+    expect(authenticate(home, { type: "hello", token: d.token, clientPubKey, clientInfo })).not.toBeNull();
+    const other = "B".repeat(43) + "=";
+    authenticate(home, { type: "hello", token: d.token, clientPubKey: other, clientInfo }, fail);
+    expect(seen).toEqual(["unknown_token", "key_mismatch"]);
+  });
+});
