@@ -241,7 +241,7 @@ export default function HostScreen() {
         }
         ListFooterComponent={
           all.length > 0 ? (
-            <Text style={styles.swipeHint}>左滑会话可看改动 / 文件、中断或结束</Text>
+            <Text style={styles.swipeHint}>左滑会话可看改动 / 文件或结束</Text>
           ) : null
         }
         renderItem={({ item }) => {
@@ -263,15 +263,8 @@ export default function HostScreen() {
               onPress: () => router.push(`/host/${hostId}/files/${item.id}`),
             },
           ];
-          // 还在跑的先给"中断"—— 多数时候用户只是想停掉当前这一轮,而不是丢掉整个会话
-          if (!done) {
-            actions.push({
-              label: "中断",
-              symbol: "stop.circle",
-              color: "#d9a441",
-              onPress: () => conn?.interrupt(item.id),
-            });
-          }
+          // 中断不放这里:会话页头部在忙时已有停止按钮,而一行塞四个操作
+          // 会把标题整个挤没(402pt 宽放不下 4×78pt,模拟器上实测到了)。
           actions.push({
             label: done ? "移除" : "结束",
             symbol: "trash",
