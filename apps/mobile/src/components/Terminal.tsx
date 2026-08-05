@@ -17,6 +17,8 @@ interface Props {
 export interface TerminalHandle {
   setFontSize(size: number): void;
   scrollToBottom(): void;
+  /** 收起键盘 */
+  blur(): void;
 }
 
 interface BridgeUp {
@@ -151,6 +153,7 @@ export const Terminal = forwardRef<TerminalHandle, Props>(function Terminal(
   useImperativeHandle(ref, () => ({
     setFontSize: (size: number) => rx({ kind: "font", size }),
     scrollToBottom: () => rx({ kind: "scrollBottom" }),
+    blur: () => rx({ kind: "blur" }),
   }), [rx]);
 
   return (
@@ -161,7 +164,8 @@ export const Terminal = forwardRef<TerminalHandle, Props>(function Terminal(
         onMessage={onMessage}
         style={styles.web}
         keyboardDisplayRequiresUserAction={false}
-        hideKeyboardAccessoryView
+        // 不要 hideKeyboardAccessoryView:那条系统辅助栏上有「完成」和听写入口,
+        // 隐藏它省下的一点高度,代价是键盘收不起来、也没法语音输入
         setSupportMultipleWindows={false}
         allowsLinkPreview={false}
         webviewDebuggingEnabled

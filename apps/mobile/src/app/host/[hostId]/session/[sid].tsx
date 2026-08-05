@@ -274,6 +274,7 @@ export default function SessionScreen() {
                 termRef.current?.setFontSize(next);
               }}
               onScrollBottom={() => termRef.current?.scrollToBottom()}
+              onDismissKeyboard={() => termRef.current?.blur()}
             />
           )}
         </>
