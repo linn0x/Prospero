@@ -448,6 +448,10 @@ export async function createDaemonServer(
         await manager.kill(msg.sid);
         return;
 
+      case "approval.policy.set":
+        manager.setApprovalPolicy(msg.sid, msg.policy);
+        return;
+
       case "fs.list":
       case "fs.read":
       case "fs.write":
