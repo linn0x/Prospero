@@ -12,6 +12,7 @@ import { Icon } from "@/components/Icon";
 import { SwipeRow } from "@/components/SwipeRow";
 import { getHosts, removeHost, type StoredHost } from "@/lib/hosts";
 import { useApp, type ConnStatus } from "@/lib/store";
+import { color, font, radius, space, statusColor } from "@/lib/theme";
 
 const statusLabel: Record<ConnStatus, string> = {
   idle: "未连接",
@@ -21,13 +22,7 @@ const statusLabel: Record<ConnStatus, string> = {
   failed: "连接失败",
 };
 
-const statusColor: Record<ConnStatus, string> = {
-  idle: "#5a5a66",
-  connecting: "#d9a441",
-  reconnecting: "#d9a441",
-  connected: "#4dbd74",
-  failed: "#e5534b",
-};
+
 
 export default function HostsScreen() {
   const [hosts, setLocal] = useState<StoredHost[]>([]);
@@ -62,19 +57,19 @@ export default function HostsScreen() {
           // 强行开启会给内容加上大幅内边距,把列表整个推出可视区(实测白屏)。
           headerRight: () => (
             <Pressable onPress={() => router.push("/pair")} hitSlop={8}>
-              <Icon name="qrcode.viewfinder" size={21} color="#7aa2f7" />
+              <Icon name="qrcode.viewfinder" size={21} color={color.accent} />
             </Pressable>
           ),
         }}
       />
       {hosts.length === 0 ? (
-        <View style={styles.empty}>
-          <Icon name="desktopcomputer" size={52} color="#3a3a46" />
+        <View style={styles.emptyWrap}>
+          <Icon name="desktopcomputer" size={52} color={color.textFaint} />
           <Text style={styles.emptyTitle}>还没有配对的 Mac</Text>
           <Text style={styles.emptyText}>在 Mac 上运行 prosperod 并生成配对码:</Text>
           <Text style={styles.code}>prosperod start{"\n"}prosperod pair</Text>
-          <Pressable style={styles.primaryBtn} onPress={() => router.push("/pair")}>
-            <Text style={styles.primaryBtnText}>扫码配对</Text>
+          <Pressable style={styles.cta} onPress={() => router.push("/pair")}>
+            <Text style={styles.ctaText}>扫码配对</Text>
           </Pressable>
         </View>
       ) : (
@@ -134,46 +129,40 @@ export default function HostsScreen() {
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1 },
-  link: { color: "#7aa2f7", fontSize: 16 },
-  empty: { flex: 1, alignItems: "center", justifyContent: "center", padding: 32, gap: 12 },
-  emptyTitle: { color: "#e8e8ee", fontSize: 20, fontWeight: "600" },
-  emptyText: { color: "#9a9aa6", fontSize: 14, textAlign: "center" },
-  code: {
-    color: "#b7c7ff",
-    fontFamily: "Menlo",
-    fontSize: 13,
-    backgroundColor: "#17171d",
-    padding: 12,
-    borderRadius: 8,
-    overflow: "hidden",
-  },
-  primaryBtn: {
-    marginTop: 12,
-    backgroundColor: "#3557b7",
-    paddingHorizontal: 24,
-    paddingVertical: 12,
-    borderRadius: 10,
-  },
-  primaryBtnText: { color: "#fff", fontSize: 16, fontWeight: "600" },
-  list: { padding: 12, gap: 10 },
+  container: { flex: 1, backgroundColor: color.bg },
+  list: { padding: space.lg, gap: space.md },
   card: {
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#17171d",
-    borderRadius: 12,
-    padding: 14,
-    gap: 12,
+    gap: space.md,
+    backgroundColor: color.surface,
+    borderRadius: radius.md,
+    paddingHorizontal: space.lg,
+    paddingVertical: space.lg,
   },
-  cardPressed: { backgroundColor: "#1f1f27" },
-  dot: { width: 10, height: 10, borderRadius: 5 },
-  cardBody: { flex: 1, gap: 2 },
-  cardTitle: { color: "#e8e8ee", fontSize: 16, fontWeight: "600" },
-  swipeHint: {
-    color: "#5a5a66",
-    fontSize: 11,
-    textAlign: "center",
-    paddingVertical: 14,
+  cardPressed: { backgroundColor: color.pressed },
+  dot: { width: 9, height: 9, borderRadius: 5 },
+  cardBody: { flex: 1, gap: 3 },
+  cardTitle: { ...font.body, fontSize: 16 },
+  cardSub: font.sub,
+  swipeHint: { ...font.meta, textAlign: "center", paddingVertical: space.lg },
+  emptyWrap: { flex: 1, alignItems: "center", justifyContent: "center", padding: space.xl, gap: space.md },
+  emptyTitle: { ...font.title, textAlign: "center" },
+  emptyText: { ...font.sub, textAlign: "center", lineHeight: 20 },
+  code: {
+    ...font.mono,
+    color: color.textDim,
+    backgroundColor: color.surfaceRaised,
+    borderRadius: radius.sm,
+    padding: space.md,
+    overflow: "hidden",
   },
-  cardSub: { color: "#8a8a96", fontSize: 12 },
+  cta: {
+    backgroundColor: color.accentDim,
+    borderRadius: radius.md,
+    paddingHorizontal: space.xl,
+    paddingVertical: space.md,
+    marginTop: space.sm,
+  },
+  ctaText: { color: color.text, fontSize: 15, fontWeight: "600" },
 });
