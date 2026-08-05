@@ -82,3 +82,65 @@ describeIf("Codex 结构化会话", () => {
     expect(info.status).toBe("idle");
   }, 120_000);
 });
+
+/**
+ * 用官方 schema(codex app-server generate-ts)里的真实形状喂事件,不依赖 codex 是否安装。
+ *
+ * 之前用量按 `turn/completed` 的 `params.usage` 读 —— 而那条通知的形状是
+ * { threadId, turn },根本没有 usage 字段。结果 codex 的 token 永远是 0,
+ * 界面上表现为"没有用量"。这类"猜字段名"的错误此前在 Grok 适配器上也发生过一次。
+ */
+describe("Codex 用量与限流(桩数据)", () => {
+  function feed(lines: object[]): CodexAdapter {
+    const a = new CodexAdapter();
+    const anyA = a as unknown as { onNotification(m: Record<string, unknown>): void };
+    for (const l of lines) anyA.onNotification(l as Record<string, unknown>);
+    return a;
+  }
+
+  it("从 thread/tokenUsage/updated 读 token,而不是 turn/completed", async () => {
+    const a = feed([
+      {
+        method: "thread/tokenUsage/updated",
+        params: {
+          threadId: "t1",
+          turnId: "u1",
+          tokenUsage: {
+            last: { inputTokens: 100, outputTokens: 20 },
+            total: { inputTokens: 14892, outputTokens: 6 },
+            modelContextWindow: 272000,
+          },
+        },
+      },
+    ]);
+    const r = await a.usage();
+    expect(r?.inputTokens).toBe(14892);
+    expect(r?.outputTokens).toBe(6);
+  });
+
+  it("account/rateLimits/updated 转成窗口,时长说成人话", async () => {
+    const a = feed([
+      {
+        method: "account/rateLimits/updated",
+        params: {
+          rateLimits: {
+            planType: "plus",
+            primary: { usedPercent: 42.5, windowDurationMins: 300, resetsAt: 1785900000 },
+            secondary: { usedPercent: 8, windowDurationMins: 10080, resetsAt: null },
+          },
+        },
+      },
+    ]);
+    const r = await a.usage();
+    expect(r?.subscription).toBe("plus");
+    expect(r?.windows.map((w) => w.label)).toEqual(["5 小时", "7 天"]);
+    expect(r?.windows[0]?.utilization).toBeCloseTo(42.5);
+    // resetsAt 是秒级时间戳,要转成 ISO
+    expect(r?.windows[0]?.resetsAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(r?.windows[1]?.resetsAt).toBeUndefined();
+  });
+
+  it("什么都没收到时返回 null,而不是编一个空报告", async () => {
+    expect(await feed([]).usage()).toBeNull();
+  });
+});
