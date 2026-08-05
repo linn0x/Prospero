@@ -63,9 +63,46 @@ async function startClaudeSession(
   return s;
 }
 
+/**
+ * 持续应答所有待处理的审批,直到 done() 成立。
+ *
+ * 只应答第一条是不够的:模型写完文件后可能再读一次确认,那会产生第二条
+ * 审批请求。没人应答时 SDK 会一直等下去,turn 永远不结束 —— 表现就是
+ * 间歇性超时(约六次一遇),而且和代码改动无关。产品行为没错,
+ * 真实用户也会被再问一次;错的是测试假设"只会问一次"。
+ */
+async function approveAll(
+  session: StructuredSession,
+  events: AgentEventBody[],
+  done: () => boolean,
+  timeoutMs = 120_000,
+): Promise<void> {
+  const answered = new Set<string>();
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (done()) return;
+    for (const e of events) {
+      if (e.kind !== "permission.request" || answered.has(e.reqId)) continue;
+      answered.add(e.reqId);
+      await session.respondPermission(e.reqId, "once");
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  throw new Error(
+    `超时;已到达:${events.map((e) => e.kind).join(" → ") || "(无)"}`,
+  );
+}
+
+/**
+ * @param seen 超时时把已到达的事件一并报出来。
+ *   这些用例跑的是真实模型,失败时只说"超时等 turn.end"根本无从判断是
+ *   模型没结束、适配器没转发、还是压根卡在另一条待审批上 —— 每次都得
+ *   重新加日志复现一遍。
+ */
 async function waitFor(
   pred: () => boolean,
   what: string,
+  seen?: () => AgentEventBody[],
   timeoutMs = 120_000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -73,7 +110,10 @@ async function waitFor(
     if (pred()) return;
     await new Promise((r) => setTimeout(r, 200));
   }
-  throw new Error(`超时等待:${what}`);
+  const trace = seen
+    ? `;已到达:${seen().map((e) => e.kind).join(" → ") || "(无)"}`
+    : "";
+  throw new Error(`超时等待:${what}${trace}`);
 }
 
 describeIf("Claude Code 结构化会话", () => {
@@ -121,6 +161,7 @@ describeIf("Claude Code 结构化会话", () => {
     await waitFor(
       () => events.some((e) => e.kind === "permission.request"),
       "permission.request",
+      () => events,
     );
     const req = events.find(
       (e): e is Extract<AgentEventBody, { kind: "permission.request" }> =>
@@ -138,6 +179,7 @@ describeIf("Claude Code 结构化会话", () => {
     await waitFor(
       () => events.some((e) => e.kind === "permission.resolved"),
       "permission.resolved",
+      () => events,
     );
     expect(session.info().pendingPermissions).toBe(0);
 
@@ -149,7 +191,7 @@ describeIf("Claude Code 结构化会话", () => {
         ),
       "tool.end(failed)",
     );
-    await waitFor(() => events.some((e) => e.kind === "turn.end"), "turn.end after reject");
+    await waitFor(() => events.some((e) => e.kind === "turn.end"), "turn.end after reject", () => events);
     expect(existsSync(path.join(cwd, "denied.txt"))).toBe(false);
   }, 180_000);
 
@@ -163,18 +205,12 @@ describeIf("Claude Code 结构化会话", () => {
     await waitFor(
       () => events.some((e) => e.kind === "permission.request"),
       "permission.request",
+      () => events,
     );
-    const req = events.find(
-      (e): e is Extract<AgentEventBody, { kind: "permission.request" }> =>
-        e.kind === "permission.request",
-    )!;
-    await session.respondPermission(req.reqId, "once");
+    // 批准每一条送上来的审批,直到这一轮结束
+    await approveAll(session, events, () => events.some((e) => e.kind === "turn.end"));
 
-    await waitFor(
-      () => events.some((e) => e.kind === "tool.end" && e.state === "success"),
-      "tool.end(success)",
-    );
-    await waitFor(() => events.some((e) => e.kind === "turn.end"), "turn.end");
+    expect(events.some((e) => e.kind === "tool.end" && e.state === "success")).toBe(true);
     expect(readFileSync(path.join(cwd, "approved.txt"), "utf8")).toContain("PROSPERO");
   }, 180_000);
 });
