@@ -84,7 +84,7 @@ export default function HostsScreen() {
           contentContainerStyle={styles.list}
           ListFooterComponent={
             hosts.length > 0 ? (
-              <Text style={styles.swipeHint}>左滑主机可删除配对</Text>
+              <Text style={styles.swipeHint}>左滑可编辑连接地址或删除配对</Text>
             ) : null
           }
           renderItem={({ item }) => {
@@ -92,6 +92,12 @@ export default function HostsScreen() {
             return (
               <SwipeRow
                 actions={[
+                  {
+                    label: "编辑",
+                    symbol: "desktopcomputer",
+                    color: "#3a6ea5",
+                    onPress: () => router.push(`/host/${item.id}/edit`),
+                  },
                   {
                     label: "删除",
                     symbol: "trash",

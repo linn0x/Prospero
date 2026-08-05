@@ -12,6 +12,8 @@ import { TERMINAL_HTML } from "./terminal-html";
 interface Props {
   conn: HostConnection;
   sid: string;
+  /** 捏合缩放后回报,让 A+/A− 的基准与终端保持一致 */
+  onFontSize?: (size: number) => void;
 }
 
 export interface TerminalHandle {
@@ -22,17 +24,18 @@ export interface TerminalHandle {
 }
 
 interface BridgeUp {
-  kind: "ready" | "resized" | "input" | "perf";
+  kind: "ready" | "resized" | "input" | "perf" | "fontSize";
   renderer?: string;
   cols?: number;
   rows?: number;
   data?: string;
   fps?: number;
   kb?: number;
+  size?: number;
 }
 
 export const Terminal = forwardRef<TerminalHandle, Props>(function Terminal(
-  { conn, sid },
+  { conn, sid, onFontSize },
   ref,
 ) {
   const webRef = useRef<WebView>(null);
@@ -139,6 +142,9 @@ export const Terminal = forwardRef<TerminalHandle, Props>(function Terminal(
         case "input":
           if (typeof msg.data === "string") conn.inputB64(sid, msg.data);
           break;
+        case "fontSize":
+          if (typeof msg.size === "number") onFontSize?.(msg.size);
+          break;
         case "perf":
           // W4 spike:Metro 控制台可直接观测洪峰时的渲染帧率与吞吐
           console.log(
@@ -147,7 +153,7 @@ export const Terminal = forwardRef<TerminalHandle, Props>(function Terminal(
           break;
       }
     },
-    [conn, sid, tryAttach, rx],
+    [conn, sid, tryAttach, rx, onFontSize],
   );
 
   useImperativeHandle(ref, () => ({
