@@ -21,6 +21,7 @@ import {
   ProtocolError,
   type AgentKind,
   type ApprovalPolicy,
+  type Attachment,
   type C2SMessage,
   type KeyPairB64,
   type PermissionReply,
@@ -668,10 +669,6 @@ export class HostConnection {
     this.send({ type: "session.attach", sid, ...(lastSeq !== undefined ? { lastSeq } : {}) });
   }
 
-  chatSend(sid: string, text: string): void {
-    this.send({ type: "chat.send", sid, text }, true);
-  }
-
   /** 拉取某次工具调用的完整输出(卡片展开时) */
   getToolOutput(sid: string, callId: string): void {
     this.send({ type: "tool.output.get", sid, callId });
@@ -699,6 +696,13 @@ export class HostConnection {
 
   interrupt(sid: string): void {
     this.send({ type: "session.interrupt", sid }, true);
+  }
+
+  chatSend(sid: string, text: string, attachments?: Attachment[]): void {
+    this.send(
+      { type: "chat.send", sid, text, ...(attachments?.length ? { attachments } : {}) },
+      true,
+    );
   }
 
   setApprovalPolicy(sid: string, policy: ApprovalPolicy): void {

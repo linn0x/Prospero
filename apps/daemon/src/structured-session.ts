@@ -5,9 +5,12 @@
  */
 import { EventEmitter } from "node:events";
 import path from "node:path";
+import { mkdir, writeFile } from "node:fs/promises";
 import { DEFAULT_POLICY } from "./approval-policy.js";
+import { prosperoHome } from "./pairing.js";
 import type {
   ApprovalPolicy,
+  Attachment,
   AgentEventBody,
   AgentKind,
   PermissionReply,
@@ -196,12 +199,50 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     this.emit("state", this.info());
   }
 
-  async send(text: string): Promise<void> {
+  async send(text: string, attachments?: Attachment[]): Promise<void> {
+    let outgoing = text;
+    let forAdapter = attachments;
+
+    if (attachments && attachments.length > 0 && this.adapter.acceptsImages !== true) {
+      // 后端吃不了图就落盘,把绝对路径并进文本 —— 有读文件能力的 agent
+      // 照样能看到内容。写进 ~/.prospero 而不是仓库里:附件是会话产物,
+      // 不该出现在用户的 git status 里。
+      const paths = await this.persistAttachments(attachments);
+      outgoing = [text, ...paths.map((p) => `[附件] ${p}`)].filter((x) => x.length > 0).join("\n");
+      forAdapter = undefined;
+    }
+
     // 用户消息本地登记,保证 attach 快照里能看到自己发过什么
-    this.record({ kind: "user.message", msgId: `u_${String(this.evSeq + 1)}`, text });
+    const label =
+      attachments && attachments.length > 0
+        ? `${text}${text.length > 0 ? " " : ""}[${String(attachments.length)} 张图]`
+        : text;
+    this.record({ kind: "user.message", msgId: `u_${String(this.evSeq + 1)}`, text: label });
     this.busySince = Date.now(); // 新一轮开始重新计时
     this.setStatus("running");
-    await this.adapter.send(text);
+    await this.adapter.send(outgoing, forAdapter);
+  }
+
+  /** 把附件写进 ~/.prospero/attachments/<sid>/,返回绝对路径 */
+  private async persistAttachments(attachments: Attachment[]): Promise<string[]> {
+    const dir = path.join(prosperoHome(), "attachments", this.id);
+    await mkdir(dir, { recursive: true });
+    const out: string[] = [];
+    for (let i = 0; i < attachments.length; i++) {
+      const a = attachments[i];
+      if (!a) continue;
+      const ext = a.mimeType.split("/")[1] ?? "png";
+      // 先去掉一切非 [字母数字._-],再把连续的点压成一个下划线。
+      // 只做前一步的话 "../../evil" 会变成 ".._.._evil" —— 逃不出目录(路径
+      // 分隔符已经没了),但文件名里挂着 ".." 只会让人怀疑到底安不安全。
+      const safe = (a.name ?? `image-${String(i + 1)}`)
+        .replace(/[^\w.-]/g, "_")
+        .replace(/\.{2,}/g, "_");
+      const file = path.join(dir, `${String(Date.now())}-${safe}.${ext}`);
+      await writeFile(file, Buffer.from(a.dataB64, "base64"));
+      out.push(file);
+    }
+    return out;
   }
 
   async respondPermission(reqId: string, reply: PermissionReply): Promise<void> {
