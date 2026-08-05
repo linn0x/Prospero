@@ -17,6 +17,7 @@ import { Stack, useLocalSearchParams } from "expo-router";
 import * as Haptics from "expo-haptics";
 import type { GitFile } from "@prospero/protocol";
 import { DiffView } from "@/components/DiffView";
+import { Icon } from "@/components/Icon";
 import { SwipeRow, type SwipeAction } from "@/components/SwipeRow";
 import { toast } from "@/components/Toast";
 import { useHostConnection } from "@/lib/use-host-connection";
@@ -136,7 +137,7 @@ export default function GitScreen(): React.ReactElement {
   if (notRepo) {
     return (
       <View style={styles.screen}>
-        <Stack.Screen options={{ title: "源代码管理" }} />
+        <Stack.Screen options={{ title: "源代码管理", headerBackTitle: "" }} />
         <Text style={styles.empty}>这个会话的目录不是 git 仓库。</Text>
       </View>
     );
@@ -151,7 +152,17 @@ export default function GitScreen(): React.ReactElement {
       behavior={Platform.OS === "ios" ? "padding" : undefined}
       keyboardVerticalOffset={Platform.OS === "ios" ? 88 : 0}
     >
-      <Stack.Screen options={{ title: branch ?? "源代码管理" }} />
+      <Stack.Screen
+        options={{
+          title: branch ?? "源代码管理",
+          headerBackTitle: "",
+          headerRight: () => (
+            <Pressable onPress={() => void refresh()} hitSlop={8} disabled={loading}>
+              <Icon name="arrow.clockwise" size={18} color={loading ? "#3a3a44" : "#7aa2f7"} />
+            </Pressable>
+          ),
+        }}
+      />
 
       <View style={styles.branchBar}>
         <Text style={styles.branch} numberOfLines={1}>

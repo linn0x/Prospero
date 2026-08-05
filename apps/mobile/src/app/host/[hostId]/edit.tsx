@@ -85,7 +85,7 @@ export default function EditHostScreen(): React.ReactElement {
       style={styles.screen}
       behavior={Platform.OS === "ios" ? "padding" : undefined}
     >
-      <Stack.Screen options={{ title: host.name }} />
+      <Stack.Screen options={{ title: host.name, headerBackButtonDisplayMode: "minimal" }} />
       <ScrollView contentContainerStyle={styles.body} keyboardShouldPersistTaps="handled">
         <Text style={styles.section}>连接地址</Text>
         <Text style={styles.note}>
