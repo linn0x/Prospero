@@ -93,8 +93,7 @@
     });
   })();
 
-  window.__rx = (jsonStr) => {
-    const m = JSON.parse(jsonStr);
+  function handle(m) {
     if (m.kind === "snapshot") {
       term.reset();
       if (m.cols && m.rows && (m.cols !== term.cols || m.rows !== term.rows)) {
@@ -108,10 +107,35 @@
       perfBytes += bytes.length;
     } else if (m.kind === "fit") {
       doFit();
+    } else if (m.kind === "font") {
+      term.options.fontSize = m.size;
+      doFit();
+    } else if (m.kind === "focus") {
+      term.focus();
+    } else if (m.kind === "scrollBottom") {
+      term.scrollToBottom();
     }
-  };
+  }
+
+  /**
+   * 入口:一次可以带多条消息(RN 侧把同一 tick 内到达的输出合并成一批)。
+   * 每次跨桥都有固定开销,洪峰时逐条过桥是纯浪费。
+   */
+  function receive(payload) {
+    const batch = JSON.parse(payload);
+    for (let i = 0; i < batch.length; i++) handle(batch[i]);
+  }
+
+  // 走 postMessage 而不是 injectJavaScript:后者要把数据 JSON 序列化两遍、
+  // 拼成一段 JS 源码、再由引擎 eval —— 输出流上这是每块都付一次的冤枉钱。
+  window.addEventListener("message", (e) => receive(e.data));
+  document.addEventListener("message", (e) => receive(e.data));
+  // 保留旧入口:RN 侧首帧仍可能用 injectJavaScript 兜底
+  window.__rx = (jsonStr) => handle(JSON.parse(jsonStr));
 
   new ResizeObserver(() => doFit()).observe(document.body);
+  // 点终端即取得焦点并唤起键盘 —— 否则要先点一下再等系统决定
+  document.getElementById("term").addEventListener("touchend", () => term.focus());
   window.addEventListener("load", () => {
     post({ kind: "ready", renderer });
     doFit();
