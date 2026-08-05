@@ -82,6 +82,29 @@ export async function addHostAddr(hostId: string, addr: string): Promise<void> {
   await saveHosts(hosts);
 }
 
+/**
+ * 删除一个候选地址。
+ * 允许删到空 —— 用户可能想只留 WireGuard 那一条,或者先清空再重填。
+ * 真删空了连接层会给出"没有可用地址"的诊断,不会静默失败。
+ */
+export async function removeHostAddr(hostId: string, addr: string): Promise<void> {
+  const hosts = await getHosts();
+  const h = hosts.find((x) => x.id === hostId);
+  if (!h) return;
+  h.addrs = h.addrs.filter((a) => a !== addr);
+  if (h.lastGoodAddr === addr) delete h.lastGoodAddr;
+  await saveHosts(hosts);
+}
+
+/** 改端口。换端口不该要求重新配对 —— token 和公钥都没变。 */
+export async function setHostPort(hostId: string, port: number): Promise<void> {
+  const hosts = await getHosts();
+  const h = hosts.find((x) => x.id === hostId);
+  if (!h) return;
+  h.port = port;
+  await saveHosts(hosts);
+}
+
 /** 设备身份密钥:首次生成后固定(daemon 侧 TOFU 绑定,换了会被拒) */
 export async function getDeviceKeys(): Promise<KeyPairB64> {
   const raw = await AsyncStorage.getItem(DEVICE_KEYS_KEY);

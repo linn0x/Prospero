@@ -140,6 +140,43 @@
   //
   // 必须区分"点"和"划":早先版本对任何 touchend 都 focus(),结果是收起键盘后
   // 一滚动就又被拉回来 —— 根本关不掉。只有位移很小、时长很短的才算点击。
+  /**
+   * 捏合缩放字号,吸附到预设档位。
+   *
+   * 吸附是刻意的:自由缩放会停在 11.3px 这种值上,等宽字体在非整数字号下
+   * 渲染发虚,而手机上本来就看得吃力。档位之间跳,每一档都清晰。
+   */
+  (function pinchZoom() {
+    const STEPS = [8, 9, 10, 11, 12, 14, 16, 18, 20];
+    const el = document.getElementById("term");
+    let base = 0, startSize = 12;
+    const dist = (t) => Math.hypot(
+      t[0].clientX - t[1].clientX,
+      t[0].clientY - t[1].clientY,
+    );
+    el.addEventListener("touchstart", (e) => {
+      if (e.touches.length !== 2) return;
+      base = dist(e.touches);
+      startSize = term.options.fontSize;
+    }, { passive: true });
+    el.addEventListener("touchmove", (e) => {
+      if (e.touches.length !== 2 || base === 0) return;
+      const target = startSize * (dist(e.touches) / base);
+      let best = STEPS[0];
+      for (const s of STEPS) {
+        if (Math.abs(s - target) < Math.abs(best - target)) best = s;
+      }
+      if (best !== term.options.fontSize) {
+        term.options.fontSize = best;
+        doFit();
+        post({ kind: "fontSize", size: best });
+      }
+    }, { passive: true });
+    el.addEventListener("touchend", (e) => {
+      if (e.touches.length < 2) base = 0;
+    }, { passive: true });
+  })();
+
   (function tapToFocus() {
     const el = document.getElementById("term");
     let sx = 0, sy = 0, st = 0, moved = false;
