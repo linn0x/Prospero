@@ -29,6 +29,7 @@ final class DaemonController {
 
   private var process: Process?
   private var refreshTimer: Timer?
+  private var restartRequested = false
   private let bonjour = BonjourAdvertiser()
   private var boundDeviceNames: Set<String> = []
 
@@ -36,9 +37,20 @@ final class DaemonController {
 
   init() {
     boundDeviceNames = Set(DaemonStatus.load().devices.filter(\.bound).map(\.name))
+    recentLog = Self.readLogTail(from: logURL)
     refresh()
-    refreshTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+    refreshTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
       Task { @MainActor in self?.refresh() }
+    }
+  }
+
+  func startIfNeeded() {
+    refresh()
+    switch state {
+    case .stopped, .failed:
+      start()
+    default:
+      break
     }
   }
 
@@ -92,12 +104,13 @@ final class DaemonController {
   }
 
   private func reallyStart() {
+    guard process == nil else { return }
     guard let node = Locator.findNode() else {
-      state = .failed("找不到 node。菜单里「选择 node…」手动指定。")
+      state = .failed("找不到 node。请在设置中确认 Node 路径。")
       return
     }
     guard let cli = Locator.findCLI() else {
-      state = .failed("找不到 apps/daemon/dist/cli.js。菜单里「选择 prosperod…」手动指定。")
+      state = .failed("找不到 apps/daemon/dist/cli.js。请在设置中确认 daemon 路径。")
       return
     }
 
@@ -107,7 +120,7 @@ final class DaemonController {
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: node)
     // 广播交给壳自己做(TCC 归属 app bundle),daemon 让位
-    proc.arguments = [cli, "start", "--no-bonjour"]
+    proc.arguments = [cli, "start", "--no-bonjour", "--tmux"]
     // 登录 shell 的 PATH 传下去,agent CLI(claude/codex/…)才找得到
     var env = ProcessInfo.processInfo.environment
     if let shellPath = Self.loginPath() { env["PATH"] = shellPath }
@@ -127,6 +140,11 @@ final class DaemonController {
       Task { @MainActor [weak self] in
         guard let self else { return }
         self.process = nil
+        if self.restartRequested {
+          self.restartRequested = false
+          self.reallyStart()
+          return
+        }
         // 正常停止走 stop(),那里已经把 state 置成 stopped 了
         if case .stopped = self.state { return }
         self.state = p.terminationStatus == 0
@@ -174,22 +192,61 @@ final class DaemonController {
 
   func stop() {
     bonjour.stop()
+    restartRequested = false
     guard let proc = process else {
       state = .stopped
       refresh()
       return
     }
     state = .stopped
-    // SIGTERM —— daemon 自己会收尾(停广播、关会话)
+    // SIGTERM —— daemon 会先落盘结构化会话,PTY 则留在 tmux 中。
     proc.terminate()
-    process = nil
   }
 
   func restart() {
-    stop()
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
-      self?.reallyStart()
+    guard let proc = process else {
+      reallyStart()
+      return
     }
+    restartRequested = true
+    state = .starting
+    bonjour.stop()
+    proc.terminate()
+  }
+
+  enum SessionAction: String {
+    case interrupt
+    case kill
+  }
+
+  /// 只通过 daemon 的本机控制接口管理会话；口令每次启动更换并只存在 0600 status.json。
+  func controlSession(id: String, action: SessionAction) async -> String? {
+    guard let running, !running.controlToken.isEmpty else {
+      return "daemon 尚未提供本机控制接口"
+    }
+    let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+    guard let url = URL(string: "http://127.0.0.1:\(running.port)/_prospero/control/session/\(encoded)/\(action.rawValue)") else {
+      return "无法构造控制地址"
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("Bearer \(running.controlToken)", forHTTPHeaderField: "Authorization")
+    do {
+      let (data, response) = try await URLSession.shared.data(for: request)
+      guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+        return String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+      }
+      try? await Task.sleep(for: .milliseconds(300))
+      refresh()
+      return nil
+    } catch {
+      return error.localizedDescription
+    }
+  }
+
+  func clearLog() {
+    recentLog.removeAll()
+    try? Data().write(to: logURL)
   }
 
   private func appendLog(_ text: String) {
@@ -205,6 +262,13 @@ final class DaemonController {
         try? data.write(to: logURL)
       }
     }
+  }
+
+  private nonisolated static func readLogTail(from url: URL) -> [String] {
+    guard let data = try? Data(contentsOf: url),
+          let text = String(data: data, encoding: .utf8)
+    else { return [] }
+    return Array(text.split(separator: "\n").suffix(400).map(String.init))
   }
 
   /// 登录 shell 的 PATH。GUI 进程的 PATH 极简,直接传给 daemon 会让它找不到各家 agent CLI。

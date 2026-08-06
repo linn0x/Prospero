@@ -10,9 +10,8 @@
  * - term.ack 用于背压:daemon 依据未确认字节数暂停 PTY 读取。
  */
 
-// v1:握手改为双方临时密钥,静态密钥只用于身份证明(前向保密)。
-// 与 v0 不兼容 —— 旧客户端会在版本校验处被拒,而不是悄悄降级。
-export const PROTOCOL_VERSION = 1;
+// v5:slash 控制不再冒充普通 Prompt；新增模型/模式、原生 compact 与结构化问答。
+export const PROTOCOL_VERSION = 5;
 
 export type {
   AgentKind,
@@ -26,6 +25,23 @@ export type {
   C2SWorkspaceList,
   C2SSessionAttach,
   C2SChatSend,
+  C2SChatQueueRemove,
+  C2SChatQueueGuide,
+  C2SChatComplete,
+  ChatDelivery,
+  ChatSuggestionKind,
+  ChatSuggestion,
+  QueuedChatMessage,
+  AgentModel,
+  AgentMode,
+  AgentControls,
+  SubagentStatus,
+  SubagentInfo,
+  C2SAgentModelsGet,
+  C2SAgentModelSet,
+  C2SAgentModesGet,
+  C2SAgentModeSet,
+  C2SAgentCompact,
   C2SToolOutputGet,
   FileDiff,
   S2CToolOutput,
@@ -33,6 +49,9 @@ export type {
   C2STermResize,
   C2STermAck,
   C2SPermissionRespond,
+  AgentQuestionAnswer,
+  C2SQuestionRespond,
+  C2SSubagentSend,
   C2SMessage,
   ChatRole,
   ToolState,
@@ -41,6 +60,11 @@ export type {
   AgentToolStart,
   AgentToolEnd,
   AgentPermissionRequest,
+  AgentQuestion,
+  AgentQuestionRequest,
+  AgentQuestionResolved,
+  AgentSubagentStarted,
+  AgentSubagentUpdated,
   AgentTurnEnd,
   S2CHelloOk,
   S2CSessionState,
@@ -48,6 +72,10 @@ export type {
   S2CTermOutput,
   S2CAgentEvent,
   S2CChatSnapshot,
+  S2CChatSuggestions,
+  S2CAgentModels,
+  S2CAgentModes,
+  S2CAgentControlResult,
   S2CPermissionRequest,
   S2CError,
   S2CMessage,

@@ -3,7 +3,7 @@
  * 未安装 opencode 时自动跳过(CI/他机友好)。
  */
 import { execFileSync } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -31,7 +31,7 @@ beforeAll(() => {
 });
 
 afterAll(async () => {
-  manager?.disposeAll();
+  await manager?.disposeAll();
   stopOpencodeServer();
 });
 
@@ -123,6 +123,35 @@ describeIf("opencode 结构化会话", () => {
     expect(() => manager.requireStructured(pty.id)).toThrowError(/终端会话/);
 
     await manager.kill(pty.id);
+  }, 90_000);
+
+  it("daemon 重启后重新订阅原生 opencode session", async () => {
+    const home = mkdtempSync(path.join(os.tmpdir(), "prospero-opencode-resume-"));
+    const first = new SessionManager({ home });
+    let second: SessionManager | null = null;
+    try {
+      const created = await first.create({
+        agent: "opencode",
+        kind: "structured",
+        cwd,
+        cols: 80,
+        rows: 24,
+        allowShell: false,
+      });
+      first.flushPersistence();
+      await first.disposeAll();
+
+      second = new SessionManager({ home });
+      const restored = await second.restoreStructured();
+      expect(restored).toHaveLength(1);
+      expect(restored[0]?.id).toBe(created.id);
+      expect(restored[0]?.status).toBe("idle");
+      await second.kill(created.id);
+    } finally {
+      await first.disposeAll();
+      await second?.disposeAll();
+      rmSync(home, { recursive: true, force: true });
+    }
   }, 90_000);
 });
 

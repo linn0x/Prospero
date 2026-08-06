@@ -8,7 +8,14 @@ struct RunningStatus: Sendable, Equatable {
   var builtAt: Double
   var port: Int
   var bind: String?
+  var controlToken: String
+  var persistence: Persistence
   var sessions: [Session]
+
+  struct Persistence: Sendable, Equatable {
+    var pty: Bool
+    var structured: Bool
+  }
 
   struct Session: Sendable, Equatable, Identifiable {
     var id: String
@@ -18,14 +25,43 @@ struct RunningStatus: Sendable, Equatable {
     var cwd: String
     var status: String
     var pendingPermissions: Int
+    var pendingQuestions: Int
     var busySince: Double?
+    var createdAt: Double
+    var approvalPolicy: String?
+    var preview: String?
+    var subagents: [Subagent]
+
+    struct Subagent: Sendable, Equatable, Identifiable {
+      var id: String
+      var name: String
+      var status: String
+      var canMessage: Bool
+      var preview: String?
+
+      var statusLabel: String {
+        switch status {
+        case "starting": return "启动中"
+        case "running": return "工作中"
+        case "waiting_input": return "待回答"
+        case "idle": return "可对话"
+        case "completed": return "已完成"
+        case "failed": return "失败"
+        case "stopped": return "已停止"
+        default: return status
+        }
+      }
+    }
+
+    var pendingInteractions: Int { pendingPermissions + pendingQuestions }
 
     /// 会话状态对应的 SF Symbol。等审批要显眼 —— 那是最高频的远程操作。
     var symbolName: String {
-      if pendingPermissions > 0 { return "hand.raised.fill" }
+      if pendingInteractions > 0 { return "hand.raised.fill" }
       switch status {
       case "running": return "circle.fill"
       case "waiting_approval": return "hand.raised.fill"
+      case "waiting_input": return "questionmark.bubble.fill"
       case "idle": return "pause.circle"
       case "done": return "checkmark.circle"
       case "died": return "xmark.circle"
@@ -34,13 +70,14 @@ struct RunningStatus: Sendable, Equatable {
     }
 
     var statusLabel: String {
-      if pendingPermissions > 0 {
-        return "待审批 \(pendingPermissions)"
+      if pendingInteractions > 0 {
+        return "待处理 \(pendingInteractions)"
       }
       switch status {
       case "starting": return "启动中"
       case "running": return "运行中"
       case "waiting_approval": return "等待审批"
+      case "waiting_input": return "等待回答"
       case "idle": return "空闲"
       case "done": return "已完成"
       case "died": return "已退出"
@@ -67,6 +104,14 @@ struct RunningStatus: Sendable, Equatable {
       builtAt: obj["builtAt"] as? Double ?? 0,
       port: obj["port"] as? Int ?? 7423,
       bind: obj["bind"] as? String,
+      controlToken: obj["controlToken"] as? String ?? "",
+      persistence: {
+        let raw = obj["persistence"] as? [String: Any]
+        return Persistence(
+          pty: raw?["pty"] as? Bool ?? false,
+          structured: raw?["structured"] as? Bool ?? false
+        )
+      }(),
       sessions: rawSessions.compactMap { s in
         guard let id = s["id"] as? String else { return nil }
         return Session(
@@ -77,7 +122,21 @@ struct RunningStatus: Sendable, Equatable {
           cwd: s["cwd"] as? String ?? "",
           status: s["status"] as? String ?? "unknown",
           pendingPermissions: s["pendingPermissions"] as? Int ?? 0,
-          busySince: s["busySince"] as? Double
+          pendingQuestions: s["pendingQuestions"] as? Int ?? 0,
+          busySince: s["busySince"] as? Double,
+          createdAt: s["createdAt"] as? Double ?? 0,
+          approvalPolicy: s["approvalPolicy"] as? String,
+          preview: s["preview"] as? String,
+          subagents: (s["subagents"] as? [[String: Any]] ?? []).compactMap { child in
+            guard let childID = child["id"] as? String else { return nil }
+            return Session.Subagent(
+              id: childID,
+              name: child["name"] as? String ?? "子 Agent",
+              status: child["status"] as? String ?? "unknown",
+              canMessage: child["canMessage"] as? Bool ?? false,
+              preview: child["preview"] as? String
+            )
+          }
         )
       }
     )
@@ -86,7 +145,7 @@ struct RunningStatus: Sendable, Equatable {
   /// 文件可能是上次崩溃留下的。进程还在才算数。
   var processAlive: Bool { kill(pid, 0) == 0 || errno == EPERM }
 
-  var pendingApprovals: Int { sessions.reduce(0) { $0 + $1.pendingPermissions } }
+  var pendingApprovals: Int { sessions.reduce(0) { $0 + $1.pendingInteractions } }
 
   /// 磁盘上的 daemon 代码是否比正在跑的这份新。
   /// 改完代码忘记重启会让手机侧的新功能被当成非法消息拒掉,而错误信息指不到原因。

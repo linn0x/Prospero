@@ -76,6 +76,7 @@ export const statusColor: Record<string, string> = {
   running: color.success,
   starting: color.warn,
   waiting_approval: color.warn,
+  waiting_input: color.accent,
   idle: color.textDim,
   done: color.textFaint,
   died: color.danger,

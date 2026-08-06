@@ -13,7 +13,13 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 import type { AgentEventBody, PermissionReply } from "@prospero/protocol";
-import { AdapterError, summarize, type AdapterContext, type AgentAdapter } from "./types.js";
+import {
+  AdapterError,
+  summarize,
+  type AdapterContext,
+  type AdapterResumeState,
+  type AgentAdapter,
+} from "./types.js";
 
 const SERVER_START_TIMEOUT_MS = 30_000;
 const HTTP_TIMEOUT_MS = 30_000;
@@ -174,7 +180,13 @@ export function stopOpencodeServer(): void {
 
 // ---------------------------------------------------------------- 适配器
 
+export interface OpencodeAdapterOptions {
+  resumeState?: AdapterResumeState | undefined;
+}
+
 export class OpencodeAdapter implements AgentAdapter {
+  constructor(private readonly opts: OpencodeAdapterOptions = {}) {}
+
   private server: SharedServer | null = null;
   private sessionId: string | null = null;
   private ctx: AdapterContext | null = null;
@@ -185,6 +197,19 @@ export class OpencodeAdapter implements AgentAdapter {
     this.ctx = ctx;
     const server = await sharedServer();
     this.server = server;
+
+    const resumeSessionId =
+      typeof this.opts.resumeState?.["sessionId"] === "string"
+        ? this.opts.resumeState["sessionId"]
+        : null;
+    if (resumeSessionId) {
+      // opencode 把会话存在自己的数据目录；确认记录仍在后直接重新订阅 SSE。
+      await fetchJson(`http://127.0.0.1:${server.port}/api/session/${resumeSessionId}`);
+      this.sessionId = resumeSessionId;
+      server.subscribers.set(resumeSessionId, (ev) => this.onEvent(ev));
+      ctx.persistState?.({ sessionId: resumeSessionId });
+      return;
+    }
 
     const model = await this.defaultModel(server.port);
     const session = await fetchJson<{ id: string }>(
@@ -199,6 +224,7 @@ export class OpencodeAdapter implements AgentAdapter {
     );
     this.sessionId = session.id;
     server.subscribers.set(session.id, (ev) => this.onEvent(ev));
+    ctx.persistState?.({ sessionId: session.id });
   }
 
   /** 从 opencode 自身配置读默认模型;拿不到就不传(由 opencode 决定) */
