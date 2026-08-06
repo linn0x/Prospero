@@ -16,6 +16,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Stack, useLocalSearchParams } from "expo-router";
 import * as Haptics from "expo-haptics";
 import type { GitFile } from "@prospero/protocol";
+import { DismissKey } from "@/components/DismissKey";
 import { DiffView } from "@/components/DiffView";
 import { Icon } from "@/components/Icon";
 import { SwipeRow, type SwipeAction } from "@/components/SwipeRow";
@@ -55,6 +56,7 @@ export default function GitScreen(): React.ReactElement {
   const [openPath, setOpenPath] = useState<string | null>(null);
   const [patch, setPatch] = useState<string | null>(null);
   const [message, setMessage] = useState("");
+  const [focused, setFocused] = useState(false);
   const [committing, setCommitting] = useState(false);
 
   const refresh = useCallback(async () => {
@@ -179,6 +181,8 @@ export default function GitScreen(): React.ReactElement {
 
       <FlatList
         data={[...staged, ...unstaged]}
+        keyboardDismissMode="interactive"
+        keyboardShouldPersistTaps="handled"
         keyExtractor={(f) => f.path}
         contentContainerStyle={{ paddingBottom: insets.bottom + 8 }}
         refreshControl={
@@ -250,6 +254,7 @@ export default function GitScreen(): React.ReactElement {
       )}
 
       <View style={styles.commitBar}>
+        <DismissKey visible={focused} />
         <TextInput
           style={styles.commitInput}
           value={message}
@@ -258,6 +263,8 @@ export default function GitScreen(): React.ReactElement {
           placeholderTextColor="#5a5a66"
           editable={hasStaged}
           multiline
+          onFocus={() => { setFocused(true); }}
+          onBlur={() => { setFocused(false); }}
         />
         <Pressable
           onPress={() => void doCommit()}

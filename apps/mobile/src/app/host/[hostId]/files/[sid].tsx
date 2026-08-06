@@ -17,6 +17,7 @@ import * as Sharing from "expo-sharing";
 import * as DocumentPicker from "expo-document-picker";
 import * as Haptics from "expo-haptics";
 import type { FsEntry } from "@prospero/protocol";
+import { DismissKey } from "@/components/DismissKey";
 import { Icon } from "@/components/Icon";
 import { SwipeRow, type SwipeAction } from "@/components/SwipeRow";
 import { useHostConnection } from "@/lib/use-host-connection";
@@ -47,6 +48,7 @@ export default function FilesScreen(): React.ReactElement {
   const [error, setError] = useState<string | null>(null);
 
   // 编辑态:null = 没在编辑
+  const [focused, setFocused] = useState(false);
   const [editing, setEditing] = useState<{
     path: string;
     text: string;
@@ -290,10 +292,13 @@ export default function FilesScreen(): React.ReactElement {
         {editing.truncated && (
           <Text style={styles.warnBar}>文件超过 1MB,只显示前 1MB —— 只读,保存已禁用</Text>
         )}
+        <DismissKey visible={focused} floating />
         <TextInput
           style={styles.editor}
           value={editing.text}
           onChangeText={(text) => setEditing({ ...editing, text })}
+          onFocus={() => { setFocused(true); }}
+          onBlur={() => { setFocused(false); }}
           multiline
           autoCapitalize="none"
           autoCorrect={false}
