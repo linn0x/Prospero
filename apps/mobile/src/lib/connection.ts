@@ -415,6 +415,7 @@ export class HostConnection {
       case "tool.output":
         this.events.emit("toolOutput", msg);
         return;
+      case "workspace.listing":
       case "fs.listing":
       case "fs.content":
       case "fs.written":
@@ -429,6 +430,10 @@ export class HostConnection {
       case "error":
         // 文件请求在等应答时,错误要回到那个 Promise,而不是只飘一个全局提示
         if (msg.sid !== undefined && this.rejectFsFor(msg.sid, msg.message)) return;
+        // workspace.list 发生在会话创建前,协议里没有 sid。旧版 daemon 不认识
+        // 这条消息时会回一个全局 bad_message,也应立刻交给目录选择器,不能让用户
+        // 对着转圈等 15 秒才超时。
+        if (this.rejectFsFor("#workspace", msg.message)) return;
         this.events.emit("serverError", msg);
         return;
       case "hello.ok":
@@ -454,7 +459,8 @@ export class HostConnection {
   private resolveFs(msg: S2CMessage & { sid?: string; path?: string }): void {
     // git.status / git.done 没有 path,用消息类型当 key 的一部分
     // 账号级应答不带 sid,用固定键配对(与 usageGet 省略 sid 时一致)
-    const key = this.fsKey(msg.sid ?? "#account", msg.path ?? `#${msg.type}`);
+    const owner = msg.type === "workspace.listing" ? "#workspace" : (msg.sid ?? "#account");
+    const key = this.fsKey(owner, msg.path ?? `#${msg.type}`);
     const waiter = this.fsWaiters.get(key);
     if (!waiter) return;
     this.fsWaiters.delete(key);
@@ -503,6 +509,19 @@ export class HostConnection {
 
   fsList(sid: string, path: string): Promise<Extract<S2CMessage, { type: "fs.listing" }>> {
     return this.fsRequest(sid, path, { type: "fs.list", sid, path });
+  }
+
+  /** 新建会话前浏览 daemon 用户 home 下的目录与文件。 */
+  async workspaceList(
+    path: string,
+  ): Promise<Extract<S2CMessage, { type: "workspace.listing" }>> {
+    const result = await this.fsRequest<Extract<S2CMessage, { type: "workspace.listing" }>>(
+      "#workspace",
+      path,
+      { type: "workspace.list", path },
+    );
+    if (result.error) throw new Error(result.error);
+    return result;
   }
 
   fsRead(sid: string, path: string): Promise<Extract<S2CMessage, { type: "fs.content" }>> {
@@ -594,7 +613,14 @@ export class HostConnection {
       this.send({ type: "fs.put", sid, path, offset, dataB64, final }, true);
       return Promise.resolve(null);
     }
-    return this.fsRequest(sid, path, { type: "fs.put", sid, path, offset, dataB64, final });
+    return this.fsRequest<Extract<S2CMessage, { type: "fs.written" }>>(sid, path, {
+      type: "fs.put",
+      sid,
+      path,
+      offset,
+      dataB64,
+      final,
+    });
   }
 
   private onClose(): void {

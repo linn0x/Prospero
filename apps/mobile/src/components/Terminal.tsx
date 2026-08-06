@@ -3,11 +3,14 @@
  * WS 保持在 RN 侧单连接,WebView 只做渲染与输入采集。
  * attach 流程:page ready → 上报 fit 尺寸 → resize → attach(带 lastSeq 续传)。
  */
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef } from "react";
+import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useRef } from "react";
 import { StyleSheet, View } from "react-native";
 import { WebView, type WebViewMessageEvent } from "react-native-webview";
 import type { HostConnection } from "@/lib/connection";
 import { TERMINAL_HTML } from "./terminal-html";
+
+// source 对象保持稳定,避免会话状态刷新时让原生 WebView 误判为需要重新加载。
+const TERMINAL_SOURCE = { html: TERMINAL_HTML } as const;
 
 interface Props {
   conn: HostConnection;
@@ -36,7 +39,7 @@ interface BridgeUp {
   size?: number;
 }
 
-export const Terminal = forwardRef<TerminalHandle, Props>(function Terminal(
+const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
   { conn, sid, onFontSize, onPerf },
   ref,
 ) {
@@ -168,7 +171,7 @@ export const Terminal = forwardRef<TerminalHandle, Props>(function Terminal(
     <View style={styles.wrap}>
       <WebView
         ref={webRef}
-        source={{ html: TERMINAL_HTML }}
+        source={TERMINAL_SOURCE}
         onMessage={onMessage}
         style={styles.web}
         keyboardDisplayRequiresUserAction={false}
@@ -176,16 +179,23 @@ export const Terminal = forwardRef<TerminalHandle, Props>(function Terminal(
         // 隐藏它省下的一点高度,代价是键盘收不起来、也没法语音输入
         setSupportMultipleWindows={false}
         allowsLinkPreview={false}
-        webviewDebuggingEnabled
+        webviewDebuggingEnabled={__DEV__}
         originWhitelist={["*"]}
         bounces={false}
         overScrollMode="never"
+        automaticallyAdjustContentInsets={false}
       />
     </View>
   );
 });
 
+/**
+ * 顶部状态计时每秒都会更新;终端连接和 sid 没变时不应连带重渲染 WebView。
+ * 这既避免无意义的原生属性同步,也守住正在进行的输入法组合态。
+ */
+export const Terminal = memo(TerminalInner);
+
 const styles = StyleSheet.create({
-  wrap: { flex: 1, backgroundColor: "#0b0b0e" },
-  web: { flex: 1, backgroundColor: "#0b0b0e" },
+  wrap: { flex: 1, backgroundColor: "#09090b" },
+  web: { flex: 1, backgroundColor: "#09090b" },
 });

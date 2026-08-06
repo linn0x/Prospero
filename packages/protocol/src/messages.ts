@@ -23,6 +23,7 @@ export type {
   PermissionReply,
   C2SHello,
   C2SSessionCreate,
+  C2SWorkspaceList,
   C2SSessionAttach,
   C2SChatSend,
   C2SToolOutputGet,
@@ -51,6 +52,7 @@ export type {
   S2CError,
   S2CMessage,
   PairingPayload,
+  WorkspaceListing,
 } from "./schemas.js";
 
 /**

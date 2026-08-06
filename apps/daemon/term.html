@@ -6,8 +6,8 @@
 <title>Prospero Terminal</title>
 <link rel="stylesheet" href="/assets/xterm.css" />
 <style>
-  html, body { margin: 0; padding: 0; height: 100%; background: #0b0b0e; overflow: hidden; }
-  #term { height: 100%; width: 100%; padding: 2px 0 2px 6px; box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%; background: #09090b; overflow: hidden; }
+  #term { height: 100%; width: 100%; padding: 6px 2px 6px 8px; box-sizing: border-box; }
   .xterm .xterm-viewport { overflow-y: auto !important; -webkit-overflow-scrolling: touch; }
 </style>
 </head>
@@ -23,9 +23,37 @@
     scrollback: 3000,
     fontSize: 12,
     fontFamily: "Menlo, Monaco, monospace",
-    theme: { background: "#0b0b0e" },
+    lineHeight: 1.12,
+    letterSpacing: 0.1,
+    minimumContrastRatio: 4.5,
+    theme: {
+      background: "#09090b",
+      foreground: "#d8d8df",
+      cursor: "#9bb3ff",
+      cursorAccent: "#09090b",
+      selectionBackground: "#3956a866",
+      black: "#202027",
+      brightBlack: "#6c6c78",
+      red: "#ef6a6a",
+      brightRed: "#ff8585",
+      green: "#69cc92",
+      brightGreen: "#85dfa8",
+      yellow: "#e6b35a",
+      brightYellow: "#f3c872",
+      blue: "#82a6ff",
+      brightBlue: "#a3bcff",
+      magenta: "#c38df3",
+      brightMagenta: "#d9adff",
+      cyan: "#62c6d7",
+      brightCyan: "#86dce8",
+      white: "#d8d8df",
+      brightWhite: "#f4f4f7",
+    },
     allowProposedApi: true,
     cursorBlink: true,
+    cursorStyle: "bar",
+    cursorInactiveStyle: "outline",
+    scrollOnUserInput: true,
   });
   const fit = new window.FitAddon.FitAddon();
   term.loadAddon(fit);
