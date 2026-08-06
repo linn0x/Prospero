@@ -16,6 +16,7 @@ import { AgentIcon } from "@/components/AgentIcon";
 import { HostSummary } from "@/components/HostSummary";
 import { Icon } from "@/components/Icon";
 import { SwipeRow, type SwipeAction } from "@/components/SwipeRow";
+import { WorkspacePicker } from "@/components/WorkspacePicker";
 import { sortSessions } from "@/lib/store";
 import { useHostConnection } from "@/lib/use-host-connection";
 import * as theme from "@/lib/theme";
@@ -53,6 +54,8 @@ export default function HostScreen() {
   const [banner, setBanner] = useState<string | null>(null);
   const [filter, setFilter] = useState<"all" | AgentKind>("all");
   const [composing, setComposing] = useState(false);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [workspacePath, setWorkspacePath] = useState("");
   const pendingCreateRef = useRef(false);
   const deepLinkCreateRef = useRef<string | null>(null);
   const insets = useSafeAreaInsets();
@@ -128,6 +131,12 @@ export default function HostScreen() {
             ? (runtime.lastError ?? "连接失败")
             : "未连接";
 
+  const submitCreate = (): void => {
+    if (!conn || runtime.status !== "connected") return;
+    pendingCreateRef.current = true;
+    conn.createSession(agent, cwd.trim() || undefined);
+  };
+
   return (
     <View style={styles.container}>
       <Stack.Screen
@@ -172,6 +181,7 @@ export default function HostScreen() {
 
       {composing ? (
         <View style={styles.newBox}>
+          <Text style={styles.formLabel}>运行方式</Text>
           <View style={styles.chips}>
             {AGENTS.map((a) => (
               <Pressable
@@ -194,27 +204,61 @@ export default function HostScreen() {
               </Pressable>
             ))}
           </View>
-          <View style={styles.newRow}>
-            <TextInput
-              style={styles.cwdInput}
-              placeholder="工作目录(默认 ~)"
-              placeholderTextColor="#5a5a66"
-              value={cwd}
-              onChangeText={setCwd}
-              autoCapitalize="none"
-              autoCorrect={false}
-            />
+          <Text style={[styles.formLabel, styles.cwdLabel]}>工作目录</Text>
+          <View style={styles.cwdRow}>
+            {/* 输入框必须放在有确定高度的横向容器里。之前外层是默认纵向布局，
+                TextInput 却用了 flex:1，iOS 会把可编辑区域压到几乎 0 高。 */}
+            <View style={styles.cwdField}>
+              <Icon name="folder.fill" size={16} color={color.textDim} />
+              <TextInput
+                style={styles.cwdInput}
+                placeholder="留空使用 Mac 主目录"
+                placeholderTextColor={color.textFaint}
+                selectionColor={color.accent}
+                value={cwd}
+                onChangeText={(value) => {
+                  setCwd(value);
+                  setWorkspacePath("");
+                }}
+                onSubmitEditing={submitCreate}
+                autoCapitalize="none"
+                autoCorrect={false}
+                spellCheck={false}
+                clearButtonMode="while-editing"
+                keyboardAppearance="dark"
+                returnKeyType="done"
+                accessibilityLabel="工作目录"
+              />
+            </View>
             <Pressable
-              style={[styles.createBtn, runtime.status !== "connected" && styles.btnDisabled]}
+              style={({ pressed }) => [
+                styles.browseBtn,
+                runtime.status !== "connected" && styles.btnDisabled,
+                pressed && styles.browseBtnPressed,
+              ]}
               disabled={runtime.status !== "connected"}
-              onPress={() => {
-                pendingCreateRef.current = true;
-                conn?.createSession(agent, cwd.trim() || undefined);
-              }}
+              onPress={() => setPickerOpen(true)}
+              accessibilityLabel="浏览 Mac 上的目录"
             >
-              <Text style={styles.createBtnText}>新建</Text>
+              <Text style={styles.browseBtnText}>浏览</Text>
             </Pressable>
           </View>
+          <Text style={styles.cwdHelp}>
+            {workspacePath === ""
+              ? "可手动输入完整路径，或像 Finder 一样浏览选择"
+              : `已从 ~/${workspacePath} 选择`}
+          </Text>
+          <Pressable
+            style={({ pressed }) => [
+              styles.createBtn,
+              runtime.status !== "connected" && styles.btnDisabled,
+              pressed && styles.createBtnPressed,
+            ]}
+            disabled={runtime.status !== "connected"}
+            onPress={submitCreate}
+          >
+            <Text style={styles.createBtnText}>新建会话</Text>
+          </Pressable>
         </View>
       ) : (
         usedAgents.length > 1 && (
@@ -240,6 +284,8 @@ export default function HostScreen() {
       <FlatList
         data={sessions}
         keyExtractor={(s) => s.id}
+        keyboardDismissMode="interactive"
+        keyboardShouldPersistTaps="handled"
         contentContainerStyle={[styles.list, { paddingBottom: insets.bottom + 32 }]}
         refreshControl={
           <RefreshControl
@@ -348,6 +394,19 @@ export default function HostScreen() {
           );
         }}
       />
+      {conn && (
+        <WorkspacePicker
+          visible={pickerOpen}
+          conn={conn}
+          initialPath={workspacePath}
+          onClose={() => setPickerOpen(false)}
+          onSelect={(selection) => {
+            setWorkspacePath(selection.path);
+            setCwd(selection.cwd);
+            setPickerOpen(false);
+          }}
+        />
+      )}
     </View>
   );
 }
@@ -402,8 +461,16 @@ const styles = StyleSheet.create({
   chips: { flexDirection: "row", flexWrap: "wrap", gap: space.sm },
   chipActive: { backgroundColor: color.accentDim },
   chipTextActive: { color: color.text, fontWeight: "600" },
-  newBox: { gap: space.sm, paddingHorizontal: space.lg, paddingBottom: space.md },
-  createBtnText: { color: color.text, fontSize: 14, fontWeight: "600" },
+  newBox: {
+    gap: space.sm,
+    paddingHorizontal: space.lg,
+    paddingVertical: space.lg,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: color.border,
+  },
+  formLabel: { ...font.meta, color: color.textDim, fontWeight: "600" },
+  cwdLabel: { marginTop: space.xs },
+  createBtnText: { color: "#0A0A0C", fontSize: 15, fontWeight: "700" },
   btnDisabled: { opacity: 0.45 },
   center: { flex: 1, alignItems: "center", justifyContent: "center" },
   dim: font.sub,
@@ -453,23 +520,44 @@ const styles = StyleSheet.create({
   cardSub: font.meta,
   emptyText: { ...font.sub, textAlign: "center", paddingVertical: 40 },
   swipeHint: { ...font.meta, textAlign: "center", paddingVertical: space.lg },
-  newRow: { gap: space.sm, paddingHorizontal: space.lg, paddingBottom: space.md },
-  agentRow: { flexDirection: "row", flexWrap: "wrap", gap: space.sm },
   cwdRow: { flexDirection: "row", gap: space.sm, alignItems: "center" },
+  cwdField: {
+    flex: 1,
+    minHeight: 46,
+    paddingLeft: space.md,
+    paddingRight: space.sm,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: space.sm,
+    backgroundColor: color.surface,
+    borderRadius: radius.md,
+  },
   cwdInput: {
     flex: 1,
-    backgroundColor: color.surface,
-    borderRadius: radius.sm,
-    paddingHorizontal: space.md,
-    paddingVertical: 10,
+    alignSelf: "stretch",
+    paddingVertical: 0,
     color: color.text,
     fontSize: 14,
   },
-  createBtn: {
-    backgroundColor: color.accentDim,
-    borderRadius: radius.sm,
-    paddingHorizontal: space.lg,
-    paddingVertical: 11,
+  browseBtn: {
+    minWidth: 62,
+    minHeight: 46,
+    paddingHorizontal: space.md,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: radius.md,
+    backgroundColor: color.surfaceRaised,
   },
-  createText: { color: color.text, fontSize: 14, fontWeight: "600" },
+  browseBtnPressed: { backgroundColor: color.pressed },
+  browseBtnText: { color: color.accent, fontSize: 14, fontWeight: "600" },
+  cwdHelp: { ...font.meta, marginLeft: 2 },
+  createBtn: {
+    minHeight: 48,
+    marginTop: space.xs,
+    backgroundColor: color.accent,
+    borderRadius: radius.md,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  createBtnPressed: { opacity: 0.82 },
 });

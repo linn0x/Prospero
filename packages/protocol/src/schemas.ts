@@ -241,6 +241,18 @@ const relPath = z
     message: "path must be relative and must not contain '..'",
   });
 
+/**
+ * 新建会话前浏览工作目录。
+ *
+ * 路径始终相对于 daemon 用户的 home;这让手机能做目录选择器,又不会把
+ * "列整个文件系统"变成一条绕过 allowShell 的隐形后门。外部路径仍可手输。
+ */
+export const C2SWorkspaceListSchema = z.object({
+  type: z.literal("workspace.list"),
+  /** "" 表示用户 home */
+  path: relPath,
+});
+
 /** 列目录 */
 export const C2SFsListSchema = z.object({
   type: z.literal("fs.list"),
@@ -363,6 +375,7 @@ export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SSessionInterruptSchema,
   C2SSessionKillSchema,
   C2SApprovalPolicySetSchema,
+  C2SWorkspaceListSchema,
   C2SFsListSchema,
   C2SFsReadSchema,
   C2SFsWriteSchema,
@@ -603,6 +616,17 @@ export const S2CFsListingSchema = z.object({
   entries: z.array(FsEntrySchema),
 });
 
+/** 新建会话目录选择器的浏览结果;失败也原路返回,避免无 sid 请求只能超时。 */
+export const S2CWorkspaceListingSchema = z.object({
+  type: z.literal("workspace.listing"),
+  /** 相对于用户 home 的路径 */
+  path: relPath,
+  /** 选中后可直接交给 session.create 的绝对路径 */
+  cwd: z.string(),
+  entries: z.array(FsEntrySchema),
+  error: z.string().optional(),
+});
+
 export const S2CFsContentSchema = z.object({
   type: z.literal("fs.content"),
   sid,
@@ -742,6 +766,7 @@ export const S2CMessageSchema = z.discriminatedUnion("type", [
   S2CToolOutputSchema,
   S2CPermissionRequestSchema,
   S2CErrorSchema,
+  S2CWorkspaceListingSchema,
   S2CFsListingSchema,
   S2CFsContentSchema,
   S2CFsWrittenSchema,
@@ -777,6 +802,7 @@ export type PermissionReply = z.infer<typeof PermissionReplySchema>;
 export type ApprovalPolicy = z.infer<typeof ApprovalPolicySchema>;
 export type C2SHello = z.infer<typeof C2SHelloSchema>;
 export type C2SSessionCreate = z.infer<typeof C2SSessionCreateSchema>;
+export type C2SWorkspaceList = z.infer<typeof C2SWorkspaceListSchema>;
 export type C2SSessionAttach = z.infer<typeof C2SSessionAttachSchema>;
 export type C2SChatSend = z.infer<typeof C2SChatSendSchema>;
 export type C2SToolOutputGet = z.infer<typeof C2SToolOutputGetSchema>;
@@ -791,6 +817,7 @@ export type Attachment = z.infer<typeof AttachmentSchema>;
 export type UsageWindow = z.infer<typeof UsageWindowSchema>;
 export type UsageAccount = z.infer<typeof UsageAccountSchema>;
 export type FsEntry = z.infer<typeof FsEntrySchema>;
+export type WorkspaceListing = z.infer<typeof S2CWorkspaceListingSchema>;
 export type GitFile = z.infer<typeof GitFileSchema>;
 export type ChatRole = z.infer<typeof ChatRoleSchema>;
 export type ToolState = z.infer<typeof ToolStateSchema>;

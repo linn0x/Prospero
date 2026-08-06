@@ -15,6 +15,9 @@ describe("message schemas", () => {
     expect(
       parseC2S({ type: "session.attach", sid: "abc", lastSeq: 42 }),
     ).toMatchObject({ lastSeq: 42 });
+    expect(parseC2S({ type: "workspace.list", path: "Projects/prospero" })).toMatchObject({
+      path: "Projects/prospero",
+    });
   });
 
   it("拒绝未知类型与缺字段", () => {
@@ -23,6 +26,12 @@ describe("message schemas", () => {
       ProtocolError,
     ); // 缺 dataB64
     expect(() => parseC2S({ type: "term.input", sid: "s", dataB64: "" })).toThrowError(
+      ProtocolError,
+    );
+    expect(() => parseC2S({ type: "workspace.list", path: "../secret" })).toThrowError(
+      ProtocolError,
+    );
+    expect(() => parseC2S({ type: "workspace.list", path: "/tmp" })).toThrowError(
       ProtocolError,
     );
   });
@@ -38,6 +47,14 @@ describe("message schemas", () => {
     expect(() =>
       parseS2C({ type: "term.output", sid: "s", dataB64: "aGk=", seq: -1 }),
     ).toThrowError(ProtocolError);
+    expect(
+      parseS2C({
+        type: "workspace.listing",
+        path: "Projects",
+        cwd: "/Users/me/Projects",
+        entries: [{ name: "Prospero", kind: "dir", size: 0, mtime: 1 }],
+      }),
+    ).toMatchObject({ type: "workspace.listing", cwd: "/Users/me/Projects" });
   });
 
   it("PairingPayload 校验端口与公钥长度", () => {

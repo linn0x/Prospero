@@ -17,10 +17,15 @@ export type IconName =
   | "bubble.left.and.text.bubble.right"
   | "ellipsis.circle"
   | "doc.on.doc"
+  | "paperclip"
   | "arrow.clockwise"
   | "chevron.down"
   | "qrcode.viewfinder"
   | "desktopcomputer"
+  | "folder.fill"
+  | "doc.fill"
+  | "house.fill"
+  | "chevron.right"
   | "checkmark.circle.fill"
   | "xmark.circle.fill"
   | "exclamationmark.triangle.fill"
@@ -38,10 +43,15 @@ const FALLBACK: Record<IconName, string> = {
   "bubble.left.and.text.bubble.right": "💬",
   "ellipsis.circle": "⋯",
   "doc.on.doc": "复制",
+  paperclip: "＋",
   "arrow.clockwise": "↻",
   "chevron.down": "▾",
   "qrcode.viewfinder": "⊞",
   desktopcomputer: "🖥",
+  "folder.fill": "▰",
+  "doc.fill": "▤",
+  "house.fill": "⌂",
+  "chevron.right": "›",
   "checkmark.circle.fill": "✓",
   "xmark.circle.fill": "✕",
   "exclamationmark.triangle.fill": "⚠︎",
