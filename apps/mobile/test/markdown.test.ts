@@ -44,6 +44,33 @@ describe("Markdown 解析", () => {
     expect(b[1]).toEqual({ type: "rule" });
   });
 
+  it("GFM 表格保留表头、行与行内样式", () => {
+    const b = parseMarkdown([
+      "| 文件 | 状态 |",
+      "| :--- | ---: |",
+      "| `src/app.ts` | **完成** |",
+      "| [配置](config/app.json) | 待检查 |",
+    ].join("\n"));
+    expect(b).toHaveLength(1);
+    expect(b[0]).toEqual({
+      type: "table",
+      headers: [[{ text: "文件" }], [{ text: "状态" }]],
+      rows: [
+        [[{ text: "src/app.ts", code: true }], [{ text: "完成", bold: true }]],
+        [[{ text: "配置", href: "config/app.json" }], [{ text: "待检查" }]],
+      ],
+    });
+  });
+
+  it("表格不会按转义竖线或行内代码里的竖线拆列", () => {
+    const b = parseMarkdown("左 | 右\n--- | ---\na\\|b | `x|y`");
+    expect(b).toEqual([{
+      type: "table",
+      headers: [[{ text: "左" }], [{ text: "右" }]],
+      rows: [[[{ text: "a|b" }], [{ text: "x|y", code: true }]]],
+    }]);
+  });
+
   it("行内:代码 / 粗体 / 斜体", () => {
     expect(parseInline("run `npm test` now")).toEqual([
       { text: "run " },
@@ -58,6 +85,15 @@ describe("Markdown 解析", () => {
       { text: "这是 " },
       { text: "斜", italic: true },
       { text: " 体" },
+    ]);
+  });
+
+  it("保留 agent 的 Markdown 文件链接", () => {
+    expect(parseInline("见 [app.ts](src/app.ts:12) 和 [配置](</tmp/My Project/app.json#L3>)")).toEqual([
+      { text: "见 " },
+      { text: "app.ts", href: "src/app.ts:12" },
+      { text: " 和 " },
+      { text: "配置", href: "/tmp/My Project/app.json#L3" },
     ]);
   });
 

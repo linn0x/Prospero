@@ -1,13 +1,26 @@
 import SwiftUI
 
+@MainActor
+final class ProsperoAppDelegate: NSObject, NSApplicationDelegate {
+  var onTerminate: (() -> Void)?
+
+  func applicationDidFinishLaunching(_ notification: Notification) {
+    NSApp.setActivationPolicy(.regular)
+  }
+
+  func applicationWillTerminate(_ notification: Notification) {
+    onTerminate?()
+  }
+}
+
 @main
 struct ProsperoShellApp: App {
+  @NSApplicationDelegateAdaptor(ProsperoAppDelegate.self) private var appDelegate
   @State private var daemon = DaemonController()
   @State private var pairing = PairingModel()
 
   init() {
-    // 菜单栏 app 出问题时最难查的就是"图标没出现,也没有任何输出"。
-    // 这个开关把定位结果直接打到终端,不用点菜单就能看出是哪一步断了。
+    // GUI 起不来时仍可从终端直接核对 Node、daemon 和数据目录定位结果。
     if CommandLine.arguments.contains("--self-check") {
       Self.selfCheck()
       exit(0)
@@ -40,49 +53,34 @@ struct ProsperoShellApp: App {
       print("  status:   无 status.json(daemon 未运行,或版本过旧)")
     }
     if node == nil || cli == nil {
-      print("\n定位失败时,在菜单里手动指定,或设 UserDefaults:")
+      print("\n定位失败时,可在设置中检查,或设 UserDefaults:")
       print("  defaults write com.linn0x.prospero.shell nodePath /opt/homebrew/bin/node")
       print("  defaults write com.linn0x.prospero.shell prosperodCLIPath /path/to/apps/daemon/dist/cli.js")
     }
   }
 
   var body: some Scene {
-    MenuBarExtra {
-      MenuContent(daemon: daemon, pairing: pairing)
+    Window("Prospero", id: "main") {
+      ProsperoDashboard(daemon: daemon, pairing: pairing)
         .task {
           // 配对成功的唯一可观察信号:daemon 握手时把客户端公钥写进 devices.json
           daemon.onDeviceBound = { name in pairing.deviceDidPair(name) }
+          appDelegate.onTerminate = { daemon.stop() }
+          daemon.startIfNeeded()
         }
-    } label: {
-      Image(systemName: daemon.symbolName)
     }
-    .menuBarExtraStyle(.menu)
+    .defaultSize(width: 1040, height: 700)
+    .windowStyle(.titleBar)
 
     Window("配对新设备", id: "pairing") {
       PairingView(pairing: pairing)
     }
     .windowResizability(.contentSize)
 
-    Window("Prospero 日志", id: "log") {
-      LogView(daemon: daemon)
-    }
   }
 }
 
 extension DaemonController {
-  /// 菜单栏图标直接反映状态 —— 这是壳最主要的信息输出,不用点开就能看见。
-  var symbolName: String {
-    // 有待审批时图标就该不一样 —— 审批是最高频的远程操作,值得占用这个位置
-    if let running, running.pendingApprovals > 0 { return "hand.raised.fill" }
-    switch state {
-    case .running: return "wand.and.stars"
-    case .externallyRunning: return "wand.and.stars.inverse"
-    case .starting: return "hourglass"
-    case .failed: return "exclamationmark.triangle"
-    case .stopped: return "wand.and.rays.inverse"
-    }
-  }
-
   var stateLabel: String {
     switch state {
     case .running(let pid): "运行中(pid \(pid))"
@@ -90,149 +88,6 @@ extension DaemonController {
     case .starting: "启动中…"
     case .failed(let message): "出错:\(message)"
     case .stopped: "已停止"
-    }
-  }
-}
-
-struct MenuContent: View {
-  @Bindable var daemon: DaemonController
-  @Bindable var pairing: PairingModel
-  @Environment(\.openWindow) private var openWindow
-
-  var body: some View {
-    Text(daemon.stateLabel)
-
-    if case .externallyRunning = daemon.state {
-      Text("端口 \(String(daemon.status.port)) 已被占用")
-    } else {
-      Text("端口 \(String(daemon.status.port)) · 监听 \(daemon.status.bindLabel)")
-    }
-
-    Divider()
-
-    switch daemon.state {
-    case .running:
-      Button("停止 daemon") { daemon.stop() }
-      Button("重启 daemon") { daemon.restart() }
-    case .starting:
-      Button("启动中…") {}.disabled(true)
-    case .externallyRunning:
-      Button("daemon 已在别处运行") {}.disabled(true)
-    case .stopped, .failed:
-      Button("启动 daemon") { daemon.start() }
-    }
-
-    Divider()
-
-    Button("配对新设备…") {
-      pairing.reset()
-      openWindow(id: "pairing")
-      NSApp.activate(ignoringOtherApps: true)
-    }
-    .disabled(Locator.findCLI() == nil)
-
-    if daemon.status.devices.isEmpty {
-      Text("尚未配对任何设备")
-    } else {
-      Menu("已配对设备(\(daemon.status.devices.count))") {
-        ForEach(daemon.status.devices) { device in
-          Menu("\(device.name)\(device.allowShell ? "" : " · 禁 shell")\(device.bound ? "" : " · 未绑定")") {
-            Text(device.bound ? "已绑定客户端公钥" : "尚未连接过")
-            Divider()
-            Button("移除「\(device.name)」") {
-              confirmRevoke(device.name)
-            }
-          }
-        }
-      }
-    }
-
-    Divider()
-
-    if daemon.running?.isStale(cliPath: Locator.findCLI()) == true {
-      Text("⚠︎ daemon 比磁盘上的代码旧 —— 改过代码就重启它")
-      Button("重启 daemon 以加载新代码") { daemon.restart() }
-    }
-
-    SessionsSection(running: daemon.running)
-
-    Divider()
-
-    LoginItemToggle()
-
-    if let note = daemon.bonjourNote {
-      Text("Bonjour:\(note)")
-    }
-
-    Divider()
-
-    Button("查看日志…") {
-      openWindow(id: "log")
-      NSApp.activate(ignoringOtherApps: true)
-    }
-    Button("打开 ~/.prospero") {
-      NSWorkspace.shared.open(DaemonStatus.home)
-    }
-    Button("退出 Prospero") {
-      daemon.stop()
-      NSApp.terminate(nil)
-    }
-    .keyboardShortcut("q")
-  }
-
-  /// 撤销不可逆(手机必须重新扫码),值得一次确认。
-  private func confirmRevoke(_ name: String) {
-    let alert = NSAlert()
-    alert.messageText = "移除设备「\(name)」?"
-    alert.informativeText = "该设备的凭证会被删除,当前连接立刻断开。要再用得重新扫码配对。"
-    alert.alertStyle = .warning
-    alert.addButton(withTitle: "移除")
-    alert.addButton(withTitle: "取消")
-    NSApp.activate(ignoringOtherApps: true)
-    guard alert.runModal() == .alertFirstButtonReturn else { return }
-
-    if let error = daemon.revokeDevice(named: name) {
-      let failure = NSAlert()
-      failure.messageText = "移除失败"
-      failure.informativeText = error
-      failure.alertStyle = .critical
-      failure.runModal()
-    }
-  }
-}
-
-/// 菜单里的运行中会话。数据来自 daemon 写的 status.json —— 壳不碰 WS 协议。
-struct SessionsSection: View {
-  let running: RunningStatus?
-
-  var body: some View {
-    if let running, !running.sessions.isEmpty {
-      let pending = running.pendingApprovals
-      Text(pending > 0
-        ? "会话(\(running.sessions.count))· 待审批 \(pending)"
-        : "会话(\(running.sessions.count))")
-      ForEach(running.sessions) { session in
-        // 会话不可在壳里操作(那是手机的活),这里只做一眼可见的总览
-        Text("  \(session.agent) · \(session.title) — \(session.statusLabel)")
-      }
-    } else if running != nil {
-      Text("没有运行中的会话")
-    } else {
-      Text("会话列表需 daemon 运行")
-    }
-  }
-}
-
-/// 开机自启。SMAppService 的状态是系统在管,每次展开菜单重新读,别缓存。
-struct LoginItemToggle: View {
-  @State private var error: String?
-
-  var body: some View {
-    Button(LoginItem.isEnabled ? "✓ 开机自启" : "开机自启") {
-      error = LoginItem.setEnabled(!LoginItem.isEnabled)
-    }
-    if let error {
-      Text(error)
     }
   }
 }
@@ -305,20 +160,5 @@ struct PairingView: View {
     }
     .padding(24)
     .frame(minWidth: 320)
-  }
-}
-
-struct LogView: View {
-  @Bindable var daemon: DaemonController
-
-  var body: some View {
-    ScrollView {
-      Text(daemon.recentLog.isEmpty ? "(daemon 由壳启动后,输出会显示在这里)" : daemon.recentLog.joined(separator: "\n"))
-        .font(.system(.caption, design: .monospaced))
-        .textSelection(.enabled)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
-    }
-    .frame(minWidth: 560, minHeight: 320)
   }
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { stripMarkdown } from "../src/structured-session.js";
+import { latestReplyPreview, stripMarkdown } from "../src/structured-session.js";
 
 describe("会话列表预览:剥离 Markdown", () => {
   it("去掉标题与列表标记", () => {
@@ -28,5 +28,18 @@ describe("会话列表预览:剥离 Markdown", () => {
 
   it("纯文本原样返回", () => {
     expect(stripMarkdown("就是一句普通的话")).toBe("就是一句普通的话");
+  });
+
+  it("长回复取最新尾部而不是开场白", () => {
+    const source = `开头说明 ${"中间内容 ".repeat(40)}最终结论：修复已经完成`;
+    const preview = latestReplyPreview(source, 60);
+    expect(preview).toMatch(/^…/);
+    expect(preview).toContain("最终结论：修复已经完成");
+    expect(preview).not.toContain("开头说明");
+    expect(preview.length).toBeLessThanOrEqual(60);
+  });
+
+  it("短回复保持完整且继续剥离 Markdown", () => {
+    expect(latestReplyPreview("**完成**：见 `src/app.ts`", 60)).toBe("完成：见 src/app.ts");
   });
 });

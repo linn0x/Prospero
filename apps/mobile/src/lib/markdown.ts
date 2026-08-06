@@ -10,6 +10,8 @@ export interface InlineSpan {
   code?: boolean;
   bold?: boolean;
   italic?: boolean;
+  /** Markdown `[label](target)`；渲染层只会激活受项目根约束的文件 target。 */
+  href?: string;
 }
 
 export type MdBlock =
@@ -18,21 +20,56 @@ export type MdBlock =
   | { type: "bullet"; spans: InlineSpan[]; ordered?: string }
   | { type: "code"; lang: string; code: string }
   | { type: "quote"; spans: InlineSpan[] }
+  | { type: "table"; headers: InlineSpan[][]; rows: InlineSpan[][][] }
   | { type: "rule" };
 
-/** 行内解析:`code`、**bold**、*italic*(code 优先,内部不再解析) */
+/** GFM 表格行；反斜线转义的竖线与行内代码中的竖线都不切列。 */
+function tableCells(line: string): string[] {
+  let source = line.trim();
+  if (source.startsWith("|")) source = source.slice(1);
+  if (source.endsWith("|") && !source.endsWith("\\|")) source = source.slice(0, -1);
+  const cells: string[] = [];
+  let cell = "";
+  let inCode = false;
+  for (let i = 0; i < source.length; i++) {
+    const char = source[i]!;
+    if (char === "\\" && source[i + 1] === "|") {
+      cell += "|";
+      i++;
+    } else if (char === "`") {
+      inCode = !inCode;
+      cell += char;
+    } else if (char === "|" && !inCode) {
+      cells.push(cell.trim());
+      cell = "";
+    } else {
+      cell += char;
+    }
+  }
+  cells.push(cell.trim());
+  return cells;
+}
+
+function tableDivider(line: string): string[] | null {
+  if (!line.includes("|")) return null;
+  const cells = tableCells(line);
+  return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/.test(cell)) ? cells : null;
+}
+
+/** 行内解析:链接、`code`、**bold**、*italic*(链接/code 优先,内部不再解析) */
 export function parseInline(text: string): InlineSpan[] {
   const spans: InlineSpan[] = [];
-  // 一次扫描三种标记,避免嵌套歧义
-  const re = /(`+)([^`]+?)\1|\*\*([^*]+?)\*\*|(?<!\*)\*([^*\n]+?)\*(?!\*)|__([^_]+?)__/g;
+  // 一次扫描所有标记,避免先解析粗体后破坏链接位置。带空格的 href 必须用 <…>。
+  const re = /\[([^\]\n]+)\]\((?:<([^>\n]+)>|([^\s)\n]+))(?:\s+"[^"\n]*")?\)|(`+)([^`]+?)\4|\*\*([^*]+?)\*\*|(?<!\*)\*([^*\n]+?)\*(?!\*)|__([^_]+?)__/g;
   let last = 0;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
     if (m.index > last) spans.push({ text: text.slice(last, m.index) });
-    if (m[2] !== undefined) spans.push({ text: m[2], code: true });
-    else if (m[3] !== undefined) spans.push({ text: m[3], bold: true });
-    else if (m[4] !== undefined) spans.push({ text: m[4], italic: true });
-    else if (m[5] !== undefined) spans.push({ text: m[5], bold: true });
+    if (m[1] !== undefined) spans.push({ text: m[1], href: m[2] ?? m[3] ?? "" });
+    else if (m[5] !== undefined) spans.push({ text: m[5], code: true });
+    else if (m[6] !== undefined) spans.push({ text: m[6], bold: true });
+    else if (m[7] !== undefined) spans.push({ text: m[7], italic: true });
+    else if (m[8] !== undefined) spans.push({ text: m[8], bold: true });
     last = m.index + m[0].length;
   }
   if (last < text.length) spans.push({ text: text.slice(last) });
@@ -73,6 +110,30 @@ export function parseMarkdown(src: string): MdBlock[] {
     if (/^\s*$/.test(line)) {
       flushParagraph();
       i++;
+      continue;
+    }
+
+    // GFM 表格：当前行是表头，下一行每列必须是 --- / :---:。
+    const headerCells = line.includes("|") ? tableCells(line) : [];
+    const divider = i + 1 < lines.length ? tableDivider(lines[i + 1]!) : null;
+    if (divider && headerCells.length === divider.length) {
+      flushParagraph();
+      i += 2;
+      const rows: InlineSpan[][][] = [];
+      while (i < lines.length && !/^\s*$/.test(lines[i]!) && lines[i]!.includes("|")) {
+        const cells = tableCells(lines[i]!);
+        rows.push(
+          Array.from({ length: headerCells.length }, (_, index) =>
+            parseInline(cells[index] ?? ""),
+          ),
+        );
+        i++;
+      }
+      blocks.push({
+        type: "table",
+        headers: headerCells.map(parseInline),
+        rows,
+      });
       continue;
     }
 

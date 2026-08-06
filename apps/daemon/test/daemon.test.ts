@@ -1,7 +1,7 @@
 /**
  * daemon 集成测试:真实加密握手 + PTY 会话全链路(内存中起服务,随机端口)。
  */
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -134,6 +134,29 @@ afterAll(async () => {
 });
 
 describe("daemon 全链路", () => {
+  it("Mac GUI 控制接口仅接受 status.json 中的本机口令", async () => {
+    const info = await server.manager.create({
+      agent: "custom",
+      command: "sleep 30",
+      cwd: home,
+      cols: 80,
+      rows: 24,
+      allowShell: true,
+    });
+    const status = JSON.parse(readFileSync(path.join(home, "status.json"), "utf8")) as {
+      controlToken: string;
+    };
+    const url = `http://127.0.0.1:${String(server.port)}/_prospero/control/session/${info.id}/kill`;
+
+    expect((await fetch(url, { method: "POST" })).status).toBe(401);
+    const killed = await fetch(url, {
+      method: "POST",
+      headers: { authorization: `Bearer ${status.controlToken}` },
+    });
+    expect(killed.status).toBe(204);
+    expect(() => server.manager.infoOf(info.id)).toThrow(/no such session/);
+  });
+
   it("新建会话前可在用户 home 内预览并选择工作目录", async () => {
     const c = await TestClient.connect(deviceToken, deviceKeys);
     await c.waitFor((m) => m.type === "hello.ok", "hello.ok");

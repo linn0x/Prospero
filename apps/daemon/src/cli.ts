@@ -88,8 +88,8 @@ program
       console.log(`dev 明文口令: ${server.devToken}`);
       console.log("  ⚠︎ 该口令等同完整 shell 权限,每次启动都会更换,请勿外传");
     }
-    if (opts.tmux && server.restoredSessions > 0) {
-      console.log(`已从 tmux 接管 ${server.restoredSessions} 个上次遗留的会话`);
+    if (server.restoredSessions > 0) {
+      console.log(`已恢复 ${server.restoredSessions} 个上次保留的会话`);
     }
     if (opts.tmux) {
       console.log(
@@ -98,6 +98,7 @@ program
           : "会话托管: 已请求 tmux 但未找到 tmux,已退回直接 spawn(daemon 退出会杀掉会话)",
       );
     }
+    console.log("对话持久化: 已启用(事件历史 + Agent 原生会话恢复)");
     console.log(
       server.notifier.enabled
         ? "推送: 已启用(App 未在线时,待审批会推到锁屏)"
@@ -105,7 +106,7 @@ program
     );
 
     const shutdown = async (): Promise<void> => {
-      console.log("\n[prosperod] 正在退出(会话进程将随之终止)…");
+      console.log("\n[prosperod] 正在保存会话并退出…");
       stopAdvertise();
       await server.close();
       process.exit(0);

@@ -3,6 +3,9 @@ import type { AgentEventBody } from "@prospero/protocol";
 import {
   applyEvent,
   applyEvents,
+  foldChatItems,
+  itemsForAgent,
+  pendingInteractions,
   pendingPermissions,
   type AssistantItem,
   type ChatItem,
@@ -43,6 +46,70 @@ describe("chat-model 事件折叠", () => {
     const a = items[0] as AssistantItem;
     expect(a.done).toBe(true);
     expect(a.finish).toEqual({ costUsd: 0.002, outputTokens: 7 });
+  });
+
+  it("turn.end 汇总本轮文件改动，同一路径采用最终 diff", () => {
+    const items = applyEvents([], [
+      ev({ kind: "user.message", msgId: "u1", text: "改两个文件" }),
+      ev({
+        kind: "tool.start",
+        msgId: "m1",
+        callId: "c1",
+        tool: "edit",
+        summary: "预览 a.ts",
+        diff: { path: "src/a.ts", patch: "+one", additions: 1, deletions: 0 },
+      }),
+      ev({
+        kind: "tool.end",
+        callId: "c1",
+        state: "success",
+        summary: "写入 a.ts",
+        diff: { path: "src/a.ts", patch: "-old\n+new", additions: 3, deletions: 2 },
+      }),
+      ev({
+        kind: "permission.request",
+        reqId: "p1",
+        action: "edit",
+        resources: ["src/b.ts"],
+        summary: "写入 b.ts",
+        diff: { path: "src/b.ts", patch: "+four", additions: 4, deletions: 0 },
+      }),
+      ev({ kind: "permission.resolved", reqId: "p1", reply: "once" }),
+      ev({ kind: "text.delta", msgId: "m1", textId: "t1", delta: "改好了" }),
+      ev({ kind: "turn.end", msgId: "m1", finish: "stop" }),
+    ]);
+    expect(items.at(-1)).toEqual({
+      type: "turn-diff-summary",
+      key: "d:m1",
+      msgId: "m1",
+      files: [
+        { path: "src/a.ts", additions: 3, deletions: 2 },
+        { path: "src/b.ts", additions: 4, deletions: 0 },
+      ],
+      additions: 7,
+      deletions: 2,
+    });
+  });
+
+  it("每轮 diff 独立汇总，重复 turn.end 不会重复添加", () => {
+    let items = applyEvents([], [
+      ev({ kind: "tool.start", msgId: "m1", callId: "a", tool: "edit", summary: "a", diff: {
+        path: "a.ts", patch: "+a", additions: 1, deletions: 0,
+      } }),
+      ev({ kind: "text.delta", msgId: "m1", textId: "t1", delta: "第一轮" }),
+      ev({ kind: "turn.end", msgId: "m1" }),
+      ev({ kind: "user.message", msgId: "u2", text: "继续" }),
+      ev({ kind: "tool.start", msgId: "m2", callId: "b", tool: "edit", summary: "b", diff: {
+        path: "b.ts", patch: "+b", additions: 2, deletions: 1,
+      } }),
+      ev({ kind: "text.delta", msgId: "m2", textId: "t2", delta: "第二轮" }),
+      ev({ kind: "turn.end", msgId: "m2" }),
+    ]);
+    items = applyEvent(items, ev({ kind: "turn.end", msgId: "m2" }));
+    const summaries = items.filter((item) => item.type === "turn-diff-summary");
+    expect(summaries).toHaveLength(2);
+    expect(summaries[0]?.files.map((file) => file.path)).toEqual(["a.ts"]);
+    expect(summaries[1]?.files.map((file) => file.path)).toEqual(["b.ts"]);
   });
 
   it("tool.end 回填到对应的 tool.start,不新增条目", () => {
@@ -94,6 +161,58 @@ describe("chat-model 事件折叠", () => {
     expect(items).toEqual([]);
   });
 
+  it("Agent 原生问题进入待处理，回答后卡片保留但退出待办", () => {
+    let items = applyEvent([], ev({
+      kind: "question.request",
+      reqId: "q1",
+      questions: [{
+        id: "scope",
+        header: "范围",
+        question: "先做哪一端？",
+        options: [{ label: "iOS" }, { label: "Mac" }],
+        multiSelect: false,
+        allowOther: true,
+      }],
+    }));
+    expect(pendingInteractions(items)).toHaveLength(1);
+    items = applyEvent(items, ev({
+      kind: "question.resolved",
+      reqId: "q1",
+      answers: [{ questionId: "scope", values: ["iOS"] }],
+    }));
+    expect(pendingInteractions(items)).toHaveLength(0);
+    expect(items[0]).toMatchObject({ type: "question", answers: [{ values: ["iOS"] }] });
+  });
+
+  it("主会话与子 Agent 事件按 agentId 分流，生命周期卡只在主会话显示", () => {
+    const items = applyEvents([], [
+      ev({
+        kind: "subagent.started",
+        subagent: {
+          id: "child-1",
+          name: "reviewer",
+          status: "running",
+          canMessage: true,
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      }),
+      ev({ kind: "text.delta", msgId: "main", textId: "main", delta: "主回复" }),
+      ev({
+        kind: "text.delta",
+        msgId: "child",
+        textId: "child",
+        delta: "子回复",
+        agentId: "child-1",
+      }),
+      ev({ kind: "user.message", msgId: "u", text: "人工引导", agentId: "child-1" }),
+    ]);
+    expect(itemsForAgent(items).map((item) => item.type)).toEqual(["subagent", "assistant"]);
+    const child = itemsForAgent(items, "child-1");
+    expect(child.map((item) => item.type)).toEqual(["assistant", "user"]);
+    expect((child[0] as AssistantItem).text).toBe("子回复");
+  });
+
   it("完整一轮对话的条目顺序符合预期", () => {
     const items = applyEvents([], [
       ev({ kind: "user.message", msgId: "u1", text: "跑测试" }),
@@ -135,5 +254,44 @@ describe("chat-model 事件折叠", () => {
       ev({ kind: "agent.error", message: "provider auth failed" }),
     ]);
     expect(items.map((i) => i.type)).toEqual(["assistant", "error"]);
+  });
+
+  it("连续三个已完成活动自动折叠", () => {
+    const items = applyEvents([], [
+      ev({ kind: "tool.start", msgId: "m", callId: "a", tool: "read", summary: "a" }),
+      ev({ kind: "tool.end", callId: "a", state: "success", summary: "ok" }),
+      ev({ kind: "permission.auto", reqId: "p", action: "read", summary: "读取", policy: "standard" }),
+      ev({ kind: "tool.start", msgId: "m", callId: "b", tool: "bash", summary: "test" }),
+      ev({ kind: "tool.end", callId: "b", state: "success", summary: "ok" }),
+    ]);
+    const display = foldChatItems(items);
+    expect(display).toHaveLength(1);
+    expect(display[0]?.type).toBe("activity-group");
+    if (display[0]?.type === "activity-group") expect(display[0].items).toHaveLength(3);
+  });
+
+  it("运行中、失败与待审批活动不折叠", () => {
+    const items = applyEvents([], [
+      ev({ kind: "tool.start", msgId: "m", callId: "ok", tool: "read", summary: "a" }),
+      ev({ kind: "tool.end", callId: "ok", state: "success", summary: "ok" }),
+      ev({ kind: "tool.start", msgId: "m", callId: "running", tool: "bash", summary: "watch" }),
+      ev({ kind: "tool.start", msgId: "m", callId: "bad", tool: "bash", summary: "bad" }),
+      ev({ kind: "tool.end", callId: "bad", state: "failed", summary: "boom" }),
+      ev({ kind: "permission.request", reqId: "wait", action: "bash", resources: ["rm x"], summary: "删除" }),
+    ]);
+    expect(foldChatItems(items).map((item) => item.type)).toEqual([
+      "tool",
+      "tool",
+      "tool",
+      "permission",
+    ]);
+  });
+
+  it("只有两个已完成活动时保持逐项展示", () => {
+    const items = applyEvents([], [
+      ev({ kind: "permission.auto", reqId: "a", action: "read", summary: "a", policy: "yolo" }),
+      ev({ kind: "permission.auto", reqId: "b", action: "read", summary: "b", policy: "yolo" }),
+    ]);
+    expect(foldChatItems(items).map((item) => item.type)).toEqual(["permission", "permission"]);
   });
 });
