@@ -5,17 +5,16 @@
     "version": "0.0.1",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
+    "backgroundColor": "#0B0B0E",
     "scheme": "prospero",
     "userInterfaceStyle": "dark",
     "ios": {
       "icon": "./assets/expo.icon",
-      "bundleIdentifier": "com.linn0x.prospero",
+      "bundleIdentifier": "com.linn0x.prospero.remote",
       "supportsTablet": true,
       "infoPlist": {
         "NSLocalNetworkUsageDescription": "Prospero 通过本地网络直连你 Mac 上的 prosperod,以控制 code agent 会话。",
-        "NSBonjourServices": [
-          "_prospero._tcp"
-        ],
+        "NSBonjourServices": ["_prospero._tcp"],
         "NSCameraUsageDescription": "用于扫描配对二维码,以及拍照作为附件发给 agent。",
         "NSAppTransportSecurity": {
           "NSAllowsLocalNetworking": true
@@ -25,6 +24,18 @@
     },
     "android": {
       "package": "com.linn0x.prospero",
+      "versionCode": 1,
+      "backgroundColor": "#0B0B0E",
+      "userInterfaceStyle": "dark",
+      "softwareKeyboardLayoutMode": "resize",
+      "allowBackup": false,
+      "permissions": [
+        "android.permission.INTERNET",
+        "android.permission.ACCESS_NETWORK_STATE",
+        "android.permission.ACCESS_WIFI_STATE",
+        "android.permission.CHANGE_WIFI_MULTICAST_STATE"
+      ],
+      "blockedPermissions": ["android.permission.POST_NOTIFICATIONS"],
       "adaptiveIcon": {
         "backgroundColor": "#0B0B0E",
         "foregroundImage": "./assets/images/android-icon-foreground.png",
@@ -35,6 +46,22 @@
     },
     "plugins": [
       "expo-router",
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "usesCleartextTraffic": true
+          }
+        }
+      ],
+      [
+        "expo-navigation-bar",
+        {
+          "enforceContrast": false,
+          "hidden": false,
+          "style": "dark"
+        }
+      ],
       [
         "expo-splash-screen",
         {
@@ -55,6 +82,14 @@
         {
           "photosPermission": "用于把截图或照片作为附件发给 agent。",
           "cameraPermission": "用于拍照作为附件发给 agent。"
+        }
+      ],
+      [
+        "expo-speech-recognition",
+        {
+          "microphonePermission": "Prospero 仅在你按住麦克风按钮时使用麦克风，并在设备上完成语音转写。",
+          "speechRecognitionPermission": "Prospero 使用设备端语音识别把口述内容填入聊天草稿，不会自动发送。",
+          "androidSpeechServicePackages": ["com.google.android.as"]
         }
       ]
     ],

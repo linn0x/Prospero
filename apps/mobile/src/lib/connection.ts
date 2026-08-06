@@ -50,6 +50,7 @@ const HEARTBEAT_MS = 10_000;
 const SILENCE_LIMIT_MS = 35_000;
 /** 断线期间最多排队多少条待发消息 */
 const MAX_QUEUE = 50;
+const CLIENT_PLATFORM = Platform.OS === "android" ? "android" : "ios";
 
 interface Won {
   ws: WebSocket;
@@ -186,7 +187,7 @@ export class HostConnection {
     const addrs = this.orderedAddrs();
     return new Promise<Won>((resolve, reject) => {
       if (addrs.length === 0) {
-        this.diagnosis = diagnose([], !this.everConnected);
+        this.diagnosis = diagnose([], !this.everConnected, CLIENT_PLATFORM);
         reject(new Error(this.diagnosis.summary));
         return;
       }
@@ -197,7 +198,7 @@ export class HostConnection {
       const finishFailure = (): void => {
         if (done) return;
         done = true;
-        this.diagnosis = diagnose(failures, !this.everConnected);
+        this.diagnosis = diagnose(failures, !this.everConnected, CLIENT_PLATFORM);
         reject(new Error(this.diagnosis.summary));
       };
 

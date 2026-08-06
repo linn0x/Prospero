@@ -14,6 +14,7 @@ import {
   PROTOCOL_VERSION,
   ProtocolError,
   fromB64,
+  hostIdForDaemonPublicKey,
   parseC2S,
   CLOSE_AUTH_FAILED,
   CLOSE_PROTOCOL,
@@ -130,6 +131,7 @@ export async function createDaemonServer(
 ): Promise<DaemonServer> {
   const identity = loadIdentity(opts.home);
   const DAEMON_STARTED_AT = Date.now();
+  const hostId = hostIdForDaemonPublicKey(identity.publicKey);
   // --dev 的一次性口令:每次启动重新生成,只存在内存里,只打印到启动它的终端。
   // 这样"能看到终端输出"就成了使用明文通道的前提,而不是"恰好在本机跑着"。
   const devToken = randomBytes(18).toString("base64url");
@@ -184,7 +186,13 @@ export async function createDaemonServer(
     if (body.kind === "permission.request" && delivered === 0 && notifier.enabled) {
       const info = safeInfo(sid);
       if (info) {
-        void notifier.notifyPermission(sid, info, body.action, body.resources[0] ?? "");
+        void notifier.notifyPermission(
+          sid,
+          info,
+          body.action,
+          body.resources[0] ?? "",
+          `prospero://host/${encodeURIComponent(hostId)}/session/${encodeURIComponent(sid)}`,
+        );
       }
     }
     if (body.kind === "permission.resolved") notifier.clear(sid);

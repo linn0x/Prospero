@@ -8,6 +8,7 @@ import {
   View,
 } from "react-native";
 import { Stack, router, useFocusEffect } from "expo-router";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Icon } from "@/components/Icon";
 import { SwipeRow } from "@/components/SwipeRow";
 import { getConnection, wireAppStateReconnect } from "@/lib/connection";
@@ -26,6 +27,7 @@ const statusLabel: Record<ConnStatus, string> = {
 
 
 export default function HostsScreen() {
+  const insets = useSafeAreaInsets();
   const [hosts, setLocal] = useState<StoredHost[]>([]);
   const setHosts = useApp((s) => s.setHosts);
   const runtimes = useApp((s) => s.runtimes);
@@ -91,7 +93,7 @@ export default function HostsScreen() {
         <FlatList
           data={hosts}
           keyExtractor={(h) => h.id}
-          contentContainerStyle={styles.list}
+          contentContainerStyle={[styles.list, { paddingBottom: insets.bottom + 20 }]}
           ListFooterComponent={
             hosts.length > 0 ? (
               <Text style={styles.swipeHint}>左滑可编辑连接地址或删除配对</Text>

@@ -180,6 +180,7 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
         setSupportMultipleWindows={false}
         allowsLinkPreview={false}
         webviewDebuggingEnabled={__DEV__}
+        androidLayerType="hardware"
         originWhitelist={["*"]}
         bounces={false}
         overScrollMode="never"

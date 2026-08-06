@@ -40,6 +40,27 @@ describe("推送通道", () => {
     expect(b["group"]).toBe("Prospero");
   });
 
+  it("ntfy 点击链接可直达对应会话", async () => {
+    const { n, calls } = makeNotifier();
+    const link = "prospero://host/mac1/session/s1";
+    await n.notifyPermission("s1", session, "Bash", "pwd", link);
+    expect(calls[0]!.body["click"]).toBe(link);
+    expect(calls[0]!.body["url"]).toBe(link);
+  });
+
+  it("用户配置的 deepLink 可覆盖自动生成的会话链接", async () => {
+    const calls: Record<string, unknown>[] = [];
+    const n = new Notifier(
+      { url: "https://ntfy.sh/topic", deepLink: "prospero://" },
+      (_url, init) => {
+        calls.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+        return Promise.resolve({ ok: true, status: 200 });
+      },
+    );
+    await n.notifyPermission("s1", session, "Write", "a", "prospero://host/h/session/s1");
+    expect(calls[0]!["click"]).toBe("prospero://");
+  });
+
   it("静默期内同一会话不重复推送", async () => {
     let t = 1000;
     const { n, calls } = makeNotifier(() => t);
