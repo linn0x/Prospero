@@ -20,17 +20,17 @@ interface KeyDef {
  * 覆盖全部 26 个组合,而工具条只多一个键位。
  */
 const KEYS: KeyDef[] = [
-  { label: "esc", seq: "\x1b" },
-  { label: "tab", seq: "\t" },
-  { label: "⏎", seq: "\r" },
+  { label: "Esc", seq: "\x1b" },
+  { label: "Tab", seq: "\t" },
   { label: "↑", seq: "\x1b[A" },
   { label: "↓", seq: "\x1b[B" },
   { label: "←", seq: "\x1b[D" },
   { label: "→", seq: "\x1b[C" },
-  { label: "home", seq: "\x1b[H" },
-  { label: "end", seq: "\x1b[F" },
-  { label: "pgup", seq: "\x1b[5~" },
-  { label: "pgdn", seq: "\x1b[6~" },
+  { label: "⏎", seq: "\r" },
+  { label: "Home", seq: "\x1b[H" },
+  { label: "End", seq: "\x1b[F" },
+  { label: "PgUp", seq: "\x1b[5~" },
+  { label: "PgDn", seq: "\x1b[6~" },
   // 手机键盘上这几个要切两层符号页才够得着,而它们在命令行里极高频
   { label: "/", seq: "/" },
   { label: "-", seq: "-" },
@@ -43,7 +43,13 @@ const CTRL_SHORTCUTS: KeyDef[] = [
   { label: "^C", seq: "\x03" },
   { label: "^D", seq: "\x04" },
   { label: "^R", seq: "\x12" },
+  { label: "^A", seq: "\x01" },
+  { label: "^E", seq: "\x05" },
+  { label: "^W", seq: "\x17" },
+  { label: "^K", seq: "\x0b" },
 ];
+
+const CTRL_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("");
 
 export function KeyBar({
   onKey,
@@ -59,12 +65,8 @@ export function KeyBar({
   const [ctrl, setCtrl] = useState(false);
 
   const send = (seq: string): void => {
-    if (ctrl) {
-      onKey(ctrlCode(seq));
-      setCtrl(false);
-      return;
-    }
     onKey(seq);
+    void Haptics.selectionAsync();
   };
 
   const paste = async (): Promise<void> => {
@@ -81,6 +83,33 @@ export function KeyBar({
 
   return (
     <View style={styles.bar}>
+      {ctrl && (
+        <View style={styles.ctrlTray}>
+          <Text style={styles.ctrlLabel}>Ctrl +</Text>
+          <ScrollView
+            horizontal
+            keyboardShouldPersistTaps="always"
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={styles.ctrlContent}
+          >
+            {CTRL_LETTERS.map((letter) => (
+              <Pressable
+                key={letter}
+                onPress={() => {
+                  onKey(ctrlCode(letter));
+                  setCtrl(false);
+                  void Haptics.selectionAsync();
+                }}
+                style={({ pressed }) => [styles.ctrlKey, pressed && styles.keyPressed]}
+                accessibilityRole="keyboardkey"
+                accessibilityLabel={`Control ${letter}`}
+              >
+                <Text style={styles.ctrlKeyText}>{letter}</Text>
+              </Pressable>
+            ))}
+          </ScrollView>
+        </View>
+      )}
       <ScrollView
         horizontal
         keyboardShouldPersistTaps="always"
@@ -98,18 +127,23 @@ export function KeyBar({
             ctrl && styles.modifierOn,
             pressed && styles.keyPressed,
           ]}
+          accessibilityRole="button"
+          accessibilityState={{ selected: ctrl }}
+          accessibilityLabel="Control 组合键"
         >
-          <Text style={[styles.keyText, ctrl && styles.keyTextOn]}>ctrl</Text>
+          <Text style={[styles.keyText, ctrl && styles.keyTextOn]}>Ctrl</Text>
         </Pressable>
 
         {CTRL_SHORTCUTS.map((k) => (
           <Pressable
             key={k.label}
             onPress={() => {
-              onKey(k.seq);
+              send(k.seq);
               setCtrl(false);
             }}
             style={({ pressed }) => [styles.key, pressed && styles.keyPressed]}
+            accessibilityRole="keyboardkey"
+            accessibilityLabel={k.label}
           >
             <Text style={styles.keyText}>{k.label}</Text>
           </Pressable>
@@ -122,6 +156,8 @@ export function KeyBar({
             key={k.label}
             onPress={() => send(k.seq)}
             style={({ pressed }) => [styles.key, pressed && styles.keyPressed]}
+            accessibilityRole="keyboardkey"
+            accessibilityLabel={k.label}
           >
             <Text style={styles.keyText}>{k.label}</Text>
           </Pressable>
@@ -132,6 +168,8 @@ export function KeyBar({
         <Pressable
           onPress={() => void paste()}
           style={({ pressed }) => [styles.key, pressed && styles.keyPressed]}
+          accessibilityRole="button"
+          accessibilityLabel="粘贴剪贴板内容"
         >
           <Text style={styles.keyText}>粘贴</Text>
         </Pressable>
@@ -140,12 +178,16 @@ export function KeyBar({
             <Pressable
               onPress={() => onFontSize(-1)}
               style={({ pressed }) => [styles.key, pressed && styles.keyPressed]}
+              accessibilityRole="button"
+              accessibilityLabel="缩小终端文字"
             >
               <Text style={styles.keyText}>A−</Text>
             </Pressable>
             <Pressable
               onPress={() => onFontSize(1)}
               style={({ pressed }) => [styles.key, pressed && styles.keyPressed]}
+              accessibilityRole="button"
+              accessibilityLabel="放大终端文字"
             >
               <Text style={styles.keyText}>A+</Text>
             </Pressable>
@@ -155,45 +197,67 @@ export function KeyBar({
           <Pressable
             onPress={onDismissKeyboard}
             style={({ pressed }) => [styles.key, pressed && styles.keyPressed]}
+            accessibilityRole="button"
+            accessibilityLabel="收起键盘"
           >
-            <Text style={styles.keyText}>⌄收起</Text>
+            <Text style={styles.keyText}>⌄ 键盘</Text>
           </Pressable>
         )}
         {onScrollBottom && (
           <Pressable
             onPress={onScrollBottom}
             style={({ pressed }) => [styles.key, pressed && styles.keyPressed]}
+            accessibilityRole="button"
+            accessibilityLabel="滚动到底部"
           >
-            <Text style={styles.keyText}>↧底</Text>
+            <Text style={styles.keyText}>↧ 底部</Text>
           </Pressable>
         )}
       </ScrollView>
-      {ctrl && <Text style={styles.hint}>ctrl 已按下 —— 再点一个字母键</Text>}
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  bar: { backgroundColor: "#141419" },
-  content: { paddingHorizontal: 8, paddingVertical: 6, gap: 6, alignItems: "center" },
+  bar: {
+    backgroundColor: "#141419",
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: "#26262D",
+  },
+  content: { paddingHorizontal: 8, paddingVertical: 7, gap: 6, alignItems: "center" },
   key: {
-    backgroundColor: "#26262e",
-    borderRadius: 6,
+    minHeight: 36,
+    backgroundColor: "#24242B",
+    borderRadius: 9,
     paddingHorizontal: 12,
-    paddingVertical: 6,
-    minWidth: 40,
+    paddingVertical: 7,
+    minWidth: 42,
     alignItems: "center",
+    justifyContent: "center",
   },
-  keyPressed: { backgroundColor: "#3a3a46" },
-  modifier: { borderWidth: 1, borderColor: "#3a3a46" },
-  modifierOn: { backgroundColor: "#3557b7", borderColor: "#5a7fd0" },
-  keyText: { color: "#e8e8ee", fontSize: 14, fontVariant: ["tabular-nums"] },
+  keyPressed: { backgroundColor: "#3A3A45", transform: [{ scale: 0.96 }] },
+  modifier: { borderWidth: 1, borderColor: "#3A3A45" },
+  modifierOn: { backgroundColor: "#3A5BA8", borderColor: "#7AA2F7" },
+  keyText: { color: "#E8E8EE", fontSize: 13, fontVariant: ["tabular-nums"] },
   keyTextOn: { color: "#fff", fontWeight: "600" },
-  sep: { width: 1, alignSelf: "stretch", marginHorizontal: 3, backgroundColor: "#2a2a33" },
-  hint: {
-    color: "#7aa2f7",
-    fontSize: 11,
-    paddingHorizontal: 12,
-    paddingBottom: 5,
+  sep: { width: 1, alignSelf: "stretch", marginHorizontal: 3, backgroundColor: "#303038" },
+  ctrlTray: {
+    minHeight: 42,
+    flexDirection: "row",
+    alignItems: "center",
+    paddingLeft: 12,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: "#26262D",
   },
+  ctrlLabel: { color: "#7AA2F7", fontSize: 12, fontWeight: "600", marginRight: 6 },
+  ctrlContent: { gap: 5, paddingVertical: 6, paddingRight: 12 },
+  ctrlKey: {
+    width: 31,
+    height: 30,
+    borderRadius: 8,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#24242B",
+  },
+  ctrlKeyText: { color: "#E8E8EE", fontSize: 12, fontWeight: "600" },
 });

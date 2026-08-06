@@ -383,6 +383,25 @@ export async function createDaemonServer(
       case "hello":
         send(conn, { type: "error", code: "bad_message", message: "already authenticated" });
         return;
+      case "workspace.list": {
+        // 新建会话前还没有 sid,所以浏览根固定为当前 macOS 用户的 home。
+        // listDir 会 realpath 并阻止符号链接逃逸;响应里只回这一级的预览。
+        const root = os.homedir();
+        const cwd = path.join(root, msg.path);
+        try {
+          const entries = await listDir(root, msg.path);
+          send(conn, { type: "workspace.listing", path: msg.path, cwd, entries });
+        } catch (e) {
+          send(conn, {
+            type: "workspace.listing",
+            path: msg.path,
+            cwd,
+            entries: [],
+            error: e instanceof Error ? e.message : String(e),
+          });
+        }
+        return;
+      }
       case "session.create": {
         const info = await manager.create({
           agent: msg.agent,
