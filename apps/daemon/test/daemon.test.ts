@@ -134,6 +134,20 @@ afterAll(async () => {
 });
 
 describe("daemon 全链路", () => {
+  it("新建会话前可在用户 home 内预览并选择工作目录", async () => {
+    const c = await TestClient.connect(deviceToken, deviceKeys);
+    await c.waitFor((m) => m.type === "hello.ok", "hello.ok");
+    c.send({ type: "workspace.list", path: "" });
+    const result = await c.waitFor(
+      (m) => m.type === "workspace.listing" && m.path === "",
+      "workspace.listing",
+    );
+    const listing = result as Extract<S2CMessage, { type: "workspace.listing" }>;
+    expect(listing.cwd).toBe(os.homedir());
+    expect(Array.isArray(listing.entries)).toBe(true);
+    c.close();
+  }, 20000);
+
   it("握手 → hello.ok → 创建会话 → 输出 → 正常结束", async () => {
     const c = await TestClient.connect(deviceToken, deviceKeys);
     await c.waitFor((m) => m.type === "hello.ok", "hello.ok");

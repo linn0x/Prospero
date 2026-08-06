@@ -14,29 +14,31 @@ import {
 } from "react-native";
 import * as Haptics from "expo-haptics";
 import { Stack, router, useLocalSearchParams } from "expo-router";
-import type { ApprovalPolicy, SessionInfo, UsageWindow } from "@prospero/protocol";
-import type { S2CMessage } from "@prospero/protocol";
-
-type UsageResult = Extract<S2CMessage, { type: "usage.result" }>;
-
-/** 把 ISO 时间说成人话:「14:30」或「明天 09:00」 */
-function formatReset(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  const now = new Date();
-  const hhmm = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
-  return d.toDateString() === now.toDateString() ? hhmm : `${String(d.getMonth() + 1)}/${String(d.getDate())} ${hhmm}`;
-}
+import type { ApprovalPolicy, S2CMessage, SessionInfo, UsageWindow } from "@prospero/protocol";
 import { ChatView } from "@/components/ChatView";
+import { DismissKey } from "@/components/DismissKey";
 import { Icon } from "@/components/Icon";
 import { KeyBar } from "@/components/KeyBar";
 import { QuickReplies } from "@/components/QuickReplies";
 import { Terminal, type TerminalHandle } from "@/components/Terminal";
 import { pickFromCamera, pickFromLibrary, type PickedImage } from "@/lib/attach";
 import { Meter, Row, Sheet } from "@/components/Sheet";
-import { color, font, utilizationColor } from "@/lib/theme";
+import { color, font, statusColor, utilizationColor } from "@/lib/theme";
 import { matchCommands } from "@/lib/slash-commands";
 import { useHostConnection } from "@/lib/use-host-connection";
+
+type UsageResult = Extract<S2CMessage, { type: "usage.result" }>;
+
+/** 把 ISO 时间说成人话:「14:30」或「8/6 09:00」 */
+function formatReset(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const now = new Date();
+  const hhmm = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  return d.toDateString() === now.toDateString()
+    ? hhmm
+    : `${String(d.getMonth() + 1)}/${String(d.getDate())} ${hhmm}`;
+}
 
 const statusText: Record<SessionInfo["status"], string> = {
   starting: "启动中",
@@ -47,25 +49,88 @@ const statusText: Record<SessionInfo["status"], string> = {
   died: "已退出",
 };
 
-/** 每秒刷新的耗时显示("运行中 · 12s") */
+/** 每秒刷新耗时;计时只重渲染标题,不牵动终端 WebView 与聊天列表。 */
 function useElapsed(since: number | undefined): string {
-  const [, tick] = useState(0);
+  const [clock, setClock] = useState<{ since: number; label: string } | null>(null);
   useEffect(() => {
     if (since === undefined) return;
-    const t = setInterval(() => tick((n) => n + 1), 1000);
-    return () => clearInterval(t);
+    const update = (): void => {
+      const seconds = Math.max(0, Math.floor((Date.now() - since) / 1000));
+      if (seconds < 60) {
+        setClock({ since, label: `${String(seconds)}s` });
+        return;
+      }
+      const minutes = Math.floor(seconds / 60);
+      setClock({
+        since,
+        label:
+          minutes < 60
+            ? `${String(minutes)}m ${String(seconds % 60)}s`
+            : `${String(Math.floor(minutes / 60))}h ${String(minutes % 60)}m`,
+      });
+    };
+    // 避免在 effect 主体同步 setState,同时让标题首帧尽快补上耗时。
+    const first = setTimeout(update, 0);
+    const timer = setInterval(update, 1000);
+    return () => {
+      clearTimeout(first);
+      clearInterval(timer);
+    };
   }, [since]);
-  if (since === undefined) return "";
-  const s = Math.max(0, Math.floor((Date.now() - since) / 1000));
-  if (s < 60) return `${String(s)}s`;
-  const m = Math.floor(s / 60);
-  return m < 60 ? `${String(m)}m ${String(s % 60)}s` : `${String(Math.floor(m / 60))}h ${String(m % 60)}m`;
+  return since !== undefined && clock?.since === since ? clock.label : "";
+}
+
+function SessionHeaderTitle({
+  session,
+  pending,
+  tightest,
+}: {
+  session?: SessionInfo;
+  pending: number;
+  tightest: UsageWindow | null;
+}) {
+  const busy = session?.status === "running" || session?.status === "starting";
+  const elapsed = useElapsed(
+    busy || session?.status === "waiting_approval" ? session?.busySince : undefined,
+  );
+  const totals = session?.totals;
+  const parts = session
+    ? [
+        session.agent,
+        `${statusText[session.status]}${elapsed ? ` ${elapsed}` : ""}`,
+        pending > 0 ? `${String(pending)} 项待批` : "",
+        totals && totals.costUsd > 0 ? `$${totals.costUsd.toFixed(3)}` : "",
+        tightest ? `${tightest.label} ${String(Math.round(tightest.utilization))}%` : "",
+      ].filter(Boolean)
+    : [];
+
+  return (
+    <View style={styles.headerTitle}>
+      <Text style={styles.headerName} numberOfLines={1}>
+        {session?.title ?? "会话"}
+      </Text>
+      {session && (
+        <View style={styles.headerMetaRow}>
+          <View
+            style={[
+              styles.headerDot,
+              { backgroundColor: statusColor[session.status] ?? color.textDim },
+            ]}
+          />
+          <Text style={styles.headerSub} numberOfLines={1}>
+            {parts.join(" · ")}
+          </Text>
+        </View>
+      )}
+    </View>
+  );
 }
 
 export default function SessionScreen() {
   const { hostId, sid } = useLocalSearchParams<{ hostId: string; sid: string }>();
   const { conn, runtime } = useHostConnection(hostId);
   const [draft, setDraft] = useState("");
+  const [focused, setFocused] = useState(false);
   const [pending, setPending] = useState(0);
   /** 结构化会话可切到 TTY 视图查看底层终端 */
   const [showTty, setShowTty] = useState(false);
@@ -78,6 +143,11 @@ export default function SessionScreen() {
   const [usage, setUsage] = useState<UsageResult | null>(null);
   const [usageOpen, setUsageOpen] = useState(false);
   const [usageError, setUsageError] = useState<string | null>(null);
+  const [images, setImages] = useState<PickedImage[]>([]);
+  const termRef = useRef<TerminalHandle>(null);
+  // 字号存在会话页而不是终端内部:切走再回来不该重置成默认值
+  const [fontSize, setFontSize] = useState(12);
+  const [perf, setPerf] = useState<{ fps: number; kb: number; renderer: string } | null>(null);
 
   // 只显示最吃紧的那个窗口 —— 头部塞不下三个,而你关心的永远是先撞上的那个
   const tightest = (usage?.windows ?? []).reduce<UsageWindow | null>(
@@ -85,17 +155,13 @@ export default function SessionScreen() {
     null,
   );
 
-  const elapsed = useElapsed(busy || session?.status === "waiting_approval" ? session?.busySince : undefined);
-
-  const [images, setImages] = useState<PickedImage[]>([]);
-
   const send = useCallback(
     (text: string): void => {
       const t = text.trim();
       // 只带图不带字是合理的:一张报错截图本身就是问题
-      if (!conn || !sid || (t.length === 0 && images.length === 0)) return;
+      if (!conn || !sid || (t.length === 0 && (!isChat || images.length === 0))) return;
       void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-      if (isStructured) {
+      if (isChat) {
         conn.chatSend(
           sid,
           t,
@@ -107,7 +173,7 @@ export default function SessionScreen() {
       }
       setDraft("");
     },
-    [conn, sid, isStructured, images],
+    [conn, sid, isChat, images, setDraft, setImages],
   );
 
   // 会话打开时取一次;不轮询 —— 限流窗口是小时级的,盯着刷没意义
@@ -171,57 +237,17 @@ export default function SessionScreen() {
     return (
       <View style={styles.center}>
         <Stack.Screen options={{ title: "会话" }} />
+        <ActivityIndicator color={color.accent} />
         <Text style={styles.dim}>正在准备连接…</Text>
       </View>
     );
   }
-
-  const termRef = useRef<TerminalHandle>(null);
-  // 字号存在会话页而不是终端内部:切走再回来不该重置成默认值
-  const [fontSize, setFontSize] = useState(12);
-  const [perf, setPerf] = useState<{ fps: number; kb: number; renderer: string } | null>(null);
 
   const policy: ApprovalPolicy = session?.approvalPolicy ?? "strict";
   const policyLabel: Record<ApprovalPolicy, string> = {
     strict: "逐条批准",
     standard: "半自动",
     yolo: "YOLO",
-  };
-
-  /**
-   * 溢出菜单。
-   *
-   * 头部原本并排塞了搜索、终端切换、用量、审批策略、停止、结束六个入口 ——
-   * 手机顶栏放不下这么多,几个文字胶囊挤在一起也难看。除了"停止"(唯一
-   * 分秒必争的),其余都收进这里;当前状态直接写在菜单项上,不必点开才知道。
-   */
-  const openMenu = (): void => {
-    const items: { text: string; style?: "destructive" | "cancel"; onPress?: () => void }[] = [];
-    if (isChat) {
-      items.push({
-        text: search === null ? "搜索消息" : "退出搜索",
-        onPress: () => setSearch((v) => (v === null ? "" : null)),
-      });
-    }
-    if (isStructured) {
-      items.push({
-        text: showTty ? "切到对话" : "切到终端",
-        onPress: () => setShowTty((v) => !v),
-      });
-      items.push({
-        text: tightest
-          ? `用量与限流(${tightest.label} ${String(Math.round(tightest.utilization))}%)`
-          : "用量与限流",
-        onPress: showUsage,
-      });
-      items.push({
-        text: `审批策略:${policyLabel[policy]}`,
-        onPress: choosePolicy,
-      });
-    }
-    items.push({ text: "结束会话", style: "destructive", onPress: confirmKill });
-    items.push({ text: "取消", style: "cancel" });
-    Alert.alert(session?.title ?? "会话", undefined, items);
   };
 
   const choosePolicy = (): void => {
@@ -262,21 +288,39 @@ export default function SessionScreen() {
     );
   };
 
-  const totals = session?.totals;
-  const subtitle = session
-    ? `${session.agent} · ${statusText[session.status]}${elapsed ? ` · ${elapsed}` : ""}${
-        pending > 0 ? ` · ${String(pending)} 项待批` : ""
-      }${
-        totals && totals.costUsd > 0 ? ` · 共 $${totals.costUsd.toFixed(3)}` : ""
-      }${
-        // 洪峰时才有值。A4 验收线是 30fps,平时没输出就不显示,免得占位置
-        perf ? ` · ${String(perf.fps)}fps ${String(perf.kb)}KB/s` : ""
-      }${tightest ? ` · ${tightest.label} ${String(Math.round(tightest.utilization))}%` : ""}`
-    : "";
+  /** 常用的 Chat / Shell 切换直接可见,不再藏在三级菜单里。 */
+  const switchMode = (tty: boolean): void => {
+    if (showTty === tty) return;
+    void Haptics.selectionAsync();
+    setShowTty(tty);
+    setSearch(null);
+    if (tty) setImages([]);
+  };
+
+  /** 低频与危险操作保留在系统菜单里,当前策略直接写在菜单项上。 */
+  const openMenu = (): void => {
+    const items: { text: string; style?: "destructive" | "cancel"; onPress?: () => void }[] = [];
+    if (isStructured) {
+      items.push({
+        text: tightest
+          ? `用量与限流(${tightest.label} ${String(Math.round(tightest.utilization))}%)`
+          : "用量与限流",
+        onPress: showUsage,
+      });
+      items.push({
+        text: `审批策略:${policyLabel[policy]}`,
+        onPress: choosePolicy,
+      });
+    }
+    items.push({ text: "结束会话", style: "destructive", onPress: confirmKill });
+    items.push({ text: "取消", style: "cancel" });
+    Alert.alert(session?.title ?? "会话", undefined, items);
+  };
 
   // 输入以 / 开头时给命令候选
   const commandHints =
     isChat && session ? matchCommands(session.agent, draft.trim()) : [];
+  const canSend = draft.trim().length > 0 || (isChat && images.length > 0);
 
   return (
     <KeyboardAvoidingView
@@ -287,26 +331,27 @@ export default function SessionScreen() {
       <Stack.Screen
         options={{
           headerTitle: () => (
-            <View style={styles.headerTitle}>
-              <Text style={styles.headerName} numberOfLines={1}>
-                {session?.title ?? "会话"}
-              </Text>
-              {subtitle.length > 0 && (
-                <Text style={styles.headerSub} numberOfLines={1}>
-                  {subtitle}
-                </Text>
-              )}
-            </View>
+            <SessionHeaderTitle session={session} pending={pending} tightest={tightest} />
           ),
           headerRight: () => (
             <View style={styles.headerRight}>
               {/* 只有"停止"留在外面 —— 它是唯一分秒必争的操作 */}
               {busy && (
-                <Pressable onPress={() => conn.interrupt(sid)} hitSlop={8}>
+                <Pressable
+                  onPress={() => conn.interrupt(sid)}
+                  hitSlop={8}
+                  accessibilityRole="button"
+                  accessibilityLabel="停止当前任务"
+                >
                   <Icon name="stop.circle" size={21} color={color.warn} />
                 </Pressable>
               )}
-              <Pressable onPress={openMenu} hitSlop={8}>
+              <Pressable
+                onPress={openMenu}
+                hitSlop={8}
+                accessibilityRole="button"
+                accessibilityLabel="更多会话操作"
+              >
                 <Icon name="ellipsis.circle" size={21} color={color.accent} />
               </Pressable>
             </View>
@@ -315,16 +360,69 @@ export default function SessionScreen() {
       />
       {runtime.status !== "connected" && (
         <View style={styles.reconnBar}>
-          <Text style={styles.reconnText}>
-            {runtime.status === "failed"
-              ? `连接失败:${runtime.lastError ?? ""}`
-              : "连接断开,重连中…(内容将自动恢复)"}
-          </Text>
+          <View style={styles.reconnCopy}>
+            <View style={styles.reconnDot} />
+            <Text style={styles.reconnText} numberOfLines={2}>
+              {runtime.status === "failed"
+                ? `连接失败 · ${runtime.lastError ?? "请重试"}`
+                : "连接已中断 · 正在自动恢复"}
+            </Text>
+          </View>
+          <Pressable onPress={() => conn.kick()} hitSlop={8} accessibilityRole="button">
+            <Text style={styles.reconnAction}>重试</Text>
+          </Pressable>
+        </View>
+      )}
+
+      {isStructured && (
+        <View style={styles.modeBar}>
+          <View style={styles.modeSwitch} accessibilityRole="tablist">
+            <Pressable
+              style={[styles.modeTab, !showTty && styles.modeTabActive]}
+              onPress={() => switchMode(false)}
+              accessibilityRole="tab"
+              accessibilityState={{ selected: !showTty }}
+              accessibilityLabel="对话视图"
+            >
+              <Icon
+                name="bubble.left.and.text.bubble.right"
+                size={14}
+                color={!showTty ? color.text : color.textDim}
+              />
+              <Text style={[styles.modeText, !showTty && styles.modeTextActive]}>对话</Text>
+              {pending > 0 && (
+                <View style={styles.pendingBadge}>
+                  <Text style={styles.pendingBadgeText}>{pending > 9 ? "9+" : pending}</Text>
+                </View>
+              )}
+            </Pressable>
+            <Pressable
+              style={[styles.modeTab, showTty && styles.modeTabActive]}
+              onPress={() => switchMode(true)}
+              accessibilityRole="tab"
+              accessibilityState={{ selected: showTty }}
+              accessibilityLabel="终端视图"
+            >
+              <Icon name="terminal" size={14} color={showTty ? color.text : color.textDim} />
+              <Text style={[styles.modeText, showTty && styles.modeTextActive]}>终端</Text>
+            </Pressable>
+          </View>
+          {!showTty && (
+            <Pressable
+              style={[styles.modeAction, search !== null && styles.modeActionActive]}
+              onPress={() => setSearch((value) => (value === null ? "" : null))}
+              accessibilityRole="button"
+              accessibilityLabel={search === null ? "搜索消息" : "关闭搜索"}
+            >
+              <Icon name="magnifyingglass" size={16} color={color.textDim} />
+            </Pressable>
+          )}
         </View>
       )}
 
       {isChat && search !== null && (
         <View style={styles.searchBar}>
+          <Icon name="magnifyingglass" size={15} color={color.textFaint} />
           <TextInput
             style={styles.searchInput}
             placeholder="在本会话中搜索…"
@@ -355,23 +453,24 @@ export default function SessionScreen() {
           {isStructured && showTty && (
             <View style={styles.ttyNotice}>
               <Text style={styles.ttyNoticeText}>
-                TTY 视图:结构化会话没有终端输出,此处用于排查底层进程。
+                原始 TTY · 部分结构化 agent 可能不会在这里输出内容
+                {__DEV__ && perf
+                  ? ` · ${perf.renderer} ${String(perf.fps)}fps ${String(perf.kb)}KB/s`
+                  : ""}
               </Text>
             </View>
           )}
           <Terminal ref={termRef} conn={conn} sid={sid} onFontSize={setFontSize} onPerf={setPerf} />
-          {!isStructured && (
-            <KeyBar
-              onKey={(seq) => conn.inputText(sid, seq)}
-              onFontSize={(delta) => {
-                const next = Math.min(20, Math.max(8, fontSize + delta));
-                setFontSize(next);
-                termRef.current?.setFontSize(next);
-              }}
-              onScrollBottom={() => termRef.current?.scrollToBottom()}
-              onDismissKeyboard={() => termRef.current?.blur()}
-            />
-          )}
+          <KeyBar
+            onKey={(seq) => conn.inputText(sid, seq)}
+            onFontSize={(delta) => {
+              const next = Math.min(20, Math.max(8, fontSize + delta));
+              setFontSize(next);
+              termRef.current?.setFontSize(next);
+            }}
+            onScrollBottom={() => termRef.current?.scrollToBottom()}
+            onDismissKeyboard={() => termRef.current?.blur()}
+          />
         </>
       )}
 
@@ -388,7 +487,7 @@ export default function SessionScreen() {
 
       {isChat && commandHints.length === 0 && <QuickReplies busy={busy} onPick={send} />}
 
-      {images.length > 0 && (
+      {isChat && images.length > 0 && (
         <ScrollView horizontal style={styles.thumbs} contentContainerStyle={styles.thumbsRow}>
           {images.map((img, i) => (
             <View key={img.uri} style={styles.thumbWrap}>
@@ -397,6 +496,8 @@ export default function SessionScreen() {
                 style={styles.thumbX}
                 hitSlop={6}
                 onPress={() => setImages((v) => v.filter((_, j) => j !== i))}
+                accessibilityRole="button"
+                accessibilityLabel={`移除第 ${String(i + 1)} 张图片`}
               >
                 <Text style={styles.thumbXText}>×</Text>
               </Pressable>
@@ -448,17 +549,25 @@ export default function SessionScreen() {
       </Sheet>
 
       <View style={styles.composer}>
+        <DismissKey visible={focused} />
         {isChat && (
-          <Pressable style={styles.attachBtn} onPress={attach} hitSlop={6}>
-            <Icon name="doc.on.doc" size={17} color="#7aa2f7" />
+          <Pressable
+            style={({ pressed }) => [styles.iconBtn, pressed && styles.composerBtnPressed]}
+            onPress={attach}
+            accessibilityRole="button"
+            accessibilityLabel="添加图片"
+          >
+            <Icon name="paperclip" size={17} color={color.textDim} />
           </Pressable>
         )}
         <TextInput
           style={[styles.input, isChat && styles.inputChat]}
-          placeholder={isChat ? `给 ${session?.agent ?? "agent"} 发消息…` : "输入后发送(自动回车)"}
-          placeholderTextColor="#5a5a66"
+          placeholder={isChat ? `给 ${session?.agent ?? "agent"} 发消息` : "输入命令，回车执行"}
+          placeholderTextColor={color.textFaint}
           value={draft}
           onChangeText={setDraft}
+          onFocus={() => { setFocused(true); }}
+          onBlur={() => { setFocused(false); }}
           onSubmitEditing={() => send(draft)}
           submitBehavior={isChat ? "newline" : "submit"}
           returnKeyType={isChat ? "default" : "send"}
@@ -467,12 +576,16 @@ export default function SessionScreen() {
           multiline={isChat}
         />
         <Pressable
-          style={[
+          style={({ pressed }) => [
             styles.sendBtn,
-            draft.trim().length === 0 && images.length === 0 && styles.sendBtnDim,
+            !canSend && styles.sendBtnDim,
+            pressed && canSend && styles.sendBtnPressed,
           ]}
           onPress={() => send(draft)}
-          disabled={draft.trim().length === 0 && images.length === 0}
+          disabled={!canSend}
+          accessibilityRole="button"
+          accessibilityLabel={isChat ? "发送消息" : "执行命令"}
+          accessibilityState={{ disabled: !canSend }}
         >
           <Icon name="arrow.up" size={17} color="#fff" weight="semibold" />
         </Pressable>
@@ -485,111 +598,191 @@ export default function SessionScreen() {
 const MAX_IMAGES = 6;
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: "#0b0b0e" },
-  thumbs: { flexGrow: 0, backgroundColor: "#141419" },
-  thumbsRow: { gap: 8, paddingHorizontal: 12, paddingVertical: 8 },
-  thumbWrap: { width: 56, height: 56 },
-  thumb: { width: 56, height: 56, borderRadius: 8, backgroundColor: "#26262e" },
-  thumbX: {
-    position: "absolute",
-    top: -5,
-    right: -5,
-    width: 20,
-    height: 20,
-    borderRadius: 10,
-    backgroundColor: "#2a2a33",
+  container: { flex: 1, backgroundColor: color.bg },
+  center: { flex: 1, alignItems: "center", justifyContent: "center", gap: 12 },
+  dim: { color: color.textDim, fontSize: 14 },
+
+  headerTitle: { alignItems: "center", maxWidth: 238 },
+  headerName: { color: color.text, fontSize: 16, fontWeight: "600" },
+  headerMetaRow: { flexDirection: "row", alignItems: "center", gap: 5, marginTop: 2 },
+  headerDot: { width: 5, height: 5, borderRadius: 3 },
+  headerSub: { color: color.textDim, fontSize: 10.5, flexShrink: 1 },
+  headerRight: { flexDirection: "row", gap: 16, alignItems: "center" },
+
+  modeBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    backgroundColor: color.bg,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: color.border,
+  },
+  modeSwitch: {
+    flex: 1,
+    flexDirection: "row",
+    gap: 3,
+    padding: 3,
+    backgroundColor: color.surfaceRaised,
+    borderRadius: 12,
+  },
+  modeTab: {
+    flex: 1,
+    minHeight: 34,
+    borderRadius: 9,
+    flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
+    gap: 7,
   },
-  thumbXText: { color: "#e8e8ee", fontSize: 13, lineHeight: 15 },
-  attachBtn: { paddingHorizontal: 6, paddingVertical: 10 },
-  center: { flex: 1, alignItems: "center", justifyContent: "center" },
-  dim: { color: "#5a5a66" },
-  headerTitle: { alignItems: "center", maxWidth: 220 },
-  headerName: { color: "#e8e8ee", fontSize: 16, fontWeight: "600" },
-  headerSub: { color: "#7a7a86", fontSize: 11, marginTop: 1 },
-  headerRight: { flexDirection: "row", gap: 12, alignItems: "center" },
+  modeTabActive: {
+    backgroundColor: color.pressed,
+    shadowColor: "#000",
+    shadowOpacity: 0.22,
+    shadowRadius: 4,
+    shadowOffset: { width: 0, height: 1 },
+  },
+  modeText: { color: color.textDim, fontSize: 13, fontWeight: "500" },
+  modeTextActive: { color: color.text, fontWeight: "600" },
+  pendingBadge: {
+    minWidth: 18,
+    height: 18,
+    paddingHorizontal: 4,
+    borderRadius: 9,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: color.danger,
+  },
+  pendingBadgeText: { color: "#fff", fontSize: 10, fontWeight: "700" },
+  modeAction: {
+    width: 40,
+    height: 40,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 12,
+    backgroundColor: color.surfaceRaised,
+  },
+  modeActionActive: { backgroundColor: color.accentBg },
+
+  reconnBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+    backgroundColor: color.warnBg,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  reconnCopy: { flex: 1, flexDirection: "row", alignItems: "center", gap: 8 },
+  reconnDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: color.warn },
+  reconnText: { flex: 1, color: "#EAC77C", fontSize: 12, lineHeight: 16 },
+  reconnAction: { color: color.text, fontSize: 12, fontWeight: "600" },
+
+  searchBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 9,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    backgroundColor: color.surface,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: color.border,
+  },
+  searchInput: {
+    flex: 1,
+    minHeight: 36,
+    backgroundColor: color.surfaceRaised,
+    borderRadius: 10,
+    paddingHorizontal: 11,
+    paddingVertical: 7,
+    color: color.text,
+    fontSize: 14,
+  },
+  searchCancel: { color: color.accent, fontSize: 14, fontWeight: "500" },
+
+  cmdBox: { backgroundColor: color.surface, paddingHorizontal: 10, paddingTop: 6, gap: 3 },
+  cmdRow: {
+    flexDirection: "row",
+    alignItems: "baseline",
+    gap: 10,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    backgroundColor: color.surfaceRaised,
+    borderRadius: 9,
+  },
+  cmdName: { color: color.accent, fontSize: 13, fontFamily: "Menlo" },
+  cmdDesc: { color: color.textDim, fontSize: 12, flex: 1 },
+
+  ttyNotice: { backgroundColor: color.accentBg, paddingHorizontal: 12, paddingVertical: 7 },
+  ttyNoticeText: { color: "#9AB7E8", fontSize: 11, lineHeight: 15 },
+
+  thumbs: { flexGrow: 0, backgroundColor: color.surface },
+  thumbsRow: { gap: 10, paddingHorizontal: 12, paddingTop: 10, paddingBottom: 4 },
+  thumbWrap: { width: 58, height: 58 },
+  thumb: { width: 58, height: 58, borderRadius: 10, backgroundColor: color.surfaceRaised },
+  thumbX: {
+    position: "absolute",
+    top: -6,
+    right: -6,
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: color.pressed,
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 2,
+    borderColor: color.surface,
+  },
+  thumbXText: { color: color.text, fontSize: 14, lineHeight: 16 },
+
   sheetLoading: { paddingVertical: 32 },
   sheetNote: { color: color.textDim, fontSize: 13, lineHeight: 19, paddingVertical: 12 },
   window: { gap: 6, paddingVertical: 14 },
   windowHead: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
   windowPct: { fontSize: 15, fontWeight: "600", fontVariant: ["tabular-nums"] },
-  ttyBtn: {
-    color: "#8a8a96",
-    fontSize: 12,
-    borderWidth: 1,
-    borderColor: "#33333d",
-    borderRadius: 6,
-    paddingHorizontal: 7,
-    paddingVertical: 3,
-    overflow: "hidden",
-  },
-  ttyBtnActive: { color: "#7aa2f7", borderColor: "#3557b7" },
-  // 放宽后必须显眼 —— 用户要能一眼看出这个会话没在逐条把关
-  policyRelaxed: { color: "#e5a341", borderColor: "#7a5a1a" },
-  // 用掉 80% 以上就变色 —— 到那时你该知道自己快撞墙了
-  usageHot: { color: "#e5534b", borderColor: "#7a2a2a" },
-  stopText: { color: "#d9a441", fontSize: 15 },
-  killText: { color: "#e5534b", fontSize: 15 },
-  reconnBar: { backgroundColor: "#3a2f1f", paddingHorizontal: 12, paddingVertical: 6 },
-  reconnText: { color: "#e8c98a", fontSize: 12 },
-  searchBar: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    backgroundColor: "#141419",
-  },
-  searchInput: {
-    flex: 1,
-    backgroundColor: "#1c1c24",
-    borderRadius: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    color: "#e8e8ee",
-    fontSize: 15,
-  },
-  searchCancel: { color: "#7aa2f7", fontSize: 15 },
-  cmdBox: { backgroundColor: "#0b0b0e", paddingHorizontal: 10, paddingBottom: 4, gap: 2 },
-  cmdRow: {
-    flexDirection: "row",
-    alignItems: "baseline",
-    gap: 10,
-    paddingVertical: 7,
-    paddingHorizontal: 8,
-    backgroundColor: "#15151b",
-    borderRadius: 8,
-  },
-  cmdName: { color: "#7aa2f7", fontSize: 14, fontFamily: "Menlo" },
-  cmdDesc: { color: "#8a8a96", fontSize: 12, flex: 1 },
-  ttyNotice: { backgroundColor: "#16202b", paddingHorizontal: 12, paddingVertical: 6 },
-  ttyNoticeText: { color: "#8fb0d0", fontSize: 11 },
+
   composer: {
     flexDirection: "row",
     gap: 8,
-    padding: 8,
-    backgroundColor: "#141419",
+    paddingHorizontal: 10,
+    paddingTop: 8,
+    paddingBottom: 10,
+    backgroundColor: color.surface,
     alignItems: "flex-end",
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: color.border,
   },
-  input: {
-    flex: 1,
-    backgroundColor: "#1c1c24",
-    borderRadius: 18,
-    paddingHorizontal: 14,
-    paddingVertical: 9,
-    color: "#e8e8ee",
-    fontSize: 15,
-  },
-  inputChat: { maxHeight: 120, minHeight: 40 },
-  sendBtn: {
-    backgroundColor: "#3557b7",
-    borderRadius: 18,
-    width: 36,
-    height: 36,
+  iconBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: color.surfaceRaised,
     alignItems: "center",
     justifyContent: "center",
   },
-  sendBtnDim: { opacity: 0.4 },
-  sendText: { color: "#fff", fontWeight: "700", fontSize: 17 },
+  composerBtnPressed: { backgroundColor: color.pressed },
+  input: {
+    flex: 1,
+    minHeight: 40,
+    backgroundColor: color.surfaceRaised,
+    borderRadius: 20,
+    paddingHorizontal: 14,
+    paddingTop: 9,
+    paddingBottom: 9,
+    color: color.text,
+    fontSize: 15,
+    lineHeight: 21,
+  },
+  inputChat: { maxHeight: 132 },
+  sendBtn: {
+    backgroundColor: color.accentDim,
+    borderRadius: 20,
+    width: 40,
+    height: 40,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  sendBtnDim: { backgroundColor: color.surfaceRaised, opacity: 0.72 },
+  sendBtnPressed: { transform: [{ scale: 0.94 }] },
 });

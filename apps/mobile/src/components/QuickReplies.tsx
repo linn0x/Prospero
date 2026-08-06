@@ -37,6 +37,8 @@ export function QuickReplies({
           key={t}
           onPress={() => onPick(t)}
           style={({ pressed }) => [styles.chip, pressed && styles.chipPressed]}
+          accessibilityRole="button"
+          accessibilityLabel={`快速发送：${t}`}
         >
           <Text style={styles.chipText}>{t}</Text>
         </Pressable>
@@ -46,16 +48,16 @@ export function QuickReplies({
 }
 
 const styles = StyleSheet.create({
-  bar: { flexGrow: 0, backgroundColor: "#0b0b0e" },
-  content: { paddingHorizontal: 10, paddingVertical: 6, gap: 6 },
+  bar: { flexGrow: 0, backgroundColor: "#141419" },
+  content: { paddingHorizontal: 10, paddingTop: 7, paddingBottom: 3, gap: 7 },
   chip: {
-    backgroundColor: "#1c1c24",
-    borderRadius: 14,
-    paddingHorizontal: 13,
-    paddingVertical: 6,
-    borderWidth: 1,
-    borderColor: "#26262e",
+    minHeight: 32,
+    justifyContent: "center",
+    backgroundColor: "#24242B",
+    borderRadius: 16,
+    paddingHorizontal: 14,
+    paddingVertical: 7,
   },
-  chipPressed: { backgroundColor: "#2a2a34" },
-  chipText: { color: "#b8b8c4", fontSize: 13 },
+  chipPressed: { backgroundColor: "#34343E", transform: [{ scale: 0.98 }] },
+  chipText: { color: "#C6C6D0", fontSize: 12.5, fontWeight: "500" },
 });

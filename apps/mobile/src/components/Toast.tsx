@@ -17,7 +17,7 @@ export function toast(message: string): void {
 
 export function ToastHost(): React.ReactElement | null {
   const [message, setMessage] = useState<string | null>(null);
-  const opacity = useRef(new Animated.Value(0)).current;
+  const [opacity] = useState(() => new Animated.Value(0));
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
