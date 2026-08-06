@@ -20,13 +20,17 @@ import {
   utf8Encode,
   ProtocolError,
   type AgentKind,
+  type AgentQuestionAnswer,
   type ApprovalPolicy,
   type Attachment,
+  type ChatDelivery,
+  type ChatSuggestionKind,
   type C2SMessage,
   type KeyPairB64,
   type PermissionReply,
   type S2CAgentEvent,
   type S2CChatSnapshot,
+  type S2CChatSuggestions,
   type S2CError,
   type S2CHelloOk,
   type S2CMessage,
@@ -426,6 +430,10 @@ export class HostConnection {
       case "git.diff.result":
       case "git.done":
       case "usage.result":
+      case "chat.suggestions":
+      case "agent.models":
+      case "agent.modes":
+      case "agent.control.result":
         this.resolveFs(msg);
         return;
       case "error":
@@ -461,7 +469,17 @@ export class HostConnection {
     // git.status / git.done 没有 path,用消息类型当 key 的一部分
     // 账号级应答不带 sid,用固定键配对(与 usageGet 省略 sid 时一致)
     const owner = msg.type === "workspace.listing" ? "#workspace" : (msg.sid ?? "#account");
-    const key = this.fsKey(owner, msg.path ?? `#${msg.type}`);
+    const responsePath =
+      msg.type === "chat.suggestions"
+        ? `#chat.suggestions:${msg.requestId}`
+        : msg.type === "agent.models"
+          ? `#agent.models:${msg.requestId}`
+          : msg.type === "agent.modes"
+            ? `#agent.modes:${msg.requestId}`
+            : msg.type === "agent.control.result"
+              ? `#agent.control:${msg.requestId}`
+        : (msg.path ?? `#${msg.type}`);
+    const key = this.fsKey(owner, responsePath);
     const waiter = this.fsWaiters.get(key);
     if (!waiter) return;
     this.fsWaiters.delete(key);
@@ -485,6 +503,7 @@ export class HostConnection {
     path: string,
     msg: C2SMessage,
     timeoutMs = 15000,
+    queueable = true,
   ): Promise<T> {
     if (!this.isConnected) return Promise.reject(new Error("未连接"));
     const key = this.fsKey(sid, path);
@@ -504,7 +523,7 @@ export class HostConnection {
           reject(e);
         },
       });
-      this.send(msg, true);
+      this.send(msg, queueable);
     });
   }
 
@@ -719,6 +738,28 @@ export class HostConnection {
     this.send({ type: "permission.respond", sid, reqId, reply }, true);
   }
 
+  respondQuestion(
+    sid: string,
+    reqId: string,
+    answers: AgentQuestionAnswer[],
+    cancelled = false,
+  ): void {
+    this.send(
+      {
+        type: "question.respond",
+        sid,
+        reqId,
+        answers,
+        ...(cancelled ? { cancelled: true } : {}),
+      },
+      true,
+    );
+  }
+
+  sendToSubagent(sid: string, subagentId: string, text: string): void {
+    this.send({ type: "subagent.send", sid, subagentId, text }, true);
+  }
+
   inputB64(sid: string, dataB64: string): void {
     this.send({ type: "term.input", sid, dataB64 });
   }
@@ -739,10 +780,110 @@ export class HostConnection {
     this.send({ type: "session.interrupt", sid }, true);
   }
 
-  chatSend(sid: string, text: string, attachments?: Attachment[]): void {
+  chatSend(
+    sid: string,
+    text: string,
+    attachments?: Attachment[],
+    delivery: ChatDelivery = "auto",
+  ): void {
     this.send(
-      { type: "chat.send", sid, text, ...(attachments?.length ? { attachments } : {}) },
+      {
+        type: "chat.send",
+        sid,
+        text,
+        ...(attachments?.length ? { attachments } : {}),
+        ...(delivery !== "auto" ? { delivery } : {}),
+      },
       true,
+    );
+  }
+
+  removeQueuedMessage(sid: string, queueId: string): void {
+    this.send({ type: "chat.queue.remove", sid, queueId }, true);
+  }
+
+  guideQueuedMessage(sid: string, queueId: string): void {
+    this.send({ type: "chat.queue.guide", sid, queueId }, true);
+  }
+
+  /** 输入补全是瞬时请求；断线时不排队，避免重连后弹出过期候选。 */
+  chatComplete(
+    sid: string,
+    kind: ChatSuggestionKind,
+    query: string,
+    requestId: string,
+  ): Promise<S2CChatSuggestions> {
+    return this.fsRequest(
+      sid,
+      `#chat.suggestions:${requestId}`,
+      { type: "chat.complete", sid, requestId, kind, query },
+      8000,
+      false,
+    );
+  }
+
+  private agentRequestId(): string {
+    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
+  }
+
+  agentModels(sid: string): Promise<Extract<S2CMessage, { type: "agent.models" }>> {
+    const requestId = this.agentRequestId();
+    return this.fsRequest(
+      sid,
+      `#agent.models:${requestId}`,
+      { type: "agent.models.get", sid, requestId },
+    );
+  }
+
+  agentModes(sid: string): Promise<Extract<S2CMessage, { type: "agent.modes" }>> {
+    const requestId = this.agentRequestId();
+    return this.fsRequest(
+      sid,
+      `#agent.modes:${requestId}`,
+      { type: "agent.modes.get", sid, requestId },
+    );
+  }
+
+  setAgentModel(
+    sid: string,
+    model: string,
+    effort?: string,
+  ): Promise<Extract<S2CMessage, { type: "agent.control.result" }>> {
+    const requestId = this.agentRequestId();
+    return this.fsRequest(
+      sid,
+      `#agent.control:${requestId}`,
+      {
+        type: "agent.model.set",
+        sid,
+        requestId,
+        model,
+        ...(effort ? { effort } : {}),
+      },
+      30_000,
+    );
+  }
+
+  setAgentMode(
+    sid: string,
+    mode: string,
+  ): Promise<Extract<S2CMessage, { type: "agent.control.result" }>> {
+    const requestId = this.agentRequestId();
+    return this.fsRequest(
+      sid,
+      `#agent.control:${requestId}`,
+      { type: "agent.mode.set", sid, requestId, mode },
+      30_000,
+    );
+  }
+
+  compactAgent(sid: string): Promise<Extract<S2CMessage, { type: "agent.control.result" }>> {
+    const requestId = this.agentRequestId();
+    return this.fsRequest(
+      sid,
+      `#agent.control:${requestId}`,
+      { type: "agent.compact", sid, requestId },
+      200_000,
     );
   }
 
