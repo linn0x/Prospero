@@ -1,3 +1,5 @@
+import { Platform } from "react-native";
+
 /**
  * 视觉语言的单一来源。
  *
@@ -9,6 +11,9 @@
  * - 文字只有三级(主/次/弱)。第四级永远是设计没想清楚的信号。
  * - 间距走 4 的倍数,圆角只有三档。约束越少,越不容易走样。
  */
+
+/** Menlo 不随 Android 分发；monospace 会映射到设备自带的等宽字体。 */
+export const MONOSPACE_FONT = Platform.OS === "ios" ? "Menlo" : "monospace";
 
 export const color = {
   /** 页面底色 */
@@ -63,7 +68,7 @@ export const font = {
   sub: { fontSize: 13, color: color.textDim },
   /** 元信息、时间戳 */
   meta: { fontSize: 11, color: color.textFaint },
-  mono: { fontFamily: "Menlo", fontSize: 12, color: color.text },
+  mono: { fontFamily: MONOSPACE_FONT, fontSize: 12, color: color.text },
 } as const;
 
 /** 会话/连接状态到颜色 —— 全 App 一套,不再各屏各写 */
