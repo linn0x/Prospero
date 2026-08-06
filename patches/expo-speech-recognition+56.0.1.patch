@@ -1,0 +1,30 @@
+diff --git a/node_modules/expo-speech-recognition/ios/ExpoSpeechRecognizer.swift b/node_modules/expo-speech-recognition/ios/ExpoSpeechRecognizer.swift
+index c474f80..d10f315 100644
+--- a/node_modules/expo-speech-recognition/ios/ExpoSpeechRecognizer.swift
++++ b/node_modules/expo-speech-recognition/ios/ExpoSpeechRecognizer.swift
+@@ -219,6 +219,14 @@ actor ExpoSpeechRecognizer: ObservableObject {
+       return
+     }
+ 
++    // Fail closed: Apple only honors requiresOnDeviceRecognition when this
++    // locale supports it. Never start a task that could use the network.
++    if options.requiresOnDeviceRecognition && !recognizer.supportsOnDeviceRecognition {
++      errorHandler(RecognizerError.recognizerIsUnavailable)
++      reset(andEmitEnd: true)
++      return
++    }
++
+     do {
+       let request = Self.prepareRequest(
+         options: options,
+@@ -576,9 +584,7 @@ actor ExpoSpeechRecognizer: ObservableObject {
+     // These won't get emitted to the user, however
+     request.shouldReportPartialResults = options.interimResults || !options.continuous
+ 
+-    if recognizer.supportsOnDeviceRecognition {
+-      request.requiresOnDeviceRecognition = options.requiresOnDeviceRecognition
+-    }
++    request.requiresOnDeviceRecognition = options.requiresOnDeviceRecognition
+ 
+     if let taskHint = options.iosTaskHint {
+       request.taskHint = taskHint.sfSpeechRecognitionTaskHint

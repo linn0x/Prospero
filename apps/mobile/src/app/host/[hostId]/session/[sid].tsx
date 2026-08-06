@@ -13,6 +13,7 @@ import {
   View,
 } from "react-native";
 import * as Haptics from "expo-haptics";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Stack, router, useLocalSearchParams } from "expo-router";
 import type { ApprovalPolicy, S2CMessage, SessionInfo, UsageWindow } from "@prospero/protocol";
 import { ChatView } from "@/components/ChatView";
@@ -21,11 +22,14 @@ import { Icon } from "@/components/Icon";
 import { KeyBar } from "@/components/KeyBar";
 import { QuickReplies } from "@/components/QuickReplies";
 import { Terminal, type TerminalHandle } from "@/components/Terminal";
+import { VoiceButton } from "@/components/VoiceButton";
 import { pickFromCamera, pickFromLibrary, type PickedImage } from "@/lib/attach";
 import { Meter, Row, Sheet } from "@/components/Sheet";
 import { color, font, statusColor, utilizationColor } from "@/lib/theme";
 import { matchCommands } from "@/lib/slash-commands";
+import { MONOSPACE_FONT } from "@/lib/theme";
 import { useHostConnection } from "@/lib/use-host-connection";
+import { appendVoiceTranscript } from "@/lib/voice-input";
 
 type UsageResult = Extract<S2CMessage, { type: "usage.result" }>;
 
@@ -127,6 +131,11 @@ function SessionHeaderTitle({
 }
 
 export default function SessionScreen() {
+  const insets = useSafeAreaInsets();
+  const appendTranscript = useCallback((text: string): void => {
+    // 使用函数式更新，转写期间用户新打的字也不会被旧闭包覆盖。
+    setDraft((current) => appendVoiceTranscript(current, text));
+  }, []);
   const { hostId, sid } = useLocalSearchParams<{ hostId: string; sid: string }>();
   const { conn, runtime } = useHostConnection(hostId);
   const [draft, setDraft] = useState("");
@@ -325,7 +334,9 @@ export default function SessionScreen() {
   return (
     <KeyboardAvoidingView
       style={styles.container}
-      behavior={Platform.OS === "ios" ? "padding" : undefined}
+      // targetSdk 35+ 的 edge-to-edge 窗口上，adjustResize 仍可能只让 IME 覆盖
+      // ReactRootView；Android 需显式按键盘高度缩短这一层，保证输入栏留在键盘上方。
+      behavior={Platform.OS === "ios" ? "padding" : "height"}
       keyboardVerticalOffset={Platform.OS === "ios" ? 88 : 0}
     >
       <Stack.Screen
@@ -548,7 +559,7 @@ export default function SessionScreen() {
         )}
       </Sheet>
 
-      <View style={styles.composer}>
+      <View style={[styles.composer, { paddingBottom: Math.max(insets.bottom, 8) }]}>
         <DismissKey visible={focused} />
         {isChat && (
           <Pressable
@@ -575,6 +586,7 @@ export default function SessionScreen() {
           autoCorrect={false}
           multiline={isChat}
         />
+        {isChat && <VoiceButton onTranscript={appendTranscript} />}
         <Pressable
           style={({ pressed }) => [
             styles.sendBtn,
@@ -711,7 +723,7 @@ const styles = StyleSheet.create({
     backgroundColor: color.surfaceRaised,
     borderRadius: 9,
   },
-  cmdName: { color: color.accent, fontSize: 13, fontFamily: "Menlo" },
+  cmdName: { color: color.accent, fontSize: 13, fontFamily: MONOSPACE_FONT },
   cmdDesc: { color: color.textDim, fontSize: 12, flex: 1 },
 
   ttyNotice: { backgroundColor: color.accentBg, paddingHorizontal: 12, paddingVertical: 7 },

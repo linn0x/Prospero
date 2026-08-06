@@ -12,7 +12,7 @@ import { Icon } from "@/components/Icon";
 import { Markdown } from "@/components/Markdown";
 import { toast } from "@/components/Toast";
 import type { HostConnection } from "@/lib/connection";
-import { color, radius } from "@/lib/theme";
+import { MONOSPACE_FONT, color, radius } from "@/lib/theme";
 import {
   applyEvents,
   applyToolOutput,
@@ -573,11 +573,11 @@ const styles = StyleSheet.create({
   toolName: { color: color.text, fontSize: 13, fontWeight: "600", flex: 1 },
   diffBadge: { color: color.success, fontSize: 11, fontVariant: ["tabular-nums"] },
   toolState: { color: color.textFaint, fontSize: 11 },
-  toolInput: { color: color.textDim, fontSize: 12, fontFamily: "Menlo", lineHeight: 18 },
+  toolInput: { color: color.textDim, fontSize: 12, fontFamily: MONOSPACE_FONT, lineHeight: 18 },
   toolResult: {
     color: "#A9B4A9",
     fontSize: 12,
-    fontFamily: "Menlo",
+    fontFamily: MONOSPACE_FONT,
     lineHeight: 18,
     borderTopWidth: StyleSheet.hairlineWidth,
     borderTopColor: color.border,
@@ -608,11 +608,11 @@ const styles = StyleSheet.create({
   permHeaderCopy: { flex: 1, gap: 2 },
   permKicker: { color: color.warn, fontSize: 11, fontWeight: "700" },
   permTitle: { color: color.text, fontSize: 14, fontWeight: "600", lineHeight: 20 },
-  permAction: { color: "#DABF87", fontSize: 12, fontFamily: "Menlo" },
+  permAction: { color: "#DABF87", fontSize: 12, fontFamily: MONOSPACE_FONT },
   permResource: {
     color: color.text,
     fontSize: 12,
-    fontFamily: "Menlo",
+    fontFamily: MONOSPACE_FONT,
     backgroundColor: "#1B1712",
     borderRadius: 8,
     padding: 9,
