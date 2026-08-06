@@ -97,6 +97,9 @@ export default function PairScreen() {
           onChangeText={setManual}
           autoCapitalize="none"
           autoCorrect={false}
+          // 回车即配对 —— 单行框按下 return 会自动失焦,顺带把键盘收了
+          returnKeyType="go"
+          onSubmitEditing={() => void handle(manual)}
         />
         <Pressable style={styles.btn} onPress={() => void handle(manual)}>
           <Text style={styles.btnText}>添加</Text>
