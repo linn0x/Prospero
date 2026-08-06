@@ -10,7 +10,8 @@ import {
 import { Stack, router, useFocusEffect } from "expo-router";
 import { Icon } from "@/components/Icon";
 import { SwipeRow } from "@/components/SwipeRow";
-import { getHosts, removeHost, type StoredHost } from "@/lib/hosts";
+import { getConnection, wireAppStateReconnect } from "@/lib/connection";
+import { getDeviceKeys, getHosts, removeHost, type StoredHost } from "@/lib/hosts";
 import { useApp, type ConnStatus } from "@/lib/store";
 import { color, font, radius, space, statusColor } from "@/lib/theme";
 
@@ -31,10 +32,24 @@ export default function HostsScreen() {
 
   useFocusEffect(
     useCallback(() => {
-      void getHosts().then((h) => {
+      let cancelled = false;
+      void (async () => {
+        const h = await getHosts();
+        if (cancelled) return;
         setLocal(h);
         setHosts(h);
-      });
+        // 冷启动后每台机器都显示"未连接",因为连接要等你点进主机页才建立 ——
+        // 那其实是"还没问过",却和"连不上"长得一模一样,而这两件事该做的处理
+        // 完全相反。开 App 就把已配对的机器连起来:状态是真的,点进去也不用
+        // 再等一次握手。start() 幂等,连接按主机缓存,进主机页时复用同一条。
+        const keys = await getDeviceKeys();
+        if (cancelled) return;
+        wireAppStateReconnect();
+        for (const host of h) getConnection(host, keys).start();
+      })();
+      return () => {
+        cancelled = true;
+      };
     }, [setHosts]),
   );
 
