@@ -24,6 +24,12 @@ describe("连接失败诊断", () => {
     expect(d.hint).toContain("本地网络");
   });
 
+  it("Android 首次不可达不误导用户寻找不存在的本地网络权限开关", () => {
+    const d = diagnose([at("192.168.1.5", "unreachable")], true, "android");
+    expect(d.hint).toContain("不需要单独");
+    expect(d.hint).toContain("同一网络");
+  });
+
   it("曾连接成功过再全部不可达 → 指向网络/休眠而非权限", () => {
     const d = diagnose([at("192.168.1.5", "unreachable")], false);
     expect(d.hint).not.toContain("本地网络");
@@ -41,6 +47,11 @@ describe("连接失败诊断", () => {
     expect(d.summary).toContain("版本不符");
     expect(d.hint).toContain("build-ipa");
     expect(d.fatal).toBe(true);
+  });
+
+  it("Android 版本不符时指向 APK 构建脚本", () => {
+    const d = diagnose([at("10.0.0.1", "version")], false, "android");
+    expect(d.hint).toContain("build-apk.sh");
   });
 
   it("设备被撤销时说清要重新配对,而不是含糊的握手失败", () => {

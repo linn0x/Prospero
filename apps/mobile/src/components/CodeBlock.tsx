@@ -2,6 +2,7 @@ import { memo, useState } from "react";
 import * as Clipboard from "expo-clipboard";
 import * as Haptics from "expo-haptics";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { MONOSPACE_FONT } from "@/lib/theme";
 
 /**
  * 代码块。带复制按钮 —— 手机上长按选中再拖两端去选一段命令是最折磨的操作之一,
@@ -61,7 +62,7 @@ const styles = StyleSheet.create({
   copiedText: { color: "#4dbd74" },
   scroll: { maxHeight: 280 },
   code: {
-    fontFamily: "Menlo",
+    fontFamily: MONOSPACE_FONT,
     fontSize: 12,
     color: "#c8c8d4",
     lineHeight: 18,

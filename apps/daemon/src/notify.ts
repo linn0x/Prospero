@@ -64,6 +64,7 @@ export class Notifier {
     session: Pick<SessionInfo, "title" | "agent">,
     action: string,
     detail: string,
+    deepLink?: string,
   ): Promise<boolean> {
     if (!this.config) return false;
     const throttle = this.config.throttleMs ?? DEFAULT_THROTTLE_MS;
@@ -76,7 +77,8 @@ export class Notifier {
       title: `${session.title} 需要批准`,
       // 只带动作与资源摘要,不带文件内容/命令输出
       body: detail.length > 0 ? `${action}: ${detail}` : action,
-      url: this.config.deepLink ?? "prospero://",
+      // config.deepLink 是用户显式覆盖；否则优先使用调用方生成的会话级链接。
+      url: this.config.deepLink ?? deepLink ?? "prospero://",
     });
   }
 

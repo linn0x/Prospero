@@ -1,6 +1,7 @@
 import { memo, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import type { FileDiff } from "@prospero/protocol";
+import { MONOSPACE_FONT } from "@/lib/theme";
 
 /**
  * 改动查看。手机屏窄,所以:
@@ -93,14 +94,14 @@ const styles = StyleSheet.create({
   row: { flexDirection: "row", paddingHorizontal: 8, minWidth: "100%" },
   rowAdd: { backgroundColor: "#12251a" },
   rowDel: { backgroundColor: "#2a1618" },
-  sign: { fontFamily: "Menlo", fontSize: 11, color: "#4a4a56", width: 12 },
+  sign: { fontFamily: MONOSPACE_FONT, fontSize: 11, color: "#4a4a56", width: 12 },
   signAdd: { color: "#4dbd74" },
   signDel: { color: "#e5534b" },
-  code: { fontFamily: "Menlo", fontSize: 11, lineHeight: 17, color: "#9a9aa6" },
+  code: { fontFamily: MONOSPACE_FONT, fontSize: 11, lineHeight: 17, color: "#9a9aa6" },
   codeAdd: { color: "#a8dcb8" },
   codeDel: { color: "#f0b0ab" },
   gapRow: { paddingHorizontal: 8, paddingVertical: 2, backgroundColor: "#141419" },
-  gapText: { fontFamily: "Menlo", fontSize: 11, color: "#4a4a56" },
+  gapText: { fontFamily: MONOSPACE_FONT, fontSize: 11, color: "#4a4a56" },
   more: {
     color: "#7aa2f7",
     fontSize: 12,

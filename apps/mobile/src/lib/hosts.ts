@@ -2,6 +2,7 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import {
   generateKeyPairB64,
+  hostIdForDaemonPublicKey,
   type KeyPairB64,
   type PairingPayload,
 } from "@prospero/protocol";
@@ -37,7 +38,7 @@ async function saveHosts(hosts: StoredHost[]): Promise<void> {
 }
 
 export function hostIdFor(daemonPub: string): string {
-  return daemonPub.slice(0, 16).replace(/[^a-zA-Z0-9]/g, "");
+  return hostIdForDaemonPublicKey(daemonPub);
 }
 
 export async function upsertHostFromPairing(p: PairingPayload): Promise<StoredHost> {
