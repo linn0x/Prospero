@@ -1,6 +1,6 @@
 # Prospero
 
-用手机(**iOS 优先**,Android 随后)丝滑远控 macOS 上的 code agent(opencode / Claude Code / Codex / Grok / Trae 及任意 CLI),并内置远程 Shell(免 sshd 的 SSH 平替)。局域网 / WireGuard 直连,零云中转,端到端加密。
+用手机(**iOS 优先**,Android 随后)丝滑远控 macOS 上的 code agent(OpenCode / Claude Code / Codex / Grok / Trae 及任意 CLI),并内置远程 Shell(免 sshd 的 SSH 平替)。局域网 / WireGuard 直连,零云中转,端到端加密。
 
 > "…my so potent art." — 像 Prospero 差遣 Ariel 一样,从掌心差遣你的 agents。
 
