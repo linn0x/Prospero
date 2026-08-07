@@ -25,6 +25,12 @@ struct ProsperoShellApp: App {
     print("  home:     \(DaemonStatus.home.path)")
     print("  端口:     \(status.port)")
     print("  监听:     \(status.bindLabel)")
+    let pending = UserDefaults.standard.string(forKey: "pendingBind")
+    if let pending {
+      print("  待生效:   \(pending == DaemonController.allInterfacesSpec ? "全部网卡" : pending)(下次启动)")
+    }
+    let ifaces = NetworkInterfaces.candidates()
+    print("  可选网卡: \(ifaces.isEmpty ? "无" : ifaces.map(\.label).joined(separator: ", "))")
     print("  已配对:   \(status.devices.count) 台")
     let host = status.bind ?? "127.0.0.1"
     let up = DaemonController.portInUse(host: host, port: status.port)
@@ -100,6 +106,9 @@ struct MenuContent: View {
   @Environment(\.openWindow) private var openWindow
 
   var body: some View {
+    // 一次 body 里只定位一遍,下面有两处要用
+    let cliPath = Locator.findCLI()
+
     Text(daemon.stateLabel)
 
     if case .externallyRunning = daemon.state {
@@ -109,6 +118,8 @@ struct MenuContent: View {
     }
 
     Divider()
+
+    BindPicker(daemon: daemon)
 
     switch daemon.state {
     case .running:
@@ -129,7 +140,7 @@ struct MenuContent: View {
       openWindow(id: "pairing")
       NSApp.activate(ignoringOtherApps: true)
     }
-    .disabled(Locator.findCLI() == nil)
+    .disabled(cliPath == nil)
 
     if daemon.status.devices.isEmpty {
       Text("尚未配对任何设备")
@@ -149,7 +160,7 @@ struct MenuContent: View {
 
     Divider()
 
-    if daemon.running?.isStale(cliPath: Locator.findCLI()) == true {
+    if daemon.running?.isStale(cliPath: cliPath) == true {
       Text("⚠︎ daemon 比磁盘上的代码旧 —— 改过代码就重启它")
       Button("重启 daemon 以加载新代码") { daemon.restart() }
     }
@@ -166,6 +177,28 @@ struct MenuContent: View {
 
     Divider()
 
+    // 定位失败时的报错文案一直叫用户「在菜单里手动指定」,但菜单里从来没有这两项。
+    // 补上,顺便让人能看见当前用的是哪条路径。
+    Menu("可执行文件位置") {
+      Text("node:\(Locator.findNode() ?? "找不到")")
+      Text("prosperod:\(cliPath ?? "找不到")")
+      Divider()
+      Button("选择 node…") {
+        chooseFile(title: "选择 node 解释器") { Locator.nodeOverride = $0 }
+      }
+      Button("选择 prosperod…") {
+        chooseFile(title: "选择 apps/daemon/dist/cli.js") { Locator.cliOverride = $0 }
+      }
+      if Locator.nodeOverride != nil || Locator.cliOverride != nil {
+        Divider()
+        Button("清除手动指定,恢复自动查找") {
+          Locator.nodeOverride = nil
+          Locator.cliOverride = nil
+          daemon.refresh()
+        }
+      }
+    }
+
     Button("查看日志…") {
       openWindow(id: "log")
       NSApp.activate(ignoringOtherApps: true)
@@ -178,6 +211,21 @@ struct MenuContent: View {
       NSApp.terminate(nil)
     }
     .keyboardShortcut("q")
+  }
+
+  /// 挑一个可执行文件/脚本。LSUIElement 的 app 不激活就弹不到前台,面板会藏在别人后面。
+  private func chooseFile(title: String, apply: (String) -> Void) {
+    let panel = NSOpenPanel()
+    panel.message = title
+    panel.canChooseFiles = true
+    panel.canChooseDirectories = false
+    panel.allowsMultipleSelection = false
+    panel.showsHiddenFiles = true
+    panel.treatsFilePackagesAsDirectories = true
+    NSApp.activate(ignoringOtherApps: true)
+    guard panel.runModal() == .OK, let url = panel.url else { return }
+    apply(url.path)
+    daemon.refresh()
   }
 
   /// 撤销不可逆(手机必须重新扫码),值得一次确认。
@@ -201,6 +249,89 @@ struct MenuContent: View {
   }
 }
 
+/// 选监听哪张网卡。
+///
+/// 绑定单张网卡的用处:Mac 同时挂着 WiFi 和 WireGuard 时,只监听隧道那张
+/// 就不会把服务暴露在咖啡馆的局域网上。代价是配对二维码只会带这一个地址
+/// —— 换网络就得重新配对,所以默认仍是全部网卡。
+struct BindPicker: View {
+  @Bindable var daemon: DaemonController
+
+  var body: some View {
+    let effective = daemon.effectiveBind
+    let dirty = daemon.pendingBind != nil
+
+    Menu(dirty ? "监听网卡 · 重启后生效" : "监听网卡") {
+      Button(mark(effective == nil) + "全部网卡") {
+        choose(DaemonController.allInterfacesSpec, label: "全部网卡")
+      }
+
+      let ifaces = NetworkInterfaces.candidates()
+      if !ifaces.isEmpty {
+        Divider()
+        ForEach(ifaces) { iface in
+          // config.json 里可能存的是网卡名(终端里 --bind en0 设的),两种都要能对上
+          let selected = effective == iface.address || effective == iface.name
+          Button(mark(selected) + iface.label) {
+            choose(iface.bindSpec, label: iface.label)
+          }
+        }
+      }
+
+      if dirty {
+        Divider()
+        Button("撤销这次更改") { daemon.setPendingBind(nil) }
+      }
+    }
+  }
+
+  private func mark(_ on: Bool) -> String { on ? "✓ " : "  " }
+
+  /// 改动只记在壳里,真正落盘由下次 `start` 时的 CLI 完成。
+  /// 所以这里唯一要问清楚的是:现在重启,还是等下次。
+  private func choose(_ spec: String, label: String) {
+    daemon.setPendingBind(spec)
+
+    // 终端里起的 daemon,壳重启不了它 —— 这时候光标一句"重启后生效"是句空话,
+    // 因为壳的这个参数永远轮不到用上。直接把该敲的命令给出来。
+    if case .externallyRunning = daemon.state {
+      let alert = NSAlert()
+      alert.messageText = "已记下「\(label)」,但当前 daemon 不是壳启动的"
+      alert.informativeText = """
+        壳只能在自己启动 daemon 时带上这个参数。要让它现在生效,\
+        在跑着 daemon 的终端里重启:
+
+        prosperod start --bind \(spec)
+        """
+      alert.addButton(withTitle: "复制命令")
+      alert.addButton(withTitle: "知道了")
+      NSApp.activate(ignoringOtherApps: true)
+      if alert.runModal() == .alertFirstButtonReturn {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString("prosperod start --bind \(spec)", forType: .string)
+      }
+      return
+    }
+
+    // 已停止 / 启动失败:下次点「启动 daemon」自然会带上,不用多问一句
+    guard case .running = daemon.state else { return }
+
+    let sessions = daemon.running?.sessions.count ?? 0
+    let alert = NSAlert()
+    alert.messageText = "监听网卡改为「\(label)」"
+    alert.informativeText = sessions > 0
+      ? "要立刻重启 daemon 生效吗?壳启动 daemon 时没带 --tmux,当前 \(sessions) 个会话会被杀掉。"
+      : "要立刻重启 daemon 生效吗?"
+    alert.alertStyle = .warning
+    alert.addButton(withTitle: "下次启动生效")
+    alert.addButton(withTitle: "现在重启")
+    NSApp.activate(ignoringOtherApps: true)
+    if alert.runModal() == .alertSecondButtonReturn {
+      daemon.restart()
+    }
+  }
+}
+
 /// 菜单里的运行中会话。数据来自 daemon 写的 status.json —— 壳不碰 WS 协议。
 struct SessionsSection: View {
   let running: RunningStatus?
@@ -212,8 +343,12 @@ struct SessionsSection: View {
         ? "会话(\(running.sessions.count))· 待审批 \(pending)"
         : "会话(\(running.sessions.count))")
       ForEach(running.sessions) { session in
-        // 会话不可在壳里操作(那是手机的活),这里只做一眼可见的总览
-        Text("  \(session.agent) · \(session.title) — \(session.statusLabel)")
+        // 会话不可在壳里操作(那是手机的活),这里只做一眼可见的总览。
+        // 用 Label 让状态先由图标传达 —— 扫一眼就知道哪个在等审批,不用逐行读文字。
+        Label(
+          "\(session.agent) · \(session.title) — \(session.statusLabel)",
+          systemImage: session.symbolName
+        )
       }
     } else if running != nil {
       Text("没有运行中的会话")
@@ -228,8 +363,10 @@ struct LoginItemToggle: View {
   @State private var error: String?
 
   var body: some View {
-    Button(LoginItem.isEnabled ? "✓ 开机自启" : "开机自启") {
-      error = LoginItem.setEnabled(!LoginItem.isEnabled)
+    // status 每问一次是一次跨进程往返,一次 body 里只问一遍
+    let enabled = LoginItem.isEnabled
+    Button(enabled ? "✓ 开机自启" : "开机自启") {
+      error = LoginItem.setEnabled(!enabled)
     }
     if let error {
       Text(error)
@@ -310,14 +447,53 @@ struct PairingView: View {
 
 struct LogView: View {
   @Bindable var daemon: DaemonController
+  /// 日志是往下长的,默认盯着最后一行。往回翻查历史的人可以关掉。
+  @State private var followTail = true
+
+  private static let tailAnchor = "tail"
 
   var body: some View {
-    ScrollView {
-      Text(daemon.recentLog.isEmpty ? "(daemon 由壳启动后,输出会显示在这里)" : daemon.recentLog.joined(separator: "\n"))
-        .font(.system(.caption, design: .monospaced))
-        .textSelection(.enabled)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
+    VStack(spacing: 0) {
+      ScrollViewReader { proxy in
+        ScrollView {
+          VStack(alignment: .leading, spacing: 0) {
+            Text(daemon.logText.isEmpty
+              ? "(daemon 由壳启动后,输出会显示在这里)"
+              : daemon.logText)
+              .font(.system(.caption, design: .monospaced))
+              .textSelection(.enabled)
+              .frame(maxWidth: .infinity, alignment: .leading)
+            Color.clear.frame(height: 1).id(Self.tailAnchor)
+          }
+          .padding(12)
+        }
+        .onChange(of: daemon.logText) {
+          guard followTail else { return }
+          proxy.scrollTo(Self.tailAnchor, anchor: .bottom)
+        }
+        .onAppear {
+          proxy.scrollTo(Self.tailAnchor, anchor: .bottom)
+        }
+      }
+
+      Divider()
+
+      HStack(spacing: 12) {
+        Toggle("跟随输出", isOn: $followTail)
+          .toggleStyle(.checkbox)
+        Spacer()
+        Button("复制全部") {
+          NSPasteboard.general.clearContents()
+          NSPasteboard.general.setString(daemon.logText, forType: .string)
+        }
+        .disabled(daemon.logText.isEmpty)
+        Button("清空") { daemon.clearLog() }
+          .disabled(daemon.logText.isEmpty)
+        Button("在访达中显示") {
+          NSWorkspace.shared.activateFileViewerSelecting([daemon.logURL])
+        }
+      }
+      .padding(8)
     }
     .frame(minWidth: 560, minHeight: 320)
   }
