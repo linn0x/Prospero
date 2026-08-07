@@ -16,19 +16,33 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { AgentEventBody, PermissionReply } from "@prospero/protocol";
-import { AdapterError, summarize, type AdapterContext, type AgentAdapter } from "./types.js";
+import {
+  AdapterError,
+  summarize,
+  type AdapterContext,
+  type AdapterResumeState,
+  type AgentAdapter,
+} from "./types.js";
 
 export interface GrokAdapterOptions {
   /** 结构化模式必须自动批准(headless 无逐条审批);默认 true */
   alwaysApprove?: boolean;
+  resumeState?: AdapterResumeState | undefined;
 }
 
 export class GrokAdapter implements AgentAdapter {
-  constructor(private readonly opts: GrokAdapterOptions = {}) {}
+  private readonly sessionId: string;
+  private started: boolean;
+
+  constructor(private readonly opts: GrokAdapterOptions = {}) {
+    this.sessionId =
+      typeof opts.resumeState?.["sessionId"] === "string"
+        ? opts.resumeState["sessionId"]
+        : randomUUID();
+    this.started = opts.resumeState?.["started"] === true;
+  }
 
   private ctx: AdapterContext | null = null;
-  private readonly sessionId = randomUUID();
-  private started = false;
   private turn: ChildProcess | null = null;
   private buf = "";
   private msgId = "";
@@ -36,6 +50,7 @@ export class GrokAdapter implements AgentAdapter {
 
   async start(ctx: AdapterContext): Promise<void> {
     this.ctx = ctx;
+    ctx.persistState?.({ sessionId: this.sessionId, started: this.started });
     // 会话建立时就把限制讲清楚,避免用户以为审批会弹到手机上
     ctx.emit({
       kind: "agent.error",
@@ -65,6 +80,7 @@ export class GrokAdapter implements AgentAdapter {
       ...((this.opts.alwaysApprove ?? true) ? ["--always-approve"] : []),
     ];
     this.started = true;
+    this.ctx.persistState?.({ sessionId: this.sessionId, started: true });
     this.msgId = `grok_${String(Date.now())}`;
     this.turnStarted = true;
     this.buf = "";

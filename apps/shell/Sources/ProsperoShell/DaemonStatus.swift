@@ -8,7 +8,7 @@ struct DaemonStatus: Sendable, Equatable {
   var devices: [Device] = []
 
   struct Device: Sendable, Equatable, Identifiable {
-    var id: String { name }
+    var id: String
     var name: String
     var allowShell: Bool
     var bound: Bool
@@ -43,8 +43,9 @@ struct DaemonStatus: Sendable, Equatable {
        let root = try? JSONSerialization.jsonObject(with: data),
        let arr = (root as? [String: Any])?["devices"] as? [[String: Any]]
                  ?? root as? [[String: Any]] {
-      status.devices = arr.map { d in
+      status.devices = arr.enumerated().map { index, d in
         Device(
+          id: d["token"] as? String ?? "\(d["name"] as? String ?? "device")-\(index)",
           name: d["name"] as? String ?? "(未命名)",
           allowShell: d["allowShell"] as? Bool ?? false,
           bound: d["clientPubKey"] != nil,

@@ -36,7 +36,7 @@ let manager: SessionManager | null = null;
 let session: StructuredSession | null = null;
 
 afterEach(async () => {
-  manager?.disposeAll();
+  await manager?.disposeAll();
   manager = null;
   await session?.dispose();
   session = null;
@@ -213,4 +213,118 @@ describeIf("Claude Code 结构化会话", () => {
     expect(events.some((e) => e.kind === "tool.end" && e.state === "success")).toBe(true);
     expect(readFileSync(path.join(cwd, "approved.txt"), "utf8")).toContain("PROSPERO");
   }, 180_000);
+});
+
+interface ClaudeHarnessInternals {
+  canUseTool(
+    tool: string,
+    input: Record<string, unknown>,
+    options: Record<string, unknown>,
+  ): Promise<unknown>;
+  onMessage(message: Record<string, unknown>): void;
+  input: { push(message: unknown): void };
+  q: { setPermissionMode(mode: string): Promise<void> };
+  ctx: unknown;
+}
+
+describe("Claude 原生提问、Plan 与子 Agent(桩数据)", () => {
+  function harness(): {
+    adapter: ClaudeAdapter;
+    events: AgentEventBody[];
+    internals: ClaudeHarnessInternals;
+  } {
+    const adapter = new ClaudeAdapter();
+    const events: AgentEventBody[] = [];
+    const internals = adapter as unknown as ClaudeHarnessInternals;
+    internals.ctx = {
+      cwd,
+      approvalPolicy: () => "standard",
+      emit: (event: AgentEventBody) => events.push(event),
+    };
+    return { adapter, events, internals };
+  }
+
+  it("AskUserQuestion 等待 GUI 回答，再把 answers 注回工具入参", async () => {
+    const { adapter, events, internals } = harness();
+    const controller = new AbortController();
+    const result = internals.canUseTool(
+      "AskUserQuestion",
+      {
+        questions: [{
+          header: "范围",
+          question: "先做哪一端？",
+          multiSelect: false,
+          options: [{ label: "iOS", description: "手机端" }],
+        }],
+      },
+      {
+        signal: controller.signal,
+        suggestions: [],
+        toolUseID: "ask-1",
+      },
+    );
+    const request = events[0];
+    expect(request).toMatchObject({
+      kind: "question.request",
+      questions: [{ id: "q1", question: "先做哪一端？" }],
+    });
+    if (!request || request.kind !== "question.request") throw new Error("缺少 question.request");
+    await adapter.respondQuestion?.(request.reqId, [
+      { questionId: "q1", values: ["iOS"] },
+    ]);
+    await expect(result).resolves.toMatchObject({
+      behavior: "allow",
+      updatedInput: { answers: { "先做哪一端？": "iOS" } },
+    });
+    expect(events.at(-1)).toMatchObject({ kind: "question.resolved", reqId: request.reqId });
+  });
+
+  it("Plan 通过 SDK permissionMode 原生切换", async () => {
+    const { adapter, internals } = harness();
+    const selected: string[] = [];
+    internals.q = { setPermissionMode: async (mode) => { selected.push(mode); } };
+    expect(await adapter.setMode?.("plan")).toEqual({ currentMode: "plan" });
+    expect(selected).toEqual(["plan"]);
+  });
+
+  it("task 生命周期进入会话管理，生命周期内可向 parent_tool_use_id 发消息", async () => {
+    const { adapter, events, internals } = harness();
+    const sent: unknown[] = [];
+    internals.input.push = (message) => sent.push(message);
+    internals.onMessage({
+      type: "system",
+      subtype: "task_started",
+      task_id: "task-1",
+      tool_use_id: "tool-1",
+      description: "检查测试",
+      subagent_type: "reviewer",
+    });
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "subagent.started",
+          subagent: expect.objectContaining({ id: "tool-1", name: "reviewer" }),
+        }),
+      ]),
+    );
+    await adapter.sendToSubagent?.("tool-1", "先看移动端");
+    expect(sent[0]).toMatchObject({
+      type: "user",
+      parent_tool_use_id: "tool-1",
+      message: { role: "user", content: "先看移动端" },
+    });
+    internals.onMessage({
+      type: "system",
+      subtype: "task_notification",
+      task_id: "task-1",
+      status: "completed",
+      summary: "检查完成",
+    });
+    expect(events.at(-1)).toMatchObject({
+      kind: "subagent.updated",
+      subagentId: "tool-1",
+      status: "completed",
+      canMessage: false,
+    });
+  });
 });

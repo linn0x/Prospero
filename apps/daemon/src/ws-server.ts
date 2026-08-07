@@ -96,7 +96,7 @@ export interface DaemonServer {
   port: number;
   /** --dev 的一次性明文口令(仅 devMode 有意义) */
   devToken: string;
-  /** 本次启动从 tmux 接管回来的会话数 */
+  /** 本次启动从 tmux/原生 Agent 存储接管回来的会话数 */
   restoredSessions: number;
   httpServer: Server;
   manager: SessionManager;
@@ -140,11 +140,23 @@ export async function createDaemonServer(
     const b = Buffer.from(devToken);
     return a.length === b.length && timingSafeEqual(a, b);
   };
-  const manager = new SessionManager(opts.useTmux ? { tmux: { home: opts.home } } : {});
-  // 菜单栏壳靠这个文件看会话列表(WS 协议要过 E2E 握手,壳没必要实现一遍)
+  // Mac GUI 的控制口令只落在 0600 的 status.json,且接口同时强制 loopback。
+  const controlToken = randomBytes(24).toString("base64url");
+  const controlTokenEqual = (supplied: string): boolean => {
+    const a = Buffer.from(supplied);
+    const b = Buffer.from(controlToken);
+    return a.length === b.length && timingSafeEqual(a, b);
+  };
+  const manager = new SessionManager({
+    home: opts.home,
+    ...(opts.useTmux ? { tmux: { home: opts.home } } : {}),
+  });
+  // Mac GUI 靠这个文件看会话列表(WS 协议要过 E2E 握手,壳没必要实现一遍)
   const statusFile = new StatusFile(opts.home, manager, {
     port: opts.port,
     bind: opts.bindAddr ?? null,
+    controlToken,
+    persistence: { pty: manager.tmuxEnabled, structured: true },
   });
   const conns = new Set<Conn>();
   const devMode = opts.devMode ?? false;
@@ -414,6 +426,7 @@ export async function createDaemonServer(
         const info = await manager.create({
           agent: msg.agent,
           kind: msg.kind,
+          approvalPolicy: msg.approvalPolicy,
           cwd: msg.cwd,
           command: msg.command,
           cols: msg.cols,
@@ -463,8 +476,161 @@ export async function createDaemonServer(
         return;
       }
       case "chat.send":
-        await manager.requireStructured(msg.sid).send(msg.text, msg.attachments);
+        await manager.requireStructured(msg.sid).send(msg.text, msg.attachments, msg.delivery);
         return;
+      case "chat.queue.remove":
+        manager.requireStructured(msg.sid).removeQueued(msg.queueId);
+        return;
+      case "chat.queue.guide":
+        await manager.requireStructured(msg.sid).guideQueued(msg.queueId);
+        return;
+      case "chat.complete": {
+        const session = manager.getStructured(msg.sid);
+        if (!session) {
+          send(conn, {
+            type: "error",
+            code: "session_not_found",
+            message: `no such structured session: ${msg.sid}`,
+            sid: msg.sid,
+          });
+          return;
+        }
+        try {
+          const items = await session.complete(msg.kind, msg.query);
+          send(conn, {
+            type: "chat.suggestions",
+            sid: msg.sid,
+            requestId: msg.requestId,
+            kind: msg.kind,
+            items,
+          });
+        } catch (error) {
+          send(conn, {
+            type: "error",
+            code: "bad_message",
+            message: error instanceof Error ? error.message : String(error),
+            sid: msg.sid,
+          });
+        }
+        return;
+      }
+      case "agent.models.get": {
+        try {
+          const catalog = await manager.requireStructured(msg.sid).models();
+          send(conn, {
+            type: "agent.models",
+            sid: msg.sid,
+            requestId: msg.requestId,
+            models: catalog.models,
+            ...(catalog.currentModel ? { currentModel: catalog.currentModel } : {}),
+            ...(catalog.currentEffort ? { currentEffort: catalog.currentEffort } : {}),
+          });
+        } catch (error) {
+          send(conn, {
+            type: "error",
+            code: "bad_message",
+            message: error instanceof Error ? error.message : String(error),
+            sid: msg.sid,
+          });
+        }
+        return;
+      }
+      case "agent.model.set": {
+        try {
+          const selection = await manager
+            .requireStructured(msg.sid)
+            .setModel(msg.model, msg.effort);
+          send(conn, {
+            type: "agent.control.result",
+            sid: msg.sid,
+            requestId: msg.requestId,
+            action: "model.set",
+            ok: true,
+            message: "模型已切换，后续轮次生效",
+            currentModel: selection.currentModel,
+            ...(selection.currentEffort
+              ? { currentEffort: selection.currentEffort }
+              : {}),
+          });
+        } catch (error) {
+          send(conn, {
+            type: "agent.control.result",
+            sid: msg.sid,
+            requestId: msg.requestId,
+            action: "model.set",
+            ok: false,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+        return;
+      }
+      case "agent.modes.get": {
+        try {
+          const catalog = await manager.requireStructured(msg.sid).modes();
+          send(conn, {
+            type: "agent.modes",
+            sid: msg.sid,
+            requestId: msg.requestId,
+            modes: catalog.modes,
+            ...(catalog.currentMode ? { currentMode: catalog.currentMode } : {}),
+          });
+        } catch (error) {
+          send(conn, {
+            type: "error",
+            code: "bad_message",
+            message: error instanceof Error ? error.message : String(error),
+            sid: msg.sid,
+          });
+        }
+        return;
+      }
+      case "agent.mode.set": {
+        try {
+          const selection = await manager.requireStructured(msg.sid).setMode(msg.mode);
+          send(conn, {
+            type: "agent.control.result",
+            sid: msg.sid,
+            requestId: msg.requestId,
+            action: "mode.set",
+            ok: true,
+            message: selection.currentMode === "plan" ? "已切换到 Plan 模式" : "已切换到执行模式",
+            currentMode: selection.currentMode,
+          });
+        } catch (error) {
+          send(conn, {
+            type: "agent.control.result",
+            sid: msg.sid,
+            requestId: msg.requestId,
+            action: "mode.set",
+            ok: false,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+        return;
+      }
+      case "agent.compact": {
+        try {
+          await manager.requireStructured(msg.sid).compact();
+          send(conn, {
+            type: "agent.control.result",
+            sid: msg.sid,
+            requestId: msg.requestId,
+            action: "compact",
+            ok: true,
+            message: "上下文压缩已完成或已由 Agent 接受",
+          });
+        } catch (error) {
+          send(conn, {
+            type: "agent.control.result",
+            sid: msg.sid,
+            requestId: msg.requestId,
+            action: "compact",
+            ok: false,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+        return;
+      }
       case "tool.output.get": {
         const full = manager.requireStructured(msg.sid).toolOutput(msg.callId);
         send(conn, {
@@ -478,6 +644,14 @@ export async function createDaemonServer(
       }
       case "permission.respond":
         await manager.requireStructured(msg.sid).respondPermission(msg.reqId, msg.reply);
+        return;
+      case "question.respond":
+        await manager
+          .requireStructured(msg.sid)
+          .respondQuestion(msg.reqId, msg.answers, msg.cancelled === true);
+        return;
+      case "subagent.send":
+        await manager.requireStructured(msg.sid).sendToSubagent(msg.subagentId, msg.text);
         return;
       case "term.input":
         manager.requirePty(msg.sid).writeInput(utf8Decode(fromB64(msg.dataB64)));
@@ -587,7 +761,7 @@ export async function createDaemonServer(
       }
 
       case "approval.policy.set":
-        manager.setApprovalPolicy(msg.sid, msg.policy);
+        await manager.setApprovalPolicy(msg.sid, msg.policy);
         return;
 
       case "fs.list":
@@ -828,11 +1002,50 @@ export async function createDaemonServer(
   const req2 = createRequire(import.meta.url);
   const pkgRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 
+  async function handleControl(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    res.setHeader("cache-control", "no-store");
+    if (!isLoopback(req)) {
+      res.writeHead(403).end("loopback only");
+      return;
+    }
+    const auth = req.headers.authorization ?? "";
+    const supplied = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    if (!controlTokenEqual(supplied)) {
+      res.writeHead(401).end("unauthorized");
+      return;
+    }
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    if (req.method === "GET" && url.pathname === "/_prospero/control/health") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, sessions: manager.list().length }));
+      return;
+    }
+    const match = url.pathname.match(/^\/_prospero\/control\/session\/([^/]+)\/(kill|interrupt)$/);
+    if (req.method !== "POST" || !match) {
+      res.writeHead(404).end("not found");
+      return;
+    }
+    const sid = decodeURIComponent(match[1]!);
+    try {
+      if (match[2] === "kill") await manager.kill(sid);
+      else await manager.interrupt(sid);
+      res.writeHead(204).end();
+    } catch (e) {
+      if (e instanceof SessionError) {
+        res.writeHead(e.code === "session_not_found" ? 404 : 409).end(e.message);
+      } else {
+        res.writeHead(500).end(e instanceof Error ? e.message : String(e));
+      }
+    }
+  }
+
   // term.html 与 xterm 资产始终提供(App 的 WebView 终端依赖;纯静态无敏感信息,
   // 会话数据只走鉴权+加密的 WS)。dev-client.html 仅 --dev。
   function handleHttp(req: IncomingMessage, res: ServerResponse): void {
     try {
-      if (req.url === "/term.html") {
+      if (req.url?.startsWith("/_prospero/control/")) {
+        void handleControl(req, res);
+      } else if (req.url === "/term.html") {
         res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
         res.end(readFileSync(path.join(pkgRoot, "term.html")));
       } else if (req.url === "/assets/xterm.js") {
@@ -920,13 +1133,14 @@ export async function createDaemonServer(
 
   // 接管上一轮留下的 tmux 会话。必须在 statusFile.start 之前,
   // 否则壳会先看到一份"零会话"的快照。
-  const restored = manager.restoreFromTmux();
+  const restoredPty = manager.restoreFromTmux();
+  const restoredStructured = await manager.restoreStructured();
   statusFile.start(port);
 
   return {
     port,
     devToken,
-    restoredSessions: restored.length,
+    restoredSessions: restoredPty.length + restoredStructured.length,
     httpServer,
     manager,
     notifier,
@@ -938,7 +1152,7 @@ export async function createDaemonServer(
       if (revokeTimer) clearTimeout(revokeTimer);
       revokeWatcher?.close();
       wss.close();
-      manager.disposeAll();
+      await manager.disposeAll();
       await new Promise<void>((resolve) => httpServer.close(() => resolve()));
     },
   };

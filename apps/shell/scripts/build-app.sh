@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# 编译菜单栏壳并组装成 Prospero.app。
+# 编译 macOS 控制中心并组装成 Prospero.app。
 #
 # 为什么要组 .app 而不是直接跑 SwiftPM 产物:TCC 权限按 app bundle 归属。
 # 裸可执行文件拿不到稳定身份,`~/Documents` 之类的授权每次都会重问甚至直接被拒 ——
@@ -53,8 +53,6 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleShortVersionString</key><string>0.0.1</string>
   <key>CFBundleVersion</key><string>1</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
-  <!-- 菜单栏常驻,不占 Dock -->
-  <key>LSUIElement</key><true/>
   <key>NSLocalNetworkUsageDescription</key>
   <string>Prospero 在本地网络上广播与接受来自你手机的直连,用于远程控制 code agent 会话。</string>
   <key>NSBonjourServices</key>
@@ -73,9 +71,9 @@ info "$APP"
 
 if (( DO_RUN )); then
   step "启动"
-  # 已经跑着的话先退掉,否则会开出两个菜单栏图标
+  # 已经跑着的话先退掉,否则会开出两个主窗口
   pkill -x ProsperoShell 2>/dev/null || true
   sleep 0.5
   open "$APP"
-  info "看屏幕右上角菜单栏"
+  info "Prospero 主窗口已打开"
 fi

@@ -19,7 +19,8 @@ export const AgentKindSchema = z.enum([
 export const SessionStatusSchema = z.enum([
   "starting",
   "running",
-  "waiting_approval", // M2 结构化轨使用,先占位
+  "waiting_approval",
+  "waiting_input",
   "idle",
   "done",
   "died",
@@ -59,11 +60,82 @@ export const SessionKindSchema = z.enum(["pty", "structured"]);
  * 而不是"审批本身多余"。standard 才是大多数时候真正想要的,
  * yolo 是明确知道自己在干什么时的选择。
  *
- * 三档都在【我们这一层】放行,不使用后端的 bypass 模式 —— 那会让工具调用
- * 完全不经过 canUseTool,聊天里也就看不到 agent 做了什么。
- * 自动批准的目的是不打断,不是不告知。
+ * strict/standard 在【我们这一层】审批，保留完整审计。YOLO 对 Codex 还会同步
+ * `never + dangerFullAccess`；只自动点批准却不解除 sandbox，会让 Docker 等资源
+ * 继续被拒，形成“界面是 YOLO、实际不是”的假开关。工具事件仍照常记录。
  */
 export const ApprovalPolicySchema = z.enum(["strict", "standard", "yolo"]);
+
+/** 忙碌会话的新消息如何送达。省略 = 空闲立即发、忙碌进入队尾。 */
+export const ChatDeliverySchema = z.enum(["auto", "queue", "steer"]);
+
+/** 输入框远程补全：文件来自会话项目，Skill 来自 daemon 的统一注册表。 */
+export const ChatSuggestionKindSchema = z.enum(["file", "skill"]);
+export const ChatSuggestionSchema = z.object({
+  kind: ChatSuggestionKindSchema,
+  /** 插入输入框的项目相对路径或 Skill 名称；绝不把服务端绝对路径发给客户端。 */
+  value: z.string().min(1).max(4096),
+  label: z.string().min(1).max(500),
+  detail: z.string().max(1000).optional(),
+});
+
+/** Agent 原生模型目录。id/effort 都来自后端实时能力，不在客户端硬编码。 */
+export const AgentModelSchema = z.object({
+  id: z.string().min(1).max(300),
+  label: z.string().min(1).max(300),
+  description: z.string().max(2000).optional(),
+  supportedEfforts: z.array(z.string().min(1).max(100)).max(20),
+  defaultEffort: z.string().min(1).max(100).optional(),
+  isDefault: z.boolean().optional(),
+});
+
+/** Agent 原生协作模式。当前 Codex/Claude 都提供 default 与 plan。 */
+export const AgentModeSchema = z.object({
+  id: z.string().min(1).max(100),
+  label: z.string().min(1).max(200),
+  description: z.string().max(1000).optional(),
+});
+
+/** 会话当前暴露给 GUI 的原生控制能力；未实现的 Agent 不伪装成支持。 */
+export const AgentControlsSchema = z.object({
+  compact: z.boolean(),
+  model: z.boolean(),
+  mode: z.boolean(),
+  currentModel: z.string().min(1).max(300).optional(),
+  currentEffort: z.string().min(1).max(100).optional(),
+  currentMode: z.string().min(1).max(100).optional(),
+});
+
+export const SubagentStatusSchema = z.enum([
+  "starting",
+  "running",
+  "waiting_input",
+  "idle",
+  "completed",
+  "failed",
+  "stopped",
+]);
+
+/** 主会话下的可查看子 Agent。id 是后端可定向投递的原生身份。 */
+export const SubagentInfoSchema = z.object({
+  id: z.string().min(1).max(500),
+  name: z.string().min(1).max(300),
+  role: z.string().max(300).optional(),
+  task: z.string().max(10000).optional(),
+  status: SubagentStatusSchema,
+  canMessage: z.boolean(),
+  createdAt: z.number().int().nonnegative(),
+  updatedAt: z.number().int().nonnegative(),
+  preview: z.string().max(1000).optional(),
+});
+
+export const QueuedChatMessageSchema = z.object({
+  id: z.string().min(1),
+  text: z.string(),
+  kind: z.enum(["queue", "guide"]),
+  createdAt: z.number().int().nonnegative(),
+  attachmentCount: z.number().int().nonnegative(),
+});
 
 export const SessionInfoSchema = z.object({
   id: sid,
@@ -77,12 +149,20 @@ export const SessionInfoSchema = z.object({
   rows,
   /** 结构化会话:当前是否有待处理审批 */
   pendingPermissions: z.number().int().nonnegative().optional(),
+  /** 结构化会话:当前有多少组 Agent 主动提问等待回答。 */
+  pendingQuestions: z.number().int().nonnegative().optional(),
   /** 当前审批策略;放宽时 UI 必须显著提示 */
   approvalPolicy: ApprovalPolicySchema.optional(),
   /** 最后一条助手消息的摘要,用于会话列表预览 */
   preview: z.string().optional(),
   /** 本轮开始时间戳,客户端据此显示"运行 12s" */
   busySince: z.number().int().nonnegative().optional(),
+  /** 忙碌时等待发送的消息；正文用于手机展示与取消。 */
+  messageQueue: z.array(QueuedChatMessageSchema).max(50).optional(),
+  /** 原生 Agent 控制（压缩、模型选择）；PTY 与尚未实现的适配器可省略。 */
+  agentControls: AgentControlsSchema.optional(),
+  /** 生命周期内发现的子 Agent；客户端在项目会话管理中作为子会话展示。 */
+  subagents: z.array(SubagentInfoSchema).max(100).optional(),
   /** 会话累计用量(所有轮次之和) */
   totals: z
     .object({
@@ -166,6 +246,61 @@ export const C2SChatSendSchema = z.object({
   sid,
   text: z.string(),
   attachments: z.array(AttachmentSchema).max(6).optional(),
+  /** queue 排到队尾；steer 尝试引导当前轮，不能引导时排到队首。 */
+  delivery: ChatDeliverySchema.optional(),
+});
+
+export const C2SChatQueueRemoveSchema = z.object({
+  type: z.literal("chat.queue.remove"),
+  sid,
+  queueId: z.string().min(1),
+});
+
+export const C2SChatQueueGuideSchema = z.object({
+  type: z.literal("chat.queue.guide"),
+  sid,
+  queueId: z.string().min(1),
+});
+
+export const C2SChatCompleteSchema = z.object({
+  type: z.literal("chat.complete"),
+  sid,
+  requestId: z.string().min(1).max(100),
+  kind: ChatSuggestionKindSchema,
+  query: z.string().max(300),
+});
+
+export const C2SAgentModelsGetSchema = z.object({
+  type: z.literal("agent.models.get"),
+  sid,
+  requestId: z.string().min(1).max(100),
+});
+
+export const C2SAgentModelSetSchema = z.object({
+  type: z.literal("agent.model.set"),
+  sid,
+  requestId: z.string().min(1).max(100),
+  model: z.string().min(1).max(300),
+  effort: z.string().min(1).max(100).optional(),
+});
+
+export const C2SAgentModesGetSchema = z.object({
+  type: z.literal("agent.modes.get"),
+  sid,
+  requestId: z.string().min(1).max(100),
+});
+
+export const C2SAgentModeSetSchema = z.object({
+  type: z.literal("agent.mode.set"),
+  sid,
+  requestId: z.string().min(1).max(100),
+  mode: z.string().min(1).max(100),
+});
+
+export const C2SAgentCompactSchema = z.object({
+  type: z.literal("agent.compact"),
+  sid,
+  requestId: z.string().min(1).max(100),
 });
 
 /** 按需拉取某次工具调用的完整输出(卡片展开时) */
@@ -208,6 +343,27 @@ export const C2SPermissionRespondSchema = z.object({
   sid,
   reqId: z.string().min(1),
   reply: PermissionReplySchema,
+});
+
+/** 通用问题回答；values 同时覆盖单选、多选与自由输入。 */
+export const AgentQuestionAnswerSchema = z.object({
+  questionId: z.string().min(1).max(300),
+  values: z.array(z.string().max(10000)).max(20),
+});
+
+export const C2SQuestionRespondSchema = z.object({
+  type: z.literal("question.respond"),
+  sid,
+  reqId: z.string().min(1),
+  answers: z.array(AgentQuestionAnswerSchema).max(4),
+  cancelled: z.boolean().optional(),
+});
+
+export const C2SSubagentSendSchema = z.object({
+  type: z.literal("subagent.send"),
+  sid,
+  subagentId: z.string().min(1).max(500),
+  text: z.string().min(1).max(100000),
 });
 
 /** 会话中途改审批策略 */
@@ -367,11 +523,21 @@ export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SSessionCreateSchema,
   C2SSessionAttachSchema,
   C2SChatSendSchema,
+  C2SChatQueueRemoveSchema,
+  C2SChatQueueGuideSchema,
+  C2SChatCompleteSchema,
+  C2SAgentModelsGetSchema,
+  C2SAgentModelSetSchema,
+  C2SAgentModesGetSchema,
+  C2SAgentModeSetSchema,
+  C2SAgentCompactSchema,
   C2SToolOutputGetSchema,
   C2STermInputSchema,
   C2STermResizeSchema,
   C2STermAckSchema,
   C2SPermissionRespondSchema,
+  C2SQuestionRespondSchema,
+  C2SSubagentSendSchema,
   C2SSessionInterruptSchema,
   C2SSessionKillSchema,
   C2SApprovalPolicySetSchema,
@@ -438,6 +604,7 @@ export const AgentTextDeltaSchema = z.object({
   msgId: z.string(),
   textId: z.string(),
   delta: z.string(),
+  agentId: z.string().min(1).max(500).optional(),
 });
 
 /** 推理(thinking)增量,UI 默认折叠 */
@@ -445,6 +612,7 @@ export const AgentReasoningDeltaSchema = z.object({
   kind: z.literal("reasoning.delta"),
   msgId: z.string(),
   delta: z.string(),
+  agentId: z.string().min(1).max(500).optional(),
 });
 
 /**
@@ -470,6 +638,7 @@ export const AgentToolStartSchema = z.object({
   summary: z.string(),
   /** 文件类工具:改动内容 */
   diff: FileDiffSchema.optional(),
+  agentId: z.string().min(1).max(500).optional(),
 });
 
 export const AgentToolEndSchema = z.object({
@@ -481,6 +650,7 @@ export const AgentToolEndSchema = z.object({
   /** 完整输出比摘要长,可用 tool.output.get 按需拉取 */
   hasMore: z.boolean().optional(),
   diff: FileDiffSchema.optional(),
+  agentId: z.string().min(1).max(500).optional(),
 });
 
 export const AgentPermissionRequestSchema = z.object({
@@ -493,6 +663,7 @@ export const AgentPermissionRequestSchema = z.object({
   summary: z.string(),
   /** 改文件类审批:待应用的改动,让用户看清再决定 */
   diff: FileDiffSchema.optional(),
+  agentId: z.string().min(1).max(500).optional(),
 });
 
 /**
@@ -507,12 +678,60 @@ export const AgentPermissionAutoSchema = z.object({
   summary: z.string(),
   /** 当时生效的策略,便于回溯是哪一档放的行 */
   policy: ApprovalPolicySchema,
+  agentId: z.string().min(1).max(500).optional(),
 });
 
 export const AgentPermissionResolvedSchema = z.object({
   kind: z.literal("permission.resolved"),
   reqId: z.string(),
   reply: PermissionReplySchema,
+  agentId: z.string().min(1).max(500).optional(),
+});
+
+export const AgentQuestionOptionSchema = z.object({
+  label: z.string().min(1).max(300),
+  description: z.string().max(2000).optional(),
+  /** Claude 可选项可携带 Markdown/HTML 预览；移动端先按文本展示。 */
+  preview: z.string().max(20000).optional(),
+});
+
+export const AgentQuestionSchema = z.object({
+  id: z.string().min(1).max(300),
+  header: z.string().max(100),
+  question: z.string().min(1).max(10000),
+  options: z.array(AgentQuestionOptionSchema).max(10),
+  multiSelect: z.boolean(),
+  allowOther: z.boolean(),
+  secret: z.boolean().optional(),
+});
+
+export const AgentQuestionRequestSchema = z.object({
+  kind: z.literal("question.request"),
+  reqId: z.string().min(1),
+  questions: z.array(AgentQuestionSchema).min(1).max(4),
+  autoResolutionMs: z.number().int().min(1000).max(24 * 60 * 60 * 1000).optional(),
+  agentId: z.string().min(1).max(500).optional(),
+});
+
+export const AgentQuestionResolvedSchema = z.object({
+  kind: z.literal("question.resolved"),
+  reqId: z.string().min(1),
+  answers: z.array(AgentQuestionAnswerSchema).max(4),
+  cancelled: z.boolean().optional(),
+  agentId: z.string().min(1).max(500).optional(),
+});
+
+export const AgentSubagentStartedSchema = z.object({
+  kind: z.literal("subagent.started"),
+  subagent: SubagentInfoSchema,
+});
+
+export const AgentSubagentUpdatedSchema = z.object({
+  kind: z.literal("subagent.updated"),
+  subagentId: z.string().min(1).max(500),
+  status: SubagentStatusSchema,
+  canMessage: z.boolean().optional(),
+  summary: z.string().max(10000).optional(),
 });
 
 export const AgentTurnEndSchema = z.object({
@@ -522,17 +741,20 @@ export const AgentTurnEndSchema = z.object({
   costUsd: z.number().optional(),
   inputTokens: z.number().int().nonnegative().optional(),
   outputTokens: z.number().int().nonnegative().optional(),
+  agentId: z.string().min(1).max(500).optional(),
 });
 
 export const AgentUserMessageSchema = z.object({
   kind: z.literal("user.message"),
   msgId: z.string(),
   text: z.string(),
+  agentId: z.string().min(1).max(500).optional(),
 });
 
 export const AgentErrorSchema = z.object({
   kind: z.literal("agent.error"),
   message: z.string(),
+  agentId: z.string().min(1).max(500).optional(),
 });
 
 export const AgentEventBodySchema = z.discriminatedUnion("kind", [
@@ -544,6 +766,10 @@ export const AgentEventBodySchema = z.discriminatedUnion("kind", [
   AgentPermissionRequestSchema,
   AgentPermissionAutoSchema,
   AgentPermissionResolvedSchema,
+  AgentQuestionRequestSchema,
+  AgentQuestionResolvedSchema,
+  AgentSubagentStartedSchema,
+  AgentSubagentUpdatedSchema,
   AgentTurnEndSchema,
   AgentErrorSchema,
 ]);
@@ -571,6 +797,43 @@ export const S2CToolOutputSchema = z.object({
   output: z.string(),
   /** 即便完整输出也可能被上限截断 */
   truncated: z.boolean().optional(),
+});
+
+export const S2CChatSuggestionsSchema = z.object({
+  type: z.literal("chat.suggestions"),
+  sid,
+  requestId: z.string().min(1).max(100),
+  kind: ChatSuggestionKindSchema,
+  items: z.array(ChatSuggestionSchema).max(50),
+});
+
+export const S2CAgentModelsSchema = z.object({
+  type: z.literal("agent.models"),
+  sid,
+  requestId: z.string().min(1).max(100),
+  models: z.array(AgentModelSchema).max(100),
+  currentModel: z.string().min(1).max(300).optional(),
+  currentEffort: z.string().min(1).max(100).optional(),
+});
+
+export const S2CAgentModesSchema = z.object({
+  type: z.literal("agent.modes"),
+  sid,
+  requestId: z.string().min(1).max(100),
+  modes: z.array(AgentModeSchema).max(20),
+  currentMode: z.string().min(1).max(100).optional(),
+});
+
+export const S2CAgentControlResultSchema = z.object({
+  type: z.literal("agent.control.result"),
+  sid,
+  requestId: z.string().min(1).max(100),
+  action: z.enum(["model.set", "mode.set", "compact"]),
+  ok: z.boolean(),
+  message: z.string().max(2000).optional(),
+  currentModel: z.string().min(1).max(300).optional(),
+  currentEffort: z.string().min(1).max(100).optional(),
+  currentMode: z.string().min(1).max(100).optional(),
 });
 
 export const S2CPermissionRequestSchema = z.object({
@@ -763,6 +1026,10 @@ export const S2CMessageSchema = z.discriminatedUnion("type", [
   S2CTermOutputSchema,
   S2CAgentEventSchema,
   S2CChatSnapshotSchema,
+  S2CChatSuggestionsSchema,
+  S2CAgentModelsSchema,
+  S2CAgentModesSchema,
+  S2CAgentControlResultSchema,
   S2CToolOutputSchema,
   S2CPermissionRequestSchema,
   S2CErrorSchema,
@@ -800,11 +1067,28 @@ export type SessionInfo = z.infer<typeof SessionInfoSchema>;
 export type HostInfo = z.infer<typeof HostInfoSchema>;
 export type PermissionReply = z.infer<typeof PermissionReplySchema>;
 export type ApprovalPolicy = z.infer<typeof ApprovalPolicySchema>;
+export type ChatDelivery = z.infer<typeof ChatDeliverySchema>;
+export type ChatSuggestionKind = z.infer<typeof ChatSuggestionKindSchema>;
+export type ChatSuggestion = z.infer<typeof ChatSuggestionSchema>;
+export type QueuedChatMessage = z.infer<typeof QueuedChatMessageSchema>;
+export type AgentModel = z.infer<typeof AgentModelSchema>;
+export type AgentMode = z.infer<typeof AgentModeSchema>;
+export type AgentControls = z.infer<typeof AgentControlsSchema>;
+export type SubagentStatus = z.infer<typeof SubagentStatusSchema>;
+export type SubagentInfo = z.infer<typeof SubagentInfoSchema>;
 export type C2SHello = z.infer<typeof C2SHelloSchema>;
 export type C2SSessionCreate = z.infer<typeof C2SSessionCreateSchema>;
 export type C2SWorkspaceList = z.infer<typeof C2SWorkspaceListSchema>;
 export type C2SSessionAttach = z.infer<typeof C2SSessionAttachSchema>;
 export type C2SChatSend = z.infer<typeof C2SChatSendSchema>;
+export type C2SChatQueueRemove = z.infer<typeof C2SChatQueueRemoveSchema>;
+export type C2SChatQueueGuide = z.infer<typeof C2SChatQueueGuideSchema>;
+export type C2SChatComplete = z.infer<typeof C2SChatCompleteSchema>;
+export type C2SAgentModelsGet = z.infer<typeof C2SAgentModelsGetSchema>;
+export type C2SAgentModelSet = z.infer<typeof C2SAgentModelSetSchema>;
+export type C2SAgentModesGet = z.infer<typeof C2SAgentModesGetSchema>;
+export type C2SAgentModeSet = z.infer<typeof C2SAgentModeSetSchema>;
+export type C2SAgentCompact = z.infer<typeof C2SAgentCompactSchema>;
 export type C2SToolOutputGet = z.infer<typeof C2SToolOutputGetSchema>;
 export type FileDiff = z.infer<typeof FileDiffSchema>;
 export type S2CToolOutput = z.infer<typeof S2CToolOutputSchema>;
@@ -812,6 +1096,9 @@ export type C2STermInput = z.infer<typeof C2STermInputSchema>;
 export type C2STermResize = z.infer<typeof C2STermResizeSchema>;
 export type C2STermAck = z.infer<typeof C2STermAckSchema>;
 export type C2SPermissionRespond = z.infer<typeof C2SPermissionRespondSchema>;
+export type AgentQuestionAnswer = z.infer<typeof AgentQuestionAnswerSchema>;
+export type C2SQuestionRespond = z.infer<typeof C2SQuestionRespondSchema>;
+export type C2SSubagentSend = z.infer<typeof C2SSubagentSendSchema>;
 export type C2SMessage = z.infer<typeof C2SMessageSchema>;
 export type Attachment = z.infer<typeof AttachmentSchema>;
 export type UsageWindow = z.infer<typeof UsageWindowSchema>;
@@ -826,6 +1113,11 @@ export type AgentTextDelta = z.infer<typeof AgentTextDeltaSchema>;
 export type AgentToolStart = z.infer<typeof AgentToolStartSchema>;
 export type AgentToolEnd = z.infer<typeof AgentToolEndSchema>;
 export type AgentPermissionRequest = z.infer<typeof AgentPermissionRequestSchema>;
+export type AgentQuestion = z.infer<typeof AgentQuestionSchema>;
+export type AgentQuestionRequest = z.infer<typeof AgentQuestionRequestSchema>;
+export type AgentQuestionResolved = z.infer<typeof AgentQuestionResolvedSchema>;
+export type AgentSubagentStarted = z.infer<typeof AgentSubagentStartedSchema>;
+export type AgentSubagentUpdated = z.infer<typeof AgentSubagentUpdatedSchema>;
 export type AgentTurnEnd = z.infer<typeof AgentTurnEndSchema>;
 export type S2CHelloOk = z.infer<typeof S2CHelloOkSchema>;
 export type S2CSessionState = z.infer<typeof S2CSessionStateSchema>;
@@ -833,6 +1125,10 @@ export type S2CTermSnapshot = z.infer<typeof S2CTermSnapshotSchema>;
 export type S2CTermOutput = z.infer<typeof S2CTermOutputSchema>;
 export type S2CAgentEvent = z.infer<typeof S2CAgentEventSchema>;
 export type S2CChatSnapshot = z.infer<typeof S2CChatSnapshotSchema>;
+export type S2CChatSuggestions = z.infer<typeof S2CChatSuggestionsSchema>;
+export type S2CAgentModels = z.infer<typeof S2CAgentModelsSchema>;
+export type S2CAgentModes = z.infer<typeof S2CAgentModesSchema>;
+export type S2CAgentControlResult = z.infer<typeof S2CAgentControlResultSchema>;
 export type S2CPermissionRequest = z.infer<typeof S2CPermissionRequestSchema>;
 export type S2CError = z.infer<typeof S2CErrorSchema>;
 export type S2CMessage = z.infer<typeof S2CMessageSchema>;

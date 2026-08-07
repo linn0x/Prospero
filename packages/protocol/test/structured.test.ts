@@ -13,6 +13,18 @@ describe("结构化轨协议", () => {
       text: "hi",
     });
     expect(
+      parseC2S({ type: "chat.send", sid: "s1", text: "先别改", delivery: "steer" }),
+    ).toMatchObject({ delivery: "steer" });
+    expect(
+      parseC2S({ type: "chat.queue.remove", sid: "s1", queueId: "q1" }),
+    ).toMatchObject({ queueId: "q1" });
+    expect(
+      parseC2S({ type: "chat.queue.guide", sid: "s1", queueId: "q1" }),
+    ).toMatchObject({ queueId: "q1" });
+    expect(() =>
+      parseC2S({ type: "chat.send", sid: "s1", text: "x", delivery: "now" }),
+    ).toThrowError(ProtocolError);
+    expect(
       parseC2S({ type: "permission.respond", sid: "s1", reqId: "p1", reply: "always" }),
     ).toMatchObject({ reply: "always" });
     // reply 必须是三选一
@@ -73,6 +85,35 @@ describe("结构化轨协议", () => {
         summary: "运行命令",
       },
       { kind: "permission.resolved", reqId: "p1", reply: "once" },
+      {
+        kind: "question.request",
+        reqId: "q1",
+        questions: [{
+          id: "target",
+          header: "范围",
+          question: "先做哪一端？",
+          options: [{ label: "iOS" }, { label: "Mac" }],
+          multiSelect: false,
+          allowOther: true,
+        }],
+      },
+      {
+        kind: "question.resolved",
+        reqId: "q1",
+        answers: [{ questionId: "target", values: ["iOS"] }],
+      },
+      {
+        kind: "subagent.started",
+        subagent: {
+          id: "child-1",
+          name: "reviewer",
+          status: "running",
+          canMessage: true,
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      },
+      { kind: "subagent.updated", subagentId: "child-1", status: "completed" },
       { kind: "turn.end", msgId: "m2", finish: "stop", costUsd: 0.01, outputTokens: 12 },
       { kind: "agent.error", message: "provider auth failed" },
     ];
@@ -99,6 +140,111 @@ describe("结构化轨协议", () => {
     expect((snap as { events: unknown[] }).events).toHaveLength(3);
   });
 
+  it("chat.complete 与 chat.suggestions 校验输入框候选", () => {
+    expect(
+      parseC2S({
+        type: "chat.complete",
+        sid: "s1",
+        requestId: "req-1",
+        kind: "file",
+        query: "src/app",
+      }),
+    ).toMatchObject({ requestId: "req-1", kind: "file" });
+    expect(
+      parseS2C({
+        type: "chat.suggestions",
+        sid: "s1",
+        requestId: "req-1",
+        kind: "skill",
+        items: [
+          { kind: "skill", value: "openai-docs", label: "openai-docs", detail: "Codex" },
+        ],
+      }),
+    ).toMatchObject({ items: [{ value: "openai-docs" }] });
+    expect(() =>
+      parseC2S({
+        type: "chat.complete",
+        sid: "s1",
+        requestId: "req-2",
+        kind: "directory",
+        query: "src",
+      }),
+    ).toThrowError(ProtocolError);
+  });
+
+  it("Agent 控制消息校验模型、Plan 模式与原生 compact", () => {
+    expect(parseC2S({
+      type: "agent.models.get",
+      sid: "s1",
+      requestId: "models-1",
+    })).toMatchObject({ requestId: "models-1" });
+    expect(parseC2S({
+      type: "agent.model.set",
+      sid: "s1",
+      requestId: "set-1",
+      model: "gpt-5.6-sol",
+      effort: "high",
+    })).toMatchObject({ model: "gpt-5.6-sol", effort: "high" });
+    expect(parseC2S({
+      type: "agent.modes.get",
+      sid: "s1",
+      requestId: "modes-1",
+    })).toMatchObject({ requestId: "modes-1" });
+    expect(parseC2S({
+      type: "agent.mode.set",
+      sid: "s1",
+      requestId: "mode-1",
+      mode: "plan",
+    })).toMatchObject({ mode: "plan" });
+    expect(parseC2S({
+      type: "agent.compact",
+      sid: "s1",
+      requestId: "compact-1",
+    })).toMatchObject({ type: "agent.compact" });
+
+    expect(parseS2C({
+      type: "agent.models",
+      sid: "s1",
+      requestId: "models-1",
+      currentModel: "gpt-5.6-sol",
+      currentEffort: "high",
+      models: [{
+        id: "gpt-5.6-sol",
+        label: "GPT-5.6 Sol",
+        supportedEfforts: ["low", "high"],
+        defaultEffort: "low",
+        isDefault: true,
+      }],
+    })).toMatchObject({ models: [{ id: "gpt-5.6-sol" }] });
+    expect(parseS2C({
+      type: "agent.control.result",
+      sid: "s1",
+      requestId: "set-1",
+      action: "model.set",
+      ok: true,
+      currentModel: "gpt-5.6-sol",
+    })).toMatchObject({ ok: true, action: "model.set" });
+    expect(parseS2C({
+      type: "agent.modes",
+      sid: "s1",
+      requestId: "modes-1",
+      currentMode: "plan",
+      modes: [{ id: "default", label: "执行" }, { id: "plan", label: "Plan" }],
+    })).toMatchObject({ currentMode: "plan" });
+    expect(parseC2S({
+      type: "question.respond",
+      sid: "s1",
+      reqId: "q1",
+      answers: [{ questionId: "target", values: ["iOS"] }],
+    })).toMatchObject({ reqId: "q1" });
+    expect(parseC2S({
+      type: "subagent.send",
+      sid: "s1",
+      subagentId: "child-1",
+      text: "先检查测试",
+    })).toMatchObject({ subagentId: "child-1" });
+  });
+
   it("拒绝未知 kind 与缺字段", () => {
     expect(() => AgentEventBodySchema.parse({ kind: "nope" })).toThrow();
     expect(() =>
@@ -120,8 +266,35 @@ describe("结构化轨协议", () => {
         cols: 80,
         rows: 24,
         pendingPermissions: 1,
+        messageQueue: [
+          { id: "q1", text: "下一步跑测试", kind: "queue", createdAt: 2, attachmentCount: 0 },
+        ],
+        agentControls: {
+          compact: true,
+          model: true,
+          mode: true,
+          currentModel: "gpt-5.6-sol",
+          currentEffort: "medium",
+          currentMode: "plan",
+        },
+        pendingQuestions: 1,
+        subagents: [{
+          id: "child-1",
+          name: "reviewer",
+          status: "running",
+          canMessage: true,
+          createdAt: 1,
+          updatedAt: 1,
+        }],
       },
     });
-    expect(ok).toMatchObject({ session: { kind: "structured", pendingPermissions: 1 } });
+    expect(ok).toMatchObject({
+      session: {
+        kind: "structured",
+        pendingPermissions: 1,
+        messageQueue: [{ id: "q1" }],
+        agentControls: { compact: true, currentModel: "gpt-5.6-sol" },
+      },
+    });
   });
 });

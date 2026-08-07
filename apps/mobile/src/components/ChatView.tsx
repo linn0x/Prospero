@@ -5,23 +5,51 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as Clipboard from "expo-clipboard";
 import * as Haptics from "expo-haptics";
-import { FlatList, Platform, Pressable, StyleSheet, Text, View } from "react-native";
-import type { AgentEventBody, PermissionReply } from "@prospero/protocol";
+import {
+  ActivityIndicator,
+  FlatList,
+  Platform,
+  Pressable,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+} from "react-native";
+import type {
+  AgentEventBody,
+  AgentKind,
+  AgentQuestionAnswer,
+  PermissionReply,
+  SessionStatus,
+  SubagentStatus,
+} from "@prospero/protocol";
+import { AgentIcon, agentTint } from "@/components/AgentIcon";
 import { DiffView } from "@/components/DiffView";
 import { Icon } from "@/components/Icon";
 import { Markdown } from "@/components/Markdown";
 import { toast } from "@/components/Toast";
 import type { HostConnection } from "@/lib/connection";
+import {
+  resolveProjectFileReference,
+  type ProjectFileReference,
+} from "@/lib/file-references";
 import { MONOSPACE_FONT, color, radius } from "@/lib/theme";
 import {
   applyEvents,
   applyToolOutput,
-  pendingPermissions,
+  foldChatItems,
+  itemsForAgent,
+  pendingInteractions,
   type AssistantItem,
+  type ChatDisplayItem,
   type ChatItem,
   type ErrorItem,
+  type FoldableActivityItem,
   type PermissionItem,
+  type QuestionItem,
+  type SubagentItem,
   type ToolItem,
+  type TurnDiffSummaryItem,
   type UserItem,
 } from "@/lib/chat-model";
 
@@ -34,6 +62,16 @@ interface Props {
   search?: string;
   /** 出错时可重发上一条用户消息 */
   onRetry?: (text: string) => void;
+  /** agent 回复里的项目文件引用可直接打开只读预览。 */
+  projectRoot?: string;
+  onOpenFile?: (reference: ProjectFileReference) => void;
+  /** 复用对话流底部的 agent 身份提示，不另占一条顶部状态栏。 */
+  agent?: AgentKind;
+  workingStatus?: SessionStatus | SubagentStatus;
+  onInterrupt?: () => void;
+  /** 省略显示主 Agent；有值时复用同一事件流展示该子 Agent 的独立对话。 */
+  subagentId?: string;
+  onOpenSubagent?: (subagentId: string) => void;
 }
 
 export const ChatView = memo(function ChatView({
@@ -42,9 +80,16 @@ export const ChatView = memo(function ChatView({
   onPendingChange,
   search,
   onRetry,
+  projectRoot,
+  onOpenFile,
+  agent,
+  workingStatus,
+  onInterrupt,
+  subagentId,
+  onOpenSubagent,
 }: Props) {
   const [items, setItems] = useState<ChatItem[]>([]);
-  const listRef = useRef<FlatList<ChatItem>>(null);
+  const listRef = useRef<FlatList<ChatDisplayItem>>(null);
   const evSeqRef = useRef(0);
   const atBottomRef = useRef(true);
   const [hasUnread, setHasUnread] = useState(false);
@@ -100,16 +145,18 @@ export const ChatView = memo(function ChatView({
     };
   }, [conn, sid]);
 
+  const scopedItems = useMemo(() => itemsForAgent(items, subagentId), [items, subagentId]);
+
   // 新内容到达时,只有用户已在底部才自动跟随(避免打断向上翻阅)
   useEffect(() => {
-    onPendingChange?.(pendingPermissions(items).length);
-    if (atBottomRef.current && items.length > 0) {
+    onPendingChange?.(pendingInteractions(scopedItems).length);
+    if (atBottomRef.current && scopedItems.length > 0) {
       const frame = requestAnimationFrame(() => {
         listRef.current?.scrollToEnd({ animated: false });
       });
       return () => cancelAnimationFrame(frame);
     }
-  }, [items, onPendingChange]);
+  }, [scopedItems, onPendingChange]);
 
   const respond = useCallback(
     (reqId: string, reply: PermissionReply) => {
@@ -129,22 +176,37 @@ export const ChatView = memo(function ChatView({
     [conn, sid],
   );
 
+  const answerQuestion = useCallback(
+    (reqId: string, answers: AgentQuestionAnswer[], cancelled = false) => {
+      void Haptics.notificationAsync(
+        cancelled
+          ? Haptics.NotificationFeedbackType.Warning
+          : Haptics.NotificationFeedbackType.Success,
+      );
+      conn.respondQuestion(sid, reqId, answers, cancelled);
+    },
+    [conn, sid],
+  );
+
   const retry = useCallback(() => {
     // 找最后一条用户消息重发
-    for (let i = items.length - 1; i >= 0; i--) {
-      const it = items[i]!;
+    for (let i = scopedItems.length - 1; i >= 0; i--) {
+      const it = scopedItems[i]!;
       if (it.type === "user") {
         onRetry?.(it.text);
         return;
       }
     }
-  }, [items, onRetry]);
+  }, [scopedItems, onRetry]);
 
   const visible = useMemo(() => {
     const q = search?.trim().toLowerCase() ?? "";
-    if (q.length === 0) return items;
-    return items.filter((i) => itemText(i).toLowerCase().includes(q));
-  }, [items, search]);
+    if (q.length > 0) {
+      // 搜索结果逐条展开，否则命中项可能藏在活动组里。
+      return scopedItems.filter((i) => itemText(i).toLowerCase().includes(q));
+    }
+    return foldChatItems(scopedItems);
+  }, [scopedItems, search]);
 
   const jumpToBottom = useCallback(() => {
     atBottomRef.current = true;
@@ -177,7 +239,7 @@ export const ChatView = memo(function ChatView({
         initialNumToRender={12}
         maxToRenderPerBatch={8}
         windowSize={11}
-        ListEmptyComponent={
+        ListEmptyComponent={workingStatus ? null : (
           <View style={styles.empty}>
             <View style={styles.emptyIcon}>
               <Icon
@@ -191,19 +253,54 @@ export const ChatView = memo(function ChatView({
               {search ? "换个关键词试试" : "描述目标，或从下方快捷回复开始"}
             </Text>
           </View>
+        )}
+        ListFooterComponent={
+          agent && workingStatus ? (
+            <AgentWorkingIndicator
+              agent={agent}
+              status={workingStatus}
+              onInterrupt={onInterrupt}
+            />
+          ) : null
         }
         renderItem={({ item }) => {
           switch (item.type) {
             case "user":
               return <UserBubble item={item} />;
             case "assistant":
-              return <AssistantBubble item={item} />;
+              return (
+                <AssistantBubble
+                  item={item}
+                  projectRoot={projectRoot}
+                  onOpenFile={onOpenFile}
+                />
+              );
             case "tool":
               return <ToolCard item={item} onFetchOutput={fetchOutput} />;
             case "permission":
               return <PermissionCard item={item} onRespond={respond} />;
+            case "question":
+              return <QuestionCard item={item} onRespond={answerQuestion} />;
+            case "subagent":
+              return <SubagentCard item={item} onOpen={onOpenSubagent} />;
             case "error":
               return <ErrorCard item={item} onRetry={onRetry ? retry : undefined} />;
+            case "turn-diff-summary":
+              return (
+                <TurnDiffSummaryBar
+                  item={item}
+                  projectRoot={projectRoot}
+                  onOpenFile={onOpenFile}
+                />
+              );
+            case "activity-group":
+              return (
+                <ActivityGroup
+                  item={item}
+                  onFetchOutput={fetchOutput}
+                  onRespond={respond}
+                />
+              );
           }
         }}
       />
@@ -221,6 +318,66 @@ export const ChatView = memo(function ChatView({
   );
 });
 
+const agentLabel: Record<AgentKind, string> = {
+  claude: "Claude",
+  codex: "Codex",
+  opencode: "OpenCode",
+  grok: "Grok",
+  trae: "Trae",
+  shell: "Shell",
+  custom: "Agent",
+};
+
+function AgentWorkingIndicator({
+  agent,
+  status,
+  onInterrupt,
+}: {
+  agent: AgentKind;
+  status: SessionStatus | SubagentStatus;
+  onInterrupt?: () => void;
+}) {
+  const waiting = status === "waiting_approval" || status === "waiting_input";
+  const label = waiting
+    ? status === "waiting_input"
+      ? `${agentLabel[agent]} 等待你的回答`
+      : `${agentLabel[agent]} 等待你的批准`
+    : status === "starting"
+      ? `正在启动 ${agentLabel[agent]}`
+      : `${agentLabel[agent]} 正在工作`;
+  return (
+    <View
+      style={styles.agentWorking}
+      accessible
+      accessibilityLiveRegion="polite"
+      accessibilityLabel={label}
+    >
+      <AgentIcon agent={agent} size={14} badge />
+      {!waiting && <ActivityIndicator size="small" color={agentTint(agent)} />}
+      <Text style={[styles.agentWorkingText, { color: waiting ? color.warn : agentTint(agent) }]}>
+        {label}
+      </Text>
+      <Text style={styles.agentWorkingHint} numberOfLines={1}>
+        {waiting ? "处理后自动继续" : "可继续排队或引导"}
+      </Text>
+      {onInterrupt && (
+        <Pressable
+          style={({ pressed }) => [styles.agentStop, pressed && styles.agentStopPressed]}
+          onPress={() => {
+            void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+            onInterrupt();
+          }}
+          accessibilityRole="button"
+          accessibilityLabel={`停止 ${agentLabel[agent]} 当前任务`}
+        >
+          <Icon name="stop.circle" size={13} color={color.danger} />
+          <Text style={styles.agentStopText}>停止</Text>
+        </Pressable>
+      )}
+    </View>
+  );
+}
+
 function itemText(i: ChatItem): string {
   switch (i.type) {
     case "user":
@@ -231,8 +388,14 @@ function itemText(i: ChatItem): string {
       return `${i.tool} ${i.input} ${i.result ?? ""}`;
     case "permission":
       return `${i.action} ${i.resources.join(" ")}`;
+    case "question":
+      return i.questions.map((question) => question.question).join(" ");
+    case "subagent":
+      return `${i.subagent.name} ${i.subagent.role ?? ""} ${i.subagent.task ?? ""} ${i.subagent.preview ?? ""}`;
     case "error":
       return i.message;
+    case "turn-diff-summary":
+      return i.files.map((file) => file.path).join(" ");
   }
 }
 
@@ -268,7 +431,15 @@ const UserBubble = memo(function UserBubble({ item }: { item: UserItem }) {
  * memo 化:流式输出时列表每收到一个 delta 就重渲染,
  * 不做记忆化的话历史消息(可能上百条)会跟着一起重算。
  */
-const AssistantBubble = memo(function AssistantBubble({ item }: { item: AssistantItem }) {
+const AssistantBubble = memo(function AssistantBubble({
+  item,
+  projectRoot,
+  onOpenFile,
+}: {
+  item: AssistantItem;
+  projectRoot?: string;
+  onOpenFile?: (reference: ProjectFileReference) => void;
+}) {
   const [showReasoning, setShowReasoning] = useState(false);
   const copy = useCopy();
   const cost = item.finish?.costUsd;
@@ -293,7 +464,9 @@ const AssistantBubble = memo(function AssistantBubble({ item }: { item: Assistan
         </Pressable>
       )}
       {showReasoning && <Text style={styles.reasoningText}>{item.reasoning}</Text>}
-      {item.text.length > 0 && <Markdown source={item.text} />}
+      {item.text.length > 0 && (
+        <Markdown source={item.text} projectRoot={projectRoot} onOpenFile={onOpenFile} />
+      )}
       {!item.done && item.text.length === 0 && item.reasoning.length === 0 && (
         <View style={styles.thinkingRow}>
           <View style={styles.thinkingDot} />
@@ -368,6 +541,84 @@ const ToolCard = memo(function ToolCard({
           {body}
           {item.hasMore === true && item.fullOutput === undefined ? "\n(正在拉取完整输出…)" : ""}
         </Text>
+      )}
+    </View>
+  );
+});
+
+const TurnDiffSummaryBar = memo(function TurnDiffSummaryBar({
+  item,
+  projectRoot,
+  onOpenFile,
+}: {
+  item: TurnDiffSummaryItem;
+  projectRoot?: string;
+  onOpenFile?: (reference: ProjectFileReference) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const files = useMemo(
+    () =>
+      item.files.map((file) => ({
+        ...file,
+        reference: projectRoot
+          ? resolveProjectFileReference(file.path, projectRoot, true)
+          : null,
+      })),
+    [item.files, projectRoot],
+  );
+  return (
+    <View style={styles.diffSummary}>
+      <Pressable
+        style={({ pressed }) => [styles.diffSummaryHeader, pressed && styles.inlinePressed]}
+        onPress={() => setExpanded((value) => !value)}
+        accessibilityRole="button"
+        accessibilityState={{ expanded }}
+        accessibilityLabel={`本轮改动 ${String(files.length)} 个文件，新增 ${String(item.additions)} 行，删除 ${String(item.deletions)} 行`}
+      >
+        <View style={styles.diffSummaryIcon}>
+          <Icon name="doc.on.doc" size={13} color={color.success} />
+        </View>
+        <Text style={styles.diffSummaryTitle}>本轮改动</Text>
+        <Text style={styles.diffSummaryFiles}>{String(files.length)} 个文件</Text>
+        <Text style={styles.diffSummaryAdd}>+{String(item.additions)}</Text>
+        <Text style={styles.diffSummaryDelete}>−{String(item.deletions)}</Text>
+        <Icon
+          name={expanded ? "chevron.down" : "chevron.right"}
+          size={11}
+          color={color.textFaint}
+        />
+      </Pressable>
+      {expanded && (
+        <View style={styles.diffSummaryList}>
+          {files.slice(0, 12).map((file) => {
+            const displayPath = file.reference?.path ?? file.path;
+            return (
+              <Pressable
+                key={file.path}
+                style={({ pressed }) => [
+                  styles.diffSummaryRow,
+                  pressed && file.reference !== null && styles.inlinePressed,
+                ]}
+                disabled={!file.reference || !onOpenFile}
+                onPress={() => {
+                  if (file.reference) onOpenFile?.(file.reference);
+                }}
+                accessibilityRole={file.reference ? "link" : undefined}
+                accessibilityLabel={`预览 ${displayPath}`}
+              >
+                <Text style={styles.diffSummaryPath} numberOfLines={1} ellipsizeMode="middle">
+                  {displayPath}
+                </Text>
+                <Text style={styles.diffSummaryMiniAdd}>+{String(file.additions)}</Text>
+                <Text style={styles.diffSummaryMiniDelete}>−{String(file.deletions)}</Text>
+                {file.reference && <Icon name="chevron.right" size={10} color={color.textFaint} />}
+              </Pressable>
+            );
+          })}
+          {files.length > 12 && (
+            <Text style={styles.diffSummaryMore}>另有 {String(files.length - 12)} 个文件</Text>
+          )}
+        </View>
       )}
     </View>
   );
@@ -461,6 +712,178 @@ const PermissionCard = memo(function PermissionCard({
   );
 });
 
+const QuestionCard = memo(function QuestionCard({
+  item,
+  onRespond,
+}: {
+  item: QuestionItem;
+  onRespond: (reqId: string, answers: AgentQuestionAnswer[], cancelled?: boolean) => void;
+}) {
+  const [selected, setSelected] = useState<Record<string, string[]>>({});
+  const [other, setOther] = useState<Record<string, string>>({});
+  const resolved = item.answers !== undefined || item.cancelled === true;
+  const answers = item.questions.map((question): AgentQuestionAnswer => {
+    const values = [...(selected[question.id] ?? [])];
+    const custom = other[question.id]?.trim();
+    if (custom) values.push(custom);
+    return { questionId: question.id, values };
+  });
+  const ready = answers.every((answer) => answer.values.length > 0);
+
+  const toggle = (questionId: string, label: string, multi: boolean): void => {
+    setSelected((previous) => {
+      const values = previous[questionId] ?? [];
+      return {
+        ...previous,
+        [questionId]: multi
+          ? values.includes(label)
+            ? values.filter((value) => value !== label)
+            : [...values, label]
+          : [label],
+      };
+    });
+  };
+
+  return (
+    <View style={[styles.questionCard, resolved && styles.questionResolved]}>
+      <View style={styles.questionHeader}>
+        <Icon name="bubble.left.and.text.bubble.right" size={17} color={color.accent} />
+        <View style={styles.questionHeaderCopy}>
+          <Text style={styles.questionKicker}>Agent 需要你的回答</Text>
+          <Text style={styles.questionHint}>回答后会自动继续当前任务</Text>
+        </View>
+      </View>
+      {item.questions.map((question) => {
+        const resolvedAnswer = item.answers?.find((answer) => answer.questionId === question.id);
+        return (
+          <View key={question.id} style={styles.questionBlock}>
+            {question.header.length > 0 && <Text style={styles.questionTag}>{question.header}</Text>}
+            <Text style={styles.questionText}>{question.question}</Text>
+            {resolved ? (
+              <Text style={styles.questionAnswer} selectable>
+                {item.cancelled
+                  ? "已取消"
+                  : resolvedAnswer?.values.join("、") || "已回答"}
+              </Text>
+            ) : (
+              <>
+                <View style={styles.questionOptions}>
+                  {question.options.map((option) => {
+                    const active = (selected[question.id] ?? []).includes(option.label);
+                    return (
+                      <Pressable
+                        key={option.label}
+                        style={({ pressed }) => [
+                          styles.questionOption,
+                          active && styles.questionOptionActive,
+                          pressed && styles.inlinePressed,
+                        ]}
+                        onPress={() => toggle(question.id, option.label, question.multiSelect)}
+                        accessibilityRole={question.multiSelect ? "checkbox" : "radio"}
+                        accessibilityState={{ checked: active }}
+                      >
+                        <View style={[styles.questionChoice, active && styles.questionChoiceActive]} />
+                        <View style={styles.questionOptionCopy}>
+                          <Text style={[styles.questionOptionLabel, active && styles.questionOptionLabelActive]}>
+                            {option.label}
+                          </Text>
+                          {option.description && (
+                            <Text style={styles.questionOptionDescription}>{option.description}</Text>
+                          )}
+                        </View>
+                      </Pressable>
+                    );
+                  })}
+                </View>
+                {question.allowOther && (
+                  <TextInput
+                    style={styles.questionInput}
+                    value={other[question.id] ?? ""}
+                    onChangeText={(value) =>
+                      setOther((previous) => ({ ...previous, [question.id]: value }))
+                    }
+                    placeholder="其他答案…"
+                    placeholderTextColor={color.textFaint}
+                    secureTextEntry={question.secret === true}
+                    multiline={!question.secret}
+                  />
+                )}
+              </>
+            )}
+          </View>
+        );
+      })}
+      {!resolved && (
+        <View style={styles.questionActions}>
+          <Pressable
+            style={({ pressed }) => [styles.questionCancel, pressed && styles.inlinePressed]}
+            onPress={() => onRespond(item.reqId, [], true)}
+          >
+            <Text style={styles.questionCancelText}>取消</Text>
+          </Pressable>
+          <Pressable
+            style={({ pressed }) => [
+              styles.questionSubmit,
+              !ready && styles.questionSubmitDisabled,
+              pressed && ready && styles.inlinePressed,
+            ]}
+            disabled={!ready}
+            onPress={() => onRespond(item.reqId, answers)}
+          >
+            <Text style={styles.questionSubmitText}>提交回答</Text>
+          </Pressable>
+        </View>
+      )}
+    </View>
+  );
+});
+
+const subagentStateLabel: Record<SubagentStatus, string> = {
+  starting: "启动中",
+  running: "工作中",
+  waiting_input: "等待回答",
+  idle: "可对话",
+  completed: "已完成",
+  failed: "失败",
+  stopped: "已停止",
+};
+
+const SubagentCard = memo(function SubagentCard({
+  item,
+  onOpen,
+}: {
+  item: SubagentItem;
+  onOpen?: (subagentId: string) => void;
+}) {
+  const subagent = item.subagent;
+  const active = subagent.status === "running" || subagent.status === "starting";
+  return (
+    <Pressable
+      style={({ pressed }) => [styles.subagentCard, pressed && styles.inlinePressed]}
+      onPress={() => onOpen?.(subagent.id)}
+      disabled={!onOpen}
+      accessibilityRole="button"
+      accessibilityLabel={`查看子 Agent ${subagent.name}`}
+    >
+      <View style={[styles.subagentDot, { backgroundColor: active ? color.accent : color.textFaint }]} />
+      <View style={styles.subagentCopy}>
+        <View style={styles.subagentTitleRow}>
+          <Text style={styles.subagentName} numberOfLines={1}>{subagent.name}</Text>
+          <Text style={[styles.subagentState, active && styles.subagentStateActive]}>
+            {subagentStateLabel[subagent.status]}
+          </Text>
+        </View>
+        {(subagent.preview || subagent.task) && (
+          <Text style={styles.subagentPreview} numberOfLines={2}>
+            {subagent.preview || subagent.task}
+          </Text>
+        )}
+      </View>
+      <Icon name="chevron.right" size={12} color={color.textFaint} />
+    </Pressable>
+  );
+});
+
 const ErrorCard = memo(function ErrorCard({
   item,
   onRetry,
@@ -487,6 +910,63 @@ const ErrorCard = memo(function ErrorCard({
   );
 });
 
+const ActivityGroup = memo(function ActivityGroup({
+  item,
+  onFetchOutput,
+  onRespond,
+}: {
+  item: Extract<ChatDisplayItem, { type: "activity-group" }>;
+  onFetchOutput: (callId: string) => void;
+  onRespond: (reqId: string, reply: PermissionReply) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const tools = item.items.filter((entry): entry is ToolItem => entry.type === "tool");
+  const approvals = item.items.length - tools.length;
+  const names = [...new Set(tools.map((entry) => entry.tool))].slice(0, 3);
+  const additions = item.items.reduce((sum, entry) => sum + (entry.diff?.additions ?? 0), 0);
+  const deletions = item.items.reduce((sum, entry) => sum + (entry.diff?.deletions ?? 0), 0);
+  const details = [
+    names.join(" · "),
+    approvals > 0 ? `${String(approvals)} 次自动/已审批` : "",
+  ].filter(Boolean).join(" · ");
+
+  const renderActivity = (entry: FoldableActivityItem): React.ReactElement =>
+    entry.type === "tool" ? (
+      <ToolCard key={entry.key} item={entry} onFetchOutput={onFetchOutput} />
+    ) : (
+      <PermissionCard key={entry.key} item={entry} onRespond={onRespond} />
+    );
+
+  return (
+    <View style={styles.activityGroup}>
+      <Pressable
+        style={({ pressed }) => [styles.activityHeader, pressed && styles.inlinePressed]}
+        onPress={() => setExpanded((value) => !value)}
+        accessibilityRole="button"
+        accessibilityState={{ expanded }}
+        accessibilityLabel={`${expanded ? "收起" : "展开"}${String(item.items.length)} 项操作`}
+      >
+        <View style={styles.activityIcon}>
+          <Icon name="terminal" size={13} color={color.textDim} />
+        </View>
+        <View style={styles.activityCopy}>
+          <Text style={styles.activityTitle}>已完成 {String(item.items.length)} 项操作</Text>
+          {details.length > 0 && <Text style={styles.activityDetail} numberOfLines={1}>{details}</Text>}
+        </View>
+        {(additions > 0 || deletions > 0) && (
+          <Text style={styles.activityDiff}>+{String(additions)} −{String(deletions)}</Text>
+        )}
+        <Icon
+          name={expanded ? "chevron.down" : "chevron.right"}
+          size={12}
+          color={color.textFaint}
+        />
+      </Pressable>
+      {expanded && <View style={styles.activityItems}>{item.items.map(renderActivity)}</View>}
+    </View>
+  );
+});
+
 const styles = StyleSheet.create({
   root: { flex: 1 },
   list: { flex: 1, backgroundColor: color.bg },
@@ -509,6 +989,28 @@ const styles = StyleSheet.create({
   },
   emptyTitle: { color: color.text, fontSize: 15, fontWeight: "600" },
   emptyText: { color: color.textDim, fontSize: 13, textAlign: "center" },
+
+  agentWorking: {
+    minHeight: 42,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 7,
+    paddingHorizontal: 2,
+    paddingTop: 10,
+  },
+  agentWorkingText: { fontSize: 12.5, fontWeight: "600" },
+  agentWorkingHint: { flex: 1, color: color.textFaint, fontSize: 10.5, textAlign: "right" },
+  agentStop: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    paddingHorizontal: 7,
+    paddingVertical: 5,
+    borderRadius: 7,
+    backgroundColor: color.dangerBg,
+  },
+  agentStopPressed: { opacity: 0.68 },
+  agentStopText: { color: color.danger, fontSize: 10, fontWeight: "600" },
 
   jumpBtn: {
     position: "absolute",
@@ -584,6 +1086,94 @@ const styles = StyleSheet.create({
     paddingTop: 8,
   },
 
+  diffSummary: {
+    backgroundColor: color.surface,
+    borderRadius: radius.md,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: "#254333",
+    overflow: "hidden",
+  },
+  diffSummaryHeader: {
+    minHeight: 42,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 7,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+  },
+  diffSummaryIcon: {
+    width: 25,
+    height: 25,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 7,
+    backgroundColor: color.successBg,
+  },
+  diffSummaryTitle: { color: color.text, fontSize: 12.5, fontWeight: "600" },
+  diffSummaryFiles: { flex: 1, color: color.textDim, fontSize: 10.5 },
+  diffSummaryAdd: { color: color.success, fontSize: 11, fontVariant: ["tabular-nums"] },
+  diffSummaryDelete: { color: color.danger, fontSize: 11, fontVariant: ["tabular-nums"] },
+  diffSummaryList: {
+    paddingHorizontal: 9,
+    paddingBottom: 8,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: color.border,
+  },
+  diffSummaryRow: {
+    minHeight: 34,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 7,
+    paddingHorizontal: 4,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: color.border,
+  },
+  diffSummaryPath: {
+    flex: 1,
+    color: color.accent,
+    fontSize: 10.5,
+    fontFamily: MONOSPACE_FONT,
+  },
+  diffSummaryMiniAdd: { color: color.success, fontSize: 9.5 },
+  diffSummaryMiniDelete: { color: color.danger, fontSize: 9.5 },
+  diffSummaryMore: { color: color.textFaint, fontSize: 10, textAlign: "center", paddingTop: 7 },
+
+  activityGroup: {
+    backgroundColor: color.surface,
+    borderRadius: radius.md,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
+    overflow: "hidden",
+  },
+  activityHeader: {
+    minHeight: 54,
+    paddingHorizontal: 11,
+    paddingVertical: 9,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 9,
+  },
+  activityIcon: {
+    width: 28,
+    height: 28,
+    borderRadius: 8,
+    backgroundColor: color.surfaceRaised,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  activityCopy: { flex: 1, gap: 2 },
+  activityTitle: { color: color.text, fontSize: 13, fontWeight: "600" },
+  activityDetail: { color: color.textFaint, fontSize: 11 },
+  activityDiff: { color: color.success, fontSize: 11, fontVariant: ["tabular-nums"] },
+  activityItems: {
+    gap: 10,
+    paddingHorizontal: 10,
+    paddingBottom: 10,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: color.border,
+    paddingTop: 10,
+  },
+
   permCard: {
     backgroundColor: color.warnBg,
     borderRadius: radius.md,
@@ -635,6 +1225,96 @@ const styles = StyleSheet.create({
   permBtnPressed: { opacity: 0.72 },
   permBtnText: { color: "#fff", fontSize: 13, fontWeight: "600" },
   permResolved: { color: color.textDim, fontSize: 12, fontWeight: "500" },
+
+  questionCard: {
+    backgroundColor: color.surface,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: color.accentDim,
+    padding: 13,
+    gap: 12,
+  },
+  questionResolved: { opacity: 0.68, borderColor: color.border },
+  questionHeader: { flexDirection: "row", alignItems: "center", gap: 9 },
+  questionHeaderCopy: { flex: 1, gap: 1 },
+  questionKicker: { color: color.accent, fontSize: 11, fontWeight: "700" },
+  questionHint: { color: color.textFaint, fontSize: 10 },
+  questionBlock: { gap: 8 },
+  questionTag: { color: color.textDim, fontSize: 10, fontWeight: "600" },
+  questionText: { color: color.text, fontSize: 14, lineHeight: 20, fontWeight: "600" },
+  questionOptions: { gap: 7 },
+  questionOption: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 9,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
+    borderRadius: 9,
+    padding: 9,
+  },
+  questionOptionActive: { borderColor: color.accent, backgroundColor: "#172035" },
+  questionChoice: {
+    width: 14,
+    height: 14,
+    borderRadius: 7,
+    borderWidth: 1,
+    borderColor: color.textFaint,
+    marginTop: 2,
+  },
+  questionChoiceActive: { borderWidth: 4, borderColor: color.accent },
+  questionOptionCopy: { flex: 1, gap: 2 },
+  questionOptionLabel: { color: color.text, fontSize: 12.5, fontWeight: "500" },
+  questionOptionLabelActive: { color: "#DCE6FF" },
+  questionOptionDescription: { color: color.textDim, fontSize: 11, lineHeight: 16 },
+  questionInput: {
+    minHeight: 38,
+    maxHeight: 100,
+    color: color.text,
+    backgroundColor: color.bg,
+    borderRadius: 9,
+    paddingHorizontal: 10,
+    paddingVertical: 9,
+    fontSize: 12.5,
+  },
+  questionAnswer: {
+    color: color.success,
+    backgroundColor: color.successBg,
+    borderRadius: 8,
+    paddingHorizontal: 9,
+    paddingVertical: 7,
+    fontSize: 12,
+  },
+  questionActions: { flexDirection: "row", justifyContent: "flex-end", gap: 8 },
+  questionCancel: { paddingHorizontal: 13, paddingVertical: 9 },
+  questionCancelText: { color: color.textDim, fontSize: 12, fontWeight: "600" },
+  questionSubmit: {
+    backgroundColor: color.accentDim,
+    borderRadius: 9,
+    paddingHorizontal: 15,
+    paddingVertical: 9,
+  },
+  questionSubmitDisabled: { opacity: 0.38 },
+  questionSubmitText: { color: "#fff", fontSize: 12, fontWeight: "700" },
+
+  subagentCard: {
+    minHeight: 62,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    backgroundColor: color.surface,
+    borderRadius: radius.md,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  subagentDot: { width: 8, height: 8, borderRadius: 4 },
+  subagentCopy: { flex: 1, gap: 4 },
+  subagentTitleRow: { flexDirection: "row", alignItems: "center", gap: 8 },
+  subagentName: { flex: 1, color: color.text, fontSize: 13, fontWeight: "600" },
+  subagentState: { color: color.textFaint, fontSize: 10 },
+  subagentStateActive: { color: color.accent },
+  subagentPreview: { color: color.textDim, fontSize: 11, lineHeight: 16 },
 
   errorCard: { backgroundColor: color.dangerBg, borderRadius: radius.md, padding: 11, gap: 7 },
   errorText: { color: "#F2AAAA", fontSize: 13, lineHeight: 19 },

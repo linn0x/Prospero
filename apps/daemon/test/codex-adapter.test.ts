@@ -2,13 +2,14 @@
  * Codex app-server 适配器集成测试。未安装 codex 时跳过。
  */
 import { execFileSync } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import type { AgentEventBody } from "@prospero/protocol";
+import type { AgentEventBody, ApprovalPolicy } from "@prospero/protocol";
 import { CodexAdapter } from "../src/adapters/codex.js";
 import { StructuredSession } from "../src/structured-session.js";
+import { SessionManager } from "../src/session-manager.js";
 
 function hasCodex(): boolean {
   try {
@@ -81,6 +82,286 @@ describeIf("Codex 结构化会话", () => {
     expect(info.agent).toBe("codex");
     expect(info.status).toBe("idle");
   }, 120_000);
+
+  it("daemon 重启后用持久化 threadId 恢复原生 Codex 会话", async () => {
+    const home = mkdtempSync(path.join(os.tmpdir(), "prospero-codex-resume-"));
+    const first = new SessionManager({ home });
+    const firstEvents: AgentEventBody[] = [];
+    first.on("agentEvent", (_sid, body) => firstEvents.push(body));
+    let second: SessionManager | null = null;
+    try {
+      const created = await first.create({
+        agent: "codex",
+        kind: "structured",
+        cwd,
+        cols: 80,
+        rows: 24,
+        allowShell: false,
+      });
+      await first.chatSend(created.id, "Reply with exactly the word PERSISTED and nothing else.");
+      await waitFor(
+        () => firstEvents.some((event) => event.kind === "turn.end"),
+        "持久化测试首轮 turn.end",
+      );
+      first.flushPersistence();
+      await first.disposeAll();
+
+      second = new SessionManager({ home });
+      const restored = await second.restoreStructured();
+      expect(restored).toHaveLength(1);
+      expect(restored[0]?.id).toBe(created.id);
+      expect(
+        restored[0]?.status,
+        JSON.stringify(second.requireStructured(created.id).snapshot().events),
+      ).toBe("idle");
+      await second.kill(created.id);
+    } finally {
+      await first.disposeAll();
+      await second?.disposeAll();
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, 120_000);
+});
+
+/** 不启动真实 Codex,直接把 app-server 请求喂给适配器。 */
+function approvalHarness(policy: () => ApprovalPolicy): {
+  adapter: CodexAdapter;
+  events: AgentEventBody[];
+  writes: Record<string, unknown>[];
+  request(message: { id: number; method: string; params: Record<string, unknown> }): void;
+} {
+  const adapter = new CodexAdapter();
+  const events: AgentEventBody[] = [];
+  const writes: Record<string, unknown>[] = [];
+  const internals = adapter as unknown as {
+    ctx: {
+      cwd: string;
+      approvalPolicy: () => ApprovalPolicy;
+      emit: (body: AgentEventBody) => void;
+    };
+    write: (message: Record<string, unknown>) => void;
+    onServerRequest: (message: {
+      id: number;
+      method: string;
+      params: Record<string, unknown>;
+    }) => void;
+  };
+  internals.ctx = { cwd, approvalPolicy: policy, emit: (body) => events.push(body) };
+  internals.write = (message) => writes.push(message);
+  return { adapter, events, writes, request: (message) => internals.onServerRequest(message) };
+}
+
+describe("Codex 审批策略(桩数据)", () => {
+  it("YOLO 自动批准命令,同时保留审计事件", () => {
+    const h = approvalHarness(() => "yolo");
+    h.request({
+      id: 41,
+      method: "item/commandExecution/requestApproval",
+      params: { itemId: "cmd-1", command: "npm test" },
+    });
+
+    expect(h.events).toEqual([
+      expect.objectContaining({
+        kind: "permission.auto",
+        reqId: "cmd-1",
+        policy: "yolo",
+        summary: "运行命令:npm test",
+      }),
+    ]);
+    expect(h.writes).toEqual([{ id: 41, result: { decision: "approved" } }]);
+  });
+
+  it("YOLO 的 turn/start 同时关闭审批并解除 sandbox", async () => {
+    let policy: ApprovalPolicy = "yolo";
+    const h = approvalHarness(() => policy);
+    (h.adapter as unknown as { threadId: string }).threadId = "thread-yolo";
+
+    await h.adapter.send("检查 Docker");
+    expect(h.writes[0]).toMatchObject({
+      method: "turn/start",
+      params: {
+        threadId: "thread-yolo",
+        approvalPolicy: "never",
+        sandboxPolicy: { type: "dangerFullAccess" },
+      },
+    });
+
+    policy = "strict";
+    await h.adapter.send("安全轮次");
+    expect(h.writes[1]).toMatchObject({
+      method: "turn/start",
+      params: {
+        approvalPolicy: "untrusted",
+        sandboxPolicy: { type: "workspaceWrite", writableRoots: [cwd] },
+      },
+    });
+  });
+
+  it("把 daemon 已解析的 Skill 作为 app-server 原生 input 发送", async () => {
+    const h = approvalHarness(() => "standard");
+    (h.adapter as unknown as { threadId: string }).threadId = "thread-skill";
+
+    await h.adapter.send("请按 $review-flow 执行", undefined, [
+      {
+        name: "review-flow",
+        description: "review",
+        path: "/tmp/review-flow/SKILL.md",
+        contents: "skill body",
+      },
+    ]);
+    expect(h.writes[0]).toMatchObject({
+      method: "turn/start",
+      params: {
+        input: [
+          { type: "text", text: "请按 $review-flow 执行" },
+          { type: "skill", name: "review-flow", path: "/tmp/review-flow/SKILL.md" },
+        ],
+      },
+    });
+  });
+
+  it("strict 与 standard 对改文件请求仍等待人工批准", () => {
+    for (const policy of ["strict", "standard"] as const) {
+      const h = approvalHarness(() => policy);
+      h.request({
+        id: 42,
+        method: "item/fileChange/requestApproval",
+        params: { itemId: `file-${policy}`, reason: "src/app.ts" },
+      });
+
+      expect(h.events).toEqual([
+        expect.objectContaining({
+          kind: "permission.request",
+          reqId: `file-${policy}`,
+        }),
+      ]);
+      expect(h.writes).toEqual([]);
+    }
+  });
+});
+
+describe("Codex 原生 Plan、提问与子 Agent(桩数据)", () => {
+  it("把 requestUserInput 转成问题卡，并把答案回到原 JSON-RPC", async () => {
+    const h = approvalHarness(() => "standard");
+    (h.adapter as unknown as { threadId: string }).threadId = "main-thread";
+    h.request({
+      id: 71,
+      method: "item/tool/requestUserInput",
+      params: {
+        threadId: "child-thread",
+        turnId: "turn-1",
+        itemId: "question-1",
+        autoResolutionMs: null,
+        questions: [{
+          id: "scope",
+          header: "范围",
+          question: "先做哪一端？",
+          isOther: true,
+          isSecret: false,
+          options: [{ label: "iOS", description: "先完成手机端" }],
+        }],
+      },
+    });
+    expect(h.events[0]).toMatchObject({
+      kind: "question.request",
+      reqId: "question-1",
+      agentId: "child-thread",
+      questions: [{ id: "scope", allowOther: true }],
+    });
+    await h.adapter.respondQuestion?.("question-1", [
+      { questionId: "scope", values: ["iOS"] },
+    ]);
+    expect(h.writes).toContainEqual({
+      id: 71,
+      result: { answers: { scope: { answers: ["iOS"] } } },
+    });
+    expect(h.events.at(-1)).toMatchObject({
+      kind: "question.resolved",
+      agentId: "child-thread",
+    });
+  });
+
+  it("Plan 模式用 collaborationMode 原生设置并持久化", async () => {
+    const h = approvalHarness(() => "standard");
+    const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+    const internals = h.adapter as unknown as {
+      threadId: string;
+      selectedModel: string;
+      selectedEffort: string;
+      request(method: string, params: Record<string, unknown>): Promise<unknown>;
+    };
+    internals.threadId = "main-thread";
+    internals.selectedModel = "gpt-test";
+    internals.selectedEffort = "high";
+    internals.request = async (method, params) => {
+      calls.push({ method, params });
+      return {};
+    };
+    expect(await h.adapter.setMode?.("plan")).toEqual({ currentMode: "plan" });
+    expect(calls[0]).toMatchObject({
+      method: "thread/settings/update",
+      params: {
+        collaborationMode: {
+          mode: "plan",
+          settings: { model: "gpt-test", reasoning_effort: "high" },
+        },
+      },
+    });
+  });
+
+  it("子 thread 的输出独立带 agentId，空闲时可由人开启新一轮", async () => {
+    const h = approvalHarness(() => "standard");
+    const internals = h.adapter as unknown as {
+      threadId: string;
+      onNotification(message: Record<string, unknown>): void;
+    };
+    internals.threadId = "main-thread";
+    internals.onNotification({
+      method: "thread/started",
+      params: {
+        thread: {
+          id: "child-thread",
+          parentThreadId: "main-thread",
+          agentNickname: "reviewer",
+          status: { type: "active", activeFlags: [] },
+          canAcceptDirectInput: true,
+          createdAt: 1,
+        },
+      },
+    });
+    internals.onNotification({
+      method: "turn/started",
+      params: { threadId: "child-thread", turn: { id: "child-turn" } },
+    });
+    internals.onNotification({
+      method: "item/agentMessage/delta",
+      params: {
+        threadId: "child-thread",
+        turnId: "child-turn",
+        itemId: "child-message",
+        delta: "检查完成",
+      },
+    });
+    internals.onNotification({
+      method: "turn/completed",
+      params: { threadId: "child-thread", turn: { id: "child-turn", status: "completed" } },
+    });
+    expect(h.events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "subagent.started",
+          subagent: expect.objectContaining({ id: "child-thread" }),
+        }),
+        expect.objectContaining({ kind: "text.delta", agentId: "child-thread", delta: "检查完成" }),
+        expect.objectContaining({ kind: "turn.end", agentId: "child-thread" }),
+      ]),
+    );
+    await h.adapter.sendToSubagent?.("child-thread", "再跑一次测试");
+    expect(h.writes.at(-1)).toMatchObject({
+      method: "turn/start",
+      params: { threadId: "child-thread", input: [{ type: "text", text: "再跑一次测试" }] },
+    });
+  });
 });
 
 /**

@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { DEFAULT_POLICY, needsApproval, policyLabel } from "../src/approval-policy.js";
+import { StructuredSession } from "../src/structured-session.js";
+import type { AdapterContext, AgentAdapter } from "../src/adapters/types.js";
+import type { PermissionReply } from "@prospero/protocol";
 
 describe("审批策略", () => {
   it("默认是每次询问 —— 放宽必须是用户主动选的", () => {
@@ -56,5 +59,58 @@ describe("审批策略", () => {
       expect(policyLabel(p).length).toBeGreaterThan(0);
     }
     expect(policyLabel("yolo")).toContain("全部");
+  });
+
+  it("切到 YOLO 会立即放行已经卡住的审批", async () => {
+    class PendingAdapter implements AgentAdapter {
+      private ctx: AdapterContext | null = null;
+      readonly replies: { reqId: string; reply: PermissionReply }[] = [];
+
+      async start(ctx: AdapterContext): Promise<void> {
+        this.ctx = ctx;
+      }
+      ask(reqId: string): void {
+        this.ctx?.emit({
+          kind: "permission.request",
+          reqId,
+          action: "修改文件",
+          resources: ["src/app.ts"],
+          summary: "修改文件:src/app.ts",
+        });
+      }
+      async respondPermission(reqId: string, reply: PermissionReply): Promise<void> {
+        this.replies.push({ reqId, reply });
+        this.ctx?.emit({ kind: "permission.resolved", reqId, reply });
+      }
+      async send(): Promise<void> {}
+      async interrupt(): Promise<void> {}
+      async dispose(): Promise<void> {}
+    }
+
+    const adapter = new PendingAdapter();
+    const session = new StructuredSession({
+      id: "policy-test",
+      agent: "codex",
+      title: "codex · test",
+      cwd: "/tmp",
+      adapter,
+    });
+    await session.start();
+    adapter.ask("pending-1");
+    expect(session.info()).toMatchObject({
+      approvalPolicy: "strict",
+      pendingPermissions: 1,
+      status: "waiting_approval",
+    });
+
+    await session.setApprovalPolicy("yolo");
+
+    expect(adapter.replies).toEqual([{ reqId: "pending-1", reply: "once" }]);
+    expect(session.info()).toMatchObject({
+      approvalPolicy: "yolo",
+      pendingPermissions: 0,
+      status: "running",
+    });
+    await session.dispose();
   });
 });
