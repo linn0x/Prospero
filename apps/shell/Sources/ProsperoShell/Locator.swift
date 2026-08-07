@@ -44,13 +44,6 @@ enum Locator {
     }
   }
 
-  /// 丢掉全部缓存重新找。手动改过路径、或者刚重新 build 过 daemon 时用。
-  static func invalidate() {
-    nodeCachedAt = nil
-    cliCachedAt = nil
-    shellCachedAt = nil
-  }
-
   /// node 解释器。先用登录 shell 问一次(能覆盖 nvm/fnm/volta 这些版本管理器),
   /// 问不到再退回常见安装路径。
   static func findNode() -> String? {
