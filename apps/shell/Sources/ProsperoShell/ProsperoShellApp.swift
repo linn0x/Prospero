@@ -25,9 +25,13 @@ struct ProsperoShellApp: App {
     print("  home:     \(DaemonStatus.home.path)")
     print("  端口:     \(status.port)")
     print("  监听:     \(status.bindLabel)")
-    let pending = UserDefaults.standard.string(forKey: "pendingBind")
-    if let pending {
+    if let pending = DaemonController.storedPendingBind {
       print("  待生效:   \(pending == DaemonController.allInterfacesSpec ? "全部网卡" : pending)(下次启动)")
+    }
+    if let bind = status.bind,
+       bind != DaemonController.allInterfacesSpec,
+       !NetworkInterfaces.resolves(bind) {
+      print("  ⚠︎ 绑定地址 \(bind) 已不在本机 —— daemon 会启动失败,菜单里可一键改回全部网卡")
     }
     let ifaces = NetworkInterfaces.candidates()
     print("  可选网卡: \(ifaces.isEmpty ? "无" : ifaces.map(\.label).joined(separator: ", "))")
@@ -114,8 +118,10 @@ struct MenuContent: View {
     if case .externallyRunning = daemon.state {
       Text("端口 \(String(daemon.status.port)) 已被占用")
     } else {
-      Text("端口 \(String(daemon.status.port)) · 监听 \(daemon.status.bindLabel)")
+      Text("端口 \(String(daemon.status.port)) · 监听 \(daemon.bindSummary)")
     }
+
+    StaleBindNotice(daemon: daemon)
 
     Divider()
 
@@ -245,6 +251,38 @@ struct MenuContent: View {
       failure.informativeText = error
       failure.alertStyle = .critical
       failure.runModal()
+    }
+  }
+}
+
+/// 绑定的地址已经不在本机时的提示与一键恢复。
+///
+/// 这个状态下 daemon 每次启动都会在解析地址那步抛错退出,而错误只出现在日志窗口里 ——
+/// 菜单上则是一个 ✓ 都不显示(绑的值和任何一张网卡都对不上),没有任何东西指向出路。
+/// 所以要把它摆到最显眼的地方,并且给一次点击就能修好的按钮。
+struct StaleBindNotice: View {
+  @Bindable var daemon: DaemonController
+
+  var body: some View {
+    if daemon.bindIsStale, let bind = daemon.status.bind {
+      Text("⚠︎ 监听地址 \(bind) 已不在本机 —— daemon 会启动失败")
+
+      switch daemon.state {
+      case .stopped, .failed:
+        Button("改回全部网卡并启动") {
+          daemon.setPendingBind(DaemonController.allInterfacesSpec)
+          daemon.restart()
+        }
+      case .running:
+        // 还在跑,说明它是在地址还在时起来的。这时重启会杀掉会话,不该一键就干,
+        // 只说明改动何时生效。
+        Button("改回全部网卡(下次启动生效)") {
+          daemon.setPendingBind(DaemonController.allInterfacesSpec)
+        }
+      case .starting, .externallyRunning:
+        // 启动中 / 别人起的 daemon,壳不插手
+        EmptyView()
+      }
     }
   }
 }
