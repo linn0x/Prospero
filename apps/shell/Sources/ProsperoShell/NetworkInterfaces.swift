@@ -34,8 +34,12 @@ enum NetworkInterfaces {
     return false
   }
 
-  /// 候选地址。顺序同 daemon:en*(WiFi/有线)→ utun*(WireGuard)→ 其它。
-  static func candidates() -> [NetworkInterface] {
+  /// 本机全部在用的 IPv4 网卡,**不做可用性过滤**。顺序同 daemon:en* → utun* → 其它。
+  ///
+  /// 判断"配置里绑的那个地址还在不在"必须用这份,不能用 `candidates()` ——
+  /// daemon 的 `resolveBindAddr()` 同样不过滤,拿过滤后的表去判断,
+  /// 会把用户在终端里手动绑的 198.18 之类误判成已失效。
+  static func all() -> [NetworkInterface] {
     var en: [NetworkInterface] = []
     var utun: [NetworkInterface] = []
     var other: [NetworkInterface] = []
@@ -62,7 +66,6 @@ enum NetworkInterfaces {
 
       // 走指针重载:接收 [CChar] 的那个 String(cString:) 已废弃
       let address = host.withUnsafeBufferPointer { String(cString: $0.baseAddress!) }
-      guard !unusable(address) else { continue }
       let name = String(cString: cur.pointee.ifa_name)
       let iface = NetworkInterface(name: name, address: address)
 
@@ -76,5 +79,20 @@ enum NetworkInterfaces {
     }
 
     return en + utun + other
+  }
+
+  /// 菜单里给人挑的候选,过滤掉手机连不上的那些。
+  static func candidates() -> [NetworkInterface] {
+    all().filter { !unusable($0.address) }
+  }
+
+  /// 这个 `--bind` 值现在还解析得出地址吗?
+  ///
+  /// 对齐 daemon 的 `resolveBindAddr()`:接受网卡名,也接受地址本身。
+  /// WireGuard 断开后,之前绑的 utun 地址就会在这里返回 false ——
+  /// 那正是 daemon 会启动失败的情形。
+  static func resolves(_ spec: String) -> Bool {
+    if spec == "0.0.0.0" || spec == "::" { return true }
+    return all().contains { $0.address == spec || $0.name == spec }
   }
 }

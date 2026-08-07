@@ -48,6 +48,12 @@ final class DaemonController {
   private static let pendingBindKey = "pendingBind"
   /// 「全部网卡」在 CLI 里的写法:传 0.0.0.0 表示取消绑定
   static let allInterfacesSpec = "0.0.0.0"
+
+  /// 便签的持久化读取。自检也要用,所以键名和读法都收在这里 ——
+  /// 在别处再抄一遍字面量,改键名时那边会静默失效。
+  static var storedPendingBind: String? {
+    UserDefaults.standard.string(forKey: pendingBindKey)
+  }
   /// 端口探测在飞。慢网络下一次探测可能比刷新间隔还长,不叠着发。
   private var probing = false
 
@@ -60,7 +66,7 @@ final class DaemonController {
 
   init() {
     boundDeviceNames = Set(DaemonStatus.load().devices.filter(\.bound).map(\.name))
-    pendingBind = UserDefaults.standard.string(forKey: Self.pendingBindKey)
+    pendingBind = Self.storedPendingBind
     refresh()
     // 菜单打开时 runloop 跑在 event tracking mode,default mode 的 timer 不触发 ——
     // 结果就是会话列表和待审批数正好在用户盯着看的时候是僵的。.common 覆盖两种 mode。
@@ -218,6 +224,25 @@ final class DaemonController {
   var effectiveBind: String? {
     let value = pendingBind ?? status.bind
     return value == Self.allInterfacesSpec ? nil : value
+  }
+
+  /// config.json 里绑的地址已经不在本机了。
+  ///
+  /// 这是个能把 daemon 卡死的状态:CLI 是**先写 config.json 再解析地址**的,
+  /// 所以一旦绑了个会消失的地址(WireGuard 的 utun 就是典型),
+  /// 地址一没,daemon 每次启动都在同一处抛错退出,而错误只出现在日志窗口里。
+  /// 认出来才能给出一键恢复。
+  var bindIsStale: Bool {
+    guard let bind = status.bind, bind != Self.allInterfacesSpec else { return false }
+    return !NetworkInterfaces.resolves(bind)
+  }
+
+  /// 顶部那行的「监听」部分。有待生效的选择时一并说明,
+  /// 免得它和子菜单标题里的「重启后生效」各说各的。
+  var bindSummary: String {
+    guard let pendingBind else { return status.bindLabel }
+    let target = pendingBind == Self.allInterfacesSpec ? "全部网卡" : pendingBind
+    return "\(status.bindLabel) → \(target)(重启后)"
   }
 
   /// 撤销设备。交给 CLI 做,壳不碰 devices.json ——
