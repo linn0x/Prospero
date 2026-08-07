@@ -13,20 +13,34 @@ import { randomUUID } from "node:crypto";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type {
   CanUseTool,
+  EffortLevel,
+  ModelInfo,
   PermissionResult,
   PermissionUpdate,
   Query,
   SDKMessage,
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { AgentEventBody, Attachment, PermissionReply } from "@prospero/protocol";
+import type {
+  AgentEventBody,
+  AgentQuestion,
+  AgentQuestionAnswer,
+  Attachment,
+  PermissionReply,
+  SubagentStatus,
+} from "@prospero/protocol";
 import { needsApproval } from "../approval-policy.js";
 import { diffFromToolInput } from "./diff.js";
 import {
   AdapterError,
   summarize,
   type AdapterContext,
+  type AdapterResumeState,
   type AgentAdapter,
+  type AgentModeCatalog,
+  type AgentModeSelection,
+  type AgentModelCatalog,
+  type AgentModelSelection,
   type UsageReport,
 } from "./types.js";
 
@@ -37,6 +51,15 @@ interface PendingPermission {
   /** 供 "始终允许" 使用:SDK 给出的规则建议 */
   suggestions: PermissionUpdate[];
   toolName: string;
+  agentId?: string;
+}
+
+interface PendingQuestion {
+  resolve(result: PermissionResult): void;
+  input: Record<string, unknown>;
+  questions: AgentQuestion[];
+  nativeQuestionById: Map<string, string>;
+  agentId?: string;
 }
 
 /** tool_result 的 content 可能是字符串或 block 数组,取其纯文本 */
@@ -99,6 +122,8 @@ class MessageQueue {
 export interface ClaudeAdapterOptions {
   /** 测试用:限制可用工具,消除模型选路的不确定性 */
   disallowedTools?: string[];
+  /** Claude Code 自己落盘的 session；恢复后继续原上下文。 */
+  resumeState?: AdapterResumeState | undefined;
 }
 
 export class ClaudeAdapter implements AgentAdapter {
@@ -108,20 +133,54 @@ export class ClaudeAdapter implements AgentAdapter {
   private q: Query | null = null;
   private readonly input = new MessageQueue();
   private readonly pending = new Map<string, PendingPermission>();
+  private readonly questions = new Map<string, PendingQuestion>();
+  private readonly questionToolIds = new Set<string>();
+  private readonly taskAgents = new Map<string, string>();
+  private readonly subagents = new Map<string, { canMessage: boolean; createdAt: number }>();
+  private readonly currentMessageByAgent = new Map<string, string>();
   private currentMsgId = "";
   private pumping: Promise<void> | null = null;
+  private sessionId: string | null = null;
+  private selectedModel: string | null = null;
+  private selectedEffort: string | null = null;
+  private selectedMode: "default" | "plan" = "default";
+  private modelCache: ModelInfo[] | null = null;
+  private compactWaiter: {
+    msgId: string;
+    resolve(): void;
+    reject(error: Error): void;
+    timer: NodeJS.Timeout;
+  } | null = null;
 
   async start(ctx: AdapterContext): Promise<void> {
     this.ctx = ctx;
+    this.sessionId =
+      typeof this.opts.resumeState?.["sessionId"] === "string"
+        ? this.opts.resumeState["sessionId"]
+        : null;
+    this.selectedModel =
+      typeof this.opts.resumeState?.["model"] === "string"
+        ? this.opts.resumeState["model"]
+        : null;
+    this.selectedEffort =
+      typeof this.opts.resumeState?.["effort"] === "string"
+        ? this.opts.resumeState["effort"]
+        : null;
+    this.selectedMode = this.opts.resumeState?.["mode"] === "plan" ? "plan" : "default";
     try {
       this.q = query({
         prompt: this.input,
         options: {
           cwd: ctx.cwd,
           // 全部工具调用都过 canUseTool → 手机审批
-          permissionMode: "default",
+          permissionMode: this.selectedMode,
           canUseTool: this.canUseTool,
           includePartialMessages: true,
+          forwardSubagentText: true,
+          agentProgressSummaries: true,
+          ...(this.sessionId ? { resume: this.sessionId } : {}),
+          ...(this.selectedModel ? { model: this.selectedModel } : {}),
+          ...(this.selectedEffort ? { effort: this.selectedEffort as EffortLevel } : {}),
           ...(this.opts.disallowedTools
             ? { disallowedTools: this.opts.disallowedTools }
             : {}),
@@ -133,8 +192,25 @@ export class ClaudeAdapter implements AgentAdapter {
     this.pumping = this.pump();
   }
 
-  private readonly canUseTool: CanUseTool = (toolName, input, options) =>
-    new Promise<PermissionResult>((resolve) => {
+  private persistNativeState(): void {
+    const state: AdapterResumeState = {};
+    if (this.sessionId) state["sessionId"] = this.sessionId;
+    if (this.selectedModel) state["model"] = this.selectedModel;
+    if (this.selectedEffort) state["effort"] = this.selectedEffort;
+    state["mode"] = this.selectedMode;
+    this.ctx?.persistState?.(state);
+  }
+
+  private readonly canUseTool: CanUseTool = (toolName, input, options) => {
+    const rawAgentId = (options as { agentID?: unknown }).agentID;
+    const agentId =
+      typeof rawAgentId === "string"
+        ? (this.taskAgents.get(rawAgentId) ?? rawAgentId)
+        : undefined;
+    if (toolName === "AskUserQuestion") {
+      return this.requestUserQuestion(input, options, agentId);
+    }
+    return new Promise<PermissionResult>((resolve) => {
       const reqId = randomUUID();
       const policy = this.ctx?.approvalPolicy?.() ?? "strict";
 
@@ -147,6 +223,7 @@ export class ClaudeAdapter implements AgentAdapter {
           action: options.displayName ?? toolName,
           policy,
           summary: options.title ?? toolName,
+          ...(agentId ? { agentId } : {}),
         });
         resolve({ behavior: "allow", updatedInput: input });
         return;
@@ -156,6 +233,7 @@ export class ClaudeAdapter implements AgentAdapter {
         input,
         suggestions: options.suggestions ?? [],
         toolName,
+        ...(agentId ? { agentId } : {}),
       });
       // 会话被中止时不能悬着,直接拒绝
       options.signal.addEventListener("abort", () => {
@@ -178,11 +256,135 @@ export class ClaudeAdapter implements AgentAdapter {
         resources,
         summary: options.title ?? `${toolName}: ${resources[0] ?? ""}`,
         ...(diff ? { diff } : {}),
+        ...(agentId ? { agentId } : {}),
       });
     });
+  };
+
+  private requestUserQuestion(
+    input: Record<string, unknown>,
+    options: Parameters<CanUseTool>[2],
+    agentId?: string,
+  ): Promise<PermissionResult> {
+    return new Promise<PermissionResult>((resolve) => {
+      const reqId = randomUUID();
+      const native = Array.isArray(input["questions"]) ? input["questions"] : [];
+      const nativeQuestionById = new Map<string, string>();
+      const questions = native.flatMap((value, index): AgentQuestion[] => {
+        if (!value || typeof value !== "object") return [];
+        const row = value as Record<string, unknown>;
+        const question = typeof row["question"] === "string" ? row["question"] : "请选择";
+        const id = `q${String(index + 1)}`;
+        nativeQuestionById.set(id, question);
+        const choices = Array.isArray(row["options"])
+          ? row["options"].flatMap((value) => {
+              if (!value || typeof value !== "object") return [];
+              const choice = value as Record<string, unknown>;
+              return typeof choice["label"] === "string"
+                ? [{
+                    label: choice["label"],
+                    ...(typeof choice["description"] === "string"
+                      ? { description: choice["description"] }
+                      : {}),
+                    ...(typeof choice["preview"] === "string"
+                      ? { preview: choice["preview"] }
+                      : {}),
+                  }]
+                : [];
+            })
+          : [];
+        return [{
+          id,
+          header: typeof row["header"] === "string" ? row["header"] : "Agent 提问",
+          question,
+          options: choices,
+          multiSelect: row["multiSelect"] === true,
+          allowOther: true,
+        }];
+      });
+      if (questions.length === 0) {
+        resolve({ behavior: "allow", updatedInput: { ...input, answers: {} } });
+        return;
+      }
+      const toolUseId = (options as { toolUseID?: unknown }).toolUseID;
+      if (typeof toolUseId === "string") this.questionToolIds.add(toolUseId);
+      this.questions.set(reqId, {
+        resolve,
+        input,
+        questions,
+        nativeQuestionById,
+        ...(agentId ? { agentId } : {}),
+      });
+      options.signal.addEventListener("abort", () => {
+        if (!this.questions.delete(reqId)) return;
+        resolve({ behavior: "deny", message: "会话已中止" });
+        this.emit({
+          kind: "question.resolved",
+          reqId,
+          answers: [],
+          cancelled: true,
+          ...(agentId ? { agentId } : {}),
+        });
+      });
+      this.emit({
+        kind: "question.request",
+        reqId,
+        questions,
+        ...(agentId ? { agentId } : {}),
+      });
+    });
+  }
 
   private emit(body: AgentEventBody): void {
     this.ctx?.emit(body);
+  }
+
+  private messageAgent(msg: SDKMessage): string | undefined {
+    const parent = (msg as { parent_tool_use_id?: unknown }).parent_tool_use_id;
+    return typeof parent === "string" && parent.length > 0
+      ? (this.taskAgents.get(parent) ?? parent)
+      : undefined;
+  }
+
+  private registerSubagent(
+    id: string,
+    details: { name?: string; role?: string; task?: string; preview?: string } = {},
+  ): void {
+    if (!id || this.subagents.has(id)) return;
+    const createdAt = Date.now();
+    this.subagents.set(id, { canMessage: true, createdAt });
+    this.emit({
+      kind: "subagent.started",
+      subagent: {
+        id,
+        name: details.name || `Claude 子 Agent ${String(this.subagents.size)}`,
+        ...(details.role ? { role: details.role } : {}),
+        ...(details.task ? { task: details.task } : {}),
+        status: "starting",
+        canMessage: true,
+        createdAt,
+        updatedAt: createdAt,
+        ...(details.preview ? { preview: details.preview } : {}),
+      },
+    });
+  }
+
+  private updateSubagent(
+    id: string,
+    status: SubagentStatus,
+    canMessage: boolean,
+    summary?: string,
+  ): void {
+    this.registerSubagent(id);
+    const known = this.subagents.get(id);
+    if (known) known.canMessage = canMessage;
+    this.emit({
+      kind: "subagent.updated",
+      subagentId: id,
+      status,
+      canMessage,
+      ...(summary ? { summary } : {}),
+    });
   }
 
   /** 消费 SDK 消息流,归一化成 Prospero 事件 */
@@ -202,6 +404,19 @@ export class ClaudeAdapter implements AgentAdapter {
   }
 
   private onMessage(msg: SDKMessage): void {
+    const nativeSessionId = (msg as { session_id?: unknown }).session_id;
+    if (typeof nativeSessionId === "string" && nativeSessionId.length > 0) {
+      if (nativeSessionId !== this.sessionId) {
+        this.sessionId = nativeSessionId;
+        this.persistNativeState();
+      }
+    }
+    const agentId = this.messageAgent(msg);
+    const agentField = agentId ? { agentId } : {};
+    if (agentId) {
+      this.registerSubagent(agentId);
+      this.updateSubagent(agentId, "running", true);
+    }
     switch (msg.type) {
       case "stream_event": {
         // 增量文本:content_block_delta 里的 text_delta
@@ -210,24 +425,36 @@ export class ClaudeAdapter implements AgentAdapter {
           delta?: { type?: string; text?: string; thinking?: string };
         };
         if (ev.type !== "content_block_delta") return;
-        const msgId = this.currentMsgId || msg.uuid;
+        const msgId =
+          this.currentMessageByAgent.get(agentId ?? "") || this.currentMsgId || msg.uuid;
         if (ev.delta?.type === "text_delta" && ev.delta.text) {
           this.emit({
             kind: "text.delta",
             msgId,
             textId: msgId,
             delta: ev.delta.text,
+            ...agentField,
           });
         } else if (ev.delta?.type === "thinking_delta" && ev.delta.thinking) {
-          this.emit({ kind: "reasoning.delta", msgId, delta: ev.delta.thinking });
+          this.emit({
+            kind: "reasoning.delta",
+            msgId,
+            delta: ev.delta.thinking,
+            ...agentField,
+          });
         }
         return;
       }
       case "assistant": {
-        this.currentMsgId = msg.message.id;
+        this.currentMessageByAgent.set(agentId ?? "", msg.message.id);
+        if (!agentId) this.currentMsgId = msg.message.id;
         // 工具调用在完整消息里出现(增量流只给文本)
         for (const block of msg.message.content) {
           if (typeof block === "object" && block.type === "tool_use") {
+            if (block.name === "AskUserQuestion") {
+              this.questionToolIds.add(block.id);
+              continue;
+            }
             const diff = diffFromToolInput(
               block.name,
               (block.input ?? {}) as Record<string, unknown>,
@@ -239,6 +466,7 @@ export class ClaudeAdapter implements AgentAdapter {
               tool: block.name,
               summary: summarize(block.input),
               ...(diff ? { diff } : {}),
+              ...agentField,
             });
           }
         }
@@ -250,6 +478,7 @@ export class ClaudeAdapter implements AgentAdapter {
         if (typeof content === "string") return;
         for (const block of content) {
           if (typeof block === "object" && block.type === "tool_result") {
+            if (this.questionToolIds.delete(block.tool_use_id)) continue;
             const full = plainText(block.content);
             // 全文留在 daemon,事件只带摘要;用户展开卡片时再拉
             if (full.length > 0) this.ctx?.recordOutput?.(block.tool_use_id, full);
@@ -260,6 +489,7 @@ export class ClaudeAdapter implements AgentAdapter {
               state: block.is_error === true ? "failed" : "success",
               summary,
               ...(full.length > summary.length ? { hasMore: true } : {}),
+              ...agentField,
             });
           }
         }
@@ -269,15 +499,72 @@ export class ClaudeAdapter implements AgentAdapter {
         const usage = msg.usage as { input_tokens?: number; output_tokens?: number } | undefined;
         this.emit({
           kind: "turn.end",
-          msgId: this.currentMsgId || msg.uuid,
+          msgId: this.currentMessageByAgent.get(agentId ?? "") || this.currentMsgId || msg.uuid,
           finish: msg.subtype,
           ...(typeof msg.total_cost_usd === "number" ? { costUsd: msg.total_cost_usd } : {}),
           ...(typeof usage?.input_tokens === "number" ? { inputTokens: usage.input_tokens } : {}),
           ...(typeof usage?.output_tokens === "number"
             ? { outputTokens: usage.output_tokens }
             : {}),
+          ...agentField,
         });
-        this.currentMsgId = "";
+        this.currentMessageByAgent.delete(agentId ?? "");
+        if (agentId) this.updateSubagent(agentId, "idle", true);
+        else this.currentMsgId = "";
+        return;
+      }
+      case "system": {
+        const system = msg as SDKMessage & {
+          subtype?: string;
+          model?: string;
+          status?: string | null;
+          compact_result?: "success" | "failed";
+          compact_error?: string;
+          task_id?: string;
+          tool_use_id?: string;
+          description?: string;
+          subagent_type?: string;
+          task_type?: string;
+          prompt?: string;
+          summary?: string;
+        };
+        if (system.subtype === "task_started" && system.task_id) {
+          const publicId = system.tool_use_id || system.task_id;
+          this.taskAgents.set(system.task_id, publicId);
+          if (system.tool_use_id) this.taskAgents.set(system.tool_use_id, publicId);
+          this.registerSubagent(publicId, {
+            ...(system.subagent_type ? { name: system.subagent_type } : {}),
+            ...(system.task_type ? { role: system.task_type } : {}),
+            ...(system.prompt || system.description
+              ? { task: system.prompt || system.description }
+              : {}),
+          });
+          this.updateSubagent(publicId, "running", true, system.description);
+        } else if (system.subtype === "task_progress" && system.task_id) {
+          const publicId = this.taskAgents.get(system.task_id) ?? system.tool_use_id ?? system.task_id;
+          this.taskAgents.set(system.task_id, publicId);
+          this.updateSubagent(publicId, "running", true, system.summary || system.description);
+        } else if (system.subtype === "task_notification" && system.task_id) {
+          const publicId = this.taskAgents.get(system.task_id) ?? system.tool_use_id ?? system.task_id;
+          const rawStatus = String(system.status ?? "completed");
+          const status: SubagentStatus =
+            rawStatus === "failed"
+              ? "failed"
+              : rawStatus === "stopped"
+                ? "stopped"
+                : "completed";
+          this.updateSubagent(publicId, status, false, system.summary || system.description);
+        }
+        if (system.subtype === "init" && !this.selectedModel && system.model) {
+          this.selectedModel = system.model;
+          this.persistNativeState();
+        }
+        if (system.subtype === "status" && system.compact_result) {
+          this.settleCompact(
+            system.compact_result === "success",
+            system.compact_error ?? "Claude 上下文压缩失败",
+          );
+        }
         return;
       }
       default:
@@ -287,6 +574,123 @@ export class ClaudeAdapter implements AgentAdapter {
 
   /** SDK 原生收图,不必落盘再让模型去读 */
   readonly acceptsImages = true;
+
+  async listModels(): Promise<AgentModelCatalog> {
+    if (!this.q) throw new AdapterError("Claude 会话尚未就绪");
+    const native = await this.q.supportedModels();
+    this.modelCache = native;
+    const selectedRow = native.find(
+      (model) =>
+        model.value === this.selectedModel || model.resolvedModel === this.selectedModel,
+    );
+    const currentModel = selectedRow?.value ?? this.selectedModel ?? native[0]?.value;
+    if (currentModel && currentModel !== this.selectedModel) {
+      this.selectedModel = currentModel;
+      this.persistNativeState();
+    }
+    return {
+      models: native.map((model, index) => ({
+        id: model.value,
+        label: model.displayName || model.value,
+        ...(model.description ? { description: model.description } : {}),
+        supportedEfforts: model.supportedEffortLevels ?? [],
+        ...(index === 0 ? { isDefault: true } : {}),
+      })),
+      ...(currentModel ? { currentModel } : {}),
+      ...(this.selectedEffort ? { currentEffort: this.selectedEffort } : {}),
+    };
+  }
+
+  async setModel(model: string, effort?: string): Promise<AgentModelSelection> {
+    if (!this.q) throw new AdapterError("Claude 会话尚未就绪");
+    const native = this.modelCache ?? (await this.q.supportedModels());
+    this.modelCache = native;
+    const selected = native.find((entry) => entry.value === model);
+    if (!selected) throw new AdapterError(`Claude 模型不可用:${model}`);
+    if (effort && !(selected.supportedEffortLevels ?? []).includes(effort as EffortLevel)) {
+      throw new AdapterError(`${model} 不支持推理强度 ${effort}`);
+    }
+    await this.q.setModel(model);
+    if (effort) await this.q.applyFlagSettings({ effortLevel: effort as EffortLevel });
+    this.selectedModel = model;
+    this.selectedEffort = effort ?? null;
+    this.persistNativeState();
+    return {
+      currentModel: model,
+      ...(effort ? { currentEffort: effort } : {}),
+    };
+  }
+
+  async listModes(): Promise<AgentModeCatalog> {
+    return {
+      modes: [
+        {
+          id: "default",
+          label: "执行",
+          description: "允许 Claude 使用工具、修改文件并完成任务。",
+        },
+        {
+          id: "plan",
+          label: "Plan",
+          description: "只调查与规划；需要决策时显示结构化问题卡片。",
+        },
+      ],
+      currentMode: this.selectedMode,
+    };
+  }
+
+  async setMode(mode: string): Promise<AgentModeSelection> {
+    if (mode !== "default" && mode !== "plan") throw new AdapterError(`Claude 模式不可用:${mode}`);
+    if (!this.q) throw new AdapterError("Claude 会话尚未就绪");
+    await this.q.setPermissionMode(mode);
+    this.selectedMode = mode;
+    this.persistNativeState();
+    return { currentMode: mode };
+  }
+
+  async compact(): Promise<void> {
+    if (!this.q) throw new AdapterError("Claude 会话尚未就绪");
+    if (this.compactWaiter) throw new AdapterError("Claude 正在压缩上下文");
+    const msgId = `compact-${randomUUID()}`;
+    const completion = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.compactWaiter?.msgId !== msgId) return;
+        this.compactWaiter = null;
+        reject(new AdapterError("Claude /compact 超时"));
+      }, 180_000);
+      timer.unref?.();
+      this.compactWaiter = { msgId, resolve, reject, timer };
+    });
+    // Claude SDK 没有单独的 compact 控制方法；streaming input 会在 CLI 本地
+    // 解析 slash command，并通过 system/status 回 compact_result，不会交给模型。
+    this.pushTextMessage("/compact", msgId);
+    return completion;
+  }
+
+  private settleCompact(ok: boolean, message: string): void {
+    const waiter = this.compactWaiter;
+    if (!waiter) return; // 自动 compact 或已经结算
+    this.compactWaiter = null;
+    clearTimeout(waiter.timer);
+    if (ok) {
+      this.emit({ kind: "turn.end", msgId: waiter.msgId, finish: "compact" });
+      waiter.resolve();
+    } else {
+      const error = new AdapterError(message);
+      this.emit({ kind: "agent.error", message });
+      waiter.reject(error);
+    }
+  }
+
+  private pushTextMessage(text: string, messageId = ""): void {
+    this.input.push({
+      type: "user",
+      message: { role: "user", content: text },
+      parent_tool_use_id: null,
+      session_id: this.sessionId ?? "",
+      ...(messageId ? { uuid: messageId } : {}),
+    } as SDKUserMessage);
+  }
 
   async send(text: string, attachments?: Attachment[]): Promise<void> {
     if (!this.q) throw new AdapterError("Claude 会话尚未就绪");
@@ -306,12 +710,22 @@ export class ClaudeAdapter implements AgentAdapter {
             ...(text.length > 0 ? [{ type: "text" as const, text }] : []),
           ]
         : text;
-    this.input.push({
-      type: "user",
-      message: { role: "user", content },
-      parent_tool_use_id: null,
-      session_id: "",
-    } as SDKUserMessage);
+    if (typeof content === "string") {
+      this.pushTextMessage(content);
+    } else {
+      this.input.push({
+        type: "user",
+        message: { role: "user", content },
+        parent_tool_use_id: null,
+        session_id: this.sessionId ?? "",
+      } as SDKUserMessage);
+    }
+  }
+
+  /** Claude streaming input 原生允许在一轮运行中继续追加用户引导。 */
+  async steer(text: string, attachments?: Attachment[]): Promise<boolean> {
+    await this.send(text, attachments);
+    return true;
   }
 
   async respondPermission(reqId: string, reply: PermissionReply): Promise<void> {
@@ -332,7 +746,50 @@ export class ClaudeAdapter implements AgentAdapter {
       // 表现为工具"执行了"却什么也没做,模型反复重试直到 turn 永远不结束。
       p.resolve({ behavior: "allow", updatedInput: p.input });
     }
-    this.emit({ kind: "permission.resolved", reqId, reply });
+    this.emit({
+      kind: "permission.resolved",
+      reqId,
+      reply,
+      ...(p.agentId ? { agentId: p.agentId } : {}),
+    });
+  }
+
+  async respondQuestion(
+    reqId: string,
+    answers: AgentQuestionAnswer[],
+    cancelled = false,
+  ): Promise<void> {
+    const pending = this.questions.get(reqId);
+    if (!pending) return;
+    this.questions.delete(reqId);
+    const nativeAnswers: Record<string, string> = {};
+    for (const answer of answers) {
+      const nativeQuestion = pending.nativeQuestionById.get(answer.questionId);
+      if (nativeQuestion) nativeAnswers[nativeQuestion] = answer.values.join(", ");
+    }
+    pending.resolve({
+      behavior: "allow",
+      updatedInput: { ...pending.input, answers: cancelled ? {} : nativeAnswers },
+    });
+    this.emit({
+      kind: "question.resolved",
+      reqId,
+      answers,
+      ...(cancelled ? { cancelled: true } : {}),
+      ...(pending.agentId ? { agentId: pending.agentId } : {}),
+    });
+  }
+
+  async sendToSubagent(subagentId: string, text: string): Promise<void> {
+    const known = this.subagents.get(subagentId);
+    if (!known || !known.canMessage) throw new AdapterError("Claude 子 Agent 当前不可寻址");
+    this.updateSubagent(subagentId, "running", true);
+    this.input.push({
+      type: "user",
+      message: { role: "user", content: text },
+      parent_tool_use_id: subagentId,
+      session_id: this.sessionId ?? "",
+    } as SDKUserMessage);
   }
 
   /**
@@ -397,6 +854,16 @@ export class ClaudeAdapter implements AgentAdapter {
       p.resolve({ behavior: "deny", message: "会话已关闭" });
       this.pending.delete(reqId);
     }
+    for (const [reqId, pending] of this.questions) {
+      pending.resolve({ behavior: "deny", message: "会话已关闭" });
+      this.questions.delete(reqId);
+    }
+    if (this.compactWaiter) {
+      const waiter = this.compactWaiter;
+      this.compactWaiter = null;
+      clearTimeout(waiter.timer);
+      waiter.reject(new AdapterError("会话已关闭"));
+    }
     this.input.close();
     try {
       await this.q?.interrupt();
@@ -405,6 +872,9 @@ export class ClaudeAdapter implements AgentAdapter {
     }
     this.q = null;
     this.ctx = null;
+    this.subagents.clear();
+    this.taskAgents.clear();
+    this.currentMessageByAgent.clear();
     await this.pumping?.catch(() => {});
   }
 }

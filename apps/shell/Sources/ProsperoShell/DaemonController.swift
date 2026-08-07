@@ -32,6 +32,8 @@ final class DaemonController {
 
   private var process: Process?
   private var refreshTimer: Timer?
+  /// 重启是在旧进程真正退出后才起新的 —— 靠 terminationHandler 接力,而不是睡一段时间赌它退干净了
+  private var restartRequested = false
   private let bonjour = BonjourAdvertiser()
   private var boundDeviceNames: Set<String> = []
   private var logHandle: FileHandle?
@@ -57,7 +59,8 @@ final class DaemonController {
   /// 端口探测在飞。慢网络下一次探测可能比刷新间隔还长,不叠着发。
   private var probing = false
 
-  private static let logLineCap = 200
+  // nonisolated:readLogTail 在主线程外读日志尾巴,要用到这个上限
+  private nonisolated static let logLineCap = 200
   /// 日志文件体积上限。这是个调试日志,没人会去读几十兆的历史,
   /// 但没有上限它就会在 ~/.prospero 里一直长。
   private static let logByteCap: UInt64 = 1 << 20
@@ -67,14 +70,26 @@ final class DaemonController {
   init() {
     boundDeviceNames = Set(DaemonStatus.load().devices.filter(\.bound).map(\.name))
     pendingBind = Self.storedPendingBind
+    setRecentLog(Self.readLogTail(from: logURL))
     refresh()
-    // 菜单打开时 runloop 跑在 event tracking mode,default mode 的 timer 不触发 ——
-    // 结果就是会话列表和待审批数正好在用户盯着看的时候是僵的。.common 覆盖两种 mode。
-    let timer = Timer(timeInterval: 3, repeats: true) { [weak self] _ in
+    // .common 而不是默认 mode:菜单跟踪、窗口拖动、列表滚动期间 runloop 都会切走,
+    // 默认 mode 的 timer 在那些时候不触发 —— 界面正好在被操作时是僵的。
+    let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
       Task { @MainActor in self?.refresh() }
     }
     RunLoop.main.add(timer, forMode: .common)
     refreshTimer = timer
+  }
+
+  /// 没在跑就拉起来。Dashboard 出现时调一次 —— 壳的存在意义就是让 daemon 归它管。
+  func startIfNeeded() {
+    refresh()
+    switch state {
+    case .stopped, .failed:
+      start()
+    default:
+      break
+    }
   }
 
   /// 刷新状态。壳没在管进程时,也要认出别处跑着的 daemon(终端里手动起的)。
@@ -149,24 +164,26 @@ final class DaemonController {
   }
 
   private func reallyStart() {
+    // 已经有一个在手上就别再起一个 —— 两个 daemon 会抢同一个端口
+    guard process == nil else { return }
     guard let node = Locator.findNode() else {
-      state = .failed("找不到 node。菜单里「选择 node…」手动指定。")
+      state = .failed("找不到 node。在设置 → 运行环境里手动指定。")
       return
     }
     guard let cli = Locator.findCLI() else {
-      state = .failed("找不到 apps/daemon/dist/cli.js。菜单里「选择 prosperod…」手动指定。")
+      state = .failed("找不到 apps/daemon/dist/cli.js。在设置 → 运行环境里手动指定。")
       return
     }
 
     state = .starting
-    recentLog.removeAll()
-    logText = ""
+    setRecentLog([])
 
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: node)
     // 广播交给壳自己做(TCC 归属 app bundle),daemon 让位
-    var args = [cli, "start", "--no-bonjour"]
-    // 用户在菜单里换过网卡就带上。CLI 会把它写进 config.json —— 落盘的事交给它做
+    // --tmux:PTY 会话托管给 tmux,daemon 重启后进程与画面都还在
+    var args = [cli, "start", "--no-bonjour", "--tmux"]
+    // 用户在设置里换过网卡就带上。CLI 会把它写进 config.json —— 落盘的事交给它做
     if let pendingBind {
       args.append(contentsOf: ["--bind", pendingBind])
     }
@@ -190,6 +207,12 @@ final class DaemonController {
       Task { @MainActor [weak self] in
         guard let self else { return }
         self.process = nil
+        // 重启:等旧进程真的退了再起新的,避免两个 daemon 抢同一个端口
+        if self.restartRequested {
+          self.restartRequested = false
+          self.reallyStart()
+          return
+        }
         // 正常停止走 stop(),那里已经把 state 置成 stopped 了
         if case .stopped = self.state { return }
         self.state = p.terminationStatus == 0
@@ -274,22 +297,74 @@ final class DaemonController {
 
   func stop() {
     bonjour.stop()
+    restartRequested = false
     guard let proc = process else {
       state = .stopped
       refresh()
       return
     }
     state = .stopped
-    // SIGTERM —— daemon 自己会收尾(停广播、关会话)
+    // SIGTERM —— daemon 会先落盘结构化会话,PTY 则留在 tmux 中。
+    // process 不在这里置 nil,交给 terminationHandler ——
+    // 它才知道进程什么时候真的退了。
     proc.terminate()
-    process = nil
   }
 
+  /// 重启。等旧进程退出后由 terminationHandler 接力起新的,
+  /// 而不是睡 0.6 秒赌它已经退干净 —— 端口没释放就起会直接失败。
   func restart() {
-    stop()
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
-      self?.reallyStart()
+    guard let proc = process else {
+      reallyStart()
+      return
     }
+    restartRequested = true
+    state = .starting
+    bonjour.stop()
+    proc.terminate()
+  }
+
+  enum SessionAction: String {
+    case interrupt
+    case kill
+  }
+
+  /// 只通过 daemon 的本机控制接口管理会话;口令每次启动更换并只存在 0600 status.json。
+  func controlSession(id: String, action: SessionAction) async -> String? {
+    guard let running, !running.controlToken.isEmpty else {
+      return "daemon 尚未提供本机控制接口"
+    }
+    let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+    guard let url = URL(string: "http://127.0.0.1:\(running.port)/_prospero/control/session/\(encoded)/\(action.rawValue)") else {
+      return "无法构造控制地址"
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("Bearer \(running.controlToken)", forHTTPHeaderField: "Authorization")
+    do {
+      let (data, response) = try await URLSession.shared.data(for: request)
+      guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+        return String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+      }
+      try? await Task.sleep(for: .milliseconds(300))
+      refresh()
+      return nil
+    } catch {
+      return error.localizedDescription
+    }
+  }
+
+  /// recentLog 和它的拼接缓存必须一起改,不然日志窗口会显示上一份内容。
+  private func setRecentLog(_ lines: [String]) {
+    recentLog = lines
+    logText = lines.joined(separator: "\n")
+  }
+
+  /// 壳重启后把上次的日志尾巴读回来 —— 否则「查看日志」在 daemon 还没输出前是空的。
+  private nonisolated static func readLogTail(from url: URL) -> [String] {
+    guard let data = try? Data(contentsOf: url),
+          let text = String(data: data, encoding: .utf8)
+    else { return [] }
+    return Array(text.split(separator: "\n").suffix(logLineCap).map(String.init))
   }
 
   private func appendLog(_ text: String) {
@@ -340,8 +415,7 @@ final class DaemonController {
   }
 
   func clearLog() {
-    recentLog.removeAll()
-    logText = ""
+    setRecentLog([])
     rewindLogFile()
   }
 
