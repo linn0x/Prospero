@@ -1,6 +1,5 @@
 import { useCallback, useState } from "react";
 import {
-  Alert,
   FlatList,
   Pressable,
   StyleSheet,
@@ -13,6 +12,7 @@ import { Icon } from "@/components/Icon";
 import { SwipeRow } from "@/components/SwipeRow";
 import { getConnection, wireAppStateReconnect } from "@/lib/connection";
 import { getDeviceKeys, getHosts, removeHost, type StoredHost } from "@/lib/hosts";
+import { clearSessionPreferences } from "@/lib/session-preferences";
 import { useApp, type ConnStatus } from "@/lib/store";
 import { color, font, radius, space, statusColor } from "@/lib/theme";
 
@@ -56,7 +56,10 @@ export default function HostsScreen() {
   );
 
   const onDelete = (h: StoredHost): void => {
-    void removeHost(h.id)
+    void Promise.all([
+      removeHost(h.id),
+      clearSessionPreferences(h.id).catch(() => undefined),
+    ])
       .then(() => getHosts())
       .then((rest) => {
         setLocal(rest);

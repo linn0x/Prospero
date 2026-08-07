@@ -237,6 +237,19 @@ fi
 
 [[ -d "$ARCHIVE" ]] || die "归档失败,完整日志重跑一次去掉末尾的 grep 就能看到"
 
+# 自动签名分支在归档前不需要 bundle id，但启动设备上的 App 时必须传真实值。
+# 尤其是 --no-prebuild：直接猜 app.json 可能和现有 Xcode 工程不一致，所以以本次
+# archive 里的 Info.plist 为准；手动签名时顺便防止描述文件目标与实际产物串包。
+ARCHIVED_APP="$(find "$ARCHIVE/Products/Applications" -maxdepth 1 -name '*.app' | head -1)"
+[[ -n "$ARCHIVED_APP" ]] || die "归档里找不到 .app:$ARCHIVE"
+ARCHIVED_BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$ARCHIVED_APP/Info.plist" 2>/dev/null || true)"
+[[ -n "$ARCHIVED_BUNDLE_ID" ]] || die "归档缺少 CFBundleIdentifier:$ARCHIVED_APP"
+if [[ -z "$BUNDLE_ID" ]]; then
+  BUNDLE_ID="$ARCHIVED_BUNDLE_ID"
+elif [[ "$BUNDLE_ID" != "$ARCHIVED_BUNDLE_ID" ]]; then
+  die "归档 bundle id 是 $ARCHIVED_BUNDLE_ID,但签名目标是 $BUNDLE_ID。先重新 prebuild,避免装错 App。"
+fi
+
 step "导出 IPA"
 # 先删掉上一次的产物。否则导出失败时旧 IPA 还在,后面的存在性检查会通过,
 # 脚本报"完成"、你装上去的却是上一版 —— 这种错最难发现。

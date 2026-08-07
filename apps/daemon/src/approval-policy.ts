@@ -6,10 +6,12 @@
  * 而是把人训练成条件反射地点「允许」,等真正危险的那一次来了也照点不误。
  * 高频的无害审批实际上在【削弱】审批的安全价值。
  *
- * 【为什么不用后端的 bypass】Claude SDK 有 permissionMode: "bypassPermissions",
+ * 【为什么多数情况不用后端的 bypass】Claude SDK 有 permissionMode: "bypassPermissions",
  * 但那样 canUseTool 完全不会被调用,聊天里也就不会出现任何工具卡片 ——
  * 用户彻底看不见 agent 做了什么。自动批准的目的是【不打断】,不是【不告知】。
- * 所以放行在我们这一层做,事件照常发,只是不等人回应。
+ * 所以 strict/standard 在我们这一层放行,事件照常发,只是不等人回应。
+ * Codex 的 YOLO 是例外:还必须解除 app-server sandbox 才能访问 Docker socket、
+ * 仓库外路径等宿主资源；工具开始/结束事件仍由 app-server 正常上报。
  */
 import type { ApprovalPolicy } from "@prospero/protocol";
 

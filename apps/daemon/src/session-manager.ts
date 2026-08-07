@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { chmodSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -20,12 +20,17 @@ import {
 } from "./agents.js";
 import { PtySession } from "./pty-session.js";
 import * as tmux from "./tmux.js";
-import { StructuredSession, titleFor } from "./structured-session.js";
+import {
+  StructuredSession,
+  titleFor,
+  type QueuedChatPersistent,
+  type StructuredSessionPersistentState,
+} from "./structured-session.js";
 import { ClaudeAdapter } from "./adapters/claude.js";
 import { CodexAdapter } from "./adapters/codex.js";
 import { GrokAdapter } from "./adapters/grok.js";
 import { OpencodeAdapter } from "./adapters/opencode.js";
-import type { AgentAdapter } from "./adapters/types.js";
+import type { AdapterResumeState, AgentAdapter } from "./adapters/types.js";
 
 export type SessionErrorCode =
   | "shell_not_allowed"
@@ -46,6 +51,7 @@ export interface CreateSessionInput {
   agent: AgentKind;
   /** 省略时按 agent 能力决定:有适配器的走 structured */
   kind?: SessionKind | undefined;
+  approvalPolicy?: ApprovalPolicy | undefined;
   cwd?: string | undefined;
   command?: string | undefined;
   cols: number;
@@ -60,16 +66,16 @@ export interface SessionManagerEvents {
   state: [info: SessionInfo];
 }
 
-function makeAdapter(agent: AgentKind): AgentAdapter {
+function makeAdapter(agent: AgentKind, resumeState?: AdapterResumeState): AgentAdapter {
   switch (agent) {
     case "opencode":
-      return new OpencodeAdapter();
+      return new OpencodeAdapter({ resumeState });
     case "claude":
-      return new ClaudeAdapter();
+      return new ClaudeAdapter({ resumeState });
     case "codex":
-      return new CodexAdapter();
+      return new CodexAdapter({ resumeState });
     case "grok":
-      return new GrokAdapter();
+      return new GrokAdapter({ resumeState });
     default:
       throw new SessionError(`agent "${agent}" 暂无结构化适配器`, "agent_unavailable");
   }
@@ -85,9 +91,142 @@ interface PtyMeta {
   rows: number;
 }
 
+function parseStructuredState(value: unknown): StructuredSessionPersistentState | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const v = value as Record<string, unknown>;
+  const agents = new Set<AgentKind>(["claude", "codex", "opencode", "grok"]);
+  const policies = new Set<ApprovalPolicy>(["strict", "standard", "yolo"]);
+  if (
+    v["version"] !== 1 ||
+    typeof v["id"] !== "string" ||
+    typeof v["agent"] !== "string" ||
+    !agents.has(v["agent"] as AgentKind) ||
+    typeof v["title"] !== "string" ||
+    typeof v["cwd"] !== "string" ||
+    typeof v["createdAt"] !== "number" ||
+    typeof v["approvalPolicy"] !== "string" ||
+    !policies.has(v["approvalPolicy"] as ApprovalPolicy) ||
+    !Array.isArray(v["events"])
+  ) {
+    return null;
+  }
+  const rawTotals =
+    v["totals"] && typeof v["totals"] === "object"
+      ? (v["totals"] as Record<string, unknown>)
+      : {};
+  const number = (x: unknown): number =>
+    typeof x === "number" && Number.isFinite(x) ? x : 0;
+  const toolOutputs = Array.isArray(v["toolOutputs"])
+    ? v["toolOutputs"].filter(
+        (entry): entry is [string, string] =>
+          Array.isArray(entry) &&
+          typeof entry[0] === "string" &&
+          typeof entry[1] === "string",
+      )
+    : [];
+  const adapterState =
+    v["adapterState"] &&
+    typeof v["adapterState"] === "object" &&
+    !Array.isArray(v["adapterState"])
+      ? (v["adapterState"] as AdapterResumeState)
+      : {};
+  const imageMimes = new Set<Attachment["mimeType"]>([
+    "image/jpeg",
+    "image/png",
+    "image/gif",
+    "image/webp",
+  ]);
+  const messageQueue: QueuedChatPersistent[] = Array.isArray(v["messageQueue"])
+    ? v["messageQueue"]
+        .flatMap((raw): QueuedChatPersistent[] => {
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+          const item = raw as Record<string, unknown>;
+          if (
+            typeof item["id"] !== "string" ||
+            typeof item["displayText"] !== "string" ||
+            typeof item["outgoingText"] !== "string" ||
+            (item["kind"] !== "queue" && item["kind"] !== "guide") ||
+            typeof item["createdAt"] !== "number" ||
+            !Number.isFinite(item["createdAt"]) ||
+            typeof item["attachmentCount"] !== "number" ||
+            !Number.isInteger(item["attachmentCount"]) ||
+            item["attachmentCount"] < 0
+          ) {
+            return [];
+          }
+          const attachments = Array.isArray(item["attachments"])
+            ? item["attachments"].flatMap((rawAttachment) => {
+                if (
+                  !rawAttachment ||
+                  typeof rawAttachment !== "object" ||
+                  Array.isArray(rawAttachment)
+                ) {
+                  return [];
+                }
+                const attachment = rawAttachment as Record<string, unknown>;
+                if (
+                  typeof attachment["mimeType"] !== "string" ||
+                  !imageMimes.has(attachment["mimeType"] as Attachment["mimeType"]) ||
+                  typeof attachment["path"] !== "string"
+                ) {
+                  return [];
+                }
+                return [
+                  {
+                    mimeType: attachment["mimeType"] as Attachment["mimeType"],
+                    path: attachment["path"],
+                    ...(typeof attachment["name"] === "string"
+                      ? { name: attachment["name"] }
+                      : {}),
+                  },
+                ];
+              })
+            : [];
+          return [
+            {
+              id: item["id"],
+              displayText: item["displayText"],
+              outgoingText: item["outgoingText"],
+              kind: item["kind"],
+              createdAt: item["createdAt"],
+              attachmentCount: item["attachmentCount"],
+              attachments,
+            },
+          ];
+        })
+        .slice(0, 50)
+    : [];
+  return {
+    version: 1,
+    id: v["id"],
+    agent: v["agent"] as AgentKind,
+    title: v["title"],
+    cwd: v["cwd"],
+    createdAt: v["createdAt"],
+    approvalPolicy: v["approvalPolicy"] as ApprovalPolicy,
+    events: v["events"] as AgentEventBody[],
+    evSeq: Math.max(0, number(v["evSeq"])),
+    preview: typeof v["preview"] === "string" ? v["preview"] : "",
+    previewRaw: typeof v["previewRaw"] === "string" ? v["previewRaw"] : "",
+    previewMsgId: typeof v["previewMsgId"] === "string" ? v["previewMsgId"] : "",
+    totals: {
+      costUsd: number(rawTotals["costUsd"]),
+      inputTokens: number(rawTotals["inputTokens"]),
+      outputTokens: number(rawTotals["outputTokens"]),
+    },
+    toolOutputs,
+    adapterState,
+    messageQueue,
+  };
+}
+
 export interface SessionManagerOptions {
+  /** 结构化会话事件与原生恢复 ID 的持久化目录。 */
+  home?: string | undefined;
   /** tmux 托管:agent 跑在 tmux 里,daemon 重启后进程与画面都还在 */
   tmux?: { home: string } | undefined;
+  /** 测试注入；生产环境使用上面的各官方适配器。 */
+  adapterFactory?: ((agent: AgentKind, state?: AdapterResumeState) => AgentAdapter) | undefined;
 }
 
 export class SessionManager extends EventEmitter<SessionManagerEvents> {
@@ -97,6 +236,10 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   private readonly tmuxBin: string | null;
 
   private readonly metaFile: string | null;
+  private readonly structuredFile: string | null;
+  private readonly adapterFactory: (agent: AgentKind, state?: AdapterResumeState) => AgentAdapter;
+  private persistTimer: NodeJS.Timeout | null = null;
+  private shuttingDown = false;
 
   constructor(opts: SessionManagerOptions = {}) {
     super();
@@ -104,6 +247,9 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     this.tmuxBin = opts.tmux ? tmux.tmuxPath() : null;
     this.tmuxConfigFile = this.tmuxBin && opts.tmux ? tmux.writeConfig(opts.tmux.home) : null;
     this.metaFile = opts.tmux ? path.join(opts.tmux.home, "pty-sessions.json") : null;
+    const home = opts.home ?? opts.tmux?.home;
+    this.structuredFile = home ? path.join(home, "structured-sessions.json") : null;
+    this.adapterFactory = opts.adapterFactory ?? makeAdapter;
   }
 
   /**
@@ -164,6 +310,72 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     }
   }
 
+  private loadStructuredStates(): StructuredSessionPersistentState[] {
+    if (!this.structuredFile) return [];
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(this.structuredFile, "utf8"));
+      return Array.isArray(parsed)
+        ? parsed.map(parseStructuredState).filter((x): x is StructuredSessionPersistentState => x !== null)
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
+  private scheduleStructuredPersist(): void {
+    if (!this.structuredFile || this.shuttingDown || this.persistTimer) return;
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = null;
+      this.persistStructuredNow();
+    }, 200);
+    this.persistTimer.unref?.();
+  }
+
+  private persistStructuredNow(): void {
+    if (!this.structuredFile) return;
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = null;
+    }
+    const tmp = `${this.structuredFile}.tmp`;
+    const states = [...this.structuredSessions.values()].map((s) => s.persistentState());
+    try {
+      writeFileSync(tmp, JSON.stringify(states, null, 2), { mode: 0o600 });
+      renameSync(tmp, this.structuredFile);
+      chmodSync(this.structuredFile, 0o600);
+    } catch {
+      // 持久化失败不能打断正在运行的 agent；下一次事件会再次尝试。
+    }
+  }
+
+  /** 测试和优雅退出使用；确保 debounce 中的最后一批事件已经落盘。 */
+  flushPersistence(): void {
+    this.persistMeta();
+    this.persistStructuredNow();
+  }
+
+  /**
+   * 恢复结构化会话。Prospero 事件日志负责 UI，adapterState 让原生 CLI
+   * 接回模型上下文；单个后端失效时仍保留历史供查看和删除。
+   */
+  async restoreStructured(): Promise<SessionInfo[]> {
+    const restored: SessionInfo[] = [];
+    for (const state of this.loadStructuredStates()) {
+      if (this.structuredSessions.has(state.id)) continue;
+      const session = this.makeStructuredSession(state.id, state.agent, state.cwd, state.title, state);
+      this.structuredSessions.set(state.id, session);
+      try {
+        await session.start();
+      } catch (e) {
+        await session.markRestoreFailed(e instanceof Error ? e.message : String(e));
+      }
+      restored.push(session.info());
+      this.emit("state", session.info());
+    }
+    this.persistStructuredNow();
+    return restored;
+  }
+
   /** tmux 托管是否真正生效(装了 tmux 且开了开关) */
   get tmuxEnabled(): boolean {
     return this.tmuxBin !== null && this.tmuxConfigFile !== null;
@@ -183,7 +395,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       throw new SessionError(`agent "${input.agent}" 暂无结构化适配器`, "agent_unavailable");
     }
     return kind === "structured"
-      ? this.createStructured(input.agent, cwd)
+      ? this.createStructured(input.agent, cwd, input.approvalPolicy)
       : this.createPty(input, cwd);
   }
 
@@ -258,30 +470,64 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     return session.info();
   }
 
-  private async createStructured(agent: AgentKind, cwd: string): Promise<SessionInfo> {
+  private async createStructured(
+    agent: AgentKind,
+    cwd: string,
+    approvalPolicy?: ApprovalPolicy,
+  ): Promise<SessionInfo> {
     const id = randomUUID();
-    const session = new StructuredSession({
+    const session = this.makeStructuredSession(
       id,
       agent,
-      title: titleFor(agent, cwd),
       cwd,
-      adapter: makeAdapter(agent),
-    });
-    session.on("event", (body, evSeq) => this.emit("agentEvent", id, body, evSeq));
-    session.on("state", (info) => this.emit("state", info));
+      titleFor(agent, cwd),
+      undefined,
+      approvalPolicy,
+    );
     this.structuredSessions.set(id, session);
     try {
       await session.start();
     } catch (e) {
       this.structuredSessions.delete(id);
       await session.dispose().catch(() => {});
+      this.scheduleStructuredPersist();
       throw new SessionError(
         `无法启动 ${agent} 会话:${e instanceof Error ? e.message : String(e)}`,
         "agent_unavailable",
       );
     }
+    this.scheduleStructuredPersist();
     this.emit("state", session.info());
     return session.info();
+  }
+
+  private makeStructuredSession(
+    id: string,
+    agent: AgentKind,
+    cwd: string,
+    title: string,
+    restored?: StructuredSessionPersistentState,
+    approvalPolicy?: ApprovalPolicy,
+  ): StructuredSession {
+    const session = new StructuredSession({
+      id,
+      agent,
+      title,
+      cwd,
+      adapter: this.adapterFactory(agent, restored?.adapterState),
+      ...(approvalPolicy !== undefined ? { approvalPolicy } : {}),
+      ...(restored ? { restored } : {}),
+    });
+    session.on("event", (body, evSeq) => {
+      this.emit("agentEvent", id, body, evSeq);
+      this.scheduleStructuredPersist();
+    });
+    session.on("state", (info) => {
+      this.emit("state", info);
+      this.scheduleStructuredPersist();
+    });
+    session.on("persist", () => this.scheduleStructuredPersist());
+    return session;
   }
 
   getPty(sid: string): PtySession | undefined {
@@ -356,17 +602,22 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   }
 
   /** 转发一条用户消息(可带附件) */
-  async chatSend(sid: string, text: string, attachments?: Attachment[]): Promise<void> {
+  async chatSend(
+    sid: string,
+    text: string,
+    attachments?: Attachment[],
+    delivery?: import("@prospero/protocol").ChatDelivery,
+  ): Promise<void> {
     const s = this.structuredSessions.get(sid);
     if (!s) throw new SessionError(`no structured session: ${sid}`, "session_not_found");
-    await s.send(text, attachments);
+    await s.send(text, attachments, delivery);
   }
 
   /** 改某个结构化会话的审批策略 */
-  setApprovalPolicy(sid: string, policy: ApprovalPolicy): void {
+  async setApprovalPolicy(sid: string, policy: ApprovalPolicy): Promise<void> {
     const s = this.structuredSessions.get(sid);
     if (!s) throw new SessionError(`no structured session: ${sid}`, "session_not_found");
-    s.setApprovalPolicy(policy);
+    await s.setApprovalPolicy(policy);
   }
 
   async interrupt(sid: string): Promise<void> {
@@ -385,6 +636,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       const info = structured.info();
       await structured.dispose();
       this.structuredSessions.delete(sid);
+      this.scheduleStructuredPersist();
       this.emit("state", { ...info, status: "done" });
       return;
     }
@@ -405,10 +657,30 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
    * daemon 退出时只断开自己这一侧。tmux 托管下会话进程留在 tmux server 里,
    * 下次启动再 attach 回来 —— 这正是托管的意义,所以这里绝不能 killSession。
    */
-  disposeAll(): void {
+  async disposeAll(): Promise<void> {
+    // 先保存“仍然存在”的集合,随后 dispose 产生的 done 状态不能把它们从磁盘抹掉。
+    this.flushPersistence();
+    this.shuttingDown = true;
+    // create() 返回时 tmux 子进程可能还在和 server 握手。极快地点击“重启”时若
+    // 立刻杀 client,session 尚未登记就会丢失；最多等 750ms 让 supervisor 接棒。
+    if (this.tmuxEnabled) {
+      const expected = new Set(
+        [...this.ptySessions.values()]
+          .filter((s) => s.info().status !== "done" && s.info().status !== "died")
+          .map((s) => s.id),
+      );
+      const deadline = Date.now() + 750;
+      while (expected.size > 0 && Date.now() < deadline) {
+        for (const id of tmux.listSessions()) expected.delete(id);
+        if (expected.size > 0) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+      }
+    }
     for (const s of this.ptySessions.values()) s.dispose();
     this.ptySessions.clear();
-    for (const s of this.structuredSessions.values()) void s.dispose();
+    const disposals = [...this.structuredSessions.values()].map((s) => s.dispose());
     this.structuredSessions.clear();
+    await Promise.allSettled(disposals);
   }
 }

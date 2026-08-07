@@ -20,7 +20,18 @@ export interface StatusSession {
   cwd: string;
   status: string;
   pendingPermissions: number;
+  pendingQuestions: number;
+  createdAt: number;
+  approvalPolicy?: string;
+  preview?: string;
   busySince?: number;
+  subagents?: Array<{
+    id: string;
+    name: string;
+    status: string;
+    canMessage: boolean;
+    preview?: string;
+  }>;
 }
 
 export interface StatusSnapshot {
@@ -30,6 +41,9 @@ export interface StatusSnapshot {
   builtAt: number;
   port: number;
   bind: string | null;
+  /** 仅供同用户 Mac GUI 调用回环控制接口；status.json 权限固定为 0600。 */
+  controlToken: string;
+  persistence: { pty: boolean; structured: boolean };
   sessions: StatusSession[];
 }
 
@@ -59,7 +73,13 @@ export class StatusFile {
   constructor(
     home: string,
     private readonly manager: SessionManager,
-    private readonly meta: { port: number; bind: string | null; startedAt?: number },
+    private readonly meta: {
+      port: number;
+      bind: string | null;
+      controlToken: string;
+      persistence: { pty: boolean; structured: boolean };
+      startedAt?: number;
+    },
   ) {
     this.filePath = path.join(home, FILE);
   }
@@ -93,6 +113,8 @@ export class StatusFile {
       builtAt: buildTimestamp(),
       port: this.meta.port,
       bind: this.meta.bind,
+      controlToken: this.meta.controlToken,
+      persistence: this.meta.persistence,
       sessions: this.manager.list().map(toStatusSession),
     };
     try {
@@ -128,7 +150,20 @@ export function toStatusSession(info: SessionInfo): StatusSession {
     cwd: info.cwd,
     status: info.status,
     pendingPermissions: info.pendingPermissions ?? 0,
+    pendingQuestions: info.pendingQuestions ?? 0,
+    createdAt: info.createdAt,
   };
+  if (info.approvalPolicy !== undefined) session.approvalPolicy = info.approvalPolicy;
+  if (info.preview !== undefined) session.preview = info.preview;
   if (info.busySince !== undefined) session.busySince = info.busySince;
+  if (info.subagents?.length) {
+    session.subagents = info.subagents.map((subagent) => ({
+      id: subagent.id,
+      name: subagent.name,
+      status: subagent.status,
+      canMessage: subagent.canMessage,
+      ...(subagent.preview ? { preview: subagent.preview } : {}),
+    }));
+  }
   return session;
 }

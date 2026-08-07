@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -15,7 +15,19 @@ import {
 import * as Haptics from "expo-haptics";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Stack, router, useLocalSearchParams } from "expo-router";
-import type { ApprovalPolicy, S2CMessage, SessionInfo, UsageWindow } from "@prospero/protocol";
+import type {
+  ApprovalPolicy,
+  AgentMode,
+  AgentModel,
+  ChatDelivery,
+  ChatSuggestion,
+  ChatSuggestionKind,
+  S2CMessage,
+  SessionInfo,
+  SubagentInfo,
+  SubagentStatus,
+  UsageWindow,
+} from "@prospero/protocol";
 import { ChatView } from "@/components/ChatView";
 import { DismissKey } from "@/components/DismissKey";
 import { Icon } from "@/components/Icon";
@@ -25,11 +37,17 @@ import { Terminal, type TerminalHandle } from "@/components/Terminal";
 import { VoiceButton } from "@/components/VoiceButton";
 import { pickFromCamera, pickFromLibrary, type PickedImage } from "@/lib/attach";
 import { Meter, Row, Sheet } from "@/components/Sheet";
-import { color, font, statusColor, utilizationColor } from "@/lib/theme";
+import { toast } from "@/components/Toast";
+import { color, font, MONOSPACE_FONT, statusColor, utilizationColor } from "@/lib/theme";
 import { matchCommands } from "@/lib/slash-commands";
-import { MONOSPACE_FONT } from "@/lib/theme";
+import { setSessionArchived } from "@/lib/session-preferences";
 import { useHostConnection } from "@/lib/use-host-connection";
 import { appendVoiceTranscript } from "@/lib/voice-input";
+import type { ProjectFileReference } from "@/lib/file-references";
+import {
+  activeComposerToken,
+  replaceComposerToken,
+} from "@/lib/composer-completion";
 
 type UsageResult = Extract<S2CMessage, { type: "usage.result" }>;
 
@@ -48,9 +66,20 @@ const statusText: Record<SessionInfo["status"], string> = {
   starting: "启动中",
   running: "运行中",
   waiting_approval: "待审批",
+  waiting_input: "待回答",
   idle: "空闲",
   done: "已完成",
   died: "已退出",
+};
+
+const subagentStatusText: Record<SubagentStatus, string> = {
+  starting: "启动中",
+  running: "工作中",
+  waiting_input: "待回答",
+  idle: "可对话",
+  completed: "已完成",
+  failed: "失败",
+  stopped: "已停止",
 };
 
 /** 每秒刷新耗时;计时只重渲染标题,不牵动终端 WebView 与聊天列表。 */
@@ -88,37 +117,53 @@ function SessionHeaderTitle({
   session,
   pending,
   tightest,
+  subagent,
 }: {
   session?: SessionInfo;
   pending: number;
   tightest: UsageWindow | null;
+  subagent?: SubagentInfo;
 }) {
-  const busy = session?.status === "running" || session?.status === "starting";
+  const busy = !subagent && (session?.status === "running" || session?.status === "starting");
   const elapsed = useElapsed(
     busy || session?.status === "waiting_approval" ? session?.busySince : undefined,
   );
   const totals = session?.totals;
   const parts = session
-    ? [
+    ? subagent
+      ? [session.agent, "子 Agent", subagentStatusText[subagent.status], pending > 0 ? `${String(pending)} 项待处理` : ""]
+          .filter(Boolean)
+      : [
         session.agent,
         `${statusText[session.status]}${elapsed ? ` ${elapsed}` : ""}`,
-        pending > 0 ? `${String(pending)} 项待批` : "",
+        pending > 0 ? `${String(pending)} 项待处理` : "",
+        session.messageQueue?.length
+          ? `${String(session.messageQueue.length)} 条排队`
+          : "",
         totals && totals.costUsd > 0 ? `$${totals.costUsd.toFixed(3)}` : "",
         tightest ? `${tightest.label} ${String(Math.round(tightest.utilization))}%` : "",
-      ].filter(Boolean)
+        ].filter(Boolean)
     : [];
 
   return (
     <View style={styles.headerTitle}>
       <Text style={styles.headerName} numberOfLines={1}>
-        {session?.title ?? "会话"}
+        {subagent?.name ?? session?.title ?? "会话"}
       </Text>
       {session && (
         <View style={styles.headerMetaRow}>
           <View
             style={[
               styles.headerDot,
-              { backgroundColor: statusColor[session.status] ?? color.textDim },
+              {
+                backgroundColor: subagent
+                  ? subagent.status === "running" || subagent.status === "starting"
+                    ? color.accent
+                    : subagent.status === "failed"
+                      ? color.danger
+                      : color.textDim
+                  : statusColor[session.status] ?? color.textDim,
+              },
             ]}
           />
           <Text style={styles.headerSub} numberOfLines={1}>
@@ -132,31 +177,98 @@ function SessionHeaderTitle({
 
 export default function SessionScreen() {
   const insets = useSafeAreaInsets();
+  const { hostId, sid, subagentId } = useLocalSearchParams<{
+    hostId: string;
+    sid: string;
+    subagentId?: string;
+  }>();
+  const { conn, runtime } = useHostConnection(hostId);
+  const [draft, setDraft] = useState("");
+  const [selection, setSelection] = useState({ start: 0, end: 0 });
+  const inputRef = useRef<TextInput>(null);
   const appendTranscript = useCallback((text: string): void => {
     // 使用函数式更新，转写期间用户新打的字也不会被旧闭包覆盖。
     setDraft((current) => appendVoiceTranscript(current, text));
   }, []);
-  const { hostId, sid } = useLocalSearchParams<{ hostId: string; sid: string }>();
-  const { conn, runtime } = useHostConnection(hostId);
-  const [draft, setDraft] = useState("");
   const [focused, setFocused] = useState(false);
   const [pending, setPending] = useState(0);
-  /** 结构化会话可切到 TTY 视图查看底层终端 */
-  const [showTty, setShowTty] = useState(false);
   const [search, setSearch] = useState<string | null>(null);
+  const [busyDelivery, setBusyDelivery] = useState<Exclude<ChatDelivery, "auto">>("queue");
+  const [completionResult, setCompletionResult] = useState<{
+    key: string;
+    items: ChatSuggestion[];
+    loading: boolean;
+  }>({ key: "", items: [], loading: false });
+  const completionSequence = useRef(0);
 
   const session = sid ? runtime.sessions[sid] : undefined;
+  const agentControls = session?.agentControls;
+  const subagent = subagentId
+    ? session?.subagents?.find((candidate) => candidate.id === subagentId)
+    : undefined;
+  const isSubagent = subagentId !== undefined;
   const isStructured = session?.kind === "structured";
-  const isChat = isStructured && !showTty;
-  const busy = session?.status === "running" || session?.status === "starting";
+  const isChat = isStructured;
+  const busy = isSubagent
+    ? subagent?.status === "running" ||
+      subagent?.status === "starting" ||
+      subagent?.status === "waiting_input"
+    : session?.status === "running" ||
+      session?.status === "starting" ||
+      session?.status === "waiting_approval" ||
+      session?.status === "waiting_input";
   const [usage, setUsage] = useState<UsageResult | null>(null);
   const [usageOpen, setUsageOpen] = useState(false);
   const [usageError, setUsageError] = useState<string | null>(null);
+  const [controlsOpen, setControlsOpen] = useState(false);
+  const [controlsLoading, setControlsLoading] = useState(false);
+  const [controlError, setControlError] = useState<string | null>(null);
+  const [models, setModels] = useState<AgentModel[]>([]);
+  const [modes, setModes] = useState<AgentMode[]>([]);
+  const [currentModel, setCurrentModel] = useState<string | undefined>(undefined);
+  const [currentEffort, setCurrentEffort] = useState<string | undefined>(undefined);
+  const [currentMode, setCurrentMode] = useState<string | undefined>(undefined);
+  const displayedModel = currentModel ?? agentControls?.currentModel;
+  const displayedEffort = currentEffort ?? agentControls?.currentEffort;
+  const displayedMode = currentMode ?? agentControls?.currentMode;
   const [images, setImages] = useState<PickedImage[]>([]);
   const termRef = useRef<TerminalHandle>(null);
-  // 字号存在会话页而不是终端内部:切走再回来不该重置成默认值
   const [fontSize, setFontSize] = useState(12);
-  const [perf, setPerf] = useState<{ fps: number; kb: number; renderer: string } | null>(null);
+  const composerToken = useMemo(
+    () => activeComposerToken(draft, selection.start),
+    [draft, selection.start],
+  );
+  const completionKind: ChatSuggestionKind | null =
+    composerToken?.kind === "file" || composerToken?.kind === "skill"
+      ? composerToken.kind
+      : null;
+  const completionQuery = completionKind === null ? "" : composerToken?.query ?? "";
+  const completionKey = completionKind === null ? "" : `${completionKind}\u0000${completionQuery}`;
+  const suggestions = completionResult.key === completionKey ? completionResult.items : [];
+  const completionLoading =
+    completionKind !== null &&
+    (completionResult.key !== completionKey || completionResult.loading);
+
+  useEffect(() => {
+    const sequence = ++completionSequence.current;
+    if (!conn || !sid || !isChat || completionKind === null) return;
+    const key = `${completionKind}\u0000${completionQuery}`;
+    const timer = setTimeout(() => {
+      setCompletionResult({ key, items: [], loading: true });
+      const requestId = `${Date.now().toString(36)}-${String(sequence)}`;
+      void conn
+        .chatComplete(sid, completionKind, completionQuery, requestId)
+        .then((response) => {
+          if (completionSequence.current !== sequence) return;
+          setCompletionResult({ key, items: response.items, loading: false });
+        })
+        .catch(() => {
+          if (completionSequence.current !== sequence) return;
+          setCompletionResult({ key, items: [], loading: false });
+        });
+    }, 120);
+    return () => clearTimeout(timer);
+  }, [conn, sid, isChat, completionKind, completionQuery]);
 
   // 只显示最吃紧的那个窗口 —— 头部塞不下三个,而你关心的永远是先撞上的那个
   const tightest = (usage?.windows ?? []).reduce<UsageWindow | null>(
@@ -164,25 +276,150 @@ export default function SessionScreen() {
     null,
   );
 
+  const openControls = useCallback((): void => {
+    if (!conn || !sid || !agentControls || isSubagent) return;
+    setControlsOpen(true);
+    setControlsLoading(true);
+    setControlError(null);
+    const requests: Promise<void>[] = [];
+    if (agentControls.model) {
+      requests.push(
+        conn.agentModels(sid).then((response) => {
+          setModels(response.models);
+          setCurrentModel(response.currentModel);
+          setCurrentEffort(response.currentEffort);
+        }),
+      );
+    }
+    if (agentControls.mode) {
+      requests.push(
+        conn.agentModes(sid).then((response) => {
+          setModes(response.modes);
+          setCurrentMode(response.currentMode);
+        }),
+      );
+    }
+    void Promise.all(requests)
+      .catch((error: unknown) => {
+        setControlError(error instanceof Error ? error.message : String(error));
+      })
+      .finally(() => setControlsLoading(false));
+  }, [conn, sid, agentControls, isSubagent]);
+
+  const selectMode = useCallback(
+    (mode: string): void => {
+      if (!conn || !sid) return;
+      setControlsLoading(true);
+      setControlError(null);
+      void conn
+        .setAgentMode(sid, mode)
+        .then((response) => {
+          if (!response.ok) throw new Error(response.message ?? "模式切换失败");
+          setCurrentMode(response.currentMode ?? mode);
+          toast(response.message ?? "模式已切换");
+        })
+        .catch((error: unknown) => {
+          setControlError(error instanceof Error ? error.message : String(error));
+        })
+        .finally(() => setControlsLoading(false));
+    },
+    [conn, sid],
+  );
+
+  const selectModel = useCallback(
+    (model: string, effort?: string): void => {
+      if (!conn || !sid) return;
+      setControlsLoading(true);
+      setControlError(null);
+      void conn
+        .setAgentModel(sid, model, effort)
+        .then((response) => {
+          if (!response.ok) throw new Error(response.message ?? "模型切换失败");
+          setCurrentModel(response.currentModel ?? model);
+          setCurrentEffort(response.currentEffort);
+          toast(response.message ?? "模型已切换");
+        })
+        .catch((error: unknown) => {
+          setControlError(error instanceof Error ? error.message : String(error));
+        })
+        .finally(() => setControlsLoading(false));
+    },
+    [conn, sid],
+  );
+
+  const compactContext = useCallback((): void => {
+    if (!conn || !sid) return;
+    setControlsLoading(true);
+    setControlError(null);
+    void conn
+      .compactAgent(sid)
+      .then((response) => {
+        if (!response.ok) throw new Error(response.message ?? "上下文压缩失败");
+        toast(response.message ?? "上下文已压缩");
+      })
+      .catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        setControlError(message);
+        toast(message);
+      })
+      .finally(() => setControlsLoading(false));
+  }, [conn, sid]);
+
   const send = useCallback(
-    (text: string): void => {
+    (text: string, deliveryOverride?: ChatDelivery): void => {
       const t = text.trim();
       // 只带图不带字是合理的:一张报错截图本身就是问题
       if (!conn || !sid || (t.length === 0 && (!isChat || images.length === 0))) return;
       void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
       if (isChat) {
-        conn.chatSend(
-          sid,
-          t,
-          images.map(({ mimeType, dataB64, name }) => ({ mimeType, dataB64, ...(name ? { name } : {}) })),
-        );
+        if (!isSubagent && images.length === 0 && t === "/model") {
+          openControls();
+        } else if (!isSubagent && images.length === 0 && t === "/compact") {
+          compactContext();
+        } else if (!isSubagent && images.length === 0 && t === "/plan") {
+          selectMode("plan");
+        } else if (!isSubagent && images.length === 0 && t === "/skills") {
+          setDraft("$");
+          setSelection({ start: 1, end: 1 });
+          requestAnimationFrame(() => inputRef.current?.focus());
+          return;
+        } else if (isSubagent && subagentId) {
+          conn.sendToSubagent(sid, subagentId, t);
+        } else {
+          conn.chatSend(
+            sid,
+            t,
+            images.map(({ mimeType, dataB64, name }) => ({
+              mimeType,
+              dataB64,
+              ...(name ? { name } : {}),
+            })),
+            deliveryOverride ?? (busy ? busyDelivery : "auto"),
+          );
+        }
         setImages([]);
       } else {
         conn.inputText(sid, t + "\r");
       }
       setDraft("");
+      setSelection({ start: 0, end: 0 });
+      completionSequence.current++;
     },
-    [conn, sid, isChat, images, setDraft, setImages],
+    [
+      conn,
+      sid,
+      isChat,
+      images,
+      busy,
+      busyDelivery,
+      isSubagent,
+      subagentId,
+      openControls,
+      compactContext,
+      selectMode,
+      setDraft,
+      setImages,
+    ],
   );
 
   // 会话打开时取一次;不轮询 —— 限流窗口是小时级的,盯着刷没意义
@@ -227,6 +464,45 @@ export default function SessionScreen() {
     ]);
   };
 
+  const returnToHost = (): void => {
+    if (router.canGoBack()) router.back();
+    else if (isSubagent && hostId && sid) {
+      router.replace({ pathname: "/host/[hostId]/session/[sid]", params: { hostId, sid } });
+    } else if (hostId) router.replace(`/host/${hostId}`);
+    else router.replace("/");
+  };
+
+  const openFileReference = useCallback(
+    (reference: ProjectFileReference): void => {
+      if (!hostId || !sid) return;
+      void Haptics.selectionAsync();
+      router.push({
+        pathname: "/host/[hostId]/preview/[sid]",
+        params: {
+          hostId,
+          sid,
+          path: reference.path,
+          ...(reference.line !== undefined ? { line: String(reference.line) } : {}),
+          ...(reference.column !== undefined ? { column: String(reference.column) } : {}),
+        },
+      });
+    },
+    [hostId, sid],
+  );
+  const openSubagent = useCallback(
+    (nextSubagentId: string): void => {
+      if (!hostId || !sid) return;
+      router.push({
+        pathname: "/host/[hostId]/session/[sid]",
+        params: { hostId, sid, subagentId: nextSubagentId },
+      });
+    },
+    [hostId, sid],
+  );
+  const interruptCurrent = useCallback((): void => {
+    if (conn && sid) conn.interrupt(sid);
+  }, [conn, sid]);
+
   const confirmKill = (): void => {
     if (!conn || !sid) return;
     Alert.alert("终止会话", "结束该会话进程?", [
@@ -236,13 +512,13 @@ export default function SessionScreen() {
         style: "destructive",
         onPress: () => {
           conn.kill(sid);
-          router.back();
+          returnToHost();
         },
       },
     ]);
   };
 
-  if (!conn || !sid) {
+  if (!conn || !sid || !session) {
     return (
       <View style={styles.center}>
         <Stack.Screen options={{ title: "会话" }} />
@@ -280,7 +556,7 @@ export default function SessionScreen() {
           onPress: () => {
             Alert.alert(
               "确认开启 YOLO?",
-              "这个会话里,agent 改文件、执行命令、联网都不再询问你。操作仍会记录在聊天里,但不会等你。",
+              "这个会话里，agent 改文件、执行命令、联网都不再询问你；Codex 沙箱也会切到完整访问。操作仍会记录在聊天里。",
               [
                 { text: "取消", style: "cancel" },
                 {
@@ -297,19 +573,13 @@ export default function SessionScreen() {
     );
   };
 
-  /** 常用的 Chat / Shell 切换直接可见,不再藏在三级菜单里。 */
-  const switchMode = (tty: boolean): void => {
-    if (showTty === tty) return;
-    void Haptics.selectionAsync();
-    setShowTty(tty);
-    setSearch(null);
-    if (tty) setImages([]);
-  };
-
   /** 低频与危险操作保留在系统菜单里,当前策略直接写在菜单项上。 */
   const openMenu = (): void => {
     const items: { text: string; style?: "destructive" | "cancel"; onPress?: () => void }[] = [];
     if (isStructured) {
+      if (session.agentControls && !isSubagent) {
+        items.push({ text: "模型与 Plan 模式", onPress: openControls });
+      }
       items.push({
         text: tightest
           ? `用量与限流(${tightest.label} ${String(Math.round(tightest.utilization))}%)`
@@ -321,15 +591,56 @@ export default function SessionScreen() {
         onPress: choosePolicy,
       });
     }
+    items.push({
+      text: "查看项目改动",
+      onPress: () => router.push(`/host/${hostId}/git/${sid}`),
+    });
+    items.push({
+      text: "浏览项目文件",
+      onPress: () => router.push(`/host/${hostId}/files/${sid}`),
+    });
+    items.push({
+      text: "归档会话（保持运行）",
+      onPress: () => {
+        void setSessionArchived(hostId, sid, true)
+          .then(returnToHost)
+          .catch((error: unknown) => {
+            Alert.alert("归档失败", error instanceof Error ? error.message : String(error));
+          });
+      },
+    });
     items.push({ text: "结束会话", style: "destructive", onPress: confirmKill });
     items.push({ text: "取消", style: "cancel" });
     Alert.alert(session?.title ?? "会话", undefined, items);
   };
 
-  // 输入以 / 开头时给命令候选
+  // 输入以 / 开头时给命令候选；@/$ 候选由 daemon 按当前项目生成。
   const commandHints =
-    isChat && session ? matchCommands(session.agent, draft.trim()) : [];
-  const canSend = draft.trim().length > 0 || (isChat && images.length > 0);
+    isChat && !isSubagent && session && composerToken?.kind === "command"
+      ? matchCommands(session.agent, draft.trim())
+      : [];
+  const canSend = draft.trim().length > 0 || (isChat && !isSubagent && images.length > 0);
+
+  const focusComposer = (cursor: number): void => {
+    setSelection({ start: cursor, end: cursor });
+    requestAnimationFrame(() => inputRef.current?.focus());
+  };
+
+  const chooseCommand = (command: string): void => {
+    const next = command === "/skills" ? "$" : command;
+    setDraft(next);
+    focusComposer(next.length);
+    void Haptics.selectionAsync();
+  };
+
+  const chooseSuggestion = (suggestion: ChatSuggestion): void => {
+    if (!composerToken || composerToken.kind === "command") return;
+    const next = replaceComposerToken(draft, composerToken, suggestion);
+    setDraft(next.text);
+    completionSequence.current++;
+    focusComposer(next.cursor);
+    void Haptics.selectionAsync();
+  };
 
   return (
     <KeyboardAvoidingView
@@ -341,13 +652,30 @@ export default function SessionScreen() {
     >
       <Stack.Screen
         options={{
+          headerBackVisible: false,
+          headerLeft: () => (
+            <Pressable
+              style={styles.headerBack}
+              onPress={returnToHost}
+              hitSlop={10}
+              accessibilityRole="button"
+              accessibilityLabel="返回项目会话列表"
+            >
+              <Icon name="chevron.left" size={20} color={color.accent} weight="semibold" />
+            </Pressable>
+          ),
           headerTitle: () => (
-            <SessionHeaderTitle session={session} pending={pending} tightest={tightest} />
+            <SessionHeaderTitle
+              session={session}
+              pending={pending}
+              tightest={tightest}
+              {...(subagent ? { subagent } : {})}
+            />
           ),
           headerRight: () => (
             <View style={styles.headerRight}>
               {/* 只有"停止"留在外面 —— 它是唯一分秒必争的操作 */}
-              {busy && (
+              {busy && !isSubagent && (
                 <Pressable
                   onPress={() => conn.interrupt(sid)}
                   hitSlop={8}
@@ -387,47 +715,47 @@ export default function SessionScreen() {
 
       {isStructured && (
         <View style={styles.modeBar}>
-          <View style={styles.modeSwitch} accessibilityRole="tablist">
-            <Pressable
-              style={[styles.modeTab, !showTty && styles.modeTabActive]}
-              onPress={() => switchMode(false)}
-              accessibilityRole="tab"
-              accessibilityState={{ selected: !showTty }}
-              accessibilityLabel="对话视图"
-            >
-              <Icon
-                name="bubble.left.and.text.bubble.right"
-                size={14}
-                color={!showTty ? color.text : color.textDim}
-              />
-              <Text style={[styles.modeText, !showTty && styles.modeTextActive]}>对话</Text>
-              {pending > 0 && (
-                <View style={styles.pendingBadge}>
-                  <Text style={styles.pendingBadgeText}>{pending > 9 ? "9+" : pending}</Text>
-                </View>
-              )}
-            </Pressable>
-            <Pressable
-              style={[styles.modeTab, showTty && styles.modeTabActive]}
-              onPress={() => switchMode(true)}
-              accessibilityRole="tab"
-              accessibilityState={{ selected: showTty }}
-              accessibilityLabel="终端视图"
-            >
-              <Icon name="terminal" size={14} color={showTty ? color.text : color.textDim} />
-              <Text style={[styles.modeText, showTty && styles.modeTextActive]}>终端</Text>
-            </Pressable>
+          <View style={styles.chatModeLabel}>
+            <Icon name="bubble.left.and.text.bubble.right" size={14} color={color.text} />
+            <Text style={styles.modeText}>{isSubagent ? "子 Agent 对话" : "对话"}</Text>
+            {pending > 0 && (
+              <View style={styles.pendingBadge}>
+                <Text style={styles.pendingBadgeText}>{pending > 9 ? "9+" : pending}</Text>
+              </View>
+            )}
           </View>
-          {!showTty && (
+          {!isSubagent && agentControls && (
             <Pressable
-              style={[styles.modeAction, search !== null && styles.modeActionActive]}
-              onPress={() => setSearch((value) => (value === null ? "" : null))}
+              style={[styles.controlChip, displayedMode === "plan" && styles.controlChipPlan]}
+              onPress={openControls}
               accessibilityRole="button"
-              accessibilityLabel={search === null ? "搜索消息" : "关闭搜索"}
+              accessibilityLabel="模型与 Plan 模式"
             >
-              <Icon name="magnifyingglass" size={16} color={color.textDim} />
+              <Text style={[styles.controlChipText, displayedMode === "plan" && styles.controlChipTextPlan]}>
+                {displayedMode === "plan" ? "Plan" : displayedModel?.split("/").at(-1) ?? "模型"}
+              </Text>
             </Pressable>
           )}
+          {!isSubagent && (
+            <Pressable
+              style={[styles.policyChip, policy === "yolo" && styles.policyChipYolo]}
+              onPress={choosePolicy}
+              accessibilityRole="button"
+              accessibilityLabel={`审批策略：${policyLabel[policy]}`}
+            >
+              <Text style={[styles.policyChipText, policy === "yolo" && styles.policyChipTextYolo]}>
+                {policyLabel[policy]}
+              </Text>
+            </Pressable>
+          )}
+          <Pressable
+            style={[styles.modeAction, search !== null && styles.modeActionActive]}
+            onPress={() => setSearch((value) => (value === null ? "" : null))}
+            accessibilityRole="button"
+            accessibilityLabel={search === null ? "搜索消息" : "关闭搜索"}
+          >
+            <Icon name="magnifyingglass" size={16} color={color.textDim} />
+          </Pressable>
         </View>
       )}
 
@@ -455,23 +783,20 @@ export default function SessionScreen() {
         <ChatView
           conn={conn}
           sid={sid}
+          agent={session.agent}
+          workingStatus={busy ? (subagent?.status ?? session.status) : undefined}
+          onInterrupt={isSubagent ? undefined : interruptCurrent}
+          {...(subagentId ? { subagentId } : {})}
+          onOpenSubagent={openSubagent}
+          projectRoot={session.cwd}
+          onOpenFile={openFileReference}
           onPendingChange={setPending}
           {...(search !== null ? { search } : {})}
           onRetry={send}
         />
       ) : (
         <>
-          {isStructured && showTty && (
-            <View style={styles.ttyNotice}>
-              <Text style={styles.ttyNoticeText}>
-                原始 TTY · 部分结构化 agent 可能不会在这里输出内容
-                {__DEV__ && perf
-                  ? ` · ${perf.renderer} ${String(perf.fps)}fps ${String(perf.kb)}KB/s`
-                  : ""}
-              </Text>
-            </View>
-          )}
-          <Terminal ref={termRef} conn={conn} sid={sid} onFontSize={setFontSize} onPerf={setPerf} />
+          <Terminal ref={termRef} conn={conn} sid={sid} onFontSize={setFontSize} />
           <KeyBar
             onKey={(seq) => conn.inputText(sid, seq)}
             onFontSize={(delta) => {
@@ -488,7 +813,7 @@ export default function SessionScreen() {
       {isChat && commandHints.length > 0 && (
         <View style={styles.cmdBox}>
           {commandHints.slice(0, 5).map((c) => (
-            <Pressable key={c.cmd} style={styles.cmdRow} onPress={() => setDraft(c.cmd)}>
+            <Pressable key={c.cmd} style={styles.cmdRow} onPress={() => chooseCommand(c.cmd)}>
               <Text style={styles.cmdName}>{c.cmd}</Text>
               <Text style={styles.cmdDesc}>{c.desc}</Text>
             </Pressable>
@@ -496,9 +821,140 @@ export default function SessionScreen() {
         </View>
       )}
 
-      {isChat && commandHints.length === 0 && <QuickReplies busy={busy} onPick={send} />}
+      {isChat && completionKind !== null && (
+        <View style={styles.suggestionBox}>
+          <View style={styles.suggestionHeader}>
+            <Text style={styles.suggestionTitle}>
+              {completionKind === "file" ? "@ 项目文件" : "$ Agent Skills"}
+            </Text>
+            {completionLoading ? (
+              <ActivityIndicator size="small" color={color.textFaint} />
+            ) : (
+              <Text style={styles.suggestionCount}>{String(suggestions.length)} 项</Text>
+            )}
+          </View>
+          {!completionLoading && suggestions.length === 0 ? (
+            <Text style={styles.suggestionEmpty}>没有匹配项</Text>
+          ) : (
+            suggestions.slice(0, 8).map((item) => (
+              <Pressable
+                key={`${item.kind}:${item.value}`}
+                style={({ pressed }) => [styles.suggestionRow, pressed && styles.suggestionPressed]}
+                onPress={() => chooseSuggestion(item)}
+                accessibilityRole="button"
+                accessibilityLabel={`插入${item.kind === "file" ? "文件" : "Skill"} ${item.label}`}
+              >
+                <View
+                  style={[
+                    styles.suggestionSigil,
+                    item.kind === "skill" && styles.suggestionSigilSkill,
+                  ]}
+                >
+                  <Text style={styles.suggestionSigilText}>{item.kind === "file" ? "@" : "$"}</Text>
+                </View>
+                <View style={styles.suggestionCopy}>
+                  <Text style={styles.suggestionName} numberOfLines={1}>{item.label}</Text>
+                  {item.detail ? (
+                    <Text style={styles.suggestionDetail} numberOfLines={1}>{item.detail}</Text>
+                  ) : null}
+                </View>
+              </Pressable>
+            ))
+          )}
+        </View>
+      )}
 
-      {isChat && images.length > 0 && (
+      {isChat && commandHints.length === 0 && completionKind === null && (
+        <QuickReplies busy={busy} onPick={send} />
+      )}
+
+      {isChat && !isSubagent && (session.messageQueue?.length ?? 0) > 0 && (
+        <View style={styles.queuePanel}>
+          <View style={styles.queueHeader}>
+            <Text style={styles.queueTitle}>
+              待发送 · {String(session.messageQueue?.length ?? 0)}
+            </Text>
+            <Text style={styles.queueHint}>当前任务结束后自动继续</Text>
+          </View>
+          {(session.messageQueue ?? []).slice(0, 4).map((item, index) => (
+            <View key={item.id} style={styles.queueRow}>
+              <View style={[styles.queueKind, item.kind === "guide" && styles.queueKindGuide]}>
+                <Text style={styles.queueKindText}>
+                  {item.kind === "guide" ? "引导" : `#${String(index + 1)}`}
+                </Text>
+              </View>
+              <Text style={styles.queueText} numberOfLines={1}>
+                {item.text || `${String(item.attachmentCount)} 张图片`}
+              </Text>
+              {item.kind === "queue" && busy && (
+                <Pressable
+                  style={({ pressed }) => [styles.queueGuide, pressed && styles.queueGuidePressed]}
+                  onPress={() => {
+                    void Haptics.selectionAsync();
+                    conn.guideQueuedMessage(sid, item.id);
+                  }}
+                  hitSlop={5}
+                  accessibilityRole="button"
+                  accessibilityLabel={`把排队消息 ${String(index + 1)} 改为引导`}
+                >
+                  <Text style={styles.queueGuideText}>改为引导</Text>
+                </Pressable>
+              )}
+              <Pressable
+                onPress={() => conn.removeQueuedMessage(sid, item.id)}
+                hitSlop={8}
+                accessibilityRole="button"
+                accessibilityLabel={`取消排队消息 ${String(index + 1)}`}
+              >
+                <Text style={styles.queueRemove}>×</Text>
+              </Pressable>
+            </View>
+          ))}
+          {(session.messageQueue?.length ?? 0) > 4 && (
+            <Text style={styles.queueMore}>
+              另有 {String((session.messageQueue?.length ?? 0) - 4)} 条
+            </Text>
+          )}
+        </View>
+      )}
+
+      {isChat && !isSubagent && busy && (
+        <View style={styles.deliveryBar}>
+          <Text style={styles.deliveryLabel}>发送方式</Text>
+          <Pressable
+            style={[styles.deliveryOption, busyDelivery === "queue" && styles.deliveryOptionActive]}
+            onPress={() => setBusyDelivery("queue")}
+            accessibilityRole="button"
+            accessibilityState={{ selected: busyDelivery === "queue" }}
+          >
+            <Text
+              style={[
+                styles.deliveryOptionText,
+                busyDelivery === "queue" && styles.deliveryOptionTextActive,
+              ]}
+            >
+              排到队尾
+            </Text>
+          </Pressable>
+          <Pressable
+            style={[styles.deliveryOption, busyDelivery === "steer" && styles.deliveryOptionActive]}
+            onPress={() => setBusyDelivery("steer")}
+            accessibilityRole="button"
+            accessibilityState={{ selected: busyDelivery === "steer" }}
+          >
+            <Text
+              style={[
+                styles.deliveryOptionText,
+                busyDelivery === "steer" && styles.deliveryOptionTextActive,
+              ]}
+            >
+              引导当前任务
+            </Text>
+          </Pressable>
+        </View>
+      )}
+
+      {isChat && !isSubagent && images.length > 0 && (
         <ScrollView horizontal style={styles.thumbs} contentContainerStyle={styles.thumbsRow}>
           {images.map((img, i) => (
             <View key={img.uri} style={styles.thumbWrap}>
@@ -516,6 +972,133 @@ export default function SessionScreen() {
           ))}
         </ScrollView>
       )}
+
+      <Sheet visible={controlsOpen} title="Agent 设置" onClose={() => setControlsOpen(false)}>
+        {controlError && <Text style={styles.controlError}>{controlError}</Text>}
+        {controlsLoading && models.length === 0 && modes.length === 0 ? (
+          <ActivityIndicator style={styles.sheetLoading} color={color.accent} />
+        ) : (
+          <>
+            {modes.length > 0 && (
+              <View style={styles.controlSection}>
+                <Text style={styles.controlSectionTitle}>工作模式</Text>
+                <View style={styles.controlSegments}>
+                  {modes.map((mode) => {
+                    const active = displayedMode === mode.id;
+                    return (
+                      <Pressable
+                        key={mode.id}
+                        style={({ pressed }) => [
+                          styles.controlSegment,
+                          active && styles.controlSegmentActive,
+                          pressed && styles.controlPressed,
+                        ]}
+                        onPress={() => selectMode(mode.id)}
+                        disabled={controlsLoading}
+                        accessibilityRole="radio"
+                        accessibilityState={{ checked: active }}
+                      >
+                        <Text style={[styles.controlSegmentTitle, active && styles.controlActiveText]}>
+                          {mode.label}
+                        </Text>
+                        {mode.description && (
+                          <Text style={styles.controlDescription}>{mode.description}</Text>
+                        )}
+                      </Pressable>
+                    );
+                  })}
+                </View>
+              </View>
+            )}
+            {models.length > 0 && (
+              <View style={styles.controlSection}>
+                <Text style={styles.controlSectionTitle}>模型</Text>
+                <View style={styles.controlList}>
+                  {models.map((model) => {
+                    const active = displayedModel === model.id;
+                    return (
+                      <Pressable
+                        key={model.id}
+                        style={({ pressed }) => [
+                          styles.controlModel,
+                          active && styles.controlModelActive,
+                          pressed && styles.controlPressed,
+                        ]}
+                        onPress={() =>
+                          selectModel(
+                            model.id,
+                            model.defaultEffort ?? model.supportedEfforts[0],
+                          )
+                        }
+                        disabled={controlsLoading}
+                      >
+                        <View style={styles.controlModelCopy}>
+                          <Text style={[styles.controlModelTitle, active && styles.controlActiveText]}>
+                            {model.label}
+                          </Text>
+                          {model.description && (
+                            <Text style={styles.controlDescription} numberOfLines={2}>
+                              {model.description}
+                            </Text>
+                          )}
+                        </View>
+                        {active && <Icon name="checkmark.circle.fill" size={16} color={color.accent} />}
+                      </Pressable>
+                    );
+                  })}
+                </View>
+                {(models.find((model) => model.id === displayedModel)?.supportedEfforts.length ?? 0) > 0 && (
+                  <View style={styles.effortRow}>
+                    <Text style={styles.effortLabel}>推理强度</Text>
+                    {models
+                      .find((model) => model.id === displayedModel)
+                      ?.supportedEfforts.map((effort) => (
+                        <Pressable
+                          key={effort}
+                          style={[
+                            styles.effortChip,
+                            displayedEffort === effort && styles.effortChipActive,
+                          ]}
+                          onPress={() => displayedModel && selectModel(displayedModel, effort)}
+                          disabled={controlsLoading}
+                        >
+                          <Text
+                            style={[
+                              styles.effortText,
+                              displayedEffort === effort && styles.controlActiveText,
+                            ]}
+                          >
+                            {effort}
+                          </Text>
+                        </Pressable>
+                      ))}
+                  </View>
+                )}
+              </View>
+            )}
+            {session.agentControls?.compact && (
+              <View style={styles.controlSection}>
+                <Text style={styles.controlSectionTitle}>上下文</Text>
+                <Pressable
+                  style={({ pressed }) => [
+                    styles.compactButton,
+                    (busy || controlsLoading) && styles.compactButtonDisabled,
+                    pressed && !busy && styles.controlPressed,
+                  ]}
+                  disabled={busy || controlsLoading}
+                  onPress={compactContext}
+                >
+                  <Text style={styles.compactButtonText}>压缩当前上下文</Text>
+                  <Text style={styles.controlDescription}>
+                    原生执行 /compact，不会把命令作为 Prompt 发给模型
+                  </Text>
+                </Pressable>
+              </View>
+            )}
+            {controlsLoading && <ActivityIndicator style={styles.controlInlineLoading} color={color.accent} />}
+          </>
+        )}
+      </Sheet>
 
       <Sheet visible={usageOpen} title="用量与限流" onClose={() => setUsageOpen(false)}>
         {usageError !== null ? (
@@ -561,7 +1144,7 @@ export default function SessionScreen() {
 
       <View style={[styles.composer, { paddingBottom: Math.max(insets.bottom, 8) }]}>
         <DismissKey visible={focused} />
-        {isChat && (
+        {isChat && !isSubagent && (
           <Pressable
             style={({ pressed }) => [styles.iconBtn, pressed && styles.composerBtnPressed]}
             onPress={attach}
@@ -572,11 +1155,24 @@ export default function SessionScreen() {
           </Pressable>
         )}
         <TextInput
+          ref={inputRef}
           style={[styles.input, isChat && styles.inputChat]}
-          placeholder={isChat ? `给 ${session?.agent ?? "agent"} 发消息` : "输入命令，回车执行"}
+          placeholder={
+            isChat
+              ? isSubagent
+                ? `给 ${subagent?.name ?? "子 Agent"} 发消息`
+                : busy
+                ? busyDelivery === "steer"
+                  ? "立即引导当前任务…"
+                  : "消息将排到队尾…"
+                : `给 ${session?.agent ?? "agent"} 发消息 · @文件 · $Skill · /命令`
+              : "输入命令，回车执行"
+          }
           placeholderTextColor={color.textFaint}
           value={draft}
           onChangeText={setDraft}
+          selection={selection}
+          onSelectionChange={(event) => setSelection(event.nativeEvent.selection)}
           onFocus={() => { setFocused(true); }}
           onBlur={() => { setFocused(false); }}
           onSubmitEditing={() => send(draft)}
@@ -596,7 +1192,15 @@ export default function SessionScreen() {
           onPress={() => send(draft)}
           disabled={!canSend}
           accessibilityRole="button"
-          accessibilityLabel={isChat ? "发送消息" : "执行命令"}
+          accessibilityLabel={
+            isChat
+              ? busyDelivery === "steer" && busy
+                ? "发送引导"
+                : busy
+                  ? "加入消息队列"
+                  : "发送消息"
+              : "执行命令"
+          }
           accessibilityState={{ disabled: !canSend }}
         >
           <Icon name="arrow.up" size={17} color="#fff" weight="semibold" />
@@ -611,6 +1215,7 @@ const MAX_IMAGES = 6;
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: color.bg },
+  headerBack: { minWidth: 30, minHeight: 36, alignItems: "flex-start", justifyContent: "center" },
   center: { flex: 1, alignItems: "center", justifyContent: "center", gap: 12 },
   dim: { color: color.textDim, fontSize: 14 },
 
@@ -631,32 +1236,14 @@ const styles = StyleSheet.create({
     borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: color.border,
   },
-  modeSwitch: {
+  chatModeLabel: {
     flex: 1,
-    flexDirection: "row",
-    gap: 3,
-    padding: 3,
-    backgroundColor: color.surfaceRaised,
-    borderRadius: 12,
-  },
-  modeTab: {
-    flex: 1,
-    minHeight: 34,
-    borderRadius: 9,
     flexDirection: "row",
     alignItems: "center",
-    justifyContent: "center",
     gap: 7,
+    paddingHorizontal: 8,
   },
-  modeTabActive: {
-    backgroundColor: color.pressed,
-    shadowColor: "#000",
-    shadowOpacity: 0.22,
-    shadowRadius: 4,
-    shadowOffset: { width: 0, height: 1 },
-  },
-  modeText: { color: color.textDim, fontSize: 13, fontWeight: "500" },
-  modeTextActive: { color: color.text, fontWeight: "600" },
+  modeText: { color: color.text, fontSize: 13, fontWeight: "600" },
   pendingBadge: {
     minWidth: 18,
     height: 18,
@@ -667,6 +1254,27 @@ const styles = StyleSheet.create({
     backgroundColor: color.danger,
   },
   pendingBadgeText: { color: "#fff", fontSize: 10, fontWeight: "700" },
+  policyChip: {
+    minHeight: 28,
+    justifyContent: "center",
+    paddingHorizontal: 9,
+    borderRadius: 9,
+    backgroundColor: color.surfaceRaised,
+  },
+  policyChipYolo: { backgroundColor: color.dangerBg },
+  policyChipText: { color: color.textDim, fontSize: 11, fontWeight: "600" },
+  policyChipTextYolo: { color: color.danger },
+  controlChip: {
+    minHeight: 28,
+    maxWidth: 92,
+    justifyContent: "center",
+    paddingHorizontal: 9,
+    borderRadius: 9,
+    backgroundColor: color.surfaceRaised,
+  },
+  controlChipPlan: { backgroundColor: color.accentBg },
+  controlChipText: { color: color.textDim, fontSize: 10.5, fontWeight: "600" },
+  controlChipTextPlan: { color: color.accent },
   modeAction: {
     width: 40,
     height: 40,
@@ -726,8 +1334,110 @@ const styles = StyleSheet.create({
   cmdName: { color: color.accent, fontSize: 13, fontFamily: MONOSPACE_FONT },
   cmdDesc: { color: color.textDim, fontSize: 12, flex: 1 },
 
-  ttyNotice: { backgroundColor: color.accentBg, paddingHorizontal: 12, paddingVertical: 7 },
-  ttyNoticeText: { color: "#9AB7E8", fontSize: 11, lineHeight: 15 },
+  suggestionBox: {
+    gap: 4,
+    paddingHorizontal: 10,
+    paddingTop: 7,
+    paddingBottom: 6,
+    backgroundColor: color.surface,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: color.border,
+  },
+  suggestionHeader: {
+    minHeight: 22,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 7,
+  },
+  suggestionTitle: { color: color.textDim, fontSize: 11, fontWeight: "600" },
+  suggestionCount: { color: color.textFaint, fontSize: 10 },
+  suggestionEmpty: { color: color.textFaint, fontSize: 12, paddingHorizontal: 9, paddingVertical: 10 },
+  suggestionRow: {
+    minHeight: 43,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 9,
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+    borderRadius: 9,
+    backgroundColor: color.surfaceRaised,
+  },
+  suggestionPressed: { backgroundColor: color.pressed },
+  suggestionSigil: {
+    width: 25,
+    height: 25,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 7,
+    backgroundColor: color.accentBg,
+  },
+  suggestionSigilSkill: { backgroundColor: color.warnBg },
+  suggestionSigilText: { color: color.accent, fontSize: 13, fontWeight: "700", fontFamily: MONOSPACE_FONT },
+  suggestionCopy: { flex: 1, minWidth: 0 },
+  suggestionName: { color: color.text, fontSize: 12.5, fontWeight: "600" },
+  suggestionDetail: { color: color.textFaint, fontSize: 10.5, marginTop: 2 },
+
+  queuePanel: {
+    gap: 5,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    backgroundColor: color.surface,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: color.border,
+  },
+  queueHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  queueTitle: { color: color.text, fontSize: 12, fontWeight: "600" },
+  queueHint: { color: color.textFaint, fontSize: 10 },
+  queueRow: {
+    minHeight: 30,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    paddingHorizontal: 8,
+    borderRadius: 8,
+    backgroundColor: color.surfaceRaised,
+  },
+  queueKind: {
+    minWidth: 28,
+    paddingHorizontal: 5,
+    paddingVertical: 2,
+    alignItems: "center",
+    borderRadius: 5,
+    backgroundColor: color.accentBg,
+  },
+  queueKindGuide: { backgroundColor: color.warnBg },
+  queueKindText: { color: color.textDim, fontSize: 9, fontWeight: "700" },
+  queueText: { flex: 1, color: color.textDim, fontSize: 11 },
+  queueGuide: {
+    paddingHorizontal: 7,
+    paddingVertical: 4,
+    borderRadius: 6,
+    backgroundColor: color.warnBg,
+  },
+  queueGuideText: { color: color.warn, fontSize: 9.5, fontWeight: "600" },
+  queueGuidePressed: { opacity: 0.68 },
+  queueRemove: { color: color.textFaint, fontSize: 19, lineHeight: 22 },
+  queueMore: { color: color.textFaint, fontSize: 10, textAlign: "center" },
+
+  deliveryBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    backgroundColor: color.surface,
+  },
+  deliveryLabel: { color: color.textFaint, fontSize: 10, marginRight: 2 },
+  deliveryOption: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 9,
+    backgroundColor: color.surfaceRaised,
+  },
+  deliveryOptionActive: { backgroundColor: color.accentBg },
+  deliveryOptionText: { color: color.textDim, fontSize: 11, fontWeight: "500" },
+  deliveryOptionTextActive: { color: color.accent, fontWeight: "600" },
 
   thumbs: { flexGrow: 0, backgroundColor: color.surface },
   thumbsRow: { gap: 10, paddingHorizontal: 12, paddingTop: 10, paddingBottom: 4 },
@@ -750,6 +1460,67 @@ const styles = StyleSheet.create({
 
   sheetLoading: { paddingVertical: 32 },
   sheetNote: { color: color.textDim, fontSize: 13, lineHeight: 19, paddingVertical: 12 },
+  controlError: {
+    color: color.danger,
+    backgroundColor: color.dangerBg,
+    borderRadius: 9,
+    padding: 10,
+    fontSize: 12,
+    marginBottom: 8,
+  },
+  controlSection: { gap: 9, paddingBottom: 18 },
+  controlSectionTitle: { color: color.textDim, fontSize: 11, fontWeight: "700" },
+  controlSegments: { flexDirection: "row", gap: 8 },
+  controlSegment: {
+    flex: 1,
+    minHeight: 78,
+    gap: 5,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
+    borderRadius: 11,
+    padding: 10,
+    backgroundColor: color.surfaceRaised,
+  },
+  controlSegmentActive: { borderColor: color.accent, backgroundColor: color.accentBg },
+  controlSegmentTitle: { color: color.text, fontSize: 13, fontWeight: "600" },
+  controlDescription: { color: color.textFaint, fontSize: 10.5, lineHeight: 15 },
+  controlActiveText: { color: color.accent },
+  controlPressed: { opacity: 0.68 },
+  controlList: { gap: 6 },
+  controlModel: {
+    minHeight: 52,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 9,
+    borderRadius: 10,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
+    backgroundColor: color.surfaceRaised,
+    paddingHorizontal: 11,
+    paddingVertical: 8,
+  },
+  controlModelActive: { borderColor: color.accentDim, backgroundColor: color.accentBg },
+  controlModelCopy: { flex: 1, gap: 2 },
+  controlModelTitle: { color: color.text, fontSize: 12.5, fontWeight: "600" },
+  effortRow: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 6 },
+  effortLabel: { color: color.textFaint, fontSize: 10.5, marginRight: 2 },
+  effortChip: {
+    paddingHorizontal: 9,
+    paddingVertical: 6,
+    borderRadius: 8,
+    backgroundColor: color.surfaceRaised,
+  },
+  effortChipActive: { backgroundColor: color.accentBg },
+  effortText: { color: color.textDim, fontSize: 10.5, fontWeight: "600" },
+  compactButton: {
+    gap: 4,
+    borderRadius: 10,
+    backgroundColor: color.surfaceRaised,
+    padding: 11,
+  },
+  compactButtonDisabled: { opacity: 0.42 },
+  compactButtonText: { color: color.text, fontSize: 12.5, fontWeight: "600" },
+  controlInlineLoading: { paddingVertical: 8 },
   window: { gap: 6, paddingVertical: 14 },
   windowHead: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
   windowPct: { fontSize: 15, fontWeight: "600", fontVariant: ["tabular-nums"] },

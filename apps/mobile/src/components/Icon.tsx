@@ -21,7 +21,9 @@ export type IconName =
   | "doc.on.doc"
   | "paperclip"
   | "arrow.clockwise"
+  | "archivebox"
   | "chevron.down"
+  | "chevron.left"
   | "qrcode.viewfinder"
   | "desktopcomputer"
   | "folder.fill"
@@ -49,7 +51,9 @@ const FALLBACK: Record<IconName, string> = {
   "doc.on.doc": "复制",
   paperclip: "＋",
   "arrow.clockwise": "↻",
+  archivebox: "归档",
   "chevron.down": "▾",
+  "chevron.left": "‹",
   "qrcode.viewfinder": "⊞",
   desktopcomputer: "🖥",
   "folder.fill": "▰",
