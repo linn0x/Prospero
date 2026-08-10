@@ -4,11 +4,16 @@
   "private": true,
   "type": "module",
   "bin": {
-    "prosperod": "./dist/cli.js"
+    "prosperod": "./dist/cli.js",
+    "prospero": "./bin/prospero"
   },
   "scripts": {
+    "prebuild": "npm run build:protocol",
     "build": "tsc --build",
+    "build:protocol": "tsc --build --force ../../packages/protocol",
+    "predev": "npm run build:protocol",
     "dev": "node --experimental-strip-types src/cli.ts",
+    "pretest": "npm run build:protocol",
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {

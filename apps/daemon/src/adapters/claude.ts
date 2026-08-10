@@ -172,6 +172,7 @@ export class ClaudeAdapter implements AgentAdapter {
         prompt: this.input,
         options: {
           cwd: ctx.cwd,
+          env: { ...process.env, ...ctx.env },
           // 全部工具调用都过 canUseTool → 手机审批
           permissionMode: this.selectedMode,
           canUseTool: this.canUseTool,

@@ -88,14 +88,28 @@ export function writeConfig(home: string): string {
  */
 export function wrapSpawn(
   spec: SpawnSpec,
-  opts: { id: string; cwd: string; cols: number; rows: number; configFile: string; tmux: string },
+  opts: {
+    id: string;
+    cwd: string;
+    cols: number;
+    rows: number;
+    configFile: string;
+    tmux: string;
+    /** tmux server 不会可靠继承 client 环境，必须用 new-session -e 显式带入。 */
+    environment?: Record<string, string>;
+  },
 ): SpawnSpec {
+  const environmentArgs = Object.entries(opts.environment ?? {}).flatMap(([name, value]) => [
+    "-e",
+    `${name}=${value}`,
+  ]);
   return {
     file: opts.tmux,
     args: [
       "-f", opts.configFile,
       "new-session",
       "-A", // attach-or-create
+      ...environmentArgs,
       "-s", sessionName(opts.id),
       "-c", opts.cwd,
       "-x", String(opts.cols),

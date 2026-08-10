@@ -80,7 +80,15 @@ export default function GitScreen(): React.ReactElement {
   }, [conn, sid]);
 
   useEffect(() => {
-    void refresh();
+    let cancelled = false;
+    // refresh 会立即设置 loading；推到 microtask 中可避免 effect 内同步 setState，
+    // 同时保证连接变更后不会启动旧请求。
+    queueMicrotask(() => {
+      if (!cancelled) void refresh();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [refresh]);
 
   const openDiff = async (f: GitFile): Promise<void> => {

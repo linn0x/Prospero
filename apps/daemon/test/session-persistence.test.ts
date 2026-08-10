@@ -58,6 +58,36 @@ class FakePersistentAdapter implements AgentAdapter {
 }
 
 describe("结构化会话持久化", () => {
+  it("创建时把 Plan 与选中的本机原生会话 ID 交给适配器", async () => {
+    const home = tempHome();
+    let received: AdapterResumeState | undefined;
+    const manager = new SessionManager({
+      home,
+      adapterFactory: (_agent, state) => {
+        received = state;
+        return new FakePersistentAdapter(state);
+      },
+    });
+    const info = await manager.create({
+      agent: "claude",
+      kind: "structured",
+      cwd: home,
+      mode: "plan",
+      resume: { id: "claude-native-session", title: "继续修复手机端" },
+      cols: 80,
+      rows: 24,
+      allowShell: false,
+    });
+
+    expect(received).toEqual({ mode: "plan", sessionId: "claude-native-session" });
+    expect(info.title).toBe("继续修复手机端");
+    expect(manager.requireStructured(info.id).persistentState().adapterState).toMatchObject({
+      mode: "plan",
+      sessionId: "claude-native-session",
+    });
+    await manager.disposeAll();
+  });
+
   it("重启后恢复同一个 ID、事件、策略、工具输出和原生会话游标", async () => {
     const home = tempHome();
     const firstStates: (AdapterResumeState | undefined)[] = [];

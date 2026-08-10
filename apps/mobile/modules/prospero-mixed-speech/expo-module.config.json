@@ -1,0 +1,9 @@
+{
+  "platforms": ["ios", "android"],
+  "ios": {
+    "modules": ["ProsperoMixedSpeechModule"]
+  },
+  "android": {
+    "modules": ["com.linn0x.prospero.mixedspeech.ProsperoMixedSpeechModule"]
+  }
+}

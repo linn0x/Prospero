@@ -47,9 +47,18 @@ export function PromptDialog({
 
   useEffect(() => {
     if (!visible) return;
-    setTouched(false);
-    setSubmitting(false);
-    setSubmitError(null);
+    let cancelled = false;
+    // 每次打开/换题目都重置一次本地反馈；放在 effect 完成后的 microtask，避免
+    // 在提交 props 的同步阶段再触发一轮渲染。
+    queueMicrotask(() => {
+      if (cancelled) return;
+      setTouched(false);
+      setSubmitting(false);
+      setSubmitError(null);
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [visible, title]);
 
   const validationError = validate?.(value) ?? null;

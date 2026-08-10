@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type {
   AgentEventBody,
   Attachment,
@@ -49,11 +49,24 @@ function makeSession(adapter: QueueAdapter, restored?: ReturnType<StructuredSess
   });
 }
 
-async function tick(): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, 0));
-}
-
 describe("结构化会话消息队列", () => {
+  it("明确区分首次就绪、运行中与一轮运行完毕，完成态仍可继续发送", async () => {
+    const adapter = new QueueAdapter();
+    const session = makeSession(adapter);
+    await session.start();
+    expect(session.info().status).toBe("idle");
+
+    await session.send("第一轮");
+    expect(session.info().status).toBe("running");
+    adapter.finish("turn-1");
+    await vi.waitFor(() => expect(session.info().status).toBe("completed"));
+
+    await session.send("第二轮");
+    expect(adapter.sends).toEqual(["第一轮", "第二轮"]);
+    expect(session.info().status).toBe("running");
+    await session.dispose();
+  });
+
   it("忙碌时按 FIFO 排队，并在每轮结束后只发送下一条", async () => {
     const adapter = new QueueAdapter();
     const session = makeSession(adapter);
@@ -67,13 +80,11 @@ describe("结构化会话消息队列", () => {
     expect(session.info().messageQueue?.map((item) => item.text)).toEqual(["第二条", "第三条"]);
 
     adapter.finish("turn-1");
-    await tick();
-    expect(adapter.sends).toEqual(["第一条", "第二条"]);
+    await vi.waitFor(() => expect(adapter.sends).toEqual(["第一条", "第二条"]));
     expect(session.info().messageQueue?.map((item) => item.text)).toEqual(["第三条"]);
 
     adapter.finish("turn-2");
-    await tick();
-    expect(adapter.sends).toEqual(["第一条", "第二条", "第三条"]);
+    await vi.waitFor(() => expect(adapter.sends).toEqual(["第一条", "第二条", "第三条"]));
     expect(session.info().messageQueue).toEqual([]);
     await session.dispose();
   });

@@ -28,12 +28,14 @@ import {
   type C2SMessage,
   type KeyPairB64,
   type PermissionReply,
+  type ResumableConversation,
   type S2CAgentEvent,
   type S2CChatSnapshot,
   type S2CChatSuggestions,
   type S2CError,
   type S2CHelloOk,
   type S2CMessage,
+  type S2COrchestrationSnapshot,
   type S2CTermOutput,
   type S2CTermSnapshot,
   type S2CToolOutput,
@@ -45,7 +47,7 @@ import { Emitter } from "./emitter";
 import { rememberGoodAddr, type StoredHost } from "./hosts";
 import { useApp } from "./store";
 
-const APP_VERSION = "0.0.1";
+const APP_VERSION = "0.0.2";
 const ATTEMPT_TIMEOUT_MS = 6000;
 const BACKOFF_MIN = 400;
 const BACKOFF_MAX = 8000;
@@ -72,6 +74,7 @@ export interface ConnEvents extends Record<string, unknown> {
   chatSnapshot: S2CChatSnapshot;
   agentEvent: S2CAgentEvent;
   toolOutput: S2CToolOutput;
+  orchestrationSnapshot: S2COrchestrationSnapshot;
   serverError: S2CError;
   /** 验收打点:A1 attach 上屏、A5 回前台恢复 */
   metric: { name: "attach" | "resume"; sid?: string; ms: number };
@@ -420,7 +423,11 @@ export class HostConnection {
       case "tool.output":
         this.events.emit("toolOutput", msg);
         return;
+      case "orchestration.snapshot":
+        this.events.emit("orchestrationSnapshot", msg);
+        return;
       case "workspace.listing":
+      case "conversation.results":
       case "fs.listing":
       case "fs.content":
       case "fs.written":
@@ -443,6 +450,7 @@ export class HostConnection {
         // 这条消息时会回一个全局 bad_message,也应立刻交给目录选择器,不能让用户
         // 对着转圈等 15 秒才超时。
         if (this.rejectFsFor("#workspace", msg.message)) return;
+        if (this.rejectFsFor("#conversations", msg.message)) return;
         this.events.emit("serverError", msg);
         return;
       case "hello.ok":
@@ -453,8 +461,7 @@ export class HostConnection {
 
   // ---------------------------------------------------------------- 文件操作
   //
-  // 协议没有请求 id,应答靠 (sid, path) 配对。同一路径的并发请求会互相顶掉,
-  // 对文件面板来说够用 —— 用户一次只看一个文件。
+  // 文件应答靠 (sid, path) 配对；搜索/控制类应答把 requestId 编进 path 键。
 
   private fsWaiters = new Map<
     string,
@@ -468,7 +475,12 @@ export class HostConnection {
   private resolveFs(msg: S2CMessage & { sid?: string; path?: string }): void {
     // git.status / git.done 没有 path,用消息类型当 key 的一部分
     // 账号级应答不带 sid,用固定键配对(与 usageGet 省略 sid 时一致)
-    const owner = msg.type === "workspace.listing" ? "#workspace" : (msg.sid ?? "#account");
+    const owner =
+      msg.type === "workspace.listing"
+        ? "#workspace"
+        : msg.type === "conversation.results"
+          ? "#conversations"
+          : (msg.sid ?? "#account");
     const responsePath =
       msg.type === "chat.suggestions"
         ? `#chat.suggestions:${msg.requestId}`
@@ -476,9 +488,11 @@ export class HostConnection {
           ? `#agent.models:${msg.requestId}`
           : msg.type === "agent.modes"
             ? `#agent.modes:${msg.requestId}`
-            : msg.type === "agent.control.result"
-              ? `#agent.control:${msg.requestId}`
-        : (msg.path ?? `#${msg.type}`);
+            : msg.type === "conversation.results"
+              ? `#conversation.results:${msg.requestId}`
+              : msg.type === "agent.control.result"
+                ? `#agent.control:${msg.requestId}`
+                : (msg.path ?? `#${msg.type}`);
     const key = this.fsKey(owner, responsePath);
     const waiter = this.fsWaiters.get(key);
     if (!waiter) return;
@@ -542,6 +556,24 @@ export class HostConnection {
     );
     if (result.error) throw new Error(result.error);
     return result;
+  }
+
+  /** 搜索 Mac 上由 Claude Code / Codex 自己保存、可原生接回的对话。 */
+  async localConversations(
+    agent: "claude" | "codex",
+    query: string,
+    limit = 20,
+  ): Promise<ResumableConversation[]> {
+    const requestId = this.agentRequestId();
+    const result = await this.fsRequest<Extract<S2CMessage, { type: "conversation.results" }>>(
+      "#conversations",
+      `#conversation.results:${requestId}`,
+      { type: "conversation.search", requestId, agent, query, limit },
+      30_000,
+      false,
+    );
+    if (result.error) throw new Error(result.error);
+    return result.conversations;
   }
 
   fsRead(sid: string, path: string): Promise<Extract<S2CMessage, { type: "fs.content" }>> {
@@ -697,6 +729,12 @@ export class HostConnection {
     kind?: SessionKind,
     cols = 80,
     rows = 24,
+    options?: {
+      mode?: "default" | "plan";
+      resume?: { id: string; title?: string };
+      /** Goal 会同时创建编排 Run，并把新会话作为协调者。 */
+      goal?: string;
+    },
   ): void {
     this.send(
       {
@@ -705,6 +743,9 @@ export class HostConnection {
         ...(kind ? { kind } : {}),
         ...(cwd ? { cwd } : {}),
         ...(command ? { command } : {}),
+        ...(options?.mode ? { mode: options.mode } : {}),
+        ...(options?.resume ? { resume: options.resume } : {}),
+        ...(options?.goal ? { goal: options.goal } : {}),
         cols,
         rows,
       },
@@ -727,6 +768,16 @@ export class HostConnection {
   attach(sid: string, lastSeq?: number): void {
     this.attachStartedAt.set(sid, Date.now());
     this.send({ type: "session.attach", sid, ...(lastSeq !== undefined ? { lastSeq } : {}) });
+  }
+
+  /** 拉取 daemon 的编排快照；前台定时刷新能跨 iOS/Android 后台恢复。 */
+  orchestrationSnapshot(): void {
+    this.send({ type: "orchestration.snapshot" });
+  }
+
+  /** 人类在手机上解开 Gate；成功后 daemon 回传新的完整快照。 */
+  resolveOrchestrationGate(gateId: string, decision: string): void {
+    this.send({ type: "orchestration.gate.resolve", gateId, decision }, true);
   }
 
   /** 拉取某次工具调用的完整输出(卡片展开时) */

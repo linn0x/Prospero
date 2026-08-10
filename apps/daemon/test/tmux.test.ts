@@ -16,6 +16,42 @@ afterEach(() => {
 });
 
 describe("tmux 托管", () => {
+  it("用 new-session -e 显式传入 worker 身份，避免 tmux server 吞掉 client 环境", () => {
+    const wrapped = wrapSpawn({ file: "codex", args: [] }, {
+      id: "worker-1",
+      cwd: "/tmp/project",
+      cols: 80,
+      rows: 24,
+      configFile: "/tmp/tmux.conf",
+      tmux: "tmux",
+      environment: {
+        PROSPERO_SESSION_ID: "worker-1",
+        PROSPERO_CONTROL_SOCK: "/tmp/control.sock",
+      },
+    });
+    expect(wrapped.args).toContain("PROSPERO_SESSION_ID=worker-1");
+    expect(wrapped.args).toContain("PROSPERO_CONTROL_SOCK=/tmp/control.sock");
+  });
+
+  it("已安装的 tmux 接受 -e 并把身份放进新 session 环境", () => {
+    const tmux = tmuxPath();
+    if (!tmux) return;
+    const home = tempHome();
+    const conf = writeConfig(home);
+    const name = `prospero-envtest-${String(Date.now())}`;
+    const created = spawnSync(
+      tmux,
+      ["-f", conf, "new-session", "-d", "-e", "PROSPERO_SESSION_ID=worker-env", "-s", name, "sleep", "10"],
+      { encoding: "utf8" },
+    );
+    const value = spawnSync(tmux, ["show-environment", "-t", name, "PROSPERO_SESSION_ID"], {
+      encoding: "utf8",
+    });
+    spawnSync(tmux, ["kill-session", "-t", name], { stdio: "ignore" });
+    expect(created.status).toBe(0);
+    expect(value.stdout.trim()).toBe("PROSPERO_SESSION_ID=worker-env");
+  });
+
   it("会话名带前缀,避免误伤用户自己的 tmux 会话", () => {
     expect(sessionName("abc-123")).toBe("prospero-abc-123");
   });

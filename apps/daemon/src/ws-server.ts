@@ -29,12 +29,18 @@ import {
   type SecureChannel,
   type SessionInfo,
   type UsageAccount,
+  type ResumableConversation,
 } from "@prospero/protocol";
 import { availableMemory, osIdentity } from "./host-stats.js";
 import { authenticate, loadDevices, loadIdentity, type DeviceRecord } from "./pairing.js";
 import { Notifier, type NotifyConfig } from "./notify.js";
 import { SessionError, SessionManager } from "./session-manager.js";
 import { StatusFile } from "./status-file.js";
+import { startControlSocket, type ControlSocketServer } from "./control-socket.js";
+import { CollaborationService } from "./orchestration/collaboration.js";
+import { DispatchService } from "./orchestration/dispatch.js";
+import { orchestrationControlApi } from "./orchestration/control-api.js";
+import { OrchestrationError, OrchestrationStore } from "./orchestration/store.js";
 import {
   FsError,
   listDir,
@@ -48,6 +54,7 @@ import {
 } from "./fs-ops.js";
 import * as gitOps from "./git-ops.js";
 import type { PtySession } from "./pty-session.js";
+import { searchLocalConversations } from "./local-conversations.js";
 
 const DAEMON_VERSION = "0.0.1";
 const HIGH_WATER = 512 * 1024; // 超过则暂停向该客户端流式发送
@@ -82,6 +89,8 @@ interface Conn {
 export interface DaemonServerOptions {
   home: string;
   port: number;
+  /** 新会话目录选择器的根；生产默认当前用户 home，测试可注入临时目录。 */
+  workspaceRoot?: string | undefined;
   /** 监听地址;省略 = 0.0.0.0(全部网卡) */
   bindAddr?: string | undefined;
   /** tmux 托管:会话进程活过 daemon 重启 */
@@ -90,6 +99,12 @@ export interface DaemonServerOptions {
   hostName?: string | undefined;
   /** 推送通道配置;省略则不推送 */
   notify?: NotifyConfig | null;
+  /** 测试可注入；生产读取 Claude/Codex 官方本机会话索引。 */
+  conversationSearch?: (
+    agent: "claude" | "codex",
+    query: string,
+    limit: number,
+  ) => Promise<ResumableConversation[]>;
 }
 
 export interface DaemonServer {
@@ -101,6 +116,10 @@ export interface DaemonServer {
   httpServer: Server;
   manager: SessionManager;
   notifier: Notifier;
+  /** M2 编排状态与派发入口；手机协议接入(M4)也将复用它们。 */
+  orchestration: { store: OrchestrationStore; dispatch: DispatchService };
+  collaboration: CollaborationService;
+  controlSocket: ControlSocketServer;
   close(): Promise<void>;
 }
 
@@ -130,6 +149,7 @@ export async function createDaemonServer(
   opts: DaemonServerOptions,
 ): Promise<DaemonServer> {
   const identity = loadIdentity(opts.home);
+  const workspaceRoot = opts.workspaceRoot ?? os.homedir();
   const DAEMON_STARTED_AT = Date.now();
   const hostId = hostIdForDaemonPublicKey(identity.publicKey);
   // --dev 的一次性口令:每次启动重新生成,只存在内存里,只打印到启动它的终端。
@@ -147,9 +167,28 @@ export async function createDaemonServer(
     const b = Buffer.from(controlToken);
     return a.length === b.length && timingSafeEqual(a, b);
   };
+  const controlSocketPath = path.join(opts.home, "control.sock");
+  const controlTokenPath = path.join(opts.home, "control.token");
+  // `apps/daemon/bin/prospero` 是 package 安装前的本地入口；npm 安装后仍由
+  // package bin 指向同一文件。每个 agent 的 PATH 都优先找到它。
+  const cliBinDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "bin");
   const manager = new SessionManager({
     home: opts.home,
     ...(opts.useTmux ? { tmux: { home: opts.home } } : {}),
+    sessionEnv: (sessionId) => ({
+      PROSPERO_SESSION_ID: sessionId,
+      PROSPERO_CONTROL_SOCK: controlSocketPath,
+      PROSPERO_CONTROL_TOKEN_PATH: controlTokenPath,
+      PATH: [cliBinDir, process.env["PATH"] ?? ""].filter((part) => part !== "").join(path.delimiter),
+    }),
+  });
+  const orchestrationStore = new OrchestrationStore(opts.home);
+  const dispatchService = new DispatchService(orchestrationStore, manager);
+  const collaboration = new CollaborationService(orchestrationStore);
+  const controlSocket = await startControlSocket({
+    home: opts.home,
+    token: controlToken,
+    handle: orchestrationControlApi(orchestrationStore, dispatchService, collaboration),
   });
   // Mac GUI 靠这个文件看会话列表(WS 协议要过 E2E 握手,壳没必要实现一遍)
   const statusFile = new StatusFile(opts.home, manager, {
@@ -161,6 +200,7 @@ export async function createDaemonServer(
   const conns = new Set<Conn>();
   const devMode = opts.devMode ?? false;
   const notifier = new Notifier(opts.notify ?? null);
+  const conversationSearch = opts.conversationSearch ?? searchLocalConversations;
 
   const httpServer = createServer((req, res) => handleHttp(req, res));
   const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
@@ -168,6 +208,31 @@ export async function createDaemonServer(
   function send(conn: Conn, msg: S2CMessage): void {
     if (conn.ws.readyState !== WebSocket.OPEN) return;
     conn.ws.send(conn.channel ? conn.channel.seal(msg) : JSON.stringify(msg));
+  }
+
+  /** 手机上的状态只读快照来自同一个 store，绝不在 WS 层维护镜像。 */
+  function sendOrchestrationSnapshot(conn: Conn): void {
+    const state = orchestrationStore.snapshot();
+    send(conn, {
+      type: "orchestration.snapshot",
+      snapshot: {
+        runs: Object.values(state.runs),
+        tasks: Object.values(state.tasks),
+        dispatches: Object.values(state.dispatches),
+        gates: Object.values(state.gates),
+      },
+    });
+  }
+
+  function goalCoordinatorPrompt(runId: string, objective: string): string {
+    return [
+      "你是本次 Prospero 编排的协调者。",
+      `Run ID: ${runId}`,
+      "目标：",
+      objective,
+      "请先调查并拆分有明确交付物的任务；需要并行执行时，用 prospero task / worker 命令派发。",
+      "Worker 只能通过 prospero task done 或 task fail 显式交付；遇到需要人决定的事，用 prospero gate create。",
+    ].join("\n\n");
   }
 
   manager.on("output", (sid, dataB64, seq) => {
@@ -406,7 +471,7 @@ export async function createDaemonServer(
       case "workspace.list": {
         // 新建会话前还没有 sid,所以浏览根固定为当前 macOS 用户的 home。
         // listDir 会 realpath 并阻止符号链接逃逸;响应里只回这一级的预览。
-        const root = os.homedir();
+        const root = workspaceRoot;
         const cwd = path.join(root, msg.path);
         try {
           const entries = await listDir(root, msg.path);
@@ -422,6 +487,26 @@ export async function createDaemonServer(
         }
         return;
       }
+      case "conversation.search": {
+        try {
+          const conversations = await conversationSearch(msg.agent, msg.query, msg.limit ?? 20);
+          send(conn, {
+            type: "conversation.results",
+            requestId: msg.requestId,
+            agent: msg.agent,
+            conversations,
+          });
+        } catch (error) {
+          send(conn, {
+            type: "conversation.results",
+            requestId: msg.requestId,
+            agent: msg.agent,
+            conversations: [],
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+        return;
+      }
       case "session.create": {
         const info = await manager.create({
           agent: msg.agent,
@@ -429,10 +514,27 @@ export async function createDaemonServer(
           approvalPolicy: msg.approvalPolicy,
           cwd: msg.cwd,
           command: msg.command,
+          mode: msg.mode,
+          resume: msg.resume,
           cols: msg.cols,
           rows: msg.rows,
           allowShell: device.allowShell,
         });
+        if (msg.goal !== undefined) {
+          const run = orchestrationStore.createRun({
+            objective: msg.goal,
+            coordinatorSessionId: info.id,
+          });
+          // Goal 一定是 structured（协议已校验）。Run 已经是可恢复的真相，不能因为
+          // 第一次给 Agent 投递提示暂时失败就把新建会话卡死；客户端 attach 后仍会收到它。
+          void manager
+            .requireStructured(info.id)
+            .send(goalCoordinatorPrompt(run.id, run.objective))
+            .catch((error: unknown) => {
+              console.error(`[prosperod] Goal ${run.id} 的协调者提示投递失败:`, error);
+            });
+          sendOrchestrationSnapshot(conn);
+        }
         // 创建者自动 attach:结构化会话发 chat.snapshot,PTY 发画面快照(锚定 seq 基线)
         if (info.kind === "structured") {
           attachChat(conn, info.id);
@@ -760,6 +862,15 @@ export async function createDaemonServer(
         return;
       }
 
+      case "orchestration.snapshot":
+        sendOrchestrationSnapshot(conn);
+        return;
+
+      case "orchestration.gate.resolve":
+        orchestrationStore.resolveGate(msg.gateId, msg.decision);
+        sendOrchestrationSnapshot(conn);
+        return;
+
       case "approval.policy.set":
         await manager.setApprovalPolicy(msg.sid, msg.policy);
         return;
@@ -968,6 +1079,10 @@ export async function createDaemonServer(
         send(conn, { type: "error", code: e.code, message: e.message });
         return;
       }
+      if (e instanceof OrchestrationError) {
+        send(conn, { type: "error", code: "bad_message", message: e.message });
+        return;
+      }
       console.error("[prosperod] internal error:", e);
       send(conn, { type: "error", code: "bad_message", message: "internal error" });
     }
@@ -1020,6 +1135,29 @@ export async function createDaemonServer(
       res.end(JSON.stringify({ ok: true, sessions: manager.list().length }));
       return;
     }
+    const gateMatch = url.pathname.match(
+      /^\/_prospero\/control\/orchestration\/gate\/([^/]+)\/resolve$/,
+    );
+    if (req.method === "POST" && gateMatch) {
+      try {
+        const body = await readControlJson(req);
+        const decision = typeof body["decision"] === "string" ? body["decision"].trim() : "";
+        if (decision === "") {
+          res.writeHead(400).end("决策内容不能为空");
+          return;
+        }
+        orchestrationStore.resolveGate(decodeURIComponent(gateMatch[1]!), decision);
+        res.writeHead(204).end();
+      } catch (e) {
+        if (e instanceof OrchestrationError) {
+          const status = e.code === "gate_not_found" ? 404 : 409;
+          res.writeHead(status).end(e.message);
+        } else {
+          res.writeHead(400).end(e instanceof Error ? e.message : String(e));
+        }
+      }
+      return;
+    }
     const match = url.pathname.match(/^\/_prospero\/control\/session\/([^/]+)\/(kill|interrupt)$/);
     if (req.method !== "POST" || !match) {
       res.writeHead(404).end("not found");
@@ -1037,6 +1175,23 @@ export async function createDaemonServer(
         res.writeHead(500).end(e instanceof Error ? e.message : String(e));
       }
     }
+  }
+
+  /** shell 的 Gate 请求只有一个短字符串；显式限长，避免控制面被大 body 占住内存。 */
+  async function readControlJson(req: IncomingMessage): Promise<Record<string, unknown>> {
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    for await (const chunk of req) {
+      const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      bytes += data.length;
+      if (bytes > 64 * 1024) throw new Error("控制请求过大");
+      chunks.push(data);
+    }
+    const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("控制请求必须是 JSON 对象");
+    }
+    return parsed as Record<string, unknown>;
   }
 
   // term.html 与 xterm 资产始终提供(App 的 WebView 终端依赖;纯静态无敏感信息,
@@ -1081,10 +1236,22 @@ export async function createDaemonServer(
     }
   }
 
-  await new Promise<void>((resolve, reject) => {
-    httpServer.once("error", reject);
-    httpServer.listen(opts.port, opts.bindAddr ?? "0.0.0.0", () => resolve());
-  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      httpServer.once("error", reject);
+      httpServer.listen(opts.port, opts.bindAddr ?? "0.0.0.0", () => resolve());
+    });
+  } catch (error) {
+    // control socket 已先于 HTTP 起来，好让所有 session 都能继承它；若主监听
+    // 失败，必须把这批私有凭证和 interval 一并清掉，不能留下幽灵 daemon。
+    clearInterval(catchupTimer);
+    clearInterval(pingTimer);
+    wss.close();
+    await controlSocket.close();
+    await manager.disposeAll();
+    orchestrationStore.close();
+    throw error;
+  }
   const address = httpServer.address();
   const port = typeof address === "object" && address !== null ? address.port : opts.port;
   /**
@@ -1144,15 +1311,20 @@ export async function createDaemonServer(
     httpServer,
     manager,
     notifier,
+    orchestration: { store: orchestrationStore, dispatch: dispatchService },
+    collaboration,
+    controlSocket,
     close: async () => {
       clearInterval(catchupTimer);
       clearInterval(pingTimer);
       for (const conn of conns) conn.ws.terminate();
       statusFile.stop();
+      await controlSocket.close();
       if (revokeTimer) clearTimeout(revokeTimer);
       revokeWatcher?.close();
       wss.close();
       await manager.disposeAll();
+      orchestrationStore.close();
       await new Promise<void>((resolve) => httpServer.close(() => resolve()));
     },
   };

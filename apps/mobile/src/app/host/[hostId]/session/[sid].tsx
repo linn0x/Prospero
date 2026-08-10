@@ -3,7 +3,6 @@ import {
   ActivityIndicator,
   Alert,
   Image,
-  KeyboardAvoidingView,
   Platform,
   Pressable,
   ScrollView,
@@ -13,6 +12,8 @@ import {
   View,
 } from "react-native";
 import * as Haptics from "expo-haptics";
+import { KeyboardAvoidingView } from "react-native-keyboard-controller";
+import { useHeaderHeight } from "expo-router/build/react-navigation/elements";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Stack, router, useLocalSearchParams } from "expo-router";
 import type {
@@ -67,8 +68,9 @@ const statusText: Record<SessionInfo["status"], string> = {
   running: "运行中",
   waiting_approval: "待审批",
   waiting_input: "待回答",
-  idle: "空闲",
-  done: "已完成",
+  idle: "空闲就绪",
+  completed: "运行完毕",
+  done: "会话结束",
   died: "已退出",
 };
 
@@ -177,6 +179,7 @@ function SessionHeaderTitle({
 
 export default function SessionScreen() {
   const insets = useSafeAreaInsets();
+  const headerHeight = useHeaderHeight();
   const { hostId, sid, subagentId } = useLocalSearchParams<{
     hostId: string;
     sid: string;
@@ -645,10 +648,10 @@ export default function SessionScreen() {
   return (
     <KeyboardAvoidingView
       style={styles.container}
-      // targetSdk 35+ 的 edge-to-edge 窗口上，adjustResize 仍可能只让 IME 覆盖
-      // ReactRootView；Android 需显式按键盘高度缩短这一层，保证输入栏留在键盘上方。
+      // 显式使用 native-stack 已知的头部高度，首轮布局就能同步算出 IME 重叠量。
+      // automaticOffset 需要异步测量窗口坐标，快速首次点按时可能晚于键盘动画。
       behavior={Platform.OS === "ios" ? "padding" : "height"}
-      keyboardVerticalOffset={Platform.OS === "ios" ? 88 : 0}
+      keyboardVerticalOffset={headerHeight}
     >
       <Stack.Screen
         options={{

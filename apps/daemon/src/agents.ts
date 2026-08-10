@@ -60,7 +60,11 @@ export function defaultKindFor(agent: AgentKind): "pty" | "structured" {
   return structuredCapable(agent) ? "structured" : "pty";
 }
 
-export function spawnEnv(): Record<string, string> {
+/**
+ * 新会话的基础环境；编排层可补入会话身份和控制 socket 信息。
+ * 覆盖项放最后，确保每个 worker 都带自己的 PROSPERO_SESSION_ID。
+ */
+export function spawnEnv(overrides: Record<string, string> = {}): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (v !== undefined) env[k] = v;
@@ -68,5 +72,5 @@ export function spawnEnv(): Record<string, string> {
   env["TERM"] = "xterm-256color";
   env["COLORTERM"] = "truecolor";
   env["LANG"] = env["LANG"] ?? "en_US.UTF-8";
-  return env;
+  return { ...env, ...overrides };
 }
