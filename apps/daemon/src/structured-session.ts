@@ -78,8 +78,12 @@ export interface StructuredSessionOptions {
   title: string;
   cwd: string;
   adapter: AgentAdapter;
+  /** 给本机会话子进程的环境；用于会话内 prospero CLI 身份。 */
+  environment?: Record<string, string>;
   approvalPolicy?: ApprovalPolicy;
   restored?: StructuredSessionPersistentState;
+  /** 新建 Prospero 会话时接入已有原生会话/初始模式。 */
+  initialAdapterState?: AdapterResumeState;
 }
 
 export interface StructuredSessionEvents {
@@ -118,6 +122,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
   readonly createdAt: number;
 
   private readonly adapter: AgentAdapter;
+  private readonly environment: Record<string, string>;
   private readonly log: AgentEventBody[] = [];
   private evSeq = 0;
   private status: SessionStatus = "starting";
@@ -148,9 +153,11 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     this.title = opts.title;
     this.cwd = opts.cwd;
     this.adapter = opts.adapter;
+    this.environment = opts.environment ?? {};
     const restored = opts.restored;
     this.createdAt = restored?.createdAt ?? Date.now();
     this.policy = restored?.approvalPolicy ?? opts.approvalPolicy ?? DEFAULT_POLICY;
+    this.adapterState = { ...(opts.initialAdapterState ?? {}) };
     if (restored) {
       this.log.push(...restored.events.slice(-MAX_EVENTS));
       this.evSeq = Math.max(restored.evSeq, this.log.length);
@@ -206,6 +213,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
   async start(): Promise<void> {
     await this.adapter.start({
       cwd: this.cwd,
+      env: this.environment,
       emit: (body) => this.record(body),
       recordOutput: (callId, output) => this.recordToolOutput(callId, output),
       persistState: (state) => {
@@ -218,8 +226,22 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
       // 取函数而非取值:策略可在会话进行中改,适配器每次调用都要读到当下的值
       approvalPolicy: () => this.policy,
     });
-    this.setStatus("idle");
+    this.setStatus(this.readyStatusFromLog());
     await this.drainQueue();
+  }
+
+  /** 第一次启动是“空闲就绪”；已有一轮落幕的恢复会话是“运行完毕”。 */
+  private readyStatusFromLog(): "idle" | "completed" {
+    for (let index = this.log.length - 1; index >= 0; index--) {
+      const body = this.log[index];
+      if (!body) continue;
+      if (body.kind === "turn.end" || body.kind === "agent.error") {
+        if (body.agentId === undefined) return "completed";
+      } else if (body.kind === "user.message" && body.agentId === undefined) {
+        return "idle";
+      }
+    }
+    return "idle";
   }
 
   /** 保留可浏览的历史,但明确标记原生会话这次没有恢复成功。 */
@@ -410,14 +432,17 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
   async compact(): Promise<void> {
     if (!this.backendAvailable) throw new Error("会话后端未恢复;无法压缩上下文");
     if (!this.adapter.compact) throw new Error(`${this.agent} 尚不支持手动压缩`);
-    if (this.status !== "idle") throw new Error("当前任务仍在运行，请结束后再压缩");
+    if (this.status !== "idle" && this.status !== "completed") {
+      throw new Error("当前任务仍在运行，请结束后再压缩");
+    }
+    const readyStatus = this.status;
     this.busySince = Date.now();
     this.setStatus("running");
     try {
       await this.adapter.compact();
-      // 成功路径由原生 compact 的 turn/status 事件发出 turn.end，再统一回 idle。
+      // 成功路径由原生 compact 的 turn/status 事件发出 turn.end，再统一进入完成态。
     } catch (error) {
-      this.setStatus("idle");
+      this.setStatus(readyStatus);
       throw error;
     }
   }
@@ -492,14 +517,14 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
       this.totals.costUsd += body.costUsd ?? 0;
       this.totals.inputTokens += body.inputTokens ?? 0;
       this.totals.outputTokens += body.outputTokens ?? 0;
-      if (this.pending.size === 0 && this.pendingQuestions.size === 0) this.setStatus("idle");
+      if (this.pending.size === 0 && this.pendingQuestions.size === 0) this.setStatus("completed");
     } else if (body.kind === "agent.error" && body.agentId === undefined) {
-      if (this.pending.size === 0 && this.pendingQuestions.size === 0) this.setStatus("idle");
+      if (this.pending.size === 0 && this.pendingQuestions.size === 0) this.setStatus("completed");
     } else if (
       body.kind !== "subagent.started" &&
       body.kind !== "subagent.updated" &&
       body.agentId === undefined &&
-      (this.status === "idle" || this.status === "starting")
+      (this.status === "idle" || this.status === "completed" || this.status === "starting")
     ) {
       this.setStatus("running");
     }
@@ -512,7 +537,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
   private setStatus(s: SessionStatus): void {
     if (this.status === s) return;
     this.status = s;
-    // running/等待交互期间才计时,回到 idle 就清掉
+    // running/等待交互期间才计时,回到就绪/完成态就清掉
     this.busySince =
       s === "running" || s === "waiting_approval" || s === "waiting_input"
         ? (this.busySince ?? Date.now())
@@ -664,7 +689,15 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     this.busySince = Date.now(); // 新一轮开始重新计时
     this.setStatus("running");
     const prepared = await this.prepareForAdapter(outgoing);
-    await this.adapter.send(prepared.text, forAdapter, prepared.skills);
+    try {
+      await this.adapter.send(prepared.text, forAdapter, prepared.skills);
+    } catch (error) {
+      this.record({
+        kind: "agent.error",
+        message: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
   }
 
   private recordUserMessage(text: string): void {
@@ -765,13 +798,16 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
       this.drainingQueue ||
       this.disposed ||
       !this.backendAvailable ||
-      this.status !== "idle"
+      (this.status !== "idle" && this.status !== "completed")
     ) {
       return;
     }
     this.drainingQueue = true;
     try {
-      while (this.status === "idle" && this.messageQueue.length > 0) {
+      while (
+        (this.status === "idle" || this.status === "completed") &&
+        this.messageQueue.length > 0
+      ) {
         const item = this.messageQueue.shift();
         if (!item) break;
         this.emit("state", this.info());

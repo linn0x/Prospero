@@ -63,7 +63,8 @@ struct RunningStatus: Sendable, Equatable {
       case "waiting_approval": return "hand.raised.fill"
       case "waiting_input": return "questionmark.bubble.fill"
       case "idle": return "pause.circle"
-      case "done": return "checkmark.circle"
+      case "completed": return "checkmark.circle.fill"
+      case "done": return "stop.circle"
       case "died": return "xmark.circle"
       default: return "circle"
       }
@@ -78,8 +79,9 @@ struct RunningStatus: Sendable, Equatable {
       case "running": return "运行中"
       case "waiting_approval": return "等待审批"
       case "waiting_input": return "等待回答"
-      case "idle": return "空闲"
-      case "done": return "已完成"
+      case "idle": return "空闲就绪"
+      case "completed": return "运行完毕"
+      case "done": return "会话结束"
       case "died": return "已退出"
       default: return status
       }

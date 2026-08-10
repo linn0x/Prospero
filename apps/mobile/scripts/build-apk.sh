@@ -75,8 +75,31 @@ info "Java:        $(java -version 2>&1 | head -1)"
 info "Android SDK: $SDK_ROOT"
 info "Variant:     $BUILD_VARIANT"
 
+ADB=()
+DEVICE_ABI=""
+if (( DO_INSTALL )); then
+  command -v adb >/dev/null 2>&1 || die "找不到 adb"
+  if [[ -z "$DEVICE_SERIAL" ]]; then
+    mapfile_output="$(adb devices | awk 'NR > 1 && $2 == "device" { print $1 }')"
+    device_count="$(printf '%s\n' "$mapfile_output" | awk 'NF { count++ } END { print count + 0 }')"
+    [[ "$device_count" -gt 0 ]] || die "没有可用 adb 设备。连接并解锁手机，或先启动模拟器。"
+    [[ "$device_count" -eq 1 ]] || die "发现多台 adb 设备，请用 --device 指定：$(tr '\n' ' ' <<<"$mapfile_output")"
+    DEVICE_SERIAL="$mapfile_output"
+  fi
+  ADB=(adb -s "$DEVICE_SERIAL")
+  "${ADB[@]}" get-state >/dev/null 2>&1 || die "adb 设备不可用：$DEVICE_SERIAL"
+  DEVICE_ABI="$("${ADB[@]}" shell getprop ro.product.cpu.abi | tr -d '\r')"
+  case "$DEVICE_ABI" in
+    arm64-v8a|armeabi-v7a|x86|x86_64) info "设备架构：  ${DEVICE_ABI}（仅构建此架构）" ;;
+    *) die "设备返回了不支持的 CPU 架构：$DEVICE_ABI" ;;
+  esac
+fi
+
 step "构建 @prospero/protocol"
 (cd "$REPO_ROOT" && npx tsc --build packages/protocol)
+
+step "准备 Android 中英混合离线语音模型"
+"$MOBILE_DIR/scripts/prepare-android-voice-model.sh"
 
 if (( DO_PREBUILD )); then
   step "生成 Android 工程（expo prebuild --clean）"
@@ -99,7 +122,11 @@ else
 fi
 
 step "Gradle $GRADLE_TASK"
-(cd "$MOBILE_DIR/android" && NODE_ENV=production ./gradlew ":app:$GRADLE_TASK" --console=plain)
+GRADLE_ARGS=("-Dorg.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m")
+if [[ -n "$DEVICE_ABI" ]]; then
+  GRADLE_ARGS+=("-PreactNativeArchitectures=$DEVICE_ABI")
+fi
+(cd "$MOBILE_DIR/android" && NODE_ENV=production ./gradlew ":app:$GRADLE_TASK" "${GRADLE_ARGS[@]}" --console=plain)
 [[ -f "$APK_SOURCE" ]] || die "Gradle 成功但没找到 APK：$APK_SOURCE"
 
 mkdir -p "$OUTPUT_DIR"
@@ -113,17 +140,6 @@ fi
 info "APK: $APK ($(du -h "$APK" | cut -f1))"
 
 if (( DO_INSTALL )); then
-  command -v adb >/dev/null 2>&1 || die "找不到 adb"
-  if [[ -z "$DEVICE_SERIAL" ]]; then
-    mapfile_output="$(adb devices | awk 'NR > 1 && $2 == "device" { print $1 }')"
-    device_count="$(printf '%s\n' "$mapfile_output" | awk 'NF { count++ } END { print count + 0 }')"
-    [[ "$device_count" -gt 0 ]] || die "没有可用 adb 设备。连接并解锁手机，或先启动模拟器。"
-    [[ "$device_count" -eq 1 ]] || die "发现多台 adb 设备，请用 --device 指定：$(tr '\n' ' ' <<<"$mapfile_output")"
-    DEVICE_SERIAL="$mapfile_output"
-  fi
-  ADB=(adb -s "$DEVICE_SERIAL")
-  "${ADB[@]}" get-state >/dev/null 2>&1 || die "adb 设备不可用：$DEVICE_SERIAL"
-
   step "安装到 $DEVICE_SERIAL"
   "${ADB[@]}" install -r "$APK"
 

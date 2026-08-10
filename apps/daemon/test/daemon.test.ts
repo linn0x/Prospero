@@ -1,7 +1,7 @@
 /**
  * daemon 集成测试:真实加密握手 + PTY 会话全链路(内存中起服务,随机端口)。
  */
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -21,6 +21,9 @@ import { loadIdentity, mintDevice } from "../src/pairing.js";
 import { createDaemonServer, type DaemonServer } from "../src/ws-server.js";
 
 const home = mkdtempSync(path.join(os.tmpdir(), "prospero-test-"));
+const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), "prospero-workspace-"));
+mkdirSync(path.join(workspaceRoot, "Projects", "Demo"), { recursive: true });
+writeFileSync(path.join(workspaceRoot, "Projects", "Demo", "README.md"), "demo\n");
 let server: DaemonServer;
 let daemonPub: string;
 
@@ -126,11 +129,25 @@ class TestClient {
 beforeAll(async () => {
   daemonPub = loadIdentity(home).publicKey;
   deviceToken = mintDevice(home, { name: "test-device", allowShell: true }).token;
-  server = await createDaemonServer({ home, port: 0 });
+  server = await createDaemonServer({
+    home,
+    port: 0,
+    workspaceRoot,
+    conversationSearch: async (agent, query, limit) => [{
+      id: `${agent}-native-1`,
+      agent,
+      title: query ? `命中 ${query}` : "最近对话",
+      preview: "本机原生上下文",
+      cwd: path.join(workspaceRoot, "Projects", "Demo"),
+      updatedAt: 123,
+    }].slice(0, limit),
+  });
 });
 
 afterAll(async () => {
   await server.close();
+  rmSync(home, { recursive: true, force: true });
+  rmSync(workspaceRoot, { recursive: true, force: true });
 });
 
 describe("daemon 全链路", () => {
@@ -155,6 +172,25 @@ describe("daemon 全链路", () => {
     });
     expect(killed.status).toBe(204);
     expect(() => server.manager.infoOf(info.id)).toThrow(/no such session/);
+
+    const run = server.orchestration.store.createRun({ objective: "Mac 处理 Gate" });
+    const gate = server.orchestration.store.createGate({
+      runId: run.id,
+      question: "发布这次更新？",
+      options: ["发布", "继续测试"],
+    });
+    const gateUrl = `http://127.0.0.1:${String(server.port)}/_prospero/control/orchestration/gate/${gate.id}/resolve`;
+    expect(
+      (await fetch(gateUrl, {
+        method: "POST",
+        headers: { authorization: `Bearer ${status.controlToken}`, "content-type": "application/json" },
+        body: JSON.stringify({ decision: "继续测试" }),
+      })).status,
+    ).toBe(204);
+    expect(server.orchestration.store.getGate(gate.id)).toMatchObject({
+      status: "resolved",
+      decision: "继续测试",
+    });
   });
 
   it("新建会话前可在用户 home 内预览并选择工作目录", async () => {
@@ -166,8 +202,74 @@ describe("daemon 全链路", () => {
       "workspace.listing",
     );
     const listing = result as Extract<S2CMessage, { type: "workspace.listing" }>;
-    expect(listing.cwd).toBe(os.homedir());
-    expect(Array.isArray(listing.entries)).toBe(true);
+    expect(listing.cwd).toBe(workspaceRoot);
+    expect(listing.entries).toContainEqual(
+      expect.objectContaining({ name: "Projects", kind: "dir" }),
+    );
+
+    // 手机点文件夹时会把相对路径再次发给 daemon；这个子目录往返此前没有测试，
+    // 协议 dist 一旦陈旧就会在这里直接退成全局 bad_message。
+    c.send({ type: "workspace.list", path: "Projects" });
+    const nested = (await c.waitFor(
+      (m) => m.type === "workspace.listing" && m.path === "Projects",
+      "nested workspace.listing",
+    )) as Extract<S2CMessage, { type: "workspace.listing" }>;
+    expect(nested.cwd).toBe(path.join(workspaceRoot, "Projects"));
+    expect(nested.entries).toContainEqual(
+      expect.objectContaining({ name: "Demo", kind: "dir" }),
+    );
+    c.close();
+  }, 20000);
+
+  it("可搜索本机原生对话，并用 requestId 精确配回应答", async () => {
+    const c = await TestClient.connect(deviceToken, deviceKeys);
+    await c.waitFor((m) => m.type === "hello.ok", "hello.ok");
+    c.send({
+      type: "conversation.search",
+      requestId: "resume-search-1",
+      agent: "codex",
+      query: "手机端",
+      limit: 10,
+    });
+    const result = (await c.waitFor(
+      (m) => m.type === "conversation.results" && m.requestId === "resume-search-1",
+      "conversation.results",
+    )) as Extract<S2CMessage, { type: "conversation.results" }>;
+    expect(result.agent).toBe("codex");
+    expect(result.conversations).toEqual([
+      expect.objectContaining({
+        id: "codex-native-1",
+        title: "命中 手机端",
+      }),
+    ]);
+    c.close();
+  }, 20000);
+
+  it("手机可拉取编排快照并处理人工 Gate", async () => {
+    const run = server.orchestration.store.createRun({ objective: "验证手机 Goal 面板" });
+    const gate = server.orchestration.store.createGate({
+      runId: run.id,
+      question: "是否发布？",
+      options: ["发布", "继续测试"],
+    });
+    const c = await TestClient.connect(deviceToken, deviceKeys);
+    await c.waitFor((m) => m.type === "hello.ok", "hello.ok");
+    c.send({ type: "orchestration.snapshot" });
+    const initial = (await c.waitFor(
+      (m) => m.type === "orchestration.snapshot",
+      "orchestration.snapshot",
+    )) as Extract<S2CMessage, { type: "orchestration.snapshot" }>;
+    expect(initial.snapshot.runs).toContainEqual(expect.objectContaining({ id: run.id }));
+    expect(initial.snapshot.gates).toContainEqual(expect.objectContaining({ id: gate.id, status: "pending" }));
+
+    c.send({ type: "orchestration.gate.resolve", gateId: gate.id, decision: "继续测试" });
+    const resolved = (await c.waitFor(
+      (m) =>
+        m.type === "orchestration.snapshot" &&
+        m.snapshot.gates.some((candidate) => candidate.id === gate.id && candidate.status === "resolved"),
+      "resolved orchestration.snapshot",
+    )) as Extract<S2CMessage, { type: "orchestration.snapshot" }>;
+    expect(resolved.snapshot.gates.find((candidate) => candidate.id === gate.id)?.decision).toBe("继续测试");
     c.close();
   }, 20000);
 

@@ -4,6 +4,7 @@ import { DarkTheme, Stack, ThemeProvider } from "expo-router";
 import { NavigationBar } from "expo-navigation-bar";
 import { StatusBar } from "expo-status-bar";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
+import { KeyboardProvider } from "react-native-keyboard-controller";
 import { ToastHost } from "@/components/Toast";
 import { color } from "@/lib/theme";
 
@@ -29,21 +30,23 @@ export default function RootLayout() {
   return (
     // Swipeable 依赖这个根视图;缺了它手势在真机上会静默失效
     <GestureHandlerRootView style={{ flex: 1 }}>
-      <ThemeProvider value={prosperoTheme}>
-        <StatusBar style="light" />
-        <NavigationBar style="dark" />
-        <Stack
-          screenOptions={{
-            headerStyle: { backgroundColor: color.surface },
-            headerTintColor: color.text,
-            headerTitleStyle: { fontSize: 17, fontWeight: "600" },
-            headerShadowVisible: false,
-            headerBackButtonDisplayMode: "minimal",
-            contentStyle: { backgroundColor: color.bg },
-          }}
-        />
-        <ToastHost />
-      </ThemeProvider>
+      <KeyboardProvider>
+        <ThemeProvider value={prosperoTheme}>
+          <StatusBar style="light" />
+          <NavigationBar style="dark" />
+          <Stack
+            screenOptions={{
+              headerStyle: { backgroundColor: color.surface },
+              headerTintColor: color.text,
+              headerTitleStyle: { fontSize: 17, fontWeight: "600" },
+              headerShadowVisible: false,
+              headerBackButtonDisplayMode: "minimal",
+              contentStyle: { backgroundColor: color.bg },
+            }}
+          />
+          <ToastHost />
+        </ThemeProvider>
+      </KeyboardProvider>
     </GestureHandlerRootView>
   );
 }

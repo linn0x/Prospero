@@ -22,6 +22,7 @@ export const SessionStatusSchema = z.enum([
   "waiting_approval",
   "waiting_input",
   "idle",
+  "completed",
   "done",
   "died",
 ]);
@@ -218,8 +219,39 @@ export const C2SSessionCreateSchema = z.object({
   cwd: z.string().optional(),
   /** agent === "custom" 时的完整命令行 */
   command: z.string().optional(),
+  /** 结构化会话的初始协作模式；Plan 会从第一轮起生效。 */
+  mode: z.enum(["default", "plan"]).optional(),
+  /** 接回 Agent 已经保存在本机的原生对话。 */
+  resume: z
+    .object({
+      id: z.string().min(1).max(500),
+      title: z.string().min(1).max(500).optional(),
+    })
+    .optional(),
+  /** 创建一条编排 Run，并将这个新会话登记为协调者。 */
+  goal: z.string().trim().min(1).max(20_000).optional(),
   cols,
   rows,
+});
+
+/** 可由 Prospero 接回的 Agent 原生本机对话。 */
+export const ResumableConversationSchema = z.object({
+  id: z.string().min(1).max(500),
+  agent: z.enum(["claude", "codex"]),
+  title: z.string().min(1).max(500),
+  preview: z.string().max(4000).optional(),
+  cwd: z.string().min(1),
+  createdAt: z.number().int().nonnegative().optional(),
+  updatedAt: z.number().int().nonnegative(),
+});
+
+export const C2SConversationSearchSchema = z.object({
+  type: z.literal("conversation.search"),
+  requestId: z.string().min(1).max(100),
+  agent: z.enum(["claude", "codex"]),
+  /** 空字符串表示列出最近对话。 */
+  query: z.string().max(300),
+  limit: z.number().int().min(1).max(50).optional(),
 });
 
 /**
@@ -518,9 +550,79 @@ export const C2SUsageGetSchema = z.object({
   sid: sid.optional(),
 });
 
+// ---------------------------------------------------------------- 编排
+//
+// 编排状态由 daemon 落盘；手机只拿快照，不在客户端复制一套状态机。轮询快照
+// 让 iOS 后台恢复、Android 进程回收后都能重新得到完整状态，而不是依赖脆弱的增量。
+
+export const OrchestrationRunSchema = z.object({
+  id: z.string().min(1).max(200),
+  objective: z.string().min(1).max(20_000),
+  status: z.enum(["active", "completed", "abandoned"]),
+  coordinatorSessionId: sid.nullable(),
+  createdAt: z.number().int().nonnegative(),
+  updatedAt: z.number().int().nonnegative(),
+});
+
+export const OrchestrationTaskSchema = z.object({
+  id: z.string().min(1).max(200),
+  runId: z.string().min(1).max(200),
+  title: z.string().min(1).max(2_000),
+  spec: z.string().max(20_000),
+  deps: z.array(z.string().min(1).max(200)).max(100),
+  parentId: z.string().min(1).max(200).nullable(),
+  status: z.enum(["pending", "dispatched", "blocked", "done", "failed", "cancelled"]),
+  result: z.string().max(20_000).nullable(),
+  createdAt: z.number().int().nonnegative(),
+  updatedAt: z.number().int().nonnegative(),
+});
+
+export const OrchestrationDispatchSchema = z.object({
+  id: z.string().min(1).max(200),
+  runId: z.string().min(1).max(200),
+  taskId: z.string().min(1).max(200),
+  sessionId: sid,
+  worktreePath: z.string().max(20_000).nullable(),
+  state: z.enum(["starting", "running", "succeeded", "failed", "abandoned"]),
+  startedAt: z.number().int().nonnegative(),
+  settledAt: z.number().int().nonnegative().nullable(),
+  outcome: z.string().max(20_000).nullable(),
+});
+
+export const OrchestrationGateSchema = z.object({
+  id: z.string().min(1).max(200),
+  runId: z.string().min(1).max(200),
+  taskId: z.string().min(1).max(200).nullable(),
+  question: z.string().min(1).max(20_000),
+  options: z.array(z.string().min(1).max(2_000)).max(20),
+  status: z.enum(["pending", "resolved", "cancelled"]),
+  decision: z.string().max(20_000).nullable(),
+  createdAt: z.number().int().nonnegative(),
+  resolvedAt: z.number().int().nonnegative().nullable(),
+});
+
+export const OrchestrationSnapshotSchema = z.object({
+  runs: z.array(OrchestrationRunSchema).max(500),
+  tasks: z.array(OrchestrationTaskSchema).max(5_000),
+  dispatches: z.array(OrchestrationDispatchSchema).max(5_000),
+  gates: z.array(OrchestrationGateSchema).max(1_000),
+});
+
+export const C2SOrchestrationSnapshotSchema = z.object({
+  type: z.literal("orchestration.snapshot"),
+});
+
+/** Gate 是人类的决策点；手机客户端可直接作答，不需要假装成 coordinator。 */
+export const C2SOrchestrationGateResolveSchema = z.object({
+  type: z.literal("orchestration.gate.resolve"),
+  gateId: z.string().min(1).max(200),
+  decision: z.string().trim().min(1).max(20_000),
+});
+
 export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SHelloSchema,
   C2SSessionCreateSchema,
+  C2SConversationSearchSchema,
   C2SSessionAttachSchema,
   C2SChatSendSchema,
   C2SChatQueueRemoveSchema,
@@ -556,6 +658,8 @@ export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SGitDiscardSchema,
   C2SGitCommitSchema,
   C2SUsageGetSchema,
+  C2SOrchestrationSnapshotSchema,
+  C2SOrchestrationGateResolveSchema,
 ]);
 
 // ---------------------------------------------------------------- S → C
@@ -890,6 +994,15 @@ export const S2CWorkspaceListingSchema = z.object({
   error: z.string().optional(),
 });
 
+/** 本机原生会话搜索有独立 requestId，不与尚未创建的 Prospero sid 混用。 */
+export const S2CConversationResultsSchema = z.object({
+  type: z.literal("conversation.results"),
+  requestId: z.string().min(1).max(100),
+  agent: z.enum(["claude", "codex"]),
+  conversations: z.array(ResumableConversationSchema).max(50),
+  error: z.string().max(2000).optional(),
+});
+
 export const S2CFsContentSchema = z.object({
   type: z.literal("fs.content"),
   sid,
@@ -1019,6 +1132,11 @@ export const S2CUsageSchema = z.object({
   accounts: z.array(UsageAccountSchema).optional(),
 });
 
+export const S2COrchestrationSnapshotSchema = z.object({
+  type: z.literal("orchestration.snapshot"),
+  snapshot: OrchestrationSnapshotSchema,
+});
+
 export const S2CMessageSchema = z.discriminatedUnion("type", [
   S2CHelloOkSchema,
   S2CSessionStateSchema,
@@ -1034,6 +1152,7 @@ export const S2CMessageSchema = z.discriminatedUnion("type", [
   S2CPermissionRequestSchema,
   S2CErrorSchema,
   S2CWorkspaceListingSchema,
+  S2CConversationResultsSchema,
   S2CFsListingSchema,
   S2CFsContentSchema,
   S2CFsWrittenSchema,
@@ -1043,6 +1162,7 @@ export const S2CMessageSchema = z.discriminatedUnion("type", [
   S2CGitDiffSchema,
   S2CGitDoneSchema,
   S2CUsageSchema,
+  S2COrchestrationSnapshotSchema,
 ]);
 
 // ---------------------------------------------------------------- 配对 QR 载荷
@@ -1078,6 +1198,10 @@ export type SubagentStatus = z.infer<typeof SubagentStatusSchema>;
 export type SubagentInfo = z.infer<typeof SubagentInfoSchema>;
 export type C2SHello = z.infer<typeof C2SHelloSchema>;
 export type C2SSessionCreate = z.infer<typeof C2SSessionCreateSchema>;
+export type C2SOrchestrationSnapshot = z.infer<typeof C2SOrchestrationSnapshotSchema>;
+export type C2SOrchestrationGateResolve = z.infer<typeof C2SOrchestrationGateResolveSchema>;
+export type ResumableConversation = z.infer<typeof ResumableConversationSchema>;
+export type C2SConversationSearch = z.infer<typeof C2SConversationSearchSchema>;
 export type C2SWorkspaceList = z.infer<typeof C2SWorkspaceListSchema>;
 export type C2SSessionAttach = z.infer<typeof C2SSessionAttachSchema>;
 export type C2SChatSend = z.infer<typeof C2SChatSendSchema>;
@@ -1103,8 +1227,14 @@ export type C2SMessage = z.infer<typeof C2SMessageSchema>;
 export type Attachment = z.infer<typeof AttachmentSchema>;
 export type UsageWindow = z.infer<typeof UsageWindowSchema>;
 export type UsageAccount = z.infer<typeof UsageAccountSchema>;
+export type OrchestrationRun = z.infer<typeof OrchestrationRunSchema>;
+export type OrchestrationTask = z.infer<typeof OrchestrationTaskSchema>;
+export type OrchestrationDispatch = z.infer<typeof OrchestrationDispatchSchema>;
+export type OrchestrationGate = z.infer<typeof OrchestrationGateSchema>;
+export type OrchestrationSnapshot = z.infer<typeof OrchestrationSnapshotSchema>;
 export type FsEntry = z.infer<typeof FsEntrySchema>;
 export type WorkspaceListing = z.infer<typeof S2CWorkspaceListingSchema>;
+export type ConversationResults = z.infer<typeof S2CConversationResultsSchema>;
 export type GitFile = z.infer<typeof GitFileSchema>;
 export type ChatRole = z.infer<typeof ChatRoleSchema>;
 export type ToolState = z.infer<typeof ToolStateSchema>;
@@ -1131,6 +1261,7 @@ export type S2CAgentModes = z.infer<typeof S2CAgentModesSchema>;
 export type S2CAgentControlResult = z.infer<typeof S2CAgentControlResultSchema>;
 export type S2CPermissionRequest = z.infer<typeof S2CPermissionRequestSchema>;
 export type S2CError = z.infer<typeof S2CErrorSchema>;
+export type S2COrchestrationSnapshot = z.infer<typeof S2COrchestrationSnapshotSchema>;
 export type S2CMessage = z.infer<typeof S2CMessageSchema>;
 export type PairingPayload = z.infer<typeof PairingPayloadSchema>;
 
@@ -1155,6 +1286,14 @@ export function parseC2S(v: unknown): C2SMessage {
     (r.data.attachments?.length ?? 0) === 0
   ) {
     throw new ProtocolError("chat.send needs text or at least one attachment", "format");
+  }
+  if (r.data.type === "session.create" && r.data.goal !== undefined) {
+    if (r.data.kind !== "structured") {
+      throw new ProtocolError("goal sessions must use the structured track", "format");
+    }
+    if (r.data.resume !== undefined) {
+      throw new ProtocolError("goal sessions cannot resume an existing conversation", "format");
+    }
   }
   return r.data;
 }

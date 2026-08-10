@@ -42,5 +42,11 @@ example
 /ios
 /android
 
+# Native Expo modules keep their Gradle intermediates below modules/, not /android.
+/modules/*/android/build/
+
 # build-ipa.sh 产物(.xcarchive / .ipa,几十 MB)
 /build
+
+# Downloaded, checksum-pinned Android offline speech model (bundled into APK).
+/.cache/voice/

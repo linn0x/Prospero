@@ -20,6 +20,7 @@ export type IconName =
   | "ellipsis.circle"
   | "doc.on.doc"
   | "paperclip"
+  | "photo"
   | "arrow.clockwise"
   | "archivebox"
   | "chevron.down"
@@ -50,6 +51,7 @@ const FALLBACK: Record<IconName, string> = {
   "ellipsis.circle": "⋯",
   "doc.on.doc": "复制",
   paperclip: "＋",
+  photo: "▧",
   "arrow.clockwise": "↻",
   archivebox: "归档",
   "chevron.down": "▾",

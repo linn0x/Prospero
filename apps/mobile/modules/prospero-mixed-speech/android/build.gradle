@@ -1,0 +1,36 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'com.linn0x.prospero'
+version = '0.1.0'
+
+def voiceModelDir = new File(rootProject.projectDir, '../.cache/voice')
+def voiceModelFile = new File(voiceModelDir, 'ggml-small-q5_1.bin')
+
+android {
+  namespace 'com.linn0x.prospero.mixedspeech'
+
+  defaultConfig {
+    versionCode 1
+    versionName '0.1.0'
+  }
+
+  sourceSets {
+    main {
+      assets.srcDir voiceModelDir
+    }
+  }
+}
+
+tasks.named('preBuild').configure {
+  doFirst {
+    if (!voiceModelFile.isFile()) {
+      throw new GradleException(
+        "Missing offline speech model: ${voiceModelFile}. " +
+          'Run scripts/prepare-android-voice-model.sh first.'
+      )
+    }
+  }
+}

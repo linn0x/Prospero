@@ -88,7 +88,7 @@ export class GrokAdapter implements AgentAdapter {
     const proc = spawn("grok", args, {
       stdio: ["ignore", "pipe", "pipe"],
       cwd: this.ctx.cwd,
-      env: { ...process.env },
+      env: { ...process.env, ...this.ctx.env },
     });
     this.turn = proc;
     proc.stdout?.setEncoding("utf8");

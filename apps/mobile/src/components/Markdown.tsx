@@ -1,6 +1,16 @@
-import { memo, useMemo } from "react";
-import { ScrollView, StyleSheet, Text, View } from "react-native";
+import { memo, useEffect, useMemo, useState } from "react";
+import {
+  ActivityIndicator,
+  Image,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  View,
+} from "react-native";
 import { CodeBlock } from "@/components/CodeBlock";
+import { Icon } from "@/components/Icon";
+import { MathFormula, MathSpans } from "@/components/MathView";
 import {
   resolveProjectFileReference,
   type ProjectFileReference,
@@ -8,15 +18,19 @@ import {
 import { parseMarkdown, type InlineSpan, type MdBlock } from "@/lib/markdown";
 import { MONOSPACE_FONT } from "@/lib/theme";
 
+export type ProjectImageLoader = (reference: ProjectFileReference) => Promise<string>;
+
 /** agent 输出的 Markdown 渲染(标题/列表/引用/行内代码/代码块) */
 export const Markdown = memo(function Markdown({
   source,
   projectRoot,
   onOpenFile,
+  loadProjectImage,
 }: {
   source: string;
   projectRoot?: string;
   onOpenFile?: (reference: ProjectFileReference) => void;
+  loadProjectImage?: ProjectImageLoader;
 }) {
   const blocks = useMemo(() => parseMarkdown(source), [source]);
   return (
@@ -27,6 +41,7 @@ export const Markdown = memo(function Markdown({
           block={b}
           projectRoot={projectRoot}
           onOpenFile={onOpenFile}
+          loadProjectImage={loadProjectImage}
         />
       ))}
     </View>
@@ -37,35 +52,70 @@ function Block({
   block,
   projectRoot,
   onOpenFile,
+  loadProjectImage,
 }: {
   block: MdBlock;
   projectRoot?: string;
   onOpenFile?: (reference: ProjectFileReference) => void;
+  loadProjectImage?: ProjectImageLoader;
 }) {
   switch (block.type) {
     case "heading":
+      if (hasMath(block.spans)) {
+        return (
+          <View style={styles.mathHeading}>
+            <MathSpans
+              spans={block.spans}
+              variant={block.level >= 3 ? "headingSmall" : "heading"}
+            />
+          </View>
+        );
+      }
       return (
-        <Text style={[styles.heading, block.level >= 3 && styles.headingSmall]}>
+        <Text style={[styles.heading, block.level >= 3 && styles.headingSmall]} selectable>
           <Spans spans={block.spans} projectRoot={projectRoot} onOpenFile={onOpenFile} />
         </Text>
       );
     case "bullet":
       return (
         <View style={styles.bulletRow}>
-          <Text style={styles.bulletMark}>{block.ordered ? `${block.ordered}.` : "•"}</Text>
-          <Text style={styles.body}>
-            <Spans spans={block.spans} projectRoot={projectRoot} onOpenFile={onOpenFile} />
-          </Text>
+          <Text style={styles.bulletMark} selectable>{block.ordered ? `${block.ordered}.` : "•"}</Text>
+          {hasMath(block.spans) ? (
+            <View style={styles.mathBulletBody}>
+              <MathSpans spans={block.spans} />
+            </View>
+          ) : (
+            <Text style={styles.body} selectable>
+              <Spans spans={block.spans} projectRoot={projectRoot} onOpenFile={onOpenFile} />
+            </Text>
+          )}
         </View>
       );
     case "code":
       return <CodeBlock code={block.code} lang={block.lang} />;
+    case "math":
+      return <MathFormula expression={block.expression} />;
+    case "image":
+      return (
+        <MarkdownImage
+          alt={block.alt}
+          target={block.target}
+          title={block.title}
+          projectRoot={projectRoot}
+          onOpenFile={onOpenFile}
+          loadProjectImage={loadProjectImage}
+        />
+      );
     case "quote":
       return (
         <View style={styles.quote}>
-          <Text style={styles.quoteText}>
-            <Spans spans={block.spans} projectRoot={projectRoot} onOpenFile={onOpenFile} />
-          </Text>
+          {hasMath(block.spans) ? (
+            <MathSpans spans={block.spans} variant="quote" />
+          ) : (
+            <Text style={styles.quoteText} selectable>
+              <Spans spans={block.spans} projectRoot={projectRoot} onOpenFile={onOpenFile} />
+            </Text>
+          )}
         </View>
       );
     case "rule":
@@ -80,13 +130,128 @@ function Block({
         />
       );
     case "paragraph":
+      if (hasMath(block.spans)) return <MathSpans spans={block.spans} />;
       return (
-        <Text style={styles.body}>
+        <Text style={styles.body} selectable>
           <Spans spans={block.spans} projectRoot={projectRoot} onOpenFile={onOpenFile} />
         </Text>
       );
   }
 }
+
+function hasMath(spans: InlineSpan[]): boolean {
+  return spans.some((span) => span.math === true);
+}
+
+function directImageUri(target: string): string | null {
+  const value = target.trim();
+  if (/^https?:\/\/[^\s]+$/i.test(value)) return value;
+  if (/^data:image\/(?:png|jpe?g|gif|webp);base64,[A-Za-z0-9+/=\s]+$/i.test(value)) {
+    // 防止一条 agent 消息直接塞入无限大的 data URI。
+    return value.length <= 8 * 1024 * 1024 ? value.replace(/\s/g, "") : null;
+  }
+  return null;
+}
+
+const MarkdownImage = memo(function MarkdownImage({
+  alt,
+  target,
+  title,
+  projectRoot,
+  onOpenFile,
+  loadProjectImage,
+}: {
+  alt: string;
+  target: string;
+  title?: string;
+  projectRoot?: string;
+  onOpenFile?: (reference: ProjectFileReference) => void;
+  loadProjectImage?: ProjectImageLoader;
+}) {
+  const direct = useMemo(() => directImageUri(target), [target]);
+  const reference = useMemo(
+    () => (projectRoot ? resolveProjectFileReference(target, projectRoot, true) : null),
+    [target, projectRoot],
+  );
+  const [uri, setUri] = useState<string | null>(direct);
+  const [loading, setLoading] = useState(direct === null && reference !== null);
+  const [error, setError] = useState<string | null>(null);
+  const [aspectRatio, setAspectRatio] = useState(16 / 9);
+
+  useEffect(() => {
+    let alive = true;
+    const timer = setTimeout(() => {
+      setError(null);
+      setAspectRatio(16 / 9);
+      if (direct !== null) {
+        setUri(direct);
+        setLoading(false);
+        return;
+      }
+      setUri(null);
+      if (!reference || !loadProjectImage) {
+        setLoading(false);
+        setError(reference ? "无法从 Mac 读取这张图片" : "不支持的图片地址");
+        return;
+      }
+      setLoading(true);
+      void loadProjectImage(reference)
+        .then((value) => {
+          if (alive) setUri(value);
+        })
+        .catch((reason: unknown) => {
+          if (alive) setError(reason instanceof Error ? reason.message : String(reason));
+        })
+        .finally(() => {
+          if (alive) setLoading(false);
+        });
+    }, 0);
+    return () => {
+      alive = false;
+      clearTimeout(timer);
+    };
+  }, [direct, reference, loadProjectImage]);
+
+  const caption = title || alt;
+  const open = reference && onOpenFile ? () => onOpenFile(reference) : undefined;
+  return (
+    <View style={styles.imageCard}>
+      <Pressable
+        disabled={!open}
+        onPress={open}
+        accessibilityRole={open ? "imagebutton" : "image"}
+        accessibilityLabel={alt || title || "Markdown 图片"}
+        accessibilityHint={open ? "打开原图预览" : undefined}
+      >
+        {loading ? (
+          <View style={styles.imagePlaceholder}>
+            <ActivityIndicator color="#7aa2f7" />
+            <Text style={styles.imageStatus}>正在从 Mac 读取图片…</Text>
+          </View>
+        ) : uri !== null && error === null ? (
+          <Image
+            source={{ uri }}
+            resizeMode="contain"
+            style={[styles.image, { aspectRatio }]}
+            onLoad={(event) => {
+              const { width, height } = event.nativeEvent.source;
+              if (width > 0 && height > 0) setAspectRatio(width / height);
+            }}
+            onError={() => setError("图片解码失败")}
+            accessibilityIgnoresInvertColors
+          />
+        ) : (
+          <View style={styles.imagePlaceholder}>
+            <Icon name="photo" size={25} color="#696979" />
+            <Text style={styles.imageError}>{error ?? "图片无法显示"}</Text>
+            {open && <Text style={styles.imageOpen}>点按打开文件预览</Text>}
+          </View>
+        )}
+      </Pressable>
+      {caption ? <Text style={styles.imageCaption} selectable>{caption}</Text> : null}
+    </View>
+  );
+});
 
 function TableBlock({
   headers,
@@ -101,9 +266,13 @@ function TableBlock({
 }) {
   const renderCell = (spans: InlineSpan[], key: string, header = false) => (
     <View key={key} style={[styles.tableCell, header && styles.tableHeaderCell]}>
-      <Text style={header ? styles.tableHeaderText : styles.tableText} selectable>
-        <Spans spans={spans} projectRoot={projectRoot} onOpenFile={onOpenFile} />
-      </Text>
+      {hasMath(spans) ? (
+        <MathSpans spans={spans} variant={header ? "tableHeader" : "table"} />
+      ) : (
+        <Text style={header ? styles.tableHeaderText : styles.tableText} selectable>
+          <Spans spans={spans} projectRoot={projectRoot} onOpenFile={onOpenFile} />
+        </Text>
+      )}
     </View>
   );
 
@@ -180,8 +349,10 @@ const styles = StyleSheet.create({
   italic: { fontStyle: "italic" },
   heading: { color: "#fff", fontSize: 17, fontWeight: "700", lineHeight: 24, marginTop: 2 },
   headingSmall: { fontSize: 15 },
+  mathHeading: { marginTop: 2 },
   bulletRow: { flexDirection: "row", gap: 8, paddingLeft: 2 },
   bulletMark: { color: "#7aa2f7", fontSize: 15, lineHeight: 22, minWidth: 14 },
+  mathBulletBody: { flex: 1 },
   inlineCode: {
     fontFamily: MONOSPACE_FONT,
     fontSize: 13,
@@ -197,6 +368,34 @@ const styles = StyleSheet.create({
   quote: { borderLeftWidth: 3, borderLeftColor: "#3a3a46", paddingLeft: 10 },
   quoteText: { color: "#a8a8b4", fontSize: 14, lineHeight: 21 },
   rule: { height: 1, backgroundColor: "#26262e", marginVertical: 4 },
+  imageCard: {
+    width: "100%",
+    overflow: "hidden",
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: "#363642",
+    borderRadius: 10,
+    backgroundColor: "#111116",
+  },
+  image: { width: "100%", minHeight: 120, maxHeight: 420, backgroundColor: "#0b0b0e" },
+  imagePlaceholder: {
+    minHeight: 150,
+    padding: 18,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+  },
+  imageStatus: { color: "#a8a8b4", fontSize: 12 },
+  imageError: { color: "#c8a56a", fontSize: 12, lineHeight: 17, textAlign: "center" },
+  imageOpen: { color: "#8eb2ff", fontSize: 11 },
+  imageCaption: {
+    color: "#8d8d99",
+    fontSize: 11,
+    lineHeight: 16,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: "#2b2b34",
+  },
   tableScroll: {
     maxWidth: "100%",
     borderWidth: StyleSheet.hairlineWidth,

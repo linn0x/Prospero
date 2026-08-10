@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   FlatList,
@@ -88,6 +88,20 @@ export function WorkspacePicker({
     [conn],
   );
 
+  // Modal.onShow 在部分原生呈现/快速重开路径上不会再次触发。可见性才是数据
+  // 生命周期的真实来源：先发请求再做入场动画，目录行不会永远卡在 disabled。
+  useEffect(() => {
+    if (!visible) {
+      requestId.current += 1;
+      return;
+    }
+    const timer = setTimeout(() => void load(initialPath), 0);
+    return () => {
+      clearTimeout(timer);
+      requestId.current += 1;
+    };
+  }, [visible, initialPath, load]);
+
   const close = (): void => {
     requestId.current += 1;
     onClose();
@@ -114,7 +128,6 @@ export function WorkspacePicker({
       visible={visible}
       animationType="slide"
       presentationStyle={Platform.OS === "ios" ? "pageSheet" : "fullScreen"}
-      onShow={() => void load(initialPath)}
       onRequestClose={close}
     >
       <View style={styles.screen}>
@@ -166,6 +179,7 @@ export function WorkspacePicker({
           <FlatList
             data={entries}
             keyExtractor={(item) => item.name}
+            keyboardShouldPersistTaps="always"
             contentContainerStyle={entries.length === 0 ? styles.emptyList : undefined}
             refreshControl={
               <RefreshControl

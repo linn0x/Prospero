@@ -17,12 +17,15 @@
  * - 决定值 ReviewDecision:"approved" | "approved_for_session" | {denied:{rejection}} | "abort"
  */
 import { spawn, type ChildProcess } from "node:child_process";
+import { existsSync } from "node:fs";
+import os from "node:os";
 import type {
   AgentEventBody,
   AgentQuestionAnswer,
   Attachment,
   FileDiff,
   PermissionReply,
+  ResumableConversation,
   SubagentStatus,
 } from "@prospero/protocol";
 import { needsApproval } from "../approval-policy.js";
@@ -49,6 +52,11 @@ function describeWindow(mins: number): string {
 }
 
 const START_TIMEOUT_MS = 30_000;
+
+function timestampMs(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return undefined;
+  return Math.round(value < 1_000_000_000_000 ? value * 1000 : value);
+}
 
 interface RpcMessage {
   id?: number | string;
@@ -117,6 +125,8 @@ export class CodexAdapter implements AgentAdapter {
   private modelCache: AgentModelCatalog | null = null;
   private nextId = 1;
   private buf = "";
+  /** app-server 的 stderr 必须持续排空，否则管道写满后子进程会假死。 */
+  private stderrTail = "";
   private readonly pendingRpc = new Map<number | string, (m: RpcMessage) => void>();
   private readonly approvals = new Map<string, PendingApproval>();
   private readonly questions = new Map<string, PendingQuestion>();
@@ -187,27 +197,7 @@ export class CodexAdapter implements AgentAdapter {
         ? this.opts.resumeState["effort"]
         : null;
     this.selectedMode = this.opts.resumeState?.["mode"] === "plan" ? "plan" : "default";
-    const proc = spawn("codex", ["app-server"], {
-      stdio: ["pipe", "pipe", "pipe"],
-      cwd: ctx.cwd,
-      env: { ...process.env },
-    });
-    this.proc = proc;
-    proc.stdout?.setEncoding("utf8");
-    proc.stdout?.on("data", (chunk: string) => this.onStdout(chunk));
-    proc.once("error", (e) => {
-      this.emit({ kind: "agent.error", message: `codex app-server 启动失败:${e.message}` });
-    });
-    proc.once("exit", (code) => {
-      if (code !== 0 && code !== null) {
-        this.emit({ kind: "agent.error", message: `codex app-server 退出,code=${String(code)}` });
-      }
-    });
-
-    await this.request("initialize", {
-      clientInfo: { name: "prospero", title: "Prospero", version: "0.0.1" },
-    });
-    this.notify("initialized", {});
+    await this.startAppServer(ctx.cwd);
 
     const resumeThreadId =
       typeof this.opts.resumeState?.["threadId"] === "string"
@@ -248,6 +238,133 @@ export class CodexAdapter implements AgentAdapter {
     this.threadId = threadId;
     this.persistNativeState();
     await this.discoverSubagents();
+  }
+
+  /** 启动并初始化 app-server；普通会话和只读本机索引查询共用同一握手。 */
+  private async startAppServer(cwd: string): Promise<void> {
+    this.stderrTail = "";
+    this.buf = "";
+    const proc = spawn("codex", ["app-server"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      cwd,
+      env: { ...process.env, ...this.ctx?.env },
+    });
+    this.proc = proc;
+    proc.stdout?.setEncoding("utf8");
+    proc.stdout?.on("data", (chunk: string) => this.onStdout(chunk));
+    proc.stderr?.setEncoding("utf8");
+    proc.stderr?.on("data", (chunk: string) => {
+      // 不把鉴权/路径等诊断整段持久化，只保留足够解释退出原因的尾部。
+      this.stderrTail = (this.stderrTail + chunk).slice(-2_000);
+    });
+    proc.once("error", (e) => {
+      if (this.proc !== proc) return;
+      this.proc = null;
+      const message = this.processFailure(`codex app-server 启动失败:${e.message}`);
+      this.failPending(message);
+      this.emit({ kind: "agent.error", message });
+    });
+    proc.once("exit", (code, signal) => {
+      if (this.proc !== proc) return;
+      this.proc = null;
+      const reason = code !== null ? `code=${String(code)}` : `signal=${signal ?? "unknown"}`;
+      const message = this.processFailure(`codex app-server 意外退出,${reason}`);
+      this.failPending(message);
+      this.emit({ kind: "agent.error", message });
+    });
+
+    await this.request("initialize", {
+      clientInfo: { name: "prospero", title: "Prospero", version: "0.0.1" },
+      // collaborationMode / Plan 属于 app-server 的实验字段。未在 initialize
+      // 显式协商时，新版 Codex 会接受会话却拒绝第一轮 turn/start。
+      capabilities: {
+        experimentalApi: true,
+        requestAttestation: false,
+      },
+    });
+    this.notify("initialized", {});
+  }
+
+  /** 读取 Codex 自己保存在 ~/.codex 的顶层 threads，不创建新会话。 */
+  static async searchLocalConversations(
+    query: string,
+    limit = 20,
+  ): Promise<ResumableConversation[]> {
+    const adapter = new CodexAdapter();
+    try {
+      await adapter.startAppServer(os.homedir());
+      const trimmed = query.trim();
+      let raw: { data?: unknown[] };
+      if (trimmed) {
+        try {
+          raw = (await adapter.request("thread/search", {
+            searchTerm: trimmed,
+            limit,
+            sortKey: "updated_at",
+            sortDirection: "desc",
+            archived: false,
+          })) as typeof raw;
+        } catch {
+          // 兼容尚未提供全文搜索 RPC 的 app-server。
+          raw = (await adapter.request("thread/list", {
+            searchTerm: trimmed,
+            limit,
+            sortKey: "updated_at",
+            sortDirection: "desc",
+            archived: false,
+          })) as typeof raw;
+        }
+      } else {
+        raw = (await adapter.request("thread/list", {
+          limit,
+          sortKey: "updated_at",
+          sortDirection: "desc",
+          archived: false,
+        })) as typeof raw;
+      }
+
+      const conversations: ResumableConversation[] = [];
+      for (const value of raw.data ?? []) {
+        if (!value || typeof value !== "object") continue;
+        const result = value as Record<string, unknown>;
+        const threadValue =
+          result["thread"] && typeof result["thread"] === "object"
+            ? result["thread"]
+            : result;
+        const thread = threadValue as Record<string, unknown>;
+        const id = typeof thread["id"] === "string" ? thread["id"] : "";
+        if (
+          !id ||
+          thread["ephemeral"] === true ||
+          typeof thread["parentThreadId"] === "string"
+        ) {
+          continue;
+        }
+        const preview = typeof thread["preview"] === "string" ? thread["preview"].trim() : "";
+        const snippet = typeof result["snippet"] === "string" ? result["snippet"].trim() : "";
+        const title =
+          typeof thread["name"] === "string" && thread["name"].trim()
+            ? thread["name"].trim()
+            : preview.split("\n")[0]?.trim() || "Codex 对话";
+        const updatedAt = timestampMs(thread["updatedAt"]);
+        const createdAt = timestampMs(thread["createdAt"]);
+        const cwd =
+          typeof thread["cwd"] === "string" && thread["cwd"] ? thread["cwd"] : os.homedir();
+        if (!existsSync(cwd)) continue;
+        conversations.push({
+          id,
+          agent: "codex",
+          title: title.slice(0, 500),
+          ...((snippet || preview) ? { preview: (snippet || preview).slice(0, 4000) } : {}),
+          cwd,
+          ...(createdAt !== undefined ? { createdAt } : {}),
+          updatedAt: updatedAt ?? createdAt ?? Date.now(),
+        });
+      }
+      return conversations.slice(0, limit);
+    } finally {
+      await adapter.dispose();
+    }
   }
 
   private persistNativeState(): void {
@@ -806,6 +923,19 @@ export class CodexAdapter implements AgentAdapter {
     this.proc?.stdin?.write(JSON.stringify(obj) + "\n");
   }
 
+  private processFailure(prefix: string): string {
+    const tail = this.stderrTail.trim().split("\n").at(-1)?.trim();
+    return tail ? `${prefix}: ${tail}` : prefix;
+  }
+
+  /** 子进程已死时立刻结束所有 RPC，不能让“启动中”再空等 30 秒。 */
+  private failPending(message: string): void {
+    for (const [id, finish] of [...this.pendingRpc]) {
+      this.pendingRpc.delete(id);
+      finish({ id, error: { code: -32_000, message } });
+    }
+  }
+
   private notify(method: string, params: Record<string, unknown>): void {
     this.write({ method, params });
   }
@@ -994,7 +1124,7 @@ export class CodexAdapter implements AgentAdapter {
   async compact(): Promise<void> {
     if (!this.threadId) throw new AdapterError("codex 会话尚未就绪");
     // 官方 app-server 原生方法；响应只表示已接受，完成由同一 thread 的
-    // turn/item 通知驱动，最终 turn/completed 会让 StructuredSession 回 idle。
+    // turn/item 通知驱动，最终 turn/completed 会让 StructuredSession 进入完成态。
     this.compactInFlight = true;
     try {
       await this.request("thread/compact/start", { threadId: this.threadId });
@@ -1175,8 +1305,10 @@ export class CodexAdapter implements AgentAdapter {
       this.respond(pending.rpcId, { answers: {} });
       this.questions.delete(reqId);
     }
-    this.proc?.kill();
+    const proc = this.proc;
     this.proc = null;
+    this.failPending("codex 会话已关闭");
+    proc?.kill();
     this.ctx = null;
     this.threadId = null;
     this.modelCache = null;
