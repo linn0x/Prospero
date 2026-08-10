@@ -73,11 +73,12 @@ export const font = {
 
 /** 会话/连接状态到颜色 —— 全 App 一套,不再各屏各写 */
 export const statusColor: Record<string, string> = {
-  running: color.success,
+  running: color.warn,
   starting: color.warn,
   waiting_approval: color.warn,
   waiting_input: color.accent,
-  idle: color.textDim,
+  idle: color.accent,
+  completed: color.success,
   done: color.textFaint,
   died: color.danger,
   connected: color.success,

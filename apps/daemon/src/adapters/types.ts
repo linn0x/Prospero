@@ -18,6 +18,8 @@ import type { ResolvedSkill } from "../composer-context.js";
 
 export interface AdapterContext {
   cwd: string;
+  /** 当前会话专属的进程环境（不含时可直接继承 daemon 环境）。 */
+  env?: Record<string, string>;
   /** 当前审批策略;适配器据此决定是否绕过人工确认 */
   approvalPolicy?: () => ApprovalPolicy;
   /** 适配器产出一条归一化事件 */

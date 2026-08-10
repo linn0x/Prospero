@@ -10,8 +10,8 @@
  * - term.ack 用于背压:daemon 依据未确认字节数暂停 PTY 读取。
  */
 
-// v5:slash 控制不再冒充普通 Prompt；新增模型/模式、原生 compact 与结构化问答。
-export const PROTOCOL_VERSION = 5;
+// v7:编排快照 / 人工 Gate，以及从手机创建 Goal 协调者会话。
+export const PROTOCOL_VERSION = 7;
 
 export type {
   AgentKind,
@@ -22,6 +22,11 @@ export type {
   PermissionReply,
   C2SHello,
   C2SSessionCreate,
+  C2SOrchestrationSnapshot,
+  C2SOrchestrationGateResolve,
+  ResumableConversation,
+  C2SConversationSearch,
+  ConversationResults,
   C2SWorkspaceList,
   C2SSessionAttach,
   C2SChatSend,
@@ -78,6 +83,12 @@ export type {
   S2CAgentControlResult,
   S2CPermissionRequest,
   S2CError,
+  OrchestrationRun,
+  OrchestrationTask,
+  OrchestrationDispatch,
+  OrchestrationGate,
+  OrchestrationSnapshot,
+  S2COrchestrationSnapshot,
   S2CMessage,
   PairingPayload,
   WorkspaceListing,

@@ -68,6 +68,122 @@ describe("结构化轨协议", () => {
     expect(() =>
       parseC2S({ type: "session.create", agent: "opencode", kind: "chat", cols: 80, rows: 24 }),
     ).toThrowError(ProtocolError);
+    expect(
+      parseC2S({
+        type: "session.create",
+        agent: "codex",
+        kind: "structured",
+        mode: "plan",
+        resume: { id: "thread-1", title: "已有对话" },
+        cols: 80,
+        rows: 24,
+      }),
+    ).toMatchObject({ mode: "plan", resume: { id: "thread-1" } });
+    expect(() =>
+      parseC2S({
+        type: "session.create",
+        agent: "codex",
+        mode: "ask",
+        cols: 80,
+        rows: 24,
+      }),
+    ).toThrowError(ProtocolError);
+    expect(
+      parseC2S({
+        type: "session.create",
+        agent: "codex",
+        kind: "structured",
+        goal: "把手机端做成可验收的编排面板",
+        cols: 80,
+        rows: 24,
+      }),
+    ).toMatchObject({ goal: "把手机端做成可验收的编排面板" });
+    expect(() =>
+      parseC2S({
+        type: "session.create",
+        agent: "codex",
+        goal: "不该创建 PTY Goal",
+        cols: 80,
+        rows: 24,
+      }),
+    ).toThrowError(ProtocolError);
+    expect(() =>
+      parseC2S({
+        type: "session.create",
+        agent: "codex",
+        kind: "structured",
+        goal: "不能接回旧会话",
+        resume: { id: "old-thread" },
+        cols: 80,
+        rows: 24,
+      }),
+    ).toThrowError(ProtocolError);
+  });
+
+  it("编排快照与手机 Gate 决策可往返校验", () => {
+    expect(
+      parseC2S({ type: "orchestration.gate.resolve", gateId: "gate-1", decision: "继续" }),
+    ).toMatchObject({ gateId: "gate-1" });
+    expect(
+      parseS2C({
+        type: "orchestration.snapshot",
+        snapshot: {
+          runs: [{
+            id: "run-1",
+            objective: "发布移动端",
+            status: "active",
+            coordinatorSessionId: "session-1",
+            createdAt: 1,
+            updatedAt: 1,
+          }],
+          tasks: [],
+          dispatches: [],
+          gates: [],
+        },
+      }),
+    ).toMatchObject({ type: "orchestration.snapshot", snapshot: { runs: [{ id: "run-1" }] } });
+  });
+
+  it("本机可恢复对话搜索与完成态可往返校验", () => {
+    expect(
+      parseC2S({
+        type: "conversation.search",
+        requestId: "search-1",
+        agent: "claude",
+        query: "Prospero",
+        limit: 12,
+      }),
+    ).toMatchObject({ requestId: "search-1", agent: "claude" });
+    expect(
+      parseS2C({
+        type: "conversation.results",
+        requestId: "search-1",
+        agent: "claude",
+        conversations: [{
+          id: "session-1",
+          agent: "claude",
+          title: "修复手机端",
+          cwd: "/tmp/prospero",
+          updatedAt: 123,
+        }],
+      }),
+    ).toMatchObject({ conversations: [{ id: "session-1" }] });
+    expect(
+      parseS2C({
+        type: "session.state",
+        session: {
+          id: "s1",
+          agent: "codex",
+          kind: "structured",
+          title: "Codex",
+          cwd: "/tmp",
+          status: "completed",
+          createdAt: 1,
+          cols: 80,
+          rows: 24,
+        },
+      }),
+    ).toMatchObject({ session: { status: "completed" } });
   });
 
   it("每种 agent 事件体都能往返校验", () => {

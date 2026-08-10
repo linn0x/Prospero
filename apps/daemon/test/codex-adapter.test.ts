@@ -52,9 +52,12 @@ async function waitFor(pred: () => boolean, what: string, timeoutMs = 120_000): 
 }
 
 describeIf("Codex 结构化会话", () => {
-  it("发消息 → 文本增量 → turn.end 且 msgId 与文本一致", async () => {
+  it("协商实验能力后带模型/协作模式发消息 → turn.end", async () => {
     const events: AgentEventBody[] = [];
     session = await startSession(events);
+    // 读取模型会让后续 turn/start 带 collaborationMode；未在 initialize 声明
+    // experimentalApi 时，Codex 正是在这一刻拒绝手机发出的第一条消息。
+    expect((await session.models()).models.length).toBeGreaterThan(0);
     await session.send("Reply with exactly the word PONG and nothing else.");
 
     await waitFor(
@@ -113,7 +116,7 @@ describeIf("Codex 结构化会话", () => {
       expect(
         restored[0]?.status,
         JSON.stringify(second.requireStructured(created.id).snapshot().events),
-      ).toBe("idle");
+      ).toBe("completed");
       await second.kill(created.id);
     } finally {
       await first.disposeAll();

@@ -55,57 +55,62 @@ export function useDiscovery(enabled: boolean): {
     let zc: ZeroconfLike | null = null;
     let scanTimer: ReturnType<typeof setTimeout> | null = null;
 
-    setHosts([]);
-    setUnavailable(false);
-    setTimedOut(false);
-
-    try {
-      // 动态 require:模块不存在时不至于让整个屏幕崩掉
-
-      const Zeroconf = require("react-native-zeroconf").default as new () => ZeroconfLike;
-      zc = new Zeroconf();
-    } catch {
-      setUnavailable(true);
-      return;
-    }
-
-    const onResolved = (service: ZeroconfService): void => {
+    // 扫描会立即清空旧结果并设置 loading；在 effect 完成后启动，避免同步
+    // setState 造成额外渲染。cleanup 会拦住因 enabled 切换而过期的启动任务。
+    queueMicrotask(() => {
       if (cancelled) return;
-      const addresses = (service.addresses ?? []).filter((a) => a.includes("."));
-      if (addresses.length === 0 || typeof service.port !== "number") return;
-      found = true;
-      setHosts((prev) => {
-        const name = service.name ?? service.host ?? addresses[0]!;
-        const rest = prev.filter((h) => h.name !== name);
-        return [...rest, { name, addresses, port: service.port! }];
-      });
-    };
+      setHosts([]);
+      setUnavailable(false);
+      setTimedOut(false);
 
-    zc.on("resolved", onResolved);
-    zc.on("error", () => {
-      if (!cancelled) {
+      try {
+        // 动态 require:模块不存在时不至于让整个屏幕崩掉
+        // eslint-disable-next-line @typescript-eslint/no-require-imports -- Expo Go 可缺少该原生模块。
+        const Zeroconf = require("react-native-zeroconf").default as new () => ZeroconfLike;
+        zc = new Zeroconf();
+      } catch {
+        setUnavailable(true);
+        return;
+      }
+
+      const onResolved = (service: ZeroconfService): void => {
+        if (cancelled) return;
+        const addresses = (service.addresses ?? []).filter((a) => a.includes("."));
+        if (addresses.length === 0 || typeof service.port !== "number") return;
+        found = true;
+        setHosts((prev) => {
+          const name = service.name ?? service.host ?? addresses[0]!;
+          const rest = prev.filter((h) => h.name !== name);
+          return [...rest, { name, addresses, port: service.port! }];
+        });
+      };
+
+      zc.on("resolved", onResolved);
+      zc.on("error", () => {
+        if (!cancelled) {
+          setUnavailable(true);
+          setScanning(false);
+        }
+      });
+
+      try {
+        setScanning(true);
+        zc.scan("prospero", "tcp", "local.");
+        scanTimer = setTimeout(() => {
+          if (cancelled) return;
+          setScanning(false);
+          if (!found) setTimedOut(true);
+          try {
+            zc?.stop();
+          } catch {
+            // 已停止或 ROM 的 NSD 实现抛错都不影响手动配对路径
+          }
+        }, SCAN_TIMEOUT_MS);
+      } catch {
         setUnavailable(true);
         setScanning(false);
       }
     });
-
-    try {
-      setScanning(true);
-      zc.scan("prospero", "tcp", "local.");
-      scanTimer = setTimeout(() => {
-        if (cancelled) return;
-        setScanning(false);
-        if (!found) setTimedOut(true);
-        try {
-          zc?.stop();
-        } catch {
-          // 已停止或 ROM 的 NSD 实现抛错都不影响手动配对路径
-        }
-      }, SCAN_TIMEOUT_MS);
-    } catch {
-      setUnavailable(true);
-      setScanning(false);
-    }
 
     return () => {
       cancelled = true;

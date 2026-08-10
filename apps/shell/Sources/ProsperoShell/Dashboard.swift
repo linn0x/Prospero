@@ -4,6 +4,7 @@ import SwiftUI
 private enum DashboardPage: String, CaseIterable, Identifiable {
   case overview
   case sessions
+  case goals
   case devices
   case logs
   case settings
@@ -14,6 +15,7 @@ private enum DashboardPage: String, CaseIterable, Identifiable {
     switch self {
     case .overview: "概览"
     case .sessions: "会话"
+    case .goals: "Goal"
     case .devices: "设备"
     case .logs: "日志"
     case .settings: "设置"
@@ -24,6 +26,7 @@ private enum DashboardPage: String, CaseIterable, Identifiable {
     switch self {
     case .overview: "square.grid.2x2"
     case .sessions: "bubble.left.and.text.bubble.right"
+    case .goals: "point.3.connected.trianglepath.dotted"
     case .devices: "iphone.and.arrow.forward"
     case .logs: "text.alignleft"
     case .settings: "gearshape"
@@ -52,6 +55,8 @@ struct ProsperoDashboard: View {
           OverviewDashboard(daemon: daemon)
         case .sessions:
           SessionsDashboard(daemon: daemon)
+        case .goals:
+          GoalsDashboard(daemon: daemon)
         case .devices:
           DevicesDashboard(daemon: daemon, pairing: pairing)
         case .logs:
@@ -419,7 +424,10 @@ private struct SessionManagementRow: View {
             NSWorkspace.shared.open(URL(fileURLWithPath: session.cwd))
           }
           Button("中断", action: interrupt)
-            .disabled(session.status == "idle" || session.status == "done" || session.status == "died")
+            .disabled(
+              session.status == "idle" || session.status == "completed" ||
+              session.status == "done" || session.status == "died"
+            )
           Button("结束", role: .destructive, action: kill)
         }
         .buttonStyle(.borderless)
@@ -449,6 +457,142 @@ private struct SessionManagementRow: View {
               }
               .padding(.leading, 8)
             }
+          }
+        }
+      }
+    }
+  }
+}
+
+private struct GoalsDashboard: View {
+  @Bindable var daemon: DaemonController
+  @State private var customDecisions: [String: String] = [:]
+  @State private var actionError: String?
+
+  private var runs: [OrchestrationStatus.Run] {
+    daemon.orchestration.runs.filter { $0.status == "active" }
+  }
+
+  var body: some View {
+    Group {
+      if runs.isEmpty {
+        ContentUnavailableView(
+          "没有进行中的 Goal",
+          systemImage: "point.3.connected.trianglepath.dotted",
+          description: Text("在 iPhone/iPad 的新会话页选择 Goal 后，协调者、任务与人工决策会显示在这里。")
+        )
+      } else {
+        List(runs) { run in
+          GoalRunRow(
+            run: run,
+            tasks: daemon.orchestration.tasks.filter { $0.runId == run.id },
+            dispatches: daemon.orchestration.dispatches.filter { $0.runId == run.id },
+            gates: daemon.orchestration.gates.filter { $0.runId == run.id && $0.status == "pending" },
+            customDecisions: $customDecisions,
+            resolve: resolveGate
+          )
+          .listRowSeparator(.hidden)
+          .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
+        }
+        .listStyle(.inset)
+      }
+    }
+    .navigationTitle("Goal")
+    .toolbar {
+      Button {
+        daemon.refresh()
+      } label: {
+        Label("刷新", systemImage: "arrow.clockwise")
+      }
+    }
+    .alert("无法提交决策", isPresented: Binding(
+      get: { actionError != nil },
+      set: { if !$0 { actionError = nil } }
+    )) {
+      Button("好") { actionError = nil }
+    } message: {
+      Text(actionError ?? "未知错误")
+    }
+  }
+
+  private func resolveGate(_ gate: OrchestrationStatus.Gate, decision: String) {
+    let trimmed = decision.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return }
+    Task {
+      if let error = await daemon.resolveGate(id: gate.id, decision: trimmed) {
+        actionError = error.isEmpty ? "daemon 拒绝了这次决策" : error
+      } else {
+        customDecisions[gate.id] = ""
+      }
+    }
+  }
+}
+
+private struct GoalRunRow: View {
+  let run: OrchestrationStatus.Run
+  let tasks: [OrchestrationStatus.Task]
+  let dispatches: [OrchestrationStatus.Dispatch]
+  let gates: [OrchestrationStatus.Gate]
+  @Binding var customDecisions: [String: String]
+  let resolve: (OrchestrationStatus.Gate, String) -> Void
+
+  private var completedTasks: Int { tasks.filter { $0.status == "done" }.count }
+  private var activeWorkers: Int {
+    dispatches.filter { $0.state == "starting" || $0.state == "running" }.count
+  }
+
+  var body: some View {
+    DashboardCard {
+      VStack(alignment: .leading, spacing: 14) {
+        HStack(alignment: .top, spacing: 12) {
+          Image(systemName: "point.3.connected.trianglepath.dotted")
+            .font(.title2)
+            .foregroundStyle(.purple)
+            .frame(width: 34, height: 34)
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+          VStack(alignment: .leading, spacing: 5) {
+            Text(run.objective).font(.headline)
+            Text("任务 \(completedTasks)/\(tasks.count) 已完成 · \(activeWorkers) 个 worker 运行中")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+          }
+          Spacer()
+          Text("进行中")
+            .font(.caption)
+            .foregroundStyle(.green)
+        }
+
+        if !gates.isEmpty {
+          Divider()
+          ForEach(gates) { gate in
+            VStack(alignment: .leading, spacing: 9) {
+              Label("需要你的决定", systemImage: "hand.raised.fill")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.orange)
+              Text(gate.question).font(.callout)
+              if gate.options.isEmpty {
+                HStack(spacing: 8) {
+                  TextField("输入决定", text: Binding(
+                    get: { customDecisions[gate.id] ?? "" },
+                    set: { customDecisions[gate.id] = $0 }
+                  ))
+                  .textFieldStyle(.roundedBorder)
+                  Button("确认") {
+                    resolve(gate, customDecisions[gate.id] ?? "")
+                  }
+                  .disabled((customDecisions[gate.id] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+              } else {
+                HStack(spacing: 8) {
+                  ForEach(gate.options, id: \.self) { option in
+                    Button(option) { resolve(gate, option) }
+                      .buttonStyle(.bordered)
+                  }
+                }
+              }
+            }
+            .padding(12)
+            .background(.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
           }
         }
       }

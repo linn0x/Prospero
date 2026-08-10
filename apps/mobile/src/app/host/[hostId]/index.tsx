@@ -1,17 +1,28 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ActivityIndicator,
   FlatList,
+  KeyboardAvoidingView,
+  Platform,
   Pressable,
   RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
   TextInput,
+  useWindowDimensions,
   View,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Stack, router, useFocusEffect, useLocalSearchParams } from "expo-router";
-import type { AgentKind, SessionInfo, SessionKind, SubagentStatus } from "@prospero/protocol";
+import type {
+  AgentKind,
+  OrchestrationSnapshot,
+  ResumableConversation,
+  SessionInfo,
+  SessionKind,
+  SubagentStatus,
+} from "@prospero/protocol";
 import { AgentIcon } from "@/components/AgentIcon";
 import { HostSummary } from "@/components/HostSummary";
 import { Icon } from "@/components/Icon";
@@ -31,14 +42,16 @@ const { color, font, radius, space } = theme;
 const AGENTS: AgentKind[] = ["claude", "codex", "opencode", "grok", "trae", "shell"];
 /** 有结构化适配器的 agent(会话会以对话形态呈现) */
 const STRUCTURED: AgentKind[] = ["claude", "codex", "opencode"];
+const RESUMABLE: AgentKind[] = ["claude", "codex"];
 
 const statusLabel: Record<SessionInfo["status"], string> = {
   starting: "启动中",
   running: "运行中",
   waiting_approval: "待审批",
   waiting_input: "待回答",
-  idle: "就绪",
-  done: "已完成",
+  idle: "空闲就绪",
+  completed: "运行完毕",
+  done: "会话结束",
   died: "已退出",
 };
 
@@ -59,6 +72,19 @@ const statusColor: Record<SessionInfo["status"], string> = {
   idle: theme.color.accent,
 } as Record<SessionInfo["status"], string>;
 
+function formatConversationDate(timestamp: number): string {
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return "时间未知";
+  const now = new Date();
+  const time = `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  if (date.toDateString() === now.toDateString()) return `今天 ${time}`;
+  return `${String(date.getMonth() + 1)}/${String(date.getDate())} ${time}`;
+}
+
+function projectNameFor(path: string): string {
+  return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
+}
+
 export default function HostScreen() {
   const { hostId, create, cmd } = useLocalSearchParams<{
     hostId: string;
@@ -68,18 +94,96 @@ export default function HostScreen() {
   const { host, conn, runtime } = useHostConnection(hostId);
   const [agent, setAgent] = useState<AgentKind>("claude");
   const [sessionKind, setSessionKind] = useState<SessionKind>("structured");
+  const [launchMode, setLaunchMode] = useState<"default" | "plan">("default");
+  const [launchIntent, setLaunchIntent] = useState<"conversation" | "goal">("conversation");
+  const [goal, setGoal] = useState("");
   const [cwd, setCwd] = useState("");
   const [banner, setBanner] = useState<string | null>(null);
   const [filter, setFilter] = useState<"all" | AgentKind>("all");
   const [composing, setComposing] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [workspacePath, setWorkspacePath] = useState("");
+  const [resumeQuery, setResumeQuery] = useState("");
+  const [resumeResults, setResumeResults] = useState<ResumableConversation[]>([]);
+  const [selectedResume, setSelectedResume] = useState<ResumableConversation | null>(null);
+  const [resumeLoading, setResumeLoading] = useState(false);
+  const [resumeLoaded, setResumeLoaded] = useState(false);
+  const [resumeError, setResumeError] = useState<string | null>(null);
   const [showArchived, setShowArchived] = useState(false);
   const [archivedIds, setArchivedIds] = useState<Set<string>>(() => new Set());
   const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(() => new Set());
+  const [orchestration, setOrchestration] = useState<OrchestrationSnapshot | null>(null);
   const pendingCreateRef = useRef(false);
   const deepLinkCreateRef = useRef<string | null>(null);
   const insets = useSafeAreaInsets();
+  const { width, height } = useWindowDimensions();
+  // 横屏手机、iPad、Android 平板用并列双栏；其余手机严格上下各占一半。
+  const wideComposer = width >= 720 || (width >= 600 && width > height);
+
+  const canSearchResume =
+    composing &&
+    launchIntent === "conversation" &&
+    sessionKind === "structured" &&
+    RESUMABLE.includes(agent) &&
+    runtime.status === "connected" &&
+    conn !== null;
+
+  // 空查询列最近会话；输入后做短 debounce，旧请求通过 effect cleanup 丢弃。
+  useEffect(() => {
+    if (!canSearchResume || !conn || (agent !== "claude" && agent !== "codex")) {
+      const reset = setTimeout(() => {
+        setResumeLoading(false);
+        setResumeError(null);
+        setResumeResults([]);
+        setResumeLoaded(false);
+      }, 0);
+      return () => clearTimeout(reset);
+    }
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      setResumeLoading(true);
+      setResumeError(null);
+      void conn
+        .localConversations(agent, resumeQuery, 20)
+        .then((conversations) => {
+          if (!cancelled) setResumeResults(conversations);
+        })
+        .catch((error: unknown) => {
+          if (!cancelled) {
+            setResumeResults([]);
+            setResumeError(error instanceof Error ? error.message : String(error));
+          }
+        })
+        .finally(() => {
+          if (!cancelled) {
+            setResumeLoading(false);
+            setResumeLoaded(true);
+          }
+        });
+    }, 280);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [agent, canSearchResume, conn, resumeQuery]);
+
+  // 编排状态是 daemon 的真相。前台轻量轮询让 iOS/Android 从后台回来后立刻收敛；
+  // 用户刚解开 Gate 时 daemon 也会立即回传，不必等下一个周期。
+  useFocusEffect(
+    useCallback(() => {
+      if (!conn || runtime.status !== "connected") return undefined;
+      const refresh = (): void => conn.orchestrationSnapshot();
+      refresh();
+      const off = conn.events.on("orchestrationSnapshot", (message) => {
+        setOrchestration(message.snapshot);
+      });
+      const timer = setInterval(refresh, 8_000);
+      return () => {
+        off();
+        clearInterval(timer);
+      };
+    }, [conn, runtime.status]),
+  );
 
   // 归档与项目展开状态属于这台手机的浏览偏好。每次从会话页回来都重读，
   // 这样在会话菜单里点“归档”后，主机页无需重建也能立刻同步。
@@ -128,6 +232,9 @@ export default function HostScreen() {
       if (!pendingCreateRef.current || !hostId) return;
       pendingCreateRef.current = false;
       setComposing(false);
+      setSelectedResume(null);
+      setLaunchIntent("conversation");
+      setGoal("");
       router.push(`/host/${hostId}/session/${sid}`);
     };
     const offSnap = conn.events.on("snapshot", (m) => enter(m.sid));
@@ -165,6 +272,10 @@ export default function HostScreen() {
     () => [...new Set(selectedPool.map((s) => s.agent))],
     [selectedPool],
   );
+  const selectedProjectSessions = useMemo(
+    () => (cwd.trim() ? all.filter((session) => session.cwd === cwd.trim()) : []),
+    [all, cwd],
+  );
 
   // 只报延迟,不报地址 —— 地址是内网拓扑,截图分享时不该跟着出去,
   // 而且连哪条线路是竞速自动决定的,用户无从干预
@@ -189,12 +300,34 @@ export default function HostScreen() {
 
   const submitCreate = (): void => {
     if (!conn || runtime.status !== "connected") return;
+    const objective = goal.trim();
+    if (launchIntent === "goal" && objective.length === 0) {
+      setBanner("请先写下 Goal，协调者才知道要完成什么。");
+      return;
+    }
     pendingCreateRef.current = true;
+    const sessionOptions =
+      launchIntent === "goal"
+        ? {
+            goal: objective,
+            ...(RESUMABLE.includes(agent) ? { mode: "plan" as const } : {}),
+          }
+        : sessionKind === "structured" && RESUMABLE.includes(agent)
+          ? {
+              mode: launchMode,
+              ...(selectedResume
+                ? { resume: { id: selectedResume.id, title: selectedResume.title } }
+                : {}),
+            }
+          : undefined;
     conn.createSession(
       agent,
       cwd.trim() || undefined,
       undefined,
-      STRUCTURED.includes(agent) ? sessionKind : "pty",
+      launchIntent === "goal" ? "structured" : STRUCTURED.includes(agent) ? sessionKind : "pty",
+      80,
+      24,
+      sessionOptions,
     );
   };
 
@@ -255,11 +388,27 @@ export default function HostScreen() {
           ),
           headerRight: () =>
             composing ? (
-              <Pressable onPress={() => setComposing(false)} hitSlop={8}>
+              <Pressable
+                onPress={() => {
+                  setComposing(false);
+                  setSelectedResume(null);
+                  setLaunchIntent("conversation");
+                  setGoal("");
+                }}
+                hitSlop={8}
+              >
                 <Text style={styles.headerCancel}>取消</Text>
               </Pressable>
             ) : (
-              <Pressable onPress={() => setComposing(true)} hitSlop={8}>
+              <Pressable
+                onPress={() => {
+                  setLaunchIntent("conversation");
+                  setGoal("");
+                  setSelectedResume(null);
+                  setComposing(true);
+                }}
+                hitSlop={8}
+              >
                 <Icon name="plus" size={19} color="#7aa2f7" weight="semibold" />
               </Pressable>
             ),
@@ -291,7 +440,99 @@ export default function HostScreen() {
       )}
 
       {composing ? (
-        <View style={styles.newBox}>
+        <KeyboardAvoidingView
+          style={styles.launcher}
+          behavior={Platform.OS === "ios" ? "padding" : undefined}
+        >
+          <View style={[styles.launcherSplit, wideComposer && styles.launcherSplitWide]}>
+            <View style={[styles.projectPane, wideComposer && styles.projectPaneWide]}>
+              <View style={styles.paneHeader}>
+                <Text style={styles.paneTitle}>项目</Text>
+                <Text style={styles.paneMeta}>
+                  {selectedProjectSessions.length > 0
+                    ? `${String(selectedProjectSessions.length)} 个已有会话`
+                    : "选择本次工作的目录"}
+                </Text>
+              </View>
+              <Pressable
+                style={({ pressed }) => [styles.selectedProjectCard, pressed && styles.cardPressed]}
+                onPress={() => setPickerOpen(true)}
+                disabled={runtime.status !== "connected"}
+                accessibilityRole="button"
+                accessibilityLabel={cwd.trim() ? "更换项目目录" : "选择项目目录"}
+              >
+                <View style={styles.selectedProjectIcon}>
+                  <Icon name="folder.fill" size={20} color={color.accent} />
+                </View>
+                <View style={styles.selectedProjectCopy}>
+                  <Text style={styles.selectedProjectName} numberOfLines={1}>
+                    {cwd.trim() ? projectNameFor(cwd.trim()) : "未选择项目"}
+                  </Text>
+                  <Text style={styles.selectedProjectPath} numberOfLines={2}>
+                    {cwd.trim() || (wideComposer ? "输入完整路径，或从 Mac 浏览选择" : "从 Mac 浏览选择目录")}
+                  </Text>
+                  {!wideComposer && <Text style={styles.selectedProjectChange}>点按更换</Text>}
+                </View>
+              </Pressable>
+              {wideComposer && <View style={styles.cwdRow}>
+                <View style={styles.cwdField}>
+                  <Icon name="folder.fill" size={16} color={color.textDim} />
+                  <TextInput
+                    style={styles.cwdInput}
+                    placeholder="项目目录"
+                    placeholderTextColor={color.textFaint}
+                    selectionColor={color.accent}
+                    value={cwd}
+                    onChangeText={(value) => {
+                      setCwd(value);
+                      setWorkspacePath("");
+                    }}
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    spellCheck={false}
+                    clearButtonMode="while-editing"
+                    keyboardAppearance="dark"
+                    accessibilityLabel="工作目录"
+                  />
+                </View>
+                <Pressable
+                  style={({ pressed }) => [
+                    styles.browseBtn,
+                    runtime.status !== "connected" && styles.btnDisabled,
+                    pressed && styles.browseBtnPressed,
+                  ]}
+                  disabled={runtime.status !== "connected"}
+                  onPress={() => setPickerOpen(true)}
+                  accessibilityLabel="浏览 Mac 上的目录"
+                >
+                  <Text style={styles.browseBtnText}>浏览</Text>
+                </Pressable>
+              </View>}
+              {wideComposer && selectedProjectSessions.slice(0, 3).map((session) => (
+                <Pressable
+                  key={session.id}
+                  style={({ pressed }) => [styles.projectSessionHint, pressed && styles.cardPressed]}
+                  onPress={() => router.push(`/host/${hostId}/session/${session.id}`)}
+                  accessibilityLabel={`打开已有会话 ${session.title}`}
+                >
+                  <View style={[styles.dot, { backgroundColor: statusColor[session.status] }]} />
+                  <Text style={styles.projectSessionHintText} numberOfLines={1}>{session.title}</Text>
+                  <Icon name="chevron.right" size={11} color={color.textFaint} />
+                </Pressable>
+              ))}
+              <Text style={[styles.projectPaneHelp, !wideComposer && styles.projectPaneHelpCompact]}>
+                {workspacePath === ""
+                  ? "目录决定会话归属；这里始终显示本次会话对应的项目。"
+                  : `已从目录浏览器选择：~/${workspacePath}`}
+              </Text>
+            </View>
+
+            <ScrollView
+              style={styles.configPane}
+              contentContainerStyle={[styles.configBox, { paddingBottom: Math.max(insets.bottom, space.lg) }]}
+              keyboardShouldPersistTaps="handled"
+              nestedScrollEnabled
+            >
           <Text style={styles.formLabel}>运行方式</Text>
           <View style={styles.chips}>
             {AGENTS.map((a) => (
@@ -300,6 +541,13 @@ export default function HostScreen() {
                 onPress={() => {
                   setAgent(a);
                   setSessionKind(STRUCTURED.includes(a) ? "structured" : "pty");
+                  setLaunchMode("default");
+                  setLaunchIntent("conversation");
+                  setGoal("");
+                  setResumeQuery("");
+                  setResumeResults([]);
+                  setResumeLoaded(false);
+                  setSelectedResume(null);
                 }}
                 style={[styles.chip, agent === a && styles.chipActive]}
               >
@@ -345,7 +593,11 @@ export default function HostScreen() {
                 </Pressable>
                 <Pressable
                   style={[styles.kindOption, sessionKind === "pty" && styles.kindOptionActive]}
-                  onPress={() => setSessionKind("pty")}
+                  onPress={() => {
+                    setSessionKind("pty");
+                    setLaunchIntent("conversation");
+                    setSelectedResume(null);
+                  }}
                   accessibilityRole="tab"
                   accessibilityState={{ selected: sessionKind === "pty" }}
                   accessibilityLabel="创建终端会话"
@@ -370,52 +622,203 @@ export default function HostScreen() {
                   ? "消息、工具调用和审批以卡片展示"
                   : `启动 ${agent} TUI，可直接操作完整终端`}
               </Text>
+              {sessionKind === "structured" && (
+                <>
+                  <Text style={[styles.formLabel, styles.kindLabel]}>发起方式</Text>
+                  <View style={styles.kindSwitch} accessibilityRole="tablist">
+                    <Pressable
+                      style={[styles.kindOption, launchIntent === "conversation" && styles.kindOptionActive]}
+                      onPress={() => setLaunchIntent("conversation")}
+                      accessibilityRole="tab"
+                      accessibilityState={{ selected: launchIntent === "conversation" }}
+                    >
+                      <Icon
+                        name="bubble.left.and.text.bubble.right"
+                        size={14}
+                        color={launchIntent === "conversation" ? color.text : color.textDim}
+                      />
+                      <Text style={[styles.kindOptionText, launchIntent === "conversation" && styles.kindOptionTextActive]}>
+                        对话
+                      </Text>
+                    </Pressable>
+                    <Pressable
+                      style={[styles.kindOption, launchIntent === "goal" && styles.kindOptionActive]}
+                      onPress={() => {
+                        setLaunchIntent("goal");
+                        setSelectedResume(null);
+                      }}
+                      accessibilityRole="tab"
+                      accessibilityState={{ selected: launchIntent === "goal" }}
+                      accessibilityLabel="创建 Goal 协调者会话"
+                    >
+                      <Icon
+                        name="command"
+                        size={14}
+                        color={launchIntent === "goal" ? color.text : color.textDim}
+                      />
+                      <Text style={[styles.kindOptionText, launchIntent === "goal" && styles.kindOptionTextActive]}>
+                        Goal
+                      </Text>
+                    </Pressable>
+                  </View>
+                  <Text style={styles.kindHelp}>
+                    {launchIntent === "goal"
+                      ? "创建协调者与 Run；它会拆分任务、派发 worker，并在需要时向你请求决策"
+                      : "普通对话只启动一个 Agent 会话"}
+                  </Text>
+                </>
+              )}
+              {sessionKind === "structured" && launchIntent === "conversation" && RESUMABLE.includes(agent) && (
+                <>
+                  <Text style={[styles.formLabel, styles.kindLabel]}>启动模式</Text>
+                  <View style={styles.kindSwitch} accessibilityRole="tablist">
+                    <Pressable
+                      style={[styles.kindOption, launchMode === "default" && styles.kindOptionActive]}
+                      onPress={() => setLaunchMode("default")}
+                      accessibilityRole="tab"
+                      accessibilityState={{ selected: launchMode === "default" }}
+                    >
+                      <Icon
+                        name="bubble.left.and.text.bubble.right"
+                        size={14}
+                        color={launchMode === "default" ? color.text : color.textDim}
+                      />
+                      <Text
+                        style={[
+                          styles.kindOptionText,
+                          launchMode === "default" && styles.kindOptionTextActive,
+                        ]}
+                      >
+                        执行
+                      </Text>
+                    </Pressable>
+                    <Pressable
+                      style={[styles.kindOption, launchMode === "plan" && styles.kindOptionActive]}
+                      onPress={() => setLaunchMode("plan")}
+                      accessibilityRole="tab"
+                      accessibilityState={{ selected: launchMode === "plan" }}
+                    >
+                      <Icon
+                        name="doc.on.doc"
+                        size={14}
+                        color={launchMode === "plan" ? color.text : color.textDim}
+                      />
+                      <Text
+                        style={[
+                          styles.kindOptionText,
+                          launchMode === "plan" && styles.kindOptionTextActive,
+                        ]}
+                      >
+                        Plan
+                      </Text>
+                    </Pressable>
+                  </View>
+                  <Text style={styles.kindHelp}>
+                    {launchMode === "plan" ? "先调查、提问并形成计划" : "直接执行任务并允许工具操作"}
+                  </Text>
+
+                  <Text style={[styles.formLabel, styles.kindLabel]}>接回本机对话</Text>
+                  <View style={styles.resumeSearch}>
+                    <Icon name="magnifyingglass" size={14} color={color.textDim} />
+                    <TextInput
+                      value={resumeQuery}
+                      onChangeText={(value) => {
+                        setResumeQuery(value);
+                        setSelectedResume(null);
+                        setResumeLoaded(false);
+                      }}
+                      style={styles.resumeInput}
+                      placeholder="搜索标题、提示词或目录"
+                      placeholderTextColor={color.textFaint}
+                      selectionColor={color.accent}
+                      autoCapitalize="none"
+                      autoCorrect={false}
+                      clearButtonMode="while-editing"
+                      keyboardAppearance="dark"
+                      accessibilityLabel="搜索本机可恢复对话"
+                    />
+                    {resumeLoading && <ActivityIndicator size="small" color={color.accent} />}
+                  </View>
+                  {resumeError && <Text style={styles.resumeError}>{resumeError}</Text>}
+                  {resumeLoaded && !resumeLoading && !resumeError && resumeResults.length === 0 && (
+                    <Text style={styles.resumeEmpty}>
+                      {resumeQuery.trim() ? "没有匹配的本机对话" : "没有找到可恢复的本机对话"}
+                    </Text>
+                  )}
+                  {resumeResults.length > 0 && (
+                    <ScrollView
+                      style={styles.resumeList}
+                      contentContainerStyle={styles.resumeListContent}
+                      nestedScrollEnabled
+                      keyboardShouldPersistTaps="handled"
+                    >
+                      {resumeResults.map((conversation) => {
+                        const selected = selectedResume?.id === conversation.id;
+                        return (
+                          <Pressable
+                            key={conversation.id}
+                            style={({ pressed }) => [
+                              styles.resumeRow,
+                              selected && styles.resumeRowSelected,
+                              pressed && styles.cardPressed,
+                            ]}
+                            onPress={() => {
+                              setSelectedResume(selected ? null : conversation);
+                              if (!selected) {
+                                setCwd(conversation.cwd);
+                                setWorkspacePath("");
+                              }
+                            }}
+                            accessibilityRole="button"
+                            accessibilityState={{ selected }}
+                            accessibilityLabel={`恢复对话 ${conversation.title}`}
+                          >
+                            <View style={styles.resumeCopy}>
+                              <Text style={styles.resumeTitle} numberOfLines={1}>
+                                {conversation.title}
+                              </Text>
+                              {conversation.preview && (
+                                <Text style={styles.resumePreview} numberOfLines={1}>
+                                  {conversation.preview}
+                                </Text>
+                              )}
+                              <Text style={styles.resumeMeta} numberOfLines={1}>
+                                {formatConversationDate(conversation.updatedAt)} · {conversation.cwd}
+                              </Text>
+                            </View>
+                            {selected && (
+                              <Icon name="checkmark.circle.fill" size={17} color={color.accent} />
+                            )}
+                          </Pressable>
+                        );
+                      })}
+                    </ScrollView>
+                  )}
+                </>
+              )}
+              {sessionKind === "structured" && launchIntent === "goal" && (
+                <>
+                  <Text style={[styles.formLabel, styles.kindLabel]}>Goal</Text>
+                  <TextInput
+                    value={goal}
+                    onChangeText={setGoal}
+                    style={styles.goalInput}
+                    placeholder="例如：完成移动端 iOS/Android 适配并验收"
+                    placeholderTextColor={color.textFaint}
+                    selectionColor={color.accent}
+                    multiline
+                    textAlignVertical="top"
+                    autoCorrect
+                    keyboardAppearance="dark"
+                    accessibilityLabel="Goal 目标"
+                  />
+                  <Text style={styles.kindHelp}>
+                    Goal 会创建新的协调者会话，不能接回已有原生对话；Claude 和 Codex 会从 Plan 开始。
+                  </Text>
+                </>
+              )}
             </>
           )}
-          <Text style={[styles.formLabel, styles.cwdLabel]}>项目目录</Text>
-          <View style={styles.cwdRow}>
-            {/* 输入框必须放在有确定高度的横向容器里。之前外层是默认纵向布局，
-                TextInput 却用了 flex:1，iOS 会把可编辑区域压到几乎 0 高。 */}
-            <View style={styles.cwdField}>
-              <Icon name="folder.fill" size={16} color={color.textDim} />
-              <TextInput
-                style={styles.cwdInput}
-                placeholder="选择目录；同目录的会话归为一个项目"
-                placeholderTextColor={color.textFaint}
-                selectionColor={color.accent}
-                value={cwd}
-                onChangeText={(value) => {
-                  setCwd(value);
-                  setWorkspacePath("");
-                }}
-                onSubmitEditing={submitCreate}
-                autoCapitalize="none"
-                autoCorrect={false}
-                spellCheck={false}
-                clearButtonMode="while-editing"
-                keyboardAppearance="dark"
-                returnKeyType="done"
-                accessibilityLabel="工作目录"
-              />
-            </View>
-            <Pressable
-              style={({ pressed }) => [
-                styles.browseBtn,
-                runtime.status !== "connected" && styles.btnDisabled,
-                pressed && styles.browseBtnPressed,
-              ]}
-              disabled={runtime.status !== "connected"}
-              onPress={() => setPickerOpen(true)}
-              accessibilityLabel="浏览 Mac 上的目录"
-            >
-              <Text style={styles.browseBtnText}>浏览</Text>
-            </Pressable>
-          </View>
-          <Text style={styles.cwdHelp}>
-            {workspacePath === ""
-              ? "一个目录就是一个项目；可输入完整路径或浏览选择"
-              : `项目目录：~/${workspacePath}`}
-          </Text>
           <Pressable
             style={({ pressed }) => [
               styles.createBtn,
@@ -425,9 +828,19 @@ export default function HostScreen() {
             disabled={runtime.status !== "connected"}
             onPress={submitCreate}
           >
-            <Text style={styles.createBtnText}>新建会话</Text>
+            <Text style={styles.createBtnText}>
+              {launchIntent === "goal"
+                ? "启动 Goal 协调者"
+                : sessionKind === "structured" && selectedResume
+                ? "恢复并打开对话"
+                : sessionKind === "structured" && launchMode === "plan"
+                  ? "新建 Plan 会话"
+                  : "新建会话"}
+            </Text>
           </Pressable>
-        </View>
+            </ScrollView>
+          </View>
+        </KeyboardAvoidingView>
       ) : all.length > 0 ? (
         <ScrollView
           horizontal
@@ -469,7 +882,7 @@ export default function HostScreen() {
         </ScrollView>
       ) : null}
 
-      <FlatList
+      {!composing && <FlatList
         data={projects}
         keyExtractor={(project) => project.path}
         keyboardDismissMode="interactive"
@@ -483,14 +896,21 @@ export default function HostScreen() {
           />
         }
         ListHeaderComponent={
-          <HostSummary
-            info={runtime.hostInfo}
-            conn={conn}
-            connected={runtime.status === "connected"}
-            rttMs={runtime.rttMs}
-            sessionCount={currentSessions.length}
-            runningCount={runningCount}
-          />
+          <>
+            <HostSummary
+              info={runtime.hostInfo}
+              conn={conn}
+              connected={runtime.status === "connected"}
+              rttMs={runtime.rttMs}
+              sessionCount={currentSessions.length}
+              runningCount={runningCount}
+            />
+            <GoalRunsPanel
+              snapshot={orchestration}
+              hostId={hostId}
+              onResolveGate={(gateId, decision) => conn?.resolveOrchestrationGate(gateId, decision)}
+            />
+          </>
         }
         ListEmptyComponent={
           <Text style={styles.emptyText}>
@@ -521,6 +941,9 @@ export default function HostScreen() {
                     onPress: () => {
                       setCwd(project.path);
                       setWorkspacePath("");
+                      setLaunchIntent("conversation");
+                      setGoal("");
+                      setSelectedResume(null);
                       setComposing(true);
                     },
                   },
@@ -683,7 +1106,7 @@ export default function HostScreen() {
             </View>
           );
         }}
-      />
+      />}
       {conn && (
         <WorkspacePicker
           visible={pickerOpen}
@@ -716,6 +1139,98 @@ function FilterChip({
         {label}
       </Text>
     </Pressable>
+  );
+}
+
+function GoalRunsPanel({
+  snapshot,
+  hostId,
+  onResolveGate,
+}: {
+  snapshot: OrchestrationSnapshot | null;
+  hostId: string;
+  onResolveGate: (gateId: string, decision: string) => void;
+}) {
+  const [otherDecisions, setOtherDecisions] = useState<Record<string, string>>({});
+  const activeRuns = (snapshot?.runs ?? []).filter((run) => run.status === "active");
+  if (activeRuns.length === 0) return null;
+
+  return (
+    <View style={styles.goalPanel}>
+      <View style={styles.goalPanelHeader}>
+        <Text style={styles.goalPanelTitle}>Goal 编排</Text>
+        <Text style={styles.goalPanelMeta}>{String(activeRuns.length)} 个进行中</Text>
+      </View>
+      {activeRuns.slice(0, 3).map((run) => {
+        const tasks = (snapshot?.tasks ?? []).filter((task) => task.runId === run.id);
+        const completed = tasks.filter((task) => task.status === "done").length;
+        const active = tasks.filter(
+          (task) => task.status === "dispatched" || task.status === "blocked",
+        ).length;
+        const gates = (snapshot?.gates ?? []).filter(
+          (gate) => gate.runId === run.id && gate.status === "pending");
+        return (
+          <View key={run.id} style={styles.goalRunCard}>
+            <Pressable
+              disabled={run.coordinatorSessionId === null}
+              onPress={() => {
+                if (run.coordinatorSessionId) router.push(`/host/${hostId}/session/${run.coordinatorSessionId}`);
+              }}
+              style={({ pressed }) => [styles.goalRunTop, pressed && run.coordinatorSessionId && styles.cardPressed]}
+              accessibilityLabel="打开 Goal 协调者会话"
+            >
+              <View style={styles.goalRunCopy}>
+                <Text style={styles.goalRunObjective} numberOfLines={2}>{run.objective}</Text>
+                <Text style={styles.goalRunStats}>
+                  {`任务 ${String(completed)}/${String(tasks.length)} 已完成${active > 0 ? ` · ${String(active)} 处理中` : ""}`}
+                </Text>
+              </View>
+              {run.coordinatorSessionId && <Icon name="chevron.right" size={13} color={color.textFaint} />}
+            </Pressable>
+            {gates.map((gate) => (
+              <View key={gate.id} style={styles.gateCard}>
+                <Text style={styles.gateQuestion}>{gate.question}</Text>
+                {gate.options.length > 0 ? (
+                  <View style={styles.gateOptions}>
+                    {gate.options.map((option) => (
+                      <Pressable
+                        key={option}
+                        style={({ pressed }) => [styles.gateOption, pressed && styles.gateOptionPressed]}
+                        onPress={() => onResolveGate(gate.id, option)}
+                        accessibilityLabel={`选择 ${option}`}
+                      >
+                        <Text style={styles.gateOptionText}>{option}</Text>
+                      </Pressable>
+                    ))}
+                  </View>
+                ) : (
+                  <View style={styles.gateOtherRow}>
+                    <TextInput
+                      value={otherDecisions[gate.id] ?? ""}
+                      onChangeText={(value) =>
+                        setOtherDecisions((current) => ({ ...current, [gate.id]: value }))
+                      }
+                      style={styles.gateOtherInput}
+                      placeholder="输入决定"
+                      placeholderTextColor={color.textFaint}
+                      selectionColor={color.accent}
+                      accessibilityLabel="输入 Gate 决定"
+                    />
+                    <Pressable
+                      style={styles.gateConfirm}
+                      disabled={(otherDecisions[gate.id] ?? "").trim().length === 0}
+                      onPress={() => onResolveGate(gate.id, (otherDecisions[gate.id] ?? "").trim())}
+                    >
+                      <Text style={styles.gateConfirmText}>确认</Text>
+                    </Pressable>
+                  </View>
+                )}
+              </View>
+            ))}
+          </View>
+        );
+      })}
+    </View>
   );
 }
 
@@ -753,13 +1268,82 @@ const styles = StyleSheet.create({
   chips: { flexDirection: "row", flexWrap: "wrap", gap: space.sm },
   chipActive: { backgroundColor: color.accentDim },
   chipTextActive: { color: color.text, fontWeight: "600" },
+  launcher: { flex: 1, minHeight: 0 },
+  launcherSplit: { flex: 1, minHeight: 0, flexDirection: "column" },
+  launcherSplitWide: { flexDirection: "row" },
+  projectPane: {
+    flexGrow: 0,
+    flexShrink: 0,
+    maxHeight: 184,
+    paddingHorizontal: space.lg,
+    paddingVertical: space.lg,
+    gap: space.sm,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: color.border,
+  },
+  projectPaneWide: {
+    flex: 1,
+    maxHeight: undefined,
+    borderBottomWidth: 0,
+    borderRightWidth: StyleSheet.hairlineWidth,
+    borderRightColor: color.border,
+  },
+  configPane: { flex: 1, minHeight: 0 },
+  configBox: {
+    width: "100%",
+    maxWidth: 920,
+    alignSelf: "center",
+    gap: space.sm,
+    paddingHorizontal: space.lg,
+    paddingTop: space.lg,
+  },
+  paneHeader: { flexDirection: "row", alignItems: "baseline", justifyContent: "space-between", gap: space.sm },
+  paneTitle: { ...font.body, fontWeight: "700" },
+  paneMeta: { ...font.meta, color: color.textDim },
+  selectedProjectCard: {
+    minHeight: 68,
+    padding: space.md,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: space.md,
+    borderRadius: radius.md,
+    backgroundColor: color.surface,
+  },
+  selectedProjectIcon: {
+    width: 40,
+    height: 40,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: radius.sm,
+    backgroundColor: color.accentBg,
+  },
+  selectedProjectCopy: { flex: 1, gap: 3 },
+  selectedProjectName: { color: color.text, fontSize: 15, fontWeight: "700" },
+  selectedProjectPath: { ...font.meta, color: color.textDim },
+  selectedProjectChange: { color: color.accent, fontSize: 11, fontWeight: "600" },
+  projectSessionHint: {
+    minHeight: 34,
+    paddingHorizontal: space.sm,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: space.sm,
+    borderRadius: radius.sm,
+    backgroundColor: color.surfaceRaised,
+  },
+  projectSessionHintText: { flex: 1, color: color.textDim, fontSize: 12 },
+  projectPaneHelp: { ...font.meta, marginTop: "auto", color: color.textFaint, lineHeight: 16 },
+  projectPaneHelpCompact: { marginTop: 0 },
   newBox: {
+    width: "100%",
+    maxWidth: 920,
+    alignSelf: "center",
     gap: space.sm,
     paddingHorizontal: space.lg,
     paddingVertical: space.lg,
     borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: color.border,
   },
+  newBoxScroll: { flexGrow: 0, maxHeight: "72%" },
   formLabel: { ...font.meta, color: color.textDim, fontWeight: "600" },
   kindLabel: { marginTop: space.xs },
   kindSwitch: {
@@ -782,6 +1366,53 @@ const styles = StyleSheet.create({
   kindOptionText: { color: color.textDim, fontSize: 13, fontWeight: "500" },
   kindOptionTextActive: { color: color.text, fontWeight: "600" },
   kindHelp: { ...font.meta, marginLeft: 2 },
+  goalInput: {
+    minHeight: 92,
+    padding: space.md,
+    borderRadius: radius.md,
+    backgroundColor: color.surface,
+    color: color.text,
+    fontSize: 14,
+    lineHeight: 20,
+  },
+  resumeSearch: {
+    minHeight: 42,
+    paddingHorizontal: space.md,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: space.sm,
+    borderRadius: radius.md,
+    backgroundColor: color.surface,
+  },
+  resumeInput: {
+    flex: 1,
+    alignSelf: "stretch",
+    paddingVertical: 0,
+    color: color.text,
+    fontSize: 13,
+  },
+  resumeError: { ...font.meta, color: color.danger },
+  resumeEmpty: { ...font.meta, paddingVertical: 4, textAlign: "center" },
+  resumeList: {
+    maxHeight: 176,
+    borderRadius: radius.md,
+    backgroundColor: color.surface,
+  },
+  resumeListContent: { gap: StyleSheet.hairlineWidth, backgroundColor: color.border },
+  resumeRow: {
+    minHeight: 64,
+    paddingHorizontal: space.md,
+    paddingVertical: 9,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: space.sm,
+    backgroundColor: color.surface,
+  },
+  resumeRowSelected: { backgroundColor: color.accentBg },
+  resumeCopy: { flex: 1, gap: 2 },
+  resumeTitle: { color: color.text, fontSize: 13, fontWeight: "600" },
+  resumePreview: { color: color.textDim, fontSize: 11.5 },
+  resumeMeta: { color: color.textFaint, fontSize: 10 },
   cwdLabel: { marginTop: space.xs },
   createBtnText: { color: "#0A0A0C", fontSize: 15, fontWeight: "700" },
   btnDisabled: { opacity: 0.45 },
@@ -807,7 +1438,78 @@ const styles = StyleSheet.create({
   chipOn: { backgroundColor: color.accentDim },
   chipText: { ...font.sub, color: color.textDim },
   chipTextOn: { color: color.text, fontWeight: "600" },
-  list: { padding: space.lg, gap: space.md },
+  list: {
+    width: "100%",
+    maxWidth: 920,
+    alignSelf: "center",
+    padding: space.lg,
+    gap: space.md,
+  },
+  goalPanel: {
+    gap: space.sm,
+    padding: space.md,
+    borderRadius: radius.lg,
+    backgroundColor: color.surface,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
+  },
+  goalPanelHeader: { flexDirection: "row", alignItems: "baseline", justifyContent: "space-between" },
+  goalPanelTitle: { ...font.body, fontWeight: "700" },
+  goalPanelMeta: { ...font.meta, color: color.accent },
+  goalRunCard: {
+    overflow: "hidden",
+    borderRadius: radius.md,
+    backgroundColor: color.surfaceRaised,
+  },
+  goalRunTop: {
+    minHeight: 62,
+    paddingHorizontal: space.md,
+    paddingVertical: space.sm,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: space.sm,
+  },
+  goalRunCopy: { flex: 1, gap: 3 },
+  goalRunObjective: { color: color.text, fontSize: 13, fontWeight: "600", lineHeight: 18 },
+  goalRunStats: { ...font.meta, color: color.textDim },
+  gateCard: {
+    gap: space.sm,
+    padding: space.md,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: color.border,
+    backgroundColor: color.warnBg,
+  },
+  gateQuestion: { color: color.text, fontSize: 13, lineHeight: 18, fontWeight: "600" },
+  gateOptions: { flexDirection: "row", flexWrap: "wrap", gap: space.sm },
+  gateOption: {
+    minHeight: 34,
+    paddingHorizontal: space.md,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 999,
+    backgroundColor: color.surface,
+  },
+  gateOptionPressed: { backgroundColor: color.pressed },
+  gateOptionText: { color: color.accent, fontSize: 12, fontWeight: "600" },
+  gateOtherRow: { flexDirection: "row", gap: space.sm },
+  gateOtherInput: {
+    flex: 1,
+    minHeight: 38,
+    paddingHorizontal: space.md,
+    borderRadius: radius.sm,
+    color: color.text,
+    backgroundColor: color.surface,
+    fontSize: 13,
+  },
+  gateConfirm: {
+    minWidth: 54,
+    minHeight: 38,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: radius.sm,
+    backgroundColor: color.accentDim,
+  },
+  gateConfirmText: { color: color.accent, fontSize: 12, fontWeight: "700" },
   projectSection: {
     backgroundColor: color.surface,
     borderRadius: radius.lg,

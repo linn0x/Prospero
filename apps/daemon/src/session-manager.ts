@@ -54,6 +54,10 @@ export interface CreateSessionInput {
   approvalPolicy?: ApprovalPolicy | undefined;
   cwd?: string | undefined;
   command?: string | undefined;
+  /** 结构化会话从第一轮起使用的协作模式。 */
+  mode?: "default" | "plan" | undefined;
+  /** Agent 原生本机会话 ID；只允许 Claude/Codex 结构化轨。 */
+  resume?: { id: string; title?: string | undefined } | undefined;
   cols: number;
   rows: number;
   /** 来自设备注册表:该设备是否允许 shell/custom(完整用户权限) */
@@ -227,6 +231,8 @@ export interface SessionManagerOptions {
   tmux?: { home: string } | undefined;
   /** 测试注入；生产环境使用上面的各官方适配器。 */
   adapterFactory?: ((agent: AgentKind, state?: AdapterResumeState) => AgentAdapter) | undefined;
+  /** 每个会话各自注入的本地环境（编排 CLI 的身份和控制 socket 在这里进入）。 */
+  sessionEnv?: ((sessionId: string) => Record<string, string>) | undefined;
 }
 
 export class SessionManager extends EventEmitter<SessionManagerEvents> {
@@ -238,6 +244,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   private readonly metaFile: string | null;
   private readonly structuredFile: string | null;
   private readonly adapterFactory: (agent: AgentKind, state?: AdapterResumeState) => AgentAdapter;
+  private readonly sessionEnv: (sessionId: string) => Record<string, string>;
   private persistTimer: NodeJS.Timeout | null = null;
   private shuttingDown = false;
 
@@ -250,6 +257,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     const home = opts.home ?? opts.tmux?.home;
     this.structuredFile = home ? path.join(home, "structured-sessions.json") : null;
     this.adapterFactory = opts.adapterFactory ?? makeAdapter;
+    this.sessionEnv = opts.sessionEnv ?? (() => ({}));
   }
 
   /**
@@ -394,8 +402,14 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     if (kind === "structured" && !structuredCapable(input.agent)) {
       throw new SessionError(`agent "${input.agent}" 暂无结构化适配器`, "agent_unavailable");
     }
+    if (input.resume && (kind !== "structured" || (input.agent !== "claude" && input.agent !== "codex"))) {
+      throw new SessionError("只有 Claude/Codex 对话会话支持接回本机对话", "agent_unavailable");
+    }
+    if (input.mode && (kind !== "structured" || (input.agent !== "claude" && input.agent !== "codex"))) {
+      throw new SessionError("只有 Claude/Codex 对话会话支持 Plan 模式", "agent_unavailable");
+    }
     return kind === "structured"
-      ? this.createStructured(input.agent, cwd, input.approvalPolicy)
+      ? this.createStructured(input.agent, cwd, input.approvalPolicy, input.mode, input.resume)
       : this.createPty(input, cwd);
   }
 
@@ -437,6 +451,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     spec: { file: string; args: string[] } | undefined,
   ): SessionInfo {
     const base = spec ?? { file: "/bin/true", args: [] };
+    const sessionEnv = this.sessionEnv(id);
     const launch =
       this.tmuxBin && this.tmuxConfigFile
         ? tmux.wrapSpawn(base, {
@@ -446,6 +461,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
             rows,
             configFile: this.tmuxConfigFile,
             tmux: this.tmuxBin,
+            environment: sessionEnv,
           })
         : base;
     let session: PtySession;
@@ -454,7 +470,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
         id, agent, title, cwd, cols, rows,
         file: launch.file,
         args: launch.args,
-        env: spawnEnv(),
+        env: spawnEnv(sessionEnv),
       });
     } catch (e) {
       // node-pty 对不存在的可执行文件同步抛 posix_spawnp failed
@@ -474,15 +490,24 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     agent: AgentKind,
     cwd: string,
     approvalPolicy?: ApprovalPolicy,
+    mode?: "default" | "plan",
+    resume?: { id: string; title?: string | undefined },
   ): Promise<SessionInfo> {
     const id = randomUUID();
+    const initialAdapterState: AdapterResumeState = {
+      ...(mode ? { mode } : {}),
+      ...(resume && agent === "claude" ? { sessionId: resume.id } : {}),
+      ...(resume && agent === "codex" ? { threadId: resume.id } : {}),
+    };
+    const hasInitialAdapterState = Object.keys(initialAdapterState).length > 0;
     const session = this.makeStructuredSession(
       id,
       agent,
       cwd,
-      titleFor(agent, cwd),
+      resume?.title || titleFor(agent, cwd),
       undefined,
       approvalPolicy,
+      hasInitialAdapterState ? initialAdapterState : undefined,
     );
     this.structuredSessions.set(id, session);
     try {
@@ -508,15 +533,18 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     title: string,
     restored?: StructuredSessionPersistentState,
     approvalPolicy?: ApprovalPolicy,
+    initialAdapterState?: AdapterResumeState,
   ): StructuredSession {
     const session = new StructuredSession({
       id,
       agent,
       title,
       cwd,
-      adapter: this.adapterFactory(agent, restored?.adapterState),
+      adapter: this.adapterFactory(agent, restored?.adapterState ?? initialAdapterState),
+      environment: this.sessionEnv(id),
       ...(approvalPolicy !== undefined ? { approvalPolicy } : {}),
       ...(restored ? { restored } : {}),
+      ...(initialAdapterState ? { initialAdapterState } : {}),
     });
     session.on("event", (body, evSeq) => {
       this.emit("agentEvent", id, body, evSeq);

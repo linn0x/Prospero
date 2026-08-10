@@ -15,18 +15,20 @@ import {
   TextInput,
   View,
 } from "react-native";
-import type {
-  AgentEventBody,
-  AgentKind,
-  AgentQuestionAnswer,
-  PermissionReply,
-  SessionStatus,
-  SubagentStatus,
+import {
+  fromB64,
+  toB64,
+  type AgentEventBody,
+  type AgentKind,
+  type AgentQuestionAnswer,
+  type PermissionReply,
+  type SessionStatus,
+  type SubagentStatus,
 } from "@prospero/protocol";
 import { AgentIcon, agentTint } from "@/components/AgentIcon";
 import { DiffView } from "@/components/DiffView";
 import { Icon } from "@/components/Icon";
-import { Markdown } from "@/components/Markdown";
+import { Markdown, type ProjectImageLoader } from "@/components/Markdown";
 import { toast } from "@/components/Toast";
 import type { HostConnection } from "@/lib/connection";
 import {
@@ -74,6 +76,18 @@ interface Props {
   onOpenSubagent?: (subagentId: string) => void;
 }
 
+const PROJECT_IMAGE_CHUNK = 192 * 1024;
+const MAX_PROJECT_IMAGE_BYTES = 6 * 1024 * 1024;
+
+function projectImageMime(path: string): string {
+  const extension = path.slice(path.lastIndexOf(".") + 1).toLowerCase();
+  if (extension === "png") return "image/png";
+  if (extension === "jpg" || extension === "jpeg") return "image/jpeg";
+  if (extension === "gif") return "image/gif";
+  if (extension === "webp") return "image/webp";
+  throw new Error("只支持 PNG、JPEG、GIF 与 WebP 图片");
+}
+
 export const ChatView = memo(function ChatView({
   conn,
   sid,
@@ -90,9 +104,55 @@ export const ChatView = memo(function ChatView({
 }: Props) {
   const [items, setItems] = useState<ChatItem[]>([]);
   const listRef = useRef<FlatList<ChatDisplayItem>>(null);
+  const imageCacheRef = useRef(new Map<string, Promise<string>>());
   const evSeqRef = useRef(0);
   const atBottomRef = useRef(true);
   const [hasUnread, setHasUnread] = useState(false);
+
+  const loadProjectImage = useCallback<ProjectImageLoader>(
+    (reference) => {
+      const key = `${sid}\u0000${reference.path}`;
+      const cached = imageCacheRef.current.get(key);
+      if (cached) return cached;
+      const request = (async (): Promise<string> => {
+        const mime = projectImageMime(reference.path);
+        let offset = 0;
+        let total: number | null = null;
+        let bytes: Uint8Array | null = null;
+        for (;;) {
+          const chunk = await conn.fsGetChunk(sid, reference.path, offset, PROJECT_IMAGE_CHUNK);
+          if (total === null) {
+            total = chunk.total;
+            if (total <= 0) throw new Error("图片文件为空");
+            if (total > MAX_PROJECT_IMAGE_BYTES) throw new Error("图片超过 6 MB，请点按打开预览");
+            bytes = new Uint8Array(total);
+          } else if (chunk.total !== total) {
+            throw new Error("读取图片时文件大小发生了变化");
+          }
+          const part = fromB64(chunk.dataB64);
+          if (!bytes || offset + part.byteLength > bytes.byteLength) {
+            throw new Error("图片分块响应无效");
+          }
+          bytes.set(part, offset);
+          offset += part.byteLength;
+          if (chunk.eof) break;
+          if (part.byteLength === 0) throw new Error("图片传输提前中断");
+        }
+        if (!bytes || total === null || offset !== total) throw new Error("图片传输不完整");
+        return `data:${mime};base64,${toB64(bytes)}`;
+      })().catch((error: unknown) => {
+        imageCacheRef.current.delete(key);
+        throw error;
+      });
+      if (imageCacheRef.current.size >= 12) {
+        const oldest = imageCacheRef.current.keys().next().value as string | undefined;
+        if (oldest) imageCacheRef.current.delete(oldest);
+      }
+      imageCacheRef.current.set(key, request);
+      return request;
+    },
+    [conn, sid],
+  );
 
   useEffect(() => {
     // 文本 delta 往往几十次/秒。逐条 setState 会反复解析 Markdown、布局列表并
@@ -273,6 +333,7 @@ export const ChatView = memo(function ChatView({
                   item={item}
                   projectRoot={projectRoot}
                   onOpenFile={onOpenFile}
+                  loadProjectImage={loadProjectImage}
                 />
               );
             case "tool":
@@ -410,19 +471,13 @@ function useCopy(): (text: string, what?: string) => void {
 }
 
 const UserBubble = memo(function UserBubble({ item }: { item: UserItem }) {
-  const copy = useCopy();
   return (
     <View style={styles.userRow}>
-      <Pressable
-        style={styles.userBubble}
-        onLongPress={() => copy(item.text, "这条消息")}
-        delayLongPress={350}
-        accessibilityHint="长按复制"
-      >
+      <View style={styles.userBubble}>
         <Text style={styles.userText} selectable>
           {item.text}
         </Text>
-      </Pressable>
+      </View>
     </View>
   );
 });
@@ -435,22 +490,19 @@ const AssistantBubble = memo(function AssistantBubble({
   item,
   projectRoot,
   onOpenFile,
+  loadProjectImage,
 }: {
   item: AssistantItem;
   projectRoot?: string;
   onOpenFile?: (reference: ProjectFileReference) => void;
+  loadProjectImage: ProjectImageLoader;
 }) {
   const [showReasoning, setShowReasoning] = useState(false);
   const copy = useCopy();
   const cost = item.finish?.costUsd;
   const out = item.finish?.outputTokens;
   return (
-    <Pressable
-      style={styles.assistantRow}
-      onLongPress={() => copy(item.text, "回复")}
-      delayLongPress={350}
-      accessibilityHint="长按复制回复"
-    >
+    <View style={styles.assistantRow}>
       {item.reasoning.length > 0 && (
         <Pressable
           onPress={() => setShowReasoning((v) => !v)}
@@ -463,9 +515,14 @@ const AssistantBubble = memo(function AssistantBubble({
           </Text>
         </Pressable>
       )}
-      {showReasoning && <Text style={styles.reasoningText}>{item.reasoning}</Text>}
+      {showReasoning && <Text style={styles.reasoningText} selectable>{item.reasoning}</Text>}
       {item.text.length > 0 && (
-        <Markdown source={item.text} projectRoot={projectRoot} onOpenFile={onOpenFile} />
+        <Markdown
+          source={item.text}
+          projectRoot={projectRoot}
+          onOpenFile={onOpenFile}
+          loadProjectImage={loadProjectImage}
+        />
       )}
       {!item.done && item.text.length === 0 && item.reasoning.length === 0 && (
         <View style={styles.thinkingRow}>
@@ -479,7 +536,18 @@ const AssistantBubble = memo(function AssistantBubble({
           {cost !== undefined && cost > 0 ? ` · $${cost.toFixed(4)}` : ""}
         </Text>
       )}
-    </Pressable>
+      {item.text.length > 0 && (
+        <Pressable
+          style={({ pressed }) => [styles.copyReply, pressed && styles.inlinePressed]}
+          onPress={() => copy(item.text, "回复")}
+          accessibilityRole="button"
+          accessibilityLabel="复制完整回复"
+        >
+          <Icon name="doc.on.doc" size={11} color={color.textFaint} />
+          <Text style={styles.copyReplyText}>复制全文</Text>
+        </Pressable>
+      )}
+    </View>
   );
 });
 
@@ -972,6 +1040,9 @@ const styles = StyleSheet.create({
   list: { flex: 1, backgroundColor: color.bg },
   content: {
     flexGrow: 1,
+    width: "100%",
+    maxWidth: 920,
+    alignSelf: "center",
     paddingHorizontal: 14,
     paddingTop: 14,
     paddingBottom: 28,
@@ -1061,6 +1132,15 @@ const styles = StyleSheet.create({
     paddingLeft: 10,
   },
   usage: { color: color.textFaint, fontSize: 11, fontVariant: ["tabular-nums"] },
+  copyReply: {
+    alignSelf: "flex-start",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    paddingVertical: 3,
+    paddingRight: 6,
+  },
+  copyReplyText: { color: color.textFaint, fontSize: 10.5 },
 
   toolCard: {
     backgroundColor: color.surface,

@@ -21,6 +21,7 @@ final class DaemonController {
   private(set) var state: State = .stopped
   private(set) var status: DaemonStatus = .load()
   private(set) var running: RunningStatus?
+  private(set) var orchestration: OrchestrationStatus = .load()
   private(set) var recentLog: [String] = []
   /// `recentLog` 拼好的样子。日志窗口直接绑这个 —— 每次渲染都 joined() 一遍几百行
   /// 是笔看不见的开销,而日志刷新时渲染恰恰最频繁。
@@ -96,6 +97,7 @@ final class DaemonController {
   func refresh() {
     status = .load()
     running = RunningStatus.load().flatMap { $0.processAlive ? $0 : nil }
+    orchestration = .load()
 
     // 新绑定的设备 = 刚刚配对成功。这是唯一能观察到"手机那边连上了"的信号:
     // daemon 在握手时把客户端公钥写进 devices.json。
@@ -346,6 +348,34 @@ final class DaemonController {
         return String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
       }
       try? await Task.sleep(for: .milliseconds(300))
+      refresh()
+      return nil
+    } catch {
+      return error.localizedDescription
+    }
+  }
+
+  /// 人类在 Mac 上解开 Goal Gate；回环地址 + 每次启动生成的 token 与会话管理同级保护。
+  func resolveGate(id: String, decision: String) async -> String? {
+    guard let running, !running.controlToken.isEmpty else {
+      return "daemon 尚未提供本机控制接口"
+    }
+    let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+    guard let url = URL(
+      string: "http://127.0.0.1:\(running.port)/_prospero/control/orchestration/gate/\(encoded)/resolve"
+    ) else {
+      return "无法构造控制地址"
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("Bearer \(running.controlToken)", forHTTPHeaderField: "Authorization")
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try? JSONSerialization.data(withJSONObject: ["decision": decision])
+    do {
+      let (data, response) = try await URLSession.shared.data(for: request)
+      guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+        return String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+      }
       refresh()
       return nil
     } catch {

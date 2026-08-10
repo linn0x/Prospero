@@ -50,7 +50,6 @@ if (leftover) {
 
 const out = `// 本文件由 scripts/build-terminal-html.mjs 自动生成,请勿手工编辑。
 // 源:apps/daemon/term.html + node_modules/@xterm/*
-/* eslint-disable */
 export const TERMINAL_HTML = ${JSON.stringify(html)};
 `;
 

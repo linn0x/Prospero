@@ -38,6 +38,54 @@ describe("Markdown 解析", () => {
     expect(b[0]).toMatchObject({ type: "code" });
   });
 
+  it("解析 Codex 常用的展示公式定界符并保留换行", () => {
+    const bracket = parseMarkdown([
+      "说明：",
+      "",
+      "\\[",
+      "\\tau_\\text{执行器} >",
+      "\\tau_\\text{气动力} + \\tau_\\text{摩擦}",
+      "\\]",
+    ].join("\n"));
+    expect(bracket).toEqual([
+      { type: "paragraph", spans: [{ text: "说明：" }] },
+      {
+        type: "math",
+        expression: "\\tau_\\text{执行器} >\n\\tau_\\text{气动力} + \\tau_\\text{摩擦}",
+      },
+    ]);
+    expect(parseMarkdown("$$ E = mc^2 $$")).toEqual([
+      { type: "math", expression: "E = mc^2" },
+    ]);
+  });
+
+  it("流式输出中尚未闭合的展示公式也形成公式块", () => {
+    expect(parseMarkdown("\\[\nx^2 + y^2")).toEqual([
+      { type: "math", expression: "x^2 + y^2" },
+    ]);
+  });
+
+  it("解析行内公式但不把金额误判成 LaTeX", () => {
+    expect(parseInline("由 $E=mc^2$，也可写作 \\(a+b\\)；费用 $5 and $10")).toEqual([
+      { text: "由 " },
+      { text: "E=mc^2", math: true },
+      { text: "，也可写作 " },
+      { text: "a+b", math: true },
+      { text: "；费用 " },
+      { text: "$5 and $" },
+      { text: "10" },
+    ]);
+  });
+
+  it("把独占一行的 Markdown 图片解析成可渲染块", () => {
+    expect(parseMarkdown("![结构图](docs/diagram.png \"架构\")")).toEqual([
+      { type: "image", alt: "结构图", target: "docs/diagram.png", title: "架构" },
+    ]);
+    expect(parseMarkdown("![结果](<images/My Result.webp>)")).toEqual([
+      { type: "image", alt: "结果", target: "images/My Result.webp" },
+    ]);
+  });
+
   it("引用与分隔线", () => {
     const b = parseMarkdown("> 注意\n\n---");
     expect(b[0]).toMatchObject({ type: "quote" });

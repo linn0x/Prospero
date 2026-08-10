@@ -181,7 +181,12 @@ info "分发方式:  $METHOD"
 # 装进 Xcode 找得到的位置
 PROFILE_STORE="$HOME/Library/MobileDevice/Provisioning Profiles"
 mkdir -p "$PROFILE_STORE"
-cp "$PROFILE" "$PROFILE_STORE/$PROFILE_UUID.mobileprovision"
+PROFILE_DEST="$PROFILE_STORE/$PROFILE_UUID.mobileprovision"
+# 调用方可能直接传 Xcode 配置目录里已经安装好的描述文件。macOS 的 cp 在
+# 源和目标是同一文件时返回非零，而脚本启用了 set -e，不能因此中断整个构建。
+if [[ "$PROFILE" != "$PROFILE_DEST" ]]; then
+  cp "$PROFILE" "$PROFILE_DEST"
+fi
 
 fi
 

@@ -88,7 +88,15 @@ export default function FilesScreen(): React.ReactElement {
   );
 
   useEffect(() => {
-    void load("");
+    let cancelled = false;
+    // 在 effect 返回后再发起请求；load 会同步更新 loading，直接调用会触发
+    // React 的级联渲染检查。卸载或切换连接后不再启动过期请求。
+    queueMicrotask(() => {
+      if (!cancelled) void load("");
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [load]);
 
   const leaveEditor = useCallback((): void => {

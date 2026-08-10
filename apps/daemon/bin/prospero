@@ -1,0 +1,4 @@
+#!/usr/bin/env node
+// npm 会把这个文件链接为 `prospero`；daemon 自己也把本目录放进 worker 的 PATH，
+// 因此开发模式（尚未全局安装 package）同样可用。
+import "../dist/orchestration-cli.js";
