@@ -21,6 +21,7 @@ final class PairingModel {
   private(set) var phase: Phase = .idle
   var deviceName: String = "iphone"
   var allowShell: Bool = true
+  var allowOrchestration: Bool = true
 
   func generate() {
     guard let node = Locator.findNode(), let cli = Locator.findCLI() else {
@@ -31,6 +32,7 @@ final class PairingModel {
 
     var args = [cli, "pair", "--name", deviceName]
     if !allowShell { args.append("--no-shell") }
+    if !allowOrchestration { args.append("--no-orchestration") }
 
     Task.detached {
       let result = Self.run(node: node, args: args)

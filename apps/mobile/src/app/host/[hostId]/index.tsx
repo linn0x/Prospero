@@ -10,13 +10,14 @@ import {
   StyleSheet,
   Text,
   TextInput,
-  useWindowDimensions,
   View,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Stack, router, useFocusEffect, useLocalSearchParams } from "expo-router";
 import type {
+  AgentAccount,
   AgentKind,
+  CodeAgentKind,
   OrchestrationSnapshot,
   ResumableConversation,
   SessionInfo,
@@ -28,6 +29,7 @@ import { HostSummary } from "@/components/HostSummary";
 import { Icon } from "@/components/Icon";
 import { SwipeRow, type SwipeAction } from "@/components/SwipeRow";
 import { WorkspacePicker } from "@/components/WorkspacePicker";
+import { useAdaptiveLayout } from "@/lib/adaptive-layout";
 import {
   getSessionPreferences,
   setProjectCollapsed,
@@ -109,6 +111,10 @@ export default function HostScreen() {
   const [resumeLoading, setResumeLoading] = useState(false);
   const [resumeLoaded, setResumeLoaded] = useState(false);
   const [resumeError, setResumeError] = useState<string | null>(null);
+  const [agentAccounts, setAgentAccounts] = useState<AgentAccount[]>([]);
+  const [selectedAccountIds, setSelectedAccountIds] = useState<
+    Partial<Record<CodeAgentKind, string>>
+  >({});
   const [showArchived, setShowArchived] = useState(false);
   const [archivedIds, setArchivedIds] = useState<Set<string>>(() => new Set());
   const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(() => new Set());
@@ -116,9 +122,15 @@ export default function HostScreen() {
   const pendingCreateRef = useRef(false);
   const deepLinkCreateRef = useRef<string | null>(null);
   const insets = useSafeAreaInsets();
-  const { width, height } = useWindowDimensions();
+  const { width, height, verticalPanes } = useAdaptiveLayout();
   // 横屏手机、iPad、Android 平板用并列双栏；其余手机严格上下各占一半。
-  const wideComposer = width >= 720 || (width >= 600 && width > height);
+  const wideComposer =
+    verticalPanes !== null || width >= 720 || (width >= 600 && width > height);
+  const balancedPaneWidth = width / 2;
+  const composerPaneWidths = verticalPanes ?? {
+    start: balancedPaneWidth,
+    end: width - balancedPaneWidth,
+  };
 
   const canSearchResume =
     composing &&
@@ -127,6 +139,48 @@ export default function HostScreen() {
     RESUMABLE.includes(agent) &&
     runtime.status === "connected" &&
     conn !== null;
+  const codeAgent = agent === "claude" || agent === "codex" ? agent : null;
+  const matchingAccounts = codeAgent
+    ? agentAccounts.filter((account) => account.agent === codeAgent)
+    : [];
+  const selectedAccount = codeAgent
+    ? matchingAccounts.find((account) => account.id === selectedAccountIds[codeAgent]) ??
+      matchingAccounts.find((account) => account.isDefault) ??
+      matchingAccounts[0]
+    : undefined;
+
+  // 账号目录属于 Mac；每次回到主机页重读，确保账号管理页的新增/默认/删除立即生效。
+  useFocusEffect(
+    useCallback(() => {
+      if (!conn || runtime.status !== "connected" || !conn.supportsAgentAccounts) {
+        setAgentAccounts([]);
+        return undefined;
+      }
+      let cancelled = false;
+      void conn
+        .agentAccounts()
+        .then((next) => {
+          if (cancelled) return;
+          setAgentAccounts(next);
+          setSelectedAccountIds((current) => {
+            const updated = { ...current };
+            for (const kind of ["claude", "codex"] as const) {
+              const available = next.filter((account) => account.agent === kind);
+              if (!available.some((account) => account.id === updated[kind])) {
+                updated[kind] = available.find((account) => account.isDefault)?.id ?? available[0]?.id;
+              }
+            }
+            return updated;
+          });
+        })
+        .catch((failure: unknown) => {
+          if (!cancelled) setBanner(`账号状态读取失败: ${failure instanceof Error ? failure.message : String(failure)}`);
+        });
+      return () => {
+        cancelled = true;
+      };
+    }, [conn, runtime.status]),
+  );
 
   // 空查询列最近会话；输入后做短 debounce，旧请求通过 effect cleanup 丢弃。
   useEffect(() => {
@@ -144,7 +198,7 @@ export default function HostScreen() {
       setResumeLoading(true);
       setResumeError(null);
       void conn
-        .localConversations(agent, resumeQuery, 20)
+        .localConversations(agent, resumeQuery, 20, selectedAccount?.id)
         .then((conversations) => {
           if (!cancelled) setResumeResults(conversations);
         })
@@ -165,7 +219,7 @@ export default function HostScreen() {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [agent, canSearchResume, conn, resumeQuery]);
+  }, [agent, canSearchResume, conn, resumeQuery, selectedAccount?.id]);
 
   // 编排状态是 daemon 的真相。前台轻量轮询让 iOS/Android 从后台回来后立刻收敛；
   // 用户刚解开 Gate 时 daemon 也会立即回传，不必等下一个周期。
@@ -306,20 +360,32 @@ export default function HostScreen() {
       return;
     }
     pendingCreateRef.current = true;
-    const sessionOptions =
+    const accountOption = selectedAccount ? { accountId: selectedAccount.id } : {};
+    const sessionOptions:
+      | {
+          mode?: "default" | "plan";
+          resume?: { id: string; title?: string };
+          goal?: string;
+          accountId?: string;
+        }
+      | undefined =
       launchIntent === "goal"
         ? {
+            ...accountOption,
             goal: objective,
             ...(RESUMABLE.includes(agent) ? { mode: "plan" as const } : {}),
           }
         : sessionKind === "structured" && RESUMABLE.includes(agent)
           ? {
+              ...accountOption,
               mode: launchMode,
               ...(selectedResume
                 ? { resume: { id: selectedResume.id, title: selectedResume.title } }
                 : {}),
             }
-          : undefined;
+          : selectedAccount
+            ? accountOption
+            : undefined;
     conn.createSession(
       agent,
       cwd.trim() || undefined,
@@ -445,7 +511,16 @@ export default function HostScreen() {
           behavior={Platform.OS === "ios" ? "padding" : undefined}
         >
           <View style={[styles.launcherSplit, wideComposer && styles.launcherSplitWide]}>
-            <View style={[styles.projectPane, wideComposer && styles.projectPaneWide]}>
+            <View
+              style={[
+                styles.projectPane,
+                wideComposer && styles.projectPaneWide,
+                wideComposer && {
+                  flex: 0,
+                  width: composerPaneWidths.start,
+                },
+              ]}
+            >
               <View style={styles.paneHeader}>
                 <Text style={styles.paneTitle}>项目</Text>
                 <Text style={styles.paneMeta}>
@@ -527,8 +602,21 @@ export default function HostScreen() {
               </Text>
             </View>
 
+            {verticalPanes && (
+              <View
+                style={[styles.foldGutter, { width: verticalPanes.gap }]}
+                pointerEvents="none"
+              />
+            )}
+
             <ScrollView
-              style={styles.configPane}
+              style={[
+                styles.configPane,
+                wideComposer && {
+                  flex: 0,
+                  width: composerPaneWidths.end,
+                },
+              ]}
               contentContainerStyle={[styles.configBox, { paddingBottom: Math.max(insets.bottom, space.lg) }]}
               keyboardShouldPersistTaps="handled"
               nestedScrollEnabled
@@ -566,6 +654,69 @@ export default function HostScreen() {
               </Pressable>
             ))}
           </View>
+          {codeAgent && conn?.supportsAgentAccounts && (
+            <>
+              <View style={[styles.accountLabelRow, styles.kindLabel]}>
+                <Text style={styles.formLabel}>账号环境</Text>
+                <Pressable
+                  onPress={() => router.push(`/host/${hostId}/accounts`)}
+                  hitSlop={8}
+                  accessibilityLabel="管理 Code Agent 账号"
+                >
+                  <Text style={styles.accountManage}>管理</Text>
+                </Pressable>
+              </View>
+              <View style={styles.chips}>
+                {matchingAccounts.map((account) => {
+                  const active = selectedAccount?.id === account.id;
+                  return (
+                    <Pressable
+                      key={account.id}
+                      style={[styles.chip, active && styles.chipActive]}
+                      onPress={() => {
+                        setSelectedAccountIds((current) => ({
+                          ...current,
+                          [codeAgent]: account.id,
+                        }));
+                        setSelectedResume(null);
+                        setResumeResults([]);
+                        setResumeLoaded(false);
+                      }}
+                      accessibilityRole="button"
+                      accessibilityState={{ selected: active }}
+                    >
+                      <View
+                        style={[
+                          styles.accountDot,
+                          {
+                            backgroundColor:
+                              account.status === "signed_in"
+                                ? color.success
+                                : account.status === "unavailable"
+                                  ? color.warn
+                                  : color.textFaint,
+                          },
+                        ]}
+                      />
+                      <Text style={[styles.chipText, active && styles.chipTextActive]} numberOfLines={1}>
+                        {account.name}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+                <Pressable
+                  style={styles.chip}
+                  onPress={() => router.push(`/host/${hostId}/accounts`)}
+                >
+                  <Icon name="plus" size={12} color={color.accent} />
+                  <Text style={[styles.chipText, { color: color.accent }]}>新增</Text>
+                </Pressable>
+              </View>
+              <Text style={styles.kindHelp}>
+                配置和凭据彼此隔离；项目目录仍使用左侧所选路径。
+              </Text>
+            </>
+          )}
           {STRUCTURED.includes(agent) && (
             <>
               <Text style={[styles.formLabel, styles.kindLabel]}>界面</Text>
@@ -905,6 +1056,46 @@ export default function HostScreen() {
               sessionCount={currentSessions.length}
               runningCount={runningCount}
             />
+            {conn?.supportsAgentAccounts && (
+              <Pressable
+                style={({ pressed }) => [styles.orchestrationEntry, pressed && styles.cardPressed]}
+                onPress={() => router.push(`/host/${hostId}/accounts`)}
+                accessibilityRole="button"
+                accessibilityLabel="管理 Code Agent 账号"
+              >
+                <View style={styles.orchestrationEntryIcon}>
+                  <Icon name="square.stack.3d.up" size={19} color={color.accent} />
+                </View>
+                <View style={styles.orchestrationEntryCopy}>
+                  <Text style={styles.orchestrationEntryTitle}>Code Agent 账号</Text>
+                  <Text style={styles.orchestrationEntryDetail}>
+                    Codex 与 Claude Code 独立登录环境，可共享同一项目目录
+                  </Text>
+                </View>
+                <Icon name="chevron.right" size={13} color={color.textFaint} />
+              </Pressable>
+            )}
+            {conn?.supportsOrchestrationSnapshot && (
+              <Pressable
+                style={({ pressed }) => [styles.orchestrationEntry, pressed && styles.cardPressed]}
+                onPress={() => router.push(`/host/${hostId}/orchestration`)}
+                accessibilityRole="button"
+                accessibilityLabel="打开 Agent 编排中心"
+              >
+                <View style={styles.orchestrationEntryIcon}>
+                  <Icon name="point.3.connected.trianglepath.dotted" size={19} color={color.accent} />
+                </View>
+                <View style={styles.orchestrationEntryCopy}>
+                  <Text style={styles.orchestrationEntryTitle}>Agent 编排</Text>
+                  <Text style={styles.orchestrationEntryDetail}>
+                    {conn.supportsManualOrchestration
+                      ? "手工创建 Run、任务依赖并指定 worker"
+                      : "查看 Run、worker 与人工 Gate"}
+                  </Text>
+                </View>
+                <Icon name="chevron.right" size={13} color={color.textFaint} />
+              </Pressable>
+            )}
             <GoalRunsPanel
               snapshot={orchestration}
               hostId={hostId}
@@ -1049,7 +1240,11 @@ export default function HostScreen() {
                           <Text style={styles.cardSub} numberOfLines={1}>
                             {(session.pendingPermissions ?? 0) + (session.pendingQuestions ?? 0) > 0
                               ? `⚠︎ ${String((session.pendingPermissions ?? 0) + (session.pendingQuestions ?? 0))} 项待处理`
-                              : `${session.agent} · ${session.kind === "structured" ? "ChatUI" : "终端"}`}
+                              : [
+                                  session.agent,
+                                  session.accountName,
+                                  session.kind === "structured" ? "ChatUI" : "终端",
+                                ].filter(Boolean).join(" · ")}
                           </Text>
                         </Pressable>
                         {(session.subagents?.length ?? 0) > 0 && (
@@ -1271,6 +1466,7 @@ const styles = StyleSheet.create({
   launcher: { flex: 1, minHeight: 0 },
   launcherSplit: { flex: 1, minHeight: 0, flexDirection: "column" },
   launcherSplitWide: { flexDirection: "row" },
+  foldGutter: { flexShrink: 0, backgroundColor: color.bg },
   projectPane: {
     flexGrow: 0,
     flexShrink: 0,
@@ -1282,7 +1478,6 @@ const styles = StyleSheet.create({
     borderBottomColor: color.border,
   },
   projectPaneWide: {
-    flex: 1,
     maxHeight: undefined,
     borderBottomWidth: 0,
     borderRightWidth: StyleSheet.hairlineWidth,
@@ -1345,6 +1540,9 @@ const styles = StyleSheet.create({
   },
   newBoxScroll: { flexGrow: 0, maxHeight: "72%" },
   formLabel: { ...font.meta, color: color.textDim, fontWeight: "600" },
+  accountLabelRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  accountManage: { color: color.accent, fontSize: 12, fontWeight: "600" },
+  accountDot: { width: 7, height: 7, borderRadius: 4 },
   kindLabel: { marginTop: space.xs },
   kindSwitch: {
     flexDirection: "row",
@@ -1445,6 +1643,25 @@ const styles = StyleSheet.create({
     padding: space.lg,
     gap: space.md,
   },
+  orchestrationEntry: {
+    padding: space.md,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: space.md,
+    borderRadius: radius.lg,
+    backgroundColor: color.surface,
+  },
+  orchestrationEntryIcon: {
+    width: 40,
+    height: 40,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: radius.sm,
+    backgroundColor: color.accentBg,
+  },
+  orchestrationEntryCopy: { flex: 1, gap: 3 },
+  orchestrationEntryTitle: { ...font.body, fontWeight: "700" },
+  orchestrationEntryDetail: { ...font.meta, color: color.textDim },
   goalPanel: {
     gap: space.sm,
     padding: space.md,

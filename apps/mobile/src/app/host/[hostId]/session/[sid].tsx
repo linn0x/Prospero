@@ -36,12 +36,14 @@ import { KeyBar } from "@/components/KeyBar";
 import { QuickReplies } from "@/components/QuickReplies";
 import { Terminal, type TerminalHandle } from "@/components/Terminal";
 import { VoiceButton } from "@/components/VoiceButton";
+import { useAdaptiveLayout } from "@/lib/adaptive-layout";
 import { pickFromCamera, pickFromLibrary, type PickedImage } from "@/lib/attach";
 import { Meter, Row, Sheet } from "@/components/Sheet";
 import { toast } from "@/components/Toast";
 import { color, font, MONOSPACE_FONT, statusColor, utilizationColor } from "@/lib/theme";
 import { matchCommands } from "@/lib/slash-commands";
 import { setSessionArchived } from "@/lib/session-preferences";
+import { sortSessions } from "@/lib/store";
 import { useHostConnection } from "@/lib/use-host-connection";
 import { appendVoiceTranscript } from "@/lib/voice-input";
 import type { ProjectFileReference } from "@/lib/file-references";
@@ -137,6 +139,7 @@ function SessionHeaderTitle({
           .filter(Boolean)
       : [
         session.agent,
+        session.accountName ?? "",
         `${statusText[session.status]}${elapsed ? ` ${elapsed}` : ""}`,
         pending > 0 ? `${String(pending)} 项待处理` : "",
         session.messageQueue?.length
@@ -177,9 +180,80 @@ function SessionHeaderTitle({
   );
 }
 
+function FoldableSessionRail({
+  sessions,
+  currentId,
+  hostId,
+  width,
+}: {
+  sessions: readonly SessionInfo[];
+  currentId: string;
+  hostId: string;
+  width: number;
+}) {
+  return (
+    <View style={[styles.sessionRail, { width }]}>
+      <View style={styles.sessionRailHeader}>
+        <Text style={styles.sessionRailTitle}>会话</Text>
+        <Text style={styles.sessionRailCount}>{String(sessions.length)}</Text>
+      </View>
+      <ScrollView
+        contentContainerStyle={styles.sessionRailList}
+        showsVerticalScrollIndicator={false}
+      >
+        {sessions.map((item) => {
+          const selected = item.id === currentId;
+          return (
+            <Pressable
+              key={item.id}
+              style={({ pressed }) => [
+                styles.sessionRailItem,
+                selected && styles.sessionRailItemSelected,
+                pressed && styles.controlPressed,
+              ]}
+              disabled={selected}
+              onPress={() =>
+                router.replace({
+                  pathname: "/host/[hostId]/session/[sid]",
+                  params: { hostId, sid: item.id },
+                })
+              }
+              accessibilityRole="button"
+              accessibilityState={{ selected }}
+              accessibilityLabel={`打开会话 ${item.title}`}
+            >
+              <View style={styles.sessionRailItemTop}>
+                <View
+                  style={[
+                    styles.sessionRailStatus,
+                    { backgroundColor: statusColor[item.status] ?? color.textFaint },
+                  ]}
+                />
+                <Text style={styles.sessionRailItemTitle} numberOfLines={1}>
+                  {item.title}
+                </Text>
+                <Text style={styles.sessionRailAgent}>{item.agent}</Text>
+              </View>
+              <Text style={styles.sessionRailPath} numberOfLines={1} ellipsizeMode="middle">
+                {item.cwd}
+              </Text>
+              {item.preview ? (
+                <Text style={styles.sessionRailPreview} numberOfLines={2}>
+                  {item.preview}
+                </Text>
+              ) : null}
+            </Pressable>
+          );
+        })}
+      </ScrollView>
+    </View>
+  );
+}
+
 export default function SessionScreen() {
   const insets = useSafeAreaInsets();
   const headerHeight = useHeaderHeight();
+  const adaptiveLayout = useAdaptiveLayout();
   const { hostId, sid, subagentId } = useLocalSearchParams<{
     hostId: string;
     sid: string;
@@ -205,6 +279,16 @@ export default function SessionScreen() {
   const completionSequence = useRef(0);
 
   const session = sid ? runtime.sessions[sid] : undefined;
+  const orderedSessions = useMemo(
+    () => sortSessions(runtime.sessions),
+    [runtime.sessions],
+  );
+  const showSessionRail =
+    adaptiveLayout.verticalPanes !== null ||
+    (adaptiveLayout.width >= 960 && adaptiveLayout.height >= 560);
+  const sessionRailWidth =
+    adaptiveLayout.verticalPanes?.start ??
+    Math.min(360, Math.max(288, adaptiveLayout.width * 0.32));
   const agentControls = session?.agentControls;
   const subagent = subagentId
     ? session?.subagents?.find((candidate) => candidate.id === subagentId)
@@ -646,14 +730,39 @@ export default function SessionScreen() {
   };
 
   return (
-    <KeyboardAvoidingView
-      style={styles.container}
-      // 显式使用 native-stack 已知的头部高度，首轮布局就能同步算出 IME 重叠量。
-      // automaticOffset 需要异步测量窗口坐标，快速首次点按时可能晚于键盘动画。
-      behavior={Platform.OS === "ios" ? "padding" : "height"}
-      keyboardVerticalOffset={headerHeight}
-    >
-      <Stack.Screen
+    <View style={[styles.adaptiveRoot, showSessionRail && styles.adaptiveRootSplit]}>
+      {showSessionRail && (
+        <FoldableSessionRail
+          sessions={orderedSessions}
+          currentId={sid}
+          hostId={hostId}
+          width={sessionRailWidth}
+        />
+      )}
+      {adaptiveLayout.verticalPanes && (
+        <View
+          style={[
+            styles.sessionFoldGutter,
+            { width: adaptiveLayout.verticalPanes.gap },
+          ]}
+          pointerEvents="none"
+        />
+      )}
+      <KeyboardAvoidingView
+        style={[
+          styles.container,
+          showSessionRail && styles.sessionDetail,
+          adaptiveLayout.verticalPanes && {
+            flex: 0,
+            width: adaptiveLayout.verticalPanes.end,
+          },
+        ]}
+        // 显式使用 native-stack 已知的头部高度，首轮布局就能同步算出 IME 重叠量。
+        // automaticOffset 需要异步测量窗口坐标，快速首次点按时可能晚于键盘动画。
+        behavior={Platform.OS === "ios" ? "padding" : "height"}
+        keyboardVerticalOffset={headerHeight}
+      >
+        <Stack.Screen
         options={{
           headerBackVisible: false,
           headerLeft: () => (
@@ -719,8 +828,29 @@ export default function SessionScreen() {
       {isStructured && (
         <View style={styles.modeBar}>
           <View style={styles.chatModeLabel}>
-            <Icon name="bubble.left.and.text.bubble.right" size={14} color={color.text} />
-            <Text style={styles.modeText}>{isSubagent ? "子 Agent 对话" : "对话"}</Text>
+            {isSubagent ? (
+              <View style={styles.subagentModeIdentity}>
+                <View
+                  style={[
+                    styles.subagentModeDot,
+                    {
+                      backgroundColor:
+                        subagent?.status === "running" || subagent?.status === "starting"
+                          ? color.accent
+                          : color.textFaint,
+                    },
+                  ]}
+                />
+                <Text style={styles.subagentModeName} numberOfLines={1}>
+                  {subagent?.name ?? "子 Agent"}
+                </Text>
+              </View>
+            ) : (
+              <>
+                <Icon name="bubble.left.and.text.bubble.right" size={14} color={color.text} />
+                <Text style={styles.modeText}>对话</Text>
+              </>
+            )}
             {pending > 0 && (
               <View style={styles.pendingBadge}>
                 <Text style={styles.pendingBadgeText}>{pending > 9 ? "9+" : pending}</Text>
@@ -759,6 +889,44 @@ export default function SessionScreen() {
           >
             <Icon name="magnifyingglass" size={16} color={color.textDim} />
           </Pressable>
+        </View>
+      )}
+
+      {isStructured && !isSubagent && (session.subagents?.length ?? 0) > 0 && (
+        <View style={styles.subagentRail}>
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={styles.subagentRailContent}
+          >
+            {session.subagents?.map((child) => {
+              const active = child.status === "running" || child.status === "starting";
+              return (
+                <Pressable
+                  key={child.id}
+                  style={({ pressed }) => [
+                    styles.subagentRailChip,
+                    active && styles.subagentRailChipActive,
+                    pressed && styles.controlPressed,
+                  ]}
+                  onPress={() => openSubagent(child.id)}
+                  accessibilityRole="button"
+                  accessibilityLabel={`查看子 Agent ${child.name} 的过程`}
+                >
+                  <View
+                    style={[
+                      styles.subagentRailDot,
+                      { backgroundColor: active ? color.accent : color.textFaint },
+                    ]}
+                  />
+                  <Text style={styles.subagentRailName} numberOfLines={1}>{child.name}</Text>
+                  <Text style={[styles.subagentRailState, active && styles.subagentRailStateActive]}>
+                    {subagentStatusText[child.status]}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </ScrollView>
         </View>
       )}
 
@@ -1209,7 +1377,8 @@ export default function SessionScreen() {
           <Icon name="arrow.up" size={17} color="#fff" weight="semibold" />
         </Pressable>
       </View>
-    </KeyboardAvoidingView>
+      </KeyboardAvoidingView>
+    </View>
   );
 }
 
@@ -1217,7 +1386,64 @@ export default function SessionScreen() {
 const MAX_IMAGES = 6;
 
 const styles = StyleSheet.create({
+  adaptiveRoot: { flex: 1, backgroundColor: color.bg },
+  adaptiveRootSplit: { flexDirection: "row" },
   container: { flex: 1, backgroundColor: color.bg },
+  sessionDetail: { minWidth: 0 },
+  sessionFoldGutter: {
+    flexShrink: 0,
+    backgroundColor: color.bg,
+    borderLeftWidth: StyleSheet.hairlineWidth,
+    borderRightWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
+  },
+  sessionRail: {
+    flexShrink: 0,
+    backgroundColor: color.surface,
+    borderRightWidth: StyleSheet.hairlineWidth,
+    borderRightColor: color.border,
+  },
+  sessionRailHeader: {
+    minHeight: 45,
+    paddingHorizontal: 14,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: color.border,
+  },
+  sessionRailTitle: { color: color.text, fontSize: 13, fontWeight: "700" },
+  sessionRailCount: {
+    minWidth: 22,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    overflow: "hidden",
+    borderRadius: 999,
+    backgroundColor: color.surfaceRaised,
+    color: color.textDim,
+    fontSize: 10,
+    textAlign: "center",
+  },
+  sessionRailList: { gap: 6, padding: 10 },
+  sessionRailItem: {
+    gap: 5,
+    paddingHorizontal: 10,
+    paddingVertical: 9,
+    borderRadius: 10,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: "transparent",
+    backgroundColor: color.bg,
+  },
+  sessionRailItemSelected: {
+    borderColor: color.accentDim,
+    backgroundColor: color.accentBg,
+  },
+  sessionRailItemTop: { flexDirection: "row", alignItems: "center", gap: 7 },
+  sessionRailStatus: { width: 7, height: 7, borderRadius: 4 },
+  sessionRailItemTitle: { flex: 1, color: color.text, fontSize: 12.5, fontWeight: "600" },
+  sessionRailAgent: { color: color.textFaint, fontSize: 9.5 },
+  sessionRailPath: { color: color.textFaint, fontSize: 9.5, fontFamily: MONOSPACE_FONT },
+  sessionRailPreview: { color: color.textDim, fontSize: 10.5, lineHeight: 15 },
   headerBack: { minWidth: 30, minHeight: 36, alignItems: "flex-start", justifyContent: "center" },
   center: { flex: 1, alignItems: "center", justifyContent: "center", gap: 12 },
   dim: { color: color.textDim, fontSize: 14 },
@@ -1247,6 +1473,43 @@ const styles = StyleSheet.create({
     paddingHorizontal: 8,
   },
   modeText: { color: color.text, fontSize: 13, fontWeight: "600" },
+  subagentModeIdentity: {
+    maxWidth: "82%",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+    borderRadius: 999,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.accentDim,
+    backgroundColor: "#18223A",
+  },
+  subagentModeDot: { width: 7, height: 7, borderRadius: 4 },
+  subagentModeName: { flexShrink: 1, color: color.text, fontSize: 12, fontWeight: "700" },
+  subagentRail: {
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: color.border,
+    backgroundColor: color.bg,
+  },
+  subagentRailContent: { gap: 8, paddingHorizontal: 12, paddingVertical: 8 },
+  subagentRailChip: {
+    maxWidth: 220,
+    minHeight: 30,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 10,
+    borderRadius: 999,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
+    backgroundColor: color.surface,
+  },
+  subagentRailChipActive: { borderColor: color.accentDim, backgroundColor: "#18223A" },
+  subagentRailDot: { width: 7, height: 7, borderRadius: 4 },
+  subagentRailName: { flexShrink: 1, color: color.text, fontSize: 12, fontWeight: "700" },
+  subagentRailState: { color: color.textFaint, fontSize: 9.5 },
+  subagentRailStateActive: { color: color.accent },
   pendingBadge: {
     minWidth: 18,
     height: 18,

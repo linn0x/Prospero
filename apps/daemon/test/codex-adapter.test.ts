@@ -244,6 +244,32 @@ describe("Codex 审批策略(桩数据)", () => {
 });
 
 describe("Codex 原生 Plan、提问与子 Agent(桩数据)", () => {
+  it("中断请求携带官方协议要求的当前 turnId", async () => {
+    const h = approvalHarness(() => "standard");
+    const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+    const internals = h.adapter as unknown as {
+      threadId: string;
+      currentTurns: Map<string, string>;
+      request(method: string, params: Record<string, unknown>): Promise<unknown>;
+    };
+    internals.threadId = "main-thread";
+    internals.currentTurns.set("main-thread", "turn-running");
+    internals.request = async (method, params) => {
+      calls.push({ method, params });
+      return {};
+    };
+
+    await h.adapter.interrupt();
+    expect(calls).toEqual([{
+      method: "turn/interrupt",
+      params: { threadId: "main-thread", turnId: "turn-running" },
+    }]);
+
+    internals.currentTurns.clear();
+    await h.adapter.interrupt();
+    expect(calls).toHaveLength(1);
+  });
+
   it("把 requestUserInput 转成问题卡，并把答案回到原 JSON-RPC", async () => {
     const h = approvalHarness(() => "standard");
     (h.adapter as unknown as { threadId: string }).threadId = "main-thread";
@@ -364,6 +390,163 @@ describe("Codex 原生 Plan、提问与子 Agent(桩数据)", () => {
       method: "turn/start",
       params: { threadId: "child-thread", input: [{ type: "text", text: "再跑一次测试" }] },
     });
+  });
+
+  it("child id 先到、thread 身份后到时会补全 Codex 原生 Agent 名称", () => {
+    const h = approvalHarness(() => "standard");
+    const internals = h.adapter as unknown as {
+      threadId: string;
+      onNotification(message: Record<string, unknown>): void;
+    };
+    internals.threadId = "main-thread";
+    internals.onNotification({
+      method: "item/started",
+      params: {
+        threadId: "main-thread",
+        item: {
+          id: "collab-1",
+          type: "collabAgentToolCall",
+          receiverThreadIds: ["late-child"],
+          prompt: "检查 UI",
+        },
+      },
+    });
+    internals.onNotification({
+      method: "thread/started",
+      params: {
+        thread: {
+          id: "late-child",
+          parentThreadId: "main-thread",
+          agentNickname: "visual-reviewer",
+          agentRole: "reviewer",
+          status: { type: "active", activeFlags: [] },
+          canAcceptDirectInput: true,
+        },
+      },
+    });
+
+    const identities = h.events.filter(
+      (event): event is Extract<AgentEventBody, { kind: "subagent.started" }> =>
+        event.kind === "subagent.started" && event.subagent.id === "late-child",
+    );
+    expect(identities).toHaveLength(2);
+    expect(identities.at(-1)?.subagent).toMatchObject({
+      name: "visual-reviewer",
+      role: "reviewer",
+      task: "检查 UI",
+    });
+  });
+
+  it("发现历史子线程时只接受 parentThreadId 精确匹配的原生子来源", async () => {
+    const h = approvalHarness(() => "standard");
+    const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+    const internals = h.adapter as unknown as {
+      threadId: string;
+      discoverSubagents(): Promise<void>;
+      request(method: string, params: Record<string, unknown>): Promise<unknown>;
+    };
+    internals.threadId = "main-thread";
+    internals.request = async (method, params) => {
+      calls.push({ method, params });
+      if (params["cursor"] === "page-2") {
+        return {
+          data: [{
+            id: "child-2",
+            parentThreadId: "main-thread",
+            agentNickname: "Laplace",
+            status: { type: "idle" },
+          }],
+        };
+      }
+      return {
+        data: [
+          { id: "main-thread", parentThreadId: null, name: "父线程" },
+          { id: "foreign-child", parentThreadId: "other-thread", agentNickname: "Wrong" },
+          {
+            id: "child-1",
+            parentThreadId: "main-thread",
+            agentNickname: "Peirce",
+            agentRole: "reviewer",
+            status: { type: "active", activeFlags: [] },
+          },
+        ],
+        nextCursor: "page-2",
+      };
+    };
+
+    await internals.discoverSubagents();
+    const identities = h.events.flatMap((event) =>
+      event.kind === "subagent.started" ? [event.subagent] : [],
+    );
+    expect(identities.map((child) => child.id)).toEqual(["child-1", "child-2"]);
+    expect(identities.map((child) => child.name)).toEqual(["Peirce", "Laplace"]);
+    expect(calls[0]?.params["sourceKinds"]).toEqual(expect.arrayContaining(["subAgent"]));
+    expect(calls[1]?.params["cursor"]).toBe("page-2");
+  });
+
+  it("thread/read 把子 Agent 的对话、推理与工具过程映射成统一事件", async () => {
+    const h = approvalHarness(() => "standard");
+    const internals = h.adapter as unknown as {
+      threadId: string;
+      onNotification(message: Record<string, unknown>): void;
+      request(method: string, params: Record<string, unknown>): Promise<unknown>;
+    };
+    internals.threadId = "main-thread";
+    internals.onNotification({
+      method: "thread/started",
+      params: {
+        thread: {
+          id: "child-thread",
+          parentThreadId: "main-thread",
+          agentNickname: "Curie",
+          status: { type: "idle" },
+        },
+      },
+    });
+    internals.request = async (method, params) => {
+      expect(method).toBe("thread/read");
+      expect(params).toEqual({ threadId: "child-thread", includeTurns: true });
+      return {
+        thread: {
+          id: "child-thread",
+          parentThreadId: "main-thread",
+          turns: [{
+            id: "turn-1",
+            status: "completed",
+            error: null,
+            items: [
+              { type: "userMessage", id: "user-1", content: [{ type: "text", text: "检查 UI" }] },
+              { type: "reasoning", id: "reason-1", summary: ["先读组件"], content: [] },
+              {
+                type: "commandExecution",
+                id: "cmd-1",
+                command: "npm test",
+                status: "completed",
+                aggregatedOutput: "12 tests passed",
+              },
+              {
+                type: "fileChange",
+                id: "edit-1",
+                status: "completed",
+                changes: [{ path: "src/View.tsx", diff: "@@ -1 +1 @@\n-old\n+new" }],
+              },
+              { type: "agentMessage", id: "answer-1", text: "检查完成" },
+            ],
+          }],
+        },
+      };
+    };
+
+    const events = await h.adapter.readSubagentHistory?.("child-thread");
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "user.message", text: "检查 UI", agentId: "child-thread" }),
+      expect.objectContaining({ kind: "reasoning.delta", delta: "先读组件" }),
+      expect.objectContaining({ kind: "tool.start", callId: "cmd-1", tool: "bash" }),
+      expect.objectContaining({ kind: "tool.end", callId: "cmd-1", summary: "12 tests passed" }),
+      expect.objectContaining({ kind: "tool.start", callId: "edit-1", diff: expect.objectContaining({ path: "src/View.tsx" }) }),
+      expect.objectContaining({ kind: "text.delta", msgId: "answer-1", delta: "检查完成" }),
+      expect.objectContaining({ kind: "turn.end", msgId: "answer-1", finish: "completed" }),
+    ]));
   });
 });
 

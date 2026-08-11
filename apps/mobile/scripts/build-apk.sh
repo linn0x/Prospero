@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 #
 # 从 CNG 配置生成 Android 工程，构建可离线启动的 APK，并可选安装/启动。
-# Release 产物由 Expo/RN 模板生成的 debug keystore 签名，适合个人侧载；脚本不保存
-# keystore 路径、别名或密码。若要正式分发，应在 CI/Gradle 中注入独立 release key。
+# Release 产物使用首次构建时生成的 debug keystore，适合个人侧载。脚本把它稳定保存
+# 在 ~/.prospero/android-side-load.keystore；否则 `expo prebuild --clean` 每次重建工程
+# 都可能换签名，Android 只能卸载旧 App，连同 Prospero 配对资料一起丢掉。
+# 若要正式分发，应在 CI/Gradle 中注入独立 release key。
 #
 #   ./scripts/build-apk.sh --install --launch
 #
@@ -17,6 +19,7 @@ DO_INSTALL=0
 DO_LAUNCH=0
 DO_PREBUILD=1
 DEVICE_SERIAL="${ANDROID_SERIAL:-}"
+SIDELOAD_KEYSTORE="${PROSPERO_ANDROID_KEYSTORE:-$HOME/.prospero/android-side-load.keystore}"
 
 die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 step() { printf '\n\033[1;34m==>\033[0m \033[1m%s\033[0m\n' "$*"; }
@@ -101,6 +104,16 @@ step "构建 @prospero/protocol"
 step "准备 Android 中英混合离线语音模型"
 "$MOBILE_DIR/scripts/prepare-android-voice-model.sh"
 
+# generated android/ 会被下一步整目录重建。先把已经用于真机安装的签名保存到
+# Prospero 私有目录，随后再拷回新工程；同 applicationId + 同证书才能原位升级。
+EXISTING_KEYSTORE="$MOBILE_DIR/android/app/debug.keystore"
+if [[ ! -f "$SIDELOAD_KEYSTORE" && -f "$EXISTING_KEYSTORE" ]]; then
+  mkdir -p "$(dirname "$SIDELOAD_KEYSTORE")"
+  cp "$EXISTING_KEYSTORE" "$SIDELOAD_KEYSTORE"
+  chmod 600 "$SIDELOAD_KEYSTORE"
+  info "已保存稳定侧载签名：$SIDELOAD_KEYSTORE"
+fi
+
 if (( DO_PREBUILD )); then
   step "生成 Android 工程（expo prebuild --clean）"
   (cd "$MOBILE_DIR" && EXPO_NO_GIT_STATUS=1 npx expo prebuild -p android --clean)
@@ -111,7 +124,14 @@ fi
 
 DEBUG_KEYSTORE="$MOBILE_DIR/android/app/debug.keystore"
 [[ -f "$DEBUG_KEYSTORE" ]] || die "Expo 模板未生成 debug keystore：$DEBUG_KEYSTORE"
-info "侧载签名：Expo/RN 模板 debug keystore"
+if [[ -f "$SIDELOAD_KEYSTORE" ]]; then
+  cp "$SIDELOAD_KEYSTORE" "$DEBUG_KEYSTORE"
+else
+  mkdir -p "$(dirname "$SIDELOAD_KEYSTORE")"
+  cp "$DEBUG_KEYSTORE" "$SIDELOAD_KEYSTORE"
+  chmod 600 "$SIDELOAD_KEYSTORE"
+fi
+info "侧载签名：${SIDELOAD_KEYSTORE}（升级复用）"
 
 if [[ "$BUILD_VARIANT" == "release" ]]; then
   GRADLE_TASK="assembleRelease"

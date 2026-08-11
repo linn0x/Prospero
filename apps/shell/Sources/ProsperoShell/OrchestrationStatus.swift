@@ -3,13 +3,30 @@ import Foundation
 /// daemon 落盘的 `~/.prospero/orchestration.json`。
 ///
 /// Mac 壳和 daemon 同机，读快照比再造一条控制通道更可靠；daemon 重启、壳重开后
-/// 仍从同一份持久化真相恢复。写操作（Gate 决策）仍走 daemon 的回环鉴权接口。
+/// 仍从同一份持久化真相恢复。写操作走 daemon 的回环鉴权接口。
 struct OrchestrationStatus: Sendable, Equatable {
+  struct Automation: Codable, Sendable, Equatable {
+    var state: String
+    var agent: String
+    var approvalPolicy: String
+    var workspace: String
+    var cwd: String
+    var workspacePath: String
+    var branch: String?
+    var startedAt: Double
+    var updatedAt: Double
+    var lastError: String?
+  }
+
   struct Run: Codable, Sendable, Equatable, Identifiable {
     var id: String
     var objective: String
     var status: String
     var coordinatorSessionId: String?
+    /// 旧 daemon 的快照没有此字段，按 0 处理。
+    var graphRevision: Int?
+    /// 旧 daemon 没有此字段；nil 表示仍由人逐个派发。
+    var automation: Automation?
     var createdAt: Double
     var updatedAt: Double
   }
@@ -18,6 +35,9 @@ struct OrchestrationStatus: Sendable, Equatable {
     var id: String
     var runId: String
     var title: String
+    var spec: String
+    var deps: [String]
+    var parentId: String?
     var status: String
     var result: String?
     var createdAt: Double
@@ -29,9 +49,11 @@ struct OrchestrationStatus: Sendable, Equatable {
     var runId: String
     var taskId: String
     var sessionId: String
+    var worktreePath: String?
     var state: String
     var startedAt: Double
     var settledAt: Double?
+    var outcome: String?
   }
 
   struct Gate: Codable, Sendable, Equatable, Identifiable {
@@ -73,4 +95,12 @@ struct OrchestrationStatus: Sendable, Equatable {
     var dispatches: [String: Dispatch] = [:]
     var gates: [String: Gate] = [:]
   }
+}
+
+/// Mac 可视化编辑器里的本地节点；id 在一次发布内稳定，用来表达依赖关系。
+struct OrchestrationGraphDraftNode: Identifiable, Sendable, Equatable {
+  var id: String = UUID().uuidString
+  var title: String
+  var spec: String
+  var deps: Set<String> = []
 }

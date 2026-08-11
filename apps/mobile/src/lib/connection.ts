@@ -10,9 +10,19 @@
  * - 发送排队:断线瞬间的用户操作不丢,重连后按序补发。
  */
 import { AppState, Platform } from "react-native";
+import { randomUUID } from "expo-crypto";
 import {
+  CAPABILITY_AGENT_ACCOUNTS,
+  CAPABILITY_ORCHESTRATION_AUTOMATION,
+  CAPABILITY_ORCHESTRATION_GRAPH,
+  CAPABILITY_ORCHESTRATION_LIFECYCLE,
+  CAPABILITY_ORCHESTRATION_MANAGEMENT,
+  CAPABILITY_ORCHESTRATION_MANUAL,
+  CAPABILITY_ORCHESTRATION_SNAPSHOT,
+  CAPABILITY_SUBAGENT_HISTORY,
   CLOSE_AUTH_FAILED,
   CLOSE_REVOKED,
+  SUPPORTED_PROTOCOL_VERSIONS,
   clientHandshakeStart,
   clientHandshakeFinish,
   parseS2C,
@@ -20,6 +30,11 @@ import {
   utf8Encode,
   ProtocolError,
   type AgentKind,
+  type AgentAccount,
+  type AgentAccountsResult,
+  type AgentCredentialKind,
+  type CodeAgentKind,
+  type AgentEventBody,
   type AgentQuestionAnswer,
   type ApprovalPolicy,
   type Attachment,
@@ -28,6 +43,7 @@ import {
   type C2SMessage,
   type KeyPairB64,
   type PermissionReply,
+  type OrchestrationGraphNodeInput,
   type ResumableConversation,
   type S2CAgentEvent,
   type S2CChatSnapshot,
@@ -47,7 +63,7 @@ import { Emitter } from "./emitter";
 import { rememberGoodAddr, type StoredHost } from "./hosts";
 import { useApp } from "./store";
 
-const APP_VERSION = "0.0.2";
+const APP_VERSION = "0.0.12";
 const ATTEMPT_TIMEOUT_MS = 6000;
 const BACKOFF_MIN = 400;
 const BACKOFF_MAX = 8000;
@@ -64,6 +80,7 @@ interface Won {
   helloOk: S2CHelloOk;
   addr: string;
   rttMs: number;
+  protocolVersion: number;
 }
 
 export interface ConnEvents extends Record<string, unknown> {
@@ -95,6 +112,9 @@ export class HostConnection {
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private lastRecvAt = 0;
   private everConnected = false;
+  private negotiatedProtocolVersion: number | null = null;
+  /** null 表示旧 daemon 未声明能力；空 Set 表示新 daemon 明确拒绝所有可选能力。 */
+  private advertisedCapabilities: Set<string> | null = null;
   /** 断线期间排队的消息,重连后按序补发 */
   private queue: C2SMessage[] = [];
 
@@ -109,6 +129,50 @@ export class HostConnection {
 
   get queuedCount(): number {
     return this.queue.length;
+  }
+
+  supportsCapability(capability: string): boolean {
+    if (this.advertisedCapabilities !== null) {
+      return this.advertisedCapabilities.has(capability);
+    }
+    const version = this.negotiatedProtocolVersion ?? 0;
+    if (capability === CAPABILITY_ORCHESTRATION_SNAPSHOT) return version >= 7;
+    if (capability === CAPABILITY_ORCHESTRATION_MANUAL) return version >= 8;
+    if (capability === CAPABILITY_SUBAGENT_HISTORY) return version >= 9;
+    if (capability === CAPABILITY_AGENT_ACCOUNTS) return version >= 10;
+    return false;
+  }
+
+  get supportsOrchestrationSnapshot(): boolean {
+    return this.supportsCapability(CAPABILITY_ORCHESTRATION_SNAPSHOT);
+  }
+
+  get supportsManualOrchestration(): boolean {
+    return this.supportsCapability(CAPABILITY_ORCHESTRATION_MANUAL);
+  }
+
+  get supportsGraphOrchestration(): boolean {
+    return this.supportsCapability(CAPABILITY_ORCHESTRATION_GRAPH);
+  }
+
+  get supportsAutomationOrchestration(): boolean {
+    return this.supportsCapability(CAPABILITY_ORCHESTRATION_AUTOMATION);
+  }
+
+  get supportsOrchestrationManagement(): boolean {
+    return this.supportsCapability(CAPABILITY_ORCHESTRATION_MANAGEMENT);
+  }
+
+  get supportsOrchestrationLifecycle(): boolean {
+    return this.supportsCapability(CAPABILITY_ORCHESTRATION_LIFECYCLE);
+  }
+
+  get supportsSubagentHistory(): boolean {
+    return this.supportsCapability(CAPABILITY_SUBAGENT_HISTORY);
+  }
+
+  get supportsAgentAccounts(): boolean {
+    return this.supportsCapability(CAPABILITY_AGENT_ACCOUNTS);
   }
 
   start(): void {
@@ -211,118 +275,141 @@ export class HostConnection {
 
       for (const addr of addrs) {
         const startedAt = Date.now();
-        let ws: WebSocket;
-        try {
-          ws = new WebSocket(`ws://${addr}:${this.host.port}/ws`);
-        } catch (e) {
-          failures.push({
-            addr,
-            failure: "unreachable",
-            detail: e instanceof Error ? e.message : undefined,
-          });
-          if (--pending === 0) finishFailure();
-          continue;
-        }
-        // v1 握手三帧:发临时公钥 → 收 daemon 临时公钥+身份证明 → 发加密 hello。
-        // 会话密钥来自双方临时密钥,daemon 静态私钥日后泄漏也解不开今天的流量。
-        const { frame, state: hsState } = clientHandshakeStart();
-        let channel: SecureChannel | null = null;
 
-        const fail = (failure: AttemptResult["failure"], detail?: string): void => {
-          clearTimeout(timer);
+        const tryVersion = (versionIndex: number): void => {
+          const protocolVersion = SUPPORTED_PROTOCOL_VERSIONS[versionIndex];
+          if (protocolVersion === undefined) return;
+          let ws: WebSocket;
           try {
-            ws.close();
-          } catch {
-            // 已关闭
-          }
-          if (done) return;
-          failures.push({ addr, ...(detail !== undefined ? { detail } : {}), failure });
-          if (failure === "auth") {
-            // 鉴权失败对所有地址都成立,不必等其余
-            finishFailure();
-            return;
-          }
-          if (--pending === 0) finishFailure();
-        };
-
-        const timer = setTimeout(() => fail("timeout"), ATTEMPT_TIMEOUT_MS);
-
-        // 连接被拒时 RN 会直接触发 onclose(而非 onerror),必须按"是否 open 过"
-        // 区分:没 open 过 = 端口不可达;open 过再关 = 握手阶段被拒。
-        let opened = false;
-        ws.onopen = () => {
-          opened = true;
-          ws.send(frame);
-        };
-        ws.onerror = () => fail(opened ? "handshake" : "unreachable");
-        // 关闭码是 daemon 唯一能在断开时留下的话。以前这里把它整个丢掉,
-        // 于是"设备被撤销""版本不符"都显示成含糊的「握手失败」。
-        ws.onclose = (ev) => {
-          if (!opened) {
-            fail("unreachable");
-            return;
-          }
-          const code = (ev as { code?: number } | undefined)?.code;
-          const reason = String((ev as { reason?: unknown } | undefined)?.reason ?? "");
-          if (code === CLOSE_AUTH_FAILED) fail("auth", reason || undefined);
-          else if (code === CLOSE_REVOKED) fail("revoked", reason || undefined);
-          else if (reason === "version") fail("version");
-          else fail("handshake", reason || undefined);
-        };
-        ws.onmessage = (ev) => {
-          try {
-            // 第 2 帧:验 daemon 身份证明,派生会话密钥,再把 hello 发出去
-            if (channel === null) {
-              const finished = clientHandshakeFinish(
-                hsState,
-                String(ev.data),
-                this.host.daemonPub,
-                {
-                  type: "hello",
-                  token: this.host.token,
-                  clientPubKey: this.keys.publicKey,
-                  clientInfo: {
-                    platform: Platform.OS === "android" ? "android" : "ios",
-                    appVersion: APP_VERSION,
-                  },
-                },
-              );
-              channel = finished.channel;
-              ws.send(finished.frame);
-              return;
-            }
-            const msg = parseS2C(channel.open(String(ev.data)));
-            if (msg.type === "error" && msg.code === "auth_failed") {
-              fail("auth", msg.message);
-              return;
-            }
-            if (msg.type !== "hello.ok") {
-              fail("handshake", `unexpected ${msg.type}`);
-              return;
-            }
-            clearTimeout(timer);
-            if (done) {
-              ws.close(); // 竞速落败
-              return;
-            }
-            done = true;
-            ws.onmessage = null;
-            ws.onclose = null;
-            ws.onerror = null;
-            resolve({ ws, channel, helloOk: msg, addr, rttMs: Date.now() - startedAt });
+            ws = new WebSocket(`ws://${addr}:${this.host.port}/ws`);
           } catch (e) {
-            // 身份证明失败是安全事件,不是普通握手错误
-            if (e instanceof ProtocolError && e.code === "untrusted") {
-              fail("untrusted", e.message);
-              return;
-            }
-            if (e instanceof ProtocolError && e.code === "version") {
-              fail("version");
-              return;
-            }
-            fail("handshake", e instanceof ProtocolError ? e.code : undefined);
+            failures.push({
+              addr,
+              failure: "unreachable",
+              detail: e instanceof Error ? e.message : undefined,
+            });
+            if (--pending === 0) finishFailure();
+            return;
           }
+
+          // 同一地址先尝试最新版本；收到明确的 version 关闭原因后才用新连接回退。
+          // v8+ 的版本已绑定进身份证明，v7/v5 保留原帧以兼容已经安装的 daemon。
+          const { frame, state: hsState } = clientHandshakeStart(protocolVersion);
+          let channel: SecureChannel | null = null;
+          let opened = false;
+          let attemptDone = false;
+
+          const fail = (failure: AttemptResult["failure"], detail?: string): void => {
+            if (attemptDone) return;
+            attemptDone = true;
+            clearTimeout(timer);
+            ws.onopen = null;
+            ws.onmessage = null;
+            ws.onerror = null;
+            ws.onclose = null;
+            try {
+              ws.close();
+            } catch {
+              // 已关闭
+            }
+            if (done) return;
+            if (
+              failure === "version" &&
+              versionIndex + 1 < SUPPORTED_PROTOCOL_VERSIONS.length
+            ) {
+              tryVersion(versionIndex + 1);
+              return;
+            }
+            failures.push({ addr, ...(detail !== undefined ? { detail } : {}), failure });
+            if (failure === "auth") {
+              // 鉴权失败对所有地址都成立,不必等其余
+              finishFailure();
+              return;
+            }
+            if (--pending === 0) finishFailure();
+          };
+
+          const timer = setTimeout(() => fail("timeout"), ATTEMPT_TIMEOUT_MS);
+          ws.onopen = () => {
+            opened = true;
+            ws.send(frame);
+          };
+          ws.onerror = () => fail(opened ? "handshake" : "unreachable");
+          ws.onclose = (ev) => {
+            if (!opened) {
+              fail("unreachable");
+              return;
+            }
+            const code = (ev as { code?: number } | undefined)?.code;
+            const reason = String((ev as { reason?: unknown } | undefined)?.reason ?? "");
+            if (code === CLOSE_AUTH_FAILED) fail("auth", reason || undefined);
+            else if (code === CLOSE_REVOKED) fail("revoked", reason || undefined);
+            else if (reason === "version") fail("version");
+            else fail("handshake", reason || undefined);
+          };
+          ws.onmessage = (ev) => {
+            try {
+              if (channel === null) {
+                const finished = clientHandshakeFinish(
+                  hsState,
+                  String(ev.data),
+                  this.host.daemonPub,
+                  {
+                    type: "hello",
+                    token: this.host.token,
+                    clientPubKey: this.keys.publicKey,
+                    clientInfo: {
+                      platform: Platform.OS === "android" ? "android" : "ios",
+                      appVersion: APP_VERSION,
+                    },
+                  },
+                );
+                channel = finished.channel;
+                ws.send(finished.frame);
+                return;
+              }
+              const msg = parseS2C(channel.open(String(ev.data)));
+              if (msg.type === "error" && msg.code === "auth_failed") {
+                fail("auth", msg.message);
+                return;
+              }
+              if (msg.type !== "hello.ok") {
+                fail("handshake", `unexpected ${msg.type}`);
+                return;
+              }
+              attemptDone = true;
+              clearTimeout(timer);
+              if (done) {
+                ws.close();
+                return;
+              }
+              done = true;
+              ws.onmessage = null;
+              ws.onclose = null;
+              ws.onerror = null;
+              resolve({
+                ws,
+                channel,
+                helloOk: msg,
+                addr,
+                rttMs: Date.now() - startedAt,
+                protocolVersion,
+              });
+            } catch (e) {
+              if (e instanceof ProtocolError && e.code === "untrusted") {
+                fail("untrusted", e.message);
+                return;
+              }
+              if (e instanceof ProtocolError && e.code === "version") {
+                fail("version");
+                return;
+              }
+              fail("handshake", e instanceof ProtocolError ? e.code : undefined);
+            }
+          };
         };
+
+        tryVersion(0);
       }
     });
   }
@@ -344,6 +431,11 @@ export class HostConnection {
     this.activeAddr = won.addr;
     this.lastRttMs = won.rttMs;
     this.lastRecvAt = Date.now();
+    this.negotiatedProtocolVersion =
+      won.helloOk.host.negotiatedProtocolVersion ?? won.protocolVersion;
+    this.advertisedCapabilities = won.helloOk.host.capabilities === undefined
+      ? null
+      : new Set(won.helloOk.host.capabilities);
 
     useApp.getState().setSessions(this.host.id, won.helloOk.sessions);
     this.patch({
@@ -428,6 +520,7 @@ export class HostConnection {
         return;
       case "workspace.listing":
       case "conversation.results":
+      case "agent.accounts.result":
       case "fs.listing":
       case "fs.content":
       case "fs.written":
@@ -441,6 +534,7 @@ export class HostConnection {
       case "agent.models":
       case "agent.modes":
       case "agent.control.result":
+      case "subagent.history.result":
         this.resolveFs(msg);
         return;
       case "error":
@@ -451,6 +545,7 @@ export class HostConnection {
         // 对着转圈等 15 秒才超时。
         if (this.rejectFsFor("#workspace", msg.message)) return;
         if (this.rejectFsFor("#conversations", msg.message)) return;
+        if (this.rejectFsFor("#accounts", msg.message)) return;
         this.events.emit("serverError", msg);
         return;
       case "hello.ok":
@@ -480,16 +575,22 @@ export class HostConnection {
         ? "#workspace"
         : msg.type === "conversation.results"
           ? "#conversations"
+          : msg.type === "agent.accounts.result"
+            ? "#accounts"
           : (msg.sid ?? "#account");
     const responsePath =
       msg.type === "chat.suggestions"
         ? `#chat.suggestions:${msg.requestId}`
+        : msg.type === "subagent.history.result"
+          ? `#subagent.history:${msg.requestId}`
         : msg.type === "agent.models"
           ? `#agent.models:${msg.requestId}`
           : msg.type === "agent.modes"
             ? `#agent.modes:${msg.requestId}`
             : msg.type === "conversation.results"
               ? `#conversation.results:${msg.requestId}`
+              : msg.type === "agent.accounts.result"
+                ? `#agent.accounts:${msg.requestId}`
               : msg.type === "agent.control.result"
                 ? `#agent.control:${msg.requestId}`
                 : (msg.path ?? `#${msg.type}`);
@@ -563,17 +664,119 @@ export class HostConnection {
     agent: "claude" | "codex",
     query: string,
     limit = 20,
+    accountId?: string,
   ): Promise<ResumableConversation[]> {
     const requestId = this.agentRequestId();
     const result = await this.fsRequest<Extract<S2CMessage, { type: "conversation.results" }>>(
       "#conversations",
       `#conversation.results:${requestId}`,
-      { type: "conversation.search", requestId, agent, query, limit },
+      {
+        type: "conversation.search",
+        requestId,
+        agent,
+        query,
+        limit,
+        ...(accountId ? { accountId } : {}),
+      },
       30_000,
       false,
     );
     if (result.error) throw new Error(result.error);
     return result.conversations;
+  }
+
+  private async accountRequest(
+    message:
+      | Extract<C2SMessage, { type: "agent.accounts.list" }>
+      | Extract<C2SMessage, { type: "agent.account.create" }>
+      | Extract<C2SMessage, { type: "agent.account.rename" }>
+      | Extract<C2SMessage, { type: "agent.account.default" }>
+      | Extract<C2SMessage, { type: "agent.account.login" }>
+      | Extract<C2SMessage, { type: "agent.account.credential.set" }>
+      | Extract<C2SMessage, { type: "agent.account.logout" }>
+      | Extract<C2SMessage, { type: "agent.account.delete" }>,
+  ): Promise<AgentAccountsResult> {
+    if (!this.supportsAgentAccounts) throw new Error("请先升级 Mac 端以管理 Code Agent 账号");
+    const result = await this.fsRequest<Extract<S2CMessage, { type: "agent.accounts.result" }>>(
+      "#accounts",
+      `#agent.accounts:${message.requestId}`,
+      message,
+      45_000,
+      false,
+    );
+    if (!result.ok) throw new Error(result.error ?? "账号操作失败");
+    return result;
+  }
+
+  async agentAccounts(): Promise<AgentAccount[]> {
+    const requestId = this.agentRequestId();
+    return (await this.accountRequest({ type: "agent.accounts.list", requestId })).accounts;
+  }
+
+  createAgentAccount(agent: CodeAgentKind, name: string): Promise<AgentAccountsResult> {
+    return this.accountRequest({
+      type: "agent.account.create",
+      requestId: this.agentRequestId(),
+      agent,
+      name,
+    });
+  }
+
+  renameAgentAccount(accountId: string, name: string): Promise<AgentAccountsResult> {
+    return this.accountRequest({
+      type: "agent.account.rename",
+      requestId: this.agentRequestId(),
+      accountId,
+      name,
+    });
+  }
+
+  setDefaultAgentAccount(accountId: string): Promise<AgentAccountsResult> {
+    return this.accountRequest({
+      type: "agent.account.default",
+      requestId: this.agentRequestId(),
+      accountId,
+    });
+  }
+
+  loginAgentAccount(accountId: string, cols = 80, rows = 24): Promise<AgentAccountsResult> {
+    return this.accountRequest({
+      type: "agent.account.login",
+      requestId: this.agentRequestId(),
+      accountId,
+      cols,
+      rows,
+    });
+  }
+
+  setAgentAccountCredential(
+    accountId: string,
+    credentialKind: AgentCredentialKind,
+    credential: string,
+  ): Promise<AgentAccountsResult> {
+    return this.accountRequest({
+      type: "agent.account.credential.set",
+      requestId: this.agentRequestId(),
+      accountId,
+      credentialKind,
+      credential,
+    });
+  }
+
+  logoutAgentAccount(accountId: string): Promise<AgentAccountsResult> {
+    return this.accountRequest({
+      type: "agent.account.logout",
+      requestId: this.agentRequestId(),
+      accountId,
+    });
+  }
+
+  deleteAgentAccount(accountId: string): Promise<AgentAccountsResult> {
+    return this.accountRequest({
+      type: "agent.account.delete",
+      requestId: this.agentRequestId(),
+      accountId,
+    });
   }
 
   fsRead(sid: string, path: string): Promise<Extract<S2CMessage, { type: "fs.content" }>> {
@@ -711,7 +914,10 @@ export class HostConnection {
       this.ws!.send(this.channel!.seal(msg));
       return true;
     }
-    if (queueable && this.queue.length < MAX_QUEUE) this.queue.push(msg);
+    if (queueable && this.queue.length < MAX_QUEUE) {
+      this.queue.push(msg);
+      return true;
+    }
     return false;
   }
 
@@ -734,6 +940,8 @@ export class HostConnection {
       resume?: { id: string; title?: string };
       /** Goal 会同时创建编排 Run，并把新会话作为协调者。 */
       goal?: string;
+      /** 账号环境与 cwd 独立；多个账号可指向同一个项目。 */
+      accountId?: string;
     },
   ): void {
     this.send(
@@ -746,6 +954,7 @@ export class HostConnection {
         ...(options?.mode ? { mode: options.mode } : {}),
         ...(options?.resume ? { resume: options.resume } : {}),
         ...(options?.goal ? { goal: options.goal } : {}),
+        ...(options?.accountId ? { accountId: options.accountId } : {}),
         cols,
         rows,
       },
@@ -772,12 +981,167 @@ export class HostConnection {
 
   /** 拉取 daemon 的编排快照；前台定时刷新能跨 iOS/Android 后台恢复。 */
   orchestrationSnapshot(): void {
+    if (!this.supportsOrchestrationSnapshot) return;
     this.send({ type: "orchestration.snapshot" });
   }
 
   /** 人类在手机上解开 Gate；成功后 daemon 回传新的完整快照。 */
   resolveOrchestrationGate(gateId: string, decision: string): void {
     this.send({ type: "orchestration.gate.resolve", gateId, decision }, true);
+  }
+
+  createOrchestrationRun(objective: string): boolean {
+    if (!this.supportsManualOrchestration) return false;
+    return this.send({
+      type: "orchestration.run.create",
+      objective,
+      operationId: randomUUID(),
+    }, true);
+  }
+
+  createOrchestrationGraph(input: {
+    objective: string;
+    nodes: OrchestrationGraphNodeInput[];
+    /** 编辑器生命周期内保持稳定；发送成功但响应丢失时重试仍只创建一次。 */
+    operationId: string;
+  }): boolean {
+    if (!this.supportsGraphOrchestration) return false;
+    return this.send({
+      type: "orchestration.graph.create",
+      objective: input.objective,
+      nodes: input.nodes,
+      operationId: input.operationId,
+    }, true);
+  }
+
+  applyOrchestrationGraph(input: {
+    runId: string;
+    baseRevision: number;
+    nodes: OrchestrationGraphNodeInput[];
+    deleteTaskIds?: string[];
+    operationId: string;
+  }): boolean {
+    if (!this.supportsGraphOrchestration) return false;
+    return this.send({
+      type: "orchestration.graph.apply",
+      runId: input.runId,
+      baseRevision: input.baseRevision,
+      nodes: input.nodes,
+      operationId: input.operationId,
+      ...(input.deleteTaskIds && input.deleteTaskIds.length > 0
+        ? { deleteTaskIds: input.deleteTaskIds }
+        : {}),
+    }, true);
+  }
+
+  deleteOrchestrationRun(runId: string): boolean {
+    if (!this.supportsOrchestrationManagement) return false;
+    return this.send({
+      type: "orchestration.run.delete",
+      runId,
+      operationId: randomUUID(),
+    }, true);
+  }
+
+  createOrchestrationTask(input: {
+    runId: string;
+    title: string;
+    spec: string;
+    deps?: string[];
+    parentId?: string;
+  }): boolean {
+    if (!this.supportsManualOrchestration) return false;
+    return this.send({
+      type: "orchestration.task.create",
+      runId: input.runId,
+      title: input.title,
+      spec: input.spec,
+      operationId: randomUUID(),
+      ...(input.deps && input.deps.length > 0 ? { deps: input.deps } : {}),
+      ...(input.parentId ? { parentId: input.parentId } : {}),
+    }, true);
+  }
+
+  cancelOrchestrationTask(taskId: string, reason?: string): boolean {
+    if (!this.supportsOrchestrationLifecycle) return false;
+    return this.send({
+      type: "orchestration.task.cancel",
+      taskId,
+      operationId: randomUUID(),
+      ...(reason ? { reason } : {}),
+    }, true);
+  }
+
+  retryOrchestrationTask(taskId: string): boolean {
+    if (!this.supportsOrchestrationLifecycle) return false;
+    return this.send({
+      type: "orchestration.task.retry",
+      taskId,
+      operationId: randomUUID(),
+    }, true);
+  }
+
+  startOrchestrationWorker(input: {
+    taskId: string;
+    agent: AgentKind;
+    accountId?: string;
+    worktree: "new" | "none";
+    cwd: string;
+    kind?: SessionKind;
+    approvalPolicy?: ApprovalPolicy;
+  }): boolean {
+    if (!this.supportsManualOrchestration) return false;
+    return this.send({
+      type: "orchestration.worker.start",
+      taskId: input.taskId,
+      agent: input.agent,
+      ...(input.accountId ? { accountId: input.accountId } : {}),
+      worktree: input.worktree,
+      cwd: input.cwd,
+      operationId: randomUUID(),
+      ...(input.kind ? { kind: input.kind } : {}),
+      ...(input.approvalPolicy ? { approvalPolicy: input.approvalPolicy } : {}),
+    }, true);
+  }
+
+  stopOrchestrationWorker(taskId: string, reason?: string): boolean {
+    if (!this.supportsOrchestrationLifecycle) return false;
+    return this.send({
+      type: "orchestration.worker.stop",
+      taskId,
+      operationId: randomUUID(),
+      ...(reason ? { reason } : {}),
+    }, true);
+  }
+
+  startOrchestrationAutomation(input: {
+    runId: string;
+    agent: AgentKind;
+    accountId?: string;
+    approvalPolicy: ApprovalPolicy;
+    workspace: "run" | "current";
+    cwd: string;
+  }): boolean {
+    if (!this.supportsAutomationOrchestration) return false;
+    return this.send({
+      type: "orchestration.automation.start",
+      operationId: randomUUID(),
+      runId: input.runId,
+      agent: input.agent,
+      ...(input.accountId ? { accountId: input.accountId } : {}),
+      approvalPolicy: input.approvalPolicy,
+      workspace: input.workspace,
+      cwd: input.cwd,
+    }, true);
+  }
+
+  pauseOrchestrationAutomation(runId: string): boolean {
+    if (!this.supportsAutomationOrchestration) return false;
+    return this.send({
+      type: "orchestration.automation.pause",
+      operationId: randomUUID(),
+      runId,
+    }, true);
   }
 
   /** 拉取某次工具调用的完整输出(卡片展开时) */
@@ -809,6 +1173,22 @@ export class HostConnection {
 
   sendToSubagent(sid: string, subagentId: string, text: string): void {
     this.send({ type: "subagent.send", sid, subagentId, text }, true);
+  }
+
+  /** 子 Agent 详情按需读取 Codex/后端原生历史；旧 daemon 继续用父快照降级。 */
+  async subagentHistory(sid: string, subagentId: string): Promise<AgentEventBody[]> {
+    if (!this.supportsSubagentHistory) throw new Error("当前 Mac 版本不支持子 Agent 历史");
+    const requestId = this.agentRequestId();
+    const result = await this.fsRequest<
+      Extract<S2CMessage, { type: "subagent.history.result" }>
+    >(
+      sid,
+      `#subagent.history:${requestId}`,
+      { type: "subagent.history.get", sid, subagentId, requestId },
+      30_000,
+      false,
+    );
+    return result.events;
   }
 
   inputB64(sid: string, dataB64: string): void {

@@ -5,7 +5,9 @@
  */
 import { fromB64Url, toB64Url } from "./b64.js";
 import { ProtocolError } from "./errors.js";
-import { PROTOCOL_VERSION } from "./messages.js";
+import {
+  SUPPORTED_PAIRING_FORMAT_VERSIONS,
+} from "./messages.js";
 import { PairingPayloadSchema, type PairingPayload } from "./schemas.js";
 import { utf8Decode, utf8Encode } from "./utf8.js";
 
@@ -35,9 +37,9 @@ export function decodePairingQR(text: string): PairingPayload {
   if (!parsed.success) {
     throw new ProtocolError("pairing payload failed validation", "format");
   }
-  if (parsed.data.v !== PROTOCOL_VERSION) {
+  if (!(SUPPORTED_PAIRING_FORMAT_VERSIONS as readonly number[]).includes(parsed.data.v)) {
     throw new ProtocolError(
-      `pairing payload version ${parsed.data.v} not supported (local ${PROTOCOL_VERSION})`,
+      `pairing payload version ${parsed.data.v} not supported (supported ${SUPPORTED_PAIRING_FORMAT_VERSIONS.join(",")})`,
       "version",
     );
   }

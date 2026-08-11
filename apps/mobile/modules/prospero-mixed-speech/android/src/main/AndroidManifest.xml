@@ -1,3 +1,11 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
   <uses-permission android:name="android.permission.RECORD_AUDIO" />
+  <uses-permission android:name="com.samsung.android.intellivoiceservice.ai.asr.permission.BIND_SPEECH_RECOGNITION_SERVICE" />
+
+  <queries>
+    <package android:name="com.samsung.android.intellivoiceservice" />
+    <intent>
+      <action android:name="android.intellivoiceservice.speech.RecognitionService" />
+    </intent>
+  </queries>
 </manifest>

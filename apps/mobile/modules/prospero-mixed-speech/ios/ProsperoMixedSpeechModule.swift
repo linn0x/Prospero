@@ -348,7 +348,14 @@ public final class ProsperoMixedSpeechModule: Module {
   public func definition() -> ModuleDefinition {
     Name("ProsperoMixedSpeech")
 
-    Events("onVolume")
+    Events("onVolume", "onTranscript")
+
+    Function("getEngine") {
+      if #available(iOS 26.0, *), SpeechTranscriber.isAvailable {
+        return "apple"
+      }
+      return "unavailable"
+    }
 
     Function("isAvailable") {
       if #available(iOS 26.0, *) {

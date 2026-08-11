@@ -86,4 +86,44 @@ describe("DispatchService", () => {
       .toThrow(/另一个 worker/);
     expect(store.getDispatch(started.dispatch.id).state).toBe("running");
   });
+
+  it("停止 worker 会终止会话、放弃本次派发并让任务进入可重试的 failed", async () => {
+    const store = new OrchestrationStore();
+    const run = store.createRun({ objective: "停止测试" });
+    const task = store.createTask({ runId: run.id, title: "长任务", spec: "" });
+    const sessions = new FakeSessions();
+    const service = new DispatchService(store, sessions);
+    const started = await service.startWorker({
+      taskId: task.id,
+      agent: "codex",
+      worktree: "none",
+      cwd: "/tmp/project",
+    });
+
+    const stopped = await service.stopWorker(task.id, "用户主动停止");
+    expect(sessions.killed).toEqual([started.session.id]);
+    expect(stopped.dispatch).toMatchObject({ state: "abandoned", outcome: "用户主动停止" });
+    expect(stopped.task).toMatchObject({ status: "failed", result: "用户主动停止" });
+    await expect(service.stopWorker(task.id)).rejects.toMatchObject({ code: "worker_not_active" });
+  });
+
+  it("worker 未交付就自然退出时会自动收尾，不再永久显示 running", async () => {
+    const store = new OrchestrationStore();
+    const run = store.createRun({ objective: "退出收尾" });
+    const task = store.createTask({ runId: run.id, title: "会退出", spec: "" });
+    const sessions = new FakeSessions();
+    const service = new DispatchService(store, sessions);
+    const started = await service.startWorker({
+      taskId: task.id,
+      agent: "codex",
+      worktree: "none",
+      cwd: "/tmp/project",
+    });
+
+    expect(service.settleEndedSession(started.session.id, "worker 会话意外退出")).toMatchObject({
+      task: { status: "failed" },
+      dispatch: { state: "abandoned" },
+    });
+    expect(service.settleEndedSession(started.session.id, "重复事件")).toBeNull();
+  });
 });

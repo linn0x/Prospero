@@ -50,3 +50,6 @@ example
 
 # Downloaded, checksum-pinned Android offline speech model (bundled into APK).
 /.cache/voice/
+
+# build-ipa.sh 为每台真机记住上次安装的 Bundle ID，防止升级时误换 App 身份。
+/.cache/installed-ios-bundle-id-*

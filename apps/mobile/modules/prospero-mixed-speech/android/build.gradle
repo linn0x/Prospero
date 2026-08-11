@@ -12,6 +12,10 @@ def voiceModelFile = new File(voiceModelDir, 'ggml-small-q5_1.bin')
 android {
   namespace 'com.linn0x.prospero.mixedspeech'
 
+  buildFeatures {
+    aidl true
+  }
+
   defaultConfig {
     versionCode 1
     versionName '0.1.0'

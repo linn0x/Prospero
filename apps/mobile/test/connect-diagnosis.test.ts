@@ -5,10 +5,11 @@ const at = (addr: string, failure: AttemptResult["failure"], detail?: string): A
   detail !== undefined ? { addr, failure, detail } : { addr, failure };
 
 describe("连接失败诊断", () => {
-  it("没有候选地址 → 需要重新配对,重试无意义", () => {
+  it("没有候选地址 → 编辑地址但保留配对,重试无意义", () => {
     const d = diagnose([], true);
     expect(d.fatal).toBe(true);
-    expect(d.hint).toContain("重新扫码");
+    expect(d.hint).toContain("无需重新扫码");
+    expect(d.hint).toContain("连接设置");
   });
 
   it("鉴权失败优先于其他原因,且不再重试", () => {
@@ -42,10 +43,11 @@ describe("连接失败诊断", () => {
     expect(d.hint).toContain("prosperod");
   });
 
-  it("版本不符是终局:指向重装 App,且不再重试", () => {
+  it("超出兼容窗口时升级旧端但保留配对", () => {
     const d = diagnose([at("10.0.0.1", "version")], false);
-    expect(d.summary).toContain("版本不符");
+    expect(d.summary).toContain("无共同协议版本");
     expect(d.hint).toContain("build-ipa");
+    expect(d.hint).toContain("不要重新扫码");
     expect(d.fatal).toBe(true);
   });
 
@@ -73,7 +75,7 @@ describe("连接失败诊断", () => {
 
   it("撤销与版本不符都排在普通鉴权失败之前", () => {
     expect(diagnose([at("a", "auth"), at("b", "revoked")], false).summary).toContain("已被移除");
-    expect(diagnose([at("a", "auth"), at("b", "version")], false).summary).toContain("版本不符");
+    expect(diagnose([at("a", "auth"), at("b", "version")], false).summary).toContain("无共同协议版本");
   });
 
   it("混合失败时超时优先(说明至少有地址可达)", () => {
