@@ -6,6 +6,7 @@ import { StatusBar } from "expo-status-bar";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { KeyboardProvider } from "react-native-keyboard-controller";
 import { ToastHost } from "@/components/Toast";
+import { useAdaptiveLayout } from "@/lib/adaptive-layout";
 import { color } from "@/lib/theme";
 
 const prosperoTheme = {
@@ -27,6 +28,8 @@ export const unstable_settings = {
 };
 
 export default function RootLayout() {
+  const { verticalPanes } = useAdaptiveLayout();
+
   return (
     // Swipeable 依赖这个根视图;缺了它手势在真机上会静默失效
     <GestureHandlerRootView style={{ flex: 1 }}>
@@ -39,6 +42,9 @@ export default function RootLayout() {
               headerStyle: { backgroundColor: color.surface },
               headerTintColor: color.text,
               headerTitleStyle: { fontSize: 17, fontWeight: "600" },
+              // A centered native-stack title otherwise lands directly under
+              // the hinge on book-style foldables.
+              headerTitleAlign: verticalPanes ? "left" : undefined,
               headerShadowVisible: false,
               headerBackButtonDisplayMode: "minimal",
               contentStyle: { backgroundColor: color.bg },

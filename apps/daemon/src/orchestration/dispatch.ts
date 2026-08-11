@@ -17,11 +17,13 @@ export interface WorkerSessionManager {
   chatSend(sid: string, text: string): Promise<void>;
   requirePty(sid: string): { writeInput(text: string): void };
   kill(sid: string): Promise<void>;
+  infoOf?(sid: string): SessionInfo;
 }
 
 export interface StartWorkerInput {
   taskId: string;
   agent: AgentKind;
+  accountId?: string | undefined;
   /** 新 worktree 才能与其他 worker 并行改代码；none 用协调者当前 cwd。 */
   worktree: WorktreeMode;
   /** 仅在 worktree:new 时用作仓库定位；none 时就是 worker 的 cwd。 */
@@ -39,8 +41,16 @@ export interface StartWorkerResult {
   worktree: { path: string; clones: CloneReport[] } | null;
 }
 
+export interface StopWorkerResult {
+  task: Task;
+  dispatch: Dispatch;
+}
+
 export class DispatchError extends Error {
-  constructor(message: string, readonly code: "task_not_ready" | "not_a_repo" | "wrong_worker") {
+  constructor(
+    message: string,
+    readonly code: "task_not_ready" | "not_a_repo" | "wrong_worker" | "worker_not_active",
+  ) {
     super(message);
   }
 }
@@ -50,6 +60,49 @@ export class DispatchService {
     private readonly store: OrchestrationStore,
     private readonly sessions: WorkerSessionManager,
   ) {}
+
+  /**
+   * 人类显式停止 worker。先终止真实会话，再把这次派发落为 abandoned；若 worker
+   * 在 kill 之前已经显式交付，则尊重 done/failed，不用停止动作覆盖真实结果。
+   */
+  async stopWorker(taskId: string, reason = "由用户停止 worker"): Promise<StopWorkerResult> {
+    const active = this.store.activeDispatchFor(taskId);
+    if (!active) {
+      throw new DispatchError(`任务 ${taskId} 没有运行中的 worker`, "worker_not_active");
+    }
+    await this.sessions.kill(active.sessionId);
+
+    let currentDispatch = this.store.getDispatch(active.id);
+    let currentTask = this.store.getTask(taskId);
+    if (currentDispatch.state === "starting" || currentDispatch.state === "running") {
+      currentDispatch = this.store.setDispatchState(active.id, "abandoned", reason);
+    } else if (currentDispatch.state === "abandoned") {
+      // SessionManager 的终态事件可能已先一步收尾；显式用户原因比泛化退出原因更有用。
+      currentDispatch = this.store.setDispatchState(active.id, "abandoned", reason);
+    }
+    if (currentTask.status === "dispatched") {
+      currentTask = this.store.setTaskStatus(taskId, "failed", reason);
+    } else if (currentTask.status === "failed" && currentDispatch.state === "abandoned") {
+      currentTask = this.store.setTaskStatus(taskId, "failed", reason);
+    }
+    return { task: currentTask, dispatch: currentDispatch };
+  }
+
+  /** PTY/结构化会话未显式交付就退出时，不能让 Dispatch 永久伪装成 running。 */
+  settleEndedSession(sessionId: string, reason: string): StopWorkerResult | null {
+    const active = this.store.listDispatches().find(
+      (candidate) =>
+        candidate.sessionId === sessionId &&
+        (candidate.state === "starting" || candidate.state === "running"),
+    );
+    if (!active) return null;
+    const settled = this.store.setDispatchState(active.id, "abandoned", reason);
+    const task = this.store.getTask(active.taskId);
+    const nextTask = task.status === "dispatched"
+      ? this.store.setTaskStatus(task.id, "failed", reason)
+      : task;
+    return { task: nextTask, dispatch: settled };
+  }
 
   /**
    * 先建好隔离目录和会话，再把 Dispatch 落盘，最后才把任务前导词送给 agent。
@@ -84,8 +137,15 @@ export class DispatchService {
         worktree = { repo, path: created.path, clones: created.clones };
       }
 
+      const coordinator = run.coordinatorSessionId && this.sessions.infoOf
+        ? this.sessions.infoOf(run.coordinatorSessionId)
+        : null;
+      const inheritedAccountId =
+        input.accountId ??
+        (coordinator?.agent === input.agent ? coordinator.accountId : undefined);
       session = await this.sessions.create({
         agent: input.agent,
+        ...(inheritedAccountId ? { accountId: inheritedAccountId } : {}),
         ...(input.kind ? { kind: input.kind } : {}),
         ...(input.approvalPolicy ? { approvalPolicy: input.approvalPolicy } : {}),
         cwd: workerCwd,

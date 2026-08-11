@@ -80,6 +80,8 @@ export interface StructuredSessionOptions {
   adapter: AgentAdapter;
   /** 给本机会话子进程的环境；用于会话内 prospero CLI 身份。 */
   environment?: Record<string, string>;
+  accountId?: string;
+  accountName?: string;
   approvalPolicy?: ApprovalPolicy;
   restored?: StructuredSessionPersistentState;
   /** 新建 Prospero 会话时接入已有原生会话/初始模式。 */
@@ -100,6 +102,9 @@ export interface StructuredSessionPersistentState {
   agent: AgentKind;
   title: string;
   cwd: string;
+  /** version=1 的旧状态没有账号；省略表示沿用当时的本机默认环境。 */
+  accountId?: string;
+  accountName?: string;
   createdAt: number;
   approvalPolicy: ApprovalPolicy;
   events: AgentEventBody[];
@@ -120,6 +125,8 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
   readonly title: string;
   readonly cwd: string;
   readonly createdAt: number;
+  readonly accountId: string | undefined;
+  readonly accountName: string | undefined;
 
   private readonly adapter: AgentAdapter;
   private readonly environment: Record<string, string>;
@@ -152,6 +159,8 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     this.agent = opts.agent;
     this.title = opts.title;
     this.cwd = opts.cwd;
+    this.accountId = opts.accountId ?? opts.restored?.accountId;
+    this.accountName = opts.accountName ?? opts.restored?.accountName;
     this.adapter = opts.adapter;
     this.environment = opts.environment ?? {};
     const restored = opts.restored;
@@ -159,8 +168,25 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     this.policy = restored?.approvalPolicy ?? opts.approvalPolicy ?? DEFAULT_POLICY;
     this.adapterState = { ...(opts.initialAdapterState ?? {}) };
     if (restored) {
-      this.log.push(...restored.events.slice(-MAX_EVENTS));
-      this.evSeq = Math.max(restored.evSeq, this.log.length);
+      const nativeThreadId =
+        typeof restored.adapterState["threadId"] === "string"
+          ? restored.adapterState["threadId"]
+          : "";
+      const restoredEvents = restored.events.filter((body) => {
+        // 0.0.10 曾给 thread/list 发送本机 app-server 不认识的 ancestorThreadId。
+        // Codex 静默忽略后返回父线程自己，旧 daemon 随即把它持久化成了伪子 Agent。
+        // 真子线程绝不可能与父 threadId 相等，因此恢复时可无歧义地清掉这两类事件。
+        if (!nativeThreadId) return true;
+        if (body.kind === "subagent.started") return body.subagent.id !== nativeThreadId;
+        if (body.kind === "subagent.updated") return body.subagentId !== nativeThreadId;
+        return true;
+      });
+      this.log.push(...restoredEvents.slice(-MAX_EVENTS));
+      // 清理过历史时主动重建事件序号。仍持有旧游标的客户端会因 afterSeq 过大
+      // 自动回退全量快照，不会按已经不连续的旧序号错误增量续传。
+      this.evSeq = restoredEvents.length === restored.events.length
+        ? Math.max(restored.evSeq, this.log.length)
+        : this.log.length;
       this.preview = restored.preview;
       this.previewRaw = restored.previewRaw;
       this.previewMsgId = restored.previewMsgId;
@@ -299,6 +325,8 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
       createdAt: this.createdAt,
       cols: 80,
       rows: 24,
+      ...(this.accountId ? { accountId: this.accountId } : {}),
+      ...(this.accountName ? { accountName: this.accountName } : {}),
       pendingPermissions: this.pending.size,
       pendingQuestions: this.pendingQuestions.size,
       messageQueue: this.messageQueue.map(
@@ -358,6 +386,8 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
       agent: this.agent,
       title: this.title,
       cwd: this.cwd,
+      ...(this.accountId ? { accountId: this.accountId } : {}),
+      ...(this.accountName ? { accountName: this.accountName } : {}),
       createdAt: this.createdAt,
       approvalPolicy: this.policy,
       events: [...this.log],
@@ -467,6 +497,46 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
   /** attach 用:全量事件历史 + 当前 evSeq */
   snapshot(): { events: AgentEventBody[]; evSeq: number } {
     return { events: [...this.log], evSeq: this.evSeq };
+  }
+
+  /**
+   * 子 Agent 详情的权威快照。优先采用适配器原生历史，因其不受 Prospero
+   * MAX_EVENTS 和 daemon 重启时点限制；人工审批/提问只存在于 Prospero 层，
+   * 因此附加到原生历史尾部保留当前可交互状态。
+   */
+  async subagentSnapshot(
+    subagentId: string,
+  ): Promise<{ subagent: SubagentInfo; events: AgentEventBody[]; evSeq: number }> {
+    const subagent = this.subagents.get(subagentId);
+    if (!subagent) throw new Error("子 Agent 已不存在");
+    const stored = this.log.filter(
+      (body) => (body as { agentId?: string }).agentId === subagentId,
+    );
+    let native: AgentEventBody[] | null = null;
+    if (this.backendAvailable && this.adapter.readSubagentHistory) {
+      try {
+        native = await this.adapter.readSubagentHistory(subagentId);
+      } catch {
+        // app-server 短暂繁忙/正在落盘时，详情页仍应显示实时日志，而不是整页报错。
+        native = null;
+      }
+    }
+    if (!native || native.length === 0) {
+      return { subagent: { ...subagent }, events: stored, evSeq: this.evSeq };
+    }
+    const interactions = stored.filter(
+      (body) =>
+        body.kind === "permission.request" ||
+        body.kind === "permission.resolved" ||
+        body.kind === "permission.auto" ||
+        body.kind === "question.request" ||
+        body.kind === "question.resolved",
+    );
+    return {
+      subagent: { ...subagent },
+      events: [...native, ...interactions],
+      evSeq: this.evSeq,
+    };
   }
 
   /** 增量续传:返回 afterSeq 之后的事件;历史已被截断时返回 null(需全量快照) */

@@ -30,6 +30,8 @@ export interface StatusSession {
     name: string;
     status: string;
     canMessage: boolean;
+    role?: string;
+    task?: string;
     preview?: string;
   }>;
 }
@@ -162,6 +164,8 @@ export function toStatusSession(info: SessionInfo): StatusSession {
       name: subagent.name,
       status: subagent.status,
       canMessage: subagent.canMessage,
+      ...(subagent.role ? { role: subagent.role } : {}),
+      ...(subagent.task ? { task: subagent.task } : {}),
       ...(subagent.preview ? { preview: subagent.preview } : {}),
     }));
   }

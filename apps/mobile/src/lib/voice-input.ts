@@ -39,6 +39,18 @@ export function supportsAndroidMixedSpeech(apiLevel: unknown): boolean {
   return Number.isFinite(parsed) && parsed >= ANDROID_MIXED_SPEECH_MIN_API;
 }
 
+export function shouldUseAndroidSystemSpeech(
+  apiLevel: unknown,
+  recognitionAvailable: boolean,
+  onDeviceRecognitionAvailable: boolean,
+): boolean {
+  return (
+    supportsAndroidMixedSpeech(apiLevel) &&
+    recognitionAvailable &&
+    onDeviceRecognitionAvailable
+  );
+}
+
 /** Android 14+ 在同一次端侧识别中自动检测并切换中英文模型。 */
 export function androidMixedRecognitionOptions() {
   return {

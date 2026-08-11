@@ -44,6 +44,8 @@ export interface PtySessionOptions {
   file: string;
   args: string[];
   env: Record<string, string>;
+  accountId?: string;
+  accountName?: string;
 }
 
 export interface SnapshotResult {
@@ -65,6 +67,8 @@ export class PtySession extends EventEmitter<PtySessionEvents> {
   readonly title: string;
   readonly cwd: string;
   readonly createdAt = Date.now();
+  readonly accountId: string | undefined;
+  readonly accountName: string | undefined;
   readonly ring = new OutputRing(RING_BYTES);
 
   private cols: number;
@@ -88,6 +92,8 @@ export class PtySession extends EventEmitter<PtySessionEvents> {
     this.agent = opts.agent;
     this.title = opts.title;
     this.cwd = opts.cwd;
+    this.accountId = opts.accountId;
+    this.accountName = opts.accountName;
     this.cols = opts.cols;
     this.rows = opts.rows;
 
@@ -132,6 +138,8 @@ export class PtySession extends EventEmitter<PtySessionEvents> {
       createdAt: this.createdAt,
       cols: this.cols,
       rows: this.rows,
+      ...(this.accountId ? { accountId: this.accountId } : {}),
+      ...(this.accountName ? { accountName: this.accountName } : {}),
     };
   }
 

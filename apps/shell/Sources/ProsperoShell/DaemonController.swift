@@ -33,6 +33,8 @@ final class DaemonController {
 
   private var process: Process?
   private var refreshTimer: Timer?
+  /// 用户要求接管一个从终端启动的 daemon 时，等待旧 PID 真正退出再起壳托管版本。
+  private var externalRestartTask: Task<Void, Never>?
   /// 重启是在旧进程真正退出后才起新的 —— 靠 terminationHandler 接力,而不是睡一段时间赌它退干净了
   private var restartRequested = false
   private let bonjour = BonjourAdvertiser()
@@ -300,6 +302,8 @@ final class DaemonController {
   func stop() {
     bonjour.stop()
     restartRequested = false
+    externalRestartTask?.cancel()
+    externalRestartTask = nil
     guard let proc = process else {
       state = .stopped
       refresh()
@@ -316,7 +320,11 @@ final class DaemonController {
   /// 而不是睡 0.6 秒赌它已经退干净 —— 端口没释放就起会直接失败。
   func restart() {
     guard let proc = process else {
-      reallyStart()
+      if let running, running.processAlive {
+        restartExternal(running)
+      } else {
+        reallyStart()
+      }
       return
     }
     restartRequested = true
@@ -325,9 +333,95 @@ final class DaemonController {
     proc.terminate()
   }
 
+  /// “由终端启动”不能意味着 Mac App 永远无法升级或接管：用户明确点重启时，
+  /// 先给 status.json 记录的精确 PID 发 SIGTERM，等它释放端口后再由 App 拉起。
+  /// 不按进程名扫、不碰其他 node 进程，也不会在 App 启动时擅自中断正在工作的 Agent。
+  private func restartExternal(_ snapshot: RunningStatus) {
+    guard externalRestartTask == nil else { return }
+    let pid = snapshot.pid
+    guard Darwin.kill(pid, SIGTERM) == 0 else {
+      state = .failed("无法停止终端启动的 daemon(pid \(pid))")
+      return
+    }
+    state = .starting
+    bonjour.stop()
+    externalRestartTask = Task { @MainActor [weak self] in
+      for _ in 0..<150 {
+        if Task.isCancelled { return }
+        if Darwin.kill(pid, 0) != 0 && errno == ESRCH {
+          guard let self else { return }
+          self.externalRestartTask = nil
+          self.reallyStart()
+          return
+        }
+        try? await Task.sleep(for: .milliseconds(100))
+      }
+      guard let self else { return }
+      self.externalRestartTask = nil
+      self.state = .failed("旧 daemon(pid \(pid)) 在 15 秒内没有退出")
+    }
+  }
+
   enum SessionAction: String {
     case interrupt
     case kill
+  }
+
+  /// Mac 宿主用户直接创建会话。仍走 daemon 的 loopback control token，避免壳复制
+  /// SessionManager 的启动、tmux 托管和结构化适配逻辑。
+  func createLocalSession(
+    agent: String,
+    kind: String,
+    cwd: String,
+    approvalPolicy: String,
+    accountId: String?
+  ) async -> (id: String?, error: String?) {
+    guard let running, !running.controlToken.isEmpty else {
+      return (nil, "daemon 尚未提供本机控制接口")
+    }
+    guard let url = URL(
+      string: "http://127.0.0.1:\(running.port)/_prospero/control/session/create"
+    ) else {
+      return (nil, "无法构造控制地址")
+    }
+    var body: [String: Any] = [
+      "agent": agent,
+      "kind": kind,
+      "cwd": cwd,
+      "cols": 120,
+      "rows": 40,
+    ]
+    if kind == "structured" {
+      body["approvalPolicy"] = approvalPolicy
+    }
+    if let accountId, !accountId.isEmpty {
+      body["accountId"] = accountId
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("Bearer \(running.controlToken)", forHTTPHeaderField: "Authorization")
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    do {
+      request.httpBody = try JSONSerialization.data(withJSONObject: body)
+      let (data, response) = try await URLSession.shared.data(for: request)
+      guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+        if (response as? HTTPURLResponse)?.statusCode == 404 {
+          return (nil, "当前 daemon 尚不支持从 Mac 启动会话，请先重启 daemon 加载新版本")
+        }
+        let message = String(decoding: data, as: UTF8.self)
+          .trimmingCharacters(in: .whitespacesAndNewlines)
+        return (nil, message.isEmpty ? "daemon 拒绝创建会话" : message)
+      }
+      let root = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+      guard let id = root?["id"] as? String, !id.isEmpty else {
+        return (nil, "daemon 已创建会话，但没有返回会话 ID")
+      }
+      try? await Task.sleep(for: .milliseconds(250))
+      refresh()
+      return (id, nil)
+    } catch {
+      return (nil, error.localizedDescription)
+    }
   }
 
   /// 只通过 daemon 的本机控制接口管理会话;口令每次启动更换并只存在 0600 status.json。
@@ -355,6 +449,41 @@ final class DaemonController {
     }
   }
 
+  /// 读取某个子 Agent 的独立事件流。接口只监听 loopback，并复用 daemon 每次启动
+  /// 生成的控制口令；Mac App 不需要实现手机端的 E2E 握手，也不会读到父会话内容。
+  func loadSubagentTranscript(
+    sessionID: String,
+    subagentID: String,
+    agentName: String
+  ) async throws -> SubagentTranscript {
+    guard let running, !running.controlToken.isEmpty else {
+      throw SubagentTranscriptFailure("daemon 尚未提供本机控制接口")
+    }
+    let encodedSession = sessionID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed)
+      ?? sessionID
+    let encodedSubagent = subagentID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed)
+      ?? subagentID
+    guard let url = URL(
+      string: "http://127.0.0.1:\(running.port)/_prospero/control/session/\(encodedSession)/subagent/\(encodedSubagent)/events"
+    ) else {
+      throw SubagentTranscriptFailure("无法构造子 Agent 事件地址")
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = "GET"
+    request.cachePolicy = .reloadIgnoringLocalCacheData
+    request.setValue("Bearer \(running.controlToken)", forHTTPHeaderField: "Authorization")
+    let (data, response) = try await URLSession.shared.data(for: request)
+    guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+      let message = String(decoding: data, as: UTF8.self)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      if (response as? HTTPURLResponse)?.statusCode == 404 {
+        throw SubagentTranscriptFailure("这个子 Agent 已不在当前会话中")
+      }
+      throw SubagentTranscriptFailure(message.isEmpty ? "daemon 拒绝读取子 Agent 过程" : message)
+    }
+    return try SubagentTranscript.decode(data, agentName: agentName)
+  }
+
   /// 人类在 Mac 上解开 Goal Gate；回环地址 + 每次启动生成的 token 与会话管理同级保护。
   func resolveGate(id: String, decision: String) async -> String? {
     guard let running, !running.controlToken.isEmpty else {
@@ -375,6 +504,207 @@ final class DaemonController {
       let (data, response) = try await URLSession.shared.data(for: request)
       guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
         return String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+      }
+      refresh()
+      return nil
+    } catch {
+      return error.localizedDescription
+    }
+  }
+
+  func createManualRun(objective: String) async -> String? {
+    await performOrchestrationAction(
+      method: "run.create",
+      params: ["objective": objective, "operationId": UUID().uuidString]
+    )
+  }
+
+  func createOrchestrationGraph(
+    objective: String,
+    nodes: [OrchestrationGraphDraftNode],
+    operationId: String
+  ) async -> String? {
+    let payload: [[String: Any]] = nodes.map { node in
+      [
+        "clientId": node.id,
+        "title": node.title,
+        "spec": node.spec,
+        "deps": Array(node.deps).sorted(),
+      ]
+    }
+    return await performOrchestrationAction(
+      method: "graph.create",
+      params: [
+        "operationId": operationId,
+        "objective": objective,
+        "nodes": payload,
+      ]
+    )
+  }
+
+  func applyOrchestrationGraph(
+    runId: String,
+    baseRevision: Int,
+    nodes: [OrchestrationGraphDraftNode],
+    deleteTaskIds: [String],
+    operationId: String
+  ) async -> String? {
+    let payload: [[String: Any]] = nodes.map { node in
+      [
+        "clientId": node.id,
+        "title": node.title,
+        "spec": node.spec,
+        "deps": Array(node.deps).sorted(),
+      ]
+    }
+    return await performOrchestrationAction(
+      method: "graph.apply",
+      params: [
+        "operationId": operationId,
+        "runId": runId,
+        "baseRevision": baseRevision,
+        "nodes": payload,
+        "deleteTaskIds": deleteTaskIds,
+      ]
+    )
+  }
+
+  func deleteOrchestrationRun(runId: String) async -> String? {
+    await performOrchestrationAction(
+      method: "run.delete",
+      params: [
+        "runId": runId,
+        "operationId": UUID().uuidString,
+      ]
+    )
+  }
+
+  func createOrchestrationTask(
+    runId: String,
+    title: String,
+    spec: String,
+    deps: [String]
+  ) async -> String? {
+    await performOrchestrationAction(
+      method: "task.create",
+      params: [
+        "runId": runId,
+        "title": title,
+        "spec": spec,
+        "deps": deps,
+        "operationId": UUID().uuidString,
+      ]
+    )
+  }
+
+  func startOrchestrationWorker(
+    taskId: String,
+    agent: String,
+    cwd: String,
+    worktree: String,
+    approvalPolicy: String
+  ) async -> String? {
+    await performOrchestrationAction(
+      method: "worker.start",
+      params: [
+        "taskId": taskId,
+        "agent": agent,
+        "cwd": cwd,
+        "worktree": worktree,
+        "approvalPolicy": approvalPolicy,
+        "operationId": UUID().uuidString,
+      ]
+    )
+  }
+
+  func stopOrchestrationWorker(taskId: String) async -> String? {
+    await performOrchestrationAction(
+      method: "worker.stop",
+      params: [
+        "taskId": taskId,
+        "reason": "由 Mac 用户停止 worker",
+        "operationId": UUID().uuidString,
+      ]
+    )
+  }
+
+  func cancelOrchestrationTask(taskId: String) async -> String? {
+    await performOrchestrationAction(
+      method: "task.cancel",
+      params: [
+        "taskId": taskId,
+        "reason": "由 Mac 用户取消任务",
+        "operationId": UUID().uuidString,
+      ]
+    )
+  }
+
+  func retryOrchestrationTask(taskId: String) async -> String? {
+    await performOrchestrationAction(
+      method: "task.retry",
+      params: [
+        "taskId": taskId,
+        "operationId": UUID().uuidString,
+      ]
+    )
+  }
+
+  func startOrchestrationAutomation(
+    runId: String,
+    agent: String,
+    cwd: String,
+    workspace: String,
+    approvalPolicy: String
+  ) async -> String? {
+    await performOrchestrationAction(
+      method: "automation.start",
+      params: [
+        "runId": runId,
+        "agent": agent,
+        "cwd": cwd,
+        "workspace": workspace,
+        "approvalPolicy": approvalPolicy,
+        "operationId": UUID().uuidString,
+      ]
+    )
+  }
+
+  func pauseOrchestrationAutomation(runId: String) async -> String? {
+    await performOrchestrationAction(
+      method: "automation.pause",
+      params: [
+        "runId": runId,
+        "operationId": UUID().uuidString,
+      ]
+    )
+  }
+
+  /// Mac 壳的人工编排写操作统一走回环 HTTP + 每次启动轮换的 control token。
+  private func performOrchestrationAction(
+    method: String,
+    params: [String: Any]
+  ) async -> String? {
+    guard let running, !running.controlToken.isEmpty else {
+      return "daemon 尚未提供本机控制接口"
+    }
+    guard let url = URL(
+      string: "http://127.0.0.1:\(running.port)/_prospero/control/orchestration/action"
+    ) else {
+      return "无法构造控制地址"
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("Bearer \(running.controlToken)", forHTTPHeaderField: "Authorization")
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    do {
+      request.httpBody = try JSONSerialization.data(
+        withJSONObject: ["method": method, "params": params]
+      )
+      let (data, response) = try await URLSession.shared.data(for: request)
+      guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+        let message = String(decoding: data, as: UTF8.self)
+          .trimmingCharacters(in: .whitespacesAndNewlines)
+        return message.isEmpty ? "daemon 拒绝了这次编排操作" : message
       }
       refresh()
       return nil

@@ -23,6 +23,8 @@ struct RunningStatus: Sendable, Equatable {
     var kind: String
     var title: String
     var cwd: String
+    var accountId: String?
+    var accountName: String?
     var status: String
     var pendingPermissions: Int
     var pendingQuestions: Int
@@ -37,6 +39,8 @@ struct RunningStatus: Sendable, Equatable {
       var name: String
       var status: String
       var canMessage: Bool
+      var role: String?
+      var task: String?
       var preview: String?
 
       var statusLabel: String {
@@ -122,6 +126,8 @@ struct RunningStatus: Sendable, Equatable {
           kind: s["kind"] as? String ?? "pty",
           title: s["title"] as? String ?? id,
           cwd: s["cwd"] as? String ?? "",
+          accountId: s["accountId"] as? String,
+          accountName: s["accountName"] as? String,
           status: s["status"] as? String ?? "unknown",
           pendingPermissions: s["pendingPermissions"] as? Int ?? 0,
           pendingQuestions: s["pendingQuestions"] as? Int ?? 0,
@@ -136,6 +142,8 @@ struct RunningStatus: Sendable, Equatable {
               name: child["name"] as? String ?? "子 Agent",
               status: child["status"] as? String ?? "unknown",
               canMessage: child["canMessage"] as? Bool ?? false,
+              role: child["role"] as? String,
+              task: child["task"] as? String,
               preview: child["preview"] as? String
             )
           }

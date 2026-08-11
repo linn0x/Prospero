@@ -10,6 +10,7 @@ import { Stack, router, useFocusEffect } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Icon } from "@/components/Icon";
 import { SwipeRow } from "@/components/SwipeRow";
+import { useAdaptiveLayout } from "@/lib/adaptive-layout";
 import { getConnection, wireAppStateReconnect } from "@/lib/connection";
 import { getDeviceKeys, getHosts, removeHost, type StoredHost } from "@/lib/hosts";
 import { clearSessionPreferences } from "@/lib/session-preferences";
@@ -28,6 +29,12 @@ const statusLabel: Record<ConnStatus, string> = {
 
 export default function HostsScreen() {
   const insets = useSafeAreaInsets();
+  const adaptiveLayout = useAdaptiveLayout();
+  const hostColumns =
+    adaptiveLayout.verticalPanes !== null || adaptiveLayout.isExpanded ? 2 : 1;
+  const columnGap = adaptiveLayout.verticalPanes?.gap ?? space.lg;
+  const regularColumnWidth =
+    (adaptiveLayout.width - space.lg * 2 - columnGap) / 2;
   const [hosts, setLocal] = useState<StoredHost[]>([]);
   const setHosts = useApp((s) => s.setHosts);
   const runtimes = useApp((s) => s.runtimes);
@@ -83,7 +90,15 @@ export default function HostsScreen() {
         }}
       />
       {hosts.length === 0 ? (
-        <View style={styles.emptyWrap}>
+        <View
+          style={[
+            styles.emptyWrap,
+            adaptiveLayout.verticalPanes && {
+              width: adaptiveLayout.verticalPanes.end,
+              alignSelf: "flex-end",
+            },
+          ]}
+        >
           <Icon name="desktopcomputer" size={52} color={color.textFaint} />
           <Text style={styles.emptyTitle}>还没有配对的 Mac</Text>
           <Text style={styles.emptyText}>在 Mac 上运行 prosperod 并生成配对码:</Text>
@@ -94,52 +109,77 @@ export default function HostsScreen() {
         </View>
       ) : (
         <FlatList
+          key={`hosts-${String(hostColumns)}`}
           data={hosts}
+          numColumns={hostColumns}
           keyExtractor={(h) => h.id}
-          contentContainerStyle={[styles.list, { paddingBottom: insets.bottom + 20 }]}
+          columnWrapperStyle={
+            hostColumns === 2 ? { gap: columnGap } : undefined
+          }
+          contentContainerStyle={[
+            styles.list,
+            hostColumns === 2 &&
+              (adaptiveLayout.verticalPanes
+                ? styles.listFolded
+                : styles.listExpanded),
+            { paddingBottom: insets.bottom + 20 },
+          ]}
           ListFooterComponent={
             hosts.length > 0 ? (
               <Text style={styles.swipeHint}>左滑可编辑连接地址或删除配对</Text>
             ) : null
           }
-          renderItem={({ item }) => {
+          renderItem={({ item, index }) => {
             const status = runtimes[item.id]?.status ?? "idle";
+            const columnWidth = adaptiveLayout.verticalPanes
+              ? index % 2 === 0
+                ? adaptiveLayout.verticalPanes.start
+                : adaptiveLayout.verticalPanes.end
+              : regularColumnWidth;
             return (
-              <SwipeRow
-                actions={[
-                  {
-                    label: "编辑",
-                    symbol: "desktopcomputer",
-                    color: "#3a6ea5",
-                    onPress: () => router.push(`/host/${item.id}/edit`),
-                  },
-                  {
-                    label: "删除",
-                    symbol: "trash",
-                    color: "#e5534b",
-                    onPress: () => onDelete(item),
-                    confirm: {
-                      title: `移除「${item.name}」的配对?`,
-                      message: "凭证会从这台手机删除,要再用得重新扫码配对。",
-                      confirmLabel: "删除",
-                    },
-                  },
+              <View
+                style={[
+                  hostColumns === 2 && styles.hostColumn,
+                  hostColumns === 2 && { width: columnWidth },
+                  adaptiveLayout.verticalPanes && styles.hostColumnFolded,
                 ]}
               >
-              <Pressable
-                style={({ pressed }) => [styles.card, pressed && styles.cardPressed]}
-                onPress={() => router.push(`/host/${item.id}`)}
-              >
-                <View style={[styles.dot, { backgroundColor: statusColor[status] }]} />
-                <View style={styles.cardBody}>
-                  <Text style={styles.cardTitle}>{item.name}</Text>
-                  <Text style={styles.cardSub}>
-                    {statusLabel[status]}
-                    {item.addrs.length > 1 ? ` · ${String(item.addrs.length)} 条线路` : ""}
-                  </Text>
-                </View>
-              </Pressable>
-              </SwipeRow>
+                <SwipeRow
+                  actions={[
+                    {
+                      label: "编辑",
+                      symbol: "desktopcomputer",
+                      color: "#3a6ea5",
+                      onPress: () => router.push(`/host/${item.id}/edit`),
+                    },
+                    {
+                      label: "删除",
+                      symbol: "trash",
+                      color: "#e5534b",
+                      onPress: () => onDelete(item),
+                      confirm: {
+                        title: `移除「${item.name}」的配对?`,
+                        message: "凭证会从这台手机删除,要再用得重新扫码配对。",
+                        confirmLabel: "删除",
+                      },
+                    },
+                  ]}
+                >
+                  <Pressable
+                    style={({ pressed }) => [styles.card, pressed && styles.cardPressed]}
+                    onPress={() => router.push(`/host/${item.id}`)}
+                  >
+                    <View style={[styles.dot, { backgroundColor: statusColor[status] }]} />
+                    <View style={styles.cardBody}>
+                      <Text style={styles.cardTitle}>{item.name}</Text>
+                      <Text style={styles.cardSub}>
+                        {statusLabel[status]}
+                        {item.addrs.length > 1 ? ` · ${String(item.addrs.length)} 条线路` : ""}
+                      </Text>
+                    </View>
+                  </Pressable>
+                </SwipeRow>
+              </View>
             );
           }}
         />
@@ -151,6 +191,10 @@ export default function HostsScreen() {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: color.bg },
   list: { padding: space.lg, gap: space.md },
+  listExpanded: { gap: space.lg },
+  listFolded: { paddingHorizontal: 0 },
+  hostColumn: { flexShrink: 0 },
+  hostColumnFolded: { paddingHorizontal: space.lg },
   card: {
     flexDirection: "row",
     alignItems: "center",

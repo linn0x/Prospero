@@ -3,16 +3,45 @@
  *
  * 一条原则贯穿全文件:**状态只认显式转移,绝不猜**。
  *
- * 调研 Orca 的实现时,它有一条"agent 空闲了就当任务做完了"的推断路径
- * (靠 hook 上报 + 扫终端标题),那是误报的主要来源 —— agent 停下来的原因
- * 可能是做完了,也可能是卡住了、在等审批、或者纯粹跑崩了。
+ * 当前 Orca 与 Prospero 都通过 hook/IPC 获取运行状态；状态仍不等于任务结果。
+ * agent 停下来的原因可能是做完了,也可能是卡住了、在等审批、或者纯粹跑崩了。
  *
  * 我们有适配器给的精确 SessionStatus,但那也只当**提示**:它只用来告诉协调者
  * "这个 worker 不动了,去看一眼",绝不自动把 Task 判成 done。
  * 任务完成必须由 worker 显式 `task done` 或协调者显式验收。
  */
+import type { AgentKind, ApprovalPolicy } from "@prospero/protocol";
 
 export type RunStatus = "active" | "completed" | "abandoned";
+
+export type AutomationState = "running" | "paused" | "completed";
+export type AutomationWorkspace = "run" | "current";
+
+/**
+ * 人工画出的静态 DAG 可以由 daemon 自动推进，但仍坚持显式交付：
+ * 只有 worker 调用 `task done` 后才会派下一个节点。
+ *
+ * v1 故意让整张 Run 共用一个工作区并串行执行。若每个任务各建 worktree，
+ * 下游默认看不到上游未合并的改动；在自动 merge/冲突处理完成前不能假装安全并行。
+ */
+export interface RunAutomation {
+  state: AutomationState;
+  agent: AgentKind;
+  /** Code Agent 隔离账号；省略为兼容旧 Run 的本机环境。 */
+  accountId?: string;
+  approvalPolicy: ApprovalPolicy;
+  /** run = daemon 创建整张图共用的隔离 worktree；current = 直接使用 cwd。 */
+  workspace: AutomationWorkspace;
+  /** 用户选择的原始项目目录。 */
+  cwd: string;
+  /** worker 实际使用的目录；run 模式下是新 worktree 路径。 */
+  workspacePath: string;
+  /** run 模式的集成分支；current 模式为 null。 */
+  branch: string | null;
+  startedAt: number;
+  updatedAt: number;
+  lastError: string | null;
+}
 
 export interface Run {
   id: string;
@@ -20,6 +49,10 @@ export interface Run {
   status: RunStatus;
   /** 发起编排的那个会话;它就是协调者 */
   coordinatorSessionId: string | null;
+  /** 任务节点或依赖结构每次原子变更只递增一次。 */
+  graphRevision: number;
+  /** 旧快照没有此字段；null/省略都表示仍由人逐个派发。 */
+  automation?: RunAutomation | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -105,6 +138,14 @@ export interface Gate {
   resolvedAt: number | null;
 }
 
+/** 已完成的幂等写入；和业务状态同文件落盘，daemon 重启后仍不会重复执行。 */
+export interface OperationRecord {
+  id: string;
+  fingerprint: string;
+  result: unknown;
+  createdAt: number;
+}
+
 export interface OrchestrationState {
   version: 1;
   runs: Record<string, Run>;
@@ -112,10 +153,19 @@ export interface OrchestrationState {
   dispatches: Record<string, Dispatch>;
   messages: Record<string, Message>;
   gates: Record<string, Gate>;
+  operations: Record<string, OperationRecord>;
 }
 
 export function emptyState(): OrchestrationState {
-  return { version: 1, runs: {}, tasks: {}, dispatches: {}, messages: {}, gates: {} };
+  return {
+    version: 1,
+    runs: {},
+    tasks: {},
+    dispatches: {},
+    messages: {},
+    gates: {},
+    operations: {},
+  };
 }
 
 // ── 状态机 ──────────────────────────────────────────────────────────────

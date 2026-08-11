@@ -40,14 +40,14 @@ class TestClient {
     private readonly channel: SecureChannel,
   ) {}
 
-  static async connect(token: string, keys: KeyPairB64): Promise<TestClient> {
+  static async connect(token: string, keys: KeyPairB64, protocolVersion?: number): Promise<TestClient> {
     const ws = new WebSocket(`ws://127.0.0.1:${server.port}/ws`);
     await new Promise<void>((resolve, reject) => {
       ws.once("open", () => resolve());
       ws.once("error", reject);
     });
     // v1 三帧握手:临时公钥 → daemon 临时公钥+证明 → 加密 hello
-    const start = clientHandshakeStart();
+    const start = clientHandshakeStart(protocolVersion);
     ws.send(start.frame);
     const serverFrame = await new Promise<string>((resolve, reject) => {
       ws.once("message", (raw: Buffer) => resolve(raw.toString()));
@@ -152,17 +152,87 @@ afterAll(async () => {
 
 describe("daemon 全链路", () => {
   it("Mac GUI 控制接口仅接受 status.json 中的本机口令", async () => {
-    const info = await server.manager.create({
-      agent: "custom",
-      command: "sleep 30",
-      cwd: home,
-      cols: 80,
-      rows: 24,
-      allowShell: true,
-    });
     const status = JSON.parse(readFileSync(path.join(home, "status.json"), "utf8")) as {
       controlToken: string;
     };
+    const createUrl = `http://127.0.0.1:${String(server.port)}/_prospero/control/session/create`;
+    const createBody = JSON.stringify({
+      agent: "shell",
+      kind: "pty",
+      cwd: home,
+      cols: 90,
+      rows: 30,
+    });
+    expect((await fetch(createUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: createBody,
+    })).status).toBe(401);
+    const createdResponse = await fetch(createUrl, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${status.controlToken}`,
+        "content-type": "application/json",
+      },
+      body: createBody,
+    });
+    expect(createdResponse.status).toBe(201);
+    const info = await createdResponse.json() as { id: string; agent: string; kind: string; cwd: string };
+    expect(info).toMatchObject({ agent: "shell", kind: "pty", cwd: home });
+    expect(server.manager.infoOf(info.id)).toMatchObject({ agent: "shell", kind: "pty" });
+
+    const sessionViewUrl =
+      `http://127.0.0.1:${String(server.port)}/_prospero/control/session/${info.id}/view`;
+    expect((await fetch(sessionViewUrl)).status).toBe(401);
+    const initialView = await fetch(sessionViewUrl, {
+      headers: { authorization: `Bearer ${status.controlToken}` },
+    });
+    expect(initialView.status).toBe(200);
+    expect(await initialView.json()).toMatchObject({ kind: "pty" });
+    expect((await fetch(`${sessionViewUrl}?knownSeq=nope`, {
+      headers: { authorization: `Bearer ${status.controlToken}` },
+    })).status).toBe(400);
+
+    const interactUrl =
+      `http://127.0.0.1:${String(server.port)}/_prospero/control/session/${info.id}/interact`;
+    const inputBody = JSON.stringify({
+      type: "term.input",
+      dataB64: Buffer.from("printf 'MAC_APP_INPUT_OK\\n'\\n").toString("base64"),
+    });
+    expect((await fetch(interactUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: inputBody,
+    })).status).toBe(401);
+    expect((await fetch(interactUrl, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${status.controlToken}`,
+        "content-type": "application/json",
+      },
+      body: inputBody,
+    })).status).toBe(204);
+    let terminalText = "";
+    for (let attempt = 0; attempt < 80 && !terminalText.includes("MAC_APP_INPUT_OK"); attempt++) {
+      const response = await fetch(sessionViewUrl, {
+        headers: { authorization: `Bearer ${status.controlToken}` },
+      });
+      const view = await response.json() as { ansi: string };
+      terminalText = view.ansi;
+      if (!terminalText.includes("MAC_APP_INPUT_OK")) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    }
+    expect(terminalText).toContain("MAC_APP_INPUT_OK");
+
+    const childEventsUrl =
+      `http://127.0.0.1:${String(server.port)}/_prospero/control/session/${info.id}/subagent/child/events`;
+    expect((await fetch(childEventsUrl)).status).toBe(401);
+    // 子 Agent 过程接口只接受结构化会话；PTY 不会被误当成空对话。
+    expect((await fetch(childEventsUrl, {
+      headers: { authorization: `Bearer ${status.controlToken}` },
+    })).status).toBe(409);
+
     const url = `http://127.0.0.1:${String(server.port)}/_prospero/control/session/${info.id}/kill`;
 
     expect((await fetch(url, { method: "POST" })).status).toBe(401);
@@ -191,6 +261,66 @@ describe("daemon 全链路", () => {
       status: "resolved",
       decision: "继续测试",
     });
+
+    const actionUrl = `http://127.0.0.1:${String(server.port)}/_prospero/control/orchestration/action`;
+    const createdRunResponse = await fetch(actionUrl, {
+      method: "POST",
+      headers: { authorization: `Bearer ${status.controlToken}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        method: "run.create",
+        params: { objective: "Mac 手工编排" },
+      }),
+    });
+    expect(createdRunResponse.status).toBe(200);
+    const createdRun = await createdRunResponse.json() as { id: string; coordinatorSessionId: string | null };
+    expect(createdRun.coordinatorSessionId).toBeNull();
+
+    const createdTaskResponse = await fetch(actionUrl, {
+      method: "POST",
+      headers: { authorization: `Bearer ${status.controlToken}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        method: "task.create",
+        params: {
+          runId: createdRun.id,
+          title: "Mac 创建任务",
+          spec: "验证本机控制 token 保护的写入",
+          deps: [],
+        },
+      }),
+    });
+    expect(createdTaskResponse.status).toBe(200);
+    expect(server.orchestration.store.listTasks(createdRun.id)).toContainEqual(
+      expect.objectContaining({ title: "Mac 创建任务", status: "pending" }),
+    );
+
+    const graphRequest = {
+      method: "graph.create",
+      params: {
+        operationId: "mac-graph-create",
+        objective: "Mac 可视化编排",
+        nodes: [
+          { clientId: "design", title: "设计", spec: "定协议", deps: [] },
+          { clientId: "ship", title: "发布", spec: "联合验收", deps: ["design"] },
+        ],
+      },
+    };
+    const graphResponse = await fetch(actionUrl, {
+      method: "POST",
+      headers: { authorization: `Bearer ${status.controlToken}`, "content-type": "application/json" },
+      body: JSON.stringify(graphRequest),
+    });
+    expect(graphResponse.status).toBe(200);
+    const graph = await graphResponse.json() as { run: { id: string; graphRevision: number } };
+    expect(graph.run.graphRevision).toBe(1);
+    const graphRetry = await fetch(actionUrl, {
+      method: "POST",
+      headers: { authorization: `Bearer ${status.controlToken}`, "content-type": "application/json" },
+      body: JSON.stringify(graphRequest),
+    });
+    expect((await graphRetry.json() as { run: { id: string } }).run.id).toBe(graph.run.id);
+    expect(server.orchestration.store.listRuns().filter(
+      (candidate) => candidate.objective === "Mac 可视化编排",
+    )).toHaveLength(1);
   });
 
   it("新建会话前可在用户 home 内预览并选择工作目录", async () => {
@@ -245,6 +375,54 @@ describe("daemon 全链路", () => {
     c.close();
   }, 20000);
 
+  it("已授权手机可管理 Code Agent 账号元数据", async () => {
+    const c = await TestClient.connect(deviceToken, deviceKeys);
+    const hello = (await c.waitFor(
+      (m) => m.type === "hello.ok",
+      "hello.ok",
+    )) as Extract<S2CMessage, { type: "hello.ok" }>;
+    expect(hello.host.capabilities).toContain("agent.accounts.v1");
+
+    c.send({ type: "agent.accounts.list", requestId: "accounts-list" });
+    const initial = (await c.waitFor(
+      (m) => m.type === "agent.accounts.result" && m.requestId === "accounts-list",
+      "initial accounts",
+      20_000,
+    )) as Extract<S2CMessage, { type: "agent.accounts.result" }>;
+    expect(initial.accounts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "native-codex", managed: false }),
+      expect.objectContaining({ id: "native-claude", managed: false }),
+    ]));
+
+    c.send({
+      type: "agent.account.create",
+      requestId: "accounts-create",
+      agent: "codex",
+      name: "集成测试 Codex",
+    });
+    const created = (await c.waitFor(
+      (m) => m.type === "agent.accounts.result" && m.requestId === "accounts-create",
+      "created account",
+      20_000,
+    )) as Extract<S2CMessage, { type: "agent.accounts.result" }>;
+    const account = created.accounts.find((candidate) => candidate.name === "集成测试 Codex");
+    expect(account).toMatchObject({ agent: "codex", managed: true });
+
+    c.send({
+      type: "agent.account.rename",
+      requestId: "accounts-rename",
+      accountId: account!.id,
+      name: "发布 Codex",
+    });
+    const renamed = (await c.waitFor(
+      (m) => m.type === "agent.accounts.result" && m.requestId === "accounts-rename",
+      "renamed account",
+      20_000,
+    )) as Extract<S2CMessage, { type: "agent.accounts.result" }>;
+    expect(renamed.accounts).toContainEqual(expect.objectContaining({ id: account!.id, name: "发布 Codex" }));
+    c.close();
+  }, 30000);
+
   it("手机可拉取编排快照并处理人工 Gate", async () => {
     const run = server.orchestration.store.createRun({ objective: "验证手机 Goal 面板" });
     const gate = server.orchestration.store.createGate({
@@ -271,6 +449,200 @@ describe("daemon 全链路", () => {
     )) as Extract<S2CMessage, { type: "orchestration.snapshot" }>;
     expect(resolved.snapshot.gates.find((candidate) => candidate.id === gate.id)?.decision).toBe("继续测试");
     c.close();
+  }, 20000);
+
+  it("已授权手机可手工创建 Run 与依赖任务", async () => {
+    const c = await TestClient.connect(deviceToken, deviceKeys);
+    const hello = (await c.waitFor(
+      (m) => m.type === "hello.ok",
+      "hello.ok",
+    )) as Extract<S2CMessage, { type: "hello.ok" }>;
+    expect(hello.host.capabilities).toContain("orchestration.manual.v1");
+    expect(hello.host.capabilities).toContain("orchestration.graph.v1");
+    expect(hello.host.capabilities).toContain("orchestration.automation.v1");
+    expect(hello.host.capabilities).toContain("orchestration.management.v1");
+    expect(hello.host.capabilities).toContain("orchestration.lifecycle.v1");
+    expect(hello.host.capabilities).toContain("subagent.history.v1");
+    expect(hello.host.capabilities).toContain("agent.accounts.v1");
+
+    const objective = `手工编排-${String(Date.now())}`;
+    c.send({ type: "orchestration.run.create", objective });
+    const withRun = (await c.waitFor(
+      (m) => m.type === "orchestration.snapshot" &&
+        m.snapshot.runs.some((run) => run.objective === objective),
+      "manual run snapshot",
+    )) as Extract<S2CMessage, { type: "orchestration.snapshot" }>;
+    const run = withRun.snapshot.runs.find((candidate) => candidate.objective === objective)!;
+    expect(run.coordinatorSessionId).toBeNull();
+
+    c.send({
+      type: "orchestration.task.create",
+      runId: run.id,
+      title: "实现兼容握手",
+      spec: "支持 v9/v8/v7/v5 并补测试",
+    });
+    const withTask = (await c.waitFor(
+      (m) => m.type === "orchestration.snapshot" &&
+        m.snapshot.tasks.some((task) => task.runId === run.id && task.title === "实现兼容握手"),
+      "manual task snapshot",
+    )) as Extract<S2CMessage, { type: "orchestration.snapshot" }>;
+    expect(withTask.snapshot.tasks).toContainEqual(expect.objectContaining({
+      runId: run.id,
+      status: "pending",
+    }));
+    const task = withTask.snapshot.tasks.find(
+      (candidate) => candidate.runId === run.id && candidate.title === "实现兼容握手",
+    )!;
+    c.send({
+      type: "orchestration.worker.start",
+      taskId: task.id,
+      agent: "shell",
+      kind: "pty",
+      worktree: "none",
+      cwd: workspaceRoot,
+      approvalPolicy: "standard",
+    });
+    const dispatched = (await c.waitFor(
+      (m) => m.type === "orchestration.snapshot" &&
+        m.snapshot.dispatches.some((candidate) => candidate.taskId === task.id),
+      "manual worker snapshot",
+    )) as Extract<S2CMessage, { type: "orchestration.snapshot" }>;
+    const dispatch = dispatched.snapshot.dispatches.find((candidate) => candidate.taskId === task.id)!;
+    expect(dispatch.state).toBe("running");
+    expect(dispatched.snapshot.tasks).toContainEqual(expect.objectContaining({
+      id: task.id,
+      status: "dispatched",
+    }));
+    await server.manager.kill(dispatch.sessionId);
+    const stopped = (await c.waitFor(
+      (m) => m.type === "orchestration.snapshot" &&
+        m.snapshot.tasks.some((candidate) => candidate.id === task.id && candidate.status === "failed") &&
+        m.snapshot.dispatches.some((candidate) => candidate.id === dispatch.id && candidate.state === "abandoned"),
+      "ended worker orchestration snapshot",
+    )) as Extract<S2CMessage, { type: "orchestration.snapshot" }>;
+    expect(stopped.snapshot.tasks.find((candidate) => candidate.id === task.id)?.result)
+      .toMatch(/退出|未显式交付/);
+
+    c.send({
+      type: "orchestration.task.retry",
+      taskId: task.id,
+      operationId: `retry-${String(Date.now())}`,
+    });
+    await expect(c.waitFor(
+      (m) => m.type === "orchestration.snapshot" &&
+        m.snapshot.tasks.some((candidate) => candidate.id === task.id && candidate.status === "pending"),
+      "retried task snapshot",
+    )).resolves.toMatchObject({ type: "orchestration.snapshot" });
+
+    c.send({
+      type: "orchestration.task.cancel",
+      taskId: task.id,
+      reason: "集成测试取消",
+      operationId: `cancel-${String(Date.now())}`,
+    });
+    await expect(c.waitFor(
+      (m) => m.type === "orchestration.snapshot" &&
+        m.snapshot.tasks.some((candidate) => candidate.id === task.id && candidate.status === "cancelled"),
+      "cancelled task snapshot",
+    )).resolves.toMatchObject({ type: "orchestration.snapshot" });
+    c.close();
+  }, 20000);
+
+  it("手机可原子发布可视化 DAG，重试不重复创建，过期 revision 返回冲突", async () => {
+    const c = await TestClient.connect(deviceToken, deviceKeys);
+    await c.waitFor((m) => m.type === "hello.ok", "hello.ok");
+    const objective = `可视化 DAG-${String(Date.now())}`;
+    const create = {
+      type: "orchestration.graph.create",
+      operationId: `graph-${String(Date.now())}`,
+      objective,
+      nodes: [
+        { clientId: "design", title: "设计", spec: "确定协议", deps: [] },
+        { clientId: "mac", title: "Mac", spec: "实现 Mac", deps: ["design"] },
+        { clientId: "ios", title: "iOS", spec: "实现 iOS", deps: ["design"] },
+      ],
+    } as const;
+    c.send(create);
+    const published = (await c.waitFor(
+      (m) => m.type === "orchestration.snapshot" &&
+        m.snapshot.runs.some((run) => run.objective === objective),
+      "graph create snapshot",
+    )) as Extract<S2CMessage, { type: "orchestration.snapshot" }>;
+    const run = published.snapshot.runs.find((candidate) => candidate.objective === objective)!;
+    expect(run.graphRevision).toBe(1);
+    expect(published.snapshot.tasks.filter((task) => task.runId === run.id)).toHaveLength(3);
+
+    c.send(create);
+    const retried = (await c.waitFor(
+      (m) => m.type === "orchestration.snapshot" &&
+        m.snapshot.runs.some((candidate) => candidate.id === run.id),
+      "graph retry snapshot",
+    )) as Extract<S2CMessage, { type: "orchestration.snapshot" }>;
+    expect(retried.snapshot.runs.filter((candidate) => candidate.objective === objective)).toHaveLength(1);
+
+    const design = retried.snapshot.tasks.find(
+      (task) => task.runId === run.id && task.title === "设计",
+    )!;
+    c.send({
+      type: "orchestration.graph.apply",
+      operationId: `stale-${String(Date.now())}`,
+      runId: run.id,
+      baseRevision: 0,
+      nodes: [{ clientId: design.id, title: "不应覆盖", spec: "过期", deps: [] }],
+    });
+    await expect(c.waitFor(
+      (m) => m.type === "error" && m.code === "conflict",
+      "stale graph conflict",
+    )).resolves.toMatchObject({ code: "conflict" });
+    expect(server.orchestration.store.getTask(design.id).title).toBe("设计");
+
+    const ios = retried.snapshot.tasks.find(
+      (task) => task.runId === run.id && task.title === "iOS",
+    )!;
+    c.send({
+      type: "orchestration.graph.apply",
+      operationId: `delete-node-${String(Date.now())}`,
+      runId: run.id,
+      baseRevision: 1,
+      nodes: [],
+      deleteTaskIds: [ios.id],
+    });
+    await expect(c.waitFor(
+      (m) => m.type === "orchestration.snapshot" &&
+        !m.snapshot.tasks.some((task) => task.id === ios.id),
+      "deleted graph node snapshot",
+    )).resolves.toMatchObject({ type: "orchestration.snapshot" });
+
+    c.send({
+      type: "orchestration.run.delete",
+      operationId: `delete-run-${String(Date.now())}`,
+      runId: run.id,
+    });
+    await expect(c.waitFor(
+      (m) => m.type === "orchestration.snapshot" &&
+        !m.snapshot.runs.some((candidate) => candidate.id === run.id),
+      "deleted run snapshot",
+    )).resolves.toMatchObject({ type: "orchestration.snapshot" });
+    c.close();
+  }, 20000);
+
+  it("旧 v8/v7/v5 客户端沿用原配对即可连接新 daemon", async () => {
+    for (const version of [8, 7, 5]) {
+      const c = await TestClient.connect(deviceToken, deviceKeys, version);
+      const hello = (await c.waitFor(
+        (m) => m.type === "hello.ok",
+        `legacy v${String(version)} hello.ok`,
+      )) as Extract<S2CMessage, { type: "hello.ok" }>;
+      expect(hello.host.negotiatedProtocolVersion).toBe(version);
+      expect(hello.host.capabilities).not.toContain("subagent.history.v1");
+      if (version < 8) {
+        expect(hello.host.capabilities).not.toContain("orchestration.graph.v1");
+        expect(hello.host.capabilities).not.toContain("orchestration.automation.v1");
+        expect(hello.host.capabilities).not.toContain("orchestration.management.v1");
+        expect(hello.host.capabilities).not.toContain("orchestration.lifecycle.v1");
+      }
+      c.close();
+    }
   }, 20000);
 
   it("握手 → hello.ok → 创建会话 → 输出 → 正常结束", async () => {
@@ -351,10 +723,48 @@ describe("daemon 全链路", () => {
     const restricted = mintDevice(home, { name: "restricted", allowShell: false });
     const keys = generateKeyPairB64();
     const c = await TestClient.connect(restricted.token, keys);
-    await c.waitFor((m) => m.type === "hello.ok", "hello.ok");
+    const hello = (await c.waitFor(
+      (m) => m.type === "hello.ok",
+      "hello.ok",
+    )) as Extract<S2CMessage, { type: "hello.ok" }>;
+    expect(hello.host.capabilities).not.toContain("orchestration.manual.v1");
+    expect(hello.host.capabilities).not.toContain("orchestration.graph.v1");
+    expect(hello.host.capabilities).not.toContain("orchestration.automation.v1");
+    expect(hello.host.capabilities).not.toContain("orchestration.management.v1");
+    expect(hello.host.capabilities).not.toContain("orchestration.lifecycle.v1");
     c.send({ type: "session.create", agent: "shell", cols: 80, rows: 24 });
     const err = await c.waitFor((m) => m.type === "error", "shell denied");
     expect((err as { code: string }).code).toBe("shell_not_allowed");
+    c.send({ type: "orchestration.run.create", objective: "不应获准" });
+    const orchestrationError = await c.waitFor(
+      (m) => m.type === "error",
+      "orchestration denied",
+    );
+    expect((orchestrationError as { code: string }).code).toBe("forbidden");
+    c.close();
+  }, 20000);
+
+  it("允许终端但关闭人工编排的设备保持只读", async () => {
+    const readOnly = mintDevice(home, {
+      name: "orchestration-read-only",
+      allowShell: true,
+      allowOrchestration: false,
+    });
+    const c = await TestClient.connect(readOnly.token, generateKeyPairB64());
+    const hello = (await c.waitFor(
+      (m) => m.type === "hello.ok",
+      "hello.ok",
+    )) as Extract<S2CMessage, { type: "hello.ok" }>;
+    expect(hello.host.capabilities).not.toContain("orchestration.manual.v1");
+    expect(hello.host.capabilities).not.toContain("orchestration.graph.v1");
+    expect(hello.host.capabilities).not.toContain("orchestration.automation.v1");
+    expect(hello.host.capabilities).not.toContain("orchestration.management.v1");
+    expect(hello.host.capabilities).not.toContain("orchestration.lifecycle.v1");
+    c.send({ type: "orchestration.run.create", objective: "不应获准" });
+    await expect(c.waitFor(
+      (m) => m.type === "error" && m.code === "forbidden",
+      "orchestration denied",
+    )).resolves.toMatchObject({ code: "forbidden" });
     c.close();
   }, 20000);
 

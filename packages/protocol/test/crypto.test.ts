@@ -9,6 +9,7 @@ import {
   generateKeyPairB64,
   serverHandshakeAccept,
   serverHandshakeRespond,
+  SUPPORTED_PROTOCOL_VERSIONS,
   type C2SHello,
 } from "../src/index.js";
 
@@ -94,9 +95,9 @@ describe("handshake + SecureChannel", () => {
     const { start, responded } = handshake();
     // 前两帧线上只有临时公钥和证明,没有任何密文承载 hello
     const f1 = JSON.parse(start.frame) as Record<string, unknown>;
-    expect(Object.keys(f1).sort()).toEqual(["eph", "v"]);
+    expect(Object.keys(f1).sort()).toEqual(["cv", "eph", "maxV", "minV", "v"]);
     const f2 = JSON.parse(responded.frame) as Record<string, unknown>;
-    expect(Object.keys(f2).sort()).toEqual(["p", "seph"]);
+    expect(Object.keys(f2).sort()).toEqual(["cv", "p", "seph", "v"]);
   });
 
   it("前向保密:静态私钥泄漏也解不开已录下的历史会话", () => {
@@ -133,6 +134,38 @@ describe("handshake + SecureChannel", () => {
     } catch (e) {
       expect((e as ProtocolError).code).toBe("version");
     }
+  });
+
+  it("daemon 接受兼容窗口内的 v8/v7/v5 旧客户端", () => {
+    const daemon = generateKeyPairB64();
+    for (const version of [8, 7, 5]) {
+      const start = clientHandshakeStart(version);
+      const responded = serverHandshakeRespond(start.frame, daemon.secretKey);
+      expect(responded.state.protocolVersion).toBe(version);
+      const finished = clientHandshakeFinish(
+        start.state,
+        responded.frame,
+        daemon.publicKey,
+        makeHello(),
+      );
+      expect(serverHandshakeAccept(responded.state, finished.frame).hello.type).toBe("hello");
+    }
+  });
+
+  it("v8+ 身份证明认证协商版本，篡改响应版本会被拒绝", () => {
+    const daemon = generateKeyPairB64();
+    const start = clientHandshakeStart();
+    const responded = serverHandshakeRespond(start.frame, daemon.secretKey);
+    const frame = JSON.parse(responded.frame) as { v: number };
+    frame.v = 7;
+    expect(() =>
+      clientHandshakeFinish(start.state, JSON.stringify(frame), daemon.publicKey, makeHello()),
+    ).toThrowError(/negotiated version/);
+  });
+
+  it("客户端只允许显式维护的回退版本", () => {
+    expect(SUPPORTED_PROTOCOL_VERSIONS).toEqual([10, 9, 8, 7, 5]);
+    expect(() => clientHandshakeStart(6)).toThrowError(/unsupported client protocol/);
   });
 
   it("用错 daemon 私钥时客户端验不过证明", () => {

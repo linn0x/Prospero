@@ -71,6 +71,12 @@ export interface AgentAdapter {
   compact?(): Promise<void>;
   /** 给一个仍可寻址的原生子 Agent 直接发消息/引导。 */
   sendToSubagent?(subagentId: string, text: string): Promise<void>;
+  /**
+   * 从后端自己的持久化记录读取子 Agent 完整过程。
+   * 实时事件日志可能在 daemon 启动前就已产生，也可能因上限被裁剪；原生历史
+   * 是 Mac/iOS 打开子 Agent 详情时的权威只读来源。
+   */
+  readSubagentHistory?(subagentId: string): Promise<AgentEventBody[] | null>;
   /** 回应 Agent 主动提出的结构化问题。 */
   respondQuestion?(
     reqId: string,

@@ -1,11 +1,14 @@
+import MaterialIcons from "@expo/vector-icons/MaterialIcons";
+import type { ComponentProps } from "react";
 import { Platform, Text, type StyleProp, type TextStyle } from "react-native";
 import { SymbolView, type SymbolViewProps } from "expo-symbols";
 
 /**
- * SF Symbols 图标。
+ * 跨平台系统图标。
  *
  * iOS 上用系统符号 —— 和系统 App 同一套字形与光学重心,这是"看起来像原生"
- * 最省力也最有效的一步。非 iOS(或符号不存在)回落到文字,不影响功能。
+ * 最省力也最有效的一步。Android 使用 Material Icons，避免 Emoji 的字形、颜色和
+ * 对齐方式随 ROM 变化；Web（或符号不存在）才回落到文字，不影响功能。
  */
 export type IconName =
   | "magnifyingglass"
@@ -36,7 +39,10 @@ export type IconName =
   | "exclamationmark.triangle.fill"
   // shell / custom 用系统符号 —— 它们不是产品,没有标(见 AgentIcon)
   | "terminal.fill"
-  | "command";
+  | "command"
+  | "point.3.connected.trianglepath.dotted"
+  | "square.stack.3d.up"
+  | "play.fill";
 
 const FALLBACK: Record<IconName, string> = {
   magnifyingglass: "🔍",
@@ -67,6 +73,45 @@ const FALLBACK: Record<IconName, string> = {
   "exclamationmark.triangle.fill": "⚠︎",
   "terminal.fill": "TTY",
   command: "⌘",
+  "point.3.connected.trianglepath.dotted": "⌘",
+  "square.stack.3d.up": "▱",
+  "play.fill": "▶︎",
+};
+
+type MaterialIconName = ComponentProps<typeof MaterialIcons>["name"];
+
+const ANDROID_ICON: Record<IconName, MaterialIconName> = {
+  magnifyingglass: "search",
+  plus: "add",
+  "arrow.up": "arrow-upward",
+  "mic.fill": "mic",
+  xmark: "close",
+  "stop.circle": "stop-circle",
+  trash: "delete-outline",
+  terminal: "terminal",
+  "bubble.left.and.text.bubble.right": "forum",
+  "ellipsis.circle": "more-horiz",
+  "doc.on.doc": "content-copy",
+  paperclip: "attach-file",
+  photo: "photo",
+  "arrow.clockwise": "refresh",
+  archivebox: "archive",
+  "chevron.down": "keyboard-arrow-down",
+  "chevron.left": "keyboard-arrow-left",
+  "qrcode.viewfinder": "qr-code-scanner",
+  desktopcomputer: "computer",
+  "folder.fill": "folder",
+  "doc.fill": "description",
+  "house.fill": "home",
+  "chevron.right": "keyboard-arrow-right",
+  "checkmark.circle.fill": "check-circle",
+  "xmark.circle.fill": "cancel",
+  "exclamationmark.triangle.fill": "warning",
+  "terminal.fill": "terminal",
+  command: "keyboard-command-key",
+  "point.3.connected.trianglepath.dotted": "account-tree",
+  "square.stack.3d.up": "layers",
+  "play.fill": "play-arrow",
 };
 
 export function Icon({
@@ -94,5 +139,18 @@ export function Icon({
       />
     );
   }
+
+  if (Platform.OS === "android") {
+    return (
+      <MaterialIcons
+        name={ANDROID_ICON[name]}
+        size={size}
+        color={color}
+        allowFontScaling={false}
+        style={style}
+      />
+    );
+  }
+
   return <Text style={[{ color, fontSize: size * 0.8 }, style]}>{FALLBACK[name]}</Text>;
 }

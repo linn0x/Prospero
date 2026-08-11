@@ -46,6 +46,10 @@ enum Locator {
 
   /// node 解释器。先用登录 shell 问一次(能覆盖 nvm/fnm/volta 这些版本管理器),
   /// 问不到再退回常见安装路径。
+  ///
+  /// Launchpad 的 zsh 是非交互登录 shell,不一定会读取 `.zshrc`。mise 通常正是
+  /// 在那里把 shim 加进 PATH,所以还要显式检查它的 shim；否则终端能运行、从
+  /// 启动台打开却显示「找不到 node」。
   static func findNode() -> String? {
     if let at = nodeCachedAt, Date().timeIntervalSince(at) < lookupTTL { return cachedNode }
     cachedNode = resolveNode()
@@ -61,7 +65,12 @@ enum Locator {
     if let viaShell = loginShell().node, fm.isExecutableFile(atPath: viaShell) {
       return viaShell
     }
+    let home = fm.homeDirectoryForCurrentUser.path
     let common = [
+      "\(home)/.local/share/mise/shims/node",
+      "\(home)/.mise/shims/node",
+      "\(home)/.volta/bin/node",
+      "\(home)/.fnm/aliases/default/bin/node",
       "/opt/homebrew/bin/node",
       "/usr/local/bin/node",
       "/usr/bin/node",
@@ -96,7 +105,17 @@ enum Locator {
   }
 
   /// 登录 shell 的 PATH。GUI 进程的 PATH 极简,直接传给 daemon 会让它找不到各家 agent CLI。
-  static func loginPath() -> String? { loginShell().path }
+  /// 即使非交互 shell 漏加载了 mise,也要把已定位 Node 所在目录补回去——同一个 shim
+  /// 目录通常还放着 agent CLI 的版本管理器入口。
+  static func loginPath() -> String? {
+    let shellPath = loginShell().path
+    guard let node = findNode() else { return shellPath }
+    let nodeDir = URL(fileURLWithPath: node).deletingLastPathComponent().path
+    guard let shellPath, !shellPath.isEmpty else { return nodeDir }
+    let entries = shellPath.split(separator: ":", omittingEmptySubsequences: true)
+    if entries.contains(Substring(nodeDir)) { return shellPath }
+    return ([nodeDir] + entries.map(String.init)).joined(separator: ":")
+  }
 
   /// 起一个登录 shell,一次问齐 node 路径和 PATH。
   ///

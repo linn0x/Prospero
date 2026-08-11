@@ -1,7 +1,7 @@
 /**
  * 身份与配对存储(~/.prospero,可用 PROSPERO_HOME 覆盖,测试用):
  * - identity.json  daemon 静态 X25519 密钥对(0600)
- * - devices.json   已配对设备:token、TOFU 绑定的客户端公钥、allowShell(0600)
+ * - devices.json   已配对设备:token、TOFU 绑定的客户端公钥与能力(0600)
  * - config.json    { port }
  */
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -9,7 +9,7 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import {
-  PROTOCOL_VERSION,
+  PAIRING_FORMAT_VERSION,
   generateKeyPairB64,
   toB64Url,
   type C2SHello,
@@ -26,6 +26,8 @@ export interface DeviceRecord {
   /** 首次 hello 时 TOFU 绑定;之后公钥变化即拒绝 */
   clientPubKey?: string;
   allowShell: boolean;
+  /** 省略表示沿用 allowShell，保证升级前已配对设备无需重新扫码。 */
+  allowOrchestration?: boolean;
   createdAt: number;
   lastSeenAt?: number;
 }
@@ -94,18 +96,24 @@ export function saveDevices(home: string, devices: DeviceRecord[]): void {
 
 export function mintDevice(
   home: string,
-  opts: { name: string; allowShell: boolean },
+  opts: { name: string; allowShell: boolean; allowOrchestration?: boolean },
 ): DeviceRecord {
   const device: DeviceRecord = {
     name: opts.name,
     token: toB64Url(randomBytes(24)),
     allowShell: opts.allowShell,
+    allowOrchestration: opts.allowOrchestration ?? opts.allowShell,
     createdAt: Date.now(),
   };
   const devices = loadDevices(home);
   devices.push(device);
   saveDevices(home, devices);
   return device;
+}
+
+/** 人工派发会在本机启动 agent，权限至少应与 shell 会话同级。 */
+export function canDeviceOrchestrate(device: DeviceRecord): boolean {
+  return device.allowShell && (device.allowOrchestration ?? device.allowShell);
 }
 
 /**
@@ -197,7 +205,7 @@ export function buildPairingPayload(
   const identity = loadIdentity(home);
   const bound = opts.bind && opts.bind !== "0.0.0.0" ? resolveBindAddr(opts.bind) : null;
   return {
-    v: PROTOCOL_VERSION,
+    v: PAIRING_FORMAT_VERSION,
     name: opts.name ?? os.hostname(),
     addrs: bound ? [bound] : candidateAddrs(),
     port: opts.port,

@@ -7,6 +7,7 @@ MODEL_DIR="$MOBILE_DIR/.cache/voice"
 MODEL_FILE="$MODEL_DIR/ggml-small-q5_1.bin"
 MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin"
 MODEL_SHA256="ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb"
+STALE_MODEL_FILE="$MODEL_DIR/ggml-tiny-q5_1.bin"
 
 checksum() {
   shasum -a 256 "$1" | awk '{ print $1 }'
@@ -14,6 +15,7 @@ checksum() {
 
 mkdir -p "$MODEL_DIR"
 if [[ -f "$MODEL_FILE" && "$(checksum "$MODEL_FILE")" == "$MODEL_SHA256" ]]; then
+  rm -f "$STALE_MODEL_FILE"
   printf 'Android 离线语音模型已就绪：%s\n' "$MODEL_FILE"
   exit 0
 fi
@@ -27,7 +29,7 @@ DOWNLOAD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/prospero-voice-model.XXXXXX")"
 DOWNLOAD_FILE="$DOWNLOAD_DIR/ggml-small-q5_1.bin"
 trap 'rm -rf "$DOWNLOAD_DIR"' EXIT
 
-printf '下载 Android 中英混合离线语音模型（约 190 MB）…\n'
+printf '下载 Android 高准确率中英混合离线语音模型（约 181 MB）…\n'
 curl --fail --location --retry 3 --progress-bar \
   "$MODEL_URL" \
   --output "$DOWNLOAD_FILE"
@@ -39,4 +41,5 @@ if [[ "$ACTUAL_SHA256" != "$MODEL_SHA256" ]]; then
 fi
 
 mv "$DOWNLOAD_FILE" "$MODEL_FILE"
+rm -f "$STALE_MODEL_FILE"
 printf 'Android 离线语音模型已就绪：%s\n' "$MODEL_FILE"

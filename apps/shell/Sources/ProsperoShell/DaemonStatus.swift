@@ -6,13 +6,23 @@ struct DaemonStatus: Sendable, Equatable {
   var bind: String?
   var notifyURL: String?
   var devices: [Device] = []
+  var agentAccounts: [AgentAccount] = []
 
   struct Device: Sendable, Equatable, Identifiable {
     var id: String
     var name: String
     var allowShell: Bool
+    var allowOrchestration: Bool
     var bound: Bool
     var lastSeenAt: Double?
+  }
+
+  struct AgentAccount: Sendable, Equatable, Identifiable {
+    var id: String
+    var agent: String
+    var name: String
+    var managed: Bool
+    var isDefault: Bool
   }
 
   var bindLabel: String { bind ?? "全部网卡" }
@@ -48,11 +58,44 @@ struct DaemonStatus: Sendable, Equatable {
           id: d["token"] as? String ?? "\(d["name"] as? String ?? "device")-\(index)",
           name: d["name"] as? String ?? "(未命名)",
           allowShell: d["allowShell"] as? Bool ?? false,
+          allowOrchestration: d["allowOrchestration"] as? Bool
+            ?? (d["allowShell"] as? Bool ?? false),
           bound: d["clientPubKey"] != nil,
           lastSeenAt: d["lastSeenAt"] as? Double
         )
       }
     }
+
+    // 账号文件只含名称与隔离目录 ID，不含真实凭据；Claude managed token 在 Keychain。
+    var storedAccounts: [[String: Any]] = []
+    var defaults: [String: String] = [:]
+    if let data = try? Data(contentsOf: home.appendingPathComponent("agent-accounts.json")),
+       let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+      storedAccounts = root["accounts"] as? [[String: Any]] ?? []
+      defaults = root["defaults"] as? [String: String] ?? [:]
+    }
+    let nativeIDs = ["claude": "native-claude", "codex": "native-codex"]
+    status.agentAccounts = nativeIDs.map { agent, id in
+      AgentAccount(
+        id: id,
+        agent: agent,
+        name: "本机默认",
+        managed: false,
+        isDefault: (defaults[agent] ?? id) == id
+      )
+    }
+    status.agentAccounts.append(contentsOf: storedAccounts.compactMap { account in
+      guard let id = account["id"] as? String,
+            let agent = account["agent"] as? String,
+            agent == "claude" || agent == "codex" else { return nil }
+      return AgentAccount(
+        id: id,
+        agent: agent,
+        name: account["name"] as? String ?? agent,
+        managed: true,
+        isDefault: defaults[agent] == id
+      )
+    })
 
     return status
   }

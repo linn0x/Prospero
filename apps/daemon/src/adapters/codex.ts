@@ -26,6 +26,7 @@ import type {
   FileDiff,
   PermissionReply,
   ResumableConversation,
+  SubagentInfo,
   SubagentStatus,
 } from "@prospero/protocol";
 import { needsApproval } from "../approval-policy.js";
@@ -130,7 +131,12 @@ export class CodexAdapter implements AgentAdapter {
   private readonly pendingRpc = new Map<number | string, (m: RpcMessage) => void>();
   private readonly approvals = new Map<string, PendingApproval>();
   private readonly questions = new Map<string, PendingQuestion>();
-  private readonly subagents = new Map<string, { createdAt: number; canMessage: boolean }>();
+  /**
+   * 保留完整身份，而不只记 canMessage。Codex 有时会先从 collab 工具调用里暴露
+   * child thread id，稍后 thread/started 才补 agentNickname / agentRole；若第一次
+   * 登记后直接 return，界面就永远只能看到“Codex 子 Agent N”。
+   */
+  private readonly subagents = new Map<string, SubagentInfo>();
   private readonly currentTurns = new Map<string, string>();
   private readonly lastTextByThread = new Map<string, string>();
   /** 本轮 token(来自 thread/tokenUsage/updated,turn/completed 时随事件带出) */
@@ -241,13 +247,16 @@ export class CodexAdapter implements AgentAdapter {
   }
 
   /** 启动并初始化 app-server；普通会话和只读本机索引查询共用同一握手。 */
-  private async startAppServer(cwd: string): Promise<void> {
+  private async startAppServer(
+    cwd: string,
+    environment: Record<string, string> | undefined = this.ctx?.env,
+  ): Promise<void> {
     this.stderrTail = "";
     this.buf = "";
     const proc = spawn("codex", ["app-server"], {
       stdio: ["pipe", "pipe", "pipe"],
       cwd,
-      env: { ...process.env, ...this.ctx?.env },
+      env: { ...process.env, ...environment },
     });
     this.proc = proc;
     proc.stdout?.setEncoding("utf8");
@@ -289,10 +298,11 @@ export class CodexAdapter implements AgentAdapter {
   static async searchLocalConversations(
     query: string,
     limit = 20,
+    environment?: Record<string, string>,
   ): Promise<ResumableConversation[]> {
     const adapter = new CodexAdapter();
     try {
-      await adapter.startAppServer(os.homedir());
+      await adapter.startAppServer(os.homedir(), environment);
       const trimmed = query.trim();
       let raw: { data?: unknown[] };
       if (trimmed) {
@@ -403,23 +413,48 @@ export class CodexAdapter implements AgentAdapter {
   ): void {
     if (!id || id === this.threadId) return;
     const existing = this.subagents.get(id);
-    if (existing) return;
-    const createdAt = details.createdAt ?? Date.now();
-    const canMessage = details.canMessage ?? true;
-    this.subagents.set(id, { createdAt, canMessage });
-    this.emit({
-      kind: "subagent.started",
-      subagent: {
-        id,
-        name: details.name || `Codex 子 Agent ${String(this.subagents.size)}`,
+    if (existing) {
+      const next: SubagentInfo = {
+        ...existing,
+        ...(details.name ? { name: details.name } : {}),
         ...(details.role ? { role: details.role } : {}),
         ...(details.task ? { task: details.task } : {}),
-        status: details.status ?? "starting",
-        canMessage,
-        createdAt,
-        updatedAt: Date.now(),
         ...(details.preview ? { preview: details.preview } : {}),
-      },
+        ...(details.status ? { status: details.status } : {}),
+        ...(details.canMessage !== undefined ? { canMessage: details.canMessage } : {}),
+        updatedAt: Date.now(),
+      };
+      const changed =
+        next.name !== existing.name ||
+        next.role !== existing.role ||
+        next.task !== existing.task ||
+        next.preview !== existing.preview ||
+        next.status !== existing.status ||
+        next.canMessage !== existing.canMessage;
+      if (!changed) return;
+      this.subagents.set(id, next);
+      // subagent.started 是完整身份快照；重复同 id 会由会话模型原位替换，适合
+      // 在原生协议晚到 nickname 时补全名称，又不需要为可选字段另开协议事件。
+      this.emit({ kind: "subagent.started", subagent: next });
+      return;
+    }
+    const createdAt = details.createdAt ?? Date.now();
+    const canMessage = details.canMessage ?? true;
+    const subagent: SubagentInfo = {
+      id,
+      name: details.name || `Codex 子 Agent ${String(this.subagents.size + 1)}`,
+      ...(details.role ? { role: details.role } : {}),
+      ...(details.task ? { task: details.task } : {}),
+      status: details.status ?? "starting",
+      canMessage,
+      createdAt,
+      updatedAt: Date.now(),
+      ...(details.preview ? { preview: details.preview } : {}),
+    };
+    this.subagents.set(id, subagent);
+    this.emit({
+      kind: "subagent.started",
+      subagent,
     });
   }
 
@@ -431,7 +466,15 @@ export class CodexAdapter implements AgentAdapter {
   ): void {
     if (!this.subagents.has(id)) this.registerSubagent(id, { status, canMessage });
     const known = this.subagents.get(id);
-    if (known) known.canMessage = canMessage;
+    if (known) {
+      this.subagents.set(id, {
+        ...known,
+        status,
+        canMessage,
+        updatedAt: Date.now(),
+        ...(summary ? { preview: summary } : {}),
+      });
+    }
     this.emit({
       kind: "subagent.updated",
       subagentId: id,
@@ -444,33 +487,55 @@ export class CodexAdapter implements AgentAdapter {
   private async discoverSubagents(): Promise<void> {
     if (!this.threadId) return;
     try {
-      const raw = (await this.request("thread/list", {
-        limit: 100,
-        ancestorThreadId: this.threadId,
-      })) as { data?: unknown[] };
-      for (const value of raw.data ?? []) {
-        if (!value || typeof value !== "object") continue;
-        const row = value as Record<string, unknown>;
-        const id = typeof row["id"] === "string" ? row["id"] : "";
-        if (!id) continue;
-        const status = this.subagentStatus(row["status"]);
-        this.registerSubagent(id, {
-          ...(typeof row["agentNickname"] === "string"
-            ? { name: row["agentNickname"] }
-            : typeof row["name"] === "string"
-              ? { name: row["name"] }
-              : {}),
-          ...(typeof row["agentRole"] === "string" ? { role: row["agentRole"] } : {}),
-          ...(typeof row["preview"] === "string" ? { preview: row["preview"] } : {}),
-          ...(typeof row["createdAt"] === "number"
-            ? { createdAt: Math.round(row["createdAt"] * 1000) }
-            : {}),
-          canMessage: row["canAcceptDirectInput"] !== false,
-          status,
-        });
+      let cursor: string | undefined;
+      const seenCursors = new Set<string>();
+      // 本机 0.147 的生成类型没有 parentThreadId/ancestorThreadId 查询字段；向旧
+      // server 发送未知字段会被静默忽略，曾因此把普通线程（甚至父线程自己）
+      // 误列为子 Agent。先限定原生子线程来源，再对返回值做严格父 id 校验。
+      for (let page = 0; page < 100; page++) {
+        const raw = (await this.request("thread/list", {
+          limit: 100,
+          sortKey: "updated_at",
+          sortDirection: "desc",
+          sourceKinds: [
+            "subAgent",
+            "subAgentReview",
+            "subAgentCompact",
+            "subAgentThreadSpawn",
+            "subAgentOther",
+          ],
+          ...(cursor ? { cursor } : {}),
+        })) as { data?: unknown[]; nextCursor?: unknown };
+        for (const value of raw.data ?? []) {
+          if (!value || typeof value !== "object") continue;
+          const row = value as Record<string, unknown>;
+          if (row["parentThreadId"] !== this.threadId) continue;
+          const id = typeof row["id"] === "string" ? row["id"] : "";
+          if (!id) continue;
+          const status = this.subagentStatus(row["status"]);
+          const createdAt = timestampMs(row["createdAt"]);
+          this.registerSubagent(id, {
+            ...(typeof row["agentNickname"] === "string"
+              ? { name: row["agentNickname"] }
+              : typeof row["name"] === "string"
+                ? { name: row["name"] }
+                : {}),
+            ...(typeof row["agentRole"] === "string" ? { role: row["agentRole"] } : {}),
+            ...(typeof row["preview"] === "string" ? { preview: row["preview"] } : {}),
+            ...(createdAt !== undefined ? { createdAt } : {}),
+            canMessage: status !== "failed" && status !== "stopped",
+            status,
+          });
+        }
+        const next = typeof raw.nextCursor === "string" && raw.nextCursor
+          ? raw.nextCursor
+          : undefined;
+        if (!next || seenCursors.has(next)) break;
+        seenCursors.add(next);
+        cursor = next;
       }
     } catch {
-      // 较老的 app-server 没有 ancestorThreadId；实时生命周期仍会补齐。
+      // 较老的 app-server 没有 sourceKinds；实时生命周期仍会补齐。
     }
   }
 
@@ -672,7 +737,7 @@ export class CodexAdapter implements AgentAdapter {
       case "thread/started": {
         const thread = (p["thread"] ?? {}) as Record<string, unknown>;
         const id = typeof thread["id"] === "string" ? thread["id"] : "";
-        if (!id || typeof thread["parentThreadId"] !== "string") return;
+        if (!id || thread["parentThreadId"] !== this.threadId) return;
         this.registerSubagent(id, {
           ...(typeof thread["agentNickname"] === "string"
             ? { name: thread["agentNickname"] }
@@ -691,7 +756,7 @@ export class CodexAdapter implements AgentAdapter {
       }
       case "thread/status/changed": {
         const id = typeof p["threadId"] === "string" ? p["threadId"] : "";
-        if (!id || id === this.threadId) return;
+        if (!id || !this.subagents.has(id)) return;
         const status = this.subagentStatus(p["status"]);
         this.updateSubagent(id, status, status !== "failed" && status !== "stopped");
         return;
@@ -699,7 +764,7 @@ export class CodexAdapter implements AgentAdapter {
       case "thread/closed":
       case "thread/deleted": {
         const id = typeof p["threadId"] === "string" ? p["threadId"] : "";
-        if (id && id !== this.threadId) this.updateSubagent(id, "stopped", false);
+        if (id && this.subagents.has(id)) this.updateSubagent(id, "stopped", false);
         return;
       }
       case "turn/started": {
@@ -707,7 +772,7 @@ export class CodexAdapter implements AgentAdapter {
         const turnId = String(turn["id"] ?? p["turnId"] ?? "");
         if (notificationThreadId) this.currentTurns.set(notificationThreadId, turnId);
         this.lastTextByThread.delete(notificationThreadId);
-        if (agentId) this.updateSubagent(agentId, "running", true);
+        if (agentId && this.subagents.has(agentId)) this.updateSubagent(agentId, "running", true);
         else {
           this.currentTurnMsgId = turnId;
           this.lastTextMsgId = "";
@@ -886,7 +951,7 @@ export class CodexAdapter implements AgentAdapter {
         });
         this.currentTurns.delete(notificationThreadId);
         this.lastTextByThread.delete(notificationThreadId);
-        if (agentId) this.updateSubagent(agentId, "idle", true);
+        if (agentId && this.subagents.has(agentId)) this.updateSubagent(agentId, "idle", true);
         else {
           this.lastTurnTokens = {};
           this.currentTurnMsgId = "";
@@ -1241,6 +1306,239 @@ export class CodexAdapter implements AgentAdapter {
     });
   }
 
+  /**
+   * `thread/read(includeTurns:true)` 是 Codex app-server 的持久化历史入口。
+   * 它既能补回 daemon 启动前的内容，也能返回正在运行的 turn；这里把原生
+   * ThreadItem 转成 Prospero 已有的统一事件，Mac/iOS 不需要认识 Codex 私有类型。
+   */
+  async readSubagentHistory(subagentId: string): Promise<AgentEventBody[] | null> {
+    if (!this.threadId || !this.subagents.has(subagentId)) return null;
+    const raw = (await this.request("thread/read", {
+      threadId: subagentId,
+      includeTurns: true,
+    })) as { thread?: unknown };
+    if (!raw.thread || typeof raw.thread !== "object") return null;
+    const thread = raw.thread as Record<string, unknown>;
+    if (thread["id"] !== subagentId || thread["parentThreadId"] !== this.threadId) {
+      throw new AdapterError("Codex 返回的线程不属于当前父会话");
+    }
+
+    const events: AgentEventBody[] = [];
+    const turns = Array.isArray(thread["turns"]) ? thread["turns"] : [];
+    for (const value of turns) {
+      if (!value || typeof value !== "object") continue;
+      const turn = value as Record<string, unknown>;
+      const turnId = typeof turn["id"] === "string" ? turn["id"] : `turn-${events.length}`;
+      let lastMessageId = turnId;
+      const items = Array.isArray(turn["items"]) ? turn["items"] : [];
+      for (const itemValue of items) {
+        if (!itemValue || typeof itemValue !== "object") continue;
+        const item = itemValue as Record<string, unknown>;
+        const itemId = typeof item["id"] === "string" ? item["id"] : `${turnId}-${events.length}`;
+        const itemEvents = this.historyItemEvents(item, itemId, turnId, subagentId);
+        events.push(...itemEvents);
+        if (item["type"] === "agentMessage" || item["type"] === "plan") {
+          lastMessageId = itemId;
+        }
+      }
+
+      const status = typeof turn["status"] === "string" ? turn["status"] : "completed";
+      if (status === "failed" && turn["error"] !== null && turn["error"] !== undefined) {
+        events.push({
+          kind: "agent.error",
+          message: summarize(turn["error"], 1000),
+          agentId: subagentId,
+        });
+      }
+      // inProgress turn 只有开始/增量卡片，不能伪造结束，否则客户端会把仍在
+      // 工作的子 Agent 渲染成已完成。
+      if (status !== "inProgress") {
+        events.push({
+          kind: "turn.end",
+          msgId: lastMessageId,
+          finish: status,
+          agentId: subagentId,
+        });
+      }
+    }
+    return events;
+  }
+
+  private historyItemEvents(
+    item: Record<string, unknown>,
+    itemId: string,
+    turnId: string,
+    subagentId: string,
+  ): AgentEventBody[] {
+    const type = String(item["type"] ?? "");
+    const agentField = { agentId: subagentId };
+    if (type === "userMessage") {
+      const content = Array.isArray(item["content"]) ? item["content"] : [];
+      const parts = content.flatMap((value) => {
+        if (!value || typeof value !== "object") return [];
+        const input = value as Record<string, unknown>;
+        if (input["type"] === "text" && typeof input["text"] === "string") return [input["text"]];
+        if (input["type"] === "skill" && typeof input["name"] === "string") {
+          return [`$${input["name"]}`];
+        }
+        if (input["type"] === "mention" && typeof input["name"] === "string") {
+          return [`@${input["name"]}`];
+        }
+        if (
+          (input["type"] === "image" || input["type"] === "localImage") &&
+          (typeof input["url"] === "string" || typeof input["path"] === "string")
+        ) {
+          return [`[图片] ${String(input["url"] ?? input["path"])}`];
+        }
+        return [];
+      });
+      const text = parts.join("\n").trim();
+      return text ? [{ kind: "user.message", msgId: itemId, text, ...agentField }] : [];
+    }
+    if (type === "agentMessage" || type === "plan") {
+      const text = typeof item["text"] === "string" ? item["text"] : "";
+      return text
+        ? [{ kind: "text.delta", msgId: itemId, textId: itemId, delta: text, ...agentField }]
+        : [];
+    }
+    if (type === "reasoning") {
+      const sections = [item["summary"], item["content"]]
+        .flatMap((value) => Array.isArray(value) ? value : [])
+        .filter((value): value is string => typeof value === "string" && value.length > 0);
+      const delta = sections.join("\n").trim();
+      return delta ? [{ kind: "reasoning.delta", msgId: itemId, delta, ...agentField }] : [];
+    }
+
+    if (type === "commandExecution") {
+      return this.historyToolEvents({
+        item,
+        itemId,
+        turnId,
+        subagentId,
+        tool: "bash",
+        input: item["command"],
+        output: item["aggregatedOutput"] ?? item["exitCode"] ?? item["status"],
+      });
+    }
+    if (type === "fileChange") {
+      const changes = Array.isArray(item["changes"])
+        ? item["changes"].filter(
+            (value): value is Record<string, unknown> => Boolean(value) && typeof value === "object",
+          )
+        : [];
+      const paths = changes.flatMap((change) =>
+        typeof change["path"] === "string" ? [change["path"]] : [],
+      );
+      const first = changes[0];
+      const diff = first && typeof first["path"] === "string" && typeof first["diff"] === "string"
+        ? fromUnifiedPatch(first["path"], first["diff"])
+        : undefined;
+      return this.historyToolEvents({
+        item,
+        itemId,
+        turnId,
+        subagentId,
+        tool: "edit",
+        input: paths.join(", ") || item["changes"],
+        output: item["status"],
+        ...(diff ? { diff } : {}),
+      });
+    }
+    if (type === "mcpToolCall") {
+      const server = typeof item["server"] === "string" ? item["server"] : "mcp";
+      const tool = typeof item["tool"] === "string" ? item["tool"] : "tool";
+      return this.historyToolEvents({
+        item,
+        itemId,
+        turnId,
+        subagentId,
+        tool: `${server}.${tool}`,
+        input: item["arguments"],
+        output: item["error"] ?? item["result"] ?? item["status"],
+      });
+    }
+    if (type === "dynamicToolCall") {
+      const namespace = typeof item["namespace"] === "string" ? `${item["namespace"]}.` : "";
+      return this.historyToolEvents({
+        item,
+        itemId,
+        turnId,
+        subagentId,
+        tool: `${namespace}${String(item["tool"] ?? "tool")}`,
+        input: item["arguments"],
+        output: item["contentItems"] ?? item["success"] ?? item["status"],
+      });
+    }
+    if (type === "collabAgentToolCall") {
+      return this.historyToolEvents({
+        item,
+        itemId,
+        turnId,
+        subagentId,
+        tool: `agent.${String(item["tool"] ?? "collaborate")}`,
+        input: item["prompt"] ?? item["receiverThreadIds"],
+        output: item["agentsStates"] ?? item["status"],
+      });
+    }
+    if (type === "webSearch") {
+      return this.historyToolEvents({
+        item: { ...item, status: "completed" },
+        itemId,
+        turnId,
+        subagentId,
+        tool: "web.search",
+        input: item["query"] ?? item["action"],
+        output: item["action"] ?? "completed",
+      });
+    }
+    if (type === "subAgentActivity" || type === "imageView" || type === "imageGeneration") {
+      return this.historyToolEvents({
+        item: { ...item, status: "completed" },
+        itemId,
+        turnId,
+        subagentId,
+        tool: type === "subAgentActivity" ? "agent.activity" : type,
+        input: item["agentThreadId"] ?? item["path"] ?? item,
+        output: item["kind"] ?? "completed",
+      });
+    }
+    return [];
+  }
+
+  private historyToolEvents(input: {
+    item: Record<string, unknown>;
+    itemId: string;
+    turnId: string;
+    subagentId: string;
+    tool: string;
+    input: unknown;
+    output: unknown;
+    diff?: FileDiff;
+  }): AgentEventBody[] {
+    const summary = summarize(input.input, 800) || input.tool;
+    const events: AgentEventBody[] = [{
+      kind: "tool.start",
+      msgId: input.turnId,
+      callId: input.itemId,
+      tool: input.tool,
+      summary,
+      ...(input.diff ? { diff: input.diff } : {}),
+      agentId: input.subagentId,
+    }];
+    const status = String(input.item["status"] ?? "completed");
+    if (status === "inProgress" || status === "running") return events;
+    const failed = status === "failed" || status === "declined" || status === "error";
+    events.push({
+      kind: "tool.end",
+      callId: input.itemId,
+      state: failed ? "failed" : "success",
+      summary: summarize(input.output, 1000) || status,
+      ...(input.diff ? { diff: input.diff } : {}),
+      agentId: input.subagentId,
+    });
+    return events;
+  }
+
   async sendToSubagent(subagentId: string, text: string): Promise<void> {
     const known = this.subagents.get(subagentId);
     if (!known || !known.canMessage) throw new AdapterError("Codex 子 Agent 当前不可寻址");
@@ -1287,12 +1585,13 @@ export class CodexAdapter implements AgentAdapter {
   }
 
   async interrupt(): Promise<void> {
-    if (!this.threadId) return;
-    try {
-      await this.request("turn/interrupt", { threadId: this.threadId });
-    } catch {
-      // 无进行中的轮次
-    }
+    const threadId = this.threadId;
+    if (!threadId) return;
+    const turnId = this.currentTurns.get(threadId);
+    if (!turnId) return; // 当前没有进行中的主 Agent turn
+    // Codex app-server v2 的 TurnInterruptParams 要求两个字段。只给 threadId 会被
+    // 服务端拒绝；过去这里又吞掉了异常，于是手机/Mac 看起来像“停止按钮没反应”。
+    await this.request("turn/interrupt", { threadId, turnId });
   }
 
   async dispose(): Promise<void> {

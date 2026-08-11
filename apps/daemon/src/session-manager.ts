@@ -31,6 +31,7 @@ import { CodexAdapter } from "./adapters/codex.js";
 import { GrokAdapter } from "./adapters/grok.js";
 import { OpencodeAdapter } from "./adapters/opencode.js";
 import type { AdapterResumeState, AgentAdapter } from "./adapters/types.js";
+import type { AccountBinding, AccountLoginSpec } from "./agent-accounts.js";
 
 export type SessionErrorCode =
   | "shell_not_allowed"
@@ -49,6 +50,8 @@ export class SessionError extends Error {
 
 export interface CreateSessionInput {
   agent: AgentKind;
+  /** Codex / Claude Code 的隔离账号；省略保持旧版的本机环境。 */
+  accountId?: string | undefined;
   /** 省略时按 agent 能力决定:有适配器的走 structured */
   kind?: SessionKind | undefined;
   approvalPolicy?: ApprovalPolicy | undefined;
@@ -93,6 +96,8 @@ interface PtyMeta {
   cwd: string;
   cols: number;
   rows: number;
+  accountId?: string;
+  accountName?: string;
 }
 
 function parseStructuredState(value: unknown): StructuredSessionPersistentState | null {
@@ -206,6 +211,8 @@ function parseStructuredState(value: unknown): StructuredSessionPersistentState 
     agent: v["agent"] as AgentKind,
     title: v["title"],
     cwd: v["cwd"],
+    ...(typeof v["accountId"] === "string" ? { accountId: v["accountId"] } : {}),
+    ...(typeof v["accountName"] === "string" ? { accountName: v["accountName"] } : {}),
     createdAt: v["createdAt"],
     approvalPolicy: v["approvalPolicy"] as ApprovalPolicy,
     events: v["events"] as AgentEventBody[],
@@ -233,6 +240,8 @@ export interface SessionManagerOptions {
   adapterFactory?: ((agent: AgentKind, state?: AdapterResumeState) => AgentAdapter) | undefined;
   /** 每个会话各自注入的本地环境（编排 CLI 的身份和控制 socket 在这里进入）。 */
   sessionEnv?: ((sessionId: string) => Record<string, string>) | undefined;
+  /** 账号目录由 daemon 的元数据层解析；SessionManager 只负责注入会话。 */
+  accountResolver?: ((accountId: string, agent: "claude" | "codex") => AccountBinding) | undefined;
 }
 
 export class SessionManager extends EventEmitter<SessionManagerEvents> {
@@ -245,6 +254,9 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   private readonly structuredFile: string | null;
   private readonly adapterFactory: (agent: AgentKind, state?: AdapterResumeState) => AgentAdapter;
   private readonly sessionEnv: (sessionId: string) => Record<string, string>;
+  private readonly accountResolver:
+    | ((accountId: string, agent: "claude" | "codex") => AccountBinding)
+    | undefined;
   private persistTimer: NodeJS.Timeout | null = null;
   private shuttingDown = false;
 
@@ -258,6 +270,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     this.structuredFile = home ? path.join(home, "structured-sessions.json") : null;
     this.adapterFactory = opts.adapterFactory ?? makeAdapter;
     this.sessionEnv = opts.sessionEnv ?? (() => ({}));
+    this.accountResolver = opts.accountResolver;
   }
 
   /**
@@ -277,7 +290,21 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       if (!alive.has(meta.id) || this.ptySessions.has(meta.id)) continue;
       try {
         // `new-session -A` 存在即 attach,所以恢复和新建走同一条命令
-        restored.push(this.spawnPty(meta.id, meta.agent, meta.title, meta.cwd, meta.cols, meta.rows, undefined));
+        const account = meta.accountId
+          ? this.resolveAccount(meta.agent, meta.accountId)
+          : undefined;
+        restored.push(
+          this.spawnPty(
+            meta.id,
+            meta.agent,
+            meta.title,
+            meta.cwd,
+            meta.cols,
+            meta.rows,
+            undefined,
+            account,
+          ),
+        );
       } catch {
         // 单个恢复失败不该拖垮启动
       }
@@ -308,6 +335,8 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
         cwd: info.cwd,
         cols: info.cols,
         rows: info.rows,
+        ...(info.accountId ? { accountId: info.accountId } : {}),
+        ...(info.accountName ? { accountName: info.accountName } : {}),
       };
     });
     try {
@@ -399,6 +428,9 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     }
     const cwd = input.cwd ?? os.homedir();
     const kind: SessionKind = input.kind ?? defaultKindFor(input.agent);
+    const account = input.accountId
+      ? this.resolveAccount(input.agent, input.accountId)
+      : undefined;
     if (kind === "structured" && !structuredCapable(input.agent)) {
       throw new SessionError(`agent "${input.agent}" 暂无结构化适配器`, "agent_unavailable");
     }
@@ -409,11 +441,22 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       throw new SessionError("只有 Claude/Codex 对话会话支持 Plan 模式", "agent_unavailable");
     }
     return kind === "structured"
-      ? this.createStructured(input.agent, cwd, input.approvalPolicy, input.mode, input.resume)
-      : this.createPty(input, cwd);
+      ? this.createStructured(
+          input.agent,
+          cwd,
+          input.approvalPolicy,
+          input.mode,
+          input.resume,
+          account,
+        )
+      : this.createPty(input, cwd, account);
   }
 
-  private createPty(input: CreateSessionInput, cwd: string): SessionInfo {
+  private createPty(
+    input: CreateSessionInput,
+    cwd: string,
+    account?: AccountBinding,
+  ): SessionInfo {
     let spec;
     try {
       spec = commandFor(input.agent, input.command);
@@ -432,6 +475,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       input.cols,
       input.rows,
       spec,
+      account,
     );
     this.persistMeta();
     return info;
@@ -449,9 +493,10 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     cols: number,
     rows: number,
     spec: { file: string; args: string[] } | undefined,
+    account?: AccountBinding,
   ): SessionInfo {
     const base = spec ?? { file: "/bin/true", args: [] };
-    const sessionEnv = this.sessionEnv(id);
+    const sessionEnv = { ...(account?.environment ?? {}), ...this.sessionEnv(id) };
     const launch =
       this.tmuxBin && this.tmuxConfigFile
         ? tmux.wrapSpawn(base, {
@@ -471,6 +516,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
         file: launch.file,
         args: launch.args,
         env: spawnEnv(sessionEnv),
+        ...(account ? { accountId: account.id, accountName: account.name } : {}),
       });
     } catch (e) {
       // node-pty 对不存在的可执行文件同步抛 posix_spawnp failed
@@ -492,6 +538,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     approvalPolicy?: ApprovalPolicy,
     mode?: "default" | "plan",
     resume?: { id: string; title?: string | undefined },
+    account?: AccountBinding,
   ): Promise<SessionInfo> {
     const id = randomUUID();
     const initialAdapterState: AdapterResumeState = {
@@ -508,6 +555,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       undefined,
       approvalPolicy,
       hasInitialAdapterState ? initialAdapterState : undefined,
+      account,
     );
     this.structuredSessions.set(id, session);
     try {
@@ -534,14 +582,19 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     restored?: StructuredSessionPersistentState,
     approvalPolicy?: ApprovalPolicy,
     initialAdapterState?: AdapterResumeState,
+    initialAccount?: AccountBinding,
   ): StructuredSession {
+    const account = restored?.accountId
+      ? this.resolveAccount(agent, restored.accountId)
+      : initialAccount;
     const session = new StructuredSession({
       id,
       agent,
       title,
       cwd,
       adapter: this.adapterFactory(agent, restored?.adapterState ?? initialAdapterState),
-      environment: this.sessionEnv(id),
+      environment: { ...(account?.environment ?? {}), ...this.sessionEnv(id) },
+      ...(account ? { accountId: account.id, accountName: account.name } : {}),
       ...(approvalPolicy !== undefined ? { approvalPolicy } : {}),
       ...(restored ? { restored } : {}),
       ...(initialAdapterState ? { initialAdapterState } : {}),
@@ -556,6 +609,33 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     });
     session.on("persist", () => this.scheduleStructuredPersist());
     return session;
+  }
+
+  /** 用官方 CLI 打开登录终端；managed Claude 在这里生成之后要安全导入的令牌。 */
+  createAccountLogin(spec: AccountLoginSpec, cols: number, rows: number): SessionInfo {
+    const id = randomUUID();
+    const info = this.spawnPty(
+      id,
+      spec.binding.agent,
+      `${spec.binding.name} · 登录`,
+      os.homedir(),
+      cols,
+      rows,
+      spec.command,
+      spec.binding,
+    );
+    this.persistMeta();
+    return info;
+  }
+
+  private resolveAccount(agent: AgentKind, accountId: string): AccountBinding {
+    if (agent !== "claude" && agent !== "codex") {
+      throw new SessionError(`agent "${agent}" 不支持账号隔离`, "agent_unavailable");
+    }
+    if (!this.accountResolver) {
+      throw new SessionError("daemon 尚未启用账号管理", "agent_unavailable");
+    }
+    return this.accountResolver(accountId, agent);
   }
 
   getPty(sid: string): PtySession | undefined {
@@ -616,17 +696,16 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   }
 
   /**
-   * 每个 agent 各挑一个结构化会话 —— 限流按账号走,而账号按 agent 分,
-   * 所以 claude 问一次、codex 问一次就够了,同一个 agent 开十个会话
-   * 拿到的是同一份额度。
+   * 每个 (agent, accountId) 各挑一个结构化会话。多账号之后只按 agent
+   * 合并会把两份订阅额度混在一起；旧会话没有 accountId 时仍归到 legacy。
    */
   structuredPerAgent(): StructuredSession[] {
-    const byAgent = new Map<AgentKind, StructuredSession>();
+    const byAccount = new Map<string, StructuredSession>();
     for (const s of this.structuredSessions.values()) {
       // 后来的覆盖先前的:新会话更可能刚从服务端拿到过限流推送
-      byAgent.set(s.agent, s);
+      byAccount.set(`${s.agent}\u0000${s.accountId ?? "legacy"}`, s);
     }
-    return [...byAgent.values()];
+    return [...byAccount.values()];
   }
 
   /** 转发一条用户消息(可带附件) */
