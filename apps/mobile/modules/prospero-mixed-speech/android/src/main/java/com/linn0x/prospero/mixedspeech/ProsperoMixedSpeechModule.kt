@@ -10,6 +10,7 @@ import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Build
 import android.os.SystemClock
+import android.util.Log
 import expo.modules.kotlin.exception.Exceptions
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
@@ -44,6 +45,7 @@ private data class AndroidSpeechRecording(
 private class AndroidPcmRecorder(
   private val context: Context,
   private val onVolume: (Double) -> Unit,
+  private val onPcm: ((ByteArray, Int) -> Unit)? = null,
 ) {
   private val pcmFile = File(context.cacheDir, "$RECORDING_PREFIX${UUID.randomUUID()}.pcm")
   private val wavFile = File(context.cacheDir, "$RECORDING_PREFIX${UUID.randomUUID()}.wav")
@@ -168,6 +170,7 @@ private class AndroidPcmRecorder(
           when {
             read > 0 -> {
               output.write(buffer, 0, read)
+              onPcm?.invoke(buffer, read)
               totalBytes += read
               bytesWritten = totalBytes
               val now = SystemClock.elapsedRealtime()
@@ -243,9 +246,17 @@ private class AndroidPcmRecorder(
 }
 
 class ProsperoMixedSpeechModule : Module() {
+  companion object {
+    private const val TAG = "ProsperoMixedSpeech"
+  }
+
   private val stateLock = Any()
   private var activeRecorder: AndroidPcmRecorder? = null
+  private var activeSamsungSession: SamsungIntelliVoiceSession? = null
   private var lastRecording: File? = null
+
+  @Volatile
+  private var samsungAccessAllowed: Boolean? = null
 
   private val context: Context
     get() = appContext.reactContext ?: throw Exceptions.ReactContextLost()
@@ -253,46 +264,109 @@ class ProsperoMixedSpeechModule : Module() {
   override fun definition() = ModuleDefinition {
     Name("ProsperoMixedSpeech")
 
-    Events("onVolume")
+    Events("onVolume", "onTranscript")
+
+    Function("getEngine") {
+      selectedEngine()
+    }
 
     Function("isAvailable") {
-      hasBundledModel()
+      selectedEngine() != "unavailable"
     }
 
     AsyncFunction<Unit>("prepare") {
       check(hasBundledModel()) {
         "安卓版离线语音模型不完整，请重新构建并安装完整 APK。"
       }
+      if (
+        samsungAccessAllowed == null &&
+        SamsungIntelliVoiceSession.isAvailable(context)
+      ) {
+        samsungAccessAllowed = SamsungIntelliVoiceSession.probe(context)
+      }
+      Log.i(TAG, "Prepared Android offline speech; preferred engine=${selectedEngine()}")
     }
 
     AsyncFunction("start") { _: List<String> ->
-      val next = AndroidPcmRecorder(context) { value ->
-        if (appContext.hasActiveReactInstance) {
-          sendEvent("onVolume", mapOf("value" to value))
-        }
-      }
       synchronized(stateLock) {
         check(activeRecorder == null) { "语音识别已经在录音。" }
+      }
+      val samsungSession = if (shouldUseSamsung()) {
+        runCatching {
+          SamsungIntelliVoiceSession.open(context) { transcript ->
+            if (appContext.hasActiveReactInstance) {
+              sendEvent("onTranscript", mapOf("transcript" to transcript))
+            }
+          }
+        }.onFailure { error ->
+          samsungAccessAllowed = false
+          Log.w(TAG, "Samsung IntelliVoice start failed; recording for Whisper", error)
+        }.getOrNull()
+      } else {
+        null
+      }
+      val next = AndroidPcmRecorder(
+        context = context,
+        onVolume = { value ->
+          if (appContext.hasActiveReactInstance) {
+            sendEvent("onVolume", mapOf("value" to value))
+          }
+        },
+        onPcm = samsungSession?.let { session ->
+          { buffer, size -> session.write(buffer, size) }
+        },
+      )
+      synchronized(stateLock) {
+        if (activeRecorder != null) {
+          samsungSession?.abort()
+          error("语音识别已经在录音。")
+        }
         lastRecording?.delete()
         lastRecording = null
         activeRecorder = next
+        activeSamsungSession = samsungSession
       }
       try {
         next.start()
       } catch (error: Throwable) {
         synchronized(stateLock) {
           if (activeRecorder === next) activeRecorder = null
+          if (activeSamsungSession === samsungSession) activeSamsungSession = null
         }
         next.abort()
+        samsungSession?.abort()
         throw error
       }
     }
 
     AsyncFunction("stop") {
-      val current = synchronized(stateLock) {
-        activeRecorder?.also { activeRecorder = null }
-      } ?: error("当前没有正在进行的语音录音。")
-      val result = current.stop()
+      val (current, samsungSession) = synchronized(stateLock) {
+        val recorder = activeRecorder ?: error("当前没有正在进行的语音录音。")
+        activeRecorder = null
+        val session = activeSamsungSession
+        activeSamsungSession = null
+        recorder to session
+      }
+      val result = try {
+        current.stop()
+      } catch (error: Throwable) {
+        samsungSession?.abort()
+        throw error
+      }
+      val samsungResult = runCatching { samsungSession?.finish() }
+        .onFailure { error -> Log.w(TAG, "Samsung IntelliVoice result failed", error) }
+        .getOrNull()
+      val samsungTranscript = samsungResult?.transcript?.trim().orEmpty()
+      if (samsungTranscript.isNotEmpty()) {
+        result.file.delete()
+        return@AsyncFunction mapOf(
+          "zh" to emptyList<Map<String, Any>>(),
+          "en" to emptyList<Map<String, Any>>(),
+          "transcript" to samsungTranscript,
+          "engine" to "samsung",
+          "duration" to result.durationSeconds,
+        )
+      }
       synchronized(stateLock) {
         lastRecording?.delete()
         lastRecording = result.file
@@ -301,6 +375,8 @@ class ProsperoMixedSpeechModule : Module() {
         "zh" to emptyList<Map<String, Any>>(),
         "en" to emptyList<Map<String, Any>>(),
         "audioFileUri" to Uri.fromFile(result.file).toString(),
+        "engine" to "whisper",
+        "fallbackReason" to samsungResult?.errorMessage,
         "duration" to result.durationSeconds,
       )
     }
@@ -332,14 +408,25 @@ class ProsperoMixedSpeechModule : Module() {
     }
   }.getOrDefault(false)
 
+  private fun selectedEngine(): String = when {
+    !hasBundledModel() -> "unavailable"
+    shouldUseSamsung() -> "samsung"
+    else -> "whisper"
+  }
+
+  private fun shouldUseSamsung(): Boolean =
+    samsungAccessAllowed != false && SamsungIntelliVoiceSession.isAvailable(context)
+
   private fun abortAndDelete() {
-    val (recorder, recording) = synchronized(stateLock) {
-      val values = activeRecorder to lastRecording
+    val (recorder, samsungSession, recording) = synchronized(stateLock) {
+      val values = Triple(activeRecorder, activeSamsungSession, lastRecording)
       activeRecorder = null
+      activeSamsungSession = null
       lastRecording = null
       values
     }
     recorder?.abort()
+    samsungSession?.abort()
     recording?.delete()
   }
 }

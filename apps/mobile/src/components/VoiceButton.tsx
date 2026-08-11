@@ -16,12 +16,17 @@ import {
   useSpeechRecognitionEvent,
 } from "expo-speech-recognition";
 import ProsperoMixedSpeechModule from "../../modules/prospero-mixed-speech/src/ProsperoMixedSpeechModule";
-import type { MixedSpeechResult } from "../../modules/prospero-mixed-speech/src/ProsperoMixedSpeech.types";
+import type {
+  MixedSpeechEngine,
+  MixedSpeechResult,
+} from "../../modules/prospero-mixed-speech/src/ProsperoMixedSpeech.types";
 import { Icon } from "@/components/Icon";
 import { toast } from "@/components/Toast";
 import {
   abortAndroidOfflineSpeech,
+  prepareAndroidOfflineSpeech,
   releaseAndroidOfflineSpeech,
+  scheduleAndroidOfflineSpeechRelease,
   transcribeAndroidOfflineSpeech,
 } from "@/lib/android-offline-speech";
 import {
@@ -30,7 +35,9 @@ import {
   joinRecognitionSegments,
   mergeBilingualSpeech,
   missingVoiceInputLocales,
+  normalizeOfflineSpeechTranscript,
   onDeviceRecognitionOptions,
+  shouldUseAndroidSystemSpeech,
   supportsAndroidMixedSpeech,
   VOICE_INPUT_LOCALES,
   voiceRecognitionErrorMessage,
@@ -73,33 +80,56 @@ const TECHNICAL_TERMS = [
   "Plan mode",
 ];
 
-function usesNativeMixedSpeech(): boolean {
+function nativeSpeechEngine(): MixedSpeechEngine {
   if (
     (Platform.OS !== "ios" && Platform.OS !== "android") ||
     !ProsperoMixedSpeechModule
   ) {
-    return false;
+    return "unavailable";
   }
   try {
-    return ProsperoMixedSpeechModule.isAvailable() === true;
+    return ProsperoMixedSpeechModule.getEngine();
   } catch {
-    return false;
+    return "unavailable";
   }
 }
 
 function usesAppleMixedSpeech(): boolean {
-  return Platform.OS === "ios" && usesNativeMixedSpeech();
+  return Platform.OS === "ios" && nativeSpeechEngine() === "apple";
+}
+
+function usesSamsungMixedSpeech(): boolean {
+  return (
+    Platform.OS === "android" &&
+    nativeSpeechEngine() === "samsung" &&
+    !usesAndroidMixedSpeech()
+  );
 }
 
 function usesBundledAndroidMixedSpeech(): boolean {
-  return Platform.OS === "android" && usesNativeMixedSpeech();
+  return (
+    Platform.OS === "android" &&
+    nativeSpeechEngine() === "whisper" &&
+    !usesAndroidMixedSpeech()
+  );
 }
 
 function usesAndroidMixedSpeech(): boolean {
-  return (
-    Platform.OS === "android" &&
-    supportsAndroidMixedSpeech(Platform.Version)
-  );
+  if (
+    Platform.OS !== "android" ||
+    !supportsAndroidMixedSpeech(Platform.Version)
+  ) {
+    return false;
+  }
+  try {
+    return shouldUseAndroidSystemSpeech(
+      Platform.Version,
+      ExpoSpeechRecognitionModule.isRecognitionAvailable(),
+      ExpoSpeechRecognitionModule.supportsOnDeviceRecognition(),
+    );
+  } catch {
+    return false;
+  }
 }
 
 function offlineLocaleNames(locales: readonly VoiceInputLocale[]): string {
@@ -113,18 +143,25 @@ async function inspectAvailability(): Promise<Availability> {
     return { kind: "unsupported", reason: "当前平台不支持设备端语音输入。" };
   }
 
-  const nativeMixedAvailable = usesNativeMixedSpeech();
+  const appleMixedAvailable = usesAppleMixedSpeech();
+  const androidSystemMixedAvailable = usesAndroidMixedSpeech();
+  const samsungMixedAvailable = usesSamsungMixedSpeech();
+  const bundledAndroidMixedAvailable = usesBundledAndroidMixedSpeech();
   try {
-    if (nativeMixedAvailable) {
+    if (appleMixedAvailable) {
       await ProsperoMixedSpeechModule!.prepare();
       return { kind: "ready" };
     }
 
-    if (Platform.OS === "android" && ProsperoMixedSpeechModule) {
-      return {
-        kind: "unsupported",
-        reason: "安卓版离线语音模型不完整，请重新构建并安装完整 APK。",
-      };
+    if (samsungMixedAvailable || bundledAndroidMixedAvailable) {
+      // Loading the model after the user releases push-to-talk accounts for a
+      // large part of perceived latency. Keep it warm as Samsung's guaranteed
+      // local fallback too, because vendor access can vary by firmware policy.
+      await Promise.all([
+        ProsperoMixedSpeechModule!.prepare(),
+        prepareAndroidOfflineSpeech(),
+      ]);
+      return { kind: "ready" };
     }
 
     if (
@@ -151,7 +188,7 @@ async function inspectAvailability(): Promise<Availability> {
       const supported = await ExpoSpeechRecognitionModule.getSupportedLocales(
         {},
       );
-      const requiredLocales = supportsAndroidMixedSpeech(apiLevel)
+      const requiredLocales = androidSystemMixedAvailable
         ? VOICE_INPUT_LOCALES
         : ([DEFAULT_VOICE_INPUT_LOCALE] as const);
       const unsupportedLocales = missingVoiceInputLocales(
@@ -179,7 +216,7 @@ async function inspectAvailability(): Promise<Availability> {
 
     return { kind: "ready" };
   } catch (error) {
-    if (nativeMixedAvailable && Platform.OS === "ios") {
+    if (appleMixedAvailable) {
       return {
         kind: "missing-model",
         reason:
@@ -188,7 +225,7 @@ async function inspectAvailability(): Promise<Availability> {
             : "中英文离线语音模型准备失败，请联网后重试。",
       };
     }
-    if (nativeMixedAvailable && Platform.OS === "android") {
+    if (samsungMixedAvailable || bundledAndroidMixedAvailable) {
       return {
         kind: "unsupported",
         reason:
@@ -211,8 +248,11 @@ interface Props {
 /** 结构化聊天专用的 push-to-talk 按钮。 */
 export function VoiceButton({ onTranscript }: Props) {
   const appleMixedMode = usesAppleMixedSpeech();
+  const samsungMixedMode = usesSamsungMixedSpeech();
   const bundledAndroidMixedMode = usesBundledAndroidMixedSpeech();
-  const nativeMixedMode = appleMixedMode || bundledAndroidMixedMode;
+  const androidNativeMixedMode =
+    samsungMixedMode || bundledAndroidMixedMode;
+  const nativeMixedMode = appleMixedMode || androidNativeMixedMode;
   const mixedMode = nativeMixedMode || usesAndroidMixedSpeech();
   const [phase, setPhaseState] = useState<Phase>("idle");
   const [availability, setAvailabilityState] = useState<Availability>({
@@ -221,6 +261,7 @@ export function VoiceButton({ onTranscript }: Props) {
   const [cancelArmed, setCancelArmedState] = useState(false);
   const [volume, setVolume] = useState(-2);
   const [preview, setPreview] = useState("");
+  const [transcriptionProgress, setTranscriptionProgress] = useState(0);
   const [downloading, setDownloading] = useState(false);
   const [detectedLanguage, setDetectedLanguage] = useState<"zh" | "en" | null>(
     null,
@@ -267,6 +308,7 @@ export function VoiceButton({ onTranscript }: Props) {
     errorRef.current = null;
     if (mountedRef.current) {
       setPreview("");
+      setTranscriptionProgress(0);
       setVolume(-2);
       setDetectedLanguage(null);
     }
@@ -286,19 +328,19 @@ export function VoiceButton({ onTranscript }: Props) {
       mountedRef.current = false;
       if (nativeMixedMode) {
         void ProsperoMixedSpeechModule?.abort();
-        if (bundledAndroidMixedMode) {
-          void releaseAndroidOfflineSpeech();
+        if (androidNativeMixedMode) {
+          scheduleAndroidOfflineSpeechRelease();
         }
       } else if (activeRef.current) {
         cancelledRef.current = true;
         ExpoSpeechRecognitionModule.abort();
       }
     };
-  }, [bundledAndroidMixedMode, nativeMixedMode, refreshAvailability]);
+  }, [androidNativeMixedMode, nativeMixedMode, refreshAvailability]);
 
   useEffect(() => {
     if (!nativeMixedMode || !ProsperoMixedSpeechModule) return;
-    const subscription = ProsperoMixedSpeechModule.addListener(
+    const volumeSubscription = ProsperoMixedSpeechModule.addListener(
       "onVolume",
       ({ value }) => {
         if (activeRef.current && !cancelledRef.current && mountedRef.current) {
@@ -306,7 +348,18 @@ export function VoiceButton({ onTranscript }: Props) {
         }
       },
     );
-    return () => subscription.remove();
+    const transcriptSubscription = ProsperoMixedSpeechModule.addListener(
+      "onTranscript",
+      ({ transcript }) => {
+        if (activeRef.current && !cancelledRef.current && mountedRef.current) {
+          setPreview(normalizeOfflineSpeechTranscript(transcript));
+        }
+      },
+    );
+    return () => {
+      volumeSubscription.remove();
+      transcriptSubscription.remove();
+    };
   }, [nativeMixedMode]);
 
   // Android 模型下载和 iOS 系统设置都可能切走 App；回来时重新检测能力。
@@ -315,17 +368,20 @@ export function VoiceButton({ onTranscript }: Props) {
     const subscription = AppState.addEventListener("change", (state) => {
       if (
         state !== "active" &&
-        bundledAndroidMixedMode &&
+        androidNativeMixedMode &&
         phaseRef.current === "idle"
       ) {
         void releaseAndroidOfflineSpeech();
       }
-      if (state === "active" && availabilityRef.current.kind !== "ready") {
+      if (
+        state === "active" &&
+        (availabilityRef.current.kind !== "ready" || androidNativeMixedMode)
+      ) {
         void refreshAvailability();
       }
     });
     return () => subscription.remove();
-  }, [bundledAndroidMixedMode, refreshAvailability]);
+  }, [androidNativeMixedMode, refreshAvailability]);
 
   useSpeechRecognitionEvent("start", () => {
     if (!activeRef.current || cancelledRef.current || stopRequestedRef.current)
@@ -472,7 +528,7 @@ export function VoiceButton({ onTranscript }: Props) {
     void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
     if (nativeMixedMode && ProsperoMixedSpeechModule) {
       const tasks: Promise<unknown>[] = [ProsperoMixedSpeechModule.abort()];
-      if (bundledAndroidMixedMode) {
+      if (androidNativeMixedMode) {
         tasks.push(abortAndroidOfflineSpeech());
       }
       void Promise.allSettled(tasks).finally(() => {
@@ -482,7 +538,7 @@ export function VoiceButton({ onTranscript }: Props) {
       ExpoSpeechRecognitionModule.abort();
     }
   }, [
-    bundledAndroidMixedMode,
+    androidNativeMixedMode,
     clearRecognitionText,
     finishMixedRecognition,
     nativeMixedMode,
@@ -499,7 +555,15 @@ export function VoiceButton({ onTranscript }: Props) {
       void ProsperoMixedSpeechModule.stop()
         .then(async (result: MixedSpeechResult) => {
           let transcript: string;
-          if (bundledAndroidMixedMode) {
+          if (Platform.OS === "android") {
+            const nativeTranscript = normalizeOfflineSpeechTranscript(
+              result.transcript ?? "",
+            );
+            if (nativeTranscript.length > 0) {
+              transcript = nativeTranscript;
+              finishMixedRecognition(operation, transcript);
+              return;
+            }
             const audioFileUri = result.audioFileUri;
             if (!audioFileUri) {
               throw new Error("安卓版录音没有生成本地音频文件。");
@@ -508,6 +572,24 @@ export function VoiceButton({ onTranscript }: Props) {
               transcript = await transcribeAndroidOfflineSpeech(
                 audioFileUri,
                 TECHNICAL_TERMS,
+                (progress) => {
+                  if (
+                    mountedRef.current &&
+                    operationRef.current === operation &&
+                    !cancelledRef.current
+                  ) {
+                    setTranscriptionProgress(Math.round(progress));
+                  }
+                },
+                (partial) => {
+                  if (
+                    mountedRef.current &&
+                    operationRef.current === operation &&
+                    !cancelledRef.current
+                  ) {
+                    setPreview(partial);
+                  }
+                },
               );
             } finally {
               await ProsperoMixedSpeechModule!.deleteRecording(audioFileUri);
@@ -524,7 +606,6 @@ export function VoiceButton({ onTranscript }: Props) {
       ExpoSpeechRecognitionModule.stop();
     }
   }, [
-    bundledAndroidMixedMode,
     finishMixedRecognition,
     nativeMixedMode,
     setPhase,
@@ -594,9 +675,11 @@ export function VoiceButton({ onTranscript }: Props) {
       }
       if (value.kind === "ready") {
         toast(
-          mixedMode
-            ? "中英文可以直接混说；松开后会在设备端合并转写。"
-            : "请按住麦克风说话，松开后转写到草稿。",
+          samsungMixedMode
+            ? "这台三星会优先使用系统中英端侧模型，失败时自动用应用内高精度模型。"
+            : mixedMode
+              ? "中英文可以直接混说；松开后会在设备端合并转写。"
+              : "请按住麦克风说话，松开后转写到草稿。",
         );
         return;
       }
@@ -634,7 +717,13 @@ export function VoiceButton({ onTranscript }: Props) {
       }
       Alert.alert("无法使用离线语音输入", value.reason, [{ text: "知道了" }]);
     },
-    [appleMixedMode, downloadOfflineModel, mixedMode, refreshAvailability],
+    [
+      appleMixedMode,
+      downloadOfflineModel,
+      mixedMode,
+      refreshAvailability,
+      samsungMixedMode,
+    ],
   );
 
   const beginRecognition = useCallback(async () => {
@@ -643,7 +732,12 @@ export function VoiceButton({ onTranscript }: Props) {
     longPressTriggeredRef.current = true;
     setPhase("starting");
 
-    const current = await inspectAvailability();
+    // The idle effect already performs the expensive model preparation. Do
+    // not repeat that work on the push-to-talk hot path once it is ready.
+    const current =
+      availabilityRef.current.kind === "ready"
+        ? availabilityRef.current
+        : await inspectAvailability();
     if (!mountedRef.current) return;
     setAvailability(current);
     if (current.kind !== "ready") {
@@ -828,12 +922,15 @@ export function VoiceButton({ onTranscript }: Props) {
                     : `正在聆听 · ${languageName}`
                   : phase === "cancelling"
                     ? "正在取消…"
-                    : "转写中… 点按取消"}
+                    : `转写中${transcriptionProgress > 0 ? ` ${String(transcriptionProgress)}%` : ""} · 点按取消`}
             </Text>
-            {phase === "recording" && (
+            {(phase === "recording" ||
+              (phase === "transcribing" && preview.length > 0)) && (
               <Text style={styles.statusHint} numberOfLines={preview ? 1 : 2}>
-                {preview ||
-                  `${detectedLanguageName ? `已识别 ${detectedLanguageName} · ` : ""}松开转写 · 上滑取消`}
+                {phase === "transcribing"
+                  ? preview
+                  : preview ||
+                    `${detectedLanguageName ? `已识别 ${detectedLanguageName} · ` : ""}松开转写 · 上滑取消`}
               </Text>
             )}
           </View>
@@ -862,7 +959,7 @@ export function VoiceButton({ onTranscript }: Props) {
         ]}
         hitSlop={6}
         pressRetentionOffset={{ top: 140, bottom: 36, left: 56, right: 56 }}
-        delayLongPress={260}
+        delayLongPress={180}
         disabled={availability.kind === "checking" || phase === "cancelling"}
         onPress={processing ? cancelRecognition : onPress}
         onPressIn={phase === "idle" ? onPressIn : undefined}

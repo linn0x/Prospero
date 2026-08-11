@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  PROTOCOL_VERSION,
+  PAIRING_FORMAT_VERSION,
   ProtocolError,
   decodePairingQR,
   encodePairingQR,
@@ -9,7 +9,7 @@ import {
   type PairingPayload,
 } from "../src/index.js";
 
-function makePayload(v = PROTOCOL_VERSION): PairingPayload {
+function makePayload(v = PAIRING_FORMAT_VERSION): PairingPayload {
   return {
     v,
     name: "MacBook-Pro",
@@ -43,13 +43,17 @@ describe("pairing QR", () => {
   });
 
   it("拒绝不支持的版本", () => {
-    const qr = encodePairingQR(makePayload(PROTOCOL_VERSION + 1));
+    const qr = encodePairingQR(makePayload(999));
     try {
       decodePairingQR(qr);
       expect.unreachable();
     } catch (e) {
       expect((e as ProtocolError).code).toBe("version");
     }
+  });
+
+  it("接受形状相同的 v5 旧二维码，配对格式不再跟 API 版本一起升级", () => {
+    expect(decodePairingQR(encodePairingQR(makePayload(5))).v).toBe(5);
   });
 
   it("拒绝损坏的载荷", () => {

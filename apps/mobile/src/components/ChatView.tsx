@@ -103,6 +103,11 @@ export const ChatView = memo(function ChatView({
   onOpenSubagent,
 }: Props) {
   const [items, setItems] = useState<ChatItem[]>([]);
+  /** 带 id 防止路由切换瞬间把上一个子 Agent 的历史短暂画到新页面。 */
+  const [subagentHistory, setSubagentHistory] = useState<{
+    subagentId: string;
+    items: ChatItem[];
+  } | null>(null);
   const listRef = useRef<FlatList<ChatDisplayItem>>(null);
   const imageCacheRef = useRef(new Map<string, Promise<string>>());
   const evSeqRef = useRef(0);
@@ -205,7 +210,41 @@ export const ChatView = memo(function ChatView({
     };
   }, [conn, sid]);
 
-  const scopedItems = useMemo(() => itemsForAgent(items, subagentId), [items, subagentId]);
+  useEffect(() => {
+    if (!subagentId) return;
+    let cancelled = false;
+    let loading = false;
+    const refresh = async (): Promise<void> => {
+      if (cancelled || loading || !conn.isConnected || !conn.supportsSubagentHistory) return;
+      loading = true;
+      try {
+        const events = await conn.subagentHistory(sid, subagentId);
+        if (!cancelled) {
+          setSubagentHistory({ subagentId, items: applyEvents([], events) });
+        }
+      } catch {
+        // 断线、重连或 Codex 正在落盘时保留上一次内容；父会话实时事件仍是降级视图。
+      } finally {
+        loading = false;
+      }
+    };
+    void refresh();
+    const timer = setInterval(() => void refresh(), 1_200);
+    const offConnected = conn.events.on("connected", () => void refresh());
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+      offConnected();
+    };
+  }, [conn, sid, subagentId]);
+
+  const scopedItems = useMemo(
+    () =>
+      subagentId && subagentHistory?.subagentId === subagentId
+        ? subagentHistory.items
+        : itemsForAgent(items, subagentId),
+    [items, subagentId, subagentHistory],
+  );
 
   // 新内容到达时,只有用户已在底部才自动跟随(避免打断向上翻阅)
   useEffect(() => {
@@ -933,13 +972,25 @@ const SubagentCard = memo(function SubagentCard({
       accessibilityRole="button"
       accessibilityLabel={`查看子 Agent ${subagent.name}`}
     >
-      <View style={[styles.subagentDot, { backgroundColor: active ? color.accent : color.textFaint }]} />
       <View style={styles.subagentCopy}>
         <View style={styles.subagentTitleRow}>
-          <Text style={styles.subagentName} numberOfLines={1}>{subagent.name}</Text>
+          <View style={[styles.subagentIdentity, active && styles.subagentIdentityActive]}>
+            <View
+              style={[
+                styles.subagentDot,
+                { backgroundColor: active ? color.accent : color.textFaint },
+              ]}
+            />
+            <Text style={styles.subagentName} numberOfLines={1}>{subagent.name}</Text>
+          </View>
+          {subagent.role && subagent.role !== subagent.name && (
+            <Text style={styles.subagentRole} numberOfLines={1}>{subagent.role}</Text>
+          )}
+          <View style={styles.subagentTitleSpacer} />
           <Text style={[styles.subagentState, active && styles.subagentStateActive]}>
             {subagentStateLabel[subagent.status]}
           </Text>
+          <Icon name="chevron.right" size={12} color={color.textFaint} />
         </View>
         {(subagent.preview || subagent.task) && (
           <Text style={styles.subagentPreview} numberOfLines={2}>
@@ -947,7 +998,6 @@ const SubagentCard = memo(function SubagentCard({
           </Text>
         )}
       </View>
-      <Icon name="chevron.right" size={12} color={color.textFaint} />
     </Pressable>
   );
 });
@@ -1378,9 +1428,6 @@ const styles = StyleSheet.create({
 
   subagentCard: {
     minHeight: 62,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 10,
     backgroundColor: color.surface,
     borderRadius: radius.md,
     borderWidth: StyleSheet.hairlineWidth,
@@ -1391,7 +1438,22 @@ const styles = StyleSheet.create({
   subagentDot: { width: 8, height: 8, borderRadius: 4 },
   subagentCopy: { flex: 1, gap: 4 },
   subagentTitleRow: { flexDirection: "row", alignItems: "center", gap: 8 },
-  subagentName: { flex: 1, color: color.text, fontSize: 13, fontWeight: "600" },
+  subagentIdentity: {
+    maxWidth: "58%",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    borderRadius: 999,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
+    backgroundColor: color.surfaceRaised,
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+  },
+  subagentIdentityActive: { borderColor: color.accentDim, backgroundColor: "#18223A" },
+  subagentName: { flexShrink: 1, color: color.text, fontSize: 12, fontWeight: "700" },
+  subagentRole: { maxWidth: "25%", color: color.textFaint, fontSize: 10 },
+  subagentTitleSpacer: { flex: 1 },
   subagentState: { color: color.textFaint, fontSize: 10 },
   subagentStateActive: { color: color.accent },
   subagentPreview: { color: color.textDim, fontSize: 11, lineHeight: 16 },

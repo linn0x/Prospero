@@ -17,6 +17,7 @@ interface PromptDialogProps {
   message?: string;
   value: string;
   confirmLabel?: string;
+  secureTextEntry?: boolean;
   onChangeText: (value: string) => void;
   onCancel: () => void;
   onSubmit: (value: string) => void | Promise<void>;
@@ -35,6 +36,7 @@ export function PromptDialog({
   message,
   value,
   confirmLabel = "确定",
+  secureTextEntry = false,
   onChangeText,
   onCancel,
   onSubmit,
@@ -124,6 +126,7 @@ export function PromptDialog({
               spellCheck={false}
               returnKeyType="done"
               importantForAutofill="no"
+              secureTextEntry={secureTextEntry}
             />
             <Text style={[styles.error, shownError === null && styles.errorHidden]}>
               {shownError ?? "占位"}

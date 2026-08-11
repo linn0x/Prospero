@@ -118,6 +118,71 @@ describe("结构化轨协议", () => {
         rows: 24,
       }),
     ).toThrowError(ProtocolError);
+    expect(
+      parseC2S({
+        type: "session.create",
+        agent: "codex",
+        accountId: "account-work",
+        cwd: "/tmp/same-project",
+        cols: 80,
+        rows: 24,
+      }),
+    ).toMatchObject({ accountId: "account-work", cwd: "/tmp/same-project" });
+  });
+
+  it("Code Agent 账号管理与受限凭据导入消息可校验", () => {
+    expect(parseC2S({
+      type: "agent.account.create",
+      requestId: "account-create-1",
+      agent: "claude",
+      name: "工作账号",
+    })).toMatchObject({ agent: "claude", name: "工作账号" });
+    expect(parseC2S({
+      type: "agent.account.login",
+      requestId: "account-login-1",
+      accountId: "account-1",
+      cols: 80,
+      rows: 24,
+    })).toMatchObject({ accountId: "account-1" });
+    expect(parseC2S({
+      type: "agent.account.credential.set",
+      requestId: "account-credential-1",
+      accountId: "account-1",
+      credentialKind: "oauth_token",
+      credential: "sk-ant-oat01-example-token-long-enough",
+    })).toMatchObject({ accountId: "account-1", credentialKind: "oauth_token" });
+    expect(() => parseC2S({
+      type: "agent.account.credential.set",
+      requestId: "account-credential-short",
+      accountId: "account-1",
+      credentialKind: "oauth_token",
+      credential: "too-short",
+    })).toThrowError(ProtocolError);
+    expect(() => parseC2S({
+      type: "agent.account.create",
+      requestId: "account-create-2",
+      agent: "opencode",
+      name: "不支持",
+    })).toThrowError(ProtocolError);
+
+    expect(parseS2C({
+      type: "agent.accounts.result",
+      requestId: "account-list-1",
+      action: "list",
+      ok: true,
+      accounts: [{
+        id: "native-codex",
+        agent: "codex",
+        name: "本机默认",
+        managed: false,
+        isDefault: true,
+        status: "signed_in",
+        authMethod: "ChatGPT",
+        createdAt: 0,
+        updatedAt: 0,
+        activeSessions: 0,
+      }],
+    })).toMatchObject({ accounts: [{ id: "native-codex", status: "signed_in" }] });
   });
 
   it("编排快照与手机 Gate 决策可往返校验", () => {
@@ -133,6 +198,18 @@ describe("结构化轨协议", () => {
             objective: "发布移动端",
             status: "active",
             coordinatorSessionId: "session-1",
+            automation: {
+              state: "running",
+              agent: "codex",
+              approvalPolicy: "standard",
+              workspace: "run",
+              cwd: "/tmp/project",
+              workspacePath: "/tmp/worktrees/run-1",
+              branch: "prospero/run-1/auto",
+              startedAt: 1,
+              updatedAt: 1,
+              lastError: null,
+            },
             createdAt: 1,
             updatedAt: 1,
           }],
@@ -142,6 +219,102 @@ describe("结构化轨协议", () => {
         },
       }),
     ).toMatchObject({ type: "orchestration.snapshot", snapshot: { runs: [{ id: "run-1" }] } });
+  });
+
+  it("人工 Run、任务与 worker 派发消息可校验", () => {
+    expect(parseC2S({
+      type: "orchestration.run.create",
+      objective: "滚动升级兼容",
+    })).toMatchObject({ objective: "滚动升级兼容" });
+    expect(parseC2S({
+      type: "orchestration.task.create",
+      runId: "run-1",
+      title: "握手回退",
+      spec: "支持 v9/v8/v7/v5",
+      deps: ["task-0"],
+    })).toMatchObject({ deps: ["task-0"] });
+    expect(parseC2S({
+      type: "orchestration.worker.start",
+      taskId: "task-1",
+      agent: "codex",
+      worktree: "new",
+      cwd: "/tmp/project",
+      approvalPolicy: "standard",
+    })).toMatchObject({ agent: "codex", worktree: "new" });
+    expect(parseC2S({
+      type: "orchestration.worker.stop",
+      taskId: "task-1",
+      reason: "先停下来检查",
+      operationId: "stop-1",
+    })).toMatchObject({ taskId: "task-1", reason: "先停下来检查" });
+    expect(parseC2S({
+      type: "orchestration.task.cancel",
+      taskId: "task-2",
+      operationId: "cancel-1",
+    })).toMatchObject({ taskId: "task-2" });
+    expect(parseC2S({
+      type: "orchestration.task.retry",
+      taskId: "task-3",
+      operationId: "retry-1",
+    })).toMatchObject({ taskId: "task-3" });
+  });
+
+  it("可视化任务图支持原子新建、revision 编辑与 operationId", () => {
+    const created = parseC2S({
+      type: "orchestration.graph.create",
+      operationId: "op-create",
+      objective: "发布",
+      nodes: [
+        { clientId: "design", title: "设计", spec: "定协议", deps: [] },
+        { clientId: "ship", title: "发布", spec: "发版本", deps: ["design"] },
+      ],
+    });
+    expect(created).toMatchObject({ operationId: "op-create" });
+    expect(created).toHaveProperty("nodes.0.clientId", "design");
+    expect(parseC2S({
+      type: "orchestration.graph.apply",
+      operationId: "op-apply",
+      runId: "run-1",
+      baseRevision: 3,
+      nodes: [],
+      deleteTaskIds: ["task-1"],
+    })).toMatchObject({ runId: "run-1", baseRevision: 3, deleteTaskIds: ["task-1"] });
+    expect(parseC2S({
+      type: "orchestration.run.delete",
+      operationId: "op-delete-run",
+      runId: "run-1",
+    })).toMatchObject({ runId: "run-1" });
+    expect(() => parseC2S({
+      type: "orchestration.graph.create",
+      objective: "缺少幂等键",
+      nodes: [{ clientId: "a", title: "A", spec: "A", deps: [] }],
+    })).toThrowError(ProtocolError);
+  });
+
+  it("静态任务图可启动、恢复或暂停自动执行", () => {
+    expect(parseC2S({
+      type: "orchestration.automation.start",
+      operationId: "auto-start",
+      runId: "run-1",
+      agent: "codex",
+      approvalPolicy: "standard",
+      workspace: "run",
+      cwd: "/tmp/project",
+    })).toMatchObject({ runId: "run-1", workspace: "run" });
+    expect(parseC2S({
+      type: "orchestration.automation.pause",
+      operationId: "auto-pause",
+      runId: "run-1",
+    })).toMatchObject({ runId: "run-1" });
+    expect(() => parseC2S({
+      type: "orchestration.automation.start",
+      operationId: "bad-auto",
+      runId: "run-1",
+      agent: "codex",
+      approvalPolicy: "standard",
+      workspace: "per-task",
+      cwd: "/tmp/project",
+    })).toThrowError(ProtocolError);
   });
 
   it("本机可恢复对话搜索与完成态可往返校验", () => {
@@ -359,6 +532,25 @@ describe("结构化轨协议", () => {
       subagentId: "child-1",
       text: "先检查测试",
     })).toMatchObject({ subagentId: "child-1" });
+    expect(parseC2S({
+      type: "subagent.history.get",
+      sid: "s1",
+      subagentId: "child-1",
+      requestId: "history-1",
+    })).toMatchObject({ subagentId: "child-1", requestId: "history-1" });
+    expect(parseS2C({
+      type: "subagent.history.result",
+      sid: "s1",
+      subagentId: "child-1",
+      requestId: "history-1",
+      events: [{
+        kind: "text.delta",
+        msgId: "answer-1",
+        textId: "answer-1",
+        delta: "检查完成",
+        agentId: "child-1",
+      }],
+    })).toMatchObject({ events: [{ kind: "text.delta", agentId: "child-1" }] });
   });
 
   it("拒绝未知 kind 与缺字段", () => {

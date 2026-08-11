@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type {
+  AgentEventBody,
   AgentQuestionAnswer,
   PermissionReply,
 } from "@prospero/protocol";
@@ -11,12 +12,16 @@ import type {
   AgentModelCatalog,
   AgentModelSelection,
 } from "../src/adapters/types.js";
-import { StructuredSession } from "../src/structured-session.js";
+import {
+  StructuredSession,
+  type StructuredSessionPersistentState,
+} from "../src/structured-session.js";
 
 class InteractiveAdapter implements AgentAdapter {
   private ctx: AdapterContext | null = null;
   readonly childMessages: Array<{ id: string; text: string }> = [];
   mode = "default";
+  history: AgentEventBody[] | null = null;
 
   async start(ctx: AdapterContext): Promise<void> {
     this.ctx = ctx;
@@ -106,6 +111,10 @@ class InteractiveAdapter implements AgentAdapter {
   async sendToSubagent(subagentId: string, text: string): Promise<void> {
     this.childMessages.push({ id: subagentId, text });
   }
+
+  async readSubagentHistory(): Promise<AgentEventBody[] | null> {
+    return this.history ? [...this.history] : null;
+  }
 }
 
 describe("结构化 Agent 原生交互", () => {
@@ -167,6 +176,95 @@ describe("结构化 Agent 原生交互", () => {
           event.text === "先跑移动端测试",
       ),
     ).toBe(true);
+    await session.dispose();
+  });
+
+  it("子 Agent 快照优先用后端完整历史，并保留 Prospero 审批事件", async () => {
+    const adapter = new InteractiveAdapter();
+    const session = new StructuredSession({
+      id: "child-history",
+      agent: "codex",
+      title: "codex · child-history",
+      cwd: "/tmp",
+      adapter,
+    });
+    await session.start();
+    adapter.spawnChild();
+    adapter.history = [
+      { kind: "user.message", msgId: "native-user", text: "原生任务", agentId: "child-1" },
+      {
+        kind: "text.delta",
+        msgId: "native-answer",
+        textId: "native-answer",
+        delta: "完整历史",
+        agentId: "child-1",
+      },
+    ];
+    const snapshot = await session.subagentSnapshot("child-1");
+    expect(snapshot.subagent.name).toBe("reviewer");
+    expect(snapshot.events).toEqual(adapter.history);
+    await session.dispose();
+  });
+
+  it("恢复时清掉旧版把父 Codex thread 误记成子 Agent 的事件", async () => {
+    const restored: StructuredSessionPersistentState = {
+      version: 1,
+      id: "restore-self-child",
+      agent: "codex",
+      title: "codex · restore",
+      cwd: "/tmp",
+      createdAt: 1,
+      approvalPolicy: "standard",
+      events: [
+        {
+          kind: "subagent.started",
+          subagent: {
+            id: "native-parent",
+            name: "Codex 子 Agent 1",
+            status: "stopped",
+            canMessage: false,
+            createdAt: 1,
+            updatedAt: 1,
+          },
+        },
+        {
+          kind: "subagent.updated",
+          subagentId: "native-parent",
+          status: "stopped",
+          canMessage: false,
+        },
+        {
+          kind: "subagent.started",
+          subagent: {
+            id: "real-child",
+            name: "Peirce",
+            status: "idle",
+            canMessage: true,
+            createdAt: 2,
+            updatedAt: 2,
+          },
+        },
+      ],
+      evSeq: 12,
+      preview: "",
+      previewRaw: "",
+      previewMsgId: "",
+      totals: { costUsd: 0, inputTokens: 0, outputTokens: 0 },
+      toolOutputs: [],
+      adapterState: { threadId: "native-parent" },
+      messageQueue: [],
+    };
+    const session = new StructuredSession({
+      id: restored.id,
+      agent: restored.agent,
+      title: restored.title,
+      cwd: restored.cwd,
+      adapter: new InteractiveAdapter(),
+      restored,
+    });
+    expect(session.info().subagents?.map((child) => child.id)).toEqual(["real-child"]);
+    expect(session.snapshot().evSeq).toBe(1);
+    expect(session.persistentState().events).toHaveLength(1);
     await session.dispose();
   });
 });

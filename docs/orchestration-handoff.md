@@ -1,8 +1,8 @@
 # 编排:交接状态
 
-**日期** 2026-08-09 · **接续** [orchestration-plan.md](orchestration-plan.md)
+**日期** 2026-08-10 · **接续** [orchestration-plan.md](orchestration-plan.md)
 
-一句话:M1(地基)+M2(派发)+M3(协作 CLI)写完并验过；M4 已接入手机 Goal、状态快照与人工 Gate，任务图的深度交互尚可继续扩展。
+一句话:M1(地基)+M2(派发)+M3(协作 CLI)写完；M4 已具备手机与 Mac 的可视化 DAG 新建/编辑、拓扑查看、自动/手工 worker 派发，以及停止、取消、重试的生命周期管理；Mac 还可直接启动并聚合本地 Agent 会话。
 
 ---
 
@@ -12,15 +12,17 @@
 | --- | --- | --- |
 | `docs/orchestration-plan.md` | 总设计:模型、分层、worktree 方案、分期 | — |
 | `src/orchestration/model.ts` | 数据模型 + 任务状态机 + 成环检测 | 随 store 一起测 |
-| `src/orchestration/store.ts` | JSON 持久化,Run/Task/Dispatch/Message/Gate 全套 CRUD | 24 个用例全过 |
+| `src/orchestration/store.ts` | JSON 持久化,Run/Task/Dispatch/Message/Gate 全套 CRUD | 36 个用例全过 |
 | `src/orchestration/worktree.ts` | git worktree + APFS 写时复制克隆依赖 | **只 typecheck,无测试** ⚠️ |
-| `test/orchestration-store.test.ts` | 20 个用例 | 全过 |
+| `test/orchestration-store.test.ts` | 36 个用例 | 全过 |
 | `src/control-socket.ts` | `~/.prospero/control.sock` 的 token 鉴权 NDJSON RPC + 0600 token 文件 | 4 个用例全过 |
-| `src/orchestration/{control-api,dispatch}.ts` | socket 方法、协调者权限、ready 校验、建会话/worktree/前导词/显式交付 | 2 个派发用例全过 |
+| `src/orchestration/{control-api,dispatch}.ts` | socket 方法、协调者权限、ready 校验、建会话/worktree/前导词/显式交付、worker 停止与异常退出收敛 | 4 个派发用例全过 |
 | `src/orchestration-cli.ts` + `bin/prospero` | worker/协调者会话内的 `prospero` CLI | daemon 端到端用例全过 |
 | `src/orchestration/collaboration.ts` | 持久邮箱的 wait/ask/reply 语义；client 断开可取消长等待 | 4 个用例全过 |
 | `test/orchestration-{cli,session-env,collaboration,control-api}.test.ts` | CLI→daemon 往返、身份环境、长轮询/问答、worker 自动 report、决策门 | 9 个用例全过 |
-| `packages/protocol` + `src/ws-server.ts` + 手机主机页 | 编排快照 / Gate 决策协议；Goal 建立 Run 与协调者会话；iOS/Android 响应式项目-配置发起页 | protocol、daemon、mobile typecheck 全过 |
+| `packages/protocol` + `src/ws-server.ts` + 手机/Mac 编排页 | 编排快照 / Gate；原子 DAG 新建、编辑与 pending 节点删除；Run 管理删除；手工或静态自动 worker 派发；Goal 协调者会话 | protocol、daemon、mobile、Swift build 全过 |
+| `src/orchestration/automation.ts` | 人工 DAG 一键运行；整张 Run 共享隔离 worktree，显式交付后安全串行推进，支持暂停/恢复/重启续跑 | 真实 git worktree + 状态推进测试 |
+| 协议 v9 + `hosts.ts` | v9→v8→v7→v5 滚动兼容；能力协商；token/设备私钥迁入 iOS Keychain | 协议、daemon 集成与移动端迁移测试全过 |
 
 跑验证:
 
@@ -64,12 +66,23 @@ cd apps/daemon && npx vitest run \
 
 ## 二、没做的(按建议顺序)
 
-### M4 手机端（已完成第一段）
+### M4 手机端与 Mac（已完成手工编排主路径）
 
-1. protocol 已加入 `orchestration.snapshot` 与 `orchestration.gate.resolve`；App 前台每 8 秒重取快照，iOS/Android 从后台回来不会依赖易丢的增量事件。
+1. protocol 已加入 `orchestration.snapshot` 与 `orchestration.gate.resolve`；App 前台定时重取快照，iOS/Android 从后台回来不会依赖易丢的增量事件。
 2. 新建会话的手机竖屏将项目收为可点按更换的紧凑上下文栏，让配置区占余下全部空间；iPad、Android 平板与横屏手机自动改为项目/配置双栏。对已有项目左滑“新会话”会把该项目固定在项目栏。
 3. Goal 会新建结构化协调者会话、创建并关联 Run、把目标与 `prospero task` / `gate` 协作约定发给协调者。主机页可查看进行中的 Goal、任务计数，并直接解开 pending Gate。
-4. M4 仍可继续补充：任务依赖图、每个 dispatch/worker 的明细，以及手机端直接新建/派发 task。M3 的 `send`、`check --wait`、`ask`、`reply` 仍只复用既有邮箱，不再另造一套。
+4. 手机新增 Agent 编排中心：创建无 coordinator 的手工 Run、添加 Task、选择前置依赖、选择 Agent/worktree/审批策略并派发 worker，可直接打开 worker 会话。
+5. Mac Goal 页同步支持新建手工 Run、任务依赖和 worker 派发；写操作走 loopback + 每次启动轮换的 control token。
+6. 已配对设备新增 `allowOrchestration` 能力；升级前记录缺少该字段时沿用 `allowShell`，因此无需重新扫码。
+7. `orchestration.graph.v1` 支持一次原子创建完整 DAG；`operationId` 在 daemon 重启后仍幂等，`graphRevision` 用乐观并发控制阻止 Mac/iPhone 静默互相覆盖。旧 v7/v5 客户端不看到新能力，仍沿用原配对连接。
+8. Mac 与 iOS 均提供自动分层 DAG 编辑器、已有 Run 的「编辑图」入口和撤销/重做；pending 节点可改可删，已派发/结束节点只读，删除与依赖重连按 revision 原子提交，客户端会阻止循环依赖。
+9. 人工 Run 可「自动运行」：默认创建一张图共用的 Run worktree，一次只派一个 worker；worker 显式 `task done` 后自动启动下游，全部完成后 Run 才完成。暂停只阻止后续派发，不强杀当前 worker。
+10. Mac 与 iOS 可删除整条 Run；活动 worker 会阻止删除，Run/Task/Dispatch/Message/Gate 记录一并清理，但可能含未合并代码的 Run worktree 明确保留。
+11. Mac 与 iOS 均可停止活动 worker、取消 pending/blocked 任务、重试 failed 任务；停止与意外退出都会原子收敛 Dispatch/Task 状态。取消不会释放下游依赖，自动执行中的生命周期操作会先暂停 Run。
+12. Mac 全局工具栏可直接启动本地 Agent；默认 Shell + PTY，也可启动 Claude/Codex/OpenCode/Grok/Trae，并为支持的 Agent 切换结构化模式。创建仍走 loopback + control token，SessionManager、tmux 恢复和手机侧会话列表保持单一真相。
+13. Mac 会话页提供醒目的「停止本轮」且保留会话；Codex app-server 中断严格携带官方 `TurnInterruptParams` 要求的 `threadId + turnId`，不再静默吞掉协议错误。手机原有停止入口同步受益，无需升级客户端。
+14. 后续仍可补充：每任务 worktree 的自动合并/冲突处理与安全并行、画布拖拽位置持久化、Run 归档，以及 worktree diff/合并/清理。M3 邮箱继续复用现有实现。
+15. Mac 会话页可按名称进入子 Agent 的独立实时过程，展示消息、推理、工具、权限与提问；读取走 loopback + control token。iOS 增加常驻名称栏与 `subagent.history.v1` 按需历史，长会话即使截断早期启动事件仍可进入。Codex 通过 `thread/read(includeTurns:true)` 恢复原生 turn/item，晚到的 `agentNickname`/`agentRole` 会补全既有身份；发现时严格校验 `parentThreadId`，恢复时自动清掉旧版误记的父线程伪子 Agent。
 
 ### 补测试
 
@@ -114,9 +127,8 @@ fs.cpSync(src, dst, { recursive: true, mode: fs.constants.COPYFILE_FICLONE_FORCE
 先做过一个 `packages/orca-bridge`(把外部 tmux PTY 注册成 Orca worker),
 按用户"不依赖 Orca"的要求**已整包删除**。其中三条结论对自研仍然有用:
 
-1. **Orca 的 agent 识别靠终端标题**里的 `✳ ✦ ⏲ ✋ ◇` 或盲文 spinner。
-   我们不需要这套——适配器直接给精确状态。但如果将来要**被别的工具识别**,记得
-   tmux 默认会吞掉内层 OSC 标题,得 `set-titles on` 才透传。
+1. **当前 Orca 通过 Claude/Codex 等原生 hooks/IPC 上报状态，不从 terminal title 推断。**
+   Prospero 同样坚持显式生命周期；session idle 只作提示，不自动完成 Task。
 2. **tmux 的目标语法不一致且静默失败**:`set-option`/`show-options`/`resize-window`
    **不认** `=name` 精确匹配前缀(报 no such session 且退出码非 0 容易被吞);
    `capture-pane`/`send-keys` 收的是 pane 目标,要先 `list-panes` 问出 `%id`。

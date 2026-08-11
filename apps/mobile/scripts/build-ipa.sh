@@ -4,7 +4,7 @@
 #
 # 两种签名方式:
 #   --team   用自己的开发者账号,Xcode 自动创建/下载描述文件,bundle id 用
-#            app.json 里的(com.linn0x.prospero)。推荐 —— 不会和别的 App 抢身份。
+#            app.json 里的(com.linn0x.prospero.remote)。推荐 —— 不会和别的 App 抢身份。
 #   --profile 用第三方签名槽的描述文件。这类槽绑定一个【固定的】bundle id,
 #            两个 App 用同一张证书就会互相覆盖(实际踩过:FundWatch 把
 #            Prospero 从设备上顶掉了)。
@@ -24,6 +24,7 @@ OUTPUT_DIR=""
 DO_INSTALL=0
 DO_LAUNCH=0
 DO_PREBUILD=1
+ALLOW_BUNDLE_ID_CHANGE=0
 DEVICE_UDID="${DEVICE_UDID:-}"
 
 die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -66,6 +67,8 @@ usage() {
   -l, --launch           安装后启动(隐含 --install)
   -d, --device <udid>    指定设备(默认自动选择描述文件授权且已连接的那台)
       --no-prebuild      跳过 expo prebuild,复用现有 ios/ 目录
+      --allow-bundle-id-change
+                         允许把同一设备上的 Prospero 换成另一个 App 身份(会失去配对)
   -h, --help
 EOF
   exit 0
@@ -80,6 +83,7 @@ while [[ $# -gt 0 ]]; do
     -i|--install) DO_INSTALL=1; shift ;;
     -l|--launch)  DO_LAUNCH=1; DO_INSTALL=1; shift ;;
     --no-prebuild) DO_PREBUILD=0; shift ;;
+    --allow-bundle-id-change) ALLOW_BUNDLE_ID_CHANGE=1; shift ;;
     -h|--help)    usage ;;
     *) die "未知参数:$1(--help 看用法)" ;;
   esac
@@ -338,11 +342,27 @@ PY
   fi
 
   info "设备: $DEVICE_UDID"
+  # Keychain 与 App 数据容器都绑定 bundle id。第三方 profile 换槽时最容易在这里
+  # 无意中把“升级”变成另一款 App，表现就是每次都要重新配对。为每台设备记住
+  # 上次实际安装的身份；真要换必须显式确认。
+  BUNDLE_ID_STATE="$MOBILE_DIR/.cache/installed-ios-bundle-id-$DEVICE_UDID"
+  if [[ -f "$BUNDLE_ID_STATE" ]]; then
+    PREVIOUS_BUNDLE_ID="$(tr -d '[:space:]' < "$BUNDLE_ID_STATE")"
+    if [[ -n "$PREVIOUS_BUNDLE_ID" && "$PREVIOUS_BUNDLE_ID" != "$BUNDLE_ID" ]]; then
+      if (( ! ALLOW_BUNDLE_ID_CHANGE )); then
+        die "检测到 Bundle ID 将从 $PREVIOUS_BUNDLE_ID 变成 $BUNDLE_ID。
+这不是原 App 的升级，会失去 Keychain 配对凭据。请复用原签名/profile；若你确定要换身份，加 --allow-bundle-id-change。"
+      fi
+      info "警告:正在更换 App 身份，设备需要重新配对。"
+    fi
+  fi
   if ! xcrun devicectl device install app --device "$DEVICE_UDID" "$IPA" > "$OUTPUT_DIR/install.log" 2>&1; then
     die "安装失败。最后几行:
 $(tail -5 "$OUTPUT_DIR/install.log" | sed 's/^/    /')
     完整日志:$OUTPUT_DIR/install.log"
   fi
+  mkdir -p "$(dirname "$BUNDLE_ID_STATE")"
+  printf '%s\n' "$BUNDLE_ID" > "$BUNDLE_ID_STATE"
   grep -E 'App installed|bundleID' "$OUTPUT_DIR/install.log" | sed 's/^/    /' || true
 
   if (( DO_LAUNCH )); then

@@ -15,8 +15,10 @@ import {
   type Dispatch,
   type Gate,
   type Message,
+  type OperationRecord,
   type OrchestrationState,
   type Run,
+  type RunAutomation,
   type Task,
   type TaskStatus,
   TransitionError,
@@ -46,7 +48,34 @@ export type OrchestrationErrorCode =
   | "task_wrong_run"
   | "dep_cycle"
   | "invalid_transition"
-  | "task_not_dispatchable";
+  | "task_not_dispatchable"
+  | "graph_invalid"
+  | "revision_conflict"
+  | "task_not_editable"
+  | "run_not_deletable"
+  | "operation_conflict";
+
+export interface GraphNodeInput {
+  clientId: string;
+  title: string;
+  spec: string;
+  deps: string[];
+  parentId?: string | null;
+}
+
+export interface GraphMutationResult {
+  run: Run;
+  tasks: Task[];
+  idMap: Record<string, string>;
+  deletedTaskIds?: string[];
+}
+
+export interface RunDeletionResult {
+  runId: string;
+  deletedTaskCount: number;
+  /** 删除编排记录不强删可能含未合并代码的 Run worktree。 */
+  preservedWorkspacePath: string | null;
+}
 
 function id(prefix: string): string {
   return `${prefix}_${randomUUID().replace(/-/g, "").slice(0, 12)}`;
@@ -69,13 +98,19 @@ export class OrchestrationStore {
     try {
       const parsed = JSON.parse(readFileSync(this.file, "utf8")) as Partial<OrchestrationState>;
       if (parsed.version === 1) {
+        const runs = parsed.runs ?? {};
+        for (const run of Object.values(runs)) {
+          run.graphRevision = Number.isInteger(run.graphRevision) ? run.graphRevision : 0;
+          run.automation ??= null;
+        }
         this.state = {
           version: 1,
-          runs: parsed.runs ?? {},
+          runs,
           tasks: parsed.tasks ?? {},
           dispatches: parsed.dispatches ?? {},
           messages: parsed.messages ?? {},
           gates: parsed.gates ?? {},
+          operations: parsed.operations ?? {},
         };
       }
     } catch {
@@ -119,6 +154,8 @@ export class OrchestrationStore {
       objective: input.objective,
       status: "active",
       coordinatorSessionId: input.coordinatorSessionId ?? null,
+      graphRevision: 0,
+      automation: null,
       createdAt: now,
       updatedAt: now,
     };
@@ -142,6 +179,51 @@ export class OrchestrationStore {
     Object.assign(run, patch, { updatedAt: Date.now() });
     this.schedulePersist();
     return run;
+  }
+
+  setRunAutomation(runId: string, automation: RunAutomation | null): Run {
+    const run = this.getRun(runId);
+    run.automation = automation;
+    run.updatedAt = Date.now();
+    this.schedulePersist();
+    return run;
+  }
+
+  deleteRun(runId: string): RunDeletionResult {
+    const run = this.getRun(runId);
+    if (run.automation?.state === "running") {
+      throw new OrchestrationError("自动执行仍在运行，请先暂停", "run_not_deletable");
+    }
+    const active = this.listDispatches(runId).find(
+      (dispatch) => dispatch.state === "starting" || dispatch.state === "running",
+    );
+    if (active) {
+      throw new OrchestrationError(
+        `仍有 worker ${active.sessionId} 在运行，不能删除编排`,
+        "run_not_deletable",
+      );
+    }
+
+    const taskIds = new Set(this.listTasks(runId).map((task) => task.id));
+    for (const taskId of taskIds) delete this.state.tasks[taskId];
+    for (const dispatch of Object.values(this.state.dispatches)) {
+      if (dispatch.runId === runId) delete this.state.dispatches[dispatch.id];
+    }
+    for (const message of Object.values(this.state.messages)) {
+      if (message.runId === runId) delete this.state.messages[message.id];
+    }
+    for (const gate of Object.values(this.state.gates)) {
+      if (gate.runId === runId) delete this.state.gates[gate.id];
+    }
+    delete this.state.runs[runId];
+    this.schedulePersist();
+    return {
+      runId,
+      deletedTaskCount: taskIds.size,
+      preservedWorkspacePath: run.automation?.workspace === "run"
+        ? run.automation.workspacePath
+        : null,
+    };
   }
 
   // ── Task ──────────────────────────────────────────────────────────────
@@ -184,6 +266,7 @@ export class OrchestrationStore {
       throw new OrchestrationError(`任务依赖成环: ${cycle.join(" → ")}`, "dep_cycle");
     }
 
+    this.bumpGraphRevision(input.runId);
     this.schedulePersist();
     return task;
   }
@@ -219,6 +302,49 @@ export class OrchestrationStore {
     return task;
   }
 
+  /** 取消尚未执行的任务；若仍有关联 worker，必须先显式停止，避免留下游离进程。 */
+  cancelTask(taskId: string, reason = "由用户取消"): Task {
+    const task = this.getTask(taskId);
+    if (task.status === "cancelled") return task;
+    if (this.activeDispatchFor(taskId)) {
+      throw new OrchestrationError("任务仍有关联 worker，请先停止 worker 再取消", "task_not_dispatchable");
+    }
+    if (task.status !== "pending" && task.status !== "blocked") {
+      throw new OrchestrationError(
+        `任务 ${task.id} 当前是 ${task.status}，只能取消尚未执行的任务`,
+        "invalid_transition",
+      );
+    }
+    const now = Date.now();
+    task.status = "cancelled";
+    task.result = reason;
+    task.updatedAt = now;
+    for (const gate of Object.values(this.state.gates)) {
+      if (gate.taskId === taskId && gate.status === "pending") {
+        gate.status = "cancelled";
+        gate.resolvedAt = now;
+      }
+    }
+    this.schedulePersist();
+    return task;
+  }
+
+  /** failed 保留在 Dispatch 历史中，任务本身退回 pending 等待重新派发。 */
+  retryTask(taskId: string): Task {
+    const task = this.getTask(taskId);
+    if (task.status !== "failed") {
+      throw new OrchestrationError(
+        `任务 ${task.id} 当前是 ${task.status}，只有 failed 任务可以重试`,
+        "invalid_transition",
+      );
+    }
+    task.status = "pending";
+    task.result = null;
+    task.updatedAt = Date.now();
+    this.schedulePersist();
+    return task;
+  }
+
   setTaskDeps(taskId: string, deps: string[]): Task {
     const task = this.getTask(taskId);
     for (const dep of deps) {
@@ -236,12 +362,308 @@ export class OrchestrationStore {
       throw new OrchestrationError(`任务依赖成环: ${cycle.join(" → ")}`, "dep_cycle");
     }
     task.updatedAt = Date.now();
+    this.bumpGraphRevision(task.runId);
     this.schedulePersist();
     return task;
   }
 
+  /**
+   * 一次提交完整的新 Run 与初始任务图。先在候选状态里解析临时 id、验引用和环，
+   * 全部通过后才把 Run 与任务放进真实状态，避免 UI 发布失败时留下半张图。
+   */
+  createRunGraph(input: {
+    objective: string;
+    nodes: GraphNodeInput[];
+    coordinatorSessionId?: string | null;
+  }): GraphMutationResult {
+    this.validateGraphInput(input.nodes);
+    const objective = input.objective.trim();
+    if (objective === "") {
+      throw new OrchestrationError("编排目标不能为空", "graph_invalid");
+    }
+
+    const now = Date.now();
+    const run: Run = {
+      id: id("run"),
+      objective,
+      status: "active",
+      coordinatorSessionId: input.coordinatorSessionId ?? null,
+      graphRevision: 1,
+      automation: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const idMap = Object.fromEntries(input.nodes.map((node) => [node.clientId, id("task")])) as Record<
+      string,
+      string
+    >;
+    const candidates = new Map<string, Task>();
+
+    for (const node of input.nodes) {
+      const taskId = idMap[node.clientId]!;
+      const deps = node.deps.map((dep) => {
+        const resolved = idMap[dep];
+        if (!resolved) {
+          throw new OrchestrationError(`依赖的节点不存在: ${dep}`, "graph_invalid");
+        }
+        return resolved;
+      });
+      const parentId = node.parentId == null
+        ? null
+        : (idMap[node.parentId] ?? null);
+      if (node.parentId != null && parentId === null) {
+        throw new OrchestrationError(`父节点不存在: ${node.parentId}`, "graph_invalid");
+      }
+      candidates.set(taskId, {
+        id: taskId,
+        runId: run.id,
+        title: node.title.trim(),
+        spec: node.spec.trim(),
+        deps,
+        parentId,
+        status: "pending",
+        result: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+
+    this.validateCandidateGraph(run.id, candidates);
+
+    this.state.runs[run.id] = run;
+    for (const task of candidates.values()) this.state.tasks[task.id] = task;
+    this.schedulePersist();
+    return { run, tasks: [...candidates.values()], idMap };
+  }
+
+  /**
+   * 在调用方看到的 revision 上原子 upsert 一组节点。clientId 若等于本 Run 的
+   * 现有 task id 就编辑它，否则创建新节点；依赖既可引用本提交的 clientId，
+   * 也可引用未编辑的现有 task id。
+   */
+  applyTaskGraph(input: {
+    runId: string;
+    baseRevision: number;
+    nodes: GraphNodeInput[];
+    deleteTaskIds?: string[];
+  }): GraphMutationResult {
+    const run = this.getRun(input.runId);
+    if (run.graphRevision !== input.baseRevision) {
+      throw new OrchestrationError(
+        `任务图已经更新（当前 revision ${run.graphRevision}，提交基于 ${input.baseRevision}）`,
+        "revision_conflict",
+      );
+    }
+    const deleteTaskIds = input.deleteTaskIds ?? [];
+    if (input.nodes.length === 0 && deleteTaskIds.length === 0) {
+      throw new OrchestrationError("图编辑至少要修改或删除一个节点", "graph_invalid");
+    }
+    if (
+      deleteTaskIds.length > 200 ||
+      deleteTaskIds.some((taskId) => taskId.trim() === "" || taskId.length > 200)
+    ) {
+      throw new OrchestrationError("deleteTaskIds 必须包含最多 200 个有效任务 id", "graph_invalid");
+    }
+    if (new Set(deleteTaskIds).size !== deleteTaskIds.length) {
+      throw new OrchestrationError("deleteTaskIds 不能重复", "graph_invalid");
+    }
+    this.validateGraphInput(input.nodes, true);
+
+    const now = Date.now();
+    const idMap: Record<string, string> = {};
+    for (const node of input.nodes) {
+      if (deleteTaskIds.includes(node.clientId)) {
+        throw new OrchestrationError(`节点 ${node.clientId} 不能同时编辑和删除`, "graph_invalid");
+      }
+      const existing = this.state.tasks[node.clientId];
+      if (existing) {
+        if (existing.runId !== run.id) {
+          throw new OrchestrationError(`节点 ${node.clientId} 属于别的 Run`, "task_wrong_run");
+        }
+        if (existing.status !== "pending") {
+          throw new OrchestrationError(
+            `任务 ${existing.id} 已经是 ${existing.status}，只能编辑 pending 任务`,
+            "task_not_editable",
+          );
+        }
+        idMap[node.clientId] = existing.id;
+      } else {
+        idMap[node.clientId] = id("task");
+      }
+    }
+
+    // 全量复制任务，验证失败时不会触碰真实对象里的 deps/title/spec。
+    const candidates = new Map(
+      Object.values(this.state.tasks).map((task) => [task.id, { ...task, deps: [...task.deps] }]),
+    );
+    for (const taskId of deleteTaskIds) {
+      const task = this.state.tasks[taskId];
+      if (!task || task.runId !== run.id) {
+        throw new OrchestrationError(`要删除的任务不存在或属于别的 Run: ${taskId}`, "task_wrong_run");
+      }
+      if (task.status !== "pending") {
+        throw new OrchestrationError(
+          `任务 ${task.id} 已经是 ${task.status}，只能删除 pending 任务`,
+          "task_not_editable",
+        );
+      }
+      candidates.delete(taskId);
+    }
+    const resolveReference = (reference: string, label: string): string => {
+      const submitted = idMap[reference];
+      if (submitted) return submitted;
+      const existing = candidates.get(reference);
+      if (!existing) {
+        throw new OrchestrationError(`${label}不存在: ${reference}`, "graph_invalid");
+      }
+      if (existing.runId !== run.id) {
+        throw new OrchestrationError(`${label} ${reference} 属于别的 Run`, "task_wrong_run");
+      }
+      return existing.id;
+    };
+
+    for (const node of input.nodes) {
+      const taskId = idMap[node.clientId]!;
+      const existing = this.state.tasks[taskId];
+      candidates.set(taskId, {
+        id: taskId,
+        runId: run.id,
+        title: node.title.trim(),
+        spec: node.spec.trim(),
+        deps: node.deps.map((dep) => resolveReference(dep, "依赖节点")),
+        parentId: node.parentId == null
+          ? null
+          : resolveReference(node.parentId, "父节点"),
+        status: existing?.status ?? "pending",
+        result: existing?.result ?? null,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+      });
+    }
+
+    this.validateCandidateGraph(run.id, candidates);
+
+    const changed: Task[] = [];
+    for (const taskId of deleteTaskIds) {
+      delete this.state.tasks[taskId];
+      for (const dispatch of Object.values(this.state.dispatches)) {
+        if (dispatch.taskId === taskId) delete this.state.dispatches[dispatch.id];
+      }
+      for (const message of Object.values(this.state.messages)) {
+        if (message.taskId === taskId) delete this.state.messages[message.id];
+      }
+      for (const gate of Object.values(this.state.gates)) {
+        if (gate.taskId === taskId) delete this.state.gates[gate.id];
+      }
+    }
+    for (const node of input.nodes) {
+      const task = candidates.get(idMap[node.clientId]!);
+      if (!task) continue;
+      this.state.tasks[task.id] = task;
+      changed.push(task);
+    }
+    run.graphRevision += 1;
+    run.updatedAt = now;
+    this.schedulePersist();
+    return { run, tasks: changed, idMap, deletedTaskIds: deleteTaskIds };
+  }
+
+  private validateGraphInput(nodes: GraphNodeInput[], allowEmpty = false): void {
+    if ((!allowEmpty && nodes.length === 0) || nodes.length > 200) {
+      throw new OrchestrationError(
+        allowEmpty ? "一次最多编辑 200 个节点" : "任务图必须包含 1 到 200 个节点",
+        "graph_invalid",
+      );
+    }
+    const ids = new Set<string>();
+    for (const node of nodes) {
+      const clientId = node.clientId.trim();
+      if (clientId === "" || ids.has(clientId)) {
+        throw new OrchestrationError(
+          clientId === "" ? "节点 clientId 不能为空" : `节点 clientId 重复: ${clientId}`,
+          "graph_invalid",
+        );
+      }
+      ids.add(clientId);
+      if (node.title.trim() === "" || node.spec.trim() === "") {
+        throw new OrchestrationError(`节点 ${clientId} 的标题和说明不能为空`, "graph_invalid");
+      }
+      if (new Set(node.deps).size !== node.deps.length) {
+        throw new OrchestrationError(`节点 ${clientId} 有重复依赖`, "graph_invalid");
+      }
+    }
+  }
+
+  private validateCandidateGraph(runId: string, candidates: ReadonlyMap<string, Task>): void {
+    const runTasks = new Map(
+      [...candidates].filter(([, task]) => task.runId === runId),
+    );
+    for (const task of runTasks.values()) {
+      for (const dep of task.deps) {
+        const target = candidates.get(dep);
+        if (!target || target.runId !== runId) {
+          throw new OrchestrationError(`依赖的任务不存在或属于别的 Run: ${dep}`, "graph_invalid");
+        }
+      }
+      if (task.parentId !== null) {
+        const parent = candidates.get(task.parentId);
+        if (!parent || parent.runId !== runId || parent.id === task.id) {
+          throw new OrchestrationError(`父任务无效: ${task.parentId}`, "graph_invalid");
+        }
+      }
+    }
+    const cycle = findCycle(runTasks);
+    if (cycle) {
+      throw new OrchestrationError(`任务依赖成环: ${cycle.join(" → ")}`, "dep_cycle");
+    }
+  }
+
+  private bumpGraphRevision(runId: string): void {
+    const run = this.getRun(runId);
+    run.graphRevision += 1;
+    run.updatedAt = Date.now();
+  }
+
   private taskMap(): Map<string, Task> {
     return new Map(Object.entries(this.state.tasks));
+  }
+
+  // ── 幂等操作 ─────────────────────────────────────────────────────────
+
+  getOperation(operationId: string): OperationRecord | null {
+    return this.state.operations[operationId] ?? null;
+  }
+
+  rememberOperation(operationId: string, fingerprint: string, result: unknown): OperationRecord {
+    const existing = this.state.operations[operationId];
+    if (existing) {
+      if (existing.fingerprint !== fingerprint) {
+        throw new OrchestrationError(
+          `operationId ${operationId} 已用于另一项操作`,
+          "operation_conflict",
+        );
+      }
+      return existing;
+    }
+    const operation: OperationRecord = {
+      id: operationId,
+      fingerprint,
+      // 业务对象仍会继续变化（例如 Run 的 revision）；幂等结果必须冻结在首次提交时。
+      result: structuredClone(result),
+      createdAt: Date.now(),
+    };
+    this.state.operations[operationId] = operation;
+
+    // 操作记录只负责覆盖离线重试窗口，不无限增长；按时间保留最近 1000 条。
+    const operations = Object.values(this.state.operations);
+    if (operations.length > 1_000) {
+      operations
+        .sort((a, b) => a.createdAt - b.createdAt)
+        .slice(0, operations.length - 1_000)
+        .forEach((candidate) => delete this.state.operations[candidate.id]);
+    }
+    this.schedulePersist();
+    return operation;
   }
 
   // ── Dispatch ──────────────────────────────────────────────────────────

@@ -39,6 +39,217 @@ describe("Run 与 Task", () => {
     expect(() => store.createTask({ runId: other.id, title: "B", spec: "", deps: [a.id] }))
       .toThrow(/属于别的 Run/);
   });
+
+  it("只有任务图结构变化才递增 revision，状态流转不会制造伪冲突", () => {
+    const { store, runId } = seed();
+    const task = store.createTask({ runId, title: "A", spec: "做 A" });
+    expect(store.getRun(runId).graphRevision).toBe(1);
+    store.createDispatch({ taskId: task.id, sessionId: "s1" });
+    store.setTaskStatus(task.id, "done");
+    expect(store.getRun(runId).graphRevision).toBe(1);
+    const next = store.createTask({ runId, title: "B", spec: "做 B" });
+    store.setTaskDeps(next.id, [task.id]);
+    expect(store.getRun(runId).graphRevision).toBe(3);
+  });
+});
+
+describe("原子任务图", () => {
+  it("一次创建 Run 和整张 DAG，并把临时节点 id 映射为持久 task id", () => {
+    const store = new OrchestrationStore();
+    const result = store.createRunGraph({
+      objective: "发布新版本",
+      nodes: [
+        { clientId: "design", title: "设计", spec: "定协议", deps: [] },
+        { clientId: "mac", title: "Mac", spec: "实现 Mac", deps: ["design"] },
+        { clientId: "ios", title: "iOS", spec: "实现 iOS", deps: ["design"] },
+        { clientId: "ship", title: "发布", spec: "联合验收", deps: ["mac", "ios"] },
+      ],
+    });
+
+    expect(result.run.graphRevision).toBe(1);
+    expect(result.tasks).toHaveLength(4);
+    expect(store.getTask(result.idMap["ship"]!).deps).toEqual([
+      result.idMap["mac"],
+      result.idMap["ios"],
+    ]);
+    expect(store.listReadyTasks(result.run.id).map((task) => task.title)).toEqual(["设计"]);
+  });
+
+  it("未知依赖或环让整次新建回滚，不留下 Run 或任务", () => {
+    const store = new OrchestrationStore();
+    expect(() => store.createRunGraph({
+      objective: "坏图",
+      nodes: [{ clientId: "a", title: "A", spec: "A", deps: ["missing"] }],
+    })).toThrow(/不存在/);
+    expect(store.listRuns()).toEqual([]);
+    expect(store.listTasks()).toEqual([]);
+
+    expect(() => store.createRunGraph({
+      objective: "环",
+      nodes: [
+        { clientId: "a", title: "A", spec: "A", deps: ["b"] },
+        { clientId: "b", title: "B", spec: "B", deps: ["a"] },
+      ],
+    })).toThrow(/成环/);
+    expect(store.listRuns()).toEqual([]);
+    expect(store.listTasks()).toEqual([]);
+  });
+
+  it("按 revision 原子编辑 pending 节点并新增依赖节点", () => {
+    const store = new OrchestrationStore();
+    const initial = store.createRunGraph({
+      objective: "继续编辑",
+      nodes: [{ clientId: "a", title: "A", spec: "旧说明", deps: [] }],
+    });
+    const a = initial.idMap["a"]!;
+    const applied = store.applyTaskGraph({
+      runId: initial.run.id,
+      baseRevision: 1,
+      nodes: [
+        { clientId: a, title: "A2", spec: "新说明", deps: [] },
+        { clientId: "new-b", title: "B", spec: "依赖 A", deps: [a] },
+      ],
+    });
+
+    expect(applied.run.graphRevision).toBe(2);
+    expect(store.getTask(a)).toMatchObject({ title: "A2", spec: "新说明" });
+    expect(store.getTask(applied.idMap["new-b"]!).deps).toEqual([a]);
+  });
+
+  it("过期 revision 或编辑已派发任务会拒绝且不产生局部改动", () => {
+    const store = new OrchestrationStore();
+    const initial = store.createRunGraph({
+      objective: "冲突保护",
+      nodes: [{ clientId: "a", title: "A", spec: "原始", deps: [] }],
+    });
+    const a = initial.idMap["a"]!;
+    expect(() => store.applyTaskGraph({
+      runId: initial.run.id,
+      baseRevision: 0,
+      nodes: [{ clientId: a, title: "不应写入", spec: "x", deps: [] }],
+    })).toThrow(/已经更新/);
+    expect(store.getTask(a).title).toBe("A");
+
+    store.createDispatch({ taskId: a, sessionId: "worker" });
+    expect(() => store.applyTaskGraph({
+      runId: initial.run.id,
+      baseRevision: 1,
+      nodes: [
+        { clientId: a, title: "也不应写入", spec: "x", deps: [] },
+        { clientId: "new", title: "不能残留", spec: "x", deps: [] },
+      ],
+    })).toThrow(/只能编辑 pending/);
+    expect(store.getTask(a).title).toBe("A");
+    expect(store.listTasks(initial.run.id)).toHaveLength(1);
+  });
+
+  it("可原子删除 pending 节点并同时重连依赖", () => {
+    const store = new OrchestrationStore();
+    const initial = store.createRunGraph({
+      objective: "删改任务图",
+      nodes: [
+        { clientId: "a", title: "A", spec: "A", deps: [] },
+        { clientId: "b", title: "B", spec: "B", deps: ["a"] },
+      ],
+    });
+    const a = initial.idMap["a"]!;
+    const b = initial.idMap["b"]!;
+
+    const applied = store.applyTaskGraph({
+      runId: initial.run.id,
+      baseRevision: 1,
+      nodes: [{ clientId: b, title: "B", spec: "不再依赖 A", deps: [] }],
+      deleteTaskIds: [a],
+    });
+
+    expect(applied.deletedTaskIds).toEqual([a]);
+    expect(applied.run.graphRevision).toBe(2);
+    expect(store.listTasks(initial.run.id)).toEqual([
+      expect.objectContaining({ id: b, deps: [] }),
+    ]);
+    expect(() => store.getTask(a)).toThrow(/找不到任务/);
+  });
+
+  it("删除仍被引用或已经派发的节点会整体拒绝", () => {
+    const store = new OrchestrationStore();
+    const initial = store.createRunGraph({
+      objective: "删除保护",
+      nodes: [
+        { clientId: "a", title: "A", spec: "A", deps: [] },
+        { clientId: "b", title: "B", spec: "B", deps: ["a"] },
+      ],
+    });
+    const a = initial.idMap["a"]!;
+
+    expect(() => store.applyTaskGraph({
+      runId: initial.run.id,
+      baseRevision: 1,
+      nodes: [],
+      deleteTaskIds: [a],
+    })).toThrow(/依赖的任务不存在/);
+    expect(store.listTasks(initial.run.id)).toHaveLength(2);
+
+    store.createDispatch({ taskId: a, sessionId: "worker" });
+    expect(() => store.applyTaskGraph({
+      runId: initial.run.id,
+      baseRevision: 1,
+      nodes: [],
+      deleteTaskIds: [a],
+    })).toThrow(/只能删除 pending/);
+    expect(store.listTasks(initial.run.id)).toHaveLength(2);
+  });
+});
+
+describe("Run 管理", () => {
+  it("删除 Run 会清理编排记录，但保留自动执行工作树路径供用户回收代码", () => {
+    const { store, runId } = seed();
+    const task = store.createTask({ runId, title: "实现", spec: "实现删除" });
+    const dispatch = store.createDispatch({ taskId: task.id, sessionId: "worker" });
+    store.setDispatchState(dispatch.id, "succeeded", "ok");
+    store.setTaskStatus(task.id, "done", "完成");
+    store.postMessage({
+      runId,
+      taskId: task.id,
+      from: "worker",
+      to: "owner",
+      type: "report",
+      subject: "完成",
+      body: "ok",
+    });
+    store.createGate({ runId, question: "保留吗？" });
+    store.setRunAutomation(runId, {
+      state: "paused",
+      agent: "codex",
+      approvalPolicy: "standard",
+      workspace: "run",
+      cwd: "/tmp/project",
+      workspacePath: "/tmp/prospero-run",
+      branch: "prospero/run/test",
+      startedAt: 1,
+      updatedAt: 2,
+      lastError: null,
+    });
+
+    expect(store.deleteRun(runId)).toEqual({
+      runId,
+      deletedTaskCount: 1,
+      preservedWorkspacePath: "/tmp/prospero-run",
+    });
+    expect(store.listRuns()).toEqual([]);
+    expect(store.listTasks()).toEqual([]);
+    expect(store.listDispatches()).toEqual([]);
+    expect(store.listMessages()).toEqual([]);
+    expect(store.listGates()).toEqual([]);
+  });
+
+  it("仍有活动 worker 时拒绝删除 Run", () => {
+    const { store, runId } = seed();
+    const task = store.createTask({ runId, title: "运行中", spec: "" });
+    store.createDispatch({ taskId: task.id, sessionId: "worker" });
+
+    expect(() => store.deleteRun(runId)).toThrow(/仍有 worker/);
+    expect(store.getRun(runId).id).toBe(runId);
+  });
 });
 
 describe("ready 是派生的", () => {
@@ -136,6 +347,33 @@ describe("状态机", () => {
     store.createDispatch({ taskId: a.id, sessionId: "s1" });
     expect(() => store.createDispatch({ taskId: a.id, sessionId: "s2" }))
       .toThrow(OrchestrationError);
+  });
+
+  it("可取消 pending/blocked 任务并关闭关联 Gate，但不能越过取消的依赖", () => {
+    const { store, runId } = seed();
+    const first = store.createTask({ runId, title: "前置", spec: "" });
+    const dependent = store.createTask({ runId, title: "后置", spec: "", deps: [first.id] });
+    const gate = store.createGate({ runId, taskId: first.id, question: "还做吗？" });
+
+    expect(store.getTask(first.id).status).toBe("blocked");
+    expect(store.cancelTask(first.id, "需求已撤销")).toMatchObject({
+      status: "cancelled",
+      result: "需求已撤销",
+    });
+    expect(store.getGate(gate.id)).toMatchObject({ status: "cancelled" });
+    expect(store.listReadyTasks(runId).map((task) => task.id)).not.toContain(dependent.id);
+  });
+
+  it("failed 任务可清除旧结果后退回 pending，活动 worker 存在时不能直接取消", () => {
+    const { store, runId } = seed();
+    const task = store.createTask({ runId, title: "重试", spec: "" });
+    const dispatch = store.createDispatch({ taskId: task.id, sessionId: "worker" });
+    expect(() => store.cancelTask(task.id)).toThrow(/先停止 worker/);
+
+    store.setDispatchState(dispatch.id, "failed", "失败");
+    store.setTaskStatus(task.id, "failed", "旧错误");
+    expect(store.retryTask(task.id)).toMatchObject({ status: "pending", result: null });
+    expect(() => store.retryTask(task.id)).toThrow(/只有 failed/);
   });
 });
 
@@ -265,5 +503,18 @@ describe("落盘", () => {
     const store = new OrchestrationStore(home);
     expect(store.listRuns()).toEqual([]);
     expect(() => store.createRun({ objective: "自愈" })).not.toThrow();
+  });
+
+  it("幂等操作记录会落盘，且同一个 id 不能换参数复用", () => {
+    const home = tmpHome();
+    const store = new OrchestrationStore(home);
+    store.rememberOperation("op-1", "fingerprint-a", { runId: "run-1" });
+    store.close();
+
+    const reopened = new OrchestrationStore(home);
+    expect(reopened.getOperation("op-1")?.result).toEqual({ runId: "run-1" });
+    expect(() => reopened.rememberOperation("op-1", "fingerprint-b", {})).toThrow(
+      /已用于另一项操作/,
+    );
   });
 });

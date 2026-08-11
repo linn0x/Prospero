@@ -21,6 +21,7 @@ import { DiffView } from "@/components/DiffView";
 import { Icon } from "@/components/Icon";
 import { SwipeRow, type SwipeAction } from "@/components/SwipeRow";
 import { toast } from "@/components/Toast";
+import { useAdaptiveLayout } from "@/lib/adaptive-layout";
 import { useHostConnection } from "@/lib/use-host-connection";
 
 /**
@@ -45,6 +46,7 @@ export default function GitScreen(): React.ReactElement {
   const { hostId, sid } = useLocalSearchParams<{ hostId: string; sid: string }>();
   const { conn } = useHostConnection(hostId);
   const insets = useSafeAreaInsets();
+  const adaptiveLayout = useAdaptiveLayout();
 
   const [branch, setBranch] = useState<string | null>(null);
   const [ahead, setAhead] = useState(0);
@@ -155,6 +157,17 @@ export default function GitScreen(): React.ReactElement {
 
   const staged = files.filter((f) => f.index !== " " && f.index !== "?");
   const unstaged = files.filter((f) => f.index === " " || f.index === "?");
+  const splitLayout =
+    adaptiveLayout.verticalPanes !== null ||
+    (adaptiveLayout.width >= 840 && adaptiveLayout.height >= 480);
+  const filePaneWidth =
+    adaptiveLayout.verticalPanes?.start ??
+    Math.min(380, Math.max(300, adaptiveLayout.width * 0.38));
+  const detailPaneWidth =
+    adaptiveLayout.verticalPanes?.end ??
+    adaptiveLayout.width - filePaneWidth - StyleSheet.hairlineWidth;
+  const splitGap =
+    adaptiveLayout.verticalPanes?.gap ?? StyleSheet.hairlineWidth;
 
   return (
     <KeyboardAvoidingView
@@ -174,120 +187,146 @@ export default function GitScreen(): React.ReactElement {
         }}
       />
 
-      <View style={styles.branchBar}>
-        <Text style={styles.branch} numberOfLines={1}>
-          {branch}
-        </Text>
-        {(ahead > 0 || behind > 0) && (
-          <Text style={styles.counts}>
-            {ahead > 0 ? `↑${String(ahead)}` : ""}
-            {behind > 0 ? ` ↓${String(behind)}` : ""}
-          </Text>
-        )}
-        <Text style={styles.changed}>{files.length} 处改动</Text>
-      </View>
-
-      <FlatList
-        data={[...staged, ...unstaged]}
-        keyboardDismissMode="interactive"
-        keyboardShouldPersistTaps="handled"
-        keyExtractor={(f) => f.path}
-        contentContainerStyle={{ paddingBottom: insets.bottom + 8 }}
-        refreshControl={
-          <RefreshControl refreshing={loading} onRefresh={() => void refresh()} tintColor="#7aa2f7" />
-        }
-        ListEmptyComponent={
-          loading ? null : <Text style={styles.empty}>工作区干净,没有改动。</Text>
-        }
-        renderItem={({ item }) => {
-          const isStaged = item.index !== " " && item.index !== "?";
-          const actions: SwipeAction[] = [
-            {
-              label: isStaged ? "取消暂存" : "暂存",
-              symbol: isStaged ? "arrow.clockwise" : "checkmark.circle.fill",
-              color: isStaged ? "#5a5a66" : "#3a6ea5",
-              onPress: () => void toggleStage(item),
-            },
-          ];
-          // 未跟踪文件没有"改动"可丢弃,git restore 也处理不了它
-          if (!item.untracked) {
-            actions.push({
-              label: "丢弃",
-              symbol: "trash",
-              color: "#e5534b",
-              onPress: () => void discard(item),
-              confirm: {
-                title: `丢弃「${item.path}」的改动?`,
-                message: "工作区的修改会恢复成上次提交的样子。不可撤销。",
-                confirmLabel: "丢弃",
-              },
-            });
-          }
-          return (
-            <SwipeRow actions={actions}>
-              <Pressable
-                style={({ pressed }) => [styles.row, pressed && styles.rowPressed]}
-                onPress={() => void openDiff(item)}
-              >
-                <Text style={[styles.badge, isStaged ? styles.badgeStaged : styles.badgeDirty]}>
-                  {item.untracked ? "新" : isStaged ? item.index : item.worktree}
-                </Text>
-                <Text style={styles.path} numberOfLines={1} ellipsizeMode="head">
-                  {item.path}
-                </Text>
-              </Pressable>
-            </SwipeRow>
-          );
-        }}
-      />
-
-      {openPath !== null && (
-        <View style={styles.diffPane}>
-          <View style={styles.diffHead}>
-            <Text style={styles.diffTitle} numberOfLines={1}>
-              {openPath}
-            </Text>
-            <Pressable onPress={() => setOpenPath(null)} hitSlop={8}>
-              <Text style={styles.close}>关闭</Text>
-            </Pressable>
-          </View>
-          {patch === null ? (
-            <ActivityIndicator style={styles.diffLoading} color="#7aa2f7" />
-          ) : patch.length === 0 ? (
-            <Text style={styles.empty}>没有可显示的差异。</Text>
-          ) : (
-            <DiffView diff={{ path: openPath, patch, ...countLines(patch) }} />
-          )}
-        </View>
-      )}
-
-      <View style={styles.commitBar}>
-        <DismissKey visible={focused} />
-        <TextInput
-          style={styles.commitInput}
-          value={message}
-          onChangeText={setMessage}
-          placeholder={hasStaged ? "提交信息" : "先暂存一些改动"}
-          placeholderTextColor="#5a5a66"
-          editable={hasStaged}
-          multiline
-          onFocus={() => { setFocused(true); }}
-          onBlur={() => { setFocused(false); }}
-        />
-        <Pressable
-          onPress={() => void doCommit()}
-          disabled={!hasStaged || message.trim().length === 0 || committing}
+      <View style={[styles.gitWorkspace, splitLayout && styles.gitWorkspaceSplit]}>
+        <View
           style={[
-            styles.commitBtn,
-            (!hasStaged || message.trim().length === 0) && styles.commitBtnOff,
+            styles.filePane,
+            splitLayout && { flex: 0, width: filePaneWidth },
           ]}
         >
-          {committing ? (
-            <ActivityIndicator size="small" color="#fff" />
-          ) : (
-            <Text style={styles.commitBtnText}>提交</Text>
-          )}
-        </Pressable>
+          <View style={styles.branchBar}>
+            <Text style={styles.branch} numberOfLines={1}>
+              {branch}
+            </Text>
+            {(ahead > 0 || behind > 0) && (
+              <Text style={styles.counts}>
+                {ahead > 0 ? `↑${String(ahead)}` : ""}
+                {behind > 0 ? ` ↓${String(behind)}` : ""}
+              </Text>
+            )}
+            <Text style={styles.changed}>{files.length} 处改动</Text>
+          </View>
+
+          <FlatList
+            data={[...staged, ...unstaged]}
+            keyboardDismissMode="interactive"
+            keyboardShouldPersistTaps="handled"
+            keyExtractor={(f) => f.path}
+            contentContainerStyle={{ paddingBottom: insets.bottom + 8 }}
+            refreshControl={
+              <RefreshControl refreshing={loading} onRefresh={() => void refresh()} tintColor="#7aa2f7" />
+            }
+            ListEmptyComponent={
+              loading ? null : <Text style={styles.empty}>工作区干净,没有改动。</Text>
+            }
+            renderItem={({ item }) => {
+              const isStaged = item.index !== " " && item.index !== "?";
+              const actions: SwipeAction[] = [
+                {
+                  label: isStaged ? "取消暂存" : "暂存",
+                  symbol: isStaged ? "arrow.clockwise" : "checkmark.circle.fill",
+                  color: isStaged ? "#5a5a66" : "#3a6ea5",
+                  onPress: () => void toggleStage(item),
+                },
+              ];
+              // 未跟踪文件没有"改动"可丢弃,git restore 也处理不了它
+              if (!item.untracked) {
+                actions.push({
+                  label: "丢弃",
+                  symbol: "trash",
+                  color: "#e5534b",
+                  onPress: () => void discard(item),
+                  confirm: {
+                    title: `丢弃「${item.path}」的改动?`,
+                    message: "工作区的修改会恢复成上次提交的样子。不可撤销。",
+                    confirmLabel: "丢弃",
+                  },
+                });
+              }
+              return (
+                <SwipeRow actions={actions}>
+                  <Pressable
+                    style={({ pressed }) => [styles.row, pressed && styles.rowPressed]}
+                    onPress={() => void openDiff(item)}
+                  >
+                    <Text style={[styles.badge, isStaged ? styles.badgeStaged : styles.badgeDirty]}>
+                      {item.untracked ? "新" : isStaged ? item.index : item.worktree}
+                    </Text>
+                    <Text style={styles.path} numberOfLines={1} ellipsizeMode="head">
+                      {item.path}
+                    </Text>
+                  </Pressable>
+                </SwipeRow>
+              );
+            }}
+          />
+        </View>
+        {splitLayout && (
+          <View
+            style={[styles.gitFoldGutter, { width: splitGap }]}
+            pointerEvents="none"
+          />
+        )}
+        <View
+          style={[
+            styles.gitDetailPane,
+            splitLayout && { flex: 0, width: detailPaneWidth },
+          ]}
+        >
+          {openPath !== null ? (
+            <View style={[styles.diffPane, splitLayout && styles.diffPaneWide]}>
+              <View style={styles.diffHead}>
+                <Text style={styles.diffTitle} numberOfLines={1}>
+                  {openPath}
+                </Text>
+                <Pressable onPress={() => setOpenPath(null)} hitSlop={8}>
+                  <Text style={styles.close}>关闭</Text>
+                </Pressable>
+              </View>
+              {patch === null ? (
+                <ActivityIndicator style={styles.diffLoading} color="#7aa2f7" />
+              ) : patch.length === 0 ? (
+                <Text style={styles.empty}>没有可显示的差异。</Text>
+              ) : (
+                <DiffView diff={{ path: openPath, patch, ...countLines(patch) }} />
+              )}
+            </View>
+          ) : splitLayout ? (
+            <View style={styles.diffPlaceholder}>
+              <Icon name="doc.fill" size={28} color="#3a3a44" />
+              <Text style={styles.empty}>从左侧选择文件查看改动</Text>
+            </View>
+          ) : null}
+
+          <View style={styles.commitBar}>
+            <DismissKey visible={focused} />
+            <TextInput
+              style={styles.commitInput}
+              value={message}
+              onChangeText={setMessage}
+              placeholder={hasStaged ? "提交信息" : "先暂存一些改动"}
+              placeholderTextColor="#5a5a66"
+              editable={hasStaged}
+              multiline
+              onFocus={() => { setFocused(true); }}
+              onBlur={() => { setFocused(false); }}
+            />
+            <Pressable
+              onPress={() => void doCommit()}
+              disabled={!hasStaged || message.trim().length === 0 || committing}
+              style={[
+                styles.commitBtn,
+                (!hasStaged || message.trim().length === 0) && styles.commitBtnOff,
+              ]}
+            >
+              {committing ? (
+                <ActivityIndicator size="small" color="#fff" />
+              ) : (
+                <Text style={styles.commitBtnText}>提交</Text>
+              )}
+            </Pressable>
+          </View>
+        </View>
       </View>
     </KeyboardAvoidingView>
   );
@@ -295,6 +334,17 @@ export default function GitScreen(): React.ReactElement {
 
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: "#0b0b0e" },
+  gitWorkspace: { flex: 1, minHeight: 0 },
+  gitWorkspaceSplit: { flexDirection: "row" },
+  filePane: { flex: 1, minHeight: 0 },
+  gitDetailPane: { flexShrink: 0, minWidth: 0 },
+  gitFoldGutter: {
+    flexShrink: 0,
+    backgroundColor: "#0b0b0e",
+    borderLeftWidth: StyleSheet.hairlineWidth,
+    borderRightWidth: StyleSheet.hairlineWidth,
+    borderColor: "#26262e",
+  },
   branchBar: {
     flexDirection: "row",
     alignItems: "center",
@@ -336,6 +386,8 @@ const styles = StyleSheet.create({
     borderTopColor: "#26262e",
     backgroundColor: "#0e0e13",
   },
+  diffPaneWide: { flex: 1, maxHeight: undefined },
+  diffPlaceholder: { flex: 1, alignItems: "center", justifyContent: "center" },
   diffHead: {
     flexDirection: "row",
     alignItems: "center",

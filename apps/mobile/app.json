@@ -2,7 +2,7 @@
   "expo": {
     "name": "Prospero",
     "slug": "prospero",
-    "version": "0.0.2",
+    "version": "0.0.12",
     "orientation": "default",
     "icon": "./assets/images/icon.png",
     "backgroundColor": "#0B0B0E",
@@ -11,7 +11,7 @@
     "ios": {
       "icon": "./assets/expo.icon",
       "bundleIdentifier": "com.linn0x.prospero.remote",
-      "buildNumber": "2",
+      "buildNumber": "12",
       "supportsTablet": true,
       "infoPlist": {
         "NSLocalNetworkUsageDescription": "Prospero 通过本地网络直连你 Mac 上的 prosperod,以控制 code agent 会话。",
@@ -25,7 +25,7 @@
     },
     "android": {
       "package": "com.linn0x.prospero",
-      "versionCode": 2,
+      "versionCode": 12,
       "backgroundColor": "#0B0B0E",
       "userInterfaceStyle": "dark",
       "softwareKeyboardLayoutMode": "resize",
@@ -47,6 +47,7 @@
     },
     "plugins": [
       "expo-router",
+      "expo-secure-store",
       [
         "expo-build-properties",
         {

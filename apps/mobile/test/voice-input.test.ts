@@ -12,6 +12,7 @@ import {
   missingVoiceInputLocales,
   normalizeOfflineSpeechTranscript,
   ON_DEVICE_RECOGNITION_OPTIONS,
+  shouldUseAndroidSystemSpeech,
   supportsAndroidMixedSpeech,
   voiceRecognitionErrorMessage,
 } from "../src/lib/voice-input";
@@ -93,6 +94,27 @@ describe("语音输入隐私与草稿处理", () => {
       false,
     );
     expect(supportsAndroidMixedSpeech(ANDROID_MIXED_SPEECH_MIN_API)).toBe(true);
+    expect(
+      shouldUseAndroidSystemSpeech(
+        ANDROID_MIXED_SPEECH_MIN_API,
+        true,
+        true,
+      ),
+    ).toBe(true);
+    expect(
+      shouldUseAndroidSystemSpeech(
+        ANDROID_MIXED_SPEECH_MIN_API - 1,
+        true,
+        true,
+      ),
+    ).toBe(false);
+    expect(
+      shouldUseAndroidSystemSpeech(
+        ANDROID_MIXED_SPEECH_MIN_API,
+        true,
+        false,
+      ),
+    ).toBe(false);
     const options = androidMixedRecognitionOptions();
     expect(options.requiresOnDeviceRecognition).toBe(true);
     expect(options.lang).toBe("zh-CN");
@@ -103,6 +125,90 @@ describe("语音输入隐私与草稿处理", () => {
       EXTRA_LANGUAGE_SWITCH_ALLOWED_LANGUAGES: ["zh-CN", "en-US"],
       EXTRA_ENABLE_BIASING_DEVICE_CONTEXT: true,
     });
+  });
+
+  it("Whisper 回退使用 small 高准确率模型并在录音前预热", () => {
+    const offlineSpeech = readFileSync(
+      join(
+        import.meta.dirname,
+        "..",
+        "src",
+        "lib",
+        "android-offline-speech.ts",
+      ),
+      "utf8",
+    );
+    const voiceButton = readFileSync(
+      join(
+        import.meta.dirname,
+        "..",
+        "src",
+        "components",
+        "VoiceButton.tsx",
+      ),
+      "utf8",
+    );
+    expect(offlineSpeech).toContain('MODEL_ASSET = "ggml-small-q5_1.bin"');
+    expect(offlineSpeech).toContain("useFlashAttn: false");
+    expect(offlineSpeech).toContain("beamSize: 5");
+    expect(offlineSpeech).toContain("bestOf: 5");
+    expect(offlineSpeech).toContain("temperatureInc: 0.2");
+    expect(voiceButton).toContain("prepareAndroidOfflineSpeech()");
+    expect(voiceButton).toContain("!usesAndroidMixedSpeech()");
+    expect(voiceButton).toContain(
+      'availabilityRef.current.kind === "ready"',
+    );
+  });
+
+  it("三星优先走明确锁定为本地的中英双语服务并保留 Whisper 回退", () => {
+    const samsung = readFileSync(
+      join(
+        import.meta.dirname,
+        "..",
+        "modules",
+        "prospero-mixed-speech",
+        "android",
+        "src",
+        "main",
+        "java",
+        "com",
+        "linn0x",
+        "prospero",
+        "mixedspeech",
+        "SamsungIntelliVoiceSession.kt",
+      ),
+      "utf8",
+    );
+    const nativeModule = readFileSync(
+      join(
+        import.meta.dirname,
+        "..",
+        "modules",
+        "prospero-mixed-speech",
+        "android",
+        "src",
+        "main",
+        "java",
+        "com",
+        "linn0x",
+        "prospero",
+        "mixedspeech",
+        "ProsperoMixedSpeechModule.kt",
+      ),
+      "utf8",
+    );
+
+    expect(samsung).toContain("CONNECTION_LOCAL = 1");
+    expect(samsung).toContain(
+      "putInt(KEY_CONNECTION_TYPE, CONNECTION_LOCAL)",
+    );
+    expect(samsung).toContain('Locale.forLanguageTag("zh-CN")');
+    expect(samsung).toContain('Locale.forLanguageTag("en-US")');
+    expect(samsung).toContain("putBoolean(KEY_ENABLED_MULTILINGUAL, true)");
+    expect(nativeModule).toContain("SamsungIntelliVoiceSession.probe(context)");
+    expect(nativeModule).toContain("samsungAccessAllowed = false");
+    expect(nativeModule).toContain('"engine" to "whisper"');
+    expect(nativeModule).toContain('"engine" to "samsung"');
   });
 
   it("Android 会分别找出未安装的中英文离线模型", () => {

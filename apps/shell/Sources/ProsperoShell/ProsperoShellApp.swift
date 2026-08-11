@@ -113,6 +113,11 @@ struct PairingView: View {
         Form {
           TextField("设备名", text: $pairing.deviceName)
           Toggle("允许 shell 会话(完整用户权限)", isOn: $pairing.allowShell)
+          Toggle("允许手工编排与派发 worker", isOn: $pairing.allowOrchestration)
+            .disabled(!pairing.allowShell)
+            .onChange(of: pairing.allowShell) { _, allowed in
+              if !allowed { pairing.allowOrchestration = false }
+            }
         }
         .formStyle(.grouped)
         Button("生成二维码") { pairing.generate() }

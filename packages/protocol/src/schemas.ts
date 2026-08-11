@@ -16,6 +16,37 @@ export const AgentKindSchema = z.enum([
   "custom",
 ]);
 
+/** 第一批支持独立账号环境的 Code Agent。 */
+export const CodeAgentKindSchema = z.enum(["claude", "codex"]);
+
+/** Claude managed accounts support either a subscription token or a Console API key. */
+export const AgentCredentialKindSchema = z.enum(["oauth_token", "api_key"]);
+
+export const AgentAccountStatusSchema = z.enum([
+  "signed_in",
+  "signed_out",
+  "unavailable",
+  "error",
+]);
+
+/**
+ * Prospero 只同步账号元数据和 CLI 自己报告的登录状态，不在快照中同步 token/key。
+ * managed=false 是兼容既有 ~/.codex / ~/.claude 的本机默认环境，不能删除。
+ */
+export const AgentAccountSchema = z.object({
+  id: z.string().min(1).max(100),
+  agent: CodeAgentKindSchema,
+  name: z.string().min(1).max(80),
+  managed: z.boolean(),
+  isDefault: z.boolean(),
+  status: AgentAccountStatusSchema,
+  authMethod: z.string().max(200).optional(),
+  detail: z.string().max(1000).optional(),
+  createdAt: z.number().int().nonnegative(),
+  updatedAt: z.number().int().nonnegative(),
+  activeSessions: z.number().int().nonnegative(),
+});
+
 export const SessionStatusSchema = z.enum([
   "starting",
   "running",
@@ -148,6 +179,9 @@ export const SessionInfoSchema = z.object({
   createdAt: z.number().int().nonnegative(),
   cols,
   rows,
+  /** Code Agent 的隔离账号；旧会话/旧 daemon 可省略。 */
+  accountId: z.string().min(1).max(100).optional(),
+  accountName: z.string().min(1).max(80).optional(),
   /** 结构化会话:当前是否有待处理审批 */
   pendingPermissions: z.number().int().nonnegative().optional(),
   /** 结构化会话:当前有多少组 Agent 主动提问等待回答。 */
@@ -177,7 +211,12 @@ export const SessionInfoSchema = z.object({
 export const HostInfoSchema = z.object({
   name: z.string(),
   daemonVersion: z.string(),
+  /** daemon 当前最高版本；兼容窗口与本次实际版本分别见下面两个字段。 */
   protocolVersion: z.number().int().nonnegative(),
+  minimumProtocolVersion: z.number().int().nonnegative().optional(),
+  negotiatedProtocolVersion: z.number().int().nonnegative().optional(),
+  /** 功能按能力开关降级，旧客户端会自动忽略这个可选字段。 */
+  capabilities: z.array(z.string().min(1).max(200)).max(100).optional(),
   /** 系统与硬件 —— 手机上想知道"我那台 Mac 现在怎么样" */
   platform: z.string().optional(),
   osVersion: z.string().optional(),
@@ -212,6 +251,8 @@ export const C2SHelloSchema = z.object({
 export const C2SSessionCreateSchema = z.object({
   type: z.literal("session.create"),
   agent: AgentKindSchema,
+  /** 仅 Claude Code / Codex 有效；cwd 仍是所选项目，不随账号改变。 */
+  accountId: z.string().min(1).max(100).optional(),
   /** 省略 = strict */
   approvalPolicy: ApprovalPolicySchema.optional(),
   /** 省略时由 daemon 按 agent 能力决定(有适配器的走 structured) */
@@ -249,9 +290,69 @@ export const C2SConversationSearchSchema = z.object({
   type: z.literal("conversation.search"),
   requestId: z.string().min(1).max(100),
   agent: z.enum(["claude", "codex"]),
+  /** 搜索对应隔离环境中的原生会话历史。 */
+  accountId: z.string().min(1).max(100).optional(),
   /** 空字符串表示列出最近对话。 */
   query: z.string().max(300),
   limit: z.number().int().min(1).max(50).optional(),
+});
+
+export const C2SAgentAccountsListSchema = z.object({
+  type: z.literal("agent.accounts.list"),
+  requestId: z.string().min(1).max(100),
+});
+
+export const C2SAgentAccountCreateSchema = z.object({
+  type: z.literal("agent.account.create"),
+  requestId: z.string().min(1).max(100),
+  agent: CodeAgentKindSchema,
+  name: z.string().trim().min(1).max(80),
+});
+
+export const C2SAgentAccountRenameSchema = z.object({
+  type: z.literal("agent.account.rename"),
+  requestId: z.string().min(1).max(100),
+  accountId: z.string().min(1).max(100),
+  name: z.string().trim().min(1).max(80),
+});
+
+export const C2SAgentAccountSetDefaultSchema = z.object({
+  type: z.literal("agent.account.default"),
+  requestId: z.string().min(1).max(100),
+  accountId: z.string().min(1).max(100),
+});
+
+/** 登录由官方 CLI 在 PTY 中完成。Claude managed account 会生成待导入的隔离令牌。 */
+export const C2SAgentAccountLoginSchema = z.object({
+  type: z.literal("agent.account.login"),
+  requestId: z.string().min(1).max(100),
+  accountId: z.string().min(1).max(100),
+  cols,
+  rows,
+});
+
+/**
+ * 为 managed Claude account 写入独立凭据。消息只走已配对的加密通道，
+ * daemon 收到后写入系统安全存储，不会回显或放进账号元数据。
+ */
+export const C2SAgentAccountCredentialSetSchema = z.object({
+  type: z.literal("agent.account.credential.set"),
+  requestId: z.string().min(1).max(100),
+  accountId: z.string().min(1).max(100),
+  credentialKind: AgentCredentialKindSchema,
+  credential: z.string().trim().min(20).max(8192),
+});
+
+export const C2SAgentAccountLogoutSchema = z.object({
+  type: z.literal("agent.account.logout"),
+  requestId: z.string().min(1).max(100),
+  accountId: z.string().min(1).max(100),
+});
+
+export const C2SAgentAccountDeleteSchema = z.object({
+  type: z.literal("agent.account.delete"),
+  requestId: z.string().min(1).max(100),
+  accountId: z.string().min(1).max(100),
 });
 
 /**
@@ -396,6 +497,14 @@ export const C2SSubagentSendSchema = z.object({
   sid,
   subagentId: z.string().min(1).max(500),
   text: z.string().min(1).max(100000),
+});
+
+/** 按需读取子 Agent 的原生完整过程，不把它塞进父会话 attach 快照。 */
+export const C2SSubagentHistoryGetSchema = z.object({
+  type: z.literal("subagent.history.get"),
+  sid,
+  subagentId: z.string().min(1).max(500),
+  requestId: z.string().min(1).max(100),
 });
 
 /** 会话中途改审批策略 */
@@ -555,11 +664,29 @@ export const C2SUsageGetSchema = z.object({
 // 编排状态由 daemon 落盘；手机只拿快照，不在客户端复制一套状态机。轮询快照
 // 让 iOS 后台恢复、Android 进程回收后都能重新得到完整状态，而不是依赖脆弱的增量。
 
+export const OrchestrationAutomationSchema = z.object({
+  state: z.enum(["running", "paused", "completed"]),
+  agent: AgentKindSchema,
+  accountId: z.string().min(1).max(100).optional(),
+  approvalPolicy: ApprovalPolicySchema,
+  workspace: z.enum(["run", "current"]),
+  cwd: z.string().min(1).max(20_000),
+  workspacePath: z.string().min(1).max(20_000),
+  branch: z.string().min(1).max(2_000).nullable(),
+  startedAt: z.number().int().nonnegative(),
+  updatedAt: z.number().int().nonnegative(),
+  lastError: z.string().max(20_000).nullable(),
+});
+
 export const OrchestrationRunSchema = z.object({
   id: z.string().min(1).max(200),
   objective: z.string().min(1).max(20_000),
   status: z.enum(["active", "completed", "abandoned"]),
   coordinatorSessionId: sid.nullable(),
+  /** 只在任务图结构变化时递增；旧快照省略时按 0 处理。 */
+  graphRevision: z.number().int().nonnegative().optional(),
+  /** 静态 DAG 自动执行；旧 daemon/快照可省略。 */
+  automation: OrchestrationAutomationSchema.nullable().optional(),
   createdAt: z.number().int().nonnegative(),
   updatedAt: z.number().int().nonnegative(),
 });
@@ -619,10 +746,119 @@ export const C2SOrchestrationGateResolveSchema = z.object({
   decision: z.string().trim().min(1).max(20_000),
 });
 
+/** 人工编排创建的 Run 没有 agent coordinator，由已授权的人直接维护任务图。 */
+export const C2SOrchestrationRunCreateSchema = z.object({
+  type: z.literal("orchestration.run.create"),
+  objective: z.string().trim().min(1).max(20_000),
+  operationId: z.string().min(1).max(200).optional(),
+});
+
+export const C2SOrchestrationRunDeleteSchema = z.object({
+  type: z.literal("orchestration.run.delete"),
+  runId: z.string().min(1).max(200),
+  operationId: z.string().min(1).max(200),
+});
+
+export const C2SOrchestrationTaskCreateSchema = z.object({
+  type: z.literal("orchestration.task.create"),
+  runId: z.string().min(1).max(200),
+  title: z.string().trim().min(1).max(2_000),
+  spec: z.string().trim().min(1).max(20_000),
+  deps: z.array(z.string().min(1).max(200)).max(100).optional(),
+  parentId: z.string().min(1).max(200).optional(),
+  operationId: z.string().min(1).max(200).optional(),
+});
+
+export const C2SOrchestrationTaskCancelSchema = z.object({
+  type: z.literal("orchestration.task.cancel"),
+  taskId: z.string().min(1).max(200),
+  reason: z.string().trim().min(1).max(20_000).optional(),
+  operationId: z.string().min(1).max(200),
+});
+
+export const C2SOrchestrationTaskRetrySchema = z.object({
+  type: z.literal("orchestration.task.retry"),
+  taskId: z.string().min(1).max(200),
+  operationId: z.string().min(1).max(200),
+});
+
+export const C2SOrchestrationWorkerStartSchema = z.object({
+  type: z.literal("orchestration.worker.start"),
+  taskId: z.string().min(1).max(200),
+  agent: AgentKindSchema,
+  accountId: z.string().min(1).max(100).optional(),
+  worktree: z.enum(["new", "none"]),
+  cwd: z.string().trim().min(1).max(20_000),
+  kind: SessionKindSchema.optional(),
+  approvalPolicy: ApprovalPolicySchema.optional(),
+  operationId: z.string().min(1).max(200).optional(),
+});
+
+export const C2SOrchestrationWorkerStopSchema = z.object({
+  type: z.literal("orchestration.worker.stop"),
+  taskId: z.string().min(1).max(200),
+  reason: z.string().trim().min(1).max(20_000).optional(),
+  operationId: z.string().min(1).max(200),
+});
+
+/** 可视化编辑器里的临时节点；依赖引用同一提交内的 clientId。 */
+export const OrchestrationGraphNodeInputSchema = z.object({
+  clientId: z.string().min(1).max(200),
+  title: z.string().trim().min(1).max(2_000),
+  spec: z.string().trim().min(1).max(20_000),
+  deps: z.array(z.string().min(1).max(200)).max(100),
+  parentId: z.string().min(1).max(200).nullable().optional(),
+});
+
+/** 一次创建 Run 与完整初始 DAG；任一节点无效时整次提交都不落盘。 */
+export const C2SOrchestrationGraphCreateSchema = z.object({
+  type: z.literal("orchestration.graph.create"),
+  operationId: z.string().min(1).max(200),
+  objective: z.string().trim().min(1).max(20_000),
+  nodes: z.array(OrchestrationGraphNodeInputSchema).min(1).max(200),
+});
+
+/** 在指定 revision 上原子新增或编辑 pending 节点。 */
+export const C2SOrchestrationGraphApplySchema = z.object({
+  type: z.literal("orchestration.graph.apply"),
+  operationId: z.string().min(1).max(200),
+  runId: z.string().min(1).max(200),
+  baseRevision: z.number().int().nonnegative(),
+  nodes: z.array(OrchestrationGraphNodeInputSchema).max(200),
+  deleteTaskIds: z.array(z.string().min(1).max(200)).max(200).optional(),
+});
+
+/** 一次启动或恢复静态 DAG；v1 用整张 Run 共用的工作区安全串行推进。 */
+export const C2SOrchestrationAutomationStartSchema = z.object({
+  type: z.literal("orchestration.automation.start"),
+  operationId: z.string().min(1).max(200),
+  runId: z.string().min(1).max(200),
+  agent: AgentKindSchema,
+  accountId: z.string().min(1).max(100).optional(),
+  approvalPolicy: ApprovalPolicySchema,
+  workspace: z.enum(["run", "current"]),
+  cwd: z.string().trim().min(1).max(20_000),
+});
+
+/** 暂停只阻止后续派发；当前 worker 仍可显式交付，避免强杀丢工作。 */
+export const C2SOrchestrationAutomationPauseSchema = z.object({
+  type: z.literal("orchestration.automation.pause"),
+  operationId: z.string().min(1).max(200),
+  runId: z.string().min(1).max(200),
+});
+
 export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SHelloSchema,
   C2SSessionCreateSchema,
   C2SConversationSearchSchema,
+  C2SAgentAccountsListSchema,
+  C2SAgentAccountCreateSchema,
+  C2SAgentAccountRenameSchema,
+  C2SAgentAccountSetDefaultSchema,
+  C2SAgentAccountLoginSchema,
+  C2SAgentAccountCredentialSetSchema,
+  C2SAgentAccountLogoutSchema,
+  C2SAgentAccountDeleteSchema,
   C2SSessionAttachSchema,
   C2SChatSendSchema,
   C2SChatQueueRemoveSchema,
@@ -640,6 +876,7 @@ export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SPermissionRespondSchema,
   C2SQuestionRespondSchema,
   C2SSubagentSendSchema,
+  C2SSubagentHistoryGetSchema,
   C2SSessionInterruptSchema,
   C2SSessionKillSchema,
   C2SApprovalPolicySetSchema,
@@ -660,6 +897,17 @@ export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SUsageGetSchema,
   C2SOrchestrationSnapshotSchema,
   C2SOrchestrationGateResolveSchema,
+  C2SOrchestrationRunCreateSchema,
+  C2SOrchestrationRunDeleteSchema,
+  C2SOrchestrationTaskCreateSchema,
+  C2SOrchestrationTaskCancelSchema,
+  C2SOrchestrationTaskRetrySchema,
+  C2SOrchestrationWorkerStartSchema,
+  C2SOrchestrationWorkerStopSchema,
+  C2SOrchestrationGraphCreateSchema,
+  C2SOrchestrationGraphApplySchema,
+  C2SOrchestrationAutomationStartSchema,
+  C2SOrchestrationAutomationPauseSchema,
 ]);
 
 // ---------------------------------------------------------------- S → C
@@ -893,6 +1141,15 @@ export const S2CChatSnapshotSchema = z.object({
   events: z.array(AgentEventBodySchema),
 });
 
+/** 子 Agent 详情页的按需历史；事件沿用统一聊天模型，不新增 Codex 专属 UI。 */
+export const S2CSubagentHistorySchema = z.object({
+  type: z.literal("subagent.history.result"),
+  sid,
+  subagentId: z.string().min(1).max(500),
+  requestId: z.string().min(1).max(100),
+  events: z.array(AgentEventBodySchema),
+});
+
 /** 工具完整输出(应 tool.output.get) */
 export const S2CToolOutputSchema = z.object({
   type: z.literal("tool.output"),
@@ -957,6 +1214,10 @@ export const S2CErrorSchema = z.object({
     "session_not_found",
     "agent_unavailable",
     "bad_message",
+    /** operationId 被复用、revision 过期或任务图有并发冲突。 */
+    "conflict",
+    /** 已完成认证，但此设备没有执行该控制动作的能力。 */
+    "forbidden",
     /** 文件操作:路径越界或权限不足 */
     "denied",
     /** 文件操作:其余失败(不存在、不是文件、过大、IO) */
@@ -1000,6 +1261,26 @@ export const S2CConversationResultsSchema = z.object({
   requestId: z.string().min(1).max(100),
   agent: z.enum(["claude", "codex"]),
   conversations: z.array(ResumableConversationSchema).max(50),
+  error: z.string().max(2000).optional(),
+});
+
+export const S2CAgentAccountsResultSchema = z.object({
+  type: z.literal("agent.accounts.result"),
+  requestId: z.string().min(1).max(100),
+  action: z.enum([
+    "list",
+    "create",
+    "rename",
+    "default",
+    "login",
+    "credential",
+    "logout",
+    "delete",
+  ]),
+  ok: z.boolean(),
+  accounts: z.array(AgentAccountSchema).max(100),
+  /** login 会新建官方 CLI 的交互终端，客户端可直接打开。 */
+  sessionId: sid.optional(),
   error: z.string().max(2000).optional(),
 });
 
@@ -1095,6 +1376,8 @@ export const UsageWindowSchema = z.object({
  */
 export const UsageAccountSchema = z.object({
   agent: AgentKindSchema,
+  accountId: z.string().min(1).max(100).optional(),
+  accountName: z.string().min(1).max(80).optional(),
   available: z.boolean(),
   subscription: z.string().nullable().optional(),
   costUsd: z.number().nonnegative().optional(),
@@ -1144,6 +1427,7 @@ export const S2CMessageSchema = z.discriminatedUnion("type", [
   S2CTermOutputSchema,
   S2CAgentEventSchema,
   S2CChatSnapshotSchema,
+  S2CSubagentHistorySchema,
   S2CChatSuggestionsSchema,
   S2CAgentModelsSchema,
   S2CAgentModesSchema,
@@ -1153,6 +1437,7 @@ export const S2CMessageSchema = z.discriminatedUnion("type", [
   S2CErrorSchema,
   S2CWorkspaceListingSchema,
   S2CConversationResultsSchema,
+  S2CAgentAccountsResultSchema,
   S2CFsListingSchema,
   S2CFsContentSchema,
   S2CFsWrittenSchema,
@@ -1181,6 +1466,10 @@ export const PairingPayloadSchema = z.object({
 // ---------------------------------------------------------------- 推断类型与解析入口
 
 export type AgentKind = z.infer<typeof AgentKindSchema>;
+export type CodeAgentKind = z.infer<typeof CodeAgentKindSchema>;
+export type AgentCredentialKind = z.infer<typeof AgentCredentialKindSchema>;
+export type AgentAccountStatus = z.infer<typeof AgentAccountStatusSchema>;
+export type AgentAccount = z.infer<typeof AgentAccountSchema>;
 export type SessionKind = z.infer<typeof SessionKindSchema>;
 export type SessionStatus = z.infer<typeof SessionStatusSchema>;
 export type SessionInfo = z.infer<typeof SessionInfoSchema>;
@@ -1200,8 +1489,28 @@ export type C2SHello = z.infer<typeof C2SHelloSchema>;
 export type C2SSessionCreate = z.infer<typeof C2SSessionCreateSchema>;
 export type C2SOrchestrationSnapshot = z.infer<typeof C2SOrchestrationSnapshotSchema>;
 export type C2SOrchestrationGateResolve = z.infer<typeof C2SOrchestrationGateResolveSchema>;
+export type C2SOrchestrationRunCreate = z.infer<typeof C2SOrchestrationRunCreateSchema>;
+export type C2SOrchestrationRunDelete = z.infer<typeof C2SOrchestrationRunDeleteSchema>;
+export type C2SOrchestrationTaskCreate = z.infer<typeof C2SOrchestrationTaskCreateSchema>;
+export type C2SOrchestrationTaskCancel = z.infer<typeof C2SOrchestrationTaskCancelSchema>;
+export type C2SOrchestrationTaskRetry = z.infer<typeof C2SOrchestrationTaskRetrySchema>;
+export type C2SOrchestrationWorkerStart = z.infer<typeof C2SOrchestrationWorkerStartSchema>;
+export type C2SOrchestrationWorkerStop = z.infer<typeof C2SOrchestrationWorkerStopSchema>;
+export type OrchestrationGraphNodeInput = z.infer<typeof OrchestrationGraphNodeInputSchema>;
+export type C2SOrchestrationGraphCreate = z.infer<typeof C2SOrchestrationGraphCreateSchema>;
+export type C2SOrchestrationGraphApply = z.infer<typeof C2SOrchestrationGraphApplySchema>;
+export type C2SOrchestrationAutomationStart = z.infer<typeof C2SOrchestrationAutomationStartSchema>;
+export type C2SOrchestrationAutomationPause = z.infer<typeof C2SOrchestrationAutomationPauseSchema>;
 export type ResumableConversation = z.infer<typeof ResumableConversationSchema>;
 export type C2SConversationSearch = z.infer<typeof C2SConversationSearchSchema>;
+export type C2SAgentAccountsList = z.infer<typeof C2SAgentAccountsListSchema>;
+export type C2SAgentAccountCreate = z.infer<typeof C2SAgentAccountCreateSchema>;
+export type C2SAgentAccountRename = z.infer<typeof C2SAgentAccountRenameSchema>;
+export type C2SAgentAccountSetDefault = z.infer<typeof C2SAgentAccountSetDefaultSchema>;
+export type C2SAgentAccountLogin = z.infer<typeof C2SAgentAccountLoginSchema>;
+export type C2SAgentAccountCredentialSet = z.infer<typeof C2SAgentAccountCredentialSetSchema>;
+export type C2SAgentAccountLogout = z.infer<typeof C2SAgentAccountLogoutSchema>;
+export type C2SAgentAccountDelete = z.infer<typeof C2SAgentAccountDeleteSchema>;
 export type C2SWorkspaceList = z.infer<typeof C2SWorkspaceListSchema>;
 export type C2SSessionAttach = z.infer<typeof C2SSessionAttachSchema>;
 export type C2SChatSend = z.infer<typeof C2SChatSendSchema>;
@@ -1223,10 +1532,12 @@ export type C2SPermissionRespond = z.infer<typeof C2SPermissionRespondSchema>;
 export type AgentQuestionAnswer = z.infer<typeof AgentQuestionAnswerSchema>;
 export type C2SQuestionRespond = z.infer<typeof C2SQuestionRespondSchema>;
 export type C2SSubagentSend = z.infer<typeof C2SSubagentSendSchema>;
+export type C2SSubagentHistoryGet = z.infer<typeof C2SSubagentHistoryGetSchema>;
 export type C2SMessage = z.infer<typeof C2SMessageSchema>;
 export type Attachment = z.infer<typeof AttachmentSchema>;
 export type UsageWindow = z.infer<typeof UsageWindowSchema>;
 export type UsageAccount = z.infer<typeof UsageAccountSchema>;
+export type OrchestrationAutomation = z.infer<typeof OrchestrationAutomationSchema>;
 export type OrchestrationRun = z.infer<typeof OrchestrationRunSchema>;
 export type OrchestrationTask = z.infer<typeof OrchestrationTaskSchema>;
 export type OrchestrationDispatch = z.infer<typeof OrchestrationDispatchSchema>;
@@ -1235,6 +1546,7 @@ export type OrchestrationSnapshot = z.infer<typeof OrchestrationSnapshotSchema>;
 export type FsEntry = z.infer<typeof FsEntrySchema>;
 export type WorkspaceListing = z.infer<typeof S2CWorkspaceListingSchema>;
 export type ConversationResults = z.infer<typeof S2CConversationResultsSchema>;
+export type AgentAccountsResult = z.infer<typeof S2CAgentAccountsResultSchema>;
 export type GitFile = z.infer<typeof GitFileSchema>;
 export type ChatRole = z.infer<typeof ChatRoleSchema>;
 export type ToolState = z.infer<typeof ToolStateSchema>;
@@ -1255,6 +1567,7 @@ export type S2CTermSnapshot = z.infer<typeof S2CTermSnapshotSchema>;
 export type S2CTermOutput = z.infer<typeof S2CTermOutputSchema>;
 export type S2CAgentEvent = z.infer<typeof S2CAgentEventSchema>;
 export type S2CChatSnapshot = z.infer<typeof S2CChatSnapshotSchema>;
+export type S2CSubagentHistory = z.infer<typeof S2CSubagentHistorySchema>;
 export type S2CChatSuggestions = z.infer<typeof S2CChatSuggestionsSchema>;
 export type S2CAgentModels = z.infer<typeof S2CAgentModelsSchema>;
 export type S2CAgentModes = z.infer<typeof S2CAgentModesSchema>;

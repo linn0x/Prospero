@@ -22,12 +22,13 @@ import {
   saveConfig,
 } from "./pairing.js";
 import { createDaemonServer } from "./ws-server.js";
+import { DAEMON_VERSION } from "./version.js";
 
 const require = createRequire(import.meta.url);
 const qrcode = require("qrcode-terminal") as typeof import("qrcode-terminal");
 
 const program = new Command();
-program.name("prosperod").description("Prospero macOS agent hub").version("0.0.1");
+program.name("prosperod").description("Prospero macOS agent hub").version(DAEMON_VERSION);
 
 program
   .command("start", { isDefault: true })
@@ -71,7 +72,7 @@ program
       : () => {};
 
     const devices = loadDevices(home);
-    console.log(`prosperod v0.0.1 已启动(home: ${home})`);
+    console.log(`prosperod v${DAEMON_VERSION} 已启动(home: ${home})`);
     console.log(`已配对设备: ${devices.length} 台${devices.length === 0 ? " —— 运行 `prosperod pair` 生成配对二维码" : ""}`);
     if (bindAddr) {
       console.log(`监听地址(已绑定 ${bindSpec}${bindSpec === bindAddr ? "" : ` → ${bindAddr}`}):`);
@@ -120,10 +121,15 @@ program
   .description("为一台新设备生成配对二维码(含全部网卡地址 + token + 公钥)")
   .option("--name <name>", "设备名", "iphone")
   .option("--no-shell", "该设备禁止 shell/custom 会话(完整用户权限)")
-  .action((opts: { name: string; shell: boolean }) => {
+  .option("--no-orchestration", "该设备只能查看编排与处理 Gate，不能创建任务或派发 worker")
+  .action((opts: { name: string; shell: boolean; orchestration: boolean }) => {
     const home = prosperoHome();
     const config = loadConfig(home);
-    const device = mintDevice(home, { name: opts.name, allowShell: opts.shell });
+    const device = mintDevice(home, {
+      name: opts.name,
+      allowShell: opts.shell,
+      allowOrchestration: opts.shell && opts.orchestration,
+    });
     const payload = buildPairingPayload(home, {
       token: device.token,
       port: config.port,
@@ -134,7 +140,10 @@ program
     }
     const url = encodePairingQR(payload);
     qrcode.generate(url, { small: true });
-    console.log(`设备「${device.name}」已登记(allowShell=${String(device.allowShell)})`);
+    console.log(
+      `设备「${device.name}」已登记(allowShell=${String(device.allowShell)}, ` +
+      `allowOrchestration=${String(device.allowOrchestration ?? device.allowShell)})`,
+    );
     console.log(`地址: ${payload.addrs.join(", ")}  端口: ${payload.port}`);
     console.log(`配对串(扫码不便时手动输入):\n${url}`);
     console.log("注意:二维码含访问凭证,请勿截图外传。daemon 重启无需重新配对。");
@@ -235,7 +244,9 @@ program
     for (const d of devices) {
       const seen = d.lastSeenAt ? new Date(d.lastSeenAt).toLocaleString() : "从未连接";
       console.log(
-        `  - ${d.name}  allowShell=${String(d.allowShell)}  绑定=${d.clientPubKey ? "已绑定" : "未绑定"}  最近: ${seen}`,
+        `  - ${d.name}  allowShell=${String(d.allowShell)}  ` +
+        `allowOrchestration=${String(d.allowOrchestration ?? d.allowShell)}  ` +
+        `绑定=${d.clientPubKey ? "已绑定" : "未绑定"}  最近: ${seen}`,
       );
     }
   });

@@ -11,6 +11,15 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer, WebSocket, type RawData } from "ws";
 import {
+  CAPABILITY_AGENT_ACCOUNTS,
+  CAPABILITY_ORCHESTRATION_AUTOMATION,
+  CAPABILITY_ORCHESTRATION_GRAPH,
+  CAPABILITY_ORCHESTRATION_LIFECYCLE,
+  CAPABILITY_ORCHESTRATION_MANAGEMENT,
+  CAPABILITY_ORCHESTRATION_MANUAL,
+  CAPABILITY_ORCHESTRATION_SNAPSHOT,
+  CAPABILITY_SUBAGENT_HISTORY,
+  MIN_PROTOCOL_VERSION,
   PROTOCOL_VERSION,
   ProtocolError,
   fromB64,
@@ -32,12 +41,23 @@ import {
   type ResumableConversation,
 } from "@prospero/protocol";
 import { availableMemory, osIdentity } from "./host-stats.js";
-import { authenticate, loadDevices, loadIdentity, type DeviceRecord } from "./pairing.js";
+import {
+  authenticate,
+  canDeviceOrchestrate,
+  loadDevices,
+  loadIdentity,
+  type DeviceRecord,
+} from "./pairing.js";
 import { Notifier, type NotifyConfig } from "./notify.js";
 import { SessionError, SessionManager } from "./session-manager.js";
 import { StatusFile } from "./status-file.js";
-import { startControlSocket, type ControlSocketServer } from "./control-socket.js";
+import {
+  ControlSocketError,
+  startControlSocket,
+  type ControlSocketServer,
+} from "./control-socket.js";
 import { CollaborationService } from "./orchestration/collaboration.js";
+import { AutomationService } from "./orchestration/automation.js";
 import { DispatchService } from "./orchestration/dispatch.js";
 import { orchestrationControlApi } from "./orchestration/control-api.js";
 import { OrchestrationError, OrchestrationStore } from "./orchestration/store.js";
@@ -55,12 +75,26 @@ import {
 import * as gitOps from "./git-ops.js";
 import type { PtySession } from "./pty-session.js";
 import { searchLocalConversations } from "./local-conversations.js";
+import { DAEMON_VERSION } from "./version.js";
+import { AgentAccountError, AgentAccountManager } from "./agent-accounts.js";
 
-const DAEMON_VERSION = "0.0.1";
 const HIGH_WATER = 512 * 1024; // 超过则暂停向该客户端流式发送
 const LOW_WATER = 64 * 1024; //   低于则通过 ring/快照追平
 const CATCHUP_MS = 250;
 const PING_MS = 15_000;
+const MANUAL_ORCHESTRATION_METHODS = new Set([
+  "run.create",
+  "run.delete",
+  "task.create",
+  "task.cancel",
+  "task.retry",
+  "worker.start",
+  "worker.stop",
+  "graph.create",
+  "graph.apply",
+  "automation.start",
+  "automation.pause",
+]);
 
 interface AttachState {
   lastSentSeq: number;
@@ -80,6 +114,8 @@ interface Conn {
   channel: SecureChannel | null;
   /** 握手中间态:已回过临时公钥、还在等 hello。收到 hello 后清空 */
   handshake: ServerHandshakeState | null;
+  /** 本条连接实际采用的版本；不是 daemon 的最高版本。 */
+  protocolVersion: number;
   device: DeviceRecord | null;
   attachments: Map<string, AttachState>;
   chatAttachments: Map<string, ChatAttachState>;
@@ -104,6 +140,7 @@ export interface DaemonServerOptions {
     agent: "claude" | "codex",
     query: string,
     limit: number,
+    environment?: Record<string, string>,
   ) => Promise<ResumableConversation[]>;
 }
 
@@ -115,9 +152,14 @@ export interface DaemonServer {
   restoredSessions: number;
   httpServer: Server;
   manager: SessionManager;
+  accounts: AgentAccountManager;
   notifier: Notifier;
   /** M2 编排状态与派发入口；手机协议接入(M4)也将复用它们。 */
-  orchestration: { store: OrchestrationStore; dispatch: DispatchService };
+  orchestration: {
+    store: OrchestrationStore;
+    dispatch: DispatchService;
+    automation: AutomationService;
+  };
   collaboration: CollaborationService;
   controlSocket: ControlSocketServer;
   close(): Promise<void>;
@@ -172,6 +214,7 @@ export async function createDaemonServer(
   // `apps/daemon/bin/prospero` 是 package 安装前的本地入口；npm 安装后仍由
   // package bin 指向同一文件。每个 agent 的 PATH 都优先找到它。
   const cliBinDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "bin");
+  const accounts = new AgentAccountManager(opts.home);
   const manager = new SessionManager({
     home: opts.home,
     ...(opts.useTmux ? { tmux: { home: opts.home } } : {}),
@@ -181,14 +224,22 @@ export async function createDaemonServer(
       PROSPERO_CONTROL_TOKEN_PATH: controlTokenPath,
       PATH: [cliBinDir, process.env["PATH"] ?? ""].filter((part) => part !== "").join(path.delimiter),
     }),
+    accountResolver: (accountId, agent) => accounts.resolve(accountId, agent),
   });
   const orchestrationStore = new OrchestrationStore(opts.home);
   const dispatchService = new DispatchService(orchestrationStore, manager);
+  const automationService = new AutomationService(orchestrationStore, dispatchService);
   const collaboration = new CollaborationService(orchestrationStore);
+  const orchestrationApi = orchestrationControlApi(
+    orchestrationStore,
+    dispatchService,
+    collaboration,
+    automationService,
+  );
   const controlSocket = await startControlSocket({
     home: opts.home,
     token: controlToken,
-    handle: orchestrationControlApi(orchestrationStore, dispatchService, collaboration),
+    handle: orchestrationApi,
   });
   // Mac GUI 靠这个文件看会话列表(WS 协议要过 E2E 握手,壳没必要实现一遍)
   const statusFile = new StatusFile(opts.home, manager, {
@@ -207,11 +258,44 @@ export async function createDaemonServer(
 
   function send(conn: Conn, msg: S2CMessage): void {
     if (conn.ws.readyState !== WebSocket.OPEN) return;
-    conn.ws.send(conn.channel ? conn.channel.seal(msg) : JSON.stringify(msg));
+    // v5 不认识 completed 和 v7 新增的响应类型。未知可选字段会被旧 Zod
+    // 自动剥掉，但未知 union 成员会让整个连接被客户端主动关闭，必须在发送边界降级。
+    if (
+      (conn.protocolVersion <= 5 &&
+        (msg.type === "orchestration.snapshot" || msg.type === "conversation.results")) ||
+      (conn.protocolVersion < 10 && msg.type === "agent.accounts.result")
+    ) return;
+    const compatible =
+      conn.protocolVersion <= 5 && msg.type === "session.state" && msg.session.status === "completed"
+        ? { ...msg, session: { ...msg.session, status: "idle" as const } }
+        : msg;
+    conn.ws.send(conn.channel ? conn.channel.seal(compatible) : JSON.stringify(compatible));
+  }
+
+  function orchestrationCapabilities(conn: Conn): string[] {
+    const capabilities: string[] = [];
+    if (conn.protocolVersion >= 10 && conn.device?.allowShell) {
+      capabilities.push(CAPABILITY_AGENT_ACCOUNTS);
+    }
+    if (conn.protocolVersion >= 9) capabilities.push(CAPABILITY_SUBAGENT_HISTORY);
+    if (conn.protocolVersion >= 7) capabilities.push(CAPABILITY_ORCHESTRATION_SNAPSHOT);
+    if (
+      conn.protocolVersion >= 8 &&
+      conn.device !== null &&
+      canDeviceOrchestrate(conn.device)
+    ) {
+      capabilities.push(CAPABILITY_ORCHESTRATION_MANUAL);
+      capabilities.push(CAPABILITY_ORCHESTRATION_GRAPH);
+      capabilities.push(CAPABILITY_ORCHESTRATION_AUTOMATION);
+      capabilities.push(CAPABILITY_ORCHESTRATION_MANAGEMENT);
+      capabilities.push(CAPABILITY_ORCHESTRATION_LIFECYCLE);
+    }
+    return capabilities;
   }
 
   /** 手机上的状态只读快照来自同一个 store，绝不在 WS 层维护镜像。 */
   function sendOrchestrationSnapshot(conn: Conn): void {
+    if (conn.protocolVersion < 7) return;
     const state = orchestrationStore.snapshot();
     send(conn, {
       type: "orchestration.snapshot",
@@ -222,6 +306,12 @@ export async function createDaemonServer(
         gates: Object.values(state.gates),
       },
     });
+  }
+
+  function broadcastOrchestrationSnapshot(): void {
+    for (const candidate of conns) {
+      if (candidate.device) sendOrchestrationSnapshot(candidate);
+    }
   }
 
   function goalCoordinatorPrompt(runId: string, objective: string): string {
@@ -284,6 +374,16 @@ export async function createDaemonServer(
   }
 
   manager.on("state", (session) => {
+    if (session.status === "done" || session.status === "died") {
+      const settled = dispatchService.settleEndedSession(
+        session.id,
+        session.status === "died" ? "worker 会话意外退出" : "worker 会话已结束但未显式交付",
+      );
+      if (settled) {
+        automationService.kick(settled.task.runId);
+        broadcastOrchestrationSnapshot();
+      }
+    }
     for (const conn of conns) {
       if (conn.device) send(conn, { type: "session.state", session });
     }
@@ -371,12 +471,20 @@ export async function createDaemonServer(
   }, PING_MS);
 
   function sendHelloOk(conn: Conn): void {
+    const sessions = manager.list().map((session) =>
+      conn.protocolVersion <= 5 && session.status === "completed"
+        ? { ...session, status: "idle" as const }
+        : session,
+    );
     send(conn, {
       type: "hello.ok",
       host: {
         name: opts.hostName ?? os.hostname(),
         daemonVersion: DAEMON_VERSION,
         protocolVersion: PROTOCOL_VERSION,
+        minimumProtocolVersion: MIN_PROTOCOL_VERSION,
+        negotiatedProtocolVersion: conn.protocolVersion,
+        capabilities: orchestrationCapabilities(conn),
         platform: osIdentity().platform,
         osVersion: osIdentity().version,
         arch: process.arch,
@@ -388,7 +496,7 @@ export async function createDaemonServer(
         daemonStartedAt: DAEMON_STARTED_AT,
         tmuxManaged: manager.tmuxEnabled,
       },
-      sessions: manager.list(),
+      sessions,
     });
   }
 
@@ -433,8 +541,9 @@ export async function createDaemonServer(
       conn.ws.send(frame);
       return;
     }
-    const { hello, channel } = serverHandshakeAccept(conn.handshake, text);
+    const { hello, channel, protocolVersion } = serverHandshakeAccept(conn.handshake, text);
     conn.handshake = null;
+    conn.protocolVersion = protocolVersion;
     // 拒绝必须在 Mac 这边留下痕迹:手机上只会看到一句模糊的"配对已失效",
     // 而 daemon 完全静默的话,排查就只剩下猜(已经为此白花过一次时间)
     const device = authenticate(opts.home, hello, (reason) => {
@@ -489,7 +598,13 @@ export async function createDaemonServer(
       }
       case "conversation.search": {
         try {
-          const conversations = await conversationSearch(msg.agent, msg.query, msg.limit ?? 20);
+          const account = msg.accountId ? accounts.resolve(msg.accountId, msg.agent) : undefined;
+          const conversations = await conversationSearch(
+            msg.agent,
+            msg.query,
+            msg.limit ?? 20,
+            account?.environment,
+          );
           send(conn, {
             type: "conversation.results",
             requestId: msg.requestId,
@@ -507,9 +622,108 @@ export async function createDaemonServer(
         }
         return;
       }
+      case "agent.accounts.list": {
+        const list = await accounts.snapshot(manager.list());
+        send(conn, {
+          type: "agent.accounts.result",
+          requestId: msg.requestId,
+          action: "list",
+          ok: true,
+          accounts: list,
+        });
+        return;
+      }
+      case "agent.account.create":
+      case "agent.account.rename":
+      case "agent.account.default":
+      case "agent.account.login":
+      case "agent.account.credential.set":
+      case "agent.account.logout":
+      case "agent.account.delete": {
+        const action =
+          msg.type === "agent.account.create"
+            ? "create"
+            : msg.type === "agent.account.rename"
+              ? "rename"
+              : msg.type === "agent.account.default"
+                ? "default"
+                : msg.type === "agent.account.login"
+                  ? "login"
+                  : msg.type === "agent.account.credential.set"
+                    ? "credential"
+                    : msg.type === "agent.account.logout"
+                      ? "logout"
+                      : "delete";
+        if (!device.allowShell) {
+          send(conn, {
+            type: "agent.accounts.result",
+            requestId: msg.requestId,
+            action,
+            ok: false,
+            accounts: [],
+            error: "这台设备没有管理 Mac 账号环境的权限",
+          });
+          return;
+        }
+        try {
+          let sessionId: string | undefined;
+          switch (msg.type) {
+            case "agent.account.create":
+              accounts.create(msg.agent, msg.name);
+              break;
+            case "agent.account.rename":
+              accounts.rename(msg.accountId, msg.name);
+              break;
+            case "agent.account.default":
+              accounts.setDefault(msg.accountId);
+              break;
+            case "agent.account.login": {
+              const info = manager.createAccountLogin(
+                accounts.loginSpec(msg.accountId),
+                msg.cols,
+                msg.rows,
+              );
+              sessionId = info.id;
+              break;
+            }
+            case "agent.account.credential.set":
+              await accounts.setCredential(
+                msg.accountId,
+                msg.credentialKind,
+                msg.credential,
+              );
+              break;
+            case "agent.account.logout":
+              await accounts.logout(msg.accountId);
+              break;
+            case "agent.account.delete":
+              await accounts.delete(msg.accountId, manager.list());
+              break;
+          }
+          send(conn, {
+            type: "agent.accounts.result",
+            requestId: msg.requestId,
+            action,
+            ok: true,
+            accounts: await accounts.snapshot(manager.list()),
+            ...(sessionId ? { sessionId } : {}),
+          });
+        } catch (error) {
+          send(conn, {
+            type: "agent.accounts.result",
+            requestId: msg.requestId,
+            action,
+            ok: false,
+            accounts: await accounts.snapshot(manager.list()).catch(() => []),
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+        return;
+      }
       case "session.create": {
         const info = await manager.create({
           agent: msg.agent,
+          accountId: msg.accountId,
           kind: msg.kind,
           approvalPolicy: msg.approvalPolicy,
           cwd: msg.cwd,
@@ -755,6 +969,26 @@ export async function createDaemonServer(
       case "subagent.send":
         await manager.requireStructured(msg.sid).sendToSubagent(msg.subagentId, msg.text);
         return;
+      case "subagent.history.get": {
+        if (conn.protocolVersion < 9) {
+          send(conn, {
+            type: "error",
+            code: "bad_message",
+            message: "当前协商协议不支持子 Agent 历史",
+            sid: msg.sid,
+          });
+          return;
+        }
+        const snapshot = await manager.requireStructured(msg.sid).subagentSnapshot(msg.subagentId);
+        send(conn, {
+          type: "subagent.history.result",
+          sid: msg.sid,
+          subagentId: msg.subagentId,
+          requestId: msg.requestId,
+          events: snapshot.events,
+        });
+        return;
+      }
       case "term.input":
         manager.requirePty(msg.sid).writeInput(utf8Decode(fromB64(msg.dataB64)));
         return;
@@ -800,6 +1034,8 @@ export async function createDaemonServer(
               }
               return {
                 agent: s.agent,
+                ...(s.accountId ? { accountId: s.accountId } : {}),
+                ...(s.accountName ? { accountName: s.accountName } : {}),
                 available: true,
                 subscription: r.subscription ?? null,
                 ...(r.costUsd !== undefined ? { costUsd: r.costUsd } : {}),
@@ -867,9 +1103,123 @@ export async function createDaemonServer(
         return;
 
       case "orchestration.gate.resolve":
-        orchestrationStore.resolveGate(msg.gateId, msg.decision);
-        sendOrchestrationSnapshot(conn);
+        {
+          const gate = orchestrationStore.resolveGate(msg.gateId, msg.decision);
+          automationService.kick(gate.runId);
+        }
+        broadcastOrchestrationSnapshot();
         return;
+
+      case "orchestration.run.create":
+      case "orchestration.run.delete":
+      case "orchestration.task.create":
+      case "orchestration.task.cancel":
+      case "orchestration.task.retry":
+      case "orchestration.worker.start":
+      case "orchestration.worker.stop":
+      case "orchestration.graph.create":
+      case "orchestration.graph.apply":
+      case "orchestration.automation.start":
+      case "orchestration.automation.pause": {
+        if (!canDeviceOrchestrate(device) || conn.protocolVersion < 8) {
+          send(conn, {
+            type: "error",
+            code: "forbidden",
+            message: "这台设备没有人工编排权限，或 daemon 版本过旧",
+          });
+          return;
+        }
+        if (msg.type === "orchestration.run.create") {
+          await orchestrationApi("run.create", {
+            objective: msg.objective,
+            coordinatorSessionId: null,
+            ...(msg.operationId ? { operationId: msg.operationId } : {}),
+          }, new AbortController().signal);
+        } else if (msg.type === "orchestration.run.delete") {
+          await orchestrationApi("run.delete", {
+            runId: msg.runId,
+            operationId: msg.operationId,
+            actorSessionId: null,
+          }, new AbortController().signal);
+        } else if (msg.type === "orchestration.task.create") {
+          await orchestrationApi("task.create", {
+            runId: msg.runId,
+            title: msg.title,
+            spec: msg.spec,
+            deps: msg.deps ?? [],
+            ...(msg.parentId ? { parentId: msg.parentId } : {}),
+            ...(msg.operationId ? { operationId: msg.operationId } : {}),
+            actorSessionId: null,
+          }, new AbortController().signal);
+        } else if (msg.type === "orchestration.task.cancel") {
+          await orchestrationApi("task.cancel", {
+            taskId: msg.taskId,
+            operationId: msg.operationId,
+            ...(msg.reason ? { reason: msg.reason } : {}),
+            actorSessionId: null,
+          }, new AbortController().signal);
+        } else if (msg.type === "orchestration.task.retry") {
+          await orchestrationApi("task.retry", {
+            taskId: msg.taskId,
+            operationId: msg.operationId,
+            actorSessionId: null,
+          }, new AbortController().signal);
+        } else if (msg.type === "orchestration.worker.start") {
+          await orchestrationApi("worker.start", {
+            taskId: msg.taskId,
+            agent: msg.agent,
+            ...(msg.accountId ? { accountId: msg.accountId } : {}),
+            worktree: msg.worktree,
+            cwd: msg.cwd,
+            ...(msg.kind ? { kind: msg.kind } : {}),
+            ...(msg.approvalPolicy ? { approvalPolicy: msg.approvalPolicy } : {}),
+            ...(msg.operationId ? { operationId: msg.operationId } : {}),
+            actorSessionId: null,
+          }, new AbortController().signal);
+        } else if (msg.type === "orchestration.worker.stop") {
+          await orchestrationApi("worker.stop", {
+            taskId: msg.taskId,
+            operationId: msg.operationId,
+            ...(msg.reason ? { reason: msg.reason } : {}),
+            actorSessionId: null,
+          }, new AbortController().signal);
+        } else if (msg.type === "orchestration.graph.create") {
+          await orchestrationApi("graph.create", {
+            operationId: msg.operationId,
+            objective: msg.objective,
+            nodes: msg.nodes,
+            coordinatorSessionId: null,
+          }, new AbortController().signal);
+        } else if (msg.type === "orchestration.graph.apply") {
+          await orchestrationApi("graph.apply", {
+            operationId: msg.operationId,
+            runId: msg.runId,
+            baseRevision: msg.baseRevision,
+            nodes: msg.nodes,
+            deleteTaskIds: msg.deleteTaskIds ?? [],
+            actorSessionId: null,
+          }, new AbortController().signal);
+        } else if (msg.type === "orchestration.automation.start") {
+          await orchestrationApi("automation.start", {
+            operationId: msg.operationId,
+            runId: msg.runId,
+            agent: msg.agent,
+            ...(msg.accountId ? { accountId: msg.accountId } : {}),
+            approvalPolicy: msg.approvalPolicy,
+            workspace: msg.workspace,
+            cwd: msg.cwd,
+            actorSessionId: null,
+          }, new AbortController().signal);
+        } else {
+          await orchestrationApi("automation.pause", {
+            operationId: msg.operationId,
+            runId: msg.runId,
+            actorSessionId: null,
+          }, new AbortController().signal);
+        }
+        broadcastOrchestrationSnapshot();
+        return;
+      }
 
       case "approval.policy.set":
         await manager.setApprovalPolicy(msg.sid, msg.policy);
@@ -1079,8 +1429,35 @@ export async function createDaemonServer(
         send(conn, { type: "error", code: e.code, message: e.message });
         return;
       }
-      if (e instanceof OrchestrationError) {
+      if (e instanceof AgentAccountError) {
         send(conn, { type: "error", code: "bad_message", message: e.message });
+        return;
+      }
+      if (e instanceof OrchestrationError) {
+        const code = e.code === "revision_conflict" ||
+          e.code === "operation_conflict" ||
+          e.code === "task_not_editable" ||
+          e.code === "run_not_deletable" ||
+          e.code === "invalid_transition" ||
+          e.code === "task_not_dispatchable"
+          ? "conflict"
+          : "bad_message";
+        send(conn, { type: "error", code, message: e.message });
+        return;
+      }
+      if (e instanceof ControlSocketError) {
+        const conflict = e.code === "revision_conflict" ||
+          e.code === "operation_conflict" ||
+          e.code === "task_not_editable" ||
+          e.code === "run_not_deletable" ||
+          e.code === "invalid_transition" ||
+          e.code === "task_not_dispatchable" ||
+          e.code === "worker_not_active";
+        send(conn, {
+          type: "error",
+          code: e.code === "forbidden" ? "forbidden" : conflict ? "conflict" : "bad_message",
+          message: e.message,
+        });
         return;
       }
       console.error("[prosperod] internal error:", e);
@@ -1093,6 +1470,7 @@ export async function createDaemonServer(
       ws,
       channel: null,
       handshake: null,
+      protocolVersion: PROTOCOL_VERSION,
       device: null,
       attachments: new Map(),
       chatAttachments: new Map(),
@@ -1135,6 +1513,220 @@ export async function createDaemonServer(
       res.end(JSON.stringify({ ok: true, sessions: manager.list().length }));
       return;
     }
+    if (req.method === "POST" && url.pathname === "/_prospero/control/session/create") {
+      try {
+        const body = await readControlJson(req);
+        // 本机壳和手机共用同一份协议校验，避免 HTTP 控制面悄悄长出另一套会话参数语义。
+        // Goal/恢复会话不是这个轻量启动器的职责，因此只挑选基础创建字段。
+        const message = parseC2S({
+          type: "session.create",
+          agent: body["agent"],
+          accountId: body["accountId"],
+          kind: body["kind"],
+          approvalPolicy: body["approvalPolicy"],
+          cwd: body["cwd"],
+          command: body["command"],
+          cols: body["cols"] ?? 120,
+          rows: body["rows"] ?? 40,
+        });
+        if (message.type !== "session.create") {
+          throw new ProtocolError("expected session.create", "format");
+        }
+        const info = await manager.create({
+          agent: message.agent,
+          accountId: message.accountId,
+          kind: message.kind,
+          approvalPolicy: message.approvalPolicy,
+          cwd: message.cwd,
+          command: message.command,
+          cols: message.cols,
+          rows: message.rows,
+          // control token 只写在 0600 status.json，且这个入口仅接受 loopback。
+          // 它代表 Mac 宿主用户本人，不继承任一手机设备的 allowShell 限制。
+          allowShell: true,
+        });
+        res.writeHead(201, { "content-type": "application/json" });
+        res.end(JSON.stringify(info));
+      } catch (e) {
+        if (e instanceof ProtocolError) {
+          res.writeHead(400).end(e.message);
+        } else if (e instanceof SessionError) {
+          res.writeHead(409).end(e.message);
+        } else {
+          res.writeHead(400).end(e instanceof Error ? e.message : String(e));
+        }
+      }
+      return;
+    }
+    const sessionViewMatch = url.pathname.match(
+      /^\/_prospero\/control\/session\/([^/]+)\/view$/,
+    );
+    if (req.method === "GET" && sessionViewMatch) {
+      try {
+        const sid = decodeURIComponent(sessionViewMatch[1]!);
+        const rawKnownSeq = url.searchParams.get("knownSeq");
+        const knownSeq = rawKnownSeq === null ? undefined : Number(rawKnownSeq);
+        if (
+          knownSeq !== undefined &&
+          (!Number.isSafeInteger(knownSeq) || knownSeq < 0)
+        ) {
+          res.writeHead(400).end("invalid knownSeq");
+          return;
+        }
+
+        const structured = manager.getStructured(sid);
+        if (structured) {
+          const snapshot = structured.snapshot();
+          if (knownSeq === snapshot.evSeq) {
+            res.writeHead(204).end();
+            return;
+          }
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({
+            kind: "structured",
+            seq: snapshot.evSeq,
+            evSeq: snapshot.evSeq,
+            events: snapshot.events,
+          }));
+          return;
+        }
+
+        const terminal = manager.requirePty(sid);
+        if (knownSeq === terminal.ring.lastSeq) {
+          res.writeHead(204).end();
+          return;
+        }
+        const snapshot = await terminal.snapshot();
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ kind: "pty", ...snapshot }));
+      } catch (e) {
+        if (e instanceof SessionError) {
+          res.writeHead(e.code === "session_not_found" ? 404 : 409).end(e.message);
+        } else if (e instanceof URIError) {
+          res.writeHead(400).end("invalid session id");
+        } else {
+          res.writeHead(400).end(e instanceof Error ? e.message : String(e));
+        }
+      }
+      return;
+    }
+    const sessionInteractMatch = url.pathname.match(
+      /^\/_prospero\/control\/session\/([^/]+)\/interact$/,
+    );
+    if (req.method === "POST" && sessionInteractMatch) {
+      try {
+        const sid = decodeURIComponent(sessionInteractMatch[1]!);
+        const body = await readControlJson(req);
+        // 复用手机协议校验，Mac 本地工作台不会悄悄形成第三套输入语义。
+        const message = parseC2S({ ...body, sid });
+        switch (message.type) {
+          case "chat.send":
+            await manager
+              .requireStructured(sid)
+              .send(message.text, message.attachments, message.delivery);
+            break;
+          case "term.input":
+            manager.requirePty(sid).writeInput(utf8Decode(fromB64(message.dataB64)));
+            break;
+          case "term.resize":
+            manager.requirePty(sid).resize(message.cols, message.rows);
+            break;
+          case "permission.respond":
+            await manager
+              .requireStructured(sid)
+              .respondPermission(message.reqId, message.reply);
+            break;
+          case "question.respond":
+            await manager
+              .requireStructured(sid)
+              .respondQuestion(message.reqId, message.answers, message.cancelled === true);
+            break;
+          case "approval.policy.set":
+            await manager.requireStructured(sid).setApprovalPolicy(message.policy);
+            break;
+          default:
+            res.writeHead(400).end("unsupported local session interaction");
+            return;
+        }
+        res.writeHead(204).end();
+      } catch (e) {
+        if (e instanceof ProtocolError) {
+          res.writeHead(400).end(e.message);
+        } else if (e instanceof SessionError) {
+          res.writeHead(e.code === "session_not_found" ? 404 : 409).end(e.message);
+        } else if (e instanceof URIError) {
+          res.writeHead(400).end("invalid session id");
+        } else {
+          res.writeHead(400).end(e instanceof Error ? e.message : String(e));
+        }
+      }
+      return;
+    }
+    const subagentEventsMatch = url.pathname.match(
+      /^\/_prospero\/control\/session\/([^/]+)\/subagent\/([^/]+)\/events$/,
+    );
+    if (req.method === "GET" && subagentEventsMatch) {
+      try {
+        const sid = decodeURIComponent(subagentEventsMatch[1]!);
+        const subagentId = decodeURIComponent(subagentEventsMatch[2]!);
+        const session = manager.requireStructured(sid);
+        if (!session.info().subagents?.some((candidate) => candidate.id === subagentId)) {
+          res.writeHead(404).end("no such subagent");
+          return;
+        }
+        const snapshot = await session.subagentSnapshot(subagentId);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(snapshot));
+      } catch (e) {
+        if (e instanceof SessionError) {
+          res.writeHead(409).end(e.message);
+        } else if (e instanceof URIError) {
+          res.writeHead(400).end("invalid session or subagent id");
+        } else {
+          res.writeHead(400).end(e instanceof Error ? e.message : String(e));
+        }
+      }
+      return;
+    }
+    if (
+      req.method === "POST" &&
+      url.pathname === "/_prospero/control/orchestration/action"
+    ) {
+      try {
+        const body = await readControlJson(req);
+        const method = body["method"];
+        const rawParams = body["params"];
+        if (
+          typeof method !== "string" ||
+          !MANUAL_ORCHESTRATION_METHODS.has(method) ||
+          !rawParams ||
+          typeof rawParams !== "object" ||
+          Array.isArray(rawParams)
+        ) {
+          res.writeHead(400).end("无效的人工编排动作");
+          return;
+        }
+        const supplied = rawParams as Record<string, unknown>;
+        const params = method === "run.create" || method === "graph.create"
+          ? { ...supplied, coordinatorSessionId: null }
+          : { ...supplied, actorSessionId: null };
+        const result = await orchestrationApi(
+          method,
+          params,
+          new AbortController().signal,
+        );
+        broadcastOrchestrationSnapshot();
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(result));
+      } catch (e) {
+        if (e instanceof ControlSocketError) {
+          res.writeHead(e.code === "forbidden" ? 403 : 409).end(e.message);
+        } else {
+          res.writeHead(400).end(e instanceof Error ? e.message : String(e));
+        }
+      }
+      return;
+    }
     const gateMatch = url.pathname.match(
       /^\/_prospero\/control\/orchestration\/gate\/([^/]+)\/resolve$/,
     );
@@ -1146,7 +1738,9 @@ export async function createDaemonServer(
           res.writeHead(400).end("决策内容不能为空");
           return;
         }
-        orchestrationStore.resolveGate(decodeURIComponent(gateMatch[1]!), decision);
+        const gate = orchestrationStore.resolveGate(decodeURIComponent(gateMatch[1]!), decision);
+        automationService.kick(gate.runId);
+        broadcastOrchestrationSnapshot();
         res.writeHead(204).end();
       } catch (e) {
         if (e instanceof OrchestrationError) {
@@ -1177,14 +1771,14 @@ export async function createDaemonServer(
     }
   }
 
-  /** shell 的 Gate 请求只有一个短字符串；显式限长，避免控制面被大 body 占住内存。 */
+  /** 图编辑一次最多 200 个节点；显式限长，避免本机控制面被大 body 占住内存。 */
   async function readControlJson(req: IncomingMessage): Promise<Record<string, unknown>> {
     const chunks: Buffer[] = [];
     let bytes = 0;
     for await (const chunk of req) {
       const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       bytes += data.length;
-      if (bytes > 64 * 1024) throw new Error("控制请求过大");
+      if (bytes > 4 * 1024 * 1024) throw new Error("控制请求过大");
       chunks.push(data);
     }
     const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
@@ -1303,6 +1897,7 @@ export async function createDaemonServer(
   const restoredPty = manager.restoreFromTmux();
   const restoredStructured = await manager.restoreStructured();
   statusFile.start(port);
+  automationService.resumePersisted();
 
   return {
     port,
@@ -1310,8 +1905,13 @@ export async function createDaemonServer(
     restoredSessions: restoredPty.length + restoredStructured.length,
     httpServer,
     manager,
+    accounts,
     notifier,
-    orchestration: { store: orchestrationStore, dispatch: dispatchService },
+    orchestration: {
+      store: orchestrationStore,
+      dispatch: dispatchService,
+      automation: automationService,
+    },
     collaboration,
     controlSocket,
     close: async () => {

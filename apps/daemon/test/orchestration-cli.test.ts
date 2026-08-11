@@ -35,6 +35,9 @@ async function cli(
     ...args,
   ], {
     cwd: path.resolve(".."),
+    // 测试本身可能正跑在 Prospero agent 会话里；未显式传 session 时不能继承
+    // 外层协调者 ID，否则手工 Run 会被误判成协调者 Run。
+    env: { ...process.env, PROSPERO_SESSION_ID: session ?? "" },
   });
   return JSON.parse(stdout) as unknown;
 }
