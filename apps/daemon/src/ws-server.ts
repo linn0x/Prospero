@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import { WebSocketServer, WebSocket, type RawData } from "ws";
 import {
   CAPABILITY_AGENT_ACCOUNTS,
+  CAPABILITY_CHAT_ATTACHMENT_PREVIEWS,
   CAPABILITY_ORCHESTRATION_AUTOMATION,
   CAPABILITY_ORCHESTRATION_GRAPH,
   CAPABILITY_ORCHESTRATION_LIFECYCLE,
@@ -274,6 +275,7 @@ export async function createDaemonServer(
 
   function orchestrationCapabilities(conn: Conn): string[] {
     const capabilities: string[] = [];
+    if (conn.protocolVersion >= 11) capabilities.push(CAPABILITY_CHAT_ATTACHMENT_PREVIEWS);
     if (conn.protocolVersion >= 10 && conn.device?.allowShell) {
       capabilities.push(CAPABILITY_AGENT_ACCOUNTS);
     }
@@ -955,6 +957,41 @@ export async function createDaemonServer(
           callId: msg.callId,
           output: full?.output ?? "(输出已不可用)",
           ...(full?.truncated === true ? { truncated: true } : {}),
+        });
+        return;
+      }
+      case "chat.attachment.get": {
+        if (conn.protocolVersion < 11) {
+          send(conn, {
+            type: "error",
+            code: "bad_message",
+            message: "当前协商协议不支持聊天附件预览",
+            sid: msg.sid,
+          });
+          return;
+        }
+        const chunk = await manager
+          .requireStructured(msg.sid)
+          .attachmentChunk(msg.msgId, msg.attachmentId, msg.offset, msg.length);
+        if (!chunk) {
+          send(conn, {
+            type: "error",
+            code: "fs_error",
+            message: "图片附件已不可用",
+            sid: msg.sid,
+          });
+          return;
+        }
+        send(conn, {
+          type: "chat.attachment.chunk",
+          sid: msg.sid,
+          msgId: msg.msgId,
+          attachmentId: msg.attachmentId,
+          mimeType: chunk.mimeType,
+          dataB64: toB64(chunk.data),
+          total: chunk.total,
+          eof: chunk.eof,
+          requestId: msg.requestId,
         });
         return;
       }

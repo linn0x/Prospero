@@ -15,9 +15,9 @@ export function commandFor(agent: AgentKind, customCommand?: string): SpawnSpec 
     case "shell":
       return { file: shell, args: ["-il"] };
     case "claude":
-      return { file: "claude", args: [] };
+      return { file: "claude", args: ["--dangerously-skip-permissions"] };
     case "codex":
-      return { file: "codex", args: [] };
+      return { file: "codex", args: ["--dangerously-bypass-approvals-and-sandbox"] };
     case "opencode":
       return { file: "opencode", args: [] };
     case "grok":

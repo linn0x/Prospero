@@ -464,6 +464,7 @@ describe("daemon 全链路", () => {
     expect(hello.host.capabilities).toContain("orchestration.lifecycle.v1");
     expect(hello.host.capabilities).toContain("subagent.history.v1");
     expect(hello.host.capabilities).toContain("agent.accounts.v1");
+    expect(hello.host.capabilities).toContain("chat.attachment-previews.v1");
 
     const objective = `手工编排-${String(Date.now())}`;
     c.send({ type: "orchestration.run.create", objective });
@@ -635,6 +636,7 @@ describe("daemon 全链路", () => {
       )) as Extract<S2CMessage, { type: "hello.ok" }>;
       expect(hello.host.negotiatedProtocolVersion).toBe(version);
       expect(hello.host.capabilities).not.toContain("subagent.history.v1");
+      expect(hello.host.capabilities).not.toContain("chat.attachment-previews.v1");
       if (version < 8) {
         expect(hello.host.capabilities).not.toContain("orchestration.graph.v1");
         expect(hello.host.capabilities).not.toContain("orchestration.automation.v1");

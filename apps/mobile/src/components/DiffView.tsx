@@ -1,6 +1,7 @@
 import { memo, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import type { FileDiff } from "@prospero/protocol";
+import { numberDiffLines, type NumberedDiffLine } from "@/lib/diff-lines";
 import { MONOSPACE_FONT } from "@/lib/theme";
 
 /**
@@ -14,7 +15,8 @@ const COLLAPSED_LINES = 14;
 export const DiffView = memo(function DiffView({ diff }: { diff: FileDiff }) {
   const [expanded, setExpanded] = useState(false);
   const lines = diff.patch.length > 0 ? diff.patch.split("\n") : [];
-  const shown = expanded ? lines : lines.slice(0, COLLAPSED_LINES);
+  const numbered = numberDiffLines(lines);
+  const shown = expanded ? numbered : numbered.slice(0, COLLAPSED_LINES);
   const hidden = lines.length - shown.length;
   const fileName = diff.path.split("/").pop() ?? diff.path;
 
@@ -30,8 +32,8 @@ export const DiffView = memo(function DiffView({ diff }: { diff: FileDiff }) {
       {lines.length > 0 && (
         <ScrollView horizontal showsHorizontalScrollIndicator={false}>
           <View>
-            {shown.map((l, i) => (
-              <DiffLine key={i} line={l} />
+            {shown.map((line, i) => (
+              <DiffLine key={i} line={line} />
             ))}
           </View>
         </ScrollView>
@@ -48,20 +50,29 @@ export const DiffView = memo(function DiffView({ diff }: { diff: FileDiff }) {
   );
 });
 
-function DiffLine({ line }: { line: string }) {
-  if (line === "@@") {
+function DiffLine({ line }: { line: NumberedDiffLine }) {
+  if (line.line === "@@") {
     return (
       <View style={styles.gapRow}>
         <Text style={styles.gapText}>⋯</Text>
       </View>
     );
   }
-  const sign = line.charAt(0);
-  const body = line.slice(1);
+  if (line.line.startsWith("@@")) {
+    return (
+      <View style={styles.hunkRow}>
+        <Text style={styles.hunkText}>{line.line}</Text>
+      </View>
+    );
+  }
+  const sign = line.line.charAt(0);
+  const body = line.line.slice(1);
   const isAdd = sign === "+";
   const isDel = sign === "-";
   return (
     <View style={[styles.row, isAdd && styles.rowAdd, isDel && styles.rowDel]}>
+      <Text style={styles.lineNumber}>{line.oldLine ?? ""}</Text>
+      <Text style={styles.lineNumber}>{line.newLine ?? ""}</Text>
       <Text style={[styles.sign, isAdd && styles.signAdd, isDel && styles.signDel]}>
         {isAdd ? "+" : isDel ? "−" : " "}
       </Text>
@@ -100,6 +111,18 @@ const styles = StyleSheet.create({
   code: { fontFamily: MONOSPACE_FONT, fontSize: 11, lineHeight: 17, color: "#9a9aa6" },
   codeAdd: { color: "#a8dcb8" },
   codeDel: { color: "#f0b0ab" },
+  lineNumber: {
+    width: 32,
+    paddingRight: 5,
+    color: "#555563",
+    fontFamily: MONOSPACE_FONT,
+    fontSize: 10,
+    lineHeight: 17,
+    textAlign: "right",
+    fontVariant: ["tabular-nums"],
+  },
+  hunkRow: { paddingHorizontal: 8, paddingVertical: 3, backgroundColor: "#172037", minWidth: "100%" },
+  hunkText: { color: "#8FB1FF", fontFamily: MONOSPACE_FONT, fontSize: 10.5, lineHeight: 16 },
   gapRow: { paddingHorizontal: 8, paddingVertical: 2, backgroundColor: "#141419" },
   gapText: { fontFamily: MONOSPACE_FONT, fontSize: 11, color: "#4a4a56" },
   more: {

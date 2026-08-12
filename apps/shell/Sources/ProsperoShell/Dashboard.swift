@@ -43,6 +43,7 @@ struct ProsperoDashboard: View {
   @State private var startingSession = false
   @State private var sessionLaunchError: String?
   @State private var sessionLaunchDirectory: String?
+  @State private var sessionLaunchAgent: String?
   @State private var selectedProjectPath: String?
   @State private var selectedSessionID: String?
 
@@ -73,7 +74,10 @@ struct ProsperoDashboard: View {
             projects: projects,
             selectedProjectPath: $selectedProjectPath,
             selectedSessionID: $selectedSessionID,
-            newSession: presentSessionLauncher
+            newSession: { directory in presentSessionLauncher(directory) },
+            newSessionForAgent: { directory, agent in
+              presentSessionLauncher(directory, agent: agent)
+            }
           )
         case .goals:
           GoalsDashboard(daemon: daemon)
@@ -108,9 +112,11 @@ struct ProsperoDashboard: View {
     }
     .sheet(isPresented: $showingSessionLauncher, onDismiss: {
       sessionLaunchDirectory = nil
+      sessionLaunchAgent = nil
     }) {
       LocalSessionComposer(
         initialDirectory: suggestedSessionDirectory,
+        initialAgent: sessionLaunchAgent ?? "codex",
         accounts: daemon.status.agentAccounts,
         isSubmitting: startingSession,
         submit: { agent, kind, cwd, policy, accountId in
@@ -129,8 +135,9 @@ struct ProsperoDashboard: View {
     }
   }
 
-  private func presentSessionLauncher(_ directory: String?) {
+  private func presentSessionLauncher(_ directory: String?, agent: String? = nil) {
     sessionLaunchDirectory = directory
+    sessionLaunchAgent = agent
     showingSessionLauncher = true
   }
 
@@ -414,9 +421,19 @@ private struct SessionsDashboard: View {
   @Binding var selectedProjectPath: String?
   @Binding var selectedSessionID: String?
   let newSession: (String?) -> Void
+  let newSessionForAgent: (String?, String) -> Void
   @State private var sessionToKill: RunningStatus.Session?
   @State private var selectedSubagent: SelectedSubagent?
   @State private var actionError: String?
+  @State private var expandedProjectPaths: Set<String> = []
+  /// HSplitView 在外层 NavigationSplitView 隐藏/显示后会重新计算分栏。
+  /// 这里把用户拖出的宽度存进偏好，重建后仍按同一宽度排版。
+  @AppStorage("projectSessionSidebarWidth") private var storedProjectSidebarWidth = 320.0
+  @State private var sidebarDragOrigin: CGFloat?
+
+  private static let projectSidebarMinWidth: CGFloat = 270
+  private static let projectSidebarMaxWidth: CGFloat = 480
+  private static let workspaceMinWidth: CGFloat = 460
 
   private var sessions: [RunningStatus.Session] {
     (daemon.running?.sessions ?? []).sorted {
@@ -437,49 +454,24 @@ private struct SessionsDashboard: View {
   }
 
   var body: some View {
-    HSplitView {
-      ProjectRail(
-        projects: projectSummaries,
-        selectedProjectPath: $selectedProjectPath,
-        addProject: chooseProject,
-        newSession: { newSession($0.path) },
-        removeProject: removeProject
-      )
-      .frame(minWidth: 190, idealWidth: 220, maxWidth: 260)
-
-      if let project = selectedProject {
-        SessionRail(
-          projectName: project.name,
-          sessions: project.sessions,
+    GeometryReader { proxy in
+      let sidebarWidth = projectSidebarWidth(for: proxy.size.width)
+      HStack(spacing: 0) {
+        ProjectSessionSidebar(
+          projects: projectSummaries,
+          selectedProjectPath: $selectedProjectPath,
           selectedSessionID: $selectedSessionID,
-          newSession: { newSession(project.path) }
+          expandedProjectPaths: $expandedProjectPaths,
+          addProject: chooseProject,
+          newSession: { newSession($0.path) },
+          removeProject: removeProject
         )
-        .frame(minWidth: 230, idealWidth: 270, maxWidth: 320)
+        .frame(width: sidebarWidth)
 
-        if let selected = selectedSession {
-          LocalSessionWorkspace(
-            daemon: daemon,
-            session: selected,
-            interrupt: { run(selected, action: .interrupt) },
-            kill: { sessionToKill = selected },
-            openSubagent: { child in
-              selectedSubagent = SelectedSubagent(session: selected, subagent: child)
-            }
-          )
-          .id(selected.id)
-        } else {
-          EmptyProjectWorkspace(
-            project: project,
-            daemonIsRunning: daemon.running != nil,
-            newSession: { newSession(project.path) }
-          )
-        }
-      } else {
-        EmptyProjectSelection(
-          daemonIsRunning: daemon.running != nil,
-          chooseProject: chooseProject
-        )
-        .frame(minWidth: 500)
+        sidebarDivider(availableWidth: proxy.size.width, displayedWidth: sidebarWidth)
+
+        workspace
+          .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
       }
     }
     .navigationTitle("项目与会话")
@@ -487,14 +479,17 @@ private struct SessionsDashboard: View {
       synchronizeProjects()
       selectAvailableProject()
       selectAvailableSession()
+      expandSelectedProject()
     }
     .onChange(of: sessions.map { "\($0.id):\($0.cwd)" }) { _, _ in
       synchronizeProjects()
       selectAvailableProject()
       selectAvailableSession()
+      expandSelectedProject()
     }
     .onChange(of: selectedProjectPath) { _, _ in
       selectAvailableSession()
+      expandSelectedProject()
     }
     .sheet(item: $selectedSubagent) { selected in
       SubagentTranscriptSheet(
@@ -527,6 +522,73 @@ private struct SessionsDashboard: View {
     return selectedProject.sessions.first { $0.id == selectedSessionID }
   }
 
+  @ViewBuilder
+  private var workspace: some View {
+    if let project = selectedProject {
+      if let selected = selectedSession {
+        LocalSessionWorkspace(
+          daemon: daemon,
+          session: selected,
+          interrupt: { run(selected, action: .interrupt) },
+          kill: { sessionToKill = selected },
+          launchCLI: { newSessionForAgent(project.path, selected.agent) },
+          openSubagent: { child in
+            selectedSubagent = SelectedSubagent(session: selected, subagent: child)
+          }
+        )
+        .id(selected.id)
+      } else {
+        EmptyProjectWorkspace(
+          project: project,
+          daemonIsRunning: daemon.running != nil,
+          newSession: { newSession(project.path) }
+        )
+      }
+    } else {
+      EmptyProjectSelection(
+        daemonIsRunning: daemon.running != nil,
+        chooseProject: chooseProject
+      )
+    }
+  }
+
+  private func projectSidebarWidth(for availableWidth: CGFloat) -> CGFloat {
+    let maxWidth = max(
+      Self.projectSidebarMinWidth,
+      min(Self.projectSidebarMaxWidth, availableWidth - Self.workspaceMinWidth)
+    )
+    return min(max(CGFloat(storedProjectSidebarWidth), Self.projectSidebarMinWidth), maxWidth)
+  }
+
+  private func sidebarDivider(availableWidth: CGFloat, displayedWidth: CGFloat) -> some View {
+    Color(nsColor: .separatorColor)
+      .frame(width: 1)
+      .overlay {
+        Color.clear
+          .frame(width: 12)
+          .contentShape(Rectangle())
+          .onHover { hovering in
+            (hovering ? NSCursor.resizeLeftRight : NSCursor.arrow).set()
+          }
+          .gesture(
+            DragGesture(minimumDistance: 0)
+              .onChanged { value in
+                if sidebarDragOrigin == nil { sidebarDragOrigin = displayedWidth }
+                guard let sidebarDragOrigin else { return }
+                let maxWidth = max(
+                  Self.projectSidebarMinWidth,
+                  min(Self.projectSidebarMaxWidth, availableWidth - Self.workspaceMinWidth)
+                )
+                storedProjectSidebarWidth = Double(min(
+                  max(sidebarDragOrigin + value.translation.width, Self.projectSidebarMinWidth),
+                  maxWidth
+                ))
+              }
+              .onEnded { _ in sidebarDragOrigin = nil }
+          )
+      }
+  }
+
   private func synchronizeProjects() {
     projects.rememberSessionDirectories(sessions.map(\.cwd))
   }
@@ -549,6 +611,14 @@ private struct SessionsDashboard: View {
       return
     }
     selectedSessionID = selectedProject.sessions.first?.id
+  }
+
+  /// 选中其他项目时自然展开；用户手动收起当前项目时 selection 不会变化，
+  /// 所以不会被这个同步逻辑立刻抢回展开状态。
+  private func expandSelectedProject() {
+    if let selectedProjectPath {
+      expandedProjectPaths.insert(selectedProjectPath)
+    }
   }
 
   private func chooseProject() {
@@ -636,14 +706,13 @@ private struct LocalSessionComposer: View {
   let submit: (String, String, String, String, String?) -> Void
   let cancel: () -> Void
 
-  @State private var agent = "codex"
-  @State private var kind = "pty"
+  @State private var agent: String
   @State private var cwd: String
-  @State private var policy = "standard"
   @State private var accountId = ""
 
   init(
     initialDirectory: String,
+    initialAgent: String,
     accounts: [DaemonStatus.AgentAccount],
     isSubmitting: Bool,
     submit: @escaping (String, String, String, String, String?) -> Void,
@@ -654,17 +723,14 @@ private struct LocalSessionComposer: View {
     self.isSubmitting = isSubmitting
     self.submit = submit
     self.cancel = cancel
+    _agent = State(initialValue: initialAgent)
     _cwd = State(initialValue: initialDirectory)
-    let codexAccounts = accounts.filter { $0.agent == "codex" }
+    let initialAccounts = accounts.filter { $0.agent == initialAgent }
     _accountId = State(
-      initialValue: codexAccounts.first(where: \.isDefault)?.id
-        ?? codexAccounts.first?.id
+      initialValue: initialAccounts.first(where: \.isDefault)?.id
+        ?? initialAccounts.first?.id
         ?? ""
     )
-  }
-
-  private var supportsStructured: Bool {
-    agent == "claude" || agent == "codex" || agent == "opencode"
   }
 
   private var selectableAccounts: [DaemonStatus.AgentAccount] {
@@ -709,8 +775,6 @@ private struct LocalSessionComposer: View {
           Text("Shell").tag("shell")
         }
         .onChange(of: agent) { _, _ in
-          // Mac 工作台以 CLI 为主：切换 Agent 后回到 Shell，而不是静默进入 Chat UI。
-          kind = "pty"
           accountId = selectableAccounts.first(where: \.isDefault)?.id
             ?? selectableAccounts.first?.id
             ?? ""
@@ -722,21 +786,6 @@ private struct LocalSessionComposer: View {
               Text(account.isDefault ? "\(account.name)（默认）" : account.name)
                 .tag(account.id)
             }
-          }
-        }
-
-        Picker("界面", selection: $kind) {
-          Text("Shell · 原生 CLI（默认）").tag("pty")
-          if supportsStructured {
-            Text("Chat UI · 结构化对话").tag("structured")
-          }
-        }
-
-        if kind == "structured" {
-          Picker("审批策略", selection: $policy) {
-            Text("标准（推荐）").tag("standard")
-            Text("严格").tag("strict")
-            Text("YOLO").tag("yolo")
           }
         }
 
@@ -762,7 +811,7 @@ private struct LocalSessionComposer: View {
         Button("取消", action: cancel)
           .disabled(isSubmitting)
         Button {
-          submit(agent, kind, cleanDirectory, policy, accountId.isEmpty ? nil : accountId)
+          submit(agent, "pty", cleanDirectory, "standard", accountId.isEmpty ? nil : accountId)
         } label: {
           if isSubmitting {
             ProgressView().controlSize(.small)
@@ -783,8 +832,11 @@ private struct LocalSessionComposer: View {
     if agent == "shell" {
       return "Shell 使用登录终端并由 tmux 托管，daemon 或 Mac App 重启后仍可恢复。"
     }
-    if kind == "structured" {
-      return "Chat UI 是可选兼容模式，会把消息、工具调用和审批渲染为卡片。"
+    if agent == "codex" {
+      return "Codex 将以 --dangerously-bypass-approvals-and-sandbox 启动：不请求审批，也不使用沙箱。"
+    }
+    if agent == "claude" {
+      return "Claude 将以 --dangerously-skip-permissions 启动：跳过所有权限确认。"
     }
     return "Shell 会直接启动 \(agent) CLI，并由 tmux 托管；daemon 或 Mac App 重启后仍可恢复。"
   }

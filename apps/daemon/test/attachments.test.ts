@@ -56,12 +56,22 @@ async function makeSession(acceptsImages: boolean) {
 }
 
 describe("消息附件", () => {
-  it("后端能收图时,原样交给适配器,不落盘", async () => {
+  it("后端能收图时，原样交给适配器，并保留可按需读取的历史索引", async () => {
     isolateHome();
-    const { s, seen } = await makeSession(true);
+    const { s, seen, events } = await makeSession(true);
     await s.send("这是什么错?", [png]);
     expect(seen[0]?.attachments).toHaveLength(1);
     expect(seen[0]?.text).toBe("这是什么错?");
+    const user = events.find((event) => event.kind === "user.message");
+    expect(user?.kind).toBe("user.message");
+    if (!user || user.kind !== "user.message") return;
+    expect(user.attachments).toHaveLength(1);
+    expect(JSON.stringify(user)).not.toContain(png.dataB64);
+    const attachment = user.attachments?.[0];
+    expect(attachment?.name).toBe("shot.png");
+    const chunk = await s.attachmentChunk(user.msgId, attachment!.id, 0, 1024);
+    expect(chunk?.mimeType).toBe("image/png");
+    expect(chunk?.data.toString("base64")).toBe(png.dataB64);
   });
 
   it("后端收不了图时落盘,并把路径并进文本", async () => {
@@ -88,12 +98,17 @@ describe("消息附件", () => {
     expect(seen[0]?.attachments).toHaveLength(1);
   });
 
-  it("聊天记录里标出带了几张图 —— 否则回看时只剩一句没头没脑的话", async () => {
+  it("聊天记录保存图片索引而不是把原图塞进事件快照", async () => {
     isolateHome();
     const { s, events } = await makeSession(true);
     await s.send("看这个", [png, png]);
     const user = events.find((e) => e.kind === "user.message");
-    expect(user && "text" in user ? user.text : "").toContain("2 张图");
+    expect(user?.kind).toBe("user.message");
+    if (!user || user.kind !== "user.message") return;
+    expect(user.text).toBe("看这个");
+    expect(user.attachments).toHaveLength(2);
+    expect(new Set(user.attachments?.map((attachment) => attachment.id))).toHaveLength(2);
+    expect(JSON.stringify(user)).not.toContain(png.dataB64);
   });
 
   it("文件名里的路径分隔符被消掉,不能借附件名写到别处", async () => {
