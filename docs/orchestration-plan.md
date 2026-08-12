@@ -9,15 +9,14 @@
 
 **非目标**:不做通用工作流引擎,不做 DAG 调度器。任务图能表达依赖就够了。
 
-## 为什么我们的位置比"在别人家编排"好
+## 为什么把编排建在 Prospero 里
 
-调研过 Orca 1.4.173 的编排实现(它把 Run/Task/Dispatch 绑在自己管理的 PTY 上)。
-它有两处硬伤,而这两处恰好是我们已经解决掉的:
+终端型编排通常把 Run/Task/Dispatch 绑在自己管理的 PTY 上,容易遇到两类问题:
 
-| | Orca 的做法 | Prospero 已有的 |
+| | 常见终端型做法 | Prospero 已有的 |
 | --- | --- | --- |
 | **agent 状态** | hook 脚本 HTTP 回报 + 扫终端标题里的 `✳ ✦ ⏲`,抓不到就靠输出静默猜 | 适配器**原生**给 `running / waiting_approval / waiting_input / idle / done`,外加 `busySince`、`pendingPermissions`、`pendingQuestions` |
-| **会话身份** | terminal handle 绑在进程上,Orca 一重启全作废,要重新绑定 | 会话 id 持久(`prospero-<id>` tmux + `pty-sessions.json`),daemon 重启后原样还在 |
+| **会话身份** | terminal handle 绑在管理进程上,管理器一重启就要重新绑定 | 会话 id 持久(`prospero-<id>` tmux + `pty-sessions.json`),daemon 重启后原样还在 |
 
 也就是说:编排最难的两件事——**知道 agent 现在到底在干嘛**、**重启后还认得它是谁**——
 我们是白捡的。剩下的是编排本身的账。
@@ -48,7 +47,7 @@ Gate      { id, runId, taskId, question, options[], status, decision, resolvedAt
 `ready` 是**派生**的,不落盘:`pending` 且 `deps` 全 `done` 即 ready。
 状态机只认显式转移,不猜——worker 干完必须显式 `task done`,
 `SessionStatus` 回到 `idle` 只是**提示**协调者去看一眼,不等于任务完成。
-(Orca 那套"agent 空闲了就当它做完了"是误报的主要来源。)
+把“暂时空闲”当作“已经交付”会制造无法可靠恢复的误报。
 
 ## 分层
 
