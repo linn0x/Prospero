@@ -11,7 +11,7 @@ import type { AgentKind, ApprovalPolicy } from "@prospero/protocol";
 import { DispatchService } from "./dispatch.js";
 import type { AutomationWorkspace, Run } from "./model.js";
 import { OrchestrationStore } from "./store.js";
-import { createWorktree, repoRoot } from "./worktree.js";
+import { createEsaytree, repoRoot } from "./esaytree.js";
 
 export interface StartAutomationInput {
   runId: string;
@@ -80,7 +80,7 @@ export class AutomationService {
         const stamp = Date.now().toString(36);
         const name = `auto-${run.id}-${stamp}`;
         branch = `prospero/${run.id}/auto-${stamp}`;
-        const created = await createWorktree({ repo, name, branch });
+        const created = await createEsaytree({ repo, name, branch });
         // 用户可能选的是 monorepo 子目录；新 worktree 仍应从对应子目录启动 agent。
         workspacePath = path.join(created.path, path.relative(repo, cwd));
       }

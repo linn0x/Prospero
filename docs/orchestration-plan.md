@@ -57,7 +57,7 @@ Gate      { id, runId, taskId, question, options[], status, decision, resolvedAt
           ├─→ ws-server ─┐
 协调者    │              ├─→ Orchestrator ─→ SessionManager ─→ tmux / 适配器
 agent ────┴─ 控制 socket ─┘        │
-   (prospero CLI)                  └─→ Store(JSON) / Worktree(git + CoW)
+   (prospero CLI)                  └─→ Store(JSON) / esaytree(git + CoW)
 ```
 
 - **Orchestrator** 是唯一的编排真相源。手机和协调者 agent 都只是它的客户端,
@@ -67,7 +67,7 @@ agent ────┴─ 控制 socket ─┘        │
 - **`prospero` CLI**:注入进每个会话的 `PATH`,agent 靠 `$PROSPERO_SESSION_ID`
   自报身份。因为会话 id 持久,这里**不需要**任何"重启后重新绑定"的机制。
 
-## worktree:不复制项目
+## esaytree：快速 worktree
 
 先破一个误解:`git worktree add` **从来就不复制仓库**。新 worktree 里的 `.git`
 只是一行 `gitdir:` 指针,对象库跟主仓共享。本仓实测:

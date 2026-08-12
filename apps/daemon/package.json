@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "bin": {
+    "esaytree": "./bin/esaytree",
     "prosperod": "./dist/cli.js",
     "prospero": "./bin/prospero"
   },
