@@ -17,8 +17,8 @@
  * 尝试，daemon 接受同一兼容窗口内的版本。这样 iOS 与 Mac 可以滚动升级，
  * 配对 token 和双方身份密钥都无需轮换。
  */
-export const PROTOCOL_VERSION = 10;
-export const SUPPORTED_PROTOCOL_VERSIONS = [10, 9, 8, 7, 5] as const;
+export const PROTOCOL_VERSION = 11;
+export const SUPPORTED_PROTOCOL_VERSIONS = [11, 10, 9, 8, 7, 5] as const;
 export const MIN_PROTOCOL_VERSION = 5;
 
 /** 加密握手格式。只有密码学帧真的不兼容时才升级。 */
@@ -42,6 +42,8 @@ export const CAPABILITY_ORCHESTRATION_LIFECYCLE = "orchestration.lifecycle.v1";
 export const CAPABILITY_SUBAGENT_HISTORY = "subagent.history.v1";
 /** Codex / Claude Code 多账号与隔离配置目录。 */
 export const CAPABILITY_AGENT_ACCOUNTS = "agent.accounts.v1";
+/** 已发送图片的按需预览，避免把原图塞进 chat.snapshot。 */
+export const CAPABILITY_CHAT_ATTACHMENT_PREVIEWS = "chat.attachment-previews.v1";
 
 export type {
   AgentKind,
@@ -103,8 +105,10 @@ export type {
   C2SAgentModeSet,
   C2SAgentCompact,
   C2SToolOutputGet,
+  C2SChatAttachmentGet,
   FileDiff,
   S2CToolOutput,
+  S2CChatAttachmentChunk,
   C2STermInput,
   C2STermResize,
   C2STermAck,

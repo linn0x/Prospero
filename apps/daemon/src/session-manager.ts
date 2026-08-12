@@ -180,8 +180,14 @@ function parseStructuredState(value: unknown): StructuredSessionPersistentState 
                 ) {
                   return [];
                 }
+                const id =
+                  typeof attachment["id"] === "string" && /^[A-Za-z0-9._-]+$/.test(attachment["id"])
+                    ? attachment["id"]
+                    : path.basename(attachment["path"]);
+                if (!/^[A-Za-z0-9._-]+$/.test(id)) return [];
                 return [
                   {
+                    id,
                     mimeType: attachment["mimeType"] as Attachment["mimeType"],
                     path: attachment["path"],
                     ...(typeof attachment["name"] === "string"
