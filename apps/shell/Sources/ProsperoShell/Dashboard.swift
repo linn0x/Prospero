@@ -14,7 +14,7 @@ private enum DashboardPage: String, CaseIterable, Identifiable {
   var title: String {
     switch self {
     case .overview: "概览"
-    case .sessions: "会话"
+    case .sessions: "项目"
     case .goals: "编排"
     case .devices: "设备"
     case .logs: "日志"
@@ -25,7 +25,7 @@ private enum DashboardPage: String, CaseIterable, Identifiable {
   var symbol: String {
     switch self {
     case .overview: "square.grid.2x2"
-    case .sessions: "bubble.left.and.text.bubble.right"
+    case .sessions: "folder"
     case .goals: "point.3.connected.trianglepath.dotted"
     case .devices: "iphone.and.arrow.forward"
     case .logs: "text.alignleft"
@@ -37,14 +37,19 @@ private enum DashboardPage: String, CaseIterable, Identifiable {
 struct ProsperoDashboard: View {
   @Bindable var daemon: DaemonController
   @Bindable var pairing: PairingModel
-  @State private var selection: DashboardPage = .overview
+  @State private var projects = LocalProjectStore()
+  @State private var selection: DashboardPage = .sessions
   @State private var showingSessionLauncher = false
   @State private var startingSession = false
   @State private var sessionLaunchError: String?
+  @State private var sessionLaunchDirectory: String?
+  @State private var selectedProjectPath: String?
   @State private var selectedSessionID: String?
 
   private var suggestedSessionDirectory: String {
-    daemon.running?.sessions.max { $0.createdAt < $1.createdAt }?.cwd
+    sessionLaunchDirectory
+      ?? selectedProjectPath
+      ?? daemon.running?.sessions.max { $0.createdAt < $1.createdAt }?.cwd
       ?? FileManager.default.homeDirectoryForCurrentUser.path
   }
 
@@ -63,7 +68,13 @@ struct ProsperoDashboard: View {
         case .overview:
           OverviewDashboard(daemon: daemon)
         case .sessions:
-          SessionsDashboard(daemon: daemon, selectedSessionID: $selectedSessionID)
+          SessionsDashboard(
+            daemon: daemon,
+            projects: projects,
+            selectedProjectPath: $selectedProjectPath,
+            selectedSessionID: $selectedSessionID,
+            newSession: presentSessionLauncher
+          )
         case .goals:
           GoalsDashboard(daemon: daemon)
         case .devices:
@@ -80,12 +91,12 @@ struct ProsperoDashboard: View {
         ToolbarItemGroup(placement: .primaryAction) {
           DaemonStatusPill(daemon: daemon)
           Button {
-            showingSessionLauncher = true
+            presentSessionLauncher(selectedProjectPath)
           } label: {
-            Label("启动 Agent", systemImage: "plus.circle.fill")
+            Label("新建 CLI", systemImage: "plus.circle.fill")
           }
           .disabled(daemon.running?.controlToken.isEmpty != false || startingSession)
-          .help("在这台 Mac 上启动 Shell 或 Code Agent")
+          .help("在当前项目的 Shell 中启动 Agent CLI")
           Button {
             daemon.restart()
           } label: {
@@ -95,7 +106,9 @@ struct ProsperoDashboard: View {
         }
       }
     }
-    .sheet(isPresented: $showingSessionLauncher) {
+    .sheet(isPresented: $showingSessionLauncher, onDismiss: {
+      sessionLaunchDirectory = nil
+    }) {
       LocalSessionComposer(
         initialDirectory: suggestedSessionDirectory,
         accounts: daemon.status.agentAccounts,
@@ -114,6 +127,11 @@ struct ProsperoDashboard: View {
     } message: {
       Text(sessionLaunchError ?? "未知错误")
     }
+  }
+
+  private func presentSessionLauncher(_ directory: String?) {
+    sessionLaunchDirectory = directory
+    showingSessionLauncher = true
   }
 
   private func startSession(
@@ -137,6 +155,8 @@ struct ProsperoDashboard: View {
         sessionLaunchError = error.isEmpty ? "daemon 拒绝创建会话" : error
       } else {
         showingSessionLauncher = false
+        projects.add(cwd)
+        selectedProjectPath = LocalProjectStore.normalizePath(cwd)
         selectedSessionID = result.id
         selection = .sessions
       }
@@ -390,7 +410,10 @@ private struct SessionsDashboard: View {
   }
 
   @Bindable var daemon: DaemonController
+  @Bindable var projects: LocalProjectStore
+  @Binding var selectedProjectPath: String?
   @Binding var selectedSessionID: String?
+  let newSession: (String?) -> Void
   @State private var sessionToKill: RunningStatus.Session?
   @State private var selectedSubagent: SelectedSubagent?
   @State private var actionError: String?
@@ -404,46 +427,75 @@ private struct SessionsDashboard: View {
     }
   }
 
-  var body: some View {
-    Group {
-      if sessions.isEmpty {
-        ContentUnavailableView(
-          "还没有 Code Agent",
-          systemImage: "sparkles.rectangle.stack",
-          description: Text(daemon.running == nil ? "daemon 启动后会在这里显示会话。" : "点工具栏的“启动 Agent”，Prospero 会启动并自动载入 Code Agent 工作台。")
-        )
-      } else {
-        HSplitView {
-          SessionRail(
-            sessions: sessions,
-            selectedSessionID: $selectedSessionID
-          )
-          .frame(minWidth: 250, idealWidth: 285, maxWidth: 340)
+  private var projectSummaries: [LocalProjectSummary] {
+    projects.summaries(for: sessions)
+  }
 
-          if let selected = selectedSession {
-            LocalSessionWorkspace(
-              daemon: daemon,
-              session: selected,
-              interrupt: { run(selected, action: .interrupt) },
-              kill: { sessionToKill = selected },
-              openSubagent: { child in
-                selectedSubagent = SelectedSubagent(session: selected, subagent: child)
-              }
-            )
-            .id(selected.id)
-          } else {
-            ContentUnavailableView(
-              "选择一个会话",
-              systemImage: "sidebar.left",
-              description: Text("会话内容会自动加载到这里。")
-            )
-          }
+  private var selectedProject: LocalProjectSummary? {
+    guard let selectedProjectPath else { return nil }
+    return projectSummaries.first { $0.path == selectedProjectPath }
+  }
+
+  var body: some View {
+    HSplitView {
+      ProjectRail(
+        projects: projectSummaries,
+        selectedProjectPath: $selectedProjectPath,
+        addProject: chooseProject,
+        newSession: { newSession($0.path) },
+        removeProject: removeProject
+      )
+      .frame(minWidth: 190, idealWidth: 220, maxWidth: 260)
+
+      if let project = selectedProject {
+        SessionRail(
+          projectName: project.name,
+          sessions: project.sessions,
+          selectedSessionID: $selectedSessionID,
+          newSession: { newSession(project.path) }
+        )
+        .frame(minWidth: 230, idealWidth: 270, maxWidth: 320)
+
+        if let selected = selectedSession {
+          LocalSessionWorkspace(
+            daemon: daemon,
+            session: selected,
+            interrupt: { run(selected, action: .interrupt) },
+            kill: { sessionToKill = selected },
+            openSubagent: { child in
+              selectedSubagent = SelectedSubagent(session: selected, subagent: child)
+            }
+          )
+          .id(selected.id)
+        } else {
+          EmptyProjectWorkspace(
+            project: project,
+            daemonIsRunning: daemon.running != nil,
+            newSession: { newSession(project.path) }
+          )
         }
+      } else {
+        EmptyProjectSelection(
+          daemonIsRunning: daemon.running != nil,
+          chooseProject: chooseProject
+        )
+        .frame(minWidth: 500)
       }
     }
-    .navigationTitle("会话")
-    .onAppear { selectAvailableSession() }
-    .onChange(of: sessions.map(\.id)) { _, _ in selectAvailableSession() }
+    .navigationTitle("项目与会话")
+    .onAppear {
+      synchronizeProjects()
+      selectAvailableProject()
+      selectAvailableSession()
+    }
+    .onChange(of: sessions.map { "\($0.id):\($0.cwd)" }) { _, _ in
+      synchronizeProjects()
+      selectAvailableProject()
+      selectAvailableSession()
+    }
+    .onChange(of: selectedProjectPath) { _, _ in
+      selectAvailableSession()
+    }
     .sheet(item: $selectedSubagent) { selected in
       SubagentTranscriptSheet(
         daemon: daemon,
@@ -471,13 +523,55 @@ private struct SessionsDashboard: View {
   }
 
   private var selectedSession: RunningStatus.Session? {
-    guard let selectedSessionID else { return nil }
-    return sessions.first { $0.id == selectedSessionID }
+    guard let selectedSessionID, let selectedProject else { return nil }
+    return selectedProject.sessions.first { $0.id == selectedSessionID }
+  }
+
+  private func synchronizeProjects() {
+    projects.rememberSessionDirectories(sessions.map(\.cwd))
+  }
+
+  private func selectAvailableProject() {
+    if let selectedProjectPath,
+       projectSummaries.contains(where: { $0.path == selectedProjectPath }) {
+      return
+    }
+    selectedProjectPath = projectSummaries.first?.path
   }
 
   private func selectAvailableSession() {
-    if let selectedSessionID, sessions.contains(where: { $0.id == selectedSessionID }) { return }
-    selectedSessionID = sessions.first?.id
+    guard let selectedProject else {
+      selectedSessionID = nil
+      return
+    }
+    if let selectedSessionID,
+       selectedProject.sessions.contains(where: { $0.id == selectedSessionID }) {
+      return
+    }
+    selectedSessionID = selectedProject.sessions.first?.id
+  }
+
+  private func chooseProject() {
+    let panel = NSOpenPanel()
+    panel.title = "添加 Agent 项目"
+    panel.prompt = "添加项目"
+    panel.canChooseFiles = false
+    panel.canChooseDirectories = true
+    panel.allowsMultipleSelection = false
+    if let selectedProjectPath {
+      panel.directoryURL = URL(fileURLWithPath: selectedProjectPath)
+    }
+    if panel.runModal() == .OK, let directory = panel.url {
+      projects.add(directory.path)
+      selectedProjectPath = LocalProjectStore.normalizePath(directory.path)
+      selectAvailableSession()
+    }
+  }
+
+  private func removeProject(_ project: LocalProjectSummary) {
+    projects.remove(project.path)
+    selectAvailableProject()
+    selectAvailableSession()
   }
 
   private func run(_ session: RunningStatus.Session, action: DaemonController.SessionAction) {
@@ -490,6 +584,51 @@ private struct SessionsDashboard: View {
   }
 }
 
+private struct EmptyProjectSelection: View {
+  let daemonIsRunning: Bool
+  let chooseProject: () -> Void
+
+  var body: some View {
+    VStack(spacing: 14) {
+      Image(systemName: "folder.badge.plus")
+        .font(.system(size: 42, weight: .light))
+        .foregroundStyle(.secondary)
+      Text("添加一个项目")
+        .font(.title2.weight(.semibold))
+      Text(daemonIsRunning
+        ? "选择代码目录后，可在该项目中创建并管理 Agent CLI 会话。"
+        : "daemon 启动后，选择代码目录来创建 Agent CLI 会话。")
+        .foregroundStyle(.secondary)
+        .multilineTextAlignment(.center)
+      Button("选择项目文件夹…", action: chooseProject)
+        .buttonStyle(.borderedProminent)
+    }
+    .padding(32)
+  }
+}
+
+private struct EmptyProjectWorkspace: View {
+  let project: LocalProjectSummary
+  let daemonIsRunning: Bool
+  let newSession: () -> Void
+
+  var body: some View {
+    VStack(spacing: 14) {
+      Image(systemName: "terminal")
+        .font(.system(size: 42, weight: .light))
+        .foregroundStyle(.secondary)
+      Text("\(project.name) 还没有会话")
+        .font(.title2.weight(.semibold))
+      Text("新 Agent 默认在内嵌 Shell 中运行原生 CLI。")
+        .foregroundStyle(.secondary)
+      Button("新建 CLI 会话", action: newSession)
+        .buttonStyle(.borderedProminent)
+        .disabled(!daemonIsRunning)
+    }
+    .padding(32)
+  }
+}
+
 private struct LocalSessionComposer: View {
   let initialDirectory: String
   let accounts: [DaemonStatus.AgentAccount]
@@ -498,7 +637,7 @@ private struct LocalSessionComposer: View {
   let cancel: () -> Void
 
   @State private var agent = "codex"
-  @State private var kind = "structured"
+  @State private var kind = "pty"
   @State private var cwd: String
   @State private var policy = "standard"
   @State private var accountId = ""
@@ -552,8 +691,8 @@ private struct LocalSessionComposer: View {
           .frame(width: 38, height: 38)
           .background(.blue.opacity(0.1), in: RoundedRectangle(cornerRadius: 9))
         VStack(alignment: .leading, spacing: 3) {
-          Text("启动本机 Agent").font(.title2.bold())
-          Text("启动后自动载入工作台；对话、工具过程与审批都可直接操作。")
+          Text("在项目中启动 Agent").font(.title2.bold())
+          Text("默认在内嵌 Shell 中直接运行 Agent 的原生 CLI。")
             .font(.callout)
             .foregroundStyle(.secondary)
         }
@@ -570,9 +709,8 @@ private struct LocalSessionComposer: View {
           Text("Shell").tag("shell")
         }
         .onChange(of: agent) { _, _ in
-          // 选择 Code Agent 就直接进入原生对话轨；早先保留了 Shell 的 PTY 值，
-          // 导致用户明明选了 Codex，看到的仍像一只普通终端。
-          kind = supportsStructured ? "structured" : "pty"
+          // Mac 工作台以 CLI 为主：切换 Agent 后回到 Shell，而不是静默进入 Chat UI。
+          kind = "pty"
           accountId = selectableAccounts.first(where: \.isDefault)?.id
             ?? selectableAccounts.first?.id
             ?? ""
@@ -587,10 +725,10 @@ private struct LocalSessionComposer: View {
           }
         }
 
-        Picker("启动方式", selection: $kind) {
-          Text("终端 / TUI（默认）").tag("pty")
+        Picker("界面", selection: $kind) {
+          Text("Shell · 原生 CLI（默认）").tag("pty")
           if supportsStructured {
-            Text("结构化对话").tag("structured")
+            Text("Chat UI · 结构化对话").tag("structured")
           }
         }
 
@@ -629,7 +767,7 @@ private struct LocalSessionComposer: View {
           if isSubmitting {
             ProgressView().controlSize(.small)
           } else {
-            Text(agent == "shell" ? "启动 Shell" : "启动 \(agent)")
+            Text(agent == "shell" ? "启动 Shell" : "启动 Agent CLI")
           }
         }
         .buttonStyle(.borderedProminent)
@@ -646,9 +784,9 @@ private struct LocalSessionComposer: View {
       return "Shell 使用登录终端并由 tmux 托管，daemon 或 Mac App 重启后仍可恢复。"
     }
     if kind == "structured" {
-      return "结构化模式保留消息、工具调用和审批事件。账号环境彼此隔离，但仍使用上面选择的项目目录。"
+      return "Chat UI 是可选兼容模式，会把消息、工具调用和审批渲染为卡片。"
     }
-    return "终端模式直接启动 \(agent) TUI，适合把多个本地 Agent 汇总到同一会话面板。"
+    return "Shell 会直接启动 \(agent) CLI，并由 tmux 托管；daemon 或 Mac App 重启后仍可恢复。"
   }
 
   private func chooseDirectory() {

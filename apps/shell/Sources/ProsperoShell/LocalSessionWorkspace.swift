@@ -2,22 +2,147 @@ import AppKit
 import SwiftUI
 import WebKit
 
-/// Orca 式的“左侧会话、右侧工作区”，但把 Agent 身份和等待人处理的状态放到视觉第一层。
-struct SessionRail: View {
-  let sessions: [RunningStatus.Session]
-  @Binding var selectedSessionID: String?
+/// 项目是 Mac 工作台的第一层；会话只在其工作目录所属的项目下出现。
+struct ProjectRail: View {
+  let projects: [LocalProjectSummary]
+  @Binding var selectedProjectPath: String?
+  let addProject: () -> Void
+  let newSession: (LocalProjectSummary) -> Void
+  let removeProject: (LocalProjectSummary) -> Void
 
   var body: some View {
     VStack(spacing: 0) {
-      HStack {
+      HStack(spacing: 8) {
         VStack(alignment: .leading, spacing: 2) {
-          Text("AGENT WORKSPACE")
-            .font(.caption2.weight(.bold))
-            .tracking(0.7)
-            .foregroundStyle(.secondary)
-          Text("\(sessions.count) 个会话")
+          Text("项目")
+            .font(.headline)
+          Text("\(projects.count) 个工作目录")
             .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+        Spacer()
+        Button(action: addProject) {
+          Image(systemName: "folder.badge.plus")
+        }
+        .buttonStyle(.borderless)
+        .help("添加项目")
+      }
+      .padding(.horizontal, 13)
+      .padding(.vertical, 12)
+
+      Divider()
+
+      if projects.isEmpty {
+        VStack(spacing: 10) {
+          Image(systemName: "folder")
+            .font(.title2)
             .foregroundStyle(.tertiary)
+          Text("还没有项目")
+            .font(.callout.weight(.medium))
+          Button("选择文件夹…", action: addProject)
+            .buttonStyle(.link)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(16)
+      } else {
+        ScrollView {
+          LazyVStack(spacing: 6) {
+            ForEach(projects) { project in
+              Button {
+                selectedProjectPath = project.path
+              } label: {
+                ProjectRailRow(
+                  project: project,
+                  selected: selectedProjectPath == project.path
+                )
+              }
+              .buttonStyle(.plain)
+              .contextMenu {
+                Button("新建 CLI 会话") { newSession(project) }
+                Button("在 Finder 中显示") {
+                  NSWorkspace.shared.activateFileViewerSelecting([
+                    URL(fileURLWithPath: project.path),
+                  ])
+                }
+                Divider()
+                Button("从项目列表移除", role: .destructive) {
+                  removeProject(project)
+                }
+                .disabled(!project.sessions.isEmpty)
+              }
+            }
+          }
+          .padding(9)
+        }
+      }
+    }
+    .background(Color(nsColor: .windowBackgroundColor))
+  }
+}
+
+private struct ProjectRailRow: View {
+  let project: LocalProjectSummary
+  let selected: Bool
+
+  var body: some View {
+    HStack(spacing: 10) {
+      Image(systemName: selected ? "folder.fill" : "folder")
+        .font(.title3)
+        .foregroundStyle(selected ? Color.accentColor : .secondary)
+        .frame(width: 25)
+      VStack(alignment: .leading, spacing: 4) {
+        Text(project.name)
+          .font(.callout.weight(selected ? .semibold : .medium))
+          .lineLimit(1)
+        HStack(spacing: 5) {
+          Text(project.path)
+            .lineLimit(1)
+            .truncationMode(.middle)
+          Spacer(minLength: 3)
+          if project.activeCount > 0 {
+            Label(String(project.activeCount), systemImage: "bolt.fill")
+              .foregroundStyle(.green)
+          } else {
+            Text("\(project.sessions.count)")
+          }
+        }
+        .font(.caption2)
+        .foregroundStyle(.secondary)
+      }
+      if project.pendingCount > 0 {
+        Text(String(project.pendingCount))
+          .font(.caption2.weight(.bold))
+          .foregroundStyle(.orange)
+          .padding(.horizontal, 6)
+          .padding(.vertical, 3)
+          .background(.orange.opacity(0.13), in: Capsule())
+      }
+    }
+    .padding(9)
+    .background(
+      selected ? Color.accentColor.opacity(0.12) : Color.clear,
+      in: RoundedRectangle(cornerRadius: 9)
+    )
+    .contentShape(RoundedRectangle(cornerRadius: 9))
+  }
+}
+
+/// Orca 式的“左侧会话、右侧工作区”，但把 Agent 身份和等待人处理的状态放到视觉第一层。
+struct SessionRail: View {
+  let projectName: String
+  let sessions: [RunningStatus.Session]
+  @Binding var selectedSessionID: String?
+  let newSession: () -> Void
+
+  var body: some View {
+    VStack(spacing: 0) {
+      HStack(spacing: 8) {
+        VStack(alignment: .leading, spacing: 2) {
+          Text("会话")
+            .font(.headline)
+          Text("\(projectName) · \(sessions.count) 个")
+            .font(.caption)
+            .foregroundStyle(.secondary)
         }
         Spacer()
         let waiting = sessions.reduce(0) { $0 + $1.pendingInteractions }
@@ -29,27 +154,46 @@ struct SessionRail: View {
             .padding(.vertical, 4)
             .background(.orange.opacity(0.12), in: Capsule())
         }
+        Button(action: newSession) {
+          Image(systemName: "plus")
+        }
+        .buttonStyle(.borderless)
+        .help("在 \(projectName) 中新建 Agent CLI")
       }
       .padding(.horizontal, 14)
       .padding(.vertical, 12)
 
       Divider()
 
-      ScrollView {
-        LazyVStack(spacing: 7) {
-          ForEach(sessions) { session in
-            Button {
-              selectedSessionID = session.id
-            } label: {
-              SessionRailRow(
-                session: session,
-                selected: selectedSessionID == session.id
-              )
-            }
-            .buttonStyle(.plain)
-          }
+      if sessions.isEmpty {
+        VStack(spacing: 8) {
+          Image(systemName: "terminal")
+            .font(.title2)
+            .foregroundStyle(.tertiary)
+          Text("还没有会话")
+            .font(.callout.weight(.medium))
+          Button("新建 CLI", action: newSession)
+            .buttonStyle(.link)
         }
-        .padding(10)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(16)
+      } else {
+        ScrollView {
+          LazyVStack(spacing: 7) {
+            ForEach(sessions) { session in
+              Button {
+                selectedSessionID = session.id
+              } label: {
+                SessionRailRow(
+                  session: session,
+                  selected: selectedSessionID == session.id
+                )
+              }
+              .buttonStyle(.plain)
+            }
+          }
+          .padding(10)
+        }
       }
     }
     // 侧栏和工作区共用窗口表面；只用选中态区分会话，避免出现一列一层底色。
@@ -72,7 +216,7 @@ private struct SessionRailRow: View {
             .font(.caption.weight(.semibold))
             .foregroundStyle(accent)
           if session.kind == "pty" {
-            Text("TUI")
+            Text("CLI")
               .font(.system(size: 8, weight: .bold, design: .rounded))
               .foregroundStyle(.secondary)
               .padding(.horizontal, 4)
@@ -178,7 +322,7 @@ struct LocalSessionWorkspace: View {
         HStack(spacing: 8) {
           Text(AgentVisuals.name(session.agent))
             .font(.headline)
-          Text(session.kind == "structured" ? "原生对话" : "终端 TUI")
+          Text(session.kind == "structured" ? "Chat UI" : "Shell · CLI")
             .font(.caption2.weight(.medium))
             .foregroundStyle(.secondary)
             .padding(.horizontal, 7)
