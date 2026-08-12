@@ -13,7 +13,7 @@
 | `docs/orchestration-plan.md` | 总设计:模型、分层、worktree 方案、分期 | — |
 | `src/orchestration/model.ts` | 数据模型 + 任务状态机 + 成环检测 | 随 store 一起测 |
 | `src/orchestration/store.ts` | JSON 持久化,Run/Task/Dispatch/Message/Gate 全套 CRUD | 36 个用例全过 |
-| `src/orchestration/worktree.ts` | git worktree + APFS 写时复制克隆依赖 | **只 typecheck,无测试** ⚠️ |
+| `src/orchestration/esaytree.ts` | 无检出 worktree + 整仓 CoW + 干净快照还原 + ignored 依赖复用 + 失败回滚 | 真实 Git 生命周期测试 |
 | `test/orchestration-store.test.ts` | 36 个用例 | 全过 |
 | `src/control-socket.ts` | `~/.prospero/control.sock` 的 token 鉴权 NDJSON RPC + 0600 token 文件 | 4 个用例全过 |
 | `src/orchestration/{control-api,dispatch}.ts` | socket 方法、协调者权限、ready 校验、建会话/worktree/前导词/显式交付、worker 停止与异常退出收敛 | 4 个派发用例全过 |
@@ -84,17 +84,15 @@ cd apps/daemon && npx vitest run \
 14. 后续仍可补充：每任务 worktree 的自动合并/冲突处理与安全并行、画布拖拽位置持久化、Run 归档，以及 worktree diff/合并/清理。M3 邮箱继续复用现有实现。
 15. Mac 会话页可按名称进入子 Agent 的独立实时过程，展示消息、推理、工具、权限与提问；读取走 loopback + control token。iOS 增加常驻名称栏与 `subagent.history.v1` 按需历史，长会话即使截断早期启动事件仍可进入。Codex 通过 `thread/read(includeTurns:true)` 恢复原生 turn/item，晚到的 `agentNickname`/`agentRole` 会补全既有身份；发现时严格校验 `parentThreadId`，恢复时自动清掉旧版误记的父线程伪子 Agent。
 
-### 补测试
+### esaytree 测试（已补）
 
-2. **`worktree.ts` 没有测试**,是当前最大的裸奔面。建议至少覆盖:
-   - `ignoredDirs()` 在 monorepo 里能列出嵌套 `apps/*/node_modules`
-   - `createWorktree()` → `removeWorktree()` 往返干净,`.git/worktrees` 不留悬挂元数据
-   - 非 APFS 路径下 `cloneIgnoredDirs()` 退回真实复制并报 `cow: false`
-   - 用 `git init` 造临时仓库测,别依赖本仓状态
+`test/esaytree.test.ts` 使用临时 `git init` 仓库覆盖 monorepo ignored 目录识别、源仓本地状态清理、
+CoW/checkout 双路径、修改隔离、clean 模式、默认根目录生命周期、分支清理和失败无残留；
+`test/esaytree-cli.test.ts` 固定 `new/list/switch/rm` 的单文档 JSON 契约、错误码与退出码。
 
 ---
 
-## 三、worktree:已经用实测定下来的事(别再纠结)
+## 三、esaytree：已经用实测定下来的事(别再纠结)
 
 用户最初的担心是"一个 worktree 就 cp 一份项目"。**实测数据(本仓)**:
 

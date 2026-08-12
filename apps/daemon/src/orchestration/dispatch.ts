@@ -2,11 +2,12 @@
 import type { AgentKind, SessionInfo, SessionKind } from "@prospero/protocol";
 import type { CreateSessionInput } from "../session-manager.js";
 import {
-  createWorktree,
+  createEsaytree,
   removeWorktree,
   repoRoot,
   type CloneReport,
-} from "./worktree.js";
+  type EsaytreeCreateMode,
+} from "./esaytree.js";
 import { OrchestrationStore } from "./store.js";
 import type { Dispatch, Task } from "./model.js";
 
@@ -38,7 +39,16 @@ export interface StartWorkerResult {
   task: Task;
   dispatch: Dispatch;
   session: SessionInfo;
-  worktree: { path: string; clones: CloneReport[] } | null;
+  worktree: WorkerWorktree | null;
+}
+
+export interface WorkerWorktree {
+  path: string;
+  clones: CloneReport[];
+  mode: EsaytreeCreateMode;
+  cow: boolean;
+  ms: number;
+  fallbackReason: string | null;
 }
 
 export interface StopWorkerResult {
@@ -116,7 +126,7 @@ export class DispatchService {
       throw new DispatchError(`任务 ${task.id} 还没 ready，不能派发`, "task_not_ready");
     }
 
-    let worktree: { repo: string; path: string; clones: CloneReport[] } | null = null;
+    let worktree: ({ repo: string } & WorkerWorktree) | null = null;
     let session: SessionInfo | null = null;
     let dispatch: Dispatch | null = null;
     try {
@@ -128,13 +138,21 @@ export class DispatchService {
         }
         const stamp = Date.now().toString(36);
         const name = `worker-${task.id}-${stamp}`;
-        const created = await createWorktree({
+        const created = await createEsaytree({
           repo,
           name,
           branch: `prospero/${task.runId}/${task.id}/${stamp}`,
         });
         workerCwd = created.path;
-        worktree = { repo, path: created.path, clones: created.clones };
+        worktree = {
+          repo,
+          path: created.path,
+          clones: created.clones,
+          mode: created.mode,
+          cow: created.cow,
+          ms: created.ms,
+          fallbackReason: created.fallbackReason ?? null,
+        };
       }
 
       const coordinator = run.coordinatorSessionId && this.sessions.infoOf
@@ -172,7 +190,16 @@ export class DispatchService {
         task: this.store.getTask(task.id),
         dispatch: running,
         session,
-        worktree: worktree ? { path: worktree.path, clones: worktree.clones } : null,
+        worktree: worktree
+          ? {
+              path: worktree.path,
+              clones: worktree.clones,
+              mode: worktree.mode,
+              cow: worktree.cow,
+              ms: worktree.ms,
+              fallbackReason: worktree.fallbackReason,
+            }
+          : null,
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
