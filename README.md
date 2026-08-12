@@ -43,6 +43,12 @@ Run 标题旁的垃圾桶可删除整条编排；仍有 worker 时会拒绝，Ru
 任务确实会改代码时才有价值；自动合并与冲突处理完成前，不能让依赖链使用彼此隔离、
 成果却未合并的工作树。
 
+隔离工作区现由自研的 `esaytree` 引擎创建：先建立无检出的 linked worktree，再用文件系统
+CoW 克隆并还原到干净提交快照。源仓的 staged、unstaged、untracked 改动不会进入 worker，
+完全 ignored 的依赖目录则默认复用；创建失败会自动回滚登记、目录和新分支。构建后可直接运行
+`apps/daemon/bin/esaytree doctor/new/list/switch/rm`，完整契约见
+[docs/esaytree.md](docs/esaytree.md)。
+
 Mac App 的日常构建会自动选择钥匙串中的 Apple Development / Developer ID 身份，
 让 TCC 授权在升级间保持稳定。首次从旧 ad-hoc 构建切换到稳定签名时可能还需确认
 一次；之后保持 `com.linn0x.prospero.shell` 与同一 Team 即无需反复授权。无开发者
