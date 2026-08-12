@@ -1,0 +1,15 @@
+title = "Prospero secret scanning"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Deterministic pairing token used only by protocol and migration tests"
+condition = "AND"
+regexTarget = "secret"
+regexes = ['''^0123456789abcdef$''']
+paths = ['''^(apps/mobile/test/hosts\.test\.ts|packages/protocol/test/(crypto|qr|schemas)\.test\.ts)$''']
+
+[[allowlists]]
+description = "Generated xterm browser bundle; its source template is scanned separately"
+paths = ['''^apps/mobile/src/components/terminal-html\.ts$''']

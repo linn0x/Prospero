@@ -21,7 +21,7 @@
 **为什么还要自己做**(2026-08 竞品格局):
 
 - Anthropic 官方 **Remote Control**(2026-02 上线,`claude remote-control` / `--rc`,扫码接管)已很强,但:转录**明文存 Anthropic 服务器(非 E2E)**、无 LAN 模式、只支持 Claude。
-- 字节 **TRAE SOLO** 官方手机 App 已落地,但闭源、走字节云、只支持 Trae。
+- 部分闭源厂商移动端方案已经落地,但依赖各自云服务,并且只覆盖自家 Agent。
 - **Happy**(MIT,23.1k★)产品形态最接近(结构化聊天 + 审批 + 语音),但默认走云 relay。
 
 → Prospero 的差异化 = **LAN/WG 零云依赖 + 跨 agent 统一 + 端到端加密**,正是官方方案都不做的组合。

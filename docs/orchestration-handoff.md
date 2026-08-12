@@ -47,8 +47,8 @@ cd apps/daemon && npx vitest run \
 ### 已经确立、别再重新讨论的决定
 
 1. **状态只认显式转移,绝不猜。** `SessionStatus` 回到 `idle` 只当"去看一眼"的提示,
-   不自动把任务判成 done。任务完成必须 worker 显式 `task done` 或协调者显式验收。
-   (调研过 Orca:它那条"agent 空闲了就当做完了"的推断是误报主要来源。)
+   不自动把任务判成 done。任务完成必须 worker 显式 `task done` 或协调者显式验收；
+   把“暂时空闲”当成“已经交付”会制造无法可靠恢复的误报。
 2. **`ready` 是派生值,不落盘。** `pending` 且 deps 全 `done` 即 ready。存下来就有两份真相。
 3. **依赖被 `cancelled` 不算放行。** 前提没了就该有人显式改依赖,不能让任务在半截地基上开工。
 4. **`done` 是终态。** 要改就新建任务,不改历史。只有 `failed` 能退回 `pending` 重试。
@@ -120,13 +120,13 @@ fs.cpSync(src, dst, { recursive: true, mode: fs.constants.COPYFILE_FICLONE_FORCE
 
 ---
 
-## 四、上一轮探索的产物(已删,结论留档)
+## 四、早期原型留下的结论
 
-先做过一个 `packages/orca-bridge`(把外部 tmux PTY 注册成 Orca worker),
-按用户"不依赖 Orca"的要求**已整包删除**。其中三条结论对自研仍然有用:
+早期做过把外部 tmux PTY 注册为 worker 的桥接原型,现已删除。三条结论继续用于
+Prospero 自研实现:
 
-1. **当前 Orca 通过 Claude/Codex 等原生 hooks/IPC 上报状态，不从 terminal title 推断。**
-   Prospero 同样坚持显式生命周期；session idle 只作提示，不自动完成 Task。
+1. **状态应由 Agent 原生 hooks/IPC 上报,不从 terminal title 推断。**
+   Prospero 坚持显式生命周期；session idle 只作提示,不自动完成 Task。
 2. **tmux 的目标语法不一致且静默失败**:`set-option`/`show-options`/`resize-window`
    **不认** `=name` 精确匹配前缀(报 no such session 且退出码非 0 容易被吞);
    `capture-pane`/`send-keys` 收的是 pane 目标,要先 `list-panes` 问出 `%id`。
