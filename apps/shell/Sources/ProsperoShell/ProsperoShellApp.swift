@@ -80,7 +80,7 @@ struct ProsperoShellApp: App {
           daemon.startIfNeeded()
         }
     }
-    .defaultSize(width: 1040, height: 700)
+    .defaultSize(width: 1320, height: 760)
     .windowStyle(.titleBar)
 
     Window("配对新设备", id: "pairing") {
