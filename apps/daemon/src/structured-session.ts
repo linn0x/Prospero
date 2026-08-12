@@ -8,6 +8,7 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { DEFAULT_POLICY } from "./approval-policy.js";
+import { readChunk } from "./fs-ops.js";
 import type {
   AdapterResumeState,
   AgentModeCatalog,
@@ -56,6 +57,8 @@ const MAX_TOOL_ENTRIES = 200;
 const MAX_MESSAGE_QUEUE = 50;
 
 interface QueuedAttachmentRef {
+  /** 仅在本会话附件目录中有意义的文件名；不会暴露绝对路径。 */
+  id: string;
   mimeType: Attachment["mimeType"];
   path: string;
   name?: string;
@@ -368,6 +371,25 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
       : { output: full, truncated: false };
   }
 
+  /** 已发图片按需分块读取；先以 user.message 中的索引授权，再落到会话专属目录。 */
+  async attachmentChunk(
+    msgId: string,
+    attachmentId: string,
+    offset: number,
+    length: number,
+  ): Promise<{ data: Buffer; total: number; eof: boolean; mimeType: Attachment["mimeType"] } | null> {
+    const message = [...this.log]
+      .reverse()
+      .find((body) => body.kind === "user.message" && body.msgId === msgId);
+    const attachment = message?.kind === "user.message"
+      ? message.attachments?.find((candidate) => candidate.id === attachmentId)
+      : undefined;
+    if (!attachment) return null;
+    const root = path.join(prosperoHome(), "attachments", this.id);
+    const chunk = await readChunk(root, attachment.id, offset, length);
+    return { ...chunk, mimeType: attachment.mimeType };
+  }
+
   /** 适配器登记完整输出;摘要仍走事件,全文按需拉取 */
   recordToolOutput(callId: string, output: string): void {
     if (this.toolOutputs.size > MAX_TOOL_ENTRIES) {
@@ -657,7 +679,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
           const steered =
             (await this.adapter.steer?.(prepared.text, forAdapter, prepared.skills)) ?? false;
           if (steered) {
-            this.recordUserMessage(queued.displayText);
+            this.recordUserMessage(queued.displayText, queued.attachments);
             return;
           }
         } catch {
@@ -716,13 +738,13 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
       if (index < 0) {
         // 另一个客户端可能在 RPC 等待期间点了删除；已经 steer 成功的内容无法撤回，
         // 聊天审计仍必须如实记录。
-        if (steered) this.recordUserMessage(initial.displayText);
+        if (steered) this.recordUserMessage(initial.displayText, initial.attachments);
         return steered;
       }
       const [item] = this.messageQueue.splice(index, 1);
       if (!item) return steered;
       if (steered) {
-        this.recordUserMessage(item.displayText);
+        this.recordUserMessage(item.displayText, item.attachments);
       } else {
         item.kind = "guide";
         this.messageQueue.unshift(item);
@@ -740,22 +762,18 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
   private async dispatchNow(text: string, attachments?: Attachment[]): Promise<void> {
     let outgoing = text;
     let forAdapter = attachments;
-
-    if (attachments && attachments.length > 0 && this.adapter.acceptsImages !== true) {
+    const refs = attachments?.length ? await this.persistAttachments(attachments) : [];
+    if (refs.length > 0 && this.adapter.acceptsImages !== true) {
       // 后端吃不了图就落盘,把绝对路径并进文本 —— 有读文件能力的 agent
       // 照样能看到内容。写进 ~/.prospero 而不是仓库里:附件是会话产物,
       // 不该出现在用户的 git status 里。
-      const paths = await this.persistAttachments(attachments);
-      outgoing = [text, ...paths.map((p) => `[附件] ${p}`)].filter((x) => x.length > 0).join("\n");
+      outgoing = [text, ...refs.map((ref) => `[附件] ${ref.path}`)]
+        .filter((x) => x.length > 0)
+        .join("\n");
       forAdapter = undefined;
     }
-
-    // 用户消息本地登记,保证 attach 快照里能看到自己发过什么
-    const label =
-      attachments && attachments.length > 0
-        ? `${text}${text.length > 0 ? " " : ""}[${String(attachments.length)} 张图]`
-        : text;
-    this.recordUserMessage(label);
+    // 用户消息本地登记,保证 attach 快照里能看到自己发过什么。
+    this.recordUserMessage(text, refs);
     this.busySince = Date.now(); // 新一轮开始重新计时
     this.setStatus("running");
     const prepared = await this.prepareForAdapter(outgoing);
@@ -770,8 +788,21 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     }
   }
 
-  private recordUserMessage(text: string): void {
-    this.record({ kind: "user.message", msgId: `u_${String(this.evSeq + 1)}`, text });
+  private recordUserMessage(text: string, attachments: QueuedAttachmentRef[] = []): void {
+    this.record({
+      kind: "user.message",
+      msgId: `u_${String(this.evSeq + 1)}`,
+      text,
+      ...(attachments.length > 0
+        ? {
+            attachments: attachments.map((attachment) => ({
+              id: attachment.id,
+              mimeType: attachment.mimeType,
+              ...(attachment.name ? { name: attachment.name } : {}),
+            })),
+          }
+        : {}),
+    });
   }
 
   private async prepareQueuedMessage(
@@ -779,25 +810,14 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     attachments: Attachment[] | undefined,
     kind: QueuedChatPersistent["kind"],
   ): Promise<QueuedChatPersistent> {
-    const paths = attachments?.length ? await this.persistAttachments(attachments) : [];
-    const refs: QueuedAttachmentRef[] = paths.map((file, index) => {
-      const attachment = attachments?.[index];
-      return {
-        mimeType: attachment?.mimeType ?? "image/png",
-        path: file,
-        ...(attachment?.name ? { name: attachment.name } : {}),
-      };
-    });
+    const refs = attachments?.length ? await this.persistAttachments(attachments) : [];
     const attachmentCount = attachments?.length ?? 0;
     return {
       id: randomUUID(),
-      displayText:
-        attachmentCount > 0
-          ? `${text}${text.length > 0 ? " " : ""}[${String(attachmentCount)} 张图]`
-          : text,
+      displayText: text,
       outgoingText:
         attachmentCount > 0 && this.adapter.acceptsImages !== true
-          ? [text, ...paths.map((file) => `[附件] ${file}`)]
+          ? [text, ...refs.map((ref) => `[附件] ${ref.path}`)]
               .filter((part) => part.length > 0)
               .join("\n")
           : text,
@@ -843,7 +863,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
 
   private async dispatchQueued(item: QueuedChatPersistent): Promise<void> {
     const attachments = await this.queuedAttachmentsForAdapter(item);
-    this.recordUserMessage(item.displayText);
+    this.recordUserMessage(item.displayText, item.attachments);
     this.busySince = Date.now();
     this.setStatus("running");
     const prepared = await this.prepareForAdapter(item.outgoingText);
@@ -896,24 +916,25 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     }
   }
 
-  /** 把附件写进 ~/.prospero/attachments/<sid>/,返回绝对路径 */
-  private async persistAttachments(attachments: Attachment[]): Promise<string[]> {
+  /** 把附件写进 ~/.prospero/attachments/<sid>/；事件里只保存文件名索引。 */
+  private async persistAttachments(attachments: Attachment[]): Promise<QueuedAttachmentRef[]> {
     const dir = path.join(prosperoHome(), "attachments", this.id);
     await mkdir(dir, { recursive: true });
-    const out: string[] = [];
+    const out: QueuedAttachmentRef[] = [];
     for (let i = 0; i < attachments.length; i++) {
       const a = attachments[i];
       if (!a) continue;
       const ext = a.mimeType.split("/")[1] ?? "png";
-      // 先去掉一切非 [字母数字._-],再把连续的点压成一个下划线。
-      // 只做前一步的话 "../../evil" 会变成 ".._.._evil" —— 逃不出目录(路径
-      // 分隔符已经没了),但文件名里挂着 ".." 只会让人怀疑到底安不安全。
-      const safe = (a.name ?? `image-${String(i + 1)}`)
-        .replace(/[^\w.-]/g, "_")
-        .replace(/\.{2,}/g, "_");
-      const file = path.join(dir, `${String(Date.now())}-${safe}.${ext}`);
+      // 文件名由 UUID 生成，既不能越出会话目录，也避免把原始文件名暴露为路径。
+      const id = `${randomUUID()}.${ext}`;
+      const file = path.join(dir, id);
       await writeFile(file, Buffer.from(a.dataB64, "base64"));
-      out.push(file);
+      out.push({
+        id,
+        mimeType: a.mimeType,
+        path: file,
+        ...(a.name ? { name: a.name } : {}),
+      });
     }
     return out;
   }

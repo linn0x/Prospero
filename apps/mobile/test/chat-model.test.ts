@@ -3,6 +3,7 @@ import type { AgentEventBody } from "@prospero/protocol";
 import {
   applyEvent,
   applyEvents,
+  applyToolOutput,
   foldChatItems,
   itemsForAgent,
   pendingInteractions,
@@ -45,7 +46,7 @@ describe("chat-model 事件折叠", () => {
     ]);
     const a = items[0] as AssistantItem;
     expect(a.done).toBe(true);
-    expect(a.finish).toEqual({ costUsd: 0.002, outputTokens: 7 });
+    expect(a.finish).toEqual({ reason: "stop", costUsd: 0.002, outputTokens: 7 });
   });
 
   it("turn.end 汇总本轮文件改动，同一路径采用最终 diff", () => {
@@ -88,6 +89,21 @@ describe("chat-model 事件折叠", () => {
       ],
       additions: 7,
       deletions: 2,
+    });
+  });
+
+  it("用户图片只保留可按需读取的轻量索引，不进入文本内容", () => {
+    const items = applyEvent([], ev({
+      kind: "user.message",
+      msgId: "u-image",
+      text: "这个报错怎么修？",
+      attachments: [{ id: "image-1.png", mimeType: "image/png", name: "crash.png" }],
+    }));
+    expect(items[0]).toMatchObject({
+      type: "user",
+      msgId: "u-image",
+      text: "这个报错怎么修？",
+      attachments: [{ id: "image-1.png", name: "crash.png" }],
     });
   });
 
@@ -139,6 +155,18 @@ describe("chat-model 事件折叠", () => {
     const tools = items.filter((i): i is ToolItem => i.type === "tool");
     expect(tools.map((t) => t.state)).toEqual(["running", "success"]);
     expect(tools[1]!.result).toBe("/tmp");
+  });
+
+  it("按需工具输出会保留服务端截断标记", () => {
+    const started = applyEvent([], ev({
+      kind: "tool.start", msgId: "m1", callId: "c1", tool: "bash", summary: "npm test",
+    }));
+    const items = applyToolOutput(started, "c1", "very long output", true);
+    expect(items[0]).toMatchObject({
+      type: "tool",
+      fullOutput: "very long output",
+      outputTruncated: true,
+    });
   });
 
   it("审批解决后卡片转只读并退出待办", () => {

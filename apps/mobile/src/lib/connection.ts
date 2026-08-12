@@ -13,6 +13,7 @@ import { AppState, Platform } from "react-native";
 import { randomUUID } from "expo-crypto";
 import {
   CAPABILITY_AGENT_ACCOUNTS,
+  CAPABILITY_CHAT_ATTACHMENT_PREVIEWS,
   CAPABILITY_ORCHESTRATION_AUTOMATION,
   CAPABILITY_ORCHESTRATION_GRAPH,
   CAPABILITY_ORCHESTRATION_LIFECYCLE,
@@ -140,6 +141,7 @@ export class HostConnection {
     if (capability === CAPABILITY_ORCHESTRATION_MANUAL) return version >= 8;
     if (capability === CAPABILITY_SUBAGENT_HISTORY) return version >= 9;
     if (capability === CAPABILITY_AGENT_ACCOUNTS) return version >= 10;
+    if (capability === CAPABILITY_CHAT_ATTACHMENT_PREVIEWS) return version >= 11;
     return false;
   }
 
@@ -173,6 +175,10 @@ export class HostConnection {
 
   get supportsAgentAccounts(): boolean {
     return this.supportsCapability(CAPABILITY_AGENT_ACCOUNTS);
+  }
+
+  get supportsChatAttachmentPreviews(): boolean {
+    return this.supportsCapability(CAPABILITY_CHAT_ATTACHMENT_PREVIEWS);
   }
 
   start(): void {
@@ -515,6 +521,9 @@ export class HostConnection {
       case "tool.output":
         this.events.emit("toolOutput", msg);
         return;
+      case "chat.attachment.chunk":
+        this.resolveFs(msg);
+        return;
       case "orchestration.snapshot":
         this.events.emit("orchestrationSnapshot", msg);
         return;
@@ -581,6 +590,8 @@ export class HostConnection {
     const responsePath =
       msg.type === "chat.suggestions"
         ? `#chat.suggestions:${msg.requestId}`
+        : msg.type === "chat.attachment.chunk"
+          ? `#chat.attachment:${msg.requestId}`
         : msg.type === "subagent.history.result"
           ? `#subagent.history:${msg.requestId}`
         : msg.type === "agent.models"
@@ -1147,6 +1158,27 @@ export class HostConnection {
   /** 拉取某次工具调用的完整输出(卡片展开时) */
   getToolOutput(sid: string, callId: string): void {
     this.send({ type: "tool.output.get", sid, callId });
+  }
+
+  /** 用户历史图片按需分块读取，避免聊天快照携带原图。 */
+  chatAttachmentChunk(
+    sid: string,
+    msgId: string,
+    attachmentId: string,
+    offset: number,
+    length: number,
+  ): Promise<Extract<S2CMessage, { type: "chat.attachment.chunk" }>> {
+    if (!this.supportsChatAttachmentPreviews) {
+      return Promise.reject(new Error("请升级 Mac 端以查看历史图片"));
+    }
+    const requestId = randomUUID();
+    return this.fsRequest(
+      sid,
+      `#chat.attachment:${requestId}`,
+      { type: "chat.attachment.get", sid, msgId, attachmentId, offset, length, requestId },
+      30_000,
+      false,
+    );
   }
 
   respondPermission(sid: string, reqId: string, reply: PermissionReply): void {

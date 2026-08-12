@@ -18,6 +18,17 @@ describe("message schemas", () => {
     expect(parseC2S({ type: "workspace.list", path: "Projects/prospero" })).toMatchObject({
       path: "Projects/prospero",
     });
+    expect(
+      parseC2S({
+        type: "chat.attachment.get",
+        sid: "s",
+        msgId: "u1",
+        attachmentId: "image-1.png",
+        offset: 0,
+        length: 1024,
+        requestId: "r1",
+      }),
+    ).toMatchObject({ type: "chat.attachment.get", attachmentId: "image-1.png" });
   });
 
   it("拒绝未知类型与缺字段", () => {
@@ -55,6 +66,19 @@ describe("message schemas", () => {
         entries: [{ name: "Prospero", kind: "dir", size: 0, mtime: 1 }],
       }),
     ).toMatchObject({ type: "workspace.listing", cwd: "/Users/me/Projects" });
+    expect(
+      parseS2C({
+        type: "chat.attachment.chunk",
+        sid: "s",
+        msgId: "u1",
+        attachmentId: "image-1.png",
+        mimeType: "image/png",
+        dataB64: "aGk=",
+        total: 2,
+        eof: true,
+        requestId: "r1",
+      }),
+    ).toMatchObject({ type: "chat.attachment.chunk", eof: true });
   });
 
   it("PairingPayload 校验端口与公钥长度", () => {

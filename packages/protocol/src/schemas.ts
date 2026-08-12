@@ -368,6 +368,13 @@ export const AttachmentSchema = z.object({
   name: z.string().max(200).optional(),
 });
 
+/** 聊天历史里只保存附件索引；原图按需从 daemon 读取，避免快照暴涨。 */
+export const AgentUserAttachmentSchema = z.object({
+  id: z.string().regex(/^[A-Za-z0-9._-]+$/).min(1).max(200),
+  mimeType: z.enum(["image/jpeg", "image/png", "image/gif", "image/webp"]),
+  name: z.string().max(200).optional(),
+});
+
 /**
  * 结构化轨:发送一条用户消息。
  *
@@ -441,6 +448,17 @@ export const C2SToolOutputGetSchema = z.object({
   type: z.literal("tool.output.get"),
   sid,
   callId: z.string().min(1),
+});
+
+/** 已发送图片仅在用户滚回该消息时分块取回，不参与 chat.snapshot。 */
+export const C2SChatAttachmentGetSchema = z.object({
+  type: z.literal("chat.attachment.get"),
+  sid,
+  msgId: z.string().min(1).max(500),
+  attachmentId: z.string().regex(/^[A-Za-z0-9._-]+$/).min(1).max(200),
+  offset: z.number().int().nonnegative(),
+  length: z.number().int().min(1).max(1024 * 1024),
+  requestId: z.string().min(1).max(100),
 });
 
 export const C2SSessionAttachSchema = z.object({
@@ -870,6 +888,7 @@ export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SAgentModeSetSchema,
   C2SAgentCompactSchema,
   C2SToolOutputGetSchema,
+  C2SChatAttachmentGetSchema,
   C2STermInputSchema,
   C2STermResizeSchema,
   C2STermAckSchema,
@@ -1100,6 +1119,7 @@ export const AgentUserMessageSchema = z.object({
   kind: z.literal("user.message"),
   msgId: z.string(),
   text: z.string(),
+  attachments: z.array(AgentUserAttachmentSchema).max(6).optional(),
   agentId: z.string().min(1).max(500).optional(),
 });
 
@@ -1158,6 +1178,18 @@ export const S2CToolOutputSchema = z.object({
   output: z.string(),
   /** 即便完整输出也可能被上限截断 */
   truncated: z.boolean().optional(),
+});
+
+export const S2CChatAttachmentChunkSchema = z.object({
+  type: z.literal("chat.attachment.chunk"),
+  sid,
+  msgId: z.string().min(1).max(500),
+  attachmentId: z.string().regex(/^[A-Za-z0-9._-]+$/).min(1).max(200),
+  mimeType: z.enum(["image/jpeg", "image/png", "image/gif", "image/webp"]),
+  dataB64: z.string(),
+  total: z.number().int().nonnegative(),
+  eof: z.boolean(),
+  requestId: z.string().min(1).max(100),
 });
 
 export const S2CChatSuggestionsSchema = z.object({
@@ -1433,6 +1465,7 @@ export const S2CMessageSchema = z.discriminatedUnion("type", [
   S2CAgentModesSchema,
   S2CAgentControlResultSchema,
   S2CToolOutputSchema,
+  S2CChatAttachmentChunkSchema,
   S2CPermissionRequestSchema,
   S2CErrorSchema,
   S2CWorkspaceListingSchema,
@@ -1523,8 +1556,10 @@ export type C2SAgentModesGet = z.infer<typeof C2SAgentModesGetSchema>;
 export type C2SAgentModeSet = z.infer<typeof C2SAgentModeSetSchema>;
 export type C2SAgentCompact = z.infer<typeof C2SAgentCompactSchema>;
 export type C2SToolOutputGet = z.infer<typeof C2SToolOutputGetSchema>;
+export type C2SChatAttachmentGet = z.infer<typeof C2SChatAttachmentGetSchema>;
 export type FileDiff = z.infer<typeof FileDiffSchema>;
 export type S2CToolOutput = z.infer<typeof S2CToolOutputSchema>;
+export type S2CChatAttachmentChunk = z.infer<typeof S2CChatAttachmentChunkSchema>;
 export type C2STermInput = z.infer<typeof C2STermInputSchema>;
 export type C2STermResize = z.infer<typeof C2STermResizeSchema>;
 export type C2STermAck = z.infer<typeof C2STermAckSchema>;
@@ -1535,6 +1570,7 @@ export type C2SSubagentSend = z.infer<typeof C2SSubagentSendSchema>;
 export type C2SSubagentHistoryGet = z.infer<typeof C2SSubagentHistoryGetSchema>;
 export type C2SMessage = z.infer<typeof C2SMessageSchema>;
 export type Attachment = z.infer<typeof AttachmentSchema>;
+export type AgentUserAttachment = z.infer<typeof AgentUserAttachmentSchema>;
 export type UsageWindow = z.infer<typeof UsageWindowSchema>;
 export type UsageAccount = z.infer<typeof UsageAccountSchema>;
 export type OrchestrationAutomation = z.infer<typeof OrchestrationAutomationSchema>;

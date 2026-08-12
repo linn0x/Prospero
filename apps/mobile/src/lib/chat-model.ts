@@ -9,6 +9,7 @@ import type {
   AgentEventBody,
   AgentQuestion,
   AgentQuestionAnswer,
+  AgentUserAttachment,
   FileDiff,
   PermissionReply,
   SubagentInfo,
@@ -18,7 +19,9 @@ import type {
 export interface UserItem {
   type: "user";
   key: string;
+  msgId: string;
   text: string;
+  attachments?: AgentUserAttachment[];
   agentId?: string;
 }
 
@@ -29,7 +32,7 @@ export interface AssistantItem {
   text: string;
   reasoning: string;
   /** 本轮结束后的用量信息 */
-  finish?: { costUsd?: number; inputTokens?: number; outputTokens?: number };
+  finish?: { reason?: string; costUsd?: number; inputTokens?: number; outputTokens?: number };
   done: boolean;
   agentId?: string;
 }
@@ -47,6 +50,8 @@ export interface ToolItem {
   hasMore?: boolean;
   /** 已拉取的完整输出 */
   fullOutput?: string;
+  /** 服务端在安全上限处截断了按需拉取的输出。 */
+  outputTruncated?: boolean;
   agentId?: string;
 }
 
@@ -137,7 +142,17 @@ export function applyEvent(items: ChatItem[], ev: AgentEventBody): ChatItem[] {
   const agentField = eventAgentId ? { agentId: eventAgentId } : {};
   switch (ev.kind) {
     case "user.message":
-      return [...items, { type: "user", key: scopedKey("u", ev.msgId), text: ev.text, ...agentField }];
+      return [
+        ...items,
+        {
+          type: "user",
+          key: scopedKey("u", ev.msgId),
+          msgId: ev.msgId,
+          text: ev.text,
+          ...(ev.attachments?.length ? { attachments: ev.attachments } : {}),
+          ...agentField,
+        },
+      ];
 
     case "text.delta":
     case "reasoning.delta": {
@@ -322,6 +337,7 @@ export function applyEvent(items: ChatItem[], ev: AgentEventBody): ChatItem[] {
       if (idx >= 0) {
         const prev = items[idx] as AssistantItem;
         const finish: AssistantItem["finish"] = {};
+        if (ev.finish !== undefined) finish.reason = ev.finish;
         if (ev.costUsd !== undefined) finish.costUsd = ev.costUsd;
         if (ev.inputTokens !== undefined) finish.inputTokens = ev.inputTokens;
         if (ev.outputTokens !== undefined) finish.outputTokens = ev.outputTokens;
@@ -363,11 +379,16 @@ export function applyToolOutput(
   items: ChatItem[],
   callId: string,
   output: string,
+  truncated = false,
 ): ChatItem[] {
   const idx = findLastIndex(items, (i) => i.type === "tool" && i.callId === callId);
   if (idx < 0) return items;
   const prev = items[idx] as ToolItem;
-  return replaceAt(items, idx, { ...prev, fullOutput: output });
+  return replaceAt(items, idx, {
+    ...prev,
+    fullOutput: output,
+    ...(truncated ? { outputTruncated: true } : {}),
+  });
 }
 
 /** 是否有待回应的审批(驱动列表徽标与输入区提示) */

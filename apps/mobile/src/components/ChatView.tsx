@@ -8,8 +8,10 @@ import * as Haptics from "expo-haptics";
 import {
   ActivityIndicator,
   FlatList,
+  Image,
   Platform,
   Pressable,
+  ScrollView,
   StyleSheet,
   Text,
   TextInput,
@@ -21,6 +23,7 @@ import {
   type AgentEventBody,
   type AgentKind,
   type AgentQuestionAnswer,
+  type AgentUserAttachment,
   type PermissionReply,
   type SessionStatus,
   type SubagentStatus,
@@ -78,6 +81,7 @@ interface Props {
 
 const PROJECT_IMAGE_CHUNK = 192 * 1024;
 const MAX_PROJECT_IMAGE_BYTES = 6 * 1024 * 1024;
+type UserAttachmentLoader = (msgId: string, attachment: AgentUserAttachment) => Promise<string>;
 
 function projectImageMime(path: string): string {
   const extension = path.slice(path.lastIndexOf(".") + 1).toLowerCase();
@@ -110,6 +114,7 @@ export const ChatView = memo(function ChatView({
   } | null>(null);
   const listRef = useRef<FlatList<ChatDisplayItem>>(null);
   const imageCacheRef = useRef(new Map<string, Promise<string>>());
+  const attachmentCacheRef = useRef(new Map<string, Promise<string>>());
   const evSeqRef = useRef(0);
   const atBottomRef = useRef(true);
   const [hasUnread, setHasUnread] = useState(false);
@@ -159,6 +164,57 @@ export const ChatView = memo(function ChatView({
     [conn, sid],
   );
 
+  const loadUserAttachment = useCallback<UserAttachmentLoader>(
+    (msgId, attachment) => {
+      const key = `${sid}\u0000${msgId}\u0000${attachment.id}`;
+      const cached = attachmentCacheRef.current.get(key);
+      if (cached) return cached;
+      const request = (async (): Promise<string> => {
+        let offset = 0;
+        let total: number | null = null;
+        let bytes: Uint8Array | null = null;
+        for (;;) {
+          const chunk = await conn.chatAttachmentChunk(
+            sid,
+            msgId,
+            attachment.id,
+            offset,
+            PROJECT_IMAGE_CHUNK,
+          );
+          if (chunk.mimeType !== attachment.mimeType) throw new Error("图片类型不匹配");
+          if (total === null) {
+            total = chunk.total;
+            if (total <= 0) throw new Error("图片文件为空");
+            if (total > MAX_PROJECT_IMAGE_BYTES) throw new Error("图片超过 6 MB");
+            bytes = new Uint8Array(total);
+          } else if (chunk.total !== total) {
+            throw new Error("读取图片时文件大小发生了变化");
+          }
+          const part = fromB64(chunk.dataB64);
+          if (!bytes || offset + part.byteLength > bytes.byteLength) {
+            throw new Error("图片分块响应无效");
+          }
+          bytes.set(part, offset);
+          offset += part.byteLength;
+          if (chunk.eof) break;
+          if (part.byteLength === 0) throw new Error("图片传输提前中断");
+        }
+        if (!bytes || total === null || offset !== total) throw new Error("图片传输不完整");
+        return `data:${attachment.mimeType};base64,${toB64(bytes)}`;
+      })().catch((error: unknown) => {
+        attachmentCacheRef.current.delete(key);
+        throw error;
+      });
+      if (attachmentCacheRef.current.size >= 12) {
+        const oldest = attachmentCacheRef.current.keys().next().value as string | undefined;
+        if (oldest) attachmentCacheRef.current.delete(oldest);
+      }
+      attachmentCacheRef.current.set(key, request);
+      return request;
+    },
+    [conn, sid],
+  );
+
   useEffect(() => {
     // 文本 delta 往往几十次/秒。逐条 setState 会反复解析 Markdown、布局列表并
     // 启动滚动动画;按约一帧半合并后仍像实时打字,但 JS/原生桥压力小很多。
@@ -196,7 +252,7 @@ export const ChatView = memo(function ChatView({
       if (m.sid !== sid) return;
       // tool.start 可能还在 32ms 合并窗里;先提交它,再回填完整输出。
       if (queued.length > 0) flush();
-      setItems((prev) => applyToolOutput(prev, m.callId, m.output));
+      setItems((prev) => applyToolOutput(prev, m.callId, m.output, m.truncated === true));
     });
     const attach = (): void => conn.attach(sid, evSeqRef.current || undefined);
     const offConn = conn.events.on("connected", attach);
@@ -365,7 +421,7 @@ export const ChatView = memo(function ChatView({
         renderItem={({ item }) => {
           switch (item.type) {
             case "user":
-              return <UserBubble item={item} />;
+              return <UserBubble item={item} loadAttachment={loadUserAttachment} />;
             case "assistant":
               return (
                 <AssistantBubble
@@ -509,14 +565,76 @@ function useCopy(): (text: string, what?: string) => void {
   }, []);
 }
 
-const UserBubble = memo(function UserBubble({ item }: { item: UserItem }) {
+const UserBubble = memo(function UserBubble({
+  item,
+  loadAttachment,
+}: {
+  item: UserItem;
+  loadAttachment: UserAttachmentLoader;
+}) {
   return (
     <View style={styles.userRow}>
       <View style={styles.userBubble}>
-        <Text style={styles.userText} selectable>
-          {item.text}
-        </Text>
+        {item.text.length > 0 && (
+          <Text style={styles.userText} selectable>
+            {item.text}
+          </Text>
+        )}
+        {item.attachments && item.attachments.length > 0 && (
+          <View style={styles.userAttachments}>
+            {item.attachments.map((attachment) => (
+              <UserAttachmentPreview
+                key={attachment.id}
+                msgId={item.msgId}
+                attachment={attachment}
+                loadAttachment={loadAttachment}
+              />
+            ))}
+          </View>
+        )}
       </View>
+    </View>
+  );
+});
+
+const UserAttachmentPreview = memo(function UserAttachmentPreview({
+  msgId,
+  attachment,
+  loadAttachment,
+}: {
+  msgId: string;
+  attachment: AgentUserAttachment;
+  loadAttachment: UserAttachmentLoader;
+}) {
+  const [uri, setUri] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    let alive = true;
+    void loadAttachment(msgId, attachment)
+      .then((value) => {
+        if (alive) setUri(value);
+      })
+      .catch((reason: unknown) => {
+        if (alive) setError(reason instanceof Error ? reason.message : String(reason));
+      });
+    return () => {
+      alive = false;
+    };
+  }, [attachment, loadAttachment, msgId]);
+
+  if (uri) {
+    return <Image source={{ uri }} style={styles.userAttachmentImage} resizeMode="cover" />;
+  }
+  return (
+    <View style={styles.userAttachmentPlaceholder}>
+      {error ? (
+        <Icon name="photo" size={16} color="#C8D7FF" />
+      ) : (
+        <ActivityIndicator size="small" color="#E5EEFF" />
+      )}
+      <Text style={styles.userAttachmentLabel} numberOfLines={2}>
+        {error ? "图片不可用" : attachment.name || "正在加载图片…"}
+      </Text>
     </View>
   );
 });
@@ -539,7 +657,9 @@ const AssistantBubble = memo(function AssistantBubble({
   const [showReasoning, setShowReasoning] = useState(false);
   const copy = useCopy();
   const cost = item.finish?.costUsd;
+  const input = item.finish?.inputTokens;
   const out = item.finish?.outputTokens;
+  const finish = finishLabel(item.finish?.reason);
   return (
     <View style={styles.assistantRow}>
       {item.reasoning.length > 0 && (
@@ -569,10 +689,16 @@ const AssistantBubble = memo(function AssistantBubble({
           <Text style={styles.thinking}>正在思考</Text>
         </View>
       )}
-      {item.done && (cost !== undefined || out !== undefined) && (
+      {item.done && (finish !== null || cost !== undefined || input !== undefined || out !== undefined) && (
         <Text style={styles.usage}>
-          {out !== undefined ? `${String(out)} tokens` : ""}
-          {cost !== undefined && cost > 0 ? ` · $${cost.toFixed(4)}` : ""}
+          {[
+            finish,
+            input !== undefined ? `输入 ${formatTokenCount(input)}` : null,
+            out !== undefined ? `输出 ${formatTokenCount(out)}` : null,
+            cost !== undefined && cost > 0 ? `$${cost.toFixed(4)}` : null,
+          ]
+            .filter((value): value is string => value !== null)
+            .join(" · ")}
         </Text>
       )}
       {item.text.length > 0 && (
@@ -592,6 +718,22 @@ const AssistantBubble = memo(function AssistantBubble({
 
 const stateLabel = { running: "运行中", success: "完成", failed: "失败" } as const;
 const stateColor = { running: color.warn, success: color.success, failed: color.danger } as const;
+
+function formatTokenCount(value: number): string {
+  if (value < 1_000) return `${String(value)} tokens`;
+  if (value < 10_000) return `${(value / 1_000).toFixed(1)}k tokens`;
+  return `${Math.round(value / 1_000)}k tokens`;
+}
+
+function finishLabel(reason?: string): string | null {
+  if (!reason) return null;
+  const value = reason.toLowerCase();
+  if (["stop", "completed", "end_turn", "success"].includes(value)) return null;
+  if (value.includes("interrupt") || value.includes("cancel")) return "已中断";
+  if (value.includes("length") || value.includes("token")) return "达到输出上限";
+  if (value.includes("error") || value.includes("fail")) return "未完成";
+  return `结束：${reason}`;
+}
 
 const ToolCard = memo(function ToolCard({
   item,
@@ -636,7 +778,7 @@ const ToolCard = memo(function ToolCard({
             {body !== undefined && body.length > 0 ? (expanded ? " ▾" : " ▸") : ""}
           </Text>
         </View>
-        {item.input.length > 0 && !item.diff && (
+        {item.input.length > 0 && (
           <Text style={styles.toolInput} numberOfLines={expanded ? undefined : 2}>
             {item.input}
           </Text>
@@ -644,10 +786,25 @@ const ToolCard = memo(function ToolCard({
       </Pressable>
       {item.diff && <DiffView diff={item.diff} />}
       {expanded && body !== undefined && body.length > 0 && (
-        <Text style={styles.toolResult} selectable>
-          {body}
-          {item.hasMore === true && item.fullOutput === undefined ? "\n(正在拉取完整输出…)" : ""}
-        </Text>
+        <ScrollView
+          horizontal
+          nestedScrollEnabled
+          showsHorizontalScrollIndicator={false}
+          style={styles.toolResultScroll}
+        >
+          <Text style={styles.toolResult} selectable>
+            {body}
+          </Text>
+        </ScrollView>
+      )}
+      {expanded && item.hasMore === true && item.fullOutput === undefined && (
+        <View style={styles.toolLoading}>
+          <ActivityIndicator size="small" color={color.textFaint} />
+          <Text style={styles.toolLoadingText}>正在拉取完整输出…</Text>
+        </View>
+      )}
+      {expanded && item.outputTruncated === true && (
+        <Text style={styles.toolTruncated}>完整输出因大小限制已截断</Text>
       )}
     </View>
   );
@@ -828,6 +985,7 @@ const QuestionCard = memo(function QuestionCard({
 }) {
   const [selected, setSelected] = useState<Record<string, string[]>>({});
   const [other, setOther] = useState<Record<string, string>>({});
+  const [visiblePreviews, setVisiblePreviews] = useState<Record<string, boolean>>({});
   const resolved = item.answers !== undefined || item.cancelled === true;
   const answers = item.questions.map((question): AgentQuestionAnswer => {
     const values = [...(selected[question.id] ?? [])];
@@ -877,28 +1035,59 @@ const QuestionCard = memo(function QuestionCard({
                 <View style={styles.questionOptions}>
                   {question.options.map((option) => {
                     const active = (selected[question.id] ?? []).includes(option.label);
+                    const previewKey = `${question.id}\u0000${option.label}`;
+                    const showPreview = visiblePreviews[previewKey] === true;
                     return (
-                      <Pressable
+                      <View
                         key={option.label}
-                        style={({ pressed }) => [
+                        style={[
                           styles.questionOption,
                           active && styles.questionOptionActive,
-                          pressed && styles.inlinePressed,
                         ]}
-                        onPress={() => toggle(question.id, option.label, question.multiSelect)}
-                        accessibilityRole={question.multiSelect ? "checkbox" : "radio"}
-                        accessibilityState={{ checked: active }}
                       >
-                        <View style={[styles.questionChoice, active && styles.questionChoiceActive]} />
-                        <View style={styles.questionOptionCopy}>
-                          <Text style={[styles.questionOptionLabel, active && styles.questionOptionLabelActive]}>
-                            {option.label}
-                          </Text>
-                          {option.description && (
-                            <Text style={styles.questionOptionDescription}>{option.description}</Text>
-                          )}
-                        </View>
-                      </Pressable>
+                        <Pressable
+                          style={({ pressed }) => [styles.questionOptionSelect, pressed && styles.inlinePressed]}
+                          onPress={() => toggle(question.id, option.label, question.multiSelect)}
+                          accessibilityRole={question.multiSelect ? "checkbox" : "radio"}
+                          accessibilityState={{ checked: active }}
+                        >
+                          <View style={[styles.questionChoice, active && styles.questionChoiceActive]} />
+                          <View style={styles.questionOptionCopy}>
+                            <Text style={[styles.questionOptionLabel, active && styles.questionOptionLabelActive]}>
+                              {option.label}
+                            </Text>
+                            {option.description && (
+                              <Text style={styles.questionOptionDescription}>{option.description}</Text>
+                            )}
+                          </View>
+                        </Pressable>
+                        {option.preview && (
+                          <Pressable
+                            style={({ pressed }) => [styles.questionPreviewToggle, pressed && styles.inlinePressed]}
+                            onPress={() =>
+                              setVisiblePreviews((previous) => ({
+                                ...previous,
+                                [previewKey]: !showPreview,
+                              }))
+                            }
+                            accessibilityRole="button"
+                            accessibilityState={{ expanded: showPreview }}
+                            accessibilityLabel={`${showPreview ? "收起" : "查看"}${option.label} 的预览`}
+                          >
+                            <Icon
+                              name={showPreview ? "chevron.down" : "chevron.right"}
+                              size={10}
+                              color={color.accent}
+                            />
+                            <Text style={styles.questionPreviewToggleText}>
+                              {showPreview ? "收起预览" : "查看预览"}
+                            </Text>
+                          </Pressable>
+                        )}
+                        {option.preview && showPreview && (
+                          <QuestionOptionPreview source={option.preview} />
+                        )}
+                      </View>
                     );
                   })}
                 </View>
@@ -944,6 +1133,33 @@ const QuestionCard = memo(function QuestionCard({
     </View>
   );
 });
+
+/** Claude 的问题选项可带 Markdown 或 HTML；HTML 在 RN 中转成安全的可读文本。 */
+const QuestionOptionPreview = memo(function QuestionOptionPreview({ source }: { source: string }) {
+  const markdown = useMemo(() => questionPreviewMarkdown(source), [source]);
+  return (
+    <View style={styles.questionPreview}>
+      <Markdown source={markdown} />
+    </View>
+  );
+});
+
+function questionPreviewMarkdown(source: string): string {
+  if (!/<\/?[a-z][^>]*>/i.test(source)) return source;
+  return source
+    .replace(/\r\n?/g, "\n")
+    .replace(/<(?:br|\/p|\/div|\/section|\/article|\/h[1-6]|\/li|\/tr|\/(?:td|th)|\/pre)\b[^>]*>/gi, "\n")
+    .replace(/<li\b[^>]*>/gi, "- ")
+    .replace(/<[^>]*>/g, "")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
 
 const subagentStateLabel: Record<SubagentStatus, string> = {
   starting: "启动中",
@@ -1157,8 +1373,27 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     paddingVertical: 10,
     maxWidth: "86%",
+    gap: 8,
   },
   userText: { color: "#fff", fontSize: 15, lineHeight: 22 },
+  userAttachments: { flexDirection: "row", flexWrap: "wrap", gap: 7 },
+  userAttachmentImage: {
+    width: 168,
+    height: 126,
+    borderRadius: 8,
+    backgroundColor: "#20345F",
+  },
+  userAttachmentPlaceholder: {
+    width: 168,
+    height: 92,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    backgroundColor: "#294375",
+  },
+  userAttachmentLabel: { color: "#E5EEFF", fontSize: 10.5, lineHeight: 14, textAlign: "center" },
 
   assistantRow: { gap: 7, paddingHorizontal: 2 },
   thinkingRow: { flexDirection: "row", alignItems: "center", gap: 8, paddingVertical: 4 },
@@ -1206,15 +1441,21 @@ const styles = StyleSheet.create({
   diffBadge: { color: color.success, fontSize: 11, fontVariant: ["tabular-nums"] },
   toolState: { color: color.textFaint, fontSize: 11 },
   toolInput: { color: color.textDim, fontSize: 12, fontFamily: MONOSPACE_FONT, lineHeight: 18 },
+  toolResultScroll: {
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: color.border,
+  },
   toolResult: {
     color: "#A9B4A9",
     fontSize: 12,
     fontFamily: MONOSPACE_FONT,
     lineHeight: 18,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: color.border,
+    minWidth: "100%",
     paddingTop: 8,
   },
+  toolLoading: { flexDirection: "row", alignItems: "center", gap: 7, paddingTop: 2 },
+  toolLoadingText: { color: color.textFaint, fontSize: 11 },
+  toolTruncated: { color: color.warn, fontSize: 10.5, paddingTop: 1 },
 
   diffSummary: {
     backgroundColor: color.surface,
@@ -1374,15 +1615,18 @@ const styles = StyleSheet.create({
   questionText: { color: color.text, fontSize: 14, lineHeight: 20, fontWeight: "600" },
   questionOptions: { gap: 7 },
   questionOption: {
-    flexDirection: "row",
-    alignItems: "flex-start",
-    gap: 9,
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: color.border,
     borderRadius: 9,
-    padding: 9,
+    overflow: "hidden",
   },
   questionOptionActive: { borderColor: color.accent, backgroundColor: "#172035" },
+  questionOptionSelect: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 9,
+    padding: 9,
+  },
   questionChoice: {
     width: 14,
     height: 14,
@@ -1396,6 +1640,27 @@ const styles = StyleSheet.create({
   questionOptionLabel: { color: color.text, fontSize: 12.5, fontWeight: "500" },
   questionOptionLabelActive: { color: "#DCE6FF" },
   questionOptionDescription: { color: color.textDim, fontSize: 11, lineHeight: 16 },
+  questionPreviewToggle: {
+    alignSelf: "flex-start",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    marginLeft: 32,
+    marginTop: -3,
+    marginBottom: 8,
+    paddingVertical: 3,
+    paddingRight: 5,
+  },
+  questionPreviewToggleText: { color: color.accent, fontSize: 10.5, fontWeight: "600" },
+  questionPreview: {
+    marginHorizontal: 9,
+    marginBottom: 9,
+    padding: 9,
+    borderRadius: 7,
+    backgroundColor: color.bg,
+    borderLeftWidth: 2,
+    borderLeftColor: color.accentDim,
+  },
   questionInput: {
     minHeight: 38,
     maxHeight: 100,

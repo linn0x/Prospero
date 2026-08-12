@@ -83,6 +83,8 @@ struct ProjectRail: View {
 private struct ProjectRailRow: View {
   let project: LocalProjectSummary
   let selected: Bool
+  /// 独立项目栏不需要展示折叠状态；合并栏传入后才显示箭头。
+  var expanded: Bool? = nil
 
   var body: some View {
     HStack(spacing: 10) {
@@ -116,6 +118,12 @@ private struct ProjectRailRow: View {
           .padding(.horizontal, 6)
           .padding(.vertical, 3)
           .background(.orange.opacity(0.13), in: Capsule())
+      }
+      if let expanded {
+        Image(systemName: expanded ? "chevron.down" : "chevron.right")
+          .font(.caption.weight(.semibold))
+          .foregroundStyle(.tertiary)
+          .frame(width: 12)
       }
     }
     .padding(9)
@@ -201,6 +209,145 @@ struct SessionRail: View {
   }
 }
 
+/// 把「项目」和「会话」收进同一条工作台侧栏。
+///
+/// 外层已经有全局导航；再把项目与会话拆成两列，会让一个普通会话页变成四栏，
+/// 终端反而没有足够的横向空间。项目作为分组标题，会话在其下缩进展示，既保留
+/// 项目归属，也让 Mac 的主视图始终把空间留给 CLI。
+struct ProjectSessionSidebar: View {
+  let projects: [LocalProjectSummary]
+  @Binding var selectedProjectPath: String?
+  @Binding var selectedSessionID: String?
+  @Binding var expandedProjectPaths: Set<String>
+  let addProject: () -> Void
+  let newSession: (LocalProjectSummary) -> Void
+  let removeProject: (LocalProjectSummary) -> Void
+
+  private var selectedProject: LocalProjectSummary? {
+    guard let selectedProjectPath else { return nil }
+    return projects.first { $0.path == selectedProjectPath }
+  }
+
+  var body: some View {
+    VStack(spacing: 0) {
+      HStack(spacing: 8) {
+        VStack(alignment: .leading, spacing: 2) {
+          Text("项目与会话")
+            .font(.headline)
+          Text("\(projects.count) 个工作目录")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+        Spacer()
+        Button(action: addProject) {
+          Image(systemName: "folder.badge.plus")
+        }
+        .buttonStyle(.borderless)
+        .help("添加项目")
+        if let selectedProject {
+          Button {
+            newSession(selectedProject)
+          } label: {
+            Image(systemName: "plus")
+          }
+          .buttonStyle(.borderless)
+          .help("在 \(selectedProject.name) 中新建 Agent CLI")
+        }
+      }
+      .padding(.horizontal, 13)
+      .padding(.vertical, 12)
+
+      Divider()
+
+      if projects.isEmpty {
+        VStack(spacing: 10) {
+          Image(systemName: "folder")
+            .font(.title2)
+            .foregroundStyle(.tertiary)
+          Text("还没有项目")
+            .font(.callout.weight(.medium))
+          Button("选择文件夹…", action: addProject)
+            .buttonStyle(.link)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(16)
+      } else {
+        ScrollView {
+          LazyVStack(spacing: 7) {
+            ForEach(projects) { project in
+              projectSection(project)
+            }
+          }
+          .padding(9)
+        }
+      }
+    }
+    .background(Color(nsColor: .windowBackgroundColor))
+  }
+
+  @ViewBuilder
+  private func projectSection(_ project: LocalProjectSummary) -> some View {
+    let selected = selectedProjectPath == project.path
+    let expanded = expandedProjectPaths.contains(project.path)
+    VStack(spacing: 5) {
+      Button {
+        if selected {
+          if expanded {
+            expandedProjectPaths.remove(project.path)
+          } else {
+            expandedProjectPaths.insert(project.path)
+          }
+        } else {
+          selectedProjectPath = project.path
+          expandedProjectPaths.insert(project.path)
+        }
+      } label: {
+        ProjectRailRow(project: project, selected: selected, expanded: expanded)
+      }
+      .buttonStyle(.plain)
+      .help(expanded ? "收起 \(project.name) 会话" : "展开 \(project.name) 会话")
+      .contextMenu {
+        Button("新建 CLI 会话") { newSession(project) }
+        Button("在 Finder 中显示") {
+          NSWorkspace.shared.activateFileViewerSelecting([
+            URL(fileURLWithPath: project.path),
+          ])
+        }
+        Divider()
+        Button("从项目列表移除", role: .destructive) {
+          removeProject(project)
+        }
+        .disabled(!project.sessions.isEmpty)
+      }
+
+      if expanded {
+        if project.sessions.isEmpty {
+          Button("新建 CLI 会话") { newSession(project) }
+            .buttonStyle(.link)
+            .font(.caption)
+            .padding(.vertical, 8)
+        } else {
+          LazyVStack(spacing: 5) {
+            ForEach(project.sessions) { session in
+              Button {
+                selectedProjectPath = project.path
+                selectedSessionID = session.id
+              } label: {
+                SessionRailRow(
+                  session: session,
+                  selected: selectedSessionID == session.id
+                )
+              }
+              .buttonStyle(.plain)
+            }
+          }
+          .padding(.leading, 10)
+        }
+      }
+    }
+  }
+}
+
 private struct SessionRailRow: View {
   let session: RunningStatus.Session
   let selected: Bool
@@ -217,6 +364,13 @@ private struct SessionRailRow: View {
             .foregroundStyle(accent)
           if session.kind == "pty" {
             Text("CLI")
+              .font(.system(size: 8, weight: .bold, design: .rounded))
+              .foregroundStyle(.secondary)
+              .padding(.horizontal, 4)
+              .padding(.vertical, 2)
+              .background(.quaternary, in: RoundedRectangle(cornerRadius: 3))
+          } else {
+            Text("移动端对话")
               .font(.system(size: 8, weight: .bold, design: .rounded))
               .foregroundStyle(.secondary)
               .padding(.horizontal, 4)
@@ -262,6 +416,7 @@ struct LocalSessionWorkspace: View {
   let session: RunningStatus.Session
   let interrupt: () -> Void
   let kill: () -> Void
+  let launchCLI: () -> Void
   let openSubagent: (RunningStatus.Session.Subagent) -> Void
 
   @State private var transcript: SubagentTranscript?
@@ -304,7 +459,12 @@ struct LocalSessionWorkspace: View {
           .frame(maxWidth: .infinity, alignment: .leading)
       }
     }
-    .task(id: session.id) { await refreshLoop() }
+    // iOS 的结构化会话只在这里展示入口说明；桌面不再拉取完整卡片事件流，
+    // 避免打开一段长对话就持续解码历史。CLI 会话才需要高频刷新终端 ANSI 帧。
+    .task(id: session.id) {
+      guard session.kind == "pty" else { return }
+      await refreshLoop()
+    }
     .alert("会话操作失败", isPresented: Binding(
       get: { actionError != nil },
       set: { if !$0 { actionError = nil } }
@@ -322,7 +482,7 @@ struct LocalSessionWorkspace: View {
         HStack(spacing: 8) {
           Text(AgentVisuals.name(session.agent))
             .font(.headline)
-          Text(session.kind == "structured" ? "Chat UI" : "Shell · CLI")
+          Text(session.kind == "structured" ? "移动端 Chat UI" : "Shell · CLI")
             .font(.caption2.weight(.medium))
             .foregroundStyle(.secondary)
             .padding(.horizontal, 7)
@@ -401,47 +561,25 @@ struct LocalSessionWorkspace: View {
 
   @ViewBuilder
   private var structuredWorkspace: some View {
-    VStack(spacing: 0) {
-      if transcript?.events.isEmpty != false {
-        ContentUnavailableView(
-          "\(AgentVisuals.name(session.agent)) 已就绪",
-          systemImage: "sparkles",
-          description: Text("在下方输入任务，Prospero 会直接投递给 Code Agent。")
-        )
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-      } else if let transcript {
-        AgentTranscriptList(transcript: transcript)
+    VStack(spacing: 16) {
+      Image(systemName: "iphone.and.arrow.forward")
+        .font(.system(size: 36, weight: .light))
+        .foregroundStyle(.secondary)
+      Text("这是移动端 Chat UI 会话")
+        .font(.title3.weight(.semibold))
+      Text("Mac 工作台只呈现原生 CLI。这个会话仍可在 iPhone 或 iPad 中查看消息、工具过程和审批；在此项目启动 CLI 会话可获得完整终端。")
+        .foregroundStyle(.secondary)
+        .multilineTextAlignment(.center)
+        .frame(maxWidth: 460)
+      Button {
+        launchCLI()
+      } label: {
+        Label("在此项目启动 \(AgentVisuals.name(session.agent)) CLI", systemImage: "terminal")
       }
-
-      if !interactions.permissions.isEmpty || !interactions.questions.isEmpty {
-        Divider()
-        ScrollView {
-          VStack(spacing: 10) {
-            ForEach(interactions.permissions) { prompt in
-              LocalPermissionCard(prompt: prompt) { reply in
-                respondPermission(prompt, reply: reply)
-              }
-            }
-            ForEach(interactions.questions) { prompt in
-              LocalQuestionCard(prompt: prompt) { answers, cancelled in
-                respondQuestion(prompt, answers: answers, cancelled: cancelled)
-              }
-            }
-          }
-          .padding(12)
-        }
-        .frame(maxHeight: 280)
-      }
-
-      Divider()
-      AgentComposer(
-        agentName: AgentVisuals.name(session.agent),
-        draft: $draft,
-        sending: sending,
-        enabled: session.status != "done" && session.status != "died",
-        send: sendDraft
-      )
+      .buttonStyle(.borderedProminent)
     }
+    .padding(32)
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
   }
 
   private var terminalWorkspace: some View {
