@@ -19,6 +19,7 @@ import {
   CAPABILITY_ORCHESTRATION_LIFECYCLE,
   CAPABILITY_ORCHESTRATION_MANAGEMENT,
   CAPABILITY_ORCHESTRATION_MANUAL,
+  CAPABILITY_ORCHESTRATION_RUN_LIFECYCLE,
   CAPABILITY_ORCHESTRATION_SNAPSHOT,
   CAPABILITY_SESSION_CREATE_MODEL,
   CAPABILITY_SUBAGENT_HISTORY,
@@ -88,6 +89,7 @@ const PING_MS = 15_000;
 const MANUAL_ORCHESTRATION_METHODS = new Set([
   "run.create",
   "run.complete",
+  "run.abandon",
   "run.delete",
   "task.create",
   "task.cancel",
@@ -301,6 +303,7 @@ export async function createDaemonServer(
       capabilities.push(CAPABILITY_ORCHESTRATION_AUTOMATION);
       capabilities.push(CAPABILITY_ORCHESTRATION_MANAGEMENT);
       capabilities.push(CAPABILITY_ORCHESTRATION_LIFECYCLE);
+      capabilities.push(CAPABILITY_ORCHESTRATION_RUN_LIFECYCLE);
     }
     return capabilities;
   }
@@ -310,9 +313,13 @@ export async function createDaemonServer(
    * worker 的 session completed 仍绝不等同于 task done；这里只汇总已经显式交付的 Task。
    */
   function completeSettledCoordinatorRuns(): number {
-    const completedCoordinators = new Set(
+    const settledCoordinators = new Set(
       manager.list()
-        .filter((session) => session.kind === "structured" && session.status === "completed")
+        .filter(
+          (session) =>
+            session.kind === "structured" &&
+            (session.status === "completed" || session.status === "done"),
+        )
         .map((session) => session.id),
     );
     let completed = 0;
@@ -320,7 +327,7 @@ export async function createDaemonServer(
       if (
         run.status !== "active" ||
         run.coordinatorSessionId === null ||
-        !completedCoordinators.has(run.coordinatorSessionId)
+        !settledCoordinators.has(run.coordinatorSessionId)
       ) {
         continue;
       }
@@ -332,7 +339,6 @@ export async function createDaemonServer(
   /** 手机上的状态只读快照来自同一个 store，绝不在 WS 层维护镜像。 */
   function sendOrchestrationSnapshot(conn: Conn): void {
     if (conn.protocolVersion < 7) return;
-    completeSettledCoordinatorRuns();
     const state = orchestrationStore.snapshot();
     send(conn, {
       type: "orchestration.snapshot",
@@ -350,6 +356,34 @@ export async function createDaemonServer(
       if (candidate.device) sendOrchestrationSnapshot(candidate);
     }
   }
+
+  // 控制 socket、自动调度器与 WebSocket 动作都写同一个 Store。统一订阅它，
+  // 才不会出现 CLI 已完成而手机还要等下一次 8 秒轮询的状态延迟。
+  let orchestrationBroadcastTimer: NodeJS.Timeout | null = null;
+  let reconcilingOrchestration = false;
+  const scheduleOrchestrationBroadcast = (): void => {
+    if (reconcilingOrchestration || orchestrationBroadcastTimer) return;
+    orchestrationBroadcastTimer = setTimeout(() => {
+      orchestrationBroadcastTimer = null;
+      reconcilingOrchestration = true;
+      try {
+        completeSettledCoordinatorRuns();
+      } finally {
+        reconcilingOrchestration = false;
+      }
+      broadcastOrchestrationSnapshot();
+    }, 25);
+    orchestrationBroadcastTimer.unref?.();
+  };
+  const stopOrchestrationChanges = orchestrationStore.onChange(scheduleOrchestrationBroadcast);
+
+  const stopOrchestrationBroadcasts = (): void => {
+    stopOrchestrationChanges();
+    if (orchestrationBroadcastTimer) {
+      clearTimeout(orchestrationBroadcastTimer);
+      orchestrationBroadcastTimer = null;
+    }
+  };
 
   function goalCoordinatorPrompt(runId: string, objective: string): string {
     return [
@@ -423,8 +457,7 @@ export async function createDaemonServer(
       if (settled) {
         automationService.kick(settled.task.runId);
       }
-      const completedRuns = completeSettledCoordinatorRuns();
-      if (settled || completedRuns > 0) broadcastOrchestrationSnapshot();
+      completeSettledCoordinatorRuns();
     }
     for (const conn of conns) {
       if (conn.device) send(conn, { type: "session.state", session });
@@ -1235,10 +1268,12 @@ export async function createDaemonServer(
           const gate = orchestrationStore.resolveGate(msg.gateId, msg.decision);
           automationService.kick(gate.runId);
         }
-        broadcastOrchestrationSnapshot();
+        sendOrchestrationSnapshot(conn);
         return;
 
       case "orchestration.run.create":
+      case "orchestration.run.complete":
+      case "orchestration.run.abandon":
       case "orchestration.run.delete":
       case "orchestration.task.create":
       case "orchestration.task.cancel":
@@ -1262,6 +1297,18 @@ export async function createDaemonServer(
             objective: msg.objective,
             coordinatorSessionId: null,
             ...(msg.operationId ? { operationId: msg.operationId } : {}),
+          }, new AbortController().signal);
+        } else if (msg.type === "orchestration.run.complete") {
+          await orchestrationApi("run.complete", {
+            runId: msg.runId,
+            operationId: msg.operationId,
+            actorSessionId: null,
+          }, new AbortController().signal);
+        } else if (msg.type === "orchestration.run.abandon") {
+          await orchestrationApi("run.abandon", {
+            runId: msg.runId,
+            operationId: msg.operationId,
+            actorSessionId: null,
           }, new AbortController().signal);
         } else if (msg.type === "orchestration.run.delete") {
           await orchestrationApi("run.delete", {
@@ -1345,7 +1392,8 @@ export async function createDaemonServer(
             actorSessionId: null,
           }, new AbortController().signal);
         }
-        broadcastOrchestrationSnapshot();
+        // 幂等重试可能不产生 Store change；仍给发起设备一份确认快照。
+        sendOrchestrationSnapshot(conn);
         return;
       }
 
@@ -1971,6 +2019,7 @@ export async function createDaemonServer(
     wss.close();
     await controlSocket.close();
     await manager.disposeAll();
+    stopOrchestrationBroadcasts();
     orchestrationStore.close();
     throw error;
   }
@@ -2053,6 +2102,7 @@ export async function createDaemonServer(
       revokeWatcher?.close();
       wss.close();
       await manager.disposeAll();
+      stopOrchestrationBroadcasts();
       orchestrationStore.close();
       await new Promise<void>((resolve) => httpServer.close(() => resolve()));
     },

@@ -254,6 +254,16 @@ describe("结构化轨协议", () => {
       objective: "滚动升级兼容",
     })).toMatchObject({ objective: "滚动升级兼容" });
     expect(parseC2S({
+      type: "orchestration.run.complete",
+      runId: "run-1",
+      operationId: "complete-1",
+    })).toMatchObject({ runId: "run-1" });
+    expect(parseC2S({
+      type: "orchestration.run.abandon",
+      runId: "run-2",
+      operationId: "abandon-1",
+    })).toMatchObject({ runId: "run-2" });
+    expect(parseC2S({
       type: "orchestration.task.create",
       runId: "run-1",
       title: "握手回退",

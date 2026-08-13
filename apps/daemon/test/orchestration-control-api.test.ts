@@ -89,6 +89,29 @@ describe("控制 API 的交付报告", () => {
     }, signal) as { status: string };
     expect(completed.status).toBe("completed");
   });
+
+  it("宿主可放弃没有活动 worker 的 Run，并保持操作幂等", async () => {
+    const store = new OrchestrationStore();
+    const run = store.createRun({ objective: "停止目标", coordinatorSessionId: null });
+    const task = store.createTask({ runId: run.id, title: "未开始", spec: "取消" });
+    const api = orchestrationControlApi(
+      store,
+      new DispatchService(store, unusedSessions),
+      new CollaborationService(store),
+    );
+    const params = {
+      runId: run.id,
+      operationId: "abandon-run",
+      actorSessionId: null,
+    };
+
+    const abandoned = await api("run.abandon", params, new AbortController().signal) as {
+      status: string;
+    };
+    expect(abandoned.status).toBe("abandoned");
+    expect(store.getTask(task.id).status).toBe("cancelled");
+    expect(await api("run.abandon", params, new AbortController().signal)).toEqual(abandoned);
+  });
 });
 
 describe("控制 API 的幂等与任务图事务", () => {

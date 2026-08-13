@@ -218,6 +218,22 @@ export function orchestrationControlApi(
             () => store.completeRun(runId),
           );
         }
+        case "run.abandon": {
+          const runId = text(params, "runId");
+          const actorSessionId = optionalText(params, "actorSessionId");
+          ownerOrCoordinator(store, runId, actorSessionId);
+          return idempotent(
+            method,
+            operationId(params),
+            { runId, actorSessionId },
+            () => {
+              if (store.getRun(runId).automation?.state === "running") {
+                automation?.pause(runId);
+              }
+              return store.abandonRun(runId);
+            },
+          );
+        }
         case "run.delete": {
           const runId = text(params, "runId");
           const actorSessionId = optionalText(params, "actorSessionId");

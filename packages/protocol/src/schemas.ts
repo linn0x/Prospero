@@ -816,6 +816,18 @@ export const C2SOrchestrationRunCreateSchema = z.object({
   operationId: z.string().min(1).max(200).optional(),
 });
 
+export const C2SOrchestrationRunCompleteSchema = z.object({
+  type: z.literal("orchestration.run.complete"),
+  runId: z.string().min(1).max(200),
+  operationId: z.string().min(1).max(200),
+});
+
+export const C2SOrchestrationRunAbandonSchema = z.object({
+  type: z.literal("orchestration.run.abandon"),
+  runId: z.string().min(1).max(200),
+  operationId: z.string().min(1).max(200),
+});
+
 export const C2SOrchestrationRunDeleteSchema = z.object({
   type: z.literal("orchestration.run.delete"),
   runId: z.string().min(1).max(200),
@@ -965,6 +977,8 @@ export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SOrchestrationSnapshotSchema,
   C2SOrchestrationGateResolveSchema,
   C2SOrchestrationRunCreateSchema,
+  C2SOrchestrationRunCompleteSchema,
+  C2SOrchestrationRunAbandonSchema,
   C2SOrchestrationRunDeleteSchema,
   C2SOrchestrationTaskCreateSchema,
   C2SOrchestrationTaskCancelSchema,
@@ -1587,6 +1601,8 @@ export type C2SSessionCreate = z.infer<typeof C2SSessionCreateSchema>;
 export type C2SOrchestrationSnapshot = z.infer<typeof C2SOrchestrationSnapshotSchema>;
 export type C2SOrchestrationGateResolve = z.infer<typeof C2SOrchestrationGateResolveSchema>;
 export type C2SOrchestrationRunCreate = z.infer<typeof C2SOrchestrationRunCreateSchema>;
+export type C2SOrchestrationRunComplete = z.infer<typeof C2SOrchestrationRunCompleteSchema>;
+export type C2SOrchestrationRunAbandon = z.infer<typeof C2SOrchestrationRunAbandonSchema>;
 export type C2SOrchestrationRunDelete = z.infer<typeof C2SOrchestrationRunDeleteSchema>;
 export type C2SOrchestrationTaskCreate = z.infer<typeof C2SOrchestrationTaskCreateSchema>;
 export type C2SOrchestrationTaskCancel = z.infer<typeof C2SOrchestrationTaskCancelSchema>;

@@ -70,6 +70,43 @@ describe("Run 与 Task", () => {
     expect(store.completeRunIfSettled(runId)).toMatchObject({ status: "completed" });
     expect(store.completeRunIfSettled(runId)).toBeNull();
     expect(store.completeRun(runId)).toMatchObject({ status: "completed" });
+    expect(() => store.createTask({ runId, title: "历史追加", spec: "不允许" }))
+      .toThrow(/历史编排只读/);
+    expect(() => store.createGate({ runId, question: "历史 Gate" }))
+      .toThrow(/历史编排只读/);
+  });
+
+  it("放弃 Run 会关闭未执行任务和 Gate，且历史状态不可再编辑", () => {
+    const { store, runId } = seed();
+    const task = store.createTask({ runId, title: "待办", spec: "不再执行" });
+    const gate = store.createGate({ runId, taskId: task.id, question: "是否继续？" });
+
+    expect(store.abandonRun(runId)).toMatchObject({ status: "abandoned" });
+    expect(store.getTask(task.id)).toMatchObject({ status: "cancelled", result: "Run 已放弃" });
+    expect(store.getGate(gate.id)).toMatchObject({ status: "cancelled" });
+    expect(store.abandonRun(runId)).toMatchObject({ status: "abandoned" });
+    expect(() => store.setTaskDeps(task.id, [])).toThrow(/历史编排只读/);
+  });
+
+  it("仍有 worker 时拒绝放弃 Run", () => {
+    const { store, runId } = seed();
+    const task = store.createTask({ runId, title: "执行中", spec: "先停止" });
+    store.createDispatch({ taskId: task.id, sessionId: "worker" });
+
+    expect(() => store.abandonRun(runId)).toThrow(/仍在运行/);
+    expect(store.getRun(runId).status).toBe("active");
+  });
+
+  it("状态变更会通知实时快照订阅者，取消订阅后停止通知", () => {
+    const store = new OrchestrationStore();
+    let changes = 0;
+    const off = store.onChange(() => { changes += 1; });
+    const run = store.createRun({ objective: "实时刷新" });
+    store.createTask({ runId: run.id, title: "任务", spec: "任务" });
+    expect(changes).toBe(2);
+    off();
+    store.updateRun(run.id, { objective: "不再通知" });
+    expect(changes).toBe(2);
   });
 });
 

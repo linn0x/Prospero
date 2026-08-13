@@ -107,6 +107,34 @@ export interface GoalSessionGroup {
   workers: GoalWorkerSessionLink[];
 }
 
+export interface GoalSessionVisibility {
+  displayedCoordinatorIds: Set<string>;
+  contextualCoordinatorIds: Set<string>;
+  nestedWorkerIds: Set<string>;
+}
+
+/** Keeps a Goal grouped when filtering or archive state hides only its coordinator row. */
+export function goalSessionVisibility(
+  groups: ReadonlyMap<string, GoalSessionGroup>,
+  visibleSessionIds: ReadonlySet<string>,
+  availableSessionIds: ReadonlySet<string>,
+): GoalSessionVisibility {
+  const displayedCoordinatorIds = new Set<string>();
+  const contextualCoordinatorIds = new Set<string>();
+  const nestedWorkerIds = new Set<string>();
+  for (const [coordinatorSessionId, group] of groups) {
+    const coordinatorVisible = visibleSessionIds.has(coordinatorSessionId);
+    const visibleWorkers = group.workers.filter((worker) =>
+      visibleSessionIds.has(worker.sessionId));
+    const canShowContext = availableSessionIds.has(coordinatorSessionId) && visibleWorkers.length > 0;
+    if (!coordinatorVisible && !canShowContext) continue;
+    displayedCoordinatorIds.add(coordinatorSessionId);
+    if (!coordinatorVisible) contextualCoordinatorIds.add(coordinatorSessionId);
+    for (const worker of visibleWorkers) nestedWorkerIds.add(worker.sessionId);
+  }
+  return { displayedCoordinatorIds, contextualCoordinatorIds, nestedWorkerIds };
+}
+
 /**
  * Links independently persisted worker sessions back to their coordinator.
  * A retry remains visible as another worker session, while duplicate snapshots

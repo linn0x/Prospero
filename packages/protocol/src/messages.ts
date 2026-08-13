@@ -39,6 +39,8 @@ export const CAPABILITY_ORCHESTRATION_GRAPH = "orchestration.graph.v1";
 export const CAPABILITY_ORCHESTRATION_AUTOMATION = "orchestration.automation.v1";
 export const CAPABILITY_ORCHESTRATION_MANAGEMENT = "orchestration.management.v1";
 export const CAPABILITY_ORCHESTRATION_LIFECYCLE = "orchestration.lifecycle.v1";
+/** Run 的完成/放弃；与旧 lifecycle.v1 的 task/worker 动作分开做能力协商。 */
+export const CAPABILITY_ORCHESTRATION_RUN_LIFECYCLE = "orchestration.run-lifecycle.v1";
 export const CAPABILITY_SUBAGENT_HISTORY = "subagent.history.v1";
 /** Codex / Claude Code 多账号与隔离配置目录。 */
 export const CAPABILITY_AGENT_ACCOUNTS = "agent.accounts.v1";
@@ -67,6 +69,8 @@ export type {
   C2SOrchestrationSnapshot,
   C2SOrchestrationGateResolve,
   C2SOrchestrationRunCreate,
+  C2SOrchestrationRunComplete,
+  C2SOrchestrationRunAbandon,
   C2SOrchestrationRunDelete,
   C2SOrchestrationTaskCreate,
   C2SOrchestrationTaskCancel,

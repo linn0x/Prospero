@@ -129,6 +129,12 @@ const taskStatusLabel: Record<OrchestrationTask["status"], string> = {
   cancelled: "已取消",
 };
 
+const runStatusLabel: Record<OrchestrationRun["status"], string> = {
+  active: "进行中",
+  completed: "已完成",
+  abandoned: "已放弃",
+};
+
 function isTaskReady(task: OrchestrationTask, tasks: OrchestrationTask[]): boolean {
   if (task.status !== "pending") return false;
   const byId = new Map(tasks.map((candidate) => [candidate.id, candidate]));
@@ -231,6 +237,8 @@ export default function OrchestrationScreen() {
   const canAutomate = runtime.status === "connected" && conn?.supportsAutomationOrchestration === true;
   const canManage = runtime.status === "connected" && conn?.supportsOrchestrationManagement === true;
   const canManageLifecycle = runtime.status === "connected" && conn?.supportsOrchestrationLifecycle === true;
+  const canManageRunLifecycle = runtime.status === "connected" &&
+    conn?.supportsOrchestrationRunLifecycle === true;
   const connectionNotice = orchestrationConnectionNotice(
     runtime.status,
     runtime.lastError,
@@ -325,7 +333,13 @@ export default function OrchestrationScreen() {
   };
 
   const openExistingGraphEditor = (): void => {
-    if (!selectedRun || !manualRun || !canCreateGraph || automationRunning) return;
+    if (
+      !selectedRun ||
+      selectedRun.status !== "active" ||
+      !manualRun ||
+      !canCreateGraph ||
+      automationRunning
+    ) return;
     const existing = tasks.map((task) => ({
       id: task.id,
       title: task.title,
@@ -347,7 +361,7 @@ export default function OrchestrationScreen() {
   };
 
   const openTaskEditor = (): void => {
-    if (automationRunning) return;
+    if (selectedRun?.status !== "active" || automationRunning) return;
     setTaskTitle("");
     setTaskSpec("");
     setTaskDeps([]);
@@ -355,6 +369,7 @@ export default function OrchestrationScreen() {
   };
 
   const openWorkerEditor = (taskId: string): void => {
+    if (selectedRun?.status !== "active") return;
     setWorkerAgent("codex");
     setWorkerAccountId(defaultAccountId("codex"));
     setWorktree("new");
@@ -363,7 +378,13 @@ export default function OrchestrationScreen() {
   };
 
   const openAutomationEditor = (): void => {
-    if (!selectedRun || !manualRun || !canAutomate || automationRunning) return;
+    if (
+      !selectedRun ||
+      selectedRun.status !== "active" ||
+      !manualRun ||
+      !canAutomate ||
+      automationRunning
+    ) return;
     const existing = selectedRun.automation;
     setAutomationAgent(
       existing && WORKER_AGENTS.includes(existing.agent) ? existing.agent : "codex",
@@ -530,6 +551,77 @@ export default function OrchestrationScreen() {
             }
             setEditor(null);
             setSelectedRunId(null);
+          },
+        },
+      ],
+    );
+  };
+
+  const confirmCompleteRun = (): void => {
+    if (!conn || !selectedRun || !canManageRunLifecycle) return;
+    const activeWorkers = dispatches.filter(
+      (dispatch) => dispatch.state === "starting" || dispatch.state === "running",
+    );
+    const unfinished = tasks.filter(
+      (task) => task.status !== "done" && task.status !== "cancelled",
+    );
+    const blockers = [
+      activeWorkers.length > 0 ? `${String(activeWorkers.length)} 个 worker 仍在运行` : null,
+      unfinished.length > 0 ? `${String(unfinished.length)} 个任务尚未结束` : null,
+      pendingGates.length > 0 ? `${String(pendingGates.length)} 个 Gate 待处理` : null,
+      automationRunning ? "自动执行仍在运行" : null,
+    ].filter((item): item is string => item !== null);
+    if (blockers.length > 0) {
+      Alert.alert("暂时不能完成", `${blockers.join("；")}。请先处理后再完成 Goal。`);
+      return;
+    }
+    Alert.alert(
+      "标记为已完成？",
+      `“${selectedRun.objective}”会进入只读历史，关联会话默认折叠。`,
+      [
+        { text: "取消", style: "cancel" },
+        {
+          text: "完成",
+          onPress: () => {
+            if (!conn.completeOrchestrationRun(selectedRun.id)) {
+              setBanner("无法完成 Goal，请升级并重启 daemon 后重试。");
+              return;
+            }
+            setHistoryOpen(true);
+            setEditor(null);
+          },
+        },
+      ],
+    );
+  };
+
+  const confirmAbandonRun = (): void => {
+    if (!conn || !selectedRun || !canManageRunLifecycle) return;
+    const activeWorkers = dispatches.filter(
+      (dispatch) => dispatch.state === "starting" || dispatch.state === "running",
+    );
+    if (activeWorkers.length > 0) {
+      Alert.alert(
+        "暂时不能放弃",
+        `还有 ${String(activeWorkers.length)} 个 worker 正在运行。请先停止它们，避免留下游离工作。`,
+      );
+      return;
+    }
+    Alert.alert(
+      "放弃这条 Goal？",
+      `“${selectedRun.objective}”会进入只读历史；尚未执行的任务和待处理 Gate 会一并取消。`,
+      [
+        { text: "返回", style: "cancel" },
+        {
+          text: "放弃 Goal",
+          style: "destructive",
+          onPress: () => {
+            if (!conn.abandonOrchestrationRun(selectedRun.id)) {
+              setBanner("无法放弃 Goal，请升级并重启 daemon 后重试。");
+              return;
+            }
+            setHistoryOpen(true);
+            setEditor(null);
           },
         },
       ],
@@ -935,7 +1027,9 @@ export default function OrchestrationScreen() {
                     >
                       {run.objective}
                     </Text>
-                    <Text style={styles.runChipMeta}>{runLabel(run)} · {run.status}</Text>
+                    <Text style={styles.runChipMeta}>
+                      {runLabel(run)} · {runStatusLabel[run.status]}
+                    </Text>
                   </Pressable>
                 ))}
               </ScrollView>
@@ -963,7 +1057,9 @@ export default function OrchestrationScreen() {
               <View style={styles.runHeaderCopy}>
                 <View style={styles.badgeRow}>
                   <Text style={styles.badge}>{runLabel(selectedRun)}</Text>
-                  <Text style={[styles.badge, styles.statusBadge]}>{selectedRun.status}</Text>
+                  <Text style={[styles.badge, styles.statusBadge]}>
+                    {runStatusLabel[selectedRun.status]}
+                  </Text>
                   <Text style={styles.revisionBadge}>r{selectedRun.graphRevision ?? 0}</Text>
                   {pendingGates.length > 0 && (
                     <Text style={[styles.badge, styles.gateBadge]}>{pendingGates.length} 个 Gate</Text>
@@ -971,7 +1067,9 @@ export default function OrchestrationScreen() {
                 </View>
                 <Text style={styles.runObjective}>{selectedRun.objective}</Text>
               </View>
-              {((manualRun && canMutate) || canManage) && (
+              {((manualRun && canMutate && selectedRun.status === "active") ||
+                canManage ||
+                (canManageRunLifecycle && selectedRun.status === "active")) && (
                 <View style={styles.runHeaderActions}>
                   {manualRun && canMutate && canAutomate && selectedRun.status === "active" && (
                     <Pressable
@@ -985,7 +1083,8 @@ export default function OrchestrationScreen() {
                       </Text>
                     </Pressable>
                   )}
-                  {manualRun && canMutate && !automationRunning && (
+                  {manualRun && canMutate && !automationRunning &&
+                    selectedRun.status === "active" && (
                     <>
                       {canCreateGraph && (
                         <Pressable style={styles.smallAction} onPress={openExistingGraphEditor}>
@@ -997,6 +1096,25 @@ export default function OrchestrationScreen() {
                         <Text style={styles.smallActionText}>任务</Text>
                       </Pressable>
                     </>
+                  )}
+                  {canManageRunLifecycle && selectedRun.status === "active" && (
+                    <View style={styles.runLifecycleActions}>
+                      <Pressable
+                        style={[styles.smallAction, styles.completeRunAction]}
+                        onPress={confirmCompleteRun}
+                        accessibilityLabel="标记 Goal 已完成"
+                      >
+                        <Icon name="checkmark.circle.fill" size={12} color={color.success} />
+                        <Text style={styles.completeRunActionText}>完成</Text>
+                      </Pressable>
+                      <Pressable
+                        style={[styles.smallAction, styles.abandonRunAction]}
+                        onPress={confirmAbandonRun}
+                        accessibilityLabel="放弃 Goal"
+                      >
+                        <Text style={styles.abandonRunActionText}>放弃</Text>
+                      </Pressable>
+                    </View>
                   )}
                   {canManage && (
                     <Pressable
@@ -1352,7 +1470,7 @@ export default function OrchestrationScreen() {
                     <Text style={styles.taskSpec}>{task.spec}</Text>
                     {task.result && <Text style={styles.taskResult}>{task.result}</Text>}
                     <View style={styles.taskActions}>
-                      {canManageLifecycle && workerActive && (
+                      {selectedRun.status === "active" && canManageLifecycle && workerActive && (
                         <Pressable
                           style={[styles.taskButton, styles.taskButtonDanger]}
                           onPress={() => confirmStopWorker(task)}
@@ -1361,7 +1479,7 @@ export default function OrchestrationScreen() {
                           <Text style={styles.taskButtonDangerText}>停止</Text>
                         </Pressable>
                       )}
-                      {canManageLifecycle && !workerActive &&
+                      {selectedRun.status === "active" && canManageLifecycle && !workerActive &&
                         (task.status === "pending" || task.status === "blocked") && (
                         <Pressable
                           style={[styles.taskButton, styles.taskButtonDanger]}
@@ -1370,13 +1488,15 @@ export default function OrchestrationScreen() {
                           <Text style={styles.taskButtonDangerText}>取消任务</Text>
                         </Pressable>
                       )}
-                      {canManageLifecycle && task.status === "failed" && (
+                      {selectedRun.status === "active" && canManageLifecycle &&
+                        task.status === "failed" && (
                         <Pressable style={styles.taskButton} onPress={() => retryTask(task)}>
                           <Icon name="arrow.clockwise" size={11} color={color.accent} />
                           <Text style={styles.taskButtonText}>重试</Text>
                         </Pressable>
                       )}
-                      {manualRun && !automationRunning && ready && canMutate && (
+                      {selectedRun.status === "active" && manualRun && !automationRunning &&
+                        ready && canMutate && (
                         <Pressable style={styles.taskButton} onPress={() => openWorkerEditor(task.id)}>
                           <Icon name="play.fill" size={11} color={color.accent} />
                           <Text style={styles.taskButtonText}>派发</Text>
@@ -1712,6 +1832,11 @@ const styles = StyleSheet.create({
   runHeader: { flexDirection: "row", alignItems: "flex-start", gap: space.md },
   runHeaderCopy: { flex: 1, gap: space.sm },
   runHeaderActions: { alignItems: "flex-end", gap: space.sm },
+  runLifecycleActions: { flexDirection: "row", gap: space.sm },
+  completeRunAction: { backgroundColor: color.successBg },
+  completeRunActionText: { color: color.success, fontSize: 12, fontWeight: "700" },
+  abandonRunAction: { backgroundColor: color.dangerBg },
+  abandonRunActionText: { color: color.danger, fontSize: 12, fontWeight: "700" },
   deleteRunAction: {
     width: 32,
     height: 32,
