@@ -13,6 +13,10 @@ Prospero 是面向 Coding Agent 的本地优先控制中枢。Claude Code、Code
 继续运行在你的 Mac 上，直接使用已有仓库、工具链、账号与登录状态；你可以从 macOS、iOS
 或 Android 查看进度、处理审批，并编排多个 Agent 完成复杂任务。
 
+> “Spirits, which by mine art I have from their confines called to enact my present fancies.”
+>
+> — Prospero, [*The Tempest*, Act IV, Scene I](https://www.folger.edu/explore/shakespeares-works/the-tempest/read/4/1/)
+
 ## 一块控制面，接住整个 Agent 工作流
 
 | | 产品能力 |
