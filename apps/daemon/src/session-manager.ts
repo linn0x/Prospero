@@ -30,7 +30,11 @@ import { ClaudeAdapter } from "./adapters/claude.js";
 import { CodexAdapter } from "./adapters/codex.js";
 import { GrokAdapter } from "./adapters/grok.js";
 import { OpencodeAdapter } from "./adapters/opencode.js";
-import type { AdapterResumeState, AgentAdapter } from "./adapters/types.js";
+import type {
+  AdapterResumeState,
+  AgentAdapter,
+  AgentModelCatalog,
+} from "./adapters/types.js";
 import type { AccountBinding, AccountLoginSpec } from "./agent-accounts.js";
 
 export type SessionErrorCode =
@@ -59,6 +63,9 @@ export interface CreateSessionInput {
   command?: string | undefined;
   /** 结构化会话从第一轮起使用的协作模式。 */
   mode?: "default" | "plan" | undefined;
+  /** 结构化会话从第一轮起使用的模型与推理强度。 */
+  model?: string | undefined;
+  effort?: string | undefined;
   /** Agent 原生本机会话 ID；只允许 Claude/Codex 结构化轨。 */
   resume?: { id: string; title?: string | undefined } | undefined;
   cols: number;
@@ -446,12 +453,20 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     if (input.mode && (kind !== "structured" || (input.agent !== "claude" && input.agent !== "codex"))) {
       throw new SessionError("只有 Claude/Codex 对话会话支持 Plan 模式", "agent_unavailable");
     }
+    if (input.model && (kind !== "structured" || (input.agent !== "claude" && input.agent !== "codex"))) {
+      throw new SessionError("只有 Claude/Codex 对话会话支持启动模型选择", "agent_unavailable");
+    }
+    if (input.effort && !input.model) {
+      throw new SessionError("推理强度必须和启动模型一起指定", "agent_unavailable");
+    }
     return kind === "structured"
       ? this.createStructured(
           input.agent,
           cwd,
           input.approvalPolicy,
           input.mode,
+          input.model,
+          input.effort,
           input.resume,
           account,
         )
@@ -543,12 +558,16 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     cwd: string,
     approvalPolicy?: ApprovalPolicy,
     mode?: "default" | "plan",
+    model?: string,
+    effort?: string,
     resume?: { id: string; title?: string | undefined },
     account?: AccountBinding,
   ): Promise<SessionInfo> {
     const id = randomUUID();
     const initialAdapterState: AdapterResumeState = {
       ...(mode ? { mode } : {}),
+      ...(model ? { model } : {}),
+      ...(effort ? { effort } : {}),
       ...(resume && agent === "claude" ? { sessionId: resume.id } : {}),
       ...(resume && agent === "codex" ? { threadId: resume.id } : {}),
     };
@@ -578,6 +597,38 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     this.scheduleStructuredPersist();
     this.emit("state", session.info());
     return session.info();
+  }
+
+  /**
+   * 新会话创建前读取 Agent 的实时模型目录。适配器是临时的，绝不进入会话表；
+   * Codex 通过 catalogOnly 跳过 thread/start，Claude SDK 则在读取后立即释放。
+   */
+  async launchModels(
+    agent: "claude" | "codex",
+    accountId?: string,
+  ): Promise<AgentModelCatalog> {
+    const account = accountId ? this.resolveAccount(agent, accountId) : undefined;
+    const adapter = this.adapterFactory(agent);
+    try {
+      await adapter.start({
+        cwd: os.homedir(),
+        ...(account ? { env: account.environment } : {}),
+        catalogOnly: true,
+        approvalPolicy: () => "strict",
+        emit: () => {},
+        persistState: () => {},
+      });
+      if (!adapter.listModels) {
+        throw new SessionError(`${agent} 尚不支持模型选择`, "agent_unavailable");
+      }
+      const catalog = await adapter.listModels();
+      if (catalog.models.length === 0) {
+        throw new SessionError(`${agent} 没有返回可选模型`, "agent_unavailable");
+      }
+      return catalog;
+    } finally {
+      await adapter.dispose().catch(() => {});
+    }
   }
 
   private makeStructuredSession(

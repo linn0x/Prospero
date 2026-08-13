@@ -17,6 +17,7 @@ import { Stack, router, useFocusEffect, useLocalSearchParams } from "expo-router
 import type {
   AgentAccount,
   AgentKind,
+  AgentModel,
   CodeAgentKind,
   OrchestrationSnapshot,
   ResumableConversation,
@@ -117,6 +118,12 @@ export default function HostScreen() {
   const [selectedAccountIds, setSelectedAccountIds] = useState<
     Partial<Record<CodeAgentKind, string>>
   >({});
+  const [launchModels, setLaunchModels] = useState<AgentModel[]>([]);
+  const [launchModelsLoading, setLaunchModelsLoading] = useState(false);
+  const [launchModelsError, setLaunchModelsError] = useState<string | null>(null);
+  const [selectedLaunchModel, setSelectedLaunchModel] = useState<string | null>(null);
+  const [selectedLaunchEffort, setSelectedLaunchEffort] = useState<string | null>(null);
+  const [launchModelsReload, setLaunchModelsReload] = useState(0);
   const [showArchived, setShowArchived] = useState(false);
   const [archivedIds, setArchivedIds] = useState<Set<string>>(() => new Set());
   const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(() => new Set());
@@ -150,6 +157,9 @@ export default function HostScreen() {
       matchingAccounts.find((account) => account.isDefault) ??
       matchingAccounts[0]
     : undefined;
+  const selectedLaunchModelInfo = launchModels.find(
+    (model) => model.id === selectedLaunchModel,
+  );
 
   // 账号目录属于 Mac；每次回到主机页重读，确保账号管理页的新增/默认/删除立即生效。
   useFocusEffect(
@@ -183,6 +193,71 @@ export default function HostScreen() {
       };
     }, [conn, runtime.status]),
   );
+
+  // 模型目录来自 Agent 自己，不能在手机里硬编码。账号切换时重新读取，保证
+  // 创建请求里的 model/effort 与即将启动的隔离环境属于同一份能力目录。
+  useEffect(() => {
+    if (
+      !composing ||
+      sessionKind !== "structured" ||
+      codeAgent === null ||
+      !conn?.supportsSessionCreateModel ||
+      runtime.status !== "connected"
+    ) {
+      const reset = setTimeout(() => {
+        setLaunchModels([]);
+        setLaunchModelsLoading(false);
+        setLaunchModelsError(null);
+        setSelectedLaunchModel(null);
+        setSelectedLaunchEffort(null);
+      }, 0);
+      return () => clearTimeout(reset);
+    }
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      setLaunchModelsLoading(true);
+      setLaunchModelsError(null);
+      void conn
+        .launchModels(codeAgent, selectedAccount?.id)
+        .then((response) => {
+          if (cancelled) return;
+          setLaunchModels(response.models);
+          const selected =
+            response.models.find((model) => model.id === response.currentModel) ??
+            response.models.find((model) => model.isDefault) ??
+            response.models[0];
+          setSelectedLaunchModel(selected?.id ?? null);
+          setSelectedLaunchEffort(
+            response.currentEffort ??
+              selected?.defaultEffort ??
+              selected?.supportedEfforts[0] ??
+              null,
+          );
+        })
+        .catch((error: unknown) => {
+          if (cancelled) return;
+          setLaunchModels([]);
+          setSelectedLaunchModel(null);
+          setSelectedLaunchEffort(null);
+          setLaunchModelsError(error instanceof Error ? error.message : String(error));
+        })
+        .finally(() => {
+          if (!cancelled) setLaunchModelsLoading(false);
+        });
+    }, 0);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [
+    codeAgent,
+    composing,
+    conn,
+    launchModelsReload,
+    runtime.status,
+    selectedAccount?.id,
+    sessionKind,
+  ]);
 
   // 空查询列最近会话；输入后做短 debounce，旧请求通过 effect cleanup 丢弃。
   useEffect(() => {
@@ -345,24 +420,37 @@ export default function HostScreen() {
     }
     pendingCreateRef.current = true;
     const accountOption = selectedAccount ? { accountId: selectedAccount.id } : {};
+    const modelOption =
+      sessionKind === "structured" &&
+      codeAgent !== null &&
+      selectedLaunchModelInfo !== undefined
+        ? {
+            model: selectedLaunchModelInfo.id,
+            ...(selectedLaunchEffort ? { effort: selectedLaunchEffort } : {}),
+          }
+        : {};
     const sessionOptions:
       | {
           mode?: "default" | "plan";
           resume?: { id: string; title?: string };
           goal?: string;
           accountId?: string;
+          model?: string;
+          effort?: string;
         }
       | undefined =
       launchIntent === "goal"
-        ? {
-            ...accountOption,
-            goal: objective,
+          ? {
+              ...accountOption,
+              ...modelOption,
+              goal: objective,
             ...(RESUMABLE.includes(agent) ? { mode: "plan" as const } : {}),
           }
         : sessionKind === "structured" && RESUMABLE.includes(agent)
-          ? {
-              ...accountOption,
-              mode: launchMode,
+            ? {
+                ...accountOption,
+                ...modelOption,
+                mode: launchMode,
               ...(selectedResume
                 ? { resume: { id: selectedResume.id, title: selectedResume.title } }
                 : {}),
@@ -757,6 +845,92 @@ export default function HostScreen() {
                   ? "消息、工具调用和审批以卡片展示"
                   : `启动 ${agent} TUI，可直接操作完整终端`}
               </Text>
+              {sessionKind === "structured" && codeAgent && conn?.supportsSessionCreateModel && (
+                <>
+                  <View style={[styles.accountLabelRow, styles.kindLabel]}>
+                    <Text style={styles.formLabel}>模型</Text>
+                    <Pressable
+                      onPress={() => setLaunchModelsReload((value) => value + 1)}
+                      disabled={launchModelsLoading}
+                      hitSlop={8}
+                      accessibilityLabel="刷新可选模型"
+                    >
+                      <Text style={styles.accountManage}>
+                        {launchModelsLoading ? "读取中" : "刷新"}
+                      </Text>
+                    </Pressable>
+                  </View>
+                  {launchModelsLoading && launchModels.length === 0 ? (
+                    <View style={styles.modelLoading}>
+                      <ActivityIndicator size="small" color={color.accent} />
+                      <Text style={styles.kindHelp}>从 {agent} 读取实时模型目录…</Text>
+                    </View>
+                  ) : (
+                    <>
+                      {launchModelsError && (
+                        <Text style={styles.resumeError}>{launchModelsError}</Text>
+                      )}
+                      {launchModels.length > 0 && (
+                        <View style={styles.chips} accessibilityRole="radiogroup">
+                          {launchModels.map((model) => {
+                            const active = selectedLaunchModel === model.id;
+                            return (
+                              <Pressable
+                                key={model.id}
+                                style={[styles.chip, active && styles.chipActive]}
+                                onPress={() => {
+                                  setSelectedLaunchModel(model.id);
+                                  setSelectedLaunchEffort(
+                                    model.defaultEffort ?? model.supportedEfforts[0] ?? null,
+                                  );
+                                }}
+                                accessibilityRole="radio"
+                                accessibilityState={{ checked: active }}
+                                accessibilityLabel={`模型 ${model.label}`}
+                              >
+                                <Text
+                                  style={[styles.chipText, active && styles.chipTextActive]}
+                                  numberOfLines={1}
+                                >
+                                  {model.label}
+                                </Text>
+                              </Pressable>
+                            );
+                          })}
+                        </View>
+                      )}
+                      {selectedLaunchModelInfo?.description && (
+                        <Text style={styles.kindHelp} numberOfLines={2}>
+                          {selectedLaunchModelInfo.description}
+                        </Text>
+                      )}
+                      {(selectedLaunchModelInfo?.supportedEfforts.length ?? 0) > 0 && (
+                        <>
+                          <Text style={[styles.formLabel, styles.modelEffortLabel]}>推理强度</Text>
+                          <View style={styles.chips} accessibilityRole="radiogroup">
+                            {selectedLaunchModelInfo?.supportedEfforts.map((effort) => {
+                              const active = selectedLaunchEffort === effort;
+                              return (
+                                <Pressable
+                                  key={effort}
+                                  style={[styles.chip, active && styles.chipActive]}
+                                  onPress={() => setSelectedLaunchEffort(effort)}
+                                  accessibilityRole="radio"
+                                  accessibilityState={{ checked: active }}
+                                >
+                                  <Text style={[styles.chipText, active && styles.chipTextActive]}>
+                                    {effort}
+                                  </Text>
+                                </Pressable>
+                              );
+                            })}
+                          </View>
+                        </>
+                      )}
+                    </>
+                  )}
+                </>
+              )}
               {sessionKind === "structured" && (
                 <>
                   <Text style={[styles.formLabel, styles.kindLabel]}>发起方式</Text>
@@ -1559,6 +1733,8 @@ const styles = StyleSheet.create({
   accountManage: { color: color.accent, fontSize: 12, fontWeight: "600" },
   accountDot: { width: 7, height: 7, borderRadius: 4 },
   kindLabel: { marginTop: space.xs },
+  modelLoading: { flexDirection: "row", alignItems: "center", gap: space.sm, minHeight: 34 },
+  modelEffortLabel: { marginTop: 2 },
   kindSwitch: {
     flexDirection: "row",
     gap: 3,

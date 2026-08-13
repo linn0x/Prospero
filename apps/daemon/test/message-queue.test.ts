@@ -31,6 +31,10 @@ class QueueAdapter implements AgentAdapter {
     this.ctx?.emit({ kind: "turn.end", msgId: id, finish: "done" });
   }
 
+  emit(body: AgentEventBody): void {
+    this.ctx?.emit(body);
+  }
+
   async respondPermission(_reqId: string, _reply: PermissionReply): Promise<void> {}
   async interrupt(): Promise<void> {
     this.interrupts++;
@@ -64,6 +68,21 @@ describe("结构化会话消息队列", () => {
     await session.send("第二轮");
     expect(adapter.sends).toEqual(["第一轮", "第二轮"]);
     expect(session.info().status).toBe("running");
+    await session.dispose();
+  });
+
+  it("turn 已结束后迟到的工具收尾不会把会话重新卡回 running", async () => {
+    const adapter = new QueueAdapter();
+    const session = makeSession(adapter);
+    await session.start();
+    await session.send("等待 worker 报告");
+
+    adapter.emit({ kind: "tool.start", msgId: "turn-1", callId: "wait-1", tool: "bash", summary: "check --wait" });
+    adapter.finish("turn-1");
+    expect(session.info().status).toBe("completed");
+
+    adapter.emit({ kind: "tool.end", callId: "wait-1", state: "success", summary: "收到报告" });
+    expect(session.info().status).toBe("completed");
     await session.dispose();
   });
 

@@ -464,6 +464,20 @@ describe("决策门", () => {
     expect(store.listReadyTasks(runId).map((t) => t.id)).toEqual([a.id]);
   });
 
+  it("解开仍有活动 worker 的门时保留 dispatched，worker 仍可显式交付", () => {
+    const { store, runId } = seed();
+    const task = store.createTask({ runId, title: "A", spec: "" });
+    const dispatch = store.createDispatch({ taskId: task.id, sessionId: "worker" });
+    const gate = store.createGate({ runId, taskId: task.id, question: "继续吗？" });
+
+    expect(store.getTask(task.id).status).toBe("blocked");
+    store.resolveGate(gate.id, "继续");
+
+    expect(store.getTask(task.id).status).toBe("dispatched");
+    expect(store.getDispatch(dispatch.id).state).toBe("starting");
+    expect(() => store.setTaskStatus(task.id, "failed", "验收未完成")).not.toThrow();
+  });
+
   it("同一任务的其他 pending gate 仍在时，不能被提前放回 pending", () => {
     const { store, runId } = seed();
     const task = store.createTask({ runId, title: "A", spec: "" });

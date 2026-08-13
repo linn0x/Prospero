@@ -20,6 +20,7 @@ import {
   CAPABILITY_ORCHESTRATION_MANAGEMENT,
   CAPABILITY_ORCHESTRATION_MANUAL,
   CAPABILITY_ORCHESTRATION_SNAPSHOT,
+  CAPABILITY_SESSION_CREATE_MODEL,
   CAPABILITY_SUBAGENT_HISTORY,
   CLOSE_AUTH_FAILED,
   CLOSE_REVOKED,
@@ -150,6 +151,7 @@ export class HostConnection {
     if (capability === CAPABILITY_SUBAGENT_HISTORY) return version >= 9;
     if (capability === CAPABILITY_AGENT_ACCOUNTS) return version >= 10;
     if (capability === CAPABILITY_CHAT_ATTACHMENT_PREVIEWS) return version >= 11;
+    if (capability === CAPABILITY_SESSION_CREATE_MODEL) return version >= 11;
     return false;
   }
 
@@ -187,6 +189,10 @@ export class HostConnection {
 
   get supportsChatAttachmentPreviews(): boolean {
     return this.supportsCapability(CAPABILITY_CHAT_ATTACHMENT_PREVIEWS);
+  }
+
+  get supportsSessionCreateModel(): boolean {
+    return this.supportsCapability(CAPABILITY_SESSION_CREATE_MODEL);
   }
 
   start(): void {
@@ -548,6 +554,7 @@ export class HostConnection {
       case "git.done":
       case "usage.result":
       case "chat.suggestions":
+      case "launch.models":
       case "agent.models":
       case "agent.modes":
       case "agent.control.result":
@@ -604,6 +611,8 @@ export class HostConnection {
           ? `#subagent.history:${msg.requestId}`
         : msg.type === "agent.models"
           ? `#agent.models:${msg.requestId}`
+          : msg.type === "launch.models"
+            ? `#launch.models:${msg.requestId}`
           : msg.type === "agent.modes"
             ? `#agent.modes:${msg.requestId}`
             : msg.type === "conversation.results"
@@ -976,6 +985,9 @@ export class HostConnection {
       goal?: string;
       /** 账号环境与 cwd 独立；多个账号可指向同一个项目。 */
       accountId?: string;
+      /** 从创建器实时目录中选择，保证第一轮就使用该模型。 */
+      model?: string;
+      effort?: string;
     },
   ): DeliveryResult {
     return this.send(
@@ -989,6 +1001,8 @@ export class HostConnection {
         ...(options?.resume ? { resume: options.resume } : {}),
         ...(options?.goal ? { goal: options.goal } : {}),
         ...(options?.accountId ? { accountId: options.accountId } : {}),
+        ...(options?.model ? { model: options.model } : {}),
+        ...(options?.effort ? { effort: options.effort } : {}),
         cols,
         rows,
       },
@@ -1310,6 +1324,31 @@ export class HostConnection {
 
   private agentRequestId(): string {
     return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
+  }
+
+  launchModels(
+    agent: "claude" | "codex",
+    accountId?: string,
+  ): Promise<Extract<S2CMessage, { type: "launch.models" }>> {
+    if (!this.supportsSessionCreateModel) {
+      return Promise.reject(new Error("请先升级 Mac 端以在创建会话时选择模型"));
+    }
+    const requestId = this.agentRequestId();
+    return this.fsRequest<Extract<S2CMessage, { type: "launch.models" }>>(
+      "#account",
+      `#launch.models:${requestId}`,
+      {
+        type: "launch.models.get",
+        requestId,
+        agent,
+        ...(accountId ? { accountId } : {}),
+      },
+      30_000,
+      false,
+    ).then((response) => {
+      if (response.error) throw new Error(response.error);
+      return response;
+    });
   }
 
   agentModels(sid: string): Promise<Extract<S2CMessage, { type: "agent.models" }>> {
