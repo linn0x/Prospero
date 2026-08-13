@@ -1099,7 +1099,7 @@ export default function HostScreen() {
         ListFooterComponent={
           projects.length > 0 ? (
             <Text style={styles.swipeHint}>
-              左滑项目可新建 · 左滑会话可{showArchived ? "恢复" : "归档"}或结束
+              左滑或点“更多”：项目可新建 · 会话可{showArchived ? "恢复" : "归档"}或结束
             </Text>
           ) : null
         }
@@ -1110,6 +1110,7 @@ export default function HostScreen() {
               <SwipeRow
                 actions={[
                   {
+                    id: "create-session",
                     label: "新会话",
                     symbol: "plus",
                     color: color.accentDim,
@@ -1160,18 +1161,21 @@ export default function HostScreen() {
                     const stale = runtime.status !== "connected";
                     const actions: SwipeAction[] = [
                       {
+                        id: "toggle-archive",
                         label: showArchived ? "恢复" : "归档",
                         symbol: "archivebox",
                         color: "#766A45",
                         onPress: () => changeArchive(session.id, !showArchived),
                       },
                       {
+                        id: "open-files",
                         label: "文件",
                         symbol: "doc.on.doc",
                         color: "#3a6ea5",
                         onPress: () => router.push(`/host/${hostId}/files/${session.id}`),
                       },
                       {
+                        id: "end-session",
                         label: done ? "移除" : "结束",
                         symbol: "trash",
                         color: "#e5534b",

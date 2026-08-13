@@ -12,10 +12,15 @@ describe("Android 折叠屏适配", () => {
     const app = JSON.parse(
       readFileSync(join(import.meta.dirname, "..", "app.json"), "utf8"),
     ) as {
-      expo: { orientation: string; plugins: unknown[] };
+      expo: {
+        orientation: string;
+        plugins: unknown[];
+        android: { predictiveBackGestureEnabled: boolean };
+      };
     };
     expect(app.expo.orientation).toBe("default");
     expect(app.expo.plugins).toContain("./plugins/with-foldable-support");
+    expect(app.expo.android.predictiveBackGestureEnabled).toBe(true);
   });
 
   it("预构建时显式允许调整窗口并移除方向和宽高比限制", () => {
