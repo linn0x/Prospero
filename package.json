@@ -1,7 +1,7 @@
 {
   "name": "prospero",
   "private": true,
-  "version": "0.0.1",
+  "version": "0.0.12",
   "license": "MIT",
   "description": "Control your coding agents from your phone. LAN/WireGuard direct, zero cloud.",
   "workspaces": [

@@ -31,6 +31,7 @@ import type {
 } from "@prospero/protocol";
 import { needsApproval } from "../approval-policy.js";
 import type { ResolvedSkill } from "../composer-context.js";
+import { DAEMON_VERSION } from "../version.js";
 import { fromUnifiedPatch } from "./diff.js";
 import {
   AdapterError,
@@ -283,7 +284,7 @@ export class CodexAdapter implements AgentAdapter {
     });
 
     await this.request("initialize", {
-      clientInfo: { name: "prospero", title: "Prospero", version: "0.0.1" },
+      clientInfo: { name: "prospero", title: "Prospero", version: DAEMON_VERSION },
       // collaborationMode / Plan 属于 app-server 的实验字段。未在 initialize
       // 显式协商时，新版 Codex 会接受会话却拒绝第一轮 turn/start。
       capabilities: {

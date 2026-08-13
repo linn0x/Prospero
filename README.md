@@ -44,6 +44,42 @@ Prospero 把你的 iPhone 或 Android 手机变成 Mac 上**所有 Coding Agent 
 | 离开电脑就失去上下文 | **手机与 Mac 状态一致**，从口袋里继续处理当前任务 |
 | 多个 Agent 并行时相互覆盖 | **可视化编排 + 隔离 worktree**，让协作过程更安全、更可预测 |
 
+## How to use
+
+> 需要 macOS 14+、Node.js 22+，以及至少一个已登录的 Agent CLI。构建 iOS 客户端需要
+> Xcode；Android 客户端需要 JDK 17 与 Android SDK。
+
+### 1. 在 Mac 启动 Prospero
+
+```bash
+git clone https://github.com/linn0x/Prospero.git
+cd Prospero
+npm ci
+npm run build -w @prospero/daemon
+node apps/daemon/dist/cli.js start --name my-mac
+```
+
+### 2. 在手机运行客户端
+
+```bash
+# iPhone 真机
+npm run ios -w @prospero/mobile -- --device
+
+# Android 设备或模拟器
+npm run android -w @prospero/mobile
+```
+
+### 3. 扫码配对并启动 Agent
+
+保持 daemon 运行，在另一个终端生成配对二维码：
+
+```bash
+node apps/daemon/dist/cli.js pair --name my-phone
+```
+
+用 Prospero App 扫描二维码，选择 Mac 上的项目与 Agent，即可创建会话。同一局域网可直接连接；
+离开局域网时，让手机与 Mac 加入同一个 WireGuard 或 Tailscale 私有网络。
+
 > [!NOTE]
 > **Prospero 正在寻找同行者。** 欢迎成为 Contributor：分享想法、改进体验、修复问题，
 > 或和我们一起定义本地 Coding Agent 的未来。
