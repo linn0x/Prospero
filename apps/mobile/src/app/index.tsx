@@ -159,7 +159,7 @@ export default function HostsScreen() {
           ]}
           ListFooterComponent={
             hosts.length > 0 ? (
-              <Text style={styles.swipeHint}>左滑或点“更多”可编辑连接地址或删除配对</Text>
+              <Text style={styles.swipeHint}>左滑可编辑连接地址或删除配对</Text>
             ) : null
           }
           renderItem={({ item, index }) => {
