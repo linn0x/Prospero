@@ -20,6 +20,7 @@ import type {
   CodeAgentKind,
   SessionInfo,
 } from "@prospero/protocol";
+import { programCommandFor } from "./agents.js";
 
 const execFile = promisify(execFileCallback);
 const require = createRequire(import.meta.url);
@@ -346,8 +347,9 @@ async function defaultRunner(
   args: string[],
   environment: Record<string, string>,
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  const command = programCommandFor(file, args);
   try {
-    const result = await execFile(file, args, {
+    const result = await execFile(command.file, command.args, {
       env: { ...process.env, ...environment },
       timeout: 12_000,
       maxBuffer: 256 * 1024,
@@ -366,9 +368,19 @@ async function defaultRunner(
       throw new AgentAccountError(`未安装 ${file}`, "agent_unavailable");
     }
     if (typeof failure.stdout === "string" || typeof failure.stderr === "string") {
+      const stdout = typeof failure.stdout === "string" ? failure.stdout : "";
+      const stderr = typeof failure.stderr === "string" ? failure.stderr : "";
+      if (
+        process.platform === "win32" &&
+        /is not recognized as an internal or external command|不是内部或外部命令/i.test(
+          `${stdout}\n${stderr}`,
+        )
+      ) {
+        throw new AgentAccountError(`未安装 ${file}`, "agent_unavailable");
+      }
       return {
-        stdout: typeof failure.stdout === "string" ? failure.stdout : "",
-        stderr: typeof failure.stderr === "string" ? failure.stderr : "",
+        stdout,
+        stderr,
         exitCode: typeof failure.code === "number" ? failure.code : 1,
       };
     }
@@ -657,6 +669,9 @@ export class AgentAccountManager {
       const result = await this.runner("codex", ["login", "status"], binding.environment);
       const output = `${result.stdout}\n${result.stderr}`.trim();
       if (/not logged in/i.test(output) || output.length === 0) return { status: "signed_out" };
+      if (result.exitCode !== 0) {
+        return { status: "error", detail: "Codex CLI 无法读取登录状态" };
+      }
       const match = output.match(/logged in(?: using| with)?\s+(.+)/i);
       return {
         status: "signed_in",

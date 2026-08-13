@@ -154,7 +154,7 @@ export default function FilePreviewScreen(): React.ReactElement {
       {loading ? (
         <View style={styles.center}>
           <ActivityIndicator color={color.accent} />
-          <Text style={styles.dim}>正在从 Mac 读取…</Text>
+          <Text style={styles.dim}>正在从电脑读取…</Text>
         </View>
       ) : error ? (
         <View style={styles.center}>

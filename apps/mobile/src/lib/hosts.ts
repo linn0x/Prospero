@@ -20,7 +20,7 @@ const SECURE_OPTIONS = {
 };
 
 export interface StoredHost {
-  /** daemon 公钥前缀,同一台 Mac 重新配对会覆盖而非新增 */
+/** daemon 公钥前缀,同一台电脑重新配对会覆盖而非新增 */
   id: string;
   name: string;
   addrs: string[];

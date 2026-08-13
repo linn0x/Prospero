@@ -1,27 +1,69 @@
-# deps
+# Dependencies and package-manager caches
 node_modules/
+.npm/
+.npm-cache/
+.pnpm-store/
+.yarn/cache/
 
-# build
+# TypeScript, test, and generated build outputs
 dist/
+build/
+coverage/
+.nyc_output/
+web-build/
 *.tsbuildinfo
+*.apk
+*.aab
+*.ipa
+*.xcarchive/
 
-# expo / ios / android
-apps/mobile/.expo/
+# Local build-tool homes and native intermediates
+.cache/
+.expo/
+.expo-home/
+.gradle/
+.gradle-home/
+.kotlin/
+.cxx/
+.externalNativeBuild/
+.metro-health-check*
+local.properties
+*.hprof
+
+# Generated mobile native projects
 apps/mobile/ios/
 apps/mobile/android/
 apps/mobile/expo-env.d.ts
 
-# swift 菜单栏壳
+# Swift and Xcode build state
 apps/shell/.build/
-apps/shell/build/
+DerivedData/
+xcuserdata/
+*.xcuserstate
 
-# env & local
+# Signing credentials and provisioning files
+*.jks
+*.keystore
+*.p8
+*.p12
+*.mobileprovision
+
+# Environment and machine-local configuration
 .env
 .env.*
+!.env.example
+!.env.*.example
 *.local
 
-# macOS
-.DS_Store
-
-# logs
+# Logs, temporary files, and patch leftovers
 *.log
+*.pid
+*.pid.lock
+*.tmp
+*.temp
+*.orig.*
+
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini

@@ -35,7 +35,7 @@ function detailFor(entry: FsEntry): string {
 function errorText(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   if (/workspace\.list|invalid discriminator|unrecognized|bad_message/i.test(message)) {
-    return "Mac 端服务版本较旧，暂时无法预览目录。关闭后仍可手动输入完整路径。";
+      return "电脑端服务版本较旧，暂时无法预览目录。关闭后仍可手动输入完整路径。";
   }
   return message;
 }
@@ -193,7 +193,7 @@ export function WorkspacePicker({
               loading ? (
                 <View style={styles.emptyState}>
                   <ActivityIndicator color={color.accent} />
-                  <Text style={styles.emptyDetail}>正在读取 Mac 上的目录…</Text>
+          <Text style={styles.emptyDetail}>正在读取电脑上的目录…</Text>
                 </View>
               ) : error !== null ? (
                 <View style={styles.emptyState}>

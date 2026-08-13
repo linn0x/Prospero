@@ -54,6 +54,7 @@ import { SessionError, SessionManager } from "./session-manager.js";
 import { StatusFile } from "./status-file.js";
 import {
   ControlSocketError,
+  controlSocketPath as makeControlSocketPath,
   startControlSocket,
   type ControlSocketServer,
 } from "./control-socket.js";
@@ -210,7 +211,7 @@ export async function createDaemonServer(
     const b = Buffer.from(controlToken);
     return a.length === b.length && timingSafeEqual(a, b);
   };
-  const controlSocketPath = path.join(opts.home, "control.sock");
+  const controlSocketPath = makeControlSocketPath(opts.home);
   const controlTokenPath = path.join(opts.home, "control.token");
   // `apps/daemon/bin/prospero` 是 package 安装前的本地入口；npm 安装后仍由
   // package bin 指向同一文件。每个 agent 的 PATH 都优先找到它。

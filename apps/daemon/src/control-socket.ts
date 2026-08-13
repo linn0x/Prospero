@@ -5,7 +5,7 @@
  * 小而明确的 RPC 边界。这里使用 Unix domain socket + NDJSON：每个请求一行、
  * 每个响应一行，连接可以短暂也可以复用。socket 与 token 文件都只允许当前用户读写。
  */
-import { timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { chmodSync, lstatSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Socket } from "node:net";
 import path from "node:path";
@@ -50,6 +50,15 @@ export interface ControlSocketServer {
   close(): Promise<void>;
 }
 
+export function controlSocketPath(home: string): string {
+  if (process.platform !== "win32") return path.join(home, "control.sock");
+  const digest = createHash("sha256")
+    .update(path.resolve(home).toLowerCase())
+    .digest("hex")
+    .slice(0, 32);
+  return `\\\\.\\pipe\\prospero-${digest}`;
+}
+
 function tokenEqual(expected: string, supplied: unknown): boolean {
   if (typeof supplied !== "string") return false;
   const a = Buffer.from(expected);
@@ -83,18 +92,29 @@ function write(socket: Socket, response: ControlResponse): void {
 export async function startControlSocket(opts: ControlSocketOptions): Promise<ControlSocketServer> {
   mkdirSync(opts.home, { recursive: true, mode: 0o700 });
   chmodSync(opts.home, 0o700);
-  const socketPath = path.join(opts.home, "control.sock");
+  const socketPath = controlSocketPath(opts.home);
+  const legacySocketPath = path.join(opts.home, "control.sock");
   const tokenPath = path.join(opts.home, "control.token");
 
   // Unix socket 不能复用旧路径；daemon 异常退出时留下的是 socket 文件。若路径
   // 被普通文件占住，宁可报错也不覆盖同目录中可能由用户放进去的内容。
-  try {
-    if (!lstatSync(socketPath).isSocket()) {
-      throw new ControlSocketError(`${socketPath} 已被非 socket 文件占用`, "socket_path_occupied");
+  if (process.platform === "win32") {
+    try {
+      if (!lstatSync(legacySocketPath).isSocket()) {
+        throw new ControlSocketError(`${legacySocketPath} 已被非 socket 文件占用`, "socket_path_occupied");
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
-    rmSync(socketPath, { force: true });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  } else {
+    try {
+      if (!lstatSync(socketPath).isSocket()) {
+        throw new ControlSocketError(`${socketPath} 已被非 socket 文件占用`, "socket_path_occupied");
+      }
+      rmSync(socketPath, { force: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
   }
   writeFileSync(tokenPath, `${opts.token}\n`, { mode: 0o600 });
   chmodSync(tokenPath, 0o600);
@@ -143,7 +163,7 @@ export async function startControlSocket(opts: ControlSocketOptions): Promise<Co
     rmSync(tokenPath, { force: true });
     throw error;
   }
-  chmodSync(socketPath, 0o600);
+  if (process.platform !== "win32") chmodSync(socketPath, 0o600);
 
   return {
     path: socketPath,
@@ -152,7 +172,7 @@ export async function startControlSocket(opts: ControlSocketOptions): Promise<Co
       // 一个半写请求的本地 client 不能让 daemon 关机永远卡在 server.close()。
       for (const client of clients) client.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
-      rmSync(socketPath, { force: true });
+      if (process.platform !== "win32") rmSync(socketPath, { force: true });
       rmSync(tokenPath, { force: true });
     },
   };

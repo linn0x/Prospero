@@ -218,7 +218,7 @@ export async function listWorktrees(repo: string): Promise<WorktreeInfo[]> {
 
 function finishWorktree(partial: Partial<WorktreeInfo>): WorktreeInfo {
   return {
-    path: partial.path ?? "",
+    path: partial.path ? path.normalize(partial.path) : "",
     branch: partial.branch ?? null,
     head: partial.head ?? "",
     detached: partial.detached ?? partial.branch === undefined,
