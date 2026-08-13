@@ -2,6 +2,7 @@
   "name": "@prospero/mobile",
   "main": "expo-router/entry",
   "version": "0.0.1",
+  "license": "MIT",
   "dependencies": {
     "@expo/vector-icons": "^15.0.2",
     "@prospero/protocol": "*",

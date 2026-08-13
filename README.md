@@ -337,5 +337,4 @@ npm test -w @prospero/daemon
 
 ## License
 
-仓库目前尚未指定根目录开源许可证。在许可证确定前，公开可读不代表自动获得复制、修改或
-分发授权。准备对外接受使用与贡献前，请先选择并加入明确的 `LICENSE`。
+Prospero 采用 [MIT License](LICENSE) 开源。
