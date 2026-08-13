@@ -12,6 +12,7 @@ import {
   View,
 } from "react-native";
 import * as Haptics from "expo-haptics";
+import * as Linking from "expo-linking";
 import { KeyboardAvoidingView } from "react-native-keyboard-controller";
 import { useHeaderHeight } from "expo-router/build/react-navigation/elements";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -37,7 +38,14 @@ import { QuickReplies } from "@/components/QuickReplies";
 import { Terminal, type TerminalHandle } from "@/components/Terminal";
 import { VoiceButton } from "@/components/VoiceButton";
 import { useAdaptiveLayout } from "@/lib/adaptive-layout";
-import { pickFromCamera, pickFromLibrary, type PickedImage } from "@/lib/attach";
+import {
+  pickFromCamera,
+  pickFromLibrary,
+  recoverPendingPickerResult,
+  type ImagePickResult,
+  type PickedImage,
+  type PickerSource,
+} from "@/lib/attach";
 import { Meter, Row, Sheet } from "@/components/Sheet";
 import { toast } from "@/components/Toast";
 import { color, font, MONOSPACE_FONT, statusColor, utilizationColor } from "@/lib/theme";
@@ -53,6 +61,16 @@ import {
   activeComposerToken,
   replaceComposerToken,
 } from "@/lib/composer-completion";
+import {
+  MAX_COMPOSER_IMAGES,
+  clearComposerDraft,
+  clearPendingPickerContext,
+  getPendingPickerContext,
+  loadComposerDraft,
+  removeComposerDraftAttachment,
+  saveComposerDraft,
+  type ComposerDraftScope,
+} from "@/lib/composer-draft-store";
 
 type UsageResult = Extract<S2CMessage, { type: "usage.result" }>;
 
@@ -263,6 +281,7 @@ export default function SessionScreen() {
   }>();
   const { conn, runtime } = useHostConnection(hostId);
   const [draft, setDraft] = useState("");
+  const [draftHydratedFor, setDraftHydratedFor] = useState("");
   /** 被连接层拒绝的消息留在编辑器中，直到用户确认修改或重试。 */
   const [deliveryError, setDeliveryError] = useState<string | null>(null);
   const [selection, setSelection] = useState({ start: 0, end: 0 });
@@ -323,6 +342,7 @@ export default function SessionScreen() {
   const displayedEffort = currentEffort ?? agentControls?.currentEffort;
   const displayedMode = currentMode ?? agentControls?.currentMode;
   const [images, setImages] = useState<PickedImage[]>([]);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const termRef = useRef<TerminalHandle>(null);
   const [fontSize, setFontSize] = useState(12);
   const composerToken = useMemo(
@@ -339,6 +359,16 @@ export default function SessionScreen() {
   const completionLoading =
     completionKind !== null &&
     (completionResult.key !== completionKey || completionResult.loading);
+  const composerScope = useMemo<ComposerDraftScope | null>(
+    () => hostId && sid
+      ? { hostId, sid, ...(subagentId ? { subagentId } : {}) }
+      : null,
+    [hostId, sid, subagentId],
+  );
+  const composerScopeKey = composerScope
+    ? `${composerScope.hostId}\u0000${composerScope.sid}\u0000${composerScope.subagentId ?? ""}`
+    : "";
+  const draftHydrated = draftHydratedFor === composerScopeKey;
 
   // 深链冷启动时 hello.ok 的会话列表可能尚未进入 zustand。先 attach 同一个 sid，
   // 不跳转、不新建，等主机状态收敛后当前路由自然恢复为完整会话页。
@@ -346,6 +376,49 @@ export default function SessionScreen() {
     if (!conn || !sid || session || runtime.status !== "connected") return;
     conn.attach(sid);
   }, [conn, runtime.status, session, sid]);
+
+  // Drafts are scoped to the exact host/session/subagent route. Do not autosave the previous
+  // screen's empty initial state over a draft before this read completes.
+  useEffect(() => {
+    if (!composerScope) return;
+    let alive = true;
+    const start = setTimeout(() => {
+      setDraftHydratedFor("");
+      setDraft("");
+      setSelection({ start: 0, end: 0 });
+      setImages([]);
+      setAttachmentError(null);
+      void loadComposerDraft(composerScope)
+        .then((restored) => {
+          if (!alive) return;
+          setDraft(restored.draft?.text ?? "");
+          setSelection(restored.draft?.selection ?? { start: 0, end: 0 });
+          setImages(restored.draft ? [...restored.draft.images] : []);
+          if (restored.discardedAttachments > 0) {
+            setAttachmentError("部分草稿图片的本地缓存已失效，已保留文字并移除这些图片。");
+          }
+          setDraftHydratedFor(composerScopeKey);
+        })
+        .catch((error: unknown) => {
+          if (!alive) return;
+          setAttachmentError(`无法恢复草稿：${error instanceof Error ? error.message : String(error)}`);
+          setDraftHydratedFor(composerScopeKey);
+        });
+    }, 0);
+    return () => {
+      alive = false;
+      clearTimeout(start);
+    };
+  }, [composerScope, composerScopeKey]);
+
+  // AsyncStorage deliberately receives only text, selection and file metadata; JPEG base64 stays
+  // in the dedicated cache file and current in-memory image list.
+  useEffect(() => {
+    if (!composerScope || !draftHydrated) return;
+    void saveComposerDraft(composerScope, { text: draft, selection, images }).catch((error: unknown) => {
+      setAttachmentError(`无法保存草稿：${error instanceof Error ? error.message : String(error)}`);
+    });
+  }, [composerScope, draft, draftHydrated, images, selection]);
 
   useEffect(() => {
     const sequence = ++completionSequence.current;
@@ -463,6 +536,125 @@ export default function SessionScreen() {
       .finally(() => setControlsLoading(false));
   }, [conn, sid]);
 
+  const presentAttachmentError = useCallback((message: string): void => {
+    setAttachmentError(message);
+    Alert.alert("图片无法添加", message);
+  }, []);
+
+  const appendPickedImages = useCallback(
+    async (picked: readonly PickedImage[]): Promise<void> => {
+      if (!composerScope || picked.length === 0) return;
+      const room = MAX_IMAGES - images.length;
+      const accepted = picked.slice(0, Math.max(0, room));
+      if (accepted.length === 0) {
+        presentAttachmentError("最多只能添加 6 张图片。");
+        return;
+      }
+      const next = [...images, ...accepted];
+      try {
+        // A selected image is persisted before it enters visible composer state.
+        await saveComposerDraft(composerScope, { text: draft, selection, images: next });
+        setImages(next);
+        setAttachmentError(null);
+      } catch (error) {
+        await Promise.allSettled(accepted.map((image) => removeComposerDraftAttachment(composerScope, image.uri)));
+        presentAttachmentError(`无法保存图片草稿：${error instanceof Error ? error.message : String(error)}`);
+      }
+    },
+    [composerScope, draft, images, presentAttachmentError, selection],
+  );
+
+  const applyPickerResult = useCallback(
+    async (result: ImagePickResult): Promise<void> => {
+      if (result.status === "selected") {
+        await appendPickedImages(result.images);
+      } else if (result.status === "error") {
+        presentAttachmentError(result.message);
+      }
+      // cancelled and permission_denied are handled by the initiating path. A genuine cancel stays silent.
+    },
+    [appendPickedImages, presentAttachmentError],
+  );
+
+  const pickAgainRef = useRef<(source: PickerSource) => void>(() => undefined);
+  const startPicker = useCallback(
+    async (source: PickerSource): Promise<void> => {
+      if (!composerScope || !draftHydrated) return;
+      const room = MAX_IMAGES - images.length;
+      if (room <= 0) {
+        Alert.alert("最多 6 张", "先移除几张再添加。");
+        return;
+      }
+      try {
+        // Android needs the exact draft safely flushed before it hands control to the picker activity.
+        await saveComposerDraft(composerScope, { text: draft, selection, images });
+      } catch (error) {
+        presentAttachmentError(`无法保存草稿：${error instanceof Error ? error.message : String(error)}`);
+        return;
+      }
+      const pendingContext = Platform.OS === "android"
+        ? { ...composerScope, source, createdAt: Date.now() }
+        : undefined;
+      const result = source === "library"
+        ? await pickFromLibrary(room, pendingContext)
+        : await pickFromCamera(pendingContext);
+      if (result.status === "permission_denied") {
+        const subject = result.source === "library" ? "相册" : "相机";
+        Alert.alert(
+          "需要权限",
+          result.canAskAgain
+            ? `允许访问${subject}后才能添加图片。`
+            : `${subject}权限已被系统关闭。请在系统设置中允许 Prospero 访问${subject}。`,
+          result.canAskAgain
+            ? [
+              { text: "取消", style: "cancel" },
+              { text: "重新授权", onPress: () => pickAgainRef.current(result.source) },
+            ]
+            : [
+              { text: "取消", style: "cancel" },
+              { text: "打开系统设置", onPress: () => { void Linking.openSettings(); } },
+            ],
+        );
+        return;
+      }
+      await applyPickerResult(result);
+    },
+    [applyPickerResult, composerScope, draft, draftHydrated, images, presentAttachmentError, selection],
+  );
+  useEffect(() => {
+    pickAgainRef.current = (source) => { void startPicker(source); };
+  }, [startPicker]);
+
+  // getPendingResultAsync is global to Android's picker. Check our persisted context first so a
+  // result can never be consumed while viewing a different host/session/subagent.
+  useEffect(() => {
+    if (Platform.OS !== "android" || !composerScope || !draftHydrated) return;
+    let alive = true;
+    void (async () => {
+      try {
+        const lookup = await getPendingPickerContext(composerScope);
+        const pending = lookup.context;
+        if (!pending) return;
+        try {
+          const result = await recoverPendingPickerResult(
+            pending.source,
+            pending.source === "camera" ? 1 : Math.max(1, MAX_IMAGES - images.length),
+          );
+          if (!alive) return;
+          await applyPickerResult(result);
+        } finally {
+          // Normal return, cancellation, picker error and stale activity recovery all clear context.
+          await clearPendingPickerContext(pending);
+        }
+      } catch (error) {
+        if (alive) {
+          presentAttachmentError(`无法恢复图片选择：${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    })();
+    return () => { alive = false; };
+  }, [applyPickerResult, composerScope, draftHydrated, images.length, presentAttachmentError]);
+
   const send = useCallback(
     (text: string, deliveryOverride?: ChatDelivery): void => {
       const t = text.trim();
@@ -523,6 +715,7 @@ export default function SessionScreen() {
       setDraft("");
       setSelection({ start: 0, end: 0 });
       setDeliveryError(null);
+      if (composerScope) void clearComposerDraft(composerScope);
       completionSequence.current++;
     },
     [
@@ -539,6 +732,7 @@ export default function SessionScreen() {
       selectMode,
       setDraft,
       setImages,
+      composerScope,
     ],
   );
 
@@ -572,14 +766,15 @@ export default function SessionScreen() {
   };
 
   const attach = (): void => {
+    if (!draftHydrated) return;
     const room = MAX_IMAGES - images.length;
     if (room <= 0) {
       Alert.alert("最多 6 张", "先移除几张再添加。");
       return;
     }
     Alert.alert("添加图片", undefined, [
-      { text: "从相册选", onPress: () => void pickFromLibrary(room).then((p) => setImages((v) => [...v, ...p])) },
-      { text: "拍一张", onPress: () => void pickFromCamera().then((p) => setImages((v) => [...v, ...p])) },
+      { text: "从相册选", onPress: () => { void startPicker("library"); } },
+      { text: "拍一张", onPress: () => { void startPicker("camera"); } },
       { text: "取消", style: "cancel" },
     ]);
   };
@@ -776,6 +971,7 @@ export default function SessionScreen() {
       : [];
   const terminalInputEnabled = runtime.status === "connected";
   const canSend =
+    draftHydrated &&
     (draft.trim().length > 0 || (isChat && !isSubagent && images.length > 0)) &&
     (isChat || terminalInputEnabled);
 
@@ -1215,7 +1411,14 @@ export default function SessionScreen() {
               <Pressable
                 style={styles.thumbX}
                 hitSlop={6}
-                onPress={() => setImages((v) => v.filter((_, j) => j !== i))}
+                onPress={() => {
+                  setImages((v) => v.filter((_, j) => j !== i));
+                  if (composerScope) {
+                    void removeComposerDraftAttachment(composerScope, img.uri).catch((error: unknown) => {
+                      setAttachmentError(`无法移除图片缓存：${error instanceof Error ? error.message : String(error)}`);
+                    });
+                  }
+                }}
                 accessibilityRole="button"
                 accessibilityLabel={`移除第 ${String(i + 1)} 张图片`}
               >
@@ -1405,6 +1608,16 @@ export default function SessionScreen() {
           <Text style={styles.deliveryErrorText}>{deliveryError}</Text>
         </View>
       )}
+      {attachmentError && (
+        <View
+          style={styles.attachmentError}
+          accessible
+          accessibilityLiveRegion="assertive"
+          accessibilityLabel={attachmentError}
+        >
+          <Text style={styles.attachmentErrorText}>{attachmentError}</Text>
+        </View>
+      )}
       <View style={[styles.composer, { paddingBottom: Math.max(insets.bottom, 8) }]}>
         <DismissKey visible={focused} />
         {isChat && !isSubagent && (
@@ -1486,7 +1699,7 @@ export default function SessionScreen() {
 }
 
 /** 与协议里的上限一致 */
-const MAX_IMAGES = 6;
+const MAX_IMAGES = MAX_COMPOSER_IMAGES;
 
 const styles = StyleSheet.create({
   adaptiveRoot: { flex: 1, backgroundColor: color.bg },
@@ -1972,4 +2185,12 @@ const styles = StyleSheet.create({
     borderTopColor: color.danger,
   },
   deliveryErrorText: { color: color.danger, fontSize: 12, lineHeight: 17, textAlign: "center" },
+  attachmentError: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    backgroundColor: color.dangerBg,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: color.danger,
+  },
+  attachmentErrorText: { color: color.danger, fontSize: 12, lineHeight: 17, textAlign: "center" },
 });
