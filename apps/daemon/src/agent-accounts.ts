@@ -15,6 +15,8 @@ import os from "node:os";
 import { promisify } from "node:util";
 import type {
   AgentAccount,
+  AgentApiProfile,
+  AgentApiProvider,
   AgentAccountStatus,
   AgentCredentialKind,
   CodeAgentKind,
@@ -36,8 +38,15 @@ interface StoredAccount {
   id: string;
   agent: CodeAgentKind;
   name: string;
+  /** 非敏感的第三方 API 连接信息；key 单独存系统安全存储。 */
+  apiProfile?: StoredApiProfile;
   createdAt: number;
   updatedAt: number;
+}
+
+interface StoredApiProfile {
+  baseUrl: string;
+  model: string;
 }
 
 interface AccountStore {
@@ -52,6 +61,10 @@ export interface AccountBinding {
   name: string;
   managed: boolean;
   environment: Record<string, string>;
+  /** 已配置的 API Profile，不含 secret，供状态与会话启动区分。 */
+  apiProfile?: AgentApiProfile;
+  /** Codex app-server 的受控配置覆盖；避免修改用户的全局 config.toml。 */
+  codexAppServerArgs?: string[];
   /** Never contains the secret itself; only lets status/UI describe the configured source. */
   credentialKind?: AgentCredentialKind;
 }
@@ -70,6 +83,12 @@ export type AccountCommandRunner = (
 export interface AgentAccountCredential {
   kind: AgentCredentialKind;
   secret: string;
+}
+
+export interface ApiProfileInput {
+  baseUrl: string;
+  model: string;
+  apiKey: string;
 }
 
 /** Injectable so tests never touch the host Keychain. */
@@ -119,10 +138,12 @@ function parseStore(value: unknown): AccountStore {
         ) {
           return [];
         }
+        const apiProfile = parseStoredApiProfile(account["apiProfile"]);
         return [{
           id: account["id"],
           agent: account["agent"],
           name: account["name"].trim().slice(0, 80),
+          ...(apiProfile ? { apiProfile } : {}),
           createdAt: Math.max(0, Math.round(account["createdAt"])),
           updatedAt: Math.max(0, Math.round(account["updatedAt"])),
         }];
@@ -166,6 +187,74 @@ function cleanCredential(
   return { kind, secret };
 }
 
+function cleanApiKey(rawSecret: string): AgentAccountCredential {
+  const secret = rawSecret.trim();
+  if (secret.length === 0 || secret.length > 8192 || /[\r\n\0]/.test(secret)) {
+    throw new AgentAccountError("API Key 格式无效", "account_invalid");
+  }
+  return { kind: "api_key", secret };
+}
+
+function apiProviderFor(agent: CodeAgentKind): AgentApiProvider {
+  return agent === "codex" ? "openai_compatible" : "anthropic_compatible";
+}
+
+function cleanApiProfile(rawBaseUrl: string, rawModel: string): StoredApiProfile {
+  const baseUrl = rawBaseUrl.trim();
+  const model = rawModel.trim();
+  if (baseUrl.length === 0 || baseUrl.length > 2000 || /[\r\n\0]/.test(baseUrl)) {
+    throw new AgentAccountError("API 地址格式无效", "account_invalid");
+  }
+  if (model.length === 0 || model.length > 300 || /[\r\n\0]/.test(model)) {
+    throw new AgentAccountError("模型名称格式无效", "account_invalid");
+  }
+  let url: URL;
+  try {
+    url = new URL(baseUrl);
+  } catch {
+    throw new AgentAccountError("API 地址必须是完整 URL", "account_invalid");
+  }
+  const localHost = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]";
+  if ((url.protocol !== "https:" && !(url.protocol === "http:" && localHost)) ||
+      url.username || url.password || url.search || url.hash) {
+    throw new AgentAccountError("API 地址必须使用 HTTPS（localhost 可使用 HTTP）", "account_invalid");
+  }
+  url.pathname = url.pathname.replace(/\/+$/, "");
+  const normalized = url.toString().replace(/\/$/, "");
+  return { baseUrl: normalized, model };
+}
+
+function parseStoredApiProfile(value: unknown): StoredApiProfile | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  if (typeof raw["baseUrl"] !== "string" || typeof raw["model"] !== "string") return undefined;
+  try {
+    return cleanApiProfile(raw["baseUrl"], raw["model"]);
+  } catch {
+    return undefined;
+  }
+}
+
+function publicApiProfile(agent: CodeAgentKind, profile: StoredApiProfile): AgentApiProfile {
+  return { provider: apiProviderFor(agent), ...profile };
+}
+
+function tomlString(value: string): string {
+  return JSON.stringify(value);
+}
+
+function codexProviderArgs(profile: StoredApiProfile): string[] {
+  return [
+    "-c", `model_provider=${tomlString("prospero")}`,
+    "-c", `model=${tomlString(profile.model)}`,
+    "-c", `model_providers.prospero.name=${tomlString("Prospero external API")}`,
+    "-c", `model_providers.prospero.base_url=${tomlString(profile.baseUrl)}`,
+    "-c", `model_providers.prospero.env_key=${tomlString("OPENAI_API_KEY")}`,
+    "-c", `model_providers.prospero.wire_api=${tomlString("responses")}`,
+    "-c", "model_providers.prospero.requires_openai_auth=false",
+  ];
+}
+
 function parseCredential(raw: string): AgentAccountCredential | null {
   try {
     const value = JSON.parse(raw) as Record<string, unknown>;
@@ -175,7 +264,9 @@ function parseCredential(raw: string): AgentAccountCredential | null {
     ) {
       return null;
     }
-    return cleanCredential(value["kind"], value["secret"]);
+    return value["kind"] === "api_key"
+      ? cleanApiKey(value["secret"])
+      : cleanCredential(value["kind"], value["secret"]);
   } catch {
     return null;
   }
@@ -431,15 +522,42 @@ export class AgentAccountManager {
     const root = this.rootFor(account.agent, account.id);
     mkdirSync(root, { recursive: true, mode: 0o700 });
     chmodSync(root, 0o700);
-    const credential = account.agent === "claude"
+    const credential = (account.agent === "claude" || account.apiProfile)
       ? this.claudeCredential(account.id, root)
       : null;
-    return {
-      id: account.id,
-      agent: account.agent,
-      name: account.name,
-      managed: true,
-      environment:
+    const apiProfile = account.apiProfile
+      ? publicApiProfile(account.agent, account.apiProfile)
+      : undefined;
+    const environment = apiProfile
+      ? account.agent === "codex"
+        ? {
+            // 自定义 provider 只从本 Profile 的 key 取值，不能回退 daemon 的全局环境。
+            OPENAI_API_KEY: credential?.kind === "api_key" ? credential.secret : "",
+            OPENAI_BASE_URL: "",
+            OPENAI_API_BASE: "",
+            OPENAI_ORGANIZATION: "",
+            CODEX_API_KEY: "",
+            CODEX_ACCESS_TOKEN: "",
+            CODEX_REFRESH_TOKEN: "",
+            CODEX_HOME: root,
+            CODEX_SQLITE_HOME: root,
+          }
+        : {
+            ANTHROPIC_API_KEY: credential?.kind === "api_key" ? credential.secret : "",
+            ANTHROPIC_AUTH_TOKEN: "",
+            ANTHROPIC_BASE_URL: apiProfile.baseUrl,
+            ANTHROPIC_MODEL: apiProfile.model,
+            CLAUDE_CODE_API_BASE_URL: apiProfile.baseUrl,
+            CLAUDE_CODE_OAUTH_TOKEN: "",
+            CLAUDE_CODE_OAUTH_REFRESH_TOKEN: "",
+            CLAUDE_CODE_OAUTH_SCOPES: "",
+            CLAUDE_CODE_USE_BEDROCK: "",
+            CLAUDE_CODE_USE_VERTEX: "",
+            CLAUDE_CODE_USE_FOUNDRY: "",
+            CLAUDE_CODE_USE_GATEWAY: "",
+            CLAUDE_CONFIG_DIR: root,
+          }
+      :
         account.agent === "codex"
           ? {
               // 不能只换目录：daemon 若带着全局 API key 启动，子进程仍会绕过
@@ -470,7 +588,17 @@ export class AgentAccountManager {
               ...(credential?.kind === "api_key"
                 ? { ANTHROPIC_API_KEY: credential.secret, CLAUDE_CODE_OAUTH_TOKEN: "" }
                 : {}),
-            },
+            };
+    return {
+      id: account.id,
+      agent: account.agent,
+      name: account.name,
+      managed: true,
+      environment,
+      ...(apiProfile ? { apiProfile } : {}),
+      ...(apiProfile && account.agent === "codex" && account.apiProfile
+        ? { codexAppServerArgs: codexProviderArgs(account.apiProfile) }
+        : {}),
       ...(credential ? { credentialKind: credential.kind } : {}),
     };
   }
@@ -489,6 +617,50 @@ export class AgentAccountManager {
     const binding = this.resolve(account.id, agent);
     this.persist();
     return binding;
+  }
+
+  async createApi(
+    agent: CodeAgentKind,
+    rawName: string,
+    input: ApiProfileInput,
+  ): Promise<AccountBinding> {
+    const now = Date.now();
+    const profile = cleanApiProfile(input.baseUrl, input.model);
+    const credential = cleanApiKey(input.apiKey);
+    const account: StoredAccount = {
+      id: randomUUID(),
+      agent,
+      name: cleanName(rawName),
+      apiProfile: profile,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const root = this.rootFor(agent, account.id);
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    chmodSync(root, 0o700);
+    await this.credentialStore.write(account.id, root, credential);
+    this.credentialCache.set(account.id, credential);
+    this.store.accounts.push(account);
+    if (!this.store.defaults[agent]) this.store.defaults[agent] = account.id;
+    this.persist();
+    return this.resolve(account.id, agent);
+  }
+
+  async configureApi(accountId: string, input: ApiProfileInput): Promise<void> {
+    const account = this.requireManaged(accountId);
+    if (!account.apiProfile) {
+      throw new AgentAccountError("这个账号不是第三方 API Profile", "account_invalid");
+    }
+    const profile = cleanApiProfile(input.baseUrl, input.model);
+    const credential = cleanApiKey(input.apiKey);
+    const root = this.rootFor(account.agent, account.id);
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    chmodSync(root, 0o700);
+    await this.credentialStore.write(account.id, root, credential);
+    this.credentialCache.set(account.id, credential);
+    account.apiProfile = profile;
+    account.updatedAt = Date.now();
+    this.persist();
   }
 
   rename(accountId: string, rawName: string): void {
@@ -510,13 +682,19 @@ export class AgentAccountManager {
     rawSecret: string,
   ): Promise<void> {
     const account = this.requireManaged(accountId);
-    if (account.agent !== "claude") {
+    if (account.apiProfile) {
+      if (kind !== "api_key") {
+        throw new AgentAccountError("第三方 API Profile 只能使用 API Key", "account_invalid");
+      }
+    } else if (account.agent !== "claude") {
       throw new AgentAccountError("Codex 请使用官方设备登录流程", "account_invalid");
     }
     const root = this.rootFor(account.agent, account.id);
     mkdirSync(root, { recursive: true, mode: 0o700 });
     chmodSync(root, 0o700);
-    const credential = cleanCredential(kind, rawSecret);
+    const credential = account.apiProfile
+      ? cleanApiKey(rawSecret)
+      : cleanCredential(kind, rawSecret);
     await this.credentialStore.write(account.id, root, credential);
     this.credentialCache.set(account.id, credential);
     account.updatedAt = Date.now();
@@ -525,6 +703,9 @@ export class AgentAccountManager {
 
   loginSpec(accountId: string): AccountLoginSpec {
     const binding = this.resolve(accountId);
+    if (binding.apiProfile) {
+      throw new AgentAccountError("第三方 API Profile 无需 CLI 登录，请配置 API Key", "account_invalid");
+    }
     if (binding.agent === "claude" && binding.managed) {
       return {
         binding: {
@@ -554,10 +735,11 @@ export class AgentAccountManager {
 
   async logout(accountId: string): Promise<void> {
     const binding = this.resolve(accountId);
-    if (binding.agent === "claude" && binding.managed) {
+    if ((binding.agent === "claude" && binding.managed) || binding.apiProfile) {
       const root = this.rootFor(binding.agent, binding.id);
       await this.credentialStore.delete(binding.id, root);
       this.credentialCache.set(binding.id, null);
+      if (binding.apiProfile) return;
       // Clean credentials created by older Prospero builds on Linux/Windows. On
       // macOS we deliberately do not call `claude auth logout`: that command would
       // mutate Claude's shared native Keychain identity.
@@ -625,6 +807,7 @@ export class AgentAccountManager {
       name: binding.name,
       managed: binding.managed,
       isDefault: this.defaultId(binding.agent) === binding.id,
+      ...(binding.apiProfile ? { apiProfile: binding.apiProfile } : {}),
       ...statuses[index]!,
       createdAt,
       updatedAt,
@@ -636,6 +819,20 @@ export class AgentAccountManager {
     binding: AccountBinding,
   ): Promise<{ status: AgentAccountStatus; authMethod?: string; detail?: string }> {
     try {
+      if (binding.apiProfile) {
+        const version = await this.runner(binding.agent, ["--version"], binding.environment);
+        if (version.exitCode !== 0) {
+          return { status: "unavailable", detail: `${binding.agent} CLI 不可用` };
+        }
+        if (binding.credentialKind !== "api_key") {
+          return { status: "signed_out", detail: "需要配置该 Profile 的 API Key" };
+        }
+        return {
+          status: "signed_in",
+          authMethod: "API Key",
+          detail: `${binding.apiProfile.provider} · ${new URL(binding.apiProfile.baseUrl).host}`,
+        };
+      }
       if (binding.agent === "claude") {
         if (binding.managed && !binding.credentialKind) {
           await this.runner("claude", ["--version"], binding.environment);

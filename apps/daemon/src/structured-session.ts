@@ -83,6 +83,8 @@ export interface StructuredSessionOptions {
   adapter: AgentAdapter;
   /** 给本机会话子进程的环境；用于会话内 prospero CLI 身份。 */
   environment?: Record<string, string>;
+  /** 隔离 API Profile 的 Codex app-server 受控配置。 */
+  codexAppServerArgs?: string[];
   accountId?: string;
   accountName?: string;
   approvalPolicy?: ApprovalPolicy;
@@ -133,6 +135,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
 
   private readonly adapter: AgentAdapter;
   private readonly environment: Record<string, string>;
+  private readonly codexAppServerArgs: string[] | undefined;
   private readonly log: AgentEventBody[] = [];
   private evSeq = 0;
   private status: SessionStatus = "starting";
@@ -166,6 +169,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     this.accountName = opts.accountName ?? opts.restored?.accountName;
     this.adapter = opts.adapter;
     this.environment = opts.environment ?? {};
+    this.codexAppServerArgs = opts.codexAppServerArgs;
     const restored = opts.restored;
     this.createdAt = restored?.createdAt ?? Date.now();
     this.policy = restored?.approvalPolicy ?? opts.approvalPolicy ?? DEFAULT_POLICY;
@@ -243,6 +247,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     await this.adapter.start({
       cwd: this.cwd,
       env: this.environment,
+      ...(this.codexAppServerArgs ? { codexAppServerArgs: this.codexAppServerArgs } : {}),
       emit: (body) => this.record(body),
       recordOutput: (callId, output) => this.recordToolOutput(callId, output),
       persistState: (state) => {

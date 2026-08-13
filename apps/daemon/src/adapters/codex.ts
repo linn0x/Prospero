@@ -204,7 +204,7 @@ export class CodexAdapter implements AgentAdapter {
         ? this.opts.resumeState["effort"]
         : null;
     this.selectedMode = this.opts.resumeState?.["mode"] === "plan" ? "plan" : "default";
-    await this.startAppServer(ctx.cwd);
+    await this.startAppServer(ctx.cwd, ctx.env, ctx.codexAppServerArgs);
     // 新会话创建器只需要 model/list。不要为一次目录读取执行 thread/start，
     // 否则用户每打开一次创建器都会在 Codex 历史里多一条空对话。
     if (ctx.catalogOnly) return;
@@ -254,10 +254,11 @@ export class CodexAdapter implements AgentAdapter {
   private async startAppServer(
     cwd: string,
     environment: Record<string, string> | undefined = this.ctx?.env,
+    appServerArgs: string[] | undefined = this.ctx?.codexAppServerArgs,
   ): Promise<void> {
     this.stderrTail = "";
     this.buf = "";
-    const proc = spawn("codex", ["app-server"], {
+    const proc = spawn("codex", ["app-server", ...(appServerArgs ?? [])], {
       stdio: ["pipe", "pipe", "pipe"],
       cwd,
       env: { ...process.env, ...environment },
@@ -303,10 +304,11 @@ export class CodexAdapter implements AgentAdapter {
     query: string,
     limit = 20,
     environment?: Record<string, string>,
+    appServerArgs?: string[],
   ): Promise<ResumableConversation[]> {
     const adapter = new CodexAdapter();
     try {
-      await adapter.startAppServer(os.homedir(), environment);
+      await adapter.startAppServer(os.homedir(), environment, appServerArgs);
       const trimmed = query.trim();
       let raw: { data?: unknown[] };
       if (trimmed) {

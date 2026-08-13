@@ -13,6 +13,7 @@ import { AppState, Platform } from "react-native";
 import { randomUUID } from "expo-crypto";
 import {
   CAPABILITY_AGENT_ACCOUNTS,
+  CAPABILITY_AGENT_API_PROFILES,
   CAPABILITY_CHAT_ATTACHMENT_PREVIEWS,
   CAPABILITY_ORCHESTRATION_AUTOMATION,
   CAPABILITY_ORCHESTRATION_GRAPH,
@@ -150,6 +151,7 @@ export class HostConnection {
     if (capability === CAPABILITY_ORCHESTRATION_MANUAL) return version >= 8;
     if (capability === CAPABILITY_SUBAGENT_HISTORY) return version >= 9;
     if (capability === CAPABILITY_AGENT_ACCOUNTS) return version >= 10;
+    if (capability === CAPABILITY_AGENT_API_PROFILES) return version >= 12;
     if (capability === CAPABILITY_CHAT_ATTACHMENT_PREVIEWS) return version >= 11;
     if (capability === CAPABILITY_SESSION_CREATE_MODEL) return version >= 11;
     return false;
@@ -185,6 +187,10 @@ export class HostConnection {
 
   get supportsAgentAccounts(): boolean {
     return this.supportsCapability(CAPABILITY_AGENT_ACCOUNTS);
+  }
+
+  get supportsAgentApiProfiles(): boolean {
+    return this.supportsCapability(CAPABILITY_AGENT_API_PROFILES);
   }
 
   get supportsChatAttachmentPreviews(): boolean {
@@ -717,6 +723,8 @@ export class HostConnection {
     message:
       | Extract<C2SMessage, { type: "agent.accounts.list" }>
       | Extract<C2SMessage, { type: "agent.account.create" }>
+      | Extract<C2SMessage, { type: "agent.account.api.create" }>
+      | Extract<C2SMessage, { type: "agent.account.api.configure" }>
       | Extract<C2SMessage, { type: "agent.account.rename" }>
       | Extract<C2SMessage, { type: "agent.account.default" }>
       | Extract<C2SMessage, { type: "agent.account.login" }>
@@ -747,6 +755,42 @@ export class HostConnection {
       requestId: this.agentRequestId(),
       agent,
       name,
+    });
+  }
+
+  createAgentApiProfile(
+    agent: CodeAgentKind,
+    name: string,
+    baseUrl: string,
+    model: string,
+    apiKey: string,
+  ): Promise<AgentAccountsResult> {
+    if (!this.supportsAgentApiProfiles) throw new Error("请先升级 Mac 端以使用第三方 API Profile");
+    return this.accountRequest({
+      type: "agent.account.api.create",
+      requestId: this.agentRequestId(),
+      agent,
+      name,
+      baseUrl,
+      model,
+      apiKey,
+    });
+  }
+
+  configureAgentApiProfile(
+    accountId: string,
+    baseUrl: string,
+    model: string,
+    apiKey: string,
+  ): Promise<AgentAccountsResult> {
+    if (!this.supportsAgentApiProfiles) throw new Error("请先升级 Mac 端以使用第三方 API Profile");
+    return this.accountRequest({
+      type: "agent.account.api.configure",
+      requestId: this.agentRequestId(),
+      accountId,
+      baseUrl,
+      model,
+      apiKey,
     });
   }
 

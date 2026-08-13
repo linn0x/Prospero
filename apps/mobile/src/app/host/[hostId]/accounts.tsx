@@ -21,6 +21,13 @@ type Editor =
   | { kind: "create"; agent: CodeAgentKind }
   | { kind: "rename"; account: AgentAccount }
   | { kind: "credential"; account: AgentAccount; credentialKind: AgentCredentialKind }
+  | {
+      kind: "api";
+      agent: CodeAgentKind;
+      account?: AgentAccount;
+      phase: "name" | "baseUrl" | "model" | "apiKey";
+      draft: { name: string; baseUrl: string; model: string };
+    }
   | null;
 
 const agentTitle: Record<CodeAgentKind, string> = {
@@ -123,6 +130,23 @@ export default function AgentAccountsScreen() {
     setEditor({ kind: "credential", account, credentialKind });
   };
 
+  const openCreateApi = (agent: CodeAgentKind): void => {
+    setName("");
+    setEditor({ kind: "api", agent, phase: "name", draft: { name: "", baseUrl: "", model: "" } });
+  };
+
+  const openConfigureApi = (account: AgentAccount): void => {
+    if (!account.apiProfile) return;
+    setName(account.apiProfile.baseUrl);
+    setEditor({
+      kind: "api",
+      agent: account.agent,
+      account,
+      phase: "baseUrl",
+      draft: { name: account.name, baseUrl: "", model: account.apiProfile.model },
+    });
+  };
+
   const chooseCredential = (account: AgentAccount): void => {
     Alert.alert("导入 Claude 凭据", "选择这个独立环境使用的认证方式。", [
       { text: "取消", style: "cancel" },
@@ -139,12 +163,45 @@ export default function AgentAccountsScreen() {
     } else if (editor.kind === "rename") {
       const result = await conn.renameAgentAccount(editor.account.id, value.trim());
       setAccounts(result.accounts);
-    } else {
+    } else if (editor.kind === "credential") {
       const result = await conn.setAgentAccountCredential(
         editor.account.id,
         editor.credentialKind,
         value.trim(),
       );
+      setAccounts(result.accounts);
+      setName("");
+    } else {
+      const trimmedValue = value.trim();
+      if (editor.phase === "name") {
+        setName("");
+        setEditor({ ...editor, phase: "baseUrl", draft: { ...editor.draft, name: trimmedValue } });
+        return;
+      }
+      if (editor.phase === "baseUrl") {
+        setName(editor.draft.model);
+        setEditor({ ...editor, phase: "model", draft: { ...editor.draft, baseUrl: trimmedValue } });
+        return;
+      }
+      if (editor.phase === "model") {
+        setName("");
+        setEditor({ ...editor, phase: "apiKey", draft: { ...editor.draft, model: trimmedValue } });
+        return;
+      }
+      const result = editor.account
+        ? await conn.configureAgentApiProfile(
+            editor.account.id,
+            editor.draft.baseUrl,
+            editor.draft.model,
+            trimmedValue,
+          )
+        : await conn.createAgentApiProfile(
+            editor.agent,
+            editor.draft.name,
+            editor.draft.baseUrl,
+            editor.draft.model,
+            trimmedValue,
+          );
       setAccounts(result.accounts);
       setName("");
     }
@@ -169,10 +226,13 @@ export default function AgentAccountsScreen() {
 
   const confirmLogout = (account: AgentAccount): void => {
     if (!conn) return;
-    Alert.alert("注销账号", `从 ${account.name} 的独立环境注销 ${agentTitle[account.agent]}？`, [
+    const api = account.apiProfile !== undefined;
+    Alert.alert(api ? "移除 API Key" : "注销账号", api
+      ? `移除 ${account.name} 的 API Key？该独立配置与会话历史会保留。`
+      : `从 ${account.name} 的独立环境注销 ${agentTitle[account.agent]}？`, [
       { text: "取消", style: "cancel" },
       {
-        text: "注销",
+        text: api ? "移除" : "注销",
         style: "destructive",
         onPress: () => {
           void mutate(account.id, () => conn.logoutAgentAccount(account.id)).catch(() => {});
@@ -207,7 +267,7 @@ export default function AgentAccountsScreen() {
     <View style={styles.container}>
       <Stack.Screen
         options={{
-          title: "Code Agent 账号",
+          title: "Code Agent 账号与 API",
           headerRight: () => (
             <Pressable onPress={() => void refresh()} hitSlop={10} accessibilityLabel="刷新账号状态">
               <Icon name="arrow.clockwise" size={17} color={color.accent} />
@@ -220,12 +280,12 @@ export default function AgentAccountsScreen() {
         refreshControl={<RefreshControl refreshing={loading} onRefresh={() => void refresh()} tintColor={color.accent} />}
       >
         <View style={styles.explainer}>
-          <Text style={styles.explainerTitle}>账号隔离，项目共享</Text>
+          <Text style={styles.explainerTitle}>账号/API 隔离，项目共享</Text>
           <Text style={styles.explainerText}>
-            每个 Prospero 账号拥有独立的凭据、配置、原生会话历史和 MCP/插件状态；创建会话时仍可选择同一个项目目录。
+            每个 Prospero 账号或 API Profile 都拥有独立的凭据、配置、原生会话历史和 MCP/插件状态；创建会话时仍可选择同一个项目目录。
           </Text>
           <Text style={styles.securityText}>
-            Codex 由官方 CLI 登录；Claude 独立令牌经配对加密通道写入 Mac 安全存储，不写进账号元数据或对话记录。
+            API Key 和 Claude 独立令牌经配对加密通道写入 Mac 安全存储，不写进账号元数据或对话记录。第三方 API 必须使用 HTTPS（localhost 除外）。
           </Text>
         </View>
 
@@ -239,14 +299,24 @@ export default function AgentAccountsScreen() {
                 <AgentIcon agent={agent} size={21} />
                 <Text style={styles.sectionTitle}>{agentTitle[agent]}</Text>
               </View>
-              <Pressable
-                style={({ pressed }) => [styles.addButton, pressed && styles.pressed]}
-                onPress={() => openCreate(agent)}
-                disabled={!conn?.supportsAgentAccounts}
-              >
-                <Icon name="plus" size={14} color={color.accent} />
-                <Text style={styles.addButtonText}>新账号</Text>
-              </Pressable>
+              <View style={styles.addActions}>
+                <Pressable
+                  style={({ pressed }) => [styles.addButton, pressed && styles.pressed]}
+                  onPress={() => openCreate(agent)}
+                  disabled={!conn?.supportsAgentAccounts}
+                >
+                  <Icon name="plus" size={14} color={color.accent} />
+                  <Text style={styles.addButtonText}>新账号</Text>
+                </Pressable>
+                <Pressable
+                  style={({ pressed }) => [styles.addButton, pressed && styles.pressed]}
+                  onPress={() => openCreateApi(agent)}
+                  disabled={!conn?.supportsAgentApiProfiles}
+                >
+                  <Icon name="plus" size={14} color={color.accent} />
+                  <Text style={styles.addButtonText}>新 API</Text>
+                </Pressable>
+              </View>
             </View>
 
             {grouped[agent].map((account) => {
@@ -265,7 +335,9 @@ export default function AgentAccountsScreen() {
                         {account.authMethod && <Text style={styles.meta}>· {account.authMethod}</Text>}
                       </View>
                       <Text style={styles.environment}>
-                        {account.managed ? "Prospero 独立环境" : "现有本机环境（兼容旧会话）"}
+                        {account.apiProfile
+                          ? `${account.apiProfile.provider === "openai_compatible" ? "OpenAI" : "Anthropic"} 兼容 API · ${account.apiProfile.model}\n${account.apiProfile.baseUrl}`
+                          : account.managed ? "Prospero 独立环境" : "现有本机环境（兼容旧会话）"}
                         {account.activeSessions > 0 ? ` · ${String(account.activeSessions)} 个活动会话` : ""}
                       </Text>
                     </View>
@@ -273,19 +345,28 @@ export default function AgentAccountsScreen() {
                   </View>
 
                   <View style={styles.actions}>
-                    <Action
-                      label={
-                        account.agent === "claude" && account.managed
-                          ? "生成令牌"
-                          : account.status === "signed_in"
-                            ? "重新登录"
-                            : "登录"
-                      }
-                      onPress={() => void login(account)}
-                      disabled={busy}
-                    />
-                    {account.agent === "claude" && account.managed && (
-                      <Action label="导入凭据" onPress={() => chooseCredential(account)} disabled={busy} />
+                    {account.apiProfile ? (
+                      <>
+                        <Action label="重新配置" onPress={() => openConfigureApi(account)} disabled={busy} />
+                        <Action label="替换 API Key" onPress={() => openCredential(account, "api_key")} disabled={busy} />
+                      </>
+                    ) : (
+                      <>
+                        <Action
+                          label={
+                            account.agent === "claude" && account.managed
+                              ? "生成令牌"
+                              : account.status === "signed_in"
+                                ? "重新登录"
+                                : "登录"
+                          }
+                          onPress={() => void login(account)}
+                          disabled={busy}
+                        />
+                        {account.agent === "claude" && account.managed && (
+                          <Action label="导入凭据" onPress={() => chooseCredential(account)} disabled={busy} />
+                        )}
+                      </>
                     )}
                     {!account.isDefault && (
                       <Action
@@ -297,7 +378,7 @@ export default function AgentAccountsScreen() {
                       />
                     )}
                     {account.managed && <Action label="重命名" onPress={() => openRename(account)} disabled={busy} />}
-                    {account.status === "signed_in" && <Action label="注销" onPress={() => confirmLogout(account)} disabled={busy} danger />}
+                    {account.status === "signed_in" && <Action label={account.apiProfile ? "移除密钥" : "注销"} onPress={() => confirmLogout(account)} disabled={busy} danger />}
                     {account.managed && <Action label="删除" onPress={() => confirmDelete(account)} disabled={busy} danger />}
                   </View>
                 </View>
@@ -313,9 +394,19 @@ export default function AgentAccountsScreen() {
           editor?.kind === "rename"
             ? "重命名账号"
             : editor?.kind === "credential"
-              ? editor.credentialKind === "oauth_token"
+              ? editor.account.apiProfile
+                ? "保存 API Key"
+                : editor.credentialKind === "oauth_token"
                 ? "导入订阅账号令牌"
                 : "导入 Anthropic API Key"
+              : editor?.kind === "api"
+                ? editor.phase === "name"
+                  ? `新增 ${agentTitle[editor.agent]} API 配置`
+                  : editor.phase === "baseUrl"
+                    ? "API Base URL"
+                    : editor.phase === "model"
+                      ? "默认模型"
+                      : "保存 API Key"
               : `新增 ${editor ? agentTitle[editor.agent] : ""} 账号`
         }
         message={
@@ -324,25 +415,42 @@ export default function AgentAccountsScreen() {
               ? "创建后先生成令牌，再把令牌导入 Mac 的独立安全存储。"
               : "创建后会得到独立环境，下一步在官方 CLI 终端完成登录。"
             : editor?.kind === "credential"
-              ? editor.credentialKind === "oauth_token"
+              ? editor.account.apiProfile
+                ? "粘贴此独立 API Profile 的新 Key。原有 Key 不会显示或回传。"
+                : editor.credentialKind === "oauth_token"
                 ? "先点“生成令牌”完成 claude setup-token，再粘贴终端最后显示的令牌。"
                 : "粘贴该账号自己的 Anthropic Console API Key。"
+              : editor?.kind === "api"
+                ? editor.phase === "name"
+                  ? `${editor.agent === "codex" ? "OpenAI Responses" : "Anthropic Messages"} 兼容服务将只供这个独立环境使用。`
+                  : editor.phase === "baseUrl"
+                    ? "输入服务 API 的根地址，例如 https://gateway.example.com/v1。"
+                    : editor.phase === "model"
+                      ? "输入该服务中要作为默认模型使用的精确模型 ID。"
+                      : "Key 仅写入 Mac 安全存储，不会保存在账号配置或聊天记录中。"
               : undefined
         }
         value={name}
-        confirmLabel={editor?.kind === "credential" ? "安全保存" : editor?.kind === "rename" ? "保存" : "创建"}
-        secureTextEntry={editor?.kind === "credential"}
+        confirmLabel={editor?.kind === "credential" || editor?.kind === "api" && editor.phase === "apiKey" ? "安全保存" : editor?.kind === "rename" ? "保存" : editor?.kind === "api" ? "下一步" : "创建"}
+        secureTextEntry={editor?.kind === "credential" || editor?.kind === "api" && editor.phase === "apiKey"}
         onChangeText={setName}
         onCancel={() => {
-          if (editor?.kind === "credential") setName("");
+          if (editor?.kind === "credential" || editor?.kind === "api") setName("");
           setEditor(null);
         }}
         onSubmit={submitName}
         validate={(value) => {
           const trimmed = value.trim();
-          if (!trimmed) return editor?.kind === "credential" ? "请粘贴凭据" : "请输入账号名称";
+          if (!trimmed) return editor?.kind === "credential" || editor?.kind === "api" && editor.phase === "apiKey" ? "请粘贴凭据" : "请输入内容";
+          if (editor?.kind === "api") {
+            if (editor.phase === "name" && trimmed.length > 80) return "名称不能超过 80 个字符";
+            if (editor.phase === "baseUrl" && (trimmed.length > 2000 || /[\r\n\0]/.test(trimmed))) return "API 地址格式不正确";
+            if (editor.phase === "model" && (trimmed.length > 300 || /[\r\n\0]/.test(trimmed))) return "模型名称格式不正确";
+            if (editor.phase === "apiKey" && (trimmed.length > 8192 || /[\r\n\0]/.test(trimmed))) return "凭据格式不正确";
+            return null;
+          }
           if (editor?.kind === "credential") {
-            if (trimmed.length < 20) return "凭据长度不正确";
+            if (trimmed.length < (editor.account.apiProfile ? 1 : 20)) return "凭据长度不正确";
             if (trimmed.length > 8192 || /[\r\n\0]/.test(trimmed)) return "凭据格式不正确";
             return null;
           }
@@ -388,6 +496,7 @@ const styles = StyleSheet.create({
   section: { gap: space.sm },
   sectionHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
   sectionIdentity: { flexDirection: "row", alignItems: "center", gap: space.sm },
+  addActions: { flexDirection: "row", alignItems: "center", gap: space.xs },
   sectionTitle: { ...font.body, fontWeight: "700" },
   addButton: { flexDirection: "row", alignItems: "center", gap: 4, paddingHorizontal: 10, paddingVertical: 7, borderRadius: radius.sm, backgroundColor: color.accentBg },
   addButtonText: { color: color.accent, fontSize: 12, fontWeight: "700" },
