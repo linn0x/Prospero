@@ -57,6 +57,13 @@ import {
   type TurnDiffSummaryItem,
   type UserItem,
 } from "@/lib/chat-model";
+import {
+  createUserAttachmentLoader,
+  createUserAttachmentPreviewLoadController,
+  type UserAttachmentLoader,
+  type UserAttachmentPreviewLoadController,
+  type UserAttachmentPreviewLoadState,
+} from "@/lib/user-attachment-loader";
 
 interface Props {
   conn: HostConnection;
@@ -81,7 +88,6 @@ interface Props {
 
 const PROJECT_IMAGE_CHUNK = 192 * 1024;
 const MAX_PROJECT_IMAGE_BYTES = 6 * 1024 * 1024;
-type UserAttachmentLoader = (msgId: string, attachment: AgentUserAttachment) => Promise<string>;
 
 function projectImageMime(path: string): string {
   const extension = path.slice(path.lastIndexOf(".") + 1).toLowerCase();
@@ -165,53 +171,17 @@ export const ChatView = memo(function ChatView({
   );
 
   const loadUserAttachment = useCallback<UserAttachmentLoader>(
-    (msgId, attachment) => {
-      const key = `${sid}\u0000${msgId}\u0000${attachment.id}`;
-      const cached = attachmentCacheRef.current.get(key);
-      if (cached) return cached;
-      const request = (async (): Promise<string> => {
-        let offset = 0;
-        let total: number | null = null;
-        let bytes: Uint8Array | null = null;
-        for (;;) {
-          const chunk = await conn.chatAttachmentChunk(
-            sid,
-            msgId,
-            attachment.id,
-            offset,
-            PROJECT_IMAGE_CHUNK,
-          );
-          if (chunk.mimeType !== attachment.mimeType) throw new Error("图片类型不匹配");
-          if (total === null) {
-            total = chunk.total;
-            if (total <= 0) throw new Error("图片文件为空");
-            if (total > MAX_PROJECT_IMAGE_BYTES) throw new Error("图片超过 6 MB");
-            bytes = new Uint8Array(total);
-          } else if (chunk.total !== total) {
-            throw new Error("读取图片时文件大小发生了变化");
-          }
-          const part = fromB64(chunk.dataB64);
-          if (!bytes || offset + part.byteLength > bytes.byteLength) {
-            throw new Error("图片分块响应无效");
-          }
-          bytes.set(part, offset);
-          offset += part.byteLength;
-          if (chunk.eof) break;
-          if (part.byteLength === 0) throw new Error("图片传输提前中断");
-        }
-        if (!bytes || total === null || offset !== total) throw new Error("图片传输不完整");
-        return `data:${attachment.mimeType};base64,${toB64(bytes)}`;
-      })().catch((error: unknown) => {
-        attachmentCacheRef.current.delete(key);
-        throw error;
-      });
-      if (attachmentCacheRef.current.size >= 12) {
-        const oldest = attachmentCacheRef.current.keys().next().value as string | undefined;
-        if (oldest) attachmentCacheRef.current.delete(oldest);
-      }
-      attachmentCacheRef.current.set(key, request);
-      return request;
-    },
+    (msgId, attachment) => createUserAttachmentLoader({
+      sid,
+      cache: attachmentCacheRef.current,
+      readChunk: (chunkMsgId, attachmentId, offset, length) => conn.chatAttachmentChunk(
+        sid,
+        chunkMsgId,
+        attachmentId,
+        offset,
+        length,
+      ),
+    })(msgId, attachment),
     [conn, sid],
   );
 
@@ -606,36 +576,61 @@ const UserAttachmentPreview = memo(function UserAttachmentPreview({
   attachment: AgentUserAttachment;
   loadAttachment: UserAttachmentLoader;
 }) {
-  const [uri, setUri] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [state, setState] = useState<UserAttachmentPreviewLoadState>({
+    status: "loading",
+    uri: null,
+    error: null,
+  });
+  const controllerRef = useRef<UserAttachmentPreviewLoadController | null>(null);
+
   useEffect(() => {
-    let alive = true;
-    void loadAttachment(msgId, attachment)
-      .then((value) => {
-        if (alive) setUri(value);
-      })
-      .catch((reason: unknown) => {
-        if (alive) setError(reason instanceof Error ? reason.message : String(reason));
-      });
+    const controller = createUserAttachmentPreviewLoadController(() =>
+      loadAttachment(msgId, attachment),
+    );
+    controllerRef.current = controller;
+    const unsubscribe = controller.subscribe(setState);
+    void controller.load();
     return () => {
-      alive = false;
+      unsubscribe();
+      controller.dispose();
+      if (controllerRef.current === controller) controllerRef.current = null;
     };
   }, [attachment, loadAttachment, msgId]);
 
-  if (uri) {
-    return <Image source={{ uri }} style={styles.userAttachmentImage} resizeMode="cover" />;
+  if (state.status === "loaded") {
+    return <Image source={{ uri: state.uri }} style={styles.userAttachmentImage} resizeMode="cover" />;
   }
+  const attachmentName = attachment.name || "图片附件";
+  const failed = state.status === "failed";
   return (
-    <View style={styles.userAttachmentPlaceholder}>
-      {error ? (
+    <Pressable
+      disabled={!failed}
+      onPress={() => void controllerRef.current?.load()}
+      style={({ pressed }) => [
+        styles.userAttachmentPlaceholder,
+        failed && styles.userAttachmentRetry,
+        pressed && failed && styles.inlinePressed,
+      ]}
+      accessibilityRole="button"
+      accessibilityState={{ disabled: !failed }}
+      accessibilityLabel={failed
+        ? `${attachmentName}，图片加载失败：${state.error}。点按重试`
+        : `${attachmentName}，正在加载图片`}
+      accessibilityHint={failed
+        ? `重试加载附件 ${attachmentName}；当前图片加载失败。`
+        : "图片加载中，暂时不可点按"}
+    >
+      {failed ? (
         <Icon name="photo" size={16} color="#C8D7FF" />
       ) : (
         <ActivityIndicator size="small" color="#E5EEFF" />
       )}
       <Text style={styles.userAttachmentLabel} numberOfLines={2}>
-        {error ? "图片不可用" : attachment.name || "正在加载图片…"}
+        {failed
+          ? `图片加载失败：${state.error}\n点按重试`
+          : attachment.name || "正在加载图片…"}
       </Text>
-    </View>
+    </Pressable>
   );
 });
 
@@ -1393,6 +1388,7 @@ const styles = StyleSheet.create({
     gap: 6,
     backgroundColor: "#294375",
   },
+  userAttachmentRetry: { borderWidth: 1, borderColor: "#8FB6FF" },
   userAttachmentLabel: { color: "#E5EEFF", fontSize: 10.5, lineHeight: 14, textAlign: "center" },
 
   assistantRow: { gap: 7, paddingHorizontal: 2 },
