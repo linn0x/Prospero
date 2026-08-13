@@ -9,10 +9,12 @@ import {
   StyleSheet,
   Text,
   TextInput,
+  useWindowDimensions,
   View,
 } from "react-native";
 import * as Haptics from "expo-haptics";
 import * as Linking from "expo-linking";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import { KeyboardAvoidingView } from "react-native-keyboard-controller";
 import { useHeaderHeight } from "expo-router/build/react-navigation/elements";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -56,6 +58,21 @@ import { useHostConnection } from "@/lib/use-host-connection";
 import { deliveryFailureText } from "@/lib/outbound-queue";
 import { sessionLoadState } from "@/lib/session-load-state";
 import { appendVoiceTranscript } from "@/lib/voice-input";
+import {
+  SYSTEM_TERMINAL_FONT_PREFERENCE,
+  COMPOSER_THUMBNAIL_GAP,
+  COMPOSER_THUMBNAIL_REMOVE_TARGET,
+  COMPOSER_THUMBNAIL_SIZE,
+  MIN_TOUCH_TARGET,
+  TERMINAL_FONT_PREFERENCE_STORAGE_KEY,
+  adjustTerminalFontSize,
+  clampTerminalFontSize,
+  parseTerminalFontPreference,
+  resetTerminalFontPreference,
+  serializeTerminalFontPreference,
+  terminalFontSizeForPreference,
+  type TerminalFontPreference,
+} from "@/lib/terminal-font-size";
 import type { ProjectFileReference } from "@/lib/file-references";
 import {
   activeComposerToken,
@@ -274,6 +291,7 @@ export default function SessionScreen() {
   const insets = useSafeAreaInsets();
   const headerHeight = useHeaderHeight();
   const adaptiveLayout = useAdaptiveLayout();
+  const { fontScale } = useWindowDimensions();
   const { hostId, sid, subagentId } = useLocalSearchParams<{
     hostId: string;
     sid: string;
@@ -344,7 +362,12 @@ export default function SessionScreen() {
   const [images, setImages] = useState<PickedImage[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const termRef = useRef<TerminalHandle>(null);
-  const [fontSize, setFontSize] = useState(12);
+  const [terminalFontPreference, setTerminalFontPreference] = useState<TerminalFontPreference>(
+    SYSTEM_TERMINAL_FONT_PREFERENCE,
+  );
+  const [terminalFontPreferenceHydrated, setTerminalFontPreferenceHydrated] = useState(false);
+  const terminalFontPreferenceChanged = useRef(false);
+  const fontSize = terminalFontSizeForPreference(terminalFontPreference, fontScale);
   const composerToken = useMemo(
     () => activeComposerToken(draft, selection.start),
     [draft, selection.start],
@@ -419,6 +442,44 @@ export default function SessionScreen() {
       setAttachmentError(`无法保存草稿：${error instanceof Error ? error.message : String(error)}`);
     });
   }, [composerScope, draft, draftHydrated, images, selection]);
+
+  // 字号是设备偏好，不应随主机或会话变化。没有保存项就保持 system，
+  // 因而 useWindowDimensions() 的 fontScale 更新会在本次渲染立即生效。
+  useEffect(() => {
+    let alive = true;
+    void AsyncStorage.getItem(TERMINAL_FONT_PREFERENCE_STORAGE_KEY)
+      .then((raw) => {
+        if (!alive) return;
+        if (!terminalFontPreferenceChanged.current) {
+          setTerminalFontPreference(parseTerminalFontPreference(raw));
+        }
+        setTerminalFontPreferenceHydrated(true);
+      })
+      .catch(() => {
+        // 偏好读取失败时不阻塞终端；默认的 system 模式仍然可用。
+        if (alive) setTerminalFontPreferenceHydrated(true);
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const setCustomTerminalFontSize = useCallback((size: number): void => {
+    terminalFontPreferenceChanged.current = true;
+    const preference: TerminalFontPreference = {
+      mode: "custom",
+      size: clampTerminalFontSize(size),
+    };
+    setTerminalFontPreference(preference);
+    const serialized = serializeTerminalFontPreference(preference);
+    if (serialized) void AsyncStorage.setItem(TERMINAL_FONT_PREFERENCE_STORAGE_KEY, serialized);
+  }, []);
+
+  const followSystemTerminalFontSize = useCallback((): void => {
+    terminalFontPreferenceChanged.current = true;
+    setTerminalFontPreference(resetTerminalFontPreference());
+    void AsyncStorage.removeItem(TERMINAL_FONT_PREFERENCE_STORAGE_KEY);
+  }, []);
 
   useEffect(() => {
     const sequence = ++completionSequence.current;
@@ -1211,7 +1272,12 @@ export default function SessionScreen() {
             autoCorrect={false}
             returnKeyType="search"
           />
-          <Pressable onPress={() => setSearch(null)} hitSlop={8}>
+          <Pressable
+            onPress={() => setSearch(null)}
+            style={styles.searchCancelButton}
+            accessibilityRole="button"
+            accessibilityLabel="关闭消息搜索"
+          >
             <Text style={styles.searchCancel}>取消</Text>
           </Pressable>
         </View>
@@ -1233,30 +1299,35 @@ export default function SessionScreen() {
           onRetry={send}
         />
       ) : (
-        <>
-          <Terminal
-            ref={termRef}
-            conn={conn}
-            sid={sid}
-            onFontSize={setFontSize}
-            inputEnabled={terminalInputEnabled}
-            disconnectedMessage="主机未连接；终端输入已冻结，断线期间的按键不会自动重放。"
-            onRetryConnection={() => conn.kick()}
-          />
-          <KeyBar
-            onKey={(seq) => conn.inputText(sid, seq)}
-            enabled={terminalInputEnabled}
-            disabledMessage="主机未连接；快捷键和粘贴已冻结，不会自动重放。"
-            onRetry={() => conn.kick()}
-            onFontSize={(delta) => {
-              const next = Math.min(20, Math.max(8, fontSize + delta));
-              setFontSize(next);
-              termRef.current?.setFontSize(next);
-            }}
-            onScrollBottom={() => termRef.current?.scrollToBottom()}
-            onDismissKeyboard={() => termRef.current?.blur()}
-          />
-        </>
+        terminalFontPreferenceHydrated ? (
+          <>
+            <Terminal
+              ref={termRef}
+              conn={conn}
+              sid={sid}
+              fontSize={fontSize}
+              onFontSize={setCustomTerminalFontSize}
+              inputEnabled={terminalInputEnabled}
+              disconnectedMessage="主机未连接；终端输入已冻结，断线期间的按键不会自动重放。"
+              onRetryConnection={() => conn.kick()}
+            />
+            <KeyBar
+              onKey={(seq) => conn.inputText(sid, seq)}
+              enabled={terminalInputEnabled}
+              disabledMessage="主机未连接；快捷键和粘贴已冻结，不会自动重放。"
+              onRetry={() => conn.kick()}
+              onFontSize={(delta) => setCustomTerminalFontSize(adjustTerminalFontSize(fontSize, delta))}
+              onResetFontSize={followSystemTerminalFontSize}
+              fontSizeMode={terminalFontPreference.mode}
+              onScrollBottom={() => termRef.current?.scrollToBottom()}
+              onDismissKeyboard={() => termRef.current?.blur()}
+            />
+          </>
+        ) : (
+          <View style={styles.terminalPreferenceLoading} accessibilityLabel="正在读取终端字号偏好">
+            <ActivityIndicator color={color.accent} />
+          </View>
+        )
       )}
 
       {isChat && commandHints.length > 0 && (
@@ -1410,7 +1481,6 @@ export default function SessionScreen() {
               <Image source={{ uri: img.uri }} style={styles.thumb} />
               <Pressable
                 style={styles.thumbX}
-                hitSlop={6}
                 onPress={() => {
                   setImages((v) => v.filter((_, j) => j !== i));
                   if (composerScope) {
@@ -1422,7 +1492,9 @@ export default function SessionScreen() {
                 accessibilityRole="button"
                 accessibilityLabel={`移除第 ${String(i + 1)} 张图片`}
               >
-                <Text style={styles.thumbXText}>×</Text>
+                <View style={styles.thumbXIcon}>
+                  <Text style={styles.thumbXText}>×</Text>
+                </View>
               </Pressable>
             </View>
           ))}
@@ -1863,7 +1935,8 @@ const styles = StyleSheet.create({
   },
   pendingBadgeText: { color: "#fff", fontSize: 10, fontWeight: "700" },
   policyChip: {
-    minHeight: 28,
+    minWidth: MIN_TOUCH_TARGET,
+    minHeight: MIN_TOUCH_TARGET,
     justifyContent: "center",
     paddingHorizontal: 9,
     borderRadius: 9,
@@ -1873,7 +1946,8 @@ const styles = StyleSheet.create({
   policyChipText: { color: color.textDim, fontSize: 11, fontWeight: "600" },
   policyChipTextYolo: { color: color.danger },
   controlChip: {
-    minHeight: 28,
+    minWidth: MIN_TOUCH_TARGET,
+    minHeight: MIN_TOUCH_TARGET,
     maxWidth: 92,
     justifyContent: "center",
     paddingHorizontal: 9,
@@ -1884,14 +1958,20 @@ const styles = StyleSheet.create({
   controlChipText: { color: color.textDim, fontSize: 10.5, fontWeight: "600" },
   controlChipTextPlan: { color: color.accent },
   modeAction: {
-    width: 40,
-    height: 40,
+    width: MIN_TOUCH_TARGET,
+    height: MIN_TOUCH_TARGET,
     alignItems: "center",
     justifyContent: "center",
     borderRadius: 12,
     backgroundColor: color.surfaceRaised,
   },
   modeActionActive: { backgroundColor: color.accentBg },
+  terminalPreferenceLoading: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#09090b",
+  },
 
   reconnBar: {
     flexDirection: "row",
@@ -1926,6 +2006,12 @@ const styles = StyleSheet.create({
     paddingVertical: 7,
     color: color.text,
     fontSize: 14,
+  },
+  searchCancelButton: {
+    minWidth: MIN_TOUCH_TARGET,
+    minHeight: MIN_TOUCH_TARGET,
+    alignItems: "center",
+    justifyContent: "center",
   },
   searchCancel: { color: color.accent, fontSize: 14, fontWeight: "500" },
 
@@ -2048,13 +2134,33 @@ const styles = StyleSheet.create({
   deliveryOptionTextActive: { color: color.accent, fontWeight: "600" },
 
   thumbs: { flexGrow: 0, backgroundColor: color.surface },
-  thumbsRow: { gap: 10, paddingHorizontal: 12, paddingTop: 10, paddingBottom: 4 },
-  thumbWrap: { width: 58, height: 58 },
-  thumb: { width: 58, height: 58, borderRadius: 10, backgroundColor: color.surfaceRaised },
+  thumbsRow: {
+    gap: COMPOSER_THUMBNAIL_GAP,
+    paddingHorizontal: 12,
+    paddingTop: 10,
+    paddingBottom: 4,
+  },
+  thumbWrap: {
+    width: COMPOSER_THUMBNAIL_SIZE,
+    height: COMPOSER_THUMBNAIL_SIZE,
+    flexShrink: 0,
+  },
+  thumb: {
+    width: COMPOSER_THUMBNAIL_SIZE,
+    height: COMPOSER_THUMBNAIL_SIZE,
+    borderRadius: 10,
+    backgroundColor: color.surfaceRaised,
+  },
   thumbX: {
     position: "absolute",
-    top: -6,
-    right: -6,
+    top: 0,
+    right: 0,
+    width: COMPOSER_THUMBNAIL_REMOVE_TARGET,
+    height: COMPOSER_THUMBNAIL_REMOVE_TARGET,
+    alignItems: "flex-end",
+    justifyContent: "flex-start",
+  },
+  thumbXIcon: {
     width: 22,
     height: 22,
     borderRadius: 11,
@@ -2113,6 +2219,10 @@ const styles = StyleSheet.create({
   effortRow: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 6 },
   effortLabel: { color: color.textFaint, fontSize: 10.5, marginRight: 2 },
   effortChip: {
+    minWidth: MIN_TOUCH_TARGET,
+    minHeight: MIN_TOUCH_TARGET,
+    alignItems: "center",
+    justifyContent: "center",
     paddingHorizontal: 9,
     paddingVertical: 6,
     borderRadius: 8,
