@@ -19,6 +19,7 @@ import {
   CAPABILITY_ORCHESTRATION_MANAGEMENT,
   CAPABILITY_ORCHESTRATION_MANUAL,
   CAPABILITY_ORCHESTRATION_SNAPSHOT,
+  CAPABILITY_SESSION_CREATE_MODEL,
   CAPABILITY_SUBAGENT_HISTORY,
   MIN_PROTOCOL_VERSION,
   PROTOCOL_VERSION,
@@ -275,7 +276,10 @@ export async function createDaemonServer(
 
   function orchestrationCapabilities(conn: Conn): string[] {
     const capabilities: string[] = [];
-    if (conn.protocolVersion >= 11) capabilities.push(CAPABILITY_CHAT_ATTACHMENT_PREVIEWS);
+    if (conn.protocolVersion >= 11) {
+      capabilities.push(CAPABILITY_CHAT_ATTACHMENT_PREVIEWS);
+      capabilities.push(CAPABILITY_SESSION_CREATE_MODEL);
+    }
     if (conn.protocolVersion >= 10 && conn.device?.allowShell) {
       capabilities.push(CAPABILITY_AGENT_ACCOUNTS);
     }
@@ -376,7 +380,10 @@ export async function createDaemonServer(
   }
 
   manager.on("state", (session) => {
-    if (session.status === "done" || session.status === "died") {
+    // Structured sessions naturally settle at completed; done/died are the
+    // terminal statuses emitted when a session is explicitly killed. All
+    // three mean a worker that did not explicitly hand in must be reconciled.
+    if (session.status === "completed" || session.status === "done" || session.status === "died") {
       const settled = dispatchService.settleEndedSession(
         session.id,
         session.status === "died" ? "worker 会话意外退出" : "worker 会话已结束但未显式交付",
@@ -731,6 +738,8 @@ export async function createDaemonServer(
           cwd: msg.cwd,
           command: msg.command,
           mode: msg.mode,
+          model: msg.model,
+          effort: msg.effort,
           resume: msg.resume,
           cols: msg.cols,
           rows: msg.rows,
@@ -760,6 +769,28 @@ export async function createDaemonServer(
         const att: AttachState = { lastSentSeq: 0, lastAckSeq: 0, paused: false };
         conn.attachments.set(info.id, att);
         await sendSnapshot(conn, info.id, session, att);
+        return;
+      }
+      case "launch.models.get": {
+        try {
+          const catalog = await manager.launchModels(msg.agent, msg.accountId);
+          send(conn, {
+            type: "launch.models",
+            requestId: msg.requestId,
+            agent: msg.agent,
+            models: catalog.models,
+            ...(catalog.currentModel ? { currentModel: catalog.currentModel } : {}),
+            ...(catalog.currentEffort ? { currentEffort: catalog.currentEffort } : {}),
+          });
+        } catch (error) {
+          send(conn, {
+            type: "launch.models",
+            requestId: msg.requestId,
+            agent: msg.agent,
+            models: [],
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
         return;
       }
       case "session.attach": {

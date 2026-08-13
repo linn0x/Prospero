@@ -205,6 +205,9 @@ export class CodexAdapter implements AgentAdapter {
         : null;
     this.selectedMode = this.opts.resumeState?.["mode"] === "plan" ? "plan" : "default";
     await this.startAppServer(ctx.cwd);
+    // 新会话创建器只需要 model/list。不要为一次目录读取执行 thread/start，
+    // 否则用户每打开一次创建器都会在 Codex 历史里多一条空对话。
+    if (ctx.catalogOnly) return;
 
     const resumeThreadId =
       typeof this.opts.resumeState?.["threadId"] === "string"

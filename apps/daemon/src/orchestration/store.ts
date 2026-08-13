@@ -884,8 +884,9 @@ export class OrchestrationStore {
     gate.status = "resolved";
     gate.decision = decision;
     gate.resolvedAt = Date.now();
-    // 退回 pending 而不是直接 dispatched:挡着的这段时间里依赖和 worker
-    // 都可能已经变了,得重新过一遍调度。
+    // 已经离开的 worker 不能被 Gate 决策凭空复活，因此退回 pending，重新
+    // 调度；但 worker 仍在时必须保留 dispatched。否则会留下
+    // pending + running dispatch 的矛盾状态，原 worker 也无法 task done/fail。
     if (gate.taskId) {
       const task = this.state.tasks[gate.taskId];
       const anotherPendingGate = Object.values(this.state.gates).some(
@@ -895,7 +896,7 @@ export class OrchestrationStore {
           candidate.status === "pending",
       );
       if (task && task.status === "blocked" && !anotherPendingGate) {
-        task.status = "pending";
+        task.status = this.activeDispatchFor(task.id) ? "dispatched" : "pending";
         task.updatedAt = Date.now();
       }
     }

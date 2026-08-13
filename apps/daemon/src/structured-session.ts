@@ -613,6 +613,10 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     } else if (body.kind === "agent.error" && body.agentId === undefined) {
       if (this.pending.size === 0 && this.pendingQuestions.size === 0) this.setStatus("completed");
     } else if (
+      // 有些原生后端会先报 turn.end，再补最后一批 tool.end（例如长轮询
+      // `check --wait` 被消息唤醒）。turn.end 已经是该轮的完成事实，迟到的
+      // 工具收尾不能把卡片重新标成 running，否则没有下一条 turn.end 将它收回。
+      body.kind !== "tool.end" &&
       body.kind !== "subagent.started" &&
       body.kind !== "subagent.updated" &&
       body.agentId === undefined &&

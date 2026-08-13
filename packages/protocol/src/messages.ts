@@ -42,6 +42,8 @@ export const CAPABILITY_ORCHESTRATION_LIFECYCLE = "orchestration.lifecycle.v1";
 export const CAPABILITY_SUBAGENT_HISTORY = "subagent.history.v1";
 /** Codex / Claude Code 多账号与隔离配置目录。 */
 export const CAPABILITY_AGENT_ACCOUNTS = "agent.accounts.v1";
+/** 新会话创建前读取原生模型目录，并把模型/推理强度原子地带入 session.create。 */
+export const CAPABILITY_SESSION_CREATE_MODEL = "session.create-model.v1";
 /** 已发送图片的按需预览，避免把原图塞进 chat.snapshot。 */
 export const CAPABILITY_CHAT_ATTACHMENT_PREVIEWS = "chat.attachment-previews.v1";
 
@@ -74,6 +76,8 @@ export type {
   OrchestrationGraphNodeInput,
   ResumableConversation,
   C2SConversationSearch,
+  C2SLaunchModelsGet,
+  LaunchModels,
   ConversationResults,
   C2SAgentAccountsList,
   C2SAgentAccountCreate,
@@ -139,6 +143,7 @@ export type {
   S2CChatSnapshot,
   S2CSubagentHistory,
   S2CChatSuggestions,
+  S2CLaunchModels,
   S2CAgentModels,
   S2CAgentModes,
   S2CAgentControlResult,

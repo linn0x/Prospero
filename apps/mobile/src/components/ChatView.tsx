@@ -32,6 +32,7 @@ import { AgentIcon, agentTint } from "@/components/AgentIcon";
 import { DiffView } from "@/components/DiffView";
 import { Icon } from "@/components/Icon";
 import { Markdown, type ProjectImageLoader } from "@/components/Markdown";
+import { Sheet } from "@/components/Sheet";
 import { toast } from "@/components/Toast";
 import type { HostConnection } from "@/lib/connection";
 import {
@@ -39,6 +40,7 @@ import {
   type ProjectFileReference,
 } from "@/lib/file-references";
 import { MONOSPACE_FONT, color, radius } from "@/lib/theme";
+import { textInSelection, type TextSelectionRange } from "@/lib/text-selection";
 import {
   applyEvents,
   applyToolOutput,
@@ -124,6 +126,7 @@ export const ChatView = memo(function ChatView({
   const evSeqRef = useRef(0);
   const atBottomRef = useRef(true);
   const [hasUnread, setHasUnread] = useState(false);
+  const [selectionSource, setSelectionSource] = useState<string | null>(null);
 
   const loadProjectImage = useCallback<ProjectImageLoader>(
     (reference) => {
@@ -399,6 +402,7 @@ export const ChatView = memo(function ChatView({
                   projectRoot={projectRoot}
                   onOpenFile={onOpenFile}
                   loadProjectImage={loadProjectImage}
+                  onSelectCopy={setSelectionSource}
                 />
               );
             case "tool":
@@ -440,6 +444,11 @@ export const ChatView = memo(function ChatView({
           <Text style={styles.jumpText}>查看新内容 ↓</Text>
         </Pressable>
       )}
+      <SelectionCopySheet
+        visible={selectionSource !== null}
+        source={selectionSource ?? ""}
+        onClose={() => setSelectionSource(null)}
+      />
     </View>
   );
 });
@@ -533,6 +542,79 @@ function useCopy(): (text: string, what?: string) => void {
     // 只给触感等于没反馈 —— 静音/关掉触感的手机上完全看不出来复制成功了
     toast(`已复制${what}`);
   }, []);
+}
+
+function SelectionCopySheet({
+  visible,
+  source,
+  onClose,
+}: {
+  visible: boolean;
+  source: string;
+  onClose: () => void;
+}) {
+  const [selection, setSelection] = useState<TextSelectionRange>({ start: 0, end: 0 });
+  const copy = useCopy();
+  const selected = textInSelection(source, selection);
+
+  useEffect(() => {
+    if (!visible) return;
+    const reset = setTimeout(() => setSelection({ start: 0, end: 0 }), 0);
+    return () => clearTimeout(reset);
+  }, [visible, source]);
+
+  return (
+    <Sheet visible={visible} title="选择复制" onClose={onClose}>
+      <Text style={styles.selectionHelp}>
+        长按文字后拖动两端，只圈选需要的部分；选好后点“复制所选”。
+      </Text>
+      <TextInput
+        value={source}
+        onChangeText={() => {}}
+        onSelectionChange={(event) => setSelection(event.nativeEvent.selection)}
+        style={styles.selectionInput}
+        multiline
+        scrollEnabled
+        showSoftInputOnFocus={false}
+        selectTextOnFocus={false}
+        selectionColor={color.accent}
+        autoCorrect={false}
+        spellCheck={false}
+        accessibilityLabel="可选择的完整回复"
+        accessibilityHint="长按并拖动选择句子，然后使用下方复制所选按钮"
+      />
+      <View style={styles.selectionActions}>
+        <Pressable
+          style={({ pressed }) => [
+            styles.selectionPrimary,
+            selected.length === 0 && styles.selectionDisabled,
+            pressed && selected.length > 0 && styles.inlinePressed,
+          ]}
+          disabled={selected.length === 0}
+          onPress={() => {
+            copy(selected, "所选文字");
+            onClose();
+          }}
+          accessibilityRole="button"
+          accessibilityState={{ disabled: selected.length === 0 }}
+        >
+          <Text style={styles.selectionPrimaryText}>
+            {selected.length > 0 ? `复制所选（${String(selected.length)} 字）` : "请先选择文字"}
+          </Text>
+        </Pressable>
+        <Pressable
+          style={({ pressed }) => [styles.selectionSecondary, pressed && styles.inlinePressed]}
+          onPress={() => {
+            copy(source, "完整回复");
+            onClose();
+          }}
+          accessibilityRole="button"
+        >
+          <Text style={styles.selectionSecondaryText}>复制全文</Text>
+        </Pressable>
+      </View>
+    </Sheet>
+  );
 }
 
 const UserBubble = memo(function UserBubble({
@@ -643,11 +725,13 @@ const AssistantBubble = memo(function AssistantBubble({
   projectRoot,
   onOpenFile,
   loadProjectImage,
+  onSelectCopy,
 }: {
   item: AssistantItem;
   projectRoot?: string;
   onOpenFile?: (reference: ProjectFileReference) => void;
   loadProjectImage: ProjectImageLoader;
+  onSelectCopy: (source: string) => void;
 }) {
   const [showReasoning, setShowReasoning] = useState(false);
   const copy = useCopy();
@@ -697,15 +781,30 @@ const AssistantBubble = memo(function AssistantBubble({
         </Text>
       )}
       {item.text.length > 0 && (
-        <Pressable
-          style={({ pressed }) => [styles.copyReply, pressed && styles.inlinePressed]}
-          onPress={() => copy(item.text, "回复")}
-          accessibilityRole="button"
-          accessibilityLabel="复制完整回复"
-        >
-          <Icon name="doc.on.doc" size={11} color={color.textFaint} />
-          <Text style={styles.copyReplyText}>复制全文</Text>
-        </Pressable>
+        <>
+          <View style={styles.replyActions}>
+            <Pressable
+              style={({ pressed }) => [styles.copyReply, pressed && styles.inlinePressed]}
+              onPress={() => {
+                // 流式回复仍可能继续增长；打开时冻结一份，避免拖动选区时正文跳动。
+                onSelectCopy(item.text);
+              }}
+              accessibilityRole="button"
+              accessibilityLabel="选择回复中的一部分复制"
+            >
+              <Icon name="doc.on.doc" size={11} color={color.accent} />
+              <Text style={[styles.copyReplyText, styles.copySelectionText]}>选择复制</Text>
+            </Pressable>
+            <Pressable
+              style={({ pressed }) => [styles.copyReply, pressed && styles.inlinePressed]}
+              onPress={() => copy(item.text, "完整回复")}
+              accessibilityRole="button"
+              accessibilityLabel="复制完整回复"
+            >
+              <Text style={styles.copyReplyText}>复制全文</Text>
+            </Pressable>
+          </View>
+        </>
       )}
     </View>
   );
@@ -1413,6 +1512,7 @@ const styles = StyleSheet.create({
     paddingLeft: 10,
   },
   usage: { color: color.textFaint, fontSize: 11, fontVariant: ["tabular-nums"] },
+  replyActions: { flexDirection: "row", alignItems: "center", gap: 12 },
   copyReply: {
     alignSelf: "flex-start",
     flexDirection: "row",
@@ -1422,6 +1522,47 @@ const styles = StyleSheet.create({
     paddingRight: 6,
   },
   copyReplyText: { color: color.textFaint, fontSize: 10.5 },
+  copySelectionText: { color: color.accent, fontWeight: "600" },
+  selectionHelp: { color: color.textDim, fontSize: 12, lineHeight: 18, marginBottom: 10 },
+  selectionInput: {
+    minHeight: 220,
+    maxHeight: 340,
+    padding: 12,
+    borderRadius: radius.md,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
+    backgroundColor: color.bg,
+    color: color.text,
+    fontSize: 15,
+    lineHeight: 22,
+    textAlignVertical: "top",
+  },
+  selectionActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    paddingTop: 12,
+    paddingBottom: 4,
+  },
+  selectionPrimary: {
+    flex: 1,
+    minHeight: 42,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: radius.md,
+    backgroundColor: color.accent,
+  },
+  selectionDisabled: { opacity: 0.42 },
+  selectionPrimaryText: { color: color.bg, fontSize: 13, fontWeight: "700" },
+  selectionSecondary: {
+    minHeight: 42,
+    paddingHorizontal: 14,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: radius.md,
+    backgroundColor: color.surfaceRaised,
+  },
+  selectionSecondaryText: { color: color.textDim, fontSize: 13, fontWeight: "600" },
 
   toolCard: {
     backgroundColor: color.surface,
