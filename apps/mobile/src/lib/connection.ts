@@ -20,6 +20,7 @@ import {
   CAPABILITY_ORCHESTRATION_LIFECYCLE,
   CAPABILITY_ORCHESTRATION_MANAGEMENT,
   CAPABILITY_ORCHESTRATION_MANUAL,
+  CAPABILITY_ORCHESTRATION_RUN_LIFECYCLE,
   CAPABILITY_ORCHESTRATION_SNAPSHOT,
   CAPABILITY_SESSION_CREATE_MODEL,
   CAPABILITY_SUBAGENT_HISTORY,
@@ -179,6 +180,10 @@ export class HostConnection {
 
   get supportsOrchestrationLifecycle(): boolean {
     return this.supportsCapability(CAPABILITY_ORCHESTRATION_LIFECYCLE);
+  }
+
+  get supportsOrchestrationRunLifecycle(): boolean {
+    return this.supportsCapability(CAPABILITY_ORCHESTRATION_RUN_LIFECYCLE);
   }
 
   get supportsSubagentHistory(): boolean {
@@ -1103,6 +1108,24 @@ export class HostConnection {
       objective: input.objective,
       nodes: input.nodes,
       operationId: input.operationId,
+    }, true).accepted;
+  }
+
+  completeOrchestrationRun(runId: string): boolean {
+    if (!this.supportsOrchestrationRunLifecycle) return false;
+    return this.send({
+      type: "orchestration.run.complete",
+      runId,
+      operationId: randomUUID(),
+    }, true).accepted;
+  }
+
+  abandonOrchestrationRun(runId: string): boolean {
+    if (!this.supportsOrchestrationRunLifecycle) return false;
+    return this.send({
+      type: "orchestration.run.abandon",
+      runId,
+      operationId: randomUUID(),
     }, true).accepted;
   }
 

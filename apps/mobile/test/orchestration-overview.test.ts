@@ -9,6 +9,7 @@ import type {
 import {
   coordinatorRunsBySession,
   goalSessionGroups,
+  goalSessionVisibility,
   groupOrchestrationRuns,
   goalRunOverview,
   orchestrationConnectionNotice,
@@ -174,5 +175,14 @@ describe("orchestration overview", () => {
       "worker-old",
       "worker-new",
     ]);
+
+    const filtered = goalSessionVisibility(
+      groups,
+      new Set(["worker-new"]),
+      new Set(["coordinator", "worker-old", "worker-new"]),
+    );
+    expect([...filtered.displayedCoordinatorIds]).toEqual(["coordinator"]);
+    expect([...filtered.contextualCoordinatorIds]).toEqual(["coordinator"]);
+    expect([...filtered.nestedWorkerIds]).toEqual(["worker-new"]);
   });
 });

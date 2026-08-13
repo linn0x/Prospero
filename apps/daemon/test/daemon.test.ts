@@ -462,6 +462,7 @@ describe("daemon 全链路", () => {
     expect(hello.host.capabilities).toContain("orchestration.automation.v1");
     expect(hello.host.capabilities).toContain("orchestration.management.v1");
     expect(hello.host.capabilities).toContain("orchestration.lifecycle.v1");
+    expect(hello.host.capabilities).toContain("orchestration.run-lifecycle.v1");
     expect(hello.host.capabilities).toContain("subagent.history.v1");
     expect(hello.host.capabilities).toContain("agent.accounts.v1");
     expect(hello.host.capabilities).toContain("chat.attachment-previews.v1");
@@ -546,6 +547,54 @@ describe("daemon 全链路", () => {
       (m) => m.type === "orchestration.snapshot" &&
         m.snapshot.tasks.some((candidate) => candidate.id === task.id && candidate.status === "cancelled"),
       "cancelled task snapshot",
+    )).resolves.toMatchObject({ type: "orchestration.snapshot" });
+
+    c.send({
+      type: "orchestration.run.complete",
+      runId: run.id,
+      operationId: `complete-${String(Date.now())}`,
+    });
+    await expect(c.waitFor(
+      (m) => m.type === "orchestration.snapshot" &&
+        m.snapshot.runs.some((candidate) =>
+          candidate.id === run.id && candidate.status === "completed"),
+      "completed run snapshot",
+    )).resolves.toMatchObject({ type: "orchestration.snapshot" });
+
+    c.send({
+      type: "orchestration.task.create",
+      runId: run.id,
+      title: "不应创建",
+      spec: "历史只读",
+    });
+    await expect(c.waitFor(
+      (m) => m.type === "error" && m.message.includes("历史编排只读"),
+      "completed run is read-only",
+    )).resolves.toMatchObject({ type: "error" });
+    c.close();
+  }, 20000);
+
+  it("Store 变更会实时推送，手机也可放弃 Run", async () => {
+    const c = await TestClient.connect(deviceToken, deviceKeys);
+    await c.waitFor((m) => m.type === "hello.ok", "hello.ok");
+    const objective = `实时推送-${String(Date.now())}`;
+    const run = server.orchestration.store.createRun({ objective });
+    await expect(c.waitFor(
+      (m) => m.type === "orchestration.snapshot" &&
+        m.snapshot.runs.some((candidate) => candidate.id === run.id),
+      "store change snapshot",
+    )).resolves.toMatchObject({ type: "orchestration.snapshot" });
+
+    c.send({
+      type: "orchestration.run.abandon",
+      runId: run.id,
+      operationId: `abandon-${String(Date.now())}`,
+    });
+    await expect(c.waitFor(
+      (m) => m.type === "orchestration.snapshot" &&
+        m.snapshot.runs.some((candidate) =>
+          candidate.id === run.id && candidate.status === "abandoned"),
+      "abandoned run snapshot",
     )).resolves.toMatchObject({ type: "orchestration.snapshot" });
     c.close();
   }, 20000);
@@ -644,6 +693,7 @@ describe("daemon 全链路", () => {
         expect(hello.host.capabilities).not.toContain("orchestration.automation.v1");
         expect(hello.host.capabilities).not.toContain("orchestration.management.v1");
         expect(hello.host.capabilities).not.toContain("orchestration.lifecycle.v1");
+        expect(hello.host.capabilities).not.toContain("orchestration.run-lifecycle.v1");
       }
       c.close();
     }
@@ -736,6 +786,7 @@ describe("daemon 全链路", () => {
     expect(hello.host.capabilities).not.toContain("orchestration.automation.v1");
     expect(hello.host.capabilities).not.toContain("orchestration.management.v1");
     expect(hello.host.capabilities).not.toContain("orchestration.lifecycle.v1");
+    expect(hello.host.capabilities).not.toContain("orchestration.run-lifecycle.v1");
     c.send({ type: "session.create", agent: "shell", cols: 80, rows: 24 });
     const err = await c.waitFor((m) => m.type === "error", "shell denied");
     expect((err as { code: string }).code).toBe("shell_not_allowed");
@@ -764,6 +815,7 @@ describe("daemon 全链路", () => {
     expect(hello.host.capabilities).not.toContain("orchestration.automation.v1");
     expect(hello.host.capabilities).not.toContain("orchestration.management.v1");
     expect(hello.host.capabilities).not.toContain("orchestration.lifecycle.v1");
+    expect(hello.host.capabilities).not.toContain("orchestration.run-lifecycle.v1");
     c.send({ type: "orchestration.run.create", objective: "不应获准" });
     await expect(c.waitFor(
       (m) => m.type === "error" && m.code === "forbidden",
