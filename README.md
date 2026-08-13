@@ -41,8 +41,8 @@ Prospero 是面向 Coding Agent 的本地优先控制中枢。Claude Code、Code
 | 人离开桌面就失去上下文 | **macOS、iOS、Android 状态一致**，关键监督动作随时可用 |
 
 > [!NOTE]
-> Prospero 目前是源码优先的早期项目。macOS 主机端、iOS/Android 客户端及核心控制与编排
-> 能力均已实现，暂未提供面向普通用户的稳定签名安装包。
+> **Prospero 正在寻找同行者。** 欢迎成为 Contributor：分享想法、改进体验、修复问题，
+> 或和我们一起定义本地 Coding Agent 的未来。
 
 ## License
 
