@@ -21,7 +21,7 @@
 
 待完成的实现项：**SH-06、IOS-01、IOS-03、IOS-04、AND-01**。
 
-## 2026-08-13 T5 构建与模拟器终验（未通过，Gate 待决）
+## 2026-08-13 T5 构建与模拟器终验（未通过，Gate 已决）
 
 此节是对上一节“待完成”陈述的更正：`9f13be9`、`e8414b5` 与 `278f169` 已补上 AND-01、SH-06 和 IOS-04；IOS-01 / IOS-03 的相应行为也随 `9f13be9` / `f9821a2` 落地。代码和单元测试可以核对为完成，但本轮不能把任一项写成“设备验收通过”。原因是 iOS 两台全新模拟器的无签名 generic Simulator release 包均停在纯黑界面，Android API 35 临时映像/AVD 又未能在本机 SDK 布局中建立；因此完整矩阵没有完成。
 
@@ -55,7 +55,7 @@
 - iOS：新建 iPhone SE（第三代）和 iPad（第十代）各一台，安装 generic Simulator release app；两者均显示纯黑应用窗口。该阻断先于权限、Settings、44 pt、Dynamic Type 和自定义字号复位验证。
 - 全部临时 AVD、iOS 模拟器和安装的临时 App 数据均已删除；本次未生成临时配对凭证，配对串没有写入日志或 Git。
 
-物理设备当前不可用。Prospero Gate `gate_4ca9584cb748` 处于 `pending`：**是否接受模拟器验收并保留真机清单？** 选项为“接受模拟器验收并记录真机待办”或“连接真机后继续”。Gate 未决且模拟器矩阵未完成时，不得声称真机或完整设备验收通过。真机待办准确包括 VoiceOver、TalkBack、真实相机、OEM IME、Android 13/15 的三键与手势导航、Android 15 predictive back、折叠铰链、iOS 权限/Settings 回返、Dynamic Type 重启和终端字号复位。
+物理设备当前不可用。Prospero Gate `gate_4ca9584cb748` 已决议为“接受模拟器验收并记录真机待办”。该决议只接受本节列出的自动化和有限模拟器证据、保留真机清单；不覆盖本轮 iOS 纯黑首屏及 Android API 35/Fold 无法建立所造成的完整模拟器矩阵阻断，也不得声称真机或完整设备验收通过。真机待办准确包括 VoiceOver、TalkBack、真实相机、OEM IME、Android 13/15 的三键与手势导航、Android 15 predictive back、折叠铰链、iOS 权限/Settings 回返、Dynamic Type 重启和终端字号复位。
 
 ## M1 · 可靠投递与连接恢复
 

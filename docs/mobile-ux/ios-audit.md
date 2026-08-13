@@ -6,7 +6,7 @@
 
 实现提交：IOS-01 为 `9f13be9`，IOS-02 / IOS-03 为 `f9821a2`，IOS-04 为 `278f169`。在 `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` 下，clean iOS prebuild、`pod install` 和无签名 generic iOS Simulator release build 均通过（`BUILD SUCCEEDED`）；移动端自动化共 24 个 Vitest 文件 / 148 个测试通过。
 
-本轮仅使用新建的 iPhone SE（第三代）与 iPad（第十代）模拟器。release app 在两机安装、启动后均停在纯黑窗口，未出现首屏；因此首次/永久权限拒绝、Settings 返回、小屏 44 pt 命中框、Dynamic Type 各档以及自定义字号跨重启/复位均**未验**，没有把这些行为写成通过。VoiceOver、真实相机及一切真机检查也未执行。详细构建、清理与 Gate 状态见 [优化 Backlog](optimization-backlog.md#2026-08-13-t5-构建与模拟器终验未通过gate-待决)。
+本轮仅使用新建的 iPhone SE（第三代）与 iPad（第十代）模拟器。release app 在两机安装、启动后均停在纯黑窗口，未出现首屏；因此首次/永久权限拒绝、Settings 返回、小屏 44 pt 命中框、Dynamic Type 各档以及自定义字号跨重启/复位均**未验**，没有把这些行为写成通过。VoiceOver、真实相机及一切真机检查也未执行。Gate `gate_4ca9584cb748` 已决议“接受模拟器验收并记录真机待办”，但不将这些阻断改写为通过；详细构建、清理与矩阵见 [优化 Backlog](optimization-backlog.md#2026-08-13-t5-构建与模拟器终验未通过gate-已决)。
 
 ## IOS-01 · 图片权限拒绝后没有解释或恢复入口
 
