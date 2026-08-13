@@ -46,8 +46,8 @@ Prospero 把你的 iPhone 或 Android 手机变成 Mac 上**所有 Coding Agent 
 
 ## How to use
 
-> 需要 macOS 14+、Node.js 22+，以及至少一个已登录的 Agent CLI。构建 iOS 客户端需要
-> Xcode；Android 客户端需要 JDK 17 与 Android SDK。
+> 以下命令都在 Mac 终端执行。需要 macOS 14+、Node.js 22+，以及至少一个已登录的
+> Agent CLI。构建 iOS 客户端需要 Xcode；Android 客户端需要 JDK 17 与 Android SDK。
 
 ### 1. 在 Mac 启动 Prospero
 
@@ -59,19 +59,22 @@ npm run build -w @prospero/daemon
 node apps/daemon/dist/cli.js start --name my-mac
 ```
 
-### 2. 在手机运行客户端
+### 2. 在 Mac 上构建并安装手机客户端
 
 ```bash
-# iPhone 真机
+# 连接 iPhone 后，选择真机并安装
 npm run ios -w @prospero/mobile -- --device
 
-# Android 设备或模拟器
+# 安装到已连接的 Android 设备或模拟器
 npm run android -w @prospero/mobile
 ```
 
+这两条命令会在 Mac 上编译原生客户端、安装到手机或模拟器，并启动 Metro 开发服务；
+不是在手机终端中运行。iPhone 真机需先在 Xcode 中登录 Apple ID 并完成开发签名配置。
+
 ### 3. 扫码配对并启动 Agent
 
-保持 daemon 运行，在另一个终端生成配对二维码：
+保持 daemon 运行，在 Mac 的另一个终端生成配对二维码：
 
 ```bash
 node apps/daemon/dist/cli.js pair --name my-phone
