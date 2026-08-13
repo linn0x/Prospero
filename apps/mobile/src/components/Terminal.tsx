@@ -4,9 +4,11 @@
  * attach 流程:page ready → 上报 fit 尺寸 → resize → attach(带 lastSeq 续传)。
  */
 import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useRef } from "react";
-import { StyleSheet, View } from "react-native";
+import { Pressable, StyleSheet, Text, View } from "react-native";
 import { WebView, type WebViewMessageEvent } from "react-native-webview";
 import type { HostConnection } from "@/lib/connection";
+import { toast } from "@/components/Toast";
+import { deliveryFailureText } from "@/lib/outbound-queue";
 import { TERMINAL_HTML } from "./terminal-html";
 
 // source 对象保持稳定,避免会话状态刷新时让原生 WebView 误判为需要重新加载。
@@ -19,6 +21,10 @@ interface Props {
   onFontSize?: (size: number) => void;
   /** 洪峰时的渲染帧率与吞吐;Release 构建里 console 是哑的,只能走 UI */
   onPerf?: (p: { fps: number; kb: number; renderer: string }) => void;
+  /** 断线后的 shell 字节不能安全补发，WebView 必须被冻结。 */
+  inputEnabled?: boolean;
+  disconnectedMessage?: string;
+  onRetryConnection?: () => void;
 }
 
 export interface TerminalHandle {
@@ -40,7 +46,15 @@ interface BridgeUp {
 }
 
 const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
-  { conn, sid, onFontSize, onPerf },
+  {
+    conn,
+    sid,
+    onFontSize,
+    onPerf,
+    inputEnabled = true,
+    disconnectedMessage = "主机未连接；终端输入已冻结。",
+    onRetryConnection,
+  },
   ref,
 ) {
   const webRef = useRef<WebView>(null);
@@ -145,7 +159,10 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
           else conn.resize(sid, msg.cols, msg.rows);
           break;
         case "input":
-          if (typeof msg.data === "string") conn.inputB64(sid, msg.data);
+          if (typeof msg.data === "string" && inputEnabled) {
+            const result = conn.inputB64(sid, msg.data);
+            if (!result.accepted) toast(deliveryFailureText(result));
+          }
           break;
         case "fontSize":
           if (typeof msg.size === "number") onFontSize?.(msg.size);
@@ -158,7 +175,7 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
           break;
       }
     },
-    [conn, sid, tryAttach, rx, onFontSize, onPerf],
+    [conn, sid, tryAttach, rx, onFontSize, onPerf, inputEnabled],
   );
 
   useImperativeHandle(ref, () => ({
@@ -186,6 +203,28 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
         overScrollMode="never"
         automaticallyAdjustContentInsets={false}
       />
+      {!inputEnabled && (
+        <View style={styles.inputFrozen} pointerEvents="auto">
+          <View
+            style={styles.inputFrozenCard}
+            accessible
+            accessibilityLiveRegion="polite"
+            accessibilityLabel={disconnectedMessage}
+          >
+            <Text style={styles.inputFrozenText}>{disconnectedMessage}</Text>
+            {onRetryConnection && (
+              <Pressable
+                style={({ pressed }) => [styles.inputFrozenRetry, pressed && styles.inputFrozenRetryPressed]}
+                onPress={onRetryConnection}
+                accessibilityRole="button"
+                accessibilityLabel="重新连接主机后继续终端输入"
+              >
+                <Text style={styles.inputFrozenRetryText}>重试连接</Text>
+              </Pressable>
+            )}
+          </View>
+        </View>
+      )}
     </View>
   );
 });
@@ -199,4 +238,30 @@ export const Terminal = memo(TerminalInner);
 const styles = StyleSheet.create({
   wrap: { flex: 1, backgroundColor: "#09090b" },
   web: { flex: 1, backgroundColor: "#09090b" },
+  inputFrozen: {
+    ...StyleSheet.absoluteFill,
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 24,
+    backgroundColor: "rgba(9, 9, 11, 0.58)",
+  },
+  inputFrozenCard: {
+    maxWidth: 340,
+    gap: 12,
+    padding: 16,
+    borderRadius: 12,
+    backgroundColor: "#211d15",
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: "#6b5524",
+  },
+  inputFrozenText: { color: "#F0D798", fontSize: 13, lineHeight: 19, textAlign: "center" },
+  inputFrozenRetry: {
+    alignSelf: "center",
+    paddingHorizontal: 13,
+    paddingVertical: 8,
+    borderRadius: 8,
+    backgroundColor: "#3A5BA8",
+  },
+  inputFrozenRetryPressed: { opacity: 0.7 },
+  inputFrozenRetryText: { color: "#fff", fontSize: 12, fontWeight: "700" },
 });

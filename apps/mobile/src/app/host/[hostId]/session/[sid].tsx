@@ -45,6 +45,8 @@ import { matchCommands } from "@/lib/slash-commands";
 import { setSessionArchived } from "@/lib/session-preferences";
 import { sortSessions } from "@/lib/store";
 import { useHostConnection } from "@/lib/use-host-connection";
+import { deliveryFailureText } from "@/lib/outbound-queue";
+import { sessionLoadState } from "@/lib/session-load-state";
 import { appendVoiceTranscript } from "@/lib/voice-input";
 import type { ProjectFileReference } from "@/lib/file-references";
 import {
@@ -261,6 +263,8 @@ export default function SessionScreen() {
   }>();
   const { conn, runtime } = useHostConnection(hostId);
   const [draft, setDraft] = useState("");
+  /** 被连接层拒绝的消息留在编辑器中，直到用户确认修改或重试。 */
+  const [deliveryError, setDeliveryError] = useState<string | null>(null);
   const [selection, setSelection] = useState({ start: 0, end: 0 });
   const inputRef = useRef<TextInput>(null);
   const appendTranscript = useCallback((text: string): void => {
@@ -335,6 +339,13 @@ export default function SessionScreen() {
   const completionLoading =
     completionKind !== null &&
     (completionResult.key !== completionKey || completionResult.loading);
+
+  // 深链冷启动时 hello.ok 的会话列表可能尚未进入 zustand。先 attach 同一个 sid，
+  // 不跳转、不新建，等主机状态收敛后当前路由自然恢复为完整会话页。
+  useEffect(() => {
+    if (!conn || !sid || session || runtime.status !== "connected") return;
+    conn.attach(sid);
+  }, [conn, runtime.status, session, sid]);
 
   useEffect(() => {
     const sequence = ++completionSequence.current;
@@ -457,7 +468,6 @@ export default function SessionScreen() {
       const t = text.trim();
       // 只带图不带字是合理的:一张报错截图本身就是问题
       if (!conn || !sid || (t.length === 0 && (!isChat || images.length === 0))) return;
-      void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
       if (isChat) {
         if (!isSubagent && images.length === 0 && t === "/model") {
           openControls();
@@ -471,9 +481,15 @@ export default function SessionScreen() {
           requestAnimationFrame(() => inputRef.current?.focus());
           return;
         } else if (isSubagent && subagentId) {
-          conn.sendToSubagent(sid, subagentId, t);
+          const result = conn.sendToSubagent(sid, subagentId, t);
+          if (!result.accepted) {
+            const message = deliveryFailureText(result);
+            setDeliveryError(message);
+            toast(message);
+            return;
+          }
         } else {
-          conn.chatSend(
+          const result = conn.chatSend(
             sid,
             t,
             images.map(({ mimeType, dataB64, name }) => ({
@@ -483,13 +499,30 @@ export default function SessionScreen() {
             })),
             deliveryOverride ?? (busy ? busyDelivery : "auto"),
           );
+          if (!result.accepted) {
+            const message = deliveryFailureText(result);
+            setDeliveryError(message);
+            toast(message);
+            return;
+          }
+          if (result.disposition === "queued") {
+            toast("连接已断开，消息已在本机排队，恢复后会按顺序发送。");
+          }
         }
         setImages([]);
       } else {
-        conn.inputText(sid, t + "\r");
+        const result = conn.inputText(sid, t + "\r");
+        if (!result.accepted) {
+          const message = deliveryFailureText(result);
+          setDeliveryError(message);
+          toast(message);
+          return;
+        }
       }
+      void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
       setDraft("");
       setSelection({ start: 0, end: 0 });
+      setDeliveryError(null);
       completionSequence.current++;
     },
     [
@@ -559,6 +592,17 @@ export default function SessionScreen() {
     else router.replace("/");
   };
 
+  const returnToHostOverview = (): void => {
+    if (hostId) router.replace(`/host/${hostId}`);
+    else router.replace("/");
+  };
+
+  const retryColdStart = (): void => {
+    if (!conn || !sid) return;
+    conn.kick();
+    if (conn.isConnected) conn.attach(sid);
+  };
+
   const openFileReference = useCallback(
     (reference: ProjectFileReference): void => {
       if (!hostId || !sid) return;
@@ -606,11 +650,35 @@ export default function SessionScreen() {
   };
 
   if (!conn || !sid || !session) {
+    const loading = sessionLoadState(runtime.status, runtime.lastError);
     return (
-      <View style={styles.center}>
-        <Stack.Screen options={{ title: "会话" }} />
-        <ActivityIndicator color={color.accent} />
-        <Text style={styles.dim}>正在准备连接…</Text>
+      <View style={styles.loadState}>
+        <Stack.Screen options={{ title: loading.title }} />
+        {loading.showSpinner && <ActivityIndicator color={color.accent} />}
+        <Text style={styles.loadTitle}>{loading.title}</Text>
+        <Text style={styles.loadDetail} accessibilityLiveRegion="polite">
+          {loading.detail}
+        </Text>
+        <View style={styles.loadActions}>
+          <Pressable
+            style={({ pressed }) => [styles.loadRetry, (!conn || pressed) && styles.loadButtonPressed]}
+            onPress={retryColdStart}
+            disabled={!conn}
+            accessibilityRole="button"
+            accessibilityLabel={loading.retryLabel}
+            accessibilityState={{ disabled: !conn }}
+          >
+            <Text style={styles.loadRetryText}>{loading.retryLabel}</Text>
+          </Pressable>
+          <Pressable
+            style={({ pressed }) => [styles.loadBack, pressed && styles.loadButtonPressed]}
+            onPress={returnToHostOverview}
+            accessibilityRole="button"
+            accessibilityLabel="返回主机"
+          >
+            <Text style={styles.loadBackText}>返回主机</Text>
+          </Pressable>
+        </View>
       </View>
     );
   }
@@ -706,7 +774,10 @@ export default function SessionScreen() {
     isChat && !isSubagent && session && composerToken?.kind === "command"
       ? matchCommands(session.agent, draft.trim())
       : [];
-  const canSend = draft.trim().length > 0 || (isChat && !isSubagent && images.length > 0);
+  const terminalInputEnabled = runtime.status === "connected";
+  const canSend =
+    (draft.trim().length > 0 || (isChat && !isSubagent && images.length > 0)) &&
+    (isChat || terminalInputEnabled);
 
   const focusComposer = (cursor: number): void => {
     setSelection({ start: cursor, end: cursor });
@@ -967,9 +1038,20 @@ export default function SessionScreen() {
         />
       ) : (
         <>
-          <Terminal ref={termRef} conn={conn} sid={sid} onFontSize={setFontSize} />
+          <Terminal
+            ref={termRef}
+            conn={conn}
+            sid={sid}
+            onFontSize={setFontSize}
+            inputEnabled={terminalInputEnabled}
+            disconnectedMessage="主机未连接；终端输入已冻结，断线期间的按键不会自动重放。"
+            onRetryConnection={() => conn.kick()}
+          />
           <KeyBar
             onKey={(seq) => conn.inputText(sid, seq)}
+            enabled={terminalInputEnabled}
+            disabledMessage="主机未连接；快捷键和粘贴已冻结，不会自动重放。"
+            onRetry={() => conn.kick()}
             onFontSize={(delta) => {
               const next = Math.min(20, Math.max(8, fontSize + delta));
               setFontSize(next);
@@ -1313,6 +1395,16 @@ export default function SessionScreen() {
         )}
       </Sheet>
 
+      {deliveryError && (
+        <View
+          style={styles.deliveryError}
+          accessible
+          accessibilityLiveRegion="assertive"
+          accessibilityLabel={deliveryError}
+        >
+          <Text style={styles.deliveryErrorText}>{deliveryError}</Text>
+        </View>
+      )}
       <View style={[styles.composer, { paddingBottom: Math.max(insets.bottom, 8) }]}>
         <DismissKey visible={focused} />
         {isChat && !isSubagent && (
@@ -1327,7 +1419,7 @@ export default function SessionScreen() {
         )}
         <TextInput
           ref={inputRef}
-          style={[styles.input, isChat && styles.inputChat]}
+          style={[styles.input, isChat && styles.inputChat, !isChat && !terminalInputEnabled && styles.inputDisabled]}
           placeholder={
             isChat
               ? isSubagent
@@ -1337,11 +1429,16 @@ export default function SessionScreen() {
                   ? "立即引导当前任务…"
                   : "消息将排到队尾…"
                 : `给 ${session?.agent ?? "agent"} 发消息 · @文件 · $Skill · /命令`
-              : "输入命令，回车执行"
+              : terminalInputEnabled
+                ? "输入命令，回车执行"
+                : "主机未连接；终端输入已冻结"
           }
           placeholderTextColor={color.textFaint}
           value={draft}
-          onChangeText={setDraft}
+          onChangeText={(next) => {
+            setDraft(next);
+            setDeliveryError(null);
+          }}
           selection={selection}
           onSelectionChange={(event) => setSelection(event.nativeEvent.selection)}
           onFocus={() => { setFocused(true); }}
@@ -1352,6 +1449,12 @@ export default function SessionScreen() {
           autoCapitalize="none"
           autoCorrect={false}
           multiline={isChat}
+          editable={isChat || terminalInputEnabled}
+          accessibilityHint={
+            !isChat && !terminalInputEnabled
+              ? "连接恢复前不能执行命令；输入内容不会自动发送。"
+              : undefined
+          }
         />
         {isChat && <VoiceButton onTranscript={appendTranscript} />}
         <Pressable
@@ -1445,8 +1548,34 @@ const styles = StyleSheet.create({
   sessionRailPath: { color: color.textFaint, fontSize: 9.5, fontFamily: MONOSPACE_FONT },
   sessionRailPreview: { color: color.textDim, fontSize: 10.5, lineHeight: 15 },
   headerBack: { minWidth: 30, minHeight: 36, alignItems: "flex-start", justifyContent: "center" },
-  center: { flex: 1, alignItems: "center", justifyContent: "center", gap: 12 },
-  dim: { color: color.textDim, fontSize: 14 },
+  loadState: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 12,
+    paddingHorizontal: 28,
+    backgroundColor: color.bg,
+  },
+  loadTitle: { color: color.text, fontSize: 18, fontWeight: "700" },
+  loadDetail: { maxWidth: 360, color: color.textDim, fontSize: 13, lineHeight: 19, textAlign: "center" },
+  loadActions: { flexDirection: "row", gap: 10, marginTop: 4 },
+  loadRetry: {
+    minHeight: 40,
+    justifyContent: "center",
+    borderRadius: 10,
+    paddingHorizontal: 14,
+    backgroundColor: color.accentDim,
+  },
+  loadRetryText: { color: "#fff", fontSize: 13, fontWeight: "700" },
+  loadBack: {
+    minHeight: 40,
+    justifyContent: "center",
+    borderRadius: 10,
+    paddingHorizontal: 14,
+    backgroundColor: color.surfaceRaised,
+  },
+  loadBackText: { color: color.text, fontSize: 13, fontWeight: "600" },
+  loadButtonPressed: { opacity: 0.55 },
 
   headerTitle: { alignItems: "center", maxWidth: 238 },
   headerName: { color: color.text, fontSize: 16, fontWeight: "600" },
@@ -1824,6 +1953,7 @@ const styles = StyleSheet.create({
     lineHeight: 21,
   },
   inputChat: { maxHeight: 132 },
+  inputDisabled: { color: color.textFaint, opacity: 0.7 },
   sendBtn: {
     backgroundColor: color.accentDim,
     borderRadius: 20,
@@ -1834,4 +1964,12 @@ const styles = StyleSheet.create({
   },
   sendBtnDim: { backgroundColor: color.surfaceRaised, opacity: 0.72 },
   sendBtnPressed: { transform: [{ scale: 0.94 }] },
+  deliveryError: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    backgroundColor: color.dangerBg,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: color.danger,
+  },
+  deliveryErrorText: { color: color.danger, fontSize: 12, lineHeight: 17, textAlign: "center" },
 });
