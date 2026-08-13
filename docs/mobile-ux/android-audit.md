@@ -2,6 +2,12 @@
 
 审计日期：2026-08-12。全部为静态证据；Android 13+、Android 15 edge-to-edge、折叠屏和 TalkBack 必须补真机验收。共享左滑无障碍问题的统一实现项为 [SH-07](shared-audit.md#sh-07--仅靠左滑的列表操作没有屏幕阅读器等价入口)，此处记录其 Android 影响以避免重复 backlog。
 
+## 2026-08-13 T6 · 未配对首页最大字号回归（代码修复；Android 运行时未验）
+
+修复提交：`44ec843`。空态采用跨平台 React Native `ScrollView` 和按当前连续面板宽度计算的布局策略：短内容居中，超高 Dynamic Type 内容可纵向滚动；窄屏命令块允许换行，CTA 最小真实高度为 44pt。分离铰链时首页仍只占右侧连续面板，主机列表分支未改动。布局单测覆盖 320×548、最大 `fontScale=3.125`、宽屏限宽及防退化的静态滚动断言；全套移动端 Vitest 为 25 文件 / 151 测试，TypeScript、Expo lint 通过。
+
+本机没有可安全复用的小屏 Android 设备：仅有既有 `FundWatch_API_35`，未启动或修改；故本次不将 Android 小屏、TalkBack、折叠分栏或 CTA 运行时点按写为通过。该局限不影响 iOS SE 3 的 Release 截图复测，但 Android 仍须在小屏、分屏和分离铰链设备实测。未生成或记录配对凭证。详见 [优化 Backlog](optimization-backlog.md#2026-08-13-t6--iphone-se-3-最大辅助字号首页已修复)。
+
 ## 2026-08-13 T5 验收增补（未通过）
 
 实现提交：AND-01 为 `9f13be9`；AND-02、AND-03、AND-05 为 `f9821a2`；AND-04 为 `4d04190`。自动化全部通过（24 个 Vitest 文件 / 148 个测试、TypeScript、lint、终端 HTML）；clean prebuild 与 signed release APK 构建通过，产物为 `apps/mobile/build/apk/prospero-release.apk`（319 MB）。

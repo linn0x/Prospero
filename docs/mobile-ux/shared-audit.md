@@ -2,6 +2,12 @@
 
 审计日期：2026-08-12。范围为 `apps/mobile` 的 TypeScript/React Native 源码；本轮没有真机、模拟器或网络故障注入实测。证据等级中“静态（代码链路）”表示可从源码确定执行结果，“静态（界面路径）”表示代码显示了可复现的 UI 缺口，仍应在发布前补设备验收。
 
+## 2026-08-13 T6 · 未配对首页辅助字号可达性（已修复）
+
+修复提交：`44ec843`。T5 的确定性 iOS 空态失败已由跨平台首页布局修复：空态使用有界、显式可滚动的 `ScrollView`；`flexGrow` 内容容器只负责短内容居中，超高字号时标题、说明、命令块和扫码 CTA 都保留在同一纵向可达内容流中。命令块取消裁切并按窄屏换行，CTA 有语义标签且真实高度不低于 44pt；宽屏限宽、iPad 与 Android 分离铰链连续面板均由可单测策略统一处理，主机列表未改。
+
+证据：策略单测覆盖 320×548 + `fontScale=3.125`、宽屏与 44pt，并静态断言不得退回不可滚动的 flex 空态；移动端全套为 25 个 Vitest 文件 / 151 个测试，TypeScript 和 Expo lint 通过。专用临时 iPhone SE（第三代，iOS 26.5）Release 包在 `large` 与 `accessibility-extra-extra-extra-large` terminate/relaunch 后截图：前者 CTA 可见，后者文本/命令块扩展进可滚动内容、未被容器裁切。最大字号的实际 CTA 触摸点击未执行（本机无触摸注入工具），所以仍需真实 iPhone/Android 小屏上的手势与读屏回归；已配对会话、VoiceOver、TalkBack、真实相机、OEM IME、离线/重连 E2E 等原有待办继续保留。测试后字号复位为 `large`，临时模拟器将在收尾删除，未使用或记录配对凭证。详见 [优化 Backlog](optimization-backlog.md#2026-08-13-t6--iphone-se-3-最大辅助字号首页已修复)。
+
 ## 2026-08-13 T5 验收增补（自动化通过；设备结论未通过）
 
 SH-01 / SH-02 / SH-03 的实现提交为 `bdd6568`，SH-04 / SH-05 为 `4d04190`，SH-06 为 `e8414b5`，SH-07 为 `f9821a2`。`npm test -w @prospero/mobile`（24 文件 / 148 测试）、TypeScript、Expo lint 与终端 HTML 生成均通过且无生成漂移；这些只证明单元/静态行为，不能替代离线恢复、读屏或网络故障设备验收。
