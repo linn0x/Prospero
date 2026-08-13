@@ -74,11 +74,38 @@ describe("结构化轨协议", () => {
         agent: "codex",
         kind: "structured",
         mode: "plan",
+        model: "gpt-5.6-sol",
+        effort: "high",
         resume: { id: "thread-1", title: "已有对话" },
         cols: 80,
         rows: 24,
       }),
-    ).toMatchObject({ mode: "plan", resume: { id: "thread-1" } });
+    ).toMatchObject({
+      mode: "plan",
+      model: "gpt-5.6-sol",
+      effort: "high",
+      resume: { id: "thread-1" },
+    });
+    expect(() =>
+      parseC2S({
+        type: "session.create",
+        agent: "codex",
+        kind: "structured",
+        effort: "high",
+        cols: 80,
+        rows: 24,
+      }),
+    ).toThrowError(ProtocolError);
+    expect(() =>
+      parseC2S({
+        type: "session.create",
+        agent: "codex",
+        kind: "pty",
+        model: "gpt-5.6-sol",
+        cols: 80,
+        rows: 24,
+      }),
+    ).toThrowError(ProtocolError);
     expect(() =>
       parseC2S({
         type: "session.create",
@@ -462,6 +489,24 @@ describe("结构化轨协议", () => {
   });
 
   it("Agent 控制消息校验模型、Plan 模式与原生 compact", () => {
+    expect(parseC2S({
+      type: "launch.models.get",
+      requestId: "launch-models-1",
+      agent: "codex",
+      accountId: "account-work",
+    })).toMatchObject({ agent: "codex", accountId: "account-work" });
+    expect(parseS2C({
+      type: "launch.models",
+      requestId: "launch-models-1",
+      agent: "codex",
+      currentModel: "gpt-5.6-sol",
+      currentEffort: "high",
+      models: [{
+        id: "gpt-5.6-sol",
+        label: "GPT-5.6 Sol",
+        supportedEfforts: ["low", "high"],
+      }],
+    })).toMatchObject({ models: [{ id: "gpt-5.6-sol" }] });
     expect(parseC2S({
       type: "agent.models.get",
       sid: "s1",

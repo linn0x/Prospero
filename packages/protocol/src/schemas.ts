@@ -262,6 +262,10 @@ export const C2SSessionCreateSchema = z.object({
   command: z.string().optional(),
   /** 结构化会话的初始协作模式；Plan 会从第一轮起生效。 */
   mode: z.enum(["default", "plan"]).optional(),
+  /** 结构化会话从首轮起使用的原生模型；值来自 launch.models.get。 */
+  model: z.string().min(1).max(300).optional(),
+  /** 所选模型的推理强度；不单独存在，避免落到未知默认模型上。 */
+  effort: z.string().min(1).max(100).optional(),
   /** 接回 Agent 已经保存在本机的原生对话。 */
   resume: z
     .object({
@@ -414,6 +418,14 @@ export const C2SAgentModelsGetSchema = z.object({
   type: z.literal("agent.models.get"),
   sid,
   requestId: z.string().min(1).max(100),
+});
+
+/** 会话尚未创建时，按 Agent 与隔离账号读取实时模型目录。 */
+export const C2SLaunchModelsGetSchema = z.object({
+  type: z.literal("launch.models.get"),
+  requestId: z.string().min(1).max(100),
+  agent: z.enum(["claude", "codex"]),
+  accountId: z.string().min(1).max(100).optional(),
 });
 
 export const C2SAgentModelSetSchema = z.object({
@@ -882,6 +894,7 @@ export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SChatQueueRemoveSchema,
   C2SChatQueueGuideSchema,
   C2SChatCompleteSchema,
+  C2SLaunchModelsGetSchema,
   C2SAgentModelsGetSchema,
   C2SAgentModelSetSchema,
   C2SAgentModesGetSchema,
@@ -1209,6 +1222,17 @@ export const S2CAgentModelsSchema = z.object({
   currentEffort: z.string().min(1).max(100).optional(),
 });
 
+/** 创建器的模型目录应答；失败也按 requestId 原路返回，不让界面等到超时。 */
+export const S2CLaunchModelsSchema = z.object({
+  type: z.literal("launch.models"),
+  requestId: z.string().min(1).max(100),
+  agent: z.enum(["claude", "codex"]),
+  models: z.array(AgentModelSchema).max(100),
+  currentModel: z.string().min(1).max(300).optional(),
+  currentEffort: z.string().min(1).max(100).optional(),
+  error: z.string().max(2000).optional(),
+});
+
 export const S2CAgentModesSchema = z.object({
   type: z.literal("agent.modes"),
   sid,
@@ -1461,6 +1485,7 @@ export const S2CMessageSchema = z.discriminatedUnion("type", [
   S2CChatSnapshotSchema,
   S2CSubagentHistorySchema,
   S2CChatSuggestionsSchema,
+  S2CLaunchModelsSchema,
   S2CAgentModelsSchema,
   S2CAgentModesSchema,
   S2CAgentControlResultSchema,
@@ -1550,6 +1575,7 @@ export type C2SChatSend = z.infer<typeof C2SChatSendSchema>;
 export type C2SChatQueueRemove = z.infer<typeof C2SChatQueueRemoveSchema>;
 export type C2SChatQueueGuide = z.infer<typeof C2SChatQueueGuideSchema>;
 export type C2SChatComplete = z.infer<typeof C2SChatCompleteSchema>;
+export type C2SLaunchModelsGet = z.infer<typeof C2SLaunchModelsGetSchema>;
 export type C2SAgentModelsGet = z.infer<typeof C2SAgentModelsGetSchema>;
 export type C2SAgentModelSet = z.infer<typeof C2SAgentModelSetSchema>;
 export type C2SAgentModesGet = z.infer<typeof C2SAgentModesGetSchema>;
@@ -1582,6 +1608,7 @@ export type OrchestrationSnapshot = z.infer<typeof OrchestrationSnapshotSchema>;
 export type FsEntry = z.infer<typeof FsEntrySchema>;
 export type WorkspaceListing = z.infer<typeof S2CWorkspaceListingSchema>;
 export type ConversationResults = z.infer<typeof S2CConversationResultsSchema>;
+export type LaunchModels = z.infer<typeof S2CLaunchModelsSchema>;
 export type AgentAccountsResult = z.infer<typeof S2CAgentAccountsResultSchema>;
 export type GitFile = z.infer<typeof GitFileSchema>;
 export type ChatRole = z.infer<typeof ChatRoleSchema>;
@@ -1605,6 +1632,7 @@ export type S2CAgentEvent = z.infer<typeof S2CAgentEventSchema>;
 export type S2CChatSnapshot = z.infer<typeof S2CChatSnapshotSchema>;
 export type S2CSubagentHistory = z.infer<typeof S2CSubagentHistorySchema>;
 export type S2CChatSuggestions = z.infer<typeof S2CChatSuggestionsSchema>;
+export type S2CLaunchModels = z.infer<typeof S2CLaunchModelsSchema>;
 export type S2CAgentModels = z.infer<typeof S2CAgentModelsSchema>;
 export type S2CAgentModes = z.infer<typeof S2CAgentModesSchema>;
 export type S2CAgentControlResult = z.infer<typeof S2CAgentControlResultSchema>;
@@ -1642,6 +1670,19 @@ export function parseC2S(v: unknown): C2SMessage {
     }
     if (r.data.resume !== undefined) {
       throw new ProtocolError("goal sessions cannot resume an existing conversation", "format");
+    }
+  }
+  if (r.data.type === "session.create") {
+    if (r.data.effort !== undefined && r.data.model === undefined) {
+      throw new ProtocolError("session.create effort requires model", "format");
+    }
+    if (r.data.model !== undefined) {
+      if (r.data.kind === "pty") {
+        throw new ProtocolError("session.create model requires the structured track", "format");
+      }
+      if (r.data.agent !== "claude" && r.data.agent !== "codex") {
+        throw new ProtocolError("session.create model only supports Claude/Codex", "format");
+      }
     }
   }
   return r.data;

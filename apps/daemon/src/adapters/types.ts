@@ -20,6 +20,8 @@ export interface AdapterContext {
   cwd: string;
   /** 当前会话专属的进程环境（不含时可直接继承 daemon 环境）。 */
   env?: Record<string, string>;
+  /** 只启动读取模型目录所需的最小后端，不创建原生对话。 */
+  catalogOnly?: boolean;
   /** 当前审批策略;适配器据此决定是否绕过人工确认 */
   approvalPolicy?: () => ApprovalPolicy;
   /** 适配器产出一条归一化事件 */
