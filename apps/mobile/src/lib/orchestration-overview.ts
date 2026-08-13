@@ -47,6 +47,31 @@ export interface GoalRunOverview {
 }
 
 /**
+ * Indexes coordinator sessions for the session list and detail screen.
+ * An active Run wins over historical Runs; otherwise the newest update wins.
+ */
+export function coordinatorRunsBySession(
+  runs: readonly OrchestrationRun[],
+): Map<string, OrchestrationRun> {
+  const indexed = new Map<string, OrchestrationRun>();
+  for (const run of runs) {
+    const sessionId = run.coordinatorSessionId;
+    if (!sessionId) continue;
+    const previous = indexed.get(sessionId);
+    const active = run.status === "active";
+    const previousActive = previous?.status === "active";
+    if (
+      previous === undefined ||
+      (active && !previousActive) ||
+      (active === previousActive && run.updatedAt > previous.updatedAt)
+    ) {
+      indexed.set(sessionId, run);
+    }
+  }
+  return indexed;
+}
+
+/**
  * Home intentionally remains a compact summary. Pending human decisions come
  * first, then the newest remaining Runs, with deterministic ties for a stable
  * order across snapshot deliveries.
