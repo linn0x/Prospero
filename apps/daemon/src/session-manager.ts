@@ -14,6 +14,7 @@ import type {
 import {
   commandFor,
   defaultKindFor,
+  noopCommand,
   requiresShellCapability,
   spawnEnv,
   structuredCapable,
@@ -501,7 +502,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     spec: { file: string; args: string[] } | undefined,
     account?: AccountBinding,
   ): SessionInfo {
-    const base = spec ?? { file: "/bin/true", args: [] };
+    const base = spec ?? noopCommand();
     const sessionEnv = { ...(account?.environment ?? {}), ...this.sessionEnv(id) };
     const launch =
       this.tmuxBin && this.tmuxConfigFile

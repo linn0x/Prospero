@@ -100,8 +100,8 @@ export default function HostsScreen() {
           ]}
         >
           <Icon name="desktopcomputer" size={52} color={color.textFaint} />
-          <Text style={styles.emptyTitle}>还没有配对的 Mac</Text>
-          <Text style={styles.emptyText}>在 Mac 上运行 prosperod 并生成配对码:</Text>
+          <Text style={styles.emptyTitle}>还没有配对的电脑</Text>
+          <Text style={styles.emptyText}>在电脑上运行 prosperod 并生成配对码:</Text>
           <Text style={styles.code}>prosperod start{"\n"}prosperod pair</Text>
           <Pressable style={styles.cta} onPress={() => router.push("/pair")}>
             <Text style={styles.ctaText}>扫码配对</Text>

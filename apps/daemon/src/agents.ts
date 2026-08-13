@@ -9,26 +9,94 @@ export interface SpawnSpec {
   args: string[];
 }
 
-export function commandFor(agent: AgentKind, customCommand?: string): SpawnSpec {
-  const shell = process.env["SHELL"] ?? "/bin/zsh";
+type EnvLike = Pick<NodeJS.ProcessEnv, string>;
+
+function windowsShell(env: EnvLike): string {
+  return env["COMSPEC"] ?? env["ComSpec"] ?? "cmd.exe";
+}
+
+function isPowerShell(file: string): boolean {
+  const name = file.replace(/\\/g, "/").split("/").pop()?.toLowerCase() ?? "";
+  return name === "powershell.exe" || name === "pwsh.exe" || name === "powershell" || name === "pwsh";
+}
+
+export function shellFor(
+  platform: NodeJS.Platform = process.platform,
+  env: EnvLike = process.env,
+): SpawnSpec {
+  if (platform === "win32") {
+    const shell = windowsShell(env);
+    return isPowerShell(shell)
+      ? { file: shell, args: ["-NoLogo"] }
+      : { file: shell, args: ["/d"] };
+  }
+  return { file: env["SHELL"] ?? "/bin/zsh", args: ["-il"] };
+}
+
+function shellCommandFor(
+  command: string,
+  platform: NodeJS.Platform,
+  env: EnvLike,
+): SpawnSpec {
+  const shell = platform === "win32" ? windowsShell(env) : (env["SHELL"] ?? "/bin/zsh");
+  if (platform === "win32") {
+    return isPowerShell(shell)
+      ? { file: shell, args: ["-NoLogo", "-NoProfile", "-Command", command] }
+      : { file: shell, args: ["/d", "/s", "/c", command] };
+  }
+  return { file: shell, args: ["-c", command] };
+}
+
+const SAFE_PROGRAM_TOKEN = /^[A-Za-z0-9_./:\\-]+$/;
+
+/** Run npm-installed CLI shims through the Windows command processor. */
+export function programCommandFor(
+  file: string,
+  args: string[],
+  platform: NodeJS.Platform = process.platform,
+  env: EnvLike = process.env,
+): SpawnSpec {
+  if (platform !== "win32") return { file, args };
+  const tokens = [file, ...args];
+  if (tokens.some((token) => !SAFE_PROGRAM_TOKEN.test(token))) {
+    throw new Error("Windows Agent 命令包含不安全字符");
+  }
+  return shellCommandFor(tokens.join(" "), platform, env);
+}
+
+export function noopCommand(): SpawnSpec {
+  return { file: process.execPath, args: ["-e", ""] };
+}
+
+export function commandFor(
+  agent: AgentKind,
+  customCommand?: string,
+  platform: NodeJS.Platform = process.platform,
+  env: EnvLike = process.env,
+): SpawnSpec {
   switch (agent) {
     case "shell":
-      return { file: shell, args: ["-il"] };
+      return shellFor(platform, env);
     case "claude":
-      return { file: "claude", args: ["--dangerously-skip-permissions"] };
+      return programCommandFor("claude", ["--dangerously-skip-permissions"], platform, env);
     case "codex":
-      return { file: "codex", args: ["--dangerously-bypass-approvals-and-sandbox"] };
+      return programCommandFor(
+        "codex",
+        ["--dangerously-bypass-approvals-and-sandbox"],
+        platform,
+        env,
+      );
     case "opencode":
-      return { file: "opencode", args: [] };
+      return programCommandFor("opencode", [], platform, env);
     case "grok":
-      return { file: "grok", args: [] };
+      return programCommandFor("grok", [], platform, env);
     case "trae":
-      return { file: "trae-cli", args: ["interactive"] };
+      return programCommandFor("trae-cli", ["interactive"], platform, env);
     case "custom": {
       if (!customCommand || customCommand.trim() === "") {
         throw new Error("custom agent requires a command");
       }
-      return { file: shell, args: ["-c", customCommand] };
+      return shellCommandFor(customCommand, platform, env);
     }
   }
 }

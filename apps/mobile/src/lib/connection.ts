@@ -670,7 +670,7 @@ export class HostConnection {
     return result;
   }
 
-  /** 搜索 Mac 上由 Claude Code / Codex 自己保存、可原生接回的对话。 */
+  /** 搜索电脑上由 Claude Code / Codex 自己保存、可原生接回的对话。 */
   async localConversations(
     agent: "claude" | "codex",
     query: string,
@@ -707,7 +707,7 @@ export class HostConnection {
       | Extract<C2SMessage, { type: "agent.account.logout" }>
       | Extract<C2SMessage, { type: "agent.account.delete" }>,
   ): Promise<AgentAccountsResult> {
-    if (!this.supportsAgentAccounts) throw new Error("请先升级 Mac 端以管理 Code Agent 账号");
+    if (!this.supportsAgentAccounts) throw new Error("请先升级电脑端以管理 Code Agent 账号");
     const result = await this.fsRequest<Extract<S2CMessage, { type: "agent.accounts.result" }>>(
       "#accounts",
       `#agent.accounts:${message.requestId}`,
@@ -1169,7 +1169,7 @@ export class HostConnection {
     length: number,
   ): Promise<Extract<S2CMessage, { type: "chat.attachment.chunk" }>> {
     if (!this.supportsChatAttachmentPreviews) {
-      return Promise.reject(new Error("请升级 Mac 端以查看历史图片"));
+      return Promise.reject(new Error("请升级电脑端以查看历史图片"));
     }
     const requestId = randomUUID();
     return this.fsRequest(
@@ -1209,7 +1209,7 @@ export class HostConnection {
 
   /** 子 Agent 详情按需读取 Codex/后端原生历史；旧 daemon 继续用父快照降级。 */
   async subagentHistory(sid: string, subagentId: string): Promise<AgentEventBody[]> {
-    if (!this.supportsSubagentHistory) throw new Error("当前 Mac 版本不支持子 Agent 历史");
+    if (!this.supportsSubagentHistory) throw new Error("当前电脑端版本不支持子 Agent 历史");
     const requestId = this.agentRequestId();
     const result = await this.fsRequest<
       Extract<S2CMessage, { type: "subagent.history.result" }>

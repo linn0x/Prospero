@@ -3,7 +3,7 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { Command } from "commander";
-import { controlRequest, ControlSocketError } from "./control-socket.js";
+import { controlRequest, controlSocketPath, ControlSocketError } from "./control-socket.js";
 import { prosperoHome } from "./pairing.js";
 
 const home = prosperoHome();
@@ -11,7 +11,7 @@ const program = new Command();
 program
   .name("prospero")
   .description("Prospero 编排控制 CLI（供协调者和 worker 会话调用）")
-  .option("--socket <path>", "控制 socket 路径", process.env["PROSPERO_CONTROL_SOCK"] ?? path.join(home, "control.sock"))
+  .option("--socket <path>", "控制 socket 路径", process.env["PROSPERO_CONTROL_SOCK"] ?? controlSocketPath(home))
   .option("--token-file <path>", "控制 token 文件", process.env["PROSPERO_CONTROL_TOKEN_PATH"] ?? path.join(home, "control.token"))
   .option("--session <id>", "当前 Prospero 会话 ID", process.env["PROSPERO_SESSION_ID"]);
 
