@@ -46,6 +46,23 @@ export interface GoalRunOverview {
   firstTruncatedGateRunId: string | null;
 }
 
+export interface OrchestrationRunGroups {
+  active: OrchestrationRun[];
+  history: OrchestrationRun[];
+  all: OrchestrationRun[];
+}
+
+/** Active work stays prominent; completed and abandoned Runs become history. */
+export function groupOrchestrationRuns(
+  runs: readonly OrchestrationRun[],
+): OrchestrationRunGroups {
+  const newestFirst = (left: OrchestrationRun, right: OrchestrationRun): number =>
+    right.updatedAt - left.updatedAt || left.id.localeCompare(right.id);
+  const active = runs.filter((run) => run.status === "active").sort(newestFirst);
+  const history = runs.filter((run) => run.status !== "active").sort(newestFirst);
+  return { active, history, all: [...active, ...history] };
+}
+
 /**
  * Indexes coordinator sessions for the session list and detail screen.
  * An active Run wins over historical Runs; otherwise the newest update wins.
