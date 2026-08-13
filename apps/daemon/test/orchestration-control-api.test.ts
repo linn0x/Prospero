@@ -67,6 +67,28 @@ describe("控制 API 的交付报告", () => {
     }, new AbortController().signal);
     expect(store.getTask(task.id).status).toBe("pending");
   });
+
+  it("只有协调者能显式完成自己的 Run", async () => {
+    const store = new OrchestrationStore();
+    const run = store.createRun({ objective: "收口", coordinatorSessionId: "coord" });
+    const api = orchestrationControlApi(
+      store,
+      new DispatchService(store, unusedSessions),
+      new CollaborationService(store),
+    );
+    const signal = new AbortController().signal;
+
+    await expect(api("run.complete", {
+      runId: run.id,
+      actorSessionId: "worker",
+    }, signal)).rejects.toMatchObject({ code: "forbidden" });
+
+    const completed = await api("run.complete", {
+      runId: run.id,
+      actorSessionId: "coord",
+    }, signal) as { status: string };
+    expect(completed.status).toBe("completed");
+  });
 });
 
 describe("控制 API 的幂等与任务图事务", () => {
