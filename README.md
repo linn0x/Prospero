@@ -1,44 +1,48 @@
 # Prospero
 
-> **让 Agent 留在你的 Mac，让控制权跟你走。**
+> **在手机上，操控 Mac 上的所有 Coding Agent。**
 >
-> Run locally. Supervise anywhere. Orchestrate everything.
+> Control every coding agent on your Mac — from anywhere.
 
 [![CI](https://github.com/linn0x/Prospero/actions/workflows/ci.yml/badge.svg)](https://github.com/linn0x/Prospero/actions/workflows/ci.yml)
 ![License](https://img.shields.io/badge/license-MIT-22c55e)
 ![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20iOS%20%7C%20Android-0ea5e9)
 ![Local First](https://img.shields.io/badge/architecture-local--first-8b5cf6)
 
-Prospero 是面向 Coding Agent 的本地优先控制中枢。Claude Code、Codex、OpenCode 等 Agent
-继续运行在你的 Mac 上，直接使用已有仓库、工具链、账号与登录状态；你可以从 macOS、iOS
-或 Android 查看进度、处理审批，并编排多个 Agent 完成复杂任务。
+Prospero 把你的 iPhone 或 Android 手机变成 Mac 上**所有 Coding Agent 的遥控器**。Agent
+继续在电脑上运行，完整使用已有仓库、工具链、账号与登录状态；你可以在手机上随时查看进度、
+回复问题、处理审批、追加指令或直接接管任务。
+
+无论是 Claude Code、Codex、OpenCode、Grok、Trae，还是任意 Agent CLI，都能进入同一个移动端
+控制界面。Prospero 深度理解已适配 Agent 的消息与工具；面对其他 Agent，则用完整 PTY/TUI
+保留终端能力。
 
 > “Spirits, which by mine art I have from their confines called to enact my present fancies.”
 >
 > — Prospero, [*The Tempest*, Act IV, Scene I](https://www.folger.edu/explore/shakespeares-works/the-tempest/read/4/1/)
 
-## 一块控制面，接住整个 Agent 工作流
+## 一部手机，掌控 Mac 上的所有 Agent
 
 | | 产品能力 |
 | --- | --- |
-| 🎛️ | **多 Agent，一个入口** — 创建、恢复、停止和切换 Claude Code、Codex、OpenCode、Grok、Trae、Shell 及自定义 CLI 会话 |
-| 🧠 | **理解 Agent，而不只转发终端** — 原生呈现消息、推理、工具调用、审批、提问、diff 与子 Agent；任意 CLI 仍有完整 PTY/TUI 兜底 |
-| 📱 | **离开电脑也不失控** — 从手机查看实时进度、回答问题、处理审批、追加指令、切换模型，并在需要时立即停止任务 |
-| 🗂️ | **项目操作随身可用** — 浏览和编辑文件，查看 Git 状态与 diff，完成 stage、commit 等常用操作 |
-| 🪄 | **把目标编排成工作流** — 用 DAG 拆分任务与依赖，派发 worker，通过 Gate 引入人工决策，并以显式 done/fail 状态可靠推进 |
-| 🌳 | **并行工作彼此隔离** — `esaytree` 为 Agent 快速创建安全、可回滚的 Git worktree，保护主工作区 |
-| 👤 | **多个账号互不干扰** — 同一项目可切换多个 Codex 或 Claude Code 账号，配置、凭据和原生会话历史保持隔离 |
-| 🔐 | **连接直达你的 Mac** — 通过 LAN 或 WireGuard 通信，无需 Prospero 云账号、托管环境或消息中转服务 |
+| 📱 | **所有 Agent，一个移动入口** — 从手机创建、恢复、切换和停止 Claude Code、Codex、OpenCode、Grok、Trae、Shell 及自定义 CLI 会话 |
+| 👀 | **进度不再锁在电脑屏幕里** — 随时查看消息、推理、工具调用、diff、子 Agent 和实时终端输出 |
+| ✅ | **关键时刻直接处理** — 在手机上回答 Agent 提问、批准或拒绝操作、追加指令、切换模型与模式，必要时立即停止任务 |
+| ⌨️ | **结构化体验，终端能力不丢失** — 已适配 Agent 使用原生交互；任意 CLI 都能通过完整 PTY/TUI 操控 |
+| 🗂️ | **连项目也能一起操作** — 浏览和编辑 Mac 上的文件，查看 Git 状态与 diff，完成 stage、commit 等常用操作 |
+| 🔐 | **无需把开发环境搬上云** — Agent 和项目留在 Mac，通过 LAN 或 WireGuard 直连；断线后自动恢复会话状态与增量输出 |
+| 🪄 | **从单个 Agent 到完整工作流** — 在手机上用 DAG 拆分任务、派发 worker、处理 Gate，并跟踪每个任务的显式交付状态 |
+| 🌳 | **并行任务互不干扰** — `esaytree` 为 Agent 创建安全、快速、可回滚的 Git worktree，保护主工作区 |
 
-## 不是另一朵 Agent 云，而是你的控制层
+## 不只是远程终端，也不是另一朵 Agent 云
 
 | 常见妥协 | Prospero 的选择 |
 | --- | --- |
-| 为远程运行迁移仓库、凭据与工具链 | **本地执行**，完整复用 Keychain、MCP、证书、私有工具和现有登录状态 |
-| 只能远程看到一块终端屏幕 | **Agent-aware 交互**，审批、提问、工具、diff 和任务状态都能直接操作 |
-| 深度绑定单一 Agent | **结构化适配 + PTY 兜底**，既有原生体验，也不把选择权锁死 |
-| 并行 Agent 相互覆盖工作区 | **隔离 worktree + 显式交付**，让协作过程更安全、更可预测 |
-| 人离开桌面就失去上下文 | **macOS、iOS、Android 状态一致**，关键监督动作随时可用 |
+| 为远程运行迁移仓库、凭据与工具链 | **Agent 留在 Mac**，完整复用 Keychain、MCP、证书、私有工具和现有登录状态 |
+| 手机上只能看到一块终端屏幕 | **Agent-aware 移动交互**，审批、提问、工具、diff 和任务状态都能直接操作 |
+| 每种 Agent 都需要不同的远控方案 | **一个 App 接入所有 Agent**，结构化适配与 PTY 兜底同时覆盖 |
+| 离开电脑就失去上下文 | **手机与 Mac 状态一致**，从口袋里继续处理当前任务 |
+| 多个 Agent 并行时相互覆盖 | **可视化编排 + 隔离 worktree**，让协作过程更安全、更可预测 |
 
 > [!NOTE]
 > **Prospero 正在寻找同行者。** 欢迎成为 Contributor：分享想法、改进体验、修复问题，
