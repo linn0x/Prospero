@@ -36,8 +36,10 @@ import {
   setSessionArchived,
 } from "@/lib/session-preferences";
 import { groupSessionsByProject } from "@/lib/session-projects";
+import { goalRunOverview, orchestrationRoute } from "@/lib/orchestration-overview";
 import { sortSessions } from "@/lib/store";
 import { useHostConnection } from "@/lib/use-host-connection";
+import { useOrchestrationSnapshot } from "@/lib/use-orchestration-snapshot";
 import * as theme from "@/lib/theme";
 const { color, font, radius, space } = theme;
 
@@ -118,11 +120,11 @@ export default function HostScreen() {
   const [showArchived, setShowArchived] = useState(false);
   const [archivedIds, setArchivedIds] = useState<Set<string>>(() => new Set());
   const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(() => new Set());
-  const [orchestration, setOrchestration] = useState<OrchestrationSnapshot | null>(null);
   const pendingCreateRef = useRef(false);
   const deepLinkCreateRef = useRef<string | null>(null);
   const insets = useSafeAreaInsets();
   const { width, height, verticalPanes } = useAdaptiveLayout();
+  const orchestration = useOrchestrationSnapshot(conn, runtime.status, 8_000);
   // 横屏手机、iPad、Android 平板用并列双栏；其余手机严格上下各占一半。
   const wideComposer =
     verticalPanes !== null || width >= 720 || (width >= 600 && width > height);
@@ -220,24 +222,6 @@ export default function HostScreen() {
       clearTimeout(timer);
     };
   }, [agent, canSearchResume, conn, resumeQuery, selectedAccount?.id]);
-
-  // 编排状态是 daemon 的真相。前台轻量轮询让 iOS/Android 从后台回来后立刻收敛；
-  // 用户刚解开 Gate 时 daemon 也会立即回传，不必等下一个周期。
-  useFocusEffect(
-    useCallback(() => {
-      if (!conn || runtime.status !== "connected") return undefined;
-      const refresh = (): void => conn.orchestrationSnapshot();
-      refresh();
-      const off = conn.events.on("orchestrationSnapshot", (message) => {
-        setOrchestration(message.snapshot);
-      });
-      const timer = setInterval(refresh, 8_000);
-      return () => {
-        off();
-        clearInterval(timer);
-      };
-    }, [conn, runtime.status]),
-  );
 
   // 归档与项目展开状态属于这台手机的浏览偏好。每次从会话页回来都重读，
   // 这样在会话菜单里点“归档”后，主机页无需重建也能立刻同步。
@@ -1347,16 +1331,18 @@ function GoalRunsPanel({
   onResolveGate: (gateId: string, decision: string) => void;
 }) {
   const [otherDecisions, setOtherDecisions] = useState<Record<string, string>>({});
-  const activeRuns = (snapshot?.runs ?? []).filter((run) => run.status === "active");
-  if (activeRuns.length === 0) return null;
+  const overview = useMemo(() => goalRunOverview(snapshot), [snapshot]);
+  if (overview.activeRunCount === 0) return null;
 
   return (
     <View style={styles.goalPanel}>
       <View style={styles.goalPanelHeader}>
         <Text style={styles.goalPanelTitle}>Goal 编排</Text>
-        <Text style={styles.goalPanelMeta}>{String(activeRuns.length)} 个进行中</Text>
+        <Text style={styles.goalPanelMeta}>
+          {`${String(overview.activeRunCount)} 个进行中 · ${String(overview.pendingGateCount)} 个待处理 Gate`}
+        </Text>
       </View>
-      {activeRuns.slice(0, 3).map((run) => {
+      {overview.visibleRuns.map((run) => {
         const tasks = (snapshot?.tasks ?? []).filter((task) => task.runId === run.id);
         const completed = tasks.filter((task) => task.status === "done").length;
         const active = tasks.filter(
@@ -1425,6 +1411,31 @@ function GoalRunsPanel({
           </View>
         );
       })}
+      {overview.truncatedRunCount > 0 && (
+        <Pressable
+          style={({ pressed }) => [styles.goalOverflow, pressed && styles.cardPressed]}
+          onPress={() => router.push(orchestrationRoute(hostId, overview.firstTruncatedGateRunId))}
+          accessibilityRole="button"
+          accessibilityLabel={overview.firstTruncatedGateRunId
+            ? `打开 Agent 编排中心，并预选包含待处理 Gate 的 Run；另有 ${String(overview.truncatedRunCount)} 个 Run 未显示`
+            : `打开 Agent 编排中心；另有 ${String(overview.truncatedRunCount)} 个 Run 未显示`}
+          accessibilityHint={overview.firstTruncatedGateRunId
+            ? "直接定位到第一个未显示的待处理 Gate 所在 Run"
+            : "查看未显示的 Run"}
+        >
+          <View style={styles.goalOverflowCopy}>
+            <Text style={styles.goalOverflowTitle}>查看全部 Agent 编排</Text>
+            <Text style={styles.goalOverflowDetail}>
+              {`另有 ${String(overview.truncatedRunCount)} 个 Run 未显示${
+                overview.truncatedPendingGateCount > 0
+                  ? ` · ${String(overview.truncatedPendingGateCount)} 个待处理 Gate`
+                  : ""
+              }`}
+            </Text>
+          </View>
+          <Icon name="chevron.right" size={13} color={color.textFaint} />
+        </Pressable>
+      )}
     </View>
   );
 }
@@ -1670,9 +1681,26 @@ const styles = StyleSheet.create({
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: color.border,
   },
-  goalPanelHeader: { flexDirection: "row", alignItems: "baseline", justifyContent: "space-between" },
+  goalPanelHeader: {
+    flexDirection: "row",
+    alignItems: "baseline",
+    justifyContent: "space-between",
+    gap: space.sm,
+  },
   goalPanelTitle: { ...font.body, fontWeight: "700" },
-  goalPanelMeta: { ...font.meta, color: color.accent },
+  goalPanelMeta: { ...font.meta, flexShrink: 1, color: color.accent, textAlign: "right" },
+  goalOverflow: {
+    minHeight: 52,
+    paddingHorizontal: space.md,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: space.sm,
+    borderRadius: radius.md,
+    backgroundColor: color.accentBg,
+  },
+  goalOverflowCopy: { flex: 1, gap: 2 },
+  goalOverflowTitle: { color: color.accent, fontSize: 13, fontWeight: "700" },
+  goalOverflowDetail: { ...font.meta, color: color.textDim },
   goalRunCard: {
     overflow: "hidden",
     borderRadius: radius.md,

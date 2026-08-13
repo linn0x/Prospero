@@ -57,3 +57,15 @@ export function verticalPaneLayout(
   if (start < MIN_USABLE_PANE || end < MIN_USABLE_PANE) return null;
   return { start, gap, endStart, end };
 }
+
+/**
+ * A separating vertical fold is a physical boundary, not a column gap that
+ * content may flow through. Screens that are designed as one task at a time
+ * use the leading continuous surface; otherwise they retain the full window.
+ */
+export function primaryPaneWidth(
+  width: number,
+  panes: VerticalPaneLayout | null,
+): number {
+  return panes?.start ?? width;
+}

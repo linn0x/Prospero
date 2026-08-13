@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  primaryPaneWidth,
   verticalPaneLayout,
   windowWidthClass,
 } from "../src/lib/adaptive-layout-math";
@@ -95,6 +96,18 @@ describe("Android 折叠屏适配", () => {
         704,
       ),
     ).toBeNull();
+  });
+
+  it("只在真实分离铰链时把单任务页面约束在连续面板内", () => {
+    const panes = verticalPaneLayout(860, {
+      bounds: { x: 420, y: 0, width: 20, height: 720 },
+      orientation: "vertical",
+      state: "half-opened",
+      occlusionType: "full",
+      isSeparating: true,
+    });
+    expect(primaryPaneWidth(860, panes)).toBe(420);
+    expect(primaryPaneWidth(860, null)).toBe(860);
   });
 
   it("新建页宽屏双栏首帧使用显式等宽约束", () => {

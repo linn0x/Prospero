@@ -23,6 +23,7 @@ import { DismissKey } from "@/components/DismissKey";
 import { Icon } from "@/components/Icon";
 import { PromptDialog } from "@/components/PromptDialog";
 import { SwipeRow, type SwipeAction } from "@/components/SwipeRow";
+import { primaryPaneWidth, useAdaptiveLayout } from "@/lib/adaptive-layout";
 import { validateFileName } from "@/lib/file-names";
 import { MONOSPACE_FONT } from "@/lib/theme";
 import { useHostConnection } from "@/lib/use-host-connection";
@@ -51,6 +52,8 @@ export default function FilesScreen(): React.ReactElement {
   const { hostId, sid } = useLocalSearchParams<{ hostId: string; sid: string }>();
   const { conn } = useHostConnection(hostId);
   const insets = useSafeAreaInsets();
+  const adaptiveLayout = useAdaptiveLayout();
+  const contentPaneWidth = primaryPaneWidth(adaptiveLayout.width, adaptiveLayout.verticalPanes);
 
   const [dir, setDir] = useState("");
   const [entries, setEntries] = useState<FsEntry[]>([]);
@@ -297,22 +300,29 @@ export default function FilesScreen(): React.ReactElement {
             ),
           }}
         />
-        {editing.truncated && (
-          <Text style={styles.warnBar}>文件超过 1MB,只显示前 1MB —— 只读,保存已禁用</Text>
-        )}
-        <DismissKey visible={focused} floating />
-        <TextInput
-          style={[styles.editor, { paddingBottom: insets.bottom + 14 }]}
-          value={editing.text}
-          onChangeText={(text) => setEditing({ ...editing, text })}
-          onFocus={() => { setFocused(true); }}
-          onBlur={() => { setFocused(false); }}
-          multiline
-          autoCapitalize="none"
-          autoCorrect={false}
-          spellCheck={false}
-          editable={!editing.truncated}
-        />
+        <View
+          style={[
+            styles.contentPane,
+            adaptiveLayout.verticalPanes && { alignSelf: "flex-start", width: contentPaneWidth },
+          ]}
+        >
+          {editing.truncated && (
+            <Text style={styles.warnBar}>文件超过 1MB,只显示前 1MB —— 只读,保存已禁用</Text>
+          )}
+          <DismissKey visible={focused} floating />
+          <TextInput
+            style={[styles.editor, { paddingBottom: insets.bottom + 14 }]}
+            value={editing.text}
+            onChangeText={(text) => setEditing({ ...editing, text })}
+            onFocus={() => { setFocused(true); }}
+            onBlur={() => { setFocused(false); }}
+            multiline
+            autoCapitalize="none"
+            autoCorrect={false}
+            spellCheck={false}
+            editable={!editing.truncated}
+          />
+        </View>
       </KeyboardAvoidingView>
     );
   }
@@ -350,28 +360,34 @@ export default function FilesScreen(): React.ReactElement {
         }}
       />
 
-      <View style={styles.pathBar}>
-        <Pressable onPress={goUp} disabled={dir === ""} hitSlop={8}>
-          <Text style={[styles.up, dir === "" && styles.upOff]}>← 上级</Text>
-        </Pressable>
-        <Text style={styles.path} numberOfLines={1} ellipsizeMode="head">
-          {dir === "" ? "/" : `/${dir}`}
-        </Text>
-      </View>
+      <View
+        style={[
+          styles.contentPane,
+          adaptiveLayout.verticalPanes && { alignSelf: "flex-start", width: contentPaneWidth },
+        ]}
+      >
+        <View style={styles.pathBar}>
+          <Pressable onPress={goUp} disabled={dir === ""} hitSlop={8}>
+            <Text style={[styles.up, dir === "" && styles.upOff]}>← 上级</Text>
+          </Pressable>
+          <Text style={styles.path} numberOfLines={1} ellipsizeMode="head">
+            {dir === "" ? "/" : `/${dir}`}
+          </Text>
+        </View>
 
-      {error !== null && <Text style={styles.error}>{error}</Text>}
+        {error !== null && <Text style={styles.error}>{error}</Text>}
 
-      <FlatList
-        data={entries}
-        keyExtractor={(e) => e.name}
-        contentContainerStyle={{ paddingBottom: insets.bottom + 16 }}
-        refreshControl={
-          <RefreshControl refreshing={loading} onRefresh={() => void load(dir)} tintColor="#7aa2f7" />
-        }
-        ListEmptyComponent={
-          loading ? null : <Text style={styles.empty}>这个目录是空的</Text>
-        }
-        renderItem={({ item }) => {
+        <FlatList
+          data={entries}
+          keyExtractor={(e) => e.name}
+          contentContainerStyle={{ paddingBottom: insets.bottom + 16 }}
+          refreshControl={
+            <RefreshControl refreshing={loading} onRefresh={() => void load(dir)} tintColor="#7aa2f7" />
+          }
+          ListEmptyComponent={
+            loading ? null : <Text style={styles.empty}>这个目录是空的</Text>
+          }
+          renderItem={({ item }) => {
           // 目录没什么可下载的,只有文件给左滑操作
           const actions: SwipeAction[] = [];
           if (item.kind === "file") {
@@ -423,10 +439,11 @@ export default function FilesScreen(): React.ReactElement {
               )}
             </Pressable>
           );
-          return actions.length > 0 ? <SwipeRow actions={actions}>{row}</SwipeRow> : row;
-        }}
-      />
-      <Text style={styles.hint}>左滑可下载 / 重命名 / 删除 · 右上角新建文件夹或上传</Text>
+            return actions.length > 0 ? <SwipeRow actions={actions}>{row}</SwipeRow> : row;
+          }}
+        />
+        <Text style={styles.hint}>左滑可下载 / 重命名 / 删除 · 右上角新建文件夹或上传</Text>
+      </View>
       <PromptDialog
         visible={namePrompt !== null}
         title={namePrompt?.kind === "rename" ? "重命名" : "新建文件夹"}
@@ -485,6 +502,7 @@ function encodeUtf8(text: string): string {
 
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: "#0b0b0e" },
+  contentPane: { flex: 1, minWidth: 0, overflow: "hidden" },
   pathBar: {
     flexDirection: "row",
     alignItems: "center",

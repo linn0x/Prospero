@@ -18,13 +18,18 @@ import type {
   AgentKind,
   ApprovalPolicy,
   OrchestrationRun,
-  OrchestrationSnapshot,
   OrchestrationTask,
 } from "@prospero/protocol";
 import { AgentIcon } from "@/components/AgentIcon";
 import { Icon } from "@/components/Icon";
 import { WorkspacePicker } from "@/components/WorkspacePicker";
+import { primaryPaneWidth, useAdaptiveLayout } from "@/lib/adaptive-layout";
 import { useHostConnection } from "@/lib/use-host-connection";
+import {
+  orchestrationConnectionNotice,
+  selectedRouteRunId,
+} from "@/lib/orchestration-overview";
+import { useOrchestrationSnapshot } from "@/lib/use-orchestration-snapshot";
 import { color, font, radius, space, statusColor } from "@/lib/theme";
 
 const WORKER_AGENTS: AgentKind[] = ["claude", "codex", "opencode", "grok", "trae"];
@@ -134,9 +139,8 @@ function runLabel(run: OrchestrationRun): string {
 }
 
 export default function OrchestrationScreen() {
-  const { hostId } = useLocalSearchParams<{ hostId: string }>();
+  const { hostId, runId } = useLocalSearchParams<{ hostId: string; runId?: string | string[] }>();
   const { host, conn, runtime } = useHostConnection(hostId);
-  const [snapshot, setSnapshot] = useState<OrchestrationSnapshot | null>(null);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [editor, setEditor] = useState<Editor>(null);
   const [banner, setBanner] = useState<string | null>(null);
@@ -170,26 +174,19 @@ export default function OrchestrationScreen() {
   const [policy, setPolicy] = useState<ApprovalPolicy>("standard");
   const [pickerOpen, setPickerOpen] = useState(false);
   const [agentAccounts, setAgentAccounts] = useState<AgentAccount[]>([]);
+  const adaptiveLayout = useAdaptiveLayout();
+  const contentPaneWidth = primaryPaneWidth(adaptiveLayout.width, adaptiveLayout.verticalPanes);
+  const snapshot = useOrchestrationSnapshot(conn, runtime.status, 5_000, setBanner);
 
   useFocusEffect(
     useCallback(() => {
-      if (!conn || runtime.status !== "connected") return undefined;
-      const refresh = (): void => conn.orchestrationSnapshot();
-      refresh();
-      if (conn.supportsAgentAccounts) {
-        void conn.agentAccounts().then(setAgentAccounts).catch(() => {});
-      }
-      const offSnapshot = conn.events.on("orchestrationSnapshot", (message) => {
-        setSnapshot(message.snapshot);
-      });
-      const offError = conn.events.on("serverError", (message) => {
-        setBanner(message.message);
-      });
-      const timer = setInterval(refresh, 5_000);
+      if (!conn || runtime.status !== "connected" || !conn.supportsAgentAccounts) return undefined;
+      let cancelled = false;
+      void conn.agentAccounts().then((accounts) => {
+        if (!cancelled) setAgentAccounts(accounts);
+      }).catch(() => {});
       return () => {
-        offSnapshot();
-        offError();
-        clearInterval(timer);
+        cancelled = true;
       };
     }, [conn, runtime.status]),
   );
@@ -207,9 +204,10 @@ export default function OrchestrationScreen() {
   const defaultAccountId = (agent: AgentKind): string | undefined =>
     accountsFor(agent).find((account) => account.isDefault)?.id ?? accountsFor(agent)[0]?.id;
 
+  const requestedRunId = selectedRouteRunId(runId, runs);
   const activeRunId = selectedRunId && runs.some((run) => run.id === selectedRunId)
     ? selectedRunId
-    : runs[0]?.id ?? null;
+    : requestedRunId ?? runs[0]?.id ?? null;
   const selectedRun = runs.find((run) => run.id === activeRunId) ?? null;
   const tasks = useMemo(
     () => (snapshot?.tasks ?? []).filter((task) => task.runId === activeRunId),
@@ -228,6 +226,11 @@ export default function OrchestrationScreen() {
   const canAutomate = runtime.status === "connected" && conn?.supportsAutomationOrchestration === true;
   const canManage = runtime.status === "connected" && conn?.supportsOrchestrationManagement === true;
   const canManageLifecycle = runtime.status === "connected" && conn?.supportsOrchestrationLifecycle === true;
+  const connectionNotice = orchestrationConnectionNotice(
+    runtime.status,
+    runtime.lastError,
+    host?.name,
+  );
   const automationRunning = selectedRun?.automation?.state === "running";
   const activeTopologyTaskId = selectedTopologyTaskId && tasks.some(
     (task) => task.id === selectedTopologyTaskId,
@@ -602,16 +605,22 @@ export default function OrchestrationScreen() {
         }}
       />
 
-      {banner !== null && (
-        <Pressable style={styles.banner} onPress={() => setBanner(null)}>
-          <Text style={styles.bannerText}>{banner}（点击关闭）</Text>
-        </Pressable>
-      )}
-
-      <ScrollView
-        contentContainerStyle={styles.content}
-        keyboardShouldPersistTaps="handled"
+      <View
+        style={[
+          styles.contentPane,
+          adaptiveLayout.verticalPanes && { alignSelf: "flex-start", width: contentPaneWidth },
+        ]}
       >
+        {banner !== null && (
+          <Pressable style={styles.banner} onPress={() => setBanner(null)}>
+            <Text style={styles.bannerText}>{banner}（点击关闭）</Text>
+          </Pressable>
+        )}
+
+        <ScrollView
+          contentContainerStyle={styles.content}
+          keyboardShouldPersistTaps="handled"
+        >
         <View style={styles.hero}>
           <View style={styles.heroIcon}>
             <Icon name="point.3.connected.trianglepath.dotted" size={24} color={color.accent} />
@@ -624,16 +633,48 @@ export default function OrchestrationScreen() {
           </View>
         </View>
 
-        {runtime.status !== "connected" ? (
-          <Text style={styles.notice}>正在连接 {host?.name ?? "Mac"}…</Text>
+        {connectionNotice !== null ? (
+          <View
+            style={[
+              styles.notice,
+              connectionNotice.tone === "danger" && styles.noticeDanger,
+              connectionNotice.tone === "quiet" && styles.noticeQuiet,
+            ]}
+            accessibilityLiveRegion={connectionNotice.tone === "danger" ? "assertive" : "polite"}
+          >
+            <Text
+              style={[
+                styles.noticeText,
+                connectionNotice.tone === "danger" && styles.noticeDangerText,
+                connectionNotice.tone === "quiet" && styles.noticeQuietText,
+              ]}
+            >
+              {connectionNotice.text}
+            </Text>
+            {connectionNotice.canRetry && (
+              <Pressable
+                style={styles.noticeRetry}
+                onPress={() => conn?.kick()}
+                accessibilityRole="button"
+                accessibilityLabel={`重试连接 ${host?.name ?? "Mac"}`}
+                accessibilityHint="重新连接后刷新编排状态"
+              >
+                <Text style={styles.noticeRetryText}>重试连接</Text>
+              </Pressable>
+            )}
+          </View>
         ) : !conn?.supportsOrchestrationSnapshot ? (
-          <Text style={styles.notice}>Mac daemon 版本过旧，升级后现有配对会自动保留。</Text>
+          <View style={styles.notice}>
+            <Text style={styles.noticeText}>Mac daemon 版本过旧，升级后现有配对会自动保留。</Text>
+          </View>
         ) : null}
 
         {conn?.supportsOrchestrationSnapshot && !conn.supportsManualOrchestration && (
-          <Text style={styles.notice}>
-            当前只能查看编排和处理 Gate。请升级 daemon，或为该设备开启人工编排权限。
-          </Text>
+          <View style={styles.notice}>
+            <Text style={styles.noticeText}>
+              当前只能查看编排和处理 Gate。请升级 daemon，或为该设备开启人工编排权限。
+            </Text>
+          </View>
         )}
 
         {editor?.kind === "graph" && (
@@ -1293,7 +1334,8 @@ export default function OrchestrationScreen() {
             </View>
           </View>
         )}
-      </ScrollView>
+        </ScrollView>
+      </View>
 
       {conn && (
         <WorkspacePicker
@@ -1510,6 +1552,7 @@ function Choice({ active, label, onPress }: { active: boolean; label: string; on
 
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: color.bg },
+  contentPane: { flex: 1, minWidth: 0, overflow: "hidden" },
   content: { padding: space.lg, paddingBottom: 48, gap: space.lg },
   banner: { backgroundColor: color.warnBg, paddingHorizontal: space.lg, paddingVertical: space.sm },
   bannerText: { color: color.warn, fontSize: 12, lineHeight: 17 },
@@ -1532,13 +1575,25 @@ const styles = StyleSheet.create({
   heroTitle: { ...font.body, fontWeight: "700" },
   heroDetail: { ...font.sub, lineHeight: 19 },
   notice: {
-    color: color.warn,
-    fontSize: 12,
-    lineHeight: 18,
     padding: space.md,
     borderRadius: radius.md,
     backgroundColor: color.warnBg,
   },
+  noticeQuiet: { backgroundColor: color.surfaceRaised },
+  noticeDanger: { backgroundColor: color.dangerBg },
+  noticeText: { color: color.warn, fontSize: 12, lineHeight: 18 },
+  noticeQuietText: { color: color.textDim },
+  noticeDangerText: { color: color.danger },
+  noticeRetry: {
+    alignSelf: "flex-start",
+    minHeight: 36,
+    justifyContent: "center",
+    marginTop: space.sm,
+    paddingHorizontal: space.md,
+    borderRadius: 18,
+    backgroundColor: color.surface,
+  },
+  noticeRetryText: { color: color.accent, fontSize: 13, fontWeight: "700" },
   runStrip: { gap: space.sm, paddingRight: space.lg },
   runChip: {
     width: 180,
