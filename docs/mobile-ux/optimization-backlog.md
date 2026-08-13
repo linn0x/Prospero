@@ -23,7 +23,7 @@
 
 ## 2026-08-13 T5 构建与模拟器终验（未通过，Gate 已决）
 
-此节是对上一节“待完成”陈述的更正：`9f13be9`、`e8414b5` 与 `278f169` 已补上 AND-01、SH-06 和 IOS-04；IOS-01 / IOS-03 的相应行为也随 `9f13be9` / `f9821a2` 落地。代码和单元测试可以核对为完成，但本轮不能把任一项写成“设备验收通过”。原因是 iOS 两台全新模拟器的无签名 generic Simulator release 包均停在纯黑界面，Android API 35 临时映像/AVD 又未能在本机 SDK 布局中建立；因此完整矩阵没有完成。
+此节是对上一节“待完成”陈述的更正：`9f13be9`、`e8414b5` 与 `278f169` 已补上 AND-01、SH-06、IOS-03 和 IOS-04；IOS-01 / IOS-02 的相应行为也随 `9f13be9` / `f9821a2` 落地。代码和单元测试可以核对为完成，但本轮不能把任一项写成“设备验收通过”。原因是 iOS 两台全新模拟器的无签名 generic Simulator release 包均停在纯黑界面，Android API 35 临时映像/AVD 又未能在本机 SDK 布局中建立；因此完整矩阵没有完成。
 
 ### 自动化与构建证据
 
@@ -45,7 +45,7 @@
 | SH-06 | `e8414b5` | 已实现；历史附件重试测试通过。 | 未做断网后点按重试 E2E。 |
 | SH-07 / IOS-02 / AND-03 | `f9821a2` | 已实现；读屏动作映射和 Git inset 测试通过。 | VoiceOver / TalkBack 未验；不宣称读屏通过。 |
 | IOS-01 / AND-01 | `9f13be9` | 已实现；权限结果、pending picker、草稿隔离/过期测试通过。 | iOS 权限与 Settings 回返未完成；Android API 33 在“不要保留活动”下进入配对页后画面为空，未能完成相册/相机返回或恢复用例。 |
-| IOS-03 | `f9821a2` | 代码命中框调整已提交。 | iPhone SE 3 黑屏，未能量测 44 pt。 |
+| IOS-03 | `278f169` | 代码命中框调整已提交。 | iPhone SE 3 黑屏，未能量测 44 pt。 |
 | IOS-04 | `278f169` | Dynamic Type 映射、持久化覆盖和复位测试通过。 | iPhone SE 3 / iPad 黑屏，未能逐档重启观察。 |
 | AND-02 / AND-05 | `f9821a2` | Git 安全区计算和 predictive-back 配置测试通过。 | 仅 API 33 启动到主机空态；IME、三键/手势切换与 predictive back 未完成。 |
 
@@ -57,9 +57,9 @@
 
 物理设备当前不可用。Prospero Gate `gate_4ca9584cb748` 已决议为“接受模拟器验收并记录真机待办”。该决议只接受本节列出的自动化和有限模拟器证据、保留真机清单；不覆盖本轮 iOS 纯黑首屏及 Android API 35/Fold 无法建立所造成的完整模拟器矩阵阻断，也不得声称真机或完整设备验收通过。真机待办准确包括 VoiceOver、TalkBack、真实相机、OEM IME、Android 13/15 的三键与手势导航、Android 15 predictive back、折叠铰链、iOS 权限/Settings 回返、Dynamic Type 重启和终端字号复位。
 
-## 2026-08-13 T5 复验（失败，未交付）
+## 2026-08-13 T5 复验（验收失败已收口）
 
-本节为 `task_d38edc8fb66f` 的实际终验记录，优先于上一节旧模拟器结论。实现提交不变：SH-01/02/03=`bdd6568`，SH-04/05/AND-04=`4d04190`，SH-06=`e8414b5`，SH-07/IOS-02/IOS-03/AND-02/03/05=`f9821a2`，IOS-01/AND-01=`9f13be9`，IOS-04=`278f169`。没有一项可写成真机通过；本轮还发现可复现的 iOS 最大辅助字号布局失败。
+本节为 `task_d38edc8fb66f` 的实际终验记录，优先于上一节旧模拟器结论。实现提交不变：SH-01/02/03=`bdd6568`，SH-04/05/AND-04=`4d04190`，SH-06=`e8414b5`，SH-07/IOS-02/AND-02/03/05=`f9821a2`，IOS-01/AND-01=`9f13be9`，IOS-03/IOS-04=`278f169`。没有一项可写成真机通过；本轮还发现可复现的 iOS 最大辅助字号布局失败。
 
 | 检查 | 本轮结果 |
 | --- | --- |
@@ -81,9 +81,9 @@
 | IOS-04 | 映射/持久化/复位单测通过；终端运行时 custom 跨重启和复位未验。 |
 | AND-02 / AND-05 | 配置/计算测试通过；Git IME 和 predictive-back 编辑确认未验。 |
 
-临时 `ProsperoT5_API33_d38edc8fb66f`、`ProsperoT5_API35_Fold_d38edc8fb66f`、iPhone SE 3、iPad 10 与其 App 数据均已删除；未创建、输出或提交临时配对凭证，现有 `FundWatch_API_35` 未被修改。本 worker 依要求尝试为当前 task 创建 Gate，但 CLI 以“只有此 Run 的协调者会话可以改动任务图”拒绝；已用 `msg_09361c8a4868` 请求协调者创建问题“是否接受模拟器验收并保留真机清单”、选项“接受模拟器验收并记录真机待办”与“连接真机后继续”的 Gate。旧 Gate `gate_4ca9584cb748` 不能把本轮失败或未验路径改写为通过。
+临时 `ProsperoT5_API33_d38edc8fb66f`、`ProsperoT5_API35_Fold_d38edc8fb66f`、iPhone SE 3、iPad 10 与其 App 数据均已删除；未创建、输出或提交临时配对凭证，现有 `FundWatch_API_35` 未被修改。worker 尝试创建当前 task 的重复 Gate 时被 CLI 以“只有此 Run 的协调者会话可以改动任务图”拒绝，随后协调者确认复用已决 Gate `gate_4ca9584cb748`：决策为“接受模拟器验收并记录真机待办”。该决策只接受有限证据，不能把本轮失败或未验路径改写为通过。
 
-本任务因 iOS 最大辅助字号布局失败、会话级双端验收未完成和当前任务 Gate 尚未由协调者创建而失败。即使接受有限模拟器证据，仍须真机验证 VoiceOver、TalkBack、真实相机、OEM IME、Android 13/15 导航与 Git IME、predictive-back 编辑确认、真实折叠铰链、iOS 权限/Settings 回返、SE 3 44 pt 会话控件、终端字号跨重启/复位与跨平台离线恢复 E2E。
+本次 QA 收口已交付，但移动端设备验收结论为失败：iOS 最大辅助字号布局有实测缺陷，会话级双端路径也未完成。即使 Gate 接受有限模拟器证据，仍须真机验证 VoiceOver、TalkBack、真实相机、OEM IME、Android 13/15 导航与 Git IME、predictive-back 编辑确认、真实折叠铰链、iOS 权限/Settings 回返、SE 3 44 pt 会话控件、终端字号跨重启/复位与跨平台离线恢复 E2E。
 
 ## M1 · 可靠投递与连接恢复
 
