@@ -1,4 +1,9 @@
-import type { OrchestrationRun, OrchestrationSnapshot } from "@prospero/protocol";
+import type {
+  OrchestrationDispatch,
+  OrchestrationRun,
+  OrchestrationSnapshot,
+  OrchestrationTask,
+} from "@prospero/protocol";
 import type { ConnStatus } from "@/lib/store";
 
 export const GOAL_RUN_SUMMARY_LIMIT = 3;
@@ -86,6 +91,61 @@ export function coordinatorRunsBySession(
     }
   }
   return indexed;
+}
+
+export interface GoalWorkerSessionLink {
+  sessionId: string;
+  taskId: string;
+  taskTitle: string;
+  taskStatus: OrchestrationTask["status"];
+  dispatchState: OrchestrationDispatch["state"];
+  startedAt: number;
+}
+
+export interface GoalSessionGroup {
+  run: OrchestrationRun;
+  workers: GoalWorkerSessionLink[];
+}
+
+/**
+ * Links independently persisted worker sessions back to their coordinator.
+ * A retry remains visible as another worker session, while duplicate snapshots
+ * of the same dispatch session collapse to its newest record.
+ */
+export function goalSessionGroups(
+  snapshot: OrchestrationSnapshot | null,
+): Map<string, GoalSessionGroup> {
+  const groups = new Map<string, GoalSessionGroup>();
+  if (!snapshot) return groups;
+  const tasks = new Map(snapshot.tasks.map((task) => [task.id, task]));
+  const selectedRuns = coordinatorRunsBySession(snapshot.runs);
+
+  for (const [coordinatorSessionId, run] of selectedRuns) {
+    const workers = new Map<string, GoalWorkerSessionLink>();
+    for (const dispatch of snapshot.dispatches) {
+      if (dispatch.runId !== run.id || dispatch.sessionId === coordinatorSessionId) continue;
+      const task = tasks.get(dispatch.taskId);
+      if (!task) continue;
+      const previous = workers.get(dispatch.sessionId);
+      if (previous && previous.startedAt > dispatch.startedAt) continue;
+      workers.set(dispatch.sessionId, {
+        sessionId: dispatch.sessionId,
+        taskId: task.id,
+        taskTitle: task.title,
+        taskStatus: task.status,
+        dispatchState: dispatch.state,
+        startedAt: dispatch.startedAt,
+      });
+    }
+    groups.set(coordinatorSessionId, {
+      run,
+      workers: [...workers.values()].sort(
+        (left, right) =>
+          left.startedAt - right.startedAt || left.sessionId.localeCompare(right.sessionId),
+      ),
+    });
+  }
+  return groups;
 }
 
 /**

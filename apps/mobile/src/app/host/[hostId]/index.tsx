@@ -39,6 +39,7 @@ import {
 import { groupSessionsByProject } from "@/lib/session-projects";
 import {
   coordinatorRunsBySession,
+  goalSessionGroups,
   goalRunOverview,
   orchestrationRoute,
 } from "@/lib/orchestration-overview";
@@ -131,6 +132,9 @@ export default function HostScreen() {
   const [showArchived, setShowArchived] = useState(false);
   const [archivedIds, setArchivedIds] = useState<Set<string>>(() => new Set());
   const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(() => new Set());
+  const [goalRunExpansionOverrides, setGoalRunExpansionOverrides] = useState<
+    Record<string, boolean>
+  >({});
   const pendingCreateRef = useRef(false);
   const deepLinkCreateRef = useRef<string | null>(null);
   const insets = useSafeAreaInsets();
@@ -140,6 +144,7 @@ export default function HostScreen() {
     () => coordinatorRunsBySession(orchestration?.runs ?? []),
     [orchestration],
   );
+  const goalGroups = useMemo(() => goalSessionGroups(orchestration), [orchestration]);
   // 横屏手机、iPad、Android 平板用并列双栏；其余手机严格上下各占一半。
   const wideComposer =
     verticalPanes !== null || width >= 720 || (width >= 600 && width > height);
@@ -385,7 +390,25 @@ export default function HostScreen() {
     () => (filter === "all" ? selectedPool : selectedPool.filter((s) => s.agent === filter)),
     [selectedPool, filter],
   );
-  const projects = useMemo(() => groupSessionsByProject(sessions), [sessions]);
+  const visibleSessionsById = useMemo(
+    () => new Map(sessions.map((session) => [session.id, session])),
+    [sessions],
+  );
+  const nestedGoalWorkerIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const [coordinatorSessionId, group] of goalGroups) {
+      if (!visibleSessionsById.has(coordinatorSessionId)) continue;
+      for (const worker of group.workers) {
+        if (visibleSessionsById.has(worker.sessionId)) ids.add(worker.sessionId);
+      }
+    }
+    return ids;
+  }, [goalGroups, visibleSessionsById]);
+  const topLevelSessions = useMemo(
+    () => sessions.filter((session) => !nestedGoalWorkerIds.has(session.id)),
+    [sessions, nestedGoalWorkerIds],
+  );
+  const projects = useMemo(() => groupSessionsByProject(topLevelSessions), [topLevelSessions]);
   const runningCount = all.filter(
     (s) => s.status === "running" || s.status === "starting",
   ).length;
@@ -1351,6 +1374,15 @@ export default function HostScreen() {
                   {project.sessions.map((session) => {
                     const done = session.status === "done" || session.status === "died";
                     const coordinatorRun = coordinatorRuns.get(session.id);
+                    const goalGroup = goalGroups.get(session.id);
+                    const goalWorkers = (goalGroup?.workers ?? []).flatMap((worker) => {
+                      const workerSession = visibleSessionsById.get(worker.sessionId);
+                      return workerSession ? [{ link: worker, session: workerSession }] : [];
+                    });
+                    const goalWorkersExpanded = goalGroup
+                      ? (goalRunExpansionOverrides[goalGroup.run.id] ??
+                        goalGroup.run.status === "active")
+                      : false;
                     // 断线时状态只代表上次连接，不能伪装成实时状态。
                     const stale = runtime.status !== "connected";
                     const actions: SwipeAction[] = [
@@ -1481,6 +1513,104 @@ export default function HostScreen() {
                                 </Pressable>
                               );
                             })}
+                          </View>
+                        )}
+                        {goalGroup && goalWorkers.length > 0 && (
+                          <View style={styles.goalWorkerGroup}>
+                            <Pressable
+                              style={({ pressed }) => [
+                                styles.goalWorkerToggle,
+                                pressed && styles.cardPressed,
+                              ]}
+                              onPress={() =>
+                                setGoalRunExpansionOverrides((current) => ({
+                                  ...current,
+                                  [goalGroup.run.id]: !goalWorkersExpanded,
+                                }))
+                              }
+                              accessibilityRole="button"
+                              accessibilityState={{ expanded: goalWorkersExpanded }}
+                              accessibilityLabel={`${goalGroup.run.status === "active" ? "进行中" : "已完成"} Goal 的 ${String(goalWorkers.length)} 个关联会话`}
+                            >
+                              <Icon
+                                name="point.3.connected.trianglepath.dotted"
+                                size={13}
+                                color={goalGroup.run.status === "active"
+                                  ? color.accent
+                                  : color.textDim}
+                              />
+                              <Text style={styles.goalWorkerToggleTitle} numberOfLines={1}>
+                                {goalGroup.run.status === "active"
+                                  ? "Goal 工作会话"
+                                  : "已完成 Goal 会话"}
+                              </Text>
+                              <Text style={styles.goalWorkerToggleMeta}>
+                                {String(goalWorkers.length)}
+                              </Text>
+                              <Icon
+                                name={goalWorkersExpanded ? "chevron.down" : "chevron.right"}
+                                size={11}
+                                color={color.textFaint}
+                              />
+                            </Pressable>
+                            {goalWorkersExpanded && (
+                              <View style={styles.childList}>
+                                {goalWorkers.map(({ link, session: workerSession }) => {
+                                  const active = workerSession.status === "running" ||
+                                    workerSession.status === "starting";
+                                  const delivered = link.taskStatus === "done";
+                                  const workerLabel = delivered
+                                    ? "已交付"
+                                    : link.taskStatus === "failed"
+                                      ? "失败"
+                                      : statusLabel[workerSession.status];
+                                  return (
+                                    <Pressable
+                                      key={workerSession.id}
+                                      style={({ pressed }) => [
+                                        styles.childRow,
+                                        pressed && styles.cardPressed,
+                                      ]}
+                                      onPress={() =>
+                                        router.push(`/host/${hostId}/session/${workerSession.id}`)
+                                      }
+                                      accessibilityRole="button"
+                                      accessibilityLabel={`打开 Goal 工作会话：${link.taskTitle}，${workerLabel}`}
+                                    >
+                                      <View
+                                        style={[
+                                          styles.childRail,
+                                          {
+                                            backgroundColor: active
+                                              ? color.accent
+                                              : delivered
+                                                ? color.success
+                                                : color.textFaint,
+                                          },
+                                        ]}
+                                      />
+                                      <View style={styles.childCopy}>
+                                        <View style={styles.childTop}>
+                                          <Text style={styles.childName} numberOfLines={1}>
+                                            {link.taskTitle}
+                                          </Text>
+                                          <Text style={[
+                                            styles.childStatus,
+                                            (active || delivered) && styles.childStatusActive,
+                                          ]}>
+                                            {workerLabel}
+                                          </Text>
+                                        </View>
+                                        <Text style={styles.childPreview} numberOfLines={1}>
+                                          {workerSession.title}
+                                        </Text>
+                                      </View>
+                                      <Icon name="chevron.right" size={11} color={color.textFaint} />
+                                    </Pressable>
+                                  );
+                                })}
+                              </View>
+                            )}
                           </View>
                         )}
                         </View>
@@ -2030,6 +2160,31 @@ const styles = StyleSheet.create({
   cardStatus: { fontSize: 12, fontWeight: "600" },
   preview: { ...font.sub, color: color.textDim, lineHeight: 18 },
   cardSub: font.meta,
+  goalWorkerGroup: {
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: color.border,
+    backgroundColor: color.surface,
+  },
+  goalWorkerToggle: {
+    minHeight: 44,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    paddingLeft: 31,
+    paddingRight: space.lg,
+    paddingVertical: 8,
+  },
+  goalWorkerToggleTitle: {
+    flex: 1,
+    color: color.textDim,
+    fontSize: 12,
+    fontWeight: "600",
+  },
+  goalWorkerToggleMeta: {
+    color: color.textFaint,
+    fontSize: 10,
+    fontVariant: ["tabular-nums"],
+  },
   childList: {
     borderTopWidth: StyleSheet.hairlineWidth,
     borderTopColor: color.border,

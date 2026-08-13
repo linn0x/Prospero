@@ -207,6 +207,17 @@ export function orchestrationControlApi(
         }
         case "run.list":
           return store.listRuns();
+        case "run.complete": {
+          const runId = text(params, "runId");
+          const actorSessionId = optionalText(params, "actorSessionId");
+          ownerOrCoordinator(store, runId, actorSessionId);
+          return idempotent(
+            method,
+            operationId(params),
+            { runId, actorSessionId },
+            () => store.completeRun(runId),
+          );
+        }
         case "run.delete": {
           const runId = text(params, "runId");
           const actorSessionId = optionalText(params, "actorSessionId");
