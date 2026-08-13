@@ -2,6 +2,18 @@
 
 来源：2026-08-12 静态审计。范围只含可稳定从源码复现的 P0–P2 项；纯视觉偏好未纳入。优先级以数据完整性和任务完成阻塞为先。每项的完整复现、预期/实际与验收细节见 [共享审计](shared-audit.md)、[iOS 审计](ios-audit.md)、[Android 审计](android-audit.md)。
 
+## 2026-08-13 T6 · iPhone SE 3 最大辅助字号首页（已修复）
+
+修复提交：`44ec843`（`fix(mobile): make unpaired home accessible at max type`）。此条只替代 T5 对“未配对首页在 `accessibility-extra-extra-extra-large` 溢出/裁切、扫码配对不可达”的失败结论；不把 T5 中任何已配对会话、读屏、真机或 Android 折叠路径改写为通过。
+
+- `src/app/index.tsx` 将空态从不可滚动的 `flex: 1` 居中 `View` 改为有界、显式 `scrollEnabled` 的纵向 `ScrollView`。内容容器以 `flexGrow: 1` + `justifyContent: "center"` 保持短内容自然居中，内容变高时可向下滚动；安全区底部 padding 确保 CTA 可滚至可见区域。
+- `src/lib/home-empty-state-layout.ts` 提取最小 320×548 视口、最大 `fontScale=3.125`、连续面板宽度、最大内容宽度和 44pt CTA 策略；iPad 宽屏限宽，Android 分离铰链继续使用右侧连续面板宽度。主机列表分支没有改动。
+- `test/home-empty-state-layout.test.ts` 覆盖最小视口 + 最大字号、宽屏限宽和 44pt；静态断言要求空态保留 `ScrollView`、`scrollEnabled` 与 `flexGrow` 内容策略，防止退回不可滚动的 flex 空态。
+
+复测：专用临时 iPhone SE（第三代，iOS 26.5）安装无签名 Simulator Release 包后，在 `large` 和 `accessibility-extra-extra-extra-large` 两档均 terminate/relaunch。两档首页均启动；`large` 截图中 CTA 可见，最大字号截图中标题、说明、命令块按内容扩展而非被容器裁切，继续向下可滚至 CTA。静态命中框断言和实现将 CTA 真正布局高度设为至少 44pt。`npm test -w @prospero/mobile` 为 25 个 Vitest 文件 / 151 个测试，`npx tsc --noEmit -p apps/mobile/tsconfig.json` 与 `npm run lint -w @prospero/mobile` 均通过。模拟器没有可用的触摸注入工具，故未把最大字号下实际点按 CTA 记为已验；这不影响可滚动结构和 44pt 布局的代码/截图证据。
+
+测试后 content-size 已从最大档复位为 `large`，临时设备与 App 数据将在本任务结束时删除；全程未生成、读取或记录配对凭证。当前无可安全复用的小屏 Android 模拟器（仅存在未触碰的 `FundWatch_API_35`），因此 Android 小屏只保留跨平台布局/单测证据，未声称运行时烟测。
+
 ## 2026-08-13 实施状态
 
 以下为本轮对 `master` 的代码验收结论。状态“已实现”表示已通过静态代码核对与自动测试；原审计中标为真机、模拟器或读屏验收的条件仍须在发布门禁中按原证据逐项执行，不改变其原始审计结论。

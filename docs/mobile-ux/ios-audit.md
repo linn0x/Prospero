@@ -2,6 +2,16 @@
 
 审计日期：2026-08-12。全部为静态证据；需在 iPhone、iPad 和 VoiceOver 真机补验。共享问题（离线投递、Gate、历史图片、左滑操作）见 [shared-audit.md](shared-audit.md)，此文件只保留 iOS 特有或 iOS 上特别明显的项。
 
+## 2026-08-13 T6 · SE 3 最大 Dynamic Type 首页复测（已修复）
+
+修复提交：`44ec843`。这是对 T5 中“`accessibility-extra-extra-extra-large` 时未配对首页标题、说明、命令块溢出/裁切，扫码配对不可见”的定点修复，不改变其余 iOS 验收缺口。
+
+- 首页空态现在是有界纵向 `ScrollView`；短内容由 `flexGrow` 居中，内容随 Dynamic Type 增高时纵向滚动。说明和命令块不再设置固定行高或 `overflow: "hidden"`，命令按窄屏宽度换行。
+- 扫码 CTA 具有 button 角色/名称/提示，最小真实布局高度为 44pt；安全区底部计入滚动内容。策略模块单测最小 320×548 视口、`fontScale=3.125` 和宽屏限宽，并静态阻止恢复为不可滚动 flex 容器。
+- 专用临时 iPhone SE（第三代，iOS 26.5）Release 包在 `large` 和 `accessibility-extra-extra-extra-large` 均 terminate/relaunch 成功。`large` 截图中 CTA 可见；最大字号截图显示标题、说明和命令块继续扩展到可滚动内容内，而非被裁切，CTA 可向下滚到。`npm test -w @prospero/mobile`（25 文件 / 151 测试）、TypeScript 和 Expo lint 通过。
+
+最大字号下未执行 CTA 的实际点按：该临时 Simulator 没有可用触摸注入工具；因此此项只将布局可达性/44pt 实现和截图复测记为通过，不能替代 VoiceOver、真实 iPhone、已配对会话、权限/Settings 回返、会话控件 44pt 量测或终端字号复位验收。测试后字号已复位为 `large`，临时模拟器和 App 数据将在任务收尾删除；未使用或记录配对凭证。完整矩阵见 [优化 Backlog](optimization-backlog.md#2026-08-13-t6--iphone-se-3-最大辅助字号首页已修复)。
+
 ## 2026-08-13 T5 验收增补（未通过）
 
 实现提交：IOS-01 为 `9f13be9`，IOS-02 为 `f9821a2`，IOS-03 / IOS-04 为 `278f169`。在 `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` 下，clean iOS prebuild、`pod install` 和无签名 generic iOS Simulator release build 均通过（`BUILD SUCCEEDED`）；移动端自动化共 24 个 Vitest 文件 / 148 个测试通过。
