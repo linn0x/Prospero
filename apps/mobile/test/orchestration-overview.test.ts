@@ -5,6 +5,7 @@ import type {
   OrchestrationSnapshot,
 } from "@prospero/protocol";
 import {
+  coordinatorRunsBySession,
   goalRunOverview,
   orchestrationConnectionNotice,
   orchestrationRoute,
@@ -92,5 +93,19 @@ describe("orchestration overview", () => {
     expect(selectedRouteRunId("selected run", runs)).toBe("selected run");
     expect(selectedRouteRunId(["first"], runs)).toBe("first");
     expect(selectedRouteRunId("deleted", runs)).toBeNull();
+  });
+
+  it("identifies coordinator sessions and prefers their active Run", () => {
+    const historical = run("historical", 100, "completed");
+    historical.coordinatorSessionId = "coordinator";
+    const active = run("active", 20);
+    active.coordinatorSessionId = "coordinator";
+    const manual = run("manual", 200);
+    manual.coordinatorSessionId = null;
+
+    const indexed = coordinatorRunsBySession([historical, active, manual]);
+
+    expect(indexed.get("coordinator")?.id).toBe("active");
+    expect(indexed.has("session-manual")).toBe(false);
   });
 });
