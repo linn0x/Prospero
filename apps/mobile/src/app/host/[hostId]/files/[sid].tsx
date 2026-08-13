@@ -460,7 +460,7 @@ export default function FilesScreen(): React.ReactElement {
             return actions.length > 0 ? <SwipeRow actions={actions}>{row}</SwipeRow> : row;
           }}
         />
-      <Text style={styles.hint}>左滑或点“更多”可下载 / 重命名 / 删除 · 右上角新建文件夹或上传</Text>
+      <Text style={styles.hint}>左滑可下载 / 重命名 / 删除 · 右上角新建文件夹或上传</Text>
       </View>
       <PromptDialog
         visible={namePrompt !== null}

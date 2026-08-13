@@ -931,6 +931,17 @@ export default function HostScreen() {
                   )}
                 </>
               )}
+              {sessionKind === "structured" &&
+                codeAgent &&
+                conn &&
+                !conn.supportsSessionCreateModel && (
+                  <>
+                    <Text style={[styles.formLabel, styles.kindLabel]}>模型与推理强度</Text>
+                    <Text style={styles.kindHelp}>
+                      Mac 端仍在运行旧版 daemon；重启 Mac 上的 Prospero 后即可选择。
+                    </Text>
+                  </>
+                )}
               {sessionKind === "structured" && (
                 <>
                   <Text style={[styles.formLabel, styles.kindLabel]}>发起方式</Text>
@@ -1273,7 +1284,7 @@ export default function HostScreen() {
         ListFooterComponent={
           projects.length > 0 ? (
             <Text style={styles.swipeHint}>
-              左滑或点“更多”：项目可新建 · 会话可{showArchived ? "恢复" : "归档"}或结束
+              左滑：项目可新建 · 会话可{showArchived ? "恢复" : "归档"}或结束
             </Text>
           ) : null
         }
