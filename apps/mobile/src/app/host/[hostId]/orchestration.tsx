@@ -26,6 +26,7 @@ import { WorkspacePicker } from "@/components/WorkspacePicker";
 import { primaryPaneWidth, useAdaptiveLayout } from "@/lib/adaptive-layout";
 import { useHostConnection } from "@/lib/use-host-connection";
 import {
+  groupOrchestrationRuns,
   orchestrationConnectionNotice,
   selectedRouteRunId,
 } from "@/lib/orchestration-overview";
@@ -142,6 +143,7 @@ export default function OrchestrationScreen() {
   const { hostId, runId } = useLocalSearchParams<{ hostId: string; runId?: string | string[] }>();
   const { host, conn, runtime } = useHostConnection(hostId);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [editor, setEditor] = useState<Editor>(null);
   const [banner, setBanner] = useState<string | null>(null);
   const [taskView, setTaskView] = useState<"graph" | "list">("graph");
@@ -191,12 +193,11 @@ export default function OrchestrationScreen() {
     }, [conn, runtime.status]),
   );
 
-  const runs = useMemo(
-    () => [...(snapshot?.runs ?? [])].sort(
-      (a, b) => Number(b.status === "active") - Number(a.status === "active") || b.updatedAt - a.updatedAt,
-    ),
+  const runGroups = useMemo(
+    () => groupOrchestrationRuns(snapshot?.runs ?? []),
     [snapshot],
   );
+  const runs = runGroups.all;
   const accountsFor = (agent: AgentKind): AgentAccount[] =>
     agent === "claude" || agent === "codex"
       ? agentAccounts.filter((account) => account.agent === agent)
@@ -205,9 +206,13 @@ export default function OrchestrationScreen() {
     accountsFor(agent).find((account) => account.isDefault)?.id ?? accountsFor(agent)[0]?.id;
 
   const requestedRunId = selectedRouteRunId(runId, runs);
-  const activeRunId = selectedRunId && runs.some((run) => run.id === selectedRunId)
+  const selectedRunCandidate = selectedRunId
+    ? runs.find((run) => run.id === selectedRunId)
+    : undefined;
+  const activeRunId = selectedRunCandidate &&
+    (selectedRunCandidate.status === "active" || historyOpen)
     ? selectedRunId
-    : requestedRunId ?? runs[0]?.id ?? null;
+    : requestedRunId ?? runGroups.active[0]?.id ?? (historyOpen ? runGroups.history[0]?.id ?? null : null);
   const selectedRun = runs.find((run) => run.id === activeRunId) ?? null;
   const tasks = useMemo(
     () => (snapshot?.tasks ?? []).filter((task) => task.runId === activeRunId),
@@ -849,13 +854,13 @@ export default function OrchestrationScreen() {
           </EditorCard>
         )}
 
-        {runs.length > 0 && (
+        {runGroups.active.length > 0 && (
           <ScrollView
             horizontal
             showsHorizontalScrollIndicator={false}
             contentContainerStyle={styles.runStrip}
           >
-            {runs.map((run) => (
+            {runGroups.active.map((run) => (
               <Pressable
                 key={run.id}
                 onPress={() => {
@@ -875,6 +880,67 @@ export default function OrchestrationScreen() {
               </Pressable>
             ))}
           </ScrollView>
+        )}
+
+        {runGroups.history.length > 0 && (
+          <View style={styles.runHistory}>
+            <Pressable
+              style={({ pressed }) => [
+                styles.runHistoryToggle,
+                pressed && styles.runHistoryTogglePressed,
+              ]}
+              onPress={() => {
+                const next = !historyOpen;
+                setHistoryOpen(next);
+                if (!next && selectedRun?.status !== "active") {
+                  setSelectedRunId(runGroups.active[0]?.id ?? null);
+                  setSelectedTopologyTaskId(null);
+                  setEditor(null);
+                }
+              }}
+              accessibilityRole="button"
+              accessibilityState={{ expanded: historyOpen }}
+              accessibilityLabel={`${historyOpen ? "折叠" : "展开"}已结束的 Goal 编排`}
+            >
+              <Icon
+                name={historyOpen ? "chevron.down" : "chevron.right"}
+                size={13}
+                color={color.textDim}
+              />
+              <Text style={styles.runHistoryTitle}>已结束的 Goal 编排</Text>
+              <Text style={styles.runHistoryCount}>{String(runGroups.history.length)}</Text>
+            </Pressable>
+            {historyOpen && (
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.runHistoryStrip}
+              >
+                {runGroups.history.map((run) => (
+                  <Pressable
+                    key={run.id}
+                    onPress={() => {
+                      setSelectedRunId(run.id);
+                      setSelectedTopologyTaskId(null);
+                      setEditor(null);
+                    }}
+                    style={[styles.runChip, activeRunId === run.id && styles.runChipActive]}
+                  >
+                    <Text
+                      style={[
+                        styles.runChipTitle,
+                        activeRunId === run.id && styles.runChipTitleActive,
+                      ]}
+                      numberOfLines={1}
+                    >
+                      {run.objective}
+                    </Text>
+                    <Text style={styles.runChipMeta}>{runLabel(run)} · {run.status}</Text>
+                  </Pressable>
+                ))}
+              </ScrollView>
+            )}
+          </View>
         )}
 
         {runs.length === 0 && editor?.kind !== "run" && conn?.supportsOrchestrationSnapshot && (
@@ -1606,6 +1672,32 @@ const styles = StyleSheet.create({
   runChipTitle: { color: color.textDim, fontSize: 13, fontWeight: "600" },
   runChipTitleActive: { color: color.text },
   runChipMeta: { ...font.meta },
+  runHistory: {
+    borderRadius: radius.md,
+    backgroundColor: color.surfaceRaised,
+    overflow: "hidden",
+  },
+  runHistoryToggle: {
+    minHeight: 46,
+    paddingHorizontal: space.md,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: space.sm,
+  },
+  runHistoryTogglePressed: { backgroundColor: color.pressed },
+  runHistoryTitle: { flex: 1, color: color.textDim, fontSize: 13, fontWeight: "600" },
+  runHistoryCount: {
+    minWidth: 24,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    overflow: "hidden",
+    borderRadius: 999,
+    backgroundColor: color.surface,
+    color: color.textDim,
+    fontSize: 10,
+    textAlign: "center",
+  },
+  runHistoryStrip: { gap: space.sm, paddingHorizontal: space.sm, paddingBottom: space.sm },
   empty: {
     alignItems: "center",
     gap: space.sm,
