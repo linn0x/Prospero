@@ -40,6 +40,7 @@ import { groupSessionsByProject } from "@/lib/session-projects";
 import {
   coordinatorRunsBySession,
   goalSessionGroups,
+  goalSessionVisibility,
   goalRunOverview,
   orchestrationRoute,
 } from "@/lib/orchestration-overview";
@@ -390,23 +391,35 @@ export default function HostScreen() {
     () => (filter === "all" ? selectedPool : selectedPool.filter((s) => s.agent === filter)),
     [selectedPool, filter],
   );
+  const allSessionsById = useMemo(
+    () => new Map(all.map((session) => [session.id, session])),
+    [all],
+  );
   const visibleSessionsById = useMemo(
     () => new Map(sessions.map((session) => [session.id, session])),
     [sessions],
   );
-  const nestedGoalWorkerIds = useMemo(() => {
-    const ids = new Set<string>();
-    for (const [coordinatorSessionId, group] of goalGroups) {
-      if (!visibleSessionsById.has(coordinatorSessionId)) continue;
-      for (const worker of group.workers) {
-        if (visibleSessionsById.has(worker.sessionId)) ids.add(worker.sessionId);
-      }
-    }
-    return ids;
-  }, [goalGroups, visibleSessionsById]);
+  const goalVisibility = useMemo(
+    () => goalSessionVisibility(
+      goalGroups,
+      new Set(visibleSessionsById.keys()),
+      new Set(allSessionsById.keys()),
+    ),
+    [allSessionsById, goalGroups, visibleSessionsById],
+  );
+  const contextualGoalCoordinators = useMemo(
+    () => Array.from(goalVisibility.contextualCoordinatorIds).flatMap((sessionId) => {
+      const session = allSessionsById.get(sessionId);
+      return session ? [session] : [];
+    }),
+    [allSessionsById, goalVisibility],
+  );
   const topLevelSessions = useMemo(
-    () => sessions.filter((session) => !nestedGoalWorkerIds.has(session.id)),
-    [sessions, nestedGoalWorkerIds],
+    () => sortSessions(Object.fromEntries([
+      ...sessions.filter((session) => !goalVisibility.nestedWorkerIds.has(session.id)),
+      ...contextualGoalCoordinators,
+    ].map((session) => [session.id, session]))),
+    [contextualGoalCoordinators, goalVisibility, sessions],
   );
   const projects = useMemo(() => groupSessionsByProject(topLevelSessions), [topLevelSessions]);
   const runningCount = all.filter(
@@ -522,6 +535,41 @@ export default function HostScreen() {
       });
       setBanner(`归档状态保存失败: ${error instanceof Error ? error.message : String(error)}`);
     });
+  };
+
+  const sessionSwipeActions = (session: SessionInfo): SwipeAction[] => {
+    const archived = archivedIds.has(session.id);
+    const done = session.status === "done" || session.status === "died";
+    return [
+      {
+        id: "toggle-archive",
+        label: archived ? "恢复" : "归档",
+        symbol: "archivebox",
+        color: "#766A45",
+        onPress: () => changeArchive(session.id, !archived),
+      },
+      {
+        id: "open-files",
+        label: "文件",
+        symbol: "doc.on.doc",
+        color: "#3a6ea5",
+        onPress: () => router.push(`/host/${hostId}/files/${session.id}`),
+      },
+      {
+        id: "end-session",
+        label: done ? "移除" : "结束",
+        symbol: "trash",
+        color: "#e5534b",
+        onPress: () => conn?.kill(session.id),
+        confirm: {
+          title: done ? `移除「${session.title}」?` : `结束「${session.title}」?`,
+          message: done
+            ? "会话已结束，这会同时删除它的持久化记录。"
+            : "会话进程会被终止，未完成的工作会丢失。归档不会终止会话。",
+          confirmLabel: done ? "移除" : "结束",
+        },
+      },
+    ];
   };
 
   const toggleProject = (path: string): void => {
@@ -1372,7 +1420,6 @@ export default function HostScreen() {
               {!collapsed && (
                 <View style={styles.projectSessions}>
                   {project.sessions.map((session) => {
-                    const done = session.status === "done" || session.status === "died";
                     const coordinatorRun = coordinatorRuns.get(session.id);
                     const goalGroup = goalGroups.get(session.id);
                     const goalWorkers = (goalGroup?.workers ?? []).flatMap((worker) => {
@@ -1385,39 +1432,9 @@ export default function HostScreen() {
                       : false;
                     // 断线时状态只代表上次连接，不能伪装成实时状态。
                     const stale = runtime.status !== "connected";
-                    const actions: SwipeAction[] = [
-                      {
-                        id: "toggle-archive",
-                        label: showArchived ? "恢复" : "归档",
-                        symbol: "archivebox",
-                        color: "#766A45",
-                        onPress: () => changeArchive(session.id, !showArchived),
-                      },
-                      {
-                        id: "open-files",
-                        label: "文件",
-                        symbol: "doc.on.doc",
-                        color: "#3a6ea5",
-                        onPress: () => router.push(`/host/${hostId}/files/${session.id}`),
-                      },
-                      {
-                        id: "end-session",
-                        label: done ? "移除" : "结束",
-                        symbol: "trash",
-                        color: "#e5534b",
-                        onPress: () => conn?.kill(session.id),
-                        confirm: {
-                          title: done ? `移除「${session.title}」?` : `结束「${session.title}」?`,
-                          message: done
-                            ? "会话已结束，这会同时删除它的持久化记录。"
-                            : "会话进程会被终止，未完成的工作会丢失。归档不会终止会话。",
-                          confirmLabel: done ? "移除" : "结束",
-                        },
-                      },
-                    ];
                     return (
-                      <SwipeRow key={session.id} actions={actions}>
-                        <View>
+                      <View key={session.id}>
+                        <SwipeRow actions={sessionSwipeActions(session)}>
                         <Pressable
                           style={({ pressed }) => [
                             styles.card,
@@ -1470,6 +1487,7 @@ export default function HostScreen() {
                                 ].filter(Boolean).join(" · ")}
                           </Text>
                         </Pressable>
+                        </SwipeRow>
                         {(session.subagents?.length ?? 0) > 0 && (
                           <View style={styles.childList}>
                             {(session.subagents ?? []).map((child) => {
@@ -1565,56 +1583,59 @@ export default function HostScreen() {
                                       ? "失败"
                                       : statusLabel[workerSession.status];
                                   return (
-                                    <Pressable
+                                    <SwipeRow
                                       key={workerSession.id}
-                                      style={({ pressed }) => [
-                                        styles.childRow,
-                                        pressed && styles.cardPressed,
-                                      ]}
-                                      onPress={() =>
-                                        router.push(`/host/${hostId}/session/${workerSession.id}`)
-                                      }
-                                      accessibilityRole="button"
-                                      accessibilityLabel={`打开 Goal 工作会话：${link.taskTitle}，${workerLabel}`}
+                                      actions={sessionSwipeActions(workerSession)}
                                     >
-                                      <View
-                                        style={[
-                                          styles.childRail,
-                                          {
-                                            backgroundColor: active
-                                              ? color.accent
-                                              : delivered
-                                                ? color.success
-                                                : color.textFaint,
-                                          },
+                                      <Pressable
+                                        style={({ pressed }) => [
+                                          styles.childRow,
+                                          pressed && styles.cardPressed,
                                         ]}
-                                      />
-                                      <View style={styles.childCopy}>
-                                        <View style={styles.childTop}>
-                                          <Text style={styles.childName} numberOfLines={1}>
-                                            {link.taskTitle}
-                                          </Text>
-                                          <Text style={[
-                                            styles.childStatus,
-                                            (active || delivered) && styles.childStatusActive,
-                                          ]}>
-                                            {workerLabel}
+                                        onPress={() =>
+                                          router.push(`/host/${hostId}/session/${workerSession.id}`)
+                                        }
+                                        accessibilityRole="button"
+                                        accessibilityLabel={`打开 Goal 工作会话：${link.taskTitle}，${workerLabel}`}
+                                      >
+                                        <View
+                                          style={[
+                                            styles.childRail,
+                                            {
+                                              backgroundColor: active
+                                                ? color.accent
+                                                : delivered
+                                                  ? color.success
+                                                  : color.textFaint,
+                                            },
+                                          ]}
+                                        />
+                                        <View style={styles.childCopy}>
+                                          <View style={styles.childTop}>
+                                            <Text style={styles.childName} numberOfLines={1}>
+                                              {link.taskTitle}
+                                            </Text>
+                                            <Text style={[
+                                              styles.childStatus,
+                                              (active || delivered) && styles.childStatusActive,
+                                            ]}>
+                                              {workerLabel}
+                                            </Text>
+                                          </View>
+                                          <Text style={styles.childPreview} numberOfLines={1}>
+                                            {workerSession.title}
                                           </Text>
                                         </View>
-                                        <Text style={styles.childPreview} numberOfLines={1}>
-                                          {workerSession.title}
-                                        </Text>
-                                      </View>
-                                      <Icon name="chevron.right" size={11} color={color.textFaint} />
-                                    </Pressable>
+                                        <Icon name="chevron.right" size={11} color={color.textFaint} />
+                                      </Pressable>
+                                    </SwipeRow>
                                   );
                                 })}
                               </View>
                             )}
                           </View>
                         )}
-                        </View>
-                      </SwipeRow>
+                      </View>
                     );
                   })}
                 </View>

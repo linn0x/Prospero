@@ -73,6 +73,13 @@ run
     runId: requireText(opts["id"], "--id"),
     actorSessionId: optionalSession(),
   })));
+run
+  .command("abandon")
+  .requiredOption("--id <id>", "Run ID")
+  .action(action("run.abandon", (opts) => ({
+    runId: requireText(opts["id"], "--id"),
+    actorSessionId: optionalSession(),
+  })));
 
 const task = program.command("task").description("Task 管理与交付");
 task

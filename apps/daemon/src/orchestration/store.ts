@@ -54,6 +54,8 @@ export type OrchestrationErrorCode =
   | "task_not_editable"
   | "run_not_deletable"
   | "run_not_completable"
+  | "run_not_abandonable"
+  | "run_not_active"
   | "operation_conflict";
 
 export interface GraphNodeInput {
@@ -87,6 +89,7 @@ export class OrchestrationStore {
   private readonly file: string | null;
   private timer: NodeJS.Timeout | null = null;
   private closed = false;
+  private readonly changeListeners = new Set<() => void>();
 
   /** home 省略时纯内存(测试用) */
   constructor(home?: string) {
@@ -121,6 +124,13 @@ export class OrchestrationStore {
   }
 
   private schedulePersist(): void {
+    for (const listener of this.changeListeners) {
+      try {
+        listener();
+      } catch {
+        // 观察者只负责刷新外部视图；失败不能回滚已经完成的状态变更。
+      }
+    }
     if (!this.file || this.closed || this.timer) return;
     this.timer = setTimeout(() => {
       this.timer = null;
@@ -146,6 +156,12 @@ export class OrchestrationStore {
     this.closed = true;
   }
 
+  /** 状态变更通知只表示“快照可能变了”；调用方应自行防抖并读取完整快照。 */
+  onChange(listener: () => void): () => void {
+    this.changeListeners.add(listener);
+    return () => this.changeListeners.delete(listener);
+  }
+
   // ── Run ───────────────────────────────────────────────────────────────
 
   createRun(input: { objective: string; coordinatorSessionId?: string | null }): Run {
@@ -168,6 +184,17 @@ export class OrchestrationStore {
   getRun(runId: string): Run {
     const run = this.state.runs[runId];
     if (!run) throw new OrchestrationError(`找不到 Run ${runId}`, "run_not_found");
+    return run;
+  }
+
+  private requireActiveRun(runId: string): Run {
+    const run = this.getRun(runId);
+    if (run.status !== "active") {
+      throw new OrchestrationError(
+        `Run ${runId} 已经是 ${run.status}，历史编排只读`,
+        "run_not_active",
+      );
+    }
     return run;
   }
 
@@ -214,6 +241,12 @@ export class OrchestrationStore {
         "run_not_completable",
       );
     }
+    if (run.automation?.state === "running") {
+      throw new OrchestrationError(
+        "自动执行仍在运行，请先暂停或等待它自行收口",
+        "run_not_completable",
+      );
+    }
     const pendingGate = this.listGates(runId, "pending")[0];
     if (pendingGate) {
       throw new OrchestrationError(
@@ -247,8 +280,53 @@ export class OrchestrationStore {
     }
   }
 
-  setRunAutomation(runId: string, automation: RunAutomation | null): Run {
+  /** 放弃 Run 会关闭未执行任务和未决 Gate，但绝不替用户强杀仍在工作的 worker。 */
+  abandonRun(runId: string, reason = "Run 已放弃"): Run {
     const run = this.getRun(runId);
+    if (run.status === "abandoned") return run;
+    if (run.status !== "active") {
+      throw new OrchestrationError(
+        `Run ${runId} 当前是 ${run.status}，不能放弃`,
+        "run_not_abandonable",
+      );
+    }
+    const activeDispatch = this.listDispatches(runId).find(
+      (dispatch) => dispatch.state === "starting" || dispatch.state === "running",
+    );
+    if (activeDispatch) {
+      throw new OrchestrationError(
+        `worker ${activeDispatch.sessionId} 仍在运行，请先停止 worker`,
+        "run_not_abandonable",
+      );
+    }
+    if (run.automation?.state === "running") {
+      throw new OrchestrationError("自动执行仍在运行，请先暂停", "run_not_abandonable");
+    }
+
+    const now = Date.now();
+    for (const task of this.listTasks(runId)) {
+      if (
+        task.status === "pending" ||
+        task.status === "blocked" ||
+        task.status === "dispatched"
+      ) {
+        task.status = "cancelled";
+        task.result = reason;
+        task.updatedAt = now;
+      }
+    }
+    for (const gate of this.listGates(runId, "pending")) {
+      gate.status = "cancelled";
+      gate.resolvedAt = now;
+    }
+    run.status = "abandoned";
+    run.updatedAt = now;
+    this.schedulePersist();
+    return run;
+  }
+
+  setRunAutomation(runId: string, automation: RunAutomation | null): Run {
+    const run = this.requireActiveRun(runId);
     run.automation = automation;
     run.updatedAt = Date.now();
     this.schedulePersist();
@@ -301,7 +379,7 @@ export class OrchestrationStore {
     deps?: string[];
     parentId?: string | null;
   }): Task {
-    this.getRun(input.runId);
+    this.requireActiveRun(input.runId);
     const deps = input.deps ?? [];
     for (const dep of deps) {
       const task = this.state.tasks[dep];
@@ -357,6 +435,7 @@ export class OrchestrationStore {
 
   setTaskStatus(taskId: string, status: TaskStatus, result?: string | null): Task {
     const task = this.getTask(taskId);
+    this.requireActiveRun(task.runId);
     if (!canTransition(task.status, status)) {
       const err = new TransitionError(task.status, status);
       throw new OrchestrationError(err.message, "invalid_transition");
@@ -371,6 +450,7 @@ export class OrchestrationStore {
   /** 取消尚未执行的任务；若仍有关联 worker，必须先显式停止，避免留下游离进程。 */
   cancelTask(taskId: string, reason = "由用户取消"): Task {
     const task = this.getTask(taskId);
+    this.requireActiveRun(task.runId);
     if (task.status === "cancelled") return task;
     if (this.activeDispatchFor(taskId)) {
       throw new OrchestrationError("任务仍有关联 worker，请先停止 worker 再取消", "task_not_dispatchable");
@@ -398,6 +478,7 @@ export class OrchestrationStore {
   /** failed 保留在 Dispatch 历史中，任务本身退回 pending 等待重新派发。 */
   retryTask(taskId: string): Task {
     const task = this.getTask(taskId);
+    this.requireActiveRun(task.runId);
     if (task.status !== "failed") {
       throw new OrchestrationError(
         `任务 ${task.id} 当前是 ${task.status}，只有 failed 任务可以重试`,
@@ -413,6 +494,7 @@ export class OrchestrationStore {
 
   setTaskDeps(taskId: string, deps: string[]): Task {
     const task = this.getTask(taskId);
+    this.requireActiveRun(task.runId);
     for (const dep of deps) {
       const target = this.state.tasks[dep];
       if (!target) throw new OrchestrationError(`依赖的任务不存在: ${dep}`, "dep_not_found");
@@ -513,7 +595,7 @@ export class OrchestrationStore {
     nodes: GraphNodeInput[];
     deleteTaskIds?: string[];
   }): GraphMutationResult {
-    const run = this.getRun(input.runId);
+    const run = this.requireActiveRun(input.runId);
     if (run.graphRevision !== input.baseRevision) {
       throw new OrchestrationError(
         `任务图已经更新（当前 revision ${run.graphRevision}，提交基于 ${input.baseRevision}）`,
@@ -740,6 +822,7 @@ export class OrchestrationStore {
     worktreePath?: string | null;
   }): Dispatch {
     const task = this.getTask(input.taskId);
+    this.requireActiveRun(task.runId);
     // 先挡重复派发,再看状态转移。
     // 不能只靠状态机:canTransition 允许同状态自转(为了让重试命令幂等),
     // 于是 dispatched → dispatched 是合法的,同一个任务会被派给两个 worker,
@@ -893,7 +976,7 @@ export class OrchestrationStore {
     question: string;
     options?: string[];
   }): Gate {
-    this.getRun(input.runId);
+    this.requireActiveRun(input.runId);
     if (input.taskId) {
       const task = this.getTask(input.taskId);
       if (task.runId !== input.runId) {
@@ -943,6 +1026,7 @@ export class OrchestrationStore {
 
   resolveGate(gateId: string, decision: string): Gate {
     const gate = this.getGate(gateId);
+    this.requireActiveRun(gate.runId);
     if (gate.status !== "pending") {
       if (gate.status === "resolved" && gate.decision === decision) return gate;
       throw new OrchestrationError(`决策门 ${gate.id} 已经是 ${gate.status}`, "gate_not_pending");
