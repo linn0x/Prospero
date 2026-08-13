@@ -2,8 +2,10 @@ import { useCallback, useState } from "react";
 import {
   FlatList,
   Pressable,
+  ScrollView,
   StyleSheet,
   Text,
+  useWindowDimensions,
   View,
 } from "react-native";
 import { Stack, router, useFocusEffect } from "expo-router";
@@ -12,6 +14,10 @@ import { Icon } from "@/components/Icon";
 import { SwipeRow } from "@/components/SwipeRow";
 import { useAdaptiveLayout } from "@/lib/adaptive-layout";
 import { getConnection, wireAppStateReconnect } from "@/lib/connection";
+import {
+  HOME_EMPTY_STATE_MIN_HIT_TARGET,
+  homeEmptyStateLayout,
+} from "@/lib/home-empty-state-layout";
 import { getDeviceKeys, getHosts, removeHost, type StoredHost } from "@/lib/hosts";
 import { clearSessionPreferences } from "@/lib/session-preferences";
 import { useApp, type ConnStatus } from "@/lib/store";
@@ -29,12 +35,20 @@ const statusLabel: Record<ConnStatus, string> = {
 
 export default function HostsScreen() {
   const insets = useSafeAreaInsets();
+  const { fontScale } = useWindowDimensions();
   const adaptiveLayout = useAdaptiveLayout();
   const hostColumns =
     adaptiveLayout.verticalPanes !== null || adaptiveLayout.isExpanded ? 2 : 1;
   const columnGap = adaptiveLayout.verticalPanes?.gap ?? space.lg;
   const regularColumnWidth =
     (adaptiveLayout.width - space.lg * 2 - columnGap) / 2;
+  const emptyStatePaneWidth =
+    adaptiveLayout.verticalPanes?.end ?? adaptiveLayout.width;
+  const emptyStateLayout = homeEmptyStateLayout({
+    viewportWidth: emptyStatePaneWidth,
+    bottomInset: insets.bottom,
+    fontScale,
+  });
   const [hosts, setLocal] = useState<StoredHost[]>([]);
   const setHosts = useApp((s) => s.setHosts);
   const runtimes = useApp((s) => s.runtimes);
@@ -96,23 +110,36 @@ export default function HostsScreen() {
         }}
       />
       {hosts.length === 0 ? (
-        <View
+        <ScrollView
+          testID="hosts-empty-state-scroll"
           style={[
-            styles.emptyWrap,
+            styles.emptyScroll,
             adaptiveLayout.verticalPanes && {
               width: adaptiveLayout.verticalPanes.end,
               alignSelf: "flex-end",
             },
           ]}
+          contentContainerStyle={emptyStateLayout.contentContainer}
+          keyboardShouldPersistTaps="handled"
+          scrollEnabled
+          showsVerticalScrollIndicator={false}
         >
-          <Icon name="desktopcomputer" size={52} color={color.textFaint} />
-          <Text style={styles.emptyTitle}>还没有配对的 Mac</Text>
-          <Text style={styles.emptyText}>在 Mac 上运行 prosperod 并生成配对码:</Text>
-          <Text style={styles.code}>prosperod start{"\n"}prosperod pair</Text>
-          <Pressable style={styles.cta} onPress={() => router.push("/pair")}>
-            <Text style={styles.ctaText}>扫码配对</Text>
-          </Pressable>
-        </View>
+          <View style={[styles.emptyWrap, emptyStateLayout.body]}>
+            <Icon name="desktopcomputer" size={52} color={color.textFaint} />
+            <Text style={styles.emptyTitle}>还没有配对的 Mac</Text>
+            <Text style={styles.emptyText}>在 Mac 上运行 prosperod 并生成配对码:</Text>
+            <Text style={styles.code}>prosperod start{"\n"}prosperod pair</Text>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="扫码配对"
+              accessibilityHint="打开相机扫描 Mac 上的配对二维码"
+              style={({ pressed }) => [styles.cta, pressed && styles.ctaPressed]}
+              onPress={() => router.push("/pair")}
+            >
+              <Text style={styles.ctaText}>扫码配对</Text>
+            </Pressable>
+          </View>
+        </ScrollView>
       ) : (
         <FlatList
           key={`hosts-${String(hostColumns)}`}
@@ -219,16 +246,18 @@ const styles = StyleSheet.create({
   cardSub: font.sub,
   headerButton: { width: 44, height: 44, alignItems: "center", justifyContent: "center" },
   swipeHint: { ...font.meta, textAlign: "center", paddingVertical: space.lg },
-  emptyWrap: { flex: 1, alignItems: "center", justifyContent: "center", padding: space.xl, gap: space.md },
+  emptyScroll: { flex: 1 },
+  emptyWrap: { alignItems: "center", gap: space.md },
   emptyTitle: { ...font.title, textAlign: "center" },
-  emptyText: { ...font.sub, textAlign: "center", lineHeight: 20 },
+  emptyText: { ...font.sub, textAlign: "center", alignSelf: "stretch" },
   code: {
     ...font.mono,
     color: color.textDim,
     backgroundColor: color.surfaceRaised,
     borderRadius: radius.sm,
     padding: space.md,
-    overflow: "hidden",
+    alignSelf: "stretch",
+    maxWidth: "100%",
   },
   cta: {
     backgroundColor: color.accentDim,
@@ -236,6 +265,10 @@ const styles = StyleSheet.create({
     paddingHorizontal: space.xl,
     paddingVertical: space.md,
     marginTop: space.sm,
+    minHeight: HOME_EMPTY_STATE_MIN_HIT_TARGET,
+    alignItems: "center",
+    justifyContent: "center",
   },
-  ctaText: { color: color.text, fontSize: 15, fontWeight: "600" },
+  ctaPressed: { backgroundColor: color.pressed },
+  ctaText: { color: color.text, fontSize: 15, fontWeight: "600", textAlign: "center" },
 });
