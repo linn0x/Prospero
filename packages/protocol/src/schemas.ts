@@ -22,6 +22,16 @@ export const CodeAgentKindSchema = z.enum(["claude", "codex"]);
 /** Claude managed accounts support either a subscription token or a Console API key. */
 export const AgentCredentialKindSchema = z.enum(["oauth_token", "api_key"]);
 
+/** 外部 API Profile 按 Agent 的原生兼容协议连接，不另造一套 Agent。 */
+export const AgentApiProviderSchema = z.enum(["anthropic_compatible", "openai_compatible"]);
+
+/** 只同步可展示的连接元数据；API Key 永远不进入协议快照。 */
+export const AgentApiProfileSchema = z.object({
+  provider: AgentApiProviderSchema,
+  baseUrl: z.string().url().max(2000),
+  model: z.string().min(1).max(300),
+});
+
 export const AgentAccountStatusSchema = z.enum([
   "signed_in",
   "signed_out",
@@ -40,6 +50,8 @@ export const AgentAccountSchema = z.object({
   managed: z.boolean(),
   isDefault: z.boolean(),
   status: AgentAccountStatusSchema,
+  /** 已配置的第三方 API；缺省表示官方 CLI 账号环境。 */
+  apiProfile: AgentApiProfileSchema.optional(),
   authMethod: z.string().max(200).optional(),
   detail: z.string().max(1000).optional(),
   createdAt: z.number().int().nonnegative(),
@@ -311,6 +323,27 @@ export const C2SAgentAccountCreateSchema = z.object({
   requestId: z.string().min(1).max(100),
   agent: CodeAgentKindSchema,
   name: z.string().trim().min(1).max(80),
+});
+
+/** 创建隔离的第三方 API Profile。daemon 收到后将 key 写入系统安全存储。 */
+export const C2SAgentAccountApiCreateSchema = z.object({
+  type: z.literal("agent.account.api.create"),
+  requestId: z.string().min(1).max(100),
+  agent: CodeAgentKindSchema,
+  name: z.string().trim().min(1).max(80),
+  baseUrl: z.string().trim().url().max(2000),
+  model: z.string().trim().min(1).max(300),
+  apiKey: z.string().trim().min(1).max(8192),
+});
+
+/** 更新 API Profile 的连接地址、模型与凭据；不会读取或回传既有 key。 */
+export const C2SAgentAccountApiConfigureSchema = z.object({
+  type: z.literal("agent.account.api.configure"),
+  requestId: z.string().min(1).max(100),
+  accountId: z.string().min(1).max(100),
+  baseUrl: z.string().trim().url().max(2000),
+  model: z.string().trim().min(1).max(300),
+  apiKey: z.string().trim().min(1).max(8192),
 });
 
 export const C2SAgentAccountRenameSchema = z.object({
@@ -883,6 +916,8 @@ export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SConversationSearchSchema,
   C2SAgentAccountsListSchema,
   C2SAgentAccountCreateSchema,
+  C2SAgentAccountApiCreateSchema,
+  C2SAgentAccountApiConfigureSchema,
   C2SAgentAccountRenameSchema,
   C2SAgentAccountSetDefaultSchema,
   C2SAgentAccountLoginSchema,
@@ -1326,6 +1361,8 @@ export const S2CAgentAccountsResultSchema = z.object({
   action: z.enum([
     "list",
     "create",
+    "api_create",
+    "api_configure",
     "rename",
     "default",
     "login",
@@ -1526,6 +1563,8 @@ export const PairingPayloadSchema = z.object({
 export type AgentKind = z.infer<typeof AgentKindSchema>;
 export type CodeAgentKind = z.infer<typeof CodeAgentKindSchema>;
 export type AgentCredentialKind = z.infer<typeof AgentCredentialKindSchema>;
+export type AgentApiProvider = z.infer<typeof AgentApiProviderSchema>;
+export type AgentApiProfile = z.infer<typeof AgentApiProfileSchema>;
 export type AgentAccountStatus = z.infer<typeof AgentAccountStatusSchema>;
 export type AgentAccount = z.infer<typeof AgentAccountSchema>;
 export type SessionKind = z.infer<typeof SessionKindSchema>;
@@ -1563,6 +1602,8 @@ export type ResumableConversation = z.infer<typeof ResumableConversationSchema>;
 export type C2SConversationSearch = z.infer<typeof C2SConversationSearchSchema>;
 export type C2SAgentAccountsList = z.infer<typeof C2SAgentAccountsListSchema>;
 export type C2SAgentAccountCreate = z.infer<typeof C2SAgentAccountCreateSchema>;
+export type C2SAgentAccountApiCreate = z.infer<typeof C2SAgentAccountApiCreateSchema>;
+export type C2SAgentAccountApiConfigure = z.infer<typeof C2SAgentAccountApiConfigureSchema>;
 export type C2SAgentAccountRename = z.infer<typeof C2SAgentAccountRenameSchema>;
 export type C2SAgentAccountSetDefault = z.infer<typeof C2SAgentAccountSetDefaultSchema>;
 export type C2SAgentAccountLogin = z.infer<typeof C2SAgentAccountLoginSchema>;

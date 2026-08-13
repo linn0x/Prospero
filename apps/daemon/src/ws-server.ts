@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import { WebSocketServer, WebSocket, type RawData } from "ws";
 import {
   CAPABILITY_AGENT_ACCOUNTS,
+  CAPABILITY_AGENT_API_PROFILES,
   CAPABILITY_CHAT_ATTACHMENT_PREVIEWS,
   CAPABILITY_ORCHESTRATION_AUTOMATION,
   CAPABILITY_ORCHESTRATION_GRAPH,
@@ -143,6 +144,7 @@ export interface DaemonServerOptions {
     query: string,
     limit: number,
     environment?: Record<string, string>,
+    codexAppServerArgs?: string[],
   ) => Promise<ResumableConversation[]>;
 }
 
@@ -282,6 +284,9 @@ export async function createDaemonServer(
     }
     if (conn.protocolVersion >= 10 && conn.device?.allowShell) {
       capabilities.push(CAPABILITY_AGENT_ACCOUNTS);
+    }
+    if (conn.protocolVersion >= 12 && conn.device?.allowShell) {
+      capabilities.push(CAPABILITY_AGENT_API_PROFILES);
     }
     if (conn.protocolVersion >= 9) capabilities.push(CAPABILITY_SUBAGENT_HISTORY);
     if (conn.protocolVersion >= 7) capabilities.push(CAPABILITY_ORCHESTRATION_SNAPSHOT);
@@ -613,6 +618,7 @@ export async function createDaemonServer(
             msg.query,
             msg.limit ?? 20,
             account?.environment,
+            account?.codexAppServerArgs,
           );
           send(conn, {
             type: "conversation.results",
@@ -643,26 +649,38 @@ export async function createDaemonServer(
         return;
       }
       case "agent.account.create":
+      case "agent.account.api.create":
+      case "agent.account.api.configure":
       case "agent.account.rename":
       case "agent.account.default":
       case "agent.account.login":
       case "agent.account.credential.set":
       case "agent.account.logout":
       case "agent.account.delete": {
-        const action =
-          msg.type === "agent.account.create"
-            ? "create"
-            : msg.type === "agent.account.rename"
-              ? "rename"
-              : msg.type === "agent.account.default"
-                ? "default"
-                : msg.type === "agent.account.login"
-                  ? "login"
-                  : msg.type === "agent.account.credential.set"
-                    ? "credential"
-                    : msg.type === "agent.account.logout"
-                      ? "logout"
-                      : "delete";
+        if (
+          conn.protocolVersion < 12 &&
+          (msg.type === "agent.account.api.create" || msg.type === "agent.account.api.configure")
+        ) {
+          send(conn, {
+            type: "error",
+            code: "bad_message",
+            message: "当前协商协议不支持第三方 API Profile",
+          });
+          return;
+        }
+        const action = (() => {
+          switch (msg.type) {
+            case "agent.account.create": return "create" as const;
+            case "agent.account.api.create": return "api_create" as const;
+            case "agent.account.api.configure": return "api_configure" as const;
+            case "agent.account.rename": return "rename" as const;
+            case "agent.account.default": return "default" as const;
+            case "agent.account.login": return "login" as const;
+            case "agent.account.credential.set": return "credential" as const;
+            case "agent.account.logout": return "logout" as const;
+            case "agent.account.delete": return "delete" as const;
+          }
+        })();
         if (!device.allowShell) {
           send(conn, {
             type: "agent.accounts.result",
@@ -679,6 +697,20 @@ export async function createDaemonServer(
           switch (msg.type) {
             case "agent.account.create":
               accounts.create(msg.agent, msg.name);
+              break;
+            case "agent.account.api.create":
+              await accounts.createApi(msg.agent, msg.name, {
+                baseUrl: msg.baseUrl,
+                model: msg.model,
+                apiKey: msg.apiKey,
+              });
+              break;
+            case "agent.account.api.configure":
+              await accounts.configureApi(msg.accountId, {
+                baseUrl: msg.baseUrl,
+                model: msg.model,
+                apiKey: msg.apiKey,
+              });
               break;
             case "agent.account.rename":
               accounts.rename(msg.accountId, msg.name);

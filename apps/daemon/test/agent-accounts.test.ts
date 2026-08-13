@@ -188,6 +188,108 @@ describe("Code Agent 账号隔离", () => {
     await restoredManager.disposeAll();
   });
 
+  it("第三方 API Profile 为 Claude/Codex 注入独立端点、模型和凭据", async () => {
+    const home = tempHome();
+    const credentialStore = new MemoryCredentialStore();
+    const accounts = new AgentAccountManager(home, signedInRunner([]), credentialStore);
+    const codexKey = "codex-third-party-key";
+    const claudeKey = "claude-third-party-key";
+    const codex = await accounts.createApi("codex", "公司网关", {
+      baseUrl: "https://openai-gateway.example.com/v1/",
+      model: "acme-coder",
+      apiKey: codexKey,
+    });
+    const claude = await accounts.createApi("claude", "Claude 网关", {
+      baseUrl: "https://anthropic-gateway.example.com/v1",
+      model: "acme-claude",
+      apiKey: claudeKey,
+    });
+
+    expect(codex.apiProfile).toEqual({
+      provider: "openai_compatible",
+      baseUrl: "https://openai-gateway.example.com/v1",
+      model: "acme-coder",
+    });
+    expect(codex.environment).toMatchObject({
+      OPENAI_API_KEY: codexKey,
+      OPENAI_BASE_URL: "",
+      CODEX_HOME: path.join(home, "agent-accounts", "codex", codex.id),
+    });
+    expect(codex.codexAppServerArgs).toEqual(expect.arrayContaining([
+      'model_provider="prospero"',
+      'model="acme-coder"',
+      'model_providers.prospero.base_url="https://openai-gateway.example.com/v1"',
+      'model_providers.prospero.wire_api="responses"',
+    ]));
+    expect(claude.apiProfile).toEqual({
+      provider: "anthropic_compatible",
+      baseUrl: "https://anthropic-gateway.example.com/v1",
+      model: "acme-claude",
+    });
+    expect(claude.environment).toMatchObject({
+      ANTHROPIC_API_KEY: claudeKey,
+      ANTHROPIC_BASE_URL: "https://anthropic-gateway.example.com/v1",
+      CLAUDE_CODE_API_BASE_URL: "https://anthropic-gateway.example.com/v1",
+      ANTHROPIC_MODEL: "acme-claude",
+      CLAUDE_CODE_OAUTH_TOKEN: "",
+      CLAUDE_CONFIG_DIR: path.join(home, "agent-accounts", "claude", claude.id),
+    });
+    expect(codex.environment["CODEX_HOME"]).not.toBe(claude.environment["CLAUDE_CONFIG_DIR"]);
+
+    const disk = readFileSync(path.join(home, "agent-accounts.json"), "utf8");
+    expect(disk).toContain("openai-gateway.example.com");
+    expect(disk).not.toContain(codexKey);
+    expect(disk).not.toContain(claudeKey);
+
+    await accounts.configureApi(codex.id, {
+      baseUrl: "https://replacement.example.com/v1",
+      model: "replacement-coder",
+      apiKey: "replacement-key",
+    });
+    const configured = accounts.resolve(codex.id, "codex");
+    expect(configured.environment["OPENAI_API_KEY"]).toBe("replacement-key");
+    expect(configured.codexAppServerArgs).toEqual(expect.arrayContaining([
+      'model="replacement-coder"',
+      'model_providers.prospero.base_url="https://replacement.example.com/v1"',
+    ]));
+
+    const contexts: AdapterContext[] = [];
+    const sessions = new SessionManager({
+      home,
+      accountResolver: (accountId, agent) => accounts.resolve(accountId, agent),
+      adapterFactory: () => new EnvAdapter(contexts),
+    });
+    await sessions.create({
+      agent: "codex",
+      accountId: codex.id,
+      kind: "structured",
+      cwd: home,
+      cols: 80,
+      rows: 24,
+      allowShell: false,
+    });
+    expect(contexts[0]?.codexAppServerArgs).toEqual(configured.codexAppServerArgs);
+    await sessions.disposeAll();
+
+    await accounts.logout(codex.id);
+    expect(accounts.resolve(codex.id, "codex").environment["OPENAI_API_KEY"]).toBe("");
+  });
+
+  it("第三方 API Profile 拒绝会将密钥发送到非本机 HTTP 或 URL 查询参数的地址", async () => {
+    const home = tempHome();
+    const accounts = new AgentAccountManager(home, signedInRunner([]), new MemoryCredentialStore());
+    await expect(accounts.createApi("codex", "不安全", {
+      baseUrl: "http://gateway.example.com/v1",
+      model: "test-model",
+      apiKey: "key",
+    })).rejects.toMatchObject({ code: "account_invalid" } satisfies Partial<AgentAccountError>);
+    await expect(accounts.createApi("claude", "含查询", {
+      baseUrl: "https://gateway.example.com/v1?token=do-not-store",
+      model: "test-model",
+      apiKey: "key",
+    })).rejects.toMatchObject({ code: "account_invalid" } satisfies Partial<AgentAccountError>);
+  });
+
   it("活动会话阻止删除，结束后才注销并移除隔离目录", async () => {
     const home = tempHome();
     const calls: Array<{ file: string; args: string[]; env: Record<string, string> }> = [];
