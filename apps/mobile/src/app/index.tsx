@@ -83,7 +83,13 @@ export default function HostsScreen() {
           // contentInsetAdjustmentBehavior,而这些屏幕上方还有状态条/筛选条。
           // 强行开启会给内容加上大幅内边距,把列表整个推出可视区(实测白屏)。
           headerRight: () => (
-            <Pressable onPress={() => router.push("/pair")} hitSlop={8}>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="扫码配对"
+              accessibilityHint="打开相机扫描 Mac 上的配对二维码"
+              onPress={() => router.push("/pair")}
+              style={styles.headerButton}
+            >
               <Icon name="qrcode.viewfinder" size={21} color={color.accent} />
             </Pressable>
           ),
@@ -126,7 +132,7 @@ export default function HostsScreen() {
           ]}
           ListFooterComponent={
             hosts.length > 0 ? (
-              <Text style={styles.swipeHint}>左滑可编辑连接地址或删除配对</Text>
+              <Text style={styles.swipeHint}>左滑或点“更多”可编辑连接地址或删除配对</Text>
             ) : null
           }
           renderItem={({ item, index }) => {
@@ -147,12 +153,14 @@ export default function HostsScreen() {
                 <SwipeRow
                   actions={[
                     {
+                      id: "edit-host",
                       label: "编辑",
                       symbol: "desktopcomputer",
                       color: "#3a6ea5",
                       onPress: () => router.push(`/host/${item.id}/edit`),
                     },
                     {
+                      id: "delete-host",
                       label: "删除",
                       symbol: "trash",
                       color: "#e5534b",
@@ -209,6 +217,7 @@ const styles = StyleSheet.create({
   cardBody: { flex: 1, gap: 3 },
   cardTitle: { ...font.body, fontSize: 16 },
   cardSub: font.sub,
+  headerButton: { width: 44, height: 44, alignItems: "center", justifyContent: "center" },
   swipeHint: { ...font.meta, textAlign: "center", paddingVertical: space.lg },
   emptyWrap: { flex: 1, alignItems: "center", justifyContent: "center", padding: space.xl, gap: space.md },
   emptyTitle: { ...font.title, textAlign: "center" },
