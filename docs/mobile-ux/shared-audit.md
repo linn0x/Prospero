@@ -8,7 +8,7 @@ SH-01 / SH-02 / SH-03 的实现提交为 `bdd6568`，SH-04 / SH-05 为 `4d04190`
 
 iOS 的两个全新模拟器在 generic Simulator release app 启动后都是纯黑窗口；Android 只完成 API 33 空态启动，API 35/Fold 无法建立，且“不要保留活动”下进入配对页后为空。故这里不把任何共享项标为完整模拟器或真机通过。Gate `gate_4ca9584cb748` 已决议“接受模拟器验收并记录真机待办”，仅接受已列出的有限证据。VoiceOver、TalkBack、真实相机、OEM IME、跨平台离线/重连 E2E 与真机网络环境仍是待办。详见 [优化 Backlog](optimization-backlog.md#2026-08-13-t5-构建与模拟器终验未通过gate-已决)。
 
-## 2026-08-13 T5 复验（失败，未交付）
+## 2026-08-13 T5 复验（验收失败已收口）
 
 最终 `HEAD` 再次通过 24 个 Vitest 文件 / 148 个测试、TypeScript、Expo lint 和终端 HTML 生成；它们继续支持 SH-01–07 的实现状态，但不替代设备 E2E。Android API 33/35、iPhone SE 3 和 iPad 10 都能启动 release App 到未配对首页，不能使共享会话行为通过。
 
@@ -17,7 +17,7 @@ iOS 的两个全新模拟器在 generic Simulator release app 启动后都是纯
 - SH-06：无历史附件断网恢复的实际重试。
 - SH-07：VoiceOver / TalkBack 未执行。
 
-iPhone SE 3 最大辅助字号下发生文字溢出和按钮不可见；这虽不是 SH 项直接交互，仍足以令本轮双端模拟器验收失败。当前 task Gate 只能由协调者创建，worker 的拒绝和请求见 `msg_09361c8a4868`；详见 [优化 Backlog 的本轮复验记录](optimization-backlog.md#2026-08-13-t5-复验失败未交付)。
+iPhone SE 3 最大辅助字号下发生文字溢出和按钮不可见；这虽不是 SH 项直接交互，仍足以令本轮双端模拟器验收失败。协调者确认复用已决 Gate `gate_4ca9584cb748`（“接受模拟器验收并记录真机待办”）；详见 [优化 Backlog 的本轮复验记录](optimization-backlog.md#2026-08-13-t5-复验验收失败已收口)。
 
 实现建议以 Expo SDK 57 为基线，尤其是 [ImagePicker](https://docs.expo.dev/versions/v57.0.0/sdk/imagepicker/) 与 [app 配置](https://docs.expo.dev/versions/v57.0.0/config/app/) 文档。
 
