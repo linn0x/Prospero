@@ -15,13 +15,9 @@ Prospero 是面向 Coding Agent 的本地优先控制中枢。Claude Code、Code
 
 ## 为什么叫 Prospero？
 
-**Prospero** 源自莎士比亚《暴风雨》中的魔法师。他召唤精灵、分派使命，也始终掌握全局与
-最后的决定。
-
-今天的 Coding Agents 就像能力各异的数字精灵——快速、强大，也需要清晰的目标、边界与协调。
-这个名字代表 Prospero 的产品理念：
-
-> **你定义目标，Agent 负责执行；你看见过程，也保留最终决定权。**
+> “Spirits, which by mine art I have from their confines called to enact my present fancies.”
+>
+> — Prospero, [*The Tempest*, Act IV, Scene I](https://www.folger.edu/explore/shakespeares-works/the-tempest/read/4/1/)
 
 ## 一块控制面，接住整个 Agent 工作流
 
