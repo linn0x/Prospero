@@ -99,9 +99,12 @@
     post({ kind: "input", data: bytesToB64(te.encode(d)) });
   });
 
+  // 首次尺寸必须等原生层发来受控字号后再计算。否则 ready 之后的默认 12px fit
+  // 可能先触发 attach，随后 Dynamic Type 才改变列数，造成短暂错配。
+  let fontReady = false;
   let fitTimer = null;
   function doFit() {
-    if (fitTimer) return;
+    if (!fontReady || fitTimer) return;
     fitTimer = setTimeout(() => {
       fitTimer = null;
       try { fit.fit(); } catch (e) {}
@@ -152,6 +155,7 @@
       doFit();
     } else if (m.kind === "font") {
       term.options.fontSize = m.size;
+      fontReady = true;
       doFit();
     } else if (m.kind === "focus") {
       term.focus();
@@ -239,7 +243,6 @@
   })();
   window.addEventListener("load", () => {
     post({ kind: "ready", renderer });
-    doFit();
   });
 </script>
 </body>
