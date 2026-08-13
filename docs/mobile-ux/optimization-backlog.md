@@ -57,6 +57,34 @@
 
 物理设备当前不可用。Prospero Gate `gate_4ca9584cb748` 已决议为“接受模拟器验收并记录真机待办”。该决议只接受本节列出的自动化和有限模拟器证据、保留真机清单；不覆盖本轮 iOS 纯黑首屏及 Android API 35/Fold 无法建立所造成的完整模拟器矩阵阻断，也不得声称真机或完整设备验收通过。真机待办准确包括 VoiceOver、TalkBack、真实相机、OEM IME、Android 13/15 的三键与手势导航、Android 15 predictive back、折叠铰链、iOS 权限/Settings 回返、Dynamic Type 重启和终端字号复位。
 
+## 2026-08-13 T5 复验（失败，未交付）
+
+本节为 `task_d38edc8fb66f` 的实际终验记录，优先于上一节旧模拟器结论。实现提交不变：SH-01/02/03=`bdd6568`，SH-04/05/AND-04=`4d04190`，SH-06=`e8414b5`，SH-07/IOS-02/IOS-03/AND-02/03/05=`f9821a2`，IOS-01/AND-01=`9f13be9`，IOS-04=`278f169`。没有一项可写成真机通过；本轮还发现可复现的 iOS 最大辅助字号布局失败。
+
+| 检查 | 本轮结果 |
+| --- | --- |
+| 自动化 | `npm test -w @prospero/mobile`：24 个 Vitest 文件 / 148 个测试通过；TypeScript、Expo lint、终端 HTML 生成均为退出码 0，生成后移动端无文件漂移。 |
+| Android 构建 | `npm run build:android -w @prospero/mobile` 成功完成 clean prebuild / `assembleRelease`（888 actionable tasks）；`apps/mobile/build/apk/prospero-release.apk` 为 334,884,366 bytes，`apksigner verify --verbose` v2 签名通过。Manifest 含 `enableOnBackInvokedCallback="true"` 和 `adjustResize`。 |
+| Android API 33 | 临时 Pixel 5 可启动 release 未配对首页；三键、手势 overlay 实际切换；相机首次与永久拒绝均显示退化页。记录并恢复 `navigation_mode=2`、`always_finish_activities=null`。无已配对会话，故 ImagePicker 返回、草稿/附件恢复、Git IME、会话 predictive back 未验。 |
+| Android API 35 Fold | 临时 Pixel Fold 在 2208×1840 主显示器启动，并报告 1080×2092 辅显示器；没有文件/编排会话，故无 separating hinge / `verticalPanes` 证据。配对页边缘返回注入最终到 Launcher，不能计 predictive-back 通过。 |
+| iOS 构建 | `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` 的 clean prebuild / CocoaPods、无签名 generic Simulator Release build 均为 `BUILD SUCCEEDED`。 |
+| iOS SE 3 / iPad 10 | 两台均启动 release 未配对首页。SE 3 逐档设置并重启 12 个 Dynamic Type 档位；`accessibility-extra-extra-extra-large` 时首页标题、说明和命令块溢出/裁切，配对按钮不可见，判为失败。没有已配对会话，IOS-01 权限/Settings、会话 44 pt、终端 custom 字号跨重启/复位未验。 |
+
+| 项 | 最终设备结论 |
+| --- | --- |
+| SH-01 / SH-02 / SH-03 | 自动化实现通过；离线、重连、终端三入口 E2E 未验。 |
+| SH-04 / SH-05 / AND-04 | 自动化实现通过；无已配对 host，Gate 深链和 Fold 铰链面板未验。 |
+| SH-06 | 自动化实现通过；历史附件断网恢复未验。 |
+| SH-07 / IOS-02 / AND-03 | 自动化实现通过；VoiceOver / TalkBack 未验。 |
+| IOS-01 / AND-01 | 自动化实现通过；会话 ImagePicker、Settings 回返、Activity 回收后恢复未验。 |
+| IOS-03 | 代码命中框测试通过；SE 3 最大辅助字号首页布局失败，列出会话控件未能量测。 |
+| IOS-04 | 映射/持久化/复位单测通过；终端运行时 custom 跨重启和复位未验。 |
+| AND-02 / AND-05 | 配置/计算测试通过；Git IME 和 predictive-back 编辑确认未验。 |
+
+临时 `ProsperoT5_API33_d38edc8fb66f`、`ProsperoT5_API35_Fold_d38edc8fb66f`、iPhone SE 3、iPad 10 与其 App 数据均已删除；未创建、输出或提交临时配对凭证，现有 `FundWatch_API_35` 未被修改。本 worker 依要求尝试为当前 task 创建 Gate，但 CLI 以“只有此 Run 的协调者会话可以改动任务图”拒绝；已用 `msg_09361c8a4868` 请求协调者创建问题“是否接受模拟器验收并保留真机清单”、选项“接受模拟器验收并记录真机待办”与“连接真机后继续”的 Gate。旧 Gate `gate_4ca9584cb748` 不能把本轮失败或未验路径改写为通过。
+
+本任务因 iOS 最大辅助字号布局失败、会话级双端验收未完成和当前任务 Gate 尚未由协调者创建而失败。即使接受有限模拟器证据，仍须真机验证 VoiceOver、TalkBack、真实相机、OEM IME、Android 13/15 导航与 Git IME、predictive-back 编辑确认、真实折叠铰链、iOS 权限/Settings 回返、SE 3 44 pt 会话控件、终端字号跨重启/复位与跨平台离线恢复 E2E。
+
 ## M1 · 可靠投递与连接恢复
 
 归属：共享 TypeScript（`connection.ts`、会话路由）。依赖：无协议破坏性变更；如要显示 daemon 接收确认，可后续协商协议。测试：Vitest 覆盖队列边界与状态机；E2E 注入离线、握手失败和恢复。

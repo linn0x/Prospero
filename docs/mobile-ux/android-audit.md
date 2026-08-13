@@ -8,6 +8,16 @@
 
 只完成了 API 33 临时 Pixel 5 AVD 的 release APK 启动，空态首页显示正常。测试前记录到临时 AVD 的 `navigation_mode=0`、`always_finish_activities=1`，并在测试后恢复为这两个原值。进入配对页后画面为空，因而在“不要保留活动”下相册/相机返回、草稿/附件恢复、IME、三键/手势以及 predictive back 均没有可接受的运行时证据。API 35 临时 Fold AVD 因本机 SDK 映像根目录不一致且重装下载停滞未能建立；折叠布局未验。TalkBack、真实相机、OEM IME 和全部真机检查仍未执行。Gate `gate_4ca9584cb748` 已决议“接受模拟器验收并记录真机待办”，但不改变上述缺口；不得将任一 Android 项记为设备或真机通过；详细矩阵见 [优化 Backlog](optimization-backlog.md#2026-08-13-t5-构建与模拟器终验未通过gate-已决)。
 
+## 2026-08-13 T5 复验（失败，未交付）
+
+本轮 clean CNG / release 为 `npm run build:android -w @prospero/mobile`，`assembleRelease` 成功；APK 为 334,884,366 bytes，v2 签名校验通过。临时 API 33 Pixel 5 与 API 35 Pixel Fold 都在结束时删除，原有 `FundWatch_API_35` 未被打开或修改。
+
+- API 33 启动 release 未配对首页；三键与手势系统 overlay 均实际切换；配对相机的首次和永久拒绝均回到可见退化页。测试前记录 `navigation_mode=2`、`always_finish_activities=null`，测试后恢复。开启“不要保留活动”但没有已配对会话，故 ImagePicker 相册/相机返回、草稿/附件恢复与 Git IME 未验。
+- API 35 Fold 启动到 2208×1840 主显示器，且报告 1080×2092 辅显示器；未进入文件/编排页，不能证明 separating hinge / `verticalPanes`。配对页的边缘返回注入最终到 Launcher，不能作为 predictive back 或编辑确认通过证据。
+- AND-01、AND-02、AND-04、AND-05 仍仅有实现/自动化证据；AND-03 没有 TalkBack 证据。真实相机、OEM IME、Android 13/15 真机导航与折叠铰链全未验。
+
+本 worker 创建当前 task Gate 的请求被 CLI 拒绝（仅协调者可改任务图），已用 `msg_09361c8a4868` 转交。完整状态与风险见 [优化 Backlog 的本轮复验记录](optimization-backlog.md#2026-08-13-t5-复验失败未交付)。
+
 ## AND-01 · ImagePicker 返回期间进程回收会同时丢失选择结果和聊天草稿
 
 - 优先级：P1
