@@ -3,8 +3,6 @@ import {
   ActivityIndicator,
   Alert,
   FlatList,
-  KeyboardAvoidingView,
-  Platform,
   Pressable,
   RefreshControl,
   StyleSheet,
@@ -15,6 +13,7 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Stack, useLocalSearchParams } from "expo-router";
 import * as Haptics from "expo-haptics";
+import { KeyboardAvoidingView } from "react-native-keyboard-controller";
 import type { GitFile } from "@prospero/protocol";
 import { DismissKey } from "@/components/DismissKey";
 import { DiffView } from "@/components/DiffView";
@@ -22,6 +21,7 @@ import { Icon } from "@/components/Icon";
 import { SwipeRow, type SwipeAction } from "@/components/SwipeRow";
 import { toast } from "@/components/Toast";
 import { useAdaptiveLayout } from "@/lib/adaptive-layout";
+import { getGitCommitBarPadding } from "@/lib/git-layout";
 import { useHostConnection } from "@/lib/use-host-connection";
 
 /**
@@ -168,19 +168,28 @@ export default function GitScreen(): React.ReactElement {
     adaptiveLayout.width - filePaneWidth - StyleSheet.hairlineWidth;
   const splitGap =
     adaptiveLayout.verticalPanes?.gap ?? StyleSheet.hairlineWidth;
+  const commitBarPadding = getGitCommitBarPadding(insets);
 
   return (
     <KeyboardAvoidingView
       style={styles.screen}
-      behavior={Platform.OS === "ios" ? "padding" : undefined}
-      keyboardVerticalOffset={Platform.OS === "ios" ? 88 : 0}
+      behavior="padding"
+      automaticOffset
     >
       <Stack.Screen
         options={{
           title: branch ?? "源代码管理",
           headerBackTitle: "",
           headerRight: () => (
-            <Pressable onPress={() => void refresh()} hitSlop={8} disabled={loading}>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={loading ? "正在刷新 Git 状态" : "刷新 Git 状态"}
+              accessibilityHint={loading ? "刷新进行中" : "读取当前工作区状态"}
+              accessibilityState={{ busy: loading, disabled: loading }}
+              onPress={() => void refresh()}
+              disabled={loading}
+              style={styles.headerButton}
+            >
               <Icon name="arrow.clockwise" size={18} color={loading ? "#3a3a44" : "#7aa2f7"} />
             </Pressable>
           ),
@@ -212,7 +221,7 @@ export default function GitScreen(): React.ReactElement {
             keyboardDismissMode="interactive"
             keyboardShouldPersistTaps="handled"
             keyExtractor={(f) => f.path}
-            contentContainerStyle={{ paddingBottom: insets.bottom + 8 }}
+            contentContainerStyle={{ paddingBottom: 8 }}
             refreshControl={
               <RefreshControl refreshing={loading} onRefresh={() => void refresh()} tintColor="#7aa2f7" />
             }
@@ -223,6 +232,7 @@ export default function GitScreen(): React.ReactElement {
               const isStaged = item.index !== " " && item.index !== "?";
               const actions: SwipeAction[] = [
                 {
+                  id: "toggle-stage",
                   label: isStaged ? "取消暂存" : "暂存",
                   symbol: isStaged ? "arrow.clockwise" : "checkmark.circle.fill",
                   color: isStaged ? "#5a5a66" : "#3a6ea5",
@@ -232,6 +242,7 @@ export default function GitScreen(): React.ReactElement {
               // 未跟踪文件没有"改动"可丢弃,git restore 也处理不了它
               if (!item.untracked) {
                 actions.push({
+                  id: "discard-change",
                   label: "丢弃",
                   symbol: "trash",
                   color: "#e5534b",
@@ -298,7 +309,7 @@ export default function GitScreen(): React.ReactElement {
             </View>
           ) : null}
 
-          <View style={styles.commitBar}>
+          <View style={[styles.commitBar, commitBarPadding]}>
             <DismissKey visible={focused} />
             <TextInput
               style={styles.commitInput}
@@ -398,11 +409,11 @@ const styles = StyleSheet.create({
   diffTitle: { color: "#8a8a96", fontSize: 12, flex: 1 },
   close: { color: "#7aa2f7", fontSize: 13 },
   diffLoading: { paddingVertical: 24 },
+  headerButton: { width: 44, height: 44, alignItems: "center", justifyContent: "center" },
   commitBar: {
     flexDirection: "row",
     alignItems: "flex-end",
     gap: 8,
-    padding: 10,
     borderTopWidth: StyleSheet.hairlineWidth,
     borderTopColor: "#26262e",
   },

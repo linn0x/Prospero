@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -24,6 +24,7 @@ import { Icon } from "@/components/Icon";
 import { PromptDialog } from "@/components/PromptDialog";
 import { SwipeRow, type SwipeAction } from "@/components/SwipeRow";
 import { primaryPaneWidth, useAdaptiveLayout } from "@/lib/adaptive-layout";
+import { getEditorExitPlan, resolveEditorExitConfirmation } from "@/lib/editor-exit";
 import { validateFileName } from "@/lib/file-names";
 import { MONOSPACE_FONT } from "@/lib/theme";
 import { useHostConnection } from "@/lib/use-host-connection";
@@ -71,6 +72,7 @@ export default function FilesScreen(): React.ReactElement {
   const [saving, setSaving] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [namePrompt, setNamePrompt] = useState<NamePrompt | null>(null);
+  const editorExitPendingRef = useRef(false);
 
   const load = useCallback(
     async (path: string) => {
@@ -104,14 +106,27 @@ export default function FilesScreen(): React.ReactElement {
 
   const leaveEditor = useCallback((): void => {
     if (!editing) return;
-    if (editing.text === editing.original) {
+    const plan = getEditorExitPlan({
+      dirty: editing.text !== editing.original,
+      confirmationPending: editorExitPendingRef.current,
+    });
+    if (plan === "ignore") return;
+    if (plan === "exit") {
       setEditing(null);
       return;
     }
+    editorExitPendingRef.current = true;
+    const resolveConfirmation = (choice: "cancel" | "discard"): void => {
+      editorExitPendingRef.current = false;
+      if (resolveEditorExitConfirmation(choice) === "exit") setEditing(null);
+    };
     Alert.alert("放弃修改?", "未保存的改动会丢失。", [
-      { text: "继续编辑", style: "cancel" },
-      { text: "放弃", style: "destructive", onPress: () => setEditing(null) },
-    ]);
+      { text: "继续编辑", style: "cancel", onPress: () => resolveConfirmation("cancel") },
+      { text: "放弃", style: "destructive", onPress: () => resolveConfirmation("discard") },
+    ], {
+      cancelable: true,
+      onDismiss: () => { editorExitPendingRef.current = false; },
+    });
   }, [editing]);
 
   // 必须使用 expo-router 导出的导航对象；SDK 57 内置了自己的 React Navigation，
@@ -392,6 +407,7 @@ export default function FilesScreen(): React.ReactElement {
           const actions: SwipeAction[] = [];
           if (item.kind === "file") {
             actions.push({
+              id: "download-file",
               label: "下载",
               symbol: "arrow.up",
               color: "#3a6ea5",
@@ -399,12 +415,14 @@ export default function FilesScreen(): React.ReactElement {
             });
           }
           actions.push({
+            id: "rename-entry",
             label: "重命名",
             symbol: "doc.on.doc",
             color: "#5a5a66",
             onPress: () => promptRename(item),
           });
           actions.push({
+            id: "delete-entry",
             label: "删除",
             symbol: "trash",
             color: "#e5534b",
@@ -442,7 +460,7 @@ export default function FilesScreen(): React.ReactElement {
             return actions.length > 0 ? <SwipeRow actions={actions}>{row}</SwipeRow> : row;
           }}
         />
-        <Text style={styles.hint}>左滑可下载 / 重命名 / 删除 · 右上角新建文件夹或上传</Text>
+      <Text style={styles.hint}>左滑或点“更多”可下载 / 重命名 / 删除 · 右上角新建文件夹或上传</Text>
       </View>
       <PromptDialog
         visible={namePrompt !== null}
