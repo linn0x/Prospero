@@ -87,6 +87,7 @@ const CATCHUP_MS = 250;
 const PING_MS = 15_000;
 const MANUAL_ORCHESTRATION_METHODS = new Set([
   "run.create",
+  "run.complete",
   "run.delete",
   "task.create",
   "task.cancel",
@@ -304,9 +305,34 @@ export async function createDaemonServer(
     return capabilities;
   }
 
+  /**
+   * 协调者的一轮已经结束、任务图也完全落定时，修复旧协调者遗漏的 Run 完成动作。
+   * worker 的 session completed 仍绝不等同于 task done；这里只汇总已经显式交付的 Task。
+   */
+  function completeSettledCoordinatorRuns(): number {
+    const completedCoordinators = new Set(
+      manager.list()
+        .filter((session) => session.kind === "structured" && session.status === "completed")
+        .map((session) => session.id),
+    );
+    let completed = 0;
+    for (const run of orchestrationStore.listRuns()) {
+      if (
+        run.status !== "active" ||
+        run.coordinatorSessionId === null ||
+        !completedCoordinators.has(run.coordinatorSessionId)
+      ) {
+        continue;
+      }
+      if (orchestrationStore.completeRunIfSettled(run.id)) completed += 1;
+    }
+    return completed;
+  }
+
   /** 手机上的状态只读快照来自同一个 store，绝不在 WS 层维护镜像。 */
   function sendOrchestrationSnapshot(conn: Conn): void {
     if (conn.protocolVersion < 7) return;
+    completeSettledCoordinatorRuns();
     const state = orchestrationStore.snapshot();
     send(conn, {
       type: "orchestration.snapshot",
@@ -333,6 +359,7 @@ export async function createDaemonServer(
       objective,
       "请先调查并拆分有明确交付物的任务；需要并行执行时，用 prospero task / worker 命令派发。",
       "Worker 只能通过 prospero task done 或 task fail 显式交付；遇到需要人决定的事，用 prospero gate create。",
+      `所有任务验收完毕且没有待处理 Gate 后，必须执行 prospero run complete --id ${runId}。`,
     ].join("\n\n");
   }
 
@@ -395,8 +422,9 @@ export async function createDaemonServer(
       );
       if (settled) {
         automationService.kick(settled.task.runId);
-        broadcastOrchestrationSnapshot();
       }
+      const completedRuns = completeSettledCoordinatorRuns();
+      if (settled || completedRuns > 0) broadcastOrchestrationSnapshot();
     }
     for (const conn of conns) {
       if (conn.device) send(conn, { type: "session.state", session });
@@ -1996,6 +2024,7 @@ export async function createDaemonServer(
   // 否则壳会先看到一份"零会话"的快照。
   const restoredPty = manager.restoreFromTmux();
   const restoredStructured = await manager.restoreStructured();
+  completeSettledCoordinatorRuns();
   statusFile.start(port);
   automationService.resumePersisted();
 

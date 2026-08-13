@@ -51,6 +51,26 @@ describe("Run 与 Task", () => {
     store.setTaskDeps(next.id, [task.id]);
     expect(store.getRun(runId).graphRevision).toBe(3);
   });
+
+  it("只在任务、派发和 Gate 都落定后完成 Run，并可修复遗漏的完成动作", () => {
+    const { store, runId } = seed();
+    const task = store.createTask({ runId, title: "A", spec: "做 A" });
+    expect(store.completeRunIfSettled(runId)).toBeNull();
+    expect(() => store.completeRun(runId)).toThrow(/仍是 pending/);
+
+    const dispatch = store.createDispatch({ taskId: task.id, sessionId: "worker" });
+    store.setTaskStatus(task.id, "done", "已验收");
+    expect(() => store.completeRun(runId)).toThrow(/仍在运行/);
+    store.setDispatchState(dispatch.id, "succeeded", "已验收");
+
+    const gate = store.createGate({ runId, question: "是否发布？" });
+    expect(store.completeRunIfSettled(runId)).toBeNull();
+    store.resolveGate(gate.id, "发布");
+
+    expect(store.completeRunIfSettled(runId)).toMatchObject({ status: "completed" });
+    expect(store.completeRunIfSettled(runId)).toBeNull();
+    expect(store.completeRun(runId)).toMatchObject({ status: "completed" });
+  });
 });
 
 describe("原子任务图", () => {

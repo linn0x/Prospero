@@ -66,6 +66,13 @@ run
     coordinatorSessionId: optionalSession(),
   })));
 run.command("list").action(action("run.list", () => ({})));
+run
+  .command("complete")
+  .requiredOption("--id <id>", "Run ID")
+  .action(action("run.complete", (opts) => ({
+    runId: requireText(opts["id"], "--id"),
+    actorSessionId: optionalSession(),
+  })));
 
 const task = program.command("task").description("Task 管理与交付");
 task

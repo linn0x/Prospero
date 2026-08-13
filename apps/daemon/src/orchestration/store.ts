@@ -53,6 +53,7 @@ export type OrchestrationErrorCode =
   | "revision_conflict"
   | "task_not_editable"
   | "run_not_deletable"
+  | "run_not_completable"
   | "operation_conflict";
 
 export interface GraphNodeInput {
@@ -179,6 +180,71 @@ export class OrchestrationStore {
     Object.assign(run, patch, { updatedAt: Date.now() });
     this.schedulePersist();
     return run;
+  }
+
+  /**
+   * 显式结束 Run。Task 的完成仍只认 worker/协调者的显式交付；这里仅在整张图
+   * 已经没有未决工作时汇总 Run 生命周期，避免 UI 永远停在 active。
+   */
+  completeRun(runId: string): Run {
+    const run = this.getRun(runId);
+    if (run.status === "completed") return run;
+    if (run.status !== "active") {
+      throw new OrchestrationError(
+        `Run ${runId} 当前是 ${run.status}，不能标记完成`,
+        "run_not_completable",
+      );
+    }
+
+    const unfinished = this.listTasks(runId).find(
+      (task) => task.status !== "done" && task.status !== "cancelled",
+    );
+    if (unfinished) {
+      throw new OrchestrationError(
+        `任务 ${unfinished.id} 仍是 ${unfinished.status}，Run 不能标记完成`,
+        "run_not_completable",
+      );
+    }
+    const activeDispatch = this.listDispatches(runId).find(
+      (dispatch) => dispatch.state === "starting" || dispatch.state === "running",
+    );
+    if (activeDispatch) {
+      throw new OrchestrationError(
+        `worker ${activeDispatch.sessionId} 仍在运行，Run 不能标记完成`,
+        "run_not_completable",
+      );
+    }
+    const pendingGate = this.listGates(runId, "pending")[0];
+    if (pendingGate) {
+      throw new OrchestrationError(
+        `Gate ${pendingGate.id} 仍待处理，Run 不能标记完成`,
+        "run_not_completable",
+      );
+    }
+
+    run.status = "completed";
+    run.updatedAt = Date.now();
+    this.schedulePersist();
+    return run;
+  }
+
+  /**
+   * 协调者会话结束后的保守修复路径。空任务图不自动猜完成；有过明确任务且全部
+   * 进入终态时，才把遗漏的 Run 完成动作补上。
+   */
+  completeRunIfSettled(runId: string): Run | null {
+    const run = this.getRun(runId);
+    if (run.status !== "active") return null;
+    if (this.listTasks(runId).length === 0) return null;
+    try {
+      return this.completeRun(runId);
+    } catch (error) {
+      if (
+        error instanceof OrchestrationError &&
+        error.code === "run_not_completable"
+      ) return null;
+      throw error;
+    }
   }
 
   setRunAutomation(runId: string, automation: RunAutomation | null): Run {

@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type {
+  OrchestrationDispatch,
   OrchestrationGate,
   OrchestrationRun,
   OrchestrationSnapshot,
+  OrchestrationTask,
 } from "@prospero/protocol";
 import {
   coordinatorRunsBySession,
+  goalSessionGroups,
   groupOrchestrationRuns,
   goalRunOverview,
   orchestrationConnectionNotice,
@@ -128,6 +131,48 @@ describe("orchestration overview", () => {
       "active-old",
       "abandoned-new",
       "completed-old",
+    ]);
+  });
+
+  it("groups worker session attempts under the selected Goal coordinator", () => {
+    const historical = run("historical", 100, "completed");
+    historical.coordinatorSessionId = "coordinator";
+    const active = run("active", 20);
+    active.coordinatorSessionId = "coordinator";
+    const task: OrchestrationTask = {
+      id: "task-active",
+      runId: active.id,
+      title: "实现修复",
+      spec: "",
+      deps: [],
+      parentId: null,
+      status: "done",
+      result: "完成",
+      createdAt: 2,
+      updatedAt: 3,
+    };
+    const dispatch = (sessionId: string, startedAt: number): OrchestrationDispatch => ({
+      id: `dispatch-${sessionId}-${String(startedAt)}`,
+      runId: active.id,
+      taskId: task.id,
+      sessionId,
+      worktreePath: null,
+      state: "succeeded",
+      startedAt,
+      settledAt: startedAt + 1,
+      outcome: "完成",
+    });
+    const groups = goalSessionGroups({
+      runs: [historical, active],
+      tasks: [task],
+      dispatches: [dispatch("worker-new", 30), dispatch("worker-old", 10)],
+      gates: [],
+    });
+
+    expect(groups.get("coordinator")).toMatchObject({ run: { id: "active" } });
+    expect(groups.get("coordinator")?.workers.map((worker) => worker.sessionId)).toEqual([
+      "worker-old",
+      "worker-new",
     ]);
   });
 });
