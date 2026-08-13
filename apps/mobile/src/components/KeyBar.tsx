@@ -3,6 +3,7 @@ import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import * as Clipboard from "expo-clipboard";
 import * as Haptics from "expo-haptics";
 import { toast } from "@/components/Toast";
+import { deliveryFailureText, type DeliveryResult } from "@/lib/outbound-queue";
 import { ctrlCode } from "@/lib/keys";
 
 interface KeyDef {
@@ -56,16 +57,27 @@ export function KeyBar({
   onFontSize,
   onScrollBottom,
   onDismissKeyboard,
+  enabled = true,
+  disabledMessage = "主机未连接；终端输入已冻结。",
+  onRetry,
 }: {
-  onKey: (seq: string) => void;
+  onKey: (seq: string) => DeliveryResult;
   onFontSize?: (delta: number) => void;
   onScrollBottom?: () => void;
   onDismissKeyboard?: () => void;
+  /** Shell 字节不可安全重放，断线时所有会投递的按键必须冻结。 */
+  enabled?: boolean;
+  disabledMessage?: string;
+  onRetry?: () => void;
 }) {
   const [ctrl, setCtrl] = useState(false);
 
   const send = (seq: string): void => {
-    onKey(seq);
+    const result = onKey(seq);
+    if (!result.accepted) {
+      toast(deliveryFailureText(result));
+      return;
+    }
     void Haptics.selectionAsync();
   };
 
@@ -75,15 +87,39 @@ export function KeyBar({
       toast("剪贴板是空的");
       return;
     }
-    // PTY 对大块粘贴有死锁报告,daemon 侧已分片写入;这里只管发
-    onKey(text);
+    // PTY 对大块粘贴有死锁报告,daemon 侧已分片写入;这里只管发。
+    // 输入在断线期间绝不排队，重连后执行旧 shell 字节比丢弃更危险。
+    const result = onKey(text);
+    if (!result.accepted) {
+      toast(deliveryFailureText(result));
+      return;
+    }
     void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     toast(`已粘贴 ${String(text.length)} 字`);
   };
 
   return (
     <View style={styles.bar}>
-      {ctrl && (
+      {!enabled && (
+        <View
+          style={styles.offlineNotice}
+          accessible
+          accessibilityLiveRegion="polite"
+          accessibilityLabel={disabledMessage}
+        >
+          <Text style={styles.offlineText}>{disabledMessage}</Text>
+          {onRetry && (
+            <Pressable
+              onPress={onRetry}
+              accessibilityRole="button"
+              accessibilityLabel="重新连接主机"
+            >
+              <Text style={styles.offlineRetry}>重试</Text>
+            </Pressable>
+          )}
+        </View>
+      )}
+      {enabled && ctrl && (
         <View style={styles.ctrlTray}>
           <Text style={styles.ctrlLabel}>Ctrl +</Text>
           <ScrollView
@@ -96,9 +132,8 @@ export function KeyBar({
               <Pressable
                 key={letter}
                 onPress={() => {
-                  onKey(ctrlCode(letter));
+                  send(ctrlCode(letter));
                   setCtrl(false);
-                  void Haptics.selectionAsync();
                 }}
                 style={({ pressed }) => [styles.ctrlKey, pressed && styles.keyPressed]}
                 accessibilityRole="keyboardkey"
@@ -121,10 +156,12 @@ export function KeyBar({
             setCtrl((v) => !v);
             void Haptics.selectionAsync();
           }}
+          disabled={!enabled}
           style={({ pressed }) => [
             styles.key,
             styles.modifier,
             ctrl && styles.modifierOn,
+            !enabled && styles.keyDisabled,
             pressed && styles.keyPressed,
           ]}
           accessibilityRole="button"
@@ -141,7 +178,8 @@ export function KeyBar({
               send(k.seq);
               setCtrl(false);
             }}
-            style={({ pressed }) => [styles.key, pressed && styles.keyPressed]}
+            disabled={!enabled}
+            style={({ pressed }) => [styles.key, !enabled && styles.keyDisabled, pressed && styles.keyPressed]}
             accessibilityRole="keyboardkey"
             accessibilityLabel={k.label}
           >
@@ -155,7 +193,8 @@ export function KeyBar({
           <Pressable
             key={k.label}
             onPress={() => send(k.seq)}
-            style={({ pressed }) => [styles.key, pressed && styles.keyPressed]}
+            disabled={!enabled}
+            style={({ pressed }) => [styles.key, !enabled && styles.keyDisabled, pressed && styles.keyPressed]}
             accessibilityRole="keyboardkey"
             accessibilityLabel={k.label}
           >
@@ -167,7 +206,8 @@ export function KeyBar({
 
         <Pressable
           onPress={() => void paste()}
-          style={({ pressed }) => [styles.key, pressed && styles.keyPressed]}
+          disabled={!enabled}
+          style={({ pressed }) => [styles.key, !enabled && styles.keyDisabled, pressed && styles.keyPressed]}
           accessibilityRole="button"
           accessibilityLabel="粘贴剪贴板内容"
         >
@@ -236,6 +276,7 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   keyPressed: { backgroundColor: "#3A3A45", transform: [{ scale: 0.96 }] },
+  keyDisabled: { opacity: 0.38 },
   modifier: { borderWidth: 1, borderColor: "#3A3A45" },
   modifierOn: { backgroundColor: "#3A5BA8", borderColor: "#7AA2F7" },
   keyText: { color: "#E8E8EE", fontSize: 13, fontVariant: ["tabular-nums"] },
@@ -260,4 +301,16 @@ const styles = StyleSheet.create({
     backgroundColor: "#24242B",
   },
   ctrlKeyText: { color: "#E8E8EE", fontSize: 12, fontWeight: "600" },
+  offlineNotice: {
+    minHeight: 38,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    paddingHorizontal: 12,
+    backgroundColor: "#3a2e17",
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: "#655022",
+  },
+  offlineText: { flex: 1, color: "#EAC77C", fontSize: 11.5, lineHeight: 16 },
+  offlineRetry: { color: "#fff", fontSize: 12, fontWeight: "700" },
 });

@@ -62,7 +62,15 @@ import {
 import { diagnose, type AttemptResult, type Diagnosis } from "./connect-diagnosis";
 import { Emitter } from "./emitter";
 import { rememberGoodAddr, type StoredHost } from "./hosts";
+import {
+  BoundedQueue,
+  acceptedDelivery,
+  rejectedDelivery,
+  type DeliveryResult,
+} from "./outbound-queue";
 import { useApp } from "./store";
+
+export type { DeliveryResult } from "./outbound-queue";
 
 const APP_VERSION = "0.0.12";
 const ATTEMPT_TIMEOUT_MS = 6000;
@@ -72,7 +80,7 @@ const BACKOFF_MAX = 8000;
 const HEARTBEAT_MS = 10_000;
 const SILENCE_LIMIT_MS = 35_000;
 /** 断线期间最多排队多少条待发消息 */
-const MAX_QUEUE = 50;
+export const MAX_OFFLINE_QUEUE = 50;
 const CLIENT_PLATFORM = Platform.OS === "android" ? "android" : "ios";
 
 interface Won {
@@ -117,7 +125,7 @@ export class HostConnection {
   /** null 表示旧 daemon 未声明能力；空 Set 表示新 daemon 明确拒绝所有可选能力。 */
   private advertisedCapabilities: Set<string> | null = null;
   /** 断线期间排队的消息,重连后按序补发 */
-  private queue: C2SMessage[] = [];
+  private queue = new BoundedQueue<C2SMessage>(MAX_OFFLINE_QUEUE);
 
   constructor(
     readonly host: StoredHost,
@@ -205,7 +213,7 @@ export class HostConnection {
     this.ws = null;
     this.channel = null;
     this.activeAddr = null;
-    this.queue = [];
+    this.queue.clear();
     useApp.getState().patchRuntime(this.host.id, { status: "idle", activeAddr: null });
   }
 
@@ -919,24 +927,39 @@ export class HostConnection {
   /**
    * @param queueable 断线时是否排队补发。
    * 用户意图(发消息、审批)值得排队;终端按键与 ack 过期即无意义,丢弃。
+   *
+   * 所有调用方都能区分“已写入连接”“已在本机排队”与“没有被接收”，不能再把
+   * `void` 当作发送成功。特别是队列满时，编辑器据此保留草稿而不是静默清空。
    */
-  send(msg: C2SMessage, queueable = false): boolean {
+  send(msg: C2SMessage, queueable = false): DeliveryResult {
     if (this.isConnected) {
-      this.ws!.send(this.channel!.seal(msg));
-      return true;
+      try {
+        this.ws!.send(this.channel!.seal(msg));
+        return acceptedDelivery("sent");
+      } catch {
+        // 发送抛错时无法证明远端没有收到，绝不擅自补发 shell 或聊天字节。
+        // close 会让正常的连接恢复逻辑接管后续操作。
+        this.ws?.close();
+        return rejectedDelivery("transport_error");
+      }
     }
-    if (queueable && this.queue.length < MAX_QUEUE) {
-      this.queue.push(msg);
-      return true;
-    }
-    return false;
+    if (!queueable) return rejectedDelivery("offline");
+    return this.queue.offer(msg)
+      ? acceptedDelivery("queued")
+      : rejectedDelivery("queue_full");
   }
 
   private flushQueue(): void {
-    if (this.queue.length === 0) return;
-    const pending = this.queue;
-    this.queue = [];
-    for (const m of pending) this.send(m);
+    while (this.queue.length > 0 && this.isConnected) {
+      const message = this.queue.take();
+      if (!message) return;
+      const result = this.send(message);
+      if (!result.accepted) {
+        // 连接刚好在 flush 中断开：将未确认的头部放回，守住 FIFO 与不丢失语义。
+        this.queue.putBackFront(message);
+        return;
+      }
+    }
   }
 
   createSession(
@@ -954,8 +977,8 @@ export class HostConnection {
       /** 账号环境与 cwd 独立；多个账号可指向同一个项目。 */
       accountId?: string;
     },
-  ): void {
-    this.send(
+  ): DeliveryResult {
+    return this.send(
       {
         type: "session.create",
         agent,
@@ -1007,7 +1030,7 @@ export class HostConnection {
       type: "orchestration.run.create",
       objective,
       operationId: randomUUID(),
-    }, true);
+    }, true).accepted;
   }
 
   createOrchestrationGraph(input: {
@@ -1022,7 +1045,7 @@ export class HostConnection {
       objective: input.objective,
       nodes: input.nodes,
       operationId: input.operationId,
-    }, true);
+    }, true).accepted;
   }
 
   applyOrchestrationGraph(input: {
@@ -1042,7 +1065,7 @@ export class HostConnection {
       ...(input.deleteTaskIds && input.deleteTaskIds.length > 0
         ? { deleteTaskIds: input.deleteTaskIds }
         : {}),
-    }, true);
+    }, true).accepted;
   }
 
   deleteOrchestrationRun(runId: string): boolean {
@@ -1051,7 +1074,7 @@ export class HostConnection {
       type: "orchestration.run.delete",
       runId,
       operationId: randomUUID(),
-    }, true);
+    }, true).accepted;
   }
 
   createOrchestrationTask(input: {
@@ -1070,7 +1093,7 @@ export class HostConnection {
       operationId: randomUUID(),
       ...(input.deps && input.deps.length > 0 ? { deps: input.deps } : {}),
       ...(input.parentId ? { parentId: input.parentId } : {}),
-    }, true);
+    }, true).accepted;
   }
 
   cancelOrchestrationTask(taskId: string, reason?: string): boolean {
@@ -1080,7 +1103,7 @@ export class HostConnection {
       taskId,
       operationId: randomUUID(),
       ...(reason ? { reason } : {}),
-    }, true);
+    }, true).accepted;
   }
 
   retryOrchestrationTask(taskId: string): boolean {
@@ -1089,7 +1112,7 @@ export class HostConnection {
       type: "orchestration.task.retry",
       taskId,
       operationId: randomUUID(),
-    }, true);
+    }, true).accepted;
   }
 
   startOrchestrationWorker(input: {
@@ -1112,7 +1135,7 @@ export class HostConnection {
       operationId: randomUUID(),
       ...(input.kind ? { kind: input.kind } : {}),
       ...(input.approvalPolicy ? { approvalPolicy: input.approvalPolicy } : {}),
-    }, true);
+    }, true).accepted;
   }
 
   stopOrchestrationWorker(taskId: string, reason?: string): boolean {
@@ -1122,7 +1145,7 @@ export class HostConnection {
       taskId,
       operationId: randomUUID(),
       ...(reason ? { reason } : {}),
-    }, true);
+    }, true).accepted;
   }
 
   startOrchestrationAutomation(input: {
@@ -1143,7 +1166,7 @@ export class HostConnection {
       approvalPolicy: input.approvalPolicy,
       workspace: input.workspace,
       cwd: input.cwd,
-    }, true);
+    }, true).accepted;
   }
 
   pauseOrchestrationAutomation(runId: string): boolean {
@@ -1152,7 +1175,7 @@ export class HostConnection {
       type: "orchestration.automation.pause",
       operationId: randomUUID(),
       runId,
-    }, true);
+    }, true).accepted;
   }
 
   /** 拉取某次工具调用的完整输出(卡片展开时) */
@@ -1181,8 +1204,8 @@ export class HostConnection {
     );
   }
 
-  respondPermission(sid: string, reqId: string, reply: PermissionReply): void {
-    this.send({ type: "permission.respond", sid, reqId, reply }, true);
+  respondPermission(sid: string, reqId: string, reply: PermissionReply): DeliveryResult {
+    return this.send({ type: "permission.respond", sid, reqId, reply }, true);
   }
 
   respondQuestion(
@@ -1190,8 +1213,8 @@ export class HostConnection {
     reqId: string,
     answers: AgentQuestionAnswer[],
     cancelled = false,
-  ): void {
-    this.send(
+  ): DeliveryResult {
+    return this.send(
       {
         type: "question.respond",
         sid,
@@ -1203,8 +1226,8 @@ export class HostConnection {
     );
   }
 
-  sendToSubagent(sid: string, subagentId: string, text: string): void {
-    this.send({ type: "subagent.send", sid, subagentId, text }, true);
+  sendToSubagent(sid: string, subagentId: string, text: string): DeliveryResult {
+    return this.send({ type: "subagent.send", sid, subagentId, text }, true);
   }
 
   /** 子 Agent 详情按需读取 Codex/后端原生历史；旧 daemon 继续用父快照降级。 */
@@ -1223,12 +1246,12 @@ export class HostConnection {
     return result.events;
   }
 
-  inputB64(sid: string, dataB64: string): void {
-    this.send({ type: "term.input", sid, dataB64 });
+  inputB64(sid: string, dataB64: string): DeliveryResult {
+    return this.send({ type: "term.input", sid, dataB64 });
   }
 
-  inputText(sid: string, text: string): void {
-    this.inputB64(sid, toB64(utf8Encode(text)));
+  inputText(sid: string, text: string): DeliveryResult {
+    return this.inputB64(sid, toB64(utf8Encode(text)));
   }
 
   resize(sid: string, cols: number, rows: number): void {
@@ -1239,8 +1262,8 @@ export class HostConnection {
     this.send({ type: "term.ack", sid, seq });
   }
 
-  interrupt(sid: string): void {
-    this.send({ type: "session.interrupt", sid }, true);
+  interrupt(sid: string): DeliveryResult {
+    return this.send({ type: "session.interrupt", sid }, true);
   }
 
   chatSend(
@@ -1248,8 +1271,8 @@ export class HostConnection {
     text: string,
     attachments?: Attachment[],
     delivery: ChatDelivery = "auto",
-  ): void {
-    this.send(
+  ): DeliveryResult {
+    return this.send(
       {
         type: "chat.send",
         sid,
@@ -1261,12 +1284,12 @@ export class HostConnection {
     );
   }
 
-  removeQueuedMessage(sid: string, queueId: string): void {
-    this.send({ type: "chat.queue.remove", sid, queueId }, true);
+  removeQueuedMessage(sid: string, queueId: string): DeliveryResult {
+    return this.send({ type: "chat.queue.remove", sid, queueId }, true);
   }
 
-  guideQueuedMessage(sid: string, queueId: string): void {
-    this.send({ type: "chat.queue.guide", sid, queueId }, true);
+  guideQueuedMessage(sid: string, queueId: string): DeliveryResult {
+    return this.send({ type: "chat.queue.guide", sid, queueId }, true);
   }
 
   /** 输入补全是瞬时请求；断线时不排队，避免重连后弹出过期候选。 */
@@ -1350,12 +1373,12 @@ export class HostConnection {
     );
   }
 
-  setApprovalPolicy(sid: string, policy: ApprovalPolicy): void {
-    this.send({ type: "approval.policy.set", sid, policy }, true);
+  setApprovalPolicy(sid: string, policy: ApprovalPolicy): DeliveryResult {
+    return this.send({ type: "approval.policy.set", sid, policy }, true);
   }
 
-  kill(sid: string): void {
-    this.send({ type: "session.kill", sid }, true);
+  kill(sid: string): DeliveryResult {
+    return this.send({ type: "session.kill", sid }, true);
   }
 }
 
