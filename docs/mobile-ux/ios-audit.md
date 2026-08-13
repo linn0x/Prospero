@@ -8,6 +8,16 @@
 
 本轮仅使用新建的 iPhone SE（第三代）与 iPad（第十代）模拟器。release app 在两机安装、启动后均停在纯黑窗口，未出现首屏；因此首次/永久权限拒绝、Settings 返回、小屏 44 pt 命中框、Dynamic Type 各档以及自定义字号跨重启/复位均**未验**，没有把这些行为写成通过。VoiceOver、真实相机及一切真机检查也未执行。Gate `gate_4ca9584cb748` 已决议“接受模拟器验收并记录真机待办”，但不将这些阻断改写为通过；详细构建、清理与矩阵见 [优化 Backlog](optimization-backlog.md#2026-08-13-t5-构建与模拟器终验未通过gate-已决)。
 
+## 2026-08-13 T5 复验（失败，未交付）
+
+以 `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` 运行的 clean iOS prebuild / CocoaPods 及无签名 generic iOS Simulator Release build 均为 `BUILD SUCCEEDED`。新建 iPhone SE（第三代）与 iPad（第十代）后，两台 release App 都能到未配对首页；旧记录中的纯黑首屏本次未复现。
+
+- SE 3：依次设置并重启 12 个 Simulator Dynamic Type 档位。最大 `accessibility-extra-extra-extra-large` 时，首页标题、说明、命令块溢出/裁切，配对按钮不可见；这是实测布局失败。
+- iPad 10：未配对首页启动正常，不代表已配对会话、附件或终端页通过。
+- IOS-01 图片权限首次/永久拒绝和 Settings 回返、IOS-03 会话控件的 44 pt 量测、IOS-04 终端初始字号 / custom 跨重启 / 跟随系统复位都需已配对会话，本轮没有可安全使用的配对凭证，故未验。VoiceOver 与真实相机也未验。
+
+临时 iOS 模拟器和 App 数据已删除，未生成、记录或提交配对串。当前 task Gate 仅协调者可创建，worker 拒绝结果已通过 `msg_09361c8a4868` 上报。详见 [优化 Backlog 的本轮复验记录](optimization-backlog.md#2026-08-13-t5-复验失败未交付)。
+
 ## IOS-01 · 图片权限拒绝后没有解释或恢复入口
 
 - 优先级：P1
