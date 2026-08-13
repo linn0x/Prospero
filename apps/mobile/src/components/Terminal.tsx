@@ -17,6 +17,8 @@ const TERMINAL_SOURCE = { html: TERMINAL_HTML } as const;
 interface Props {
   conn: HostConnection;
   sid: string;
+  /** 由原生层控制；WebView 就绪和后续变化都会收到 font 消息。 */
+  fontSize: number;
   /** 捏合缩放后回报,让 A+/A− 的基准与终端保持一致 */
   onFontSize?: (size: number) => void;
   /** 洪峰时的渲染帧率与吞吐;Release 构建里 console 是哑的,只能走 UI */
@@ -28,7 +30,6 @@ interface Props {
 }
 
 export interface TerminalHandle {
-  setFontSize(size: number): void;
   scrollToBottom(): void;
   /** 收起键盘 */
   blur(): void;
@@ -49,6 +50,7 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
   {
     conn,
     sid,
+    fontSize,
     onFontSize,
     onPerf,
     inputEnabled = true,
@@ -64,6 +66,7 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
   const queueRef = useRef<object[]>([]);
   const sizeRef = useRef<{ cols: number; rows: number } | null>(null);
   const ackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const fontSizeRef = useRef(fontSize);
 
   const batchRef = useRef<object[]>([]);
   const flushRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -101,6 +104,14 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
     conn.attach(sid, lastSeqRef.current > 0 ? lastSeqRef.current : undefined);
     attachedRef.current = true;
   }, [conn, sid]);
+
+  // font 不走 shell 输入通道，也不影响 attach；WebView 自己在收到 font 后 fit，
+  // 这样首次 resized/attach 已经使用正确字号。系统 Dynamic Type 变更则由受控 prop
+  // 触发同一条桥接消息，不重建 WebView 或 shell 会话。
+  useEffect(() => {
+    fontSizeRef.current = fontSize;
+    if (readyRef.current) rx({ kind: "font", size: fontSize });
+  }, [fontSize, rx]);
 
   useEffect(() => {
     const offSnap = conn.events.on("snapshot", (m) => {
@@ -144,6 +155,9 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
           readyRef.current = true;
           attachedRef.current = false;
           lastSeqRef.current = 0;
+          // term.html 在收到 font 后才允许首次 fit，因此它产生的 resized/attach
+          // 必然反映这一受控字号。字体消息排在重放输出之前，避免初始帧闪回默认值。
+          rx({ kind: "font", size: fontSizeRef.current });
           // 之前这里直接清空队列 —— 页面就绪前到达的消息被丢掉了。
           // 现在补发,后续的全量快照会覆盖它们,但丢弃从来不是对的默认。
           if (queueRef.current.length > 0) {
@@ -179,7 +193,6 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
   );
 
   useImperativeHandle(ref, () => ({
-    setFontSize: (size: number) => rx({ kind: "font", size }),
     scrollToBottom: () => rx({ kind: "scrollBottom" }),
     blur: () => rx({ kind: "blur" }),
   }), [rx]);

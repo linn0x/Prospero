@@ -5,6 +5,7 @@ import * as Haptics from "expo-haptics";
 import { toast } from "@/components/Toast";
 import { deliveryFailureText, type DeliveryResult } from "@/lib/outbound-queue";
 import { ctrlCode } from "@/lib/keys";
+import { MIN_TOUCH_TARGET, type TerminalFontPreference } from "@/lib/terminal-font-size";
 
 interface KeyDef {
   label: string;
@@ -55,6 +56,8 @@ const CTRL_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("");
 export function KeyBar({
   onKey,
   onFontSize,
+  onResetFontSize,
+  fontSizeMode = "system",
   onScrollBottom,
   onDismissKeyboard,
   enabled = true,
@@ -63,6 +66,9 @@ export function KeyBar({
 }: {
   onKey: (seq: string) => DeliveryResult;
   onFontSize?: (delta: number) => void;
+  /** 清除自定义档位，回到当前系统 Dynamic Type。 */
+  onResetFontSize?: () => void;
+  fontSizeMode?: TerminalFontPreference["mode"];
   onScrollBottom?: () => void;
   onDismissKeyboard?: () => void;
   /** Shell 字节不可安全重放，断线时所有会投递的按键必须冻结。 */
@@ -231,6 +237,27 @@ export function KeyBar({
             >
               <Text style={styles.keyText}>A+</Text>
             </Pressable>
+            {onResetFontSize && (
+              <Pressable
+                onPress={onResetFontSize}
+                style={({ pressed }) => [
+                  styles.key,
+                  styles.followSystemKey,
+                  fontSizeMode === "system" && styles.followSystemKeyActive,
+                  pressed && styles.keyPressed,
+                ]}
+                accessibilityRole="button"
+                accessibilityLabel={
+                  fontSizeMode === "custom"
+                    ? "将终端字号重置为跟随系统"
+                    : "终端字号已跟随系统"
+                }
+              >
+                <Text style={[styles.keyText, fontSizeMode === "system" && styles.followSystemKeyText]}>
+                  跟随系统
+                </Text>
+              </Pressable>
+            )}
           </>
         )}
         {onDismissKeyboard && (
@@ -266,12 +293,12 @@ const styles = StyleSheet.create({
   },
   content: { paddingHorizontal: 8, paddingVertical: 7, gap: 6, alignItems: "center" },
   key: {
-    minHeight: 36,
+    minWidth: MIN_TOUCH_TARGET,
+    minHeight: MIN_TOUCH_TARGET,
     backgroundColor: "#24242B",
     borderRadius: 9,
     paddingHorizontal: 12,
     paddingVertical: 7,
-    minWidth: 42,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -281,9 +308,12 @@ const styles = StyleSheet.create({
   modifierOn: { backgroundColor: "#3A5BA8", borderColor: "#7AA2F7" },
   keyText: { color: "#E8E8EE", fontSize: 13, fontVariant: ["tabular-nums"] },
   keyTextOn: { color: "#fff", fontWeight: "600" },
+  followSystemKey: { paddingHorizontal: 12 },
+  followSystemKeyActive: { backgroundColor: "#223354", borderWidth: 1, borderColor: "#3A5BA8" },
+  followSystemKeyText: { color: "#AFC8FF" },
   sep: { width: 1, alignSelf: "stretch", marginHorizontal: 3, backgroundColor: "#303038" },
   ctrlTray: {
-    minHeight: 42,
+    minHeight: MIN_TOUCH_TARGET,
     flexDirection: "row",
     alignItems: "center",
     paddingLeft: 12,
@@ -291,10 +321,10 @@ const styles = StyleSheet.create({
     borderBottomColor: "#26262D",
   },
   ctrlLabel: { color: "#7AA2F7", fontSize: 12, fontWeight: "600", marginRight: 6 },
-  ctrlContent: { gap: 5, paddingVertical: 6, paddingRight: 12 },
+  ctrlContent: { gap: 5, paddingVertical: 4, paddingRight: 12 },
   ctrlKey: {
-    width: 31,
-    height: 30,
+    width: MIN_TOUCH_TARGET,
+    height: MIN_TOUCH_TARGET,
     borderRadius: 8,
     alignItems: "center",
     justifyContent: "center",
