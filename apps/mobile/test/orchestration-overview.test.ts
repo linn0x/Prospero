@@ -6,6 +6,7 @@ import type {
 } from "@prospero/protocol";
 import {
   coordinatorRunsBySession,
+  groupOrchestrationRuns,
   goalRunOverview,
   orchestrationConnectionNotice,
   orchestrationRoute,
@@ -107,5 +108,26 @@ describe("orchestration overview", () => {
 
     expect(indexed.get("coordinator")?.id).toBe("active");
     expect(indexed.has("session-manual")).toBe(false);
+  });
+
+  it("separates active Runs from folded history and keeps each group newest first", () => {
+    const groups = groupOrchestrationRuns([
+      run("completed-old", 10, "completed"),
+      run("active-old", 20),
+      run("abandoned-new", 50, "abandoned"),
+      run("active-new", 40),
+    ]);
+
+    expect(groups.active.map((item) => item.id)).toEqual(["active-new", "active-old"]);
+    expect(groups.history.map((item) => item.id)).toEqual([
+      "abandoned-new",
+      "completed-old",
+    ]);
+    expect(groups.all.map((item) => item.id)).toEqual([
+      "active-new",
+      "active-old",
+      "abandoned-new",
+      "completed-old",
+    ]);
   });
 });
