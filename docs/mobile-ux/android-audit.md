@@ -2,6 +2,12 @@
 
 审计日期：2026-08-12。全部为静态证据；Android 13+、Android 15 edge-to-edge、折叠屏和 TalkBack 必须补真机验收。共享左滑无障碍问题的统一实现项为 [SH-07](shared-audit.md#sh-07--仅靠左滑的列表操作没有屏幕阅读器等价入口)，此处记录其 Android 影响以避免重复 backlog。
 
+## 2026-08-13 T5 验收增补（未通过）
+
+实现提交：AND-01 为 `9f13be9`；AND-02、AND-03、AND-05 为 `f9821a2`；AND-04 为 `4d04190`。自动化全部通过（24 个 Vitest 文件 / 148 个测试、TypeScript、lint、终端 HTML）；clean prebuild 与 signed release APK 构建通过，产物为 `apps/mobile/build/apk/prospero-release.apk`（319 MB）。
+
+只完成了 API 33 临时 Pixel 5 AVD 的 release APK 启动，空态首页显示正常。测试前记录到临时 AVD 的 `navigation_mode=0`、`always_finish_activities=1`，并在测试后恢复为这两个原值。进入配对页后画面为空，因而在“不要保留活动”下相册/相机返回、草稿/附件恢复、IME、三键/手势以及 predictive back 均没有可接受的运行时证据。API 35 临时 Fold AVD 因本机 SDK 映像根目录不一致且重装下载停滞未能建立；折叠布局未验。TalkBack、真实相机、OEM IME 和全部真机检查仍未执行。不得将任一 Android 项记为设备或真机通过；详细 Gate 和矩阵见 [优化 Backlog](optimization-backlog.md#2026-08-13-t5-构建与模拟器终验未通过gate-待决)。
+
 ## AND-01 · ImagePicker 返回期间进程回收会同时丢失选择结果和聊天草稿
 
 - 优先级：P1
