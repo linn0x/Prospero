@@ -33,6 +33,7 @@ function repo(): string {
   git("config", "user.email", "test@example.com");
   git("config", "user.name", "Test");
   git("config", "commit.gpgsign", "false");
+  git("config", "core.autocrlf", "false");
   writeFileSync(path.join(dir, ".gitignore"), "node_modules/\n");
   writeFileSync(path.join(dir, "README.md"), "# fixture\n");
   mkdirSync(path.join(dir, "apps", "mobile", "node_modules", "fixture"), { recursive: true });
@@ -96,7 +97,7 @@ describe("esaytree", () => {
     )).toBe("ok\n");
 
     const canonicalTarget = realpathSync(target);
-    expect((await listWorktrees(root)).some((worktree) => worktree.path === canonicalTarget)).toBe(true);
+    expect((await listWorktrees(root)).some((worktree) => realpathSync(worktree.path) === canonicalTarget)).toBe(true);
     await removeWorktree(root, target, { deleteBranch: true });
     expect(existsSync(target)).toBe(false);
     expect((await listWorktrees(root)).some((worktree) => worktree.path === canonicalTarget)).toBe(false);

@@ -20,7 +20,11 @@ const PREFIX = "prospero-";
 let cachedPath: string | null | undefined;
 
 /** tmux 可执行文件路径;没装则 null。结果缓存,每次会话创建都探一次没必要。 */
-export function tmuxPath(): string | null {
+export function tmuxPath(platform: NodeJS.Platform = process.platform): string | null {
+  if (platform === "win32") {
+    if (process.platform === "win32") cachedPath = null;
+    return null;
+  }
   if (cachedPath !== undefined) return cachedPath;
   for (const candidate of ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"]) {
     try {

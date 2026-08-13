@@ -32,7 +32,7 @@ const statusText: Record<AgentAccount["status"], string> = {
   signed_in: "已登录",
   signed_out: "未登录",
   unavailable: "CLI 未安装",
-  error: "状态未知",
+  error: "状态读取失败",
 };
 
 const statusColor: Record<AgentAccount["status"], string> = {
@@ -58,7 +58,7 @@ export default function AgentAccountsScreen() {
       return;
     }
     if (!conn.supportsAgentAccounts) {
-      setError("当前 Mac 端还不支持账号管理，请先升级并重启 Prospero daemon。");
+      setError("当前电脑端还不支持账号管理，请先升级并重启 Prospero daemon。");
       setLoading(false);
       return;
     }
@@ -158,7 +158,7 @@ export default function AgentAccountsScreen() {
     try {
       const result = await conn.loginAgentAccount(account.id);
       setAccounts(result.accounts);
-      if (!result.sessionId) throw new Error("Mac 没有返回登录终端");
+      if (!result.sessionId) throw new Error("电脑端没有返回登录终端");
       router.push(`/host/${hostId}/session/${result.sessionId}`);
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : String(failure));
@@ -225,7 +225,7 @@ export default function AgentAccountsScreen() {
             每个 Prospero 账号拥有独立的凭据、配置、原生会话历史和 MCP/插件状态；创建会话时仍可选择同一个项目目录。
           </Text>
           <Text style={styles.securityText}>
-            Codex 由官方 CLI 登录；Claude 独立令牌经配对加密通道写入 Mac 安全存储，不写进账号元数据或对话记录。
+            Codex 由官方 CLI 登录；Claude 独立令牌经配对加密通道写入电脑端安全存储，不写进账号元数据或对话记录。
           </Text>
         </View>
 
@@ -264,6 +264,7 @@ export default function AgentAccountsScreen() {
                         <Text style={styles.meta}>{statusText[account.status]}</Text>
                         {account.authMethod && <Text style={styles.meta}>· {account.authMethod}</Text>}
                       </View>
+                      {account.detail && <Text style={styles.environment}>{account.detail}</Text>}
                       <Text style={styles.environment}>
                         {account.managed ? "Prospero 独立环境" : "现有本机环境（兼容旧会话）"}
                         {account.activeSessions > 0 ? ` · ${String(account.activeSessions)} 个活动会话` : ""}
@@ -321,7 +322,7 @@ export default function AgentAccountsScreen() {
         message={
           editor?.kind === "create"
             ? editor.agent === "claude"
-              ? "创建后先生成令牌，再把令牌导入 Mac 的独立安全存储。"
+              ? "创建后先生成令牌，再把令牌导入电脑端的独立安全存储。"
               : "创建后会得到独立环境，下一步在官方 CLI 终端完成登录。"
             : editor?.kind === "credential"
               ? editor.credentialKind === "oauth_token"

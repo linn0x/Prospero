@@ -29,6 +29,7 @@ import type {
   SubagentInfo,
   SubagentStatus,
 } from "@prospero/protocol";
+import { programCommandFor } from "../agents.js";
 import { needsApproval } from "../approval-policy.js";
 import type { ResolvedSkill } from "../composer-context.js";
 import { DAEMON_VERSION } from "../version.js";
@@ -254,7 +255,8 @@ export class CodexAdapter implements AgentAdapter {
   ): Promise<void> {
     this.stderrTail = "";
     this.buf = "";
-    const proc = spawn("codex", ["app-server"], {
+    const command = programCommandFor("codex", ["app-server"]);
+    const proc = spawn(command.file, command.args, {
       stdio: ["pipe", "pipe", "pipe"],
       cwd,
       env: { ...process.env, ...environment },

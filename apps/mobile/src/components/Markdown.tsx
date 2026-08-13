@@ -191,7 +191,7 @@ const MarkdownImage = memo(function MarkdownImage({
       setUri(null);
       if (!reference || !loadProjectImage) {
         setLoading(false);
-        setError(reference ? "无法从 Mac 读取这张图片" : "不支持的图片地址");
+        setError(reference ? "无法从电脑读取这张图片" : "不支持的图片地址");
         return;
       }
       setLoading(true);
@@ -226,7 +226,7 @@ const MarkdownImage = memo(function MarkdownImage({
         {loading ? (
           <View style={styles.imagePlaceholder}>
             <ActivityIndicator color="#7aa2f7" />
-            <Text style={styles.imageStatus}>正在从 Mac 读取图片…</Text>
+        <Text style={styles.imageStatus}>正在从电脑读取图片…</Text>
           </View>
         ) : uri !== null && error === null ? (
           <Image

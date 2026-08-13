@@ -619,15 +619,15 @@ export default function OrchestrationScreen() {
           <View style={styles.heroCopy}>
             <Text style={styles.heroTitle}>画出依赖，再指定 Agent 执行</Text>
             <Text style={styles.heroDetail}>
-              可视化任务图会原子保存在 Mac；worker 只有显式交付才会完成任务。
+              可视化任务图会原子保存在电脑端；worker 只有显式交付才会完成任务。
             </Text>
           </View>
         </View>
 
         {runtime.status !== "connected" ? (
-          <Text style={styles.notice}>正在连接 {host?.name ?? "Mac"}…</Text>
+          <Text style={styles.notice}>正在连接 {host?.name ?? "电脑"}…</Text>
         ) : !conn?.supportsOrchestrationSnapshot ? (
-          <Text style={styles.notice}>Mac daemon 版本过旧，升级后现有配对会自动保留。</Text>
+          <Text style={styles.notice}>电脑端 daemon 版本过旧，升级后现有配对会自动保留。</Text>
         ) : null}
 
         {conn?.supportsOrchestrationSnapshot && !conn.supportsManualOrchestration && (
@@ -648,7 +648,7 @@ export default function OrchestrationScreen() {
                 setObjective(value);
               }}
               style={[styles.multilineInput, graphIsEditing && styles.readOnlyInput]}
-              placeholder="最终目标，例如：完成协议兼容并发布 iOS 与 Mac"
+                placeholder="最终目标，例如：完成协议兼容并发布移动端与桌面端"
               placeholderTextColor={color.textFaint}
               selectionColor={color.accent}
               multiline
@@ -1069,7 +1069,7 @@ export default function OrchestrationScreen() {
                       setWorkspacePath("");
                     }}
                     style={[styles.input, styles.cwdInput]}
-                    placeholder="Mac 上的项目完整路径"
+              placeholder="电脑上的项目完整路径"
                     placeholderTextColor={color.textFaint}
                     selectionColor={color.accent}
                     autoCapitalize="none"
@@ -1166,7 +1166,7 @@ export default function OrchestrationScreen() {
                       setWorkspacePath("");
                     }}
                     style={[styles.input, styles.cwdInput]}
-                    placeholder="Mac 上的项目完整路径"
+              placeholder="电脑上的项目完整路径"
                     placeholderTextColor={color.textFaint}
                     selectionColor={color.accent}
                     autoCapitalize="none"

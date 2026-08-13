@@ -22,7 +22,7 @@ export default function PairScreen() {
   const [manual, setManual] = useState("");
   const scannedRef = useRef(false);
   const { d } = useLocalSearchParams<{ d?: string }>();
-  // 扫描同网段的 prosperod:让用户确认"这台 Mac 确实在跑",再去扫码
+  // 扫描同网段的 prosperod:让用户确认这台电脑确实在线，再去扫码。
   const { hosts: discovered, scanning, unavailable, timedOut } = useDiscovery(true);
 
   const discoveryHint =
@@ -33,10 +33,10 @@ export default function PairScreen() {
       : unavailable
         ? "局域网发现不可用；仍可直接扫码或粘贴配对串"
         : timedOut
-          ? "未发现附近的 Mac；部分 Android ROM 会限制 mDNS，直接扫码不受影响"
+          ? "未发现附近的电脑；部分 Android ROM 会限制 mDNS，直接扫码不受影响"
           : scanning
-            ? "正在发现同一网络里的 Mac…也可以直接扫描配对码"
-            : "对准 Mac 终端里 prosperod pair 打印的二维码";
+            ? "正在发现同一网络里的电脑…也可以直接扫描配对码"
+            : "对准电脑终端里 prosperod pair 打印的二维码";
 
   const handle = useCallback(async (text: string): Promise<void> => {
     if (scannedRef.current) return;
@@ -73,7 +73,7 @@ export default function PairScreen() {
       style={styles.container}
       behavior={Platform.OS === "ios" ? "padding" : "height"}
     >
-      <Stack.Screen options={{ title: "配对 Mac" }} />
+      <Stack.Screen options={{ title: "配对电脑" }} />
       <View style={styles.cameraWrap}>
         {permission?.granted ? (
           <CameraView
@@ -119,7 +119,7 @@ export default function PairScreen() {
       </View>
       <Text style={[styles.note, { paddingBottom: Math.max(insets.bottom, 16) }]}>
         {Platform.OS === "ios"
-          ? "首次连接时 iOS 会请求「本地网络」权限，请允许，否则无法发现或连接 Mac。"
+          ? "首次连接时 iOS 会请求「本地网络」权限，请允许，否则无法发现或连接电脑。"
           : "Android 的 mDNS 发现可能受 ROM 或 VPN 限制；发现失败时直接扫码即可，配对与连接不依赖发现。"}
       </Text>
     </KeyboardAvoidingView>
