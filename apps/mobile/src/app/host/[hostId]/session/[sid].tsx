@@ -55,6 +55,8 @@ import { matchCommands } from "@/lib/slash-commands";
 import { setSessionArchived } from "@/lib/session-preferences";
 import { sortSessions } from "@/lib/store";
 import { useHostConnection } from "@/lib/use-host-connection";
+import { coordinatorRunsBySession } from "@/lib/orchestration-overview";
+import { useOrchestrationSnapshot } from "@/lib/use-orchestration-snapshot";
 import { deliveryFailureText } from "@/lib/outbound-queue";
 import { sessionLoadState } from "@/lib/session-load-state";
 import { appendVoiceTranscript } from "@/lib/voice-input";
@@ -320,6 +322,11 @@ export default function SessionScreen() {
   const completionSequence = useRef(0);
 
   const session = sid ? runtime.sessions[sid] : undefined;
+  const orchestration = useOrchestrationSnapshot(conn, runtime.status, 8_000);
+  const coordinatorRun = useMemo(
+    () => coordinatorRunsBySession(orchestration?.runs ?? []).get(sid) ?? null,
+    [orchestration, sid],
+  );
   const orderedSessions = useMemo(
     () => sortSessions(runtime.sessions),
     [runtime.sessions],
@@ -1175,14 +1182,17 @@ export default function SessionScreen() {
               </View>
             ) : (
               <>
-                <Icon name="bubble.left.and.text.bubble.right" size={14} color={color.text} />
-                <Text style={styles.modeText}>对话</Text>
+                <Icon
+                  name={coordinatorRun
+                    ? "point.3.connected.trianglepath.dotted"
+                    : "bubble.left.and.text.bubble.right"}
+                  size={14}
+                  color={coordinatorRun ? color.accent : color.text}
+                />
+                <Text style={[styles.modeText, coordinatorRun && styles.coordinatorModeText]}>
+                  {coordinatorRun ? "Goal 编排者" : "对话"}
+                </Text>
               </>
-            )}
-            {pending > 0 && (
-              <View style={styles.pendingBadge}>
-                <Text style={styles.pendingBadgeText}>{pending > 9 ? "9+" : pending}</Text>
-              </View>
             )}
           </View>
           {!isSubagent && agentControls && (
@@ -1887,6 +1897,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 8,
   },
   modeText: { color: color.text, fontSize: 13, fontWeight: "600" },
+  coordinatorModeText: { color: color.accent },
   subagentModeIdentity: {
     maxWidth: "82%",
     flexDirection: "row",
@@ -1924,16 +1935,6 @@ const styles = StyleSheet.create({
   subagentRailName: { flexShrink: 1, color: color.text, fontSize: 12, fontWeight: "700" },
   subagentRailState: { color: color.textFaint, fontSize: 9.5 },
   subagentRailStateActive: { color: color.accent },
-  pendingBadge: {
-    minWidth: 18,
-    height: 18,
-    paddingHorizontal: 4,
-    borderRadius: 9,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: color.danger,
-  },
-  pendingBadgeText: { color: "#fff", fontSize: 10, fontWeight: "700" },
   policyChip: {
     minWidth: MIN_TOUCH_TARGET,
     minHeight: MIN_TOUCH_TARGET,

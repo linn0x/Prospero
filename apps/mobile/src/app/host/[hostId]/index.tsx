@@ -37,7 +37,11 @@ import {
   setSessionArchived,
 } from "@/lib/session-preferences";
 import { groupSessionsByProject } from "@/lib/session-projects";
-import { goalRunOverview, orchestrationRoute } from "@/lib/orchestration-overview";
+import {
+  coordinatorRunsBySession,
+  goalRunOverview,
+  orchestrationRoute,
+} from "@/lib/orchestration-overview";
 import { sortSessions } from "@/lib/store";
 import { useHostConnection } from "@/lib/use-host-connection";
 import { useOrchestrationSnapshot } from "@/lib/use-orchestration-snapshot";
@@ -132,6 +136,10 @@ export default function HostScreen() {
   const insets = useSafeAreaInsets();
   const { width, height, verticalPanes } = useAdaptiveLayout();
   const orchestration = useOrchestrationSnapshot(conn, runtime.status, 8_000);
+  const coordinatorRuns = useMemo(
+    () => coordinatorRunsBySession(orchestration?.runs ?? []),
+    [orchestration],
+  );
   // 横屏手机、iPad、Android 平板用并列双栏；其余手机严格上下各占一半。
   const wideComposer =
     verticalPanes !== null || width >= 720 || (width >= 600 && width > height);
@@ -1342,6 +1350,7 @@ export default function HostScreen() {
                 <View style={styles.projectSessions}>
                   {project.sessions.map((session) => {
                     const done = session.status === "done" || session.status === "died";
+                    const coordinatorRun = coordinatorRuns.get(session.id);
                     // 断线时状态只代表上次连接，不能伪装成实时状态。
                     const stale = runtime.status !== "connected";
                     const actions: SwipeAction[] = [
@@ -1395,8 +1404,17 @@ export default function HostScreen() {
                               ]}
                             />
                             <Text style={styles.cardTitle} numberOfLines={1}>{session.title}</Text>
-                            <Text style={styles.kindTag}>
-                              {session.kind === "structured" ? "对话" : "终端"}
+                            <Text
+                              style={[
+                                styles.kindTag,
+                                coordinatorRun && styles.coordinatorTag,
+                              ]}
+                            >
+                              {coordinatorRun
+                                ? "Goal 编排者"
+                                : session.kind === "structured"
+                                  ? "对话"
+                                  : "终端"}
                             </Text>
                             <Text
                               style={[
@@ -2008,6 +2026,7 @@ const styles = StyleSheet.create({
     paddingVertical: 2,
     overflow: "hidden",
   },
+  coordinatorTag: { color: color.accent, backgroundColor: color.accentBg },
   cardStatus: { fontSize: 12, fontWeight: "600" },
   preview: { ...font.sub, color: color.textDim, lineHeight: 18 },
   cardSub: font.meta,
