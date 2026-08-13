@@ -22,6 +22,8 @@ export interface AdapterContext {
   env?: Record<string, string>;
   /** 只启动读取模型目录所需的最小后端，不创建原生对话。 */
   catalogOnly?: boolean;
+  /** 由隔离账号生成的 Codex app-server 配置覆盖，不来自用户输入命令行。 */
+  codexAppServerArgs?: string[];
   /** 当前审批策略;适配器据此决定是否绕过人工确认 */
   approvalPolicy?: () => ApprovalPolicy;
   /** 适配器产出一条归一化事件 */

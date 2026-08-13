@@ -15,10 +15,11 @@ export async function searchLocalConversations(
   query: string,
   requestedLimit = 20,
   environment?: Record<string, string>,
+  codexAppServerArgs?: string[],
 ): Promise<ResumableConversation[]> {
   const limit = Math.max(1, Math.min(50, requestedLimit));
   if (agent === "codex") {
-    return CodexAdapter.searchLocalConversations(query, limit, environment);
+    return CodexAdapter.searchLocalConversations(query, limit, environment, codexAppServerArgs);
   }
 
   if (environment?.["CLAUDE_CONFIG_DIR"]) {

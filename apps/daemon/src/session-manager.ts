@@ -487,6 +487,9 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
         "agent_unavailable",
       );
     }
+    if (input.agent === "codex" && account?.codexAppServerArgs) {
+      spec = { ...spec, args: [...spec.args, ...account.codexAppServerArgs] };
+    }
     const id = randomUUID();
     const info = this.spawnPty(
       id,
@@ -613,6 +616,9 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       await adapter.start({
         cwd: os.homedir(),
         ...(account ? { env: account.environment } : {}),
+        ...(account?.codexAppServerArgs
+          ? { codexAppServerArgs: account.codexAppServerArgs }
+          : {}),
         catalogOnly: true,
         approvalPolicy: () => "strict",
         emit: () => {},
@@ -651,6 +657,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       cwd,
       adapter: this.adapterFactory(agent, restored?.adapterState ?? initialAdapterState),
       environment: { ...(account?.environment ?? {}), ...this.sessionEnv(id) },
+      ...(account?.codexAppServerArgs ? { codexAppServerArgs: account.codexAppServerArgs } : {}),
       ...(account ? { accountId: account.id, accountName: account.name } : {}),
       ...(approvalPolicy !== undefined ? { approvalPolicy } : {}),
       ...(restored ? { restored } : {}),
