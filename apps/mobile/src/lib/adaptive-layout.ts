@@ -11,6 +11,7 @@ import {
 } from "@/lib/adaptive-layout-math";
 
 export {
+  primaryPaneWidth,
   verticalPaneLayout,
   windowWidthClass,
   type VerticalPaneLayout,
