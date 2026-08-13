@@ -2,6 +2,12 @@
 
 审计日期：2026-08-12。范围为 `apps/mobile` 的 TypeScript/React Native 源码；本轮没有真机、模拟器或网络故障注入实测。证据等级中“静态（代码链路）”表示可从源码确定执行结果，“静态（界面路径）”表示代码显示了可复现的 UI 缺口，仍应在发布前补设备验收。
 
+## 2026-08-13 T5 验收增补（自动化通过；设备结论未通过）
+
+SH-01 / SH-02 / SH-03 的实现提交为 `bdd6568`，SH-04 / SH-05 为 `4d04190`，SH-06 为 `e8414b5`，SH-07 为 `f9821a2`。`npm test -w @prospero/mobile`（24 文件 / 148 测试）、TypeScript、Expo lint 与终端 HTML 生成均通过且无生成漂移；这些只证明单元/静态行为，不能替代离线恢复、读屏或网络故障设备验收。
+
+iOS 的两个全新模拟器在 generic Simulator release app 启动后都是纯黑窗口；Android 只完成 API 33 空态启动，API 35/Fold 无法建立，且“不要保留活动”下进入配对页后为空。故这里不把任何共享项标为完整模拟器或真机通过。VoiceOver、TalkBack、真实相机、OEM IME、跨平台离线/重连 E2E 与真机网络环境仍是待办。详见 [优化 Backlog](optimization-backlog.md#2026-08-13-t5-构建与模拟器终验未通过gate-待决)。
+
 实现建议以 Expo SDK 57 为基线，尤其是 [ImagePicker](https://docs.expo.dev/versions/v57.0.0/sdk/imagepicker/) 与 [app 配置](https://docs.expo.dev/versions/v57.0.0/config/app/) 文档。
 
 ## SH-01 · 离线队列满时聊天草稿和图片被静默清空

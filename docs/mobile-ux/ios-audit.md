@@ -2,6 +2,12 @@
 
 审计日期：2026-08-12。全部为静态证据；需在 iPhone、iPad 和 VoiceOver 真机补验。共享问题（离线投递、Gate、历史图片、左滑操作）见 [shared-audit.md](shared-audit.md)，此文件只保留 iOS 特有或 iOS 上特别明显的项。
 
+## 2026-08-13 T5 验收增补（未通过）
+
+实现提交：IOS-01 为 `9f13be9`，IOS-02 / IOS-03 为 `f9821a2`，IOS-04 为 `278f169`。在 `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` 下，clean iOS prebuild、`pod install` 和无签名 generic iOS Simulator release build 均通过（`BUILD SUCCEEDED`）；移动端自动化共 24 个 Vitest 文件 / 148 个测试通过。
+
+本轮仅使用新建的 iPhone SE（第三代）与 iPad（第十代）模拟器。release app 在两机安装、启动后均停在纯黑窗口，未出现首屏；因此首次/永久权限拒绝、Settings 返回、小屏 44 pt 命中框、Dynamic Type 各档以及自定义字号跨重启/复位均**未验**，没有把这些行为写成通过。VoiceOver、真实相机及一切真机检查也未执行。详细构建、清理与 Gate 状态见 [优化 Backlog](optimization-backlog.md#2026-08-13-t5-构建与模拟器终验未通过gate-待决)。
+
 ## IOS-01 · 图片权限拒绝后没有解释或恢复入口
 
 - 优先级：P1

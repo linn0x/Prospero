@@ -21,6 +21,42 @@
 
 待完成的实现项：**SH-06、IOS-01、IOS-03、IOS-04、AND-01**。
 
+## 2026-08-13 T5 构建与模拟器终验（未通过，Gate 待决）
+
+此节是对上一节“待完成”陈述的更正：`9f13be9`、`e8414b5` 与 `278f169` 已补上 AND-01、SH-06 和 IOS-04；IOS-01 / IOS-03 的相应行为也随 `9f13be9` / `f9821a2` 落地。代码和单元测试可以核对为完成，但本轮不能把任一项写成“设备验收通过”。原因是 iOS 两台全新模拟器的无签名 generic Simulator release 包均停在纯黑界面，Android API 35 临时映像/AVD 又未能在本机 SDK 布局中建立；因此完整矩阵没有完成。
+
+### 自动化与构建证据
+
+| 检查 | 结果 | 证据 |
+| --- | --- | --- |
+| `npm test -w @prospero/mobile` | 通过 | 24 个 Vitest 文件、148 个测试。 |
+| `npx tsc --noEmit -p apps/mobile/tsconfig.json` | 通过 | 退出码 0。 |
+| `npm run lint -w @prospero/mobile` | 通过 | `expo lint` 退出码 0。 |
+| `npm run build:terminal -w @prospero/mobile` | 通过 | 生成 `terminal-html.ts` 后工作区无生成物漂移。 |
+| Android CNG / release | 通过 | `expo prebuild --clean` + `assembleRelease`，APK 为 `apps/mobile/build/apk/prospero-release.apk`（319 MB），已由 `apksigner verify` 校验。 |
+| iOS CNG / generic Simulator | 通过 | 指定 `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`；clean prebuild、`pod install`、无签名 `xcodebuild … generic/platform=iOS Simulator` 均为 `BUILD SUCCEEDED`。 |
+
+### 项目最终代码状态与设备证据
+
+| 项 | 实现提交 | 最终代码/自动化状态 | T5 模拟器状态 |
+| --- | --- | --- | --- |
+| SH-01 / SH-02 / SH-03 | `bdd6568` | 已实现；队列、冷启动状态机测试通过。 | 未做连接故障 E2E；非真机通过。 |
+| SH-04 / SH-05 / AND-04 | `4d04190` | 已实现；编排摘要和布局单测通过。 | Android API 35 / 折叠铰链未完成。 |
+| SH-06 | `e8414b5` | 已实现；历史附件重试测试通过。 | 未做断网后点按重试 E2E。 |
+| SH-07 / IOS-02 / AND-03 | `f9821a2` | 已实现；读屏动作映射和 Git inset 测试通过。 | VoiceOver / TalkBack 未验；不宣称读屏通过。 |
+| IOS-01 / AND-01 | `9f13be9` | 已实现；权限结果、pending picker、草稿隔离/过期测试通过。 | iOS 权限与 Settings 回返未完成；Android API 33 在“不要保留活动”下进入配对页后画面为空，未能完成相册/相机返回或恢复用例。 |
+| IOS-03 | `f9821a2` | 代码命中框调整已提交。 | iPhone SE 3 黑屏，未能量测 44 pt。 |
+| IOS-04 | `278f169` | Dynamic Type 映射、持久化覆盖和复位测试通过。 | iPhone SE 3 / iPad 黑屏，未能逐档重启观察。 |
+| AND-02 / AND-05 | `f9821a2` | Git 安全区计算和 predictive-back 配置测试通过。 | 仅 API 33 启动到主机空态；IME、三键/手势切换与 predictive back 未完成。 |
+
+### 已执行的临时模拟器操作
+
+- Android：新建 `ProsperoT5_API33_d38edc8fb66f`。该临时 AVD 启动并安装 release APK，空态首页可见；记录的 `navigation_mode=0` 与 `always_finish_activities=1` 在测试后已恢复为原值。点击配对后在“不要保留活动”环境得到空白画面，故停止，不将该路径计为通过。API 35 的临时 Fold AVD 未建立：本机的 command-line tools 将 API 33 映像安装到其自身根目录、却把既有 API 35 映像视为无效；重装 API 35 映像下载停滞后已中止。没有触碰已有 `FundWatch_API_35` 数据。
+- iOS：新建 iPhone SE（第三代）和 iPad（第十代）各一台，安装 generic Simulator release app；两者均显示纯黑应用窗口。该阻断先于权限、Settings、44 pt、Dynamic Type 和自定义字号复位验证。
+- 全部临时 AVD、iOS 模拟器和安装的临时 App 数据均已删除；本次未生成临时配对凭证，配对串没有写入日志或 Git。
+
+物理设备当前不可用。Prospero Gate `gate_4ca9584cb748` 处于 `pending`：**是否接受模拟器验收并保留真机清单？** 选项为“接受模拟器验收并记录真机待办”或“连接真机后继续”。Gate 未决且模拟器矩阵未完成时，不得声称真机或完整设备验收通过。真机待办准确包括 VoiceOver、TalkBack、真实相机、OEM IME、Android 13/15 的三键与手势导航、Android 15 predictive back、折叠铰链、iOS 权限/Settings 回返、Dynamic Type 重启和终端字号复位。
+
 ## M1 · 可靠投递与连接恢复
 
 归属：共享 TypeScript（`connection.ts`、会话路由）。依赖：无协议破坏性变更；如要显示 daemon 接收确认，可后续协商协议。测试：Vitest 覆盖队列边界与状态机；E2E 注入离线、握手失败和恢复。
