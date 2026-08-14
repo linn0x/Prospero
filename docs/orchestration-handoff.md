@@ -49,6 +49,25 @@ worker（包含 `completed`）会被停止并保留会话历史，防止重启�
 不改分支；旧 worker 的 `repo === path` 只当待检查候选，找不到不同于目标工作树的可靠源仓
 上下文就返回 `unknown`，不能清理。
 
+### Supervisor 升级、回滚与孤儿
+
+结构化会话由每会话 supervisor 持有；daemon 只是可替换的控制/展示客户端。升级或 daemon
+重启只能断开 facade，不能向这些会话发送 `interrupt`、`dispose` 或 `kill`。新 daemon 在 control
+socket 就绪后会扫描私有 manifest、按事件序号重连 live owner，再做 Dispatch 对账；因此 worker
+的 `completed` 仍是可继续聊天的状态，Dispatch 继续为 `running`，Task 仍为 `dispatched`，直到
+worker 显式 `prospero task done` / `task fail`。
+
+若必须回滚，只停止 daemon 并启动兼容的旧版本，必要时关闭**新建** supervisor 会话；绝不可把
+杀掉 live supervisor 当作回滚步骤。待审批/待回答的原始 request ID 会在重连后继续等待处理，
+离线本身从不等于批准。
+
+启动时发现 PID、0600 socket、token 或协议不可信的 manifest，会保留为只读 `died` 会话（UI 显示
+“已退出”），绝不自动补开一条 worker/原生 turn。运维清理前必须检查该会话的 0600 manifest 和
+`session.json`、确认精确 `supervisorPid` 已不存在且没有 daemon 已重连，先归档整个 0700 会话目录；
+之后才能删除 manifest 中精确记录的随机 `/tmp/prospero-supervisor-<nonce>.sock`。不得通配删除
+`/tmp`、不得删除 nonterminal 历史或附件。详细步骤和故障证据见
+[structured-agent-supervisor.md](structured-agent-supervisor.md)。
+
 ### API 与客户端入口
 
 - snapshot / 手机协议：`orchestration.snapshot`、`orchestration.gate.resolve`；客户端以前台
