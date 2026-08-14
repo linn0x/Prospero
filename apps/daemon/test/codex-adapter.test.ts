@@ -2,7 +2,7 @@
  * Codex app-server 适配器集成测试。未安装 codex 时跳过。
  */
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -29,12 +29,15 @@ afterEach(async () => {
   session = null;
 });
 
-async function startSession(events: AgentEventBody[]): Promise<StructuredSession> {
+async function startSession(
+  events: AgentEventBody[],
+  sessionCwd = cwd,
+): Promise<StructuredSession> {
   const s = new StructuredSession({
     id: `codex-test-${String(Date.now())}`,
     agent: "codex",
     title: "codex · test",
-    cwd,
+    cwd: sessionCwd,
     adapter: new CodexAdapter(),
   });
   s.on("event", (body) => events.push(body));
@@ -49,6 +52,27 @@ async function waitFor(pred: () => boolean, what: string, timeoutMs = 120_000): 
     await new Promise((r) => setTimeout(r, 200));
   }
   throw new Error(`超时等待:${what}`);
+}
+
+/** 真实后端在一轮中可能连续请求多次审批；每个 reqId 只能回复一次。 */
+async function approveAll(
+  target: StructuredSession,
+  events: AgentEventBody[],
+  done: () => boolean,
+  timeoutMs = 120_000,
+): Promise<void> {
+  const answered = new Set<string>();
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (done()) return;
+    for (const event of events) {
+      if (event.kind !== "permission.request" || answered.has(event.reqId)) continue;
+      answered.add(event.reqId);
+      await target.respondPermission(event.reqId, "once");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  throw new Error(`超时;已到达:${events.map((event) => event.kind).join(" → ") || "(无)"}`);
 }
 
 describeIf("Codex 结构化会话", () => {
@@ -85,6 +109,34 @@ describeIf("Codex 结构化会话", () => {
     expect(info.agent).toBe("codex");
     expect(info.status).toBe("idle");
   }, 120_000);
+
+  it("v2 批准后在隔离临时 worktree 真正写入，而不是被 Codex declined", async () => {
+    const worktree = mkdtempSync(path.join(os.tmpdir(), "prospero-codex-approval-worktree-"));
+    const target = path.join(worktree, "approved-by-v2.txt");
+    const events: AgentEventBody[] = [];
+    try {
+      // 这个仓库仅为 app-server 回归创建；绝不使用调用测试者的工作目录。
+      execFileSync("git", ["init", "--quiet"], { cwd: worktree, timeout: 15_000 });
+      session = await startSession(events, worktree);
+      await session.send(
+        "Create approved-by-v2.txt in the current directory with exactly the text V2_APPROVED. " +
+          "Use your file-editing tool, do not use a shell command, and then stop.",
+      );
+
+      await waitFor(
+        () => events.some((event) => event.kind === "permission.request"),
+        `permission.request;errors=${JSON.stringify(events.filter((event) => event.kind === "agent.error"))}`,
+      );
+      await approveAll(session, events, () => events.some((event) => event.kind === "turn.end"));
+
+      expect(readFileSync(target, "utf8").trim()).toBe("V2_APPROVED");
+      expect(events.some((event) => event.kind === "tool.end" && event.state === "success")).toBe(true);
+    } finally {
+      await session?.dispose();
+      session = null;
+      rmSync(worktree, { recursive: true, force: true });
+    }
+  }, 180_000);
 
   it("daemon 重启后用持久化 threadId 恢复原生 Codex 会话", async () => {
     const home = mkdtempSync(path.join(os.tmpdir(), "prospero-codex-resume-"));
@@ -171,7 +223,33 @@ describe("Codex 审批策略(桩数据)", () => {
         summary: "运行命令:npm test",
       }),
     ]);
-    expect(h.writes).toEqual([{ id: 41, result: { decision: "approved" } }]);
+    expect(h.writes).toEqual([{ id: 41, result: { decision: "accept" } }]);
+  });
+
+  it("YOLO 对 v2 permissions 也走 method-aware 的最小授权响应并保留审计", () => {
+    const h = approvalHarness(() => "yolo");
+    h.request({
+      id: 43,
+      method: "item/permissions/requestApproval",
+      params: {
+        itemId: "permission-yolo-1",
+        reason: "需要联网",
+        permissions: {
+          network: { enabled: true },
+          fileSystem: null,
+        },
+      },
+    });
+
+    expect(h.writes).toEqual([{
+      id: 43,
+      result: { permissions: { network: { enabled: true } }, scope: "turn" },
+    }]);
+    expect(h.events).toEqual([expect.objectContaining({
+      kind: "permission.auto",
+      reqId: "permission-yolo-1",
+      policy: "yolo",
+    })]);
   });
 
   it("YOLO 的 turn/start 同时关闭审批并解除 sandbox", async () => {
@@ -240,6 +318,177 @@ describe("Codex 审批策略(桩数据)", () => {
       ]);
       expect(h.writes).toEqual([]);
     }
+  });
+});
+
+describe("Codex app-server 审批响应兼容性(桩数据)", () => {
+  it("v2 command 与 fileChange 将 once/always/reject 映射为各自的新 decision", async () => {
+    const h = approvalHarness(() => "strict");
+    const cases = [
+      {
+        id: 101,
+        method: "item/commandExecution/requestApproval",
+        reqId: "command-once",
+        reply: "once",
+        expected: "accept",
+      },
+      {
+        id: 102,
+        method: "item/commandExecution/requestApproval",
+        reqId: "command-always",
+        reply: "always",
+        expected: "acceptForSession",
+      },
+      {
+        id: 103,
+        method: "item/commandExecution/requestApproval",
+        reqId: "command-reject",
+        reply: "reject",
+        expected: "decline",
+      },
+      {
+        id: 104,
+        method: "item/fileChange/requestApproval",
+        reqId: "file-once",
+        reply: "once",
+        expected: "accept",
+      },
+      {
+        id: 105,
+        method: "item/fileChange/requestApproval",
+        reqId: "file-always",
+        reply: "always",
+        expected: "acceptForSession",
+      },
+      {
+        id: 106,
+        method: "item/fileChange/requestApproval",
+        reqId: "file-reject",
+        reply: "reject",
+        expected: "decline",
+      },
+    ] as const;
+
+    for (const testCase of cases) {
+      h.request({
+        id: testCase.id,
+        method: testCase.method,
+        params: {
+          itemId: testCase.reqId,
+          ...(testCase.method === "item/commandExecution/requestApproval"
+            ? { command: "echo v2" }
+            : { reason: "src/v2.ts" }),
+        },
+      });
+      await h.adapter.respondPermission(testCase.reqId, testCase.reply);
+    }
+
+    expect(h.writes).toEqual(cases.map((testCase) => ({
+      id: testCase.id,
+      result: { decision: testCase.expected },
+    })));
+  });
+
+  it("v2 permissions 只回显请求的非 null profile，并按 reply 选择 scope 或零权限拒绝", async () => {
+    const h = approvalHarness(() => "strict");
+    const fileSystem = {
+      read: ["/tmp/prospero-read"],
+      write: ["/tmp/prospero-write"],
+      entries: [{ path: "/tmp/prospero-write", access: "write" }],
+    };
+    const cases = [
+      {
+        id: 111,
+        reqId: "permissions-once",
+        reply: "once",
+        permissions: {
+          network: { enabled: true },
+          fileSystem: null,
+          unexpected: "must not be echoed",
+        },
+        expected: { permissions: { network: { enabled: true } }, scope: "turn" },
+      },
+      {
+        id: 112,
+        reqId: "permissions-always",
+        reply: "always",
+        permissions: { network: null, fileSystem },
+        expected: { permissions: { fileSystem }, scope: "session" },
+      },
+      {
+        id: 113,
+        reqId: "permissions-reject",
+        reply: "reject",
+        permissions: { network: { enabled: true }, fileSystem },
+        expected: { permissions: {}, scope: "turn" },
+      },
+    ] as const;
+
+    for (const testCase of cases) {
+      h.request({
+        id: testCase.id,
+        method: "item/permissions/requestApproval",
+        params: {
+          itemId: testCase.reqId,
+          reason: "需要额外权限",
+          permissions: testCase.permissions,
+        },
+      });
+      await h.adapter.respondPermission(testCase.reqId, testCase.reply);
+    }
+
+    expect(h.writes).toEqual(cases.map((testCase) => ({
+      id: testCase.id,
+      result: testCase.expected,
+    })));
+  });
+
+  it("legacy execCommandApproval/applyPatchApproval 保持旧 ReviewDecision", async () => {
+    const h = approvalHarness(() => "strict");
+    h.request({
+      id: 121,
+      method: "execCommandApproval",
+      params: { callId: "legacy-command-once", command: ["echo", "legacy"] },
+    });
+    h.request({
+      id: 122,
+      method: "execCommandApproval",
+      params: { callId: "legacy-command-always", command: ["echo", "legacy"] },
+    });
+    h.request({
+      id: 123,
+      method: "applyPatchApproval",
+      params: { callId: "legacy-patch-reject", reason: "src/legacy.ts" },
+    });
+
+    await h.adapter.respondPermission("legacy-command-once", "once");
+    await h.adapter.respondPermission("legacy-command-always", "always");
+    await h.adapter.respondPermission("legacy-patch-reject", "reject");
+
+    expect(h.writes).toEqual([
+      { id: 121, result: { decision: "approved" } },
+      { id: 122, result: { decision: "approved_for_session" } },
+      {
+        id: 123,
+        result: { decision: { denied: { rejection: "用户在手机上拒绝了此操作" } } },
+      },
+    ]);
+  });
+
+  it("忽略未知或已经处理过的 reqId，避免重复回复同一个 JSON-RPC callback", async () => {
+    const h = approvalHarness(() => "strict");
+    await h.adapter.respondPermission("unknown", "once");
+
+    h.request({
+      id: 131,
+      method: "item/fileChange/requestApproval",
+      params: { itemId: "only-once", reason: "src/once.ts" },
+    });
+    await h.adapter.respondPermission("only-once", "once");
+    await h.adapter.respondPermission("only-once", "reject");
+
+    expect(h.writes).toEqual([{ id: 131, result: { decision: "accept" } }]);
+    expect(h.events.filter((event) => event.kind === "permission.resolved")).toHaveLength(1);
   });
 });
 

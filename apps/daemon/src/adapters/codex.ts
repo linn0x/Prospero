@@ -13,8 +13,11 @@
  * - initialize → thread/start → turn/start
  * - 通知:item/started、item/agentMessage/delta、item/reasoning/textDelta、
  *   item/completed、turn/completed
- * - 审批请求:item/commandExecution/requestApproval、item/fileChange/requestApproval
- * - 决定值 ReviewDecision:"approved" | "approved_for_session" | {denied:{rejection}} | "abort"
+ * - v2 审批请求:item/commandExecution/requestApproval、item/fileChange/requestApproval、
+ *   item/permissions/requestApproval
+ * - v2 command/file 决定值:"accept" | "acceptForSession" | "decline" | "cancel"；
+ *   permissions 是独立的 { permissions, scope } 响应
+ * - 旧 execCommandApproval / applyPatchApproval 仍使用 ReviewDecision
  */
 import type { ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -69,10 +72,24 @@ interface RpcMessage {
   error?: { code: number; message: string };
 }
 
+type ApprovalKind =
+  | "v2CommandExecution"
+  | "v2FileChange"
+  | "v2Permissions"
+  | "legacyExecCommand"
+  | "legacyApplyPatch";
+
+/** v2 permissions 原始请求快照；响应前再缩减成可授予的 profile。 */
+type RequestedPermissionProfile = Record<string, unknown>;
+
 interface PendingApproval {
   /** JSON-RPC 请求 id,回 response 时用 */
   rpcId: number | string;
   itemId: string;
+  /** app-server 的响应 enum 取决于这个 server→client request method。 */
+  kind: ApprovalKind;
+  /** 仅 v2 item/permissions/requestApproval 有值；保留 server 原始 profile。 */
+  requestedPermissions?: RequestedPermissionProfile;
   agentId?: string;
 }
 
@@ -597,7 +614,12 @@ export class CodexAdapter implements AgentAdapter {
 
   private onServerRequest(msg: RpcMessage): void {
     const p = msg.params ?? {};
-    const itemId = String(p["itemId"] ?? msg.id);
+    // v2 zsh-exec-bridge can send several callbacks for one item. approvalId is the
+    // only per-callback identity in that case; legacy requests identify themselves by callId.
+    const approvalId = typeof p["approvalId"] === "string" && p["approvalId"].length > 0
+      ? p["approvalId"]
+      : undefined;
+    const itemId = String(approvalId ?? p["itemId"] ?? p["callId"] ?? msg.id);
     const agentId = this.eventAgent(p["threadId"]);
     switch (msg.method) {
       case "item/tool/requestUserInput": {
@@ -653,6 +675,7 @@ export class CodexAdapter implements AgentAdapter {
         this.requestApproval({
           rpcId: msg.id!,
           itemId,
+          kind: "v2CommandExecution",
           toolName: "commandExecution",
           action: "运行命令",
           resources: [summarize(cmd, 400)],
@@ -661,16 +684,61 @@ export class CodexAdapter implements AgentAdapter {
         });
         return;
       }
-      case "item/fileChange/requestApproval":
-      case "item/permissions/requestApproval": {
+      case "item/fileChange/requestApproval": {
         const reason = p["reason"] ?? p["grantRoot"] ?? p["changes"] ?? "修改文件";
         // Codex 会通过 patchUpdated 先行给出 patch,这里取用
         const diff = this.pendingDiffs.get(itemId) ?? extractDiff(p);
         this.requestApproval({
           rpcId: msg.id!,
           itemId,
-          toolName:
-            msg.method === "item/fileChange/requestApproval" ? "fileChange" : "permissions",
+          kind: "v2FileChange",
+          toolName: "fileChange",
+          action: "修改文件",
+          resources: [summarize(diff?.path ?? reason, 400)],
+          summary: `修改文件:${summarize(diff?.path ?? reason, 200)}`,
+          diff,
+          ...(agentId ? { agentId } : {}),
+        });
+        return;
+      }
+      case "item/permissions/requestApproval": {
+        const reason = p["reason"] ?? "请求额外权限";
+        const requestedPermissions = this.requestedPermissions(p["permissions"]);
+        this.requestApproval({
+          rpcId: msg.id!,
+          itemId,
+          kind: "v2Permissions",
+          toolName: "permissions",
+          action: "请求额外权限",
+          resources: [summarize(reason, 400)],
+          summary: `请求额外权限:${summarize(reason, 200)}`,
+          ...(requestedPermissions ? { requestedPermissions } : {}),
+          ...(agentId ? { agentId } : {}),
+        });
+        return;
+      }
+      case "execCommandApproval": {
+        const command = p["command"];
+        this.requestApproval({
+          rpcId: msg.id!,
+          itemId,
+          kind: "legacyExecCommand",
+          toolName: "commandExecution",
+          action: "运行命令",
+          resources: [summarize(command, 400)],
+          summary: `运行命令:${summarize(command, 200)}`,
+          ...(agentId ? { agentId } : {}),
+        });
+        return;
+      }
+      case "applyPatchApproval": {
+        const reason = p["reason"] ?? p["grantRoot"] ?? p["fileChanges"] ?? "修改文件";
+        const diff = this.pendingDiffs.get(itemId) ?? extractDiff(p);
+        this.requestApproval({
+          rpcId: msg.id!,
+          itemId,
+          kind: "legacyApplyPatch",
+          toolName: "fileChange",
           action: "修改文件",
           resources: [summarize(diff?.path ?? reason, 400)],
           summary: `修改文件:${summarize(diff?.path ?? reason, 200)}`,
@@ -689,24 +757,88 @@ export class CodexAdapter implements AgentAdapter {
   }
 
   /**
+   * 记录 v2 permissions 的原始 profile。批准时由 grantedPermissions() 再取
+   * 非 null 的 network/fileSystem，避免丢失审计输入或将未知字段写回协议。
+   */
+  private requestedPermissions(value: unknown): RequestedPermissionProfile | undefined {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+    return { ...(value as Record<string, unknown>) };
+  }
+
+  /** 将原始请求缩减为 v2 GrantedPermissionProfile 可接受的最小授权。 */
+  private grantedPermissions(requested: RequestedPermissionProfile | undefined): {
+    network?: unknown;
+    fileSystem?: unknown;
+  } {
+    const profile: RequestedPermissionProfile = {};
+    if (requested?.["network"] !== null && requested?.["network"] !== undefined) {
+      profile.network = requested["network"];
+    }
+    if (requested?.["fileSystem"] !== null && requested?.["fileSystem"] !== undefined) {
+      profile.fileSystem = requested["fileSystem"];
+    }
+    return profile;
+  }
+
+  /**
+   * v2 与 legacy 的 server request 同时存在于 0.147 的 schema，响应一定要按
+   * request method 分流。把它集中在这里，YOLO、手工审批和 dispose 才不会漂移。
+   */
+  private approvalResponse(
+    pending: Pick<PendingApproval, "kind" | "requestedPermissions">,
+    reply: PermissionReply,
+    rejection = "用户在手机上拒绝了此操作",
+  ): Record<string, unknown> {
+    switch (pending.kind) {
+      case "v2CommandExecution":
+      case "v2FileChange":
+        return {
+          decision:
+            reply === "reject" ? "decline" : reply === "always" ? "acceptForSession" : "accept",
+        };
+      case "v2Permissions":
+        // 生成 schema 没有 permissions 的 decision/reject 变体。拒绝以零权限、
+        // 单轮 scope 表示；批准时严格回显 server 请求的非 null 项。
+        return reply === "reject"
+          ? { permissions: {}, scope: "turn" }
+          : {
+              permissions: this.grantedPermissions(pending.requestedPermissions),
+              scope: reply === "always" ? "session" : "turn",
+            };
+      case "legacyExecCommand":
+      case "legacyApplyPatch":
+        return {
+          decision:
+            reply === "reject"
+              ? { denied: { rejection } }
+              : reply === "always"
+                ? "approved_for_session"
+                : "approved",
+        };
+    }
+  }
+
+  /**
    * strict/standard 以 untrusted 启动,审批在 Prospero 层处理以保留审计。
    * YOLO 通常不会再收到请求；若切换瞬间仍有旧请求在途，这里仍会立即放行。
    */
   private requestApproval(input: {
     rpcId: number | string;
     itemId: string;
+    kind: ApprovalKind;
     toolName: string;
     action: string;
     resources: string[];
     summary: string;
     diff?: FileDiff | null;
+    requestedPermissions?: RequestedPermissionProfile;
     agentId?: string;
   }): void {
     const policy = this.ctx?.approvalPolicy?.() ?? "strict";
     if (!needsApproval(policy, input.toolName)) {
-      // 只批准这一次。若回 approved_for_session,Codex 后续不再发请求,
+      // 只批准这一次。若请求 session 级批准,Codex 后续不再发请求,
       // Prospero 也就无法继续留下 permission.auto 审计记录。
-      this.respond(input.rpcId, { decision: "approved" });
+      this.respond(input.rpcId, this.approvalResponse(input, "once"));
       this.emit({
         kind: "permission.auto",
         reqId: input.itemId,
@@ -721,6 +853,8 @@ export class CodexAdapter implements AgentAdapter {
     this.approvals.set(input.itemId, {
       rpcId: input.rpcId,
       itemId: input.itemId,
+      kind: input.kind,
+      ...(input.requestedPermissions ? { requestedPermissions: input.requestedPermissions } : {}),
       ...(input.agentId ? { agentId: input.agentId } : {}),
     });
     this.emit({
@@ -1277,13 +1411,7 @@ export class CodexAdapter implements AgentAdapter {
     const pending = this.approvals.get(reqId);
     if (!pending) return;
     this.approvals.delete(reqId);
-    const decision =
-      reply === "reject"
-        ? { denied: { rejection: "用户在手机上拒绝了此操作" } }
-        : reply === "always"
-          ? "approved_for_session"
-          : "approved";
-    this.respond(pending.rpcId, { decision });
+    this.respond(pending.rpcId, this.approvalResponse(pending, reply));
     this.emit({
       kind: "permission.resolved",
       reqId,
@@ -1604,7 +1732,7 @@ export class CodexAdapter implements AgentAdapter {
   async dispose(): Promise<void> {
     // 悬着的审批先拒掉,避免 codex 永久等待
     for (const [reqId, pending] of this.approvals) {
-      this.respond(pending.rpcId, { decision: { denied: { rejection: "会话已关闭" } } });
+      this.respond(pending.rpcId, this.approvalResponse(pending, "reject", "会话已关闭"));
       this.approvals.delete(reqId);
     }
     for (const [reqId, pending] of this.questions) {
