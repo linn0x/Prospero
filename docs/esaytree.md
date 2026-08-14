@@ -6,8 +6,9 @@
 
 - 新工作区从指定 ref 的已提交快照开始。
 - 源仓的 staged、unstaged 和 untracked 改动不会泄漏给 worker。
-- 默认复用完全被 Git 忽略的目录，例如 monorepo 中各层的 `node_modules`。
-- CoW 克隆不是硬链接；修改 worker 文件不会改变源仓或其他工作区。
+- 默认只复用明确的依赖目录：monorepo 中各层的 `node_modules`。
+- `build/`、`.cache/`、`.expo/`、`ios/build/`、`.claude/` 等构建产物、缓存和潜在私有配置不会进入 worker。
+- CoW 克隆不是硬链接；修改 worker 文件不会改变源仓或其他工作区。macOS 只在直接 `clonefile` 成功后才报告 CoW，绝不把 `cp -c` 的成功当作证明。
 - 创建中途失败会撤销 worktree 登记、目标目录和本次新建的分支。
 - 移除前会确认目标确实是当前仓库登记的 worktree。
 
@@ -15,15 +16,20 @@
 
 ## 为什么快
 
-普通 `git worktree add` 会重新写出全部 tracked 文件，而且新的工作区没有 ignored 依赖。esaytree 的快速路径是：
+普通 `git worktree add` 会检出已提交的 tracked 文件，但新的工作区没有 ignored 依赖。esaytree 保持这条安全 Git 路径，并只为允许的依赖加速：
 
-1. `git worktree add --no-checkout` 只建立 Git 元数据和分支。
-2. 使用 `COPYFILE_FICLONE_FORCE` 对源工作区做文件系统级 CoW 克隆，根 `.git` 不复制。
-3. 暂存要复用的 ignored 目录。
-4. 用 `git reset`、`git clean` 和按需 `git checkout` 把目标还原到自己的提交快照。
-5. 把 ignored 依赖移回目标。
+1. `git worktree add` 从指定 ref 检出干净的 tracked 快照；源仓的本地状态和所有 ignored 内容都不会进入目标。
+2. 仅发现 allowlist 中的 `node_modules`，并先对每个目录尝试严格 CoW。
+3. macOS 同卷路径通过系统自带 JXA 显式绑定并调用 `clonefile`；其他平台使用 Node 的 `COPYFILE_FICLONE_FORCE` 严格语义。
+4. 只有上一步失败且显式开启 `--copy-fallback` 时，才统计失败候选目录并进行容量预检，然后做实体副本。
 
-干净 tracked 文件和 ignored 依赖因此共享物理块，只有第一次写入的块会真正分裂。若文件系统不支持强制 CoW，默认退回普通 Git checkout；CLI 不会默认真实复制大型 ignored 目录。
+允许的 ignored 依赖在 CoW 成功时共享物理块，只有第一次写入的块会真正分裂。若文件系统不支持强制 CoW（包括跨卷的 `EXDEV`、Node 探针的 `ENOSYS`），默认保留普通 Git checkout，且**不复制** ignored 依赖；工作树仍然完全隔离，可在其中重新安装依赖。
+
+`--copy-fallback` 是唯一允许实体复制的 CLI 开关。复制前 esaytree 会先统计所有候选依赖的逻辑字节数、读取目标卷可用空间，并一次性判断以下门槛；未通过时不会写任何一个候选目录：
+
+- 默认每次最多 `8 GiB`（`ESAYTREE_MAX_FALLBACK_COPY_BYTES`，设为 `0` 可禁止）；
+- 复制后至少保留 `4 GiB`（`ESAYTREE_MIN_FREE_BYTES`）；
+- 任一预检、复制或 CoW 降级原因都会写入报告，便于释放空间、提高上限或改为在目标树安装依赖。
 
 ## CLI
 
@@ -63,6 +69,8 @@ apps/daemon/bin/esaytree rm fix-login
 
 默认存储目录是仓库相邻的 `.prospero-worktrees/<repo>/<name>`。可通过 `ESAYTREE_ROOT` 改为统一根目录；该目录下仍会按仓库名分组。
 
+`doctor` 使用与创建相同的源→目标同卷探针，并在可用时报告 `cow_backend: macos_clonefile`（人类输出为 `cow backend: macos_clonefile`）。它不是 `cp -c` 探测：`clonefile` 返回失败就会明确报告 unavailable 并走安全 fallback。
+
 ## 机器接口
 
 JSON 响应使用以下 envelope：
@@ -75,6 +83,8 @@ JSON 响应使用以下 envelope：
   "data": {}
 }
 ```
+
+`esaytree.task-new` 的 `data.task` 除路径和分支外还包括 `mode`、`cow`、`cow_backend`、`elapsed_ms`、`fallback_reason`（若降级），以及完整的 `clones` 数组。每项有 `strategy: cow|copy|skipped`、耗时、可选字节估算和原因；`preserved_ignored` 与 `skipped_ignored` 分别列出最终带入和明确未带入的目录。消费者不得把 `cow: false` 或 `skipped` 当作已复用。
 
 成功 kind 包括：
 
@@ -92,7 +102,7 @@ JSON 响应使用以下 envelope：
 
 实现位于 `apps/daemon/src/orchestration/esaytree.ts`。编排层主要使用：
 
-- `createEsaytree()`：创建并返回 `mode`、`cow`、耗时和 preserved ignored 报告；旧的 `createWorktree()` 名称继续兼容。
+- `createEsaytree()`：创建并返回 `mode`、`cow`/`cowBackend`、耗时，以及 preserved/skipped ignored 和逐目录 clone 报告；旧的 `createWorktree()` 名称继续兼容。
 - `listWorktrees()` / `listManagedWorktrees()`：读取 Git 登记与 esaytree 管理范围。
 - `removeWorktree()` / `removeManagedWorktree()`：安全移除和可选分支清理。
 - `diagnoseEsaytree()`：验证 Git 与目标文件系统的 CoW 能力。

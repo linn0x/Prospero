@@ -58,7 +58,19 @@ describe("esaytree CLI", () => {
       schema: string;
       schema_version: number;
       kind: string;
-      data: { task: { name: string; path: string; mode: string; cow: boolean } };
+      data: {
+        task: {
+          name: string;
+          path: string;
+          mode: string;
+          cow: boolean;
+          cow_backend: string;
+          preserved_ignored: string[];
+          skipped_ignored: unknown[];
+          clones: unknown[];
+          elapsed_ms: number;
+        };
+      };
     };
     expect(createdRaw.stdout.trim().split("\n")).toHaveLength(1);
     expect(created).toMatchObject({
@@ -69,6 +81,11 @@ describe("esaytree CLI", () => {
     });
     expect(["copy-on-write", "git-checkout"]).toContain(created.data.task.mode);
     expect(typeof created.data.task.cow).toBe("boolean");
+    expect(typeof created.data.task.cow_backend).toBe("string");
+    expect(Array.isArray(created.data.task.preserved_ignored)).toBe(true);
+    expect(Array.isArray(created.data.task.skipped_ignored)).toBe(true);
+    expect(Array.isArray(created.data.task.clones)).toBe(true);
+    expect(typeof created.data.task.elapsed_ms).toBe("number");
 
     const listed = JSON.parse((await cli(repo, storage, ["list"])).stdout) as {
       kind: string;
