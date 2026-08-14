@@ -1,8 +1,12 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { SessionInfo } from "@prospero/protocol";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   DispatchError,
   DispatchService,
+  WORKER_TERMINATION_TIMEOUT_MS,
   type WorkerSessionManager,
 } from "../src/orchestration/dispatch.js";
 import { OrchestrationStore } from "../src/orchestration/store.js";
@@ -15,6 +19,7 @@ class FakeSessions implements WorkerSessionManager {
   readonly killOptions: Array<{ preserveHistory?: boolean } | undefined> = [];
   readonly live = new Map<string, SessionInfo>();
   killError: Error | null = null;
+  killNever = false;
   createBarrier: Promise<void> | null = null;
 
   async create(input: CreateSessionInput): Promise<SessionInfo> {
@@ -46,6 +51,7 @@ class FakeSessions implements WorkerSessionManager {
   async kill(sid: string, options?: { preserveHistory?: boolean }): Promise<void> {
     this.killed.push(sid);
     this.killOptions.push(options);
+    if (this.killNever) return new Promise<void>(() => {});
     if (this.killError) throw this.killError;
     this.live.delete(sid);
   }
@@ -181,6 +187,75 @@ describe("DispatchService", () => {
       { preserveHistory: true },
       { preserveHistory: true },
     ]);
+  });
+
+  it("终态写盘失败时重试仍先写盘；只有成功恢复持久化后才 kill", async () => {
+    vi.useFakeTimers();
+    const homes: string[] = [];
+    try {
+      for (const terminal of ["done", "failed"] as const) {
+        const home = mkdtempSync(path.join(os.tmpdir(), "prospero-delivery-persist-"));
+        homes.push(home);
+        const store = new OrchestrationStore(home);
+        const run = store.createRun({ objective: `${terminal} 持久化失败` });
+        const task = store.createTask({ runId: run.id, title: terminal, spec: "" });
+        const sessions = new FakeSessions();
+        const service = new DispatchService(store, sessions);
+        const started = await service.startWorker({
+          taskId: task.id, agent: "codex", worktree: "none", cwd: `/tmp/${terminal}-persist`,
+        });
+        const persist = vi.spyOn(store, "persistNow").mockImplementation(() => {
+          throw new Error("磁盘暂不可写");
+        });
+        const deliver = () => terminal === "done"
+          ? service.completeTask(task.id, started.session.id, "交付")
+          : service.failTask(task.id, started.session.id, "交付失败");
+
+        await expect(deliver()).rejects.toThrow("磁盘暂不可写");
+        expect(store.getTask(task.id).status).toBe(terminal);
+        expect(sessions.killed).toEqual([]);
+        // 幂等重放不能因为内存已终态就跳过失败的持久化，更不能提前 kill。
+        await expect(deliver()).rejects.toThrow("磁盘暂不可写");
+        expect(sessions.killed).toEqual([]);
+
+        persist.mockRestore();
+        await expect(deliver()).resolves.toMatchObject({ status: terminal });
+        expect(sessions.killed).toEqual([started.session.id]);
+        const reloaded = new OrchestrationStore(home);
+        expect(reloaded.getTask(task.id)).toMatchObject({ status: terminal });
+        reloaded.close();
+        store.close();
+      }
+    } finally {
+      vi.useRealTimers();
+      for (const home of homes) rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("自杀式 kill 卡住时在超时后返回已持久交付，而非无限阻塞", async () => {
+    vi.useFakeTimers();
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const store = new OrchestrationStore();
+      const run = store.createRun({ objective: "kill 超时" });
+      const task = store.createTask({ runId: run.id, title: "实现", spec: "" });
+      const sessions = new FakeSessions();
+      const service = new DispatchService(store, sessions);
+      const started = await service.startWorker({
+        taskId: task.id, agent: "codex", worktree: "none", cwd: "/tmp/kill-timeout",
+      });
+      sessions.killNever = true;
+
+      const delivered = service.completeTask(task.id, started.session.id, "已落盘");
+      await vi.advanceTimersByTimeAsync(WORKER_TERMINATION_TIMEOUT_MS);
+      await expect(delivered).resolves.toMatchObject({ status: "done" });
+      expect(store.getDispatch(started.dispatch.id).state).toBe("succeeded");
+      expect(sessions.killed).toEqual([started.session.id]);
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining("终止超过"));
+    } finally {
+      warning.mockRestore();
+      vi.useRealTimers();
+    }
   });
 
   it("worktree:none 拒绝同路径 live writer，但终态/缺失会话和不同路径仍可派发", async () => {

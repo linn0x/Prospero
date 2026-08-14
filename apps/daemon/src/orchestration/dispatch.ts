@@ -19,6 +19,9 @@ import {
 
 export type WorktreeMode = "new" | "none";
 
+/** kill 正在处理自我发起的 control RPC 时，不能让 task.done/fail 永久卡住。 */
+export const WORKER_TERMINATION_TIMEOUT_MS = 5_000;
+
 export interface WorkerSessionManager {
   create(input: CreateSessionInput): Promise<SessionInfo>;
   chatSend(sid: string, text: string): Promise<void>;
@@ -336,6 +339,9 @@ export class DispatchService {
   async completeTask(taskId: string, actorSessionId: string | null, body: string): Promise<Task> {
     const task = this.store.getTask(taskId);
     if (task.status === "done") {
+      // 上次同步写盘可能在 rename/fsync 前失败；内存里的终态不等于可恢复交付。
+      // 必须先重试持久化，失败则让 CLI 重试继续报错，绝不能先杀掉唯一 writer。
+      this.store.persistNow();
       await this.terminatePreviouslyDeliveredWorker(taskId, "succeeded");
       return task; // CLI 重试可安全重放
     }
@@ -356,6 +362,8 @@ export class DispatchService {
   async failTask(taskId: string, actorSessionId: string | null, body: string): Promise<Task> {
     const task = this.store.getTask(taskId);
     if (task.status === "failed") {
+      // 与 done 同理：先恢复可重启的持久化事实，再终止旧会话。
+      this.store.persistNow();
       await this.terminatePreviouslyDeliveredWorker(taskId, "failed");
       return task;
     }
@@ -390,10 +398,28 @@ export class DispatchService {
 
   /**
    * 交付事实已由 settleWorkerDelivery 同步落盘；kill 只是防止结构化队列继续
-   * 消费，失败也绝不能把已经 done/failed 的任务回滚或伪装成 RPC 失败。
+   * 消费，失败也绝不能把已经 done/failed 的任务回滚或伪装成 RPC 失败。若
+   * adapter 自杀式关闭卡住，超时后保持已交付状态和 worktree 租约，原 kill
+   * promise 仍可在后台自行收尾。
    */
   private async terminateDeliveredWorker(sessionId: string): Promise<void> {
-    await this.sessions.kill(sessionId, { preserveHistory: true }).catch(() => {});
+    const kill = Promise.resolve()
+      .then(() => this.sessions.kill(sessionId, { preserveHistory: true }))
+      .then(() => true, () => true);
+    let timer: NodeJS.Timeout | null = null;
+    const completed = await Promise.race([
+      kill,
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), WORKER_TERMINATION_TIMEOUT_MS);
+        timer.unref?.();
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (!completed) {
+      console.warn(
+        `[prosperod] worker ${sessionId} 的终止超过 ${String(WORKER_TERMINATION_TIMEOUT_MS)}ms；保留交付和工作树租约，等待后台终止收尾`,
+      );
+    }
   }
 
   private async terminatePreviouslyDeliveredWorker(
