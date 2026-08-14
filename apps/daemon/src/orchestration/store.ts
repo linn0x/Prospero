@@ -211,9 +211,21 @@ export class OrchestrationStore {
     return Object.values(this.state.runs).sort((a, b) => b.createdAt - a.createdAt);
   }
 
-  updateRun(runId: string, patch: Partial<Pick<Run, "status" | "objective" | "coordinatorSessionId">>): Run {
-    const run = this.getRun(runId);
-    Object.assign(run, patch, { updatedAt: Date.now() });
+  /**
+   * 修改 Run 的非生命周期字段。
+   *
+   * status 只能由 completeRun/abandonRun 改动；否则调用方很容易绕过完成
+   * 时必须校验的 Task、Dispatch、Gate 与自动执行状态。
+   */
+  updateRun(runId: string, patch: Partial<Pick<Run, "objective" | "coordinatorSessionId">>): Run {
+    if ("status" in patch) {
+      throw new OrchestrationError("Run 状态只能通过完成或放弃入口转换", "invalid_transition");
+    }
+    const run = this.requireActiveRun(runId);
+    const now = Date.now();
+    if (patch.objective !== undefined) run.objective = patch.objective;
+    if (patch.coordinatorSessionId !== undefined) run.coordinatorSessionId = patch.coordinatorSessionId;
+    run.updatedAt = now;
     this.schedulePersist();
     return run;
   }
@@ -222,7 +234,7 @@ export class OrchestrationStore {
    * 显式结束 Run。Task 的完成仍只认 worker/协调者的显式交付；这里仅在整张图
    * 已经没有未决工作时汇总 Run 生命周期，避免 UI 永远停在 active。
    */
-  completeRun(runId: string): Run {
+  completeRun(runId: string, options: { fromAutomation?: boolean } = {}): Run {
     const run = this.getRun(runId);
     if (run.status === "completed") return run;
     if (run.status !== "active") {
@@ -232,12 +244,39 @@ export class OrchestrationStore {
       );
     }
 
-    const unfinished = this.listTasks(runId).find(
+    const tasks = this.listTasks(runId);
+    const unfinished = tasks.find(
       (task) => task.status !== "done" && task.status !== "cancelled",
     );
     if (unfinished) {
       throw new OrchestrationError(
         `任务 ${unfinished.id} 仍是 ${unfinished.status}，Run 不能标记完成`,
+        "run_not_completable",
+      );
+    }
+    if (options.fromAutomation) {
+      if (tasks.length === 0) {
+        throw new OrchestrationError(
+          "自动执行没有可交付的任务，Run 不能自动标记完成",
+          "run_not_completable",
+        );
+      }
+      const notDelivered = tasks.find((task) => task.status !== "done");
+      if (notDelivered) {
+        throw new OrchestrationError(
+          `自动执行任务 ${notDelivered.id} 仍是 ${notDelivered.status}，Run 不能标记完成`,
+          "run_not_completable",
+        );
+      }
+      if (run.automation?.state !== "running") {
+        throw new OrchestrationError(
+          "自动执行并未处于运行中，不能自动标记 Run 完成",
+          "run_not_completable",
+        );
+      }
+    } else if (run.automation?.state === "running") {
+      throw new OrchestrationError(
+        "自动执行仍在运行，请先暂停或等待它自行收口",
         "run_not_completable",
       );
     }
@@ -250,12 +289,6 @@ export class OrchestrationStore {
         "run_not_completable",
       );
     }
-    if (run.automation?.state === "running") {
-      throw new OrchestrationError(
-        "自动执行仍在运行，请先暂停或等待它自行收口",
-        "run_not_completable",
-      );
-    }
     const pendingGate = this.listGates(runId, "pending")[0];
     if (pendingGate) {
       throw new OrchestrationError(
@@ -264,8 +297,18 @@ export class OrchestrationStore {
       );
     }
 
+    const now = Date.now();
+    // 完成 Run 同时终结自动执行，不能在历史 Run 上留下 running/paused 的假状态。
+    if (run.automation && run.automation.state !== "completed") {
+      run.automation = {
+        ...run.automation,
+        state: "completed",
+        updatedAt: now,
+        lastError: null,
+      };
+    }
     run.status = "completed";
-    run.updatedAt = Date.now();
+    run.updatedAt = now;
     this.schedulePersist();
     return run;
   }

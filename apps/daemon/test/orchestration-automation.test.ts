@@ -114,6 +114,44 @@ describe("静态 DAG 自动执行", () => {
       status: "completed",
       automation: { state: "completed", lastError: null },
     });
+
+    // 完成后的重试是空操作，不能重开 Run 或再次派发 worker。
+    await ctx.automation.advance(ctx.runId);
+    expect(ctx.store.getRun(ctx.runId)).toMatchObject({
+      status: "completed",
+      automation: { state: "completed", lastError: null },
+    });
+    expect(ctx.sessions.creates).toHaveLength(2);
+  });
+
+  it("run-level pending Gate 会阻止自动完成，解决后才通过统一完成入口收口", async () => {
+    const ctx = graph();
+    const cwd = temporaryRoot();
+    await ctx.automation.start({
+      runId: ctx.runId,
+      agent: "codex",
+      approvalPolicy: "standard",
+      workspace: "current",
+      cwd,
+    });
+
+    ctx.dispatch.completeTask(ctx.firstId, "worker-1", "第一步已验收");
+    await ctx.automation.advance(ctx.runId);
+    ctx.dispatch.completeTask(ctx.secondId, "worker-2", "全部完成");
+    const gate = ctx.store.createGate({ runId: ctx.runId, question: "是否发布？" });
+
+    await ctx.automation.advance(ctx.runId);
+    expect(ctx.store.getRun(ctx.runId)).toMatchObject({
+      status: "active",
+      automation: { state: "running", lastError: null },
+    });
+
+    ctx.store.resolveGate(gate.id, "发布");
+    await ctx.automation.advance(ctx.runId);
+    expect(ctx.store.getRun(ctx.runId)).toMatchObject({
+      status: "completed",
+      automation: { state: "completed", lastError: null },
+    });
   });
 
   it("暂停只阻止后续派发，恢复后从下一个 ready 节点继续", async () => {
