@@ -536,7 +536,11 @@ export function orchestrationControlApi(
         case "gate.resolve": {
           const gate = store.getGate(text(params, "gateId"));
           coordinatorOnly(store, gate.runId, optionalText(params, "actorSessionId"));
-          return store.resolveGate(gate.id, text(params, "decision"));
+          const resolved = store.resolveGate(gate.id, text(params, "decision"));
+          // run-level Gate 不会改变任何 task；自动执行需要在 Gate 解开后主动
+          // 再次检查整张 Run 是否已满足完成条件。
+          automation?.kick(resolved.runId);
+          return resolved;
         }
         case "gate.list": {
           const runId = optionalText(params, "runId");
