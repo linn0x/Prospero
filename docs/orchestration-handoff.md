@@ -36,10 +36,12 @@ daemon 启动顺序不可调换：control socket 就绪后先恢复 SessionManag
 `adapter.start()` **之前**即时读取 Store，已结算便只恢复审计历史、绝不接回原生会话；第二道在
 `adapter.start()` 返回后、`drainQueue()` 之前重新读取 Store，若此窗口内收到了 `task.done` /
 `task.fail`，同步封存并阻止旧队列发送。随后 `reconcilePersistedSessions()` 才作为兜底，对账
-消失、已终态或仍存活但已交付的会话，不能替代前两道闸门。
-活动 Dispatch 找不到会话、或会话已终态但没有显式交付时，原子收敛为
-`abandoned + failed` 并保留原因；存活的 `starting` 恢复为 `running`，不会重复派发。
-已落盘为 `succeeded`/`failed` 却仍活着的 worker 会被停止并保留会话历史，防止重启后继续
+消失、真正终态或仍存活但已交付的会话，不能替代前两道闸门。真正终态只包括 `done` 和
+`died`：结构化会话的 `completed` 只是本轮结束，和 `idle`、`waiting_*` 一样仍能接受下一轮
+chat，也继续持有工作树 writer 租约。活动 Dispatch 找不到会话、或会话真正终态但没有显式
+交付时，原子收敛为 `abandoned + failed` 并保留原因；`starting`（包括恢复到 `completed` 的
+结构化 worker）恢复为 `running`，不会重复派发。已落盘为 `succeeded`/`failed` 却仍活着的
+worker（包含 `completed`）会被停止并保留会话历史，防止重启后继续
 消费旧队列。自动 Run 遇到已收敛的失败会暂停并留下诊断，而不是假装继续；Goal 首提示的
 `pending` 投递账本会在重启后重试。
 
@@ -146,9 +148,9 @@ cd apps/daemon && npx vitest run \
 
 ### 已经确立、别再重新讨论的决定
 
-1. **状态只认显式转移,绝不猜。** `SessionStatus` 回到 `idle` 只当"去看一眼"的提示,
-   不自动把任务判成 done。任务完成必须 worker 显式 `task done` 或协调者显式验收；
-   把“暂时空闲”当成“已经交付”会制造无法可靠恢复的误报。
+1. **状态只认显式转移,绝不猜。** `SessionStatus` 回到 `idle` 或 `completed` 都只当"去看一眼"的
+   提示，不自动把任务判成 done；后者只代表结构化 agent 的一轮结束，仍可继续 chat。任务完成必须
+   worker 显式 `task done` 或协调者显式验收；把“暂时空闲”当成“已经交付”会制造无法可靠恢复的误报。
 2. **`ready` 是派生值,不落盘。** `pending` 且 deps 全 `done` 即 ready。存下来就有两份真相。
 3. **依赖被 `cancelled` 不算放行。** 前提没了就该有人显式改依赖,不能让任务在半截地基上开工。
 4. **`done` 是终态。** 要改就新建任务,不改历史。只有 `failed` 能退回 `pending` 重试。

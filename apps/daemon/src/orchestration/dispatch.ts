@@ -133,8 +133,11 @@ export class DispatchService {
     return { task: currentTask, dispatch: currentDispatch };
   }
 
-  /** PTY/结构化会话未显式交付就退出时，不能让 Dispatch 永久伪装成 running。 */
-  settleEndedSession(sessionId: string, reason: string): StopWorkerResult | null {
+  /**
+   * PTY/结构化会话真正终止（done/died）却未显式交付时，不能让 Dispatch
+   * 永久伪装成 running。结构化的 `completed` 只是本轮结束，绝不可调用这里。
+   */
+  settleTerminatedSession(sessionId: string, reason: string): StopWorkerResult | null {
     const active = this.store.listDispatches().find(
       (candidate) =>
         candidate.sessionId === sessionId &&
@@ -148,7 +151,7 @@ export class DispatchService {
 
   /**
    * 恢复 daemon 后不能只等后续 state 事件：直接托管的会话已不在内存，
-   * tmux/结构化会话也可能已在 daemon 启动前结束。逐条对账让持久状态收口。
+   * tmux/结构化会话也可能已在 daemon 启动前真正结束。逐条对账让持久状态收口。
    */
   async reconcilePersistedSessions(): Promise<DispatchRecoveryResult> {
     const settled: StopWorkerResult[] = [];
@@ -172,19 +175,13 @@ export class DispatchService {
         continue;
       }
 
-      if (!session) {
-        const result = this.store.abandonActiveDispatchForMissingSession(
-          dispatch.id,
-          "worker 会话在 daemon 恢复后不存在",
-        );
-        if (result) settled.push(result);
-        if (result) this.store.preserveWorktreeAssetsForDispatch(dispatch.id, result.dispatch.outcome);
-        continue;
-      }
       if (isTerminalSession(session)) {
+        const reason = session
+          ? "worker 会话在 daemon 恢复时已结束但未显式交付"
+          : "worker 会话在 daemon 恢复后不存在";
         const result = this.store.abandonActiveDispatchForMissingSession(
           dispatch.id,
-          "worker 会话在 daemon 恢复时已结束但未显式交付",
+          reason,
         );
         if (result) settled.push(result);
         if (result) this.store.preserveWorktreeAssetsForDispatch(dispatch.id, result.dispatch.outcome);
