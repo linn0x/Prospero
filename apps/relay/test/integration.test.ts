@@ -38,7 +38,7 @@ describe.skipIf(process.env.RELAY_INTEGRATION !== "1")("MySQL 8.4 + Redis real-c
       await expect(routes.applyDeviceSnapshot(routeId, 2, [
         { deviceId, credentialDigest: credentialDigest(token).toString("base64url") }, { deviceId: missingDeviceId, revoked: true },
       ])).resolves.toMatchObject({ route: { generation: 2 } });
-      await expect(routes.applyDeviceSnapshot(routeId, 2, [{ deviceId, credentialDigest: credentialDigest(token).toString("base64url") }])).rejects.toThrow("stale or inconsistent");
+      await expect(routes.applyDeviceSnapshot(routeId, 2, [{ deviceId, credentialDigest: credentialDigest(token).toString("base64url") }])).resolves.toMatchObject({ route: { generation: 2 } });
       await expect(routes.applyDeviceSnapshot(routeId, 1, [{ deviceId, credentialDigest: credentialDigest(token).toString("base64url") }])).rejects.toThrow("stale or inconsistent");
 
       const concurrent = await Promise.allSettled([
@@ -54,6 +54,15 @@ describe.skipIf(process.env.RELAY_INTEGRATION !== "1")("MySQL 8.4 + Redis real-c
       expect(await ephemeral.redeemTicket(ticket, randomOpaque(16))).toEqual({ status: "invalid" });
       expect((await ephemeral.redeemTicket(ticket, streamId))).toMatchObject({ status: "ok", ticket: { streamId } });
       expect(await ephemeral.redeemTicket(ticket, streamId)).toEqual({ status: "used" });
+      const concurrentTicket = randomOpaque(16);
+      const concurrentStreamId = randomOpaque(16);
+      await ephemeral.createTicket({ streamId: concurrentStreamId, ticket: concurrentTicket, routeId, hostConnectionId: "test", clientDeviceId: "client", expiresAt: Date.now() + 30_000 });
+      const concurrentRedemptions = await Promise.all([
+        ephemeral.redeemTicket(concurrentTicket, concurrentStreamId),
+        ephemeral.redeemTicket(concurrentTicket, concurrentStreamId),
+      ]);
+      expect(concurrentRedemptions.filter((result) => result.status === "ok")).toHaveLength(1);
+      expect(concurrentRedemptions.filter((result) => result.status === "used")).toHaveLength(1);
       const expiringTicket = randomOpaque(16);
       await ephemeral.createTicket({ streamId: randomOpaque(16), ticket: expiringTicket, routeId, hostConnectionId: "test", clientDeviceId: "client", expiresAt: Date.now() + 25 });
       await new Promise((resolve) => setTimeout(resolve, 40));
@@ -66,8 +75,11 @@ describe.skipIf(process.env.RELAY_INTEGRATION !== "1")("MySQL 8.4 + Redis real-c
       await ephemeral.releaseStreamLease(routeId, "replacement");
 
       await rawRedis.connect();
-      await ephemeral.setPresence(routeId, "old", 30); await ephemeral.setPresence(routeId, "new", 30); await ephemeral.clearPresence(routeId, "old");
-      expect(await rawRedis.get(`presence:${routeId}`)).toBe("new");
+      for (let race = 0; race < 8; race += 1) {
+        await ephemeral.setPresence(routeId, "old", 30);
+        await Promise.all([ephemeral.setPresence(routeId, "new", 30), ephemeral.clearPresence(routeId, "old")]);
+        expect(await rawRedis.get(`presence:${routeId}`)).toBe("new");
+      }
       const inspected = await routes.inspectRoute(routeId);
       expect(JSON.stringify(inspected)).not.toContain(token);
     } finally {
