@@ -149,7 +149,33 @@ export class MySqlRouteStore implements RouteStore {
     await this.pool.execute("INSERT INTO routes (route_id) VALUES (?)", [routeId]);
   }
 
+  /**
+   * Concurrent first-time route/snapshot inserts can deadlock on InnoDB gap
+   * locks even when their opaque route IDs differ. The whole transaction is
+   * safe to retry: it is either rolled back or atomically committed, and the
+   * generation check still rejects non-idempotent replays.
+   */
+  private async retryDeadlock<T>(operation: () => Promise<T>): Promise<T> {
+    const retries = 8;
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await operation();
+      } catch (error) {
+        const mysql = error as { code?: unknown; errno?: unknown; sqlState?: unknown };
+        const deadlock = mysql.code === "ER_LOCK_DEADLOCK" || mysql.errno === 1213 || mysql.sqlState === "40001";
+        if (!deadlock || attempt >= retries) throw error;
+        // Bounded jitter breaks lock-step reconnect/snapshot storms without
+        // stretching a caller beyond its normal authentication timeout.
+        await new Promise<void>((resolve) => setTimeout(resolve, 5 + Math.floor(Math.random() * 10) + attempt * 10));
+      }
+    }
+  }
+
   async ensureRoute(routeId: string): Promise<RouteRecord | null> {
+    return this.retryDeadlock(() => this.ensureRouteOnce(routeId));
+  }
+
+  private async ensureRouteOnce(routeId: string): Promise<RouteRecord | null> {
     const connection = await this.pool.getConnection();
     try {
       await connection.beginTransaction();
@@ -172,6 +198,10 @@ export class MySqlRouteStore implements RouteStore {
   }
 
   async applyDeviceSnapshot(routeId: string, generation: number, credentials: SnapshotCredential[]): Promise<RouteSnapshot | null> {
+    return this.retryDeadlock(() => this.applyDeviceSnapshotOnce(routeId, generation, credentials));
+  }
+
+  private async applyDeviceSnapshotOnce(routeId: string, generation: number, credentials: SnapshotCredential[]): Promise<RouteSnapshot | null> {
     const connection = await this.pool.getConnection();
     let transactionOpen = false;
     try {

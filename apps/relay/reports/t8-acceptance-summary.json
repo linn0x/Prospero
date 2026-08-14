@@ -1,0 +1,90 @@
+{
+  "schemaVersion": 1,
+  "kind": "prospero-relay-t8-acceptance-summary",
+  "status": "inconclusive",
+  "qualificationStatus": "inconclusive",
+  "environment": {
+    "dockerCpus": 10,
+    "dockerMemoryBytes": 12601012224,
+    "requiredDockerCpus": 8,
+    "requiredDockerMemoryBytes": 17179869184
+  },
+  "deploymentStatic": {
+    "onlyCaddyPublicPorts": true,
+    "publicPorts": [80, 443],
+    "mysqlRedisRelayHealthchecks": true,
+    "relayNofile": 131072,
+    "publicTlsValidation": "not_executed_without_public_dns_and_deployed_caddy"
+  },
+  "failureMatrix": {
+    "report": "apps/relay/reports/t8-local-failure.json",
+    "status": "passed",
+    "redisAndMysqlFailClosedRecovery": true,
+    "relayRestartReconnect": true,
+    "disabledTombstone": true,
+    "backupRestore": true,
+    "thirtyDayCleanup": true
+  },
+  "scaleResults": [
+    {
+      "report": "apps/relay/reports/t8-capacity-250h-50p-30s.json",
+      "hosts": 250,
+      "pairs": 50,
+      "holdSeconds": 30,
+      "executionStatus": "passed"
+    },
+    {
+      "report": "apps/relay/reports/t8-capacity-1000h-200p-60s.json",
+      "hosts": 1000,
+      "pairs": 200,
+      "holdSeconds": 60,
+      "executionStatus": "passed",
+      "openP95Ms": 111.77433400000018,
+      "relayCpuPercent": 8.722865735975299,
+      "relayRssPeakBytes": 225005568,
+      "relayFdPeak": 1434,
+      "relayEventLoopP99Ms": 40.009727
+    },
+    {
+      "report": "apps/relay/reports/t8-capacity-2500h-500p-60s.json",
+      "hosts": 2500,
+      "pairs": 500,
+      "holdSeconds": 60,
+      "executionStatus": "passed",
+      "openP95Ms": 202.17891700000018,
+      "relayCpuPercent": 15.917778081650635,
+      "relayRssPeakBytes": 348090368,
+      "relayFdPeak": 3534,
+      "relayEventLoopP99Ms": 72.679423
+    },
+    {
+      "report": "apps/relay/reports/t8-capacity-5000h-1000p-60s.json",
+      "hosts": 5000,
+      "pairs": 1000,
+      "holdSeconds": 60,
+      "executionStatus": "failed",
+      "unexpectedDisconnects": 174,
+      "heartbeatSent": 45000,
+      "heartbeatAcknowledged": 45000,
+      "heartbeatMissed": 0,
+      "openP95Ms": 312.7354999999998,
+      "relayCpuPercent": 27.413004425244974,
+      "relayRssPeakBytes": 491438080,
+      "relayFdPeak": 7035,
+      "relayEventLoopP99Ms": 115.277823,
+      "queuedWritePeakBytes": 266288,
+      "sendCallbackErrors": 6
+    }
+  ],
+  "qualificationBlockers": [
+    "Docker memory is below the required 16 GiB.",
+    "The short target run did not sustain zero disconnects at 5000 hosts and 1000 pairs.",
+    "A same-environment direct baseline was not supplied, so added RTT is not measured.",
+    "Public TLS validation requires DNS and a deployed Caddy endpoint.",
+    "No 600-second target run was executed."
+  ],
+  "notes": [
+    "All load results are short execution evidence, not a 600-second qualification.",
+    "Reports contain aggregate safe projections only."
+  ]
+}

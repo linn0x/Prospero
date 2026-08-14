@@ -1,0 +1,95 @@
+{
+  "schemaVersion": 1,
+  "kind": "prospero-relay-failure-report",
+  "startedAt": "2026-08-14T10:08:33.610Z",
+  "status": "passed",
+  "steps": [
+    {
+      "name": "compose_public_ports_only_caddy_80_443",
+      "pass": null,
+      "skipped": "isolated local stack has no Caddy; production Caddy validation remains required"
+    },
+    {
+      "name": "live_and_ready",
+      "pass": true,
+      "result": {
+        "live": 200,
+        "ready": 200
+      }
+    },
+    {
+      "name": "caddy_tls_wss_handshake",
+      "pass": null,
+      "skipped": "no public WSS URL supplied"
+    },
+    {
+      "name": "initial_host_ready",
+      "pass": true,
+      "result": {
+        "ready": true
+      }
+    },
+    {
+      "name": "redis_fail_closed",
+      "pass": true,
+      "result": {
+        "readinessDuringFault": 503,
+        "reconnect": true
+      }
+    },
+    {
+      "name": "mysql_fail_closed",
+      "pass": true,
+      "result": {
+        "readinessDuringFault": 503,
+        "reconnect": true
+      }
+    },
+    {
+      "name": "relay_graceful_restart_and_host_reconnect",
+      "pass": true,
+      "result": {
+        "reconnect": true
+      }
+    },
+    {
+      "name": "disabled_tombstone_rejects_existing_host",
+      "pass": true,
+      "result": {
+        "rejected": true
+      }
+    },
+    {
+      "name": "mysql_backup_restore_preserves_tombstone",
+      "pass": true,
+      "result": {
+        "pass": true,
+        "restoredRouteCount": 1
+      }
+    },
+    {
+      "name": "scheduled_30_day_cleanup",
+      "pass": true,
+      "result": {
+        "pass": true,
+        "staleRouteDeleted": true
+      }
+    }
+  ],
+  "failures": [],
+  "recovery": [
+    {
+      "service": "mysql",
+      "restored": true
+    },
+    {
+      "service": "redis",
+      "restored": true
+    },
+    {
+      "service": "relay",
+      "restored": true
+    }
+  ],
+  "finishedAt": "2026-08-14T10:09:54.223Z"
+}
