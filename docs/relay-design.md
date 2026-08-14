@@ -102,8 +102,11 @@ routeId = base64url(SHA-256(
 ```
 
 This prevents a route ID from acting as a host identity or a reusable host
-credential. It is a route selector derived from a secret known to the host
-registration flow and the relay authentication check.
+credential. It is a route selector derived from a secret known only to the
+host and the relay authentication check. There is no user account, route-create
+CLI, or device-add CLI: a valid host self-registers its route on first
+authentication. A disabled route remains a tombstone and cannot be recreated
+by presenting that secret.
 
 Authentication alone does not put a host online. The host must next send an
 atomic full replacement snapshot:
@@ -135,9 +138,12 @@ from a newer snapshot is revoked too; `credentials: []` revokes every previously
 known device. Duplicate device IDs are invalid.
 
 Generations are monotonic per route. A relay applies a newer snapshot atomically
-and returns `host.device-sync.ack { v, generation }`; it may ACK a byte-identical
-retransmission of the current generation for recovery, but it must not merge
-partial snapshots. Only after the ack for its initial snapshot does the relay
+and returns `host.device-sync.ack { v, generation }`; it may ACK a semantically
+equivalent retransmission of the current generation for recovery. In particular,
+MySQL retains devices omitted by a newer snapshot as revoked audit rows, so a
+retry may omit those rows or include them as `revoked: true`; active device IDs
+and credential digests must still match exactly. It must not merge partial
+snapshots. Only after the ack for its initial snapshot does the relay
 send `host.ready { v, routeId, generation }` and advertise the host as online.
 
 An online host sends `host.heartbeat { v, generation }`; the relay returns

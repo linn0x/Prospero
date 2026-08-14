@@ -77,21 +77,21 @@ describe("relay v1 independent data-plane contract", () => {
     });
   });
 
-  it("keeps host control JSON-only and rejects the old same-socket stream.open shape", () => {
+  it("keeps host control JSON-only and rejects legacy same-socket relay shapes", () => {
     // This is an application SecureChannel ciphertext shape, not relay control.
     expect(() => parseRelayHostControlMessage({ c: "opaque_e2e_ciphertext" })).toThrowError(
       ProtocolError,
     );
     expect(() =>
       parseRelayHostControlMessage({
-        type: "stream.open",
+        type: "stream.legacy-open",
         v: RELAY_PROTOCOL_VERSION,
         streamId,
       }),
     ).toThrowError(ProtocolError);
     expect(() =>
       parseRelayControlMessage({
-        type: "stream.open",
+        type: "stream.legacy-open",
         v: RELAY_PROTOCOL_VERSION,
         streamId,
       }),
