@@ -2070,7 +2070,12 @@ const styles = StyleSheet.create({
     borderRadius: radius.md,
     backgroundColor: color.surface,
   },
-  orphanWorktreeToggle: { flexDirection: "row", alignItems: "center", gap: space.sm },
+  orphanWorktreeToggle: {
+    minHeight: WORKTREE_ACTION_MIN_HIT_TARGET,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: space.sm,
+  },
   orphanWorktreeCopy: { flex: 1, gap: 2 },
   orphanWorktreeTitle: { color: color.text, fontSize: 13, fontWeight: "700" },
   orphanWorktreeDetail: { color: color.textFaint, fontSize: 10, lineHeight: 14 },
