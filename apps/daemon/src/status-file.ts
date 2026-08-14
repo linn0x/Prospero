@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import type { SessionInfo } from "@prospero/protocol";
 import type { SessionManager } from "./session-manager.js";
+import type { RelayRuntimeStatus } from "./relay-host-client.js";
 
 /** 壳只需要这些字段;完整 SessionInfo 里的 seq/totals 之类没必要外泄。 */
 export interface StatusSession {
@@ -46,6 +47,8 @@ export interface StatusSnapshot {
   /** 仅供同用户 Mac GUI 调用回环控制接口；status.json 权限固定为 0600。 */
   controlToken: string;
   persistence: { pty: boolean; structured: boolean };
+  /** Deliberately safe relay observability; credentials are never copied here. */
+  relay?: RelayRuntimeStatus;
   sessions: StatusSession[];
 }
 
@@ -71,6 +74,7 @@ export class StatusFile {
   private readonly filePath: string;
   private timer: NodeJS.Timeout | null = null;
   private detach: (() => void) | null = null;
+  private relay: RelayRuntimeStatus | undefined;
 
   constructor(
     home: string,
@@ -95,6 +99,11 @@ export class StatusFile {
     this.write();
   }
 
+  setRelayStatus(status: RelayRuntimeStatus): void {
+    this.relay = status;
+    this.schedule();
+  }
+
   /**
    * 合并写。洪峰输出时 state 事件很密,每次都写文件会白白打盘;
    * 壳是 3 秒轮询的,250ms 的合帧对它来说已经是即时。
@@ -117,6 +126,7 @@ export class StatusFile {
       bind: this.meta.bind,
       controlToken: this.meta.controlToken,
       persistence: this.meta.persistence,
+      ...(this.relay ? { relay: this.relay } : {}),
       sessions: this.manager.list().map(toStatusSession),
     };
     try {

@@ -4,14 +4,19 @@
  * M1 期间在终端里手动运行(继承终端的 TCC 权限),不装 LaunchAgent(M3 由菜单栏壳接管)。
  */
 import { createRequire } from "node:module";
+import { readFileSync } from "node:fs";
 import os from "node:os";
+import path from "node:path";
 import { Command } from "commander";
-import { encodePairingQR } from "@prospero/protocol";
+import { encodePairingQR, validateRelayUrl } from "@prospero/protocol";
 import { advertise, candidateAddrs, resolveBindAddr } from "./discovery.js";
 import { Notifier } from "./notify.js";
 import {
   DEFAULT_PORT,
   buildPairingPayload,
+  deriveRelayRouteId,
+  effectiveRelayUrl,
+  generateRelayHostSecret,
   loadConfig,
   loadDevices,
   loadIdentity,
@@ -19,6 +24,8 @@ import {
   rotateIdentity,
   mintDevice,
   prosperoHome,
+  relayPairingForDevice,
+  saveDevices,
   saveConfig,
 } from "./pairing.js";
 import { createDaemonServer } from "./ws-server.js";
@@ -122,9 +129,26 @@ program
   .option("--name <name>", "设备名", "iphone")
   .option("--no-shell", "该设备禁止 shell/custom 会话(完整用户权限)")
   .option("--no-orchestration", "该设备只能查看编排与处理 Gate，不能创建任务或派发 worker")
-  .action((opts: { name: string; shell: boolean; orchestration: boolean }) => {
+  .option("--dev", "只用于 ws://loopback relay 开发二维码", false)
+  .action((opts: { name: string; shell: boolean; orchestration: boolean; dev: boolean }) => {
     const home = prosperoHome();
     const config = loadConfig(home);
+    if (config.relay?.enabled) {
+      const relayUrl = effectiveRelayUrl(config);
+      if (!relayUrl || !config.relay.hostSecret) {
+        console.error("relay 已启用但配置不完整；请先运行 prosperod relay enable --url <wss URL>。");
+        process.exitCode = 1;
+        return;
+      }
+      try {
+        validateRelayUrl(relayUrl, { allowInsecureLoopback: opts.dev });
+        deriveRelayRouteId(config.relay.hostSecret);
+      } catch (error) {
+        console.error(`无法生成 relay 配对二维码：${error instanceof Error ? error.message : String(error)}`);
+        process.exitCode = 1;
+        return;
+      }
+    }
     const device = mintDevice(home, {
       name: opts.name,
       allowShell: opts.shell,
@@ -134,19 +158,152 @@ program
       token: device.token,
       port: config.port,
       bind: config.bind,
+      relay: relayPairingForDevice(config, device) ?? undefined,
     });
-    if (payload.addrs.length === 0) {
-      console.error("警告:未发现可用网卡地址(WiFi/WG 均未连接?),二维码不可用。");
+    if (payload.addrs.length === 0 && !payload.relay) {
+      console.error("警告:未发现可用网卡地址且 relay 未就绪,二维码不可用。");
+    } else if (payload.addrs.length === 0 && payload.relay) {
+      console.log("未发现可用网卡地址；将生成 relay-only 配对二维码。");
     }
-    const url = encodePairingQR(payload);
+    const url = encodePairingQR(payload, { allowInsecureLoopback: opts.dev });
     qrcode.generate(url, { small: true });
     console.log(
       `设备「${device.name}」已登记(allowShell=${String(device.allowShell)}, ` +
       `allowOrchestration=${String(device.allowOrchestration ?? device.allowShell)})`,
     );
-    console.log(`地址: ${payload.addrs.join(", ")}  端口: ${payload.port}`);
+    console.log(`地址: ${payload.addrs.join(", ") || "(relay-only)"}  端口: ${payload.port}`);
+    if (payload.relay) console.log(`中继: ${payload.relay.url}`);
     console.log(`配对串(扫码不便时手动输入):\n${url}`);
     console.log("注意:二维码含访问凭证,请勿截图外传。daemon 重启无需重新配对。");
+  });
+
+const relay = program
+  .command("relay")
+  .description("配置并查看公网 relay（relay token 与 hostSecret 永不打印）");
+
+relay
+  .command("enable")
+  .description("启用 relay；无 --url 时使用已有 override 或 PROSPERO_DEFAULT_RELAY_URL")
+  .option("--url <url>", "覆盖 relay 完整 WSS URL")
+  .option("--dev", "仅允许 ws://localhost/loopback 开发 relay", false)
+  .action((opts: { url?: string; dev: boolean }) => {
+    const home = prosperoHome();
+    const config = loadConfig(home);
+    const url = opts.url ?? effectiveRelayUrl(config);
+    if (!url) {
+      console.error("无法启用 relay：未设置 --url，且 PROSPERO_DEFAULT_RELAY_URL 不存在。");
+      process.exitCode = 1;
+      return;
+    }
+    try {
+      validateRelayUrl(url, { allowInsecureLoopback: opts.dev });
+    } catch (error) {
+      console.error(`无法启用 relay：${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+      return;
+    }
+    const previous = config.relay;
+    saveConfig(home, {
+      ...config,
+      relay: {
+        enabled: true,
+        ...(opts.url !== undefined ? { url: opts.url } : previous?.url ? { url: previous.url } : {}),
+        hostSecret: previous?.hostSecret ?? generateRelayHostSecret(),
+      },
+    });
+    console.log(`relay 已启用：${url}`);
+    console.log("运行中的 daemon 会热加载此配置；新配对二维码会带 relay 凭证。");
+  });
+
+relay
+  .command("disable")
+  .description("停止 relay 注册连接；不删除 URL 或 hostSecret")
+  .action(() => {
+    const home = prosperoHome();
+    const config = loadConfig(home);
+    saveConfig(home, {
+      ...config,
+      relay: {
+        enabled: false,
+        ...(config.relay?.url ? { url: config.relay.url } : {}),
+        ...(config.relay?.hostSecret ? { hostSecret: config.relay.hostSecret } : {}),
+      },
+    });
+    console.log("relay 已关闭；运行中的 daemon 会断开 relay 连接。");
+  });
+
+relay
+  .command("status")
+  .description("查看 relay 配置及 daemon 运行时状态")
+  .option("--json", "输出机器可读 JSON", false)
+  .action((opts: { json: boolean }) => {
+    const home = prosperoHome();
+    const config = loadConfig(home);
+    const devices = loadDevices(home);
+    const url = effectiveRelayUrl(config) ?? null;
+    let routeId: string | null = null;
+    if (config.relay?.hostSecret) {
+      try {
+        routeId = deriveRelayRouteId(config.relay.hostSecret);
+      } catch {
+        // Keep status usable for hand-edited/corrupt config; runtime reports a
+        // sanitized configuration error rather than exposing secret material.
+      }
+    }
+    let runtime: Record<string, unknown> | undefined;
+    try {
+      const raw = JSON.parse(readFileSync(path.join(home, "status.json"), "utf8")) as { relay?: Record<string, unknown> };
+      runtime = raw.relay;
+    } catch {
+      // daemon may not be running; config status is still useful.
+    }
+    const legacy = devices.filter((device) => !device.relayDeviceId || !device.relayToken).length;
+    const result = {
+      enabled: config.relay?.enabled === true,
+      url,
+      routeId,
+      state: runtime?.["state"] ?? (config.relay?.enabled ? "offline" : "disabled"),
+      updatedAt: runtime?.["updatedAt"] ?? null,
+      lastConnectedAt: runtime?.["lastConnectedAt"] ?? null,
+      lastError: runtime?.["lastError"] ?? null,
+      devices: runtime?.["devices"] ?? { total: devices.length, ready: 0, needsRePair: legacy },
+      rePairRequired: legacy > 0,
+    };
+    if (opts.json) {
+      console.log(JSON.stringify(result));
+      return;
+    }
+    console.log(`relay: ${result.enabled ? result.state : "disabled"}`);
+    console.log(`URL: ${result.url ?? "未配置"}`);
+    console.log(`已就绪设备: ${(result.devices as { ready?: number }).ready ?? 0}`);
+    if (result.rePairRequired) console.log(`提示: ${legacy} 台旧设备没有 relay 凭证，需重新配对；仍可直连。`);
+    if (typeof result.lastError === "string") console.log(`最近错误: ${result.lastError}`);
+  });
+
+relay
+  .command("rotate-key")
+  .description("轮换 relay route key；所有设备需重新配对才能继续使用 relay")
+  .option("-y, --yes", "跳过确认")
+  .action((opts: { yes?: boolean }) => {
+    const home = prosperoHome();
+    const config = loadConfig(home);
+    const devices = loadDevices(home);
+    if (opts.yes !== true) {
+      console.log("这会轮换 relay host key，并移除所有设备的 relay 凭证。");
+      console.log("直连配对不会失效，但每台设备必须重新扫码才可继续经 relay 连接。");
+      console.log("确认请加 --yes 重跑: prosperod relay rotate-key --yes");
+      return;
+    }
+    saveConfig(home, {
+      ...config,
+      relay: {
+        enabled: config.relay?.enabled ?? false,
+        ...(config.relay?.url ? { url: config.relay.url } : {}),
+        hostSecret: generateRelayHostSecret(),
+      },
+    });
+    saveDevices(home, devices.map(({ relayDeviceId: _id, relayToken: _token, ...device }) => device));
+    console.log(`已轮换 relay key；${devices.length} 台设备需要重新配对后才能使用 relay。`);
   });
 
 program
