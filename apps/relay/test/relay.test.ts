@@ -21,6 +21,7 @@ async function open(url: string): Promise<WebSocket> { const ws = new WebSocket(
 async function next(ws: WebSocket): Promise<{ data: Buffer; binary: boolean }> { const state = inbox(ws); const item = state.queue.shift(); return item === undefined ? new Promise((resolve) => state.waiting.push(resolve)) : item; }
 async function close(ws: WebSocket): Promise<void> { if (ws.readyState >= WebSocket.CLOSING) return; const done = once(ws, "close"); ws.close(); await done; }
 const wait = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+const nextTurn = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
 class DelayedRouteStore extends MemoryRouteStore {
   inFlight = 0; maxInFlight = 0; hold = false;
@@ -42,6 +43,72 @@ class DelayedRouteStore extends MemoryRouteStore {
   release(): void { this.releaseHold?.(); }
 }
 
+class DeferredGate {
+  readonly entered: Promise<void>;
+  private readonly markEntered: () => void;
+  private readonly released: Promise<void>;
+  private readonly markReleased: () => void;
+  constructor() {
+    this.entered = new Promise((resolve) => { this.markEntered = resolve; });
+    this.released = new Promise((resolve) => { this.markReleased = resolve; });
+  }
+  arrive(): void { this.markEntered(); }
+  async wait(): Promise<void> { await this.released; }
+  release(): void { this.markReleased(); }
+}
+
+class OneShotDeferredRouteStore extends MemoryRouteStore {
+  private gate: DeferredGate | undefined;
+  deferNextSnapshot(): DeferredGate { const gate = new DeferredGate(); this.gate = gate; return gate; }
+  override async applyDeviceSnapshot(...args: Parameters<MemoryRouteStore["applyDeviceSnapshot"]>) {
+    const gate = this.gate; this.gate = undefined;
+    if (gate !== undefined) { gate.arrive(); await gate.wait(); }
+    return super.applyDeviceSnapshot(...args);
+  }
+}
+
+class DeferredEphemeralStore extends MemoryEphemeralStore {
+  private cacheGate: DeferredGate | undefined;
+  private presenceGate: DeferredGate | undefined;
+  private connectionGate: DeferredGate | undefined;
+  private clientAuthGate: DeferredGate | undefined;
+  private redeemGate: DeferredGate | undefined;
+  readonly presenceWrites: Array<{ routeId: string; connectionId: string }> = [];
+  private presenceWaiters: Array<() => void> = [];
+  deferNextCache(): DeferredGate { const gate = new DeferredGate(); this.cacheGate = gate; return gate; }
+  deferNextPresence(): DeferredGate { const gate = new DeferredGate(); this.presenceGate = gate; return gate; }
+  deferConnectionAdmission(): DeferredGate { const gate = new DeferredGate(); this.connectionGate = gate; return gate; }
+  deferClientAuth(): DeferredGate { const gate = new DeferredGate(); this.clientAuthGate = gate; return gate; }
+  deferTicketRedeem(): DeferredGate { const gate = new DeferredGate(); this.redeemGate = gate; return gate; }
+  async waitForPresenceWrites(count: number): Promise<void> {
+    while (this.presenceWrites.length < count) await new Promise<void>((resolve) => this.presenceWaiters.push(resolve));
+  }
+  override async cacheCredential(...args: Parameters<MemoryEphemeralStore["cacheCredential"]>): Promise<void> {
+    const gate = this.cacheGate; this.cacheGate = undefined;
+    if (gate !== undefined) { gate.arrive(); await gate.wait(); }
+    await super.cacheCredential(...args);
+  }
+  override async setPresence(...args: Parameters<MemoryEphemeralStore["setPresence"]>): Promise<void> {
+    const gate = this.presenceGate; this.presenceGate = undefined;
+    if (gate !== undefined) { gate.arrive(); await gate.wait(); }
+    await super.setPresence(...args);
+    this.presenceWrites.push({ routeId: args[0], connectionId: args[1] });
+    for (const waiter of this.presenceWaiters.splice(0)) waiter();
+  }
+  override async consumeRateLimit(...args: Parameters<MemoryEphemeralStore["consumeRateLimit"]>) {
+    const gate = args[0].startsWith("connection:") ? this.connectionGate : args[0].startsWith("auth:client:") ? this.clientAuthGate : undefined;
+    if (args[0].startsWith("connection:")) this.connectionGate = undefined;
+    if (args[0].startsWith("auth:client:")) this.clientAuthGate = undefined;
+    if (gate !== undefined) { gate.arrive(); await gate.wait(); }
+    return super.consumeRateLimit(...args);
+  }
+  override async redeemTicket(...args: Parameters<MemoryEphemeralStore["redeemTicket"]>) {
+    const gate = this.redeemGate; this.redeemGate = undefined;
+    if (gate !== undefined) { gate.arrive(); await gate.wait(); }
+    return super.redeemTicket(...args);
+  }
+}
+
 class FailingEphemeralStore extends MemoryEphemeralStore {
   failCache = false; failPublish = false; failPresence = false;
   override async cacheCredential(...args: Parameters<MemoryEphemeralStore["cacheCredential"]>): Promise<void> { if (this.failCache) throw new Error("cache unavailable"); await super.cacheCredential(...args); }
@@ -53,10 +120,10 @@ describe("relay v1 independent data-plane service", () => {
   const running: RelayServer[] = [];
   afterEach(async () => { await Promise.all(running.splice(0).map((relay) => relay.close())); });
 
-  async function start(overrides: Partial<RelayConfig> = {}, routes = new MemoryRouteStore(), ephemeral = new MemoryEphemeralStore()) {
-    const relay = new RelayServer({ routes, ephemeral, config: { ...config(), ...overrides }, logger: createLogger("silent") });
+  async function start(overrides: Partial<RelayConfig> = {}, routes = new MemoryRouteStore(), ephemeral = new MemoryEphemeralStore(), shutdownGraceMs?: number) {
+    const relay = new RelayServer({ routes, ephemeral, config: { ...config(), ...overrides }, logger: createLogger("silent"), ...(shutdownGraceMs === undefined ? {} : { shutdownGraceMs }) });
     await relay.listen(); running.push(relay); const address = relay.address(); if (address === undefined) throw new Error("missing address");
-    return { routes, ephemeral, url: `ws://127.0.0.1:${address.port}` };
+    return { relay, routes, ephemeral, url: `ws://127.0.0.1:${address.port}` };
   }
 
   async function hostOnline(url: string, generation = 1): Promise<WebSocket> {
@@ -210,6 +277,95 @@ describe("relay v1 independent data-plane service", () => {
     await expect(routes.applyDeviceSnapshot(routeId, 1, [activeCredential(deviceId, token), { deviceId: secondDevice, revoked: true }])).rejects.toThrow("stale or inconsistent");
     await expect(routes.applyDeviceSnapshot(routeId, 2, [activeCredential(deviceId, token), { deviceId: secondDevice, revoked: true }])).resolves.toMatchObject({ route: { generation: 2 } });
     await expect(routes.applyDeviceSnapshot(routeId, 2, [activeCredential(deviceId, "V".repeat(43))])).rejects.toThrow("stale or inconsistent");
+    await expect(routes.applyDeviceSnapshot(routeId, 2, [activeCredential(deviceId, token), { deviceId: "e".repeat(22), revoked: true }])).rejects.toThrow("stale or inconsistent");
+  });
+
+  it("fences timed-out and superseded hosts across deferred snapshot, cache, and presence work", async () => {
+    const timedOutRoutes = new OneShotDeferredRouteStore(); const timedOutEphemeral = new DeferredEphemeralStore();
+    const timedOut = await start({ authTimeoutMs: 40 }, timedOutRoutes, timedOutEphemeral);
+    const slow = await open(`${timedOut.url}/v1/host`); const snapshotGate = timedOutRoutes.deferNextSnapshot(); const slowClosed = once(slow, "close");
+    slow.send(JSON.stringify({ v: 1, routeId, hostSecret }));
+    slow.send(JSON.stringify({ type: "host.device-sync", v: 1, generation: 1, credentials: [activeCredential(deviceId, token)] }));
+    await snapshotGate.entered;
+    expect((await slowClosed)[0]).toBe(1013);
+    snapshotGate.release(); await nextTurn();
+    expect(timedOutEphemeral.presence.size).toBe(0);
+
+    const cacheRoutes = new MemoryRouteStore(); const cacheEphemeral = new DeferredEphemeralStore(); const cached = await start({}, cacheRoutes, cacheEphemeral);
+    const old = await open(`${cached.url}/v1/host`); const cacheGate = cacheEphemeral.deferNextCache(); const oldClosed = once(old, "close");
+    old.send(JSON.stringify({ v: 1, routeId, hostSecret }));
+    old.send(JSON.stringify({ type: "host.device-sync", v: 1, generation: 1, credentials: [activeCredential(deviceId, token)] }));
+    await cacheGate.entered;
+    const newer = await hostOnline(cached.url, 2);
+    expect((await oldClosed)[0]).toBe(4009);
+    const newestPresence = cacheEphemeral.presence.get(routeId);
+    cacheGate.release(); await nextTurn();
+    expect(cacheEphemeral.presence.get(routeId)).toBe(newestPresence);
+    await close(newer);
+
+    const presenceRoutes = new MemoryRouteStore(); const presenceEphemeral = new DeferredEphemeralStore(); const present = await start({}, presenceRoutes, presenceEphemeral);
+    const previous = await open(`${present.url}/v1/host`); const presenceGate = presenceEphemeral.deferNextPresence(); const previousClosed = once(previous, "close");
+    previous.send(JSON.stringify({ v: 1, routeId, hostSecret }));
+    previous.send(JSON.stringify({ type: "host.device-sync", v: 1, generation: 1, credentials: [activeCredential(deviceId, token)] }));
+    await presenceGate.entered;
+    const current = await hostOnline(present.url, 2);
+    expect((await previousClosed)[0]).toBe(4009);
+    const currentPresence = presenceEphemeral.presence.get(routeId);
+    presenceGate.release();
+    await presenceEphemeral.waitForPresenceWrites(3);
+    expect(presenceEphemeral.presence.get(routeId)).toBe(currentPresence);
+    await close(current);
+
+    // H1's delayed write is repairing H2 exactly as H3 takes over. H2 can
+    // therefore land after H3, be compare-deleted, and must re-resolve H3
+    // instead of leaving the route with no presence marker.
+    const tripleRoutes = new MemoryRouteStore(); const tripleEphemeral = new DeferredEphemeralStore(); const triple = await start({}, tripleRoutes, tripleEphemeral);
+    const h1 = await open(`${triple.url}/v1/host`); const h1PresenceGate = tripleEphemeral.deferNextPresence(); const h1Closed = once(h1, "close");
+    h1.send(JSON.stringify({ v: 1, routeId, hostSecret }));
+    h1.send(JSON.stringify({ type: "host.device-sync", v: 1, generation: 1, credentials: [activeCredential(deviceId, token)] }));
+    await h1PresenceGate.entered;
+    const h2 = await hostOnline(triple.url, 2); const h2Closed = once(h2, "close");
+    expect((await h1Closed)[0]).toBe(4009);
+    const h2RepairGate = tripleEphemeral.deferNextPresence();
+    h1PresenceGate.release(); await h2RepairGate.entered;
+    const h3 = await hostOnline(triple.url, 3);
+    expect((await h2Closed)[0]).toBe(4009);
+    const h3Presence = tripleEphemeral.presence.get(routeId);
+    h2RepairGate.release();
+    await tripleEphemeral.waitForPresenceWrites(5);
+    expect(tripleEphemeral.presence.get(routeId)).toBe(h3Presence);
+    await close(h3);
+  });
+
+  it("cancels pre-ready and closed peers before they can leave client-open or redeem side effects", async () => {
+    const ephemeral = new DeferredEphemeralStore(); const { relay, url } = await start({}, new MemoryRouteStore(), ephemeral);
+    const host = await hostOnline(url);
+    const preReady = await open(`${url}/v1/client`); const authGate = ephemeral.deferClientAuth(); const preReadyClosed = once(preReady, "close");
+    preReady.send(JSON.stringify({ type: "client.open", v: 1, routeId, deviceId, token }));
+    preReady.send("not control");
+    await authGate.entered;
+    expect((await preReadyClosed)[0]).toBe(1008);
+    authGate.release(); await nextTurn();
+    expect(ephemeral.tickets.size).toBe(0); expect(ephemeral.leases.size).toBe(0); expect(inbox(host).queue).toHaveLength(0);
+
+    const closedClient = await open(`${url}/v1/client`); const closeGate = ephemeral.deferClientAuth();
+    closedClient.send(JSON.stringify({ type: "client.open", v: 1, routeId, deviceId, token }));
+    await closeGate.entered;
+    const clientGone = once(closedClient, "close"); closedClient.close(); await clientGone;
+    closeGate.release(); await nextTurn();
+    expect(ephemeral.tickets.size).toBe(0); expect(ephemeral.leases.size).toBe(0); expect(inbox(host).queue).toHaveLength(0);
+
+    const pending = await clientPending(url); const offer = JSON.parse((await next(host)).data.toString()) as { streamId: string; ticket: string };
+    const redeemGate = ephemeral.deferTicketRedeem(); const stream = await open(`${url}/v1/stream`); const streamGone = once(stream, "close"); const pendingGone = once(pending.client, "close");
+    stream.send(JSON.stringify({ type: "stream.accept", v: 1, streamId: offer.streamId, ticket: offer.ticket }));
+    await redeemGate.entered;
+    stream.close(); await streamGone;
+    redeemGate.release(); await pendingGone; await nextTurn();
+    expect(inbox(stream).queue).toHaveLength(0); expect(ephemeral.tickets.has(offer.ticket)).toBe(false); expect(ephemeral.leases.size).toBe(0);
+    const metricValues = (await relay.metrics.connections.get()).values.map((value) => value.value);
+    expect(metricValues.every((value) => value >= 0)).toBe(true);
+    await close(host); await relay.close();
+    expect((await relay.metrics.connections.get()).values.every((value) => value.value === 0)).toBe(true);
   });
 
   it("accepts an idempotent snapshot after a host restart and fails existing streams closed on MySQL loss", async () => {
@@ -267,6 +423,25 @@ describe("relay v1 independent data-plane service", () => {
     const binaryClosed = once(client, "close"); client.send(Buffer.from([7])); expect((await binaryClosed)[0]).toBe(1008);
     const raw = await open(`${url}/v1/client`); const relay = running.at(-1)!; const rawClosed = once(raw, "close"); await relay.close();
     expect((await rawClosed)[0]).toBe(1012); await close(host);
+  });
+
+  it("bounds shutdown for stalled close handshakes and never upgrades a deferred admission after stopping", async () => {
+    const first = await start({}, new MemoryRouteStore(), new MemoryEphemeralStore(), 25);
+    const host = await hostOnline(first.url);
+    const rawSocket = (host as unknown as { _socket?: { pause: () => void } })._socket;
+    expect(rawSocket).toBeDefined(); rawSocket?.pause();
+    const started = Date.now(); await first.relay.close();
+    expect(Date.now() - started).toBeLessThan(750);
+    host.terminate();
+
+    const deferred = new DeferredEphemeralStore(); const second = await start({}, new MemoryRouteStore(), deferred, 100);
+    const admissionGate = deferred.deferConnectionAdmission(); const delayed = new WebSocket(`${second.url}/v1/client`); delayed.on("error", () => undefined);
+    await admissionGate.entered;
+    const closing = second.relay.close();
+    admissionGate.release();
+    await closing; await nextTurn();
+    expect(delayed.readyState).not.toBe(WebSocket.OPEN);
+    delayed.terminate();
   });
 
   it("rejects URL query credentials and closes both peers for pre-ready stream data", async () => {

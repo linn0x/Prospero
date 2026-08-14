@@ -39,6 +39,9 @@ describe.skipIf(process.env.RELAY_INTEGRATION !== "1")("MySQL 8.4 + Redis real-c
         { deviceId, credentialDigest: credentialDigest(token).toString("base64url") }, { deviceId: missingDeviceId, revoked: true },
       ])).resolves.toMatchObject({ route: { generation: 2 } });
       await expect(routes.applyDeviceSnapshot(routeId, 2, [{ deviceId, credentialDigest: credentialDigest(token).toString("base64url") }])).resolves.toMatchObject({ route: { generation: 2 } });
+      await expect(routes.applyDeviceSnapshot(routeId, 2, [
+        { deviceId, credentialDigest: credentialDigest(token).toString("base64url") }, { deviceId: randomOpaque(16), revoked: true },
+      ])).rejects.toThrow("stale or inconsistent");
       await expect(routes.applyDeviceSnapshot(routeId, 1, [{ deviceId, credentialDigest: credentialDigest(token).toString("base64url") }])).rejects.toThrow("stale or inconsistent");
 
       const concurrent = await Promise.allSettled([
