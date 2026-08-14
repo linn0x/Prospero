@@ -30,22 +30,22 @@ npm run migrate --workspace @prospero/relay
 
 ## Route ceremony and administration
 
-All commands require `MYSQL_URL` and `REDIS_URL`. The create command emits
-secret material exactly once; save it in the host's private durable settings,
-not in source control, shell history, QR URLs, logs, or MySQL.
+All commands require `MYSQL_URL` and `REDIS_URL`.
 
 ```sh
-npm run admin --workspace @prospero/relay -- route create
 npm run admin --workspace @prospero/relay -- route disable <routeId>
 npm run admin --workspace @prospero/relay -- route enable <routeId>
 npm run admin --workspace @prospero/relay -- route inspect <routeId>
 ```
 
-`route create` makes a 32-byte `hostSecret` and derives the T1 selector
-`routeId = base64url(SHA-256("prospero.relay.v1.route-id\\0" || hostSecret))`.
-The host emits a generation-numbered full device snapshot, in which each phone
-has an independent relay token represented by T1's domain-separated credential
-digest. MySQL stores only that digest, never a token or host secret.
+There is no user/route-create or device-add ceremony. A host creates and keeps
+its own 32-byte `hostSecret`, derives
+`routeId = base64url(SHA-256("prospero.relay.v1.route-id\\0" || hostSecret))`,
+and self-registers on its first valid host authentication. The host's complete,
+generation-numbered snapshot is the only way devices are added. MySQL stores
+only device credential digests, never a token or host secret. A disabled route
+is a retained tombstone: presenting its valid secret cannot recreate it. An
+administrator may explicitly enable a tombstone when that is intended.
 
 The first `/v1/host` WebSocket frame is exactly `{ v, routeId, hostSecret }`.
 The relay validates the derivation, then atomically persists the host's full
@@ -53,8 +53,9 @@ The relay validates the derivation, then atomically persists the host's full
 and advertising `host.ready`; a partial snapshot never becomes online. Phone
 `client.open` is also its first frame. The relay sends `client.status: pending`
 and a host-control `stream.offer`; the daemon redeems its one-time Redis ticket
-in a first `/v1/stream` `stream.accept`. It emits `stream.ready` to both data
-sockets before either side becomes opaque.
+in a first `/v1/stream` `stream.accept`. Tickets are control-frame fields only,
+never URL query parameters. It emits `stream.ready` to both data sockets before
+either side becomes opaque.
 
 Routes are deleted after 30 days without a seen host/device activity, unless
 disabled. Disabled routes are tombstones and are retained. Disable/revoke is
