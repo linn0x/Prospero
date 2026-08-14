@@ -5,6 +5,13 @@ import path from "node:path";
 import { Command } from "commander";
 import { controlRequest, controlSocketPath, ControlSocketError } from "./control-socket.js";
 import { controlRequestTimeoutFor } from "./orchestration-cli-timeouts.js";
+import {
+  noRunStatus,
+  projectRunList,
+  projectRunStatus,
+  selectRunForSession,
+} from "./orchestration/status-projection.js";
+import type { OrchestrationState } from "./orchestration/model.js";
 import { prosperoHome } from "./pairing.js";
 
 const home = prosperoHome();
@@ -26,11 +33,11 @@ function optionalSession(): string | null {
   return session && session.trim() !== "" ? session : null;
 }
 
-async function invoke(
+async function request<T = unknown>(
   method: string,
   params: Record<string, unknown>,
   timeoutMs = controlRequestTimeoutFor(method),
-): Promise<void> {
+): Promise<T> {
   const opts = program.opts<{ socket: string; tokenFile: string }>();
   let token: string;
   try {
@@ -40,12 +47,23 @@ async function invoke(
       `无法读取控制 token 文件 ${opts.tokenFile}：${error instanceof Error ? error.message : String(error)}`,
     );
   }
-  const result = await controlRequest<unknown>(
+  return await controlRequest<T>(
     { socketPath: opts.socket, token, timeoutMs },
     method,
     params,
   );
+}
+
+function print(result: unknown): void {
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+}
+
+async function invoke(
+  method: string,
+  params: Record<string, unknown>,
+  timeoutMs = controlRequestTimeoutFor(method),
+): Promise<void> {
+  print(await request(method, params, timeoutMs));
 }
 
 function action(method: string, makeParams: (opts: Record<string, unknown>) => Record<string, unknown>) {
@@ -115,8 +133,30 @@ for (const [name, method] of [["done", "task.done"], ["fail", "task.fail"]] as c
       actorSessionId: optionalSession(),
     })));
 }
+task
+  .command("retry")
+  .description("仅重试 failed Task；自动编排运行中会先暂停")
+  .requiredOption("--id <id>", "failed Task ID")
+  .option("--operation-id <id>", "调用方提供时，用于同一 retry 请求的幂等重试")
+  .action(action("task.retry", (opts) => ({
+    taskId: requireText(opts["id"], "--id"),
+    ...(typeof opts["operationId"] === "string" ? { operationId: opts["operationId"] } : {}),
+    actorSessionId: optionalSession(),
+  })));
+task
+  .command("cancel")
+  .description("仅取消未运行 Task；若自动编排运行中会先暂停，运行中的 worker 请先 stop")
+  .requiredOption("--id <id>", "Task ID")
+  .option("--reason <text>", "取消原因；省略时使用服务端默认原因")
+  .option("--operation-id <id>", "调用方提供时，用于同一 cancel 请求的幂等重试")
+  .action(action("task.cancel", (opts) => ({
+    taskId: requireText(opts["id"], "--id"),
+    ...(typeof opts["reason"] === "string" ? { reason: opts["reason"] } : {}),
+    ...(typeof opts["operationId"] === "string" ? { operationId: opts["operationId"] } : {}),
+    actorSessionId: optionalSession(),
+  })));
 
-const worker = program.command("worker").description("派发 worker");
+const worker = program.command("worker").description("派发和停止 worker");
 worker
   .command("start")
   .requiredOption("--task <id>", "Task ID")
@@ -135,6 +175,18 @@ worker
     ...(typeof opts["approvalPolicy"] === "string"
       ? { approvalPolicy: opts["approvalPolicy"] }
       : {}),
+    ...(typeof opts["operationId"] === "string" ? { operationId: opts["operationId"] } : {}),
+    actorSessionId: optionalSession(),
+  })));
+worker
+  .command("stop")
+  .description("停止运行中的 worker 并把 Task 标为 failed；自动编排运行中会先暂停")
+  .requiredOption("--task <id>", "运行中 worker 所属的 Task ID")
+  .option("--reason <text>", "停止原因；省略时使用服务端默认原因")
+  .option("--operation-id <id>", "调用方提供时，用于同一 stop 请求的幂等重试")
+  .action(action("worker.stop", (opts) => ({
+    taskId: requireText(opts["task"], "--task"),
+    ...(typeof opts["reason"] === "string" ? { reason: opts["reason"] } : {}),
     ...(typeof opts["operationId"] === "string" ? { operationId: opts["operationId"] } : {}),
     actorSessionId: optionalSession(),
   })));
@@ -289,7 +341,27 @@ gate
     ...(typeof opts["status"] === "string" ? { status: opts["status"] } : {}),
   })));
 
-program.command("status").description("查看编排快照").action(action("orchestration.snapshot", () => ({})));
+program
+  .command("status")
+  .description("查看当前会话关联 Run 的紧凑状态；--json 输出旧版完整 snapshot")
+  .option("--run <id>", "精确选择一个 Run")
+  .option("--all", "列出全部 Run 的精简摘要", false)
+  .option("--json", "输出原始完整 snapshot（兼容旧版；忽略 --run/--all）", false)
+  .action(async (opts: { run?: string; all: boolean; json: boolean }) => {
+    const snapshot = await request<OrchestrationState>("orchestration.snapshot", {});
+    if (opts.json) {
+      print(snapshot);
+      return;
+    }
+    if (opts.all) {
+      print(projectRunList(snapshot));
+      return;
+    }
+    const run = opts.run
+      ? snapshot.runs[opts.run] ?? null
+      : selectRunForSession(snapshot, optionalSession());
+    print(run ? projectRunStatus(snapshot, run) : noRunStatus(optionalSession(), opts.run));
+  });
 
 program.parseAsync().catch((error: unknown) => {
   const message = error instanceof Error ? error.message : String(error);

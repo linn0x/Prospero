@@ -412,9 +412,22 @@ adapter 的 `SessionStatus`（idle 等）猜 done。
 ### 8.2 会话内 `prospero`（`orchestration-cli.ts`）
 
 纯 socket client（不把编排状态存进 agent 进程），走 `controlRequest` NDJSON RPC。全局 `--socket`、`--token-file`、
-`--session`（默认 `PROSPERO_SESSION_ID`）。子命令：`run create/list/complete/abandon`、`task create/list/done/fail`、
-`worker start`、`worktree list/inspect/cleanup`、`send/check/ask/reply`、`gate create/resolve/list`、`status`。
+`--session`（默认 `PROSPERO_SESSION_ID`）。子命令：`run create/list/complete/abandon`、
+`task create/list/done/fail/retry/cancel`、`worker start/stop`、`worktree list/inspect/cleanup`、
+`send/check/ask/reply`、`gate create/resolve/list`、`status`。
 交付命令：`prospero --session <sid> task done --id <taskId> --body "..."`。
+
+`prospero status` 默认以当前 `PROSPERO_SESSION_ID` 选关联 Run（coordinator 或该 worker 的 dispatch），优先 active，
+再按最近更新的历史 Run。它输出紧凑 JSON：Run 基本态、Task 状态计数和 ready 数、ready Task、活动 worker、pending Gate，
+以及可复制的 `nextActions`。动作只显示当前最高优先级的一组：`gate → failed → running → ready → waiting → complete`，避免
+低优先级操作掩盖待决 Gate。`--run <id>` 精确选 Run，`--all` 输出所有 Run 的精简摘要；找不到关联 Run 时会输出可执行的
+`prospero status --all` / `prospero run create` 提示。`--json` 保留旧版完整原始 snapshot（并忽略 `--run`/`--all`），因此默认
+紧凑输出不会带 Task `spec/result`、邮箱消息或 worktree 历史。
+
+恢复/干预命令和控制 API 一一对应：`task retry --id <failed-task> [--operation-id <id>]` 仅适用于 failed Task；
+`task cancel --id <task> [--reason <text>] [--operation-id <id>]` 仅取消未运行 Task；
+`worker stop --task <task> [--reason <text>] [--operation-id <id>]` 停止运行中的 worker 并将 Task 标为 failed。三者如遇自动
+编排正在运行，都会由既有控制 API 先暂停自动编排；取消运行中任务前必须先 stop worker。
 
 ### 8.3 `esaytree`（独立 CLI，`esaytree-cli.ts`）
 
