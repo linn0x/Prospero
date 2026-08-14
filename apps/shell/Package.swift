@@ -9,6 +9,12 @@ let package = Package(
       name: "ProsperoShell",
       path: "Sources/ProsperoShell",
       swiftSettings: [.swiftLanguageMode(.v6)]
+    ),
+    .testTarget(
+      name: "ProsperoShellTests",
+      dependencies: ["ProsperoShell"],
+      path: "Tests/ProsperoShellTests",
+      swiftSettings: [.swiftLanguageMode(.v6)]
     )
   ]
 )
