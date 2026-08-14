@@ -15,6 +15,15 @@ export type SnapshotCredential =
   | { deviceId: string; credentialDigest: string; revoked?: false | undefined }
   | { deviceId: string; revoked: true };
 
+/** A generation conflict is a protocol error, not a missing/disabled route. */
+export class SnapshotGenerationError extends Error {
+  constructor() { super("stale or inconsistent device snapshot generation"); this.name = "SnapshotGenerationError"; }
+}
+
+export type TicketRedemption =
+  | { status: "ok"; ticket: StreamTicket }
+  | { status: "invalid" | "expired" | "used" };
+
 export interface RouteStore {
   ping(): Promise<void>;
   close(): Promise<void>;
@@ -36,8 +45,14 @@ export interface EphemeralStore {
   getCachedCredential(routeId: string, deviceId: string): Promise<{ device: DeviceRecord; disabledAt: Date | null } | null>;
   setPresence(routeId: string, connectionId: string, ttlSeconds: number): Promise<void>;
   clearPresence(routeId: string, connectionId: string): Promise<void>;
-  createTicket(ticket: StreamTicket, ttlSeconds: number): Promise<void>;
-  consumeTicket(ticket: string): Promise<StreamTicket | null>;
+  /** The ticket record's Redis TTL is derived exactly from ticket.expiresAt. */
+  createTicket(ticket: StreamTicket): Promise<void>;
+  redeemTicket(ticket: string, streamId: string): Promise<TicketRedemption>;
+  invalidateTicket(ticket: string): Promise<void>;
+  /** Distributed route semaphore. A live stream must renew until it closes. */
+  acquireStreamLease(routeId: string, leaseId: string, limit: number, ttlMs: number): Promise<boolean>;
+  renewStreamLease(routeId: string, leaseId: string, ttlMs: number): Promise<boolean>;
+  releaseStreamLease(routeId: string, leaseId: string): Promise<void>;
   consumeRateLimit(key: string, limit: number, windowSeconds: number): Promise<{ allowed: boolean; retryAfterMs: number }>;
   publish(event: RelayEvent): Promise<void>;
   subscribe(listener: (event: RelayEvent) => void): Promise<() => Promise<void>>;
@@ -93,8 +108,12 @@ function snapshotEquals(current: DeviceRecord[], credentials: SnapshotCredential
   if (present.length !== wanted.length) return false;
   return present.every((device, index) => {
     const other = wanted[index]!;
-    return device.deviceId === other.deviceId && device.revoked === other.revoked &&
-      ((device.digest === null && other.digest === null) || (device.digest !== null && other.digest !== null && device.digest.equals(other.digest)));
+    // An omitted device is retained as a revoked DB row with its old digest.
+    // That digest is no longer credential state, so a same-generation full
+    // snapshot represents it by { deviceId, revoked: true } equivalently.
+    if (device.deviceId !== other.deviceId || device.revoked !== other.revoked) return false;
+    if (device.revoked) return true;
+    return (device.digest === null && other.digest === null) || (device.digest !== null && other.digest !== null && device.digest.equals(other.digest));
   });
 }
 
@@ -148,7 +167,7 @@ export class MySqlRouteStore implements RouteStore {
       const existing = existingRows.map(deviceFromRow);
       if (generation < routeRow.generation || (generation === routeRow.generation && !snapshotEquals(existing, credentials))) {
         await connection.rollback();
-        throw new Error("stale or inconsistent device snapshot generation");
+        throw new SnapshotGenerationError();
       }
       if (generation > routeRow.generation) {
         // Full replacement: absent entries are revoked, and explicit revocations are retained.
@@ -258,6 +277,85 @@ function decodeDevice(value: string): { device: DeviceRecord; disabledAt: Date |
 }
 
 const EVENT_CHANNEL = "prospero:relay:events:v1";
+const TICKET_STATUS_RETENTION_MS = 60_000;
+
+const COMPARE_AND_DELETE = `
+  if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+  end
+  return 0
+`;
+
+const CREATE_TICKET = `
+  if redis.call('EXISTS', KEYS[1]) ~= 0 or redis.call('EXISTS', KEYS[2]) ~= 0 then
+    return 0
+  end
+  redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+  redis.call('SET', KEYS[2], 'active', 'PX', ARGV[3])
+  return 1
+`;
+
+// The comparison happens before DEL, so a host that accidentally supplies the
+// wrong streamId does not burn the valid ticket and turn its retry into "used".
+const REDEEM_TICKET = `
+  local raw = redis.call('GET', KEYS[1])
+  if not raw then
+    local state = redis.call('GET', KEYS[2])
+    if state == 'used' then return {2, ''} end
+    if state == 'active' or state == 'expired' then
+      redis.call('SET', KEYS[2], 'expired', 'KEEPTTL')
+      return {3, ''}
+    end
+    return {1, ''}
+  end
+  local ok, decoded = pcall(cjson.decode, raw)
+  if not ok or type(decoded) ~= 'table' or decoded.streamId ~= ARGV[1] then
+    return {1, ''}
+  end
+  if tonumber(decoded.expiresAt) <= tonumber(ARGV[2]) then
+    redis.call('DEL', KEYS[1])
+    redis.call('SET', KEYS[2], 'expired', 'KEEPTTL')
+    return {3, ''}
+  end
+  redis.call('DEL', KEYS[1])
+  redis.call('SET', KEYS[2], 'used', 'KEEPTTL')
+  return {0, raw}
+`;
+
+const INVALIDATE_TICKET = `
+  redis.call('DEL', KEYS[1])
+  redis.call('SET', KEYS[2], 'invalid', 'PX', ARGV[1])
+  return 1
+`;
+
+// A sorted set gives every stream an individually expiring lease. Cleaning old
+// members and checking ZCARD occur in one Redis script, unlike a local Map.
+const ACQUIRE_STREAM_LEASE = `
+  redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+  if redis.call('ZSCORE', KEYS[1], ARGV[2]) then
+    redis.call('ZADD', KEYS[1], ARGV[3], ARGV[2])
+    redis.call('PEXPIRE', KEYS[1], ARGV[4])
+    return 1
+  end
+  if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[5]) then return 0 end
+  redis.call('ZADD', KEYS[1], ARGV[3], ARGV[2])
+  redis.call('PEXPIRE', KEYS[1], ARGV[4])
+  return 1
+`;
+
+const RENEW_STREAM_LEASE = `
+  redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+  if not redis.call('ZSCORE', KEYS[1], ARGV[2]) then return 0 end
+  redis.call('ZADD', KEYS[1], ARGV[3], ARGV[2])
+  redis.call('PEXPIRE', KEYS[1], ARGV[4])
+  return 1
+`;
+
+const RELEASE_STREAM_LEASE = `
+  redis.call('ZREM', KEYS[1], ARGV[1])
+  if redis.call('ZCARD', KEYS[1]) == 0 then redis.call('DEL', KEYS[1]) end
+  return 1
+`;
 
 export class RedisEphemeralStore implements EphemeralStore {
   private readonly client: RedisClientType;
@@ -269,9 +367,44 @@ export class RedisEphemeralStore implements EphemeralStore {
   async cacheCredential(device: DeviceRecord, disabledAt: Date | null, ttlSeconds: number): Promise<void> { await this.ready(); await this.client.set(`credential:${device.routeId}:${device.deviceId}`, encodeDevice(device, disabledAt), { EX: ttlSeconds }); }
   async getCachedCredential(routeId: string, deviceId: string): Promise<{ device: DeviceRecord; disabledAt: Date | null } | null> { await this.ready(); const value = await this.client.get(`credential:${routeId}:${deviceId}`); return value === null ? null : decodeDevice(value); }
   async setPresence(routeId: string, connectionId: string, ttlSeconds: number): Promise<void> { await this.ready(); await this.client.set(`presence:${routeId}`, connectionId, { EX: ttlSeconds }); }
-  async clearPresence(routeId: string, connectionId: string): Promise<void> { await this.ready(); if (await this.client.get(`presence:${routeId}`) === connectionId) await this.client.del(`presence:${routeId}`); }
-  async createTicket(ticket: StreamTicket, ttlSeconds: number): Promise<void> { await this.ready(); const stored = await this.client.set(`ticket:${ticket.ticket}`, JSON.stringify(ticket), { EX: ttlSeconds, NX: true }); if (stored !== "OK") throw new Error("stream ticket collision"); }
-  async consumeTicket(ticket: string): Promise<StreamTicket | null> { await this.ready(); const value = await this.client.getDel(`ticket:${ticket}`); if (value === null) return null; try { return JSON.parse(value) as StreamTicket; } catch { return null; } }
+  async clearPresence(routeId: string, connectionId: string): Promise<void> { await this.ready(); await this.client.eval(COMPARE_AND_DELETE, { keys: [`presence:${routeId}`], arguments: [connectionId] }); }
+  async createTicket(ticket: StreamTicket): Promise<void> {
+    const ttlMs = ticket.expiresAt - Date.now();
+    if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0) throw new Error("ticket already expired");
+    await this.ready();
+    const created = await this.client.eval(CREATE_TICKET, {
+      keys: [`ticket:${ticket.ticket}`, `ticket-state:${ticket.ticket}`],
+      arguments: [JSON.stringify(ticket), String(ttlMs), String(ttlMs + TICKET_STATUS_RETENTION_MS)],
+    });
+    if (Number(created) !== 1) throw new Error("stream ticket collision");
+  }
+  async redeemTicket(ticket: string, streamId: string): Promise<TicketRedemption> {
+    await this.ready();
+    const reply = await this.client.eval(REDEEM_TICKET, {
+      keys: [`ticket:${ticket}`, `ticket-state:${ticket}`], arguments: [streamId, String(Date.now())],
+    }) as unknown as [number, string];
+    const status = Number(reply[0]);
+    if (status === 2) return { status: "used" };
+    if (status === 3) return { status: "expired" };
+    if (status !== 0) return { status: "invalid" };
+    try {
+      const parsed = JSON.parse(reply[1]) as StreamTicket;
+      if (parsed.ticket !== ticket || parsed.streamId !== streamId) return { status: "invalid" };
+      return { status: "ok", ticket: parsed };
+    } catch { return { status: "invalid" }; }
+  }
+  async invalidateTicket(ticket: string): Promise<void> { await this.ready(); await this.client.eval(INVALIDATE_TICKET, { keys: [`ticket:${ticket}`, `ticket-state:${ticket}`], arguments: [String(TICKET_STATUS_RETENTION_MS)] }); }
+  async acquireStreamLease(routeId: string, leaseId: string, limit: number, ttlMs: number): Promise<boolean> {
+    const now = Date.now(); await this.ready();
+    const reply = await this.client.eval(ACQUIRE_STREAM_LEASE, { keys: [`stream-leases:${routeId}`], arguments: [String(now), leaseId, String(now + ttlMs), String(ttlMs), String(limit)] });
+    return Number(reply) === 1;
+  }
+  async renewStreamLease(routeId: string, leaseId: string, ttlMs: number): Promise<boolean> {
+    const now = Date.now(); await this.ready();
+    const reply = await this.client.eval(RENEW_STREAM_LEASE, { keys: [`stream-leases:${routeId}`], arguments: [String(now), leaseId, String(now + ttlMs), String(ttlMs)] });
+    return Number(reply) === 1;
+  }
+  async releaseStreamLease(routeId: string, leaseId: string): Promise<void> { await this.ready(); await this.client.eval(RELEASE_STREAM_LEASE, { keys: [`stream-leases:${routeId}`], arguments: [leaseId] }); }
   async consumeRateLimit(key: string, limit: number, windowSeconds: number): Promise<{ allowed: boolean; retryAfterMs: number }> { await this.ready(); const tx = this.client.multi(); tx.incr(key); tx.expire(key, windowSeconds, "NX"); const [count] = await tx.exec(); return { allowed: Number(count) <= limit, retryAfterMs: windowSeconds * 1000 }; }
   async publish(event: RelayEvent): Promise<void> { await this.ready(); await this.client.publish(EVENT_CHANNEL, JSON.stringify(event)); }
   async subscribe(listener: (event: RelayEvent) => void): Promise<() => Promise<void>> { await this.ready(); const subscriber = this.client.duplicate(); subscriber.on("error", () => undefined); await subscriber.connect(); await subscriber.subscribe(EVENT_CHANNEL, (message) => { try { const event = JSON.parse(message) as RelayEvent; if (event && typeof event.type === "string" && typeof event.routeId === "string") listener(event); } catch { /* ignore malformed pub/sub */ } }); this.subscriber = subscriber; return async () => { if (subscriber.isOpen) await subscriber.quit(); if (this.subscriber === subscriber) this.subscriber = undefined; }; }
