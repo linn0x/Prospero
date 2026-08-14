@@ -9,7 +9,7 @@ The supervisor has two deliberately separate responsibilities:
 1. **Transport lifetime and durability** — process ownership, private IPC, ordered durable events, reconnect/replay, attachment custody, and explicit kill semantics. This layer is agent-neutral and must not know any provider's request/approval enum values.
 2. **Agent protocol compatibility** — the adapter inside that supervisor translates a particular installed CLI/SDK version to Prospero's normalized events. It is versioned per adapter and can change independently of the transport protocol.
 
-That separation is important for the current Codex issue: local `codex 0.147.0 generate-ts` reports v2 decisions `accept`, `acceptForSession`, `decline`, and `cancel`; the current adapter still sends `approved` / `approved_for_session`. T4 owns that translation repair. The supervisor protocol carries the normalized request and resolution records unchanged; it must not duplicate or freeze the Codex-specific mapping.
+That separation is important for Codex compatibility: local `codex 0.147.0 generate-ts` reports v2 decisions `accept`, `acceptForSession`, `decline`, and `cancel`; the adapter maps the normalized once/always/reject replies to those provider-specific values. The supervisor protocol carries the normalized request and resolution records unchanged; it must not duplicate or freeze the Codex-specific mapping.
 
 ## Isolated evidence
 
@@ -33,6 +33,14 @@ cli SIGTERM → server.close → manager.disposeAll
 
 `SIGKILL` never runs a cleanup handler. A supervised native process may or may not remain as an OS orphan, but an adapter held by the daemon loses its SDK/stdio protocol state and has no durable owner to reconnect it. That is why “the child PID still exists” is not a recovery guarantee.
 
+`apps/daemon/test/daemon-supervisor-recovery.e2e.test.ts` is the production-boundary acceptance test added after the production launcher and Codex v2 approval compatibility work. It builds the daemon, then for **each** `SIGTERM` and `SIGKILL` case starts the compiled CLI with all of the following isolated inputs:
+
+- a temporary `HOME` (therefore a separate `~/.prospero`), temporary `git init` repository, and three loopback-only temporary ports;
+- a temporary first-`PATH` fake `codex app-server`, speaking only JSONL to the production `CodexAdapter` and never contacting a provider; and
+- the real HTTP control plane to create a Run/Task/worker, start the structured turn, inspect state, and issue the eventual explicit session kill.
+
+It sends a long fake turn, stops the daemon after a durable middle delta, then starts a new daemon on a different port. The same supervisor PID reattaches; the three marker deltas (`started → middle → finished`) are asserted exactly once and in order. The test also proves a `completed` structured turn leaves its Dispatch `running` and Task `dispatched`, takes a daemon offline while both an approval and a question are pending (neither is auto-approved), reconnects and resolves the original request IDs, and proves `session.kill` terminates the supervisor whereas daemon shutdown does not. A third case loads a terminal legacy `structured-sessions.json` history through a real daemon, then crashes a test-owned supervisor process group and verifies the next daemon exposes its cache as read-only `died` history and rejects a new chat rather than spawning a replacement turn.
+
 ## Target boundary
 
 ```text
@@ -51,9 +59,11 @@ The daemon remains the authority for device authentication and UI fan-out. The s
 
 ### Private IPC and authentication
 
-On Unix, each supervisor gets a 0700 directory and a 0600 Unix socket. It also has a fresh 256-bit capability token in a 0600 token file. Every NDJSON RPC includes that token; Unix ownership protects local peer access and the capability makes accidental socket-path reuse insufficient for access.
+On Unix, each supervisor gets a 0700 owner directory and a fresh 256-bit capability token in a 0600 token file. Every NDJSON RPC includes that token; Unix ownership protects local peer access and the capability makes accidental socket-path reuse insufficient for access.
 
-Do not put a capability token in argv. The daemon launcher should pass a pre-opened protected token file/FD, or arrange a private token file before spawning the supervisor. The current vertical slice returns it only to its test parent through a pipe. Windows needs a named-pipe equivalent with the same per-user ACL/token rule before this feature is enabled there.
+macOS limits Unix-domain socket path length. The production launcher therefore records a random, compact `/tmp/prospero-supervisor-<nonce>.sock` endpoint in the private 0600 manifest, while the token, `session.json`, attachments, and manifest remain under the 0700 owner directory. The socket itself is chmod 0600. The nonce is not an authorization mechanism: the token is; it only prevents a predictable pathname collision. This split is essential because binding a relative `s` after the runner `chdir`s can appear to work, while a restarted daemon later fails to connect to the long absolute pathname with `EINVAL`.
+
+Do not put a capability token in argv. The launcher writes a protected token file before spawning and passes only the protected bootstrap-file path in its environment; neither stdout/stderr nor argv carries credentials. Windows needs a named-pipe equivalent with the same per-user ACL/token rule before this feature is enabled there.
 
 The external supervisor protocol is not Codex app-server JSON-RPC. It is a small, versioned Prospero envelope:
 
@@ -69,20 +79,19 @@ Events are written atomically before notification. Delivery to a reconnecting da
 
 ### Supervisor-owned state
 
-The production shape is one directory per session:
+The current production owner directory is one directory per session:
 
 ```text
 ~/.prospero/structured-supervisor/<session-id>/
-  manifest.json       # agent, cwd identity, adapter/native resume state, lifecycle epoch
+  manifest.json       # identity, lifecycle epoch, PID, short runtime socket endpoint
+  session.json        # 0600 UI/history cache, including pending interactions
+  state.json          # bounded supervisor replay snapshot
   events.jsonl        # monotonic normalized events and request/resolution audit
-  commands.jsonl      # idempotency keys and accepted mutating RPCs
-  pending.json        # question/permission requests and queued replies
   attachments/<id>    # supervisor-owned immutable attachment copies
-  supervisor.sock
   token
 ```
 
-The vertical slice intentionally uses one `state.json` plus one socket in its temporary `home`; it proves the transport invariant, not final per-session process spawning or log compaction. The durable format must include a schema version, native adapter resume cursor, executable identity/version, PID start time, and supervisor epoch. Events are append-first (or atomic replace in the slice), then visible to clients. Snapshot compaction records the first retained sequence and preserves a reducer snapshot.
+The original transport slice proved the `state.json` and replay invariant; production now adds detached per-session spawning, manifest ownership, and bounded journal compaction. The durable format includes a schema version, native adapter resume cursor, PID, lifecycle epoch, and adapter identity. Events are append-first, then visible to clients. Snapshot compaction records the first retained sequence and preserves a reducer snapshot.
 
 Attachments are copied into the supervisor's attachment root before an adapter sees them. IPC carries attachment IDs and metadata, never a daemon-provided absolute path. The supervisor resolves the final path under that root, rejects symlinks/traversal, uses mode 0600, and stores the content hash. This lets a reconnected daemon render a stable attachment reference without gaining arbitrary filesystem access.
 
@@ -98,10 +107,10 @@ If a configured policy has a legitimate local auto-allow rule, the supervisor re
 
 On daemon startup or upgrade:
 
-1. Scan supervisor manifests, verify socket ownership/mode, PID plus process start time, and lifecycle epoch.
+1. Scan supervisor manifests, verify owner-directory/socket/token modes, a live PID, and lifecycle epoch. PID reuse/start-time verification is an operator/platform hardening boundary, not yet an automatic POSIX check.
 2. Reconnect to each live supervisor and call `session.subscribe(lastAckedSeq)` before serving UI traffic.
 3. Reconcile the supervisor's `running`, pending request, terminal, and native-resume records with orchestration task state.
-4. Mark a manifest whose process is absent as `orphaned`, preserving logs and attachments. Do not automatically launch another native turn from a stale manifest.
+4. Expose a manifest whose process is absent, socket is stale, token is unsafe, or protocol is incompatible as read-only `died` session history (the UI label is “已退出”), preserving logs and attachments. Do not automatically launch another native turn from a stale manifest.
 5. Delete only a verified stale socket and fully terminal, retention-expired directory. Never delete an unknown live PID, a nonterminal orphan, or an attachment root during routine startup.
 
 The operator can explicitly reclaim an orphan (adapter-specific resume) or explicitly kill/archive it. The daemon must use a lock/epoch when spawning so two rapidly restarted daemons cannot create competing supervisors for the same session.
@@ -139,14 +148,13 @@ Claude, OpenCode, and Grok must not be assumed to offer an equivalent daemon end
 
 `apps/daemon/test/structured-supervisor.test.ts` starts it in a separate Node process with a fake long-running adapter. Client A subscribes, starts work, and exits. The supervisor records progress while no client exists. Client B reconnects with A's cursor, receives replayed sequence 2 and live sequence 3 exactly once. The test also reads the persisted log and verifies socket/token mode.
 
-The vertical slice does **not** yet make `SessionManager` spawn production supervisors, migrate an existing `StructuredSession`, expose snapshots/command idempotency over the wire, or implement a Codex durable proxy. It is intentionally compatible with T4's independent approval vocabulary repair.
+The standalone transport is now used by the production `SessionManager` through `RemoteStructuredSession`; it exposes snapshots and preserves the existing Codex adapter's approval vocabulary compatibility. It remains intentionally independent of a Codex-native durable proxy: the supervisor owns the fake/real app-server stdio child for its lifetime.
 
 ## Migration plan and explicit agent work
 
-1. **Shared transport (this slice)**
-   - Add a production launcher/registry and per-session directories.
-   - Add a `RemoteStructuredSession` facade with the same public calls/events used by `SessionManager`, so WS/mobile state reducers do not need a large rewrite.
-   - Add command idempotency, snapshots, retention/compaction, process lock/epoch, and orphan reconciliation.
+1. **Shared transport (production)**
+   - Keep the launcher/registry and `RemoteStructuredSession` facade aligned with the public `SessionManager` surface, so WS/mobile reducers need no separate recovery path.
+   - Continue hardening command idempotency, retention/compaction, PID start-time verification, and explicit orphan reconciliation.
 
 2. **Codex**
    - Move `CodexAdapter` ownership and `codex app-server` child into the supervisor.
@@ -176,6 +184,14 @@ The vertical slice does **not** yet make `SessionManager` spawn production super
 Ship behind a feature flag that applies only to newly created structured sessions. The existing in-daemon path stays intact until each agent's migration tests are green. A supervisor session carries its implementation kind and protocol version in its manifest; an older daemon that cannot speak it leaves it running/read-only rather than disposing it.
 
 Rollback disables creation of new supervisor sessions and reconnects only compatible existing ones. It never kills a running supervisor just to return to the old daemon-owned implementation. For a failed migration, preserve the event log, native resume cursor, and attachments; the operator chooses explicit resume, archive, or kill after reconciliation.
+
+### Upgrade, rollback, and orphan runbook
+
+1. Build the new daemon, then start it against the existing Prospero home. It first opens the control socket, scans manifests, attaches every live compatible supervisor by sequence, and only then resumes orchestration recovery. Do not send `session.kill` as part of an upgrade.
+2. Confirm the new `status.json` session list and the private manifest's `supervisorPid`, `lifecycleEpoch`, and `status`; a live detached owner keeps the same PID across the old daemon's graceful stop or crash. Pending approvals/questions must still show `waiting_approval`/`waiting_input` and require an explicit reply.
+3. If the upgrade must be rolled back, stop only the daemon client and launch the compatible previous daemon. Disable **new** supervisor creation if needed. Never roll back by killing a live supervisor: it owns the only native callback/turn and its `session.json` history.
+4. For a `died`/orphaned record, inspect its 0600 `manifest.json` and `session.json` first. Verify the exact `supervisorPid` is absent (including a PID-reuse/start-time check in an operator tool) and that no daemon has reattached. The normal recovery path intentionally leaves it read-only.
+5. Archive the entire 0700 session directory before any manual deletion. Remove only the exact manifest-recorded compact `/tmp/prospero-supervisor-<nonce>.sock` after the owner is verified absent; never glob `/tmp`, never remove a live socket, and never delete nonterminal history/attachments during routine cleanup. Native resume, archive, or an explicit session kill are operator decisions, not automated recovery actions.
 
 ## Current production integration
 
