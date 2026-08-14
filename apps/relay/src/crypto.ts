@@ -1,24 +1,32 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-
-const ROUTE_DOMAIN = Buffer.from("prospero.relay.route.v1\\0", "utf8");
+import {
+  deriveRelayDeviceCredentialDigest,
+  deriveRelayRouteId,
+  relayRouteIdMatchesHostSecret,
+} from "@prospero/protocol";
 
 export function randomOpaque(bytes: number): string {
   return randomBytes(bytes).toString("base64url");
 }
 
-export function tokenDigest(token: string): Buffer {
-  return createHash("sha256").update(token, "utf8").digest();
+/** T1's domain-separated digest, stored as its raw 32-byte form in MySQL/Redis. */
+export function credentialDigest(token: string): Buffer {
+  return Buffer.from(deriveRelayDeviceCredentialDigest(token), "base64url");
 }
 
-export function equalDigest(actual: Buffer, candidateToken: string): boolean {
-  const candidate = tokenDigest(candidateToken);
+export function equalCredentialDigest(actual: Buffer | null, candidateToken: string): boolean {
+  if (actual === null) return false;
+  const candidate = credentialDigest(candidateToken);
   return actual.length === candidate.length && timingSafeEqual(actual, candidate);
 }
 
-/** route IDs are deterministic selectors, while host secrets never leave the host/admin ceremony. */
 export function deriveRouteId(hostSecret: Buffer): string {
   if (hostSecret.length !== 32) throw new Error("hostSecret must contain exactly 32 bytes");
-  return createHash("sha256").update(ROUTE_DOMAIN).update(hostSecret).digest("base64url");
+  return deriveRelayRouteId(hostSecret.toString("base64url"));
+}
+
+export function routeIdMatchesHostSecret(routeId: string, hostSecret: string): boolean {
+  return relayRouteIdMatchesHostSecret(routeId, hostSecret);
 }
 
 export function opaqueLogId(value: string): string {

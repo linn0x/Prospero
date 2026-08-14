@@ -1,17 +1,16 @@
-export type DeviceRole = "host" | "client";
-
 export interface RouteRecord {
   routeId: string;
+  generation: number;
   disabledAt: Date | null;
   createdAt: Date;
   lastSeenAt: Date | null;
 }
 
+/** The stored value is the T1 domain-separated relay credential digest, never a token. */
 export interface DeviceRecord {
   routeId: string;
   deviceId: string;
-  role: DeviceRole;
-  tokenDigest: Buffer;
+  credentialDigest: Buffer | null;
   createdAt: Date;
   lastSeenAt: Date | null;
   revokedAt: Date | null;
@@ -22,19 +21,22 @@ export interface AuthenticatedDevice {
   device: DeviceRecord;
 }
 
-export interface RouteSnapshot extends AuthenticatedDevice {
+export interface RouteSnapshot {
+  route: RouteRecord;
   devices: DeviceRecord[];
 }
 
 export interface RouteInspection extends RouteRecord {
-  devices: Array<Omit<DeviceRecord, "tokenDigest">>;
+  devices: Array<Omit<DeviceRecord, "credentialDigest">>;
 }
 
 export interface StreamTicket {
   streamId: string;
+  ticket: string;
   routeId: string;
   hostConnectionId: string;
   clientDeviceId: string;
+  expiresAt: number;
 }
 
 export interface RelayEvent {

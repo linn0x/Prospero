@@ -1,9 +1,10 @@
 # Prospero relay
 
 `@prospero/relay` is a Node 22 relay for the v1 control contract in
-`@prospero/protocol`. It never decrypts, parses, transforms, compresses, or
-reframes application payloads after `stream.open`; text/binary WebSocket frame
-boundaries are forwarded one for one.
+`@prospero/protocol`. `/v1/host` is JSON-only control; after `stream.ready` it
+never decrypts, parses, transforms, compresses, or reframes application
+payloads on `/v1/client` or `/v1/stream`. Text/binary WebSocket frame boundaries
+are forwarded one for one.
 
 ## Run
 
@@ -35,26 +36,25 @@ not in source control, shell history, QR URLs, logs, or MySQL.
 
 ```sh
 npm run admin --workspace @prospero/relay -- route create
-npm run admin --workspace @prospero/relay -- device add <routeId>
-npm run admin --workspace @prospero/relay -- device revoke <routeId> <deviceId>
 npm run admin --workspace @prospero/relay -- route disable <routeId>
 npm run admin --workspace @prospero/relay -- route enable <routeId>
 npm run admin --workspace @prospero/relay -- route inspect <routeId>
 ```
 
-`route create` makes a 32-byte `hostSecret`, derives
-`routeId = base64url(SHA-256("prospero.relay.route.v1\\0" || hostSecret))`, and
-creates a separate host device credential. Every phone gets an independent
-32-byte relay token. MySQL stores only SHA-256 token digests.
+`route create` makes a 32-byte `hostSecret` and derives the T1 selector
+`routeId = base64url(SHA-256("prospero.relay.v1.route-id\\0" || hostSecret))`.
+The host emits a generation-numbered full device snapshot, in which each phone
+has an independent relay token represented by T1's domain-separated credential
+digest. MySQL stores only that digest, never a token or host secret.
 
-The host proves its host-device credential in its first `/v1/host` WebSocket
-message. During this authentication, the relay takes a locked MySQL snapshot of
-all non-revoked devices and warms Redis before advertising `host.ready`; a
-partially synchronized device set never becomes online. Phone `/v1/client`
-authentication similarly occurs in the first message. The opaque T1 `streamId`
-is a single-use, Redis-backed 15-second ticket: host redeems it as the first
-strict `stream.open` message on `/v1/stream`, then all following frames are
-opaque application frames.
+The first `/v1/host` WebSocket frame is exactly `{ v, routeId, hostSecret }`.
+The relay validates the derivation, then atomically persists the host's full
+`host.device-sync` credential snapshot and warms Redis before acknowledging it
+and advertising `host.ready`; a partial snapshot never becomes online. Phone
+`client.open` is also its first frame. The relay sends `client.status: pending`
+and a host-control `stream.offer`; the daemon redeems its one-time Redis ticket
+in a first `/v1/stream` `stream.accept`. It emits `stream.ready` to both data
+sockets before either side becomes opaque.
 
 Routes are deleted after 30 days without a seen host/device activity, unless
 disabled. Disabled routes are tombstones and are retained. Disable/revoke is
