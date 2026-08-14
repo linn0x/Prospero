@@ -50,12 +50,15 @@ interface GitWorktreeRecord {
 interface ReliableRepoContext {
   repo: string;
   records: GitWorktreeRecord[];
+  /** asset.path 可能是旧 Run worktree 里的 monorepo 子目录。 */
+  worktreePath: string;
 }
 
 /** cleanup 删分支前必须保留的内部检查元数据。 */
 interface ResolvedInspection {
   inspection: WorktreeInspection;
   repo: string | null;
+  worktreePath: string | null;
   sourceCommit: string | null;
 }
 
@@ -139,7 +142,13 @@ export class WorktreeAssetService {
     try {
       // force:false 是第二道门：即使检查和删除之间又出现改动，Git 也会拒绝移除。
       // 分支分两步删，保证“删分支失败”不会否认已经安全完成的 worktree 移除。
-      await this.operations.remove(resolved.repo, asset.path, { force: false, deleteBranch: false });
+      if (!resolved.worktreePath) {
+        throw new Error("缺少可靠的 worktree 根目录");
+      }
+      await this.operations.remove(resolved.repo, resolved.worktreePath, {
+        force: false,
+        deleteBranch: false,
+      });
     } catch (error) {
       throw new WorktreeAssetError(
         `Git 拒绝清理工作树；已保留目录和分支：${errorMessage(error)}`,
@@ -147,7 +156,7 @@ export class WorktreeAssetService {
       );
     }
 
-    if (pathExists(asset.path)) {
+    if (resolved.worktreePath && pathExists(resolved.worktreePath)) {
       throw new WorktreeAssetError(
         "Git 返回成功但工作树路径仍存在；为避免误报，资产保持未清理状态",
         "cleanup_failed",
@@ -220,9 +229,8 @@ async function inspectWorktreeAssetResolved(
 
   try {
     const context = await resolveReliableRepoContext(asset);
-    const { repo, records } = context;
-    const canonicalAssetPath = canonicalPath(asset.path);
-    const registered = records.find((record) => canonicalPath(record.path) === canonicalAssetPath) ?? null;
+    const { repo, records, worktreePath } = context;
+    const registered = records.find((record) => canonicalPath(record.path) === worktreePath) ?? null;
     if (!registered) {
       return unresolvedInspection({
         state: "unknown",
@@ -256,7 +264,7 @@ async function inspectWorktreeAssetResolved(
         aheadCommitCount: null,
         equivalentCommitCount: null,
         message: "工作树含 staged、unstaged 或未跟踪文件；请人工处理后再检查",
-      }, repo);
+      }, repo, worktreePath);
     }
 
     // targetRef 绝不能在资产 worktree 中解析。v1 worker 的 repo === path，
@@ -284,7 +292,7 @@ async function inspectWorktreeAssetResolved(
         aheadCommitCount: 0,
         equivalentCommitCount: 0,
         message: "工作树分支已被目标分支包含；可显式移除工作树",
-      }, repo, sourceCommit);
+      }, repo, worktreePath, sourceCommit);
     }
 
     const aheadCommitCount = Number.parseInt(
@@ -314,7 +322,7 @@ async function inspectWorktreeAssetResolved(
         aheadCommitCount,
         equivalentCommitCount,
         message: "分支提交的补丁已等价进入目标分支；可显式移除，默认保留分支",
-      }, repo, sourceCommit);
+      }, repo, worktreePath, sourceCommit);
     }
     return resolvedInspection({
       state: "unmerged",
@@ -327,7 +335,7 @@ async function inspectWorktreeAssetResolved(
       aheadCommitCount: Number.isFinite(aheadCommitCount) ? aheadCommitCount : null,
       equivalentCommitCount,
       message: "分支仍有未等价进入目标分支的补丁；已保留，不能安全清理",
-    }, repo, sourceCommit);
+    }, repo, worktreePath, sourceCommit);
   } catch (error) {
     return unresolvedInspection({
       state: "unknown",
@@ -345,15 +353,16 @@ async function inspectWorktreeAssetResolved(
 }
 
 function unresolvedInspection(inspection: WorktreeInspection): ResolvedInspection {
-  return { inspection, repo: null, sourceCommit: null };
+  return { inspection, repo: null, worktreePath: null, sourceCommit: null };
 }
 
 function resolvedInspection(
   inspection: WorktreeInspection,
   repo: string,
+  worktreePath: string,
   sourceCommit: string | null = null,
 ): ResolvedInspection {
-  return { inspection, repo, sourceCommit };
+  return { inspection, repo, worktreePath, sourceCommit };
 }
 
 /**
@@ -361,27 +370,29 @@ function resolvedInspection(
  * repository 的主 worktree 解析；没有独立上下文只能 unknown。
  */
 async function resolveReliableRepoContext(asset: WorktreeAsset): Promise<ReliableRepoContext> {
+  const worktreePath = canonicalPath(
+    (await git(asset.path, ["rev-parse", "--show-toplevel"])).trim(),
+  );
   const declaredRoot = canonicalPath((await git(asset.repo, ["rev-parse", "--show-toplevel"])).trim());
   const records = await listGitWorktrees(declaredRoot);
-  const canonicalAssetPath = canonicalPath(asset.path);
-  if (!records.some((record) => canonicalPath(record.path) === canonicalAssetPath)) {
+  if (!records.some((record) => canonicalPath(record.path) === worktreePath)) {
     throw new Error("登记路径不是候选源仓已登记的 worktree");
   }
-  if (declaredRoot !== canonicalAssetPath) return { repo: declaredRoot, records };
+  if (declaredRoot !== worktreePath) return { repo: declaredRoot, records, worktreePath };
 
   // `git worktree list` 的首项是主 worktree。它是 legacy 自指时唯一可靠的
   // 回退上下文，且必须和资产路径不同。
   const primary = records[0];
-  if (!primary || canonicalPath(primary.path) === canonicalAssetPath) {
+  if (!primary || canonicalPath(primary.path) === worktreePath) {
     throw new Error("legacy worker 没有独立主工作树可解析目标 ref");
   }
   const primaryRoot = canonicalPath(
     (await git(primary.path, ["rev-parse", "--show-toplevel"])).trim(),
   );
-  if (primaryRoot === canonicalAssetPath) {
+  if (primaryRoot === worktreePath) {
     throw new Error("legacy worker 的源仓解析上下文与待检查 worktree 相同");
   }
-  return { repo: primaryRoot, records };
+  return { repo: primaryRoot, records, worktreePath };
 }
 
 async function listGitWorktrees(repo: string): Promise<GitWorktreeRecord[]> {
