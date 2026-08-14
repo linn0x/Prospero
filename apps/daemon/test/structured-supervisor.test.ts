@@ -213,4 +213,40 @@ describe("structured supervisor transport", () => {
       await incumbent.close();
     }
   });
+
+  it("append-journals dense deltas, snapshots a bounded window, then reloads the post-snapshot tail in order", async () => {
+    const home = tempHome();
+    let first = await startStructuredSupervisor({ home });
+    try {
+      await first.createSession("dense", {
+        async start(context) {
+          for (let index = 0; index < 4_200; index++) {
+            context.emit({ kind: "text.delta", msgId: "dense", textId: "dense", delta: String(index) });
+          }
+          context.emit({ kind: "turn.end", msgId: "dense", inputTokens: 1, outputTokens: 1 });
+          setTimeout(() => context.emit({ kind: "text.delta", msgId: "dense", textId: "dense", delta: "tail" }), 5).unref();
+        },
+      });
+      await delay(30);
+      const snapshot = JSON.parse(readFileSync(path.join(home, "state.json"), "utf8")) as {
+        sessions: Array<{ events: SupervisorEvent[]; lastSeq: number }>;
+      };
+      expect(snapshot.sessions[0]?.events).toHaveLength(4_000);
+      expect(snapshot.sessions[0]?.lastSeq).toBe(4_201);
+      // turn.end compacts the incorporated prefix; only the later tail stays
+      // in the append-only journal, avoiding a full history scan at restart.
+      expect(readFileSync(path.join(home, "events.jsonl"), "utf8").trim().split("\n")).toHaveLength(1);
+
+      await first.close();
+      first = await startStructuredSupervisor({ home });
+      const replay = first.replay("dense", 0);
+      expect(replay.gap).toBe(true);
+      expect(replay.events).toHaveLength(4_000);
+      expect(replay.events[0]?.seq).toBe(203);
+      expect(replay.events.at(-1)?.seq).toBe(4_202);
+      expect(replay.events.every((event, index, all) => index === 0 || event.seq === all[index - 1]!.seq + 1)).toBe(true);
+    } finally {
+      await first.close();
+    }
+  });
 });

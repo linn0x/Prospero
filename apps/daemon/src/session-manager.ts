@@ -28,6 +28,12 @@ import {
   type QueuedChatPersistent,
   type StructuredSessionPersistentState,
 } from "./structured-session.js";
+import {
+  RemoteStructuredSession,
+  launchStructuredSupervisor,
+  reconnectStructuredSupervisors,
+  type LaunchStructuredSupervisorInput,
+} from "./structured-supervisor-client.js";
 import { ClaudeAdapter } from "./adapters/claude.js";
 import { CodexAdapter } from "./adapters/codex.js";
 import { GrokAdapter } from "./adapters/grok.js";
@@ -263,6 +269,14 @@ export interface SessionManagerOptions {
   sessionEnv?: ((sessionId: string) => Record<string, string>) | undefined;
   /** 账号目录由 daemon 的元数据层解析；SessionManager 只负责注入会话。 */
   accountResolver?: ((accountId: string, agent: "claude" | "codex") => AccountBinding) | undefined;
+  /**
+   * Production Unix defaults to detached per-session supervisors when a home
+   * exists. Tests that inject adapters and unsupported platforms stay safely
+   * in-process; this flag is also an explicit operator rollback.
+   */
+  supervisor?: boolean | undefined;
+  /** Test seam for the detached launcher; production uses the real launcher. */
+  supervisorLauncher?: ((input: LaunchStructuredSupervisorInput) => Promise<RemoteStructuredSession>) | undefined;
 }
 
 /** 恢复前由编排层判定应封存的会话；避免 adapter 先接回并 drain 旧队列。 */
@@ -272,7 +286,7 @@ export interface RestoreStructuredOptions {
 
 export class SessionManager extends EventEmitter<SessionManagerEvents> {
   private readonly ptySessions = new Map<string, PtySession>();
-  private readonly structuredSessions = new Map<string, StructuredSession>();
+  private readonly structuredSessions = new Map<string, StructuredSession | RemoteStructuredSession>();
   private readonly tmuxConfigFile: string | null;
   private readonly tmuxBin: string | null;
 
@@ -283,6 +297,9 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   private readonly accountResolver:
     | ((accountId: string, agent: "claude" | "codex") => AccountBinding)
     | undefined;
+  private readonly structuredSupervisorRoot: string | null;
+  private readonly useStructuredSupervisor: boolean;
+  private readonly supervisorLauncher: (input: LaunchStructuredSupervisorInput) => Promise<RemoteStructuredSession>;
   private persistTimer: NodeJS.Timeout | null = null;
   private shuttingDown = false;
 
@@ -294,9 +311,19 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     this.metaFile = opts.tmux ? path.join(opts.tmux.home, "pty-sessions.json") : null;
     const home = opts.home ?? opts.tmux?.home;
     this.structuredFile = home ? path.join(home, "structured-sessions.json") : null;
+    this.structuredSupervisorRoot = home ? path.join(home, "structured-supervisor") : null;
     this.adapterFactory = opts.adapterFactory ?? makeAdapter;
     this.sessionEnv = opts.sessionEnv ?? (() => ({}));
     this.accountResolver = opts.accountResolver;
+    this.supervisorLauncher = opts.supervisorLauncher ?? launchStructuredSupervisor;
+    // An injected adapter is the test seam. It cannot safely cross a process
+    // boundary, so retain the long-standing in-process behavior there. The
+    // daemon opts in explicitly; direct SessionManager construction remains a
+    // deterministic in-process test/library fallback.
+    this.useStructuredSupervisor =
+      !!opts.supervisorLauncher || (
+        opts.supervisor === true && !opts.adapterFactory && !!this.structuredSupervisorRoot && process.platform !== "win32"
+      );
   }
 
   /**
@@ -401,7 +428,12 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       this.persistTimer = null;
     }
     const tmp = `${this.structuredFile}.tmp`;
-    const states = [...this.structuredSessions.values()].map((s) => s.persistentState());
+    // Supervisor-owned session.json is authoritative for detached sessions.
+    // Keeping it out of this legacy daemon file prevents daemon shutdown from
+    // overwriting/restarting a live owner on the next boot.
+    const states = [...this.structuredSessions.values()]
+      .filter((s): s is StructuredSession => s instanceof StructuredSession)
+      .map((s) => s.persistentState());
     try {
       writeFileSync(tmp, JSON.stringify(states, null, 2), { mode: 0o600 });
       renameSync(tmp, this.structuredFile);
@@ -423,6 +455,18 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
    */
   async restoreStructured(options: RestoreStructuredOptions = {}): Promise<SessionInfo[]> {
     const restored: SessionInfo[] = [];
+    // Reattach first: each manifest represents the already-running owner. A
+    // missing/stale/incompatible one is kept visible but read-only; scanning
+    // must never invoke the launcher or replay a queued native turn.
+    if (this.structuredSupervisorRoot) {
+      for (const session of await reconnectStructuredSupervisors(this.structuredSupervisorRoot)) {
+        if (this.structuredSessions.has(session.id)) continue;
+        this.wireStructuredSession(session);
+        this.structuredSessions.set(session.id, session);
+        restored.push(session.info());
+        this.emit("state", session.info());
+      }
+    }
     for (const loaded of this.loadStructuredStates()) {
       // Store 已经落下 worker 交付、但还没来得及 kill 就崩溃时，这里先封存而
       // 不能让 session.start() 接回 native thread 并从 messageQueue 取走一条。
@@ -610,6 +654,32 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       ...(resume && agent === "codex" ? { threadId: resume.id } : {}),
     };
     const hasInitialAdapterState = Object.keys(initialAdapterState).length > 0;
+    if (this.useStructuredSupervisor && this.structuredSupervisorRoot) {
+      try {
+        const session = await this.supervisorLauncher({
+          root: this.structuredSupervisorRoot,
+          sessionId: id,
+          agent,
+          cwd,
+          title: resume?.title || titleFor(agent, cwd),
+          createdAt: Date.now(),
+          ...(approvalPolicy !== undefined ? { approvalPolicy } : {}),
+          environment: { ...(account?.environment ?? {}), ...this.sessionEnv(id) },
+          ...(account?.codexAppServerArgs ? { codexAppServerArgs: account.codexAppServerArgs } : {}),
+          ...(account ? { accountId: account.id, accountName: account.name } : {}),
+          ...(hasInitialAdapterState ? { initialAdapterState } : {}),
+        });
+        this.wireStructuredSession(session);
+        this.structuredSessions.set(id, session);
+        this.emit("state", session.info());
+        return session.info();
+      } catch (e) {
+        throw new SessionError(
+          `无法启动 ${agent} supervisor 会话:${e instanceof Error ? e.message : String(e)}`,
+          "agent_unavailable",
+        );
+      }
+    }
     const session = this.makeStructuredSession(
       id,
       agent,
@@ -698,16 +768,23 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       ...(restored ? { restored } : {}),
       ...(initialAdapterState ? { initialAdapterState } : {}),
     });
-    session.on("event", (body, evSeq) => {
+    this.wireStructuredSession(session);
+    return session;
+  }
+
+  private wireStructuredSession(session: StructuredSession | RemoteStructuredSession): void {
+    session.on("event", (body: AgentEventBody, evSeq: number) => {
+      const id = session.id;
       this.emit("agentEvent", id, body, evSeq);
       this.scheduleStructuredPersist();
     });
-    session.on("state", (info) => {
+    session.on("state", (info: SessionInfo) => {
       this.emit("state", info);
       this.scheduleStructuredPersist();
     });
-    session.on("persist", () => this.scheduleStructuredPersist());
-    return session;
+    if (session instanceof StructuredSession) {
+      session.on("persist", () => this.scheduleStructuredPersist());
+    }
   }
 
   /** 用官方 CLI 打开登录终端；managed Claude 在这里生成之后要安全导入的令牌。 */
@@ -741,7 +818,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     return this.ptySessions.get(sid);
   }
 
-  getStructured(sid: string): StructuredSession | undefined {
+  getStructured(sid: string): StructuredSession | RemoteStructuredSession | undefined {
     return this.structuredSessions.get(sid);
   }
 
@@ -763,7 +840,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     return s;
   }
 
-  requireStructured(sid: string): StructuredSession {
+  requireStructured(sid: string): StructuredSession | RemoteStructuredSession {
     const s = this.structuredSessions.get(sid);
     if (!s) {
       throw new SessionError(
@@ -790,7 +867,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   }
 
   /** 任意一个结构化会话;账号级查询(用量/限流)用它当入口 */
-  anyStructured(): StructuredSession | null {
+  anyStructured(): StructuredSession | RemoteStructuredSession | null {
     return this.structuredSessions.values().next().value ?? null;
   }
 
@@ -798,8 +875,8 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
    * 每个 (agent, accountId) 各挑一个结构化会话。多账号之后只按 agent
    * 合并会把两份订阅额度混在一起；旧会话没有 accountId 时仍归到 legacy。
    */
-  structuredPerAgent(): StructuredSession[] {
-    const byAccount = new Map<string, StructuredSession>();
+  structuredPerAgent(): Array<StructuredSession | RemoteStructuredSession> {
+    const byAccount = new Map<string, StructuredSession | RemoteStructuredSession>();
     for (const s of this.structuredSessions.values()) {
       // 后来的覆盖先前的:新会话更可能刚从服务端拿到过限流推送
       byAccount.set(`${s.agent}\u0000${s.accountId ?? "legacy"}`, s);
@@ -840,6 +917,14 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     const structured = this.structuredSessions.get(sid);
     if (structured) {
       const info = structured.info();
+      if (structured instanceof RemoteStructuredSession) {
+        // The only daemon operation allowed to terminate a detached owner.
+        // disposeAll() below deliberately calls dispose() instead.
+        await structured.kill();
+        if (!options.preserveHistory) this.structuredSessions.delete(sid);
+        this.emit("state", { ...info, status: "done" });
+        return;
+      }
       // dispose 在首个 await 前就同步把 StructuredSession 标为 done/read-only；
       // 因此 preserveHistory 可以在 adapter.dispose 卡住时仍立即写出终态快照。
       const disposing = structured.dispose();
