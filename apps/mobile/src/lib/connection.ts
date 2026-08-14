@@ -124,6 +124,8 @@ export class HostConnection {
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private lastRecvAt = 0;
+  /** 格式错误重连也不会自愈；保留原因让 onclose 停止无限退避。 */
+  private fatalReceiveError: string | null = null;
   private everConnected = false;
   private negotiatedProtocolVersion: number | null = null;
   /** null 表示旧 daemon 未声明能力；空 Set 表示新 daemon 明确拒绝所有可选能力。 */
@@ -465,6 +467,7 @@ export class HostConnection {
     this.diagnosis = null;
     this.ws = won.ws;
     this.channel = won.channel;
+    this.fatalReceiveError = null;
     this.activeAddr = won.addr;
     this.lastRttMs = won.rttMs;
     this.lastRecvAt = Date.now();
@@ -520,8 +523,12 @@ export class HostConnection {
     let msg: S2CMessage;
     try {
       msg = parseS2C(this.channel!.open(text));
-    } catch {
-      this.ws?.close(); // 通道不可信,断开走重连
+    } catch (error) {
+      if (error instanceof ProtocolError && error.code === "format") {
+        this.fatalReceiveError =
+          `主机返回的数据不符合协议：${error.message}。请升级 daemon 后手动重试。`;
+      }
+      this.ws?.close(); // 密文/计数器错误可重连；格式错误由 onClose 停止死循环
       return;
     }
     switch (msg.type) {
@@ -962,7 +969,10 @@ export class HostConnection {
   }
 
   private onClose(): void {
-    const wasConnected = this.isConnected;
+    // close 事件触发时 readyState 已不是 OPEN，不能再用 isConnected 判断旧状态。
+    const wasConnected = this.ws !== null && this.channel !== null;
+    const fatalReceiveError = this.fatalReceiveError;
+    this.fatalReceiveError = null;
     // 断线时挂起的文件请求永远等不到应答了,立刻失败好过等超时
     for (const [, waiter] of this.fsWaiters) waiter.reject(new Error("连接已断开"));
     this.fsWaiters.clear();
@@ -971,6 +981,11 @@ export class HostConnection {
     this.channel = null;
     this.activeAddr = null;
     if (this.stopped) return;
+    if (fatalReceiveError) {
+      this.patch({ status: "failed", activeAddr: null, lastError: fatalReceiveError });
+      if (wasConnected) this.events.emit("disconnected", { willRetry: false });
+      return;
+    }
     this.patch({ status: "reconnecting", activeAddr: null });
     if (wasConnected) this.events.emit("disconnected", { willRetry: true });
     this.scheduleRetry();
