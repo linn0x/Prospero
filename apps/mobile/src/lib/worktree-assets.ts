@@ -1,4 +1,4 @@
-import type { OrchestrationWorktreeAsset } from "@prospero/protocol";
+import type { OrchestrationRun, OrchestrationWorktreeAsset } from "@prospero/protocol";
 
 export interface WorktreeAssetPresentation {
   label: string;
@@ -13,6 +13,42 @@ export interface WorktreePathAction {
   label: "浏览路径" | "复制路径";
   accessibilityLabel: string;
   accessibilityHint: string;
+}
+
+export interface WorktreeAssetGroups {
+  /** Assets still owned by a Run present in the latest snapshot. */
+  byRunId: ReadonlyMap<string, OrchestrationWorktreeAsset[]>;
+  /**
+   * Assets whose Run was explicitly deleted, or whose Run is no longer in the
+   * snapshot. Deliberately includes cleaned records so their final state stays
+   * visible instead of making a successful cleanup look like lost history.
+   */
+  orphaned: OrchestrationWorktreeAsset[];
+}
+
+/**
+ * Keeps active Run ownership ahead of presentation, while making deletion
+ * tombstones and snapshot gaps recoverable from one dedicated UI section.
+ */
+export function groupWorktreeAssets(
+  assets: readonly OrchestrationWorktreeAsset[],
+  runs: readonly Pick<OrchestrationRun, "id">[],
+): WorktreeAssetGroups {
+  const currentRunIds = new Set(runs.map((run) => run.id));
+  const byRunId = new Map<string, OrchestrationWorktreeAsset[]>();
+  const orphaned: OrchestrationWorktreeAsset[] = [];
+
+  for (const asset of assets) {
+    if (asset.runDeletedAt !== null || !currentRunIds.has(asset.runId)) {
+      orphaned.push(asset);
+      continue;
+    }
+    const grouped = byRunId.get(asset.runId);
+    if (grouped) grouped.push(asset);
+    else byRunId.set(asset.runId, [asset]);
+  }
+
+  return { byRunId, orphaned };
 }
 
 /** A path can only be browsed when it is backed by a linked worker dispatch. */
