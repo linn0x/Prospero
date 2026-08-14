@@ -96,8 +96,12 @@ describe("esaytree", () => {
       "utf8",
     )).toBe("ok\n");
 
-    const canonicalTarget = realpathSync(target);
-    expect((await listWorktrees(root)).some((worktree) => realpathSync(worktree.path) === canonicalTarget)).toBe(true);
+    const canonicalTarget = realpathSync.native(target);
+    expect(
+      (await listWorktrees(root)).some(
+        (worktree) => realpathSync.native(worktree.path) === canonicalTarget,
+      ),
+    ).toBe(true);
     await removeWorktree(root, target, { deleteBranch: true });
     expect(existsSync(target)).toBe(false);
     expect((await listWorktrees(root)).some((worktree) => worktree.path === canonicalTarget)).toBe(false);
