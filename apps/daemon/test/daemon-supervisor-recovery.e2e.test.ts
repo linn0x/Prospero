@@ -9,13 +9,16 @@ import { once } from "node:events";
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
+  rmdirSync,
   writeFileSync,
 } from "node:fs";
-import { createServer } from "node:net";
+import { createConnection, createServer, type Socket } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -46,11 +49,21 @@ interface StatusFile {
 interface Manifest {
   supervisorPid?: number;
   status?: string;
+  socket: string;
+  sessionDir?: string;
+}
+
+interface SupervisorArtifact {
+  supervisorPid: number | undefined;
+  socket: string;
+  socketDir: string;
+  sessionDir: string;
 }
 
 const temporary: string[] = [];
 const daemons: DaemonProcess[] = [];
 const supervisorGroups = new Set<number>();
+const supervisorArtifacts = new Map<string, SupervisorArtifact>();
 
 function temp(prefix: string): string {
   const value = mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -97,6 +110,16 @@ function processAlive(pid: number | undefined): boolean {
   if (!pid || !Number.isSafeInteger(pid) || pid <= 1) return false;
   try {
     process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function processGroupAlive(groupId: number | undefined): boolean {
+  if (!groupId || !Number.isSafeInteger(groupId) || groupId <= 1) return false;
+  try {
+    process.kill(-groupId, 0);
     return true;
   } catch {
     return false;
@@ -161,10 +184,77 @@ function status(home: string): StatusFile {
 }
 
 function manifest(home: string, sessionId: string): Manifest {
-  return JSON.parse(readFileSync(
+  const value = JSON.parse(readFileSync(
     path.join(home, "structured-supervisor", sessionId, "manifest.json"),
     "utf8",
   )) as Manifest;
+  if (typeof value.socket !== "string" || value.socket.length === 0) {
+    throw new Error(`manifest for ${sessionId} did not record a socket`);
+  }
+  const sessionDir = typeof value.sessionDir === "string"
+    ? value.sessionDir
+    : path.join(home, "structured-supervisor", sessionId);
+  supervisorArtifacts.set(value.socket, {
+    supervisorPid: value.supervisorPid,
+    socket: value.socket,
+    socketDir: path.dirname(value.socket),
+    sessionDir,
+  });
+  return value;
+}
+
+async function socketHasListener(socketPath: string): Promise<boolean> {
+  if (!existsSync(socketPath)) return false;
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (listening: boolean) => {
+      if (settled) return;
+      settled = true;
+      probe?.destroy();
+      resolve(listening);
+    };
+    let probe: Socket | undefined;
+    try {
+      probe = createConnection(socketPath);
+    } catch {
+      resolve(false);
+      return;
+    }
+    probe.once("connect", () => finish(true));
+    probe.once("error", () => finish(false));
+  });
+}
+
+async function removeConfirmedOrphanRuntime(artifact: SupervisorArtifact): Promise<void> {
+  // The path comes from this exact temporary session manifest.  Do not remove
+  // it until both its recorded owner and the endpoint listener are gone.
+  expect(processAlive(artifact.supervisorPid)).toBe(false);
+  expect(processGroupAlive(artifact.supervisorPid)).toBe(false);
+  await eventually(async () => !(await socketHasListener(artifact.socket)), "orphan socket listener exit");
+  if (existsSync(artifact.socket)) {
+    expect(lstatSync(artifact.socket).isSocket()).toBe(true);
+    rmSync(artifact.socket, { force: true });
+  }
+  if (existsSync(artifact.socketDir)) {
+    const metadata = lstatSync(artifact.socketDir);
+    expect(metadata.isDirectory()).toBe(true);
+    expect(metadata.isSymbolicLink()).toBe(false);
+    rmdirSync(artifact.socketDir);
+  }
+}
+
+async function assertNoSupervisorResiduals(): Promise<void> {
+  for (const artifact of supervisorArtifacts.values()) {
+    await eventually(
+      () => !processAlive(artifact.supervisorPid) && !processGroupAlive(artifact.supervisorPid),
+      `runner and fake provider process group ${String(artifact.supervisorPid)} exit`,
+    );
+    expect(existsSync(artifact.socket)).toBe(false);
+    expect(existsSync(artifact.socketDir)).toBe(false);
+    if (existsSync(artifact.sessionDir)) {
+      expect(readdirSync(artifact.sessionDir).some((entry) => entry.startsWith(".bootstrap-"))).toBe(false);
+    }
+  }
 }
 
 async function sessionView(home: string, port: number, sessionId: string): Promise<SessionView> {
@@ -399,9 +489,13 @@ async function exerciseSignalRecovery(signal: NodeJS.Signals): Promise<void> {
   expect(processAlive(liveManifest.supervisorPid)).toBe(true);
   const killed = await control(home, third.port, "POST", `/_prospero/control/session/${encodeURIComponent(sessionId)}/kill`, {});
   expect(killed.status).toBe(204);
-  await eventually(() => !processAlive(liveManifest.supervisorPid), "explicit session.kill supervisor termination");
+  await eventually(
+    () => !processAlive(liveManifest.supervisorPid) && !processGroupAlive(liveManifest.supervisorPid),
+    "explicit session.kill supervisor and fake provider termination",
+  );
   supervisorGroups.delete(liveManifest.supervisorPid!);
   await stopDaemon(third, "SIGTERM");
+  await assertNoSupervisorResiduals();
 }
 
 afterEach(async () => {
@@ -417,6 +511,10 @@ afterEach(async () => {
     try { process.kill(-pid, "SIGKILL"); } catch { /* already gone */ }
   }
   supervisorGroups.clear();
+  supervisorArtifacts.clear();
+  // Every entry was created with mkdtempSync by this test.  This is never a
+  // glob or a user-owned runtime root; production-residual assertions happen
+  // in the test body before this final isolated fixture cleanup.
   for (const dir of temporary.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -485,8 +583,20 @@ describe.sequential("daemon supervisor SIGTERM/SIGKILL full-process recovery", (
     // This is a supervisor crash, not session.kill.  On the next daemon boot
     // it must remain an inspectable `died` history rather than a new turn.
     process.kill(-(owned.supervisorPid!), "SIGKILL");
-    await eventually(() => !processAlive(owned.supervisorPid), "simulated supervisor crash");
+    await eventually(
+      () => !processAlive(owned.supervisorPid) && !processGroupAlive(owned.supervisorPid),
+      "simulated supervisor and fake provider crash",
+    );
     supervisorGroups.delete(owned.supervisorPid!);
+    const orphanRuntime: SupervisorArtifact = {
+      supervisorPid: owned.supervisorPid,
+      socket: owned.socket,
+      socketDir: path.dirname(owned.socket),
+      sessionDir: owned.sessionDir ?? path.join(orphanHome, "structured-supervisor", created.id),
+    };
+    // SIGKILL bypasses runner cleanup.  Remove only this recorded endpoint,
+    // after proving its exact owner and listener are both gone.
+    await removeConfirmedOrphanRuntime(orphanRuntime);
     await stopDaemon(first, "SIGTERM");
 
     const second = await startDaemon(orphanHome, await freePort(), orphanBin);
@@ -503,5 +613,6 @@ describe.sequential("daemon supervisor SIGTERM/SIGKILL full-process recovery", (
     expect(rejected.status).toBe(400);
     expect(rejected.body).toMatch(/disconnected|unavailable/i);
     await stopDaemon(second, "SIGTERM");
+    await assertNoSupervisorResiduals();
   });
 });

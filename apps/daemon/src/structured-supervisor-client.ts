@@ -707,13 +707,66 @@ async function waitForProcessGroupExit(groupId: number, timeoutMs: number): Prom
  * returned by this exact detached spawn. It never consults manifests or scans
  * PIDs, so an already-running/reconnected supervisor cannot be selected here.
  */
-async function terminateNewSupervisorGroup(groupId: number | undefined): Promise<void> {
-  if (!groupId || !Number.isSafeInteger(groupId) || groupId <= 1 || !processGroupAlive(groupId)) return;
-  signalProcessGroup(groupId, "SIGTERM");
-  if (await waitForProcessGroupExit(groupId, SUPERVISOR_TERM_GRACE_MS)) return;
-  signalProcessGroup(groupId, "SIGKILL");
-  if (await waitForProcessGroupExit(groupId, SUPERVISOR_KILL_GRACE_MS)) return;
-  throw new RemoteSupervisorError("new supervisor process group did not exit during launch rollback", "cleanup_failed");
+interface SupervisorGroupTermination {
+  /** Whether the launcher has positively established that its own group is gone. */
+  exited: boolean;
+  errors: Error[];
+}
+
+function cleanupError(stage: string, error: unknown): Error {
+  const detail = error instanceof Error ? error.message : String(error);
+  return new RemoteSupervisorError(`${stage}: ${detail}`, "cleanup_failed");
+}
+
+/**
+ * Attempt every escalation step against only the exact process group returned
+ * by this launch.  A failure to signal or wait is diagnostic, not permission
+ * to abandon the remaining rollback work.
+ */
+async function terminateNewSupervisorGroup(
+  groupId: number | undefined,
+  spawnAttempted: boolean,
+): Promise<SupervisorGroupTermination> {
+  // When spawn threw before returning a ChildProcess, there is no owner that
+  // could have bound the launch-owned endpoint.  If spawn did return but no
+  // safe PID was available, retain the endpoint: guessing a PID would violate
+  // the rollback authority boundary.
+  if (!spawnAttempted) return { exited: true, errors: [] };
+  if (!groupId || !Number.isSafeInteger(groupId) || groupId <= 1) {
+    return {
+      exited: false,
+      errors: [new RemoteSupervisorError("new supervisor process group was not identified during launch rollback", "cleanup_failed")],
+    };
+  }
+  if (!processGroupAlive(groupId)) return { exited: true, errors: [] };
+
+  const errors: Error[] = [];
+  try {
+    signalProcessGroup(groupId, "SIGTERM");
+  } catch (error) {
+    errors.push(cleanupError("failed to SIGTERM new supervisor process group", error));
+  }
+  try {
+    if (await waitForProcessGroupExit(groupId, SUPERVISOR_TERM_GRACE_MS)) return { exited: true, errors };
+  } catch (error) {
+    errors.push(cleanupError("failed while waiting for new supervisor process group after SIGTERM", error));
+  }
+
+  // Still address the same negative PID even if TERM or its wait failed.
+  try {
+    signalProcessGroup(groupId, "SIGKILL");
+  } catch (error) {
+    errors.push(cleanupError("failed to SIGKILL new supervisor process group", error));
+  }
+  try {
+    if (await waitForProcessGroupExit(groupId, SUPERVISOR_KILL_GRACE_MS)) return { exited: true, errors };
+  } catch (error) {
+    errors.push(cleanupError("failed while waiting for new supervisor process group after SIGKILL", error));
+  }
+
+  if (!processGroupAlive(groupId)) return { exited: true, errors };
+  errors.push(new RemoteSupervisorError("new supervisor process group did not exit during launch rollback", "cleanup_failed"));
+  return { exited: false, errors };
 }
 
 /** Only the launcher's exact random endpoint is considered; ordinary files are never unlinked. */
@@ -754,24 +807,107 @@ async function waitForSpawn(child: ChildProcess): Promise<void> {
   });
 }
 
-async function rollbackFailedLaunch(
-  groupId: number | undefined,
-  bootstrap: string | undefined,
-  socketPath: string,
-  socketDir: string,
-  manifestFile: string,
-  manifest: StructuredSupervisorManifest,
-): Promise<void> {
-  // Signal and reap the whole new group before unlinking its endpoint. This
-  // covers a runner that already spawned a provider child, including Codex.
-  await terminateNewSupervisorGroup(groupId);
-  if (bootstrap) rmSync(bootstrap, { force: true });
-  removeNewSupervisorSocket(socketPath, socketDir);
+export interface FailedStructuredSupervisorLaunch {
+  groupId: number | undefined;
+  /** True once detached spawn returned; an absent PID is then unsafe to guess. */
+  spawnAttempted: boolean;
+  bootstrap: string | undefined;
+  socketPath: string;
+  socketDir: string;
+  manifestFile: string;
+  manifest: StructuredSupervisorManifest;
+}
+
+export interface FailedStructuredSupervisorLaunchRollback {
+  groupExited: boolean;
+  /** Every failed cleanup step, retained without replacing the launch error. */
+  errors: Error[];
+}
+
+/** Test-only dependency seam for exceptional rollback branches. */
+export interface FailedStructuredSupervisorLaunchRollbackOperations {
+  terminateGroup(input: Pick<FailedStructuredSupervisorLaunch, "groupId" | "spawnAttempted">): Promise<SupervisorGroupTermination>;
+  removeBootstrap(bootstrap: string): void;
+  removeSocket(socketPath: string, socketDir: string): void;
+  readManifest(manifestFile: string): StructuredSupervisorManifest | null;
+  writeManifest(manifestFile: string, manifest: StructuredSupervisorManifest): void;
+}
+
+const rollbackOperations: FailedStructuredSupervisorLaunchRollbackOperations = {
+  terminateGroup: ({ groupId, spawnAttempted }) => terminateNewSupervisorGroup(groupId, spawnAttempted),
+  removeBootstrap: (bootstrap) => rmSync(bootstrap, { force: true }),
+  removeSocket: removeNewSupervisorSocket,
+  readManifest: readSupervisorManifest,
+  writeManifest: privateWrite,
+};
+
+/**
+ * Run every independently-safe rollback action.  The transient bootstrap is
+ * always attempted because it can contain account credentials.  In contrast,
+ * the socket/runtime directory is left alone until the exact launch group is
+ * known to be gone, so a failed rollback cannot affect a live owner.
+ */
+export async function rollbackFailedStructuredSupervisorLaunch(
+  failedLaunch: FailedStructuredSupervisorLaunch,
+  overrides: Partial<FailedStructuredSupervisorLaunchRollbackOperations> = {},
+): Promise<FailedStructuredSupervisorLaunchRollback> {
+  const operations = { ...rollbackOperations, ...overrides };
+  const errors: Error[] = [];
+  let groupExited = false;
+
+  try {
+    const termination = await operations.terminateGroup(failedLaunch);
+    groupExited = termination.exited;
+    errors.push(...termination.errors);
+  } catch (error) {
+    errors.push(cleanupError("failed to terminate new supervisor process group", error));
+  }
+
+  // Do this even when signaling, waiting, or manifest preservation failed.
+  if (failedLaunch.bootstrap) {
+    try {
+      operations.removeBootstrap(failedLaunch.bootstrap);
+    } catch (error) {
+      errors.push(cleanupError("failed to remove launch bootstrap", error));
+    }
+  }
+
+  if (groupExited) {
+    try {
+      operations.removeSocket(failedLaunch.socketPath, failedLaunch.socketDir);
+    } catch (error) {
+      errors.push(cleanupError("failed to remove launch socket/runtime directory", error));
+    }
+  } else {
+    errors.push(new RemoteSupervisorError(
+      "new supervisor process group was not confirmed exited; retained launch socket/runtime directory",
+      "cleanup_failed",
+    ));
+  }
 
   // Keep the private directory and manifest as a read-only audit record. A
   // later daemon restart exposes it as died history and never relaunches it.
-  const latest = readSupervisorManifest(manifestFile) ?? manifest;
-  privateWrite(manifestFile, { ...latest, status: "died", updatedAt: Date.now() });
+  try {
+    const latest = operations.readManifest(failedLaunch.manifestFile) ?? failedLaunch.manifest;
+    operations.writeManifest(failedLaunch.manifestFile, { ...latest, status: "died", updatedAt: Date.now() });
+  } catch (error) {
+    errors.push(cleanupError("failed to preserve failed launch manifest", error));
+  }
+
+  return { groupExited, errors };
+}
+
+function addRollbackDiagnostics(original: unknown, rollback: FailedStructuredSupervisorLaunchRollback): Error {
+  const primary = original instanceof Error ? original : new Error(String(original));
+  if (rollback.errors.length === 0) return primary;
+  // Preserve the original error (and RemoteSupervisorError.code) as the
+  // rejection.  Cleanup diagnostics are aggregate metadata for logs/tests,
+  // rather than a replacement error which would hide the real launch failure.
+  Object.defineProperty(primary, "rollbackErrors", {
+    configurable: true,
+    value: new AggregateError(rollback.errors, "supervisor launch rollback encountered cleanup failures"),
+  });
+  return primary;
 }
 
 export async function launchStructuredSupervisor(input: LaunchStructuredSupervisorInput): Promise<RemoteStructuredSession> {
@@ -813,6 +949,7 @@ export async function launchStructuredSupervisor(input: LaunchStructuredSupervis
   const manifestFile = path.join(sessionDir, "manifest.json");
   let bootstrap: string | undefined;
   let groupId: number | undefined;
+  let spawnAttempted = false;
   try {
     privateWrite(manifestFile, manifest);
     const bootstrapFile = path.join(sessionDir, `.bootstrap-${randomBytes(8).toString("hex")}.json`);
@@ -848,9 +985,15 @@ export async function launchStructuredSupervisor(input: LaunchStructuredSupervis
         PROSPERO_STRUCTURED_SUPERVISOR_CONFIG: bootstrapFile,
       },
     });
+    spawnAttempted = true;
     // If Node fails before the runner consumes it, do not leave account
     // environment data in a bootstrap file. Normal startup removes it itself.
-    child.once("exit", () => rmSync(bootstrapFile, { force: true }));
+    child.once("exit", () => {
+      try { rmSync(bootstrapFile, { force: true }); }
+      // Launch rollback will make another best-effort exact-path attempt and
+      // retain its error diagnostics; an exit-event callback must not throw.
+      catch { /* handled by the rollback path when launch did not succeed */ }
+    });
     await waitForSpawn(child);
     if (!child.pid || !Number.isSafeInteger(child.pid) || child.pid <= 1) {
       throw new RemoteSupervisorError("supervisor spawn returned no process id", "spawn_failed");
@@ -879,15 +1022,10 @@ export async function launchStructuredSupervisor(input: LaunchStructuredSupervis
     }
     throw new RemoteSupervisorError(`supervisor did not become ready: ${lastError instanceof Error ? lastError.message : "unknown error"}`);
   } catch (error) {
-    try {
-      await rollbackFailedLaunch(groupId, bootstrap, socketPath, socketDir, manifestFile, manifest);
-    } catch (cleanupError) {
-      throw new RemoteSupervisorError(
-        `supervisor launch failed and rollback was incomplete: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
-        "cleanup_failed",
-      );
-    }
-    throw error;
+    const rollback = await rollbackFailedStructuredSupervisorLaunch({
+      groupId, spawnAttempted, bootstrap, socketPath, socketDir, manifestFile, manifest,
+    });
+    throw addRollbackDiagnostics(error, rollback);
   }
 }
 
