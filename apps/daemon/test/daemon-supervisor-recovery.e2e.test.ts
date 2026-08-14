@@ -511,6 +511,21 @@ afterEach(async () => {
     try { process.kill(-pid, "SIGKILL"); } catch { /* already gone */ }
   }
   supervisorGroups.clear();
+
+  // A test can fail before its success-path cleanup.  Every entry here came
+  // from this test's private manifest, so reap and remove only that exact
+  // process group/runtime endpoint; never enumerate user processes or glob
+  // /tmp.  This keeps failed test runs as clean as successful ones.
+  for (const artifact of supervisorArtifacts.values()) {
+    if (processGroupAlive(artifact.supervisorPid)) {
+      try { process.kill(-(artifact.supervisorPid!), "SIGKILL"); } catch { /* already gone */ }
+    }
+    await eventually(
+      () => !processAlive(artifact.supervisorPid) && !processGroupAlive(artifact.supervisorPid),
+      `fixture supervisor process group ${String(artifact.supervisorPid)} exit`,
+    );
+    await removeConfirmedOrphanRuntime(artifact);
+  }
   supervisorArtifacts.clear();
   // Every entry was created with mkdtempSync by this test.  This is never a
   // glob or a user-owned runtime root; production-residual assertions happen

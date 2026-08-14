@@ -1044,7 +1044,15 @@ export async function reconnectStructuredSupervisors(root: string): Promise<Remo
     // A dead PID, stale socket or protocol mismatch is historical/read-only.
     // Crucially this path does not call the launcher, preventing duplicate turns.
     const withOwnerDir = { ...manifest, sessionDir: dir };
-    if (!processAlive(manifest.supervisorPid) || !privateMode(path.join(dir, "token")) || !privateMode(manifest.socket)) {
+    // A failed-launch/explicitly-ended audit is permanently read-only.  Even
+    // if rollback could not confirm process exit, a later daemon must never
+    // attach the owner of a create() call that already returned failure.
+    if (
+      manifest.status === "died" || manifest.status === "done" ||
+      !processAlive(manifest.supervisorPid) ||
+      !privateMode(path.join(dir, "token")) ||
+      !privateMode(manifest.socket)
+    ) {
       sessions.push(RemoteStructuredSession.unavailable(withOwnerDir));
       continue;
     }
