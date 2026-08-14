@@ -396,6 +396,60 @@ describe("资产持久化迁移与控制 API", () => {
     expect(git(repo, ["branch", "--list", safe.branch])).toBe("");
   });
 
+  it("v1 Run 的 monorepo 子目录会解析到 worktree 根后再检查和清理", async () => {
+    const { repo, assets } = repository();
+    const packageDir = path.join("packages", "app");
+    mkdirSync(path.join(repo, packageDir), { recursive: true });
+    writeFileSync(path.join(repo, packageDir, "package.json"), "{}\n");
+    git(repo, ["add", packageDir]);
+    git(repo, ["commit", "-m", "add monorepo package"]);
+
+    const created = await createEsaytree({
+      repo,
+      name: "legacy-run-subdir",
+      at: path.join(assets, "legacy-run-subdir"),
+      branch: "prospero/legacy-run-subdir",
+      cloneIgnored: false,
+    });
+    const original = new OrchestrationStore();
+    const run = original.createRun({ objective: "legacy run subdir" });
+    original.setRunAutomation(run.id, {
+      state: "paused",
+      agent: "codex",
+      approvalPolicy: "standard",
+      workspace: "run",
+      cwd: path.join(repo, packageDir),
+      workspacePath: path.join(created.path, packageDir),
+      branch: created.branch,
+      startedAt: Date.now(),
+      updatedAt: Date.now(),
+      lastError: null,
+    });
+    const legacy = original.snapshot() as unknown as Record<string, unknown>;
+    legacy.version = 1;
+    delete legacy.worktreeAssets;
+    const home = temporaryRoot();
+    writeFileSync(path.join(home, "orchestration.json"), JSON.stringify(legacy));
+
+    const migrated = new OrchestrationStore(home);
+    const asset = migrated.listWorktreeAssets(run.id).find((candidate) => candidate.kind === "run");
+    if (!asset) throw new Error("v1 Run asset was not migrated");
+    expect(asset).toMatchObject({
+      repo: path.join(repo, packageDir),
+      path: path.join(created.path, packageDir),
+      legacy: true,
+    });
+
+    const service = new WorktreeAssetService(migrated);
+    await expect(service.inspect(asset.id, "main"))
+      .resolves.toMatchObject({ state: "safe_to_clean", registered: true });
+    await expect(service.cleanup({ assetId: asset.id, targetRef: "main", confirm: true }))
+      .resolves.toMatchObject({ branchDeleted: false, warning: null });
+    expect(() => readFileSync(path.join(created.path, packageDir, "package.json"), "utf8")).toThrow();
+    expect(git(repo, ["branch", "--list", created.branch!])).toBe(created.branch);
+    migrated.close();
+  });
+
   it("没有独立源 worktree 的自指 legacy 候选只能返回 unknown", async () => {
     const { repo } = repository();
     const store = new OrchestrationStore();
