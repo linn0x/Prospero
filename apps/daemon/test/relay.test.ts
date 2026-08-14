@@ -22,13 +22,16 @@ import {
   loadDevices,
   loadIdentity,
   mintDevice,
+  issueRelayCredentials,
+  persistRelayCredentials,
   relayPairingForDevice,
+  rotateRelayKey,
   saveConfig,
   saveDevices,
   type DaemonConfig,
   type DeviceRecord,
 } from "../src/pairing.js";
-import { RelayHostClient } from "../src/relay-host-client.js";
+import { RELAY_SYNC_STATE_FILE, RelayHostClient } from "../src/relay-host-client.js";
 import { createDaemonServer, type DaemonServer } from "../src/ws-server.js";
 
 const homes: string[] = [];
@@ -49,6 +52,7 @@ function device(name: string): DeviceRecord {
     token: "pairing-token-0123456789",
     relayDeviceId: `device_${name}_0123456789`,
     relayToken: `ticket_${name}_0123456789`,
+    relayCredentialIssued: true,
     allowShell: true,
     createdAt: 1,
   };
@@ -89,7 +93,7 @@ afterEach(async () => {
 });
 
 describe("relay pairing persistence", () => {
-  it("migrates old records, mints distinct relay credentials, and derives stable domain-separated routes", () => {
+  it("keeps direct pairings relay-inactive until credentials are rendered in a relay QR", () => {
     const dir = home();
     const secret = generateRelayHostSecret();
     const first = deriveRelayRouteId(secret);
@@ -101,12 +105,18 @@ describe("relay pairing persistence", () => {
       name: "old-phone", token: "old-pairing-token-123", allowShell: true, createdAt: 1,
     }]);
     const fresh = mintDevice(dir, { name: "new-phone", allowShell: true });
-    expect(fresh.relayDeviceId).toMatch(/^[A-Za-z0-9_-]{16,}$/);
-    expect(fresh.relayToken).toMatch(/^[A-Za-z0-9_-]{16,}$/);
+    expect(fresh.relayDeviceId).toBeUndefined();
+    expect(relayPairingForDevice(
+      { port: 7423, relay: { enabled: true, url: "wss://relay.example.test/v1", hostSecret: secret } },
+      fresh,
+    )).toBeNull();
+    const issued = issueRelayCredentials(fresh);
+    expect(issued.relayDeviceId).toMatch(/^[A-Za-z0-9_-]{16,}$/);
+    expect(issued.relayToken).toMatch(/^[A-Za-z0-9_-]{16,}$/);
 
     const relay = relayPairingForDevice(
       { port: 7423, relay: { enabled: true, url: "wss://relay.example.test/v1", hostSecret: secret } },
-      fresh,
+      issued,
     );
     expect(relay).toMatchObject({ url: "wss://relay.example.test/v1", routeId: first });
     expect(relayPairingForDevice(
@@ -114,12 +124,17 @@ describe("relay pairing persistence", () => {
       { name: "old-phone", token: "old-pairing-token-123", allowShell: true, createdAt: 1 },
     )).toBeNull();
     const payload = buildPairingPayload(dir, {
-      token: fresh.token,
+      token: issued.token,
       port: 7423,
       relay: relay!,
     });
     expect(payload.relay).toEqual(relay);
     expect(payload.addrs.length === 0 || payload.relay !== undefined).toBe(true);
+    persistRelayCredentials(dir, issued);
+    expect(relayPairingForDevice(
+      { port: 7423, relay: { enabled: true, url: "wss://relay.example.test/v1", hostSecret: secret } },
+      loadDevices(dir).find((device) => device.token === issued.token)!,
+    )).toEqual(relay);
   });
 
   it("uses override before deployment default and keeps config private", () => {
@@ -146,7 +161,8 @@ describe("prosperod relay CLI", () => {
     expect(enabled.relay?.hostSecret).toHaveLength(43);
     expect(statSync(path.join(dir, "config.json")).mode & 0o777).toBe(0o600);
 
-    const paired = mintDevice(dir, { name: "cli-phone", allowShell: true });
+    const paired = issueRelayCredentials(mintDevice(dir, { name: "cli-phone", allowShell: true }));
+    persistRelayCredentials(dir, paired);
     const status = cli(dir, ["relay", "status", "--json"]);
     expect(status.status).toBe(0);
     expect(JSON.parse(status.stdout)).toMatchObject({
@@ -161,6 +177,34 @@ describe("prosperod relay CLI", () => {
     expect(cli(dir, ["relay", "disable"]).status).toBe(0);
     expect(loadConfig(dir).relay?.enabled).toBe(false);
   }, 20_000);
+
+  it("requires a direct pairing made while relay was disabled to re-pair after enable", () => {
+    const dir = home();
+    const direct = mintDevice(dir, { name: "direct-phone", allowShell: true });
+    expect(direct.relayDeviceId).toBeUndefined();
+    expect(cli(dir, ["relay", "enable", "--url", "ws://127.0.0.1:9010", "--dev"]).status).toBe(0);
+    const before = JSON.parse(cli(dir, ["relay", "status", "--json"]).stdout) as {
+      rePairRequired: boolean; devices: { ready: number; needsRePair: number };
+    };
+    expect(before).toMatchObject({ rePairRequired: true, devices: { ready: 0, needsRePair: 1 } });
+    expect(relayPairingForDevice(loadConfig(dir), loadDevices(dir)[0]!)).toBeNull();
+  });
+
+  it("clears credentials before a relay key rotation config write and stays conservative on failure", () => {
+    const dir = home();
+    const initial = config("wss://relay.example.test/v1");
+    saveConfig(dir, initial);
+    const paired = issueRelayCredentials(mintDevice(dir, { name: "rotate-phone", allowShell: true }));
+    persistRelayCredentials(dir, paired);
+    expect(() => rotateRelayKey(dir, initial, {
+      saveDevices: (_home, devices) => saveDevices(dir, devices),
+      saveConfig: () => { throw new Error("simulated config write failure"); },
+    })).toThrow("simulated config write failure");
+    const retainedConfig = loadConfig(dir);
+    const cleared = loadDevices(dir)[0]!;
+    expect(retainedConfig.relay?.hostSecret).toBe(initial.relay?.hostSecret);
+    expect(relayPairingForDevice(retainedConfig, cleared)).toBeNull();
+  });
 });
 
 describe("RelayHostClient", () => {
@@ -196,6 +240,7 @@ describe("RelayHostClient", () => {
       minReconnectMs: 5,
       maxReconnectMs: 10,
       random: () => 1,
+      stateDir: home(),
       onStream: () => {},
       onStatus: (status) => states.push(status.state),
     });
@@ -231,15 +276,225 @@ describe("RelayHostClient", () => {
     expect(client.status()).toMatchObject({ state: "error", lastError: "relay URL or key is invalid" });
     client.close();
   });
+
+  it("persists strictly increasing route-local generations across restart and initializes a rotated route independently", async () => {
+    const dir = home();
+    const relay = await relayServer();
+    const snapshots: Array<{ routeId: string; generation: number }> = [];
+    relay.wss.on("connection", (ws) => {
+      let routeId = "";
+      ws.on("message", (raw) => {
+        const message = JSON.parse(raw.toString()) as { routeId?: string; type?: string; generation?: number };
+        if (!message.type) {
+          routeId = message.routeId!;
+          return;
+        }
+        if (message.type !== "host.device-sync") return;
+        snapshots.push({ routeId, generation: message.generation! });
+        ws.send(JSON.stringify({ type: "host.device-sync.ack", v: 1, generation: message.generation }));
+        ws.send(JSON.stringify({ type: "host.ready", v: 1, routeId, generation: message.generation }));
+      });
+    });
+    const firstConfig = config(relay.url);
+    const first = new RelayHostClient({
+      devMode: true, stateDir: dir, minReconnectMs: 5, maxReconnectMs: 10, random: () => 1, onStream: () => {},
+    });
+    try {
+      first.update(firstConfig, [device("persist")]);
+      await waitFor(() => first.status().state === "online" && snapshots.length === 1);
+      expect(statSync(path.join(dir, RELAY_SYNC_STATE_FILE)).mode & 0o777).toBe(0o600);
+      first.close();
+
+      const restarted = new RelayHostClient({
+        devMode: true, stateDir: dir, minReconnectMs: 5, maxReconnectMs: 10, random: () => 1, onStream: () => {},
+      });
+      try {
+        restarted.update(firstConfig, [device("persist")]);
+        await waitFor(() => restarted.status().state === "online" && snapshots.length === 2);
+        expect(snapshots[1]!.generation).toBeGreaterThan(snapshots[0]!.generation);
+
+        const rotated = config(relay.url);
+        restarted.update(rotated, [device("persist")]);
+        await waitFor(() => restarted.status().state === "online" && snapshots.length === 3);
+        expect(snapshots[2]).toMatchObject({
+          routeId: deriveRelayRouteId(rotated.relay!.hostSecret!), generation: 1,
+        });
+      } finally {
+        restarted.close();
+      }
+    } finally {
+      first.close();
+      await relay.close();
+    }
+  });
+
+  it("recovers from duplicate current ACKs and ignores a late ACK/ready while a newer snapshot is pending", async () => {
+    const dir = home();
+    const relay = await relayServer();
+    const generations: number[] = [];
+    let controls = 0;
+    relay.wss.on("connection", (ws) => {
+      let routeId = "";
+      ws.on("message", (raw) => {
+        const message = JSON.parse(raw.toString()) as { routeId?: string; type?: string; generation?: number };
+        if (!message.type) {
+          routeId = message.routeId!;
+          return;
+        }
+        if (message.type !== "host.device-sync") return;
+        controls++;
+        const generation = message.generation!;
+        generations.push(generation);
+        if (controls === 1) {
+          // ACK delivery is idempotent; receiving it twice must still reach ready.
+          ws.send(JSON.stringify({ type: "host.device-sync.ack", v: 1, generation }));
+          ws.send(JSON.stringify({ type: "host.device-sync.ack", v: 1, generation }));
+          ws.send(JSON.stringify({ type: "host.ready", v: 1, routeId, generation }));
+          return;
+        }
+        if (controls === 2) return; // Hold this ACK until generation 3 exists.
+        const previous = generations[1]!;
+        ws.send(JSON.stringify({ type: "host.device-sync.ack", v: 1, generation: previous }));
+        ws.send(JSON.stringify({ type: "host.ready", v: 1, routeId, generation: previous }));
+        setTimeout(() => {
+          ws.send(JSON.stringify({ type: "host.device-sync.ack", v: 1, generation }));
+          ws.send(JSON.stringify({ type: "host.ready", v: 1, routeId, generation }));
+        }, 5);
+      });
+    });
+    const client = new RelayHostClient({
+      devMode: true, stateDir: dir, minReconnectMs: 5, maxReconnectMs: 10, random: () => 1, onStream: () => {},
+    });
+    try {
+      const first = device("rapid-one");
+      const relayConfig = config(relay.url);
+      client.update(relayConfig, [first]);
+      await waitFor(() => client.status().state === "online" && generations.length === 1);
+      client.update(relayConfig, [first, device("rapid-two")]);
+      await waitFor(() => generations.length === 2);
+      client.update(relayConfig, [first]);
+      await waitFor(() => client.status().state === "online" && generations.length === 3);
+      expect(generations[0]).toBeLessThan(generations[1]!);
+      expect(generations[1]).toBeLessThan(generations[2]!);
+      expect(client.status()).toMatchObject({ state: "online", devices: { ready: 1 } });
+    } finally {
+      client.close();
+      await relay.close();
+    }
+  });
+
+  it("bounds silent authentication/device-sync and ready phases with a reconnect", async () => {
+    const authSilent = await relayServer();
+    let authConnections = 0;
+    authSilent.wss.on("connection", () => { authConnections++; });
+    const authStates: string[] = [];
+    const authClient = new RelayHostClient({
+      devMode: true, stateDir: home(), minReconnectMs: 5, maxReconnectMs: 10, random: () => 1,
+      authTimeoutMs: 20, deviceSyncTimeoutMs: 20, readyTimeoutMs: 20,
+      onStream: () => {}, onStatus: (status) => authStates.push(status.state),
+    });
+    try {
+      authClient.update(config(authSilent.url), [device("silent-auth")]);
+      await waitFor(() => authConnections >= 2 && authStates.includes("error"), 1_000);
+    } finally {
+      authClient.close();
+      await authSilent.close();
+    }
+
+    const readySilent = await relayServer();
+    let readyConnections = 0;
+    readySilent.wss.on("connection", (ws) => {
+      readyConnections++;
+      ws.on("message", (raw) => {
+        const message = JSON.parse(raw.toString()) as { type?: string; generation?: number };
+        if (message.type === "host.device-sync") {
+          // This ACK also proves auth, but deliberately withhold host.ready.
+          ws.send(JSON.stringify({ type: "host.device-sync.ack", v: 1, generation: message.generation }));
+        }
+      });
+    });
+    const readyStates: string[] = [];
+    const readyClient = new RelayHostClient({
+      devMode: true, stateDir: home(), minReconnectMs: 5, maxReconnectMs: 10, random: () => 1,
+      authTimeoutMs: 20, deviceSyncTimeoutMs: 20, readyTimeoutMs: 20,
+      onStream: () => {}, onStatus: (status) => readyStates.push(status.state),
+    });
+    try {
+      readyClient.update(config(readySilent.url), [device("silent-ready")]);
+      await waitFor(() => readyConnections >= 2 && readyStates.includes("error"), 1_000);
+    } finally {
+      readyClient.close();
+      await readySilent.close();
+    }
+  });
+
+  it("closes control and active data sockets when a generation-mismatched heartbeat ACK leaves relay half-open", async () => {
+    const dir = home();
+    const relay = await relayServer();
+    let routeId = "";
+    let streamClosed = false;
+    let streamOpened = false;
+    relay.wss.on("connection", (ws, req) => {
+      if (req.url === "/v1/host") {
+        ws.on("message", (raw) => {
+          const message = JSON.parse(raw.toString()) as {
+            routeId?: string; type?: string; generation?: number;
+          };
+          if (!message.type) {
+            routeId = message.routeId!;
+            return;
+          }
+          if (message.type === "host.device-sync") {
+            ws.send(JSON.stringify({ type: "host.device-sync.ack", v: 1, generation: message.generation }));
+            ws.send(JSON.stringify({ type: "host.ready", v: 1, routeId, generation: message.generation }));
+            setTimeout(() => ws.send(JSON.stringify({
+              type: "stream.offer", v: 1, streamId: "stream_heartbeat_012345", ticket: "ticket_heartbeat_012345",
+              deviceId: device("heartbeat").relayDeviceId!, expiresAt: Date.now() + 10_000,
+            })), 0);
+            return;
+          }
+          if (message.type === "host.heartbeat") {
+            // It is syntactically valid but is deliberately for the wrong
+            // snapshot. It must not satisfy the liveness deadline.
+            ws.send(JSON.stringify({ type: "host.heartbeat.ack", v: 1, generation: message.generation! - 1 }));
+          }
+        });
+        return;
+      }
+      expect(req.url).toBe("/v1/stream");
+      ws.once("message", (raw) => {
+        const message = JSON.parse(raw.toString()) as { type?: string };
+        expect(message.type).toBe("stream.accept");
+        streamOpened = true;
+        ws.send(JSON.stringify({ type: "stream.ready", v: 1, streamId: "stream_heartbeat_012345" }));
+      });
+      ws.once("close", () => { streamClosed = true; });
+    });
+    const states: string[] = [];
+    const client = new RelayHostClient({
+      devMode: true, stateDir: dir, minReconnectMs: 5, maxReconnectMs: 10, random: () => 1,
+      heartbeatMs: 20, heartbeatAckTimeoutMs: 100,
+      onStream: () => {}, onStatus: (status) => states.push(status.state),
+    });
+    try {
+      client.update(config(relay.url), [device("heartbeat")]);
+      await waitFor(() => streamOpened);
+      await waitFor(() => streamClosed && states.includes("error"), 1_000);
+    } finally {
+      client.close();
+      await relay.close();
+    }
+  });
 });
 
 describe("relay stream socket joins the existing E2E server path", () => {
   it("accepts v13 E2E hello and encrypted ping after offer/accept/ready without dev plaintext", async () => {
     const dir = home();
     const relay = await relayServer();
-    const paired = mintDevice(dir, { name: "phone", allowShell: true });
     const relayConfig = config(relay.url);
     saveConfig(dir, relayConfig);
+    const paired = issueRelayCredentials(mintDevice(dir, { name: "phone", allowShell: true }));
+    persistRelayCredentials(dir, paired);
     const daemonPub = loadIdentity(dir).publicKey;
     let channel: SecureChannel | undefined;
     let startState: ReturnType<typeof clientHandshakeStart>["state"] | undefined;

@@ -14,9 +14,11 @@ import { Notifier } from "./notify.js";
 import {
   DEFAULT_PORT,
   buildPairingPayload,
+  deviceRelayCredentials,
   deriveRelayRouteId,
   effectiveRelayUrl,
   generateRelayHostSecret,
+  issueRelayCredentials,
   loadConfig,
   loadDevices,
   loadIdentity,
@@ -25,7 +27,8 @@ import {
   mintDevice,
   prosperoHome,
   relayPairingForDevice,
-  saveDevices,
+  persistRelayCredentials,
+  rotateRelayKey,
   saveConfig,
 } from "./pairing.js";
 import { createDaemonServer } from "./ws-server.js";
@@ -154,11 +157,16 @@ program
       allowShell: opts.shell,
       allowOrchestration: opts.shell && opts.orchestration,
     });
+    // Direct pairing records intentionally have no relay credential.  When
+    // relay is enabled we add it only to the QR about to be rendered, then
+    // persist it afterwards; enabling relay later cannot promote an unseen
+    // credential into an active one.
+    const issuedDevice = config.relay?.enabled ? issueRelayCredentials(device) : device;
     const payload = buildPairingPayload(home, {
-      token: device.token,
+      token: issuedDevice.token,
       port: config.port,
       bind: config.bind,
-      relay: relayPairingForDevice(config, device) ?? undefined,
+      relay: relayPairingForDevice(config, issuedDevice) ?? undefined,
     });
     if (payload.addrs.length === 0 && !payload.relay) {
       console.error("警告:未发现可用网卡地址且 relay 未就绪,二维码不可用。");
@@ -167,6 +175,7 @@ program
     }
     const url = encodePairingQR(payload, { allowInsecureLoopback: opts.dev });
     qrcode.generate(url, { small: true });
+    if (payload.relay) persistRelayCredentials(home, issuedDevice);
     console.log(
       `设备「${device.name}」已登记(allowShell=${String(device.allowShell)}, ` +
       `allowOrchestration=${String(device.allowOrchestration ?? device.allowShell)})`,
@@ -257,7 +266,7 @@ relay
     } catch {
       // daemon may not be running; config status is still useful.
     }
-    const legacy = devices.filter((device) => !device.relayDeviceId || !device.relayToken).length;
+    const legacy = devices.filter((device) => deviceRelayCredentials(device) === null).length;
     const result = {
       enabled: config.relay?.enabled === true,
       url,
@@ -294,15 +303,7 @@ relay
       console.log("确认请加 --yes 重跑: prosperod relay rotate-key --yes");
       return;
     }
-    saveConfig(home, {
-      ...config,
-      relay: {
-        enabled: config.relay?.enabled ?? false,
-        ...(config.relay?.url ? { url: config.relay.url } : {}),
-        hostSecret: generateRelayHostSecret(),
-      },
-    });
-    saveDevices(home, devices.map(({ relayDeviceId: _id, relayToken: _token, ...device }) => device));
+    rotateRelayKey(home, config);
     console.log(`已轮换 relay key；${devices.length} 台设备需要重新配对后才能使用 relay。`);
   });
 
