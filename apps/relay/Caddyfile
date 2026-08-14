@@ -1,0 +1,11 @@
+{
+  email {$ACME_EMAIL}
+}
+
+# Caddy obtains and renews certificates automatically.  Relay metrics deliberately
+# stay off this public vhost; scrape them from the internal Docker network instead.
+{$RELAY_DOMAIN} {
+  encode zstd gzip
+  reverse_proxy /v1/* relay:8787
+  reverse_proxy /health/* relay:8787
+}

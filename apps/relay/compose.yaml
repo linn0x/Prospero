@@ -1,0 +1,99 @@
+name: prospero-relay
+
+services:
+  mysql:
+    image: mysql:8.4.4-oraclelinux9
+    command: ["mysqld", "--default-authentication-plugin=caching_sha2_password"]
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-prospero_relay}
+      MYSQL_USER: ${MYSQL_USER:-prospero}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD in .env}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env}
+    volumes:
+      - mysql-data:/var/lib/mysql
+    expose: ["3306"]
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4.2-alpine3.21
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    volumes:
+      - redis-data:/data
+    expose: ["6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  migrate:
+    build:
+      context: ../..
+      dockerfile: apps/relay/Dockerfile
+    image: prospero-relay:0.0.12
+    command: ["node", "dist/migrate.js"]
+    working_dir: /srv/prospero/apps/relay
+    environment:
+      MYSQL_URL: mysql://${MYSQL_USER:-prospero}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE:-prospero_relay}
+      REDIS_URL: redis://redis:6379
+      MIGRATIONS_DIR: /srv/prospero/apps/relay/migrations
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: "no"
+
+  relay:
+    image: prospero-relay:0.0.12
+    build:
+      context: ../..
+      dockerfile: apps/relay/Dockerfile
+    environment:
+      RELAY_HOST: 0.0.0.0
+      RELAY_PORT: 8787
+      MYSQL_URL: mysql://${MYSQL_USER:-prospero}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE:-prospero_relay}
+      REDIS_URL: redis://redis:6379
+      METRICS_INTERNAL_ONLY: "true"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    expose: ["8787"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.8.4-alpine
+    environment:
+      RELAY_DOMAIN: ${RELAY_DOMAIN:?set public DNS name in .env}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      relay:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    restart: unless-stopped
+
+volumes:
+  mysql-data:
+  redis-data:
+  caddy-data:
+  caddy-config:
