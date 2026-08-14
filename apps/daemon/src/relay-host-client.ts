@@ -127,7 +127,15 @@ export class RelayHostClient {
   private awaitingHeartbeatGeneration: number | null = null;
   private attempts = 0;
   private generation = 0;
-  private acceptedGeneration = 0;
+  /** The latest complete snapshot that this control socket has acknowledged. */
+  private acceptedGeneration: number | null = null;
+  /**
+   * `host.ready` is a connection-level transition, not a per-snapshot ACK.
+   * T1/T2 send it once after the first snapshot on each /v1/host socket.
+   */
+  private connectionReady = false;
+  private initialGeneration: number | null = null;
+  private initialGenerationAcknowledged = false;
   private ready = false;
   private stopped = false;
   private lastError: string | undefined;
@@ -172,7 +180,11 @@ export class RelayHostClient {
     return { ...this.statusValue, devices: { ...this.statusValue.devices } };
   }
 
-  /** Hot-load config/devices.json. A device event sends a full atomic snapshot, never a delta. */
+  /**
+   * Hot-load config/devices.json. Only a change to the active relay credential
+   * set sends a full atomic replacement snapshot; metadata and local
+   * authorization changes must not perturb relay generations or streams.
+   */
   update(config: DaemonConfig, devices: DeviceRecord[]): void {
     this.stopped = false;
     const requestedUrl = effectiveRelayUrl(config);
@@ -215,7 +227,7 @@ export class RelayHostClient {
     this.lastError = undefined;
     if (endpointChanged) {
       this.generation = this.generations.get(next.routeId) ?? 0;
-      this.acceptedGeneration = 0;
+      this.acceptedGeneration = null;
       this.disconnect();
       this.publish("connecting", next.url, next.routeId, devices);
       this.connect();
@@ -225,8 +237,12 @@ export class RelayHostClient {
       // A full replacement sync revokes omissions.  Existing stream sockets
       // carry no device ID, so close them conservatively when that credential
       // set changes rather than allowing a removed device to linger.
-      if (credentialsChanged) this.closeDataSockets();
-      this.sendFullDeviceSync();
+      if (credentialsChanged) {
+        this.closeDataSockets();
+        this.sendFullDeviceSync();
+      } else {
+        this.refreshStatus();
+      }
     } else {
       this.publish("connecting", next.url, next.routeId, devices);
       this.connect();
@@ -252,8 +268,11 @@ export class RelayHostClient {
       return;
     }
     this.control = ws;
+    this.connectionReady = false;
+    this.initialGeneration = null;
+    this.initialGenerationAcknowledged = false;
     ws.once("open", () => {
-      if (this.control !== ws || this.target !== target || this.stopped) {
+      if (this.control !== ws || this.stopped) {
         ws.close();
         return;
       }
@@ -276,11 +295,14 @@ export class RelayHostClient {
       if (this.control !== ws) return;
       this.control = null;
       this.ready = false;
+      this.connectionReady = false;
+      this.initialGeneration = null;
+      this.initialGenerationAcknowledged = false;
       this.stopControlTimers();
       this.stopHeartbeat();
       this.closeDataSockets();
       this.refreshStatus();
-      if (!this.stopped && this.target === target) this.scheduleReconnect();
+      if (!this.stopped && this.target) this.scheduleReconnect();
     });
   }
 
@@ -293,34 +315,37 @@ export class RelayHostClient {
       validateRelayFrameSize(Buffer.byteLength(rawText(raw), "utf8"), "control");
       const control = parseRelayHostControlMessage(value);
       if (control.type === "host.device-sync.ack") {
-        // Device updates can race relay acknowledgements.  An old (or future,
-        // nonsensical) ACK must not tear down the current snapshot or mark it
-        // accepted; the current generation remains authoritative.
-        if (control.generation !== this.generation) return;
-        this.clearAuthTimer();
-        this.clearDeviceSyncTimer();
-        this.acceptedGeneration = control.generation;
-        if (!this.ready) this.startReadyTimeout(ws, control.generation);
+        const isInitial = control.generation === this.initialGeneration;
+        const isCurrent = control.generation === this.generation;
+        // A delayed first-generation ACK still unlocks the one connection-level
+        // ready frame, but cannot promote a newer snapshot. Every other stale
+        // (or future) ACK is harmless and ignored.
+        if (!isInitial && !isCurrent) return;
+        if (isInitial) {
+          const firstInitialAck = !this.initialGenerationAcknowledged;
+          this.clearAuthTimer();
+          this.initialGenerationAcknowledged = true;
+          if (firstInitialAck && !this.connectionReady) this.startReadyTimeout(ws, control.generation);
+        }
+        if (isCurrent) {
+          this.clearDeviceSyncTimer();
+          this.acceptedGeneration = control.generation;
+        }
+        this.restoreOnlineWhenCurrentSnapshotIsAccepted();
         this.refreshStatus();
         return;
       }
       if (control.type === "host.ready") {
-        if (control.routeId !== this.target.routeId || control.generation !== this.acceptedGeneration) {
-          // Like stale ACKs, late ready frames are harmless but must never
-          // promote a newer device snapshot.
+        if (control.routeId !== this.target.routeId ||
+          control.generation !== this.initialGeneration || !this.initialGenerationAcknowledged) {
+          // A ready for any generation other than this socket's first snapshot
+          // is stale or malformed for the T1/T2 contract. It must never
+          // promote the latest snapshot by itself.
           return;
         }
         this.clearReadyTimer();
-        this.clearAuthTimer();
-        this.clearDeviceSyncTimer();
-        const becameReady = !this.ready;
-        this.ready = true;
-        if (becameReady) {
-          this.attempts = 0;
-          this.lastError = undefined;
-          this.lastConnectedAt = Date.now();
-          this.startHeartbeat();
-        }
+        this.connectionReady = true;
+        this.restoreOnlineWhenCurrentSnapshotIsAccepted();
         this.refreshStatus();
         return;
       }
@@ -377,10 +402,10 @@ export class RelayHostClient {
       return;
     }
     this.generation = generation;
-    this.acceptedGeneration = 0;
+    this.acceptedGeneration = null;
     this.ready = false;
     this.stopHeartbeat();
-    this.clearReadyTimer();
+    if (this.initialGeneration === null) this.initialGeneration = generation;
     const credentials = target.devices.flatMap((device) => {
       const credentials = deviceRelayCredentials(device);
       return credentials ? [{
@@ -484,6 +509,23 @@ export class RelayHostClient {
     this.clearHeartbeatAckTimer();
   }
 
+  /**
+   * A connected relay is usable only once its first snapshot has produced the
+   * one `host.ready` transition and the most recent replacement is ACKed.
+   * Subsequent credential snapshots therefore resume on ACK alone.
+   */
+  private restoreOnlineWhenCurrentSnapshotIsAccepted(): void {
+    if (!this.connectionReady || this.acceptedGeneration !== this.generation) return;
+    const becameReady = !this.ready;
+    this.ready = true;
+    if (becameReady) {
+      this.attempts = 0;
+      this.lastError = undefined;
+      this.lastConnectedAt = Date.now();
+      this.startHeartbeat();
+    }
+  }
+
   private fail(error: RelayErrorCode | "invalid_control" | "network"): void {
     this.ready = false;
     this.lastError = safeRelayError(error);
@@ -510,6 +552,9 @@ export class RelayHostClient {
     const ws = this.control;
     this.control = null;
     this.ready = false;
+    this.connectionReady = false;
+    this.initialGeneration = null;
+    this.initialGenerationAcknowledged = false;
     ws?.terminate();
     this.closeDataSockets();
   }
@@ -558,7 +603,7 @@ export class RelayHostClient {
   private startReadyTimeout(ws: WebSocket, generation: number): void {
     this.clearReadyTimer();
     this.readyTimer = setTimeout(() => {
-      if (this.control === ws && this.generation === generation && !this.ready) {
+      if (this.control === ws && this.initialGeneration === generation && !this.connectionReady) {
         this.failAndClose(ws, "network");
       }
     }, this.readyTimeoutMs);
