@@ -66,7 +66,7 @@ struct DaemonStatus: Sendable, Equatable {
       }
     }
 
-    // 账号文件只含名称与隔离目录 ID，不含真实凭据；Claude managed token 在 Keychain。
+    // 账号元数据只含名称与隔离目录 ID；真实凭据位于各账号目录的 0600 私有文件。
     var storedAccounts: [[String: Any]] = []
     var defaults: [String: String] = [:]
     if let data = try? Data(contentsOf: home.appendingPathComponent("agent-accounts.json")),
