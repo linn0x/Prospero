@@ -683,17 +683,19 @@ describe("daemon 全链路", () => {
     c.close();
   }, 20000);
 
-  it("旧 v8/v7/v5 客户端沿用原配对即可连接新 daemon", async () => {
-    for (const version of [8, 7, 5]) {
+  it("v12 与旧 v8/v7/v5 客户端沿用原配对即可连接新 daemon", async () => {
+    for (const version of [12, 8, 7, 5]) {
       const c = await TestClient.connect(deviceToken, deviceKeys, version);
       const hello = (await c.waitFor(
         (m) => m.type === "hello.ok",
         `legacy v${String(version)} hello.ok`,
       )) as Extract<S2CMessage, { type: "hello.ok" }>;
       expect(hello.host.negotiatedProtocolVersion).toBe(version);
-      expect(hello.host.capabilities).not.toContain("subagent.history.v1");
-      expect(hello.host.capabilities).not.toContain("chat.attachment-previews.v1");
-      expect(hello.host.capabilities).not.toContain("session.create-model.v1");
+      if (version < 9) expect(hello.host.capabilities).not.toContain("subagent.history.v1");
+      if (version < 11) {
+        expect(hello.host.capabilities).not.toContain("chat.attachment-previews.v1");
+        expect(hello.host.capabilities).not.toContain("session.create-model.v1");
+      }
       if (version < 8) {
         expect(hello.host.capabilities).not.toContain("orchestration.graph.v1");
         expect(hello.host.capabilities).not.toContain("orchestration.automation.v1");

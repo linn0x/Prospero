@@ -10,8 +10,11 @@ import os from "node:os";
 import path from "node:path";
 import {
   PAIRING_FORMAT_VERSION,
+  RELAY_PROTOCOL_VERSION,
+  deriveRelayRouteId as deriveRelayRouteIdContract,
   generateKeyPairB64,
   toB64Url,
+  type RelayPairing,
   type C2SHello,
   type KeyPairB64,
   type PairingPayload,
@@ -19,6 +22,14 @@ import {
 import { candidateAddrs, resolveBindAddr } from "./discovery.js";
 
 export const DEFAULT_PORT = 7423;
+
+/** Published relay URL used when the local config has no explicit override. */
+export function defaultRelayUrl(): string | undefined {
+  return process.env["PROSPERO_DEFAULT_RELAY_URL"];
+}
+
+/** A 32-byte host secret is deliberately distinct from the daemon static identity key. */
+export const RELAY_HOST_SECRET_BYTES = 32;
 
 export interface DeviceRecord {
   name: string;
@@ -28,6 +39,9 @@ export interface DeviceRecord {
   allowShell: boolean;
   /** 省略表示沿用 allowShell，保证升级前已配对设备无需重新扫码。 */
   allowOrchestration?: boolean;
+  /** Relay control-plane credentials. Missing fields mean this is a pre-relay pairing. */
+  relayDeviceId?: string;
+  relayToken?: string;
   createdAt: number;
   lastSeenAt?: number;
 }
@@ -46,6 +60,19 @@ export interface DaemonConfig {
     deepLink?: string;
     throttleMs?: number;
   };
+  /** Relay settings and its private per-host routing secret, all stored in 0600 config.json. */
+  relay?: {
+    enabled: boolean;
+    /** Explicit full relay endpoint; omission uses PROSPERO_DEFAULT_RELAY_URL. */
+    url?: string;
+    /** base64url 32 bytes; never written to status/logs/QR. */
+    hostSecret?: string;
+  };
+}
+
+export interface RelayCredentials {
+  deviceId: string;
+  token: string;
 }
 
 export function prosperoHome(): string {
@@ -85,6 +112,25 @@ export function saveConfig(home: string, config: DaemonConfig): void {
   writeJsonPrivate(path.join(home, "config.json"), config);
 }
 
+/** Return the override first, then the deployment default. Empty strings are not useful URLs. */
+export function effectiveRelayUrl(config: DaemonConfig): string | undefined {
+  return config.relay?.url || defaultRelayUrl();
+}
+
+export function generateRelayHostSecret(): string {
+  return toB64Url(randomBytes(RELAY_HOST_SECRET_BYTES));
+}
+
+/** Stable opaque selector; a leaked route ID never reveals the host secret. */
+export function deriveRelayRouteId(hostSecret: string): string {
+  return deriveRelayRouteIdContract(hostSecret);
+}
+
+export function deviceRelayCredentials(device: DeviceRecord): RelayCredentials | null {
+  if (!device.relayDeviceId || !device.relayToken) return null;
+  return { deviceId: device.relayDeviceId, token: device.relayToken };
+}
+
 export function loadDevices(home: string): DeviceRecord[] {
   return readJson<DevicesFile>(path.join(home, "devices.json"))?.devices ?? [];
 }
@@ -103,6 +149,8 @@ export function mintDevice(
     token: toB64Url(randomBytes(24)),
     allowShell: opts.allowShell,
     allowOrchestration: opts.allowOrchestration ?? opts.allowShell,
+    relayDeviceId: toB64Url(randomBytes(24)),
+    relayToken: toB64Url(randomBytes(32)),
     createdAt: Date.now(),
   };
   const devices = loadDevices(home);
@@ -200,6 +248,8 @@ export function buildPairingPayload(
     name?: string | undefined;
     /** 已绑定到某个地址时,二维码只带这一个 —— 其余地址连不上,带了只会让客户端白试 */
     bind?: string | undefined;
+    /** Relay credentials are separate from the E2E pairing token above. */
+    relay?: RelayPairing | undefined;
   },
 ): PairingPayload {
   const identity = loadIdentity(home);
@@ -211,5 +261,24 @@ export function buildPairingPayload(
     port: opts.port,
     token: opts.token,
     pubKey: identity.publicKey,
+    ...(opts.relay ? { relay: opts.relay } : {}),
+  };
+}
+
+/** Build the public relay portion of a QR without ever exposing hostSecret. */
+export function relayPairingForDevice(
+  config: DaemonConfig,
+  device: DeviceRecord,
+): RelayPairing | null {
+  if (!config.relay?.enabled || !config.relay.hostSecret) return null;
+  const url = effectiveRelayUrl(config);
+  const credentials = deviceRelayCredentials(device);
+  if (!url || !credentials) return null;
+  return {
+    v: RELAY_PROTOCOL_VERSION,
+    url,
+    routeId: deriveRelayRouteId(config.relay.hostSecret),
+    deviceId: credentials.deviceId,
+    token: credentials.token,
   };
 }

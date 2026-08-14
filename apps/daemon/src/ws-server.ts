@@ -49,10 +49,12 @@ import { availableMemory, osIdentity } from "./host-stats.js";
 import {
   authenticate,
   canDeviceOrchestrate,
+  loadConfig,
   loadDevices,
   loadIdentity,
   type DeviceRecord,
 } from "./pairing.js";
+import { RelayHostClient } from "./relay-host-client.js";
 import { Notifier, type NotifyConfig } from "./notify.js";
 import { SessionError, SessionManager } from "./session-manager.js";
 import { StatusFile } from "./status-file.js";
@@ -166,6 +168,7 @@ export interface DaemonServer {
   manager: SessionManager;
   accounts: AgentAccountManager;
   notifier: Notifier;
+  relay: RelayHostClient;
   /** M2 编排状态与派发入口；手机协议接入(M4)也将复用它们。 */
   orchestration: {
     store: OrchestrationStore;
@@ -271,7 +274,14 @@ export async function createDaemonServer(
   const conversationSearch = opts.conversationSearch ?? searchLocalConversations;
 
   const httpServer = createServer((req, res) => handleHttp(req, res));
-  const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
+  // Direct /ws is an untrusted network boundary too. Keep application frames
+  // bounded and never negotiate compression for encrypted payloads.
+  const wss = new WebSocketServer({
+    server: httpServer,
+    path: "/ws",
+    maxPayload: 16 * 1024 * 1024,
+    perMessageDeflate: false,
+  });
 
   function send(conn: Conn, msg: S2CMessage): void {
     if (conn.ws.readyState !== WebSocket.OPEN) return;
@@ -587,8 +597,11 @@ export async function createDaemonServer(
     });
   }
 
-  function handleHello(conn: Conn, text: string, req: IncomingMessage): void {
-    if (devMode && isLoopback(req)) {
+  function handleHello(conn: Conn, text: string, allowDevPlaintext: boolean): void {
+    // A relay WebSocket is outbound from this daemon. It must never inherit
+    // --dev's loopback plaintext exception, even when the relay itself is a
+    // local development server.
+    if (allowDevPlaintext) {
       let plain: unknown = null;
       try {
         plain = JSON.parse(text);
@@ -663,6 +676,11 @@ export async function createDaemonServer(
     switch (msg.type) {
       case "hello":
         send(conn, { type: "error", code: "bad_message", message: "already authenticated" });
+        return;
+      case "connection.ping":
+        // v13 adds encrypted app-level liveness. Do not send a v13-only union
+        // member to old clients: their Zod parser would terminate the session.
+        if (conn.protocolVersion >= 13) send(conn, { type: "connection.pong", id: msg.id });
         return;
       case "workspace.list": {
         // 新建会话前还没有 sid,所以浏览根固定为当前 macOS 用户的 home。
@@ -1601,11 +1619,11 @@ export async function createDaemonServer(
     }
   }
 
-  async function onMessage(conn: Conn, raw: RawData, req: IncomingMessage): Promise<void> {
+  async function onMessage(conn: Conn, raw: RawData, allowDevPlaintext: boolean): Promise<void> {
     const text = rawToString(raw);
     try {
       if (conn.device === null) {
-        handleHello(conn, text, req);
+        handleHello(conn, text, allowDevPlaintext);
         return;
       }
       const msg = conn.channel
@@ -1666,7 +1684,8 @@ export async function createDaemonServer(
     }
   }
 
-  wss.on("connection", (ws, req) => {
+  /** Both a direct inbound socket and a relay-ready outbound socket use this exact E2E path. */
+  function attachIncomingSocket(ws: WebSocket, allowDevPlaintext: boolean): void {
     const conn: Conn = {
       ws,
       channel: null,
@@ -1682,7 +1701,7 @@ export async function createDaemonServer(
       conn.alive = true;
     });
     ws.on("message", (raw) => {
-      void onMessage(conn, raw, req);
+      void onMessage(conn, raw, allowDevPlaintext);
     });
     ws.on("close", () => {
       conns.delete(conn);
@@ -1690,6 +1709,16 @@ export async function createDaemonServer(
     ws.on("error", () => {
       // close 事件随后触发
     });
+  }
+
+  wss.on("connection", (ws, req) => {
+    attachIncomingSocket(ws, devMode && isLoopback(req));
+  });
+
+  const relayClient = new RelayHostClient({
+    devMode,
+    onStream: (ws) => attachIncomingSocket(ws, false),
+    onStatus: (status) => statusFile.setRelayStatus(status),
   });
 
   // ---- dev 静态资源(仅 --dev):调试页 + xterm 资产,先于 App 验证协议 ----
@@ -2041,6 +2070,7 @@ export async function createDaemonServer(
     // 失败，必须把这批私有凭证和 interval 一并清掉，不能留下幽灵 daemon。
     clearInterval(catchupTimer);
     clearInterval(pingTimer);
+    relayClient.close();
     wss.close();
     await controlSocket.close();
     await manager.disposeAll();
@@ -2088,11 +2118,33 @@ export async function createDaemonServer(
       revokeTimer = setTimeout(() => {
         revokeTimer = null;
         dropRevokedConnections();
+        // devices.json is the relay registration source of truth. Re-send the
+        // complete set after every observed change; registrations are idempotent
+        // and a full sync cannot miss a revoke/rename write sequence.
+        relayClient.update(loadConfig(opts.home), loadDevices(opts.home));
       }, 150);
       revokeTimer.unref?.();
     });
   } catch {
     // 连 home 目录都监视不了(极少见);撤销退化为"下次连接时生效"
+  }
+
+  let relayConfigWatcher: { close(): void } | null = null;
+  let relayConfigTimer: NodeJS.Timeout | null = null;
+  try {
+    relayConfigWatcher = watch(opts.home, (_event, filename) => {
+      if (filename !== null && filename !== "config.json") return;
+      if (relayConfigTimer) return;
+      relayConfigTimer = setTimeout(() => {
+        relayConfigTimer = null;
+        // Enable/disable/URL/key changes take effect without dropping direct
+        // client sessions or restarting the daemon.
+        relayClient.update(loadConfig(opts.home), loadDevices(opts.home));
+      }, 100);
+      relayConfigTimer.unref?.();
+    });
+  } catch {
+    // The explicit CLI still updates disk safely; only hot reload is unavailable.
   }
 
   // 接管上一轮留下的 tmux 会话。必须在 statusFile.start 之前,
@@ -2114,6 +2166,7 @@ export async function createDaemonServer(
   await dispatchService.reconcilePersistedSessions();
   completeSettledCoordinatorRuns();
   statusFile.start(port);
+  relayClient.update(loadConfig(opts.home), loadDevices(opts.home));
   automationService.resumePersisted();
   await goalInitialization.retryPending();
 
@@ -2125,6 +2178,7 @@ export async function createDaemonServer(
     manager,
     accounts,
     notifier,
+    relay: relayClient,
     orchestration: {
       store: orchestrationStore,
       dispatch: dispatchService,
@@ -2135,12 +2189,15 @@ export async function createDaemonServer(
     close: async () => {
       clearInterval(catchupTimer);
       clearInterval(pingTimer);
+      relayClient.close();
       for (const conn of conns) conn.ws.terminate();
       statusFile.stop();
       await controlSocket.close();
       goalInitialization.close();
       if (revokeTimer) clearTimeout(revokeTimer);
       revokeWatcher?.close();
+      if (relayConfigTimer) clearTimeout(relayConfigTimer);
+      relayConfigWatcher?.close();
       wss.close();
       await manager.disposeAll();
       stopOrchestrationBroadcasts();
