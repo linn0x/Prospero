@@ -59,8 +59,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIdentifier</key><string>com.linn0x.prospero.shell</string>
   <key>CFBundleExecutable</key><string>ProsperoShell</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.0.12</string>
-  <key>CFBundleVersion</key><string>12</string>
+  <key>CFBundleShortVersionString</key><string>0.0.13</string>
+  <key>CFBundleVersion</key><string>13</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSLocalNetworkUsageDescription</key>
   <string>Prospero 在本地网络上广播与接受来自你手机的直连,用于远程控制 code agent 会话。</string>

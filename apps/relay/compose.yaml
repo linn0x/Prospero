@@ -44,7 +44,7 @@ services:
     build:
       context: ../..
       dockerfile: apps/relay/Dockerfile
-    image: prospero-relay:0.0.12
+    image: prospero-relay:0.0.13
     command: ["node", "dist/migrate.js"]
     working_dir: /srv/prospero/apps/relay
     environment:
@@ -60,7 +60,7 @@ services:
     networks: [relay-backend]
 
   relay:
-    image: prospero-relay:0.0.12
+    image: prospero-relay:0.0.13
     build:
       context: ../..
       dockerfile: apps/relay/Dockerfile
@@ -88,6 +88,7 @@ services:
       nofile:
         soft: ${RELAY_NOFILE_SOFT:-131072}
         hard: ${RELAY_NOFILE_HARD:-131072}
+      core: 0
     depends_on:
       mysql:
         condition: service_healthy
@@ -107,8 +108,6 @@ services:
     security_opt:
       - no-new-privileges:true
     pids_limit: 256
-    ulimits:
-      core: 0
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m
     networks: [relay-backend]
