@@ -232,10 +232,11 @@ describe("编排工作树资产检查与清理", () => {
       },
     };
     const service = new WorktreeAssetService(store, undefined, sessions);
+    const trackedBeforeCleanup = readFileSync(path.join(created.path, "tracked.txt"), "utf8");
 
     await expect(service.cleanup({ assetId: asset.id, targetRef: "main", confirm: true }))
       .rejects.toMatchObject({ code: "worktree_not_cleanable" } satisfies Partial<WorktreeAssetError>);
-    expect(readFileSync(path.join(created.path, "tracked.txt"), "utf8")).toBe("base\n");
+    expect(readFileSync(path.join(created.path, "tracked.txt"), "utf8")).toBe(trackedBeforeCleanup);
     expect(store.getWorktreeAsset(asset.id)).toMatchObject({
       state: "preserved",
       lastError: expect.stringContaining("settled-but-live"),
