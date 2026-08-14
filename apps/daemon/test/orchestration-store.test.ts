@@ -338,6 +338,7 @@ describe("Run 管理", () => {
       runId,
       deletedTaskCount: 1,
       preservedWorkspacePath: "/tmp/prospero-run",
+      preservedWorktreeAssetIds: [],
     });
     expect(store.listRuns()).toEqual([]);
     expect(store.listTasks()).toEqual([]);

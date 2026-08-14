@@ -92,6 +92,33 @@ CoW/checkout 双路径、修改隔离、clean 模式、默认根目录生命周�
 
 ---
 
+### 工作树资产生命周期（v2）
+
+`orchestration.json` 的 `version: 2` 新增独立的 `worktreeAssets` 账本。每次创建 Run
+共享工作树或 `worker --worktree new` 时，都会在创建会话前立即登记 `runId`、可选
+`taskId/dispatchId`、`repo`、`path`、`branch`、创建时间和当前安全状态。删除 Run 只会给
+资产写入 `runDeletedAt`，不会删除目录、分支或资产记录。
+
+旧版 `version: 1` 文件在读取时只做保守迁移：从 `Run.automation` 与
+`Dispatch.worktreePath` 补出 legacy 资产，原路径和分支均不触碰；worker 旧记录缺少 repo
+时先把其 path 作为待复核候选，必须经过检查后才能清理。
+
+控制 socket / 会话 CLI 的接口为：
+
+```bash
+prospero worktree list [--run RUN_ID]
+prospero worktree inspect --id WT_ASSET_ID --target main
+prospero worktree cleanup --id WT_ASSET_ID --target main \
+  --operation-id UNIQUE_ID --confirm
+```
+
+`inspect` 只读 Git，明确返回 `missing`、`dirty`、`unmerged`、`equivalent` 或
+`safe_to_clean`（元数据异常为 `unknown`）。`cleanup` 必须带 `confirm` 和幂等
+`operationId`，执行前会再次检查并用非 force 的 Git 移除作为第二道保护；默认保留本地
+分支，只有额外传 `--delete-branch` 才会请求删分支。
+
+---
+
 ## 三、esaytree：已经用实测定下来的事(别再纠结)
 
 用户最初的担心是"一个 worktree 就 cp 一份项目"。**实测数据(本仓)**:

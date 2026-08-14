@@ -5,6 +5,7 @@ import { ControlSocketError } from "../control-socket.js";
 import { AutomationError, AutomationService } from "./automation.js";
 import { CollaborationError, CollaborationService } from "./collaboration.js";
 import { DispatchError, DispatchService, type WorktreeMode } from "./dispatch.js";
+import { WorktreeAssetError, WorktreeAssetService } from "./worktree-assets.js";
 import {
   OrchestrationError,
   OrchestrationStore,
@@ -123,6 +124,12 @@ function optionalBoolean(params: Params, name: string, fallback: boolean): boole
   return value;
 }
 
+function requiredBoolean(params: Params, name: string): boolean {
+  const value = params[name];
+  if (typeof value !== "boolean") throw new ControlSocketError(`缺少或无效参数: ${name}`, "bad_params");
+  return value;
+}
+
 function coordinatorOnly(
   store: OrchestrationStore,
   runId: string,
@@ -146,6 +153,22 @@ function ownerOrCoordinator(
   }
 }
 
+/** Run 已删除的遗留资产只允许宿主处理；原协调者记录已经不再可信。 */
+function ownerOrCoordinatorForWorktreeAsset(
+  store: OrchestrationStore,
+  assetId: string,
+  actorSessionId: string | null,
+): void {
+  const asset = store.getWorktreeAsset(assetId);
+  if (asset.runDeletedAt !== null) {
+    if (actorSessionId !== null) {
+      throw new ControlSocketError("所属 Run 已删除；只有宿主可以管理遗留工作树资产", "forbidden");
+    }
+    return;
+  }
+  ownerOrCoordinator(store, asset.runId, actorSessionId);
+}
+
 function rejectMutationWhileAutomating(store: OrchestrationStore, runId: string): void {
   if (store.getRun(runId).automation?.state === "running") {
     throw new ControlSocketError("任务图正在自动执行；请先暂停，再编辑或手工派发", "forbidden");
@@ -158,6 +181,7 @@ export function orchestrationControlApi(
   dispatch: DispatchService,
   collaboration: CollaborationService,
   automation?: AutomationService,
+  worktrees = new WorktreeAssetService(store),
 ): (method: string, params: unknown, signal: AbortSignal) => Promise<unknown> {
   const inflight = new Map<string, { fingerprint: string; promise: Promise<unknown> }>();
 
@@ -470,6 +494,37 @@ export function orchestrationControlApi(
             () => automation.pause(runId),
           );
         }
+        case "worktree.list": {
+          const runId = optionalText(params, "runId");
+          const actorSessionId = optionalText(params, "actorSessionId");
+          if (runId !== null) ownerOrCoordinator(store, runId, actorSessionId);
+          else if (actorSessionId !== null) {
+            throw new ControlSocketError("worker 必须按 Run 查询自己的工作树资产", "forbidden");
+          }
+          return worktrees.list(runId ?? undefined);
+        }
+        case "worktree.inspect": {
+          const assetId = text(params, "assetId");
+          ownerOrCoordinatorForWorktreeAsset(store, assetId, optionalText(params, "actorSessionId"));
+          const targetRef = optionalText(params, "targetRef") ?? "HEAD";
+          return worktrees.inspect(assetId, targetRef);
+        }
+        case "worktree.cleanup": {
+          const assetId = text(params, "assetId");
+          const actorSessionId = optionalText(params, "actorSessionId");
+          ownerOrCoordinatorForWorktreeAsset(store, assetId, actorSessionId);
+          const targetRef = optionalText(params, "targetRef") ?? "HEAD";
+          const confirm = requiredBoolean(params, "confirm");
+          const deleteBranch = optionalBoolean(params, "deleteBranch", false);
+          const op = operationId(params);
+          if (op === null) throw new ControlSocketError("清理工作树必须提供 operationId", "bad_params");
+          return idempotent(
+            method,
+            op,
+            { assetId, targetRef, confirm, deleteBranch, actorSessionId },
+            () => worktrees.cleanup({ assetId, targetRef, confirm, deleteBranch }),
+          );
+        }
         case "mail.send": {
           const type = text(params, "type");
           if (!SEND_MESSAGE_TYPES.has(type as SendMailType)) {
@@ -563,7 +618,8 @@ export function orchestrationControlApi(
         error instanceof OrchestrationError ||
         error instanceof DispatchError ||
         error instanceof AutomationError ||
-        error instanceof CollaborationError
+        error instanceof CollaborationError ||
+        error instanceof WorktreeAssetError
       ) {
         throw new ControlSocketError(error.message, error.code);
       }

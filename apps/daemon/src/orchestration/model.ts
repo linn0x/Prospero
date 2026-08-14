@@ -159,25 +159,100 @@ export interface OperationRecord {
   createdAt: number;
 }
 
+/**
+ * 编排创建过的 Git worktree 是独立于 Run/Dispatch 历史的资产。
+ *
+ * Run 可以被用户从画布中删除，Dispatch 也会随之清掉；两者都不能成为磁盘
+ * 工作区唯一的“索引”。因此这里故意保存 owner 的不可变 id，而不是外键，并在
+ * Run 删除后保留记录与恢复所需的 repo/path/branch。
+ */
+export type WorktreeAssetKind = "run" | "worker";
+
+/**
+ * `active` / `preserved` 是生命周期状态；其余值由只读 Git 检查得出。
+ * `cleaned` 只由显式 cleanup 成功后写入，避免把手工删除误说成我们已安全清理。
+ */
+export type WorktreeAssetState =
+  | "active"
+  | "preserved"
+  | "missing"
+  | "dirty"
+  | "unmerged"
+  | "equivalent"
+  | "safe_to_clean"
+  | "cleaned"
+  | "unknown";
+
+export interface WorktreeInspection {
+  state: Extract<
+    WorktreeAssetState,
+    "missing" | "dirty" | "unmerged" | "equivalent" | "safe_to_clean" | "unknown"
+  >;
+  /** 用户指定的集成目标；默认检查 API 使用 HEAD，调用方可传 main/release 等。 */
+  targetRef: string;
+  checkedAt: number;
+  pathExists: boolean;
+  registered: boolean | null;
+  dirty: boolean | null;
+  branch: string | null;
+  aheadCommitCount: number | null;
+  equivalentCommitCount: number | null;
+  message: string | null;
+}
+
+export interface WorktreeAssetCleanup {
+  removedAt: number;
+  /** 默认 false：worktree 移除不等于删除恢复分支。 */
+  branchDeleted: boolean;
+  /** 删除分支失败时保留可恢复的分支名和诊断，而不把已完成的移除伪装成失败。 */
+  warning: string | null;
+}
+
+export interface WorktreeAsset {
+  id: string;
+  kind: WorktreeAssetKind;
+  /** 即便对应 Run 已被删除，runId 也永久保留以供审计与查找。 */
+  runId: string;
+  taskId: string | null;
+  dispatchId: string | null;
+  /** 创建 worktree 时确认的 Git 仓库根目录；旧数据迁移时是待复核的候选目录。 */
+  repo: string;
+  path: string;
+  /** 新 worktree 的本地分支名；detached worktree 为 null。 */
+  branch: string | null;
+  state: WorktreeAssetState;
+  createdAt: number;
+  updatedAt: number;
+  /** Run 删除不会删除资产，只记录其原始所有者已经不存在。 */
+  runDeletedAt: number | null;
+  lastInspection: WorktreeInspection | null;
+  cleanup: WorktreeAssetCleanup | null;
+  /** 仅用于旧 orchestration.json 推断出的保守登记。 */
+  legacy: boolean;
+  lastError: string | null;
+}
+
 export interface OrchestrationState {
-  version: 1;
+  version: 2;
   runs: Record<string, Run>;
   tasks: Record<string, Task>;
   dispatches: Record<string, Dispatch>;
   messages: Record<string, Message>;
   gates: Record<string, Gate>;
   operations: Record<string, OperationRecord>;
+  worktreeAssets: Record<string, WorktreeAsset>;
 }
 
 export function emptyState(): OrchestrationState {
   return {
-    version: 1,
+    version: 2,
     runs: {},
     tasks: {},
     dispatches: {},
     messages: {},
     gates: {},
     operations: {},
+    worktreeAssets: {},
   };
 }
 
