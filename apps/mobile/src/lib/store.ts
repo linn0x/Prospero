@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import type { HostInfo, SessionInfo } from "@prospero/protocol";
 import type { StoredHost } from "./hosts";
+import type { ConnectionPath } from "./connection-candidates";
 
 export type ConnStatus =
   | "idle"
@@ -13,6 +14,8 @@ export interface HostRuntime {
   status: ConnStatus;
   hostInfo: HostInfo | null;
   activeAddr: string | null;
+  /** Actual winner; differs from the user preference when mode is auto. */
+  activePath: ConnectionPath | null;
   lastError: string | null;
   /** 握手往返耗时,用于显示连接质量 */
   rttMs: number | null;
@@ -23,6 +26,7 @@ export const emptyRuntime: HostRuntime = {
   status: "idle",
   hostInfo: null,
   activeAddr: null,
+  activePath: null,
   lastError: null,
   rttMs: null,
   sessions: {},

@@ -99,4 +99,20 @@ describe("连接失败诊断", () => {
       expect(d.hint.length).toBeGreaterThan(10);
     }
   });
+
+  it("relay 的离线、鉴权、限流、过载、版本与 TLS 都给出可执行提示", () => {
+    const cases: Array<[AttemptResult["failure"], string]> = [
+      ["relay_offline", "prosperod relay"],
+      ["relay_auth", "重新生成"],
+      ["relay_rate_limit", "退避"],
+      ["relay_overload", "自动退避"],
+      ["relay_version", "升级"],
+      ["relay_tls", "wss://"],
+      ["relay_credentials_missing", "重新扫码"],
+    ];
+    for (const [failure, hint] of cases) {
+      const diagnosis = diagnose([at("relay", failure)], false);
+      expect(diagnosis.hint).toContain(hint);
+    }
+  });
 });

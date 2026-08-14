@@ -21,7 +21,14 @@ vi.mock("expo-secure-store", () => ({
 
 import { generateKeyPairB64 } from "@prospero/protocol";
 import * as SecureStore from "expo-secure-store";
-import { getDeviceKeys, getHosts, removeHost } from "../src/lib/hosts";
+import {
+  getDeviceKeys,
+  getHosts,
+  RelayCredentialsMissingError,
+  removeHost,
+  setHostConnectionMode,
+  upsertHostFromPairing,
+} from "../src/lib/hosts";
 
 beforeEach(() => {
   storage.clear();
@@ -66,6 +73,7 @@ describe("配对凭据安全迁移", () => {
 
   it("删除主机时也删除对应安全存储 token", async () => {
     secrets.set("prospero.hostToken.v1.host123", "0123456789abcdef");
+    secrets.set("prospero.relayToken.v1.host123", "relay_token_0123456789");
     storage.set("prospero.hosts.v1", JSON.stringify([{
       id: "host123",
       name: "MacBook",
@@ -78,6 +86,7 @@ describe("配对凭据安全迁移", () => {
     await removeHost("host123");
     expect(await getHosts()).toEqual([]);
     expect(secrets.has("prospero.hostToken.v1.host123")).toBe(false);
+    expect(secrets.has("prospero.relayToken.v1.host123")).toBe(false);
   });
 
   it("多主机迁移有一项写入失败时保留全部旧 token，避免半迁移丢配对", async () => {
@@ -102,5 +111,109 @@ describe("配对凭据安全迁移", () => {
       token?: string;
     }>;
     expect(persisted.map((host) => host.token)).toEqual(["token-one", "token-two"]);
+  });
+
+  it("把 relay ticket 存到不同 SecureStore key，地址簿只留下公开 route 元数据", async () => {
+    storage.set("prospero.hosts.v1", JSON.stringify([{
+      id: "host123",
+      name: "MacBook",
+      addrs: [],
+      port: 7423,
+      token: "0123456789abcdef",
+      daemonPub: generateKeyPairB64().publicKey,
+      pairedAt: 1,
+      relay: {
+        url: "wss://relay.example.com/v1",
+        routeId: "route_0123456789",
+        deviceId: "device_0123456789",
+        token: "relay_token_0123456789",
+      },
+    }]));
+
+    const hosts = await getHosts();
+    expect(hosts[0]).toMatchObject({ connectionMode: "direct", relayToken: "relay_token_0123456789" });
+    expect(secrets.get("prospero.hostToken.v1.host123")).toBe("0123456789abcdef");
+    expect(secrets.get("prospero.relayToken.v1.host123")).toBe("relay_token_0123456789");
+    const persisted = JSON.parse(storage.get("prospero.hosts.v1") ?? "[]") as Array<Record<string, unknown>>;
+    expect(persisted[0]?.token).toBeUndefined();
+    expect((persisted[0]?.relay as Record<string, unknown>).token).toBeUndefined();
+    expect((persisted[0]?.relay as Record<string, unknown>).routeId).toBe("route_0123456789");
+  });
+
+  it("relay SecureStore 半迁移失败时保留旧 E2E 和 relay ticket", async () => {
+    storage.set("prospero.hosts.v1", JSON.stringify([{
+      id: "host123",
+      name: "MacBook",
+      addrs: [],
+      port: 7423,
+      token: "0123456789abcdef",
+      daemonPub: generateKeyPairB64().publicKey,
+      pairedAt: 1,
+      relay: {
+        url: "wss://relay.example.com/v1",
+        routeId: "route_0123456789",
+        deviceId: "device_0123456789",
+        token: "relay_token_0123456789",
+      },
+    }]));
+    vi.mocked(SecureStore.setItemAsync).mockImplementation(async (key, value) => {
+      if (key.includes("relayToken")) throw new Error("Keychain busy");
+      secrets.set(key, value);
+    });
+
+    await getHosts();
+    const persisted = JSON.parse(storage.get("prospero.hosts.v1") ?? "[]") as Array<{
+      token?: string;
+      relay?: { token?: string };
+    }>;
+    expect(persisted[0]?.token).toBe("0123456789abcdef");
+    expect(persisted[0]?.relay?.token).toBe("relay_token_0123456789");
+  });
+
+  it("没有 QR ticket 时拒绝把主机保存为 relay 模式", async () => {
+    secrets.set("prospero.hostToken.v1.host123", "0123456789abcdef");
+    storage.set("prospero.hosts.v1", JSON.stringify([{
+      id: "host123",
+      name: "MacBook",
+      addrs: ["192.168.1.8"],
+      port: 7423,
+      daemonPub: generateKeyPairB64().publicKey,
+      pairedAt: 1,
+      connectionMode: "direct",
+      relay: {
+        url: "wss://relay.example.com/v1",
+        routeId: "route_0123456789",
+        deviceId: "device_0123456789",
+      },
+    }]));
+
+    await expect(setHostConnectionMode("host123", "relay")).rejects.toBeInstanceOf(
+      RelayCredentialsMissingError,
+    );
+  });
+
+  it("新的 relay QR 默认 auto，重新配对不覆盖用户已选的模式", async () => {
+    const daemon = generateKeyPairB64().publicKey;
+    const pairing = {
+      v: 7,
+      name: "MacBook",
+      addrs: ["192.168.1.8"],
+      port: 7423,
+      token: "0123456789abcdef",
+      pubKey: daemon,
+      relay: {
+        v: 1 as const,
+        url: "wss://relay.example.com/v1",
+        routeId: "route_0123456789",
+        deviceId: "device_0123456789",
+        token: "relay_token_0123456789",
+      },
+    };
+    const first = await upsertHostFromPairing(pairing);
+    expect(first.connectionMode).toBe("auto");
+
+    await setHostConnectionMode(first.id, "direct");
+    const again = await upsertHostFromPairing({ ...pairing, token: "fedcba9876543210" });
+    expect(again.connectionMode).toBe("direct");
   });
 });
