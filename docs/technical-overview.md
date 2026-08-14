@@ -300,6 +300,24 @@ sendToSubagent/readSubagentHistory/respondQuestion/usage/interrupt/dispose`。
 `adapters/diff.ts`：行级 LCS 合成审批/工具卡片 diff（`MAX_PATCH_CHARS=8000`），支持 Claude Write/Edit/MultiEdit
 工具输入与 Codex unified patch。
 
+#### Codex app-server 审批兼容性
+
+2026-08-14 在本机以 `codex-cli 0.147.0` 运行 `codex app-server generate-ts --out <tmp>` 校验。该版本同时生成
+v2 与 legacy server request，因此 `CodexAdapter` 必须按**收到的 request method**记录审批类型，而不能只保存一份
+通用 `decision`：
+
+- v2 `item/commandExecution/requestApproval` 和 `item/fileChange/requestApproval`：Prospero 的
+  `once / always / reject` 分别回 `{ decision: "accept" / "acceptForSession" / "decline" }`。
+- v2 `item/permissions/requestApproval` 没有 `decision`。批准仅回显该请求中非 `null` 的 `permissions.network`
+  与 `permissions.fileSystem`，并选 `scope: "turn" | "session"`；拒绝回 `{ permissions: {}, scope: "turn" }`。
+  adapter 会保存原始请求 profile，响应前再缩减为这两个字段；这使 UI 不能凭空扩大 server 请求的授权范围。
+- legacy `execCommandApproval` 与 `applyPatchApproval` 继续使用 `ReviewDecision`（`approved`、
+  `approved_for_session`、`{ denied: { rejection } }`），保障旧 Codex 不被新 enum 破坏。
+
+同一个 method-aware 映射用于人工回复、YOLO 自动批准与关闭会话时的拒绝；已处理或未知 `reqId` 不会再次回复同一个
+JSON-RPC callback。单元测试覆盖三类 v2、两个 legacy callback 与 `once / always / reject`；安装并登录 Codex 的
+环境还运行一个真实 app-server 回归：在临时 `git init` worktree 内批准受控文件编辑后验证文件实际落盘。
+
 ### 6.4 审批策略（`approval-policy.ts`）
 
 - `strict`（默认，每次询问）/ `standard`（`READ_ONLY` 白名单自动放行，**未知工具一律需审批**，保守方向）/ `yolo`（全部批准）。
