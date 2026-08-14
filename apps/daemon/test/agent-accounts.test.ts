@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -6,6 +6,7 @@ import type { SessionInfo } from "@prospero/protocol";
 import {
   AgentAccountError,
   AgentAccountManager,
+  LocalFileCredentialStore,
   type AccountCommandRunner,
   type AgentAccountCredential,
   type AgentAccountCredentialStore,
@@ -78,6 +79,95 @@ class MemoryCredentialStore implements AgentAccountCredentialStore {
 }
 
 describe("Code Agent 账号隔离", () => {
+  it("默认凭据存储使用账号私有文件并可在 daemon 重启后读取", async () => {
+    const home = tempHome();
+    const apiKey = "local-profile-api-key";
+    const first = new AgentAccountManager(home, signedInRunner([]));
+    const account = await first.createApi("codex", "本地 Profile", {
+      baseUrl: "https://gateway.example.com/v1",
+      model: "local-model",
+      apiKey,
+    });
+    const root = account.environment["CODEX_HOME"]!;
+    const credentialFile = path.join(root, ".prospero-credential.json");
+    const markerFile = path.join(root, ".prospero-credential-local-v1");
+
+    expect(readFileSync(credentialFile, "utf8")).toBe(JSON.stringify({
+      kind: "api_key",
+      secret: apiKey,
+    }));
+    expect(existsSync(markerFile)).toBe(true);
+    expect(readFileSync(path.join(home, "agent-accounts.json"), "utf8")).not.toContain(apiKey);
+    if (process.platform !== "win32") {
+      expect(statSync(root).mode & 0o777).toBe(0o700);
+      expect(statSync(credentialFile).mode & 0o777).toBe(0o600);
+      expect(statSync(markerFile).mode & 0o777).toBe(0o600);
+    }
+
+    const replacementKey = "replacement-local-profile-api-key";
+    await first.configureApi(account.id, {
+      baseUrl: "https://gateway.example.com/v1",
+      model: "local-model",
+      apiKey: replacementKey,
+    });
+    expect(readFileSync(credentialFile, "utf8")).toContain(replacementKey);
+
+    const restarted = new AgentAccountManager(home, signedInRunner([]));
+    expect(restarted.resolve(account.id, "codex").environment["OPENAI_API_KEY"])
+      .toBe(replacementKey);
+    await restarted.logout(account.id);
+    expect(existsSync(credentialFile)).toBe(false);
+    expect(existsSync(markerFile)).toBe(true);
+  });
+
+  it("旧 macOS Keychain 凭据只读迁移一次，删除后不会重新导入", async () => {
+    const root = path.join(tempHome(), "agent-accounts", "claude", "legacy-account");
+    const legacy = {
+      kind: "api_key" as const,
+      secret: "legacy-keychain-api-key",
+    };
+    let legacyReads = 0;
+    const migrate = new LocalFileCredentialStore((accountId) => {
+      legacyReads += 1;
+      expect(accountId).toBe("legacy-account");
+      return legacy;
+    });
+
+    expect(migrate.read("legacy-account", root)).toEqual(legacy);
+    expect(legacyReads).toBe(1);
+    expect(readFileSync(path.join(root, ".prospero-credential.json"), "utf8"))
+      .toBe(JSON.stringify(legacy));
+
+    const afterRestart = new LocalFileCredentialStore(() => {
+      throw new Error("local file should win");
+    });
+    expect(afterRestart.read("legacy-account", root)).toEqual(legacy);
+    await afterRestart.delete("legacy-account", root);
+
+    const afterDelete = new LocalFileCredentialStore(() => {
+      legacyReads += 1;
+      return legacy;
+    });
+    expect(afterDelete.read("legacy-account", root)).toBeNull();
+    expect(legacyReads).toBe(1);
+
+    const retryRoot = path.join(tempHome(), "agent-accounts", "claude", "retry-account");
+    let retryReads = 0;
+    const unavailable = new LocalFileCredentialStore(() => {
+      retryReads += 1;
+      throw new Error("Keychain locked");
+    });
+    expect(unavailable.read("retry-account", retryRoot)).toBeNull();
+    expect(existsSync(path.join(retryRoot, ".prospero-credential-local-v1"))).toBe(false);
+
+    const retry = new LocalFileCredentialStore(() => {
+      retryReads += 1;
+      return legacy;
+    });
+    expect(retry.read("retry-account", retryRoot)).toEqual(legacy);
+    expect(retryReads).toBe(2);
+  });
+
   it("区分 Codex 未登录与状态命令异常", async () => {
     const signedOut = new AgentAccountManager(tempHome(), async () => ({
       stdout: "",

@@ -1,8 +1,8 @@
 import { execFile as execFileCallback, execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { createRequire } from "node:module";
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   readFileSync,
   renameSync,
@@ -11,7 +11,6 @@ import {
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
-import os from "node:os";
 import { promisify } from "node:util";
 import type {
   AgentAccount,
@@ -25,10 +24,9 @@ import type {
 import { programCommandFor } from "./agents.js";
 
 const execFile = promisify(execFileCallback);
-const require = createRequire(import.meta.url);
-const pty = require("node-pty") as typeof import("node-pty");
-const CLAUDE_KEYCHAIN_SERVICE = "com.prospero.code-agent.claude";
-const CLAUDE_CREDENTIAL_FILE = ".prospero-credential.json";
+const LEGACY_MACOS_KEYCHAIN_SERVICE = "com.prospero.code-agent.claude";
+const ACCOUNT_CREDENTIAL_FILE = ".prospero-credential.json";
+const LOCAL_CREDENTIAL_MARKER = ".prospero-credential-local-v1";
 const MISSING_CLAUDE_CREDENTIAL = "prospero-managed-account-not-authenticated";
 const NATIVE_IDS: Record<CodeAgentKind, string> = {
   codex: "native-codex",
@@ -39,7 +37,7 @@ interface StoredAccount {
   id: string;
   agent: CodeAgentKind;
   name: string;
-  /** 非敏感的第三方 API 连接信息；key 单独存系统安全存储。 */
+  /** 非敏感的第三方 API 连接信息；key 单独存账号目录的私有文件。 */
   apiProfile?: StoredApiProfile;
   createdAt: number;
   updatedAt: number;
@@ -92,7 +90,7 @@ export interface ApiProfileInput {
   apiKey: string;
 }
 
-/** Injectable so tests never touch the host Keychain. */
+/** Injectable so tests can exercise account behavior without writing credentials to disk. */
 export interface AgentAccountCredentialStore {
   read(accountId: string, root: string): AgentAccountCredential | null;
   write(accountId: string, root: string, credential: AgentAccountCredential): Promise<void>;
@@ -273,163 +271,138 @@ function parseCredential(raw: string): AgentAccountCredential | null {
   }
 }
 
-function childEnvironment(): Record<string, string> {
-  return Object.fromEntries(
-    Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
-  );
+type LegacyCredentialReader = (accountId: string) => AgentAccountCredential | null;
+
+function writePrivateFile(target: string, contents: string): void {
+  const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temporary, contents, { mode: 0o600, flag: "wx" });
+    renameSync(temporary, target);
+    chmodSync(target, 0o600);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
+}
+
+/** Read-only bridge for credentials saved by older macOS builds. Never writes or deletes Keychain items. */
+function readLegacyMacosKeychainCredential(accountId: string): AgentAccountCredential | null {
+  try {
+    const raw = execFileSync(
+      "/usr/bin/security",
+      [
+        "find-generic-password",
+        "-a",
+        accountId,
+        "-s",
+        LEGACY_MACOS_KEYCHAIN_SERVICE,
+        "-w",
+      ],
+      {
+        encoding: "utf8",
+        timeout: 2_000,
+        maxBuffer: 16 * 1024,
+        stdio: ["ignore", "pipe", "ignore"],
+      },
+    );
+    return parseCredential(raw.trim());
+  } catch (error) {
+    // `security` uses 44 for an absent item. Timeouts/locked Keychains remain retryable
+    // and must not be mistaken for a definitive miss by the migration marker.
+    if ((error as { status?: unknown }).status === 44) return null;
+    throw error;
+  }
+}
+
+function credentialFile(root: string): string {
+  return path.join(root, ACCOUNT_CREDENTIAL_FILE);
+}
+
+function localCredentialMarker(root: string): string {
+  return path.join(root, LOCAL_CREDENTIAL_MARKER);
+}
+
+function isMissingFile(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException).code === "ENOENT";
 }
 
 /**
- * On macOS the secret lives in a Prospero-specific Keychain item. `security -w` is
- * intentionally fed through a private PTY so the secret is never placed in argv.
- * Other daemon platforms use a mode-0600 file inside that account's mode-0700 root.
+ * Credentials live in a mode-0600 file inside the account's mode-0700 root on every
+ * platform. macOS only receives a one-time, read-only legacy Keychain migration; new
+ * saves and deletes never invoke Keychain, so they cannot wait on a system prompt.
  */
-class SystemCredentialStore implements AgentAccountCredentialStore {
+export class LocalFileCredentialStore implements AgentAccountCredentialStore {
+  constructor(
+    private readonly legacyReader: LegacyCredentialReader | null =
+      process.platform === "darwin" ? readLegacyMacosKeychainCredential : null,
+  ) {}
+
   read(accountId: string, root: string): AgentAccountCredential | null {
-    if (process.platform === "darwin") {
+    const target = credentialFile(root);
+    try {
+      const credential = parseCredential(readFileSync(target, "utf8"));
       try {
-        const raw = execFileSync(
-          "/usr/bin/security",
-          [
-            "find-generic-password",
-            "-a",
-            accountId,
-            "-s",
-            CLAUDE_KEYCHAIN_SERVICE,
-            "-w",
-          ],
-          {
-            encoding: "utf8",
-            timeout: 8_000,
-            maxBuffer: 16 * 1024,
-            stdio: ["ignore", "pipe", "ignore"],
-          },
-        );
-        return parseCredential(raw.trim());
+        chmodSync(target, 0o600);
+        this.markLocal(root);
       } catch {
-        return null;
+        // The credential is still readable for this process; a later explicit save can repair permissions.
       }
+      return credential;
+    } catch (error) {
+      if (!isMissingFile(error)) return null;
     }
 
-    try {
-      return parseCredential(readFileSync(path.join(root, CLAUDE_CREDENTIAL_FILE), "utf8"));
-    } catch {
+    if (existsSync(localCredentialMarker(root)) || this.legacyReader === null) {
       return null;
     }
+
+    let migrated: AgentAccountCredential | null = null;
+    try {
+      migrated = this.legacyReader(accountId);
+    } catch {
+      // A locked/slow Keychain is not a definitive miss. Do not create the marker,
+      // so the user can unlock it or simply save a new local credential and retry.
+      return null;
+    }
+    try {
+      if (migrated) this.writeLocal(root, migrated);
+      else this.markLocal(root);
+    } catch {
+      // Migration is best-effort. Keep the recovered value in this daemon's in-memory cache.
+    }
+    return migrated;
   }
 
   async write(
-    accountId: string,
+    _accountId: string,
     root: string,
     credential: AgentAccountCredential,
   ): Promise<void> {
-    const payload = JSON.stringify(credential);
-    if (process.platform === "darwin") {
-      await this.writeKeychain(accountId, payload);
-      return;
-    }
-
-    mkdirSync(root, { recursive: true, mode: 0o700 });
-    const target = path.join(root, CLAUDE_CREDENTIAL_FILE);
-    const temporary = `${target}.tmp`;
-    writeFileSync(temporary, payload, { mode: 0o600 });
-    renameSync(temporary, target);
-    chmodSync(target, 0o600);
+    this.writeLocal(root, credential);
   }
 
-  async delete(accountId: string, root: string): Promise<void> {
-    if (process.platform === "darwin") {
-      if (this.read(accountId, root) === null) return;
-      try {
-        execFileSync(
-          "/usr/bin/security",
-          ["delete-generic-password", "-a", accountId, "-s", CLAUDE_KEYCHAIN_SERVICE],
-          { timeout: 8_000, stdio: "ignore" },
-        );
-      } catch (error) {
-        throw new AgentAccountError(
-          `无法从 macOS Keychain 删除 Claude 凭据: ${error instanceof Error ? error.message : String(error)}`,
-          "agent_unavailable",
-        );
-      }
-      return;
-    }
-
+  async delete(_accountId: string, root: string): Promise<void> {
+    this.markLocal(root);
     try {
-      unlinkSync(path.join(root, CLAUDE_CREDENTIAL_FILE));
+      unlinkSync(credentialFile(root));
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      if (!isMissingFile(error)) throw error;
     }
   }
 
-  private writeKeychain(accountId: string, payload: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-      let child: import("node-pty").IPty;
-      try {
-        child = pty.spawn(
-          "/usr/bin/security",
-          [
-            "add-generic-password",
-            "-U",
-            "-a",
-            accountId,
-            "-s",
-            CLAUDE_KEYCHAIN_SERVICE,
-            "-l",
-            "Prospero Claude Code account",
-            "-T",
-            "/usr/bin/security",
-            "-w",
-          ],
-          {
-            name: "xterm-256color",
-            cols: 80,
-            rows: 24,
-            cwd: os.homedir(),
-            env: childEnvironment(),
-          },
-        );
-      } catch (error) {
-        reject(
-          new AgentAccountError(
-            `无法打开 macOS Keychain: ${error instanceof Error ? error.message : String(error)}`,
-            "agent_unavailable",
-          ),
-        );
-        return;
-      }
+  private writeLocal(root: string, credential: AgentAccountCredential): void {
+    this.markLocal(root);
+    writePrivateFile(credentialFile(root), JSON.stringify(credential));
+  }
 
-      let supplied = false;
-      let settled = false;
-      let output = "";
-      const finish = (error?: Error): void => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        if (error) reject(error);
-        else resolve();
-      };
-      const timer = setTimeout(() => {
-        child.kill();
-        finish(new AgentAccountError("写入 macOS Keychain 超时", "agent_unavailable"));
-      }, 30_000);
-
-      child.onData((chunk) => {
-        // Never retain more than the prompt itself, and never append `payload`.
-        output = `${output}${chunk}`.slice(-2048);
-        if (!supplied && /password data|password.*item|密码/i.test(output)) {
-          supplied = true;
-          child.write(`${payload}\r`);
-        }
-      });
-      child.onExit(({ exitCode }) => {
-        if (exitCode === 0 && supplied) {
-          finish();
-          return;
-        }
-        finish(new AgentAccountError("无法把 Claude 凭据写入 macOS Keychain", "agent_unavailable"));
-      });
-    });
+  private markLocal(root: string): void {
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    chmodSync(root, 0o700);
+    const marker = localCredentialMarker(root);
+    if (existsSync(marker)) {
+      chmodSync(marker, 0o600);
+      return;
+    }
+    writePrivateFile(marker, "local-file-v1\n");
   }
 }
 
@@ -483,7 +456,8 @@ async function defaultRunner(
  * Code Agent 账号目录管理。
  *
  * 元数据只写名称、默认项和隔离目录；Codex 由官方 CLI 写入独立 CODEX_HOME，
- * managed Claude 的显式凭据写入系统安全存储。项目 cwd 不在这里，因此多个账号
+ * managed Claude 与第三方 API Profile 的显式凭据写入账号目录的 0600 私有文件。
+ * 项目 cwd 不在这里，因此多个账号
  * 可以进入同一项目，同时不会共享 agent 用户态配置。
  */
 export class AgentAccountManager {
@@ -495,7 +469,7 @@ export class AgentAccountManager {
   constructor(
     private readonly home: string,
     private readonly runner: AccountCommandRunner = defaultRunner,
-    private readonly credentialStore: AgentAccountCredentialStore = new SystemCredentialStore(),
+    private readonly credentialStore: AgentAccountCredentialStore = new LocalFileCredentialStore(),
   ) {
     this.storeFile = path.join(home, "agent-accounts.json");
     this.rootsDir = path.join(home, "agent-accounts");
