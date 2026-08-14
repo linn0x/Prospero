@@ -10,7 +10,7 @@ import path from "node:path";
 import type { AgentKind, ApprovalPolicy } from "@prospero/protocol";
 import { DispatchService } from "./dispatch.js";
 import type { AutomationWorkspace, Run } from "./model.js";
-import { OrchestrationStore } from "./store.js";
+import { OrchestrationError, OrchestrationStore } from "./store.js";
 import { createEsaytree, repoRoot } from "./esaytree.js";
 
 export interface StartAutomationInput {
@@ -168,14 +168,16 @@ export class AutomationService {
     if (active) return;
 
     if (tasks.every((task) => task.status === "done")) {
-      const now = Date.now();
-      this.store.setRunAutomation(runId, {
-        ...automation,
-        state: "completed",
-        updatedAt: now,
-        lastError: null,
-      });
-      this.store.updateRun(runId, { status: "completed" });
+      try {
+        // 只能经由 Run 的唯一完成入口收口。它会再次验证 Gate、Dispatch 与
+        // automation 状态，并在成功时原子地将 automation 标成 completed。
+        this.store.completeRun(runId, { fromAutomation: true });
+      } catch (error) {
+        // run-level Gate 不会改变 task 状态；它被解决时会 kick 本 Run，届时
+        // 再尝试完成即可。这里不是自动执行故障，也不能把它提前标成 completed。
+        if (error instanceof OrchestrationError && error.code === "run_not_completable") return;
+        throw error;
+      }
       return;
     }
 
