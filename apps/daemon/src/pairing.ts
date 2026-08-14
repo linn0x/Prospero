@@ -42,6 +42,13 @@ export interface DeviceRecord {
   /** Relay control-plane credentials. Missing fields mean this is a pre-relay pairing. */
   relayDeviceId?: string;
   relayToken?: string;
+  /**
+   * Set only after the relay credentials have been rendered in this device's
+   * pairing QR.  Older records deliberately lack it: we cannot prove that a
+   * phone ever received their independently minted relay token, so they must
+   * re-pair rather than becoming relay-active after a later enable.
+   */
+  relayCredentialIssued?: true;
   createdAt: number;
   lastSeenAt?: number;
 }
@@ -127,7 +134,7 @@ export function deriveRelayRouteId(hostSecret: string): string {
 }
 
 export function deviceRelayCredentials(device: DeviceRecord): RelayCredentials | null {
-  if (!device.relayDeviceId || !device.relayToken) return null;
+  if (!device.relayCredentialIssued || !device.relayDeviceId || !device.relayToken) return null;
   return { deviceId: device.relayDeviceId, token: device.relayToken };
 }
 
@@ -149,14 +156,38 @@ export function mintDevice(
     token: toB64Url(randomBytes(24)),
     allowShell: opts.allowShell,
     allowOrchestration: opts.allowOrchestration ?? opts.allowShell,
-    relayDeviceId: toB64Url(randomBytes(24)),
-    relayToken: toB64Url(randomBytes(32)),
     createdAt: Date.now(),
   };
   const devices = loadDevices(home);
   devices.push(device);
   saveDevices(home, devices);
   return device;
+}
+
+/**
+ * Produce credentials for a relay QR, but do not persist them yet.  The CLI
+ * calls persistRelayCredentials only after the QR has actually been emitted;
+ * this ordering is intentionally fail-closed if rendering or writing fails.
+ */
+export function issueRelayCredentials(device: DeviceRecord): DeviceRecord {
+  return {
+    ...device,
+    relayDeviceId: toB64Url(randomBytes(24)),
+    relayToken: toB64Url(randomBytes(32)),
+    relayCredentialIssued: true,
+  };
+}
+
+/** Persist the relay credentials that were just included in a QR for this token. */
+export function persistRelayCredentials(home: string, issued: DeviceRecord): void {
+  if (!deviceRelayCredentials(issued)) {
+    throw new Error("cannot persist relay credentials that were not issued in a pairing QR");
+  }
+  const devices = loadDevices(home);
+  const index = devices.findIndex((device) => tokenEqual(device.token, issued.token));
+  if (index < 0) throw new Error("paired device disappeared before relay credentials could be saved");
+  devices[index] = issued;
+  saveDevices(home, devices);
 }
 
 /** 人工派发会在本机启动 agent，权限至少应与 shell 会话同级。 */
@@ -180,6 +211,42 @@ export function rotateIdentity(home: string): KeyPairB64 {
   writeJsonPrivate(path.join(home, "identity.json"), fresh);
   saveDevices(home, []);
   return fresh;
+}
+
+export interface RelayRotationStorage {
+  saveConfig(home: string, config: DaemonConfig): void;
+  saveDevices(home: string, devices: DeviceRecord[]): void;
+}
+
+/**
+ * Clear device credentials before publishing a new route key.  This ordering
+ * is conservative across the two files: a later config-write failure leaves
+ * the old route with no active device credentials, never the new route with
+ * credentials the phone did not obtain from a new QR.
+ */
+export function rotateRelayKey(
+  home: string,
+  config: DaemonConfig,
+  storage: RelayRotationStorage = { saveConfig, saveDevices },
+): DaemonConfig {
+  const devices = loadDevices(home);
+  const cleared = devices.map(({
+    relayDeviceId: _relayDeviceId,
+    relayToken: _relayToken,
+    relayCredentialIssued: _relayCredentialIssued,
+    ...device
+  }) => device);
+  storage.saveDevices(home, cleared);
+  const next: DaemonConfig = {
+    ...config,
+    relay: {
+      enabled: config.relay?.enabled ?? false,
+      ...(config.relay?.url ? { url: config.relay.url } : {}),
+      hostSecret: generateRelayHostSecret(),
+    },
+  };
+  storage.saveConfig(home, next);
+  return next;
 }
 
 /**
