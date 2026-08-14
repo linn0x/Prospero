@@ -174,7 +174,7 @@ async function tryGit(cwd: string, args: string[]): Promise<boolean> {
 export async function repoRoot(cwd: string): Promise<string | null> {
   try {
     const out = await git(cwd, ["rev-parse", "--show-toplevel"]);
-    return out.trim() || null;
+    return out.trim() ? canonicalPath(out.trim()) : null;
   } catch {
     return null;
   }
@@ -218,7 +218,7 @@ export async function listWorktrees(repo: string): Promise<WorktreeInfo[]> {
 
 function finishWorktree(partial: Partial<WorktreeInfo>): WorktreeInfo {
   return {
-    path: partial.path ? path.normalize(partial.path) : "",
+    path: partial.path ? canonicalPath(partial.path) : "",
     branch: partial.branch ?? null,
     head: partial.head ?? "",
     detached: partial.detached ?? partial.branch === undefined,
@@ -230,7 +230,10 @@ function finishWorktree(partial: Partial<WorktreeInfo>): WorktreeInfo {
 function canonicalPath(value: string): string {
   const resolved = path.resolve(value);
   try {
-    return realpathSync(resolved);
+    // On Windows the native implementation expands 8.3 aliases such as
+    // RUNNER~1. Git reports the long path, while os.tmpdir() may return the
+    // short alias; treating those as different loses registered worktrees.
+    return realpathSync.native(resolved);
   } catch {
     // 目标尚不存在时也要解析最近的既存祖先。macOS 的 /var → /private/var
     // 会让单纯 path.resolve 得到两个不同字符串，进而漏掉“目标在源目录内”。
@@ -243,7 +246,7 @@ function canonicalPath(value: string): string {
       cursor = parent;
     }
     try {
-      return path.join(realpathSync(cursor), ...suffix);
+      return path.join(realpathSync.native(cursor), ...suffix);
     } catch {
       return resolved;
     }
