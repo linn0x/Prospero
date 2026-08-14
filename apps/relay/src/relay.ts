@@ -318,7 +318,22 @@ export class RelayServer {
   }
 
   private handleHostControlFailure(host: HostConnection, error: unknown): void {
-    if (host.closed || !this.isCurrentHost(host)) return;
+    if (!this.isCurrentHost(host)) {
+      // SnapshotGenerationError is raised by RouteStore only after rollback,
+      // so a superseded host's rejected snapshot has no side effect to fence.
+      if (error instanceof SnapshotGenerationError) return;
+      // A generic rejection may have happened after a snapshot/cache/presence
+      // write committed. Its old identity cannot be proven harmless, so fail
+      // the current route owner and every stream it owns closed as well.
+      this.logger.warn({ event: "relay.stale_host_control_failed", route: opaqueLogId(host.routeId), error: errorKind(error) }, "stale host control failed ambiguously; route failed closed");
+      const current = this.hosts.get(host.routeId);
+      if (current !== undefined && current.id !== host.id) this.failHost(current, "ambiguous stale host control failure");
+      // There might be no newer owner, or the stale write might have replaced
+      // that owner's presence immediately before its failure. Compare-delete
+      // the stale identity in either case.
+      this.clearHostPresence(host, "ambiguous stale host control failure");
+      return;
+    }
     if (error instanceof SnapshotGenerationError) this.sendErrorAndClose(host.ws, "bad_frame", "stale or inconsistent device snapshot");
     else this.sendErrorAndClose(host.ws, "internal", "relay unavailable");
     this.logger.warn({ event: "relay.host_control_failed", route: opaqueLogId(host.routeId), error: errorKind(error) }, "host control failed closed");

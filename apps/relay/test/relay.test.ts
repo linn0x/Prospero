@@ -116,6 +116,39 @@ class FailingEphemeralStore extends MemoryEphemeralStore {
   override async setPresence(...args: Parameters<MemoryEphemeralStore["setPresence"]>): Promise<void> { if (this.failPresence) throw new Error("presence unavailable"); await super.setPresence(...args); }
 }
 
+class PostWriteThrowRouteStore extends MemoryRouteStore {
+  private snapshotGate: DeferredGate | undefined;
+  deferNextSnapshotWriteThenThrow(): DeferredGate { const gate = new DeferredGate(); this.snapshotGate = gate; return gate; }
+  override async applyDeviceSnapshot(...args: Parameters<MemoryRouteStore["applyDeviceSnapshot"]>) {
+    const snapshot = await super.applyDeviceSnapshot(...args);
+    const gate = this.snapshotGate; this.snapshotGate = undefined;
+    if (gate === undefined) return snapshot;
+    gate.arrive(); await gate.wait();
+    throw new Error("snapshot write acknowledgement lost");
+  }
+}
+
+class PostWriteThrowEphemeralStore extends MemoryEphemeralStore {
+  private cacheGate: DeferredGate | undefined;
+  private presenceGate: DeferredGate | undefined;
+  deferNextCacheWriteThenThrow(): DeferredGate { const gate = new DeferredGate(); this.cacheGate = gate; return gate; }
+  deferNextPresenceWriteThenThrow(): DeferredGate { const gate = new DeferredGate(); this.presenceGate = gate; return gate; }
+  override async cacheCredential(...args: Parameters<MemoryEphemeralStore["cacheCredential"]>): Promise<void> {
+    await super.cacheCredential(...args);
+    const gate = this.cacheGate; this.cacheGate = undefined;
+    if (gate === undefined) return;
+    gate.arrive(); await gate.wait();
+    throw new Error("cache write acknowledgement lost");
+  }
+  override async setPresence(...args: Parameters<MemoryEphemeralStore["setPresence"]>): Promise<void> {
+    await super.setPresence(...args);
+    const gate = this.presenceGate; this.presenceGate = undefined;
+    if (gate === undefined) return;
+    gate.arrive(); await gate.wait();
+    throw new Error("presence write acknowledgement lost");
+  }
+}
+
 describe("relay v1 independent data-plane service", () => {
   const running: RelayServer[] = [];
   afterEach(async () => { await Promise.all(running.splice(0).map((relay) => relay.close())); });
@@ -335,6 +368,49 @@ describe("relay v1 independent data-plane service", () => {
     await tripleEphemeral.waitForPresenceWrites(5);
     expect(tripleEphemeral.presence.get(routeId)).toBe(h3Presence);
     await close(h3);
+  });
+
+  it.each(["snapshot", "cache", "presence"] as const)("fails the newer owner closed after an ambiguous stale %s write", async (operation) => {
+    const routes = new PostWriteThrowRouteStore(); const ephemeral = new PostWriteThrowEphemeralStore();
+    const { url } = await start({}, routes, ephemeral);
+    const gate = operation === "snapshot"
+      ? routes.deferNextSnapshotWriteThenThrow()
+      : operation === "cache"
+        ? ephemeral.deferNextCacheWriteThenThrow()
+        : ephemeral.deferNextPresenceWriteThenThrow();
+    const old = await open(`${url}/v1/host`); const oldClosed = once(old, "close");
+    old.send(JSON.stringify({ v: 1, routeId, hostSecret }));
+    old.send(JSON.stringify({ type: "host.device-sync", v: 1, generation: 1, credentials: [activeCredential(deviceId, token)] }));
+    await gate.entered;
+
+    const newer = await hostOnline(url, 2);
+    expect((await oldClosed)[0]).toBe(4009);
+
+    const pending = await clientPending(url);
+    const pendingOffer = JSON.parse((await next(newer)).data.toString()) as { streamId: string; ticket: string };
+    const live = await clientPending(url);
+    const liveOffer = JSON.parse((await next(newer)).data.toString()) as { streamId: string; ticket: string };
+    const dataSocket = await open(`${url}/v1/stream`);
+    dataSocket.send(JSON.stringify({ type: "stream.accept", v: 1, streamId: liveOffer.streamId, ticket: liveOffer.ticket }));
+    await next(dataSocket); await next(live.client);
+
+    const newerClosed = once(newer, "close"); const pendingClosed = once(pending.client, "close");
+    const liveClosed = once(live.client, "close"); const dataClosed = once(dataSocket, "close");
+    gate.release();
+    expect((await newerClosed)[0]).toBe(1013);
+    expect((await pendingClosed)[0]).toBe(1013);
+    expect((await liveClosed)[0]).toBe(1013);
+    expect((await dataClosed)[0]).toBe(1013);
+    await nextTurn();
+    expect(ephemeral.presence.has(routeId)).toBe(false);
+    expect(ephemeral.tickets.size).toBe(0);
+    expect(ephemeral.leases.size).toBe(0);
+    expect(pendingOffer.streamId).not.toBe(liveOffer.streamId);
+
+    const offline = await open(`${url}/v1/client`); const offlineClosed = once(offline, "close");
+    offline.send(JSON.stringify({ type: "client.open", v: 1, routeId, deviceId, token }));
+    expect(JSON.parse((await next(offline)).data.toString())).toMatchObject({ type: "error", code: "route_unavailable" });
+    expect((await offlineClosed)[0]).toBe(1008);
   });
 
   it("cancels pre-ready and closed peers before they can leave client-open or redeem side effects", async () => {
