@@ -395,10 +395,14 @@ adapter 的 `SessionStatus`（idle 等）猜 done。
 
 ### 7.5 esaytree 工作树隔离
 
-快速路径：`git worktree add --no-checkout` → `FICLONE_FORCE` CoW 复制源工作区（跳过根 `.git`）→
-`restoreCommittedSnapshot`（`git reset --mixed` + `clean -ffdx` + 按目标 ref 还原）→ 复用 ignored 目录
-（`node_modules` 等整目录折叠）。CoW 失败退回普通 checkout。`rollbackCreatedWorktree` 保证创建失败无残留。
-默认根 `<repo>/.prospero-worktrees/<repoBasename>/<name>`（`ESAYTREE_ROOT` 可覆盖）。
+快速路径：`git worktree add` 只检出目标 ref 的 tracked 快照（不带任何 ignored 内容）→ 仅对 allowlist
+`node_modules` 先尝试 macOS 同卷直接 `clonefile`（非 macOS 为 Node `FICLONE_FORCE`）严格 CoW。`cp -c`
+的成功不能证明 CoW，因此不参与探测或报告；JXA 显式绑定 `clonefile`，探针与真实复制均以它的返回值为准。
+`build/`、`.cache/`、`.expo/`、`ios/build/`、`.claude/` 等从不进入目标，连短暂整仓 clone 也没有。CoW
+失败时保留普通 checkout，默认不实体复制依赖；显式允许实体复制时，只有 CoW 已失败的候选目录才会被以
+逻辑字节数预估，并在任何实体写入前检查目标卷可用空间、8 GiB 单次上限与 4 GiB 安全保留。预检失败不写
+任何候选目录且会报告原因。`rollbackCreatedWorktree` 保证创建失败无残留。默认根
+`<repo>/.prospero-worktrees/<repoBasename>/<name>`（`ESAYTREE_ROOT` 可覆盖）。
 
 **资产检查/清理（`worktree-assets.ts`）**：`inspect` 只读，结论 `missing|dirty|unmerged|equivalent|safe_to_clean|…`；
 `cleanup` 多重保护：必须 `confirm` → 删除前**无条件重新 inspect** → live lease 检查 → `git worktree remove --force=false`

@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import {
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -19,6 +20,7 @@ import {
   listWorktrees,
   removeManagedWorktree,
   removeWorktree,
+  type EsaytreeOperations,
 } from "../src/orchestration/esaytree.js";
 
 const temps: string[] = [];
@@ -34,13 +36,52 @@ function repo(): string {
   git("config", "user.name", "Test");
   git("config", "commit.gpgsign", "false");
   git("config", "core.autocrlf", "false");
-  writeFileSync(path.join(dir, ".gitignore"), "node_modules/\n");
+  writeFileSync(path.join(dir, ".gitignore"), [
+    "node_modules/",
+    "build/",
+    ".cache/",
+    ".expo/",
+    "ios/build/",
+    ".claude/",
+  ].join("\n"));
   writeFileSync(path.join(dir, "README.md"), "# fixture\n");
   mkdirSync(path.join(dir, "apps", "mobile", "node_modules", "fixture"), { recursive: true });
   writeFileSync(path.join(dir, "apps", "mobile", "node_modules", "fixture", "index.js"), "ok\n");
+  mkdirSync(path.join(dir, "build"), { recursive: true });
+  mkdirSync(path.join(dir, ".cache"), { recursive: true });
+  mkdirSync(path.join(dir, ".expo"), { recursive: true });
+  mkdirSync(path.join(dir, "ios", "build"), { recursive: true });
+  mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  writeFileSync(path.join(dir, "build", "artifact"), "build\n");
+  writeFileSync(path.join(dir, ".cache", "cache"), "cache\n");
+  writeFileSync(path.join(dir, ".expo", "state"), "expo\n");
+  writeFileSync(path.join(dir, "ios", "build", "artifact"), "ios build\n");
+  writeFileSync(path.join(dir, ".claude", "private"), "private\n");
   git("add", ".");
   git("commit", "-m", "init");
   return dir;
+}
+
+/** 真实临时 Git 仓上的受控 CoW 后端；实体 cp 只用于故障注入，不冒充生产严格语义。 */
+const cowAvailable: EsaytreeOperations = {
+  cloneCow(source, target) {
+    cpSync(source, target, { recursive: true });
+  },
+  // 严格 CoW 成功不应统计 31 GiB 依赖或读取实体复制的剩余空间。
+  availableBytes: () => {
+    throw new Error("实体复制预检不应在 CoW 成功时运行");
+  },
+};
+
+function cowFailure(code: "ENOSYS" | "EXDEV"): EsaytreeOperations {
+  return {
+    cloneCow() {
+      const error = new Error(code) as NodeJS.ErrnoException;
+      error.code = code;
+      throw error;
+    },
+    availableBytes: () => 100 * 1024 ** 3,
+  };
 }
 
 function git(root: string, ...args: string[]): string {
@@ -55,6 +96,11 @@ describe("esaytree", () => {
   it("能识别 monorepo 嵌套的 ignored 依赖目录", async () => {
     const root = repo();
     await expect(ignoredDirs(root)).resolves.toContain("apps/mobile/node_modules");
+    await expect(ignoredDirs(root)).resolves.not.toContain("build");
+    await expect(ignoredDirs(root)).resolves.not.toContain(".cache");
+    await expect(ignoredDirs(root)).resolves.not.toContain(".expo");
+    await expect(ignoredDirs(root)).resolves.not.toContain("ios/build");
+    await expect(ignoredDirs(root)).resolves.not.toContain(".claude");
   });
 
   it("从提交快照创建隔离工作区，同时用 CoW 路径复用 ignored 依赖", async () => {
@@ -72,10 +118,15 @@ describe("esaytree", () => {
       at: target,
       name: "one",
       branch: "prospero/test-worker",
+      operations: cowAvailable,
     });
 
     expect(created.path).toBe(target);
-    expect(["copy-on-write", "git-checkout"]).toContain(created.mode);
+    expect(created).toMatchObject({ mode: "git-checkout", cow: true, cowBackend: "injected" });
+    expect(created.preservedIgnored).toEqual(["apps/mobile/node_modules"]);
+    expect(created.skippedIgnored.map((item) => item.dir)).toEqual(
+      expect.arrayContaining(["build", ".cache", ".expo", "ios/build", ".claude"]),
+    );
     expect(readFileSync(path.join(target, "README.md"), "utf8")).toBe("# fixture\n");
     expect(existsSync(path.join(target, "staged.txt"))).toBe(false);
     expect(existsSync(path.join(target, "untracked.txt"))).toBe(false);
@@ -83,6 +134,11 @@ describe("esaytree", () => {
       path.join(target, "apps", "mobile", "node_modules", "fixture", "index.js"),
       "utf8",
     )).toBe("ok\n");
+    expect(existsSync(path.join(target, "build"))).toBe(false);
+    expect(existsSync(path.join(target, ".cache"))).toBe(false);
+    expect(existsSync(path.join(target, ".expo"))).toBe(false);
+    expect(existsSync(path.join(target, "ios", "build"))).toBe(false);
+    expect(existsSync(path.join(target, ".claude"))).toBe(false);
     expect(git(target, "status", "--porcelain")).toBe("");
 
     writeFileSync(path.join(target, "README.md"), "# worker edit\n");
@@ -108,6 +164,26 @@ describe("esaytree", () => {
     expect(git(root, "branch", "--list", "prospero/test-worker")).toBe("");
   });
 
+  it.skipIf(process.platform !== "darwin")(
+    "macOS 同卷路径由 clonefile 严格确认 CoW，而非 cp -c 的静默 fallback",
+    async () => {
+      const root = repo();
+      const target = path.join(root, ".workers", "macos-clonefile");
+      const created = await createEsaytree({
+        repo: root,
+        at: target,
+        name: "macos-clonefile",
+        branch: "esaytree/macos-clonefile",
+      });
+      expect(created).toMatchObject({
+        mode: "git-checkout",
+        cow: true,
+        cowBackend: "macos_clonefile",
+      });
+      await removeWorktree(root, target, { deleteBranch: true });
+    },
+  );
+
   it("clean 模式不会把 ignored 依赖带入工作区", async () => {
     const root = repo();
     const target = path.join(root, ".workers", "clean");
@@ -117,6 +193,7 @@ describe("esaytree", () => {
       name: "clean",
       branch: "prospero/clean-worker",
       cloneIgnored: false,
+      operations: cowAvailable,
     });
     expect(existsSync(path.join(target, "apps", "mobile", "node_modules"))).toBe(false);
     await removeWorktree(root, target, { deleteBranch: true });
@@ -160,6 +237,137 @@ describe("esaytree", () => {
     })).rejects.toMatchObject({ code: "git_failed" });
     expect(existsSync(target)).toBe(false);
     expect(git(root, "branch", "--list", "esaytree/broken")).toBe("");
+    expect((await listWorktrees(root)).some((worktree) => worktree.path === target)).toBe(false);
+  });
+
+  it("CoW 后端 ENOSYS 时默认不实体复制依赖，且报告可操作原因", async () => {
+    const root = repo();
+    const target = path.join(root, ".workers", "enosys");
+    const created = await createEsaytree({
+      repo: root,
+      at: target,
+      name: "enosys",
+      branch: "esaytree/enosys",
+      operations: cowFailure("ENOSYS"),
+    });
+
+    expect(created).toMatchObject({ mode: "git-checkout", cow: false, cowBackend: "none" });
+    expect(created.fallbackReason).toContain("ENOSYS");
+    expect(existsSync(path.join(target, "apps", "mobile", "node_modules"))).toBe(false);
+    expect(created.skippedIgnored).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        dir: "apps/mobile/node_modules",
+        strategy: "skipped",
+        reason: expect.stringContaining("未显式启用"),
+      }),
+    ]));
+    await removeWorktree(root, target, { deleteBranch: true });
+  });
+
+  it("跨卷 CoW 故障允许受限的实体副本，副本写入不会污染源依赖", async () => {
+    const root = repo();
+    const target = path.join(root, ".workers", "cross-volume");
+    const created = await createEsaytree({
+      repo: root,
+      at: target,
+      name: "cross-volume",
+      branch: "esaytree/cross-volume",
+      operations: cowFailure("EXDEV"),
+      fallbackCopyIgnored: true,
+      maxFallbackCopyBytes: 1024 * 1024,
+      minFreeBytes: 1024,
+    });
+
+    expect(created.fallbackReason).toContain("EXDEV");
+    expect(created.clones).toEqual(expect.arrayContaining([
+      expect.objectContaining({ dir: "apps/mobile/node_modules", strategy: "copy", cow: false }),
+    ]));
+    const targetDependency = path.join(target, "apps", "mobile", "node_modules", "fixture", "index.js");
+    writeFileSync(targetDependency, "worker copy\n");
+    expect(readFileSync(path.join(root, "apps", "mobile", "node_modules", "fixture", "index.js"), "utf8"))
+      .toBe("ok\n");
+    await removeWorktree(root, target, { deleteBranch: true });
+  });
+
+  it("空间不足预检不写任何实体依赖副本", async () => {
+    const root = repo();
+    const target = path.join(root, ".workers", "no-space");
+    const operations: EsaytreeOperations = {
+      ...cowFailure("ENOSYS"),
+      availableBytes: () => 1_024,
+    };
+    const created = await createEsaytree({
+      repo: root,
+      at: target,
+      name: "no-space",
+      branch: "esaytree/no-space",
+      operations,
+      fallbackCopyIgnored: true,
+      maxFallbackCopyBytes: 1024 * 1024,
+      minFreeBytes: 2048,
+    });
+
+    expect(existsSync(path.join(target, "apps", "mobile", "node_modules"))).toBe(false);
+    expect(created.skippedIgnored).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        dir: "apps/mobile/node_modules",
+        strategy: "skipped",
+        reason: expect.stringContaining("安全保留"),
+      }),
+    ]));
+    await removeWorktree(root, target, { deleteBranch: true });
+  });
+
+  it("实体复制上限在写入前拒绝依赖副本", async () => {
+    const root = repo();
+    const target = path.join(root, ".workers", "copy-limit");
+    const created = await createEsaytree({
+      repo: root,
+      at: target,
+      name: "copy-limit",
+      branch: "esaytree/copy-limit",
+      operations: cowFailure("ENOSYS"),
+      fallbackCopyIgnored: true,
+      maxFallbackCopyBytes: 0,
+      minFreeBytes: 0,
+    });
+
+    expect(existsSync(path.join(target, "apps", "mobile", "node_modules"))).toBe(false);
+    expect(created.skippedIgnored).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        dir: "apps/mobile/node_modules",
+        strategy: "skipped",
+        reason: expect.stringContaining("上限"),
+      }),
+    ]));
+    await removeWorktree(root, target, { deleteBranch: true });
+  });
+
+  it("CoW 在写出残片后失败也会回滚目标、worktree 登记和新分支", async () => {
+    const root = repo();
+    const target = path.join(root, ".workers", "partial-cow");
+    const operations: EsaytreeOperations = {
+      cloneCow(source, destination) {
+        cpSync(source, destination, { recursive: true });
+        if (!path.basename(destination).startsWith(".esaytree-cow-probe-")) {
+          const error = new Error("injected partial ENOSYS") as NodeJS.ErrnoException;
+          error.code = "ENOSYS";
+          throw error;
+        }
+      },
+      availableBytes: () => 100 * 1024 ** 3,
+    };
+
+    await expect(createEsaytree({
+      repo: root,
+      at: target,
+      name: "partial-cow",
+      branch: "esaytree/partial-cow",
+      fallbackToCheckout: false,
+      operations,
+    })).rejects.toMatchObject({ code: "cow_unavailable" });
+    expect(existsSync(target)).toBe(false);
+    expect(git(root, "branch", "--list", "esaytree/partial-cow")).toBe("");
     expect((await listWorktrees(root)).some((worktree) => worktree.path === target)).toBe(false);
   });
 });

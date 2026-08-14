@@ -79,26 +79,15 @@ agent ────┴─ 控制 socket ─┘        │
 
 所以贵的从来不是仓库,是**依赖**。而新 worktree 里没有依赖,重装一次几分钟起步。
 
-解法是 APFS 的写时复制(`clonefile`),Node 原生支持:
+解法是只为明确依赖目录（目前为各层 `node_modules`）使用 APFS 的写时复制
+(`clonefile`)。macOS 通过显式绑定的系统 `clonefile` 调用确认成功，不能把
+`cp -c` 的成功当作 CoW；非 macOS 才使用 Node 的 `COPYFILE_FICLONE_FORCE` 严格语义。
+正常 `git worktree add` 只检出 tracked 快照，所有 ignored 目录先留在源仓，
+因此 `build/`、`.cache/`、`.expo/`、`ios/build/`、`.claude/` 不会短暂进入目标。
 
-```ts
-fs.cpSync(src, dst, { recursive: true, mode: fs.constants.COPYFILE_FICLONE_FORCE });
-```
-
-实测把 4.3 GB 的 `node_modules` 克隆进新 worktree:**11 秒,磁盘占用增量约等于 0**。
-且已验证是真 CoW 而非硬链接 —— inode 不同,改克隆不会污染源目录。
-
-要克隆哪些目录不靠猜,问 git:
-
-```
-git ls-files --others --ignored --directory --exclude-standard
-```
-
-它会把**完全被忽略的目录整个折叠**成一条,monorepo 里嵌套的
-`apps/*/node_modules`、`packages/*/node_modules` 一并列出。
-
-非 APFS(或跨卷)时 `FICLONE_FORCE` 会抛错,退回真实复制并把 `cow: false` 报上去,
-让上层能提示"这次要占 4.3G"。
+若 CoW 不可用（例如 `ENOSYS` 或跨卷 `EXDEV`），默认保留干净 checkout 并跳过依赖；
+目标可自行安装。只有显式 `--copy-fallback` 才会在所有实体写入前估算候选依赖、检查
+可用空间、8 GiB 单次上限和 4 GiB 安全保留，拒绝时报告原因且不复制任何目录。
 
 ## 协调者 agent 的一轮
 
