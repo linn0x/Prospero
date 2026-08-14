@@ -29,7 +29,9 @@ import { primaryPaneWidth, useAdaptiveLayout } from "@/lib/adaptive-layout";
 import { useHostConnection } from "@/lib/use-host-connection";
 import {
   groupOrchestrationRuns,
+  ORCHESTRATION_ACTION_MIN_HIT_TARGET,
   orchestrationConnectionNotice,
+  orchestrationRunCurrentState,
   selectedRouteRunId,
 } from "@/lib/orchestration-overview";
 import { useOrchestrationSnapshot } from "@/lib/use-orchestration-snapshot";
@@ -146,12 +148,6 @@ const runStatusLabel: Record<OrchestrationRun["status"], string> = {
   abandoned: "已放弃",
 };
 
-function isTaskReady(task: OrchestrationTask, tasks: OrchestrationTask[]): boolean {
-  if (task.status !== "pending") return false;
-  const byId = new Map(tasks.map((candidate) => [candidate.id, candidate]));
-  return task.deps.every((id) => byId.get(id)?.status === "done");
-}
-
 function runLabel(run: OrchestrationRun): string {
   return run.coordinatorSessionId === null ? "手工" : "协调者";
 }
@@ -166,6 +162,7 @@ export default function OrchestrationScreen() {
   const [banner, setBanner] = useState<string | null>(null);
   const [taskView, setTaskView] = useState<"graph" | "list">("graph");
   const [selectedTopologyTaskId, setSelectedTopologyTaskId] = useState<string | null>(null);
+  const [otherGateDecisions, setOtherGateDecisions] = useState<Record<string, string>>({});
 
   const [objective, setObjective] = useState("");
   const [draftNodes, setDraftNodes] = useState<DraftNode[]>([]);
@@ -249,9 +246,11 @@ export default function OrchestrationScreen() {
     () => activeRunId ? worktreeAssetGroups.byRunId.get(activeRunId) ?? [] : [],
     [worktreeAssetGroups, activeRunId],
   );
-  const pendingGates = (snapshot?.gates ?? []).filter(
-    (gate) => gate.runId === activeRunId && gate.status === "pending",
+  const selectedRunState = useMemo(
+    () => selectedRun && snapshot ? orchestrationRunCurrentState(selectedRun, snapshot) : null,
+    [selectedRun, snapshot],
   );
+  const pendingGates = selectedRunState?.pendingGates ?? [];
   const manualRun = selectedRun?.coordinatorSessionId === null;
   const canMutate = runtime.status === "connected" && conn?.supportsManualOrchestration === true;
   const canCreateGraph = runtime.status === "connected" && conn?.supportsGraphOrchestration === true;
@@ -262,6 +261,7 @@ export default function OrchestrationScreen() {
     conn?.supportsOrchestrationRunLifecycle === true;
   const canManageWorktrees = runtime.status === "connected" &&
     conn?.supportsOrchestrationWorktrees === true;
+  const canResolveGate = selectedRun?.status === "active" && runtime.status === "connected" && conn !== null;
   const connectionNotice = orchestrationConnectionNotice(
     runtime.status,
     runtime.lastError,
@@ -542,6 +542,20 @@ export default function OrchestrationScreen() {
     if (!conn.pauseOrchestrationAutomation(selectedRun.id)) {
       setBanner("无法暂停自动执行，请检查连接与 daemon 版本。");
     }
+  };
+
+  const resolveGate = (gateId: string, decision: string): void => {
+    if (!conn || runtime.status !== "connected") {
+      setBanner("连接电脑后才能处理 Gate。");
+      return;
+    }
+    conn.resolveOrchestrationGate(gateId, decision);
+  };
+
+  const focusGateTask = (taskId: string): void => {
+    setTaskView("graph");
+    setSelectedTopologyTaskId(taskId);
+    setEditor(null);
   };
 
   const inspectWorktree = (asset: OrchestrationWorktreeAsset): void => {
@@ -1152,14 +1166,16 @@ export default function OrchestrationScreen() {
                     {runStatusLabel[selectedRun.status]}
                   </Text>
                   <Text style={styles.revisionBadge}>r{selectedRun.graphRevision ?? 0}</Text>
-                  {pendingGates.length > 0 && (
-                    <Text style={[styles.badge, styles.gateBadge]}>{pendingGates.length} 个 Gate</Text>
-                  )}
+                  {selectedRunState?.pendingGateCount ? (
+                    <Text style={[styles.badge, styles.gateBadge]}>
+                      {selectedRunState.pendingGateCount} 个 Gate
+                    </Text>
+                  ) : null}
                 </View>
                 <Text style={styles.runObjective}>{selectedRun.objective}</Text>
               </View>
               {((manualRun && canMutate && selectedRun.status === "active") ||
-                canManage ||
+                (canManage && selectedRun.status === "active") ||
                 (canManageRunLifecycle && selectedRun.status === "active")) && (
                 <View style={styles.runHeaderActions}>
                   {manualRun && canMutate && canAutomate && selectedRun.status === "active" && (
@@ -1207,7 +1223,7 @@ export default function OrchestrationScreen() {
                       </Pressable>
                     </View>
                   )}
-                  {canManage && (
+                  {canManage && selectedRun.status === "active" && (
                     <Pressable
                       style={styles.deleteRunAction}
                       onPress={confirmDeleteRun}
@@ -1219,6 +1235,139 @@ export default function OrchestrationScreen() {
                 </View>
               )}
             </View>
+
+            {selectedRunState && (
+              <View
+                style={styles.runCurrentState}
+                accessibilityLiveRegion="polite"
+              >
+                <View style={styles.runCurrentTop}>
+                  <Text style={styles.runCurrentTitle}>
+                    {`进度 ${String(selectedRunState.done)}/${String(selectedRunState.total)} 已完成`}
+                  </Text>
+                  <View style={styles.runCurrentStats}>
+                    {selectedRunState.running > 0 && (
+                      <Text style={styles.runCurrentStat}>{`${String(selectedRunState.running)} 运行中`}</Text>
+                    )}
+                    {selectedRunState.ready > 0 && (
+                      <Text style={styles.runCurrentStat}>{`${String(selectedRunState.ready)} Ready`}</Text>
+                    )}
+                    {selectedRunState.failed > 0 && (
+                      <Text style={[styles.runCurrentStat, styles.runCurrentStatDanger]}>
+                        {`${String(selectedRunState.failed)} 失败`}
+                      </Text>
+                    )}
+                    {selectedRunState.blocked > 0 && (
+                      <Text style={styles.runCurrentStat}>{`${String(selectedRunState.blocked)} 阻塞`}</Text>
+                    )}
+                    {selectedRunState.pendingGateCount > 0 && (
+                      <Text style={[styles.runCurrentStat, styles.runCurrentStatWarning]}>
+                        {`${String(selectedRunState.pendingGateCount)} Gate`}
+                      </Text>
+                    )}
+                  </View>
+                </View>
+                <Text style={styles.runCurrentGuide}>{selectedRunState.guide.text}</Text>
+                {selectedRunState.guide.kind === "gate" && selectedRunState.guide.taskId &&
+                  tasks.some((task) => task.id === selectedRunState.guide.taskId) && (
+                  <Pressable
+                    style={({ pressed }) => [
+                      styles.runCurrentTaskLink,
+                      pressed && styles.runCurrentTaskLinkPressed,
+                    ]}
+                    onPress={() => focusGateTask(selectedRunState.guide.taskId!)}
+                    accessibilityRole="button"
+                    accessibilityLabel={`在拓扑中定位 Gate 关联任务：${tasks.find((task) => task.id === selectedRunState.guide.taskId)?.title ?? selectedRunState.guide.taskId}`}
+                    accessibilityState={{ disabled: false }}
+                  >
+                    <Icon name="point.3.connected.trianglepath.dotted" size={13} color={color.accent} />
+                    <Text style={styles.runCurrentTaskLinkText}>定位关联任务</Text>
+                  </Pressable>
+                )}
+              </View>
+            )}
+
+            {pendingGates.length > 0 && (
+              <View style={styles.inlineGates}>
+                <Text style={styles.inlineGatesTitle}>待处理 Gate</Text>
+                {pendingGates.map((gate) => {
+                  const task = gate.taskId ? tasks.find((candidate) => candidate.id === gate.taskId) : null;
+                  const decision = otherGateDecisions[gate.id] ?? "";
+                  return (
+                    <View key={gate.id} style={styles.inlineGateCard}>
+                      <Text style={styles.inlineGateQuestion}>{gate.question}</Text>
+                      {task && (
+                        <Pressable
+                          style={({ pressed }) => [
+                            styles.inlineGateTaskLink,
+                            pressed && styles.inlineGateTaskLinkPressed,
+                          ]}
+                          onPress={() => focusGateTask(task.id)}
+                          accessibilityRole="button"
+                          accessibilityLabel={`在拓扑中定位 Gate 关联任务：${task.title}`}
+                          accessibilityState={{ disabled: false }}
+                        >
+                          <Icon name="point.3.connected.trianglepath.dotted" size={13} color={color.accent} />
+                          <Text style={styles.inlineGateTaskLinkText}>{`定位任务：${task.title}`}</Text>
+                        </Pressable>
+                      )}
+                      {gate.options.length > 0 ? (
+                        <View style={styles.inlineGateOptions}>
+                          {gate.options.map((option) => (
+                            <Pressable
+                              key={`${gate.id}-${option}`}
+                              disabled={!canResolveGate}
+                              style={({ pressed }) => [
+                                styles.inlineGateOption,
+                                !canResolveGate && styles.disabled,
+                                pressed && canResolveGate && styles.inlineGateOptionPressed,
+                              ]}
+                              onPress={() => resolveGate(gate.id, option)}
+                              accessibilityRole="button"
+                              accessibilityLabel={`回答 Gate：${option}`}
+                              accessibilityState={{ disabled: !canResolveGate }}
+                            >
+                              <Text style={styles.inlineGateOptionText}>{option}</Text>
+                            </Pressable>
+                          ))}
+                        </View>
+                      ) : (
+                        <View style={styles.inlineGateOtherRow}>
+                          <TextInput
+                            value={decision}
+                            onChangeText={(value) =>
+                              setOtherGateDecisions((current) => ({ ...current, [gate.id]: value }))
+                            }
+                            style={styles.inlineGateOtherInput}
+                            placeholder="输入决定"
+                            placeholderTextColor={color.textFaint}
+                            selectionColor={color.accent}
+                            editable={canResolveGate}
+                            accessibilityLabel="输入 Gate 决定"
+                          />
+                          <Pressable
+                            disabled={!canResolveGate || decision.trim().length === 0}
+                            style={({ pressed }) => [
+                              styles.inlineGateConfirm,
+                              (!canResolveGate || decision.trim().length === 0) && styles.disabled,
+                              pressed && canResolveGate && styles.inlineGateConfirmPressed,
+                            ]}
+                            onPress={() => resolveGate(gate.id, decision.trim())}
+                            accessibilityRole="button"
+                            accessibilityLabel="确认 Gate 决定"
+                            accessibilityState={{
+                              disabled: !canResolveGate || decision.trim().length === 0,
+                            }}
+                          >
+                            <Text style={styles.inlineGateConfirmText}>确认</Text>
+                          </Pressable>
+                        </View>
+                      )}
+                    </View>
+                  );
+                })}
+              </View>
+            )}
 
             {selectedRun.automation && (
               <View style={styles.automationStatus}>
@@ -1251,11 +1400,13 @@ export default function OrchestrationScreen() {
               />
             )}
 
-            {!manualRun && (
-              <Text style={styles.coordinatorNote}>
-                此 Run 由协调者会话维护任务图；你仍可查看 worker，并在主机页处理 Gate。
-              </Text>
-            )}
+            <Text style={styles.coordinatorNote}>
+              {selectedRun.status !== "active"
+                ? "此 Run 已结束，只读。"
+                : manualRun
+                  ? "此 Run 由你手工派发；可编辑任务图并派发 Ready 任务。"
+                  : "此 Run 由协调者派发并维护任务图；可在当前页查看 worker 和处理 Gate。"}
+            </Text>
 
             {tasks.length > 0 && (
               <View style={styles.viewSwitch}>
@@ -1546,7 +1697,7 @@ export default function OrchestrationScreen() {
                 ? tasks
                 : tasks.filter((task) => task.id === activeTopologyTaskId)
               ).map((task) => {
-                const ready = isTaskReady(task, tasks);
+                const ready = selectedRunState?.readyTaskIds.has(task.id) ?? false;
                 const dependencyNames = task.deps
                   .map((id) => tasks.find((candidate) => candidate.id === id)?.title ?? id)
                   .join("、");
@@ -2129,6 +2280,98 @@ const styles = StyleSheet.create({
     paddingVertical: 3,
   },
   runObjective: { color: color.text, fontSize: 20, lineHeight: 27, fontWeight: "700" },
+  runCurrentState: {
+    gap: space.sm,
+    padding: space.md,
+    borderRadius: radius.md,
+    backgroundColor: color.surfaceRaised,
+  },
+  runCurrentTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: space.sm },
+  runCurrentTitle: { color: color.text, fontSize: 13, fontWeight: "800" },
+  runCurrentStats: { flexDirection: "row", flexWrap: "wrap", justifyContent: "flex-end", gap: 5 },
+  runCurrentStat: {
+    overflow: "hidden",
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 8,
+    color: color.textDim,
+    backgroundColor: color.surface,
+    fontSize: 10,
+    fontWeight: "700",
+  },
+  runCurrentStatDanger: { color: color.danger, backgroundColor: color.dangerBg },
+  runCurrentStatWarning: { color: color.warn, backgroundColor: color.warnBg },
+  runCurrentGuide: { color: color.textDim, fontSize: 12, lineHeight: 18 },
+  runCurrentTaskLink: {
+    alignSelf: "flex-start",
+    minHeight: ORCHESTRATION_ACTION_MIN_HIT_TARGET,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: space.md,
+    borderRadius: radius.sm,
+    backgroundColor: color.accentBg,
+  },
+  runCurrentTaskLinkPressed: { backgroundColor: color.pressed },
+  runCurrentTaskLinkText: { color: color.accent, fontSize: 12, fontWeight: "700" },
+  inlineGates: {
+    gap: space.sm,
+    padding: space.md,
+    borderRadius: radius.md,
+    backgroundColor: color.warnBg,
+  },
+  inlineGatesTitle: { color: color.warn, fontSize: 13, fontWeight: "800" },
+  inlineGateCard: {
+    gap: space.sm,
+    padding: space.md,
+    borderRadius: radius.sm,
+    backgroundColor: color.surface,
+  },
+  inlineGateQuestion: { color: color.text, fontSize: 13, lineHeight: 19, fontWeight: "700" },
+  inlineGateTaskLink: {
+    alignSelf: "flex-start",
+    minHeight: ORCHESTRATION_ACTION_MIN_HIT_TARGET,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: space.md,
+    borderRadius: radius.sm,
+    backgroundColor: color.accentBg,
+  },
+  inlineGateTaskLinkPressed: { backgroundColor: color.pressed },
+  inlineGateTaskLinkText: { color: color.accent, fontSize: 12, fontWeight: "700" },
+  inlineGateOptions: { flexDirection: "row", flexWrap: "wrap", gap: space.sm },
+  inlineGateOption: {
+    minHeight: ORCHESTRATION_ACTION_MIN_HIT_TARGET,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: space.md,
+    borderRadius: radius.sm,
+    backgroundColor: color.accentDim,
+  },
+  inlineGateOptionPressed: { backgroundColor: color.pressed },
+  inlineGateOptionText: { color: color.accent, fontSize: 12, fontWeight: "800" },
+  inlineGateOtherRow: { flexDirection: "row", gap: space.sm },
+  inlineGateOtherInput: {
+    flex: 1,
+    minHeight: ORCHESTRATION_ACTION_MIN_HIT_TARGET,
+    paddingHorizontal: space.md,
+    borderRadius: radius.sm,
+    color: color.text,
+    backgroundColor: color.surfaceRaised,
+    fontSize: 13,
+  },
+  inlineGateConfirm: {
+    minWidth: ORCHESTRATION_ACTION_MIN_HIT_TARGET,
+    minHeight: ORCHESTRATION_ACTION_MIN_HIT_TARGET,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: space.md,
+    borderRadius: radius.sm,
+    backgroundColor: color.accent,
+  },
+  inlineGateConfirmPressed: { opacity: 0.82 },
+  inlineGateConfirmText: { color: "#08101F", fontSize: 12, fontWeight: "800" },
   automationStatus: {
     gap: 5,
     padding: space.md,
