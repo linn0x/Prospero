@@ -188,6 +188,60 @@ describe("编排工作树资产检查与清理", () => {
     expect(git(repo, ["branch", "--list", "prospero/cleanup"])).toBe("prospero/cleanup");
   });
 
+  it("cleanup 拒绝仍由 live settled session 使用的工作树，并记录后续处理原因", async () => {
+    const { repo, assets } = repository();
+    const store = new OrchestrationStore();
+    const run = store.createRun({ objective: "live settled worker" });
+    const task = store.createTask({ runId: run.id, title: "实现", spec: "" });
+    const created = await createEsaytree({
+      repo,
+      name: "live-settled",
+      at: path.join(assets, "live-settled"),
+      branch: "prospero/live-settled",
+      cloneIgnored: false,
+    });
+    const asset = store.registerWorktreeAsset({
+      kind: "worker",
+      runId: run.id,
+      taskId: task.id,
+      repo,
+      path: created.path,
+      branch: created.branch,
+    });
+    const dispatch = store.createDispatch({
+      taskId: task.id,
+      sessionId: "settled-but-live",
+      worktreePath: created.path,
+    });
+    store.linkWorktreeAssetDispatch(asset.id, dispatch.id);
+    store.setTaskStatus(task.id, "done", "已交付");
+    store.setDispatchState(dispatch.id, "succeeded", "已交付");
+    const sessions = {
+      infoOf() {
+        return {
+          id: "settled-but-live",
+          agent: "codex" as const,
+          kind: "structured" as const,
+          title: "worker",
+          cwd: created.path,
+          status: "running" as const,
+          createdAt: 1,
+          cols: 80,
+          rows: 24,
+        };
+      },
+    };
+    const service = new WorktreeAssetService(store, undefined, sessions);
+
+    await expect(service.cleanup({ assetId: asset.id, targetRef: "main", confirm: true }))
+      .rejects.toMatchObject({ code: "worktree_not_cleanable" } satisfies Partial<WorktreeAssetError>);
+    expect(readFileSync(path.join(created.path, "tracked.txt"), "utf8")).toBe("base\n");
+    expect(store.getWorktreeAsset(asset.id)).toMatchObject({
+      state: "preserved",
+      lastError: expect.stringContaining("settled-but-live"),
+    });
+  });
+
   it("Run 删除后不删除或失联资产，并拒绝清理未合并补丁", async () => {
     const { repo, assets } = repository();
     const store = new OrchestrationStore();
@@ -216,6 +270,21 @@ describe("编排工作树资产检查与清理", () => {
     const store = new OrchestrationStore();
     const run = store.createRun({ objective: "worker 登记" });
     const task = store.createTask({ runId: run.id, title: "实现", spec: "实现" });
+    const oldTask = store.createTask({ runId: run.id, title: "旧 writer", spec: "" });
+    const oldDispatch = store.createDispatch({
+      taskId: oldTask.id,
+      sessionId: "old-live-session",
+      worktreePath: repo,
+    });
+    const oldAsset = store.registerWorktreeAsset({
+      kind: "worker",
+      runId: run.id,
+      taskId: oldTask.id,
+      repo,
+      path: repo,
+      branch: "main",
+    });
+    store.linkWorktreeAssetDispatch(oldAsset.id, oldDispatch.id);
     const sessions: WorkerSessionManager = {
       async create(input) {
         return {
@@ -233,6 +302,20 @@ describe("编排工作树资产检查与清理", () => {
       async chatSend() {},
       requirePty() { return { writeInput() {} }; },
       async kill() {},
+      infoOf(sid) {
+        if (sid !== "old-live-session") throw new Error("not used");
+        return {
+          id: sid,
+          agent: "codex",
+          kind: "structured",
+          title: "old worker",
+          cwd: repo,
+          status: "running",
+          createdAt: 1,
+          cols: 80,
+          rows: 24,
+        };
+      },
     };
 
     const started = await new DispatchService(store, sessions).startWorker({
@@ -252,6 +335,8 @@ describe("编排工作树资产检查与清理", () => {
       branch: expect.stringMatching(new RegExp(`^prospero/${run.id}/${task.id}/`)),
       state: "active",
     });
+    // `new` 创建独立目录，不复用旧 writer 的 cwd，因此不应被 none 模式的租约挡住。
+    expect(started.worktree?.path).not.toBe(repo);
   });
 
   it("deleteBranch 在检查后分支被推进时保留新提交并报告 warning", async () => {
@@ -291,6 +376,7 @@ describe("编排工作树资产检查与清理", () => {
       async chatSend() { throw new Error("not reached"); },
       requirePty() { throw new Error("not reached"); },
       async kill() {},
+      infoOf() { throw new Error("not used"); },
     };
     await expect(new DispatchService(createStore, createFails).startWorker({
       taskId: createTask.id, agent: "codex", worktree: "new", cwd: repo,
@@ -323,6 +409,7 @@ describe("编排工作树资产检查与清理", () => {
       async chatSend() { throw new Error("chatSend failed"); },
       requirePty() { throw new Error("not reached"); },
       async kill() {},
+      infoOf() { throw new Error("not used"); },
     };
     await expect(new DispatchService(chatStore, chatFails).startWorker({
       taskId: chatTask.id, agent: "codex", worktree: "new", cwd: repo,
@@ -475,6 +562,7 @@ describe("资产持久化迁移与控制 API", () => {
       async chatSend() { throw new Error("not used"); },
       requirePty() { throw new Error("not used"); },
       async kill() {},
+      infoOf() { throw new Error("not used"); },
     };
     const api = orchestrationControlApi(
       store,

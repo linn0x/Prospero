@@ -10,6 +10,7 @@ const unusedSessions: WorkerSessionManager = {
   async chatSend() { throw new Error("not used"); },
   requirePty() { throw new Error("not used"); },
   async kill() {},
+  infoOf() { throw new Error("not used"); },
 };
 
 describe("控制 API 的交付报告", () => {
@@ -216,6 +217,43 @@ describe("控制 API 的幂等与任务图事务", () => {
 
     expect(retry).toEqual(first);
     expect(store.listRuns()).toEqual([]);
+  });
+
+  it("run.delete 拒绝仍活着的已交付 worker，避免随后 cleanup 失去 session 索引", async () => {
+    const store = new OrchestrationStore();
+    const run = store.createRun({ objective: "保留 live settled worker" });
+    const task = store.createTask({ runId: run.id, title: "实现", spec: "" });
+    const dispatch = store.createDispatch({ taskId: task.id, sessionId: "live-worker" });
+    store.setTaskStatus(task.id, "done", "已交付");
+    store.setDispatchState(dispatch.id, "succeeded", "已交付");
+    const sessions: WorkerSessionManager = {
+      ...unusedSessions,
+      infoOf() {
+        return {
+          id: "live-worker",
+          agent: "codex",
+          kind: "structured",
+          title: "worker",
+          cwd: "/tmp/live-worker",
+          status: "running",
+          createdAt: 1,
+          cols: 80,
+          rows: 24,
+        };
+      },
+    };
+    const api = orchestrationControlApi(
+      store,
+      new DispatchService(store, sessions),
+      new CollaborationService(store),
+    );
+
+    await expect(api("run.delete", {
+      runId: run.id,
+      operationId: "delete-live-settled",
+      actorSessionId: null,
+    }, new AbortController().signal)).rejects.toMatchObject({ code: "worker_session_live" });
+    expect(store.getRun(run.id).status).toBe("active");
   });
 
   it("普通 worker 不能删除宿主创建的手工 Run", async () => {
