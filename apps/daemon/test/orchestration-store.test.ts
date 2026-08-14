@@ -76,6 +76,38 @@ describe("Run 与 Task", () => {
       .toThrow(/历史编排只读/);
   });
 
+  it("自动完成仍会校验运行态和活动 Dispatch，并原子收口 automation", () => {
+    const { store, runId } = seed();
+    const task = store.createTask({ runId, title: "A", spec: "做 A" });
+    const dispatch = store.createDispatch({ taskId: task.id, sessionId: "worker" });
+    store.setTaskStatus(task.id, "done", "已验收");
+    store.setRunAutomation(runId, {
+      state: "running",
+      agent: "codex",
+      approvalPolicy: "standard",
+      workspace: "current",
+      cwd: "/tmp/project",
+      workspacePath: "/tmp/project",
+      branch: null,
+      startedAt: 1,
+      updatedAt: 1,
+      lastError: null,
+    });
+
+    expect(() => store.completeRun(runId)).toThrow(/自动执行仍在运行/);
+    expect(() => store.completeRun(runId, { fromAutomation: true })).toThrow(/仍在运行/);
+    expect(store.getRun(runId)).toMatchObject({
+      status: "active",
+      automation: { state: "running" },
+    });
+
+    store.setDispatchState(dispatch.id, "succeeded", "已验收");
+    expect(store.completeRun(runId, { fromAutomation: true })).toMatchObject({
+      status: "completed",
+      automation: { state: "completed", lastError: null },
+    });
+  });
+
   it("放弃 Run 会关闭未执行任务和 Gate，且历史状态不可再编辑", () => {
     const { store, runId } = seed();
     const task = store.createTask({ runId, title: "待办", spec: "不再执行" });
@@ -86,6 +118,21 @@ describe("Run 与 Task", () => {
     expect(store.getGate(gate.id)).toMatchObject({ status: "cancelled" });
     expect(store.abandonRun(runId)).toMatchObject({ status: "abandoned" });
     expect(() => store.setTaskDeps(task.id, [])).toThrow(/历史编排只读/);
+  });
+
+  it("Run 生命周期只能由专用入口转换，completed 和 abandoned 不能彼此改写", () => {
+    const { store, runId } = seed();
+    expect(() => store.updateRun(runId, { status: "completed" } as never))
+      .toThrow(/只能通过完成或放弃入口/);
+    expect(store.getRun(runId).status).toBe("active");
+    const completed = store.completeRun(runId);
+    expect(completed.status).toBe("completed");
+    expect(() => store.updateRun(runId, { objective: "不应编辑" })).toThrow(/历史编排只读/);
+    expect(() => store.abandonRun(runId)).toThrow(/不能放弃/);
+
+    const abandoned = store.createRun({ objective: "不做了" });
+    expect(store.abandonRun(abandoned.id).status).toBe("abandoned");
+    expect(() => store.completeRun(abandoned.id)).toThrow(/不能标记完成/);
   });
 
   it("仍有 worker 时拒绝放弃 Run", () => {
