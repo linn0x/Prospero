@@ -9,6 +9,10 @@ import {
   SUPPORTED_PAIRING_FORMAT_VERSIONS,
 } from "./messages.js";
 import { PairingPayloadSchema, type PairingPayload } from "./schemas.js";
+import {
+  validateRelayUrl,
+  type RelayUrlValidationOptions,
+} from "./relay.js";
 import { utf8Decode, utf8Encode } from "./utf8.js";
 
 const PREFIX = "prospero://pair?d=";
@@ -18,12 +22,23 @@ export function hostIdForDaemonPublicKey(publicKey: string): string {
   return publicKey.slice(0, 16).replace(/[^a-zA-Z0-9]/g, "");
 }
 
-export function encodePairingQR(payload: PairingPayload): string {
+/**
+ * Encode a pairing QR. Production callers use the default wss-only policy;
+ * a ws://loopback relay requires an explicit development opt-in.
+ */
+export function encodePairingQR(
+  payload: PairingPayload,
+  relayUrlOptions: RelayUrlValidationOptions = {},
+): string {
   const p = PairingPayloadSchema.parse(payload);
+  if (p.relay !== undefined) validateRelayUrl(p.relay.url, relayUrlOptions);
   return PREFIX + toB64Url(utf8Encode(JSON.stringify(p)));
 }
 
-export function decodePairingQR(text: string): PairingPayload {
+export function decodePairingQR(
+  text: string,
+  relayUrlOptions: RelayUrlValidationOptions = {},
+): PairingPayload {
   if (!text.startsWith(PREFIX)) {
     throw new ProtocolError("not a Prospero pairing QR", "format");
   }
@@ -42,6 +57,9 @@ export function decodePairingQR(text: string): PairingPayload {
       `pairing payload version ${parsed.data.v} not supported (supported ${SUPPORTED_PAIRING_FORMAT_VERSIONS.join(",")})`,
       "version",
     );
+  }
+  if (parsed.data.relay !== undefined) {
+    validateRelayUrl(parsed.data.relay.url, relayUrlOptions);
   }
   return parsed.data;
 }

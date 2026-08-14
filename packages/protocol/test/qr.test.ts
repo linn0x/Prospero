@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { z } from "zod";
 import {
   PAIRING_FORMAT_VERSION,
   ProtocolError,
@@ -17,6 +18,16 @@ function makePayload(v = PAIRING_FORMAT_VERSION): PairingPayload {
     port: 7423,
     token: "0123456789abcdef",
     pubKey: generateKeyPairB64().publicKey,
+  };
+}
+
+function relay() {
+  return {
+    v: 1 as const,
+    url: "wss://relay.example.com/v1",
+    routeId: "route_0123456789",
+    deviceId: "device_0123456789",
+    token: "ticket_0123456789",
   };
 }
 
@@ -54,6 +65,41 @@ describe("pairing QR", () => {
 
   it("接受形状相同的 v5 旧二维码，配对格式不再跟 API 版本一起升级", () => {
     expect(decodePairingQR(encodePairingQR(makePayload(5))).v).toBe(5);
+  });
+
+  it("v7 QR 可带 relay，旧 v7 形状会忽略未知 relay 字段", () => {
+    const decoded = decodePairingQR(encodePairingQR({ ...makePayload(7), relay: relay() }));
+    const legacyV7Shape = z.object({
+      v: z.literal(7),
+      name: z.string(),
+      addrs: z.array(z.string()).min(1),
+      port: z.number(),
+      token: z.string(),
+      pubKey: z.string(),
+    });
+    const legacyParsed = legacyV7Shape.parse(decoded);
+    expect(decoded.relay).toEqual(relay());
+    expect(legacyParsed).not.toHaveProperty("relay");
+  });
+
+  it("允许 relay-only QR，但没有 direct 和 relay 的 QR 无效", () => {
+    const relayOnly = { ...makePayload(), addrs: [], relay: relay() };
+    expect(decodePairingQR(encodePairingQR(relayOnly))).toEqual(relayOnly);
+    expect(() => encodePairingQR({ ...makePayload(), addrs: [] })).toThrowError(/direct address or relay/);
+  });
+
+  it("ws relay 只允许显式 loopback 开发模式，且 token 不会进 URL query", () => {
+    const devRelay = { ...relay(), url: "ws://127.0.0.1:8787" };
+    expect(() => encodePairingQR({ ...makePayload(), relay: devRelay })).toThrowError(/must use wss/);
+    const qr = encodePairingQR(
+      { ...makePayload(), relay: devRelay },
+      { allowInsecureLoopback: true },
+    );
+    expect(() => decodePairingQR(qr)).toThrowError(/must use wss/);
+    expect(decodePairingQR(qr, { allowInsecureLoopback: true }).relay?.url).toBe(devRelay.url);
+    expect(() =>
+      encodePairingQR({ ...makePayload(), relay: { ...relay(), url: "wss://relay.example.com?token=x" } }),
+    ).toThrowError(/must not contain credentials, query, or fragment/);
   });
 
   it("拒绝损坏的载荷", () => {

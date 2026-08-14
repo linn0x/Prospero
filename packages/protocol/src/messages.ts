@@ -17,8 +17,8 @@
  * 尝试，daemon 接受同一兼容窗口内的版本。这样 iOS 与 Mac 可以滚动升级，
  * 配对 token 和双方身份密钥都无需轮换。
  */
-export const PROTOCOL_VERSION = 12;
-export const SUPPORTED_PROTOCOL_VERSIONS = [12, 11, 10, 9, 8, 7, 5] as const;
+export const PROTOCOL_VERSION = 13;
+export const SUPPORTED_PROTOCOL_VERSIONS = [13, 12, 11, 10, 9, 8, 7, 5] as const;
 export const MIN_PROTOCOL_VERSION = 5;
 
 /** 加密握手格式。只有密码学帧真的不兼容时才升级。 */
@@ -67,6 +67,7 @@ export type {
   HostInfo,
   PermissionReply,
   C2SHello,
+  C2SConnectionPing,
   C2SSessionCreate,
   C2SOrchestrationSnapshot,
   C2SOrchestrationGateResolve,
@@ -150,6 +151,7 @@ export type {
   AgentSubagentUpdated,
   AgentTurnEnd,
   S2CHelloOk,
+  S2CConnectionPong,
   S2CSessionState,
   S2CTermSnapshot,
   S2CTermOutput,

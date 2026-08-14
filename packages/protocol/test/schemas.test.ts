@@ -15,6 +15,10 @@ describe("message schemas", () => {
     expect(
       parseC2S({ type: "session.attach", sid: "abc", lastSeq: 42 }),
     ).toMatchObject({ lastSeq: 42 });
+    expect(parseC2S({ type: "connection.ping", id: "ping-1" })).toEqual({
+      type: "connection.ping",
+      id: "ping-1",
+    });
     expect(parseC2S({ type: "workspace.list", path: "Projects/prospero" })).toMatchObject({
       path: "Projects/prospero",
     });
@@ -66,6 +70,10 @@ describe("message schemas", () => {
         entries: [{ name: "Prospero", kind: "dir", size: 0, mtime: 1 }],
       }),
     ).toMatchObject({ type: "workspace.listing", cwd: "/Users/me/Projects" });
+    expect(parseS2C({ type: "connection.pong", id: "ping-1" })).toEqual({
+      type: "connection.pong",
+      id: "ping-1",
+    });
     expect(
       parseS2C({
         type: "chat.attachment.chunk",
@@ -100,5 +108,18 @@ describe("message schemas", () => {
     expect(PairingPayloadSchema.safeParse({ ...good, addrs: [] }).success).toBe(
       false,
     );
+    expect(
+      PairingPayloadSchema.safeParse({
+        ...good,
+        addrs: [],
+        relay: {
+          v: 1,
+          url: "wss://relay.example.com/v1",
+          routeId: "route_0123456789",
+          deviceId: "device_0123456789",
+          token: "ticket_0123456789",
+        },
+      }).success,
+    ).toBe(true);
   });
 });
