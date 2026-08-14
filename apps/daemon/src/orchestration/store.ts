@@ -106,6 +106,7 @@ export class OrchestrationStore {
         for (const run of Object.values(runs)) {
           run.graphRevision = Number.isInteger(run.graphRevision) ? run.graphRevision : 0;
           run.automation ??= null;
+          run.coordinatorPrompt ??= null;
         }
         this.state = {
           version: 1,
@@ -164,7 +165,12 @@ export class OrchestrationStore {
 
   // ── Run ───────────────────────────────────────────────────────────────
 
-  createRun(input: { objective: string; coordinatorSessionId?: string | null }): Run {
+  createRun(input: {
+    objective: string;
+    coordinatorSessionId?: string | null;
+    /** Goal 的协调者首提示在 Run 落盘时一并登记，投递失败才能安全恢复。 */
+    coordinatorPrompt?: boolean;
+  }): Run {
     const now = Date.now();
     const run: Run = {
       id: id("run"),
@@ -173,6 +179,9 @@ export class OrchestrationStore {
       coordinatorSessionId: input.coordinatorSessionId ?? null,
       graphRevision: 0,
       automation: null,
+      coordinatorPrompt: input.coordinatorPrompt
+        ? { state: "pending", attempts: 0, lastError: null, updatedAt: now }
+        : null,
       createdAt: now,
       updatedAt: now,
     };
@@ -329,6 +338,51 @@ export class OrchestrationStore {
     const run = this.requireActiveRun(runId);
     run.automation = automation;
     run.updatedAt = Date.now();
+    this.schedulePersist();
+    return run;
+  }
+
+  /** 所有尚未成功投递 Goal 首提示的活跃 Run。 */
+  pendingCoordinatorPrompts(): Run[] {
+    return this.listRuns().filter(
+      (run) => run.status === "active" && run.coordinatorPrompt?.state === "pending",
+    );
+  }
+
+  /** 发送前先把尝试次数落盘；崩在发送确认之间时宁可重投，也不能永久丢提示。 */
+  recordCoordinatorPromptAttempt(runId: string): Run {
+    const run = this.requireActiveRun(runId);
+    const prompt = run.coordinatorPrompt;
+    if (!prompt || prompt.state === "delivered") return run;
+    run.coordinatorPrompt = {
+      ...prompt,
+      attempts: prompt.attempts + 1,
+      lastError: null,
+      updatedAt: Date.now(),
+    };
+    run.updatedAt = run.coordinatorPrompt.updatedAt;
+    this.schedulePersist();
+    return run;
+  }
+
+  markCoordinatorPromptDelivered(runId: string): Run {
+    const run = this.getRun(runId);
+    const prompt = run.coordinatorPrompt;
+    if (!prompt || prompt.state === "delivered") return run;
+    const now = Date.now();
+    run.coordinatorPrompt = { ...prompt, state: "delivered", lastError: null, updatedAt: now };
+    run.updatedAt = now;
+    this.schedulePersist();
+    return run;
+  }
+
+  markCoordinatorPromptFailed(runId: string, error: string): Run {
+    const run = this.getRun(runId);
+    const prompt = run.coordinatorPrompt;
+    if (!prompt || prompt.state === "delivered") return run;
+    const now = Date.now();
+    run.coordinatorPrompt = { ...prompt, state: "pending", lastError: error, updatedAt: now };
+    run.updatedAt = now;
     this.schedulePersist();
     return run;
   }
@@ -538,6 +592,7 @@ export class OrchestrationStore {
       coordinatorSessionId: input.coordinatorSessionId ?? null,
       graphRevision: 1,
       automation: null,
+      coordinatorPrompt: null,
       createdAt: now,
       updatedAt: now,
     };
@@ -895,6 +950,44 @@ export class OrchestrationStore {
     }
     this.schedulePersist();
     return dispatch;
+  }
+
+  /**
+   * daemon 恢复时发现 worker 会话不存在或已经终态的单次收敛写入。
+   *
+   * Dispatch 与 Task 共用同一份状态快照；在调用观察者和安排落盘前一起修改，
+   * 避免手机或自动编排看见“已 abandoned 但 task 还 dispatched”的中间态。
+   * 已有显式 done/failed 的极窄崩溃窗口则保留交付事实，只补齐 Dispatch 历史。
+   */
+  abandonActiveDispatchForMissingSession(
+    dispatchId: string,
+    reason: string,
+  ): { task: Task; dispatch: Dispatch } | null {
+    const dispatch = this.getDispatch(dispatchId);
+    if (dispatch.state !== "starting" && dispatch.state !== "running") return null;
+    const task = this.getTask(dispatch.taskId);
+    const now = Date.now();
+
+    if (task.status === "done") {
+      dispatch.state = "succeeded";
+      dispatch.outcome = task.result ?? "worker 已显式交付";
+    } else if (task.status === "failed") {
+      dispatch.state = "failed";
+      dispatch.outcome = task.result ?? reason;
+    } else {
+      dispatch.state = "abandoned";
+      dispatch.outcome = reason;
+      // 正常不变量下 active Dispatch 一定对应 dispatched；仍用防御性赋值扛住
+      // 旧版本在两次写入之间崩溃留下的半截快照。
+      if (task.status !== "cancelled") {
+        task.status = "failed";
+        task.result = reason;
+        task.updatedAt = now;
+      }
+    }
+    dispatch.settledAt = now;
+    this.schedulePersist();
+    return { task, dispatch };
   }
 
   // ── Message ───────────────────────────────────────────────────────────
