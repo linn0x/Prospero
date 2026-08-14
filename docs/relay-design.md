@@ -6,6 +6,24 @@ account, identity provider, message broker, or trusted endpoint. There are no
 relay accounts: the host creates an opaque route and a device scans the same
 pairing QR in person. The QR remains the out-of-band trust ceremony.
 
+## Release status and qualification boundary
+
+Release `0.0.13` supplies source, Compose/Caddy deployment artifacts, migrations,
+operational runbook, security audit, fault harness, and cross-platform QA
+evidence. It does **not** assert that any public relay has been deployed or
+that a public DNS/TLS/WSS endpoint was tested. Operators must perform that
+deployment verification in their own environment before enabling it for users.
+
+T8 capacity acceptance is explicitly **inconclusive/waived**, not a capacity
+pass. The available 10-vCPU/11.7-GiB Docker host (below the 16-GiB requirement)
+passed the highest stable execution tier of 2,500 host controls / 500 active
+stream pairs / 60 seconds, but the 5,000 / 1,000 / 60-second execution had 174
+unexpected disconnects and incomplete drain callbacks. Therefore there is no
+successful 5,000 / 1,000 / 600-second qualification, 16-GiB qualification,
+same-environment direct RTT baseline, or public DNS TLS/WSS validation. The
+waiver accepts the degraded evidence only; its reports are
+`apps/relay/reports/t8-acceptance-summary.json` and `t8-local-failure.json`.
+
 ## Security boundary
 
 The relay sees only the route selector, device ID, limited relay ticket,
@@ -219,3 +237,14 @@ They are ordinary SecureChannel application frames, never relay controls or
 WebSocket ping frames. The supported application-version fallback list remains
 `[13, 12, 11, 10, 9, 8, 7, 5]`; versions v8 and later authenticate the negotiated
 application version in the daemon identity proof.
+
+## Compatibility matrix
+
+| Producer or consumer | Relay-aware behavior | Compatible fallback / operator action |
+| --- | --- | --- |
+| Prospero `0.0.13` daemon + mobile | Application v13, QR v7 optional relay extension, relay v1 control/data planes | `auto` races direct and relay; `direct` and `relay` can be selected explicitly. |
+| Existing application peers | v13 offers protocol fallback `[13,12,11,10,9,8,7,5]` | E2E direct compatibility is unchanged; relay does not alter application frames. |
+| Existing QR v7 client | The optional `relay` object is unknown to an old client | It retains direct-address pairing behavior. |
+| QR v5 or pre-relay device record | No relay credential is present | Direct mode continues. Re-scan a newly minted QR to use relay; never synthesize a credential for an old record. |
+| Older daemon without relay commands | Cannot register `/v1/host` or mint relay credentials | Continue direct operation; upgrade daemon before enabling relay. |
+| `ws://` relay URL | Rejected in production | Only `--dev` loopback (`localhost`, `127.0.0.1`, or `::1`) is accepted for local development; production uses `wss://`. |

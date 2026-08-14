@@ -30,7 +30,7 @@ Prospero 把你的 iPhone 或 Android 手机变成 Mac 或 Windows 电脑上**�
 | ✅ | **关键时刻直接处理** — 在手机上回答 Agent 提问、批准或拒绝操作、追加指令、切换模型与模式，必要时立即停止任务 |
 | ⌨️ | **结构化体验，终端能力不丢失** — 已适配 Agent 使用原生交互；任意 CLI 都能通过完整 PTY/TUI 操控 |
 | 🗂️ | **连项目也能一起操作** — 浏览和编辑电脑上的文件，查看 Git 状态与 diff，完成 stage、commit 等常用操作 |
-| 🔐 | **无需把开发环境搬上云** — Agent 和项目留在本机，通过 LAN 或 WireGuard 直连；断线后自动恢复会话状态与增量输出 |
+| 🔐 | **无需把开发环境搬上云** — Agent 和项目留在本机；优先通过 LAN 或 WireGuard 直连，必要时可用自托管 relay 传输 E2E 密文 |
 | 🪄 | **从单个 Agent 到完整工作流** — 在手机上用 DAG 拆分任务、派发 worker、处理 Gate，并跟踪每个任务的显式交付状态 |
 | 🌳 | **并行任务互不干扰** — `esaytree` 为 Agent 创建安全、快速、可回滚的 Git worktree，保护主工作区 |
 
@@ -82,6 +82,28 @@ node apps/daemon/dist/cli.js pair --name my-phone
 
 用 Prospero App 扫描二维码，选择电脑上的项目与 Agent，即可创建会话。同一局域网可直接连接；
 离开局域网时，让手机与电脑加入同一个 WireGuard 或 Tailscale 私有网络。
+
+### 4. 可选：自托管 relay 与三种连接模式
+
+relay 让已配对手机在没有直连路径时抵达自己的 daemon；它只转发端到端加密数据，不能读取聊天、终端或文件内容。
+部署说明、备份恢复、升级和回滚见 [relay runbook](apps/relay/README.md)。先在 relay 主机按该文档配置 DNS、`.env` 和
+Compose，再在 daemon 的服务环境注入默认 URL（或只为本机指定 `--url`）：
+
+```bash
+PROSPERO_DEFAULT_RELAY_URL=wss://relay.example.com \
+  node apps/daemon/dist/cli.js relay enable
+node apps/daemon/dist/cli.js relay status --json
+node apps/daemon/dist/cli.js pair --name my-phone
+```
+
+新 QR 会包含独立 relay 凭证，App 默认使用 `auto`：直连和 relay 同时竞速，首个完成 E2E `hello.ok` 的路径获胜。
+也可在主机设置中改为 `direct`（仅 LAN/WireGuard）或 `relay`（仅 relay）。启用 relay 之前创建的设备没有可追溯的
+relay 凭证，必须重新扫码；`relay rotate-key --yes` 也会要求所有设备重新扫码，但不会使原来的直连配对失效。
+
+> [!IMPORTANT]
+> 本仓交付的是可部署制品和 runbook，不是已完成的真实公网部署证明。当前容量资格为 **inconclusive/waived**：没有
+> 5k host / 1k stream pair / 600 秒成功结论，没有 16 GiB 环境资格、同环境 direct RTT baseline，也没有公网 DNS TLS/WSS 验证。
+> 完整证据和限制见 [release status](docs/relay-release.md)。
 
 > [!NOTE]
 > `--tmux` 会话托管目前只在 macOS/Linux 上启用；Windows daemon 会自动回退为直接 PTY 启动，仍可创建和操控 Shell、Claude Code、Codex、OpenCode、Grok、Trae 与自定义 CLI 会话。

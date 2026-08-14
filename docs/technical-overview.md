@@ -3,16 +3,17 @@
 > 本文是对**当前代码库**的权威技术参考，区别于 `architecture-exploration.md`（早期探索定稿）。
 > 所有符号名、常量、状态值均来自源码实读，以源码为准；若与旧文档冲突，以本文与源码为准。
 >
-> 生成时间：2026-08-13 ｜ 版本：`0.0.12` ｜ 协议版本：`PROTOCOL_VERSION = 12`
+> 生成时间：2026-08-14 ｜ 版本：`0.0.13` ｜ 协议版本：`PROTOCOL_VERSION = 13`
 
 ---
 
 ## 1. 项目概览
 
 Prospero 把 iPhone / Android 变成 Mac / Windows 上**所有 Coding Agent 的遥控器**。Agent 继续在本机运行
-（复用仓库、工具链、账号与登录状态），手机通过 **LAN 或 WireGuard 直连**，零云中转、端到端加密。
+（复用仓库、工具链、账号与登录状态），手机可通过 **LAN / WireGuard 直连**，也可在直连不可用时通过
+可自托管 relay；两条路径都使用同一条端到端加密会话。
 
-核心差异化：**LAN/WG 零云依赖 + 跨 agent 统一入口 + 应用层 E2E**。
+核心差异化：**LAN/WG 直连优先 + 可自托管 relay + 跨 agent 统一入口 + 应用层 E2E**。
 
 - **仓库形态**：npm workspaces monorepo（`apps/*` + `packages/*`），Node ≥ 22，TypeScript strict，MIT。
 - **运行时组件**：
@@ -22,6 +23,7 @@ Prospero 把 iPhone / Android 变成 Mac / Windows 上**所有 Coding Agent 的�
   | mobile | `apps/mobile` | React Native 0.86 + Expo SDK 57 | 手机客户端：会话/审批/终端/文件/Git/编排 |
   | shell | `apps/shell` | SwiftUI（macOS 14+） | 菜单栏/窗口壳：TCC 归属、Bonjour、QR、daemon 生命周期 |
   | protocol | `packages/protocol` | TS + zod + tweetnacl | 共享协议：消息 schema、E2E 握手、QR、ring buffer |
+  | relay | `apps/relay` | Node 22 + MySQL 8.4 + Redis 7.4 + Caddy | 可自托管的 relay v1 控制面与透明数据面 |
   | tools | `tools/` | 脚本 | `fix-node-pty-darwin-helper.mjs`（postinstall 修补） |
 
 ---
@@ -60,7 +62,17 @@ flowchart LR
     CTRL["控制面<br/>HTTP + Unix socket RPC"]
   end
 
+  subgraph Relay["可自托管 Relay"]
+    RH["/v1/host 控制"]
+    RD["/v1/client + /v1/stream\n就绪后透明转发"]
+    DB["MySQL / Redis"]
+    RH --- DB
+    RD --- DB
+  end
+
   CONN <-- "ws:// …/ws（E2E 加密，LAN / WireGuard）" --> WS
+  CONN <-- "wss:// …/v1/client（E2E 加密）" --> RD
+  WS <-- "wss:// …/v1/host、/v1/stream" --> RH
   SM --- Track
   STR --- Adapters
   Shell <-- "spawn / status.json / 回环 HTTP" --> Mac
@@ -90,6 +102,7 @@ apps/
     approval-policy.ts      # strict / standard / yolo
     composer-context.ts     # @文件 / $Skill 补全与解析
     pairing.ts              # 身份/设备/配对载荷（identity.json / devices.json）
+    relay-host-client.ts    # outbound relay 控制、快照同步和独立数据 socket
     discovery.ts            # 候选地址枚举 + mDNS 广播
     control-socket.ts       # 本机 Unix socket NDJSON RPC
     notify.ts               # Bark / ntfy 推送
@@ -107,6 +120,7 @@ apps/
   shell/
     Package.swift           # SwiftUI 壳（Sources/ProsperoShell/*.swift）
 packages/protocol/src/      # messages / schemas / crypto / qr / ring / b64 / utf8 / errors
+apps/relay/                 # relay 服务、迁移、Compose/Caddy、审计与容量证据
 ```
 
 ---
@@ -129,7 +143,7 @@ packages/protocol/src/      # messages / schemas / crypto / qr / ring / b64 / ut
 
 ### 4.2 版本与能力协商
 
-- `PROTOCOL_VERSION = 12`；兼容窗口 `[12,11,10,9,8,7,5]`，`MIN_PROTOCOL_VERSION = 5`；客户端从新到旧回退尝试。
+- `PROTOCOL_VERSION = 13`；兼容窗口 `[13,12,11,10,9,8,7,5]`，`MIN_PROTOCOL_VERSION = 5`；客户端从新到旧回退尝试。
 - `CRYPTO_VERSION = 1`（只有密码学帧不兼容才升级）；`PAIRING_FORMAT_VERSION = 7`（QR 载荷版本，与应用协议解耦）。
 - **能力开关**（13 个 `CAPABILITY_*` 常量）随 `hello.ok` 下发，例如 `orchestration.snapshot.v1`、
   `orchestration.manual.v1`、`orchestration.worktrees.v1`、`subagent.history.v1`、`agent.accounts.v1`、
@@ -186,8 +200,9 @@ DH 派生，daemon 静态密钥只做身份证明（泄漏也解不开历史流�
 - **存储目录** `~/.prospero`（`PROSPERO_HOME` 可覆盖，0700）：`identity.json`（daemon 静态密钥对）、
   `devices.json`（已配对设备）、`config.json`（`{port}`）、`control.token`（0600）、`orchestration.json` 等。
 - **默认端口** `7423`。配对 `pair --name <dev>` 铸设备（token = base64url 24 字节随机数）并生成 QR。
-- **QR 载荷**（`prospero://pair?d=` + base64url JSON）：`{v, name, addrs[], port, token, pubKey}` ——
-  `addrs` 一次带齐所有网卡候选地址（en0 + utun* 等），客户端并发竞速。
+- **QR 载荷**（`prospero://pair?d=` + base64url JSON）：`{v, name, addrs[], port, token, pubKey, relay?}` ——
+  `addrs` 一次带齐所有网卡候选地址（en0 + utun* 等）；可选 `relay` 携带独立的 route/device/token，
+  不会复用 E2E token。客户端并发竞速。
 - **发现三层**：mDNS（`_prospero._tcp`，仅同广播域）→ QR 配对 → 客户端地址簿记忆。
 - `hostIdForDaemonPublicKey(pubKey)`：取公钥前 16 字符做稳定主机 ID（路由与深链共用）。
 - `candidateAddrs()`：只取 IPv4 非 internal，过滤 RFC2544（198.18/19）、link-local（169.254）与 `.0` 网段地址；
@@ -215,6 +230,20 @@ DH 派生，daemon 静态密钥只做身份证明（泄漏也解不开历史流�
 App 不在前台（iOS 挂起后 WS 断）时的锁屏通道：**Bark / ntfy** 统一成一个 URL 模板（POST JSON）。
 `DEFAULT_THROTTLE_MS = 30s`，按 key（通常 sessionId）节流；只推元数据摘要（`会话标题需要批准` + action），
 **不推命令输出/文件内容**。触发点：`permission.request` 且 `delivered === 0`（无客户端在看）；`permission.resolved` 时清除。
+
+### 5.5 Relay（直连的 E2E 传输后备）
+
+- **三 socket 约定**：daemon 的 `/v1/host` 只承载 JSON 控制；手机 `/v1/client` 与 daemon `/v1/stream`
+  在双方收到 `stream.ready` 后一对一透明转发 SecureChannel 数据。relay 不解密、解析、压缩或重组应用帧。
+- **凭证与状态**：host secret、配对 E2E token、relay device token 与一次性 stream ticket 各自独立。MySQL/Redis
+  仅存域分离 digest；ticket 的 Redis key 也经过域分离 hash，持久值不含 raw ticket。断依赖、鉴权失败、过期或
+  重放一律 fail-closed。详见 [relay-design.md](relay-design.md) 和 [relay-security-audit.md](relay-security-audit.md)。
+- **默认 URL 注入**：daemon 仅从自身进程环境读取 `PROSPERO_DEFAULT_RELAY_URL`；`config.json` 中显式 `relay.url`
+  优先。发布包或服务管理器应在启动 daemon 时注入 `wss://` URL，绝不把 URL 或任何秘密编入手机包或 QR 之外的日志。
+  `prosperod relay enable` 可使用该默认值，`--url` 仅写本机 override；`ws://` 只允许 `--dev` 的 loopback。
+- **三种手机模式**：`direct` 仅尝试 QR 地址；`relay` 仅尝试 QR 中的 relay 凭证；`auto` 同时竞速所有可用路径，
+  第一个完成 E2E `hello.ok` 的路径获胜。旧 QR/旧地址簿保持 direct；要获得 relay 凭证须重新扫码。
+- **部署边界**：仓库提供可部署的 Compose/Caddy 制品和 runbook，未在本次交付中声明或验证真实公网 DNS、TLS/WSS 部署。
 
 ---
 
@@ -372,6 +401,9 @@ adapter 的 `SessionStatus`（idle 等）猜 done。
 |---|---|
 | `start`（默认） | 启动 WS 服务 + Bonjour。选项 `-p/--port`、`-b/--bind`、`--dev`、`--no-bonjour`、`--tmux`、`--name` |
 | `pair` | 铸设备并打印配对 QR。`--name`、`--no-shell`、`--no-orchestration` |
+| `relay enable [--url <wss-url>]` | 启用 host 到 relay 的注册；未提供 URL 时读取 `PROSPERO_DEFAULT_RELAY_URL` |
+| `relay disable` / `relay status [--json]` | 停止注册但保留本机配置 / 查看公开状态与需要重新配对的设备数 |
+| `relay rotate-key --yes` | 轮换 host route key；既有 relay 凭证失效，所有设备必须重新扫码；直连配对仍有效 |
 | `notify` | 配置 Bark/ntfy 推送。`--url`、`--off`、`--test` |
 | `rotate-key` | 更换 daemon 身份密钥（`--yes`，所有设备重配） |
 | `revoke <name>` | 撤销设备并断开连接 |
@@ -400,6 +432,8 @@ adapter 的 `SessionStatus`（idle 等）猜 done。
 - **栈**：Expo SDK 57 / RN 0.86 / React 19 / expo-router（文件式路由）/ zustand / AsyncStorage；strict TS。
 - **连接核心 `HostConnection`**（`lib/connection.ts`）：
   - **多地址并发竞速**：`orderedAddrs()`（lastGood 优先）并发建 WS，先完成 E2E 握手者胜；同地址按协议版本从新到旧回退。
+  - **三模式 relay 选择**：新 relay QR 默认 `auto`，同时发起 direct 与 relay；`direct`/`relay` 可显式固定。
+    relay ticket 保存在 SecureStore，route/device 元数据才可进入 AsyncStorage；缺少 relay ticket 的旧设备必须重新扫码。
   - **重连**：指数退避 400→8000ms；`kick()` 清退避立即连。
   - **心跳**：`HEARTBEAT_MS=10s`、`SILENCE_LIMIT_MS=35s`（RN WS 无 ping/pong，靠最近收包时间判半开）。
   - **离线队列**：`BoundedQueue`（`MAX_OFFLINE_QUEUE=50`）。
@@ -451,6 +485,9 @@ node apps/daemon/dist/cli.js start --name my-computer --tmux
 # 生成配对二维码
 node apps/daemon/dist/cli.js pair --name my-phone
 
+# 可选：在 daemon 服务环境已注入 PROSPERO_DEFAULT_RELAY_URL 时启用 relay
+node apps/daemon/dist/cli.js relay enable
+
 # 移动端（需要 Xcode / JDK 17 + Android SDK）
 npm run ios -w @prospero/mobile -- --device      # iOS 真机
 npm run android -w @prospero/mobile              # Android
@@ -461,6 +498,8 @@ apps/shell/scripts/build-app.sh
 # 类型检查 / 测试
 npm run typecheck
 npm test          # 或 npm run test -w @prospero/daemon（vitest）
+npm test -w @prospero/relay
+npm run test:e2e -w @prospero/relay  # 需要 Docker
 ```
 
 - 运行时要求：macOS 14+ / Windows 11、Node.js 22+，至少一个已登录的 Agent CLI。
@@ -474,9 +513,10 @@ npm test          # 或 npm run test -w @prospero/daemon（vitest）
 
 | 常量 | 值 | 位置 |
 |---|---|---|
-| 协议版本 | `12`（兼容 `[12,11,10,9,8,7,5]`，最低 `5`） | `protocol/messages.ts` |
+| 协议版本 | `13`（兼容 `[13,12,11,10,9,8,7,5]`，最低 `5`） | `protocol/messages.ts` |
 | 加密版本 / 配对载荷版本 | `1` / `7` | `protocol/messages.ts` |
-| daemon 版本 | `0.0.12` | `daemon/version.ts` |
+| daemon 版本 | `0.0.13` | `daemon/version.ts` |
+| relay 协议 / endpoint | `1` / `/v1/host`、`/v1/client`、`/v1/stream` | `protocol/relay.ts` |
 | 默认端口 | `7423` | `daemon/pairing.ts` |
 | 数据目录 | `~/.prospero`（0700） | `daemon/pairing.ts` |
 | mDNS 服务类型 | `_prospero._tcp` | `daemon/discovery.ts` |
@@ -495,4 +535,5 @@ npm test          # 或 npm run test -w @prospero/daemon（vitest）
 - `docs/architecture-exploration.md` —— 早期探索与决策记录（竞品、选型、踩坑）
 - `docs/orchestration-handoff.md` / `docs/orchestration-plan.md` —— 编排契约与规划
 - `docs/esaytree.md` —— esaytree 工作树隔离设计
+- `docs/relay-design.md` / `docs/relay-security-audit.md` / `docs/relay-release.md` —— relay 契约、审计与交付状态
 - `docs/mobile-ux/`、`docs/voice-input-plan.md`、`docs/android-plan.md`、`docs/m1-plan.md` —— 各专题
