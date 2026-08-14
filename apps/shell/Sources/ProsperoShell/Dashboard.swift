@@ -2764,10 +2764,187 @@ private struct SettingsDashboard: View {
           LabeledContent("Bonjour", value: note)
         }
       }
+
+      RelaySettingsSection(daemon: daemon)
     }
     .formStyle(.grouped)
     .padding(12)
     .navigationTitle("设置")
+  }
+}
+
+/// Relay 的所有变更都经由 `prosperod relay …`，不把 config.json 当成 UI 的存储层。
+/// 这让终端和 App 的配置语义、热加载和权限检查始终只有 daemon 一份实现。
+private struct RelaySettingsSection: View {
+  @Bindable var daemon: DaemonController
+  @State private var settings = RelaySettingsModel()
+  @State private var showingRotateFirstConfirmation = false
+  @State private var showingRotateFinalConfirmation = false
+
+  private var relay: RelayStatus? { settings.relay }
+
+  private var stateColor: Color {
+    switch relay?.connectionState {
+    case .connected: .green
+    case .connecting: .orange
+    case .error: .red
+    case .offline, .disabled, .unknown, .none: .secondary
+    }
+  }
+
+  var body: some View {
+    Section("Relay") {
+      if settings.cliSupported == false {
+        Label("当前 daemon 不支持 Relay", systemImage: "arrow.triangle.2.circlepath")
+          .foregroundStyle(.secondary)
+          .accessibilityLabel("当前 daemon 不支持 Relay，请升级 daemon 后再使用")
+        Text("旧版 daemon 和没有 relay 字段的配置会继续按原有直连方式工作。")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+      } else {
+        Toggle("启用 Relay", isOn: Binding(
+          get: { settings.isEnabled },
+          set: { enabled in
+            Task { await settings.setEnabled(enabled) }
+          }
+        ))
+        .disabled(settings.isWorking)
+        .accessibilityHint("开启后 daemon 会连接 Relay；关闭不会影响现有本地服务和设备记录")
+
+        HStack(spacing: 8) {
+          Circle().fill(stateColor).frame(width: 9, height: 9)
+          Text(relay?.connectionState.label ?? "正在读取状态")
+          Spacer()
+          if settings.isWorking { ProgressView().controlSize(.small) }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Relay 连接状态")
+        .accessibilityValue(relay?.connectionState.label ?? "正在读取状态")
+        .accessibilityHint(relay?.retryHint ?? "")
+
+        LabeledContent("发布默认 URL") {
+          Text(relay?.publishedDefaultURL ?? "daemon 未发布")
+            .foregroundStyle(relay?.publishedDefaultURL == nil ? .secondary : .primary)
+            .textSelection(.enabled)
+            .accessibilityLabel("发布默认 Relay URL")
+        }
+
+        TextField("覆盖 Relay URL（留空使用默认）", text: Binding(
+          get: { settings.urlInput },
+          set: { value in
+            settings.urlInput = value
+            settings.noteURLChanged()
+          }
+        ))
+        .textFieldStyle(.roundedBorder)
+        .disabled(settings.isWorking)
+        .accessibilityLabel("Relay URL 覆盖")
+        .accessibilityHint("留空使用发布默认 URL。正式构建仅接受 wss 地址")
+
+        if let validationError = settings.validationError {
+          Label(validationError, systemImage: "exclamationmark.triangle.fill")
+            .font(.caption)
+            .foregroundStyle(.red)
+            .accessibilityLabel("Relay URL 无效：\(validationError)")
+        } else {
+          Text("正式构建只允许 wss；开发构建中的 ws 也只能是 localhost、127.0.0.1 或 ::1。")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+
+        if let effectiveURL = relay?.displayURL {
+          LabeledContent("当前 URL") {
+            Text(effectiveURL)
+              .textSelection(.enabled)
+              .lineLimit(1)
+              .accessibilityLabel("当前有效 Relay URL")
+          }
+        }
+
+        if let connectedAt = relay?.connectedAt {
+          LabeledContent("最近连接") {
+            Text(relativeDate(connectedAt))
+              .accessibilityLabel("Relay 最近连接时间：\(relativeDate(connectedAt))")
+          }
+        }
+
+        if let retryHint = relay?.retryHint {
+          Label(retryHint, systemImage: "arrow.clockwise")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .accessibilityLabel("Relay 重试提示：\(retryHint)")
+        }
+
+        if let lastError = relay?.lastError {
+          LabeledContent("最近错误") {
+            Text(lastError)
+              .foregroundStyle(.red)
+              .textSelection(.enabled)
+              .accessibilityLabel("Relay 最近错误：\(lastError)")
+          }
+        }
+
+        if let actionError = settings.actionError {
+          Label(actionError, systemImage: "exclamationmark.triangle.fill")
+            .foregroundStyle(.red)
+            .accessibilityLabel("Relay 操作失败：\(actionError)")
+        }
+
+        HStack {
+          Button("应用 URL") {
+            Task { await settings.setEnabled(true) }
+          }
+          .disabled(!settings.isEnabled || settings.isWorking || settings.validationError != nil)
+          .accessibilityLabel("应用 Relay URL 覆盖")
+          .accessibilityHint("通过 prosperod 更新 Relay 配置")
+
+          Button("使用默认 URL") {
+            settings.urlInput = ""
+            settings.noteURLChanged()
+          }
+          .disabled(settings.isWorking || settings.urlInput.isEmpty)
+          .accessibilityLabel("清除 Relay URL 覆盖并使用默认 URL")
+
+          Spacer()
+
+          Button {
+            Task { await settings.refresh() }
+          } label: {
+            Label("刷新状态", systemImage: "arrow.clockwise")
+          }
+          .disabled(settings.isWorking)
+          .accessibilityLabel("刷新 Relay 状态")
+        }
+
+        Button("轮换 Relay 密钥…", role: .destructive) {
+          showingRotateFirstConfirmation = true
+        }
+        .disabled(!settings.isEnabled || settings.isWorking)
+        .accessibilityLabel("轮换 Relay 密钥")
+        .accessibilityHint("会使所有现有 Relay 配对失效，设备需要重新扫码")
+      }
+    }
+    .task {
+      settings.consume(daemon.status)
+      await settings.refresh()
+    }
+    .onChange(of: daemon.status.relay) { _, _ in
+      settings.consume(daemon.status)
+    }
+    .alert("轮换 Relay 密钥？", isPresented: $showingRotateFirstConfirmation) {
+      Button("继续") { showingRotateFinalConfirmation = true }
+      Button("取消", role: .cancel) {}
+    } message: {
+      Text("这会使所有现有 Relay 配对立即失效。每台受影响的设备都需要重新扫码配对。")
+    }
+    .confirmationDialog("最后确认：轮换 Relay 密钥", isPresented: $showingRotateFinalConfirmation) {
+      Button("轮换密钥并使配对失效", role: .destructive) {
+        Task { await settings.rotateKey() }
+      }
+      Button("取消", role: .cancel) {}
+    } message: {
+      Text("此操作无法撤销，并会使所有现有 Relay 配对失效；之后必须重新扫码。")
+    }
   }
 }
 

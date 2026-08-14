@@ -764,11 +764,14 @@ final class DaemonController {
     guard let data = try? Data(contentsOf: url),
           let text = String(data: data, encoding: .utf8)
     else { return [] }
-    return Array(text.split(separator: "\n").suffix(logLineCap).map(String.init))
+    return Array(text.split(separator: "\n").suffix(logLineCap).map { RelayRedaction.redact(String($0)) })
   }
 
   private func appendLog(_ text: String) {
-    let lines = text
+    // Relay 的 host secret、设备 ticket 和 route ticket 不属于 GUI 日志。daemon 本身
+    // 应该已脱敏；这里再做一层防线，以免旧 daemon 或第三方 wrapper 把键值对直接写出。
+    let safeText = RelayRedaction.redact(text)
+    let lines = safeText
       .split(separator: "\n", omittingEmptySubsequences: false)
       .map(String.init)
       .filter { !$0.isEmpty }
@@ -784,7 +787,7 @@ final class DaemonController {
       }
     }
 
-    guard let data = text.data(using: .utf8), let handle = logFileHandle() else { return }
+    guard let data = safeText.data(using: .utf8), let handle = logFileHandle() else { return }
     try? handle.write(contentsOf: data)
     logBytes += UInt64(data.count)
     // 超了就从头写起。句柄是常开的,所以上限必须在写入路径上盯着 ——

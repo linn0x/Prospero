@@ -5,6 +5,8 @@ struct DaemonStatus: Sendable, Equatable {
   var port: Int = 7423
   var bind: String?
   var notifyURL: String?
+  /// Relay 的公开配置和运行时状态。不存在表示旧版 daemon，设置页会安全降级。
+  var relay: RelayStatus?
   var devices: [Device] = []
   var agentAccounts: [AgentAccount] = []
 
@@ -37,15 +39,27 @@ struct DaemonStatus: Sendable, Equatable {
   /// 读 config.json + devices.json。文件不存在是正常状态(还没跑过 daemon),不是错误。
   static func load() -> DaemonStatus {
     var status = DaemonStatus()
+    var configRoot: [String: Any]?
 
     if let data = try? Data(contentsOf: home.appendingPathComponent("config.json")),
        let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+      configRoot = obj
       status.port = obj["port"] as? Int ?? 7423
       status.bind = obj["bind"] as? String
       if let notify = obj["notify"] as? [String: Any] {
         status.notifyURL = notify["url"] as? String
       }
     }
+
+    // status.json 只提供运行中的公开 relay 快照。不要把整个对象缓存到模型中：
+    // 它还含本机 control token，而 RelayStatus 只挑选允许展示的字段。
+    let runtimeRoot: [String: Any] = {
+      guard let data = try? Data(contentsOf: RunningStatus.fileURL),
+            let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+      else { return [:] }
+      return value
+    }()
+    status.relay = RelayStatus.parse(config: configRoot, runtime: runtimeRoot)
 
     // devices.json 是 { "devices": [...] },不是裸数组 —— 按裸数组读会永远得到 0 台,
     // 而"配对成功"提示正是靠设备列表变化触发的,所以这里错了整个功能都是哑的。
