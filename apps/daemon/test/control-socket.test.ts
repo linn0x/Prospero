@@ -127,6 +127,34 @@ describe("control socket", () => {
     expect(DEFAULT_CONTROL_REQUEST_TIMEOUT_MS).toBe(15_000);
   });
 
+  it("调用方在延迟响应前断开时，控制 socket 仍可服务后续请求", async () => {
+    let started: (() => void) | null = null;
+    const startedPromise = new Promise<void>((resolve) => { started = resolve; });
+    const server = await startControlSocket({
+      home: home(),
+      token: "secret",
+      handle: async (method, _params, signal) => {
+        if (method !== "slow") return "ok";
+        started?.();
+        await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+        return "late response";
+      },
+    });
+    servers.push(server);
+
+    const abandoned = createConnection(server.path);
+    await new Promise<void>((resolve, reject) => {
+      abandoned.once("connect", resolve);
+      abandoned.once("error", reject);
+    });
+    abandoned.write(`${JSON.stringify({ id: "slow", method: "slow", token: "secret" })}\n`);
+    await startedPromise;
+    abandoned.destroy();
+
+    await expect(controlRequest({ socketPath: server.path, token: "secret" }, "health"))
+      .resolves.toBe("ok");
+  });
+
   it("不会把同名普通文件当作陈旧 socket 删除", async () => {
     const dir = home();
     const occupied = path.join(dir, "control.sock");
