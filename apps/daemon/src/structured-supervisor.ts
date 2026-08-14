@@ -16,7 +16,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { createServer, type Socket } from "node:net";
+import { createConnection, createServer, type Socket } from "node:net";
 import path from "node:path";
 import type { AgentEventBody } from "@prospero/protocol";
 
@@ -24,6 +24,8 @@ const MAX_LINE_BYTES = 1024 * 1024;
 const MAX_EVENTS_PER_SESSION = 4_000;
 const STATE_VERSION = 1;
 const SESSION_ID = /^[A-Za-z0-9._-]{1,128}$/;
+/** Bump only with a backwards-compatible server/client migration plan. */
+export const SUPERVISOR_PROTOCOL_VERSION = 1;
 
 export type SupervisorSessionStatus = "created" | "running" | "killed" | "failed";
 
@@ -94,6 +96,7 @@ interface RuntimeSession {
 }
 
 interface RpcRequest {
+  version: unknown;
   id: string | number;
   method: string;
   params?: unknown;
@@ -148,6 +151,7 @@ function requestFrom(value: unknown): RpcRequest | null {
     return null;
   }
   return {
+    version: raw["version"],
     id: raw["id"],
     method: raw["method"],
     ...(raw["params"] === undefined ? {} : { params: raw["params"] }),
@@ -155,10 +159,10 @@ function requestFrom(value: unknown): RpcRequest | null {
   };
 }
 
-function write(socket: Socket, value: unknown): void {
+function write(socket: Socket, value: Record<string, unknown>): void {
   if (socket.destroyed || !socket.writable) return;
   try {
-    socket.write(`${JSON.stringify(value)}\n`);
+    socket.write(`${JSON.stringify({ version: SUPERVISOR_PROTOCOL_VERSION, ...value })}\n`);
   } catch {
     // A daemon may restart after writable was checked. Reconnection is normal.
   }
@@ -208,8 +212,12 @@ class SupervisorState {
     try {
       await adapter.start({ emit: (body) => this.record(runtime, body) });
     } catch (error) {
-      runtime.persisted.status = "failed";
-      this.persist();
+      // A concurrent explicit kill remains terminal even if its adapter then
+      // reports an expected cancellation/startup error.
+      if (!isKilled(runtime.persisted.status)) {
+        runtime.persisted.status = "failed";
+        this.persist();
+      }
       throw error;
     }
   }
@@ -230,9 +238,12 @@ class SupervisorState {
   async kill(sessionId: string): Promise<void> {
     const session = this.require(sessionId);
     if (session.persisted.status === "killed") return;
-    await session.adapter?.kill?.();
+    // Persist the termination fence before touching native work. An adapter
+    // can still emit during (or even after) cancellation; those late events
+    // must not revive a session or leak into a subsequent daemon attachment.
     session.persisted.status = "killed";
     this.persist();
+    await session.adapter?.kill?.();
   }
 
   status(sessionId: string): { status: SupervisorSessionStatus; lastSeq: number } {
@@ -252,6 +263,7 @@ class SupervisorState {
 
   private record(runtime: RuntimeSession, body: AgentEventBody): void {
     const persisted = runtime.persisted;
+    if (persisted.status === "killed") return;
     const event: SupervisorEvent = {
       sessionId: persisted.id,
       seq: persisted.lastSeq + 1,
@@ -327,6 +339,12 @@ function isStatus(value: unknown): value is SupervisorSessionStatus {
   return value === "created" || value === "running" || value === "killed" || value === "failed";
 }
 
+// This function deliberately keeps TypeScript from treating the pre-await
+// `running` assignment in start() as proof about the mutable runtime state.
+function isKilled(status: SupervisorSessionStatus): boolean {
+  return status === "killed";
+}
+
 function isSupervisorEvent(value: unknown): value is SupervisorEvent {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const event = value as Partial<SupervisorEvent>;
@@ -342,6 +360,34 @@ function isSupervisorEvent(value: unknown): value is SupervisorEvent {
   );
 }
 
+/**
+ * A stale Unix socket is safe to unlink only after a connection attempt has
+ * proved that no listener owns it. Never unlink an unknown live supervisor:
+ * doing so would create two owners for the same persisted session.
+ */
+async function removeVerifiedStaleSocket(socketPath: string): Promise<void> {
+  if (!existsSync(socketPath)) return;
+  if (!lstatSync(socketPath).isSocket()) {
+    throw new SupervisorError(`${socketPath} 已被非 socket 文件占用`, "socket_path_occupied");
+  }
+  await new Promise<void>((resolve, reject) => {
+    const probe = createConnection(socketPath);
+    probe.once("connect", () => {
+      probe.destroy();
+      reject(new SupervisorError(`${socketPath} 已有运行中的 supervisor`, "socket_path_occupied"));
+    });
+    probe.once("error", (error: NodeJS.ErrnoException) => {
+      probe.destroy();
+      if (error.code === "ECONNREFUSED" || error.code === "ENOENT" || error.code === "ECONNRESET") {
+        rmSync(socketPath, { force: true });
+        resolve();
+        return;
+      }
+      reject(error);
+    });
+  });
+}
+
 /** Start the private Unix-socket endpoint used by daemon clients. */
 export async function startStructuredSupervisor(
   opts: StructuredSupervisorOptions,
@@ -354,14 +400,6 @@ export async function startStructuredSupervisor(
   const socketPath = opts.socketPath ?? path.join(opts.home, "supervisor.sock");
   const tokenPath = path.join(opts.home, "supervisor.token");
   const token = opts.token ?? randomBytes(32).toString("base64url");
-  if (existsSync(socketPath)) {
-    if (!lstatSync(socketPath).isSocket()) {
-      throw new SupervisorError(`${socketPath} 已被非 socket 文件占用`, "socket_path_occupied");
-    }
-    rmSync(socketPath, { force: true });
-  }
-  writeFileSync(tokenPath, `${token}\n`, { mode: 0o600 });
-  chmodSync(tokenPath, 0o600);
 
   const connections = new Set<Connection>();
   const state = new SupervisorState(opts.home, (event) => {
@@ -394,6 +432,7 @@ export async function startStructuredSupervisor(
       }
     });
   });
+  await removeVerifiedStaleSocket(socketPath);
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(socketPath, () => {
@@ -402,6 +441,14 @@ export async function startStructuredSupervisor(
     });
   });
   chmodSync(socketPath, 0o600);
+  try {
+    writeFileSync(tokenPath, `${token}\n`, { mode: 0o600 });
+    chmodSync(tokenPath, 0o600);
+  } catch (error) {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(socketPath, { force: true });
+    throw error;
+  }
 
   return {
     socketPath,
@@ -433,6 +480,14 @@ async function handleLine(
   const request = requestFrom(raw);
   if (!request) {
     write(connection.socket, { id: null, ok: false, error: { code: "bad_request", message: "缺少 id 或 method" } });
+    return;
+  }
+  if (request.version !== SUPERVISOR_PROTOCOL_VERSION) {
+    write(connection.socket, {
+      id: request.id,
+      ok: false,
+      error: { code: "unsupported_version", message: "supervisor 协议版本不兼容" },
+    });
     return;
   }
   if (!tokenEqual(token, request.token)) {
