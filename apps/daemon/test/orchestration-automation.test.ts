@@ -206,5 +206,15 @@ describe("静态 DAG 自动执行", () => {
     expect(
       execFileSync("git", ["branch", "--show-current"], { cwd: config.workspacePath, encoding: "utf8" }).trim(),
     ).toBe(config.branch);
+    expect(ctx.store.listWorktreeAssets(ctx.runId)).toEqual([
+      expect.objectContaining({
+        kind: "run",
+        runId: ctx.runId,
+        repo: realpathSync.native(repo),
+        path: config.workspacePath,
+        branch: config.branch,
+        state: "active",
+      }),
+    ]);
   });
 });

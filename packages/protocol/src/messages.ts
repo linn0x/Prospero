@@ -41,6 +41,8 @@ export const CAPABILITY_ORCHESTRATION_MANAGEMENT = "orchestration.management.v1"
 export const CAPABILITY_ORCHESTRATION_LIFECYCLE = "orchestration.lifecycle.v1";
 /** Run 的完成/放弃；与旧 lifecycle.v1 的 task/worker 动作分开做能力协商。 */
 export const CAPABILITY_ORCHESTRATION_RUN_LIFECYCLE = "orchestration.run-lifecycle.v1";
+/** 已登记工作树的只读安全检查与显式清理。 */
+export const CAPABILITY_ORCHESTRATION_WORKTREES = "orchestration.worktrees.v1";
 export const CAPABILITY_SUBAGENT_HISTORY = "subagent.history.v1";
 /** Codex / Claude Code 多账号与隔离配置目录。 */
 export const CAPABILITY_AGENT_ACCOUNTS = "agent.accounts.v1";
@@ -81,6 +83,8 @@ export type {
   C2SOrchestrationGraphApply,
   C2SOrchestrationAutomationStart,
   C2SOrchestrationAutomationPause,
+  C2SOrchestrationWorktreeInspect,
+  C2SOrchestrationWorktreeCleanup,
   OrchestrationGraphNodeInput,
   ResumableConversation,
   C2SConversationSearch,
@@ -163,6 +167,8 @@ export type {
   OrchestrationRun,
   OrchestrationTask,
   OrchestrationDispatch,
+  OrchestrationWorktreeInspection,
+  OrchestrationWorktreeAsset,
   OrchestrationGate,
   OrchestrationSnapshot,
   S2COrchestrationSnapshot,

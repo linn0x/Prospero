@@ -12,6 +12,7 @@ import { DispatchService } from "./dispatch.js";
 import type { AutomationWorkspace, Run } from "./model.js";
 import { OrchestrationError, OrchestrationStore } from "./store.js";
 import { createEsaytree, repoRoot } from "./esaytree.js";
+import { WorktreeAssetService } from "./worktree-assets.js";
 
 export interface StartAutomationInput {
   runId: string;
@@ -39,6 +40,7 @@ export class AutomationService {
   constructor(
     private readonly store: OrchestrationStore,
     private readonly dispatch: DispatchService,
+    private readonly worktreeAssets = new WorktreeAssetService(store),
   ) {}
 
   async start(input: StartAutomationInput): Promise<Run> {
@@ -81,6 +83,13 @@ export class AutomationService {
         const name = `auto-${run.id}-${stamp}`;
         branch = `prospero/${run.id}/auto-${stamp}`;
         const created = await createEsaytree({ repo, name, branch });
+        // 创建成功即登记；随后 setRunAutomation 或派发失败时仍能从资产清单找到它。
+        this.worktreeAssets.registerRun({
+          runId: run.id,
+          repo,
+          path: created.path,
+          branch: created.branch,
+        });
         // 用户可能选的是 monorepo 子目录；新 worktree 仍应从对应子目录启动 agent。
         workspacePath = path.join(created.path, path.relative(repo, cwd));
       }
