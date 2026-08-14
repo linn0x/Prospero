@@ -12,6 +12,7 @@ import {
   goalSessionVisibility,
   groupOrchestrationRuns,
   goalRunOverview,
+  orchestrationRunCurrentState,
   orchestrationConnectionNotice,
   orchestrationRoute,
   selectedRouteRunId,
@@ -42,8 +43,51 @@ function gate(id: string, runId: string, status: OrchestrationGate["status"] = "
   };
 }
 
-function snapshot(runs: OrchestrationRun[], gates: OrchestrationGate[] = []): OrchestrationSnapshot {
-  return { runs, gates, tasks: [], dispatches: [] };
+function task(
+  id: string,
+  status: OrchestrationTask["status"],
+  deps: string[] = [],
+): OrchestrationTask {
+  return {
+    id,
+    runId: "state-run",
+    title: id,
+    spec: "",
+    deps,
+    parentId: null,
+    status,
+    result: null,
+    createdAt: 1,
+    updatedAt: 1,
+  };
+}
+
+function dispatch(
+  id: string,
+  taskId: string,
+  state: OrchestrationDispatch["state"],
+  startedAt: number,
+): OrchestrationDispatch {
+  return {
+    id,
+    runId: "state-run",
+    taskId,
+    sessionId: `session-${id}`,
+    worktreePath: null,
+    state,
+    startedAt,
+    settledAt: state === "starting" || state === "running" ? null : startedAt + 1,
+    outcome: null,
+  };
+}
+
+function snapshot(
+  runs: OrchestrationRun[],
+  gates: OrchestrationGate[] = [],
+  tasks: OrchestrationTask[] = [],
+  dispatches: OrchestrationDispatch[] = [],
+): OrchestrationSnapshot {
+  return { runs, gates, tasks, dispatches };
 }
 
 describe("orchestration overview", () => {
@@ -184,5 +228,149 @@ describe("orchestration overview", () => {
     expect([...filtered.displayedCoordinatorIds]).toEqual(["coordinator"]);
     expect([...filtered.contextualCoordinatorIds]).toEqual(["coordinator"]);
     expect([...filtered.nestedWorkerIds]).toEqual(["worker-new"]);
+  });
+
+  it("puts a pending Gate before every other next step and retains its task target", () => {
+    const selected = run("state-run", 10);
+    const gated = task("gated", "blocked");
+    const pending = gate("gate-1", selected.id);
+    pending.taskId = gated.id;
+    const state = orchestrationRunCurrentState(selected, snapshot(
+      [selected],
+      [pending],
+      [gated, task("failed", "failed"), task("active", "dispatched"), task("ready", "pending")],
+      [dispatch("active", "active", "running", 2)],
+    ));
+
+    expect(state).toMatchObject({
+      done: 0,
+      total: 4,
+      blocked: 1,
+      pendingGateCount: 1,
+      guide: { kind: "gate", gateId: pending.id, taskId: gated.id },
+    });
+  });
+
+  it("prioritizes failed work over running and ready work", () => {
+    const selected = run("state-run", 10);
+    const state = orchestrationRunCurrentState(selected, snapshot(
+      [selected],
+      [],
+      [task("failed", "failed"), task("active", "dispatched"), task("ready", "pending")],
+      [dispatch("active", "active", "running", 2)],
+    ));
+
+    expect(state.failed).toBe(1);
+    expect(state.running).toBe(1);
+    expect(state.ready).toBe(1);
+    expect(state.guide).toMatchObject({ kind: "failed", taskId: "failed" });
+  });
+
+  it("counts only current starting or running Dispatches as running", () => {
+    const selected = run("state-run", 10);
+    const state = orchestrationRunCurrentState(selected, snapshot(
+      [selected],
+      [],
+      [task("active", "dispatched"), task("retried", "pending")],
+      [
+        dispatch("historic-failure", "retried", "failed", 30),
+        dispatch("active-worker", "active", "running", 20),
+      ],
+    ));
+
+    expect(state.running).toBe(1);
+    expect(state.ready).toBe(1);
+    expect(state.currentDispatches.map((item) => item.id)).toEqual(["active-worker"]);
+    expect(state.guide.kind).toBe("running");
+  });
+
+  it("treats a settled retry attempt as history rather than active work", () => {
+    const selected = run("state-run", 10);
+    const state = orchestrationRunCurrentState(selected, snapshot(
+      [selected],
+      [],
+      [task("retried", "pending")],
+      [dispatch("historic-failure", "retried", "failed", 30)],
+    ));
+
+    expect(state).toMatchObject({ running: 0, ready: 1, guide: { kind: "ready" } });
+    expect(state.currentDispatches).toEqual([]);
+  });
+
+  it("labels ready work as hand-dispatched only for a manual Run", () => {
+    const selected = run("state-run", 10);
+    selected.coordinatorSessionId = null;
+    const state = orchestrationRunCurrentState(selected, snapshot(
+      [selected],
+      [],
+      [task("ready", "pending")],
+    ));
+
+    expect(state.ready).toBe(1);
+    expect(state.guide).toMatchObject({ kind: "ready", taskId: "ready" });
+    expect(state.guide.text).toContain("手工派发");
+
+    const coordinator = run("state-run", 11);
+    const coordinatorState = orchestrationRunCurrentState(coordinator, snapshot(
+      [coordinator],
+      [],
+      [task("ready", "pending")],
+    ));
+    expect(coordinatorState.guide.text).toContain("协调者派发");
+  });
+
+  it("keeps unmet and cancelled dependencies waiting instead of silently releasing them", () => {
+    const selected = run("state-run", 10);
+    const unmet = orchestrationRunCurrentState(selected, snapshot(
+      [selected],
+      [],
+      [task("upstream", "dispatched"), task("downstream", "pending", ["upstream"])],
+    ));
+    const cancelled = orchestrationRunCurrentState(selected, snapshot(
+      [selected],
+      [],
+      [task("cancelled", "cancelled"), task("downstream", "pending", ["cancelled"])],
+    ));
+
+    expect(unmet).toMatchObject({ ready: 0, waiting: 1, guide: { kind: "waiting" } });
+    expect(unmet.guide.text).toContain("前置依赖");
+    expect(cancelled).toMatchObject({
+      ready: 0,
+      waiting: 1,
+      waitingOnCancelledDependency: 1,
+      guide: { kind: "waiting" },
+    });
+    expect(cancelled.guide.text).toContain("依赖已取消");
+  });
+
+  it("marks a fully terminal active Run as completable, including cancelled tasks", () => {
+    const selected = run("state-run", 10);
+    const state = orchestrationRunCurrentState(selected, snapshot(
+      [selected],
+      [],
+      [task("done", "done"), task("cancelled", "cancelled")],
+    ));
+
+    expect(state).toMatchObject({
+      done: 1,
+      total: 2,
+      cancelled: 1,
+      canComplete: true,
+      guide: { kind: "complete" },
+    });
+  });
+
+  it("keeps completed Runs read-only even if an old snapshot carries a pending-looking task", () => {
+    const selected = run("state-run", 10, "completed");
+    const state = orchestrationRunCurrentState(selected, snapshot(
+      [selected],
+      [],
+      [task("old", "pending")],
+      [dispatch("historic", "old", "succeeded", 1)],
+    ));
+
+    expect(state.canComplete).toBe(false);
+    expect(state.guide).toMatchObject({ kind: "complete" });
+    expect(state.guide.text).toContain("只读");
   });
 });
