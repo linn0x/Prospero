@@ -39,6 +39,8 @@ export interface StructuredSupervisorManifest {
   approvalPolicy: ApprovalPolicy;
   socket: string;
   tokenFile: string;
+  /** Private owner directory; socket may use a short endpoint under /tmp. */
+  sessionDir?: string;
   supervisorPid?: number;
   lifecycleEpoch: string;
   status?: string;
@@ -134,6 +136,7 @@ function updateManifest(config: RunnerConfig, patch: Partial<StructuredSuperviso
       approvalPolicy: config.approvalPolicy ?? "standard",
       socket: config.socketPath,
       tokenFile: "token",
+      sessionDir: config.sessionDir,
       lifecycleEpoch: "unknown",
     }),
     ...patch,

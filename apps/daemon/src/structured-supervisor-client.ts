@@ -60,6 +60,8 @@ export interface StructuredSupervisorManifest {
   approvalPolicy: ApprovalPolicy;
   socket: string;
   tokenFile: string;
+  /** Private owner directory; may differ from a short runtime socket path. */
+  sessionDir?: string;
   supervisorPid?: number;
   lifecycleEpoch: string;
   status?: string;
@@ -204,7 +206,8 @@ export function readSupervisorManifest(file: string): StructuredSupervisorManife
       v.implementation !== "supervisor" || typeof v.sessionId !== "string" || !SESSION_ID.test(v.sessionId) ||
       typeof v.agent !== "string" || typeof v.title !== "string" || typeof v.cwd !== "string" ||
       typeof v.createdAt !== "number" || typeof v.approvalPolicy !== "string" ||
-      typeof v.socket !== "string" || v.tokenFile !== "token" || typeof v.lifecycleEpoch !== "string"
+      typeof v.socket !== "string" || v.tokenFile !== "token" || typeof v.lifecycleEpoch !== "string" ||
+      (v.sessionDir !== undefined && (typeof v.sessionDir !== "string" || !path.isAbsolute(v.sessionDir)))
     ) return null;
     return v as StructuredSupervisorManifest;
   } catch {
@@ -267,7 +270,7 @@ export class RemoteStructuredSession extends EventEmitter {
   }
 
   private loadReadonlyCache(): void {
-    const file = path.join(path.dirname(this.manifest.socket), "session.json");
+    const file = path.join(this.ownerDir(), "session.json");
     if (!privateMode(file)) return;
     try {
       const raw: unknown = JSON.parse(readFileSync(file, "utf8"));
@@ -305,11 +308,16 @@ export class RemoteStructuredSession extends EventEmitter {
   }
 
   private token(): string {
-    const file = path.join(path.dirname(this.manifest.socket), this.manifest.tokenFile);
+    const file = path.join(this.ownerDir(), this.manifest.tokenFile);
     if (!privateMode(file)) throw new RemoteSupervisorError("supervisor token file is missing or has unsafe mode");
     const token = readFileSync(file, "utf8").trim();
     if (!token) throw new RemoteSupervisorError("supervisor token is empty");
     return token;
+  }
+
+  /** The socket can be in /tmp while state/token remain in the 0700 owner directory. */
+  private ownerDir(): string {
+    return this.manifest.sessionDir ?? path.dirname(this.manifest.socket);
   }
 
   async reconnect(): Promise<void> {
@@ -512,7 +520,7 @@ export class RemoteStructuredSession extends EventEmitter {
     // Tool output is deliberately read from the supervisor-owned, 0600 state
     // file. WS needs this synchronous method and the file is a bounded cache
     // written by StructuredSession itself; never read daemon-provided paths.
-    const file = path.join(path.dirname(this.manifest.socket), "session.json");
+    const file = path.join(this.ownerDir(), "session.json");
     if (!privateMode(file)) return null;
     try {
       const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
@@ -606,14 +614,20 @@ export async function launchStructuredSupervisor(input: LaunchStructuredSupervis
   const tokenPath = path.join(sessionDir, "token");
   writeFileSync(tokenPath, `${token}\n`, { mode: 0o600 });
   chmodSync(tokenPath, 0o600);
-  // macOS has a short Unix-domain socket path limit; keep the leaf compact so
-  // a normal temporary/home path cannot make a new session unlaunchable.
-  const socketPath = path.join(sessionDir, "s");
+  // macOS has a short Unix-domain socket path limit. A compact leaf inside a
+  // long `~/.prospero/.../<uuid>` directory is still too long *to reconnect*
+  // from the daemon: binding after runner chdir works, but the manifest's
+  // absolute endpoint later fails with EINVAL.  Use a random, 0600 socket in
+  // sticky /tmp instead. Its unguessable name remains private through the
+  // 0600 manifest/token; the socket itself is chmod 0600 by the transport.
+  // `/tmp` is intentionally literal rather than os.tmpdir(), which is often
+  // another long per-user path on macOS.
+  const socketPath = path.join("/tmp", `prospero-supervisor-${randomBytes(12).toString("hex")}.sock`);
   const manifest: StructuredSupervisorManifest = {
     version: SUPERVISOR_MANIFEST_VERSION, protocolVersion: SUPERVISOR_PROTOCOL_VERSION,
     implementation: "supervisor", sessionId: input.sessionId, agent: input.agent, title: input.title,
     cwd: input.cwd, createdAt: input.createdAt, approvalPolicy: input.approvalPolicy ?? "standard",
-    socket: socketPath, tokenFile: "token", lifecycleEpoch: randomUUID(), status: "starting",
+    socket: socketPath, tokenFile: "token", sessionDir, lifecycleEpoch: randomUUID(), status: "starting",
     ...(input.accountId ? { accountId: input.accountId } : {}), ...(input.accountName ? { accountName: input.accountName } : {}),
   };
   privateWrite(path.join(sessionDir, "manifest.json"), manifest);
@@ -621,9 +635,7 @@ export async function launchStructuredSupervisor(input: LaunchStructuredSupervis
   privateWrite(bootstrap, {
     version: 1, sessionId: input.sessionId, agent: input.agent, title: input.title, cwd: input.cwd,
     createdAt: input.createdAt, approvalPolicy: input.approvalPolicy, sessionDir,
-    // Runner chdirs into sessionDir, so this avoids Unix sun_path limits while
-    // the manifest keeps the absolute path used by reconnecting daemons.
-    attachmentRoot: path.join(sessionDir, "attachments"), socketPath: "s", environment: input.environment,
+    attachmentRoot: path.join(sessionDir, "attachments"), socketPath, environment: input.environment,
     ...(input.codexAppServerArgs ? { codexAppServerArgs: input.codexAppServerArgs } : {}),
     ...(input.accountId ? { accountId: input.accountId } : {}), ...(input.accountName ? { accountName: input.accountName } : {}),
     ...(input.initialAdapterState ? { initialAdapterState: input.initialAdapterState } : {}),
@@ -685,12 +697,13 @@ export async function reconnectStructuredSupervisors(root: string): Promise<Remo
     if (!manifest || manifest.sessionId !== entry.name) continue;
     // A dead PID, stale socket or protocol mismatch is historical/read-only.
     // Crucially this path does not call the launcher, preventing duplicate turns.
+    const withOwnerDir = { ...manifest, sessionDir: dir };
     if (!processAlive(manifest.supervisorPid) || !privateMode(path.join(dir, "token")) || !privateMode(manifest.socket)) {
-      sessions.push(RemoteStructuredSession.unavailable(manifest));
+      sessions.push(RemoteStructuredSession.unavailable(withOwnerDir));
       continue;
     }
-    try { sessions.push(await RemoteStructuredSession.attach(manifest)); }
-    catch { sessions.push(RemoteStructuredSession.unavailable(manifest)); }
+    try { sessions.push(await RemoteStructuredSession.attach(withOwnerDir)); }
+    catch { sessions.push(RemoteStructuredSession.unavailable(withOwnerDir)); }
   }
   return sessions;
 }
