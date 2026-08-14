@@ -212,9 +212,13 @@ describe("RelayHostClient", () => {
     const relay = await relayServer();
     const snapshots: Array<{ routeId: string; generation: number; credentials: Array<{ deviceId: string }> }> = [];
     let first: WebSocket | null = null;
+    let reconnected: WebSocket | null = null;
+    let connections = 0;
     relay.wss.on("connection", (ws) => {
+      const connection = ++connections;
       let routeId = "";
       let authed = false;
+      let syncsOnConnection = 0;
       ws.on("message", (raw) => {
         const message = JSON.parse(raw.toString()) as {
           routeId?: string; hostSecret?: string; type?: string; generation?: number;
@@ -229,9 +233,13 @@ describe("RelayHostClient", () => {
           return;
         }
         if (message.type !== "host.device-sync") return;
+        syncsOnConnection++;
         snapshots.push({ routeId, generation: message.generation!, credentials: message.credentials! });
         ws.send(JSON.stringify({ type: "host.device-sync.ack", v: 1, generation: message.generation }));
-        ws.send(JSON.stringify({ type: "host.ready", v: 1, routeId, generation: message.generation }));
+        if (syncsOnConnection === 1) {
+          if (connection === 2) reconnected = ws;
+          else ws.send(JSON.stringify({ type: "host.ready", v: 1, routeId, generation: message.generation }));
+        }
       });
     });
     const states: string[] = [];
@@ -249,6 +257,12 @@ describe("RelayHostClient", () => {
     await waitFor(() => snapshots.length === 1 && client.status().state === "online");
     first!.close();
     await waitFor(() => snapshots.length === 2);
+    expect(snapshots[1]!.generation).toBeGreaterThan(snapshots[0]!.generation);
+    expect(client.status().state).toBe("syncing");
+    reconnected!.send(JSON.stringify({
+      type: "host.ready", v: 1, routeId: snapshots[1]!.routeId, generation: snapshots[1]!.generation,
+    }));
+    await waitFor(() => client.status().state === "online");
 
     client.update(config(relay.url), [firstDevice, device("second")]);
     await waitFor(() => snapshots.length >= 3 && client.status().devices.ready === 2);
@@ -275,6 +289,210 @@ describe("RelayHostClient", () => {
     client.update(config("ws://127.0.0.1:9000"), [device("one")]);
     expect(client.status()).toMatchObject({ state: "error", lastError: "relay URL or key is invalid" });
     client.close();
+  });
+
+  it("waits for ready once per control connection, then resumes later credential snapshots on ACK and heartbeat", async () => {
+    const dir = home();
+    const relay = await relayServer();
+    const generations: number[] = [];
+    const heartbeats: number[] = [];
+    let routeId = "";
+    let control: WebSocket | undefined;
+    relay.wss.on("connection", (ws) => {
+      control = ws;
+      ws.on("message", (raw) => {
+        const message = JSON.parse(raw.toString()) as { routeId?: string; type?: string; generation?: number };
+        if (!message.type) {
+          routeId = message.routeId!;
+          return;
+        }
+        if (message.type === "host.device-sync") {
+          generations.push(message.generation!);
+          ws.send(JSON.stringify({ type: "host.device-sync.ack", v: 1, generation: message.generation }));
+          // T2's relay sends host.ready exactly once, after this connection's
+          // first snapshot. The test emits that frame below and never again.
+          return;
+        }
+        if (message.type === "host.heartbeat") {
+          heartbeats.push(message.generation!);
+          ws.send(JSON.stringify({ type: "host.heartbeat.ack", v: 1, generation: message.generation }));
+        }
+      });
+    });
+    const client = new RelayHostClient({
+      devMode: true, stateDir: dir, minReconnectMs: 5, maxReconnectMs: 10, random: () => 1,
+      heartbeatMs: 20, heartbeatAckTimeoutMs: 100, onStream: () => {},
+    });
+    try {
+      const first = device("ready-once");
+      const relayConfig = config(relay.url);
+      client.update(relayConfig, [first]);
+      await waitFor(() => generations.length === 1);
+      expect(client.status().state).toBe("syncing");
+
+      control!.send(JSON.stringify({
+        type: "host.ready", v: 1, routeId, generation: generations[0],
+      }));
+      await waitFor(() => client.status().state === "online" && heartbeats.includes(generations[0]!));
+
+      client.update(relayConfig, [first, device("ready-once-second")]);
+      await waitFor(() =>
+        generations.length === 2 && client.status().state === "online" && heartbeats.includes(generations[1]!),
+      );
+      expect(generations[1]).toBeGreaterThan(generations[0]!);
+    } finally {
+      client.close();
+      await relay.close();
+    }
+  });
+
+  it("leaves relay state untouched for lastSeen, metadata, permission, and no-op device updates", async () => {
+    const dir = home();
+    const relay = await relayServer();
+    const snapshots: number[] = [];
+    let routeId = "";
+    let control: WebSocket | undefined;
+    let streamReady = false;
+    let streamClosed = false;
+    relay.wss.on("connection", (ws, req) => {
+      if (req.url === "/v1/stream") {
+        ws.once("message", (raw) => {
+          expect(JSON.parse(raw.toString())).toMatchObject({ type: "stream.accept" });
+          ws.send(JSON.stringify({ type: "stream.ready", v: 1, streamId: "stream_metadata_012345" }));
+        });
+        ws.once("close", () => { streamClosed = true; });
+        return;
+      }
+      control = ws;
+      ws.on("message", (raw) => {
+        const message = JSON.parse(raw.toString()) as { routeId?: string; type?: string; generation?: number };
+        if (!message.type) {
+          routeId = message.routeId!;
+          return;
+        }
+        if (message.type === "host.device-sync") {
+          snapshots.push(message.generation!);
+          ws.send(JSON.stringify({ type: "host.device-sync.ack", v: 1, generation: message.generation }));
+          ws.send(JSON.stringify({ type: "host.ready", v: 1, routeId, generation: message.generation }));
+          return;
+        }
+        if (message.type === "host.heartbeat") {
+          ws.send(JSON.stringify({ type: "host.heartbeat.ack", v: 1, generation: message.generation }));
+        }
+      });
+    });
+    const client = new RelayHostClient({
+      devMode: true, stateDir: dir, minReconnectMs: 5, maxReconnectMs: 10, random: () => 1,
+      heartbeatMs: 1_000, heartbeatAckTimeoutMs: 1_000, onStream: () => { streamReady = true; },
+    });
+    try {
+      const first = device("metadata");
+      const relayConfig = config(relay.url);
+      client.update(relayConfig, [first]);
+      await waitFor(() => client.status().state === "online" && snapshots.length === 1);
+      control!.send(JSON.stringify({
+        type: "stream.offer", v: 1, streamId: "stream_metadata_012345", ticket: "ticket_metadata_012345",
+        deviceId: first.relayDeviceId, expiresAt: Date.now() + 10_000,
+      }));
+      await waitFor(() => streamReady);
+
+      const journal = path.join(dir, RELAY_SYNC_STATE_FILE);
+      const journalBefore = readFileSync(journal, "utf8");
+      const metadataOnly = {
+        ...first,
+        name: "metadata-renamed",
+        lastSeenAt: 2,
+        allowShell: false,
+        allowOrchestration: false,
+      };
+      client.update(relayConfig, [metadataOnly]);
+      client.update(relayConfig, [{ ...metadataOnly, lastSeenAt: 3 }]);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      expect(snapshots).toHaveLength(1);
+      expect(readFileSync(journal, "utf8")).toBe(journalBefore);
+      expect(streamClosed).toBe(false);
+    } finally {
+      client.close();
+      await relay.close();
+    }
+  });
+
+  it("pauses offers and closes active data sockets until a credential replacement ACK arrives", async () => {
+    const dir = home();
+    const relay = await relayServer();
+    let routeId = "";
+    let control: WebSocket | undefined;
+    let updateGeneration: number | undefined;
+    const heartbeats: number[] = [];
+    let streamReady = false;
+    let streamClosed = false;
+    let revokedOffer = false;
+    relay.wss.on("connection", (ws, req) => {
+      if (req.url === "/v1/stream") {
+        ws.once("message", (raw) => {
+          expect(JSON.parse(raw.toString())).toMatchObject({ type: "stream.accept" });
+          ws.send(JSON.stringify({ type: "stream.ready", v: 1, streamId: "stream_sync_012345" }));
+        });
+        ws.once("close", () => { streamClosed = true; });
+        return;
+      }
+      control = ws;
+      let snapshots = 0;
+      ws.on("message", (raw) => {
+        const message = JSON.parse(raw.toString()) as { routeId?: string; type?: string; generation?: number };
+        if (!message.type) {
+          routeId = message.routeId!;
+          return;
+        }
+        if (message.type === "host.device-sync") {
+          snapshots++;
+          if (snapshots === 1) {
+            ws.send(JSON.stringify({ type: "host.device-sync.ack", v: 1, generation: message.generation }));
+            ws.send(JSON.stringify({ type: "host.ready", v: 1, routeId, generation: message.generation }));
+          } else {
+            updateGeneration = message.generation;
+          }
+          return;
+        }
+        if (message.type === "host.heartbeat") {
+          heartbeats.push(message.generation!);
+          ws.send(JSON.stringify({ type: "host.heartbeat.ack", v: 1, generation: message.generation }));
+          return;
+        }
+        if (message.type === "stream.revoke") revokedOffer = true;
+      });
+    });
+    const client = new RelayHostClient({
+      devMode: true, stateDir: dir, minReconnectMs: 5, maxReconnectMs: 10, random: () => 1,
+      heartbeatMs: 20, heartbeatAckTimeoutMs: 100, onStream: () => { streamReady = true; },
+    });
+    try {
+      const first = device("sync-pause");
+      const relayConfig = config(relay.url);
+      client.update(relayConfig, [first]);
+      await waitFor(() => client.status().state === "online");
+      control!.send(JSON.stringify({
+        type: "stream.offer", v: 1, streamId: "stream_sync_012345", ticket: "ticket_sync_012345",
+        deviceId: first.relayDeviceId, expiresAt: Date.now() + 10_000,
+      }));
+      await waitFor(() => streamReady);
+
+      client.update(relayConfig, [first, device("sync-pause-second")]);
+      await waitFor(() => updateGeneration !== undefined && streamClosed);
+      expect(client.status().state).toBe("syncing");
+      control!.send(JSON.stringify({
+        type: "stream.offer", v: 1, streamId: "stream_sync_new_012345", ticket: "ticket_sync_new_012345",
+        deviceId: first.relayDeviceId, expiresAt: Date.now() + 10_000,
+      }));
+      await waitFor(() => revokedOffer);
+
+      control!.send(JSON.stringify({ type: "host.device-sync.ack", v: 1, generation: updateGeneration }));
+      await waitFor(() => client.status().state === "online" && heartbeats.includes(updateGeneration!));
+    } finally {
+      client.close();
+      await relay.close();
+    }
   });
 
   it("persists strictly increasing route-local generations across restart and initializes a rotated route independently", async () => {
@@ -328,11 +546,13 @@ describe("RelayHostClient", () => {
     }
   });
 
-  it("recovers from duplicate current ACKs and ignores a late ACK/ready while a newer snapshot is pending", async () => {
+  it("brings only the latest rapid credential generation online after late ACK/ready frames, then restores heartbeat", async () => {
     const dir = home();
     const relay = await relayServer();
     const generations: number[] = [];
+    const heartbeats: number[] = [];
     let controls = 0;
+    let staleFramesSent = false;
     relay.wss.on("connection", (ws) => {
       let routeId = "";
       ws.on("message", (raw) => {
@@ -341,12 +561,17 @@ describe("RelayHostClient", () => {
           routeId = message.routeId!;
           return;
         }
+        if (message.type === "host.heartbeat") {
+          heartbeats.push(message.generation!);
+          ws.send(JSON.stringify({ type: "host.heartbeat.ack", v: 1, generation: message.generation }));
+          return;
+        }
         if (message.type !== "host.device-sync") return;
         controls++;
         const generation = message.generation!;
         generations.push(generation);
         if (controls === 1) {
-          // ACK delivery is idempotent; receiving it twice must still reach ready.
+          // ACK delivery is idempotent, and the first snapshot alone emits ready.
           ws.send(JSON.stringify({ type: "host.device-sync.ack", v: 1, generation }));
           ws.send(JSON.stringify({ type: "host.device-sync.ack", v: 1, generation }));
           ws.send(JSON.stringify({ type: "host.ready", v: 1, routeId, generation }));
@@ -356,14 +581,16 @@ describe("RelayHostClient", () => {
         const previous = generations[1]!;
         ws.send(JSON.stringify({ type: "host.device-sync.ack", v: 1, generation: previous }));
         ws.send(JSON.stringify({ type: "host.ready", v: 1, routeId, generation: previous }));
+        staleFramesSent = true;
         setTimeout(() => {
+          // T2 only ACKs replacements on an already-ready socket.
           ws.send(JSON.stringify({ type: "host.device-sync.ack", v: 1, generation }));
-          ws.send(JSON.stringify({ type: "host.ready", v: 1, routeId, generation }));
-        }, 5);
+        }, 20);
       });
     });
     const client = new RelayHostClient({
       devMode: true, stateDir: dir, minReconnectMs: 5, maxReconnectMs: 10, random: () => 1, onStream: () => {},
+      heartbeatMs: 20, heartbeatAckTimeoutMs: 100,
     });
     try {
       const first = device("rapid-one");
@@ -373,7 +600,9 @@ describe("RelayHostClient", () => {
       client.update(relayConfig, [first, device("rapid-two")]);
       await waitFor(() => generations.length === 2);
       client.update(relayConfig, [first]);
-      await waitFor(() => client.status().state === "online" && generations.length === 3);
+      await waitFor(() => generations.length === 3 && staleFramesSent);
+      expect(client.status().state).toBe("syncing");
+      await waitFor(() => client.status().state === "online" && heartbeats.includes(generations[2]!));
       expect(generations[0]).toBeLessThan(generations[1]!);
       expect(generations[1]).toBeLessThan(generations[2]!);
       expect(client.status()).toMatchObject({ state: "online", devices: { ready: 1 } });
