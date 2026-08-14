@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { AutomationService } from "../src/orchestration/automation.js";
 import { CollaborationService } from "../src/orchestration/collaboration.js";
 import { orchestrationControlApi } from "../src/orchestration/control-api.js";
 import { DispatchService, type WorkerSessionManager } from "../src/orchestration/dispatch.js";
@@ -66,6 +67,42 @@ describe("控制 API 的交付报告", () => {
       actorSessionId: "coord",
     }, new AbortController().signal);
     expect(store.getTask(task.id).status).toBe("pending");
+  });
+
+  it("gate.resolve 会唤醒自动执行，让已交付的 Run 在 run-level Gate 解开后收口", async () => {
+    const store = new OrchestrationStore();
+    const run = store.createRun({ objective: "等待发布确认" });
+    const task = store.createTask({ runId: run.id, title: "实现", spec: "完成实现" });
+    const dispatch = store.createDispatch({ taskId: task.id, sessionId: "worker" });
+    store.setTaskStatus(task.id, "done", "已验收");
+    store.setDispatchState(dispatch.id, "succeeded", "已验收");
+    store.setRunAutomation(run.id, {
+      state: "running",
+      agent: "codex",
+      approvalPolicy: "standard",
+      workspace: "current",
+      cwd: "/tmp/project",
+      workspacePath: "/tmp/project",
+      branch: null,
+      startedAt: 1,
+      updatedAt: 1,
+      lastError: null,
+    });
+    const gate = store.createGate({ runId: run.id, question: "是否发布？" });
+    const workerDispatch = new DispatchService(store, unusedSessions);
+    const automation = new AutomationService(store, workerDispatch);
+    const api = orchestrationControlApi(store, workerDispatch, new CollaborationService(store), automation);
+
+    await api("gate.resolve", {
+      gateId: gate.id,
+      decision: "发布",
+      actorSessionId: null,
+    }, new AbortController().signal);
+
+    await vi.waitFor(() => expect(store.getRun(run.id)).toMatchObject({
+      status: "completed",
+      automation: { state: "completed", lastError: null },
+    }));
   });
 
   it("只有协调者能显式完成自己的 Run", async () => {
