@@ -181,7 +181,7 @@ export function orchestrationControlApi(
   dispatch: DispatchService,
   collaboration: CollaborationService,
   automation?: AutomationService,
-  worktrees = new WorktreeAssetService(store),
+  worktrees = new WorktreeAssetService(store, undefined, dispatch.sessionInspector()),
 ): (method: string, params: unknown, signal: AbortSignal) => Promise<unknown> {
   const inflight = new Map<string, { fingerprint: string; promise: Promise<unknown> }>();
 
@@ -267,6 +267,7 @@ export function orchestrationControlApi(
             { runId, actorSessionId },
             () => {
               ownerOrCoordinator(store, runId, actorSessionId);
+              dispatch.assertNoLiveSessionForRun(runId);
               if (store.getRun(runId).automation?.state === "running") {
                 automation?.pause(runId);
               }
@@ -337,7 +338,7 @@ export function orchestrationControlApi(
           const actorSessionId = optionalText(params, "actorSessionId");
           const taskId = text(params, "taskId");
           const wasDone = store.getTask(taskId).status === "done";
-          const task = dispatch.completeTask(
+          const task = await dispatch.completeTask(
             taskId,
             actorSessionId,
             text(params, "body"),
@@ -350,7 +351,7 @@ export function orchestrationControlApi(
           const actorSessionId = optionalText(params, "actorSessionId");
           const taskId = text(params, "taskId");
           const wasFailed = store.getTask(taskId).status === "failed";
-          const task = dispatch.failTask(
+          const task = await dispatch.failTask(
             taskId,
             actorSessionId,
             text(params, "body"),

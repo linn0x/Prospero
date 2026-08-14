@@ -122,6 +122,8 @@ export interface StructuredSessionPersistentState {
   adapterState: AdapterResumeState;
   /** 兼容早期 version=1 状态；新写入总会带这个字段。 */
   messageQueue?: QueuedChatPersistent[];
+  /** 已终止 worker 的本地审计历史；恢复时不可重启或接受新 chat。 */
+  terminal?: true;
 }
 
 export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
@@ -171,6 +173,11 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     this.environment = opts.environment ?? {};
     this.codexAppServerArgs = opts.codexAppServerArgs;
     const restored = opts.restored;
+    if (restored?.terminal) {
+      this.status = "done";
+      this.disposed = true;
+      this.backendAvailable = false;
+    }
     this.createdAt = restored?.createdAt ?? Date.now();
     this.policy = restored?.approvalPolicy ?? opts.approvalPolicy ?? DEFAULT_POLICY;
     this.adapterState = { ...(opts.initialAdapterState ?? {}) };
@@ -290,6 +297,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
   private policy: ApprovalPolicy = DEFAULT_POLICY;
 
   async setApprovalPolicy(policy: ApprovalPolicy): Promise<void> {
+    if (this.disposed) throw new Error("会话已经结束，历史只读");
     this.policy = policy;
     await this.adapter.setApprovalPolicy?.(policy);
     this.emit("state", this.info());
@@ -432,6 +440,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
         ...item,
         attachments: item.attachments.map((attachment) => ({ ...attachment })),
       })),
+      ...(this.disposed ? { terminal: true as const } : {}),
     };
   }
 
@@ -668,6 +677,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     attachments?: Attachment[],
     delivery: ChatDelivery = "auto",
   ): Promise<void> {
+    if (this.disposed) throw new Error("会话已经结束，历史只读");
     if (!this.backendAvailable) throw new Error("会话后端未恢复;重启 daemon 后会再次尝试");
     const busy =
       this.status === "starting" ||
@@ -706,6 +716,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
 
   /** 取消尚未发给 agent 的消息。已经 steer/发送的内容不能假装撤回。 */
   removeQueued(queueId: string): boolean {
+    if (this.disposed) return false;
     const index = this.messageQueue.findIndex((item) => item.id === queueId);
     if (index < 0) return false;
     this.messageQueue.splice(index, 1);
@@ -719,6 +730,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
    * 消息改标为 guide 并移到队首；无论竞态如何都不会丢正文或附件。
    */
   async guideQueued(queueId: string): Promise<boolean> {
+    if (this.disposed) throw new Error("会话已经结束，历史只读");
     if (!this.backendAvailable) throw new Error("会话后端未恢复;无法发送引导");
     if (this.drainingQueue) throw new Error("队列正在发送，请稍后再试");
     const initial = this.messageQueue.find((item) => item.id === queueId);

@@ -1,6 +1,6 @@
 /** 把一个 ready task 变成实际 worker 会话的唯一入口。 */
 import type { AgentKind, SessionInfo, SessionKind } from "@prospero/protocol";
-import type { CreateSessionInput } from "../session-manager.js";
+import type { CreateSessionInput, KillSessionOptions } from "../session-manager.js";
 import {
   createEsaytree,
   repoRoot,
@@ -10,6 +10,12 @@ import {
 import { OrchestrationStore } from "./store.js";
 import type { Dispatch, Task } from "./model.js";
 import { WorktreeAssetService } from "./worktree-assets.js";
+import {
+  findLiveSessionForRun,
+  findLiveWorktreeLease,
+  registeredWorktreeAssetForCwd,
+  type WorktreeSessionInspector,
+} from "./worktree-leases.js";
 
 export type WorktreeMode = "new" | "none";
 
@@ -17,8 +23,8 @@ export interface WorkerSessionManager {
   create(input: CreateSessionInput): Promise<SessionInfo>;
   chatSend(sid: string, text: string): Promise<void>;
   requirePty(sid: string): { writeInput(text: string): void };
-  kill(sid: string): Promise<void>;
-  infoOf?(sid: string): SessionInfo;
+  kill(sid: string, options?: KillSessionOptions): Promise<void>;
+  infoOf(sid: string): SessionInfo;
 }
 
 export interface StartWorkerInput {
@@ -67,18 +73,30 @@ export interface DispatchRecoveryResult {
 export class DispatchError extends Error {
   constructor(
     message: string,
-    readonly code: "task_not_ready" | "not_a_repo" | "wrong_worker" | "worker_not_active",
+    readonly code:
+      | "task_not_ready"
+      | "not_a_repo"
+      | "wrong_worker"
+      | "worker_not_active"
+      | "worktree_busy"
+      | "worker_session_live",
   ) {
     super(message);
   }
 }
 
 export class DispatchService {
+  private readonly worktreeAssets: WorktreeAssetService;
+  /** Session 尚未创建完成时也必须占住已登记 worktree，避免并发请求双写。 */
+  private readonly startingWorktreeAssetIds = new Set<string>();
+
   constructor(
     private readonly store: OrchestrationStore,
     private readonly sessions: WorkerSessionManager,
-    private readonly worktreeAssets = new WorktreeAssetService(store),
-  ) {}
+    worktreeAssets?: WorktreeAssetService,
+  ) {
+    this.worktreeAssets = worktreeAssets ?? new WorktreeAssetService(store, undefined, sessions);
+  }
 
   /**
    * 人类显式停止 worker。先终止真实会话，再把这次派发落为 abandoned；若 worker
@@ -136,7 +154,7 @@ export class DispatchService {
 
       let session: SessionInfo | null = null;
       try {
-        session = this.sessions.infoOf?.(dispatch.sessionId) ?? null;
+        session = this.sessions.infoOf(dispatch.sessionId);
       } catch {
         // SessionManager 用抛错表达不存在；恢复对账必须把它当成正常输入。
       }
@@ -186,6 +204,7 @@ export class DispatchService {
     let worktree: ({ repo: string } & WorkerWorktree) | null = null;
     let session: SessionInfo | null = null;
     let dispatch: Dispatch | null = null;
+    let startingAssetId: string | null = null;
     try {
       let workerCwd = input.cwd;
       if (input.worktree === "new") {
@@ -220,11 +239,35 @@ export class DispatchService {
           ms: created.ms,
           fallbackReason: created.fallbackReason ?? null,
         };
+      } else {
+        const registered = registeredWorktreeAssetForCwd(this.store, workerCwd);
+        if (registered && this.startingWorktreeAssetIds.has(registered.id)) {
+          throw new DispatchError(
+            `工作目录 ${workerCwd} 所在的登记工作树正在创建另一名 worker；请等待该派发落定`,
+            "worktree_busy",
+          );
+        }
+        const lease = findLiveWorktreeLease(this.store, this.sessions, workerCwd);
+        if (lease) {
+          throw new DispatchError(
+            `工作目录 ${workerCwd} 属于已登记工作树 ${lease.asset.path}，仍由会话 ${lease.session.id} 写入；请先等待其终态或停止该 worker`,
+            "worktree_busy",
+          );
+        }
+        if (registered) {
+          this.startingWorktreeAssetIds.add(registered.id);
+          startingAssetId = registered.id;
+        }
       }
 
-      const coordinator = run.coordinatorSessionId && this.sessions.infoOf
-        ? this.sessions.infoOf(run.coordinatorSessionId)
-        : null;
+      let coordinator: SessionInfo | null = null;
+      if (run.coordinatorSessionId) {
+        try {
+          coordinator = this.sessions.infoOf(run.coordinatorSessionId);
+        } catch {
+          // 协调者可能已经结束或不由当前 SessionManager 托管；账号继承只是增强。
+        }
+      }
       const inheritedAccountId =
         input.accountId ??
         (coordinator?.agent === input.agent ? coordinator.accountId : undefined);
@@ -284,37 +327,83 @@ export class DispatchService {
         );
       }
       throw error;
+    } finally {
+      if (startingAssetId) this.startingWorktreeAssetIds.delete(startingAssetId);
     }
   }
 
   /** worker 显式交付成功；会话 idle/done 绝不触发这里。 */
-  completeTask(taskId: string, actorSessionId: string | null, body: string): Task {
+  async completeTask(taskId: string, actorSessionId: string | null, body: string): Promise<Task> {
     const task = this.store.getTask(taskId);
-    if (task.status === "done") return task; // CLI 重试可安全重放
+    if (task.status === "done") {
+      await this.terminatePreviouslyDeliveredWorker(taskId, "succeeded");
+      return task; // CLI 重试可安全重放
+    }
     const dispatch = this.store.activeDispatchFor(taskId);
     this.assertWorker(dispatch, actorSessionId, taskId);
-    const completed = this.store.setTaskStatus(taskId, "done", body);
-    this.store.setDispatchState(dispatch.id, "succeeded", body);
-    this.store.preserveWorktreeAssetsForDispatch(
+    const completed = this.store.settleWorkerDelivery(
       dispatch.id,
+      "done",
+      "succeeded",
+      body,
       "worker 已交付；工作树默认保留，需显式检查或清理",
     );
+    await this.terminateDeliveredWorker(dispatch.sessionId);
     return completed;
   }
 
   /** worker 显式报告失败；failed 之后可由协调者退回 pending 重新派。 */
-  failTask(taskId: string, actorSessionId: string | null, body: string): Task {
+  async failTask(taskId: string, actorSessionId: string | null, body: string): Promise<Task> {
     const task = this.store.getTask(taskId);
-    if (task.status === "failed") return task;
+    if (task.status === "failed") {
+      await this.terminatePreviouslyDeliveredWorker(taskId, "failed");
+      return task;
+    }
     const dispatch = this.store.activeDispatchFor(taskId);
     this.assertWorker(dispatch, actorSessionId, taskId);
-    const failed = this.store.setTaskStatus(taskId, "failed", body);
-    this.store.setDispatchState(dispatch.id, "failed", body);
-    this.store.preserveWorktreeAssetsForDispatch(
+    const failed = this.store.settleWorkerDelivery(
       dispatch.id,
+      "failed",
+      "failed",
+      body,
       "worker 报告失败；工作树默认保留，需显式检查或清理",
     );
+    await this.terminateDeliveredWorker(dispatch.sessionId);
     return failed;
+  }
+
+  /** Run 删除前必须把已交付但仍活着的旧 session 当成 writer 保留索引。 */
+  assertNoLiveSessionForRun(runId: string): void {
+    const live = findLiveSessionForRun(this.store, this.sessions, runId);
+    if (live) {
+      throw new DispatchError(
+        `会话 ${live.id} 仍存活；不能删除 Run，以免后续清理遗失其工作树写入者`,
+        "worker_session_live",
+      );
+    }
+  }
+
+  /** 给 WorktreeAssetService 注入同一个 SessionManager 的只读查询面。 */
+  sessionInspector(): WorktreeSessionInspector {
+    return this.sessions;
+  }
+
+  /**
+   * 交付事实已由 settleWorkerDelivery 同步落盘；kill 只是防止结构化队列继续
+   * 消费，失败也绝不能把已经 done/failed 的任务回滚或伪装成 RPC 失败。
+   */
+  private async terminateDeliveredWorker(sessionId: string): Promise<void> {
+    await this.sessions.kill(sessionId, { preserveHistory: true }).catch(() => {});
+  }
+
+  private async terminatePreviouslyDeliveredWorker(
+    taskId: string,
+    state: "succeeded" | "failed",
+  ): Promise<void> {
+    const dispatch = this.store.listDispatches()
+      .filter((candidate) => candidate.taskId === taskId && candidate.state === state)
+      .at(-1);
+    if (dispatch) await this.terminateDeliveredWorker(dispatch.sessionId);
   }
 
   private assertWorker(dispatch: Dispatch | null, actorSessionId: string | null, taskId: string): asserts dispatch is Dispatch {

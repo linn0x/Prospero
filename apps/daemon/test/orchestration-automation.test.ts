@@ -40,6 +40,10 @@ class FakeSessions implements WorkerSessionManager {
   }
 
   async kill(): Promise<void> {}
+
+  infoOf(): SessionInfo {
+    throw new Error("no persisted session in this test double");
+  }
 }
 
 const roots: string[] = [];
@@ -103,12 +107,12 @@ describe("静态 DAG 自动执行", () => {
     await ctx.automation.advance(ctx.runId);
     expect(ctx.sessions.creates).toHaveLength(1);
 
-    ctx.dispatch.completeTask(ctx.firstId, "worker-1", "第一步已验收");
+    await ctx.dispatch.completeTask(ctx.firstId, "worker-1", "第一步已验收");
     await ctx.automation.advance(ctx.runId);
     expect(ctx.store.getTask(ctx.secondId).status).toBe("dispatched");
     expect(ctx.sessions.creates).toHaveLength(2);
 
-    ctx.dispatch.completeTask(ctx.secondId, "worker-2", "全部完成");
+    await ctx.dispatch.completeTask(ctx.secondId, "worker-2", "全部完成");
     await ctx.automation.advance(ctx.runId);
     expect(ctx.store.getRun(ctx.runId)).toMatchObject({
       status: "completed",
@@ -135,9 +139,9 @@ describe("静态 DAG 自动执行", () => {
       cwd,
     });
 
-    ctx.dispatch.completeTask(ctx.firstId, "worker-1", "第一步已验收");
+    await ctx.dispatch.completeTask(ctx.firstId, "worker-1", "第一步已验收");
     await ctx.automation.advance(ctx.runId);
-    ctx.dispatch.completeTask(ctx.secondId, "worker-2", "全部完成");
+    await ctx.dispatch.completeTask(ctx.secondId, "worker-2", "全部完成");
     const gate = ctx.store.createGate({ runId: ctx.runId, question: "是否发布？" });
 
     await ctx.automation.advance(ctx.runId);
@@ -166,7 +170,7 @@ describe("静态 DAG 自动执行", () => {
     };
     await ctx.automation.start(input);
     ctx.automation.pause(ctx.runId);
-    ctx.dispatch.completeTask(ctx.firstId, "worker-1", "完成");
+    await ctx.dispatch.completeTask(ctx.firstId, "worker-1", "完成");
     await ctx.automation.advance(ctx.runId);
     expect(ctx.sessions.creates).toHaveLength(1);
     expect(ctx.store.getTask(ctx.secondId).status).toBe("pending");

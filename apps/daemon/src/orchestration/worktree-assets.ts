@@ -11,6 +11,7 @@ import { promisify } from "node:util";
 import type { WorktreeAsset, WorktreeInspection } from "./model.js";
 import { removeWorktree } from "./esaytree.js";
 import { OrchestrationStore } from "./store.js";
+import { findLiveLeaseForAsset, type WorktreeSessionInspector } from "./worktree-leases.js";
 
 const exec = promisify(execFile);
 const MAX_GIT_BUFFER = 8 * 1024 * 1024;
@@ -79,6 +80,7 @@ export class WorktreeAssetService {
   constructor(
     private readonly store: OrchestrationStore,
     private readonly operations: WorktreeAssetOperations = defaultWorktreeAssetOperations,
+    private readonly sessions?: WorktreeSessionInspector,
   ) {}
 
   registerRun(input: {
@@ -137,6 +139,17 @@ export class WorktreeAssetService {
         "缺少可靠的源仓或待删分支提交；已保留工作树和分支",
         "cleanup_failed",
       );
+    }
+
+    // 已交付的 dispatch 不代表其结构化 session 已停止；若仍在消费旧队列，
+    // 删除目录会把它变成继续写向已移除工作树的孤儿。删除前使用同一
+    // SessionManager 的实时状态再核验一次，并把需后续处理的原因留在资产上。
+    const lease = this.sessions ? findLiveLeaseForAsset(this.store, this.sessions, asset) : null;
+    if (lease) {
+      const message = `会话 ${lease.session.id} 仍在使用此工作树；已保留目录，待其终态后再清理`;
+      this.store.preserveWorktreeAsset(asset.id, message);
+      this.store.persistNow();
+      throw new WorktreeAssetError(message, "worktree_not_cleanable");
     }
 
     try {
