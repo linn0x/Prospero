@@ -7,6 +7,12 @@ import { afterEach, describe, expect, it } from "vitest";
 
 const exec = promisify(execFile);
 const temps: string[] = [];
+const esaytreeBin = process.platform === "win32"
+  ? process.execPath
+  : path.resolve("bin/esaytree");
+const esaytreePrefix = process.platform === "win32"
+  ? [path.resolve("dist/esaytree-cli.js")]
+  : [];
 
 function fixture(): { repo: string; storage: string } {
   const repo = mkdtempSync(path.join(os.tmpdir(), "prospero-esaytree-cli-repo-"));
@@ -18,6 +24,7 @@ function fixture(): { repo: string; storage: string } {
   git("init", "-b", "main");
   git("config", "user.email", "test@example.com");
   git("config", "user.name", "Test");
+  git("config", "core.autocrlf", "false");
   writeFileSync(path.join(repo, "README.md"), "fixture\n");
   git("add", ".");
   git("commit", "-m", "init");
@@ -29,9 +36,13 @@ async function cli(
   storage: string,
   args: string[],
 ): Promise<{ stdout: string; stderr: string }> {
-  return await exec(path.resolve("bin/esaytree"), [...args, "-C", repo, "--json"], {
+  return await exec(esaytreeBin, [...esaytreePrefix, ...args, "-C", repo, "--json"], {
     cwd: path.resolve("."),
-    env: { ...process.env, ESAYTREE_ROOT: storage },
+    env: {
+      ...process.env,
+      ESAYTREE_ROOT: storage,
+      PATH: [path.dirname(process.execPath), process.env["PATH"] ?? ""].join(path.delimiter),
+    },
   });
 }
 

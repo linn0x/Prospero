@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  controlSocketPath,
   controlRequest,
   ControlSocketError,
   startControlSocket,
@@ -25,6 +26,12 @@ afterEach(async () => {
 });
 
 describe("control socket", () => {
+  it("uses a Windows named pipe path on Windows", () => {
+    const socket = controlSocketPath("C:\\Users\\test\\.prospero");
+    if (process.platform === "win32") expect(socket).toMatch(/^\\\\\.\\pipe\\prospero-/);
+    else expect(socket).toBe(path.join("C:\\Users\\test\\.prospero", "control.sock"));
+  });
+
   it("以 NDJSON 路由请求、检查 token，并把 token/socket 写成私有文件", async () => {
     const server = await startControlSocket({
       home: home(),
@@ -39,8 +46,12 @@ describe("control socket", () => {
       { hello: "world" },
     );
     expect(result).toEqual({ method: "echo", params: { hello: "world" } });
-    expect(statSync(server.path).mode & 0o777).toBe(0o600);
-    expect(statSync(server.tokenPath).mode & 0o777).toBe(0o600);
+    if (process.platform !== "win32") {
+      expect(statSync(server.path).mode & 0o777).toBe(0o600);
+      expect(statSync(server.tokenPath).mode & 0o777).toBe(0o600);
+    } else {
+      expect(readFileSync(server.tokenPath, "utf8")).toBe("secret\n");
+    }
 
     await expect(
       controlRequest({ socketPath: server.path, token: "wrong" }, "echo"),

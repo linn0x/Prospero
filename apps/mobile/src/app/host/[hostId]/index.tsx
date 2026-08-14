@@ -175,7 +175,7 @@ export default function HostScreen() {
     (model) => model.id === selectedLaunchModel,
   );
 
-  // 账号目录属于 Mac；每次回到主机页重读，确保账号管理页的新增/默认/删除立即生效。
+  // 账号目录属于电脑端；每次回到主机页重读，确保账号管理页的新增/默认/删除立即生效。
   useFocusEffect(
     useCallback(() => {
       if (!conn || runtime.status !== "connected" || !conn.supportsAgentAccounts) {
@@ -695,7 +695,7 @@ export default function HostScreen() {
                     {cwd.trim() ? projectNameFor(cwd.trim()) : "未选择项目"}
                   </Text>
                   <Text style={styles.selectedProjectPath} numberOfLines={2}>
-                    {cwd.trim() || (wideComposer ? "输入完整路径，或从 Mac 浏览选择" : "从 Mac 浏览选择目录")}
+                    {cwd.trim() || (wideComposer ? "输入完整路径，或从电脑浏览选择" : "从电脑浏览选择目录")}
                   </Text>
                   {!wideComposer && <Text style={styles.selectedProjectChange}>点按更换</Text>}
                 </View>
@@ -729,7 +729,7 @@ export default function HostScreen() {
                   ]}
                   disabled={runtime.status !== "connected"}
                   onPress={() => setPickerOpen(true)}
-                  accessibilityLabel="浏览 Mac 上的目录"
+                  accessibilityLabel="浏览电脑上的目录"
                 >
                   <Text style={styles.browseBtnText}>浏览</Text>
                 </Pressable>
@@ -1017,7 +1017,7 @@ export default function HostScreen() {
                   <>
                     <Text style={[styles.formLabel, styles.kindLabel]}>模型与推理强度</Text>
                     <Text style={styles.kindHelp}>
-                      Mac 端仍在运行旧版 daemon；重启 Mac 上的 Prospero 后即可选择。
+                      电脑端仍在运行旧版 daemon；重启电脑上的 Prospero 后即可选择。
                     </Text>
                   </>
                 )}

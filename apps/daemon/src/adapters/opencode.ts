@@ -10,9 +10,10 @@
  * - 创建会话必须显式带 model,否则 prompt 只会 admitted 而不触发模型;
  *   默认模型从 GET /config 的 `model` 字段读("providerID/model-id",id 可含斜杠)
  */
-import { spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 import type { AgentEventBody, PermissionReply } from "@prospero/protocol";
+import crossSpawn from "cross-spawn";
 import {
   AdapterError,
   summarize,
@@ -56,7 +57,7 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
 
 /** 起 opencode serve 并持续消费 SSE;整个 daemon 共用一个 */
 async function startSharedServer(): Promise<SharedServer> {
-  const proc = spawn("opencode", ["serve", "--hostname", "127.0.0.1", "--port", "0"], {
+  const proc = crossSpawn("opencode", ["serve", "--hostname", "127.0.0.1", "--port", "0"], {
     stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env },
   });

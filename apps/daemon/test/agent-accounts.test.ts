@@ -78,6 +78,34 @@ class MemoryCredentialStore implements AgentAccountCredentialStore {
 }
 
 describe("Code Agent 账号隔离", () => {
+  it("区分 Codex 未登录与状态命令异常", async () => {
+    const signedOut = new AgentAccountManager(tempHome(), async () => ({
+      stdout: "",
+      stderr: "Not logged in",
+      exitCode: 1,
+    }));
+    await expect(signedOut.snapshot([])).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "native-codex", status: "signed_out" }),
+      ]),
+    );
+
+    const failed = new AgentAccountManager(tempHome(), async (file) => ({
+      stdout: "",
+      stderr: file === "codex" ? "unexpected failure" : "",
+      exitCode: 1,
+    }));
+    await expect(failed.snapshot([])).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "native-codex",
+          status: "error",
+          detail: "Codex CLI 无法读取登录状态",
+        }),
+      ]),
+    );
+  });
+
   it("只保存元数据，并为 Codex/Claude 生成不同的官方配置目录", async () => {
     const home = tempHome();
     const calls: Array<{ file: string; args: string[]; env: Record<string, string> }> = [];
@@ -98,8 +126,14 @@ describe("Code Agent 账号隔离", () => {
     expect(claude.environment["CLAUDE_CODE_OAUTH_TOKEN"]).toBe(
       "prospero-managed-account-not-authenticated",
     );
-    expect(statSync(codex.environment["CODEX_HOME"]!).mode & 0o777).toBe(0o700);
-    expect(statSync(path.join(home, "agent-accounts.json")).mode & 0o777).toBe(0o600);
+    const codexRootStat = statSync(codex.environment["CODEX_HOME"]!);
+    const storeStat = statSync(path.join(home, "agent-accounts.json"));
+    expect(codexRootStat.isDirectory()).toBe(true);
+    expect(storeStat.isFile()).toBe(true);
+    if (process.platform !== "win32") {
+      expect(codexRootStat.mode & 0o777).toBe(0o700);
+      expect(storeStat.mode & 0o777).toBe(0o600);
+    }
 
     const disk = readFileSync(path.join(home, "agent-accounts.json"), "utf8");
     expect(disk).toContain("工作 Codex");

@@ -16,7 +16,7 @@
  * - 审批请求:item/commandExecution/requestApproval、item/fileChange/requestApproval
  * - 决定值 ReviewDecision:"approved" | "approved_for_session" | {denied:{rejection}} | "abort"
  */
-import { spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import os from "node:os";
 import type {
@@ -29,6 +29,7 @@ import type {
   SubagentInfo,
   SubagentStatus,
 } from "@prospero/protocol";
+import crossSpawn from "cross-spawn";
 import { needsApproval } from "../approval-policy.js";
 import type { ResolvedSkill } from "../composer-context.js";
 import { DAEMON_VERSION } from "../version.js";
@@ -258,7 +259,7 @@ export class CodexAdapter implements AgentAdapter {
   ): Promise<void> {
     this.stderrTail = "";
     this.buf = "";
-    const proc = spawn("codex", ["app-server", ...(appServerArgs ?? [])], {
+    const proc = crossSpawn("codex", ["app-server", ...(appServerArgs ?? [])], {
       stdio: ["pipe", "pipe", "pipe"],
       cwd,
       env: { ...process.env, ...environment },

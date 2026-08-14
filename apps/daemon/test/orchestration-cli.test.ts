@@ -9,6 +9,12 @@ import { createDaemonServer, type DaemonServer } from "../src/ws-server.js";
 const exec = promisify(execFile);
 const homes: string[] = [];
 const servers: DaemonServer[] = [];
+const prosperoBin = process.platform === "win32"
+  ? process.execPath
+  : path.resolve("bin/prospero");
+const prosperoPrefix = process.platform === "win32"
+  ? [path.resolve("dist/orchestration-cli.js")]
+  : [];
 
 function tempHome(): string {
   const home = mkdtempSync(path.join(os.tmpdir(), "prospero-orchestration-cli-"));
@@ -27,8 +33,8 @@ async function cli(
   args: string[],
   session?: string,
 ): Promise<unknown> {
-  const bin = path.resolve("bin/prospero");
-  const { stdout } = await exec(bin, [
+  const { stdout } = await exec(prosperoBin, [
+    ...prosperoPrefix,
     "--socket", socket,
     "--token-file", tokenFile,
     ...(session ? ["--session", session] : []),
@@ -37,7 +43,11 @@ async function cli(
     cwd: path.resolve(".."),
     // 测试本身可能正跑在 Prospero agent 会话里；未显式传 session 时不能继承
     // 外层协调者 ID，否则手工 Run 会被误判成协调者 Run。
-    env: { ...process.env, PROSPERO_SESSION_ID: session ?? "" },
+    env: {
+      ...process.env,
+      PROSPERO_SESSION_ID: session ?? "",
+      PATH: [path.dirname(process.execPath), process.env["PATH"] ?? ""].join(path.delimiter),
+    },
   });
   return JSON.parse(stdout) as unknown;
 }
