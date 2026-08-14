@@ -115,7 +115,8 @@ prospero worktree cleanup --id WT_ASSET_ID --target main \
 `inspect` 只读 Git，明确返回 `missing`、`dirty`、`unmerged`、`equivalent` 或
 `safe_to_clean`（元数据异常为 `unknown`）。目标 ref 会先在与待检查工作树不同的、可靠的
 源仓/主工作树中固定解析为 commit SHA；因此 v1 worker 的 `repo === path` 不会把自己的
-`HEAD` 当作已合入目标。找不到这种独立上下文时只返回 `unknown`，绝不允许清理。
+`HEAD` 当作已合入目标。v1 Run 若登记的是 monorepo 子目录，检查会先解析实际 worktree
+根目录，并只对该根执行移除。找不到可靠上下文时只返回 `unknown`，绝不允许清理。
 
 `cleanup` 必须带 `confirm` 和幂等 `operationId`，执行前会在同一可靠上下文重新检查、以
 非 force 的 Git 移除作为第二道保护；默认保留本地分支。额外传 `--delete-branch` 时，会以
