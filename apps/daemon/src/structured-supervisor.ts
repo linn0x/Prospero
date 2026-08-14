@@ -7,6 +7,7 @@
  */
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import {
+  appendFileSync,
   chmodSync,
   existsSync,
   lstatSync,
@@ -48,6 +49,12 @@ export interface SupervisorAdapter {
   interrupt?(): Promise<void>;
   /** Explicit kill only; neither socket close nor daemon shutdown calls this. */
   kill?(): Promise<void>;
+  /**
+   * Provider-neutral control plane used by the production StructuredSession
+   * wrapper.  The transport deliberately treats the method and payload as
+   * opaque: provider vocabularies (especially approvals) stay in the runner.
+   */
+  call?(method: string, params: unknown): Promise<unknown>;
 }
 
 export interface SupervisorReplay {
@@ -61,6 +68,8 @@ export interface StructuredSupervisorOptions {
   /** Private directory, normally ~/.prospero/structured-supervisor. */
   home: string;
   socketPath?: string;
+  /** Defaults to supervisor.token for the standalone transport slice. */
+  tokenPath?: string;
   token?: string;
 }
 
@@ -81,6 +90,7 @@ interface PersistedSession {
   /** Sequence immediately before events[0] when retention compacted history. */
   oldestSeq: number;
   lastSeq: number;
+  /** Bounded/terminal snapshot; events.jsonl is canonical between snapshots. */
   events: SupervisorEvent[];
 }
 
@@ -170,6 +180,7 @@ function write(socket: Socket, value: Record<string, unknown>): void {
 
 class SupervisorState {
   private readonly statePath: string;
+  private readonly eventsPath: string;
   readonly sessions = new Map<string, RuntimeSession>();
 
   constructor(
@@ -177,6 +188,7 @@ class SupervisorState {
     private readonly broadcast: (event: SupervisorEvent) => void,
   ) {
     this.statePath = path.join(home, "state.json");
+    this.eventsPath = path.join(home, "events.jsonl");
     this.load();
   }
 
@@ -216,7 +228,7 @@ class SupervisorState {
       // reports an expected cancellation/startup error.
       if (!isKilled(runtime.persisted.status)) {
         runtime.persisted.status = "failed";
-        this.persist();
+        this.persist(true);
       }
       throw error;
     }
@@ -242,8 +254,17 @@ class SupervisorState {
     // can still emit during (or even after) cancellation; those late events
     // must not revive a session or leak into a subsequent daemon attachment.
     session.persisted.status = "killed";
-    this.persist();
+    this.persist(true);
     await session.adapter?.kill?.();
+  }
+
+  async call(sessionId: string, method: string, params: unknown): Promise<unknown> {
+    const session = this.require(sessionId);
+    if (session.persisted.status === "killed") {
+      throw new SupervisorError("session 已被显式终止", "session_killed");
+    }
+    if (!session.adapter?.call) throw new SupervisorError("adapter 不支持 control call", "unsupported");
+    return session.adapter.call(method, params);
   }
 
   status(sessionId: string): { status: SupervisorSessionStatus; lastSeq: number } {
@@ -270,15 +291,26 @@ class SupervisorState {
       at: Date.now(),
       body,
     };
+    // Appending one framed record is O(1) in the number of streamed deltas.
+    // It is completed before clients are notified, preserving the replay
+    // contract without repeatedly serializing a 4,000-event JSON array.
+    appendFileSync(this.eventsPath, `${JSON.stringify(event)}\n`, { mode: 0o600 });
+    chmodSync(this.eventsPath, 0o600);
     persisted.lastSeq = event.seq;
     persisted.events.push(event);
     while (persisted.events.length > MAX_EVENTS_PER_SESSION) {
       const removed = persisted.events.shift();
       if (removed) persisted.oldestSeq = removed.seq;
     }
-    // Durably replace state before any client gets a notification. This is the
-    // no-loss side of the reconnect contract.
-    this.persist();
+    // State snapshots remain bounded and are only rewritten for terminal or
+    // interaction boundaries; events.jsonl above is the durable hot path.
+    if (isSnapshotBoundary(body)) {
+      // Snapshot first, then atomically discard exactly the journal prefix it
+      // contains. A crash before this point replays the harmless duplicate
+      // prefix; a crash after it has the complete bounded snapshot.
+      this.persist(true);
+      this.compactJournal();
+    }
     this.broadcast(event);
   }
 
@@ -305,9 +337,9 @@ class SupervisorState {
     }
     for (const candidate of state.sessions) {
       if (!candidate || typeof candidate !== "object" || !SESSION_ID.test(candidate.id)) continue;
-      if (!Array.isArray(candidate.events) || typeof candidate.lastSeq !== "number" || typeof candidate.oldestSeq !== "number") continue;
+      if (typeof candidate.lastSeq !== "number" || typeof candidate.oldestSeq !== "number") continue;
       if (!isStatus(candidate.status)) continue;
-      const events = candidate.events.filter(isSupervisorEvent);
+      const events = Array.isArray(candidate.events) ? candidate.events.filter(isSupervisorEvent) : [];
       this.sessions.set(candidate.id, {
         persisted: {
           id: candidate.id,
@@ -320,12 +352,41 @@ class SupervisorState {
         started: false,
       });
     }
+    this.loadJournal();
   }
 
-  private persist(): void {
+  private loadJournal(): void {
+    if (!existsSync(this.eventsPath)) return;
+    let raw: string;
+    try { raw = readFileSync(this.eventsPath, "utf8"); } catch { return; }
+    for (const line of raw.split("\n")) {
+      if (!line) continue;
+      try {
+        const event: unknown = JSON.parse(line);
+        if (!isSupervisorEvent(event)) continue;
+        const runtime = this.sessions.get(event.sessionId);
+        if (!runtime || event.seq <= runtime.persisted.lastSeq) continue;
+        // A corrupt/truncated tail must never create a synthetic gap.
+        if (event.seq !== runtime.persisted.lastSeq + 1) continue;
+        runtime.persisted.lastSeq = event.seq;
+        runtime.persisted.events.push(event);
+        while (runtime.persisted.events.length > MAX_EVENTS_PER_SESSION) {
+          const removed = runtime.persisted.events.shift();
+          if (removed) runtime.persisted.oldestSeq = removed.seq;
+        }
+      } catch {
+        // An interrupted final append is ignored; no later entry can bridge it.
+      }
+    }
+  }
+
+  private persist(includeEvents = false): void {
     const state: PersistedState = {
       version: STATE_VERSION,
-      sessions: [...this.sessions.values()].map((runtime) => runtime.persisted),
+      sessions: [...this.sessions.values()].map((runtime) => ({
+        ...runtime.persisted,
+        ...(includeEvents ? { events: runtime.persisted.events } : { events: [] }),
+      })),
     };
     const temp = `${this.statePath}.${process.pid}.${randomBytes(5).toString("hex")}.tmp`;
     writeFileSync(temp, JSON.stringify(state), { mode: 0o600 });
@@ -333,6 +394,20 @@ class SupervisorState {
     renameSync(temp, this.statePath);
     chmodSync(this.statePath, 0o600);
   }
+
+  private compactJournal(): void {
+    const temp = `${this.eventsPath}.${process.pid}.${randomBytes(5).toString("hex")}.tmp`;
+    writeFileSync(temp, "", { mode: 0o600 });
+    chmodSync(temp, 0o600);
+    renameSync(temp, this.eventsPath);
+    chmodSync(this.eventsPath, 0o600);
+  }
+}
+
+function isSnapshotBoundary(body: AgentEventBody): boolean {
+  return body.kind === "turn.end" || body.kind === "agent.error" ||
+    body.kind === "permission.request" || body.kind === "permission.resolved" ||
+    body.kind === "question.request" || body.kind === "question.resolved";
 }
 
 function isStatus(value: unknown): value is SupervisorSessionStatus {
@@ -398,7 +473,7 @@ export async function startStructuredSupervisor(
     throw new SupervisorError("structured supervisor 纵切暂只支持 Unix socket", "unsupported_platform");
   }
   const socketPath = opts.socketPath ?? path.join(opts.home, "supervisor.sock");
-  const tokenPath = path.join(opts.home, "supervisor.token");
+  const tokenPath = opts.tokenPath ?? path.join(opts.home, "supervisor.token");
   const token = opts.token ?? randomBytes(32).toString("base64url");
 
   const connections = new Set<Connection>();
@@ -531,6 +606,12 @@ async function route(connection: Connection, request: RpcRequest, state: Supervi
     case "session.kill":
       await state.kill(sessionId);
       return state.status(sessionId);
+    case "session.call": {
+      if (typeof params["method"] !== "string") {
+        throw new SupervisorError("method 必须是字符串", "bad_request");
+      }
+      return state.call(sessionId, params["method"], params["params"] ?? {});
+    }
     case "session.status":
       return state.status(sessionId);
     default:
