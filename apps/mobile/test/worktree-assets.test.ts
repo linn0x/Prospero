@@ -123,6 +123,29 @@ describe("worktree asset presentation", () => {
     expect(worktreeRunDeletionNotice([], () => "unused", null)).toBe("");
   });
 
+  it("keeps the Mac legacy fallback limited to empty assets from Run workspaces", () => {
+    const shellSource = readFileSync(
+      join(
+        import.meta.dirname,
+        "..",
+        "..",
+        "shell",
+        "Sources",
+        "ProsperoShell",
+        "OrchestrationStatus.swift",
+      ),
+      "utf8",
+    );
+
+    expect(shellSource).toContain("func orchestrationRunDeletionNotice(");
+    expect(shellSource).toMatch(
+      /guard assets\.isEmpty,[\s\S]*?automation\?\.workspace == "run",[\s\S]*?let workspacePath = automation\?\.workspacePath/,
+    );
+    expect(shellSource).toContain(
+      'return "\\n\\n删除编排不会清理自动 Run 工作树。它会保留在主机上：\\n\\(workspacePath)"',
+    );
+  });
+
   it("keeps compact worktree controls at a 44pt target with explicit accessibility metadata", () => {
     const screen = readFileSync(
       join(import.meta.dirname, "..", "src", "app", "host", "[hostId]", "orchestration.tsx"),
@@ -132,6 +155,9 @@ describe("worktree asset presentation", () => {
     expect(WORKTREE_ACTION_MIN_HIT_TARGET).toBe(44);
     expect(screen).toContain("minWidth: WORKTREE_ACTION_MIN_HIT_TARGET");
     expect(screen).toContain("minHeight: WORKTREE_ACTION_MIN_HIT_TARGET");
+    expect(screen).toMatch(
+      /orphanWorktreeToggle: \{[\s\S]*?minHeight: WORKTREE_ACTION_MIN_HIT_TARGET/,
+    );
     expect(screen).toContain('accessibilityRole="button"');
     expect(screen).toContain("accessibilityLabel={pathAction.accessibilityLabel}");
     expect(screen).toContain("accessibilityState={{ disabled: !canManage }}");

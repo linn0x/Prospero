@@ -140,6 +140,34 @@ struct OrchestrationStatus: Sendable, Equatable {
   }
 }
 
+/// The warning is pure so the UI and regression tests keep legacy automation
+/// paths visible when an older daemon has not supplied asset records yet.
+func orchestrationRunDeletionNotice(
+  assets: [OrchestrationStatus.WorktreeAsset],
+  tasks: [OrchestrationStatus.Task],
+  automation: OrchestrationStatus.Automation?
+) -> String {
+  let preservedAssets = assets.filter { $0.state != "cleaned" }
+  if !preservedAssets.isEmpty {
+    let workerCount = preservedAssets.filter { $0.kind == "worker" }.count
+    let locations = preservedAssets.map { asset in
+      let task = asset.taskId.flatMap { id in tasks.first { $0.id == id } }
+      let owner = asset.kind == "run"
+        ? "共享 Run 工作树"
+        : "worker：\(task?.title ?? asset.taskId ?? "已删除任务")"
+      return "\(owner)\n\(asset.path)"
+    }.joined(separator: "\n\n")
+    return "\n\n删除编排不会清理全部 \(preservedAssets.count) 个关联工作树（其中 \(workerCount) 个 worker 工作树）。它们会保留在主机上：\n\(locations)"
+  }
+
+  guard assets.isEmpty,
+        automation?.workspace == "run",
+        let workspacePath = automation?.workspacePath,
+        !workspacePath.isEmpty
+  else { return "" }
+  return "\n\n删除编排不会清理自动 Run 工作树。它会保留在主机上：\n\(workspacePath)"
+}
+
 /// Mac 可视化编辑器里的本地节点；id 在一次发布内稳定，用来表达依赖关系。
 struct OrchestrationGraphDraftNode: Identifiable, Sendable, Equatable {
   var id: String = UUID().uuidString

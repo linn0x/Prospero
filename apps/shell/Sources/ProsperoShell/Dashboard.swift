@@ -1696,25 +1696,12 @@ private struct GoalRunRow: View {
     ].compactMap { $0 }
   }
   private var deleteMessage: String {
-    var message = "“\(run.objective)”及其任务、消息和 Gate 会从编排列表中删除。"
-    let preservedAssets = worktreeAssets.filter { $0.state != "cleaned" }
-    if !preservedAssets.isEmpty {
-      let workerCount = preservedAssets.filter { $0.kind == "worker" }.count
-      let locations = preservedAssets.map { asset in
-        let task = asset.taskId.flatMap { id in tasks.first { $0.id == id } }
-        let owner = asset.kind == "run"
-          ? "共享 Run 工作树"
-          : "worker：\(task?.title ?? asset.taskId ?? "已删除任务")"
-        return "\(owner)\n\(asset.path)"
-      }.joined(separator: "\n\n")
-      message += "\n\n删除编排不会清理全部 \(preservedAssets.count) 个关联工作树（其中 \(workerCount) 个 worker 工作树）。它们会保留在主机上：\n\(locations)"
-    } else if worktreeAssets.isEmpty,
-              run.automation?.workspace == "run",
-              let workspacePath = run.automation?.workspacePath,
-              !workspacePath.isEmpty {
-      message += "\n\n删除编排不会清理自动 Run 工作树。它会保留在主机上：\n\(workspacePath)"
-    }
-    return message
+    "“\(run.objective)”及其任务、消息和 Gate 会从编排列表中删除。" +
+      orchestrationRunDeletionNotice(
+        assets: worktreeAssets,
+        tasks: tasks,
+        automation: run.automation
+      )
   }
 
   var body: some View {
