@@ -2258,7 +2258,7 @@ private struct WorktreeAssetSection: View {
   }
 
   private func state(for asset: OrchestrationStatus.WorktreeAsset) -> String {
-    asset.lastInspection?.state ?? asset.state
+    orchestrationWorktreeState(asset)
   }
 
   private func stateLabel(for asset: OrchestrationStatus.WorktreeAsset) -> String {
@@ -2275,6 +2275,7 @@ private struct WorktreeAssetSection: View {
   }
 
   private func stateDetail(for asset: OrchestrationStatus.WorktreeAsset) -> String {
+    if state(for: asset) == "cleaned" { return "目录已移除；分支默认保留" }
     if let message = asset.lastInspection?.message, !message.isEmpty { return message }
     return switch state(for: asset) {
     case "dirty": "请先提交、暂存或保留改动"
@@ -2296,12 +2297,11 @@ private struct WorktreeAssetSection: View {
   }
 
   private func pathCanOpen(_ asset: OrchestrationStatus.WorktreeAsset) -> Bool {
-    asset.state != "cleaned" && asset.lastInspection?.pathExists != false
+    state(for: asset) != "cleaned" && asset.lastInspection?.pathExists != false
   }
 
   private func canClean(_ asset: OrchestrationStatus.WorktreeAsset) -> Bool {
-    let inspectionState = asset.lastInspection?.state
-    return inspectionState == "safe_to_clean" || inspectionState == "equivalent"
+    orchestrationWorktreeCanClean(asset)
   }
 
   private func summary(for asset: OrchestrationStatus.WorktreeAsset) -> String {

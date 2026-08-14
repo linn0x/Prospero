@@ -69,11 +69,19 @@ export function worktreePathAction(
     };
 }
 
-/** The displayed result always comes from the daemon's last inspection. */
+/** A persisted cleanup is terminal even when an older inspection says it was safe to clean. */
+export function worktreeEffectiveState(
+  asset: OrchestrationWorktreeAsset,
+): OrchestrationWorktreeAsset["state"] {
+  if (asset.state === "cleaned" || asset.cleanup !== null) return "cleaned";
+  return asset.lastInspection?.state ?? asset.state;
+}
+
+/** The displayed result prefers a persisted cleanup over the daemon's last inspection. */
 export function worktreeAssetPresentation(
   asset: OrchestrationWorktreeAsset,
 ): WorktreeAssetPresentation {
-  const state = asset.lastInspection?.state ?? asset.state;
+  const state = worktreeEffectiveState(asset);
   switch (state) {
     case "dirty":
       return { label: "有未提交改动", detail: "请先提交、暂存或保留", tone: "warning" };
@@ -96,8 +104,9 @@ export function worktreeAssetPresentation(
 
 /** Only a server inspection, not a cached lifecycle label, can unlock cleanup. */
 export function worktreeCanClean(asset: OrchestrationWorktreeAsset): boolean {
-  const state = asset.lastInspection?.state;
-  return state === "safe_to_clean" || state === "equivalent";
+  if (worktreeEffectiveState(asset) === "cleaned") return false;
+  const inspectionState = asset.lastInspection?.state;
+  return inspectionState === "safe_to_clean" || inspectionState === "equivalent";
 }
 
 export function worktreeInspectionSummary(asset: OrchestrationWorktreeAsset): string {
