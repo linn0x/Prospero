@@ -7,6 +7,7 @@ import {
   groupWorktreeAssets,
   worktreeAssetPresentation,
   worktreeCanClean,
+  worktreeEffectiveState,
   worktreeInspectionSummary,
   worktreePathAction,
   worktreeRunDeletionNotice,
@@ -78,6 +79,51 @@ describe("worktree asset presentation", () => {
   it("never offers cleanup before a safe server inspection", () => {
     expect(worktreeCanClean(asset("safe_to_clean"))).toBe(false);
     expect(worktreeAssetPresentation(asset("dirty"))).toMatchObject({ label: "有未提交改动" });
+  });
+
+  it("treats persisted cleanup as terminal despite an older safe inspection", () => {
+    const cleaned = asset("cleaned");
+    cleaned.lastInspection = {
+      state: "safe_to_clean",
+      targetRef: "main",
+      checkedAt: 2,
+      pathExists: true,
+      registered: true,
+      dirty: false,
+      branch: "feature/worktree",
+      aheadCommitCount: 0,
+      equivalentCommitCount: 0,
+      message: "可安全清理",
+    };
+    cleaned.cleanup = { removedAt: 3, branchDeleted: false, warning: null };
+
+    expect(worktreeEffectiveState(cleaned)).toBe("cleaned");
+    expect(worktreeAssetPresentation(cleaned)).toMatchObject({ label: "已清理", tone: "muted" });
+    expect(worktreeCanClean(cleaned)).toBe(false);
+    expect(worktreeInspectionSummary(cleaned)).toContain("状态：已清理");
+
+    const cleanupRecordedBeforeStateUpdate = asset("active");
+    cleanupRecordedBeforeStateUpdate.lastInspection = cleaned.lastInspection;
+    cleanupRecordedBeforeStateUpdate.cleanup = cleaned.cleanup;
+    expect(worktreeEffectiveState(cleanupRecordedBeforeStateUpdate)).toBe("cleaned");
+    expect(worktreeCanClean(cleanupRecordedBeforeStateUpdate)).toBe(false);
+
+    const shellSource = readFileSync(
+      join(import.meta.dirname, "..", "..", "shell", "Sources", "ProsperoShell", "OrchestrationStatus.swift"),
+      "utf8",
+    );
+    expect(shellSource).toMatch(
+      /func orchestrationWorktreeState\([\s\S]*?asset\.state == "cleaned" \|\| asset\.cleanup != nil[\s\S]*?return "cleaned"/,
+    );
+    expect(shellSource).toMatch(
+      /func orchestrationWorktreeCanClean\([\s\S]*?guard orchestrationWorktreeState\(asset\) != "cleaned" else \{ return false \}/,
+    );
+    const dashboardSource = readFileSync(
+      join(import.meta.dirname, "..", "..", "shell", "Sources", "ProsperoShell", "Dashboard.swift"),
+      "utf8",
+    );
+    expect(dashboardSource).toContain("orchestrationWorktreeState(asset)");
+    expect(dashboardSource).toContain("orchestrationWorktreeCanClean(asset)");
   });
 
   it("retains a daemon diagnostic in an unchecked worktree summary", () => {
