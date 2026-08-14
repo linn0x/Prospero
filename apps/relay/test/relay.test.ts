@@ -1,6 +1,6 @@
 import { once } from "node:events";
 import { randomBytes } from "node:crypto";
-import { deriveRelayRouteId } from "@prospero/protocol";
+import { deriveRelayRouteId, MAX_RELAY_CONTROL_FRAME_BYTES, MAX_RELAY_DATA_FRAME_BYTES } from "@prospero/protocol";
 import { createLogger } from "../src/log.js";
 import { RelayServer } from "../src/relay.js";
 import type { RelayConfig } from "../src/config.js";
@@ -101,6 +101,17 @@ describe("relay v1 independent data-plane service", () => {
     expect((await oldClose)[0]).toBe(4009); await close(newHost);
   });
 
+  it("keeps a disabled self-registered route as a tombstone", async () => {
+    const { url, routes } = await start();
+    const first = await hostOnline(url); await close(first);
+    expect(await routes.disableRoute(routeId)).toBe(true);
+    const retry = await open(`${url}/v1/host`); const retryClosed = once(retry, "close");
+    retry.send(JSON.stringify({ v: 1, routeId, hostSecret }));
+    expect(JSON.parse((await next(retry)).data.toString())).toMatchObject({ type: "error", code: "route_unavailable" });
+    expect((await retryClosed)[0]).toBe(1008);
+    expect((await routes.inspectRoute(routeId))?.disabledAt).not.toBeNull();
+  });
+
   it("uses separate ticketed host data sockets and preserves opaque text/binary frame boundaries", async () => {
     const { url } = await start(); const host = await hostOnline(url); const { client, pending } = await clientPending(url);
     const offer = JSON.parse((await next(host)).data.toString()) as { streamId: string; ticket: string; deviceId: string };
@@ -193,9 +204,12 @@ describe("relay v1 independent data-plane service", () => {
     await routes.applyDeviceSnapshot(routeId, 2, [activeCredential(deviceId, token)]);
     const retained = await routes.inspectRoute(routeId);
     expect(retained?.devices.find((device) => device.deviceId === secondDevice)?.revokedAt).not.toBeNull();
-    await expect(routes.applyDeviceSnapshot(routeId, 2, [activeCredential(deviceId, token)])).rejects.toThrow("stale or inconsistent");
+    // A restart sends the active set again; the old missing device remains a
+    // retained revoked DB row without having to be re-listed on the wire.
+    await expect(routes.applyDeviceSnapshot(routeId, 2, [activeCredential(deviceId, token)])).resolves.toMatchObject({ route: { generation: 2 } });
     await expect(routes.applyDeviceSnapshot(routeId, 1, [activeCredential(deviceId, token), { deviceId: secondDevice, revoked: true }])).rejects.toThrow("stale or inconsistent");
     await expect(routes.applyDeviceSnapshot(routeId, 2, [activeCredential(deviceId, token), { deviceId: secondDevice, revoked: true }])).resolves.toMatchObject({ route: { generation: 2 } });
+    await expect(routes.applyDeviceSnapshot(routeId, 2, [activeCredential(deviceId, "V".repeat(43))])).rejects.toThrow("stale or inconsistent");
   });
 
   it("accepts an idempotent snapshot after a host restart and fails existing streams closed on MySQL loss", async () => {
@@ -253,6 +267,58 @@ describe("relay v1 independent data-plane service", () => {
     const binaryClosed = once(client, "close"); client.send(Buffer.from([7])); expect((await binaryClosed)[0]).toBe(1008);
     const raw = await open(`${url}/v1/client`); const relay = running.at(-1)!; const rawClosed = once(raw, "close"); await relay.close();
     expect((await rawClosed)[0]).toBe(1012); await close(host);
+  });
+
+  it("rejects URL query credentials and closes both peers for pre-ready stream data", async () => {
+    const { url } = await start({ ticketTimeoutMs: 5_000 });
+    const rejected = new WebSocket(`${url}/v1/stream?ticket=must-not-be-here`);
+    rejected.on("error", () => undefined);
+    const status = await new Promise<number | undefined>((resolve) => {
+      rejected.once("unexpected-response", (_request, response) => { response.resume(); resolve(response.statusCode); });
+    });
+    expect(status).toBe(400);
+
+    const host = await hostOnline(url); const { client } = await clientPending(url);
+    const offer = JSON.parse((await next(host)).data.toString()) as { streamId: string; ticket: string };
+    const stream = await open(`${url}/v1/stream`);
+    const clientClosed = once(client, "close"); const streamClosed = once(stream, "close");
+    stream.send(JSON.stringify({ type: "stream.accept", v: 1, streamId: offer.streamId, ticket: offer.ticket }));
+    stream.send("application data before stream.ready");
+    expect((await streamClosed)[0]).toBe(1008);
+    expect((await clientClosed)[0]).toBe(1008);
+    await close(host);
+  });
+
+  it("enforces control and data limits and closes the opposite data peer", async () => {
+    const { url } = await start({ ticketTimeoutMs: 5_000 });
+    const oversizedHost = await open(`${url}/v1/host`);
+    const oversizedHostClosed = once(oversizedHost, "close");
+    oversizedHost.send(JSON.stringify({ v: 1, routeId, hostSecret }));
+    oversizedHost.send("x".repeat(MAX_RELAY_CONTROL_FRAME_BYTES + 1));
+    expect((await oversizedHostClosed)[0]).toBe(1008);
+
+    const host = await hostOnline(url); const { client } = await clientPending(url);
+    const offer = JSON.parse((await next(host)).data.toString()) as { streamId: string; ticket: string };
+    const stream = await open(`${url}/v1/stream`);
+    stream.send(JSON.stringify({ type: "stream.accept", v: 1, streamId: offer.streamId, ticket: offer.ticket }));
+    await next(stream); await next(client);
+    const clientClosed = once(client, "close"); const streamClosed = once(stream, "close");
+    client.send(Buffer.alloc(MAX_RELAY_DATA_FRAME_BYTES + 1));
+    expect((await clientClosed)[0]).toBe(1009);
+    expect((await streamClosed)[0]).toBe(1009);
+    await close(host);
+  });
+
+  it("closes the client when an authenticated host data socket disappears", async () => {
+    const { url } = await start(); const host = await hostOnline(url); const { client } = await clientPending(url);
+    const offer = JSON.parse((await next(host)).data.toString()) as { streamId: string; ticket: string };
+    const stream = await open(`${url}/v1/stream`);
+    stream.send(JSON.stringify({ type: "stream.accept", v: 1, streamId: offer.streamId, ticket: offer.ticket }));
+    await next(stream); await next(client);
+    const clientClosed = once(client, "close");
+    await close(stream);
+    expect((await clientClosed)[0]).toBe(1000);
+    await close(host);
   });
 
   it("requires a bounded initial snapshot after host authentication", async () => {

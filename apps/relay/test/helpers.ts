@@ -1,5 +1,5 @@
 import { credentialDigest, equalCredentialDigest } from "../src/crypto.js";
-import { SnapshotGenerationError, type EphemeralStore, type RouteStore, type SnapshotCredential, type TicketRedemption } from "../src/store.js";
+import { SnapshotGenerationError, snapshotEquals, type EphemeralStore, type RouteStore, type SnapshotCredential, type TicketRedemption } from "../src/store.js";
 import type { AuthenticatedDevice, DeviceRecord, RelayEvent, RouteInspection, RouteRecord, RouteSnapshot, StreamTicket } from "../src/types.js";
 
 const copyDate = (value: Date | null): Date | null => value === null ? null : new Date(value);
@@ -18,13 +18,7 @@ export class MemoryRouteStore implements RouteStore {
   async applyDeviceSnapshot(routeId: string, generation: number, credentials: SnapshotCredential[]): Promise<RouteSnapshot | null> {
     this.ensure(); const route = this.routes.get(routeId); if (route === undefined || route.disabledAt !== null) return null;
     const devices = this.devices.get(routeId)!;
-    const normalized = (items: SnapshotCredential[]) => items.map((item) => ({ deviceId: item.deviceId, revoked: item.revoked === true, digest: item.revoked === true ? null : Buffer.from(item.credentialDigest, "base64url") })).sort((a, b) => a.deviceId.localeCompare(b.deviceId));
-    const current = [...devices.values()].map((item) => ({ deviceId: item.deviceId, revoked: item.revokedAt !== null, digest: item.credentialDigest })).sort((a, b) => a.deviceId.localeCompare(b.deviceId));
-    const equivalent = current.length === normalized(credentials).length && current.every((item, index) => {
-      const other = normalized(credentials)[index]!;
-      return item.deviceId === other.deviceId && item.revoked === other.revoked && (item.revoked || ((item.digest === null && other.digest === null) || (item.digest !== null && other.digest !== null && item.digest.equals(other.digest))));
-    });
-    if (generation < route.generation || (generation === route.generation && !equivalent)) throw new SnapshotGenerationError();
+    if (generation < route.generation || (generation === route.generation && !snapshotEquals([...devices.values()], credentials))) throw new SnapshotGenerationError();
     if (generation > route.generation) {
       for (const device of devices.values()) if (device.revokedAt === null) device.revokedAt = new Date();
       for (const item of credentials) {

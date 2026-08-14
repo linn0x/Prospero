@@ -67,6 +67,9 @@ function sourceIp(request: IncomingMessage): string { const forwarded = request.
 function isInternal(address: string | undefined): boolean { if (address === undefined) return false; const ip = address.replace(/^::ffff:/, ""); return ip === "127.0.0.1" || ip === "::1" || ip.startsWith("10.") || ip.startsWith("192.168.") || /^172\.(1[6-9]|2\d|3[01])\./.test(ip); }
 function isOpen(ws: WebSocket | undefined): ws is WebSocket { return ws !== undefined && ws.readyState === WebSocket.OPEN; }
 function errorKind(error: unknown): string { return error instanceof Error ? error.name : "unknown"; }
+function closeCodeForSocketError(error: unknown): number {
+  return error instanceof RangeError && /max payload size exceeded/i.test(error.message) ? 1009 : 1013;
+}
 
 export class RelayServer {
   private readonly routes: RouteStore;
@@ -84,6 +87,8 @@ export class RelayServer {
   private stopping = false;
   private unsubscribe: (() => Promise<void>) | undefined;
   private cleanupTimer: NodeJS.Timeout | undefined;
+  /** Wakes graceful shutdown when the last upgraded socket actually closes. */
+  private shutdownDrain: (() => void) | undefined;
 
   constructor(deps: RelayDependencies) {
     this.routes = deps.routes; this.ephemeral = deps.ephemeral; this.config = deps.config; this.logger = deps.logger; this.metrics = deps.metrics ?? new RelayMetrics();
@@ -118,26 +123,54 @@ export class RelayServer {
 
   address(): AddressInfo | undefined { const address = this.http.address(); return address !== null && typeof address !== "string" ? address : undefined; }
   private async requireDependencies(): Promise<void> { await Promise.all([this.routes.ping(), this.ephemeral.ping()]); }
-  private async ready(): Promise<boolean> { try { await this.requireDependencies(); return true; } catch (error) { this.logger.warn({ event: "relay.dependency_unavailable", error: errorKind(error) }, "relay dependency unavailable"); return false; } }
+  private async ready(): Promise<boolean> {
+    try {
+      await this.requireDependencies();
+      return true;
+    } catch (error) {
+      this.logger.warn({ event: "relay.dependency_unavailable", error: errorKind(error) }, "relay dependency unavailable");
+      // Dependency health is global, but fail-closed state is route scoped: do
+      // not leave any authenticated host advertising an online route after a
+      // Redis/MySQL probe has failed.
+      this.failAllRoutes("dependency health check failed");
+      return false;
+    }
+  }
 
   private handleHttp(request: IncomingMessage, response: ServerResponse): void {
     const path = new URL(request.url ?? "/", "http://relay.invalid").pathname;
     if (request.method !== "GET") { response.writeHead(405).end(); return; }
     if (path === "/health/live") { response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" }).end('{"status":"live"}'); return; }
-    if (path === "/health/ready") { void this.ready().then((ready) => response.writeHead(ready ? 200 : 503, { "content-type": "application/json", "cache-control": "no-store" }).end(ready ? '{"status":"ready"}' : '{"status":"unavailable"}')); return; }
+    if (path === "/health/ready") {
+      void this.ready()
+        .then((ready) => response.writeHead(ready ? 200 : 503, { "content-type": "application/json", "cache-control": "no-store" }).end(ready ? '{"status":"ready"}' : '{"status":"unavailable"}'))
+        .catch(() => response.writeHead(503, { "content-type": "application/json", "cache-control": "no-store" }).end('{"status":"unavailable"}'));
+      return;
+    }
     if (path === "/metrics") {
       const auth = request.headers.authorization;
       const value = typeof auth === "string" && auth.startsWith("Bearer ") ? auth.slice(7) : "";
       const tokenOk = this.config.metricsToken !== undefined && value.length === this.config.metricsToken.length && timingSafeEqual(Buffer.from(value), Buffer.from(this.config.metricsToken));
       if (!tokenOk && (this.config.metricsToken !== undefined || this.config.metricsInternalOnly === false || !isInternal(request.socket.remoteAddress))) { response.writeHead(403).end(); return; }
-      void this.metrics.registry.metrics().then((body) => response.writeHead(200, { "content-type": this.metrics.registry.contentType, "cache-control": "no-store" }).end(body)); return;
+      void this.metrics.registry.metrics()
+        .then((body) => response.writeHead(200, { "content-type": this.metrics.registry.contentType, "cache-control": "no-store" }).end(body))
+        .catch((error: unknown) => {
+          this.logger.warn({ event: "relay.metrics_failed", error: errorKind(error) }, "metrics scrape failed");
+          response.writeHead(503).end();
+        });
+      return;
     }
     response.writeHead(404).end();
   }
 
   private handleUpgrade(request: IncomingMessage, socket: import("node:stream").Duplex, head: Buffer): void {
     if (this.stopping) { socket.destroy(); return; }
-    const path = new URL(request.url ?? "/", "http://relay.invalid").pathname;
+    const url = new URL(request.url ?? "/", "http://relay.invalid");
+    // Query strings are never part of relay endpoint identity. Reject them
+    // rather than silently allowing a ticket to be leaked through an URL or an
+    // access log and then duplicated in the first control frame.
+    if (url.search !== "") { socket.write("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n"); socket.destroy(); return; }
+    const path = url.pathname;
     const server = path === RELAY_HOST_PATH ? this.hostWss : path === RELAY_CLIENT_PATH ? this.clientWss : path === RELAY_STREAM_PATH ? this.streamWss : undefined;
     if (server === undefined) { socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n"); socket.destroy(); return; }
     void this.allowConnection(sourceIp(request)).then((allowed) => {
@@ -149,14 +182,31 @@ export class RelayServer {
   private async allowConnection(ip: string): Promise<boolean> { const verdict = await this.ephemeral.consumeRateLimit(`connection:${ip}`, this.config.connectionRatePerMinute, 60); if (!verdict.allowed) this.metrics.rateLimited.inc({ scope: "connection" }); return verdict.allowed; }
   private async allowAuth(endpoint: Endpoint, ip: string): Promise<boolean> { const verdict = await this.ephemeral.consumeRateLimit(`auth:${endpoint}:${ip}`, this.config.authRatePerMinute, 60); if (!verdict.allowed) this.metrics.rateLimited.inc({ scope: "auth" }); return verdict.allowed; }
 
-  private trackSocket(ws: WebSocket): void { this.sockets.add(ws); ws.on("error", () => undefined); ws.once("close", () => this.sockets.delete(ws)); }
+  private trackSocket(ws: WebSocket): void {
+    this.sockets.add(ws);
+    ws.on("error", () => undefined);
+    ws.once("close", () => { this.sockets.delete(ws); this.shutdownDrain?.(); });
+  }
   private async closeHttpWithDeadline(): Promise<void> {
     await new Promise<void>((resolve) => {
       let finished = false;
       let deadline: NodeJS.Timeout | undefined;
-      const finish = () => { if (!finished) { finished = true; if (deadline !== undefined) clearTimeout(deadline); resolve(); } };
-      deadline = setTimeout(() => { for (const socket of this.sockets) { try { socket.terminate(); } catch { /* already gone */ } } finish(); }, SHUTDOWN_GRACE_MS).unref();
-      this.http.close(finish);
+      let httpClosed = false;
+      const drain = () => { if (httpClosed && this.sockets.size === 0) finish(); };
+      const finish = () => {
+        if (!finished) {
+          finished = true;
+          if (deadline !== undefined) clearTimeout(deadline);
+          if (this.shutdownDrain === drain) this.shutdownDrain = undefined;
+          resolve();
+        }
+      };
+      this.shutdownDrain = drain;
+      deadline = setTimeout(() => {
+        for (const socket of this.sockets) { try { socket.terminate(); } catch { /* already gone */ } }
+        finish();
+      }, SHUTDOWN_GRACE_MS).unref();
+      this.http.close(() => { httpClosed = true; drain(); });
     });
   }
 
@@ -169,9 +219,11 @@ export class RelayServer {
     ws.on("message", (data, binary) => {
       if (received) {
         if (subsequent === undefined) {
-          // Before the authenticated handler is installed every endpoint is still
-          // control-only. Do not buffer an unbounded/data-plane frame here.
-          if (binary || bytesOf(data) > MAX_RELAY_CONTROL_FRAME_BYTES || queued.length > 0) { this.closeSocket(ws, 1008, "pre-ready control frame invalid"); return; }
+          // Only hosts have a legitimate second control frame (device-sync) that
+          // can arrive while authentication awaits storage. Client and stream
+          // endpoints have no pre-ready frame at all: accepting text here would
+          // let application data race stream.ready and become opaque data.
+          if (endpoint !== "host" || binary || bytesOf(data) > MAX_RELAY_CONTROL_FRAME_BYTES || queued.length > 0) { this.closeSocket(ws, 1008, "pre-ready frame invalid"); return; }
           queued.push({ message: data, binary });
         }
         else subsequent(data, binary);
@@ -190,10 +242,13 @@ export class RelayServer {
       let auth;
       try { auth = parseRelayHostAuthentication(safeJson(data)); } catch { this.sendErrorAndClose(ws, "bad_frame", "expected host authentication"); return; }
       if (!(await this.allowAuth("host", sourceIp(request)))) { this.sendErrorAndClose(ws, "rate_limited", "too many attempts", 60_000); return; }
+      if (!isOpen(ws)) return;
       if (!(await this.ready())) { this.sendErrorAndClose(ws, "internal", "relay unavailable"); return; }
+      if (!isOpen(ws)) return;
       if (!routeIdMatchesHostSecret(auth.routeId, auth.hostSecret)) { this.metrics.authFailures.inc({ endpoint: "host", reason: "unauthorized" }); this.sendErrorAndClose(ws, "unauthorized", "authentication failed"); return; }
       const route = await this.routes.ensureRoute(auth.routeId);
       if (route === null) { this.sendErrorAndClose(ws, "route_unavailable", "route disabled"); return; }
+      if (!isOpen(ws)) return;
       let host!: HostConnection;
       const readyTimeout = setTimeout(() => this.failHost(host, "initial snapshot timeout"), this.config.authTimeoutMs).unref();
       host = { id: randomUUID(), routeId: auth.routeId, ws, generation: null, online: false, readySent: false, syncing: false, closed: false, lastHeartbeat: Date.now(), readyTimeout, controlChain: Promise.resolve() };
@@ -254,6 +309,7 @@ export class RelayServer {
     }
     if (control.type === "host.heartbeat") {
       if (!host.online || host.generation !== control.generation) { this.sendErrorAndClose(host.ws, "stream_not_ready", "host snapshot is not current"); this.failHost(host, "host snapshot is not current", 1008); return; }
+      if (!(await this.ready())) throw new Error("relay dependency unavailable during heartbeat");
       host.lastHeartbeat = Date.now();
       await this.ephemeral.setPresence(host.routeId, host.id, this.config.presenceTtlSeconds);
       this.sendControl(host.ws, { type: "host.heartbeat.ack", v: RELAY_PROTOCOL_VERSION, generation: control.generation }, () => this.failHost(host, "host heartbeat acknowledgement write failed"));
@@ -289,13 +345,17 @@ export class RelayServer {
       let leaseId: string | undefined;
       try {
         if (!(await this.allowAuth("client", sourceIp(request)))) { this.sendErrorAndClose(ws, "rate_limited", "too many attempts", 60_000); return; }
+        if (!isOpen(ws)) return;
         if (!(await this.ready())) { this.failRoute(control.routeId, "dependency health check failed"); this.sendErrorAndClose(ws, "internal", "relay unavailable"); return; }
+        if (!isOpen(ws)) return;
         const authenticated = await this.authenticateClient(control.routeId, control.deviceId, control.token);
         if (authenticated === null) { this.metrics.authFailures.inc({ endpoint: "client", reason: "unauthorized" }); this.sendErrorAndClose(ws, "unauthorized", "authentication failed"); return; }
+        if (!isOpen(ws)) return;
         const host = this.hosts.get(control.routeId);
         if (host === undefined || !host.online || host.syncing || !isOpen(host.ws)) { this.sendErrorAndClose(ws, "route_unavailable", "route is offline"); return; }
         leaseId = randomOpaque(24);
         if (!(await this.ephemeral.acquireStreamLease(control.routeId, leaseId, this.config.maxStreamsPerRoute, STREAM_LEASE_TTL_MS))) { this.sendErrorAndClose(ws, "rate_limited", "stream limit reached", 1_000); return; }
+        if (!isOpen(ws)) { await this.releaseLeaseAfterFailedOpen(control.routeId, leaseId); leaseId = undefined; return; }
         const streamId = randomOpaque(24); const ticketValue = randomOpaque(32); const expiresAt = Date.now() + this.config.ticketTimeoutMs;
         const ticket: StreamTicket = { streamId, ticket: ticketValue, routeId: control.routeId, hostConnectionId: host.id, clientDeviceId: authenticated.device.deviceId, expiresAt };
         await this.ephemeral.createTicket(ticket);
@@ -311,7 +371,11 @@ export class RelayServer {
         const stream: StreamConnection = { id: streamId, routeId: control.routeId, clientDeviceId: authenticated.device.deviceId, hostConnectionId: host.id, client: ws, ready: false, timeout, ticket: ticketValue, leaseId, leaseWatch, closed: false };
         this.streams.set(streamId, stream); this.metrics.streams.inc(); this.metrics.connections.inc({ endpoint: "client", phase: "authenticated" });
         install((message, binary) => this.fromClient(stream, message, binary));
-        ws.once("close", () => { this.metrics.connections.dec({ endpoint: "client", phase: "authenticated" }); this.closeStream(stream, 1000, "client disconnected", false); });
+        ws.once("error", (error) => this.closeStream(stream, closeCodeForSocketError(error), "client socket error", false));
+        ws.once("close", (code) => {
+          this.metrics.connections.dec({ endpoint: "client", phase: "authenticated" });
+          this.closeStream(stream, code === 1009 ? 1009 : 1000, "client disconnected", false);
+        });
         this.sendControl(ws, { type: "client.status", v: RELAY_PROTOCOL_VERSION, status: "pending", streamId, expiresAt }, () => this.closeStream(stream, 1013, "client pending write failed", false));
         this.sendControl(host.ws, { type: "stream.offer", v: RELAY_PROTOCOL_VERSION, streamId, ticket: ticketValue, deviceId: authenticated.device.deviceId, expiresAt }, () => this.failHost(host, "stream offer write failed"));
         leaseId = undefined; // Stream ownership takes over exact release below.
@@ -325,6 +389,7 @@ export class RelayServer {
   }
 
   private failRoute(routeId: string, reason: string): void { const host = this.hosts.get(routeId); if (host !== undefined) this.failHost(host, reason); }
+  private failAllRoutes(reason: string): void { for (const host of [...this.hosts.values()]) this.failHost(host, reason); }
   private async releaseLeaseAfterFailedOpen(routeId: string, leaseId: string): Promise<void> {
     try { await this.ephemeral.releaseStreamLease(routeId, leaseId); }
     catch (error) { this.logger.warn({ event: "relay.lease_release_failed", route: opaqueLogId(routeId), error: errorKind(error) }, "lease release failed closed"); this.failRoute(routeId, "stream lease release failed"); }
@@ -353,7 +418,9 @@ export class RelayServer {
       const expected = this.streams.get(control.streamId);
       try {
         if (!(await this.allowAuth("stream", sourceIp(request)))) { this.sendErrorAndClose(ws, "rate_limited", "too many attempts", 60_000); return; }
+        if (!isOpen(ws)) { if (expected !== undefined) this.closeStream(expected, 1008, "pre-ready stream frame"); return; }
         if (!(await this.ready())) { if (expected !== undefined) this.failRoute(expected.routeId, "dependency health check failed"); this.sendErrorAndClose(ws, "internal", "relay unavailable"); return; }
+        if (!isOpen(ws)) { if (expected !== undefined) this.closeStream(expected, 1008, "pre-ready stream frame"); return; }
         const redemption = await this.ephemeral.redeemTicket(control.ticket, control.streamId);
         if (redemption.status !== "ok") {
           const code: RelayErrorCode = redemption.status === "used" ? "ticket_used" : redemption.status === "expired" ? "ticket_expired" : "ticket_invalid";
@@ -368,9 +435,14 @@ export class RelayServer {
           this.sendErrorAndClose(ws, "ticket_invalid", "stream ticket invalid");
           return;
         }
+        if (!isOpen(ws)) { this.closeStream(stream, 1013, "host stream disconnected"); return; }
         stream.host = ws; stream.ready = true; clearTimeout(stream.timeout); this.metrics.connections.inc({ endpoint: "stream", phase: "authenticated" });
         install((message, binary) => this.fromHost(stream, message, binary));
-        ws.once("close", () => { this.metrics.connections.dec({ endpoint: "stream", phase: "authenticated" }); this.closeStream(stream, 1000, "host stream disconnected", false); });
+        ws.once("error", (error) => this.closeStream(stream, closeCodeForSocketError(error), "host stream socket error"));
+        ws.once("close", (code) => {
+          this.metrics.connections.dec({ endpoint: "stream", phase: "authenticated" });
+          this.closeStream(stream, code === 1009 ? 1009 : 1000, "host stream disconnected");
+        });
         // Both sockets transition only after ready is emitted; after this no frame is parsed by the relay.
         this.sendControl(ws, { type: "stream.ready", v: RELAY_PROTOCOL_VERSION, streamId: stream.id }, () => this.closeStream(stream, 1013, "host stream ready write failed"));
         this.sendControl(stream.client, { type: "stream.ready", v: RELAY_PROTOCOL_VERSION, streamId: stream.id }, () => this.closeStream(stream, 1013, "client stream ready write failed"));
@@ -393,7 +465,8 @@ export class RelayServer {
   }
 
   private forward(stream: StreamConnection, target: WebSocket | undefined, data: Data, binary: boolean, direction: "client_to_host" | "host_to_client"): void {
-    if (stream.closed || !isOpen(target)) return;
+    if (stream.closed) return;
+    if (!isOpen(target)) { this.closeStream(stream, 1013, "peer unavailable"); return; }
     const size = bytesOf(data);
     if (size > MAX_RELAY_DATA_FRAME_BYTES) { this.closeStream(stream, 1009, "frame too large"); return; }
     if (target.bufferedAmount + size > BACKPRESSURE_LIMIT_BYTES) { this.closeStream(stream, 1013, "backpressure limit"); return; }
@@ -444,8 +517,16 @@ export class RelayServer {
   private closeSocket(ws: WebSocket | undefined, code: number, reason: string): void { if (isOpen(ws)) { try { ws.close(code, reason.slice(0, 123)); } catch { try { ws.terminate(); } catch { /* already gone */ } } } }
 
   private applyEvent(event: RelayEvent): void {
-    if (event.type === "route.disabled") { const host = this.hosts.get(event.routeId); if (host !== undefined) this.closeSocket(host.ws, 1008, "route disabled"); for (const stream of this.streams.values()) if (stream.routeId === event.routeId) this.closeStream(stream, 1008, "route disabled"); return; }
+    if (event.type === "route.disabled") { const host = this.hosts.get(event.routeId); if (host !== undefined) this.failHost(host, "route disabled", 1008); for (const stream of this.streams.values()) if (stream.routeId === event.routeId) this.closeStream(stream, 1008, "route disabled"); return; }
     if (event.type === "device.revoked" && event.deviceId !== undefined) for (const stream of this.streams.values()) if (stream.routeId === event.routeId && stream.clientDeviceId === event.deviceId) this.closeStream(stream, 1008, "device revoked");
   }
-  private async runCleanup(): Promise<void> { try { const count = await this.routes.cleanupInactiveRoutes(new Date(Date.now() - OFFLINE_CLEANUP_MS)); if (count > 0) this.logger.info({ event: "relay.routes_cleaned", count }, "removed inactive routes"); } catch (error) { this.logger.warn({ event: "relay.cleanup_failed", error: errorKind(error) }, "route cleanup failed"); } }
+  private async runCleanup(): Promise<void> {
+    try {
+      const count = await this.routes.cleanupInactiveRoutes(new Date(Date.now() - OFFLINE_CLEANUP_MS));
+      if (count > 0) this.logger.info({ event: "relay.routes_cleaned", count }, "removed inactive routes");
+    } catch (error) {
+      this.logger.warn({ event: "relay.cleanup_failed", error: errorKind(error) }, "route cleanup failed");
+      for (const host of this.hosts.values()) this.failHost(host, "route cleanup dependency failure");
+    }
+  }
 }

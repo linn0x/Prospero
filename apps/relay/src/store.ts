@@ -98,23 +98,36 @@ function normalize(credentials: SnapshotCredential[]): Array<{ deviceId: string;
   })).sort((a, b) => a.deviceId.localeCompare(b.deviceId));
 }
 
-function snapshotEquals(current: DeviceRecord[], credentials: SnapshotCredential[]): boolean {
-  const wanted = normalize(credentials);
-  const present = current.map((device) => ({
-    deviceId: device.deviceId,
-    digest: device.credentialDigest,
-    revoked: device.revokedAt !== null,
-  })).sort((a, b) => a.deviceId.localeCompare(b.deviceId));
-  if (present.length !== wanted.length) return false;
-  return present.every((device, index) => {
-    const other = wanted[index]!;
-    // An omitted device is retained as a revoked DB row with its old digest.
-    // That digest is no longer credential state, so a same-generation full
-    // snapshot represents it by { deviceId, revoked: true } equivalently.
-    if (device.deviceId !== other.deviceId || device.revoked !== other.revoked) return false;
-    if (device.revoked) return true;
-    return (device.digest === null && other.digest === null) || (device.digest !== null && other.digest !== null && device.digest.equals(other.digest));
-  });
+/**
+ * A full snapshot describes the current active credential set. MySQL retains
+ * previously omitted devices as revoked audit rows, so a retry at the same
+ * generation may omit such a row or spell it as `{ revoked: true }`; both mean
+ * the same thing. A different active set, digest, or newly introduced revoked
+ * identity is not an idempotent replay and must be rejected.
+ */
+export function snapshotEquals(current: DeviceRecord[], credentials: SnapshotCredential[]): boolean {
+  const wanted = new Map(normalize(credentials).map((credential) => [credential.deviceId, credential]));
+  const present = new Map(current.map((device) => [device.deviceId, device]));
+
+  for (const device of current) {
+    const credential = wanted.get(device.deviceId);
+    if (device.revokedAt !== null) {
+      if (credential !== undefined && !credential.revoked) return false;
+      continue;
+    }
+    if (credential === undefined || credential.revoked) return false;
+    if (device.credentialDigest === null || !device.credentialDigest.equals(credential.digest!)) return false;
+  }
+
+  for (const credential of wanted.values()) {
+    const device = present.get(credential.deviceId);
+    if (credential.revoked) {
+      if (device === undefined || device.revokedAt === null) return false;
+      continue;
+    }
+    if (device === undefined || device.revokedAt !== null || device.credentialDigest === null || !device.credentialDigest.equals(credential.digest!)) return false;
+  }
+  return true;
 }
 
 export class MySqlRouteStore implements RouteStore {
@@ -369,9 +382,11 @@ export class RedisEphemeralStore implements EphemeralStore {
   async setPresence(routeId: string, connectionId: string, ttlSeconds: number): Promise<void> { await this.ready(); await this.client.set(`presence:${routeId}`, connectionId, { EX: ttlSeconds }); }
   async clearPresence(routeId: string, connectionId: string): Promise<void> { await this.ready(); await this.client.eval(COMPARE_AND_DELETE, { keys: [`presence:${routeId}`], arguments: [connectionId] }); }
   async createTicket(ticket: StreamTicket): Promise<void> {
+    await this.ready();
+    // Derive both Redis TTLs at the atomic write boundary. A reconnect cannot
+    // stretch a ticket beyond its advertised expiresAt.
     const ttlMs = ticket.expiresAt - Date.now();
     if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0) throw new Error("ticket already expired");
-    await this.ready();
     const created = await this.client.eval(CREATE_TICKET, {
       keys: [`ticket:${ticket.ticket}`, `ticket-state:${ticket.ticket}`],
       arguments: [JSON.stringify(ticket), String(ttlMs), String(ttlMs + TICKET_STATUS_RETENTION_MS)],
