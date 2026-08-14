@@ -15,7 +15,12 @@ export type SnapshotCredential =
   | { deviceId: string; credentialDigest: string; revoked?: false | undefined }
   | { deviceId: string; revoked: true };
 
-/** A generation conflict is a protocol error, not a missing/disabled route. */
+/**
+ * A generation conflict is a protocol error, not a missing/disabled route.
+ *
+ * `applyDeviceSnapshot` raises this only after its transaction has rolled back,
+ * so callers may distinguish it from an otherwise ambiguous storage failure.
+ */
 export class SnapshotGenerationError extends Error {
   constructor() { super("stale or inconsistent device snapshot generation"); this.name = "SnapshotGenerationError"; }
 }
@@ -168,18 +173,24 @@ export class MySqlRouteStore implements RouteStore {
 
   async applyDeviceSnapshot(routeId: string, generation: number, credentials: SnapshotCredential[]): Promise<RouteSnapshot | null> {
     const connection = await this.pool.getConnection();
+    let transactionOpen = false;
     try {
       await connection.beginTransaction();
+      transactionOpen = true;
       const [routes] = await connection.execute<RouteRow[]>("SELECT route_id, generation, disabled_at, created_at, last_seen_at FROM routes WHERE route_id = ? FOR UPDATE", [routeId]);
       const routeRow = routes[0];
       if (routeRow === undefined || routeRow.disabled_at !== null) {
         await connection.rollback();
+        transactionOpen = false;
         return null;
       }
       const [existingRows] = await connection.execute<DeviceRow[]>("SELECT route_id, device_id, credential_digest, created_at, last_seen_at, revoked_at FROM devices WHERE route_id = ? FOR UPDATE", [routeId]);
       const existing = existingRows.map(deviceFromRow);
       if (generation < routeRow.generation || (generation === routeRow.generation && !snapshotEquals(existing, credentials))) {
+        // This is the sole safe stale-snapshot outcome: release the locked
+        // transaction before exposing SnapshotGenerationError to the relay.
         await connection.rollback();
+        transactionOpen = false;
         throw new SnapshotGenerationError();
       }
       if (generation > routeRow.generation) {
@@ -208,12 +219,13 @@ export class MySqlRouteStore implements RouteStore {
       }
       const [allRows] = await connection.execute<DeviceRow[]>("SELECT route_id, device_id, credential_digest, created_at, last_seen_at, revoked_at FROM devices WHERE route_id = ?", [routeId]);
       await connection.commit();
+      transactionOpen = false;
       return {
         route: { ...routeFromRow(routeRow), generation, lastSeenAt: new Date() },
         devices: allRows.map(deviceFromRow),
       };
     } catch (error) {
-      await connection.rollback();
+      if (transactionOpen) await connection.rollback();
       throw error;
     } finally {
       connection.release();
