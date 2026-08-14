@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -164,12 +164,25 @@ describe("结构化会话持久化", () => {
       rows: 24,
       allowShell: false,
     });
-    // 模拟 store 先落下 dispatch succeeded/failed、进程在 kill 之前崩溃：
-    // structured state 仍是非 terminal。
+    // 模拟 store 先落下 dispatch succeeded/failed、进程在 kill 之前崩溃：磁盘的
+    // structured state 仍非 terminal，却已有一条本来会在恢复时 drain 的排队消息。
     first.flushPersistence();
     await first.disposeAll();
+    const stateFile = path.join(home, "structured-sessions.json");
+    const states = JSON.parse(readFileSync(stateFile, "utf8")) as Array<Record<string, unknown>>;
+    states[0]!["messageQueue"] = [{
+      id: "queued-after-delivery",
+      displayText: "绝不能在重启后写入 worktree",
+      outgoingText: "绝不能在重启后写入 worktree",
+      kind: "queue",
+      createdAt: 1,
+      attachmentCount: 0,
+      attachments: [],
+    }];
+    writeFileSync(stateFile, JSON.stringify(states));
 
     let starts = 0;
+    let sends = 0;
     const second = new SessionManager({
       home,
       adapterFactory: (_agent, state) => {
@@ -178,6 +191,9 @@ describe("结构化会话持久化", () => {
         adapter.start = async (context) => {
           starts += 1;
           await start(context);
+        };
+        adapter.send = async () => {
+          sends += 1;
         };
         return adapter;
       },
@@ -188,6 +204,10 @@ describe("结构化会话持久化", () => {
 
     expect(restored).toEqual([expect.objectContaining({ id: created.id, status: "done" })]);
     expect(starts).toBe(0);
+    expect(sends).toBe(0);
+    expect(second.infoOf(created.id).messageQueue).toEqual([
+      expect.objectContaining({ text: "绝不能在重启后写入 worktree" }),
+    ]);
     expect(JSON.parse(readFileSync(path.join(home, "structured-sessions.json"), "utf8")))
       .toEqual([expect.objectContaining({ id: created.id, terminal: true })]);
     await expect(second.chatSend(created.id, "不得在恢复时重连"))
