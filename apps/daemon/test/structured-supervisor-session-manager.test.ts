@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, rmSync, writeFileSync, chmodSync, mkdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync, mkdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -220,6 +220,25 @@ describe("SessionManager structured supervisor facade", () => {
     const recovered = new SessionManager({ home: value, supervisorLauncher: fakeLauncher });
     const sessions = await recovered.restoreStructured();
     expect(sessions).toEqual([expect.objectContaining({ id: info.id, status: "died" })]);
+    expect(counters.get(info.id)).toEqual({ disposed: 0, killed: 0 });
+    await recovered.disposeAll();
+  });
+
+  it("never reattaches a live owner whose manifest is a failed-launch audit", async () => {
+    const value = home();
+    const first = new SessionManager({ home: value, supervisorLauncher: fakeLauncher });
+    const info = await first.create({ agent: "codex", cwd: value, cols: 80, rows: 24, allowShell: false });
+    await first.disposeAll();
+
+    const manifestFile = path.join(value, "structured-supervisor", info.id, "manifest.json");
+    const manifest = JSON.parse(readFileSync(manifestFile, "utf8")) as StructuredSupervisorManifest;
+    privateJson(manifestFile, { ...manifest, status: "died" });
+
+    const recovered = new SessionManager({ home: value, supervisorLauncher: fakeLauncher });
+    const sessions = await recovered.restoreStructured();
+    expect(sessions).toEqual([expect.objectContaining({ id: info.id, status: "died" })]);
+    await expect(recovered.chatSend(info.id, "must remain audit-only"))
+      .rejects.toThrow(/disconnected|unavailable/i);
     expect(counters.get(info.id)).toEqual({ disposed: 0, killed: 0 });
     await recovered.disposeAll();
   });
