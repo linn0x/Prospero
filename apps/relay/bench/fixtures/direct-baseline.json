@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "kind": "prospero-direct-baseline-report",
+  "latency": {
+    "roundTripMs": {
+      "p95": 2.5
+    }
+  }
+}

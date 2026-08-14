@@ -655,6 +655,7 @@ export class RelayServer {
     try { target.send(data, { binary, compress: false }, (error) => { if (error != null) this.closeStream(stream, 1013, "write failed"); }); }
     catch { this.closeStream(stream, 1013, "write failed"); return; }
     this.metrics.forwardedFrames.inc({ direction, kind: binary ? "binary" : "text" });
+    this.metrics.forwardedBytes.inc({ direction }, size);
   }
 
   private closeStream(stream: StreamConnection, code: number, reason: string, closeClient = true): void {
