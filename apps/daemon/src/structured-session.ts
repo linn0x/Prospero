@@ -39,6 +39,7 @@ import type {
   SessionStatus,
   SubagentInfo,
 } from "@prospero/protocol";
+import { MAX_SUBAGENT_SUMMARY_CHARS } from "@prospero/protocol";
 import type { AgentAdapter } from "./adapters/types.js";
 
 /** 事件日志上限:超出后丢弃最旧的(快照会带 truncated 标记) */
@@ -55,6 +56,107 @@ const MAX_TOOL_OUTPUT = 200_000;
 const MAX_TOOL_ENTRIES = 200;
 /** daemon 级消息队列上限；防止断线客户端无限堆积。 */
 const MAX_MESSAGE_QUEUE = 50;
+/** Parent chat only renders two lines; full child history remains available on demand. */
+const SNAPSHOT_SUBAGENT_PREVIEW_CHARS = 220;
+
+/**
+ * Adapter events are trusted TypeScript values, not parsed protocol input. Native SDKs can still
+ * return strings beyond the schema limit, so enforce the wire invariant before persist/broadcast.
+ */
+export function normalizeAgentEvent(body: AgentEventBody): AgentEventBody {
+  if (
+    body.kind !== "subagent.updated" ||
+    body.summary === undefined ||
+    body.summary.length <= MAX_SUBAGENT_SUMMARY_CHARS
+  ) {
+    return body;
+  }
+  return {
+    ...body,
+    // Completion conclusions tend to be at the end; make truncation explicit and keep that tail.
+    summary: `…${body.summary.slice(-(MAX_SUBAGENT_SUMMARY_CHARS - 1))}`,
+  };
+}
+
+function sameOptionalAgent(
+  a: { agentId?: string | undefined },
+  b: { agentId?: string | undefined },
+): boolean {
+  return a.agentId === b.agentId;
+}
+
+/**
+ * Builds an equivalent parent-chat replay without token-sized delta/event overhead.
+ * The durable log and incremental sequence remain untouched; evSeq therefore stays authoritative.
+ */
+export function compactAgentSnapshotEvents(events: readonly AgentEventBody[]): AgentEventBody[] {
+  const compact: AgentEventBody[] = [];
+  const subagentUpdateIndex = new Map<string, number>();
+
+  for (const source of events) {
+    let body = normalizeAgentEvent(source);
+    if (body.kind === "subagent.updated" && body.summary) {
+      body = {
+        ...body,
+        summary: latestReplyPreview(body.summary, SNAPSHOT_SUBAGENT_PREVIEW_CHARS),
+      };
+    }
+
+    const previous = compact.at(-1);
+    if (
+      body.kind === "text.delta" &&
+      previous?.kind === "text.delta" &&
+      body.msgId === previous.msgId &&
+      body.textId === previous.textId &&
+      sameOptionalAgent(body, previous)
+    ) {
+      compact[compact.length - 1] = { ...previous, delta: previous.delta + body.delta };
+      continue;
+    }
+    if (
+      body.kind === "reasoning.delta" &&
+      previous?.kind === "reasoning.delta" &&
+      body.msgId === previous.msgId &&
+      sameOptionalAgent(body, previous)
+    ) {
+      compact[compact.length - 1] = { ...previous, delta: previous.delta + body.delta };
+      continue;
+    }
+    if (body.kind === "subagent.started") {
+      // A repeated identity event starts a new folding segment for this child.
+      subagentUpdateIndex.delete(body.subagent.id);
+      compact.push(body);
+      continue;
+    }
+    if (body.kind === "subagent.updated") {
+      const index = subagentUpdateIndex.get(body.subagentId);
+      if (index === undefined) {
+        subagentUpdateIndex.set(body.subagentId, compact.length);
+        compact.push(body);
+        continue;
+      }
+      const prior = compact[index];
+      if (prior?.kind !== "subagent.updated") {
+        subagentUpdateIndex.set(body.subagentId, compact.length);
+        compact.push(body);
+        continue;
+      }
+      // Missing fields mean "retain the previous value" in the mobile reducer.
+      compact[index] = {
+        ...body,
+        ...(body.canMessage === undefined && prior.canMessage !== undefined
+          ? { canMessage: prior.canMessage }
+          : {}),
+        ...(!body.summary && prior.summary
+          ? { summary: prior.summary }
+          : {}),
+      };
+      continue;
+    }
+    compact.push(body);
+  }
+  return compact;
+}
 
 interface QueuedAttachmentRef {
   /** 仅在本会话附件目录中有意义的文件名；不会暴露绝对路径。 */
@@ -186,7 +288,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
         typeof restored.adapterState["threadId"] === "string"
           ? restored.adapterState["threadId"]
           : "";
-      const restoredEvents = restored.events.filter((body) => {
+      const restoredEvents = restored.events.map(normalizeAgentEvent).filter((body) => {
         // 0.0.10 曾给 thread/list 发送本机 app-server 不认识的 ancestorThreadId。
         // Codex 静默忽略后返回父线程自己，旧 daemon 随即把它持久化成了伪子 Agent。
         // 真子线程绝不可能与父 threadId 相等，因此恢复时可无歧义地清掉这两类事件。
@@ -541,6 +643,11 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     return { events: [...this.log], evSeq: this.evSeq };
   }
 
+  /** attach 传输用：保持最终聊天状态等价，同时压掉高频增量与进度摘要。 */
+  transportSnapshot(): { events: AgentEventBody[]; evSeq: number } {
+    return { events: compactAgentSnapshotEvents(this.log), evSeq: this.evSeq };
+  }
+
   /**
    * 子 Agent 详情的权威快照。优先采用适配器原生历史，因其不受 Prospero
    * MAX_EVENTS 和 daemon 重启时点限制；人工审批/提问只存在于 Prospero 层，
@@ -564,7 +671,11 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
       }
     }
     if (!native || native.length === 0) {
-      return { subagent: { ...subagent }, events: stored, evSeq: this.evSeq };
+      return {
+        subagent: { ...subagent },
+        events: compactAgentSnapshotEvents(stored),
+        evSeq: this.evSeq,
+      };
     }
     const interactions = stored.filter(
       (body) =>
@@ -576,7 +687,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     );
     return {
       subagent: { ...subagent },
-      events: [...native, ...interactions],
+      events: compactAgentSnapshotEvents([...native, ...interactions]),
       evSeq: this.evSeq,
     };
   }
@@ -592,6 +703,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
 
   private record(body: AgentEventBody): void {
     if (this.disposed) return;
+    body = normalizeAgentEvent(body);
     this.evSeq++;
     this.log.push(body);
     if (this.log.length > MAX_EVENTS) this.log.shift();

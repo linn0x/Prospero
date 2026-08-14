@@ -32,6 +32,7 @@ export {
   AgentControlsSchema,
   SubagentStatusSchema,
   SubagentInfoSchema,
+  MAX_SUBAGENT_SUMMARY_CHARS,
   C2SChatQueueGuideSchema,
   C2SAgentModelsGetSchema,
   C2SAgentModelSetSchema,
