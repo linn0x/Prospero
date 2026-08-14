@@ -6,7 +6,7 @@
  * account credentials are read from private files and never appear in argv or
  * stdout/stderr.  The daemon is consequently just an IPC client.
  */
-import { chmodSync, existsSync, lstatSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, readFileSync, renameSync, rmSync, rmdirSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type {
   ApprovalPolicy,
@@ -60,6 +60,8 @@ interface RunnerConfig {
   sessionDir: string;
   attachmentRoot: string;
   socketPath: string;
+  /** Atomically-created /tmp parent, removed only by this runner on exit. */
+  socketDir?: string;
   environment: Record<string, string>;
   codexAppServerArgs?: string[];
   accountId?: string;
@@ -103,6 +105,7 @@ function readConfig(): RunnerConfig {
     v.version !== 1 || typeof v.sessionId !== "string" || typeof v.agent !== "string" ||
     typeof v.title !== "string" || typeof v.cwd !== "string" || typeof v.createdAt !== "number" ||
     typeof v.sessionDir !== "string" || typeof v.attachmentRoot !== "string" || typeof v.socketPath !== "string" ||
+    (v.socketDir !== undefined && (typeof v.socketDir !== "string" || path.dirname(v.socketPath) !== v.socketDir)) ||
     !v.environment || typeof v.environment !== "object" || Array.isArray(v.environment)
   ) {
     throw new Error("invalid supervisor bootstrap");
@@ -112,6 +115,19 @@ function readConfig(): RunnerConfig {
 
 function manifestPath(config: RunnerConfig): string {
   return path.join(config.sessionDir, "manifest.json");
+}
+
+function removeSocketDirectory(config: RunnerConfig): void {
+  if (!config.socketDir) return;
+  try {
+    const metadata = lstatSync(config.socketDir);
+    if (metadata.isDirectory() && !metadata.isSymbolicLink() && (metadata.mode & 0o777) === 0o700) {
+      rmdirSync(config.socketDir);
+    }
+  } catch {
+    // The socket was already closed. Retain a changed/non-empty directory
+    // rather than deleting anything beyond the exact launch-owned endpoint.
+  }
 }
 
 function updateManifest(config: RunnerConfig, patch: Partial<StructuredSupervisorManifest>): void {
@@ -228,6 +244,18 @@ export async function runStructuredSupervisor(): Promise<void> {
   session.on("state", () => persist(session));
 
   let supervisor: Awaited<ReturnType<typeof startStructuredSupervisor>> | null = null;
+  const exitAfterClose = () => {
+    const current = supervisor;
+    if (!current) {
+      removeSocketDirectory(config);
+      process.exit(0);
+      return;
+    }
+    void current.close().finally(() => {
+      removeSocketDirectory(config);
+      process.exit(0);
+    });
+  };
   const adapter: SupervisorAdapter = {
     async start(context) {
       session.on("event", (body) => context.emit(body));
@@ -240,9 +268,7 @@ export async function runStructuredSupervisor(): Promise<void> {
       persist(session);
       // Allow the kill response to flush first.  This is the only path where a
       // daemon request terminates the supervisor process group.
-      setTimeout(() => {
-        void supervisor?.close().finally(() => process.exit(0));
-      }, 25).unref();
+      setTimeout(exitAfterClose, 25).unref();
     },
     call: (method, params) => control(session, method, params),
   };
@@ -261,7 +287,7 @@ export async function runStructuredSupervisor(): Promise<void> {
     // This is a deliberate process-level shutdown, never a daemon-client
     // disconnect.  Do not call session.dispose here: a normal daemon restart
     // never sends us a signal in the first place.
-    void supervisor?.close().finally(() => process.exit(0));
+    exitAfterClose();
   };
   process.once("SIGTERM", close);
   process.once("SIGINT", close);

@@ -1,16 +1,18 @@
 /** Daemon-side launcher and reconnectable facade for one structured session. */
 import { randomBytes, randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import {
   chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   readdirSync,
   renameSync,
   rmSync,
+  rmdirSync,
   statSync,
   writeFileSync,
 } from "node:fs";
@@ -73,6 +75,10 @@ export interface StructuredSupervisorManifest {
 const MAX_EVENTS = 4_000;
 const INFO_REFRESH_MS = 250;
 const SESSION_ID = /^[A-Za-z0-9._-]{1,128}$/;
+const SUPERVISOR_STARTUP_TIMEOUT_MS = 8_000;
+const SUPERVISOR_ATTACH_ATTEMPT_TIMEOUT_MS = 250;
+const SUPERVISOR_TERM_GRACE_MS = 500;
+const SUPERVISOR_KILL_GRACE_MS = 2_000;
 
 export type StructuredHosting = "supervisor" | "in_process" | "unavailable";
 
@@ -96,7 +102,11 @@ class SupervisorRpc {
   private socket: Socket | null = null;
   private buffer = "";
   private nextId = 1;
-  private readonly pending = new Map<number, { resolve(value: unknown): void; reject(error: Error): void }>();
+  private readonly pending = new Map<number, {
+    resolve(value: unknown): void;
+    reject(error: Error): void;
+    timeout: NodeJS.Timeout | undefined;
+  }>();
 
   constructor(
     private readonly socketPath: string,
@@ -105,11 +115,15 @@ class SupervisorRpc {
     private readonly onDisconnect: () => void,
   ) {}
 
-  async connect(): Promise<void> {
+  async connect(timeoutMs?: number): Promise<void> {
     if (this.socket && !this.socket.destroyed) return;
     const socket = createConnection(this.socketPath);
     try {
-      await once(socket, "connect");
+      await withTimeout(
+        once(socket, "connect").then(() => undefined),
+        timeoutMs,
+        "supervisor socket connection timed out",
+      );
     } catch (error) {
       socket.destroy();
       throw error;
@@ -127,15 +141,37 @@ class SupervisorRpc {
     });
   }
 
-  async request<T>(method: string, params: Record<string, unknown>): Promise<T> {
-    await this.connect();
+  async request<T>(method: string, params: Record<string, unknown>, timeoutMs?: number): Promise<T> {
+    const startedAt = Date.now();
+    await this.connect(timeoutMs);
     const socket = this.socket;
     if (!socket || socket.destroyed || !socket.writable) throw new RemoteSupervisorError("supervisor socket unavailable");
     const id = this.nextId++;
-    const result = new Promise<T>((resolve, reject) => this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject }));
-    socket.write(`${JSON.stringify({
-      version: SUPERVISOR_PROTOCOL_VERSION, id, method, params, token: this.token,
-    })}\n`);
+    const remaining = timeoutMs === undefined ? undefined : Math.max(1, timeoutMs - (Date.now() - startedAt));
+    const result = new Promise<T>((resolve, reject) => {
+      const timeout = remaining === undefined ? undefined : setTimeout(() => {
+        const pending = this.pending.get(id);
+        if (!pending) return;
+        this.pending.delete(id);
+        pending.reject(new RemoteSupervisorError("supervisor request timed out", "startup_timeout"));
+        // A timed-out startup handshake must not retain a live client socket.
+        // The caller will either retry or tear down the newly spawned owner.
+        this.socket?.destroy();
+      }, remaining);
+      this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject, timeout });
+    });
+    try {
+      socket.write(`${JSON.stringify({
+        version: SUPERVISOR_PROTOCOL_VERSION, id, method, params, token: this.token,
+      })}\n`);
+    } catch (error) {
+      const pending = this.pending.get(id);
+      if (pending) {
+        this.pending.delete(id);
+        if (pending.timeout) clearTimeout(pending.timeout);
+        pending.reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    }
     return result;
   }
 
@@ -167,15 +203,30 @@ class SupervisorRpc {
       const pending = this.pending.get(message.id);
       if (!pending) continue;
       this.pending.delete(message.id);
+      if (pending.timeout) clearTimeout(pending.timeout);
       if (message.ok) pending.resolve(message.result);
       else pending.reject(new RemoteSupervisorError(message.error?.message ?? "supervisor request failed", message.error?.code));
     }
   }
 
   private rejectAll(error: Error): void {
-    for (const entry of this.pending.values()) entry.reject(error);
+    for (const entry of this.pending.values()) {
+      if (entry.timeout) clearTimeout(entry.timeout);
+      entry.reject(error);
+    }
     this.pending.clear();
   }
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number | undefined, message: string): Promise<T> {
+  if (timeoutMs === undefined) return promise;
+  return new Promise<T>((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new RemoteSupervisorError(message, "startup_timeout")), timeoutMs);
+    promise.then(
+      (value) => { clearTimeout(timeout); resolve(value); },
+      (error) => { clearTimeout(timeout); reject(error); },
+    );
+  });
 }
 
 function privateWrite(file: string, value: unknown): void {
@@ -297,10 +348,17 @@ export class RemoteStructuredSession extends EventEmitter {
     }
   }
 
-  static async attach(manifest: StructuredSupervisorManifest): Promise<RemoteStructuredSession> {
+  static async attach(manifest: StructuredSupervisorManifest, timeoutMs?: number): Promise<RemoteStructuredSession> {
     const session = new RemoteStructuredSession(manifest, "supervisor");
-    await session.reconnect();
-    return session;
+    try {
+      await session.reconnect(timeoutMs);
+      return session;
+    } catch (error) {
+      // A launch retry must not leave an unauthenticated or timed-out facade
+      // socket attached to the child supervisor.
+      await session.dispose();
+      throw error;
+    }
   }
 
   static unavailable(manifest: StructuredSupervisorManifest): RemoteStructuredSession {
@@ -320,7 +378,7 @@ export class RemoteStructuredSession extends EventEmitter {
     return this.manifest.sessionDir ?? path.dirname(this.manifest.socket);
   }
 
-  async reconnect(): Promise<void> {
+  async reconnect(timeoutMs?: number): Promise<void> {
     if (this.hosting === "unavailable") throw new RemoteSupervisorError("supervisor is unavailable");
     this.rpc?.close();
     this.disconnected = false;
@@ -335,20 +393,33 @@ export class RemoteStructuredSession extends EventEmitter {
       },
     );
     this.rpc = rpc;
-    const replay = await this.rpc.request<{ events: SupervisorEvent[]; lastSeq: number; gap: boolean }>(
-      "session.subscribe", { sessionId: this.id, afterSeq: this.evSeq },
-    );
-    if (replay.gap) {
-      // A restart with compacted history must never claim a partial exact
-      // replay.  The runner's full snapshot is the authoritative recovery.
-      const snap = await this.call<{ events: AgentEventBody[]; evSeq: number }>("snapshot", {});
-      this.log.splice(0, this.log.length, ...snap.events.slice(-MAX_EVENTS));
-      this.evSeq = snap.evSeq;
-      this.rebuildPending();
-    } else {
-      for (const event of replay.events) this.acceptEvent(event);
+    const deadline = timeoutMs === undefined ? undefined : Date.now() + timeoutMs;
+    const remaining = (): number | undefined => deadline === undefined ? undefined : Math.max(1, deadline - Date.now());
+    try {
+      const replay = await this.rpc.request<{ events: SupervisorEvent[]; lastSeq: number; gap: boolean }>(
+        "session.subscribe", { sessionId: this.id, afterSeq: this.evSeq }, remaining(),
+      );
+      if (replay.gap) {
+        // A restart with compacted history must never claim a partial exact
+        // replay.  The runner's full snapshot is the authoritative recovery.
+        const snap = await this.call<{ events: AgentEventBody[]; evSeq: number }>("snapshot", {}, remaining());
+        this.log.splice(0, this.log.length, ...snap.events.slice(-MAX_EVENTS));
+        this.evSeq = snap.evSeq;
+        this.rebuildPending();
+      } else {
+        for (const event of replay.events) this.acceptEvent(event);
+      }
+      await this.refreshInfo(remaining());
+    } catch (error) {
+      // reconnect() may be called after a temporary transport failure too;
+      // leave it retryable, but never retain the failed socket or pending RPC.
+      if (this.rpc === rpc) {
+        this.rpc = null;
+        this.disconnected = true;
+        rpc.close();
+      }
+      throw error;
     }
-    await this.refreshInfo();
   }
 
   private acceptEvent(event: SupervisorEvent): void {
@@ -425,15 +496,15 @@ export class RemoteStructuredSession extends EventEmitter {
     }
   }
 
-  private async call<T>(method: string, params: Record<string, unknown>): Promise<T> {
+  private async call<T>(method: string, params: Record<string, unknown>, timeoutMs?: number): Promise<T> {
     if (!this.rpc || this.disconnected) throw new RemoteSupervisorError("supervisor client is disconnected");
     try {
-      return await this.rpc.request<T>("session.call", { sessionId: this.id, method, params });
+      return await this.rpc.request<T>("session.call", { sessionId: this.id, method, params }, timeoutMs);
     } catch (error) { throw error; }
   }
 
-  private async refreshInfo(): Promise<void> {
-    const info = await this.call<SessionInfo>("info", {});
+  private async refreshInfo(timeoutMs?: number): Promise<void> {
+    const info = await this.call<SessionInfo>("info", {}, timeoutMs);
     this.infoValue = info;
     this.emit("state", this.info());
   }
@@ -592,6 +663,8 @@ export interface LaunchStructuredSupervisorInput {
   accountId?: string;
   accountName?: string;
   initialAdapterState?: AdapterResumeState;
+  /** Test seam for a bounded startup failure; production uses eight seconds. */
+  startupTimeoutMs?: number;
 }
 
 function runnerPath(): string {
@@ -601,9 +674,113 @@ function runnerPath(): string {
   return path.resolve(here, "../dist/structured-supervisor-runner.js");
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** A negative PID addresses exactly the detached process group created by spawn(). */
+function processGroupAlive(groupId: number): boolean {
+  try {
+    process.kill(-groupId, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+function signalProcessGroup(groupId: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(-groupId, signal);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+  }
+}
+
+async function waitForProcessGroupExit(groupId: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (processGroupAlive(groupId) && Date.now() < deadline) await delay(20);
+  return !processGroupAlive(groupId);
+}
+
+/**
+ * Rollback has one authority boundary: the process group whose leader was
+ * returned by this exact detached spawn. It never consults manifests or scans
+ * PIDs, so an already-running/reconnected supervisor cannot be selected here.
+ */
+async function terminateNewSupervisorGroup(groupId: number | undefined): Promise<void> {
+  if (!groupId || !Number.isSafeInteger(groupId) || groupId <= 1 || !processGroupAlive(groupId)) return;
+  signalProcessGroup(groupId, "SIGTERM");
+  if (await waitForProcessGroupExit(groupId, SUPERVISOR_TERM_GRACE_MS)) return;
+  signalProcessGroup(groupId, "SIGKILL");
+  if (await waitForProcessGroupExit(groupId, SUPERVISOR_KILL_GRACE_MS)) return;
+  throw new RemoteSupervisorError("new supervisor process group did not exit during launch rollback", "cleanup_failed");
+}
+
+/** Only the launcher's exact random endpoint is considered; ordinary files are never unlinked. */
+function removeNewSupervisorSocket(socketPath: string, socketDir: string): void {
+  // socketDir was atomically allocated by mkdtempSync for this launch. Do not
+  // unlink a socket merely because its pathname happens to look familiar.
+  if (path.dirname(socketPath) !== socketDir) return;
+  try {
+    if (lstatSync(socketPath).isSocket()) rmSync(socketPath, { force: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  try {
+    const metadata = lstatSync(socketDir);
+    if (metadata.isDirectory() && !metadata.isSymbolicLink() && (metadata.mode & 0o777) === 0o700) {
+      rmdirSync(socketDir);
+    }
+  } catch (error) {
+    // A non-empty/changed private directory is retained rather than deleted.
+    // Its one exact socket has already been removed above.
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT" && code !== "ENOTEMPTY") throw error;
+  }
+}
+
+async function waitForSpawn(child: ChildProcess): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const spawned = () => {
+      child.off("error", failed);
+      resolve();
+    };
+    const failed = (error: Error) => {
+      child.off("spawn", spawned);
+      reject(error);
+    };
+    child.once("spawn", spawned);
+    child.once("error", failed);
+  });
+}
+
+async function rollbackFailedLaunch(
+  groupId: number | undefined,
+  bootstrap: string | undefined,
+  socketPath: string,
+  socketDir: string,
+  manifestFile: string,
+  manifest: StructuredSupervisorManifest,
+): Promise<void> {
+  // Signal and reap the whole new group before unlinking its endpoint. This
+  // covers a runner that already spawned a provider child, including Codex.
+  await terminateNewSupervisorGroup(groupId);
+  if (bootstrap) rmSync(bootstrap, { force: true });
+  removeNewSupervisorSocket(socketPath, socketDir);
+
+  // Keep the private directory and manifest as a read-only audit record. A
+  // later daemon restart exposes it as died history and never relaunches it.
+  const latest = readSupervisorManifest(manifestFile) ?? manifest;
+  privateWrite(manifestFile, { ...latest, status: "died", updatedAt: Date.now() });
+}
+
 export async function launchStructuredSupervisor(input: LaunchStructuredSupervisorInput): Promise<RemoteStructuredSession> {
   if (process.platform === "win32") throw new RemoteSupervisorError("structured supervisor requires Unix", "unsupported_platform");
   if (!SESSION_ID.test(input.sessionId)) throw new RemoteSupervisorError("invalid session id", "bad_request");
+  const startupTimeoutMs = input.startupTimeoutMs ?? SUPERVISOR_STARTUP_TIMEOUT_MS;
+  if (!Number.isFinite(startupTimeoutMs) || startupTimeoutMs <= 0) {
+    throw new RemoteSupervisorError("invalid supervisor startup timeout", "bad_request");
+  }
   mkdirSync(input.root, { recursive: true, mode: 0o700 });
   chmodSync(input.root, 0o700);
   const sessionDir = path.join(input.root, input.sessionId);
@@ -617,12 +794,15 @@ export async function launchStructuredSupervisor(input: LaunchStructuredSupervis
   // macOS has a short Unix-domain socket path limit. A compact leaf inside a
   // long `~/.prospero/.../<uuid>` directory is still too long *to reconnect*
   // from the daemon: binding after runner chdir works, but the manifest's
-  // absolute endpoint later fails with EINVAL.  Use a random, 0600 socket in
-  // sticky /tmp instead. Its unguessable name remains private through the
-  // 0600 manifest/token; the socket itself is chmod 0600 by the transport.
+  // absolute endpoint later fails with EINVAL.  Use a random 0700 directory
+  // and a 0600 socket in sticky /tmp instead. The atomically-created parent
+  // proves this launch owns the exact endpoint even in the vanishingly rare
+  // nonce-collision case; the socket itself is chmod 0600 by the transport.
   // `/tmp` is intentionally literal rather than os.tmpdir(), which is often
   // another long per-user path on macOS.
-  const socketPath = path.join("/tmp", `prospero-supervisor-${randomBytes(12).toString("hex")}.sock`);
+  const socketDir = mkdtempSync("/tmp/prospero-supervisor-");
+  chmodSync(socketDir, 0o700);
+  const socketPath = path.join(socketDir, "s.sock");
   const manifest: StructuredSupervisorManifest = {
     version: SUPERVISOR_MANIFEST_VERSION, protocolVersion: SUPERVISOR_PROTOCOL_VERSION,
     implementation: "supervisor", sessionId: input.sessionId, agent: input.agent, title: input.title,
@@ -630,57 +810,85 @@ export async function launchStructuredSupervisor(input: LaunchStructuredSupervis
     socket: socketPath, tokenFile: "token", sessionDir, lifecycleEpoch: randomUUID(), status: "starting",
     ...(input.accountId ? { accountId: input.accountId } : {}), ...(input.accountName ? { accountName: input.accountName } : {}),
   };
-  privateWrite(path.join(sessionDir, "manifest.json"), manifest);
-  const bootstrap = path.join(sessionDir, `.bootstrap-${randomBytes(8).toString("hex")}.json`);
-  privateWrite(bootstrap, {
-    version: 1, sessionId: input.sessionId, agent: input.agent, title: input.title, cwd: input.cwd,
-    createdAt: input.createdAt, approvalPolicy: input.approvalPolicy, sessionDir,
-    attachmentRoot: path.join(sessionDir, "attachments"), socketPath, environment: input.environment,
-    ...(input.codexAppServerArgs ? { codexAppServerArgs: input.codexAppServerArgs } : {}),
-    ...(input.accountId ? { accountId: input.accountId } : {}), ...(input.accountName ? { accountName: input.accountName } : {}),
-    ...(input.initialAdapterState ? { initialAdapterState: input.initialAdapterState } : {}),
-  });
-  const child = spawn(process.execPath, [runnerPath()], {
-    detached: true, stdio: "ignore", cwd: sessionDir,
-    // Do not inherit the daemon environment: account credentials travel only
-    // in the 0600 bootstrap file and never through argv or daemon logs.
-    env: {
-      PATH: process.env["PATH"] ?? "",
-      // Native CLIs/SDKs use these operational values before their adapter
-      // context is applied. Credentials are intentionally absent here.
-      HOME: process.env["HOME"] ?? "",
-      TMPDIR: process.env["TMPDIR"] ?? "/tmp",
-      LANG: process.env["LANG"] ?? "en_US.UTF-8",
-      LC_ALL: process.env["LC_ALL"] ?? "",
-      SHELL: process.env["SHELL"] ?? "/bin/sh",
-      USER: process.env["USER"] ?? "",
-      TERM: process.env["TERM"] ?? "xterm-256color",
-      COLORTERM: process.env["COLORTERM"] ?? "truecolor",
-      ...(process.env["XDG_RUNTIME_DIR"] ? { XDG_RUNTIME_DIR: process.env["XDG_RUNTIME_DIR"] } : {}),
-      ...(process.env["XDG_CONFIG_HOME"] ? { XDG_CONFIG_HOME: process.env["XDG_CONFIG_HOME"] } : {}),
-      ...(process.env["XDG_CACHE_HOME"] ? { XDG_CACHE_HOME: process.env["XDG_CACHE_HOME"] } : {}),
-      ...(process.env["SSH_AUTH_SOCK"] ? { SSH_AUTH_SOCK: process.env["SSH_AUTH_SOCK"] } : {}),
-      PROSPERO_STRUCTURED_SUPERVISOR_CONFIG: bootstrap,
-    },
-  });
-  // If Node fails before the runner consumes it, do not leave account
-  // environment data in a bootstrap file. Normal startup removes it itself.
-  child.once("exit", () => rmSync(bootstrap, { force: true }));
-  child.unref();
-  // The runner may become ready unusually fast; preserve any status update it
-  // wrote instead of racing it back to "starting" from the launch template.
-  const latestManifest = readSupervisorManifest(path.join(sessionDir, "manifest.json")) ?? manifest;
-  privateWrite(path.join(sessionDir, "manifest.json"), { ...latestManifest, supervisorPid: child.pid, updatedAt: Date.now() });
-  const readyManifest = readSupervisorManifest(path.join(sessionDir, "manifest.json"));
-  if (!readyManifest) throw new RemoteSupervisorError("failed to write supervisor manifest");
-  const deadline = Date.now() + 8_000;
-  let lastError: unknown;
-  while (Date.now() < deadline) {
-    try { return await RemoteStructuredSession.attach(readyManifest); }
-    catch (error) { lastError = error; await new Promise((resolve) => setTimeout(resolve, 40)); }
+  const manifestFile = path.join(sessionDir, "manifest.json");
+  let bootstrap: string | undefined;
+  let groupId: number | undefined;
+  try {
+    privateWrite(manifestFile, manifest);
+    const bootstrapFile = path.join(sessionDir, `.bootstrap-${randomBytes(8).toString("hex")}.json`);
+    bootstrap = bootstrapFile;
+    privateWrite(bootstrapFile, {
+      version: 1, sessionId: input.sessionId, agent: input.agent, title: input.title, cwd: input.cwd,
+      createdAt: input.createdAt, approvalPolicy: input.approvalPolicy, sessionDir,
+      attachmentRoot: path.join(sessionDir, "attachments"), socketPath, socketDir, environment: input.environment,
+      ...(input.codexAppServerArgs ? { codexAppServerArgs: input.codexAppServerArgs } : {}),
+      ...(input.accountId ? { accountId: input.accountId } : {}), ...(input.accountName ? { accountName: input.accountName } : {}),
+      ...(input.initialAdapterState ? { initialAdapterState: input.initialAdapterState } : {}),
+    });
+    const child = spawn(process.execPath, [runnerPath()], {
+      detached: true, stdio: "ignore", cwd: sessionDir,
+      // Do not inherit the daemon environment: account credentials travel only
+      // in the 0600 bootstrap file and never through argv or daemon logs.
+      env: {
+        PATH: process.env["PATH"] ?? "",
+        // Native CLIs/SDKs use these operational values before their adapter
+        // context is applied. Credentials are intentionally absent here.
+        HOME: process.env["HOME"] ?? "",
+        TMPDIR: process.env["TMPDIR"] ?? "/tmp",
+        LANG: process.env["LANG"] ?? "en_US.UTF-8",
+        LC_ALL: process.env["LC_ALL"] ?? "",
+        SHELL: process.env["SHELL"] ?? "/bin/sh",
+        USER: process.env["USER"] ?? "",
+        TERM: process.env["TERM"] ?? "xterm-256color",
+        COLORTERM: process.env["COLORTERM"] ?? "truecolor",
+        ...(process.env["XDG_RUNTIME_DIR"] ? { XDG_RUNTIME_DIR: process.env["XDG_RUNTIME_DIR"] } : {}),
+        ...(process.env["XDG_CONFIG_HOME"] ? { XDG_CONFIG_HOME: process.env["XDG_CONFIG_HOME"] } : {}),
+        ...(process.env["XDG_CACHE_HOME"] ? { XDG_CACHE_HOME: process.env["XDG_CACHE_HOME"] } : {}),
+        ...(process.env["SSH_AUTH_SOCK"] ? { SSH_AUTH_SOCK: process.env["SSH_AUTH_SOCK"] } : {}),
+        PROSPERO_STRUCTURED_SUPERVISOR_CONFIG: bootstrapFile,
+      },
+    });
+    // If Node fails before the runner consumes it, do not leave account
+    // environment data in a bootstrap file. Normal startup removes it itself.
+    child.once("exit", () => rmSync(bootstrapFile, { force: true }));
+    await waitForSpawn(child);
+    if (!child.pid || !Number.isSafeInteger(child.pid) || child.pid <= 1) {
+      throw new RemoteSupervisorError("supervisor spawn returned no process id", "spawn_failed");
+    }
+    groupId = child.pid;
+    child.unref();
+    // The runner may become ready unusually fast; preserve any status update it
+    // wrote instead of racing it back to "starting" from the launch template.
+    const latestManifest = readSupervisorManifest(manifestFile) ?? manifest;
+    privateWrite(manifestFile, { ...latestManifest, supervisorPid: groupId, updatedAt: Date.now() });
+    const readyManifest = readSupervisorManifest(manifestFile);
+    if (!readyManifest) throw new RemoteSupervisorError("failed to write supervisor manifest");
+    const deadline = Date.now() + startupTimeoutMs;
+    let lastError: unknown;
+    while (Date.now() < deadline) {
+      const remaining = Math.max(1, deadline - Date.now());
+      try {
+        return await RemoteStructuredSession.attach(
+          readyManifest,
+          Math.min(SUPERVISOR_ATTACH_ATTEMPT_TIMEOUT_MS, remaining),
+        );
+      } catch (error) {
+        lastError = error;
+        if (Date.now() < deadline) await delay(Math.min(40, Math.max(1, deadline - Date.now())));
+      }
+    }
+    throw new RemoteSupervisorError(`supervisor did not become ready: ${lastError instanceof Error ? lastError.message : "unknown error"}`);
+  } catch (error) {
+    try {
+      await rollbackFailedLaunch(groupId, bootstrap, socketPath, socketDir, manifestFile, manifest);
+    } catch (cleanupError) {
+      throw new RemoteSupervisorError(
+        `supervisor launch failed and rollback was incomplete: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+        "cleanup_failed",
+      );
+    }
+    throw error;
   }
-  rmSync(bootstrap, { force: true });
-  throw new RemoteSupervisorError(`supervisor did not become ready: ${lastError instanceof Error ? lastError.message : "unknown error"}`);
 }
 
 /** Scan only private per-session directories; never launch a replacement here. */
