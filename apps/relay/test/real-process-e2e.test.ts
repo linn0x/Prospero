@@ -101,6 +101,8 @@ interface AuditFrame {
 /** A transparent loopback observer in front of the real relay process. */
 class RelayAuditProxy {
   readonly controlTypes = new Set<string>();
+  /** Credential counts only; test evidence never retains a bearer credential. */
+  readonly hostSnapshotCredentialCounts: number[] = [];
   readonly postReadyFrames: AuditFrame[] = [];
   private readonly http = createServer();
   private readonly wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
@@ -153,6 +155,10 @@ class RelayAuditProxy {
         // relay must be equally transparent to future binary framing.
       }
       if (typeof message?.type === "string") this.controlTypes.add(`${pathname}:${message.type}`);
+      if (pathname === "/v1/host" && message?.type === "host.device-sync") {
+        const credentials = (message as { credentials?: unknown }).credentials;
+        if (Array.isArray(credentials)) this.hostSnapshotCredentialCounts.push(credentials.length);
+      }
       const alreadyDataPlane = dataPlane;
       if (message?.type === "stream.ready") dataPlane = true;
       if (alreadyDataPlane) this.postReadyFrames.push({ path: pathname, body });
@@ -324,6 +330,10 @@ describe.skipIf(process.env.RELAY_REAL_PROCESS_E2E !== "1")("real-process relay 
       const pairing = decodePairingQR(pairingUrl, { allowInsecureLoopback: true });
       expect(pairing).toMatchObject({ port: directPort, relay: { url: audit.url } });
       expect(pairing.relay?.token).toBeTruthy();
+      await waitFor(
+        () => audit.hostSnapshotCredentialCounts.some((count) => count >= 1),
+        "daemon sync of the QR-issued relay credential",
+      );
 
       const keys = generateKeyPairB64();
       const direct = await TestClient.direct(pairing, keys);
