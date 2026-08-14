@@ -192,21 +192,96 @@ export async function getHosts(): Promise<StoredHost[]> {
 }
 
 async function saveHosts(hosts: StoredHost[]): Promise<void> {
+  await saveHostsAtomically(hosts);
+}
+
+interface SecureWrite {
+  key: string;
+  value: string | null;
+}
+
+type SecureSnapshot = SecureWrite;
+
+/**
+ * SecureStore has no multi-key transaction.  Snapshot before touching either
+ * credential, then compensate every touched key if SecureStore or the public
+ * address book rejects the update.  In particular, a new relay route can
+ * never end up paired with an old E2E token (or vice versa).
+ */
+async function saveHostsAtomically(
+  hosts: StoredHost[],
+  relayTokenKeysToDelete: readonly string[] = [],
+): Promise<void> {
   if (!await secureAvailable()) {
     throw new Error("安全存储不可用，无法保存配对凭证");
   }
-  // Do not write a new plaintext fallback. If either secure write or metadata
-  // write fails, leave the previous address book untouched so a legacy token
-  // remains recoverable on the next migration attempt.
-  await Promise.all(
-    hosts.flatMap((host) => [
-      SecureStore.setItemAsync(hostTokenKey(host.id), host.token, SECURE_OPTIONS),
-      ...(host.relayToken
-        ? [SecureStore.setItemAsync(relayTokenKey(host.id), host.relayToken, SECURE_OPTIONS)]
-        : []),
-    ]),
-  );
-  await AsyncStorage.setItem(HOSTS_KEY, JSON.stringify(hosts.map(withoutSecrets)));
+  const previousMetadata = await AsyncStorage.getItem(HOSTS_KEY);
+  const writes: SecureWrite[] = hosts.flatMap((host) => [
+    { key: hostTokenKey(host.id), value: host.token },
+    ...(host.relayToken ? [{ key: relayTokenKey(host.id), value: host.relayToken }] : []),
+  ]);
+  const keysToWrite = new Set(writes.map(({ key }) => key));
+  for (const key of relayTokenKeysToDelete) {
+    if (!keysToWrite.has(key)) writes.push({ key, value: null });
+  }
+
+  // Every read completes before the first write.  If a credential cannot be
+  // read, it is unsafe to replace it because we could not compensate later.
+  const snapshots: SecureSnapshot[] = [];
+  for (const write of writes) {
+    snapshots.push({
+      key: write.key,
+      value: await SecureStore.getItemAsync(write.key, SECURE_OPTIONS),
+    });
+  }
+
+  const touched: SecureSnapshot[] = [];
+  let metadataWriteStarted = false;
+  try {
+    // Sequential writes make the recovery set deterministic. Promise.all()
+    // would allow a still-running write to race the rollback.
+    for (const write of writes) {
+      const snapshot = snapshots.find(({ key }) => key === write.key)!;
+      touched.push(snapshot);
+      if (write.value === null) {
+        await SecureStore.deleteItemAsync(write.key, SECURE_OPTIONS);
+      } else {
+        await SecureStore.setItemAsync(write.key, write.value, SECURE_OPTIONS);
+      }
+    }
+    metadataWriteStarted = true;
+    await AsyncStorage.setItem(HOSTS_KEY, JSON.stringify(hosts.map(withoutSecrets)));
+  } catch (error) {
+    const rollbackErrors: unknown[] = [];
+    for (const snapshot of [...touched].reverse()) {
+      try {
+        if (snapshot.value === null) {
+          await SecureStore.deleteItemAsync(snapshot.key, SECURE_OPTIONS);
+        } else {
+          await SecureStore.setItemAsync(snapshot.key, snapshot.value, SECURE_OPTIONS);
+        }
+      } catch (rollbackError) {
+        rollbackErrors.push(rollbackError);
+      }
+    }
+    if (metadataWriteStarted) {
+      try {
+        if (previousMetadata === null) {
+          await AsyncStorage.removeItem(HOSTS_KEY);
+        } else {
+          await AsyncStorage.setItem(HOSTS_KEY, previousMetadata);
+        }
+      } catch (rollbackError) {
+        rollbackErrors.push(rollbackError);
+      }
+    }
+    if (rollbackErrors.length > 0) {
+      const recoveryError = new Error("保存配对凭据失败，且回滚未完全完成");
+      (recoveryError as Error & { cause?: unknown }).cause = error;
+      throw recoveryError;
+    }
+    throw error;
+  }
 }
 
 export function hostIdFor(daemonPub: string): string {
@@ -245,20 +320,20 @@ export async function upsertHostFromPairing(p: PairingPayload): Promise<StoredHo
   const i = hosts.findIndex((h) => h.id === id);
   if (i >= 0) hosts[i] = host;
   else hosts.push(host);
-  await saveHosts(hosts);
-  // A newer direct-only pairing intentionally revokes the obsolete local
-  // relay ticket only after metadata has been persisted successfully.
-  if (!p.relay && existing && await secureAvailable()) {
-    await SecureStore.deleteItemAsync(relayTokenKey(id), SECURE_OPTIONS).catch(() => {});
-  }
+  // A direct-only re-pair revokes the obsolete relay ticket in the same
+  // compensating transaction as the new E2E credential and public metadata.
+  await saveHostsAtomically(
+    hosts,
+    !p.relay && existing ? [relayTokenKey(id)] : [],
+  );
   return host;
 }
 
 export async function removeHost(id: string): Promise<void> {
   await saveHosts((await getHosts()).filter((h) => h.id !== id));
   if (await secureAvailable()) {
-    await SecureStore.deleteItemAsync(hostTokenKey(id), SECURE_OPTIONS).catch(() => {});
-    await SecureStore.deleteItemAsync(relayTokenKey(id), SECURE_OPTIONS).catch(() => {});
+    await SecureStore.deleteItemAsync(hostTokenKey(id), SECURE_OPTIONS);
+    await SecureStore.deleteItemAsync(relayTokenKey(id), SECURE_OPTIONS);
   }
 }
 
