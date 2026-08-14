@@ -110,7 +110,12 @@ function parseKeyPair(raw: string | null): KeyPairB64 | null {
   }
 }
 
-export async function getHosts(): Promise<StoredHost[]> {
+interface GetHostsOptions {
+  /** Internal callers that are about to reject an operation must not migrate first. */
+  migrate?: boolean;
+}
+
+export async function getHosts({ migrate = true }: GetHostsOptions = {}): Promise<StoredHost[]> {
   const raw = await AsyncStorage.getItem(HOSTS_KEY);
   if (!raw) return [];
   let stored: PersistedHost[];
@@ -175,7 +180,7 @@ export async function getHosts(): Promise<StoredHost[]> {
       });
     }
   }
-  if (secure && (stripLegacyTokens || migrateMetadata) && allLegacyTokensSecured) {
+  if (migrate && secure && (stripLegacyTokens || migrateMetadata) && allLegacyTokensSecured) {
     const sanitized = stored.map(({ token: _token, relayToken: _relayToken, relay, ...metadata }) => ({
       ...metadata,
       connectionMode: normalConnectionMode(metadata.connectionMode),
@@ -294,9 +299,15 @@ export async function upsertHostFromPairing(p: PairingPayload): Promise<StoredHo
       allowInsecureLoopback: typeof __DEV__ !== "undefined" && __DEV__,
     });
   }
-  const hosts = await getHosts();
   const id = hostIdFor(p.pubKey);
+  // A legacy/direct-only QR cannot replace an explicitly relay-only host:
+  // getHosts() may migrate secrets, so use its read-only form and reject before
+  // any SecureStore or AsyncStorage write can alter the existing pairing.
+  const hosts = await getHosts({ migrate: false });
   const existing = hosts.find((h) => h.id === id);
+  if (!p.relay && existing?.connectionMode === "relay") {
+    throw new RelayCredentialsMissingError();
+  }
   const host: StoredHost = {
     id,
     name: p.name,
