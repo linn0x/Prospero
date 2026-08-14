@@ -175,6 +175,61 @@ describe("控制 API 的幂等与任务图事务", () => {
     )).rejects.toMatchObject({ code: "operation_conflict" });
   });
 
+  it("失败 Task 重试后以新的 worker.start operationId 可合法新派发", async () => {
+    const store = new OrchestrationStore();
+    const run = store.createRun({ objective: "重新派发" });
+    const task = store.createTask({ runId: run.id, title: "实现", spec: "" });
+    let starts = 0;
+    const sessions: WorkerSessionManager = {
+      ...unusedSessions,
+      async create(input) {
+        starts += 1;
+        return {
+          id: `worker-${starts}`,
+          agent: input.agent,
+          kind: input.kind ?? "structured",
+          title: "worker",
+          cwd: input.cwd ?? "/tmp",
+          status: "idle",
+          createdAt: starts,
+          cols: input.cols,
+          rows: input.rows,
+        };
+      },
+      async chatSend() {},
+      async kill() {},
+    };
+    const api = orchestrationControlApi(store, new DispatchService(store, sessions), new CollaborationService(store));
+    const signal = new AbortController().signal;
+    const startParams = {
+      taskId: task.id,
+      agent: "codex",
+      worktree: "none",
+      cwd: "/tmp/project",
+      actorSessionId: null,
+    };
+
+    const first = await api("worker.start", { ...startParams, operationId: "start-attempt-1" }, signal) as {
+      session: { id: string };
+    };
+    await api("task.fail", {
+      taskId: task.id,
+      actorSessionId: first.session.id,
+      body: "本次尝试失败",
+    }, signal);
+    await api("task.retry", {
+      taskId: task.id,
+      actorSessionId: null,
+      operationId: "retry-task-1",
+    }, signal);
+
+    const second = await api("worker.start", { ...startParams, operationId: "start-attempt-2" }, signal) as {
+      session: { id: string };
+    };
+    expect(second.session.id).not.toBe(first.session.id);
+    expect(starts).toBe(2);
+  });
+
   it("graph.create 一次提交整张图，重复提交返回同一组 id", async () => {
     const store = new OrchestrationStore();
     const api = orchestrationControlApi(
