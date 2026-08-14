@@ -965,17 +965,26 @@ private struct SessionManagementRow: View {
 private struct GoalsDashboard: View {
   @Bindable var daemon: DaemonController
   @State private var showingGraphComposer = false
+  @State private var activeRunsExpanded = true
+  @State private var endedRunsExpanded = false
 
-  private var runs: [OrchestrationStatus.Run] {
-    daemon.orchestration.runs.sorted {
-      if ($0.status == "active") != ($1.status == "active") { return $0.status == "active" }
-      return $0.updatedAt > $1.updatedAt
+  private func newestFirst(_ runs: [OrchestrationStatus.Run]) -> [OrchestrationStatus.Run] {
+    runs.sorted { left, right in
+      left.updatedAt == right.updatedAt ? left.id < right.id : left.updatedAt > right.updatedAt
     }
+  }
+
+  private var activeRuns: [OrchestrationStatus.Run] {
+    newestFirst(daemon.orchestration.runs.filter { $0.status == "active" })
+  }
+
+  private var endedRuns: [OrchestrationStatus.Run] {
+    newestFirst(daemon.orchestration.runs.filter { $0.status != "active" })
   }
 
   var body: some View {
     Group {
-      if runs.isEmpty {
+      if activeRuns.isEmpty && endedRuns.isEmpty {
         ContentUnavailableView(
           "还没有编排",
           systemImage: "point.3.connected.trianglepath.dotted",
@@ -984,10 +993,20 @@ private struct GoalsDashboard: View {
       } else {
         ScrollView {
           LazyVStack(spacing: 14) {
-            ForEach(runs) { run in
-              GoalRunRow(
-                run: run,
-                daemon: daemon
+            if !activeRuns.isEmpty {
+              GoalRunSection(
+                title: "进行中的编排",
+                runs: activeRuns,
+                daemon: daemon,
+                expanded: $activeRunsExpanded
+              )
+            }
+            if !endedRuns.isEmpty {
+              GoalRunSection(
+                title: "已结束的编排",
+                runs: endedRuns,
+                daemon: daemon,
+                expanded: $endedRunsExpanded
               )
             }
           }
@@ -1013,6 +1032,44 @@ private struct GoalsDashboard: View {
     }
     .sheet(isPresented: $showingGraphComposer) {
       VisualGraphComposer(daemon: daemon)
+    }
+  }
+}
+
+private struct GoalRunSection: View {
+  let title: String
+  let runs: [OrchestrationStatus.Run]
+  @Bindable var daemon: DaemonController
+  @Binding var expanded: Bool
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 10) {
+      Button {
+        expanded.toggle()
+      } label: {
+        HStack(spacing: 8) {
+          Image(systemName: expanded ? "chevron.down" : "chevron.right")
+            .font(.caption.weight(.bold))
+            .foregroundStyle(.secondary)
+          Text(title).font(.headline)
+          Text("\(runs.count)")
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2)
+            .background(.quaternary, in: Capsule())
+          Spacer()
+        }
+        .contentShape(Rectangle())
+      }
+      .buttonStyle(.plain)
+      .accessibilityLabel("\(expanded ? "折叠" : "展开")\(title)")
+
+      if expanded {
+        ForEach(runs) { run in
+          GoalRunRow(run: run, daemon: daemon)
+        }
+      }
     }
   }
 }
@@ -1588,6 +1645,8 @@ private struct GoalRunRow: View {
   @State private var showingGraphEditor = false
   @State private var showingAutomationComposer = false
   @State private var showingDeleteConfirmation = false
+  @State private var showingCompleteConfirmation = false
+  @State private var showingAbandonConfirmation = false
   @State private var dispatchingTask: OrchestrationStatus.Task?
   @State private var actionError: String?
 
@@ -1600,6 +1659,9 @@ private struct GoalRunRow: View {
   private var gates: [OrchestrationStatus.Gate] {
     daemon.orchestration.gates.filter { $0.runId == run.id && $0.status == "pending" }
   }
+  private var worktreeAssets: [OrchestrationStatus.WorktreeAsset] {
+    daemon.orchestration.worktreeAssets.filter { $0.runId == run.id }
+  }
   private var manual: Bool { run.coordinatorSessionId == nil }
   private var automationRunning: Bool { run.automation?.state == "running" }
 
@@ -1607,10 +1669,28 @@ private struct GoalRunRow: View {
   private var activeWorkers: Int {
     dispatches.filter { $0.state == "starting" || $0.state == "running" }.count
   }
+  private var completionBlockers: [String] {
+    let unfinished = tasks.filter { $0.status != "done" && $0.status != "cancelled" }.count
+    return [
+      activeWorkers > 0 ? "还有 \(activeWorkers) 个 worker 正在运行" : nil,
+      unfinished > 0 ? "还有 \(unfinished) 个任务尚未结束" : nil,
+      !gates.isEmpty ? "还有 \(gates.count) 个 Gate 待处理" : nil,
+      automationRunning ? "自动执行仍在运行" : nil,
+    ].compactMap { $0 }
+  }
   private var deleteMessage: String {
     var message = "“\(run.objective)”及其任务、消息和 Gate 会从编排列表中删除。"
-    if let automation = run.automation, automation.workspace == "run" {
-      message += "\n\n为避免丢失未合并代码，工作树会保留在：\n\(automation.workspacePath)"
+    let preservedAssets = worktreeAssets.filter { $0.state != "cleaned" }
+    if !preservedAssets.isEmpty {
+      let workerCount = preservedAssets.filter { $0.kind == "worker" }.count
+      let locations = preservedAssets.map { asset in
+        let task = asset.taskId.flatMap { id in tasks.first { $0.id == id } }
+        let owner = asset.kind == "run"
+          ? "共享 Run 工作树"
+          : "worker：\(task?.title ?? asset.taskId ?? "已删除任务")"
+        return "\(owner)\n\(asset.path)"
+      }.joined(separator: "\n\n")
+      message += "\n\n删除编排不会清理全部 \(preservedAssets.count) 个关联工作树（其中 \(workerCount) 个 worker 工作树）。它们会保留在主机上：\n\(locations)"
     }
     return message
   }
@@ -1651,6 +1731,37 @@ private struct GoalRunRow: View {
               .buttonStyle(.borderless)
               .foregroundStyle(.red)
               .help("删除编排")
+            }
+            if run.status == "active" {
+              HStack(spacing: 6) {
+                Button {
+                  if completionBlockers.isEmpty {
+                    showingCompleteConfirmation = true
+                  } else {
+                    actionError = "暂时不能完成：\(completionBlockers.joined(separator: "；"))。"
+                  }
+                } label: {
+                  Label("完成", systemImage: "checkmark.circle.fill")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .tint(.green)
+                .help("标记这个 Run 已完成")
+
+                Button {
+                  if activeWorkers > 0 {
+                    actionError = "还有 \(activeWorkers) 个 worker 正在运行。请先停止它们，避免留下游离工作。"
+                  } else {
+                    showingAbandonConfirmation = true
+                  }
+                } label: {
+                  Label("放弃", systemImage: "xmark.circle.fill")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .tint(.red)
+                .help("放弃这个 Run")
+              }
             }
             if manual {
               VStack(alignment: .trailing, spacing: 6) {
@@ -1718,6 +1829,14 @@ private struct GoalRunRow: View {
           }
           .padding(.leading, 1)
         }
+
+        Divider()
+        WorktreeAssetSection(
+          assets: worktreeAssets,
+          tasks: tasks,
+          daemon: daemon,
+          reportError: { actionError = $0 }
+        )
 
         if !tasks.isEmpty {
           Divider()
@@ -1862,6 +1981,38 @@ private struct GoalRunRow: View {
     } message: {
       Text(deleteMessage)
     }
+    .confirmationDialog(
+      "标记这个 Run 已完成？",
+      isPresented: $showingCompleteConfirmation,
+      titleVisibility: .visible
+    ) {
+      Button("完成") {
+        Task {
+          if let error = await daemon.completeOrchestrationRun(runId: run.id) {
+            actionError = error
+          }
+        }
+      }
+      Button("取消", role: .cancel) {}
+    } message: {
+      Text("“\(run.objective)”会进入已结束的只读编排；关联工作树默认保留，便于检查和恢复。")
+    }
+    .confirmationDialog(
+      "放弃这个 Run？",
+      isPresented: $showingAbandonConfirmation,
+      titleVisibility: .visible
+    ) {
+      Button("放弃 Run", role: .destructive) {
+        Task {
+          if let error = await daemon.abandonOrchestrationRun(runId: run.id) {
+            actionError = error
+          }
+        }
+      }
+      Button("返回", role: .cancel) {}
+    } message: {
+      Text("“\(run.objective)”会进入已结束的只读编排；尚未执行的任务和待处理 Gate 会一并取消，关联工作树仍会保留。")
+    }
     .alert("编排操作失败", isPresented: Binding(
       get: { actionError != nil },
       set: { if !$0 { actionError = nil } }
@@ -1912,6 +2063,196 @@ private struct GoalRunRow: View {
         actionError = error.isEmpty ? "daemon 拒绝重试任务" : error
       }
     }
+  }
+}
+
+private struct WorktreeAssetSection: View {
+  let assets: [OrchestrationStatus.WorktreeAsset]
+  let tasks: [OrchestrationStatus.Task]
+  @Bindable var daemon: DaemonController
+  let reportError: (String) -> Void
+  @State private var summaryTarget: OrchestrationStatus.WorktreeAsset?
+  @State private var cleanupTarget: OrchestrationStatus.WorktreeAsset?
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      HStack {
+        VStack(alignment: .leading, spacing: 2) {
+          Label("工作树", systemImage: "point.3.connected.trianglepath.dotted")
+            .font(.caption.weight(.semibold))
+          Text("状态由主机 Git 只读检查决定；清理前会再次核验。")
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+        }
+        Spacer()
+        Text("\(assets.count)")
+          .font(.caption.monospacedDigit())
+          .foregroundStyle(.secondary)
+          .padding(.horizontal, 7)
+          .padding(.vertical, 2)
+          .background(.quaternary, in: Capsule())
+      }
+
+      ForEach(assets) { asset in
+        VStack(alignment: .leading, spacing: 5) {
+          HStack(spacing: 8) {
+            Text(owner(for: asset)).font(.caption.weight(.semibold)).lineLimit(1)
+            Spacer()
+            Text(stateLabel(for: asset))
+              .font(.caption2.weight(.semibold))
+              .foregroundStyle(stateColor(for: asset))
+              .padding(.horizontal, 6)
+              .padding(.vertical, 2)
+              .background(stateColor(for: asset).opacity(0.12), in: Capsule())
+          }
+          Text("分支 · \(asset.branch ?? "detached")")
+            .font(.caption2.monospaced())
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+          Text(asset.path)
+            .font(.caption2.monospaced())
+            .foregroundStyle(.tertiary)
+            .lineLimit(1)
+            .textSelection(.enabled)
+          Text(stateDetail(for: asset))
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+
+          HStack(spacing: 7) {
+            Button("打开路径") {
+              NSWorkspace.shared.open(URL(fileURLWithPath: asset.path))
+            }
+            .buttonStyle(.borderless)
+            .disabled(!pathCanOpen(asset))
+
+            Button("查看摘要") { summaryTarget = asset }
+              .buttonStyle(.borderless)
+
+            Button("检查") {
+              Task {
+                if let error = await daemon.inspectOrchestrationWorktree(assetId: asset.id) {
+                  reportError(error.isEmpty ? "daemon 拒绝检查工作树" : error)
+                }
+              }
+            }
+            .buttonStyle(.borderless)
+
+            if canClean(asset) {
+              Button("清理", role: .destructive) { cleanupTarget = asset }
+                .buttonStyle(.borderless)
+            }
+          }
+          .font(.caption)
+        }
+        .padding(9)
+        .background(.quaternary.opacity(0.42), in: RoundedRectangle(cornerRadius: 8))
+      }
+      if assets.isEmpty {
+        Text("这个 Run 尚未登记独立工作树。")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+      }
+    }
+    .alert("工作树摘要", isPresented: Binding(
+      get: { summaryTarget != nil },
+      set: { if !$0 { summaryTarget = nil } }
+    )) {
+      Button("关闭") { summaryTarget = nil }
+    } message: {
+      Text(summaryTarget.map { summary(for: $0) } ?? "尚未检查")
+    }
+    .confirmationDialog(
+      "清理这个工作树？",
+      isPresented: Binding(
+        get: { cleanupTarget != nil },
+        set: { if !$0 { cleanupTarget = nil } }
+      ),
+      titleVisibility: .visible
+    ) {
+      Button("清理工作树", role: .destructive) {
+        guard let target = cleanupTarget else { return }
+        cleanupTarget = nil
+        Task {
+          if let error = await daemon.cleanupOrchestrationWorktree(assetId: target.id) {
+            reportError(error.isEmpty ? "daemon 拒绝清理工作树" : error)
+          }
+        }
+      }
+      Button("取消", role: .cancel) { cleanupTarget = nil }
+    } message: {
+      Text(cleanupTarget.map {
+        "将移除：\n\($0.path)\n\n服务端会在执行前重新确认安全状态。分支默认保留，方便恢复。"
+      } ?? "")
+    }
+  }
+
+  private func owner(for asset: OrchestrationStatus.WorktreeAsset) -> String {
+    if asset.kind == "run" { return "共享 Run 工作树" }
+    guard let taskId = asset.taskId else { return "worker · 已删除任务" }
+    return tasks.first { $0.id == taskId }?.title ?? "worker · \(taskId)"
+  }
+
+  private func state(for asset: OrchestrationStatus.WorktreeAsset) -> String {
+    asset.lastInspection?.state ?? asset.state
+  }
+
+  private func stateLabel(for asset: OrchestrationStatus.WorktreeAsset) -> String {
+    switch state(for: asset) {
+    case "dirty": "有未提交改动"
+    case "unmerged": "未合并"
+    case "equivalent": "已合并"
+    case "safe_to_clean": "可清理"
+    case "cleaned": "已清理"
+    case "missing": "路径已丢失"
+    case "unknown": "无法确认"
+    default: "待检查"
+    }
+  }
+
+  private func stateDetail(for asset: OrchestrationStatus.WorktreeAsset) -> String {
+    if let message = asset.lastInspection?.message, !message.isEmpty { return message }
+    return switch state(for: asset) {
+    case "dirty": "请先提交、暂存或保留改动"
+    case "unmerged": "分支仍有未合并提交"
+    case "equivalent": "与目标 ref 等价，可安全清理"
+    case "safe_to_clean": "服务端已确认没有待保留改动"
+    case "cleaned": "目录已移除；分支默认保留"
+    default: "尚未获得安全结论"
+    }
+  }
+
+  private func stateColor(for asset: OrchestrationStatus.WorktreeAsset) -> Color {
+    switch state(for: asset) {
+    case "equivalent", "safe_to_clean": .green
+    case "dirty", "unmerged": .orange
+    case "missing", "unknown": .red
+    default: .secondary
+    }
+  }
+
+  private func pathCanOpen(_ asset: OrchestrationStatus.WorktreeAsset) -> Bool {
+    asset.state != "cleaned" && asset.lastInspection?.pathExists != false
+  }
+
+  private func canClean(_ asset: OrchestrationStatus.WorktreeAsset) -> Bool {
+    let inspectionState = asset.lastInspection?.state
+    return inspectionState == "safe_to_clean" || inspectionState == "equivalent"
+  }
+
+  private func summary(for asset: OrchestrationStatus.WorktreeAsset) -> String {
+    guard let inspection = asset.lastInspection else {
+      return "尚未检查。点“检查”可让主机只读核验工作树状态。"
+    }
+    var lines = [
+      "状态：\(stateLabel(for: asset))",
+      "目标：\(inspection.targetRef)",
+      "分支：\(inspection.branch ?? asset.branch ?? "detached")",
+    ]
+    if let count = inspection.aheadCommitCount { lines.append("待合并提交：\(count)") }
+    if let count = inspection.equivalentCommitCount { lines.append("等价提交：\(count)") }
+    if let message = inspection.message, !message.isEmpty { lines.append("说明：\(message)") }
+    return lines.joined(separator: "\n")
   }
 }
 

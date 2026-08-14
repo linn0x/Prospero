@@ -22,6 +22,7 @@ import {
   CAPABILITY_ORCHESTRATION_MANUAL,
   CAPABILITY_ORCHESTRATION_RUN_LIFECYCLE,
   CAPABILITY_ORCHESTRATION_SNAPSHOT,
+  CAPABILITY_ORCHESTRATION_WORKTREES,
   CAPABILITY_SESSION_CREATE_MODEL,
   CAPABILITY_SUBAGENT_HISTORY,
   CLOSE_AUTH_FAILED,
@@ -184,6 +185,11 @@ export class HostConnection {
 
   get supportsOrchestrationRunLifecycle(): boolean {
     return this.supportsCapability(CAPABILITY_ORCHESTRATION_RUN_LIFECYCLE);
+  }
+
+  /** 已登记工作树的只读检查与服务端复核后的显式清理。 */
+  get supportsOrchestrationWorktrees(): boolean {
+    return this.supportsCapability(CAPABILITY_ORCHESTRATION_WORKTREES);
   }
 
   get supportsSubagentHistory(): boolean {
@@ -1256,6 +1262,33 @@ export class HostConnection {
       type: "orchestration.automation.pause",
       operationId: randomUUID(),
       runId,
+    }, true).accepted;
+  }
+
+  /** 重新执行只读 Git 检查；结果会随下一份编排快照返回。 */
+  inspectOrchestrationWorktree(assetId: string, targetRef?: string): boolean {
+    if (!this.supportsOrchestrationWorktrees) return false;
+    return this.send({
+      type: "orchestration.worktree.inspect",
+      assetId,
+      ...(targetRef ? { targetRef } : {}),
+    }, true).accepted;
+  }
+
+  /**
+   * 服务端会在删除前再检查一遍；这里不暴露 force，且始终保留分支作为恢复锚点。
+   */
+  cleanupOrchestrationWorktree(input: {
+    assetId: string;
+    targetRef?: string;
+  }): boolean {
+    if (!this.supportsOrchestrationWorktrees) return false;
+    return this.send({
+      type: "orchestration.worktree.cleanup",
+      operationId: randomUUID(),
+      assetId: input.assetId,
+      ...(input.targetRef ? { targetRef: input.targetRef } : {}),
+      confirm: true,
     }, true).accepted;
   }
 
