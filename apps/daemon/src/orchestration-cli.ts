@@ -136,6 +136,41 @@ worker
     actorSessionId: optionalSession(),
   })));
 
+const worktree = program
+  .command("worktree")
+  .description("已登记编排工作树的只读检查与显式安全清理");
+worktree
+  .command("list")
+  .option("--run <id>", "只列出指定 Run（worker 会话必须带此项）")
+  .action(action("worktree.list", (opts) => ({
+    ...(typeof opts["run"] === "string" ? { runId: opts["run"] } : {}),
+    actorSessionId: optionalSession(),
+  })));
+worktree
+  .command("inspect")
+  .requiredOption("--id <assetId>", "工作树资产 ID")
+  .option("--target <ref>", "比较的目标分支或 ref", "HEAD")
+  .action(action("worktree.inspect", (opts) => ({
+    assetId: requireText(opts["id"], "--id"),
+    targetRef: requireText(opts["target"], "--target"),
+    actorSessionId: optionalSession(),
+  })));
+worktree
+  .command("cleanup")
+  .requiredOption("--id <assetId>", "工作树资产 ID")
+  .option("--target <ref>", "比较的目标分支或 ref", "HEAD")
+  .option("--delete-branch", "在移除工作树后也删除分支；默认保留分支供恢复", false)
+  .option("--confirm", "明确执行删除；省略时 API 会拒绝", false)
+  .requiredOption("--operation-id <id>", "幂等删除操作 ID")
+  .action(action("worktree.cleanup", (opts) => ({
+    assetId: requireText(opts["id"], "--id"),
+    targetRef: requireText(opts["target"], "--target"),
+    confirm: opts["confirm"] === true,
+    deleteBranch: opts["deleteBranch"] === true,
+    operationId: requireText(opts["operationId"], "--operation-id"),
+    actorSessionId: optionalSession(),
+  })));
+
 program
   .command("send")
   .description("投递 note/report 等普通邮箱消息")

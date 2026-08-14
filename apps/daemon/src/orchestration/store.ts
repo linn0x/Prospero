@@ -21,6 +21,10 @@ import {
   type RunAutomation,
   type Task,
   type TaskStatus,
+  type WorktreeAsset,
+  type WorktreeAssetCleanup,
+  type WorktreeAssetKind,
+  type WorktreeInspection,
   TransitionError,
   canTransition,
   emptyState,
@@ -56,6 +60,7 @@ export type OrchestrationErrorCode =
   | "run_not_completable"
   | "run_not_abandonable"
   | "run_not_active"
+  | "worktree_asset_not_found"
   | "operation_conflict";
 
 export interface GraphNodeInput {
@@ -76,8 +81,10 @@ export interface GraphMutationResult {
 export interface RunDeletionResult {
   runId: string;
   deletedTaskCount: number;
-  /** 删除编排记录不强删可能含未合并代码的 Run worktree。 */
+  /** 兼容旧客户端；实际资产仍可通过 worktree.list 找到。 */
   preservedWorkspacePath: string | null;
+  /** Run 删除后仍保留、且已脱离画布记录的工作树资产。 */
+  preservedWorktreeAssetIds: string[];
 }
 
 function id(prefix: string): string {
@@ -100,28 +107,126 @@ export class OrchestrationStore {
   private load(): void {
     if (!this.file) return;
     try {
-      const parsed = JSON.parse(readFileSync(this.file, "utf8")) as Partial<OrchestrationState>;
-      if (parsed.version === 1) {
+      const parsed = JSON.parse(readFileSync(this.file, "utf8")) as Omit<Partial<OrchestrationState>, "version"> & {
+        version?: number;
+      };
+      if (parsed.version === 1 || parsed.version === 2) {
         const runs = parsed.runs ?? {};
         for (const run of Object.values(runs)) {
           run.graphRevision = Number.isInteger(run.graphRevision) ? run.graphRevision : 0;
           run.automation ??= null;
           run.coordinatorPrompt ??= null;
         }
+        const dispatches = parsed.dispatches ?? {};
+        const worktreeAssets = parsed.worktreeAssets ?? {};
+        let migrated = parsed.version === 1;
+
+        // v1 把 worktree 只挂在 Run automation 或 Dispatch 上；一旦删除 Run，
+        // 那些路径就没有任何可发现索引。升级时只保守登记，绝不尝试检查或删除。
+        if (parsed.version === 1) {
+          for (const run of Object.values(runs)) {
+            const automation = run.automation;
+            if (automation?.workspace !== "run") continue;
+            const asset = this.legacyWorktreeAsset({
+              kind: "run",
+              runId: run.id,
+              repo: automation.cwd,
+              path: automation.workspacePath,
+              branch: automation.branch,
+              createdAt: automation.startedAt,
+            });
+            worktreeAssets[asset.id] = asset;
+          }
+          for (const dispatch of Object.values(dispatches)) {
+            if (!dispatch.worktreePath) continue;
+            const asset = this.legacyWorktreeAsset({
+              kind: "worker",
+              runId: dispatch.runId,
+              taskId: dispatch.taskId,
+              dispatchId: dispatch.id,
+              // v1 没有 repo/branch；path 是唯一安全的候选，后续 inspect 会复核。
+              repo: dispatch.worktreePath,
+              path: dispatch.worktreePath,
+              branch: null,
+              createdAt: dispatch.startedAt,
+            });
+            worktreeAssets[asset.id] = asset;
+          }
+        }
+        for (const asset of Object.values(worktreeAssets)) {
+          if (this.normalizeWorktreeAsset(asset)) migrated = true;
+        }
         this.state = {
-          version: 1,
+          version: 2,
           runs,
           tasks: parsed.tasks ?? {},
-          dispatches: parsed.dispatches ?? {},
+          dispatches,
           messages: parsed.messages ?? {},
           gates: parsed.gates ?? {},
           operations: parsed.operations ?? {},
+          worktreeAssets,
         };
+        // 迁移只补登记，不会触碰用户磁盘上的任何工作树。立即原子落盘，避免下一次
+        // Run 删除发生在迁移结果尚未写入之前。
+        if (migrated) this.persistNow();
       }
     } catch {
       // 文件不在或者坏了都当空的开始。编排状态坏掉不该让 daemon 起不来 ——
       // 手机上还有一堆正常会话等着连。
     }
+  }
+
+  private legacyWorktreeAsset(input: {
+    kind: WorktreeAssetKind;
+    runId: string;
+    taskId?: string | null;
+    dispatchId?: string | null;
+    repo: string;
+    path: string;
+    branch: string | null;
+    createdAt: number;
+  }): WorktreeAsset {
+    const now = Date.now();
+    return {
+      id: id("wt"),
+      kind: input.kind,
+      runId: input.runId,
+      taskId: input.taskId ?? null,
+      dispatchId: input.dispatchId ?? null,
+      repo: input.repo,
+      path: input.path,
+      branch: input.branch,
+      state: "preserved",
+      createdAt: input.createdAt,
+      updatedAt: now,
+      runDeletedAt: null,
+      lastInspection: null,
+      cleanup: null,
+      legacy: true,
+      lastError: "由 orchestration.json v1 迁移；请先只读检查后再决定是否清理",
+    };
+  }
+
+  /** 在原对象上补齐 v2 可选字段；返回是否实际做了迁移。 */
+  private normalizeWorktreeAsset(asset: WorktreeAsset): boolean {
+    let changed = false;
+    const fill = <K extends keyof WorktreeAsset>(key: K, value: WorktreeAsset[K]): void => {
+      if (asset[key] !== undefined) return;
+      asset[key] = value;
+      changed = true;
+    };
+    fill("taskId", null);
+    fill("dispatchId", null);
+    fill("branch", null);
+    fill("state", "preserved");
+    fill("createdAt", Date.now());
+    fill("updatedAt", asset.createdAt);
+    fill("runDeletedAt", null);
+    fill("lastInspection", null);
+    fill("cleanup", null);
+    fill("legacy", false);
+    fill("lastError", null);
+    return changed;
   }
 
   private schedulePersist(): void {
@@ -309,6 +414,7 @@ export class OrchestrationStore {
     }
     run.status = "completed";
     run.updatedAt = now;
+    this.preserveWorktreeAssetsForRun(runId, "Run 已完成；工作树默认保留，需显式清理");
     this.schedulePersist();
     return run;
   }
@@ -373,6 +479,7 @@ export class OrchestrationStore {
     }
     run.status = "abandoned";
     run.updatedAt = now;
+    this.preserveWorktreeAssetsForRun(runId, "Run 已放弃；工作树默认保留，需显式清理");
     this.schedulePersist();
     return run;
   }
@@ -446,6 +553,7 @@ export class OrchestrationStore {
     }
 
     const taskIds = new Set(this.listTasks(runId).map((task) => task.id));
+    const preservedWorktreeAssetIds = this.detachWorktreeAssetsForDeletedRun(runId);
     for (const taskId of taskIds) delete this.state.tasks[taskId];
     for (const dispatch of Object.values(this.state.dispatches)) {
       if (dispatch.runId === runId) delete this.state.dispatches[dispatch.id];
@@ -464,7 +572,142 @@ export class OrchestrationStore {
       preservedWorkspacePath: run.automation?.workspace === "run"
         ? run.automation.workspacePath
         : null,
+      preservedWorktreeAssetIds,
     };
+  }
+
+  // ── Worktree assets ──────────────────────────────────────────────────
+
+  /**
+   * 在工作树已经成功创建、但尚未创建 worker 会话时立即登记。
+   *
+   * 这是一个外部资源的所有权边界，所以有 home 时同步落盘；否则 daemon 在紧接着
+   * 的 session.create 前崩溃，磁盘目录会再次失去索引。
+   */
+  registerWorktreeAsset(input: {
+    kind: WorktreeAssetKind;
+    runId: string;
+    taskId?: string | null;
+    dispatchId?: string | null;
+    repo: string;
+    path: string;
+    branch: string | null;
+  }): WorktreeAsset {
+    const now = Date.now();
+    const asset: WorktreeAsset = {
+      id: id("wt"),
+      kind: input.kind,
+      runId: input.runId,
+      taskId: input.taskId ?? null,
+      dispatchId: input.dispatchId ?? null,
+      repo: input.repo,
+      path: input.path,
+      branch: input.branch,
+      state: "active",
+      createdAt: now,
+      updatedAt: now,
+      runDeletedAt: null,
+      lastInspection: null,
+      cleanup: null,
+      legacy: false,
+      lastError: null,
+    };
+    this.state.worktreeAssets[asset.id] = asset;
+    this.schedulePersist();
+    this.persistNow();
+    return asset;
+  }
+
+  getWorktreeAsset(assetId: string): WorktreeAsset {
+    const asset = this.state.worktreeAssets[assetId];
+    if (!asset) {
+      throw new OrchestrationError(`找不到工作树资产 ${assetId}`, "worktree_asset_not_found");
+    }
+    return asset;
+  }
+
+  listWorktreeAssets(runId?: string): WorktreeAsset[] {
+    return Object.values(this.state.worktreeAssets)
+      .filter((asset) => (runId ? asset.runId === runId : true))
+      .sort((a, b) => b.createdAt - a.createdAt);
+  }
+
+  linkWorktreeAssetDispatch(assetId: string, dispatchId: string): WorktreeAsset {
+    const asset = this.getWorktreeAsset(assetId);
+    const dispatch = this.getDispatch(dispatchId);
+    if (asset.kind !== "worker" || asset.runId !== dispatch.runId || asset.taskId !== dispatch.taskId) {
+      throw new OrchestrationError("工作树资产与派发归属不匹配", "invalid_transition");
+    }
+    asset.dispatchId = dispatchId;
+    asset.updatedAt = Date.now();
+    this.schedulePersist();
+    this.persistNow();
+    return asset;
+  }
+
+  recordWorktreeInspection(assetId: string, inspection: WorktreeInspection): WorktreeAsset {
+    const asset = this.getWorktreeAsset(assetId);
+    // 已显式清理的路径以后仍不存在是预期，不覆盖成“用户丢失了路径”。
+    if (asset.cleanup !== null && inspection.state === "missing") {
+      asset.state = "cleaned";
+    } else {
+      asset.state = inspection.state;
+    }
+    asset.lastInspection = inspection;
+    asset.updatedAt = inspection.checkedAt;
+    asset.lastError = inspection.state === "unknown" ? inspection.message : null;
+    this.schedulePersist();
+    return asset;
+  }
+
+  preserveWorktreeAsset(assetId: string, reason: string | null = null): WorktreeAsset {
+    const asset = this.getWorktreeAsset(assetId);
+    if (asset.cleanup !== null || asset.state === "missing") return asset;
+    asset.state = "preserved";
+    asset.updatedAt = Date.now();
+    asset.lastError = reason;
+    this.schedulePersist();
+    return asset;
+  }
+
+  preserveWorktreeAssetsForDispatch(dispatchId: string, reason: string | null = null): void {
+    for (const asset of Object.values(this.state.worktreeAssets)) {
+      if (asset.dispatchId === dispatchId) this.preserveWorktreeAsset(asset.id, reason);
+    }
+  }
+
+  preserveWorktreeAssetsForRun(runId: string, reason: string | null = null): void {
+    for (const asset of Object.values(this.state.worktreeAssets)) {
+      if (asset.runId === runId) this.preserveWorktreeAsset(asset.id, reason);
+    }
+  }
+
+  private detachWorktreeAssetsForDeletedRun(runId: string): string[] {
+    const now = Date.now();
+    const ids: string[] = [];
+    for (const asset of Object.values(this.state.worktreeAssets)) {
+      if (asset.runId !== runId) continue;
+      asset.runDeletedAt ??= now;
+      if (asset.cleanup === null && asset.state !== "missing") asset.state = "preserved";
+      asset.updatedAt = now;
+      asset.lastError = "所属 Run 已删除；资产与恢复分支仍保留，需显式检查或清理";
+      ids.push(asset.id);
+    }
+    return ids;
+  }
+
+  markWorktreeAssetCleaned(
+    assetId: string,
+    cleanup: WorktreeAssetCleanup,
+  ): WorktreeAsset {
+    const asset = this.getWorktreeAsset(assetId);
+    asset.state = "cleaned";
+    asset.cleanup = cleanup;
+    asset.updatedAt = cleanup.removedAt;
+    asset.lastError = cleanup.warning;
+    this.schedulePersist();
+    this.persistNow();
+    return asset;
   }
 
   // ── Task ──────────────────────────────────────────────────────────────

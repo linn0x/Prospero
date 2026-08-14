@@ -3,13 +3,13 @@ import type { AgentKind, SessionInfo, SessionKind } from "@prospero/protocol";
 import type { CreateSessionInput } from "../session-manager.js";
 import {
   createEsaytree,
-  removeWorktree,
   repoRoot,
   type CloneReport,
   type EsaytreeCreateMode,
 } from "./esaytree.js";
 import { OrchestrationStore } from "./store.js";
 import type { Dispatch, Task } from "./model.js";
+import { WorktreeAssetService } from "./worktree-assets.js";
 
 export type WorktreeMode = "new" | "none";
 
@@ -43,6 +43,7 @@ export interface StartWorkerResult {
 }
 
 export interface WorkerWorktree {
+  assetId: string;
   path: string;
   clones: CloneReport[];
   mode: EsaytreeCreateMode;
@@ -76,6 +77,7 @@ export class DispatchService {
   constructor(
     private readonly store: OrchestrationStore,
     private readonly sessions: WorkerSessionManager,
+    private readonly worktreeAssets = new WorktreeAssetService(store),
   ) {}
 
   /**
@@ -102,6 +104,10 @@ export class DispatchService {
     } else if (currentTask.status === "failed" && currentDispatch.state === "abandoned") {
       currentTask = this.store.setTaskStatus(taskId, "failed", reason);
     }
+    this.store.preserveWorktreeAssetsForDispatch(
+      currentDispatch.id,
+      "worker 已停止；工作树默认保留，需显式检查或清理",
+    );
     return { task: currentTask, dispatch: currentDispatch };
   }
 
@@ -113,7 +119,9 @@ export class DispatchService {
         (candidate.state === "starting" || candidate.state === "running"),
     );
     if (!active) return null;
-    return this.store.abandonActiveDispatchForMissingSession(active.id, reason);
+    const settled = this.store.abandonActiveDispatchForMissingSession(active.id, reason);
+    if (settled) this.store.preserveWorktreeAssetsForDispatch(active.id, reason);
+    return settled;
   }
 
   /**
@@ -139,6 +147,7 @@ export class DispatchService {
           "worker 会话在 daemon 恢复后不存在",
         );
         if (result) settled.push(result);
+        if (result) this.store.preserveWorktreeAssetsForDispatch(dispatch.id, result.dispatch.outcome);
         continue;
       }
       if (session.status === "completed" || session.status === "done" || session.status === "died") {
@@ -147,6 +156,7 @@ export class DispatchService {
           "worker 会话在 daemon 恢复时已结束但未显式交付",
         );
         if (result) settled.push(result);
+        if (result) this.store.preserveWorktreeAssetsForDispatch(dispatch.id, result.dispatch.outcome);
         continue;
       }
 
@@ -191,8 +201,18 @@ export class DispatchService {
           branch: `prospero/${task.runId}/${task.id}/${stamp}`,
         });
         workerCwd = created.path;
+        // 目录一旦创建就立即持久登记，发生在 session.create 之前。创建后任一步
+        // 失败也保留它和分支，必须由用户走显式 cleanup 才能删除。
+        const asset = this.worktreeAssets.registerWorker({
+          runId: task.runId,
+          taskId: task.id,
+          repo,
+          path: created.path,
+          branch: created.branch,
+        });
         worktree = {
           repo,
+          assetId: asset.id,
           path: created.path,
           clones: created.clones,
           mode: created.mode,
@@ -224,6 +244,7 @@ export class DispatchService {
         sessionId: session.id,
         worktreePath: worktree?.path ?? null,
       });
+      if (worktree) this.store.linkWorktreeAssetDispatch(worktree.assetId, dispatch.id);
 
       const prompt = workerPrompt(task, session.id, workerCwd, run.coordinatorSessionId);
       if (session.kind === "structured") {
@@ -239,6 +260,7 @@ export class DispatchService {
         session,
         worktree: worktree
           ? {
+              assetId: worktree.assetId,
               path: worktree.path,
               clones: worktree.clones,
               mode: worktree.mode,
@@ -255,7 +277,12 @@ export class DispatchService {
         this.store.setTaskStatus(task.id, "failed", message);
       }
       if (session) await this.sessions.kill(session.id).catch(() => {});
-      if (worktree) await removeWorktree(worktree.repo, worktree.path).catch(() => {});
+      if (worktree) {
+        this.store.preserveWorktreeAsset(
+          worktree.assetId,
+          `worker 派发未完成；已保留工作树和分支：${message}`,
+        );
+      }
       throw error;
     }
   }
@@ -268,6 +295,10 @@ export class DispatchService {
     this.assertWorker(dispatch, actorSessionId, taskId);
     const completed = this.store.setTaskStatus(taskId, "done", body);
     this.store.setDispatchState(dispatch.id, "succeeded", body);
+    this.store.preserveWorktreeAssetsForDispatch(
+      dispatch.id,
+      "worker 已交付；工作树默认保留，需显式检查或清理",
+    );
     return completed;
   }
 
@@ -279,6 +310,10 @@ export class DispatchService {
     this.assertWorker(dispatch, actorSessionId, taskId);
     const failed = this.store.setTaskStatus(taskId, "failed", body);
     this.store.setDispatchState(dispatch.id, "failed", body);
+    this.store.preserveWorktreeAssetsForDispatch(
+      dispatch.id,
+      "worker 报告失败；工作树默认保留，需显式检查或清理",
+    );
     return failed;
   }
 

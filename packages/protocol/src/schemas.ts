@@ -779,6 +779,53 @@ export const OrchestrationDispatchSchema = z.object({
   outcome: z.string().max(20_000).nullable(),
 });
 
+/** 独立于 Run/Dispatch 历史的持久工作树资产；Run 删除后仍会出现在快照中。 */
+export const OrchestrationWorktreeInspectionSchema = z.object({
+  state: z.enum(["missing", "dirty", "unmerged", "equivalent", "safe_to_clean", "unknown"]),
+  targetRef: z.string().min(1).max(2_000),
+  checkedAt: z.number().int().nonnegative(),
+  pathExists: z.boolean(),
+  registered: z.boolean().nullable(),
+  dirty: z.boolean().nullable(),
+  branch: z.string().min(1).max(2_000).nullable(),
+  aheadCommitCount: z.number().int().nonnegative().nullable(),
+  equivalentCommitCount: z.number().int().nonnegative().nullable(),
+  message: z.string().max(20_000).nullable(),
+});
+
+export const OrchestrationWorktreeAssetSchema = z.object({
+  id: z.string().min(1).max(200),
+  kind: z.enum(["run", "worker"]),
+  runId: z.string().min(1).max(200),
+  taskId: z.string().min(1).max(200).nullable(),
+  dispatchId: z.string().min(1).max(200).nullable(),
+  repo: z.string().min(1).max(20_000),
+  path: z.string().min(1).max(20_000),
+  branch: z.string().min(1).max(2_000).nullable(),
+  state: z.enum([
+    "active",
+    "preserved",
+    "missing",
+    "dirty",
+    "unmerged",
+    "equivalent",
+    "safe_to_clean",
+    "cleaned",
+    "unknown",
+  ]),
+  createdAt: z.number().int().nonnegative(),
+  updatedAt: z.number().int().nonnegative(),
+  runDeletedAt: z.number().int().nonnegative().nullable(),
+  lastInspection: OrchestrationWorktreeInspectionSchema.nullable(),
+  cleanup: z.object({
+    removedAt: z.number().int().nonnegative(),
+    branchDeleted: z.boolean(),
+    warning: z.string().max(20_000).nullable(),
+  }).nullable(),
+  legacy: z.boolean(),
+  lastError: z.string().max(20_000).nullable(),
+});
+
 export const OrchestrationGateSchema = z.object({
   id: z.string().min(1).max(200),
   runId: z.string().min(1).max(200),
@@ -796,6 +843,8 @@ export const OrchestrationSnapshotSchema = z.object({
   tasks: z.array(OrchestrationTaskSchema).max(5_000),
   dispatches: z.array(OrchestrationDispatchSchema).max(5_000),
   gates: z.array(OrchestrationGateSchema).max(1_000),
+  /** v2+ 才有；可选保证旧 daemon 的快照仍能被新客户端读取。 */
+  worktreeAssets: z.array(OrchestrationWorktreeAssetSchema).max(5_000).optional(),
 });
 
 export const C2SOrchestrationSnapshotSchema = z.object({
@@ -922,6 +971,23 @@ export const C2SOrchestrationAutomationPauseSchema = z.object({
   runId: z.string().min(1).max(200),
 });
 
+/** 只读检查会把最新安全结论写回资产快照，但不会修改 Git 工作树。 */
+export const C2SOrchestrationWorktreeInspectSchema = z.object({
+  type: z.literal("orchestration.worktree.inspect"),
+  assetId: z.string().min(1).max(200),
+  targetRef: z.string().trim().min(1).max(2_000).optional(),
+});
+
+/** cleanup 必须明确 confirm；默认保留分支，deleteBranch 另需显式选择。 */
+export const C2SOrchestrationWorktreeCleanupSchema = z.object({
+  type: z.literal("orchestration.worktree.cleanup"),
+  operationId: z.string().min(1).max(200),
+  assetId: z.string().min(1).max(200),
+  targetRef: z.string().trim().min(1).max(2_000).optional(),
+  confirm: z.literal(true),
+  deleteBranch: z.boolean().optional(),
+});
+
 export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SHelloSchema,
   C2SSessionCreateSchema,
@@ -989,6 +1055,8 @@ export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SOrchestrationGraphApplySchema,
   C2SOrchestrationAutomationStartSchema,
   C2SOrchestrationAutomationPauseSchema,
+  C2SOrchestrationWorktreeInspectSchema,
+  C2SOrchestrationWorktreeCleanupSchema,
 ]);
 
 // ---------------------------------------------------------------- S → C
@@ -1614,6 +1682,8 @@ export type C2SOrchestrationGraphCreate = z.infer<typeof C2SOrchestrationGraphCr
 export type C2SOrchestrationGraphApply = z.infer<typeof C2SOrchestrationGraphApplySchema>;
 export type C2SOrchestrationAutomationStart = z.infer<typeof C2SOrchestrationAutomationStartSchema>;
 export type C2SOrchestrationAutomationPause = z.infer<typeof C2SOrchestrationAutomationPauseSchema>;
+export type C2SOrchestrationWorktreeInspect = z.infer<typeof C2SOrchestrationWorktreeInspectSchema>;
+export type C2SOrchestrationWorktreeCleanup = z.infer<typeof C2SOrchestrationWorktreeCleanupSchema>;
 export type ResumableConversation = z.infer<typeof ResumableConversationSchema>;
 export type C2SConversationSearch = z.infer<typeof C2SConversationSearchSchema>;
 export type C2SAgentAccountsList = z.infer<typeof C2SAgentAccountsListSchema>;
@@ -1660,6 +1730,8 @@ export type OrchestrationAutomation = z.infer<typeof OrchestrationAutomationSche
 export type OrchestrationRun = z.infer<typeof OrchestrationRunSchema>;
 export type OrchestrationTask = z.infer<typeof OrchestrationTaskSchema>;
 export type OrchestrationDispatch = z.infer<typeof OrchestrationDispatchSchema>;
+export type OrchestrationWorktreeInspection = z.infer<typeof OrchestrationWorktreeInspectionSchema>;
+export type OrchestrationWorktreeAsset = z.infer<typeof OrchestrationWorktreeAssetSchema>;
 export type OrchestrationGate = z.infer<typeof OrchestrationGateSchema>;
 export type OrchestrationSnapshot = z.infer<typeof OrchestrationSnapshotSchema>;
 export type FsEntry = z.infer<typeof FsEntrySchema>;

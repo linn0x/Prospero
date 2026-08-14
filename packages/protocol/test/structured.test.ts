@@ -354,6 +354,27 @@ describe("结构化轨协议", () => {
     })).toThrowError(ProtocolError);
   });
 
+  it("工作树资产检查协议是只读的，清理必须明确 confirm", () => {
+    expect(parseC2S({
+      type: "orchestration.worktree.inspect",
+      assetId: "wt-1",
+      targetRef: "main",
+    })).toMatchObject({ assetId: "wt-1", targetRef: "main" });
+    expect(parseC2S({
+      type: "orchestration.worktree.cleanup",
+      operationId: "cleanup-1",
+      assetId: "wt-1",
+      targetRef: "main",
+      confirm: true,
+    })).toMatchObject({ assetId: "wt-1", confirm: true });
+    expect(() => parseC2S({
+      type: "orchestration.worktree.cleanup",
+      operationId: "cleanup-no-confirm",
+      assetId: "wt-1",
+      confirm: false,
+    })).toThrowError(ProtocolError);
+  });
+
   it("本机可恢复对话搜索与完成态可往返校验", () => {
     expect(
       parseC2S({

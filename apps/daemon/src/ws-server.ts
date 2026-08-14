@@ -21,6 +21,7 @@ import {
   CAPABILITY_ORCHESTRATION_MANUAL,
   CAPABILITY_ORCHESTRATION_RUN_LIFECYCLE,
   CAPABILITY_ORCHESTRATION_SNAPSHOT,
+  CAPABILITY_ORCHESTRATION_WORKTREES,
   CAPABILITY_SESSION_CREATE_MODEL,
   CAPABILITY_SUBAGENT_HISTORY,
   MIN_PROTOCOL_VERSION,
@@ -102,6 +103,8 @@ const MANUAL_ORCHESTRATION_METHODS = new Set([
   "graph.apply",
   "automation.start",
   "automation.pause",
+  "worktree.inspect",
+  "worktree.cleanup",
 ]);
 
 interface AttachState {
@@ -311,6 +314,7 @@ export async function createDaemonServer(
       capabilities.push(CAPABILITY_ORCHESTRATION_MANAGEMENT);
       capabilities.push(CAPABILITY_ORCHESTRATION_LIFECYCLE);
       capabilities.push(CAPABILITY_ORCHESTRATION_RUN_LIFECYCLE);
+      capabilities.push(CAPABILITY_ORCHESTRATION_WORKTREES);
     }
     return capabilities;
   }
@@ -354,6 +358,7 @@ export async function createDaemonServer(
         tasks: Object.values(state.tasks),
         dispatches: Object.values(state.dispatches),
         gates: Object.values(state.gates),
+        worktreeAssets: Object.values(state.worktreeAssets),
       },
     });
   }
@@ -1286,7 +1291,9 @@ export async function createDaemonServer(
       case "orchestration.graph.create":
       case "orchestration.graph.apply":
       case "orchestration.automation.start":
-      case "orchestration.automation.pause": {
+      case "orchestration.automation.pause":
+      case "orchestration.worktree.inspect":
+      case "orchestration.worktree.cleanup": {
         if (!canDeviceOrchestrate(device) || conn.protocolVersion < 8) {
           send(conn, {
             type: "error",
@@ -1388,10 +1395,25 @@ export async function createDaemonServer(
             cwd: msg.cwd,
             actorSessionId: null,
           }, new AbortController().signal);
-        } else {
+        } else if (msg.type === "orchestration.automation.pause") {
           await orchestrationApi("automation.pause", {
             operationId: msg.operationId,
             runId: msg.runId,
+            actorSessionId: null,
+          }, new AbortController().signal);
+        } else if (msg.type === "orchestration.worktree.inspect") {
+          await orchestrationApi("worktree.inspect", {
+            assetId: msg.assetId,
+            ...(msg.targetRef ? { targetRef: msg.targetRef } : {}),
+            actorSessionId: null,
+          }, new AbortController().signal);
+        } else {
+          await orchestrationApi("worktree.cleanup", {
+            operationId: msg.operationId,
+            assetId: msg.assetId,
+            ...(msg.targetRef ? { targetRef: msg.targetRef } : {}),
+            confirm: msg.confirm,
+            ...(msg.deleteBranch ? { deleteBranch: msg.deleteBranch } : {}),
             actorSessionId: null,
           }, new AbortController().signal);
         }
