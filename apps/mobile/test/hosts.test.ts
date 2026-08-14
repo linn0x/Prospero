@@ -51,6 +51,11 @@ function relayPairing(pubKey = generateKeyPairB64().publicKey) {
   };
 }
 
+function directPairing(pubKey: string) {
+  const { relay: _relay, ...pairing } = relayPairing(pubKey);
+  return pairing;
+}
+
 function relaySecretKeys(hostId: string) {
   return {
     e2e: `prospero.hostToken.v1.${hostId}`,
@@ -212,6 +217,7 @@ describe("配对凭据安全迁移", () => {
   it("已有 relay 主机重新配对时，地址簿失败会恢复两把旧凭据与旧 route 元数据", async () => {
     const firstPairing = relayPairing();
     const first = await upsertHostFromPairing(firstPairing);
+    await setHostConnectionMode(first.id, "relay");
     const keys = relaySecretKeys(first.id);
     const oldMetadata = storage.get(HOSTS_KEY);
     let failMetadataOnce = true;
@@ -242,6 +248,7 @@ describe("配对凭据安全迁移", () => {
     expect(storage.get(HOSTS_KEY)).not.toContain(replacement.relay.token);
     expect(storage.get(HOSTS_KEY)).not.toContain(replacement.relay.routeId);
     expect(storage.get(HOSTS_KEY)).not.toContain(replacement.relay.deviceId);
+    expect(JSON.parse(storage.get(HOSTS_KEY) ?? "[]")[0]?.connectionMode).toBe("relay");
   });
 
   it("旧 relay ticket 原本不存在时，地址簿失败会删除刚写入的新 ticket", async () => {
@@ -399,5 +406,103 @@ describe("配对凭据安全迁移", () => {
     await setHostConnectionMode(first.id, "direct");
     const again = await upsertHostFromPairing({ ...pairing, token: "fedcba9876543210" });
     expect(again.connectionMode).toBe("direct");
+  });
+
+  it("显式 relay 主机扫 direct-only QR 时会在任何写入前拒绝，并保留全部旧配对状态", async () => {
+    const firstPairing = relayPairing();
+    const first = await upsertHostFromPairing(firstPairing);
+    await setHostConnectionMode(first.id, "relay");
+    const keys = relaySecretKeys(first.id);
+    const oldMetadata = storage.get(HOSTS_KEY);
+
+    vi.mocked(AsyncStorage.setItem).mockClear();
+    vi.mocked(AsyncStorage.removeItem).mockClear();
+    vi.mocked(SecureStore.setItemAsync).mockClear();
+    vi.mocked(SecureStore.deleteItemAsync).mockClear();
+
+    await expect(upsertHostFromPairing({
+      ...directPairing(firstPairing.pubKey),
+      token: "fedcba9876543210",
+    })).rejects.toBeInstanceOf(RelayCredentialsMissingError);
+
+    expect(AsyncStorage.setItem).not.toHaveBeenCalled();
+    expect(AsyncStorage.removeItem).not.toHaveBeenCalled();
+    expect(SecureStore.setItemAsync).not.toHaveBeenCalled();
+    expect(SecureStore.deleteItemAsync).not.toHaveBeenCalled();
+    expect(storage.get(HOSTS_KEY)).toBe(oldMetadata);
+    expect(secrets.get(keys.e2e)).toBe(firstPairing.token);
+    expect(secrets.get(keys.relay)).toBe(firstPairing.relay.token);
+    expect(JSON.parse(oldMetadata ?? "[]")[0]).toMatchObject({
+      connectionMode: "relay",
+      relay: {
+        routeId: firstPairing.relay.routeId,
+        deviceId: firstPairing.relay.deviceId,
+      },
+    });
+  });
+
+  it.each(["direct", "auto"] as const)(
+    "保留 %s 主机扫 direct-only QR 的兼容重配行为",
+    async (mode) => {
+      const firstPairing = relayPairing();
+      const first = await upsertHostFromPairing(firstPairing);
+      if (mode === "direct") await setHostConnectionMode(first.id, mode);
+      const keys = relaySecretKeys(first.id);
+
+      const updated = await upsertHostFromPairing({
+        ...directPairing(firstPairing.pubKey),
+        token: "fedcba9876543210",
+      });
+
+      expect(updated).toMatchObject({
+        connectionMode: mode,
+        token: "fedcba9876543210",
+      });
+      expect(updated.relay).toBeUndefined();
+      expect(updated.relayToken).toBeUndefined();
+      expect(secrets.get(keys.e2e)).toBe("fedcba9876543210");
+      expect(secrets.has(keys.relay)).toBe(false);
+      expect(JSON.parse(storage.get(HOSTS_KEY) ?? "[]")[0]).toMatchObject({
+        connectionMode: mode,
+      });
+    },
+  );
+
+  it("显式 relay 主机扫新 relay QR 时原子更新凭证和 route，同时保持 relay 模式", async () => {
+    const firstPairing = relayPairing();
+    const first = await upsertHostFromPairing(firstPairing);
+    await setHostConnectionMode(first.id, "relay");
+    const keys = relaySecretKeys(first.id);
+    const replacement = {
+      ...relayPairing(firstPairing.pubKey),
+      token: "fedcba9876543210",
+      relay: {
+        ...firstPairing.relay,
+        routeId: "route_replacement_0123456789",
+        deviceId: "device_replacement_0123456789",
+        token: "relay_replacement_0123456789",
+      },
+    };
+
+    const updated = await upsertHostFromPairing(replacement);
+
+    expect(updated).toMatchObject({
+      connectionMode: "relay",
+      token: replacement.token,
+      relay: {
+        routeId: replacement.relay.routeId,
+        deviceId: replacement.relay.deviceId,
+      },
+      relayToken: replacement.relay.token,
+    });
+    expect(secrets.get(keys.e2e)).toBe(replacement.token);
+    expect(secrets.get(keys.relay)).toBe(replacement.relay.token);
+    expect(JSON.parse(storage.get(HOSTS_KEY) ?? "[]")[0]).toMatchObject({
+      connectionMode: "relay",
+      relay: {
+        routeId: replacement.relay.routeId,
+        deviceId: replacement.relay.deviceId,
+      },
+    });
   });
 });
