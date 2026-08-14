@@ -1,8 +1,77 @@
 # 编排:交接状态
 
-**日期** 2026-08-10 · **接续** [orchestration-plan.md](orchestration-plan.md)
+**日期** 2026-08-13 · **接续** [orchestration-plan.md](orchestration-plan.md)
 
 一句话:M1(地基)+M2(派发)+M3(协作 CLI)写完；M4 已具备手机与 Mac 的可视化 DAG 新建/编辑、拓扑查看、自动/手工 worker 派发，以及停止、取消、重试的生命周期管理；Mac 还可直接启动并聚合本地 Agent 会话。
+
+---
+
+## 零、本轮集成后的不可变约定
+
+### 状态与 Gate
+
+- `ready` 始终是派生值：仅 `pending` 且所有依赖均为 `done` 的 Task 才可派发；不落盘，
+  `cancelled` 依赖也绝不放行下游。
+- Session 的 `idle`、重连或恢复只能提示人查看，不能推断交付。只有 worker 的
+  `prospero task done` / `task fail`（或协调者的显式操作）能结算 Task；`done` 不可回写，
+  只有 `failed` 能重试回 `pending`。
+- Task Gate 把 Task 置为 `blocked`；最后一个待决 Gate 被以相同决定解决后，Task 回到
+  `pending`，由正常 ready/派发路径重新检查。Run-level Gate 不改变任一 Task，但会阻止
+  Run 完成：所有 Task 已结算也仍保持 `active`，解开 Gate 后由自动调度器 kick 并经同一
+  `completeRun` 入口收口。
+- 一个 Run 只有在 Task、活动 Dispatch 和待决 Gate 都已结算时才能完成；`completed` 与
+  `abandoned` 均为只读历史。停止、取消、重试会先暂停自动 Run，不能与队列推进竞态。
+- 同一 `operationId` 以方法和 payload 指纹绑定，运行中请求共享 promise，完成记录随
+  `orchestration.json` 落盘。重试不会重复建 Run/图/worker；用同一 id 改参数返回冲突。
+
+### 启动恢复与旧状态
+
+daemon 启动顺序不可调换：先恢复 SessionManager，再调用
+`DispatchService.reconcilePersistedSessions()`，最后才恢复自动队列和 coordinator 首提示。
+活动 Dispatch 找不到会话、或会话已终态但没有显式交付时，原子收敛为
+`abandoned + failed` 并保留原因；存活的 `starting` 恢复为 `running`，不会重复派发。
+已落盘为 `succeeded`/`failed` 却仍活着的 worker 会被停止并保留会话历史，防止重启后继续
+消费旧队列。自动 Run 遇到已收敛的失败会暂停并留下诊断，而不是假装继续；Goal 首提示的
+`pending` 投递账本会在重启后重试。
+
+状态文件现为 `version: 2`。读取 `version: 1` 时只补保守的 legacy 工作树资产，不移动路径、
+不改分支；旧 worker 的 `repo === path` 只当待检查候选，找不到不同于目标工作树的可靠源仓
+上下文就返回 `unknown`，不能清理。
+
+### API 与客户端入口
+
+- snapshot / 手机协议：`orchestration.snapshot`、`orchestration.gate.resolve`；客户端以前台
+  重取完整快照作为断线和后台恢复基线。
+- 本地 control socket：`graph.create` / `graph.apply`、`automation.start` / `pause`、
+  `task.done` / `fail` / `retry` / `cancel`、`worker.start` / `stop`、`gate.create` /
+  `resolve`，以及下列工作树接口。写操作遵守 coordinator/owner 权限和 `operationId` 幂等。
+- worker / coordinator CLI：
+
+  ```bash
+  prospero worktree list [--run RUN_ID]
+  prospero worktree inspect --id WT_ASSET_ID --target main
+  prospero worktree cleanup --id WT_ASSET_ID --target main \
+    --operation-id UNIQUE_ID --confirm
+  ```
+
+- 手机和 Mac 都将 active Run 与 completed/abandoned 历史分组、折叠历史；待决 Gate 优先进入
+  紧凑概览。两端都有进入编排详情、解开 Gate、停止 worker、取消 pending/blocked、重试 failed
+  和查看/检查工作树的生命周期入口。已清理资产以持久 cleanup 记录为准，不能被旧 snapshot 的
+  `safe_to_clean` 反向显示为可清理。
+
+### 工作树安全规则
+
+每次创建 Run 共享工作树或 worker 新工作树，均在创建会话前登记独立资产账本。删除 Run 只写
+`runDeletedAt`，不删除目录、分支或资产记录；worker 停止、异常退出和 Run 删除均默认保留工作树。
+`inspect` 仅只读 Git，并在可靠的源仓/主工作树固定目标 SHA 后给出 `missing`、`dirty`、
+`unmerged`、`equivalent`、`safe_to_clean` 或 `unknown`。legacy monorepo 子目录会先解析实际
+worktree 根目录；自指或缺少可靠上下文一律 `unknown`。
+
+`cleanup` 必须同时具备新 `operationId` 和 `confirm`，并在删除前于同一可靠上下文重新检查；
+只接受 `equivalent` / `safe_to_clean`，使用非 force 的 Git 移除作为第二道保护。默认保留恢复
+分支；请求 `--delete-branch` 时以检查到的 branch commit 作为 expected-old 原子删除，若分支
+期间推进，目录移除仍可成功但分支保留并返回 warning。绝不将这套 API 用于用户现有工作树；
+测试只创建和清理自己的临时 `git init` 目录。
 
 ---
 
@@ -12,17 +81,32 @@
 | --- | --- | --- |
 | `docs/orchestration-plan.md` | 总设计:模型、分层、worktree 方案、分期 | — |
 | `src/orchestration/model.ts` | 数据模型 + 任务状态机 + 成环检测 | 随 store 一起测 |
-| `src/orchestration/store.ts` | JSON 持久化,Run/Task/Dispatch/Message/Gate 全套 CRUD | 36 个用例全过 |
+| `src/orchestration/store.ts` | JSON 持久化,Run/Task/Dispatch/Message/Gate/工作树资产全套 CRUD | 43 个用例全过 |
 | `src/orchestration/esaytree.ts` | 无检出 worktree + 整仓 CoW + 干净快照还原 + ignored 依赖复用 + 失败回滚 | 真实 Git 生命周期测试 |
-| `test/orchestration-store.test.ts` | 36 个用例 | 全过 |
+| `test/orchestration-store.test.ts` | 43 个用例 | 全过 |
 | `src/control-socket.ts` | `~/.prospero/control.sock` 的 token 鉴权 NDJSON RPC + 0600 token 文件 | 4 个用例全过 |
-| `src/orchestration/{control-api,dispatch}.ts` | socket 方法、协调者权限、ready 校验、建会话/worktree/前导词/显式交付、worker 停止与异常退出收敛 | 4 个派发用例全过 |
+| `src/orchestration/{control-api,dispatch}.ts` | socket 方法、协调者权限、ready 校验、建会话/worktree/前导词/显式交付、worker 停止与重启对账收敛 | dispatch/recovery/control API 回归全过 |
 | `src/orchestration-cli.ts` + `bin/prospero` | worker/协调者会话内的 `prospero` CLI | daemon 端到端用例全过 |
 | `src/orchestration/collaboration.ts` | 持久邮箱的 wait/ask/reply 语义；client 断开可取消长等待 | 4 个用例全过 |
 | `test/orchestration-{cli,session-env,collaboration,control-api}.test.ts` | CLI→daemon 往返、身份环境、长轮询/问答、worker 自动 report、决策门 | 9 个用例全过 |
 | `packages/protocol` + `src/ws-server.ts` + 手机/Mac 编排页 | 编排快照 / Gate；原子 DAG 新建、编辑与 pending 节点删除；Run 管理删除；手工或静态自动 worker 派发；Goal 协调者会话 | protocol、daemon、mobile、Swift build 全过 |
 | `src/orchestration/automation.ts` | 人工 DAG 一键运行；整张 Run 共享隔离 worktree，显式交付后安全串行推进，支持暂停/恢复/重启续跑 | 真实 git worktree + 状态推进测试 |
 | 协议 v9 + `hosts.ts` | v9→v8→v7→v5 滚动兼容；能力协商；token/设备私钥迁入 iOS Keychain | 协议、daemon 集成与移动端迁移测试全过 |
+
+本轮集成验收（2026-08-13）：
+
+```bash
+npm run typecheck
+npm test
+npm test --workspace @prospero/mobile
+cd apps/shell && swift build --scratch-path /tmp/prospero-swift-b0ef31b22c72
+git diff --check
+git status --short
+```
+
+结果：TypeScript typecheck 通过；daemon 35 个文件、318 项（4 项显式 skipped）通过；
+mobile 26 个文件、163 项通过；Swift debug build 通过；diff 检查和 Git 状态干净。Swift 使用
+本任务专用 scratch 目录，避免复用从其他绝对路径带入的 Swift module cache，未清理任何用户工作树。
 
 跑验证:
 
@@ -64,9 +148,9 @@ cd apps/daemon && npx vitest run \
 
 ---
 
-## 二、没做的(按建议顺序)
+## 二、产品入口与仍可迭代项
 
-### M4 手机端与 Mac（已完成手工编排主路径）
+### M4 手机端与 Mac（已完成主路径）
 
 1. protocol 已加入 `orchestration.snapshot` 与 `orchestration.gate.resolve`；App 前台定时重取快照，iOS/Android 从后台回来不会依赖易丢的增量事件。
 2. 新建会话的手机竖屏将项目收为可点按更换的紧凑上下文栏，让配置区占余下全部空间；iPad、Android 平板与横屏手机自动改为项目/配置双栏。对已有项目左滑“新会话”会把该项目固定在项目栏。
@@ -81,7 +165,7 @@ cd apps/daemon && npx vitest run \
 11. Mac 与 iOS 均可停止活动 worker、取消 pending/blocked 任务、重试 failed 任务；停止与意外退出都会原子收敛 Dispatch/Task 状态。取消不会释放下游依赖，自动执行中的生命周期操作会先暂停 Run。
 12. Mac 全局工具栏可直接启动本地 Agent；默认 Shell + PTY，也可启动 Claude/Codex/OpenCode/Grok/Trae，并为支持的 Agent 切换结构化模式。创建仍走 loopback + control token，SessionManager、tmux 恢复和手机侧会话列表保持单一真相。
 13. Mac 会话页提供醒目的「停止本轮」且保留会话；Codex app-server 中断严格携带官方 `TurnInterruptParams` 要求的 `threadId + turnId`，不再静默吞掉协议错误。手机原有停止入口同步受益，无需升级客户端。
-14. 后续仍可补充：每任务 worktree 的自动合并/冲突处理与安全并行、画布拖拽位置持久化、Run 归档，以及 worktree diff/合并/清理。M3 邮箱继续复用现有实现。
+14. 后续仍可补充：每任务 worktree 的自动合并/冲突处理与安全并行、画布拖拽位置持久化、Run 归档，以及更丰富的 worktree diff/合并视图。M3 邮箱继续复用现有实现；检查与安全清理已交付。
 15. Mac 会话页可按名称进入子 Agent 的独立实时过程，展示消息、推理、工具、权限与提问；读取走 loopback + control token。iOS 增加常驻名称栏与 `subagent.history.v1` 按需历史，长会话即使截断早期启动事件仍可进入。Codex 通过 `thread/read(includeTurns:true)` 恢复原生 turn/item，晚到的 `agentNickname`/`agentRole` 会补全既有身份；发现时严格校验 `parentThreadId`，恢复时自动清掉旧版误记的父线程伪子 Agent。
 
 ### esaytree 测试（已补）
@@ -170,14 +254,14 @@ Prospero 自研实现:
 
 ---
 
-## 五、当前工作区状态
+## 五、交接检查清单
 
-- 新增未提交:`docs/orchestration-{plan,handoff}.md`、
-  `src/orchestration/{model,store,worktree,control-api,dispatch,collaboration}.ts`、
-  `src/{control-socket,orchestration-cli}.ts`、`bin/prospero`、
-  `test/orchestration-{store,dispatch,cli,session-env,collaboration,control-api}.test.ts`、
-  `test/control-socket.test.ts`
-- 这些是**在既有的一大堆未提交改动之上**加的(`git status` 里本来就有几十个改动文件),
-  提交前先确认别把别人的活一起带上
-- 无残留:orca-bridge 已删,root `package.json`/`README.md` 的改动已 `git checkout` 还原,
-  实验用的 tmux 会话和 `/tmp` 产物已清,用户自己的两个 telescreen 会话未受影响
+1. 改状态机或恢复顺序时，至少运行 `orchestration-store`、`orchestration-dispatch`、
+   `orchestration-recovery`、`orchestration-automation` 和 `orchestration-control-api`；不要以
+   Session `idle` 为完成信号。
+2. 改工作树登记、迁移或清理时，运行 `orchestration-worktree-assets` 与 mobile
+   `worktree-assets`；用临时 `git init` 仓库断言拒绝路径，绝不针对开发者现有 worktree 试删。
+3. 改手机/Mac 概览或生命周期入口时，运行 mobile `orchestration-overview`、`worktree-assets`
+   和 `swift build`；历史折叠不得隐藏待决 Gate，已清理资产不得重新出现清理按钮。
+4. 交付前运行本节的完整命令、`git diff --check` 与 `git status --short`。只提交本任务实际
+   修改；不清理用户已有 worktree、分支或会话。
