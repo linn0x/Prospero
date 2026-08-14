@@ -58,6 +58,63 @@ class FakePersistentAdapter implements AgentAdapter {
 }
 
 describe("结构化会话持久化", () => {
+  it("worker 交付后终止原生会话但保留只读历史，重启后也不会复活队列", async () => {
+    const home = tempHome();
+    const first = new SessionManager({
+      home,
+      adapterFactory: (_agent, state) => {
+        const adapter = new FakePersistentAdapter(state);
+        // 第一轮刻意不结束，让第二条消息留在队列中；这正是 worker task.done
+        // 之后旧结构化会话过去会继续消费并写回原 worktree 的场景。
+        adapter.send = async () => {};
+        return adapter;
+      },
+    });
+    const created = await first.create({
+      agent: "codex",
+      kind: "structured",
+      cwd: home,
+      cols: 80,
+      rows: 24,
+      allowShell: false,
+    });
+    await first.chatSend(created.id, "交付前仍在运行");
+    await first.chatSend(created.id, "不得在交付后继续消费");
+    expect(first.infoOf(created.id).messageQueue).toHaveLength(1);
+    await first.kill(created.id, { preserveHistory: true });
+    expect(first.infoOf(created.id).status).toBe("done");
+    await expect(first.chatSend(created.id, "不得继续写 worktree"))
+      .rejects.toThrow("历史只读");
+    first.flushPersistence();
+    expect(JSON.parse(readFileSync(path.join(home, "structured-sessions.json"), "utf8")))
+      .toEqual([expect.objectContaining({
+        id: created.id,
+        terminal: true,
+        messageQueue: [expect.objectContaining({ displayText: "不得在交付后继续消费" })],
+      })]);
+    await first.disposeAll();
+
+    let starts = 0;
+    const second = new SessionManager({
+      home,
+      adapterFactory: (_agent, state) => {
+        const adapter = new FakePersistentAdapter(state);
+        const start = adapter.start.bind(adapter);
+        adapter.start = async (context) => {
+          starts += 1;
+          await start(context);
+        };
+        return adapter;
+      },
+    });
+    const restored = await second.restoreStructured();
+    expect(restored).toEqual([expect.objectContaining({ id: created.id, status: "done" })]);
+    expect(starts).toBe(0);
+    await expect(second.chatSend(created.id, "不得重启"))
+      .rejects.toThrow("历史只读");
+    await second.disposeAll();
+  });
+
   it("创建时把 Plan、模型与选中的本机原生会话 ID 交给适配器", async () => {
     const home = tempHome();
     let received: AdapterResumeState | undefined;

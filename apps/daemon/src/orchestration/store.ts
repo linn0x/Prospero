@@ -1239,6 +1239,47 @@ export class OrchestrationStore {
   }
 
   /**
+   * worker 显式交付的持久化提交点。Task、Dispatch 和关联工作树资产先在同一
+   * 快照里收敛，再同步原子写入；调用方只有在这里返回后才能终止真实会话。
+   */
+  settleWorkerDelivery(
+    dispatchId: string,
+    taskStatus: Extract<TaskStatus, "done" | "failed">,
+    dispatchState: Extract<Dispatch["state"], "succeeded" | "failed">,
+    outcome: string,
+    worktreeReason: string,
+  ): Task {
+    const dispatch = this.getDispatch(dispatchId);
+    if (dispatch.state !== "starting" && dispatch.state !== "running") {
+      throw new OrchestrationError(`派发 ${dispatch.id} 已经是 ${dispatch.state}，不能再次交付`, "invalid_transition");
+    }
+    const task = this.getTask(dispatch.taskId);
+    this.requireActiveRun(task.runId);
+    if (!canTransition(task.status, taskStatus)) {
+      const err = new TransitionError(task.status, taskStatus);
+      throw new OrchestrationError(err.message, "invalid_transition");
+    }
+
+    const now = Date.now();
+    task.status = taskStatus;
+    task.result = outcome;
+    task.updatedAt = now;
+    dispatch.state = dispatchState;
+    dispatch.outcome = outcome;
+    dispatch.settledAt = now;
+    for (const asset of Object.values(this.state.worktreeAssets)) {
+      if (asset.dispatchId !== dispatch.id || asset.cleanup !== null || asset.state === "missing") continue;
+      asset.state = "preserved";
+      asset.updatedAt = now;
+      asset.lastError = worktreeReason;
+    }
+    this.schedulePersist();
+    // `kill` 后 session.state 会立即触发回调；这里不能把交付事实留给 debounce。
+    this.persistNow();
+    return task;
+  }
+
+  /**
    * daemon 恢复时发现 worker 会话不存在或已经终态的单次收敛写入。
    *
    * Dispatch 与 Task 共用同一份状态快照；在调用观察者和安排落盘前一起修改，

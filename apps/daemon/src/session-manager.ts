@@ -76,6 +76,11 @@ export interface CreateSessionInput {
   allowShell: boolean;
 }
 
+/** 终止时可保留已结束结构化会话的本地只读历史。 */
+export interface KillSessionOptions {
+  preserveHistory?: boolean;
+}
+
 export interface SessionManagerEvents {
   output: [sid: string, dataB64: string, seq: number];
   agentEvent: [sid: string, body: AgentEventBody, evSeq: number];
@@ -243,6 +248,7 @@ function parseStructuredState(value: unknown): StructuredSessionPersistentState 
     toolOutputs,
     adapterState,
     messageQueue,
+    ...(v["terminal"] === true ? { terminal: true as const } : {}),
   };
 }
 
@@ -416,6 +422,12 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       if (this.structuredSessions.has(state.id)) continue;
       const session = this.makeStructuredSession(state.id, state.agent, state.cwd, state.title, state);
       this.structuredSessions.set(state.id, session);
+      if (state.terminal) {
+        // 已交付 worker 只保留本地审计历史，不能在重启后接回 native thread。
+        restored.push(session.info());
+        this.emit("state", session.info());
+        continue;
+      }
       try {
         await session.start();
       } catch (e) {
@@ -805,13 +817,13 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     this.requirePty(sid).interrupt();
   }
 
-  /** 终止并移除会话 */
-  async kill(sid: string): Promise<void> {
+  /** 终止会话；编排 worker 可保留结构化历史为只读。 */
+  async kill(sid: string, options: KillSessionOptions = {}): Promise<void> {
     const structured = this.structuredSessions.get(sid);
     if (structured) {
       const info = structured.info();
       await structured.dispose();
-      this.structuredSessions.delete(sid);
+      if (!options.preserveHistory) this.structuredSessions.delete(sid);
       this.scheduleStructuredPersist();
       this.emit("state", { ...info, status: "done" });
       return;
