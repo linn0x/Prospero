@@ -9,26 +9,127 @@ export interface SpawnSpec {
   args: string[];
 }
 
-export function commandFor(agent: AgentKind, customCommand?: string): SpawnSpec {
-  const shell = process.env["SHELL"] ?? "/bin/zsh";
+type EnvLike = Pick<NodeJS.ProcessEnv, string>;
+
+function windowsShell(env: EnvLike): string {
+  return env["COMSPEC"] ?? env["ComSpec"] ?? "cmd.exe";
+}
+
+function isPowerShell(file: string): boolean {
+  const name = file.replace(/\\/g, "/").split("/").pop()?.toLowerCase() ?? "";
+  return name === "powershell.exe" || name === "pwsh.exe" || name === "powershell" || name === "pwsh";
+}
+
+export function shellFor(
+  platform: NodeJS.Platform = process.platform,
+  env: EnvLike = process.env,
+): SpawnSpec {
+  if (platform === "win32") {
+    const shell = windowsShell(env);
+    return isPowerShell(shell)
+      ? { file: shell, args: ["-NoLogo"] }
+      : { file: shell, args: ["/d"] };
+  }
+  return { file: env["SHELL"] ?? "/bin/zsh", args: ["-il"] };
+}
+
+function shellCommandFor(
+  command: string,
+  platform: NodeJS.Platform,
+  env: EnvLike,
+): SpawnSpec {
+  const shell = platform === "win32" ? windowsShell(env) : (env["SHELL"] ?? "/bin/zsh");
+  if (platform === "win32") {
+    return isPowerShell(shell)
+      ? { file: shell, args: ["-NoLogo", "-NoProfile", "-Command", command] }
+      : { file: shell, args: ["/d", "/s", "/c", command] };
+  }
+  return { file: shell, args: ["-c", command] };
+}
+
+function encodedPowerShellProgram(file: string, args: string[]): SpawnSpec {
+  if ([file, ...args].some((value) => value.includes("\0"))) {
+    throw new Error("Windows Agent 命令包含 NUL 字符");
+  }
+  // Never interpolate argv into PowerShell source. A nested base64 JSON payload
+  // preserves spaces, quotes and cmd metacharacters used by Codex API profiles.
+  const payload = Buffer.from(JSON.stringify([file, ...args]), "utf8").toString("base64");
+  const script =
+    "$ErrorActionPreference='Stop';try{" +
+    `$p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${payload}'))|ConvertFrom-Json;` +
+    "$a=@($p|Select-Object -Skip 1);& ([string]$p[0]) @a;" +
+    "$code=$LASTEXITCODE;if($null -eq $code){$code=0};exit $code" +
+    "}catch{Write-Error $_;exit 127}";
+  return {
+    file: "powershell.exe",
+    args: [
+      "-NoLogo",
+      "-NoProfile",
+      "-EncodedCommand",
+      Buffer.from(script, "utf16le").toString("base64"),
+    ],
+  };
+}
+
+/**
+ * Run npm-installed CLI shims through Windows PowerShell.
+ *
+ * npm CLIs are commonly `.cmd` shims and cannot be launched directly by
+ * child_process/node-pty on Windows. Encoding argv as data also avoids cmd.exe
+ * parsing API URLs, TOML quotes or user-selected model names as shell syntax.
+ */
+export function programCommandFor(
+  file: string,
+  args: string[],
+  platform: NodeJS.Platform = process.platform,
+  env: EnvLike = process.env,
+): SpawnSpec {
+  if (platform !== "win32") return { file, args };
+  const command = encodedPowerShellProgram(file, args);
+  const configuredShell = windowsShell(env);
+  return isPowerShell(configuredShell) ? { ...command, file: configuredShell } : command;
+}
+
+export function noopCommand(): SpawnSpec {
+  return { file: process.execPath, args: ["-e", ""] };
+}
+
+export function commandFor(
+  agent: AgentKind,
+  customCommand?: string,
+  platform: NodeJS.Platform = process.platform,
+  env: EnvLike = process.env,
+  extraArgs: string[] = [],
+): SpawnSpec {
   switch (agent) {
     case "shell":
-      return { file: shell, args: ["-il"] };
+      return shellFor(platform, env);
     case "claude":
-      return { file: "claude", args: ["--dangerously-skip-permissions"] };
+      return programCommandFor(
+        "claude",
+        ["--dangerously-skip-permissions", ...extraArgs],
+        platform,
+        env,
+      );
     case "codex":
-      return { file: "codex", args: ["--dangerously-bypass-approvals-and-sandbox"] };
+      return programCommandFor(
+        "codex",
+        ["--dangerously-bypass-approvals-and-sandbox", ...extraArgs],
+        platform,
+        env,
+      );
     case "opencode":
-      return { file: "opencode", args: [] };
+      return programCommandFor("opencode", extraArgs, platform, env);
     case "grok":
-      return { file: "grok", args: [] };
+      return programCommandFor("grok", extraArgs, platform, env);
     case "trae":
-      return { file: "trae-cli", args: ["interactive"] };
+      return programCommandFor("trae-cli", ["interactive", ...extraArgs], platform, env);
     case "custom": {
       if (!customCommand || customCommand.trim() === "") {
         throw new Error("custom agent requires a command");
       }
-      return { file: shell, args: ["-c", customCommand] };
+      if (extraArgs.length > 0) throw new Error("custom agent does not accept extra arguments");
+      return shellCommandFor(customCommand, platform, env);
     }
   }
 }

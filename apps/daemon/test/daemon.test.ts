@@ -24,6 +24,12 @@ const home = mkdtempSync(path.join(os.tmpdir(), "prospero-test-"));
 const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), "prospero-workspace-"));
 mkdirSync(path.join(workspaceRoot, "Projects", "Demo"), { recursive: true });
 writeFileSync(path.join(workspaceRoot, "Projects", "Demo", "README.md"), "demo\n");
+const smokeCommand = process.platform === "win32"
+  ? "echo PROSPERO_SMOKE && ping -n 2 127.0.0.1 >NUL"
+  : "printf 'PROSPERO_SMOKE\\n'; sleep 0.2";
+const markerCommand = process.platform === "win32"
+  ? "echo MARKER_ONE && ping -n 31 127.0.0.1 >NUL"
+  : "printf 'MARKER_ONE\\n'; sleep 30";
 let server: DaemonServer;
 let daemonPub: string;
 
@@ -705,7 +711,7 @@ describe("daemon 全链路", () => {
     c.send({
       type: "session.create",
       agent: "custom",
-      command: "printf 'PROSPERO_SMOKE\\n'; sleep 0.2",
+      command: smokeCommand,
       cols: 80,
       rows: 24,
     });
@@ -725,7 +731,7 @@ describe("daemon 全链路", () => {
     c1.send({
       type: "session.create",
       agent: "custom",
-      command: "printf 'MARKER_ONE\\n'; sleep 30",
+      command: markerCommand,
       cols: 80,
       rows: 24,
     });

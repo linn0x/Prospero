@@ -39,7 +39,7 @@ const statusText: Record<AgentAccount["status"], string> = {
   signed_in: "已登录",
   signed_out: "未登录",
   unavailable: "CLI 未安装",
-  error: "状态未知",
+  error: "状态读取失败",
 };
 
 const statusColor: Record<AgentAccount["status"], string> = {
@@ -65,7 +65,7 @@ export default function AgentAccountsScreen() {
       return;
     }
     if (!conn.supportsAgentAccounts) {
-      setError("当前 Mac 端还不支持账号管理，请先升级并重启 Prospero daemon。");
+      setError("当前电脑端还不支持账号管理，请先升级并重启 Prospero daemon。");
       setLoading(false);
       return;
     }
@@ -215,7 +215,7 @@ export default function AgentAccountsScreen() {
     try {
       const result = await conn.loginAgentAccount(account.id);
       setAccounts(result.accounts);
-      if (!result.sessionId) throw new Error("Mac 没有返回登录终端");
+      if (!result.sessionId) throw new Error("电脑端没有返回登录终端");
       router.push(`/host/${hostId}/session/${result.sessionId}`);
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : String(failure));
@@ -285,7 +285,7 @@ export default function AgentAccountsScreen() {
             每个 Prospero 账号或 API Profile 都拥有独立的凭据、配置、原生会话历史和 MCP/插件状态；创建会话时仍可选择同一个项目目录。
           </Text>
           <Text style={styles.securityText}>
-            API Key 和 Claude 独立令牌经配对加密通道写入 Mac 安全存储，不写进账号元数据或对话记录。第三方 API 必须使用 HTTPS（localhost 除外）。
+            Codex 可由官方 CLI 登录；API Key 和 Claude 独立令牌经配对加密通道写入电脑端安全存储，不写进账号元数据或对话记录。第三方 API 必须使用 HTTPS（localhost 除外）。
           </Text>
         </View>
 
@@ -334,6 +334,7 @@ export default function AgentAccountsScreen() {
                         <Text style={styles.meta}>{statusText[account.status]}</Text>
                         {account.authMethod && <Text style={styles.meta}>· {account.authMethod}</Text>}
                       </View>
+                      {account.detail && <Text style={styles.environment}>{account.detail}</Text>}
                       <Text style={styles.environment}>
                         {account.apiProfile
                           ? `${account.apiProfile.provider === "openai_compatible" ? "OpenAI" : "Anthropic"} 兼容 API · ${account.apiProfile.model}\n${account.apiProfile.baseUrl}`
@@ -412,7 +413,7 @@ export default function AgentAccountsScreen() {
         message={
           editor?.kind === "create"
             ? editor.agent === "claude"
-              ? "创建后先生成令牌，再把令牌导入 Mac 的独立安全存储。"
+              ? "创建后先生成令牌，再把令牌导入电脑端的独立安全存储。"
               : "创建后会得到独立环境，下一步在官方 CLI 终端完成登录。"
             : editor?.kind === "credential"
               ? editor.account.apiProfile
@@ -427,7 +428,7 @@ export default function AgentAccountsScreen() {
                     ? "输入服务 API 的根地址，例如 https://gateway.example.com/v1。"
                     : editor.phase === "model"
                       ? "输入该服务中要作为默认模型使用的精确模型 ID。"
-                      : "Key 仅写入 Mac 安全存储，不会保存在账号配置或聊天记录中。"
+                      : "Key 仅写入电脑端安全存储，不会保存在账号配置或聊天记录中。"
               : undefined
         }
         value={name}

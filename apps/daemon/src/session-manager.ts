@@ -14,6 +14,8 @@ import type {
 import {
   commandFor,
   defaultKindFor,
+  noopCommand,
+  programCommandFor,
   requiresShellCapability,
   spawnEnv,
   structuredCapable,
@@ -480,15 +482,18 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   ): SessionInfo {
     let spec;
     try {
-      spec = commandFor(input.agent, input.command);
+      spec = commandFor(
+        input.agent,
+        input.command,
+        process.platform,
+        process.env,
+        input.agent === "codex" ? (account?.codexAppServerArgs ?? []) : [],
+      );
     } catch (e) {
       throw new SessionError(
         e instanceof Error ? e.message : String(e),
         "agent_unavailable",
       );
-    }
-    if (input.agent === "codex" && account?.codexAppServerArgs) {
-      spec = { ...spec, args: [...spec.args, ...account.codexAppServerArgs] };
     }
     const id = randomUUID();
     const info = this.spawnPty(
@@ -519,7 +524,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     spec: { file: string; args: string[] } | undefined,
     account?: AccountBinding,
   ): SessionInfo {
-    const base = spec ?? { file: "/bin/true", args: [] };
+    const base = spec ?? noopCommand();
     const sessionEnv = { ...(account?.environment ?? {}), ...this.sessionEnv(id) };
     const launch =
       this.tmuxBin && this.tmuxConfigFile
@@ -685,7 +690,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       os.homedir(),
       cols,
       rows,
-      spec.command,
+      programCommandFor(spec.command.file, spec.command.args),
       spec.binding,
     );
     this.persistMeta();

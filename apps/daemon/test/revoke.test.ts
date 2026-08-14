@@ -74,8 +74,9 @@ describe("设备撤销", () => {
     mintDevice(home, { name: "a", allowShell: true });
     mintDevice(home, { name: "b", allowShell: true });
     revokeDevices(home, "a");
-    const mode = statSync(path.join(home, "devices.json")).mode & 0o777;
-    expect(mode).toBe(0o600);
+    const info = statSync(path.join(home, "devices.json"));
+    expect(info.isFile()).toBe(true);
+    if (process.platform !== "win32") expect(info.mode & 0o777).toBe(0o600);
   });
 
   it("拒绝时能说出到底是哪一种失败 —— 两种的处理方式完全不同", () => {

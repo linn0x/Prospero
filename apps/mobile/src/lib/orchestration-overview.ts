@@ -22,7 +22,7 @@ export function orchestrationConnectionNotice(
   lastError: string | null,
   hostName: string | undefined,
 ): OrchestrationConnectionNotice | null {
-  const target = hostName ?? "Mac";
+  const target = hostName ?? "电脑";
   switch (status) {
     case "connected":
       return null;

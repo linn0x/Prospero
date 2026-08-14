@@ -13,9 +13,10 @@
  * 事件解析是防御性的:未登录时无法核对真实字段名,因此对几种可能的形态
  * (ACP 风格 session/update、扁平 type 字段)都做兼容,认不出的整体忽略。
  */
-import { spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { AgentEventBody, PermissionReply } from "@prospero/protocol";
+import crossSpawn from "cross-spawn";
 import {
   AdapterError,
   summarize,
@@ -85,7 +86,7 @@ export class GrokAdapter implements AgentAdapter {
     this.turnStarted = true;
     this.buf = "";
 
-    const proc = spawn("grok", args, {
+    const proc = crossSpawn("grok", args, {
       stdio: ["ignore", "pipe", "pipe"],
       cwd: this.ctx.cwd,
       env: { ...process.env, ...this.ctx.env },

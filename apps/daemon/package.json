@@ -28,12 +28,14 @@
     "@xterm/xterm": "^6.0.0",
     "bonjour-service": "^1.4.0",
     "commander": "^13.0.0",
+    "cross-spawn": "^7.0.6",
     "node-pty": "^1.1.0",
     "qrcode-terminal": "^0.12.0",
     "tweetnacl": "^1.0.3",
     "ws": "^8.18.0"
   },
   "devDependencies": {
+    "@types/cross-spawn": "^6.0.6",
     "@types/qrcode-terminal": "^0.12.2",
     "@types/ws": "^8.5.13",
     "vitest": "^3.2.7"
