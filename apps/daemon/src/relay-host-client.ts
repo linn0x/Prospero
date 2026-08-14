@@ -73,6 +73,13 @@ interface Target {
   routeId: string;
   hostSecret: string;
   devices: DeviceRecord[];
+  /**
+   * Snapshot the active relay credential set when config is loaded.  Device
+   * watcher implementations are allowed to reuse/mutate their record array;
+   * comparing the live previous array would then make a real credential
+   * rotation look like a no-op.
+   */
+  credentialFingerprint: string;
 }
 
 interface RelaySyncState {
@@ -210,6 +217,7 @@ export class RelayHostClient {
         routeId: deriveRelayRouteId(config.relay.hostSecret),
         hostSecret: config.relay.hostSecret,
         devices,
+        credentialFingerprint: deviceSnapshotFingerprint(devices),
       };
     } catch {
       this.target = null;
@@ -222,7 +230,7 @@ export class RelayHostClient {
     const endpointChanged = previous?.url !== next.url ||
       this.target?.routeId !== next.routeId || this.target?.hostSecret !== next.hostSecret;
     const credentialsChanged = previous !== null && previous !== undefined &&
-      deviceSnapshotFingerprint(previous.devices) !== deviceSnapshotFingerprint(next.devices);
+      previous.credentialFingerprint !== next.credentialFingerprint;
     this.target = next;
     this.lastError = undefined;
     if (endpointChanged) {

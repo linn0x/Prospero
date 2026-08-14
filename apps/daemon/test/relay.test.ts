@@ -346,6 +346,65 @@ describe("RelayHostClient", () => {
     }
   });
 
+  it("keeps the first ready gate across an in-place credential replacement and promotes only its latest ACK", async () => {
+    const dir = home();
+    const relay = await relayServer();
+    const generations: number[] = [];
+    const heartbeats: number[] = [];
+    let routeId = "";
+    let control: WebSocket | undefined;
+    relay.wss.on("connection", (ws) => {
+      control = ws;
+      ws.on("message", (raw) => {
+        const message = JSON.parse(raw.toString()) as { routeId?: string; type?: string; generation?: number };
+        if (!message.type) {
+          routeId = message.routeId!;
+          return;
+        }
+        if (message.type === "host.device-sync") {
+          generations.push(message.generation!);
+          // Deliberately acknowledge both generations without ever sending a
+          // replacement ready. The sole ready below belongs to the first
+          // snapshot, as the T2 relay contract requires.
+          ws.send(JSON.stringify({ type: "host.device-sync.ack", v: 1, generation: message.generation }));
+          return;
+        }
+        if (message.type === "host.heartbeat") {
+          heartbeats.push(message.generation!);
+          ws.send(JSON.stringify({ type: "host.heartbeat.ack", v: 1, generation: message.generation }));
+        }
+      });
+    });
+    const client = new RelayHostClient({
+      devMode: true, stateDir: dir, minReconnectMs: 5, maxReconnectMs: 10, random: () => 1,
+      heartbeatMs: 20, heartbeatAckTimeoutMs: 100, onStream: () => {},
+    });
+    try {
+      const records = [device("in-place-one")];
+      const relayConfig = config(relay.url);
+      client.update(relayConfig, records);
+      await waitFor(() => generations.length === 1);
+
+      // A watcher can retain its array and replace a record in place. The
+      // previous active credential snapshot must still detect this as a relay
+      // update rather than comparing the same mutated object twice.
+      records[0] = { ...records[0]!, relayToken: "ticket_in-place-rotated_0123456789" };
+      client.update(relayConfig, records);
+      await waitFor(() => generations.length === 2);
+      expect(generations[1]).toBeGreaterThan(generations[0]!);
+      expect(client.status().state).toBe("syncing");
+      expect(heartbeats).toEqual([]);
+
+      control!.send(JSON.stringify({
+        type: "host.ready", v: 1, routeId, generation: generations[0],
+      }));
+      await waitFor(() => client.status().state === "online" && heartbeats.includes(generations[1]!));
+    } finally {
+      client.close();
+      await relay.close();
+    }
+  });
+
   it("leaves relay state untouched for lastSeen, metadata, permission, and no-op device updates", async () => {
     const dir = home();
     const relay = await relayServer();
