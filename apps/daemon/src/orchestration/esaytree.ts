@@ -71,7 +71,7 @@ export interface ManagedWorktreeInfo extends WorktreeInfo {
 
 export interface CloneReport {
   dir: string;
-  /** true 表示文件系统确认使用 CoW；false 表示发生了真实复制。 */
+  /** true 表示文件系统确认使用 CoW；false 时以 strategy 区分实体复制和跳过。 */
   cow: boolean;
   /** `skipped` 从未写入目标路径；不能被误认为已复用。 */
   strategy: "cow" | "copy" | "skipped";
@@ -113,7 +113,7 @@ export interface CreateWorktreeInput {
   baseRef?: string;
   /** 要新建的分支；省略时创建 detached worktree。 */
   branch?: string;
-  /** 是否保留完全被 Git 忽略的目录（依赖、缓存等）；默认保留。 */
+  /** 是否尝试复用 allowlist 中完全被 Git 忽略的依赖目录；默认尝试。 */
   cloneIgnored?: boolean;
   /** CoW 不可用时是否退回普通 Git checkout；默认退回。 */
   fallbackToCheckout?: boolean;

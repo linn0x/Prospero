@@ -460,7 +460,8 @@ adapter 的 `SessionStatus`（idle 等）猜 done。
 
 ### 8.4 超时（`orchestration-cli-timeouts.ts`）
 
-`worker.start` 5 分钟（`--worktree new` 要同步建树 + 复制 ignored 依赖）；其余 RPC 15 秒；`check --wait`/`ask` 走 `timeoutMs=0`。
+`worker.start` 5 分钟（`--worktree new` 要同步 Git checkout，并对 allowlist 依赖执行严格 CoW 或安全跳过）；
+其余 RPC 15 秒；`check --wait`/`ask` 走 `timeoutMs=0`。
 
 ---
 
