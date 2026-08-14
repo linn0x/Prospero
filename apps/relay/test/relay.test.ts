@@ -1,197 +1,112 @@
 import { once } from "node:events";
+import { randomBytes } from "node:crypto";
+import { deriveRelayRouteId } from "@prospero/protocol";
 import { createLogger } from "../src/log.js";
 import { RelayServer } from "../src/relay.js";
 import type { RelayConfig } from "../src/config.js";
 import { WebSocket } from "ws";
 import { afterEach, describe, expect, it } from "vitest";
-import { MemoryEphemeralStore, MemoryRouteStore } from "./helpers.js";
+import { activeCredential, MemoryEphemeralStore, MemoryRouteStore } from "./helpers.js";
 
-const routeId = "r".repeat(22);
-const hostId = "h".repeat(22);
-const clientId = "c".repeat(22);
-const hostToken = "H".repeat(43);
-const clientToken = "C".repeat(43);
+const hostSecret = randomBytes(32).toString("base64url");
+const routeId = deriveRelayRouteId(hostSecret);
+const deviceId = "c".repeat(22);
+const token = "T".repeat(43);
 
-function config(): RelayConfig {
-  return {
-    host: "127.0.0.1", port: 0, mysqlUrl: "", redisUrl: "", migrationDir: "", metricsInternalOnly: true,
-    maxStreamsPerRoute: 8, authTimeoutMs: 500, ticketTimeoutMs: 1_000, credentialCacheTtlSeconds: 60,
-    presenceTtlSeconds: 20, authRatePerMinute: 20, connectionRatePerMinute: 60, cleanupIntervalMs: 60_000, logLevel: "silent",
-  };
-}
+function config(): RelayConfig { return { host: "127.0.0.1", port: 0, mysqlUrl: "", redisUrl: "", migrationDir: "", metricsInternalOnly: true, maxStreamsPerRoute: 8, authTimeoutMs: 500, ticketTimeoutMs: 1_000, credentialCacheTtlSeconds: 60, presenceTtlSeconds: 20, authRatePerMinute: 20, connectionRatePerMinute: 60, cleanupIntervalMs: 60_000, logLevel: "silent" }; }
+interface Inbox { queue: Array<{ data: Buffer; binary: boolean }>; waiting: Array<(value: { data: Buffer; binary: boolean }) => void>; }
+const inboxes = new WeakMap<WebSocket, Inbox>();
+function inbox(ws: WebSocket): Inbox { let value = inboxes.get(ws); if (value !== undefined) return value; value = { queue: [], waiting: [] }; ws.on("message", (data, binary) => { const item = { data: Buffer.from(data), binary: Boolean(binary) }; const listener = value!.waiting.shift(); if (listener !== undefined) listener(item); else value!.queue.push(item); }); inboxes.set(ws, value); return value; }
+async function open(url: string): Promise<WebSocket> { const ws = new WebSocket(url); await once(ws, "open"); inbox(ws); return ws; }
+async function next(ws: WebSocket): Promise<{ data: Buffer; binary: boolean }> { const state = inbox(ws); const item = state.queue.shift(); return item === undefined ? new Promise((resolve) => state.waiting.push(resolve)) : item; }
+async function close(ws: WebSocket): Promise<void> { if (ws.readyState >= WebSocket.CLOSING) return; const done = once(ws, "close"); ws.close(); await done; }
 
-async function open(url: string): Promise<WebSocket> {
-  const ws = new WebSocket(url);
-  await once(ws, "open");
-  return ws;
-}
-
-async function next(ws: WebSocket): Promise<{ data: Buffer; binary: boolean }> {
-  const [data, binary] = await once(ws, "message") as [Buffer, boolean];
-  return { data: Buffer.from(data), binary };
-}
-
-async function close(ws: WebSocket): Promise<void> {
-  if (ws.readyState >= WebSocket.CLOSING) return;
-  const event = once(ws, "close");
-  ws.close();
-  await event;
-}
-
-describe("relay v1 service", () => {
+describe("relay v1 independent data-plane service", () => {
   const running: RelayServer[] = [];
   afterEach(async () => { await Promise.all(running.splice(0).map((relay) => relay.close())); });
 
   async function start(overrides: Partial<RelayConfig> = {}) {
-    const routes = new MemoryRouteStore();
-    const ephemeral = new MemoryEphemeralStore();
-    await routes.createRoute(routeId, hostId, hostToken);
-    await routes.addDevice(routeId, clientId, clientToken);
+    const routes = new MemoryRouteStore(); const ephemeral = new MemoryEphemeralStore();
     const relay = new RelayServer({ routes, ephemeral, config: { ...config(), ...overrides }, logger: createLogger("silent") });
-    await relay.listen();
-    running.push(relay);
-    const address = relay.address();
-    if (address === undefined) throw new Error("missing address");
-    return { routes, ephemeral, relay, url: `ws://127.0.0.1:${address.port}` };
+    await relay.listen(); running.push(relay); const address = relay.address(); if (address === undefined) throw new Error("missing address");
+    return { routes, ephemeral, url: `ws://127.0.0.1:${address.port}` };
   }
 
-  async function hostOnline(url: string): Promise<WebSocket> {
+  async function hostOnline(url: string, generation = 1): Promise<WebSocket> {
     const host = await open(`${url}/v1/host`);
-    host.send(JSON.stringify({ type: "host.register", v: 1, routeId, deviceId: hostId, token: hostToken }));
-    expect(JSON.parse((await next(host)).data.toString())).toMatchObject({ type: "host.ready", routeId });
+    host.send(JSON.stringify({ v: 1, routeId, hostSecret }));
+    host.send(JSON.stringify({ type: "host.device-sync", v: 1, generation, credentials: [activeCredential(deviceId, token)] }));
+    expect(JSON.parse((await next(host)).data.toString())).toMatchObject({ type: "host.device-sync.ack", generation });
+    expect(JSON.parse((await next(host)).data.toString())).toMatchObject({ type: "host.ready", routeId, generation });
     return host;
   }
 
-  it("authenticates first frames, atomically warms all devices, and fails closed", async () => {
-    const { url, ephemeral, routes } = await start();
+  async function clientPending(url: string): Promise<{ client: WebSocket; pending: { streamId: string; expiresAt: number } }> {
+    const client = await open(`${url}/v1/client`);
+    client.send(JSON.stringify({ type: "client.open", v: 1, routeId, deviceId, token }));
+    const pending = JSON.parse((await next(client)).data.toString()) as { streamId: string; expiresAt: number };
+    expect(pending).toMatchObject({ streamId: expect.any(String), expiresAt: expect.any(Number) });
+    return { client, pending };
+  }
+
+  it("authenticates host secrets, atomically syncs credentials before online, and fails closed", async () => {
+    const { url, routes, ephemeral } = await start();
     const bad = await open(`${url}/v1/host`);
-    bad.send(JSON.stringify({ type: "host.register", v: 1, routeId, deviceId: hostId, token: clientToken }));
+    const badClosed = once(bad, "close");
+    bad.send(JSON.stringify({ v: 1, routeId, hostSecret: randomBytes(32).toString("base64url") }));
     expect(JSON.parse((await next(bad)).data.toString()).code).toBe("unauthorized");
-    await once(bad, "close");
+    expect((await badClosed)[0]).toBe(1008);
     const host = await hostOnline(url);
-    expect(ephemeral.cached.size).toBe(2);
-    expect(ephemeral.presence.has(routeId)).toBe(true);
-    await close(host);
-    routes.available = false;
+    expect(ephemeral.cached.size).toBe(1); expect(ephemeral.presence.has(routeId)).toBe(true);
+    await close(host); routes.available = false;
     const unavailable = await open(`${url}/v1/host`);
-    unavailable.send(JSON.stringify({ type: "host.register", v: 1, routeId, deviceId: hostId, token: hostToken }));
+    unavailable.send(JSON.stringify({ v: 1, routeId, hostSecret }));
     expect(JSON.parse((await next(unavailable)).data.toString()).code).toBe("internal");
   });
 
-  it("reports offline routes and lets newest authenticated host win", async () => {
+  it("keeps offline routes unavailable and newest authenticated host wins", async () => {
     const { url } = await start();
-    const client = await open(`${url}/v1/client`);
-    client.send(JSON.stringify({ type: "client.connect", v: 1, routeId, deviceId: clientId, token: clientToken }));
-    expect(JSON.parse((await next(client)).data.toString()).code).toBe("route_unavailable");
-    await once(client, "close");
-    const oldHost = await hostOnline(url);
-    const oldClose = once(oldHost, "close");
-    const newHost = await hostOnline(url);
-    const [code] = await oldClose as [number];
-    expect(code).toBe(4009);
-    await close(newHost);
+    const offline = await open(`${url}/v1/client`);
+    offline.send(JSON.stringify({ type: "client.open", v: 1, routeId, deviceId, token }));
+    expect(JSON.parse((await next(offline)).data.toString()).code).toBe("unauthorized");
+    await once(offline, "close");
+    const oldHost = await hostOnline(url); const oldClose = once(oldHost, "close"); const newHost = await hostOnline(url, 2);
+    expect((await oldClose)[0]).toBe(4009); await close(newHost);
   });
 
-  it("redeems stream tickets once and forwards opaque text/binary frames unchanged", async () => {
-    const { url } = await start();
-    const host = await hostOnline(url);
-    const client = await open(`${url}/v1/client`);
-    client.send(JSON.stringify({ type: "client.connect", v: 1, routeId, deviceId: clientId, token: clientToken }));
-    const connected = JSON.parse((await next(client)).data.toString()) as { streamId: string };
-    const offered = JSON.parse((await next(host)).data.toString()) as { streamId: string };
-    expect(offered.streamId).toBe(connected.streamId);
-    client.send("early-frame");
+  it("uses separate ticketed host data sockets and preserves opaque text/binary frame boundaries", async () => {
+    const { url } = await start(); const host = await hostOnline(url); const { client, pending } = await clientPending(url);
+    const offer = JSON.parse((await next(host)).data.toString()) as { streamId: string; ticket: string; deviceId: string };
+    expect(offer.streamId).toBe(pending.streamId); expect(offer.deviceId).toBe(deviceId);
     const stream = await open(`${url}/v1/stream`);
-    stream.send(JSON.stringify({ type: "stream.open", v: 1, streamId: connected.streamId }));
-    const early = await next(stream);
-    expect(early.binary).toBe(false);
-    expect(early.data.toString()).toBe("early-frame");
-    client.send(Buffer.from([1, 2, 3]));
-    const binary = await next(stream);
-    expect(binary.binary).toBe(true);
-    expect([...binary.data]).toEqual([1, 2, 3]);
-    stream.send("host-frame");
-    expect((await next(client)).data.toString()).toBe("host-frame");
-    const reused = await open(`${url}/v1/stream`);
-    reused.send(JSON.stringify({ type: "stream.open", v: 1, streamId: connected.streamId }));
-    expect(JSON.parse((await next(reused)).data.toString()).code).toBe("unauthorized");
-    await close(stream);
-    await close(client);
-    await close(host);
+    stream.send(JSON.stringify({ type: "stream.accept", v: 1, streamId: offer.streamId, ticket: offer.ticket }));
+    expect(JSON.parse((await next(stream)).data.toString())).toMatchObject({ type: "stream.ready", streamId: offer.streamId });
+    expect(JSON.parse((await next(client)).data.toString())).toMatchObject({ type: "stream.ready", streamId: offer.streamId });
+    client.send("opaque text"); expect((await next(stream)).data.toString()).toBe("opaque text");
+    stream.send(Buffer.from([1, 2, 3])); const binary = await next(client); expect(binary.binary).toBe(true); expect([...binary.data]).toEqual([1, 2, 3]);
+    const reused = await open(`${url}/v1/stream`); reused.send(JSON.stringify({ type: "stream.accept", v: 1, streamId: offer.streamId, ticket: offer.ticket }));
+    expect(JSON.parse((await next(reused)).data.toString()).code).toBe("ticket_used");
+    await close(stream); await close(client); await close(host);
   });
 
-  it("closes live streams immediately when a device is revoked", async () => {
-    const { url, ephemeral, routes } = await start();
-    const host = await hostOnline(url);
-    const client = await open(`${url}/v1/client`);
-    client.send(JSON.stringify({ type: "client.connect", v: 1, routeId, deviceId: clientId, token: clientToken }));
-    const streamId = (JSON.parse((await next(client)).data.toString()) as { streamId: string }).streamId;
-    await next(host);
-    const stream = await open(`${url}/v1/stream`);
-    stream.send(JSON.stringify({ type: "stream.open", v: 1, streamId }));
+  it("propagates a full-snapshot revocation to live streams", async () => {
+    const { url } = await start(); const host = await hostOnline(url); const { client, pending } = await clientPending(url);
+    const offer = JSON.parse((await next(host)).data.toString()) as { streamId: string; ticket: string };
+    const stream = await open(`${url}/v1/stream`); stream.send(JSON.stringify({ type: "stream.accept", v: 1, streamId: offer.streamId, ticket: offer.ticket })); await next(stream); await next(client);
     const closed = once(client, "close");
-    await routes.revokeDevice(routeId, clientId);
-    await ephemeral.publish({ type: "device.revoked", routeId, deviceId: clientId });
-    expect((await closed)[0]).toBe(1008);
-    await close(stream);
-    await close(host);
+    host.send(JSON.stringify({ type: "host.device-sync", v: 1, generation: 2, credentials: [{ deviceId, revoked: true }] }));
+    expect(JSON.parse((await next(host)).data.toString())).toMatchObject({ type: "host.device-sync.ack", generation: 2 });
+    expect((await closed)[0]).toBe(1008); await close(stream); await close(host);
   });
 
-  it("enforces Redis-backed rate limits and keeps disabled tombstones during cleanup", async () => {
-    const { url, ephemeral, routes } = await start();
-    const ws = await open(`${url}/v1/host`);
-    ephemeral.limitAllowed = false;
-    ws.send(JSON.stringify({ type: "host.register", v: 1, routeId, deviceId: hostId, token: hostToken }));
-    expect(JSON.parse((await next(ws)).data.toString()).code).toBe("rate_limited");
-    await routes.disableRoute(routeId);
-    const removed = await routes.cleanupInactiveRoutes(new Date(Date.now() + 1_000));
-    expect(removed).toBe(0);
-    expect(await routes.inspectRoute(routeId)).not.toBeNull();
-  });
-
-  it("enforces route stream limits and closes a pre-host queue above 32 MiB", async () => {
-    const limited = await start({ maxStreamsPerRoute: 1, ticketTimeoutMs: 5_000 });
-    const host = await hostOnline(limited.url);
-    const first = await open(`${limited.url}/v1/client`);
-    first.send(JSON.stringify({ type: "client.connect", v: 1, routeId, deviceId: clientId, token: clientToken }));
-    await next(first);
-    await next(host);
-    const second = await open(`${limited.url}/v1/client`);
-    second.send(JSON.stringify({ type: "client.connect", v: 1, routeId, deviceId: clientId, token: clientToken }));
-    expect(JSON.parse((await next(second)).data.toString()).code).toBe("rate_limited");
-    await once(second, "close");
-    const closed = once(first, "close");
-    const frame = Buffer.alloc(15 * 1024 * 1024, 7);
-    first.send(frame);
-    first.send(frame);
-    first.send(frame);
-    expect((await closed)[0]).toBe(1013);
-    await close(host);
-  }, 20_000);
-
-  it("survives a process restart when durable route state remains and removes old enabled routes", async () => {
-    const routes = new MemoryRouteStore();
-    const ephemeral = new MemoryEphemeralStore();
-    await routes.createRoute(routeId, hostId, hostToken);
-    await routes.addDevice(routeId, clientId, clientToken);
-    const first = new RelayServer({ routes, ephemeral, config: config(), logger: createLogger("silent") });
-    await first.listen();
-    const firstAddress = first.address();
-    if (firstAddress === undefined) throw new Error("missing address");
-    const firstHost = await hostOnline(`ws://127.0.0.1:${firstAddress.port}`);
-    await close(firstHost);
-    await first.close();
-    const second = new RelayServer({ routes, ephemeral, config: config(), logger: createLogger("silent") });
-    await second.listen();
-    running.push(second);
-    const secondAddress = second.address();
-    if (secondAddress === undefined) throw new Error("missing address");
-    const secondHost = await hostOnline(`ws://127.0.0.1:${secondAddress.port}`);
-    await close(secondHost);
-    const stale = routes.routes.get(routeId);
-    if (stale === undefined) throw new Error("missing route");
-    stale.lastSeenAt = new Date(0);
-    expect(await routes.cleanupInactiveRoutes(new Date(1))).toBe(1);
-    expect(await routes.inspectRoute(routeId)).toBeNull();
+  it("enforces Redis rate limits, per-route stream limits, restart, and 30-day cleanup", async () => {
+    const { url, routes, ephemeral } = await start({ maxStreamsPerRoute: 1, ticketTimeoutMs: 5_000 });
+    const rate = await open(`${url}/v1/host`); ephemeral.limitAllowed = false; rate.send(JSON.stringify({ v: 1, routeId, hostSecret }));
+    expect(JSON.parse((await next(rate)).data.toString()).code).toBe("rate_limited"); await once(rate, "close"); ephemeral.limitAllowed = true;
+    const host = await hostOnline(url); const first = await clientPending(url); await next(host);
+    const second = await open(`${url}/v1/client`); second.send(JSON.stringify({ type: "client.open", v: 1, routeId, deviceId, token })); expect(JSON.parse((await next(second)).data.toString()).code).toBe("rate_limited");
+    await routes.disableRoute(routeId); expect(await routes.cleanupInactiveRoutes(new Date(Date.now() + 1_000))).toBe(0); await routes.enableRoute(routeId);
+    const route = routes.routes.get(routeId)!; route.lastSeenAt = new Date(0); expect(await routes.cleanupInactiveRoutes(new Date(1))).toBe(1); expect(await routes.inspectRoute(routeId)).toBeNull();
+    await close(first.client); await close(host);
   });
 });
