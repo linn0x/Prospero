@@ -69,12 +69,24 @@ describe("会话内 prospero CLI", () => {
     ]) as { id: string; runId: string };
     expect(task.runId).toBe(run.id);
 
-    const snapshot = await cli(server.controlSocket.path, server.controlSocket.tokenPath, ["status"]) as {
-      runs: Record<string, unknown>;
-      tasks: Record<string, unknown>;
+    const compact = await cli(server.controlSocket.path, server.controlSocket.tokenPath, [
+      "status", "--run", run.id,
+    ]) as {
+      run: { id: string };
+      taskCounts: { pending: number; ready: number };
+      readyTasks: Array<{ id: string }>;
     };
-    expect(snapshot.runs[run.id]).toBeDefined();
-    expect(snapshot.tasks[task.id]).toBeDefined();
+    expect(compact.run.id).toBe(run.id);
+    expect(compact.taskCounts).toMatchObject({ pending: 1, ready: 1 });
+    expect(compact.readyTasks).toEqual([expect.objectContaining({ id: task.id })]);
+    expect(JSON.stringify(compact)).not.toContain("写一条测试");
+
+    const raw = await cli(server.controlSocket.path, server.controlSocket.tokenPath, ["status", "--json"]) as {
+      runs: Record<string, unknown>;
+      tasks: Record<string, { spec: string }>;
+    };
+    expect(raw.runs[run.id]).toBeDefined();
+    expect(raw.tasks[task.id]?.spec).toBe("写一条测试");
 
     await server.close();
     servers.splice(servers.indexOf(server), 1);
@@ -134,6 +146,80 @@ describe("会话内 prospero CLI", () => {
       "worker", "start", "--task", "task-2", "--agent", "codex",
     ], "coord") as { params: Record<string, unknown> };
     expect(withoutOperationId.params).not.toHaveProperty("operationId");
+  });
+
+  it("status 按当前会话优先选择 active Run，并支持 --all 与空态提示", async () => {
+    const home = tempHome();
+    const server = await createDaemonServer({ home, port: 0 });
+    servers.push(server);
+
+    const history = await cli(server.controlSocket.path, server.controlSocket.tokenPath, [
+      "run", "create", "--objective", "历史 Run",
+    ], "coord") as { id: string };
+    await cli(server.controlSocket.path, server.controlSocket.tokenPath, [
+      "run", "complete", "--id", history.id,
+    ], "coord");
+    const active = await cli(server.controlSocket.path, server.controlSocket.tokenPath, [
+      "run", "create", "--objective", "当前 Run",
+    ], "coord") as { id: string };
+
+    const selected = await cli(server.controlSocket.path, server.controlSocket.tokenPath, ["status"], "coord") as {
+      run: { id: string; status: string };
+    };
+    expect(selected.run).toMatchObject({ id: active.id, status: "active" });
+
+    const all = await cli(server.controlSocket.path, server.controlSocket.tokenPath, ["status", "--all"], "coord") as {
+      runs: Array<{ id: string }>;
+    };
+    expect(all.runs.map((run) => run.id)).toEqual(expect.arrayContaining([history.id, active.id]));
+
+    const empty = await cli(server.controlSocket.path, server.controlSocket.tokenPath, ["status"], "other") as {
+      run: null;
+      hint: string;
+      nextActions: Array<{ command: string }>;
+    };
+    expect(empty).toMatchObject({ run: null });
+    expect(empty.hint).toContain("没有关联 Run");
+    expect(empty.nextActions).toEqual(expect.arrayContaining([
+      expect.objectContaining({ command: "prospero status --all" }),
+    ]));
+  });
+
+  it("task 恢复命令和 worker.stop 转发 reason、operationId 与当前会话", async () => {
+    const control = await startControlSocket({
+      home: tempHome(),
+      token: "secret",
+      handle: (method, params) => ({ method, params }),
+    });
+    servers.push(control);
+
+    const retry = await cli(control.path, control.tokenPath, [
+      "task", "retry", "--id", "task-failed", "--operation-id", "retry-1",
+    ], "coord") as { method: string; params: Record<string, unknown> };
+    expect(retry).toMatchObject({
+      method: "task.retry",
+      params: { taskId: "task-failed", operationId: "retry-1", actorSessionId: "coord" },
+    });
+
+    const cancel = await cli(control.path, control.tokenPath, [
+      "task", "cancel", "--id", "task-pending", "--reason", "范围变更", "--operation-id", "cancel-1",
+    ], "coord") as { method: string; params: Record<string, unknown> };
+    expect(cancel).toMatchObject({
+      method: "task.cancel",
+      params: {
+        taskId: "task-pending", reason: "范围变更", operationId: "cancel-1", actorSessionId: "coord",
+      },
+    });
+
+    const stop = await cli(control.path, control.tokenPath, [
+      "worker", "stop", "--task", "task-running", "--reason", "人工接管", "--operation-id", "stop-1",
+    ], "coord") as { method: string; params: Record<string, unknown> };
+    expect(stop).toMatchObject({
+      method: "worker.stop",
+      params: {
+        taskId: "task-running", reason: "人工接管", operationId: "stop-1", actorSessionId: "coord",
+      },
+    });
   });
 });
 
