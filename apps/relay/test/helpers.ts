@@ -1,4 +1,4 @@
-import { credentialDigest, equalCredentialDigest } from "../src/crypto.js";
+import { credentialDigest, equalCredentialDigest, streamTicketStorageKey } from "../src/crypto.js";
 import { SnapshotGenerationError, snapshotEquals, type EphemeralStore, type RouteStore, type SnapshotCredential, type TicketRedemption } from "../src/store.js";
 import type { AuthenticatedDevice, DeviceRecord, RelayEvent, RouteInspection, RouteRecord, RouteSnapshot, StreamTicket } from "../src/types.js";
 
@@ -40,22 +40,22 @@ export class MemoryRouteStore implements RouteStore {
 export class MemoryEphemeralStore implements EphemeralStore {
   available = true; limitAllowed = true;
   readonly cached = new Map<string, { device: DeviceRecord; disabledAt: Date | null }>();
-  readonly presence = new Map<string, string>(); readonly tickets = new Map<string, StreamTicket>(); readonly ticketStates = new Map<string, "active" | "used" | "expired" | "invalid">(); readonly leases = new Map<string, Map<string, number>>(); readonly listeners = new Set<(event: RelayEvent) => void>();
+  readonly presence = new Map<string, string>(); readonly tickets = new Map<string, Omit<StreamTicket, "ticket">>(); readonly ticketStates = new Map<string, "active" | "used" | "expired" | "invalid">(); readonly leases = new Map<string, Map<string, number>>(); readonly listeners = new Set<(event: RelayEvent) => void>();
   private ensure(): void { if (!this.available) throw new Error("redis unavailable"); }
   async ping(): Promise<void> { this.ensure(); } async close(): Promise<void> {}
   async cacheCredential(device: DeviceRecord, disabledAt: Date | null, _ttl: number): Promise<void> { this.ensure(); this.cached.set(`${device.routeId}:${device.deviceId}`, { device: cloneDevice(device), disabledAt: copyDate(disabledAt) }); }
   async getCachedCredential(routeId: string, deviceId: string): Promise<{ device: DeviceRecord; disabledAt: Date | null } | null> { this.ensure(); const item = this.cached.get(`${routeId}:${deviceId}`); return item === undefined ? null : { device: cloneDevice(item.device), disabledAt: copyDate(item.disabledAt) }; }
   async setPresence(routeId: string, connectionId: string, _ttl: number): Promise<void> { this.ensure(); this.presence.set(routeId, connectionId); }
   async clearPresence(routeId: string, connectionId: string): Promise<void> { this.ensure(); if (this.presence.get(routeId) === connectionId) this.presence.delete(routeId); }
-  async createTicket(ticket: StreamTicket): Promise<void> { this.ensure(); if (ticket.expiresAt <= Date.now() || this.tickets.has(ticket.ticket) || this.ticketStates.has(ticket.ticket)) throw new Error("collision or expired ticket"); this.tickets.set(ticket.ticket, { ...ticket }); this.ticketStates.set(ticket.ticket, "active"); }
+  async createTicket(ticket: StreamTicket): Promise<void> { this.ensure(); const key = streamTicketStorageKey(ticket.ticket); if (ticket.expiresAt <= Date.now() || this.tickets.has(key) || this.ticketStates.has(key)) throw new Error("collision or expired ticket"); const { ticket: _ticket, ...stored } = ticket; this.tickets.set(key, stored); this.ticketStates.set(key, "active"); }
   async redeemTicket(ticket: string, streamId: string): Promise<TicketRedemption> {
-    this.ensure(); const value = this.tickets.get(ticket);
-    if (value === undefined) { const state = this.ticketStates.get(ticket); if (state === "used") return { status: "used" }; if (state === "active" || state === "expired") { this.ticketStates.set(ticket, "expired"); return { status: "expired" }; } return { status: "invalid" }; }
+    this.ensure(); const key = streamTicketStorageKey(ticket); const value = this.tickets.get(key);
+    if (value === undefined) { const state = this.ticketStates.get(key); if (state === "used") return { status: "used" }; if (state === "active" || state === "expired") { this.ticketStates.set(key, "expired"); return { status: "expired" }; } return { status: "invalid" }; }
     if (value.streamId !== streamId) return { status: "invalid" };
-    if (value.expiresAt <= Date.now()) { this.tickets.delete(ticket); this.ticketStates.set(ticket, "expired"); return { status: "expired" }; }
-    this.tickets.delete(ticket); this.ticketStates.set(ticket, "used"); return { status: "ok", ticket: { ...value } };
+    if (value.expiresAt <= Date.now()) { this.tickets.delete(key); this.ticketStates.set(key, "expired"); return { status: "expired" }; }
+    this.tickets.delete(key); this.ticketStates.set(key, "used"); return { status: "ok", ticket: { ...value, ticket } };
   }
-  async invalidateTicket(ticket: string): Promise<void> { this.ensure(); this.tickets.delete(ticket); this.ticketStates.set(ticket, "invalid"); }
+  async invalidateTicket(ticket: string): Promise<void> { this.ensure(); const key = streamTicketStorageKey(ticket); this.tickets.delete(key); this.ticketStates.set(key, "invalid"); }
   private pruneLeases(routeId: string): Map<string, number> { const leases = this.leases.get(routeId) ?? new Map<string, number>(); const now = Date.now(); for (const [id, expiresAt] of leases) if (expiresAt <= now) leases.delete(id); if (leases.size > 0) this.leases.set(routeId, leases); else this.leases.delete(routeId); return leases; }
   async acquireStreamLease(routeId: string, leaseId: string, limit: number, ttlMs: number): Promise<boolean> { this.ensure(); const leases = this.pruneLeases(routeId); if (!leases.has(leaseId) && leases.size >= limit) return false; leases.set(leaseId, Date.now() + ttlMs); this.leases.set(routeId, leases); return true; }
   async renewStreamLease(routeId: string, leaseId: string, ttlMs: number): Promise<boolean> { this.ensure(); const leases = this.pruneLeases(routeId); if (!leases.has(leaseId)) return false; leases.set(leaseId, Date.now() + ttlMs); return true; }

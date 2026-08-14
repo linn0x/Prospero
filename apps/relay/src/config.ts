@@ -1,4 +1,5 @@
 import { resolve } from "node:path";
+import { isIP } from "node:net";
 
 function integer(env: NodeJS.ProcessEnv, name: string, fallback: number, min: number, max: number): number {
   const source = env[name];
@@ -18,6 +19,16 @@ function bool(env: NodeJS.ProcessEnv, name: string, fallback: boolean): boolean 
   throw new Error(`${name} must be true or false`);
 }
 
+function ipList(env: NodeJS.ProcessEnv, name: string): string[] {
+  const source = env[name];
+  if (source === undefined || source.trim() === "") return [];
+  const values = source.split(",").map((value) => value.trim());
+  if (values.some((value) => value === "" || isIP(value) === 0)) {
+    throw new Error(`${name} must be a comma-separated list of IP addresses`);
+  }
+  return [...new Set(values.map((value) => value.replace(/^::ffff:/, "")))];
+}
+
 export interface RelayConfig {
   host: string;
   port: number;
@@ -35,6 +46,8 @@ export interface RelayConfig {
   connectionRatePerMinute: number;
   cleanupIntervalMs: number;
   logLevel: string;
+  /** Exact proxy source addresses permitted to supply the sanitized client IP header. */
+  trustedProxyIps?: readonly string[];
 }
 
 export function readConfig(env: NodeJS.ProcessEnv = process.env): RelayConfig {
@@ -62,5 +75,6 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): RelayConfig {
       connectionRatePerMinute: integer(env, "CONNECTION_RATE_PER_MINUTE", 60, 1, 10_000),
       cleanupIntervalMs: integer(env, "CLEANUP_INTERVAL_MS", 3_600_000, 60_000, 86_400_000),
       logLevel: env.LOG_LEVEL ?? "info",
+      trustedProxyIps: ipList(env, "RELAY_TRUSTED_PROXY_IPS"),
     };
 }

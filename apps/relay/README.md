@@ -6,6 +6,32 @@ never decrypts, parses, transforms, compresses, or reframes application
 payloads on `/v1/client` or `/v1/stream`. Text/binary WebSocket frame boundaries
 are forwarded one for one.
 
+## Security and deployment boundary
+
+The relay does not persist an E2E pairing token, host secret, device relay
+credential, one-time stream ticket, or application plaintext. MySQL stores the
+domain-separated device credential digest only. Redis caches that digest and
+uses a separate domain-separated hash as the key for a stream ticket; its AOF
+and RDB values omit the raw ticket. Relay logs redact credential-shaped fields,
+and metrics carry only bounded endpoint/reason/direction labels.
+
+The supplied Compose deployment places MySQL, Redis, and relay on an internal
+network. Relay trusts the sanitized client-IP header only from Caddy's fixed
+backend IP; Caddy deletes public forwarding headers before setting it. Relay
+also runs with core dumps disabled, a read-only filesystem, no Linux
+capabilities, a bounded PID count, and a small temporary filesystem. Retain
+these controls if deploying without the supplied Compose file (`ulimit -c 0`
+before starting Node is required).
+
+There is deliberately no Origin allowlist. Native mobile and daemon WebSocket
+clients commonly omit `Origin`, so requiring it would break the supported
+non-browser transport. The relay accepts no cookie or URL credential and
+requires the bounded, schema-validated first control frame with an explicit
+bearer credential. Browser Origin is therefore not an authentication decision;
+an untrusted browser without that credential cannot open a stream. Deployments
+that add a browser UI may layer a same-origin policy at Caddy, but must not
+substitute it for first-message authentication.
+
 ## Run
 
 Copy `.env.example` to `.env`, point `RELAY_DOMAIN` at this server, then run:
