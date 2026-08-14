@@ -21,13 +21,22 @@
   `completeRun` 入口收口。
 - 一个 Run 只有在 Task、活动 Dispatch 和待决 Gate 都已结算时才能完成；`completed` 与
   `abandoned` 均为只读历史。停止、取消、重试会先暂停自动 Run，不能与队列推进竞态。
-- 同一 `operationId` 以方法和 payload 指纹绑定，运行中请求共享 promise，完成记录随
-  `orchestration.json` 落盘。重试不会重复建 Run/图/worker；用同一 id 改参数返回冲突。
+- **只有调用方提供相同的** `operationId` 时，才以方法和 payload 指纹绑定：运行中请求共享
+  promise，完成记录随 `orchestration.json` 落盘；同一 id 改参数返回冲突。未提供 id 的调用不作
+  通用去重，不能把“任意重试都幂等”当作约定。`prospero worker start` 的
+  `--operation-id` 是可选的：遇到不确定请求是否送达时，调用方须以**同一个** id 重试；Task
+  失败后先 `task retry` 再派发是新的逻辑操作，必须使用新的 id（或省略该选项），不能按 Task ID
+  自动派生并永久复用 operationId。
 
 ### 启动恢复与旧状态
 
-daemon 启动顺序不可调换：先恢复 SessionManager，再调用
-`DispatchService.reconcilePersistedSessions()`，最后才恢复自动队列和 coordinator 首提示。
+daemon 启动顺序不可调换：control socket 就绪后先恢复 SessionManager，再调用
+`DispatchService.reconcilePersistedSessions()`，最后才恢复自动队列和 coordinator 首提示。对每个
+结构化 worker，`restoreStructured()` 有两道针对已结算 Dispatch 的封存闸门：第一道在
+`adapter.start()` **之前**即时读取 Store，已结算便只恢复审计历史、绝不接回原生会话；第二道在
+`adapter.start()` 返回后、`drainQueue()` 之前重新读取 Store，若此窗口内收到了 `task.done` /
+`task.fail`，同步封存并阻止旧队列发送。随后 `reconcilePersistedSessions()` 才作为兜底，对账
+消失、已终态或仍存活但已交付的会话，不能替代前两道闸门。
 活动 Dispatch 找不到会话、或会话已终态但没有显式交付时，原子收敛为
 `abandoned + failed` 并保留原因；存活的 `starting` 恢复为 `running`，不会重复派发。
 已落盘为 `succeeded`/`failed` 却仍活着的 worker 会被停止并保留会话历史，防止重启后继续
@@ -48,11 +57,18 @@ daemon 启动顺序不可调换：先恢复 SessionManager，再调用
 - worker / coordinator CLI：
 
   ```bash
+  prospero worker start --task TASK_ID --agent codex --worktree new \
+    [--operation-id RETRY_ID]
   prospero worktree list [--run RUN_ID]
   prospero worktree inspect --id WT_ASSET_ID --target main
   prospero worktree cleanup --id WT_ASSET_ID --target main \
     --operation-id UNIQUE_ID --confirm
   ```
+
+  control socket 的普通短 RPC 默认等待 15 秒。只有 `worker.start` 使用命令级 5 分钟上限，
+  给 esaytree CoW（或 CoW 不可用时的依赖复制）和 agent session 创建完成后再返回；这不是无限
+  等待，也不改变 `task.done`、`worktree.inspect` 等短 RPC 的 15 秒窗口。`check --wait` /
+  `ask` 的显式长等待仍是各自的无超时语义，不适用该命令级上限。
 
 - 手机和 Mac 都将 active Run 与 completed/abandoned 历史分组、折叠历史；待决 Gate 优先进入
   紧凑概览。两端都有进入编排详情、解开 Gate、停止 worker、取消 pending/blocked、重试 failed

@@ -4,12 +4,14 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  DEFAULT_CONTROL_REQUEST_TIMEOUT_MS,
   controlSocketPath,
   controlRequest,
   ControlSocketError,
   startControlSocket,
   type ControlSocketServer,
 } from "../src/control-socket.js";
+import { controlRequestTimeoutFor } from "../src/orchestration-cli-timeouts.js";
 
 const homes: string[] = [];
 const servers: ControlSocketServer[] = [];
@@ -96,6 +98,33 @@ describe("control socket", () => {
     servers.push(server);
     await expect(controlRequest({ socketPath: server.path, token: "secret" }, "worker.start"))
       .rejects.toMatchObject({ code: "task_not_ready", message: "不能派发" });
+  });
+
+  it("慢 worker.start 越过短 RPC 窗口仍会收到响应，短 RPC 仍在原窗口超时", async () => {
+    const server = await startControlSocket({
+      home: home(),
+      token: "secret",
+      handle: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        return "完成";
+      },
+    });
+    servers.push(server);
+    // 用缩短后的等比策略复现 15 秒窗口后的响应，不让回归测试实际等待数分钟。
+    const timeouts = { defaultTimeoutMs: 10, workerStartTimeoutMs: 1_000 };
+
+    await expect(controlRequest(
+      { socketPath: server.path, token: "secret", timeoutMs: controlRequestTimeoutFor("worker.start", timeouts) },
+      "worker.start",
+    )).resolves.toBe("完成");
+    await expect(controlRequest(
+      { socketPath: server.path, token: "secret", timeoutMs: controlRequestTimeoutFor("task.done", timeouts) },
+      "task.done",
+    )).rejects.toMatchObject({
+      code: "timeout",
+      message: "等待 daemon 控制响应超时",
+    });
+    expect(DEFAULT_CONTROL_REQUEST_TIMEOUT_MS).toBe(15_000);
   });
 
   it("不会把同名普通文件当作陈旧 socket 删除", async () => {

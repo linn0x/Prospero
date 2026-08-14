@@ -4,11 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
+import { startControlSocket, type ControlSocketServer } from "../src/control-socket.js";
 import { createDaemonServer, type DaemonServer } from "../src/ws-server.js";
 
 const exec = promisify(execFile);
 const homes: string[] = [];
-const servers: DaemonServer[] = [];
+const servers: Array<DaemonServer | ControlSocketServer> = [];
 const prosperoBin = process.platform === "win32"
   ? process.execPath
   : path.resolve("bin/prospero");
@@ -111,6 +112,28 @@ describe("会话内 prospero CLI", () => {
       ask: { id: ask.id },
       reply: { id: reply.id, body: "选 B" },
     });
+  });
+
+  it("worker.start 只在调用方给出时转发 operationId", async () => {
+    const control = await startControlSocket({
+      home: tempHome(),
+      token: "secret",
+      handle: (method, params) => ({ method, params }),
+    });
+    servers.push(control);
+
+    const withOperationId = await cli(control.path, control.tokenPath, [
+      "worker", "start", "--task", "task-1", "--agent", "codex", "--operation-id", "start-attempt-1",
+    ], "coord") as { method: string; params: Record<string, unknown> };
+    expect(withOperationId).toMatchObject({
+      method: "worker.start",
+      params: { taskId: "task-1", operationId: "start-attempt-1", actorSessionId: "coord" },
+    });
+
+    const withoutOperationId = await cli(control.path, control.tokenPath, [
+      "worker", "start", "--task", "task-2", "--agent", "codex",
+    ], "coord") as { params: Record<string, unknown> };
+    expect(withoutOperationId.params).not.toHaveProperty("operationId");
   });
 });
 
