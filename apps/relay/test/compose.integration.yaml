@@ -20,3 +20,40 @@ services:
       interval: 3s
       timeout: 3s
       retries: 30
+  migrate:
+    build:
+      context: ../../..
+      dockerfile: apps/relay/Dockerfile
+    command: ["node", "dist/migrate.js"]
+    working_dir: /srv/prospero/apps/relay
+    environment:
+      MYSQL_URL: mysql://prospero:integration-password@mysql:3306/prospero_relay_test
+      REDIS_URL: redis://redis:6379
+      MIGRATIONS_DIR: /srv/prospero/apps/relay/migrations
+    depends_on:
+      mysql:
+        condition: service_healthy
+  relay:
+    build:
+      context: ../../..
+      dockerfile: apps/relay/Dockerfile
+    environment:
+      RELAY_HOST: 0.0.0.0
+      RELAY_PORT: 8787
+      MYSQL_URL: mysql://prospero:integration-password@mysql:3306/prospero_relay_test
+      REDIS_URL: redis://redis:6379
+      METRICS_INTERNAL_ONLY: "true"
+      LOG_LEVEL: silent
+    ports: ["38787:8787"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
