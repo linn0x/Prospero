@@ -72,13 +72,20 @@ direct-only until re-paired. The full compatibility matrix is in
   --quiet`. The relay production dependency audit is zero vulnerabilities.
   The root production audit has 23 findings (9 moderate, 14 high, 0 critical)
   in the Expo/Metro/React Native chain and is not waived by the relay result.
-- A current Docker integration rebuild was attempted twice but could not be
-  completed because Docker Hub metadata resolution hit a TLS handshake timeout;
-  a subsequent dependency-layer retry made no progress and was stopped. No
-  test containers were left behind. Thus this release does **not** claim a
-  fresh T10 Docker integration/E2E or load-smoke pass; use the committed T7
-  real-process E2E evidence only as prior evidence, then rerun these checks
-  once registry access is healthy.
+- Fresh local Docker verification completed on the final source: the fixed
+  digest for `node:22.14.0-alpine3.21` was pulled, and the production
+  `apps/relay/Dockerfile` built successfully as `prospero-relay:t10-verify`.
+  `npm run test:integration --workspace @prospero/relay` passed (1/1), as did
+  `npm run test:e2e --workspace @prospero/relay` (1/1), including direct,
+  relay, and auto paths plus relay forwarding of opaque E2E traffic.
+- An isolated `prospero-t10-smoke` Docker project passed a 250 host-control /
+  50 active-pair / 30-second smoke: all requested connections established,
+  there were no unexpected disconnects, 1,000/1,000 host heartbeats were
+  acknowledged, and each direction drained exactly 45,495,600 bytes with zero
+  integrity failures. Its local report
+  `/tmp/prospero-t10-load-smoke.json` contains desensitized aggregate counters
+  only; the dedicated project's containers, volumes, and network were removed
+  after the run.
 - No Gitleaks-compatible executable is installed locally. A tracked-file
   high-confidence private-key/cloud-token heuristic had no matches; this is a
   fallback, not a replacement for the mandatory CI Gitleaks-or-equivalent scan
@@ -87,18 +94,21 @@ direct-only until re-paired. The full compatibility matrix is in
 | Area | Evidence | Status |
 | --- | --- | --- |
 | Relay security | [T7 audit](relay-security-audit.md), adversarial unit/integration/E2E coverage | Completed; see audit for boundaries and supply-chain residual risks. |
+| Fresh local Docker verification | Production image `prospero-relay:t10-verify`; Docker integration and E2E tests (1/1 each); isolated 250/50/30-second smoke | Passed at this local test scope; not a capacity qualification or public-deployment proof. |
 | Capacity and reliability | `apps/relay/reports/t8-acceptance-summary.json`, `t8-local-failure.json`, per-scale reports, and bench harness | **Inconclusive/waived**; not a 5k/1k/600s pass. |
 | Client QA | [T9 cross-platform matrix](qa/t9-cross-platform-qa.md) | Completed on simulators and macOS shell; no physical mobile-device coverage. |
 | Public deployment | Operator runbook and static Compose/Caddy configuration | Not performed or claimed; public DNS, TLS/WSS, and firewall checks remain operator work. |
 
-The waived T8 evidence was obtained on a Docker host with 10 vCPU and 11.7 GiB
-of memory, below the 16 GiB target. It passed 2,500 host controls / 500 active
-pairs / 60 seconds, but the 5,000 / 1,000 / 60-second execution recorded 174
-unexpected disconnects and incomplete drain callbacks. There is no successful
-5,000 host / 1,000 active stream-pair / 600-second result, no 16 GiB
-qualification, no same-environment direct RTT baseline, and no public
-DNS/TLS/WSS validation. These are release blockers for any claim beyond the
-documented waiver, not passing criteria.
+The fresh reduced smoke has execution status `passed`, but its qualification
+status remains `inconclusive`: it is not the T8 target. The waived T8 evidence
+was obtained on a Docker host with 10 vCPU and 11.7 GiB of memory, below the
+16 GiB target. It passed 2,500 host controls / 500 active pairs / 60 seconds,
+but the 5,000 / 1,000 / 60-second execution recorded 174 unexpected
+disconnects and incomplete drain callbacks. There is no successful 5,000 host
+/ 1,000 active stream-pair / 600-second result, no 16 GiB qualification, no
+same-environment direct RTT baseline, and no public DNS/TLS/WSS validation.
+These remain inconclusive/waived release boundaries—not passing criteria—and
+no real public deployment has been performed or claimed.
 
 Remaining risks include relay-visible metadata and denial of service by a
 malicious or unavailable relay; no physical iOS/Android validation; no safe
