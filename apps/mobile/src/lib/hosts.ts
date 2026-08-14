@@ -144,17 +144,21 @@ export async function getHosts({ migrate = true }: GetHostsOptions = {}): Promis
       try {
         token = await SecureStore.getItemAsync(hostTokenKey(persisted.id), SECURE_OPTIONS);
         if (!token && legacyToken) {
-          await SecureStore.setItemAsync(hostTokenKey(persisted.id), legacyToken, SECURE_OPTIONS);
+          if (migrate) {
+            await SecureStore.setItemAsync(hostTokenKey(persisted.id), legacyToken, SECURE_OPTIONS);
+          }
           token = legacyToken;
         }
         if (metadata) {
           relayToken = await SecureStore.getItemAsync(relayTokenKey(persisted.id), SECURE_OPTIONS);
           if (!relayToken && legacyRelayToken) {
-            await SecureStore.setItemAsync(
-              relayTokenKey(persisted.id),
-              legacyRelayToken,
-              SECURE_OPTIONS,
-            );
+            if (migrate) {
+              await SecureStore.setItemAsync(
+                relayTokenKey(persisted.id),
+                legacyRelayToken,
+                SECURE_OPTIONS,
+              );
+            }
             relayToken = legacyRelayToken;
           }
         }

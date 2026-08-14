@@ -25,6 +25,7 @@ import * as SecureStore from "expo-secure-store";
 import {
   getDeviceKeys,
   getHosts,
+  hostIdFor,
   RelayCredentialsMissingError,
   removeHost,
   setHostConnectionMode,
@@ -437,6 +438,91 @@ describe("配对凭据安全迁移", () => {
       relay: {
         routeId: firstPairing.relay.routeId,
         deviceId: firstPairing.relay.deviceId,
+      },
+    });
+  });
+
+  it("只读预检不会迁移旧 relay 凭证，且拒绝 direct-only QR 后完整保留旧状态", async () => {
+    const pubKey = generateKeyPairB64().publicKey;
+    const legacyHost = {
+      id: hostIdFor(pubKey),
+      name: "MacBook",
+      addrs: [],
+      port: 7423,
+      token: "0123456789abcdef",
+      daemonPub: pubKey,
+      pairedAt: 1,
+      connectionMode: "relay" as const,
+      relay: {
+        url: "wss://relay.example.com/v1",
+        routeId: "route_0123456789",
+        deviceId: "device_0123456789",
+        token: "relay_token_0123456789",
+      },
+    };
+    const oldMetadata = JSON.stringify([legacyHost]);
+    storage.set(HOSTS_KEY, oldMetadata);
+
+    vi.mocked(AsyncStorage.setItem).mockClear();
+    vi.mocked(AsyncStorage.removeItem).mockClear();
+    vi.mocked(SecureStore.setItemAsync).mockClear();
+    vi.mocked(SecureStore.deleteItemAsync).mockClear();
+
+    await expect(upsertHostFromPairing({
+      ...directPairing(pubKey),
+      token: "fedcba9876543210",
+    })).rejects.toBeInstanceOf(RelayCredentialsMissingError);
+
+    expect(AsyncStorage.setItem).not.toHaveBeenCalled();
+    expect(AsyncStorage.removeItem).not.toHaveBeenCalled();
+    expect(SecureStore.setItemAsync).not.toHaveBeenCalled();
+    expect(SecureStore.deleteItemAsync).not.toHaveBeenCalled();
+    expect(storage.get(HOSTS_KEY)).toBe(oldMetadata);
+    expect(secrets).toEqual(new Map());
+    expect(JSON.parse(storage.get(HOSTS_KEY) ?? "[]")[0]).toEqual(legacyHost);
+  });
+
+  it("默认 getHosts 仍迁移旧 relay 凭证", async () => {
+    const pubKey = generateKeyPairB64().publicKey;
+    const id = hostIdFor(pubKey);
+    storage.set(HOSTS_KEY, JSON.stringify([{
+      id,
+      name: "MacBook",
+      addrs: [],
+      port: 7423,
+      token: "0123456789abcdef",
+      daemonPub: pubKey,
+      pairedAt: 1,
+      connectionMode: "relay",
+      relay: {
+        url: "wss://relay.example.com/v1",
+        routeId: "route_0123456789",
+        deviceId: "device_0123456789",
+        token: "relay_token_0123456789",
+      },
+    }]));
+
+    const hosts = await getHosts();
+
+    expect(hosts[0]).toMatchObject({
+      connectionMode: "relay",
+      token: "0123456789abcdef",
+      relayToken: "relay_token_0123456789",
+    });
+    expect(secrets.get(relaySecretKeys(id).e2e)).toBe("0123456789abcdef");
+    expect(secrets.get(relaySecretKeys(id).relay)).toBe("relay_token_0123456789");
+    expect(JSON.parse(storage.get(HOSTS_KEY) ?? "[]")[0]).toEqual({
+      id,
+      name: "MacBook",
+      addrs: [],
+      port: 7423,
+      daemonPub: pubKey,
+      pairedAt: 1,
+      connectionMode: "relay",
+      relay: {
+        url: "wss://relay.example.com/v1",
+        routeId: "route_0123456789",
+        deviceId: "device_0123456789",
       },
     });
   });
