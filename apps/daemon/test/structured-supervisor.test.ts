@@ -5,7 +5,11 @@ import { once } from "node:events";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import type { SupervisorEvent } from "../src/structured-supervisor.js";
+import {
+  SUPERVISOR_PROTOCOL_VERSION,
+  startStructuredSupervisor,
+  type SupervisorEvent,
+} from "../src/structured-supervisor.js";
 
 const homes: string[] = [];
 const children: ChildProcess[] = [];
@@ -50,7 +54,11 @@ class SupervisorClient {
     return new SupervisorClient(socket, token);
   }
 
-  request<T>(method: string, params: Record<string, unknown>): Promise<T> {
+  request<T>(
+    method: string,
+    params: Record<string, unknown>,
+    version = SUPERVISOR_PROTOCOL_VERSION,
+  ): Promise<T> {
     const id = this.nextId++;
     const response = new Promise<T>((resolve, reject) => {
       this.waiting.set(id, {
@@ -58,7 +66,7 @@ class SupervisorClient {
         reject,
       });
     });
-    this.socket.write(`${JSON.stringify({ id, method, params, token: this.token })}\n`);
+    this.socket.write(`${JSON.stringify({ version, id, method, params, token: this.token })}\n`);
     return response;
   }
 
@@ -80,6 +88,10 @@ class SupervisorClient {
       this.buffer = this.buffer.slice(newline + 1);
       if (!line) continue;
       const message = JSON.parse(line) as Record<string, unknown>;
+      if (message["version"] !== SUPERVISOR_PROTOCOL_VERSION) {
+        this.rejectAll(new Error("unexpected supervisor protocol version"));
+        return;
+      }
       if (message["method"] === "session.event") {
         this.events.push(message["params"] as SupervisorEvent);
         continue;
@@ -183,5 +195,22 @@ describe("structured supervisor transport", () => {
       .resolves.toEqual({ status: "killed", lastSeq: 1 });
     expect(client.events).toEqual([]);
     client.close();
+  });
+
+  it("rejects an incompatible protocol version and will not unlink a live supervisor socket", async () => {
+    const home = tempHome();
+    const incumbent = await startStructuredSupervisor({ home });
+    try {
+      const client = await SupervisorClient.connect(incumbent.socketPath, incumbent.token);
+      await expect(
+        client.request("session.status", { sessionId: "fake-long-turn" }, SUPERVISOR_PROTOCOL_VERSION + 1),
+      ).rejects.toThrow("协议版本不兼容");
+      client.close();
+      await expect(startStructuredSupervisor({ home })).rejects.toMatchObject({
+        code: "socket_path_occupied",
+      });
+    } finally {
+      await incumbent.close();
+    }
   });
 });
