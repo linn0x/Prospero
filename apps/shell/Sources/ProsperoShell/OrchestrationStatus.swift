@@ -56,6 +56,45 @@ struct OrchestrationStatus: Sendable, Equatable {
     var outcome: String?
   }
 
+  /// 已登记的工作树独立于 Run/Dispatch 历史；Run 删除后仍要让用户能检查和清理它。
+  struct WorktreeInspection: Codable, Sendable, Equatable {
+    var state: String
+    var targetRef: String
+    var checkedAt: Double
+    var pathExists: Bool
+    var registered: Bool?
+    var dirty: Bool?
+    var branch: String?
+    var aheadCommitCount: Int?
+    var equivalentCommitCount: Int?
+    var message: String?
+  }
+
+  struct WorktreeCleanup: Codable, Sendable, Equatable {
+    var removedAt: Double
+    var branchDeleted: Bool
+    var warning: String?
+  }
+
+  struct WorktreeAsset: Codable, Sendable, Equatable, Identifiable {
+    var id: String
+    var kind: String
+    var runId: String
+    var taskId: String?
+    var dispatchId: String?
+    var repo: String
+    var path: String
+    var branch: String?
+    var state: String
+    var createdAt: Double
+    var updatedAt: Double
+    var runDeletedAt: Double?
+    var lastInspection: WorktreeInspection?
+    var cleanup: WorktreeCleanup?
+    var legacy: Bool
+    var lastError: String?
+  }
+
   struct Gate: Codable, Sendable, Equatable, Identifiable {
     var id: String
     var runId: String
@@ -71,6 +110,7 @@ struct OrchestrationStatus: Sendable, Equatable {
   var runs: [Run] = []
   var tasks: [Task] = []
   var dispatches: [Dispatch] = []
+  var worktreeAssets: [WorktreeAsset] = []
   var gates: [Gate] = []
 
   static var fileURL: URL {
@@ -85,6 +125,7 @@ struct OrchestrationStatus: Sendable, Equatable {
       runs: stored.runs.values.sorted { $0.updatedAt > $1.updatedAt },
       tasks: stored.tasks.values.sorted { $0.createdAt < $1.createdAt },
       dispatches: stored.dispatches.values.sorted { $0.startedAt > $1.startedAt },
+      worktreeAssets: (stored.worktreeAssets ?? [:]).values.sorted { $0.updatedAt > $1.updatedAt },
       gates: stored.gates.values.sorted { $0.createdAt > $1.createdAt }
     )
   }
@@ -93,6 +134,8 @@ struct OrchestrationStatus: Sendable, Equatable {
     var runs: [String: Run] = [:]
     var tasks: [String: Task] = [:]
     var dispatches: [String: Dispatch] = [:]
+    /// v1 状态文件没有该键；缺失时不能让整个编排快照解码失败。
+    var worktreeAssets: [String: WorktreeAsset]?
     var gates: [String: Gate] = [:]
   }
 }

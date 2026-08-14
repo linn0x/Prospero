@@ -1,4 +1,5 @@
 import { useCallback, useMemo, useState } from "react";
+import * as Clipboard from "expo-clipboard";
 import {
   Alert,
   KeyboardAvoidingView,
@@ -19,6 +20,7 @@ import type {
   ApprovalPolicy,
   OrchestrationRun,
   OrchestrationTask,
+  OrchestrationWorktreeAsset,
 } from "@prospero/protocol";
 import { AgentIcon } from "@/components/AgentIcon";
 import { Icon } from "@/components/Icon";
@@ -31,6 +33,11 @@ import {
   selectedRouteRunId,
 } from "@/lib/orchestration-overview";
 import { useOrchestrationSnapshot } from "@/lib/use-orchestration-snapshot";
+import {
+  worktreeAssetPresentation,
+  worktreeCanClean,
+  worktreeInspectionSummary,
+} from "@/lib/worktree-assets";
 import { color, font, radius, space, statusColor } from "@/lib/theme";
 
 const WORKER_AGENTS: AgentKind[] = ["claude", "codex", "opencode", "grok", "trae"];
@@ -228,6 +235,10 @@ export default function OrchestrationScreen() {
     () => (snapshot?.dispatches ?? []).filter((dispatch) => dispatch.runId === activeRunId),
     [snapshot, activeRunId],
   );
+  const worktreeAssets = useMemo(
+    () => (snapshot?.worktreeAssets ?? []).filter((asset) => asset.runId === activeRunId),
+    [snapshot, activeRunId],
+  );
   const pendingGates = (snapshot?.gates ?? []).filter(
     (gate) => gate.runId === activeRunId && gate.status === "pending",
   );
@@ -239,6 +250,8 @@ export default function OrchestrationScreen() {
   const canManageLifecycle = runtime.status === "connected" && conn?.supportsOrchestrationLifecycle === true;
   const canManageRunLifecycle = runtime.status === "connected" &&
     conn?.supportsOrchestrationRunLifecycle === true;
+  const canManageWorktrees = runtime.status === "connected" &&
+    conn?.supportsOrchestrationWorktrees === true;
   const connectionNotice = orchestrationConnectionNotice(
     runtime.status,
     runtime.lastError,
@@ -521,6 +534,72 @@ export default function OrchestrationScreen() {
     }
   };
 
+  const inspectWorktree = (asset: OrchestrationWorktreeAsset): void => {
+    if (!conn || !canManageWorktrees) return;
+    if (!conn.inspectOrchestrationWorktree(asset.id)) {
+      setBanner("无法检查工作树，请检查连接、daemon 版本与编排权限。");
+    }
+  };
+
+  const confirmCleanupWorktree = (asset: OrchestrationWorktreeAsset): void => {
+    if (!conn || !canManageWorktrees || !worktreeCanClean(asset)) return;
+    Alert.alert(
+      "清理这个工作树？",
+      `将移除主机上的工作树目录：\n${asset.path}\n\n服务端会在删除前再次检查。分支会保留，方便恢复。`,
+      [
+        { text: "取消", style: "cancel" },
+        {
+          text: "清理工作树",
+          style: "destructive",
+          onPress: () => {
+            if (!conn.cleanupOrchestrationWorktree({ assetId: asset.id })) {
+              setBanner("无法清理工作树，请检查连接、daemon 版本与编排权限。");
+            }
+          },
+        },
+      ],
+    );
+  };
+
+  const copyWorktreePath = (asset: OrchestrationWorktreeAsset): void => {
+    void Clipboard.setStringAsync(asset.path);
+    setBanner("工作树路径已复制到剪贴板。");
+  };
+
+  const showWorktreeSummary = (asset: OrchestrationWorktreeAsset): void => {
+    Alert.alert(
+      "工作树摘要",
+      `路径：${asset.path}\n\n${worktreeInspectionSummary(asset)}`,
+      [
+        { text: "关闭", style: "cancel" },
+        { text: "重新检查", onPress: () => inspectWorktree(asset) },
+      ],
+    );
+  };
+
+  const openWorktreePath = (asset: OrchestrationWorktreeAsset): void => {
+    const linkedDispatch = asset.dispatchId
+      ? dispatches.find((dispatch) => dispatch.id === asset.dispatchId)
+      : dispatches.find((dispatch) => dispatch.worktreePath === asset.path);
+    if (linkedDispatch) {
+      router.push(`/host/${hostId}/files/${linkedDispatch.sessionId}`);
+      return;
+    }
+    copyWorktreePath(asset);
+  };
+
+  const relatedWorktreeNotice = (): string => {
+    const preservedAssets = worktreeAssets.filter((asset) => asset.state !== "cleaned");
+    if (preservedAssets.length === 0) return "";
+    const workerCount = preservedAssets.filter((asset) => asset.kind === "worker").length;
+    const locations = preservedAssets.map((asset) => {
+      const task = asset.taskId ? tasks.find((candidate) => candidate.id === asset.taskId) : undefined;
+      const owner = asset.kind === "run" ? "共享 Run" : `worker：${task?.title ?? asset.taskId ?? "已删除任务"}`;
+      return `${owner}\n${asset.path}`;
+    }).join("\n\n");
+    return `\n\n删除编排不会清理全部 ${String(preservedAssets.length)} 个关联工作树（其中 ${String(workerCount)} 个 worker 工作树）。它们会保留在主机上：\n${locations}`;
+  };
+
   const confirmDeleteRun = (): void => {
     if (!conn || !selectedRun || !canManage) return;
     const activeWorkers = dispatches.filter(
@@ -533,9 +612,7 @@ export default function OrchestrationScreen() {
       );
       return;
     }
-    const workspaceNotice = selectedRun.automation?.workspace === "run"
-      ? `\n\n为避免丢失未合并代码，工作树会保留在：\n${selectedRun.automation.workspacePath}`
-      : "";
+    const workspaceNotice = relatedWorktreeNotice();
     Alert.alert(
       "删除这条编排？",
       `“${selectedRun.objective}”及其任务、消息和 Gate 会从编排列表中删除。${workspaceNotice}`,
@@ -1147,6 +1224,18 @@ export default function OrchestrationScreen() {
               </View>
             )}
 
+            {(worktreeAssets.length > 0 || canManageWorktrees) && (
+              <WorktreeAssets
+                assets={worktreeAssets}
+                tasks={tasks}
+                canManage={canManageWorktrees}
+                onInspect={inspectWorktree}
+                onShowSummary={showWorktreeSummary}
+                onOpenPath={openWorktreePath}
+                onClean={confirmCleanupWorktree}
+              />
+            )}
+
             {!manualRun && (
               <Text style={styles.coordinatorNote}>
                 此 Run 由协调者会话维护任务图；你仍可查看 worker，并在主机页处理 Gate。
@@ -1544,6 +1633,88 @@ export default function OrchestrationScreen() {
   );
 }
 
+function WorktreeAssets({
+  assets,
+  tasks,
+  canManage,
+  onInspect,
+  onShowSummary,
+  onOpenPath,
+  onClean,
+}: {
+  assets: OrchestrationWorktreeAsset[];
+  tasks: OrchestrationTask[];
+  canManage: boolean;
+  onInspect: (asset: OrchestrationWorktreeAsset) => void;
+  onShowSummary: (asset: OrchestrationWorktreeAsset) => void;
+  onOpenPath: (asset: OrchestrationWorktreeAsset) => void;
+  onClean: (asset: OrchestrationWorktreeAsset) => void;
+}) {
+  return (
+    <View style={styles.worktreeSection}>
+      <View style={styles.worktreeHeader}>
+        <View>
+          <Text style={styles.worktreeTitle}>工作树</Text>
+          <Text style={styles.worktreeSubtitle}>检查结果由主机 Git 只读核验</Text>
+        </View>
+        <Text style={styles.worktreeCount}>{String(assets.length)}</Text>
+      </View>
+      {assets.length === 0 ? (
+        <Text style={styles.worktreeEmpty}>这个 Run 尚未登记独立工作树。</Text>
+      ) : assets.map((asset) => {
+        const task = asset.taskId ? tasks.find((candidate) => candidate.id === asset.taskId) : undefined;
+        const owner = asset.kind === "run"
+          ? "共享 Run 工作树"
+          : task?.title ?? `worker · ${asset.taskId ?? "已删除任务"}`;
+        const presentation = worktreeAssetPresentation(asset);
+        const statusStyle = presentation.tone === "success"
+          ? styles.worktreeStateSuccess
+          : presentation.tone === "warning"
+            ? styles.worktreeStateWarning
+            : presentation.tone === "danger"
+              ? styles.worktreeStateDanger
+              : styles.worktreeStateMuted;
+        return (
+          <View key={asset.id} style={styles.worktreeCard}>
+            <View style={styles.worktreeTop}>
+              <Text style={styles.worktreeOwner} numberOfLines={1}>{owner}</Text>
+              <Text style={[styles.worktreeState, statusStyle]}>{presentation.label}</Text>
+            </View>
+            <Text style={styles.worktreeBranch} numberOfLines={1}>
+              {asset.branch ? `分支 · ${asset.branch}` : "分支 · detached"}
+            </Text>
+            <Text style={styles.worktreePath} selectable numberOfLines={2}>{asset.path}</Text>
+            <Text style={styles.worktreeDetail}>{presentation.detail}</Text>
+            <View style={styles.worktreeActions}>
+              <Pressable style={styles.worktreeAction} onPress={() => onOpenPath(asset)}>
+                <Text style={styles.worktreeActionText}>打开路径</Text>
+              </Pressable>
+              <Pressable style={styles.worktreeAction} onPress={() => onShowSummary(asset)}>
+                <Text style={styles.worktreeActionText}>查看摘要</Text>
+              </Pressable>
+              <Pressable
+                disabled={!canManage}
+                style={[styles.worktreeAction, !canManage && styles.disabled]}
+                onPress={() => onInspect(asset)}
+              >
+                <Text style={styles.worktreeActionText}>检查</Text>
+              </Pressable>
+              {canManage && worktreeCanClean(asset) && (
+                <Pressable
+                  style={[styles.worktreeAction, styles.worktreeCleanAction]}
+                  onPress={() => onClean(asset)}
+                >
+                  <Text style={styles.worktreeCleanActionText}>清理</Text>
+                </Pressable>
+              )}
+            </View>
+          </View>
+        );
+      })}
+    </View>
+  );
+}
+
 function TaskTopology({
   nodes,
   selectedId,
@@ -1883,6 +2054,63 @@ const styles = StyleSheet.create({
   automationStatusTitle: { color: color.accent, fontSize: 12, fontWeight: "700" },
   automationStatusMeta: { color: color.textDim, fontSize: 11, fontWeight: "600" },
   automationError: { color: color.warn, fontSize: 12, lineHeight: 17 },
+  worktreeSection: {
+    gap: space.sm,
+    padding: space.md,
+    borderRadius: radius.md,
+    backgroundColor: color.surface,
+  },
+  worktreeHeader: { flexDirection: "row", alignItems: "center", gap: space.sm },
+  worktreeTitle: { color: color.text, fontSize: 13, fontWeight: "700" },
+  worktreeSubtitle: { color: color.textFaint, fontSize: 10, marginTop: 2 },
+  worktreeCount: {
+    minWidth: 22,
+    marginLeft: "auto",
+    overflow: "hidden",
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 9,
+    backgroundColor: color.surfaceRaised,
+    color: color.textDim,
+    fontSize: 10,
+    fontWeight: "700",
+    textAlign: "center",
+  },
+  worktreeEmpty: { ...font.meta, color: color.textDim, paddingVertical: space.xs },
+  worktreeCard: {
+    gap: 4,
+    padding: space.sm,
+    borderRadius: radius.sm,
+    backgroundColor: color.surfaceRaised,
+  },
+  worktreeTop: { flexDirection: "row", alignItems: "center", gap: space.sm },
+  worktreeOwner: { flex: 1, color: color.text, fontSize: 12, fontWeight: "700" },
+  worktreeState: {
+    overflow: "hidden",
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 8,
+    fontSize: 10,
+    fontWeight: "700",
+  },
+  worktreeStateMuted: { color: color.textFaint, backgroundColor: color.surface },
+  worktreeStateWarning: { color: color.warn, backgroundColor: color.warnBg },
+  worktreeStateSuccess: { color: color.success, backgroundColor: color.successBg },
+  worktreeStateDanger: { color: color.danger, backgroundColor: color.dangerBg },
+  worktreeBranch: { color: color.textDim, fontSize: 10, fontWeight: "600" },
+  worktreePath: { color: color.textFaint, fontSize: 10, lineHeight: 14 },
+  worktreeDetail: { color: color.textDim, fontSize: 10, lineHeight: 14 },
+  worktreeActions: { flexDirection: "row", flexWrap: "wrap", gap: 6, marginTop: 2 },
+  worktreeAction: {
+    minHeight: 28,
+    justifyContent: "center",
+    paddingHorizontal: space.sm,
+    borderRadius: 14,
+    backgroundColor: color.surface,
+  },
+  worktreeActionText: { color: color.accent, fontSize: 11, fontWeight: "700" },
+  worktreeCleanAction: { backgroundColor: color.dangerBg },
+  worktreeCleanActionText: { color: color.danger, fontSize: 11, fontWeight: "700" },
   smallAction: {
     flexDirection: "row",
     alignItems: "center",

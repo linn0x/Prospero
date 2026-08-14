@@ -579,6 +579,46 @@ final class DaemonController {
     )
   }
 
+  func completeOrchestrationRun(runId: String) async -> String? {
+    await performOrchestrationAction(
+      method: "run.complete",
+      params: [
+        "runId": runId,
+        "operationId": UUID().uuidString,
+      ]
+    )
+  }
+
+  func abandonOrchestrationRun(runId: String) async -> String? {
+    await performOrchestrationAction(
+      method: "run.abandon",
+      params: [
+        "runId": runId,
+        "operationId": UUID().uuidString,
+      ]
+    )
+  }
+
+  /// 只读检查会更新本地编排快照；实际 Git 判断只在 daemon 端完成。
+  func inspectOrchestrationWorktree(assetId: String) async -> String? {
+    await performOrchestrationAction(
+      method: "worktree.inspect",
+      params: ["assetId": assetId]
+    )
+  }
+
+  /// 服务端会再次核验 safe_to_clean/equivalent；默认保留分支，便于恢复。
+  func cleanupOrchestrationWorktree(assetId: String) async -> String? {
+    await performOrchestrationAction(
+      method: "worktree.cleanup",
+      params: [
+        "assetId": assetId,
+        "confirm": true,
+        "operationId": UUID().uuidString,
+      ]
+    )
+  }
+
   func createOrchestrationTask(
     runId: String,
     title: String,
