@@ -58,12 +58,12 @@ Do not put a capability token in argv. The daemon launcher should pass a pre-ope
 The external supervisor protocol is not Codex app-server JSON-RPC. It is a small, versioned Prospero envelope:
 
 ```text
-request  { id, token, method, params }
-response { id, ok, result | error }
-event    { method: "session.event", params: { sessionId, seq, at, body } }
+request  { version: 1, id, token, method, params }
+response { version: 1, id, ok, result | error }
+event    { version: 1, method: "session.event", params: { sessionId, seq, at, body } }
 ```
 
-Initial methods are `session.subscribe`, `session.send`, `session.interrupt`, `session.kill`, and `session.status`. `session.subscribe(afterSeq)` responds with all retained events whose sequence is greater than `afterSeq`, then streams new events. The supervisor installs the subscription cursor before writing the response, so a later event is not both replayed and live-delivered on one connection.
+The client must send the exact version it negotiated; a mismatch is rejected before dispatch. Initial methods are `session.subscribe`, `session.send`, `session.interrupt`, `session.kill`, and `session.status`. `session.subscribe(afterSeq)` responds with all retained events whose sequence is greater than `afterSeq`, then streams new events. The supervisor installs the subscription cursor before writing the response, so a later event is not both replayed and live-delivered on one connection.
 
 Events are written atomically before notification. Delivery to a reconnecting daemon is therefore at-least-once across a crash boundary; the daemon deduplicates by `(sessionId, seq)`. Within retained history, no sequence is skipped. If retention has advanced, `gap: true` forces a durable snapshot/reconciliation instead of pretending an incomplete replay is exact. Command RPCs will gain `commandId`/result persistence before production clients retry mutating commands.
 
@@ -131,9 +131,10 @@ Claude, OpenCode, and Grok must not be assumed to offer an equivalent daemon end
 
 - private Unix socket plus per-request capability token;
 - strict session IDs, bounded NDJSON frames, 0600 token/socket files;
+- explicit v1 protocol negotiation and verified-stale-socket cleanup (never unlink a live supervisor socket);
 - persisted monotonic `SupervisorEvent` records before live notification;
 - `session.subscribe(afterSeq)` replay plus a single live cursor;
-- explicit `session.kill` distinct from socket/client disappearance; and
+- explicit `session.kill` distinct from socket/client disappearance, including a durable terminal fence that drops late native events; and
 - an adapter-neutral interface with no Codex/Claude/OpenCode/Grok decision enums.
 
 `apps/daemon/test/structured-supervisor.test.ts` starts it in a separate Node process with a fake long-running adapter. Client A subscribes, starts work, and exits. The supervisor records progress while no client exists. Client B reconnects with A's cursor, receives replayed sequence 2 and live sequence 3 exactly once. The test also reads the persisted log and verifies socket/token mode.

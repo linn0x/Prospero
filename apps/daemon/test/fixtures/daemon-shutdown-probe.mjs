@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { SessionManager } from "../../dist/session-manager.js";
 
 const [mode, marker] = process.argv.slice(2);
@@ -30,14 +30,24 @@ if (mode === "fake-agent") {
   if (mode === "pty") {
     manager = new SessionManager({ home, tmux: { home } });
     if (!manager.tmuxEnabled) throw new Error("tmux is required for PTY shutdown probe");
+    // `SessionManager.create()` returns after tmux accepts the command, not
+    // necessarily after its shell has exec'd it. A SIGKILL immediately after
+    // the parent says "ready" would therefore race the child process itself
+    // and produce a false negative for tmux survival.
+    const started = `${marker}.started`;
     const info = await manager.create({
       agent: "custom",
-      command: `sleep 0.35; printf survived > ${JSON.stringify(marker)}`,
+      command: `printf started > ${JSON.stringify(started)}; sleep 0.35; printf survived > ${JSON.stringify(marker)}`,
       cwd: repo,
       cols: 80,
       rows: 24,
       allowShell: true,
     });
+    const deadline = Date.now() + 2_000;
+    while (!existsSync(started) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    if (!existsSync(started)) throw new Error("tmux probe command did not start");
     process.stdout.write(`${JSON.stringify({ ready: true, sessionId: info.id })}\n`);
   } else {
     class PipeBoundFakeAdapter {

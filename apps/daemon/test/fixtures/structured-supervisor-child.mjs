@@ -22,6 +22,10 @@ const adapter = {
   async kill() {
     for (const timer of timers) clearTimeout(timer);
     timers = [];
+    // Native cancellation can race an already-buffered callback. The
+    // supervisor's durable kill fence, rather than this cooperative adapter,
+    // is what must keep the late event out of a reattached daemon's replay.
+    emit?.({ kind: "text.delta", msgId: "fake", textId: "fake", delta: "late-after-kill" });
   },
 };
 
