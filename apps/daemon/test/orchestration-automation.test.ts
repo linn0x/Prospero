@@ -135,7 +135,10 @@ describe("静态 DAG 自动执行", () => {
 
     await ctx.automation.start(input);
     expect(ctx.sessions.creates).toHaveLength(2);
-    expect(ctx.sessions.creates[1]).toMatchObject({ agent: "claude", cwd: realpathSync(cwd) });
+    expect(ctx.sessions.creates[1]).toMatchObject({
+      agent: "claude",
+      cwd: realpathSync.native(cwd),
+    });
   });
 
   it("默认可为整张 Run 创建一个共享隔离 worktree", async () => {

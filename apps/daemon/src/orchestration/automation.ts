@@ -235,7 +235,7 @@ function isDirectory(value: string): boolean {
 function canonicalDirectory(value: string): string | null {
   if (!isDirectory(value)) return null;
   try {
-    return realpathSync(value);
+    return realpathSync.native(value);
   } catch {
     return null;
   }
