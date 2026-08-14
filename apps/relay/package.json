@@ -1,6 +1,6 @@
 {
   "name": "@prospero/relay",
-  "version": "0.0.12",
+  "version": "0.0.13",
   "license": "MIT",
   "private": true,
   "type": "module",
@@ -24,7 +24,7 @@
     "test:e2e": "npm run build --workspace @prospero/daemon && npm run build --workspace @prospero/relay && RELAY_REAL_PROCESS_E2E=1 vitest run test/real-process-e2e.test.ts"
   },
   "dependencies": {
-    "@prospero/protocol": "0.0.12",
+    "@prospero/protocol": "0.0.13",
     "mysql2": "3.11.5",
     "pino": "9.5.0",
     "prom-client": "15.1.3",

@@ -6,6 +6,13 @@ never decrypts, parses, transforms, compresses, or reframes application
 payloads on `/v1/client` or `/v1/stream`. Text/binary WebSocket frame boundaries
 are forwarded one for one.
 
+> [!IMPORTANT]
+> This repository ships deployable artifacts and an operator runbook; it does **not** claim a completed public deployment.
+> Capacity qualification is **inconclusive/waived**: the stable local tier was 2,500 host controls / 500 active pairs / 60 s;
+> the 5,000 / 1,000 / 60 s execution failed, and there is no successful 5,000 / 1,000 / 600 s result, 16 GiB qualification,
+> same-environment direct RTT baseline, or public DNS TLS/WSS validation. See
+> [`docs/relay-release.md`](../../docs/relay-release.md) and the safe reports under `apps/relay/reports/`.
+
 ## Security and deployment boundary
 
 The relay does not persist an E2E pairing token, host secret, device relay
@@ -46,6 +53,9 @@ certificates automatically. Use `/health/live` for process liveness and
 `/health/ready` for MySQL+Redis readiness. `/metrics` is internal-only by
 default; set a 24+ character `METRICS_TOKEN` only when an authenticated scrape
 path is intentionally exposed.
+
+This is a deployment procedure, not proof that a real DNS record, firewall,
+certificate issuance, or public WSS connection has already been validated.
 
 Run migrations manually (normally compose runs `migrate` before relay):
 
@@ -163,6 +173,12 @@ fails nonzero for connection, delivery, heartbeat, integrity, or harness
 failures. Its JSON contains aggregate counters only and uses repository-root
 relative output paths, so it can be run from the repository root or an npm
 workspace without relocating reports.
+
+Do not treat the example command or configured `nofile` values as a passed
+capacity qualification. The release evidence is waived/inconclusive as stated
+at the top of this document; run the full target workload in an isolated
+16-GiB-or-better environment and record a same-environment direct baseline
+before making capacity or public-deployment claims.
 
 ### Monitoring and alerts
 
