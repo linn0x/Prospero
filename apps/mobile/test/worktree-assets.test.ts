@@ -1,9 +1,14 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { OrchestrationWorktreeAsset } from "@prospero/protocol";
 import {
+  WORKTREE_ACTION_MIN_HIT_TARGET,
   worktreeAssetPresentation,
   worktreeCanClean,
   worktreeInspectionSummary,
+  worktreePathAction,
+  worktreeRunDeletionNotice,
 } from "../src/lib/worktree-assets";
 
 function asset(state: OrchestrationWorktreeAsset["state"]): OrchestrationWorktreeAsset {
@@ -51,5 +56,62 @@ describe("worktree asset presentation", () => {
   it("never offers cleanup before a safe server inspection", () => {
     expect(worktreeCanClean(asset("safe_to_clean"))).toBe(false);
     expect(worktreeAssetPresentation(asset("dirty"))).toMatchObject({ label: "有未提交改动" });
+  });
+
+  it("retains a daemon diagnostic in an unchecked worktree summary", () => {
+    const unchecked = asset("unknown");
+    unchecked.lastError = "完成 worker 派发失败：会话已结束";
+
+    expect(worktreeInspectionSummary(unchecked)).toContain("诊断：完成 worker 派发失败：会话已结束");
+  });
+
+  it("labels the path action truthfully for browseable and copy-only paths", () => {
+    expect(worktreePathAction("/worker", true)).toMatchObject({
+      label: "浏览路径",
+      accessibilityLabel: "浏览工作树路径：/worker",
+    });
+    expect(worktreePathAction("/orphan", false)).toMatchObject({
+      label: "复制路径",
+      accessibilityLabel: "复制工作树路径：/orphan",
+    });
+  });
+
+  it("warns about all registered worktrees and preserves the legacy automation fallback", () => {
+    const worker = asset("active");
+    worker.kind = "worker";
+    worker.taskId = "task-1";
+    const run = asset("active");
+    run.id = "wt-run";
+    run.kind = "run";
+    run.taskId = null;
+    run.path = "/run-worktree";
+
+    const registered = worktreeRunDeletionNotice(
+      [worker, run],
+      (candidate) => candidate.kind === "run" ? "共享 Run" : "worker：实现任务",
+      "/legacy-run-worktree",
+    );
+    expect(registered).toContain("全部 2 个关联工作树（其中 1 个 worker 工作树）");
+    expect(registered).toContain("worker：实现任务\n/worktree");
+    expect(registered).toContain("共享 Run\n/run-worktree");
+    expect(registered).not.toContain("/legacy-run-worktree");
+
+    expect(worktreeRunDeletionNotice([], () => "unused", "/legacy-run-worktree"))
+      .toContain("自动 Run 工作树。它会保留在主机上：\n/legacy-run-worktree");
+    expect(worktreeRunDeletionNotice([], () => "unused", null)).toBe("");
+  });
+
+  it("keeps compact worktree controls at a 44pt target with explicit accessibility metadata", () => {
+    const screen = readFileSync(
+      join(import.meta.dirname, "..", "src", "app", "host", "[hostId]", "orchestration.tsx"),
+      "utf8",
+    );
+
+    expect(WORKTREE_ACTION_MIN_HIT_TARGET).toBe(44);
+    expect(screen).toContain("minWidth: WORKTREE_ACTION_MIN_HIT_TARGET");
+    expect(screen).toContain("minHeight: WORKTREE_ACTION_MIN_HIT_TARGET");
+    expect(screen).toContain('accessibilityRole="button"');
+    expect(screen).toContain("accessibilityLabel={pathAction.accessibilityLabel}");
+    expect(screen).toContain("accessibilityState={{ disabled: !canManage }}");
   });
 });

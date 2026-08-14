@@ -6,6 +6,33 @@ export interface WorktreeAssetPresentation {
   tone: "muted" | "warning" | "success" | "danger";
 }
 
+/** All compact worktree actions still need a full mobile hit target. */
+export const WORKTREE_ACTION_MIN_HIT_TARGET = 44;
+
+export interface WorktreePathAction {
+  label: "浏览路径" | "复制路径";
+  accessibilityLabel: string;
+  accessibilityHint: string;
+}
+
+/** A path can only be browsed when it is backed by a linked worker dispatch. */
+export function worktreePathAction(
+  path: string,
+  hasLinkedDispatch: boolean,
+): WorktreePathAction {
+  return hasLinkedDispatch
+    ? {
+      label: "浏览路径",
+      accessibilityLabel: `浏览工作树路径：${path}`,
+      accessibilityHint: "在关联 worker 的文件浏览器中查看此路径。",
+    }
+    : {
+      label: "复制路径",
+      accessibilityLabel: `复制工作树路径：${path}`,
+      accessibilityHint: "当前没有关联 worker 会话，路径会复制到剪贴板。",
+    };
+}
+
 /** The displayed result always comes from the daemon's last inspection. */
 export function worktreeAssetPresentation(
   asset: OrchestrationWorktreeAsset,
@@ -39,7 +66,11 @@ export function worktreeCanClean(asset: OrchestrationWorktreeAsset): boolean {
 
 export function worktreeInspectionSummary(asset: OrchestrationWorktreeAsset): string {
   const inspection = asset.lastInspection;
-  if (!inspection) return "尚未检查。点“检查”可让主机只读核验工作树状态。";
+  if (!inspection) {
+    const lines = ["尚未检查。点“检查”可让主机只读核验工作树状态。"];
+    if (asset.lastError) lines.push(`诊断：${asset.lastError}`);
+    return lines.join("\n");
+  }
   const lines = [
     `状态：${worktreeAssetPresentation(asset).label}`,
     `目标：${inspection.targetRef}`,
@@ -49,4 +80,27 @@ export function worktreeInspectionSummary(asset: OrchestrationWorktreeAsset): st
   if (inspection.equivalentCommitCount !== null) lines.push(`等价提交：${inspection.equivalentCommitCount}`);
   if (inspection.message) lines.push(`说明：${inspection.message}`);
   return lines.join("\n");
+}
+
+/**
+ * Preserve the pre-worktree-assets warning for automation Runs served by an
+ * older daemon (or before its asset record has arrived).
+ */
+export function worktreeRunDeletionNotice(
+  assets: readonly OrchestrationWorktreeAsset[],
+  ownerForAsset: (asset: OrchestrationWorktreeAsset) => string,
+  fallbackRunWorkspacePath?: string | null,
+): string {
+  const preservedAssets = assets.filter((asset) => asset.state !== "cleaned");
+  if (preservedAssets.length > 0) {
+    const workerCount = preservedAssets.filter((asset) => asset.kind === "worker").length;
+    const locations = preservedAssets.map((asset) => `${ownerForAsset(asset)}\n${asset.path}`).join("\n\n");
+    return `\n\n删除编排不会清理全部 ${String(preservedAssets.length)} 个关联工作树（其中 ${String(workerCount)} 个 worker 工作树）。它们会保留在主机上：\n${locations}`;
+  }
+
+  if (assets.length === 0 && fallbackRunWorkspacePath) {
+    return `\n\n删除编排不会清理自动 Run 工作树。它会保留在主机上：\n${fallbackRunWorkspacePath}`;
+  }
+
+  return "";
 }

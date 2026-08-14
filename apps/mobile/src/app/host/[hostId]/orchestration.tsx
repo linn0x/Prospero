@@ -34,9 +34,12 @@ import {
 } from "@/lib/orchestration-overview";
 import { useOrchestrationSnapshot } from "@/lib/use-orchestration-snapshot";
 import {
+  WORKTREE_ACTION_MIN_HIT_TARGET,
   worktreeAssetPresentation,
   worktreeCanClean,
   worktreeInspectionSummary,
+  worktreePathAction,
+  worktreeRunDeletionNotice,
 } from "@/lib/worktree-assets";
 import { color, font, radius, space, statusColor } from "@/lib/theme";
 
@@ -577,10 +580,13 @@ export default function OrchestrationScreen() {
     );
   };
 
-  const openWorktreePath = (asset: OrchestrationWorktreeAsset): void => {
-    const linkedDispatch = asset.dispatchId
+  const linkedDispatchForWorktree = (asset: OrchestrationWorktreeAsset) =>
+    asset.dispatchId
       ? dispatches.find((dispatch) => dispatch.id === asset.dispatchId)
       : dispatches.find((dispatch) => dispatch.worktreePath === asset.path);
+
+  const openWorktreePath = (asset: OrchestrationWorktreeAsset): void => {
+    const linkedDispatch = linkedDispatchForWorktree(asset);
     if (linkedDispatch) {
       router.push(`/host/${hostId}/files/${linkedDispatch.sessionId}`);
       return;
@@ -589,15 +595,16 @@ export default function OrchestrationScreen() {
   };
 
   const relatedWorktreeNotice = (): string => {
-    const preservedAssets = worktreeAssets.filter((asset) => asset.state !== "cleaned");
-    if (preservedAssets.length === 0) return "";
-    const workerCount = preservedAssets.filter((asset) => asset.kind === "worker").length;
-    const locations = preservedAssets.map((asset) => {
-      const task = asset.taskId ? tasks.find((candidate) => candidate.id === asset.taskId) : undefined;
-      const owner = asset.kind === "run" ? "共享 Run" : `worker：${task?.title ?? asset.taskId ?? "已删除任务"}`;
-      return `${owner}\n${asset.path}`;
-    }).join("\n\n");
-    return `\n\n删除编排不会清理全部 ${String(preservedAssets.length)} 个关联工作树（其中 ${String(workerCount)} 个 worker 工作树）。它们会保留在主机上：\n${locations}`;
+    return worktreeRunDeletionNotice(
+      worktreeAssets,
+      (asset) => {
+        const task = asset.taskId ? tasks.find((candidate) => candidate.id === asset.taskId) : undefined;
+        return asset.kind === "run" ? "共享 Run" : `worker：${task?.title ?? asset.taskId ?? "已删除任务"}`;
+      },
+      selectedRun?.automation?.workspace === "run"
+        ? selectedRun.automation.workspacePath
+        : null,
+    );
   };
 
   const confirmDeleteRun = (): void => {
@@ -1232,6 +1239,7 @@ export default function OrchestrationScreen() {
                 onInspect={inspectWorktree}
                 onShowSummary={showWorktreeSummary}
                 onOpenPath={openWorktreePath}
+                hasLinkedDispatch={(asset) => linkedDispatchForWorktree(asset) !== undefined}
                 onClean={confirmCleanupWorktree}
               />
             )}
@@ -1640,6 +1648,7 @@ function WorktreeAssets({
   onInspect,
   onShowSummary,
   onOpenPath,
+  hasLinkedDispatch,
   onClean,
 }: {
   assets: OrchestrationWorktreeAsset[];
@@ -1648,6 +1657,7 @@ function WorktreeAssets({
   onInspect: (asset: OrchestrationWorktreeAsset) => void;
   onShowSummary: (asset: OrchestrationWorktreeAsset) => void;
   onOpenPath: (asset: OrchestrationWorktreeAsset) => void;
+  hasLinkedDispatch: (asset: OrchestrationWorktreeAsset) => boolean;
   onClean: (asset: OrchestrationWorktreeAsset) => void;
 }) {
   return (
@@ -1667,6 +1677,7 @@ function WorktreeAssets({
           ? "共享 Run 工作树"
           : task?.title ?? `worker · ${asset.taskId ?? "已删除任务"}`;
         const presentation = worktreeAssetPresentation(asset);
+        const pathAction = worktreePathAction(asset.path, hasLinkedDispatch(asset));
         const statusStyle = presentation.tone === "success"
           ? styles.worktreeStateSuccess
           : presentation.tone === "warning"
@@ -1686,16 +1697,34 @@ function WorktreeAssets({
             <Text style={styles.worktreePath} selectable numberOfLines={2}>{asset.path}</Text>
             <Text style={styles.worktreeDetail}>{presentation.detail}</Text>
             <View style={styles.worktreeActions}>
-              <Pressable style={styles.worktreeAction} onPress={() => onOpenPath(asset)}>
-                <Text style={styles.worktreeActionText}>打开路径</Text>
+              <Pressable
+                style={styles.worktreeAction}
+                onPress={() => onOpenPath(asset)}
+                accessibilityRole="button"
+                accessibilityLabel={pathAction.accessibilityLabel}
+                accessibilityHint={pathAction.accessibilityHint}
+                accessibilityState={{ disabled: false }}
+              >
+                <Text style={styles.worktreeActionText}>{pathAction.label}</Text>
               </Pressable>
-              <Pressable style={styles.worktreeAction} onPress={() => onShowSummary(asset)}>
+              <Pressable
+                style={styles.worktreeAction}
+                onPress={() => onShowSummary(asset)}
+                accessibilityRole="button"
+                accessibilityLabel={`查看工作树摘要：${owner}`}
+                accessibilityHint="显示路径、检查结果和主机诊断。"
+                accessibilityState={{ disabled: false }}
+              >
                 <Text style={styles.worktreeActionText}>查看摘要</Text>
               </Pressable>
               <Pressable
                 disabled={!canManage}
                 style={[styles.worktreeAction, !canManage && styles.disabled]}
                 onPress={() => onInspect(asset)}
+                accessibilityRole="button"
+                accessibilityLabel={`检查工作树：${owner}`}
+                accessibilityHint="让主机只读核验 Git 状态。"
+                accessibilityState={{ disabled: !canManage }}
               >
                 <Text style={styles.worktreeActionText}>检查</Text>
               </Pressable>
@@ -1703,6 +1732,10 @@ function WorktreeAssets({
                 <Pressable
                   style={[styles.worktreeAction, styles.worktreeCleanAction]}
                   onPress={() => onClean(asset)}
+                  accessibilityRole="button"
+                  accessibilityLabel={`清理工作树：${owner}`}
+                  accessibilityHint="需确认；主机会在删除前再次核验安全状态。"
+                  accessibilityState={{ disabled: false }}
                 >
                   <Text style={styles.worktreeCleanActionText}>清理</Text>
                 </Pressable>
@@ -2102,7 +2135,8 @@ const styles = StyleSheet.create({
   worktreeDetail: { color: color.textDim, fontSize: 10, lineHeight: 14 },
   worktreeActions: { flexDirection: "row", flexWrap: "wrap", gap: 6, marginTop: 2 },
   worktreeAction: {
-    minHeight: 28,
+    minWidth: WORKTREE_ACTION_MIN_HIT_TARGET,
+    minHeight: WORKTREE_ACTION_MIN_HIT_TARGET,
     justifyContent: "center",
     paddingHorizontal: space.sm,
     borderRadius: 14,
