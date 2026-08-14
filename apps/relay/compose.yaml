@@ -3,7 +3,9 @@ name: prospero-relay
 services:
   mysql:
     image: mysql:8.4.4-oraclelinux9
-    command: ["mysqld", "--default-authentication-plugin=caching_sha2_password"]
+    # MySQL 8.4 defaults to caching_sha2_password.  The old
+    # --default-authentication-plugin switch was removed in 8.4 and makes a
+    # fresh container fail before it can initialize its data directory.
     environment:
       MYSQL_DATABASE: ${MYSQL_DATABASE:-prospero_relay}
       MYSQL_USER: ${MYSQL_USER:-prospero}
@@ -14,6 +16,10 @@ services:
     expose: ["3306"]
     healthcheck:
       test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD --silent"]
+      # The official image starts a temporary bootstrap mysqld that answers
+      # ping, then replaces it with the final server. Do not release migrate
+      # during that transient window.
+      start_period: 30s
       interval: 5s
       timeout: 5s
       retries: 30
@@ -67,8 +73,21 @@ services:
       # Only Caddy has this fixed backend address. It supplies a sanitized
       # client IP for per-source rate limiting; direct callers cannot forge it.
       RELAY_TRUSTED_PROXY_IPS: "172.30.0.2"
+      # Defaults are safe for ordinary deployments.  The capacity harness
+      # overrides these two guards for its known benchmark source addresses.
+      AUTH_RATE_PER_MINUTE: ${AUTH_RATE_PER_MINUTE:-20}
+      CONNECTION_RATE_PER_MINUTE: ${CONNECTION_RATE_PER_MINUTE:-60}
+      MAX_STREAMS_PER_ROUTE: ${MAX_STREAMS_PER_ROUTE:-8}
+      CLEANUP_INTERVAL_MS: ${CLEANUP_INTERVAL_MS:-3600000}
       LOG_LEVEL: ${LOG_LEVEL:-info}
     expose: ["8787"]
+    # 5k host controls + 1k bidirectional data pairs require substantially
+    # more than a platform's common 1024-FD default. Keep this explicit so an
+    # image/runtime change cannot silently reduce the capacity envelope.
+    ulimits:
+      nofile:
+        soft: ${RELAY_NOFILE_SOFT:-131072}
+        hard: ${RELAY_NOFILE_HARD:-131072}
     depends_on:
       mysql:
         condition: service_healthy
@@ -109,6 +128,10 @@ services:
     ports:
       - "80:80"
       - "443:443"
+    ulimits:
+      nofile:
+        soft: ${CADDY_NOFILE_SOFT:-131072}
+        hard: ${CADDY_NOFILE_HARD:-131072}
     restart: unless-stopped
     networks:
       relay-backend:

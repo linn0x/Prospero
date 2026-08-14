@@ -1,0 +1,80 @@
+# Isolated local capacity/failure stack.  It intentionally has no Caddy: TLS
+# validation belongs to a public-DNS deployment and is exercised separately.
+# Every published port is distinct from test/compose.integration.yaml so this
+# file can run beside another worker's integration stack.
+# Keep the local harness in its own explicit project even when invoked from a
+# different working directory.  An override is available for an intentionally
+# separate local run, but callers must never reuse another task's project.
+name: ${T8_COMPOSE_PROJECT:-prospero-t8-capacity}
+
+services:
+  mysql:
+    image: mysql:8.4.4-oraclelinux9
+    environment:
+      MYSQL_DATABASE: prospero_relay_t8
+      MYSQL_USER: prospero
+      MYSQL_PASSWORD: t8-local-password
+      MYSQL_ROOT_PASSWORD: t8-local-root-password
+    ports: ["${T8_MYSQL_PORT:-43306}:3306"]
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uprospero -pt8-local-password --silent"]
+      start_period: 30s
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7.4.2-alpine3.21
+    ports: ["${T8_REDIS_PORT:-46379}:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  migrate:
+    build:
+      context: ../../..
+      dockerfile: apps/relay/Dockerfile
+    command: ["node", "dist/migrate.js"]
+    working_dir: /srv/prospero/apps/relay
+    environment:
+      MYSQL_URL: mysql://prospero:t8-local-password@mysql:3306/prospero_relay_t8
+      REDIS_URL: redis://redis:6379
+      MIGRATIONS_DIR: /srv/prospero/apps/relay/migrations
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  relay:
+    build:
+      context: ../../..
+      dockerfile: apps/relay/Dockerfile
+    environment:
+      RELAY_HOST: 0.0.0.0
+      RELAY_PORT: 8787
+      MYSQL_URL: mysql://prospero:t8-local-password@mysql:3306/prospero_relay_t8
+      REDIS_URL: redis://redis:6379
+      METRICS_INTERNAL_ONLY: "true"
+      AUTH_RATE_PER_MINUTE: ${AUTH_RATE_PER_MINUTE:-10000}
+      CONNECTION_RATE_PER_MINUTE: ${CONNECTION_RATE_PER_MINUTE:-10000}
+      MAX_STREAMS_PER_ROUTE: ${MAX_STREAMS_PER_ROUTE:-8}
+      CLEANUP_INTERVAL_MS: ${CLEANUP_INTERVAL_MS:-3600000}
+      LOG_LEVEL: ${LOG_LEVEL:-warn}
+    ports: ["${T8_RELAY_PORT:-43878}:8787"]
+    ulimits:
+      nofile:
+        soft: ${RELAY_NOFILE_SOFT:-131072}
+        hard: ${RELAY_NOFILE_HARD:-131072}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 3s
+      timeout: 3s
+      retries: 30

@@ -1,0 +1,286 @@
+{
+  "schemaVersion": 1,
+  "kind": "prospero-relay-load-report",
+  "status": "inconclusive",
+  "executionStatus": "passed",
+  "qualificationStatus": "inconclusive",
+  "startedAt": "2026-08-14T10:17:29.768Z",
+  "finishedAt": "2026-08-14T10:18:32.103Z",
+  "qualification": {
+    "fullScaleInvocation": false,
+    "dockerEightCpuSixteenGiBOrMore": false,
+    "directBaseline": {
+      "value": null,
+      "errorCode": "not_supplied"
+    },
+    "reason": "Docker engine does not expose the required 8 vCPU / 16 GiB capacity"
+  },
+  "target": {
+    "hostControls": 5000,
+    "activeDataPairs": 1000,
+    "holdSeconds": 600,
+    "perDirectionBytesPerSecond": 4096,
+    "burstBytes": 262144
+  },
+  "requested": {
+    "hostControls": 1000,
+    "activeDataPairs": 200,
+    "holdSeconds": 60,
+    "setupConcurrency": 64,
+    "burstSeconds": 30,
+    "drainMs": 5000
+  },
+  "achieved": {
+    "hostEstablished": 1000,
+    "hostFailed": 0,
+    "streamEstablished": 200,
+    "streamFailed": 0,
+    "unexpectedDisconnects": 0,
+    "hostHeartbeatsSent": 8000,
+    "hostHeartbeatsAcked": 8000,
+    "hostHeartbeatsMissed": 0,
+    "hostSuccessRate": 1,
+    "streamSuccessRate": 1
+  },
+  "latency": {
+    "streamOpenMs": {
+      "count": 200,
+      "p50": 40.11333400000012,
+      "p95": 111.77433400000018,
+      "p99": 114.83991700000001,
+      "max": 118.84012500000017
+    },
+    "relayRoundTripMs": {
+      "count": 12000,
+      "p50": 18.678791999998793,
+      "p95": 36.009665999999925,
+      "p99": 136.87483300000167,
+      "max": 244.48574999999983
+    },
+    "directBaselineRoundTripMs": null,
+    "addedRttMs": {
+      "p95": null,
+      "formula": "relayRoundTripMs.p95 - directBaselineRoundTripMs.p95"
+    }
+  },
+  "throughput": {
+    "clientToHostSent": 154249600,
+    "clientToHostReceived": 154249600,
+    "hostToClientSent": 154249600,
+    "hostToClientReceived": 154249600,
+    "clientContinuousSent": 49152000,
+    "clientBurstSent": 104857600,
+    "clientRttSent": 240000,
+    "hostContinuousSent": 49152000,
+    "hostBurstSent": 104857600,
+    "hostRttEchoSent": 240000,
+    "clientPayloadUnitsReceived": 12400,
+    "hostPayloadUnitsReceived": 12400,
+    "payloadIntegrityFailures": 0,
+    "ticksWithAllPairs": 60,
+    "ticksWithMissingPairs": 0,
+    "trafficElapsedSeconds": 60.947650833,
+    "clientToHostSentBytesPerSecond": 2530853.90317426,
+    "hostToClientSentBytesPerSecond": 2530853.90317426,
+    "relayForwardedBytes": {
+      "clientToHost": 153426400,
+      "hostToClient": 153426400
+    }
+  },
+  "runtime": {
+    "relayCpuPercent": 8.722865735975299,
+    "relayRssPeakBytes": 225005568,
+    "relayOpenFdsPeak": 1434,
+    "relayEventLoopLagP99Ms": 40.009727000000005,
+    "runnerEventLoopLagMs": {
+      "p95": 64.9119589999973,
+      "max": 190.63412499999686
+    },
+    "sendEvidence": {
+      "queuedWritePeakBytes": 0,
+      "sendCallbackErrors": 0,
+      "synchronousSendErrors": 0,
+      "pendingCallbacks": 0,
+      "drainCompleted": true
+    },
+    "metricSampleCount": 63,
+    "metricErrorCount": 0
+  },
+  "environment": {
+    "node": "v24.16.0",
+    "platform": "darwin/arm64",
+    "hostLogicalCpus": 10,
+    "hostMemoryBytes": 25769803776,
+    "docker": {
+      "available": true,
+      "cpus": 10,
+      "memoryBytes": 12601012224
+    }
+  },
+  "executionChecks": [
+    {
+      "name": "requested_host_controls_established",
+      "expected": 1000,
+      "actual": 1000,
+      "pass": true
+    },
+    {
+      "name": "requested_data_pairs_established",
+      "expected": 200,
+      "actual": 200,
+      "pass": true
+    },
+    {
+      "name": "unexpected_disconnects_zero",
+      "expected": 0,
+      "actual": 0,
+      "pass": true
+    },
+    {
+      "name": "host_heartbeat_acknowledgements",
+      "expected": 8000,
+      "actual": 8000,
+      "pass": true
+    },
+    {
+      "name": "host_heartbeat_misses_zero",
+      "expected": 0,
+      "actual": 0,
+      "pass": true
+    },
+    {
+      "name": "harness_failures_zero",
+      "expected": 0,
+      "actual": 0,
+      "pass": true
+    },
+    {
+      "name": "continuous_client_to_host_4_kib_per_second",
+      "expected": 49152000,
+      "actual": 49152000,
+      "pass": true
+    },
+    {
+      "name": "continuous_host_to_client_4_kib_per_second",
+      "expected": 49152000,
+      "actual": 49152000,
+      "pass": true
+    },
+    {
+      "name": "periodic_client_to_host_256_kib_bursts",
+      "expected": 104857600,
+      "actual": 104857600,
+      "pass": true
+    },
+    {
+      "name": "periodic_host_to_client_256_kib_bursts",
+      "expected": 104857600,
+      "actual": 104857600,
+      "pass": true
+    },
+    {
+      "name": "client_to_host_delivery_exact_after_drain",
+      "expected": 154249600,
+      "actual": 154249600,
+      "pass": true
+    },
+    {
+      "name": "host_to_client_delivery_exact_after_drain",
+      "expected": 154249600,
+      "actual": 154249600,
+      "pass": true
+    },
+    {
+      "name": "payload_integrity",
+      "expected": 0,
+      "actual": 0,
+      "pass": true
+    },
+    {
+      "name": "all_active_pairs_sent_each_tick",
+      "expected": 60,
+      "actual": 60,
+      "pass": true
+    },
+    {
+      "name": "send_callbacks_and_queued_writes_drained",
+      "expected": 0,
+      "actual": 0,
+      "pass": true
+    }
+  ],
+  "qualificationChecks": [
+    {
+      "name": "full_5k_host_controls",
+      "expected": 5000,
+      "actual": 1000,
+      "pass": false
+    },
+    {
+      "name": "full_1k_active_data_pairs",
+      "expected": 1000,
+      "actual": 200,
+      "pass": false
+    },
+    {
+      "name": "hold_duration_seconds",
+      "expected": 600,
+      "actual": 60,
+      "pass": false
+    },
+    {
+      "name": "docker_8_vcpu_16_gib",
+      "expected": {
+        "cpus": 8,
+        "memoryBytes": 17179869184
+      },
+      "actual": {
+        "available": true,
+        "cpus": 10,
+        "memoryBytes": 12601012224
+      },
+      "pass": false
+    },
+    {
+      "name": "stream_open_p95_ms_lt_500",
+      "expected": 500,
+      "actual": 111.77433400000018,
+      "pass": true
+    },
+    {
+      "name": "direct_baseline_present",
+      "expected": "latency.roundTripMs.p95",
+      "actual": null,
+      "pass": false
+    },
+    {
+      "name": "added_rtt_p95_ms_lt_100",
+      "expected": 100,
+      "actual": null,
+      "pass": false
+    },
+    {
+      "name": "unexpected_disconnects_zero",
+      "expected": 0,
+      "actual": 0,
+      "pass": true
+    },
+    {
+      "name": "relay_rss_peak_lt_2_gib",
+      "expected": 2147483648,
+      "actual": 225005568,
+      "pass": true
+    },
+    {
+      "name": "relay_metrics_collected",
+      "expected": true,
+      "actual": true,
+      "pass": true
+    }
+  ],
+  "failures": [],
+  "notes": [
+    "`addedRttMs` is only calculated from the supplied direct baseline; raw relay round-trip is never used as an added-RTT substitute.",
+    "Report contains aggregate counters and safe projections only."
+  ]
+}

@@ -25,6 +25,16 @@ export class RelayMetrics {
     labelNames: ["direction", "kind"] as const,
     registers: [this.registry],
   });
+  /**
+   * The relay deliberately does not inspect opaque payloads, but byte counts
+   * are safe operational telemetry and are needed to verify capacity traffic.
+   */
+  readonly forwardedBytes = new Counter({
+    name: "prospero_relay_forwarded_bytes_total",
+    help: "Opaque WebSocket payload bytes forwarded without inspection",
+    labelNames: ["direction"] as const,
+    registers: [this.registry],
+  });
   readonly rateLimited = new Counter({
     name: "prospero_relay_rate_limited_total",
     help: "Connections and auth attempts rate limited",
