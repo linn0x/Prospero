@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   PairingPayloadSchema,
   ProtocolError,
+  deriveRelayRouteId,
   generateKeyPairB64,
   parseC2S,
   parseS2C,
@@ -115,7 +116,7 @@ describe("message schemas", () => {
         relay: {
           v: 1,
           url: "wss://relay.example.com/v1",
-          routeId: "route_0123456789",
+          routeId: deriveRelayRouteId("BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"),
           deviceId: "device_0123456789",
           token: "ticket_0123456789",
         },

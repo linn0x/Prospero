@@ -4,6 +4,7 @@ import {
   PAIRING_FORMAT_VERSION,
   ProtocolError,
   decodePairingQR,
+  deriveRelayRouteId,
   encodePairingQR,
   generateKeyPairB64,
   hostIdForDaemonPublicKey,
@@ -25,7 +26,7 @@ function relay() {
   return {
     v: 1 as const,
     url: "wss://relay.example.com/v1",
-    routeId: "route_0123456789",
+    routeId: deriveRelayRouteId("BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"),
     deviceId: "device_0123456789",
     token: "ticket_0123456789",
   };
