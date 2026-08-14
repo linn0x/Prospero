@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { randomBytes } from "node:crypto";
-import { deriveRouteId, randomOpaque } from "./crypto.js";
+import { deriveRouteId } from "./crypto.js";
 import { readConfig } from "./config.js";
 import { RedisEphemeralStore, MySqlRouteStore } from "./store.js";
 import type { RelayEvent } from "./types.js";
@@ -11,8 +11,6 @@ function usage(): never {
   prospero-relay-admin route disable <routeId>
   prospero-relay-admin route enable <routeId>
   prospero-relay-admin route inspect <routeId>
-  prospero-relay-admin device add <routeId>
-  prospero-relay-admin device revoke <routeId> <deviceId>
 `);
   process.exit(2);
 }
@@ -47,11 +45,9 @@ async function main(args: string[]): Promise<void> {
       const secret = option === "--host-secret" ? hostSecretFromArgument(rest[1]) : hostSecretFromArgument(undefined);
       if (option !== undefined && option !== "--host-secret") usage();
       const routeId = deriveRouteId(secret);
-      const hostDeviceId = randomOpaque(16);
-      const hostToken = randomOpaque(32);
-      await routes.createRoute(routeId, hostDeviceId, hostToken);
+      await routes.createRoute(routeId);
       // The secret is intentionally emitted once for the host's local durable store; MySQL never sees it.
-      process.stdout.write(`${JSON.stringify({ routeId, hostSecret: secret.toString("base64url"), hostDeviceId, hostToken })}\n`);
+      process.stdout.write(`${JSON.stringify({ routeId, hostSecret: secret.toString("base64url") })}\n`);
       return;
     }
     if (noun === "route" && (verb === "disable" || verb === "enable" || verb === "inspect")) {
@@ -66,23 +62,6 @@ async function main(args: string[]): Promise<void> {
       if (!changed) throw new Error("route not found");
       await publish(ephemeral, { type: verb === "disable" ? "route.disabled" : "route.enabled", routeId });
       process.stdout.write(`${JSON.stringify({ routeId, status: verb === "disable" ? "disabled" : "enabled" })}\n`);
-      return;
-    }
-    if (noun === "device" && verb === "add") {
-      const routeId = requireId(rest[0], "routeId");
-      const deviceId = randomOpaque(16);
-      const token = randomOpaque(32);
-      await routes.addDevice(routeId, deviceId, token, "client");
-      process.stdout.write(`${JSON.stringify({ routeId, deviceId, token })}\n`);
-      return;
-    }
-    if (noun === "device" && verb === "revoke") {
-      const routeId = requireId(rest[0], "routeId");
-      const deviceId = requireId(rest[1], "deviceId");
-      const changed = await routes.revokeDevice(routeId, deviceId);
-      if (!changed) throw new Error("device not found");
-      await publish(ephemeral, { type: "device.revoked", routeId, deviceId });
-      process.stdout.write(`${JSON.stringify({ routeId, deviceId, status: "revoked" })}\n`);
       return;
     }
     usage();
