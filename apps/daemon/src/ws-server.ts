@@ -1717,6 +1717,7 @@ export async function createDaemonServer(
 
   const relayClient = new RelayHostClient({
     devMode,
+    stateDir: opts.home,
     onStream: (ws) => attachIncomingSocket(ws, false),
     onStatus: (status) => statusFile.setRelayStatus(status),
   });
