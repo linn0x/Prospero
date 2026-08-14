@@ -15,6 +15,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { decodePairingQR } from "@prospero/protocol";
 import { useDiscovery } from "@/lib/discovery";
 import { upsertHostFromPairing } from "@/lib/hosts";
+import { pairingErrorNotice } from "@/lib/pairing-error-notice";
 
 export default function PairScreen() {
   const [permission, requestPermission] = useCameraPermissions();
@@ -54,7 +55,8 @@ export default function PairScreen() {
       router.replace(`/host/${host.id}`);
     } catch (e) {
       scannedRef.current = false;
-      Alert.alert("配对码无效", e instanceof Error ? e.message : String(e));
+      const notice = pairingErrorNotice(e);
+      Alert.alert(notice.title, notice.message);
     }
   }, []);
 
