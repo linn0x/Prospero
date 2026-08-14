@@ -130,7 +130,7 @@ describe("DispatchService", () => {
     await expect(service.stopWorker(task.id)).rejects.toMatchObject({ code: "worker_not_active" });
   });
 
-  it("worker 未交付就自然退出时会自动收尾，不再永久显示 running", async () => {
+  it("worker 在真正终止前未交付时会自动收尾，不再永久显示 running", async () => {
     const store = new OrchestrationStore();
     const run = store.createRun({ objective: "退出收尾" });
     const task = store.createTask({ runId: run.id, title: "会退出", spec: "" });
@@ -143,11 +143,56 @@ describe("DispatchService", () => {
       cwd: "/tmp/project",
     });
 
-    expect(service.settleEndedSession(started.session.id, "worker 会话意外退出")).toMatchObject({
+    expect(service.settleTerminatedSession(started.session.id, "worker 会话意外退出")).toMatchObject({
       task: { status: "failed" },
       dispatch: { state: "abandoned" },
     });
-    expect(service.settleEndedSession(started.session.id, "重复事件")).toBeNull();
+    expect(service.settleTerminatedSession(started.session.id, "重复事件")).toBeNull();
+  });
+
+  it("结构化 worker 的首轮 completed 仍保留派发、工作树 writer 租约并可在第二轮显式交付", async () => {
+    const store = new OrchestrationStore();
+    const run = store.createRun({ objective: "首轮完成后继续" });
+    const task = store.createTask({ runId: run.id, title: "首轮 completed", spec: "继续等待交付" });
+    const competing = store.createTask({ runId: run.id, title: "不得抢占 writer", spec: "" });
+    store.registerWorktreeAsset({
+      kind: "worker",
+      runId: run.id,
+      taskId: task.id,
+      repo: "/tmp/repo",
+      path: "/tmp/completed-worker",
+      branch: null,
+    });
+    const sessions = new FakeSessions();
+    const service = new DispatchService(store, sessions);
+    const started = await service.startWorker({
+      taskId: task.id,
+      agent: "codex",
+      worktree: "none",
+      cwd: "/tmp/completed-worker",
+    });
+
+    sessions.live.set(started.session.id, {
+      ...sessions.infoOf(started.session.id),
+      status: "completed",
+    });
+    expect(store.getTask(task.id)).toMatchObject({ status: "dispatched" });
+    expect(store.getDispatch(started.dispatch.id)).toMatchObject({ state: "running" });
+    await expect(service.startWorker({
+      taskId: competing.id,
+      agent: "codex",
+      worktree: "none",
+      cwd: "/tmp/completed-worker",
+    })).rejects.toMatchObject({ code: "worktree_busy" } satisfies Partial<DispatchError>);
+
+    await sessions.chatSend(started.session.id, "第二轮：请现在交付");
+    await service.completeTask(task.id, started.session.id, "第二轮已完成并验过");
+    expect(sessions.messages.at(-1)).toEqual({ sid: started.session.id, text: "第二轮：请现在交付" });
+    expect(store.getTask(task.id)).toMatchObject({ status: "done", result: "第二轮已完成并验过" });
+    expect(store.getDispatch(started.dispatch.id)).toMatchObject({
+      state: "succeeded",
+      outcome: "第二轮已完成并验过",
+    });
   });
 
   it("done/fail 先持久交付再 kill；kill 失败与重复终态事件都不回滚交付", async () => {
@@ -258,7 +303,7 @@ describe("DispatchService", () => {
     }
   });
 
-  it("worktree:none 拒绝同路径 live writer，但终态/缺失会话和不同路径仍可派发", async () => {
+  it("worktree:none 拒绝同路径 live writer（包括 completed），但真正终态/缺失会话和不同路径仍可派发", async () => {
     const store = new OrchestrationStore();
     const oldRun = store.createRun({ objective: "旧 worktree" });
     const oldTask = store.createTask({ runId: oldRun.id, title: "旧任务", spec: "" });
@@ -278,7 +323,8 @@ describe("DispatchService", () => {
     });
     const targetRun = store.createRun({ objective: "新 worktree" });
     const blocked = store.createTask({ runId: targetRun.id, title: "应拒绝", spec: "" });
-    const terminal = store.createTask({ runId: targetRun.id, title: "终态允许", spec: "" });
+    const doneTerminal = store.createTask({ runId: targetRun.id, title: "done 终态允许", spec: "" });
+    const diedTerminal = store.createTask({ runId: targetRun.id, title: "died 终态允许", spec: "" });
     const missing = store.createTask({ runId: targetRun.id, title: "缺失允许", spec: "" });
     const elsewhere = store.createTask({ runId: targetRun.id, title: "不同路径允许", spec: "" });
     const sessions = new FakeSessions();
@@ -294,16 +340,31 @@ describe("DispatchService", () => {
     expect(sessions.creates).toHaveLength(0);
 
     sessions.live.set("old-live", {
+      ...sessions.infoOf("old-live"), status: "completed",
+    });
+    await expect(service.startWorker({
+      taskId: doneTerminal.id, agent: "codex", worktree: "none", cwd: "/tmp/registered-worktree",
+    })).rejects.toMatchObject({ code: "worktree_busy" } satisfies Partial<DispatchError>);
+    expect(sessions.creates).toHaveLength(0);
+
+    sessions.live.set("old-live", {
       ...sessions.infoOf("old-live"), status: "done",
     });
     await service.startWorker({
-      taskId: terminal.id, agent: "codex", worktree: "none", cwd: "/tmp/registered-worktree",
+      taskId: doneTerminal.id, agent: "codex", worktree: "none", cwd: "/tmp/registered-worktree",
     });
 
-    sessions.live.delete("old-live");
     // 上一步实际新建了一个 writer；模拟它也已从 SessionManager 消失后，才能
-    // 验证“旧 session 缺失”不会永久占用租约。
+    // 分别验证 died 和缺失的旧 session 都不会永久占用租约。
     sessions.live.delete("worker-session");
+    sessions.live.set("old-live", {
+      ...sessions.infoOf("old-live"), status: "died",
+    });
+    await service.startWorker({
+      taskId: diedTerminal.id, agent: "codex", worktree: "none", cwd: "/tmp/registered-worktree",
+    });
+    sessions.live.delete("worker-session");
+    sessions.live.delete("old-live");
     await service.startWorker({
       taskId: missing.id, agent: "codex", worktree: "none", cwd: "/tmp/registered-worktree",
     });
@@ -311,7 +372,7 @@ describe("DispatchService", () => {
     await service.startWorker({
       taskId: elsewhere.id, agent: "codex", worktree: "none", cwd: "/tmp/another-worktree",
     });
-    expect(sessions.creates).toHaveLength(3);
+    expect(sessions.creates).toHaveLength(4);
   });
 
   it("已登记 worktree 在 session.create 进行中也只允许一个 writer", async () => {

@@ -67,6 +67,59 @@ class RecoverySessions implements WorkerSessionManager {
 }
 
 describe("daemon 启动时的 Dispatch 对账", () => {
+  it("WS 状态监听把 completed 当作 live：只检查 coordinator Run，不失败 active Dispatch", async () => {
+    const home = temporaryHome();
+    const server = await createDaemonServer({ home, port: 0 });
+    try {
+      const coordinatorRun = server.orchestration.store.createRun({
+        objective: "coordinator completed 后检查收口",
+        coordinatorSessionId: "coordinator-session",
+      });
+      const coordinatorTask = server.orchestration.store.createTask({
+        runId: coordinatorRun.id,
+        title: "已显式交付",
+        spec: "",
+      });
+      const coordinatorDispatch = server.orchestration.store.createDispatch({
+        taskId: coordinatorTask.id,
+        sessionId: "coordinator-worker",
+      });
+      server.orchestration.store.settleWorkerDelivery(
+        coordinatorDispatch.id,
+        "done",
+        "succeeded",
+        "已交付",
+        "已交付",
+      );
+      vi.spyOn(server.manager, "list").mockReturnValue([
+        session("coordinator-session", "completed"),
+      ]);
+
+      const workerRun = server.orchestration.store.createRun({ objective: "completed worker 不失联" });
+      const workerTask = server.orchestration.store.createTask({
+        runId: workerRun.id,
+        title: "继续等待第二轮",
+        spec: "",
+      });
+      const workerDispatch = server.orchestration.store.createDispatch({
+        taskId: workerTask.id,
+        sessionId: "completed-worker",
+      });
+
+      server.manager.emit("state", session("completed-worker", "completed"));
+
+      expect(server.orchestration.store.getRun(coordinatorRun.id).status).toBe("completed");
+      expect(server.orchestration.store.getDispatch(workerDispatch.id)).toMatchObject({ state: "starting" });
+      expect(server.orchestration.store.getTask(workerTask.id)).toMatchObject({ status: "dispatched" });
+
+      server.manager.emit("state", session("completed-worker", "done"));
+      expect(server.orchestration.store.getDispatch(workerDispatch.id)).toMatchObject({ state: "abandoned" });
+      expect(server.orchestration.store.getTask(workerTask.id)).toMatchObject({ status: "failed" });
+    } finally {
+      await server.close();
+    }
+  });
+
   it("真实 daemon 启动会对账持久化的缺失会话，第二次启动保持幂等", async () => {
     const home = temporaryHome();
     const seeded = new OrchestrationStore(home);
@@ -123,51 +176,75 @@ describe("daemon 启动时的 Dispatch 对账", () => {
     restarted.close();
   });
 
-  it("恢复时已终态的会话同样失败；已经显式 done 的事实仍优先", async () => {
+  it("恢复时只有 done/died 会话失败；completed 恢复为 running，已显式 done 的事实仍优先", async () => {
     const store = new OrchestrationStore();
     const run = store.createRun({ objective: "恢复终态 worker" });
-    const endedTask = store.createTask({ runId: run.id, title: "未交付", spec: "" });
+    const completedTask = store.createTask({ runId: run.id, title: "首轮完成，仍可继续", spec: "" });
+    const doneTask = store.createTask({ runId: run.id, title: "done 未交付", spec: "" });
+    const diedTask = store.createTask({ runId: run.id, title: "died 未交付", spec: "" });
     const explicitTask = store.createTask({ runId: run.id, title: "已交付", spec: "" });
-    const ended = store.createDispatch({ taskId: endedTask.id, sessionId: "ended-worker" });
+    const completed = store.createDispatch({ taskId: completedTask.id, sessionId: "completed-worker" });
+    const done = store.createDispatch({ taskId: doneTask.id, sessionId: "done-worker" });
+    const died = store.createDispatch({ taskId: diedTask.id, sessionId: "died-worker" });
     const explicit = store.createDispatch({ taskId: explicitTask.id, sessionId: "reported-worker" });
     // 模拟 task.done 已落盘、dispatch 成功状态尚未来得及落盘时 daemon 崩溃。
     store.setTaskStatus(explicitTask.id, "done", "worker 已显式交付");
 
     const sessions = new RecoverySessions();
-    sessions.live.set("ended-worker", session("ended-worker", "completed"));
+    sessions.live.set("completed-worker", session("completed-worker", "completed"));
+    sessions.live.set("done-worker", session("done-worker", "done"));
+    sessions.live.set("died-worker", session("died-worker", "died"));
     sessions.live.set("reported-worker", session("reported-worker", "done"));
     const result = await new DispatchService(store, sessions).reconcilePersistedSessions();
 
-    expect(result.settled).toHaveLength(2);
-    expect(store.getDispatch(ended.id).state).toBe("abandoned");
-    expect(store.getTask(endedTask.id).status).toBe("failed");
+    expect(result.settled).toHaveLength(3);
+    expect(result.resumed).toEqual([expect.objectContaining({ id: completed.id, state: "running" })]);
+    expect(store.getDispatch(completed.id).state).toBe("running");
+    expect(store.getTask(completedTask.id).status).toBe("dispatched");
+    expect(store.getDispatch(done.id).state).toBe("abandoned");
+    expect(store.getTask(doneTask.id).status).toBe("failed");
+    expect(store.getDispatch(died.id).state).toBe("abandoned");
+    expect(store.getTask(diedTask.id).status).toBe("failed");
     expect(store.getDispatch(explicit.id)).toMatchObject({ state: "succeeded", outcome: "worker 已显式交付" });
     expect(store.getTask(explicitTask.id)).toMatchObject({ status: "done", result: "worker 已显式交付" });
   });
 
-  it("重启会终止已持久化交付但仍存活的 succeeded/failed worker，并保留历史", async () => {
+  it("重启会终止已持久化交付但仍存活（含 completed）的 worker，并保留历史", async () => {
     const home = temporaryHome();
     const seeded = new OrchestrationStore(home);
     const run = seeded.createRun({ objective: "交付后 kill 前崩溃" });
     const doneTask = seeded.createTask({ runId: run.id, title: "done", spec: "" });
     const failedTask = seeded.createTask({ runId: run.id, title: "failed", spec: "" });
+    const completedTask = seeded.createTask({ runId: run.id, title: "completed", spec: "" });
     const doneDispatch = seeded.createDispatch({ taskId: doneTask.id, sessionId: "done-still-live" });
     const failedDispatch = seeded.createDispatch({ taskId: failedTask.id, sessionId: "failed-still-live" });
+    const completedDispatch = seeded.createDispatch({
+      taskId: completedTask.id,
+      sessionId: "completed-still-live",
+    });
     seeded.setTaskStatus(doneTask.id, "done", "已交付");
     seeded.setDispatchState(doneDispatch.id, "succeeded", "已交付");
     seeded.setTaskStatus(failedTask.id, "failed", "已报告失败");
     seeded.setDispatchState(failedDispatch.id, "failed", "已报告失败");
+    seeded.setTaskStatus(completedTask.id, "done", "已交付但会话刚结束本轮");
+    seeded.setDispatchState(completedDispatch.id, "succeeded", "已交付但会话刚结束本轮");
     seeded.close();
 
     const restored = new OrchestrationStore(home);
     const sessions = new RecoverySessions();
     sessions.live.set("done-still-live", session("done-still-live", "idle"));
     sessions.live.set("failed-still-live", session("failed-still-live", "running"));
+    sessions.live.set("completed-still-live", session("completed-still-live", "completed"));
     const result = await new DispatchService(restored, sessions).reconcilePersistedSessions();
 
     expect(result).toEqual({ settled: [], resumed: [] });
-    expect(sessions.killed).toEqual(["done-still-live", "failed-still-live"]);
+    expect(sessions.killed).toEqual([
+      "done-still-live",
+      "failed-still-live",
+      "completed-still-live",
+    ]);
     expect(sessions.killOptions).toEqual([
+      { preserveHistory: true },
       { preserveHistory: true },
       { preserveHistory: true },
     ]);
@@ -175,6 +252,8 @@ describe("daemon 启动时的 Dispatch 对账", () => {
     expect(restored.getDispatch(failedDispatch.id).state).toBe("failed");
     expect(restored.getTask(doneTask.id).status).toBe("done");
     expect(restored.getTask(failedTask.id).status).toBe("failed");
+    expect(restored.getDispatch(completedDispatch.id).state).toBe("succeeded");
+    expect(restored.getTask(completedTask.id).status).toBe("done");
     restored.close();
   });
 

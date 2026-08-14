@@ -188,7 +188,7 @@ describe("编排工作树资产检查与清理", () => {
     expect(git(repo, ["branch", "--list", "prospero/cleanup"])).toBe("prospero/cleanup");
   });
 
-  it("cleanup 拒绝仍由 live settled session 使用的工作树，并记录后续处理原因", async () => {
+  it("cleanup 拒绝仍由 completed live settled session 使用的工作树，并记录后续处理原因", async () => {
     const { repo, assets } = repository();
     const store = new OrchestrationStore();
     const run = store.createRun({ objective: "live settled worker" });
@@ -224,7 +224,8 @@ describe("编排工作树资产检查与清理", () => {
           kind: "structured" as const,
           title: "worker",
           cwd: created.path,
-          status: "running" as const,
+          // completed 是结构化 worker 的本轮结束，仍可接收 chat 并写入 cwd。
+          status: "completed" as const,
           createdAt: 1,
           cols: 80,
           rows: 24,
