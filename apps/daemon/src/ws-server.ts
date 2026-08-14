@@ -2098,10 +2098,20 @@ export async function createDaemonServer(
   // 接管上一轮留下的 tmux 会话。必须在 statusFile.start 之前,
   // 否则壳会先看到一份"零会话"的快照。
   const restoredPty = manager.restoreFromTmux();
-  const restoredStructured = await manager.restoreStructured();
+  const restoredStructured = await manager.restoreStructured({
+    // 先于 adapter.start 封存已结算 worker，避免重启窗口重新消费旧 worktree 的队列。
+    // 每条 state 恢复前即时读取 Store：control socket 已启用，旧 worker 可能恰在
+    // daemon 启动时落下交付，不能使用启动前的一份静态快照。
+    preserveHistoryWhen: (state) => orchestrationStore.listDispatches().some(
+      (dispatch) =>
+        dispatch.sessionId === state.id &&
+        dispatch.state !== "starting" &&
+        dispatch.state !== "running",
+    ),
+  });
   // state 事件只能覆盖恢复过程中仍会报告终态的会话；直接托管消失、或终态
   // 已早于 daemon 启动发生的 worker 必须主动逐条对账，不能永久卡在 running。
-  dispatchService.reconcilePersistedSessions();
+  await dispatchService.reconcilePersistedSessions();
   completeSettledCoordinatorRuns();
   statusFile.start(port);
   automationService.resumePersisted();
