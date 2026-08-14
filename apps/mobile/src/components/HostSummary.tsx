@@ -84,6 +84,7 @@ export function HostSummary({
     info.arch,
     info.cpus !== undefined ? `${String(info.cpus)} 核` : null,
   ].filter((x): x is string => typeof x === "string" && x.length > 0);
+  const pathLabel = conn?.activePath === "relay" ? "中继" : conn?.activePath === "direct" ? "直连" : null;
 
   return (
     <>
@@ -98,6 +99,7 @@ export function HostSummary({
           <Text style={styles.headText} numberOfLines={1}>
             {connected ? "已连接" : "未连接"}
             {connected && rttMs !== null ? ` · ${String(rttMs)}ms` : ""}
+            {connected && pathLabel ? ` · ${pathLabel}` : ""}
           </Text>
           <Text style={font.meta}>
             {runningCount > 0 ? `${String(runningCount)} 个运行中 · ` : ""}
@@ -178,6 +180,7 @@ export function HostSummary({
           label="daemon 版本"
           value={`${info.daemonVersion} · 协议 v${String(info.protocolVersion)}`}
         />
+        {connected && pathLabel && <Row label="当前路径" value={pathLabel} />}
         {/* 这条决定 daemon 重启后会话是否还在 —— 值得单独说,而不是藏在文档里 */}
         {info.tmuxManaged !== undefined && (
           <Row

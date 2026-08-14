@@ -19,7 +19,23 @@ export type AttemptFailure =
   /** 这台设备已在电脑端被移除 */
   | "revoked"
   /** 对面证明不了自己是配对时那台电脑(换了密钥,或有中间人) */
-  | "untrusted";
+  | "untrusted"
+  /** relay 模式没有来自 QR 的独立 route ticket */
+  | "relay_credentials_missing"
+  /** relay 已知但主机目前未注册/离线 */
+  | "relay_offline"
+  /** relay route ticket 被撤销或不匹配 */
+  | "relay_auth"
+  /** relay 的连接认证/并发限流 */
+  | "relay_rate_limit"
+  /** relay 暂时内部过载 */
+  | "relay_overload"
+  /** relay control-plane 版本不兼容 */
+  | "relay_version"
+  /** TLS 或安全 URL 策略不满足 */
+  | "relay_tls"
+  /** relay 返回了不符合 v1 合约的控制帧 */
+  | "relay_protocol";
 
 export interface AttemptResult {
   addr: string;
@@ -90,7 +106,74 @@ export function diagnose(
     };
   }
 
+  if (results.some((r) => r.failure === "relay_credentials_missing")) {
+    return {
+      summary: "中继凭证缺失",
+      hint: "这台主机的中继 route ticket 不在此设备上。请在电脑运行 prosperod pair 后重新扫码；不要手动输入或复用 E2E token。",
+      fatal: true,
+    };
+  }
+
+  if (results.some((r) => r.failure === "relay_auth")) {
+    return {
+      summary: "中继配对已失效",
+      hint: "中继拒绝了这台设备的独立 route ticket。请在电脑重新生成 prosperod pair 并扫码配对。",
+      fatal: true,
+    };
+  }
+
+  if (results.some((r) => r.failure === "relay_version")) {
+    return {
+      summary: "中继版本不兼容",
+      hint: "中继服务与此 App 的 relay v1 控制协议不兼容。请升级中继服务或移动端后重试，不需要更改 E2E 配对。",
+      fatal: true,
+    };
+  }
+
+  if (results.some((r) => r.failure === "relay_tls")) {
+    return {
+      summary: "中继 TLS 连接被拒绝",
+      hint: "生产环境只接受 wss:// 中继地址。检查中继证书、URL 和网络；开发环境也只允许 loopback 的 ws://。",
+      fatal: true,
+    };
+  }
+
   const kinds = new Set(results.map((r) => r.failure));
+
+  if (kinds.size === 1 && kinds.has("relay_offline")) {
+    return {
+      summary: "中继上的电脑当前离线",
+      hint: "请确认电脑已联网且 prosperod relay 已连接。手机会自动重试；也可切到直连并连接同一局域网。",
+      fatal: false,
+    };
+  }
+
+  if (kinds.has("relay_rate_limit")) {
+    const retryAfterMs = results.find((r) => r.failure === "relay_rate_limit")?.detail;
+    return {
+      summary: "中继暂时限流",
+      hint: retryAfterMs
+        ? `中继要求稍后重试（${retryAfterMs}）。应用会使用退避自动重连。`
+        : "中继暂时限制了连接频率。应用会使用退避自动重连。",
+      fatal: false,
+    };
+  }
+
+  if (kinds.has("relay_overload")) {
+    return {
+      summary: "中继暂时过载",
+      hint: "中继服务暂时无法建立流。应用会自动退避重试；也可以切换到直连。",
+      fatal: false,
+    };
+  }
+
+  if (kinds.has("relay_protocol")) {
+    return {
+      summary: "中继控制握手失败",
+      hint: "中继返回了无效控制帧。请查看中继服务状态或升级服务后重试。",
+      fatal: false,
+    };
+  }
 
   if (kinds.size === 1 && kinds.has("unreachable")) {
     return {

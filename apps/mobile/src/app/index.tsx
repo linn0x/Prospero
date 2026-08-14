@@ -163,7 +163,9 @@ export default function HostsScreen() {
             ) : null
           }
           renderItem={({ item, index }) => {
-            const status = runtimes[item.id]?.status ?? "idle";
+            const runtime = runtimes[item.id];
+            const status = runtime?.status ?? "idle";
+            const path = runtime?.activePath === "relay" ? "中继" : runtime?.activePath === "direct" ? "直连" : null;
             const columnWidth = adaptiveLayout.verticalPanes
               ? index % 2 === 0
                 ? adaptiveLayout.verticalPanes.start
@@ -209,6 +211,7 @@ export default function HostsScreen() {
                       <Text style={styles.cardTitle}>{item.name}</Text>
                       <Text style={styles.cardSub}>
                         {statusLabel[status]}
+                        {path ? ` · ${path}` : ""}
                         {item.addrs.length > 1 ? ` · ${String(item.addrs.length)} 条线路` : ""}
                       </Text>
                     </View>

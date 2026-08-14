@@ -30,9 +30,11 @@ import {
   SUPPORTED_PROTOCOL_VERSIONS,
   clientHandshakeStart,
   clientHandshakeFinish,
+  parseRelayControlMessage,
   parseS2C,
   toB64,
   utf8Encode,
+  validateRelayUrl,
   ProtocolError,
   type AgentKind,
   type AgentAccount,
@@ -64,8 +66,24 @@ import {
   type SessionKind,
 } from "@prospero/protocol";
 import { diagnose, type AttemptResult, type Diagnosis } from "./connect-diagnosis";
+import {
+  selectConnectionCandidates,
+  type ConnectionCandidate,
+  type ConnectionPath,
+  type RelayCandidate,
+} from "./connection-candidates";
+import {
+  AllAttemptsFailed,
+  raceFirstSuccessful,
+  type ManagedAttempt,
+} from "./connection-race";
+import {
+  HEARTBEAT_TICK_MS,
+  nextLivenessAction,
+} from "./connection-liveness";
 import { Emitter } from "./emitter";
 import { rememberGoodAddr, type StoredHost } from "./hosts";
+import { advanceRelayClient, type RelayClientState } from "./relay-client-state";
 import {
   BoundedQueue,
   acceptedDelivery,
@@ -81,8 +99,6 @@ const ATTEMPT_TIMEOUT_MS = 6000;
 const BACKOFF_MIN = 400;
 const BACKOFF_MAX = 8000;
 /** 心跳间隔与容忍的静默时长(daemon 每 15s ping 一次) */
-const HEARTBEAT_MS = 10_000;
-const SILENCE_LIMIT_MS = 35_000;
 /** 断线期间最多排队多少条待发消息 */
 export const MAX_OFFLINE_QUEUE = 50;
 const CLIENT_PLATFORM = Platform.OS === "android" ? "android" : "ios";
@@ -91,13 +107,14 @@ interface Won {
   ws: WebSocket;
   channel: SecureChannel;
   helloOk: S2CHelloOk;
-  addr: string;
+  endpoint: string;
+  path: ConnectionPath;
   rttMs: number;
   protocolVersion: number;
 }
 
 export interface ConnEvents extends Record<string, unknown> {
-  connected: { addr: string; rttMs: number };
+  connected: { addr: string; path: ConnectionPath; rttMs: number };
   disconnected: { willRetry: boolean };
   snapshot: S2CTermSnapshot;
   output: S2CTermOutput;
@@ -113,6 +130,7 @@ export interface ConnEvents extends Record<string, unknown> {
 export class HostConnection {
   readonly events = new Emitter<ConnEvents>();
   activeAddr: string | null = null;
+  activePath: ConnectionPath | null = null;
   lastRttMs: number | null = null;
   diagnosis: Diagnosis | null = null;
 
@@ -124,6 +142,8 @@ export class HostConnection {
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private lastRecvAt = 0;
+  private lastPingAt = 0;
+  private pendingPingId: string | null = null;
   /** 格式错误重连也不会自愈；保留原因让 onclose 停止无限退避。 */
   private fatalReceiveError: string | null = null;
   private everConnected = false;
@@ -132,6 +152,7 @@ export class HostConnection {
   private advertisedCapabilities: Set<string> | null = null;
   /** 断线期间排队的消息,重连后按序补发 */
   private queue = new BoundedQueue<C2SMessage>(MAX_OFFLINE_QUEUE);
+  private racingAttempts: ManagedAttempt<Won>[] | null = null;
 
   constructor(
     readonly host: StoredHost,
@@ -234,12 +255,18 @@ export class HostConnection {
   stop(): void {
     this.stopped = true;
     this.clearTimers();
+    this.abortRacingAttempts();
     this.ws?.close();
     this.ws = null;
     this.channel = null;
     this.activeAddr = null;
+    this.activePath = null;
     this.queue.clear();
-    useApp.getState().patchRuntime(this.host.id, { status: "idle", activeAddr: null });
+    useApp.getState().patchRuntime(this.host.id, {
+      status: "idle",
+      activeAddr: null,
+      activePath: null,
+    });
   }
 
   private clearTimers(): void {
@@ -263,9 +290,15 @@ export class HostConnection {
     this.patch({ status: this.everConnected ? "reconnecting" : "connecting" });
     try {
       const won = await this.race();
+      if (this.stopped) {
+        won.ws.close();
+        this.connecting = false;
+        return;
+      }
       this.adopt(won);
     } catch {
       this.connecting = false;
+      if (this.stopped) return;
       const d = this.diagnosis;
       this.patch({
         status: "failed",
@@ -275,182 +308,331 @@ export class HostConnection {
     }
   }
 
-  /** 成功过的地址优先,其余保持原序 */
-  private orderedAddrs(): string[] {
-    const seen = new Set<string>();
-    const out: string[] = [];
-    const preferred = this.host.lastGoodAddr;
-    if (preferred) {
-      out.push(preferred);
-      seen.add(preferred);
+  private abortRacingAttempts(): void {
+    const attempts = this.racingAttempts;
+    this.racingAttempts = null;
+    if (!attempts) return;
+    for (const attempt of attempts) {
+      try { attempt.abort(); } catch { /* best effort */ }
     }
-    for (const a of this.host.addrs) {
-      if (!seen.has(a)) {
-        out.push(a);
-        seen.add(a);
-      }
-    }
-    return out;
   }
 
-  private race(): Promise<Won> {
-    const addrs = this.orderedAddrs();
-    return new Promise<Won>((resolve, reject) => {
-      if (addrs.length === 0) {
-        this.diagnosis = diagnose([], !this.everConnected, CLIENT_PLATFORM);
-        reject(new Error(this.diagnosis.summary));
-        return;
-      }
-      let pending = addrs.length;
-      let done = false;
-      const failures: AttemptResult[] = [];
+  private async race(): Promise<Won> {
+    const selection = selectConnectionCandidates(this.host);
+    if (selection.candidates.length === 0) {
+      const failures: AttemptResult[] = selection.relayCredentialsMissing
+        ? [{ addr: "relay", failure: "relay_credentials_missing" }]
+        : [];
+      this.diagnosis = diagnose(failures, !this.everConnected, CLIENT_PLATFORM);
+      throw new Error(this.diagnosis.summary);
+    }
 
-      const finishFailure = (): void => {
-        if (done) return;
-        done = true;
-        this.diagnosis = diagnose(failures, !this.everConnected, CLIENT_PLATFORM);
-        reject(new Error(this.diagnosis.summary));
+    // Starting each attempt here (rather than in a chained await) is what
+    // makes auto a real direct+relay race.
+    const attempts = selection.candidates.map((candidate) => this.startCandidate(candidate));
+    this.racingAttempts = attempts;
+    try {
+      return await raceFirstSuccessful(attempts);
+    } catch (error) {
+      const failures = error instanceof AllAttemptsFailed ? error.failures : [];
+      this.diagnosis = diagnose(failures, !this.everConnected, CLIENT_PLATFORM);
+      throw error;
+    } finally {
+      if (this.racingAttempts === attempts) this.racingAttempts = null;
+    }
+  }
+
+  private startCandidate(candidate: ConnectionCandidate): ManagedAttempt<Won> {
+    return candidate.path === "direct"
+      ? this.startDirectCandidate(candidate.addr)
+      : this.startRelayCandidate(candidate);
+  }
+
+  private startDirectCandidate(addr: string): ManagedAttempt<Won> {
+    return this.startE2ECandidate({
+      label: `direct:${addr}`,
+      path: "direct",
+      endpoint: addr,
+      open: () => new WebSocket(`ws://${addr}:${this.host.port}/ws`),
+      initialOpen: () => {},
+      beforeE2EFailure: () => "unreachable",
+    });
+  }
+
+  private startRelayCandidate(candidate: RelayCandidate): ManagedAttempt<Won> {
+    let secureUrl: string;
+    try {
+      secureUrl = validateRelayUrl(candidate.url, {
+        allowInsecureLoopback: typeof __DEV__ !== "undefined" && __DEV__,
+      });
+    } catch (error) {
+      return this.failedAttempt(
+        `relay:${candidate.url}`,
+        { addr: candidate.url, failure: "relay_tls", detail: error instanceof Error ? error.message : undefined },
+      );
+    }
+
+    const relay = {
+      v: 1 as const,
+      url: secureUrl,
+      routeId: candidate.routeId,
+      deviceId: candidate.deviceId,
+      token: candidate.token,
+    };
+    let clientUrl: string;
+    try {
+      const parsed = new URL(secureUrl);
+      const path = parsed.pathname.replace(/\/$/, "");
+      parsed.pathname = path.endsWith("/v1/client")
+        ? path
+        : path.endsWith("/v1")
+          ? `${path}/client`
+          : "/v1/client";
+      clientUrl = parsed.toString();
+    } catch {
+      // validateRelayUrl already checked this; keep a defensive diagnosis if a
+      // platform URL implementation nevertheless cannot construct it.
+      return this.failedAttempt(`relay:${candidate.url}`, { addr: candidate.url, failure: "relay_tls" });
+    }
+    let relayState: RelayClientState = "opening";
+    return this.startE2ECandidate({
+      label: `relay:${clientUrl}`,
+      path: "relay",
+      endpoint: clientUrl,
+      open: () => new WebSocket(clientUrl),
+      initialOpen: (ws) => {
+        // A protocol-version fallback creates a fresh relay stream; its
+        // control plane starts over even though the candidate remains the same.
+        relayState = "opening";
+        const transition = advanceRelayClient(relayState, "opened", relay);
+        relayState = transition.state;
+        if (transition.action?.type === "send_connect") ws.send(transition.action.frame);
+      },
+      beforeE2EMessage: (text, ws) => {
+        if (relayState === "e2e") return "e2e";
+        try {
+          const control = parseRelayControlMessage(JSON.parse(text));
+          const transition = advanceRelayClient(relayState, control, relay);
+          relayState = transition.state;
+          if (transition.action?.type === "send_connect") {
+            ws.send(transition.action.frame);
+            return "waiting";
+          }
+          if (transition.action?.type === "start_e2e") return "e2e";
+          if (transition.action?.type === "fail") return transition.action;
+          return "waiting";
+        } catch (error) {
+          return {
+            type: "fail" as const,
+            failure: "relay_protocol" as const,
+            detail: error instanceof Error ? error.message : "invalid relay control frame",
+          };
+        }
+      },
+      beforeE2EFailure: () => relayState === "opening" ? "relay_tls" : "relay_offline",
+    });
+  }
+
+  private failedAttempt(label: string, failure: AttemptResult): ManagedAttempt<Won> {
+    return { label, promise: Promise.reject(failure), abort: () => {} };
+  }
+
+  /**
+   * Applies the existing protocol-version fallback and E2E handshake to either
+   * a direct socket or the byte stream established on a relay socket.
+   */
+  private startE2ECandidate(input: {
+    label: string;
+    path: ConnectionPath;
+    endpoint: string;
+    open(): WebSocket;
+    initialOpen(ws: WebSocket, frame: string): void;
+    beforeE2EMessage?: (
+      text: string,
+      ws: WebSocket,
+    ) => "waiting" | "e2e" | { type: "fail"; failure: AttemptResult["failure"]; detail?: string };
+    beforeE2EFailure(): AttemptResult["failure"];
+  }): ManagedAttempt<Won> {
+    let activeWs: WebSocket | null = null;
+    // A candidate can finish its own E2E handshake in the same microtask as a
+    // different candidate wins. Keep this reference so race cleanup still
+    // closes that already-resolved loser rather than leaking its socket.
+    let completedWs: WebSocket | null = null;
+    let settled = false;
+    let rejectAttempt: ((failure: AttemptResult) => void) | null = null;
+
+    const promise = new Promise<Won>((resolve, reject) => {
+      rejectAttempt = reject;
+      const startedAt = Date.now();
+      const failAttempt = (failure: AttemptResult["failure"], detail?: string): void => {
+        if (settled) return;
+        settled = true;
+        reject({ addr: input.endpoint, failure, ...(detail !== undefined ? { detail } : {}) });
       };
 
-      for (const addr of addrs) {
-        const startedAt = Date.now();
+      const tryVersion = (versionIndex: number): void => {
+        if (settled) return;
+        const protocolVersion = SUPPORTED_PROTOCOL_VERSIONS[versionIndex];
+        if (protocolVersion === undefined) {
+          failAttempt("version");
+          return;
+        }
+        let ws: WebSocket;
+        try {
+          ws = input.open();
+        } catch (error) {
+          failAttempt(input.beforeE2EFailure(), error instanceof Error ? error.message : undefined);
+          return;
+        }
+        activeWs = ws;
+        let opened = false;
+        let e2eReady = input.beforeE2EMessage === undefined;
+        let versionDone = false;
+        let channel: SecureChannel | null = null;
+        const { frame, state: hsState } = clientHandshakeStart(protocolVersion);
 
-        const tryVersion = (versionIndex: number): void => {
-          const protocolVersion = SUPPORTED_PROTOCOL_VERSIONS[versionIndex];
-          if (protocolVersion === undefined) return;
-          let ws: WebSocket;
-          try {
-            ws = new WebSocket(`ws://${addr}:${this.host.port}/ws`);
-          } catch (e) {
-            failures.push({
-              addr,
-              failure: "unreachable",
-              detail: e instanceof Error ? e.message : undefined,
-            });
-            if (--pending === 0) finishFailure();
+        const detach = (close: boolean): void => {
+          ws.onopen = null;
+          ws.onmessage = null;
+          ws.onerror = null;
+          ws.onclose = null;
+          if (activeWs === ws) activeWs = null;
+          if (close) {
+            try { ws.close(); } catch { /* already closed */ }
+          }
+        };
+        const failVersion = (failure: AttemptResult["failure"], detail?: string): void => {
+          if (versionDone || settled) return;
+          versionDone = true;
+          clearTimeout(timer);
+          detach(true);
+          if (failure === "version" && versionIndex + 1 < SUPPORTED_PROTOCOL_VERSIONS.length) {
+            tryVersion(versionIndex + 1);
             return;
           }
-
-          // 同一地址先尝试最新版本；收到明确的 version 关闭原因后才用新连接回退。
-          // v8+ 的版本已绑定进身份证明，v7/v5 保留原帧以兼容已经安装的 daemon。
-          const { frame, state: hsState } = clientHandshakeStart(protocolVersion);
-          let channel: SecureChannel | null = null;
-          let opened = false;
-          let attemptDone = false;
-
-          const fail = (failure: AttemptResult["failure"], detail?: string): void => {
-            if (attemptDone) return;
-            attemptDone = true;
-            clearTimeout(timer);
-            ws.onopen = null;
-            ws.onmessage = null;
-            ws.onerror = null;
-            ws.onclose = null;
-            try {
-              ws.close();
-            } catch {
-              // 已关闭
-            }
-            if (done) return;
-            if (
-              failure === "version" &&
-              versionIndex + 1 < SUPPORTED_PROTOCOL_VERSIONS.length
-            ) {
-              tryVersion(versionIndex + 1);
-              return;
-            }
-            failures.push({ addr, ...(detail !== undefined ? { detail } : {}), failure });
-            if (failure === "auth") {
-              // 鉴权失败对所有地址都成立,不必等其余
-              finishFailure();
-              return;
-            }
-            if (--pending === 0) finishFailure();
-          };
-
-          const timer = setTimeout(() => fail("timeout"), ATTEMPT_TIMEOUT_MS);
-          ws.onopen = () => {
-            opened = true;
-            ws.send(frame);
-          };
-          ws.onerror = () => fail(opened ? "handshake" : "unreachable");
-          ws.onclose = (ev) => {
-            if (!opened) {
-              fail("unreachable");
-              return;
-            }
-            const code = (ev as { code?: number } | undefined)?.code;
-            const reason = String((ev as { reason?: unknown } | undefined)?.reason ?? "");
-            if (code === CLOSE_AUTH_FAILED) fail("auth", reason || undefined);
-            else if (code === CLOSE_REVOKED) fail("revoked", reason || undefined);
-            else if (reason === "version") fail("version");
-            else fail("handshake", reason || undefined);
-          };
-          ws.onmessage = (ev) => {
-            try {
-              if (channel === null) {
-                const finished = clientHandshakeFinish(
-                  hsState,
-                  String(ev.data),
-                  this.host.daemonPub,
-                  {
-                    type: "hello",
-                    token: this.host.token,
-                    clientPubKey: this.keys.publicKey,
-                    clientInfo: {
-                      platform: Platform.OS === "android" ? "android" : "ios",
-                      appVersion: APP_VERSION,
-                    },
-                  },
-                );
-                channel = finished.channel;
-                ws.send(finished.frame);
-                return;
-              }
-              const msg = parseS2C(channel.open(String(ev.data)));
-              if (msg.type === "error" && msg.code === "auth_failed") {
-                fail("auth", msg.message);
-                return;
-              }
-              if (msg.type !== "hello.ok") {
-                fail("handshake", `unexpected ${msg.type}`);
-                return;
-              }
-              attemptDone = true;
-              clearTimeout(timer);
-              if (done) {
-                ws.close();
-                return;
-              }
-              done = true;
-              ws.onmessage = null;
-              ws.onclose = null;
-              ws.onerror = null;
-              resolve({
-                ws,
-                channel,
-                helloOk: msg,
-                addr,
-                rttMs: Date.now() - startedAt,
-                protocolVersion,
-              });
-            } catch (e) {
-              if (e instanceof ProtocolError && e.code === "untrusted") {
-                fail("untrusted", e.message);
-                return;
-              }
-              if (e instanceof ProtocolError && e.code === "version") {
-                fail("version");
-                return;
-              }
-              fail("handshake", e instanceof ProtocolError ? e.code : undefined);
-            }
-          };
+          failAttempt(failure, detail);
         };
+        const timer = setTimeout(() => {
+          failVersion(e2eReady ? "timeout" : input.beforeE2EFailure());
+        }, ATTEMPT_TIMEOUT_MS);
 
-        tryVersion(0);
-      }
+        ws.onopen = () => {
+          opened = true;
+          try {
+            input.initialOpen(ws, frame);
+            if (e2eReady) ws.send(frame);
+          } catch (error) {
+            failVersion(e2eReady ? "handshake" : input.beforeE2EFailure(), error instanceof Error ? error.message : undefined);
+          }
+        };
+        ws.onerror = () => failVersion(opened ? (e2eReady ? "handshake" : input.beforeE2EFailure()) : input.beforeE2EFailure());
+        ws.onclose = (event) => {
+          if (!opened || !e2eReady) {
+            failVersion(input.beforeE2EFailure());
+            return;
+          }
+          const code = (event as { code?: number } | undefined)?.code;
+          const reason = String((event as { reason?: unknown } | undefined)?.reason ?? "");
+          if (code === CLOSE_AUTH_FAILED) failVersion("auth", reason || undefined);
+          else if (code === CLOSE_REVOKED) failVersion("revoked", reason || undefined);
+          else if (reason === "version") failVersion("version");
+          else failVersion("handshake", reason || undefined);
+        };
+        ws.onmessage = (event) => {
+          const text = String(event.data);
+          try {
+            if (!e2eReady) {
+              const relayResult = input.beforeE2EMessage?.(text, ws);
+              if (relayResult === "waiting") return;
+              if (relayResult && typeof relayResult === "object") {
+                failVersion(relayResult.failure, relayResult.detail);
+                return;
+              }
+              if (relayResult !== "e2e") {
+                failVersion("relay_protocol");
+                return;
+              }
+              e2eReady = true;
+              ws.send(frame);
+              return;
+            }
+            if (channel === null) {
+              const finished = clientHandshakeFinish(
+                hsState,
+                text,
+                this.host.daemonPub,
+                {
+                  type: "hello",
+                  token: this.host.token,
+                  clientPubKey: this.keys.publicKey,
+                  clientInfo: { platform: CLIENT_PLATFORM, appVersion: APP_VERSION },
+                },
+              );
+              channel = finished.channel;
+              ws.send(finished.frame);
+              return;
+            }
+            const msg = parseS2C(channel.open(text));
+            if (msg.type === "error" && msg.code === "auth_failed") {
+              failVersion("auth", msg.message);
+              return;
+            }
+            if (msg.type !== "hello.ok") {
+              failVersion("handshake", `unexpected ${msg.type}`);
+              return;
+            }
+            versionDone = true;
+            clearTimeout(timer);
+            detach(false);
+            completedWs = ws;
+            settled = true;
+            resolve({
+              ws,
+              channel,
+              helloOk: msg,
+              endpoint: input.endpoint,
+              path: input.path,
+              rttMs: Date.now() - startedAt,
+              protocolVersion,
+            });
+          } catch (error) {
+            if (error instanceof ProtocolError && error.code === "untrusted") {
+              failVersion("untrusted", error.message);
+            } else if (error instanceof ProtocolError && error.code === "version") {
+              failVersion("version");
+            } else {
+              failVersion("handshake", error instanceof ProtocolError ? error.code : undefined);
+            }
+          }
+        };
+      };
+      tryVersion(0);
     });
+
+    return {
+      label: input.label,
+      promise,
+      abort: () => {
+        if (completedWs !== null) {
+          const ws = completedWs;
+          completedWs = null;
+          try { ws.close(); } catch { /* already closed */ }
+          return;
+        }
+        if (settled) return;
+        settled = true;
+        const ws = activeWs;
+        activeWs = null;
+        if (ws) {
+          ws.onopen = null;
+          ws.onmessage = null;
+          ws.onerror = null;
+          ws.onclose = null;
+          try { ws.close(); } catch { /* already closed */ }
+        }
+        rejectAttempt?.({ addr: input.endpoint, failure: "unreachable", detail: "cancelled" });
+      },
+    };
   }
 
   private adopt(won: Won): void {
@@ -468,9 +650,12 @@ export class HostConnection {
     this.ws = won.ws;
     this.channel = won.channel;
     this.fatalReceiveError = null;
-    this.activeAddr = won.addr;
+    this.activeAddr = won.endpoint;
+    this.activePath = won.path;
     this.lastRttMs = won.rttMs;
     this.lastRecvAt = Date.now();
+    this.lastPingAt = this.lastRecvAt;
+    this.pendingPingId = null;
     this.negotiatedProtocolVersion =
       won.helloOk.host.negotiatedProtocolVersion ?? won.protocolVersion;
     this.advertisedCapabilities = won.helloOk.host.capabilities === undefined
@@ -481,13 +666,14 @@ export class HostConnection {
     this.patch({
       status: "connected",
       hostInfo: won.helloOk.host,
-      activeAddr: won.addr,
+      activeAddr: won.endpoint,
+      activePath: won.path,
       lastError: null,
       rttMs: won.rttMs,
     });
 
     // 记住这个地址,下次优先试(切网后往往还是同一个)
-    void rememberGoodAddr(this.host.id, won.addr);
+    if (won.path === "direct") void rememberGoodAddr(this.host.id, won.endpoint);
 
     won.ws.onmessage = (ev) => this.onMessage(String(ev.data));
     won.ws.onclose = () => this.onClose();
@@ -497,25 +683,37 @@ export class HostConnection {
 
     this.startHeartbeat();
     this.flushQueue();
-    this.events.emit("connected", { addr: won.addr, rttMs: won.rttMs });
+    this.events.emit("connected", { addr: won.endpoint, path: won.path, rttMs: won.rttMs });
   }
 
   /**
-   * 心跳:RN 的 WebSocket 不暴露 ping/pong,靠"最近收到任何数据的时间"判活。
-   * daemon 每 15s 发一次 ping(ws 协议层),RN 侧收不到 ping 事件,
-   * 所以这里额外发一条无副作用的 term.ack 触发对端活动,并检测长时间静默。
+   * RN WebSocket 没有暴露底层 ping/pong。v13 起改用已加密的应用层
+   * connection.ping/pong；旧 daemon 没有该消息，仍只做静默超时检测。
    */
   private startHeartbeat(): void {
     if (this.heartbeatTimer !== null) clearInterval(this.heartbeatTimer);
     this.heartbeatTimer = setInterval(() => {
       if (!this.isConnected) return;
-      const silent = Date.now() - this.lastRecvAt;
-      if (silent > SILENCE_LIMIT_MS) {
+      const now = Date.now();
+      const action = nextLivenessAction({
+        protocolVersion: this.negotiatedProtocolVersion ?? 0,
+        lastRecvAt: this.lastRecvAt,
+        lastPingAt: this.lastPingAt,
+        pendingPingId: this.pendingPingId,
+      }, now);
+      if (action === "reconnect") {
         // 半开连接:socket 还是 OPEN 但实际已死,主动断开走重连
         this.ws?.close();
         return;
       }
-    }, HEARTBEAT_MS);
+      if (action !== "send_ping") return;
+      const id = randomUUID();
+      const result = this.send({ type: "connection.ping", id });
+      if (result.accepted) {
+        this.pendingPingId = id;
+        this.lastPingAt = now;
+      }
+    }, HEARTBEAT_TICK_MS);
   }
 
   private onMessage(text: string): void {
@@ -532,6 +730,9 @@ export class HostConnection {
       return;
     }
     switch (msg.type) {
+      case "connection.pong":
+        if (msg.id === this.pendingPingId) this.pendingPingId = null;
+        return;
       case "session.state":
         useApp.getState().upsertSession(this.host.id, msg.session);
         return;
@@ -980,13 +1181,14 @@ export class HostConnection {
     this.ws = null;
     this.channel = null;
     this.activeAddr = null;
+    this.activePath = null;
     if (this.stopped) return;
     if (fatalReceiveError) {
-      this.patch({ status: "failed", activeAddr: null, lastError: fatalReceiveError });
+      this.patch({ status: "failed", activeAddr: null, activePath: null, lastError: fatalReceiveError });
       if (wasConnected) this.events.emit("disconnected", { willRetry: false });
       return;
     }
-    this.patch({ status: "reconnecting", activeAddr: null });
+    this.patch({ status: "reconnecting", activeAddr: null, activePath: null });
     if (wasConnected) this.events.emit("disconnected", { willRetry: true });
     this.scheduleRetry();
   }
@@ -1540,11 +1742,26 @@ export class HostConnection {
 
 const connections = new Map<string, HostConnection>();
 
+function hasSameConnectionConfig(a: StoredHost, b: StoredHost): boolean {
+  return a.token === b.token &&
+    a.daemonPub === b.daemonPub &&
+    a.connectionMode === b.connectionMode &&
+    a.port === b.port &&
+    a.lastGoodAddr === b.lastGoodAddr &&
+    a.relayToken === b.relayToken &&
+    a.addrs.length === b.addrs.length &&
+    a.addrs.every((addr, index) => addr === b.addrs[index]) &&
+    a.relay?.url === b.relay?.url &&
+    a.relay?.routeId === b.relay?.routeId &&
+    a.relay?.deviceId === b.relay?.deviceId;
+}
+
 export function getConnection(host: StoredHost, keys: KeyPairB64): HostConnection {
   const existing = connections.get(host.id);
   if (existing) {
-    // 重新配对(token/公钥变化)则替换连接
-    if (existing.host.token === host.token && existing.host.daemonPub === host.daemonPub) {
+    // 重新配对、修改线路或切换模式后都必须换掉旧 socket，避免它继续按
+    // 已过期的候选集重连。
+    if (hasSameConnectionConfig(existing.host, host)) {
       return existing;
     }
     existing.stop();
