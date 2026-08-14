@@ -5,6 +5,14 @@ import {
   relayRouteIdMatchesHostSecret,
 } from "@prospero/protocol";
 
+/**
+ * Redis must not retain the one-time bearer ticket itself in either a key or
+ * a value (AOF/RDB backups are persistence too).  This identifier is only an
+ * internal lookup key, so it gets a separate domain from route and device
+ * credentials.
+ */
+const STREAM_TICKET_STORAGE_DOMAIN = "prospero.relay.v1.stream-ticket-storage\0";
+
 export function randomOpaque(bytes: number): string {
   return randomBytes(bytes).toString("base64url");
 }
@@ -31,4 +39,11 @@ export function routeIdMatchesHostSecret(routeId: string, hostSecret: string): b
 
 export function opaqueLogId(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex").slice(0, 12);
+}
+
+export function streamTicketStorageKey(ticket: string): string {
+  return createHash("sha256")
+    .update(STREAM_TICKET_STORAGE_DOMAIN, "utf8")
+    .update(ticket, "utf8")
+    .digest("base64url");
 }

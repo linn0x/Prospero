@@ -17,6 +17,13 @@ The relay does **not** see the pairing E2E token (`PairingPayload.token`), the
 host's static private key, application messages, chats, terminal bytes, file
 contents, or decrypted application ping/pong values. The `relay.token` field is
 a separate route-scoped bearer credential and is never the E2E pairing token.
+Neither MySQL nor Redis stores that credential in plaintext: MySQL stores the
+domain-separated digest and Redis caches that digest only. Redis stores a
+one-time stream ticket under a separate domain-separated hash and its persisted
+value omits the raw ticket, so AOF/RDB backups contain no live bearer strings.
+The supplied relay deployment disables core dumps and uses a read-only,
+capability-dropped container; relay logs and metrics must keep using only the
+bounded identifiers/labels documented here.
 
 The data plane is deliberately separate from host control:
 
@@ -66,6 +73,22 @@ route ID, device ID, stream ticket, relay token, or E2E token enters a URL.
 `RELAY_PROTOCOL_VERSION` remains **1**. Pairing stays v7 and the application
 protocol remains **v13**; the relay does not change application URLs or E2E
 handshake/message contracts.
+
+### Origin and proxy policy
+
+Relay v1 has no browser-cookie session and never treats `Origin` as an
+authentication signal. The supported native phone and daemon clients may omit
+it, so the relay accepts absent or present Origin headers and always requires
+the endpoint's first control message instead. A browser cannot authenticate
+without independently possessing the explicit relay credential; deployments
+adding a browser UI may enforce its own Caddy allowlist in addition to, never
+instead of, this check.
+
+Rate limits use the TCP peer by default. The provided Compose deployment has
+Caddy strip public forwarding headers and write `X-Prospero-Source-IP`; relay
+honors that header only when the TCP peer is Caddy's configured fixed internal
+address. It never trusts caller-controlled `X-Forwarded-For`, which prevents
+both rate-limit bypass and secret-shaped header values entering auth logs.
 
 ## Endpoint and frame limits
 

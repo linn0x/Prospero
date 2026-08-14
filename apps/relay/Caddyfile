@@ -1,11 +1,17 @@
 {
-  email {$ACME_EMAIL}
+	email {$ACME_EMAIL}
 }
 
 # Caddy obtains and renews certificates automatically.  Relay metrics deliberately
 # stay off this public vhost; scrape them from the internal Docker network instead.
 {$RELAY_DOMAIN} {
-  encode zstd gzip
-  reverse_proxy /v1/* relay:8787
-  reverse_proxy /health/* relay:8787
+	encode zstd gzip
+	reverse_proxy /v1/* relay:8787 {
+		# A public client controls X-Forwarded-For. Remove it and set a dedicated,
+		# single-IP header that relay accepts only from Caddy's fixed backend IP.
+		header_up -X-Forwarded-For
+		header_up -X-Prospero-Source-IP
+		header_up X-Prospero-Source-IP {remote_host}
+	}
+	reverse_proxy /health/* relay:8787
 }

@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createClient } from "redis";
-import { credentialDigest, deriveRouteId, randomOpaque } from "../src/crypto.js";
+import { credentialDigest, deriveRouteId, randomOpaque, streamTicketStorageKey } from "../src/crypto.js";
 import { runMigrations } from "../src/migrate.js";
 import { MySqlRouteStore, RedisEphemeralStore, SnapshotGenerationError } from "../src/store.js";
 
@@ -24,6 +24,7 @@ describe.skipIf(process.env.RELAY_INTEGRATION !== "1")("MySQL 8.4 + Redis real-c
     try {
       await runMigrations(mysqlUrl, join(here, "..", "migrations"));
       expect((await fetch("http://127.0.0.1:38787/health/ready")).status).toBe(200);
+      await rawRedis.connect();
       const routeId = deriveRouteId(Buffer.from(randomOpaque(32), "base64url"));
       const token = randomOpaque(32);
       const deviceId = randomOpaque(16);
@@ -58,6 +59,11 @@ describe.skipIf(process.env.RELAY_INTEGRATION !== "1")("MySQL 8.4 + Redis real-c
       const streamId = randomOpaque(16);
       const ticket = randomOpaque(16);
       await ephemeral.createTicket({ streamId, ticket, routeId, hostConnectionId: "test", clientDeviceId: "client", expiresAt: Date.now() + 30_000 });
+      const redisKeys = await rawRedis.keys("*");
+      const redisValues = redisKeys.length === 0 ? [] : await rawRedis.mGet(redisKeys);
+      const persistedRedis = JSON.stringify({ redisKeys, redisValues });
+      expect(persistedRedis).not.toContain(ticket);
+      expect(redisKeys).toContain(`ticket:${streamTicketStorageKey(ticket)}`);
       expect(await ephemeral.redeemTicket(ticket, randomOpaque(16))).toEqual({ status: "invalid" });
       expect((await ephemeral.redeemTicket(ticket, streamId))).toMatchObject({ status: "ok", ticket: { streamId } });
       expect(await ephemeral.redeemTicket(ticket, streamId)).toEqual({ status: "used" });
@@ -81,7 +87,6 @@ describe.skipIf(process.env.RELAY_INTEGRATION !== "1")("MySQL 8.4 + Redis real-c
       expect(await ephemeral.acquireStreamLease(routeId, "replacement", 8, 5_000)).toBe(true);
       await ephemeral.releaseStreamLease(routeId, "replacement");
 
-      await rawRedis.connect();
       for (let race = 0; race < 8; race += 1) {
         await ephemeral.setPresence(routeId, "old", 30);
         await Promise.all([ephemeral.setPresence(routeId, "new", 30), ephemeral.clearPresence(routeId, "old")]);
@@ -89,6 +94,10 @@ describe.skipIf(process.env.RELAY_INTEGRATION !== "1")("MySQL 8.4 + Redis real-c
       }
       const inspected = await routes.inspectRoute(routeId);
       expect(JSON.stringify(inspected)).not.toContain(token);
+      const [storedDevices] = await routes.pool.execute<Array<{ credential_digest: Buffer }>>("SELECT credential_digest FROM devices WHERE route_id = ?", [routeId]);
+      expect(storedDevices).toHaveLength(2);
+      expect(storedDevices.every((device) => Buffer.isBuffer(device.credential_digest) && device.credential_digest.length === 32)).toBe(true);
+      expect(JSON.stringify(storedDevices)).not.toContain(token);
     } finally {
       await Promise.allSettled([routes.close(), ephemeral.close(), rawRedis.isOpen ? rawRedis.quit() : Promise.resolve()]);
       await exec("docker", ["compose", "-p", project, "-f", compose, "down", "-v"], { timeout: 60_000 });
