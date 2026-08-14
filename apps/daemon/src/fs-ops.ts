@@ -249,7 +249,7 @@ export async function removeEntry(root: string, rel: string): Promise<void> {
       throw new FsError("cannot read directory", "denied");
     });
     if (left.length > 0) {
-      throw new FsError("目录非空 —— 请先清空,或在 Mac 上删除", "denied");
+      throw new FsError("目录非空 —— 请先清空,或在电脑上删除", "denied");
     }
     await rmdir(target).catch(() => {
       throw new FsError("cannot remove directory", "denied");

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * prosperod — Prospero macOS 宿主 daemon。
+ * prosperod — Prospero local agent host daemon。
  * M1 期间在终端里手动运行(继承终端的 TCC 权限),不装 LaunchAgent(M3 由菜单栏壳接管)。
  */
 import { createRequire } from "node:module";
@@ -28,7 +28,7 @@ const require = createRequire(import.meta.url);
 const qrcode = require("qrcode-terminal") as typeof import("qrcode-terminal");
 
 const program = new Command();
-program.name("prosperod").description("Prospero macOS agent hub").version(DAEMON_VERSION);
+program.name("prosperod").description("Prospero local agent hub").version(DAEMON_VERSION);
 
 program
   .command("start", { isDefault: true })

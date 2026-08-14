@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
-import { sessionName, tmuxPath, wrapSpawn, writeConfig } from "../src/tmux.js";
+import { resetTmuxPathCache, sessionName, tmuxPath, wrapSpawn, writeConfig } from "../src/tmux.js";
 
 const temps: string[] = [];
 function tempHome(): string {
@@ -13,6 +13,14 @@ function tempHome(): string {
 }
 afterEach(() => {
   for (const dir of temps.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+describe("tmux platform support", () => {
+  it("treats tmux as unavailable on Windows", () => {
+    resetTmuxPathCache();
+    expect(tmuxPath("win32")).toBeNull();
+    resetTmuxPathCache();
+  });
 });
 
 describe("tmux 托管", () => {

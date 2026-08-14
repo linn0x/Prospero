@@ -15,7 +15,7 @@ export function sessionLoadState(
   if (status === "failed") {
     return {
       title: "无法连接到主机",
-      detail: lastError ?? "连接失败，请检查 Mac 是否在线后重试。",
+      detail: lastError ?? "连接失败，请检查电脑是否在线后重试。",
       retryLabel: "重试连接",
       showSpinner: false,
     };

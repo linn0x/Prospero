@@ -100,7 +100,7 @@ export default function HostsScreen() {
             <Pressable
               accessibilityRole="button"
               accessibilityLabel="扫码配对"
-              accessibilityHint="打开相机扫描 Mac 上的配对二维码"
+              accessibilityHint="打开相机扫描电脑上的配对二维码"
               onPress={() => router.push("/pair")}
               style={styles.headerButton}
             >
@@ -126,13 +126,13 @@ export default function HostsScreen() {
         >
           <View style={[styles.emptyWrap, emptyStateLayout.body]}>
             <Icon name="desktopcomputer" size={52} color={color.textFaint} />
-            <Text style={styles.emptyTitle}>还没有配对的 Mac</Text>
-            <Text style={styles.emptyText}>在 Mac 上运行 prosperod 并生成配对码:</Text>
+            <Text style={styles.emptyTitle}>还没有配对的电脑</Text>
+            <Text style={styles.emptyText}>在电脑上运行 prosperod 并生成配对码:</Text>
             <Text style={styles.code}>prosperod start{"\n"}prosperod pair</Text>
             <Pressable
               accessibilityRole="button"
               accessibilityLabel="扫码配对"
-              accessibilityHint="打开相机扫描 Mac 上的配对二维码"
+              accessibilityHint="打开相机扫描电脑上的配对二维码"
               style={({ pressed }) => [styles.cta, pressed && styles.ctaPressed]}
               onPress={() => router.push("/pair")}
             >

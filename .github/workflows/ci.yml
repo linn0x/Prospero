@@ -15,8 +15,12 @@ concurrency:
 
 jobs:
   node:
-    name: Node checks
-    runs-on: ubuntu-latest
+    name: Node checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6

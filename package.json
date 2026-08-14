@@ -12,7 +12,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "postinstall": "patch-package && (chmod +x node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper 2>/dev/null || true)",
+    "postinstall": "patch-package && node tools/fix-node-pty-darwin-helper.mjs",
     "typecheck": "tsc --build --force packages/protocol apps/daemon",
     "test": "npm run test --workspaces --if-present"
   },
