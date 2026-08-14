@@ -168,6 +168,18 @@ func orchestrationRunDeletionNotice(
   return "\n\n删除编排不会清理自动 Run 工作树。它会保留在主机上：\n\(workspacePath)"
 }
 
+/// Cleanup persistence is terminal; inspections describe the pre-cleanup Git state.
+func orchestrationWorktreeState(_ asset: OrchestrationStatus.WorktreeAsset) -> String {
+  if asset.state == "cleaned" || asset.cleanup != nil { return "cleaned" }
+  return asset.lastInspection?.state ?? asset.state
+}
+
+func orchestrationWorktreeCanClean(_ asset: OrchestrationStatus.WorktreeAsset) -> Bool {
+  guard orchestrationWorktreeState(asset) != "cleaned" else { return false }
+  let inspectionState = asset.lastInspection?.state
+  return inspectionState == "safe_to_clean" || inspectionState == "equivalent"
+}
+
 /// Mac 可视化编辑器里的本地节点；id 在一次发布内稳定，用来表达依赖关系。
 struct OrchestrationGraphDraftNode: Identifiable, Sendable, Equatable {
   var id: String = UUID().uuidString
