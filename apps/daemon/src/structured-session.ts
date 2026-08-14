@@ -6,7 +6,7 @@
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { DEFAULT_POLICY } from "./approval-policy.js";
 import { readChunk } from "./fs-ops.js";
 import type {
@@ -193,6 +193,12 @@ export interface StructuredSessionOptions {
   restored?: StructuredSessionPersistentState;
   /** 新建 Prospero 会话时接入已有原生会话/初始模式。 */
   initialAdapterState?: AdapterResumeState;
+  /**
+   * Supervisor sessions keep immutable attachment copies under their private
+   * per-session directory.  Legacy in-process sessions retain the historical
+   * Prospero-home location for backwards-compatible restoration.
+   */
+  attachmentRoot?: string;
 }
 
 export interface StructuredSessionEvents {
@@ -240,6 +246,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
   private readonly adapter: AgentAdapter;
   private readonly environment: Record<string, string>;
   private readonly codexAppServerArgs: string[] | undefined;
+  private readonly attachmentRoot: string;
   private readonly log: AgentEventBody[] = [];
   private evSeq = 0;
   private status: SessionStatus = "starting";
@@ -274,6 +281,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     this.adapter = opts.adapter;
     this.environment = opts.environment ?? {};
     this.codexAppServerArgs = opts.codexAppServerArgs;
+    this.attachmentRoot = opts.attachmentRoot ?? path.join(prosperoHome(), "attachments", this.id);
     const restored = opts.restored;
     if (restored?.terminal) {
       this.status = "done";
@@ -506,8 +514,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
       ? message.attachments?.find((candidate) => candidate.id === attachmentId)
       : undefined;
     if (!attachment) return null;
-    const root = path.join(prosperoHome(), "attachments", this.id);
-    const chunk = await readChunk(root, attachment.id, offset, length);
+    const chunk = await readChunk(this.attachmentRoot, attachment.id, offset, length);
     return { ...chunk, mimeType: attachment.mimeType };
   }
 
@@ -981,7 +988,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     item: QueuedChatPersistent,
   ): Promise<Attachment[] | undefined> {
     if (this.adapter.acceptsImages !== true || item.attachments.length === 0) return undefined;
-    const root = path.resolve(prosperoHome(), "attachments", this.id);
+    const root = path.resolve(this.attachmentRoot);
     const loaded: Attachment[] = [];
     for (const ref of item.attachments) {
       const resolved = path.resolve(ref.path);
@@ -1059,10 +1066,11 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     }
   }
 
-  /** 把附件写进 ~/.prospero/attachments/<sid>/；事件里只保存文件名索引。 */
+  /** 把附件写进会话专属目录；事件里只保存文件名索引。 */
   private async persistAttachments(attachments: Attachment[]): Promise<QueuedAttachmentRef[]> {
-    const dir = path.join(prosperoHome(), "attachments", this.id);
-    await mkdir(dir, { recursive: true });
+    const dir = this.attachmentRoot;
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    await chmod(dir, 0o700).catch(() => {});
     const out: QueuedAttachmentRef[] = [];
     for (let i = 0; i < attachments.length; i++) {
       const a = attachments[i];
@@ -1071,7 +1079,8 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
       // 文件名由 UUID 生成，既不能越出会话目录，也避免把原始文件名暴露为路径。
       const id = `${randomUUID()}.${ext}`;
       const file = path.join(dir, id);
-      await writeFile(file, Buffer.from(a.dataB64, "base64"));
+      await writeFile(file, Buffer.from(a.dataB64, "base64"), { mode: 0o600 });
+      await chmod(file, 0o600).catch(() => {});
       out.push({
         id,
         mimeType: a.mimeType,

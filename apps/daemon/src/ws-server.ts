@@ -144,6 +144,8 @@ export interface DaemonServerOptions {
   bindAddr?: string | undefined;
   /** tmux 托管:会话进程活过 daemon 重启 */
   useTmux?: boolean | undefined;
+  /** Detached structured owners are production-default; tests may opt out. */
+  structuredSupervisor?: boolean | undefined;
   devMode?: boolean;
   hostName?: string | undefined;
   /** 推送通道配置;省略则不推送 */
@@ -232,6 +234,11 @@ export async function createDaemonServer(
   const accounts = new AgentAccountManager(opts.home);
   const manager = new SessionManager({
     home: opts.home,
+    // Direct SessionManager users (notably unit tests) remain in-process by
+    // default. The production daemon is the opt-in authority; Vitest's own
+    // servers intentionally exercise the legacy path unless a test asks for
+    // an isolated supervisor explicitly.
+    supervisor: opts.structuredSupervisor ?? process.env["VITEST"] !== "true",
     ...(opts.useTmux ? { tmux: { home: opts.home } } : {}),
     sessionEnv: (sessionId) => ({
       PROSPERO_SESSION_ID: sessionId,
@@ -955,7 +962,7 @@ export async function createDaemonServer(
         await manager.requireStructured(msg.sid).send(msg.text, msg.attachments, msg.delivery);
         return;
       case "chat.queue.remove":
-        manager.requireStructured(msg.sid).removeQueued(msg.queueId);
+        await manager.requireStructured(msg.sid).removeQueued(msg.queueId);
         return;
       case "chat.queue.guide":
         await manager.requireStructured(msg.sid).guideQueued(msg.queueId);
