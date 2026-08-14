@@ -282,6 +282,10 @@ export async function createDaemonServer(
     maxPayload: 16 * 1024 * 1024,
     perMessageDeflate: false,
   });
+  // 端口抢占等底层 HTTP 监听错误会同时被 ws 转发。启动流程会由
+  // httpServer 的 error promise 受控回收资源；这里仅阻止同一错误作为
+  // 未监听的 WebSocketServer "error" 再次杀掉整个进程。
+  wss.on("error", () => {});
 
   function send(conn: Conn, msg: S2CMessage): void {
     if (conn.ws.readyState !== WebSocket.OPEN) return;

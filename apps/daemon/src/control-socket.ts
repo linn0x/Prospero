@@ -88,7 +88,14 @@ function requestFrom(value: unknown): ControlRequest | null {
 }
 
 function write(socket: Socket, response: ControlResponse): void {
-  if (!socket.destroyed) socket.write(`${JSON.stringify(response)}\n`);
+  // `close` 与异步 write 之间存在竞争：短命 CLI 已经离开时，下一次写入
+  // 会在 Socket 上发出 EPIPE。它只表示调用方不再需要响应，绝不能带崩 daemon。
+  if (socket.destroyed || !socket.writable) return;
+  try {
+    socket.write(`${JSON.stringify(response)}\n`);
+  } catch {
+    // Node 也可能在 destroyed 状态刚变化时同步抛错；同样按断开处理。
+  }
 }
 
 /** 启动 socket，并同步写下给 CLI 读取的 0600 token 文件。 */
@@ -126,6 +133,9 @@ export async function startControlSocket(opts: ControlSocketOptions): Promise<Co
   const server = createServer((socket) => {
     clients.add(socket);
     socket.once("close", () => clients.delete(socket));
+    // write() 的 EPIPE 是异步从 Socket 发出的，try/catch 接不住。每条本地
+    // client 连接都必须消费它；close 回调会清理 clients，并会中止长请求。
+    socket.on("error", () => {});
     socket.setEncoding("utf8");
     let buffer = "";
     let closedForSize = false;
