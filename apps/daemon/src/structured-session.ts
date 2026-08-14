@@ -250,7 +250,11 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     }
   }
 
-  async start(): Promise<void> {
+  /**
+   * `beforeDrain` 给恢复路径在 adapter 已接回、但队列尚未发送前再做一次
+   * 编排归属检查的机会。回调可同步 dispose 本会话，随后不再触碰旧队列。
+   */
+  async start(beforeDrain?: () => void | Promise<void>): Promise<void> {
     await this.adapter.start({
       cwd: this.cwd,
       env: this.environment,
@@ -267,6 +271,8 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
       // 取函数而非取值:策略可在会话进行中改,适配器每次调用都要读到当下的值
       approvalPolicy: () => this.policy,
     });
+    await beforeDrain?.();
+    if (this.disposed) return;
     this.setStatus(this.readyStatusFromLog());
     await this.drainQueue();
   }
@@ -884,10 +890,14 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
 
   private async dispatchQueued(item: QueuedChatPersistent): Promise<void> {
     const attachments = await this.queuedAttachmentsForAdapter(item);
+    if (this.disposed || !this.backendAvailable) return;
     this.recordUserMessage(item.displayText, item.attachments);
     this.busySince = Date.now();
     this.setStatus("running");
     const prepared = await this.prepareForAdapter(item.outgoingText);
+    // prepare/附件读取中可能有外部 control RPC 同步封存 session。不能在那个
+    // await 间隙之后继续把旧 worktree 的队列消息交给原生 adapter。
+    if (this.disposed || !this.backendAvailable) return;
     await this.adapter.send(prepared.text, attachments, prepared.skills);
   }
 

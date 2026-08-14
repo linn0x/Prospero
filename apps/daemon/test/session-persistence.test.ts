@@ -57,6 +57,38 @@ class FakePersistentAdapter implements AgentAdapter {
   }
 }
 
+/** 模拟交付 Store 已落盘、尚未来得及 preserveHistory kill 的崩溃现场。 */
+async function seedRecoverableQueuedState(home: string): Promise<string> {
+  const first = new SessionManager({
+    home,
+    adapterFactory: (_agent, state) => new FakePersistentAdapter(state),
+  });
+  const created = await first.create({
+    agent: "codex",
+    kind: "structured",
+    cwd: home,
+    cols: 80,
+    rows: 24,
+    allowShell: false,
+  });
+  first.flushPersistence();
+  await first.disposeAll();
+
+  const stateFile = path.join(home, "structured-sessions.json");
+  const states = JSON.parse(readFileSync(stateFile, "utf8")) as Array<Record<string, unknown>>;
+  states[0]!["messageQueue"] = [{
+    id: "queued-after-delivery",
+    displayText: "绝不能在重启后写入 worktree",
+    outgoingText: "绝不能在重启后写入 worktree",
+    kind: "queue",
+    createdAt: 1,
+    attachmentCount: 0,
+    attachments: [],
+  }];
+  writeFileSync(stateFile, JSON.stringify(states));
+  return created.id;
+}
+
 describe("结构化会话持久化", () => {
   it("worker 交付后终止原生会话但保留只读历史，重启后也不会复活队列", async () => {
     const home = tempHome();
@@ -152,34 +184,9 @@ describe("结构化会话持久化", () => {
 
   it("恢复阶段可先封存已结算 worker，不启动 adapter 或消费旧队列", async () => {
     const home = tempHome();
-    const first = new SessionManager({
-      home,
-      adapterFactory: (_agent, state) => new FakePersistentAdapter(state),
-    });
-    const created = await first.create({
-      agent: "codex",
-      kind: "structured",
-      cwd: home,
-      cols: 80,
-      rows: 24,
-      allowShell: false,
-    });
     // 模拟 store 先落下 dispatch succeeded/failed、进程在 kill 之前崩溃：磁盘的
     // structured state 仍非 terminal，却已有一条本来会在恢复时 drain 的排队消息。
-    first.flushPersistence();
-    await first.disposeAll();
-    const stateFile = path.join(home, "structured-sessions.json");
-    const states = JSON.parse(readFileSync(stateFile, "utf8")) as Array<Record<string, unknown>>;
-    states[0]!["messageQueue"] = [{
-      id: "queued-after-delivery",
-      displayText: "绝不能在重启后写入 worktree",
-      outgoingText: "绝不能在重启后写入 worktree",
-      kind: "queue",
-      createdAt: 1,
-      attachmentCount: 0,
-      attachments: [],
-    }];
-    writeFileSync(stateFile, JSON.stringify(states));
+    const sessionId = await seedRecoverableQueuedState(home);
 
     let starts = 0;
     let sends = 0;
@@ -199,19 +206,62 @@ describe("结构化会话持久化", () => {
       },
     });
     const restored = await second.restoreStructured({
-      preserveHistoryWhen: (state) => state.id === created.id,
+      preserveHistoryWhen: (state) => state.id === sessionId,
     });
 
-    expect(restored).toEqual([expect.objectContaining({ id: created.id, status: "done" })]);
+    expect(restored).toEqual([expect.objectContaining({ id: sessionId, status: "done" })]);
     expect(starts).toBe(0);
     expect(sends).toBe(0);
-    expect(second.infoOf(created.id).messageQueue).toEqual([
+    expect(second.infoOf(sessionId).messageQueue).toEqual([
       expect.objectContaining({ text: "绝不能在重启后写入 worktree" }),
     ]);
     expect(JSON.parse(readFileSync(path.join(home, "structured-sessions.json"), "utf8")))
-      .toEqual([expect.objectContaining({ id: created.id, terminal: true })]);
-    await expect(second.chatSend(created.id, "不得在恢复时重连"))
+      .toEqual([expect.objectContaining({ id: sessionId, terminal: true })]);
+    await expect(second.chatSend(sessionId, "不得在恢复时重连"))
       .rejects.toThrow("历史只读");
+    await second.disposeAll();
+  });
+
+  it("adapter.start 期间才结算的 worker 在 drainQueue 前也会封存", async () => {
+    const home = tempHome();
+    const sessionId = await seedRecoverableQueuedState(home);
+    let settled = false;
+    let starts = 0;
+    let sends = 0;
+    let enterStart: (() => void) | null = null;
+    let releaseStart: (() => void) | null = null;
+    const enteredStart = new Promise<void>((resolve) => { enterStart = resolve; });
+    const second = new SessionManager({
+      home,
+      adapterFactory: (_agent, state) => {
+        const adapter = new FakePersistentAdapter(state);
+        const start = adapter.start.bind(adapter);
+        adapter.start = async (context) => {
+          starts += 1;
+          enterStart?.();
+          await new Promise<void>((resolve) => { releaseStart = resolve; });
+          await start(context);
+        };
+        adapter.send = async () => { sends += 1; };
+        return adapter;
+      },
+    });
+
+    const restoring = second.restoreStructured({ preserveHistoryWhen: () => settled });
+    await enteredStart;
+    // control socket 在 adapter.start 的 await 期间收到了旧 worker 的 task.done/fail。
+    settled = true;
+    releaseStart?.();
+    const restored = await restoring;
+
+    expect(restored).toEqual([expect.objectContaining({ id: sessionId, status: "done" })]);
+    expect(starts).toBe(1);
+    expect(sends).toBe(0);
+    expect(second.infoOf(sessionId).messageQueue).toEqual([
+      expect.objectContaining({ text: "绝不能在重启后写入 worktree" }),
+    ]);
+    expect(JSON.parse(readFileSync(path.join(home, "structured-sessions.json"), "utf8")))
+      .toEqual([expect.objectContaining({ id: sessionId, terminal: true })]);
     await second.disposeAll();
   });
 

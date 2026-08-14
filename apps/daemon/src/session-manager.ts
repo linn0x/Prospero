@@ -439,7 +439,15 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
         continue;
       }
       try {
-        await session.start();
+        await session.start(() => {
+          // control socket 会先于 restoreStructured 监听；adapter.start 的 await
+          // 期间旧 worker 仍可能刚好报 task.done/fail。此处是 drainQueue 前的
+          // 第二道闸门，必须同步封存，不能等启动末尾的 reconcile。
+          if (!options.preserveHistoryWhen?.(loaded)) return;
+          // `kill` 在其首个 await 前把 StructuredSession 标为 done 并同步尝试
+          // 持久化 terminal snapshot；start() 随即看见 disposed 而跳过 drain。
+          void this.kill(state.id, { preserveHistory: true }).catch(() => {});
+        });
       } catch (e) {
         await session.markRestoreFailed(e instanceof Error ? e.message : String(e));
       }
