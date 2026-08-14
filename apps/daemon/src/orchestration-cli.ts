@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { Command } from "commander";
 import { controlRequest, controlSocketPath, ControlSocketError } from "./control-socket.js";
+import { controlRequestTimeoutFor } from "./orchestration-cli-timeouts.js";
 import { prosperoHome } from "./pairing.js";
 
 const home = prosperoHome();
@@ -28,7 +29,7 @@ function optionalSession(): string | null {
 async function invoke(
   method: string,
   params: Record<string, unknown>,
-  timeoutMs?: number,
+  timeoutMs = controlRequestTimeoutFor(method),
 ): Promise<void> {
   const opts = program.opts<{ socket: string; tokenFile: string }>();
   let token: string;
@@ -40,7 +41,7 @@ async function invoke(
     );
   }
   const result = await controlRequest<unknown>(
-    { socketPath: opts.socket, token, ...(timeoutMs !== undefined ? { timeoutMs } : {}) },
+    { socketPath: opts.socket, token, timeoutMs },
     method,
     params,
   );
@@ -124,6 +125,7 @@ worker
   .option("--cwd <path>", "任务工作目录", process.cwd())
   .option("--kind <kind>", "structured 或 pty")
   .option("--approval-policy <policy>", "strict/standard/yolo")
+  .option("--operation-id <id>", "调用方提供时，用于同一 worker.start 请求的幂等重试")
   .action(action("worker.start", (opts) => ({
     taskId: requireText(opts["task"], "--task"),
     agent: requireText(opts["agent"], "--agent"),
@@ -133,6 +135,7 @@ worker
     ...(typeof opts["approvalPolicy"] === "string"
       ? { approvalPolicy: opts["approvalPolicy"] }
       : {}),
+    ...(typeof opts["operationId"] === "string" ? { operationId: opts["operationId"] } : {}),
     actorSessionId: optionalSession(),
   })));
 

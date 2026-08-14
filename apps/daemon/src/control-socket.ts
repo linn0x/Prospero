@@ -12,6 +12,9 @@ import path from "node:path";
 
 const MAX_LINE_BYTES = 1024 * 1024;
 
+/** 普通本地控制 RPC 的默认上限；长操作必须由调用方显式覆盖。 */
+export const DEFAULT_CONTROL_REQUEST_TIMEOUT_MS = 15_000;
+
 export type ControlRequestId = string | number;
 
 export interface ControlRequest {
@@ -240,7 +243,7 @@ export async function controlRequest<T>(
   method: string,
   params?: unknown,
 ): Promise<T> {
-  const timeoutMs = opts.timeoutMs ?? 15_000;
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_CONTROL_REQUEST_TIMEOUT_MS;
   return new Promise<T>((resolve, reject) => {
     const socket = createConnection(opts.socketPath);
     let buffer = "";
