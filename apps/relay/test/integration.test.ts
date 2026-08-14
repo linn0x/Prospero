@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 import { createClient } from "redis";
 import { credentialDigest, deriveRouteId, randomOpaque } from "../src/crypto.js";
 import { runMigrations } from "../src/migrate.js";
-import { MySqlRouteStore, RedisEphemeralStore } from "../src/store.js";
+import { MySqlRouteStore, RedisEphemeralStore, SnapshotGenerationError } from "../src/store.js";
 
 const exec = promisify(execFile);
 const here = dirname(fileURLToPath(import.meta.url));
@@ -39,9 +39,13 @@ describe.skipIf(process.env.RELAY_INTEGRATION !== "1")("MySQL 8.4 + Redis real-c
         { deviceId, credentialDigest: credentialDigest(token).toString("base64url") }, { deviceId: missingDeviceId, revoked: true },
       ])).resolves.toMatchObject({ route: { generation: 2 } });
       await expect(routes.applyDeviceSnapshot(routeId, 2, [{ deviceId, credentialDigest: credentialDigest(token).toString("base64url") }])).resolves.toMatchObject({ route: { generation: 2 } });
+      const beforeRejectedSnapshot = await routes.inspectRoute(routeId);
       await expect(routes.applyDeviceSnapshot(routeId, 2, [
         { deviceId, credentialDigest: credentialDigest(token).toString("base64url") }, { deviceId: randomOpaque(16), revoked: true },
-      ])).rejects.toThrow("stale or inconsistent");
+      ])).rejects.toBeInstanceOf(SnapshotGenerationError);
+      // SnapshotGenerationError is emitted only after the MySQL transaction
+      // rolls back, which makes a stale host's rejection safe to ignore.
+      expect(await routes.inspectRoute(routeId)).toEqual(beforeRejectedSnapshot);
       await expect(routes.applyDeviceSnapshot(routeId, 1, [{ deviceId, credentialDigest: credentialDigest(token).toString("base64url") }])).rejects.toThrow("stale or inconsistent");
 
       const concurrent = await Promise.allSettled([
