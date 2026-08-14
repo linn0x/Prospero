@@ -13,6 +13,7 @@ import { WorktreeAssetService } from "./worktree-assets.js";
 import {
   findLiveSessionForRun,
   findLiveWorktreeLease,
+  isTerminalSession,
   registeredWorktreeAssetForCwd,
   type WorktreeSessionInspector,
 } from "./worktree-leases.js";
@@ -149,17 +150,26 @@ export class DispatchService {
    * 恢复 daemon 后不能只等后续 state 事件：直接托管的会话已不在内存，
    * tmux/结构化会话也可能已在 daemon 启动前结束。逐条对账让持久状态收口。
    */
-  reconcilePersistedSessions(): DispatchRecoveryResult {
+  async reconcilePersistedSessions(): Promise<DispatchRecoveryResult> {
     const settled: StopWorkerResult[] = [];
     const resumed: Dispatch[] = [];
     for (const dispatch of this.store.listDispatches()) {
-      if (dispatch.state !== "starting" && dispatch.state !== "running") continue;
-
       let session: SessionInfo | null = null;
       try {
         session = this.sessions.infoOf(dispatch.sessionId);
       } catch {
         // SessionManager 用抛错表达不存在；恢复对账必须把它当成正常输入。
+      }
+
+      const active = dispatch.state === "starting" || dispatch.state === "running";
+      if (!active) {
+        // “交付已落盘、kill 尚未来得及调用”是一个独立的 crash window。成功/失败
+        // dispatch 的旧结构化会话若仍活着，会在恢复后继续消费已排队 chat；必须
+        // 像正常 task.done/fail 一样终止并归档，不可只对账 running 状态。
+        if (session && !isTerminalSession(session)) {
+          await this.terminateDeliveredWorker(dispatch.sessionId);
+        }
+        continue;
       }
 
       if (!session) {
@@ -171,7 +181,7 @@ export class DispatchService {
         if (result) this.store.preserveWorktreeAssetsForDispatch(dispatch.id, result.dispatch.outcome);
         continue;
       }
-      if (session.status === "completed" || session.status === "done" || session.status === "died") {
+      if (isTerminalSession(session)) {
         const result = this.store.abandonActiveDispatchForMissingSession(
           dispatch.id,
           "worker 会话在 daemon 恢复时已结束但未显式交付",

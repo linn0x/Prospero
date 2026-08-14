@@ -43,6 +43,8 @@ function session(id: string, status: SessionInfo["status"]): SessionInfo {
 class RecoverySessions implements WorkerSessionManager {
   readonly live = new Map<string, SessionInfo>();
   readonly created: CreateSessionInput[] = [];
+  readonly killed: string[] = [];
+  readonly killOptions: Array<{ preserveHistory?: boolean } | undefined> = [];
 
   async create(input: CreateSessionInput): Promise<SessionInfo> {
     this.created.push(input);
@@ -51,7 +53,11 @@ class RecoverySessions implements WorkerSessionManager {
 
   async chatSend(): Promise<void> {}
   requirePty(): { writeInput(text: string): void } { return { writeInput() {} }; }
-  async kill(): Promise<void> {}
+  async kill(sid: string, options?: { preserveHistory?: boolean }): Promise<void> {
+    this.killed.push(sid);
+    this.killOptions.push(options);
+    this.live.delete(sid);
+  }
 
   infoOf(sid: string): SessionInfo {
     const found = this.live.get(sid);
@@ -86,7 +92,7 @@ describe("daemon 启动时的 Dispatch 对账", () => {
     }
   });
 
-  it("缺失会话会一次性收敛为 abandoned + failed，持久化后重复启动不再重复处理", () => {
+  it("缺失会话会一次性收敛为 abandoned + failed，持久化后重复启动不再重复处理", async () => {
     const home = temporaryHome();
     const initial = new OrchestrationStore(home);
     const run = initial.createRun({ objective: "恢复缺失 worker" });
@@ -95,7 +101,7 @@ describe("daemon 启动时的 Dispatch 对账", () => {
     let changes = 0;
     initial.onChange(() => { changes += 1; });
 
-    const first = new DispatchService(initial, new RecoverySessions()).reconcilePersistedSessions();
+    const first = await new DispatchService(initial, new RecoverySessions()).reconcilePersistedSessions();
     expect(first.settled).toHaveLength(1);
     expect(initial.getDispatch(dispatch.id)).toMatchObject({
       state: "abandoned",
@@ -111,13 +117,13 @@ describe("daemon 启动时的 Dispatch 对账", () => {
     initial.close();
 
     const restarted = new OrchestrationStore(home);
-    const second = new DispatchService(restarted, new RecoverySessions()).reconcilePersistedSessions();
+    const second = await new DispatchService(restarted, new RecoverySessions()).reconcilePersistedSessions();
     expect(second).toEqual({ settled: [], resumed: [] });
     expect(restarted.getTask(task.id).status).toBe("failed");
     restarted.close();
   });
 
-  it("恢复时已终态的会话同样失败；已经显式 done 的事实仍优先", () => {
+  it("恢复时已终态的会话同样失败；已经显式 done 的事实仍优先", async () => {
     const store = new OrchestrationStore();
     const run = store.createRun({ objective: "恢复终态 worker" });
     const endedTask = store.createTask({ runId: run.id, title: "未交付", spec: "" });
@@ -130,13 +136,46 @@ describe("daemon 启动时的 Dispatch 对账", () => {
     const sessions = new RecoverySessions();
     sessions.live.set("ended-worker", session("ended-worker", "completed"));
     sessions.live.set("reported-worker", session("reported-worker", "done"));
-    const result = new DispatchService(store, sessions).reconcilePersistedSessions();
+    const result = await new DispatchService(store, sessions).reconcilePersistedSessions();
 
     expect(result.settled).toHaveLength(2);
     expect(store.getDispatch(ended.id).state).toBe("abandoned");
     expect(store.getTask(endedTask.id).status).toBe("failed");
     expect(store.getDispatch(explicit.id)).toMatchObject({ state: "succeeded", outcome: "worker 已显式交付" });
     expect(store.getTask(explicitTask.id)).toMatchObject({ status: "done", result: "worker 已显式交付" });
+  });
+
+  it("重启会终止已持久化交付但仍存活的 succeeded/failed worker，并保留历史", async () => {
+    const home = temporaryHome();
+    const seeded = new OrchestrationStore(home);
+    const run = seeded.createRun({ objective: "交付后 kill 前崩溃" });
+    const doneTask = seeded.createTask({ runId: run.id, title: "done", spec: "" });
+    const failedTask = seeded.createTask({ runId: run.id, title: "failed", spec: "" });
+    const doneDispatch = seeded.createDispatch({ taskId: doneTask.id, sessionId: "done-still-live" });
+    const failedDispatch = seeded.createDispatch({ taskId: failedTask.id, sessionId: "failed-still-live" });
+    seeded.setTaskStatus(doneTask.id, "done", "已交付");
+    seeded.setDispatchState(doneDispatch.id, "succeeded", "已交付");
+    seeded.setTaskStatus(failedTask.id, "failed", "已报告失败");
+    seeded.setDispatchState(failedDispatch.id, "failed", "已报告失败");
+    seeded.close();
+
+    const restored = new OrchestrationStore(home);
+    const sessions = new RecoverySessions();
+    sessions.live.set("done-still-live", session("done-still-live", "idle"));
+    sessions.live.set("failed-still-live", session("failed-still-live", "running"));
+    const result = await new DispatchService(restored, sessions).reconcilePersistedSessions();
+
+    expect(result).toEqual({ settled: [], resumed: [] });
+    expect(sessions.killed).toEqual(["done-still-live", "failed-still-live"]);
+    expect(sessions.killOptions).toEqual([
+      { preserveHistory: true },
+      { preserveHistory: true },
+    ]);
+    expect(restored.getDispatch(doneDispatch.id).state).toBe("succeeded");
+    expect(restored.getDispatch(failedDispatch.id).state).toBe("failed");
+    expect(restored.getTask(doneTask.id).status).toBe("done");
+    expect(restored.getTask(failedTask.id).status).toBe("failed");
+    restored.close();
   });
 
   it("存活会话把遗留 starting 恢复为 running，自动编排保持运行而不重复派发", async () => {
@@ -162,7 +201,7 @@ describe("daemon 启动时的 Dispatch 对账", () => {
     const service = new DispatchService(store, sessions);
     const automation = new AutomationService(store, service);
 
-    expect(service.reconcilePersistedSessions()).toMatchObject({
+    expect(await service.reconcilePersistedSessions()).toMatchObject({
       settled: [],
       resumed: [{ id: dispatch.id, state: "running" }],
     });
@@ -196,7 +235,7 @@ describe("daemon 启动时的 Dispatch 对账", () => {
     const automation = new AutomationService(store, new DispatchService(store, new RecoverySessions()));
     const dispatch = new DispatchService(store, new RecoverySessions());
 
-    dispatch.reconcilePersistedSessions();
+    await dispatch.reconcilePersistedSessions();
     automation.resumePersisted();
     await automation.advance(run.id);
 

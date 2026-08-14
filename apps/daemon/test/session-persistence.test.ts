@@ -85,7 +85,8 @@ describe("结构化会话持久化", () => {
     expect(first.infoOf(created.id).status).toBe("done");
     await expect(first.chatSend(created.id, "不得继续写 worktree"))
       .rejects.toThrow("历史只读");
-    first.flushPersistence();
+    // preserveHistory kill 自己就必须同步写 terminal 快照；这里刻意不手动 flush，
+    // 模拟 kill 返回后 daemon 立刻崩溃。
     expect(JSON.parse(readFileSync(path.join(home, "structured-sessions.json"), "utf8")))
       .toEqual([expect.objectContaining({
         id: created.id,
@@ -111,6 +112,85 @@ describe("结构化会话持久化", () => {
     expect(restored).toEqual([expect.objectContaining({ id: created.id, status: "done" })]);
     expect(starts).toBe(0);
     await expect(second.chatSend(created.id, "不得重启"))
+      .rejects.toThrow("历史只读");
+    await second.disposeAll();
+  });
+
+  it("preserveHistory 在原生 adapter 释放卡住时也立即写出终态", async () => {
+    const home = tempHome();
+    let releaseDispose: (() => void) | null = null;
+    const manager = new SessionManager({
+      home,
+      adapterFactory: (_agent, state) => {
+        const adapter = new FakePersistentAdapter(state);
+        adapter.dispose = async () => new Promise<void>((resolve) => {
+          releaseDispose = resolve;
+        });
+        return adapter;
+      },
+    });
+    const created = await manager.create({
+      agent: "codex",
+      kind: "structured",
+      cwd: home,
+      cols: 80,
+      rows: 24,
+      allowShell: false,
+    });
+
+    // 不 await：模拟 worker 自己正在承载的 control RPC 令 adapter.dispose 等待，
+    // daemon 仍必须先同步落下 terminal snapshot 才能防止随后崩溃时错误恢复。
+    const killing = manager.kill(created.id, { preserveHistory: true });
+    expect(releaseDispose).not.toBeNull();
+    expect(JSON.parse(readFileSync(path.join(home, "structured-sessions.json"), "utf8")))
+      .toEqual([expect.objectContaining({ id: created.id, terminal: true })]);
+
+    releaseDispose?.();
+    await killing;
+    await manager.disposeAll();
+  });
+
+  it("恢复阶段可先封存已结算 worker，不启动 adapter 或消费旧队列", async () => {
+    const home = tempHome();
+    const first = new SessionManager({
+      home,
+      adapterFactory: (_agent, state) => new FakePersistentAdapter(state),
+    });
+    const created = await first.create({
+      agent: "codex",
+      kind: "structured",
+      cwd: home,
+      cols: 80,
+      rows: 24,
+      allowShell: false,
+    });
+    // 模拟 store 先落下 dispatch succeeded/failed、进程在 kill 之前崩溃：
+    // structured state 仍是非 terminal。
+    first.flushPersistence();
+    await first.disposeAll();
+
+    let starts = 0;
+    const second = new SessionManager({
+      home,
+      adapterFactory: (_agent, state) => {
+        const adapter = new FakePersistentAdapter(state);
+        const start = adapter.start.bind(adapter);
+        adapter.start = async (context) => {
+          starts += 1;
+          await start(context);
+        };
+        return adapter;
+      },
+    });
+    const restored = await second.restoreStructured({
+      preserveHistoryWhen: (state) => state.id === created.id,
+    });
+
+    expect(restored).toEqual([expect.objectContaining({ id: created.id, status: "done" })]);
+    expect(starts).toBe(0);
+    expect(JSON.parse(readFileSync(path.join(home, "structured-sessions.json"), "utf8")))
+      .toEqual([expect.objectContaining({ id: created.id, terminal: true })]);
+    await expect(second.chatSend(created.id, "不得在恢复时重连"))
       .rejects.toThrow("历史只读");
     await second.disposeAll();
   });

@@ -265,6 +265,11 @@ export interface SessionManagerOptions {
   accountResolver?: ((accountId: string, agent: "claude" | "codex") => AccountBinding) | undefined;
 }
 
+/** 恢复前由编排层判定应封存的会话；避免 adapter 先接回并 drain 旧队列。 */
+export interface RestoreStructuredOptions {
+  preserveHistoryWhen?: (state: StructuredSessionPersistentState) => boolean;
+}
+
 export class SessionManager extends EventEmitter<SessionManagerEvents> {
   private readonly ptySessions = new Map<string, PtySession>();
   private readonly structuredSessions = new Map<string, StructuredSession>();
@@ -416,9 +421,14 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
    * 恢复结构化会话。Prospero 事件日志负责 UI，adapterState 让原生 CLI
    * 接回模型上下文；单个后端失效时仍保留历史供查看和删除。
    */
-  async restoreStructured(): Promise<SessionInfo[]> {
+  async restoreStructured(options: RestoreStructuredOptions = {}): Promise<SessionInfo[]> {
     const restored: SessionInfo[] = [];
-    for (const state of this.loadStructuredStates()) {
+    for (const loaded of this.loadStructuredStates()) {
+      // Store 已经落下 worker 交付、但还没来得及 kill 就崩溃时，这里先封存而
+      // 不能让 session.start() 接回 native thread 并从 messageQueue 取走一条。
+      const state = !loaded.terminal && options.preserveHistoryWhen?.(loaded)
+        ? { ...loaded, terminal: true as const }
+        : loaded;
       if (this.structuredSessions.has(state.id)) continue;
       const session = this.makeStructuredSession(state.id, state.agent, state.cwd, state.title, state);
       this.structuredSessions.set(state.id, session);
@@ -822,9 +832,18 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     const structured = this.structuredSessions.get(sid);
     if (structured) {
       const info = structured.info();
-      await structured.dispose();
+      // dispose 在首个 await 前就同步把 StructuredSession 标为 done/read-only；
+      // 因此 preserveHistory 可以在 adapter.dispose 卡住时仍立即写出终态快照。
+      const disposing = structured.dispose();
+      if (options.preserveHistory) {
+        // 终态 worker 不能只等 200ms debounce：daemon 若在此刻崩溃，旧状态会在
+        // 下次启动时被当成可恢复会话并继续消费原 worktree 的队列。
+        this.persistStructuredNow();
+      } else {
+        this.scheduleStructuredPersist();
+      }
+      await disposing;
       if (!options.preserveHistory) this.structuredSessions.delete(sid);
-      this.scheduleStructuredPersist();
       this.emit("state", { ...info, status: "done" });
       return;
     }

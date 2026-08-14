@@ -1095,8 +1095,11 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
       clearTimeout(this.previewStateTimer);
       this.previewStateTimer = null;
     }
-    await this.adapter.dispose().catch(() => {});
+    // 先把会话封存为 done，再等待原生 adapter 释放。worker 的 control RPC 可能
+    // 正由 adapter 自己承载；若此处等待形成自杀式死锁，SessionManager 仍能立即
+    // 落盘只读终态，避免重启后消费旧 worktree 的排队消息。
     this.setStatus("done");
+    await this.adapter.dispose().catch(() => {});
     this.removeAllListeners();
   }
 }
