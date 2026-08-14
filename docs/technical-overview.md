@@ -354,9 +354,11 @@ adapter 的 `SessionStatus`（idle 等）猜 done。
 
 **恢复对账** `reconcilePersistedSessions()`（启动顺序不可调换：control socket → SessionManager →
 对账 → 自动队列/Goal 重试）：
-- 非 active 但会话仍活 → 终止已交付 worker；
-- active 但会话缺失/终态 → 收敛为 `abandoned + failed` 并保留原因；
-- `starting` 但会话存活 → 标回 `running`（不重复派发）。
+- 会话的真正终态只有 `done | died`；`completed` 是结构化会话的一轮结束，和 `idle`、
+  `waiting_*` 一样仍可接收 chat、持有 writer 租约。`infoOf` 缺失等同真正终态。
+- 非 active 但会话仍活（含 `completed`）→ 显式终止并归档已交付 worker，防止恢复后旧队列写回；
+- active 但会话缺失/真正终态 → 收敛为 `abandoned + failed` 并保留原因；
+- `starting` 但会话存活（含 `completed`）→ 标回 `running`（不重复派发）。
 
 **收敛（settle）**：`settleWorkerDelivery` 是同步持久化提交点——Task、Dispatch、关联 worktree 资产在同一
 快照里收敛再原子写，返回后才允许 kill 真实会话。`restoreStructured` 有两道封存闸门防止旧队列在恢复窗口内

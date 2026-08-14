@@ -15,11 +15,18 @@ export interface LiveWorktreeLease {
   session: SessionInfo;
 }
 
-export function isTerminalSession(session: SessionInfo): boolean {
-  return session.status === "completed" || session.status === "done" || session.status === "died";
+/**
+ * 会话/进程已真正终止，今后不可能再向它的 cwd 写入。
+ *
+ * `completed` 只表示结构化 agent 的一轮 turn 结束；`idle`、各种 waiting 状态和
+ * `completed` 都仍可以接受下一轮 chat，因而仍是工作树 writer。调用方应把
+ * `SessionManager.infoOf` 的缺失规范为 `null`，它和真正终止一样不再占租约。
+ */
+export function isTerminalSession(session: SessionInfo | null | undefined): boolean {
+  return session == null || session.status === "done" || session.status === "died";
 }
 
-/** 找到某个 cwd 所在登记工作树的存活 writer；缺失或终态会话不占租约。 */
+/** 找到某个 cwd 所在登记工作树的存活 writer；缺失或真正终态会话不占租约。 */
 export function findLiveWorktreeLease(
   store: OrchestrationStore,
   sessions: WorktreeSessionInspector,

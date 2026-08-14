@@ -472,17 +472,21 @@ export async function createDaemonServer(
   }
 
   manager.on("state", (session) => {
-    // Structured sessions naturally settle at completed; done/died are the
-    // terminal statuses emitted when a session is explicitly killed. All
-    // three mean a worker that did not explicitly hand in must be reconciled.
-    if (session.status === "completed" || session.status === "done" || session.status === "died") {
-      const settled = dispatchService.settleEndedSession(
+    // Structured `completed` 只是本轮结束，仍可接受下一轮 chat 并继续持有
+    // worktree writer 租约。只有 done/died 才表示会话真正终止；未显式交付的
+    // worker 才需要在这里失败收口。
+    if (session.status === "done" || session.status === "died") {
+      const settled = dispatchService.settleTerminatedSession(
         session.id,
         session.status === "died" ? "worker 会话意外退出" : "worker 会话已结束但未显式交付",
       );
       if (settled) {
         automationService.kick(settled.task.runId);
       }
+    }
+    // coordinator 的 completed 可以促成已显式交付完毕的 Run 收口，但不会结算
+    // 任何 worker Dispatch。
+    if (session.status === "completed" || session.status === "done" || session.status === "died") {
       completeSettledCoordinatorRuns();
     }
     for (const conn of conns) {

@@ -274,7 +274,7 @@ describe("控制 API 的幂等与任务图事务", () => {
     expect(store.listRuns()).toEqual([]);
   });
 
-  it("run.delete 拒绝仍活着的已交付 worker，避免随后 cleanup 失去 session 索引", async () => {
+  it("run.delete 拒绝仍活着的已交付 completed worker，避免随后 cleanup 失去 session 索引", async () => {
     const store = new OrchestrationStore();
     const run = store.createRun({ objective: "保留 live settled worker" });
     const task = store.createTask({ runId: run.id, title: "实现", spec: "" });
@@ -290,7 +290,7 @@ describe("控制 API 的幂等与任务图事务", () => {
           kind: "structured",
           title: "worker",
           cwd: "/tmp/live-worker",
-          status: "running",
+          status: "completed",
           createdAt: 1,
           cols: 80,
           rows: 24,
