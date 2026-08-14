@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 
 const storage = vi.hoisted(() => new Map<string, string>());
 const secrets = vi.hoisted(() => new Map<string, string>());
@@ -30,9 +31,43 @@ import {
   upsertHostFromPairing,
 } from "../src/lib/hosts";
 
+const HOSTS_KEY = "prospero.hosts.v1";
+
+function relayPairing(pubKey = generateKeyPairB64().publicKey) {
+  return {
+    v: 7,
+    name: "MacBook",
+    addrs: ["192.168.1.8"],
+    port: 7423,
+    token: "0123456789abcdef",
+    pubKey,
+    relay: {
+      v: 1 as const,
+      url: "wss://relay.example.com/v1",
+      routeId: "route_0123456789",
+      deviceId: "device_0123456789",
+      token: "relay_token_0123456789",
+    },
+  };
+}
+
+function relaySecretKeys(hostId: string) {
+  return {
+    e2e: `prospero.hostToken.v1.${hostId}`,
+    relay: `prospero.relayToken.v1.${hostId}`,
+  };
+}
+
 beforeEach(() => {
   storage.clear();
   secrets.clear();
+  vi.mocked(AsyncStorage.getItem).mockImplementation(async (key) => storage.get(key) ?? null);
+  vi.mocked(AsyncStorage.setItem).mockImplementation(async (key, value) => {
+    storage.set(key, value);
+  });
+  vi.mocked(AsyncStorage.removeItem).mockImplementation(async (key) => {
+    storage.delete(key);
+  });
   vi.mocked(SecureStore.isAvailableAsync).mockResolvedValue(true);
   vi.mocked(SecureStore.getItemAsync).mockImplementation(async (key) => secrets.get(key) ?? null);
   vi.mocked(SecureStore.setItemAsync).mockImplementation(async (key, value) => {
@@ -161,13 +196,162 @@ describe("配对凭据安全迁移", () => {
       secrets.set(key, value);
     });
 
-    await getHosts();
+    const hosts = await getHosts();
+    expect(hosts[0]).toMatchObject({
+      token: "0123456789abcdef",
+      relayToken: "relay_token_0123456789",
+    });
     const persisted = JSON.parse(storage.get("prospero.hosts.v1") ?? "[]") as Array<{
       token?: string;
       relay?: { token?: string };
     }>;
     expect(persisted[0]?.token).toBe("0123456789abcdef");
     expect(persisted[0]?.relay?.token).toBe("relay_token_0123456789");
+  });
+
+  it("已有 relay 主机重新配对时，地址簿失败会恢复两把旧凭据与旧 route 元数据", async () => {
+    const firstPairing = relayPairing();
+    const first = await upsertHostFromPairing(firstPairing);
+    const keys = relaySecretKeys(first.id);
+    const oldMetadata = storage.get(HOSTS_KEY);
+    let failMetadataOnce = true;
+    vi.mocked(AsyncStorage.setItem).mockImplementation(async (key, value) => {
+      if (key === HOSTS_KEY && failMetadataOnce) {
+        failMetadataOnce = false;
+        throw new Error("address book full");
+      }
+      storage.set(key, value);
+    });
+
+    const replacement = {
+      ...firstPairing,
+      token: "fedcba9876543210",
+      relay: {
+        ...firstPairing.relay,
+        routeId: "route_replacement_0123456789",
+        deviceId: "device_replacement_0123456789",
+        token: "relay_replacement_0123456789",
+      },
+    };
+    await expect(upsertHostFromPairing(replacement)).rejects.toThrow("address book full");
+
+    expect(secrets.get(keys.e2e)).toBe(firstPairing.token);
+    expect(secrets.get(keys.relay)).toBe(firstPairing.relay.token);
+    expect(storage.get(HOSTS_KEY)).toBe(oldMetadata);
+    expect(storage.get(HOSTS_KEY)).not.toContain(replacement.token);
+    expect(storage.get(HOSTS_KEY)).not.toContain(replacement.relay.token);
+    expect(storage.get(HOSTS_KEY)).not.toContain(replacement.relay.routeId);
+    expect(storage.get(HOSTS_KEY)).not.toContain(replacement.relay.deviceId);
+  });
+
+  it("旧 relay ticket 原本不存在时，地址簿失败会删除刚写入的新 ticket", async () => {
+    const firstPairing = relayPairing();
+    const first = await upsertHostFromPairing(firstPairing);
+    const keys = relaySecretKeys(first.id);
+    const oldMetadata = storage.get(HOSTS_KEY);
+    secrets.delete(keys.relay);
+    let failMetadataOnce = true;
+    vi.mocked(AsyncStorage.setItem).mockImplementation(async (key, value) => {
+      if (key === HOSTS_KEY && failMetadataOnce) {
+        failMetadataOnce = false;
+        throw new Error("address book full");
+      }
+      storage.set(key, value);
+    });
+
+    await expect(upsertHostFromPairing({
+      ...firstPairing,
+      token: "fedcba9876543210",
+      relay: { ...firstPairing.relay, token: "relay_replacement_0123456789" },
+    })).rejects.toThrow("address book full");
+
+    expect(secrets.get(keys.e2e)).toBe(firstPairing.token);
+    expect(secrets.has(keys.relay)).toBe(false);
+    expect(storage.get(HOSTS_KEY)).toBe(oldMetadata);
+  });
+
+  it("首个 SecureStore 写入失败时不会改变已有 relay 主机", async () => {
+    const firstPairing = relayPairing();
+    const first = await upsertHostFromPairing(firstPairing);
+    const keys = relaySecretKeys(first.id);
+    const oldMetadata = storage.get(HOSTS_KEY);
+    let writes = 0;
+    vi.mocked(SecureStore.setItemAsync).mockImplementation(async (key, value) => {
+      writes += 1;
+      if (writes === 1) throw new Error("first secure write failed");
+      secrets.set(key, value);
+    });
+
+    await expect(upsertHostFromPairing({
+      ...firstPairing,
+      token: "fedcba9876543210",
+      relay: { ...firstPairing.relay, token: "relay_replacement_0123456789" },
+    })).rejects.toThrow("first secure write failed");
+
+    expect(secrets.get(keys.e2e)).toBe(firstPairing.token);
+    expect(secrets.get(keys.relay)).toBe(firstPairing.relay.token);
+    expect(storage.get(HOSTS_KEY)).toBe(oldMetadata);
+  });
+
+  it("第二个 SecureStore 写入失败时会回滚已经更新的 E2E 与 relay ticket", async () => {
+    const firstPairing = relayPairing();
+    const first = await upsertHostFromPairing(firstPairing);
+    const keys = relaySecretKeys(first.id);
+    const oldMetadata = storage.get(HOSTS_KEY);
+    let writes = 0;
+    vi.mocked(SecureStore.setItemAsync).mockImplementation(async (key, value) => {
+      writes += 1;
+      if (writes === 2) throw new Error("second secure write failed");
+      secrets.set(key, value);
+    });
+
+    await expect(upsertHostFromPairing({
+      ...firstPairing,
+      token: "fedcba9876543210",
+      relay: { ...firstPairing.relay, token: "relay_replacement_0123456789" },
+    })).rejects.toThrow("second secure write failed");
+
+    expect(secrets.get(keys.e2e)).toBe(firstPairing.token);
+    expect(secrets.get(keys.relay)).toBe(firstPairing.relay.token);
+    expect(storage.get(HOSTS_KEY)).toBe(oldMetadata);
+  });
+
+  it("补偿写入也失败时保守地保留旧地址簿与仍可用的旧凭据，并报告恢复失败", async () => {
+    const firstPairing = relayPairing();
+    const first = await upsertHostFromPairing(firstPairing);
+    const keys = relaySecretKeys(first.id);
+    const oldMetadata = storage.get(HOSTS_KEY);
+    let writes = 0;
+    vi.mocked(SecureStore.setItemAsync).mockImplementation(async (key, value) => {
+      writes += 1;
+      if (writes === 2 || writes === 3) throw new Error("secure store unavailable");
+      secrets.set(key, value);
+    });
+
+    await expect(upsertHostFromPairing({
+      ...firstPairing,
+      token: "fedcba9876543210",
+      relay: { ...firstPairing.relay, token: "relay_replacement_0123456789" },
+    })).rejects.toThrow("回滚未完全完成");
+
+    expect(secrets.get(keys.e2e)).toBe(firstPairing.token);
+    expect(secrets.get(keys.relay)).toBe(firstPairing.relay.token);
+    expect(storage.get(HOSTS_KEY)).toBe(oldMetadata);
+  });
+
+  it("正常配对的 AsyncStorage 元数据绝不包含 E2E 或 relay secret", async () => {
+    const pairing = relayPairing();
+    await upsertHostFromPairing(pairing);
+
+    const metadata = storage.get(HOSTS_KEY) ?? "";
+    expect(metadata).not.toContain(pairing.token);
+    expect(metadata).not.toContain(pairing.relay.token);
+    expect(JSON.parse(metadata)[0]).toMatchObject({
+      relay: {
+        routeId: pairing.relay.routeId,
+        deviceId: pairing.relay.deviceId,
+      },
+    });
   });
 
   it("没有 QR ticket 时拒绝把主机保存为 relay 模式", async () => {
