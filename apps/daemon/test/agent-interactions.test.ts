@@ -4,6 +4,7 @@ import type {
   AgentQuestionAnswer,
   PermissionReply,
 } from "@prospero/protocol";
+import { MAX_SUBAGENT_SUMMARY_CHARS, parseS2C } from "@prospero/protocol";
 import type {
   AdapterContext,
   AgentAdapter,
@@ -115,9 +116,128 @@ class InteractiveAdapter implements AgentAdapter {
   async readSubagentHistory(): Promise<AgentEventBody[] | null> {
     return this.history ? [...this.history] : null;
   }
+
+  emit(body: AgentEventBody): void {
+    this.ctx?.emit(body);
+  }
 }
 
 describe("结构化 Agent 原生交互", () => {
+  it("清洗超长子 Agent 摘要并发送可解析的紧凑快照", async () => {
+    const adapter = new InteractiveAdapter();
+    const session = new StructuredSession({
+      id: "bounded-subagent-summary",
+      agent: "claude",
+      title: "claude · summary",
+      cwd: "/tmp",
+      adapter,
+    });
+    await session.start();
+    const longSummary = `开头 ${"长".repeat(MAX_SUBAGENT_SUMMARY_CHARS + 8_000)} 最终结论`;
+    adapter.emit({
+      kind: "subagent.started",
+      subagent: {
+        id: "child-long",
+        name: "reviewer",
+        status: "running",
+        canMessage: true,
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    });
+    adapter.emit({ kind: "reasoning.delta", msgId: "m1", delta: "先分析" });
+    adapter.emit({ kind: "reasoning.delta", msgId: "m1", delta: "再判断" });
+    adapter.emit({
+      kind: "subagent.updated",
+      subagentId: "child-long",
+      status: "running",
+      canMessage: true,
+      summary: longSummary,
+    });
+    adapter.emit({
+      kind: "subagent.updated",
+      subagentId: "child-long",
+      status: "completed",
+      canMessage: false,
+    });
+
+    const durableUpdate = session.snapshot().events.find(
+      (body): body is Extract<AgentEventBody, { kind: "subagent.updated" }> =>
+        body.kind === "subagent.updated" && body.summary !== undefined,
+    );
+    expect(durableUpdate?.summary).toHaveLength(MAX_SUBAGENT_SUMMARY_CHARS);
+    expect(durableUpdate?.summary.endsWith("最终结论")).toBe(true);
+
+    const wire = session.transportSnapshot();
+    expect(wire.events.filter((body) => body.kind === "reasoning.delta")).toEqual([
+      expect.objectContaining({ delta: "先分析再判断" }),
+    ]);
+    const wireUpdates = wire.events.filter(
+      (body): body is Extract<AgentEventBody, { kind: "subagent.updated" }> =>
+        body.kind === "subagent.updated",
+    );
+    expect(wireUpdates).toHaveLength(1);
+    expect(wireUpdates[0]).toMatchObject({
+      status: "completed",
+      canMessage: false,
+    });
+    expect(wireUpdates[0]?.summary?.length).toBeLessThanOrEqual(220);
+    expect(() => parseS2C({
+      type: "chat.snapshot",
+      sid: session.id,
+      evSeq: wire.evSeq,
+      events: wire.events,
+    })).not.toThrow();
+    await session.dispose();
+  });
+
+  it("恢复旧历史时也修复超过协议上限的子 Agent 摘要", async () => {
+    const longSummary = "旧".repeat(MAX_SUBAGENT_SUMMARY_CHARS + 1);
+    const restored: StructuredSessionPersistentState = {
+      version: 1,
+      id: "legacy-long-subagent-summary",
+      agent: "claude",
+      title: "claude · legacy",
+      cwd: "/tmp",
+      createdAt: 1,
+      approvalPolicy: "standard",
+      events: [{
+        kind: "subagent.updated",
+        subagentId: "legacy-child",
+        status: "completed",
+        summary: longSummary,
+      }],
+      evSeq: 8,
+      preview: "",
+      previewRaw: "",
+      previewMsgId: "",
+      totals: { costUsd: 0, inputTokens: 0, outputTokens: 0 },
+      toolOutputs: [],
+      adapterState: {},
+      messageQueue: [],
+    };
+    const session = new StructuredSession({
+      id: restored.id,
+      agent: restored.agent,
+      title: restored.title,
+      cwd: restored.cwd,
+      adapter: new InteractiveAdapter(),
+      restored,
+    });
+
+    const update = session.snapshot().events[0];
+    expect(update?.kind).toBe("subagent.updated");
+    if (update?.kind === "subagent.updated") {
+      expect(update.summary).toHaveLength(MAX_SUBAGENT_SUMMARY_CHARS);
+    }
+    expect(() => parseS2C({
+      type: "chat.snapshot",
+      sid: session.id,
+      ...session.transportSnapshot(),
+    })).not.toThrow();
+    await session.dispose();
+  });
+
   it("模型/Plan 能力写进会话状态并持久化选择", async () => {
     const adapter = new InteractiveAdapter();
     const session = new StructuredSession({

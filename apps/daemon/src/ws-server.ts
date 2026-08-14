@@ -513,7 +513,7 @@ export async function createDaemonServer(
       }
       return;
     }
-    const snap = session.snapshot();
+    const snap = session.transportSnapshot();
     conn.chatAttachments.set(sid, { lastEvSeq: snap.evSeq });
     send(conn, { type: "chat.snapshot", sid, evSeq: snap.evSeq, events: snap.events });
   }

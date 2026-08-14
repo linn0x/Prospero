@@ -160,6 +160,9 @@ export const SubagentStatusSchema = z.enum([
   "stopped",
 ]);
 
+/** Native Agent SDK summaries must be bounded before they enter a wire event. */
+export const MAX_SUBAGENT_SUMMARY_CHARS = 10_000;
+
 /** 主会话下的可查看子 Agent。id 是后端可定向投递的原生身份。 */
 export const SubagentInfoSchema = z.object({
   id: z.string().min(1).max(500),
@@ -1232,7 +1235,7 @@ export const AgentSubagentUpdatedSchema = z.object({
   subagentId: z.string().min(1).max(500),
   status: SubagentStatusSchema,
   canMessage: z.boolean().optional(),
-  summary: z.string().max(10000).optional(),
+  summary: z.string().max(MAX_SUBAGENT_SUMMARY_CHARS).optional(),
 });
 
 export const AgentTurnEndSchema = z.object({
