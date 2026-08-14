@@ -5,6 +5,7 @@
 import { z } from "zod";
 import { fromB64 } from "./b64.js";
 import { ProtocolError } from "./errors.js";
+import { RelayPairingSchema } from "./relay.js";
 
 export const AgentKindSchema = z.enum([
   "shell",
@@ -261,6 +262,16 @@ export const C2SHelloSchema = z.object({
     platform: z.enum(["ios", "android"]),
     appVersion: z.string(),
   }),
+});
+
+/**
+ * 应用层保活。它和 pong 都必须经 SecureChannel 加密，relay 只能观察到
+ * 密文大小与时序，不能伪造一个会被应用接受的响应。
+ */
+export const C2SConnectionPingSchema = z.object({
+  type: z.literal("connection.ping"),
+  /** 请求/响应关联 ID，不含时间、地址或任何身份信息。 */
+  id: z.string().min(1).max(128),
 });
 
 export const C2SSessionCreateSchema = z.object({
@@ -993,6 +1004,7 @@ export const C2SOrchestrationWorktreeCleanupSchema = z.object({
 
 export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SHelloSchema,
+  C2SConnectionPingSchema,
   C2SSessionCreateSchema,
   C2SConversationSearchSchema,
   C2SAgentAccountsListSchema,
@@ -1068,6 +1080,12 @@ export const S2CHelloOkSchema = z.object({
   type: z.literal("hello.ok"),
   host: HostInfoSchema,
   sessions: z.array(SessionInfoSchema),
+});
+
+/** 对 connection.ping 的加密回显。 */
+export const S2CConnectionPongSchema = z.object({
+  type: z.literal("connection.pong"),
+  id: z.string().min(1).max(128),
 });
 
 export const S2CSessionStateSchema = z.object({
@@ -1600,6 +1618,7 @@ export const S2COrchestrationSnapshotSchema = z.object({
 
 export const S2CMessageSchema = z.discriminatedUnion("type", [
   S2CHelloOkSchema,
+  S2CConnectionPongSchema,
   S2CSessionStateSchema,
   S2CTermSnapshotSchema,
   S2CTermOutputSchema,
@@ -1635,12 +1654,22 @@ export const S2CMessageSchema = z.discriminatedUnion("type", [
 export const PairingPayloadSchema = z.object({
   v: z.number().int().nonnegative(),
   name: z.string().min(1),
-  /** 全部网卡候选地址(en0 / utun* …),客户端并发竞速 */
-  addrs: z.array(z.string().min(1)).min(1),
+  /** 全部网卡候选地址(en0 / utun* …),客户端并发竞速；relay-only 时可为空。 */
+  addrs: z.array(z.string().min(1)).max(64),
   port: z.number().int().min(1).max(65535),
   token: z.string().min(16),
   /** daemon X25519 公钥(base64) */
   pubKey: b64Key32,
+  /** 可选的公网 relay 路由；其中 token 不是上面的 E2E pairing token。 */
+  relay: RelayPairingSchema.optional(),
+}).superRefine((payload, ctx) => {
+  if (payload.addrs.length === 0 && payload.relay === undefined) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["addrs"],
+      message: "at least one direct address or relay is required",
+    });
+  }
 });
 
 // ---------------------------------------------------------------- 推断类型与解析入口
@@ -1668,6 +1697,7 @@ export type AgentControls = z.infer<typeof AgentControlsSchema>;
 export type SubagentStatus = z.infer<typeof SubagentStatusSchema>;
 export type SubagentInfo = z.infer<typeof SubagentInfoSchema>;
 export type C2SHello = z.infer<typeof C2SHelloSchema>;
+export type C2SConnectionPing = z.infer<typeof C2SConnectionPingSchema>;
 export type C2SSessionCreate = z.infer<typeof C2SSessionCreateSchema>;
 export type C2SOrchestrationSnapshot = z.infer<typeof C2SOrchestrationSnapshotSchema>;
 export type C2SOrchestrationGateResolve = z.infer<typeof C2SOrchestrationGateResolveSchema>;
@@ -1757,6 +1787,7 @@ export type AgentSubagentStarted = z.infer<typeof AgentSubagentStartedSchema>;
 export type AgentSubagentUpdated = z.infer<typeof AgentSubagentUpdatedSchema>;
 export type AgentTurnEnd = z.infer<typeof AgentTurnEndSchema>;
 export type S2CHelloOk = z.infer<typeof S2CHelloOkSchema>;
+export type S2CConnectionPong = z.infer<typeof S2CConnectionPongSchema>;
 export type S2CSessionState = z.infer<typeof S2CSessionStateSchema>;
 export type S2CTermSnapshot = z.infer<typeof S2CTermSnapshotSchema>;
 export type S2CTermOutput = z.infer<typeof S2CTermOutputSchema>;

@@ -5,6 +5,7 @@ export * from "./utf8.js";
 export * from "./crypto.js";
 export * from "./qr.js";
 export * from "./ring.js";
+export * from "./relay.js";
 export {
   parseC2S,
   parseS2C,
@@ -91,6 +92,8 @@ export {
   C2SMessageSchema,
   S2CMessageSchema,
   PairingPayloadSchema,
+  C2SConnectionPingSchema,
+  S2CConnectionPongSchema,
 } from "./schemas.js";
 export type {
   ApprovalPolicy,
@@ -101,6 +104,7 @@ export type {
   ChatSuggestion,
   QueuedChatMessage,
   ResumableConversation,
+  C2SConnectionPing,
   C2SConversationSearch,
   C2SLaunchModelsGet,
   LaunchModels,
@@ -162,4 +166,5 @@ export type {
   C2SOrchestrationWorktreeInspect,
   C2SOrchestrationWorktreeCleanup,
   S2COrchestrationSnapshot,
+  S2CConnectionPong,
 } from "./schemas.js";
