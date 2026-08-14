@@ -7,6 +7,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { spawn } from "node:child_process";
 import { createServer, type Server } from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -14,6 +15,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   launchStructuredSupervisor,
   RemoteStructuredSession,
+  rollbackFailedStructuredSupervisorLaunch,
   type StructuredSupervisorManifest,
 } from "../src/structured-supervisor-client.js";
 
@@ -59,6 +61,32 @@ async function startHangingSocket(socketPath: string): Promise<Server> {
   return server;
 }
 
+async function startDetachedSentinel(): Promise<number> {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    detached: true,
+    stdio: "ignore",
+  });
+  await new Promise<void>((resolve, reject) => {
+    child.once("spawn", resolve);
+    child.once("error", reject);
+  });
+  if (!child.pid || !Number.isSafeInteger(child.pid) || child.pid <= 1) {
+    throw new Error("sentinel spawn returned no process group id");
+  }
+  child.unref();
+  ownedGroups.add(child.pid);
+  await eventually(() => processAlive(child.pid!), "independent detached sentinel start");
+  return child.pid;
+}
+
+async function stopOwnedGroup(groupId: number): Promise<void> {
+  // The test knows this PGID from its own detached spawn.  Never enumerate or
+  // infer a process group while cleaning up a regression fixture.
+  try { process.kill(-groupId, "SIGKILL"); } catch { /* already gone */ }
+  await eventually(() => !processAlive(groupId), `owned process group ${String(groupId)} exit`);
+  ownedGroups.delete(groupId);
+}
+
 function installHangingCodex(bin: string): void {
   const fixture = path.join(import.meta.dirname, "fixtures", "hanging-codex-app-server.mjs");
   const executable = path.join(bin, "codex");
@@ -91,6 +119,9 @@ describe("structured supervisor launch rollback", () => {
     const providerPidFile = path.join(home, "provider.pid");
     const sessionId = "launch-rollback-fixture";
     const root = path.join(home, "structured-supervisor");
+    // This is deliberately unrelated to the launch under test.  It models a
+    // pre-existing detached supervisor and proves rollback never picks it.
+    const sentinelGroup = await startDetachedSentinel();
 
     // The real RemoteStructuredSession client connects to this owned fixture
     // endpoint, which accepts the Unix connection but never replies. The
@@ -132,6 +163,12 @@ describe("structured supervisor launch rollback", () => {
     );
     ownedGroups.delete(runnerPid);
 
+    // A failed launch may only target the exact newly spawned PGID.  The
+    // independent sentinel must survive, then is removed by this test using
+    // its exact recorded PGID.
+    expect(processAlive(sentinelGroup)).toBe(true);
+    await stopOwnedGroup(sentinelGroup);
+
     expect(manifest.status).toBe("died");
     expect(existsSync(manifest.socket)).toBe(false);
     expect(existsSync(path.dirname(manifest.socket))).toBe(false);
@@ -139,5 +176,57 @@ describe("structured supervisor launch rollback", () => {
     // The 0700 directory, manifest, and protected token remain as audit-only
     // history; rollback never deletes broad roots or discovers other PIDs.
     expect(existsSync(path.join(sessionDir, "token"))).toBe(true);
+  });
+
+  it("continues credential cleanup and audit preservation after rollback operations fail", async () => {
+    const home = temp("prospero-launch-rollback-errors-");
+    const bootstrap = path.join(home, ".bootstrap-account.json");
+    writeFileSync(bootstrap, JSON.stringify({ environment: { ACCOUNT_TOKEN: "secret" } }), { mode: 0o600 });
+    const manifest: StructuredSupervisorManifest = {
+      version: 1,
+      protocolVersion: 1,
+      implementation: "supervisor",
+      sessionId: "rollback-error-fixture",
+      agent: "codex",
+      title: "rollback error fixture",
+      cwd: home,
+      createdAt: 1,
+      approvalPolicy: "standard",
+      socket: path.join(home, "s.sock"),
+      tokenFile: "token",
+      lifecycleEpoch: "fixture",
+    };
+    let socketCleanupCalled = false;
+    let manifestWriteCalled = false;
+
+    const rollback = await rollbackFailedStructuredSupervisorLaunch({
+      groupId: 41_424,
+      spawnAttempted: true,
+      bootstrap,
+      socketPath: manifest.socket,
+      socketDir: home,
+      manifestFile: path.join(home, "manifest.json"),
+      manifest,
+    }, {
+      // Simulates a failure in the TERM/KILL/wait escalation path.  The
+      // independent bootstrap and manifest operations must still run.
+      terminateGroup: async () => { throw new Error("TERM/KILL/wait failed"); },
+      removeSocket: () => { socketCleanupCalled = true; },
+      readManifest: () => manifest,
+      writeManifest: () => {
+        manifestWriteCalled = true;
+        throw new Error("manifest update failed");
+      },
+    });
+
+    expect(rollback.groupExited).toBe(false);
+    expect(existsSync(bootstrap)).toBe(false);
+    expect(socketCleanupCalled).toBe(false);
+    expect(manifestWriteCalled).toBe(true);
+    expect(rollback.errors.map((error) => error.message)).toEqual(expect.arrayContaining([
+      expect.stringContaining("terminate new supervisor process group"),
+      expect.stringContaining("retained launch socket/runtime directory"),
+      expect.stringContaining("preserve failed launch manifest"),
+    ]));
   });
 });
