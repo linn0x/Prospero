@@ -1,16 +1,16 @@
 /**
  * esaytree: 为 coding agent 创建快速、隔离、可回收的 Git 工作区。
  *
- * 快速路径不是先让 Git 把每个文件重新写一遍，而是：
- *   1. 建立 `--no-checkout` linked worktree；
- *   2. 用文件系统 CoW 克隆源工作区（不复制根 `.git`）；
- *   3. 清掉源工作区的本地改动，只保留目标 ref 的提交快照；
- *   4. 按需把完全被 Git 忽略的目录移回去，以复用依赖和构建缓存。
+ * 快速路径以 Git 正常检出已提交的 tracked 快照（它不复制 ignored 文件）开始，再：
+ *   1. 只识别明确允许的 ignored 依赖目录；
+ *   2. 用文件系统 CoW 逐目录克隆允许的依赖；
+ *   3. CoW 不可用时保留干净 Git checkout，默认不做实体复制；
+ *   4. 只有显式允许的实体复制才先完成磁盘容量预检。
  *
- * 这样 clean tracked 文件和依赖目录都共享物理块，任一工作区第一次写入时才分裂，
- * 同时 staged / unstaged / untracked 状态不会泄漏给 worker。
+ * 这样 staged / unstaged / untracked 状态不会泄漏给 worker，依赖的首次写入也不会
+ * 污染源树；构建缓存和私有配置从始至终不进入目标工作树。
  */
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import {
   constants,
   copyFileSync,
@@ -21,9 +21,9 @@ import {
   mkdtempSync,
   readdirSync,
   realpathSync,
-  renameSync,
   rmSync,
   statSync,
+  statfsSync,
 } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -73,8 +73,32 @@ export interface CloneReport {
   dir: string;
   /** true 表示文件系统确认使用 CoW；false 表示发生了真实复制。 */
   cow: boolean;
+  /** `skipped` 从未写入目标路径；不能被误认为已复用。 */
+  strategy: "cow" | "copy" | "skipped";
   ms: number;
+  /** 物理复制预检得到的保守逻辑字节数；CoW 路径不需要遍历统计。 */
+  bytes?: number;
+  /** 跳过、降级或失败的可操作原因。 */
+  reason?: string;
+  /** @deprecated 使用 reason；保留给已有 API 调用方。 */
   error?: string;
+}
+
+export type CowBackend = "macos_clonefile" | "node_copyfile_ficlone" | "injected" | "none";
+
+/**
+ * 实体复制是兜底，不是常态。默认 8 GiB 可防止一次 worker 派发吞掉整个数据卷；
+ * 部署方可通过 ESAYTREE_MAX_FALLBACK_COPY_BYTES 调整，0 表示禁止实体复制。
+ */
+export const DEFAULT_MAX_FALLBACK_COPY_BYTES = 8 * 1024 ** 3;
+/** 无论候选目录大小，都为源仓、Git 和后续工具留下最少 4 GiB。 */
+export const DEFAULT_MIN_FREE_BYTES = 4 * 1024 ** 3;
+
+export interface EsaytreeOperations {
+  /** 测试或受控嵌入可替换严格 CoW 后端；生产代码不应以普通 copy 冒充成功。 */
+  cloneCow?(from: string, to: string): void;
+  /** 以字节返回目标文件系统当前可分配空间。 */
+  availableBytes?(at: string): number;
 }
 
 export type EsaytreeCreateMode = "copy-on-write" | "git-checkout";
@@ -93,8 +117,14 @@ export interface CreateWorktreeInput {
   cloneIgnored?: boolean;
   /** CoW 不可用时是否退回普通 Git checkout；默认退回。 */
   fallbackToCheckout?: boolean;
-  /** fallback 时是否允许真实复制 ignored 目录；默认允许，以兼容既有行为。 */
+  /** fallback 时是否允许真实复制 ignored 目录；默认关闭，避免一次派发耗尽数据卷。 */
   fallbackCopyIgnored?: boolean;
+  /** fallback 实体复制的总量上限；默认 8 GiB。 */
+  maxFallbackCopyBytes?: number;
+  /** fallback 实体复制后必须保留的可用空间；默认 4 GiB。 */
+  minFreeBytes?: number;
+  /** 仅供受控嵌入和故障注入测试替换文件系统观察点。 */
+  operations?: EsaytreeOperations;
 }
 
 export interface CreateWorktreeResult {
@@ -102,8 +132,10 @@ export interface CreateWorktreeResult {
   branch: string | null;
   mode: EsaytreeCreateMode;
   cow: boolean;
+  cowBackend: CowBackend;
   clones: CloneReport[];
   preservedIgnored: string[];
+  skippedIgnored: CloneReport[];
   ms: number;
   fallbackReason?: string;
 }
@@ -113,6 +145,7 @@ export interface EsaytreeDoctorReport {
   root: string;
   gitVersion: string;
   cow: boolean;
+  cowBackend?: Exclude<CowBackend, "none">;
   cowError?: string;
 }
 
@@ -124,11 +157,113 @@ class CowCloneFailure extends Error {
 }
 
 /**
+ * `cp -c` 在 macOS 上允许静默退回 copyfile，因而它的 0 退出码不能证明 CoW。
+ * 这里通过系统自带的 JXA ObjC bridge 直接调用 libSystem 的 clonefile(2)。绑定使用
+ * `char *` 和未包装的 JS 路径字符串，读取 C `int` 返回值并额外核验原子目标创建；
+ * 没有两项成功绝不报告 `cow: true`。不引入 npm 原生 addon，也不共享可写目录。
+ *
+ * 每个允许的依赖目录只启动一次 helper；目录层级由 clonefile 原子处理，避免为
+ * node_modules 的每个文件启动进程或重写递归复制逻辑。
+ */
+const MACOS_CLONEFILE_SCRIPT = String.raw`
+ObjC.import('Foundation');
+// Foundation 不会自动把 libSystem 的 C 符号暴露到 dollar bridge。显式绑定是严格
+// clonefile 路径的一部分：没有它就失败并让上层安全降级，绝不退回 cp -c。
+ObjC.bindFunction('clonefile', ['int', ['char *', 'char *', 'uint32']]);
+
+const fileManager = $.NSFileManager.defaultManager;
+const environment = $.NSProcessInfo.processInfo.environment;
+const sourceRoot = ObjC.unwrap(environment.objectForKey($('ESAYTREE_CLONE_SOURCE')));
+const destinationRoot = ObjC.unwrap(environment.objectForKey($('ESAYTREE_CLONE_DESTINATION')));
+
+// clonefile 对目录会原子地 clone 整棵层级。不要在 JXA 中重写递归 copy；那既慢又
+// 容易破坏 xattr/符号链接语义。dst 原本不存在，调用后必须收到 0 并且实际存在。
+if (!sourceRoot || !destinationRoot) throw new Error('missing clonefile source or destination');
+if (fileManager.fileExistsAtPath($(destinationRoot))) throw new Error('clonefile destination already exists');
+const result = $.clonefile(sourceRoot, destinationRoot, 0);
+if (result !== 0 || !fileManager.fileExistsAtPath($(destinationRoot))) {
+  throw new Error('clonefile failed to create destination (rc=' + result + ')');
+}
+`;
+
+function nearestExistingDirectory(value: string): string {
+  let cursor = path.resolve(value);
+  while (!pathExists(cursor)) {
+    const parent = path.dirname(cursor);
+    if (parent === cursor) break;
+    cursor = parent;
+  }
+  return cursor;
+}
+
+function assertSameVolume(from: string, to: string): void {
+  const sourceDevice = statSync(from).dev;
+  const destinationDevice = statSync(nearestExistingDirectory(path.dirname(to))).dev;
+  if (sourceDevice !== destinationDevice) {
+    throw new CowCloneFailure(
+      `CoW 源和目标不在同一文件系统（source dev ${String(sourceDevice)}，target dev ${String(destinationDevice)}）`,
+    );
+  }
+}
+
+function cloneWithMacosClonefile(from: string, to: string): void {
+  assertSameVolume(from, to);
+  try {
+    // macOS 自带 /usr/bin/osascript；参数经环境变量传递且完全不经过 shell。
+    // clonefile 的返回值是严格语义，区别于 /bin/cp -c 的静默 copyfile fallback。
+    execFileSync("/usr/bin/osascript", ["-l", "JavaScript", "-e", MACOS_CLONEFILE_SCRIPT], {
+      env: {
+        ...process.env,
+        ESAYTREE_CLONE_SOURCE: from,
+        ESAYTREE_CLONE_DESTINATION: to,
+      },
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (error) {
+    const failure = error as { stderr?: string | Buffer; stdout?: string | Buffer; message?: string };
+    const detail = String(failure.stderr ?? failure.stdout ?? failure.message ?? error).trim();
+    throw new CowCloneFailure(detail || "macOS clonefile failed");
+  }
+}
+
+function cloneCowPath(
+  from: string,
+  to: string,
+  operations?: EsaytreeOperations,
+): Exclude<CowBackend, "none"> {
+  try {
+    if (operations?.cloneCow) {
+      operations.cloneCow(from, to);
+      return "injected";
+    }
+    if (process.platform === "darwin") {
+      cloneWithMacosClonefile(from, to);
+      return "macos_clonefile";
+    }
+    // 非 macOS 平台仍保留 Node 的 FORCE 语义；一旦不支持就必须抛错，绝不静默复制。
+    if (lstatSync(from).isDirectory()) {
+      cpSync(from, to, { recursive: true, mode: constants.COPYFILE_FICLONE_FORCE });
+    } else {
+      copyFileSync(from, to, constants.COPYFILE_FICLONE_FORCE);
+    }
+    return "node_copyfile_ficlone";
+  } catch (error) {
+    if (error instanceof CowCloneFailure) throw error;
+    throw new CowCloneFailure(error instanceof Error ? error.message : String(error));
+  }
+}
+
+/**
  * 用源仓 Git 元数据中的小文件做跨源/目标卷的强制 clonefile 探针。
  * 不能用空仓库“没有文件可复制”来推断 CoW 可用，也不能只在目标卷内部自拷贝，
  * 否则跨卷存储会被误报为可用。
  */
-function assertCowAvailable(fromRepo: string, toDir: string): void {
+function assertCowAvailable(
+  fromRepo: string,
+  toDir: string,
+  operations?: EsaytreeOperations,
+): Exclude<CowBackend, "none"> {
   const dotGit = path.join(fromRepo, ".git");
   const source = lstatSync(dotGit).isFile() ? dotGit : path.join(dotGit, "HEAD");
   const probe = path.join(
@@ -136,9 +271,7 @@ function assertCowAvailable(fromRepo: string, toDir: string): void {
     `.esaytree-cow-probe-${String(process.pid)}-${Date.now().toString(36)}`,
   );
   try {
-    copyFileSync(source, probe, constants.COPYFILE_FICLONE_FORCE);
-  } catch (error) {
-    throw new CowCloneFailure(error instanceof Error ? error.message : String(error));
+    return cloneCowPath(source, probe, operations);
   } finally {
     rmSync(probe, { force: true });
   }
@@ -272,11 +405,24 @@ function isStrictlyInside(root: string, candidate: string): boolean {
   return rel !== "" && !path.isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${path.sep}`);
 }
 
+interface IgnoredDirectorySelection {
+  preserved: string[];
+  skipped: CloneReport[];
+}
+
+/** 仅复用明确的、可再生成的依赖目录。绝不搬运缓存、构建输出或私有 agent 配置。 */
+function isReusableDependencyDir(rel: string): boolean {
+  return path.basename(rel) === "node_modules";
+}
+
 /**
  * 返回完全被 Git 忽略的目录。`--directory` 会折叠整棵 ignored 子树，避免遍历
  * node_modules 等巨型目录；`-z` 让空格和换行文件名也能被无损解析。
+ *
+ * 不再把“git ignored”等同于“可安全复用”：`build/`、`.cache/`、`.expo/`、
+ * `ios/build/`、`.claude/` 等可能很大、可再生成或含私有状态的目录都会跳过。
  */
-export async function ignoredDirs(repo: string): Promise<string[]> {
+async function selectIgnoredDirs(repo: string): Promise<IgnoredDirectorySelection> {
   const out = await git(repo, [
     "ls-files",
     "-z",
@@ -285,7 +431,7 @@ export async function ignoredDirs(repo: string): Promise<string[]> {
     "--directory",
     "--exclude-standard",
   ]);
-  return out
+  const allIgnored = out
     .split("\0")
     .map((line) => line.endsWith("/") ? line.slice(0, -1) : line)
     .filter((line) => line !== "")
@@ -297,16 +443,173 @@ export async function ignoredDirs(repo: string): Promise<string[]> {
         return false;
       }
     });
+  const preserved: string[] = [];
+  const skipped: CloneReport[] = [];
+  for (const rel of allIgnored) {
+    if (isReusableDependencyDir(rel)) {
+      preserved.push(rel);
+    } else {
+      skipped.push({
+        dir: rel,
+        cow: false,
+        strategy: "skipped",
+        ms: 0,
+        reason: "默认仅复用明确依赖目录 node_modules；构建产物、缓存和私有配置不会带入工作树",
+      });
+    }
+  }
+  return { preserved, skipped };
 }
 
-/** 单独克隆 ignored 目录；普通 checkout fallback 使用这一兼容路径。 */
+/** 兼容公开 API：只返回默认允许复用的依赖目录。 */
+export async function ignoredDirs(repo: string): Promise<string[]> {
+  return (await selectIgnoredDirs(repo)).preserved;
+}
+
+function configuredLimit(value: number | undefined, envName: string, fallback: number): number {
+  if (value !== undefined) return Math.max(0, Math.floor(value));
+  const raw = process.env[envName]?.trim();
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : fallback;
+}
+
+function availableBytesAt(value: string, operations?: EsaytreeOperations): number {
+  if (operations?.availableBytes) return operations.availableBytes(value);
+  const stats = statfsSync(nearestExistingDirectory(value));
+  return Number(stats.bavail) * Number(stats.bsize);
+}
+
+/**
+ * 统计逻辑字节数，而不是 `du` 的已分配块。这样对稀疏文件和 APFS 已有 clone 都是
+ * 保守估算；宁可少复用一个可重装依赖，也不能按已共享块数把目标卷打满。
+ */
+function estimateDirectoryBytes(source: string, stopAfter = Number.MAX_SAFE_INTEGER): number {
+  let total = 0;
+  const pending = [source];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (!current) continue;
+    const status = lstatSync(current);
+    if (status.isDirectory()) {
+      for (const entry of readdirSync(current, { withFileTypes: true })) {
+        pending.push(path.join(current, entry.name));
+      }
+    } else if (status.isFile()) {
+      total += status.size;
+      if (!Number.isSafeInteger(total)) {
+        throw new Error(`目录过大，无法安全估算：${source}`);
+      }
+      // 一旦已经确定会越过实体复制上限/可用空间预算，就不再遍历余下的 node_modules。
+      if (total > stopAfter) return total;
+    }
+    // symlink 只复制链接文本，不跟随其指向内容；无需计入可用空间预算。
+  }
+  return total;
+}
+
+export interface PhysicalCopyPreflight {
+  approved: Map<string, number>;
+  skipped: CloneReport[];
+}
+
+function skippedReport(dir: string, reason: string, bytes?: number): CloneReport {
+  return {
+    dir,
+    cow: false,
+    strategy: "skipped",
+    ms: 0,
+    ...(bytes === undefined ? {} : { bytes }),
+    reason,
+    error: reason,
+  };
+}
+
+/** 在写任何一个 ignored 目录前完成容量预检，避免“复制到一半才发现磁盘满”。 */
+export function preflightPhysicalIgnoredCopy(
+  from: string,
+  to: string,
+  dirs: string[],
+  opts: Pick<CreateWorktreeInput, "maxFallbackCopyBytes" | "minFreeBytes" | "operations"> = {},
+): PhysicalCopyPreflight {
+  const maxBytes = configuredLimit(
+    opts.maxFallbackCopyBytes,
+    "ESAYTREE_MAX_FALLBACK_COPY_BYTES",
+    DEFAULT_MAX_FALLBACK_COPY_BYTES,
+  );
+  const minFreeBytes = configuredLimit(
+    opts.minFreeBytes,
+    "ESAYTREE_MIN_FREE_BYTES",
+    DEFAULT_MIN_FREE_BYTES,
+  );
+  const available = availableBytesAt(path.dirname(to), opts.operations);
+  if (available < minFreeBytes) {
+    const reason = `跳过实体复制：目标卷仅剩 ${formatBytes(available)}，低于 ${formatBytes(minFreeBytes)} 安全保留；请释放空间、改用 CoW 或重新安装依赖`;
+    return { approved: new Map(), skipped: dirs.map((dir) => skippedReport(dir, reason)) };
+  }
+
+  const estimates = new Map<string, number>();
+  let total = 0;
+  // 空间预算可能比配置上限更紧；任一门槛越界即可立即停止扫描并拒绝全部实体副本。
+  const capacityBudget = Math.max(0, available - minFreeBytes);
+  const estimateBudget = Math.min(maxBytes, capacityBudget);
+  for (const rel of dirs) {
+    const source = path.join(from, rel);
+    if (!existsSync(source)) continue;
+    try {
+      const bytes = estimateDirectoryBytes(source, Math.max(0, estimateBudget - total));
+      estimates.set(rel, bytes);
+      total += bytes;
+    } catch (error) {
+      const reason = `跳过实体复制：无法安全估算 ${rel}（${error instanceof Error ? error.message : String(error)}）`;
+      return { approved: new Map(), skipped: dirs.map((dir) => skippedReport(dir, reason)) };
+    }
+    if (total > maxBytes) {
+      const reason = `跳过实体复制：候选依赖至少 ${formatBytes(total)}，超过本次 ${formatBytes(maxBytes)} 上限；可设置 ESAYTREE_MAX_FALLBACK_COPY_BYTES 或在目标工作树重新安装依赖`;
+      return {
+        approved: new Map(),
+        skipped: dirs.map((dir) => skippedReport(dir, reason, estimates.get(dir))),
+      };
+    }
+    if (total + minFreeBytes > available) {
+      const reason = `跳过实体复制：候选依赖至少 ${formatBytes(total)}，复制后将低于 ${formatBytes(minFreeBytes)} 安全保留（当前可用 ${formatBytes(available)}）；请释放空间或重新安装依赖`;
+      return {
+        approved: new Map(),
+        skipped: dirs.map((dir) => skippedReport(dir, reason, estimates.get(dir))),
+      };
+    }
+  }
+  return { approved: estimates, skipped: [] };
+}
+
+function formatBytes(value: number): string {
+  if (value < 1024) return `${String(value)} B`;
+  const units = ["KiB", "MiB", "GiB", "TiB"];
+  let amount = value;
+  let unit = -1;
+  while (amount >= 1024 && unit < units.length - 1) {
+    amount /= 1024;
+    unit += 1;
+  }
+  return `${amount.toFixed(amount >= 10 ? 0 : 1)} ${units[unit]}`;
+}
+
+/**
+ * 单独克隆允许的 ignored 依赖。严格 CoW 总是先尝试；只有实际失败的目录且调用
+ * 方显式允许时，才做一次实体复制预检。这样 31 GiB 的 APFS clone 不会因 8 GiB
+ * fallback 上限被遍历或拒绝，同时依旧保证任何实体写入前已经过完整空间检查。
+ */
 export function cloneIgnoredDirs(
   from: string,
   to: string,
   dirs: string[],
-  opts: { allowPhysicalCopy?: boolean } = {},
+  opts: Pick<CreateWorktreeInput,
+    "fallbackCopyIgnored" | "maxFallbackCopyBytes" | "minFreeBytes" | "operations"
+  > & { allowPhysicalCopy?: boolean } = {},
 ): CloneReport[] {
   const reports: CloneReport[] = [];
+  const allowPhysicalCopy = opts.allowPhysicalCopy ?? opts.fallbackCopyIgnored === true;
+  const failedCow: Array<{ dir: string; error: string; started: number }> = [];
   for (const rel of dirs) {
     const src = path.join(from, rel);
     const dst = path.join(to, rel);
@@ -314,131 +617,72 @@ export function cloneIgnoredDirs(
     const started = Date.now();
     mkdirSync(path.dirname(dst), { recursive: true });
     try {
-      cpSync(src, dst, { recursive: true, mode: constants.COPYFILE_FICLONE_FORCE });
-      reports.push({ dir: rel, cow: true, ms: Date.now() - started });
-      continue;
+      const backend = cloneCowPath(src, dst, opts.operations);
+      reports.push({
+        dir: rel,
+        cow: true,
+        strategy: "cow",
+        ms: Date.now() - started,
+        reason: `严格 CoW：${backend}`,
+      });
     } catch (cowError) {
-      if (opts.allowPhysicalCopy === false) {
-        // recursive clone 可能已经写出了一部分；不能把残缺依赖伪装成可用缓存。
-        rmSync(dst, { recursive: true, force: true });
-        reports.push({
-          dir: rel,
-          cow: false,
-          ms: Date.now() - started,
-          error: cowError instanceof Error ? cowError.message : String(cowError),
-        });
-        continue;
-      }
-      try {
-        rmSync(dst, { recursive: true, force: true });
-        cpSync(src, dst, { recursive: true });
-        reports.push({ dir: rel, cow: false, ms: Date.now() - started });
-      } catch (copyError) {
-        reports.push({
-          dir: rel,
-          cow: false,
-          ms: Date.now() - started,
-          error: copyError instanceof Error ? copyError.message : String(copyError),
-        });
-      }
+      // clonefile/Node FORCE 可能创建了一部分树；删除后才可安全选择实体 fallback。
+      rmSync(dst, { recursive: true, force: true });
+      failedCow.push({
+        dir: rel,
+        error: cowError instanceof Error ? cowError.message : String(cowError),
+        started,
+      });
+    }
+  }
+
+  if (failedCow.length === 0) return reports;
+  if (!allowPhysicalCopy) {
+    reports.push(...failedCow.map((failed) => ({
+      ...skippedReport(
+        failed.dir,
+        `跳过实体复制：严格 CoW 不可用（${failed.error}），且 fallback 实体复制未显式启用；工作树保持隔离，可在其中重新安装依赖`,
+      ),
+      ms: Date.now() - failed.started,
+    })));
+    return reports;
+  }
+
+  // 必须在任何实体写入之前对 *所有* CoW 失败候选做一次总量/可用空间检查。
+  const preflight = preflightPhysicalIgnoredCopy(from, to, failedCow.map((failed) => failed.dir), opts);
+  if (preflight.skipped.length > 0) {
+    reports.push(...preflight.skipped);
+    return reports;
+  }
+  for (const failed of failedCow) {
+    const src = path.join(from, failed.dir);
+    const dst = path.join(to, failed.dir);
+    try {
+      mkdirSync(path.dirname(dst), { recursive: true });
+      cpSync(src, dst, { recursive: true });
+      reports.push({
+        dir: failed.dir,
+        cow: false,
+        strategy: "copy",
+        ms: Date.now() - failed.started,
+        ...(preflight.approved.has(failed.dir) ? { bytes: preflight.approved.get(failed.dir)! } : {}),
+        reason: `实体复制（已通过容量预检；CoW 原因：${failed.error}）`,
+      });
+    } catch (copyError) {
+      rmSync(dst, { recursive: true, force: true });
+      const reason = copyError instanceof Error ? copyError.message : String(copyError);
+      reports.push({
+        dir: failed.dir,
+        cow: false,
+        strategy: "skipped",
+        ms: Date.now() - failed.started,
+        ...(preflight.approved.has(failed.dir) ? { bytes: preflight.approved.get(failed.dir)! } : {}),
+        reason,
+        error: reason,
+      });
     }
   }
   return reports;
-}
-
-function cloneRepositoryCow(from: string, to: string): CloneReport {
-  const started = Date.now();
-  try {
-    for (const entry of readdirSync(from, { withFileTypes: true })) {
-      if (entry.name === ".git") continue;
-      const src = path.join(from, entry.name);
-      // 兼容显式把 worktree 放在源仓内部的旧调用，避免把目标递归复制进自己。
-      if (isSameOrInside(src, to)) continue;
-      cpSync(src, path.join(to, entry.name), {
-        recursive: true,
-        mode: constants.COPYFILE_FICLONE_FORCE,
-      });
-    }
-    return { dir: ".", cow: true, ms: Date.now() - started };
-  } catch (error) {
-    throw new CowCloneFailure(error instanceof Error ? error.message : String(error));
-  }
-}
-
-interface PreservedDirs {
-  staging: string;
-  dirs: string[];
-}
-
-function stageIgnoredDirs(target: string, dirs: string[]): PreservedDirs | null {
-  let staging: string | null = null;
-  const moved: string[] = [];
-  for (const rel of dirs) {
-    const source = path.join(target, rel);
-    if (!pathExists(source) || !isStrictlyInside(target, source)) continue;
-    staging ??= mkdtempSync(path.join(path.dirname(target), ".esaytree-preserve-"));
-    const destination = path.join(staging, rel);
-    mkdirSync(path.dirname(destination), { recursive: true });
-    renameSync(source, destination);
-    moved.push(rel);
-  }
-  return staging ? { staging, dirs: moved } : null;
-}
-
-function restoreIgnoredDirs(target: string, preserved: PreservedDirs | null): void {
-  if (!preserved) return;
-  for (const rel of preserved.dirs) {
-    const source = path.join(preserved.staging, rel);
-    if (!pathExists(source)) continue;
-    const destination = path.join(target, rel);
-    mkdirSync(path.dirname(destination), { recursive: true });
-    renameSync(source, destination);
-  }
-}
-
-function pathChunks(paths: string[], maxBytes = 32 * 1024): string[][] {
-  const result: string[][] = [];
-  let current: string[] = [];
-  let bytes = 0;
-  for (const value of paths) {
-    const size = Buffer.byteLength(value) + 1;
-    if (current.length > 0 && bytes + size > maxBytes) {
-      result.push(current);
-      current = [];
-      bytes = 0;
-    }
-    current.push(value);
-    bytes += size;
-  }
-  if (current.length > 0) result.push(current);
-  return result;
-}
-
-/** 把 CoW 克隆出来的源工作区还原成目标 HEAD 的干净提交快照。 */
-async function restoreCommittedSnapshot(
-  target: string,
-  preservedIgnored: string[],
-): Promise<string[]> {
-  const preserved = stageIgnoredDirs(target, preservedIgnored);
-  try {
-    await git(target, ["reset", "--quiet", "--mixed", "HEAD"]);
-    // 先删掉目标 ref 不认识的文件，避免“源是目录、目标是文件”等形态冲突。
-    await git(target, ["clean", "-ffdx", "-q"]);
-    const changed = (await git(target, ["diff", "--no-renames", "--name-only", "-z"]))
-      .split("\0")
-      .filter((value) => value !== "");
-    for (const chunk of pathChunks(changed)) {
-      await git(target, ["checkout", "-q", "--", ...chunk]);
-    }
-    restoreIgnoredDirs(target, preserved);
-    const status = await git(target, ["status", "--porcelain"]);
-    if (status.trim() !== "") {
-      throw new EsaytreeError(`创建后的工作区不是干净快照：${status.trim()}`, "git_failed");
-    }
-    return preserved?.dirs ?? [];
-  } finally {
-    if (preserved) rmSync(preserved.staging, { recursive: true, force: true });
-  }
 }
 
 function addArgs(
@@ -495,55 +739,72 @@ export async function createWorktree(input: CreateWorktreeInput): Promise<Create
   const branch = input.branch;
   const baseRef = input.baseRef?.trim() || "HEAD";
   const keepIgnored = input.cloneIgnored !== false;
-  const dirs = keepIgnored ? await ignoredDirs(root) : [];
+  const ignored = keepIgnored
+    ? await selectIgnoredDirs(root)
+    : { preserved: [], skipped: [] } satisfies IgnoredDirectorySelection;
+  const dirs = ignored.preserved;
   mkdirSync(path.dirname(target), { recursive: true });
 
   let added = false;
   try {
-    await git(root, addArgs(target, baseRef, branch, true));
+    // Git 只检出已提交 tracked 文件；它不会把 ignored/private 目录带进目标。
+    // 大型依赖随后仅通过 allowlist 的严格 CoW 复制，避免整仓 clone 的短暂泄漏。
+    await git(root, addArgs(target, baseRef, branch, false));
     added = true;
-    assertCowAvailable(root, target);
-    const clone = cloneRepositoryCow(root, target);
-    const preservedIgnored = await restoreCommittedSnapshot(target, dirs);
+    let probeBackend: Exclude<CowBackend, "none"> | null = null;
+    let cowFailure: string | null = null;
+    try {
+      probeBackend = assertCowAvailable(root, target, input.operations);
+    } catch (error) {
+      cowFailure = error instanceof Error ? error.message : String(error);
+      if (input.fallbackToCheckout === false) {
+        throw new EsaytreeError(`当前文件系统无法完成 CoW 克隆：${cowFailure}`, "cow_unavailable");
+      }
+    }
+
+    const clones = keepIgnored
+      ? cloneIgnoredDirs(root, target, dirs, {
+          ...(input.fallbackCopyIgnored === true ? { allowPhysicalCopy: true } : {}),
+          ...(input.maxFallbackCopyBytes === undefined
+            ? {}
+            : { maxFallbackCopyBytes: input.maxFallbackCopyBytes }),
+          ...(input.minFreeBytes === undefined ? {} : { minFreeBytes: input.minFreeBytes }),
+          ...(input.operations ? { operations: input.operations } : {}),
+        })
+      : [];
+    const nonCow = clones.filter((item) => item.strategy !== "cow");
+    if (input.fallbackToCheckout === false && nonCow.length > 0) {
+      throw new EsaytreeError(
+        `当前文件系统无法完成 CoW 克隆：${nonCow.map((item) => item.reason ?? item.dir).join("；")}`,
+        "cow_unavailable",
+      );
+    }
+    const preservedIgnored = clones
+      .filter((item) => item.strategy === "cow" || item.strategy === "copy")
+      .map((item) => item.dir);
+    const skippedIgnored = [
+      ...ignored.skipped,
+      ...clones.filter((item) => item.strategy === "skipped"),
+    ];
+    const cow = dirs.length > 0 && clones.length === dirs.length && nonCow.length === 0;
+    const cloneFailure = nonCow.map((item) => item.reason).filter((reason): reason is string => Boolean(reason));
     return {
       path: target,
       branch: branch ?? null,
-      mode: "copy-on-write",
-      cow: true,
-      clones: [clone],
+      mode: "git-checkout",
+      cow,
+      cowBackend: cow ? (probeBackend ?? "none") : "none",
+      clones: [...clones, ...ignored.skipped],
       preservedIgnored,
+      skippedIgnored,
       ms: Date.now() - started,
+      ...((cowFailure || cloneFailure.length > 0)
+        ? { fallbackReason: [cowFailure, ...cloneFailure].filter(Boolean).join("；") }
+        : {}),
     };
   } catch (error) {
     if (added) await rollbackCreatedWorktree(root, target, branch);
-    if (!(error instanceof CowCloneFailure)) throw error;
-    if (input.fallbackToCheckout === false) {
-      throw new EsaytreeError(`当前文件系统无法完成 CoW 克隆：${error.message}`, "cow_unavailable");
-    }
-
-    let fallbackAdded = false;
-    try {
-      await git(root, addArgs(target, baseRef, branch, false));
-      fallbackAdded = true;
-      const clones = keepIgnored
-        ? cloneIgnoredDirs(root, target, dirs, {
-            allowPhysicalCopy: input.fallbackCopyIgnored !== false,
-          })
-        : [];
-      return {
-        path: target,
-        branch: branch ?? null,
-        mode: "git-checkout",
-        cow: false,
-        clones,
-        preservedIgnored: clones.filter((item) => !item.error).map((item) => item.dir),
-        ms: Date.now() - started,
-        fallbackReason: error.message,
-      };
-    } catch (fallbackError) {
-      if (fallbackAdded) await rollbackCreatedWorktree(root, target, branch);
-      throw fallbackError;
-    }
+    throw error;
   }
 }
 
@@ -625,10 +886,11 @@ export async function diagnoseEsaytree(repo: string): Promise<EsaytreeDoctorRepo
   mkdirSync(path.dirname(storageRoot), { recursive: true });
   const probe = mkdtempSync(path.join(path.dirname(storageRoot), ".esaytree-doctor-"));
   let cow = false;
+  let cowBackend: Exclude<CowBackend, "none"> | undefined;
   let cowError: string | undefined;
   try {
     try {
-      assertCowAvailable(root, probe);
+      cowBackend = assertCowAvailable(root, probe);
       cow = true;
     } catch (error) {
       cowError = error instanceof Error ? error.message : String(error);
@@ -641,6 +903,7 @@ export async function diagnoseEsaytree(repo: string): Promise<EsaytreeDoctorRepo
     root: storageRoot,
     gitVersion,
     cow,
+    ...(cowBackend ? { cowBackend } : {}),
     ...(cowError ? { cowError } : {}),
   };
 }

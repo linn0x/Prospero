@@ -119,7 +119,7 @@ addOutputOptions(
     .option("--base <ref>", "起点 ref", "HEAD")
     .option("--branch <branch>", "新分支名；默认 esaytree/<name>")
     .option("--detach", "创建 detached worktree")
-    .option("--no-ignored", "不复用 ignored 依赖和缓存")
+    .option("--no-ignored", "不复用 allowlist ignored 依赖")
     .option("--require-cow", "CoW 不可用时直接失败")
     .option("--copy-fallback", "fallback 时允许真实复制 ignored 目录"),
 ).action(async (name: string, opts: {
@@ -155,7 +155,10 @@ addOutputOptions(
       branch: created.branch,
       mode: created.mode,
       cow: created.cow,
+      cow_backend: created.cowBackend,
       preserved_ignored: created.preservedIgnored,
+      skipped_ignored: created.skippedIgnored,
+      clones: created.clones,
       elapsed_ms: created.ms,
       ...(created.fallbackReason ? { fallback_reason: created.fallbackReason } : {}),
     };
@@ -165,8 +168,15 @@ addOutputOptions(
     }
     process.stdout.write(`created: ${created.path}\n`);
     process.stdout.write(`branch: ${created.branch ?? "detached"}\n`);
-    process.stdout.write(`mode: ${created.mode} (${String(created.ms)} ms)\n`);
+    process.stdout.write(`mode: ${created.mode}; CoW: ${created.cow ? created.cowBackend : "no"} (${String(created.ms)} ms)\n`);
     process.stdout.write(`preserved ignored dirs: ${String(created.preservedIgnored.length)}\n`);
+    process.stdout.write(`skipped ignored dirs: ${String(created.skippedIgnored.length)}\n`);
+    for (const clone of created.clones) {
+      if (clone.dir === ".") continue;
+      process.stdout.write(
+        `ignored ${clone.dir}: ${clone.strategy}${clone.reason ? ` (${clone.reason})` : ""}; ${String(clone.ms)} ms\n`,
+      );
+    }
     if (created.fallbackReason) {
       process.stderr.write(`esaytree: CoW 不可用，已退回 Git checkout：${created.fallbackReason}\n`);
     }
@@ -244,6 +254,7 @@ addOutputOptions(
       process.stdout.write(`root: ${report.root}\n`);
       process.stdout.write(`git: ${report.gitVersion}\n`);
       process.stdout.write(`copy-on-write: ${report.cow ? "available" : "unavailable"}\n`);
+      if (report.cowBackend) process.stdout.write(`cow backend: ${report.cowBackend}\n`);
       if (report.cowError) process.stderr.write(`esaytree: ${report.cowError}\n`);
     }
     if (!report.cow) process.exitCode = 5;

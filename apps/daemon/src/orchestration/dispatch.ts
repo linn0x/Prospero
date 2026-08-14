@@ -5,6 +5,7 @@ import {
   createEsaytree,
   repoRoot,
   type CloneReport,
+  type CowBackend,
   type EsaytreeCreateMode,
 } from "./esaytree.js";
 import { OrchestrationStore } from "./store.js";
@@ -58,6 +59,9 @@ export interface WorkerWorktree {
   clones: CloneReport[];
   mode: EsaytreeCreateMode;
   cow: boolean;
+  cowBackend: CowBackend;
+  preservedIgnored: string[];
+  skippedIgnored: CloneReport[];
   ms: number;
   fallbackReason: string | null;
 }
@@ -246,6 +250,9 @@ export class DispatchService {
           clones: created.clones,
           mode: created.mode,
           cow: created.cow,
+          cowBackend: created.cowBackend,
+          preservedIgnored: created.preservedIgnored,
+          skippedIgnored: created.skippedIgnored,
           ms: created.ms,
           fallbackReason: created.fallbackReason ?? null,
         };
@@ -318,6 +325,9 @@ export class DispatchService {
               clones: worktree.clones,
               mode: worktree.mode,
               cow: worktree.cow,
+              cowBackend: worktree.cowBackend,
+              preservedIgnored: worktree.preservedIgnored,
+              skippedIgnored: worktree.skippedIgnored,
               ms: worktree.ms,
               fallbackReason: worktree.fallbackReason,
             }
