@@ -67,4 +67,6 @@ published via Redis and closes matching live sockets on every relay instance.
 npm test --workspace @prospero/relay
 # Requires Docker Desktop / a container runtime:
 npm run test:integration --workspace @prospero/relay
+# Starts real MySQL, Redis, relay, and daemon processes, then drives a QR test client:
+npm run test:e2e --workspace @prospero/relay
 ```

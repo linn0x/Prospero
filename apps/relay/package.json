@@ -16,7 +16,8 @@
     "migrate": "node dist/migrate.js",
     "admin": "node dist/admin.js",
     "test": "npm run build --workspace @prospero/protocol && vitest run",
-    "test:integration": "RELAY_INTEGRATION=1 vitest run test/integration.test.ts"
+    "test:integration": "RELAY_INTEGRATION=1 vitest run test/integration.test.ts",
+    "test:e2e": "npm run build --workspace @prospero/daemon && npm run build --workspace @prospero/relay && RELAY_REAL_PROCESS_E2E=1 vitest run test/real-process-e2e.test.ts"
   },
   "dependencies": {
     "@prospero/protocol": "0.0.12",
