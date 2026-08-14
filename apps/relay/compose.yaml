@@ -18,6 +18,7 @@ services:
       timeout: 5s
       retries: 30
     restart: unless-stopped
+    networks: [relay-backend]
 
   redis:
     image: redis:7.4.2-alpine3.21
@@ -31,6 +32,7 @@ services:
       timeout: 3s
       retries: 30
     restart: unless-stopped
+    networks: [relay-backend]
 
   migrate:
     build:
@@ -47,6 +49,9 @@ services:
       mysql:
         condition: service_healthy
     restart: "no"
+    ulimits:
+      core: 0
+    networks: [relay-backend]
 
   relay:
     image: prospero-relay:0.0.12
@@ -59,6 +64,9 @@ services:
       MYSQL_URL: mysql://${MYSQL_USER:-prospero}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE:-prospero_relay}
       REDIS_URL: redis://redis:6379
       METRICS_INTERNAL_ONLY: "true"
+      # Only Caddy has this fixed backend address. It supplies a sanitized
+      # client IP for per-source rate limiting; direct callers cannot forge it.
+      RELAY_TRUSTED_PROXY_IPS: "172.30.0.2"
       LOG_LEVEL: ${LOG_LEVEL:-info}
     expose: ["8787"]
     depends_on:
@@ -74,6 +82,17 @@ services:
       timeout: 3s
       retries: 12
     restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    ulimits:
+      core: 0
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    networks: [relay-backend]
 
   caddy:
     image: caddy:2.8.4-alpine
@@ -91,9 +110,23 @@ services:
       - "80:80"
       - "443:443"
     restart: unless-stopped
+    networks:
+      relay-backend:
+        ipv4_address: 172.30.0.2
+      relay-public: {}
 
 volumes:
   mysql-data:
   redis-data:
   caddy-data:
   caddy-config:
+
+networks:
+  # MySQL, Redis, and relay never receive a host-published port. Caddy is the
+  # only bridge between the public network and this internal network.
+  relay-backend:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+  relay-public: {}

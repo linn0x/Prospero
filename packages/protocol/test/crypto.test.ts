@@ -77,6 +77,25 @@ describe("handshake + SecureChannel", () => {
     expect(() => server.open(JSON.stringify({ c: flipped }))).toThrowError(/decrypt failed/);
   });
 
+  it("篡改、截断、重放、乱序与跨会话调包都不能打开应用消息", () => {
+    const first = handshake();
+    const second = handshake(first.daemon);
+    const original = first.client.seal({ type: "chat.send", text: "audit business plaintext" });
+    const following = first.client.seal({ type: "term.input", dataB64: "b3JkZXI=" });
+
+    const parsed = JSON.parse(original) as { c: string };
+    const tampered = JSON.stringify({ c: `${parsed.c.slice(0, -1)}${parsed.c.endsWith("A") ? "B" : "A"}` });
+    expect(() => first.server.open(tampered)).toThrowError(ProtocolError);
+    expect(() => handshake(first.daemon).server.open(original.slice(0, -1))).toThrowError(ProtocolError);
+    expect(() => handshake(first.daemon).server.open(following)).toThrowError(ProtocolError);
+    expect(() => second.server.open(original)).toThrowError(ProtocolError);
+
+    const replay = handshake(first.daemon);
+    const frame = replay.client.seal({ type: "connection.ping", id: "once" });
+    expect(replay.server.open(frame)).toEqual({ type: "connection.ping", id: "once" });
+    expect(() => replay.server.open(frame)).toThrowError(ProtocolError);
+  });
+
   it("冒充 daemon 的中间人过不了身份证明", () => {
     const real = generateKeyPairB64();
     const impostor = generateKeyPairB64();

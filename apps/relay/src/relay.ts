@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomUUID, timingSafeEqual } from "node:crypto";
-import type { AddressInfo, Socket } from "node:net";
+import { isIP, type AddressInfo, type Socket } from "node:net";
 import type { Duplex } from "node:stream";
 import {
   MAX_RELAY_CONTROL_FRAME_BYTES,
@@ -78,8 +78,22 @@ interface RelayDependencies {
 
 function bytesOf(data: Data): number { return Buffer.isBuffer(data) ? data.length : data instanceof ArrayBuffer ? data.byteLength : data.reduce((sum, part) => sum + part.length, 0); }
 function safeJson(data: Data): unknown { return JSON.parse((Buffer.isBuffer(data) ? data : data instanceof ArrayBuffer ? Buffer.from(data) : Buffer.concat(data)).toString("utf8")) as unknown; }
-function sourceIp(request: IncomingMessage): string { const forwarded = request.headers["x-forwarded-for"]; const first = typeof forwarded === "string" ? forwarded.split(",")[0]?.trim() : undefined; return first && first.length <= 64 ? first : request.socket.remoteAddress ?? "unknown"; }
-function isInternal(address: string | undefined): boolean { if (address === undefined) return false; const ip = address.replace(/^::ffff:/, ""); return ip === "127.0.0.1" || ip === "::1" || ip.startsWith("10.") || ip.startsWith("192.168.") || /^172\.(1[6-9]|2\d|3[01])\./.test(ip); }
+function normalizedIp(address: string | undefined): string | undefined {
+  if (address === undefined) return undefined;
+  const ip = address.replace(/^::ffff:/, "");
+  return isIP(ip) === 0 ? undefined : ip;
+}
+function sourceIp(request: IncomingMessage, trustedProxyIps: readonly string[] = []): string {
+  const peer = normalizedIp(request.socket.remoteAddress);
+  // Do not trust X-Forwarded-For: a direct caller controls it and it would
+  // otherwise both bypass rate limits and enter an auth-failure log. Caddy
+  // strips that header and writes this dedicated one after a fixed trusted
+  // proxy address has been configured.
+  const forwarded = request.headers["x-prospero-source-ip"];
+  const claimed = typeof forwarded === "string" ? normalizedIp(forwarded) : undefined;
+  return peer !== undefined && trustedProxyIps.includes(peer) && claimed !== undefined ? claimed : peer ?? "unknown";
+}
+function isInternal(address: string | undefined): boolean { const ip = normalizedIp(address); return ip !== undefined && (ip === "127.0.0.1" || ip === "::1" || ip.startsWith("10.") || ip.startsWith("192.168.") || /^172\.(1[6-9]|2\d|3[01])\./.test(ip)); }
 function isOpen(ws: WebSocket | undefined): ws is WebSocket { return ws !== undefined && ws.readyState === WebSocket.OPEN; }
 function errorKind(error: unknown): string { return error instanceof Error ? error.name : "unknown"; }
 function closeCodeForSocketError(error: unknown): number {
@@ -166,7 +180,11 @@ export class RelayServer {
   }
 
   private handleHttp(request: IncomingMessage, response: ServerResponse): void {
-    const path = new URL(request.url ?? "/", "http://relay.invalid").pathname;
+    const url = new URL(request.url ?? "/", "http://relay.invalid");
+    // Health and metrics do not have query parameters. Rejecting them avoids
+    // accidentally preserving a copied credential in an outer access log.
+    if (url.search !== "") { response.writeHead(400).end(); return; }
+    const path = url.pathname;
     if (request.method !== "GET") { response.writeHead(405).end(); return; }
     if (path === "/health/live") { response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" }).end('{"status":"live"}'); return; }
     if (path === "/health/ready") {
@@ -204,7 +222,7 @@ export class RelayServer {
     const path = url.pathname;
     const server = path === RELAY_HOST_PATH ? this.hostWss : path === RELAY_CLIENT_PATH ? this.clientWss : path === RELAY_STREAM_PATH ? this.streamWss : undefined;
     if (server === undefined) { discard(); socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n"); socket.destroy(); return; }
-    void this.allowConnection(sourceIp(request)).then((allowed) => {
+    void this.allowConnection(sourceIp(request, this.config.trustedProxyIps)).then((allowed) => {
       // Admission is asynchronous. Shutdown may have begun after the TCP
       // connection was accepted but before Redis answered; never upgrade it.
       if (this.stopping || socket.destroyed) { discard(); socket.destroy(); return; }
@@ -278,7 +296,7 @@ export class RelayServer {
       received = true; clearTimeout(timeout); this.metrics.connections.dec({ endpoint, phase: "unauthenticated" });
       if (binary || bytesOf(data) > MAX_RELAY_CONTROL_FRAME_BYTES) { this.metrics.authFailures.inc({ endpoint, reason: "bad_frame" }); this.sendErrorAndClose(ws, "bad_frame", "invalid control frame"); return; }
       const install = (handler: (message: Data, binary: boolean) => void) => { subsequent = handler; for (const item of queued.splice(0)) handler(item.message, item.binary); };
-      void onAuth(data, install).catch((error) => { this.logger.warn({ event: "relay.auth_error", endpoint, ip: sourceIp(request), error: errorKind(error) }, "authentication failed"); this.metrics.authFailures.inc({ endpoint, reason: "internal" }); this.sendErrorAndClose(ws, "internal", "relay unavailable"); });
+      void onAuth(data, install).catch((error) => { this.logger.warn({ event: "relay.auth_error", endpoint, ip: sourceIp(request, this.config.trustedProxyIps), error: errorKind(error) }, "authentication failed"); this.metrics.authFailures.inc({ endpoint, reason: "internal" }); this.sendErrorAndClose(ws, "internal", "relay unavailable"); });
     });
     ws.once("close", () => { clearTimeout(timeout); if (!received) this.metrics.connections.dec({ endpoint, phase: "unauthenticated" }); });
   }
@@ -287,7 +305,7 @@ export class RelayServer {
     this.setupFirstFrame(ws, request, "host", async (data, install) => {
       let auth;
       try { auth = parseRelayHostAuthentication(safeJson(data)); } catch { this.sendErrorAndClose(ws, "bad_frame", "expected host authentication"); return; }
-      if (!(await this.allowAuth("host", sourceIp(request)))) { this.sendErrorAndClose(ws, "rate_limited", "too many attempts", 60_000); return; }
+      if (!(await this.allowAuth("host", sourceIp(request, this.config.trustedProxyIps)))) { this.sendErrorAndClose(ws, "rate_limited", "too many attempts", 60_000); return; }
       if (!isOpen(ws) || this.stopping) return;
       if (!(await this.ready())) { this.sendErrorAndClose(ws, "internal", "relay unavailable"); return; }
       if (!isOpen(ws) || this.stopping) return;
@@ -494,7 +512,7 @@ export class RelayServer {
       if (control.type !== "client.open") { this.sendErrorAndClose(ws, "bad_frame", "expected client.open"); return; }
       let leaseId: string | undefined;
       try {
-        if (!(await this.allowAuth("client", sourceIp(request)))) { this.sendErrorAndClose(ws, "rate_limited", "too many attempts", 60_000); return; }
+        if (!(await this.allowAuth("client", sourceIp(request, this.config.trustedProxyIps)))) { this.sendErrorAndClose(ws, "rate_limited", "too many attempts", 60_000); return; }
         if (!isOpen(ws) || this.stopping) return;
         if (!(await this.ready())) { this.failRoute(control.routeId, "dependency health check failed"); this.sendErrorAndClose(ws, "internal", "relay unavailable"); return; }
         if (!isOpen(ws) || this.stopping) return;
@@ -578,7 +596,7 @@ export class RelayServer {
       if (control.type !== "stream.accept") { this.sendErrorAndClose(ws, "bad_frame", "expected stream.accept"); return; }
       const expected = this.streams.get(control.streamId);
       try {
-        if (!(await this.allowAuth("stream", sourceIp(request)))) { this.sendErrorAndClose(ws, "rate_limited", "too many attempts", 60_000); return; }
+        if (!(await this.allowAuth("stream", sourceIp(request, this.config.trustedProxyIps)))) { this.sendErrorAndClose(ws, "rate_limited", "too many attempts", 60_000); return; }
         if (!isOpen(ws)) { if (expected !== undefined) this.closeStream(expected, 1008, "pre-ready stream frame"); return; }
         if (!(await this.ready())) { if (expected !== undefined) this.failRoute(expected.routeId, "dependency health check failed"); this.sendErrorAndClose(ws, "internal", "relay unavailable"); return; }
         if (!isOpen(ws)) { if (expected !== undefined) this.closeStream(expected, 1008, "pre-ready stream frame"); return; }

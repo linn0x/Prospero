@@ -1,6 +1,6 @@
 import { createPool, type Pool, type ResultSetHeader, type RowDataPacket } from "mysql2/promise";
 import { createClient, type RedisClientType } from "redis";
-import { equalCredentialDigest } from "./crypto.js";
+import { equalCredentialDigest, streamTicketStorageKey } from "./crypto.js";
 import type {
   AuthenticatedDevice,
   DeviceRecord,
@@ -286,6 +286,37 @@ interface CachedCredential {
   disabledAt: string | null;
 }
 
+/** The raw ticket is accepted from a live host socket, never Redis persistence. */
+type StoredStreamTicket = Omit<StreamTicket, "ticket">;
+
+function ticketKeys(ticket: string): [string, string] {
+  const id = streamTicketStorageKey(ticket);
+  return [`ticket:${id}`, `ticket-state:${id}`];
+}
+
+function encodeTicket(ticket: StreamTicket): string {
+  const { ticket: _ticket, ...stored } = ticket;
+  return JSON.stringify(stored satisfies StoredStreamTicket);
+}
+
+function decodeTicket(value: string, ticket: string, streamId: string): StreamTicket | null {
+  try {
+    const parsed = JSON.parse(value) as Partial<StoredStreamTicket>;
+    if (
+      parsed === null ||
+      typeof parsed.streamId !== "string" ||
+      parsed.streamId !== streamId ||
+      typeof parsed.routeId !== "string" ||
+      typeof parsed.hostConnectionId !== "string" ||
+      typeof parsed.clientDeviceId !== "string" ||
+      !Number.isSafeInteger(parsed.expiresAt)
+    ) return null;
+    return { ...parsed, ticket } as StreamTicket;
+  } catch {
+    return null;
+  }
+}
+
 function encodeDevice(device: DeviceRecord, disabledAt: Date | null): string {
   return JSON.stringify({
     device: { routeId: device.routeId, deviceId: device.deviceId, credentialDigest: device.credentialDigest?.toString("base64") ?? null, createdAt: device.createdAt.toISOString(), lastSeenAt: device.lastSeenAt?.toISOString() ?? null, revokedAt: device.revokedAt?.toISOString() ?? null },
@@ -400,27 +431,24 @@ export class RedisEphemeralStore implements EphemeralStore {
     const ttlMs = ticket.expiresAt - Date.now();
     if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0) throw new Error("ticket already expired");
     const created = await this.client.eval(CREATE_TICKET, {
-      keys: [`ticket:${ticket.ticket}`, `ticket-state:${ticket.ticket}`],
-      arguments: [JSON.stringify(ticket), String(ttlMs), String(ttlMs + TICKET_STATUS_RETENTION_MS)],
+      keys: ticketKeys(ticket.ticket),
+      arguments: [encodeTicket(ticket), String(ttlMs), String(ttlMs + TICKET_STATUS_RETENTION_MS)],
     });
     if (Number(created) !== 1) throw new Error("stream ticket collision");
   }
   async redeemTicket(ticket: string, streamId: string): Promise<TicketRedemption> {
     await this.ready();
     const reply = await this.client.eval(REDEEM_TICKET, {
-      keys: [`ticket:${ticket}`, `ticket-state:${ticket}`], arguments: [streamId, String(Date.now())],
+      keys: ticketKeys(ticket), arguments: [streamId, String(Date.now())],
     }) as unknown as [number, string];
     const status = Number(reply[0]);
     if (status === 2) return { status: "used" };
     if (status === 3) return { status: "expired" };
     if (status !== 0) return { status: "invalid" };
-    try {
-      const parsed = JSON.parse(reply[1]) as StreamTicket;
-      if (parsed.ticket !== ticket || parsed.streamId !== streamId) return { status: "invalid" };
-      return { status: "ok", ticket: parsed };
-    } catch { return { status: "invalid" }; }
+    const parsed = decodeTicket(reply[1], ticket, streamId);
+    return parsed === null ? { status: "invalid" } : { status: "ok", ticket: parsed };
   }
-  async invalidateTicket(ticket: string): Promise<void> { await this.ready(); await this.client.eval(INVALIDATE_TICKET, { keys: [`ticket:${ticket}`, `ticket-state:${ticket}`], arguments: [String(TICKET_STATUS_RETENTION_MS)] }); }
+  async invalidateTicket(ticket: string): Promise<void> { await this.ready(); await this.client.eval(INVALIDATE_TICKET, { keys: ticketKeys(ticket), arguments: [String(TICKET_STATUS_RETENTION_MS)] }); }
   async acquireStreamLease(routeId: string, leaseId: string, limit: number, ttlMs: number): Promise<boolean> {
     const now = Date.now(); await this.ready();
     const reply = await this.client.eval(ACQUIRE_STREAM_LEASE, { keys: [`stream-leases:${routeId}`], arguments: [String(now), leaseId, String(now + ttlMs), String(ttlMs), String(limit)] });
