@@ -1,0 +1,255 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import type { SessionInfo } from "@prospero/protocol";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { AutomationService } from "../src/orchestration/automation.js";
+import {
+  DispatchService,
+  type WorkerSessionManager,
+} from "../src/orchestration/dispatch.js";
+import { GoalInitializationService } from "../src/orchestration/goal-initialization.js";
+import { OrchestrationStore } from "../src/orchestration/store.js";
+import type { CreateSessionInput } from "../src/session-manager.js";
+import { createDaemonServer } from "../src/ws-server.js";
+
+const homes: string[] = [];
+
+function temporaryHome(): string {
+  const home = mkdtempSync(path.join(os.tmpdir(), "prospero-orchestration-recovery-"));
+  homes.push(home);
+  return home;
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true });
+});
+
+function session(id: string, status: SessionInfo["status"]): SessionInfo {
+  return {
+    id,
+    agent: "codex",
+    kind: "structured",
+    title: "worker",
+    cwd: "/tmp/project",
+    status,
+    createdAt: 1,
+    cols: 120,
+    rows: 40,
+  };
+}
+
+class RecoverySessions implements WorkerSessionManager {
+  readonly live = new Map<string, SessionInfo>();
+  readonly created: CreateSessionInput[] = [];
+
+  async create(input: CreateSessionInput): Promise<SessionInfo> {
+    this.created.push(input);
+    return session(`new-worker-${String(this.created.length)}`, "idle");
+  }
+
+  async chatSend(): Promise<void> {}
+  requirePty(): { writeInput(text: string): void } { return { writeInput() {} }; }
+  async kill(): Promise<void> {}
+
+  infoOf(sid: string): SessionInfo {
+    const found = this.live.get(sid);
+    if (!found) throw new Error(`no such session: ${sid}`);
+    return found;
+  }
+}
+
+describe("daemon 启动时的 Dispatch 对账", () => {
+  it("真实 daemon 启动会对账持久化的缺失会话，第二次启动保持幂等", async () => {
+    const home = temporaryHome();
+    const seeded = new OrchestrationStore(home);
+    const run = seeded.createRun({ objective: "daemon 启动恢复" });
+    const task = seeded.createTask({ runId: run.id, title: "遗留 worker", spec: "" });
+    const dispatch = seeded.createDispatch({ taskId: task.id, sessionId: "gone-before-restart" });
+    seeded.close();
+
+    const first = await createDaemonServer({ home, port: 0 });
+    try {
+      expect(first.orchestration.store.getDispatch(dispatch.id).state).toBe("abandoned");
+      expect(first.orchestration.store.getTask(task.id).status).toBe("failed");
+    } finally {
+      await first.close();
+    }
+
+    const second = await createDaemonServer({ home, port: 0 });
+    try {
+      expect(second.orchestration.store.getDispatch(dispatch.id).state).toBe("abandoned");
+      expect(second.orchestration.store.getTask(task.id).status).toBe("failed");
+    } finally {
+      await second.close();
+    }
+  });
+
+  it("缺失会话会一次性收敛为 abandoned + failed，持久化后重复启动不再重复处理", () => {
+    const home = temporaryHome();
+    const initial = new OrchestrationStore(home);
+    const run = initial.createRun({ objective: "恢复缺失 worker" });
+    const task = initial.createTask({ runId: run.id, title: "实现", spec: "" });
+    const dispatch = initial.createDispatch({ taskId: task.id, sessionId: "lost-worker" });
+    let changes = 0;
+    initial.onChange(() => { changes += 1; });
+
+    const first = new DispatchService(initial, new RecoverySessions()).reconcilePersistedSessions();
+    expect(first.settled).toHaveLength(1);
+    expect(initial.getDispatch(dispatch.id)).toMatchObject({
+      state: "abandoned",
+      outcome: "worker 会话在 daemon 恢复后不存在",
+    });
+    expect(initial.getTask(task.id)).toMatchObject({
+      status: "failed",
+      result: "worker 会话在 daemon 恢复后不存在",
+    });
+    // Dispatch/Task 对观察者只发布一次，不能暴露半截收敛状态。
+    expect(changes).toBe(1);
+    initial.persistNow();
+    initial.close();
+
+    const restarted = new OrchestrationStore(home);
+    const second = new DispatchService(restarted, new RecoverySessions()).reconcilePersistedSessions();
+    expect(second).toEqual({ settled: [], resumed: [] });
+    expect(restarted.getTask(task.id).status).toBe("failed");
+    restarted.close();
+  });
+
+  it("恢复时已终态的会话同样失败；已经显式 done 的事实仍优先", () => {
+    const store = new OrchestrationStore();
+    const run = store.createRun({ objective: "恢复终态 worker" });
+    const endedTask = store.createTask({ runId: run.id, title: "未交付", spec: "" });
+    const explicitTask = store.createTask({ runId: run.id, title: "已交付", spec: "" });
+    const ended = store.createDispatch({ taskId: endedTask.id, sessionId: "ended-worker" });
+    const explicit = store.createDispatch({ taskId: explicitTask.id, sessionId: "reported-worker" });
+    // 模拟 task.done 已落盘、dispatch 成功状态尚未来得及落盘时 daemon 崩溃。
+    store.setTaskStatus(explicitTask.id, "done", "worker 已显式交付");
+
+    const sessions = new RecoverySessions();
+    sessions.live.set("ended-worker", session("ended-worker", "completed"));
+    sessions.live.set("reported-worker", session("reported-worker", "done"));
+    const result = new DispatchService(store, sessions).reconcilePersistedSessions();
+
+    expect(result.settled).toHaveLength(2);
+    expect(store.getDispatch(ended.id).state).toBe("abandoned");
+    expect(store.getTask(endedTask.id).status).toBe("failed");
+    expect(store.getDispatch(explicit.id)).toMatchObject({ state: "succeeded", outcome: "worker 已显式交付" });
+    expect(store.getTask(explicitTask.id)).toMatchObject({ status: "done", result: "worker 已显式交付" });
+  });
+
+  it("存活会话把遗留 starting 恢复为 running，自动编排保持运行而不重复派发", async () => {
+    const home = temporaryHome();
+    const store = new OrchestrationStore();
+    const run = store.createRun({ objective: "恢复存活 worker" });
+    const task = store.createTask({ runId: run.id, title: "继续执行", spec: "" });
+    const dispatch = store.createDispatch({ taskId: task.id, sessionId: "live-worker" });
+    store.setRunAutomation(run.id, {
+      state: "running",
+      agent: "codex",
+      approvalPolicy: "standard",
+      workspace: "current",
+      cwd: home,
+      workspacePath: home,
+      branch: null,
+      startedAt: 1,
+      updatedAt: 1,
+      lastError: null,
+    });
+    const sessions = new RecoverySessions();
+    sessions.live.set("live-worker", session("live-worker", "idle"));
+    const service = new DispatchService(store, sessions);
+    const automation = new AutomationService(store, service);
+
+    expect(service.reconcilePersistedSessions()).toMatchObject({
+      settled: [],
+      resumed: [{ id: dispatch.id, state: "running" }],
+    });
+    automation.resumePersisted();
+    await automation.advance(run.id);
+
+    expect(store.getTask(task.id).status).toBe("dispatched");
+    expect(store.getDispatch(dispatch.id).state).toBe("running");
+    expect(store.getRun(run.id).automation).toMatchObject({ state: "running", lastError: null });
+    expect(sessions.created).toHaveLength(0);
+  });
+
+  it("丢失 worker 后恢复自动编排会暂停并留下失败原因，而不是伪装继续运行", async () => {
+    const home = temporaryHome();
+    const store = new OrchestrationStore();
+    const run = store.createRun({ objective: "恢复自动暂停" });
+    const task = store.createTask({ runId: run.id, title: "会丢失", spec: "" });
+    store.createDispatch({ taskId: task.id, sessionId: "missing-auto-worker" });
+    store.setRunAutomation(run.id, {
+      state: "running",
+      agent: "codex",
+      approvalPolicy: "standard",
+      workspace: "current",
+      cwd: home,
+      workspacePath: home,
+      branch: null,
+      startedAt: 1,
+      updatedAt: 1,
+      lastError: null,
+    });
+    const automation = new AutomationService(store, new DispatchService(store, new RecoverySessions()));
+    const dispatch = new DispatchService(store, new RecoverySessions());
+
+    dispatch.reconcilePersistedSessions();
+    automation.resumePersisted();
+    await automation.advance(run.id);
+
+    expect(store.getTask(task.id).status).toBe("failed");
+    expect(store.getRun(run.id).automation).toMatchObject({
+      state: "paused",
+      lastError: expect.stringContaining("failed"),
+    });
+  });
+});
+
+describe("Goal 协调者首提示恢复", () => {
+  it("首次投递失败会保留 pending 账本，并在重启后的重试中成功投递", async () => {
+    const home = temporaryHome();
+    const store = new OrchestrationStore(home);
+    const run = store.createRun({
+      objective: "修复可靠性",
+      coordinatorSessionId: "coordinator",
+      coordinatorPrompt: true,
+    });
+    let shouldFail = true;
+    const sent: Array<{ sid: string; text: string }> = [];
+    const sessions = {
+      async chatSend(sid: string, text: string): Promise<void> {
+        if (shouldFail) throw new Error("adapter reconnecting");
+        sent.push({ sid, text });
+      },
+    };
+    const prompt = (runId: string, objective: string) => `Goal ${runId}: ${objective}`;
+    const first = new GoalInitializationService(store, sessions, prompt);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await expect(first.deliver(run.id)).resolves.toBe(false);
+    expect(store.getRun(run.id).coordinatorPrompt).toMatchObject({
+      state: "pending",
+      attempts: 1,
+      lastError: "adapter reconnecting",
+    });
+    first.close();
+    store.close();
+
+    shouldFail = false;
+    const restarted = new OrchestrationStore(home);
+    const retry = new GoalInitializationService(restarted, sessions, prompt);
+    await retry.retryPending();
+
+    expect(sent).toEqual([{ sid: "coordinator", text: `Goal ${run.id}: 修复可靠性` }]);
+    expect(restarted.getRun(run.id).coordinatorPrompt).toMatchObject({
+      state: "delivered",
+      attempts: 2,
+      lastError: null,
+    });
+    retry.close();
+    restarted.close();
+  });
+});

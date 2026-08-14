@@ -64,6 +64,7 @@ import {
 import { CollaborationService } from "./orchestration/collaboration.js";
 import { AutomationService } from "./orchestration/automation.js";
 import { DispatchService } from "./orchestration/dispatch.js";
+import { GoalInitializationService } from "./orchestration/goal-initialization.js";
 import { orchestrationControlApi } from "./orchestration/control-api.js";
 import { OrchestrationError, OrchestrationStore } from "./orchestration/store.js";
 import {
@@ -237,6 +238,11 @@ export async function createDaemonServer(
   const orchestrationStore = new OrchestrationStore(opts.home);
   const dispatchService = new DispatchService(orchestrationStore, manager);
   const automationService = new AutomationService(orchestrationStore, dispatchService);
+  const goalInitialization = new GoalInitializationService(
+    orchestrationStore,
+    manager,
+    goalCoordinatorPrompt,
+  );
   const collaboration = new CollaborationService(orchestrationStore);
   const orchestrationApi = orchestrationControlApi(
     orchestrationStore,
@@ -843,15 +849,11 @@ export async function createDaemonServer(
           const run = orchestrationStore.createRun({
             objective: msg.goal,
             coordinatorSessionId: info.id,
+            coordinatorPrompt: true,
           });
-          // Goal 一定是 structured（协议已校验）。Run 已经是可恢复的真相，不能因为
-          // 第一次给 Agent 投递提示暂时失败就把新建会话卡死；客户端 attach 后仍会收到它。
-          void manager
-            .requireStructured(info.id)
-            .send(goalCoordinatorPrompt(run.id, run.objective))
-            .catch((error: unknown) => {
-              console.error(`[prosperod] Goal ${run.id} 的协调者提示投递失败:`, error);
-            });
+          // Goal 的 Run 与 pending 投递账本已同次落盘；失败会由服务重试并在下次
+          // daemon 启动恢复，不能再只打一条日志就把协调者饿死。
+          void goalInitialization.deliver(run.id);
           sendOrchestrationSnapshot(conn);
         }
         // 创建者自动 attach:结构化会话发 chat.snapshot,PTY 发画面快照(锚定 seq 基线)
@@ -2020,6 +2022,7 @@ export async function createDaemonServer(
     wss.close();
     await controlSocket.close();
     await manager.disposeAll();
+    goalInitialization.close();
     stopOrchestrationBroadcasts();
     orchestrationStore.close();
     throw error;
@@ -2074,9 +2077,13 @@ export async function createDaemonServer(
   // 否则壳会先看到一份"零会话"的快照。
   const restoredPty = manager.restoreFromTmux();
   const restoredStructured = await manager.restoreStructured();
+  // state 事件只能覆盖恢复过程中仍会报告终态的会话；直接托管消失、或终态
+  // 已早于 daemon 启动发生的 worker 必须主动逐条对账，不能永久卡在 running。
+  dispatchService.reconcilePersistedSessions();
   completeSettledCoordinatorRuns();
   statusFile.start(port);
   automationService.resumePersisted();
+  await goalInitialization.retryPending();
 
   return {
     port,
@@ -2099,6 +2106,7 @@ export async function createDaemonServer(
       for (const conn of conns) conn.ws.terminate();
       statusFile.stop();
       await controlSocket.close();
+      goalInitialization.close();
       if (revokeTimer) clearTimeout(revokeTimer);
       revokeWatcher?.close();
       wss.close();

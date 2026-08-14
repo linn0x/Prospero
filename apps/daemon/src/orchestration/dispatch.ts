@@ -56,6 +56,13 @@ export interface StopWorkerResult {
   dispatch: Dispatch;
 }
 
+export interface DispatchRecoveryResult {
+  /** 会话已丢失/终态而被收敛的 worker；Task 仍须由显式 done/fail 才能成功。 */
+  settled: StopWorkerResult[];
+  /** 找回的存活 worker；crash 前残留的 starting 已可安全恢复为 running。 */
+  resumed: Dispatch[];
+}
+
 export class DispatchError extends Error {
   constructor(
     message: string,
@@ -106,12 +113,52 @@ export class DispatchService {
         (candidate.state === "starting" || candidate.state === "running"),
     );
     if (!active) return null;
-    const settled = this.store.setDispatchState(active.id, "abandoned", reason);
-    const task = this.store.getTask(active.taskId);
-    const nextTask = task.status === "dispatched"
-      ? this.store.setTaskStatus(task.id, "failed", reason)
-      : task;
-    return { task: nextTask, dispatch: settled };
+    return this.store.abandonActiveDispatchForMissingSession(active.id, reason);
+  }
+
+  /**
+   * 恢复 daemon 后不能只等后续 state 事件：直接托管的会话已不在内存，
+   * tmux/结构化会话也可能已在 daemon 启动前结束。逐条对账让持久状态收口。
+   */
+  reconcilePersistedSessions(): DispatchRecoveryResult {
+    const settled: StopWorkerResult[] = [];
+    const resumed: Dispatch[] = [];
+    for (const dispatch of this.store.listDispatches()) {
+      if (dispatch.state !== "starting" && dispatch.state !== "running") continue;
+
+      let session: SessionInfo | null = null;
+      try {
+        session = this.sessions.infoOf?.(dispatch.sessionId) ?? null;
+      } catch {
+        // SessionManager 用抛错表达不存在；恢复对账必须把它当成正常输入。
+      }
+
+      if (!session) {
+        const result = this.store.abandonActiveDispatchForMissingSession(
+          dispatch.id,
+          "worker 会话在 daemon 恢复后不存在",
+        );
+        if (result) settled.push(result);
+        continue;
+      }
+      if (session.status === "completed" || session.status === "done" || session.status === "died") {
+        const result = this.store.abandonActiveDispatchForMissingSession(
+          dispatch.id,
+          "worker 会话在 daemon 恢复时已结束但未显式交付",
+        );
+        if (result) settled.push(result);
+        continue;
+      }
+
+      // `starting` 仅表示创建/前导词路径尚未全部返回。进程已被 SessionManager
+      // 找回时不存在那条 in-flight promise；恢复后把“有活 worker”的事实标为 running。
+      if (dispatch.state === "starting") {
+        resumed.push(this.store.setDispatchState(dispatch.id, "running"));
+      } else {
+        resumed.push(dispatch);
+      }
+    }
+    return { settled, resumed };
   }
 
   /**

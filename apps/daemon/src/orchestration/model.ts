@@ -18,6 +18,17 @@ export type AutomationState = "running" | "paused" | "completed";
 export type AutomationWorkspace = "run" | "current";
 
 /**
+ * Goal 协调者的第一条编排提示也属于需要可靠投递的工作。它不放在会话队列里，
+ * 因为 Run 与会话分别落盘；这里留下最小的投递账本，让 daemon 重启后可以重试。
+ */
+export interface CoordinatorPromptDelivery {
+  state: "pending" | "delivered";
+  attempts: number;
+  lastError: string | null;
+  updatedAt: number;
+}
+
+/**
  * 人工画出的静态 DAG 可以由 daemon 自动推进，但仍坚持显式交付：
  * 只有 worker 调用 `task done` 后才会派下一个节点。
  *
@@ -53,6 +64,8 @@ export interface Run {
   graphRevision: number;
   /** 旧快照没有此字段；null/省略都表示仍由人逐个派发。 */
   automation?: RunAutomation | null;
+  /** Goal 创建时的协调者首提示；手工 Run 与旧 Run 为 null。 */
+  coordinatorPrompt?: CoordinatorPromptDelivery | null;
   createdAt: number;
   updatedAt: number;
 }
