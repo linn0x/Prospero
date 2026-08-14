@@ -42,7 +42,11 @@ export default function PairScreen() {
     if (scannedRef.current) return;
     scannedRef.current = true;
     try {
-      const payload = decodePairingQR(text.trim());
+      // Production pairing must reject cleartext relay URLs.  The only
+      // development exception mirrors the protocol policy: loopback ws://.
+      const payload = decodePairingQR(text.trim(), {
+        allowInsecureLoopback: typeof __DEV__ !== "undefined" && __DEV__,
+      });
       const host = await upsertHostFromPairing(payload);
       // 深链每次都会把 /pair 压进栈,replace 只换掉这一层 —— 反复扫码/点深链
       // 会攒出一摞 host 页,返回要点很多下。先退回根再进。
