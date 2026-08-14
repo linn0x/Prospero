@@ -982,9 +982,18 @@ private struct GoalsDashboard: View {
     newestFirst(daemon.orchestration.runs.filter { $0.status != "active" })
   }
 
+  /// A deletion tombstone is authoritative; a missing Run covers interrupted
+  /// snapshots and legacy records restored after the Run history was removed.
+  private var orphanWorktreeAssets: [OrchestrationStatus.WorktreeAsset] {
+    let currentRunIDs = Set(daemon.orchestration.runs.map(\.id))
+    return daemon.orchestration.worktreeAssets.filter {
+      $0.runDeletedAt != nil || !currentRunIDs.contains($0.runId)
+    }
+  }
+
   var body: some View {
     Group {
-      if activeRuns.isEmpty && endedRuns.isEmpty {
+      if activeRuns.isEmpty && endedRuns.isEmpty && orphanWorktreeAssets.isEmpty {
         ContentUnavailableView(
           "还没有编排",
           systemImage: "point.3.connected.trianglepath.dotted",
@@ -1007,6 +1016,12 @@ private struct GoalsDashboard: View {
                 runs: endedRuns,
                 daemon: daemon,
                 expanded: $endedRunsExpanded
+              )
+            }
+            if !orphanWorktreeAssets.isEmpty {
+              DeletedRunWorktreeAssetsSection(
+                assets: orphanWorktreeAssets,
+                daemon: daemon
               )
             }
           }
@@ -1660,7 +1675,9 @@ private struct GoalRunRow: View {
     daemon.orchestration.gates.filter { $0.runId == run.id && $0.status == "pending" }
   }
   private var worktreeAssets: [OrchestrationStatus.WorktreeAsset] {
-    daemon.orchestration.worktreeAssets.filter { $0.runId == run.id }
+    daemon.orchestration.worktreeAssets.filter {
+      $0.runId == run.id && $0.runDeletedAt == nil
+    }
   }
   private var manual: Bool { run.coordinatorSessionId == nil }
   private var automationRunning: Bool { run.automation?.state == "running" }
@@ -1691,6 +1708,11 @@ private struct GoalRunRow: View {
         return "\(owner)\n\(asset.path)"
       }.joined(separator: "\n\n")
       message += "\n\n删除编排不会清理全部 \(preservedAssets.count) 个关联工作树（其中 \(workerCount) 个 worker 工作树）。它们会保留在主机上：\n\(locations)"
+    } else if worktreeAssets.isEmpty,
+              run.automation?.workspace == "run",
+              let workspacePath = run.automation?.workspacePath,
+              !workspacePath.isEmpty {
+      message += "\n\n删除编排不会清理自动 Run 工作树。它会保留在主机上：\n\(workspacePath)"
     }
     return message
   }
@@ -1830,13 +1852,15 @@ private struct GoalRunRow: View {
           .padding(.leading, 1)
         }
 
-        Divider()
-        WorktreeAssetSection(
-          assets: worktreeAssets,
-          tasks: tasks,
-          daemon: daemon,
-          reportError: { actionError = $0 }
-        )
+        if !worktreeAssets.isEmpty {
+          Divider()
+          WorktreeAssetSection(
+            assets: worktreeAssets,
+            tasks: tasks,
+            daemon: daemon,
+            reportError: { actionError = $0 }
+          )
+        }
 
         if !tasks.isEmpty {
           Divider()
@@ -2066,6 +2090,59 @@ private struct GoalRunRow: View {
   }
 }
 
+private struct DeletedRunWorktreeAssetsSection: View {
+  let assets: [OrchestrationStatus.WorktreeAsset]
+  @Bindable var daemon: DaemonController
+  @State private var expanded = false
+  @State private var actionError: String?
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 10) {
+      Button {
+        expanded.toggle()
+      } label: {
+        HStack(spacing: 8) {
+          Image(systemName: expanded ? "chevron.down" : "chevron.right")
+            .font(.caption.weight(.bold))
+            .foregroundStyle(.secondary)
+          Label("已删除编排遗留工作树", systemImage: "point.3.connected.trianglepath.dotted")
+            .font(.headline)
+          Text("\(assets.count)")
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2)
+            .background(.quaternary, in: Capsule())
+          Spacer()
+        }
+        .contentShape(Rectangle())
+      }
+      .buttonStyle(.plain)
+      .accessibilityLabel("\(expanded ? "折叠" : "展开")已删除编排遗留工作树")
+
+      if expanded {
+        Text("删除或缺失 Run 的工作树仍可检查、打开和安全清理。")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+        WorktreeAssetSection(
+          assets: assets,
+          tasks: [],
+          daemon: daemon,
+          reportError: { actionError = $0 }
+        )
+      }
+    }
+    .alert("工作树操作失败", isPresented: Binding(
+      get: { actionError != nil },
+      set: { if !$0 { actionError = nil } }
+    )) {
+      Button("好") { actionError = nil }
+    } message: {
+      Text(actionError ?? "未知错误")
+    }
+  }
+}
+
 private struct WorktreeAssetSection: View {
   let assets: [OrchestrationStatus.WorktreeAsset]
   let tasks: [OrchestrationStatus.Task]
@@ -2242,7 +2319,9 @@ private struct WorktreeAssetSection: View {
 
   private func summary(for asset: OrchestrationStatus.WorktreeAsset) -> String {
     guard let inspection = asset.lastInspection else {
-      return "尚未检查。点“检查”可让主机只读核验工作树状态。"
+      var lines = ["尚未检查。点“检查”可让主机只读核验工作树状态。"]
+      if let error = asset.lastError, !error.isEmpty { lines.append("诊断：\(error)") }
+      return lines.joined(separator: "\n")
     }
     var lines = [
       "状态：\(stateLabel(for: asset))",

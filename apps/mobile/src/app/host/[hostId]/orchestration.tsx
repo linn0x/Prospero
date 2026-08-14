@@ -35,6 +35,7 @@ import {
 import { useOrchestrationSnapshot } from "@/lib/use-orchestration-snapshot";
 import {
   WORKTREE_ACTION_MIN_HIT_TARGET,
+  groupWorktreeAssets,
   worktreeAssetPresentation,
   worktreeCanClean,
   worktreeInspectionSummary,
@@ -160,6 +161,7 @@ export default function OrchestrationScreen() {
   const { host, conn, runtime } = useHostConnection(hostId);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [orphanWorktreesOpen, setOrphanWorktreesOpen] = useState(false);
   const [editor, setEditor] = useState<Editor>(null);
   const [banner, setBanner] = useState<string | null>(null);
   const [taskView, setTaskView] = useState<"graph" | "list">("graph");
@@ -214,6 +216,11 @@ export default function OrchestrationScreen() {
     [snapshot],
   );
   const runs = runGroups.all;
+  const worktreeAssetGroups = useMemo(
+    () => groupWorktreeAssets(snapshot?.worktreeAssets ?? [], snapshot?.runs ?? []),
+    [snapshot],
+  );
+  const orphanWorktreeAssets = worktreeAssetGroups.orphaned;
   const accountsFor = (agent: AgentKind): AgentAccount[] =>
     agent === "claude" || agent === "codex"
       ? agentAccounts.filter((account) => account.agent === agent)
@@ -239,8 +246,8 @@ export default function OrchestrationScreen() {
     [snapshot, activeRunId],
   );
   const worktreeAssets = useMemo(
-    () => (snapshot?.worktreeAssets ?? []).filter((asset) => asset.runId === activeRunId),
-    [snapshot, activeRunId],
+    () => activeRunId ? worktreeAssetGroups.byRunId.get(activeRunId) ?? [] : [],
+    [worktreeAssetGroups, activeRunId],
   );
   const pendingGates = (snapshot?.gates ?? []).filter(
     (gate) => gate.runId === activeRunId && gate.status === "pending",
@@ -1617,6 +1624,41 @@ export default function OrchestrationScreen() {
             </View>
           </View>
         )}
+
+        {orphanWorktreeAssets.length > 0 && (
+          <View style={styles.orphanWorktreeSection}>
+            <Pressable
+              style={({ pressed }) => [styles.orphanWorktreeToggle, pressed && styles.runHistoryTogglePressed]}
+              onPress={() => setOrphanWorktreesOpen((open) => !open)}
+              accessibilityRole="button"
+              accessibilityState={{ expanded: orphanWorktreesOpen }}
+              accessibilityLabel={`${orphanWorktreesOpen ? "折叠" : "展开"}已删除编排遗留工作树`}
+            >
+              <Icon
+                name={orphanWorktreesOpen ? "chevron.down" : "chevron.right"}
+                size={13}
+                color={color.textDim}
+              />
+              <View style={styles.orphanWorktreeCopy}>
+                <Text style={styles.orphanWorktreeTitle}>已删除编排遗留工作树</Text>
+                <Text style={styles.orphanWorktreeDetail}>删除或缺失 Run 的工作树仍可检查和安全清理</Text>
+              </View>
+              <Text style={styles.runHistoryCount}>{String(orphanWorktreeAssets.length)}</Text>
+            </Pressable>
+            {orphanWorktreesOpen && (
+              <WorktreeAssets
+                assets={orphanWorktreeAssets}
+                tasks={[]}
+                canManage={canManageWorktrees}
+                onInspect={inspectWorktree}
+                onShowSummary={showWorktreeSummary}
+                onOpenPath={openWorktreePath}
+                hasLinkedDispatch={(asset) => linkedDispatchForWorktree(asset) !== undefined}
+                onClean={confirmCleanupWorktree}
+              />
+            )}
+          </View>
+        )}
         </ScrollView>
       </View>
 
@@ -2022,6 +2064,16 @@ const styles = StyleSheet.create({
     textAlign: "center",
   },
   runHistoryStrip: { gap: space.sm, paddingHorizontal: space.sm, paddingBottom: space.sm },
+  orphanWorktreeSection: {
+    gap: space.sm,
+    padding: space.md,
+    borderRadius: radius.md,
+    backgroundColor: color.surface,
+  },
+  orphanWorktreeToggle: { flexDirection: "row", alignItems: "center", gap: space.sm },
+  orphanWorktreeCopy: { flex: 1, gap: 2 },
+  orphanWorktreeTitle: { color: color.text, fontSize: 13, fontWeight: "700" },
+  orphanWorktreeDetail: { color: color.textFaint, fontSize: 10, lineHeight: 14 },
   empty: {
     alignItems: "center",
     gap: space.sm,

@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import type { OrchestrationWorktreeAsset } from "@prospero/protocol";
 import {
   WORKTREE_ACTION_MIN_HIT_TARGET,
+  groupWorktreeAssets,
   worktreeAssetPresentation,
   worktreeCanClean,
   worktreeInspectionSummary,
@@ -33,6 +34,27 @@ function asset(state: OrchestrationWorktreeAsset["state"]): OrchestrationWorktre
 }
 
 describe("worktree asset presentation", () => {
+  it("keeps current Run assets attached and groups deleted or missing Runs as retained worktrees", () => {
+    const current = asset("active");
+    current.runId = "run-current";
+    const deleted = asset("preserved");
+    deleted.id = "wt-deleted";
+    // A deletion tombstone wins even while a stale snapshot still contains its Run.
+    deleted.runId = "run-current";
+    deleted.runDeletedAt = 2;
+    const missingCleaned = asset("cleaned");
+    missingCleaned.id = "wt-missing-cleaned";
+    missingCleaned.runId = "run-missing";
+
+    const groups = groupWorktreeAssets([current, deleted, missingCleaned], [{ id: "run-current" }]);
+
+    expect(groups.byRunId.get("run-current")).toEqual([current]);
+    expect(groups.orphaned).toEqual([deleted, missingCleaned]);
+    expect(groups.orphaned.find((candidate) => candidate.id === "wt-missing-cleaned"))
+      .toMatchObject({ state: "cleaned" });
+    expect(worktreeAssetPresentation(missingCleaned).label).toBe("已清理");
+  });
+
   it("uses the daemon inspection for its visible safety status", () => {
     const checked = asset("active");
     checked.lastInspection = {
