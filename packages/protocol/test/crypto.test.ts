@@ -53,6 +53,14 @@ describe("handshake + SecureChannel", () => {
     }
   });
 
+  it("v13 connection.ping/pong 作为 SecureChannel 加密应用帧往返", () => {
+    const { client, server } = handshake();
+    const ping = { type: "connection.ping", id: "ping-123" };
+    expect(server.open(client.seal(ping))).toEqual(ping);
+    const pong = { type: "connection.pong", id: ping.id };
+    expect(client.open(server.seal(pong))).toEqual(pong);
+  });
+
   it("拒绝重放(计数器前移后同帧解密失败)", () => {
     const { client, server } = handshake();
     const f = client.seal({ a: 1 });
@@ -136,9 +144,9 @@ describe("handshake + SecureChannel", () => {
     }
   });
 
-  it("daemon 接受兼容窗口内的 v8/v7/v5 旧客户端", () => {
+  it("daemon 与 v12/v11/.../v5 回退版本协商，并为 v8+ 认证协商结果", () => {
     const daemon = generateKeyPairB64();
-    for (const version of [8, 7, 5]) {
+    for (const version of [12, 11, 10, 9, 8, 7, 5]) {
       const start = clientHandshakeStart(version);
       const responded = serverHandshakeRespond(start.frame, daemon.secretKey);
       expect(responded.state.protocolVersion).toBe(version);
@@ -164,7 +172,7 @@ describe("handshake + SecureChannel", () => {
   });
 
   it("客户端只允许显式维护的回退版本", () => {
-    expect(SUPPORTED_PROTOCOL_VERSIONS).toEqual([12, 11, 10, 9, 8, 7, 5]);
+    expect(SUPPORTED_PROTOCOL_VERSIONS).toEqual([13, 12, 11, 10, 9, 8, 7, 5]);
     expect(() => clientHandshakeStart(6)).toThrowError(/unsupported client protocol/);
   });
 
