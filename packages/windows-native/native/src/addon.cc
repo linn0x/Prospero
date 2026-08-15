@@ -96,6 +96,28 @@ bool DoesNotHaveNamed(napi_env env, napi_value object, const char* name) {
 }
 #endif
 
+// char16_t and wchar_t are distinct C++ types even on Windows, where both use
+// UTF-16 code units. Do not type-pun one buffer as the other: Release builds
+// may optimize that undefined behavior and corrupt CreateProcessW arguments.
+bool CopyUtf16CodeUnitsToWide(const char16_t* code_units,
+                               size_t length,
+                               std::wstring* out) {
+  if (code_units == nullptr || out == nullptr) return false;
+  try {
+    std::wstring converted;
+    converted.reserve(length);
+    for (size_t index = 0; index < length; ++index) {
+      // Preserve every UTF-16 code unit, including a valid surrogate pair or
+      // an unpaired surrogate that JavaScript can represent in a string.
+      converted.push_back(static_cast<wchar_t>(code_units[index]));
+    }
+    *out = std::move(converted);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
 bool GetUtf16(napi_env env, napi_value value, std::wstring* out) {
   napi_valuetype type = napi_undefined;
   if (napi_typeof(env, value, &type) != napi_ok || type != napi_string) return false;
@@ -106,7 +128,7 @@ bool GetUtf16(napi_env env, napi_value value, std::wstring* out) {
     if (napi_get_value_string_utf16(env, value, storage.data(), storage.size(), &length) != napi_ok) {
       return false;
     }
-    out->assign(reinterpret_cast<const wchar_t*>(storage.data()), length);
+    if (!CopyUtf16CodeUnitsToWide(storage.data(), length, out)) return false;
     return out->find(L'\0') == std::wstring::npos;
   } catch (...) {
     return false;
@@ -188,11 +210,35 @@ bool SetString(napi_env env, napi_value object, const char* name, const char* va
          napi_set_named_property(env, object, name, js_value) == napi_ok;
 }
 
+bool CreateJsUtf16StringFromWide(napi_env env,
+                                 const wchar_t* value,
+                                 napi_value* out_value) {
+  if (value == nullptr || out_value == nullptr) return false;
+  try {
+    std::u16string code_units;
+    for (const wchar_t* cursor = value; *cursor != L'\0'; ++cursor) {
+      const uint32_t value_unit = static_cast<uint32_t>(*cursor);
+      if (value_unit <= 0xffff) {
+        code_units.push_back(static_cast<char16_t>(value_unit));
+      } else if (value_unit <= 0x10ffff) {
+        const uint32_t supplementary = value_unit - 0x10000;
+        code_units.push_back(static_cast<char16_t>(0xd800 + (supplementary >> 10)));
+        code_units.push_back(static_cast<char16_t>(0xdc00 + (supplementary & 0x3ff)));
+      } else {
+        return false;
+      }
+    }
+    const char16_t* data = code_units.empty() ? u"" : code_units.data();
+    return napi_create_string_utf16(env, data, code_units.size(), out_value) == napi_ok;
+  } catch (...) {
+    return false;
+  }
+}
+
 bool SetWideString(napi_env env, napi_value object, const char* name, const wchar_t* value) {
   napi_value js_value = nullptr;
   return value != nullptr &&
-         napi_create_string_utf16(env, reinterpret_cast<const char16_t*>(value),
-                                  NAPI_AUTO_LENGTH, &js_value) == napi_ok &&
+         CreateJsUtf16StringFromWide(env, value, &js_value) &&
          napi_set_named_property(env, object, name, js_value) == napi_ok;
 }
 
@@ -714,8 +760,7 @@ napi_value ListSecureStateEntries(napi_env env, napi_callback_info info) {
   }
   for (uint32_t index = 0; index < entries.count; ++index) {
     napi_value value = nullptr;
-    if (napi_create_string_utf16(env, reinterpret_cast<const char16_t*>(entries.entries[index]),
-                                 NAPI_AUTO_LENGTH, &value) != napi_ok ||
+    if (!CreateJsUtf16StringFromWide(env, entries.entries[index], &value) ||
         napi_set_element(env, result, index, value) != napi_ok) {
       prospero_secure_state_entry_list_release(&entries);
       return nullptr;
@@ -853,8 +898,7 @@ bool GetUtf16String(napi_env env, napi_value value, std::wstring* out_value) {
   if (napi_get_value_string_utf16(env, value, buffer.data(), buffer.size(), &length) != napi_ok) {
     return false;
   }
-  static_assert(sizeof(wchar_t) == sizeof(char16_t), "Windows wchar_t must be UTF-16");
-  out_value->assign(reinterpret_cast<const wchar_t*>(buffer.data()), length);
+  if (!CopyUtf16CodeUnitsToWide(buffer.data(), length, out_value)) return false;
   if (out_value->find(L'\0') != std::wstring::npos) {
     ThrowTypeError(env, "embedded NUL is not allowed in a Windows path or argument");
     return false;
