@@ -38,6 +38,7 @@ const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
 const CANCELLATION_TIMEOUT_MS = 5_000;
+const PIPE_ROUND_TRIP_TIMEOUT_MS = 10_000;
 
 function waitForWorkerMessage(worker: Worker, expected: string, timeoutMs = 10_000): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
@@ -160,29 +161,46 @@ function observeNativePipeWorker(worker: Worker, timeoutMs = 10_000): {
   return { ready, terminal };
 }
 
-function readPipeRoundTrip(pipeName: string): Promise<PipeRoundTripResult> {
+function readPipeRoundTrip(pipeName: string, timeoutMs = PIPE_ROUND_TRIP_TIMEOUT_MS): Promise<PipeRoundTripResult> {
   return new Promise((resolve) => {
     let settled = false;
+    const socket = createConnection(pipeName);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const onConnect = () => {
+      try {
+        socket.write(Buffer.from("pipe-round-trip"));
+      } catch (error) {
+        finish({ kind: "error", error: error instanceof Error ? error : new Error(String(error)) });
+      }
+    };
+    const onData = (data: Buffer) => finish({ kind: "response", data });
+    const onError = (error: Error) => finish({ kind: "error", error });
+    const onEnd = () => finish({ kind: "error", error: new Error("Named pipe ended before roundtrip response") });
+    const onClose = () => finish({ kind: "error", error: new Error("Named pipe closed before roundtrip response") });
+    const cleanup = () => {
+      if (timeout !== undefined) clearTimeout(timeout);
+      socket.off("connect", onConnect);
+      socket.off("data", onData);
+      socket.off("error", onError);
+      socket.off("end", onEnd);
+      socket.off("close", onClose);
+    };
     const finish = (result: PipeRoundTripResult) => {
       if (settled) return;
       settled = true;
+      cleanup();
+      if (!socket.destroyed) socket.destroy();
       resolve(result);
     };
-    const socket = createConnection(pipeName);
-    socket.on("error", (error) => finish({ kind: "error", error }));
-    socket.once("connect", () => {
-      socket.write(Buffer.from("pipe-round-trip"));
-    });
-    socket.once("data", (data) => {
-      finish({ kind: "response", data });
-      socket.end();
-    });
-    socket.once("end", () => {
-      finish({ kind: "error", error: new Error("Named pipe ended before roundtrip response") });
-    });
-    socket.once("close", () => {
-      finish({ kind: "error", error: new Error("Named pipe closed before roundtrip response") });
-    });
+    timeout = setTimeout(
+      () => finish({ kind: "error", error: new Error(`Timed out waiting for named pipe roundtrip after ${timeoutMs}ms`) }),
+      timeoutMs,
+    );
+    socket.once("connect", onConnect);
+    socket.once("data", onData);
+    socket.once("error", onError);
+    socket.once("end", onEnd);
+    socket.once("close", onClose);
   });
 }
 

@@ -17,4 +17,20 @@ describe("secure named-pipe ABI v2 layout", () => {
     expect(header).toContain("uint32_t session_id;");
     expect(addon).toContain('SetUint32(env, result, "sessionId", peer.session_id)');
   });
+
+  it("wipes unauthenticated first-read bytes before disconnecting the endpoint", () => {
+    const implementation = readFileSync(join(packageRoot, "native", "src", "secure_named_pipe.cc"), "utf8");
+    const readStart = implementation.indexOf("extern \"C\" prospero_status prospero_secure_pipe_connection_read(");
+    const writeStart = implementation.indexOf("extern \"C\" prospero_status prospero_secure_pipe_connection_write(");
+    expect(readStart).toBeGreaterThanOrEqual(0);
+    expect(writeStart).toBeGreaterThan(readStart);
+    const readImplementation = implementation.slice(readStart, writeStart);
+    const failureBlock = readImplementation.slice(readImplementation.indexOf("if (authentication_failed)"));
+
+    expect(implementation).toContain("HMAC framing is an upper-layer protocol concern.");
+    expect(implementation).not.toContain("first-frame proof");
+    expect(failureBlock).toMatch(
+      /const uint32_t bytes_to_clear = \*out_read;\s+SecureZeroMemory\(buffer, bytes_to_clear\);\s+\*out_read = 0;\s+\/\/ Close only after the read lease drains[\s\S]*connection->endpoint->CancelAndDisconnect\(\);/,
+    );
+  });
 });
