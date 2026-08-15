@@ -75,7 +75,8 @@ napi_value ThrowStatus(napi_env env, prospero_status status) {
  */
 napi_value ThrowSecureStateWriteFailure(
     napi_env env,
-    prospero_secure_state_write_stage stage) {
+    prospero_secure_state_write_stage stage,
+    prospero_secure_state_write_error_category error_category) {
   const char* code = "PROSPERO_NATIVE_SECURE_STATE_WRITE_UNKNOWN";
   const char* message = "Secure-state atomic write failed during a native operation";
   switch (stage) {
@@ -119,7 +120,41 @@ napi_value ThrowSecureStateWriteFailure(
     default:
       break;
   }
-  napi_throw_error(env, code, message);
+  const char* error_category_name = "other";
+  switch (error_category) {
+    case PROSPERO_SECURE_STATE_WRITE_ERROR_NONE:
+      error_category_name = "none";
+      break;
+    case PROSPERO_SECURE_STATE_WRITE_ERROR_ACCESS_DENIED:
+      error_category_name = "access-denied";
+      break;
+    case PROSPERO_SECURE_STATE_WRITE_ERROR_INVALID_PARAMETER:
+      error_category_name = "invalid-parameter";
+      break;
+    case PROSPERO_SECURE_STATE_WRITE_ERROR_NOT_FOUND:
+      error_category_name = "not-found";
+      break;
+    case PROSPERO_SECURE_STATE_WRITE_ERROR_SHARING_VIOLATION:
+      error_category_name = "sharing-violation";
+      break;
+    case PROSPERO_SECURE_STATE_WRITE_ERROR_OTHER:
+    default:
+      break;
+  }
+  napi_value code_value = nullptr;
+  napi_value message_value = nullptr;
+  napi_value category_value = nullptr;
+  napi_value error = nullptr;
+  if (napi_create_string_utf8(env, code, NAPI_AUTO_LENGTH, &code_value) != napi_ok ||
+      napi_create_string_utf8(env, message, NAPI_AUTO_LENGTH, &message_value) != napi_ok ||
+      napi_create_string_utf8(env, error_category_name, NAPI_AUTO_LENGTH, &category_value) != napi_ok ||
+      napi_create_error(env, nullptr, message_value, &error) != napi_ok ||
+      napi_set_named_property(env, error, "code", code_value) != napi_ok ||
+      napi_set_named_property(env, error, "win32ErrorCategory", category_value) != napi_ok) {
+    napi_throw_error(env, code, message);
+    return nullptr;
+  }
+  napi_throw(env, error);
   return nullptr;
 }
 
@@ -781,7 +816,8 @@ napi_value WriteSecureStateFileAtomically(napi_env env, napi_callback_info info)
   return status == PROSPERO_STATUS_OK
              ? ReturnUndefined(env)
              : ThrowSecureStateWriteFailure(
-                   env, prospero_secure_state_directory_last_write_stage());
+                   env, prospero_secure_state_directory_last_write_stage(),
+                   prospero_secure_state_directory_last_write_error_category());
 }
 
 napi_value ReadSecureStateFile(napi_env env, napi_callback_info info) {

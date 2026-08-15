@@ -32,6 +32,26 @@ static_assert(offsetof(Windows64FileRenameInfo, file_name) == 20,
 static_assert(sizeof(Windows64FileRenameInfo) == 24,
               "Windows x64/arm64 FILE_RENAME_INFO size changed");
 
+// A simple target name renames an already-open file within its current
+// directory. Microsoft requires RootDirectory to be NULL for that request;
+// the parent directory is therefore anchored by the source file handle, not
+// by the process current directory or a path lookup.
+//
+// Keep this request construction portable so the policy is covered by the
+// strict non-Windows C++ regression test as well as the Windows round trip.
+template <typename RootDirectory>
+struct SameDirectoryRenameRequest {
+  uint8_t replace_if_exists;
+  RootDirectory root_directory;
+  uint32_t file_name_length;
+};
+
+template <typename RootDirectory>
+constexpr SameDirectoryRenameRequest<RootDirectory> MakeSameDirectoryRenameRequest(
+    uint32_t file_name_length) {
+  return {1, RootDirectory{}, file_name_length};
+}
+
 constexpr size_t FileRenameInfoBufferBytes(size_t file_name_bytes) {
   return file_name_bytes <=
                  std::numeric_limits<size_t>::max() - sizeof(Windows64FileRenameInfo)
