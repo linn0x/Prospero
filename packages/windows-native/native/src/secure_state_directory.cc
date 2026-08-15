@@ -97,6 +97,10 @@ constexpr ULONG kFileDirectoryInformation = 1UL;
 constexpr NtStatus kStatusObjectNameCollision = static_cast<NtStatus>(0xC0000035UL);
 constexpr NtStatus kStatusNoMoreFiles = static_cast<NtStatus>(0x80000006UL);
 constexpr uint64_t kMaximumStateFileBytes = 64ULL * 1024ULL * 1024ULL;
+// ACLs persisted on file-system objects use the file-specific full-access
+// mask. Do not compare it to GENERIC_ALL: Windows maps the generic bit while
+// applying the descriptor, which would otherwise reject our own strict DACL.
+constexpr ACCESS_MASK kCurrentUserOnlyFileAccess = FILE_ALL_ACCESS;
 
 struct NtUnicodeString {
   USHORT length;
@@ -263,7 +267,7 @@ bool IsCurrentUserOnlyDacl(PACL dacl, const std::vector<BYTE>& owner_sid) {
   if (header->AceType != ACCESS_ALLOWED_ACE_TYPE || header->AceFlags != 0) return false;
   const ACCESS_ALLOWED_ACE* ace = reinterpret_cast<const ACCESS_ALLOWED_ACE*>(raw_ace);
   const PSID ace_sid = reinterpret_cast<PSID>(const_cast<DWORD*>(&ace->SidStart));
-  return ace->Mask == GENERIC_ALL &&
+  return ace->Mask == kCurrentUserOnlyFileAccess &&
          IsValidSid(ace_sid) &&
          EqualSid(ace_sid, const_cast<BYTE*>(owner_sid.data())) != FALSE;
 }
@@ -280,7 +284,9 @@ bool BuildCurrentUserOnlySecurityDescriptor(const std::vector<BYTE>& owner_sid,
   }
   bool success = false;
   try {
-    const std::wstring sddl = L"D:P(A;;GA;;;" + std::wstring(sid_text) + L")";
+    // FA is the file-specific full-access mask that the file system persists;
+    // GA is normalized to this mask when the descriptor is applied.
+    const std::wstring sddl = L"D:P(A;;FA;;;" + std::wstring(sid_text) + L")";
     SECURITY_DESCRIPTOR_CONTROL control = 0;
     DWORD revision = 0;
     if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
