@@ -44,12 +44,18 @@ const PIPE_ROUND_TRIP_ACK = Buffer.from("pipe-round-trip-ack");
 
 function waitForWorkerMessage(worker: Worker, expected: string, timeoutMs = 10_000): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => finish(new Error(`Timed out waiting for pipe worker ${expected}`)), timeoutMs);
+    let lastPhase = "worker-startup";
+    const timeout = setTimeout(
+      () => finish(new Error(`Timed out waiting for pipe worker ${expected} (last phase: ${lastPhase})`)),
+      timeoutMs,
+    );
     const onError = (error: Error) => finish(error);
     const onExit = (code: number) => finish(new Error(`Pipe worker exited before ${expected} (${code})`));
     const onMessage = (message: Record<string, unknown>) => {
+      if (typeof message.phase === "string") lastPhase = message.phase;
       if (message.type === "error") {
-        finish(new Error(`${message.name}: ${message.message}`));
+        const phase = typeof message.phase === "string" ? ` at ${message.phase}` : "";
+        finish(new Error(`${message.name}: ${message.message}${phase}`));
       } else if (message.type === expected) {
         finish(undefined, message);
       }
@@ -500,13 +506,25 @@ describe.runIf(process.platform === "win32")("Windows identity, secure pipe, DPA
       control = new Worker(fixture, { workerData: { bindingPath, role: "control" } });
       const server = await waitForWorkerMessage(primary, "server-ready", CANCELLATION_TIMEOUT_MS);
       await waitForWorkerMessage(control, "control-ready", CANCELLATION_TIMEOUT_MS);
-      await expect(waitForWorkerMessage(primary, "blocking", CANCELLATION_TIMEOUT_MS)).resolves.toMatchObject({ operation: "accept" });
+      await expect(waitForWorkerMessage(primary, "accept-ready", CANCELLATION_TIMEOUT_MS)).resolves.toMatchObject({
+        phase: "ready-for-accept",
+      });
+      const acceptStarted = waitForWorkerMessage(primary, "accept-started", CANCELLATION_TIMEOUT_MS);
       const controlComplete = waitForWorkerMessage(control, "control-complete", CANCELLATION_TIMEOUT_MS);
       const unblocked = waitForWorkerMessage(primary, "unblocked", CANCELLATION_TIMEOUT_MS);
+      const closeStarted = waitForWorkerMessage(control, "close-started", CANCELLATION_TIMEOUT_MS);
+      primary.postMessage({ action: "start-idle-accept" });
+      await expect(acceptStarted).resolves.toMatchObject({ operation: "accept", phase: "ConnectNamedPipe" });
       control.postMessage({ action: "close-server", handle: server.server });
-      const [cancelled, result] = await Promise.all([controlComplete, unblocked]);
-      expect(cancelled.action).toBe("close-server");
-      expect(result).toMatchObject({ operation: "accept", code: "PROSPERO_NATIVE_NOT_FOUND", ownerClose: "control-only" });
+      const [started, cancelled, result] = await Promise.all([closeStarted, controlComplete, unblocked]);
+      expect(started).toMatchObject({ action: "close-server", phase: "close-server" });
+      expect(cancelled).toMatchObject({ action: "close-server", phase: "closed" });
+      expect(result).toMatchObject({
+        operation: "accept",
+        code: "PROSPERO_NATIVE_NOT_FOUND",
+        ownerClose: "control-only",
+        phase: "accept-unblocked",
+      });
     } finally {
       await Promise.all([terminateWorker(primary), terminateWorker(control)]);
     }
@@ -529,10 +547,17 @@ describe.runIf(process.platform === "win32")("Windows identity, secure pipe, DPA
       await expect(waitForWorkerMessage(primary, "blocking", CANCELLATION_TIMEOUT_MS)).resolves.toMatchObject({ operation: "read" });
       const controlComplete = waitForWorkerMessage(control, "control-complete", CANCELLATION_TIMEOUT_MS);
       const unblocked = waitForWorkerMessage(primary, "unblocked", CANCELLATION_TIMEOUT_MS);
+      const closeStarted = waitForWorkerMessage(control, "close-started", CANCELLATION_TIMEOUT_MS);
       control.postMessage({ action: "disconnect-connection", handle: connection.connection });
-      const [cancelled, result] = await Promise.all([controlComplete, unblocked]);
-      expect(cancelled.action).toBe("disconnect-connection");
-      expect(result).toMatchObject({ operation: "read", code: "PROSPERO_NATIVE_NOT_FOUND", ownerClose: "primary-after-disconnect" });
+      const [started, cancelled, result] = await Promise.all([closeStarted, controlComplete, unblocked]);
+      expect(started).toMatchObject({ action: "disconnect-connection", phase: "disconnect-connection" });
+      expect(cancelled).toMatchObject({ action: "disconnect-connection", phase: "closed" });
+      expect(result).toMatchObject({
+        operation: "read",
+        code: "PROSPERO_NATIVE_NOT_FOUND",
+        ownerClose: "primary-after-disconnect",
+        phase: "read-unblocked",
+      });
     } finally {
       client?.destroy();
       await Promise.all([terminateWorker(primary), terminateWorker(control)]);
