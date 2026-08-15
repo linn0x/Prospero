@@ -69,3 +69,16 @@ The committed manifests are deliberately unsigned placeholders: all capabilities
 The signer data in a manifest is adjacent release metadata, not an independent trust root: it is accepted only after the binary hash and live Authenticode verification agree. Before a production release, maintainers must pin a signer-policy allowlist (including rotation procedure) in the release workflow and enforce npm package integrity and provenance for the published tarball. Do not treat a repository manifest thumbprint by itself as authorization to load an artifact.
 
 `npm run build:native` and `npm run test:native` explicitly fail outside Windows. The regular TypeScript test suite uses injected mock loader runtimes, so it can verify this policy on macOS and Linux without loading a Windows binary.
+
+## CI, signing, and npm distribution
+
+CI has two deliberately separate artifact classes:
+
+- Every pull request builds and executes the Node-API smoke suite on `windows-latest` (x64) and the unconditional `windows-11-arm` job (arm64). It stages an **unsigned** artifact only for CI evidence, raw-addon execution, and the negative production-loader smoke. The production loader must reject that artifact with `unsigned`; it is never packed into the daemon or published.
+- A `v*` tag first downloads both tested artifacts, requires the PFX, PFX password, expected signer thumbprint, and timestamp URL, then signs and verifies every `.node`. Any missing secret, missing `signtool`, signature error, unexpected signer, hash mismatch, or missing architecture fails the release. Signed artifacts are loaded through the real production loader again on both x64 and arm64 before publishing is allowed.
+
+`stage-prebuild.mjs` is the only release metadata writer. It writes the post-signing SHA-256 and full capability map beside the exact binary. `verify-release-pack.mjs` independently recalculates both hashes, compares the daemon's copies byte-for-byte through their manifests, runs `npm pack --json`, and verifies each tarball's returned SHA-512 integrity value. It writes `npm-pack-integrity.json` as release evidence. GitHub build provenance is attested for both tarballs and the publishable native package uses `npm publish --provenance` only after signed loader smoke succeeds.
+
+The daemon pins `@prospero/windows-native` and its `prepack` hook is separately fail-closed: `PROSPERO_WINDOWS_NATIVE_PREBUILD_SOURCE` must name a complete signed x64+arm64 native package. It copies those pairs into `windows-native/prebuilds/` inside the daemon tarball. Consequently both the installed dependency and the daemon archive contain matching architecture prebuilds; an unsigned, partial, absent, or hash-mismatched native artifact cannot be accidentally packed. The staged files and every `.node` are ignored by Git and must never be committed.
+
+The `windows-11-arm` label is a hosted-runner public preview. It remains a required job rather than a conditional or `continue-on-error` job: CI scheduling/image failure is evidence that release coverage is not available, not a passing substitute. Maintainers must observe the first repository run and provision an approved Windows 11 ARM64 runner if the hosted label cannot execute reliably.
