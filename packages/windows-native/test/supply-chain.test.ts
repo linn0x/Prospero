@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { resolveNpmInvocation } from "../scripts/verify-release-pack.mjs";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const stageScript = join(repositoryRoot, "packages/windows-native/scripts/stage-prebuild.mjs");
@@ -63,6 +64,63 @@ describe("Windows native release supply-chain scripts", () => {
     const evidence = JSON.parse(await readFile(join(outputRoot, "npm-pack-integrity.json"), "utf8"));
     expect(evidence.nativePrebuilds).toHaveLength(2);
   }, 30_000);
+
+  it("uses a validated Windows npm CLI through Node without shell parsing", async () => {
+    const root = await mkdtemp(join(tmpdir(), "prospero npm & shell-meta-"));
+    temporaryRoots.push(root);
+    const npmCli = join(root, "npm cli & $(not-a-command).mjs");
+    const tracePath = join(root, "trace.json");
+    const shellArgument = join(root, "pack output & $(not-a-command)");
+    await mkdir(shellArgument);
+    await writeFile(
+      npmCli,
+      [
+        'import { writeFileSync } from "node:fs";',
+        'writeFileSync(process.env.PROSPERO_NPM_TRACE, JSON.stringify(process.argv.slice(2)));',
+      ].join("\n"),
+    );
+
+    const invocation = resolveNpmInvocation({ platform: "win32", npmExecPath: npmCli, execPath: process.execPath });
+    const result = spawnSync(invocation.command, [...invocation.arguments, "pack", "--pack-destination", shellArgument], {
+      encoding: "utf8",
+      env: { ...process.env, PROSPERO_NPM_TRACE: tracePath },
+      shell: false,
+    });
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(JSON.parse(await readFile(tracePath, "utf8"))).toEqual(["pack", "--pack-destination", shellArgument]);
+  });
+
+  it("rejects Windows pack execution when neither npm CLI path is a validated file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "prospero-missing-npm-cli-"));
+    temporaryRoots.push(root);
+    const nodeExecutable = join(root, "node.exe");
+    await writeFile(nodeExecutable, "fixture executable");
+
+    expect(() => resolveNpmInvocation({
+      platform: "win32",
+      npmExecPath: join(root, "missing npm-cli.js"),
+      execPath: nodeExecutable,
+    })).toThrow("validated absolute npm CLI path");
+  });
+
+  it("uses the Node-adjacent npm CLI when npm_execpath is unavailable", async () => {
+    const root = await mkdtemp(join(tmpdir(), "prospero-adjacent-npm-cli-"));
+    temporaryRoots.push(root);
+    const nodeExecutable = join(root, "node", "node.exe");
+    const adjacentNpmCli = join(root, "node", "node_modules", "npm", "bin", "npm-cli.js");
+    await mkdir(dirname(adjacentNpmCli), { recursive: true });
+    await Promise.all([
+      writeFile(nodeExecutable, "fixture executable"),
+      writeFile(adjacentNpmCli, "fixture npm cli"),
+    ]);
+
+    expect(resolveNpmInvocation({
+      platform: "win32",
+      npmExecPath: "relative/npm-cli.js",
+      execPath: nodeExecutable,
+    })).toEqual({ command: nodeExecutable, arguments: [adjacentNpmCli] });
+  });
 
   it("refuses to embed an unsigned CI artifact in a daemon distribution", async () => {
     const root = await mkdtemp(join(tmpdir(), "prospero-native-unsigned-"));
