@@ -35,7 +35,8 @@ function workerMessageFailure(message: WorkerMessage): Error {
  * Observe a Worker from construction onward, retaining messages that arrive
  * before their individual phase is awaited. Any message error, Worker error,
  * or Worker exit closes the observer exactly once and clears all listeners and
- * phase timers.
+ * phase timers. Messages already received remain consumable in per-type FIFO
+ * order after close; only pending and future missing phases reject.
  */
 export function observeWorkerMessages(worker: Worker): WorkerMessageObserver {
   const buffered = new Map<string, WorkerMessage[]>();
@@ -73,7 +74,6 @@ export function observeWorkerMessages(worker: Worker): WorkerMessageObserver {
       }
     }
     pending.clear();
-    buffered.clear();
   };
 
   const onMessage = (value: unknown) => {
