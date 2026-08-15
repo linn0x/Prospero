@@ -98,6 +98,21 @@ export interface StructuredSupervisorRuntimeSnapshotOptions {
   afterCopyForTest?: (attempt: number) => void;
 }
 
+/**
+ * This image relies on POSIX owner mode bits as part of its security proof.
+ * Node's Windows chmod/stat compatibility values are not a Windows ACL, so
+ * accepting them here would turn an unverifiable image into executable state.
+ * Windows session persistence belongs to the Session Host's N-API
+ * secure-state boundary instead; it must not reuse this format.
+ */
+function requirePosixRuntimeImagePlatform(): void {
+  if (process.platform === "win32") {
+    throw new Error(
+      "POSIX structured supervisor runtime snapshot is unsupported on win32: Node chmod/stat mode bits do not prove a private Windows ACL; use the Windows Session Host N-API secure-state boundary",
+    );
+  }
+}
+
 function privateFileMode(mode: number): mode is 0o600 | 0o700 {
   return (mode & 0o077) === 0 && ((mode & 0o777) === 0o600 || (mode & 0o777) === 0o700);
 }
@@ -733,6 +748,7 @@ function createLease(runtimeRoot: string, digest: string): { heartbeat(): void; 
 export function createStructuredSupervisorRuntimeSnapshot(
   options: StructuredSupervisorRuntimeSnapshotOptions,
 ): StructuredSupervisorRuntimeSnapshot {
+  requirePosixRuntimeImagePlatform();
   const runner = options.runnerPath ?? resolveStructuredSupervisorRunnerPath();
   const runnerMetadata = lstatSync(runner);
   if (!runnerMetadata.isFile() || runnerMetadata.isSymbolicLink()) {
