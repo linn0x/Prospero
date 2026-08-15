@@ -26,6 +26,29 @@ function runtimeFixture(prefix: string): { source: string; runtimeRoot: string; 
   return { source, runtimeRoot, runner };
 }
 
+function installedLayoutFixture(prefix: string, layout: "npm" | "pnpm" = "npm"): {
+  project: string;
+  packageRoot: string;
+  runtimeRoot: string;
+  runner: string;
+} {
+  const project = temp(`${prefix}-project-`);
+  const packageRoot = layout === "pnpm"
+    ? path.join(project, "node_modules", ".pnpm", "@prospero+daemon@1.0.0", "node_modules", "@prospero", "daemon")
+    : path.join(project, "node_modules", "@prospero", "daemon");
+  const runner = path.join(packageRoot, "dist", "structured-supervisor-runner.mjs");
+  mkdirSync(path.dirname(runner), { recursive: true, mode: 0o700 });
+  writePrivate(path.join(packageRoot, "package.json"), JSON.stringify({
+    name: "@prospero/daemon", type: "module",
+  }));
+  return {
+    project,
+    packageRoot,
+    runtimeRoot: path.join(temp(`${prefix}-home-`), "structured-supervisor-runtime"),
+    runner,
+  };
+}
+
 afterEach(() => {
   for (const directory of temporary.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
@@ -73,6 +96,68 @@ describe("structured supervisor immutable runtime", () => {
       first.release();
       second.release();
     }
+  });
+
+  it("trusts the physical node_modules tree for a package installed without a workspace manifest", () => {
+    const fixture = installedLayoutFixture("prospero-runtime-installed");
+    const sibling = path.join(fixture.project, "node_modules", "@fixture", "sibling");
+    mkdirSync(sibling, { recursive: true, mode: 0o700 });
+    writePrivate(path.join(sibling, "package.json"), JSON.stringify({
+      name: "@fixture/sibling", type: "module", exports: "./index.mjs",
+    }));
+    writePrivate(path.join(sibling, "index.mjs"), "export const sibling = 'hoisted sibling';\n");
+    writePrivate(fixture.runner, "import { sibling } from '@fixture/sibling'; console.log(sibling);\n");
+
+    const snapshot = createStructuredSupervisorRuntimeSnapshot({
+      runtimeRoot: fixture.runtimeRoot,
+      runnerPath: fixture.runner,
+    });
+    try {
+      expect(existsSync(path.join(snapshot.directory, "dist", "node_modules", "@fixture", "sibling", "index.mjs"))).toBe(true);
+      expect(execFileSync(process.execPath, [snapshot.runnerPath], { encoding: "utf8" }).trim()).toBe("hoisted sibling");
+    } finally {
+      snapshot.release();
+    }
+  });
+
+  it("uses the outer physical node_modules tree for a pnpm-hoisted sibling", () => {
+    const fixture = installedLayoutFixture("prospero-runtime-pnpm", "pnpm");
+    const sibling = path.join(fixture.project, "node_modules", "@fixture", "hoisted");
+    mkdirSync(sibling, { recursive: true, mode: 0o700 });
+    writePrivate(path.join(sibling, "package.json"), JSON.stringify({
+      name: "@fixture/hoisted", type: "module", exports: "./index.mjs",
+    }));
+    writePrivate(path.join(sibling, "index.mjs"), "export const hoisted = 'pnpm sibling';\n");
+    writePrivate(fixture.runner, "import { hoisted } from '@fixture/hoisted'; console.log(hoisted);\n");
+
+    const snapshot = createStructuredSupervisorRuntimeSnapshot({
+      runtimeRoot: fixture.runtimeRoot,
+      runnerPath: fixture.runner,
+    });
+    try {
+      expect(execFileSync(process.execPath, [snapshot.runnerPath], { encoding: "utf8" }).trim()).toBe("pnpm sibling");
+    } finally {
+      snapshot.release();
+    }
+  });
+
+  it.skipIf(process.platform === "win32")("rejects a symlinked package that escapes the physical node_modules tree", () => {
+    const fixture = installedLayoutFixture("prospero-runtime-installed-escape");
+    const outside = path.join(fixture.project, "outside-package");
+    mkdirSync(outside, { recursive: true, mode: 0o700 });
+    writePrivate(path.join(outside, "package.json"), JSON.stringify({
+      name: "@fixture/escape", type: "module", exports: "./index.mjs",
+    }));
+    writePrivate(path.join(outside, "index.mjs"), "export const escaped = 'outside';\n");
+    const scope = path.join(fixture.project, "node_modules", "@fixture");
+    mkdirSync(scope, { recursive: true, mode: 0o700 });
+    symlinkSync(outside, path.join(scope, "escape"), "dir");
+    writePrivate(fixture.runner, "import { escaped } from '@fixture/escape'; console.log(escaped);\n");
+
+    expect(() => createStructuredSupervisorRuntimeSnapshot({
+      runtimeRoot: fixture.runtimeRoot,
+      runnerPath: fixture.runner,
+    })).toThrow(/outside the trusted installation root/);
   });
 
   it("retries a changed source graph rather than publishing a mixed image", () => {
@@ -208,5 +293,34 @@ describe("structured supervisor immutable runtime", () => {
       runtimeRoot: path.join(link, "structured-supervisor-runtime"),
       runnerPath: fixture.runner,
     })).toThrow(/unsafe ancestor/);
+  });
+
+  const invalidSnapshotMutations: Array<[string, (directory: string) => void]> = [
+    ["an extra private file", (directory) => writePrivate(path.join(directory, "injected-0600"), "not in the record\n")],
+    ["an extra private directory", (directory) => mkdirSync(path.join(directory, "injected-directory"), { mode: 0o700 })],
+    ["an unexpected symlink", (directory) => symlinkSync("snapshot.json", path.join(directory, "injected-link"), "file")],
+    ["a file mode change", (directory) => chmodSync(path.join(directory, "dist", "runner.mjs"), 0o700)],
+    ["a file replaced by a directory", (directory) => {
+      const runner = path.join(directory, "dist", "runner.mjs");
+      rmSync(runner);
+      mkdirSync(runner, { mode: 0o700 });
+    }],
+  ];
+
+  it.each(invalidSnapshotMutations)("does not reuse a snapshot with %s", (_description, mutate) => {
+    const fixture = runtimeFixture("prospero-runtime-inventory");
+    writePrivate(fixture.runner, "console.log('immutable');\n");
+    const first = createStructuredSupervisorRuntimeSnapshot({ runtimeRoot: fixture.runtimeRoot, runnerPath: fixture.runner });
+    first.release();
+    mutate(first.directory);
+
+    // Existing finals are never removed based on a failed inspection. The
+    // creator either publishes a separately valid replacement or fails closed
+    // when this content-addressed name is already occupied.
+    expect(() => createStructuredSupervisorRuntimeSnapshot({
+      runtimeRoot: fixture.runtimeRoot,
+      runnerPath: fixture.runner,
+    })).toThrow();
+    expect(existsSync(first.directory)).toBe(true);
   });
 });
