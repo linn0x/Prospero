@@ -1,4 +1,5 @@
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { EventEmitter } from "node:events";
 import os from "node:os";
 import path from "node:path";
 import type { SessionInfo } from "@prospero/protocol";
@@ -10,6 +11,11 @@ import {
   type WorkerSessionManager,
 } from "../src/orchestration/dispatch.js";
 import { OrchestrationStore } from "../src/orchestration/store.js";
+import {
+  PTY_STARTUP_READY_TIMEOUT_MS,
+  PTY_STARTUP_STABILITY_WINDOW_MS,
+  waitForPtyStartupReadiness,
+} from "../src/pty-startup-readiness.js";
 import type { CreateSessionInput } from "../src/session-manager.js";
 
 class FakeSessions implements WorkerSessionManager {
@@ -65,7 +71,220 @@ class FakeSessions implements WorkerSessionManager {
   }
 }
 
+/**
+ * 模拟真实 TUI：初始化输出出现前会吞掉输入；旧的 create() 后立即 writeInput
+ * 实现会让 worker 永远停在空提示符。readiness 复用生产观察器而非手写 sleep。
+ */
+class InitializingTuiSessions extends EventEmitter implements WorkerSessionManager {
+  readonly creates: CreateSessionInput[] = [];
+  readonly attemptedPrompts: string[] = [];
+  readonly acceptedPrompts: string[] = [];
+  readonly discardedPrompts: string[] = [];
+  readonly killed: string[] = [];
+  readonly live = new Map<string, SessionInfo>();
+  waitingForReady = false;
+  private acceptsInput = false;
+
+  async create(input: CreateSessionInput): Promise<SessionInfo> {
+    this.creates.push(input);
+    const session: SessionInfo = {
+      id: "pty-worker-session",
+      agent: input.agent,
+      kind: "pty",
+      title: "initializing TUI",
+      cwd: input.cwd ?? "/tmp",
+      status: "starting",
+      createdAt: Date.now(),
+      cols: input.cols,
+      rows: input.rows,
+    };
+    this.live.set(session.id, session);
+    return session;
+  }
+
+  async chatSend(): Promise<void> {
+    throw new Error("PTY fake 不应走 chatSend");
+  }
+
+  requirePty(sid: string): { writeInput(text: string): void } {
+    return {
+      writeInput: (text) => {
+        if (sid !== "pty-worker-session") throw new Error(`unexpected PTY ${sid}`);
+        this.attemptedPrompts.push(text);
+        if (this.acceptsInput) this.acceptedPrompts.push(text);
+        else this.discardedPrompts.push(text);
+      },
+    };
+  }
+
+  async waitForPtyReady(sid: string): Promise<void> {
+    this.waitingForReady = true;
+    try {
+      await waitForPtyStartupReadiness(this, sid);
+    } finally {
+      this.waitingForReady = false;
+    }
+  }
+
+  async kill(sid: string): Promise<void> {
+    this.killed.push(sid);
+    const current = this.live.get(sid);
+    if (current && current.status !== "done" && current.status !== "died") {
+      this.publish({ ...current, status: "done" });
+    }
+  }
+
+  infoOf(sid: string): SessionInfo {
+    const session = this.live.get(sid);
+    if (!session) throw new Error(`no such session: ${sid}`);
+    return session;
+  }
+
+  emitReadyOutput(): void {
+    this.acceptsInput = true;
+    const session = this.infoOf("pty-worker-session");
+    this.publish({ ...session, status: "running" });
+    this.emit("output", session.id, "cmVhZHk=", 1);
+  }
+
+  exitDuringStartup(): void {
+    const session = this.infoOf("pty-worker-session");
+    this.publish({ ...session, status: "died" });
+  }
+
+  acceptQuietInput(): void {
+    this.acceptsInput = true;
+  }
+
+  private publish(session: SessionInfo): void {
+    this.live.set(session.id, session);
+    this.emit("state", session);
+  }
+}
+
+async function waitForReadinessListener(sessions: InitializingTuiSessions): Promise<void> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (sessions.waitingForReady) return;
+    await Promise.resolve();
+  }
+  throw new Error("PTY readiness listener was not installed");
+}
+
 describe("DispatchService", () => {
+  it("等待 PTY TUI 首帧稳定后恰好提交一次完整 worker prompt", async () => {
+    vi.useFakeTimers();
+    try {
+      const store = new OrchestrationStore();
+      const run = store.createRun({ objective: "PTY 初始化竞态" });
+      const task = store.createTask({ runId: run.id, title: "只应收到一次 prompt", spec: "验证竞态" });
+      const sessions = new InitializingTuiSessions();
+      const service = new DispatchService(store, sessions);
+
+      const starting = service.startWorker({
+        taskId: task.id, agent: "codex", kind: "pty", worktree: "none", cwd: "/tmp/pty-ready",
+      });
+      await waitForReadinessListener(sessions);
+      expect(store.listDispatches().filter((dispatch) => dispatch.taskId === task.id)).toHaveLength(1);
+      expect(sessions.attemptedPrompts).toEqual([]);
+
+      sessions.emitReadyOutput();
+      await vi.advanceTimersByTimeAsync(PTY_STARTUP_STABILITY_WINDOW_MS);
+      const started = await starting;
+
+      expect(started.dispatch.state).toBe("running");
+      expect(sessions.discardedPrompts).toEqual([]);
+      expect(sessions.acceptedPrompts).toHaveLength(1);
+      expect(sessions.acceptedPrompts[0]).toContain(`任务 ID: ${task.id}`);
+      expect(sessions.acceptedPrompts[0]).toContain(`--session ${started.session.id} task done --id ${task.id}`);
+      expect(sessions.acceptedPrompts[0]).toMatch(/\r$/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("PTY quiet CLI 在有界 timeout 后仍只派发一次", async () => {
+    vi.useFakeTimers();
+    try {
+      const store = new OrchestrationStore();
+      const run = store.createRun({ objective: "quiet PTY timeout" });
+      const task = store.createTask({ runId: run.id, title: "quiet", spec: "无启动输出也要投递" });
+      const sessions = new InitializingTuiSessions();
+      const service = new DispatchService(store, sessions);
+
+      const starting = service.startWorker({
+        taskId: task.id, agent: "codex", kind: "pty", worktree: "none", cwd: "/tmp/pty-quiet",
+      });
+      await waitForReadinessListener(sessions);
+      // quiet CLI 没有启动输出，但在后台已经可读 stdin；timeout 不应阻塞派发。
+      sessions.acceptQuietInput();
+      await vi.advanceTimersByTimeAsync(PTY_STARTUP_READY_TIMEOUT_MS);
+      await starting;
+
+      // timeout 以后正常投递，而不是无限等待或重复 writeInput。
+      expect(sessions.attemptedPrompts).toHaveLength(1);
+      expect(sessions.discardedPrompts).toEqual([]);
+      expect(sessions.acceptedPrompts).toHaveLength(1);
+      expect(store.listDispatches().filter((dispatch) => dispatch.taskId === task.id)).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("PTY 启动中提前退出会取消等待且不会重复派发", async () => {
+    vi.useFakeTimers();
+    try {
+      const store = new OrchestrationStore();
+      const run = store.createRun({ objective: "PTY 提前退出" });
+      const task = store.createTask({ runId: run.id, title: "退出", spec: "不得写 prompt" });
+      const sessions = new InitializingTuiSessions();
+      const service = new DispatchService(store, sessions);
+
+      const starting = service.startWorker({
+        taskId: task.id, agent: "codex", kind: "pty", worktree: "none", cwd: "/tmp/pty-died",
+      });
+      await waitForReadinessListener(sessions);
+      sessions.exitDuringStartup();
+      await expect(starting).rejects.toThrow(/启动完成前已退出/);
+
+      expect(sessions.attemptedPrompts).toEqual([]);
+      expect(store.getTask(task.id)).toMatchObject({ status: "failed" });
+      expect(store.listDispatches().filter((dispatch) => dispatch.taskId === task.id)).toHaveLength(1);
+      await expect(service.startWorker({
+        taskId: task.id, agent: "codex", kind: "pty", worktree: "none", cwd: "/tmp/pty-died",
+      })).rejects.toMatchObject({ code: "task_not_ready" } satisfies Partial<DispatchError>);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["done", "failed"] as const)("PTY 等待期间的显式 task.%s 不会被启动路径覆盖", async (terminal) => {
+    vi.useFakeTimers();
+    try {
+      const store = new OrchestrationStore();
+      const run = store.createRun({ objective: `PTY 显式 ${terminal}` });
+      const task = store.createTask({ runId: run.id, title: terminal, spec: "优先保留显式交付" });
+      const sessions = new InitializingTuiSessions();
+      const service = new DispatchService(store, sessions);
+
+      const starting = service.startWorker({
+        taskId: task.id, agent: "codex", kind: "pty", worktree: "none", cwd: `/tmp/pty-${terminal}`,
+      });
+      await waitForReadinessListener(sessions);
+      if (terminal === "done") {
+        await service.completeTask(task.id, "pty-worker-session", "已显式交付");
+      } else {
+        await service.failTask(task.id, "pty-worker-session", "已显式失败");
+      }
+      const started = await starting;
+
+      expect(started.dispatch.state).toBe(terminal === "done" ? "succeeded" : "failed");
+      expect(store.getTask(task.id)).toMatchObject({ status: terminal });
+      expect(sessions.attemptedPrompts).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("只派发 ready task，并在发送前导词前先建立可交付的 dispatch", async () => {
     const store = new OrchestrationStore();
     const run = store.createRun({ objective: "派发测试", coordinatorSessionId: "coord" });

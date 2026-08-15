@@ -1,6 +1,7 @@
 /** 把一个 ready task 变成实际 worker 会话的唯一入口。 */
 import type { AgentKind, SessionInfo, SessionKind } from "@prospero/protocol";
 import type { CreateSessionInput, KillSessionOptions } from "../session-manager.js";
+import type { PtyStartupReadinessOptions } from "../pty-startup-readiness.js";
 import {
   createEsaytree,
   repoRoot,
@@ -28,6 +29,8 @@ export interface WorkerSessionManager {
   create(input: CreateSessionInput): Promise<SessionInfo>;
   chatSend(sid: string, text: string): Promise<void>;
   requirePty(sid: string): { writeInput(text: string): void | Promise<void> };
+  /** 仅 PTY 实现的、可取消且有界的 TUI 启动稳定等待。 */
+  waitForPtyReady?(sid: string, options?: PtyStartupReadinessOptions): Promise<void>;
   kill(sid: string, options?: KillSessionOptions): Promise<void>;
   infoOf(sid: string): SessionInfo;
 }
@@ -335,7 +338,18 @@ export class DispatchService {
       if (session.kind === "structured") {
         await this.sessions.chatSend(session.id, prompt);
       } else {
-        // PTY 轨没有 chat API；用一段单行提示直接送进 agent 的终端输入。
+        // PTY 轨没有 chat API；TUI 可能在 create() 返回后仍清空输入行。真实
+        // SessionManager 会等首帧/非 starting 状态后的短稳定窗口；旧测试 double
+        // 没有这个可选能力时保持同步 fallback，不影响 structured 或其它后端。
+        await this.sessions.waitForPtyReady?.(session.id);
+        const beforePrompt = this.store.getDispatch(dispatch.id);
+        if (beforePrompt.state !== "starting" && beforePrompt.state !== "running") {
+          // 等待期间 worker 可能已显式 task.done/fail；绝不能再把前导词写入
+          // 已关闭的 PTY，也不能用后续 running 覆盖那个真实交付。
+          this.store.persistNow();
+          return result(session, beforePrompt);
+        }
+        // 用一段单行提示直接送进已经稳定的 agent 终端输入。
         await this.sessions.requirePty(session.id).writeInput(`${prompt.replace(/\n/g, " ")}\r`);
       }
       const currentDispatch = this.store.getDispatch(dispatch.id);
