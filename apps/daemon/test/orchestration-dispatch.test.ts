@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { SessionInfo } from "@prospero/protocol";
@@ -21,6 +21,7 @@ class FakeSessions implements WorkerSessionManager {
   killError: Error | null = null;
   killNever = false;
   createBarrier: Promise<void> | null = null;
+  chatHook: ((sid: string, text: string) => Promise<void>) | null = null;
 
   async create(input: CreateSessionInput): Promise<SessionInfo> {
     this.creates.push(input);
@@ -42,6 +43,7 @@ class FakeSessions implements WorkerSessionManager {
 
   async chatSend(sid: string, text: string): Promise<void> {
     this.messages.push({ sid, text });
+    await this.chatHook?.(sid, text);
   }
 
   requirePty(): { writeInput(text: string): void } {
@@ -87,6 +89,86 @@ describe("DispatchService", () => {
     expect(store.getTask(task.id)).toMatchObject({ status: "done", result: "已完成并验过" });
     expect(store.getDispatch(started.dispatch.id)).toMatchObject({ state: "succeeded", outcome: "已完成并验过" });
     expect(sessions.killed).toEqual(["worker-session"]);
+  });
+
+  it("在发送前导词前持久化 starting，并在返回 worker.start 前持久化 running", async () => {
+    const home = mkdtempSync(path.join(os.tmpdir(), "prospero-dispatch-start-persist-"));
+    try {
+      const store = new OrchestrationStore(home);
+      const run = store.createRun({ objective: "派发持久化边界" });
+      const task = store.createTask({ runId: run.id, title: "快速 worker", spec: "" });
+      const sessions = new FakeSessions();
+      sessions.chatHook = async () => {
+        const persisted = JSON.parse(readFileSync(path.join(home, "orchestration.json"), "utf8")) as {
+          tasks: Record<string, { status: string }>;
+          dispatches: Record<string, { state: string }>;
+        };
+        expect(persisted.tasks[task.id]?.status).toBe("dispatched");
+        expect(Object.values(persisted.dispatches)).toEqual([
+          expect.objectContaining({ state: "starting" }),
+        ]);
+      };
+      const service = new DispatchService(store, sessions);
+
+      const started = await service.startWorker({
+        taskId: task.id,
+        agent: "codex",
+        worktree: "none",
+        cwd: "/tmp/project",
+      });
+      const persisted = JSON.parse(readFileSync(path.join(home, "orchestration.json"), "utf8")) as {
+        tasks: Record<string, { status: string }>;
+        dispatches: Record<string, { state: string }>;
+      };
+      expect(persisted.tasks[task.id]?.status).toBe("dispatched");
+      expect(persisted.dispatches[started.dispatch.id]?.state).toBe("running");
+      store.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("不让迟到的 running 覆盖前导词期间已经显式交付的终态", async () => {
+    const store = new OrchestrationStore();
+    const run = store.createRun({ objective: "极速交付" });
+    const task = store.createTask({ runId: run.id, title: "立即完成", spec: "" });
+    const sessions = new FakeSessions();
+    const service = new DispatchService(store, sessions);
+    sessions.chatHook = async (sid) => {
+      await service.completeTask(task.id, sid, "前导词期间已完成");
+    };
+
+    const started = await service.startWorker({
+      taskId: task.id,
+      agent: "codex",
+      worktree: "none",
+      cwd: "/tmp/project",
+    });
+    expect(started.task).toMatchObject({ status: "done", result: "前导词期间已完成" });
+    expect(started.dispatch).toMatchObject({ state: "succeeded", outcome: "前导词期间已完成" });
+    expect(store.getDispatch(started.dispatch.id).state).toBe("succeeded");
+  });
+
+  it("显式交付结束传输时，让 worker.start 返回已落盘终态而不是回滚", async () => {
+    const store = new OrchestrationStore();
+    const run = store.createRun({ objective: "交付时关闭 supervisor" });
+    const task = store.createTask({ runId: run.id, title: "立即交付", spec: "" });
+    const sessions = new FakeSessions();
+    const service = new DispatchService(store, sessions);
+    sessions.chatHook = async (sid) => {
+      await service.completeTask(task.id, sid, "已在连接关闭前持久化");
+      throw new Error("supervisor socket closed");
+    };
+
+    const started = await service.startWorker({
+      taskId: task.id,
+      agent: "codex",
+      worktree: "none",
+      cwd: "/tmp/project",
+    });
+    expect(started.task).toMatchObject({ status: "done", result: "已在连接关闭前持久化" });
+    expect(started.dispatch).toMatchObject({ state: "succeeded", outcome: "已在连接关闭前持久化" });
+    expect(sessions.killed).toEqual([started.session.id]);
   });
 
   it("依赖未完成时不会创建会话；错误的 worker 也不能交付", async () => {
