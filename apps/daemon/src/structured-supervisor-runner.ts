@@ -8,6 +8,7 @@
  */
 import { chmodSync, existsSync, lstatSync, readFileSync, renameSync, rmSync, rmdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type {
   ApprovalPolicy,
   AgentKind,
@@ -32,6 +33,10 @@ import {
   structuredSupervisorTransport,
   type StructuredSupervisorTransport,
 } from "./structured-supervisor-platform.js";
+import {
+  createStructuredSupervisorHostLease,
+  STRUCTURED_RUNTIME_LEASE_HEARTBEAT_MS,
+} from "./structured-supervisor-runtime-lease.js";
 
 export const SUPERVISOR_MANIFEST_VERSION = 1;
 
@@ -150,7 +155,10 @@ function readLegacyManifest(sessionDir: string): StructuredSupervisorManifest | 
       typeof raw["agent"] !== "string" || typeof raw["title"] !== "string" || typeof raw["cwd"] !== "string" ||
       typeof raw["createdAt"] !== "number" || !Number.isFinite(raw["createdAt"]) ||
       typeof raw["approvalPolicy"] !== "string" || typeof raw["socket"] !== "string" ||
-      raw["transport"] !== "unix_socket" || raw["tokenFile"] !== "token" ||
+      // Real schema-1 launchers predate transport entirely.  Only omission or
+      // the one Unix value is admissible; null and every other explicit value
+      // remain fail-closed before endpoint inference below.
+      (raw["transport"] !== undefined && raw["transport"] !== "unix_socket") || raw["tokenFile"] !== "token" ||
       typeof raw["sessionDir"] !== "string" || raw["sessionDir"] !== sessionDir ||
       typeof raw["lifecycleEpoch"] !== "string" || raw["lifecycleEpoch"].length === 0 ||
       (raw["supervisorPid"] !== undefined &&
@@ -291,6 +299,11 @@ function updateManifest(config: RunnerConfig, patch: Partial<StructuredSuperviso
       lifecycleEpoch: config.lifecycleEpoch,
     }),
     ...patch,
+    // A recovered schema-1 manifest intentionally omitted transport. Once
+    // bound to this Unix-only runner, persist the inferred authoritative value
+    // so subsequent daemon attaches no longer rely on legacy inference.
+    transport: config.transport,
+    lifecycleEpoch: config.lifecycleEpoch,
     updatedAt: Date.now(),
   });
 }
@@ -350,6 +363,21 @@ async function control(session: StructuredSession, method: string, raw: unknown)
 
 export async function runStructuredSupervisor(): Promise<void> {
   const config = readConfig();
+  // The daemon lease permits a live daemon to launch future owners; this
+  // independent host lease protects an already-started owner which may lazily
+  // load SDK/resources after the daemon exits or is upgraded.
+  const hostLease = createStructuredSupervisorHostLease(fileURLToPath(import.meta.url));
+  const hostLeaseTimer = hostLease
+    ? setInterval(() => {
+      try { hostLease.heartbeat(); } catch { /* PID check keeps GC conservative on heartbeat failure */ }
+    }, STRUCTURED_RUNTIME_LEASE_HEARTBEAT_MS)
+    : undefined;
+  hostLeaseTimer?.unref();
+  const releaseHostLease = (): void => {
+    if (hostLeaseTimer) clearInterval(hostLeaseTimer);
+    hostLease?.release();
+  };
+  process.once("exit", releaseHostLease);
   const tokenPath = path.join(config.sessionDir, "token");
   if (!existsSync(tokenPath)) throw new Error("missing supervisor capability token");
   const tokenMetadata = lstatSync(tokenPath);
@@ -386,11 +414,13 @@ export async function runStructuredSupervisor(): Promise<void> {
     const current = supervisor;
     if (!current) {
       removeSocketDirectory(config);
+      releaseHostLease();
       process.exit(0);
       return;
     }
     void current.close().finally(() => {
       removeSocketDirectory(config);
+      releaseHostLease();
       process.exit(0);
     });
   };

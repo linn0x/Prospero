@@ -4,7 +4,7 @@
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { readFileSync, watch } from "node:fs";
+import { readFileSync, realpathSync, watch } from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
@@ -241,8 +241,21 @@ export async function createDaemonServer(
   // Falling back to mutable dist after a snapshot error would recreate the
   // exact build-version split this boundary prevents, so fail closed instead.
   const structuredRuntime = structuredSupervisorEnabled && process.platform !== "win32"
-    ? createStructuredSupervisorRuntimeSnapshot()
+    ? createStructuredSupervisorRuntimeSnapshot({
+      // Runtime images are daemon state, never a cache beside a source or
+      // installed package (which may be read-only after deployment).
+      // Keep the public daemon home spelling (notably short macOS UDS paths)
+      // for control/session state, but place only the image beneath its
+      // canonical physical directory before the runtime's ancestor checks.
+      runtimeRoot: path.join(realpathSync(opts.home), "structured-supervisor-runtime"),
+    })
     : undefined;
+  const structuredRuntimeHeartbeat = structuredRuntime
+    ? setInterval(() => {
+      try { structuredRuntime.heartbeat(); } catch { /* live lease remains fail-safe until PID check */ }
+    }, 30_000)
+    : undefined;
+  structuredRuntimeHeartbeat?.unref();
   const manager = new SessionManager({
     home: opts.home,
     // Direct SessionManager users (notably unit tests) remain in-process by
@@ -2099,6 +2112,8 @@ export async function createDaemonServer(
     // 失败，必须把这批私有凭证和 interval 一并清掉，不能留下幽灵 daemon。
     clearInterval(catchupTimer);
     clearInterval(pingTimer);
+    if (structuredRuntimeHeartbeat) clearInterval(structuredRuntimeHeartbeat);
+    structuredRuntime?.release();
     relayClient.close();
     wss.close();
     await controlSocket.close();
@@ -2221,6 +2236,8 @@ export async function createDaemonServer(
     close: async () => {
       clearInterval(catchupTimer);
       clearInterval(pingTimer);
+      if (structuredRuntimeHeartbeat) clearInterval(structuredRuntimeHeartbeat);
+      structuredRuntime?.release();
       relayClient.close();
       for (const conn of conns) conn.ws.terminate();
       statusFile.stop();

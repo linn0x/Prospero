@@ -141,7 +141,6 @@ function legacyRunnerFixture(home: string, sessionId: string, environment: Recor
     createdAt,
     approvalPolicy: "standard",
     socket,
-    transport: "unix_socket",
     tokenFile: "token",
     sessionDir,
     lifecycleEpoch: "legacy-lifecycle-epoch",
@@ -244,16 +243,21 @@ describe("structured supervisor launch rollback", () => {
     }
   });
 
-  it.skipIf(process.platform === "win32")("rejects legacy bootstrap identity mismatches and unknown fields", async () => {
+  it.skipIf(process.platform === "win32")("rejects legacy bootstrap identity mismatches, unknown fields, and explicit non-Unix transport", async () => {
     const home = temp("prospero-legacy-reject-");
-    for (const [index, mutate] of [
-      (value: Record<string, unknown>) => { value["socketPath"] = path.join(home, "wrong.sock"); },
-      (value: Record<string, unknown>) => { value["unexpected"] = true; },
-    ].entries()) {
+    const mutations: Array<(bootstrap: Record<string, unknown>, manifest: Record<string, unknown>) => void> = [
+      (value) => { value["socketPath"] = path.join(home, "wrong.sock"); },
+      (value) => { value["unexpected"] = true; },
+      (_value: Record<string, unknown>, manifest: Record<string, unknown>) => { manifest["transport"] = "named_pipe"; },
+      (_value: Record<string, unknown>, manifest: Record<string, unknown>) => { manifest["transport"] = null; },
+    ];
+    for (const [index, mutate] of mutations.entries()) {
       const fixture = legacyRunnerFixture(home, `legacy-reject-${String(index)}`, {});
       const bootstrap = JSON.parse(readFileSync(fixture.bootstrap, "utf8")) as Record<string, unknown>;
-      mutate(bootstrap);
+      const manifest = JSON.parse(readFileSync(path.join(fixture.manifest.sessionDir!, "manifest.json"), "utf8")) as Record<string, unknown>;
+      mutate(bootstrap, manifest);
       writePrivateJson(fixture.bootstrap, bootstrap);
+      writePrivateJson(path.join(fixture.manifest.sessionDir!, "manifest.json"), manifest);
       const child = await spawnRunner(fixture.bootstrap, false);
       await expect(waitForExit(child)).resolves.toBe(1);
       expect(existsSync(fixture.bootstrap)).toBe(false);
