@@ -65,6 +65,12 @@ typedef struct prospero_owned_buffer {
   uint32_t length;
 } prospero_owned_buffer;
 
+/** A list of direct filenames returned from a validated state directory. */
+typedef struct prospero_secure_state_entry_list {
+  wchar_t** entries;
+  uint32_t count;
+} prospero_secure_state_entry_list;
+
 /**
  * The server must use this explicit security descriptor. Passing NULL or zero
  * bytes is invalid. Implementations must not rely on a default DACL and must
@@ -240,6 +246,29 @@ prospero_status prospero_secure_state_directory_write_atomic(
     const wchar_t* file_name,
     const uint8_t* data,
     uint32_t length);
+/**
+ * Reads one direct state-file name. `file_name` must be a non-empty single
+ * segment: no dot segment, separator, ADS colon, DOS device name, or reparse
+ * point is permitted. The caller releases `out_data` with
+ * prospero_owned_buffer_release().
+ */
+prospero_status prospero_secure_state_directory_read(
+    prospero_secure_state_directory_handle directory,
+    const wchar_t* file_name,
+    prospero_owned_buffer* out_data);
+/**
+ * Enumerates only direct, non-reparse state files. The caller releases
+ * `out_entries` with prospero_secure_state_entry_list_release().
+ */
+prospero_status prospero_secure_state_directory_list(
+    prospero_secure_state_directory_handle directory,
+    prospero_secure_state_entry_list* out_entries);
+/** Removes one direct state-file name after the same strict name/reparse checks. */
+prospero_status prospero_secure_state_directory_remove(
+    prospero_secure_state_directory_handle directory,
+    const wchar_t* file_name);
+void prospero_secure_state_entry_list_release(
+    prospero_secure_state_entry_list* entries);
 prospero_status prospero_secure_state_directory_close(
     prospero_secure_state_directory_handle directory);
 
