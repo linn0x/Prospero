@@ -1,4 +1,5 @@
 #include "prospero_windows_native.h"
+#include "prospero_create_process_command_line.h"
 
 #if defined(_WIN32)
 
@@ -102,54 +103,6 @@ bool IsAbsoluteApplicationPath(const wchar_t* path) {
   if (iswalpha(path[0]) && path[1] == L':' && path[2] == L'\\') return true;
   return path[0] == L'\\' && path[1] == L'\\' &&
          path[2] != L'?' && path[2] != L'.' && path[2] != L'\0';
-}
-
-void AppendQuotedArgument(const wchar_t* argument, std::wstring* command_line) {
-  const bool quote = argument[0] == L'\0' || wcspbrk(argument, L" \t\n\v\"") != nullptr;
-  if (!quote) {
-    command_line->append(argument);
-    return;
-  }
-  command_line->push_back(L'"');
-  size_t slashes = 0;
-  for (const wchar_t* cursor = argument; *cursor != L'\0'; ++cursor) {
-    if (*cursor == L'\\') {
-      ++slashes;
-      continue;
-    }
-    if (*cursor == L'"') {
-      command_line->append(slashes * 2 + 1, L'\\');
-      command_line->push_back(L'"');
-      slashes = 0;
-      continue;
-    }
-    command_line->append(slashes, L'\\');
-    slashes = 0;
-    command_line->push_back(*cursor);
-  }
-  command_line->append(slashes * 2, L'\\');
-  command_line->push_back(L'"');
-}
-
-bool BuildCommandLine(
-    const wchar_t* executable_path,
-    const wchar_t* const* arguments,
-    uint32_t argument_count,
-    std::wstring* out_command_line) {
-  if (out_command_line == nullptr || executable_path == nullptr ||
-      (argument_count != 0 && arguments == nullptr)) {
-    return false;
-  }
-  std::wstring command_line;
-  AppendQuotedArgument(executable_path, &command_line);
-  for (uint32_t index = 0; index < argument_count; ++index) {
-    if (arguments[index] == nullptr) return false;
-    command_line.push_back(L' ');
-    AppendQuotedArgument(arguments[index], &command_line);
-  }
-  if (command_line.size() >= 32767) return false;
-  *out_command_line = std::move(command_line);
-  return true;
 }
 
 bool IsSafeEnvironmentBlock(const wchar_t* environment_block) {
@@ -312,10 +265,10 @@ extern "C" prospero_status prospero_conpty_spawn(
   }
 
   std::wstring command_line;
-  if (!BuildCommandLine(options->executable_path,
-                        options->arguments,
-                        options->argument_count,
-                        &command_line)) {
+  if (!prospero_create_process::BuildCommandLine(options->executable_path,
+                                                  options->arguments,
+                                                  options->argument_count,
+                                                  &command_line)) {
     if (owns_job) CloseIfValid(job);
     return PROSPERO_STATUS_INVALID_ARGUMENT;
   }
