@@ -315,8 +315,10 @@ extern "C" prospero_status prospero_conpty_spawn(
     return StatusFromHresult(create_result);
   }
   // Keep these two pseudoconsole ends open until CreateProcessW has consumed
-  // the attribute. The Windows ConPTY walkthrough requires closing them only
-  // after the child launch; the host retains the opposite ends for I/O.
+  // the attribute. They are the ConPTY-side endpoints; the host retains only
+  // input_write and output_read for its synchronous UTF-8 VT streams. Closing
+  // either host-side endpoint early would turn this into a pipe-lifecycle bug,
+  // not an argv or terminal-rendering failure.
 
   SIZE_T attribute_list_bytes = 0;
   InitializeProcThreadAttributeList(nullptr, 1, 0, &attribute_list_bytes);
@@ -374,10 +376,29 @@ extern "C" prospero_status prospero_conpty_spawn(
 
   STARTUPINFOEXW startup_info = {};
   startup_info.StartupInfo.cb = sizeof(startup_info);
+  // GitHub Actions/Vitest starts this host with stdout and stderr redirected
+  // to capture pipes. Windows copies those standard-handle slots into a
+  // console child even when bInheritHandles is FALSE. ConPTY replaces console
+  // handles, but intentionally does not replace a pre-existing pipe, so the
+  // provider's output leaked to the runner while output_read contained only
+  // conhost's VT/title sequences. Request explicit standard handles with
+  // NULL slots: this prevents the capture pipes from crossing the boundary
+  // and lets the pseudoconsole initialize the child's console handles.
+  //
+  // Do not replace this with inherited pipe handles or bInheritHandles=TRUE.
+  // The zero slots carry no host handle, so the Job, journal, IPC, and parent
+  // stdio handles remain outside the provider boundary.
+  startup_info.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+  startup_info.StartupInfo.hStdInput = nullptr;
+  startup_info.StartupInfo.hStdOutput = nullptr;
+  startup_info.StartupInfo.hStdError = nullptr;
   startup_info.lpAttributeList = attribute_list;
   PROCESS_INFORMATION process = {};
+  // This is deliberately not the detached-host flag set. HPCON supplies the
+  // terminal, the Job owns the process tree, and no Ctrl-event process group
+  // is used. CREATE_NEW_PROCESS_GROUP would additionally disable Ctrl+C in
+  // the child; DETACHED_PROCESS would sever the very console ConPTY provides.
   const DWORD creation_flags = CREATE_UNICODE_ENVIRONMENT |
-      CREATE_NEW_PROCESS_GROUP |
       CREATE_SUSPENDED |
       EXTENDED_STARTUPINFO_PRESENT;
   const BOOL created = CreateProcessW(options->executable_path,
@@ -393,8 +414,9 @@ extern "C" prospero_status prospero_conpty_spawn(
   const DWORD create_error = created ? ERROR_SUCCESS : GetLastError();
   DeleteProcThreadAttributeList(attribute_list);
   HeapFree(GetProcessHeap(), 0, attribute_list);
-  // The pseudoconsole owns the child-side relationship from here; retaining
-  // these local pipe handles would keep its streams artificially alive.
+  // CreatePseudoConsole owns the child-side relationship from here; retaining
+  // these local pipe handles would keep its streams artificially alive and
+  // prevent output EOF after the hosted process exits.
   CloseIfValid(input_read);
   CloseIfValid(output_write);
   input_read = nullptr;
