@@ -187,7 +187,11 @@ prospero_status prospero_job_object_assign_process(
     prospero_process_identity process);
 prospero_status prospero_job_object_terminate(prospero_job_object_handle job, uint32_t exit_code);
 prospero_status prospero_job_object_close(prospero_job_object_handle job);
-/** Queries IsProcessInJob and the parent Job's breakaway limit flags. */
+/**
+ * Queries whether the caller is in any Job and the immediate Job's breakaway
+ * limit flags. Nested ancestor policy is verified on the suspended child by
+ * the detached launcher before it reports success.
+ */
 prospero_status prospero_query_parent_job_compatibility(
     prospero_parent_job_compatibility* out_compatibility);
 

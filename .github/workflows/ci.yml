@@ -32,6 +32,8 @@ jobs:
       - run: npm run typecheck
       - run: npm run lint -w @prospero/mobile
       - run: npm test
+      - if: runner.os == 'Windows'
+        run: npm run test:native -w @prospero/windows-native
 
   swift:
     name: Swift build
