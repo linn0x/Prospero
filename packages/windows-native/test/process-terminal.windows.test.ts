@@ -419,19 +419,21 @@ describeWindows.sequential("Windows N-API Job Object, detached host, and ConPTY 
       else process.env[inheritedProbe] = priorValue;
     }
 
-    // The API still represents {} as an explicit double-NUL block. Use a
-    // direct Windows native executable instead of Node, whose empty
+    // The API still represents {} as an explicit double-NUL block. Use an
+    // absolute system command processor rather than Node, whose empty
     // environment startup aborts before user code can observe the block.
-    const whoami = join(systemRoot, "System32", "whoami.exe");
+    const emptyEnvironmentMarker = "PROSPERO_EMPTY_ENVIRONMENT_BLOCK";
+    const commandProcessor = join(systemRoot, "System32", "cmd.exe");
     const emptyEnvironmentTerminal = native.spawnConPty({
-      executablePath: whoami,
-      arguments: ["/user"],
+      executablePath: commandProcessor,
+      arguments: ["/d", "/s", "/c", `echo ${emptyEnvironmentMarker}`],
       columns: 80,
       rows: 24,
       environment: {},
     });
     try {
-      expect(await drainUntil(emptyEnvironmentTerminal, "\\")).toContain("\\");
+      expect(await drainUntil(emptyEnvironmentTerminal, emptyEnvironmentMarker))
+        .toContain(emptyEnvironmentMarker);
     } finally {
       native.closeConPty(emptyEnvironmentTerminal);
     }
