@@ -29,6 +29,7 @@
             "libraries": ["advapi32.lib", "crypt32.lib", "userenv.lib"],
             "msvs_settings": {
               "VCCLCompilerTool": {
+                "ExceptionHandling": 1,
                 "WarningLevel": 4,
                 "WarnAsError": "true",
                 "AdditionalOptions": ["/permissive-", "/WX"]
