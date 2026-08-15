@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createStructuredSupervisorHostLease } from "../src/structured-supervisor-runtime-lease.js";
 import { createStructuredSupervisorRuntimeSnapshot } from "../src/structured-supervisor-runtime.js";
+import { createDaemonServer } from "../src/ws-server.js";
 
 const temporary: string[] = [];
 
@@ -53,7 +54,11 @@ afterEach(() => {
   for (const directory of temporary.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
 
-describe("structured supervisor immutable runtime", () => {
+// The snapshot is a POSIX security format: its complete anti-tamper proof
+// includes owner-only modes, link rejection, inventory, and digests. Windows
+// cannot derive that proof from Node mode bits, so it has its own fail-closed
+// coverage below rather than treating this as a generic cross-platform FS API.
+describe.runIf(process.platform !== "win32")("POSIX structured supervisor immutable runtime", () => {
   it("prefers CoW cloning without weakening digest verification or using hardlinks", () => {
     const implementation = readFileSync(path.join(import.meta.dirname, "..", "src", "structured-supervisor-runtime.ts"), "utf8");
     expect(implementation).toContain("constants as fsConstants");
@@ -141,7 +146,7 @@ describe("structured supervisor immutable runtime", () => {
     }
   });
 
-  it.skipIf(process.platform === "win32")("rejects a symlinked package that escapes the physical node_modules tree", () => {
+  it("rejects a symlinked package that escapes the physical node_modules tree", () => {
     const fixture = installedLayoutFixture("prospero-runtime-installed-escape");
     const outside = path.join(fixture.project, "outside-package");
     mkdirSync(outside, { recursive: true, mode: 0o700 });
@@ -283,7 +288,7 @@ describe("structured supervisor immutable runtime", () => {
     }
   });
 
-  it.skipIf(process.platform === "win32")("rejects a runtime root whose ancestor is a symlink", () => {
+  it("rejects a runtime root whose ancestor is a symlink", () => {
     const fixture = runtimeFixture("prospero-runtime-symlink");
     writePrivate(fixture.runner, "console.log('unsafe');\n");
     const linkParent = temp("prospero-runtime-link-parent-");
@@ -322,5 +327,38 @@ describe("structured supervisor immutable runtime", () => {
       runnerPath: fixture.runner,
     })).toThrow();
     expect(existsSync(first.directory)).toBe(true);
+  });
+});
+
+describe.runIf(process.platform === "win32")("Windows structured supervisor runtime boundary", () => {
+  it("rejects the POSIX snapshot before Node mode bits can be mistaken for an ACL", () => {
+    const runtimeRoot = path.join(temp("prospero-runtime-win32-api-"), "structured-supervisor-runtime");
+    expect(() => createStructuredSupervisorRuntimeSnapshot({
+      runtimeRoot,
+      // The API must reject based on platform before it even inspects a
+      // runner. A missing runner makes that ordering observable.
+      runnerPath: path.join(runtimeRoot, "missing-runner.mjs"),
+    })).toThrow(/unsupported on win32.*do not prove a private Windows ACL/);
+    expect(existsSync(runtimeRoot)).toBe(false);
+  });
+
+  it("does not create a POSIX runtime image when the production daemon enables structured sessions", async () => {
+    const home = temp("prospero-runtime-win32-daemon-");
+    const runtimeRoot = path.join(home, "structured-supervisor-runtime");
+    const daemon = await createDaemonServer({
+      home,
+      port: 0,
+      structuredSupervisor: true,
+      ptySupervisor: false,
+    });
+    try {
+      // ws-server leaves Windows out of POSIX image creation. A future Windows
+      // Session Host must own its N-API secure-state/ACL boundary instead; it
+      // must not call this API merely because structured mode was requested.
+      // That API independently fails closed above if called directly.
+      expect(existsSync(runtimeRoot)).toBe(false);
+    } finally {
+      await daemon.close();
+    }
   });
 });

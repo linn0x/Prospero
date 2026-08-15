@@ -237,9 +237,11 @@ export async function createDaemonServer(
   const cliBinDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "bin");
   const accounts = new AgentAccountManager(opts.home);
   const structuredSupervisorEnabled = opts.structuredSupervisor ?? process.env["VITEST"] !== "true";
-  // Freeze the executable boundary before any session launcher is created.
-  // Falling back to mutable dist after a snapshot error would recreate the
-  // exact build-version split this boundary prevents, so fail closed instead.
+  // Freeze the POSIX executable boundary before any Unix session launcher is
+  // created. Falling back to mutable dist after a snapshot error would
+  // recreate the exact build-version split this boundary prevents, so fail
+  // closed instead. Windows deliberately does not create this POSIX image:
+  // its Session Host must use the native N-API secure-state/ACL boundary.
   const structuredRuntime = structuredSupervisorEnabled && process.platform !== "win32"
     ? createStructuredSupervisorRuntimeSnapshot({
       // Runtime images are daemon state, never a cache beside a source or
