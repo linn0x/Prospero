@@ -250,6 +250,11 @@ interface NativeWindowsMethods {
   spawnConPty(options: ConPtySpawnOptions): ConPtyHandle;
   resizeConPty(terminal: ConPtyHandle, columns: number, rows: number): void;
   readConPty(terminal: ConPtyHandle, maxBytes: number): Uint8Array;
+  /**
+   * Writes the supplied raw terminal bytes without encoding or newline
+   * translation. A product-facing cross-platform input facade, if present,
+   * owns mappings such as Enter; Windows terminal Enter is normally `\r`.
+   */
   writeConPty(terminal: ConPtyHandle, data: Uint8Array): number;
   killConPty(terminal: ConPtyHandle, exitCode: number): void;
   closeConPty(terminal: ConPtyHandle): void;

@@ -217,6 +217,11 @@ prospero_status prospero_conpty_read(
     uint8_t* buffer,
     uint32_t capacity,
     uint32_t* out_read);
+/**
+ * Writes the caller's raw terminal bytes to ConPTY without character encoding
+ * or newline translation. A product-facing cross-platform facade owns any
+ * mapping such as terminal Enter (normally '\r' on Windows).
+ */
 prospero_status prospero_conpty_write(
     prospero_conpty_handle terminal,
     const uint8_t* buffer,
