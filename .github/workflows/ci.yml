@@ -80,31 +80,18 @@ jobs:
           $source = 'packages/windows-native/build/Release/prospero_windows_native.node'
           Write-Host 'Creating ephemeral code-signing certificate'
           $certificate = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=Prospero Windows CI Session Host Test' -CertStoreLocation 'Cert:\CurrentUser\My'
+          $certificateFile = Join-Path $env:RUNNER_TEMP 'prospero-windows-session-host-test.cer'
           $signTool = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\${{ matrix.arch }}\signtool.exe" -File -ErrorAction SilentlyContinue |
             Sort-Object FullName -Descending |
             Select-Object -First 1 -ExpandProperty FullName
           if (-not $signTool) { throw 'signtool.exe was not found in the Windows SDK' }
-          function Set-EphemeralCertificateTrust {
-            param(
-              [System.Security.Cryptography.X509Certificates.X509Certificate2] $Certificate,
-              [string] $StoreName,
-              [bool] $Trusted
-            )
-            $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
-              $StoreName,
-              [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
-            )
-            try {
-              $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
-              if ($Trusted) { $store.Add($Certificate) } else { $store.Remove($Certificate) }
-            } finally {
-              $store.Close()
-            }
-          }
           try {
-            Write-Host 'Trusting ephemeral certificate without certificate-import UI'
-            Set-EphemeralCertificateTrust -Certificate $certificate -StoreName 'Root' -Trusted $true
-            Set-EphemeralCertificateTrust -Certificate $certificate -StoreName 'TrustedPublisher' -Trusted $true
+            Export-Certificate -Cert $certificate -FilePath $certificateFile | Out-Null
+            Write-Host 'Trusting ephemeral certificate through non-interactive certutil'
+            & certutil.exe -user -f -addstore Root $certificateFile
+            if ($LASTEXITCODE -ne 0) { throw 'certutil failed to trust the ephemeral root certificate' }
+            & certutil.exe -user -f -addstore TrustedPublisher $certificateFile
+            if ($LASTEXITCODE -ne 0) { throw 'certutil failed to trust the ephemeral publisher certificate' }
             Copy-Item -LiteralPath $source -Destination $artifact -Force
             Write-Host "Signing $artifact with $signTool"
             & $signTool sign /fd SHA256 /sha1 $certificate.Thumbprint $artifact
@@ -121,8 +108,12 @@ jobs:
           } finally {
             Copy-Item -LiteralPath $source -Destination $artifact -Force
             node packages/windows-native/scripts/stage-prebuild.mjs --source $artifact --destination packages/windows-native --arch ${{ matrix.arch }} --authenticode-status unsigned
-            Set-EphemeralCertificateTrust -Certificate $certificate -StoreName 'Root' -Trusted $false
-            Set-EphemeralCertificateTrust -Certificate $certificate -StoreName 'TrustedPublisher' -Trusted $false
+            & certutil.exe -user -f -delstore Root $certificate.Thumbprint
+            if ($LASTEXITCODE -ne 0) { Write-Warning 'certutil could not remove the ephemeral root certificate' }
+            & certutil.exe -user -f -delstore TrustedPublisher $certificate.Thumbprint
+            if ($LASTEXITCODE -ne 0) { Write-Warning 'certutil could not remove the ephemeral publisher certificate' }
+            $global:LASTEXITCODE = 0
+            Remove-Item -LiteralPath $certificateFile -Force -ErrorAction SilentlyContinue
             Remove-Item -LiteralPath "Cert:\CurrentUser\My\$($certificate.Thumbprint)" -Force -ErrorAction SilentlyContinue
           }
       - name: Upload unsigned test artifact and SHA-256 manifest
