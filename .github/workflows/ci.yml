@@ -79,7 +79,10 @@ jobs:
           $source = 'packages/windows-native/build/Release/prospero_windows_native.node'
           $certificate = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=Prospero Windows CI Session Host Test' -CertStoreLocation 'Cert:\CurrentUser\My'
           $certificateFile = Join-Path $env:RUNNER_TEMP 'prospero-windows-session-host-test.cer'
-          $signTool = (Get-Command signtool.exe -ErrorAction Stop).Source
+          $signTool = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\${{ matrix.arch }}\signtool.exe" -File -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signTool) { throw 'signtool.exe was not found in the Windows SDK' }
           try {
             Export-Certificate -Cert $certificate -FilePath $certificateFile | Out-Null
             Import-Certificate -FilePath $certificateFile -CertStoreLocation 'Cert:\CurrentUser\Root' | Out-Null
@@ -156,7 +159,10 @@ jobs:
           $missing = @($required | Where-Object { [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) })
           if ($missing.Count -gt 0) { throw "Release signing is fail-closed; missing: $($missing -join ', ')" }
           if ($env:WINDOWS_AUTHENTICODE_THUMBPRINT_SHA1 -notmatch '^[a-fA-F0-9]{40}$') { throw 'WINDOWS_AUTHENTICODE_THUMBPRINT_SHA1 must be a SHA-1 thumbprint' }
-          $signTool = (Get-Command signtool.exe -ErrorAction Stop).Source
+          $signTool = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -File -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signTool) { throw 'signtool.exe was not found in the Windows SDK' }
           $certificatePath = Join-Path $env:RUNNER_TEMP 'prospero-release-signing.pfx'
           try {
             [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:WINDOWS_AUTHENTICODE_PFX_BASE64))
