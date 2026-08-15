@@ -14,6 +14,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   rmdirSync,
   writeFileSync,
@@ -285,8 +286,9 @@ function daemonRunner(): string {
   return path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "dist", "structured-supervisor-runner.js");
 }
 
-function runtimeSnapshots(): string[] {
-  const runtimeRoot = path.join(path.dirname(path.dirname(daemonRunner())), ".prospero-runtime");
+function runtimeSnapshots(home: string): string[] {
+  if (!existsSync(home)) return [];
+  const runtimeRoot = path.join(realpathSync(home), "structured-supervisor-runtime");
   if (!existsSync(runtimeRoot)) return [];
   return readdirSync(runtimeRoot).filter((entry) => entry.startsWith("structured-supervisor-"));
 }
@@ -323,7 +325,10 @@ async function startDaemon(home: string, port: number, fakeBin: string): Promise
       if (!existsSync(path.join(home, "control.token"))) return false;
       const health = await control(home, port, "GET", "/_prospero/control/health");
       return health.status === 200;
-    }, `daemon at ${String(port)}`);
+    // A complete immutable image includes package assets and platform runtime
+    // dependencies; a cold first snapshot can legitimately exceed the normal
+    // request/recovery polling window without indicating a failed daemon.
+    }, `daemon at ${String(port)}`, 60_000);
   } catch (error) {
     throw new Error(`${String(error)}\ndaemon stdout:\n${stdout}\ndaemon stderr:\n${stderr}`);
   }
@@ -553,18 +558,24 @@ describe.sequential("daemon supervisor SIGTERM/SIGKILL full-process recovery", (
     await waitForExit(git, "snapshot temporary git init");
     if (git.exitCode !== 0) throw new Error("snapshot temporary git init failed");
 
-    const before = new Set(runtimeSnapshots());
+    const before = new Set(runtimeSnapshots(home));
     const daemon = await startDaemon(home, await freePort(), fakeBin);
-    const createdSnapshots = runtimeSnapshots().filter((entry) => !before.has(entry));
+    const createdSnapshots = runtimeSnapshots(home).filter((entry) => !before.has(entry));
     expect(createdSnapshots).toHaveLength(1);
     const snapshotRunner = path.join(
-      path.dirname(path.dirname(daemonRunner())),
-      ".prospero-runtime",
+      realpathSync(home),
+      "structured-supervisor-runtime",
       createdSnapshots[0]!,
       "dist",
       "structured-supervisor-runner.js",
     );
     expect(readFileSync(snapshotRunner, "utf8")).toContain("runStructuredSupervisor");
+    // @prospero/protocol is a workspace symlink during this test run. Its
+    // frozen package must be copied as regular files, never linked back into
+    // the mutable worktree/node_modules tree.
+    const snapshotProtocol = path.join(path.dirname(snapshotRunner), "node_modules", "@prospero", "protocol");
+    expect(lstatSync(snapshotProtocol).isSymbolicLink()).toBe(false);
+    expect(lstatSync(path.join(snapshotProtocol, "dist", "index.js")).isSymbolicLink()).toBe(false);
 
     const runner = daemonRunner();
     const original = readFileSync(runner, "utf8");
@@ -582,6 +593,11 @@ describe.sequential("daemon supervisor SIGTERM/SIGKILL full-process recovery", (
       const owned = manifest(home, created.id);
       expect(processAlive(owned.supervisorPid)).toBe(true);
       supervisorGroups.add(owned.supervisorPid!);
+      const leaseDirectory = path.join(realpathSync(home), "structured-supervisor-runtime", "leases");
+      await eventually(
+        () => readdirSync(leaseDirectory).filter((entry) => entry.endsWith(".json")).length >= 2,
+        "daemon and detached host runtime leases",
+      );
       const killed = await control(home, daemon.port, "POST", `/_prospero/control/session/${encodeURIComponent(created.id)}/kill`, {});
       expect(killed.status).toBe(204);
       await eventually(
@@ -589,6 +605,10 @@ describe.sequential("daemon supervisor SIGTERM/SIGKILL full-process recovery", (
         "snapshot-owned runner exit",
       );
       supervisorGroups.delete(owned.supervisorPid!);
+      await eventually(
+        () => readdirSync(leaseDirectory).filter((entry) => entry.endsWith(".json")).length === 1,
+        "detached host runtime lease release",
+      );
     } finally {
       writeFileSync(runner, original);
       await stopDaemon(daemon, "SIGTERM");

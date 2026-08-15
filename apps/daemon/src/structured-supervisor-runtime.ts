@@ -1,45 +1,105 @@
 /**
  * Immutable runtime image for detached structured-supervisor owners.
  *
- * A daemon can keep serving while a developer builds or upgrades the package.
- * Starting a child directly from dist would then mix the daemon's old launcher
- * with whatever happened to replace dist. At daemon start we instead copy the
- * runner's complete relative-module closure into a private image and launch
- * every new owner from that image. Package dependencies remain resolved from
- * the installed daemon's node_modules ancestry; credentials and mutable
- * session data are intentionally not copied here.
+ * The daemon itself may outlive a build or package upgrade.  A detached
+ * runner therefore never starts from mutable dist: it starts from a private,
+ * content-addressed image below the daemon's state home.  In addition to the
+ * runner's relative closure, the image contains complete resolved bare
+ * packages and their dependency trees needed by Node ESM. This deliberately
+ * avoids writing a cache beside an installed (and potentially read-only)
+ * package or retaining links into mutable node_modules.
  */
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
+  constants as fsConstants,
   copyFileSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { resolveStructuredSupervisorRunnerPath } from "./structured-supervisor-client.js";
 
-const RUNTIME_DIR = ".prospero-runtime";
 const SNAPSHOT_PREFIX = "structured-supervisor-";
 const STAGING_PREFIX = ".structured-supervisor-staging-";
-const MAX_SNAPSHOTS = 8;
-const MAX_SNAPSHOT_AGE_MS = 7 * 24 * 60 * 60 * 1_000;
-const RELATIVE_IMPORT_PATTERNS = [
-  /\b(?:import|export)\s+(?:[^"']*?\s+from\s+)?["'](\.{1,2}\/[^"']+)["']/g,
-  /\bimport\s*\(\s*["'](\.{1,2}\/[^"']+)["']\s*\)/g,
+const LEASE_DIR = "leases";
+const SNAPSHOT_VERSION = 2;
+const LEASE_VERSION = 1;
+const FINAL_GC_AGE_MS = 7 * 24 * 60 * 60 * 1_000;
+const STAGING_GC_AGE_MS = 24 * 60 * 60 * 1_000;
+const LEASE_HEARTBEAT_MS = 30_000;
+const LEASE_STALE_MS = LEASE_HEARTBEAT_MS * 4;
+const MAX_CAPTURE_ATTEMPTS = 3;
+
+const MODULE_SPECIFIER_PATTERNS = [
+  /\b(?:import|export)\s+(?:[^"']*?\s+from\s+)?["']([^"']+)["']/g,
+  /\bimport\s*\(\s*["']([^"']+)["']\s*\)/g,
+  /\brequire\s*\(\s*["']([^"']+)["']\s*\)/g,
 ] as const;
+
+interface SnapshotFile {
+  /** POSIX-like path below the image root, never an absolute source path. */
+  target: string;
+  mode: 0o600 | 0o700;
+  source?: string;
+  contents?: string;
+}
+
+interface RuntimeImage {
+  files: SnapshotFile[];
+  runnerTarget: string;
+}
+
+type PackageManifest = {
+  dependencies?: Record<string, string>;
+  optionalDependencies?: Record<string, string>;
+  peerDependencies?: Record<string, string>;
+  peerDependenciesMeta?: Record<string, { optional?: boolean }>;
+};
+
+interface RuntimeLeaseFile {
+  version: 1;
+  digest: string;
+  pid: number;
+  heartbeatAt: number;
+}
+
+interface SnapshotRecord {
+  version: 2;
+  digest: string;
+  files: Array<{ path: string; mode: 0o600 | 0o700 }>;
+}
 
 export interface StructuredSupervisorRuntimeSnapshot {
   /** Exact immutable executable passed to Node for each new detached owner. */
   runnerPath: string;
   /** Private image directory, useful only for local diagnostics/tests. */
   directory: string;
+  /** Refreshes the owning daemon's liveness lease. */
+  heartbeat(): void;
+  /** Releases only this daemon's exact lease; it never removes the image. */
+  release(): void;
+}
+
+export interface StructuredSupervisorRuntimeSnapshotOptions {
+  /** State-owned, private root; production passes <prospero home>/runtime. */
+  runtimeRoot: string;
+  /** Test seam; production always resolves the runner beside this daemon. */
+  runnerPath?: string;
+  /** Exercises the source-stability retry without weakening production checks. */
+  afterCopyForTest?: (attempt: number) => void;
+}
+
+function privateFileMode(mode: number): mode is 0o600 | 0o700 {
+  return (mode & 0o077) === 0 && ((mode & 0o777) === 0o600 || (mode & 0o777) === 0o700);
 }
 
 function isPrivateDirectory(file: string): boolean {
@@ -54,14 +114,16 @@ function isPrivateDirectory(file: string): boolean {
 function isPrivateFile(file: string): boolean {
   try {
     const metadata = lstatSync(file);
-    return metadata.isFile() && !metadata.isSymbolicLink() && (metadata.mode & 0o777) === 0o600;
+    return metadata.isFile() && !metadata.isSymbolicLink() && privateFileMode(metadata.mode);
   } catch {
     return false;
   }
 }
 
 function ensurePrivateDirectory(dir: string): void {
+  ensureNoSymlinkAncestors(dir);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
+  ensureNoSymlinkAncestors(dir);
   const metadata = lstatSync(dir);
   if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
     throw new Error("structured supervisor runtime path is not a directory");
@@ -69,50 +131,320 @@ function ensurePrivateDirectory(dir: string): void {
   chmodSync(dir, 0o700);
 }
 
+/** A private leaf is insufficient when a writable ancestor is a symlink. */
+function ensureNoSymlinkAncestors(directory: string): void {
+  const absolute = path.resolve(directory);
+  const parsed = path.parse(absolute);
+  let current = parsed.root;
+  for (const part of absolute.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
+    current = path.join(current, part);
+    try {
+      const metadata = lstatSync(current);
+      if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+        throw new Error("structured supervisor runtime path has an unsafe ancestor");
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+  }
+}
+
 function isWithin(root: string, file: string): boolean {
   const relative = path.relative(root, file);
   return relative !== "" && !relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative);
 }
 
-function readRelativeImports(file: string, sourceRoot: string): string[] {
+function imagePath(...parts: string[]): string {
+  const result = path.posix.join(...parts.map((part) => part.split(path.sep).join("/")));
+  if (result === "." || result.startsWith("../") || path.posix.isAbsolute(result)) {
+    throw new Error("structured supervisor runtime image path escaped its root");
+  }
+  return result;
+}
+
+function moduleSpecifiers(file: string): string[] {
   const source = readFileSync(file, "utf8");
   const imports = new Set<string>();
-  for (const pattern of RELATIVE_IMPORT_PATTERNS) {
+  for (const pattern of MODULE_SPECIFIER_PATTERNS) {
     pattern.lastIndex = 0;
     for (const match of source.matchAll(pattern)) {
+      const offset = match.index ?? 0;
+      // Package JSDoc frequently contains `import("./types")` references to
+      // declaration-only files. Those are not runtime edges (and resolving
+      // them would make a valid JS package look incomplete).
+      const blockStart = source.lastIndexOf("/*", offset);
+      if (blockStart > source.lastIndexOf("*/", offset)) continue;
+      const lineStart = source.lastIndexOf("\n", offset) + 1;
+      const lineComment = source.indexOf("//", lineStart);
+      if (lineComment >= lineStart && lineComment < offset) continue;
       const specifier = match[1];
-      if (!specifier || !specifier.endsWith(".js")) {
-        throw new Error("structured supervisor runtime has an unsupported relative module specifier");
-      }
-      const resolved = path.resolve(path.dirname(file), specifier);
-      if (!isWithin(sourceRoot, resolved)) {
-        throw new Error("structured supervisor runtime relative dependency escapes dist");
-      }
-      imports.add(resolved);
+      if (specifier) imports.add(specifier);
     }
   }
   return [...imports];
 }
 
-/** Discover the runner's actual runtime closure, rejecting links and escapes. */
-function collectRuntimeModules(runner: string): { sourceRoot: string; modules: string[] } {
-  const sourceRoot = path.dirname(runner);
+function sourceFileMode(file: string): 0o600 | 0o700 {
+  const metadata = lstatSync(file);
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    throw new Error("structured supervisor runtime module is unsafe");
+  }
+  return (metadata.mode & 0o100) === 0 ? 0o600 : 0o700;
+}
+
+function resolveModule(specifier: string, from: string): string {
+  const resolved = createRequire(from).resolve(specifier);
+  if (resolved.startsWith("node:")) throw new Error("built-in module does not have a runtime file");
+  const real = realpathSync(resolved);
+  sourceFileMode(real);
+  return real;
+}
+
+/** Resolve a declared package even when it intentionally has no root export. */
+function resolvePackageDirectory(specifier: string, from: string): string {
+  const name = packageName(specifier);
+  const paths = createRequire(from).resolve.paths(specifier);
+  if (!paths) throw new Error("structured supervisor runtime package has no lookup paths");
+  for (const lookup of paths) {
+    const candidate = path.join(lookup, name);
+    try {
+      const metadata = lstatSync(candidate);
+      if (!metadata.isDirectory() && !metadata.isSymbolicLink()) continue;
+      const directory = realpathSync(candidate);
+      const canonical = lstatSync(directory);
+      if (!canonical.isDirectory() || canonical.isSymbolicLink()) continue;
+      const manifest = lstatSync(path.join(directory, "package.json"));
+      if (manifest.isFile() && !manifest.isSymbolicLink()) return directory;
+    } catch { /* keep Node's normal lookup order */ }
+  }
+  throw new Error("structured supervisor runtime package dependency is missing");
+}
+
+function packageName(specifier: string): string {
+  const parts = specifier.split("/");
+  const name = specifier.startsWith("@") ? `${parts[0] ?? ""}/${parts[1] ?? ""}` : parts[0] ?? "";
+  if (!name || name === "@") throw new Error("structured supervisor runtime has an invalid bare module specifier");
+  return name;
+}
+
+function isBareSpecifier(specifier: string): boolean {
+  return !specifier.startsWith(".") && !specifier.startsWith("/") && !specifier.startsWith("node:") && !specifier.startsWith("file:");
+}
+
+/**
+ * Discover the runner's relative graph and copy every resolved bare package
+ * in full, including assets and recursively resolved production dependencies.
+ * Each dependency is placed beneath its importing package, so nested package
+ * versions retain Node's normal lookup semantics without source symlinks.
+ */
+function collectRuntimeImage(runner: string): RuntimeImage {
+  const canonicalRunner = realpathSync(runner);
+  sourceFileMode(canonicalRunner);
+  const sourceRoot = path.dirname(canonicalRunner);
   const rootMetadata = lstatSync(sourceRoot);
   if (!rootMetadata.isDirectory() || rootMetadata.isSymbolicLink()) {
     throw new Error("structured supervisor dist root is unsafe");
   }
-  const modules = new Set<string>();
-  const visit = (file: string): void => {
-    if (modules.has(file)) return;
-    const metadata = lstatSync(file);
-    if (!metadata.isFile() || metadata.isSymbolicLink()) {
-      throw new Error("structured supervisor runtime module is unsafe");
+
+  const files = new Map<string, SnapshotFile>();
+  const visiting = new Set<string>();
+  const copiedPackages = new Map<string, string>();
+  const trustedRoot = trustedPackageRoot(sourceRoot);
+  const addFile = (source: string, target: string): void => {
+    const prior = files.get(target);
+    if (prior) {
+      if (prior.source !== source) throw new Error("structured supervisor runtime image has conflicting modules");
+      return;
     }
-    modules.add(file);
-    for (const dependency of readRelativeImports(file, sourceRoot)) visit(dependency);
+    files.set(target, { source, target, mode: sourceFileMode(source) });
   };
-  visit(runner);
-  return { sourceRoot, modules: [...modules] };
+
+  const copyPackageTree = (packageRoot: string, packageTarget: string): void => {
+    const visitDirectory = (directory: string): void => {
+      for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+        // Dependencies are explicitly copied below; following this directory
+        // could retain a linked/mutable nested node_modules tree.
+        if (entry.name === "node_modules") continue;
+        const source = path.join(directory, entry.name);
+        const metadata = lstatSync(source);
+        if (metadata.isSymbolicLink()) {
+          throw new Error("structured supervisor runtime package contains a symlink");
+        }
+        if (metadata.isDirectory()) {
+          visitDirectory(source);
+          continue;
+        }
+        if (!metadata.isFile()) throw new Error("structured supervisor runtime package contains an unsafe entry");
+        addFile(source, imagePath(packageTarget, path.relative(packageRoot, source)));
+      }
+    };
+    visitDirectory(packageRoot);
+  };
+
+  const visit = (source: string, target: string): void => {
+    const key = `${source}\0${target}`;
+    if (visiting.has(key)) return;
+    visiting.add(key);
+    addFile(source, target);
+    for (const specifier of moduleSpecifiers(source)) {
+      if (specifier.startsWith("node:")) continue;
+      if (!isBareSpecifier(specifier)) {
+        const resolved = resolveModule(specifier, source);
+        const relative = path.relative(sourceRoot, resolved);
+        if (!isWithin(sourceRoot, resolved)) {
+          throw new Error("structured supervisor runtime relative dependency escapes dist");
+        }
+        visit(resolved, imagePath("dist", relative));
+        continue;
+      }
+      const dependency = resolveModule(specifier, source);
+      const dependencyTarget = imagePath(path.posix.dirname(target), "node_modules", packageName(specifier));
+      visitPackageEntry(dependency, dependencyTarget);
+    }
+  };
+
+  const visitPackage = (packageRoot: string, packageTarget: string): void => {
+    if (!isWithin(trustedRoot, packageRoot)) {
+      throw new Error("structured supervisor runtime package resolves outside the trusted installation root");
+    }
+    const copied = copiedPackages.get(packageTarget);
+    if (copied) {
+      if (copied !== packageRoot) throw new Error("structured supervisor runtime image has conflicting package versions");
+      return;
+    }
+    copiedPackages.set(packageTarget, packageRoot);
+    copyPackageTree(packageRoot, packageTarget);
+
+    const manifestFile = path.join(packageRoot, "package.json");
+    let manifest: PackageManifest;
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(manifestFile, "utf8"));
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid package manifest");
+      manifest = parsed as PackageManifest;
+    } catch {
+      throw new Error("structured supervisor runtime package manifest is invalid");
+    }
+    const dependencies = packageDependencies(manifest);
+    for (const [dependencyName, optional] of dependencies) {
+      try {
+        const dependency = resolvePackageDirectory(dependencyName, manifestFile);
+        visitPackage(dependency, imagePath(packageTarget, "node_modules", packageName(dependencyName)));
+      } catch (error) {
+        if (!optional) throw error;
+      }
+    }
+  };
+
+  const visitPackageEntry = (entry: string, packageTarget: string): void => {
+    visitPackage(realpathSync(packageRootFor(entry)), packageTarget);
+  };
+
+  const runnerTarget = imagePath("dist", path.relative(sourceRoot, canonicalRunner));
+  visit(canonicalRunner, runnerTarget);
+  // Node needs an ESM package boundary after the image moves below daemon home.
+  files.set("package.json", {
+    target: "package.json",
+    mode: 0o600,
+    contents: `${JSON.stringify({ private: true, type: "module" })}\n`,
+  });
+  return { files: [...files.values()].sort((a, b) => a.target.localeCompare(b.target)), runnerTarget };
+}
+
+function packageRootFor(entry: string): string {
+  let directory = path.dirname(entry);
+  while (true) {
+    const candidate = path.join(directory, "package.json");
+    try {
+      const metadata = lstatSync(candidate);
+      if (metadata.isFile() && !metadata.isSymbolicLink()) return directory;
+    } catch { /* walk upward */ }
+    const parent = path.dirname(directory);
+    if (parent === directory) throw new Error("structured supervisor runtime package root is missing");
+    directory = parent;
+  }
+}
+
+/** Workspace links are accepted only after their real target stays in here. */
+function trustedPackageRoot(sourceRoot: string): string {
+  let directory = sourceRoot;
+  let nearestPackage: string | undefined;
+  // A published package can depend on siblings hoisted beneath its enclosing
+  // node_modules. Remember the outermost one, rather than accidentally
+  // trusting an arbitrary package.json farther up a user's filesystem.
+  let installedRoot: string | undefined;
+  while (true) {
+    const manifest = path.join(directory, "package.json");
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(manifest, "utf8"));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && "workspaces" in parsed) {
+        return realpathSync(directory);
+      }
+      nearestPackage ??= realpathSync(directory);
+    } catch { /* continue to the next ancestor */ }
+    if (path.basename(directory) === "node_modules") installedRoot = path.dirname(directory);
+    const parent = path.dirname(directory);
+    if (parent === directory) return realpathSync(installedRoot ?? nearestPackage ?? sourceRoot);
+    directory = parent;
+  }
+}
+
+function packageDependencies(manifest: PackageManifest): Array<[name: string, optional: boolean]> {
+  const dependencies = new Map<string, boolean>();
+  for (const name of Object.keys(manifest.dependencies ?? {})) dependencies.set(name, false);
+  for (const name of Object.keys(manifest.optionalDependencies ?? {})) dependencies.set(name, true);
+  for (const name of Object.keys(manifest.peerDependencies ?? {})) {
+    const optional = manifest.peerDependenciesMeta?.[name]?.optional === true;
+    dependencies.set(name, optional);
+  }
+  return [...dependencies.entries()].sort(([left], [right]) => left.localeCompare(right));
+}
+
+function digestFiles(files: readonly SnapshotFile[], root?: string): string {
+  const digest = createHash("sha256");
+  digest.update(`structured-supervisor-runtime-v${String(SNAPSHOT_VERSION)}\0`);
+  for (const file of files) {
+    digest.update(file.target).update("\0").update(String(file.mode)).update("\0");
+    if (!root && file.contents !== undefined) {
+      digest.update(createHash("sha256").update(file.contents).digest());
+      continue;
+    }
+    const source = root ? path.join(root, file.target) : file.source;
+    if (!source) throw new Error("structured supervisor runtime file has no source");
+    const metadata = lstatSync(source);
+    if (!metadata.isFile() || metadata.isSymbolicLink() || (root && !privateFileMode(metadata.mode))) {
+      throw new Error("structured supervisor runtime image is unsafe or changed");
+    }
+    digest.update(createHash("sha256").update(readFileSync(source)).digest());
+  }
+  return digest.digest("hex");
+}
+
+function ensureTargetParent(staging: string, target: string): string {
+  const destination = path.join(staging, target);
+  const parent = path.dirname(destination);
+  ensurePrivateDirectory(parent);
+  return destination;
+}
+
+function copyImage(staging: string, image: RuntimeImage): void {
+  for (const file of image.files) {
+    const destination = ensureTargetParent(staging, file.target);
+    if (file.contents !== undefined) {
+      writeFileSync(destination, file.contents, { mode: file.mode });
+    } else if (file.source) {
+      sourceFileMode(file.source);
+      // APFS/ReFS and other CoW filesystems avoid a cold-start byte-for-byte
+      // copy of large platform SDK assets. COPYFILE_FICLONE never creates a
+      // hardlink; when cloning is unavailable Node safely falls back to a
+      // normal copy, which is still covered by the destination digest below.
+      copyFileSync(file.source, destination, fsConstants.COPYFILE_FICLONE);
+    } else {
+      throw new Error("structured supervisor runtime file has no source");
+    }
+    chmodSync(destination, file.mode);
+    if (!isPrivateFile(destination)) throw new Error("structured supervisor runtime copy is unsafe");
+  }
 }
 
 /** Do not recursively remove a cache entry until every child was inspected. */
@@ -135,86 +467,256 @@ function removePrivateSnapshot(directory: string): void {
   if (privateTree(directory)) rmSync(directory, { recursive: true, force: true });
 }
 
-/**
- * Bounded best-effort cache cleanup. Only exact names we create are eligible;
- * a changed mode, a symlink/reparse point, or an unfamiliar entry is retained.
- */
-function cleanupRuntimeCache(root: string): void {
-  const now = Date.now();
-  const entries = readdirSync(root, { withFileTypes: true })
-    .flatMap((entry) => {
-      const known = entry.name.startsWith(SNAPSHOT_PREFIX) || entry.name.startsWith(STAGING_PREFIX);
-      if (!known || !entry.isDirectory()) return [];
-      const directory = path.join(root, entry.name);
-      try {
-        const metadata = lstatSync(directory);
-        if (!metadata.isDirectory() || metadata.isSymbolicLink() || !isPrivateDirectory(directory)) return [];
-        return [{ directory, modifiedAt: metadata.mtimeMs }];
-      } catch {
-        return [];
-      }
-    })
-    .sort((a, b) => a.modifiedAt - b.modifiedAt);
-  const excess = Math.max(0, entries.length - MAX_SNAPSHOTS);
-  for (let index = 0; index < entries.length; index++) {
-    const entry = entries[index]!;
-    if (now - entry.modifiedAt >= MAX_SNAPSHOT_AGE_MS || index < excess) {
-      try { removePrivateSnapshot(entry.directory); } catch { /* retain an unsafe/busy cache entry */ }
-    }
-  }
-}
-
-function writePrivate(file: string, value: string): void {
+function privateWrite(file: string, value: string): void {
   writeFileSync(file, value, { mode: 0o600 });
   chmodSync(file, 0o600);
 }
 
+function atomicPrivateJson(file: string, value: unknown): void {
+  const temporary = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  try {
+    privateWrite(temporary, `${JSON.stringify(value)}\n`);
+    renameSync(temporary, file);
+    chmodSync(file, 0o600);
+  } finally {
+    try { rmSync(temporary, { force: true }); } catch { /* exact temporary cleanup only */ }
+  }
+}
+
+function processAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 1) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM proves neither death nor ownership. Any error other than ESRCH is
+    // treated as potentially live: a false positive only retains a cache;
+    // a false negative could delete code still lazily loaded by a host.
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+function validDigest(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
+
+function readActiveLeases(runtimeRoot: string, now: number): Set<string> | null {
+  const directory = path.join(runtimeRoot, LEASE_DIR);
+  try {
+    if (!isPrivateDirectory(directory)) return null;
+    const active = new Set<string>();
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) return null;
+      const file = path.join(directory, entry.name);
+      if (!isPrivateFile(file)) return null;
+      let parsed: unknown;
+      try { parsed = JSON.parse(readFileSync(file, "utf8")); } catch { return null; }
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+      const lease = parsed as Partial<RuntimeLeaseFile>;
+      const pid = lease.pid;
+      const heartbeatAt = lease.heartbeatAt;
+      if (
+        lease.version !== LEASE_VERSION || !validDigest(lease.digest) ||
+        typeof pid !== "number" || !Number.isSafeInteger(pid) ||
+        typeof heartbeatAt !== "number" || !Number.isFinite(heartbeatAt)
+      ) return null;
+      const alive = processAlive(pid);
+      const expired = now - heartbeatAt > LEASE_STALE_MS;
+      // Event loops can be blocked beyond the heartbeat interval. A lease is
+      // collectible only once its owner is proven gone *and* it is expired.
+      if (alive || !expired) {
+        active.add(lease.digest);
+        continue;
+      }
+      // A stale/dead lease is an exact private file created by us, so it is
+      // safe to remove. Its snapshot remains subject to the final GC age.
+      try { rmSync(file, { force: true }); } catch { return null; }
+    }
+    return active;
+  } catch {
+    return null;
+  }
+}
+
+function snapshotDigestFromName(name: string): string | null {
+  const match = new RegExp(`^${SNAPSHOT_PREFIX}([a-f0-9]{64})$`).exec(name);
+  return match?.[1] ?? null;
+}
+
 /**
- * Freeze the currently compiled structured runner at daemon startup. The
- * image deliberately contains only executable modules and a minimal ESM
- * package marker; it never contains session bootstrap/configuration data.
+ * Final images are collected only when their content-addressed lease has no
+ * live daemon owner. A live PID *or* a fresh heartbeat retains an image;
+ * malformed lease state disables final GC rather than risking an old daemon's
+ * launcher.
+ * Staging images have never been published and can be collected independently.
  */
-export function createStructuredSupervisorRuntimeSnapshot(): StructuredSupervisorRuntimeSnapshot {
-  const runner = resolveStructuredSupervisorRunnerPath();
+function cleanupRuntimeCache(runtimeRoot: string): void {
+  const now = Date.now();
+  const active = readActiveLeases(runtimeRoot, now);
+  for (const entry of readdirSync(runtimeRoot, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const directory = path.join(runtimeRoot, entry.name);
+    let metadata;
+    try {
+      metadata = lstatSync(directory);
+      if (!metadata.isDirectory() || metadata.isSymbolicLink() || !isPrivateDirectory(directory)) continue;
+    } catch { continue; }
+    if (entry.name.startsWith(STAGING_PREFIX)) {
+      if (now - metadata.mtimeMs >= STAGING_GC_AGE_MS) {
+        try { removePrivateSnapshot(directory); } catch { /* retain uncertain staging */ }
+      }
+      continue;
+    }
+    const digest = snapshotDigestFromName(entry.name);
+    if (!digest || active === null || active.has(digest) || now - metadata.mtimeMs < FINAL_GC_AGE_MS) continue;
+    try { removePrivateSnapshot(directory); } catch { /* retain uncertain final image */ }
+  }
+}
+
+function expectedSnapshotRecord(digest: string, image: RuntimeImage): SnapshotRecord {
+  return {
+    version: SNAPSHOT_VERSION,
+    digest,
+    files: image.files.map((file) => ({ path: file.target, mode: file.mode })),
+  };
+}
+
+/**
+ * The directory key covers every copied image file *and* its immutable record.
+ * The record holds the payload hash (rather than its own name) to avoid a
+ * self-referential hash while still making metadata tampering non-reusable.
+ */
+function imageDigest(contentDigest: string, record: SnapshotRecord): string {
+  return createHash("sha256")
+    .update("structured-supervisor-runtime-image-v2\0")
+    .update(contentDigest)
+    .update("\0")
+    .update(JSON.stringify(record))
+    .digest("hex");
+}
+
+function matchesSnapshotRecord(value: unknown, expected: SnapshotRecord): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Partial<SnapshotRecord>;
+  if (record.version !== expected.version || record.digest !== expected.digest || !Array.isArray(record.files)) return false;
+  return record.files.length === expected.files.length && record.files.every((file, index) => {
+    const wanted = expected.files[index];
+    return !!wanted && file && typeof file === "object" && !Array.isArray(file) &&
+      (file as { path?: unknown }).path === wanted.path && (file as { mode?: unknown }).mode === wanted.mode;
+  });
+}
+
+function validExistingSnapshot(
+  directory: string,
+  digest: string,
+  contentDigest: string,
+  image: RuntimeImage,
+): boolean {
+  if (!privateTree(directory)) return false;
+  const recordFile = path.join(directory, "snapshot.json");
+  if (!isPrivateFile(recordFile)) return false;
+  try {
+    const expected = expectedSnapshotRecord(contentDigest, image);
+    if (!matchesSnapshotRecord(JSON.parse(readFileSync(recordFile, "utf8")), expected)) return false;
+    return imageDigest(contentDigest, expected) === digest && digestFiles(image.files, directory) === contentDigest;
+  } catch {
+    return false;
+  }
+}
+
+function createLease(runtimeRoot: string, digest: string): { heartbeat(): void; release(): void } {
+  const directory = path.join(runtimeRoot, LEASE_DIR);
+  ensurePrivateDirectory(directory);
+  const file = path.join(directory, `${digest}-${process.pid}-${randomBytes(12).toString("hex")}.json`);
+  let released = false;
+  const heartbeat = (): void => {
+    if (released) return;
+    const value: RuntimeLeaseFile = { version: LEASE_VERSION, digest, pid: process.pid, heartbeatAt: Date.now() };
+    atomicPrivateJson(file, value);
+  };
+  heartbeat();
+  return {
+    heartbeat,
+    release: (): void => {
+      if (released) return;
+      released = true;
+      try { rmSync(file, { force: true }); } catch { /* stale lease will be checked before GC */ }
+    },
+  };
+}
+
+/**
+ * Freeze the compiled structured runner at daemon startup. Concurrent builds
+ * are fail-closed: source is fingerprinted before and after the copy, and a
+ * changed graph retries rather than publishing a mixed image.
+ */
+export function createStructuredSupervisorRuntimeSnapshot(
+  options: StructuredSupervisorRuntimeSnapshotOptions,
+): StructuredSupervisorRuntimeSnapshot {
+  const runner = options.runnerPath ?? resolveStructuredSupervisorRunnerPath();
   const runnerMetadata = lstatSync(runner);
   if (!runnerMetadata.isFile() || runnerMetadata.isSymbolicLink()) {
     throw new Error("structured supervisor runner is unsafe or missing");
   }
-  const { sourceRoot, modules } = collectRuntimeModules(runner);
-  const runtimeRoot = path.join(path.dirname(sourceRoot), RUNTIME_DIR);
-  ensurePrivateDirectory(runtimeRoot);
-  cleanupRuntimeCache(runtimeRoot);
+  ensurePrivateDirectory(options.runtimeRoot);
+  ensurePrivateDirectory(path.join(options.runtimeRoot, LEASE_DIR));
+  cleanupRuntimeCache(options.runtimeRoot);
 
-  const staging = mkdtempSync(path.join(runtimeRoot, STAGING_PREFIX));
-  chmodSync(staging, 0o700);
-  try {
-    const destinationRoot = path.join(staging, "dist");
-    ensurePrivateDirectory(destinationRoot);
-    for (const source of modules) {
-      const relative = path.relative(sourceRoot, source);
-      if (!relative || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-        throw new Error("structured supervisor runtime module escaped dist");
-      }
-      const destination = path.join(destinationRoot, relative);
-      ensurePrivateDirectory(path.dirname(destination));
-      copyFileSync(source, destination, 0);
-      chmodSync(destination, 0o600);
+  for (let attempt = 1; attempt <= MAX_CAPTURE_ATTEMPTS; attempt++) {
+    const image = collectRuntimeImage(runner);
+    const contentDigest = digestFiles(image.files);
+    const record = expectedSnapshotRecord(contentDigest, image);
+    const digest = imageDigest(contentDigest, record);
+    const directory = path.join(options.runtimeRoot, `${SNAPSHOT_PREFIX}${digest}`);
+    if (validExistingSnapshot(directory, digest, contentDigest, image)) {
+      // Re-read the source graph before adopting a shared final image.
+      const current = collectRuntimeImage(runner);
+      if (digestFiles(current.files) !== contentDigest) continue;
+      const lease = createLease(options.runtimeRoot, digest);
+      return {
+        runnerPath: path.join(directory, image.runnerTarget),
+        directory,
+        heartbeat: lease.heartbeat,
+        release: lease.release,
+      };
     }
-    // Node must preserve ESM semantics after the image is moved out of dist.
-    writePrivate(path.join(staging, "package.json"), `${JSON.stringify({ private: true, type: "module" })}\n`);
-    writePrivate(path.join(staging, "snapshot.json"), `${JSON.stringify({
-      version: 1,
-      createdAt: Date.now(),
-      modules: modules.map((file) => path.relative(sourceRoot, file)).sort(),
-    })}\n`);
-    const directory = path.join(runtimeRoot, `${SNAPSHOT_PREFIX}${randomBytes(12).toString("hex")}`);
-    renameSync(staging, directory);
-    chmodSync(directory, 0o700);
-    const snapshotRunner = path.join(directory, "dist", path.relative(sourceRoot, runner));
-    if (!isPrivateFile(snapshotRunner)) throw new Error("structured supervisor runtime snapshot is incomplete");
-    return { runnerPath: snapshotRunner, directory };
-  } catch (error) {
-    try { removePrivateSnapshot(staging); } catch { /* do not widen deletion after a failed snapshot */ }
-    throw error;
+
+    const staging = mkdtempSync(path.join(options.runtimeRoot, STAGING_PREFIX));
+    chmodSync(staging, 0o700);
+    try {
+      copyImage(staging, image);
+      options.afterCopyForTest?.(attempt);
+      // Copy correctness and source stability are separate checks: either a
+      // short read or a concurrent overwrite rejects this attempt.
+      if (digestFiles(image.files, staging) !== contentDigest) {
+        throw new Error("structured supervisor runtime snapshot copy mismatch");
+      }
+      const current = collectRuntimeImage(runner);
+      if (digestFiles(current.files) !== contentDigest) continue;
+
+      privateWrite(path.join(staging, "snapshot.json"), `${JSON.stringify(record)}\n`);
+      const published = path.join(options.runtimeRoot, `${SNAPSHOT_PREFIX}${digest}`);
+      try {
+        renameSync(staging, published);
+      } catch (error) {
+        // A concurrent daemon may have won publication of this same content.
+        if (!validExistingSnapshot(published, digest, contentDigest, image)) throw error;
+      }
+      if (!validExistingSnapshot(published, digest, contentDigest, image)) {
+        throw new Error("structured supervisor runtime snapshot is incomplete");
+      }
+      const lease = createLease(options.runtimeRoot, digest);
+      return {
+        runnerPath: path.join(published, image.runnerTarget),
+        directory: published,
+        heartbeat: lease.heartbeat,
+        release: lease.release,
+      };
+    } finally {
+      // rename moved staging on success; exact private-path cleanup is safe on
+      // retry/failure and never broadens to a user-owned root.
+      try { removePrivateSnapshot(staging); } catch { /* retain uncertain staging */ }
+    }
   }
+  throw new Error("structured supervisor runtime changed while creating immutable snapshot");
 }
