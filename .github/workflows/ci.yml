@@ -102,9 +102,14 @@ jobs:
             }
             Write-Host 'Ephemeral Authenticode signature is trusted; running Session Host acceptance'
             node packages/windows-native/scripts/stage-prebuild.mjs --source $artifact --destination packages/windows-native --arch ${{ matrix.arch }} --authenticode-status valid --thumbprint $certificate.Thumbprint
+            if ($LASTEXITCODE -ne 0) { throw 'failed to stage the signed Session Host test artifact' }
+            node packages/windows-native/scripts/smoke-loader.mjs --package-root packages/windows-native --expect valid
+            if ($LASTEXITCODE -ne 0) { throw 'the production loader rejected the signed Session Host test artifact' }
             $env:PROSPERO_WINDOWS_SIGNED_SESSION_HOST_TEST = '1'
             npm run build --workspace=@prospero/daemon
+            if ($LASTEXITCODE -ne 0) { throw 'daemon build failed before Windows Session Host acceptance' }
             npm run test:windows-native --workspace=@prospero/daemon
+            if ($LASTEXITCODE -ne 0) { throw 'Windows Session Host acceptance failed' }
           } finally {
             Copy-Item -LiteralPath $source -Destination $artifact -Force
             node packages/windows-native/scripts/stage-prebuild.mjs --source $artifact --destination packages/windows-native --arch ${{ matrix.arch }} --authenticode-status unsigned
