@@ -119,7 +119,7 @@ jobs:
             $npmPath = (Get-Command npm.cmd -ErrorAction Stop).Source
             $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
             @($taskScript, $taskLauncher, $taskLog, $taskResult, $npmPath, $windowsPowerShell, $env:GITHUB_WORKSPACE) | ForEach-Object {
-              if ($_ -match "['`\"]") { throw "scheduled-task path contains an unsupported quote: $_" }
+              if ($_.Contains("'") -or $_.Contains('"')) { throw "scheduled-task path contains an unsupported quote: $_" }
             }
             @"
             & '$taskScript' -Workspace '$env:GITHUB_WORKSPACE' -NpmPath '$npmPath' -LogPath '$taskLog' -ResultPath '$taskResult'
