@@ -64,8 +64,10 @@ export interface PipePeerIdentity {
 export interface SecureNamedPipeServerOptions {
   /** Full \\.\pipe\ name; caller owns collision avoidance. */
   readonly pipeName: string;
-  /** Canonical owner/user SID which must be the only permitted client identity. */
-  readonly allowedUserSid: string;
+  /**
+   * The addon derives TokenUser and the logon SID from its own process token.
+   * Callers must never select a SID: a manifest is not an ACL trust root.
+   */
   readonly maxInstances: number;
   readonly inboundBufferBytes: number;
   readonly outboundBufferBytes: number;

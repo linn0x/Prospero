@@ -74,12 +74,19 @@ typedef struct prospero_secure_state_entry_list {
 /**
  * The server must use this explicit security descriptor. Passing NULL or zero
  * bytes is invalid. Implementations must not rely on a default DACL and must
- * pass PIPE_REJECT_REMOTE_CLIENTS to CreateNamedPipeW.
+ * pass PIPE_REJECT_REMOTE_CLIENTS to CreateNamedPipeW. TokenUser is always
+ * derived by native code from the current process token; no caller-selected
+ * SID may be trusted from a manifest.
  */
 typedef struct prospero_secure_pipe_security {
   const void* self_relative_security_descriptor;
   uint32_t security_descriptor_bytes;
-  const wchar_t* allowed_user_sid;
+  /**
+   * ABI-v2 layout reservation. It replaced no storage and must be NULL;
+   * callers may not select a user SID. Native code derives TokenUser from its
+   * own process token and validates the descriptor against its logon SID.
+   */
+  const wchar_t* reserved_legacy_allowed_user_sid;
 } prospero_secure_pipe_security;
 
 typedef struct prospero_secure_pipe_server_options {
