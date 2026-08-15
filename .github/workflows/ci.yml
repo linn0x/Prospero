@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [master]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -32,8 +33,207 @@ jobs:
       - run: npm run typecheck
       - run: npm run lint -w @prospero/mobile
       - run: npm test
-      - if: runner.os == 'Windows'
-        run: npm run test:native -w @prospero/windows-native
+
+  windows-native:
+    name: Windows native (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-latest
+          # This is intentionally an unconditional real hosted ARM64 job: a
+          # queue/image/build failure is a CI failure, never a skipped pass.
+          - arch: arm64
+            runner: windows-11-arm
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci
+      - name: Assert the runner matches the artifact architecture
+        run: |
+          node -e "if (process.platform !== 'win32' || process.arch !== '${{ matrix.arch }}') { throw new Error('expected win32/${{ matrix.arch }}, received ' + process.platform + '/' + process.arch) }"
+      - name: Build and exercise the real Node-API addon
+        run: |
+          npm run build --workspace=@prospero/windows-native
+          npm run test:native --workspace=@prospero/windows-native
+      - name: Stage an unsigned CI-only artifact and prove production rejects it
+        run: |
+          node packages/windows-native/scripts/stage-prebuild.mjs --source packages/windows-native/build/Release/prospero_windows_native.node --destination packages/windows-native --arch ${{ matrix.arch }} --authenticode-status unsigned
+          node packages/windows-native/scripts/smoke-loader.mjs --package-root packages/windows-native --expect unsigned
+          npm run verify:prebuilds --workspace=@prospero/windows-native
+      - name: Upload unsigned test artifact and SHA-256 manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-native-unsigned-${{ matrix.arch }}
+          path: packages/windows-native/prebuilds/win32-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release-stage:
+    name: Sign and package Windows native release artifacts
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: windows-native
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci
+      - run: npm run build --workspace=@prospero/windows-native
+      - uses: actions/download-artifact@v5
+        with:
+          name: windows-native-unsigned-x64
+          path: packages/windows-native/prebuilds/win32-x64
+      - uses: actions/download-artifact@v5
+        with:
+          name: windows-native-unsigned-arm64
+          path: packages/windows-native/prebuilds/win32-arm64
+      - name: Require signing configuration and Authenticode-sign both architectures
+        env:
+          WINDOWS_AUTHENTICODE_PFX_BASE64: ${{ secrets.WINDOWS_AUTHENTICODE_PFX_BASE64 }}
+          WINDOWS_AUTHENTICODE_PFX_PASSWORD: ${{ secrets.WINDOWS_AUTHENTICODE_PFX_PASSWORD }}
+          WINDOWS_AUTHENTICODE_THUMBPRINT_SHA1: ${{ secrets.WINDOWS_AUTHENTICODE_THUMBPRINT_SHA1 }}
+          WINDOWS_AUTHENTICODE_TIMESTAMP_URL: ${{ vars.WINDOWS_AUTHENTICODE_TIMESTAMP_URL }}
+        run: |
+          $required = @(
+            'WINDOWS_AUTHENTICODE_PFX_BASE64',
+            'WINDOWS_AUTHENTICODE_PFX_PASSWORD',
+            'WINDOWS_AUTHENTICODE_THUMBPRINT_SHA1',
+            'WINDOWS_AUTHENTICODE_TIMESTAMP_URL'
+          )
+          $missing = @($required | Where-Object { [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) })
+          if ($missing.Count -gt 0) { throw "Release signing is fail-closed; missing: $($missing -join ', ')" }
+          if ($env:WINDOWS_AUTHENTICODE_THUMBPRINT_SHA1 -notmatch '^[a-fA-F0-9]{40}$') { throw 'WINDOWS_AUTHENTICODE_THUMBPRINT_SHA1 must be a SHA-1 thumbprint' }
+          $signTool = (Get-Command signtool.exe -ErrorAction Stop).Source
+          $certificatePath = Join-Path $env:RUNNER_TEMP 'prospero-release-signing.pfx'
+          try {
+            [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:WINDOWS_AUTHENTICODE_PFX_BASE64))
+            $artifacts = @(Get-ChildItem 'packages/windows-native/prebuilds/win32-*/prospero_windows_native.node')
+            if ($artifacts.Count -ne 2) { throw "Expected exactly two Windows native artifacts, found $($artifacts.Count)" }
+            $expectedThumbprint = $env:WINDOWS_AUTHENTICODE_THUMBPRINT_SHA1.ToUpperInvariant()
+            $artifacts | ForEach-Object {
+              & $signTool sign /fd SHA256 /f $certificatePath /p $env:WINDOWS_AUTHENTICODE_PFX_PASSWORD /tr $env:WINDOWS_AUTHENTICODE_TIMESTAMP_URL /td SHA256 $_.FullName
+              if ($LASTEXITCODE -ne 0) { throw "signtool failed for $($_.FullName)" }
+              & $signTool verify /pa /v $_.FullName
+              if ($LASTEXITCODE -ne 0) { throw "signtool verification failed for $($_.FullName)" }
+              $signature = Get-AuthenticodeSignature -LiteralPath $_.FullName
+              if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Thumbprint.ToUpperInvariant() -ne $expectedThumbprint) {
+                throw "Unexpected Authenticode signer for $($_.FullName)"
+              }
+            }
+          } finally {
+            Remove-Item -LiteralPath $certificatePath -Force -ErrorAction SilentlyContinue
+          }
+      - name: Emit signed SHA-256 manifests
+        env:
+          WINDOWS_AUTHENTICODE_THUMBPRINT_SHA1: ${{ secrets.WINDOWS_AUTHENTICODE_THUMBPRINT_SHA1 }}
+        run: |
+          node packages/windows-native/scripts/stage-prebuild.mjs --source packages/windows-native/prebuilds/win32-x64/prospero_windows_native.node --destination packages/windows-native --arch x64 --authenticode-status valid --thumbprint $env:WINDOWS_AUTHENTICODE_THUMBPRINT_SHA1
+          node packages/windows-native/scripts/stage-prebuild.mjs --source packages/windows-native/prebuilds/win32-arm64/prospero_windows_native.node --destination packages/windows-native --arch arm64 --authenticode-status valid --thumbprint $env:WINDOWS_AUTHENTICODE_THUMBPRINT_SHA1
+          npm run verify:prebuilds --workspace=@prospero/windows-native
+      - name: Build daemon package and require it to embed both signed prebuilds
+        env:
+          PROSPERO_WINDOWS_NATIVE_PREBUILD_SOURCE: ${{ github.workspace }}/packages/windows-native
+        run: |
+          npm run build --workspace=@prospero/daemon
+          npm run prepack --workspace=@prospero/daemon
+          node packages/windows-native/scripts/verify-release-pack.mjs --native-root packages/windows-native --daemon-root apps/daemon --output-dir $env:RUNNER_TEMP/release-packages
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ runner.temp }}/release-packages/*.tgz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-native-signed-x64
+          path: packages/windows-native/prebuilds/win32-x64
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-native-signed-arm64
+          path: packages/windows-native/prebuilds/win32-arm64
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prospero-release-packages
+          path: ${{ runner.temp }}/release-packages
+          if-no-files-found: error
+
+  release-signed-load:
+    name: Signed production loader (${{ matrix.arch }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: release-stage
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-latest
+          - arch: arm64
+            runner: windows-11-arm
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci
+      - run: npm run build --workspace=@prospero/windows-native
+      - name: Assert signed smoke runner architecture
+        run: |
+          node -e "if (process.platform !== 'win32' || process.arch !== '${{ matrix.arch }}') { throw new Error('expected win32/${{ matrix.arch }}, received ' + process.platform + '/' + process.arch) }"
+      - uses: actions/download-artifact@v5
+        with:
+          name: windows-native-signed-${{ matrix.arch }}
+          path: packages/windows-native/prebuilds/win32-${{ matrix.arch }}
+      - name: Load the signed artifact through the production loader
+        run: node packages/windows-native/scripts/smoke-loader.mjs --package-root packages/windows-native --expect valid
+
+  release-publish:
+    name: Publish Windows native npm package with provenance
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [release-stage, release-signed-load]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v5
+        with:
+          name: prospero-release-packages
+          path: release-packages
+      - name: Require npm publish credentials and publish the attested native package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          test -n "$NODE_AUTH_TOKEN" || { echo 'NPM_TOKEN is required; refusing unsigned/unprovenanced release'; exit 1; }
+          npm publish release-packages/prospero-windows-native-*.tgz --provenance
 
   swift:
     name: Swift build

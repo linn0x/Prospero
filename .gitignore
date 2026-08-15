@@ -10,6 +10,7 @@ dist/
 build/
 coverage/
 .nyc_output/
+*.node
 web-build/
 *.tsbuildinfo
 *.apk
@@ -62,6 +63,11 @@ xcuserdata/
 *.tmp
 *.temp
 *.orig.*
+
+# Release-only Windows prebuilds staged into the daemon npm tarball. They are
+# copied from signed CI artifacts immediately before `npm pack`, never kept in
+# source control.
+apps/daemon/windows-native/
 
 # OS metadata
 .DS_Store
