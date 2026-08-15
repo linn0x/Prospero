@@ -44,10 +44,53 @@ Prospero 把你的 iPhone 或 Android 手机变成 Mac 或 Windows 电脑上**�
 | 离开电脑就失去上下文 | **手机与电脑状态一致**，从口袋里继续处理当前任务 |
 | 多个 Agent 并行时相互覆盖 | **可视化编排 + 隔离 worktree**，让协作过程更安全、更可预测 |
 
+## 多 Agent 编排：从目标到可验收交付
+
+Prospero 的编排层不依赖某个 Agent 或 IDE：Run、Task、Dispatch、Gate、协作消息和工作树资产都由
+daemon 持久管理，协调者 Agent 与手机只是它的客户端。你可以从手机主机页进入 **Goal**，用一句话创建目标，
+再让协调者调查、拆分、派发和验收。
+
+| 阶段 | Prospero 负责什么 |
+| --- | --- |
+| **Goal / Run** | 为目标创建独立 Run 与协调者会话；活动 Run 和历史记录分开展示 |
+| **DAG 拆分** | Task 可声明依赖与层级；只有依赖全部完成的节点才会 ready，成环会被拒绝 |
+| **执行** | 可手工派发多个隔离 worker 并行工作，也可一键自动推进；当前自动模式在 Run 共享工作树中串行执行，确保下游看见上游改动 |
+| **人机协作** | coordinator 与 worker 可通过持久邮箱发送、询问和回复；需要人决定时创建 Gate，手机可直接处理 |
+| **显式交付** | worker 必须明确执行 `task done` 或 `task fail`；Agent 暂时空闲、结束一轮对话或断线都不会被误判为完成 |
+| **验收与恢复** | 只有 Task、活动 Dispatch 和待决 Gate 全部收口后 Run 才能完成；daemon 重启会根据持久状态与存活会话重新对账，不重复派发 |
+
+手工并行时，`esaytree` 会为 worker 建立独立 Git worktree；自动模式则让整张 Run 共享一个隔离工作树并安全串行推进。
+CoW 依赖复用不可用时会安全降级，不会把 ignored 缓存偷偷变成实体副本。工作树在成功、失败或停止后都默认保留，
+只有经过只读检查并显式确认后才会清理。
+
+编排契约、恢复语义和 CLI 全景见 [编排交接文档](docs/orchestration-handoff.md)；工作树安全规则见
+[esaytree 设计](docs/esaytree.md)。
+
+## Windows 支持
+
+Windows 11 是受支持的 daemon 平台，不只是可以打开仓库或连接手机。Windows 与 macOS 使用相同的配对协议、
+端到端加密连接、移动端界面和编排状态机；本地 worker CLI 通过 Windows named pipe 与 control token 访问 daemon。
+
+| 能力 | Windows 11 状态 |
+| --- | --- |
+| daemon、扫码配对、LAN / WireGuard / relay | ✅ 支持；relay 仍只转发 E2E 密文 |
+| Shell 与 Agent CLI | ✅ 支持 PowerShell/cmd，以及 Claude Code、Codex、OpenCode、Grok、Trae 和自定义 CLI |
+| 结构化聊天 | ✅ Claude Code、Codex、OpenCode、Grok 可用；其余 Agent 使用完整 PTY/TUI |
+| DAG / Goal / Gate / worker 编排 | ✅ 支持手工与自动编排；使用 worktree 时需安装 Git for Windows |
+| daemon 重启时保活 Agent | ⚠️ 尚未支持；Windows 没有 tmux，detached structured supervisor 也仍需 Windows named-pipe/ACL 实现 |
+| CI | ✅ 每次提交在 `windows-latest` 执行安装、类型检查、移动端 lint 和 Node 测试矩阵 |
+
+编排数据会持久保存，因此 Windows daemon 重启后仍能看到 Run、Task、Gate 和工作树记录，并会把失去会话的活动任务
+明确收敛为可诊断、可重试的失败；但当前不能保证原 Agent 进程继续运行。macOS/Linux 上，结构化会话由每会话 detached
+supervisor 托管，可跨 daemon 的 SIGTERM、SIGKILL 与重启；PTY 会话则可选 `--tmux` 托管。
+
+Windows 当前没有独立托盘应用，请在 PowerShell 或 cmd 中运行 `prosperod`。命令、配置目录和手机客户端与 macOS 版本一致。
+
 ## How to use
 
-> 以下 daemon 命令在 Mac 终端或 Windows PowerShell/cmd 中执行。需要 macOS 14+ 或 Windows 11、Node.js 22+，以及至少一个已登录的
-> Agent CLI。构建 iOS 客户端需要 Xcode；Android 客户端需要 JDK 17 与 Android SDK。
+> 以下 daemon 命令可在 Mac 终端或 Windows PowerShell/cmd 中执行。需要 macOS 14+ 或 Windows 11、
+> Node.js 22+，以及至少一个已登录的 Agent CLI。构建 iOS 客户端需要 Xcode；Android 客户端需要
+> JDK 17 与 Android SDK。
 
 ### 1. 在电脑上启动 Prospero
 
@@ -83,7 +126,16 @@ node apps/daemon/dist/cli.js pair --name my-phone
 用 Prospero App 扫描二维码，选择电脑上的项目与 Agent，即可创建会话。同一局域网可直接连接；
 离开局域网时，让手机与电脑加入同一个 WireGuard 或 Tailscale 私有网络。
 
-### 4. 可选：自托管 relay 与三种连接模式
+### 4. 可选：发起一个 Goal 编排
+
+在手机的主机页新建会话并选择 **Goal**，填写最终目标、项目目录和协调者 Agent。启动后可进入
+**Agent 编排**查看 DAG：让协调者通过会话拆任务，或在图上手工创建、编辑依赖；随后选择
+**自动运行**串行推进共享 Run worktree，也可以为 ready Task 手工派发独立 worker 并行执行。
+
+运行中可从手机打开 worker 会话、停止任务、重试失败节点和处理 Gate。所有节点显式交付且没有
+活动 worker 或待决 Gate 后，再完成 Goal；工作树仍会保留，便于验收 diff 后按需清理。
+
+### 5. 可选：自托管 relay 与三种连接模式
 
 relay 让已配对手机在没有直连路径时抵达自己的 daemon；它只转发端到端加密数据，不能读取聊天、终端或文件内容。
 部署说明、备份恢复、升级和回滚见 [relay runbook](apps/relay/README.md)。先在 relay 主机按该文档配置 DNS、`.env` 和
@@ -96,6 +148,15 @@ node apps/daemon/dist/cli.js relay status --json
 node apps/daemon/dist/cli.js pair --name my-phone
 ```
 
+Windows PowerShell 中可这样设置默认 relay：
+
+```powershell
+$env:PROSPERO_DEFAULT_RELAY_URL = "wss://relay.example.com"
+node apps/daemon/dist/cli.js relay enable
+node apps/daemon/dist/cli.js relay status --json
+node apps/daemon/dist/cli.js pair --name my-phone
+```
+
 新 QR 会包含独立 relay 凭证，App 默认使用 `auto`：直连和 relay 同时竞速，首个完成 E2E `hello.ok` 的路径获胜。
 也可在主机设置中改为 `direct`（仅 LAN/WireGuard）或 `relay`（仅 relay）。启用 relay 之前创建的设备没有可追溯的
 relay 凭证，必须重新扫码；`relay rotate-key --yes` 也会要求所有设备重新扫码，但不会使原来的直连配对失效。
@@ -104,9 +165,6 @@ relay 凭证，必须重新扫码；`relay rotate-key --yes` 也会要求所有�
 > 本仓交付的是可部署制品和 runbook，不是已完成的真实公网部署证明。当前容量资格为 **inconclusive/waived**：没有
 > 5k host / 1k stream pair / 600 秒成功结论，没有 16 GiB 环境资格、同环境 direct RTT baseline，也没有公网 DNS TLS/WSS 验证。
 > 完整证据和限制见 [release status](docs/relay-release.md)。
-
-> [!NOTE]
-> `--tmux` 会话托管目前只在 macOS/Linux 上启用；Windows daemon 会自动回退为直接 PTY 启动，仍可创建和操控 Shell、Claude Code、Codex、OpenCode、Grok、Trae 与自定义 CLI 会话。
 
 > [!NOTE]
 > **Prospero 正在寻找同行者。** 欢迎成为 Contributor：分享想法、改进体验、修复问题，
