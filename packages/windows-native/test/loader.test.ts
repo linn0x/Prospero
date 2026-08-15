@@ -8,7 +8,7 @@ import {
   NativeLoadError,
   loadWindowsNative,
 } from "../src/index.js";
-import { resolveSystemPowerShellPath } from "../src/loader.js";
+import { resolveSystemPowerShellPath, resolveSystemRootEnvironmentValue } from "../src/loader.js";
 
 const allCapabilities = {
   processIdentity: true,
@@ -125,6 +125,13 @@ describe("Windows native fail-closed loader", () => {
     expect(resolveSystemPowerShellPath("C:\\Windows\\..\\evil", () => true)).toBeNull();
     expect(resolveSystemPowerShellPath("C:/Windows", () => true)).toBeNull();
     expect(resolveSystemPowerShellPath(systemRoot, () => false)).toBeNull();
+  });
+
+  it("reads a unique SystemRoot case-insensitively for Windows Worker environments", () => {
+    expect(resolveSystemRootEnvironmentValue({ SYSTEMROOT: "C:\\Windows" })).toBe("C:\\Windows");
+    expect(resolveSystemRootEnvironmentValue({ systemroot: "D:\\Windows" })).toBe("D:\\Windows");
+    expect(resolveSystemRootEnvironmentValue({ SystemRoot: "C:\\Windows", SYSTEMROOT: "D:\\Windows" })).toBeUndefined();
+    expect(resolveSystemRootEnvironmentValue({ PATH: "C:\\Windows\\System32" })).toBeUndefined();
   });
 
   it("does not attempt to load anything outside Windows", () => {
