@@ -134,12 +134,19 @@ function defaultAuthenticodeCheck(binaryPath: string): AuthenticodeResult {
   // alter the verification command.
   const binaryPathEnvironmentVariable = "PROSPERO_WINDOWS_NATIVE_AUTHENTICODE_PATH";
   const command = [
+    "$securityModule = Join-Path $PSHOME 'Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1'",
+    "Import-Module -Name $securityModule -ErrorAction Stop",
     `$binaryPath = [Environment]::GetEnvironmentVariable('${binaryPathEnvironmentVariable}', 'Process')`,
     "$signature = Get-AuthenticodeSignature -LiteralPath $binaryPath",
     "$thumbprint = if ($null -eq $signature.SignerCertificate) { '' } else { $signature.SignerCertificate.Thumbprint }",
     "[Console]::Out.Write($signature.Status.ToString() + '|' + $thumbprint)",
   ].join("; ");
   const encodedCommand = Buffer.from(command, "utf16le").toString("base64");
+  const childEnvironment = Object.fromEntries(
+    Object.entries(process.env).filter(([name]) => name.toLowerCase() !== "psmodulepath"),
+  );
+  childEnvironment.PSModulePath = win32.join(win32.dirname(powershellPath), "Modules");
+  childEnvironment[binaryPathEnvironmentVariable] = binaryPath;
   try {
     const result = spawnSync(
       powershellPath,
@@ -147,7 +154,7 @@ function defaultAuthenticodeCheck(binaryPath: string): AuthenticodeResult {
       {
         encoding: "utf8",
         windowsHide: true,
-        env: { ...process.env, [binaryPathEnvironmentVariable]: binaryPath },
+        env: childEnvironment,
       },
     );
     if (result.error || result.status !== 0 || typeof result.stdout !== "string") {
