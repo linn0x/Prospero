@@ -27,7 +27,7 @@ export const WORKER_TERMINATION_TIMEOUT_MS = 5_000;
 export interface WorkerSessionManager {
   create(input: CreateSessionInput): Promise<SessionInfo>;
   chatSend(sid: string, text: string): Promise<void>;
-  requirePty(sid: string): { writeInput(text: string): void };
+  requirePty(sid: string): { writeInput(text: string): void | Promise<void> };
   kill(sid: string, options?: KillSessionOptions): Promise<void>;
   infoOf(sid: string): SessionInfo;
 }
@@ -336,7 +336,7 @@ export class DispatchService {
         await this.sessions.chatSend(session.id, prompt);
       } else {
         // PTY 轨没有 chat API；用一段单行提示直接送进 agent 的终端输入。
-        this.sessions.requirePty(session.id).writeInput(`${prompt.replace(/\n/g, " ")}\r`);
+        await this.sessions.requirePty(session.id).writeInput(`${prompt.replace(/\n/g, " ")}\r`);
       }
       const currentDispatch = this.store.getDispatch(dispatch.id);
       // 极快的 worker 可以在前导词调用尚未返回时显式 task.done/fail。不能用迟到的

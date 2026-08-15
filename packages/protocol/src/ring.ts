@@ -38,9 +38,18 @@ export class OutputRing {
    * 时返回 null,调用方应改发全量快照。
    */
   since(lastSeq: number): Uint8Array[] | null {
+    const entries = this.entriesSince(lastSeq);
+    return entries?.map((entry) => entry.data) ?? null;
+  }
+
+  /**
+   * 和 since() 相同，但保留每一帧的游标。Detached session host 用它把
+   * owner 分配的 seq 原样交给重新连接的 daemon，不能由 client 重新编号。
+   */
+  entriesSince(lastSeq: number): RingChunk[] | null {
     if (lastSeq > this.lastSeq) return null; // 客户端声称的进度超前,状态不可信
     const oldest = this.chunks[0]?.seq ?? this.nextSeq;
     if (lastSeq + 1 < oldest && lastSeq < this.lastSeq) return null; // gap 已被淘汰
-    return this.chunks.filter((c) => c.seq > lastSeq).map((c) => c.data);
+    return this.chunks.filter((c) => c.seq > lastSeq).map((c) => ({ ...c }));
   }
 }

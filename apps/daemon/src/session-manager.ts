@@ -21,6 +21,12 @@ import {
   structuredCapable,
 } from "./agents.js";
 import { PtySession } from "./pty-session.js";
+import {
+  RemotePtySession,
+  launchPtySupervisor,
+  reconnectPtySupervisors,
+  type LaunchPtySupervisorInput,
+} from "./pty-supervisor-client.js";
 import * as tmux from "./tmux.js";
 import {
   StructuredSession,
@@ -277,6 +283,10 @@ export interface SessionManagerOptions {
   supervisor?: boolean | undefined;
   /** Test seam for the detached launcher; production uses the real launcher. */
   supervisorLauncher?: ((input: LaunchStructuredSupervisorInput) => Promise<RemoteStructuredSession>) | undefined;
+  /** Detached PTY owners; production daemon opts in, direct unit tests do not. */
+  ptySupervisor?: boolean | undefined;
+  /** Test seam for detached PTY host launch. */
+  ptySupervisorLauncher?: ((input: LaunchPtySupervisorInput) => Promise<RemotePtySession>) | undefined;
 }
 
 /** 恢复前由编排层判定应封存的会话；避免 adapter 先接回并 drain 旧队列。 */
@@ -285,7 +295,7 @@ export interface RestoreStructuredOptions {
 }
 
 export class SessionManager extends EventEmitter<SessionManagerEvents> {
-  private readonly ptySessions = new Map<string, PtySession>();
+  private readonly ptySessions = new Map<string, PtySession | RemotePtySession>();
   private readonly structuredSessions = new Map<string, StructuredSession | RemoteStructuredSession>();
   private readonly tmuxConfigFile: string | null;
   private readonly tmuxBin: string | null;
@@ -298,8 +308,11 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     | ((accountId: string, agent: "claude" | "codex") => AccountBinding)
     | undefined;
   private readonly structuredSupervisorRoot: string | null;
+  private readonly ptySupervisorRoot: string | null;
   private readonly useStructuredSupervisor: boolean;
   private readonly supervisorLauncher: (input: LaunchStructuredSupervisorInput) => Promise<RemoteStructuredSession>;
+  private readonly usePtySupervisor: boolean;
+  private readonly ptySupervisorLauncher: (input: LaunchPtySupervisorInput) => Promise<RemotePtySession>;
   private persistTimer: NodeJS.Timeout | null = null;
   private shuttingDown = false;
 
@@ -312,10 +325,12 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     const home = opts.home ?? opts.tmux?.home;
     this.structuredFile = home ? path.join(home, "structured-sessions.json") : null;
     this.structuredSupervisorRoot = home ? path.join(home, "structured-supervisor") : null;
+    this.ptySupervisorRoot = home ? path.join(home, "pty-supervisor") : null;
     this.adapterFactory = opts.adapterFactory ?? makeAdapter;
     this.sessionEnv = opts.sessionEnv ?? (() => ({}));
     this.accountResolver = opts.accountResolver;
     this.supervisorLauncher = opts.supervisorLauncher ?? launchStructuredSupervisor;
+    this.ptySupervisorLauncher = opts.ptySupervisorLauncher ?? launchPtySupervisor;
     // An injected adapter is the test seam. It cannot safely cross a process
     // boundary, so retain the long-standing in-process behavior there. The
     // daemon opts in explicitly; direct SessionManager construction remains a
@@ -324,6 +339,18 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       !!opts.supervisorLauncher || (
         opts.supervisor === true && !opts.adapterFactory && !!this.structuredSupervisorRoot && process.platform !== "win32"
       );
+    // tmux remains an explicit compatibility path. A PTY host already owns
+    // both the terminal state and its process; stacking tmux beneath it only
+    // obscures explicit kill semantics.
+    this.usePtySupervisor =
+      // Windows has neither a peer-authenticated Named Pipe transport nor a
+      // Job Object/process-tree implementation here.  Keep detached PTY
+      // ownership fail-closed even when a test seam happens to be supplied.
+      process.platform !== "win32" && !this.tmuxEnabled && (
+        !!opts.ptySupervisorLauncher || (
+          opts.ptySupervisor === true && !!this.ptySupervisorRoot
+        )
+      );
   }
 
   /**
@@ -331,7 +358,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
    * tmux 只记得会话名,agent/title/cwd 这些是我们自己存的;两边取交集 ——
    * 元数据里有但 tmux 没有的是已经结束的,tmux 有但元数据没有的不归我们管。
    */
-  restoreFromTmux(): SessionInfo[] {
+  async restoreFromTmux(): Promise<SessionInfo[]> {
     if (!this.tmuxEnabled || !this.metaFile) return [];
     const alive = new Set(tmux.listSessions());
     if (alive.size === 0) {
@@ -347,7 +374,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
           ? this.resolveAccount(meta.agent, meta.accountId)
           : undefined;
         restored.push(
-          this.spawnPty(
+          await this.spawnPty(
             meta.id,
             meta.agent,
             meta.title,
@@ -363,6 +390,24 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       }
     }
     this.persistMeta();
+    return restored;
+  }
+
+  /**
+   * Reconnect only to a manifest's existing owner. A dead/stale manifest is
+   * retained as read-only failed history; this scan never starts a replacement
+   * command, preventing duplicate agents after daemon restart.
+   */
+  async restorePtySupervisors(): Promise<SessionInfo[]> {
+    if (!this.ptySupervisorRoot) return [];
+    const restored: SessionInfo[] = [];
+    for (const session of await reconnectPtySupervisors(this.ptySupervisorRoot)) {
+      if (this.ptySessions.has(session.id)) continue;
+      this.wirePtySession(session);
+      this.ptySessions.set(session.id, session);
+      restored.push(session.info());
+      this.emit("state", session.info());
+    }
     return restored;
   }
 
@@ -507,6 +552,11 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     return this.tmuxBin !== null && this.tmuxConfigFile !== null;
   }
 
+  /** Whether PTY terminal state is held by detached per-session hosts. */
+  get ptySupervisorEnabled(): boolean {
+    return this.usePtySupervisor;
+  }
+
   /** 结构化会话需要异步启动后端,故整体为 async */
   async create(input: CreateSessionInput): Promise<SessionInfo> {
     if (requiresShellCapability(input.agent) && !input.allowShell) {
@@ -546,14 +596,14 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
           input.resume,
           account,
         )
-      : this.createPty(input, cwd, account);
+      : await this.createPty(input, cwd, account);
   }
 
-  private createPty(
+  private async createPty(
     input: CreateSessionInput,
     cwd: string,
     account?: AccountBinding,
-  ): SessionInfo {
+  ): Promise<SessionInfo> {
     let spec;
     try {
       spec = commandFor(
@@ -570,7 +620,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       );
     }
     const id = randomUUID();
-    const info = this.spawnPty(
+    const info = await this.spawnPty(
       id,
       input.agent,
       `${input.agent} · ${path.basename(cwd)}`,
@@ -588,7 +638,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
    * 建 PtySession。新建与 tmux 恢复共用 —— 恢复时 spec 省略,
    * 因为 `new-session -A` 遇到已存在的会话会直接 attach 并忽略命令参数。
    */
-  private spawnPty(
+  private async spawnPty(
     id: string,
     agent: AgentKind,
     title: string,
@@ -597,7 +647,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     rows: number,
     spec: { file: string; args: string[] } | undefined,
     account?: AccountBinding,
-  ): SessionInfo {
+  ): Promise<SessionInfo> {
     const base = spec ?? noopCommand();
     const sessionEnv = { ...(account?.environment ?? {}), ...this.sessionEnv(id) };
     const launch =
@@ -612,15 +662,22 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
             environment: sessionEnv,
           })
         : base;
-    let session: PtySession;
+    let session: PtySession | RemotePtySession;
     try {
-      session = new PtySession({
+      const ptyOptions = {
         id, agent, title, cwd, cols, rows,
         file: launch.file,
         args: launch.args,
         env: spawnEnv(sessionEnv),
         ...(account ? { accountId: account.id, accountName: account.name } : {}),
-      });
+      };
+      session = this.usePtySupervisor && this.ptySupervisorRoot
+        ? await this.ptySupervisorLauncher({
+            root: this.ptySupervisorRoot,
+            createdAt: Date.now(),
+            ...ptyOptions,
+          })
+        : new PtySession(ptyOptions);
     } catch (e) {
       // node-pty 对不存在的可执行文件同步抛 posix_spawnp failed
       throw new SessionError(
@@ -629,10 +686,14 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       );
     }
     this.ptySessions.set(id, session);
-    session.on("output", (dataB64, seq) => this.emit("output", id, dataB64, seq));
-    session.on("state", (info) => this.emit("state", info));
+    this.wirePtySession(session);
     this.emit("state", session.info());
     return session.info();
+  }
+
+  private wirePtySession(session: PtySession | RemotePtySession): void {
+    session.on("output", (dataB64: string, seq: number) => this.emit("output", session.id, dataB64, seq));
+    session.on("state", (info: SessionInfo) => this.emit("state", info));
   }
 
   private async createStructured(
@@ -788,9 +849,9 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   }
 
   /** 用官方 CLI 打开登录终端；managed Claude 在这里生成之后要安全导入的令牌。 */
-  createAccountLogin(spec: AccountLoginSpec, cols: number, rows: number): SessionInfo {
+  async createAccountLogin(spec: AccountLoginSpec, cols: number, rows: number): Promise<SessionInfo> {
     const id = randomUUID();
-    const info = this.spawnPty(
+    const info = await this.spawnPty(
       id,
       spec.binding.agent,
       `${spec.binding.name} · 登录`,
@@ -814,7 +875,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     return this.accountResolver(accountId, agent);
   }
 
-  getPty(sid: string): PtySession | undefined {
+  getPty(sid: string): PtySession | RemotePtySession | undefined {
     return this.ptySessions.get(sid);
   }
 
@@ -827,7 +888,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     return this.list().find((s) => s.id === sid)?.cwd ?? null;
   }
 
-  requirePty(sid: string): PtySession {
+  requirePty(sid: string): PtySession | RemotePtySession {
     const s = this.ptySessions.get(sid);
     if (!s) {
       throw new SessionError(
@@ -909,7 +970,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       await structured.interrupt();
       return;
     }
-    this.requirePty(sid).interrupt();
+    await this.requirePty(sid).interrupt();
   }
 
   /** 终止会话；编排 worker 可保留结构化历史为只读。 */
@@ -942,14 +1003,18 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     }
     const pty = this.requirePty(sid);
     const info = pty.info();
-    pty.dispose();
+    if (pty instanceof RemotePtySession) await pty.kill();
+    else pty.dispose();
     // tmux 下 dispose 只是断开 client,进程还在 server 里活着 —— kill 得说到做到
     if (this.tmuxEnabled) tmux.killSession(sid);
     this.ptySessions.delete(sid);
     this.persistMeta();
     this.emit("state", {
       ...info,
-      status: info.status === "done" ? "done" : "died",
+      // A detached facade already records an explicit kill as `done`; retain
+      // that user-visible distinction instead of turning it into an apparent
+      // owner crash while removing it from this daemon's session table.
+      status: pty instanceof RemotePtySession ? "done" : (info.status === "done" ? "done" : "died"),
     });
   }
 
@@ -977,10 +1042,10 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
         }
       }
     }
-    for (const s of this.ptySessions.values()) s.dispose();
+    const ptyDisposals = [...this.ptySessions.values()].map((session) => Promise.resolve(session.dispose()));
     this.ptySessions.clear();
     const disposals = [...this.structuredSessions.values()].map((s) => s.dispose());
     this.structuredSessions.clear();
-    await Promise.allSettled(disposals);
+    await Promise.allSettled([...ptyDisposals, ...disposals]);
   }
 }

@@ -13,7 +13,6 @@ import {
   renameSync,
   rmSync,
   rmdirSync,
-  statSync,
   writeFileSync,
 } from "node:fs";
 import { createConnection, type Socket } from "node:net";
@@ -47,6 +46,15 @@ import {
   SUPERVISOR_PROTOCOL_VERSION,
   type SupervisorEvent,
 } from "./structured-supervisor.js";
+import {
+  hasPrivateSupervisorDirectoryMode,
+  hasPrivateSupervisorFileMode,
+  isStructuredSupervisorEndpoint,
+  structuredSupervisorPlatformGate,
+  structuredSupervisorRunnerEnvironment,
+  structuredSupervisorTransport,
+  type StructuredSupervisorTransport,
+} from "./structured-supervisor-platform.js";
 /** Kept in sync with the runner without importing its executable module. */
 export const SUPERVISOR_MANIFEST_VERSION = 1;
 
@@ -61,6 +69,8 @@ export interface StructuredSupervisorManifest {
   createdAt: number;
   approvalPolicy: ApprovalPolicy;
   socket: string;
+  /** Omitted only by pre-transport Unix manifests. */
+  transport?: StructuredSupervisorTransport;
   tokenFile: string;
   /** Private owner directory; may differ from a short runtime socket path. */
   sessionDir?: string;
@@ -238,7 +248,27 @@ function privateWrite(file: string, value: unknown): void {
 }
 
 function privateMode(file: string): boolean {
-  try { return (statSync(file).mode & 0o777) === 0o600; } catch { return false; }
+  try {
+    const metadata = lstatSync(file);
+    return (metadata.isFile() || metadata.isSocket()) && !metadata.isSymbolicLink() && hasPrivateSupervisorFileMode(metadata.mode);
+  } catch { return false; }
+}
+
+function privateDirectory(dir: string): boolean {
+  try {
+    const metadata = lstatSync(dir);
+    return metadata.isDirectory() && !metadata.isSymbolicLink() && hasPrivateSupervisorDirectoryMode(metadata.mode);
+  } catch { return false; }
+}
+
+function manifestTransport(manifest: StructuredSupervisorManifest): StructuredSupervisorTransport {
+  return manifest.transport ?? "unix_socket";
+}
+
+function manifestMatchesPlatform(manifest: StructuredSupervisorManifest): boolean {
+  const transport = structuredSupervisorTransport();
+  return transport !== null && manifestTransport(manifest) === transport &&
+    isStructuredSupervisorEndpoint(manifest.socket, transport);
 }
 
 function processAlive(pid: number | undefined): boolean {
@@ -257,7 +287,9 @@ export function readSupervisorManifest(file: string): StructuredSupervisorManife
       v.implementation !== "supervisor" || typeof v.sessionId !== "string" || !SESSION_ID.test(v.sessionId) ||
       typeof v.agent !== "string" || typeof v.title !== "string" || typeof v.cwd !== "string" ||
       typeof v.createdAt !== "number" || typeof v.approvalPolicy !== "string" ||
-      typeof v.socket !== "string" || v.tokenFile !== "token" || typeof v.lifecycleEpoch !== "string" ||
+      typeof v.socket !== "string" ||
+      (v.transport !== undefined && v.transport !== "unix_socket") ||
+      v.tokenFile !== "token" || typeof v.lifecycleEpoch !== "string" || v.lifecycleEpoch.length === 0 ||
       (v.sessionDir !== undefined && (typeof v.sessionDir !== "string" || !path.isAbsolute(v.sessionDir)))
     ) return null;
     return v as StructuredSupervisorManifest;
@@ -349,6 +381,9 @@ export class RemoteStructuredSession extends EventEmitter {
   }
 
   static async attach(manifest: StructuredSupervisorManifest, timeoutMs?: number): Promise<RemoteStructuredSession> {
+    if (!manifestMatchesPlatform(manifest)) {
+      throw new RemoteSupervisorError("supervisor endpoint 与当前平台不兼容", "unsupported_platform");
+    }
     const session = new RemoteStructuredSession(manifest, "supervisor");
     try {
       await session.reconnect(timeoutMs);
@@ -738,6 +773,14 @@ async function terminateNewSupervisorGroup(
       errors: [new RemoteSupervisorError("new supervisor process group was not identified during launch rollback", "cleanup_failed")],
     };
   }
+  // Windows is rejected before detached spawn. Do not turn a PID into a
+  // general-purpose Windows termination authority in this defensive path.
+  if (process.platform === "win32") {
+    return {
+      exited: false,
+      errors: [new RemoteSupervisorError("Windows structured supervisor launch is disabled", "unsupported_platform")],
+    };
+  }
   if (!processGroupAlive(groupId)) return { exited: true, errors: [] };
 
   const errors: Error[] = [];
@@ -781,7 +824,7 @@ function removeNewSupervisorSocket(socketPath: string, socketDir: string): void 
   }
   try {
     const metadata = lstatSync(socketDir);
-    if (metadata.isDirectory() && !metadata.isSymbolicLink() && (metadata.mode & 0o777) === 0o700) {
+    if (metadata.isDirectory() && !metadata.isSymbolicLink() && hasPrivateSupervisorDirectoryMode(metadata.mode)) {
       rmdirSync(socketDir);
     }
   } catch (error) {
@@ -911,7 +954,10 @@ function addRollbackDiagnostics(original: unknown, rollback: FailedStructuredSup
 }
 
 export async function launchStructuredSupervisor(input: LaunchStructuredSupervisorInput): Promise<RemoteStructuredSession> {
-  if (process.platform === "win32") throw new RemoteSupervisorError("structured supervisor requires Unix", "unsupported_platform");
+  const platformGate = structuredSupervisorPlatformGate();
+  if (platformGate) throw new RemoteSupervisorError(platformGate, "unsupported_platform");
+  const transport = structuredSupervisorTransport();
+  if (!transport) throw new RemoteSupervisorError("structured supervisor transport is unavailable", "unsupported_platform");
   if (!SESSION_ID.test(input.sessionId)) throw new RemoteSupervisorError("invalid session id", "bad_request");
   const startupTimeoutMs = input.startupTimeoutMs ?? SUPERVISOR_STARTUP_TIMEOUT_MS;
   if (!Number.isFinite(startupTimeoutMs) || startupTimeoutMs <= 0) {
@@ -927,23 +973,18 @@ export async function launchStructuredSupervisor(input: LaunchStructuredSupervis
   const tokenPath = path.join(sessionDir, "token");
   writeFileSync(tokenPath, `${token}\n`, { mode: 0o600 });
   chmodSync(tokenPath, 0o600);
-  // macOS has a short Unix-domain socket path limit. A compact leaf inside a
-  // long `~/.prospero/.../<uuid>` directory is still too long *to reconnect*
-  // from the daemon: binding after runner chdir works, but the manifest's
-  // absolute endpoint later fails with EINVAL.  Use a random 0700 directory
-  // and a 0600 socket in sticky /tmp instead. The atomically-created parent
-  // proves this launch owns the exact endpoint even in the vanishingly rare
-  // nonce-collision case; the socket itself is chmod 0600 by the transport.
-  // `/tmp` is intentionally literal rather than os.tmpdir(), which is often
-  // another long per-user path on macOS.
+  // macOS has a short Unix-domain socket path limit. Use a random 0700
+  // directory under literal /tmp rather than placing the endpoint below the
+  // potentially long persistent session directory.
   const socketDir = mkdtempSync("/tmp/prospero-supervisor-");
   chmodSync(socketDir, 0o700);
   const socketPath = path.join(socketDir, "s.sock");
+  const lifecycleEpoch = randomUUID();
   const manifest: StructuredSupervisorManifest = {
     version: SUPERVISOR_MANIFEST_VERSION, protocolVersion: SUPERVISOR_PROTOCOL_VERSION,
     implementation: "supervisor", sessionId: input.sessionId, agent: input.agent, title: input.title,
     cwd: input.cwd, createdAt: input.createdAt, approvalPolicy: input.approvalPolicy ?? "standard",
-    socket: socketPath, tokenFile: "token", sessionDir, lifecycleEpoch: randomUUID(), status: "starting",
+    socket: socketPath, transport, tokenFile: "token", sessionDir, lifecycleEpoch, status: "starting",
     ...(input.accountId ? { accountId: input.accountId } : {}), ...(input.accountName ? { accountName: input.accountName } : {}),
   };
   const manifestFile = path.join(sessionDir, "manifest.json");
@@ -957,7 +998,8 @@ export async function launchStructuredSupervisor(input: LaunchStructuredSupervis
     privateWrite(bootstrapFile, {
       version: 1, sessionId: input.sessionId, agent: input.agent, title: input.title, cwd: input.cwd,
       createdAt: input.createdAt, approvalPolicy: input.approvalPolicy, sessionDir,
-      attachmentRoot: path.join(sessionDir, "attachments"), socketPath, socketDir, environment: input.environment,
+      attachmentRoot: path.join(sessionDir, "attachments"), socketPath, transport, lifecycleEpoch,
+      socketDir, environment: input.environment,
       ...(input.codexAppServerArgs ? { codexAppServerArgs: input.codexAppServerArgs } : {}),
       ...(input.accountId ? { accountId: input.accountId } : {}), ...(input.accountName ? { accountName: input.accountName } : {}),
       ...(input.initialAdapterState ? { initialAdapterState: input.initialAdapterState } : {}),
@@ -967,21 +1009,7 @@ export async function launchStructuredSupervisor(input: LaunchStructuredSupervis
       // Do not inherit the daemon environment: account credentials travel only
       // in the 0600 bootstrap file and never through argv or daemon logs.
       env: {
-        PATH: process.env["PATH"] ?? "",
-        // Native CLIs/SDKs use these operational values before their adapter
-        // context is applied. Credentials are intentionally absent here.
-        HOME: process.env["HOME"] ?? "",
-        TMPDIR: process.env["TMPDIR"] ?? "/tmp",
-        LANG: process.env["LANG"] ?? "en_US.UTF-8",
-        LC_ALL: process.env["LC_ALL"] ?? "",
-        SHELL: process.env["SHELL"] ?? "/bin/sh",
-        USER: process.env["USER"] ?? "",
-        TERM: process.env["TERM"] ?? "xterm-256color",
-        COLORTERM: process.env["COLORTERM"] ?? "truecolor",
-        ...(process.env["XDG_RUNTIME_DIR"] ? { XDG_RUNTIME_DIR: process.env["XDG_RUNTIME_DIR"] } : {}),
-        ...(process.env["XDG_CONFIG_HOME"] ? { XDG_CONFIG_HOME: process.env["XDG_CONFIG_HOME"] } : {}),
-        ...(process.env["XDG_CACHE_HOME"] ? { XDG_CACHE_HOME: process.env["XDG_CACHE_HOME"] } : {}),
-        ...(process.env["SSH_AUTH_SOCK"] ? { SSH_AUTH_SOCK: process.env["SSH_AUTH_SOCK"] } : {}),
+        ...structuredSupervisorRunnerEnvironment(process.env),
         PROSPERO_STRUCTURED_SUPERVISOR_CONFIG: bootstrapFile,
       },
     });
@@ -1031,14 +1059,12 @@ export async function launchStructuredSupervisor(input: LaunchStructuredSupervis
 
 /** Scan only private per-session directories; never launch a replacement here. */
 export async function reconnectStructuredSupervisors(root: string): Promise<RemoteStructuredSession[]> {
-  if (process.platform === "win32" || !existsSync(root)) return [];
+  if (structuredSupervisorPlatformGate() || !existsSync(root)) return [];
   const sessions: RemoteStructuredSession[] = [];
   for (const entry of readdirSync(root, { withFileTypes: true })) {
     if (!entry.isDirectory() || !SESSION_ID.test(entry.name)) continue;
     const dir = path.join(root, entry.name);
-    try {
-      if ((lstatSync(dir).mode & 0o777) !== 0o700) continue;
-    } catch { continue; }
+    if (!privateDirectory(dir)) continue;
     const manifest = readSupervisorManifest(path.join(dir, "manifest.json"));
     if (!manifest || manifest.sessionId !== entry.name) continue;
     // A dead PID, stale socket or protocol mismatch is historical/read-only.
@@ -1049,9 +1075,10 @@ export async function reconnectStructuredSupervisors(root: string): Promise<Remo
     // attach the owner of a create() call that already returned failure.
     if (
       manifest.status === "died" || manifest.status === "done" ||
+      !manifestMatchesPlatform(manifest) ||
       !processAlive(manifest.supervisorPid) ||
       !privateMode(path.join(dir, "token")) ||
-      !privateMode(manifest.socket)
+      (manifestTransport(manifest) === "unix_socket" && !privateMode(manifest.socket))
     ) {
       sessions.push(RemoteStructuredSession.unavailable(withOwnerDir));
       continue;

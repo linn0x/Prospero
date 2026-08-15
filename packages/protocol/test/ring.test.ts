@@ -33,6 +33,20 @@ describe("OutputRing", () => {
     expect(ring.since(3)).toEqual([bytes(4, 4)]);
   });
 
+  it("entriesSince 保留 owner 分配的 cursor，并和 gap 语义一致", () => {
+    const ring = new OutputRing(4);
+    ring.push(bytes(1, 1)); // seq1
+    ring.push(bytes(2, 2)); // seq2
+    ring.push(bytes(3, 3)); // seq3, evicts seq1
+
+    expect(ring.entriesSince(1)).toEqual([
+      { seq: 2, data: bytes(2, 2) },
+      { seq: 3, data: bytes(3, 3) },
+    ]);
+    expect(ring.entriesSince(0)).toBeNull();
+    expect(ring.entriesSince(4)).toBeNull();
+  });
+
   it("单块超容也保留最新块", () => {
     const ring = new OutputRing(4);
     ring.push(bytes(1));
