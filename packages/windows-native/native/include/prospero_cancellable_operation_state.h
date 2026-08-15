@@ -101,6 +101,21 @@ class State {
   // refuse to submit a request that could not be cancelled.
   StopGuard BeginStop() { return StopGuard(this); }
 
+  /**
+   * Keep stopping and the native cancellation call atomic with overlapped
+   * submission, then release the issue lock before waiting for borrowers.
+   * Centralising this order prevents a closer from waiting while a borrower
+   * is itself blocked trying to observe `stopped_`.
+   */
+  template <typename Cancel>
+  void StopCancelAndWait(Cancel&& cancel) {
+    {
+      auto stop = BeginStop();
+      std::forward<Cancel>(cancel)();
+    }
+    WaitForBorrowers();
+  }
+
   void WaitForBorrowers() noexcept {
     std::unique_lock<std::mutex> lock(state_mutex_);
     drained_.wait(lock, [this] { return borrowers_ == 0; });

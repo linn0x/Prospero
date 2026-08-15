@@ -96,23 +96,17 @@ class CancelablePipeHandle {
 
  private:
   HANDLE StopAndDrain() noexcept {
-    // Keep the issue guard until CancelIoEx has run.  Without this ordering,
-    // close can cancel an empty handle immediately before another worker
-    // submits ConnectNamedPipe, leaving that future request uncancellable.
-    auto stop = state_.BeginStop();
     HANDLE handle = INVALID_HANDLE_VALUE;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (handle_ == INVALID_HANDLE_VALUE) return INVALID_HANDLE_VALUE;
       handle = handle_;
     }
-    // The endpoint stays open until every borrower has drained. The state
-    // mutex is independent from the issue guard, so completion may call End.
-    CancelIoEx(handle, nullptr);
-    // Do not retain the issue guard while waiting: a borrower that lost the
-    // race must reacquire it, observe stopped_, and unwind its lease.
-    stop.Release();
-    state_.WaitForBorrowers();
+    // Keep the issue guard only through CancelIoEx. Without this ordering,
+    // close can cancel an empty handle immediately before another worker
+    // submits ConnectNamedPipe. The shared state method releases that guard
+    // before draining, so a losing borrower can observe stopped_ and unwind.
+    state_.StopCancelAndWait([handle] { CancelIoEx(handle, nullptr); });
     return handle;
   }
 
