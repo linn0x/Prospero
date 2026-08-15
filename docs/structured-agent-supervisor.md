@@ -65,7 +65,7 @@ macOS limits Unix-domain socket path length. The production launcher therefore a
 
 Do not put a capability token in argv. The launcher writes a protected token file before spawning and passes only the protected bootstrap-file path in its environment; neither stdout/stderr nor argv carries credentials.
 
-Windows structured supervisors are intentionally fail-closed today. A default DACL, random named-pipe path, capability token, PID, or `taskkill` is not a durable ownership or authorization boundary. Before enabling Windows, a Gate must select and implement a native Win32 security boundary with platform tests. `taskkill` is never a normal supervisor-control mechanism; if introduced for Windows, it may only clean up the exact child tree from the launch attempt that just failed.
+Windows does not use this Unix supervisor implementation. Claude Code, Codex, OpenCode and Grok structured sessions use the native **Windows Session Host**: a per-session owner with a verified N-API pipe, DPAPI-held capability, peer identity check, journal and Job Object. `taskkill` remains outside normal session control; use the explicit session Kill operation, which records a terminal fence and terminates the owner Job. The Windows lifecycle, fallback and incident boundaries are documented in [Windows Session Host operations](windows-session-host-operations.md).
 
 The external supervisor protocol is not Codex app-server JSON-RPC. It is a small, versioned Prospero envelope:
 

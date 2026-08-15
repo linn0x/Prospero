@@ -77,12 +77,20 @@ Windows 11 是受支持的 daemon 平台，不只是可以打开仓库或连接�
 | Shell 与 Agent CLI | ✅ 支持 PowerShell/cmd，以及 Claude Code、Codex、OpenCode、Grok、Trae 和自定义 CLI |
 | 结构化聊天 | ✅ Claude Code、Codex、OpenCode、Grok 可用；其余 Agent 使用完整 PTY/TUI |
 | DAG / Goal / Gate / worker 编排 | ✅ 支持手工与自动编排；使用 worktree 时需安装 Git for Windows |
-| daemon 重启时保活 Agent | ⚠️ 尚未支持；Windows 没有 tmux，detached structured supervisor 也仍需 Windows named-pipe/ACL 实现 |
-| CI | ✅ 每次提交在 `windows-latest` 执行安装、类型检查、移动端 lint 和 Node 测试矩阵 |
+| daemon 重启时保活 Agent | ✅ PTY 与 Claude Code / Codex / OpenCode / Grok structured 会话使用每会话 Windows Session Host；daemon 只重连已验证的 owner，不重复启动 agent |
+| 原生分发与 CI | ✅ x64、arm64 都有预编译 N-API 路径；PR 验证原生 ABI/加载拒绝 unsigned artifact，`v*` release 再签名、校验并在两种架构加载 signed artifact |
 
-编排数据会持久保存，因此 Windows daemon 重启后仍能看到 Run、Task、Gate 和工作树记录，并会把失去会话的活动任务
-明确收敛为可诊断、可重试的失败；但当前不能保证原 Agent 进程继续运行。macOS/Linux 上，结构化会话由每会话 detached
-supervisor 托管，可跨 daemon 的 SIGTERM、SIGKILL 与重启；PTY 会话则可选 `--tmux` 托管。
+在 Windows 上，Session Host 而非 daemon 持有 ConPTY、structured adapter、Job Object 和 append-only journal。正常退出或强制结束
+daemon 后，新 daemon 只会以 manifest 的 epoch、PID+FILETIME、pipe peer identity 和 capability 重新 attach；身份不符、host 已死
+或状态不完整时会显示为不可用/只读，而不是静默补开一条命令。原生 binding 在 **host 创建前**缺失、签名/ABI 不通过或能力不足时，
+Windows 会明确使用 daemon 内 `direct` 会话；它不具备重启保活语义。已启动 host 的 attach、身份或 Job 策略错误不会回退到
+direct，以免创建重复 agent。显式 **Kill** 与 daemon 停止不同：Kill 持久化终态 fence 并终止受控 Job；Stop/Interrupt 只请求中断。
+
+这项保证只覆盖 daemon 生命周期，不覆盖 Windows 注销、系统关机/重启、睡眠/断电或 EDR 强制终止。此类场景之后会保留可审计的
+journal/终态历史，但不会自动重放 native 命令或宣称 in-flight turn 已恢复。架构、安全边界、状态含义和操作步骤见
+[Windows Session Host 运维与排障](docs/windows-session-host-operations.md)；N-API 安装、签名和 release 校验见
+[Windows N-API native boundary](docs/windows-native-boundary.md)。macOS/Linux 仍分别使用 detached structured supervisor 与可选
+`tmux` PTY 托管。
 
 Windows 当前没有独立托盘应用，请在 PowerShell 或 cmd 中运行 `prosperod`。命令、配置目录和手机客户端与 macOS 版本一致。
 
@@ -101,6 +109,10 @@ npm ci
 npm run build -w @prospero/daemon
 node apps/daemon/dist/cli.js start --name my-computer
 ```
+
+Windows 的 signed release 包会携带 x64 与 arm64 N-API prebuild；loader 在创建 Session Host 前验证签名、hash、ABI 和能力集。
+直接从源码 checkout 执行 `npm ci`/本机 native build 不会把 unsigned 开发 addon 变成 production artifact，因此会走明确的
+`direct` fallback，而不是伪装成可保活 host。发布包的签名、安装和验收规则见 [Windows N-API native boundary](docs/windows-native-boundary.md)。
 
 ### 2. 构建并安装手机客户端
 

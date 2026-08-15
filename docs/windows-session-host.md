@@ -2,7 +2,7 @@
 
 > 状态：Windows PTY 与 structured vertical 均已实现。目标平台为 Windows 11；`ConPTY` 的 API 最低支持 Windows 10 1809，但本项目不因此降低产品支持基线。
 >
-> 本文是 [structured-agent-supervisor.md](structured-agent-supervisor.md) 的 Windows 对应设计。已落地的 PTY 路径提供 **daemon 重启可存活** 的 Session Host；structured 会话仍不改变手机—daemon 的 E2E 鉴权边界，也不声称已有这一能力。
+> 本文是 [structured-agent-supervisor.md](structured-agent-supervisor.md) 的 Windows 对应实现说明。PTY 与 Claude Code、Codex、OpenCode、Grok structured 会话均可由 **daemon 重启可重连** 的 Session Host 托管；不改变手机—daemon 的 E2E 鉴权边界。日常重启、故障和不承诺的机器生命周期场景见 [Windows Session Host 运维与排障](windows-session-host-operations.md)。
 
 ## 结论
 
@@ -16,21 +16,20 @@ Windows host 必须经原生 Win32 边界提供以下能力：
 - `TerminateJobObject` 的树级显式 kill；以及
 - Windows ACL/DPAPI/重解析点安全的状态目录操作。
 
-现有 Node 和 `node-pty` API 不完整暴露这些保证。PTY 已通过预编译 N-API Session Host 使用这条边界；只有经过签名加载、ConPTY、Job、状态目录和受认证 pipe 全部可用时才声明 durable。任一原生 prerequisite 不可用时，Windows 明确降级为 daemon 内 direct PTY，绝不宣称独立生命周期。structured adapter 仍是 daemon 内实现。
+现有 Node 和 `node-pty` API 不完整暴露这些保证。PTY 与 structured 都通过预编译 N-API Session Host 使用这条边界；只有经过签名加载、完整能力集、状态目录、受认证 pipe 和 Job 全部可用时才声明 durable。原生 binding 在 **host 创建前**不可用时，PTY 与 structured 可以明确降级为 daemon 内 `direct` 会话；host 已启动后的 attach、identity、pipe、journal 或 Job-policy 错误会 fail closed，绝不通过补开 direct session 制造重复 agent。
 
 ## 当前实现审计（2026-08-15）
 
-| 区域 | 已有行为 | Windows 缺口 / 结论 |
+| 区域 | 已有行为 | 恢复与边界 |
 | --- | --- | --- |
-| [`windows-pty-host.ts`](../apps/daemon/src/windows-pty-host.ts) / [`windows-pty-session.ts`](../apps/daemon/src/windows-pty-session.ts) | 每个 Windows PTY 使用 detached Session Host；host 持有 ConPTY、xterm reducer、output ring/journal 与 provider Job。daemon 只持有 `RemoteWindowsPtySession` facade。 | manifest+PID/FILETIME+authenticated pipe 只允许 attach，不从 stale owner 重启；kill 先落 terminal fence，再 `TerminateJobObject`/关闭 ConPTY。`pty-session.ts` 只在 native unavailable 时作为明确 non-durable fallback。 |
-| [`tmux.ts`](../apps/daemon/src/tmux.ts) 与 [`session-manager.ts`](../apps/daemon/src/session-manager.ts) | Unix/macOS 的 PTY 可由 tmux 接管；`disposeAll()` 只断 client，`kill()` 会 `tmux.killSession()`。 | `tmuxPath("win32")` 明确返回 `null`，Windows 回落为直接 PTY；`pty-sessions.json` 不是活进程身份或 screen 的恢复依据。 |
-| [`structured-supervisor.ts`](../apps/daemon/src/structured-supervisor.ts) | Unix socket + 256-bit token + 有序 journal/replay；显式 `session.kill` 与客户端断开分离。 | `startStructuredSupervisor()` 在 `win32` 直接报 `unsupported_platform`。Unix socket stale probe、`chmod(0600)`、socket unlink 都不能移植为 Pipe ACL 语义。 |
-| [`structured-supervisor-client.ts`](../apps/daemon/src/structured-supervisor-client.ts) / runner | Unix 用 `detached: true`、负 PID process group 回滚、短 `/tmp` socket；manifest 目前仅记录 PID，无 creation time。 | `launchStructuredSupervisor()` 和 `reconnectStructuredSupervisors()` 在 Windows 分别拒绝/返回空。负 PID signal、`SIGTERM/SIGKILL`、`/tmp` 均无等价物；PID 单独不能抵抗 PID reuse。 |
-| [`session-manager.ts`](../apps/daemon/src/session-manager.ts) | production Unix 才启用 remote structured supervisor；启动时先 reattach manifest，失败者只读；`disposeAll()` 对 remote facade 只关 socket。 | `useStructuredSupervisor` 明确要求 `process.platform !== "win32"`。Windows 恢复会跳过所有 host manifest；in-process `structured-sessions.json` 不能拥有活 adapter。 |
+| [`windows-pty-host.ts`](../apps/daemon/src/windows-pty-host.ts) / [`windows-pty-session.ts`](../apps/daemon/src/windows-pty-session.ts) | 每个 Windows PTY 使用 detached Session Host；host 持有 ConPTY、xterm reducer、output ring/journal 与 provider Job。daemon 只持有 `RemoteWindowsPtySession` facade。 | manifest + PID/FILETIME + authenticated pipe 只允许 attach，不从 stale owner 重启；kill 先落 terminal fence，再 `TerminateJobObject`/关闭 ConPTY。`pty-session.ts` 仅在 pre-host native unavailable 时作为明确 non-durable fallback。 |
+| [`windows-structured-session-host.ts`](../apps/daemon/src/windows-structured-session-host.ts) / [`windows-structured-session-client.ts`](../apps/daemon/src/windows-structured-session-client.ts) | 每个 Claude/Codex/OpenCode/Grok structured 会话也使用 detached host；host 拥有 adapter、pending approval/question、PSJ2 journal 和 Job，daemon 为 remote facade。 | daemon offline 时请求保持 pending；原 `reqId`、event sequence 和 terminal kill ledger 用于 reattach。native binding 缺失/ABI 或能力不足才回退 in-process；provider Job/identity 失败不降级。durable structured attachment custody 尚未实现，会明确拒绝该 attachment，而不改走不安全的 Node 路径。 |
+| [`session-manager.ts`](../apps/daemon/src/session-manager.ts) | Windows 启动扫描 PTY 与 structured host record，先 reattach 既有 owner，再恢复 legacy in-process history；`disposeAll()` 对 Windows remote facade 只断 pipe client。 | 有效 owner 为 `hosted`；in-process 为 `direct`；manifest 无法安全 attach 为 `unavailable`。恢复扫描不会 launch replacement，也不会重放可能已送达 provider 的 mutation。 |
+| [`tmux.ts`](../apps/daemon/src/tmux.ts) 与 Unix structured supervisor | macOS/Linux 继续使用 tmux 或 Unix supervisor；`tmuxPath("win32")` 返回 `null`。 | Windows 不把 Unix socket、POSIX mode bits、负 PID signal 或 `taskkill` 伪装成同一安全语义。 |
 | [`control-socket.ts`](../apps/daemon/src/control-socket.ts) | Windows 路径已是哈希化 `\\\\.\\pipe\\prospero-…`，仍用 Node `net.createServer()` 和 NDJSON token。 | Node 路径名不是 DACL：当前代码不能传入 `SECURITY_ATTRIBUTES`，`chmod(0600)` 在 Windows 不形成 ACL 保证，且没有 `GetNamedPipeClientProcessId` / token SID 检查。它是 worker 控制 pipe，不应误当 session host pipe。 |
-| 启动与恢复 | [`ws-server.ts`](../apps/daemon/src/ws-server.ts) 先开 control socket，再恢复 PTY/structured，最后 reconcile orchestration。 | Windows PTY 恢复逐个通过 native state boundary 读取 manifest/record，再完成 manifest—PID/FILETIME—pipe identity 核验；stale owner 只读且永不自动 spawn replacement。 |
+| 启动与恢复 | [`ws-server.ts`](../apps/daemon/src/ws-server.ts) 先开 control socket，再恢复 PTY/structured，最后 reconcile orchestration。 | Windows 会逐个通过 native state boundary 读取 manifest/record，并完成 manifest—PID/FILETIME—pipe identity 核验；stale owner 只读且永不自动 spawn replacement。 |
 
-现有 Unix 覆盖了 transport/replay 的重要语义，但 `structured-supervisor*.test.ts`、`daemon-supervisor-recovery.e2e.test.ts` 和 launch rollback 测试均以 `skipIf(process.platform === "win32")` 排除 Windows。当前 Windows CI 只能证明常规 Node 行为，不能证明 durable host。
+Unix supervisor 测试仍以 `skipIf(process.platform === "win32")` 排除 Windows，这是两套 transport 的刻意分离，不是 Windows structured host 缺失。Windows host 的 portable contract/recovery coverage 位于 `windows-session-host*.test.ts`、`windows-pty-session.test.ts` 与 `windows-structured-session-host.test.ts`；Windows x64/arm64 CI 另行构建真实 N-API addon。`v*` release 必须在两种架构通过 signed production loader，并运行 signed Session Host ConPTY worker。该证据不等同于机器重启、logoff、sleep 或企业 EDR 的实机存活证明。
 
 ## 目标边界
 
@@ -42,7 +41,7 @@ prosperod daemon（可重启、可升级、无会话树所有权）
         │ host Named Pipe：ACL + peer token + capability + protocol version
         ▼
 每会话 Windows Session Host（detached，唯一 owner）
-        ├── durable manifest / snapshot / append journal / attachment custody
+        ├── durable manifest / snapshot / append journal
         ├── structured：adapter + native provider connection/child
         └── PTY：terminal reducer + ConPTY + native child Job Object
                                       │
@@ -54,7 +53,7 @@ prosperod daemon（可重启、可升级、无会话树所有权）
 
 对于 PTY，host 持有 ConPTY 的输入/输出、`@xterm/headless` snapshot 和 output ring。对于 structured，host 持有 adapter 的 SDK/stdio/HTTP 连接及其 pending approval callback；daemon 内只有 `RemotePtySession` / `RemoteStructuredSession` facade。两个会话类型共享同一 manifest、IPC、journal、恢复与 kill 规则。
 
-当前 structured host 通过 `windows-structured-session-host.ts` 运行 Claude/Codex/OpenCode/Grok adapter 入口，并以通用 PSJ2 journal 保存标准化 `AgentEventBody`（含原始 approval/question `reqId` 与 session `evSeq`）。daemon 的 Windows facade 只持有 native pipe client/lease/cursor；`disposeAll()` 只断开该 client，不会代替离线用户批准或拒绝待处理 callback。若 Windows N-API prebuild 不可用，SessionManager 保留旧 in-process structured 路径并明确标为 `hosting: "in_process"`，不声称 durable。若适配器不能向 host 提供可经 PID+FILETIME 验证并加入 Session Job 的 provider child（当前 Claude SDK 属于此类），创建会 fail closed 为 `provider_job_incompatible`，绝不以 `taskkill` 或 PID 终止伪造树所有权。
+当前 structured host 通过 `windows-structured-session-host.ts` 运行 Claude/Codex/OpenCode/Grok adapter 入口，并以通用 PSJ2 journal 保存标准化 `AgentEventBody`（含原始 approval/question `reqId` 与 session `evSeq`）。host 在 adapter 启动前已加入 `KILL_ON_JOB_CLOSE` Job；适配器产生 child 时再以 PID+FILETIME 审计其归属。daemon 的 Windows facade 只持有 native pipe client/lease/cursor；`disposeAll()` 只断开该 client，不会代替离线用户批准或拒绝待处理 callback。若 Windows N-API prebuild 不可用，SessionManager 保留旧 in-process structured 路径并将 provenance 报为 `direct`，不声称 durable。parent Job、provider Job 或 identity 审计失败会 fail closed，绝不以 `taskkill` 或 PID 终止伪造树所有权。
 
 ### 不共享的两个本机 IPC 边界
 
@@ -74,7 +73,7 @@ prosperod daemon（可重启、可升级、无会话树所有权）
 要求如下：
 
 - 仅 native host 管理 `HPCON`、进程与 pipe handle；daemon 永不直接保存/关闭它们。
-- host 在独立 reader worker 上持续 drain output，传入 xterm reducer，并以持久 `pty.output` journal record 再向 daemon 广播。resize 先持久化 intent，再 `ResizePseudoConsole`，最后广播新的 cols/rows。
+- host 在独立 reader worker 上持续 drain output，传入 xterm reducer，并将 provider-neutral PTY output event 序列化写入 journal 后再供 daemon replay。resize、input、interrupt 和 kill 也经同一 command/journal fence，不让 daemon 持有 HPCON。
 - host 只向目标进程传递最小 handle list；Job handle、journal、manifest token、host control pipe 不可继承。不可把 `bInheritHandles=true` 当作控制边界。
 - `ClosePseudoConsole` 会向仍连接的 client 发 `CTRL_CLOSE_EVENT`。较旧 Windows 版本中如果输出 pipe 未关闭或持续 drain，调用可能无限等待；它不得运行在唯一 output reader 线程。实现必须先做 Job Object 终止/等待、关闭 host input、继续 drain output，最后在独立线程 close HPCON。Windows 11 24H2 改善了这个行为，但不能把 24H2 当唯一受支持的 Windows 11 版本。[Microsoft: ClosePseudoConsole](https://learn.microsoft.com/en-us/windows/console/closepseudoconsole)
 
@@ -89,7 +88,7 @@ native launcher 的规则：
 1. 以 `CreateProcessW` 启动 host（完整 `lpApplicationName`、Unicode argv/environment、无可见 console 的显式 creation-flag 组合），不从 shell 拼接 command line。host 自身的 detached 启动和 ConPTY target 的 `STARTUPINFOEXW` 启动是两条分别测试的路径，不能把一组 creation flags 盲目复用到两者。
 2. 先以 `IsProcessInJob` 检测 daemon 是否被外部 Job 管理。若它位于 `KILL_ON_JOB_CLOSE` Job，只有该外层 Job 显式允许 `CREATE_BREAKAWAY_FROM_JOB` 时才能让 host break away；不允许时，**拒绝创建 durable session** 并报 `parent_job_prevents_detach`，不要默默降级为“可恢复”。[Microsoft: Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects) [Microsoft: process creation flags](https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags)
 3. host 为其实际 agent/provider tree 创建一个未命名 Session Job，设置 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，不设置 `BREAKAWAY_OK` 或 `SILENT_BREAKAWAY_OK`，并保留唯一非继承的 job handle。
-4. target 要在创建时或被 resume 前加入该 Job。若 provider 已在不可嵌套/不兼容 Job，或 `AssignProcessToJobObject` 失败，记录 `provider_job_incompatible`、清理本次 host，不启动 durable session。Windows 11 支持 nested jobs 不表示每个第三方 provider 都兼容它。
+4. host 在 adapter factory 运行前已经加入该 Job，因此 provider child 继承 containment；adapter 注册 child 时只用 PID+FILETIME 审计它确实属于该 Job，不在 spawn 后补 assign 而重开 race。若 Job membership 不兼容或审计失败，清理本次 host，不启动 durable session。Windows 11 支持 nested jobs 不表示每个第三方 provider 都兼容它。
 5. 显式 kill 走 `TerminateJobObject`，而不是 `taskkill /T`、按进程名枚举或只杀 manifest PID。host 退出/被 force-kill 时其唯一 job handle 关闭，`KILL_ON_JOB_CLOSE` 作为最终收口。
 
 这给 Prospero 一个可审计的 owner tree，不给 provider 任意 breakaway 权。Job Object 默认会将 `CreateProcess` 的 child 置入 job；一旦 allow breakaway，就会失去完整子树可见性/kill 承诺，故默认禁止。[Microsoft: Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)
@@ -98,10 +97,10 @@ native launcher 的规则：
 
 ### Pipe 创建
 
-每个 epoch 创建随机且不可预测的 endpoint，例如：
+每个 epoch 创建随机且不可预测的 endpoint，例如 PTY 的：
 
 ```text
-\\.\pipe\prospero.v2.<logon-sid-hash>.<session-id>.<epoch-random>
+\\.\pipe\prospero.pty.<session-id>.<epoch>
 ```
 
 host 在 pipe 已由 `CreateNamedPipeW` 成功创建、DACL 已读取回核验后，才可以把 endpoint 写入 manifest。第一实例使用 `FILE_FLAG_FIRST_PIPE_INSTANCE`，message mode，`PIPE_REJECT_REMOTE_CLIENTS`；如需并发 handoff 则由 host 自己创建额外实例，所有实例使用同一经过验证的 DACL。Pipe 名有 256 字符上限，且不区分大小写，设计不得从长工作目录派生。[Microsoft: CreateNamedPipe](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-createnamedpipea)
@@ -117,33 +116,29 @@ host 在 pipe 已由 `CreateNamedPipeW` 成功创建、DACL 已读取回核验�
 
 ### 双重认证与 lease
 
-每个连接先受 pipe DACL 限制，再完成以下无副作用握手；未完成前只允许固定大小 `hello`，不允许 subscribe、send、kill 或任意 adapter call：
+每个连接先受 pipe DACL 限制，再完成以下无副作用握手；未完成前只允许固定大小 `hello`，不允许 replay、send、kill 或任意 adapter call：
 
 ```json
 {
-  "v": 2,
-  "method": "host.hello",
-  "params": {
-    "sessionId": "…",
-    "epoch": "…",
-    "daemonInstanceId": "uuid",
-    "daemonPid": 1234,
-    "daemonCreationTimeFileTime": "134001234567890000",
-    "capability": "base64url-256-bit",
-    "lastAckedSeq": 912
-  }
+  "version": 2,
+  "type": "hello",
+  "sessionId": "…",
+  "epoch": "…",
+  "daemon": { "pid": 1234, "creationTime100ns": "134001234567890000" },
+  "nonce": "base64url-random",
+  "proof": "HMAC(capability, canonical hello material)"
 }
 ```
 
-host 要在**读到 hello 后**调用 `GetNamedPipeClientProcessId`，以 `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE)` 打开该 PID，调用 `GetProcessTimes` 读 creation time，并和 hello 中的 PID/creation time 及同一连接的 impersonated token 比对。token 比对使用 `ImpersonateNamedPipeClient` → `OpenThreadToken`/`GetTokenInformation`（`TokenUser`、logon SID、integrity level）→ 总是 `RevertToSelf`。任一步失败则断开，绝不能在 host 自身权限下继续执行请求；微软也明确要求 impersonation 失败时不执行 client 请求。[Microsoft: GetNamedPipeClientProcessId](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getnamedpipeclientprocessid) [Microsoft: ImpersonateNamedPipeClient](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-impersonatenamedpipeclient)
+host 在**首帧 read 后**取 native `PipePeerIdentity`：`GetNamedPipeClientProcessId`/`GetProcessTimes` 得到 PID+FILETIME，且在 impersonation 下读取 `TokenUser` SID 与 `TokenSessionId`。它必须与 hello 的 daemon identity 匹配，随后才验证 capability HMAC proof 并回送 host-signed `welcome`。任一步失败即断开，绝不能在 host 自身权限下继续执行请求；微软也明确要求 impersonation 失败时不执行 client 请求。[Microsoft: GetNamedPipeClientProcessId](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getnamedpipeclientprocessid) [Microsoft: ImpersonateNamedPipeClient](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-impersonatenamedpipeclient)
 
 capability 是另一层 256-bit constant-time comparison，并有每连接随机 challenge/response，防止普通 pipe client 或旧 connection replay。daemon 以 DPAPI current-user 密文保存 capability（文件只含版本、key id、密文和 session/epoch binding，manifest 不含 raw token）；raw token 不得出现在 argv、environment、日志、crash report、WebSocket、状态文件或 error message。DPAPI 提高静态文件泄露门槛，不把同一受损 user principal 变成可信边界。
 
-host 每时刻只授予一个 `daemonInstanceId` 可变命令 lease。一个已认证新连接只能在旧连接已断开，或收到同 capability 的有序 `host.handoff` 后取代 lease；它不能让两个 daemon 同时发送 non-idempotent commands。read-only status 可以被独立短连接获取，但仍需认证并限流。
+host 每时刻只授予一个 daemon process identity 的可变命令 lease。socket 断开不会杀 host 或立即清除 lease；lease 有界过期，新的认证 daemon 才能取得它。server-side read-only method 可以免 lease，但仍必须先完成认证；两个 daemon 不能同时发送 mutation。
 
 ### PID + creation time 的用途
 
-PID 从不单独成为授权或 kill 依据。manifest 中记录 host 的 `{ pid, creationTimeFileTime }`，启动恢复或 force-kill 时必须以受限 process handle 重新读 `GetProcessTimes`，严格匹配后才可 connect 或终止。`GetProcessTimes` 返回的 creation time 是 FILETIME；以十进制字符串持久化以避免 JavaScript number 精度截断。查询所需的最小访问权是 `PROCESS_QUERY_LIMITED_INFORMATION`（或更高的 query right）。[Microsoft: GetProcessTimes](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocesstimes) [Microsoft: process access rights](https://learn.microsoft.com/en-us/windows/win32/procthread/process-security-and-access-rights)
+PID 从不单独成为授权或 kill 依据。manifest 中记录 host 的 `{ pid, creationTime100ns }`；启动恢复与内部 exact-process rollback 都必须以受限 process handle 重新读 `GetProcessTimes`，严格匹配后才可 connect 或终止。`GetProcessTimes` 返回的 creation time 是 FILETIME；以十进制字符串持久化以避免 JavaScript number 精度截断。当前没有公开的 force-kill CLI；运维只能使用显式 `session.kill` 或将不可达 host 标为 `unavailable`，不能按 PID 手工终止。查询所需的最小访问权是 `PROCESS_QUERY_LIMITED_INFORMATION`（或更高的 query right）。[Microsoft: GetProcessTimes](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocesstimes) [Microsoft: process access rights](https://learn.microsoft.com/en-us/windows/win32/procthread/process-security-and-access-rights)
 
 同样，host 检查 daemon peer tuple 防止其把断开的 PID 值误关联到已复用的新进程。PID/creation time 不证明进程“良性”，只消除 PID reuse 和 stale-manifest 的错杀类别；有效 DACL、capability、protocol epoch 仍是必要条件。
 
@@ -153,51 +148,43 @@ PID 从不单独成为授权或 kill 依据。manifest 中记录 host 的 `{ pid
 
 ```text
 session-host/<session-id>/
-  manifest.json             # 小、原子替换、无 secret
-  capability.dpapi          # DPAPI 密文，非 raw token
-  snapshot.json             # reducer + native resume cursor + terminal snapshot
-  journal-000017.psj        # append-only framed records
-  attachments/<attachment>  # host-owned immutable copies，ACL/reparse-safe
+  manifest.json             # schema 2，原子替换，无 raw secret
+  credential.dpapi          # DPAPI current-user 密文，非 raw capability
+  journal.psj2              # framed durable event/command/terminal record
+  snapshot.psj2.json        # reducer、command ledger、terminal fence
+  provider.record.json      # discovery metadata；不授予 pipe/owner 权限
+  host.bootstrap.json       # detached host 一次性消费后删除
 ```
 
 ### `manifest.json`（schema 2）
 
 ```json
 {
-  "schema": 2,
+  "schemaVersion": 2,
+  "protocolVersion": 2,
   "implementation": "windows-session-host",
   "sessionId": "2d0a…",
-  "kind": "pty",
-  "agent": "codex",
-  "createdAt": 1786782000000,
-  "lifecycleEpoch": "443a…",
-  "state": "running",
-  "host": {
-    "pid": 4180,
-    "creationTimeFileTime": "134001234567890000",
-    "exe": "C:\\…\\node.exe"
-  },
-  "ipc": {
-    "protocolVersion": 2,
-    "pipeName": "\\\\.\\pipe\\prospero.v2.…",
-    "aclProfile": "current-logon-sid-v1",
-    "remoteClients": "rejected",
-    "capabilityStorage": "capability.dpapi"
-  },
+  "epoch": "443a…",
+  "pipeName": "\\\\.\\pipe\\prospero.pty.2d0a….443a…",
+  "stateDirectory": "C:\\…\\windows-session-host\\2d0a…",
+  "aclProfile": "current-logon-token-v1",
   "owner": {
-    "job": "session-job",
-    "killOnClose": true,
-    "breakaway": "forbidden"
+    "pid": 4180,
+    "creationTime100ns": "134001234567890000"
   },
-  "journal": { "generation": 17, "snapshotSeq": 900, "lastSeq": 912 },
-  "native": { "providerCursor": { "threadId": "…" } },
+  "nativeAbiVersion": 3,
+  "credentialFile": "credential.dpapi",
+  "journalFile": "journal.psj2",
+  "snapshotFile": "snapshot.psj2.json",
+  "status": "active",
+  "createdAt": 1786782000000,
   "updatedAt": 1786782012345
 }
 ```
 
-`state` 包括 `preparing | starting | ready | running | waiting_approval | waiting_input | completed | kill_requested | killed | died | unavailable`。`host` creation time、epoch、pipe name 和 last sequence 是恢复安全条件，不是 UI 的可修改元数据。manifest 要先写 `preparing`，host 建 pipe/Job 后写 `ready`；若 launch 回滚，应保留 `died` 审计 manifest 而不是删除整目录。
+严格 parser 只接受上述固定字段，以及 `status: active | terminal | failed`。UI `running`、`waiting_approval`、`waiting_input`、`done`、`died` 是 journal/snapshot reducer 的会话状态，不能伪造为 manifest 的 owner 状态。epoch、owner PID+FILETIME、pipe name、state directory 与 N-API ABI 是 attach 安全条件，不是 UI 可修改元数据；launch rollback 保留 `failed` manifest 供 discovery 标成不可用，而不是删除整目录。
 
-通过临时同目录文件、`FlushFileBuffers`、native atomic replace（例如 `ReplaceFileW`/等价受控 rename）写 manifest 与 snapshot。最后一次写失败保持旧文件可解析；任何损坏/未知 schema/ACL 不合格的 manifest 都是 `unavailable`，只读且不得自动覆盖。
+native secure-state API 以 current-user DACL、reparse-point 检查和受控 atomic replacement 写入这些固定文件名。任何损坏、未知 schema、ABI 不匹配或 state root 不匹配的 manifest 都是 `unavailable`，只读且不得自动覆盖。
 
 ### `.psj` journal（schema 2）
 
@@ -209,50 +196,43 @@ magic "PSJ2" | payloadLength:u32le | crc32c:u32le | UTF-8 JSON payload
 
 ```json
 {
-  "v": 2,
+  "schemaVersion": 2,
+  "kind": "event",
   "sessionId": "2d0a…",
   "epoch": "443a…",
   "seq": 912,
-  "at": 1786782012345,
-  "type": "pty.output",
-  "body": { "dataB64": "…", "cols": 120, "rows": 40 },
-  "commandId": null
+  "payload": { "provider": "pty", "type": "output", "dataB64": "…" }
 }
 ```
 
-有效 `type` 至少包括：`host.started`、`pty.output`、`pty.resize`、标准化 structured `agent.event`、`permission.request/resolved`、`question.request/resolved`、`command.accepted`、`command.result`、`interrupt.requested`、`kill.requested`、`job.terminated` 与 `host.terminal`。record 必须 session/epoch/seq 连续、大小受限、校验和正确；末尾不完整 frame 仅可作为 interrupted tail 丢弃，后续 seq 不得跨过它伪造连续性。
+每个 frame 是 `PSJ2` magic、little-endian payload length、CRC-32C 与 UTF-8 JSON。第一条是 `kind: "base"`，后续只允许严格连续的 `event | command | terminal` record；mutating command 才带 `commandId`。PTY output 与标准化 structured event 都位于 provider-neutral `payload`。不完整的**最后一帧**是唯一可接受的 crash tail；CRC、session、epoch、schema 或 sequence 错误都使恢复 fail closed。
 
-append 后先 `FlushFileBuffers`，再更新内存 ring/通知 IPC client；这保证 daemon restart 只会 at-least-once replay，并按 `(sessionId, epoch, seq)` 去重。它不保证 native provider 的 exactly-once execution：若 host 在 provider 已接受 `send` 而 `command.result` 落盘前崩溃，command 标为 `unknown_outcome`，不得静默重发。
+host 先经 native secure-state boundary durably写入 record，再更新内存 replay state/回复 client；reconnect 因而是 at-least-once，daemon 按 `(sessionId, epoch, seq)` 去重。它不保证 native provider exactly once：若 provider 已接受 `send` 而 durable result 未写入，host 会竖起 `unknown_command_outcome` terminal fence，不得静默重发。
 
-`snapshot.json` 包含 reducer 状态、pending request IDs、terminal fence、PTY ANSI snapshot/output cursor 或 structured provider resume cursor、`snapshotSeq`。compaction 顺序固定为：flush journal → 原子 snapshot at `N` → 创建并 flush new generation → 原子 manifest 指向 new generation → 最后保留或延迟删除旧 generation。崩溃时允许重复 replay，不允许少事件；retention advancement 回 `gap: true`，daemon 必须取得 snapshot 而不是声称精确增量。
+`snapshot.psj2.json` 是 `{ sessionId, epoch, lastSeq, terminal, commands, state }`：`state` 由 PTY 或 structured reducer 提供，`commands` 是 completed mutation 的 idempotency ledger。compaction 顺序为先原子写 snapshot at `N`，再以新的 base record 重置 `journal.psj2`；崩溃时两者并存仍可完整验证与 replay。retention advancement 返回 `gap: true`，daemon 必须使用 snapshot，不得把不完整增量称为精确 replay。
 
 ## 生命周期与失败语义
 
 ```text
-                 +-- launch failure --> died (audit-only)
-preparing -> starting -> ready -> running <-> waiting_approval
-                                      |  \-> waiting_input
-                                      |            |
-                                      +--------> completed -- send --> running
-                                      |
-                               interrupt (nonterminal)
-                                      |
-                                      v
-                              kill_requested -> killed
+launch -> manifest active -> host owns live reducer/provider
+                 |                    |
+                 |                    +-- explicit kill --> terminal manifest + terminal snapshot
+                 |
+                 +-- launch rollback --> failed manifest (read-only/unavailable facade)
 
-any live state -- host identity absent --> died (read-only)
-any live state -- identity/ACL/pipe unverifiable --> unavailable (read-only, not presumed dead)
+active manifest + absent owner / bad identity / pipe / state --> unavailable or died facade;
+the recovery scan never publishes a replacement owner.
 ```
 
 | 事件 | required action | 不得发生的事 |
 | --- | --- | --- |
 | daemon 正常退出 / `SIGTERM` 对 daemon | daemon 仅关闭 host pipe facade；host 和 Session Job 保持运行，继续 journal，pending approvals 保持 pending。 | `disposeAll()` 不得向 host 发送 interrupt、dispose、kill，不能关闭 HPCON/Job。 |
-| daemon 被强杀 | host 收到 broken pipe 后不作 native cancel；新 daemon 通过 manifest identity + pipe handshake 重连并从 `lastAckedSeq` replay。 | 不得因 daemon 消失 auto-approve、auto-deny（除非预先记录的显式 policy timeout），或启动第二个 host。 |
-| host 自身 crash / OS 强杀 host | host 的 Session Job handle 关闭，应终止受控 provider tree；下一 daemon 发现 host PID/creation time 不存在，暴露 `died` history 与 journal tail。 | 不得把 PID reuse 的进程视为 owner，或自动重新执行上一条 queued/provider command。 |
-| `session.interrupt` | journal `interrupt.requested`，尽力通知 adapter / 写 Ctrl-C；会话继续可用。 | 不得把 interrupt 当作 tree kill 或把它写成 terminal fence。 |
-| `session.kill` | 先持久 `kill_requested` fence 与 commandId，拒绝后续 mutation；host 取消 adapter 后 `TerminateJobObject`，wait/记录 `job.terminated`，持久 `killed`，最后关闭 pipe/exit。重复 commandId 回同一结果。 | 不得仅 kill manifest PID、按名称扫描、`taskkill /T` 猜树，或在 event late arrival 时复活 session。 |
-| daemon admin/repair force-kill | 操作工具必须要求 session ID，读取 manifest 后匹配 PID + creation time + host pipe `status` epoch，才用受限 host handle `TerminateProcess`；等待 handle signaled，Job close 收口。 | identity 不匹配/查询失败时不得发 signal；状态改 `unavailable` 并请求人工处理。 |
-| rolling upgrade | 新 daemon 先做 read-only validation；通过 authenticated handoff 取得 lease 后旧 daemon 关闭 facade。 | 两个 daemon 同时发送 mutation；为了升级 kill 运行中 host。 |
+| daemon 被强杀 | host 收到 broken pipe 后不作 native cancel；新 daemon 通过 manifest identity + pipe handshake 重连并从 durable replay cursor 恢复。 | 不得因 daemon 消失 auto-approve、auto-deny（除非预先记录的显式 policy timeout），或启动第二个 host。 |
+| host 自身 crash / OS 强杀 host | host 的 `KILL_ON_JOB_CLOSE` Job 收口受控 provider tree；下一 daemon 发现 host PID/creation time 不存在，暴露只读 `died`/`unavailable` history 与可验证 journal tail。 | 不得把 PID reuse 的进程视为 owner，或自动重新执行上一条 queued/provider command。 |
+| `session.interrupt` | 经 host command journal 尽力通知 adapter / 写 Ctrl-C；会话继续可用。 | 不得把 interrupt 当作 tree kill 或把它写成 terminal fence。 |
+| `session.kill` | 先形成 durable terminal command/ledger，并拒绝后续 mutation；structured kill 会在 provider action 前另记 `kill_requested` intent。host 取消 adapter 后终止 Job、持久 terminal snapshot/manifest，最后关闭 pipe/exit。重复 commandId 回同一结果。 | 不得仅 kill manifest PID、按名称扫描、`taskkill /T` 猜树，或在 event late arrival 时复活 session。 |
+| daemon admin/repair force-kill | 当前没有公开的 force-kill CLI。正常路径是 authenticated `session.kill`；host 不可达时保留证据并标 `unavailable`。native exact PID+FILETIME terminate 仅用于受控 launch rollback/内部路径。 | 不得用 `taskkill /T`、按名称或裸 PID 终止；不得为「修复」删除 manifest/state 或启动 replacement。 |
+| rolling upgrade | 新 daemon 先做 read-only validation；旧 daemon 关闭 facade 后，新 daemon 在 bounded mutation lease 可取得时继续。 | 两个 daemon 同时发送 mutation；为了升级 kill 运行中 host。 |
 
 approval/question 的底线与 Unix supervisor 一致：daemon offline 表示等待，不表示允许。host 从 journal/snapshot 重放原 `reqId`；reply 只接受该 ID，先持久 resolution 再转发 adapter。host 崩溃后无法泛化重建 SDK callback 时标 `needs_reconciliation`，不伪造 reply。
 
@@ -265,11 +245,11 @@ approval/question 的底线与 Unix supervisor 一致：daemon offline 表示等
 | token 出现在日志、argv、环境、manifest | raw token 仅 host/daemon 内存与 DPAPI ciphertext；bootstrap 只含密文路径；redact error。 | 同一用户可运行任意代码或读 host 内存时，DPAPI current-user 不能保护它。 |
 | PID reuse 导致 attach/kill 错对象 | manifest 记录 FILETIME creation time；每次 `OpenProcess` 后重读匹配；Job handle 而非 PID 负责常规 kill。 | image path/hash 是附加诊断，不能单独认证 executable。 |
 | 子进程逃逸或进程名误杀 | Session Job 默认禁止 breakaway、最小 handle inheritance、`TerminateJobObject`。 | provider 通过服务、计划任务、Docker、远程 API 或被外部 Job 管理产生的进程不一定属于 Job。 |
-| journal 损坏、部分写入、重复重放 | framed CRC record、flush-before-visible、snapshot generation，按 epoch/seq 去重。 | 电源丢失后最后未 flush output/事件可能丢失；不能凭此承诺完整 terminal transcript 或 exactly-once agent actions。 |
-| 路径替换/attachment traversal | native canonical-handle traversal，拒绝 reparse point，attachments 由 host copy/hash/ACL；IPC 只传 attachment ID。 | 已获同用户完全文件系统控制的攻击者在 host 启动前后仍不在目标防护模型。 |
+| journal 损坏、部分写入、重复重放 | framed CRC record、native secure atomic write、snapshot + reset journal，按 epoch/seq 去重。 | 电源丢失后最后未完成的 output/事件可能丢失；不能凭此承诺完整 terminal transcript 或 exactly-once agent actions。 |
+| 路径替换/attachment traversal | native secure-state 目录逐 handle 拒绝 reparse point；IPC 不传 host 文件路径。当前 durable structured attachment custody 尚未交付，带 attachment 的 structured send 会显式拒绝。 | 已获同用户完全文件系统控制的攻击者在 host 启动前后仍不在目标防护模型。 |
 | provider 启动命令注入 | `CreateProcessW` 指定完整 `lpApplicationName`、结构化 argv、Unicode environment；不得通过 `cmd.exe`/PowerShell 重新解释 session-host/provider launch。 | 用户明确创建的 `custom` shell command 本身拥有用户选择的 shell 语义。 |
 
-额外运行时要求：所有 frame 有最大大小与解析深度；protocol/method 白名单；auth 和 bad-frame telemetry 不记录 token/prompt/attachment 内容；IPC rate limit；所有 native handle RAII close；host 的 crash dump 默认不含 secret；DACL/DPAPI/creation-time native 调用都有不依赖管理员的 Windows 11 integration test。
+额外运行时要求：所有 frame 有最大大小与解析深度；protocol/method 白名单；auth 和 bad-frame telemetry 不记录 token/prompt/attachment 内容；IPC rate limit；所有 native handle RAII close；host 的 crash dump 默认不含 secret。N-API 的 DACL、DPAPI、creation-time、Job 和 ConPTY Windows tests 以不需要管理员的临时资源运行；signed release 的实机 worker smoke 由 CI 另行执行。
 
 ## 明确无法承诺的边界
 
@@ -280,19 +260,17 @@ approval/question 的底线与 Unix supervisor 一致：daemon offline 表示等
 - 不承诺 ConPTY 与所有 legacy GUI/console、Windows service、elevated/跨 integrity provider 的兼容性。遇到 unsupported console/provider 给清晰错误，不回落到谎称 durable 的 daemon PTY。
 - 不承诺 native command exactly once；mutating command 的 crash ambiguity 需要 idempotency key、provider support 或人工 reconciliation。
 
-## 分阶段改造清单
+## 已交付范围与未扩展的边界
 
-| 阶段 | 文件 | 工作与退出条件 |
-| --- | --- | --- |
-| 0：产品 gate（已决） | `gate_5a655a0ec88b` | 采用预编译 N-API；实现与 release 不得改回 helper EXE 或 runtime download。未通过架构 build/校验前仍维持 Windows direct-only。 |
-| 1：platform primitives | 新增 `apps/daemon/src/windows/session-host-native.ts`、`apps/daemon/src/windows/named-pipe.ts`、N-API package 与其 publish config；`apps/daemon/package.json` | 暴露 ConPTY、ACL pipe、DPAPI、process identity、Job/launch；没有任何 `chmod` 伪装为 ACL。为 Windows x64 和 arm64 各发布 prebuild，CI 验证 Node N-API ABI、目标架构、加载 smoke test 与发布 SHA-256/integrity manifest；安装时绝不 runtime download 或本机静默编译。 |
-| 2：公共 host transport | 将 [`structured-supervisor.ts`](../apps/daemon/src/structured-supervisor.ts) 的 protocol/replay reducer 拆到平台无关模块；新增 `windows-session-host-protocol.ts` 与 `windows-session-host-runner.ts` | 保留 Unix 行为；Windows 支持 framed pipe、lease、manifest v2、snapshot/journal、token/peer check。 |
-| 3：PTY vertical slice（已完成） | [`windows-pty-host.ts`](../apps/daemon/src/windows-pty-host.ts)、[`windows-pty-terminal-worker.ts`](../apps/daemon/src/windows-pty-terminal-worker.ts)、[`windows-pty-session.ts`](../apps/daemon/src/windows-pty-session.ts)、[`session-manager.ts`](../apps/daemon/src/session-manager.ts) | 新 Windows PTY 通过 host + ConPTY；daemon facade 提供 create/subscribe/snapshot/input/resize/interrupt/status/kill。direct PTY 只在 native unavailable 时明确降级，Unix/tmux 不变。 |
-| 4：structured migration | 改 [`structured-supervisor-client.ts`](../apps/daemon/src/structured-supervisor-client.ts)、[`structured-supervisor-runner.ts`](../apps/daemon/src/structured-supervisor-runner.ts)、adapter spawn seams | host 拥有 Claude/Codex/OpenCode/Grok adapter 与 native children；每个 adapter 分别证明 resume、pending approval 与 Job 兼容性，不批量假定。 |
-| 5：manager/control/recovery（PTY 完成） | [`session-manager.ts`](../apps/daemon/src/session-manager.ts)、[`ws-server.ts`](../apps/daemon/src/ws-server.ts) | PTY 的 `disposeAll()` 仅 close facade；startup 安全扫 manifest；Windows control pipe 与 structured migration 仍在后续范围。 |
-| 6：tests/CI/ops | 新增 `windows-session-host*.test.ts`、Windows fixture、更新 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)、README/technical overview/runbook | Windows runner 实机执行下表 P0；签名/defender/upgrade telemetry；无论 feature flag 如何，都不把不兼容状态误报可恢复。 |
+| 交付 | 实现与可复现验证 |
+| --- | --- |
+| 原生边界与分发 | `@prospero/windows-native` 提供 secure pipe、peer identity、DPAPI secure state、PID+FILETIME、Job、detached launch 和 ConPTY。PR 在 Windows x64/arm64 构建并验证 unsigned artifact 被 production loader 拒绝；tag release 对两种架构签名、核验、打包 hash/integrity/provenance，并重新通过 production loader。 |
+| 公共 host transport | [`windows-session-host-runner.ts`](../apps/daemon/src/windows-session-host-runner.ts) 提供 manifest v2、capability challenge、single mutation lease、framed PSJ2 journal、snapshot/terminal fence 和 bounded native pipe I/O；`windows-session-host.test.ts` 覆盖 malformed peer、cursor/replay、bootstrap 消费、launch rollback 与 terminal commit。 |
+| PTY host | [`windows-pty-host.ts`](../apps/daemon/src/windows-pty-host.ts) 与 [`windows-pty-session.ts`](../apps/daemon/src/windows-pty-session.ts) 提供 ConPTY create/subscribe/snapshot/input/resize/interrupt/kill；`windows-pty-session.test.ts` 覆盖 detached facade、gap snapshot、terminal kill 和 stale owner 不启动 replacement。 |
+| Structured host | [`windows-structured-session-host.ts`](../apps/daemon/src/windows-structured-session-host.ts) 与 client 将 Claude/Codex/OpenCode/Grok adapter 放入 host；`windows-structured-session-host.test.ts` 覆盖 pending approval/question 的原 ID、断线 mutation idempotency、terminal recovery 与 Job cleanup。text-only durable flow 已交付；durable attachment custody 仍显式拒绝。 |
+| daemon 与编排恢复 | `SessionManager` 与 `ws-server` 先 secure reattach，再 reconciliation；`orchestration-recovery.test.ts` 覆盖 hosted/direct/unavailable provenance，owner identity 改变或无法 attach 不会被错误当作可继续的 worker。 |
 
-现有 [`structured-agent-supervisor.md`](structured-agent-supervisor.md) 的 Unix process-group rollback 保持原样；不要在其函数里加入 `if (win32)` 的半实现。Windows 应通过明确的 platform abstraction 接入，避免混用 `SIGKILL`、负 PID 与 Job Object。
+Unix 的 [`structured-agent-supervisor.md`](structured-agent-supervisor.md) 保持自己的 process-group rollback；Windows 使用明确的 platform abstraction，不混用 `SIGKILL`、负 PID、POSIX socket 权限或 `taskkill`。
 
 ## 已决的产品/分发 Gate
 
@@ -306,28 +284,16 @@ approval/question 的底线与 Unix supervisor 一致：daemon offline 表示等
 2. **签名 helper EXE**：Node host 以受限私有 IPC 调 helper；隔离 ABI，但增加 EXE 签名、升级、Defender/EDR 兼容、私有二进制协议和安装体积。
 3. **不引入原生边界**：Windows 保留直接 PTY / 禁用 durable session host；发布简单，但不满足本 Run 的 durability 目标。
 
-决议为：「采用预编译 N-API 模块：Node 内直接调用 Win32；维护 Windows x64/arm64 N-API 构建、校验与发布。」本 worker 曾因权限限制将 gate 创建请求上报 coordinator；该决议现已解除产品选择阻塞。实现必须遵守上述 release 约束，不能以 helper EXE、runtime download 或 source-build 取代已决 N-API 分发。
+决议为：「采用预编译 N-API 模块：Node 内直接调用 Win32；维护 Windows x64/arm64 N-API 构建、校验与发布。」实现和 release 必须遵守上述约束，不能以 helper EXE、runtime download 或 source-build 取代已决 N-API 分发。
 
-## Windows 验收矩阵
+## 验收证据与仍需现场验证的事项
 
-所有 P0 用隔离 temporary `%LOCALAPPDATA%`、随机 pipe/port、假 provider 和测试拥有的 PID/Job；不得枚举、kill 或重用用户现有 process/pipe。`SIGTERM/SIGKILL` 测试在 Windows 分别以 daemon normal exit、`TerminateProcess` 和受控 Job 语义表达。
+所有 native tests 使用临时状态目录、随机 pipe/port、fake provider 和测试拥有的 PID/Job；不得枚举、kill 或重用用户既有 process/pipe。Windows 下「正常 daemon 退出」与「强制结束 daemon」分别以 facade dispose 和 `TerminateProcess`/Job 语义验证，不能用 Unix `SIGKILL` 的字面行为替代。
 
-| 优先级 | 场景 | 操作 | 断言 |
-| --- | --- | --- | --- |
-| P0 | Pipe ACL / squatting | 另一 SID、另一 logon session、remote client、预创建同名 pipe 分别连接/抢占。 | DACL 拒绝；remote 被拒；first-instance collision fail closed；host 不发布被劫持 endpoint。 |
-| P0 | Peer/auth | 正确与错误 capability、错误 epoch、错误 protocol、超大 frame、PID/creation-time mismatch。 | 仅正确 hello 获 lease；无副作用 RPC；token 不在日志；错误连接不影响活动 daemon。 |
-| P0 | PID reuse 防错杀 | 用 manifest 的旧 PID + 不同 creation time 模拟新 process，执行 attach/force-kill。 | 不 connect、不 `TerminateProcess`、状态为 `unavailable`；测试 sentinel 存活。 |
-| P0 | PTY ConPTY | PowerShell/cmd fake TUI 的 output、UTF-8、resize、DSR/DA/OSC、1KB 分片 input。 | snapshot + ordered seq 一致；daemon 重连不丢/重放错误；host 而非 daemon 持有 terminal。 |
-| P0 | daemon 正常退出 | PTY 和 structured fake 中间输出后关闭 daemon。 | host PID/creation time 未变；输出继续 journal；第二 daemon exact/gap-correct replay；无 auto approval。 |
-| P0 | daemon 强杀 | `TerminateProcess` 测试 daemon，host 继续写 long-turn marker。 | 同上；旧 peer lease 消失、新 daemon 能认证接管；没有 duplicate host/native turn。 |
-| P0 | explicit interrupt / kill | 先 interrupt，再 kill；重放同一 commandId；并测试 host force-kill。 | interrupt 非终态；kill journal fence 在前、`TerminateJobObject` 收口、后续 mutation 拒绝；host force-kill 关闭 Job 并杀 test-owned child tree。 |
-| P0 | outer Job 禁止 breakaway | 将 test daemon 放入 kill-on-close Job 且不允许 breakaway，再请求 durable host。 | 创建拒绝 `parent_job_prevents_detach`，没有“存活”错报，也没有残留 host。 |
-| P0 | journal crash/compaction | 在 append、snapshot replace、generation switch 各阶段杀 host。 | 解析至最后有效 CRC frame；无 seq 跳跃；重复可去重；未知 native command 不自动 replay。 |
-| P0 | pending approval/question | daemon offline 时产生 request，重连后 reply 原 reqId；host crash case。 | offline 只等待；resolution 先落盘；host crash 标 reconciliation，不批准/伪造。 |
-| P1 | provider/Job 兼容 | Claude/Codex/OpenCode/Grok 各自以 fake + 可选真实 installed CLI 验证 nested Job/child spawn。 | 不兼容明确拒绝或受限标记；没有 claim 全树 kill。 |
-| P1 | ACL/path safety | capability、manifest、snapshot、attachment root 的 ACL、reparse point、path traversal 和 replace race。 | 仅预期 SID 可访问；不跟随 reparse point；manifest 从不含 raw token。 |
-| P1 | 升级/回滚 | 新 daemon authenticated handoff，旧 daemon 关闭；不兼容旧 daemon 回读 manifest。 | 单 writer lease；host 不被升级杀死；不兼容者只读。 |
-| P1 | Windows editions/architectures | Windows 11 23H2 + 24H2；Windows x64 与 arm64 都必测。 | ConPTY close 无 deadlock；匹配架构的 N-API prebuild 可验证加载，SHA-256/npm integrity/provenance 与 release artifact 一致；结果写入 release evidence。 |
-| P2 | EDR/Defender、logoff、sleep、provider external side effects | 真实企业配置与人工场景。 | 记录兼容/失败原因；不把失败扩展为 unsupported durability claim。 |
+| 证据 | 当前范围 | 不可据此推导的结论 |
+| --- | --- | --- |
+| `packages/windows-native/test/process-terminal.windows.test.ts` 与 `native.windows.test.ts` | Windows x64/arm64 runner 上的真实 Node-API、secure pipe、PID identity、Job 与 ConPTY primitives。 | 不证明特定第三方 EDR、企业 Job policy 或所有 provider CLI 都兼容。 |
+| `apps/daemon/test/windows-session-host.test.ts`、`windows-pty-session.test.ts`、`windows-structured-session-host.test.ts` | transport、journal/replay、lease、terminal fence、stale identity、approval/question 与 recovery contract。 | 其中 fixture/mock coverage 不能替代一次真实机器 reboot/logoff 测试。 |
+| `.github/workflows/ci.yml` 的 `windows-native` / `release-signed-load` | PR 要求 x64 与 arm64 native build；tag release 必须对 signed artifact 作 production-loader smoke，并运行 signed Session Host ConPTY worker。 | 未经特定 tag 的公开 CI result，不能声称该 release 已在客户环境通过。 |
 
-PTY 的 mock replay/terminal-fence 覆盖在 daemon suite 中运行；签名 release artifact 的 Windows x64/arm64 CI 会额外运行真实 ConPTY + Job Session Host worker smoke。structured migration 的 Windows supervisor 测试仍应保持明确 `unsupported`，直到其独立 P0 通过。
+尚无实机验收记录的场景保持为运维边界：Windows logoff、系统关机/重启、sleep/断电、EDR 强制终止、跨 integrity/elevated provider、Job 外副作用与 in-flight native command exactly-once。它们发生后不得自动重放命令、spawn replacement 或把历史显示为已恢复；按 [Windows Session Host 运维与排障](windows-session-host-operations.md) 保留记录、检查状态并由操作者决定新建、resume（若 adapter 支持）或归档。
