@@ -70,6 +70,39 @@ jobs:
           node packages/windows-native/scripts/stage-prebuild.mjs --source packages/windows-native/build/Release/prospero_windows_native.node --destination packages/windows-native --arch ${{ matrix.arch }} --authenticode-status unsigned
           node packages/windows-native/scripts/smoke-loader.mjs --package-root packages/windows-native --expect unsigned
           npm run verify:prebuilds --workspace=@prospero/windows-native
+      - name: Exercise full-process Session Host acceptance with an ephemeral trusted test signature
+        # The production loader deliberately rejects source-built/unsigned
+        # addons. Trust a runner-local self-signed copy only for this step,
+        # then restore the original unsigned artifact before upload/release.
+        run: |
+          $artifact = 'packages/windows-native/prebuilds/win32-${{ matrix.arch }}/prospero_windows_native.node'
+          $source = 'packages/windows-native/build/Release/prospero_windows_native.node'
+          $certificate = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=Prospero Windows CI Session Host Test' -CertStoreLocation 'Cert:\CurrentUser\My'
+          $certificateFile = Join-Path $env:RUNNER_TEMP 'prospero-windows-session-host-test.cer'
+          $signTool = (Get-Command signtool.exe -ErrorAction Stop).Source
+          try {
+            Export-Certificate -Cert $certificate -FilePath $certificateFile | Out-Null
+            Import-Certificate -FilePath $certificateFile -CertStoreLocation 'Cert:\CurrentUser\Root' | Out-Null
+            Import-Certificate -FilePath $certificateFile -CertStoreLocation 'Cert:\CurrentUser\TrustedPublisher' | Out-Null
+            Copy-Item -LiteralPath $source -Destination $artifact -Force
+            & $signTool sign /fd SHA256 /sha1 $certificate.Thumbprint $artifact
+            if ($LASTEXITCODE -ne 0) { throw 'signtool failed for the ephemeral Session Host test artifact' }
+            $signature = Get-AuthenticodeSignature -LiteralPath $artifact
+            if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Thumbprint -ne $certificate.Thumbprint) {
+              throw 'ephemeral Session Host test artifact is not trusted by the Windows loader'
+            }
+            node packages/windows-native/scripts/stage-prebuild.mjs --source $artifact --destination packages/windows-native --arch ${{ matrix.arch }} --authenticode-status valid --thumbprint $certificate.Thumbprint
+            $env:PROSPERO_WINDOWS_SIGNED_SESSION_HOST_TEST = '1'
+            npm run build --workspace=@prospero/daemon
+            npm run test:windows-native --workspace=@prospero/daemon
+          } finally {
+            Copy-Item -LiteralPath $source -Destination $artifact -Force
+            node packages/windows-native/scripts/stage-prebuild.mjs --source $artifact --destination packages/windows-native --arch ${{ matrix.arch }} --authenticode-status unsigned
+            Remove-Item -LiteralPath $certificateFile -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath "Cert:\CurrentUser\My\$($certificate.Thumbprint)" -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath "Cert:\CurrentUser\Root\$($certificate.Thumbprint)" -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath "Cert:\CurrentUser\TrustedPublisher\$($certificate.Thumbprint)" -Force -ErrorAction SilentlyContinue
+          }
       - name: Upload unsigned test artifact and SHA-256 manifest
         uses: actions/upload-artifact@v4
         with:
@@ -210,7 +243,7 @@ jobs:
           path: packages/windows-native/prebuilds/win32-${{ matrix.arch }}
       - name: Load the signed artifact through the production loader
         run: node packages/windows-native/scripts/smoke-loader.mjs --package-root packages/windows-native --expect valid
-      - name: Exercise the signed Session Host ConPTY worker
+      - name: Exercise signed full-process Session Host acceptance
         env:
           PROSPERO_WINDOWS_SIGNED_SESSION_HOST_TEST: "1"
         run: |
