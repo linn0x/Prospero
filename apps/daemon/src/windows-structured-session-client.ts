@@ -1,6 +1,6 @@
 /** Daemon-side durable facade for structured Windows Session Hosts. */
 import { randomUUID } from "node:crypto";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { SessionInfoSchema } from "@prospero/protocol";
@@ -46,6 +46,7 @@ import {
 } from "./windows-session-host-runner.js";
 import { WindowsSessionHostNativeWorker } from "./windows-session-host-native.js";
 import { WINDOWS_STRUCTURED_READ_ONLY_METHODS, type WindowsStructuredHostBootstrap } from "./windows-structured-session-host.js";
+import { emittedSiblingPath } from "./runtime-module-path.js";
 
 const REGISTRY_RECORD_PREFIX = "structured-session-";
 const REGISTRY_RECORD_SUFFIX = ".json";
@@ -779,7 +780,7 @@ export class WindowsRemoteStructuredSession extends EventEmitter {
 }
 
 function handlerModuleUrl(): string {
-  return pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.url)), "windows-structured-session-host.js")).href;
+  return pathToFileURL(emittedSiblingPath(import.meta.url, "windows-structured-session-host.js")).href;
 }
 
 const launchLocks = new Map<string, Promise<void>>();

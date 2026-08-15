@@ -46,6 +46,7 @@ import {
   type WindowsSessionHostSnapshot,
 } from "./windows-session-host-protocol.js";
 import { WindowsSessionHostNativeWorker } from "./windows-session-host-native.js";
+import { emittedSiblingPath } from "./runtime-module-path.js";
 
 const MAX_PIPE_READ_BYTES = 1024 * 1024;
 const COMPACTION_EVENT_LIMIT = 128;
@@ -1268,7 +1269,7 @@ export async function launchDetachedWindowsSessionHostWithNative(
       await native.writeAtomic(name, value);
     }
     await native.writeAtomic(DETACHED_BOOTSTRAP_FILE, new TextEncoder().encode(JSON.stringify(bootstrap)));
-    const entry = options.runnerEntryPath ?? fileURLToPath(new URL("./windows-session-host-runner-entry.js", import.meta.url));
+    const entry = options.runnerEntryPath ?? emittedSiblingPath(import.meta.url, "windows-session-host-runner-entry.js");
     if (!isAbsolute(entry)) throw new WindowsSessionHostUnavailable("invalid_manifest", "Windows detached runner entry must be absolute");
     const launch = await native.launchDetachedHost({
       executablePath: process.execPath,

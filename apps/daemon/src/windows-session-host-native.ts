@@ -13,6 +13,7 @@ import {
 } from "@prospero/windows-native";
 import type { WindowsSessionHostStateStore } from "./windows-session-host-protocol.js";
 import { isProcessIdentity, WindowsSessionHostUnavailable } from "./windows-session-host-protocol.js";
+import { emittedSiblingUrl } from "./runtime-module-path.js";
 
 interface WorkerReply {
   readonly id?: unknown;
@@ -68,7 +69,7 @@ class WindowsSessionHostPipeCanceller {
   }
 
   static async create(): Promise<WindowsSessionHostPipeCanceller> {
-    const worker = new Worker(new URL("./windows-session-host-native-cancel-worker.js", import.meta.url));
+    const worker = new Worker(emittedSiblingUrl(import.meta.url, "windows-session-host-native-cancel-worker.js"));
     const canceller = new WindowsSessionHostPipeCanceller(worker);
     try {
       const initialized = await canceller.call("initialize");
@@ -162,7 +163,7 @@ export class WindowsSessionHostNativeWorker implements WindowsSessionHostStateSt
 
   static async create(): Promise<WindowsSessionHostNativeWorker> {
     if (process.platform !== "win32") throw nativeFailure("Windows session host is unavailable outside win32");
-    const worker = new Worker(new URL("./windows-session-host-native-worker.js", import.meta.url));
+    const worker = new Worker(emittedSiblingUrl(import.meta.url, "windows-session-host-native-worker.js"));
     let canceller: WindowsSessionHostPipeCanceller | null = null;
     let bridge: WindowsSessionHostNativeWorker | null = null;
     try {

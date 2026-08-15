@@ -12,6 +12,7 @@ import type {
   WindowsSessionHostCommandOutcome,
   WindowsSessionHostHandlerFactory,
 } from "./windows-session-host-runner.js";
+import { emittedSiblingUrl } from "./runtime-module-path.js";
 
 const require = createRequire(import.meta.url);
 const { Terminal } = require("@xterm/headless") as { Terminal: typeof HeadlessTerminal };
@@ -136,7 +137,7 @@ class WindowsPtyTerminal extends EventEmitter<{ output: [Uint8Array]; terminalFa
 
   constructor() {
     super();
-    this.worker = new Worker(new URL("./windows-pty-terminal-worker.js", import.meta.url));
+    this.worker = new Worker(emittedSiblingUrl(import.meta.url, "windows-pty-terminal-worker.js"));
     this.worker.on("message", (message: unknown) => this.onMessage(message));
     this.worker.on("error", (error) => {
       this.workerCrashed = true;
