@@ -13,12 +13,27 @@
         "native/src/secure_state_directory.cc"
       ],
       "include_dirs": ["native/include"],
-      "defines": ["NAPI_VERSION=8", "WIN32_LEAN_AND_MEAN", "UNICODE", "_UNICODE"],
+      "defines": [
+        "NAPI_VERSION=8",
+        "WIN32_LEAN_AND_MEAN",
+        "UNICODE",
+        "_UNICODE",
+        "WINVER=0x0A00",
+        "_WIN32_WINNT=0x0A00",
+        "NTDDI_VERSION=0x0A000006"
+      ],
       "conditions": [
         [
           "OS=='win'",
           {
-            "libraries": ["advapi32.lib", "crypt32.lib", "userenv.lib"]
+            "libraries": ["advapi32.lib", "crypt32.lib", "userenv.lib"],
+            "msvs_settings": {
+              "VCCLCompilerTool": {
+                "WarningLevel": 4,
+                "WarnAsError": "true",
+                "AdditionalOptions": ["/permissive-", "/WX"]
+              }
+            }
           },
           {
             "type": "none"

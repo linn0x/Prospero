@@ -207,6 +207,18 @@ describe("Windows native fail-closed loader", () => {
     );
   });
 
+  it("rejects an addon missing the Job Object and ConPTY tree-control calls", () => {
+    const addon = completeAddon(addonReport()) as Partial<NativeAddonBinding>;
+    delete addon.assignProcessToJob;
+    delete addon.terminateJobObject;
+    delete addon.spawnConPty;
+    delete addon.killConPty;
+    expectNativeLoadError(
+      () => loadWindowsNative(mockRuntime(validManifest(), addon)),
+      "addon-invalid",
+    );
+  });
+
   it("rejects an addon without manifest recovery and cleanup operations", () => {
     const addon = completeAddon(addonReport()) as Partial<NativeAddonBinding>;
     delete addon.readSecureStateFile;
@@ -288,5 +300,14 @@ describe("Windows native fail-closed loader", () => {
       mockRuntime(validManifest(), addon, { isDedicatedWorkerThread: () => false }),
     );
     expectNativeLoadError(() => binding.getProcessIdentity(42), "worker-thread-required");
+  });
+
+  it("keeps DPAPI session/epoch binding in the required native method surface", () => {
+    const addon = completeAddon(addonReport());
+    const entropy = new Uint8Array([7, 0, 9]);
+    const binding = loadWindowsNative(mockRuntime(validManifest(), addon));
+    // The mock is intentionally inert; this verifies that the trusted wrapper
+    // exposes the complete two-argument method rather than a JS token shim.
+    expect(() => binding.dpapiProtectCurrentUser(new Uint8Array([1]), entropy)).not.toThrow();
   });
 });

@@ -80,9 +80,12 @@ export interface JobObjectOptions {
 export interface ParentJobCompatibility {
   /** Whether the current process has an enclosing Job Object. */
   readonly parentJobDetected: boolean;
-  /** Whether that Job Object grants BREAKAWAY_OK or SILENT_BREAKAWAY_OK. */
+  /** Whether the immediate Job grants BREAKAWAY_OK or SILENT_BREAKAWAY_OK. */
   readonly breakawayAllowed: boolean;
-  /** A detached child can be launched without silently inheriting the parent Job. */
+  /**
+   * Immediate-job preflight result. A successful detached launch additionally
+   * verifies the suspended child has escaped every ancestor Job.
+   */
   readonly detachedLaunchAllowed: boolean;
 }
 
@@ -220,6 +223,11 @@ interface NativeWindowsMethods {
   closeSecureNamedPipeServer(server: SecureNamedPipeServerHandle): void;
   readSecureNamedPipeConnection(connection: SecureNamedPipeConnectionHandle, maxBytes: number): Uint8Array;
   writeSecureNamedPipeConnection(connection: SecureNamedPipeConnectionHandle, data: Uint8Array): number;
+  /**
+   * Requires a successful first `readSecureNamedPipeConnection` authentication
+   * frame. Windows impersonates the client represented by the last pipe read;
+   * requesting identity before that frame is rejected.
+   */
   getSecureNamedPipePeerIdentity(connection: SecureNamedPipeConnectionHandle): PipePeerIdentity;
   disconnectSecureNamedPipeConnection(connection: SecureNamedPipeConnectionHandle): void;
   closeSecureNamedPipeConnection(connection: SecureNamedPipeConnectionHandle): void;
@@ -241,10 +249,14 @@ interface NativeWindowsMethods {
   killConPty(terminal: ConPtyHandle, exitCode: number): void;
   closeConPty(terminal: ConPtyHandle): void;
 
-  /** DPAPI CryptProtectData using the current user's scope only. */
-  dpapiProtectCurrentUser(plaintext: Uint8Array, optionalEntropy?: Uint8Array): Uint8Array;
-  /** DPAPI CryptUnprotectData using the current user's scope only. */
-  dpapiUnprotectCurrentUser(ciphertext: Uint8Array, optionalEntropy?: Uint8Array): Uint8Array;
+  /**
+   * DPAPI CryptProtectData using current-user scope only. `sessionEpochEntropy`
+   * must be a non-empty opaque encoding bound to the session and lifecycle
+   * epoch; raw capabilities must never be used as the entropy value.
+   */
+  dpapiProtectCurrentUser(plaintext: Uint8Array, sessionEpochEntropy: Uint8Array): Uint8Array;
+  /** Uses the same non-empty session/epoch entropy supplied during protection. */
+  dpapiUnprotectCurrentUser(ciphertext: Uint8Array, sessionEpochEntropy: Uint8Array): Uint8Array;
   /** Creates/opens a current-user-only state directory after rejecting reparse points. */
   openSecureStateDirectory(options: SecureStateDirectoryOptions): SecureStateDirectoryHandle;
   /** Writes a single relative filename atomically without escaping the validated directory. */
