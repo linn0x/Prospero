@@ -121,10 +121,11 @@ jobs:
             @($taskScript, $taskLauncher, $taskLog, $taskResult, $npmPath, $windowsPowerShell, $env:GITHUB_WORKSPACE) | ForEach-Object {
               if ($_.Contains("'") -or $_.Contains('"')) { throw "scheduled-task path contains an unsupported quote: $_" }
             }
-            @"
-            & '$taskScript' -Workspace '$env:GITHUB_WORKSPACE' -NpmPath '$npmPath' -LogPath '$taskLog' -ResultPath '$taskResult'
-            exit `$LASTEXITCODE
-            "@ | Set-Content -LiteralPath $taskLauncher -Encoding utf8
+            $taskLauncherLines = @(
+              "& '$taskScript' -Workspace '$env:GITHUB_WORKSPACE' -NpmPath '$npmPath' -LogPath '$taskLog' -ResultPath '$taskResult'",
+              'exit $LASTEXITCODE'
+            )
+            Set-Content -LiteralPath $taskLauncher -Value $taskLauncherLines -Encoding utf8
             $taskCommand = "`"$windowsPowerShell`" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$taskLauncher`""
             if ($taskCommand.Length -gt 261) { throw 'scheduled-task launcher command exceeds the Windows Task Scheduler limit' }
             try {
