@@ -534,15 +534,15 @@ afterEach(async () => {
 });
 
 describe.sequential("daemon supervisor SIGTERM/SIGKILL full-process recovery", () => {
-  it("SIGTERM preserves the long turn, ordered replay, pending interactions, and dispatch", async () => {
+  it.skipIf(process.platform === "win32")("SIGTERM preserves the long turn, ordered replay, pending interactions, and dispatch", async () => {
     await exerciseSignalRecovery("SIGTERM");
   });
 
-  it("SIGKILL preserves the long turn, ordered replay, pending interactions, and dispatch", async () => {
+  it.skipIf(process.platform === "win32")("SIGKILL preserves the long turn, ordered replay, pending interactions, and dispatch", async () => {
     await exerciseSignalRecovery("SIGKILL");
   });
 
-  it("keeps legacy in-process history readable and exposes a killed supervisor as a real read-only died session", async () => {
+  it.skipIf(process.platform === "win32")("keeps legacy in-process history readable and exposes a killed supervisor as a real read-only died session", async () => {
     const legacyHome = path.join(temp("prospero-t7-legacy-home-"), ".prospero");
     const fakeBin = temp("prospero-t7-legacy-bin-");
     installFakeCodex(fakeBin);

@@ -219,6 +219,25 @@ export class DispatchService {
     let session: SessionInfo | null = null;
     let dispatch: Dispatch | null = null;
     let startingAssetId: string | null = null;
+    const result = (resultSession: SessionInfo, resultDispatch: Dispatch): StartWorkerResult => ({
+      task: this.store.getTask(task.id),
+      dispatch: resultDispatch,
+      session: resultSession,
+      worktree: worktree
+        ? {
+            assetId: worktree.assetId,
+            path: worktree.path,
+            clones: worktree.clones,
+            mode: worktree.mode,
+            cow: worktree.cow,
+            cowBackend: worktree.cowBackend,
+            preservedIgnored: worktree.preservedIgnored,
+            skippedIgnored: worktree.skippedIgnored,
+            ms: worktree.ms,
+            fallbackReason: worktree.fallbackReason,
+          }
+        : null,
+    });
     try {
       let workerCwd = input.cwd;
       if (input.worktree === "new") {
@@ -305,6 +324,12 @@ export class DispatchService {
         worktreePath: worktree?.path ?? null,
       });
       if (worktree) this.store.linkWorktreeAssetDispatch(worktree.assetId, dispatch.id);
+      // worker.start 的成功响应必须代表可恢复事实，而不只是内存状态。尤其是
+      // structured adapter 可能在同一事件循环内极快地产生 turn.end；若此时
+      // daemon 遭遇 SIGKILL，不能把已启动 worker 恢复成仍可重复派发的 pending。
+      // 先把 starting + task.dispatched（以及 worktree 关联）同步原子落盘，再发送
+      // 任何可能让 agent 执行用户代码的前导词。
+      this.store.persistNow();
 
       const prompt = workerPrompt(task, session.id, workerCwd, run.coordinatorSessionId);
       if (session.kind === "structured") {
@@ -313,31 +338,33 @@ export class DispatchService {
         // PTY 轨没有 chat API；用一段单行提示直接送进 agent 的终端输入。
         this.sessions.requirePty(session.id).writeInput(`${prompt.replace(/\n/g, " ")}\r`);
       }
-      const running = this.store.setDispatchState(dispatch.id, "running");
-      return {
-        task: this.store.getTask(task.id),
-        dispatch: running,
-        session,
-        worktree: worktree
-          ? {
-              assetId: worktree.assetId,
-              path: worktree.path,
-              clones: worktree.clones,
-              mode: worktree.mode,
-              cow: worktree.cow,
-              cowBackend: worktree.cowBackend,
-              preservedIgnored: worktree.preservedIgnored,
-              skippedIgnored: worktree.skippedIgnored,
-              ms: worktree.ms,
-              fallbackReason: worktree.fallbackReason,
-            }
-          : null,
-      };
+      const currentDispatch = this.store.getDispatch(dispatch.id);
+      // 极快的 worker 可以在前导词调用尚未返回时显式 task.done/fail。不能用迟到的
+      // running 覆盖已经持久交付的终态。
+      const running = currentDispatch.state === "starting"
+        ? this.store.setDispatchState(dispatch.id, "running")
+        : currentDispatch;
+      this.store.persistNow();
+      return result(session, running);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (dispatch) {
-        this.store.setDispatchState(dispatch.id, "failed", message);
-        this.store.setTaskStatus(task.id, "failed", message);
+        const currentDispatch = this.store.getDispatch(dispatch.id);
+        const currentTask = this.store.getTask(task.id);
+        const explicitlyDelivered =
+          (currentDispatch.state === "succeeded" && currentTask.status === "done") ||
+          (currentDispatch.state === "failed" && currentTask.status === "failed");
+        // task.done/fail 会先同步写盘再终止 supervisor；终止动作可能让仍在等待的
+        // chatSend 以“连接关闭”拒绝。此时交付事实优先，worker.start 应返回该终态，
+        // 不能把成功交付伪装成启动失败，更不能回滚 Task/Dispatch。
+        if (explicitlyDelivered && session) return result(session, currentDispatch);
+        if (currentDispatch.state === "starting" || currentDispatch.state === "running") {
+          this.store.setDispatchState(dispatch.id, "failed", message);
+          if (currentTask.status === "dispatched") {
+            this.store.setTaskStatus(task.id, "failed", message);
+          }
+          this.store.persistNow();
+        }
       }
       if (session) await this.sessions.kill(session.id).catch(() => {});
       if (worktree) {

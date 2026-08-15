@@ -110,7 +110,7 @@ afterEach(async () => {
 });
 
 describe("structured supervisor launch rollback", () => {
-  it("reaps only its new detached group after a short attach timeout and preserves an audit manifest", async () => {
+  it.skipIf(process.platform === "win32")("reaps only its new detached group after a short attach timeout and preserves an audit manifest", async () => {
     const home = temp("prospero-launch-rollback-home-");
     const fakeBin = temp("prospero-launch-rollback-bin-");
     installHangingCodex(fakeBin);

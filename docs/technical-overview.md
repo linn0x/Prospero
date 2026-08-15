@@ -367,8 +367,8 @@ adapter 的 `SessionStatus`（idle 等）猜 done。
 ### 7.2 派发与恢复（`dispatch.ts`）
 
 `startWorker` 顺序严格：校验 ready → 建 worktree（`new` 时先登记资产再建会话）→ 继承账号 → `sessions.create`
-→ `createDispatch`（**先于前导词落盘**，防止 `task done` 抢在归属记录前）→ 发 worker 前导词（含交付命令
-`prospero --session <sid> task done/fail --id …`）→ `running`。
+→ `createDispatch`（**先于前导词同步原子落盘**，防止即时 SIGKILL 丢失归属或 `task done` 抢在归属记录前）
+→ 发 worker 前导词（含交付命令 `prospero --session <sid> task done/fail --id …`）→ `running` 再同步落盘后返回。
 
 **恢复对账** `reconcilePersistedSessions()`（启动顺序不可调换：control socket → SessionManager →
 对账 → 自动队列/Goal 重试）：
