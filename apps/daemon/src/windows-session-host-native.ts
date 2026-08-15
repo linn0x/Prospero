@@ -11,7 +11,7 @@ import {
   type ProcessIdentity,
 } from "@prospero/windows-native";
 import type { WindowsSessionHostStateStore } from "./windows-session-host-protocol.js";
-import { WindowsSessionHostUnavailable } from "./windows-session-host-protocol.js";
+import { isProcessIdentity, WindowsSessionHostUnavailable } from "./windows-session-host-protocol.js";
 
 interface WorkerReply {
   readonly id?: unknown;
@@ -26,6 +26,22 @@ interface Pending {
 }
 
 const NATIVE_CLOSE_TIMEOUT_MS = 2_000;
+
+/** TokenSessionId is a Win32 DWORD, not a 16-bit terminal-session field. */
+export const WINDOWS_DWORD_MAX = 0xffff_ffff;
+
+/**
+ * Native peer identity is untrusted worker-message data until this validation
+ * succeeds. Keep the full DWORD range: valid RDP/session identifiers are not
+ * limited to 16 bits.
+ */
+export function isStrictWindowsPipePeerIdentity(value: unknown): value is PipePeerIdentity {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const peer = value as Partial<PipePeerIdentity>;
+  return isProcessIdentity(peer.process) && typeof peer.userSid === "string" && /^S-1-\d+(?:-\d+)+$/.test(peer.userSid) &&
+    typeof peer.sessionId === "number" && Number.isSafeInteger(peer.sessionId) &&
+    peer.sessionId >= 0 && peer.sessionId <= WINDOWS_DWORD_MAX;
+}
 
 async function withinNativeCloseBound<T>(operation: Promise<T>): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -310,11 +326,7 @@ export class WindowsSessionHostNativeWorker implements WindowsSessionHostStateSt
   }
 
   private isPeer(value: unknown): value is PipePeerIdentity {
-    if (!value || typeof value !== "object") return false;
-    const peer = value as Partial<PipePeerIdentity>;
-    try { this.identityResult(peer.process); } catch { return false; }
-    return typeof peer.userSid === "string" && /^S-1-\d+(?:-\d+)+$/.test(peer.userSid) &&
-      typeof peer.sessionId === "number" && Number.isSafeInteger(peer.sessionId) && peer.sessionId >= 0 && peer.sessionId <= 0xffff;
+    return isStrictWindowsPipePeerIdentity(value);
   }
 
   private pipeHandle(value: unknown, message: string): bigint {

@@ -10,6 +10,7 @@ import { createConnection } from "node:net";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isAbsolute } from "node:path";
 import { NATIVE_WINDOWS_ABI_VERSION, type PipePeerIdentity, type ProcessIdentity } from "@prospero/windows-native";
+import { isStrictWindowsPipePeerIdentity } from "./windows-session-host-native.js";
 import {
   assertEpoch,
   assertSecureWindowsPipeName,
@@ -247,8 +248,7 @@ function validNonceProof(value: unknown): value is string {
 
 function strictPeer(value: PipePeerIdentity | null): value is PipePeerIdentity {
   if (!isObject(value) || !hasOnlyKeys(value, ["process", "userSid", "sessionId"])) return false;
-  return isProcessIdentity(value.process) && typeof value.userSid === "string" && /^S-1-\d+(?:-\d+)+$/.test(value.userSid) &&
-    Number.isSafeInteger(value.sessionId) && value.sessionId >= 0 && value.sessionId <= 0xffff;
+  return isStrictWindowsPipePeerIdentity(value);
 }
 
 function strictHello(value: SessionHostWireMessage, manifest: WindowsSessionHostManifest): SessionHostHello {

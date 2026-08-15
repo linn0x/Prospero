@@ -1,5 +1,5 @@
 import { createRequire } from "node:module";
-import { createConnection } from "node:net";
+import { createConnection, type Socket } from "node:net";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -37,20 +37,57 @@ const binding = (process.platform === "win32" ? require(bindingPath) : undefined
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-function waitForWorker(worker: Worker, expected: "ready" | "complete"): Promise<Record<string, unknown>> {
+const CANCELLATION_TIMEOUT_MS = 5_000;
+
+function waitForWorkerMessage(worker: Worker, expected: string, timeoutMs = 10_000): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error(`Timed out waiting for pipe worker ${expected}`)), 10_000);
-    worker.once("error", reject);
-    worker.on("message", (message: Record<string, unknown>) => {
+    const timeout = setTimeout(() => finish(new Error(`Timed out waiting for pipe worker ${expected}`)), timeoutMs);
+    const onError = (error: Error) => finish(error);
+    const onExit = (code: number) => finish(new Error(`Pipe worker exited before ${expected} (${code})`));
+    const onMessage = (message: Record<string, unknown>) => {
       if (message.type === "error") {
-        clearTimeout(timeout);
-        reject(new Error(`${message.name}: ${message.message}`));
+        finish(new Error(`${message.name}: ${message.message}`));
       } else if (message.type === expected) {
-        clearTimeout(timeout);
-        resolve(message);
+        finish(undefined, message);
       }
-    });
+    };
+    const finish = (error?: Error, message?: Record<string, unknown>) => {
+      clearTimeout(timeout);
+      worker.off("error", onError);
+      worker.off("exit", onExit);
+      worker.off("message", onMessage);
+      if (error) reject(error);
+      else resolve(message!);
+    };
+    worker.once("error", onError);
+    worker.once("exit", onExit);
+    worker.on("message", onMessage);
   });
+}
+
+function waitForWorker(worker: Worker, expected: "ready" | "complete"): Promise<Record<string, unknown>> {
+  return waitForWorkerMessage(worker, expected);
+}
+
+async function connectPipe(pipeName: string): Promise<Socket> {
+  return new Promise<Socket>((resolve, reject) => {
+    const socket = createConnection(pipeName);
+    const fail = (error: Error) => {
+      socket.off("connect", connected);
+      reject(error);
+    };
+    const connected = () => {
+      socket.off("error", fail);
+      socket.on("error", () => {});
+      resolve(socket);
+    };
+    socket.once("error", fail);
+    socket.once("connect", connected);
+  });
+}
+
+async function terminateWorker(worker: Worker | undefined): Promise<void> {
+  if (worker) await worker.terminate();
 }
 
 describe.runIf(process.platform === "win32")("Windows identity, secure pipe, DPAPI, and state addon", () => {
@@ -135,6 +172,55 @@ describe.runIf(process.platform === "win32")("Windows identity, secure pipe, DPA
     expect(peer.process.creationTime100ns).toMatch(/^[1-9]\d*$/);
     expect(peer.userSid).toMatch(/^S-1-\d+(?:-\d+)+$/i);
     await worker.terminate();
+  });
+
+  it("uses a second addon-loaded worker to close an idle ConnectNamedPipe by its opaque handle", async () => {
+    const pipeName = `\\\\.\\pipe\\prospero-native-cancel-accept-${process.pid}-${randomUUID()}`;
+    const fixture = new URL("./fixtures/native-pipe-cancellation-worker.mjs", import.meta.url);
+    let primary: Worker | undefined;
+    let control: Worker | undefined;
+    try {
+      primary = new Worker(fixture, { workerData: { bindingPath, pipeName, role: "primary", scenario: "idle-accept" } });
+      control = new Worker(fixture, { workerData: { bindingPath, role: "control" } });
+      const server = await waitForWorkerMessage(primary, "server-ready", CANCELLATION_TIMEOUT_MS);
+      await waitForWorkerMessage(control, "control-ready", CANCELLATION_TIMEOUT_MS);
+      await expect(waitForWorkerMessage(primary, "blocking", CANCELLATION_TIMEOUT_MS)).resolves.toMatchObject({ operation: "accept" });
+      const controlComplete = waitForWorkerMessage(control, "control-complete", CANCELLATION_TIMEOUT_MS);
+      const unblocked = waitForWorkerMessage(primary, "unblocked", CANCELLATION_TIMEOUT_MS);
+      control.postMessage({ action: "close-server", handle: server.server });
+      const [cancelled, result] = await Promise.all([controlComplete, unblocked]);
+      expect(cancelled.action).toBe("close-server");
+      expect(result).toMatchObject({ operation: "accept", code: "PROSPERO_NATIVE_NOT_FOUND", ownerClose: "control-only" });
+    } finally {
+      await Promise.all([terminateWorker(primary), terminateWorker(control)]);
+    }
+  });
+
+  it("uses a second addon-loaded worker to disconnect an active ReadFile before the owner performs its one close", async () => {
+    const pipeName = `\\\\.\\pipe\\prospero-native-cancel-read-${process.pid}-${randomUUID()}`;
+    const fixture = new URL("./fixtures/native-pipe-cancellation-worker.mjs", import.meta.url);
+    let primary: Worker | undefined;
+    let control: Worker | undefined;
+    let client: Socket | undefined;
+    try {
+      primary = new Worker(fixture, { workerData: { bindingPath, pipeName, role: "primary", scenario: "active-read" } });
+      control = new Worker(fixture, { workerData: { bindingPath, role: "control" } });
+      await waitForWorkerMessage(primary, "server-ready", CANCELLATION_TIMEOUT_MS);
+      await waitForWorkerMessage(control, "control-ready", CANCELLATION_TIMEOUT_MS);
+      const connectionReady = waitForWorkerMessage(primary, "connection-ready", CANCELLATION_TIMEOUT_MS);
+      client = await connectPipe(pipeName);
+      const connection = await connectionReady;
+      await expect(waitForWorkerMessage(primary, "blocking", CANCELLATION_TIMEOUT_MS)).resolves.toMatchObject({ operation: "read" });
+      const controlComplete = waitForWorkerMessage(control, "control-complete", CANCELLATION_TIMEOUT_MS);
+      const unblocked = waitForWorkerMessage(primary, "unblocked", CANCELLATION_TIMEOUT_MS);
+      control.postMessage({ action: "disconnect-connection", handle: connection.connection });
+      const [cancelled, result] = await Promise.all([controlComplete, unblocked]);
+      expect(cancelled.action).toBe("disconnect-connection");
+      expect(result).toMatchObject({ operation: "read", code: "PROSPERO_NATIVE_NOT_FOUND", ownerClose: "primary-after-disconnect" });
+    } finally {
+      client?.destroy();
+      await Promise.all([terminateWorker(primary), terminateWorker(control)]);
+    }
   });
 
   it("derives TokenUser internally and rejects caller-selected SID or invalid pipe names", () => {
