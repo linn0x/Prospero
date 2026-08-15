@@ -1,0 +1,154 @@
+import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
+
+const ARCHITECTURES = ["x64", "arm64"];
+const ARTIFACT_NAME = "prospero_windows_native.node";
+const CAPABILITIES = [
+  "processIdentity",
+  "secureNamedPipe",
+  "jobObject",
+  "parentJobCompatibility",
+  "detachedHost",
+  "conPty",
+  "dpapiCurrentUser",
+  "secureStateDirectory",
+];
+
+function parseArguments(argv) {
+  const values = new Map();
+  for (let index = 0; index < argv.length; index += 2) {
+    const key = argv[index];
+    const value = argv[index + 1];
+    if (!key?.startsWith("--") || value === undefined || values.has(key)) {
+      throw new Error("usage: verify-release-pack.mjs --native-root <root> --daemon-root <root> --output-dir <dir>");
+    }
+    values.set(key, value);
+  }
+  const nativeRoot = values.get("--native-root");
+  const daemonRoot = values.get("--daemon-root");
+  const outputDir = values.get("--output-dir");
+  if (!nativeRoot || !daemonRoot || !outputDir) {
+    throw new Error("usage: verify-release-pack.mjs --native-root <root> --daemon-root <root> --output-dir <dir>");
+  }
+  return { nativeRoot: resolve(nativeRoot), daemonRoot: resolve(daemonRoot), outputDir: resolve(outputDir) };
+}
+
+async function verifyPrebuild(root, prefix, arch) {
+  const directory = resolve(root, prefix, "prebuilds", `win32-${arch}`);
+  const binaryPath = resolve(directory, ARTIFACT_NAME);
+  const manifestPath = resolve(directory, "manifest.json");
+  const [binary, rawManifest, binaryStat] = await Promise.all([
+    readFile(binaryPath),
+    readFile(manifestPath, "utf8"),
+    stat(binaryPath),
+  ]);
+  if (!binaryStat.isFile() || binary.byteLength === 0) throw new Error(`${prefix || "native"}/${arch}: missing native binary`);
+  let manifest;
+  try {
+    manifest = JSON.parse(rawManifest);
+  } catch {
+    throw new Error(`${prefix || "native"}/${arch}: invalid manifest JSON`);
+  }
+  const sha256 = createHash("sha256").update(binary).digest("hex");
+  if (
+    manifest?.schemaVersion !== 2 ||
+    manifest.platform !== "win32" ||
+    manifest.arch !== arch ||
+    manifest.artifact?.file !== ARTIFACT_NAME ||
+    manifest.artifact?.sha256?.toLowerCase() !== sha256 ||
+    manifest.native?.abiVersion !== 2 ||
+    manifest.native?.napiVersion !== 8 ||
+    CAPABILITIES.some((capability) => manifest.native?.capabilities?.[capability] !== true) ||
+    manifest.authenticode?.status !== "valid" ||
+    !/^[a-fA-F0-9]{40}$/.test(manifest.authenticode?.thumbprintSha1 ?? "")
+  ) {
+    throw new Error(`${prefix || "native"}/${arch}: artifact does not meet signed release policy`);
+  }
+  return {
+    arch,
+    sha256,
+    signerThumbprintSha1: manifest.authenticode.thumbprintSha1.toUpperCase(),
+  };
+}
+
+function npmCommand() {
+  return process.platform === "win32" ? "npm.cmd" : "npm";
+}
+
+async function packPackage(root, outputDir) {
+  const raw = execFileSync(
+    npmCommand(),
+    ["pack", "--json", "--ignore-scripts", "--pack-destination", outputDir],
+    { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] },
+  );
+  let entries;
+  try {
+    entries = JSON.parse(raw);
+  } catch {
+    throw new Error(`npm pack did not emit JSON for ${root}`);
+  }
+  if (!Array.isArray(entries) || entries.length !== 1) throw new Error(`Unexpected npm pack result for ${root}`);
+  const entry = entries[0];
+  const tarball = resolve(outputDir, entry.filename ?? "");
+  const bytes = await readFile(tarball);
+  const integrity = `sha512-${createHash("sha512").update(bytes).digest("base64")}`;
+  if (entry.integrity !== integrity) throw new Error(`npm pack integrity mismatch for ${entry.filename}`);
+  if (!Array.isArray(entry.files)) throw new Error(`npm pack did not list files for ${entry.filename}`);
+  return {
+    filename: entry.filename,
+    integrity,
+    shasum: createHash("sha1").update(bytes).digest("hex"),
+    files: entry.files.map((file) => file.path),
+  };
+}
+
+function assertPackedFiles(pack, required, label) {
+  for (const file of required) {
+    if (!pack.files.includes(file)) throw new Error(`${label} npm tarball does not carry ${file}`);
+  }
+}
+
+const options = parseArguments(process.argv.slice(2));
+await mkdir(options.outputDir, { recursive: true });
+const nativePrebuilds = await Promise.all(ARCHITECTURES.map((arch) => verifyPrebuild(options.nativeRoot, "", arch)));
+const daemonPrebuilds = await Promise.all(ARCHITECTURES.map((arch) => verifyPrebuild(options.daemonRoot, "windows-native", arch)));
+for (const arch of ARCHITECTURES) {
+  const native = nativePrebuilds.find((entry) => entry.arch === arch);
+  const daemon = daemonPrebuilds.find((entry) => entry.arch === arch);
+  if (!native || !daemon || native.sha256 !== daemon.sha256 || native.signerThumbprintSha1 !== daemon.signerThumbprintSha1) {
+    throw new Error(`Daemon embedded prebuild for ${arch} differs from its signed native package artifact`);
+  }
+}
+const [nativePack, daemonPack] = await Promise.all([
+  packPackage(options.nativeRoot, options.outputDir),
+  packPackage(options.daemonRoot, options.outputDir),
+]);
+assertPackedFiles(
+  nativePack,
+  ARCHITECTURES.flatMap((arch) => [
+    `prebuilds/win32-${arch}/${ARTIFACT_NAME}`,
+    `prebuilds/win32-${arch}/manifest.json`,
+  ]),
+  "windows-native",
+);
+assertPackedFiles(
+  daemonPack,
+  ARCHITECTURES.flatMap((arch) => [
+    `windows-native/prebuilds/win32-${arch}/${ARTIFACT_NAME}`,
+    `windows-native/prebuilds/win32-${arch}/manifest.json`,
+  ]),
+  "daemon",
+);
+const evidence = {
+  schemaVersion: 1,
+  nativePrebuilds,
+  packages: {
+    windowsNative: { filename: nativePack.filename, integrity: nativePack.integrity, shasum: nativePack.shasum },
+    daemon: { filename: daemonPack.filename, integrity: daemonPack.integrity, shasum: daemonPack.shasum },
+  },
+};
+const evidencePath = join(options.outputDir, "npm-pack-integrity.json");
+await writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`, { mode: 0o600 });
+process.stdout.write(`${JSON.stringify({ evidencePath, ...evidence })}\n`);
