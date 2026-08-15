@@ -87,10 +87,10 @@ jobs:
           if (-not $signTool) { throw 'signtool.exe was not found in the Windows SDK' }
           try {
             Export-Certificate -Cert $certificate -FilePath $certificateFile | Out-Null
-            Write-Host 'Trusting ephemeral certificate through non-interactive certutil'
-            & certutil.exe -user -f -addstore Root $certificateFile
+            Write-Host 'Trusting ephemeral certificate in the isolated runner machine stores'
+            & certutil.exe -f -addstore Root $certificateFile
             if ($LASTEXITCODE -ne 0) { throw 'certutil failed to trust the ephemeral root certificate' }
-            & certutil.exe -user -f -addstore TrustedPublisher $certificateFile
+            & certutil.exe -f -addstore TrustedPublisher $certificateFile
             if ($LASTEXITCODE -ne 0) { throw 'certutil failed to trust the ephemeral publisher certificate' }
             Copy-Item -LiteralPath $source -Destination $artifact -Force
             Write-Host "Signing $artifact with $signTool"
@@ -108,9 +108,9 @@ jobs:
           } finally {
             Copy-Item -LiteralPath $source -Destination $artifact -Force
             node packages/windows-native/scripts/stage-prebuild.mjs --source $artifact --destination packages/windows-native --arch ${{ matrix.arch }} --authenticode-status unsigned
-            & certutil.exe -user -f -delstore Root $certificate.Thumbprint
+            & certutil.exe -f -delstore Root $certificate.Thumbprint
             if ($LASTEXITCODE -ne 0) { Write-Warning 'certutil could not remove the ephemeral root certificate' }
-            & certutil.exe -user -f -delstore TrustedPublisher $certificate.Thumbprint
+            & certutil.exe -f -delstore TrustedPublisher $certificate.Thumbprint
             if ($LASTEXITCODE -ne 0) { Write-Warning 'certutil could not remove the ephemeral publisher certificate' }
             $global:LASTEXITCODE = 0
             Remove-Item -LiteralPath $certificateFile -Force -ErrorAction SilentlyContinue
