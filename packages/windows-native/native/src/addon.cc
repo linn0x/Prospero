@@ -23,8 +23,8 @@
 namespace {
 
 constexpr uint32_t kMaximumPipeIoBytes = 16U * 1024U * 1024U;
-constexpr uint32_t kMaxNativeIoBytes = 16u * 1024u * 1024u;
 #if defined(_WIN32)
+constexpr uint32_t kMaxNativeIoBytes = 16u * 1024u * 1024u;
 // CreateProcessW accepts at most 32,767 UTF-16 code units including its
 // required terminators. The block builder counts every separator and final
 // NUL before passing the owned memory to Windows.
@@ -163,25 +163,25 @@ bool GetUint8Array(napi_env env,
 }
 
 bool SetUint32(napi_env env, napi_value object, const char* name, uint32_t value) {
-  napi_value js_value;
+  napi_value js_value = nullptr;
   return napi_create_uint32(env, value, &js_value) == napi_ok &&
          napi_set_named_property(env, object, name, js_value) == napi_ok;
 }
 
 bool SetBool(napi_env env, napi_value object, const char* name, bool value) {
-  napi_value js_value;
+  napi_value js_value = nullptr;
   return napi_get_boolean(env, value, &js_value) == napi_ok &&
          napi_set_named_property(env, object, name, js_value) == napi_ok;
 }
 
 bool SetString(napi_env env, napi_value object, const char* name, const char* value) {
-  napi_value js_value;
+  napi_value js_value = nullptr;
   return napi_create_string_utf8(env, value, NAPI_AUTO_LENGTH, &js_value) == napi_ok &&
          napi_set_named_property(env, object, name, js_value) == napi_ok;
 }
 
 bool SetWideString(napi_env env, napi_value object, const char* name, const wchar_t* value) {
-  napi_value js_value;
+  napi_value js_value = nullptr;
   return value != nullptr &&
          napi_create_string_utf16(env, reinterpret_cast<const char16_t*>(value),
                                   NAPI_AUTO_LENGTH, &js_value) == napi_ok &&
@@ -189,7 +189,7 @@ bool SetWideString(napi_env env, napi_value object, const char* name, const wcha
 }
 
 napi_value ReturnUndefined(napi_env env) {
-  napi_value value;
+  napi_value value = nullptr;
   return napi_get_undefined(env, &value) == napi_ok ? value : nullptr;
 }
 
@@ -209,8 +209,8 @@ bool ParseFileTime(const std::string& value, uint64_t* out) {
 
 bool GetProcessIdentity(napi_env env, napi_value value, prospero_process_identity* identity) {
   if (!IsObject(env, value)) return false;
-  napi_value pid_value;
-  napi_value creation_time_value;
+  napi_value pid_value = nullptr;
+  napi_value creation_time_value = nullptr;
   uint32_t pid = 0;
   std::string creation_time;
   if (!GetNamed(env, value, "pid", &pid_value) || !GetUint32(env, pid_value, &pid) || pid == 0 ||
@@ -225,8 +225,8 @@ bool GetProcessIdentity(napi_env env, napi_value value, prospero_process_identit
 
 napi_value MakeProcessIdentity(napi_env env, const prospero_process_identity& identity) {
   try {
-    napi_value object;
-    napi_value creation_time;
+    napi_value object = nullptr;
+    napi_value creation_time = nullptr;
     const std::string value = std::to_string(identity.creation_time_100ns);
     if (napi_create_object(env, &object) != napi_ok ||
         !SetUint32(env, object, "pid", identity.pid) ||
@@ -242,8 +242,8 @@ napi_value MakeProcessIdentity(napi_env env, const prospero_process_identity& id
 
 napi_value MakeUint8Array(napi_env env, const uint8_t* data, uint32_t length) {
   void* raw = nullptr;
-  napi_value buffer;
-  napi_value output;
+  napi_value buffer = nullptr;
+  napi_value output = nullptr;
   if (napi_create_arraybuffer(env, length, &raw, &buffer) != napi_ok ||
       napi_create_typedarray(env, napi_uint8_array, length, buffer, 0, &output) != napi_ok) {
     return nullptr;
@@ -320,7 +320,7 @@ bool IsFullLocalPipeName(const std::wstring& value) {
 #endif
 
 bool ExportMethod(napi_env env, napi_value exports, const char* name, napi_callback callback) {
-  napi_value function;
+  napi_value function = nullptr;
   return napi_create_function(env, name, NAPI_AUTO_LENGTH, callback, nullptr, &function) == napi_ok &&
          napi_set_named_property(env, exports, name, function) == napi_ok;
 }
@@ -332,8 +332,8 @@ napi_value GetAbiInfo(napi_env env, napi_callback_info info) {
     napi_throw_error(env, "PROSPERO_NATIVE_INTERNAL", "Could not query native ABI report");
     return nullptr;
   }
-  napi_value report;
-  napi_value capabilities;
+  napi_value report = nullptr;
+  napi_value capabilities = nullptr;
   if (napi_create_object(env, &report) != napi_ok || napi_create_object(env, &capabilities) != napi_ok) {
     return nullptr;
   }
@@ -380,7 +380,7 @@ napi_value GetCurrentProcessIdentity(napi_env env, napi_callback_info info) {
 }
 
 napi_value GetProcessIdentityForPid(napi_env env, napi_callback_info info) {
-  napi_value argv[1];
+  napi_value argv[1] = {nullptr};
   size_t argc = 0;
   uint32_t pid = 0;
   if (!GetArguments(env, info, 1, argv, &argc) || argc != 1 || !GetUint32(env, argv[0], &pid) || pid == 0) {
@@ -393,7 +393,7 @@ napi_value GetProcessIdentityForPid(napi_env env, napi_callback_info info) {
 }
 
 napi_value MatchesProcessIdentity(napi_env env, napi_callback_info info) {
-  napi_value argv[1];
+  napi_value argv[1] = {nullptr};
   size_t argc = 0;
   prospero_process_identity identity{};
   if (!GetArguments(env, info, 1, argv, &argc) || argc != 1 ||
@@ -403,7 +403,7 @@ napi_value MatchesProcessIdentity(napi_env env, napi_callback_info info) {
   uint8_t matches = 0;
   const prospero_status status = prospero_process_identity_matches(identity, &matches);
   if (status != PROSPERO_STATUS_OK) return ThrowStatus(env, status);
-  napi_value result;
+  napi_value result = nullptr;
   return napi_get_boolean(env, matches != 0, &result) == napi_ok ? result : nullptr;
 }
 
@@ -413,13 +413,13 @@ napi_value CreateSecureNamedPipeServer(napi_env env, napi_callback_info info) {
 #else
   PSECURITY_DESCRIPTOR descriptor = nullptr;
   try {
-  napi_value argv[1];
+  napi_value argv[1] = {nullptr};
   size_t argc = 0;
-  napi_value pipe_name_value;
-  napi_value allowed_sid_value;
-  napi_value max_instances_value;
-  napi_value inbound_value;
-  napi_value outbound_value;
+  napi_value pipe_name_value = nullptr;
+  napi_value allowed_sid_value = nullptr;
+  napi_value max_instances_value = nullptr;
+  napi_value inbound_value = nullptr;
+  napi_value outbound_value = nullptr;
   std::wstring pipe_name;
   std::wstring allowed_sid;
   uint32_t max_instances = 0;
@@ -465,7 +465,7 @@ napi_value CreateSecureNamedPipeServer(napi_env env, napi_callback_info info) {
   LocalFree(descriptor);
   descriptor = nullptr;
   if (status != PROSPERO_STATUS_OK) return ThrowStatus(env, status);
-  napi_value result;
+  napi_value result = nullptr;
   return napi_create_bigint_uint64(env, server, &result) == napi_ok ? result : nullptr;
   } catch (...) {
     if (descriptor != nullptr) LocalFree(descriptor);
@@ -475,7 +475,7 @@ napi_value CreateSecureNamedPipeServer(napi_env env, napi_callback_info info) {
 }
 
 napi_value AcceptSecureNamedPipeConnection(napi_env env, napi_callback_info info) {
-  napi_value argv[1];
+  napi_value argv[1] = {nullptr};
   size_t argc = 0;
   uint64_t server = 0;
   if (!GetArguments(env, info, 1, argv, &argc) || argc != 1 ||
@@ -485,12 +485,12 @@ napi_value AcceptSecureNamedPipeConnection(napi_env env, napi_callback_info info
   prospero_secure_pipe_connection_handle connection = 0;
   const prospero_status status = prospero_secure_pipe_server_accept(server, &connection);
   if (status != PROSPERO_STATUS_OK) return ThrowStatus(env, status);
-  napi_value result;
+  napi_value result = nullptr;
   return napi_create_bigint_uint64(env, connection, &result) == napi_ok ? result : nullptr;
 }
 
 napi_value CloseSecureNamedPipeServer(napi_env env, napi_callback_info info) {
-  napi_value argv[1];
+  napi_value argv[1] = {nullptr};
   size_t argc = 0;
   uint64_t server = 0;
   if (!GetArguments(env, info, 1, argv, &argc) || argc != 1 ||
@@ -502,7 +502,7 @@ napi_value CloseSecureNamedPipeServer(napi_env env, napi_callback_info info) {
 }
 
 napi_value ReadSecureNamedPipeConnection(napi_env env, napi_callback_info info) {
-  napi_value argv[2];
+  napi_value argv[2] = {nullptr};
   size_t argc = 0;
   uint64_t connection = 0;
   uint32_t maximum = 0;
@@ -524,7 +524,7 @@ napi_value ReadSecureNamedPipeConnection(napi_env env, napi_callback_info info) 
 }
 
 napi_value WriteSecureNamedPipeConnection(napi_env env, napi_callback_info info) {
-  napi_value argv[2];
+  napi_value argv[2] = {nullptr};
   size_t argc = 0;
   uint64_t connection = 0;
   uint8_t* data = nullptr;
@@ -538,12 +538,12 @@ napi_value WriteSecureNamedPipeConnection(napi_env env, napi_callback_info info)
   const prospero_status status = prospero_secure_pipe_connection_write(
       connection, data, length, &written);
   if (status != PROSPERO_STATUS_OK) return ThrowStatus(env, status);
-  napi_value result;
+  napi_value result = nullptr;
   return napi_create_uint32(env, written, &result) == napi_ok ? result : nullptr;
 }
 
 napi_value GetSecureNamedPipePeerIdentity(napi_env env, napi_callback_info info) {
-  napi_value argv[1];
+  napi_value argv[1] = {nullptr};
   size_t argc = 0;
   uint64_t connection = 0;
   if (!GetArguments(env, info, 1, argv, &argc) || argc != 1 ||
@@ -563,7 +563,7 @@ napi_value GetSecureNamedPipePeerIdentity(napi_env env, napi_callback_info info)
   } catch (...) {
     return ThrowStatus(env, PROSPERO_STATUS_SYSTEM_ERROR);
   }
-  napi_value result;
+  napi_value result = nullptr;
   napi_value process = MakeProcessIdentity(env, peer.process);
   if (process == nullptr || napi_create_object(env, &result) != napi_ok ||
       napi_set_named_property(env, result, "process", process) != napi_ok ||
@@ -575,7 +575,7 @@ napi_value GetSecureNamedPipePeerIdentity(napi_env env, napi_callback_info info)
 }
 
 napi_value DisconnectSecureNamedPipeConnection(napi_env env, napi_callback_info info) {
-  napi_value argv[1];
+  napi_value argv[1] = {nullptr};
   size_t argc = 0;
   uint64_t connection = 0;
   if (!GetArguments(env, info, 1, argv, &argc) || argc != 1 ||
@@ -587,7 +587,7 @@ napi_value DisconnectSecureNamedPipeConnection(napi_env env, napi_callback_info 
 }
 
 napi_value CloseSecureNamedPipeConnection(napi_env env, napi_callback_info info) {
-  napi_value argv[1];
+  napi_value argv[1] = {nullptr};
   size_t argc = 0;
   uint64_t connection = 0;
   if (!GetArguments(env, info, 1, argv, &argc) || argc != 1 ||
@@ -599,7 +599,7 @@ napi_value CloseSecureNamedPipeConnection(napi_env env, napi_callback_info info)
 }
 
 napi_value DpapiProtectCurrentUser(napi_env env, napi_callback_info info) {
-  napi_value argv[2];
+  napi_value argv[2] = {nullptr};
   size_t argc = 0;
   uint8_t* plaintext = nullptr;
   uint8_t* entropy = nullptr;
@@ -621,7 +621,7 @@ napi_value DpapiProtectCurrentUser(napi_env env, napi_callback_info info) {
 }
 
 napi_value DpapiUnprotectCurrentUser(napi_env env, napi_callback_info info) {
-  napi_value argv[2];
+  napi_value argv[2] = {nullptr};
   size_t argc = 0;
   uint8_t* ciphertext = nullptr;
   uint8_t* entropy = nullptr;
@@ -640,9 +640,9 @@ napi_value DpapiUnprotectCurrentUser(napi_env env, napi_callback_info info) {
 }
 
 napi_value OpenSecureStateDirectory(napi_env env, napi_callback_info info) {
-  napi_value argv[1];
+  napi_value argv[1] = {nullptr};
   size_t argc = 0;
-  napi_value path_value;
+  napi_value path_value = nullptr;
   std::wstring path;
   if (!GetArguments(env, info, 1, argv, &argc) || argc != 1 || !IsObject(env, argv[0]) ||
       !GetNamed(env, argv[0], "path", &path_value) || !GetUtf16(env, path_value, &path) ||
@@ -654,12 +654,12 @@ napi_value OpenSecureStateDirectory(napi_env env, napi_callback_info info) {
   prospero_secure_state_directory_handle directory = 0;
   const prospero_status status = prospero_secure_state_directory_open(&options, &directory);
   if (status != PROSPERO_STATUS_OK) return ThrowStatus(env, status);
-  napi_value result;
+  napi_value result = nullptr;
   return napi_create_bigint_uint64(env, directory, &result) == napi_ok ? result : nullptr;
 }
 
 napi_value WriteSecureStateFileAtomically(napi_env env, napi_callback_info info) {
-  napi_value argv[3];
+  napi_value argv[3] = {nullptr};
   size_t argc = 0;
   uint64_t directory = 0;
   std::wstring file_name;
@@ -676,7 +676,7 @@ napi_value WriteSecureStateFileAtomically(napi_env env, napi_callback_info info)
 }
 
 napi_value ReadSecureStateFile(napi_env env, napi_callback_info info) {
-  napi_value argv[2];
+  napi_value argv[2] = {nullptr};
   size_t argc = 0;
   uint64_t directory = 0;
   std::wstring file_name;
@@ -692,7 +692,7 @@ napi_value ReadSecureStateFile(napi_env env, napi_callback_info info) {
 }
 
 napi_value ListSecureStateEntries(napi_env env, napi_callback_info info) {
-  napi_value argv[1];
+  napi_value argv[1] = {nullptr};
   size_t argc = 0;
   uint64_t directory = 0;
   if (!GetArguments(env, info, 1, argv, &argc) || argc != 1 ||
@@ -702,13 +702,13 @@ napi_value ListSecureStateEntries(napi_env env, napi_callback_info info) {
   prospero_secure_state_entry_list entries{};
   const prospero_status status = prospero_secure_state_directory_list(directory, &entries);
   if (status != PROSPERO_STATUS_OK) return ThrowStatus(env, status);
-  napi_value result;
+  napi_value result = nullptr;
   if (napi_create_array_with_length(env, entries.count, &result) != napi_ok) {
     prospero_secure_state_entry_list_release(&entries);
     return nullptr;
   }
   for (uint32_t index = 0; index < entries.count; ++index) {
-    napi_value value;
+    napi_value value = nullptr;
     if (napi_create_string_utf16(env, reinterpret_cast<const char16_t*>(entries.entries[index]),
                                  NAPI_AUTO_LENGTH, &value) != napi_ok ||
         napi_set_element(env, result, index, value) != napi_ok) {
@@ -721,7 +721,7 @@ napi_value ListSecureStateEntries(napi_env env, napi_callback_info info) {
 }
 
 napi_value RemoveSecureStateFile(napi_env env, napi_callback_info info) {
-  napi_value argv[2];
+  napi_value argv[2] = {nullptr};
   size_t argc = 0;
   uint64_t directory = 0;
   std::wstring file_name;
@@ -735,7 +735,7 @@ napi_value RemoveSecureStateFile(napi_env env, napi_callback_info info) {
 }
 
 napi_value CloseSecureStateDirectory(napi_env env, napi_callback_info info) {
-  napi_value argv[1];
+  napi_value argv[1] = {nullptr};
   size_t argc = 0;
   uint64_t directory = 0;
   if (!GetArguments(env, info, 1, argv, &argc) || argc != 1 ||
@@ -747,6 +747,8 @@ napi_value CloseSecureStateDirectory(napi_env env, napi_callback_info info) {
 }
 
 namespace process_terminal {
+
+#if defined(_WIN32)
 
 void ThrowStatus(napi_env env, prospero_status status, const char* operation) {
   const char* code = "PROSPERO_NATIVE_SYSTEM_ERROR";
@@ -779,8 +781,6 @@ void ThrowStatus(napi_env env, prospero_status status, const char* operation) {
   napi_throw_error(env, code, message.c_str());
 }
 
-#if defined(_WIN32)
-
 void ThrowTypeError(napi_env env, const char* message) {
   napi_throw_type_error(env, "PROSPERO_NATIVE_INVALID_ARGUMENT", message);
 }
@@ -806,7 +806,7 @@ bool GetRequiredObjectArgument(
     napi_env env,
     napi_callback_info info,
     napi_value* out_options) {
-  napi_value arguments[1];
+  napi_value arguments[1] = {nullptr};
   size_t count = 0;
   if (!GetArguments(env, info, 1, &count, arguments) || count != 1 ||
       !IsObject(env, arguments[0])) {
@@ -823,13 +823,15 @@ bool GetNamedProperty(
     const char* name,
     napi_value* out_value,
     bool* out_present) {
+  if (out_value == nullptr) return false;
+  *out_value = nullptr;
+  if (out_present != nullptr) *out_present = false;
   bool present = false;
   if (napi_has_named_property(env, object, name, &present) != napi_ok) return false;
-  if (!present) {
-    if (out_present != nullptr) *out_present = false;
-    return true;
-  }
-  if (napi_get_named_property(env, object, name, out_value) != napi_ok) return false;
+  if (!present) return true;
+  napi_value value = nullptr;
+  if (napi_get_named_property(env, object, name, &value) != napi_ok || value == nullptr) return false;
+  *out_value = value;
   if (out_present != nullptr) *out_present = true;
   return true;
 }
@@ -860,7 +862,7 @@ bool GetRequiredStringProperty(
     napi_value object,
     const char* name,
     std::wstring* out_value) {
-  napi_value value;
+  napi_value value = nullptr;
   bool present = false;
   if (!GetNamedProperty(env, object, name, &value, &present) || !present) {
     ThrowTypeError(env, "required string option is missing");
@@ -875,7 +877,7 @@ bool GetOptionalStringProperty(
     const char* name,
     std::wstring* out_value,
     bool* out_present) {
-  napi_value value;
+  napi_value value = nullptr;
   bool present = false;
   if (!GetNamedProperty(env, object, name, &value, &present)) return false;
   if (!present) {
@@ -894,7 +896,7 @@ bool GetBoolProperty(
     bool required,
     bool* out_value,
     bool* out_present = nullptr) {
-  napi_value value;
+  napi_value value = nullptr;
   bool present = false;
   if (!GetNamedProperty(env, object, name, &value, &present)) return false;
   if (!present) {
@@ -939,7 +941,7 @@ bool GetOptionalUint32Property(
     const char* name,
     uint32_t* out_value,
     bool* out_present) {
-  napi_value value;
+  napi_value value = nullptr;
   bool present = false;
   if (!GetNamedProperty(env, object, name, &value, &present)) return false;
   if (!present) {
@@ -960,7 +962,7 @@ bool GetStringArrayProperty(
     napi_value object,
     const char* name,
     std::vector<std::wstring>* out_values) {
-  napi_value value;
+  napi_value value = nullptr;
   bool present = false;
   if (!GetNamedProperty(env, object, name, &value, &present) || !present) {
     ThrowTypeError(env, "required arguments array is missing");
@@ -979,7 +981,7 @@ bool GetStringArrayProperty(
   out_values->clear();
   out_values->reserve(length);
   for (uint32_t index = 0; index < length; ++index) {
-    napi_value element;
+    napi_value element = nullptr;
     if (napi_get_element(env, value, index, &element) != napi_ok) return false;
     std::wstring argument;
     if (!GetUtf16String(env, element, &argument)) return false;
@@ -1003,7 +1005,7 @@ bool ContainsInvalidEnvironmentText(const std::wstring& value) {
 }
 
 bool BuildEnvironmentBlock(napi_env env, napi_value options, EnvironmentBlock* out_block) {
-  napi_value environment;
+  napi_value environment = nullptr;
   bool present = false;
   if (!GetNamedProperty(env, options, "environment", &environment, &present)) return false;
   if (!present) {
@@ -1014,7 +1016,7 @@ bool BuildEnvironmentBlock(napi_env env, napi_value options, EnvironmentBlock* o
     ThrowTypeError(env, "environment must be an object of string values");
     return false;
   }
-  napi_value keys;
+  napi_value keys = nullptr;
   if (napi_get_property_names(env, environment, &keys) != napi_ok) return false;
   uint32_t key_count = 0;
   if (napi_get_array_length(env, keys, &key_count) != napi_ok || key_count > 4096) {
@@ -1028,8 +1030,8 @@ bool BuildEnvironmentBlock(napi_env env, napi_value options, EnvironmentBlock* o
   std::vector<EnvironmentEntry> entries;
   entries.reserve(key_count);
   for (uint32_t index = 0; index < key_count; ++index) {
-    napi_value key_value;
-    napi_value value;
+    napi_value key_value = nullptr;
+    napi_value value = nullptr;
     if (napi_get_element(env, keys, index, &key_value) != napi_ok ||
         napi_get_property(env, environment, key_value, &value) != napi_ok) {
       return false;
@@ -1182,7 +1184,7 @@ bool GetBigIntToken(napi_env env, napi_value value, uint64_t* out_token) {
 }
 
 napi_value MakeBigInt(napi_env env, uint64_t value) {
-  napi_value result;
+  napi_value result = nullptr;
   if (napi_create_bigint_uint64(env, value, &result) != napi_ok) return nullptr;
   return result;
 }
@@ -1212,7 +1214,7 @@ bool GetOptionalJobProperty(
     napi_value options,
     prospero_job_object_handle* out_job,
     uint8_t* out_has_job) {
-  napi_value value;
+  napi_value value = nullptr;
   bool present = false;
   if (!GetNamedProperty(env, options, "job", &value, &present)) return false;
   if (!present) {
@@ -1229,9 +1231,9 @@ bool MakeProcessIdentity(
     napi_env env,
     const prospero_process_identity& identity,
     napi_value* out_value) {
-  napi_value result;
-  napi_value pid;
-  napi_value creation_time;
+  napi_value result = nullptr;
+  napi_value pid = nullptr;
+  napi_value creation_time = nullptr;
   const std::string ticks = std::to_string(identity.creation_time_100ns);
   if (napi_create_object(env, &result) != napi_ok ||
       napi_create_uint32(env, identity.pid, &pid) != napi_ok ||
@@ -1248,7 +1250,7 @@ bool MakeParentJobCompatibility(
     napi_env env,
     const prospero_parent_job_compatibility& value,
     napi_value* out_value) {
-  napi_value result;
+  napi_value result = nullptr;
   if (napi_create_object(env, &result) != napi_ok ||
       !SetBool(env, result, "parentJobDetected", value.parent_job_detected != 0) ||
       !SetBool(env, result, "breakawayAllowed", value.breakaway_allowed != 0) ||
@@ -1296,7 +1298,7 @@ bool ParseProcessLaunchOptions(
 }
 
 napi_value CreateJobObject(napi_env env, napi_callback_info info) {
-  napi_value options_value;
+  napi_value options_value = nullptr;
   if (!GetRequiredObjectArgument(env, info, &options_value)) return nullptr;
   bool kill_on_close = false;
   if (!GetBoolProperty(env, options_value, "killOnClose", true, &kill_on_close)) return nullptr;
@@ -1324,7 +1326,7 @@ napi_value CreateJobObject(napi_env env, napi_callback_info info) {
 }
 
 napi_value AssignProcessToJob(napi_env env, napi_callback_info info) {
-  napi_value arguments[2];
+  napi_value arguments[2] = {nullptr};
   size_t count = 0;
   if (!GetArguments(env, info, 2, &count, arguments) || count != 2) {
     ThrowTypeError(env, "assignProcessToJob expects a Job Object and process identity");
@@ -1332,8 +1334,8 @@ napi_value AssignProcessToJob(napi_env env, napi_callback_info info) {
   }
   prospero_job_object_handle job = 0;
   if (!GetRequiredJobHandle(env, arguments[0], &job) || !IsObject(env, arguments[1])) return nullptr;
-  napi_value pid_value;
-  napi_value creation_value;
+  napi_value pid_value = nullptr;
+  napi_value creation_value = nullptr;
   bool has_pid = false;
   bool has_creation = false;
   if (!GetNamedProperty(env, arguments[1], "pid", &pid_value, &has_pid) ||
@@ -1361,13 +1363,11 @@ napi_value AssignProcessToJob(napi_env env, napi_callback_info info) {
     ThrowStatus(env, status, "assignProcessToJob");
     return nullptr;
   }
-  napi_value undefined;
-  napi_get_undefined(env, &undefined);
-  return undefined;
+  return ReturnUndefined(env);
 }
 
 napi_value TerminateJobObject(napi_env env, napi_callback_info info) {
-  napi_value arguments[2];
+  napi_value arguments[2] = {nullptr};
   size_t count = 0;
   if (!GetArguments(env, info, 2, &count, arguments) || count != 2) {
     ThrowTypeError(env, "terminateJobObject expects a Job Object and exit code");
@@ -1382,13 +1382,11 @@ napi_value TerminateJobObject(napi_env env, napi_callback_info info) {
     ThrowStatus(env, status, "terminateJobObject");
     return nullptr;
   }
-  napi_value undefined;
-  napi_get_undefined(env, &undefined);
-  return undefined;
+  return ReturnUndefined(env);
 }
 
 napi_value CloseJobObject(napi_env env, napi_callback_info info) {
-  napi_value arguments[1];
+  napi_value arguments[1] = {nullptr};
   size_t count = 0;
   if (!GetArguments(env, info, 1, &count, arguments) || count != 1) {
     ThrowTypeError(env, "closeJobObject expects a Job Object");
@@ -1406,13 +1404,11 @@ napi_value CloseJobObject(napi_env env, napi_callback_info info) {
     ThrowStatus(env, status, "closeJobObject");
     return nullptr;
   }
-  napi_value undefined;
-  napi_get_undefined(env, &undefined);
-  return undefined;
+  return ReturnUndefined(env);
 }
 
 napi_value GetParentJobCompatibility(napi_env env, napi_callback_info info) {
-  napi_value unused[1];
+  napi_value unused[1] = {nullptr};
   size_t count = 0;
   if (!GetArguments(env, info, 1, &count, unused) || count != 0) {
     ThrowTypeError(env, "getParentJobCompatibility expects no arguments");
@@ -1424,12 +1420,12 @@ napi_value GetParentJobCompatibility(napi_env env, napi_callback_info info) {
     ThrowStatus(env, status, "getParentJobCompatibility");
     return nullptr;
   }
-  napi_value result;
+  napi_value result = nullptr;
   return MakeParentJobCompatibility(env, compatibility, &result) ? result : nullptr;
 }
 
 napi_value LaunchDetachedHost(napi_env env, napi_callback_info info) {
-  napi_value options_value;
+  napi_value options_value = nullptr;
   if (!GetRequiredObjectArgument(env, info, &options_value)) return nullptr;
   ParsedProcessLaunchOptions parsed;
   if (!ParseProcessLaunchOptions(env, options_value, true, &parsed)) return nullptr;
@@ -1448,10 +1444,10 @@ napi_value LaunchDetachedHost(napi_env env, napi_callback_info info) {
     ThrowStatus(env, status, "launchDetachedHost");
     return nullptr;
   }
-  napi_value response;
+  napi_value response = nullptr;
   if (napi_create_object(env, &response) != napi_ok) return nullptr;
   if (result.outcome == PROSPERO_DETACHED_HOST_PARENT_JOB_PREVENTS_DETACH) {
-    napi_value parent_job;
+    napi_value parent_job = nullptr;
     if (!SetString(env, response, "status", "parent_job_prevents_detach") ||
         !MakeParentJobCompatibility(env, result.parent_job, &parent_job) ||
         napi_set_named_property(env, response, "parentJob", parent_job) != napi_ok) {
@@ -1459,7 +1455,7 @@ napi_value LaunchDetachedHost(napi_env env, napi_callback_info info) {
     }
     return response;
   }
-  napi_value process;
+  napi_value process = nullptr;
   if (result.outcome != PROSPERO_DETACHED_HOST_LAUNCHED ||
       !SetString(env, response, "status", "launched") ||
       !MakeProcessIdentity(env, result.process, &process) ||
@@ -1471,12 +1467,12 @@ napi_value LaunchDetachedHost(napi_env env, napi_callback_info info) {
 }
 
 napi_value SpawnConPty(napi_env env, napi_callback_info info) {
-  napi_value options_value;
+  napi_value options_value = nullptr;
   if (!GetRequiredObjectArgument(env, info, &options_value)) return nullptr;
   ParsedProcessLaunchOptions parsed;
   if (!ParseProcessLaunchOptions(env, options_value, true, &parsed)) return nullptr;
-  napi_value columns_value;
-  napi_value rows_value;
+  napi_value columns_value = nullptr;
+  napi_value rows_value = nullptr;
   bool has_columns = false;
   bool has_rows = false;
   if (!GetNamedProperty(env, options_value, "columns", &columns_value, &has_columns) ||
@@ -1510,7 +1506,7 @@ napi_value SpawnConPty(napi_env env, napi_callback_info info) {
 }
 
 napi_value ResizeConPty(napi_env env, napi_callback_info info) {
-  napi_value arguments[3];
+  napi_value arguments[3] = {nullptr};
   size_t count = 0;
   if (!GetArguments(env, info, 3, &count, arguments) || count != 3) {
     ThrowTypeError(env, "resizeConPty expects a terminal, columns, and rows");
@@ -1527,16 +1523,14 @@ napi_value ResizeConPty(napi_env env, napi_callback_info info) {
     ThrowStatus(env, status, "resizeConPty");
     return nullptr;
   }
-  napi_value undefined;
-  napi_get_undefined(env, &undefined);
-  return undefined;
+  return ReturnUndefined(env);
 }
 
 bool GetByteArray(napi_env env, napi_value value, const uint8_t** out_data, size_t* out_length) {
   napi_typedarray_type array_type;
   size_t length = 0;
   void* data = nullptr;
-  napi_value array_buffer;
+  napi_value array_buffer = nullptr;
   size_t byte_offset = 0;
   if (napi_get_typedarray_info(env,
                                value,
@@ -1555,7 +1549,7 @@ bool GetByteArray(napi_env env, napi_value value, const uint8_t** out_data, size
 }
 
 napi_value ReadConPty(napi_env env, napi_callback_info info) {
-  napi_value arguments[2];
+  napi_value arguments[2] = {nullptr};
   size_t count = 0;
   if (!GetArguments(env, info, 2, &count, arguments) || count != 2) {
     ThrowTypeError(env, "readConPty expects a terminal and maxBytes");
@@ -1578,11 +1572,11 @@ napi_value ReadConPty(napi_env env, napi_callback_info info) {
     ThrowStatus(env, status, "readConPty");
     return nullptr;
   }
-  napi_value array_buffer;
+  napi_value array_buffer = nullptr;
   void* target = nullptr;
   if (napi_create_arraybuffer(env, read, &target, &array_buffer) != napi_ok) return nullptr;
   if (read != 0) memcpy(target, data.data(), read);
-  napi_value result;
+  napi_value result = nullptr;
   if (napi_create_typedarray(env, napi_uint8_array, read, array_buffer, 0, &result) != napi_ok) {
     return nullptr;
   }
@@ -1590,7 +1584,7 @@ napi_value ReadConPty(napi_env env, napi_callback_info info) {
 }
 
 napi_value WriteConPty(napi_env env, napi_callback_info info) {
-  napi_value arguments[2];
+  napi_value arguments[2] = {nullptr};
   size_t count = 0;
   if (!GetArguments(env, info, 2, &count, arguments) || count != 2) {
     ThrowTypeError(env, "writeConPty expects a terminal and Uint8Array");
@@ -1602,9 +1596,8 @@ napi_value WriteConPty(napi_env env, napi_callback_info info) {
   if (!GetRequiredConPtyHandle(env, arguments[0], &terminal) ||
       !GetByteArray(env, arguments[1], &data, &length)) return nullptr;
   if (length == 0) {
-    napi_value zero;
-    napi_create_uint32(env, 0, &zero);
-    return zero;
+    napi_value zero = nullptr;
+    return napi_create_uint32(env, 0, &zero) == napi_ok ? zero : nullptr;
   }
   if (length > kMaxNativeIoBytes) {
     ThrowTypeError(env, "Uint8Array must not exceed 16 MiB");
@@ -1617,13 +1610,13 @@ napi_value WriteConPty(napi_env env, napi_callback_info info) {
     ThrowStatus(env, status, "writeConPty");
     return nullptr;
   }
-  napi_value result;
+  napi_value result = nullptr;
   if (napi_create_uint32(env, written, &result) != napi_ok) return nullptr;
   return result;
 }
 
 napi_value KillConPty(napi_env env, napi_callback_info info) {
-  napi_value arguments[2];
+  napi_value arguments[2] = {nullptr};
   size_t count = 0;
   if (!GetArguments(env, info, 2, &count, arguments) || count != 2) {
     ThrowTypeError(env, "killConPty expects a terminal and exit code");
@@ -1638,13 +1631,11 @@ napi_value KillConPty(napi_env env, napi_callback_info info) {
     ThrowStatus(env, status, "killConPty");
     return nullptr;
   }
-  napi_value undefined;
-  napi_get_undefined(env, &undefined);
-  return undefined;
+  return ReturnUndefined(env);
 }
 
 napi_value CloseConPty(napi_env env, napi_callback_info info) {
-  napi_value arguments[1];
+  napi_value arguments[1] = {nullptr};
   size_t count = 0;
   if (!GetArguments(env, info, 1, &count, arguments) || count != 1) {
     ThrowTypeError(env, "closeConPty expects a terminal");
@@ -1662,9 +1653,7 @@ napi_value CloseConPty(napi_env env, napi_callback_info info) {
     ThrowStatus(env, status, "closeConPty");
     return nullptr;
   }
-  napi_value undefined;
-  napi_get_undefined(env, &undefined);
-  return undefined;
+  return ReturnUndefined(env);
 }
 
 #endif  // defined(_WIN32)
