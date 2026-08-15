@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, join } from "node:path";
+import { dirname, join, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { isMainThread } from "node:worker_threads";
@@ -46,6 +46,58 @@ interface AuthenticodeResult {
   readonly thumbprintSha1: string | null;
 }
 
+const SYSTEM_POWERSHELL_RELATIVE_PATH = [
+  "System32",
+  "WindowsPowerShell",
+  "v1.0",
+  "powershell.exe",
+];
+
+/**
+ * Returns only the inbox PowerShell path beneath an absolute, normalized
+ * SystemRoot. This intentionally never performs PATH resolution: invoking a
+ * same-named executable found through PATH would undermine the verification
+ * decision. `null` is a fail-closed result for a missing or malformed root.
+ */
+export function resolveSystemPowerShellPath(
+  systemRoot: string | undefined,
+  fileExists: (path: string) => boolean = existsSync,
+): string | null {
+  if (
+    typeof systemRoot !== "string" ||
+    systemRoot.length === 0 ||
+    systemRoot !== systemRoot.trim()
+  ) {
+    return null;
+  }
+  // SystemRoot must be a drive-rooted Win32 path. UNC, device, relative, and
+  // forward-slash paths are intentionally excluded from this trust boundary.
+  if (
+    !/^[A-Za-z]:\\/.test(systemRoot) ||
+    systemRoot.includes("/") ||
+    systemRoot.includes("\0")
+  ) {
+    return null;
+  }
+  const normalized = win32.normalize(systemRoot);
+  const root = normalized.endsWith("\\") ? normalized.slice(0, -1) : normalized;
+  if (root.length < 4 || root !== systemRoot.replace(/\\+$/, "") || !win32.isAbsolute(root)) {
+    return null;
+  }
+  const components = root.slice(3).split("\\");
+  if (
+    components.length === 0 ||
+    components.some(
+      (component) => component.length === 0 || component === "." || component === "..",
+    )
+  ) {
+    return null;
+  }
+  if (!fileExists(root)) return null;
+  const powershellPath = win32.join(root, ...SYSTEM_POWERSHELL_RELATIVE_PATH);
+  return fileExists(powershellPath) ? powershellPath : null;
+}
+
 /** Test seam; production callers must use the default runtime. */
 export interface NativeLoaderRuntime {
   readonly platform: string;
@@ -66,20 +118,35 @@ function defaultPackageRoot(): string {
 }
 
 function defaultAuthenticodeCheck(binaryPath: string): AuthenticodeResult {
+  let powershellPath: string | null;
+  try {
+    powershellPath = resolveSystemPowerShellPath(process.env.SystemRoot);
+  } catch {
+    return { status: "systemroot-unavailable", thumbprintSha1: null };
+  }
+  if (powershellPath === null) {
+    return { status: "systemroot-unavailable", thumbprintSha1: null };
+  }
   // The binary path is passed as an argument, not interpolated into PowerShell.
   const command = [
     "$signature = Get-AuthenticodeSignature -LiteralPath $args[0]",
     "$thumbprint = if ($null -eq $signature.SignerCertificate) { '' } else { $signature.SignerCertificate.Thumbprint }",
     "[Console]::Out.Write($signature.Status.ToString() + '|' + $thumbprint)",
   ].join("; ");
-  const result = spawnSync(
-    "powershell.exe",
-    ["-NoProfile", "-NonInteractive", "-Command", command, binaryPath],
-    { encoding: "utf8", windowsHide: true },
-  );
-  if (result.status !== 0) return { status: "command-failed", thumbprintSha1: null };
-  const [status = "unknown", thumbprint = ""] = result.stdout.trim().split("|", 2);
-  return { status, thumbprintSha1: thumbprint || null };
+  try {
+    const result = spawnSync(
+      powershellPath,
+      ["-NoProfile", "-NonInteractive", "-Command", command, binaryPath],
+      { encoding: "utf8", windowsHide: true },
+    );
+    if (result.error || result.status !== 0 || typeof result.stdout !== "string") {
+      return { status: "command-failed", thumbprintSha1: null };
+    }
+    const [status = "unknown", thumbprint = ""] = result.stdout.trim().split("|", 2);
+    return { status, thumbprintSha1: thumbprint || null };
+  } catch {
+    return { status: "command-failed", thumbprintSha1: null };
+  }
 }
 
 function defaultRuntime(): NativeLoaderRuntime {
@@ -164,7 +231,24 @@ function assertAuthenticode(
   if (manifest.authenticode.status !== "valid") {
     loadError("unsigned", "Windows native prebuild is not an Authenticode-verified release artifact");
   }
-  const verified = runtime.verifyAuthenticode(binaryPath);
+  let verifierResult: unknown;
+  try {
+    verifierResult = runtime.verifyAuthenticode(binaryPath);
+  } catch {
+    loadError("authenticode-invalid", "Windows native prebuild Authenticode verification failed unexpectedly");
+  }
+  if (
+    typeof verifierResult !== "object" ||
+    verifierResult === null ||
+    typeof (verifierResult as Partial<AuthenticodeResult>).status !== "string" ||
+    !(
+      typeof (verifierResult as Partial<AuthenticodeResult>).thumbprintSha1 === "string" ||
+      (verifierResult as Partial<AuthenticodeResult>).thumbprintSha1 === null
+    )
+  ) {
+    loadError("authenticode-invalid", "Windows native prebuild Authenticode verifier returned invalid data");
+  }
+  const verified = verifierResult as AuthenticodeResult;
   if (
     verified.status !== "Valid" ||
     verified.thumbprintSha1 === null ||

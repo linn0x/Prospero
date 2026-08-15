@@ -199,6 +199,9 @@ export const NATIVE_SYNCHRONOUS_BLOCKING_METHODS = [
   "dpapiUnprotectCurrentUser",
   "openSecureStateDirectory",
   "writeSecureStateFileAtomically",
+  "readSecureStateFile",
+  "listSecureStateEntries",
+  "removeSecureStateFile",
   "closeSecureStateDirectory",
 ] as const;
 
@@ -250,6 +253,16 @@ interface NativeWindowsMethods {
     fileName: string,
     data: Uint8Array,
   ): void;
+  /**
+   * Reads one state file from the validated directory. `fileName` must be one
+   * non-empty relative path segment: no dot segments, separators, ADS colon,
+   * reserved DOS device name, or reparse-point traversal is accepted.
+   */
+  readSecureStateFile(directory: SecureStateDirectoryHandle, fileName: string): Uint8Array;
+  /** Returns the direct, reparse-free state-file names held by this directory. */
+  listSecureStateEntries(directory: SecureStateDirectoryHandle): readonly string[];
+  /** Deletes one state file using the same strict filename and reparse checks as reads/writes. */
+  removeSecureStateFile(directory: SecureStateDirectoryHandle, fileName: string): void;
   closeSecureStateDirectory(directory: SecureStateDirectoryHandle): void;
 }
 
