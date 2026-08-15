@@ -50,6 +50,11 @@ type NativeProcessTerminalBinding = {
 const native = process.platform === "win32"
   ? require(addonPath) as NativeProcessTerminalBinding
   : undefined as unknown as NativeProcessTerminalBinding;
+const uncheckedNative = native as unknown as {
+  createJobObject(options: unknown): bigint;
+  assignProcessToJob(job: bigint, process: unknown): void;
+  spawnConPty(options: unknown): bigint;
+};
 const encoder = new TextEncoder();
 const describeWindows = process.platform === "win32" ? describe : describe.skip;
 
@@ -152,6 +157,58 @@ describeWindows.sequential("Windows N-API Job Object, detached host, and ConPTY 
       native.closeJobObject(job);
     }
     expect(() => native.closeJobObject(job)).toThrow(/unknown or closed/i);
+  });
+
+  it("fails closed for missing or mistyped N-API launch and identity properties", () => {
+    const processLaunch = {
+      executablePath: process.execPath,
+      arguments: [],
+      columns: 80,
+      rows: 24,
+    };
+
+    // Omitted optional workingDirectory, environment, and job are exercised by
+    // the successful ConPTY smoke below. These malformed variants must fail
+    // while parsing JavaScript options, before any child process is created.
+    expect(() => uncheckedNative.spawnConPty({
+      executablePath: process.execPath,
+      columns: 80,
+      rows: 24,
+    })).toThrow(/arguments array is missing/i);
+    expect(() => uncheckedNative.spawnConPty({
+      executablePath: process.execPath,
+      arguments: [],
+      rows: 24,
+    })).toThrow(/require columns and rows/i);
+    expect(() => uncheckedNative.spawnConPty({ ...processLaunch, columns: "80" }))
+      .toThrow(/unsigned 32-bit integer/i);
+    expect(() => uncheckedNative.spawnConPty({ ...processLaunch, arguments: [80] }))
+      .toThrow(/expected a string/i);
+    expect(() => uncheckedNative.spawnConPty({ ...processLaunch, workingDirectory: 42 }))
+      .toThrow(/expected a string/i);
+    expect(() => uncheckedNative.spawnConPty({ ...processLaunch, environment: "not-an-object" }))
+      .toThrow(/environment must be an object/i);
+    expect(() => uncheckedNative.spawnConPty({ ...processLaunch, job: 42 }))
+      .toThrow(/opaque native bigint handle/i);
+    expect(() => uncheckedNative.createJobObject({})).toThrow(/required boolean option is missing/i);
+    expect(() => uncheckedNative.createJobObject({ killOnClose: true, activeProcessLimit: "1" }))
+      .toThrow(/unsigned 32-bit integer/i);
+
+    const job = native.createJobObject({ killOnClose: true });
+    try {
+      expect(() => uncheckedNative.assignProcessToJob(job, {}))
+        .toThrow(/pid and creationTime100ns/i);
+      expect(() => uncheckedNative.assignProcessToJob(job, {
+        pid: "1",
+        creationTime100ns: "1",
+      })).toThrow(/unsigned 32-bit integer/i);
+      expect(() => uncheckedNative.assignProcessToJob(job, {
+        pid: 1,
+        creationTime100ns: 1,
+      })).toThrow(/expected a string/i);
+    } finally {
+      native.closeJobObject(job);
+    }
   });
 
   it("keeps a launched detached host alive after its launcher exits when parent Job policy permits", async () => {
