@@ -263,6 +263,10 @@ describeWindows.sequential("Windows N-API Job Object, detached host, and ConPTY 
     // output; the capture-boundary case below shows why. Keep argv parsing
     // independent of resize, input, and Job-tree assertions so it identifies
     // a command-line regression once terminal stdio is correctly isolated.
+    const multipleBackslashesBeforeOrdinaryCharacter = "multiple" + "\\".repeat(3) + "ordinary text";
+    const emptyArgument = "";
+    const backslashesBeforeQuote = "slashes before " + "\\".repeat(2) + "\"quote\" after";
+    const trailingBackslashes = "trailing backslashes " + "\\".repeat(3);
     const unicodeArgument = "参数 with spaces, quote \" and trailing slash\\";
     const childSource = [
       "const payload = {",
@@ -276,7 +280,15 @@ describeWindows.sequential("Windows N-API Job Object, detached host, and ConPTY 
     ].join("\n");
     const terminal = native.spawnConPty({
       executablePath: process.execPath,
-      arguments: ["-e", childSource, unicodeArgument, ""],
+      arguments: [
+        "-e",
+        childSource,
+        multipleBackslashesBeforeOrdinaryCharacter,
+        emptyArgument,
+        backslashesBeforeQuote,
+        trailingBackslashes,
+        unicodeArgument,
+      ],
       columns: 80,
       rows: 24,
     });
@@ -286,7 +298,14 @@ describeWindows.sequential("Windows N-API Job Object, detached host, and ConPTY 
       expect(match).not.toBeNull();
       expect(JSON.parse(match?.[1] ?? "")).toEqual({
         argv0: process.execPath,
-        argv: [process.execPath, unicodeArgument, ""],
+        argv: [
+          process.execPath,
+          multipleBackslashesBeforeOrdinaryCharacter,
+          emptyArgument,
+          backslashesBeforeQuote,
+          trailingBackslashes,
+          unicodeArgument,
+        ],
         stdinIsTty: true,
         stdoutIsTty: true,
         stderrIsTty: true,
