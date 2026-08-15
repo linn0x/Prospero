@@ -8,6 +8,8 @@ let connection;
 let phase = "create";
 let binding;
 
+const ROUND_TRIP_ACK = Buffer.from("pipe-round-trip-ack");
+
 function reportFailure(error) {
   parentPort.postMessage({
     type: "error",
@@ -69,8 +71,22 @@ try {
   const peer = binding.getSecureNamedPipePeerIdentity(connection);
   completePhase("peer-identity");
   beginPhase("write");
-  binding.writeSecureNamedPipeConnection(connection, input);
+  const written = binding.writeSecureNamedPipeConnection(connection, input);
+  if (written !== input.byteLength) {
+    throw new Error(`native pipe echo was short (${written}/${input.byteLength})`);
+  }
   completePhase("write");
+  // DisconnectNamedPipe discards server-to-client bytes that the client has
+  // not read.  A completed WriteFile is therefore not a delivery guarantee.
+  // Require the client to read the echoed payload and send a fixed ACK before
+  // closing the native endpoint; this is an ordered duplex boundary, not a
+  // timing delay or an ignored peer-close error.
+  beginPhase("ack-read");
+  const acknowledgement = binding.readSecureNamedPipeConnection(connection, ROUND_TRIP_ACK.byteLength);
+  if (!Buffer.from(acknowledgement).equals(ROUND_TRIP_ACK)) {
+    throw new Error("native pipe client acknowledgement is invalid");
+  }
+  completePhase("ack-read");
   beginPhase("disconnect");
   binding.disconnectSecureNamedPipeConnection(connection);
   binding.closeSecureNamedPipeConnection(connection);
@@ -78,7 +94,7 @@ try {
   binding.closeSecureNamedPipeServer(server);
   server = undefined;
   completePhase("disconnect");
-  parentPort.postMessage({ type: "complete", peer, preReadPeerRejected, preReadWriteRejected });
+  parentPort.postMessage({ type: "complete", peer, preReadPeerRejected, preReadWriteRejected, acknowledged: true });
 } catch (error) {
   reportFailure(error);
 } finally {
