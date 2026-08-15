@@ -25,6 +25,7 @@ describe("cancellable overlapped-operation state", () => {
           "-Wextra",
           "-Werror",
           "-Wpedantic",
+          "-pthread",
           "-I",
           includeDirectory,
           sourcePath,
