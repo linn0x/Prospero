@@ -57,6 +57,18 @@ const uncheckedNative = native as unknown as {
 };
 const encoder = new TextEncoder();
 const describeWindows = process.platform === "win32" ? describe : describe.skip;
+// writeConPty is the raw ConPTY terminal-byte boundary. Windows terminal
+// Enter is CR; the default cooked console read below then reports that line to
+// the provider as CRLF. Any product-facing cross-platform input facade must
+// select the platform terminal byte before it reaches this native API.
+const WINDOWS_TERMINAL_ENTER = "\r";
+
+function providerDataCallbackMarker(data: string): string {
+  // JSON preserves CR and LF visibly in the terminal output. A marker emitted
+  // from the provider's data callback cannot be confused with ConPTY's local
+  // echo of input bytes.
+  return `PROVIDER_DATA:${JSON.stringify(data)}`;
+}
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
@@ -368,13 +380,13 @@ describeWindows.sequential("Windows N-API Job Object, detached host, and ConPTY 
     expect(result.output).toContain(`${marker}:stderr`);
   });
 
-  it("echoes UTF-8, resizes, and Job-kills the provider tree", async () => {
+  it("delivers Windows Enter input to the provider, resizes, and Job-kills the provider tree", async () => {
     const providerSource = [
       "const { spawn } = require('node:child_process');",
       "const grandchild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });",
       "process.stdout.write(`PIDS:${process.pid}:${grandchild.pid}\\n你好🙂\\n`);",
       "process.stdin.setEncoding('utf8');",
-      "process.stdin.on('data', (data) => process.stdout.write(`ECHO:${data}`));",
+      "process.stdin.on('data', (data) => process.stdout.write(`PROVIDER_DATA:${JSON.stringify(data)}\\n`));",
       "setInterval(() => {}, 1000);",
     ].join("\n");
     const terminal = native.spawnConPty({
@@ -387,10 +399,12 @@ describeWindows.sequential("Windows N-API Job Object, detached host, and ConPTY 
       native.resizeConPty(terminal, 120, 40);
       let output = await drainUntil(terminal, "你好");
       expect(output).toContain("你好");
-      const written = native.writeConPty(terminal, encoder.encode("hello\n"));
+      const providerInput = `hello${WINDOWS_TERMINAL_ENTER}`;
+      const providerCallback = providerDataCallbackMarker("hello\r\n");
+      const written = native.writeConPty(terminal, encoder.encode(providerInput));
       expect(written).toBeGreaterThan(0);
-      output += await drainUntil(terminal, "ECHO:hello");
-      expect(output).toContain("ECHO:hello");
+      output += await drainUntil(terminal, providerCallback);
+      expect(output).toContain(providerCallback);
 
       const match = output.match(/PIDS:(\d+):(\d+)/);
       expect(match).not.toBeNull();
@@ -473,12 +487,12 @@ describeWindows.sequential("Windows N-API Job Object, detached host, and ConPTY 
     })).toThrow(/CreateProcessW UTF-16 limit/i);
   });
 
-  it("rolls back a post-launch Job assignment failure without terminating the caller Job", async () => {
+  it("rolls back a post-launch Job assignment failure while the original terminal still reaches its provider", async () => {
     const job = native.createJobObject({ killOnClose: true, activeProcessLimit: 1 });
     const providerSource = [
       "process.stdout.write('READY\\n');",
       "process.stdin.setEncoding('utf8');",
-      "process.stdin.on('data', (data) => process.stdout.write(`ECHO:${data}`));",
+      "process.stdin.on('data', (data) => process.stdout.write(`PROVIDER_DATA:${JSON.stringify(data)}\\n`));",
       "setInterval(() => {}, 1000);",
     ].join("\n");
     const first = native.spawnConPty({
@@ -497,8 +511,10 @@ describeWindows.sequential("Windows N-API Job Object, detached host, and ConPTY 
         rows: 24,
         job,
       })).toThrow();
-      expect(native.writeConPty(first, encoder.encode("still-alive\\n"))).toBeGreaterThan(0);
-      expect(await drainUntil(first, "ECHO:still-alive")).toContain("ECHO:still-alive");
+      const providerInput = `still-alive${WINDOWS_TERMINAL_ENTER}`;
+      const providerCallback = providerDataCallbackMarker("still-alive\r\n");
+      expect(native.writeConPty(first, encoder.encode(providerInput))).toBeGreaterThan(0);
+      expect(await drainUntil(first, providerCallback)).toContain(providerCallback);
     } finally {
       native.closeConPty(first);
       native.closeJobObject(job);
