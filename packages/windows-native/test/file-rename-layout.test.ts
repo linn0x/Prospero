@@ -11,7 +11,7 @@ const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const includeDirectory = join(packageRoot, "native", "include");
 const sourcePath = join(packageRoot, "native", "test", "file_rename_layout_test.cc");
 
-describe("FILE_RENAME_INFO allocation layout", () => {
+describe("FILE_RENAME_INFORMATION allocation layout", () => {
   it.skipIf(process.platform === "win32")(
     "regresses the Windows x64/arm64 SDK-size rule with portable strict C++",
     async () => {
