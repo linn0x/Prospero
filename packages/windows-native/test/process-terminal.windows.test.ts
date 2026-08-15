@@ -19,7 +19,9 @@ type NativeProcessTerminalBinding = {
   };
   createJobObject(options: { killOnClose: boolean; activeProcessLimit?: number }): bigint;
   assignProcessToJob(job: bigint, process: { pid: number; creationTime100ns: string }): void;
+  isProcessInJob(job: bigint, process: { pid: number; creationTime100ns: string }): boolean;
   closeJobObject(job: bigint): void;
+  terminateProcessIfIdentity(identity: { pid: number; creationTime100ns: string }, exitCode: number, timeoutMs: number): boolean;
   launchDetachedHost(options: {
     executablePath: string;
     arguments: string[];
@@ -53,6 +55,7 @@ const native = process.platform === "win32"
 const uncheckedNative = native as unknown as {
   createJobObject(options: unknown): bigint;
   assignProcessToJob(job: bigint, process: unknown): void;
+  isProcessInJob(job: bigint, process: unknown): boolean;
   spawnConPty(options: unknown): bigint;
 };
 const encoder = new TextEncoder();
@@ -165,10 +168,38 @@ describeWindows.sequential("Windows N-API Job Object, detached host, and ConPTY 
         pid: 0x7fff_fffe,
         creationTime100ns: "1",
       })).toThrow(/not found/i);
+      expect(() => native.isProcessInJob(job, {
+        pid: 0x7fff_fffe,
+        creationTime100ns: "1",
+      })).toThrow(/not found/i);
     } finally {
       native.closeJobObject(job);
     }
     expect(() => native.closeJobObject(job)).toThrow(/unknown or closed/i);
+  });
+
+  it("never rolls back a detached host by PID alone", async () => {
+    expect(native.terminateProcessIfIdentity({
+      pid: 0x7fff_fffe,
+      creationTime100ns: "1",
+    }, 1, 100)).toBe(false);
+
+    const launch = native.launchDetachedHost({
+      executablePath: process.execPath,
+      arguments: ["-e", "setInterval(() => {}, 1000)"],
+    });
+    if (launch.status === "parent_job_prevents_detach") {
+      expect(launch.parentJob.detachedLaunchAllowed).toBe(false);
+      return;
+    }
+    expect(native.terminateProcessIfIdentity(launch.process, 0xC000013A, 5_000)).toBe(true);
+    await waitForExit(launch.process.pid);
+    // The same numeric PID with a different creation FILETIME is never a
+    // target, including after the original host has exited.
+    expect(native.terminateProcessIfIdentity({
+      ...launch.process,
+      creationTime100ns: "1",
+    }, 1, 100)).toBe(false);
   });
 
   it("fails closed for missing or mistyped N-API launch and identity properties", () => {

@@ -11,7 +11,7 @@
 extern "C" {
 #endif
 
-#define PROSPERO_WINDOWS_NATIVE_ABI_VERSION 2u
+#define PROSPERO_WINDOWS_NATIVE_ABI_VERSION 3u
 #define PROSPERO_WINDOWS_NATIVE_NAPI_VERSION 8u
 
 typedef enum prospero_status {
@@ -192,6 +192,17 @@ prospero_status prospero_get_process_identity(uint32_t pid, prospero_process_ide
 prospero_status prospero_process_identity_matches(
     prospero_process_identity expected,
     uint8_t* out_matches);
+/**
+ * Terminates and waits for precisely `expected`; a missing or
+ * FILETIME-mismatched process reports `out_terminated = 0`, while access
+ * denial remains an error rather than a false rollback claim. It never falls
+ * back to a PID-only operation.
+ */
+prospero_status prospero_terminate_process_if_identity(
+    prospero_process_identity expected,
+    uint32_t exit_code,
+    uint32_t timeout_ms,
+    uint8_t* out_terminated);
 
 prospero_status prospero_secure_pipe_server_create(
     const prospero_secure_pipe_server_options* options,
@@ -224,6 +235,11 @@ prospero_status prospero_job_object_create(
 prospero_status prospero_job_object_assign_process(
     prospero_job_object_handle job,
     prospero_process_identity process);
+/** Revalidates PID+FILETIME, then audits membership in this exact Job. */
+prospero_status prospero_job_object_contains_process(
+    prospero_job_object_handle job,
+    prospero_process_identity process,
+    uint8_t* out_contains);
 prospero_status prospero_job_object_terminate(prospero_job_object_handle job, uint32_t exit_code);
 prospero_status prospero_job_object_close(prospero_job_object_handle job);
 /**

@@ -74,7 +74,7 @@ const manifest = {
   platform: "win32",
   arch: options.arch,
   artifact: { file: ARTIFACT_NAME, sha256 },
-  native: { abiVersion: 2, napiVersion: 8, capabilities: CAPABILITIES },
+  native: { abiVersion: 3, napiVersion: 8, capabilities: CAPABILITIES },
   authenticode,
 };
 await writeAtomically(targetManifest, `${JSON.stringify(manifest, null, 2)}\n`);

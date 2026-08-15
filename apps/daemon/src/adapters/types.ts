@@ -15,6 +15,39 @@ import type {
   PermissionReply,
 } from "@prospero/protocol";
 import type { ResolvedSkill } from "../composer-context.js";
+import type { ChildProcess } from "node:child_process";
+
+/**
+ * A provider child which failed Job registration is not yet known to the
+ * native Job and must not be left alive while the caller unwinds.  This is
+ * deliberately a direct-child, bounded cleanup only: it is never used as a
+ * substitute for normal provider-tree shutdown (that remains Job-only).
+ */
+async function waitForProviderChildExit(process: Pick<ChildProcess, "once" | "removeListener">, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const exited = (): void => {
+      if (timer !== undefined) clearTimeout(timer);
+      resolve(true);
+    };
+    process.once("exit", exited);
+    timer = setTimeout(() => {
+      process.removeListener("exit", exited);
+      resolve(false);
+    }, timeoutMs);
+  });
+}
+
+export async function terminateUnregisteredProviderProcess(process: Pick<ChildProcess, "exitCode" | "kill" | "once" | "removeListener">): Promise<void> {
+  if (process.exitCode !== null) return;
+  try { process.kill(); } catch { /* the original registration error wins */ }
+  if (await waitForProviderChildExit(process, 750)) return;
+  // POSIX test/dev children may ignore SIGTERM. This remains exact to the
+  // direct just-spawned PID and is bounded; normal provider-tree shutdown is
+  // never routed through this helper.
+  try { process.kill("SIGKILL"); } catch { /* the original registration error wins */ }
+  await waitForProviderChildExit(process, 250);
+}
 
 export interface AdapterContext {
   cwd: string;
@@ -39,12 +72,24 @@ export interface AdapterContext {
    * 上层收到后立即落盘，daemon 重启时再交还给同一个适配器。
    */
   persistState?(state: AdapterResumeState): void;
+  /**
+   * Durable Windows hosts register every provider child with their native
+   * KILL_ON_JOB_CLOSE Job before the adapter begins using it.  Assignment
+   * failure is deliberately fatal; callers must not fall back to PID kills.
+   */
+  registerProviderProcess?(process: { pid?: number | undefined }): Promise<void>;
 }
 
 /** 只允许 JSON 可序列化的浅对象；各适配器自行校验自己认识的字段。 */
 export type AdapterResumeState = Record<string, unknown>;
 
 export interface AgentAdapter {
+  /**
+   * Windows durable hosts put the Session Host itself in the Job before this
+   * adapter starts; adapters inherit containment and may optionally audit a
+   * child identity through `registerProviderProcess`.
+   */
+  readonly durableProviderJobCompatible?: boolean;
   /** 是否能直接吃图;false 时由上层落盘降级 */
   readonly acceptsImages?: boolean;
   /** 是否支持 Codex app-server 风格的原生 Skill input。 */

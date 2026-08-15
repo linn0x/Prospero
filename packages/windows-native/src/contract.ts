@@ -4,7 +4,9 @@
  * `FileTime100ns` is the unsigned decimal representation of a Windows FILETIME.
  * It deliberately is not a JavaScript `number`, which would lose precision.
  */
-export const NATIVE_WINDOWS_ABI_VERSION = 2;
+// ABI v3 adds an exact PID+FILETIME + Job membership audit. A v2 binary can
+// only assign after spawn, which is not safe for a host-owned Job boundary.
+export const NATIVE_WINDOWS_ABI_VERSION = 3;
 export const REQUIRED_NAPI_VERSION = 8;
 
 export const NATIVE_REQUIRED_CAPABILITIES = [
@@ -183,6 +185,7 @@ export const NATIVE_SYNCHRONOUS_BLOCKING_METHODS = [
   "getCurrentProcessIdentity",
   "getProcessIdentity",
   "matchesProcessIdentity",
+  "terminateProcessIfIdentity",
   "createSecureNamedPipeServer",
   "acceptSecureNamedPipeConnection",
   "closeSecureNamedPipeServer",
@@ -193,6 +196,7 @@ export const NATIVE_SYNCHRONOUS_BLOCKING_METHODS = [
   "closeSecureNamedPipeConnection",
   "createJobObject",
   "assignProcessToJob",
+  "isProcessInJob",
   "terminateJobObject",
   "closeJobObject",
   "getParentJobCompatibility",
@@ -221,6 +225,13 @@ interface NativeWindowsMethods {
   getProcessIdentity(pid: number): ProcessIdentity;
   /** Returns true only if both the PID and creation FILETIME still match. */
   matchesProcessIdentity(identity: ProcessIdentity): boolean;
+  /**
+   * Terminates and waits only for the exact PID+creation-FILETIME process.
+   * A stale, exited, or PID-reused identity returns false; access denial is a
+   * hard error because callers cannot claim rollback succeeded. This API never
+   * performs a PID-only termination.
+   */
+  terminateProcessIfIdentity(identity: ProcessIdentity, exitCode: number, timeoutMs: number): boolean;
 
   createSecureNamedPipeServer(options: SecureNamedPipeServerOptions): SecureNamedPipeServerHandle;
   /** Blocks until one local client is accepted; remote clients are always rejected. */
@@ -240,6 +251,8 @@ interface NativeWindowsMethods {
   createJobObject(options: JobObjectOptions): JobObjectHandle;
   /** Assign succeeds only after strict PID+FILETIME revalidation. */
   assignProcessToJob(job: JobObjectHandle, process: ProcessIdentity): void;
+  /** Revalidates PID+FILETIME, then proves membership in this exact Job. */
+  isProcessInJob(job: JobObjectHandle, process: ProcessIdentity): boolean;
   terminateJobObject(job: JobObjectHandle, exitCode: number): void;
   closeJobObject(job: JobObjectHandle): void;
   getParentJobCompatibility(): ParentJobCompatibility;

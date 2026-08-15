@@ -59,7 +59,7 @@ async function validatePrebuild(sourceRoot, arch) {
     manifest.arch !== arch ||
     manifest.artifact?.file !== ARTIFACT_NAME ||
     manifest.artifact?.sha256?.toLowerCase() !== actualHash ||
-    manifest.native?.abiVersion !== 2 ||
+    manifest.native?.abiVersion !== 3 ||
     manifest.native?.napiVersion !== 8 ||
     CAPABILITIES.some((capability) => manifest.native?.capabilities?.[capability] !== true) ||
     manifest.authenticode?.status !== "valid" ||

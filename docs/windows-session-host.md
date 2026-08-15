@@ -1,8 +1,8 @@
 # Windows Session Host 架构与威胁模型
 
-> 状态：设计与审计，尚未实现。目标平台为 Windows 11；`ConPTY` 的 API 最低支持 Windows 10 1809，但本项目不因此降低产品支持基线。
+> 状态：Windows PTY 与 structured vertical 均已实现。目标平台为 Windows 11；`ConPTY` 的 API 最低支持 Windows 10 1809，但本项目不因此降低产品支持基线。
 >
-> 本文是 [structured-agent-supervisor.md](structured-agent-supervisor.md) 的 Windows 对应设计。它定义 **daemon 重启可存活** 的 PTY 与 structured 会话，不改变手机—daemon 的 E2E 鉴权边界，也不声称当前 Windows 版本已有这一能力。
+> 本文是 [structured-agent-supervisor.md](structured-agent-supervisor.md) 的 Windows 对应设计。已落地的 PTY 路径提供 **daemon 重启可存活** 的 Session Host；structured 会话仍不改变手机—daemon 的 E2E 鉴权边界，也不声称已有这一能力。
 
 ## 结论
 
@@ -16,19 +16,19 @@ Windows host 必须经原生 Win32 边界提供以下能力：
 - `TerminateJobObject` 的树级显式 kill；以及
 - Windows ACL/DPAPI/重解析点安全的状态目录操作。
 
-现有 Node 和 `node-pty` API 不完整暴露这些保证。Gate 已决定采用预编译 N-API 模块；在该模块的 Windows x64/arm64 构建、校验、发布和本文件的验收矩阵通过前，Windows 仍维持现状：直接 PTY 与 daemon 内 structured adapter；不得为它们宣称 daemon 独立生命周期。
+现有 Node 和 `node-pty` API 不完整暴露这些保证。PTY 已通过预编译 N-API Session Host 使用这条边界；只有经过签名加载、ConPTY、Job、状态目录和受认证 pipe 全部可用时才声明 durable。任一原生 prerequisite 不可用时，Windows 明确降级为 daemon 内 direct PTY，绝不宣称独立生命周期。structured adapter 仍是 daemon 内实现。
 
 ## 当前实现审计（2026-08-15）
 
 | 区域 | 已有行为 | Windows 缺口 / 结论 |
 | --- | --- | --- |
-| [`pty-session.ts`](../apps/daemon/src/pty-session.ts) | `PtySession` 用 `node-pty` 直接 spawn，`@xterm/headless` 保存画面，`OutputRing` 仅在 daemon 内存；`kill()` 是 `IPty.kill()`。 | 没有 host、Job Object 或持久 terminal reducer。`node-pty` 的内部后端不能代替 Prospero 对 ConPTY、子树收口和恢复的所有权。daemon 死亡后不能恢复它的 PTY。 |
+| [`windows-pty-host.ts`](../apps/daemon/src/windows-pty-host.ts) / [`windows-pty-session.ts`](../apps/daemon/src/windows-pty-session.ts) | 每个 Windows PTY 使用 detached Session Host；host 持有 ConPTY、xterm reducer、output ring/journal 与 provider Job。daemon 只持有 `RemoteWindowsPtySession` facade。 | manifest+PID/FILETIME+authenticated pipe 只允许 attach，不从 stale owner 重启；kill 先落 terminal fence，再 `TerminateJobObject`/关闭 ConPTY。`pty-session.ts` 只在 native unavailable 时作为明确 non-durable fallback。 |
 | [`tmux.ts`](../apps/daemon/src/tmux.ts) 与 [`session-manager.ts`](../apps/daemon/src/session-manager.ts) | Unix/macOS 的 PTY 可由 tmux 接管；`disposeAll()` 只断 client，`kill()` 会 `tmux.killSession()`。 | `tmuxPath("win32")` 明确返回 `null`，Windows 回落为直接 PTY；`pty-sessions.json` 不是活进程身份或 screen 的恢复依据。 |
 | [`structured-supervisor.ts`](../apps/daemon/src/structured-supervisor.ts) | Unix socket + 256-bit token + 有序 journal/replay；显式 `session.kill` 与客户端断开分离。 | `startStructuredSupervisor()` 在 `win32` 直接报 `unsupported_platform`。Unix socket stale probe、`chmod(0600)`、socket unlink 都不能移植为 Pipe ACL 语义。 |
 | [`structured-supervisor-client.ts`](../apps/daemon/src/structured-supervisor-client.ts) / runner | Unix 用 `detached: true`、负 PID process group 回滚、短 `/tmp` socket；manifest 目前仅记录 PID，无 creation time。 | `launchStructuredSupervisor()` 和 `reconnectStructuredSupervisors()` 在 Windows 分别拒绝/返回空。负 PID signal、`SIGTERM/SIGKILL`、`/tmp` 均无等价物；PID 单独不能抵抗 PID reuse。 |
 | [`session-manager.ts`](../apps/daemon/src/session-manager.ts) | production Unix 才启用 remote structured supervisor；启动时先 reattach manifest，失败者只读；`disposeAll()` 对 remote facade 只关 socket。 | `useStructuredSupervisor` 明确要求 `process.platform !== "win32"`。Windows 恢复会跳过所有 host manifest；in-process `structured-sessions.json` 不能拥有活 adapter。 |
 | [`control-socket.ts`](../apps/daemon/src/control-socket.ts) | Windows 路径已是哈希化 `\\\\.\\pipe\\prospero-…`，仍用 Node `net.createServer()` 和 NDJSON token。 | Node 路径名不是 DACL：当前代码不能传入 `SECURITY_ATTRIBUTES`，`chmod(0600)` 在 Windows 不形成 ACL 保证，且没有 `GetNamedPipeClientProcessId` / token SID 检查。它是 worker 控制 pipe，不应误当 session host pipe。 |
-| 启动与恢复 | [`ws-server.ts`](../apps/daemon/src/ws-server.ts) 先开 control socket，再恢复 tmux/structured，最后 reconcile orchestration。 | 新 host 必须在恢复期先完成 manifest—PID—pipe identity 核验，再允许 UI 或 orchestration 发送命令；永不从 stale manifest 自动 spawn replacement。 |
+| 启动与恢复 | [`ws-server.ts`](../apps/daemon/src/ws-server.ts) 先开 control socket，再恢复 PTY/structured，最后 reconcile orchestration。 | Windows PTY 恢复逐个通过 native state boundary 读取 manifest/record，再完成 manifest—PID/FILETIME—pipe identity 核验；stale owner 只读且永不自动 spawn replacement。 |
 
 现有 Unix 覆盖了 transport/replay 的重要语义，但 `structured-supervisor*.test.ts`、`daemon-supervisor-recovery.e2e.test.ts` 和 launch rollback 测试均以 `skipIf(process.platform === "win32")` 排除 Windows。当前 Windows CI 只能证明常规 Node 行为，不能证明 durable host。
 
@@ -53,6 +53,8 @@ prosperod daemon（可重启、可升级、无会话树所有权）
 `WindowsSessionHost` 是一个 detached 的 Node runner 进程；它加载 session reducer 与 provider adapter。Gate 已决定它的 Win32 操作由随 daemon 发布的**预编译 N-API 模块**提供。该模块是唯一可调用 ConPTY、ACL pipe、process identity、DPAPI 和 Job Object 的平台层；不引入签名 helper EXE 或第二个 public IPC 边界。**host runner 才是 public IPC、journal 和 session ownership 的唯一边界**。
 
 对于 PTY，host 持有 ConPTY 的输入/输出、`@xterm/headless` snapshot 和 output ring。对于 structured，host 持有 adapter 的 SDK/stdio/HTTP 连接及其 pending approval callback；daemon 内只有 `RemotePtySession` / `RemoteStructuredSession` facade。两个会话类型共享同一 manifest、IPC、journal、恢复与 kill 规则。
+
+当前 structured host 通过 `windows-structured-session-host.ts` 运行 Claude/Codex/OpenCode/Grok adapter 入口，并以通用 PSJ2 journal 保存标准化 `AgentEventBody`（含原始 approval/question `reqId` 与 session `evSeq`）。daemon 的 Windows facade 只持有 native pipe client/lease/cursor；`disposeAll()` 只断开该 client，不会代替离线用户批准或拒绝待处理 callback。若 Windows N-API prebuild 不可用，SessionManager 保留旧 in-process structured 路径并明确标为 `hosting: "in_process"`，不声称 durable。若适配器不能向 host 提供可经 PID+FILETIME 验证并加入 Session Job 的 provider child（当前 Claude SDK 属于此类），创建会 fail closed 为 `provider_job_incompatible`，绝不以 `taskkill` 或 PID 终止伪造树所有权。
 
 ### 不共享的两个本机 IPC 边界
 
@@ -285,9 +287,9 @@ approval/question 的底线与 Unix supervisor 一致：daemon offline 表示等
 | 0：产品 gate（已决） | `gate_5a655a0ec88b` | 采用预编译 N-API；实现与 release 不得改回 helper EXE 或 runtime download。未通过架构 build/校验前仍维持 Windows direct-only。 |
 | 1：platform primitives | 新增 `apps/daemon/src/windows/session-host-native.ts`、`apps/daemon/src/windows/named-pipe.ts`、N-API package 与其 publish config；`apps/daemon/package.json` | 暴露 ConPTY、ACL pipe、DPAPI、process identity、Job/launch；没有任何 `chmod` 伪装为 ACL。为 Windows x64 和 arm64 各发布 prebuild，CI 验证 Node N-API ABI、目标架构、加载 smoke test 与发布 SHA-256/integrity manifest；安装时绝不 runtime download 或本机静默编译。 |
 | 2：公共 host transport | 将 [`structured-supervisor.ts`](../apps/daemon/src/structured-supervisor.ts) 的 protocol/replay reducer 拆到平台无关模块；新增 `windows-session-host-protocol.ts` 与 `windows-session-host-runner.ts` | 保留 Unix 行为；Windows 支持 framed pipe、lease、manifest v2、snapshot/journal、token/peer check。 |
-| 3：PTY vertical slice | 新增 `remote-pty-session.ts`；改 [`pty-session.ts`](../apps/daemon/src/pty-session.ts)、[`session-manager.ts`](../apps/daemon/src/session-manager.ts) | 新 PTY 通过 host + ConPTY；daemon facade 提供 input/resize/snapshot/seq。旧 direct PTY 保持明确 fallback，feature flag 只给新 Windows session。 |
+| 3：PTY vertical slice（已完成） | [`windows-pty-host.ts`](../apps/daemon/src/windows-pty-host.ts)、[`windows-pty-terminal-worker.ts`](../apps/daemon/src/windows-pty-terminal-worker.ts)、[`windows-pty-session.ts`](../apps/daemon/src/windows-pty-session.ts)、[`session-manager.ts`](../apps/daemon/src/session-manager.ts) | 新 Windows PTY 通过 host + ConPTY；daemon facade 提供 create/subscribe/snapshot/input/resize/interrupt/status/kill。direct PTY 只在 native unavailable 时明确降级，Unix/tmux 不变。 |
 | 4：structured migration | 改 [`structured-supervisor-client.ts`](../apps/daemon/src/structured-supervisor-client.ts)、[`structured-supervisor-runner.ts`](../apps/daemon/src/structured-supervisor-runner.ts)、adapter spawn seams | host 拥有 Claude/Codex/OpenCode/Grok adapter 与 native children；每个 adapter 分别证明 resume、pending approval 与 Job 兼容性，不批量假定。 |
-| 5：manager/control/recovery | 改 [`session-manager.ts`](../apps/daemon/src/session-manager.ts)、[`ws-server.ts`](../apps/daemon/src/ws-server.ts)、[`control-socket.ts`](../apps/daemon/src/control-socket.ts)、[`status-file.ts`](../apps/daemon/src/status-file.ts) | `disposeAll()` 仅 close facade；startup 安全扫 manifest；Windows control pipe 改为 ACL/token native pipe；状态中精确报 `hosted/direct/unavailable`。 |
+| 5：manager/control/recovery（PTY 完成） | [`session-manager.ts`](../apps/daemon/src/session-manager.ts)、[`ws-server.ts`](../apps/daemon/src/ws-server.ts) | PTY 的 `disposeAll()` 仅 close facade；startup 安全扫 manifest；Windows control pipe 与 structured migration 仍在后续范围。 |
 | 6：tests/CI/ops | 新增 `windows-session-host*.test.ts`、Windows fixture、更新 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)、README/technical overview/runbook | Windows runner 实机执行下表 P0；签名/defender/upgrade telemetry；无论 feature flag 如何，都不把不兼容状态误报可恢复。 |
 
 现有 [`structured-agent-supervisor.md`](structured-agent-supervisor.md) 的 Unix process-group rollback 保持原样；不要在其函数里加入 `if (win32)` 的半实现。Windows 应通过明确的 platform abstraction 接入，避免混用 `SIGKILL`、负 PID 与 Job Object。
@@ -328,4 +330,4 @@ approval/question 的底线与 Unix supervisor 一致：daemon offline 表示等
 | P1 | Windows editions/architectures | Windows 11 23H2 + 24H2；Windows x64 与 arm64 都必测。 | ConPTY close 无 deadlock；匹配架构的 N-API prebuild 可验证加载，SHA-256/npm integrity/provenance 与 release artifact 一致；结果写入 release evidence。 |
 | P2 | EDR/Defender、logoff、sleep、provider external side effects | 真实企业配置与人工场景。 | 记录兼容/失败原因；不把失败扩展为 unsupported durability claim。 |
 
-通过 P0 前，CI 应继续把 Windows supervisor 相关测试标为明确 `unsupported`，而不是取消 skip 后得到偶然绿色。P0 通过后才可移除这些 Windows skip，并将 Windows durable PTY/structured feature flag 从实验性升级为默认候选。
+PTY 的 mock replay/terminal-fence 覆盖在 daemon suite 中运行；签名 release artifact 的 Windows x64/arm64 CI 会额外运行真实 ConPTY + Job Session Host worker smoke。structured migration 的 Windows supervisor 测试仍应保持明确 `unsupported`，直到其独立 P0 通过。

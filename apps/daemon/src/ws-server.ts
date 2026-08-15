@@ -85,6 +85,7 @@ import {
 import * as gitOps from "./git-ops.js";
 import type { PtySession } from "./pty-session.js";
 import type { RemotePtySession } from "./pty-supervisor-client.js";
+import type { RemoteWindowsPtySession } from "./windows-pty-session.js";
 import { searchLocalConversations } from "./local-conversations.js";
 import { DAEMON_VERSION } from "./version.js";
 import { AgentAccountError, AgentAccountManager } from "./agent-accounts.js";
@@ -150,6 +151,8 @@ export interface DaemonServerOptions {
   structuredSupervisor?: boolean | undefined;
   /** Detached PTY hosts are production-default on Unix; tests may opt out. */
   ptySupervisor?: boolean | undefined;
+  /** Windows N-API Session Host feature gate; false keeps both tracks direct. */
+  windowsSessionHost?: boolean | undefined;
   devMode?: boolean;
   hostName?: string | undefined;
   /** 推送通道配置;省略则不推送 */
@@ -267,6 +270,7 @@ export async function createDaemonServer(
     supervisor: structuredSupervisorEnabled,
     ...(structuredRuntime ? { supervisorRunnerPath: structuredRuntime.runnerPath } : {}),
     ptySupervisor: opts.ptySupervisor ?? process.env["VITEST"] !== "true",
+    windowsSessionHost: opts.windowsSessionHost,
     ...(opts.useTmux ? { tmux: { home: opts.home } } : {}),
     sessionEnv: (sessionId) => ({
       PROSPERO_SESSION_ID: sessionId,
@@ -530,7 +534,7 @@ export async function createDaemonServer(
   });
 
   /** 用快照把某个 attachment 拉到最新(attach 全量 / 背压追平 / gap 淘汰共用) */
-  async function sendSnapshot(conn: Conn, sid: string, session: PtySession | RemotePtySession, att: AttachState): Promise<void> {
+  async function sendSnapshot(conn: Conn, sid: string, session: PtySession | RemotePtySession | RemoteWindowsPtySession, att: AttachState): Promise<void> {
     if (att.snapshotInflight) return;
     att.snapshotInflight = true;
     att.paused = true; // 快照生成期间挡住流式输出,避免乱序

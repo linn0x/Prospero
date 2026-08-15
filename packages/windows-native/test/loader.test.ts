@@ -27,7 +27,7 @@ function validManifest(): NativePrebuildManifest {
     platform: "win32",
     arch: "x64",
     artifact: { file: "prospero_windows_native.node", sha256: "a".repeat(64) },
-    native: { abiVersion: 2, napiVersion: 8, capabilities: allCapabilities },
+    native: { abiVersion: 3, napiVersion: 8, capabilities: allCapabilities },
     authenticode: { status: "valid", thumbprintSha1: "b".repeat(40) },
   };
 }
@@ -39,6 +39,7 @@ function completeAddon(report: NativeAddonCapabilityReport): NativeAddonBinding 
     getCurrentProcessIdentity: unavailable as NativeAddonBinding["getCurrentProcessIdentity"],
     getProcessIdentity: unavailable as NativeAddonBinding["getProcessIdentity"],
     matchesProcessIdentity: unavailable as NativeAddonBinding["matchesProcessIdentity"],
+    terminateProcessIfIdentity: unavailable as NativeAddonBinding["terminateProcessIfIdentity"],
     createSecureNamedPipeServer: unavailable as NativeAddonBinding["createSecureNamedPipeServer"],
     acceptSecureNamedPipeConnection: unavailable as NativeAddonBinding["acceptSecureNamedPipeConnection"],
     closeSecureNamedPipeServer: unavailable as NativeAddonBinding["closeSecureNamedPipeServer"],
@@ -49,6 +50,7 @@ function completeAddon(report: NativeAddonCapabilityReport): NativeAddonBinding 
     closeSecureNamedPipeConnection: unavailable as NativeAddonBinding["closeSecureNamedPipeConnection"],
     createJobObject: unavailable as NativeAddonBinding["createJobObject"],
     assignProcessToJob: unavailable as NativeAddonBinding["assignProcessToJob"],
+    isProcessInJob: unavailable as NativeAddonBinding["isProcessInJob"],
     terminateJobObject: unavailable as NativeAddonBinding["terminateJobObject"],
     closeJobObject: unavailable as NativeAddonBinding["closeJobObject"],
     getParentJobCompatibility: unavailable as NativeAddonBinding["getParentJobCompatibility"],
@@ -93,7 +95,7 @@ function mockRuntime(
 
 function addonReport(overrides: Partial<NativeAddonCapabilityReport> = {}): NativeAddonCapabilityReport {
   return {
-    abiVersion: 2,
+    abiVersion: 3,
     napiVersion: 8,
     platform: "win32",
     arch: "x64",
@@ -138,6 +140,7 @@ describe("Windows native fail-closed loader", () => {
       "readSecureStateFile",
       "listSecureStateEntries",
       "removeSecureStateFile",
+      "terminateProcessIfIdentity",
     ]));
   });
 
@@ -177,7 +180,7 @@ describe("Windows native fail-closed loader", () => {
     const skeleton: NativePrebuildManifest = {
       ...validManifest(),
       native: {
-        abiVersion: 2,
+        abiVersion: 3,
         napiVersion: 8,
         capabilities: { ...allCapabilities, dpapiCurrentUser: false },
       },
@@ -210,9 +213,11 @@ describe("Windows native fail-closed loader", () => {
   it("rejects an addon missing the Job Object and ConPTY tree-control calls", () => {
     const addon = completeAddon(addonReport()) as Partial<NativeAddonBinding>;
     delete addon.assignProcessToJob;
+    delete addon.isProcessInJob;
     delete addon.terminateJobObject;
     delete addon.spawnConPty;
     delete addon.killConPty;
+    delete addon.terminateProcessIfIdentity;
     expectNativeLoadError(
       () => loadWindowsNative(mockRuntime(validManifest(), addon)),
       "addon-invalid",
@@ -230,15 +235,22 @@ describe("Windows native fail-closed loader", () => {
     );
   });
 
-  it("rejects manifest ABI mismatches before the binary can load", () => {
+  it("rejects the old ABI 2 manifest before the binary can load", () => {
     const manifest = validManifest();
     const wrongAbi = {
       ...manifest,
-      native: { ...manifest.native, abiVersion: 1 },
+      native: { ...manifest.native, abiVersion: 2 },
     } as unknown as NativePrebuildManifest;
     expectNativeLoadError(
       () => loadWindowsNative(mockRuntime(wrongAbi, completeAddon(addonReport()))),
       "manifest-invalid",
+    );
+  });
+
+  it("rejects an old ABI 2 addon after a valid ABI 3 manifest", () => {
+    expectNativeLoadError(
+      () => loadWindowsNative(mockRuntime(validManifest(), completeAddon(addonReport({ abiVersion: 2 })))),
+      "addon-invalid",
     );
   });
 
