@@ -151,7 +151,18 @@ function defaultAuthenticodeCheck(binaryPath: string): AuthenticodeResult {
       },
     );
     if (result.error || result.status !== 0 || typeof result.stdout !== "string") {
-      return { status: "command-failed", thumbprintSha1: null };
+      const detail = [
+        result.error?.message,
+        `exit=${result.status ?? "none"}`,
+        typeof result.stderr === "string" ? result.stderr : undefined,
+      ]
+        .filter((value): value is string => Boolean(value))
+        .join(" ")
+        .replace(/[\r\n|]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 320);
+      return { status: `command-failed:${detail || "unknown"}`, thumbprintSha1: null };
     }
     const [status = "unknown", thumbprint = ""] = result.stdout.trim().split("|", 2);
     return { status, thumbprintSha1: thumbprint || null };
