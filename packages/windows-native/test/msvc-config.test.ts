@@ -51,7 +51,7 @@ describe("Windows native MSVC configuration", () => {
     expect(compiler.ExceptionHandling).toBe(1);
     expect(compiler.WarningLevel).toBe(4);
     expect(compiler.WarnAsError).toBe("true");
-    expect(additionalOptions).toEqual(expect.arrayContaining(["/WX"]));
+    expect(additionalOptions).toEqual(expect.arrayContaining(["/permissive-", "/WX"]));
     expect(additionalOptions).not.toEqual(expect.arrayContaining(["/WX-", "/W0", "/W1", "/W2", "/W3"]));
   });
 });
