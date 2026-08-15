@@ -22,7 +22,7 @@
     "dev": "node --experimental-strip-types src/cli.ts",
     "pretest": "npm run build:protocol && tsc --build",
     "test": "vitest run --passWithNoTests",
-    "test:windows-native": "vitest run test/windows-pty-terminal-worker.windows.test.ts --passWithNoTests",
+    "test:windows-native": "vitest run test/windows-pty-terminal-worker.windows.test.ts test/windows-session-host-acceptance.windows.test.ts --passWithNoTests",
     "prepack": "node ./scripts/prepare-windows-native-prebuilds.mjs"
   },
   "dependencies": {
