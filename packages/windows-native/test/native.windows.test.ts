@@ -8,6 +8,7 @@ import { Worker } from "node:worker_threads";
 import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import { SecurePipeRoundTripState } from "./secure-pipe-roundtrip-state.js";
+import { observeWorkerMessages, type WorkerMessage } from "./worker-message-observer.js";
 
 const require = createRequire(import.meta.url);
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -43,42 +44,6 @@ const PIPE_ROUND_TRIP_TIMEOUT_MS = 10_000;
 const PIPE_ROUND_TRIP_REQUEST = Buffer.from("pipe-round-trip");
 const PIPE_ROUND_TRIP_ACK = Buffer.from("pipe-round-trip-ack");
 
-function waitForWorkerMessage(worker: Worker, expected: string, timeoutMs = 10_000): Promise<Record<string, unknown>> {
-  return new Promise((resolve, reject) => {
-    let lastPhase = "worker-startup";
-    const timeout = setTimeout(
-      () => finish(new Error(`Timed out waiting for pipe worker ${expected} (last phase: ${lastPhase})`)),
-      timeoutMs,
-    );
-    const onError = (error: Error) => finish(error);
-    const onExit = (code: number) => finish(new Error(`Pipe worker exited before ${expected} (${code})`));
-    const onMessage = (message: Record<string, unknown>) => {
-      if (typeof message.phase === "string") lastPhase = message.phase;
-      if (message.type === "error") {
-        const phase = typeof message.phase === "string" ? ` at ${message.phase}` : "";
-        finish(new Error(`${message.name}: ${message.message}${phase}`));
-      } else if (message.type === expected) {
-        finish(undefined, message);
-      }
-    };
-    const finish = (error?: Error, message?: Record<string, unknown>) => {
-      clearTimeout(timeout);
-      worker.off("error", onError);
-      worker.off("exit", onExit);
-      worker.off("message", onMessage);
-      if (error) reject(error);
-      else resolve(message!);
-    };
-    worker.once("error", onError);
-    worker.once("exit", onExit);
-    worker.on("message", onMessage);
-  });
-}
-
-function waitForWorker(worker: Worker, expected: "ready" | "complete"): Promise<Record<string, unknown>> {
-  return waitForWorkerMessage(worker, expected);
-}
-
 async function connectPipe(pipeName: string): Promise<Socket> {
   return new Promise<Socket>((resolve, reject) => {
     const socket = createConnection(pipeName);
@@ -100,7 +65,7 @@ async function terminateWorker(worker: Worker | undefined): Promise<void> {
   if (worker) await worker.terminate();
 }
 
-type NativePipeWorkerMessage = Record<string, unknown> & { type: string };
+type NativePipeWorkerMessage = WorkerMessage;
 type NativePipeWorkerTerminal =
   | (NativePipeWorkerMessage & { type: "complete" })
   | (NativePipeWorkerMessage & { type: "error" });
@@ -515,16 +480,22 @@ describe.runIf(process.platform === "win32")("Windows identity, secure pipe, DPA
     let control: Worker | undefined;
     try {
       primary = new Worker(fixture, { workerData: { bindingPath, pipeName, role: "primary", scenario: "idle-accept" } });
+      const primaryMessages = observeWorkerMessages(primary);
+      // Register every startup phase before either worker is awaited. The
+      // primary can post both of these while the control worker is loading.
+      const serverReady = primaryMessages.waitFor("server-ready", CANCELLATION_TIMEOUT_MS);
+      const acceptReady = primaryMessages.waitFor("accept-ready", CANCELLATION_TIMEOUT_MS);
       control = new Worker(fixture, { workerData: { bindingPath, role: "control" } });
-      const server = await waitForWorkerMessage(primary, "server-ready", CANCELLATION_TIMEOUT_MS);
-      await waitForWorkerMessage(control, "control-ready", CANCELLATION_TIMEOUT_MS);
-      await expect(waitForWorkerMessage(primary, "accept-ready", CANCELLATION_TIMEOUT_MS)).resolves.toMatchObject({
+      const controlMessages = observeWorkerMessages(control);
+      const controlReady = controlMessages.waitFor("control-ready", CANCELLATION_TIMEOUT_MS);
+      const [server] = await Promise.all([serverReady, controlReady, acceptReady]);
+      await expect(acceptReady).resolves.toMatchObject({
         phase: "ready-for-accept",
       });
-      const acceptStarted = waitForWorkerMessage(primary, "accept-started", CANCELLATION_TIMEOUT_MS);
-      const controlComplete = waitForWorkerMessage(control, "control-complete", CANCELLATION_TIMEOUT_MS);
-      const unblocked = waitForWorkerMessage(primary, "unblocked", CANCELLATION_TIMEOUT_MS);
-      const closeStarted = waitForWorkerMessage(control, "close-started", CANCELLATION_TIMEOUT_MS);
+      const acceptStarted = primaryMessages.waitFor("accept-started", CANCELLATION_TIMEOUT_MS);
+      const controlComplete = controlMessages.waitFor("control-complete", CANCELLATION_TIMEOUT_MS);
+      const unblocked = primaryMessages.waitFor("unblocked", CANCELLATION_TIMEOUT_MS);
+      const closeStarted = controlMessages.waitFor("close-started", CANCELLATION_TIMEOUT_MS);
       primary.postMessage({ action: "start-idle-accept" });
       await expect(acceptStarted).resolves.toMatchObject({ operation: "accept", phase: "ConnectNamedPipe" });
       control.postMessage({ action: "close-server", handle: server.server });
@@ -550,16 +521,22 @@ describe.runIf(process.platform === "win32")("Windows identity, secure pipe, DPA
     let client: Socket | undefined;
     try {
       primary = new Worker(fixture, { workerData: { bindingPath, pipeName, role: "primary", scenario: "active-read" } });
+      const primaryMessages = observeWorkerMessages(primary);
+      const serverReady = primaryMessages.waitFor("server-ready", CANCELLATION_TIMEOUT_MS);
       control = new Worker(fixture, { workerData: { bindingPath, role: "control" } });
-      await waitForWorkerMessage(primary, "server-ready", CANCELLATION_TIMEOUT_MS);
-      await waitForWorkerMessage(control, "control-ready", CANCELLATION_TIMEOUT_MS);
-      const connectionReady = waitForWorkerMessage(primary, "connection-ready", CANCELLATION_TIMEOUT_MS);
+      const controlMessages = observeWorkerMessages(control);
+      // The control worker can report ready before the primary server does;
+      // retain both startup messages before awaiting either one.
+      const controlReady = controlMessages.waitFor("control-ready", CANCELLATION_TIMEOUT_MS);
+      await Promise.all([serverReady, controlReady]);
+      const connectionReady = primaryMessages.waitFor("connection-ready", CANCELLATION_TIMEOUT_MS);
+      const blocking = primaryMessages.waitFor("blocking", CANCELLATION_TIMEOUT_MS);
       client = await connectPipe(pipeName);
       const connection = await connectionReady;
-      await expect(waitForWorkerMessage(primary, "blocking", CANCELLATION_TIMEOUT_MS)).resolves.toMatchObject({ operation: "read" });
-      const controlComplete = waitForWorkerMessage(control, "control-complete", CANCELLATION_TIMEOUT_MS);
-      const unblocked = waitForWorkerMessage(primary, "unblocked", CANCELLATION_TIMEOUT_MS);
-      const closeStarted = waitForWorkerMessage(control, "close-started", CANCELLATION_TIMEOUT_MS);
+      await expect(blocking).resolves.toMatchObject({ operation: "read" });
+      const controlComplete = controlMessages.waitFor("control-complete", CANCELLATION_TIMEOUT_MS);
+      const unblocked = primaryMessages.waitFor("unblocked", CANCELLATION_TIMEOUT_MS);
+      const closeStarted = controlMessages.waitFor("close-started", CANCELLATION_TIMEOUT_MS);
       control.postMessage({ action: "disconnect-connection", handle: connection.connection });
       const [started, cancelled, result] = await Promise.all([closeStarted, controlComplete, unblocked]);
       expect(started).toMatchObject({ action: "disconnect-connection", phase: "disconnect-connection" });
