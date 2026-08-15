@@ -135,7 +135,7 @@ function defaultAuthenticodeCheck(binaryPath: string): AuthenticodeResult {
   const binaryPathEnvironmentVariable = "PROSPERO_WINDOWS_NATIVE_AUTHENTICODE_PATH";
   const command = [
     `$binaryPath = [Environment]::GetEnvironmentVariable('${binaryPathEnvironmentVariable}', 'Process')`,
-    "$signature = Microsoft.PowerShell.Security\\Get-AuthenticodeSignature -LiteralPath $binaryPath",
+    "$signature = Get-AuthenticodeSignature -LiteralPath $binaryPath",
     "$thumbprint = if ($null -eq $signature.SignerCertificate) { '' } else { $signature.SignerCertificate.Thumbprint }",
     "[Console]::Out.Write($signature.Status.ToString() + '|' + $thumbprint)",
   ].join("; ");
