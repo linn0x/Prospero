@@ -40,6 +40,7 @@ import { fromUnifiedPatch } from "./diff.js";
 import {
   AdapterError,
   summarize,
+  terminateUnregisteredProviderProcess,
   type AdapterContext,
   type AgentAdapter,
   type AgentModeCatalog,
@@ -134,6 +135,10 @@ export class CodexAdapter implements AgentAdapter {
 
   /** app-server 能保留 Skill 的结构化身份，而不是把它降级成一大段普通文本。 */
   readonly acceptsSkillInputs = true;
+  // The detached Session Host joins its KILL_ON_JOB_CLOSE Job before this
+  // adapter can spawn app-server, so app-server and all descendants inherit
+  // the boundary without a spawn-to-assign window.
+  readonly durableProviderJobCompatible = true;
 
   private proc: ChildProcess | null = null;
   private ctx: AdapterContext | null = null;
@@ -282,6 +287,13 @@ export class CodexAdapter implements AgentAdapter {
       env: { ...process.env, ...environment },
     });
     this.proc = proc;
+    try {
+      await this.ctx?.registerProviderProcess?.(proc);
+    } catch (error) {
+      this.proc = null;
+      await terminateUnregisteredProviderProcess(proc);
+      throw error;
+    }
     proc.stdout?.setEncoding("utf8");
     proc.stdout?.on("data", (chunk: string) => this.onStdout(chunk));
     proc.stderr?.setEncoding("utf8");

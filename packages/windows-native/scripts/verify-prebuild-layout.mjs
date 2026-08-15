@@ -23,7 +23,7 @@ for (const arch of ["x64", "arm64"]) {
   if (!/^[a-fA-F0-9]{64}$/.test(manifest.artifact?.sha256 ?? "")) {
     throw new Error(`Invalid artifact SHA-256 format in ${manifestPath.pathname}`);
   }
-  if (manifest.native?.abiVersion !== 2 || manifest.native?.napiVersion !== 8) {
+  if (manifest.native?.abiVersion !== 3 || manifest.native?.napiVersion !== 8) {
     throw new Error(`Invalid native ABI metadata in ${manifestPath.pathname}`);
   }
   if (

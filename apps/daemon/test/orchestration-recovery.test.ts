@@ -42,6 +42,8 @@ function session(id: string, status: SessionInfo["status"]): SessionInfo {
 
 class RecoverySessions implements WorkerSessionManager {
   readonly live = new Map<string, SessionInfo>();
+  readonly hosting = new Map<string, "hosted" | "direct" | "unavailable">();
+  readonly hostOwners = new Map<string, string | null>();
   readonly created: CreateSessionInput[] = [];
   readonly killed: string[] = [];
   readonly killOptions: Array<{ preserveHistory?: boolean } | undefined> = [];
@@ -63,6 +65,14 @@ class RecoverySessions implements WorkerSessionManager {
     const found = this.live.get(sid);
     if (!found) throw new Error(`no such session: ${sid}`);
     return found;
+  }
+
+  sessionHostingOf(sid: string): "hosted" | "direct" | "unavailable" {
+    return this.hosting.get(sid) ?? "direct";
+  }
+
+  hostOwnerIdentityOf(sid: string): string | null {
+    return this.hostOwners.get(sid) ?? null;
   }
 }
 
@@ -291,6 +301,45 @@ describe("daemon 启动时的 Dispatch 对账", () => {
     expect(store.getDispatch(dispatch.id).state).toBe("running");
     expect(store.getRun(run.id).automation).toMatchObject({ state: "running", lastError: null });
     expect(sessions.created).toHaveLength(0);
+  });
+
+  it("Windows host owner 的 epoch + PID + FILETIME 一致时恢复 running，不一致时明确失败", async () => {
+    const store = new OrchestrationStore();
+    const run = store.createRun({ objective: "Windows owner identity recovery" });
+    const liveTask = store.createTask({ runId: run.id, title: "仍由原 host 托管", spec: "" });
+    const missingTask = store.createTask({ runId: run.id, title: "host 已不可用", spec: "" });
+    const owner = "windows-session-host:epoch-a:4242:133700000000000000";
+    const liveDispatch = store.createDispatch({
+      taskId: liveTask.id,
+      sessionId: "windows-live",
+      hostOwnerIdentity: owner,
+    });
+    const missingDispatch = store.createDispatch({
+      taskId: missingTask.id,
+      sessionId: "windows-missing",
+      hostOwnerIdentity: owner,
+    });
+    const sessions = new RecoverySessions();
+    sessions.live.set("windows-live", session("windows-live", "idle"));
+    sessions.hosting.set("windows-live", "hosted");
+    sessions.hostOwners.set("windows-live", owner);
+    sessions.live.set("windows-missing", session("windows-missing", "idle"));
+    sessions.hosting.set("windows-missing", "unavailable");
+
+    const result = await new DispatchService(store, sessions).reconcilePersistedSessions();
+
+    expect(result.resumed).toEqual([expect.objectContaining({ id: liveDispatch.id, state: "running" })]);
+    expect(store.getTask(liveTask.id).status).toBe("dispatched");
+    expect(store.getDispatch(liveDispatch.id).state).toBe("running");
+    expect(sessions.created).toHaveLength(0);
+    expect(store.getDispatch(missingDispatch.id)).toMatchObject({
+      state: "abandoned",
+      outcome: "Windows Session Host owner 不可用或身份验证不匹配；worker 未显式交付",
+    });
+    expect(store.getTask(missingTask.id)).toMatchObject({
+      status: "failed",
+      result: "Windows Session Host owner 不可用或身份验证不匹配；worker 未显式交付",
+    });
   });
 
   it("丢失 worker 后恢复自动编排会暂停并留下失败原因，而不是伪装继续运行", async () => {

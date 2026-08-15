@@ -199,6 +199,8 @@ export interface StructuredSessionOptions {
    * Prospero-home location for backwards-compatible restoration.
    */
   attachmentRoot?: string;
+  /** Native Session Host-only provider Job registration callback. */
+  registerProviderProcess?: ((process: { pid?: number | undefined }) => Promise<void>) | undefined;
 }
 
 export interface StructuredSessionEvents {
@@ -235,6 +237,8 @@ export interface StructuredSessionPersistentState {
 }
 
 export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
+  /** Legacy/in-process structured state is intentionally not durable. */
+  readonly hosting = "in_process" as const;
   readonly id: string;
   readonly agent: AgentKind;
   readonly title: string;
@@ -247,6 +251,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
   private readonly environment: Record<string, string>;
   private readonly codexAppServerArgs: string[] | undefined;
   private readonly attachmentRoot: string;
+  private readonly registerProviderProcess: ((process: { pid?: number | undefined }) => Promise<void>) | undefined;
   private readonly log: AgentEventBody[] = [];
   private evSeq = 0;
   private status: SessionStatus = "starting";
@@ -282,6 +287,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     this.environment = opts.environment ?? {};
     this.codexAppServerArgs = opts.codexAppServerArgs;
     this.attachmentRoot = opts.attachmentRoot ?? path.join(prosperoHome(), "attachments", this.id);
+    this.registerProviderProcess = opts.registerProviderProcess;
     const restored = opts.restored;
     if (restored?.terminal) {
       this.status = "done";
@@ -380,6 +386,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
       },
       // 取函数而非取值:策略可在会话进行中改,适配器每次调用都要读到当下的值
       approvalPolicy: () => this.policy,
+      ...(this.registerProviderProcess ? { registerProviderProcess: this.registerProviderProcess } : {}),
     });
     await beforeDrain?.();
     if (this.disposed) return;
@@ -1230,8 +1237,12 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     // 正由 adapter 自己承载；若此处等待形成自杀式死锁，SessionManager 仍能立即
     // 落盘只读终态，避免重启后消费旧 worktree 的排队消息。
     this.setStatus("done");
-    await this.adapter.dispose().catch(() => {});
-    this.removeAllListeners();
+    // Callers that own an external containment boundary (the Windows Session
+    // Host Job) need the real adapter failure so they can preserve it while
+    // still running their finally cleanup.  The session is terminal either
+    // way, and listeners must not leak if disposal rejects.
+    try { await this.adapter.dispose(); }
+    finally { this.removeAllListeners(); }
   }
 }
 

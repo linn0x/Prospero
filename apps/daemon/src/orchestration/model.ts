@@ -111,6 +111,12 @@ export interface Dispatch {
   taskId: string;
   /** Prospero 会话 id。它是持久的,daemon 重启后依然指向同一个 agent */
   sessionId: string;
+  /**
+   * Windows Session Host 的不可替代 owner 身份。它同时绑定 manifest epoch、
+   * PID 和进程 FILETIME；缺失或变化时不能把同一 session id 误认为仍是原 worker。
+   * 旧的 direct/Unix dispatch 不写这个字段，保持其既有恢复语义。
+   */
+  hostOwnerIdentity?: string;
   worktreePath: string | null;
   state: DispatchState;
   startedAt: number;

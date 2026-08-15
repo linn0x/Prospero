@@ -1,6 +1,6 @@
 /** 把一个 ready task 变成实际 worker 会话的唯一入口。 */
 import type { AgentKind, SessionInfo, SessionKind } from "@prospero/protocol";
-import type { CreateSessionInput, KillSessionOptions } from "../session-manager.js";
+import type { CreateSessionInput, KillSessionOptions, SessionHosting } from "../session-manager.js";
 import type { PtyStartupReadinessOptions } from "../pty-startup-readiness.js";
 import {
   createEsaytree,
@@ -33,6 +33,10 @@ export interface WorkerSessionManager {
   waitForPtyReady?(sid: string, options?: PtyStartupReadinessOptions): Promise<void>;
   kill(sid: string, options?: KillSessionOptions): Promise<void>;
   infoOf(sid: string): SessionInfo;
+  /** Exact host provenance is optional so existing direct-session adapters remain compatible. */
+  sessionHostingOf?(sid: string): SessionHosting;
+  /** Windows owner identity includes manifest epoch + PID + process FILETIME. */
+  hostOwnerIdentityOf?(sid: string): string | null;
 }
 
 export interface StartWorkerInput {
@@ -209,10 +213,33 @@ export class DispatchService {
         continue;
       }
 
-      if (isTerminalSession(session)) {
-        const reason = session
-          ? "worker 会话在 daemon 恢复时已结束但未显式交付"
-          : "worker 会话在 daemon 恢复后不存在";
+      let hosting: SessionHosting | undefined = session ? undefined : "unavailable";
+      if (session && this.sessions.sessionHostingOf) {
+        try {
+          hosting = this.sessions.sessionHostingOf(dispatch.sessionId);
+        } catch {
+          hosting = "unavailable";
+        }
+      }
+      let ownerIdentity: string | null | undefined;
+      if (session && dispatch.hostOwnerIdentity && this.sessions.hostOwnerIdentityOf) {
+        try {
+          ownerIdentity = this.sessions.hostOwnerIdentityOf(dispatch.sessionId);
+        } catch {
+          ownerIdentity = null;
+        }
+      }
+      const ownerChanged = ownerIdentity !== undefined && ownerIdentity !== dispatch.hostOwnerIdentity;
+      // Old dispatches have no host provenance. Retain their generic missing
+      // session outcome rather than falsely labelling every historical direct
+      // session as a Windows host failure.
+      const hostUnavailable = hosting === "unavailable" && dispatch.hostOwnerIdentity !== undefined;
+      if (hostUnavailable || ownerChanged || isTerminalSession(session)) {
+        const reason = hostUnavailable || ownerChanged
+          ? "Windows Session Host owner 不可用或身份验证不匹配；worker 未显式交付"
+          : session
+            ? "worker 会话在 daemon 恢复时已结束但未显式交付"
+            : "worker 会话在 daemon 恢复后不存在";
         const result = this.store.abandonActiveDispatchForMissingSession(
           dispatch.id,
           reason,
@@ -368,9 +395,17 @@ export class DispatchService {
         // worker 是 daemon 自己创建的本地进程，不沿用某一台手机的 allowShell。
         allowShell: true,
       });
+      let hostOwnerIdentity: string | null | undefined;
+      try {
+        hostOwnerIdentity = this.sessions.hostOwnerIdentityOf?.(session.id);
+      } catch {
+        // A newly created session with unreadable provenance is still handled
+        // by the normal create failure path if its first command cannot run.
+      }
       dispatch = this.store.createDispatch({
         taskId: task.id,
         sessionId: session.id,
+        ...(hostOwnerIdentity ? { hostOwnerIdentity } : {}),
         worktreePath: worktree?.path ?? null,
       });
       if (worktree) this.store.linkWorktreeAssetDispatch(worktree.assetId, dispatch.id);

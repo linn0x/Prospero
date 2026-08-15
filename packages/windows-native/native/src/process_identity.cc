@@ -74,6 +74,63 @@ prospero_status GetProcessIdentityInternal(uint32_t pid,
   return status;
 }
 
+// This intentionally shares neither a PID-only shortcut nor a best-effort
+// shell fallback with callers.  The creation FILETIME is checked immediately
+// before TerminateProcess, and the process handle is then waited before this
+// operation reports success to its caller.
+prospero_status TerminateExactProcess(prospero_process_identity expected,
+                                      uint32_t exit_code,
+                                      uint32_t timeout_ms,
+                                      uint8_t* out_terminated) {
+  if (expected.pid == 0 || expected.creation_time_100ns == 0 ||
+      timeout_ms == 0 || out_terminated == nullptr) {
+    return PROSPERO_STATUS_INVALID_ARGUMENT;
+  }
+  *out_terminated = 0;
+  HANDLE process = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION |
+                                   SYNCHRONIZE,
+                               FALSE,
+                               expected.pid);
+  if (process == nullptr) {
+    const prospero_status status = StatusFromLastError(GetLastError());
+    // A missing process is explicitly not a termination target. Access denial
+    // is deliberately propagated so a caller cannot claim rollback succeeded.
+    return status == PROSPERO_STATUS_NOT_FOUND ? PROSPERO_STATUS_OK : status;
+  }
+
+  prospero_process_identity actual{};
+  const prospero_status identity_status =
+      GetIdentityForOpenedProcess(process, expected.pid, &actual);
+  if (identity_status != PROSPERO_STATUS_OK ||
+      actual.creation_time_100ns != expected.creation_time_100ns) {
+    CloseHandle(process);
+    return identity_status == PROSPERO_STATUS_NOT_FOUND ||
+                   identity_status == PROSPERO_STATUS_OK
+               ? PROSPERO_STATUS_OK
+               : identity_status;
+  }
+
+  // GetIdentityForOpenedProcess performs a final liveness check.  The process
+  // is this exact kernel handle, so no PID reuse can be introduced between
+  // this point and TerminateProcess.
+  if (!TerminateProcess(process, exit_code)) {
+    const prospero_status status = StatusFromLastError(GetLastError());
+    CloseHandle(process);
+    return status == PROSPERO_STATUS_NOT_FOUND ? PROSPERO_STATUS_OK : status;
+  }
+  const DWORD waited = WaitForSingleObject(process, timeout_ms);
+  if (waited == WAIT_OBJECT_0) {
+    *out_terminated = 1;
+    CloseHandle(process);
+    return PROSPERO_STATUS_OK;
+  }
+  const prospero_status status = waited == WAIT_FAILED
+                                     ? StatusFromLastError(GetLastError())
+                                     : PROSPERO_STATUS_SYSTEM_ERROR;
+  CloseHandle(process);
+  return status;
+}
+
 }  // namespace
 
 extern "C" prospero_status prospero_get_current_process_identity(
@@ -102,14 +159,21 @@ extern "C" prospero_status prospero_process_identity_matches(
   *out_matches = 0;
   prospero_process_identity actual{};
   const prospero_status status = prospero_get_process_identity(expected.pid, &actual);
-  if (status == PROSPERO_STATUS_NOT_FOUND || status == PROSPERO_STATUS_ACCESS_DENIED) {
-    // A missing or inaccessible process is never a match. It is not an error
-    // condition that callers should be tempted to recover from as a PID match.
-    return PROSPERO_STATUS_OK;
-  }
+  if (status == PROSPERO_STATUS_NOT_FOUND) return PROSPERO_STATUS_OK;
+  // An access-denied revalidation cannot establish either absence or a
+  // FILETIME mismatch. Propagate it so a caller cannot treat an inaccessible
+  // owner as safely gone and perform a PID-only recovery action.
   if (status != PROSPERO_STATUS_OK) return status;
   *out_matches = actual.creation_time_100ns == expected.creation_time_100ns ? 1 : 0;
   return PROSPERO_STATUS_OK;
+}
+
+extern "C" prospero_status prospero_terminate_process_if_identity(
+    prospero_process_identity expected,
+    uint32_t exit_code,
+    uint32_t timeout_ms,
+    uint8_t* out_terminated) {
+  return TerminateExactProcess(expected, exit_code, timeout_ms, out_terminated);
 }
 
 #else
@@ -138,6 +202,20 @@ extern "C" prospero_status prospero_process_identity_matches(
     return PROSPERO_STATUS_INVALID_ARGUMENT;
   }
   *out_matches = 0;
+  return PROSPERO_STATUS_NOT_AVAILABLE;
+}
+
+extern "C" prospero_status prospero_terminate_process_if_identity(
+    prospero_process_identity expected,
+    uint32_t exit_code,
+    uint32_t timeout_ms,
+    uint8_t* out_terminated) {
+  (void)exit_code;
+  if (expected.pid == 0 || expected.creation_time_100ns == 0 ||
+      timeout_ms == 0 || out_terminated == nullptr) {
+    return PROSPERO_STATUS_INVALID_ARGUMENT;
+  }
+  *out_terminated = 0;
   return PROSPERO_STATUS_NOT_AVAILABLE;
 }
 

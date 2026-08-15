@@ -15,9 +15,12 @@ import {
 import { isStrictWindowsPipePeerIdentity } from "../src/windows-session-host-native.js";
 import {
   consumeDetachedWindowsSessionHostBootstrap,
+  launchDetachedWindowsSessionHostWithNative,
+  rollbackDetachedWindowsSessionHostWithNative,
   runDetachedWindowsSessionHostFromEnvironment,
   serveWindowsSessionHostPipe,
   stopWindowsSessionHostTransport,
+  type WindowsSessionHostDetachedLaunchNative,
   type WindowsSessionHostNativeFactory,
   type WindowsSessionHostRunnerNative,
 } from "../src/windows-session-host-runner.js";
@@ -198,7 +201,7 @@ describe("Windows Session Host common transport (mock native process)", () => {
     expect(duplicate.calls).toBe(1);
   });
 
-  it("returns durable terminal command/event records even when optional compaction fails", async () => {
+  it("fails closed when required terminal compaction cannot persist", async () => {
     const { child, manifest } = await startMock();
     await call(child, "hello", { frame: makeHello(manifest), peer: { process: daemonA, userSid: "S-1-5-21-1000", sessionId: 1 } });
     const lease = await call(child, "command", { frame: {
@@ -212,14 +215,44 @@ describe("Windows Session Host common transport (mock native process)", () => {
       commandId: "terminal-with-failed-compaction", mutation: true, method: "stop", params: {}, leaseId,
     } as const;
     const first = await call(child, "command", { frame: stop });
-    expect((first.value as { ok: boolean }).ok).toBe(true);
+    expect((first.value as { error: { code: string } }).error.code).toBe("unknown_command_outcome");
+    // Required terminal persistence failed, so the retained finalizer closes
+    // containment without issuing a success reply.
+    expect(first.terminalFinalized).toBe(1);
     const duplicate = await call(child, "command", { frame: stop });
     expect(duplicate.value).toEqual(first.value);
 
     const { child: eventChild } = await startMock();
     await call(eventChild, "failSnapshotWrites");
-    const terminalEvent = await call(eventChild, "appendEvent", { payload: { terminal: "output" }, options: { terminal: true } });
-    expect((terminalEvent.value as { kind: string }).kind).toBe("terminal");
+    await expect(call(eventChild, "appendEvent", { payload: { terminal: "output" }, options: { terminal: true } })).rejects.toThrow(/snapshot compaction/i);
+  });
+
+  it("commits terminal intent/state before reply and runs the Job finalizer only after the reply boundary", async () => {
+    const { child, manifest } = await startMock();
+    await call(child, "hello", { frame: makeHello(manifest), peer: { process: daemonA, userSid: "S-1-5-21-1000", sessionId: 1 } });
+    const lease = await call(child, "command", { frame: {
+      version: 2, type: "command", sessionId: manifest.sessionId, epoch: manifest.epoch,
+      commandId: "kill-lease", mutation: true, method: "lease.acquire", params: {},
+    } });
+    const leaseId = (lease.value as { result: { leaseId: string } }).result.leaseId;
+    const kill = {
+      version: 2 as const, type: "command" as const, sessionId: manifest.sessionId, epoch: manifest.epoch,
+      commandId: "kill-once", mutation: true, method: "structured.kill", params: {}, leaseId,
+    };
+    const first = await call(child, "command", { frame: kill });
+    expect(first.terminalFinalized).toBe(0);
+    expect(first.snapshotBytes).toBeGreaterThan(0);
+    const duplicate = await call(child, "command", { frame: kill });
+    expect(duplicate.value).toEqual(first.value);
+    expect(duplicate.calls).toBe(1);
+    const replay = await call(child, "replay", { frame: {
+      version: 2, type: "replay", sessionId: manifest.sessionId, epoch: manifest.epoch, afterSeq: 0,
+    } });
+    expect((replay.value as { terminal: boolean }).terminal).toBe(true);
+    const finalized = await call(child, "replyDelivered", { commandId: "kill-once" });
+    expect(finalized.terminalFinalized).toBe(1);
+    const repeatedFinalization = await call(child, "replyDelivered", { commandId: "kill-once" });
+    expect(repeatedFinalization.terminalFinalized).toBe(1);
   });
 
   it("durably appends host output while detached, serializes it with other appends, and fences a terminal event", async () => {
@@ -450,13 +483,19 @@ describe("Windows Session Host detached bootstrap and provider output", () => {
   it("injects durable appendEvent/emit into the detached factory while no daemon is attached", async () => {
     const files = new Map<string, Uint8Array>([["host.bootstrap.json", new TextEncoder().encode(JSON.stringify(bootstrap))]]);
     let rejectAccept: ((error: Error) => void) | undefined;
+    const order: string[] = [];
     const native: WindowsSessionHostRunnerNative & { close(): Promise<void> } = {
       async openState() {},
       async read(name) { return files.get(name) ?? null; },
       async writeAtomic(name, bytes) { files.set(name, Uint8Array.from(bytes)); },
       async removeState(name) { files.delete(name); },
       async createCredential() {}, async hmac(material) { return hmacProof(secret, material); },
-      async currentIdentity() { return daemonA; }, async createPipe() {},
+      async currentIdentity() { return daemonA; },
+      async createProviderJob() { order.push("job.create"); },
+      async assignProviderProcess(process) { expect(process).toEqual(daemonA); order.push("job.assign-self"); },
+      async isProviderProcessInJob(process) { expect(process).toEqual(daemonA); order.push("job.audit-self"); return true; },
+      async terminateProviderJob() {}, async closeProviderJob() {},
+      async createPipe() { order.push("pipe.create"); },
       async acceptPipe() { return new Promise<void>((_resolve, reject) => { rejectAccept = reject; }); },
       async readPipe() { return { data: new Uint8Array(), peer: null }; }, async writePipe() { return 0; },
       async closePipeConnection() {}, async closePipeServer() {},
@@ -464,6 +503,7 @@ describe("Windows Session Host detached bootstrap and provider output", () => {
     };
     const factory: WindowsSessionHostNativeFactory = { async create() { return native; } };
     const running = await runDetachedWindowsSessionHostFromEnvironment({ PROSPERO_WINDOWS_SESSION_HOST_STATE_DIRECTORY: stateDirectory }, factory);
+    expect(order.slice(0, 4)).toEqual(["job.create", "job.assign-self", "job.audit-self", "pipe.create"]);
     const journal = decodePsj2Journal(files.get("journal.psj2")!, sessionId, epoch);
     expect(journal.events.map((event) => event.payload)).toEqual([
       { source: "factory", output: "daemon-offline" },
@@ -472,6 +512,153 @@ describe("Windows Session Host detached bootstrap and provider output", () => {
     expect(files.has("host.bootstrap.json")).toBe(false);
     await running.closeTransport();
     await expect(runDetachedWindowsSessionHostFromEnvironment({ PROSPERO_WINDOWS_SESSION_HOST_STATE_DIRECTORY: stateDirectory }, factory)).rejects.toMatchObject({ code: "native_unavailable" });
+  });
+
+  it("fails closed and closes the self-owned Job when adapter startup fails", async () => {
+    const failingBootstrap = {
+      ...bootstrap,
+      handlerModule: new URL("./fixtures/windows-session-host-failing-factory.mjs", import.meta.url).href,
+    };
+    const files = new Map<string, Uint8Array>([["host.bootstrap.json", new TextEncoder().encode(JSON.stringify(failingBootstrap))]]);
+    let closeJob = 0;
+    let rejectAccept: ((error: Error) => void) | undefined;
+    const native: WindowsSessionHostRunnerNative & { close(): Promise<void> } = {
+      async openState() {},
+      async read(name) { return files.get(name) ?? null; },
+      async writeAtomic(name, bytes) { files.set(name, Uint8Array.from(bytes)); },
+      async removeState(name) { files.delete(name); },
+      async createCredential() {}, async hmac(material) { return hmacProof(secret, material); },
+      async currentIdentity() { return daemonA; },
+      async createProviderJob() {}, async assignProviderProcess() {}, async isProviderProcessInJob() { return true; },
+      async terminateProviderJob() {}, async closeProviderJob() { closeJob += 1; },
+      async createPipe() {},
+      async acceptPipe() { return new Promise<void>((_resolve, reject) => { rejectAccept = reject; }); },
+      async readPipe() { return { data: new Uint8Array(), peer: null }; }, async writePipe() { return 0; },
+      async closePipeConnection() {}, async closePipeServer() {},
+      async cancelActivePipeIo() { rejectAccept?.(new Error("test cancellation")); }, async close() {},
+    };
+    await expect(runDetachedWindowsSessionHostFromEnvironment(
+      { PROSPERO_WINDOWS_SESSION_HOST_STATE_DIRECTORY: stateDirectory },
+      { async create() { return native; } },
+    )).rejects.toThrow(/handler is invalid/);
+    expect(closeJob).toBe(1);
+  });
+
+  it("exactly rolls back a launched host and clears credential-bearing bootstrap on invalid manifest publication", async () => {
+    const files = new Map<string, Uint8Array>();
+    const launched = { pid: 51001, creationTime100ns: "555555555555555" } as const;
+    const terminated: unknown[] = [];
+    let manifestReads = 0;
+    const native: WindowsSessionHostDetachedLaunchNative = {
+      async openState() {},
+      async read(name) {
+        if (name === "manifest.json") {
+          manifestReads += 1;
+          return manifestReads === 1 ? null : new TextEncoder().encode("{not-json}");
+        }
+        return files.get(name) ?? null;
+      },
+      async writeAtomic(name, bytes) { files.set(name, Uint8Array.from(bytes)); },
+      async removeState(name) { files.delete(name); },
+      async launchDetachedHost() { return { status: "launched", process: launched }; },
+      async terminateIdentityAndWait(identity) { terminated.push(identity); return true; },
+      async close() {},
+    };
+    await expect(launchDetachedWindowsSessionHostWithNative({
+      sessionId,
+      epoch,
+      pipeName: "\\\\.\\pipe\\prospero-detached-rollback-invalid",
+      stateDirectory,
+      handlerModule,
+      providerBootstrap: new TextEncoder().encode(JSON.stringify({ environment: { API_TOKEN: "secret" } })),
+      providerRecord: new TextEncoder().encode("record"),
+    }, native)).rejects.toMatchObject({ code: "invalid_manifest" });
+    expect(terminated).toEqual([launched]);
+    expect(files.has("provider.bootstrap.json")).toBe(false);
+    expect(files.has("host.bootstrap.json")).toBe(false);
+    // Immutable non-secret discovery metadata may remain, but it cannot start
+    // another owner without a valid manifest/bootstrap.
+    expect(files.has("provider.record.json")).toBe(true);
+  });
+
+  it("cleans all launch records when CreateProcess never succeeds", async () => {
+    const files = new Map<string, Uint8Array>();
+    let exactTerminateCalls = 0;
+    const native: WindowsSessionHostDetachedLaunchNative = {
+      async openState() {}, async read(name) { return files.get(name) ?? null; },
+      async writeAtomic(name, bytes) { files.set(name, Uint8Array.from(bytes)); },
+      async removeState(name) { files.delete(name); },
+      async launchDetachedHost() {
+        return { status: "parent_job_prevents_detach", parentJob: { parentJobDetected: true, breakawayAllowed: false, detachedLaunchAllowed: false } };
+      },
+      async terminateIdentityAndWait() { exactTerminateCalls += 1; return false; },
+      async close() {},
+    };
+    await expect(launchDetachedWindowsSessionHostWithNative({
+      sessionId,
+      epoch,
+      pipeName: "\\\\.\\pipe\\prospero-detached-no-spawn",
+      stateDirectory,
+      handlerModule,
+      providerBootstrap: new TextEncoder().encode("sensitive"),
+      providerRecord: new TextEncoder().encode("record"),
+    }, native)).rejects.toMatchObject({ code: "native_unavailable" });
+    expect(exactTerminateCalls).toBe(0);
+    expect([...files.keys()]).toEqual([]);
+  });
+
+  it("uses exact owner identity for facade-attach rollback and persists failed discovery state", async () => {
+    const files = new Map<string, Uint8Array>([
+      ["provider.bootstrap.json", new TextEncoder().encode("sensitive")],
+      ["host.bootstrap.json", new TextEncoder().encode("bootstrap")],
+    ]);
+    const terminated: unknown[] = [];
+    const owner = { pid: 52001, creationTime100ns: "666666666666666" } as const;
+    const rollbackManifest = parseWindowsSessionHostManifest({
+      schemaVersion: 2, protocolVersion: 2, implementation: "windows-session-host", sessionId, epoch,
+      pipeName: "\\\\.\\pipe\\prospero-detached-attach-rollback", stateDirectory, aclProfile: "current-logon-token-v1",
+      owner, nativeAbiVersion: NATIVE_WINDOWS_ABI_VERSION, credentialFile: "credential.dpapi", journalFile: "journal.psj2",
+      snapshotFile: "snapshot.psj2.json", status: "active", createdAt: 1, updatedAt: 1,
+    });
+    const native: WindowsSessionHostDetachedLaunchNative = {
+      async openState() {}, async read(name) { return files.get(name) ?? null; },
+      async writeAtomic(name, bytes) { files.set(name, Uint8Array.from(bytes)); },
+      async removeState(name) { files.delete(name); },
+      async launchDetachedHost() { throw new Error("not used"); },
+      async terminateIdentityAndWait(identity) { terminated.push(identity); return true; },
+      async close() {},
+    };
+    await rollbackDetachedWindowsSessionHostWithNative(rollbackManifest, native);
+    expect(terminated).toEqual([owner]);
+    expect(files.has("provider.bootstrap.json")).toBe(false);
+    expect(files.has("host.bootstrap.json")).toBe(false);
+    expect(JSON.parse(new TextDecoder().decode(files.get("manifest.json")!))).toMatchObject({ status: "failed" });
+  });
+
+  it("clears provider bootstrap when common host setup fails before the factory can consume it", async () => {
+    const files = new Map<string, Uint8Array>([
+      ["host.bootstrap.json", new TextEncoder().encode(JSON.stringify(bootstrap))],
+      ["provider.bootstrap.json", new TextEncoder().encode(JSON.stringify({ environment: { API_TOKEN: "secret" } }))],
+    ]);
+    let closed = 0;
+    const native: WindowsSessionHostRunnerNative & { close(): Promise<void> } = {
+      async openState() {}, async read(name) { return files.get(name) ?? null; },
+      async writeAtomic(name, bytes) { files.set(name, Uint8Array.from(bytes)); },
+      async removeState(name) { files.delete(name); },
+      async createCredential() {}, async hmac(material) { return hmacProof(secret, material); },
+      async currentIdentity() { return daemonA; },
+      async createProviderJob() {}, async assignProviderProcess() {}, async isProviderProcessInJob() { return true; },
+      async terminateProviderJob() {}, async closeProviderJob() {},
+      async createPipe() { throw new Error("pipe creation failed"); },
+      async acceptPipe() {}, async readPipe() { return { data: new Uint8Array(), peer: null }; }, async writePipe() { return 0; },
+      async closePipeConnection() {}, async closePipeServer() {},
+      async close() { closed += 1; },
+    };
+    const factory: WindowsSessionHostNativeFactory = { async create() { return native; } };
+    await expect(runDetachedWindowsSessionHostFromEnvironment({ PROSPERO_WINDOWS_SESSION_HOST_STATE_DIRECTORY: stateDirectory }, factory)).rejects.toThrow(/pipe creation failed/i);
+    expect(files.has("host.bootstrap.json")).toBe(false);
+    expect(files.has("provider.bootstrap.json")).toBe(false);
+    expect(closed).toBe(1);
   });
 });
 

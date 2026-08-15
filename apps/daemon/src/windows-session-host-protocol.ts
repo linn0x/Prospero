@@ -27,8 +27,13 @@ export type WindowsSessionHostAvailabilityCode =
   | "identity_mismatch"
   | "acl_unverified"
   | "native_unavailable"
+  /** A host was created, then verification/attach/rollback failed. */
+  | "launch_failed"
   | "native_abi_mismatch"
   | "native_capability_missing"
+  | "parent_job_prevents_detach"
+  | "provider_job_incompatible"
+  | "reconciliation_required"
   | "journal_corrupt"
   | "snapshot_corrupt"
   | "terminal_fence";

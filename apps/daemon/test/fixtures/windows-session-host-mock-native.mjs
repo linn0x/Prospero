@@ -17,6 +17,7 @@ const files = new Map();
 let failWrites = false;
 let failSnapshotWrites = false;
 let handlerCalls = 0;
+let terminalFinalized = 0;
 
 const initial = createPsj2Journal(sessionId, epoch);
 const persisted = appendPsj2Event(initial, {
@@ -64,7 +65,15 @@ const manifest = parseWindowsSessionHostManifest({
 const runner = new WindowsSessionHostRunner(manifest, native, {
   async handleCommand(context) {
     handlerCalls += 1;
-    if (context.method === "stop") return { ok: true, result: { stopped: true }, terminal: true, snapshotState: { stopped: true } };
+    if (context.method === "stop" || context.method === "structured.kill") {
+      return {
+        ok: true,
+        result: { stopped: true },
+        terminal: true,
+        snapshotState: { stopped: true },
+        async afterReply() { terminalFinalized += 1; },
+      };
+    }
     return { ok: true, result: { method: context.method, calls: handlerCalls } };
   },
   snapshotState: () => ({ calls: handlerCalls }),
@@ -72,7 +81,7 @@ const runner = new WindowsSessionHostRunner(manifest, native, {
 await runner.load();
 
 function reply(id, value) {
-  process.send?.({ id, ok: true, value, calls: handlerCalls, journalBytes: files.get("journal.psj2")?.byteLength ?? 0, snapshotBytes: files.get("snapshot.psj2.json")?.byteLength ?? 0 });
+  process.send?.({ id, ok: true, value, calls: handlerCalls, terminalFinalized, journalBytes: files.get("journal.psj2")?.byteLength ?? 0, snapshotBytes: files.get("snapshot.psj2.json")?.byteLength ?? 0 });
 }
 
 process.send?.({ type: "ready", manifest, owner });
@@ -81,6 +90,7 @@ process.on("message", async (message) => {
     if (!message || typeof message !== "object") return;
     if (message.op === "hello") return reply(message.id, await runner.acceptHello(message.frame, message.peer));
     if (message.op === "command") return reply(message.id, await runner.command(message.frame));
+    if (message.op === "replyDelivered") { await runner.replyDelivered(message.commandId); return reply(message.id, { finalized: true }); }
     if (message.op === "replay") return reply(message.id, await runner.replay(message.frame));
     if (message.op === "appendEvent") return reply(message.id, await runner.appendEvent(message.payload, message.options));
     if (message.op === "detach") { runner.detachConnection(); return reply(message.id, { detached: true }); }

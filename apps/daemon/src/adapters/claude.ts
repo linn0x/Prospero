@@ -129,6 +129,10 @@ export interface ClaudeAdapterOptions {
 export class ClaudeAdapter implements AgentAdapter {
   constructor(private readonly opts: ClaudeAdapterOptions = {}) {}
 
+  // Claude's SDK need not expose a child PID: the host process joined the
+  // KILL_ON_JOB_CLOSE Job before `query()` can create its runtime.
+  readonly durableProviderJobCompatible = true;
+
   private ctx: AdapterContext | null = null;
   private q: Query | null = null;
   private readonly input = new MessageQueue();

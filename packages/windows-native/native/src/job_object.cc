@@ -167,6 +167,32 @@ extern "C" prospero_status prospero_job_object_assign_process(
   return status;
 }
 
+extern "C" prospero_status prospero_job_object_contains_process(
+    prospero_job_object_handle job,
+    prospero_process_identity process_identity,
+    uint8_t* out_contains) {
+  if (job == 0 || out_contains == nullptr || process_identity.pid == 0 ||
+      process_identity.creation_time_100ns == 0) {
+    return PROSPERO_STATUS_INVALID_ARGUMENT;
+  }
+  *out_contains = 0;
+
+  HANDLE process = nullptr;
+  const prospero_status verify_status =
+      OpenVerifiedProcess(process_identity, &process);
+  if (verify_status != PROSPERO_STATUS_OK) return verify_status;
+
+  BOOL in_job = FALSE;
+  if (!IsProcessInJob(process, ToHandle(job), &in_job)) {
+    const prospero_status status = StatusFromWin32Error(GetLastError());
+    CloseHandle(process);
+    return status;
+  }
+  CloseHandle(process);
+  *out_contains = in_job ? 1 : 0;
+  return PROSPERO_STATUS_OK;
+}
+
 extern "C" prospero_status prospero_job_object_terminate(
     prospero_job_object_handle job,
     uint32_t exit_code) {
@@ -246,6 +272,18 @@ extern "C" prospero_status prospero_job_object_assign_process(
   if (job == 0 || process.pid == 0 || process.creation_time_100ns == 0) {
     return PROSPERO_STATUS_INVALID_ARGUMENT;
   }
+  return PROSPERO_STATUS_NOT_AVAILABLE;
+}
+
+extern "C" prospero_status prospero_job_object_contains_process(
+    prospero_job_object_handle job,
+    prospero_process_identity process,
+    uint8_t* out_contains) {
+  if (out_contains == nullptr || job == 0 || process.pid == 0 ||
+      process.creation_time_100ns == 0) {
+    return PROSPERO_STATUS_INVALID_ARGUMENT;
+  }
+  *out_contains = 0;
   return PROSPERO_STATUS_NOT_AVAILABLE;
 }
 

@@ -557,6 +557,24 @@ napi_value MatchesProcessIdentity(napi_env env, napi_callback_info info) {
   return napi_get_boolean(env, matches != 0, &result) == napi_ok ? result : nullptr;
 }
 
+napi_value TerminateProcessIfIdentity(napi_env env, napi_callback_info info) {
+  napi_value argv[3] = {nullptr, nullptr, nullptr};
+  size_t argc = 0;
+  prospero_process_identity identity{};
+  uint32_t exit_code = 0;
+  uint32_t timeout_ms = 0;
+  if (!GetArguments(env, info, 3, argv, &argc) || argc != 3 ||
+      !GetProcessIdentity(env, argv[0], &identity) ||
+      !GetUint32(env, argv[1], &exit_code) ||
+      !GetUint32(env, argv[2], &timeout_ms) || timeout_ms == 0) return ThrowInvalidArgument(env);
+  uint8_t terminated = 0;
+  const prospero_status status = prospero_terminate_process_if_identity(
+      identity, exit_code, timeout_ms, &terminated);
+  if (status != PROSPERO_STATUS_OK) return ThrowStatus(env, status);
+  napi_value result = nullptr;
+  return napi_get_boolean(env, terminated != 0, &result) == napi_ok ? result : nullptr;
+}
+
 napi_value CreateSecureNamedPipeServer(napi_env env, napi_callback_info info) {
 #if !defined(_WIN32)
   return ThrowNotAvailable(env, info);
@@ -1254,55 +1272,95 @@ bool BuildEnvironmentBlock(napi_env env, napi_value options, EnvironmentBlock* o
 
 class NativeHandleRegistry {
  public:
-  uint64_t StoreJob(prospero_job_object_handle raw_handle) {
+  uint64_t StoreJob(napi_env owner_env, prospero_job_object_handle raw_handle) {
     std::lock_guard<std::mutex> lock(mutex_);
     const uint64_t token = NextTokenLocked();
-    jobs_.emplace(token, raw_handle);
+    jobs_.emplace(token, JobEntry{owner_env, raw_handle});
     return token;
   }
 
-  uint64_t StoreConPty(prospero_conpty_handle raw_handle) {
+  uint64_t StoreConPty(napi_env owner_env, prospero_conpty_handle raw_handle) {
     std::lock_guard<std::mutex> lock(mutex_);
     const uint64_t token = NextTokenLocked();
-    terminals_.emplace(token, raw_handle);
+    terminals_.emplace(token, ConPtyEntry{owner_env, raw_handle});
     return token;
   }
 
-  bool GetJob(uint64_t token, prospero_job_object_handle* out_handle) {
+  bool GetJob(napi_env owner_env, uint64_t token, prospero_job_object_handle* out_handle) {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto found = jobs_.find(token);
-    if (found == jobs_.end()) return false;
-    *out_handle = found->second;
+    if (found == jobs_.end() || found->second.owner_env != owner_env) return false;
+    *out_handle = found->second.handle;
     return true;
   }
 
-  bool TakeJob(uint64_t token, prospero_job_object_handle* out_handle) {
+  bool TakeJob(napi_env owner_env, uint64_t token, prospero_job_object_handle* out_handle) {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto found = jobs_.find(token);
-    if (found == jobs_.end()) return false;
-    *out_handle = found->second;
+    if (found == jobs_.end() || found->second.owner_env != owner_env) return false;
+    *out_handle = found->second.handle;
     jobs_.erase(found);
     return true;
   }
 
-  bool GetConPty(uint64_t token, prospero_conpty_handle* out_handle) {
+  bool GetConPty(napi_env owner_env, uint64_t token, prospero_conpty_handle* out_handle) {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto found = terminals_.find(token);
-    if (found == terminals_.end()) return false;
-    *out_handle = found->second;
+    if (found == terminals_.end() || found->second.owner_env != owner_env) return false;
+    *out_handle = found->second.handle;
     return true;
   }
 
-  bool TakeConPty(uint64_t token, prospero_conpty_handle* out_handle) {
+  bool TakeConPty(napi_env owner_env, uint64_t token, prospero_conpty_handle* out_handle) {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto found = terminals_.find(token);
-    if (found == terminals_.end()) return false;
-    *out_handle = found->second;
+    if (found == terminals_.end() || found->second.owner_env != owner_env) return false;
+    *out_handle = found->second.handle;
     terminals_.erase(found);
     return true;
   }
 
+  bool TakeConPtyForEnvironment(napi_env owner_env, prospero_conpty_handle* out_handle) {
+    if (out_handle == nullptr) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto current = terminals_.begin(); current != terminals_.end();) {
+      if (current->second.owner_env != owner_env) {
+        ++current;
+        continue;
+      }
+      *out_handle = current->second.handle;
+      terminals_.erase(current);
+      return true;
+    }
+    return false;
+  }
+
+  bool TakeJobForEnvironment(napi_env owner_env, prospero_job_object_handle* out_handle) {
+    if (out_handle == nullptr) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto current = jobs_.begin(); current != jobs_.end();) {
+      if (current->second.owner_env != owner_env) {
+        ++current;
+        continue;
+      }
+      *out_handle = current->second.handle;
+      jobs_.erase(current);
+      return true;
+    }
+    return false;
+  }
+
  private:
+  struct JobEntry {
+    napi_env owner_env;
+    prospero_job_object_handle handle;
+  };
+
+  struct ConPtyEntry {
+    napi_env owner_env;
+    prospero_conpty_handle handle;
+  };
+
   uint64_t NextTokenLocked() {
     do {
       ++next_token_;
@@ -1313,8 +1371,8 @@ class NativeHandleRegistry {
 
   std::mutex mutex_;
   uint64_t next_token_ = 0;
-  std::unordered_map<uint64_t, prospero_job_object_handle> jobs_;
-  std::unordered_map<uint64_t, prospero_conpty_handle> terminals_;
+  std::unordered_map<uint64_t, JobEntry> jobs_;
+  std::unordered_map<uint64_t, ConPtyEntry> terminals_;
 };
 
 NativeHandleRegistry& HandleRegistry() {
@@ -1341,7 +1399,7 @@ napi_value MakeBigInt(napi_env env, uint64_t value) {
 bool GetRequiredJobHandle(napi_env env, napi_value value, prospero_job_object_handle* out_handle) {
   uint64_t token = 0;
   if (!GetBigIntToken(env, value, &token)) return false;
-  if (!HandleRegistry().GetJob(token, out_handle)) {
+  if (!HandleRegistry().GetJob(env, token, out_handle)) {
     napi_throw_error(env, "PROSPERO_NATIVE_NOT_FOUND", "unknown or closed Job Object handle");
     return false;
   }
@@ -1351,7 +1409,7 @@ bool GetRequiredJobHandle(napi_env env, napi_value value, prospero_job_object_ha
 bool GetRequiredConPtyHandle(napi_env env, napi_value value, prospero_conpty_handle* out_handle) {
   uint64_t token = 0;
   if (!GetBigIntToken(env, value, &token)) return false;
-  if (!HandleRegistry().GetConPty(token, out_handle)) {
+  if (!HandleRegistry().GetConPty(env, token, out_handle)) {
     napi_throw_error(env, "PROSPERO_NATIVE_NOT_FOUND", "unknown or closed ConPTY handle");
     return false;
   }
@@ -1471,7 +1529,7 @@ napi_value CreateJobObject(napi_env env, napi_callback_info info) {
     ThrowStatus(env, status, "createJobObject");
     return nullptr;
   }
-  return MakeBigInt(env, HandleRegistry().StoreJob(raw_job));
+  return MakeBigInt(env, HandleRegistry().StoreJob(env, raw_job));
 }
 
 napi_value AssignProcessToJob(napi_env env, napi_callback_info info) {
@@ -1515,6 +1573,50 @@ napi_value AssignProcessToJob(napi_env env, napi_callback_info info) {
   return ReturnUndefined(env);
 }
 
+napi_value IsProcessInJobObject(napi_env env, napi_callback_info info) {
+  napi_value arguments[2] = {nullptr};
+  size_t count = 0;
+  if (!GetArguments(env, info, 2, &count, arguments) || count != 2) {
+    ThrowTypeError(env, "isProcessInJob expects a Job Object and process identity");
+    return nullptr;
+  }
+  prospero_job_object_handle job = 0;
+  if (!GetRequiredJobHandle(env, arguments[0], &job) || !IsObject(env, arguments[1])) return nullptr;
+  napi_value pid_value = nullptr;
+  napi_value creation_value = nullptr;
+  bool has_pid = false;
+  bool has_creation = false;
+  if (!GetNamedProperty(env, arguments[1], "pid", &pid_value, &has_pid) ||
+      !GetNamedProperty(env, arguments[1], "creationTime100ns", &creation_value, &has_creation) ||
+      !has_pid || !has_creation) {
+    ThrowTypeError(env, "process identity requires pid and creationTime100ns");
+    return nullptr;
+  }
+  prospero_process_identity process = {};
+  if (!GetUint32Value(env, pid_value, &process.pid) || process.pid == 0) {
+    if (process.pid == 0) ThrowTypeError(env, "process identity pid must be non-zero");
+    return nullptr;
+  }
+  std::wstring creation_time_text;
+  if (!GetUtf16String(env, creation_value, &creation_time_text) || creation_time_text.empty()) return nullptr;
+  wchar_t* end = nullptr;
+  const unsigned long long creation_time = wcstoull(creation_time_text.c_str(), &end, 10);
+  if (end == nullptr || *end != L'\0' || creation_time == 0) {
+    ThrowTypeError(env, "creationTime100ns must be a non-zero unsigned decimal FILETIME");
+    return nullptr;
+  }
+  process.creation_time_100ns = static_cast<uint64_t>(creation_time);
+  uint8_t in_job = 0;
+  const prospero_status status =
+      prospero_job_object_contains_process(job, process, &in_job);
+  if (status != PROSPERO_STATUS_OK) {
+    ThrowStatus(env, status, "isProcessInJob");
+    return nullptr;
+  }
+  napi_value result = nullptr;
+  return napi_get_boolean(env, in_job != 0, &result) == napi_ok ? result : nullptr;
+}
+
 napi_value TerminateJobObject(napi_env env, napi_callback_info info) {
   napi_value arguments[2] = {nullptr};
   size_t count = 0;
@@ -1544,7 +1646,7 @@ napi_value CloseJobObject(napi_env env, napi_callback_info info) {
   uint64_t token = 0;
   prospero_job_object_handle job = 0;
   if (!GetBigIntToken(env, arguments[0], &token)) return nullptr;
-  if (!HandleRegistry().TakeJob(token, &job)) {
+  if (!HandleRegistry().TakeJob(env, token, &job)) {
     napi_throw_error(env, "PROSPERO_NATIVE_NOT_FOUND", "unknown or closed Job Object handle");
     return nullptr;
   }
@@ -1651,7 +1753,7 @@ napi_value SpawnConPty(napi_env env, napi_callback_info info) {
     ThrowStatus(env, status, "spawnConPty");
     return nullptr;
   }
-  return MakeBigInt(env, HandleRegistry().StoreConPty(raw_terminal));
+  return MakeBigInt(env, HandleRegistry().StoreConPty(env, raw_terminal));
 }
 
 napi_value ResizeConPty(napi_env env, napi_callback_info info) {
@@ -1793,7 +1895,7 @@ napi_value CloseConPty(napi_env env, napi_callback_info info) {
   uint64_t token = 0;
   prospero_conpty_handle terminal = 0;
   if (!GetBigIntToken(env, arguments[0], &token)) return nullptr;
-  if (!HandleRegistry().TakeConPty(token, &terminal)) {
+  if (!HandleRegistry().TakeConPty(env, token, &terminal)) {
     napi_throw_error(env, "PROSPERO_NATIVE_NOT_FOUND", "unknown or closed ConPTY handle");
     return nullptr;
   }
@@ -1803,6 +1905,24 @@ napi_value CloseConPty(napi_env env, napi_callback_info info) {
     return nullptr;
   }
   return ReturnUndefined(env);
+}
+
+void CleanupEnvironmentHandles(void* data) {
+  const napi_env owner_env = static_cast<napi_env>(data);
+  // A worker can be force-terminated without running its JavaScript process
+  // hooks. Detach each token while holding the registry lock, then do its
+  // potentially blocking Windows teardown outside that lock. ConPTY closes
+  // first because it owns the safe pipe/Job/ClosePseudoConsole ordering; all
+  // remaining caller-owned Jobs are then explicitly terminated and closed.
+  prospero_conpty_handle terminal = 0;
+  while (HandleRegistry().TakeConPtyForEnvironment(owner_env, &terminal)) {
+    (void)prospero_conpty_close(terminal);
+  }
+  prospero_job_object_handle job = 0;
+  while (HandleRegistry().TakeJobForEnvironment(owner_env, &job)) {
+    (void)prospero_job_object_terminate(job, ERROR_PROCESS_ABORTED);
+    (void)prospero_job_object_close(job);
+  }
 }
 
 #endif  // defined(_WIN32)
@@ -1832,10 +1952,20 @@ extern "C" prospero_status prospero_query_capability_report(
 }
 
 NAPI_MODULE_INIT() {
+#if defined(_WIN32)
+  // This is deliberately native rather than a JS process hook: Worker.terminate()
+  // tears down the napi_env without running process "exit" listeners.
+  if (napi_add_env_cleanup_hook(env, process_terminal::CleanupEnvironmentHandles, env) != napi_ok) {
+    napi_throw_error(env, "PROSPERO_NATIVE_SYSTEM_ERROR",
+                     "failed to register Windows native environment cleanup");
+    return nullptr;
+  }
+#endif
   if (!ExportMethod(env, exports, "getAbiInfo", GetAbiInfo) ||
       !ExportMethod(env, exports, "getCurrentProcessIdentity", GetCurrentProcessIdentity) ||
       !ExportMethod(env, exports, "getProcessIdentity", GetProcessIdentityForPid) ||
       !ExportMethod(env, exports, "matchesProcessIdentity", MatchesProcessIdentity) ||
+      !ExportMethod(env, exports, "terminateProcessIfIdentity", TerminateProcessIfIdentity) ||
       !ExportMethod(env, exports, "createSecureNamedPipeServer", CreateSecureNamedPipeServer) ||
       !ExportMethod(env, exports, "acceptSecureNamedPipeConnection", AcceptSecureNamedPipeConnection) ||
       !ExportMethod(env, exports, "closeSecureNamedPipeServer", CloseSecureNamedPipeServer) ||
@@ -1847,6 +1977,7 @@ NAPI_MODULE_INIT() {
 #if defined(_WIN32)
       !ExportMethod(env, exports, "createJobObject", process_terminal::CreateJobObject) ||
       !ExportMethod(env, exports, "assignProcessToJob", process_terminal::AssignProcessToJob) ||
+      !ExportMethod(env, exports, "isProcessInJob", process_terminal::IsProcessInJobObject) ||
       !ExportMethod(env, exports, "terminateJobObject", process_terminal::TerminateJobObject) ||
       !ExportMethod(env, exports, "closeJobObject", process_terminal::CloseJobObject) ||
       !ExportMethod(env, exports, "getParentJobCompatibility", process_terminal::GetParentJobCompatibility) ||
@@ -1860,6 +1991,7 @@ NAPI_MODULE_INIT() {
 #else
       !ExportMethod(env, exports, "createJobObject", ThrowNotAvailable) ||
       !ExportMethod(env, exports, "assignProcessToJob", ThrowNotAvailable) ||
+      !ExportMethod(env, exports, "isProcessInJob", ThrowNotAvailable) ||
       !ExportMethod(env, exports, "terminateJobObject", ThrowNotAvailable) ||
       !ExportMethod(env, exports, "closeJobObject", ThrowNotAvailable) ||
       !ExportMethod(env, exports, "getParentJobCompatibility", ThrowNotAvailable) ||
