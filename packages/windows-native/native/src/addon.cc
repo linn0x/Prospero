@@ -68,6 +68,61 @@ napi_value ThrowStatus(napi_env env, prospero_status status) {
   }
 }
 
+/**
+ * N-API argument parsing uses ThrowInvalidArgument above. A valid JS call can
+ * still fail inside the native atomic-write pipeline, so report that stage
+ * without surfacing the state path, filename, bytes, or raw OS error.
+ */
+napi_value ThrowSecureStateWriteFailure(
+    napi_env env,
+    prospero_secure_state_write_stage stage) {
+  const char* code = "PROSPERO_NATIVE_SECURE_STATE_WRITE_UNKNOWN";
+  const char* message = "Secure-state atomic write failed during a native operation";
+  switch (stage) {
+    case PROSPERO_SECURE_STATE_WRITE_STAGE_VALIDATE:
+      code = "PROSPERO_NATIVE_SECURE_STATE_WRITE_VALIDATE";
+      message = "Secure-state atomic write native validation rejected an invalid argument";
+      break;
+    case PROSPERO_SECURE_STATE_WRITE_STAGE_DIRECTORY:
+      code = "PROSPERO_NATIVE_SECURE_STATE_WRITE_DIRECTORY";
+      message = "Secure-state atomic write failed while resolving its native directory handle";
+      break;
+    case PROSPERO_SECURE_STATE_WRITE_STAGE_TARGET:
+      code = "PROSPERO_NATIVE_SECURE_STATE_WRITE_TARGET";
+      message = "Secure-state atomic write failed while validating its existing target";
+      break;
+    case PROSPERO_SECURE_STATE_WRITE_STAGE_CREATE_TEMPORARY:
+      code = "PROSPERO_NATIVE_SECURE_STATE_WRITE_CREATE_TEMPORARY";
+      message = "Secure-state atomic write failed while creating its temporary file";
+      break;
+    case PROSPERO_SECURE_STATE_WRITE_STAGE_VERIFY_TEMPORARY:
+      code = "PROSPERO_NATIVE_SECURE_STATE_WRITE_VERIFY_TEMPORARY";
+      message = "Secure-state atomic write failed while validating temporary-file security";
+      break;
+    case PROSPERO_SECURE_STATE_WRITE_STAGE_WRITE:
+      code = "PROSPERO_NATIVE_SECURE_STATE_WRITE_WRITE";
+      message = "Secure-state atomic write failed while writing its temporary file";
+      break;
+    case PROSPERO_SECURE_STATE_WRITE_STAGE_FLUSH:
+      code = "PROSPERO_NATIVE_SECURE_STATE_WRITE_FLUSH";
+      message = "Secure-state atomic write failed while flushing its temporary file";
+      break;
+    case PROSPERO_SECURE_STATE_WRITE_STAGE_RENAME:
+      code = "PROSPERO_NATIVE_SECURE_STATE_WRITE_RENAME";
+      message = "Secure-state atomic write failed during native atomic rename";
+      break;
+    case PROSPERO_SECURE_STATE_WRITE_STAGE_CLEANUP:
+      code = "PROSPERO_NATIVE_SECURE_STATE_WRITE_CLEANUP";
+      message = "Secure-state atomic write failed while cleaning up its temporary file";
+      break;
+    case PROSPERO_SECURE_STATE_WRITE_STAGE_NONE:
+    default:
+      break;
+  }
+  napi_throw_error(env, code, message);
+  return nullptr;
+}
+
 bool GetArguments(napi_env env,
                   napi_callback_info info,
                   size_t maximum,
@@ -723,7 +778,10 @@ napi_value WriteSecureStateFileAtomically(napi_env env, napi_callback_info info)
   }
   const prospero_status status = prospero_secure_state_directory_write_atomic(
       directory, file_name.c_str(), data, length);
-  return status == PROSPERO_STATUS_OK ? ReturnUndefined(env) : ThrowStatus(env, status);
+  return status == PROSPERO_STATUS_OK
+             ? ReturnUndefined(env)
+             : ThrowSecureStateWriteFailure(
+                   env, prospero_secure_state_directory_last_write_stage());
 }
 
 napi_value ReadSecureStateFile(napi_env env, napi_callback_info info) {
