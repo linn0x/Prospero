@@ -258,19 +258,109 @@ describeWindows.sequential("Windows N-API Job Object, detached host, and ConPTY 
     }
   });
 
-  it("echoes UTF-8, resizes, and Job-kills the provider tree", async () => {
+  it("round-trips argv0 and Unicode arguments through ConPTY before terminal lifecycle work", async () => {
+    // CI previously received ConPTY's VT/title stream but not the -e script
+    // output; the capture-boundary case below shows why. Keep argv parsing
+    // independent of resize, input, and Job-tree assertions so it identifies
+    // a command-line regression once terminal stdio is correctly isolated.
     const unicodeArgument = "参数 with spaces, quote \" and trailing slash\\";
+    const childSource = [
+      "const payload = {",
+      "  argv0: process.argv0,",
+      "  argv: process.argv,",
+      "  stdinIsTty: process.stdin.isTTY === true,",
+      "  stdoutIsTty: process.stdout.isTTY === true,",
+      "  stderrIsTty: process.stderr.isTTY === true,",
+      "};",
+      "process.stdout.write(`PROSPERO_ARGV_ROUND_TRIP:${JSON.stringify(payload)}\\n`);",
+    ].join("\n");
+    const terminal = native.spawnConPty({
+      executablePath: process.execPath,
+      arguments: ["-e", childSource, unicodeArgument, ""],
+      columns: 80,
+      rows: 24,
+    });
+    try {
+      const output = await drainUntil(terminal, "PROSPERO_ARGV_ROUND_TRIP:");
+      const match = output.match(/PROSPERO_ARGV_ROUND_TRIP:(.+)\r?\n/);
+      expect(match).not.toBeNull();
+      expect(JSON.parse(match?.[1] ?? "")).toEqual({
+        argv0: process.execPath,
+        argv: [process.execPath, unicodeArgument, ""],
+        stdinIsTty: true,
+        stdoutIsTty: true,
+        stderrIsTty: true,
+      });
+    } finally {
+      native.closeConPty(terminal);
+    }
+  });
+
+  it("keeps ConPTY output in its drain when the parent stdout and stderr are redirected", async () => {
+    // Run the native spawn inside an execFile child, whose stdout/stderr are
+    // capture pipes. That reproduces the GitHub runner condition: before the
+    // STARTF_USESTDHANDLES+NULL fix, these markers escaped into `stdout` and
+    // `stderr`, while readConPty saw only conhost's VT/title sequences.
+    const marker = "PROSPERO_CONPTY_CAPTURE_BOUNDARY";
+    const childSource = [
+      `process.stdout.write(${JSON.stringify(`${marker}:stdout\\n`)});`,
+      `process.stderr.write(${JSON.stringify(`${marker}:stderr\\n`)});`,
+    ].join("\n");
+    const helperSource = [
+      "const native = require(process.argv[1]);",
+      `const marker = ${JSON.stringify(marker)};`,
+      `const childSource = ${JSON.stringify(childSource)};`,
+      "(async () => {",
+      "  const terminal = native.spawnConPty({",
+      "    executablePath: process.execPath,",
+      "    arguments: ['-e', childSource],",
+      "    columns: 80,",
+      "    rows: 24,",
+      "  });",
+      "  const decoder = new TextDecoder();",
+      "  let output = '';",
+      "  try {",
+      "    for (let attempt = 0; attempt < 100; ++attempt) {",
+      "      output += decoder.decode(native.readConPty(terminal, 16 * 1024), { stream: true });",
+      "      if (output.includes(`${marker}:stdout`) && output.includes(`${marker}:stderr`)) break;",
+      "      await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));",
+      "    }",
+      "    output += decoder.decode();",
+      "  } finally {",
+      "    native.closeConPty(terminal);",
+      "  }",
+      "  process.stdout.write(JSON.stringify({ output }) + '\\n');",
+      "})().catch((error) => {",
+      "  process.stderr.write(error.stack || String(error));",
+      "  process.exitCode = 1;",
+      "});",
+    ].join("\n");
+    const { stdout, stderr } = await execFileAsync(process.execPath, ["-e", helperSource, addonPath], {
+      windowsHide: true,
+    });
+
+    // The helper writes exactly one JSON line. A raw marker here would prove
+    // that a child inherited its parent's capture pipes instead of ConPTY.
+    const stdoutLines = stdout.split(/\r?\n/).filter((line) => line.length > 0);
+    expect(stdoutLines).toHaveLength(1);
+    expect(stderr).toBe("");
+    const result = JSON.parse(stdoutLines[0]) as { output: string };
+    expect(result.output).toContain(`${marker}:stdout`);
+    expect(result.output).toContain(`${marker}:stderr`);
+  });
+
+  it("echoes UTF-8, resizes, and Job-kills the provider tree", async () => {
     const providerSource = [
       "const { spawn } = require('node:child_process');",
       "const grandchild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });",
-      "process.stdout.write(`PIDS:${process.pid}:${grandchild.pid}\\n你好🙂\\nARGV0:${process.argv0}\\nARG:${process.argv[1]}\\n`);",
+      "process.stdout.write(`PIDS:${process.pid}:${grandchild.pid}\\n你好🙂\\n`);",
       "process.stdin.setEncoding('utf8');",
       "process.stdin.on('data', (data) => process.stdout.write(`ECHO:${data}`));",
       "setInterval(() => {}, 1000);",
     ].join("\n");
     const terminal = native.spawnConPty({
       executablePath: process.execPath,
-      arguments: ["-e", providerSource, unicodeArgument],
+      arguments: ["-e", providerSource],
       columns: 80,
       rows: 24,
     });
@@ -278,8 +368,6 @@ describeWindows.sequential("Windows N-API Job Object, detached host, and ConPTY 
       native.resizeConPty(terminal, 120, 40);
       let output = await drainUntil(terminal, "你好");
       expect(output).toContain("你好");
-      expect(output).toContain(`ARGV0:${process.execPath}`);
-      expect(output).toContain(`ARG:${unicodeArgument}`);
       const written = native.writeConPty(terminal, encoder.encode("hello\n"));
       expect(written).toBeGreaterThan(0);
       output += await drainUntil(terminal, "ECHO:hello");
@@ -304,23 +392,48 @@ describeWindows.sequential("Windows N-API Job Object, detached host, and ConPTY 
     })).toThrow();
   });
 
-  it("uses an explicit double-NUL empty environment and rejects ambiguous or oversized blocks", async () => {
+  it("uses explicit Unicode environment blocks and safely probes an empty block", async () => {
     const inheritedProbe = "PROSPERO_NATIVE_ENV_INHERIT_PROBE";
     const priorValue = process.env[inheritedProbe];
     process.env[inheritedProbe] = "must-not-inherit";
+    const systemRoot = process.env.SystemRoot;
+    if (!systemRoot) throw new Error("SystemRoot is required for the Windows environment smoke check");
     const terminal = native.spawnConPty({
       executablePath: process.execPath,
-      arguments: ["-e", `process.stdout.write(process.env.${inheritedProbe} === undefined ? 'EMPTY_ENV' : 'INHERITED_ENV')`],
+      arguments: ["-e", `process.stdout.write(process.env.${inheritedProbe} === undefined ? 'ISOLATED_ENV' : 'INHERITED_ENV')`],
+      columns: 80,
+      rows: 24,
+      // Node 22's CSPRNG initialization needs Windows' system-directory
+      // variables. Keep the production bootstrap minimal and explicit rather
+      // than treating its initialization abort as an empty-block failure.
+      environment: {
+        SystemRoot: systemRoot,
+        WINDIR: process.env.WINDIR ?? systemRoot,
+      },
+    });
+    try {
+      expect(await drainUntil(terminal, "ENV")).toContain("ISOLATED_ENV");
+    } finally {
+      native.closeConPty(terminal);
+      if (priorValue === undefined) delete process.env[inheritedProbe];
+      else process.env[inheritedProbe] = priorValue;
+    }
+
+    // The API still represents {} as an explicit double-NUL block. Use a
+    // direct Windows native executable instead of Node, whose empty
+    // environment startup aborts before user code can observe the block.
+    const whoami = join(systemRoot, "System32", "whoami.exe");
+    const emptyEnvironmentTerminal = native.spawnConPty({
+      executablePath: whoami,
+      arguments: ["/user"],
       columns: 80,
       rows: 24,
       environment: {},
     });
     try {
-      expect(await drainUntil(terminal, "ENV")).toContain("EMPTY_ENV");
+      expect(await drainUntil(emptyEnvironmentTerminal, "\\")).toContain("\\");
     } finally {
-      native.closeConPty(terminal);
-      if (priorValue === undefined) delete process.env[inheritedProbe];
-      else process.env[inheritedProbe] = priorValue;
+      native.closeConPty(emptyEnvironmentTerminal);
     }
 
     expect(() => native.spawnConPty({
