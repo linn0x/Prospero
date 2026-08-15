@@ -1,4 +1,5 @@
 #include "prospero_windows_native.h"
+#include "prospero_cancellable_operation_state.h"
 
 #if defined(_WIN32)
 
@@ -48,6 +49,8 @@ struct TokenIdentity {
  */
 class CancelablePipeHandle {
  public:
+  using IssueGuard = prospero_cancellable_operation::State::IssueGuard;
+
   explicit CancelablePipeHandle(HANDLE handle) : handle_(handle) {}
   ~CancelablePipeHandle() { CancelAndClose(); }
 
@@ -55,18 +58,19 @@ class CancelablePipeHandle {
   CancelablePipeHandle& operator=(const CancelablePipeHandle&) = delete;
 
   bool Begin(HANDLE* out_handle) {
+    if (!state_.BeginBorrow()) return false;
     std::lock_guard<std::mutex> lock(mutex_);
-    if (stopped_ || handle_ == INVALID_HANDLE_VALUE) return false;
-    ++in_flight_;
+    if (handle_ == INVALID_HANDLE_VALUE) {
+      state_.EndBorrow();
+      return false;
+    }
     *out_handle = handle_;
     return true;
   }
 
-  void End() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (in_flight_ != 0) --in_flight_;
-    if (stopped_ && in_flight_ == 0) drained_.notify_all();
-  }
+  void End() { state_.EndBorrow(); }
+
+  IssueGuard BeginIssue() { return state_.BeginIssue(); }
 
   void CancelAndClose() noexcept {
     std::lock_guard<std::mutex> termination_lock(termination_mutex_);
@@ -92,27 +96,30 @@ class CancelablePipeHandle {
 
  private:
   HANDLE StopAndDrain() noexcept {
+    // Keep the issue guard until CancelIoEx has run.  Without this ordering,
+    // close can cancel an empty handle immediately before another worker
+    // submits ConnectNamedPipe, leaving that future request uncancellable.
+    auto stop = state_.BeginStop();
     HANDLE handle = INVALID_HANDLE_VALUE;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (handle_ == INVALID_HANDLE_VALUE) return INVALID_HANDLE_VALUE;
-      stopped_ = true;
       handle = handle_;
     }
-    // CancelIoEx is intentionally outside the mutex: completion needs End()
-    // to acquire it. The handle stays open until every borrower has drained.
+    // The endpoint stays open until every borrower has drained. The state
+    // mutex is independent from the issue guard, so completion may call End.
     CancelIoEx(handle, nullptr);
-    std::unique_lock<std::mutex> lock(mutex_);
-    drained_.wait(lock, [this] { return in_flight_ == 0; });
-    return handle_;
+    // Do not retain the issue guard while waiting: a borrower that lost the
+    // race must reacquire it, observe stopped_, and unwind its lease.
+    stop.Release();
+    state_.WaitForBorrowers();
+    return handle;
   }
 
   std::mutex mutex_;
   std::mutex termination_mutex_;
-  std::condition_variable drained_;
+  prospero_cancellable_operation::State state_;
   HANDLE handle_ = INVALID_HANDLE_VALUE;
-  uint32_t in_flight_ = 0;
-  bool stopped_ = false;
 };
 
 class PipeIoLease {
@@ -120,16 +127,33 @@ class PipeIoLease {
   explicit PipeIoLease(const std::shared_ptr<CancelablePipeHandle>& endpoint)
       : endpoint_(endpoint), acquired_(endpoint_ != nullptr && endpoint_->Begin(&handle_)) {}
   ~PipeIoLease() {
+    EndIssue();
     if (acquired_) endpoint_->End();
   }
 
   bool acquired() const { return acquired_; }
   HANDLE handle() const { return handle_; }
 
+  bool BeginIssue() {
+    if (!acquired_ || issuing_) return false;
+    issue_ = endpoint_->BeginIssue();
+    issuing_ = issue_.active();
+    if (!issuing_) issue_.Release();
+    return issuing_;
+  }
+
+  void EndIssue() {
+    if (!issuing_) return;
+    issue_.Release();
+    issuing_ = false;
+  }
+
  private:
   std::shared_ptr<CancelablePipeHandle> endpoint_;
   HANDLE handle_ = INVALID_HANDLE_VALUE;
   bool acquired_ = false;
+  CancelablePipeHandle::IssueGuard issue_;
+  bool issuing_ = false;
 };
 
 struct PipeServer {
@@ -407,31 +431,50 @@ prospero_status AwaitOverlapped(HANDLE handle, OVERLAPPED* overlapped, DWORD* ou
   return PROSPERO_STATUS_OK;
 }
 
-prospero_status ConnectCancelable(HANDLE handle) {
+bool StartConnect(PipeIoLease* lease,
+                  OVERLAPPED* overlapped,
+                  BOOL* out_connected,
+                  DWORD* out_error) {
+  if (lease == nullptr || overlapped == nullptr || out_connected == nullptr || out_error == nullptr ||
+      !lease->BeginIssue()) {
+    return false;
+  }
+  *out_connected = ConnectNamedPipe(lease->handle(), overlapped);
+  *out_error = *out_connected ? ERROR_SUCCESS : GetLastError();
+  lease->EndIssue();
+  return true;
+}
+
+prospero_status ConnectCancelable(PipeIoLease* lease) {
+  if (lease == nullptr || !lease->acquired()) return PROSPERO_STATUS_NOT_FOUND;
   HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
   if (event == nullptr) return StatusFromLastError(GetLastError());
   OVERLAPPED overlapped{};
   overlapped.hEvent = event;
-  BOOL connected = ConnectNamedPipe(handle, &overlapped);
-  DWORD error = connected ? ERROR_SUCCESS : GetLastError();
+  BOOL connected = FALSE;
+  DWORD error = ERROR_OPERATION_ABORTED;
+  const bool started = StartConnect(lease, &overlapped, &connected, &error);
   prospero_status status = PROSPERO_STATUS_OK;
-  if (!connected && error != ERROR_PIPE_CONNECTED) {
+  if (!started) {
+    status = PROSPERO_STATUS_NOT_FOUND;
+  } else if (!connected && error != ERROR_PIPE_CONNECTED) {
     if (error == ERROR_IO_PENDING) {
       DWORD ignored = 0;
-      status = AwaitOverlapped(handle, &overlapped, &ignored);
+      status = AwaitOverlapped(lease->handle(), &overlapped, &ignored);
     } else if (error == ERROR_NO_DATA) {
       // A client disappeared between instance creation and accept. Reset the
       // same owned instance once; caller may retry on a later new client.
-      DisconnectNamedPipe(handle);
+      DisconnectNamedPipe(lease->handle());
       ResetEvent(event);
       memset(&overlapped, 0, sizeof(overlapped));
       overlapped.hEvent = event;
-      connected = ConnectNamedPipe(handle, &overlapped);
-      error = connected ? ERROR_SUCCESS : GetLastError();
-      if (!connected && error != ERROR_PIPE_CONNECTED) {
+      const bool restarted = StartConnect(lease, &overlapped, &connected, &error);
+      if (!restarted) {
+        status = PROSPERO_STATUS_NOT_FOUND;
+      } else if (!connected && error != ERROR_PIPE_CONNECTED) {
         if (error == ERROR_IO_PENDING) {
           DWORD ignored = 0;
-          status = AwaitOverlapped(handle, &overlapped, &ignored);
+          status = AwaitOverlapped(lease->handle(), &overlapped, &ignored);
         } else {
           status = StatusFromLastError(error);
         }
@@ -444,21 +487,27 @@ prospero_status ConnectCancelable(HANDLE handle) {
   return status;
 }
 
-prospero_status ReadCancelable(HANDLE handle,
+prospero_status ReadCancelable(PipeIoLease* lease,
                               uint8_t* buffer,
                               uint32_t capacity,
                               uint32_t* out_read) {
+  if (lease == nullptr || !lease->acquired()) return PROSPERO_STATUS_NOT_FOUND;
   HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
   if (event == nullptr) return StatusFromLastError(GetLastError());
   OVERLAPPED overlapped{};
   overlapped.hEvent = event;
   DWORD read = 0;
-  const BOOL succeeded = ReadFile(handle, buffer, capacity, &read, &overlapped);
+  if (!lease->BeginIssue()) {
+    CloseHandle(event);
+    return PROSPERO_STATUS_NOT_FOUND;
+  }
+  const BOOL succeeded = ReadFile(lease->handle(), buffer, capacity, &read, &overlapped);
   const DWORD error = succeeded ? ERROR_SUCCESS : GetLastError();
+  lease->EndIssue();
   prospero_status status = PROSPERO_STATUS_OK;
   if (!succeeded) {
     if (error == ERROR_IO_PENDING) {
-      status = AwaitOverlapped(handle, &overlapped, &read);
+      status = AwaitOverlapped(lease->handle(), &overlapped, &read);
     } else {
       status = StatusFromLastError(error);
     }
@@ -468,21 +517,27 @@ prospero_status ReadCancelable(HANDLE handle,
   return status;
 }
 
-prospero_status WriteCancelable(HANDLE handle,
+prospero_status WriteCancelable(PipeIoLease* lease,
                                const uint8_t* buffer,
                                uint32_t length,
                                uint32_t* out_written) {
+  if (lease == nullptr || !lease->acquired()) return PROSPERO_STATUS_NOT_FOUND;
   HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
   if (event == nullptr) return StatusFromLastError(GetLastError());
   OVERLAPPED overlapped{};
   overlapped.hEvent = event;
   DWORD written = 0;
-  const BOOL succeeded = WriteFile(handle, buffer, length, &written, &overlapped);
+  if (!lease->BeginIssue()) {
+    CloseHandle(event);
+    return PROSPERO_STATUS_NOT_FOUND;
+  }
+  const BOOL succeeded = WriteFile(lease->handle(), buffer, length, &written, &overlapped);
   const DWORD error = succeeded ? ERROR_SUCCESS : GetLastError();
+  lease->EndIssue();
   prospero_status status = PROSPERO_STATUS_OK;
   if (!succeeded) {
     if (error == ERROR_IO_PENDING) {
-      status = AwaitOverlapped(handle, &overlapped, &written);
+      status = AwaitOverlapped(lease->handle(), &overlapped, &written);
     } else {
       status = StatusFromLastError(error);
     }
@@ -671,7 +726,7 @@ extern "C" prospero_status prospero_secure_pipe_server_accept(
     }
     PipeIoLease lease(listener);
     const prospero_status accept_status = lease.acquired()
-        ? ConnectCancelable(lease.handle())
+        ? ConnectCancelable(&lease)
         : PROSPERO_STATUS_NOT_FOUND;
     {
       std::lock_guard<std::mutex> lock(server->mutex);
@@ -743,7 +798,7 @@ extern "C" prospero_status prospero_secure_pipe_connection_read(
   {
     PipeIoLease lease(connection->endpoint);
     if (!lease.acquired()) return PROSPERO_STATUS_NOT_FOUND;
-    status = ReadCancelable(lease.handle(), buffer, capacity, out_read);
+    status = ReadCancelable(&lease, buffer, capacity, out_read);
     if (status != PROSPERO_STATUS_OK) return status;
     if (*out_read == 0) return PROSPERO_STATUS_NOT_FOUND;
     if (HasAuthenticatedPeer(connection.get())) return PROSPERO_STATUS_OK;
@@ -778,7 +833,7 @@ extern "C" prospero_status prospero_secure_pipe_connection_write(
   if (!HasAuthenticatedPeer(connection.get())) return PROSPERO_STATUS_ACCESS_DENIED;
   PipeIoLease lease(connection->endpoint);
   if (!lease.acquired()) return PROSPERO_STATUS_NOT_FOUND;
-  return WriteCancelable(lease.handle(), buffer, length, out_written);
+  return WriteCancelable(&lease, buffer, length, out_written);
 }
 
 extern "C" prospero_status prospero_secure_pipe_connection_peer_identity(
