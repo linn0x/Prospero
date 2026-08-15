@@ -127,17 +127,26 @@ function defaultAuthenticodeCheck(binaryPath: string): AuthenticodeResult {
   if (powershellPath === null) {
     return { status: "systemroot-unavailable", thumbprintSha1: null };
   }
-  // The binary path is passed as an argument, not interpolated into PowerShell.
+  // Windows PowerShell treats every token following a string-valued -Command
+  // as part of that command. Pass the path as child-process data instead of
+  // interpolating it or relying on $args, so spaces and metacharacters cannot
+  // alter the verification command.
+  const binaryPathEnvironmentVariable = "PROSPERO_WINDOWS_NATIVE_AUTHENTICODE_PATH";
   const command = [
-    "$signature = Get-AuthenticodeSignature -LiteralPath $args[0]",
+    `$binaryPath = [Environment]::GetEnvironmentVariable('${binaryPathEnvironmentVariable}', 'Process')`,
+    "$signature = Microsoft.PowerShell.Security\\Get-AuthenticodeSignature -LiteralPath $binaryPath",
     "$thumbprint = if ($null -eq $signature.SignerCertificate) { '' } else { $signature.SignerCertificate.Thumbprint }",
     "[Console]::Out.Write($signature.Status.ToString() + '|' + $thumbprint)",
   ].join("; ");
   try {
     const result = spawnSync(
       powershellPath,
-      ["-NoProfile", "-NonInteractive", "-Command", command, binaryPath],
-      { encoding: "utf8", windowsHide: true },
+      ["-NoProfile", "-NonInteractive", "-Command", command],
+      {
+        encoding: "utf8",
+        windowsHide: true,
+        env: { ...process.env, [binaryPathEnvironmentVariable]: binaryPath },
+      },
     );
     if (result.error || result.status !== 0 || typeof result.stdout !== "string") {
       return { status: "command-failed", thumbprintSha1: null };
