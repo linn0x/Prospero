@@ -50,7 +50,7 @@ try {
     preReadPeerRejected = error?.code === "PROSPERO_NATIVE_ACCESS_DENIED";
   }
   if (!preReadPeerRejected) {
-    throw new Error("peer identity must be rejected until the first authentication frame is read");
+    throw new Error("peer identity must be rejected until the first non-empty read verifies OS peer identity");
   }
   let preReadWriteRejected = false;
   try {
@@ -59,7 +59,7 @@ try {
     preReadWriteRejected = error?.code === "PROSPERO_NATIVE_ACCESS_DENIED";
   }
   if (!preReadWriteRejected) {
-    throw new Error("writes must be rejected until the first read authenticates the peer");
+    throw new Error("writes must be rejected until the first non-empty read verifies OS peer identity");
   }
   completePhase("pre-read-peer");
   beginPhase("read");
