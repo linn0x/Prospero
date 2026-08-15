@@ -1,6 +1,6 @@
 # Windows N-API native boundary
 
-`@prospero/windows-native` is a prebuilt Node-API C ABI boundary for Windows x64 and arm64. It is intentionally separate from the daemon and does **not** enable production Windows durable sessions. A higher layer must keep that feature disabled until this package loads successfully and its individual operations have production implementations.
+`@prospero/windows-native` is a prebuilt Node-API C ABI boundary for Windows x64 and arm64. It is intentionally separate from the daemon. A successfully verified binding is a prerequisite—not by itself a durable-session claim: the daemon creates a Windows Session Host only after the binding, its complete capability set, secure state directory, authenticated pipe and Job launch all succeed. See the [Session Host operations guide](windows-session-host-operations.md) for the resulting fallback and recovery states.
 
 ## Contract and source ownership
 
