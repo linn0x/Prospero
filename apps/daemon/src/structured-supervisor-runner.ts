@@ -23,7 +23,7 @@ import { GrokAdapter } from "./adapters/grok.js";
 import { OpencodeAdapter } from "./adapters/opencode.js";
 import type { AdapterResumeState, AgentAdapter } from "./adapters/types.js";
 import { StructuredSession, type StructuredSessionPersistentState } from "./structured-session.js";
-import { startStructuredSupervisor, type SupervisorAdapter } from "./structured-supervisor.js";
+import { SUPERVISOR_PROTOCOL_VERSION, startStructuredSupervisor, type SupervisorAdapter } from "./structured-supervisor.js";
 import {
   hasPrivateSupervisorDirectoryMode,
   hasPrivateSupervisorFileMode,
@@ -80,6 +80,123 @@ interface RunnerConfig {
   initialAdapterState?: AdapterResumeState;
 }
 
+const RUNNER_CONFIG_KEYS = new Set([
+  "version", "sessionId", "agent", "title", "cwd", "createdAt", "approvalPolicy",
+  "sessionDir", "attachmentRoot", "socketPath", "transport", "lifecycleEpoch", "socketDir",
+  "environment", "codexAppServerArgs", "accountId", "accountName", "initialAdapterState",
+]);
+const LEGACY_RUNNER_CONFIG_KEYS = new Set([...RUNNER_CONFIG_KEYS].filter(
+  (key) => key !== "transport" && key !== "lifecycleEpoch",
+));
+const MANIFEST_KEYS = new Set([
+  "version", "protocolVersion", "implementation", "sessionId", "agent", "title", "cwd", "createdAt",
+  "approvalPolicy", "socket", "transport", "tokenFile", "sessionDir", "supervisorPid", "lifecycleEpoch",
+  "status", "updatedAt", "accountId", "accountName",
+]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasOnlyKeys(value: Record<string, unknown>, allowed: ReadonlySet<string>): boolean {
+  return Object.keys(value).every((key) => allowed.has(key));
+}
+
+function stringRecord(value: unknown): value is Record<string, string> {
+  return isRecord(value) && Object.values(value).every((entry) => typeof entry === "string");
+}
+
+function stringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === "string");
+}
+
+function privateDirectory(dir: string): boolean {
+  try {
+    const metadata = lstatSync(dir);
+    return metadata.isDirectory() && !metadata.isSymbolicLink() && hasPrivateSupervisorDirectoryMode(metadata.mode);
+  } catch {
+    return false;
+  }
+}
+
+function validConfigShape(value: Record<string, unknown>, allowLegacyTransport: boolean): boolean {
+  const allowed = allowLegacyTransport ? LEGACY_RUNNER_CONFIG_KEYS : RUNNER_CONFIG_KEYS;
+  if (!hasOnlyKeys(value, allowed)) return false;
+  return value["version"] === 1 &&
+    typeof value["sessionId"] === "string" && typeof value["agent"] === "string" &&
+    typeof value["title"] === "string" && typeof value["cwd"] === "string" &&
+    typeof value["createdAt"] === "number" && Number.isFinite(value["createdAt"]) &&
+    (value["approvalPolicy"] === undefined || typeof value["approvalPolicy"] === "string") &&
+    typeof value["sessionDir"] === "string" && path.isAbsolute(value["sessionDir"] as string) &&
+    typeof value["attachmentRoot"] === "string" && typeof value["socketPath"] === "string" &&
+    (value["socketDir"] === undefined || typeof value["socketDir"] === "string") &&
+    stringRecord(value["environment"]) &&
+    (value["codexAppServerArgs"] === undefined || stringArray(value["codexAppServerArgs"])) &&
+    (value["accountId"] === undefined || typeof value["accountId"] === "string") &&
+    (value["accountName"] === undefined || typeof value["accountName"] === "string") &&
+    (value["initialAdapterState"] === undefined || isRecord(value["initialAdapterState"]));
+}
+
+function readLegacyManifest(sessionDir: string): StructuredSupervisorManifest | null {
+  const file = path.join(sessionDir, "manifest.json");
+  try {
+    const metadata = lstatSync(file);
+    if (!metadata.isFile() || metadata.isSymbolicLink() || !hasPrivateSupervisorFileMode(metadata.mode)) return null;
+    const raw: unknown = JSON.parse(readFileSync(file, "utf8"));
+    if (!isRecord(raw) || !hasOnlyKeys(raw, MANIFEST_KEYS)) return null;
+    if (
+      raw["version"] !== SUPERVISOR_MANIFEST_VERSION || raw["protocolVersion"] !== SUPERVISOR_PROTOCOL_VERSION ||
+      raw["implementation"] !== "supervisor" || typeof raw["sessionId"] !== "string" ||
+      typeof raw["agent"] !== "string" || typeof raw["title"] !== "string" || typeof raw["cwd"] !== "string" ||
+      typeof raw["createdAt"] !== "number" || !Number.isFinite(raw["createdAt"]) ||
+      typeof raw["approvalPolicy"] !== "string" || typeof raw["socket"] !== "string" ||
+      raw["transport"] !== "unix_socket" || raw["tokenFile"] !== "token" ||
+      typeof raw["sessionDir"] !== "string" || raw["sessionDir"] !== sessionDir ||
+      typeof raw["lifecycleEpoch"] !== "string" || raw["lifecycleEpoch"].length === 0 ||
+      (raw["supervisorPid"] !== undefined &&
+        (typeof raw["supervisorPid"] !== "number" || !Number.isSafeInteger(raw["supervisorPid"]) || raw["supervisorPid"] <= 1)) ||
+      (raw["status"] !== undefined && typeof raw["status"] !== "string") ||
+      (raw["updatedAt"] !== undefined && (typeof raw["updatedAt"] !== "number" || !Number.isFinite(raw["updatedAt"]))) ||
+      (raw["accountId"] !== undefined && typeof raw["accountId"] !== "string") ||
+      (raw["accountName"] !== undefined && typeof raw["accountName"] !== "string")
+    ) return null;
+    return raw as unknown as StructuredSupervisorManifest;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The original Unix launcher wrote schema-1 bootstrap data before transport
+ * and lifecycleEpoch were added. Recover exactly those two values only after
+ * binding the private bootstrap to its own private manifest. This is not a
+ * general old-schema migration: any added field or identity disagreement is
+ * rejected before the child reaches an IPC listener.
+ */
+function recoverLegacyConfig(value: Record<string, unknown>, bootstrapFile: string): RunnerConfig | null {
+  if (process.platform === "win32" || !validConfigShape(value, true)) return null;
+  const sessionDir = value["sessionDir"] as string;
+  const socketPath = value["socketPath"] as string;
+  if (
+    path.dirname(bootstrapFile) !== sessionDir || !privateDirectory(sessionDir) ||
+    value["attachmentRoot"] !== path.join(sessionDir, "attachments") ||
+    (value["socketDir"] !== undefined && path.dirname(socketPath) !== value["socketDir"])
+  ) return null;
+  const manifest = readLegacyManifest(sessionDir);
+  if (!manifest ||
+    manifest.sessionId !== value["sessionId"] || manifest.cwd !== value["cwd"] || manifest.socket !== socketPath ||
+    manifest.agent !== value["agent"] || manifest.title !== value["title"] || manifest.createdAt !== value["createdAt"] ||
+    manifest.approvalPolicy !== (value["approvalPolicy"] ?? "standard") ||
+    manifest.accountId !== value["accountId"] || manifest.accountName !== value["accountName"] ||
+    !isStructuredSupervisorEndpoint(socketPath, "unix_socket")
+  ) return null;
+  return {
+    ...value,
+    transport: "unix_socket",
+    lifecycleEpoch: manifest.lifecycleEpoch,
+  } as unknown as RunnerConfig;
+}
+
 function adapterFor(agent: AgentKind, state?: AdapterResumeState): AgentAdapter {
   switch (agent) {
     case "opencode": return new OpencodeAdapter({ resumeState: state });
@@ -114,23 +231,20 @@ function readConfig(): RunnerConfig {
   // process.  It contains account environment data but is never logged.
   rmSync(file, { force: true });
   const parsed: unknown = JSON.parse(stat);
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid supervisor bootstrap");
-  const v = parsed as Partial<RunnerConfig>;
-  if (
-    v.version !== 1 || typeof v.sessionId !== "string" || typeof v.agent !== "string" ||
-    typeof v.title !== "string" || typeof v.cwd !== "string" || typeof v.createdAt !== "number" ||
-    typeof v.sessionDir !== "string" || typeof v.attachmentRoot !== "string" || typeof v.socketPath !== "string" ||
-    v.transport !== "unix_socket" ||
-    typeof v.lifecycleEpoch !== "string" || v.lifecycleEpoch.length === 0 ||
-    (v.socketDir !== undefined && (typeof v.socketDir !== "string" || path.dirname(v.socketPath) !== v.socketDir)) ||
-    !v.environment || typeof v.environment !== "object" || Array.isArray(v.environment)
-  ) {
-    throw new Error("invalid supervisor bootstrap");
-  }
-  if (v.transport !== transport || !isStructuredSupervisorEndpoint(v.socketPath, v.transport)) {
+  if (!isRecord(parsed)) throw new Error("invalid supervisor bootstrap");
+  const v = parsed;
+  const current = validConfigShape(v, false) &&
+    v["transport"] === "unix_socket" && typeof v["lifecycleEpoch"] === "string" && v["lifecycleEpoch"].length > 0 &&
+    path.dirname(file) === v["sessionDir"] && privateDirectory(v["sessionDir"] as string) &&
+    v["attachmentRoot"] === path.join(v["sessionDir"] as string, "attachments") &&
+    (v["socketDir"] === undefined || path.dirname(v["socketPath"] as string) === v["socketDir"])
+      ? v as unknown as RunnerConfig
+      : recoverLegacyConfig(v, file);
+  if (!current) throw new Error("invalid supervisor bootstrap");
+  if (current.transport !== transport || !isStructuredSupervisorEndpoint(current.socketPath, current.transport)) {
     throw new Error("supervisor bootstrap endpoint is incompatible with this platform");
   }
-  return v as RunnerConfig;
+  return current;
 }
 
 function manifestPath(config: RunnerConfig): string {

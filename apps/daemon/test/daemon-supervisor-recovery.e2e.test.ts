@@ -281,6 +281,16 @@ function daemonCli(): string {
   return path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "dist", "cli.js");
 }
 
+function daemonRunner(): string {
+  return path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "dist", "structured-supervisor-runner.js");
+}
+
+function runtimeSnapshots(): string[] {
+  const runtimeRoot = path.join(path.dirname(path.dirname(daemonRunner())), ".prospero-runtime");
+  if (!existsSync(runtimeRoot)) return [];
+  return readdirSync(runtimeRoot).filter((entry) => entry.startsWith("structured-supervisor-"));
+}
+
 async function startDaemon(home: string, port: number, fakeBin: string): Promise<DaemonProcess> {
   let stdout = "";
   let stderr = "";
@@ -534,6 +544,57 @@ afterEach(async () => {
 });
 
 describe.sequential("daemon supervisor SIGTERM/SIGKILL full-process recovery", () => {
+  it.skipIf(process.platform === "win32")("launches a new owner from the daemon-start runtime snapshot after dist is overwritten", async () => {
+    const home = path.join(temp("prospero-snapshot-home-"), ".prospero");
+    const repo = temp("prospero-snapshot-repo-");
+    const fakeBin = temp("prospero-snapshot-bin-");
+    installFakeCodex(fakeBin);
+    const git = spawn("git", ["init", "--quiet", repo], { stdio: "ignore" });
+    await waitForExit(git, "snapshot temporary git init");
+    if (git.exitCode !== 0) throw new Error("snapshot temporary git init failed");
+
+    const before = new Set(runtimeSnapshots());
+    const daemon = await startDaemon(home, await freePort(), fakeBin);
+    const createdSnapshots = runtimeSnapshots().filter((entry) => !before.has(entry));
+    expect(createdSnapshots).toHaveLength(1);
+    const snapshotRunner = path.join(
+      path.dirname(path.dirname(daemonRunner())),
+      ".prospero-runtime",
+      createdSnapshots[0]!,
+      "dist",
+      "structured-supervisor-runner.js",
+    );
+    expect(readFileSync(snapshotRunner, "utf8")).toContain("runStructuredSupervisor");
+
+    const runner = daemonRunner();
+    const original = readFileSync(runner, "utf8");
+    try {
+      // The daemon has already started. A direct dist launch would now exit
+      // immediately; the only successful route is its frozen snapshot.
+      writeFileSync(runner, "throw new Error('mutable dist runner must not be used');\n");
+      const created = await controlJson<{ id: string }>(home, daemon.port, "/_prospero/control/session/create", {
+        agent: "codex",
+        kind: "structured",
+        cwd: repo,
+        cols: 80,
+        rows: 24,
+      });
+      const owned = manifest(home, created.id);
+      expect(processAlive(owned.supervisorPid)).toBe(true);
+      supervisorGroups.add(owned.supervisorPid!);
+      const killed = await control(home, daemon.port, "POST", `/_prospero/control/session/${encodeURIComponent(created.id)}/kill`, {});
+      expect(killed.status).toBe(204);
+      await eventually(
+        () => !processAlive(owned.supervisorPid) && !processGroupAlive(owned.supervisorPid),
+        "snapshot-owned runner exit",
+      );
+      supervisorGroups.delete(owned.supervisorPid!);
+    } finally {
+      writeFileSync(runner, original);
+      await stopDaemon(daemon, "SIGTERM");
+    }
+  });
+
   it.skipIf(process.platform === "win32")("SIGTERM preserves the long turn, ordered replay, pending interactions, and dispatch", async () => {
     await exerciseSignalRecovery("SIGTERM");
   });

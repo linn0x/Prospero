@@ -283,6 +283,8 @@ export interface SessionManagerOptions {
   supervisor?: boolean | undefined;
   /** Test seam for the detached launcher; production uses the real launcher. */
   supervisorLauncher?: ((input: LaunchStructuredSupervisorInput) => Promise<RemoteStructuredSession>) | undefined;
+  /** Immutable daemon-start executable for newly launched structured owners. */
+  supervisorRunnerPath?: string | undefined;
   /** Detached PTY owners; production daemon opts in, direct unit tests do not. */
   ptySupervisor?: boolean | undefined;
   /** Test seam for detached PTY host launch. */
@@ -311,6 +313,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   private readonly ptySupervisorRoot: string | null;
   private readonly useStructuredSupervisor: boolean;
   private readonly supervisorLauncher: (input: LaunchStructuredSupervisorInput) => Promise<RemoteStructuredSession>;
+  private readonly supervisorRunnerPath: string | undefined;
   private readonly usePtySupervisor: boolean;
   private readonly ptySupervisorLauncher: (input: LaunchPtySupervisorInput) => Promise<RemotePtySession>;
   private persistTimer: NodeJS.Timeout | null = null;
@@ -330,6 +333,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     this.sessionEnv = opts.sessionEnv ?? (() => ({}));
     this.accountResolver = opts.accountResolver;
     this.supervisorLauncher = opts.supervisorLauncher ?? launchStructuredSupervisor;
+    this.supervisorRunnerPath = opts.supervisorRunnerPath;
     this.ptySupervisorLauncher = opts.ptySupervisorLauncher ?? launchPtySupervisor;
     // An injected adapter is the test seam. It cannot safely cross a process
     // boundary, so retain the long-standing in-process behavior there. The
@@ -729,6 +733,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
           ...(account?.codexAppServerArgs ? { codexAppServerArgs: account.codexAppServerArgs } : {}),
           ...(account ? { accountId: account.id, accountName: account.name } : {}),
           ...(hasInitialAdapterState ? { initialAdapterState } : {}),
+          ...(this.supervisorRunnerPath ? { runnerPath: this.supervisorRunnerPath } : {}),
         });
         this.wireStructuredSession(session);
         this.structuredSessions.set(id, session);

@@ -698,11 +698,14 @@ export interface LaunchStructuredSupervisorInput {
   accountId?: string;
   accountName?: string;
   initialAdapterState?: AdapterResumeState;
+  /** Immutable daemon-start runner image for this detached owner. */
+  runnerPath?: string;
   /** Test seam for a bounded startup failure; production uses eight seconds. */
   startupTimeoutMs?: number;
 }
 
-function runnerPath(): string {
+/** Resolve the runner adjacent to the currently executing daemon build. */
+export function resolveStructuredSupervisorRunnerPath(): string {
   const here = path.dirname(fileURLToPath(import.meta.url));
   const sameDir = path.join(here, "structured-supervisor-runner.js");
   if (existsSync(sameDir)) return sameDir;
@@ -1004,7 +1007,7 @@ export async function launchStructuredSupervisor(input: LaunchStructuredSupervis
       ...(input.accountId ? { accountId: input.accountId } : {}), ...(input.accountName ? { accountName: input.accountName } : {}),
       ...(input.initialAdapterState ? { initialAdapterState: input.initialAdapterState } : {}),
     });
-    const child = spawn(process.execPath, [runnerPath()], {
+    const child = spawn(process.execPath, [input.runnerPath ?? resolveStructuredSupervisorRunnerPath()], {
       detached: true, stdio: "ignore", cwd: sessionDir,
       // Do not inherit the daemon environment: account credentials travel only
       // in the 0600 bootstrap file and never through argv or daemon logs.

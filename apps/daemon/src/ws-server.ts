@@ -57,6 +57,7 @@ import {
 import { RelayHostClient } from "./relay-host-client.js";
 import { Notifier, type NotifyConfig } from "./notify.js";
 import { SessionError, SessionManager } from "./session-manager.js";
+import { createStructuredSupervisorRuntimeSnapshot } from "./structured-supervisor-runtime.js";
 import { StatusFile } from "./status-file.js";
 import {
   ControlSocketError,
@@ -235,13 +236,21 @@ export async function createDaemonServer(
   // package bin 指向同一文件。每个 agent 的 PATH 都优先找到它。
   const cliBinDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "bin");
   const accounts = new AgentAccountManager(opts.home);
+  const structuredSupervisorEnabled = opts.structuredSupervisor ?? process.env["VITEST"] !== "true";
+  // Freeze the executable boundary before any session launcher is created.
+  // Falling back to mutable dist after a snapshot error would recreate the
+  // exact build-version split this boundary prevents, so fail closed instead.
+  const structuredRuntime = structuredSupervisorEnabled && process.platform !== "win32"
+    ? createStructuredSupervisorRuntimeSnapshot()
+    : undefined;
   const manager = new SessionManager({
     home: opts.home,
     // Direct SessionManager users (notably unit tests) remain in-process by
     // default. The production daemon is the opt-in authority; Vitest's own
     // servers intentionally exercise the legacy path unless a test asks for
     // an isolated supervisor explicitly.
-    supervisor: opts.structuredSupervisor ?? process.env["VITEST"] !== "true",
+    supervisor: structuredSupervisorEnabled,
+    ...(structuredRuntime ? { supervisorRunnerPath: structuredRuntime.runnerPath } : {}),
     ptySupervisor: opts.ptySupervisor ?? process.env["VITEST"] !== "true",
     ...(opts.useTmux ? { tmux: { home: opts.home } } : {}),
     sessionEnv: (sessionId) => ({
