@@ -367,12 +367,15 @@ function packageRootFor(entry: string): string {
 
 /** Workspace links are accepted only after their real target stays in here. */
 function trustedPackageRoot(sourceRoot: string): string {
-  let directory = sourceRoot;
+  let directory = realpathSync(sourceRoot);
   let nearestPackage: string | undefined;
   // A published package can depend on siblings hoisted beneath its enclosing
-  // node_modules. Remember the outermost one, rather than accidentally
-  // trusting an arbitrary package.json farther up a user's filesystem.
-  let installedRoot: string | undefined;
+  // node_modules. The trust boundary is that *physical node_modules*, not
+  // its parent install prefix: a globally installed package must never make
+  // arbitrary files below (for example) /usr/local/lib trusted runtime code.
+  // Walking to the outermost node_modules also covers pnpm's physical nested
+  // layout when a sibling was hoisted to the outer dependency tree.
+  let installedNodeModules: string | undefined;
   while (true) {
     const manifest = path.join(directory, "package.json");
     try {
@@ -382,9 +385,15 @@ function trustedPackageRoot(sourceRoot: string): string {
       }
       nearestPackage ??= realpathSync(directory);
     } catch { /* continue to the next ancestor */ }
-    if (path.basename(directory) === "node_modules") installedRoot = path.dirname(directory);
+    if (path.basename(directory) === "node_modules") {
+      const metadata = lstatSync(directory);
+      if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+        throw new Error("structured supervisor runtime installation root is unsafe");
+      }
+      installedNodeModules = realpathSync(directory);
+    }
     const parent = path.dirname(directory);
-    if (parent === directory) return realpathSync(installedRoot ?? nearestPackage ?? sourceRoot);
+    if (parent === directory) return installedNodeModules ?? nearestPackage ?? directory;
     directory = parent;
   }
 }
@@ -606,6 +615,76 @@ function matchesSnapshotRecord(value: unknown, expected: SnapshotRecord): boolea
   });
 }
 
+/**
+ * A content digest proves the expected bytes, but cannot prove absence.  Keep
+ * the snapshot an exact mirror of its record so a private, injected file (or
+ * directory, link, type, or mode change) never becomes executable baggage
+ * that a later process silently trusts.
+ */
+function hasExactSnapshotInventory(directory: string, image: RuntimeImage): boolean {
+  const expectedFiles = new Map<string, 0o600 | 0o700>(
+    image.files.map((file) => [file.target, file.mode]),
+  );
+  expectedFiles.set("snapshot.json", 0o600);
+  const expectedDirectories = new Set<string>([""]);
+  for (const file of expectedFiles.keys()) {
+    let parent = path.posix.dirname(file);
+    while (parent !== ".") {
+      expectedDirectories.add(parent);
+      parent = path.posix.dirname(parent);
+    }
+  }
+  const seenFiles = new Set<string>();
+  const seenDirectories = new Set<string>();
+
+  const walk = (relative: string): boolean => {
+    const current = relative
+      ? path.join(directory, ...relative.split("/"))
+      : directory;
+    let metadata;
+    try {
+      metadata = lstatSync(current);
+    } catch {
+      return false;
+    }
+    if (!metadata.isDirectory() || metadata.isSymbolicLink() || (metadata.mode & 0o777) !== 0o700) return false;
+    seenDirectories.add(relative);
+
+    let entries;
+    try {
+      entries = readdirSync(current, { withFileTypes: true });
+    } catch {
+      return false;
+    }
+    for (const entry of entries) {
+      const child = relative ? `${relative}/${entry.name}` : entry.name;
+      const childPath = path.join(current, entry.name);
+      let childMetadata;
+      try {
+        childMetadata = lstatSync(childPath);
+      } catch {
+        return false;
+      }
+      if (expectedDirectories.has(child)) {
+        if (!childMetadata.isDirectory() || childMetadata.isSymbolicLink()) return false;
+        if (!walk(child)) return false;
+        continue;
+      }
+      const expectedMode = expectedFiles.get(child);
+      if (
+        expectedMode === undefined || !childMetadata.isFile() || childMetadata.isSymbolicLink() ||
+        (childMetadata.mode & 0o777) !== expectedMode
+      ) return false;
+      seenFiles.add(child);
+    }
+    return true;
+  };
+
+  return walk("") &&
+    seenFiles.size === expectedFiles.size && [...expectedFiles.keys()].every((file) => seenFiles.has(file)) &&
+    seenDirectories.size === expectedDirectories.size && [...expectedDirectories].every((child) => seenDirectories.has(child));
+}
+
 function validExistingSnapshot(
   directory: string,
   digest: string,
@@ -618,6 +697,7 @@ function validExistingSnapshot(
   try {
     const expected = expectedSnapshotRecord(contentDigest, image);
     if (!matchesSnapshotRecord(JSON.parse(readFileSync(recordFile, "utf8")), expected)) return false;
+    if (!hasExactSnapshotInventory(directory, image)) return false;
     return imageDigest(contentDigest, expected) === digest && digestFiles(image.files, directory) === contentDigest;
   } catch {
     return false;
