@@ -395,10 +395,12 @@ extern "C" prospero_status prospero_conpty_spawn(
   startup_info.lpAttributeList = attribute_list;
   PROCESS_INFORMATION process = {};
   // This is deliberately not the detached-host flag set. HPCON supplies the
-  // terminal, the Job owns the process tree, and no Ctrl-event process group
-  // is used. CREATE_NEW_PROCESS_GROUP would additionally disable Ctrl+C in
-  // the child; DETACHED_PROCESS would sever the very console ConPTY provides.
+  // terminal and the Job owns the process tree. Preserve the established
+  // process-group/Ctrl-C isolation semantics: the standard-handle fix above
+  // is independent of CREATE_NEW_PROCESS_GROUP. DETACHED_PROCESS, however,
+  // would sever the very console ConPTY provides.
   const DWORD creation_flags = CREATE_UNICODE_ENVIRONMENT |
+      CREATE_NEW_PROCESS_GROUP |
       CREATE_SUSPENDED |
       EXTENDED_STARTUPINFO_PRESENT;
   const BOOL created = CreateProcessW(options->executable_path,
