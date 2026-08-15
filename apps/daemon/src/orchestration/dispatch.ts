@@ -100,6 +100,12 @@ export class DispatchService {
   private readonly worktreeAssets: WorktreeAssetService;
   /** Session 尚未创建完成时也必须占住已登记 worktree，避免并发请求双写。 */
   private readonly startingWorktreeAssetIds = new Set<string>();
+  /**
+   * stop 必须先等真实 session 终止，才能把未显式交付的派发落为 abandoned。
+   * 在这段 await 期间，启动路径收到 PTY 的终态事件也不能抢先把它记成普通启动
+   * 失败；同一 dispatch 的并发 stop 还应共享同一次 kill。
+   */
+  private readonly stoppingDispatches = new Map<string, Promise<StopWorkerResult>>();
 
   constructor(
     private readonly store: OrchestrationStore,
@@ -118,8 +124,26 @@ export class DispatchService {
     if (!active) {
       throw new DispatchError(`任务 ${taskId} 没有运行中的 worker`, "worker_not_active");
     }
-    await this.sessions.kill(active.sessionId);
+    const alreadyStopping = this.stoppingDispatches.get(active.id);
+    if (alreadyStopping) return alreadyStopping;
 
+    const stopping = this.stopActiveWorker(active, taskId, reason);
+    this.stoppingDispatches.set(active.id, stopping);
+    try {
+      return await stopping;
+    } finally {
+      if (this.stoppingDispatches.get(active.id) === stopping) {
+        this.stoppingDispatches.delete(active.id);
+      }
+    }
+  }
+
+  private async stopActiveWorker(
+    active: Dispatch,
+    taskId: string,
+    reason: string,
+  ): Promise<StopWorkerResult> {
+    await this.sessions.kill(active.sessionId);
     let currentDispatch = this.store.getDispatch(active.id);
     let currentTask = this.store.getTask(taskId);
     if (currentDispatch.state === "starting" || currentDispatch.state === "running") {
@@ -137,6 +161,9 @@ export class DispatchService {
       currentDispatch.id,
       "worker 已停止；工作树默认保留，需显式检查或清理",
     );
+    // worker.start 可能仍在 readiness/prompt await 中；停止结果必须先成为恢复后
+    // 的事实，才能让它返回这个终态而不是旧 create() 快照或重新标记 running。
+    this.store.persistNow();
     return { task: currentTask, dispatch: currentDispatch };
   }
 
@@ -241,6 +268,26 @@ export class DispatchService {
           }
         : null,
     });
+    const refreshedSession = (fallback: SessionInfo, currentDispatch: Dispatch): SessionInfo => {
+      // create() 的结果只是创建瞬间的快照。PTY readiness 和 prompt 写入之间可能
+      // 已把 SessionManager 的状态推进到 running；控制 API 的成功响应必须读同一
+      // sid 的当前事实，而不是把这个旧 starting 带回调用方。
+      try {
+        const current = this.sessions.infoOf(fallback.id);
+        // 显式 task.done/fail 已同步落盘后，kill 的后台收尾可能仍留下一个旧的
+        // live facade。交付终态比那份过渡中的内存状态更权威。
+        if (isSettledDispatch(currentDispatch)) return { ...current, status: "done" };
+        return current;
+      } catch {
+        // PTY kill 会从 SessionManager 删除会话。若 Dispatch 已落定，不能回传
+        // create() 时的 starting/idle 误导调用方；其余错误保留唯一可用的快照。
+        return isSettledDispatch(currentDispatch)
+          ? { ...fallback, status: "done" }
+          : fallback;
+      }
+    };
+    const currentResult = (fallback: SessionInfo, currentDispatch: Dispatch): StartWorkerResult =>
+      result(refreshedSession(fallback, currentDispatch), currentDispatch);
     try {
       let workerCwd = input.cwd;
       if (input.worktree === "new") {
@@ -347,7 +394,7 @@ export class DispatchService {
           // 等待期间 worker 可能已显式 task.done/fail；绝不能再把前导词写入
           // 已关闭的 PTY，也不能用后续 running 覆盖那个真实交付。
           this.store.persistNow();
-          return result(session, beforePrompt);
+          return currentResult(session, beforePrompt);
         }
         // 用一段单行提示直接送进已经稳定的 agent 终端输入。
         await this.sessions.requirePty(session.id).writeInput(`${prompt.replace(/\n/g, " ")}\r`);
@@ -359,19 +406,27 @@ export class DispatchService {
         ? this.store.setDispatchState(dispatch.id, "running")
         : currentDispatch;
       this.store.persistNow();
-      return result(session, running);
+      // structured 路径没有 readiness timer；这里仅做一次同步 infoOf 刷新，不会
+      // 给 chat worker 增加人为延迟。
+      return currentResult(session, running);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (dispatch) {
+        const stopping = this.stoppingDispatches.get(dispatch.id);
+        if (stopping && session) {
+          // stop 已先占有这个 dispatch。等待它把 abandoned/显式交付结果持久化，
+          // 不能把 readiness 的“会话已结束”当作另一条启动失败路径。
+          const stopped = await stopping;
+          return currentResult(session, stopped.dispatch);
+        }
         const currentDispatch = this.store.getDispatch(dispatch.id);
         const currentTask = this.store.getTask(task.id);
-        const explicitlyDelivered =
-          (currentDispatch.state === "succeeded" && currentTask.status === "done") ||
-          (currentDispatch.state === "failed" && currentTask.status === "failed");
+        const settled = isSettledDispatch(currentDispatch) && isSettledTask(currentTask);
         // task.done/fail 会先同步写盘再终止 supervisor；终止动作可能让仍在等待的
-        // chatSend 以“连接关闭”拒绝。此时交付事实优先，worker.start 应返回该终态，
-        // 不能把成功交付伪装成启动失败，更不能回滚 Task/Dispatch。
-        if (explicitlyDelivered && session) return result(session, currentDispatch);
+        // chatSend 以“连接关闭”拒绝。任何已持久的终态（包括并发 stop）优先，
+        // worker.start 应返回该事实，不能把成功交付伪装成启动失败，更不能回滚
+        // Task/Dispatch。
+        if (settled && session) return currentResult(session, currentDispatch);
         if (currentDispatch.state === "starting" || currentDispatch.state === "running") {
           this.store.setDispatchState(dispatch.id, "failed", message);
           if (currentTask.status === "dispatched") {
@@ -498,6 +553,14 @@ export class DispatchService {
       throw new DispatchError(`任务 ${taskId} 属于另一个 worker，不能由当前会话交付`, "wrong_worker");
     }
   }
+}
+
+function isSettledDispatch(dispatch: Dispatch): boolean {
+  return dispatch.state === "succeeded" || dispatch.state === "failed" || dispatch.state === "abandoned";
+}
+
+function isSettledTask(task: Task): boolean {
+  return task.status === "done" || task.status === "failed" || task.status === "cancelled";
 }
 
 function workerPrompt(

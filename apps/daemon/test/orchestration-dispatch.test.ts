@@ -28,6 +28,7 @@ class FakeSessions implements WorkerSessionManager {
   killNever = false;
   createBarrier: Promise<void> | null = null;
   chatHook: ((sid: string, text: string) => Promise<void>) | null = null;
+  ptyReadinessCalls = 0;
 
   async create(input: CreateSessionInput): Promise<SessionInfo> {
     this.creates.push(input);
@@ -54,6 +55,11 @@ class FakeSessions implements WorkerSessionManager {
 
   requirePty(): { writeInput(text: string): void } {
     return { writeInput: () => {} };
+  }
+
+  async waitForPtyReady(): Promise<void> {
+    this.ptyReadinessCalls += 1;
+    throw new Error("structured worker 不应等待 PTY readiness");
   }
 
   async kill(sid: string, options?: { preserveHistory?: boolean }): Promise<void> {
@@ -147,6 +153,10 @@ class InitializingTuiSessions extends EventEmitter implements WorkerSessionManag
     this.emit("output", session.id, "cmVhZHk=", 1);
   }
 
+  emitStartupOutput(): void {
+    this.emit("output", "pty-worker-session", "YW5pbWF0aW9u", 2);
+  }
+
   exitDuringStartup(): void {
     const session = this.infoOf("pty-worker-session");
     this.publish({ ...session, status: "died" });
@@ -192,11 +202,74 @@ describe("DispatchService", () => {
       const started = await starting;
 
       expect(started.dispatch.state).toBe("running");
+      expect(started.session.status).toBe("running");
       expect(sessions.discardedPrompts).toEqual([]);
       expect(sessions.acceptedPrompts).toHaveLength(1);
       expect(sessions.acceptedPrompts[0]).toContain(`任务 ID: ${task.id}`);
       expect(sessions.acceptedPrompts[0]).toContain(`--session ${started.session.id} task done --id ${task.id}`);
       expect(sessions.acceptedPrompts[0]).toMatch(/\r$/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("PTY 每帧启动输出都会重置 quiet window，直到短暂无输出才写 prompt", async () => {
+    vi.useFakeTimers();
+    try {
+      const store = new OrchestrationStore();
+      const run = store.createRun({ objective: "PTY quiet window" });
+      const task = store.createTask({ runId: run.id, title: "等待最后一帧", spec: "不能过早输入" });
+      const sessions = new InitializingTuiSessions();
+      const service = new DispatchService(store, sessions);
+
+      const starting = service.startWorker({
+        taskId: task.id, agent: "codex", kind: "pty", worktree: "none", cwd: "/tmp/pty-quiet-window",
+      });
+      await waitForReadinessListener(sessions);
+      sessions.emitReadyOutput();
+      await vi.advanceTimersByTimeAsync(PTY_STARTUP_STABILITY_WINDOW_MS - 1);
+      sessions.emitStartupOutput();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(sessions.attemptedPrompts).toEqual([]);
+
+      await vi.advanceTimersByTimeAsync(PTY_STARTUP_STABILITY_WINDOW_MS - 2);
+      expect(sessions.attemptedPrompts).toEqual([]);
+      await vi.advanceTimersByTimeAsync(2);
+      const started = await starting;
+
+      expect(started.session.status).toBe("running");
+      expect(sessions.acceptedPrompts).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("PTY 连续动画输出不会越过有界总启动 timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const store = new OrchestrationStore();
+      const run = store.createRun({ objective: "PTY bounded animation" });
+      const task = store.createTask({ runId: run.id, title: "动画不无限等待", spec: "总 timeout 仍要派发" });
+      const sessions = new InitializingTuiSessions();
+      const service = new DispatchService(store, sessions);
+
+      const starting = service.startWorker({
+        taskId: task.id, agent: "codex", kind: "pty", worktree: "none", cwd: "/tmp/pty-bounded-animation",
+      });
+      await waitForReadinessListener(sessions);
+      sessions.emitReadyOutput();
+      for (let elapsed = 100; elapsed < PTY_STARTUP_READY_TIMEOUT_MS; elapsed += 100) {
+        await vi.advanceTimersByTimeAsync(100);
+        sessions.emitStartupOutput();
+      }
+      expect(sessions.attemptedPrompts).toEqual([]);
+
+      await vi.advanceTimersByTimeAsync(100);
+      const started = await starting;
+
+      expect(started.session.status).toBe("running");
+      expect(sessions.acceptedPrompts).toHaveLength(1);
+      expect(store.listDispatches().filter((dispatch) => dispatch.taskId === task.id)).toHaveLength(1);
     } finally {
       vi.useRealTimers();
     }
@@ -278,11 +351,39 @@ describe("DispatchService", () => {
       const started = await starting;
 
       expect(started.dispatch.state).toBe(terminal === "done" ? "succeeded" : "failed");
+      expect(started.session.status).toBe("done");
       expect(store.getTask(task.id)).toMatchObject({ status: terminal });
       expect(sessions.attemptedPrompts).toEqual([]);
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("并发 stop 在 readiness 终态事件之前占有 dispatch，启动不重写或重复派发", async () => {
+    const store = new OrchestrationStore();
+    const run = store.createRun({ objective: "PTY 并发停止" });
+    const task = store.createTask({ runId: run.id, title: "停止优先", spec: "停止时不得重新派发" });
+    const sessions = new InitializingTuiSessions();
+    const service = new DispatchService(store, sessions);
+
+    const starting = service.startWorker({
+      taskId: task.id, agent: "codex", kind: "pty", worktree: "none", cwd: "/tmp/pty-stop-race",
+    });
+    await waitForReadinessListener(sessions);
+    const stopping = service.stopWorker(task.id, "用户在启动中停止");
+    const [started, stopped] = await Promise.all([starting, stopping]);
+
+    expect(stopped.dispatch).toMatchObject({ state: "abandoned", outcome: "用户在启动中停止" });
+    expect(stopped.task).toMatchObject({ status: "failed", result: "用户在启动中停止" });
+    expect(started.dispatch).toEqual(stopped.dispatch);
+    expect(started.task).toEqual(stopped.task);
+    expect(started.session.status).toBe("done");
+    expect(sessions.attemptedPrompts).toEqual([]);
+    expect(sessions.creates).toHaveLength(1);
+    await expect(service.startWorker({
+      taskId: task.id, agent: "codex", kind: "pty", worktree: "none", cwd: "/tmp/pty-stop-race",
+    })).rejects.toMatchObject({ code: "task_not_ready" } satisfies Partial<DispatchError>);
+    expect(sessions.creates).toHaveLength(1);
   });
 
   it("只派发 ready task，并在发送前导词前先建立可交付的 dispatch", async () => {
@@ -308,6 +409,26 @@ describe("DispatchService", () => {
     expect(store.getTask(task.id)).toMatchObject({ status: "done", result: "已完成并验过" });
     expect(store.getDispatch(started.dispatch.id)).toMatchObject({ state: "succeeded", outcome: "已完成并验过" });
     expect(sessions.killed).toEqual(["worker-session"]);
+  });
+
+  it("structured worker 在 prompt 后同步刷新实时状态，不等待 PTY readiness", async () => {
+    const store = new OrchestrationStore();
+    const run = store.createRun({ objective: "structured 无延迟" });
+    const task = store.createTask({ runId: run.id, title: "立即投递", spec: "prompt 后刷新状态" });
+    const sessions = new FakeSessions();
+    sessions.chatHook = async (sid) => {
+      const current = sessions.infoOf(sid);
+      sessions.live.set(sid, { ...current, status: "running" });
+    };
+    const service = new DispatchService(store, sessions);
+
+    const started = await service.startWorker({
+      taskId: task.id, agent: "codex", kind: "structured", worktree: "none", cwd: "/tmp/structured-refresh",
+    });
+
+    expect(started.session.status).toBe("running");
+    expect(sessions.ptyReadinessCalls).toBe(0);
+    expect(sessions.messages).toHaveLength(1);
   });
 
   it("在发送前导词前持久化 starting，并在返回 worker.start 前持久化 running", async () => {

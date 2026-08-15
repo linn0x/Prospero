@@ -77,8 +77,15 @@ export function waitForPtyStartupReadiness(
       if (error) reject(error);
       else resolve();
     };
-    const readyAfterStableWindow = () => {
-      if (settled || stability) return;
+    const readyAfterQuietWindow = () => {
+      if (settled) return;
+      // “stability” 的含义是随后一小段时间没有新的终端输出，而不是观察到
+      // 第一帧后盲等一次。TUI 的 banner / 动画可拆成多个 output frame；每帧
+      // 都应把 quiet timer 往后推，但绝不能影响已经独立启动的总 timeout。
+      if (stability) {
+        clearTimeout(stability);
+        stability = null;
+      }
       if (stabilityWindowMs === 0) {
         finish();
         return;
@@ -96,10 +103,10 @@ export function waitForPtyStartupReadiness(
         finish(new PtyStartupReadinessError(`PTY worker ${sid} 在启动完成前已${info.status === "died" ? "退出" : "结束"}`));
         return;
       }
-      if (info.status !== "starting") readyAfterStableWindow();
+      if (info.status !== "starting") readyAfterQuietWindow();
     };
     const onOutput = (outputSid: string) => {
-      if (outputSid === sid) readyAfterStableWindow();
+      if (outputSid === sid) readyAfterQuietWindow();
     };
     const onState = (info: SessionInfo) => observe(info);
     const onAbort = () => finish(new PtyStartupReadinessError(`PTY worker ${sid} 的启动等待已取消`));

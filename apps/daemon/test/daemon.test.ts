@@ -299,6 +299,35 @@ describe("daemon 全链路", () => {
       expect.objectContaining({ title: "Mac 创建任务", status: "pending" }),
     );
 
+    // PTY worker.create 最初返回的是 starting；worker.start 会等待首帧/quiet
+    // window 后再写 prompt，HTTP 响应必须重新读取同一 sid 的实时状态，不能把
+    // create() 的陈旧快照带回 macOS GUI（这在 Ubuntu/Windows CI 都出现过）。
+    const startedWorkerResponse = await fetch(actionUrl, {
+      method: "POST",
+      headers: { authorization: `Bearer ${status.controlToken}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        method: "worker.start",
+        params: {
+          taskId: server.orchestration.store.listTasks(createdRun.id).find(
+            (candidate) => candidate.title === "Mac 创建任务",
+          )!.id,
+          agent: "shell",
+          kind: "pty",
+          worktree: "none",
+          cwd: workspaceRoot,
+          approvalPolicy: "standard",
+        },
+      }),
+    });
+    expect(startedWorkerResponse.status).toBe(200);
+    const startedWorker = await startedWorkerResponse.json() as {
+      dispatch: { state: string };
+      session: { id: string; kind: string; status: string };
+    };
+    expect(startedWorker.dispatch.state).toBe("running");
+    expect(startedWorker.session).toMatchObject({ kind: "pty", status: "running" });
+    await server.manager.kill(startedWorker.session.id);
+
     const graphRequest = {
       method: "graph.create",
       params: {
@@ -513,7 +542,9 @@ describe("daemon 全链路", () => {
     });
     const dispatched = (await c.waitFor(
       (m) => m.type === "orchestration.snapshot" &&
-        m.snapshot.dispatches.some((candidate) => candidate.taskId === task.id),
+        m.snapshot.dispatches.some(
+          (candidate) => candidate.taskId === task.id && candidate.state === "running",
+        ),
       "manual worker snapshot",
     )) as Extract<S2CMessage, { type: "orchestration.snapshot" }>;
     const dispatch = dispatched.snapshot.dispatches.find((candidate) => candidate.taskId === task.id)!;
