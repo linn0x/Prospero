@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -138,10 +139,11 @@ function defaultAuthenticodeCheck(binaryPath: string): AuthenticodeResult {
     "$thumbprint = if ($null -eq $signature.SignerCertificate) { '' } else { $signature.SignerCertificate.Thumbprint }",
     "[Console]::Out.Write($signature.Status.ToString() + '|' + $thumbprint)",
   ].join("; ");
+  const encodedCommand = Buffer.from(command, "utf16le").toString("base64");
   try {
     const result = spawnSync(
       powershellPath,
-      ["-NoProfile", "-NonInteractive", "-Command", command],
+      ["-NoProfile", "-NonInteractive", "-EncodedCommand", encodedCommand],
       {
         encoding: "utf8",
         windowsHide: true,
