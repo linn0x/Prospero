@@ -83,6 +83,12 @@ struct ProsperoShellApp: App {
     .defaultSize(width: 1320, height: 760)
     .windowStyle(.titleBar)
 
+    Window("Code Agent 账号", id: "agent-accounts") {
+      AgentAccountsDashboard(daemon: daemon)
+    }
+    .defaultSize(width: 920, height: 720)
+    .windowStyle(.titleBar)
+
     Window("配对新设备", id: "pairing") {
       PairingView(pairing: pairing)
     }

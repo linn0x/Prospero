@@ -138,6 +138,30 @@ interface Conn {
   alive: boolean;
 }
 
+/** The local control plane accepts exactly the account messages the paired clients use. */
+type AgentAccountControlMessage = Extract<C2SMessage, {
+  type:
+    | "agent.accounts.list"
+    | "agent.account.create"
+    | "agent.account.api.create"
+    | "agent.account.api.configure"
+    | "agent.account.rename"
+    | "agent.account.default"
+    | "agent.account.login"
+    | "agent.account.credential.set"
+    | "agent.account.logout"
+    | "agent.account.delete";
+}>;
+
+type AgentAccountControlResult = Extract<S2CMessage, { type: "agent.accounts.result" }>;
+
+class ControlRequestError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ControlRequestError";
+  }
+}
+
 export interface DaemonServerOptions {
   home: string;
   port: number;
@@ -340,6 +364,139 @@ export async function createDaemonServer(
         ? { ...msg, session: { ...msg.session, status: "idle" as const } }
         : msg;
     conn.ws.send(conn.channel ? conn.channel.seal(compatible) : JSON.stringify(compatible));
+  }
+
+  function isAgentAccountControlMessage(message: C2SMessage): message is AgentAccountControlMessage {
+    switch (message.type) {
+      case "agent.accounts.list":
+      case "agent.account.create":
+      case "agent.account.api.create":
+      case "agent.account.api.configure":
+      case "agent.account.rename":
+      case "agent.account.default":
+      case "agent.account.login":
+      case "agent.account.credential.set":
+      case "agent.account.logout":
+      case "agent.account.delete":
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  function accountAction(message: AgentAccountControlMessage): AgentAccountControlResult["action"] {
+    switch (message.type) {
+      case "agent.accounts.list": return "list";
+      case "agent.account.create": return "create";
+      case "agent.account.api.create": return "api_create";
+      case "agent.account.api.configure": return "api_configure";
+      case "agent.account.rename": return "rename";
+      case "agent.account.default": return "default";
+      case "agent.account.login": return "login";
+      case "agent.account.credential.set": return "credential";
+      case "agent.account.logout": return "logout";
+      case "agent.account.delete": return "delete";
+    }
+  }
+
+  function accountFailureStatus(error: unknown): number {
+    if (!(error instanceof AgentAccountError)) return 500;
+    switch (error.code) {
+      case "account_not_found": return 404;
+      case "account_in_use": return 409;
+      case "account_not_managed": return 403;
+      case "account_invalid": return 422;
+      case "agent_unavailable": return 503;
+    }
+  }
+
+  /**
+   * The WebSocket and local HTTP surfaces deliberately share this dispatcher.
+   * In particular, credentials only cross the request boundary into
+   * AgentAccountManager; this function returns its public snapshot, never input.
+   */
+  async function performAccountControl(
+    message: AgentAccountControlMessage,
+  ): Promise<{ status: number; result: AgentAccountControlResult }> {
+    const action = accountAction(message);
+    try {
+      let sessionId: string | undefined;
+      switch (message.type) {
+        case "agent.accounts.list":
+          break;
+        case "agent.account.create":
+          accounts.create(message.agent, message.name);
+          break;
+        case "agent.account.api.create":
+          await accounts.createApi(message.agent, message.name, {
+            baseUrl: message.baseUrl,
+            model: message.model,
+            apiKey: message.apiKey,
+          });
+          break;
+        case "agent.account.api.configure":
+          await accounts.configureApi(message.accountId, {
+            baseUrl: message.baseUrl,
+            model: message.model,
+            apiKey: message.apiKey,
+          });
+          break;
+        case "agent.account.rename":
+          accounts.rename(message.accountId, message.name);
+          break;
+        case "agent.account.default":
+          accounts.setDefault(message.accountId);
+          break;
+        case "agent.account.login": {
+          const info = await manager.createAccountLogin(
+            accounts.loginSpec(message.accountId),
+            message.cols,
+            message.rows,
+          );
+          sessionId = info.id;
+          break;
+        }
+        case "agent.account.credential.set":
+          await accounts.setCredential(
+            message.accountId,
+            message.credentialKind,
+            message.credential,
+          );
+          break;
+        case "agent.account.logout":
+          await accounts.logout(message.accountId);
+          break;
+        case "agent.account.delete":
+          await accounts.delete(message.accountId, manager.list());
+          break;
+      }
+      return {
+        status: 200,
+        result: {
+          type: "agent.accounts.result",
+          requestId: message.requestId,
+          action,
+          ok: true,
+          accounts: await accounts.snapshot(manager.list()),
+          ...(sessionId ? { sessionId } : {}),
+        },
+      };
+    } catch (error) {
+      // Do not serialize arbitrary exceptions here: a CLI or storage backend must
+      // never turn a submitted secret into a response body or daemon log.
+      const safeError = error instanceof AgentAccountError ? error.message : "账号操作失败";
+      return {
+        status: accountFailureStatus(error),
+        result: {
+          type: "agent.accounts.result",
+          requestId: message.requestId,
+          action,
+          ok: false,
+          accounts: await accounts.snapshot(manager.list()).catch(() => []),
+          error: safeError,
+        },
+      };
+    }
   }
 
   function orchestrationCapabilities(conn: Conn): string[] {
@@ -776,14 +933,7 @@ export async function createDaemonServer(
         return;
       }
       case "agent.accounts.list": {
-        const list = await accounts.snapshot(manager.list());
-        send(conn, {
-          type: "agent.accounts.result",
-          requestId: msg.requestId,
-          action: "list",
-          ok: true,
-          accounts: list,
-        });
+        send(conn, (await performAccountControl(msg)).result);
         return;
       }
       case "agent.account.create":
@@ -806,19 +956,7 @@ export async function createDaemonServer(
           });
           return;
         }
-        const action = (() => {
-          switch (msg.type) {
-            case "agent.account.create": return "create" as const;
-            case "agent.account.api.create": return "api_create" as const;
-            case "agent.account.api.configure": return "api_configure" as const;
-            case "agent.account.rename": return "rename" as const;
-            case "agent.account.default": return "default" as const;
-            case "agent.account.login": return "login" as const;
-            case "agent.account.credential.set": return "credential" as const;
-            case "agent.account.logout": return "logout" as const;
-            case "agent.account.delete": return "delete" as const;
-          }
-        })();
+        const action = accountAction(msg);
         if (!device.allowShell) {
           send(conn, {
             type: "agent.accounts.result",
@@ -830,73 +968,7 @@ export async function createDaemonServer(
           });
           return;
         }
-        try {
-          let sessionId: string | undefined;
-          switch (msg.type) {
-            case "agent.account.create":
-              accounts.create(msg.agent, msg.name);
-              break;
-            case "agent.account.api.create":
-              await accounts.createApi(msg.agent, msg.name, {
-                baseUrl: msg.baseUrl,
-                model: msg.model,
-                apiKey: msg.apiKey,
-              });
-              break;
-            case "agent.account.api.configure":
-              await accounts.configureApi(msg.accountId, {
-                baseUrl: msg.baseUrl,
-                model: msg.model,
-                apiKey: msg.apiKey,
-              });
-              break;
-            case "agent.account.rename":
-              accounts.rename(msg.accountId, msg.name);
-              break;
-            case "agent.account.default":
-              accounts.setDefault(msg.accountId);
-              break;
-            case "agent.account.login": {
-              const info = await manager.createAccountLogin(
-                accounts.loginSpec(msg.accountId),
-                msg.cols,
-                msg.rows,
-              );
-              sessionId = info.id;
-              break;
-            }
-            case "agent.account.credential.set":
-              await accounts.setCredential(
-                msg.accountId,
-                msg.credentialKind,
-                msg.credential,
-              );
-              break;
-            case "agent.account.logout":
-              await accounts.logout(msg.accountId);
-              break;
-            case "agent.account.delete":
-              await accounts.delete(msg.accountId, manager.list());
-              break;
-          }
-          send(conn, {
-            type: "agent.accounts.result",
-            requestId: msg.requestId,
-            action,
-            ok: true,
-            accounts: await accounts.snapshot(manager.list()),
-            ...(sessionId ? { sessionId } : {}),
-          });
-        } catch (error) {
-          send(conn, {
-            type: "agent.accounts.result",
-            requestId: msg.requestId,
-            action,
-            ok: false,
-            accounts: await accounts.snapshot(manager.list()).catch(() => []),
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
+        send(conn, (await performAccountControl(msg)).result);
         return;
       }
       case "session.create": {
@@ -1791,6 +1863,32 @@ export async function createDaemonServer(
       res.end(JSON.stringify({ ok: true, sessions: manager.list().length }));
       return;
     }
+    if (req.method === "POST" && url.pathname === "/_prospero/control/accounts") {
+      try {
+        // 8 KiB is the largest protocol credential; leave bounded JSON overhead
+        // rather than letting a local caller hold the daemon in a huge body read.
+        const body = await readControlJson(req, 24 * 1024);
+        const message = parseC2S(body);
+        if (!isAgentAccountControlMessage(message)) {
+          throw new ControlRequestError("expected an agent account protocol message", 400);
+        }
+        const outcome = await performAccountControl(message);
+        res.writeHead(outcome.status, { "content-type": "application/json" });
+        // Account snapshots contain public metadata only. In particular this never
+        // includes apiKey / credential from the incoming JSON body.
+        res.end(JSON.stringify(outcome.result));
+      } catch (error) {
+        const status = error instanceof ControlRequestError ? error.status : 400;
+        const message = error instanceof ControlRequestError
+          ? error.message
+          : error instanceof ProtocolError
+            ? error.message
+            : "invalid account control request";
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: message }));
+      }
+      return;
+    }
     if (req.method === "POST" && url.pathname === "/_prospero/control/session/create") {
       try {
         const body = await readControlJson(req);
@@ -2050,18 +2148,26 @@ export async function createDaemonServer(
   }
 
   /** 图编辑一次最多 200 个节点；显式限长，避免本机控制面被大 body 占住内存。 */
-  async function readControlJson(req: IncomingMessage): Promise<Record<string, unknown>> {
+  async function readControlJson(
+    req: IncomingMessage,
+    maxBytes = 4 * 1024 * 1024,
+  ): Promise<Record<string, unknown>> {
     const chunks: Buffer[] = [];
     let bytes = 0;
     for await (const chunk of req) {
       const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       bytes += data.length;
-      if (bytes > 4 * 1024 * 1024) throw new Error("控制请求过大");
+      if (bytes > maxBytes) throw new ControlRequestError("控制请求过大", 413);
       chunks.push(data);
     }
-    const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    } catch {
+      throw new ControlRequestError("控制请求必须是有效 JSON", 400);
+    }
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      throw new Error("控制请求必须是 JSON 对象");
+      throw new ControlRequestError("控制请求必须是 JSON 对象", 400);
     }
     return parsed as Record<string, unknown>;
   }
