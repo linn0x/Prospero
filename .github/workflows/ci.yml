@@ -74,26 +74,46 @@ jobs:
         # The production loader deliberately rejects source-built/unsigned
         # addons. Trust a runner-local self-signed copy only for this step,
         # then restore the original unsigned artifact before upload/release.
+        timeout-minutes: 10
         run: |
           $artifact = 'packages/windows-native/prebuilds/win32-${{ matrix.arch }}/prospero_windows_native.node'
           $source = 'packages/windows-native/build/Release/prospero_windows_native.node'
+          Write-Host 'Creating ephemeral code-signing certificate'
           $certificate = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=Prospero Windows CI Session Host Test' -CertStoreLocation 'Cert:\CurrentUser\My'
-          $certificateFile = Join-Path $env:RUNNER_TEMP 'prospero-windows-session-host-test.cer'
           $signTool = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\${{ matrix.arch }}\signtool.exe" -File -ErrorAction SilentlyContinue |
             Sort-Object FullName -Descending |
             Select-Object -First 1 -ExpandProperty FullName
           if (-not $signTool) { throw 'signtool.exe was not found in the Windows SDK' }
+          function Set-EphemeralCertificateTrust {
+            param(
+              [System.Security.Cryptography.X509Certificates.X509Certificate2] $Certificate,
+              [string] $StoreName,
+              [bool] $Trusted
+            )
+            $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
+              $StoreName,
+              [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
+            )
+            try {
+              $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+              if ($Trusted) { $store.Add($Certificate) } else { $store.Remove($Certificate) }
+            } finally {
+              $store.Close()
+            }
+          }
           try {
-            Export-Certificate -Cert $certificate -FilePath $certificateFile | Out-Null
-            Import-Certificate -FilePath $certificateFile -CertStoreLocation 'Cert:\CurrentUser\Root' | Out-Null
-            Import-Certificate -FilePath $certificateFile -CertStoreLocation 'Cert:\CurrentUser\TrustedPublisher' | Out-Null
+            Write-Host 'Trusting ephemeral certificate without certificate-import UI'
+            Set-EphemeralCertificateTrust -Certificate $certificate -StoreName 'Root' -Trusted $true
+            Set-EphemeralCertificateTrust -Certificate $certificate -StoreName 'TrustedPublisher' -Trusted $true
             Copy-Item -LiteralPath $source -Destination $artifact -Force
+            Write-Host "Signing $artifact with $signTool"
             & $signTool sign /fd SHA256 /sha1 $certificate.Thumbprint $artifact
             if ($LASTEXITCODE -ne 0) { throw 'signtool failed for the ephemeral Session Host test artifact' }
             $signature = Get-AuthenticodeSignature -LiteralPath $artifact
             if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Thumbprint -ne $certificate.Thumbprint) {
               throw 'ephemeral Session Host test artifact is not trusted by the Windows loader'
             }
+            Write-Host 'Ephemeral Authenticode signature is trusted; running Session Host acceptance'
             node packages/windows-native/scripts/stage-prebuild.mjs --source $artifact --destination packages/windows-native --arch ${{ matrix.arch }} --authenticode-status valid --thumbprint $certificate.Thumbprint
             $env:PROSPERO_WINDOWS_SIGNED_SESSION_HOST_TEST = '1'
             npm run build --workspace=@prospero/daemon
@@ -101,10 +121,9 @@ jobs:
           } finally {
             Copy-Item -LiteralPath $source -Destination $artifact -Force
             node packages/windows-native/scripts/stage-prebuild.mjs --source $artifact --destination packages/windows-native --arch ${{ matrix.arch }} --authenticode-status unsigned
-            Remove-Item -LiteralPath $certificateFile -Force -ErrorAction SilentlyContinue
+            Set-EphemeralCertificateTrust -Certificate $certificate -StoreName 'Root' -Trusted $false
+            Set-EphemeralCertificateTrust -Certificate $certificate -StoreName 'TrustedPublisher' -Trusted $false
             Remove-Item -LiteralPath "Cert:\CurrentUser\My\$($certificate.Thumbprint)" -Force -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath "Cert:\CurrentUser\Root\$($certificate.Thumbprint)" -Force -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath "Cert:\CurrentUser\TrustedPublisher\$($certificate.Thumbprint)" -Force -ErrorAction SilentlyContinue
           }
       - name: Upload unsigned test artifact and SHA-256 manifest
         uses: actions/upload-artifact@v4
