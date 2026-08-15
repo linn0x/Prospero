@@ -42,6 +42,15 @@ function home(): string {
   return value;
 }
 
+function expectPrivateFile(file: string): void {
+  const stats = statSync(file);
+  expect(stats.isFile()).toBe(true);
+  // Windows reports POSIX compatibility mode bits from its ACL translation;
+  // 0600 is enforceable and meaningful only on POSIX. Windows coverage still
+  // verifies the file lifecycle and that secrets never enter status output.
+  if (process.platform !== "win32") expect(stats.mode & 0o777).toBe(0o600);
+}
+
 function config(url: string, hostSecret = generateRelayHostSecret()): DaemonConfig {
   return { port: 7423, relay: { enabled: true, url, hostSecret } };
 }
@@ -144,7 +153,7 @@ describe("relay pairing persistence", () => {
     expect(effectiveRelayUrl({ port: 1 })).toBe("wss://default.example.test/v1");
     saveConfig(dir, config("wss://override.example.test/v1"));
     expect(effectiveRelayUrl(loadConfig(dir))).toBe("wss://override.example.test/v1");
-    expect(statSync(path.join(dir, "config.json")).mode & 0o777).toBe(0o600);
+    expectPrivateFile(path.join(dir, "config.json"));
     if (previous === undefined) delete process.env["PROSPERO_DEFAULT_RELAY_URL"];
     else process.env["PROSPERO_DEFAULT_RELAY_URL"] = previous;
   });
@@ -159,7 +168,7 @@ describe("prosperod relay CLI", () => {
     const enabled = loadConfig(dir);
     expect(enabled.relay).toMatchObject({ enabled: true, url: "ws://127.0.0.1:9010" });
     expect(enabled.relay?.hostSecret).toHaveLength(43);
-    expect(statSync(path.join(dir, "config.json")).mode & 0o777).toBe(0o600);
+    expectPrivateFile(path.join(dir, "config.json"));
 
     const paired = issueRelayCredentials(mintDevice(dir, { name: "cli-phone", allowShell: true }));
     persistRelayCredentials(dir, paired);
@@ -579,7 +588,7 @@ describe("RelayHostClient", () => {
     try {
       first.update(firstConfig, [device("persist")]);
       await waitFor(() => first.status().state === "online" && snapshots.length === 1);
-      expect(statSync(path.join(dir, RELAY_SYNC_STATE_FILE)).mode & 0o777).toBe(0o600);
+      expectPrivateFile(path.join(dir, RELAY_SYNC_STATE_FILE));
       first.close();
 
       const restarted = new RelayHostClient({

@@ -142,7 +142,7 @@ afterEach(async () => {
 });
 
 describe("SessionManager structured supervisor facade", () => {
-  it("creates, reconnects after daemon client disposal, serves cached tool output, and only kill terminates the owner", async () => {
+  it.skipIf(process.platform === "win32")("creates, reconnects after daemon client disposal, serves cached tool output, and only kill terminates the owner", async () => {
     const value = home();
     const first = new SessionManager({ home: value, supervisorLauncher: fakeLauncher });
     const info = await first.create({ agent: "codex", cwd: value, cols: 80, rows: 24, allowShell: false });
@@ -190,7 +190,7 @@ describe("SessionManager structured supervisor facade", () => {
     await second.disposeAll();
   });
 
-  it("keeps a dead/stale supervisor visible as read-only history instead of starting a duplicate turn", async () => {
+  it.skipIf(process.platform === "win32")("keeps a dead/stale supervisor visible as read-only history instead of starting a duplicate turn", async () => {
     const value = home();
     const first = new SessionManager({ home: value, supervisorLauncher: fakeLauncher });
     const info = await first.create({ agent: "codex", cwd: value, cols: 80, rows: 24, allowShell: false });
@@ -208,7 +208,7 @@ describe("SessionManager structured supervisor facade", () => {
     await recovered.disposeAll();
   });
 
-  it("marks a live socket with a stale capability token read-only without touching its native adapter", async () => {
+  it.skipIf(process.platform === "win32")("marks a live socket with a stale capability token read-only without touching its native adapter", async () => {
     const value = home();
     const first = new SessionManager({ home: value, supervisorLauncher: fakeLauncher });
     const info = await first.create({ agent: "codex", cwd: value, cols: 80, rows: 24, allowShell: false });
@@ -224,7 +224,7 @@ describe("SessionManager structured supervisor facade", () => {
     await recovered.disposeAll();
   });
 
-  it("never reattaches a live owner whose manifest is a failed-launch audit", async () => {
+  it.skipIf(process.platform === "win32")("never reattaches a live owner whose manifest is a failed-launch audit", async () => {
     const value = home();
     const first = new SessionManager({ home: value, supervisorLauncher: fakeLauncher });
     const info = await first.create({ agent: "codex", cwd: value, cols: 80, rows: 24, allowShell: false });

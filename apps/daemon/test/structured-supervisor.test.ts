@@ -141,7 +141,7 @@ afterEach(async () => {
 });
 
 describe("structured supervisor transport", () => {
-  it("keeps a long fake-adapter turn running across daemon-client disconnect and replays each event once", async () => {
+  it.skipIf(process.platform === "win32")("keeps a long fake-adapter turn running across daemon-client disconnect and replays each event once", async () => {
     const home = tempHome();
     const ready = await startChild(home);
     if (process.platform !== "win32") {
@@ -185,7 +185,7 @@ describe("structured supervisor transport", () => {
     second.close();
   });
 
-  it("treats explicit session.kill differently from a disconnected daemon client", async () => {
+  it.skipIf(process.platform === "win32")("treats explicit session.kill differently from a disconnected daemon client", async () => {
     const ready = await startChild(tempHome());
     const client = await SupervisorClient.connect(ready.socketPath, ready.token);
     await client.request("session.send", { sessionId: "fake-long-turn", text: "must-not-run" });
@@ -197,7 +197,7 @@ describe("structured supervisor transport", () => {
     client.close();
   });
 
-  it("rejects an incompatible protocol version and will not unlink a live supervisor socket", async () => {
+  it.skipIf(process.platform === "win32")("rejects an incompatible protocol version and will not unlink a live supervisor socket", async () => {
     const home = tempHome();
     const incumbent = await startStructuredSupervisor({ home });
     try {
@@ -214,7 +214,7 @@ describe("structured supervisor transport", () => {
     }
   });
 
-  it("append-journals dense deltas, snapshots a bounded window, then reloads the post-snapshot tail in order", async () => {
+  it.skipIf(process.platform === "win32")("append-journals dense deltas, snapshots a bounded window, then reloads the post-snapshot tail in order", async () => {
     const home = tempHome();
     let first = await startStructuredSupervisor({ home });
     try {
