@@ -1,0 +1,468 @@
+import { fork, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { afterEach, describe, expect, it } from "vitest";
+import { NATIVE_WINDOWS_ABI_VERSION } from "@prospero/windows-native";
+import {
+  WindowsSessionHostClient,
+  type WindowsSessionHostClientNative,
+  type WindowsSessionHostWireConnection,
+} from "../src/windows-session-host-client.js";
+import {
+  consumeDetachedWindowsSessionHostBootstrap,
+  runDetachedWindowsSessionHostFromEnvironment,
+  serveWindowsSessionHostPipe,
+  stopWindowsSessionHostTransport,
+  type WindowsSessionHostNativeFactory,
+  type WindowsSessionHostRunnerNative,
+} from "../src/windows-session-host-runner.js";
+import {
+  decodePsj2Journal,
+  hmacProof,
+  helloProofMaterial,
+  parseWindowsSessionHostManifest,
+  welcomeProofMaterial,
+  type SessionHostHello,
+  type SessionHostWireMessage,
+  type WindowsSessionHostManifest,
+} from "../src/windows-session-host-protocol.js";
+
+const secret = new TextEncoder().encode("mock-native-process-secret-only");
+const daemonA = { pid: 41001, creationTime100ns: "111111111111111" } as const;
+const daemonB = { pid: 41002, creationTime100ns: "222222222222222" } as const;
+const children: ChildProcess[] = [];
+
+function makeHello(manifest: WindowsSessionHostManifest, daemon = daemonA, nonce = "bm9uY2UtbW9jay1uYXRpdmU="): SessionHostHello {
+  const unsigned = { sessionId: manifest.sessionId, epoch: manifest.epoch, daemon, nonce };
+  return { version: 2, type: "hello", ...unsigned, proof: hmacProof(secret, helloProofMaterial(unsigned)) };
+}
+
+async function startMock(): Promise<{ child: ChildProcess; manifest: WindowsSessionHostManifest; owner: typeof daemonA }> {
+  const child = fork(fileURLToPath(new URL("./fixtures/windows-session-host-mock-native.mjs", import.meta.url)), [], { stdio: ["ignore", "ignore", "ignore", "ipc"] });
+  children.push(child);
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("mock native host did not become ready")), 5_000);
+    child.once("error", reject);
+    child.on("message", (message: unknown) => {
+      if (!message || typeof message !== "object" || (message as { type?: unknown }).type !== "ready") return;
+      clearTimeout(timeout);
+      const ready = message as { manifest: WindowsSessionHostManifest; owner: typeof daemonA };
+      resolve({ child, manifest: ready.manifest, owner: ready.owner });
+    });
+  });
+}
+
+async function call(child: ChildProcess, op: string, payload: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+  const id = randomUUID();
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error(`mock native host timed out for ${op}`)), 5_000);
+    const onMessage = (message: unknown) => {
+      if (!message || typeof message !== "object" || (message as { id?: unknown }).id !== id) return;
+      child.off("message", onMessage);
+      clearTimeout(timeout);
+      const reply = message as { ok?: unknown; error?: unknown } & Record<string, unknown>;
+      if (reply.ok === true) resolve(reply);
+      else reject(new Error(typeof reply.error === "string" ? reply.error : "mock native host operation failed"));
+    };
+    child.on("message", onMessage);
+    child.send({ id, op, ...payload });
+  });
+}
+
+afterEach(async () => {
+  await Promise.all(children.splice(0).map((child) => new Promise<void>((resolve) => {
+    child.once("exit", () => resolve());
+    child.kill();
+  })));
+});
+
+describe("Windows Session Host common transport (mock native process)", () => {
+  it("authenticates peer PID+FILETIME, fences one lease, recovers crash tails, snapshots gaps, deduplicates commands, and fences terminal state", async () => {
+    const { child, manifest } = await startMock();
+    expect(JSON.stringify(manifest)).not.toContain("mock-native-process-secret-only");
+    expect(manifest).not.toHaveProperty("secret");
+    expect(manifest).not.toHaveProperty("capability");
+
+    const hello = makeHello(manifest);
+    const welcomeResult = await call(child, "hello", { frame: hello, peer: { process: daemonA, userSid: "S-1-5-21-1000", sessionId: 1 } });
+    const welcome = welcomeResult.value as { proof: string; terminal: boolean; lastSeq: number; host: typeof daemonA };
+    expect(welcome.lastSeq).toBe(1); // valid prefix survived the cut-off PSJ2 record
+    expect(welcome.terminal).toBe(false);
+    expect(welcome.proof).toBe(hmacProof(secret, welcomeProofMaterial({
+      sessionId: manifest.sessionId, epoch: manifest.epoch, host: welcome.host, terminal: false, lastSeq: 1,
+    }, hello.nonce)));
+    expect(welcomeResult.snapshotBytes).toBeTypeOf("number"); // crash tail compacted before attach
+
+    const lease = await call(child, "command", { frame: {
+      version: 2, type: "command", sessionId: manifest.sessionId, epoch: manifest.epoch,
+      commandId: "lease-a", mutation: false, method: "lease.acquire", params: {},
+    } });
+    const leaseId = (lease.value as { result: { leaseId: string } }).result.leaseId;
+
+    await call(child, "detach");
+    await call(child, "hello", { frame: makeHello(manifest, daemonB), peer: { process: daemonB, userSid: "S-1-5-21-1000", sessionId: 1 } });
+    const bypass = await call(child, "command", { frame: {
+      version: 2, type: "command", sessionId: manifest.sessionId, epoch: manifest.epoch,
+      commandId: "old-daemon-bypass", mutation: false, method: "effect", params: {},
+    } });
+    expect(["lease_required", "lease_held"]).toContain((bypass.value as { error: { code: string } }).error.code);
+    const blockedLease = await call(child, "command", { frame: {
+      version: 2, type: "command", sessionId: manifest.sessionId, epoch: manifest.epoch,
+      commandId: "lease-b", mutation: false, method: "lease.acquire", params: {},
+    } });
+    expect((blockedLease.value as { error: { code: string } }).error.code).toBe("lease_held");
+
+    await call(child, "hello", { frame: makeHello(manifest), peer: { process: daemonA, userSid: "S-1-5-21-1000", sessionId: 1 } });
+    const effect = {
+      version: 2, type: "command", sessionId: manifest.sessionId, epoch: manifest.epoch,
+      commandId: "effect-once", mutation: false, method: "effect", params: {}, leaseId,
+    } as const;
+    const first = await call(child, "command", { frame: effect });
+    const duplicate = await call(child, "command", { frame: effect });
+    expect(duplicate.value).toEqual(first.value);
+    expect(duplicate.calls).toBe(1);
+
+    const terminal = await call(child, "command", { frame: { ...effect, commandId: "explicit-terminal", method: "stop" } });
+    expect((terminal.value as { ok: boolean }).ok).toBe(true);
+    const afterTerminal = await call(child, "command", { frame: { ...effect, commandId: "after-terminal" } });
+    expect((afterTerminal.value as { error: { code: string } }).error.code).toBe("terminal_fence");
+    const replay = await call(child, "replay", { frame: {
+      version: 2, type: "replay", sessionId: manifest.sessionId, epoch: manifest.epoch, afterSeq: 0,
+    } });
+    expect((replay.value as { gap: boolean; terminal: boolean; snapshot: { lastSeq: number } }).gap).toBe(true);
+    expect((replay.value as { terminal: boolean }).terminal).toBe(true);
+  });
+
+  it("sets an in-memory unknown-outcome fence if native journal persistence fails after a handler effect", async () => {
+    const { child, manifest } = await startMock();
+    await call(child, "hello", { frame: makeHello(manifest), peer: { process: daemonA, userSid: "S-1-5-21-1000", sessionId: 1 } });
+    const lease = await call(child, "command", { frame: {
+      version: 2, type: "command", sessionId: manifest.sessionId, epoch: manifest.epoch,
+      commandId: "lease", mutation: true, method: "lease.acquire", params: {},
+    } });
+    const leaseId = (lease.value as { result: { leaseId: string } }).result.leaseId;
+    await call(child, "failWrites");
+    const effect = {
+      version: 2, type: "command", sessionId: manifest.sessionId, epoch: manifest.epoch,
+      commandId: "effect-unknown", mutation: true, method: "effect", params: {}, leaseId,
+    } as const;
+    const first = await call(child, "command", { frame: effect });
+    expect((first.value as { error: { code: string } }).error.code).toBe("unknown_command_outcome");
+    const duplicate = await call(child, "command", { frame: effect });
+    expect(duplicate.value).toEqual(first.value);
+    expect(duplicate.calls).toBe(1);
+  });
+
+  it("returns durable terminal command/event records even when optional compaction fails", async () => {
+    const { child, manifest } = await startMock();
+    await call(child, "hello", { frame: makeHello(manifest), peer: { process: daemonA, userSid: "S-1-5-21-1000", sessionId: 1 } });
+    const lease = await call(child, "command", { frame: {
+      version: 2, type: "command", sessionId: manifest.sessionId, epoch: manifest.epoch,
+      commandId: "lease-for-compaction", mutation: true, method: "lease.acquire", params: {},
+    } });
+    const leaseId = (lease.value as { result: { leaseId: string } }).result.leaseId;
+    await call(child, "failSnapshotWrites");
+    const stop = {
+      version: 2, type: "command", sessionId: manifest.sessionId, epoch: manifest.epoch,
+      commandId: "terminal-with-failed-compaction", mutation: true, method: "stop", params: {}, leaseId,
+    } as const;
+    const first = await call(child, "command", { frame: stop });
+    expect((first.value as { ok: boolean }).ok).toBe(true);
+    const duplicate = await call(child, "command", { frame: stop });
+    expect(duplicate.value).toEqual(first.value);
+
+    const { child: eventChild } = await startMock();
+    await call(eventChild, "failSnapshotWrites");
+    const terminalEvent = await call(eventChild, "appendEvent", { payload: { terminal: "output" }, options: { terminal: true } });
+    expect((terminalEvent.value as { kind: string }).kind).toBe("terminal");
+  });
+
+  it("durably appends host output while detached, serializes it with other appends, and fences a terminal event", async () => {
+    const { child, manifest } = await startMock();
+    const [first, second] = await Promise.all([
+      call(child, "appendEvent", { payload: { stream: "pty", data: "one" } }),
+      call(child, "appendEvent", { payload: { stream: "pty", data: "two" } }),
+    ]);
+    const sequences = [first, second].map((reply) => (reply.value as { seq: number }).seq).sort((left, right) => left - right);
+    expect(sequences).toEqual([2, 3]);
+    const terminal = await call(child, "appendEvent", { payload: { exited: true }, options: { terminal: true, snapshotState: { exited: true } } });
+    expect((terminal.value as { kind: string }).kind).toBe("terminal");
+    await expect(call(child, "appendEvent", { payload: { after: "terminal" } })).rejects.toThrow(/terminal fence/i);
+
+    await call(child, "hello", { frame: makeHello(manifest), peer: { process: daemonA, userSid: "S-1-5-21-1000", sessionId: 1 } });
+    const replay = await call(child, "replay", { frame: {
+      version: 2, type: "replay", sessionId: manifest.sessionId, epoch: manifest.epoch, afterSeq: 0,
+    } });
+    expect((replay.value as { terminal: boolean; snapshot: { lastSeq: number } }).terminal).toBe(true);
+    expect((replay.value as { snapshot: { lastSeq: number } }).snapshot.lastSeq).toBe(4);
+  });
+
+  it("rejects malformed native peer identity and replay cursors beyond the durable watermark", async () => {
+    const { child, manifest } = await startMock();
+    await expect(call(child, "hello", { frame: makeHello(manifest), peer: { process: daemonA, userSid: "not-a-sid", sessionId: 1 } })).rejects.toThrow(/peer/i);
+    await call(child, "hello", { frame: makeHello(manifest), peer: { process: daemonA, userSid: "S-1-5-21-1000", sessionId: 1 } });
+    await expect(call(child, "replay", { frame: {
+      version: 2, type: "replay", sessionId: manifest.sessionId, epoch: manifest.epoch, afterSeq: 999,
+    } })).rejects.toThrow(/cursor/i);
+  });
+});
+
+describe("Windows Session Host client replay validation", () => {
+  const manifest = parseWindowsSessionHostManifest({
+    schemaVersion: 2, protocolVersion: 2, implementation: "windows-session-host", sessionId: "client-session", epoch: "client-epoch-0001",
+    pipeName: "\\\\.\\pipe\\prospero-client-test", stateDirectory: "C:\\client-state", aclProfile: "current-logon-token-v1",
+    owner: daemonA, nativeAbiVersion: NATIVE_WINDOWS_ABI_VERSION, credentialFile: "credential.dpapi", journalFile: "journal.psj2",
+    snapshotFile: "snapshot.psj2.json", status: "active", createdAt: 1, updatedAt: 1,
+  });
+
+  it("does not advance its consumption cursor from welcome and rejects discontinuous replay", async () => {
+    const sent: SessionHostWireMessage[] = [];
+    const nonce = "mock-client-nonce";
+    const native: WindowsSessionHostClientNative = {
+      async openState() {}, async loadCredential() {}, async currentIdentity() { return daemonA; }, async matchesIdentity() { return true; },
+      async hmac(material) { return hmacProof(secret, material); },
+    };
+    const welcome = {
+      version: 2, type: "welcome", sessionId: manifest.sessionId, epoch: manifest.epoch, host: manifest.owner,
+      terminal: false, lastSeq: 5,
+      proof: hmacProof(secret, welcomeProofMaterial({ sessionId: manifest.sessionId, epoch: manifest.epoch, host: manifest.owner, terminal: false, lastSeq: 5 }, nonce)),
+    } as const;
+    const replies: SessionHostWireMessage[] = [welcome, {
+      version: 2, type: "replay", sessionId: manifest.sessionId, epoch: manifest.epoch, afterSeq: 0,
+      lastSeq: 2, gap: false, terminal: false, snapshot: null,
+      events: [{ schemaVersion: 2, sessionId: manifest.sessionId, epoch: manifest.epoch, seq: 2, kind: "event", payload: {} }],
+    }];
+    const connection: WindowsSessionHostWireConnection = {
+      async send(frame) {
+        const line = new TextDecoder().decode(frame).trim();
+        const message = JSON.parse(line) as SessionHostWireMessage;
+        if (message.type === "hello") {
+          // The client chooses a random nonce. Re-sign the queued welcome for
+          // exactly that nonce rather than trusting test fixture metadata.
+          const mutable = replies[0] as { proof: string } & typeof welcome;
+          mutable.proof = hmacProof(secret, welcomeProofMaterial({
+            sessionId: manifest.sessionId, epoch: manifest.epoch, host: manifest.owner, terminal: false, lastSeq: 5,
+          }, message.nonce));
+        }
+        sent.push(message);
+      },
+      async receive() {
+        const next = replies.shift();
+        if (!next) throw new Error("no queued reply");
+        return next;
+      },
+      detach() {},
+    };
+    const client = await WindowsSessionHostClient.attach(manifest, native, async () => connection);
+    expect(client.cursor).toBe(0);
+    await expect(client.replay()).rejects.toMatchObject({ code: "session_host_unavailable" });
+    expect((sent.at(-1) as { type: string; afterSeq: number }).afterSeq).toBe(0);
+  });
+
+  it("does not advance the replay cursor from a command reply, releases native ownership on dispose, and binds its expected state directory", async () => {
+    const sent: SessionHostWireMessage[] = [];
+    let detached = 0;
+    let nativeClosed = 0;
+    const native: WindowsSessionHostClientNative = {
+      async openState() {}, async loadCredential() {}, async currentIdentity() { return daemonA; }, async matchesIdentity() { return true; },
+      async hmac(material) { return hmacProof(secret, material); }, async close() { nativeClosed += 1; },
+    };
+    const replies: SessionHostWireMessage[] = [{
+      version: 2, type: "welcome", sessionId: manifest.sessionId, epoch: manifest.epoch, host: manifest.owner,
+      terminal: false, lastSeq: 5, proof: "",
+    }, {
+      version: 2, type: "reply", commandId: "status-command", ok: true, result: { active: true }, seq: 5,
+    }, {
+      version: 2, type: "replay", sessionId: manifest.sessionId, epoch: manifest.epoch, afterSeq: 0, lastSeq: 5,
+      gap: true, terminal: false,
+      snapshot: { schemaVersion: 2, sessionId: manifest.sessionId, epoch: manifest.epoch, lastSeq: 4, terminal: false, commands: [], state: {} },
+      events: [{ schemaVersion: 2, sessionId: manifest.sessionId, epoch: manifest.epoch, seq: 5, kind: "event", payload: { output: "late" } }],
+    }];
+    const connection: WindowsSessionHostWireConnection = {
+      async send(frame) {
+        const message = JSON.parse(new TextDecoder().decode(frame).trim()) as SessionHostWireMessage;
+        if (message.type === "hello") {
+          (replies[0] as { proof: string }).proof = hmacProof(secret, welcomeProofMaterial({
+            sessionId: manifest.sessionId, epoch: manifest.epoch, host: manifest.owner, terminal: false, lastSeq: 5,
+          }, message.nonce));
+        }
+        sent.push(message);
+      },
+      async receive() {
+        const next = replies.shift();
+        if (!next) throw new Error("no queued reply");
+        return next;
+      },
+      detach() { detached += 1; },
+    };
+    await expect(WindowsSessionHostClient.attach(manifest, native, async () => connection, { expectedStateDirectory: "C:\\wrong" })).rejects.toMatchObject({ code: "invalid_manifest" });
+    const client = await WindowsSessionHostClient.attach(manifest, native, async () => connection, {
+      expectedStateDirectory: manifest.stateDirectory, readOnlyMethods: ["status"],
+    });
+    await expect(client.command("status", {}, false, "status-command")).resolves.toEqual({ active: true });
+    expect(client.cursor).toBe(0);
+    await client.replay();
+    expect((sent.at(-1) as { type: string; afterSeq: number }).afterSeq).toBe(0);
+    expect(client.cursor).toBe(5);
+    await client.dispose();
+    expect(detached).toBe(1);
+    expect(nativeClosed).toBe(1);
+  });
+
+  it("bounds a stalled welcome receive and detaches its socket", async () => {
+    let detached = 0;
+    const native: WindowsSessionHostClientNative = {
+      async openState() {}, async loadCredential() {}, async currentIdentity() { return daemonA; }, async matchesIdentity() { return true; },
+      async hmac(material) { return hmacProof(secret, material); },
+    };
+    const connection: WindowsSessionHostWireConnection = {
+      async send() {}, async receive() { return new Promise<SessionHostWireMessage>(() => {}); }, detach() { detached += 1; },
+    };
+    await expect(WindowsSessionHostClient.attach(manifest, native, async () => connection, { handshakeTimeoutMs: 10 })).rejects.toMatchObject({ code: "timeout" });
+    expect(detached).toBe(1);
+  });
+});
+
+describe("Windows Session Host detached bootstrap and provider output", () => {
+  const stateDirectory = "C:\\detached-state";
+  const sessionId = "detached-session";
+  const epoch = "detached-epoch-0001";
+  const handlerModule = new URL("./fixtures/windows-session-host-factory.mjs", import.meta.url).href;
+  const bootstrap = {
+    schemaVersion: 2, implementation: "windows-session-host-runner", sessionId, epoch,
+    pipeName: "\\\\.\\pipe\\prospero-detached-test", stateDirectory, handlerModule, createdAt: 1,
+  } as const;
+
+  it("securely consumes bootstrap once so a second detached entry cannot reuse it", async () => {
+    const files = new Map<string, Uint8Array>([["host.bootstrap.json", new TextEncoder().encode(JSON.stringify(bootstrap))]]);
+    let removed = 0;
+    const native = {
+      async read(name: string) { return files.get(name) ?? null; },
+      async removeState(name: string) { removed += 1; files.delete(name); },
+    };
+    await expect(consumeDetachedWindowsSessionHostBootstrap(native, stateDirectory)).resolves.toMatchObject({ sessionId, epoch });
+    expect(removed).toBe(1);
+    await expect(consumeDetachedWindowsSessionHostBootstrap(native, stateDirectory)).rejects.toMatchObject({ code: "native_unavailable" });
+  });
+
+  it("injects durable appendEvent/emit into the detached factory while no daemon is attached", async () => {
+    const files = new Map<string, Uint8Array>([["host.bootstrap.json", new TextEncoder().encode(JSON.stringify(bootstrap))]]);
+    let rejectAccept: ((error: Error) => void) | undefined;
+    const native: WindowsSessionHostRunnerNative & { close(): Promise<void> } = {
+      async openState() {},
+      async read(name) { return files.get(name) ?? null; },
+      async writeAtomic(name, bytes) { files.set(name, Uint8Array.from(bytes)); },
+      async removeState(name) { files.delete(name); },
+      async createCredential() {}, async hmac(material) { return hmacProof(secret, material); },
+      async currentIdentity() { return daemonA; }, async createPipe() {},
+      async acceptPipe() { return new Promise<void>((_resolve, reject) => { rejectAccept = reject; }); },
+      async readPipe() { return { data: new Uint8Array(), peer: null }; }, async writePipe() { return 0; },
+      async closePipeConnection() {}, async closePipeServer() {},
+      async cancelActivePipeIo() { rejectAccept?.(new Error("test cancellation")); }, async close() {},
+    };
+    const factory: WindowsSessionHostNativeFactory = { async create() { return native; } };
+    const running = await runDetachedWindowsSessionHostFromEnvironment({ PROSPERO_WINDOWS_SESSION_HOST_STATE_DIRECTORY: stateDirectory }, factory);
+    const journal = decodePsj2Journal(files.get("journal.psj2")!, sessionId, epoch);
+    expect(journal.events.map((event) => event.payload)).toEqual([
+      { source: "factory", output: "daemon-offline" },
+      { source: "factory", output: "second" },
+    ]);
+    expect(files.has("host.bootstrap.json")).toBe(false);
+    await running.closeTransport();
+    await expect(runDetachedWindowsSessionHostFromEnvironment({ PROSPERO_WINDOWS_SESSION_HOST_STATE_DIRECTORY: stateDirectory }, factory)).rejects.toMatchObject({ code: "native_unavailable" });
+  });
+});
+
+describe("Windows Session Host fail-closed edges", () => {
+  it("rejects a manifest ABI/SID trust input and native-invalid pipe names", () => {
+    const base = {
+      schemaVersion: 2, protocolVersion: 2, implementation: "windows-session-host", sessionId: "edge-session", epoch: "edge-epoch-000001",
+      pipeName: "\\\\.\\pipe\\prospero-edge", stateDirectory: "C:\\edge-state", aclProfile: "current-logon-token-v1",
+      owner: daemonA, nativeAbiVersion: NATIVE_WINDOWS_ABI_VERSION, credentialFile: "credential.dpapi", journalFile: "journal.psj2",
+      snapshotFile: "snapshot.psj2.json", status: "active", createdAt: 1, updatedAt: 1,
+    } as const;
+    expect(() => parseWindowsSessionHostManifest({ ...base, nativeAbiVersion: NATIVE_WINDOWS_ABI_VERSION + 1 })).toThrow();
+    expect(() => parseWindowsSessionHostManifest({ ...base, allowedUserSid: "S-1-5-18" })).toThrow();
+    expect(() => parseWindowsSessionHostManifest({ ...base, owner: { ...daemonA, creationTime100ns: "0" } })).toThrow();
+    expect(() => parseWindowsSessionHostManifest({ ...base, pipeName: "\\\\.\\pipe\\bad/pipe" })).toThrow();
+    expect(() => parseWindowsSessionHostManifest({ ...base, pipeName: `\\\\.\\pipe\\${"x".repeat(257)}` })).toThrow();
+  });
+
+  it("stops after an accepted connection when requested instead of spinning after close", async () => {
+    let stopping = false;
+    let accepted = 0;
+    let closed = 0;
+    const native: WindowsSessionHostRunnerNative = {
+      async openState() {}, async read() { return null; }, async writeAtomic() {}, async removeState() {}, async createCredential() {}, async hmac() { return ""; },
+      async currentIdentity() { return daemonA; }, async createPipe() {},
+      async acceptPipe() { accepted += 1; stopping = true; },
+      async readPipe() { return { data: new Uint8Array(), peer: null }; }, async writePipe() { return 0; },
+      async closePipeConnection() { closed += 1; }, async closePipeServer() {},
+    };
+    await serveWindowsSessionHostPipe(native, { detachConnection() {} } as never, () => stopping);
+    expect(accepted).toBe(1);
+    expect(closed).toBe(1);
+  });
+
+  it("cancels an active blocking read instead of waiting for the native worker queue", async () => {
+    let stopping = false;
+    let accepted = 0;
+    let closeConnection = 0;
+    let closeServer = 0;
+    let nativeClosed = 0;
+    let cancel = 0;
+    let rejectRead: ((error: Error) => void) | undefined;
+    let reading!: () => void;
+    const startedRead = new Promise<void>((resolve) => { reading = resolve; });
+    const native: WindowsSessionHostRunnerNative = {
+      async openState() {}, async read() { return null; }, async writeAtomic() {}, async removeState() {}, async createCredential() {}, async hmac() { return ""; },
+      async currentIdentity() { return daemonA; }, async createPipe() {},
+      async acceptPipe() { accepted += 1; },
+      async readPipe() {
+        reading();
+        return new Promise<{ data: Uint8Array; peer: null }>((_resolve, reject) => { rejectRead = reject; });
+      },
+      async writePipe() { return 0; },
+      async closePipeConnection() { closeConnection += 1; }, async closePipeServer() { closeServer += 1; },
+      async cancelActivePipeIo() { cancel += 1; rejectRead?.(new Error("DisconnectNamedPipe cancelled active read")); },
+      async close() { nativeClosed += 1; },
+    };
+    const serving = serveWindowsSessionHostPipe(native, { detachConnection() {} } as never, () => stopping);
+    await startedRead;
+    stopping = true;
+    await stopWindowsSessionHostTransport(native, serving, "\\\\.\\pipe\\test-active-read");
+    expect(accepted).toBe(1);
+    expect(cancel).toBe(1);
+    expect(closeConnection).toBe(1);
+    expect(closeServer).toBe(1);
+    expect(nativeClosed).toBe(1);
+  });
+
+  it("cancels an idle blocking accept and always closes the native worker after a close error", async () => {
+    let stopping = false;
+    let rejectAccept: ((error: Error) => void) | undefined;
+    let acceptStarted!: () => void;
+    const started = new Promise<void>((resolve) => { acceptStarted = resolve; });
+    let cancel = 0;
+    let nativeClosed = 0;
+    const native: WindowsSessionHostRunnerNative = {
+      async openState() {}, async read() { return null; }, async writeAtomic() {}, async removeState() {}, async createCredential() {}, async hmac() { return ""; },
+      async currentIdentity() { return daemonA; }, async createPipe() {},
+      async acceptPipe() {
+        acceptStarted();
+        return new Promise<void>((_resolve, reject) => { rejectAccept = reject; });
+      },
+      async readPipe() { return { data: new Uint8Array(), peer: null }; }, async writePipe() { return 0; },
+      async closePipeConnection() {},
+      async closePipeServer() { throw new Error("server close failed"); },
+      async cancelActivePipeIo() { cancel += 1; rejectAccept?.(new Error("close idle accept")); },
+      async close() { nativeClosed += 1; },
+    };
+    const serving = serveWindowsSessionHostPipe(native, { detachConnection() {} } as never, () => stopping);
+    await started;
+    stopping = true;
+    await expect(stopWindowsSessionHostTransport(native, serving, "\\\\.\\pipe\\test-idle-accept")).rejects.toThrow(/server close failed/);
+    expect(cancel).toBe(1);
+    expect(nativeClosed).toBe(1);
+  });
+});

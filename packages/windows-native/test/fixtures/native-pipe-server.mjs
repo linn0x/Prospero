@@ -7,7 +7,6 @@ try {
   const binding = require(workerData.bindingPath);
   const server = binding.createSecureNamedPipeServer({
     pipeName: workerData.pipeName,
-    allowedUserSid: workerData.userSid,
     maxInstances: 2,
     inboundBufferBytes: 4096,
     outboundBufferBytes: 4096,
