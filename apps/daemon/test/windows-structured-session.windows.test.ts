@@ -16,7 +16,10 @@ afterEach(() => {
   for (const dir of temporary.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-describe.runIf(process.platform === "win32")("Windows structured Session Host native integration", () => {
+const signedNativeAcceptance = process.platform === "win32"
+  && process.env["PROSPERO_WINDOWS_SIGNED_SESSION_HOST_TEST"] === "1";
+
+describe.runIf(signedNativeAcceptance)("Windows structured Session Host native integration", () => {
   it("puts the detached host in the real N-API Job before its provider starts, survives daemon detach, then kills provider and grandchild after reply", async () => {
     const root = mkdtempSync(path.join(os.tmpdir(), "prospero-windows-structured-"));
     temporary.push(root);
