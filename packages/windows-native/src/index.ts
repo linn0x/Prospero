@@ -1,0 +1,25 @@
+export {
+  NATIVE_REQUIRED_CAPABILITIES,
+  NATIVE_WINDOWS_ABI_VERSION,
+  REQUIRED_NAPI_VERSION,
+  type ConPtyHandle,
+  type ConPtySpawnOptions,
+  type DetachedHostLaunchOptions,
+  type FileTime100ns,
+  type JobObjectHandle,
+  type JobObjectOptions,
+  type NativeCapability,
+  type NativeCapabilityReport,
+  type NativePrebuildManifest,
+  type NativeWindowsBinding,
+  type PipePeerIdentity,
+  type ProcessIdentity,
+  type SecureNamedPipeServerHandle,
+  type SecureNamedPipeServerOptions,
+  type SupportedWindowsArchitecture,
+} from "./contract.js";
+export {
+  NativeLoadError,
+  loadWindowsNative,
+  type NativeLoaderRuntime,
+} from "./loader.js";

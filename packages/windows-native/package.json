@@ -1,0 +1,37 @@
+{
+  "name": "@prospero/windows-native",
+  "version": "0.0.13",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./loader": {
+      "types": "./dist/loader.d.ts",
+      "default": "./dist/loader.js"
+    }
+  },
+  "files": [
+    "binding.gyp",
+    "dist",
+    "native",
+    "prebuilds",
+    "scripts"
+  ],
+  "scripts": {
+    "build": "tsc --build",
+    "build:native": "node ./scripts/assert-windows.mjs && node-gyp rebuild",
+    "test": "vitest run --passWithNoTests",
+    "test:native": "node ./scripts/assert-windows.mjs && npm run build:native && vitest run --config vitest.windows.config.mts",
+    "verify:prebuilds": "node ./scripts/verify-prebuild-layout.mjs"
+  },
+  "devDependencies": {
+    "node-gyp": "^11.2.0",
+    "vitest": "^3.2.7"
+  }
+}

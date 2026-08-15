@@ -13,7 +13,7 @@
   },
   "scripts": {
     "postinstall": "patch-package && node tools/fix-node-pty-darwin-helper.mjs",
-    "typecheck": "tsc --build --force packages/protocol apps/daemon apps/relay",
+    "typecheck": "tsc --build --force packages/protocol packages/windows-native apps/daemon apps/relay",
     "test": "npm run test --workspaces --if-present"
   },
   "devDependencies": {

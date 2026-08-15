@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "platform": "win32",
+  "arch": "arm64",
+  "artifact": {
+    "file": "prospero_windows_native.node",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "native": {
+    "abiVersion": 1,
+    "napiVersion": 8,
+    "capabilities": {
+      "processIdentity": false,
+      "secureNamedPipe": false,
+      "jobObject": false,
+      "detachedHost": false,
+      "conPty": false
+    }
+  },
+  "authenticode": {
+    "status": "unsigned"
+  }
+}
