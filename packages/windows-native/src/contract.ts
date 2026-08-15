@@ -58,6 +58,7 @@ export interface PipePeerIdentity {
   readonly process: ProcessIdentity;
   /** Canonical string SID queried while impersonating the pipe client. */
   readonly userSid: string;
+  /** Win32 TokenSessionId DWORD: an integer in the inclusive range 0..0xffffffff. */
   readonly sessionId: number;
 }
 

@@ -1,13 +1,18 @@
 import { fork, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { once } from "node:events";
+import { createConnection, createServer, type Socket } from "node:net";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { NATIVE_WINDOWS_ABI_VERSION } from "@prospero/windows-native";
 import {
+  MAX_WINDOWS_SESSION_HOST_FRAME_BYTES,
+  NodePipeConnection,
   WindowsSessionHostClient,
   type WindowsSessionHostClientNative,
   type WindowsSessionHostWireConnection,
 } from "../src/windows-session-host-client.js";
+import { isStrictWindowsPipePeerIdentity } from "../src/windows-session-host-native.js";
 import {
   consumeDetachedWindowsSessionHostBootstrap,
   runDetachedWindowsSessionHostFromEnvironment,
@@ -31,6 +36,46 @@ const secret = new TextEncoder().encode("mock-native-process-secret-only");
 const daemonA = { pid: 41001, creationTime100ns: "111111111111111" } as const;
 const daemonB = { pid: 41002, creationTime100ns: "222222222222222" } as const;
 const children: ChildProcess[] = [];
+
+async function nodePipePair(): Promise<{
+  readonly connection: NodePipeConnection;
+  readonly peer: Socket;
+  close(): Promise<void>;
+}> {
+  let resolvePeer!: (socket: Socket) => void;
+  const peerReady = new Promise<Socket>((resolve) => { resolvePeer = resolve; });
+  const server = createServer((socket) => {
+    socket.on("error", () => {});
+    resolvePeer(socket);
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("test server did not expose a TCP address");
+  const client = createConnection({ host: "127.0.0.1", port: address.port });
+  const connected = once(client, "connect");
+  const peer = await peerReady;
+  await connected;
+  const connection = new NodePipeConnection(client);
+  return {
+    connection,
+    peer,
+    async close() {
+      connection.detach();
+      peer.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
+
+async function writeSocket(socket: Socket, data: Uint8Array): Promise<void> {
+  await new Promise<void>((resolve, reject) => socket.write(data, (error) => error ? reject(error) : resolve()));
+}
 
 function makeHello(manifest: WindowsSessionHostManifest, daemon = daemonA, nonce = "bm9uY2UtbW9jay1uYXRpdmU="): SessionHostHello {
   const unsigned = { sessionId: manifest.sessionId, epoch: manifest.epoch, daemon, nonce };
@@ -205,6 +250,23 @@ describe("Windows Session Host common transport (mock native process)", () => {
       version: 2, type: "replay", sessionId: manifest.sessionId, epoch: manifest.epoch, afterSeq: 999,
     } })).rejects.toThrow(/cursor/i);
   });
+
+  it("accepts the complete DWORD TokenSessionId range and rejects values outside it", async () => {
+    const highest = { process: daemonA, userSid: "S-1-5-21-1000", sessionId: 0xffff_ffff };
+    expect(isStrictWindowsPipePeerIdentity({ process: daemonA, userSid: "S-1-5-21-1000", sessionId: 0 })).toBe(true);
+    expect(isStrictWindowsPipePeerIdentity(highest)).toBe(true);
+    for (const sessionId of [-1, 0x1_0000_0000, 1.5]) {
+      expect(isStrictWindowsPipePeerIdentity({ ...highest, sessionId })).toBe(false);
+    }
+
+    const { child, manifest } = await startMock();
+    await expect(call(child, "hello", { frame: makeHello(manifest), peer: highest })).resolves.toBeDefined();
+    for (const sessionId of [-1, 0x1_0000_0000, 1.5]) {
+      await expect(call(child, "hello", {
+        frame: makeHello(manifest), peer: { ...highest, sessionId },
+      })).rejects.toThrow(/peer/i);
+    }
+  });
 });
 
 describe("Windows Session Host client replay validation", () => {
@@ -320,6 +382,46 @@ describe("Windows Session Host client replay validation", () => {
     };
     await expect(WindowsSessionHostClient.attach(manifest, native, async () => connection, { handshakeTimeoutMs: 10 })).rejects.toMatchObject({ code: "timeout" });
     expect(detached).toBe(1);
+  });
+});
+
+describe("Windows Session Host Node pipe reply boundary", () => {
+  it("fails closed when a peer sends more than one reply", async () => {
+    const pair = await nodePipePair();
+    try {
+      const pending = pair.connection.receive();
+      await writeSocket(pair.peer, new TextEncoder().encode('{"version":2,"type":"reply"}\n{"version":2,"type":"reply"}\n'));
+      await expect(pending).rejects.toThrow(/more than one unconsumed reply/i);
+      await expect(pair.connection.receive()).rejects.toThrow(/more than one unconsumed reply/i);
+    } finally { await pair.close(); }
+  });
+
+  it("decodes before releasing its sole waiter and rejects malformed frames immediately", async () => {
+    const pair = await nodePipePair();
+    try {
+      const pending = pair.connection.receive();
+      await writeSocket(pair.peer, new TextEncoder().encode("{not-json}\n"));
+      await expect(pending).rejects.toThrow(/invalid JSON/i);
+      await expect(pair.connection.receive()).rejects.toThrow(/invalid JSON/i);
+    } finally { await pair.close(); }
+  });
+
+  it("fails closed instead of accumulating oversized buffered input or concurrent waiters", async () => {
+    const waitingPair = await nodePipePair();
+    try {
+      const first = waitingPair.connection.receive();
+      const second = waitingPair.connection.receive();
+      await expect(first).rejects.toThrow(/one pending reply/i);
+      await expect(second).rejects.toThrow(/one pending reply/i);
+    } finally { await waitingPair.close(); }
+
+    const bufferPair = await nodePipePair();
+    try {
+      const pending = bufferPair.connection.receive();
+      await writeSocket(bufferPair.peer, new Uint8Array(MAX_WINDOWS_SESSION_HOST_FRAME_BYTES + 1));
+      await expect(pending).rejects.toThrow(/frame exceeds maximum/i);
+      await expect(bufferPair.connection.receive()).rejects.toThrow(/frame exceeds maximum/i);
+    } finally { await bufferPair.close(); }
   });
 });
 

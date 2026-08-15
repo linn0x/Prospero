@@ -28,7 +28,7 @@ import {
 } from "./windows-session-host-protocol.js";
 import { WindowsSessionHostNativeWorker } from "./windows-session-host-native.js";
 
-const MAX_FRAME_BYTES = 4 * 1024 * 1024;
+export const MAX_WINDOWS_SESSION_HOST_FRAME_BYTES = 4 * 1024 * 1024;
 
 export class WindowsSessionHostClientError extends Error {
   constructor(message: string, readonly code = "session_host_unavailable") {
@@ -64,13 +64,18 @@ export interface WindowsSessionHostClientOptions {
   readonly requestTimeoutMs?: number;
 }
 
-class NodePipeConnection implements WindowsSessionHostWireConnection {
-  private readonly frames: Uint8Array[] = [];
-  private readonly waiters: Array<{ resolve: (message: SessionHostWireMessage) => void; reject: (error: Error) => void }> = [];
+/**
+ * A host pipe is deliberately request/reply, never a general event stream.
+ * Keep exactly one either queued reply or pending receive; any flood means the
+ * peer violated that contract and the connection must not remain usable.
+ */
+export class NodePipeConnection implements WindowsSessionHostWireConnection {
+  private queuedReply: SessionHostWireMessage | null = null;
+  private waiter: { resolve: (message: SessionHostWireMessage) => void; reject: (error: Error) => void } | null = null;
   private remainder = new Uint8Array();
   private terminalError: Error | null = null;
 
-  private constructor(private readonly socket: Socket) {
+  constructor(private readonly socket: Socket) {
     socket.on("data", (chunk: Buffer) => this.onData(new Uint8Array(chunk)));
     socket.on("error", (error) => this.fail(error));
     socket.on("close", () => this.fail(new WindowsSessionHostClientError("Windows session host pipe closed")));
@@ -89,34 +94,59 @@ class NodePipeConnection implements WindowsSessionHostWireConnection {
 
   async send(frame: Uint8Array): Promise<void> {
     if (this.terminalError || this.socket.destroyed || !this.socket.writable) throw this.terminalError ?? new WindowsSessionHostClientError("Windows session host pipe is unavailable");
-    await new Promise<void>((resolve, reject) => {
-      try { this.socket.write(frame, (error) => error ? reject(error) : resolve()); }
-      catch (error) { reject(error); }
-    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        try { this.socket.write(frame, (error) => error ? reject(error) : resolve()); }
+        catch (error) { reject(error); }
+      });
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      this.fail(failure);
+      throw failure;
+    }
   }
 
   receive(): Promise<SessionHostWireMessage> {
-    const frame = this.frames.shift();
-    if (frame) return Promise.resolve(decodeWireMessage(frame));
+    if (this.queuedReply !== null) {
+      const reply = this.queuedReply;
+      this.queuedReply = null;
+      return Promise.resolve(reply);
+    }
     if (this.terminalError) return Promise.reject(this.terminalError);
-    return new Promise<SessionHostWireMessage>((resolve, reject) => this.waiters.push({ resolve, reject }));
+    if (this.waiter !== null) {
+      const error = new WindowsSessionHostClientError("Windows session host allows only one pending reply");
+      this.fail(error);
+      return Promise.reject(error);
+    }
+    return new Promise<SessionHostWireMessage>((resolve, reject) => { this.waiter = { resolve, reject }; });
   }
 
-  detach(): void { this.socket.destroy(); }
+  detach(): void { this.fail(new WindowsSessionHostClientError("Windows session host pipe detached")); }
 
   private onData(chunk: Uint8Array): void {
     if (this.terminalError) return;
-    const merged = new Uint8Array(this.remainder.byteLength + chunk.byteLength);
-    merged.set(this.remainder);
-    merged.set(chunk, this.remainder.byteLength);
     try {
+      if (chunk.byteLength > MAX_WINDOWS_SESSION_HOST_FRAME_BYTES - this.remainder.byteLength) {
+        throw new WindowsSessionHostClientError("Windows session host frame exceeds maximum");
+      }
+      const merged = new Uint8Array(this.remainder.byteLength + chunk.byteLength);
+      merged.set(this.remainder);
+      merged.set(chunk, this.remainder.byteLength);
       const split = splitWireFrames(merged);
+      if (split.frames.length > 1 || (split.frames.length === 1 && this.queuedReply !== null)) {
+        throw new WindowsSessionHostClientError("Windows session host sent more than one unconsumed reply");
+      }
+      // Decode before consuming the waiter. A malformed frame must reject the
+      // current receive immediately, never strand it until its caller timeout.
+      const reply = split.frames.length === 1 ? decodeWireMessage(split.frames[0]!) : null;
       this.remainder = Uint8Array.from(split.remainder);
-      for (const frame of split.frames) {
-        if (frame.byteLength > MAX_FRAME_BYTES) throw new WindowsSessionHostClientError("Windows session host frame exceeds maximum");
-        const waiter = this.waiters.shift();
-        if (waiter) waiter.resolve(decodeWireMessage(frame));
-        else this.frames.push(frame);
+      if (reply === null) return;
+      const waiter = this.waiter;
+      if (waiter !== null) {
+        this.waiter = null;
+        waiter.resolve(reply);
+      } else {
+        this.queuedReply = reply;
       }
     } catch (error) { this.fail(error instanceof Error ? error : new Error(String(error))); }
   }
@@ -124,7 +154,12 @@ class NodePipeConnection implements WindowsSessionHostWireConnection {
   private fail(error: Error): void {
     if (this.terminalError) return;
     this.terminalError = error;
-    for (const waiter of this.waiters.splice(0)) waiter.reject(error);
+    this.remainder = new Uint8Array();
+    this.queuedReply = null;
+    const waiter = this.waiter;
+    this.waiter = null;
+    waiter?.reject(error);
+    if (!this.socket.destroyed) this.socket.destroy(error);
   }
 }
 
