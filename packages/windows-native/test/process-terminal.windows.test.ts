@@ -1,0 +1,305 @@
+import { execFile } from "node:child_process";
+import { access, mkdtemp, readFile, rm } from "node:fs/promises";
+import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { promisify } from "node:util";
+import { describe, expect, it } from "vitest";
+
+const execFileAsync = promisify(execFile);
+const require = createRequire(import.meta.url);
+const addonPath = resolve(process.cwd(), "build", "Release", "prospero_windows_native.node");
+
+type NativeProcessTerminalBinding = {
+  getAbiInfo(): { capabilities: Record<string, boolean> };
+  getParentJobCompatibility(): {
+    parentJobDetected: boolean;
+    breakawayAllowed: boolean;
+    detachedLaunchAllowed: boolean;
+  };
+  createJobObject(options: { killOnClose: boolean; activeProcessLimit?: number }): bigint;
+  assignProcessToJob(job: bigint, process: { pid: number; creationTime100ns: string }): void;
+  closeJobObject(job: bigint): void;
+  launchDetachedHost(options: {
+    executablePath: string;
+    arguments: string[];
+    workingDirectory?: string;
+    environment?: Record<string, string>;
+    job?: bigint;
+  }):
+    | { status: "launched"; process: { pid: number; creationTime100ns: string } }
+    | {
+        status: "parent_job_prevents_detach";
+        parentJob: { parentJobDetected: boolean; detachedLaunchAllowed: boolean };
+      };
+  spawnConPty(options: {
+    executablePath: string;
+    arguments: string[];
+    columns: number;
+    rows: number;
+    environment?: Record<string, string>;
+    job?: bigint;
+  }): bigint;
+  resizeConPty(terminal: bigint, columns: number, rows: number): void;
+  readConPty(terminal: bigint, maxBytes: number): Uint8Array;
+  writeConPty(terminal: bigint, data: Uint8Array): number;
+  killConPty(terminal: bigint, exitCode: number): void;
+  closeConPty(terminal: bigint): void;
+};
+
+const native = process.platform === "win32"
+  ? require(addonPath) as NativeProcessTerminalBinding
+  : undefined as unknown as NativeProcessTerminalBinding;
+const encoder = new TextEncoder();
+const describeWindows = process.platform === "win32" ? describe : describe.skip;
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
+}
+
+async function drainUntil(terminal: bigint, marker: string): Promise<string> {
+  const decoder = new TextDecoder();
+  let output = "";
+  for (let attempt = 0; attempt < 100; ++attempt) {
+    output += decoder.decode(native.readConPty(terminal, 16 * 1024), { stream: true });
+    if (output.includes(marker)) return output;
+    await delay(50);
+  }
+  return output + decoder.decode();
+}
+
+async function waitForExit(pid: number): Promise<void> {
+  for (let attempt = 0; attempt < 100; ++attempt) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+      throw error;
+    }
+    await delay(50);
+  }
+  throw new Error(`process ${pid} still exists after Job termination`);
+}
+
+async function isProcessInAnyJob(pid: number): Promise<boolean> {
+  const systemRoot = process.env.SystemRoot;
+  if (!systemRoot) throw new Error("SystemRoot is required for the Windows Job smoke check");
+  const powerShell = join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const script = [
+    "$signature = @'",
+    "using System;",
+    "using System.Runtime.InteropServices;",
+    "public static class ProsperoJobProbe {",
+    "  [DllImport(\"kernel32.dll\", SetLastError = true)] public static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, uint processId);",
+    "  [DllImport(\"kernel32.dll\", SetLastError = true)] public static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);",
+    "  [DllImport(\"kernel32.dll\", SetLastError = true)] public static extern bool CloseHandle(IntPtr handle);",
+    "}",
+    "'@",
+    "Add-Type -TypeDefinition $signature -ErrorAction Stop",
+    `$processHandle = [ProsperoJobProbe]::OpenProcess(0x1000, $false, ${pid})`,
+    "if ($processHandle -eq [IntPtr]::Zero) { throw 'OpenProcess failed' }",
+    "$inJob = $false",
+    "try {",
+    "  if (-not [ProsperoJobProbe]::IsProcessInJob($processHandle, [IntPtr]::Zero, [ref]$inJob)) { throw 'IsProcessInJob failed' }",
+    "  if ($inJob) { Write-Output 'true' } else { Write-Output 'false' }",
+    "} finally {",
+    "  [void][ProsperoJobProbe]::CloseHandle($processHandle)",
+    "}",
+  ].join("\n");
+  const { stdout } = await execFileAsync(powerShell, [
+    "-NoLogo",
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
+    script,
+  ]);
+  const result = stdout.trim();
+  if (result !== "true" && result !== "false") {
+    throw new Error(`unexpected IsProcessInJob result: ${result}`);
+  }
+  return result === "true";
+}
+
+describeWindows.sequential("Windows N-API Job Object, detached host, and ConPTY smoke", () => {
+  it("reports the merged native surface and rejects forged handles", () => {
+    const report = native.getAbiInfo();
+    expect(report.capabilities).toMatchObject({
+      jobObject: true,
+      parentJobCompatibility: true,
+      detachedHost: true,
+      conPty: true,
+      processIdentity: true,
+      secureNamedPipe: true,
+      dpapiCurrentUser: true,
+      secureStateDirectory: true,
+    });
+    expect(() => native.closeJobObject(987654321n)).toThrow(/unknown or closed/i);
+
+    const parent = native.getParentJobCompatibility();
+    expect(typeof parent.parentJobDetected).toBe("boolean");
+    expect(typeof parent.detachedLaunchAllowed).toBe("boolean");
+
+    const job = native.createJobObject({ killOnClose: true });
+    try {
+      // Windows returns ERROR_INVALID_PARAMETER for this nonzero nonexistent
+      // PID. The Job boundary must report the recoverable stale-PID outcome,
+      // not an opaque system error.
+      expect(() => native.assignProcessToJob(job, {
+        pid: 0x7fff_fffe,
+        creationTime100ns: "1",
+      })).toThrow(/not found/i);
+    } finally {
+      native.closeJobObject(job);
+    }
+    expect(() => native.closeJobObject(job)).toThrow(/unknown or closed/i);
+  });
+
+  it("keeps a launched detached host alive after its launcher exits when parent Job policy permits", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "prospero-native-host-"));
+    const marker = join(directory, "host-survived.txt");
+    const helperSource = [
+      "const { createRequire } = require('node:module');",
+      `const native = createRequire(${JSON.stringify(join(directory, "launcher.cjs"))})(${JSON.stringify(addonPath)});`,
+      `const result = native.launchDetachedHost({ executablePath: process.execPath, arguments: ['-e', ${JSON.stringify(`require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'alive'); setTimeout(() => process.exit(0), 3000)`)}], workingDirectory: ${JSON.stringify(directory)} });`,
+      "process.stdout.write(JSON.stringify(result));",
+    ].join("\n");
+    try {
+      const { stdout } = await execFileAsync(process.execPath, ["-e", helperSource], {
+        windowsHide: true,
+      });
+      const result = JSON.parse(stdout) as ReturnType<NativeProcessTerminalBinding["launchDetachedHost"]>;
+      if (result.status === "parent_job_prevents_detach") {
+        expect(result.parentJob.parentJobDetected).toBe(true);
+        expect(result.parentJob.detachedLaunchAllowed).toBe(false);
+        return;
+      }
+      expect(result.process.pid).toBeGreaterThan(0);
+      expect(result.process.creationTime100ns).toMatch(/^\d+$/);
+      for (let attempt = 0; attempt < 60; ++attempt) {
+        try {
+          await access(marker);
+          expect(await readFile(marker, "utf8")).toBe("alive");
+          // A successful response is valid only if the suspended child really
+          // escaped every inherited Job before it was resumed.
+          expect(await isProcessInAnyJob(result.process.pid)).toBe(false);
+          return;
+        } catch {
+          await delay(50);
+        }
+      }
+      throw new Error("detached host did not survive launcher exit long enough to write its marker");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("echoes UTF-8, resizes, and Job-kills the provider tree", async () => {
+    const providerSource = [
+      "const { spawn } = require('node:child_process');",
+      "const grandchild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });",
+      "process.stdout.write(`PIDS:${process.pid}:${grandchild.pid}\\n你好🙂\\n`);",
+      "process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data', (data) => process.stdout.write(`ECHO:${data}`));",
+      "setInterval(() => {}, 1000);",
+    ].join("\n");
+    const terminal = native.spawnConPty({
+      executablePath: process.execPath,
+      arguments: ["-e", providerSource],
+      columns: 80,
+      rows: 24,
+    });
+    try {
+      native.resizeConPty(terminal, 120, 40);
+      let output = await drainUntil(terminal, "你好");
+      expect(output).toContain("你好");
+      const written = native.writeConPty(terminal, encoder.encode("hello\n"));
+      expect(written).toBeGreaterThan(0);
+      output += await drainUntil(terminal, "ECHO:hello");
+      expect(output).toContain("ECHO:hello");
+
+      const match = output.match(/PIDS:(\d+):(\d+)/);
+      expect(match).not.toBeNull();
+      native.killConPty(terminal, 42);
+      await waitForExit(Number(match?.[1]));
+      await waitForExit(Number(match?.[2]));
+    } finally {
+      native.closeConPty(terminal);
+    }
+  });
+
+  it("rolls back an invalid ConPTY launch without returning a terminal handle", () => {
+    expect(() => native.spawnConPty({
+      executablePath: "C:\\definitely-missing-prospero-native.exe",
+      arguments: [],
+      columns: 80,
+      rows: 24,
+    })).toThrow();
+  });
+
+  it("uses an explicit double-NUL empty environment and rejects ambiguous or oversized blocks", async () => {
+    const inheritedProbe = "PROSPERO_NATIVE_ENV_INHERIT_PROBE";
+    const priorValue = process.env[inheritedProbe];
+    process.env[inheritedProbe] = "must-not-inherit";
+    const terminal = native.spawnConPty({
+      executablePath: process.execPath,
+      arguments: ["-e", `process.stdout.write(process.env.${inheritedProbe} === undefined ? 'EMPTY_ENV' : 'INHERITED_ENV')`],
+      columns: 80,
+      rows: 24,
+      environment: {},
+    });
+    try {
+      expect(await drainUntil(terminal, "ENV")).toContain("EMPTY_ENV");
+    } finally {
+      native.closeConPty(terminal);
+      if (priorValue === undefined) delete process.env[inheritedProbe];
+      else process.env[inheritedProbe] = priorValue;
+    }
+
+    expect(() => native.spawnConPty({
+      executablePath: process.execPath,
+      arguments: [],
+      columns: 80,
+      rows: 24,
+      environment: { Path: "one", PATH: "two" },
+    })).toThrow(/unique without regard to case/i);
+    expect(() => native.spawnConPty({
+      executablePath: process.execPath,
+      arguments: [],
+      columns: 80,
+      rows: 24,
+      environment: { PROSPERO_OVERSIZED: "x".repeat(32767) },
+    })).toThrow(/CreateProcessW UTF-16 limit/i);
+  });
+
+  it("rolls back a post-launch Job assignment failure without terminating the caller Job", async () => {
+    const job = native.createJobObject({ killOnClose: true, activeProcessLimit: 1 });
+    const providerSource = [
+      "process.stdout.write('READY\\n');",
+      "process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data', (data) => process.stdout.write(`ECHO:${data}`));",
+      "setInterval(() => {}, 1000);",
+    ].join("\n");
+    const first = native.spawnConPty({
+      executablePath: process.execPath,
+      arguments: ["-e", providerSource],
+      columns: 80,
+      rows: 24,
+      job,
+    });
+    try {
+      expect(await drainUntil(first, "READY")).toContain("READY");
+      expect(() => native.spawnConPty({
+        executablePath: process.execPath,
+        arguments: ["-e", providerSource],
+        columns: 80,
+        rows: 24,
+        job,
+      })).toThrow();
+      expect(native.writeConPty(first, encoder.encode("still-alive\\n"))).toBeGreaterThan(0);
+      expect(await drainUntil(first, "ECHO:still-alive")).toContain("ECHO:still-alive");
+    } finally {
+      native.closeConPty(first);
+      native.closeJobObject(job);
+    }
+  });
+});
