@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { createConnection } from "node:net";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
@@ -19,7 +18,6 @@ type RawBinding = {
   matchesProcessIdentity(identity: { pid: number; creationTime100ns: string }): boolean;
   createSecureNamedPipeServer(options: {
     pipeName: string;
-    allowedUserSid: string;
     maxInstances: number;
     inboundBufferBytes: number;
     outboundBufferBytes: number;
@@ -38,13 +36,6 @@ type RawBinding = {
 const binding = (process.platform === "win32" ? require(bindingPath) : undefined) as RawBinding;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
-
-function currentUserSid(): string {
-  const output = execFileSync("whoami", ["/user", "/fo", "csv", "/nh"], { encoding: "utf8" });
-  const sid = output.match(/S-1-\d+(?:-\d+)+/i)?.[0];
-  if (!sid) throw new Error("whoami did not return a current user SID");
-  return sid;
-}
 
 function waitForWorker(worker: Worker, expected: "ready" | "complete"): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
@@ -123,7 +114,7 @@ describe.runIf(process.platform === "win32")("Windows identity, secure pipe, DPA
   it("uses an explicit current-logon-SID DACL and verifies the accepted client identity", async () => {
     const pipeName = `\\\\.\\pipe\\prospero-native-smoke-${process.pid}-${randomUUID()}`;
     const worker = new Worker(new URL("./fixtures/native-pipe-server.mjs", import.meta.url), {
-      workerData: { bindingPath, pipeName, userSid: currentUserSid() },
+      workerData: { bindingPath, pipeName },
     });
     const completePromise = waitForWorker(worker, "complete");
     await waitForWorker(worker, "ready");
@@ -142,11 +133,11 @@ describe.runIf(process.platform === "win32")("Windows identity, secure pipe, DPA
     expect(complete.preReadPeerRejected).toBe(true);
     expect(peer.process.pid).toBe(process.pid);
     expect(peer.process.creationTime100ns).toMatch(/^[1-9]\d*$/);
-    expect(peer.userSid).toBe(currentUserSid());
+    expect(peer.userSid).toMatch(/^S-1-\d+(?:-\d+)+$/i);
     await worker.terminate();
   });
 
-  it("rejects a pipe SID that is not the current identity before endpoint publication", () => {
+  it("derives TokenUser internally and rejects caller-selected SID or invalid pipe names", () => {
     const pipeName = `\\\\.\\pipe\\prospero-native-negative-${process.pid}-${randomUUID()}`;
     expect(() => binding.createSecureNamedPipeServer({
       pipeName,
@@ -154,10 +145,21 @@ describe.runIf(process.platform === "win32")("Windows identity, secure pipe, DPA
       maxInstances: 1,
       inboundBufferBytes: 4096,
       outboundBufferBytes: 4096,
-    })).toThrow(/security validation/i);
+    } as unknown as Parameters<RawBinding["createSecureNamedPipeServer"]>[0])).toThrow(/invalid argument/i);
     expect(() => binding.createSecureNamedPipeServer({
       pipeName: "\\\\remote-host\\pipe\\prospero-native-negative",
-      allowedUserSid: currentUserSid(),
+      maxInstances: 1,
+      inboundBufferBytes: 4096,
+      outboundBufferBytes: 4096,
+    })).toThrow(/invalid argument/i);
+    expect(() => binding.createSecureNamedPipeServer({
+      pipeName: `\\\\.\\pipe\\${"x".repeat(257)}`,
+      maxInstances: 1,
+      inboundBufferBytes: 4096,
+      outboundBufferBytes: 4096,
+    })).toThrow(/invalid argument/i);
+    expect(() => binding.createSecureNamedPipeServer({
+      pipeName: "\\\\.\\pipe\\prospero/escape",
       maxInstances: 1,
       inboundBufferBytes: 4096,
       outboundBufferBytes: 4096,

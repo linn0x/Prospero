@@ -88,6 +88,14 @@ bool GetNamed(napi_env env, napi_value object, const char* name, napi_value* out
          napi_get_named_property(env, object, name, out) == napi_ok;
 }
 
+/** Reject legacy/caller-selected security inputs instead of silently ignoring them. */
+#if defined(_WIN32)
+bool DoesNotHaveNamed(napi_env env, napi_value object, const char* name) {
+  bool present = false;
+  return napi_has_named_property(env, object, name, &present) == napi_ok && !present;
+}
+#endif
+
 bool GetUtf16(napi_env env, napi_value value, std::wstring* out) {
   napi_valuetype type = napi_undefined;
   if (napi_typeof(env, value, &type) != napi_ok || type != napi_string) return false;
@@ -421,15 +429,13 @@ napi_value CreateSecureNamedPipeServer(napi_env env, napi_callback_info info) {
   napi_value inbound_value = nullptr;
   napi_value outbound_value = nullptr;
   std::wstring pipe_name;
-  std::wstring allowed_sid;
   uint32_t max_instances = 0;
   uint32_t inbound = 0;
   uint32_t outbound = 0;
   if (!GetArguments(env, info, 1, argv, &argc) || argc != 1 || !IsObject(env, argv[0]) ||
       !GetNamed(env, argv[0], "pipeName", &pipe_name_value) ||
       !GetUtf16(env, pipe_name_value, &pipe_name) || !IsFullLocalPipeName(pipe_name) ||
-      !GetNamed(env, argv[0], "allowedUserSid", &allowed_sid_value) ||
-      !GetUtf16(env, allowed_sid_value, &allowed_sid) || allowed_sid.empty() ||
+      !DoesNotHaveNamed(env, argv[0], "allowedUserSid") ||
       !GetNamed(env, argv[0], "maxInstances", &max_instances_value) ||
       !GetUint32(env, max_instances_value, &max_instances) || max_instances == 0 ||
       !GetNamed(env, argv[0], "inboundBufferBytes", &inbound_value) ||
@@ -456,7 +462,7 @@ napi_value CreateSecureNamedPipeServer(napi_env env, napi_callback_info info) {
   options.pipe_name = pipe_name.c_str();
   options.security.self_relative_security_descriptor = descriptor;
   options.security.security_descriptor_bytes = descriptor_bytes;
-  options.security.allowed_user_sid = allowed_sid.c_str();
+  options.security.reserved_legacy_allowed_user_sid = nullptr;
   options.max_instances = max_instances;
   options.inbound_buffer_bytes = inbound;
   options.outbound_buffer_bytes = outbound;

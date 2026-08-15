@@ -22,6 +22,14 @@ namespace {
 constexpr uint32_t kMaximumSecurityDescriptorBytes = 64U * 1024U;
 constexpr size_t kMaximumPipeNameChars = 256;
 
+// Keep ABI v2's historical third pointer slot. The semantic contract changed
+// to native TokenUser derivation, but changing this struct's layout would make
+// a v2 addon compiled against an older header read later fields at bad offsets.
+static_assert(
+    offsetof(prospero_secure_pipe_security, reserved_legacy_allowed_user_sid) ==
+        ((sizeof(void*) + sizeof(uint32_t) + alignof(void*) - 1) & ~(alignof(void*) - 1)),
+    "prospero_secure_pipe_security must retain the ABI-v2 legacy SID slot");
+
 prospero_status StatusFromLastError(DWORD error);
 
 struct TokenIdentity {
@@ -127,7 +135,6 @@ class PipeIoLease {
 struct PipeServer {
   std::mutex mutex;
   std::wstring pipe_name;
-  std::wstring allowed_user_sid;
   std::vector<BYTE> security_descriptor;
   TokenIdentity owner;
   DWORD max_instances = 0;
@@ -270,15 +277,6 @@ bool QueryCurrentTokenIdentity(TokenIdentity* output) {
 bool SidsEqual(const std::vector<BYTE>& left, const std::vector<BYTE>& right) {
   return !left.empty() && !right.empty() &&
          EqualSid(const_cast<BYTE*>(left.data()), const_cast<BYTE*>(right.data())) != FALSE;
-}
-
-bool StringSidMatches(const wchar_t* string_sid, const std::vector<BYTE>& expected_sid) {
-  if (string_sid == nullptr || expected_sid.empty()) return false;
-  PSID parsed = nullptr;
-  if (!ConvertStringSidToSidW(string_sid, &parsed) || parsed == nullptr) return false;
-  const bool matches = EqualSid(parsed, const_cast<BYTE*>(expected_sid.data())) != FALSE;
-  LocalFree(parsed);
-  return matches;
 }
 
 bool IsStrictLocalPipeName(const wchar_t* value) {
@@ -523,11 +521,10 @@ extern "C" prospero_status prospero_secure_pipe_server_create(
     prospero_secure_pipe_server_handle* out_server) {
   if (out_server != nullptr) *out_server = 0;
   if (options == nullptr || out_server == nullptr || !IsStrictLocalPipeName(options->pipe_name) ||
-      options->security.allowed_user_sid == nullptr ||
-      options->security.allowed_user_sid[0] == L'\0' ||
       options->security.self_relative_security_descriptor == nullptr ||
       options->security.security_descriptor_bytes == 0 ||
       options->security.security_descriptor_bytes > kMaximumSecurityDescriptorBytes ||
+      options->security.reserved_legacy_allowed_user_sid != nullptr ||
       options->max_instances == 0 ||
       options->max_instances > PIPE_UNLIMITED_INSTANCES) {
     return PROSPERO_STATUS_INVALID_ARGUMENT;
@@ -539,15 +536,16 @@ extern "C" prospero_status prospero_secure_pipe_server_create(
         static_cast<const BYTE*>(options->security.self_relative_security_descriptor),
         static_cast<const BYTE*>(options->security.self_relative_security_descriptor) +
             options->security.security_descriptor_bytes);
-    if (!StringSidMatches(options->security.allowed_user_sid, current.user_sid) ||
-        !IsExplicitCurrentLogonDacl(security_descriptor.data(),
+    // TokenUser is queried from this native process, never supplied by the
+    // caller or a manifest. The descriptor itself must grant exactly this
+    // process token's current logon SID.
+    if (!IsExplicitCurrentLogonDacl(security_descriptor.data(),
                                     static_cast<uint32_t>(security_descriptor.size()),
                                     current.logon_sid)) {
       return PROSPERO_STATUS_ACCESS_DENIED;
     }
     auto server = std::make_shared<PipeServer>();
     server->pipe_name = options->pipe_name;
-    server->allowed_user_sid = options->security.allowed_user_sid;
     server->owner = std::move(current);
     server->max_instances = options->max_instances;
     server->inbound_buffer_bytes = options->inbound_buffer_bytes;
@@ -784,9 +782,9 @@ extern "C" prospero_status prospero_secure_pipe_server_create(
     prospero_secure_pipe_server_handle* out_server) {
   if (out_server != nullptr) *out_server = 0;
   if (options == nullptr || out_server == nullptr || options->pipe_name == nullptr ||
-      options->security.allowed_user_sid == nullptr ||
       options->security.self_relative_security_descriptor == nullptr ||
-      options->security.security_descriptor_bytes == 0) {
+      options->security.security_descriptor_bytes == 0 ||
+      options->security.reserved_legacy_allowed_user_sid != nullptr) {
     return PROSPERO_STATUS_INVALID_ARGUMENT;
   }
   return PROSPERO_STATUS_NOT_AVAILABLE;
