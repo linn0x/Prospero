@@ -168,6 +168,20 @@ typedef enum prospero_secure_state_write_stage {
   PROSPERO_SECURE_STATE_WRITE_STAGE_CLEANUP = 9,
 } prospero_secure_state_write_stage;
 
+/**
+ * A path/content-free category for the last native atomic-write Win32 error.
+ * It is useful for diagnostics without exposing a state location, filename,
+ * bytes, or a raw OS error value.
+ */
+typedef enum prospero_secure_state_write_error_category {
+  PROSPERO_SECURE_STATE_WRITE_ERROR_NONE = 0,
+  PROSPERO_SECURE_STATE_WRITE_ERROR_ACCESS_DENIED = 1,
+  PROSPERO_SECURE_STATE_WRITE_ERROR_INVALID_PARAMETER = 2,
+  PROSPERO_SECURE_STATE_WRITE_ERROR_NOT_FOUND = 3,
+  PROSPERO_SECURE_STATE_WRITE_ERROR_SHARING_VIOLATION = 4,
+  PROSPERO_SECURE_STATE_WRITE_ERROR_OTHER = 5,
+} prospero_secure_state_write_error_category;
+
 prospero_status prospero_query_capability_report(prospero_capability_report* out_report);
 
 prospero_status prospero_get_current_process_identity(prospero_process_identity* out_identity);
@@ -284,6 +298,13 @@ prospero_status prospero_secure_state_directory_write_atomic(
  * on the same thread.
  */
 prospero_secure_state_write_stage prospero_secure_state_directory_last_write_stage(void);
+/**
+ * Returns only a coarse Win32 error category for the last write on this
+ * thread. It intentionally exposes no state path, filename, bytes, or raw OS
+ * error value.
+ */
+prospero_secure_state_write_error_category
+prospero_secure_state_directory_last_write_error_category(void);
 /**
  * Reads one direct state-file name. `file_name` must be a non-empty single
  * segment: no dot segment, separator, ADS colon, DOS device name, or reparse

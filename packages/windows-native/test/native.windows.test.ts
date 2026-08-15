@@ -331,15 +331,25 @@ function nativePipeWorkerFailure(terminal: NativePipeWorkerTerminal): Error | un
   return new Error(`${name} at ${phase}${code}: ${message}`);
 }
 
-function nativeErrorCode(action: () => unknown): string {
+type NativeWriteError = Error & {
+  readonly code?: unknown;
+  readonly win32ErrorCategory?: unknown;
+};
+
+function captureNativeError(action: () => unknown): NativeWriteError {
   try {
     action();
   } catch (error) {
-    const code = error && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
-    if (typeof code === "string") return code;
+    if (error instanceof Error) return error as NativeWriteError;
     throw error;
   }
   throw new Error("expected a native error");
+}
+
+function nativeErrorCode(action: () => unknown): string {
+  const code = captureNativeError(action).code;
+  if (typeof code === "string") return code;
+  throw new Error("expected native error code");
 }
 
 describe.runIf(process.platform === "win32")("Windows identity, secure pipe, DPAPI, and state addon", () => {
@@ -376,7 +386,7 @@ describe.runIf(process.platform === "win32")("Windows identity, secure pipe, DPA
       .dpapiProtectCurrentUser(plaintext)).toThrow(/invalid argument/i);
   });
 
-  it("round-trips and atomically replaces state in a reparse-free current-user-only directory", () => {
+  it("first-writes, round-trips, and atomically replaces state in a reparse-free current-user-only directory", () => {
     const directoryPath = mkdtempSync(join(tmpdir(), "prospero-native-state-"));
     directories.push(directoryPath);
     const missingParent = join(directoryPath, "must-not-create");
@@ -396,9 +406,15 @@ describe.runIf(process.platform === "win32")("Windows identity, secure pipe, DPA
         writeSecureStateFileAtomically(directory: number, fileName: string, data: Uint8Array): void;
       }).writeSecureStateFileAtomically(Number(directory), "manifest.json", encoder.encode("x"))))
         .toBe("PROSPERO_NATIVE_INVALID_ARGUMENT");
-      expect(nativeErrorCode(() => binding.writeSecureStateFileAtomically(
-        directory, "../escape", encoder.encode("x"),
-      ))).toBe("PROSPERO_NATIVE_SECURE_STATE_WRITE_VALIDATE");
+      const rejectedName = "../state-path-must-not-appear";
+      const rejectedContents = "state-bytes-must-not-appear";
+      const rejectedWrite = captureNativeError(() => binding.writeSecureStateFileAtomically(
+        directory, rejectedName, encoder.encode(rejectedContents),
+      ));
+      expect(rejectedWrite.code).toBe("PROSPERO_NATIVE_SECURE_STATE_WRITE_VALIDATE");
+      expect(rejectedWrite.win32ErrorCategory).toBe("none");
+      expect(rejectedWrite.message).not.toContain(rejectedName);
+      expect(rejectedWrite.message).not.toContain(rejectedContents);
       expect(() => binding.readSecureStateFile(directory, "state:ads")).toThrow(/invalid argument/i);
       expect(() => binding.readSecureStateFile(directory, "COM\u00b9.json")).toThrow(/invalid argument/i);
       expect(() => binding.readSecureStateFile(directory, "LPT\u00b2")).toThrow(/invalid argument/i);

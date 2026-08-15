@@ -169,6 +169,8 @@ std::atomic<uint64_t> g_next_state_handle{1};
 std::atomic<uint64_t> g_temp_counter{1};
 thread_local prospero_secure_state_write_stage g_last_write_stage =
     PROSPERO_SECURE_STATE_WRITE_STAGE_NONE;
+thread_local prospero_secure_state_write_error_category g_last_write_error_category =
+    PROSPERO_SECURE_STATE_WRITE_ERROR_NONE;
 
 static_assert(sizeof(HANDLE) == sizeof(uint64_t),
               "secure state writes require Windows x64 or arm64 handles");
@@ -192,10 +194,33 @@ static_assert(sizeof(FILE_RENAME_INFO) ==
                   sizeof(prospero_file_rename_layout::Windows64FileRenameInfo),
               "SDK FILE_RENAME_INFO size changed");
 
-prospero_status WriteFailure(prospero_secure_state_write_stage stage,
-                             prospero_status status) {
+prospero_status WriteFailure(
+    prospero_secure_state_write_stage stage,
+    prospero_status status,
+    prospero_secure_state_write_error_category error_category =
+        PROSPERO_SECURE_STATE_WRITE_ERROR_NONE) {
   g_last_write_stage = stage;
+  g_last_write_error_category = error_category;
   return status;
+}
+
+prospero_secure_state_write_error_category Win32ErrorCategory(DWORD error) {
+  switch (error) {
+    case ERROR_ACCESS_DENIED:
+      return PROSPERO_SECURE_STATE_WRITE_ERROR_ACCESS_DENIED;
+    case ERROR_INVALID_PARAMETER:
+    case ERROR_INVALID_NAME:
+      return PROSPERO_SECURE_STATE_WRITE_ERROR_INVALID_PARAMETER;
+    case ERROR_FILE_NOT_FOUND:
+    case ERROR_PATH_NOT_FOUND:
+    case ERROR_INVALID_HANDLE:
+      return PROSPERO_SECURE_STATE_WRITE_ERROR_NOT_FOUND;
+    case ERROR_SHARING_VIOLATION:
+    case ERROR_LOCK_VIOLATION:
+      return PROSPERO_SECURE_STATE_WRITE_ERROR_SHARING_VIOLATION;
+    default:
+      return PROSPERO_SECURE_STATE_WRITE_ERROR_OTHER;
+  }
 }
 
 bool NtSucceeded(NtStatus status) { return status >= 0; }
@@ -658,6 +683,7 @@ extern "C" prospero_status prospero_secure_state_directory_write_atomic(
     const uint8_t* data,
     uint32_t length) {
   g_last_write_stage = PROSPERO_SECURE_STATE_WRITE_STAGE_NONE;
+  g_last_write_error_category = PROSPERO_SECURE_STATE_WRITE_ERROR_NONE;
   if (directory_handle == 0 || !IsStrictStateFileName(file_name) || data == nullptr || length == 0) {
     return WriteFailure(PROSPERO_SECURE_STATE_WRITE_STAGE_VALIDATE,
                         PROSPERO_STATUS_INVALID_ARGUMENT);
@@ -749,14 +775,16 @@ extern "C" prospero_status prospero_secure_state_directory_write_atomic(
     while (offset < length) {
       DWORD written = 0;
       if (!WriteFile(temporary, data + offset, length - offset, &written, nullptr)) {
-        const prospero_status write_status = StatusFromLastError(GetLastError());
+        const DWORD write_error = GetLastError();
+        const prospero_status write_status = StatusFromLastError(write_error);
         const prospero_status cleanup = CleanupTemporaryFile(temporary);
         temporary = INVALID_HANDLE_VALUE;
         return WriteFailure(cleanup == PROSPERO_STATUS_OK
                                 ? PROSPERO_SECURE_STATE_WRITE_STAGE_WRITE
                                 : PROSPERO_SECURE_STATE_WRITE_STAGE_CLEANUP,
                             cleanup == PROSPERO_STATUS_OK ? write_status
-                                                           : PROSPERO_STATUS_SYSTEM_ERROR);
+                                                           : PROSPERO_STATUS_SYSTEM_ERROR,
+                            Win32ErrorCategory(write_error));
       }
       if (written == 0) {
         const prospero_status cleanup = CleanupTemporaryFile(temporary);
@@ -769,14 +797,16 @@ extern "C" prospero_status prospero_secure_state_directory_write_atomic(
       offset += written;
     }
     if (!FlushFileBuffers(temporary)) {
-      const prospero_status flush_status = StatusFromLastError(GetLastError());
+      const DWORD flush_error = GetLastError();
+      const prospero_status flush_status = StatusFromLastError(flush_error);
       const prospero_status cleanup = CleanupTemporaryFile(temporary);
       temporary = INVALID_HANDLE_VALUE;
       return WriteFailure(cleanup == PROSPERO_STATUS_OK
                               ? PROSPERO_SECURE_STATE_WRITE_STAGE_FLUSH
                               : PROSPERO_SECURE_STATE_WRITE_STAGE_CLEANUP,
                           cleanup == PROSPERO_STATUS_OK ? flush_status
-                                                         : PROSPERO_STATUS_SYSTEM_ERROR);
+                                                         : PROSPERO_STATUS_SYSTEM_ERROR,
+                          Win32ErrorCategory(flush_error));
     }
 
     const size_t file_name_characters = wcslen(file_name);
@@ -806,22 +836,29 @@ extern "C" prospero_status prospero_secure_state_directory_write_atomic(
     }
     std::vector<BYTE> rename_storage(rename_bytes, 0);
     FILE_RENAME_INFO* rename = reinterpret_cast<FILE_RENAME_INFO*>(rename_storage.data());
-    rename->ReplaceIfExists = TRUE;
-    // Keep the target relative to the retained, already reparse-checked state
-    // directory handle. A full path or NULL root would weaken that boundary.
-    rename->RootDirectory = directory->directory;
-    rename->FileNameLength = static_cast<DWORD>(file_name_bytes);
+    const auto rename_request =
+        prospero_file_rename_layout::MakeSameDirectoryRenameRequest<HANDLE>(
+            static_cast<DWORD>(file_name_bytes));
+    rename->ReplaceIfExists = rename_request.replace_if_exists == 0 ? FALSE : TRUE;
+    // FileName is a strictly validated simple name. Per FILE_RENAME_INFO,
+    // NULL means rename the already-open temporary file within its current
+    // directory. That current directory is securely anchored by the temp file
+    // itself, which was created relative to the verified directory handle.
+    rename->RootDirectory = rename_request.root_directory;
+    rename->FileNameLength = rename_request.file_name_length;
     memcpy(rename->FileName, file_name, file_name_bytes);
     if (!SetFileInformationByHandle(temporary, FileRenameInfo, rename,
                                     static_cast<DWORD>(rename_storage.size()))) {
-      const prospero_status rename_status = StatusFromLastError(GetLastError());
+      const DWORD rename_error = GetLastError();
+      const prospero_status rename_status = StatusFromLastError(rename_error);
       const prospero_status cleanup = CleanupTemporaryFile(temporary);
       temporary = INVALID_HANDLE_VALUE;
       return WriteFailure(cleanup == PROSPERO_STATUS_OK
                               ? PROSPERO_SECURE_STATE_WRITE_STAGE_RENAME
                               : PROSPERO_SECURE_STATE_WRITE_STAGE_CLEANUP,
                           cleanup == PROSPERO_STATUS_OK ? rename_status
-                                                         : PROSPERO_STATUS_SYSTEM_ERROR);
+                                                         : PROSPERO_STATUS_SYSTEM_ERROR,
+                          Win32ErrorCategory(rename_error));
     }
     CloseHandle(temporary);
     temporary = INVALID_HANDLE_VALUE;
@@ -836,6 +873,11 @@ extern "C" prospero_status prospero_secure_state_directory_write_atomic(
 extern "C" prospero_secure_state_write_stage
 prospero_secure_state_directory_last_write_stage(void) {
   return g_last_write_stage;
+}
+
+extern "C" prospero_secure_state_write_error_category
+prospero_secure_state_directory_last_write_error_category(void) {
+  return g_last_write_error_category;
 }
 
 extern "C" prospero_status prospero_secure_state_directory_read(
@@ -1013,10 +1055,16 @@ namespace {
 
 thread_local prospero_secure_state_write_stage g_last_write_stage =
     PROSPERO_SECURE_STATE_WRITE_STAGE_NONE;
+thread_local prospero_secure_state_write_error_category g_last_write_error_category =
+    PROSPERO_SECURE_STATE_WRITE_ERROR_NONE;
 
-prospero_status WriteFailure(prospero_secure_state_write_stage stage,
-                             prospero_status status) {
+prospero_status WriteFailure(
+    prospero_secure_state_write_stage stage,
+    prospero_status status,
+    prospero_secure_state_write_error_category error_category =
+        PROSPERO_SECURE_STATE_WRITE_ERROR_NONE) {
   g_last_write_stage = stage;
+  g_last_write_error_category = error_category;
   return status;
 }
 
@@ -1038,6 +1086,7 @@ extern "C" prospero_status prospero_secure_state_directory_write_atomic(
     const uint8_t* data,
     uint32_t length) {
   g_last_write_stage = PROSPERO_SECURE_STATE_WRITE_STAGE_NONE;
+  g_last_write_error_category = PROSPERO_SECURE_STATE_WRITE_ERROR_NONE;
   if (directory == 0 || !IsStrictStateFileName(file_name) || data == nullptr || length == 0) {
     return WriteFailure(PROSPERO_SECURE_STATE_WRITE_STAGE_VALIDATE,
                         PROSPERO_STATUS_INVALID_ARGUMENT);
@@ -1049,6 +1098,11 @@ extern "C" prospero_status prospero_secure_state_directory_write_atomic(
 extern "C" prospero_secure_state_write_stage
 prospero_secure_state_directory_last_write_stage(void) {
   return g_last_write_stage;
+}
+
+extern "C" prospero_secure_state_write_error_category
+prospero_secure_state_directory_last_write_error_category(void) {
+  return g_last_write_error_category;
 }
 
 extern "C" prospero_status prospero_secure_state_directory_read(
