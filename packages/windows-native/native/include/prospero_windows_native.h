@@ -169,9 +169,9 @@ typedef enum prospero_secure_state_write_stage {
 } prospero_secure_state_write_stage;
 
 /**
- * A path/content-free category for the last native atomic-write Win32 error.
+ * A path/content-free category for the last native atomic-write OS failure.
  * It is useful for diagnostics without exposing a state location, filename,
- * bytes, or a raw OS error value.
+ * bytes, or a raw Win32/NT status value.
  */
 typedef enum prospero_secure_state_write_error_category {
   PROSPERO_SECURE_STATE_WRITE_ERROR_NONE = 0,
@@ -180,6 +180,8 @@ typedef enum prospero_secure_state_write_error_category {
   PROSPERO_SECURE_STATE_WRITE_ERROR_NOT_FOUND = 3,
   PROSPERO_SECURE_STATE_WRITE_ERROR_SHARING_VIOLATION = 4,
   PROSPERO_SECURE_STATE_WRITE_ERROR_OTHER = 5,
+  PROSPERO_SECURE_STATE_WRITE_ERROR_NOT_SAME_DEVICE = 6,
+  PROSPERO_SECURE_STATE_WRITE_ERROR_NOT_SUPPORTED = 7,
 } prospero_secure_state_write_error_category;
 
 prospero_status prospero_query_capability_report(prospero_capability_report* out_report);

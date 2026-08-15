@@ -137,6 +137,12 @@ napi_value ThrowSecureStateWriteFailure(
     case PROSPERO_SECURE_STATE_WRITE_ERROR_SHARING_VIOLATION:
       error_category_name = "sharing-violation";
       break;
+    case PROSPERO_SECURE_STATE_WRITE_ERROR_NOT_SAME_DEVICE:
+      error_category_name = "not-same-device";
+      break;
+    case PROSPERO_SECURE_STATE_WRITE_ERROR_NOT_SUPPORTED:
+      error_category_name = "not-supported";
+      break;
     case PROSPERO_SECURE_STATE_WRITE_ERROR_OTHER:
     default:
       break;
