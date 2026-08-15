@@ -39,6 +39,8 @@ const decoder = new TextDecoder();
 
 const CANCELLATION_TIMEOUT_MS = 5_000;
 const PIPE_ROUND_TRIP_TIMEOUT_MS = 10_000;
+const PIPE_ROUND_TRIP_REQUEST = Buffer.from("pipe-round-trip");
+const PIPE_ROUND_TRIP_ACK = Buffer.from("pipe-round-trip-ack");
 
 function waitForWorkerMessage(worker: Worker, expected: string, timeoutMs = 10_000): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
@@ -98,6 +100,15 @@ type NativePipeWorkerTerminal =
 type PipeRoundTripResult =
   | { readonly kind: "response"; readonly data: Buffer }
   | { readonly kind: "error"; readonly error: Error };
+
+function socketFailure(stage: string, cause?: unknown): Error {
+  const socketError = cause && typeof cause === "object" ? cause as NodeJS.ErrnoException : undefined;
+  const code = typeof socketError?.code === "string" ? socketError.code : undefined;
+  const detail = cause instanceof Error ? `: ${cause.message}` : "";
+  const error = new Error(`Named pipe ${stage}${code ? ` (${code})` : ""}${detail}`);
+  if (code) Object.assign(error, { code });
+  return error;
+}
 
 /**
  * A socket EPIPE is only a symptom when the native worker closed its endpoint.
@@ -166,17 +177,68 @@ function readPipeRoundTrip(pipeName: string, timeoutMs = PIPE_ROUND_TRIP_TIMEOUT
     let settled = false;
     const socket = createConnection(pipeName);
     let timeout: ReturnType<typeof setTimeout> | undefined;
+    let response = Buffer.alloc(0);
+    let acknowledgementStarted = false;
+    let acknowledgementFlushed = false;
+    let serverClosed = false;
     const onConnect = () => {
       try {
-        socket.write(Buffer.from("pipe-round-trip"));
+        socket.write(PIPE_ROUND_TRIP_REQUEST, (error) => {
+          if (error) finish({ kind: "error", error: socketFailure("request write failed", error) });
+        });
       } catch (error) {
-        finish({ kind: "error", error: error instanceof Error ? error : new Error(String(error)) });
+        finish({ kind: "error", error: socketFailure("request write threw", error) });
       }
     };
-    const onData = (data: Buffer) => finish({ kind: "response", data });
-    const onError = (error: Error) => finish({ kind: "error", error });
-    const onEnd = () => finish({ kind: "error", error: new Error("Named pipe ended before roundtrip response") });
-    const onClose = () => finish({ kind: "error", error: new Error("Named pipe closed before roundtrip response") });
+    const finishOrderedResponse = () => {
+      if (acknowledgementFlushed && serverClosed) finish({ kind: "response", data: response });
+    };
+    const onData = (data: Buffer) => {
+      if (acknowledgementStarted) {
+        finish({ kind: "error", error: socketFailure("sent extra data after the roundtrip response") });
+        return;
+      }
+      response = Buffer.concat([response, data]);
+      if (response.byteLength > PIPE_ROUND_TRIP_REQUEST.byteLength ||
+        !PIPE_ROUND_TRIP_REQUEST.subarray(0, response.byteLength).equals(response)) {
+        finish({ kind: "error", error: socketFailure("returned an invalid roundtrip response") });
+        return;
+      }
+      if (response.byteLength !== PIPE_ROUND_TRIP_REQUEST.byteLength) return;
+      acknowledgementStarted = true;
+      try {
+        // The write callback confirms the ACK was handed to the OS. The
+        // server's next native read is the delivery acknowledgement that
+        // permits DisconnectNamedPipe; no sleep or EPIPE suppression exists.
+        socket.write(PIPE_ROUND_TRIP_ACK, (error) => {
+          if (error) {
+            finish({ kind: "error", error: socketFailure("acknowledgement write failed", error) });
+            return;
+          }
+          acknowledgementFlushed = true;
+          finishOrderedResponse();
+        });
+      } catch (error) {
+        finish({ kind: "error", error: socketFailure("acknowledgement write threw", error) });
+      }
+    };
+    const onError = (error: Error) => finish({ kind: "error", error: socketFailure("socket error", error) });
+    const onEnd = () => {
+      serverClosed = true;
+      if (!acknowledgementStarted) {
+        finish({ kind: "error", error: socketFailure("ended before the roundtrip response") });
+        return;
+      }
+      finishOrderedResponse();
+    };
+    const onClose = () => {
+      serverClosed = true;
+      if (!acknowledgementStarted) {
+        finish({ kind: "error", error: socketFailure("closed before the roundtrip response") });
+        return;
+      }
+      finishOrderedResponse();
+    };
     const cleanup = () => {
       if (timeout !== undefined) clearTimeout(timeout);
       socket.off("connect", onConnect);
@@ -197,7 +259,62 @@ function readPipeRoundTrip(pipeName: string, timeoutMs = PIPE_ROUND_TRIP_TIMEOUT
       timeoutMs,
     );
     socket.once("connect", onConnect);
-    socket.once("data", onData);
+    socket.on("data", onData);
+    socket.once("error", onError);
+    socket.once("end", onEnd);
+    socket.once("close", onClose);
+  });
+}
+
+/** Read the echo then deliberately abort before the required ACK. */
+function readPipeResponseThenDisconnect(pipeName: string, timeoutMs = PIPE_ROUND_TRIP_TIMEOUT_MS): Promise<PipeRoundTripResult> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const socket = createConnection(pipeName);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let response = Buffer.alloc(0);
+    const cleanup = () => {
+      if (timeout !== undefined) clearTimeout(timeout);
+      socket.off("connect", onConnect);
+      socket.off("data", onData);
+      socket.off("error", onError);
+      socket.off("end", onEnd);
+      socket.off("close", onClose);
+    };
+    const finish = (result: PipeRoundTripResult) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (!socket.destroyed) socket.destroy();
+      resolve(result);
+    };
+    const onConnect = () => {
+      try {
+        socket.write(PIPE_ROUND_TRIP_REQUEST, (error) => {
+          if (error) finish({ kind: "error", error: socketFailure("request write failed", error) });
+        });
+      } catch (error) {
+        finish({ kind: "error", error: socketFailure("request write threw", error) });
+      }
+    };
+    const onData = (data: Buffer) => {
+      response = Buffer.concat([response, data]);
+      if (response.byteLength > PIPE_ROUND_TRIP_REQUEST.byteLength ||
+        !PIPE_ROUND_TRIP_REQUEST.subarray(0, response.byteLength).equals(response)) {
+        finish({ kind: "error", error: socketFailure("returned an invalid roundtrip response") });
+        return;
+      }
+      if (response.byteLength === PIPE_ROUND_TRIP_REQUEST.byteLength) finish({ kind: "response", data: response });
+    };
+    const onError = (error: Error) => finish({ kind: "error", error: socketFailure("socket error", error) });
+    const onEnd = () => finish({ kind: "error", error: socketFailure("ended before the roundtrip response") });
+    const onClose = () => finish({ kind: "error", error: socketFailure("closed before the roundtrip response") });
+    timeout = setTimeout(
+      () => finish({ kind: "error", error: socketFailure(`roundtrip timed out after ${timeoutMs}ms`) }),
+      timeoutMs,
+    );
+    socket.once("connect", onConnect);
+    socket.on("data", onData);
     socket.once("error", onError);
     socket.once("end", onEnd);
     socket.once("close", onClose);
@@ -281,10 +398,12 @@ describe.runIf(process.platform === "win32")("Windows identity, secure pipe, DPA
       const observer = observeNativePipeWorker(worker);
       await observer.ready;
       const [roundTrip, terminal] = await Promise.all([readPipeRoundTrip(pipeName), observer.terminal]);
+      // Fail with the client socket's original code before an assertion can
+      // hide it behind an expected/unexpected-result diff.
+      if (roundTrip.kind !== "response") throw roundTrip.error;
       const workerFailure = nativePipeWorkerFailure(terminal);
       if (workerFailure) throw workerFailure;
       expect(roundTrip.kind).toBe("response");
-      if (roundTrip.kind !== "response") throw roundTrip.error;
       expect(roundTrip.data.toString("utf8")).toBe("pipe-round-trip");
       const peer = terminal.peer as {
         process: { pid: number; creationTime100ns: string };
@@ -298,6 +417,31 @@ describe.runIf(process.platform === "win32")("Windows identity, secure pipe, DPA
       expect(peer.userSid).toMatch(/^S-1-\d+(?:-\d+)+$/i);
       expect(peer.sessionId).toBeGreaterThanOrEqual(0);
       expect(peer.sessionId).toBeLessThanOrEqual(0xffff_ffff);
+      expect(terminal.acknowledged).toBe(true);
+    } finally {
+      await terminateWorker(worker);
+    }
+  });
+
+  it("returns the echo before a client disconnect makes the server ACK read fail", async () => {
+    const pipeName = `\\\\.\\pipe\\prospero-native-disconnect-${process.pid}-${randomUUID()}`;
+    let worker: Worker | undefined;
+    try {
+      worker = new Worker(new URL("./fixtures/native-pipe-server.mjs", import.meta.url), {
+        workerData: { bindingPath, pipeName },
+      });
+      const observer = observeNativePipeWorker(worker);
+      await observer.ready;
+      const [roundTrip, terminal] = await Promise.all([readPipeResponseThenDisconnect(pipeName), observer.terminal]);
+      // Just as in the normal duplex test, report a concrete client socket
+      // failure before any expectation can obscure it.
+      if (roundTrip.kind !== "response") throw roundTrip.error;
+      expect(roundTrip.data.toString("utf8")).toBe("pipe-round-trip");
+      expect(terminal).toMatchObject({
+        type: "error",
+        phase: "ack-read",
+        code: "PROSPERO_NATIVE_NOT_FOUND",
+      });
     } finally {
       await terminateWorker(worker);
     }
