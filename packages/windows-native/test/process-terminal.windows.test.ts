@@ -214,10 +214,15 @@ describeWindows.sequential("Windows N-API Job Object, detached host, and ConPTY 
   it("keeps a launched detached host alive after its launcher exits when parent Job policy permits", async () => {
     const directory = await mkdtemp(join(tmpdir(), "prospero-native-host-"));
     const marker = join(directory, "host-survived.txt");
+    const unicodeArgument = "参数 with spaces, quote \" and trailing slash\\";
+    const hostSource = [
+      `require('node:fs').writeFileSync(${JSON.stringify(marker)}, JSON.stringify({ argv0: process.argv0, argv: process.argv }));`,
+      "setTimeout(() => process.exit(0), 3000);",
+    ].join(" ");
     const helperSource = [
       "const { createRequire } = require('node:module');",
       `const native = createRequire(${JSON.stringify(join(directory, "launcher.cjs"))})(${JSON.stringify(addonPath)});`,
-      `const result = native.launchDetachedHost({ executablePath: process.execPath, arguments: ['-e', ${JSON.stringify(`require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'alive'); setTimeout(() => process.exit(0), 3000)`)}], workingDirectory: ${JSON.stringify(directory)} });`,
+      `const result = native.launchDetachedHost({ executablePath: process.execPath, arguments: ['-e', ${JSON.stringify(hostSource)}, ${JSON.stringify(unicodeArgument)}], workingDirectory: ${JSON.stringify(directory)} });`,
       "process.stdout.write(JSON.stringify(result));",
     ].join("\n");
     try {
@@ -235,7 +240,10 @@ describeWindows.sequential("Windows N-API Job Object, detached host, and ConPTY 
       for (let attempt = 0; attempt < 60; ++attempt) {
         try {
           await access(marker);
-          expect(await readFile(marker, "utf8")).toBe("alive");
+          expect(JSON.parse(await readFile(marker, "utf8"))).toEqual({
+            argv0: process.execPath,
+            argv: [process.execPath, unicodeArgument],
+          });
           // A successful response is valid only if the suspended child really
           // escaped every inherited Job before it was resumed.
           expect(await isProcessInAnyJob(result.process.pid)).toBe(false);
@@ -251,17 +259,18 @@ describeWindows.sequential("Windows N-API Job Object, detached host, and ConPTY 
   });
 
   it("echoes UTF-8, resizes, and Job-kills the provider tree", async () => {
+    const unicodeArgument = "参数 with spaces, quote \" and trailing slash\\";
     const providerSource = [
       "const { spawn } = require('node:child_process');",
       "const grandchild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });",
-      "process.stdout.write(`PIDS:${process.pid}:${grandchild.pid}\\n你好🙂\\n`);",
+      "process.stdout.write(`PIDS:${process.pid}:${grandchild.pid}\\n你好🙂\\nARGV0:${process.argv0}\\nARG:${process.argv[1]}\\n`);",
       "process.stdin.setEncoding('utf8');",
       "process.stdin.on('data', (data) => process.stdout.write(`ECHO:${data}`));",
       "setInterval(() => {}, 1000);",
     ].join("\n");
     const terminal = native.spawnConPty({
       executablePath: process.execPath,
-      arguments: ["-e", providerSource],
+      arguments: ["-e", providerSource, unicodeArgument],
       columns: 80,
       rows: 24,
     });
@@ -269,6 +278,8 @@ describeWindows.sequential("Windows N-API Job Object, detached host, and ConPTY 
       native.resizeConPty(terminal, 120, 40);
       let output = await drainUntil(terminal, "你好");
       expect(output).toContain("你好");
+      expect(output).toContain(`ARGV0:${process.execPath}`);
+      expect(output).toContain(`ARG:${unicodeArgument}`);
       const written = native.writeConPty(terminal, encoder.encode("hello\n"));
       expect(written).toBeGreaterThan(0);
       output += await drainUntil(terminal, "ECHO:hello");

@@ -117,6 +117,7 @@ typedef struct prospero_parent_job_compatibility {
 
 typedef struct prospero_detached_host_launch_options {
   const wchar_t* executable_path;
+  /** argv entries after the boundary-generated executable-path argv[0]. */
   const wchar_t* const* arguments;
   uint32_t argument_count;
   const wchar_t* working_directory;
@@ -138,6 +139,7 @@ typedef struct prospero_detached_host_launch_result {
 
 typedef struct prospero_conpty_spawn_options {
   const wchar_t* executable_path;
+  /** argv entries after the boundary-generated executable-path argv[0]. */
   const wchar_t* const* arguments;
   uint32_t argument_count;
   uint16_t columns;

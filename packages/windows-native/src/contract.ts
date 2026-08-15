@@ -94,6 +94,7 @@ export interface ParentJobCompatibility {
 
 export interface DetachedHostLaunchOptions {
   readonly executablePath: string;
+  /** argv elements after the native boundary's exact-path argv[0]. */
   readonly arguments: readonly string[];
   readonly workingDirectory?: string;
   /** Environment values are passed to CreateProcessW; no shell is involved. */
@@ -110,6 +111,7 @@ export type DetachedHostLaunchResult =
 
 export interface ConPtySpawnOptions {
   readonly executablePath: string;
+  /** argv elements after the native boundary's exact-path argv[0]. */
   readonly arguments: readonly string[];
   readonly columns: number;
   readonly rows: number;
