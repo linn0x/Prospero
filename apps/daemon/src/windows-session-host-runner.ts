@@ -1093,7 +1093,16 @@ export async function runDetachedWindowsSessionHostFromEnvironment(
 }
 
 function runnerEnvironment(stateDirectory: string): Record<string, string> {
-  const inherited = ["SystemRoot", "WINDIR", "PATH", "TEMP", "TMP"] as const;
+  // Keep provider/API credentials out of the detached host environment, but
+  // retain the Windows runtime/profile locations required by Authenticode,
+  // DPAPI, PowerShell and Node when the daemon is running as a service user.
+  const inherited = [
+    "SystemRoot", "WINDIR", "SystemDrive", "ComSpec", "PATH", "PATHEXT",
+    "TEMP", "TMP", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
+    "LOCALAPPDATA", "APPDATA", "ProgramData", "ProgramFiles",
+    "ProgramFiles(x86)", "ProgramW6432", "CommonProgramFiles",
+    "CommonProgramFiles(x86)", "CommonProgramW6432",
+  ] as const;
   return {
     ...Object.fromEntries(inherited.filter((name) => process.env[name] !== undefined).map((name) => [name, process.env[name]!])),
     [DETACHED_RUNNER_ENV]: stateDirectory,
