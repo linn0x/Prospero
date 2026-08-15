@@ -4,6 +4,7 @@ import SwiftUI
 private enum DashboardPage: String, CaseIterable, Identifiable {
   case overview
   case sessions
+  case accounts
   case goals
   case devices
   case logs
@@ -15,6 +16,7 @@ private enum DashboardPage: String, CaseIterable, Identifiable {
     switch self {
     case .overview: "概览"
     case .sessions: "项目"
+    case .accounts: "账号"
     case .goals: "编排"
     case .devices: "设备"
     case .logs: "日志"
@@ -26,6 +28,7 @@ private enum DashboardPage: String, CaseIterable, Identifiable {
     switch self {
     case .overview: "square.grid.2x2"
     case .sessions: "folder"
+    case .accounts: "person.crop.circle.badge.checkmark"
     case .goals: "point.3.connected.trianglepath.dotted"
     case .devices: "iphone.and.arrow.forward"
     case .logs: "text.alignleft"
@@ -79,6 +82,8 @@ struct ProsperoDashboard: View {
               presentSessionLauncher(directory, agent: agent)
             }
           )
+        case .accounts:
+          AgentAccountsDashboard(daemon: daemon)
         case .goals:
           GoalsDashboard(daemon: daemon)
         case .devices:

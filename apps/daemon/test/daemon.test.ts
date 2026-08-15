@@ -1,7 +1,7 @@
 /**
  * daemon 集成测试:真实加密握手 + PTY 会话全链路(内存中起服务,随机端口)。
  */
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -157,6 +157,115 @@ afterAll(async () => {
 });
 
 describe("daemon 全链路", () => {
+  it("Mac 账号控制接口复用协议、鉴权并且不回显凭据", async () => {
+    const status = JSON.parse(readFileSync(path.join(home, "status.json"), "utf8")) as {
+      controlToken: string;
+    };
+    const endpoint = `http://127.0.0.1:${String(server.port)}/_prospero/control/accounts`;
+    const request = async (body: Record<string, unknown>, authenticated = true): Promise<Response> =>
+      fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(authenticated ? { authorization: `Bearer ${status.controlToken}` } : {}),
+        },
+        body: JSON.stringify({ ...body, requestId: "mac-account-test" }),
+      });
+
+    expect((await request({ type: "agent.accounts.list" }, false)).status).toBe(401);
+    expect((await fetch(endpoint, {
+      method: "POST",
+      headers: { authorization: "Bearer wrong-control-token", "content-type": "application/json" },
+      body: JSON.stringify({ type: "agent.accounts.list", requestId: "wrong-token" }),
+    })).status).toBe(401);
+    expect((await request({
+      type: "session.create", agent: "shell", kind: "pty", cwd: home, cols: 80, rows: 24,
+    })).status).toBe(400);
+    expect((await fetch(endpoint, {
+      method: "POST",
+      headers: { authorization: `Bearer ${status.controlToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ type: "agent.accounts.list", requestId: "x", padding: "x".repeat(25 * 1024) }),
+    })).status).toBe(413);
+
+    const created = await request({
+      type: "agent.account.create", agent: "claude", name: "Mac 独立 Claude",
+    });
+    expect(created.status).toBe(200);
+    const createdBody = await created.json() as { accounts: Array<{ id: string; name: string }> };
+    const claude = createdBody.accounts.find((account) => account.name === "Mac 独立 Claude")!;
+    expect(claude.id).toBeTruthy();
+
+    const credential = "oauth-token-that-must-not-leak-from-http-response";
+    const credentialResponse = await request({
+      type: "agent.account.credential.set",
+      accountId: claude.id,
+      credentialKind: "oauth_token",
+      credential,
+    });
+    const credentialText = await credentialResponse.text();
+    expect(credentialResponse.status).toBe(200);
+    expect(credentialText).not.toContain(credential);
+    expect(readFileSync(path.join(home, "agent-accounts.json"), "utf8")).not.toContain(credential);
+
+    const apiKey = "api-key-that-must-not-leak-from-http-response";
+    const apiResponse = await request({
+      type: "agent.account.api.create",
+      agent: "codex",
+      name: "Mac API Profile",
+      baseUrl: "https://gateway.example.test/v1",
+      model: "test-model",
+      apiKey,
+    });
+    const apiText = await apiResponse.text();
+    expect(apiResponse.status).toBe(200);
+    expect(apiText).not.toContain(apiKey);
+    const apiBody = JSON.parse(apiText) as { accounts: Array<{ id: string; name: string; apiProfile?: unknown }> };
+    const api = apiBody.accounts.find((account) => account.name === "Mac API Profile")!;
+    expect(api.apiProfile).toBeDefined();
+    expect(readFileSync(path.join(home, "agent-accounts.json"), "utf8")).not.toContain(apiKey);
+
+    const renamed = await request({
+      type: "agent.account.rename", accountId: api.id, name: "重命名 API Profile",
+    });
+    expect(renamed.status).toBe(200);
+    expect((await request({ type: "agent.account.default", accountId: api.id })).status).toBe(200);
+    const configured = await request({
+      type: "agent.account.api.configure",
+      accountId: api.id,
+      baseUrl: "https://gateway.example.test/v2",
+      model: "test-model-2",
+      apiKey: "replacement-api-key-that-must-not-leak",
+    });
+    expect(configured.status).toBe(200);
+    expect((await request({ type: "agent.account.logout", accountId: api.id })).status).toBe(200);
+    expect((await request({ type: "agent.account.delete", accountId: api.id })).status).toBe(200);
+    expect((await request({ type: "agent.account.logout", accountId: claude.id })).status).toBe(200);
+    expect((await request({ type: "agent.account.delete", accountId: claude.id })).status).toBe(200);
+
+    // Never invoke the developer's real Codex login during regression tests.
+    // The endpoint must still create a PTY and return its LocalSessionWorkspace id.
+    if (process.platform !== "win32") {
+      const fakeBin = mkdtempSync(path.join(os.tmpdir(), "prospero-fake-agent-"));
+      const fakeCodex = path.join(fakeBin, "codex");
+      writeFileSync(fakeCodex, "#!/bin/sh\nif [ \"$1\" = \"login\" ] && [ \"$2\" = \"status\" ]; then echo 'Logged in using Test'; exit 0; fi\nif [ \"$1\" = \"--version\" ]; then echo test; exit 0; fi\necho LOGIN_SESSION\nsleep 30\n");
+      chmodSync(fakeCodex, 0o755);
+      const oldPath = process.env.PATH;
+      process.env.PATH = `${fakeBin}${path.delimiter}${oldPath ?? ""}`;
+      try {
+        const login = await request({
+          type: "agent.account.login", accountId: "native-codex", cols: 80, rows: 24,
+        });
+        expect(login.status).toBe(200);
+        const result = await login.json() as { sessionId?: string };
+        expect(result.sessionId).toBeTruthy();
+        await server.manager.kill(result.sessionId!);
+      } finally {
+        process.env.PATH = oldPath;
+        rmSync(fakeBin, { recursive: true, force: true });
+      }
+    }
+  });
+
   it("Mac GUI 控制接口仅接受 status.json 中的本机口令", async () => {
     const status = JSON.parse(readFileSync(path.join(home, "status.json"), "utf8")) as {
       controlToken: string;
