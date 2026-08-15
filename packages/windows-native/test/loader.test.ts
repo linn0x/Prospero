@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  NATIVE_SYNCHRONOUS_BLOCKING_METHODS,
   type NativeAddonBinding,
   type NativeAddonCapabilityReport,
   type NativeLoaderRuntime,
@@ -7,6 +8,7 @@ import {
   NativeLoadError,
   loadWindowsNative,
 } from "../src/index.js";
+import { resolveSystemPowerShellPath } from "../src/loader.js";
 
 const allCapabilities = {
   processIdentity: true,
@@ -61,6 +63,9 @@ function completeAddon(report: NativeAddonCapabilityReport): NativeAddonBinding 
     dpapiUnprotectCurrentUser: unavailable as NativeAddonBinding["dpapiUnprotectCurrentUser"],
     openSecureStateDirectory: unavailable as NativeAddonBinding["openSecureStateDirectory"],
     writeSecureStateFileAtomically: unavailable as NativeAddonBinding["writeSecureStateFileAtomically"],
+    readSecureStateFile: unavailable as NativeAddonBinding["readSecureStateFile"],
+    listSecureStateEntries: unavailable as NativeAddonBinding["listSecureStateEntries"],
+    removeSecureStateFile: unavailable as NativeAddonBinding["removeSecureStateFile"],
     closeSecureStateDirectory: unavailable as NativeAddonBinding["closeSecureStateDirectory"],
   };
 }
@@ -109,12 +114,31 @@ function expectNativeLoadError(action: () => unknown, code: NativeLoadError["cod
 }
 
 describe("Windows native fail-closed loader", () => {
+  it("resolves Authenticode PowerShell only beneath a verified absolute SystemRoot", () => {
+    const systemRoot = "C:\\Windows";
+    const expected = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+    expect(resolveSystemPowerShellPath(systemRoot, (path) => path === systemRoot || path === expected)).toBe(expected);
+    expect(resolveSystemPowerShellPath(undefined, () => true)).toBeNull();
+    expect(resolveSystemPowerShellPath("Windows", () => true)).toBeNull();
+    expect(resolveSystemPowerShellPath("C:\\Windows\\..\\evil", () => true)).toBeNull();
+    expect(resolveSystemPowerShellPath("C:/Windows", () => true)).toBeNull();
+    expect(resolveSystemPowerShellPath(systemRoot, () => false)).toBeNull();
+  });
+
   it("does not attempt to load anything outside Windows", () => {
     expectNativeLoadError(() =>
       loadWindowsNative(
         mockRuntime(validManifest(), {}, { platform: "darwin", loadBinding: () => { throw new Error("must not run"); } }),
       ),
     "unsupported-platform");
+  });
+
+  it("treats state recovery and cleanup operations as blocking ABI methods", () => {
+    expect(NATIVE_SYNCHRONOUS_BLOCKING_METHODS).toEqual(expect.arrayContaining([
+      "readSecureStateFile",
+      "listSecureStateEntries",
+      "removeSecureStateFile",
+    ]));
   });
 
   it("rejects architectures and host Node-API levels outside the release contract", () => {
@@ -183,6 +207,17 @@ describe("Windows native fail-closed loader", () => {
     );
   });
 
+  it("rejects an addon without manifest recovery and cleanup operations", () => {
+    const addon = completeAddon(addonReport()) as Partial<NativeAddonBinding>;
+    delete addon.readSecureStateFile;
+    delete addon.listSecureStateEntries;
+    delete addon.removeSecureStateFile;
+    expectNativeLoadError(
+      () => loadWindowsNative(mockRuntime(validManifest(), addon)),
+      "addon-invalid",
+    );
+  });
+
   it("rejects manifest ABI mismatches before the binary can load", () => {
     const manifest = validManifest();
     const wrongAbi = {
@@ -204,6 +239,47 @@ describe("Windows native fail-closed loader", () => {
         }),
       ),
     "authenticode-invalid");
+  });
+
+  it("fails closed when Authenticode verification is unavailable or throws", () => {
+    let missingVerifierLoaded = false;
+    expectNativeLoadError(
+      () => loadWindowsNative(mockRuntime(validManifest(), completeAddon(addonReport()), {
+        verifyAuthenticode: () => ({ status: "systemroot-unavailable", thumbprintSha1: null }),
+        loadBinding: () => {
+          missingVerifierLoaded = true;
+          return completeAddon(addonReport());
+        },
+      })),
+      "authenticode-invalid",
+    );
+    expect(missingVerifierLoaded).toBe(false);
+
+    let throwingVerifierLoaded = false;
+    expectNativeLoadError(
+      () => loadWindowsNative(mockRuntime(validManifest(), completeAddon(addonReport()), {
+        verifyAuthenticode: () => { throw new Error("verification failed"); },
+        loadBinding: () => {
+          throwingVerifierLoaded = true;
+          return completeAddon(addonReport());
+        },
+      })),
+      "authenticode-invalid",
+    );
+    expect(throwingVerifierLoaded).toBe(false);
+
+    let malformedVerifierLoaded = false;
+    expectNativeLoadError(
+      () => loadWindowsNative(mockRuntime(validManifest(), completeAddon(addonReport()), {
+        verifyAuthenticode: () => undefined as never,
+        loadBinding: () => {
+          malformedVerifierLoaded = true;
+          return completeAddon(addonReport());
+        },
+      })),
+      "authenticode-invalid",
+    );
+    expect(malformedVerifierLoaded).toBe(false);
   });
 
   it("refuses all synchronous native operations on the main thread", () => {

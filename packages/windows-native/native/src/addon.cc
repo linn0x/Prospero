@@ -121,6 +121,9 @@ NAPI_MODULE_INIT() {
       !ExportMethod(env, exports, "dpapiUnprotectCurrentUser", ThrowNotAvailable) ||
       !ExportMethod(env, exports, "openSecureStateDirectory", ThrowNotAvailable) ||
       !ExportMethod(env, exports, "writeSecureStateFileAtomically", ThrowNotAvailable) ||
+      !ExportMethod(env, exports, "readSecureStateFile", ThrowNotAvailable) ||
+      !ExportMethod(env, exports, "listSecureStateEntries", ThrowNotAvailable) ||
+      !ExportMethod(env, exports, "removeSecureStateFile", ThrowNotAvailable) ||
       !ExportMethod(env, exports, "closeSecureStateDirectory", ThrowNotAvailable)) {
     return nullptr;
   }
