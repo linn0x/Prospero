@@ -105,11 +105,48 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'failed to stage the signed Session Host test artifact' }
             node packages/windows-native/scripts/smoke-loader.mjs --package-root packages/windows-native --expect valid
             if ($LASTEXITCODE -ne 0) { throw 'the production loader rejected the signed Session Host test artifact' }
-            $env:PROSPERO_WINDOWS_SIGNED_SESSION_HOST_TEST = '1'
             npm run build --workspace=@prospero/daemon
             if ($LASTEXITCODE -ne 0) { throw 'daemon build failed before Windows Session Host acceptance' }
-            npm run test:windows-native --workspace=@prospero/daemon
-            if ($LASTEXITCODE -ne 0) { throw 'Windows Session Host acceptance failed' }
+            # GitHub hosted runners place the runner process in a restrictive
+            # Job that deliberately blocks durable child breakaway. Run the
+            # acceptance process as a one-shot SYSTEM scheduled task so the
+            # real detached-host/Job lifecycle is exercised outside that Job.
+            $taskName = "Prospero-SessionHost-$env:GITHUB_RUN_ID-${{ matrix.arch }}"
+            $taskScript = Join-Path $env:GITHUB_WORKSPACE 'packages/windows-native/scripts/run-session-host-acceptance.ps1'
+            $taskLauncher = Join-Path $env:RUNNER_TEMP "prospero-session-host-${{ matrix.arch }}-launch.ps1"
+            $taskLog = Join-Path $env:RUNNER_TEMP "prospero-session-host-${{ matrix.arch }}.log"
+            $taskResult = Join-Path $env:RUNNER_TEMP "prospero-session-host-${{ matrix.arch }}.result"
+            $npmPath = (Get-Command npm.cmd -ErrorAction Stop).Source
+            $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            @($taskScript, $taskLauncher, $taskLog, $taskResult, $npmPath, $windowsPowerShell, $env:GITHUB_WORKSPACE) | ForEach-Object {
+              if ($_ -match "['`\"]") { throw "scheduled-task path contains an unsupported quote: $_" }
+            }
+            @"
+            & '$taskScript' -Workspace '$env:GITHUB_WORKSPACE' -NpmPath '$npmPath' -LogPath '$taskLog' -ResultPath '$taskResult'
+            exit `$LASTEXITCODE
+            "@ | Set-Content -LiteralPath $taskLauncher -Encoding utf8
+            $taskCommand = "`"$windowsPowerShell`" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$taskLauncher`""
+            if ($taskCommand.Length -gt 261) { throw 'scheduled-task launcher command exceeds the Windows Task Scheduler limit' }
+            try {
+              $startTime = (Get-Date).AddMinutes(1).ToString('HH:mm')
+              & schtasks.exe /Create /TN $taskName /SC ONCE /ST $startTime /TR $taskCommand /RU SYSTEM /RL HIGHEST /F
+              if ($LASTEXITCODE -ne 0) { throw 'failed to register out-of-Job Session Host acceptance task' }
+              & schtasks.exe /Run /TN $taskName
+              if ($LASTEXITCODE -ne 0) { throw 'failed to start out-of-Job Session Host acceptance task' }
+              $deadline = (Get-Date).AddMinutes(4)
+              while (-not (Test-Path -LiteralPath $taskResult)) {
+                if ((Get-Date) -ge $deadline) { throw 'out-of-Job Session Host acceptance timed out' }
+                Start-Sleep -Seconds 1
+              }
+              if (Test-Path -LiteralPath $taskLog) { Get-Content -LiteralPath $taskLog }
+              $acceptanceExitCode = [int]((Get-Content -LiteralPath $taskResult -Raw).Trim())
+              if ($acceptanceExitCode -ne 0) { throw "Windows Session Host acceptance failed with exit code $acceptanceExitCode" }
+            } finally {
+              & schtasks.exe /End /TN $taskName 2>$null | Out-Null
+              & schtasks.exe /Delete /TN $taskName /F 2>$null | Out-Null
+              $global:LASTEXITCODE = 0
+              Remove-Item -LiteralPath $taskLauncher, $taskLog, $taskResult -Force -ErrorAction SilentlyContinue
+            }
           } finally {
             Copy-Item -LiteralPath $source -Destination $artifact -Force
             node packages/windows-native/scripts/stage-prebuild.mjs --source $artifact --destination packages/windows-native --arch ${{ matrix.arch }} --authenticode-status unsigned
