@@ -50,6 +50,10 @@ import type {
   AgentModelCatalog,
 } from "./adapters/types.js";
 import type { AccountBinding, AccountLoginSpec } from "./agent-accounts.js";
+import {
+  waitForPtyStartupReadiness,
+  type PtyStartupReadinessOptions,
+} from "./pty-startup-readiness.js";
 
 export type SessionErrorCode =
   | "shell_not_allowed"
@@ -904,6 +908,14 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       );
     }
     return s;
+  }
+
+  /**
+   * PTY TUI 的首个输入必须避开其初始化清屏窗口；structured 会话没有这条路径。
+   * 实现位于独立的观察器中，以便编排层可用确定性 fake 复现这一竞态。
+   */
+  async waitForPtyReady(sid: string, options?: PtyStartupReadinessOptions): Promise<void> {
+    await waitForPtyStartupReadiness(this, sid, options);
   }
 
   requireStructured(sid: string): StructuredSession | RemoteStructuredSession {
