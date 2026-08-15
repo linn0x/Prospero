@@ -4,7 +4,7 @@
 
 ## Contract and source ownership
 
-The only JavaScript/TypeScript contract is `packages/windows-native/src/contract.ts`; the only native contract is `packages/windows-native/native/include/prospero_windows_native.h`. Both have ABI version 2 and target Node-API 8. A FILETIME crosses the JS boundary as an unsigned decimal string, paired with its PID, so callers never identify a reused PID alone. `getProcessIdentity(pid)` obtains both values, and `matchesProcessIdentity()` must reopen the PID and compare the FILETIME exactly before a process-sensitive action.
+The only JavaScript/TypeScript contract is `packages/windows-native/src/contract.ts`; the only native contract is `packages/windows-native/native/include/prospero_windows_native.h`. Both have ABI version 3 and target Node-API 8. A FILETIME crosses the JS boundary as an unsigned decimal string, paired with its PID, so callers never identify a reused PID alone. `getProcessIdentity(pid)` obtains both values, and `matchesProcessIdentity()` must reopen the PID and compare the FILETIME exactly before a process-sensitive action.
 
 The native work is intentionally split into independently editable units:
 
@@ -44,7 +44,7 @@ Each `manifest.json` has schema version 2 and this shape:
     "sha256": "64 lowercase-or-uppercase hexadecimal characters"
   },
   "native": {
-    "abiVersion": 2,
+    "abiVersion": 3,
     "napiVersion": 8,
     "capabilities": {
       "processIdentity": true,

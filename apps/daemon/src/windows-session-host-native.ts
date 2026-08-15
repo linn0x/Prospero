@@ -6,6 +6,7 @@ import {
   NATIVE_WINDOWS_ABI_VERSION,
   type DetachedHostLaunchOptions,
   type DetachedHostLaunchResult,
+  type JobObjectHandle,
   type NativeCapabilityReport,
   type PipePeerIdentity,
   type ProcessIdentity,
@@ -189,6 +190,13 @@ export class WindowsSessionHostNativeWorker implements WindowsSessionHostStateSt
     if (!(value instanceof Uint8Array)) throw nativeFailure("Windows native state read returned invalid bytes");
     return value;
   }
+  async list(): Promise<readonly string[]> {
+    const value = await this.call("state.list");
+    if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string")) {
+      throw nativeFailure("Windows native state list returned invalid entries");
+    }
+    return value;
+  }
   async writeAtomic(fileName: string, bytes: Uint8Array): Promise<void> {
     await this.call("state.write", { name: fileName, bytes });
   }
@@ -206,9 +214,37 @@ export class WindowsSessionHostNativeWorker implements WindowsSessionHostStateSt
     return result;
   }
   async currentIdentity(): Promise<ProcessIdentity> { return this.identityResult(await this.call("identity.current")); }
+  async processIdentity(pid: number): Promise<ProcessIdentity> { return this.identityResult(await this.call("identity.process", { pid })); }
   async matchesIdentity(identity: ProcessIdentity): Promise<boolean> {
     const result = await this.call("identity.matches", { identity });
     if (typeof result !== "boolean") throw nativeFailure("Windows native identity result is invalid");
+    return result;
+  }
+  async createProviderJob(): Promise<JobObjectHandle> {
+    const result = await this.call("job.create");
+    return this.jobHandle(result, "Windows native provider Job Object handle is invalid");
+  }
+  async assignProviderProcess(process: ProcessIdentity): Promise<void> {
+    await this.call("job.assign", { process });
+  }
+  async isProviderProcessInJob(process: ProcessIdentity): Promise<boolean> {
+    const result = await this.call("job.contains", { process });
+    if (typeof result !== "boolean") throw nativeFailure("Windows native Job membership result is invalid");
+    return result;
+  }
+  async terminateProviderJob(): Promise<void> { await this.call("job.terminate"); }
+  async closeProviderJob(): Promise<void> { await this.call("job.close"); }
+  /**
+   * The sole detached-host rollback primitive. Native code reopens the PID,
+   * checks FILETIME, terminates that exact handle, and waits for its exit.
+   */
+  async terminateIdentityAndWait(
+    identity: ProcessIdentity,
+    exitCode = 0xC000013A,
+    timeoutMs = 5_000,
+  ): Promise<boolean> {
+    const result = await this.call("identity.terminate", { identity, exitCode, timeoutMs });
+    if (typeof result !== "boolean") throw nativeFailure("Windows native exact termination result is invalid");
     return result;
   }
 
@@ -297,6 +333,11 @@ export class WindowsSessionHostNativeWorker implements WindowsSessionHostStateSt
         reject(nativeFailure(error instanceof Error ? error.message : "Windows native worker send failed"));
       }
     });
+  }
+
+  private jobHandle(value: unknown, message: string): JobObjectHandle {
+    if (typeof value !== "bigint" || value <= 0n) throw nativeFailure(message);
+    return value as JobObjectHandle;
   }
 
   private onMessage(message: unknown): void {

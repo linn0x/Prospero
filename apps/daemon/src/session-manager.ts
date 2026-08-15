@@ -27,6 +27,11 @@ import {
   reconnectPtySupervisors,
   type LaunchPtySupervisorInput,
 } from "./pty-supervisor-client.js";
+import {
+  RemoteWindowsPtySession,
+  launchWindowsPtySession,
+  reconnectWindowsPtySessions,
+} from "./windows-pty-session.js";
 import * as tmux from "./tmux.js";
 import {
   StructuredSession,
@@ -40,6 +45,13 @@ import {
   reconnectStructuredSupervisors,
   type LaunchStructuredSupervisorInput,
 } from "./structured-supervisor-client.js";
+import {
+  WindowsRemoteStructuredSession,
+  canFallbackToInProcessStructured,
+  launchWindowsStructuredSession,
+  reconnectWindowsStructuredSessions,
+  type LaunchWindowsStructuredSessionInput,
+} from "./windows-structured-session-client.js";
 import { ClaudeAdapter } from "./adapters/claude.js";
 import { CodexAdapter } from "./adapters/codex.js";
 import { GrokAdapter } from "./adapters/grok.js";
@@ -287,13 +299,22 @@ export interface SessionManagerOptions {
   supervisor?: boolean | undefined;
   /** Test seam for the detached launcher; production uses the real launcher. */
   supervisorLauncher?: ((input: LaunchStructuredSupervisorInput) => Promise<RemoteStructuredSession>) | undefined;
+  /** Windows-only native Session Host seam; production uses the N-API launcher. */
+  windowsStructuredLauncher?: ((input: LaunchWindowsStructuredSessionInput) => Promise<WindowsRemoteStructuredSession>) | undefined;
   /** Immutable daemon-start executable for newly launched structured owners. */
   supervisorRunnerPath?: string | undefined;
   /** Detached PTY owners; production daemon opts in, direct unit tests do not. */
   ptySupervisor?: boolean | undefined;
   /** Test seam for detached PTY host launch. */
   ptySupervisorLauncher?: ((input: LaunchPtySupervisorInput) => Promise<RemotePtySession>) | undefined;
+  /** Windows uses the N-API Session Host by default; false is an explicit direct-PTY rollback. */
+  windowsPtySessionHost?: boolean | undefined;
+  /** One explicit Windows host feature gate for both PTY and structured sessions. */
+  windowsSessionHost?: boolean | undefined;
 }
+
+/** Public recovery provenance: hosted owners are durable, direct ones are daemon-local. */
+export type SessionHosting = "hosted" | "direct" | "unavailable";
 
 /** 恢复前由编排层判定应封存的会话；避免 adapter 先接回并 drain 旧队列。 */
 export interface RestoreStructuredOptions {
@@ -301,8 +322,8 @@ export interface RestoreStructuredOptions {
 }
 
 export class SessionManager extends EventEmitter<SessionManagerEvents> {
-  private readonly ptySessions = new Map<string, PtySession | RemotePtySession>();
-  private readonly structuredSessions = new Map<string, StructuredSession | RemoteStructuredSession>();
+  private readonly ptySessions = new Map<string, PtySession | RemotePtySession | RemoteWindowsPtySession>();
+  private readonly structuredSessions = new Map<string, StructuredSession | RemoteStructuredSession | WindowsRemoteStructuredSession>();
   private readonly tmuxConfigFile: string | null;
   private readonly tmuxBin: string | null;
 
@@ -314,11 +335,19 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     | ((accountId: string, agent: "claude" | "codex") => AccountBinding)
     | undefined;
   private readonly structuredSupervisorRoot: string | null;
+  /** Native secure-state directories must be direct children of an existing root. */
+  private readonly windowsStructuredRoot: string | null;
   private readonly ptySupervisorRoot: string | null;
+  private readonly windowsPtySessionHostRoot: string | null;
   private readonly useStructuredSupervisor: boolean;
+  private readonly useWindowsStructuredHost: boolean;
   private readonly supervisorLauncher: (input: LaunchStructuredSupervisorInput) => Promise<RemoteStructuredSession>;
+  private readonly windowsStructuredLauncher: (input: LaunchWindowsStructuredSessionInput) => Promise<WindowsRemoteStructuredSession>;
   private readonly supervisorRunnerPath: string | undefined;
   private readonly usePtySupervisor: boolean;
+  private readonly useWindowsPtySessionHost: boolean;
+  /** Becomes true only after an actual native host attach succeeds. */
+  private windowsPtySessionHostDurable = false;
   private readonly ptySupervisorLauncher: (input: LaunchPtySupervisorInput) => Promise<RemotePtySession>;
   private persistTimer: NodeJS.Timeout | null = null;
   private shuttingDown = false;
@@ -332,11 +361,14 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     const home = opts.home ?? opts.tmux?.home;
     this.structuredFile = home ? path.join(home, "structured-sessions.json") : null;
     this.structuredSupervisorRoot = home ? path.join(home, "structured-supervisor") : null;
+    this.windowsStructuredRoot = home ?? null;
     this.ptySupervisorRoot = home ? path.join(home, "pty-supervisor") : null;
+    this.windowsPtySessionHostRoot = home ? path.join(home, "windows-session-host") : null;
     this.adapterFactory = opts.adapterFactory ?? makeAdapter;
     this.sessionEnv = opts.sessionEnv ?? (() => ({}));
     this.accountResolver = opts.accountResolver;
     this.supervisorLauncher = opts.supervisorLauncher ?? launchStructuredSupervisor;
+    this.windowsStructuredLauncher = opts.windowsStructuredLauncher ?? launchWindowsStructuredSession;
     this.supervisorRunnerPath = opts.supervisorRunnerPath;
     this.ptySupervisorLauncher = opts.ptySupervisorLauncher ?? launchPtySupervisor;
     // An injected adapter is the test seam. It cannot safely cross a process
@@ -347,6 +379,9 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       !!opts.supervisorLauncher || (
         opts.supervisor === true && !opts.adapterFactory && !!this.structuredSupervisorRoot && process.platform !== "win32"
       );
+    this.useWindowsStructuredHost =
+      process.platform === "win32" && opts.windowsSessionHost !== false && !!this.windowsStructuredRoot && !opts.adapterFactory &&
+      (opts.supervisor === true || !!opts.windowsStructuredLauncher);
     // tmux remains an explicit compatibility path. A PTY host already owns
     // both the terminal state and its process; stacking tmux beneath it only
     // obscures explicit kill semantics.
@@ -359,6 +394,8 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
           opts.ptySupervisor === true && !!this.ptySupervisorRoot
         )
       );
+    this.useWindowsPtySessionHost =
+      process.platform === "win32" && opts.windowsSessionHost !== false && opts.windowsPtySessionHost !== false && !!this.windowsPtySessionHostRoot && !this.tmuxEnabled;
   }
 
   /**
@@ -407,6 +444,18 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
    * command, preventing duplicate agents after daemon restart.
    */
   async restorePtySupervisors(): Promise<SessionInfo[]> {
+    if (this.useWindowsPtySessionHost && this.windowsPtySessionHostRoot) {
+      const restored: SessionInfo[] = [];
+      for (const session of await reconnectWindowsPtySessions(this.windowsPtySessionHostRoot)) {
+        if (this.ptySessions.has(session.id)) continue;
+        this.wirePtySession(session);
+        this.ptySessions.set(session.id, session);
+        if (session.hosting === "windows-session-host") this.windowsPtySessionHostDurable = true;
+        restored.push(session.info());
+        this.emit("state", session.info());
+      }
+      return restored;
+    }
     if (!this.ptySupervisorRoot) return [];
     const restored: SessionInfo[] = [];
     for (const session of await reconnectPtySupervisors(this.ptySupervisorRoot)) {
@@ -511,7 +560,20 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     // Reattach first: each manifest represents the already-running owner. A
     // missing/stale/incompatible one is kept visible but read-only; scanning
     // must never invoke the launcher or replay a queued native turn.
-    if (this.structuredSupervisorRoot) {
+    if (this.useWindowsStructuredHost && this.windowsStructuredRoot) {
+      try {
+        for (const session of await reconnectWindowsStructuredSessions(this.windowsStructuredRoot)) {
+          if (this.structuredSessions.has(session.id)) continue;
+          this.wireStructuredSession(session);
+          this.structuredSessions.set(session.id, session);
+          restored.push(session.info());
+          this.emit("state", session.info());
+        }
+      } catch {
+        // No native N-API host means legacy in-process sessions remain
+        // explicitly non-durable; do not infer or recreate a durable owner.
+      }
+    } else if (this.structuredSupervisorRoot) {
       for (const session of await reconnectStructuredSupervisors(this.structuredSupervisorRoot)) {
         if (this.structuredSessions.has(session.id)) continue;
         this.wireStructuredSession(session);
@@ -562,7 +624,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
 
   /** Whether PTY terminal state is held by detached per-session hosts. */
   get ptySupervisorEnabled(): boolean {
-    return this.usePtySupervisor;
+    return this.usePtySupervisor || this.windowsPtySessionHostDurable;
   }
 
   /** 结构化会话需要异步启动后端,故整体为 async */
@@ -670,7 +732,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
             environment: sessionEnv,
           })
         : base;
-    let session: PtySession | RemotePtySession;
+    let session: PtySession | RemotePtySession | RemoteWindowsPtySession;
     try {
       const ptyOptions = {
         id, agent, title, cwd, cols, rows,
@@ -679,13 +741,32 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
         env: spawnEnv(sessionEnv),
         ...(account ? { accountId: account.id, accountName: account.name } : {}),
       };
-      session = this.usePtySupervisor && this.ptySupervisorRoot
-        ? await this.ptySupervisorLauncher({
+      if (this.useWindowsPtySessionHost && this.windowsPtySessionHostRoot) {
+        try {
+          session = await launchWindowsPtySession({
+            root: this.windowsPtySessionHostRoot,
+            createdAt: Date.now(),
+            ...ptyOptions,
+          });
+          this.windowsPtySessionHostDurable = true;
+        } catch (error) {
+          // The sole Windows fallback is a plainly in-process PTY when the
+          // verified native binding failed before *any* detached host spawn.
+          // Manifest/identity/timeout/attach failures are post-launch or
+          // otherwise ambiguous and must never create a duplicate direct PTY.
+          if ((error as { directPtyFallbackAllowed?: unknown } | null)?.directPtyFallbackAllowed !== true) throw error;
+          console.warn("[prosperod] Windows Session Host unavailable; using non-durable direct PTY");
+          session = new PtySession(ptyOptions);
+        }
+      } else if (this.usePtySupervisor && this.ptySupervisorRoot) {
+        session = await this.ptySupervisorLauncher({
             root: this.ptySupervisorRoot,
             createdAt: Date.now(),
             ...ptyOptions,
-          })
-        : new PtySession(ptyOptions);
+          });
+      } else {
+        session = new PtySession(ptyOptions);
+      }
     } catch (e) {
       // node-pty 对不存在的可执行文件同步抛 posix_spawnp failed
       throw new SessionError(
@@ -699,7 +780,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     return session.info();
   }
 
-  private wirePtySession(session: PtySession | RemotePtySession): void {
+  private wirePtySession(session: PtySession | RemotePtySession | RemoteWindowsPtySession): void {
     session.on("output", (dataB64: string, seq: number) => this.emit("output", session.id, dataB64, seq));
     session.on("state", (info: SessionInfo) => this.emit("state", info));
   }
@@ -723,6 +804,37 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       ...(resume && agent === "codex" ? { threadId: resume.id } : {}),
     };
     const hasInitialAdapterState = Object.keys(initialAdapterState).length > 0;
+    if (this.useWindowsStructuredHost && this.windowsStructuredRoot) {
+      try {
+        const session = await this.windowsStructuredLauncher({
+          root: this.windowsStructuredRoot,
+          sessionId: id,
+          agent,
+          cwd,
+          title: resume?.title || titleFor(agent, cwd),
+          createdAt: Date.now(),
+          ...(approvalPolicy !== undefined ? { approvalPolicy } : {}),
+          environment: { ...(account?.environment ?? {}), ...this.sessionEnv(id) },
+          ...(account?.codexAppServerArgs ? { codexAppServerArgs: account.codexAppServerArgs } : {}),
+          ...(account ? { accountId: account.id, accountName: account.name } : {}),
+          ...(hasInitialAdapterState ? { initialAdapterState } : {}),
+        });
+        this.wireStructuredSession(session);
+        this.structuredSessions.set(id, session);
+        this.emit("state", session.info());
+        return session.info();
+      } catch (error) {
+        // Missing/invalid native prebuilds deliberately retain the historical
+        // in-process path, but parent-Job and provider-Job failures are a
+        // security boundary and must never be silently downgraded.
+        if (!canFallbackToInProcessStructured(error)) {
+          throw new SessionError(
+            `无法启动 Windows durable ${agent} 会话:${error instanceof Error ? error.message : String(error)}`,
+            "agent_unavailable",
+          );
+        }
+      }
+    }
     if (this.useStructuredSupervisor && this.structuredSupervisorRoot) {
       try {
         const session = await this.supervisorLauncher({
@@ -842,7 +954,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     return session;
   }
 
-  private wireStructuredSession(session: StructuredSession | RemoteStructuredSession): void {
+  private wireStructuredSession(session: StructuredSession | RemoteStructuredSession | WindowsRemoteStructuredSession): void {
     session.on("event", (body: AgentEventBody, evSeq: number) => {
       const id = session.id;
       this.emit("agentEvent", id, body, evSeq);
@@ -884,11 +996,11 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     return this.accountResolver(accountId, agent);
   }
 
-  getPty(sid: string): PtySession | RemotePtySession | undefined {
+  getPty(sid: string): PtySession | RemotePtySession | RemoteWindowsPtySession | undefined {
     return this.ptySessions.get(sid);
   }
 
-  getStructured(sid: string): StructuredSession | RemoteStructuredSession | undefined {
+  getStructured(sid: string): StructuredSession | RemoteStructuredSession | WindowsRemoteStructuredSession | undefined {
     return this.structuredSessions.get(sid);
   }
 
@@ -897,7 +1009,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     return this.list().find((s) => s.id === sid)?.cwd ?? null;
   }
 
-  requirePty(sid: string): PtySession | RemotePtySession {
+  requirePty(sid: string): PtySession | RemotePtySession | RemoteWindowsPtySession {
     const s = this.ptySessions.get(sid);
     if (!s) {
       throw new SessionError(
@@ -918,7 +1030,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     await waitForPtyStartupReadiness(this, sid, options);
   }
 
-  requireStructured(sid: string): StructuredSession | RemoteStructuredSession {
+  requireStructured(sid: string): StructuredSession | RemoteStructuredSession | WindowsRemoteStructuredSession {
     const s = this.structuredSessions.get(sid);
     if (!s) {
       throw new SessionError(
@@ -937,6 +1049,45 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     return s.info();
   }
 
+  /**
+   * Whether this daemon has an attached durable owner, an in-process direct
+   * session, or a manifest that deliberately failed closed during recovery.
+   */
+  sessionHostingOf(sid: string): SessionHosting {
+    const pty = this.ptySessions.get(sid);
+    if (pty instanceof RemoteWindowsPtySession) {
+      return pty.hosting === "windows-session-host" ? "hosted" : "unavailable";
+    }
+    if (pty instanceof RemotePtySession) return "hosted";
+
+    const structured = this.structuredSessions.get(sid);
+    if (structured instanceof WindowsRemoteStructuredSession) {
+      return structured.hosting === "windows-session-host" ? "hosted" : "unavailable";
+    }
+    if (structured instanceof RemoteStructuredSession) return "hosted";
+    if (pty || structured) return "direct";
+    throw new SessionError(`no such session: ${sid}`, "session_not_found");
+  }
+
+  /**
+   * Canonical Windows owner identity for Dispatch persistence. PID alone is
+   * intentionally insufficient: epoch and FILETIME fence PID reuse and a
+   * stale manifest/pipe can never inherit a running worker.
+   */
+  hostOwnerIdentityOf(sid: string): string | null {
+    const pty = this.ptySessions.get(sid);
+    const host = pty instanceof RemoteWindowsPtySession && pty.hosting === "windows-session-host"
+      ? pty.manifest
+      : (() => {
+          const structured = this.structuredSessions.get(sid);
+          return structured instanceof WindowsRemoteStructuredSession && structured.hosting === "windows-session-host"
+            ? structured.manifest.host
+            : null;
+        })();
+    if (!host) return null;
+    return `windows-session-host:${host.epoch}:${host.owner.pid}:${host.owner.creationTime100ns}`;
+  }
+
   list(): SessionInfo[] {
     return [
       ...[...this.ptySessions.values()].map((s) => s.info()),
@@ -945,7 +1096,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   }
 
   /** 任意一个结构化会话;账号级查询(用量/限流)用它当入口 */
-  anyStructured(): StructuredSession | RemoteStructuredSession | null {
+  anyStructured(): StructuredSession | RemoteStructuredSession | WindowsRemoteStructuredSession | null {
     return this.structuredSessions.values().next().value ?? null;
   }
 
@@ -953,8 +1104,8 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
    * 每个 (agent, accountId) 各挑一个结构化会话。多账号之后只按 agent
    * 合并会把两份订阅额度混在一起；旧会话没有 accountId 时仍归到 legacy。
    */
-  structuredPerAgent(): Array<StructuredSession | RemoteStructuredSession> {
-    const byAccount = new Map<string, StructuredSession | RemoteStructuredSession>();
+  structuredPerAgent(): Array<StructuredSession | RemoteStructuredSession | WindowsRemoteStructuredSession> {
+    const byAccount = new Map<string, StructuredSession | RemoteStructuredSession | WindowsRemoteStructuredSession>();
     for (const s of this.structuredSessions.values()) {
       // 后来的覆盖先前的:新会话更可能刚从服务端拿到过限流推送
       byAccount.set(`${s.agent}\u0000${s.accountId ?? "legacy"}`, s);
@@ -995,7 +1146,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     const structured = this.structuredSessions.get(sid);
     if (structured) {
       const info = structured.info();
-      if (structured instanceof RemoteStructuredSession) {
+      if (structured instanceof RemoteStructuredSession || structured instanceof WindowsRemoteStructuredSession) {
         // The only daemon operation allowed to terminate a detached owner.
         // disposeAll() below deliberately calls dispose() instead.
         await structured.kill();
@@ -1020,7 +1171,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     }
     const pty = this.requirePty(sid);
     const info = pty.info();
-    if (pty instanceof RemotePtySession) await pty.kill();
+    if (pty instanceof RemotePtySession || pty instanceof RemoteWindowsPtySession) await pty.kill();
     else pty.dispose();
     // tmux 下 dispose 只是断开 client,进程还在 server 里活着 —— kill 得说到做到
     if (this.tmuxEnabled) tmux.killSession(sid);
@@ -1031,7 +1182,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       // A detached facade already records an explicit kill as `done`; retain
       // that user-visible distinction instead of turning it into an apparent
       // owner crash while removing it from this daemon's session table.
-      status: pty instanceof RemotePtySession ? "done" : (info.status === "done" ? "done" : "died"),
+      status: pty instanceof RemotePtySession || pty instanceof RemoteWindowsPtySession ? "done" : (info.status === "done" ? "done" : "died"),
     });
   }
 

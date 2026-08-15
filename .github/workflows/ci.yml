@@ -210,6 +210,12 @@ jobs:
           path: packages/windows-native/prebuilds/win32-${{ matrix.arch }}
       - name: Load the signed artifact through the production loader
         run: node packages/windows-native/scripts/smoke-loader.mjs --package-root packages/windows-native --expect valid
+      - name: Exercise the signed Session Host ConPTY worker
+        env:
+          PROSPERO_WINDOWS_SIGNED_SESSION_HOST_TEST: "1"
+        run: |
+          npm run build --workspace=@prospero/daemon
+          npm run test:windows-native --workspace=@prospero/daemon
 
   release-publish:
     name: Publish Windows native npm package with provenance

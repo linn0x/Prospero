@@ -20,6 +20,7 @@ import crossSpawn from "cross-spawn";
 import {
   AdapterError,
   summarize,
+  terminateUnregisteredProviderProcess,
   type AdapterContext,
   type AdapterResumeState,
   type AgentAdapter,
@@ -32,6 +33,8 @@ export interface GrokAdapterOptions {
 }
 
 export class GrokAdapter implements AgentAdapter {
+  /** Each headless turn inherits the Session Host's Job before execution. */
+  readonly durableProviderJobCompatible = true;
   private readonly sessionId: string;
   private started: boolean;
 
@@ -92,6 +95,13 @@ export class GrokAdapter implements AgentAdapter {
       env: { ...process.env, ...this.ctx.env },
     });
     this.turn = proc;
+    try {
+      await this.ctx.registerProviderProcess?.(proc);
+    } catch (error) {
+      this.turn = null;
+      await terminateUnregisteredProviderProcess(proc);
+      throw error;
+    }
     proc.stdout?.setEncoding("utf8");
     proc.stdout?.on("data", (chunk: string) => this.onStdout(chunk));
     let stderr = "";

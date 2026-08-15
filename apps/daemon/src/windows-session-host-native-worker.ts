@@ -9,6 +9,7 @@ import { createHmac } from "node:crypto";
 import { parentPort } from "node:worker_threads";
 import {
   loadWindowsNative,
+  type JobObjectHandle,
   type NativeWindowsBinding,
   type ProcessIdentity,
   type SecureNamedPipeConnectionHandle,
@@ -30,6 +31,7 @@ let pipeServer: SecureNamedPipeServerHandle | null = null;
 let pipeConnection: SecureNamedPipeConnectionHandle | null = null;
 let peerIdentity: unknown = null;
 let credential: Buffer | null = null;
+let providerJob: JobObjectHandle | null = null;
 
 function asBytes(value: unknown, name: string): Uint8Array {
   if (!(value instanceof Uint8Array)) throw new Error(`${name} must be Uint8Array`);
@@ -96,6 +98,13 @@ function request(op: string, args: Record<string, unknown>): unknown {
         throw error;
       }
     }
+    case "state.list": {
+      const entries = addon.listSecureStateEntries(directory());
+      if (!Array.isArray(entries) || !entries.every((entry) => typeof entry === "string")) {
+        throw new Error("native secure state entry list is invalid");
+      }
+      return entries;
+    }
     case "state.write": {
       const name = args["name"];
       if (typeof name !== "string") throw new Error("state filename is invalid");
@@ -139,9 +148,51 @@ function request(op: string, args: Record<string, unknown>): unknown {
     }
     case "credential.hmac": return hmac(asBytes(args["material"], "HMAC material"));
     case "identity.current": return addon.getCurrentProcessIdentity();
+    case "identity.process": {
+      const pid = args["pid"];
+      if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid < 2 || pid > 0x7fffffff) {
+        throw new Error("provider process pid is invalid");
+      }
+      return addon.getProcessIdentity(pid);
+    }
     case "identity.matches": {
       const identity = args["identity"] as ProcessIdentity;
       return addon.matchesProcessIdentity(identity);
+    }
+    case "job.create": {
+      if (providerJob !== null) throw new Error("provider Job Object is already active");
+      providerJob = addon.createJobObject({ killOnClose: true });
+      return providerJob;
+    }
+    case "job.assign": {
+      if (providerJob === null) throw new Error("provider Job Object is not active");
+      addon.assignProcessToJob(providerJob, args["process"] as ProcessIdentity);
+      return undefined;
+    }
+    case "job.contains": {
+      if (providerJob === null) throw new Error("provider Job Object is not active");
+      return addon.isProcessInJob(providerJob, args["process"] as ProcessIdentity);
+    }
+    case "job.terminate": {
+      if (providerJob === null) throw new Error("provider Job Object is not active");
+      addon.terminateJobObject(providerJob, 0xC000013A);
+      return undefined;
+    }
+    case "job.close": {
+      const previous = providerJob;
+      providerJob = null;
+      if (previous !== null) addon.closeJobObject(previous);
+      return undefined;
+    }
+    case "identity.terminate": {
+      const identity = args["identity"] as ProcessIdentity;
+      const exitCode = args["exitCode"];
+      const timeoutMs = args["timeoutMs"];
+      if (typeof exitCode !== "number" || !Number.isSafeInteger(exitCode) || exitCode < 0 || exitCode > 0xffff_ffff ||
+        typeof timeoutMs !== "number" || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) {
+        throw new Error("exact process termination options are invalid");
+      }
+      return addon.terminateProcessIfIdentity(identity, exitCode, timeoutMs);
     }
     case "pipe.create": {
       const pipeName = args["pipeName"];
@@ -201,15 +252,18 @@ function request(op: string, args: Record<string, unknown>): unknown {
       const previousConnection = pipeConnection;
       const previousServer = pipeServer;
       const previousDirectory = stateDirectory;
+      const previousJob = providerJob;
       credential?.fill(0);
       credential = null;
       pipeConnection = null;
       pipeServer = null;
       stateDirectory = null;
+      providerJob = null;
       peerIdentity = null;
       if (previousConnection !== null) addon.closeSecureNamedPipeConnection(previousConnection);
       if (previousServer !== null) addon.closeSecureNamedPipeServer(previousServer);
       if (previousDirectory !== null) addon.closeSecureStateDirectory(previousDirectory);
+      if (previousJob !== null) addon.closeJobObject(previousJob);
       return undefined;
     }
     default: throw new Error(`unknown native worker operation: ${op}`);

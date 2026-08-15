@@ -17,6 +17,7 @@ import crossSpawn from "cross-spawn";
 import {
   AdapterError,
   summarize,
+  terminateUnregisteredProviderProcess,
   type AdapterContext,
   type AdapterResumeState,
   type AgentAdapter,
@@ -56,11 +57,17 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 /** 起 opencode serve 并持续消费 SSE;整个 daemon 共用一个 */
-async function startSharedServer(): Promise<SharedServer> {
+async function startSharedServer(registerProviderProcess?: AdapterContext["registerProviderProcess"]): Promise<SharedServer> {
   const proc = crossSpawn("opencode", ["serve", "--hostname", "127.0.0.1", "--port", "0"], {
     stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env },
   });
+  try {
+    await registerProviderProcess?.(proc);
+  } catch (error) {
+    await terminateUnregisteredProviderProcess(proc);
+    throw error;
+  }
 
   const port = await new Promise<number>((resolve, reject) => {
     const timer = setTimeout(
@@ -166,8 +173,8 @@ async function consumeEvents(server: SharedServer): Promise<void> {
   }
 }
 
-function sharedServer(): Promise<SharedServer> {
-  sharedPromise ??= startSharedServer().catch((e: unknown) => {
+function sharedServer(registerProviderProcess?: AdapterContext["registerProviderProcess"]): Promise<SharedServer> {
+  sharedPromise ??= startSharedServer(registerProviderProcess).catch((e: unknown) => {
     sharedPromise = null;
     throw e;
   });
@@ -188,6 +195,9 @@ export interface OpencodeAdapterOptions {
 export class OpencodeAdapter implements AgentAdapter {
   constructor(private readonly opts: OpencodeAdapterOptions = {}) {}
 
+  /** The host-in-Job boundary protects the shared server and its descendants. */
+  readonly durableProviderJobCompatible = true;
+
   private server: SharedServer | null = null;
   private sessionId: string | null = null;
   private ctx: AdapterContext | null = null;
@@ -196,7 +206,7 @@ export class OpencodeAdapter implements AgentAdapter {
 
   async start(ctx: AdapterContext): Promise<void> {
     this.ctx = ctx;
-    const server = await sharedServer();
+    const server = await sharedServer(ctx.registerProviderProcess);
     this.server = server;
 
     const resumeSessionId =

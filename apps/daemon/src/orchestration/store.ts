@@ -1160,6 +1160,7 @@ export class OrchestrationStore {
   createDispatch(input: {
     taskId: string;
     sessionId: string;
+    hostOwnerIdentity?: string | undefined;
     worktreePath?: string | null;
   }): Dispatch {
     const task = this.getTask(input.taskId);
@@ -1195,6 +1196,7 @@ export class OrchestrationStore {
       runId: task.runId,
       taskId: task.id,
       sessionId: input.sessionId,
+      ...(input.hostOwnerIdentity ? { hostOwnerIdentity: input.hostOwnerIdentity } : {}),
       worktreePath: input.worktreePath ?? null,
       state: "starting",
       startedAt: Date.now(),
