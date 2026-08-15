@@ -152,10 +152,11 @@ struct PipeConnection {
   std::vector<BYTE> expected_logon_sid;
   DWORD expected_session_id = 0;
   DWORD minimum_integrity_rid = 0;
-  // A byte-mode pipe has no message boundary beyond ReadFile itself. Keep the
-  // first-frame proof on the same native call that consumed those bytes: after
-  // control returns to Node, a later N-API call must not be responsible for
-  // establishing the impersonation context that authorizes a response.
+  // A byte-mode pipe has no message boundary beyond ReadFile itself. Verify
+  // OS peer identity on the native call that consumed the first non-empty
+  // read: after control returns to Node, a later N-API call must not be
+  // responsible for establishing the impersonation context that authorizes a
+  // response. HMAC framing is an upper-layer protocol concern.
   std::mutex read_mutex;
   std::mutex peer_mutex;
   bool peer_authenticated = false;
@@ -750,7 +751,12 @@ extern "C" prospero_status prospero_secure_pipe_connection_read(
     authentication_failed = status != PROSPERO_STATUS_OK;
   }
   if (authentication_failed) {
-    // A first-frame proof failure may not be retried on the same connection.
+    // The first non-empty read did not authenticate this OS peer, so it may
+    // not be retried on the same connection. The completed read's contents
+    // must never reach Node on an authentication error.
+    const uint32_t bytes_to_clear = *out_read;
+    SecureZeroMemory(buffer, bytes_to_clear);
+    *out_read = 0;
     // Close only after the read lease drains so CancelIoEx cannot deadlock
     // against this call; preserve the original validation status for JS.
     connection->endpoint->CancelAndDisconnect();
