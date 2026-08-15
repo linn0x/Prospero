@@ -95,6 +95,10 @@ constexpr ULONG kFileOpen = 0x00000001UL;
 constexpr ULONG kFileCreate = 0x00000002UL;
 constexpr ULONG kFileOpenIf = 0x00000003UL;
 constexpr ULONG kFileDirectoryInformation = 1UL;
+constexpr ULONG kFileRenameInformation =
+    prospero_file_rename_layout::kFileRenameInformation;
+constexpr NtStatus kStatusSuccess = 0;
+constexpr NtStatus kStatusPending = 0x00000103L;
 constexpr NtStatus kStatusObjectNameCollision = static_cast<NtStatus>(0xC0000035UL);
 constexpr NtStatus kStatusNoMoreFiles = static_cast<NtStatus>(0x80000006UL);
 constexpr uint64_t kMaximumStateFileBytes = 64ULL * 1024ULL * 1024ULL;
@@ -119,6 +123,8 @@ struct NtObjectAttributes {
 };
 
 struct NtIoStatusBlock {
+  // ABI-compatible with WDK IO_STATUS_BLOCK; keep this local so the addon
+  // does not depend on WDK headers.
   union {
     NtStatus status;
     PVOID pointer;
@@ -140,16 +146,31 @@ struct NtFileDirectoryInformation {
   WCHAR file_name[1];
 };
 
+// This is the WDK FILE_RENAME_INFORMATION layout used by
+// NtSetInformationFile(FileRenameInformation). Do not use the similarly
+// shaped Win32 FILE_RENAME_INFO / SetFileInformationByHandle request here:
+// with a simple name and NULL RootDirectory, the NT operation is anchored to
+// the already-open source file's directory rather than process CWD.
+struct NtFileRenameInformation {
+  BOOLEAN replace_if_exists;
+  HANDLE root_directory;
+  ULONG file_name_length;
+  WCHAR file_name[1];
+};
+
 using NtCreateFileFn = NtStatus(NTAPI*)(
     PHANDLE, ACCESS_MASK, NtObjectAttributes*, NtIoStatusBlock*, PLARGE_INTEGER,
     ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
 using NtQueryDirectoryFileFn = NtStatus(NTAPI*)(
     HANDLE, HANDLE, PVOID, PVOID, NtIoStatusBlock*, PVOID, ULONG, ULONG,
     BOOLEAN, NtUnicodeString*, BOOLEAN);
+using NtSetInformationFileFn = NtStatus(NTAPI*)(
+    HANDLE, NtIoStatusBlock*, PVOID, ULONG, ULONG);
 
 struct NtApi {
   NtCreateFileFn create_file = nullptr;
   NtQueryDirectoryFileFn query_directory_file = nullptr;
+  NtSetInformationFileFn set_information_file = nullptr;
 };
 
 struct StateDirectory {
@@ -174,25 +195,27 @@ thread_local prospero_secure_state_write_error_category g_last_write_error_categ
 
 static_assert(sizeof(HANDLE) == sizeof(uint64_t),
               "secure state writes require Windows x64 or arm64 handles");
-static_assert(offsetof(FILE_RENAME_INFO, ReplaceIfExists) ==
-                  offsetof(prospero_file_rename_layout::Windows64FileRenameInfo,
+static_assert(kFileRenameInformation == 10UL,
+              "NtSetInformationFile FileRenameInformation value changed");
+static_assert(offsetof(NtFileRenameInformation, replace_if_exists) ==
+                  offsetof(prospero_file_rename_layout::Windows64FileRenameInformation,
                            replace_if_exists),
-              "SDK FILE_RENAME_INFO ReplaceIfExists layout changed");
-static_assert(offsetof(FILE_RENAME_INFO, RootDirectory) ==
-                  offsetof(prospero_file_rename_layout::Windows64FileRenameInfo,
+              "WDK FILE_RENAME_INFORMATION ReplaceIfExists layout changed");
+static_assert(offsetof(NtFileRenameInformation, root_directory) ==
+                  offsetof(prospero_file_rename_layout::Windows64FileRenameInformation,
                            root_directory),
-              "SDK FILE_RENAME_INFO RootDirectory layout changed");
-static_assert(offsetof(FILE_RENAME_INFO, FileNameLength) ==
-                  offsetof(prospero_file_rename_layout::Windows64FileRenameInfo,
+              "WDK FILE_RENAME_INFORMATION RootDirectory layout changed");
+static_assert(offsetof(NtFileRenameInformation, file_name_length) ==
+                  offsetof(prospero_file_rename_layout::Windows64FileRenameInformation,
                            file_name_length),
-              "SDK FILE_RENAME_INFO FileNameLength layout changed");
-static_assert(offsetof(FILE_RENAME_INFO, FileName) ==
-                  offsetof(prospero_file_rename_layout::Windows64FileRenameInfo,
+              "WDK FILE_RENAME_INFORMATION FileNameLength layout changed");
+static_assert(offsetof(NtFileRenameInformation, file_name) ==
+                  offsetof(prospero_file_rename_layout::Windows64FileRenameInformation,
                            file_name),
-              "SDK FILE_RENAME_INFO FileName layout changed");
-static_assert(sizeof(FILE_RENAME_INFO) ==
-                  sizeof(prospero_file_rename_layout::Windows64FileRenameInfo),
-              "SDK FILE_RENAME_INFO size changed");
+              "WDK FILE_RENAME_INFORMATION FileName layout changed");
+static_assert(sizeof(NtFileRenameInformation) ==
+                  sizeof(prospero_file_rename_layout::Windows64FileRenameInformation),
+              "WDK FILE_RENAME_INFORMATION size changed");
 
 prospero_status WriteFailure(
     prospero_secure_state_write_stage stage,
@@ -218,6 +241,33 @@ prospero_secure_state_write_error_category Win32ErrorCategory(DWORD error) {
     case ERROR_SHARING_VIOLATION:
     case ERROR_LOCK_VIOLATION:
       return PROSPERO_SECURE_STATE_WRITE_ERROR_SHARING_VIOLATION;
+    case ERROR_NOT_SAME_DEVICE:
+      return PROSPERO_SECURE_STATE_WRITE_ERROR_NOT_SAME_DEVICE;
+    case ERROR_NOT_SUPPORTED:
+      return PROSPERO_SECURE_STATE_WRITE_ERROR_NOT_SUPPORTED;
+    default:
+      return PROSPERO_SECURE_STATE_WRITE_ERROR_OTHER;
+  }
+}
+
+prospero_secure_state_write_error_category NtStatusErrorCategory(NtStatus status) {
+  switch (static_cast<ULONG>(status)) {
+    case 0xC0000022UL:  // STATUS_ACCESS_DENIED
+      return PROSPERO_SECURE_STATE_WRITE_ERROR_ACCESS_DENIED;
+    case 0xC000000DUL:  // STATUS_INVALID_PARAMETER
+      return PROSPERO_SECURE_STATE_WRITE_ERROR_INVALID_PARAMETER;
+    case 0xC0000034UL:  // STATUS_OBJECT_NAME_NOT_FOUND
+    case 0xC000003AUL:  // STATUS_OBJECT_PATH_NOT_FOUND
+    case 0xC0000008UL:  // STATUS_INVALID_HANDLE
+      return PROSPERO_SECURE_STATE_WRITE_ERROR_NOT_FOUND;
+    case 0xC0000043UL:  // STATUS_SHARING_VIOLATION
+    case 0xC0000054UL:  // STATUS_FILE_LOCK_CONFLICT
+      return PROSPERO_SECURE_STATE_WRITE_ERROR_SHARING_VIOLATION;
+    case 0xC00000D4UL:  // STATUS_NOT_SAME_DEVICE
+      return PROSPERO_SECURE_STATE_WRITE_ERROR_NOT_SAME_DEVICE;
+    case 0xC00000BBUL:  // STATUS_NOT_SUPPORTED
+    case 0xC0000010UL:  // STATUS_INVALID_DEVICE_REQUEST
+      return PROSPERO_SECURE_STATE_WRITE_ERROR_NOT_SUPPORTED;
     default:
       return PROSPERO_SECURE_STATE_WRITE_ERROR_OTHER;
   }
@@ -247,6 +297,7 @@ prospero_status StatusFromNt(NtStatus status) {
       return PROSPERO_STATUS_ACCESS_DENIED;
     case 0xC0000034UL:  // STATUS_OBJECT_NAME_NOT_FOUND
     case 0xC000003AUL:  // STATUS_OBJECT_PATH_NOT_FOUND
+    case 0xC0000008UL:  // STATUS_INVALID_HANDLE
     case 0x80000006UL:  // STATUS_NO_MORE_FILES
       return PROSPERO_STATUS_NOT_FOUND;
     case 0xC000000DUL:  // STATUS_INVALID_PARAMETER
@@ -264,9 +315,12 @@ const NtApi* GetNtApi() {
     result.create_file = reinterpret_cast<NtCreateFileFn>(GetProcAddress(ntdll, "NtCreateFile"));
     result.query_directory_file = reinterpret_cast<NtQueryDirectoryFileFn>(
         GetProcAddress(ntdll, "NtQueryDirectoryFile"));
+    result.set_information_file = reinterpret_cast<NtSetInformationFileFn>(
+        GetProcAddress(ntdll, "NtSetInformationFile"));
     return result;
   }();
-  return api.create_file != nullptr && api.query_directory_file != nullptr
+  return api.create_file != nullptr && api.query_directory_file != nullptr &&
+                 api.set_information_file != nullptr
              ? &api
              : nullptr;
 }
@@ -820,11 +874,12 @@ extern "C" prospero_status prospero_secure_state_directory_write_atomic(
                                                          : PROSPERO_STATUS_SYSTEM_ERROR);
     }
     const size_t file_name_bytes = file_name_characters * sizeof(WCHAR);
-    // Microsoft requires sizeof(FILE_RENAME_INFO) plus the UTF-16 file-name
-    // bytes. sizeof includes the fixed structure's trailing ABI padding; using
-    // offsetof(FileName) plus a NUL is two bytes short for manifest.json on
-    // Windows x64 and arm64, and SetFileInformationByHandle rejects it.
-    const size_t rename_bytes = sizeof(FILE_RENAME_INFO) + file_name_bytes;
+    // FILE_RENAME_INFORMATION has a one-element trailing array. The native
+    // request must include the full fixed sizeof value plus exactly the UTF-16
+    // name bytes; offsetof(FileName) plus a NUL is two bytes short for
+    // manifest.json on Windows x64 and arm64.
+    const size_t rename_bytes =
+        prospero_file_rename_layout::FileRenameInformationBufferBytes(file_name_bytes);
     if (rename_bytes == 0 || rename_bytes > MAXDWORD) {
       const prospero_status cleanup = CleanupTemporaryFile(temporary);
       temporary = INVALID_HANDLE_VALUE;
@@ -835,30 +890,40 @@ extern "C" prospero_status prospero_secure_state_directory_write_atomic(
                                                          : PROSPERO_STATUS_SYSTEM_ERROR);
     }
     std::vector<BYTE> rename_storage(rename_bytes, 0);
-    FILE_RENAME_INFO* rename = reinterpret_cast<FILE_RENAME_INFO*>(rename_storage.data());
+    NtFileRenameInformation* rename =
+        reinterpret_cast<NtFileRenameInformation*>(rename_storage.data());
     const auto rename_request =
-        prospero_file_rename_layout::MakeSameDirectoryRenameRequest<HANDLE>(
+        prospero_file_rename_layout::MakeNtSetInformationFileRenameRequest<HANDLE>(
             static_cast<DWORD>(file_name_bytes));
-    rename->ReplaceIfExists = rename_request.replace_if_exists == 0 ? FALSE : TRUE;
-    // FileName is a strictly validated simple name. Per FILE_RENAME_INFO,
-    // NULL means rename the already-open temporary file within its current
-    // directory. That current directory is securely anchored by the temp file
-    // itself, which was created relative to the verified directory handle.
-    rename->RootDirectory = rename_request.root_directory;
-    rename->FileNameLength = rename_request.file_name_length;
-    memcpy(rename->FileName, file_name, file_name_bytes);
-    if (!SetFileInformationByHandle(temporary, FileRenameInfo, rename,
-                                    static_cast<DWORD>(rename_storage.size()))) {
-      const DWORD rename_error = GetLastError();
-      const prospero_status rename_status = StatusFromLastError(rename_error);
+    rename->replace_if_exists = rename_request.rename.replace_if_exists == 0 ? FALSE : TRUE;
+    // FileName is a strictly validated simple name. For
+    // NtSetInformationFile(FileRenameInformation), NULL means rename the
+    // already-open temporary file within its source directory. That directory
+    // is securely anchored by the temp handle created relative to the verified
+    // directory handle; it is never resolved through process CWD.
+    rename->root_directory = rename_request.rename.root_directory;
+    rename->file_name_length = rename_request.rename.file_name_length;
+    memcpy(rename->file_name, file_name, file_name_bytes);
+    NtIoStatusBlock rename_io_status{};
+    rename_io_status.value.status = kStatusPending;
+    const NtStatus rename_status = api->set_information_file(
+        temporary, &rename_io_status, rename, static_cast<ULONG>(rename_storage.size()),
+        rename_request.information_class);
+    // A successful syscall return is insufficient: inspect the IO_STATUS_BLOCK
+    // filled by NtSetInformationFile too. This synchronous handle must report
+    // STATUS_SUCCESS in both places before the temporary can be considered
+    // committed and its cleanup responsibility released.
+    if (rename_status != kStatusSuccess || rename_io_status.value.status != kStatusSuccess) {
+      const NtStatus failure_status =
+          rename_status != kStatusSuccess ? rename_status : rename_io_status.value.status;
       const prospero_status cleanup = CleanupTemporaryFile(temporary);
       temporary = INVALID_HANDLE_VALUE;
       return WriteFailure(cleanup == PROSPERO_STATUS_OK
                               ? PROSPERO_SECURE_STATE_WRITE_STAGE_RENAME
                               : PROSPERO_SECURE_STATE_WRITE_STAGE_CLEANUP,
-                          cleanup == PROSPERO_STATUS_OK ? rename_status
+                          cleanup == PROSPERO_STATUS_OK ? StatusFromNt(failure_status)
                                                          : PROSPERO_STATUS_SYSTEM_ERROR,
-                          Win32ErrorCategory(rename_error));
+                          NtStatusErrorCategory(failure_status));
     }
     CloseHandle(temporary);
     temporary = INVALID_HANDLE_VALUE;
