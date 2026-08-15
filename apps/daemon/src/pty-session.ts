@@ -33,6 +33,7 @@ const FLUSH_MS = 16;
 const SCROLLBACK_LINES = 2000;
 const RING_BYTES = 1024 * 1024;
 const INPUT_CHUNK = 1024; // >1KB 粘贴经 PTY 有死锁报告,分片写入
+const KILL_ESCALATION_MS = 500;
 
 export interface PtySessionOptions {
   id: string;
@@ -44,6 +45,8 @@ export interface PtySessionOptions {
   file: string;
   args: string[];
   env: Record<string, string>;
+  /** Reattached detached hosts preserve the launcher-assigned creation time. */
+  createdAt?: number;
   accountId?: string;
   accountName?: string;
 }
@@ -66,7 +69,7 @@ export class PtySession extends EventEmitter<PtySessionEvents> {
   readonly agent: AgentKind;
   readonly title: string;
   readonly cwd: string;
-  readonly createdAt = Date.now();
+  readonly createdAt: number;
   readonly accountId: string | undefined;
   readonly accountName: string | undefined;
   readonly ring = new OutputRing(RING_BYTES);
@@ -83,6 +86,7 @@ export class PtySession extends EventEmitter<PtySessionEvents> {
   private pending: string[] = [];
   private pendingBytes = 0;
   private flushTimer: NodeJS.Timeout | null = null;
+  private killEscalationTimer: NodeJS.Timeout | null = null;
   /** 终端查询序列可能跨 chunk 断裂,保留尾部少量字节做拼接匹配 */
   private queryCarry = "";
 
@@ -94,6 +98,7 @@ export class PtySession extends EventEmitter<PtySessionEvents> {
     this.cwd = opts.cwd;
     this.accountId = opts.accountId;
     this.accountName = opts.accountName;
+    this.createdAt = opts.createdAt ?? Date.now();
     this.cols = opts.cols;
     this.rows = opts.rows;
 
@@ -215,7 +220,32 @@ export class PtySession extends EventEmitter<PtySessionEvents> {
   }
 
   kill(): void {
-    if (!this.exited) this.proc.kill();
+    if (this.exited) return;
+    // forkpty normally gives the child its own process group. Address that
+    // group first so an agent which spawned helpers does not outlive an
+    // explicit session.kill. If a platform/node-pty build does not expose a
+    // group at this PID, retain node-pty's established single-process path.
+    if (process.platform !== "win32") {
+      try {
+        process.kill(-this.proc.pid, "SIGTERM");
+        // dispose() may detach the daemon immediately. Keep its own bounded
+        // escalation so an in-process session cannot leave a helper tree alive
+        // merely because the shell ignores SIGTERM.
+        if (this.killEscalationTimer === null) {
+          const pid = this.proc.pid;
+          this.killEscalationTimer = setTimeout(() => {
+            this.killEscalationTimer = null;
+            try { process.kill(-pid, "SIGKILL"); }
+            catch { /* leader/group is already gone or cannot be addressed */ }
+          }, KILL_ESCALATION_MS);
+          this.killEscalationTimer.unref?.();
+        }
+        return;
+      } catch {
+        // ESRCH/EINVAL mean there is no independently addressable group.
+      }
+    }
+    this.proc.kill();
   }
 
   dispose(): void {

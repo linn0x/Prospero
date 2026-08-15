@@ -83,6 +83,7 @@ import {
 } from "./fs-ops.js";
 import * as gitOps from "./git-ops.js";
 import type { PtySession } from "./pty-session.js";
+import type { RemotePtySession } from "./pty-supervisor-client.js";
 import { searchLocalConversations } from "./local-conversations.js";
 import { DAEMON_VERSION } from "./version.js";
 import { AgentAccountError, AgentAccountManager } from "./agent-accounts.js";
@@ -146,6 +147,8 @@ export interface DaemonServerOptions {
   useTmux?: boolean | undefined;
   /** Detached structured owners are production-default; tests may opt out. */
   structuredSupervisor?: boolean | undefined;
+  /** Detached PTY hosts are production-default on Unix; tests may opt out. */
+  ptySupervisor?: boolean | undefined;
   devMode?: boolean;
   hostName?: string | undefined;
   /** 推送通道配置;省略则不推送 */
@@ -239,6 +242,7 @@ export async function createDaemonServer(
     // servers intentionally exercise the legacy path unless a test asks for
     // an isolated supervisor explicitly.
     supervisor: opts.structuredSupervisor ?? process.env["VITEST"] !== "true",
+    ptySupervisor: opts.ptySupervisor ?? process.env["VITEST"] !== "true",
     ...(opts.useTmux ? { tmux: { home: opts.home } } : {}),
     sessionEnv: (sessionId) => ({
       PROSPERO_SESSION_ID: sessionId,
@@ -273,7 +277,7 @@ export async function createDaemonServer(
     port: opts.port,
     bind: opts.bindAddr ?? null,
     controlToken,
-    persistence: { pty: manager.tmuxEnabled, structured: true },
+    persistence: { pty: manager.tmuxEnabled || manager.ptySupervisorEnabled, structured: true },
   });
   const conns = new Set<Conn>();
   const devMode = opts.devMode ?? false;
@@ -502,7 +506,7 @@ export async function createDaemonServer(
   });
 
   /** 用快照把某个 attachment 拉到最新(attach 全量 / 背压追平 / gap 淘汰共用) */
-  async function sendSnapshot(conn: Conn, sid: string, session: PtySession, att: AttachState): Promise<void> {
+  async function sendSnapshot(conn: Conn, sid: string, session: PtySession | RemotePtySession, att: AttachState): Promise<void> {
     if (att.snapshotInflight) return;
     att.snapshotInflight = true;
     att.paused = true; // 快照生成期间挡住流式输出,避免乱序
@@ -825,7 +829,7 @@ export async function createDaemonServer(
               accounts.setDefault(msg.accountId);
               break;
             case "agent.account.login": {
-              const info = manager.createAccountLogin(
+              const info = await manager.createAccountLogin(
                 accounts.loginSpec(msg.accountId),
                 msg.cols,
                 msg.rows,
@@ -1192,10 +1196,10 @@ export async function createDaemonServer(
         return;
       }
       case "term.input":
-        manager.requirePty(msg.sid).writeInput(utf8Decode(fromB64(msg.dataB64)));
+        await manager.requirePty(msg.sid).writeInput(utf8Decode(fromB64(msg.dataB64)));
         return;
       case "term.resize":
-        manager.requirePty(msg.sid).resize(msg.cols, msg.rows);
+        await manager.requirePty(msg.sid).resize(msg.cols, msg.rows);
         return;
       case "term.ack": {
         const att = conn.attachments.get(msg.sid);
@@ -1872,10 +1876,10 @@ export async function createDaemonServer(
               .send(message.text, message.attachments, message.delivery);
             break;
           case "term.input":
-            manager.requirePty(sid).writeInput(utf8Decode(fromB64(message.dataB64)));
+            await manager.requirePty(sid).writeInput(utf8Decode(fromB64(message.dataB64)));
             break;
           case "term.resize":
-            manager.requirePty(sid).resize(message.cols, message.rows);
+            await manager.requirePty(sid).resize(message.cols, message.rows);
             break;
           case "permission.respond":
             await manager
@@ -2165,7 +2169,10 @@ export async function createDaemonServer(
 
   // 接管上一轮留下的 tmux 会话。必须在 statusFile.start 之前,
   // 否则壳会先看到一份"零会话"的快照。
-  const restoredPty = manager.restoreFromTmux();
+  const restoredPty = [
+    ...(await manager.restoreFromTmux()),
+    ...(await manager.restorePtySupervisors()),
+  ];
   const restoredStructured = await manager.restoreStructured({
     // 先于 adapter.start 封存已结算 worker，避免重启窗口重新消费旧 worktree 的队列。
     // 每条 state 恢复前即时读取 Store：control socket 已启用，旧 worker 可能恰在

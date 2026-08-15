@@ -20,6 +20,11 @@ import {
 import { createConnection, createServer, type Socket } from "node:net";
 import path from "node:path";
 import type { AgentEventBody } from "@prospero/protocol";
+import {
+  isStructuredSupervisorEndpoint,
+  structuredSupervisorPlatformGate,
+  structuredSupervisorTransport,
+} from "./structured-supervisor-platform.js";
 
 const MAX_LINE_BYTES = 1024 * 1024;
 const MAX_EVENTS_PER_SESSION = 4_000;
@@ -467,12 +472,16 @@ async function removeVerifiedStaleSocket(socketPath: string): Promise<void> {
 export async function startStructuredSupervisor(
   opts: StructuredSupervisorOptions,
 ): Promise<StructuredSupervisor> {
+  const platformGate = structuredSupervisorPlatformGate();
+  if (platformGate) throw new SupervisorError(platformGate, "unsupported_platform");
+  const transport = structuredSupervisorTransport();
+  if (!transport) throw new SupervisorError("structured supervisor transport is unavailable", "unsupported_platform");
   mkdirSync(opts.home, { recursive: true, mode: 0o700 });
   chmodSync(opts.home, 0o700);
-  if (process.platform === "win32") {
-    throw new SupervisorError("structured supervisor 纵切暂只支持 Unix socket", "unsupported_platform");
-  }
   const socketPath = opts.socketPath ?? path.join(opts.home, "supervisor.sock");
+  if (!isStructuredSupervisorEndpoint(socketPath, transport)) {
+    throw new SupervisorError("structured supervisor endpoint 与当前平台不兼容", "bad_request");
+  }
   const tokenPath = opts.tokenPath ?? path.join(opts.home, "supervisor.token");
   const token = opts.token ?? randomBytes(32).toString("base64url");
 

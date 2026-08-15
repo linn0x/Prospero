@@ -63,7 +63,9 @@ On Unix, each supervisor gets a 0700 owner directory and a fresh 256-bit capabil
 
 macOS limits Unix-domain socket path length. The production launcher therefore atomically creates a random, compact 0700 `/tmp/prospero-supervisor-<nonce>/` directory and records its `s.sock` endpoint in the private 0600 manifest, while the token, `session.json`, attachments, and manifest remain under the 0700 owner directory. The socket itself is chmod 0600. The nonce is not an authorization mechanism: the token is; it prevents a predictable pathname collision and proves which launch owns the exact socket path. This split is essential because binding a relative `s` after the runner `chdir`s can appear to work, while a restarted daemon later fails to connect to the long absolute pathname with `EINVAL`.
 
-Do not put a capability token in argv. The launcher writes a protected token file before spawning and passes only the protected bootstrap-file path in its environment; neither stdout/stderr nor argv carries credentials. Windows needs a named-pipe equivalent with the same per-user ACL/token rule before this feature is enabled there.
+Do not put a capability token in argv. The launcher writes a protected token file before spawning and passes only the protected bootstrap-file path in its environment; neither stdout/stderr nor argv carries credentials.
+
+Windows structured supervisors are intentionally fail-closed today. A default DACL, random named-pipe path, capability token, PID, or `taskkill` is not a durable ownership or authorization boundary. Before enabling Windows, a Gate must select and implement a native Win32 security boundary with platform tests. `taskkill` is never a normal supervisor-control mechanism; if introduced for Windows, it may only clean up the exact child tree from the launch attempt that just failed.
 
 The external supervisor protocol is not Codex app-server JSON-RPC. It is a small, versioned Prospero envelope:
 
