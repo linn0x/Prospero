@@ -14,5 +14,7 @@ describe("secure named-pipe ABI v2 layout", () => {
     expect(implementation).toContain("prospero_secure_pipe_security must retain the ABI-v2 legacy SID slot");
     expect(implementation).toContain("reserved_legacy_allowed_user_sid != nullptr");
     expect(addon).toContain("options.security.reserved_legacy_allowed_user_sid = nullptr;");
+    expect(header).toContain("uint32_t session_id;");
+    expect(addon).toContain('SetUint32(env, result, "sessionId", peer.session_id)');
   });
 });
