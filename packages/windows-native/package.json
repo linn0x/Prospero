@@ -27,6 +27,7 @@
     "access": "public"
   },
   "scripts": {
+    "install": "node ./scripts/install-noop.mjs",
     "build": "tsc --build",
     "build:native": "node ./scripts/assert-windows.mjs && node-gyp rebuild",
     "test": "vitest run --passWithNoTests",
@@ -37,7 +38,7 @@
     "verify:release-pack": "node ./scripts/verify-release-pack.mjs"
   },
   "devDependencies": {
-    "node-gyp": "^11.2.0",
+    "node-gyp": "13.0.1",
     "vitest": "^3.2.7"
   }
 }
