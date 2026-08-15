@@ -99,6 +99,19 @@ export function resolveSystemPowerShellPath(
   return fileExists(powershellPath) ? powershellPath : null;
 }
 
+/**
+ * Worker-thread environment copies are case-sensitive even on Windows. Accept
+ * the platform's case-insensitive spelling while rejecting ambiguous copies.
+ */
+export function resolveSystemRootEnvironmentValue(
+  environment: Readonly<Record<string, string | undefined>>,
+): string | undefined {
+  const matches = Object.entries(environment).filter(
+    ([name, value]) => name.toLowerCase() === "systemroot" && typeof value === "string",
+  );
+  return matches.length === 1 ? matches[0]?.[1] : undefined;
+}
+
 /** Test seam; production callers must use the default runtime. */
 export interface NativeLoaderRuntime {
   readonly platform: string;
@@ -121,7 +134,7 @@ function defaultPackageRoot(): string {
 function defaultAuthenticodeCheck(binaryPath: string): AuthenticodeResult {
   let powershellPath: string | null;
   try {
-    powershellPath = resolveSystemPowerShellPath(process.env.SystemRoot);
+    powershellPath = resolveSystemPowerShellPath(resolveSystemRootEnvironmentValue(process.env));
   } catch {
     return { status: "systemroot-unavailable", thumbprintSha1: null };
   }
