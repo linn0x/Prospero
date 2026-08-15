@@ -424,7 +424,6 @@ napi_value CreateSecureNamedPipeServer(napi_env env, napi_callback_info info) {
   napi_value argv[1] = {nullptr};
   size_t argc = 0;
   napi_value pipe_name_value = nullptr;
-  napi_value allowed_sid_value = nullptr;
   napi_value max_instances_value = nullptr;
   napi_value inbound_value = nullptr;
   napi_value outbound_value = nullptr;

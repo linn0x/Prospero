@@ -152,7 +152,16 @@ struct PipeConnection {
   std::vector<BYTE> expected_logon_sid;
   DWORD expected_session_id = 0;
   DWORD minimum_integrity_rid = 0;
-  std::atomic<bool> received_message{false};
+  // A byte-mode pipe has no message boundary beyond ReadFile itself. Keep the
+  // first-frame proof on the same native call that consumed those bytes: after
+  // control returns to Node, a later N-API call must not be responsible for
+  // establishing the impersonation context that authorizes a response.
+  std::mutex read_mutex;
+  std::mutex peer_mutex;
+  bool peer_authenticated = false;
+  prospero_process_identity peer_process{};
+  std::wstring peer_user_sid;
+  DWORD peer_session_id = 0;
 };
 
 std::mutex g_registry_mutex;
@@ -514,6 +523,79 @@ void ClearPeer(prospero_pipe_peer_identity* out_peer) {
   out_peer->session_id = 0;
 }
 
+void ClearAuthenticatedPeer(PipeConnection* connection) {
+  std::lock_guard<std::mutex> lock(connection->peer_mutex);
+  connection->peer_authenticated = false;
+  connection->peer_process = {};
+  connection->peer_user_sid.clear();
+  connection->peer_session_id = 0;
+}
+
+bool HasAuthenticatedPeer(PipeConnection* connection) {
+  std::lock_guard<std::mutex> lock(connection->peer_mutex);
+  return connection->peer_authenticated;
+}
+
+// This must run immediately after the first non-empty ReadFile on the same
+// server thread. It obtains the client token while impersonating, restores the
+// server token before parsing or allocating, then records only the verified
+// identity for later reads/writes/getPeer calls.
+prospero_status AuthenticatePeerAfterFirstRead(PipeConnection* connection, HANDLE pipe) {
+  DWORD client_pid = 0;
+  if (!GetNamedPipeClientProcessId(pipe, &client_pid) || client_pid == 0) {
+    return StatusFromLastError(GetLastError());
+  }
+  prospero_process_identity process{};
+  const prospero_status process_status = prospero_get_process_identity(client_pid, &process);
+  if (process_status != PROSPERO_STATUS_OK) return process_status;
+
+  if (!ImpersonateNamedPipeClient(pipe)) return StatusFromLastError(GetLastError());
+  HANDLE client_token = nullptr;
+  const BOOL opened_token = OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &client_token);
+  const DWORD token_error = opened_token ? ERROR_SUCCESS : GetLastError();
+  if (!RevertToSelf()) {
+    if (client_token != nullptr) CloseHandle(client_token);
+    // Continuing this worker while it still impersonates the pipe client
+    // would make every later native call attacker-context dependent.
+    TerminateProcess(GetCurrentProcess(), ERROR_ACCESS_DENIED);
+    RaiseFailFastException(nullptr, nullptr, 0);
+    return PROSPERO_STATUS_SYSTEM_ERROR;
+  }
+  if (!opened_token) return StatusFromLastError(token_error);
+
+  TokenIdentity client;
+  if (!QueryTokenIdentity(client_token, &client)) {
+    const prospero_status token_status = StatusFromLastError(GetLastError());
+    CloseHandle(client_token);
+    return token_status;
+  }
+  CloseHandle(client_token);
+  if (!SidsEqual(client.user_sid, connection->expected_user_sid) ||
+      !SidsEqual(client.logon_sid, connection->expected_logon_sid) ||
+      client.session_id != connection->expected_session_id ||
+      client.integrity_rid < SECURITY_MANDATORY_MEDIUM_RID ||
+      client.integrity_rid < connection->minimum_integrity_rid) {
+    return PROSPERO_STATUS_ACCESS_DENIED;
+  }
+  uint8_t still_matches = 0;
+  const prospero_status match_status =
+      prospero_process_identity_matches(process, &still_matches);
+  if (match_status != PROSPERO_STATUS_OK) return match_status;
+  if (still_matches == 0) return PROSPERO_STATUS_NOT_FOUND;
+
+  try {
+    std::lock_guard<std::mutex> lock(connection->peer_mutex);
+    connection->peer_process = process;
+    connection->peer_user_sid = std::move(client.user_sid_text);
+    connection->peer_session_id = client.session_id;
+    connection->peer_authenticated = true;
+    return PROSPERO_STATUS_OK;
+  } catch (...) {
+    ClearAuthenticatedPeer(connection);
+    return PROSPERO_STATUS_SYSTEM_ERROR;
+  }
+}
+
 }  // namespace
 
 extern "C" prospero_status prospero_secure_pipe_server_create(
@@ -596,11 +678,11 @@ extern "C" prospero_status prospero_secure_pipe_server_accept(
       if (server->closed) return PROSPERO_STATUS_NOT_FOUND;
       if (accept_status != PROSPERO_STATUS_OK) return accept_status;
       if (server->listener == listener) {
-        server->listener.reset();  // Ownership transfers to the connection below.
-        // Keep the next endpoint pre-created whenever Windows permits it. With
-        // maxInstances=1 it remains absent until the connection closes.
-        const prospero_status next = CreateListeningInstanceLocked(server.get());
-        if (next != PROSPERO_STATUS_OK && next != PROSPERO_STATUS_SYSTEM_ERROR) return next;
+        // Ownership transfers to the connection below. Do not eagerly create
+        // another instance here: this server intentionally serializes accept,
+        // so a second unaccepted endpoint cannot make progress and a failed
+        // pre-create must never tear down a client that was already accepted.
+        server->listener.reset();
       }
     }
     auto connection = std::make_shared<PipeConnection>();
@@ -654,13 +736,24 @@ extern "C" prospero_status prospero_secure_pipe_connection_read(
   }
   const std::shared_ptr<PipeConnection> connection = FindConnection(connection_handle);
   if (connection == nullptr) return PROSPERO_STATUS_NOT_FOUND;
-  PipeIoLease lease(connection->endpoint);
-  if (!lease.acquired()) return PROSPERO_STATUS_NOT_FOUND;
-  const prospero_status status = ReadCancelable(lease.handle(), buffer, capacity, out_read);
-  if (status == PROSPERO_STATUS_OK && *out_read != 0) {
-    // Windows binds ImpersonateNamedPipeClient to the last message read. The
-    // peer proof intentionally cannot be requested before this first frame.
-    connection->received_message.store(true, std::memory_order_release);
+  std::lock_guard<std::mutex> read_lock(connection->read_mutex);
+  prospero_status status = PROSPERO_STATUS_OK;
+  bool authentication_failed = false;
+  {
+    PipeIoLease lease(connection->endpoint);
+    if (!lease.acquired()) return PROSPERO_STATUS_NOT_FOUND;
+    status = ReadCancelable(lease.handle(), buffer, capacity, out_read);
+    if (status != PROSPERO_STATUS_OK) return status;
+    if (*out_read == 0) return PROSPERO_STATUS_NOT_FOUND;
+    if (HasAuthenticatedPeer(connection.get())) return PROSPERO_STATUS_OK;
+    status = AuthenticatePeerAfterFirstRead(connection.get(), lease.handle());
+    authentication_failed = status != PROSPERO_STATUS_OK;
+  }
+  if (authentication_failed) {
+    // A first-frame proof failure may not be retried on the same connection.
+    // Close only after the read lease drains so CancelIoEx cannot deadlock
+    // against this call; preserve the original validation status for JS.
+    connection->endpoint->CancelAndDisconnect();
   }
   return status;
 }
@@ -676,6 +769,7 @@ extern "C" prospero_status prospero_secure_pipe_connection_write(
   }
   const std::shared_ptr<PipeConnection> connection = FindConnection(connection_handle);
   if (connection == nullptr) return PROSPERO_STATUS_NOT_FOUND;
+  if (!HasAuthenticatedPeer(connection.get())) return PROSPERO_STATUS_ACCESS_DENIED;
   PipeIoLease lease(connection->endpoint);
   if (!lease.acquired()) return PROSPERO_STATUS_NOT_FOUND;
   return WriteCancelable(lease.handle(), buffer, length, out_written);
@@ -689,59 +783,14 @@ extern "C" prospero_status prospero_secure_pipe_connection_peer_identity(
   try {
     const std::shared_ptr<PipeConnection> connection = FindConnection(connection_handle);
     if (connection == nullptr) return PROSPERO_STATUS_NOT_FOUND;
-    if (!connection->received_message.load(std::memory_order_acquire)) {
-      return PROSPERO_STATUS_ACCESS_DENIED;
-    }
     PipeIoLease lease(connection->endpoint);
     if (!lease.acquired()) return PROSPERO_STATUS_NOT_FOUND;
-    DWORD client_pid = 0;
-    if (!GetNamedPipeClientProcessId(lease.handle(), &client_pid) || client_pid == 0) {
-      return StatusFromLastError(GetLastError());
-    }
-    prospero_process_identity process{};
-    const prospero_status process_status = prospero_get_process_identity(client_pid, &process);
-    if (process_status != PROSPERO_STATUS_OK) return process_status;
-
-    // Do not allocate, parse token groups, or take locks while impersonating.
-    // The temporary thread token remains valid after RevertToSelf, so acquire
-    // it first and immediately restore this native worker's original token.
-    if (!ImpersonateNamedPipeClient(lease.handle())) return StatusFromLastError(GetLastError());
-    HANDLE client_token = nullptr;
-    const BOOL opened_token = OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &client_token);
-    const DWORD token_error = opened_token ? ERROR_SUCCESS : GetLastError();
-    if (!RevertToSelf()) {
-      if (client_token != nullptr) CloseHandle(client_token);
-      // Continuing this worker while it still impersonates the pipe client
-      // would make every later native call attacker-context dependent.
-      TerminateProcess(GetCurrentProcess(), ERROR_ACCESS_DENIED);
-      RaiseFailFastException(nullptr, nullptr, 0);
-      return PROSPERO_STATUS_SYSTEM_ERROR;
-    }
-    if (!opened_token) return StatusFromLastError(token_error);
-
-    TokenIdentity client;
-    if (!QueryTokenIdentity(client_token, &client)) {
-      const prospero_status token_status = StatusFromLastError(GetLastError());
-      CloseHandle(client_token);
-      return token_status;
-    }
-    CloseHandle(client_token);
-    if (!SidsEqual(client.user_sid, connection->expected_user_sid) ||
-        !SidsEqual(client.logon_sid, connection->expected_logon_sid) ||
-        client.session_id != connection->expected_session_id ||
-        client.integrity_rid < SECURITY_MANDATORY_MEDIUM_RID ||
-        client.integrity_rid < connection->minimum_integrity_rid) {
-      return PROSPERO_STATUS_ACCESS_DENIED;
-    }
-    uint8_t still_matches = 0;
-    const prospero_status match_status =
-        prospero_process_identity_matches(process, &still_matches);
-    if (match_status != PROSPERO_STATUS_OK) return match_status;
-    if (still_matches == 0) return PROSPERO_STATUS_NOT_FOUND;
-    g_peer_sid_copy = client.user_sid_text;
-    out_peer->process = process;
+    std::lock_guard<std::mutex> lock(connection->peer_mutex);
+    if (!connection->peer_authenticated) return PROSPERO_STATUS_ACCESS_DENIED;
+    g_peer_sid_copy = connection->peer_user_sid;
+    out_peer->process = connection->peer_process;
     out_peer->user_sid = g_peer_sid_copy.c_str();
-    out_peer->session_id = client.session_id;
+    out_peer->session_id = connection->peer_session_id;
     return PROSPERO_STATUS_OK;
   } catch (...) {
     ClearPeer(out_peer);
@@ -756,7 +805,7 @@ extern "C" prospero_status prospero_secure_pipe_connection_disconnect(
   if (connection == nullptr) return PROSPERO_STATUS_NOT_FOUND;
   const prospero_status status = connection->endpoint->CancelAndDisconnect();
   if (status != PROSPERO_STATUS_OK) return status;
-  connection->received_message.store(false, std::memory_order_release);
+  ClearAuthenticatedPeer(connection.get());
   return PROSPERO_STATUS_OK;
 }
 

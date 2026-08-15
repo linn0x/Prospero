@@ -90,6 +90,111 @@ async function terminateWorker(worker: Worker | undefined): Promise<void> {
   if (worker) await worker.terminate();
 }
 
+type NativePipeWorkerMessage = Record<string, unknown> & { type: string };
+type NativePipeWorkerTerminal =
+  | (NativePipeWorkerMessage & { type: "complete" })
+  | (NativePipeWorkerMessage & { type: "error" });
+type PipeRoundTripResult =
+  | { readonly kind: "response"; readonly data: Buffer }
+  | { readonly kind: "error"; readonly error: Error };
+
+/**
+ * A socket EPIPE is only a symptom when the native worker closed its endpoint.
+ * Keep one observer for ready and terminal messages so the test always waits
+ * for, and reports, the server's phase/code before considering client I/O.
+ */
+function observeNativePipeWorker(worker: Worker, timeoutMs = 10_000): {
+  readonly ready: Promise<NativePipeWorkerMessage>;
+  readonly terminal: Promise<NativePipeWorkerTerminal>;
+} {
+  let resolveReady!: (message: NativePipeWorkerMessage) => void;
+  let rejectReady!: (error: Error) => void;
+  let resolveTerminal!: (message: NativePipeWorkerTerminal) => void;
+  const ready = new Promise<NativePipeWorkerMessage>((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
+  });
+  const terminal = new Promise<NativePipeWorkerTerminal>((resolve) => {
+    resolveTerminal = resolve;
+  });
+  let sawReady = false;
+  let terminalMessage: NativePipeWorkerTerminal | undefined;
+  let timeout: ReturnType<typeof setTimeout>;
+  const settleTerminal = (message: NativePipeWorkerTerminal) => {
+    if (terminalMessage) return;
+    terminalMessage = message;
+    clearTimeout(timeout);
+    resolveTerminal(message);
+  };
+  timeout = setTimeout(() => {
+    const error = new Error("Timed out waiting for native pipe worker terminal result");
+    if (!sawReady) rejectReady(error);
+    settleTerminal({ type: "error", phase: "timeout", name: error.name, message: error.message });
+  }, timeoutMs);
+  worker.on("message", (value: unknown) => {
+    if (!value || typeof value !== "object" || typeof (value as { type?: unknown }).type !== "string") return;
+    const message = value as NativePipeWorkerMessage;
+    if (message.type === "ready" && !sawReady) {
+      sawReady = true;
+      resolveReady(message);
+      return;
+    }
+    if (message.type === "complete" || message.type === "error") {
+      if (!sawReady) {
+        rejectReady(new Error(`Native pipe worker ended before ready: ${String(message.message ?? message.type)}`));
+      }
+      settleTerminal(message as NativePipeWorkerTerminal);
+    }
+  });
+  worker.once("error", (error) => {
+    if (!sawReady) rejectReady(error);
+    settleTerminal({ type: "error", phase: "worker-error", name: error.name, message: error.message });
+  });
+  worker.once("exit", (code) => {
+    if (!terminalMessage) {
+      const error = new Error(`Native pipe worker exited before terminal result (${code})`);
+      if (!sawReady) rejectReady(error);
+      settleTerminal({ type: "error", phase: "worker-exit", name: error.name, message: error.message, exitCode: code });
+    }
+  });
+  return { ready, terminal };
+}
+
+function readPipeRoundTrip(pipeName: string): Promise<PipeRoundTripResult> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result: PipeRoundTripResult) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    const socket = createConnection(pipeName);
+    socket.on("error", (error) => finish({ kind: "error", error }));
+    socket.once("connect", () => {
+      socket.write(Buffer.from("pipe-round-trip"));
+    });
+    socket.once("data", (data) => {
+      finish({ kind: "response", data });
+      socket.end();
+    });
+    socket.once("end", () => {
+      finish({ kind: "error", error: new Error("Named pipe ended before roundtrip response") });
+    });
+    socket.once("close", () => {
+      finish({ kind: "error", error: new Error("Named pipe closed before roundtrip response") });
+    });
+  });
+}
+
+function nativePipeWorkerFailure(terminal: NativePipeWorkerTerminal): Error | undefined {
+  if (terminal.type !== "error") return undefined;
+  const phase = typeof terminal.phase === "string" ? terminal.phase : "unknown";
+  const code = typeof terminal.code === "string" ? ` (${terminal.code})` : "";
+  const name = typeof terminal.name === "string" ? terminal.name : "NativePipeError";
+  const message = typeof terminal.message === "string" ? terminal.message : "native pipe worker failed";
+  return new Error(`${name} at ${phase}${code}: ${message}`);
+}
+
 describe.runIf(process.platform === "win32")("Windows identity, secure pipe, DPAPI, and state addon", () => {
   const directories: string[] = [];
 
@@ -150,28 +255,57 @@ describe.runIf(process.platform === "win32")("Windows identity, secure pipe, DPA
 
   it("uses an explicit current-logon-SID DACL and verifies the accepted client identity", async () => {
     const pipeName = `\\\\.\\pipe\\prospero-native-smoke-${process.pid}-${randomUUID()}`;
-    const worker = new Worker(new URL("./fixtures/native-pipe-server.mjs", import.meta.url), {
-      workerData: { bindingPath, pipeName },
-    });
-    const completePromise = waitForWorker(worker, "complete");
-    await waitForWorker(worker, "ready");
-    const response = await new Promise<Buffer>((resolve, reject) => {
-      const socket = createConnection(pipeName);
-      socket.once("error", reject);
-      socket.once("connect", () => socket.write(Buffer.from("pipe-round-trip")));
-      socket.once("data", (data) => {
-        resolve(data);
-        socket.end();
+    let worker: Worker | undefined;
+    try {
+      worker = new Worker(new URL("./fixtures/native-pipe-server.mjs", import.meta.url), {
+        workerData: { bindingPath, pipeName },
       });
-    });
-    expect(response.toString("utf8")).toBe("pipe-round-trip");
-    const complete = await completePromise;
-    const peer = complete.peer as { process: { pid: number; creationTime100ns: string }; userSid: string };
-    expect(complete.preReadPeerRejected).toBe(true);
-    expect(peer.process.pid).toBe(process.pid);
-    expect(peer.process.creationTime100ns).toMatch(/^[1-9]\d*$/);
-    expect(peer.userSid).toMatch(/^S-1-\d+(?:-\d+)+$/i);
-    await worker.terminate();
+      const observer = observeNativePipeWorker(worker);
+      await observer.ready;
+      const [roundTrip, terminal] = await Promise.all([readPipeRoundTrip(pipeName), observer.terminal]);
+      const workerFailure = nativePipeWorkerFailure(terminal);
+      if (workerFailure) throw workerFailure;
+      expect(roundTrip.kind).toBe("response");
+      if (roundTrip.kind !== "response") throw roundTrip.error;
+      expect(roundTrip.data.toString("utf8")).toBe("pipe-round-trip");
+      const peer = terminal.peer as {
+        process: { pid: number; creationTime100ns: string };
+        userSid: string;
+        sessionId: number;
+      };
+      expect(terminal.preReadPeerRejected).toBe(true);
+      expect(terminal.preReadWriteRejected).toBe(true);
+      expect(peer.process.pid).toBe(process.pid);
+      expect(peer.process.creationTime100ns).toMatch(/^[1-9]\d*$/);
+      expect(peer.userSid).toMatch(/^S-1-\d+(?:-\d+)+$/i);
+      expect(peer.sessionId).toBeGreaterThanOrEqual(0);
+      expect(peer.sessionId).toBeLessThanOrEqual(0xffff_ffff);
+    } finally {
+      await terminateWorker(worker);
+    }
+  });
+
+  it("reports the server worker's native phase before a client pipe close", async () => {
+    const pipeName = `\\\\.\\pipe\\prospero-native-diagnostic-${process.pid}-${randomUUID()}`;
+    let worker: Worker | undefined;
+    try {
+      worker = new Worker(new URL("./fixtures/native-pipe-server.mjs", import.meta.url), {
+        workerData: { bindingPath, pipeName, failAfterPhase: "read" },
+      });
+      const observer = observeNativePipeWorker(worker);
+      await observer.ready;
+      const [roundTrip, terminal] = await Promise.all([readPipeRoundTrip(pipeName), observer.terminal]);
+      expect(roundTrip.kind).toBe("error");
+      expect(terminal).toMatchObject({
+        type: "error",
+        phase: "read",
+        name: "Error",
+        message: "injected native pipe worker failure after read",
+      });
+      expect(nativePipeWorkerFailure(terminal)?.message).toContain("at read");
+    } finally {
+      await terminateWorker(worker);
+    }
   });
 
   it("uses a second addon-loaded worker to close an idle ConnectNamedPipe by its opaque handle", async () => {
