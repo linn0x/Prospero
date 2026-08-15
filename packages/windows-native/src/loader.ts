@@ -264,7 +264,11 @@ function assertAuthenticode(
     verified.thumbprintSha1.replace(/\s/g, "").toLowerCase() !==
       manifest.authenticode.thumbprintSha1.toLowerCase()
   ) {
-    loadError("authenticode-invalid", "Windows native prebuild Authenticode signature is invalid or untrusted");
+    const signer = verified.thumbprintSha1?.replace(/\s/g, "") || "none";
+    loadError(
+      "authenticode-invalid",
+      `Windows native prebuild Authenticode signature is invalid or untrusted (status=${verified.status}, signer=${signer})`,
+    );
   }
 }
 
