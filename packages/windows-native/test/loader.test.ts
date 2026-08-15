@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
-  type NativeCapabilityReport,
+  type NativeAddonBinding,
+  type NativeAddonCapabilityReport,
   type NativeLoaderRuntime,
   type NativePrebuildManifest,
-  type NativeWindowsBinding,
   NativeLoadError,
   loadWindowsNative,
 } from "../src/index.js";
@@ -12,40 +12,56 @@ const allCapabilities = {
   processIdentity: true,
   secureNamedPipe: true,
   jobObject: true,
+  parentJobCompatibility: true,
   detachedHost: true,
   conPty: true,
+  dpapiCurrentUser: true,
+  secureStateDirectory: true,
 } as const;
 
 function validManifest(): NativePrebuildManifest {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     platform: "win32",
     arch: "x64",
     artifact: { file: "prospero_windows_native.node", sha256: "a".repeat(64) },
-    native: { abiVersion: 1, napiVersion: 8, capabilities: allCapabilities },
+    native: { abiVersion: 2, napiVersion: 8, capabilities: allCapabilities },
     authenticode: { status: "valid", thumbprintSha1: "b".repeat(40) },
   };
 }
 
-function completeBinding(report: NativeCapabilityReport): NativeWindowsBinding {
+function completeAddon(report: NativeAddonCapabilityReport): NativeAddonBinding {
   const unavailable = () => undefined;
   return {
     getAbiInfo: () => report,
-    getCurrentProcessIdentity: unavailable as NativeWindowsBinding["getCurrentProcessIdentity"],
-    createSecureNamedPipeServer: unavailable as NativeWindowsBinding["createSecureNamedPipeServer"],
-    closeSecureNamedPipeServer: unavailable as NativeWindowsBinding["closeSecureNamedPipeServer"],
-    getSecureNamedPipePeerIdentity: unavailable as NativeWindowsBinding["getSecureNamedPipePeerIdentity"],
-    createJobObject: unavailable as NativeWindowsBinding["createJobObject"],
-    assignProcessToJob: unavailable as NativeWindowsBinding["assignProcessToJob"],
-    terminateJobObject: unavailable as NativeWindowsBinding["terminateJobObject"],
-    closeJobObject: unavailable as NativeWindowsBinding["closeJobObject"],
-    launchDetachedHost: unavailable as NativeWindowsBinding["launchDetachedHost"],
-    spawnConPty: unavailable as NativeWindowsBinding["spawnConPty"],
-    resizeConPty: unavailable as NativeWindowsBinding["resizeConPty"],
-    readConPty: unavailable as NativeWindowsBinding["readConPty"],
-    writeConPty: unavailable as NativeWindowsBinding["writeConPty"],
-    killConPty: unavailable as NativeWindowsBinding["killConPty"],
-    closeConPty: unavailable as NativeWindowsBinding["closeConPty"],
+    getCurrentProcessIdentity: unavailable as NativeAddonBinding["getCurrentProcessIdentity"],
+    getProcessIdentity: unavailable as NativeAddonBinding["getProcessIdentity"],
+    matchesProcessIdentity: unavailable as NativeAddonBinding["matchesProcessIdentity"],
+    createSecureNamedPipeServer: unavailable as NativeAddonBinding["createSecureNamedPipeServer"],
+    acceptSecureNamedPipeConnection: unavailable as NativeAddonBinding["acceptSecureNamedPipeConnection"],
+    closeSecureNamedPipeServer: unavailable as NativeAddonBinding["closeSecureNamedPipeServer"],
+    readSecureNamedPipeConnection: unavailable as NativeAddonBinding["readSecureNamedPipeConnection"],
+    writeSecureNamedPipeConnection: unavailable as NativeAddonBinding["writeSecureNamedPipeConnection"],
+    getSecureNamedPipePeerIdentity: unavailable as NativeAddonBinding["getSecureNamedPipePeerIdentity"],
+    disconnectSecureNamedPipeConnection: unavailable as NativeAddonBinding["disconnectSecureNamedPipeConnection"],
+    closeSecureNamedPipeConnection: unavailable as NativeAddonBinding["closeSecureNamedPipeConnection"],
+    createJobObject: unavailable as NativeAddonBinding["createJobObject"],
+    assignProcessToJob: unavailable as NativeAddonBinding["assignProcessToJob"],
+    terminateJobObject: unavailable as NativeAddonBinding["terminateJobObject"],
+    closeJobObject: unavailable as NativeAddonBinding["closeJobObject"],
+    getParentJobCompatibility: unavailable as NativeAddonBinding["getParentJobCompatibility"],
+    launchDetachedHost: unavailable as NativeAddonBinding["launchDetachedHost"],
+    spawnConPty: unavailable as NativeAddonBinding["spawnConPty"],
+    resizeConPty: unavailable as NativeAddonBinding["resizeConPty"],
+    readConPty: unavailable as NativeAddonBinding["readConPty"],
+    writeConPty: unavailable as NativeAddonBinding["writeConPty"],
+    killConPty: unavailable as NativeAddonBinding["killConPty"],
+    closeConPty: unavailable as NativeAddonBinding["closeConPty"],
+    dpapiProtectCurrentUser: unavailable as NativeAddonBinding["dpapiProtectCurrentUser"],
+    dpapiUnprotectCurrentUser: unavailable as NativeAddonBinding["dpapiUnprotectCurrentUser"],
+    openSecureStateDirectory: unavailable as NativeAddonBinding["openSecureStateDirectory"],
+    writeSecureStateFileAtomically: unavailable as NativeAddonBinding["writeSecureStateFileAtomically"],
+    closeSecureStateDirectory: unavailable as NativeAddonBinding["closeSecureStateDirectory"],
   };
 }
 
@@ -65,18 +81,18 @@ function mockRuntime(
     sha256: () => "a".repeat(64),
     verifyAuthenticode: () => ({ status: "Valid", thumbprintSha1: "b".repeat(40) }),
     loadBinding: () => binding,
+    isDedicatedWorkerThread: () => true,
     ...overrides,
   };
 }
 
-function nativeReport(overrides: Partial<NativeCapabilityReport> = {}): NativeCapabilityReport {
+function addonReport(overrides: Partial<NativeAddonCapabilityReport> = {}): NativeAddonCapabilityReport {
   return {
-    abiVersion: 1,
+    abiVersion: 2,
     napiVersion: 8,
     platform: "win32",
     arch: "x64",
-    buildId: "signed-test-build",
-    signatureVerified: true,
+    buildId: "test-build",
     capabilities: allCapabilities,
     ...overrides,
   };
@@ -102,7 +118,7 @@ describe("Windows native fail-closed loader", () => {
   });
 
   it("rejects architectures and host Node-API levels outside the release contract", () => {
-    const binding = completeBinding(nativeReport());
+    const binding = completeAddon(addonReport());
     expectNativeLoadError(
       () => loadWindowsNative(mockRuntime(validManifest(), binding, { arch: "ia32" })),
       "unsupported-architecture",
@@ -113,33 +129,57 @@ describe("Windows native fail-closed loader", () => {
     );
   });
 
-  it("accepts a complete signed mock binding", () => {
-    const report = nativeReport();
-    const binding = completeBinding(report);
-    expect(loadWindowsNative(mockRuntime(validManifest(), binding))).toBe(binding);
+  it("wraps a complete signed addon and creates the trust report in the loader", () => {
+    const addon = completeAddon(addonReport());
+    const binding = loadWindowsNative(mockRuntime(validManifest(), addon));
+    expect(binding).not.toBe(addon);
+    expect(binding.getAbiInfo()).toMatchObject({ ...addonReport(), signatureVerified: true });
+    expect(Object.isFrozen(binding)).toBe(true);
+    expect(Object.isFrozen(binding.getAbiInfo())).toBe(true);
+  });
+
+  it("rejects an addon that tries to self-attest signature verification", () => {
+    const selfAttesting = completeAddon({
+      ...addonReport(),
+      signatureVerified: true,
+    } as unknown as NativeAddonCapabilityReport);
+    expectNativeLoadError(
+      () => loadWindowsNative(mockRuntime(validManifest(), selfAttesting)),
+      "addon-invalid",
+    );
   });
 
   it("rejects the unsigned, capability-false skeleton manifest", () => {
     const skeleton: NativePrebuildManifest = {
       ...validManifest(),
       native: {
-        abiVersion: 1,
+        abiVersion: 2,
         napiVersion: 8,
-        capabilities: { ...allCapabilities, conPty: false },
+        capabilities: { ...allCapabilities, dpapiCurrentUser: false },
       },
       authenticode: { status: "unsigned" },
     };
     expectNativeLoadError(
-      () => loadWindowsNative(mockRuntime(skeleton, completeBinding(nativeReport()))),
+      () => loadWindowsNative(mockRuntime(skeleton, completeAddon(addonReport()))),
       "capability-missing",
     );
   });
 
-  it("rejects a signed prebuild whose addon reports an incomplete capability", () => {
-    const report = nativeReport({ capabilities: { ...allCapabilities, secureNamedPipe: false } });
+  it("rejects a signed prebuild whose addon omits a new contract capability", () => {
+    const report = addonReport({ capabilities: { ...allCapabilities, secureStateDirectory: false } });
     expectNativeLoadError(
-      () => loadWindowsNative(mockRuntime(validManifest(), completeBinding(report))),
+      () => loadWindowsNative(mockRuntime(validManifest(), completeAddon(report))),
       "capability-missing",
+    );
+  });
+
+  it("rejects a pipe API without accept and connection operations", () => {
+    const addon = completeAddon(addonReport()) as Partial<NativeAddonBinding>;
+    delete addon.acceptSecureNamedPipeConnection;
+    delete addon.closeSecureNamedPipeConnection;
+    expectNativeLoadError(
+      () => loadWindowsNative(mockRuntime(validManifest(), addon)),
+      "addon-invalid",
     );
   });
 
@@ -147,10 +187,10 @@ describe("Windows native fail-closed loader", () => {
     const manifest = validManifest();
     const wrongAbi = {
       ...manifest,
-      native: { ...manifest.native, abiVersion: 2 },
+      native: { ...manifest.native, abiVersion: 1 },
     } as unknown as NativePrebuildManifest;
     expectNativeLoadError(
-      () => loadWindowsNative(mockRuntime(wrongAbi, completeBinding(nativeReport()))),
+      () => loadWindowsNative(mockRuntime(wrongAbi, completeAddon(addonReport()))),
       "manifest-invalid",
     );
   });
@@ -158,11 +198,19 @@ describe("Windows native fail-closed loader", () => {
   it("rejects an Authenticode thumbprint mismatch before loading the addon", () => {
     expectNativeLoadError(() =>
       loadWindowsNative(
-        mockRuntime(validManifest(), completeBinding(nativeReport()), {
+        mockRuntime(validManifest(), completeAddon(addonReport()), {
           verifyAuthenticode: () => ({ status: "Valid", thumbprintSha1: "c".repeat(40) }),
           loadBinding: () => { throw new Error("must not run"); },
         }),
       ),
     "authenticode-invalid");
+  });
+
+  it("refuses all synchronous native operations on the main thread", () => {
+    const addon = completeAddon(addonReport());
+    const binding = loadWindowsNative(
+      mockRuntime(validManifest(), addon, { isDedicatedWorkerThread: () => false }),
+    );
+    expectNativeLoadError(() => binding.getProcessIdentity(42), "worker-thread-required");
   });
 });

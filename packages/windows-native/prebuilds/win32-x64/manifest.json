@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "platform": "win32",
   "arch": "x64",
   "artifact": {
@@ -7,14 +7,17 @@
     "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
   },
   "native": {
-    "abiVersion": 1,
+    "abiVersion": 2,
     "napiVersion": 8,
     "capabilities": {
       "processIdentity": false,
       "secureNamedPipe": false,
       "jobObject": false,
+      "parentJobCompatibility": false,
       "detachedHost": false,
-      "conPty": false
+      "conPty": false,
+      "dpapiCurrentUser": false,
+      "secureStateDirectory": false
     }
   },
   "authenticode": {

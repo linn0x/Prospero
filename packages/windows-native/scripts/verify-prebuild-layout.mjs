@@ -1,11 +1,20 @@
 import { existsSync, readFileSync } from "node:fs";
-const capabilityNames = ["processIdentity", "secureNamedPipe", "jobObject", "detachedHost", "conPty"];
+const capabilityNames = [
+  "processIdentity",
+  "secureNamedPipe",
+  "jobObject",
+  "parentJobCompatibility",
+  "detachedHost",
+  "conPty",
+  "dpapiCurrentUser",
+  "secureStateDirectory",
+];
 for (const arch of ["x64", "arm64"]) {
   const directory = new URL(`../prebuilds/win32-${arch}/`, import.meta.url);
   const manifestPath = new URL("manifest.json", directory);
   if (!existsSync(manifestPath)) throw new Error(`Missing ${manifestPath.pathname}`);
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
-  if (manifest.schemaVersion !== 1 || manifest.platform !== "win32" || manifest.arch !== arch) {
+  if (manifest.schemaVersion !== 2 || manifest.platform !== "win32" || manifest.arch !== arch) {
     throw new Error(`Invalid prebuild metadata in ${manifestPath.pathname}`);
   }
   if (manifest.artifact?.file !== "prospero_windows_native.node") {
@@ -14,7 +23,7 @@ for (const arch of ["x64", "arm64"]) {
   if (!/^[a-fA-F0-9]{64}$/.test(manifest.artifact?.sha256 ?? "")) {
     throw new Error(`Invalid artifact SHA-256 format in ${manifestPath.pathname}`);
   }
-  if (manifest.native?.abiVersion !== 1 || manifest.native?.napiVersion !== 8) {
+  if (manifest.native?.abiVersion !== 2 || manifest.native?.napiVersion !== 8) {
     throw new Error(`Invalid native ABI metadata in ${manifestPath.pathname}`);
   }
   if (
