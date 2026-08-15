@@ -154,6 +154,20 @@ typedef struct prospero_secure_state_directory_options {
   const wchar_t* absolute_path;
 } prospero_secure_state_directory_options;
 
+/** Native-only diagnostic stage for the most recent atomic state write on the calling thread. */
+typedef enum prospero_secure_state_write_stage {
+  PROSPERO_SECURE_STATE_WRITE_STAGE_NONE = 0,
+  PROSPERO_SECURE_STATE_WRITE_STAGE_VALIDATE = 1,
+  PROSPERO_SECURE_STATE_WRITE_STAGE_DIRECTORY = 2,
+  PROSPERO_SECURE_STATE_WRITE_STAGE_TARGET = 3,
+  PROSPERO_SECURE_STATE_WRITE_STAGE_CREATE_TEMPORARY = 4,
+  PROSPERO_SECURE_STATE_WRITE_STAGE_VERIFY_TEMPORARY = 5,
+  PROSPERO_SECURE_STATE_WRITE_STAGE_WRITE = 6,
+  PROSPERO_SECURE_STATE_WRITE_STAGE_FLUSH = 7,
+  PROSPERO_SECURE_STATE_WRITE_STAGE_RENAME = 8,
+  PROSPERO_SECURE_STATE_WRITE_STAGE_CLEANUP = 9,
+} prospero_secure_state_write_stage;
+
 prospero_status prospero_query_capability_report(prospero_capability_report* out_report);
 
 prospero_status prospero_get_current_process_identity(prospero_process_identity* out_identity);
@@ -264,6 +278,12 @@ prospero_status prospero_secure_state_directory_write_atomic(
     const wchar_t* file_name,
     const uint8_t* data,
     uint32_t length);
+/**
+ * Returns a stage label only; it intentionally exposes no filesystem path,
+ * filename, data, or OS error details. It is valid immediately after a write
+ * on the same thread.
+ */
+prospero_secure_state_write_stage prospero_secure_state_directory_last_write_stage(void);
 /**
  * Reads one direct state-file name. `file_name` must be a non-empty single
  * segment: no dot segment, separator, ADS colon, DOS device name, or reparse

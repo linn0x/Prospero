@@ -330,6 +330,17 @@ function nativePipeWorkerFailure(terminal: NativePipeWorkerTerminal): Error | un
   return new Error(`${name} at ${phase}${code}: ${message}`);
 }
 
+function nativeErrorCode(action: () => unknown): string {
+  try {
+    action();
+  } catch (error) {
+    const code = error && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
+    if (typeof code === "string") return code;
+    throw error;
+  }
+  throw new Error("expected a native error");
+}
+
 describe.runIf(process.platform === "win32")("Windows identity, secure pipe, DPAPI, and state addon", () => {
   const directories: string[] = [];
 
@@ -364,7 +375,7 @@ describe.runIf(process.platform === "win32")("Windows identity, secure pipe, DPA
       .dpapiProtectCurrentUser(plaintext)).toThrow(/invalid argument/i);
   });
 
-  it("keeps state operations in a reparse-free current-user-only directory", () => {
+  it("round-trips and atomically replaces state in a reparse-free current-user-only directory", () => {
     const directoryPath = mkdtempSync(join(tmpdir(), "prospero-native-state-"));
     directories.push(directoryPath);
     const missingParent = join(directoryPath, "must-not-create");
@@ -375,9 +386,18 @@ describe.runIf(process.platform === "win32")("Windows identity, secure pipe, DPA
     try {
       binding.writeSecureStateFileAtomically(directory, "manifest.json", encoder.encode('{"epoch":7}'));
       expect(decoder.decode(binding.readSecureStateFile(directory, "manifest.json"))).toBe('{"epoch":7}');
+      // Exercise the replace path too: it must remain an atomic same-directory
+      // rename, rather than a delete-and-recreate fallback.
+      binding.writeSecureStateFileAtomically(directory, "manifest.json", encoder.encode('{"epoch":8}'));
+      expect(decoder.decode(binding.readSecureStateFile(directory, "manifest.json"))).toBe('{"epoch":8}');
       expect(binding.listSecureStateEntries(directory)).toEqual(["manifest.json"]);
-      expect(() => binding.writeSecureStateFileAtomically(directory, "../escape", encoder.encode("x")))
-        .toThrow(/invalid argument/i);
+      expect(nativeErrorCode(() => (binding as unknown as {
+        writeSecureStateFileAtomically(directory: number, fileName: string, data: Uint8Array): void;
+      }).writeSecureStateFileAtomically(Number(directory), "manifest.json", encoder.encode("x"))))
+        .toBe("PROSPERO_NATIVE_INVALID_ARGUMENT");
+      expect(nativeErrorCode(() => binding.writeSecureStateFileAtomically(
+        directory, "../escape", encoder.encode("x"),
+      ))).toBe("PROSPERO_NATIVE_SECURE_STATE_WRITE_VALIDATE");
       expect(() => binding.readSecureStateFile(directory, "state:ads")).toThrow(/invalid argument/i);
       expect(() => binding.readSecureStateFile(directory, "COM\u00b9.json")).toThrow(/invalid argument/i);
       expect(() => binding.readSecureStateFile(directory, "LPT\u00b2")).toThrow(/invalid argument/i);
