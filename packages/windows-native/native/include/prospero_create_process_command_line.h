@@ -68,7 +68,7 @@ inline bool AppendQuotedArgument(const wchar_t* argument, std::wstring* command_
       slashes = 0;
       continue;
     }
-    if (!AppendCodeUnits(command_line, L"\\", slashes) ||
+    if (!AppendRepeatedCodeUnit(command_line, L'\\', slashes) ||
         !AppendCodeUnit(command_line, *cursor)) {
       return false;
     }
