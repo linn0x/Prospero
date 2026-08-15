@@ -51,17 +51,22 @@ napi_value GetAbiInfo(napi_env env, napi_callback_info info) {
       !SetString(env, report, "arch", "x64") ||
 #endif
       !SetString(env, report, "buildId", "skeleton-untrusted") ||
-      !SetBool(env, report, "signatureVerified", native_report.signature_verified != 0) ||
       !SetBool(env, capabilities, "processIdentity",
                (native_report.capability_mask & PROSPERO_CAPABILITY_PROCESS_IDENTITY) != 0) ||
       !SetBool(env, capabilities, "secureNamedPipe",
                (native_report.capability_mask & PROSPERO_CAPABILITY_SECURE_NAMED_PIPE) != 0) ||
       !SetBool(env, capabilities, "jobObject",
                (native_report.capability_mask & PROSPERO_CAPABILITY_JOB_OBJECT) != 0) ||
+      !SetBool(env, capabilities, "parentJobCompatibility",
+               (native_report.capability_mask & PROSPERO_CAPABILITY_PARENT_JOB_COMPATIBILITY) != 0) ||
       !SetBool(env, capabilities, "detachedHost",
                (native_report.capability_mask & PROSPERO_CAPABILITY_DETACHED_HOST) != 0) ||
       !SetBool(env, capabilities, "conPty",
                (native_report.capability_mask & PROSPERO_CAPABILITY_CONPTY) != 0) ||
+      !SetBool(env, capabilities, "dpapiCurrentUser",
+               (native_report.capability_mask & PROSPERO_CAPABILITY_DPAPI_CURRENT_USER) != 0) ||
+      !SetBool(env, capabilities, "secureStateDirectory",
+               (native_report.capability_mask & PROSPERO_CAPABILITY_SECURE_STATE_DIRECTORY) != 0) ||
       napi_set_named_property(env, report, "capabilities", capabilities) != napi_ok) {
     return nullptr;
   }
@@ -84,27 +89,39 @@ extern "C" prospero_status prospero_query_capability_report(
   // This skeleton has no production implementation. It must never claim a
   // feature merely because an export name has been reserved.
   out_report->capability_mask = 0;
-  out_report->signature_verified = 0;
   return PROSPERO_STATUS_OK;
 }
 
 NAPI_MODULE_INIT() {
   if (!ExportMethod(env, exports, "getAbiInfo", GetAbiInfo) ||
       !ExportMethod(env, exports, "getCurrentProcessIdentity", ThrowNotAvailable) ||
+      !ExportMethod(env, exports, "getProcessIdentity", ThrowNotAvailable) ||
+      !ExportMethod(env, exports, "matchesProcessIdentity", ThrowNotAvailable) ||
       !ExportMethod(env, exports, "createSecureNamedPipeServer", ThrowNotAvailable) ||
+      !ExportMethod(env, exports, "acceptSecureNamedPipeConnection", ThrowNotAvailable) ||
       !ExportMethod(env, exports, "closeSecureNamedPipeServer", ThrowNotAvailable) ||
+      !ExportMethod(env, exports, "readSecureNamedPipeConnection", ThrowNotAvailable) ||
+      !ExportMethod(env, exports, "writeSecureNamedPipeConnection", ThrowNotAvailable) ||
       !ExportMethod(env, exports, "getSecureNamedPipePeerIdentity", ThrowNotAvailable) ||
+      !ExportMethod(env, exports, "disconnectSecureNamedPipeConnection", ThrowNotAvailable) ||
+      !ExportMethod(env, exports, "closeSecureNamedPipeConnection", ThrowNotAvailable) ||
       !ExportMethod(env, exports, "createJobObject", ThrowNotAvailable) ||
       !ExportMethod(env, exports, "assignProcessToJob", ThrowNotAvailable) ||
       !ExportMethod(env, exports, "terminateJobObject", ThrowNotAvailable) ||
       !ExportMethod(env, exports, "closeJobObject", ThrowNotAvailable) ||
+      !ExportMethod(env, exports, "getParentJobCompatibility", ThrowNotAvailable) ||
       !ExportMethod(env, exports, "launchDetachedHost", ThrowNotAvailable) ||
       !ExportMethod(env, exports, "spawnConPty", ThrowNotAvailable) ||
       !ExportMethod(env, exports, "resizeConPty", ThrowNotAvailable) ||
       !ExportMethod(env, exports, "readConPty", ThrowNotAvailable) ||
       !ExportMethod(env, exports, "writeConPty", ThrowNotAvailable) ||
       !ExportMethod(env, exports, "killConPty", ThrowNotAvailable) ||
-      !ExportMethod(env, exports, "closeConPty", ThrowNotAvailable)) {
+      !ExportMethod(env, exports, "closeConPty", ThrowNotAvailable) ||
+      !ExportMethod(env, exports, "dpapiProtectCurrentUser", ThrowNotAvailable) ||
+      !ExportMethod(env, exports, "dpapiUnprotectCurrentUser", ThrowNotAvailable) ||
+      !ExportMethod(env, exports, "openSecureStateDirectory", ThrowNotAvailable) ||
+      !ExportMethod(env, exports, "writeSecureStateFileAtomically", ThrowNotAvailable) ||
+      !ExportMethod(env, exports, "closeSecureStateDirectory", ThrowNotAvailable)) {
     return nullptr;
   }
   return exports;

@@ -4,11 +4,14 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { isMainThread } from "node:worker_threads";
 import {
   NATIVE_REQUIRED_CAPABILITIES,
+  NATIVE_SYNCHRONOUS_BLOCKING_METHODS,
   NATIVE_WINDOWS_ABI_VERSION,
   REQUIRED_NAPI_VERSION,
-  type NativeCapabilityReport,
+  type NativeAddonBinding,
+  type NativeAddonCapabilityReport,
   type NativeCapabilities,
   type NativePrebuildManifest,
   type NativeWindowsBinding,
@@ -25,7 +28,8 @@ export type NativeLoadErrorCode =
   | "unsigned"
   | "authenticode-invalid"
   | "addon-invalid"
-  | "capability-missing";
+  | "capability-missing"
+  | "worker-thread-required";
 
 export class NativeLoadError extends Error {
   constructor(
@@ -53,6 +57,8 @@ export interface NativeLoaderRuntime {
   readonly sha256: (bytes: Uint8Array) => string;
   readonly verifyAuthenticode: (path: string) => AuthenticodeResult;
   readonly loadBinding: (path: string) => unknown;
+  /** True only in the scheduler-owned worker allowed to run blocking native calls. */
+  readonly isDedicatedWorkerThread: () => boolean;
 }
 
 function defaultPackageRoot(): string {
@@ -88,6 +94,7 @@ function defaultRuntime(): NativeLoaderRuntime {
     sha256: (bytes) => createHash("sha256").update(bytes).digest("hex"),
     verifyAuthenticode: defaultAuthenticodeCheck,
     loadBinding: (path) => require(path),
+    isDedicatedWorkerThread: () => !isMainThread,
   };
 }
 
@@ -128,7 +135,7 @@ function parseManifest(raw: Uint8Array, expectedArch: SupportedWindowsArchitectu
   const native = manifest.native as Record<string, unknown> | undefined;
   const authenticode = manifest.authenticode as Record<string, unknown> | undefined;
   if (
-    manifest.schemaVersion !== 1 ||
+    manifest.schemaVersion !== 2 ||
     manifest.platform !== "win32" ||
     manifest.arch !== expectedArch ||
     !artifact ||
@@ -168,10 +175,10 @@ function assertAuthenticode(
   }
 }
 
-function assertBindingContract(
+function assertAddonContract(
   candidate: unknown,
   expectedArch: SupportedWindowsArchitecture,
-): asserts candidate is NativeWindowsBinding {
+): asserts candidate is NativeAddonBinding {
   if (typeof candidate !== "object" || candidate === null || typeof (candidate as { getAbiInfo?: unknown }).getAbiInfo !== "function") {
     loadError("addon-invalid", "Windows native addon does not expose getAbiInfo()");
   }
@@ -179,41 +186,58 @@ function assertBindingContract(
   if (typeof report !== "object" || report === null) {
     loadError("addon-invalid", "Windows native addon returned an invalid ABI report");
   }
-  const value = report as Partial<NativeCapabilityReport>;
+  const value = report as Partial<NativeAddonCapabilityReport> & Record<string, unknown>;
   if (
     value.abiVersion !== NATIVE_WINDOWS_ABI_VERSION ||
     value.napiVersion !== REQUIRED_NAPI_VERSION ||
     value.platform !== "win32" ||
     value.arch !== expectedArch ||
-    value.signatureVerified !== true ||
+    "signatureVerified" in value ||
     !isCapabilities(value.capabilities)
   ) {
-    loadError("addon-invalid", "Windows native addon ABI, platform, architecture, or signature report mismatches");
+    loadError("addon-invalid", "Windows native addon ABI/platform/architecture report mismatches or self-attests trust");
   }
   if (!hasEveryCapability(value.capabilities)) {
     loadError("capability-missing", "Windows native addon is missing required capabilities");
   }
-  const binding = candidate as Partial<NativeWindowsBinding>;
-  const methods: readonly (keyof NativeWindowsBinding)[] = [
-    "getCurrentProcessIdentity",
-    "createSecureNamedPipeServer",
-    "closeSecureNamedPipeServer",
-    "getSecureNamedPipePeerIdentity",
-    "createJobObject",
-    "assignProcessToJob",
-    "terminateJobObject",
-    "closeJobObject",
-    "launchDetachedHost",
-    "spawnConPty",
-    "resizeConPty",
-    "readConPty",
-    "writeConPty",
-    "killConPty",
-    "closeConPty",
-  ];
+  const binding = candidate as Partial<NativeAddonBinding>;
+  const methods = NATIVE_SYNCHRONOUS_BLOCKING_METHODS;
   if (methods.some((method) => typeof binding[method] !== "function")) {
     loadError("addon-invalid", "Windows native addon is missing a required ABI method");
   }
+}
+
+/**
+ * Turns a byte-verified addon into the only binding exposed to callers. The
+ * addon can describe its ABI but cannot assert that it was signed; that fact is
+ * created here after manifest, SHA-256, and Authenticode validation.
+ */
+function wrapTrustedBinding(
+  addon: NativeAddonBinding,
+  runtime: NativeLoaderRuntime,
+): NativeWindowsBinding {
+  const rawReport = addon.getAbiInfo();
+  const trustedReport = Object.freeze({
+    ...rawReport,
+    capabilities: Object.freeze({ ...rawReport.capabilities }),
+    signatureVerified: true as const,
+  });
+  const wrapped: Record<string, unknown> = {
+    getAbiInfo: () => trustedReport,
+  };
+  for (const method of NATIVE_SYNCHRONOUS_BLOCKING_METHODS) {
+    wrapped[method] = (...args: unknown[]) => {
+      if (!runtime.isDedicatedWorkerThread()) {
+        return loadError(
+          "worker-thread-required",
+          `Windows native ${method}() may block and must run on a dedicated worker thread`,
+        );
+      }
+      const fn = addon[method] as (...nativeArgs: unknown[]) => unknown;
+      return fn.apply(addon, args);
+    };
+  }
+  return Object.freeze(wrapped) as unknown as NativeWindowsBinding;
 }
 
 /**
@@ -254,6 +278,6 @@ export function loadWindowsNative(runtime: NativeLoaderRuntime = defaultRuntime(
     const detail = error instanceof Error ? `: ${error.message}` : "";
     return loadError("addon-invalid", `Windows native addon could not be loaded${detail}`);
   }
-  assertBindingContract(binding, runtime.arch);
-  return binding;
+  assertAddonContract(binding, runtime.arch);
+  return wrapTrustedBinding(binding, runtime);
 }
