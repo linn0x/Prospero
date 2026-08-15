@@ -6,7 +6,7 @@
  * account credentials are read from private files and never appear in argv or
  * stdout/stderr.  The daemon is consequently just an IPC client.
  */
-import { chmodSync, existsSync, lstatSync, readFileSync, renameSync, rmSync, rmdirSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, readFileSync, renameSync, rmSync, rmdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type {
   ApprovalPolicy,
@@ -24,6 +24,14 @@ import { OpencodeAdapter } from "./adapters/opencode.js";
 import type { AdapterResumeState, AgentAdapter } from "./adapters/types.js";
 import { StructuredSession, type StructuredSessionPersistentState } from "./structured-session.js";
 import { startStructuredSupervisor, type SupervisorAdapter } from "./structured-supervisor.js";
+import {
+  hasPrivateSupervisorDirectoryMode,
+  hasPrivateSupervisorFileMode,
+  isStructuredSupervisorEndpoint,
+  structuredSupervisorPlatformGate,
+  structuredSupervisorTransport,
+  type StructuredSupervisorTransport,
+} from "./structured-supervisor-platform.js";
 
 export const SUPERVISOR_MANIFEST_VERSION = 1;
 
@@ -38,6 +46,7 @@ export interface StructuredSupervisorManifest {
   createdAt: number;
   approvalPolicy: ApprovalPolicy;
   socket: string;
+  transport?: StructuredSupervisorTransport;
   tokenFile: string;
   /** Private owner directory; socket may use a short endpoint under /tmp. */
   sessionDir?: string;
@@ -60,6 +69,8 @@ interface RunnerConfig {
   sessionDir: string;
   attachmentRoot: string;
   socketPath: string;
+  transport: StructuredSupervisorTransport;
+  lifecycleEpoch: string;
   /** Atomically-created /tmp parent, removed only by this runner on exit. */
   socketDir?: string;
   environment: Record<string, string>;
@@ -88,10 +99,14 @@ function privateWrite(file: string, value: unknown): void {
 }
 
 function readConfig(): RunnerConfig {
+  const platformGate = structuredSupervisorPlatformGate();
+  if (platformGate) throw new Error(platformGate);
+  const transport = structuredSupervisorTransport();
+  if (!transport) throw new Error("structured supervisor transport is unavailable");
   const file = process.env["PROSPERO_STRUCTURED_SUPERVISOR_CONFIG"];
   if (!file) throw new Error("missing structured supervisor bootstrap path");
   const metadata = lstatSync(file);
-  if (!metadata.isFile() || metadata.isSymbolicLink() || (metadata.mode & 0o777) !== 0o600) {
+  if (!metadata.isFile() || metadata.isSymbolicLink() || !hasPrivateSupervisorFileMode(metadata.mode)) {
     throw new Error("unsafe structured supervisor bootstrap");
   }
   const stat = readFileSync(file, "utf8");
@@ -105,10 +120,15 @@ function readConfig(): RunnerConfig {
     v.version !== 1 || typeof v.sessionId !== "string" || typeof v.agent !== "string" ||
     typeof v.title !== "string" || typeof v.cwd !== "string" || typeof v.createdAt !== "number" ||
     typeof v.sessionDir !== "string" || typeof v.attachmentRoot !== "string" || typeof v.socketPath !== "string" ||
+    v.transport !== "unix_socket" ||
+    typeof v.lifecycleEpoch !== "string" || v.lifecycleEpoch.length === 0 ||
     (v.socketDir !== undefined && (typeof v.socketDir !== "string" || path.dirname(v.socketPath) !== v.socketDir)) ||
     !v.environment || typeof v.environment !== "object" || Array.isArray(v.environment)
   ) {
     throw new Error("invalid supervisor bootstrap");
+  }
+  if (v.transport !== transport || !isStructuredSupervisorEndpoint(v.socketPath, v.transport)) {
+    throw new Error("supervisor bootstrap endpoint is incompatible with this platform");
   }
   return v as RunnerConfig;
 }
@@ -121,7 +141,7 @@ function removeSocketDirectory(config: RunnerConfig): void {
   if (!config.socketDir) return;
   try {
     const metadata = lstatSync(config.socketDir);
-    if (metadata.isDirectory() && !metadata.isSymbolicLink() && (metadata.mode & 0o777) === 0o700) {
+    if (metadata.isDirectory() && !metadata.isSymbolicLink() && hasPrivateSupervisorDirectoryMode(metadata.mode)) {
       rmdirSync(config.socketDir);
     }
   } catch {
@@ -151,9 +171,10 @@ function updateManifest(config: RunnerConfig, patch: Partial<StructuredSuperviso
       createdAt: config.createdAt,
       approvalPolicy: config.approvalPolicy ?? "standard",
       socket: config.socketPath,
+      transport: config.transport,
       tokenFile: "token",
       sessionDir: config.sessionDir,
-      lifecycleEpoch: "unknown",
+      lifecycleEpoch: config.lifecycleEpoch,
     }),
     ...patch,
     updatedAt: Date.now(),
@@ -217,7 +238,10 @@ export async function runStructuredSupervisor(): Promise<void> {
   const config = readConfig();
   const tokenPath = path.join(config.sessionDir, "token");
   if (!existsSync(tokenPath)) throw new Error("missing supervisor capability token");
-  if ((statSync(tokenPath).mode & 0o777) !== 0o600) throw new Error("unsafe supervisor capability token");
+  const tokenMetadata = lstatSync(tokenPath);
+  if (!tokenMetadata.isFile() || tokenMetadata.isSymbolicLink() || !hasPrivateSupervisorFileMode(tokenMetadata.mode)) {
+    throw new Error("unsafe supervisor capability token");
+  }
   const token = readFileSync(tokenPath, "utf8").trim();
   if (!token) throw new Error("empty supervisor capability token");
 
