@@ -275,6 +275,24 @@ describe("Windows Session Host common transport (mock native process)", () => {
     expect((replay.value as { snapshot: { lastSeq: number } }).snapshot.lastSeq).toBe(4);
   });
 
+  it("lets a command await durable provider events without overlapping command handlers", async () => {
+    const { child, manifest } = await startMock();
+    await call(child, "hello", { frame: makeHello(manifest), peer: { process: daemonA, userSid: "S-1-5-21-1000", sessionId: 1 } });
+    const lease = await call(child, "command", { frame: {
+      version: 2, type: "command", sessionId: manifest.sessionId, epoch: manifest.epoch,
+      commandId: "emit-lease", mutation: true, method: "lease.acquire", params: {},
+    } });
+    const leaseId = (lease.value as { result: { leaseId: string } }).result.leaseId;
+    const emitted = await call(child, "command", { frame: {
+      version: 2, type: "command", sessionId: manifest.sessionId, epoch: manifest.epoch,
+      commandId: "effect-with-events", mutation: true, method: "effect.emit", params: {}, leaseId,
+    } });
+    const reply = emitted.value as { ok: true; seq: number; result: { eventSeqs: number[]; calls: number } };
+    expect(reply.result.eventSeqs).toEqual([3, 4]);
+    expect(reply.seq).toBe(5);
+    expect(reply.result.calls).toBe(1);
+  });
+
   it("rejects malformed native peer identity and replay cursors beyond the durable watermark", async () => {
     const { child, manifest } = await startMock();
     await expect(call(child, "hello", { frame: makeHello(manifest), peer: { process: daemonA, userSid: "not-a-sid", sessionId: 1 } })).rejects.toThrow(/peer/i);
@@ -487,7 +505,10 @@ describe("Windows Session Host detached bootstrap and provider output", () => {
     const native: WindowsSessionHostRunnerNative & { close(): Promise<void> } = {
       async openState() {},
       async read(name) { return files.get(name) ?? null; },
-      async writeAtomic(name, bytes) { files.set(name, Uint8Array.from(bytes)); },
+      async writeAtomic(name, bytes) {
+        if (name === "host.ready.json") order.push("ready.write");
+        files.set(name, Uint8Array.from(bytes));
+      },
       async removeState(name) { files.delete(name); },
       async createCredential() {}, async hmac(material) { return hmacProof(secret, material); },
       async currentIdentity() { return daemonA; },
@@ -496,7 +517,10 @@ describe("Windows Session Host detached bootstrap and provider output", () => {
       async isProviderProcessInJob(process) { expect(process).toEqual(daemonA); order.push("job.audit-self"); return true; },
       async terminateProviderJob() {}, async closeProviderJob() {},
       async createPipe() { order.push("pipe.create"); },
-      async acceptPipe() { return new Promise<void>((_resolve, reject) => { rejectAccept = reject; }); },
+      async acceptPipe() {
+        order.push("pipe.accept");
+        return new Promise<void>((_resolve, reject) => { rejectAccept = reject; });
+      },
       async readPipe() { return { data: new Uint8Array(), peer: null }; }, async writePipe() { return 0; },
       async closePipeConnection() {}, async closePipeServer() {},
       async cancelActivePipeIo() { rejectAccept?.(new Error("test cancellation")); }, async close() {},
@@ -504,6 +528,7 @@ describe("Windows Session Host detached bootstrap and provider output", () => {
     const factory: WindowsSessionHostNativeFactory = { async create() { return native; } };
     const running = await runDetachedWindowsSessionHostFromEnvironment({ PROSPERO_WINDOWS_SESSION_HOST_STATE_DIRECTORY: stateDirectory }, factory);
     expect(order.slice(0, 4)).toEqual(["job.create", "job.assign-self", "job.audit-self", "pipe.create"]);
+    expect(order.indexOf("ready.write")).toBeLessThan(order.indexOf("pipe.accept"));
     const journal = decodePsj2Journal(files.get("journal.psj2")!, sessionId, epoch);
     expect(journal.events.map((event) => event.payload)).toEqual([
       { source: "factory", output: "daemon-offline" },
@@ -542,6 +567,11 @@ describe("Windows Session Host detached bootstrap and provider output", () => {
       { async create() { return native; } },
     )).rejects.toThrow(/handler is invalid/);
     expect(closeJob).toBe(1);
+    expect(JSON.parse(new TextDecoder().decode(files.get("host.failed.json")!))).toEqual({
+      version: 1,
+      code: "native_unavailable",
+      stage: "starting_handler",
+    });
   });
 
   it("exactly rolls back a launched host and clears credential-bearing bootstrap on invalid manifest publication", async () => {
@@ -605,6 +635,47 @@ describe("Windows Session Host detached bootstrap and provider output", () => {
     }, native)).rejects.toMatchObject({ code: "native_unavailable" });
     expect(exactTerminateCalls).toBe(0);
     expect([...files.keys()]).toEqual([]);
+  });
+
+  it("canonicalizes Windows runtime variables copied from a worker-thread environment", async () => {
+    const environmentKeys = ["SystemRoot", "SYSTEMROOT"] as const;
+    const previous = new Map(environmentKeys.map((name) => [name, process.env[name]]));
+    let launchedEnvironment: Readonly<Record<string, string>> | undefined;
+    try {
+      for (const name of environmentKeys) delete process.env[name];
+      // Node documents worker-thread process.env copies as case-sensitive on
+      // Windows. Task Scheduler commonly supplies this all-uppercase spelling.
+      process.env["SYSTEMROOT"] = "C:\\Windows";
+      const files = new Map<string, Uint8Array>();
+      const native: WindowsSessionHostDetachedLaunchNative = {
+        async openState() {}, async read(name) { return files.get(name) ?? null; },
+        async writeAtomic(name, bytes) { files.set(name, Uint8Array.from(bytes)); },
+        async removeState(name) { files.delete(name); },
+        async launchDetachedHost(options) {
+          launchedEnvironment = options.environment;
+          return { status: "parent_job_prevents_detach", parentJob: { parentJobDetected: true, breakawayAllowed: false, detachedLaunchAllowed: false } };
+        },
+        async terminateIdentityAndWait() { return false; },
+        async close() {},
+      };
+      await expect(launchDetachedWindowsSessionHostWithNative({
+        sessionId,
+        epoch,
+        pipeName: "\\\\.\\pipe\\prospero-detached-worker-environment",
+        stateDirectory,
+        handlerModule,
+      }, native)).rejects.toMatchObject({ code: "native_unavailable" });
+      expect(launchedEnvironment).toMatchObject({
+        SystemRoot: "C:\\Windows",
+        PROSPERO_WINDOWS_SESSION_HOST_STATE_DIRECTORY: stateDirectory,
+      });
+    } finally {
+      for (const name of environmentKeys) {
+        const value = previous.get(name);
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
   });
 
   it("uses exact owner identity for facade-attach rollback and persists failed discovery state", async () => {
