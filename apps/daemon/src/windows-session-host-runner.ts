@@ -126,6 +126,7 @@ export interface StartWindowsSessionHostOptions {
 const DETACHED_BOOTSTRAP_FILE = "host.bootstrap.json";
 const DETACHED_READY_FILE = "host.ready.json";
 const DETACHED_FAILED_FILE = "host.failed.json";
+const DETACHED_TEST_DIAGNOSTIC_FILE = "host.test-diagnostic.json";
 const DETACHED_STARTUP_STAGES = [
   "opening_state",
   "claiming_bootstrap",
@@ -1154,6 +1155,9 @@ function runnerEnvironment(stateDirectory: string): Record<string, string> {
   ] as const;
   return {
     ...Object.fromEntries(inherited.filter((name) => process.env[name] !== undefined).map((name) => [name, process.env[name]!])),
+    ...(process.env["PROSPERO_WINDOWS_SIGNED_SESSION_HOST_TEST"] === "1"
+      ? { PROSPERO_WINDOWS_SIGNED_SESSION_HOST_TEST: "1" }
+      : {}),
     [DETACHED_RUNNER_ENV]: stateDirectory,
   };
 }
@@ -1209,7 +1213,20 @@ async function waitForDetachedManifest(
       : !readyPublished
         ? "after_manifest_publish"
         : "after_ready_publish";
-  throw new WindowsSessionHostUnavailable("launch_failed", `Windows detached host did not publish a verified manifest (${stage})`);
+  let diagnostic = "";
+  if (process.env["PROSPERO_WINDOWS_SIGNED_SESSION_HOST_TEST"] === "1") {
+    const bytes = await native.read(DETACHED_TEST_DIAGNOSTIC_FILE);
+    if (bytes !== null) {
+      try {
+        const value: unknown = JSON.parse(new TextDecoder().decode(bytes));
+        if (isObject(value) && (value.stage === "entry_loaded" || value.stage === "entry_failed")) {
+          const message = typeof value.message === "string" ? value.message.slice(0, 320) : "";
+          diagnostic = `; test_entry=${value.stage}${message ? `:${message}` : ""}`;
+        }
+      } catch { /* CI-only diagnostic is advisory */ }
+    }
+  }
+  throw new WindowsSessionHostUnavailable("launch_failed", `Windows detached host did not publish a verified manifest (${stage}${diagnostic})`);
 }
 
 async function removeDetachedBootstrapState(
