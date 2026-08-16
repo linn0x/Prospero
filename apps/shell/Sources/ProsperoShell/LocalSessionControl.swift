@@ -1,33 +1,26 @@
 import Foundation
 
-/// Mac 工作台从 daemon 本机控制面取得的单帧。结构化会话返回完整事件快照，
-/// PTY 返回可直接重放给 xterm 的 ANSI 画面；`seq` 用来让无变化轮询走 204。
+/// A terminal view is still a complete ANSI snapshot. Structured conversations instead use the
+/// append-only `afterSeq` protocol below, so a long chat never gets rebuilt every polling turn.
 enum LocalSessionFrame: Sendable, Equatable {
-  case structured(seq: Int, payload: Data)
   case terminal(seq: Int, ansi: String, cols: Int, rows: Int)
 
   var seq: Int {
     switch self {
-    case .structured(let seq, _), .terminal(let seq, _, _, _): seq
+    case .terminal(let seq, _, _, _): seq
     }
   }
 
-  static func decode(_ data: Data) throws -> LocalSessionFrame {
+  static func decodeTerminal(_ data: Data) throws -> LocalSessionFrame {
     guard
       let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-      let kind = root["kind"] as? String
+      root["kind"] as? String == "pty",
+      let ansi = root["ansi"] as? String
     else {
-      throw LocalSessionControlFailure("daemon 返回了无法识别的会话画面")
-    }
-    let seq = root["seq"] as? Int ?? 0
-    if kind == "structured" {
-      return .structured(seq: seq, payload: data)
-    }
-    guard kind == "pty", let ansi = root["ansi"] as? String else {
       throw LocalSessionControlFailure("daemon 返回了不完整的终端画面")
     }
     return .terminal(
-      seq: seq,
+      seq: root["seq"] as? Int ?? 0,
       ansi: ansi,
       cols: root["cols"] as? Int ?? 120,
       rows: root["rows"] as? Int ?? 40
@@ -35,114 +28,52 @@ enum LocalSessionFrame: Sendable, Equatable {
   }
 }
 
-struct LocalPermissionPrompt: Identifiable, Sendable, Equatable {
-  var id: String { requestID }
-  let requestID: String
-  let action: String
-  let summary: String
-  let resources: [String]
-}
+/// Checked response to the structured `afterSeq` contract. A delta can only be applied to the
+/// cursor used in the request; every other case is an authoritative snapshot (including restart).
+enum LocalStructuredFrame: Sendable, Equatable {
+  case snapshot(ChatSnapshot)
+  case delta(ChatDelta)
 
-struct LocalAgentQuestionOption: Identifiable, Sendable, Equatable {
-  var id: String { label }
-  let label: String
-  let detail: String?
-}
-
-struct LocalAgentQuestion: Identifiable, Sendable, Equatable {
-  let id: String
-  let header: String
-  let question: String
-  let options: [LocalAgentQuestionOption]
-  let multiSelect: Bool
-  let allowOther: Bool
-  let secret: Bool
-}
-
-struct LocalQuestionPrompt: Identifiable, Sendable, Equatable {
-  var id: String { requestID }
-  let requestID: String
-  let questions: [LocalAgentQuestion]
-}
-
-struct LocalSessionInteractions: Sendable, Equatable {
-  var permissions: [LocalPermissionPrompt]
-  var questions: [LocalQuestionPrompt]
-
-  static let empty = LocalSessionInteractions(permissions: [], questions: [])
-
-  /// 从同一份事件快照推导当前仍未处理的交互。后出现的 resolved 事件会移除请求，
-  /// 所以 daemon 重启恢复后也不会把旧审批重新亮起来。
-  static func decode(_ data: Data) throws -> LocalSessionInteractions {
-    guard
-      let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-      let events = root["events"] as? [[String: Any]]
-    else {
-      throw LocalSessionControlFailure("daemon 返回了无法识别的 Agent 事件")
+  static func decode(_ data: Data, requestedAfterSeq: Int) throws -> LocalStructuredFrame {
+    guard requestedAfterSeq >= 0 else {
+      throw LocalSessionControlFailure("结构化会话游标无效")
     }
-
-    var permissionOrder: [String] = []
-    var permissions: [String: LocalPermissionPrompt] = [:]
-    var questionOrder: [String] = []
-    var questions: [String: LocalQuestionPrompt] = [:]
-
-    for event in events {
-      let kind = event["kind"] as? String ?? ""
-      let requestID = event["reqId"] as? String ?? ""
-      switch kind {
-      case "permission.request":
-        guard !requestID.isEmpty else { continue }
-        if permissions[requestID] == nil { permissionOrder.append(requestID) }
-        permissions[requestID] = LocalPermissionPrompt(
-          requestID: requestID,
-          action: event["action"] as? String ?? "权限请求",
-          summary: event["summary"] as? String ?? "",
-          resources: event["resources"] as? [String] ?? []
-        )
-      case "permission.resolved":
-        permissions.removeValue(forKey: requestID)
-      case "question.request":
-        guard !requestID.isEmpty else { continue }
-        let decoded: [LocalAgentQuestion] =
-          (event["questions"] as? [[String: Any]] ?? []).compactMap { raw -> LocalAgentQuestion? in
-            guard let id = raw["id"] as? String, let text = raw["question"] as? String else {
-              return nil
-            }
-            let options: [LocalAgentQuestionOption] =
-              (raw["options"] as? [[String: Any]] ?? []).compactMap { option -> LocalAgentQuestionOption? in
-              guard let label = option["label"] as? String else { return nil }
-              return LocalAgentQuestionOption(
-                label: label,
-                detail: option["description"] as? String
-              )
-            }
-            return LocalAgentQuestion(
-              id: id,
-              header: raw["header"] as? String ?? "",
-              question: text,
-              options: options,
-              multiSelect: raw["multiSelect"] as? Bool ?? false,
-              allowOther: raw["allowOther"] as? Bool ?? false,
-              secret: raw["secret"] as? Bool ?? false
-            )
-          }
-        if questions[requestID] == nil { questionOrder.append(requestID) }
-        questions[requestID] = LocalQuestionPrompt(requestID: requestID, questions: decoded)
-      case "question.resolved":
-        questions.removeValue(forKey: requestID)
-      default:
-        continue
+    guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+          root["kind"] as? String == "structured",
+          let mode = root["mode"] as? String else {
+      throw LocalSessionControlFailure("daemon 返回了无法识别的结构化会话")
+    }
+    switch mode {
+    case "snapshot":
+      // Snapshot intentionally accepts a lower evSeq. It is how a daemon restart replaces a
+      // stale in-memory timeline without leaving a mixed transcript on screen.
+      return .snapshot(try ChatPayloadDecoder.localSnapshot(from: data))
+    case "delta":
+      let delta = try ChatPayloadDecoder.localDelta(from: data)
+      guard delta.baseSeq == requestedAfterSeq else {
+        throw LocalSessionControlFailure("结构化会话增量的 baseSeq 与请求游标不一致")
       }
+      return .delta(delta)
+    default:
+      throw LocalSessionControlFailure("daemon 返回了未知的结构化会话模式")
     }
-
-    return LocalSessionInteractions(
-      permissions: permissionOrder.compactMap { permissions[$0] },
-      questions: questionOrder.compactMap { questions[$0] }
-    )
   }
 }
 
-struct LocalSessionControlFailure: LocalizedError, Sendable {
+struct LocalToolOutput: Sendable, Equatable {
+  let output: String
+  let truncated: Bool
+
+  static func decode(_ data: Data) throws -> LocalToolOutput {
+    guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let output = root["output"] as? String else {
+      throw LocalSessionControlFailure("daemon 返回了无法识别的工具输出")
+    }
+    return LocalToolOutput(output: output, truncated: root["truncated"] as? Bool ?? false)
+  }
+}
+
+struct LocalSessionControlFailure: LocalizedError, Sendable, Equatable {
   let message: String
 
   init(_ message: String) {
@@ -153,53 +84,94 @@ struct LocalSessionControlFailure: LocalizedError, Sendable {
 }
 
 extension DaemonController {
-  /// 返回 nil 表示 `knownSeq` 仍是最新，调用者无需重绘。
-  func loadLocalSessionFrame(id: String, knownSeq: Int?) async throws -> LocalSessionFrame? {
-    guard let initialRequest = localSessionRequest(id: id, endpoint: "view", method: "GET") else {
-      throw LocalSessionControlFailure("daemon 尚未提供本机会话接口")
-    }
-    var request = initialRequest
-    if let knownSeq, var components = URLComponents(url: request.url!, resolvingAgainstBaseURL: false) {
-      components.queryItems = [URLQueryItem(name: "knownSeq", value: String(knownSeq))]
-      request.url = components.url
-    }
-    let (data, response) = try await URLSession.shared.data(for: request)
-    guard let http = response as? HTTPURLResponse else {
-      throw LocalSessionControlFailure("daemon 没有返回 HTTP 状态")
-    }
-    if http.statusCode == 204 { return nil }
-    guard (200..<300).contains(http.statusCode) else {
+  /// Used once when the daemon identity changes. A PID change is the only safe time to replace a
+  /// timeline even if its numerical cursor happens to be the same after persistence recovery.
+  func loadLocalStructuredSnapshot(id: String) async throws -> ChatSnapshot {
+    let (data, response) = try await performLocalSessionRead(id: id, endpoint: "view", query: [])
+    guard (200..<300).contains(response.statusCode) else {
       throw LocalSessionControlFailure(controlErrorMessage(data, fallback: "daemon 拒绝读取会话"))
     }
-    return try LocalSessionFrame.decode(data)
+    return try ChatPayloadDecoder.localSnapshot(from: data)
+  }
+
+  /// `nil` means HTTP 204: the requested cursor is still current and the caller must not redraw.
+  func loadLocalStructuredFrame(id: String, afterSeq: Int) async throws -> LocalStructuredFrame? {
+    guard afterSeq >= 0 else { throw LocalSessionControlFailure("结构化会话游标无效") }
+    let (data, response) = try await performLocalSessionRead(
+      id: id,
+      endpoint: "view",
+      query: [URLQueryItem(name: "afterSeq", value: String(afterSeq))]
+    )
+    if response.statusCode == 204 { return nil }
+    guard (200..<300).contains(response.statusCode) else {
+      throw LocalSessionControlFailure(controlErrorMessage(data, fallback: "daemon 拒绝读取会话"))
+    }
+    return try LocalStructuredFrame.decode(data, requestedAfterSeq: afterSeq)
+  }
+
+  /// PTY stays on its established complete-frame contract; no structured cursor is sent here.
+  func loadLocalTerminalFrame(id: String, knownSeq: Int?) async throws -> LocalSessionFrame? {
+    var query: [URLQueryItem] = []
+    if let knownSeq { query.append(URLQueryItem(name: "knownSeq", value: String(knownSeq))) }
+    let (data, response) = try await performLocalSessionRead(id: id, endpoint: "view", query: query)
+    if response.statusCode == 204 { return nil }
+    guard (200..<300).contains(response.statusCode) else {
+      throw LocalSessionControlFailure(controlErrorMessage(data, fallback: "daemon 拒绝读取终端"))
+    }
+    return try LocalSessionFrame.decodeTerminal(data)
+  }
+
+  /// Tool payloads are intentionally loaded only when a user expands a truncated tool card.
+  func loadLocalToolOutput(id: String, callID: String) async throws -> LocalToolOutput {
+    let (data, response) = try await performLocalSessionRead(
+      id: id,
+      endpoint: "tool-output",
+      query: [URLQueryItem(name: "callId", value: callID)]
+    )
+    guard (200..<300).contains(response.statusCode) else {
+      throw LocalSessionControlFailure(controlErrorMessage(data, fallback: "无法读取完整工具输出"))
+    }
+    return try LocalToolOutput.decode(data)
+  }
+
+  /// Child details share the same reducer as their parent, but are read from the daemon's isolated
+  /// child endpoint so child tokens never contaminate the parent timeline.
+  func loadLocalSubagentSnapshot(sessionID: String, subagentID: String) async throws -> ChatSnapshot {
+    guard let running, !running.controlToken.isEmpty else {
+      throw LocalSessionControlFailure("daemon 尚未提供本机控制接口")
+    }
+    let encodedSession = sessionID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? sessionID
+    let encodedSubagent = subagentID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? subagentID
+    guard let url = URL(
+      string: "http://127.0.0.1:\(running.port)/_prospero/control/session/\(encodedSession)/subagent/\(encodedSubagent)/events"
+    ) else {
+      throw LocalSessionControlFailure("无法构造子 Agent 事件地址")
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = "GET"
+    request.cachePolicy = .reloadIgnoringLocalCacheData
+    request.setValue("Bearer \(running.controlToken)", forHTTPHeaderField: "Authorization")
+    let (data, response) = try await URLSession.shared.data(for: request)
+    guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+      throw LocalSessionControlFailure(controlErrorMessage(data, fallback: "无法读取子 Agent 过程"))
+    }
+    return try ChatPayloadDecoder.subagentSnapshot(from: data)
   }
 
   func sendLocalChat(id: String, text: String) async -> String? {
-    await performLocalSessionInteraction(
-      id: id,
-      body: ["type": "chat.send", "text": text]
-    )
+    await performLocalSessionInteraction(id: id, body: ["type": "chat.send", "text": text])
   }
 
   func sendLocalTerminalInput(id: String, dataB64: String) async -> String? {
-    await performLocalSessionInteraction(
-      id: id,
-      body: ["type": "term.input", "dataB64": dataB64]
-    )
+    await performLocalSessionInteraction(id: id, body: ["type": "term.input", "dataB64": dataB64])
   }
 
   func resizeLocalTerminal(id: String, cols: Int, rows: Int) async -> String? {
-    await performLocalSessionInteraction(
-      id: id,
-      body: ["type": "term.resize", "cols": cols, "rows": rows]
-    )
+    await performLocalSessionInteraction(id: id, body: ["type": "term.resize", "cols": cols, "rows": rows])
   }
 
   func respondLocalPermission(id: String, requestID: String, reply: String) async -> String? {
-    await performLocalSessionInteraction(
-      id: id,
-      body: ["type": "permission.respond", "reqId": requestID, "reply": reply]
-    )
+    await performLocalSessionInteraction(id: id, body: ["type": "permission.respond", "reqId": requestID, "reply": reply])
   }
 
   func respondLocalQuestion(
@@ -211,13 +183,27 @@ extension DaemonController {
     let payload = answers.map { ["questionId": $0.questionID, "values": $0.values] as [String: Any] }
     return await performLocalSessionInteraction(
       id: id,
-      body: [
-        "type": "question.respond",
-        "reqId": requestID,
-        "answers": payload,
-        "cancelled": cancelled,
-      ]
+      body: ["type": "question.respond", "reqId": requestID, "answers": payload, "cancelled": cancelled]
     )
+  }
+
+  private func performLocalSessionRead(
+    id: String,
+    endpoint: String,
+    query: [URLQueryItem]
+  ) async throws -> (Data, HTTPURLResponse) {
+    guard var request = localSessionRequest(id: id, endpoint: endpoint, method: "GET") else {
+      throw LocalSessionControlFailure("daemon 尚未提供本机会话接口")
+    }
+    if !query.isEmpty, var components = URLComponents(url: request.url!, resolvingAgainstBaseURL: false) {
+      components.queryItems = query
+      request.url = components.url
+    }
+    let (data, response) = try await URLSession.shared.data(for: request)
+    guard let http = response as? HTTPURLResponse else {
+      throw LocalSessionControlFailure("daemon 没有返回 HTTP 状态")
+    }
+    return (data, http)
   }
 
   private func localSessionRequest(id: String, endpoint: String, method: String) -> URLRequest? {

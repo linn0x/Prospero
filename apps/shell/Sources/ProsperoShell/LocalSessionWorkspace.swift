@@ -416,17 +416,17 @@ struct LocalSessionWorkspace: View {
   let session: RunningStatus.Session
   let interrupt: () -> Void
   let kill: () -> Void
-  let launchCLI: () -> Void
-  let openSubagent: (RunningStatus.Session.Subagent) -> Void
 
-  @State private var transcript: SubagentTranscript?
-  @State private var interactions = LocalSessionInteractions.empty
+  @State private var timeline = ChatTimeline()
   @State private var terminalFrame: TerminalRenderFrame?
-  @State private var lastSeq: Int?
+  @State private var lastTerminalSeq: Int?
+  @State private var daemonPID: Int32?
   @State private var loadError: String?
   @State private var actionError: String?
   @State private var draft = ""
   @State private var sending = false
+  @State private var pendingActions: Set<String> = []
+  @State private var selectedSubagent: ChatTimeline.Subagent?
 
   private var accent: Color { AgentVisuals.statusColor(session) }
   private var terminalPort: Int { daemon.running?.port ?? 7423 }
@@ -459,11 +459,16 @@ struct LocalSessionWorkspace: View {
           .frame(maxWidth: .infinity, alignment: .leading)
       }
     }
-    // iOS 的结构化会话只在这里展示入口说明；桌面不再拉取完整卡片事件流，
-    // 避免打开一段长对话就持续解码历史。CLI 会话才需要高频刷新终端 ANSI 帧。
-    .task(id: session.id) {
-      guard session.kind == "pty" else { return }
+    .task(id: "\(session.id):\(daemon.running?.pid ?? 0)") {
       await refreshLoop()
+    }
+    .sheet(item: $selectedSubagent) { subagent in
+      LocalSubagentWorkspace(
+        daemon: daemon,
+        sessionID: session.id,
+        subagentID: String(subagent.id.dropFirst("subagent:".count)),
+        subagentName: subagent.name
+      )
     }
     .alert("会话操作失败", isPresented: Binding(
       get: { actionError != nil },
@@ -482,7 +487,7 @@ struct LocalSessionWorkspace: View {
         HStack(spacing: 8) {
           Text(AgentVisuals.name(session.agent))
             .font(.headline)
-          Text(session.kind == "structured" ? "移动端 Chat UI" : "Shell · CLI")
+          Text(session.kind == "structured" ? "Chat" : "Shell · CLI")
             .font(.caption2.weight(.medium))
             .foregroundStyle(.secondary)
             .padding(.horizontal, 7)
@@ -561,25 +566,22 @@ struct LocalSessionWorkspace: View {
 
   @ViewBuilder
   private var structuredWorkspace: some View {
-    VStack(spacing: 16) {
-      Image(systemName: "iphone.and.arrow.forward")
-        .font(.system(size: 36, weight: .light))
-        .foregroundStyle(.secondary)
-      Text("这是移动端 Chat UI 会话")
-        .font(.title3.weight(.semibold))
-      Text("Mac 工作台只呈现原生 CLI。这个会话仍可在 iPhone 或 iPad 中查看消息、工具过程和审批；在此项目启动 CLI 会话可获得完整终端。")
-        .foregroundStyle(.secondary)
-        .multilineTextAlignment(.center)
-        .frame(maxWidth: 460)
-      Button {
-        launchCLI()
-      } label: {
-        Label("在此项目启动 \(AgentVisuals.name(session.agent)) CLI", systemImage: "terminal")
-      }
-      .buttonStyle(.borderedProminent)
-    }
-    .padding(32)
-    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    ChatTimelineView(
+      timeline: timeline,
+      actions: ChatTimelineActions(
+        send: sendChat,
+        respondToPermission: { requestID, reply in respondPermission(requestID, reply: reply) },
+        respondToQuestion: { requestID, answers, cancelled in
+          respondQuestion(requestID, answers: answers, cancelled: cancelled)
+        },
+        loadToolOutput: loadToolOutput,
+        openSubagent: openSubagent,
+        isPending: { pendingActions.contains($0) }
+      ),
+      draft: $draft,
+      isSending: sending,
+      sendEnabled: daemon.running?.controlToken.isEmpty == false
+    )
   }
 
   private var terminalWorkspace: some View {
@@ -606,40 +608,90 @@ struct LocalSessionWorkspace: View {
         ProgressView("正在载入终端…")
           .tint(.white)
           .foregroundStyle(.white)
+      } else {
+        ContentUnavailableView(
+          "无法载入终端",
+          systemImage: "terminal",
+          description: Text("保持会话内容不变，正在自动重试。")
+        )
+        .foregroundStyle(.white)
       }
     }
   }
 
   private func refreshLoop() async {
+    var failedAttempts = 0
     while !Task.isCancelled {
       do {
-        if let frame = try await daemon.loadLocalSessionFrame(id: session.id, knownSeq: lastSeq) {
-          lastSeq = frame.seq
+        if session.kind == "structured" {
+          try await refreshStructuredTimeline()
+        } else if let frame = try await daemon.loadLocalTerminalFrame(id: session.id, knownSeq: lastTerminalSeq) {
+          lastTerminalSeq = frame.seq
           switch frame {
-          case .structured(_, let payload):
-            transcript = try SubagentTranscript.decode(
-              payload,
-              agentName: AgentVisuals.name(session.agent)
-            )
-            interactions = try LocalSessionInteractions.decode(payload)
           case .terminal(let seq, let ansi, let cols, let rows):
             terminalFrame = TerminalRenderFrame(seq: seq, ansi: ansi, cols: cols, rows: rows)
           }
         }
         loadError = nil
+        failedAttempts = 0
       } catch {
         loadError = error.localizedDescription
+        failedAttempts = min(failedAttempts + 1, 5)
       }
       do {
-        try await Task.sleep(for: .milliseconds(450))
+        let delay = min(8_000, 450 * (1 << failedAttempts))
+        try await Task.sleep(for: .milliseconds(delay))
       } catch {
         return
       }
     }
   }
 
-  private func sendDraft() {
-    let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+  private func refreshStructuredTimeline() async throws {
+    let currentPID = daemon.running?.pid
+    if daemonPID != currentPID {
+      // A new daemon may have a lower event sequence. Its snapshot is authoritative and replaces
+      // the retained UI only after a valid response arrives, so a transient restart keeps content.
+      let snapshot = try await daemon.loadLocalStructuredSnapshot(id: session.id)
+      timeline.reset(with: snapshot)
+      daemonPID = currentPID
+      return
+    }
+    let frame: LocalStructuredFrame?
+    do {
+      frame = try await daemon.loadLocalStructuredFrame(id: session.id, afterSeq: timeline.evSeq)
+    } catch let failure as LocalSessionControlFailure where failure.message.contains("结构化会话增量") {
+      // A malformed or discontinuous delta is never retried against the same cursor. Ask for the
+      // authoritative snapshot immediately; if that fails, the outer loop retains existing UI and
+      // backs off normally.
+      timeline.reset(with: try await daemon.loadLocalStructuredSnapshot(id: session.id))
+      return
+    }
+    guard let frame else {
+      return // HTTP 204; no state mutation means no redraw.
+    }
+    switch frame {
+    case .snapshot(let snapshot):
+      timeline.reset(with: snapshot)
+    case .delta(let delta):
+      guard delta.baseSeq == timeline.evSeq else {
+        // Never blend a reply for an old cursor into the visible transcript. The next request gets
+        // an authoritative snapshot if the gap came from truncation or a daemon restart.
+        timeline.reset(with: try await daemon.loadLocalStructuredSnapshot(id: session.id))
+        return
+      }
+      for (offset, body) in delta.events.enumerated() {
+        let result = timeline.apply(.init(evSeq: delta.baseSeq + offset + 1, body: body))
+        if case .gap = result {
+          timeline.reset(with: try await daemon.loadLocalStructuredSnapshot(id: session.id))
+          return
+        }
+      }
+    }
+  }
+
+  private func sendChat(_ value: String) {
+    let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !text.isEmpty, !sending else { return }
     draft = ""
     sending = true
@@ -652,12 +704,15 @@ struct LocalSessionWorkspace: View {
     }
   }
 
-  private func respondPermission(_ prompt: LocalPermissionPrompt, reply: String) {
+  private func respondPermission(_ requestID: String, reply: ChatPermissionReply) {
+    let actionID = "permission:\(requestID)"
+    guard pendingActions.insert(actionID).inserted else { return }
     Task {
+      defer { pendingActions.remove(actionID) }
       if let error = await daemon.respondLocalPermission(
         id: session.id,
-        requestID: prompt.requestID,
-        reply: reply
+        requestID: requestID,
+        reply: reply.rawValue
       ) {
         actionError = error
       }
@@ -665,314 +720,164 @@ struct LocalSessionWorkspace: View {
   }
 
   private func respondQuestion(
-    _ prompt: LocalQuestionPrompt,
-    answers: [(questionID: String, values: [String])],
+    _ requestID: String,
+    answers: [ChatQuestionAnswer],
     cancelled: Bool
   ) {
+    let actionID = "question:\(requestID)"
+    guard pendingActions.insert(actionID).inserted else { return }
     Task {
+      defer { pendingActions.remove(actionID) }
       if let error = await daemon.respondLocalQuestion(
         id: session.id,
-        requestID: prompt.requestID,
-        answers: answers,
+        requestID: requestID,
+        answers: cancelled ? [] : answers.map { ($0.questionID, $0.values) },
         cancelled: cancelled
       ) {
         actionError = error
       }
     }
   }
-}
 
-private struct AgentTranscriptList: View {
-  let transcript: SubagentTranscript
-
-  var body: some View {
-    ScrollViewReader { proxy in
-      ScrollView {
-        LazyVStack(alignment: .leading, spacing: 10) {
-          ForEach(transcript.events) { event in
-            SubagentTranscriptEventRow(event: event)
-              .id(event.id)
-          }
-          Color.clear.frame(height: 1).id("transcript-bottom")
-        }
-        .padding(18)
-        .frame(maxWidth: 860)
-        .frame(maxWidth: .infinity)
-      }
-      .onChange(of: transcript.evSeq) { _, _ in
-        withAnimation(.easeOut(duration: 0.16)) {
-          proxy.scrollTo("transcript-bottom", anchor: .bottom)
-        }
+  private func loadToolOutput(_ callID: String) {
+    let actionID = "tool:\(callID)"
+    guard pendingActions.insert(actionID).inserted else { return }
+    Task {
+      defer { pendingActions.remove(actionID) }
+      do {
+        let result = try await daemon.loadLocalToolOutput(id: session.id, callID: callID)
+        timeline.setToolOutput(callID: callID, output: result.output, truncated: result.truncated)
+      } catch {
+        actionError = error.localizedDescription
       }
     }
   }
-}
 
-private struct AgentComposer: View {
-  let agentName: String
-  @Binding var draft: String
-  let sending: Bool
-  let enabled: Bool
-  let send: () -> Void
-
-  var body: some View {
-    VStack(alignment: .leading, spacing: 8) {
-      HStack(spacing: 7) {
-        Image(systemName: "sparkles")
-          .foregroundStyle(.blue)
-        Text("发给 \(agentName)")
-          .font(.caption.weight(.bold))
-        Text("Return 发送")
-          .font(.caption2)
-          .foregroundStyle(.tertiary)
-        Spacer()
-      }
-      HStack(alignment: .bottom, spacing: 10) {
-        TextField("描述任务、补充上下文或继续追问…", text: $draft, axis: .vertical)
-          .textFieldStyle(.plain)
-          .lineLimit(1...5)
-          .font(.body)
-          .padding(.horizontal, 12)
-          .padding(.vertical, 10)
-          .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 11))
-          .onSubmit(send)
-          .disabled(!enabled || sending)
-        Button(action: send) {
-          Group {
-            if sending {
-              ProgressView().controlSize(.small)
-            } else {
-              Image(systemName: "arrow.up")
-                .font(.body.weight(.bold))
-            }
-          }
-          .frame(width: 18, height: 18)
-        }
-        .buttonStyle(.borderedProminent)
-        .controlSize(.large)
-        .disabled(!enabled || sending || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-        .help("发送给 \(agentName)")
-      }
+  private func openSubagent(_ id: String) {
+    let entryID = "subagent:\(id)"
+    guard let entry = timeline.entries.first(where: { $0.id == entryID }), case .subagent(let child) = entry else {
+      actionError = "这个子 Agent 已不在当前会话中"
+      return
     }
-    .padding(.horizontal, 16)
-    .padding(.vertical, 12)
-    .background(Color(nsColor: .windowBackgroundColor))
+    selectedSubagent = child
   }
 }
 
-private struct LocalPermissionCard: View {
-  let prompt: LocalPermissionPrompt
-  let respond: (String) -> Void
+/// Child conversations intentionally use the same `ChatTimeline` reducer and cards as the parent.
+/// The endpoint currently supplies snapshots, so equal `evSeq` responses are ignored to avoid
+/// recreating the visible child transcript on every polling pass.
+private struct LocalSubagentWorkspace: View {
+  @Bindable var daemon: DaemonController
+  let sessionID: String
+  let subagentID: String
+  let subagentName: String
+
+  @Environment(\.dismiss) private var dismiss
+  @State private var timeline: ChatTimeline
+  @State private var loadError: String?
+  @State private var draft = ""
+
+  init(daemon: DaemonController, sessionID: String, subagentID: String, subagentName: String) {
+    self.daemon = daemon
+    self.sessionID = sessionID
+    self.subagentID = subagentID
+    self.subagentName = subagentName
+    _timeline = State(initialValue: ChatTimeline(scope: .subagent(subagentID)))
+  }
 
   var body: some View {
-    HStack(alignment: .top, spacing: 10) {
-      Rectangle().fill(.orange.opacity(0.75)).frame(width: 3)
-      VStack(alignment: .leading, spacing: 10) {
-      HStack(spacing: 9) {
-        Image(systemName: "hand.raised.fill")
-          .foregroundStyle(.orange)
+    VStack(spacing: 0) {
+      HStack(spacing: 10) {
+        Image(systemName: "person.2.fill").foregroundStyle(.tint)
         VStack(alignment: .leading, spacing: 2) {
-          Text("需要你的批准")
-            .font(.caption.weight(.bold))
-            .foregroundStyle(.orange)
-          Text(prompt.summary.isEmpty ? prompt.action : prompt.summary)
-            .font(.callout.weight(.semibold))
+          Text(subagentName).font(.headline)
+          Text("子 Agent 过程").font(.caption).foregroundStyle(.secondary)
         }
         Spacer()
+        Button("完成") { dismiss() }
+          .keyboardShortcut(.cancelAction)
       }
-      if !prompt.resources.isEmpty {
-        VStack(alignment: .leading, spacing: 3) {
-          ForEach(prompt.resources.prefix(4), id: \.self) { resource in
-            Text(resource)
-              .font(.system(.caption, design: .monospaced))
-              .textSelection(.enabled)
-              .lineLimit(3)
-          }
-        }
-        .padding(9)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.black.opacity(0.055), in: RoundedRectangle(cornerRadius: 7))
-      }
-      HStack {
-        Button("拒绝", role: .destructive) { respond("reject") }
-        Spacer()
-        Button("始终允许") { respond("always") }
-        Button("允许一次") { respond("once") }
-          .buttonStyle(.borderedProminent)
-      }
-      }
-      .padding(.vertical, 12)
-    }
-    .padding(.leading, 1)
-  }
-}
+      .padding(.horizontal, 18)
+      .padding(.vertical, 14)
+      Divider()
 
-private struct LocalQuestionCard: View {
-  let prompt: LocalQuestionPrompt
-  let respond: ([(questionID: String, values: [String])], Bool) -> Void
-
-  @State private var selections: [String: Set<String>] = [:]
-  @State private var other: [String: String] = [:]
-
-  private var answers: [(questionID: String, values: [String])] {
-    prompt.questions.map { question in
-      var values = Array(selections[question.id] ?? []).sorted()
-      if let custom = other[question.id]?.trimmingCharacters(in: .whitespacesAndNewlines),
-         !custom.isEmpty {
-        values.append(custom)
-      }
-      return (question.id, values)
-    }
-  }
-
-  private var ready: Bool { answers.allSatisfy { !$0.values.isEmpty } }
-
-  var body: some View {
-    HStack(alignment: .top, spacing: 10) {
-      Rectangle().fill(.indigo.opacity(0.75)).frame(width: 3)
-      VStack(alignment: .leading, spacing: 12) {
-      Label("Agent 需要你的回答", systemImage: "questionmark.bubble.fill")
-        .font(.callout.weight(.bold))
-        .foregroundStyle(.indigo)
-      ForEach(prompt.questions) { question in
-        VStack(alignment: .leading, spacing: 8) {
-          if !question.header.isEmpty {
-            Text(question.header.uppercased())
-              .font(.caption2.weight(.bold))
-              .foregroundStyle(.secondary)
-          }
-          Text(question.question)
-            .font(.callout.weight(.semibold))
-          if !question.options.isEmpty {
-            FlowLayout(spacing: 7) {
-              ForEach(question.options) { option in
-                let selected = selections[question.id]?.contains(option.label) == true
-                Button {
-                  toggle(option.label, for: question)
-                } label: {
-                  VStack(alignment: .leading, spacing: 2) {
-                    Text(option.label).font(.caption.weight(.semibold))
-                    if let detail = option.detail, !detail.isEmpty {
-                      Text(detail).font(.caption2).foregroundStyle(.secondary)
-                    }
-                  }
-                  .padding(.horizontal, 9)
-                  .padding(.vertical, 7)
-                  .background(
-                    selected ? Color.indigo.opacity(0.14) : Color.secondary.opacity(0.07),
-                    in: RoundedRectangle(cornerRadius: 8)
-                  )
-                  .overlay(
-                    RoundedRectangle(cornerRadius: 8)
-                      .stroke(selected ? Color.indigo.opacity(0.55) : Color.clear)
-                  )
-                }
-                .buttonStyle(.plain)
-              }
-            }
-          }
-          if question.allowOther || question.options.isEmpty {
-            SecureOrPlainField(
-              placeholder: "其他答案…",
-              value: Binding(
-                get: { other[question.id] ?? "" },
-                set: { other[question.id] = $0 }
-              ),
-              secure: question.secret
-            )
-          }
-        }
-      }
-      HStack {
-        Button("取消问题") { respond([], true) }
-          .foregroundStyle(.secondary)
-        Spacer()
-        Button("提交回答") { respond(answers, false) }
-          .buttonStyle(.borderedProminent)
-          .disabled(!ready)
-      }
-      }
-      .padding(.vertical, 12)
-    }
-    .padding(.leading, 1)
-  }
-
-  private func toggle(_ label: String, for question: LocalAgentQuestion) {
-    if question.multiSelect {
-      var values = selections[question.id] ?? []
-      if values.contains(label) { values.remove(label) } else { values.insert(label) }
-      selections[question.id] = values
-    } else {
-      selections[question.id] = [label]
-    }
-  }
-}
-
-private struct SecureOrPlainField: View {
-  let placeholder: String
-  @Binding var value: String
-  let secure: Bool
-
-  var body: some View {
-    Group {
-      if secure {
-        SecureField(placeholder, text: $value)
-      } else {
-        TextField(placeholder, text: $value, axis: .vertical)
-          .lineLimit(1...3)
-      }
-    }
-    .textFieldStyle(.roundedBorder)
-  }
-}
-
-/// 很小的自适应标签布局，避免问题选项在窄窗口里被硬挤成一行。
-private struct FlowLayout: Layout {
-  var spacing: CGFloat
-
-  func sizeThatFits(
-    proposal: ProposedViewSize,
-    subviews: Subviews,
-    cache: inout ()
-  ) -> CGSize {
-    arrange(proposal: proposal, subviews: subviews).size
-  }
-
-  func placeSubviews(
-    in bounds: CGRect,
-    proposal: ProposedViewSize,
-    subviews: Subviews,
-    cache: inout ()
-  ) {
-    let result = arrange(proposal: proposal, subviews: subviews)
-    for (index, point) in result.points.enumerated() {
-      subviews[index].place(
-        at: CGPoint(x: bounds.minX + point.x, y: bounds.minY + point.y),
-        proposal: .unspecified
+      ChatTimelineView(
+        timeline: timeline,
+        showsComposer: false,
+        draft: $draft
       )
+
+      if let loadError {
+        Divider()
+        Label(loadError, systemImage: "wifi.exclamationmark")
+          .font(.caption)
+          .foregroundStyle(.orange)
+          .padding(10)
+          .frame(maxWidth: .infinity, alignment: .leading)
+      }
+    }
+    .frame(minWidth: 640, idealWidth: 820, minHeight: 520, idealHeight: 680)
+    .task(id: "\(sessionID):\(subagentID):\(daemon.running?.pid ?? 0)") {
+      await refreshLoop()
     }
   }
 
-  private func arrange(proposal: ProposedViewSize, subviews: Subviews) -> (size: CGSize, points: [CGPoint]) {
-    let maxWidth = proposal.width ?? .infinity
-    var x: CGFloat = 0
-    var y: CGFloat = 0
-    var rowHeight: CGFloat = 0
-    var usedWidth: CGFloat = 0
-    var points: [CGPoint] = []
-    for subview in subviews {
-      let size = subview.sizeThatFits(.unspecified)
-      if x > 0, x + size.width > maxWidth {
-        x = 0
-        y += rowHeight + spacing
-        rowHeight = 0
+  private func refreshLoop() async {
+    var failures = 0
+    while !Task.isCancelled {
+      do {
+        let snapshot = try await daemon.loadLocalSubagentSnapshot(
+          sessionID: sessionID,
+          subagentID: subagentID
+        )
+        if snapshot.evSeq != timeline.evSeq || timeline.entries.isEmpty != snapshot.events.isEmpty {
+          timeline.reset(with: snapshot)
+        }
+        loadError = nil
+        failures = 0
+      } catch {
+        // A temporary read failure never clears the last usable child transcript.
+        loadError = error.localizedDescription
+        failures = min(failures + 1, 5)
       }
-      points.append(CGPoint(x: x, y: y))
-      x += size.width + spacing
-      rowHeight = max(rowHeight, size.height)
-      usedWidth = max(usedWidth, x - spacing)
+      do {
+        try await Task.sleep(for: .milliseconds(min(8_000, 800 * (1 << failures))))
+      } catch {
+        return
+      }
     }
-    return (CGSize(width: usedWidth, height: y + rowHeight), points)
+  }
+}
+
+/// A compact identity treatment shared by the session list and the child-process sheet.
+struct SubagentIdentityBadge: View {
+  let subagent: RunningStatus.Session.Subagent
+  var compact = false
+
+  private var isActive: Bool {
+    subagent.status == "running" || subagent.status == "starting"
+  }
+
+  private var tint: Color {
+    if subagent.status == "failed" { return .red }
+    if subagent.status == "waiting_input" { return .orange }
+    return isActive ? .blue : .secondary
+  }
+
+  var body: some View {
+    HStack(spacing: 6) {
+      Circle().fill(tint).frame(width: 7, height: 7)
+      Text(subagent.name)
+        .font(compact ? .caption.weight(.semibold) : .callout.weight(.semibold))
+        .lineLimit(1)
+      if !compact, let role = subagent.role, !role.isEmpty, role != subagent.name {
+        Text(role).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+      }
+    }
+    .padding(.horizontal, compact ? 8 : 10)
+    .padding(.vertical, compact ? 4 : 6)
+    .background(tint.opacity(0.10), in: Capsule())
+    .overlay(Capsule().stroke(tint.opacity(0.25), lineWidth: 1))
   }
 }
 
