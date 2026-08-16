@@ -6,10 +6,9 @@
  * single-daemon mutation fence implemented here.
  */
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { isAbsolute, join } from "node:path";
+import { isAbsolute } from "node:path";
 import {
   NATIVE_WINDOWS_ABI_VERSION,
   type DetachedHostLaunchOptions,
@@ -127,7 +126,6 @@ export interface StartWindowsSessionHostOptions {
 const DETACHED_BOOTSTRAP_FILE = "host.bootstrap.json";
 const DETACHED_READY_FILE = "host.ready.json";
 const DETACHED_FAILED_FILE = "host.failed.json";
-const DETACHED_TEST_DIAGNOSTIC_FILE = "host.test-diagnostic.json";
 const DETACHED_STARTUP_STAGES = [
   "opening_state",
   "claiming_bootstrap",
@@ -1168,16 +1166,13 @@ function runnerEnvironment(
   }
   return {
     ...runtimeEnvironment,
-    ...(source["PROSPERO_WINDOWS_SIGNED_SESSION_HOST_TEST"] === "1"
-      ? { PROSPERO_WINDOWS_SIGNED_SESSION_HOST_TEST: "1" }
-      : {}),
     [DETACHED_RUNNER_ENV]: stateDirectory,
   };
 }
 
 async function waitForDetachedManifest(
   native: Pick<WindowsSessionHostDetachedLaunchNative, "read">,
-  expected: { sessionId: string; epoch: string; stateDirectory: string; process: ProcessIdentity },
+  expected: { sessionId: string; epoch: string; process: ProcessIdentity },
   timeoutMs = 8_000,
 ): Promise<WindowsSessionHostManifest> {
   const deadline = Date.now() + timeoutMs;
@@ -1226,20 +1221,7 @@ async function waitForDetachedManifest(
       : !readyPublished
         ? "after_manifest_publish"
         : "after_ready_publish";
-  let diagnostic = "";
-  if (process.env["PROSPERO_WINDOWS_SIGNED_SESSION_HOST_TEST"] === "1") {
-    try {
-      // The entry probe intentionally runs before the trusted native state
-      // worker exists, so its CI-only file cannot satisfy production ACL
-      // metadata validation. Read it only through this explicitly gated path.
-      const value: unknown = JSON.parse(readFileSync(join(expected.stateDirectory, DETACHED_TEST_DIAGNOSTIC_FILE), "utf8"));
-      if (isObject(value) && (value.stage === "entry_loaded" || value.stage === "entry_failed")) {
-        const message = typeof value.message === "string" ? value.message.slice(0, 320) : "";
-        diagnostic = `; test_entry=${value.stage}${message ? `:${message}` : ""}`;
-      }
-    } catch { /* CI-only diagnostic is advisory */ }
-  }
-  throw new WindowsSessionHostUnavailable("launch_failed", `Windows detached host did not publish a verified manifest (${stage}${diagnostic})`);
+  throw new WindowsSessionHostUnavailable("launch_failed", `Windows detached host did not publish a verified manifest (${stage})`);
 }
 
 async function removeDetachedBootstrapState(
@@ -1392,7 +1374,7 @@ export async function launchDetachedWindowsSessionHostWithNative(
     launchedOwner = launch.process;
     return await waitForDetachedManifest(
       native,
-      { sessionId: options.sessionId, epoch: options.epoch, stateDirectory: options.stateDirectory, process: launch.process },
+      { sessionId: options.sessionId, epoch: options.epoch, process: launch.process },
       options.manifestTimeoutMs,
     );
   } catch (error) {
