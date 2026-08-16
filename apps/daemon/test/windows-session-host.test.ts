@@ -275,6 +275,24 @@ describe("Windows Session Host common transport (mock native process)", () => {
     expect((replay.value as { snapshot: { lastSeq: number } }).snapshot.lastSeq).toBe(4);
   });
 
+  it("lets a command await durable provider events without overlapping command handlers", async () => {
+    const { child, manifest } = await startMock();
+    await call(child, "hello", { frame: makeHello(manifest), peer: { process: daemonA, userSid: "S-1-5-21-1000", sessionId: 1 } });
+    const lease = await call(child, "command", { frame: {
+      version: 2, type: "command", sessionId: manifest.sessionId, epoch: manifest.epoch,
+      commandId: "emit-lease", mutation: true, method: "lease.acquire", params: {},
+    } });
+    const leaseId = (lease.value as { result: { leaseId: string } }).result.leaseId;
+    const emitted = await call(child, "command", { frame: {
+      version: 2, type: "command", sessionId: manifest.sessionId, epoch: manifest.epoch,
+      commandId: "effect-with-events", mutation: true, method: "effect.emit", params: {}, leaseId,
+    } });
+    const reply = emitted.value as { ok: true; seq: number; result: { eventSeqs: number[]; calls: number } };
+    expect(reply.result.eventSeqs).toEqual([3, 4]);
+    expect(reply.seq).toBe(5);
+    expect(reply.result.calls).toBe(1);
+  });
+
   it("rejects malformed native peer identity and replay cursors beyond the durable watermark", async () => {
     const { child, manifest } = await startMock();
     await expect(call(child, "hello", { frame: makeHello(manifest), peer: { process: daemonA, userSid: "not-a-sid", sessionId: 1 } })).rejects.toThrow(/peer/i);

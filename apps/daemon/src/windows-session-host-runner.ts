@@ -494,6 +494,7 @@ export class WindowsSessionHostRunner {
   private terminal = false;
   private loaded = false;
   private compactionDeferred = false;
+  private commandChain: Promise<void> = Promise.resolve();
   private mutationChain: Promise<void> = Promise.resolve();
   private readonly readOnlyMethods: ReadonlySet<string>;
 
@@ -563,7 +564,7 @@ export class WindowsSessionHostRunner {
   }
 
   async command(value: SessionHostWireMessage): Promise<SessionHostReply> {
-    return this.serialize(() => this.commandUnlocked(value));
+    return this.serializeCommand(() => this.commandUnlocked(value));
   }
 
   /**
@@ -577,15 +578,24 @@ export class WindowsSessionHostRunner {
   }
 
   /**
-   * Durable host-side output API.  It shares the command serialization chain,
-   * so PTY/structured output cannot overtake a command result or reuse a
-   * sequence.  A terminal event is an explicit one-way fence.
+   * Durable host-side output API. Journal mutations remain strictly serial,
+   * while a handler may await output persistence before returning its command
+   * outcome. A terminal event is an explicit one-way fence.
    */
   async appendEvent(payload: unknown, options: WindowsSessionHostAppendEventOptions = {}): Promise<WindowsSessionHostJournalEvent> {
-    return this.serialize(() => this.appendEventUnlocked(payload, options));
+    return this.serializeMutation(() => this.appendEventUnlocked(payload, options));
   }
 
-  private async serialize<T>(operation: () => Promise<T>): Promise<T> {
+  private async serializeCommand<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.commandChain;
+    let release!: () => void;
+    this.commandChain = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try { return await operation(); }
+    finally { release(); }
+  }
+
+  private async serializeMutation<T>(operation: () => Promise<T>): Promise<T> {
     const previous = this.mutationChain;
     let release!: () => void;
     this.mutationChain = new Promise<void>((resolve) => { release = resolve; });
@@ -618,6 +628,29 @@ export class WindowsSessionHostRunner {
   }
 
   private async commandUnlocked(value: SessionHostWireMessage): Promise<SessionHostReply> {
+    const prepared = await this.serializeMutation(() => this.prepareCommandUnlocked(value));
+    if (prepared.type === "reply") return prepared;
+    const command = prepared;
+    let outcome: WindowsSessionHostCommandOutcome;
+    try {
+      // Provider callbacks are allowed to await appendEvent while a command is
+      // active. The separate mutation chain gives those events durable order
+      // without allowing a second handler command to overlap this one.
+      outcome = await this.handler.handleCommand({ commandId: command.commandId, method: command.method, params: command.params });
+    } catch {
+      // An uncaught provider exception has unknown external outcome. Fence the
+      // owner instead of rerunning the same command after a daemon restart.
+      outcome = { ok: false, code: "unknown_command_outcome", message: "Windows session host command outcome is unknown", terminal: true };
+    }
+    if (command.method === "structured.kill" && outcome.terminal !== true) {
+      // A rejected/failed kill after its intent is durable is itself an
+      // unresolved tree state. Fence the owner for reconciliation.
+      outcome = { ...outcome, terminal: true };
+    }
+    return this.serializeMutation(() => this.commitCommandUnlocked(command, outcome));
+  }
+
+  private async prepareCommandUnlocked(value: SessionHostWireMessage): Promise<SessionHostCommand | SessionHostReply> {
     await this.load();
     const connection = this.requireConnection();
     let command: SessionHostCommand;
@@ -666,19 +699,13 @@ export class WindowsSessionHostRunner {
       this.events.push(intent);
       this.lastSeq = intent.seq;
     }
-    let outcome: WindowsSessionHostCommandOutcome;
-    try {
-      outcome = await this.handler.handleCommand({ commandId: command.commandId, method: command.method, params: command.params });
-    } catch {
-      // An uncaught provider exception has unknown external outcome. Fence the
-      // owner instead of rerunning the same command after a daemon restart.
-      outcome = { ok: false, code: "unknown_command_outcome", message: "Windows session host command outcome is unknown", terminal: true };
-    }
-    if (command.method === "structured.kill" && outcome.terminal !== true) {
-      // A rejected/failed kill after its intent is durable is itself an
-      // unresolved tree state. Fence the owner for reconciliation.
-      outcome = { ...outcome, terminal: true };
-    }
+    return command;
+  }
+
+  private async commitCommandUnlocked(command: SessionHostCommand, outcome: WindowsSessionHostCommandOutcome): Promise<SessionHostReply> {
+    // A provider-side terminal event may have landed while the handler was
+    // active. Never append a non-terminal success beyond that durable fence.
+    if (this.terminal && outcome.terminal !== true) return this.fenceUnknownOutcome(command.commandId);
     if (outcome.terminal === true && outcome.afterReply) {
       // Retain containment before any terminal append/compaction. If either
       // write fails, this callback is still the fail-closed cleanup path.
