@@ -58,6 +58,32 @@ function describeWindow(mins: number): string {
   return `${String(mins)} 分钟`;
 }
 
+function usageFromRateLimits(value: unknown): UsageReport | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const rateLimits = value as Record<string, unknown>;
+  const window = (candidate: unknown, fallbackLabel: string): UsageReport["windows"][number] | null => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return null;
+    const record = candidate as Record<string, unknown>;
+    if (typeof record["usedPercent"] !== "number") return null;
+    const mins = typeof record["windowDurationMins"] === "number"
+      ? record["windowDurationMins"]
+      : null;
+    return {
+      label: mins ? describeWindow(mins) : fallbackLabel,
+      utilization: record["usedPercent"],
+      ...(typeof record["resetsAt"] === "number"
+        ? { resetsAt: new Date(record["resetsAt"] * 1000).toISOString() }
+        : {}),
+    };
+  };
+  const windows = [
+    window(rateLimits["primary"], "主窗口"),
+    window(rateLimits["secondary"], "次窗口"),
+  ].filter((candidate): candidate is UsageReport["windows"][number] => candidate !== null);
+  const plan = typeof rateLimits["planType"] === "string" ? rateLimits["planType"] : null;
+  return windows.length > 0 || plan !== null ? { subscription: plan, windows } : null;
+}
+
 const START_TIMEOUT_MS = 30_000;
 
 function timestampMs(value: unknown): number | undefined {
@@ -236,6 +262,7 @@ export class CodexAdapter implements AgentAdapter {
       typeof this.opts.resumeState?.["threadId"] === "string"
         ? this.opts.resumeState["threadId"]
         : null;
+    const forkThread = this.opts.resumeState?.["forkThread"] === true;
     // 实测:threadId 在 result.thread.id,不是顶层 threadId(spec 类型名有误导)。
     // Codex 自己把 thread 落在 ~/.codex；Prospero 只需保存这个 ID。
     const initialPolicy = this.executionPolicy();
@@ -247,7 +274,13 @@ export class CodexAdapter implements AgentAdapter {
     };
     let started: { thread?: { id?: string }; threadId?: string };
     if (resumeThreadId) {
-      try {
+      if (forkThread) {
+        started = (await this.request("thread/fork", {
+          threadId: resumeThreadId,
+          ...baseParams,
+          deferGoalContinuation: true,
+        })) as typeof started;
+      } else try {
         started = (await this.request("thread/resume", {
           threadId: resumeThreadId,
           ...baseParams,
@@ -287,13 +320,6 @@ export class CodexAdapter implements AgentAdapter {
       env: { ...process.env, ...environment },
     });
     this.proc = proc;
-    try {
-      await this.ctx?.registerProviderProcess?.(proc);
-    } catch (error) {
-      this.proc = null;
-      await terminateUnregisteredProviderProcess(proc);
-      throw error;
-    }
     proc.stdout?.setEncoding("utf8");
     proc.stdout?.on("data", (chunk: string) => this.onStdout(chunk));
     proc.stderr?.setEncoding("utf8");
@@ -301,21 +327,37 @@ export class CodexAdapter implements AgentAdapter {
       // 不把鉴权/路径等诊断整段持久化，只保留足够解释退出原因的尾部。
       this.stderrTail = (this.stderrTail + chunk).slice(-2_000);
     });
-    proc.once("error", (e) => {
+    const failProcess = (message: string): void => {
       if (this.proc !== proc) return;
       this.proc = null;
-      const message = this.processFailure(`codex app-server 启动失败:${e.message}`);
       this.failPending(message);
       this.emit({ kind: "agent.error", message });
+    };
+    // `ChildProcess` 的 error/exit 不会代替 stdin 自己的 error。Windows 上
+    // app-server 提前退出时，管道会异步发出 EPIPE；若没有监听器，Node 会把
+    // 它升级为 uncaught exception，连只读账号用量查询也会拖垮整个 daemon。
+    proc.stdin?.on("error", (error: Error) => {
+      failProcess(this.processFailure(`codex app-server stdin 写入失败:${error.message}`));
+    });
+    proc.once("error", (e) => {
+      failProcess(this.processFailure(`codex app-server 启动失败:${e.message}`));
     });
     proc.once("exit", (code, signal) => {
-      if (this.proc !== proc) return;
-      this.proc = null;
       const reason = code !== null ? `code=${String(code)}` : `signal=${signal ?? "unknown"}`;
-      const message = this.processFailure(`codex app-server 意外退出,${reason}`);
-      this.failPending(message);
-      this.emit({ kind: "agent.error", message });
+      failProcess(this.processFailure(`codex app-server 意外退出,${reason}`));
     });
+    // 监听器必须在这个可能异步等待的注册动作之前安装；否则进程可在窗口内
+    // 退出，随后 initialize 才写入一条已经没有接收端的管道。
+    try {
+      await this.ctx?.registerProviderProcess?.(proc);
+    } catch (error) {
+      this.proc = null;
+      await terminateUnregisteredProviderProcess(proc);
+      throw error;
+    }
+    if (this.proc !== proc) {
+      throw new AdapterError(this.processFailure("codex app-server 在初始化前退出"));
+    }
 
     await this.request("initialize", {
       clientInfo: { name: "prospero", title: "Prospero", version: DAEMON_VERSION },
@@ -408,6 +450,26 @@ export class CodexAdapter implements AgentAdapter {
         });
       }
       return conversations.slice(0, limit);
+    } finally {
+      await adapter.dispose();
+    }
+  }
+
+  /** 不创建 thread，直接读取某个 Codex 账号当前的订阅限流窗口。 */
+  static async readAccountUsage(
+    environment?: Record<string, string>,
+    appServerArgs?: string[],
+  ): Promise<UsageReport | null> {
+    const adapter = new CodexAdapter();
+    try {
+      await adapter.startAppServer(os.homedir(), environment, appServerArgs);
+      const response = await adapter.request("account/rateLimits/read", {}) as {
+        rateLimits?: unknown;
+        rateLimitsByLimitId?: Record<string, unknown> | null;
+      };
+      return usageFromRateLimits(
+        response.rateLimitsByLimitId?.["codex"] ?? response.rateLimits,
+      );
     } finally {
       await adapter.dispose();
     }
@@ -1137,8 +1199,16 @@ export class CodexAdapter implements AgentAdapter {
       : [];
   }
 
-  private write(obj: Record<string, unknown>): void {
-    this.proc?.stdin?.write(JSON.stringify(obj) + "\n");
+  private write(obj: Record<string, unknown>): boolean {
+    const input = this.proc?.stdin;
+    if (!input || input.destroyed || input.writableEnded || !input.writable) return false;
+    try {
+      // false 只表示 backpressure，数据仍已被 Writable 接受，因此也是成功。
+      input.write(JSON.stringify(obj) + "\n");
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private processFailure(prefix: string): string {
@@ -1185,7 +1255,11 @@ export class CodexAdapter implements AgentAdapter {
         }
         resolve(m.result ?? {});
       });
-      this.write({ id, method, params });
+      if (!this.write({ id, method, params })) {
+        this.pendingRpc.delete(id);
+        if (timer) clearTimeout(timer);
+        reject(new AdapterError(this.processFailure(`codex ${method} 失败:app-server 管道不可写`)));
+      }
     });
   }
 

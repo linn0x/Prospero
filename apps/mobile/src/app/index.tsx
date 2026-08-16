@@ -180,6 +180,7 @@ export default function HostsScreen() {
                 ]}
               >
                 <SwipeRow
+                  clipRadius={radius.md}
                   actions={[
                     {
                       id: "edit-host",
