@@ -6,7 +6,7 @@
  * single-daemon mutation fence implemented here.
  */
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isAbsolute } from "node:path";
@@ -399,6 +399,16 @@ async function writeDetachedStartupFailure(
     code,
     stage,
   }))).catch(() => {});
+}
+
+function writeDetachedTestDiagnostic(
+  environment: NodeJS.ProcessEnv,
+  stage: string,
+): void {
+  const diagnosticPath = environment[DETACHED_TEST_DIAGNOSTIC_ENV];
+  if (typeof diagnosticPath !== "string" || diagnosticPath.length === 0) return;
+  try { writeFileSync(diagnosticPath, JSON.stringify({ version: 1, stage })); }
+  catch { /* CI-only sibling diagnostic must not change startup behavior */ }
 }
 
 function validCommandId(value: unknown): value is string {
@@ -1002,13 +1012,16 @@ export async function runDetachedWindowsSessionHostFromEnvironment(
     throw new WindowsSessionHostUnavailable("invalid_manifest", "Windows detached runner state directory is missing");
   }
   const native = await nativeFactory.create();
+  writeDetachedTestDiagnostic(environment, "runner_native_created");
   let stage: DetachedStartupStage = "opening_state";
   let stateOpened = false;
   try {
     await native.openState(stateDirectory);
+    writeDetachedTestDiagnostic(environment, "runner_state_opened");
     stateOpened = true;
     stage = "claiming_bootstrap";
     const bootstrap = await consumeDetachedWindowsSessionHostBootstrap(native, stateDirectory);
+    writeDetachedTestDiagnostic(environment, "runner_bootstrap_claimed");
     // This is deliberately before importing a vertical handler, constructing
     // an adapter, creating a pipe, or starting a session. Once the detached
     // owner joins this KILL_ON_JOB_CLOSE Job, every ordinary child and
@@ -1018,16 +1031,20 @@ export async function runDetachedWindowsSessionHostFromEnvironment(
     }
     stage = "creating_provider_job";
     await native.createProviderJob();
+    writeDetachedTestDiagnostic(environment, "runner_job_created");
     let providerJob: NativeWindowsSessionHostProviderJob | null = null;
     try {
       stage = "resolving_owner";
       const owner = await native.currentIdentity();
+      writeDetachedTestDiagnostic(environment, "runner_owner_resolved");
       stage = "assigning_owner_job";
       await native.assignProviderProcess(owner);
+      writeDetachedTestDiagnostic(environment, "runner_owner_assigned");
       stage = "auditing_owner_job";
       if (!await native.isProviderProcessInJob(owner)) {
         throw new WindowsSessionHostUnavailable("provider_job_incompatible", "Windows detached Session Host did not join its own Job");
       }
+      writeDetachedTestDiagnostic(environment, "runner_job_audited");
       providerJob = new NativeWindowsSessionHostProviderJob(native);
     } catch (error) {
       // Record the stage before closing a partially assigned KILL_ON_JOB_CLOSE
@@ -1040,6 +1057,7 @@ export async function runDetachedWindowsSessionHostFromEnvironment(
     }
     stage = "importing_handler";
     const factory = (await import(bootstrap.handlerModule)) as Partial<WindowsSessionHostHandlerFactory>;
+    writeDetachedTestDiagnostic(environment, "runner_handler_imported");
     if (typeof factory.createWindowsSessionHostHandler !== "function") {
       throw new WindowsSessionHostUnavailable("native_unavailable", "Windows detached runner handler factory is unavailable");
     }
@@ -1075,6 +1093,7 @@ export async function runDetachedWindowsSessionHostFromEnvironment(
         ...(bootstrap.handlerOptions === undefined ? {} : { handlerOptions: bootstrap.handlerOptions }),
       }))
       .then((handler) => {
+        writeDetachedTestDiagnostic(environment, "runner_handler_created");
         factoryHandler = handler;
         return handler;
       })
@@ -1088,12 +1107,14 @@ export async function runDetachedWindowsSessionHostFromEnvironment(
     let running: RunningWindowsSessionHost | null = null;
     try {
       stage = "starting_common_host";
+      writeDetachedTestDiagnostic(environment, "runner_common_starting");
       running = await startWindowsSessionHostWithNative({
         sessionId: bootstrap.sessionId, epoch: bootstrap.epoch, pipeName: bootstrap.pipeName, stateDirectory,
         handler: deferredHandler, createdAt: bootstrap.createdAt,
         ...(bootstrap.leaseDurationMs === undefined ? {} : { leaseDurationMs: bootstrap.leaseDurationMs }),
         ...(bootstrap.readOnlyMethods === undefined ? {} : { readOnlyMethods: bootstrap.readOnlyMethods }),
       }, native, false);
+      writeDetachedTestDiagnostic(environment, "runner_common_started");
       sink.bind(running.runner);
       stage = "starting_handler";
       const handler = await handlerPromise;
@@ -1101,8 +1122,10 @@ export async function runDetachedWindowsSessionHostFromEnvironment(
         throw handlerFailure ?? new WindowsSessionHostUnavailable("native_unavailable", "Windows detached runner handler is invalid");
       }
       deferredHandler.bind(handler);
+      writeDetachedTestDiagnostic(environment, "runner_handler_bound");
       stage = "publishing_ready";
       await native.writeAtomic(DETACHED_READY_FILE, new TextEncoder().encode(JSON.stringify({ version: 1, ready: true })));
+      writeDetachedTestDiagnostic(environment, "runner_ready_published");
       return running;
     } catch (error) {
       const failure = error instanceof Error ? error : new Error(String(error));
