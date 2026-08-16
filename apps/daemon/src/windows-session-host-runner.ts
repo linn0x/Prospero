@@ -862,6 +862,11 @@ export interface RunningWindowsSessionHost {
   closeTransport(): Promise<void>;
 }
 
+interface StartableRunningWindowsSessionHost extends RunningWindowsSessionHost {
+  /** Begins the blocking native accept loop exactly once. */
+  startTransport(): void;
+}
+
 /**
  * Starts a new owner only when explicitly called by a vertical's creation
  * flow. Recovery must use `WindowsSessionHostClient.attach`, never this API.
@@ -878,7 +883,8 @@ async function startWindowsSessionHostWithNative(
   options: StartWindowsSessionHostOptions,
   native: WindowsSessionHostRunnerNative,
   closeOnFailure = true,
-): Promise<RunningWindowsSessionHost> {
+  deferTransport = false,
+): Promise<StartableRunningWindowsSessionHost> {
   assertSessionId(options.sessionId);
   assertEpoch(options.epoch);
   assertSecureWindowsPipeName(options.pipeName);
@@ -908,18 +914,24 @@ async function startWindowsSessionHostWithNative(
     const runner = new WindowsSessionHostRunner(manifest, native, options.handler, options.leaseDurationMs, options.readOnlyMethods);
     await runner.load();
     let stopping = false;
+    let serving: Promise<void> | null = null;
     let closePromise: Promise<void> | null = null;
-    const serving = serveWindowsSessionHostPipe(native, runner, () => stopping);
-    return {
+    const running: StartableRunningWindowsSessionHost = {
       manifest,
       runner,
+      startTransport: () => {
+        if (stopping || serving !== null) return;
+        serving = serveWindowsSessionHostPipe(native, runner, () => stopping);
+      },
       closeTransport: async () => {
         if (closePromise) return closePromise;
         stopping = true;
-        closePromise = stopWindowsSessionHostTransport(native, serving, options.pipeName);
+        closePromise = stopWindowsSessionHostTransport(native, serving ?? Promise.resolve(), options.pipeName);
         return closePromise;
       },
     };
+    if (!deferTransport) running.startTransport();
+    return running;
   } catch (error) {
     if (closeOnFailure) await native.close?.();
     throw error;
@@ -1104,7 +1116,7 @@ export async function runDetachedWindowsSessionHostFromEnvironment(
         handlerFailure = error instanceof Error ? error : new Error(String(error));
         return null;
       });
-    let running: RunningWindowsSessionHost | null = null;
+    let running: StartableRunningWindowsSessionHost | null = null;
     try {
       stage = "starting_common_host";
       writeDetachedTestDiagnostic(environment, "runner_common_starting");
@@ -1113,7 +1125,7 @@ export async function runDetachedWindowsSessionHostFromEnvironment(
         handler: deferredHandler, createdAt: bootstrap.createdAt,
         ...(bootstrap.leaseDurationMs === undefined ? {} : { leaseDurationMs: bootstrap.leaseDurationMs }),
         ...(bootstrap.readOnlyMethods === undefined ? {} : { readOnlyMethods: bootstrap.readOnlyMethods }),
-      }, native, false);
+      }, native, false, true);
       writeDetachedTestDiagnostic(environment, "runner_common_started");
       sink.bind(running.runner);
       stage = "starting_handler";
@@ -1126,6 +1138,7 @@ export async function runDetachedWindowsSessionHostFromEnvironment(
       stage = "publishing_ready";
       await native.writeAtomic(DETACHED_READY_FILE, new TextEncoder().encode(JSON.stringify({ version: 1, ready: true })));
       writeDetachedTestDiagnostic(environment, "runner_ready_published");
+      running.startTransport();
       return running;
     } catch (error) {
       const failure = error instanceof Error ? error : new Error(String(error));

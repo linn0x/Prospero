@@ -487,7 +487,10 @@ describe("Windows Session Host detached bootstrap and provider output", () => {
     const native: WindowsSessionHostRunnerNative & { close(): Promise<void> } = {
       async openState() {},
       async read(name) { return files.get(name) ?? null; },
-      async writeAtomic(name, bytes) { files.set(name, Uint8Array.from(bytes)); },
+      async writeAtomic(name, bytes) {
+        if (name === "host.ready.json") order.push("ready.write");
+        files.set(name, Uint8Array.from(bytes));
+      },
       async removeState(name) { files.delete(name); },
       async createCredential() {}, async hmac(material) { return hmacProof(secret, material); },
       async currentIdentity() { return daemonA; },
@@ -496,7 +499,10 @@ describe("Windows Session Host detached bootstrap and provider output", () => {
       async isProviderProcessInJob(process) { expect(process).toEqual(daemonA); order.push("job.audit-self"); return true; },
       async terminateProviderJob() {}, async closeProviderJob() {},
       async createPipe() { order.push("pipe.create"); },
-      async acceptPipe() { return new Promise<void>((_resolve, reject) => { rejectAccept = reject; }); },
+      async acceptPipe() {
+        order.push("pipe.accept");
+        return new Promise<void>((_resolve, reject) => { rejectAccept = reject; });
+      },
       async readPipe() { return { data: new Uint8Array(), peer: null }; }, async writePipe() { return 0; },
       async closePipeConnection() {}, async closePipeServer() {},
       async cancelActivePipeIo() { rejectAccept?.(new Error("test cancellation")); }, async close() {},
@@ -504,6 +510,7 @@ describe("Windows Session Host detached bootstrap and provider output", () => {
     const factory: WindowsSessionHostNativeFactory = { async create() { return native; } };
     const running = await runDetachedWindowsSessionHostFromEnvironment({ PROSPERO_WINDOWS_SESSION_HOST_STATE_DIRECTORY: stateDirectory }, factory);
     expect(order.slice(0, 4)).toEqual(["job.create", "job.assign-self", "job.audit-self", "pipe.create"]);
+    expect(order.indexOf("ready.write")).toBeLessThan(order.indexOf("pipe.accept"));
     const journal = decodePsj2Journal(files.get("journal.psj2")!, sessionId, epoch);
     expect(journal.events.map((event) => event.payload)).toEqual([
       { source: "factory", output: "daemon-offline" },
