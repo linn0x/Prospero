@@ -165,9 +165,6 @@ function defaultAuthenticodeCheck(binaryPath: string): AuthenticodeResult {
     : [];
   const command = [
     ...diagnosticCommands,
-    "$securityModule = Join-Path $PSHOME 'Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1'",
-    "Import-Module -Name $securityModule -ErrorAction Stop",
-    ...(diagnosticCommands.length > 0 ? ["Write-ProsperoDiagnostic 'powershell_module_imported'"] : []),
     `$binaryPath = [Environment]::GetEnvironmentVariable('${binaryPathEnvironmentVariable}', 'Process')`,
     ...(diagnosticCommands.length > 0 ? ["Write-ProsperoDiagnostic 'powershell_signature_checking'"] : []),
     "$signature = Get-AuthenticodeSignature -LiteralPath $binaryPath",
