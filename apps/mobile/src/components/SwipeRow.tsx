@@ -27,9 +27,12 @@ export interface SwipeAction {
 export function SwipeRow({
   children,
   actions,
+  clipRadius,
 }: {
   children: React.ReactNode;
   actions: SwipeAction[];
+  /** 操作层与内容按同一圆角裁切，适用于独立卡片行。 */
+  clipRadius?: number;
 }): React.ReactElement {
   const ref = useRef<SwipeableMethods>(null);
 
@@ -51,40 +54,44 @@ export function SwipeRow({
     ]);
   };
 
-  return (
+  const swipeable = (
     <ReanimatedSwipeable
-      ref={ref}
-      friction={2}
-      rightThreshold={40}
-      overshootRight={false}
-      renderRightActions={() => (
-        <View style={styles.actions}>
-          {actions.map((action) => (
-            <Pressable
-              key={action.id}
-              accessibilityRole="button"
-              accessibilityLabel={action.label}
-              accessibilityHint={action.confirm ? "需要确认" : undefined}
-              style={({ pressed }) => [
-                styles.action,
-                { backgroundColor: action.color },
-                pressed && styles.actionPressed,
-              ]}
-              onPress={() => run(action)}
-            >
-              <Icon name={action.symbol} size={18} color="#fff" />
-              <Text style={styles.actionLabel}>{action.label}</Text>
-            </Pressable>
-          ))}
-        </View>
-      )}
-    >
-      {children}
-    </ReanimatedSwipeable>
+        ref={ref}
+        friction={2}
+        rightThreshold={40}
+        overshootRight={false}
+        renderRightActions={() => (
+          <View style={styles.actions}>
+            {actions.map((action) => (
+              <Pressable
+                key={action.id}
+                accessibilityRole="button"
+                accessibilityLabel={action.label}
+                accessibilityHint={action.confirm ? "需要确认" : undefined}
+                style={({ pressed }) => [
+                  styles.action,
+                  { backgroundColor: action.color },
+                  pressed && styles.actionPressed,
+                ]}
+                onPress={() => run(action)}
+              >
+                <Icon name={action.symbol} size={18} color="#fff" />
+                <Text style={styles.actionLabel}>{action.label}</Text>
+              </Pressable>
+            ))}
+          </View>
+        )}
+      >
+        {children}
+      </ReanimatedSwipeable>
+  );
+  return clipRadius === undefined ? swipeable : (
+    <View style={[styles.clipped, { borderRadius: clipRadius }]}>{swipeable}</View>
   );
 }
 
 const styles = StyleSheet.create({
+  clipped: { overflow: "hidden" },
   actions: { flexDirection: "row", alignItems: "stretch" },
   action: {
     // 窄一点:一行三个操作时,行内容还得留得下标题

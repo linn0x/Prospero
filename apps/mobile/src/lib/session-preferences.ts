@@ -2,6 +2,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 
 export interface SessionPreferences {
   archivedSessionIds: string[];
+  hiddenSessionIds: string[];
   collapsedProjects: string[];
 }
 
@@ -18,15 +19,16 @@ function stringArray(value: unknown): string[] {
 }
 
 function parse(raw: string | null): SessionPreferences {
-  if (!raw) return { archivedSessionIds: [], collapsedProjects: [] };
+  if (!raw) return { archivedSessionIds: [], hiddenSessionIds: [], collapsedProjects: [] };
   try {
     const value = JSON.parse(raw) as Record<string, unknown>;
     return {
       archivedSessionIds: stringArray(value["archivedSessionIds"]),
+      hiddenSessionIds: stringArray(value["hiddenSessionIds"]),
       collapsedProjects: stringArray(value["collapsedProjects"]),
     };
   } catch {
-    return { archivedSessionIds: [], collapsedProjects: [] };
+    return { archivedSessionIds: [], hiddenSessionIds: [], collapsedProjects: [] };
   }
 }
 
@@ -69,6 +71,19 @@ export function setSessionArchived(
     if (archived) ids.add(sessionId);
     else ids.delete(sessionId);
     return { ...current, archivedSessionIds: [...ids] };
+  });
+}
+
+export function setSessionHidden(
+  hostId: string,
+  sessionId: string,
+  hidden: boolean,
+): Promise<void> {
+  return updateSessionPreferences(hostId, (current) => {
+    const ids = new Set(current.hiddenSessionIds);
+    if (hidden) ids.add(sessionId);
+    else ids.delete(sessionId);
+    return { ...current, hiddenSessionIds: [...ids] };
   });
 }
 

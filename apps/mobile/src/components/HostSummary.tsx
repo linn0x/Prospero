@@ -9,6 +9,14 @@ import { color, font, radius, space, utilizationColor } from "@/lib/theme";
 
 type UsageResult = Extract<S2CMessage, { type: "usage.result" }>;
 
+type UsageCacheEntry = {
+  value: UsageResult;
+  updatedAt: number;
+};
+
+const usageCache = new Map<string, UsageCacheEntry>();
+const usageRequests = new Map<string, Promise<UsageResult>>();
+
 /** 用量取一次的间隔。限流窗口以小时计,一分钟一刷已经远快过它的变化 */
 const POLL_MS = 60_000;
 
@@ -24,6 +32,7 @@ const POLL_MS = 60_000;
  * 细节收进弹层,想看点一下,不想看不占地方。
  */
 export function HostSummary({
+  hostId,
   info,
   conn,
   connected,
@@ -31,6 +40,7 @@ export function HostSummary({
   sessionCount,
   runningCount,
 }: {
+  hostId: string;
   info: HostInfo | null;
   conn: HostConnection | null;
   connected: boolean;
@@ -38,7 +48,9 @@ export function HostSummary({
   sessionCount: number;
   runningCount: number;
 }) {
-  const [usage, setUsage] = useState<UsageResult | null>(null);
+  const [usage, setUsage] = useState<UsageResult | null>(
+    () => usageCache.get(hostId)?.value ?? null,
+  );
   const [open, setOpen] = useState(false);
   // 渲染期读 Date.now() 拿到的是渲染那一刻的快照,之后再不更新 ——
   // "daemon 运行 3 小时"会一直是 3 小时。让它跟着轮询一起 tick。
@@ -49,13 +61,22 @@ export function HostSummary({
   // setState 会触发一轮级联渲染
   const fetchUsage = useCallback(() => {
     if (!conn) return;
+    const cached = usageCache.get(hostId);
+    if (cached && Date.now() - cached.updatedAt < POLL_MS) return;
     // 不传 sid:问账号级的额度。取不到就当作没有 —— 用量是锦上添花,
     // 它失败不该在主机页弹错误,那会盖过真正重要的连接状态
-    conn.usageGet().then(
-      (r) => { setUsage(r); },
-      () => { setUsage(null); },
-    );
-  }, [conn]);
+    const pending = usageRequests.get(hostId) ?? conn.usageGet();
+    usageRequests.set(hostId, pending);
+    pending.then(
+      (result) => {
+        usageCache.set(hostId, { value: result, updatedAt: Date.now() });
+        setUsage(result);
+      },
+      () => {},
+    ).finally(() => {
+      if (usageRequests.get(hostId) === pending) usageRequests.delete(hostId);
+    });
+  }, [conn, hostId]);
 
   useEffect(() => {
     if (!connected) return;
@@ -76,6 +97,11 @@ export function HostSummary({
 
   // 紧的排前面 —— 快满的那个订阅是唯一会改变今天怎么干活的信息
   const accounts = [...(usage?.accounts ?? [])].sort((a, b) => tightest(b) - tightest(a));
+  const showDeepseekHarness =
+    connected &&
+    conn?.supportsDeepseekHarness === true &&
+    !accounts.some((account) => account.agent === "deepseek");
+  const hasCodeAgents = accounts.length > 0 || showDeepseekHarness;
 
   const specs = [
     info.platform !== undefined
@@ -90,7 +116,7 @@ export function HostSummary({
     <>
       <Pressable
         style={({ pressed }) => [styles.card, pressed && styles.cardPressed]}
-        onPress={() => { setOpen(true); setNow(Date.now()); fetchUsage(); }}
+        onPress={() => { setOpen(true); setNow(Date.now()); }}
       >
         {/* 连接状态并进卡片 —— 它以前是卡片上方孤零零一行灰字,和机器信息
             明明说的是同一件事,却分成两块各占一份高度 */}
@@ -125,7 +151,7 @@ export function HostSummary({
           />
         )}
 
-        {accounts.length > 0 && <View style={styles.rule} />}
+        {hasCodeAgents && <View style={styles.rule} />}
 
         {accounts.map((a) => {
           const w = topWindow(a);
@@ -134,10 +160,10 @@ export function HostSummary({
               key={a.agent}
               label={a.agent}
               agent={a.agent}
-              badge={a.subscription ?? undefined}
+              badge={accountSourceLabel(a)}
               value={
                 w
-                  ? `${w.label} ${String(Math.round(w.utilization))}%`
+                  ? `${w.label} 剩 ${String(remainingPct(w.utilization))}%`
                   : a.available
                     ? "无限流"
                     : "暂无数据"
@@ -147,6 +173,18 @@ export function HostSummary({
             />
           );
         })}
+
+        {showDeepseekHarness && (
+          <Gauge
+            label="deepseek"
+            agent="deepseek"
+            badge="Harness"
+            value="已接入 · 模型服务商计费"
+            pct={0}
+            tint={color.border}
+            showBar={false}
+          />
+        )}
       </Pressable>
 
       <Sheet visible={open} title="这台机器" onClose={() => { setOpen(false); }}>
@@ -189,20 +227,21 @@ export function HostSummary({
           />
         )}
 
-        <Text style={styles.section}>订阅用量</Text>
-        {accounts.length === 0 ? (
+        <Text style={styles.section}>Code Agent</Text>
+        {!hasCodeAgents ? (
           <Text style={styles.note}>
             {connected
               ? (usage?.reason ?? "还没有对话型会话 —— 用量要有会话才问得到。")
               : "未连接。"}
           </Text>
         ) : (
-          accounts.map((a) => (
+          <>
+            {accounts.map((a) => (
             <View key={a.agent} style={styles.account}>
               <View style={styles.accountHead}>
                 <AgentIcon agent={a.agent} size={17} badge />
                 <Text style={font.body}>{a.agent}</Text>
-                {a.subscription != null && <Text style={styles.badge}>{a.subscription}</Text>}
+                <Text style={styles.badge}>{accountSourceLabel(a)}</Text>
               </View>
 
               {a.windows.length > 0 ? (
@@ -217,7 +256,7 @@ export function HostSummary({
                           { color: utilizationColor(w.utilization) },
                         ]}
                       >
-                        {String(Math.round(w.utilization))}%
+                        {`已用 ${String(Math.round(w.utilization))}% · 剩 ${String(remainingPct(w.utilization))}%`}
                       </Text>
                     </View>
                     <Bar pct={w.utilization} tint={utilizationColor(w.utilization)} />
@@ -227,7 +266,7 @@ export function HostSummary({
                   </View>
                 ))
               ) : (
-                <Text style={styles.note}>{a.reason ?? "这个后端不提供套餐限流窗口。"}</Text>
+                <Text style={styles.note}>{a.reason ?? noWindowReason(a)}</Text>
               )}
 
               {a.inputTokens !== undefined && (
@@ -237,7 +276,20 @@ export function HostSummary({
                 </Text>
               )}
             </View>
-          ))
+            ))}
+            {showDeepseekHarness && (
+              <View style={styles.account}>
+                <View style={styles.accountHead}>
+                  <AgentIcon agent="deepseek" size={17} badge />
+                  <Text style={font.body}>deepseek</Text>
+                  <Text style={styles.badge}>Harness</Text>
+                </View>
+                <Text style={styles.note}>
+                  本机 DeepSeek Harness 已接入；模型、API Key 与额度由 dsh 对应的模型服务商管理。
+                </Text>
+              </View>
+            )}
+          </>
         )}
       </Sheet>
     </>
@@ -252,6 +304,7 @@ function Gauge({
   tint,
   agent,
   badge,
+  showBar = true,
 }: {
   label: string;
   value: string;
@@ -259,6 +312,7 @@ function Gauge({
   tint: string;
   agent?: AgentKind;
   badge?: string;
+  showBar?: boolean;
 }) {
   return (
     <View style={styles.gauge}>
@@ -268,7 +322,7 @@ function Gauge({
         {badge !== undefined && <Text style={styles.badge}>{badge}</Text>}
         <Text style={[styles.gaugeValue, styles.gaugeValueRight]}>{value}</Text>
       </View>
-      <Bar pct={pct} tint={tint} />
+      {showBar && <Bar pct={pct} tint={tint} />}
     </View>
   );
 }
@@ -292,6 +346,22 @@ function topWindow(a: UsageAccount): UsageAccount["windows"][number] | null {
 
 function tightest(a: UsageAccount): number {
   return topWindow(a)?.utilization ?? -1;
+}
+
+function remainingPct(utilization: number): number {
+  return Math.max(0, Math.min(100, Math.round(100 - utilization)));
+}
+
+function accountSourceLabel(a: UsageAccount): string {
+  if (a.source === "api") return "API Profile";
+  if (a.subscription != null && a.subscription.length > 0) return `${a.subscription} 订阅`;
+  if (a.source === "subscription") return "ChatGPT 订阅";
+  return "来源未知";
+}
+
+function noWindowReason(a: UsageAccount): string {
+  if (a.source === "api") return "API Profile 按 API 用量计费，不提供订阅限流窗口。";
+  return "Codex 暂未提供套餐限流窗口。开始一次 Codex 对话后再刷新。";
 }
 
 const styles = StyleSheet.create({

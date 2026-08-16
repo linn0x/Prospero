@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -10,12 +10,48 @@ import {
   View,
 } from "react-native";
 import { Stack, router, useFocusEffect, useLocalSearchParams } from "expo-router";
-import type { AgentAccount, AgentCredentialKind, CodeAgentKind } from "@prospero/protocol";
+import type {
+  AgentAccount,
+  AgentCredentialKind,
+  CodeAgentKind,
+  S2CMessage,
+  UsageAccount,
+} from "@prospero/protocol";
 import { AgentIcon } from "@/components/AgentIcon";
 import { Icon } from "@/components/Icon";
 import { PromptDialog } from "@/components/PromptDialog";
 import { useHostConnection } from "@/lib/use-host-connection";
-import { color, font, radius, space } from "@/lib/theme";
+import { untilLabel } from "@/lib/format";
+import { color, font, radius, space, utilizationColor } from "@/lib/theme";
+
+type UsageResult = Extract<S2CMessage, { type: "usage.result" }>;
+
+type AccountsPageCache = {
+  accounts: AgentAccount[];
+  usage: UsageResult | null;
+  accountsUpdatedAt: number;
+};
+
+const ACCOUNTS_CACHE_TTL_MS = 60_000;
+const accountsPageCache = new Map<string, AccountsPageCache>();
+
+function cacheAccounts(hostId: string, accounts: AgentAccount[]): void {
+  const cached = accountsPageCache.get(hostId);
+  accountsPageCache.set(hostId, {
+    accounts,
+    usage: cached?.usage ?? null,
+    accountsUpdatedAt: Date.now(),
+  });
+}
+
+function cacheUsage(hostId: string, usage: UsageResult | null): void {
+  const cached = accountsPageCache.get(hostId);
+  accountsPageCache.set(hostId, {
+    accounts: cached?.accounts ?? [],
+    usage,
+    accountsUpdatedAt: cached?.accountsUpdatedAt ?? 0,
+  });
+}
 
 type Editor =
   | { kind: "create"; agent: CodeAgentKind }
@@ -52,14 +88,22 @@ const statusColor: Record<AgentAccount["status"], string> = {
 export default function AgentAccountsScreen() {
   const { hostId } = useLocalSearchParams<{ hostId: string }>();
   const { conn, runtime } = useHostConnection(hostId);
-  const [accounts, setAccounts] = useState<AgentAccount[]>([]);
-  const [loading, setLoading] = useState(true);
+  const initialCache = hostId ? accountsPageCache.get(hostId) : undefined;
+  const [accounts, setAccounts] = useState<AgentAccount[]>(() => initialCache?.accounts ?? []);
+  const [loading, setLoading] = useState(() => initialCache === undefined);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [usage, setUsage] = useState<UsageResult | null>(() => initialCache?.usage ?? null);
+  const [now, setNow] = useState(() => Date.now());
   const [editor, setEditor] = useState<Editor>(null);
   const [name, setName] = useState("");
 
-  const refresh = useCallback(async (): Promise<void> => {
+  const rememberAccounts = useCallback((nextAccounts: AgentAccount[]): void => {
+    setAccounts(nextAccounts);
+    if (hostId) cacheAccounts(hostId, nextAccounts);
+  }, [hostId]);
+
+  const refresh = useCallback(async (showLoading = false): Promise<void> => {
     if (!conn || runtime.status !== "connected") {
       setLoading(false);
       return;
@@ -69,23 +113,52 @@ export default function AgentAccountsScreen() {
       setLoading(false);
       return;
     }
-    setLoading(true);
+    const cached = hostId ? accountsPageCache.get(hostId) : undefined;
+    setLoading(showLoading || cached === undefined);
     setError(null);
     try {
-      setAccounts(await conn.agentAccounts());
+      const [nextAccounts, nextUsage] = await Promise.all([
+        conn.agentAccounts(),
+        conn.usageGet().catch(() => null),
+      ]);
+      rememberAccounts(nextAccounts);
+      setUsage(nextUsage);
+      if (hostId) cacheUsage(hostId, nextUsage);
+      setNow(Date.now());
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : String(failure));
     } finally {
       setLoading(false);
     }
-  }, [conn, runtime.status]);
+  }, [conn, hostId, rememberAccounts, runtime.status]);
 
   useFocusEffect(
     useCallback(() => {
-      void refresh();
+      const cached = hostId ? accountsPageCache.get(hostId) : undefined;
+      if (cached) {
+        setAccounts(cached.accounts);
+        setUsage(cached.usage);
+        setNow(Date.now());
+        setLoading(false);
+      }
+      if (!cached || Date.now() - cached.accountsUpdatedAt >= ACCOUNTS_CACHE_TTL_MS) {
+        void refresh(cached === undefined);
+      }
       return undefined;
-    }, [refresh]),
+    }, [hostId, refresh]),
   );
+
+  useEffect(() => {
+    if (!conn || runtime.status !== "connected") return;
+    const timer = setInterval(() => {
+      setNow(Date.now());
+      void conn.usageGet().then((nextUsage) => {
+        setUsage(nextUsage);
+        if (hostId) cacheUsage(hostId, nextUsage);
+      }, () => {});
+    }, 60_000);
+    return () => clearInterval(timer);
+  }, [conn, hostId, runtime.status]);
 
   const grouped = useMemo(
     () => ({
@@ -94,6 +167,13 @@ export default function AgentAccountsScreen() {
     }),
     [accounts],
   );
+  const usageByAccount = useMemo(() => {
+    const result = new Map<string, UsageAccount>();
+    for (const item of usage?.accounts ?? []) {
+      if (item.accountId) result.set(item.accountId, item);
+    }
+    return result;
+  }, [usage]);
 
   const mutate = async (
     accountId: string,
@@ -103,7 +183,7 @@ export default function AgentAccountsScreen() {
     setError(null);
     try {
       const result = await action();
-      setAccounts(result.accounts);
+      rememberAccounts(result.accounts);
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : String(failure));
       throw failure;
@@ -159,17 +239,17 @@ export default function AgentAccountsScreen() {
     if (!conn || !editor) return;
     if (editor.kind === "create") {
       const result = await conn.createAgentAccount(editor.agent, value.trim());
-      setAccounts(result.accounts);
+      rememberAccounts(result.accounts);
     } else if (editor.kind === "rename") {
       const result = await conn.renameAgentAccount(editor.account.id, value.trim());
-      setAccounts(result.accounts);
+      rememberAccounts(result.accounts);
     } else if (editor.kind === "credential") {
       const result = await conn.setAgentAccountCredential(
         editor.account.id,
         editor.credentialKind,
         value.trim(),
       );
-      setAccounts(result.accounts);
+      rememberAccounts(result.accounts);
       setName("");
     } else {
       const trimmedValue = value.trim();
@@ -202,7 +282,7 @@ export default function AgentAccountsScreen() {
             editor.draft.model,
             trimmedValue,
           );
-      setAccounts(result.accounts);
+      rememberAccounts(result.accounts);
       setName("");
     }
     setEditor(null);
@@ -214,7 +294,7 @@ export default function AgentAccountsScreen() {
     setError(null);
     try {
       const result = await conn.loginAgentAccount(account.id);
-      setAccounts(result.accounts);
+      rememberAccounts(result.accounts);
       if (!result.sessionId) throw new Error("电脑端没有返回登录终端");
       router.push(`/host/${hostId}/session/${result.sessionId}`);
     } catch (failure) {
@@ -269,7 +349,7 @@ export default function AgentAccountsScreen() {
         options={{
           title: "Code Agent 账号与 API",
           headerRight: () => (
-            <Pressable onPress={() => void refresh()} hitSlop={10} accessibilityLabel="刷新账号状态">
+            <Pressable onPress={() => void refresh(true)} hitSlop={10} accessibilityLabel="刷新账号状态">
               <Icon name="arrow.clockwise" size={17} color={color.accent} />
             </Pressable>
           ),
@@ -277,7 +357,7 @@ export default function AgentAccountsScreen() {
       />
       <ScrollView
         contentContainerStyle={styles.content}
-        refreshControl={<RefreshControl refreshing={loading} onRefresh={() => void refresh()} tintColor={color.accent} />}
+        refreshControl={<RefreshControl refreshing={loading} onRefresh={() => void refresh(true)} tintColor={color.accent} />}
       >
         <View style={styles.explainer}>
           <Text style={styles.explainerTitle}>账号/API 隔离，项目共享</Text>
@@ -341,6 +421,11 @@ export default function AgentAccountsScreen() {
                           : account.managed ? "Prospero 独立环境" : "现有本机环境（兼容旧会话）"}
                         {account.activeSessions > 0 ? ` · ${String(account.activeSessions)} 个活动会话` : ""}
                       </Text>
+                      <AccountUsage
+                        account={account}
+                        usage={usageByAccount.get(account.id)}
+                        now={now}
+                      />
                     </View>
                     {busy && <ActivityIndicator size="small" color={color.accent} />}
                   </View>
@@ -387,6 +472,38 @@ export default function AgentAccountsScreen() {
             })}
           </View>
         ))}
+
+        {conn?.supportsDeepseekHarness && (
+          <View style={styles.section}>
+            <View style={styles.sectionHeader}>
+              <View style={styles.sectionIdentity}>
+                <AgentIcon agent="deepseek" size={21} />
+                <Text style={styles.sectionTitle}>DeepSeek Harness</Text>
+              </View>
+            </View>
+
+            <View style={styles.card}>
+              <View style={styles.cardTop}>
+                <View style={styles.cardCopy}>
+                  <Text style={styles.name}>本机 Harness</Text>
+                  <View style={styles.metaRow}>
+                    <View style={[styles.statusDot, { backgroundColor: color.success }]} />
+                    <Text style={styles.meta}>已接入</Text>
+                  </View>
+                  <Text style={styles.environment}>
+                    模型与 API Key 由 DeepSeek Harness（dsh）管理
+                  </Text>
+                  <View style={styles.usageBox}>
+                    <View style={styles.usageHead}>
+                      <Text style={styles.sourceBadge}>Harness 模型</Text>
+                      <Text style={styles.usageValue}>额度由模型服务商管理</Text>
+                    </View>
+                  </View>
+                </View>
+              </View>
+            </View>
+          </View>
+        )}
       </ScrollView>
 
       <PromptDialog
@@ -463,6 +580,68 @@ export default function AgentAccountsScreen() {
   );
 }
 
+function tightestWindow(usage: UsageAccount | undefined): UsageAccount["windows"][number] | null {
+  return usage?.windows.reduce<UsageAccount["windows"][number] | null>(
+    (best, window) => best === null || window.utilization > best.utilization ? window : best,
+    null,
+  ) ?? null;
+}
+
+function sourceLabel(account: AgentAccount, usage: UsageAccount | undefined): string {
+  if (account.apiProfile || usage?.source === "api" || /api/i.test(account.authMethod ?? "")) {
+    return "API 模型";
+  }
+  if (usage?.subscription) return `${usage.subscription} 订阅`;
+  if (/chatgpt/i.test(account.authMethod ?? "")) return "ChatGPT 订阅";
+  return account.status === "signed_in" ? "官方订阅账号" : "来源待登录";
+}
+
+function AccountUsage({
+  account,
+  usage,
+  now,
+}: {
+  account: AgentAccount;
+  usage: UsageAccount | undefined;
+  now: number;
+}) {
+  const window = tightestWindow(usage);
+  const api = account.apiProfile !== undefined || usage?.source === "api";
+  const remaining = window ? Math.max(0, Math.min(100, Math.round(100 - window.utilization))) : null;
+  return (
+    <View style={styles.usageBox}>
+      <View style={styles.usageHead}>
+        <Text style={styles.sourceBadge}>{sourceLabel(account, usage)}</Text>
+        <Text style={[styles.usageValue, window && { color: utilizationColor(window.utilization) }]}>
+          {remaining !== null
+            ? `${window?.label ?? "额度"}剩余 ${String(remaining)}%`
+            : api
+              ? "由 API 服务商计费"
+              : usage?.reason ?? "额度暂不可用"}
+        </Text>
+      </View>
+      {window && (
+        <>
+          <View style={styles.usageTrack}>
+            <View
+              style={[
+                styles.usageFill,
+                {
+                  width: `${Math.max(0, Math.min(100, window.utilization))}%` as const,
+                  backgroundColor: utilizationColor(window.utilization),
+                },
+              ]}
+            />
+          </View>
+          {window.resetsAt && (
+            <Text style={styles.resetText}>{untilLabel(window.resetsAt, now)}</Text>
+          )}
+        </>
+      )}
+    </View>
+  );
+}
+
 function Action({
   label,
   onPress,
@@ -511,6 +690,13 @@ const styles = StyleSheet.create({
   statusDot: { width: 7, height: 7, borderRadius: 4 },
   meta: { ...font.meta, color: color.textDim },
   environment: { ...font.meta, lineHeight: 15 },
+  usageBox: { marginTop: 3, gap: 5 },
+  usageHead: { flexDirection: "row", alignItems: "center", gap: space.sm, flexWrap: "wrap" },
+  sourceBadge: { ...font.meta, color: color.accent, backgroundColor: color.accentBg, paddingHorizontal: 7, paddingVertical: 3, borderRadius: radius.sm, overflow: "hidden" },
+  usageValue: { ...font.meta, color: color.textDim, flexShrink: 1 },
+  usageTrack: { height: 4, borderRadius: 2, overflow: "hidden", backgroundColor: color.surfaceRaised },
+  usageFill: { height: "100%", borderRadius: 2 },
+  resetText: { ...font.meta, color: color.textFaint },
   actions: { flexDirection: "row", flexWrap: "wrap", gap: space.sm },
   action: { paddingHorizontal: 10, paddingVertical: 7, borderRadius: radius.sm, backgroundColor: color.surfaceRaised },
   actionText: { color: color.textDim, fontSize: 12, fontWeight: "600" },

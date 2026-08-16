@@ -11,6 +11,7 @@ export const AgentKindSchema = z.enum([
   "shell",
   "claude",
   "codex",
+  "deepseek",
   "opencode",
   "grok",
   "trae",
@@ -297,6 +298,8 @@ export const C2SSessionCreateSchema = z.object({
     .object({
       id: z.string().min(1).max(500),
       title: z.string().min(1).max(500).optional(),
+      /** 仅 Codex：用户确认原对话被占用后，显式创建独立 thread 副本。 */
+      fork: z.literal(true).optional(),
     })
     .optional(),
   /** 创建一条编排 Run，并将这个新会话登记为协调者。 */
@@ -625,6 +628,20 @@ export const C2SWorkspaceListSchema = z.object({
   type: z.literal("workspace.list"),
   /** "" 表示用户 home */
   path: relPath,
+  /** 新版 Windows daemon 支持“此电脑”与盘符根；省略时保持旧版 home 语义。 */
+  root: z.union([
+    z.literal("home"),
+    z.literal("computer"),
+    z.string().regex(/^[A-Za-z]:$/),
+  ]).optional(),
+  /** 在当前目录创建一个直接子目录，并返回刷新后的目录列表。 */
+  mkdir: z.string()
+    .min(1)
+    .max(255)
+    .refine((name) => name !== "." && name !== ".." && !/[<>:"/\\|?*\0]/.test(name), {
+      message: "invalid directory name",
+    })
+    .optional(),
 });
 
 /** 列目录 */
@@ -1419,6 +1436,8 @@ export const S2CErrorSchema = z.object({
   ]),
   message: z.string(),
   sid: sid.optional(),
+  /** 可操作错误的稳定原因；客户端不需要解析人类可读文案。 */
+  reason: z.literal("conversation_active_writer").optional(),
 });
 
 // ---------------------------------------------------------------- 文件操作应答
@@ -1441,6 +1460,12 @@ export const S2CFsListingSchema = z.object({
 /** 新建会话目录选择器的浏览结果;失败也原路返回,避免无 sid 请求只能超时。 */
 export const S2CWorkspaceListingSchema = z.object({
   type: z.literal("workspace.listing"),
+  /** 旧 daemon 不返回；新版用于维持“此电脑 / 盘符”的导航状态。 */
+  root: z.union([
+    z.literal("home"),
+    z.literal("computer"),
+    z.string().regex(/^[A-Za-z]:$/),
+  ]).optional(),
   /** 相对于用户 home 的路径 */
   path: relPath,
   /** 选中后可直接交给 session.create 的绝对路径 */
@@ -1574,6 +1599,7 @@ export const UsageAccountSchema = z.object({
   agent: AgentKindSchema,
   accountId: z.string().min(1).max(100).optional(),
   accountName: z.string().min(1).max(80).optional(),
+  source: z.enum(["subscription", "api", "unknown"]).optional(),
   available: z.boolean(),
   subscription: z.string().nullable().optional(),
   costUsd: z.number().nonnegative().optional(),
@@ -1836,6 +1862,9 @@ export function parseC2S(v: unknown): C2SMessage {
     }
   }
   if (r.data.type === "session.create") {
+    if (r.data.resume?.fork === true && r.data.agent !== "codex") {
+      throw new ProtocolError("session.create resume.fork only supports Codex", "format");
+    }
     if (r.data.effort !== undefined && r.data.model === undefined) {
       throw new ProtocolError("session.create effort requires model", "format");
     }

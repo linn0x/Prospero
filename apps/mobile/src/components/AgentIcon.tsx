@@ -8,7 +8,7 @@ import { color, radius } from "@/lib/theme";
 /**
  * agent 的标识与识别色。
  *
- * 有官方标的用官方标(claude / codex / opencode / grok / trae),没有的用系统符号
+ * 有官方标的用官方标(claude / codex / deepseek / opencode / grok / trae),没有的用系统符号
  * —— shell 和 custom 不是产品,是"随便跑个命令",给它们编一个标反而是在暗示
  * 那儿有个不存在的东西。
  *
@@ -18,6 +18,7 @@ import { color, radius } from "@/lib/theme";
 const AGENTS: Record<AgentKind, { tint: string; symbol?: IconName }> = {
   claude: { tint: "#D97757" },
   codex: { tint: "#8AB4F8" },
+  deepseek: { tint: "#6B8CFF" },
   opencode: { tint: "#5BC98C" },
   grok: { tint: "#C9C9D4" },
   trae: { tint: "#3ED592" },

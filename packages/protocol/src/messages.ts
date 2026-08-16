@@ -50,8 +50,12 @@ export const CAPABILITY_AGENT_ACCOUNTS = "agent.accounts.v1";
 export const CAPABILITY_SESSION_CREATE_MODEL = "session.create-model.v1";
 /** Claude/Codex 的第三方兼容 API Profile 与独立运行环境。 */
 export const CAPABILITY_AGENT_API_PROFILES = "agent.api-profiles.v1";
+/** DeepSeek Harness 官方本机 RPC/SSE 结构化会话与编排 worker。 */
+export const CAPABILITY_AGENT_DEEPSEEK_HARNESS = "agent.deepseek-harness.v1";
 /** 已发送图片的按需预览，避免把原图塞进 chat.snapshot。 */
 export const CAPABILITY_CHAT_ATTACHMENT_PREVIEWS = "chat.attachment-previews.v1";
+/** Windows 工作目录选择器可浏览盘符并在选中目录中新建文件夹。 */
+export const CAPABILITY_WORKSPACE_ROOTS = "workspace.roots-mkdir.v1";
 
 export type {
   AgentKind,

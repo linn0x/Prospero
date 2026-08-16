@@ -456,6 +456,7 @@ export const ChatView = memo(function ChatView({
 const agentLabel: Record<AgentKind, string> = {
   claude: "Claude",
   codex: "Codex",
+  deepseek: "DeepSeek Harness",
   opencode: "OpenCode",
   grok: "Grok",
   trae: "Trae",

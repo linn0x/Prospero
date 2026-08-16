@@ -14,6 +14,7 @@ import { randomUUID } from "expo-crypto";
 import {
   CAPABILITY_AGENT_ACCOUNTS,
   CAPABILITY_AGENT_API_PROFILES,
+  CAPABILITY_AGENT_DEEPSEEK_HARNESS,
   CAPABILITY_CHAT_ATTACHMENT_PREVIEWS,
   CAPABILITY_ORCHESTRATION_AUTOMATION,
   CAPABILITY_ORCHESTRATION_GRAPH,
@@ -25,6 +26,7 @@ import {
   CAPABILITY_ORCHESTRATION_WORKTREES,
   CAPABILITY_SESSION_CREATE_MODEL,
   CAPABILITY_SUBAGENT_HISTORY,
+  CAPABILITY_WORKSPACE_ROOTS,
   CLOSE_AUTH_FAILED,
   CLOSE_REVOKED,
   SUPPORTED_PROTOCOL_VERSIONS,
@@ -179,6 +181,7 @@ export class HostConnection {
     if (capability === CAPABILITY_AGENT_API_PROFILES) return version >= 12;
     if (capability === CAPABILITY_CHAT_ATTACHMENT_PREVIEWS) return version >= 11;
     if (capability === CAPABILITY_SESSION_CREATE_MODEL) return version >= 11;
+    if (capability === CAPABILITY_WORKSPACE_ROOTS) return false;
     return false;
   }
 
@@ -227,12 +230,20 @@ export class HostConnection {
     return this.supportsCapability(CAPABILITY_AGENT_API_PROFILES);
   }
 
+  get supportsDeepseekHarness(): boolean {
+    return this.supportsCapability(CAPABILITY_AGENT_DEEPSEEK_HARNESS);
+  }
+
   get supportsChatAttachmentPreviews(): boolean {
     return this.supportsCapability(CAPABILITY_CHAT_ATTACHMENT_PREVIEWS);
   }
 
   get supportsSessionCreateModel(): boolean {
     return this.supportsCapability(CAPABILITY_SESSION_CREATE_MODEL);
+  }
+
+  get supportsWorkspaceRoots(): boolean {
+    return this.supportsCapability(CAPABILITY_WORKSPACE_ROOTS);
   }
 
   start(): void {
@@ -902,14 +913,29 @@ export class HostConnection {
   /** 新建会话前浏览 daemon 用户 home 下的目录与文件。 */
   async workspaceList(
     path: string,
+    root?: string,
+    mkdir?: string,
   ): Promise<Extract<S2CMessage, { type: "workspace.listing" }>> {
     const result = await this.fsRequest<Extract<S2CMessage, { type: "workspace.listing" }>>(
       "#workspace",
       path,
-      { type: "workspace.list", path },
+      {
+        type: "workspace.list",
+        path,
+        ...(root ? { root } : {}),
+        ...(mkdir ? { mkdir } : {}),
+      },
     );
     if (result.error) throw new Error(result.error);
     return result;
+  }
+
+  workspaceMkdir(
+    path: string,
+    root: string,
+    name: string,
+  ): Promise<Extract<S2CMessage, { type: "workspace.listing" }>> {
+    return this.workspaceList(path, root, name);
   }
 
   /** 搜索电脑上由 Claude Code / Codex 自己保存、可原生接回的对话。 */
@@ -1252,7 +1278,7 @@ export class HostConnection {
     rows = 24,
     options?: {
       mode?: "default" | "plan";
-      resume?: { id: string; title?: string };
+      resume?: { id: string; title?: string; fork?: true };
       /** Goal 会同时创建编排 Run，并把新会话作为协调者。 */
       goal?: string;
       /** 账号环境与 cwd 独立；多个账号可指向同一个项目。 */

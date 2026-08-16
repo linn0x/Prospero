@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { commandFor, noopCommand, programCommandFor, shellFor } from "../src/agents.js";
+import {
+  commandFor,
+  defaultKindFor,
+  noopCommand,
+  programCommandFor,
+  shellFor,
+} from "../src/agents.js";
 
 function decodedWindowsArgv(spec: { file: string; args: string[] }): string[] {
   const encodedScript = spec.args.at(-1);
@@ -23,6 +29,11 @@ describe("PTY agent startup commands", () => {
       file: "claude",
       args: ["--dangerously-skip-permissions"],
     });
+  });
+
+  it("routes DeepSeek Harness through its structured web API", () => {
+    expect(() => commandFor("deepseek", undefined, "linux")).toThrow("structured");
+    expect(defaultKindFor("deepseek")).toBe("structured");
   });
 
   it("does not add agent bypass flags to Shell or custom commands", () => {
@@ -58,6 +69,7 @@ describe("PTY agent startup commands", () => {
       "codex",
       "--dangerously-bypass-approvals-and-sandbox",
     ]);
+    expect(() => commandFor("deepseek", undefined, "win32", env)).toThrow("structured");
   });
 
   it("preserves dynamic Windows arguments without interpreting shell syntax", () => {

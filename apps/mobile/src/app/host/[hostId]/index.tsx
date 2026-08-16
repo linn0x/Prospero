@@ -28,6 +28,7 @@ import type {
 import { AgentIcon } from "@/components/AgentIcon";
 import { HostSummary } from "@/components/HostSummary";
 import { Icon } from "@/components/Icon";
+import { Sheet, SheetAction } from "@/components/Sheet";
 import { SwipeRow, type SwipeAction } from "@/components/SwipeRow";
 import { WorkspacePicker } from "@/components/WorkspacePicker";
 import { useAdaptiveLayout } from "@/lib/adaptive-layout";
@@ -35,6 +36,7 @@ import {
   getSessionPreferences,
   setProjectCollapsed,
   setSessionArchived,
+  setSessionHidden,
 } from "@/lib/session-preferences";
 import { groupSessionsByProject } from "@/lib/session-projects";
 import {
@@ -50,9 +52,11 @@ import { useOrchestrationSnapshot } from "@/lib/use-orchestration-snapshot";
 import * as theme from "@/lib/theme";
 const { color, font, radius, space } = theme;
 
-const AGENTS: AgentKind[] = ["claude", "codex", "opencode", "grok", "trae", "shell"];
+const AGENTS: AgentKind[] = [
+  "claude", "codex", "deepseek", "opencode", "grok", "trae", "shell",
+];
 /** 有结构化适配器的 agent(会话会以对话形态呈现) */
-const STRUCTURED: AgentKind[] = ["claude", "codex", "opencode"];
+const STRUCTURED: AgentKind[] = ["claude", "codex", "opencode", "deepseek"];
 const RESUMABLE: AgentKind[] = ["claude", "codex"];
 
 const statusLabel: Record<SessionInfo["status"], string> = {
@@ -103,6 +107,12 @@ export default function HostScreen() {
     cmd?: string;
   }>();
   const { host, conn, runtime } = useHostConnection(hostId);
+  const supportsDeepseekHarness =
+    runtime.status === "connected" && conn?.supportsDeepseekHarness === true;
+  const availableAgents = useMemo(
+    () => AGENTS.filter((candidate) => candidate !== "deepseek" || supportsDeepseekHarness),
+    [supportsDeepseekHarness],
+  );
   const [agent, setAgent] = useState<AgentKind>("claude");
   const [sessionKind, setSessionKind] = useState<SessionKind>("structured");
   const [launchMode, setLaunchMode] = useState<"default" | "plan">("default");
@@ -132,11 +142,15 @@ export default function HostScreen() {
   const [launchModelsReload, setLaunchModelsReload] = useState(0);
   const [showArchived, setShowArchived] = useState(false);
   const [archivedIds, setArchivedIds] = useState<Set<string>>(() => new Set());
+  const [hiddenIds, setHiddenIds] = useState<Set<string>>(() => new Set());
+  const [deleteTarget, setDeleteTarget] = useState<SessionInfo | null>(null);
+  const [resumeConflictTitle, setResumeConflictTitle] = useState<string | null>(null);
   const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(() => new Set());
   const [goalRunExpansionOverrides, setGoalRunExpansionOverrides] = useState<
     Record<string, boolean>
   >({});
   const pendingCreateRef = useRef(false);
+  const pendingForkCreateRef = useRef<{ title: string; run: () => void } | null>(null);
   const deepLinkCreateRef = useRef<string | null>(null);
   const insets = useSafeAreaInsets();
   const { width, height, verticalPanes } = useAdaptiveLayout();
@@ -322,6 +336,7 @@ export default function HostScreen() {
         .then((preferences) => {
           if (cancelled) return;
           setArchivedIds(new Set(preferences.archivedSessionIds));
+          setHiddenIds(new Set(preferences.hiddenSessionIds));
           setCollapsedProjects(new Set(preferences.collapsedProjects));
         })
         .catch((error: unknown) => {
@@ -341,7 +356,7 @@ export default function HostScreen() {
     const fireKey = `${create}:${typeof cmd === "string" ? cmd : ""}`;
     if (deepLinkCreateRef.current === fireKey) return;
     if (runtime.status !== "connected") return;
-    if (!AGENTS.includes(create as AgentKind) && create !== "custom") return;
+    if (!availableAgents.includes(create as AgentKind) && create !== "custom") return;
     deepLinkCreateRef.current = fireKey;
     pendingCreateRef.current = true;
     conn.createSession(
@@ -349,7 +364,7 @@ export default function HostScreen() {
       undefined,
       typeof cmd === "string" && cmd.length > 0 ? cmd : undefined,
     );
-  }, [conn, create, cmd, runtime.status]);
+  }, [availableAgents, conn, create, cmd, runtime.status]);
 
   // 新建会话:创建后 daemon 自动 attach 并发快照(PTY 发 term.snapshot,
   // 结构化发 chat.snapshot)→ 以快照的 sid 进入会话页
@@ -358,6 +373,7 @@ export default function HostScreen() {
     const enter = (sid: string): void => {
       if (!pendingCreateRef.current || !hostId) return;
       pendingCreateRef.current = false;
+      pendingForkCreateRef.current = null;
       setComposing(false);
       setSelectedResume(null);
       setLaunchIntent("conversation");
@@ -368,6 +384,11 @@ export default function HostScreen() {
     const offChat = conn.events.on("chatSnapshot", (m) => enter(m.sid));
     const offErr = conn.events.on("serverError", (m) => {
       pendingCreateRef.current = false;
+      if (m.reason === "conversation_active_writer" && pendingForkCreateRef.current) {
+        setResumeConflictTitle(pendingForkCreateRef.current.title);
+        return;
+      }
+      pendingForkCreateRef.current = null;
       setBanner(`${m.code}: ${m.message}`);
     });
     return () => {
@@ -377,7 +398,10 @@ export default function HostScreen() {
     };
   }, [conn, hostId]);
 
-  const all = useMemo(() => sortSessions(runtime.sessions), [runtime.sessions]);
+  const all = useMemo(
+    () => sortSessions(runtime.sessions).filter((session) => !hiddenIds.has(session.id)),
+    [hiddenIds, runtime.sessions],
+  );
   const currentSessions = useMemo(
     () => all.filter((session) => !archivedIds.has(session.id)),
     [all, archivedIds],
@@ -457,6 +481,12 @@ export default function HostScreen() {
 
   const submitCreate = (): void => {
     if (!conn || runtime.status !== "connected") return;
+    const projectPath = cwd.trim();
+    if (projectPath.length === 0) {
+      setBanner("请先选择项目目录，再新建会话。");
+      setPickerOpen(true);
+      return;
+    }
     const objective = goal.trim();
     if (launchIntent === "goal" && objective.length === 0) {
       setBanner("请先写下 Goal，协调者才知道要完成什么。");
@@ -476,7 +506,7 @@ export default function HostScreen() {
     const sessionOptions:
       | {
           mode?: "default" | "plan";
-          resume?: { id: string; title?: string };
+          resume?: { id: string; title?: string; fork?: true };
           goal?: string;
           accountId?: string;
           model?: string;
@@ -502,15 +532,29 @@ export default function HostScreen() {
           : selectedAccount
             ? accountOption
             : undefined;
-    conn.createSession(
-      agent,
-      cwd.trim() || undefined,
-      undefined,
-      launchIntent === "goal" ? "structured" : STRUCTURED.includes(agent) ? sessionKind : "pty",
-      80,
-      24,
-      sessionOptions,
-    );
+    const createKind = launchIntent === "goal"
+      ? "structured"
+      : STRUCTURED.includes(agent)
+        ? sessionKind
+        : "pty";
+    const sendCreate = (options: typeof sessionOptions): void => {
+      conn.createSession(agent, projectPath, undefined, createKind, 80, 24, options);
+    };
+    pendingForkCreateRef.current =
+      agent === "codex" && sessionOptions?.resume
+        ? {
+            title: sessionOptions.resume.title ?? "这条 Codex 对话",
+            run: () => {
+              pendingCreateRef.current = true;
+              setResumeConflictTitle(null);
+              sendCreate({
+                ...sessionOptions,
+                resume: { ...sessionOptions.resume!, fork: true },
+              });
+            },
+          }
+        : null;
+    sendCreate(sessionOptions);
   };
 
   const leaveHost = (): void => {
@@ -537,9 +581,22 @@ export default function HostScreen() {
     });
   };
 
+  const hideSession = (session: SessionInfo, stopOnComputer: boolean): void => {
+    setDeleteTarget(null);
+    setHiddenIds((current) => new Set(current).add(session.id));
+    if (stopOnComputer) conn?.kill(session.id);
+    void setSessionHidden(hostId, session.id, true).catch((error: unknown) => {
+      setHiddenIds((current) => {
+        const next = new Set(current);
+        next.delete(session.id);
+        return next;
+      });
+      setBanner(`删除状态保存失败: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  };
+
   const sessionSwipeActions = (session: SessionInfo): SwipeAction[] => {
     const archived = archivedIds.has(session.id);
-    const done = session.status === "done" || session.status === "died";
     return [
       {
         id: "toggle-archive",
@@ -557,17 +614,10 @@ export default function HostScreen() {
       },
       {
         id: "end-session",
-        label: done ? "移除" : "结束",
+        label: "删除",
         symbol: "trash",
         color: "#e5534b",
-        onPress: () => conn?.kill(session.id),
-        confirm: {
-          title: done ? `移除「${session.title}」?` : `结束「${session.title}」?`,
-          message: done
-            ? "会话已结束，这会同时删除它的持久化记录。"
-            : "会话进程会被终止，未完成的工作会丢失。归档不会终止会话。",
-          confirmLabel: done ? "移除" : "结束",
-        },
+        onPress: () => setDeleteTarget(session),
       },
     ];
   };
@@ -589,7 +639,16 @@ export default function HostScreen() {
     <View style={styles.container}>
       <Stack.Screen
         options={{
-          title: host?.name ?? "主机",
+          headerTitleAlign: "center",
+          headerTitle: () => (
+            <Text
+              style={[styles.headerTitle, { maxWidth: Math.max(96, width - 136) }]}
+              numberOfLines={1}
+              ellipsizeMode="middle"
+            >
+              {host?.name ?? "主机"}
+            </Text>
+          ),
           headerBackVisible: false,
           headerLeft: () => (
             <Pressable
@@ -600,7 +659,6 @@ export default function HostScreen() {
               accessibilityLabel="返回机器列表"
             >
               <Icon name="chevron.left" size={20} color={color.accent} weight="semibold" />
-              <Text style={styles.headerBackText}>机器</Text>
             </Pressable>
           ),
           headerRight: () =>
@@ -622,6 +680,7 @@ export default function HostScreen() {
                   setLaunchIntent("conversation");
                   setGoal("");
                   setSelectedResume(null);
+                  setCwd((current) => current.trim() || currentSessions[0]?.cwd || "");
                   setComposing(true);
                 }}
                 hitSlop={8}
@@ -774,7 +833,7 @@ export default function HostScreen() {
             >
           <Text style={styles.formLabel}>运行方式</Text>
           <View style={styles.chips}>
-            {AGENTS.map((a) => (
+            {availableAgents.map((a) => (
               <Pressable
                 key={a}
                 onPress={() => {
@@ -868,7 +927,7 @@ export default function HostScreen() {
               </Text>
             </>
           )}
-          {STRUCTURED.includes(agent) && (
+          {STRUCTURED.includes(agent) && agent !== "deepseek" && (
             <>
               <Text style={[styles.formLabel, styles.kindLabel]}>界面</Text>
               <View style={styles.kindSwitch} accessibilityRole="tablist">
@@ -1297,6 +1356,7 @@ export default function HostScreen() {
         ListHeaderComponent={
           <>
             <HostSummary
+              hostId={hostId}
               info={runtime.hostInfo}
               conn={conn}
               connected={runtime.status === "connected"}
@@ -1363,7 +1423,7 @@ export default function HostScreen() {
         ListFooterComponent={
           projects.length > 0 ? (
             <Text style={styles.swipeHint}>
-              左滑：项目可新建 · 会话可{showArchived ? "恢复" : "归档"}或结束
+              左滑：项目可新建 · 会话可{showArchived ? "恢复" : "归档"}或删除
             </Text>
           ) : null
         }
@@ -1649,6 +1709,7 @@ export default function HostScreen() {
           visible={pickerOpen}
           conn={conn}
           initialPath={workspacePath}
+          initialCwd={cwd}
           onClose={() => setPickerOpen(false)}
           onSelect={(selection) => {
             setWorkspacePath(selection.path);
@@ -1657,6 +1718,50 @@ export default function HostScreen() {
           }}
         />
       )}
+      <Sheet
+        visible={resumeConflictTitle !== null}
+        title="电脑正在使用这条对话"
+        onClose={() => {
+          setResumeConflictTitle(null);
+          pendingForkCreateRef.current = null;
+        }}
+      >
+        <Text style={styles.decisionNote}>
+          「{resumeConflictTitle ?? "Codex 对话"}」当前有活动写入者。Prospero 不会抢占电脑端；可以从现有历史创建一条独立副本。
+        </Text>
+        <SheetAction
+          label="创建独立副本"
+          detail="保留当前上下文，在手机上继续新的 Codex 对话"
+          symbol="doc.on.doc"
+          onPress={() => pendingForkCreateRef.current?.run()}
+        />
+      </Sheet>
+      <Sheet
+        visible={deleteTarget !== null}
+        title="删除会话"
+        onClose={() => setDeleteTarget(null)}
+      >
+        <Text style={styles.decisionNote}>
+          请选择删除范围。仅手机删除不会改变电脑上的会话和进程。
+        </Text>
+        <SheetAction
+          label="仅在手机上删除"
+          detail="从这台手机的列表隐藏，电脑端继续保留"
+          symbol="archivebox"
+          onPress={() => deleteTarget && hideSession(deleteTarget, false)}
+        />
+        <SheetAction
+          label="电脑和手机同时删除"
+          detail={
+            deleteTarget?.status === "done" || deleteTarget?.status === "died"
+              ? "删除电脑端持久化记录，并从手机列表隐藏"
+              : "结束电脑端会话进程，并从手机列表隐藏"
+          }
+          symbol="trash"
+          destructive
+          onPress={() => deleteTarget && hideSession(deleteTarget, true)}
+        />
+      </Sheet>
     </View>
   );
 }
@@ -1800,8 +1905,8 @@ function GoalRunsPanel({
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: color.bg },
-  headerBack: { flexDirection: "row", alignItems: "center", gap: 2, minHeight: 36 },
-  headerBackText: { color: color.accent, fontSize: 15 },
+  headerTitle: { ...font.body, fontWeight: "700", textAlign: "center" },
+  headerBack: { width: 40, height: 40, alignItems: "center", justifyContent: "center" },
   headerCancel: { color: color.accent, fontSize: 15 },
   statusBar: {
     paddingHorizontal: space.lg,
@@ -2231,6 +2336,12 @@ const styles = StyleSheet.create({
   childPreview: { color: color.textDim, fontSize: 10.5 },
   emptyText: { ...font.sub, textAlign: "center", paddingVertical: 40 },
   swipeHint: { ...font.meta, textAlign: "center", paddingVertical: space.lg },
+  decisionNote: {
+    ...font.sub,
+    color: color.textDim,
+    lineHeight: 20,
+    paddingBottom: space.md,
+  },
   cwdRow: { flexDirection: "row", gap: space.sm, alignItems: "center" },
   cwdField: {
     flex: 1,
