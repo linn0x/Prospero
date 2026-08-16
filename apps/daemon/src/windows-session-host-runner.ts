@@ -6,6 +6,7 @@
  * single-daemon mutation fence implemented here.
  */
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isAbsolute } from "node:path";
@@ -142,6 +143,8 @@ type DetachedStartupStage = typeof DETACHED_STARTUP_STAGES[number];
 const PROVIDER_BOOTSTRAP_FILE = "provider.bootstrap.json";
 const PROVIDER_RECORD_FILE = "provider.record.json";
 const DETACHED_RUNNER_ENV = "PROSPERO_WINDOWS_SESSION_HOST_STATE_DIRECTORY";
+const DETACHED_TEST_DIAGNOSTIC_ENV = "PROSPERO_WINDOWS_SESSION_HOST_TEST_DIAGNOSTIC";
+const SIGNED_SESSION_HOST_TEST_ENV = "PROSPERO_WINDOWS_SIGNED_SESSION_HOST_TEST";
 const DETACHED_HOST_ROLLBACK_EXIT_CODE = 0xC000013A;
 const DETACHED_HOST_ROLLBACK_TIMEOUT_MS = 5_000;
 
@@ -1166,13 +1169,19 @@ function runnerEnvironment(
   }
   return {
     ...runtimeEnvironment,
+    ...(sourceEntries.filter(([name, value]) => name.toLowerCase() === SIGNED_SESSION_HOST_TEST_ENV.toLowerCase() && value === "1").length === 1
+      ? {
+          [SIGNED_SESSION_HOST_TEST_ENV]: "1",
+          [DETACHED_TEST_DIAGNOSTIC_ENV]: `${stateDirectory}.entry-diagnostic.json`,
+        }
+      : {}),
     [DETACHED_RUNNER_ENV]: stateDirectory,
   };
 }
 
 async function waitForDetachedManifest(
   native: Pick<WindowsSessionHostDetachedLaunchNative, "read">,
-  expected: { sessionId: string; epoch: string; process: ProcessIdentity },
+  expected: { sessionId: string; epoch: string; process: ProcessIdentity; testDiagnosticPath?: string },
   timeoutMs = 8_000,
 ): Promise<WindowsSessionHostManifest> {
   const deadline = Date.now() + timeoutMs;
@@ -1221,7 +1230,17 @@ async function waitForDetachedManifest(
       : !readyPublished
         ? "after_manifest_publish"
         : "after_ready_publish";
-  throw new WindowsSessionHostUnavailable("launch_failed", `Windows detached host did not publish a verified manifest (${stage})`);
+  let diagnostic = "";
+  if (expected.testDiagnosticPath) {
+    try {
+      const value: unknown = JSON.parse(readFileSync(expected.testDiagnosticPath, "utf8"));
+      if (isObject(value) && (value.stage === "entry_loaded" || value.stage === "entry_failed")) {
+        const message = typeof value.message === "string" ? value.message.slice(0, 320) : "";
+        diagnostic = `; test_entry=${value.stage}${message ? `:${message}` : ""}`;
+      }
+    } catch { /* CI-only sibling diagnostic is advisory */ }
+  }
+  throw new WindowsSessionHostUnavailable("launch_failed", `Windows detached host did not publish a verified manifest (${stage}${diagnostic})`);
 }
 
 async function removeDetachedBootstrapState(
@@ -1357,10 +1376,11 @@ export async function launchDetachedWindowsSessionHostWithNative(
     await native.writeAtomic(DETACHED_BOOTSTRAP_FILE, new TextEncoder().encode(JSON.stringify(bootstrap)));
     const entry = options.runnerEntryPath ?? emittedSiblingPath(import.meta.url, "windows-session-host-runner-entry.js");
     if (!isAbsolute(entry)) throw new WindowsSessionHostUnavailable("invalid_manifest", "Windows detached runner entry must be absolute");
+    const environment = runnerEnvironment(options.stateDirectory);
     const launch = await native.launchDetachedHost({
       executablePath: process.execPath,
       arguments: [entry],
-      environment: runnerEnvironment(options.stateDirectory),
+      environment,
     });
     if (launch.status !== "launched") {
       // The native boundary proved CreateProcessW never succeeded. Unlike a
@@ -1374,7 +1394,14 @@ export async function launchDetachedWindowsSessionHostWithNative(
     launchedOwner = launch.process;
     return await waitForDetachedManifest(
       native,
-      { sessionId: options.sessionId, epoch: options.epoch, process: launch.process },
+      {
+        sessionId: options.sessionId,
+        epoch: options.epoch,
+        process: launch.process,
+        ...(environment[DETACHED_TEST_DIAGNOSTIC_ENV]
+          ? { testDiagnosticPath: environment[DETACHED_TEST_DIAGNOSTIC_ENV] }
+          : {}),
+      },
       options.manifestTimeoutMs,
     );
   } catch (error) {
