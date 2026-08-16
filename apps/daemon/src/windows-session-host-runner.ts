@@ -1234,7 +1234,7 @@ async function waitForDetachedManifest(
   if (expected.testDiagnosticPath) {
     try {
       const value: unknown = JSON.parse(readFileSync(expected.testDiagnosticPath, "utf8"));
-      if (isObject(value) && (value.stage === "entry_loaded" || value.stage === "entry_failed")) {
+      if (isObject(value) && typeof value.stage === "string" && /^[a-z_]{1,64}$/.test(value.stage)) {
         const message = typeof value.message === "string" ? value.message.slice(0, 320) : "";
         diagnostic = `; test_entry=${value.stage}${message ? `:${message}` : ""}`;
       }
