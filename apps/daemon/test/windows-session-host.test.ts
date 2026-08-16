@@ -612,6 +612,47 @@ describe("Windows Session Host detached bootstrap and provider output", () => {
     expect([...files.keys()]).toEqual([]);
   });
 
+  it("canonicalizes Windows runtime variables copied from a worker-thread environment", async () => {
+    const environmentKeys = ["SystemRoot", "SYSTEMROOT"] as const;
+    const previous = new Map(environmentKeys.map((name) => [name, process.env[name]]));
+    let launchedEnvironment: Readonly<Record<string, string>> | undefined;
+    try {
+      for (const name of environmentKeys) delete process.env[name];
+      // Node documents worker-thread process.env copies as case-sensitive on
+      // Windows. Task Scheduler commonly supplies this all-uppercase spelling.
+      process.env["SYSTEMROOT"] = "C:\\Windows";
+      const files = new Map<string, Uint8Array>();
+      const native: WindowsSessionHostDetachedLaunchNative = {
+        async openState() {}, async read(name) { return files.get(name) ?? null; },
+        async writeAtomic(name, bytes) { files.set(name, Uint8Array.from(bytes)); },
+        async removeState(name) { files.delete(name); },
+        async launchDetachedHost(options) {
+          launchedEnvironment = options.environment;
+          return { status: "parent_job_prevents_detach", parentJob: { parentJobDetected: true, breakawayAllowed: false, detachedLaunchAllowed: false } };
+        },
+        async terminateIdentityAndWait() { return false; },
+        async close() {},
+      };
+      await expect(launchDetachedWindowsSessionHostWithNative({
+        sessionId,
+        epoch,
+        pipeName: "\\\\.\\pipe\\prospero-detached-worker-environment",
+        stateDirectory,
+        handlerModule,
+      }, native)).rejects.toMatchObject({ code: "native_unavailable" });
+      expect(launchedEnvironment).toMatchObject({
+        SystemRoot: "C:\\Windows",
+        PROSPERO_WINDOWS_SESSION_HOST_STATE_DIRECTORY: stateDirectory,
+      });
+    } finally {
+      for (const name of environmentKeys) {
+        const value = previous.get(name);
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  });
+
   it("uses exact owner identity for facade-attach rollback and persists failed discovery state", async () => {
     const files = new Map<string, Uint8Array>([
       ["provider.bootstrap.json", new TextEncoder().encode("sensitive")],

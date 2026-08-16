@@ -6,9 +6,10 @@
  * single-daemon mutation fence implemented here.
  */
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { isAbsolute } from "node:path";
+import { isAbsolute, join } from "node:path";
 import {
   NATIVE_WINDOWS_ABI_VERSION,
   type DetachedHostLaunchOptions,
@@ -1142,7 +1143,10 @@ export async function runDetachedWindowsSessionHostFromEnvironment(
   }
 }
 
-function runnerEnvironment(stateDirectory: string): Record<string, string> {
+function runnerEnvironment(
+  stateDirectory: string,
+  source: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
   // Keep provider/API credentials out of the detached host environment, but
   // retain the Windows runtime/profile locations required by Authenticode,
   // DPAPI, PowerShell and Node when the daemon is running as a service user.
@@ -1153,9 +1157,18 @@ function runnerEnvironment(stateDirectory: string): Record<string, string> {
     "ProgramFiles(x86)", "ProgramW6432", "CommonProgramFiles",
     "CommonProgramFiles(x86)", "CommonProgramW6432",
   ] as const;
+  const sourceEntries = Object.entries(source).filter((entry): entry is [string, string] => typeof entry[1] === "string");
+  const runtimeEnvironment: Record<string, string> = {};
+  for (const canonicalName of inherited) {
+    // A worker-thread environment copy is case-sensitive even on Windows,
+    // while the OS environment is not. Canonicalize exactly one match and
+    // fail closed by omitting ambiguous case variants.
+    const matches = sourceEntries.filter(([name]) => name.toLowerCase() === canonicalName.toLowerCase());
+    if (matches.length === 1) runtimeEnvironment[canonicalName] = matches[0]![1];
+  }
   return {
-    ...Object.fromEntries(inherited.filter((name) => process.env[name] !== undefined).map((name) => [name, process.env[name]!])),
-    ...(process.env["PROSPERO_WINDOWS_SIGNED_SESSION_HOST_TEST"] === "1"
+    ...runtimeEnvironment,
+    ...(source["PROSPERO_WINDOWS_SIGNED_SESSION_HOST_TEST"] === "1"
       ? { PROSPERO_WINDOWS_SIGNED_SESSION_HOST_TEST: "1" }
       : {}),
     [DETACHED_RUNNER_ENV]: stateDirectory,
@@ -1164,7 +1177,7 @@ function runnerEnvironment(stateDirectory: string): Record<string, string> {
 
 async function waitForDetachedManifest(
   native: Pick<WindowsSessionHostDetachedLaunchNative, "read">,
-  expected: { sessionId: string; epoch: string; process: ProcessIdentity },
+  expected: { sessionId: string; epoch: string; stateDirectory: string; process: ProcessIdentity },
   timeoutMs = 8_000,
 ): Promise<WindowsSessionHostManifest> {
   const deadline = Date.now() + timeoutMs;
@@ -1215,16 +1228,16 @@ async function waitForDetachedManifest(
         : "after_ready_publish";
   let diagnostic = "";
   if (process.env["PROSPERO_WINDOWS_SIGNED_SESSION_HOST_TEST"] === "1") {
-    const bytes = await native.read(DETACHED_TEST_DIAGNOSTIC_FILE);
-    if (bytes !== null) {
-      try {
-        const value: unknown = JSON.parse(new TextDecoder().decode(bytes));
-        if (isObject(value) && (value.stage === "entry_loaded" || value.stage === "entry_failed")) {
-          const message = typeof value.message === "string" ? value.message.slice(0, 320) : "";
-          diagnostic = `; test_entry=${value.stage}${message ? `:${message}` : ""}`;
-        }
-      } catch { /* CI-only diagnostic is advisory */ }
-    }
+    try {
+      // The entry probe intentionally runs before the trusted native state
+      // worker exists, so its CI-only file cannot satisfy production ACL
+      // metadata validation. Read it only through this explicitly gated path.
+      const value: unknown = JSON.parse(readFileSync(join(expected.stateDirectory, DETACHED_TEST_DIAGNOSTIC_FILE), "utf8"));
+      if (isObject(value) && (value.stage === "entry_loaded" || value.stage === "entry_failed")) {
+        const message = typeof value.message === "string" ? value.message.slice(0, 320) : "";
+        diagnostic = `; test_entry=${value.stage}${message ? `:${message}` : ""}`;
+      }
+    } catch { /* CI-only diagnostic is advisory */ }
   }
   throw new WindowsSessionHostUnavailable("launch_failed", `Windows detached host did not publish a verified manifest (${stage}${diagnostic})`);
 }
@@ -1379,7 +1392,7 @@ export async function launchDetachedWindowsSessionHostWithNative(
     launchedOwner = launch.process;
     return await waitForDetachedManifest(
       native,
-      { sessionId: options.sessionId, epoch: options.epoch, process: launch.process },
+      { sessionId: options.sessionId, epoch: options.epoch, stateDirectory: options.stateDirectory, process: launch.process },
       options.manifestTimeoutMs,
     );
   } catch (error) {
