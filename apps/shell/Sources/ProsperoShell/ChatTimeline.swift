@@ -71,6 +71,14 @@ struct ChatSnapshot: Sendable, Equatable {
   var events: [ChatEventBody]
 }
 
+/// A checked portion of the daemon's append-only structured-session log.
+/// `baseSeq` is the last event the caller had before this response.
+struct ChatDelta: Sendable, Equatable {
+  var baseSeq: Int
+  var evSeq: Int
+  var events: [ChatEventBody]
+}
+
 /// A deterministic reducer for either the parent conversation or one child conversation.
 struct ChatTimeline: Sendable, Equatable {
   enum Scope: Sendable, Equatable { case main; case subagent(String) }
@@ -90,6 +98,9 @@ struct ChatTimeline: Sendable, Equatable {
   struct Reasoning: Identifiable, Sendable, Equatable { var id: String; var text: String }
   struct Tool: Identifiable, Sendable, Equatable {
     var id: String; var title: String; var summary: String; var state: ChatToolState; var hasMore: Bool; var diff: ChatDiff?
+    /// Kept outside the event stream: full output is deliberately fetched only after the user asks.
+    var fullOutput: String?
+    var outputTruncated: Bool
   }
   struct Permission: Identifiable, Sendable, Equatable {
     var id: String; var action: String; var resources: [String]; var summary: String; var diff: ChatDiff?; var status: PermissionStatus
@@ -177,6 +188,17 @@ struct ChatTimeline: Sendable, Equatable {
     return .applied
   }
 
+  /// Stores a user-requested tool payload without inventing a second event model.
+  mutating func setToolOutput(callID: String, output: String, truncated: Bool) {
+    let id = "tool:\(callID)"
+    guard let index = entries.firstIndex(where: { $0.id == id }), case .tool(var tool) = entries[index] else {
+      return
+    }
+    tool.fullOutput = output
+    tool.outputTruncated = truncated
+    entries[index] = .tool(tool)
+  }
+
   /// Folds only adjacent completed activities. Pending or failed activity remains visible.
   var presentationItems: [PresentationItem] {
     var result: [PresentationItem] = []
@@ -232,7 +254,7 @@ struct ChatTimeline: Sendable, Equatable {
         entries.append(.reasoning(Reasoning(id: id, text: input.delta)))
       }
     case .toolStart(let input):
-      upsert(.tool(Tool(id: "tool:\(input.callID)", title: input.tool.isEmpty ? "工具调用" : input.tool, summary: input.summary, state: .running, hasMore: false, diff: input.diff)))
+      upsert(.tool(Tool(id: "tool:\(input.callID)", title: input.tool.isEmpty ? "工具调用" : input.tool, summary: input.summary, state: .running, hasMore: false, diff: input.diff, fullOutput: nil, outputTruncated: false)))
     case .toolEnd(let input):
       let id = "tool:\(input.callID)"
       if let index = entries.firstIndex(where: { $0.id == id }), case .tool(var tool) = entries[index] {
@@ -242,7 +264,7 @@ struct ChatTimeline: Sendable, Equatable {
         tool.state = input.state; tool.hasMore = input.hasMore; tool.diff = input.diff ?? tool.diff
         entries[index] = .tool(tool)
       } else {
-        entries.append(.tool(Tool(id: id, title: "工具调用", summary: input.summary, state: input.state, hasMore: input.hasMore, diff: input.diff)))
+        entries.append(.tool(Tool(id: id, title: "工具调用", summary: input.summary, state: input.state, hasMore: input.hasMore, diff: input.diff, fullOutput: nil, outputTruncated: false)))
       }
     case .permissionRequest(let input):
       upsert(.permission(Permission(id: "permission:\(input.requestID)", action: input.action, resources: input.resources, summary: input.summary, diff: input.diff, status: .pending)))
@@ -319,13 +341,45 @@ enum ChatPayloadDecoder {
   static func snapshot(from data: Data) throws -> ChatSnapshot {
     let root = try object(data)
     guard try string(root, "type") == "chat.snapshot" else { throw Failure(message: "不是 chat.snapshot") }
-    let events = try array(root, "events").map { value -> ChatEventBody in
-      guard let event = value as? [String: Any] else { throw Failure(message: "events 包含非对象") }
-      return try body(event)
-    }
+    let events = try eventBodies(root)
     let evSeq = try integer(root, "evSeq")
     guard evSeq >= 0 else { throw Failure(message: "evSeq 不可为负数") }
     return ChatSnapshot(evSeq: evSeq, events: events)
+  }
+
+  /// Decodes the daemon's native Mac control response. The caller additionally checks the cursor
+  /// it asked for; keeping the event parser here ensures snapshot and delta share one schema.
+  static func localSnapshot(from data: Data) throws -> ChatSnapshot {
+    let root = try object(data)
+    guard try string(root, "kind") == "structured", try string(root, "mode") == "snapshot" else {
+      throw Failure(message: "不是结构化会话快照")
+    }
+    let evSeq = try integer(root, "evSeq")
+    guard evSeq >= 0 else { throw Failure(message: "evSeq 不可为负数") }
+    return ChatSnapshot(evSeq: evSeq, events: try eventBodies(root))
+  }
+
+  static func localDelta(from data: Data) throws -> ChatDelta {
+    let root = try object(data)
+    guard try string(root, "kind") == "structured", try string(root, "mode") == "delta" else {
+      throw Failure(message: "不是结构化会话增量")
+    }
+    let baseSeq = try integer(root, "baseSeq")
+    let evSeq = try integer(root, "evSeq")
+    guard baseSeq >= 0, evSeq >= baseSeq else { throw Failure(message: "结构化会话游标无效") }
+    let events = try eventBodies(root)
+    guard events.count == evSeq - baseSeq else {
+      throw Failure(message: "结构化会话增量事件数与游标不一致")
+    }
+    return ChatDelta(baseSeq: baseSeq, evSeq: evSeq, events: events)
+  }
+
+  /// The child endpoint has the same event bodies but a smaller envelope.
+  static func subagentSnapshot(from data: Data) throws -> ChatSnapshot {
+    let root = try object(data)
+    let evSeq = try integer(root, "evSeq")
+    guard evSeq >= 0 else { throw Failure(message: "子 Agent evSeq 不可为负数") }
+    return ChatSnapshot(evSeq: evSeq, events: try eventBodies(root))
   }
 
   private static func object(_ data: Data) throws -> [String: Any] {
@@ -339,6 +393,12 @@ enum ChatPayloadDecoder {
   private static func array(_ value: [String: Any], _ key: String) throws -> [Any] {
     guard let array = value[key] as? [Any] else { throw Failure(message: "\(key) 必须是数组") }
     return array
+  }
+  private static func eventBodies(_ value: [String: Any]) throws -> [ChatEventBody] {
+    try array(value, "events").map { raw in
+      guard let event = raw as? [String: Any] else { throw Failure(message: "events 包含非对象") }
+      return try body(event)
+    }
   }
   private static func string(_ value: [String: Any], _ key: String) throws -> String {
     guard let string = value[key] as? String else { throw Failure(message: "\(key) 必须是字符串") }

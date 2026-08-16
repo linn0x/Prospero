@@ -415,12 +415,6 @@ private struct CompactSessionRow: View {
 }
 
 private struct SessionsDashboard: View {
-  private struct SelectedSubagent: Identifiable {
-    let session: RunningStatus.Session
-    let subagent: RunningStatus.Session.Subagent
-    var id: String { "\(session.id):\(subagent.id)" }
-  }
-
   @Bindable var daemon: DaemonController
   @Bindable var projects: LocalProjectStore
   @Binding var selectedProjectPath: String?
@@ -428,7 +422,6 @@ private struct SessionsDashboard: View {
   let newSession: (String?) -> Void
   let newSessionForAgent: (String?, String) -> Void
   @State private var sessionToKill: RunningStatus.Session?
-  @State private var selectedSubagent: SelectedSubagent?
   @State private var actionError: String?
   @State private var expandedProjectPaths: Set<String> = []
   /// HSplitView 在外层 NavigationSplitView 隐藏/显示后会重新计算分栏。
@@ -496,13 +489,6 @@ private struct SessionsDashboard: View {
       selectAvailableSession()
       expandSelectedProject()
     }
-    .sheet(item: $selectedSubagent) { selected in
-      SubagentTranscriptSheet(
-        daemon: daemon,
-        session: selected.session,
-        subagent: selected.subagent
-      )
-    }
     .alert("结束会话？", isPresented: Binding(
       get: { sessionToKill != nil },
       set: { if !$0 { sessionToKill = nil } }
@@ -535,11 +521,7 @@ private struct SessionsDashboard: View {
           daemon: daemon,
           session: selected,
           interrupt: { run(selected, action: .interrupt) },
-          kill: { sessionToKill = selected },
-          launchCLI: { newSessionForAgent(project.path, selected.agent) },
-          openSubagent: { child in
-            selectedSubagent = SelectedSubagent(session: selected, subagent: child)
-          }
+          kill: { sessionToKill = selected }
         )
         .id(selected.id)
       } else {

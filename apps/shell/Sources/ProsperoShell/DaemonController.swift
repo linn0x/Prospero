@@ -449,41 +449,6 @@ final class DaemonController {
     }
   }
 
-  /// 读取某个子 Agent 的独立事件流。接口只监听 loopback，并复用 daemon 每次启动
-  /// 生成的控制口令；Mac App 不需要实现手机端的 E2E 握手，也不会读到父会话内容。
-  func loadSubagentTranscript(
-    sessionID: String,
-    subagentID: String,
-    agentName: String
-  ) async throws -> SubagentTranscript {
-    guard let running, !running.controlToken.isEmpty else {
-      throw SubagentTranscriptFailure("daemon 尚未提供本机控制接口")
-    }
-    let encodedSession = sessionID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed)
-      ?? sessionID
-    let encodedSubagent = subagentID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed)
-      ?? subagentID
-    guard let url = URL(
-      string: "http://127.0.0.1:\(running.port)/_prospero/control/session/\(encodedSession)/subagent/\(encodedSubagent)/events"
-    ) else {
-      throw SubagentTranscriptFailure("无法构造子 Agent 事件地址")
-    }
-    var request = URLRequest(url: url)
-    request.httpMethod = "GET"
-    request.cachePolicy = .reloadIgnoringLocalCacheData
-    request.setValue("Bearer \(running.controlToken)", forHTTPHeaderField: "Authorization")
-    let (data, response) = try await URLSession.shared.data(for: request)
-    guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-      let message = String(decoding: data, as: UTF8.self)
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-      if (response as? HTTPURLResponse)?.statusCode == 404 {
-        throw SubagentTranscriptFailure("这个子 Agent 已不在当前会话中")
-      }
-      throw SubagentTranscriptFailure(message.isEmpty ? "daemon 拒绝读取子 Agent 过程" : message)
-    }
-    return try SubagentTranscript.decode(data, agentName: agentName)
-  }
-
   /// 人类在 Mac 上解开 Goal Gate；回环地址 + 每次启动生成的 token 与会话管理同级保护。
   func resolveGate(id: String, decision: String) async -> String? {
     guard let running, !running.controlToken.isEmpty else {
