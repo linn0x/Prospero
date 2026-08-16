@@ -155,11 +155,23 @@ function defaultAuthenticodeCheck(binaryPath: string): AuthenticodeResult {
   // interpolating it or relying on $args, so spaces and metacharacters cannot
   // alter the verification command.
   const binaryPathEnvironmentVariable = "PROSPERO_WINDOWS_NATIVE_AUTHENTICODE_PATH";
+  const diagnosticPathEnvironmentVariable = "PROSPERO_WINDOWS_SESSION_HOST_TEST_DIAGNOSTIC";
+  const diagnosticCommands = typeof process.env[diagnosticPathEnvironmentVariable] === "string"
+    ? [
+        `$diagnosticPath = [Environment]::GetEnvironmentVariable('${diagnosticPathEnvironmentVariable}', 'Process')`,
+        "function Write-ProsperoDiagnostic([string]$Stage) { if (-not [string]::IsNullOrWhiteSpace($diagnosticPath)) { [IO.File]::WriteAllText($diagnosticPath, ('{\"version\":1,\"stage\":\"' + $Stage + '\"}')) } }",
+        "Write-ProsperoDiagnostic 'powershell_started'",
+      ]
+    : [];
   const command = [
+    ...diagnosticCommands,
     "$securityModule = Join-Path $PSHOME 'Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1'",
     "Import-Module -Name $securityModule -ErrorAction Stop",
+    ...(diagnosticCommands.length > 0 ? ["Write-ProsperoDiagnostic 'powershell_module_imported'"] : []),
     `$binaryPath = [Environment]::GetEnvironmentVariable('${binaryPathEnvironmentVariable}', 'Process')`,
+    ...(diagnosticCommands.length > 0 ? ["Write-ProsperoDiagnostic 'powershell_signature_checking'"] : []),
     "$signature = Get-AuthenticodeSignature -LiteralPath $binaryPath",
+    ...(diagnosticCommands.length > 0 ? ["Write-ProsperoDiagnostic 'powershell_signature_checked'"] : []),
     "$thumbprint = if ($null -eq $signature.SignerCertificate) { '' } else { $signature.SignerCertificate.Thumbprint }",
     "[Console]::Out.Write($signature.Status.ToString() + '|' + $thumbprint)",
   ].join("; ");
@@ -178,6 +190,7 @@ function defaultAuthenticodeCheck(binaryPath: string): AuthenticodeResult {
         encoding: "utf8",
         windowsHide: true,
         env: childEnvironment,
+        stdio: ["ignore", "pipe", "pipe"],
       },
     );
     writeLoaderTestDiagnostic("authenticode_powershell_returned");
