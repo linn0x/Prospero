@@ -5,29 +5,80 @@ import SwiftUI
 struct ChatTimelineActions {
   var send: (String) -> Void = { _ in }
   var respondToPermission: (String, ChatPermissionReply) -> Void = { _, _ in }
-  var respondToQuestion: (String, [ChatQuestionAnswer]) -> Void = { _, _ in }
+  var respondToQuestion: (String, [ChatQuestionAnswer], Bool) -> Void = { _, _, _ in }
   var loadToolOutput: (String) -> Void = { _ in }
   var openSubagent: (String) -> Void = { _ in }
+  var isPending: (String) -> Bool = { _ in false }
 }
 
 struct ChatTimelineView: View {
   let timeline: ChatTimeline
   var actions = ChatTimelineActions()
   var showsComposer = true
-  @State private var draft = ""
+  @Binding var draft: String
+  var isSending = false
+  var sendEnabled = true
+  @State private var isAtBottom = true
+  @State private var showsLatestButton = false
 
   var body: some View {
     VStack(spacing: 0) {
-      ScrollView {
-        LazyVStack(alignment: .leading, spacing: 12) {
-          ForEach(timeline.presentationItems) { item in
-            switch item {
-            case .entry(let entry): ChatTimelineEntryView(entry: entry, actions: actions)
-            case .collapsedActivities(let group): ChatCollapsedActivityView(group: group, actions: actions)
+      ScrollViewReader { proxy in
+        ZStack(alignment: .bottomTrailing) {
+          ScrollView {
+            LazyVStack(alignment: .leading, spacing: 12) {
+              if timeline.entries.isEmpty {
+                ContentUnavailableView(
+                  "还没有对话内容",
+                  systemImage: "bubble.left.and.bubble.right",
+                  description: Text("发送一条消息即可开始与 Agent 协作。")
+                )
+                .frame(maxWidth: .infinity, minHeight: 260)
+              } else {
+                ForEach(timeline.presentationItems) { item in
+                  switch item {
+                  case .entry(let entry): ChatTimelineEntryView(entry: entry, actions: actions)
+                  case .collapsedActivities(let group): ChatCollapsedActivityView(group: group, actions: actions)
+                  }
+                }
+              }
+              Color.clear
+                .frame(height: 1)
+                .id("chat-bottom")
+                .onAppear { isAtBottom = true; showsLatestButton = false }
+                .onDisappear { isAtBottom = false }
             }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 16)
+            .frame(maxWidth: 960)
+            .frame(maxWidth: .infinity)
+          }
+          if showsLatestButton {
+            Button {
+              withAnimation(.easeOut(duration: 0.18)) {
+                proxy.scrollTo("chat-bottom", anchor: .bottom)
+              }
+              isAtBottom = true
+              showsLatestButton = false
+            } label: {
+              Label("查看最新", systemImage: "arrow.down")
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            .padding(16)
+            .shadow(color: .black.opacity(0.15), radius: 8, y: 3)
           }
         }
-        .padding()
+        .onChange(of: timeline.evSeq) { _, _ in
+          guard timeline.evSeq > 0 else { return }
+          if isAtBottom {
+            withAnimation(.easeOut(duration: 0.16)) {
+              proxy.scrollTo("chat-bottom", anchor: .bottom)
+            }
+          } else {
+            showsLatestButton = true
+          }
+        }
       }
       if showsComposer { composer }
     }
@@ -36,28 +87,47 @@ struct ChatTimelineView: View {
   }
 
   private var composer: some View {
-    HStack(alignment: .bottom, spacing: 10) {
-      TextField("发送消息", text: $draft, axis: .vertical)
-        .lineLimit(1...6)
-        .textFieldStyle(.roundedBorder)
-        .accessibilityLabel("发送给 Agent 的消息")
-        .onSubmit(sendDraft)
-      Button(action: sendDraft) {
-        Label("发送", systemImage: "arrow.up.circle.fill")
+    VStack(alignment: .leading, spacing: 8) {
+      HStack(spacing: 6) {
+        Image(systemName: "sparkles").foregroundStyle(.tint)
+        Text("发送给 Agent").font(.caption.weight(.semibold))
+        Text("⌘↵ 发送 · Return 换行")
+          .font(.caption2)
+          .foregroundStyle(.secondary)
+        Spacer()
+        if isSending { ProgressView().controlSize(.small) }
       }
-      .buttonStyle(.borderedProminent)
-      .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-      .accessibilityLabel("发送消息")
+      HStack(alignment: .bottom, spacing: 10) {
+        TextField("描述任务、补充上下文或继续追问…", text: $draft, axis: .vertical)
+        .lineLimit(1...6)
+        .textFieldStyle(.plain)
+        .padding(.horizontal, 11)
+        .padding(.vertical, 9)
+        .background(.quaternary.opacity(0.7), in: RoundedRectangle(cornerRadius: 10))
+        .accessibilityLabel("发送给 Agent 的消息")
+        .onKeyPress(.return, phases: .down) { press in
+          guard press.modifiers.contains(.command) else { return .ignored }
+          sendDraft()
+          return .handled
+        }
+        .disabled(!sendEnabled || isSending)
+        Button(action: sendDraft) {
+          Label("发送", systemImage: "arrow.up.circle.fill")
+        }
+        .buttonStyle(.borderedProminent)
+        .disabled(!sendEnabled || isSending || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        .accessibilityLabel("发送消息")
+      }
     }
-    .padding()
-    .background(.bar)
+    .padding(.horizontal, 18)
+    .padding(.vertical, 12)
+    .background(.bar.opacity(0.86))
   }
 
   private func sendDraft() {
     let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !text.isEmpty else { return }
+    guard !text.isEmpty, !isSending, sendEnabled else { return }
     actions.send(text)
-    draft = ""
   }
 }
 
@@ -150,7 +220,27 @@ private struct ChatToolView: View {
       VStack(alignment: .leading, spacing: 8) {
         if !tool.summary.isEmpty { Text(tool.summary).textSelection(.enabled) }
         if let diff = tool.diff { ChatDiffView(diff: diff) }
-        if tool.hasMore {
+        if let output = tool.fullOutput {
+          VStack(alignment: .leading, spacing: 4) {
+            Text("完整输出")
+              .font(.caption.weight(.semibold))
+              .foregroundStyle(.secondary)
+            Text(output)
+              .font(.caption.monospaced())
+              .textSelection(.enabled)
+              .frame(maxWidth: .infinity, alignment: .leading)
+              .padding(8)
+              .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+            if tool.outputTruncated {
+              Text("daemon 为保护工作台已截断过长输出。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+          }
+        } else if tool.hasMore, actions.isPending(tool.id) {
+          ProgressView("正在载入完整输出…")
+            .controlSize(.small)
+        } else if tool.hasMore {
           Button("拉取完整输出") { actions.loadToolOutput(String(tool.id.dropFirst("tool:".count))) }
             .accessibilityLabel("拉取 \(tool.title) 的完整输出")
         }
@@ -222,7 +312,9 @@ private struct ChatPermissionView: View {
           Button("允许一次") { actions.respondToPermission(requestID, .once) }.buttonStyle(.borderedProminent)
           Button("始终允许") { actions.respondToPermission(requestID, .always) }
           Button("拒绝", role: .destructive) { actions.respondToPermission(requestID, .reject) }
+          if actions.isPending(permission.id) { ProgressView().controlSize(.small) }
         }
+        .disabled(actions.isPending(permission.id))
         .accessibilityElement(children: .contain)
         .accessibilityLabel("审批操作")
       }
@@ -264,10 +356,16 @@ private struct ChatQuestionView: View {
       if prompt.questions.isEmpty { Text(resolvedText).font(.callout).foregroundStyle(.secondary) }
       ForEach(prompt.questions, id: \.id) { question in questionBody(question) }
       if case .pending = prompt.status {
-        Button("提交回答") { actions.respondToQuestion(requestID, answers) }
-          .buttonStyle(.borderedProminent)
-          .disabled(!hasAnswer)
-          .accessibilityLabel("提交问题回答")
+        HStack {
+          Button("提交回答") { actions.respondToQuestion(requestID, answers, false) }
+            .buttonStyle(.borderedProminent)
+            .disabled(!hasAnswer || actions.isPending(prompt.id))
+            .accessibilityLabel("提交问题回答")
+          Button("取消问题", role: .cancel) { actions.respondToQuestion(requestID, [], true) }
+            .disabled(actions.isPending(prompt.id))
+            .accessibilityLabel("取消问题")
+          if actions.isPending(prompt.id) { ProgressView().controlSize(.small) }
+        }
       } else if !resolvedText.isEmpty { Text(resolvedText).font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
     }
     .padding(12)

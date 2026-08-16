@@ -108,6 +108,16 @@ final class ChatTimelineTests: XCTestCase {
     XCTAssertThrowsError(try ChatPayloadDecoder.snapshot(from: malformedSnapshot))
   }
 
+  func testOnDemandToolOutputDecoratesTheExistingToolEntry() {
+    var timeline = ChatTimeline()
+    _ = timeline.apply(.init(evSeq: 1, body: .toolStart(.init(
+      msgID: "m", callID: "call", tool: "shell", summary: "pwd", diff: nil, agentID: nil
+    ))))
+    timeline.setToolOutput(callID: "call", output: "/workspace", truncated: false)
+    XCTAssertEqual(tool(id: "tool:call", in: timeline)?.fullOutput, "/workspace")
+    XCTAssertEqual(tool(id: "tool:call", in: timeline)?.outputTruncated, false)
+  }
+
   private func message(id: String, in timeline: ChatTimeline) -> ChatTimeline.Message? {
     guard let entry = timeline.entries.first(where: { $0.id == id }), case .message(let value) = entry else { return nil }; return value
   }

@@ -367,9 +367,7 @@ struct AgentAccountsDashboard: View {
           daemon: daemon,
           session: session,
           interrupt: { Task { _ = await daemon.controlSession(id: session.id, action: .interrupt) } },
-          kill: { Task { _ = await daemon.controlSession(id: session.id, action: .kill) } },
-          launchCLI: {},
-          openSubagent: { _ in }
+          kill: { Task { _ = await daemon.controlSession(id: session.id, action: .kill) } }
         )
         .frame(minWidth: 900, minHeight: 620)
       }
