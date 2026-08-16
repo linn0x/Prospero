@@ -207,10 +207,20 @@ extern "C" prospero_status prospero_detached_host_launch(
 
   STARTUPINFOW startup_info = {};
   startup_info.cb = sizeof(startup_info);
+  // A durable background owner must not retain the launcher's capture pipes,
+  // but it still needs to be able to create children with working stdio of
+  // their own (the Authenticode verifier does exactly that). DETACHED_PROCESS
+  // leaves console-process stream state unusable for that nested spawn on the
+  // hosted Windows runners. CREATE_NO_WINDOW preserves the no-console policy,
+  // while explicit NULL standard slots prevent parent stdio from crossing.
+  startup_info.dwFlags = STARTF_USESTDHANDLES;
+  startup_info.hStdInput = nullptr;
+  startup_info.hStdOutput = nullptr;
+  startup_info.hStdError = nullptr;
   PROCESS_INFORMATION process = {};
   DWORD creation_flags = CREATE_UNICODE_ENVIRONMENT |
       CREATE_NEW_PROCESS_GROUP |
-      DETACHED_PROCESS |
+      CREATE_NO_WINDOW |
       CREATE_SUSPENDED;
   if (breakaway_mode == ImmediateJobBreakawayMode::kExplicit) {
     creation_flags |= CREATE_BREAKAWAY_FROM_JOB;
