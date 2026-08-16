@@ -178,7 +178,12 @@ describe("Mac control structured session views", () => {
         agent: "custom",
         kind: "pty",
         cwd: home,
-        command: process.platform === "win32" ? "exit 0" : "exit 0",
+        // Keep the process stable across both view requests. An immediate
+        // exit can legitimately advance the PTY sequence between snapshots,
+        // turning the no-change probe into a racy 200 response on Windows.
+        command: process.platform === "win32"
+          ? "ping -n 31 127.0.0.1 >NUL"
+          : "sleep 30",
       });
       const ptyViewPath = `/_prospero/control/session/${pty.id}/view`;
       const ptyView = await request(`${ptyViewPath}?afterSeq=not-a-sequence`);

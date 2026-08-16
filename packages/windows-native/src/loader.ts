@@ -138,19 +138,23 @@ function defaultAuthenticodeCheck(binaryPath: string): AuthenticodeResult {
   } catch {
     return { status: "systemroot-unavailable", thumbprintSha1: null };
   }
-  if (powershellPath === null) {
-    return { status: "systemroot-unavailable", thumbprintSha1: null };
-  }
+  if (powershellPath === null) return { status: "systemroot-unavailable", thumbprintSha1: null };
   // Windows PowerShell treats every token following a string-valued -Command
   // as part of that command. Pass the path as child-process data instead of
   // interpolating it or relying on $args, so spaces and metacharacters cannot
   // alter the verification command.
   const binaryPathEnvironmentVariable = "PROSPERO_WINDOWS_NATIVE_AUTHENTICODE_PATH";
   const command = [
-    "$securityModule = Join-Path $PSHOME 'Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1'",
-    "Import-Module -Name $securityModule -ErrorAction Stop",
     `$binaryPath = [Environment]::GetEnvironmentVariable('${binaryPathEnvironmentVariable}', 'Process')`,
-    "$signature = Get-AuthenticodeSignature -LiteralPath $binaryPath",
+    // Get-AuthenticodeSignature is implemented by the inbox PowerShell core,
+    // but importing/autoloading Microsoft.PowerShell.Security can deadlock in
+    // a no-console detached owner. Invoke that same fail-closed verifier
+    // directly and tolerate framework builds that expose it non-publicly.
+    "$signatureHelper = [System.Management.Automation.PSObject].Assembly.GetType('System.Management.Automation.SignatureHelper', $true)",
+    "$getSignature = $null",
+    "foreach ($candidate in $signatureHelper.GetMethods([System.Reflection.BindingFlags]'Static, Public, NonPublic')) { if ($candidate.Name -eq 'GetSignature' -and $candidate.GetParameters().Length -eq 2) { $getSignature = $candidate; break } }",
+    "if ($null -eq $getSignature) { throw 'The inbox Authenticode verifier is unavailable' }",
+    "$signature = $getSignature.Invoke($null, [object[]]@($binaryPath, $null))",
     "$thumbprint = if ($null -eq $signature.SignerCertificate) { '' } else { $signature.SignerCertificate.Thumbprint }",
     "[Console]::Out.Write($signature.Status.ToString() + '|' + $thumbprint)",
   ].join("; ");
@@ -168,6 +172,7 @@ function defaultAuthenticodeCheck(binaryPath: string): AuthenticodeResult {
         encoding: "utf8",
         windowsHide: true,
         env: childEnvironment,
+        stdio: ["ignore", "pipe", "pipe"],
       },
     );
     if (result.error || result.status !== 0 || typeof result.stdout !== "string") {

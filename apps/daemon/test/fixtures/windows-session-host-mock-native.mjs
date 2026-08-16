@@ -62,9 +62,17 @@ const manifest = parseWindowsSessionHostManifest({
   updatedAt: 1,
 });
 
-const runner = new WindowsSessionHostRunner(manifest, native, {
+let runner;
+runner = new WindowsSessionHostRunner(manifest, native, {
   async handleCommand(context) {
     handlerCalls += 1;
+    if (context.method === "effect.emit") {
+      const emitted = await Promise.all([
+        runner.appendEvent({ emittedDuringCommand: context.commandId, index: 1 }),
+        runner.appendEvent({ emittedDuringCommand: context.commandId, index: 2 }),
+      ]);
+      return { ok: true, result: { eventSeqs: emitted.map((event) => event.seq), calls: handlerCalls } };
+    }
     if (context.method === "stop" || context.method === "structured.kill") {
       return {
         ok: true,
