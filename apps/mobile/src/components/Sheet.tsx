@@ -1,5 +1,6 @@
 import { Modal, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { Icon, type IconName } from "@/components/Icon";
 import { color, font, radius, space } from "@/lib/theme";
 
 /**
@@ -62,6 +63,41 @@ export function Row({ label, value }: { label: string; value: string }) {
   );
 }
 
+/** 底部面板里的明确动作；可带补充说明，避免只靠按钮名猜作用范围。 */
+export function SheetAction({
+  label,
+  detail,
+  symbol,
+  destructive = false,
+  onPress,
+}: {
+  label: string;
+  detail?: string;
+  symbol: IconName;
+  destructive?: boolean;
+  onPress: () => void;
+}) {
+  const tint = destructive ? color.danger : color.accent;
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={label}
+      accessibilityHint={detail}
+      style={({ pressed }) => [styles.sheetAction, pressed && styles.sheetActionPressed]}
+      onPress={onPress}
+    >
+      <View style={[styles.sheetActionIcon, { backgroundColor: destructive ? color.dangerBg : color.accentBg }]}>
+        <Icon name={symbol} size={18} color={tint} />
+      </View>
+      <View style={styles.sheetActionCopy}>
+        <Text style={[styles.sheetActionLabel, destructive && { color: tint }]}>{label}</Text>
+        {detail ? <Text style={styles.sheetActionDetail}>{detail}</Text> : null}
+      </View>
+      <Icon name="chevron.right" size={14} color={color.textFaint} />
+    </Pressable>
+  );
+}
+
 const styles = StyleSheet.create({
   backdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.55)" },
   sheet: {
@@ -103,4 +139,24 @@ const styles = StyleSheet.create({
     borderBottomColor: color.border,
   },
   rowValue: { fontVariant: ["tabular-nums"] },
+  sheetAction: {
+    minHeight: 58,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: space.md,
+    paddingVertical: space.sm,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: color.border,
+  },
+  sheetActionPressed: { backgroundColor: color.pressed },
+  sheetActionIcon: {
+    width: 36,
+    height: 36,
+    borderRadius: radius.sm,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  sheetActionCopy: { flex: 1, gap: 3 },
+  sheetActionLabel: { color: color.text, fontSize: 15, fontWeight: "600" },
+  sheetActionDetail: { ...font.meta, color: color.textDim, lineHeight: 16 },
 });

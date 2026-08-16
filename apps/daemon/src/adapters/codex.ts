@@ -58,6 +58,32 @@ function describeWindow(mins: number): string {
   return `${String(mins)} 分钟`;
 }
 
+function usageFromRateLimits(value: unknown): UsageReport | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const rateLimits = value as Record<string, unknown>;
+  const window = (candidate: unknown, fallbackLabel: string): UsageReport["windows"][number] | null => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return null;
+    const record = candidate as Record<string, unknown>;
+    if (typeof record["usedPercent"] !== "number") return null;
+    const mins = typeof record["windowDurationMins"] === "number"
+      ? record["windowDurationMins"]
+      : null;
+    return {
+      label: mins ? describeWindow(mins) : fallbackLabel,
+      utilization: record["usedPercent"],
+      ...(typeof record["resetsAt"] === "number"
+        ? { resetsAt: new Date(record["resetsAt"] * 1000).toISOString() }
+        : {}),
+    };
+  };
+  const windows = [
+    window(rateLimits["primary"], "主窗口"),
+    window(rateLimits["secondary"], "次窗口"),
+  ].filter((candidate): candidate is UsageReport["windows"][number] => candidate !== null);
+  const plan = typeof rateLimits["planType"] === "string" ? rateLimits["planType"] : null;
+  return windows.length > 0 || plan !== null ? { subscription: plan, windows } : null;
+}
+
 const START_TIMEOUT_MS = 30_000;
 
 function timestampMs(value: unknown): number | undefined {
@@ -236,6 +262,7 @@ export class CodexAdapter implements AgentAdapter {
       typeof this.opts.resumeState?.["threadId"] === "string"
         ? this.opts.resumeState["threadId"]
         : null;
+    const forkThread = this.opts.resumeState?.["forkThread"] === true;
     // 实测:threadId 在 result.thread.id,不是顶层 threadId(spec 类型名有误导)。
     // Codex 自己把 thread 落在 ~/.codex；Prospero 只需保存这个 ID。
     const initialPolicy = this.executionPolicy();
@@ -247,7 +274,13 @@ export class CodexAdapter implements AgentAdapter {
     };
     let started: { thread?: { id?: string }; threadId?: string };
     if (resumeThreadId) {
-      try {
+      if (forkThread) {
+        started = (await this.request("thread/fork", {
+          threadId: resumeThreadId,
+          ...baseParams,
+          deferGoalContinuation: true,
+        })) as typeof started;
+      } else try {
         started = (await this.request("thread/resume", {
           threadId: resumeThreadId,
           ...baseParams,
@@ -408,6 +441,26 @@ export class CodexAdapter implements AgentAdapter {
         });
       }
       return conversations.slice(0, limit);
+    } finally {
+      await adapter.dispose();
+    }
+  }
+
+  /** 不创建 thread，直接读取某个 Codex 账号当前的订阅限流窗口。 */
+  static async readAccountUsage(
+    environment?: Record<string, string>,
+    appServerArgs?: string[],
+  ): Promise<UsageReport | null> {
+    const adapter = new CodexAdapter();
+    try {
+      await adapter.startAppServer(os.homedir(), environment, appServerArgs);
+      const response = await adapter.request("account/rateLimits/read", {}) as {
+        rateLimits?: unknown;
+        rateLimitsByLimitId?: Record<string, unknown> | null;
+      };
+      return usageFromRateLimits(
+        response.rateLimitsByLimitId?.["codex"] ?? response.rateLimits,
+      );
     } finally {
       await adapter.dispose();
     }
