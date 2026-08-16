@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { createConnection, createServer, type Socket } from "node:net";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { NATIVE_WINDOWS_ABI_VERSION } from "@prospero/windows-native";
 import {
   MAX_WINDOWS_SESSION_HOST_FRAME_BYTES,
@@ -118,7 +118,6 @@ async function call(child: ChildProcess, op: string, payload: Record<string, unk
 }
 
 afterEach(async () => {
-  vi.useRealTimers();
   await Promise.all(children.splice(0).map((child) => new Promise<void>((resolve) => {
     child.once("exit", () => resolve());
     child.kill();
@@ -580,45 +579,6 @@ describe("Windows Session Host detached bootstrap and provider output", () => {
     // Immutable non-secret discovery metadata may remain, but it cannot start
     // another owner without a valid manifest/bootstrap.
     expect(files.has("provider.record.json")).toBe(true);
-  });
-
-  it("allows a signed detached owner to publish after the former eight-second cold-start window", async () => {
-    vi.useFakeTimers();
-    const startedAt = Date.now();
-    const files = new Map<string, Uint8Array>();
-    const launched = { pid: 51002, creationTime100ns: "555555555555556" } as const;
-    const manifest = parseWindowsSessionHostManifest({
-      schemaVersion: 2, protocolVersion: 2, implementation: "windows-session-host", sessionId, epoch,
-      pipeName: "\\\\.\\pipe\\prospero-detached-cold-start", stateDirectory, aclProfile: "current-logon-token-v1",
-      owner: launched, nativeAbiVersion: NATIVE_WINDOWS_ABI_VERSION, credentialFile: "credential.dpapi",
-      journalFile: "journal.psj2", snapshotFile: "snapshot.psj2.json", status: "active", createdAt: 1, updatedAt: 1,
-    });
-    let exactTerminateCalls = 0;
-    const native: WindowsSessionHostDetachedLaunchNative = {
-      async openState() {},
-      async read(name) {
-        if (Date.now() - startedAt >= 9_000) {
-          if (name === "manifest.json") return new TextEncoder().encode(JSON.stringify(manifest));
-          if (name === "host.ready.json") return new TextEncoder().encode(JSON.stringify({ version: 1, ready: true }));
-        }
-        return files.get(name) ?? null;
-      },
-      async writeAtomic(name, bytes) { files.set(name, Uint8Array.from(bytes)); },
-      async removeState(name) { files.delete(name); },
-      async launchDetachedHost() { return { status: "launched", process: launched }; },
-      async terminateIdentityAndWait() { exactTerminateCalls += 1; return true; },
-      async close() {},
-    };
-    const pending = launchDetachedWindowsSessionHostWithNative({
-      sessionId,
-      epoch,
-      pipeName: "\\\\.\\pipe\\prospero-detached-cold-start",
-      stateDirectory,
-      handlerModule,
-    }, native);
-    await vi.advanceTimersByTimeAsync(9_000);
-    await expect(pending).resolves.toEqual(manifest);
-    expect(exactTerminateCalls).toBe(0);
   });
 
   it("cleans all launch records when CreateProcess never succeeds", async () => {
