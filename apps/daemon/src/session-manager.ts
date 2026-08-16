@@ -54,6 +54,7 @@ import {
 } from "./windows-structured-session-client.js";
 import { ClaudeAdapter } from "./adapters/claude.js";
 import { CodexAdapter } from "./adapters/codex.js";
+import { DeepseekAdapter } from "./adapters/deepseek.js";
 import { GrokAdapter } from "./adapters/grok.js";
 import { OpencodeAdapter } from "./adapters/opencode.js";
 import type {
@@ -70,12 +71,20 @@ import {
 export type SessionErrorCode =
   | "shell_not_allowed"
   | "agent_unavailable"
+  | "conflict"
   | "session_not_found";
+
+export type SessionErrorReason = "conversation_active_writer";
+
+function isConversationActiveWriterError(error: unknown): boolean {
+  return error instanceof Error && /already has an active writer/i.test(error.message);
+}
 
 export class SessionError extends Error {
   constructor(
     message: string,
     public readonly code: SessionErrorCode,
+    public readonly reason?: SessionErrorReason,
   ) {
     super(message);
     this.name = "SessionError";
@@ -97,7 +106,7 @@ export interface CreateSessionInput {
   model?: string | undefined;
   effort?: string | undefined;
   /** Agent 原生本机会话 ID；只允许 Claude/Codex 结构化轨。 */
-  resume?: { id: string; title?: string | undefined } | undefined;
+  resume?: { id: string; title?: string | undefined; fork?: true | undefined } | undefined;
   cols: number;
   rows: number;
   /** 来自设备注册表:该设备是否允许 shell/custom(完整用户权限) */
@@ -123,6 +132,8 @@ function makeAdapter(agent: AgentKind, resumeState?: AdapterResumeState): AgentA
       return new ClaudeAdapter({ resumeState });
     case "codex":
       return new CodexAdapter({ resumeState });
+    case "deepseek":
+      return new DeepseekAdapter({ resumeState });
     case "grok":
       return new GrokAdapter({ resumeState });
     default:
@@ -145,7 +156,7 @@ interface PtyMeta {
 function parseStructuredState(value: unknown): StructuredSessionPersistentState | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const v = value as Record<string, unknown>;
-  const agents = new Set<AgentKind>(["claude", "codex", "opencode", "grok"]);
+  const agents = new Set<AgentKind>(["claude", "codex", "opencode", "grok", "deepseek"]);
   const policies = new Set<ApprovalPolicy>(["strict", "standard", "yolo"]);
   if (
     v["version"] !== 1 ||
@@ -792,7 +803,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     mode?: "default" | "plan",
     model?: string,
     effort?: string,
-    resume?: { id: string; title?: string | undefined },
+    resume?: { id: string; title?: string | undefined; fork?: true | undefined },
     account?: AccountBinding,
   ): Promise<SessionInfo> {
     const id = randomUUID();
@@ -802,6 +813,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       ...(effort ? { effort } : {}),
       ...(resume && agent === "claude" ? { sessionId: resume.id } : {}),
       ...(resume && agent === "codex" ? { threadId: resume.id } : {}),
+      ...(resume?.fork === true && agent === "codex" ? { forkThread: true } : {}),
     };
     const hasInitialAdapterState = Object.keys(initialAdapterState).length > 0;
     if (this.useWindowsStructuredHost && this.windowsStructuredRoot) {
@@ -824,6 +836,13 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
         this.emit("state", session.info());
         return session.info();
       } catch (error) {
+        if (isConversationActiveWriterError(error)) {
+          throw new SessionError(
+            "这条 Codex 对话正在被电脑端使用",
+            "conflict",
+            "conversation_active_writer",
+          );
+        }
         // Missing/invalid native prebuilds deliberately retain the historical
         // in-process path, but parent-Job and provider-Job failures are a
         // security boundary and must never be silently downgraded.
@@ -856,6 +875,13 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
         this.emit("state", session.info());
         return session.info();
       } catch (e) {
+        if (isConversationActiveWriterError(e)) {
+          throw new SessionError(
+            "这条 Codex 对话正在被电脑端使用",
+            "conflict",
+            "conversation_active_writer",
+          );
+        }
         throw new SessionError(
           `无法启动 ${agent} supervisor 会话:${e instanceof Error ? e.message : String(e)}`,
           "agent_unavailable",
@@ -879,6 +905,13 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       this.structuredSessions.delete(id);
       await session.dispose().catch(() => {});
       this.scheduleStructuredPersist();
+      if (isConversationActiveWriterError(e)) {
+        throw new SessionError(
+          "这条 Codex 对话正在被电脑端使用",
+          "conflict",
+          "conversation_active_writer",
+        );
+      }
       throw new SessionError(
         `无法启动 ${agent} 会话:${e instanceof Error ? e.message : String(e)}`,
         "agent_unavailable",

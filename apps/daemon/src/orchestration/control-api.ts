@@ -13,9 +13,11 @@ import {
 } from "./store.js";
 
 const AGENTS = new Set<AgentKind>([
-  "shell", "claude", "codex", "opencode", "grok", "trae", "custom",
+  "shell", "claude", "codex", "deepseek", "opencode", "grok", "trae", "custom",
 ]);
-const AUTOMATION_AGENTS = new Set<AgentKind>(["claude", "codex", "opencode", "grok", "trae"]);
+const AUTOMATION_AGENTS = new Set<AgentKind>([
+  "claude", "codex", "deepseek", "opencode", "grok", "trae",
+]);
 const SESSION_KINDS = new Set<SessionKind>(["pty", "structured"]);
 const POLICIES = new Set<ApprovalPolicy>(["strict", "standard", "yolo"]);
 type MailType = "note" | "ask" | "reply" | "report";

@@ -13,10 +13,17 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import type { FsEntry } from "@prospero/protocol";
 import { Icon } from "@/components/Icon";
+import { PromptDialog } from "@/components/PromptDialog";
 import type { HostConnection } from "@/lib/connection";
 import { color, font, radius, space } from "@/lib/theme";
 
 type Selection = { path: string; cwd: string };
+
+function initialWindowsLocation(cwd: string): { root: string; path: string } | null {
+  const match = /^([A-Za-z]:)[\\/](.*)$/.exec(cwd.trim());
+  if (!match) return null;
+  return { root: match[1]!.toUpperCase(), path: match[2]!.replace(/\\/g, "/") };
+}
 
 function humanSize(bytes: number): string {
   if (bytes < 1024) return `${String(bytes)} B`;
@@ -50,32 +57,38 @@ export function WorkspacePicker({
   visible,
   conn,
   initialPath,
+  initialCwd = "",
   onClose,
   onSelect,
 }: {
   visible: boolean;
   conn: HostConnection;
   initialPath: string;
+  initialCwd?: string;
   onClose: () => void;
   onSelect: (selection: Selection) => void;
 }) {
   const insets = useSafeAreaInsets();
   const requestId = useRef(0);
   const [path, setPath] = useState("");
+  const [root, setRoot] = useState("home");
   const [cwd, setCwd] = useState("");
   const [entries, setEntries] = useState<FsEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [createOpen, setCreateOpen] = useState(false);
+  const [createName, setCreateName] = useState("");
 
   const load = useCallback(
-    async (nextPath: string) => {
+    async (nextPath: string, nextRoot: string) => {
       const id = ++requestId.current;
       setLoading(true);
       setError(null);
       try {
-        const listing = await conn.workspaceList(nextPath);
+        const listing = await conn.workspaceList(nextPath, nextRoot);
         if (requestId.current !== id) return;
         setPath(listing.path);
+        setRoot(listing.root ?? nextRoot);
         setCwd(listing.cwd);
         setEntries(listing.entries);
       } catch (e) {
@@ -95,12 +108,15 @@ export function WorkspacePicker({
       requestId.current += 1;
       return;
     }
-    const timer = setTimeout(() => void load(initialPath), 0);
+    const initial = conn.supportsWorkspaceRoots
+      ? initialWindowsLocation(initialCwd) ?? { root: "computer", path: "" }
+      : { root: "home", path: initialPath };
+    const timer = setTimeout(() => void load(initial.path, initial.root), 0);
     return () => {
       clearTimeout(timer);
       requestId.current += 1;
     };
-  }, [visible, initialPath, load]);
+  }, [visible, initialPath, initialCwd, conn.supportsWorkspaceRoots, load]);
 
   const close = (): void => {
     requestId.current += 1;
@@ -108,13 +124,36 @@ export function WorkspacePicker({
   };
 
   const goUp = (): void => {
-    const parent = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
-    void load(parent);
+    if (path !== "") {
+      const parent = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+      void load(parent, root);
+      return;
+    }
+    if (root !== "home" && root !== "computer") void load("", "computer");
   };
 
   const openFolder = (entry: FsEntry): void => {
     if (entry.kind !== "dir") return;
-    void load(path === "" ? entry.name : `${path}/${entry.name}`);
+    if (root === "computer") {
+      void load("", entry.name);
+      return;
+    }
+    void load(path === "" ? entry.name : `${path}/${entry.name}`, root);
+  };
+
+  const createFolder = async (name: string): Promise<void> => {
+    if (root === "computer" || cwd === "") return;
+    setCreateOpen(false);
+    setCreateName("");
+    setLoading(true);
+    setError(null);
+    try {
+      await conn.workspaceMkdir(path, root, name.trim());
+      await load(path === "" ? name.trim() : `${path}/${name.trim()}`, root);
+    } catch (failure) {
+      setLoading(false);
+      setError(errorText(failure));
+    }
   };
 
   const choose = (): void => {
@@ -136,7 +175,18 @@ export function WorkspacePicker({
             <Text style={styles.headerAction}>取消</Text>
           </Pressable>
           <Text style={styles.title}>选择工作目录</Text>
-          <View style={styles.headerSide} />
+          <View style={[styles.headerSide, styles.headerRight]}>
+            {conn.supportsWorkspaceRoots && root !== "computer" && cwd !== "" && (
+              <Pressable
+                onPress={() => setCreateOpen(true)}
+                hitSlop={10}
+                accessibilityLabel="新建文件夹"
+                style={styles.headerIcon}
+              >
+                <Icon name="plus" size={18} color={color.accent} />
+              </Pressable>
+            )}
+          </View>
         </View>
 
         <View style={styles.locationCard}>
@@ -146,31 +196,35 @@ export function WorkspacePicker({
           <View style={styles.locationCopy}>
             <Text style={styles.locationLabel}>当前位置</Text>
             <Text style={styles.locationPath} numberOfLines={2}>
-              {path === "" ? "~" : `~/${path}`}
+              {root === "computer"
+                ? "此电脑"
+                : root === "home"
+                  ? (path === "" ? "~" : `~/${path}`)
+                  : `${root}\\${path.replace(/\//g, "\\")}`}
             </Text>
           </View>
           <Pressable
             style={({ pressed }) => [styles.navButton, pressed && styles.pressed]}
-            onPress={() => void load("")}
-            disabled={loading || path === ""}
-            accessibilityLabel="返回主目录"
+            onPress={() => void load("", conn.supportsWorkspaceRoots ? "computer" : "home")}
+            disabled={loading || (conn.supportsWorkspaceRoots ? root === "computer" : path === "")}
+            accessibilityLabel={conn.supportsWorkspaceRoots ? "返回此电脑" : "返回主目录"}
           >
             <Icon
               name="house.fill"
               size={17}
-              color={path === "" ? color.textFaint : color.textDim}
+              color={(conn.supportsWorkspaceRoots ? root === "computer" : path === "") ? color.textFaint : color.textDim}
             />
           </Pressable>
           <Pressable
             style={({ pressed }) => [styles.navButton, pressed && styles.pressed]}
             onPress={goUp}
-            disabled={loading || path === ""}
+            disabled={loading || (path === "" && (root === "home" || root === "computer"))}
             accessibilityLabel="上一级目录"
           >
             <Icon
               name="arrow.up"
               size={17}
-              color={path === "" ? color.textFaint : color.textDim}
+              color={path === "" && (root === "home" || root === "computer") ? color.textFaint : color.textDim}
             />
           </Pressable>
         </View>
@@ -184,7 +238,7 @@ export function WorkspacePicker({
             refreshControl={
               <RefreshControl
                 refreshing={loading}
-                onRefresh={() => void load(path)}
+                onRefresh={() => void load(path, root)}
                 tintColor={color.accent}
               />
             }
@@ -199,7 +253,7 @@ export function WorkspacePicker({
                 <View style={styles.emptyState}>
                   <Icon name="exclamationmark.triangle.fill" size={26} color={color.warn} />
                   <Text style={styles.errorText}>{error}</Text>
-                  <Pressable style={styles.retryButton} onPress={() => void load(path)}>
+                  <Pressable style={styles.retryButton} onPress={() => void load(path, root)}>
                     <Text style={styles.retryText}>重新加载</Text>
                   </Pressable>
                 </View>
@@ -248,16 +302,35 @@ export function WorkspacePicker({
           </Text>
           <Pressable
             onPress={choose}
-            disabled={loading || error !== null || cwd === ""}
+            disabled={loading || error !== null || cwd === "" || root === "computer"}
             style={({ pressed }) => [
               styles.chooseButton,
-              (loading || error !== null || cwd === "") && styles.chooseDisabled,
+              (loading || error !== null || cwd === "" || root === "computer") && styles.chooseDisabled,
               pressed && styles.choosePressed,
             ]}
           >
             <Text style={styles.chooseText}>选择当前文件夹</Text>
           </Pressable>
         </View>
+        <PromptDialog
+          visible={createOpen}
+          title="新建文件夹"
+          message={cwd}
+          value={createName}
+          confirmLabel="创建并进入"
+          onChangeText={setCreateName}
+          onCancel={() => { setCreateOpen(false); setCreateName(""); }}
+          onSubmit={createFolder}
+          validate={(value) => {
+            const trimmed = value.trim();
+            if (!trimmed) return "请输入文件夹名称";
+            if (trimmed === "." || trimmed === ".." || /[<>:"/\\|?*\0]/.test(trimmed)) {
+              return "文件夹名称包含 Windows 不允许的字符";
+            }
+            if (trimmed.length > 255) return "文件夹名称过长";
+            return null;
+          }}
+        />
       </View>
     </Modal>
   );
@@ -275,6 +348,8 @@ const styles = StyleSheet.create({
     borderBottomColor: color.border,
   },
   headerSide: { width: 64 },
+  headerRight: { alignItems: "flex-end" },
+  headerIcon: { width: 36, height: 36, alignItems: "center", justifyContent: "center" },
   headerAction: { color: color.accent, fontSize: 15 },
   title: { ...font.body, flex: 1, textAlign: "center", fontWeight: "700" },
   locationCard: {

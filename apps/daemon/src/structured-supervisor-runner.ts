@@ -20,6 +20,7 @@ import type {
 } from "@prospero/protocol";
 import { ClaudeAdapter } from "./adapters/claude.js";
 import { CodexAdapter } from "./adapters/codex.js";
+import { DeepseekAdapter } from "./adapters/deepseek.js";
 import { GrokAdapter } from "./adapters/grok.js";
 import { OpencodeAdapter } from "./adapters/opencode.js";
 import type { AdapterResumeState, AgentAdapter } from "./adapters/types.js";
@@ -210,6 +211,7 @@ function adapterFor(agent: AgentKind, state?: AdapterResumeState): AgentAdapter 
     case "opencode": return new OpencodeAdapter({ resumeState: state });
     case "claude": return new ClaudeAdapter({ resumeState: state });
     case "codex": return new CodexAdapter({ resumeState: state });
+    case "deepseek": return new DeepseekAdapter({ resumeState: state });
     case "grok": return new GrokAdapter({ resumeState: state });
     default: throw new Error(`agent ${agent} has no structured adapter`);
   }

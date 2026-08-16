@@ -492,6 +492,27 @@ describe("daemon 全链路", () => {
     expect(nested.entries).toContainEqual(
       expect.objectContaining({ name: "Demo", kind: "dir" }),
     );
+
+    c.send({ type: "workspace.list", root: "home", path: "Projects", mkdir: "CreatedOnPhone" });
+    const created = (await c.waitFor(
+      (m) => m.type === "workspace.listing" && m.path === "Projects" && m.root === "home",
+      "workspace mkdir listing",
+    )) as Extract<S2CMessage, { type: "workspace.listing" }>;
+    expect(created.entries).toContainEqual(
+      expect.objectContaining({ name: "CreatedOnPhone", kind: "dir" }),
+    );
+
+    if (process.platform === "win32") {
+      c.send({ type: "workspace.list", root: "computer", path: "" });
+      const computer = (await c.waitFor(
+        (m) => m.type === "workspace.listing" && m.root === "computer",
+        "workspace computer roots",
+      )) as Extract<S2CMessage, { type: "workspace.listing" }>;
+      expect(computer.cwd).toBe("");
+      expect(computer.entries).toContainEqual(
+        expect.objectContaining({ name: "C:", kind: "dir" }),
+      );
+    }
     c.close();
   }, 20000);
 
@@ -526,6 +547,7 @@ describe("daemon 全链路", () => {
       "hello.ok",
     )) as Extract<S2CMessage, { type: "hello.ok" }>;
     expect(hello.host.capabilities).toContain("agent.accounts.v1");
+    expect(hello.host.capabilities).toContain("agent.deepseek-harness.v1");
 
     c.send({ type: "agent.accounts.list", requestId: "accounts-list" });
     const initial = (await c.waitFor(
@@ -1020,13 +1042,14 @@ describe("daemon 全链路", () => {
     c.send({ type: "usage.get" });
     const r = await c.waitFor((m) => m.type === "usage.result", "usage.result");
     const u = r as Extract<S2CMessage, { type: "usage.result" }>;
-    // 一个结构化会话都没有时,答"没有可用数据"而不是报错关连接
-    expect(u.available).toBe(false);
+    // 不创建会话也要按账号返回来源；Codex 新版可直接读取账号级限流窗口，
+    // 旧 CLI 则保留 available=false 和明确原因。
     expect(u.sid).toBeUndefined();
-    expect(typeof u.reason).toBe("string");
-    // accounts 一定要在(哪怕是空数组):手机按它渲染订阅列表,
-    // 缺字段和"没有订阅"在 UI 上是两种东西
-    expect(u.accounts).toEqual([]);
+    expect(u.accounts?.map((account) => account.accountId)).toEqual(
+      expect.arrayContaining(["native-claude", "native-codex"]),
+    );
+    expect(u.accounts?.find((account) => account.accountId === "native-codex")?.source)
+      .toMatch(/subscription|api|unknown/);
     c.close();
   }, 20000);
 });

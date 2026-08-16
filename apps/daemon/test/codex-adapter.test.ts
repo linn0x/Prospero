@@ -10,6 +10,7 @@ import type { AgentEventBody, ApprovalPolicy } from "@prospero/protocol";
 import { CodexAdapter } from "../src/adapters/codex.js";
 import { StructuredSession } from "../src/structured-session.js";
 import { SessionManager } from "../src/session-manager.js";
+import type { AdapterContext } from "../src/adapters/types.js";
 
 function hasCodex(): boolean {
   try {
@@ -177,6 +178,103 @@ describeIf("Codex 结构化会话", () => {
     }
   }, 120_000);
 });
+
+  describe("Codex 本机任务接回", () => {
+    it("原任务已有 writer 时上抛冲突，不自动创建副本", async () => {
+      const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+      const adapter = new CodexAdapter({ resumeState: { threadId: "busy-thread" } });
+    const internals = adapter as unknown as {
+      startAppServer(): Promise<void>;
+      request(method: string, params: Record<string, unknown>): Promise<unknown>;
+    };
+    internals.startAppServer = async () => {};
+    internals.request = async (method, params) => {
+      calls.push({ method, params });
+      if (method === "thread/resume") {
+        throw new Error("codex thread/resume 失败: thread busy-thread already has an active writer");
+      }
+        if (method === "thread/list") return { data: [] };
+        throw new Error(`unexpected method ${method}`);
+    };
+
+    const context: AdapterContext = {
+        cwd,
+        approvalPolicy: () => "standard",
+        emit: () => {},
+        persistState: () => {},
+      };
+      await expect(adapter.start(context)).rejects.toThrow("already has an active writer");
+      expect(calls.map((call) => call.method)).toEqual(["thread/resume"]);
+    });
+
+    it("用户确认后直接 thread/fork 创建独立副本", async () => {
+      const persisted: Array<Record<string, unknown>> = [];
+      const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+      const adapter = new CodexAdapter({
+        resumeState: { threadId: "busy-thread", forkThread: true },
+      });
+      const internals = adapter as unknown as {
+        startAppServer(): Promise<void>;
+        request(method: string, params: Record<string, unknown>): Promise<unknown>;
+      };
+      internals.startAppServer = async () => {};
+      internals.request = async (method, params) => {
+        calls.push({ method, params });
+        if (method === "thread/fork") return { thread: { id: "forked-thread" } };
+        if (method === "thread/list") return { data: [] };
+        throw new Error(`unexpected method ${method}`);
+      };
+
+      await adapter.start({
+        cwd,
+        approvalPolicy: () => "standard",
+        emit: () => {},
+        persistState: (state) => persisted.push(state),
+      });
+
+      expect(calls[0]?.method).toBe("thread/fork");
+      expect(calls[0]?.params).toMatchObject({
+        threadId: "busy-thread",
+        cwd,
+      deferGoalContinuation: true,
+    });
+      expect(persisted.at(-1)?.["threadId"]).toBe("forked-thread");
+    });
+
+    it("SessionManager 将 active writer 映射为手机可识别的冲突", async () => {
+      const manager = new SessionManager({
+        adapterFactory: (_agent, state) => {
+          const adapter = new CodexAdapter({ resumeState: state });
+          const internals = adapter as unknown as {
+            startAppServer(): Promise<void>;
+            request(method: string): Promise<unknown>;
+          };
+          internals.startAppServer = async () => {};
+          internals.request = async (method) => {
+            if (method === "thread/resume") {
+              throw new Error("thread busy-thread already has an active writer");
+            }
+            throw new Error(`unexpected method ${method}`);
+          };
+          return adapter;
+        },
+      });
+
+      await expect(manager.create({
+        agent: "codex",
+        kind: "structured",
+        cwd,
+        resume: { id: "busy-thread" },
+        cols: 80,
+        rows: 24,
+        allowShell: false,
+      })).rejects.toMatchObject({
+        code: "conflict",
+        reason: "conversation_active_writer",
+      });
+      await manager.disposeAll();
+    });
+  });
 
 /** 不启动真实 Codex,直接把 app-server 请求喂给适配器。 */
 function approvalHarness(policy: () => ApprovalPolicy): {

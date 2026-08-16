@@ -48,7 +48,7 @@ import {
   type PickedImage,
   type PickerSource,
 } from "@/lib/attach";
-import { Meter, Row, Sheet } from "@/components/Sheet";
+import { Meter, Row, Sheet, SheetAction } from "@/components/Sheet";
 import { toast } from "@/components/Toast";
 import { color, font, MONOSPACE_FONT, statusColor, utilizationColor } from "@/lib/theme";
 import { matchCommands } from "@/lib/slash-commands";
@@ -356,6 +356,10 @@ export default function SessionScreen() {
   const [usageOpen, setUsageOpen] = useState(false);
   const [usageError, setUsageError] = useState<string | null>(null);
   const [controlsOpen, setControlsOpen] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [policyOpen, setPolicyOpen] = useState(false);
+  const [yoloConfirmOpen, setYoloConfirmOpen] = useState(false);
+  const [killConfirmOpen, setKillConfirmOpen] = useState(false);
   const [controlsLoading, setControlsLoading] = useState(false);
   const [controlError, setControlError] = useState<string | null>(null);
   const [models, setModels] = useState<AgentModel[]>([]);
@@ -899,17 +903,8 @@ export default function SessionScreen() {
 
   const confirmKill = (): void => {
     if (!conn || !sid) return;
-    Alert.alert("终止会话", "结束该会话进程?", [
-      { text: "取消", style: "cancel" },
-      {
-        text: "终止",
-        style: "destructive",
-        onPress: () => {
-          conn.kill(sid);
-          returnToHost();
-        },
-      },
-    ]);
+    setMenuOpen(false);
+    setKillConfirmOpen(true);
   };
 
   if (!conn || !sid || !session) {
@@ -954,82 +949,13 @@ export default function SessionScreen() {
   };
 
   const choosePolicy = (): void => {
-    Alert.alert(
-      "审批策略",
-      "决定哪些操作需要你点头。",
-      [
-        {
-          text: "逐条批准(最安全)",
-          onPress: () => conn.setApprovalPolicy(sid, "strict"),
-        },
-        {
-          text: "半自动:只读放行",
-          onPress: () => conn.setApprovalPolicy(sid, "standard"),
-        },
-        {
-          // YOLO 要单独再确认一次。它允许 agent 无提示地改文件、跑命令,
-          // 一次误点的代价远大于多点一次的成本。
-          text: "YOLO:全部自动批准",
-          style: "destructive",
-          onPress: () => {
-            Alert.alert(
-              "确认开启 YOLO?",
-              "这个会话里，agent 改文件、执行命令、联网都不再询问你；Codex 沙箱也会切到完整访问。操作仍会记录在聊天里。",
-              [
-                { text: "取消", style: "cancel" },
-                {
-                  text: "我明白,开启",
-                  style: "destructive",
-                  onPress: () => conn.setApprovalPolicy(sid, "yolo"),
-                },
-              ],
-            );
-          },
-        },
-        { text: "取消", style: "cancel" },
-      ],
-    );
+    setMenuOpen(false);
+    setPolicyOpen(true);
   };
 
-  /** 低频与危险操作保留在系统菜单里,当前策略直接写在菜单项上。 */
+  /** 低频操作放进可点背景关闭的应用内面板。 */
   const openMenu = (): void => {
-    const items: { text: string; style?: "destructive" | "cancel"; onPress?: () => void }[] = [];
-    if (isStructured) {
-      if (session.agentControls && !isSubagent) {
-        items.push({ text: "模型与 Plan 模式", onPress: openControls });
-      }
-      items.push({
-        text: tightest
-          ? `用量与限流(${tightest.label} ${String(Math.round(tightest.utilization))}%)`
-          : "用量与限流",
-        onPress: showUsage,
-      });
-      items.push({
-        text: `审批策略:${policyLabel[policy]}`,
-        onPress: choosePolicy,
-      });
-    }
-    items.push({
-      text: "查看项目改动",
-      onPress: () => router.push(`/host/${hostId}/git/${sid}`),
-    });
-    items.push({
-      text: "浏览项目文件",
-      onPress: () => router.push(`/host/${hostId}/files/${sid}`),
-    });
-    items.push({
-      text: "归档会话（保持运行）",
-      onPress: () => {
-        void setSessionArchived(hostId, sid, true)
-          .then(returnToHost)
-          .catch((error: unknown) => {
-            Alert.alert("归档失败", error instanceof Error ? error.message : String(error));
-          });
-      },
-    });
-    items.push({ text: "结束会话", style: "destructive", onPress: confirmKill });
-    items.push({ text: "取消", style: "cancel" });
-    Alert.alert(session?.title ?? "会话", undefined, items);
+    setMenuOpen(true);
   };
 
   // 输入以 / 开头时给命令候选；@/$ 候选由 daemon 按当前项目生成。
@@ -1510,6 +1436,150 @@ export default function SessionScreen() {
           ))}
         </ScrollView>
       )}
+
+      <Sheet visible={menuOpen} title={session.title || "会话"} onClose={() => setMenuOpen(false)}>
+        {isStructured && session.agentControls && !isSubagent ? (
+          <SheetAction
+            label="模型与 Plan 模式"
+            detail="切换当前会话的模型、推理强度和工作模式"
+            symbol="command"
+            onPress={() => {
+              setMenuOpen(false);
+              openControls();
+            }}
+          />
+        ) : null}
+        {isStructured ? (
+          <>
+            <SheetAction
+              label={tightest
+                ? `用量与限流 · ${tightest.label} ${String(Math.round(tightest.utilization))}%`
+                : "用量与限流"}
+              detail="查看套餐窗口、剩余额度和重置时间"
+              symbol="arrow.clockwise"
+              onPress={() => {
+                setMenuOpen(false);
+                showUsage();
+              }}
+            />
+            <SheetAction
+              label={`审批策略 · ${policyLabel[policy]}`}
+              detail="决定哪些操作需要你确认"
+              symbol="checkmark.circle.fill"
+              onPress={choosePolicy}
+            />
+          </>
+        ) : null}
+        <SheetAction
+          label="查看项目改动"
+          detail="检查当前项目的 Git 变更"
+          symbol="doc.on.doc"
+          onPress={() => {
+            setMenuOpen(false);
+            router.push(`/host/${hostId}/git/${sid}`);
+          }}
+        />
+        <SheetAction
+          label="浏览项目文件"
+          detail="打开当前会话的工作目录"
+          symbol="folder.fill"
+          onPress={() => {
+            setMenuOpen(false);
+            router.push(`/host/${hostId}/files/${sid}`);
+          }}
+        />
+        <SheetAction
+          label="归档会话"
+          detail="仅从手机当前列表移入归档，电脑端保持运行"
+          symbol="archivebox"
+          onPress={() => {
+            setMenuOpen(false);
+            void setSessionArchived(hostId, sid, true)
+              .then(returnToHost)
+              .catch((error: unknown) => {
+                toast(error instanceof Error ? error.message : String(error));
+              });
+          }}
+        />
+        <SheetAction
+          label="结束会话"
+          detail="终止电脑端会话进程"
+          symbol="trash"
+          destructive
+          onPress={confirmKill}
+        />
+      </Sheet>
+
+      <Sheet visible={policyOpen} title="审批策略" onClose={() => setPolicyOpen(false)}>
+        <Text style={styles.sheetNote}>决定哪些操作需要你点头。</Text>
+        <SheetAction
+          label="逐条批准"
+          detail="文件修改、命令和联网操作均请求确认"
+          symbol="checkmark.circle.fill"
+          onPress={() => {
+            conn.setApprovalPolicy(sid, "strict");
+            setPolicyOpen(false);
+          }}
+        />
+        <SheetAction
+          label="半自动"
+          detail="只读操作自动放行，其余操作请求确认"
+          symbol="command"
+          onPress={() => {
+            conn.setApprovalPolicy(sid, "standard");
+            setPolicyOpen(false);
+          }}
+        />
+        <SheetAction
+          label="YOLO"
+          detail="全部操作自动批准"
+          symbol="exclamationmark.triangle.fill"
+          destructive
+          onPress={() => {
+            setPolicyOpen(false);
+            setYoloConfirmOpen(true);
+          }}
+        />
+      </Sheet>
+
+      <Sheet
+        visible={yoloConfirmOpen}
+        title="确认开启 YOLO"
+        onClose={() => setYoloConfirmOpen(false)}
+      >
+        <Text style={styles.sheetNote}>
+          Agent 修改文件、执行命令和联网都不再询问；Codex 沙箱也会切到完整访问。操作仍会记录在聊天里。
+        </Text>
+        <SheetAction
+          label="我明白，开启 YOLO"
+          detail="立即应用到当前会话"
+          symbol="exclamationmark.triangle.fill"
+          destructive
+          onPress={() => {
+            conn.setApprovalPolicy(sid, "yolo");
+            setYoloConfirmOpen(false);
+          }}
+        />
+      </Sheet>
+
+      <Sheet
+        visible={killConfirmOpen}
+        title="结束会话"
+        onClose={() => setKillConfirmOpen(false)}
+      >
+        <Text style={styles.sheetNote}>电脑端会话进程会被终止，未完成的工作可能丢失。</Text>
+        <SheetAction
+          label="结束电脑端会话"
+          detail="此操作无法撤销"
+          symbol="trash"
+          destructive
+          onPress={() => {
+            setKillConfirmOpen(false);
+            conn.kill(sid);
+            returnToHost();
+          }}
+        />
+      </Sheet>
 
       <Sheet visible={controlsOpen} title="Agent 设置" onClose={() => setControlsOpen(false)}>
         {controlError && <Text style={styles.controlError}>{controlError}</Text>}

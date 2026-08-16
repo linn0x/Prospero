@@ -46,7 +46,9 @@ import {
 } from "@/lib/worktree-assets";
 import { color, font, radius, space, statusColor } from "@/lib/theme";
 
-const WORKER_AGENTS: AgentKind[] = ["claude", "codex", "opencode", "grok", "trae"];
+const WORKER_AGENTS: AgentKind[] = [
+  "claude", "codex", "deepseek", "opencode", "grok", "trae",
+];
 const POLICIES: ApprovalPolicy[] = ["strict", "standard", "yolo"];
 
 type Editor =
@@ -194,6 +196,14 @@ export default function OrchestrationScreen() {
   const adaptiveLayout = useAdaptiveLayout();
   const contentPaneWidth = primaryPaneWidth(adaptiveLayout.width, adaptiveLayout.verticalPanes);
   const snapshot = useOrchestrationSnapshot(conn, runtime.status, 5_000, setBanner);
+  const supportsDeepseekHarness =
+    runtime.status === "connected" && conn?.supportsDeepseekHarness === true;
+  const availableWorkerAgents = useMemo(
+    () => WORKER_AGENTS.filter(
+      (candidate) => candidate !== "deepseek" || supportsDeepseekHarness,
+    ),
+    [supportsDeepseekHarness],
+  );
 
   useFocusEffect(
     useCallback(() => {
@@ -1505,7 +1515,7 @@ export default function OrchestrationScreen() {
                 <View style={styles.fieldGroup}>
                   <Text style={styles.fieldLabel}>默认 Agent</Text>
                   <View style={styles.wrapRow}>
-                    {WORKER_AGENTS.map((agent) => (
+                    {availableWorkerAgents.map((agent) => (
                       <Pressable
                         key={agent}
                         style={[styles.choice, automationAgent === agent && styles.choiceActive]}
@@ -1606,7 +1616,7 @@ export default function OrchestrationScreen() {
                 <View style={styles.fieldGroup}>
                   <Text style={styles.fieldLabel}>Agent</Text>
                   <View style={styles.wrapRow}>
-                    {WORKER_AGENTS.map((agent) => (
+                    {availableWorkerAgents.map((agent) => (
                       <Pressable
                         key={agent}
                         style={[styles.choice, workerAgent === agent && styles.choiceActive]}
@@ -1818,6 +1828,7 @@ export default function OrchestrationScreen() {
           visible={pickerOpen}
           conn={conn}
           initialPath={workspacePath}
+          initialCwd={editor?.kind === "automation" ? automationCwd : workerCwd}
           onClose={() => setPickerOpen(false)}
           onSelect={(selection) => {
             setWorkspacePath(selection.path);

@@ -17,6 +17,7 @@ import type {
 } from "@prospero/protocol";
 import { ClaudeAdapter } from "./adapters/claude.js";
 import { CodexAdapter } from "./adapters/codex.js";
+import { DeepseekAdapter } from "./adapters/deepseek.js";
 import { GrokAdapter } from "./adapters/grok.js";
 import { OpencodeAdapter } from "./adapters/opencode.js";
 import type { AdapterResumeState, AgentAdapter } from "./adapters/types.js";
@@ -76,7 +77,7 @@ function bootstrap(value: unknown): WindowsStructuredHostBootstrap {
     throw new Error("invalid Windows structured Session Host bootstrap");
   }
   const agent = value["agent"] as AgentKind;
-  if (agent !== "claude" && agent !== "codex" && agent !== "opencode" && agent !== "grok") {
+  if (agent !== "claude" && agent !== "codex" && agent !== "opencode" && agent !== "grok" && agent !== "deepseek") {
     throw new Error("Windows structured Session Host adapter is unavailable");
   }
   if (!Object.values(value["environment"]).every((entry) => typeof entry === "string") ||
@@ -91,6 +92,7 @@ function adapterFor(agent: AgentKind, state?: AdapterResumeState): AgentAdapter 
   switch (agent) {
     case "claude": return new ClaudeAdapter({ resumeState: state });
     case "codex": return new CodexAdapter({ resumeState: state });
+    case "deepseek": return new DeepseekAdapter({ resumeState: state });
     case "opencode": return new OpencodeAdapter({ resumeState: state });
     case "grok": return new GrokAdapter({ resumeState: state });
     default: throw new Error("Windows structured Session Host adapter is unavailable");

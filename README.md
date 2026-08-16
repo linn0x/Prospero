@@ -13,7 +13,7 @@ Prospero 把你的 iPhone 或 Android 手机变成 Mac 或 Windows 电脑上**�
 继续在电脑上运行，完整使用已有仓库、工具链、账号与登录状态；你可以在手机上随时查看进度、
 回复问题、处理审批、追加指令或直接接管任务。
 
-无论是 Claude Code、Codex、OpenCode、Grok、Trae，还是任意 Agent CLI，都能进入同一个移动端
+无论是 Claude Code、Codex、DeepSeek Harness、OpenCode、Grok、Trae，还是任意 Agent CLI，都能进入同一个移动端
 控制界面。Prospero 深度理解已适配 Agent 的消息与工具；面对其他 Agent，则用完整 PTY/TUI
 保留终端能力。
 
@@ -25,7 +25,7 @@ Prospero 把你的 iPhone 或 Android 手机变成 Mac 或 Windows 电脑上**�
 
 | | 产品能力 |
 | --- | --- |
-| 📱 | **所有 Agent，一个移动入口** — 从手机创建、恢复、切换和停止 Claude Code、Codex、OpenCode、Grok、Trae、Shell 及自定义 CLI 会话 |
+| 📱 | **所有 Agent，一个移动入口** — 从手机创建、恢复、切换和停止 Claude Code、Codex、DeepSeek Harness、OpenCode、Grok、Trae、Shell 及自定义 CLI 会话 |
 | 👀 | **进度不再锁在电脑屏幕里** — 随时查看消息、推理、工具调用、diff、子 Agent 和实时终端输出 |
 | ✅ | **关键时刻直接处理** — 在手机上回答 Agent 提问、批准或拒绝操作、追加指令、切换模型与模式，必要时立即停止任务 |
 | ⌨️ | **结构化体验，终端能力不丢失** — 已适配 Agent 使用原生交互；任意 CLI 都能通过完整 PTY/TUI 操控 |
@@ -74,10 +74,10 @@ Windows 11 是受支持的 daemon 平台，不只是可以打开仓库或连接�
 | 能力 | Windows 11 状态 |
 | --- | --- |
 | daemon、扫码配对、LAN / WireGuard / relay | ✅ 支持；relay 仍只转发 E2E 密文 |
-| Shell 与 Agent CLI | ✅ 支持 PowerShell/cmd，以及 Claude Code、Codex、OpenCode、Grok、Trae 和自定义 CLI |
-| 结构化聊天 | ✅ Claude Code、Codex、OpenCode、Grok 可用；其余 Agent 使用完整 PTY/TUI |
+| Shell 与 Agent CLI | ✅ 支持 PowerShell/cmd，以及 Claude Code、Codex、DeepSeek Harness、OpenCode、Grok、Trae 和自定义 CLI |
+| 结构化聊天 | ✅ Claude Code、Codex、DeepSeek Harness、OpenCode、Grok 可用；其余 Agent 使用完整 PTY/TUI |
 | DAG / Goal / Gate / worker 编排 | ✅ 支持手工与自动编排；使用 worktree 时需安装 Git for Windows |
-| daemon 重启时保活 Agent | ✅ PTY 与 Claude Code / Codex / OpenCode / Grok structured 会话使用每会话 Windows Session Host；daemon 只重连已验证的 owner，不重复启动 agent |
+| daemon 重启时保活 Agent | ✅ PTY 与 Claude Code / Codex / DeepSeek Harness / OpenCode / Grok structured 会话使用每会话 Windows Session Host；daemon 只重连已验证的 owner，不重复启动 agent |
 | 原生分发与 CI | ✅ x64、arm64 都有预编译 N-API 路径；PR 验证原生 ABI/加载拒绝 unsigned artifact，`v*` release 再签名、校验并在两种架构加载 signed artifact |
 
 在 Windows 上，Session Host 而非 daemon 持有 ConPTY、structured adapter、Job Object 和 append-only journal。正常退出或强制结束
@@ -109,6 +109,17 @@ npm ci
 npm run build -w @prospero/daemon
 node apps/daemon/dist/cli.js start --name my-computer
 ```
+
+使用 DeepSeek Harness 前，在运行 daemon 的同一 Node.js 环境安装官方 CLI。Prospero 会启动仅监听
+`127.0.0.1` 随机端口的 `dsh web` host，并通过官方 RPC/SSE 接入多轮会话、工具审批、问题和模型目录：
+
+```bash
+npm install -g @deepseek-ai/dsh
+dsh web
+```
+
+首次运行 `dsh web` 时在 **Settings → Models** 配置 DeepSeek API Key，并选择工作区。Windows 上若使用
+nvm 切换 Node.js，需在新版本下重新安装 `dsh`，然后重启 Prospero daemon，让它继承新的 `PATH`。
 
 Windows 的 signed release 包会携带 x64 与 arm64 N-API prebuild；loader 在创建 Session Host 前验证签名、hash、ABI 和能力集。
 直接从源码 checkout 执行 `npm ci`/本机 native build 不会把 unsigned 开发 addon 变成 production artifact，因此会走明确的

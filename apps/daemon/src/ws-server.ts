@@ -4,7 +4,7 @@
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { readFileSync, realpathSync, watch } from "node:fs";
+import { existsSync, readFileSync, realpathSync, watch } from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
@@ -13,6 +13,7 @@ import { WebSocketServer, WebSocket, type RawData } from "ws";
 import {
   CAPABILITY_AGENT_ACCOUNTS,
   CAPABILITY_AGENT_API_PROFILES,
+  CAPABILITY_AGENT_DEEPSEEK_HARNESS,
   CAPABILITY_CHAT_ATTACHMENT_PREVIEWS,
   CAPABILITY_ORCHESTRATION_AUTOMATION,
   CAPABILITY_ORCHESTRATION_GRAPH,
@@ -24,6 +25,7 @@ import {
   CAPABILITY_ORCHESTRATION_WORKTREES,
   CAPABILITY_SESSION_CREATE_MODEL,
   CAPABILITY_SUBAGENT_HISTORY,
+  CAPABILITY_WORKSPACE_ROOTS,
   MIN_PROTOCOL_VERSION,
   PROTOCOL_VERSION,
   ProtocolError,
@@ -44,6 +46,7 @@ import {
   type SessionInfo,
   type UsageAccount,
   type ResumableConversation,
+  type FsEntry,
 } from "@prospero/protocol";
 import { availableMemory, osIdentity } from "./host-stats.js";
 import {
@@ -89,11 +92,33 @@ import type { RemoteWindowsPtySession } from "./windows-pty-session.js";
 import { searchLocalConversations } from "./local-conversations.js";
 import { DAEMON_VERSION } from "./version.js";
 import { AgentAccountError, AgentAccountManager } from "./agent-accounts.js";
+import { CodexAdapter } from "./adapters/codex.js";
 
 const HIGH_WATER = 512 * 1024; // 超过则暂停向该客户端流式发送
 const LOW_WATER = 64 * 1024; //   低于则通过 ring/快照追平
 const CATCHUP_MS = 250;
 const PING_MS = 15_000;
+
+function windowsWorkspaceDrives(): FsEntry[] {
+  if (process.platform !== "win32") return [];
+  const entries: FsEntry[] = [];
+  for (let code = 65; code <= 90; code += 1) {
+    const name = `${String.fromCharCode(code)}:`;
+    if (existsSync(`${name}\\`)) entries.push({ name, kind: "dir", size: 0, mtime: 0 });
+  }
+  return entries;
+}
+
+function workspaceRootFor(rootId: string | undefined, fallback: string): string | null {
+  if (rootId === undefined || rootId === "home") return fallback;
+  if (rootId === "computer") return null;
+  if (process.platform !== "win32" || !/^[A-Za-z]:$/.test(rootId)) {
+    throw new FsError("workspace root is not available", "denied");
+  }
+  const root = `${rootId.toUpperCase()}\\`;
+  if (!existsSync(root)) throw new FsError("drive is not available", "not_found");
+  return root;
+}
 const MANUAL_ORCHESTRATION_METHODS = new Set([
   "run.create",
   "run.complete",
@@ -507,6 +532,7 @@ export async function createDaemonServer(
 
   function orchestrationCapabilities(conn: Conn): string[] {
     const capabilities: string[] = [];
+    capabilities.push(CAPABILITY_AGENT_DEEPSEEK_HARNESS);
     if (conn.protocolVersion >= 11) {
       capabilities.push(CAPABILITY_CHAT_ATTACHMENT_PREVIEWS);
       capabilities.push(CAPABILITY_SESSION_CREATE_MODEL);
@@ -517,6 +543,7 @@ export async function createDaemonServer(
     if (conn.protocolVersion >= 12 && conn.device?.allowShell) {
       capabilities.push(CAPABILITY_AGENT_API_PROFILES);
     }
+    if (process.platform === "win32") capabilities.push(CAPABILITY_WORKSPACE_ROOTS);
     if (conn.protocolVersion >= 9) capabilities.push(CAPABILITY_SUBAGENT_HISTORY);
     if (conn.protocolVersion >= 7) capabilities.push(CAPABILITY_ORCHESTRATION_SNAPSHOT);
     if (
@@ -893,16 +920,33 @@ export async function createDaemonServer(
         if (conn.protocolVersion >= 13) send(conn, { type: "connection.pong", id: msg.id });
         return;
       case "workspace.list": {
-        // 新建会话前还没有 sid,所以浏览根固定为当前 macOS 用户的 home。
-        // listDir 会 realpath 并阻止符号链接逃逸;响应里只回这一级的预览。
-        const root = workspaceRoot;
-        const cwd = path.join(root, msg.path);
+        // 新建会话前还没有 sid。旧客户端仍以用户 home 为根；协商了新能力的
+        // Windows 客户端可先看“此电脑”，再选择一个明确的盘符作为安全根。
+        const requestedRoot = msg.root ?? "home";
+        let cwd = "";
         try {
+          const root = workspaceRootFor(requestedRoot, workspaceRoot);
+          if (root === null) {
+            send(conn, {
+              type: "workspace.listing",
+              root: "computer",
+              path: "",
+              cwd: "",
+              entries: windowsWorkspaceDrives(),
+            });
+            return;
+          }
+          cwd = path.join(root, msg.path);
+          if (msg.mkdir) {
+            const target = msg.path === "" ? msg.mkdir : `${msg.path}/${msg.mkdir}`;
+            await makeDir(root, target);
+          }
           const entries = await listDir(root, msg.path);
-          send(conn, { type: "workspace.listing", path: msg.path, cwd, entries });
+          send(conn, { type: "workspace.listing", root: requestedRoot, path: msg.path, cwd, entries });
         } catch (e) {
           send(conn, {
             type: "workspace.listing",
+            root: requestedRoot,
             path: msg.path,
             cwd,
             entries: [],
@@ -1324,30 +1368,52 @@ export async function createDaemonServer(
         // 随便挑一个会话只能答出其中一家的额度,另外几家的订阅就看不见了。
         if (msg.sid === undefined) {
           const sessions = manager.structuredPerAgent();
-          if (sessions.length === 0) {
-            send(conn, {
-              type: "usage.result",
-              available: false,
-              reason: "还没有对话型会话 —— 用量要有会话才问得到。",
-              accounts: [],
-            });
-            return;
-          }
-          const accounts = await Promise.all(
-            sessions.map(async (s): Promise<UsageAccount> => {
-              const r = await s.usage();
+          const accountSnapshot = await accounts.snapshot(manager.list());
+          const usageAccounts = await Promise.all(
+            accountSnapshot.map(async (accountMeta): Promise<UsageAccount> => {
+              const s = sessions.find((candidate) =>
+                candidate.accountId === accountMeta.id ||
+                (candidate.accountId === undefined && !accountMeta.managed && candidate.agent === accountMeta.agent),
+              );
+              const account = accounts.resolve(accountMeta.id, accountMeta.agent);
+              let r = s ? await s.usage() : null;
+              // Codex 的限流是账号级 RPC，不需要先创建 thread。这样账号管理页
+              // 第一次打开就能显示额度，也不会为了查额度消耗一次对话。
+              if (!account.apiProfile && account.agent === "codex" && (!r || r.windows.length === 0)) {
+                try {
+                  r = await CodexAdapter.readAccountUsage(
+                    account.environment,
+                    account.codexAppServerArgs,
+                  ) ?? r;
+                } catch {
+                  // 兼容尚未实现 account/rateLimits/read 的旧 Codex CLI；若已有会话
+                  // 快照仍可继续显示，没有则在该账号卡片上给出明确的暂无数据。
+                }
+              }
+              const source: UsageAccount["source"] =
+                account.apiProfile || /api/i.test(accountMeta.authMethod ?? "")
+                  ? "api"
+                  : r?.subscription || accountMeta.status === "signed_in"
+                    ? "subscription"
+                    : "unknown";
               if (!r) {
                 return {
-                  agent: s.agent,
-                  available: false,
+                  agent: accountMeta.agent,
+                  accountId: accountMeta.id,
+                  accountName: accountMeta.name,
+                  source,
+                  available: source === "api",
                   windows: [],
-                  reason: "还没产生用量 —— 发一条消息后再看。",
+                  reason: source === "api"
+                    ? "API 模型由服务商按 API 用量计费，不提供 ChatGPT 订阅窗口。"
+                    : "暂时读不到账号额度，请确认 Codex CLI 已登录并刷新。",
                 };
               }
               return {
-                agent: s.agent,
-                ...(s.accountId ? { accountId: s.accountId } : {}),
-                ...(s.accountName ? { accountName: s.accountName } : {}),
+                agent: accountMeta.agent,
+                accountId: accountMeta.id,
+                accountName: accountMeta.name,
+                source,
                 available: true,
                 subscription: r.subscription ?? null,
                 ...(r.costUsd !== undefined ? { costUsd: r.costUsd } : {}),
@@ -1362,23 +1428,23 @@ export async function createDaemonServer(
           );
           // 顶层字段挑压力最大的那家:老客户端只认这几个字段,给它最该看见的一份
           const lead =
-            [...accounts]
+            [...usageAccounts]
               .filter((a) => a.available)
               .sort(
                 (a, b) =>
                   Math.max(0, ...b.windows.map((w) => w.utilization)) -
                   Math.max(0, ...a.windows.map((w) => w.utilization)),
-              )[0] ?? accounts[0];
+              )[0] ?? usageAccounts[0];
           send(conn, {
             type: "usage.result",
-            available: accounts.some((a) => a.available),
+            available: usageAccounts.some((a) => a.available),
             ...(lead?.subscription !== undefined ? { subscription: lead.subscription } : {}),
             ...(lead?.costUsd !== undefined ? { costUsd: lead.costUsd } : {}),
             ...(lead?.inputTokens !== undefined ? { inputTokens: lead.inputTokens } : {}),
             ...(lead?.outputTokens !== undefined ? { outputTokens: lead.outputTokens } : {}),
             windows: lead?.windows ?? [],
             ...(lead?.reason !== undefined ? { reason: lead.reason } : {}),
-            accounts,
+            accounts: usageAccounts,
           });
           return;
         }
@@ -1770,7 +1836,12 @@ export async function createDaemonServer(
         return;
       }
       if (e instanceof SessionError) {
-        send(conn, { type: "error", code: e.code, message: e.message });
+        send(conn, {
+          type: "error",
+          code: e.code,
+          message: e.message,
+          ...(e.reason ? { reason: e.reason } : {}),
+        });
         return;
       }
       if (e instanceof AgentAccountError) {

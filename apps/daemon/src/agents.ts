@@ -118,6 +118,8 @@ export function commandFor(
         platform,
         env,
       );
+    case "deepseek":
+      throw new Error("DeepSeek Harness 仅支持 structured 会话");
     case "opencode":
       return programCommandFor("opencode", extraArgs, platform, env);
     case "grok":
@@ -145,7 +147,7 @@ export function requiresShellCapability(agent: AgentKind): boolean {
  */
 export function structuredCapable(agent: AgentKind): boolean {
   return (
-    agent === "opencode" || agent === "claude" || agent === "codex" || agent === "grok"
+    agent === "opencode" || agent === "claude" || agent === "codex" || agent === "grok" || agent === "deepseek"
   );
 }
 

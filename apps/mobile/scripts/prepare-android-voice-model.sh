@@ -10,7 +10,11 @@ MODEL_SHA256="ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb"
 STALE_MODEL_FILE="$MODEL_DIR/ggml-tiny-q5_1.bin"
 
 checksum() {
-  shasum -a 256 "$1" | awk '{ print $1 }'
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{ print $1 }'
+  else
+    sha256sum "$1" | awk '{ print $1 }'
+  fi
 }
 
 mkdir -p "$MODEL_DIR"
