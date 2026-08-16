@@ -190,7 +190,11 @@ describeWindows.sequential("Windows daemon force-kill and Session Host full-proc
       const fake = resultFromProbe(graceful.ready);
       await once(graceful.child, "exit");
       expect(graceful.child.exitCode).toBe(0);
-      expect(fake.environment).toEqual(testEnvironment(value));
+      expect(fake.environment).toEqual({
+        home: value.home,
+        localAppData: value.localAppData,
+        repo: value.repo,
+      });
 
       // Let the first daemon's short mutation lease lapse before handing the
       // pipe to another daemon identity. The host is intentionally not using
@@ -297,7 +301,7 @@ describeWindows.sequential("Windows daemon force-kill and Session Host full-proc
       if (!reconnected) throw new Error("Windows PTY Session Host did not reconnect");
       try {
         await reconnected.resize(120, 40);
-        await reconnected.writeInput("after-reconnect\\r");
+        await reconnected.writeInput("after-reconnect\r");
         const output = await waitFor("PTY post-reconnect output", async () => {
           const replay = await reconnected.subscribe(0);
           const text = replay.events.map((event) => Buffer.from(event.dataB64, "base64").toString()).join("");
