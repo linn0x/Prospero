@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -45,13 +45,6 @@ export class NativeLoadError extends Error {
 interface AuthenticodeResult {
   readonly status: string;
   readonly thumbprintSha1: string | null;
-}
-
-function writeLoaderTestDiagnostic(stage: string): void {
-  const diagnosticPath = process.env["PROSPERO_WINDOWS_SESSION_HOST_TEST_DIAGNOSTIC"];
-  if (typeof diagnosticPath !== "string" || diagnosticPath.length === 0) return;
-  try { writeFileSync(diagnosticPath, JSON.stringify({ version: 1, stage })); }
-  catch { /* CI-only diagnostic must not change loader behavior */ }
 }
 
 const SYSTEM_POWERSHELL_RELATIVE_PATH = [
@@ -139,40 +132,29 @@ function defaultPackageRoot(): string {
 }
 
 function defaultAuthenticodeCheck(binaryPath: string): AuthenticodeResult {
-  writeLoaderTestDiagnostic("authenticode_resolving_powershell");
   let powershellPath: string | null;
   try {
     powershellPath = resolveSystemPowerShellPath(resolveSystemRootEnvironmentValue(process.env));
   } catch {
     return { status: "systemroot-unavailable", thumbprintSha1: null };
   }
-  if (powershellPath === null) {
-    writeLoaderTestDiagnostic("authenticode_powershell_unavailable");
-    return { status: "systemroot-unavailable", thumbprintSha1: null };
-  }
+  if (powershellPath === null) return { status: "systemroot-unavailable", thumbprintSha1: null };
   // Windows PowerShell treats every token following a string-valued -Command
   // as part of that command. Pass the path as child-process data instead of
   // interpolating it or relying on $args, so spaces and metacharacters cannot
   // alter the verification command.
   const binaryPathEnvironmentVariable = "PROSPERO_WINDOWS_NATIVE_AUTHENTICODE_PATH";
-  const diagnosticPathEnvironmentVariable = "PROSPERO_WINDOWS_SESSION_HOST_TEST_DIAGNOSTIC";
-  const diagnosticCommands = typeof process.env[diagnosticPathEnvironmentVariable] === "string"
-    ? [
-        `$diagnosticPath = [Environment]::GetEnvironmentVariable('${diagnosticPathEnvironmentVariable}', 'Process')`,
-        "function Write-ProsperoDiagnostic([string]$Stage) { if (-not [string]::IsNullOrWhiteSpace($diagnosticPath)) { [IO.File]::WriteAllText($diagnosticPath, ('{\"version\":1,\"stage\":\"' + $Stage + '\"}')) } }",
-        "Write-ProsperoDiagnostic 'powershell_started'",
-      ]
-    : [];
   const command = [
-    ...diagnosticCommands,
     `$binaryPath = [Environment]::GetEnvironmentVariable('${binaryPathEnvironmentVariable}', 'Process')`,
-    ...(diagnosticCommands.length > 0 ? ["Write-ProsperoDiagnostic 'powershell_signature_checking'"] : []),
+    // Get-AuthenticodeSignature is implemented by the inbox PowerShell core,
+    // but importing/autoloading Microsoft.PowerShell.Security can deadlock in
+    // a no-console detached owner. Invoke that same fail-closed verifier
+    // directly and tolerate framework builds that expose it non-publicly.
     "$signatureHelper = [System.Management.Automation.PSObject].Assembly.GetType('System.Management.Automation.SignatureHelper', $true)",
     "$getSignature = $null",
     "foreach ($candidate in $signatureHelper.GetMethods([System.Reflection.BindingFlags]'Static, Public, NonPublic')) { if ($candidate.Name -eq 'GetSignature' -and $candidate.GetParameters().Length -eq 2) { $getSignature = $candidate; break } }",
     "if ($null -eq $getSignature) { throw 'The inbox Authenticode verifier is unavailable' }",
     "$signature = $getSignature.Invoke($null, [object[]]@($binaryPath, $null))",
-    ...(diagnosticCommands.length > 0 ? ["Write-ProsperoDiagnostic 'powershell_signature_checked'"] : []),
     "$thumbprint = if ($null -eq $signature.SignerCertificate) { '' } else { $signature.SignerCertificate.Thumbprint }",
     "[Console]::Out.Write($signature.Status.ToString() + '|' + $thumbprint)",
   ].join("; ");
@@ -183,7 +165,6 @@ function defaultAuthenticodeCheck(binaryPath: string): AuthenticodeResult {
   childEnvironment.PSModulePath = win32.join(win32.dirname(powershellPath), "Modules");
   childEnvironment[binaryPathEnvironmentVariable] = binaryPath;
   try {
-    writeLoaderTestDiagnostic("authenticode_spawning_powershell");
     const result = spawnSync(
       powershellPath,
       ["-NoProfile", "-NonInteractive", "-EncodedCommand", encodedCommand],
@@ -194,7 +175,6 @@ function defaultAuthenticodeCheck(binaryPath: string): AuthenticodeResult {
         stdio: ["ignore", "pipe", "pipe"],
       },
     );
-    writeLoaderTestDiagnostic("authenticode_powershell_returned");
     if (result.error || result.status !== 0 || typeof result.stdout !== "string") {
       const detail = [
         result.error?.message,
@@ -401,7 +381,6 @@ function wrapTrustedBinding(
  * partial feature set: callers get an error and must leave the feature disabled.
  */
 export function loadWindowsNative(runtime: NativeLoaderRuntime = defaultRuntime()): NativeWindowsBinding {
-  writeLoaderTestDiagnostic("native_loader_started");
   if (runtime.platform !== "win32") {
     return loadError("unsupported-platform", "Windows native module is unavailable outside win32");
   }
@@ -427,12 +406,9 @@ export function loadWindowsNative(runtime: NativeLoaderRuntime = defaultRuntime(
     return loadError("capability-missing", "Windows native prebuild manifest declares incomplete capabilities");
   }
   assertAuthenticode(runtime, manifest, binaryPath);
-  writeLoaderTestDiagnostic("native_loader_authenticode_verified");
   let binding: unknown;
   try {
-    writeLoaderTestDiagnostic("native_loader_binding_loading");
     binding = runtime.loadBinding(binaryPath);
-    writeLoaderTestDiagnostic("native_loader_binding_loaded");
   } catch (error) {
     const detail = error instanceof Error ? `: ${error.message}` : "";
     return loadError("addon-invalid", `Windows native addon could not be loaded${detail}`);

@@ -1,6 +1,5 @@
 /** Main-thread proxy for the dedicated Windows-native blocking-I/O worker. */
 import { randomBytes } from "node:crypto";
-import { writeFileSync } from "node:fs";
 import { Worker } from "node:worker_threads";
 import {
   NATIVE_REQUIRED_CAPABILITIES,
@@ -29,18 +28,6 @@ interface Pending {
 }
 
 const NATIVE_CLOSE_TIMEOUT_MS = 2_000;
-const TEST_DIAGNOSTIC_ENV = "PROSPERO_WINDOWS_SESSION_HOST_TEST_DIAGNOSTIC";
-
-function writeNativeTestDiagnostic(stage: string, error?: unknown): void {
-  const diagnosticPath = process.env[TEST_DIAGNOSTIC_ENV];
-  if (typeof diagnosticPath !== "string" || diagnosticPath.length === 0) return;
-  const message = error instanceof Error
-    ? error.message.replace(/[\r\n|]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 320)
-    : undefined;
-  try {
-    writeFileSync(diagnosticPath, JSON.stringify({ version: 1, stage, ...(message ? { message } : {}) }));
-  } catch { /* CI-only diagnostic must not change native startup behavior */ }
-}
 
 /** TokenSessionId is a Win32 DWORD, not a 16-bit terminal-session field. */
 export const WINDOWS_DWORD_MAX = 0xffff_ffff;
@@ -82,20 +69,15 @@ class WindowsSessionHostPipeCanceller {
   }
 
   static async create(): Promise<WindowsSessionHostPipeCanceller> {
-    writeNativeTestDiagnostic("canceller_spawning");
     const worker = new Worker(emittedSiblingUrl(import.meta.url, "windows-session-host-native-cancel-worker.js"));
-    writeNativeTestDiagnostic("canceller_spawned");
     const canceller = new WindowsSessionHostPipeCanceller(worker);
     try {
-      writeNativeTestDiagnostic("canceller_initializing");
       const initialized = await canceller.call("initialize");
       if (!initialized || typeof initialized !== "object" || !reportIsTrusted((initialized as { report?: unknown }).report)) {
         throw new WindowsSessionHostUnavailable("native_capability_missing", "Windows pipe cancellation worker did not expose a trusted complete capability report");
       }
-      writeNativeTestDiagnostic("canceller_initialized");
       return canceller;
     } catch (error) {
-      writeNativeTestDiagnostic("canceller_failed", error);
       await canceller.close();
       throw error;
     }
@@ -181,25 +163,18 @@ export class WindowsSessionHostNativeWorker implements WindowsSessionHostStateSt
 
   static async create(): Promise<WindowsSessionHostNativeWorker> {
     if (process.platform !== "win32") throw nativeFailure("Windows session host is unavailable outside win32");
-    writeNativeTestDiagnostic("primary_spawning");
     const worker = new Worker(emittedSiblingUrl(import.meta.url, "windows-session-host-native-worker.js"));
-    writeNativeTestDiagnostic("primary_spawned");
     let canceller: WindowsSessionHostPipeCanceller | null = null;
     let bridge: WindowsSessionHostNativeWorker | null = null;
     try {
-      writeNativeTestDiagnostic("canceller_creating");
       canceller = await WindowsSessionHostPipeCanceller.create();
-      writeNativeTestDiagnostic("bridge_creating");
       bridge = new WindowsSessionHostNativeWorker(worker, canceller);
-      writeNativeTestDiagnostic("primary_initializing");
       const initialized = await bridge.call("initialize");
       if (!initialized || typeof initialized !== "object" || !reportIsTrusted((initialized as { report?: unknown }).report)) {
         throw new WindowsSessionHostUnavailable("native_capability_missing", "Windows native worker did not expose a trusted complete capability report");
       }
-      writeNativeTestDiagnostic("primary_initialized");
       return bridge;
     } catch (error) {
-      writeNativeTestDiagnostic("native_create_failed", error);
       if (bridge) await bridge.close();
       else {
         await worker.terminate();

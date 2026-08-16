@@ -8,7 +8,6 @@
  * avoids placing a close request behind the very read it must cancel.
  */
 import { parentPort } from "node:worker_threads";
-import { writeFileSync } from "node:fs";
 import {
   loadWindowsNative,
   type SecureNamedPipeConnectionHandle,
@@ -16,14 +15,6 @@ import {
 } from "@prospero/windows-native";
 
 if (!parentPort) throw new Error("Windows session host native cancellation worker requires a parent port");
-
-const testDiagnosticPath = process.env["PROSPERO_WINDOWS_SESSION_HOST_TEST_DIAGNOSTIC"];
-function writeTestDiagnostic(stage: string): void {
-  if (typeof testDiagnosticPath !== "string" || testDiagnosticPath.length === 0) return;
-  try { writeFileSync(testDiagnosticPath, JSON.stringify({ version: 1, stage })); }
-  catch { /* CI-only diagnostic must not change worker behavior */ }
-}
-writeTestDiagnostic("canceller_module_loaded");
 
 interface Request {
   readonly id: number;
@@ -34,11 +25,7 @@ interface Request {
 let native: ReturnType<typeof loadWindowsNative> | null = null;
 
 function binding(): ReturnType<typeof loadWindowsNative> {
-  if (!native) {
-    writeTestDiagnostic("canceller_binding_loading");
-    native = loadWindowsNative();
-    writeTestDiagnostic("canceller_binding_loaded");
-  }
+  if (!native) native = loadWindowsNative();
   return native;
 }
 
@@ -63,7 +50,6 @@ parentPort.on("message", (message: unknown) => {
   const value = message as Partial<Request>;
   if (typeof value.id !== "number" || !Number.isSafeInteger(value.id) ||
     (value.op !== "initialize" && value.op !== "disconnectConnection" && value.op !== "closeServer")) return;
-  writeTestDiagnostic("canceller_request_received");
   try { parentPort!.postMessage({ id: value.id, ok: true, value: request(value.op, value.args) }); }
   catch (error) { parentPort!.postMessage({ id: value.id, ok: false, error: error instanceof Error ? error.message : String(error) }); }
 });
