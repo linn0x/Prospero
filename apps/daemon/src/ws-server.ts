@@ -56,7 +56,7 @@ import {
 } from "./pairing.js";
 import { RelayHostClient } from "./relay-host-client.js";
 import { Notifier, type NotifyConfig } from "./notify.js";
-import { SessionError, SessionManager } from "./session-manager.js";
+import { SessionError, SessionManager, type SessionManagerOptions } from "./session-manager.js";
 import { createStructuredSupervisorRuntimeSnapshot } from "./structured-supervisor-runtime.js";
 import { StatusFile } from "./status-file.js";
 import {
@@ -189,6 +189,11 @@ export interface DaemonServerOptions {
     environment?: Record<string, string>,
     codexAppServerArgs?: string[],
   ) => Promise<ResumableConversation[]>;
+  /**
+   * Structured-session test seam. Injected adapters stay in-process, so this
+   * is intentionally for deterministic daemon integration tests only.
+   */
+  adapterFactory?: SessionManagerOptions["adapterFactory"];
 }
 
 export interface DaemonServer {
@@ -295,6 +300,7 @@ export async function createDaemonServer(
     ...(structuredRuntime ? { supervisorRunnerPath: structuredRuntime.runnerPath } : {}),
     ptySupervisor: opts.ptySupervisor ?? process.env["VITEST"] !== "true",
     windowsSessionHost: opts.windowsSessionHost,
+    ...(opts.adapterFactory ? { adapterFactory: opts.adapterFactory } : {}),
     ...(opts.useTmux ? { tmux: { home: opts.home } } : {}),
     sessionEnv: (sessionId) => ({
       PROSPERO_SESSION_ID: sessionId,
@@ -1953,6 +1959,36 @@ export async function createDaemonServer(
         const structured = manager.getStructured(sid);
         if (structured) {
           const snapshot = structured.snapshot();
+          const rawAfterSeq = url.searchParams.get("afterSeq");
+          const afterSeq = rawAfterSeq === null ? undefined : Number(rawAfterSeq);
+          if (
+            afterSeq !== undefined &&
+            (!Number.isSafeInteger(afterSeq) || afterSeq < 0)
+          ) {
+            res.writeHead(400).end("invalid afterSeq");
+            return;
+          }
+          // afterSeq is the structured-session cursor. It deliberately wins
+          // over knownSeq when both are sent, leaving existing knownSeq
+          // clients and the PTY view path byte-for-byte compatible.
+          if (afterSeq !== undefined) {
+            if (afterSeq === snapshot.evSeq) {
+              res.writeHead(204).end();
+              return;
+            }
+            const events = structured.since(afterSeq);
+            if (events !== null) {
+              res.writeHead(200, { "content-type": "application/json" });
+              res.end(JSON.stringify({
+                kind: "structured",
+                mode: "delta",
+                baseSeq: afterSeq,
+                evSeq: snapshot.evSeq,
+                events,
+              }));
+              return;
+            }
+          }
           if (knownSeq === snapshot.evSeq) {
             res.writeHead(204).end();
             return;
@@ -1960,6 +1996,7 @@ export async function createDaemonServer(
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify({
             kind: "structured",
+            mode: "snapshot",
             seq: snapshot.evSeq,
             evSeq: snapshot.evSeq,
             events: snapshot.events,
@@ -1979,6 +2016,42 @@ export async function createDaemonServer(
         if (e instanceof SessionError) {
           res.writeHead(e.code === "session_not_found" ? 404 : 409).end(e.message);
         } else if (e instanceof URIError) {
+          res.writeHead(400).end("invalid session id");
+        } else {
+          res.writeHead(400).end(e instanceof Error ? e.message : String(e));
+        }
+      }
+      return;
+    }
+    const sessionToolOutputMatch = url.pathname.match(
+      /^\/_prospero\/control\/session\/([^/]+)\/tool-output$/,
+    );
+    if (req.method === "GET" && sessionToolOutputMatch) {
+      try {
+        const sid = decodeURIComponent(sessionToolOutputMatch[1]!);
+        const callId = url.searchParams.get("callId");
+        if (!callId) {
+          res.writeHead(400).end("missing callId");
+          return;
+        }
+        const session = manager.getStructured(sid);
+        if (!session) {
+          if (manager.getPty(sid)) {
+            res.writeHead(409).end(`session ${sid} is not structured`);
+          } else {
+            res.writeHead(404).end(`no such session: ${sid}`);
+          }
+          return;
+        }
+        const output = session.toolOutput(callId);
+        if (!output) {
+          res.writeHead(404).end("tool output not found");
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(output));
+      } catch (e) {
+        if (e instanceof URIError) {
           res.writeHead(400).end("invalid session id");
         } else {
           res.writeHead(400).end(e instanceof Error ? e.message : String(e));
