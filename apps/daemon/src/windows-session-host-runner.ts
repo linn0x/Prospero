@@ -126,6 +126,19 @@ export interface StartWindowsSessionHostOptions {
 const DETACHED_BOOTSTRAP_FILE = "host.bootstrap.json";
 const DETACHED_READY_FILE = "host.ready.json";
 const DETACHED_FAILED_FILE = "host.failed.json";
+const DETACHED_STARTUP_STAGES = [
+  "opening_state",
+  "claiming_bootstrap",
+  "creating_provider_job",
+  "resolving_owner",
+  "assigning_owner_job",
+  "auditing_owner_job",
+  "importing_handler",
+  "starting_common_host",
+  "starting_handler",
+  "publishing_ready",
+] as const;
+type DetachedStartupStage = typeof DETACHED_STARTUP_STAGES[number];
 const PROVIDER_BOOTSTRAP_FILE = "provider.bootstrap.json";
 const PROVIDER_RECORD_FILE = "provider.record.json";
 const DETACHED_RUNNER_ENV = "PROSPERO_WINDOWS_SESSION_HOST_STATE_DIRECTORY";
@@ -361,6 +374,28 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 function hasOnlyKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
   return Object.keys(value).every((key) => keys.includes(key));
+}
+
+function isDetachedStartupStage(value: unknown): value is DetachedStartupStage {
+  return typeof value === "string" && (DETACHED_STARTUP_STAGES as readonly string[]).includes(value);
+}
+
+async function writeDetachedStartupFailure(
+  native: Pick<WindowsSessionHostRunnerNative, "writeAtomic">,
+  error: unknown,
+  stage: DetachedStartupStage,
+): Promise<void> {
+  const code = (error as { code?: unknown } | null)?.code === "provider_job_incompatible"
+    ? "provider_job_incompatible"
+    : "native_unavailable";
+  // Persist only a closed enum and normalized code. Arbitrary provider/native
+  // error text can contain paths or configuration and must never cross this
+  // secure-state diagnostic boundary.
+  await native.writeAtomic(DETACHED_FAILED_FILE, new TextEncoder().encode(JSON.stringify({
+    version: 1,
+    code,
+    stage,
+  }))).catch(() => {});
 }
 
 function validCommandId(value: unknown): value is string {
@@ -964,8 +999,12 @@ export async function runDetachedWindowsSessionHostFromEnvironment(
     throw new WindowsSessionHostUnavailable("invalid_manifest", "Windows detached runner state directory is missing");
   }
   const native = await nativeFactory.create();
+  let stage: DetachedStartupStage = "opening_state";
+  let stateOpened = false;
   try {
     await native.openState(stateDirectory);
+    stateOpened = true;
+    stage = "claiming_bootstrap";
     const bootstrap = await consumeDetachedWindowsSessionHostBootstrap(native, stateDirectory);
     // This is deliberately before importing a vertical handler, constructing
     // an adapter, creating a pipe, or starting a session. Once the detached
@@ -974,21 +1013,29 @@ export async function runDetachedWindowsSessionHostFromEnvironment(
     if (!native.createProviderJob || !native.assignProviderProcess || !native.isProviderProcessInJob) {
       throw new WindowsSessionHostUnavailable("native_capability_missing", "Windows native host-in-Job APIs are unavailable");
     }
+    stage = "creating_provider_job";
     await native.createProviderJob();
     let providerJob: NativeWindowsSessionHostProviderJob | null = null;
     try {
+      stage = "resolving_owner";
       const owner = await native.currentIdentity();
+      stage = "assigning_owner_job";
       await native.assignProviderProcess(owner);
+      stage = "auditing_owner_job";
       if (!await native.isProviderProcessInJob(owner)) {
         throw new WindowsSessionHostUnavailable("provider_job_incompatible", "Windows detached Session Host did not join its own Job");
       }
       providerJob = new NativeWindowsSessionHostProviderJob(native);
     } catch (error) {
+      // Record the stage before closing a partially assigned KILL_ON_JOB_CLOSE
+      // Job: if self-assignment succeeded, the close terminates this process.
+      await writeDetachedStartupFailure(native, error, stage);
       // If self-assignment raced only partway through, close is itself the
       // KILL_ON_JOB_CLOSE containment action. There is no PID fallback.
       await native.closeProviderJob?.().catch(() => {});
       throw error;
     }
+    stage = "importing_handler";
     const factory = (await import(bootstrap.handlerModule)) as Partial<WindowsSessionHostHandlerFactory>;
     if (typeof factory.createWindowsSessionHostHandler !== "function") {
       throw new WindowsSessionHostUnavailable("native_unavailable", "Windows detached runner handler factory is unavailable");
@@ -1014,6 +1061,7 @@ export async function runDetachedWindowsSessionHostFromEnvironment(
     };
     let handlerFailure: Error | null = null;
     let factoryHandler: WindowsSessionHostCommandHandler | null = null;
+    stage = "starting_handler";
     const handlerPromise: Promise<WindowsSessionHostCommandHandler | null> = Promise.resolve()
       .then(() => factory.createWindowsSessionHostHandler!({
         sessionId: bootstrap.sessionId, epoch: bootstrap.epoch, stateDirectory,
@@ -1036,6 +1084,7 @@ export async function runDetachedWindowsSessionHostFromEnvironment(
       });
     let running: RunningWindowsSessionHost | null = null;
     try {
+      stage = "starting_common_host";
       running = await startWindowsSessionHostWithNative({
         sessionId: bootstrap.sessionId, epoch: bootstrap.epoch, pipeName: bootstrap.pipeName, stateDirectory,
         handler: deferredHandler, createdAt: bootstrap.createdAt,
@@ -1043,19 +1092,18 @@ export async function runDetachedWindowsSessionHostFromEnvironment(
         ...(bootstrap.readOnlyMethods === undefined ? {} : { readOnlyMethods: bootstrap.readOnlyMethods }),
       }, native, false);
       sink.bind(running.runner);
+      stage = "starting_handler";
       const handler = await handlerPromise;
       if (!handler || typeof handler.handleCommand !== "function") {
         throw handlerFailure ?? new WindowsSessionHostUnavailable("native_unavailable", "Windows detached runner handler is invalid");
       }
       deferredHandler.bind(handler);
+      stage = "publishing_ready";
       await native.writeAtomic(DETACHED_READY_FILE, new TextEncoder().encode(JSON.stringify({ version: 1, ready: true })));
       return running;
     } catch (error) {
       const failure = error instanceof Error ? error : new Error(String(error));
-      const code = (failure as { code?: unknown }).code === "provider_job_incompatible"
-        ? "provider_job_incompatible"
-        : "native_unavailable";
-      await native.writeAtomic(DETACHED_FAILED_FILE, new TextEncoder().encode(JSON.stringify({ version: 1, code }))).catch(() => {});
+      await writeDetachedStartupFailure(native, failure, stage);
       deferredHandler.fail(failure);
       sink.fail(failure);
       // startWindowsSessionHostWithNative can fail while an asynchronous
@@ -1087,6 +1135,7 @@ export async function runDetachedWindowsSessionHostFromEnvironment(
       throw failure;
     }
   } catch (error) {
+    if (stateOpened) await writeDetachedStartupFailure(native, error, stage);
     await native.close();
     throw error;
   }
@@ -1120,8 +1169,14 @@ async function waitForDetachedManifest(
     if (failed !== null) {
       try {
         const value: unknown = JSON.parse(new TextDecoder().decode(failed));
-        if (isObject(value) && value.version === 1 && value.code === "provider_job_incompatible") {
-          throw new WindowsSessionHostUnavailable("provider_job_incompatible", "Windows provider is incompatible with the required Session Job");
+        if (isObject(value) && value.version === 1) {
+          const suffix = isDetachedStartupStage(value.stage) ? ` during ${value.stage}` : "";
+          if (value.code === "provider_job_incompatible") {
+            throw new WindowsSessionHostUnavailable("provider_job_incompatible", `Windows provider is incompatible with the required Session Job${suffix}`);
+          }
+          if (value.code === "native_unavailable") {
+            throw new WindowsSessionHostUnavailable("native_unavailable", `Windows detached host failed before becoming ready${suffix}`);
+          }
         }
       } catch (error) {
         if (error instanceof WindowsSessionHostUnavailable) throw error;
@@ -1144,7 +1199,17 @@ async function waitForDetachedManifest(
   // CreateProcessW has already succeeded. This is an ambiguous post-launch
   // failure, not a missing native binding and therefore never a direct-PTY
   // downgrade signal.
-  throw new WindowsSessionHostUnavailable("launch_failed", "Windows detached host did not publish a verified manifest");
+  const bootstrapClaimed = await native.read(DETACHED_BOOTSTRAP_FILE) === null;
+  const manifestPublished = await native.read("manifest.json") !== null;
+  const readyPublished = await native.read(DETACHED_READY_FILE) !== null;
+  const stage = !bootstrapClaimed
+    ? "before_bootstrap_claim"
+    : !manifestPublished
+      ? "after_bootstrap_claim"
+      : !readyPublished
+        ? "after_manifest_publish"
+        : "after_ready_publish";
+  throw new WindowsSessionHostUnavailable("launch_failed", `Windows detached host did not publish a verified manifest (${stage})`);
 }
 
 async function removeDetachedBootstrapState(

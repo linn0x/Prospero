@@ -542,6 +542,11 @@ describe("Windows Session Host detached bootstrap and provider output", () => {
       { async create() { return native; } },
     )).rejects.toThrow(/handler is invalid/);
     expect(closeJob).toBe(1);
+    expect(JSON.parse(new TextDecoder().decode(files.get("host.failed.json")!))).toEqual({
+      version: 1,
+      code: "native_unavailable",
+      stage: "starting_handler",
+    });
   });
 
   it("exactly rolls back a launched host and clears credential-bearing bootstrap on invalid manifest publication", async () => {
