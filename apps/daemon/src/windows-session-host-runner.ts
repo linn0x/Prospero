@@ -52,6 +52,11 @@ const MAX_PIPE_READ_BYTES = 1024 * 1024;
 const COMPACTION_EVENT_LIMIT = 128;
 const DEFAULT_LEASE_MS = 15_000;
 const TRANSPORT_STOP_TIMEOUT_MS = 2_000;
+// A detached owner initializes two native workers, each of which independently
+// verifies the signed addon before any manifest can be published. Cold Windows
+// service/scheduled-task starts can legitimately take longer than the old
+// eight-second window, especially on hosted ARM64 runners.
+const DETACHED_MANIFEST_TIMEOUT_MS = 30_000;
 
 export interface WindowsSessionHostRunnerNative {
   openState(path: string): Promise<void>;
@@ -1112,7 +1117,7 @@ function runnerEnvironment(stateDirectory: string): Record<string, string> {
 async function waitForDetachedManifest(
   native: Pick<WindowsSessionHostDetachedLaunchNative, "read">,
   expected: { sessionId: string; epoch: string; process: ProcessIdentity },
-  timeoutMs = 8_000,
+  timeoutMs = DETACHED_MANIFEST_TIMEOUT_MS,
 ): Promise<WindowsSessionHostManifest> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
