@@ -259,7 +259,9 @@ describeWindows.sequential("Windows N-API Job Object, detached host, and ConPTY 
     const marker = join(directory, "host-survived.txt");
     const unicodeArgument = "参数 with spaces, quote \" and trailing slash\\";
     const hostSource = [
-      `require('node:fs').writeFileSync(${JSON.stringify(marker)}, JSON.stringify({ argv0: process.argv0, argv: process.argv }));`,
+      "const { spawnSync } = require('node:child_process');",
+      "const nested = spawnSync(process.execPath, ['-e', `process.stdout.write('nested-ok')`], { encoding: 'utf8', windowsHide: true, timeout: 5000 });",
+      `require('node:fs').writeFileSync(${JSON.stringify(marker)}, JSON.stringify({ argv0: process.argv0, argv: process.argv, nestedStatus: nested.status, nestedStdout: nested.stdout, nestedError: nested.error?.message ?? null }));`,
       "setTimeout(() => process.exit(0), 3000);",
     ].join(" ");
     const helperSource = [
@@ -286,6 +288,9 @@ describeWindows.sequential("Windows N-API Job Object, detached host, and ConPTY 
           expect(JSON.parse(await readFile(marker, "utf8"))).toEqual({
             argv0: process.execPath,
             argv: [process.execPath, unicodeArgument],
+            nestedStatus: 0,
+            nestedStdout: "nested-ok",
+            nestedError: null,
           });
           // A successful response is valid only if the suspended child really
           // escaped every inherited Job before it was resumed.

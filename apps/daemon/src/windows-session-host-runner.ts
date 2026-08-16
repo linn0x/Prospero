@@ -126,6 +126,19 @@ export interface StartWindowsSessionHostOptions {
 const DETACHED_BOOTSTRAP_FILE = "host.bootstrap.json";
 const DETACHED_READY_FILE = "host.ready.json";
 const DETACHED_FAILED_FILE = "host.failed.json";
+const DETACHED_STARTUP_STAGES = [
+  "opening_state",
+  "claiming_bootstrap",
+  "creating_provider_job",
+  "resolving_owner",
+  "assigning_owner_job",
+  "auditing_owner_job",
+  "importing_handler",
+  "starting_common_host",
+  "starting_handler",
+  "publishing_ready",
+] as const;
+type DetachedStartupStage = typeof DETACHED_STARTUP_STAGES[number];
 const PROVIDER_BOOTSTRAP_FILE = "provider.bootstrap.json";
 const PROVIDER_RECORD_FILE = "provider.record.json";
 const DETACHED_RUNNER_ENV = "PROSPERO_WINDOWS_SESSION_HOST_STATE_DIRECTORY";
@@ -363,6 +376,28 @@ function hasOnlyKeys(value: Record<string, unknown>, keys: readonly string[]): b
   return Object.keys(value).every((key) => keys.includes(key));
 }
 
+function isDetachedStartupStage(value: unknown): value is DetachedStartupStage {
+  return typeof value === "string" && (DETACHED_STARTUP_STAGES as readonly string[]).includes(value);
+}
+
+async function writeDetachedStartupFailure(
+  native: Pick<WindowsSessionHostRunnerNative, "writeAtomic">,
+  error: unknown,
+  stage: DetachedStartupStage,
+): Promise<void> {
+  const code = (error as { code?: unknown } | null)?.code === "provider_job_incompatible"
+    ? "provider_job_incompatible"
+    : "native_unavailable";
+  // Persist only a closed enum and normalized code. Arbitrary provider/native
+  // error text can contain paths or configuration and must never cross this
+  // secure-state diagnostic boundary.
+  await native.writeAtomic(DETACHED_FAILED_FILE, new TextEncoder().encode(JSON.stringify({
+    version: 1,
+    code,
+    stage,
+  }))).catch(() => {});
+}
+
 function validCommandId(value: unknown): value is string {
   return typeof value === "string" && /^[A-Za-z0-9._:-]{1,160}$/.test(value);
 }
@@ -446,6 +481,7 @@ export class WindowsSessionHostRunner {
   private terminal = false;
   private loaded = false;
   private compactionDeferred = false;
+  private commandChain: Promise<void> = Promise.resolve();
   private mutationChain: Promise<void> = Promise.resolve();
   private readonly readOnlyMethods: ReadonlySet<string>;
 
@@ -515,7 +551,7 @@ export class WindowsSessionHostRunner {
   }
 
   async command(value: SessionHostWireMessage): Promise<SessionHostReply> {
-    return this.serialize(() => this.commandUnlocked(value));
+    return this.serializeCommand(() => this.commandUnlocked(value));
   }
 
   /**
@@ -529,15 +565,24 @@ export class WindowsSessionHostRunner {
   }
 
   /**
-   * Durable host-side output API.  It shares the command serialization chain,
-   * so PTY/structured output cannot overtake a command result or reuse a
-   * sequence.  A terminal event is an explicit one-way fence.
+   * Durable host-side output API. Journal mutations remain strictly serial,
+   * while a handler may await output persistence before returning its command
+   * outcome. A terminal event is an explicit one-way fence.
    */
   async appendEvent(payload: unknown, options: WindowsSessionHostAppendEventOptions = {}): Promise<WindowsSessionHostJournalEvent> {
-    return this.serialize(() => this.appendEventUnlocked(payload, options));
+    return this.serializeMutation(() => this.appendEventUnlocked(payload, options));
   }
 
-  private async serialize<T>(operation: () => Promise<T>): Promise<T> {
+  private async serializeCommand<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.commandChain;
+    let release!: () => void;
+    this.commandChain = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try { return await operation(); }
+    finally { release(); }
+  }
+
+  private async serializeMutation<T>(operation: () => Promise<T>): Promise<T> {
     const previous = this.mutationChain;
     let release!: () => void;
     this.mutationChain = new Promise<void>((resolve) => { release = resolve; });
@@ -570,6 +615,29 @@ export class WindowsSessionHostRunner {
   }
 
   private async commandUnlocked(value: SessionHostWireMessage): Promise<SessionHostReply> {
+    const prepared = await this.serializeMutation(() => this.prepareCommandUnlocked(value));
+    if (prepared.type === "reply") return prepared;
+    const command = prepared;
+    let outcome: WindowsSessionHostCommandOutcome;
+    try {
+      // Provider callbacks are allowed to await appendEvent while a command is
+      // active. The separate mutation chain gives those events durable order
+      // without allowing a second handler command to overlap this one.
+      outcome = await this.handler.handleCommand({ commandId: command.commandId, method: command.method, params: command.params });
+    } catch {
+      // An uncaught provider exception has unknown external outcome. Fence the
+      // owner instead of rerunning the same command after a daemon restart.
+      outcome = { ok: false, code: "unknown_command_outcome", message: "Windows session host command outcome is unknown", terminal: true };
+    }
+    if (command.method === "structured.kill" && outcome.terminal !== true) {
+      // A rejected/failed kill after its intent is durable is itself an
+      // unresolved tree state. Fence the owner for reconciliation.
+      outcome = { ...outcome, terminal: true };
+    }
+    return this.serializeMutation(() => this.commitCommandUnlocked(command, outcome));
+  }
+
+  private async prepareCommandUnlocked(value: SessionHostWireMessage): Promise<SessionHostCommand | SessionHostReply> {
     await this.load();
     const connection = this.requireConnection();
     let command: SessionHostCommand;
@@ -618,19 +686,13 @@ export class WindowsSessionHostRunner {
       this.events.push(intent);
       this.lastSeq = intent.seq;
     }
-    let outcome: WindowsSessionHostCommandOutcome;
-    try {
-      outcome = await this.handler.handleCommand({ commandId: command.commandId, method: command.method, params: command.params });
-    } catch {
-      // An uncaught provider exception has unknown external outcome. Fence the
-      // owner instead of rerunning the same command after a daemon restart.
-      outcome = { ok: false, code: "unknown_command_outcome", message: "Windows session host command outcome is unknown", terminal: true };
-    }
-    if (command.method === "structured.kill" && outcome.terminal !== true) {
-      // A rejected/failed kill after its intent is durable is itself an
-      // unresolved tree state. Fence the owner for reconciliation.
-      outcome = { ...outcome, terminal: true };
-    }
+    return command;
+  }
+
+  private async commitCommandUnlocked(command: SessionHostCommand, outcome: WindowsSessionHostCommandOutcome): Promise<SessionHostReply> {
+    // A provider-side terminal event may have landed while the handler was
+    // active. Never append a non-terminal success beyond that durable fence.
+    if (this.terminal && outcome.terminal !== true) return this.fenceUnknownOutcome(command.commandId);
     if (outcome.terminal === true && outcome.afterReply) {
       // Retain containment before any terminal append/compaction. If either
       // write fails, this callback is still the fail-closed cleanup path.
@@ -814,6 +876,11 @@ export interface RunningWindowsSessionHost {
   closeTransport(): Promise<void>;
 }
 
+interface StartableRunningWindowsSessionHost extends RunningWindowsSessionHost {
+  /** Begins the blocking native accept loop exactly once. */
+  startTransport(): void;
+}
+
 /**
  * Starts a new owner only when explicitly called by a vertical's creation
  * flow. Recovery must use `WindowsSessionHostClient.attach`, never this API.
@@ -830,7 +897,8 @@ async function startWindowsSessionHostWithNative(
   options: StartWindowsSessionHostOptions,
   native: WindowsSessionHostRunnerNative,
   closeOnFailure = true,
-): Promise<RunningWindowsSessionHost> {
+  deferTransport = false,
+): Promise<StartableRunningWindowsSessionHost> {
   assertSessionId(options.sessionId);
   assertEpoch(options.epoch);
   assertSecureWindowsPipeName(options.pipeName);
@@ -860,18 +928,24 @@ async function startWindowsSessionHostWithNative(
     const runner = new WindowsSessionHostRunner(manifest, native, options.handler, options.leaseDurationMs, options.readOnlyMethods);
     await runner.load();
     let stopping = false;
+    let serving: Promise<void> | null = null;
     let closePromise: Promise<void> | null = null;
-    const serving = serveWindowsSessionHostPipe(native, runner, () => stopping);
-    return {
+    const running: StartableRunningWindowsSessionHost = {
       manifest,
       runner,
+      startTransport: () => {
+        if (stopping || serving !== null) return;
+        serving = serveWindowsSessionHostPipe(native, runner, () => stopping);
+      },
       closeTransport: async () => {
         if (closePromise) return closePromise;
         stopping = true;
-        closePromise = stopWindowsSessionHostTransport(native, serving, options.pipeName);
+        closePromise = stopWindowsSessionHostTransport(native, serving ?? Promise.resolve(), options.pipeName);
         return closePromise;
       },
     };
+    if (!deferTransport) running.startTransport();
+    return running;
   } catch (error) {
     if (closeOnFailure) await native.close?.();
     throw error;
@@ -964,8 +1038,12 @@ export async function runDetachedWindowsSessionHostFromEnvironment(
     throw new WindowsSessionHostUnavailable("invalid_manifest", "Windows detached runner state directory is missing");
   }
   const native = await nativeFactory.create();
+  let stage: DetachedStartupStage = "opening_state";
+  let stateOpened = false;
   try {
     await native.openState(stateDirectory);
+    stateOpened = true;
+    stage = "claiming_bootstrap";
     const bootstrap = await consumeDetachedWindowsSessionHostBootstrap(native, stateDirectory);
     // This is deliberately before importing a vertical handler, constructing
     // an adapter, creating a pipe, or starting a session. Once the detached
@@ -974,21 +1052,29 @@ export async function runDetachedWindowsSessionHostFromEnvironment(
     if (!native.createProviderJob || !native.assignProviderProcess || !native.isProviderProcessInJob) {
       throw new WindowsSessionHostUnavailable("native_capability_missing", "Windows native host-in-Job APIs are unavailable");
     }
+    stage = "creating_provider_job";
     await native.createProviderJob();
     let providerJob: NativeWindowsSessionHostProviderJob | null = null;
     try {
+      stage = "resolving_owner";
       const owner = await native.currentIdentity();
+      stage = "assigning_owner_job";
       await native.assignProviderProcess(owner);
+      stage = "auditing_owner_job";
       if (!await native.isProviderProcessInJob(owner)) {
         throw new WindowsSessionHostUnavailable("provider_job_incompatible", "Windows detached Session Host did not join its own Job");
       }
       providerJob = new NativeWindowsSessionHostProviderJob(native);
     } catch (error) {
+      // Record the stage before closing a partially assigned KILL_ON_JOB_CLOSE
+      // Job: if self-assignment succeeded, the close terminates this process.
+      await writeDetachedStartupFailure(native, error, stage);
       // If self-assignment raced only partway through, close is itself the
       // KILL_ON_JOB_CLOSE containment action. There is no PID fallback.
       await native.closeProviderJob?.().catch(() => {});
       throw error;
     }
+    stage = "importing_handler";
     const factory = (await import(bootstrap.handlerModule)) as Partial<WindowsSessionHostHandlerFactory>;
     if (typeof factory.createWindowsSessionHostHandler !== "function") {
       throw new WindowsSessionHostUnavailable("native_unavailable", "Windows detached runner handler factory is unavailable");
@@ -1014,6 +1100,7 @@ export async function runDetachedWindowsSessionHostFromEnvironment(
     };
     let handlerFailure: Error | null = null;
     let factoryHandler: WindowsSessionHostCommandHandler | null = null;
+    stage = "starting_handler";
     const handlerPromise: Promise<WindowsSessionHostCommandHandler | null> = Promise.resolve()
       .then(() => factory.createWindowsSessionHostHandler!({
         sessionId: bootstrap.sessionId, epoch: bootstrap.epoch, stateDirectory,
@@ -1034,28 +1121,29 @@ export async function runDetachedWindowsSessionHostFromEnvironment(
         handlerFailure = error instanceof Error ? error : new Error(String(error));
         return null;
       });
-    let running: RunningWindowsSessionHost | null = null;
+    let running: StartableRunningWindowsSessionHost | null = null;
     try {
+      stage = "starting_common_host";
       running = await startWindowsSessionHostWithNative({
         sessionId: bootstrap.sessionId, epoch: bootstrap.epoch, pipeName: bootstrap.pipeName, stateDirectory,
         handler: deferredHandler, createdAt: bootstrap.createdAt,
         ...(bootstrap.leaseDurationMs === undefined ? {} : { leaseDurationMs: bootstrap.leaseDurationMs }),
         ...(bootstrap.readOnlyMethods === undefined ? {} : { readOnlyMethods: bootstrap.readOnlyMethods }),
-      }, native, false);
+      }, native, false, true);
       sink.bind(running.runner);
+      stage = "starting_handler";
       const handler = await handlerPromise;
       if (!handler || typeof handler.handleCommand !== "function") {
         throw handlerFailure ?? new WindowsSessionHostUnavailable("native_unavailable", "Windows detached runner handler is invalid");
       }
       deferredHandler.bind(handler);
+      stage = "publishing_ready";
       await native.writeAtomic(DETACHED_READY_FILE, new TextEncoder().encode(JSON.stringify({ version: 1, ready: true })));
+      running.startTransport();
       return running;
     } catch (error) {
       const failure = error instanceof Error ? error : new Error(String(error));
-      const code = (failure as { code?: unknown }).code === "provider_job_incompatible"
-        ? "provider_job_incompatible"
-        : "native_unavailable";
-      await native.writeAtomic(DETACHED_FAILED_FILE, new TextEncoder().encode(JSON.stringify({ version: 1, code }))).catch(() => {});
+      await writeDetachedStartupFailure(native, failure, stage);
       deferredHandler.fail(failure);
       sink.fail(failure);
       // startWindowsSessionHostWithNative can fail while an asynchronous
@@ -1087,12 +1175,16 @@ export async function runDetachedWindowsSessionHostFromEnvironment(
       throw failure;
     }
   } catch (error) {
+    if (stateOpened) await writeDetachedStartupFailure(native, error, stage);
     await native.close();
     throw error;
   }
 }
 
-function runnerEnvironment(stateDirectory: string): Record<string, string> {
+function runnerEnvironment(
+  stateDirectory: string,
+  source: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
   // Keep provider/API credentials out of the detached host environment, but
   // retain the Windows runtime/profile locations required by Authenticode,
   // DPAPI, PowerShell and Node when the daemon is running as a service user.
@@ -1103,8 +1195,17 @@ function runnerEnvironment(stateDirectory: string): Record<string, string> {
     "ProgramFiles(x86)", "ProgramW6432", "CommonProgramFiles",
     "CommonProgramFiles(x86)", "CommonProgramW6432",
   ] as const;
+  const sourceEntries = Object.entries(source).filter((entry): entry is [string, string] => typeof entry[1] === "string");
+  const runtimeEnvironment: Record<string, string> = {};
+  for (const canonicalName of inherited) {
+    // A worker-thread environment copy is case-sensitive even on Windows,
+    // while the OS environment is not. Canonicalize exactly one match and
+    // fail closed by omitting ambiguous case variants.
+    const matches = sourceEntries.filter(([name]) => name.toLowerCase() === canonicalName.toLowerCase());
+    if (matches.length === 1) runtimeEnvironment[canonicalName] = matches[0]![1];
+  }
   return {
-    ...Object.fromEntries(inherited.filter((name) => process.env[name] !== undefined).map((name) => [name, process.env[name]!])),
+    ...runtimeEnvironment,
     [DETACHED_RUNNER_ENV]: stateDirectory,
   };
 }
@@ -1120,8 +1221,14 @@ async function waitForDetachedManifest(
     if (failed !== null) {
       try {
         const value: unknown = JSON.parse(new TextDecoder().decode(failed));
-        if (isObject(value) && value.version === 1 && value.code === "provider_job_incompatible") {
-          throw new WindowsSessionHostUnavailable("provider_job_incompatible", "Windows provider is incompatible with the required Session Job");
+        if (isObject(value) && value.version === 1) {
+          const suffix = isDetachedStartupStage(value.stage) ? ` during ${value.stage}` : "";
+          if (value.code === "provider_job_incompatible") {
+            throw new WindowsSessionHostUnavailable("provider_job_incompatible", `Windows provider is incompatible with the required Session Job${suffix}`);
+          }
+          if (value.code === "native_unavailable") {
+            throw new WindowsSessionHostUnavailable("native_unavailable", `Windows detached host failed before becoming ready${suffix}`);
+          }
         }
       } catch (error) {
         if (error instanceof WindowsSessionHostUnavailable) throw error;
@@ -1144,7 +1251,17 @@ async function waitForDetachedManifest(
   // CreateProcessW has already succeeded. This is an ambiguous post-launch
   // failure, not a missing native binding and therefore never a direct-PTY
   // downgrade signal.
-  throw new WindowsSessionHostUnavailable("launch_failed", "Windows detached host did not publish a verified manifest");
+  const bootstrapClaimed = await native.read(DETACHED_BOOTSTRAP_FILE) === null;
+  const manifestPublished = await native.read("manifest.json") !== null;
+  const readyPublished = await native.read(DETACHED_READY_FILE) !== null;
+  const stage = !bootstrapClaimed
+    ? "before_bootstrap_claim"
+    : !manifestPublished
+      ? "after_bootstrap_claim"
+      : !readyPublished
+        ? "after_manifest_publish"
+        : "after_ready_publish";
+  throw new WindowsSessionHostUnavailable("launch_failed", `Windows detached host did not publish a verified manifest (${stage})`);
 }
 
 async function removeDetachedBootstrapState(
@@ -1280,10 +1397,11 @@ export async function launchDetachedWindowsSessionHostWithNative(
     await native.writeAtomic(DETACHED_BOOTSTRAP_FILE, new TextEncoder().encode(JSON.stringify(bootstrap)));
     const entry = options.runnerEntryPath ?? emittedSiblingPath(import.meta.url, "windows-session-host-runner-entry.js");
     if (!isAbsolute(entry)) throw new WindowsSessionHostUnavailable("invalid_manifest", "Windows detached runner entry must be absolute");
+    const environment = runnerEnvironment(options.stateDirectory);
     const launch = await native.launchDetachedHost({
       executablePath: process.execPath,
       arguments: [entry],
-      environment: runnerEnvironment(options.stateDirectory),
+      environment,
     });
     if (launch.status !== "launched") {
       // The native boundary proved CreateProcessW never succeeded. Unlike a
