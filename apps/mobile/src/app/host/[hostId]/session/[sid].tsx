@@ -50,7 +50,7 @@ import {
 } from "@/lib/attach";
 import { Meter, Row, Sheet, SheetAction } from "@/components/Sheet";
 import { toast } from "@/components/Toast";
-import { color, font, MONOSPACE_FONT, statusColor, utilizationColor } from "@/lib/theme";
+import { color, font, MONOSPACE_FONT, quotaRemainingColor, quotaRemainingPct, statusColor } from "@/lib/theme";
 import { matchCommands } from "@/lib/slash-commands";
 import { setSessionArchived } from "@/lib/session-preferences";
 import { sortSessions } from "@/lib/store";
@@ -313,6 +313,7 @@ export default function SessionScreen() {
   const [focused, setFocused] = useState(false);
   const [pending, setPending] = useState(0);
   const [search, setSearch] = useState<string | null>(null);
+  const [deepseekView, setDeepseekView] = useState<"chat" | "trajectory">("chat");
   const [busyDelivery, setBusyDelivery] = useState<Exclude<ChatDelivery, "auto">>("queue");
   const [completionResult, setCompletionResult] = useState<{
     key: string;
@@ -322,6 +323,8 @@ export default function SessionScreen() {
   const completionSequence = useRef(0);
 
   const session = sid ? runtime.sessions[sid] : undefined;
+  const supportsDeepseekTrajectory = conn?.supportsDeepseekTrajectory ?? false;
+  const effectiveDeepseekView = supportsDeepseekTrajectory ? deepseekView : "chat";
   const orchestration = useOrchestrationSnapshot(conn, runtime.status, 8_000);
   const coordinatorRun = useMemo(
     () => coordinatorRunsBySession(orchestration?.runs ?? []).get(sid) ?? null,
@@ -1106,6 +1109,22 @@ export default function SessionScreen() {
                   {subagent?.name ?? "子 Agent"}
                 </Text>
               </View>
+            ) : session.agent === "deepseek" && supportsDeepseekTrajectory ? (
+              <View style={styles.deepseekViewToggle}>
+                {(["chat", "trajectory"] as const).map((mode) => (
+                  <Pressable
+                    key={mode}
+                    style={[styles.deepseekViewOption, deepseekView === mode && styles.deepseekViewOptionActive]}
+                    onPress={() => setDeepseekView(mode)}
+                    accessibilityRole="button"
+                    accessibilityState={{ selected: deepseekView === mode }}
+                  >
+                    <Text style={[styles.deepseekViewText, deepseekView === mode && styles.deepseekViewTextActive]}>
+                      {mode === "chat" ? "对话" : "轨迹"}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
             ) : (
               <>
                 <Icon
@@ -1126,7 +1145,7 @@ export default function SessionScreen() {
               style={[styles.controlChip, displayedMode === "plan" && styles.controlChipPlan]}
               onPress={openControls}
               accessibilityRole="button"
-              accessibilityLabel="模型与 Plan 模式"
+              accessibilityLabel={session.agent === "deepseek" ? "模型与推理强度" : "模型与 Plan 模式"}
             >
               <Text style={[styles.controlChipText, displayedMode === "plan" && styles.controlChipTextPlan]}>
                 {displayedMode === "plan" ? "Plan" : displayedModel?.split("/").at(-1) ?? "模型"}
@@ -1231,6 +1250,7 @@ export default function SessionScreen() {
           projectRoot={session.cwd}
           onOpenFile={openFileReference}
           onPendingChange={setPending}
+          viewMode={session.agent === "deepseek" ? effectiveDeepseekView : "chat"}
           {...(search !== null ? { search } : {})}
           onRetry={send}
         />
@@ -1440,8 +1460,10 @@ export default function SessionScreen() {
       <Sheet visible={menuOpen} title={session.title || "会话"} onClose={() => setMenuOpen(false)}>
         {isStructured && session.agentControls && !isSubagent ? (
           <SheetAction
-            label="模型与 Plan 模式"
-            detail="切换当前会话的模型、推理强度和工作模式"
+            label={session.agent === "deepseek" ? "模型与推理强度" : "模型与 Plan 模式"}
+            detail={session.agent === "deepseek"
+              ? "切换当前会话的模型和推理强度"
+              : "切换当前会话的模型、推理强度和工作模式"}
             symbol="command"
             onPress={() => {
               setMenuOpen(false);
@@ -1726,20 +1748,23 @@ export default function SessionScreen() {
               <Row label="输出 token" value={usage.outputTokens.toLocaleString()} />
             ) : null}
 
-            {(usage.windows ?? []).map((w) => (
-              <View key={w.label} style={styles.window}>
-                <View style={styles.windowHead}>
-                  <Text style={font.body}>{w.label}</Text>
-                  <Text style={[styles.windowPct, { color: utilizationColor(w.utilization) }]}>
-                    {String(Math.round(w.utilization))}%
-                  </Text>
+            {(usage.windows ?? []).map((w) => {
+              const remaining = quotaRemainingPct(w.utilization);
+              return (
+                <View key={w.label} style={styles.window}>
+                  <View style={styles.windowHead}>
+                    <Text style={font.body}>{w.label}</Text>
+                    <Text style={[styles.windowPct, { color: quotaRemainingColor(remaining) }]}>
+                      剩余 {String(remaining)}%
+                    </Text>
+                  </View>
+                  <Meter value={remaining} tint={quotaRemainingColor(remaining)} />
+                  {w.resetsAt ? (
+                    <Text style={font.meta}>{formatReset(w.resetsAt)} 重置</Text>
+                  ) : null}
                 </View>
-                <Meter value={w.utilization} tint={utilizationColor(w.utilization)} />
-                {w.resetsAt ? (
-                  <Text style={font.meta}>{formatReset(w.resetsAt)} 重置</Text>
-                ) : null}
-              </View>
-            ))}
+              );
+            })}
 
             {!usage.available || (usage.windows ?? []).length === 0 ? (
               <Text style={styles.sheetNote}>
@@ -1966,6 +1991,24 @@ const styles = StyleSheet.create({
     gap: 7,
     paddingHorizontal: 8,
   },
+  deepseekViewToggle: {
+    minHeight: 30,
+    flexDirection: "row",
+    alignItems: "stretch",
+    borderRadius: 7,
+    backgroundColor: color.surfaceRaised,
+    padding: 2,
+  },
+  deepseekViewOption: {
+    minWidth: 48,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 5,
+    paddingHorizontal: 9,
+  },
+  deepseekViewOptionActive: { backgroundColor: color.accentDim },
+  deepseekViewText: { color: color.textDim, fontSize: 11.5, fontWeight: "600" },
+  deepseekViewTextActive: { color: "#fff" },
   modeText: { color: color.text, fontSize: 13, fontWeight: "600" },
   coordinatorModeText: { color: color.accent },
   subagentModeIdentity: {

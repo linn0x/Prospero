@@ -13,11 +13,16 @@ class FakeTransport implements DeepseekTransport {
 
   async call<T>(method: string, payload: Record<string, unknown>): Promise<T> {
     this.calls.push({ method, payload });
-    if (method === "session.create") return { sessionId: payload["sessionId"] ?? "dsh-session-1" } as T;
+    if (method === "session.create") return {
+      sessionId: payload["sessionId"] ?? "dsh-session-1",
+      ...(typeof payload["agentPreset"] === "string" ? { agentPreset: payload["agentPreset"] } : {}),
+    } as T;
     if (method === "session.history") return { events: this.historyEvents, hasMore: false } as T;
-    if (method === "session.models") {
+    if (method === "session.models" || method === "llm.models") {
       return {
-        current: { provider: "deepseek-official", model: "deepseek-v4-flash", reasoningEffort: "high" },
+        ...(method === "session.models"
+          ? { current: { provider: "deepseek-official", model: "deepseek-v4-flash", reasoningEffort: "high" } }
+          : {}),
         groups: [{
           id: "deepseek-official",
           name: "DeepSeek",
@@ -35,6 +40,14 @@ class FakeTransport implements DeepseekTransport {
         model: payload["model"],
         reasoningEffort: payload["reasoningEffort"],
       } } as T;
+    }
+    if (method === "agentPreset.list") {
+      return {
+        presets: [
+          { id: "default", name: "Default", isDefault: true, trust: "builtin" },
+          { id: "reviewer", name: "Reviewer", description: "Review changes", trust: "user" },
+        ],
+      } as T;
     }
     return { accepted: true } as T;
   }
@@ -130,7 +143,7 @@ describe("DeepseekAdapter", () => {
     expect(events).toContainEqual(expect.objectContaining({ kind: "tool.end", callId: "call-1", state: "success" }));
     expect(events.at(-1)).toEqual({
       kind: "turn.end",
-      msgId: "deepseek_3",
+      msgId: "deepseek_3_1",
       finish: "completed",
       inputTokens: 20,
       outputTokens: 7,
@@ -155,17 +168,22 @@ describe("DeepseekAdapter", () => {
     const adapter = new DeepseekAdapter({ transport });
     await adapter.start(context(events, []));
 
-    expect(events).toEqual([
+    expect(events.filter((event) => event.kind !== "trajectory.record")).toEqual([
       { kind: "text.delta", msgId: "deepseek_2_1", textId: "deepseek_2_1", delta: "已补回" },
-      { kind: "turn.end", msgId: "deepseek_2", finish: "completed" },
+      { kind: "turn.end", msgId: "deepseek_2_1", finish: "completed" },
     ]);
+    expect(events).toContainEqual(expect.objectContaining({
+      kind: "trajectory.record",
+      recordId: "turn_2",
+      phase: "completed",
+    }));
 
     transport.emit("live-replay", {
       type: "session/event",
       sessionId: "dsh-session-1",
       event: transport.historyEvents[1]!.event,
     });
-    expect(events).toHaveLength(2);
+    expect(events.filter((event) => event.kind !== "trajectory.record")).toHaveLength(2);
   });
 
   it("resumes from the persisted Harness event cursor without replaying old answers", async () => {
@@ -184,6 +202,146 @@ describe("DeepseekAdapter", () => {
     });
     await adapter.start(context(events, []));
     expect(events).toEqual([]);
+  });
+
+  it("restores assembled DeepSeek history and its trajectory without raw chunks", async () => {
+    const transport = new FakeTransport();
+    transport.historyEvents = [
+      {
+        event: {
+          seq: 1,
+          time: 1_000,
+          type: "user/message",
+          data: { id: "user-1", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "检查项目" }] },
+        },
+      },
+      { event: { seq: 2, time: 1_100, type: "turn/start", data: { turn: 1 } } },
+      { event: { seq: 3, time: 1_200, type: "step/start", data: { turn: 1, step: 0 } } },
+      {
+        event: {
+          seq: 4,
+          time: 1_900,
+          type: "assistant/message",
+          data: {
+            turn: 1,
+            step: 0,
+            message: { id: "assistant-1", content: [{ type: "reasoning", text: "分析" }, { type: "text", text: "已完成" }] },
+            usage: { inputTokens: 12, outputTokens: 4 },
+          },
+        },
+      },
+      { event: { seq: 5, time: 2_000, type: "step/end", data: { turn: 1, step: 0 } } },
+      { event: { seq: 6, time: 2_100, type: "turn/end", data: { turn: 1, reason: { kind: "completed" } } } },
+    ];
+    const events: AgentEventBody[] = [];
+    const adapter = new DeepseekAdapter({ transport });
+    await adapter.start(context(events, []));
+
+    expect(events).toContainEqual({ kind: "user.message", msgId: "user-1", text: "检查项目" });
+    expect(events).toContainEqual({ kind: "reasoning.delta", msgId: "assistant-1", delta: "分析" });
+    expect(events).toContainEqual({ kind: "text.delta", msgId: "assistant-1", textId: "assistant-1", delta: "已完成" });
+    expect(events).toContainEqual(expect.objectContaining({
+      kind: "trajectory.record",
+      recordId: "request_1_0",
+      durationMs: 700,
+      inputTokens: 12,
+      outputTokens: 4,
+    }));
+    expect(events.at(-1)).toEqual({
+      kind: "turn.end",
+      msgId: "assistant-1",
+      finish: "completed",
+      inputTokens: 12,
+      outputTokens: 4,
+    });
+  });
+
+  it("maps model context, turn duration and compaction lifecycle into trajectory records", async () => {
+    const transport = new FakeTransport();
+    transport.historyEvents = [
+      { event: { seq: 1, time: 100, type: "turn/start", data: { turn: 4 } } },
+      {
+        event: {
+          seq: 2,
+          time: 150,
+          type: "request/context",
+          data: { provider: "deepseek-official", model: "deepseek-v4-flash", contextWindow: 128_000 },
+        },
+      },
+      { event: { seq: 3, time: 200, type: "compaction/start", data: { compactionId: "compact-1", turn: 4 } } },
+      {
+        event: {
+          seq: 4,
+          time: 500,
+          type: "compaction/summary",
+          data: {
+            compactionId: "compact-1",
+            summary: "保留关键上下文",
+            usage: { inputTokens: 30, outputTokens: 8 },
+          },
+        },
+      },
+      { event: { seq: 5, time: 700, type: "compaction/end", data: { compactionId: "compact-1", turn: 4 } } },
+      { event: { seq: 6, time: 900, type: "turn/end", data: { turn: 4, reason: { kind: "completed" } } } },
+    ];
+    const events: AgentEventBody[] = [];
+    const adapter = new DeepseekAdapter({ transport });
+    await adapter.start(context(events, []));
+
+    expect(events).toContainEqual(expect.objectContaining({
+      kind: "trajectory.record",
+      recordId: "context_2",
+      detail: "deepseek-official/deepseek-v4-flash · 128000 tokens",
+    }));
+    expect(events).toContainEqual(expect.objectContaining({
+      kind: "trajectory.record",
+      recordId: "compaction_compact-1",
+      phase: "completed",
+      detail: "保留关键上下文",
+      durationMs: 500,
+      inputTokens: 30,
+      outputTokens: 8,
+    }));
+    expect(events).toContainEqual(expect.objectContaining({
+      kind: "trajectory.record",
+      recordId: "turn_4",
+      phase: "completed",
+      durationMs: 800,
+    }));
+  });
+
+  it("applies the selected preset, model and reasoning effort to a new session", async () => {
+    const transport = new FakeTransport();
+    const states: Record<string, unknown>[] = [];
+    const adapter = new DeepseekAdapter({
+      transport,
+      resumeState: {
+        agentPreset: "reviewer",
+        model: "deepseek-official/deepseek-v4-flash",
+        effort: "low",
+      },
+    });
+    await adapter.start(context([], states));
+
+    expect(transport.calls).toContainEqual({
+      method: "session.create",
+      payload: { cwd: "D:\\work\\project", agentPreset: "reviewer" },
+    });
+    expect(transport.calls).toContainEqual({
+      method: "session.selectModel",
+      payload: {
+        sessionId: "dsh-session-1",
+        provider: "deepseek-official",
+        model: "deepseek-v4-flash",
+        reasoningEffort: "low",
+      },
+    });
+    expect(states.at(-1)).toEqual({
+      sessionId: "dsh-session-1",
+      agentPreset: "reviewer",
+      model: "deepseek-official/deepseek-v4-flash",
+      effort: "low",
+    });
   });
 
   it("answers approval and question server requests through /api/respond semantics", async () => {
@@ -253,6 +411,10 @@ describe("DeepseekAdapter", () => {
       }],
       currentModel: "deepseek-official/deepseek-v4-flash",
       currentEffort: "high",
+      presets: [
+        { id: "default", name: "Default", isDefault: true },
+        { id: "reviewer", name: "Reviewer", description: "Review changes", custom: true },
+      ],
     });
     await expect(adapter.setModel("deepseek-official/deepseek-v4-flash", "low")).resolves.toEqual({
       currentModel: "deepseek-official/deepseek-v4-flash",
@@ -263,5 +425,27 @@ describe("DeepseekAdapter", () => {
       model: "deepseek-official/deepseek-v4-flash",
       effort: "low",
     });
+  });
+
+  it("reads launch catalogs without creating an empty Harness session", async () => {
+    const transport = new FakeTransport();
+    const adapter = new DeepseekAdapter({ transport });
+    await adapter.start({ ...context([], []), catalogOnly: true });
+
+    await expect(adapter.listModels()).resolves.toEqual({
+      models: [{
+        id: "deepseek-official/deepseek-v4-flash",
+        label: "DeepSeek · V4 Flash",
+        supportedEfforts: ["low", "high"],
+        defaultEffort: "high",
+      }],
+      presets: [
+        { id: "default", name: "Default", isDefault: true },
+        { id: "reviewer", name: "Reviewer", description: "Review changes", custom: true },
+      ],
+    });
+    expect(transport.calls.some((call) => call.method === "session.create")).toBe(false);
+    expect(transport.calls).toContainEqual({ method: "llm.models", payload: {} });
+    expect(transport.calls).toContainEqual({ method: "agentPreset.list", payload: {} });
   });
 });

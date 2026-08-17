@@ -1,10 +1,12 @@
-import { useRef } from "react";
-import { Alert, Pressable, StyleSheet, Text, View } from "react-native";
+import { useRef, useState } from "react";
+import { Pressable, StyleSheet, Text, View } from "react-native";
 import ReanimatedSwipeable, {
   type SwipeableMethods,
 } from "react-native-gesture-handler/ReanimatedSwipeable";
 import * as Haptics from "expo-haptics";
 import { Icon, type IconName } from "@/components/Icon";
+import { Sheet, SheetAction } from "@/components/Sheet";
+import { color, font } from "@/lib/theme";
 
 export interface SwipeAction {
   /** Stable custom accessibility-action name, unique within this row. */
@@ -35,6 +37,7 @@ export function SwipeRow({
   clipRadius?: number;
 }): React.ReactElement {
   const ref = useRef<SwipeableMethods>(null);
+  const [pending, setPending] = useState<SwipeAction | null>(null);
 
   const run = (action: SwipeAction): void => {
     ref.current?.close();
@@ -44,14 +47,7 @@ export function SwipeRow({
       return;
     }
     void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
-    Alert.alert(action.confirm.title, action.confirm.message, [
-      { text: "取消", style: "cancel" },
-      {
-        text: action.confirm.confirmLabel,
-        style: "destructive",
-        onPress: () => action.onPress(),
-      },
-    ]);
+    setPending(action);
   };
 
   const swipeable = (
@@ -85,8 +81,30 @@ export function SwipeRow({
         {children}
       </ReanimatedSwipeable>
   );
-  return clipRadius === undefined ? swipeable : (
-    <View style={[styles.clipped, { borderRadius: clipRadius }]}>{swipeable}</View>
+  return (
+    <>
+      {clipRadius === undefined ? swipeable : (
+        <View style={[styles.clipped, { borderRadius: clipRadius }]}>{swipeable}</View>
+      )}
+      <Sheet
+        visible={pending !== null}
+        title={pending?.confirm?.title ?? "确认操作"}
+        onClose={() => setPending(null)}
+      >
+        <Text style={styles.confirmMessage}>{pending?.confirm?.message}</Text>
+        <SheetAction
+          label={pending?.confirm?.confirmLabel ?? "确认"}
+          detail="此操作无法自动撤销"
+          symbol={pending?.symbol ?? "trash"}
+          destructive
+          onPress={() => {
+            const action = pending;
+            setPending(null);
+            action?.onPress();
+          }}
+        />
+      </Sheet>
+    </>
   );
 }
 
@@ -102,4 +120,5 @@ const styles = StyleSheet.create({
   },
   actionPressed: { opacity: 0.75 },
   actionLabel: { color: "#fff", fontSize: 11, fontWeight: "600" },
+  confirmMessage: { ...font.sub, color: color.textDim, lineHeight: 20 },
 });

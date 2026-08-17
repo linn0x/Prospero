@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { listSessions } from "@anthropic-ai/claude-agent-sdk";
 import type { ResumableConversation } from "@prospero/protocol";
 import { CodexAdapter } from "./adapters/codex.js";
+import { DeepseekAdapter } from "./adapters/deepseek.js";
 
 export type ResumableAgent = ResumableConversation["agent"];
 
@@ -20,6 +21,9 @@ export async function searchLocalConversations(
   const limit = Math.max(1, Math.min(50, requestedLimit));
   if (agent === "codex") {
     return CodexAdapter.searchLocalConversations(query, limit, environment, codexAppServerArgs);
+  }
+  if (agent === "deepseek") {
+    return DeepseekAdapter.searchLocalConversations(query, limit);
   }
 
   if (environment?.["CLAUDE_CONFIG_DIR"]) {

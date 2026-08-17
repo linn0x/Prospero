@@ -5,7 +5,7 @@ import { AgentIcon } from "@/components/AgentIcon";
 import type { HostConnection } from "@/lib/connection";
 import { bytes, duration, untilLabel } from "@/lib/format";
 import { Row, Sheet } from "@/components/Sheet";
-import { color, font, radius, space, utilizationColor } from "@/lib/theme";
+import { color, font, quotaRemainingColor, quotaRemainingPct, radius, space, utilizationColor } from "@/lib/theme";
 
 type UsageResult = Extract<S2CMessage, { type: "usage.result" }>;
 
@@ -163,13 +163,13 @@ export function HostSummary({
               badge={accountSourceLabel(a)}
               value={
                 w
-                  ? `${w.label} 剩 ${String(remainingPct(w.utilization))}%`
+                  ? `${w.label} 剩 ${String(quotaRemainingPct(w.utilization))}%`
                   : a.available
                     ? "无限流"
                     : "暂无数据"
               }
-              pct={w?.utilization ?? 0}
-              tint={w ? utilizationColor(w.utilization) : color.border}
+              pct={w ? quotaRemainingPct(w.utilization) : 0}
+              tint={w ? quotaRemainingColor(quotaRemainingPct(w.utilization)) : color.border}
             />
           );
         })}
@@ -253,13 +253,16 @@ export function HostSummary({
                         style={[
                           styles.gaugeValue,
                           styles.gaugeValueRight,
-                          { color: utilizationColor(w.utilization) },
+                          { color: quotaRemainingColor(quotaRemainingPct(w.utilization)) },
                         ]}
                       >
-                        {`已用 ${String(Math.round(w.utilization))}% · 剩 ${String(remainingPct(w.utilization))}%`}
+                        {`已用 ${String(Math.round(w.utilization))}% · 剩 ${String(quotaRemainingPct(w.utilization))}%`}
                       </Text>
                     </View>
-                    <Bar pct={w.utilization} tint={utilizationColor(w.utilization)} />
+                    <Bar
+                      pct={quotaRemainingPct(w.utilization)}
+                      tint={quotaRemainingColor(quotaRemainingPct(w.utilization))}
+                    />
                     {w.resetsAt !== undefined && (
                       <Text style={font.meta}>{untilLabel(w.resetsAt, now)}</Text>
                     )}
@@ -346,10 +349,6 @@ function topWindow(a: UsageAccount): UsageAccount["windows"][number] | null {
 
 function tightest(a: UsageAccount): number {
   return topWindow(a)?.utilization ?? -1;
-}
-
-function remainingPct(utilization: number): number {
-  return Math.max(0, Math.min(100, Math.round(100 - utilization)));
 }
 
 function accountSourceLabel(a: UsageAccount): string {
