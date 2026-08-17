@@ -2,6 +2,7 @@ import { execFile as execFileCallback, execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -10,6 +11,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import type {
@@ -497,6 +499,22 @@ export class AgentAccountManager {
         if (expectedAgent && expectedAgent !== agent) {
           throw new AgentAccountError("账号与所选 Agent 不匹配", "account_invalid");
         }
+        if (agent === "codex") {
+          // 本机默认 Codex 也必须隔离 CODEX_HOME：daemon 的 app-server 会持有
+          // ~/.codex 里的 thread-writer-locks，与 Codex 桌面应用共享同一份 home 时
+          // 会把后者的线程锁成“在另一个应用中打开”。隔离后两者互不相扰。
+          const root = this.rootFor("codex", NATIVE_IDS.codex);
+          mkdirSync(root, { recursive: true, mode: 0o700 });
+          chmodSync(root, 0o700);
+          this.migrateNativeCodexAuth(root);
+          return {
+            id: accountId,
+            agent,
+            name: "本机默认",
+            managed: false,
+            environment: { CODEX_HOME: root, CODEX_SQLITE_HOME: root },
+          };
+        }
         return { id: accountId, agent, name: "本机默认", managed: false, environment: {} };
       }
     }
@@ -879,6 +897,25 @@ export class AgentAccountManager {
       throw new AgentAccountError("账号 ID 无效", "account_invalid");
     }
     return path.join(this.rootsDir, agent, accountId);
+  }
+
+  /**
+   * 隔离本机默认 Codex 的 home 后，一次性继承用户既有的登录凭据，避免要求用户
+   * 重新跑一遍 `codex login`。只复制 auth.json，不复制 config.toml —— 桌面应用的
+   * 全局配置(如 code_mode_host)不该泄漏进 daemon 的会话环境。
+   */
+  private migrateNativeCodexAuth(root: string): void {
+    const target = path.join(root, "auth.json");
+    if (existsSync(target)) return;
+    const sharedCodexHome = process.env["CODEX_HOME"] ?? path.join(os.homedir(), ".codex");
+    const sharedAuth = path.join(sharedCodexHome, "auth.json");
+    if (!existsSync(sharedAuth) || sharedAuth === target) return;
+    try {
+      copyFileSync(sharedAuth, target);
+      chmodSync(target, 0o600);
+    } catch {
+      // 迁移失败只是退化为“需要在账号页重新登录”，不影响隔离本身。
+    }
   }
 
   private load(): AccountStore {

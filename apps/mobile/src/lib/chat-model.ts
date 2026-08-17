@@ -110,6 +110,23 @@ export interface TurnDiffSummaryItem {
   agentId?: string;
 }
 
+export interface TrajectoryItem {
+  type: "trajectory";
+  key: string;
+  recordId: string;
+  recordKind: "turn" | "step" | "request" | "retry" | "compaction";
+  phase: "running" | "completed" | "failed" | "info";
+  title: string;
+  detail?: string;
+  turn?: number;
+  step?: number;
+  startedAt?: number;
+  durationMs?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  agentId?: string;
+}
+
 export type ChatItem =
   | UserItem
   | AssistantItem
@@ -118,6 +135,7 @@ export type ChatItem =
   | QuestionItem
   | SubagentItem
   | ErrorItem
+  | TrajectoryItem
   | TurnDiffSummaryItem;
 
 export type FoldableActivityItem = ToolItem | PermissionItem;
@@ -328,6 +346,28 @@ export function applyEvent(items: ChatItem[], ev: AgentEventBody): ChatItem[] {
           ...(ev.summary ? { preview: ev.summary } : {}),
         },
       });
+    }
+
+    case "trajectory.record": {
+      const key = scopedKey("tr", ev.recordId);
+      const next: TrajectoryItem = {
+        type: "trajectory",
+        key,
+        recordId: ev.recordId,
+        recordKind: ev.recordKind,
+        phase: ev.phase,
+        title: ev.title,
+        ...(ev.detail !== undefined ? { detail: ev.detail } : {}),
+        ...(ev.turn !== undefined ? { turn: ev.turn } : {}),
+        ...(ev.step !== undefined ? { step: ev.step } : {}),
+        ...(ev.startedAt !== undefined ? { startedAt: ev.startedAt } : {}),
+        ...(ev.durationMs !== undefined ? { durationMs: ev.durationMs } : {}),
+        ...(ev.inputTokens !== undefined ? { inputTokens: ev.inputTokens } : {}),
+        ...(ev.outputTokens !== undefined ? { outputTokens: ev.outputTokens } : {}),
+        ...agentField,
+      };
+      const idx = findLastIndex(items, (item) => item.type === "trajectory" && item.key === key);
+      return idx < 0 ? [...items, next] : replaceAt(items, idx, next);
     }
 
     case "turn.end": {
