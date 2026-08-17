@@ -1,6 +1,31 @@
 import Foundation
 import Observation
 
+enum LocalSessionControlRequest {
+  static func createBody(
+    agent: String,
+    kind: String,
+    cwd: String,
+    approvalPolicy: String,
+    accountId: String?
+  ) -> [String: Any] {
+    var body: [String: Any] = [
+      "agent": agent,
+      "kind": kind,
+      "cwd": cwd,
+      "cols": 120,
+      "rows": 40,
+    ]
+    if kind == "structured" {
+      body["approvalPolicy"] = approvalPolicy
+    }
+    if let accountId, !accountId.isEmpty {
+      body["accountId"] = accountId
+    }
+    return body
+  }
+}
+
 /// 起停并盯着 prosperod。
 ///
 /// 这个壳存在的理由就在这里:daemon 作为 app 的子进程运行,TCC 权限归属 app bundle,
@@ -384,19 +409,13 @@ final class DaemonController {
     ) else {
       return (nil, "无法构造控制地址")
     }
-    var body: [String: Any] = [
-      "agent": agent,
-      "kind": kind,
-      "cwd": cwd,
-      "cols": 120,
-      "rows": 40,
-    ]
-    if kind == "structured" {
-      body["approvalPolicy"] = approvalPolicy
-    }
-    if let accountId, !accountId.isEmpty {
-      body["accountId"] = accountId
-    }
+    let body = LocalSessionControlRequest.createBody(
+      agent: agent,
+      kind: kind,
+      cwd: cwd,
+      approvalPolicy: approvalPolicy,
+      accountId: accountId
+    )
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
     request.setValue("Bearer \(running.controlToken)", forHTTPHeaderField: "Authorization")

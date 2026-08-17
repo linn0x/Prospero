@@ -479,6 +479,8 @@ adapter 的 `SessionStatus`（idle 等）猜 done。
     daemon 公钥 TOFU 绑定。
 - **状态/持久化**：运行时 `lib/store.ts`（zustand，`sortSessions` 待审批置顶）；地址簿 `lib/hosts.ts`（AsyncStorage）；
   凭据 SecureStore；诊断 `lib/connect-diagnosis.ts`（失败分类 + 可执行提示）。
+- **会话创建**：结构化会话可在创建前选择 `strict / standard / yolo`，并将策略与账号、模型、Plan/Goal、恢复参数
+  原子写入同一条 `session.create`；默认保持 `strict`，选择 `yolo` 必须二次确认。
 - **路由**：`/`（主机列表）、`/pair`、`/host/[hostId]`（会话列表 + Goal/账号入口）、`.../edit`、`.../accounts`、
   `.../orchestration`、`.../session/[sid]`（ChatView 或 Terminal+KeyBar）、`.../files/[sid]`、`.../git/[sid]`、
   `.../preview/[sid]`。
@@ -501,6 +503,8 @@ SwiftPM 可执行目标 `ProsperoShell`（macOS 14+，Swift 6）。**存在的�
   `stopped/starting/running(externallyRunning)/failed`；端口探测避免抢占手动起的 daemon；通过回环 HTTP + 每次启动
   轮换的 control token 提供本机控制接口。
 - `Pairing`：调 `prosperod pair` 铸设备，CoreImage 渲染 QR（凭证只显示不落盘）。
+- `Dashboard`：本机新建器可选结构化 ChatUI 或原生 CLI；结构化会话在创建前选择 `strict / standard / yolo`，
+  与手机保持相同的默认值和 YOLO 二次确认。
 - `Bonjour`：`NetService` 发布 `_prospero._tcp`（广播从 daemon 挪到壳，TCC 归属 .app）。
 - `LoginItem`：`SMAppService.mainApp` 开机自启。
 - `scripts/build-app.sh`：`swift build -c release` → 组装 `.app`（Info.plist 写 bundle id 与 Bonjour/本地网络描述）→

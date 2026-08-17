@@ -37,6 +37,20 @@ private enum DashboardPage: String, CaseIterable, Identifiable {
   }
 }
 
+enum LocalSessionLaunchRules {
+  /// 这些 Agent 的本机结构化轨能把审批请求映射到 Prospero ChatUI。
+  /// Grok/Trae/Shell 保持 PTY，避免展示一个原生轨实际无法兑现的策略选择。
+  private static let structuredAgents: Set<String> = ["claude", "codex", "opencode"]
+
+  static func supportsStructured(_ agent: String) -> Bool {
+    structuredAgents.contains(agent)
+  }
+
+  static func defaultKind(for agent: String) -> String {
+    supportsStructured(agent) ? "structured" : "pty"
+  }
+}
+
 struct ProsperoDashboard: View {
   @Bindable var daemon: DaemonController
   @Bindable var pairing: PairingModel
@@ -102,10 +116,10 @@ struct ProsperoDashboard: View {
           Button {
             presentSessionLauncher(selectedProjectPath)
           } label: {
-            Label("新建 CLI", systemImage: "plus.circle.fill")
+            Label("新建会话", systemImage: "plus.circle.fill")
           }
           .disabled(daemon.running?.controlToken.isEmpty != false || startingSession)
-          .help("在当前项目的 Shell 中启动 Agent CLI")
+          .help("在当前项目中启动 ChatUI 对话或 Agent CLI")
           Button {
             daemon.restart()
           } label: {
@@ -653,8 +667,8 @@ private struct EmptyProjectSelection: View {
       Text("添加一个项目")
         .font(.title2.weight(.semibold))
       Text(daemonIsRunning
-        ? "选择代码目录后，可在该项目中创建并管理 Agent CLI 会话。"
-        : "daemon 启动后，选择代码目录来创建 Agent CLI 会话。")
+        ? "选择代码目录后，可在该项目中创建并管理 Agent 会话。"
+        : "daemon 启动后，选择代码目录来创建 Agent 会话。")
         .foregroundStyle(.secondary)
         .multilineTextAlignment(.center)
       Button("选择项目文件夹…", action: chooseProject)
@@ -676,9 +690,9 @@ private struct EmptyProjectWorkspace: View {
         .foregroundStyle(.secondary)
       Text("\(project.name) 还没有会话")
         .font(.title2.weight(.semibold))
-      Text("新 Agent 默认在内嵌 Shell 中运行原生 CLI。")
+      Text("可创建结构化 ChatUI 对话，或在内嵌 Shell 中运行原生 CLI。")
         .foregroundStyle(.secondary)
-      Button("新建 CLI 会话", action: newSession)
+      Button("新建会话", action: newSession)
         .buttonStyle(.borderedProminent)
         .disabled(!daemonIsRunning)
     }
@@ -694,8 +708,11 @@ private struct LocalSessionComposer: View {
   let cancel: () -> Void
 
   @State private var agent: String
+  @State private var kind: String
   @State private var cwd: String
   @State private var accountId = ""
+  @State private var policy = "strict"
+  @State private var showingYoloConfirmation = false
 
   init(
     initialDirectory: String,
@@ -711,6 +728,7 @@ private struct LocalSessionComposer: View {
     self.submit = submit
     self.cancel = cancel
     _agent = State(initialValue: initialAgent)
+    _kind = State(initialValue: LocalSessionLaunchRules.defaultKind(for: initialAgent))
     _cwd = State(initialValue: initialDirectory)
     let initialAccounts = accounts.filter { $0.agent == initialAgent }
     _accountId = State(
@@ -728,6 +746,17 @@ private struct LocalSessionComposer: View {
     cwd.trimmingCharacters(in: .whitespacesAndNewlines)
   }
 
+  private var policyHelp: String {
+    switch policy {
+    case "standard":
+      return "只读操作自动放行；修改文件、执行命令和联网仍需确认。"
+    case "yolo":
+      return "全部操作自动批准；Codex 同时启用完整访问，操作仍会记录。"
+    default:
+      return "每次工具操作都请求确认；新会话默认使用此策略。"
+    }
+  }
+
   private var directoryIsValid: Bool {
     var isDirectory: ObjCBool = false
     return !cleanDirectory.isEmpty &&
@@ -738,14 +767,14 @@ private struct LocalSessionComposer: View {
   var body: some View {
     VStack(alignment: .leading, spacing: 18) {
       HStack(spacing: 12) {
-        Image(systemName: agent == "shell" ? "terminal.fill" : "cpu")
+        Image(systemName: kind == "structured" ? "bubble.left.and.text.bubble.right.fill" : "terminal.fill")
           .font(.title2)
           .foregroundStyle(.blue)
           .frame(width: 38, height: 38)
           .background(.blue.opacity(0.1), in: RoundedRectangle(cornerRadius: 9))
         VStack(alignment: .leading, spacing: 3) {
           Text("在项目中启动 Agent").font(.title2.bold())
-          Text("默认在内嵌 Shell 中直接运行 Agent 的原生 CLI。")
+          Text(kind == "structured" ? "使用与手机一致的 ChatUI。" : "在内嵌 Shell 中运行原生 CLI。")
             .font(.callout)
             .foregroundStyle(.secondary)
         }
@@ -762,6 +791,8 @@ private struct LocalSessionComposer: View {
           Text("Shell").tag("shell")
         }
         .onChange(of: agent) { _, _ in
+          kind = LocalSessionLaunchRules.defaultKind(for: agent)
+          policy = "strict"
           accountId = selectableAccounts.first(where: \.isDefault)?.id
             ?? selectableAccounts.first?.id
             ?? ""
@@ -774,6 +805,35 @@ private struct LocalSessionComposer: View {
                 .tag(account.id)
             }
           }
+        }
+
+
+        if LocalSessionLaunchRules.supportsStructured(agent) {
+          Picker("界面", selection: $kind) {
+            Text("对话（ChatUI）").tag("structured")
+            Text("终端（CLI）").tag("pty")
+          }
+          .pickerStyle(.segmented)
+          .onChange(of: kind) { _, next in
+            if next != "structured" { policy = "strict" }
+          }
+        }
+
+        if kind == "structured" {
+          Picker("审批策略", selection: Binding(
+            get: { policy },
+            set: { next in
+              if next == "yolo" { showingYoloConfirmation = true }
+              else { policy = next }
+            }
+          )) {
+            Text("逐条批准").tag("strict")
+            Text("半自动").tag("standard")
+            Text("YOLO").tag("yolo")
+          }
+          Text(policyHelp)
+            .font(.caption)
+            .foregroundStyle(policy == "yolo" ? .red : .secondary)
         }
 
         HStack(spacing: 8) {
@@ -798,12 +858,16 @@ private struct LocalSessionComposer: View {
         Button("取消", action: cancel)
           .disabled(isSubmitting)
         Button {
-          submit(agent, "pty", cleanDirectory, "standard", accountId.isEmpty ? nil : accountId)
+          submit(agent, kind, cleanDirectory, policy, accountId.isEmpty ? nil : accountId)
         } label: {
           if isSubmitting {
             ProgressView().controlSize(.small)
           } else {
-            Text(agent == "shell" ? "启动 Shell" : "启动 Agent CLI")
+            Text(
+              kind == "structured"
+                ? "创建对话"
+                : agent == "shell" ? "启动 Shell" : "启动 Agent CLI"
+            )
           }
         }
         .buttonStyle(.borderedProminent)
@@ -812,10 +876,23 @@ private struct LocalSessionComposer: View {
       }
     }
     .padding(24)
-    .frame(width: 540)
+    .frame(width: 560)
+    .confirmationDialog(
+      "新会话使用 YOLO？",
+      isPresented: $showingYoloConfirmation,
+      titleVisibility: .visible
+    ) {
+      Button("我明白，选择 YOLO", role: .destructive) { policy = "yolo" }
+      Button("取消", role: .cancel) {}
+    } message: {
+      Text("Agent 修改文件、执行命令和联网都不再询问；Codex 沙箱也会切到完整访问。")
+    }
   }
 
   private var helpText: String {
+    if kind == "structured" {
+      return "结构化事件会显示为消息、工具、审批和问题卡片；审批策略从第一轮开始生效。"
+    }
     if agent == "shell" {
       return "Shell 使用登录终端并由 tmux 托管，daemon 或 Mac App 重启后仍可恢复。"
     }
