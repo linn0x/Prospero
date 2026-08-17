@@ -49,6 +49,38 @@ describe("chat-model 事件折叠", () => {
     expect(a.finish).toEqual({ reason: "stop", costUsd: 0.002, outputTokens: 7 });
   });
 
+  it("DeepSeek 轨迹以稳定 recordId 原地更新，不产生重复步骤", () => {
+    const items = applyEvents([], [
+      ev({
+        kind: "trajectory.record",
+        recordId: "step_1_0",
+        recordKind: "step",
+        phase: "running",
+        title: "步骤 1",
+        turn: 1,
+        step: 0,
+        startedAt: 1_000,
+      }),
+      ev({
+        kind: "trajectory.record",
+        recordId: "step_1_0",
+        recordKind: "step",
+        phase: "completed",
+        title: "步骤 1",
+        turn: 1,
+        step: 0,
+        startedAt: 1_000,
+        durationMs: 720,
+      }),
+    ]);
+    expect(items).toEqual([expect.objectContaining({
+      type: "trajectory",
+      key: "tr:step_1_0",
+      phase: "completed",
+      durationMs: 720,
+    })]);
+  });
+
   it("turn.end 汇总本轮文件改动，同一路径采用最终 diff", () => {
     const items = applyEvents([], [
       ev({ kind: "user.message", msgId: "u1", text: "改两个文件" }),

@@ -763,6 +763,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
       // `check --wait` 被消息唤醒）。turn.end 已经是该轮的完成事实，迟到的
       // 工具收尾不能把卡片重新标成 running，否则没有下一条 turn.end 将它收回。
       body.kind !== "tool.end" &&
+      body.kind !== "trajectory.record" &&
       body.kind !== "subagent.started" &&
       body.kind !== "subagent.updated" &&
       body.agentId === undefined &&

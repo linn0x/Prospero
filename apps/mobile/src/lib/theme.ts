@@ -93,3 +93,15 @@ export function utilizationColor(pct: number): string {
   if (pct >= 80) return color.warn;
   return color.accent;
 }
+
+/** 订阅余额颜色：余额越少越紧急，低于 15% 明确标红。 */
+export function quotaRemainingColor(remaining: number): string {
+  if (remaining < 15) return color.danger;
+  if (remaining < 35) return color.warn;
+  return color.accent;
+}
+
+/** 服务端上报已用比例；进度条统一表达为 100% → 0% 的剩余额度。 */
+export function quotaRemainingPct(utilization: number): number {
+  return Math.max(0, Math.min(100, Math.round(100 - utilization)));
+}

@@ -22,7 +22,7 @@ import { Icon } from "@/components/Icon";
 import { PromptDialog } from "@/components/PromptDialog";
 import { useHostConnection } from "@/lib/use-host-connection";
 import { untilLabel } from "@/lib/format";
-import { color, font, radius, space, utilizationColor } from "@/lib/theme";
+import { color, font, quotaRemainingColor, quotaRemainingPct, radius, space } from "@/lib/theme";
 
 type UsageResult = Extract<S2CMessage, { type: "usage.result" }>;
 
@@ -607,12 +607,12 @@ function AccountUsage({
 }) {
   const window = tightestWindow(usage);
   const api = account.apiProfile !== undefined || usage?.source === "api";
-  const remaining = window ? Math.max(0, Math.min(100, Math.round(100 - window.utilization))) : null;
+  const remaining = window ? quotaRemainingPct(window.utilization) : null;
   return (
     <View style={styles.usageBox}>
       <View style={styles.usageHead}>
         <Text style={styles.sourceBadge}>{sourceLabel(account, usage)}</Text>
-        <Text style={[styles.usageValue, window && { color: utilizationColor(window.utilization) }]}>
+        <Text style={[styles.usageValue, remaining !== null && { color: quotaRemainingColor(remaining) }]}>
           {remaining !== null
             ? `${window?.label ?? "额度"}剩余 ${String(remaining)}%`
             : api
@@ -627,8 +627,8 @@ function AccountUsage({
               style={[
                 styles.usageFill,
                 {
-                  width: `${Math.max(0, Math.min(100, window.utilization))}%` as const,
-                  backgroundColor: utilizationColor(window.utilization),
+                  width: `${remaining ?? 0}%` as const,
+                  backgroundColor: quotaRemainingColor(remaining ?? 0),
                 },
               ]}
             />

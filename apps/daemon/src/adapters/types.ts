@@ -152,6 +152,16 @@ export interface AgentModelSelection {
 
 export interface AgentModelCatalog extends Partial<AgentModelSelection> {
   models: AgentModel[];
+  presets?: AgentPresetCatalogEntry[];
+  currentPreset?: string;
+}
+
+export interface AgentPresetCatalogEntry {
+  id: string;
+  name: string;
+  description?: string;
+  isDefault?: boolean;
+  custom?: boolean;
 }
 
 export interface AgentModeSelection {

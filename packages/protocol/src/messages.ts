@@ -17,8 +17,8 @@
  * 尝试，daemon 接受同一兼容窗口内的版本。这样 iOS 与 Mac 可以滚动升级，
  * 配对 token 和双方身份密钥都无需轮换。
  */
-export const PROTOCOL_VERSION = 13;
-export const SUPPORTED_PROTOCOL_VERSIONS = [13, 12, 11, 10, 9, 8, 7, 5] as const;
+export const PROTOCOL_VERSION = 14;
+export const SUPPORTED_PROTOCOL_VERSIONS = [14, 13, 12, 11, 10, 9, 8, 7, 5] as const;
 export const MIN_PROTOCOL_VERSION = 5;
 
 /** 加密握手格式。只有密码学帧真的不兼容时才升级。 */
@@ -52,6 +52,8 @@ export const CAPABILITY_SESSION_CREATE_MODEL = "session.create-model.v1";
 export const CAPABILITY_AGENT_API_PROFILES = "agent.api-profiles.v1";
 /** DeepSeek Harness 官方本机 RPC/SSE 结构化会话与编排 worker。 */
 export const CAPABILITY_AGENT_DEEPSEEK_HARNESS = "agent.deepseek-harness.v1";
+/** DeepSeek Harness 执行轨迹事件与移动端时间线。 */
+export const CAPABILITY_DEEPSEEK_TRAJECTORY = "agent.deepseek-trajectory.v1";
 /** 已发送图片的按需预览，避免把原图塞进 chat.snapshot。 */
 export const CAPABILITY_CHAT_ATTACHMENT_PREVIEWS = "chat.attachment-previews.v1";
 /** Windows 工作目录选择器可浏览盘符并在选中目录中新建文件夹。 */

@@ -105,6 +105,7 @@ export interface CreateSessionInput {
   /** 结构化会话从第一轮起使用的模型与推理强度。 */
   model?: string | undefined;
   effort?: string | undefined;
+  agentPreset?: string | undefined;
   /** Agent 原生本机会话 ID；只允许 Claude/Codex 结构化轨。 */
   resume?: { id: string; title?: string | undefined; fork?: true | undefined } | undefined;
   cols: number;
@@ -654,14 +655,24 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     if (kind === "structured" && !structuredCapable(input.agent)) {
       throw new SessionError(`agent "${input.agent}" 暂无结构化适配器`, "agent_unavailable");
     }
-    if (input.resume && (kind !== "structured" || (input.agent !== "claude" && input.agent !== "codex"))) {
-      throw new SessionError("只有 Claude/Codex 对话会话支持接回本机对话", "agent_unavailable");
+    if (input.resume && (kind !== "structured" || (input.agent !== "claude" && input.agent !== "codex" && input.agent !== "deepseek"))) {
+      throw new SessionError("这个 Agent 不支持接回本机对话", "agent_unavailable");
+    }
+    if (input.resume?.fork === true) {
+      throw new SessionError(
+        "不再支持从占用中的 Codex 对话创建副本；请先关闭电脑端任务",
+        "conflict",
+        "conversation_active_writer",
+      );
     }
     if (input.mode && (kind !== "structured" || (input.agent !== "claude" && input.agent !== "codex"))) {
       throw new SessionError("只有 Claude/Codex 对话会话支持 Plan 模式", "agent_unavailable");
     }
-    if (input.model && (kind !== "structured" || (input.agent !== "claude" && input.agent !== "codex"))) {
-      throw new SessionError("只有 Claude/Codex 对话会话支持启动模型选择", "agent_unavailable");
+    if (input.model && (kind !== "structured" || (input.agent !== "claude" && input.agent !== "codex" && input.agent !== "deepseek"))) {
+      throw new SessionError("这个 Agent 不支持启动模型选择", "agent_unavailable");
+    }
+    if (input.agentPreset && (kind !== "structured" || input.agent !== "deepseek")) {
+      throw new SessionError("只有 DeepSeek Harness 支持 Agent 预设", "agent_unavailable");
     }
     if (input.effort && !input.model) {
       throw new SessionError("推理强度必须和启动模型一起指定", "agent_unavailable");
@@ -674,6 +685,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
           input.mode,
           input.model,
           input.effort,
+          input.agentPreset,
           input.resume,
           account,
         )
@@ -803,6 +815,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     mode?: "default" | "plan",
     model?: string,
     effort?: string,
+    agentPreset?: string,
     resume?: { id: string; title?: string | undefined; fork?: true | undefined },
     account?: AccountBinding,
   ): Promise<SessionInfo> {
@@ -811,9 +824,10 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       ...(mode ? { mode } : {}),
       ...(model ? { model } : {}),
       ...(effort ? { effort } : {}),
+      ...(agentPreset && agent === "deepseek" ? { agentPreset } : {}),
+      ...(resume && agent === "deepseek" ? { sessionId: resume.id } : {}),
       ...(resume && agent === "claude" ? { sessionId: resume.id } : {}),
       ...(resume && agent === "codex" ? { threadId: resume.id } : {}),
-      ...(resume?.fork === true && agent === "codex" ? { forkThread: true } : {}),
     };
     const hasInitialAdapterState = Object.keys(initialAdapterState).length > 0;
     if (this.useWindowsStructuredHost && this.windowsStructuredRoot) {
@@ -927,10 +941,10 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
    * Codex 通过 catalogOnly 跳过 thread/start，Claude SDK 则在读取后立即释放。
    */
   async launchModels(
-    agent: "claude" | "codex",
+    agent: "claude" | "codex" | "deepseek",
     accountId?: string,
   ): Promise<AgentModelCatalog> {
-    const account = accountId ? this.resolveAccount(agent, accountId) : undefined;
+    const account = accountId && agent !== "deepseek" ? this.resolveAccount(agent, accountId) : undefined;
     const adapter = this.adapterFactory(agent);
     try {
       await adapter.start({

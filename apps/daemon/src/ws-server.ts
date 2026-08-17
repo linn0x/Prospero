@@ -15,6 +15,7 @@ import {
   CAPABILITY_AGENT_API_PROFILES,
   CAPABILITY_AGENT_DEEPSEEK_HARNESS,
   CAPABILITY_CHAT_ATTACHMENT_PREVIEWS,
+  CAPABILITY_DEEPSEEK_TRAJECTORY,
   CAPABILITY_ORCHESTRATION_AUTOMATION,
   CAPABILITY_ORCHESTRATION_GRAPH,
   CAPABILITY_ORCHESTRATION_LIFECYCLE,
@@ -208,7 +209,7 @@ export interface DaemonServerOptions {
   notify?: NotifyConfig | null;
   /** 测试可注入；生产读取 Claude/Codex 官方本机会话索引。 */
   conversationSearch?: (
-    agent: "claude" | "codex",
+    agent: "claude" | "codex" | "deepseek",
     query: string,
     limit: number,
     environment?: Record<string, string>,
@@ -381,6 +382,37 @@ export async function createDaemonServer(
   // 未监听的 WebSocketServer "error" 再次杀掉整个进程。
   wss.on("error", () => {});
 
+  const SUBAGENT_PREVIEW_WIRE_CHARS = 1000;
+  const trimWireText = (value: string, max: number): string =>
+    value.length <= max ? value : `…${value.slice(-(max - 1))}`;
+
+  function sanitizeSessionInfo(session: SessionInfo): SessionInfo {
+    if (!session.subagents?.some((subagent) =>
+      subagent.preview !== undefined && subagent.preview.length > SUBAGENT_PREVIEW_WIRE_CHARS
+    )) {
+      return session;
+    }
+    return {
+      ...session,
+      subagents: session.subagents.map((subagent) => ({
+        ...subagent,
+        ...(subagent.preview !== undefined
+          ? { preview: trimWireText(subagent.preview, SUBAGENT_PREVIEW_WIRE_CHARS) }
+          : {}),
+      })),
+    };
+  }
+
+  function sanitizeOutboundMessage(msg: S2CMessage): S2CMessage {
+    if (msg.type === "hello.ok") {
+      return { ...msg, sessions: msg.sessions.map(sanitizeSessionInfo) };
+    }
+    if (msg.type === "session.state") {
+      return { ...msg, session: sanitizeSessionInfo(msg.session) };
+    }
+    return msg;
+  }
+
   function send(conn: Conn, msg: S2CMessage): void {
     if (conn.ws.readyState !== WebSocket.OPEN) return;
     // v5 不认识 completed 和 v7 新增的响应类型。未知可选字段会被旧 Zod
@@ -390,10 +422,11 @@ export async function createDaemonServer(
         (msg.type === "orchestration.snapshot" || msg.type === "conversation.results")) ||
       (conn.protocolVersion < 10 && msg.type === "agent.accounts.result")
     ) return;
+    const sanitized = sanitizeOutboundMessage(msg);
     const compatible =
-      conn.protocolVersion <= 5 && msg.type === "session.state" && msg.session.status === "completed"
-        ? { ...msg, session: { ...msg.session, status: "idle" as const } }
-        : msg;
+      conn.protocolVersion <= 5 && sanitized.type === "session.state" && sanitized.session.status === "completed"
+        ? { ...sanitized, session: { ...sanitized.session, status: "idle" as const } }
+        : sanitized;
     conn.ws.send(conn.channel ? conn.channel.seal(compatible) : JSON.stringify(compatible));
   }
 
@@ -533,6 +566,7 @@ export async function createDaemonServer(
   function orchestrationCapabilities(conn: Conn): string[] {
     const capabilities: string[] = [];
     capabilities.push(CAPABILITY_AGENT_DEEPSEEK_HARNESS);
+    if (conn.protocolVersion >= 14) capabilities.push(CAPABILITY_DEEPSEEK_TRAJECTORY);
     if (conn.protocolVersion >= 11) {
       capabilities.push(CAPABILITY_CHAT_ATTACHMENT_PREVIEWS);
       capabilities.push(CAPABILITY_SESSION_CREATE_MODEL);
@@ -671,8 +705,9 @@ export async function createDaemonServer(
     for (const conn of conns) {
       const att = conn.chatAttachments.get(sid);
       if (!conn.device || !att) continue;
-      send(conn, { type: "agent.event", sid, evSeq, body });
       att.lastEvSeq = evSeq;
+      if (body.kind === "trajectory.record" && conn.protocolVersion < 14) continue;
+      send(conn, { type: "agent.event", sid, evSeq, body });
       delivered++;
     }
     // 没有客户端在看这个会话(App 被挂起/切走)且需要人决策 → 推到锁屏。
@@ -756,13 +791,22 @@ export async function createDaemonServer(
       conn.chatAttachments.set(sid, { lastEvSeq: session.snapshot().evSeq });
       let seq = lastEvSeq;
       for (const body of incremental) {
-        send(conn, { type: "agent.event", sid, evSeq: ++seq, body });
+        seq++;
+        if (body.kind === "trajectory.record" && conn.protocolVersion < 14) continue;
+        send(conn, { type: "agent.event", sid, evSeq: seq, body });
       }
       return;
     }
     const snap = session.transportSnapshot();
     conn.chatAttachments.set(sid, { lastEvSeq: snap.evSeq });
-    send(conn, { type: "chat.snapshot", sid, evSeq: snap.evSeq, events: snap.events });
+    send(conn, {
+      type: "chat.snapshot",
+      sid,
+      evSeq: snap.evSeq,
+      events: conn.protocolVersion >= 14
+        ? snap.events
+        : snap.events.filter((body) => body.kind !== "trajectory.record"),
+    });
   }
 
   const catchupTimer = setInterval(() => {
@@ -957,7 +1001,9 @@ export async function createDaemonServer(
       }
       case "conversation.search": {
         try {
-          const account = msg.accountId ? accounts.resolve(msg.accountId, msg.agent) : undefined;
+          const account = msg.accountId && msg.agent !== "deepseek"
+            ? accounts.resolve(msg.accountId, msg.agent)
+            : undefined;
           const conversations = await conversationSearch(
             msg.agent,
             msg.query,
@@ -1032,6 +1078,7 @@ export async function createDaemonServer(
           mode: msg.mode,
           model: msg.model,
           effort: msg.effort,
+          agentPreset: msg.agentPreset,
           resume: msg.resume,
           cols: msg.cols,
           rows: msg.rows,
@@ -1067,6 +1114,8 @@ export async function createDaemonServer(
             requestId: msg.requestId,
             agent: msg.agent,
             models: catalog.models,
+            ...(catalog.presets ? { presets: catalog.presets } : {}),
+            ...(catalog.currentPreset ? { currentPreset: catalog.currentPreset } : {}),
             ...(catalog.currentModel ? { currentModel: catalog.currentModel } : {}),
             ...(catalog.currentEffort ? { currentEffort: catalog.currentEffort } : {}),
           });
@@ -1368,7 +1417,12 @@ export async function createDaemonServer(
         // 随便挑一个会话只能答出其中一家的额度,另外几家的订阅就看不见了。
         if (msg.sid === undefined) {
           const sessions = manager.structuredPerAgent();
-          const accountSnapshot = await accounts.snapshot(manager.list());
+          // 未安装对应 CLI 的 agent(如本机没装 claude)不该出现在主机概览里：
+          // status === "unavailable" 正是“CLI 未安装”，这类账号没有可展示的额度，
+          // 之前会以“来源未知”混进卡片。这里只用于用量展示，账号管理页仍完整保留。
+          const accountSnapshot = (await accounts.snapshot(manager.list())).filter(
+            (account) => account.status !== "unavailable",
+          );
           const usageAccounts = await Promise.all(
             accountSnapshot.map(async (accountMeta): Promise<UsageAccount> => {
               const s = sessions.find((candidate) =>
