@@ -3,6 +3,40 @@ import XCTest
 
 // Contract tests for the Mac daemon cursor boundary.
 final class LocalSessionControlTests: XCTestCase {
+  func testLaunchRulesPreferStructuredOnlyForInteractiveChatAdapters() {
+    XCTAssertEqual(LocalSessionLaunchRules.defaultKind(for: "codex"), "structured")
+    XCTAssertEqual(LocalSessionLaunchRules.defaultKind(for: "claude"), "structured")
+    XCTAssertEqual(LocalSessionLaunchRules.defaultKind(for: "opencode"), "structured")
+    XCTAssertEqual(LocalSessionLaunchRules.defaultKind(for: "grok"), "pty")
+    XCTAssertEqual(LocalSessionLaunchRules.defaultKind(for: "shell"), "pty")
+  }
+
+  func testStructuredCreateBodyIncludesInitialApprovalPolicy() {
+    let body = LocalSessionControlRequest.createBody(
+      agent: "codex",
+      kind: "structured",
+      cwd: "/work/prospero",
+      approvalPolicy: "standard",
+      accountId: "work-account"
+    )
+
+    XCTAssertEqual(body["kind"] as? String, "structured")
+    XCTAssertEqual(body["approvalPolicy"] as? String, "standard")
+    XCTAssertEqual(body["accountId"] as? String, "work-account")
+  }
+
+  func testPtyCreateBodyDoesNotClaimAnApprovalPolicy() {
+    let body = LocalSessionControlRequest.createBody(
+      agent: "codex",
+      kind: "pty",
+      cwd: "/work/prospero",
+      approvalPolicy: "yolo",
+      accountId: nil
+    )
+
+    XCTAssertNil(body["approvalPolicy"])
+  }
+
   func testStructuredDeltaChecksRequestedBaseAndEventContinuity() throws {
     let response = Data(#"""
     {

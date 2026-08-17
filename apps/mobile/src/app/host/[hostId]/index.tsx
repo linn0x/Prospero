@@ -18,6 +18,7 @@ import type {
   AgentAccount,
   AgentKind,
   AgentModel,
+  ApprovalPolicy,
   CodeAgentKind,
   OrchestrationSnapshot,
   ResumableConversation,
@@ -58,6 +59,20 @@ const AGENTS: AgentKind[] = [
 /** 有结构化适配器的 agent(会话会以对话形态呈现) */
 const STRUCTURED: AgentKind[] = ["claude", "codex", "opencode", "deepseek"];
 const RESUMABLE: AgentKind[] = ["claude", "codex"];
+const APPROVAL_POLICIES: readonly {
+  value: ApprovalPolicy;
+  label: string;
+  symbol: "checkmark.circle.fill" | "command" | "exclamationmark.triangle.fill";
+}[] = [
+  { value: "strict", label: "逐条", symbol: "checkmark.circle.fill" },
+  { value: "standard", label: "半自动", symbol: "command" },
+  { value: "yolo", label: "YOLO", symbol: "exclamationmark.triangle.fill" },
+];
+const approvalPolicyHelp: Record<ApprovalPolicy, string> = {
+  strict: "每次工具操作都请求确认；新会话默认使用此策略。",
+  standard: "只读操作自动放行；修改文件、执行命令和联网仍需确认。",
+  yolo: "全部操作自动批准；Codex 同时启用完整访问，操作仍会记录。",
+};
 
 const statusLabel: Record<SessionInfo["status"], string> = {
   starting: "启动中",
@@ -117,6 +132,8 @@ export default function HostScreen() {
   const [sessionKind, setSessionKind] = useState<SessionKind>("structured");
   const [launchMode, setLaunchMode] = useState<"default" | "plan">("default");
   const [launchIntent, setLaunchIntent] = useState<"conversation" | "goal">("conversation");
+  const [approvalPolicy, setApprovalPolicy] = useState<ApprovalPolicy>("strict");
+  const [createYoloConfirmOpen, setCreateYoloConfirmOpen] = useState(false);
   const [goal, setGoal] = useState("");
   const [cwd, setCwd] = useState("");
   const [banner, setBanner] = useState<string | null>(null);
@@ -378,6 +395,8 @@ export default function HostScreen() {
       setSelectedResume(null);
       setLaunchIntent("conversation");
       setGoal("");
+      setApprovalPolicy("strict");
+      setCreateYoloConfirmOpen(false);
       router.push(`/host/${hostId}/session/${sid}`);
     };
     const offSnap = conn.events.on("snapshot", (m) => enter(m.sid));
@@ -509,6 +528,7 @@ export default function HostScreen() {
           resume?: { id: string; title?: string; fork?: true };
           goal?: string;
           accountId?: string;
+          approvalPolicy?: ApprovalPolicy;
           model?: string;
           effort?: string;
         }
@@ -517,6 +537,7 @@ export default function HostScreen() {
           ? {
               ...accountOption,
               ...modelOption,
+              approvalPolicy,
               goal: objective,
             ...(RESUMABLE.includes(agent) ? { mode: "plan" as const } : {}),
           }
@@ -524,14 +545,21 @@ export default function HostScreen() {
             ? {
                 ...accountOption,
                 ...modelOption,
+                approvalPolicy,
                 mode: launchMode,
               ...(selectedResume
                 ? { resume: { id: selectedResume.id, title: selectedResume.title } }
                 : {}),
             }
-          : selectedAccount
-            ? accountOption
-            : undefined;
+          : sessionKind === "structured"
+            ? {
+                ...accountOption,
+                ...modelOption,
+                approvalPolicy,
+              }
+            : selectedAccount
+              ? accountOption
+              : undefined;
     const createKind = launchIntent === "goal"
       ? "structured"
       : STRUCTURED.includes(agent)
@@ -669,6 +697,8 @@ export default function HostScreen() {
                   setSelectedResume(null);
                   setLaunchIntent("conversation");
                   setGoal("");
+                  setApprovalPolicy("strict");
+                  setCreateYoloConfirmOpen(false);
                 }}
                 hitSlop={8}
               >
@@ -680,6 +710,8 @@ export default function HostScreen() {
                   setLaunchIntent("conversation");
                   setGoal("");
                   setSelectedResume(null);
+                  setApprovalPolicy("strict");
+                  setCreateYoloConfirmOpen(false);
                   setCwd((current) => current.trim() || currentSessions[0]?.cwd || "");
                   setComposing(true);
                 }}
@@ -839,6 +871,7 @@ export default function HostScreen() {
                 onPress={() => {
                   setAgent(a);
                   setSessionKind(STRUCTURED.includes(a) ? "structured" : "pty");
+                  if (!STRUCTURED.includes(a)) setApprovalPolicy("strict");
                   setLaunchMode("default");
                   setLaunchIntent("conversation");
                   setGoal("");
@@ -956,6 +989,7 @@ export default function HostScreen() {
                   style={[styles.kindOption, sessionKind === "pty" && styles.kindOptionActive]}
                   onPress={() => {
                     setSessionKind("pty");
+                    setApprovalPolicy("strict");
                     setLaunchIntent("conversation");
                     setSelectedResume(null);
                   }}
@@ -1123,6 +1157,58 @@ export default function HostScreen() {
                     {launchIntent === "goal"
                       ? "创建协调者与 Run；它会拆分任务、派发 worker，并在需要时向你请求决策"
                       : "普通对话只启动一个 Agent 会话"}
+                  </Text>
+                </>
+              )}
+              {sessionKind === "structured" && (
+                <>
+                  <Text style={[styles.formLabel, styles.kindLabel]}>审批策略</Text>
+                  <View style={styles.kindSwitch} accessibilityRole="radiogroup">
+                    {APPROVAL_POLICIES.map((option) => {
+                      const active = approvalPolicy === option.value;
+                      const danger = option.value === "yolo";
+                      return (
+                        <Pressable
+                          key={option.value}
+                          style={[
+                            styles.kindOption,
+                            active && styles.kindOptionActive,
+                            active && danger && styles.policyOptionDangerActive,
+                          ]}
+                          onPress={() => {
+                            if (danger) setCreateYoloConfirmOpen(true);
+                            else setApprovalPolicy(option.value);
+                          }}
+                          accessibilityRole="radio"
+                          accessibilityState={{ checked: active }}
+                          accessibilityLabel={`审批策略：${option.label}`}
+                          accessibilityHint={approvalPolicyHelp[option.value]}
+                        >
+                          <Icon
+                            name={option.symbol}
+                            size={14}
+                            color={active && danger ? color.danger : active ? color.text : color.textDim}
+                          />
+                          <Text
+                            style={[
+                              styles.kindOptionText,
+                              active && styles.kindOptionTextActive,
+                              active && danger && styles.policyOptionDangerText,
+                            ]}
+                          >
+                            {option.label}
+                          </Text>
+                        </Pressable>
+                      );
+                    })}
+                  </View>
+                  <Text
+                    style={[
+                      styles.kindHelp,
+                      approvalPolicy === "yolo" && styles.policyDangerHelp,
+                    ]}
+                  >
+                    {approvalPolicyHelp[approvalPolicy]}
                   </Text>
                 </>
               )}
@@ -1444,6 +1530,8 @@ export default function HostScreen() {
                       setLaunchIntent("conversation");
                       setGoal("");
                       setSelectedResume(null);
+                      setApprovalPolicy("strict");
+                      setCreateYoloConfirmOpen(false);
                       setComposing(true);
                     },
                   },
@@ -1718,6 +1806,25 @@ export default function HostScreen() {
           }}
         />
       )}
+      <Sheet
+        visible={createYoloConfirmOpen}
+        title="新会话使用 YOLO？"
+        onClose={() => setCreateYoloConfirmOpen(false)}
+      >
+        <Text style={styles.decisionNote}>
+          Agent 修改文件、执行命令和联网都不再询问；Codex 沙箱也会切到完整访问。操作仍会记录在聊天里。
+        </Text>
+        <SheetAction
+          label="我明白，选择 YOLO"
+          detail="仅应用到这次新建的结构化会话"
+          symbol="exclamationmark.triangle.fill"
+          destructive
+          onPress={() => {
+            setApprovalPolicy("yolo");
+            setCreateYoloConfirmOpen(false);
+          }}
+        />
+      </Sheet>
       <Sheet
         visible={resumeConflictTitle !== null}
         title="电脑正在使用这条对话"
@@ -2037,9 +2144,12 @@ const styles = StyleSheet.create({
     gap: 7,
   },
   kindOptionActive: { backgroundColor: color.pressed },
+  policyOptionDangerActive: { backgroundColor: color.dangerBg },
+  policyOptionDangerText: { color: color.danger },
   kindOptionText: { color: color.textDim, fontSize: 13, fontWeight: "500" },
   kindOptionTextActive: { color: color.text, fontWeight: "600" },
   kindHelp: { ...font.meta, marginLeft: 2 },
+  policyDangerHelp: { color: color.danger },
   goalInput: {
     minHeight: 92,
     padding: space.md,

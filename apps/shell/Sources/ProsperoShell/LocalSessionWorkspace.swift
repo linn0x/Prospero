@@ -58,7 +58,7 @@ struct ProjectRail: View {
               }
               .buttonStyle(.plain)
               .contextMenu {
-                Button("新建 CLI 会话") { newSession(project) }
+                Button("新建会话") { newSession(project) }
                 Button("在 Finder 中显示") {
                   NSWorkspace.shared.activateFileViewerSelecting([
                     URL(fileURLWithPath: project.path),
@@ -180,7 +180,7 @@ struct SessionRail: View {
             .foregroundStyle(.tertiary)
           Text("还没有会话")
             .font(.callout.weight(.medium))
-          Button("新建 CLI", action: newSession)
+          Button("新建会话", action: newSession)
             .buttonStyle(.link)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -307,7 +307,7 @@ struct ProjectSessionSidebar: View {
       .buttonStyle(.plain)
       .help(expanded ? "收起 \(project.name) 会话" : "展开 \(project.name) 会话")
       .contextMenu {
-        Button("新建 CLI 会话") { newSession(project) }
+        Button("新建会话") { newSession(project) }
         Button("在 Finder 中显示") {
           NSWorkspace.shared.activateFileViewerSelecting([
             URL(fileURLWithPath: project.path),
@@ -322,7 +322,7 @@ struct ProjectSessionSidebar: View {
 
       if expanded {
         if project.sessions.isEmpty {
-          Button("新建 CLI 会话") { newSession(project) }
+          Button("新建会话") { newSession(project) }
             .buttonStyle(.link)
             .font(.caption)
             .padding(.vertical, 8)

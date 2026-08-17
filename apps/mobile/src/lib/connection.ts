@@ -1278,6 +1278,8 @@ export class HostConnection {
     rows = 24,
     options?: {
       mode?: "default" | "plan";
+      /** 从第一轮起生效；省略时 daemon 保持最保守的 strict。 */
+      approvalPolicy?: ApprovalPolicy;
       resume?: { id: string; title?: string; fork?: true };
       /** Goal 会同时创建编排 Run，并把新会话作为协调者。 */
       goal?: string;
@@ -1296,6 +1298,7 @@ export class HostConnection {
         ...(cwd ? { cwd } : {}),
         ...(command ? { command } : {}),
         ...(options?.mode ? { mode: options.mode } : {}),
+        ...(options?.approvalPolicy ? { approvalPolicy: options.approvalPolicy } : {}),
         ...(options?.resume ? { resume: options.resume } : {}),
         ...(options?.goal ? { goal: options.goal } : {}),
         ...(options?.accountId ? { accountId: options.accountId } : {}),
