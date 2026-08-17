@@ -131,4 +131,29 @@ describe("HostConnection WebSocket candidates", () => {
     expect(socket.readyState).toBe(3);
     connection.stop();
   });
+
+  it("carries the selected approval policy in session.create", () => {
+    const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
+    const send = vi.spyOn(connection, "send").mockReturnValue({
+      accepted: true,
+      disposition: "sent",
+    });
+
+    connection.createSession("codex", "/work/prospero", undefined, "structured", 80, 24, {
+      mode: "plan",
+      approvalPolicy: "standard",
+    });
+
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "session.create",
+        agent: "codex",
+        kind: "structured",
+        cwd: "/work/prospero",
+        mode: "plan",
+        approvalPolicy: "standard",
+      }),
+      true,
+    );
+  });
 });
