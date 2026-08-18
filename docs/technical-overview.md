@@ -342,7 +342,8 @@ JSON-RPC callback。单元测试覆盖三类 v2、两个 legacy callback 与 `on
 - **`host-stats.ts`**：darwin 用 `sw_vers` 取人读系统名、`vm_stat` 算可用内存（对齐活动监视器）。
 - **`tmux.ts`**：`new-session -A` 托管（存在即 attach）；环境显式 `-e` 带入；server 声明 `tmux-256color/RGB`
   （缺少对应 terminfo 时回退 `screen-256color`），
-  `status/prefix/mouse/history/window-size` 只定向设置 Prospero session（不污染用户其他 tmux 会话）；未装时静默回退直接 spawn。
+  `status/prefix/mouse/history/window-size` 只定向设置 Prospero session（不污染用户其他 tmux 会话）；`mouse on` 把
+  alternate-screen 的滚轮交给 tmux copy-mode，从而访问 10000 行历史（Mac 用 Option + 拖动选择文本）；未装时静默回退直接 spawn。
 
 ---
 

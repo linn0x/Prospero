@@ -125,10 +125,10 @@ describe("tmux 托管", () => {
     expect(conf).toContain("escape-time 10");
     expect(conf).not.toContain("status off");
     expect(conf).not.toContain("prefix None");
-    expect(conf).not.toContain("mouse off");
+    expect(conf).not.toContain("mouse on");
   });
 
-  it("只给目标 Prospero session 关闭 tmux UI 和鼠标接管", () => {
+  it("只给目标 Prospero session 配置 UI 与可滚动历史", () => {
     const tmux = tmuxPath();
     if (!tmux) return;
     const id = `optiontest-${String(Date.now())}`;
@@ -145,7 +145,7 @@ describe("tmux 托管", () => {
       };
       expect(option("session", "status")).toBe("off");
       expect(option("session", "prefix")).toBe("None");
-      expect(option("session", "mouse")).toBe("off");
+      expect(option("session", "mouse")).toBe("on");
       expect(option("session", "destroy-unattached")).toBe("off");
       expect(option("session", "xterm-keys")).toBe("on");
       expect(option("window", "history-limit")).toBe("10000");
