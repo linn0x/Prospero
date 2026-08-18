@@ -593,14 +593,16 @@ struct LocalSessionWorkspace: View {
           sessionID: session.id,
           frame: terminalFrame,
           input: { dataB64 in
-            Task {
-              if let error = await daemon.sendLocalTerminalInput(id: session.id, dataB64: dataB64) {
-                actionError = error
-              }
-            }
+            await daemon.sendLocalTerminalInput(id: session.id, dataB64: dataB64)
+          },
+          inputError: { error in
+            actionError = error
           },
           resize: { cols, rows in
-            Task { _ = await daemon.resizeLocalTerminal(id: session.id, cols: cols, rows: rows) }
+            await daemon.resizeLocalTerminal(id: session.id, cols: cols, rows: rows)
+          },
+          resync: {
+            lastTerminalSeq = nil
           }
         )
         .id(terminalPort)
@@ -622,14 +624,23 @@ struct LocalSessionWorkspace: View {
   private func refreshLoop() async {
     var failedAttempts = 0
     while !Task.isCancelled {
+      var receivedTerminalFrame = false
       do {
         if session.kind == "structured" {
           try await refreshStructuredTimeline()
-        } else if let frame = try await daemon.loadLocalTerminalFrame(id: session.id, knownSeq: lastTerminalSeq) {
-          lastTerminalSeq = frame.seq
+        } else if let frame = try await daemon.loadLocalTerminalFrame(id: session.id, afterSeq: lastTerminalSeq) {
+          receivedTerminalFrame = true
           switch frame {
-          case .terminal(let seq, let ansi, let cols, let rows):
-            terminalFrame = TerminalRenderFrame(seq: seq, ansi: ansi, cols: cols, rows: rows)
+          case .terminalSnapshot(let seq, let ansi, let cols, let rows):
+            lastTerminalSeq = seq
+            terminalFrame = .snapshot(seq: seq, ansi: ansi, cols: cols, rows: rows)
+          case .terminalDelta(let baseSeq, let seq, let dataB64):
+            guard lastTerminalSeq == baseSeq else {
+              lastTerminalSeq = nil
+              throw LocalSessionControlFailure("终端增量游标不连续，正在重新同步")
+            }
+            lastTerminalSeq = seq
+            terminalFrame = .output(baseSeq: baseSeq, seq: seq, dataB64: dataB64)
           }
         }
         loadError = nil
@@ -639,7 +650,17 @@ struct LocalSessionWorkspace: View {
         failedAttempts = min(failedAttempts + 1, 5)
       }
       do {
-        let delay = min(8_000, 450 * (1 << failedAttempts))
+        let delay: Int
+        if failedAttempts > 0 {
+          delay = min(8_000, 450 * (1 << failedAttempts))
+        } else if session.kind == "pty" {
+          // New daemons have already waited server-side; this tiny yield lets
+          // SwiftUI hand the frame to xterm before the next local long poll.
+          // Older daemons return 204 immediately, so 50 ms also avoids a spin.
+          delay = receivedTerminalFrame ? 8 : 50
+        } else {
+          delay = 450
+        }
         try await Task.sleep(for: .milliseconds(delay))
       } catch {
         return
@@ -984,11 +1005,16 @@ private enum AgentVisuals {
   }
 }
 
-struct TerminalRenderFrame: Equatable {
-  let seq: Int
-  let ansi: String
-  let cols: Int
-  let rows: Int
+enum TerminalRenderFrame: Equatable {
+  case snapshot(seq: Int, ansi: String, cols: Int, rows: Int)
+  case output(baseSeq: Int, seq: Int, dataB64: String)
+
+  var seq: Int {
+    switch self {
+    case .snapshot(let seq, _, _, _): seq
+    case .output(_, let seq, _): seq
+    }
+  }
 }
 
 /// 复用手机端已经验证过的 xterm 页面。画面和输入都留在 Mac App 内，
@@ -997,11 +1023,13 @@ private struct MacTerminalSurface: NSViewRepresentable {
   let port: Int
   let sessionID: String
   let frame: TerminalRenderFrame
-  let input: (String) -> Void
-  let resize: (Int, Int) -> Void
+  let input: @MainActor (String) async -> String?
+  let inputError: @MainActor (String) -> Void
+  let resize: @MainActor (Int, Int) async -> String?
+  let resync: @MainActor () -> Void
 
   func makeCoordinator() -> Coordinator {
-    Coordinator(input: input, resize: resize)
+    Coordinator(input: input, inputError: inputError, resize: resize, resync: resync)
   }
 
   func makeNSView(context: Context) -> WKWebView {
@@ -1030,11 +1058,14 @@ private struct MacTerminalSurface: NSViewRepresentable {
 
   func updateNSView(_ webView: WKWebView, context: Context) {
     context.coordinator.input = input
+    context.coordinator.inputError = inputError
     context.coordinator.resize = resize
+    context.coordinator.resync = resync
     context.coordinator.push(frame)
   }
 
   static func dismantleNSView(_ webView: WKWebView, coordinator: Coordinator) {
+    coordinator.cancel()
     webView.configuration.userContentController.removeScriptMessageHandler(forName: "prospero")
     webView.stopLoading()
   }
@@ -1042,15 +1073,29 @@ private struct MacTerminalSurface: NSViewRepresentable {
   @MainActor
   final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
     weak var webView: WKWebView?
-    var input: (String) -> Void
-    var resize: (Int, Int) -> Void
+    var input: @MainActor (String) async -> String?
+    var inputError: @MainActor (String) -> Void
+    var resize: @MainActor (Int, Int) async -> String?
+    var resync: @MainActor () -> Void
     private var ready = false
-    private var pending: TerminalRenderFrame?
+    private var pendingFrames: [TerminalRenderFrame] = []
     private var renderedSeq: Int?
+    private var rendering = false
+    private var pendingInput = Data()
+    private var inputTask: Task<Void, Never>?
+    private var pendingResize: (cols: Int, rows: Int)?
+    private var resizeTask: Task<Void, Never>?
 
-    init(input: @escaping (String) -> Void, resize: @escaping (Int, Int) -> Void) {
+    init(
+      input: @escaping @MainActor (String) async -> String?,
+      inputError: @escaping @MainActor (String) -> Void,
+      resize: @escaping @MainActor (Int, Int) async -> String?,
+      resync: @escaping @MainActor () -> Void
+    ) {
       self.input = input
+      self.inputError = inputError
       self.resize = resize
+      self.resync = resync
     }
 
     func userContentController(
@@ -1066,13 +1111,19 @@ private struct MacTerminalSurface: NSViewRepresentable {
       switch kind {
       case "ready":
         ready = true
-        if let pending { push(pending) }
+        // The shared page waits for its host-provided font before fitting. The
+        // mobile host already sends this; without it Mac stayed at the launch
+        // default 120x40 no matter how the window was resized.
+        sendControl(["kind": "font", "size": 13])
+        sendControl(["kind": "focus"])
+        webView?.window?.makeFirstResponder(webView)
+        drainFrames()
       case "input":
-        if let dataB64 = body["data"] as? String { input(dataB64) }
+        if let dataB64 = body["data"] as? String { enqueueInput(dataB64) }
       case "resized":
         if let cols = body["cols"] as? Int, let rows = body["rows"] as? Int,
            (10...500).contains(cols), (5...300).contains(rows) {
-          resize(cols, rows)
+          enqueueResize(cols: cols, rows: rows)
         }
       default:
         break
@@ -1080,23 +1131,108 @@ private struct MacTerminalSurface: NSViewRepresentable {
     }
 
     func push(_ frame: TerminalRenderFrame) {
-      guard renderedSeq != frame.seq else { return }
-      pending = frame
-      guard ready, let webView else { return }
-      let message: [String: Any] = [
-        "kind": "snapshot",
-        "ansi": frame.ansi,
-        "cols": frame.cols,
-        "rows": frame.rows,
-      ]
+      switch frame {
+      case .snapshot:
+        // A snapshot is authoritative after attach, a ring gap or daemon
+        // restart. Discard queued deltas from the superseded cursor.
+        pendingFrames = [frame]
+      case .output:
+        if renderedSeq == frame.seq || pendingFrames.last?.seq == frame.seq { return }
+        pendingFrames.append(frame)
+      }
+      drainFrames()
+    }
+
+    func cancel() {
+      inputTask?.cancel()
+      inputTask = nil
+      resizeTask?.cancel()
+      resizeTask = nil
+      pendingInput.removeAll()
+      pendingResize = nil
+      pendingFrames.removeAll()
+    }
+
+    private func enqueueInput(_ dataB64: String) {
+      guard let bytes = Data(base64Encoded: dataB64), !bytes.isEmpty else { return }
+      pendingInput.append(bytes)
+      guard inputTask == nil else { return }
+      inputTask = Task { @MainActor [weak self] in
+        // Coalesce key bursts/paste into one ordered local request. The old
+        // per-key detached Tasks could race and deliver typed bytes out of order.
+        await Task.yield()
+        while let self, !self.pendingInput.isEmpty, !Task.isCancelled {
+          let payload = self.pendingInput
+          self.pendingInput.removeAll(keepingCapacity: true)
+          if let error = await self.input(payload.base64EncodedString()) {
+            self.inputError(error)
+          }
+        }
+        self?.inputTask = nil
+      }
+    }
+
+    private func enqueueResize(cols: Int, rows: Int) {
+      pendingResize = (cols, rows)
+      guard resizeTask == nil else { return }
+      resizeTask = Task { @MainActor [weak self] in
+        // Window drags can produce overlapping HTTP tasks. Keep only the
+        // latest pending geometry and deliver each request in order so an old
+        // response cannot resize tmux after a newer one.
+        while let self, let next = self.pendingResize, !Task.isCancelled {
+          self.pendingResize = nil
+          if let error = await self.resize(next.cols, next.rows) {
+            self.inputError(error)
+          }
+        }
+        self?.resizeTask = nil
+      }
+    }
+
+    private func drainFrames() {
+      guard ready, !rendering, let webView, !pendingFrames.isEmpty else { return }
+      let frame = pendingFrames.removeFirst()
+      let message: [String: Any]
+      switch frame {
+      case .snapshot(_, let ansi, let cols, let rows):
+        message = ["kind": "snapshot", "ansi": ansi, "cols": cols, "rows": rows]
+      case .output(let baseSeq, _, let dataB64):
+        guard renderedSeq == baseSeq else {
+          pendingFrames.removeAll()
+          resync()
+          return
+        }
+        message = ["kind": "output", "dataB64": dataB64]
+      }
       guard
         let data = try? JSONSerialization.data(withJSONObject: message),
         let json = String(data: data, encoding: .utf8),
         let quotedData = try? JSONEncoder().encode(json),
         let quoted = String(data: quotedData, encoding: .utf8)
       else { return }
-      renderedSeq = frame.seq
-      pending = nil
+      rendering = true
+      webView.evaluateJavaScript("window.__rx(\(quoted));") { [weak self] _, error in
+        Task { @MainActor in
+          guard let self else { return }
+          self.rendering = false
+          if error == nil {
+            self.renderedSeq = frame.seq
+          } else {
+            self.pendingFrames.removeAll()
+            self.resync()
+          }
+          self.drainFrames()
+        }
+      }
+    }
+
+    private func sendControl(_ message: [String: Any]) {
+      guard ready, let webView,
+            let data = try? JSONSerialization.data(withJSONObject: message),
+            let json = String(data: data, encoding: .utf8),
+            let quotedData = try? JSONEncoder().encode(json),
+            let quoted = String(data: quotedData, encoding: .utf8)
+      else { return }
       webView.evaluateJavaScript("window.__rx(\(quoted));")
     }
   }
