@@ -3,7 +3,15 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
-import { resetTmuxPathCache, sessionName, tmuxPath, wrapSpawn, writeConfig } from "../src/tmux.js";
+import {
+  configureSession,
+  defaultTerminal,
+  resetTmuxPathCache,
+  sessionName,
+  tmuxPath,
+  wrapSpawn,
+  writeConfig,
+} from "../src/tmux.js";
 
 const temps: string[] = [];
 function tempHome(): string {
@@ -109,15 +117,41 @@ describe("tmux 托管", () => {
     expect(noise).not.toMatch(/bad key|unknown option|invalid|error/i);
   });
 
-  it("配置关掉状态栏、不占用任何前缀键、且不销毁未接管的会话", () => {
+  it("server 配置只声明安全终端能力，不污染用户其他 tmux 会话", () => {
     const home = tempHome();
     const conf = readFileSync(writeConfig(home), "utf8");
-    // 状态栏在手机上是纯噪音,还占一行
-    expect(conf).toContain("status off");
-    // 前缀整个去掉:手机上没人管理 tmux 窗口,留着只会从 agent 手里偷键
-    expect(conf).toContain("unbind C-b");
-    expect(conf).toContain("prefix None");
-    // 这条错了整个托管就失去意义:daemon 断开即销毁会话
-    expect(conf).toContain("destroy-unattached off");
+    expect(conf).toContain(`default-terminal '${defaultTerminal()}'`);
+    expect(conf).toContain("xterm-256color:RGB");
+    expect(conf).toContain("escape-time 10");
+    expect(conf).not.toContain("status off");
+    expect(conf).not.toContain("prefix None");
+    expect(conf).not.toContain("mouse off");
+  });
+
+  it("只给目标 Prospero session 关闭 tmux UI 和鼠标接管", () => {
+    const tmux = tmuxPath();
+    if (!tmux) return;
+    const id = `optiontest-${String(Date.now())}`;
+    const name = sessionName(id);
+    const created = spawnSync(tmux, ["new-session", "-d", "-s", name, "sleep", "10"]);
+    expect(created.status).toBe(0);
+    try {
+      expect(configureSession(id, tmux)).toBe(true);
+      const option = (scope: "session" | "window", name: string): string => {
+        const command = scope === "window" ? "show-window-options" : "show-options";
+        return spawnSync(tmux, [command, "-v", "-t", sessionName(id), name], {
+          encoding: "utf8",
+        }).stdout.trim();
+      };
+      expect(option("session", "status")).toBe("off");
+      expect(option("session", "prefix")).toBe("None");
+      expect(option("session", "mouse")).toBe("off");
+      expect(option("session", "destroy-unattached")).toBe("off");
+      expect(option("session", "xterm-keys")).toBe("on");
+      expect(option("window", "history-limit")).toBe("10000");
+      expect(option("window", "window-size")).toBe("latest");
+    } finally {
+      spawnSync(tmux, ["kill-session", "-t", name], { stdio: "ignore" });
+    }
   });
 });

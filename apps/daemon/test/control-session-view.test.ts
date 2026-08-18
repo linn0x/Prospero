@@ -56,8 +56,8 @@ class ControlViewAdapter implements AgentAdapter {
   }
 }
 
-describe("Mac control structured session views", () => {
-  it("serves authenticated snapshots, deltas and tool output without changing PTY views", async () => {
+describe("Mac control session views", () => {
+  it("serves structured events and a snapshot-then-delta PTY stream", async () => {
     const home = mkdtempSync(path.join(os.tmpdir(), "prospero-control-view-"));
     let server: DaemonServer | undefined;
     try {
@@ -172,8 +172,9 @@ describe("Mac control structured session views", () => {
         events: [{ kind: "turn.end" }],
       });
 
-      // The PTY view keeps its existing knownSeq and response shape; afterSeq
-      // is structured-only and must not make a terminal request invalid.
+      // afterSeq is structured-only and remains ignored for PTY compatibility.
+      // The Mac-specific outputAfterSeq cursor upgrades PTY rendering without
+      // changing knownSeq clients.
       const pty = await create({
         agent: "custom",
         kind: "pty",
@@ -191,6 +192,46 @@ describe("Mac control structured session views", () => {
       const ptySnapshot = await ptyView.json() as { kind: string; seq: number };
       expect(ptySnapshot.kind).toBe("pty");
       expect((await request(`${ptyViewPath}?knownSeq=${String(ptySnapshot.seq)}`)).status).toBe(204);
+      expect((await request(`${ptyViewPath}?outputAfterSeq=nope`)).status).toBe(400);
+      expect((await request(`${ptyViewPath}?outputAfterSeq=0&waitMs=25001`)).status).toBe(400);
+
+      const terminal = server.manager.requirePty(pty.id);
+      const firstBytes = new TextEncoder().encode("first-delta");
+      const firstSeq = terminal.ring.push(firstBytes);
+      const firstDeltaResponse = await request(
+        `${ptyViewPath}?outputAfterSeq=${String(ptySnapshot.seq)}`,
+      );
+      expect(firstDeltaResponse.status).toBe(200);
+      expect(await firstDeltaResponse.json()).toEqual({
+        kind: "pty",
+        mode: "delta",
+        baseSeq: ptySnapshot.seq,
+        seq: firstSeq,
+        dataB64: Buffer.from(firstBytes).toString("base64"),
+      });
+
+      // A long poll registers before rechecking the ring, then wakes as soon
+      // as SessionManager publishes output instead of adding a fixed UI poll.
+      const waiting = request(`${ptyViewPath}?outputAfterSeq=${String(firstSeq)}&waitMs=2000`);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const secondBytes = new TextEncoder().encode("second-delta");
+      const secondSeq = terminal.ring.push(secondBytes);
+      server.manager.emit("output", pty.id, Buffer.from(secondBytes).toString("base64"), secondSeq);
+      const secondDeltaResponse = await waiting;
+      expect(secondDeltaResponse.status).toBe(200);
+      expect(await secondDeltaResponse.json()).toMatchObject({
+        mode: "delta",
+        baseSeq: firstSeq,
+        seq: secondSeq,
+        dataB64: Buffer.from(secondBytes).toString("base64"),
+      });
+
+      expect((await request(
+        `${ptyViewPath}?outputAfterSeq=${String(secondSeq)}&waitMs=5`,
+      )).status).toBe(204);
+      const repaired = await request(`${ptyViewPath}?outputAfterSeq=${String(secondSeq + 100)}`);
+      expect(repaired.status).toBe(200);
+      expect(await repaired.json()).toMatchObject({ kind: "pty", mode: "snapshot", seq: secondSeq });
     } finally {
       await server?.close();
       rmSync(home, { recursive: true, force: true });

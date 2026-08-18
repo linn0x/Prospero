@@ -1,25 +1,44 @@
 import Foundation
 
-/// A terminal view is still a complete ANSI snapshot. Structured conversations instead use the
-/// append-only `afterSeq` protocol below, so a long chat never gets rebuilt every polling turn.
+/// A terminal attaches with one ANSI snapshot, then consumes raw PTY output by cursor. Replaying a
+/// full snapshot for every prompt update destroys xterm selection/scroll state and feels unlike a
+/// local shell, so deltas are a first-class frame rather than an implementation detail.
 enum LocalSessionFrame: Sendable, Equatable {
-  case terminal(seq: Int, ansi: String, cols: Int, rows: Int)
+  case terminalSnapshot(seq: Int, ansi: String, cols: Int, rows: Int)
+  case terminalDelta(baseSeq: Int, seq: Int, dataB64: String)
 
   var seq: Int {
     switch self {
-    case .terminal(let seq, _, _, _): seq
+    case .terminalSnapshot(let seq, _, _, _): seq
+    case .terminalDelta(_, let seq, _): seq
     }
   }
 
-  static func decodeTerminal(_ data: Data) throws -> LocalSessionFrame {
+  static func decodeTerminal(_ data: Data, requestedAfterSeq: Int?) throws -> LocalSessionFrame {
     guard
       let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-      root["kind"] as? String == "pty",
-      let ansi = root["ansi"] as? String
+      root["kind"] as? String == "pty"
     else {
       throw LocalSessionControlFailure("daemon 返回了不完整的终端画面")
     }
-    return .terminal(
+    if root["mode"] as? String == "delta" {
+      guard
+        let requestedAfterSeq,
+        let baseSeq = root["baseSeq"] as? Int,
+        let seq = root["seq"] as? Int,
+        let dataB64 = root["dataB64"] as? String,
+        baseSeq == requestedAfterSeq,
+        seq > baseSeq,
+        Data(base64Encoded: dataB64) != nil
+      else {
+        throw LocalSessionControlFailure("daemon 返回了不连续的终端增量")
+      }
+      return .terminalDelta(baseSeq: baseSeq, seq: seq, dataB64: dataB64)
+    }
+    guard let ansi = root["ansi"] as? String else {
+      throw LocalSessionControlFailure("daemon 返回了不完整的终端快照")
+    }
+    return .terminalSnapshot(
       seq: root["seq"] as? Int ?? 0,
       ansi: ansi,
       cols: root["cols"] as? Int ?? 120,
@@ -109,16 +128,22 @@ extension DaemonController {
     return try LocalStructuredFrame.decode(data, requestedAfterSeq: afterSeq)
   }
 
-  /// PTY stays on its established complete-frame contract; no structured cursor is sent here.
-  func loadLocalTerminalFrame(id: String, knownSeq: Int?) async throws -> LocalSessionFrame? {
+  /// The first read is an authoritative snapshot. Later reads are authenticated local long polls:
+  /// a new daemon returns raw output immediately, while an older daemon safely falls back to the
+  /// legacy knownSeq snapshot contract instead of busy-looping.
+  func loadLocalTerminalFrame(id: String, afterSeq: Int?) async throws -> LocalSessionFrame? {
     var query: [URLQueryItem] = []
-    if let knownSeq { query.append(URLQueryItem(name: "knownSeq", value: String(knownSeq))) }
+    if let afterSeq {
+      query.append(URLQueryItem(name: "knownSeq", value: String(afterSeq)))
+      query.append(URLQueryItem(name: "outputAfterSeq", value: String(afterSeq)))
+      query.append(URLQueryItem(name: "waitMs", value: "15000"))
+    }
     let (data, response) = try await performLocalSessionRead(id: id, endpoint: "view", query: query)
     if response.statusCode == 204 { return nil }
     guard (200..<300).contains(response.statusCode) else {
       throw LocalSessionControlFailure(controlErrorMessage(data, fallback: "daemon 拒绝读取终端"))
     }
-    return try LocalSessionFrame.decodeTerminal(data)
+    return try LocalSessionFrame.decodeTerminal(data, requestedAfterSeq: afterSeq)
   }
 
   /// Tool payloads are intentionally loaded only when a user expands a truncated tool card.

@@ -222,6 +222,8 @@ DH 派生，daemon 静态密钥只做身份证明（泄漏也解不开历史流�
 
 - **HTTP**：`/_prospero/control/*`（health、session 查看/交互、orchestration action、gate resolve、kill/interrupt），
   仅 loopback + `Bearer controlToken`。控制 token 代表宿主机用户本人（`allowShell: true`），不继承手机设备限制。
+  Mac PTY 首次 `view` 取 ANSI 快照，之后用 `outputAfterSeq + waitMs` 长轮询原始增量；ring gap/daemon 重启才回快照，
+  避免持续重置 xterm 导致滚动、选择与输入回显退化。
 - **`control-socket.ts`**：Unix domain socket（Windows 命名管道）+ NDJSON，`ControlRequest/ControlResponse`
   模型，`MAX_LINE_BYTES = 1MB`，默认 15s 超时。供 shell 与**会话内 worker CLI** 使用。
 
@@ -338,7 +340,9 @@ JSON-RPC callback。单元测试覆盖三类 v2、两个 legacy callback 与 `on
   无原生 Skill input 的 agent 注入完整 SKILL.md。
 - **`local-conversations.ts`**：codex 走 app-server `thread/search`；claude 走 `CLAUDE_CONFIG_DIR` 下 jsonl 或 SDK `listSessions`。
 - **`host-stats.ts`**：darwin 用 `sw_vers` 取人读系统名、`vm_stat` 算可用内存（对齐活动监视器）。
-- **`tmux.ts`**：`new-session -A` 托管（存在即 attach）；环境显式 `-e` 带入；`history-limit 10000`；未装 tmux 静默回退直接 spawn。
+- **`tmux.ts`**：`new-session -A` 托管（存在即 attach）；环境显式 `-e` 带入；server 声明 `tmux-256color/RGB`
+  （缺少对应 terminfo 时回退 `screen-256color`），
+  `status/prefix/mouse/history/window-size` 只定向设置 Prospero session（不污染用户其他 tmux 会话）；未装时静默回退直接 spawn。
 
 ---
 
@@ -504,7 +508,8 @@ SwiftPM 可执行目标 `ProsperoShell`（macOS 14+，Swift 6）。**存在的�
   轮换的 control token 提供本机控制接口。
 - `Pairing`：调 `prosperod pair` 铸设备，CoreImage 渲染 QR（凭证只显示不落盘）。
 - `Dashboard`：本机新建器可选结构化 ChatUI 或原生 CLI；结构化会话在创建前选择 `strict / standard / yolo`，
-  与手机保持相同的默认值和 YOLO 二次确认。
+  与手机保持相同的默认值和 YOLO 二次确认。CLI 终端首次快照后走有序增量长轮询，输入按原始字节有序合并发送；
+  xterm 字号就绪后会按 Mac 窗口实时 fit，不再固定在创建时的 120×40。
 - `Bonjour`：`NetService` 发布 `_prospero._tcp`（广播从 daemon 挪到壳，TCC 归属 .app）。
 - `LoginItem`：`SMAppService.mainApp` 开机自启。
 - `scripts/build-app.sh`：`swift build -c release` → 组装 `.app`（Info.plist 写 bundle id 与 Bonjour/本地网络描述）→

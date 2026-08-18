@@ -368,6 +368,12 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     // 没装 tmux 就静默退回直接 spawn —— 托管是增强,不该变成硬依赖
     this.tmuxBin = opts.tmux ? tmux.tmuxPath() : null;
     this.tmuxConfigFile = this.tmuxBin && opts.tmux ? tmux.writeConfig(opts.tmux.home) : null;
+    if (this.tmuxBin && this.tmuxConfigFile) {
+      // `tmux -f` is ignored after a server already exists. Reload only the
+      // safe server capabilities; per-session input/UI options are targeted
+      // after each attach below.
+      tmux.reloadConfig(this.tmuxBin);
+    }
     this.metaFile = opts.tmux ? path.join(opts.tmux.home, "pty-sessions.json") : null;
     const home = opts.home ?? opts.tmux?.home;
     this.structuredFile = home ? path.join(home, "structured-sessions.json") : null;
@@ -784,6 +790,19 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
         `failed to spawn "${base.file}" — is ${agent} installed? (${e instanceof Error ? e.message : String(e)})`,
         "agent_unavailable",
       );
+    }
+    if (this.tmuxBin) {
+      let configured = false;
+      // node-pty returns as soon as the tmux client is forked; give that client
+      // a bounded moment to create/attach its server-side session before
+      // targeting options. Restore normally succeeds on the first attempt.
+      for (let attempt = 0; attempt < 8 && !configured; attempt++) {
+        configured = tmux.configureSession(id, this.tmuxBin);
+        if (!configured) await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      if (!configured) {
+        console.warn(`[prosperod] tmux session options were not applied to ${id}`);
+      }
     }
     this.ptySessions.set(id, session);
     this.wirePtySession(session);

@@ -1922,6 +1922,54 @@ export async function createDaemonServer(
   const req2 = createRequire(import.meta.url);
   const pkgRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 
+  /**
+   * The Mac shell uses this as a local, authenticated long poll. Register the
+   * listener before re-checking the ring so output cannot land in the gap
+   * between the caller's empty read and the wait itself.
+   */
+  function waitForTerminalOutput(
+    req: IncomingMessage,
+    sid: string,
+    afterSeq: number,
+    waitMs: number,
+  ): Promise<boolean> {
+    return new Promise((resolve) => {
+      let timer: NodeJS.Timeout | undefined;
+      let settled = false;
+      const finish = (changed: boolean): void => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        manager.off("output", onOutput);
+        manager.off("state", onState);
+        req.off("aborted", onAbort);
+        resolve(changed);
+      };
+      const onOutput = (outputSid: string, _dataB64: string, seq: number): void => {
+        if (outputSid === sid && seq > afterSeq) finish(true);
+      };
+      const onState = (info: SessionInfo): void => {
+        if (info.id === sid && (info.status === "done" || info.status === "died")) finish(true);
+      };
+      const onAbort = (): void => finish(false);
+
+      manager.on("output", onOutput);
+      manager.on("state", onState);
+      req.once("aborted", onAbort);
+      timer = setTimeout(() => finish(false), waitMs);
+      timer.unref?.();
+
+      // Close the race with the read that decided to wait.
+      try {
+        if (manager.requirePty(sid).ring.lastSeq > afterSeq) finish(true);
+      } catch {
+        // Let the normal request path turn a concurrently removed session into
+        // its established 404/409 response instead of hiding it as a timeout.
+        finish(true);
+      }
+    });
+  }
+
   async function handleControl(req: IncomingMessage, res: ServerResponse): Promise<void> {
     res.setHeader("cache-control", "no-store");
     if (!isLoopback(req)) {
@@ -2075,14 +2123,59 @@ export async function createDaemonServer(
           return;
         }
 
-        const terminal = manager.requirePty(sid);
-        if (knownSeq === terminal.ring.lastSeq) {
+        let terminal = manager.requirePty(sid);
+        const rawOutputAfterSeq = url.searchParams.get("outputAfterSeq");
+        const outputAfterSeq = rawOutputAfterSeq === null ? undefined : Number(rawOutputAfterSeq);
+        if (
+          outputAfterSeq !== undefined &&
+          (!Number.isSafeInteger(outputAfterSeq) || outputAfterSeq < 0)
+        ) {
+          res.writeHead(400).end("invalid outputAfterSeq");
+          return;
+        }
+        const rawWaitMs = url.searchParams.get("waitMs");
+        const waitMs = rawWaitMs === null ? 0 : Number(rawWaitMs);
+        if (!Number.isSafeInteger(waitMs) || waitMs < 0 || waitMs > 25_000) {
+          res.writeHead(400).end("invalid waitMs");
+          return;
+        }
+
+        // outputAfterSeq is an append-only PTY cursor. It lets the Mac render
+        // the initial snapshot exactly once and then feed xterm raw output,
+        // preserving scroll position, selection and low-latency input echo.
+        // knownSeq remains the legacy full-snapshot/no-change contract.
+        if (outputAfterSeq !== undefined) {
+          let chunks = terminal.ring.since(outputAfterSeq);
+          if (chunks?.length === 0 && waitMs > 0) {
+            await waitForTerminalOutput(req, sid, outputAfterSeq, waitMs);
+            if (req.aborted || res.destroyed) return;
+            terminal = manager.requirePty(sid);
+            chunks = terminal.ring.since(outputAfterSeq);
+          }
+          if (chunks !== null) {
+            if (chunks.length === 0) {
+              res.writeHead(204).end();
+              return;
+            }
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({
+              kind: "pty",
+              mode: "delta",
+              baseSeq: outputAfterSeq,
+              seq: terminal.ring.lastSeq,
+              dataB64: toB64(concatBytes(chunks)),
+            }));
+            return;
+          }
+          // A stale/ahead cursor or an evicted ring gap is repaired by one
+          // authoritative snapshot; subsequent requests return to deltas.
+        } else if (knownSeq === terminal.ring.lastSeq) {
           res.writeHead(204).end();
           return;
         }
         const snapshot = await terminal.snapshot();
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ kind: "pty", ...snapshot }));
+        res.end(JSON.stringify({ kind: "pty", mode: "snapshot", ...snapshot }));
       } catch (e) {
         if (e instanceof SessionError) {
           res.writeHead(e.code === "session_not_found" ? 404 : 409).end(e.message);
