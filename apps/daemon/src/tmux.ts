@@ -129,7 +129,10 @@ export function configureSession(id: string, tmux: string): boolean {
   const commands = [
     ["set-option", "-t", target, "status", "off"],
     ["set-option", "-t", target, "prefix", "None"],
-    ["set-option", "-t", target, "mouse", "off"],
+    // xterm's alternate buffer has no local scrollback. Let tmux consume wheel
+    // events so its own 10k-line history enters copy-mode. The Mac host enables
+    // xterm's Option-drag escape hatch for native text selection.
+    ["set-option", "-t", target, "mouse", "on"],
     ["set-option", "-t", target, "destroy-unattached", "off"],
     ["set-option", "-t", target, "xterm-keys", "on"],
     ["set-window-option", "-t", target, "history-limit", "10000"],

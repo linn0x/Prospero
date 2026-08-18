@@ -493,6 +493,12 @@ struct LocalSessionWorkspace: View {
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
             .background(.quaternary, in: Capsule())
+          if session.kind == "pty" {
+            Label("滚轮查看历史", systemImage: "clock.arrow.circlepath")
+              .font(.caption2)
+              .foregroundStyle(.tertiary)
+              .help("滚轮进入 tmux 历史，q 返回；Option + 拖动选择文本")
+          }
           if let policy = session.approvalPolicy {
             Text(AgentVisuals.policyName(policy))
               .font(.caption2.weight(.medium))
@@ -1116,6 +1122,10 @@ private struct MacTerminalSurface: NSViewRepresentable {
         // default 120x40 no matter how the window was resized.
         sendControl(["kind": "font", "size": 13])
         sendControl(["kind": "focus"])
+        // tmux mouse mode owns ordinary pointer events so wheel gestures can
+        // enter copy-mode. On macOS xterm requires this explicit option to
+        // retain a native text-selection gesture alongside it.
+        webView?.evaluateJavaScript("term.options.macOptionClickForcesSelection = true;")
         webView?.window?.makeFirstResponder(webView)
         drainFrames()
       case "input":
