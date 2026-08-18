@@ -57,9 +57,23 @@ export function sessionName(id: string): string {
   return `${PREFIX}${id}`;
 }
 
+/** Prefer tmux's accurate terminfo, with the portable screen entry as fallback. */
+export function defaultTerminal(): "tmux-256color" | "screen-256color" {
+  for (const infocmp of ["/usr/bin/infocmp", "/opt/homebrew/bin/infocmp", "/usr/local/bin/infocmp"]) {
+    try {
+      execFileSync(infocmp, ["tmux-256color"], { stdio: "ignore" });
+      return "tmux-256color";
+    } catch {
+      // Try another terminfo installation.
+    }
+  }
+  return "screen-256color";
+}
+
 /**
- * 写一份最小 tmux 配置。
- * 状态栏必须关掉 —— 手机上那一行是纯噪音,而且会吃掉一行高度。
+ * Write only server-scoped capabilities here. A tmux server reads `-f` only
+ * when it first starts and may also contain the user's unrelated sessions, so
+ * Prospero input/UI options are applied to the named session below.
  */
 export function writeConfig(home: string): string {
   const dir = path.join(home, "tmux");
@@ -68,22 +82,60 @@ export function writeConfig(home: string): string {
   writeFileSync(
     file,
     [
-      "set -g status off",
-      "set -g default-terminal 'xterm-256color'",
-      // 前缀键整个去掉。手机上没人从这里管理 tmux 窗口,留着任何前缀都只是
-      // 从 agent 手里偷走一个键 —— Ctrl-B 本身就是 readline 的后退一字符。
-      // (曾经改成 C-\\,但转义多写了一层,生成出 'C-\\\\',tmux 每次启动都报 bad key)
-      "unbind C-b",
-      "set -g prefix None",
-      "set -g escape-time 0",
-      "set -g history-limit 10000",
-      // daemon 断开时不要销毁会话 —— 整件事的重点
-      "set -g destroy-unattached off",
-      "set -g mouse on",
+      // tmux must describe its own virtual terminal to applications. Advertising
+      // xterm here loses capabilities and makes modern Agent TUIs render
+      // differently from the same command in a normal macOS terminal.
+      `set -g default-terminal '${defaultTerminal()}'`,
+      // The outer Prospero xterm supports 24-bit color. Keep this explicit for
+      // tmux versions which cannot infer RGB from COLORTERM.
+      "set -as terminal-features ',xterm-256color:RGB'",
+      "set -s focus-events on",
+      // A tiny window keeps Option/Alt escape sequences intact without the
+      // perceptible 500 ms default delay after a literal Escape key.
+      "set -s escape-time 10",
       "",
     ].join("\n"),
   );
   return file;
+}
+
+/** Reload safe server capabilities when the tmux server predates this daemon. */
+export function reloadConfig(tmux: string): void {
+  // A missing server is expected on first launch. `new-session -f` will load
+  // the file when it creates one, so these commands are deliberately best-effort.
+  const current = spawnSync(tmux, ["show-options", "-sv", "terminal-features"], {
+    encoding: "utf8",
+  });
+  if (current.status !== 0) return;
+  spawnSync(tmux, ["set-option", "-s", "default-terminal", defaultTerminal()], { stdio: "ignore" });
+  spawnSync(tmux, ["set-option", "-s", "focus-events", "on"], { stdio: "ignore" });
+  spawnSync(tmux, ["set-option", "-s", "escape-time", "10"], { stdio: "ignore" });
+  if (!current.stdout.includes("xterm-256color:RGB")) {
+    // Append once. Re-sourcing an `-a` config on every daemon restart would
+    // otherwise grow terminal-features without bound.
+    spawnSync(tmux, ["set-option", "-sa", "terminal-features", ",xterm-256color:RGB"], {
+      stdio: "ignore",
+    });
+  }
+}
+
+/**
+ * Apply UI/input behavior only to one Prospero session. In particular prefix,
+ * status and mouse must not change the user's unrelated sessions in the same
+ * default tmux server.
+ */
+export function configureSession(id: string, tmux: string): boolean {
+  const target = sessionName(id);
+  const commands = [
+    ["set-option", "-t", target, "status", "off"],
+    ["set-option", "-t", target, "prefix", "None"],
+    ["set-option", "-t", target, "mouse", "off"],
+    ["set-option", "-t", target, "destroy-unattached", "off"],
+    ["set-option", "-t", target, "xterm-keys", "on"],
+    ["set-window-option", "-t", target, "history-limit", "10000"],
+    ["set-window-option", "-t", target, "window-size", "latest"],
+  ];
+  return commands.every((args) => spawnSync(tmux, args, { stdio: "ignore" }).status === 0);
 }
 
 /**
