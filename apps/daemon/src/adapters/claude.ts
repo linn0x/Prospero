@@ -142,6 +142,8 @@ export class ClaudeAdapter implements AgentAdapter {
   private readonly taskAgents = new Map<string, string>();
   private readonly subagents = new Map<string, { canMessage: boolean; createdAt: number }>();
   private readonly currentMessageByAgent = new Map<string, string>();
+  /** 正在流式输出的消息 id(按 agent);增量事件的归并键只能来自流本身 */
+  private readonly streamMessageByAgent = new Map<string, string>();
   private currentMsgId = "";
   private pumping: Promise<void> | null = null;
   private sessionId: string | null = null;
@@ -340,6 +342,24 @@ export class ClaudeAdapter implements AgentAdapter {
     });
   }
 
+  /**
+   * 流式增量的归并键。
+   *
+   * 只能取自流本身:完整的 assistant 消息要等整条消息结束才到,拿它当键
+   * 会把本步的 thinking 挂到上一步的气泡上;而一轮开头连上一步都没有,
+   * 就退化成每个 stream_event 各自的 uuid —— 一个 token 一个气泡。
+   * DeepSeek V4 这类每步都先思考的模型必现:手机上一轮能刷出几百张
+   * 只有几个字的"思考过程"卡片。
+   */
+  private streamMessageId(agentKey: string): string {
+    const streaming = this.streamMessageByAgent.get(agentKey);
+    if (streaming) return streaming;
+    // provider 没给 message_start 时也要有稳定键,补一个并沿用到本条消息结束
+    const generated = randomUUID();
+    this.streamMessageByAgent.set(agentKey, generated);
+    return generated;
+  }
+
   private emit(body: AgentEventBody): void {
     this.ctx?.emit(body);
   }
@@ -427,11 +447,25 @@ export class ClaudeAdapter implements AgentAdapter {
         // 增量文本:content_block_delta 里的 text_delta
         const ev = msg.event as {
           type?: string;
+          message?: { id?: unknown };
           delta?: { type?: string; text?: string; thinking?: string };
         };
+        const streamKey = agentId ?? "";
+        // 归并键来自 message_start,而不是等整条消息结束才到的 assistant 消息
+        if (ev.type === "message_start") {
+          const id = ev.message?.id;
+          this.streamMessageByAgent.set(
+            streamKey,
+            typeof id === "string" && id.length > 0 ? id : randomUUID(),
+          );
+          return;
+        }
+        if (ev.type === "message_stop") {
+          this.streamMessageByAgent.delete(streamKey);
+          return;
+        }
         if (ev.type !== "content_block_delta") return;
-        const msgId =
-          this.currentMessageByAgent.get(agentId ?? "") || this.currentMsgId || msg.uuid;
+        const msgId = this.streamMessageId(streamKey);
         if (ev.delta?.type === "text_delta" && ev.delta.text) {
           this.emit({
             kind: "text.delta",
@@ -514,6 +548,7 @@ export class ClaudeAdapter implements AgentAdapter {
           ...agentField,
         });
         this.currentMessageByAgent.delete(agentId ?? "");
+        this.streamMessageByAgent.delete(agentId ?? "");
         if (agentId) this.updateSubagent(agentId, "idle", true);
         else this.currentMsgId = "";
         return;
@@ -880,6 +915,7 @@ export class ClaudeAdapter implements AgentAdapter {
     this.subagents.clear();
     this.taskAgents.clear();
     this.currentMessageByAgent.clear();
+    this.streamMessageByAgent.clear();
     await this.pumping?.catch(() => {});
   }
 }
