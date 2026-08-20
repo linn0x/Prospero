@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { AgentEventBody } from "@prospero/protocol";
+import type { AgentEventBody, ApprovalPolicy } from "@prospero/protocol";
 import {
   DeepseekAdapter,
   type DeepseekTransport,
@@ -53,11 +53,16 @@ class FakeTransport implements DeepseekTransport {
   }
 }
 
-function context(events: AgentEventBody[], states: Record<string, unknown>[]) {
+function context(
+  events: AgentEventBody[],
+  states: Record<string, unknown>[],
+  approvalPolicy?: ApprovalPolicy,
+) {
   return {
     cwd: "D:\\work\\project",
     emit: (event: AgentEventBody) => events.push(event),
     persistState: (state: Record<string, unknown>) => states.push(state),
+    ...(approvalPolicy ? { approvalPolicy: () => approvalPolicy } : {}),
   };
 }
 
@@ -184,6 +189,71 @@ describe("DeepseekAdapter", () => {
     });
     await adapter.start(context(events, []));
     expect(events).toEqual([]);
+  });
+
+  it("yolo 策略自动批准,不再打断用户,但保留 permission.auto 审计事件", async () => {
+    const transport = new FakeTransport();
+    const events: AgentEventBody[] = [];
+    const adapter = new DeepseekAdapter({ transport });
+    await adapter.start(context(events, [], "yolo"));
+
+    transport.emit("approval-rpc", {
+      type: "approval/requested",
+      sessionId: "dsh-session-1",
+      approvalId: "approval-1",
+      toolName: "bash",
+      reason: "运行测试",
+    });
+    await Promise.resolve();
+
+    // 不能再向手机发审批请求
+    expect(events.some((e) => e.kind === "permission.request")).toBe(false);
+    expect(events.at(-1)).toEqual({
+      kind: "permission.auto",
+      reqId: "approval-1",
+      action: "bash",
+      policy: "yolo",
+      summary: "运行测试",
+    });
+    // 且必须真的答复 dsh,否则 Harness 会一直卡在等待批准
+    expect(transport.responses[0]).toEqual({
+      rpcId: "approval-rpc",
+      result: {
+        ok: true,
+        value: {
+          sessionId: "dsh-session-1",
+          approvalId: "approval-1",
+          outcome: "allowed-once",
+        },
+      },
+    });
+  });
+
+  it("standard 策略只放行只读工具,写操作仍然要问", async () => {
+    const transport = new FakeTransport();
+    const events: AgentEventBody[] = [];
+    const adapter = new DeepseekAdapter({ transport });
+    await adapter.start(context(events, [], "standard"));
+
+    transport.emit("read-rpc", {
+      type: "approval/requested",
+      sessionId: "dsh-session-1",
+      approvalId: "approval-read",
+      toolName: "read_file",
+      reason: "查看配置",
+    });
+    await Promise.resolve();
+    expect(events.at(-1)?.kind).toBe("permission.auto");
+
+    transport.emit("write-rpc", {
+      type: "approval/requested",
+      sessionId: "dsh-session-1",
+      approvalId: "approval-write",
+      toolName: "bash",
+      reason: "删除文件",
+    });
+    await Promise.resolve();
+    expect(events.at(-1)?.kind).toBe("permission.request");
   });
 
   it("answers approval and question server requests through /api/respond semantics", async () => {
