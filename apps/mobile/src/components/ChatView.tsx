@@ -16,6 +16,8 @@ import {
   Text,
   TextInput,
   View,
+  type NativeScrollEvent,
+  type NativeSyntheticEvent,
 } from "react-native";
 import {
   fromB64,
@@ -100,6 +102,8 @@ function projectImageMime(path: string): string {
   throw new Error("只支持 PNG、JPEG、GIF 与 WebP 图片");
 }
 
+const chatKeyExtractor = (i: ChatDisplayItem): string => i.key;
+
 export const ChatView = memo(function ChatView({
   conn,
   sid,
@@ -138,7 +142,8 @@ export const ChatView = memo(function ChatView({
         let offset = 0;
         let total: number | null = null;
         let bytes: Uint8Array | null = null;
-        for (;;) {
+        // 用 while(true) 而非 for(;;):后者会让 React Compiler 放弃优化整个 ChatView。
+        while (true) {
           const chunk = await conn.fsGetChunk(sid, reference.path, offset, PROJECT_IMAGE_CHUNK);
           if (total === null) {
             total = chunk.total;
@@ -253,9 +258,10 @@ export const ChatView = memo(function ChatView({
         }
       } catch {
         // 断线、重连或 Codex 正在落盘时保留上一次内容；父会话实时事件仍是降级视图。
-      } finally {
-        loading = false;
       }
+      // 不用 finally:带 finalizer 的 try 会让 React Compiler 放弃优化整个 ChatView。
+      // catch 吞掉了所有异常,控制流必然到达这里,语义等价。
+      loading = false;
     };
     void refresh();
     const timer = setInterval(() => void refresh(), 1_200);
@@ -316,16 +322,24 @@ export const ChatView = memo(function ChatView({
     [conn, sid],
   );
 
+  // 流式期间 scopedItems 每帧都是新数组。retry 只在点击时才需要读它,
+  // 直接依赖会让 renderItem 跟着每帧换引用,memo 过的气泡就全部白重渲染。
+  const scopedItemsRef = useRef(scopedItems);
+  useEffect(() => {
+    scopedItemsRef.current = scopedItems;
+  }, [scopedItems]);
+
   const retry = useCallback(() => {
     // 找最后一条用户消息重发
-    for (let i = scopedItems.length - 1; i >= 0; i--) {
-      const it = scopedItems[i]!;
+    const current = scopedItemsRef.current;
+    for (let i = current.length - 1; i >= 0; i--) {
+      const it = current[i]!;
       if (it.type === "user") {
         onRetry?.(it.text);
         return;
       }
     }
-  }, [scopedItems, onRetry]);
+  }, [onRetry]);
 
   const visible = useMemo(() => {
     const q = search?.trim().toLowerCase() ?? "";
@@ -342,24 +356,124 @@ export const ChatView = memo(function ChatView({
     listRef.current?.scrollToEnd({ animated: true });
   }, []);
 
+  // 内联写在 JSX 里的话每次渲染都是新函数,FlatList 会据此重建所有 cell,
+  // 下面那些 memo() 过的气泡就一个都拦不住。依赖项全部是稳定引用。
+  const renderItem = useCallback(
+    ({ item }: { item: ChatDisplayItem }) => {
+      switch (item.type) {
+        case "user":
+          return <UserBubble item={item} loadAttachment={loadUserAttachment} />;
+        case "assistant":
+          return (
+            <AssistantBubble
+              item={item}
+              projectRoot={projectRoot}
+              onOpenFile={onOpenFile}
+              loadProjectImage={loadProjectImage}
+              onSelectCopy={setSelectionSource}
+            />
+          );
+        case "tool":
+          return <ToolCard item={item} onFetchOutput={fetchOutput} />;
+        case "permission":
+          return <PermissionCard item={item} onRespond={respond} />;
+        case "question":
+          return <QuestionCard item={item} onRespond={answerQuestion} />;
+        case "subagent":
+          return <SubagentCard item={item} onOpen={onOpenSubagent} />;
+        case "error":
+          return <ErrorCard item={item} onRetry={onRetry ? retry : undefined} />;
+        case "turn-diff-summary":
+          return (
+            <TurnDiffSummaryBar
+              item={item}
+              projectRoot={projectRoot}
+              onOpenFile={onOpenFile}
+            />
+          );
+        case "activity-group":
+          return (
+            <ActivityGroup item={item} onFetchOutput={fetchOutput} onRespond={respond} />
+          );
+      }
+    },
+    [
+      loadUserAttachment,
+      projectRoot,
+      onOpenFile,
+      loadProjectImage,
+      fetchOutput,
+      respond,
+      answerQuestion,
+      onOpenSubagent,
+      onRetry,
+      retry,
+    ],
+  );
+
+  const listEmpty = useMemo(
+    () =>
+      workingStatus ? null : (
+        <View style={styles.empty}>
+          <View style={styles.emptyIcon}>
+            <Icon
+              name={search ? "magnifyingglass" : "bubble.left.and.text.bubble.right"}
+              size={22}
+              color={color.textFaint}
+            />
+          </View>
+          <Text style={styles.emptyTitle}>{search ? "没有找到消息" : "准备好了"}</Text>
+          <Text style={styles.emptyText}>
+            {search ? "换个关键词试试" : "描述目标，或从下方快捷回复开始"}
+          </Text>
+        </View>
+      ),
+    [workingStatus, search],
+  );
+
+  const listFooter = useMemo(
+    () =>
+      agent && workingStatus ? (
+        <AgentWorkingIndicator
+          agent={agent}
+          status={workingStatus}
+          onInterrupt={onInterrupt}
+        />
+      ) : null,
+    [agent, workingStatus, onInterrupt],
+  );
+
+  const handleContentSizeChange = useCallback(() => {
+    if (atBottomRef.current) listRef.current?.scrollToEnd({ animated: false });
+  }, []);
+
+  // hasUnread 走 ref:直接读 state 会让 onScroll 在每次未读标记变化时换引用。
+  const hasUnreadRef = useRef(hasUnread);
+  useEffect(() => {
+    hasUnreadRef.current = hasUnread;
+  }, [hasUnread]);
+
+  const handleScroll = useCallback(
+    (e: NativeSyntheticEvent<NativeScrollEvent>) => {
+      const { layoutMeasurement, contentOffset, contentSize } = e.nativeEvent;
+      const bottom =
+        layoutMeasurement.height + contentOffset.y >= contentSize.height - 60;
+      atBottomRef.current = bottom;
+      if (bottom && hasUnreadRef.current) setHasUnread(false);
+    },
+    [],
+  );
+
   return (
     <View style={styles.root}>
       <FlatList
         ref={listRef}
         data={visible}
-        keyExtractor={(i) => i.key}
+        keyExtractor={chatKeyExtractor}
         style={styles.list}
         contentContainerStyle={styles.content}
-        onContentSizeChange={() => {
-          if (atBottomRef.current) listRef.current?.scrollToEnd({ animated: false });
-        }}
-        onScroll={(e) => {
-          const { layoutMeasurement, contentOffset, contentSize } = e.nativeEvent;
-          const bottom =
-            layoutMeasurement.height + contentOffset.y >= contentSize.height - 60;
-          atBottomRef.current = bottom;
-          if (bottom && hasUnread) setHasUnread(false);
-        }}
+        onContentSizeChange={handleContentSizeChange}
+        onScroll={handleScroll}
         scrollEventThrottle={32}
         keyboardShouldPersistTaps="handled"
         keyboardDismissMode={Platform.OS === "ios" ? "interactive" : "on-drag"}
@@ -367,72 +481,9 @@ export const ChatView = memo(function ChatView({
         initialNumToRender={12}
         maxToRenderPerBatch={8}
         windowSize={11}
-        ListEmptyComponent={workingStatus ? null : (
-          <View style={styles.empty}>
-            <View style={styles.emptyIcon}>
-              <Icon
-                name={search ? "magnifyingglass" : "bubble.left.and.text.bubble.right"}
-                size={22}
-                color={color.textFaint}
-              />
-            </View>
-            <Text style={styles.emptyTitle}>{search ? "没有找到消息" : "准备好了"}</Text>
-            <Text style={styles.emptyText}>
-              {search ? "换个关键词试试" : "描述目标，或从下方快捷回复开始"}
-            </Text>
-          </View>
-        )}
-        ListFooterComponent={
-          agent && workingStatus ? (
-            <AgentWorkingIndicator
-              agent={agent}
-              status={workingStatus}
-              onInterrupt={onInterrupt}
-            />
-          ) : null
-        }
-        renderItem={({ item }) => {
-          switch (item.type) {
-            case "user":
-              return <UserBubble item={item} loadAttachment={loadUserAttachment} />;
-            case "assistant":
-              return (
-                <AssistantBubble
-                  item={item}
-                  projectRoot={projectRoot}
-                  onOpenFile={onOpenFile}
-                  loadProjectImage={loadProjectImage}
-                  onSelectCopy={setSelectionSource}
-                />
-              );
-            case "tool":
-              return <ToolCard item={item} onFetchOutput={fetchOutput} />;
-            case "permission":
-              return <PermissionCard item={item} onRespond={respond} />;
-            case "question":
-              return <QuestionCard item={item} onRespond={answerQuestion} />;
-            case "subagent":
-              return <SubagentCard item={item} onOpen={onOpenSubagent} />;
-            case "error":
-              return <ErrorCard item={item} onRetry={onRetry ? retry : undefined} />;
-            case "turn-diff-summary":
-              return (
-                <TurnDiffSummaryBar
-                  item={item}
-                  projectRoot={projectRoot}
-                  onOpenFile={onOpenFile}
-                />
-              );
-            case "activity-group":
-              return (
-                <ActivityGroup
-                  item={item}
-                  onFetchOutput={fetchOutput}
-                  onRespond={respond}
-                />
-              );
-          }
-        }}
+        ListEmptyComponent={listEmpty}
+        ListFooterComponent={listFooter}
+        renderItem={renderItem}
       />
       {hasUnread && (
         <Pressable
