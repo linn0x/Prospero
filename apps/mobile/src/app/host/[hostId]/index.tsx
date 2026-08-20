@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   FlatList,
@@ -46,6 +46,8 @@ import {
   goalSessionVisibility,
   goalRunOverview,
   orchestrationRoute,
+  type GoalSessionGroup,
+  type GoalWorkerSessionLink,
 } from "@/lib/orchestration-overview";
 import { sortSessions } from "@/lib/store";
 import { useHostConnection } from "@/lib/use-host-connection";
@@ -590,7 +592,7 @@ export default function HostScreen() {
     else router.replace("/");
   };
 
-  const changeArchive = (sessionId: string, archived: boolean): void => {
+  const changeArchive = useCallback((sessionId: string, archived: boolean): void => {
     setArchivedIds((current) => {
       const next = new Set(current);
       if (archived) next.add(sessionId);
@@ -607,7 +609,7 @@ export default function HostScreen() {
       });
       setBanner(`归档状态保存失败: ${error instanceof Error ? error.message : String(error)}`);
     });
-  };
+  }, [hostId]);
 
   const hideSession = (session: SessionInfo, stopOnComputer: boolean): void => {
     setDeleteTarget(null);
@@ -623,7 +625,9 @@ export default function HostScreen() {
     });
   };
 
-  const sessionSwipeActions = (session: SessionInfo): SwipeAction[] => {
+  // SessionRow 的 memo 比较会读这个引用;写成普通函数的话每次渲染都换新的,
+  // 所有行都会被判定为 props 变化,memo 等于没做。
+  const sessionSwipeActions = useCallback((session: SessionInfo): SwipeAction[] => {
     const archived = archivedIds.has(session.id);
     return [
       {
@@ -648,7 +652,11 @@ export default function HostScreen() {
         onPress: () => setDeleteTarget(session),
       },
     ];
-  };
+  }, [archivedIds, changeArchive, hostId]);
+
+  const toggleGoalWorkers = useCallback((runId: string, expanded: boolean): void => {
+    setGoalRunExpansionOverrides((current) => ({ ...current, [runId]: expanded }));
+  }, []);
 
   const toggleProject = (path: string): void => {
     const collapsed = !collapsedProjects.has(path);
@@ -1431,6 +1439,12 @@ export default function HostScreen() {
         keyExtractor={(project) => project.path}
         keyboardDismissMode="interactive"
         keyboardShouldPersistTaps="handled"
+        // 一行 = 一个项目,展开后含它全部会话与 subagent,单行成本远高于普通列表。
+        // 默认 windowSize=21(约 21 屏)会把几十个项目的整棵子树都挂在原生侧。
+        initialNumToRender={6}
+        maxToRenderPerBatch={4}
+        windowSize={7}
+        removeClippedSubviews={Platform.OS === "android"}
         contentContainerStyle={[styles.list, { paddingBottom: insets.bottom + 32 }]}
         refreshControl={
           <RefreshControl
@@ -1568,222 +1582,30 @@ export default function HostScreen() {
               {!collapsed && (
                 <View style={styles.projectSessions}>
                   {project.sessions.map((session) => {
-                    const coordinatorRun = coordinatorRuns.get(session.id);
                     const goalGroup = goalGroups.get(session.id);
                     const goalWorkers = (goalGroup?.workers ?? []).flatMap((worker) => {
                       const workerSession = visibleSessionsById.get(worker.sessionId);
                       return workerSession ? [{ link: worker, session: workerSession }] : [];
                     });
-                    const goalWorkersExpanded = goalGroup
-                      ? (goalRunExpansionOverrides[goalGroup.run.id] ??
-                        goalGroup.run.status === "active")
-                      : false;
-                    // 断线时状态只代表上次连接，不能伪装成实时状态。
-                    const stale = runtime.status !== "connected";
                     return (
-                      <View key={session.id}>
-                        <SwipeRow actions={sessionSwipeActions(session)}>
-                        <Pressable
-                          style={({ pressed }) => [
-                            styles.card,
-                            pressed && styles.cardPressed,
-                            (session.status === "waiting_approval" ||
-                              session.status === "waiting_input") &&
-                              styles.cardAttention,
-                          ]}
-                          onPress={() => router.push(`/host/${hostId}/session/${session.id}`)}
-                        >
-                          <View style={styles.cardTop}>
-                            <View
-                              style={[
-                                styles.dot,
-                                { backgroundColor: stale ? "#3a3a44" : statusColor[session.status] },
-                              ]}
-                            />
-                            <Text style={styles.cardTitle} numberOfLines={1}>{session.title}</Text>
-                            <Text
-                              style={[
-                                styles.kindTag,
-                                coordinatorRun && styles.coordinatorTag,
-                              ]}
-                            >
-                              {coordinatorRun
-                                ? "Goal 编排者"
-                                : session.kind === "structured"
-                                  ? "对话"
-                                  : "终端"}
-                            </Text>
-                            <Text
-                              style={[
-                                styles.cardStatus,
-                                { color: stale ? "#5a5a66" : statusColor[session.status] },
-                              ]}
-                            >
-                              {statusLabel[session.status]}{stale ? "(离线前)" : ""}
-                            </Text>
-                          </View>
-                          {session.preview !== undefined && session.preview.length > 0 && (
-                            <Text style={styles.preview} numberOfLines={2}>{session.preview}</Text>
-                          )}
-                          <Text style={styles.cardSub} numberOfLines={1}>
-                            {(session.pendingPermissions ?? 0) + (session.pendingQuestions ?? 0) > 0
-                              ? `⚠︎ ${String((session.pendingPermissions ?? 0) + (session.pendingQuestions ?? 0))} 项待处理`
-                              : [
-                                  session.agent,
-                                  session.accountName,
-                                  session.kind === "structured" ? "ChatUI" : "终端",
-                                ].filter(Boolean).join(" · ")}
-                          </Text>
-                        </Pressable>
-                        </SwipeRow>
-                        {(session.subagents?.length ?? 0) > 0 && (
-                          <View style={styles.childList}>
-                            {(session.subagents ?? []).map((child) => {
-                              const active = child.status === "running" || child.status === "starting";
-                              return (
-                                <Pressable
-                                  key={child.id}
-                                  style={({ pressed }) => [
-                                    styles.childRow,
-                                    pressed && styles.cardPressed,
-                                  ]}
-                                  onPress={() =>
-                                    router.push({
-                                      pathname: "/host/[hostId]/session/[sid]",
-                                      params: { hostId, sid: session.id, subagentId: child.id },
-                                    })
-                                  }
-                                  accessibilityRole="button"
-                                  accessibilityLabel={`查看子 Agent ${child.name}`}
-                                >
-                                  <View
-                                    style={[
-                                      styles.childRail,
-                                      { backgroundColor: active ? color.accent : color.textFaint },
-                                    ]}
-                                  />
-                                  <View style={styles.childCopy}>
-                                    <View style={styles.childTop}>
-                                      <Text style={styles.childName} numberOfLines={1}>{child.name}</Text>
-                                      <Text style={[styles.childStatus, active && styles.childStatusActive]}>
-                                        {childStatusLabel[child.status]}
-                                      </Text>
-                                    </View>
-                                    {(child.preview || child.task) && (
-                                      <Text style={styles.childPreview} numberOfLines={1}>
-                                        {child.preview || child.task}
-                                      </Text>
-                                    )}
-                                  </View>
-                                  <Icon name="chevron.right" size={11} color={color.textFaint} />
-                                </Pressable>
-                              );
-                            })}
-                          </View>
-                        )}
-                        {goalGroup && goalWorkers.length > 0 && (
-                          <View style={styles.goalWorkerGroup}>
-                            <Pressable
-                              style={({ pressed }) => [
-                                styles.goalWorkerToggle,
-                                pressed && styles.cardPressed,
-                              ]}
-                              onPress={() =>
-                                setGoalRunExpansionOverrides((current) => ({
-                                  ...current,
-                                  [goalGroup.run.id]: !goalWorkersExpanded,
-                                }))
-                              }
-                              accessibilityRole="button"
-                              accessibilityState={{ expanded: goalWorkersExpanded }}
-                              accessibilityLabel={`${goalGroup.run.status === "active" ? "进行中" : "已完成"} Goal 的 ${String(goalWorkers.length)} 个关联会话`}
-                            >
-                              <Icon
-                                name="point.3.connected.trianglepath.dotted"
-                                size={13}
-                                color={goalGroup.run.status === "active"
-                                  ? color.accent
-                                  : color.textDim}
-                              />
-                              <Text style={styles.goalWorkerToggleTitle} numberOfLines={1}>
-                                {goalGroup.run.status === "active"
-                                  ? "Goal 工作会话"
-                                  : "已完成 Goal 会话"}
-                              </Text>
-                              <Text style={styles.goalWorkerToggleMeta}>
-                                {String(goalWorkers.length)}
-                              </Text>
-                              <Icon
-                                name={goalWorkersExpanded ? "chevron.down" : "chevron.right"}
-                                size={11}
-                                color={color.textFaint}
-                              />
-                            </Pressable>
-                            {goalWorkersExpanded && (
-                              <View style={styles.childList}>
-                                {goalWorkers.map(({ link, session: workerSession }) => {
-                                  const active = workerSession.status === "running" ||
-                                    workerSession.status === "starting";
-                                  const delivered = link.taskStatus === "done";
-                                  const workerLabel = delivered
-                                    ? "已交付"
-                                    : link.taskStatus === "failed"
-                                      ? "失败"
-                                      : statusLabel[workerSession.status];
-                                  return (
-                                    <SwipeRow
-                                      key={workerSession.id}
-                                      actions={sessionSwipeActions(workerSession)}
-                                    >
-                                      <Pressable
-                                        style={({ pressed }) => [
-                                          styles.childRow,
-                                          pressed && styles.cardPressed,
-                                        ]}
-                                        onPress={() =>
-                                          router.push(`/host/${hostId}/session/${workerSession.id}`)
-                                        }
-                                        accessibilityRole="button"
-                                        accessibilityLabel={`打开 Goal 工作会话：${link.taskTitle}，${workerLabel}`}
-                                      >
-                                        <View
-                                          style={[
-                                            styles.childRail,
-                                            {
-                                              backgroundColor: active
-                                                ? color.accent
-                                                : delivered
-                                                  ? color.success
-                                                  : color.textFaint,
-                                            },
-                                          ]}
-                                        />
-                                        <View style={styles.childCopy}>
-                                          <View style={styles.childTop}>
-                                            <Text style={styles.childName} numberOfLines={1}>
-                                              {link.taskTitle}
-                                            </Text>
-                                            <Text style={[
-                                              styles.childStatus,
-                                              (active || delivered) && styles.childStatusActive,
-                                            ]}>
-                                              {workerLabel}
-                                            </Text>
-                                          </View>
-                                          <Text style={styles.childPreview} numberOfLines={1}>
-                                            {workerSession.title}
-                                          </Text>
-                                        </View>
-                                        <Icon name="chevron.right" size={11} color={color.textFaint} />
-                                      </Pressable>
-                                    </SwipeRow>
-                                  );
-                                })}
-                              </View>
-                            )}
-                          </View>
-                        )}
-                      </View>
+                      <SessionRow
+                        key={session.id}
+                        session={session}
+                        hostId={hostId}
+                        // 断线时状态只代表上次连接，不能伪装成实时状态。
+                        stale={runtime.status !== "connected"}
+                        isCoordinator={coordinatorRuns.get(session.id) !== undefined}
+                        goalGroup={goalGroup}
+                        goalWorkers={goalWorkers}
+                        goalWorkersExpanded={
+                          goalGroup
+                            ? (goalRunExpansionOverrides[goalGroup.run.id] ??
+                              goalGroup.run.status === "active")
+                            : false
+                        }
+                        onToggleGoalWorkers={toggleGoalWorkers}
+                        swipeActionsFor={sessionSwipeActions}
+                      />
                     );
                   })}
                 </View>
@@ -1872,6 +1694,235 @@ export default function HostScreen() {
     </View>
   );
 }
+
+interface GoalWorkerEntry {
+  link: GoalWorkerSessionLink;
+  session: SessionInfo;
+}
+
+interface SessionRowProps {
+  session: SessionInfo;
+  hostId: string;
+  stale: boolean;
+  isCoordinator: boolean;
+  goalGroup: GoalSessionGroup | undefined;
+  goalWorkers: GoalWorkerEntry[];
+  goalWorkersExpanded: boolean;
+  onToggleGoalWorkers: (runId: string, expanded: boolean) => void;
+  swipeActionsFor: (session: SessionInfo) => SwipeAction[];
+}
+
+/**
+ * 单个会话行（含 subagent 与 Goal 工作会话）。
+ *
+ * 独立成 memo 组件是有实测依据的:React Compiler 在本文件的主组件上直接 bail out
+ * （"Unexpected terminal kind `logical` for ternary test block"），整屏拿不到任何
+ * 自动记忆化。而 upsertSession 只替换单个会话对象,其余 session 引用是稳定的 ——
+ * 只要这里挡住,一次会话状态更新就不会重渲染其余上百行。
+ */
+const SessionRow = memo(function SessionRow({
+  session,
+  hostId,
+  stale,
+  isCoordinator,
+  goalGroup,
+  goalWorkers,
+  goalWorkersExpanded,
+  onToggleGoalWorkers,
+  swipeActionsFor,
+}: SessionRowProps) {
+  const pending = (session.pendingPermissions ?? 0) + (session.pendingQuestions ?? 0);
+  return (
+    <View>
+      <SwipeRow actions={swipeActionsFor(session)}>
+        <Pressable
+          style={({ pressed }) => [
+            styles.card,
+            pressed && styles.cardPressed,
+            (session.status === "waiting_approval" || session.status === "waiting_input") &&
+              styles.cardAttention,
+          ]}
+          onPress={() => router.push(`/host/${hostId}/session/${session.id}`)}
+        >
+          <View style={styles.cardTop}>
+            <View
+              style={[
+                styles.dot,
+                { backgroundColor: stale ? "#3a3a44" : statusColor[session.status] },
+              ]}
+            />
+            <Text style={styles.cardTitle} numberOfLines={1}>{session.title}</Text>
+            <Text style={[styles.kindTag, isCoordinator && styles.coordinatorTag]}>
+              {isCoordinator
+                ? "Goal 编排者"
+                : session.kind === "structured"
+                  ? "对话"
+                  : "终端"}
+            </Text>
+            <Text
+              style={[
+                styles.cardStatus,
+                { color: stale ? "#5a5a66" : statusColor[session.status] },
+              ]}
+            >
+              {statusLabel[session.status]}{stale ? "(离线前)" : ""}
+            </Text>
+          </View>
+          {session.preview !== undefined && session.preview.length > 0 && (
+            <Text style={styles.preview} numberOfLines={2}>{session.preview}</Text>
+          )}
+          <Text style={styles.cardSub} numberOfLines={1}>
+            {pending > 0
+              ? `⚠︎ ${String(pending)} 项待处理`
+              : [
+                  session.agent,
+                  session.accountName,
+                  session.kind === "structured" ? "ChatUI" : "终端",
+                ].filter(Boolean).join(" · ")}
+          </Text>
+        </Pressable>
+      </SwipeRow>
+      {(session.subagents?.length ?? 0) > 0 && (
+        <View style={styles.childList}>
+          {(session.subagents ?? []).map((child) => {
+            const active = child.status === "running" || child.status === "starting";
+            return (
+              <Pressable
+                key={child.id}
+                style={({ pressed }) => [styles.childRow, pressed && styles.cardPressed]}
+                onPress={() =>
+                  router.push({
+                    pathname: "/host/[hostId]/session/[sid]",
+                    params: { hostId, sid: session.id, subagentId: child.id },
+                  })
+                }
+                accessibilityRole="button"
+                accessibilityLabel={`查看子 Agent ${child.name}`}
+              >
+                <View
+                  style={[
+                    styles.childRail,
+                    { backgroundColor: active ? color.accent : color.textFaint },
+                  ]}
+                />
+                <View style={styles.childCopy}>
+                  <View style={styles.childTop}>
+                    <Text style={styles.childName} numberOfLines={1}>{child.name}</Text>
+                    <Text style={[styles.childStatus, active && styles.childStatusActive]}>
+                      {childStatusLabel[child.status]}
+                    </Text>
+                  </View>
+                  {(child.preview || child.task) && (
+                    <Text style={styles.childPreview} numberOfLines={1}>
+                      {child.preview || child.task}
+                    </Text>
+                  )}
+                </View>
+                <Icon name="chevron.right" size={11} color={color.textFaint} />
+              </Pressable>
+            );
+          })}
+        </View>
+      )}
+      {goalGroup && goalWorkers.length > 0 && (
+        <View style={styles.goalWorkerGroup}>
+          <Pressable
+            style={({ pressed }) => [styles.goalWorkerToggle, pressed && styles.cardPressed]}
+            onPress={() => onToggleGoalWorkers(goalGroup.run.id, !goalWorkersExpanded)}
+            accessibilityRole="button"
+            accessibilityState={{ expanded: goalWorkersExpanded }}
+            accessibilityLabel={`${goalGroup.run.status === "active" ? "进行中" : "已完成"} Goal 的 ${String(goalWorkers.length)} 个关联会话`}
+          >
+            <Icon
+              name="point.3.connected.trianglepath.dotted"
+              size={13}
+              color={goalGroup.run.status === "active" ? color.accent : color.textDim}
+            />
+            <Text style={styles.goalWorkerToggleTitle} numberOfLines={1}>
+              {goalGroup.run.status === "active" ? "Goal 工作会话" : "已完成 Goal 会话"}
+            </Text>
+            <Text style={styles.goalWorkerToggleMeta}>{String(goalWorkers.length)}</Text>
+            <Icon
+              name={goalWorkersExpanded ? "chevron.down" : "chevron.right"}
+              size={11}
+              color={color.textFaint}
+            />
+          </Pressable>
+          {goalWorkersExpanded && (
+            <View style={styles.childList}>
+              {goalWorkers.map(({ link, session: workerSession }) => {
+                const active = workerSession.status === "running" ||
+                  workerSession.status === "starting";
+                const delivered = link.taskStatus === "done";
+                const workerLabel = delivered
+                  ? "已交付"
+                  : link.taskStatus === "failed"
+                    ? "失败"
+                    : statusLabel[workerSession.status];
+                return (
+                  <SwipeRow key={workerSession.id} actions={swipeActionsFor(workerSession)}>
+                    <Pressable
+                      style={({ pressed }) => [styles.childRow, pressed && styles.cardPressed]}
+                      onPress={() =>
+                        router.push(`/host/${hostId}/session/${workerSession.id}`)
+                      }
+                      accessibilityRole="button"
+                      accessibilityLabel={`打开 Goal 工作会话：${link.taskTitle}，${workerLabel}`}
+                    >
+                      <View
+                        style={[
+                          styles.childRail,
+                          {
+                            backgroundColor: active
+                              ? color.accent
+                              : delivered
+                                ? color.success
+                                : color.textFaint,
+                          },
+                        ]}
+                      />
+                      <View style={styles.childCopy}>
+                        <View style={styles.childTop}>
+                          <Text style={styles.childName} numberOfLines={1}>
+                            {link.taskTitle}
+                          </Text>
+                          <Text style={[
+                            styles.childStatus,
+                            (active || delivered) && styles.childStatusActive,
+                          ]}>
+                            {workerLabel}
+                          </Text>
+                        </View>
+                        <Text style={styles.childPreview} numberOfLines={1}>
+                          {workerSession.title}
+                        </Text>
+                      </View>
+                      <Icon name="chevron.right" size={11} color={color.textFaint} />
+                    </Pressable>
+                  </SwipeRow>
+                );
+              })}
+            </View>
+          )}
+        </View>
+      )}
+    </View>
+  );
+}, (prev, next) =>
+  // goalWorkers 每次渲染都是新数组(flatMap 产物),默认浅比较会让所有行都失效;
+  // 它通常是空的,按内容比较代价极小。
+  prev.session === next.session &&
+  prev.hostId === next.hostId &&
+  prev.stale === next.stale &&
+  prev.isCoordinator === next.isCoordinator &&
+  prev.goalGroup === next.goalGroup &&
+  prev.goalWorkersExpanded === next.goalWorkersExpanded &&
+  prev.onToggleGoalWorkers === next.onToggleGoalWorkers &&
+  prev.swipeActionsFor === next.swipeActionsFor &&
+  prev.goalWorkers.length === next.goalWorkers.length &&
+  prev.goalWorkers.every((w, i) =>
+    w.session === next.goalWorkers[i]?.session && w.link === next.goalWorkers[i]?.link),
+);
 
 function FilterChip({
   label,
