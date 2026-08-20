@@ -18,6 +18,7 @@ import type {
 } from "@prospero/protocol";
 import crossSpawn from "cross-spawn";
 import { WebSocket, type RawData } from "ws";
+import { needsApproval } from "../approval-policy.js";
 import {
   AdapterError,
   summarize,
@@ -392,6 +393,23 @@ export class DeepseekAdapter implements AgentAdapter {
       const tool = String(frame["toolName"] ?? "tool");
       const reason = typeof frame["reason"] === "string" ? frame["reason"] : "";
       const callId = typeof frame["callId"] === "string" ? frame["callId"] : "";
+
+      // 策略放行:不等人,但把"这一步被自动批准了"照常发出去 —— 与 claude/codex
+      // 适配器同一套语义。不打断 ≠ 不告知,聊天里仍要留下这次调用便于事后追溯。
+      const policy = this.ctx?.approvalPolicy?.() ?? "strict";
+      if (!needsApproval(policy, tool)) {
+        this.emit({
+          kind: "permission.auto",
+          reqId: approvalId,
+          action: tool,
+          policy,
+          summary: reason || `允许 ${tool} 执行此操作`,
+        });
+        // 复用手动批准的同一条通路:dsh 回 approval/resolved 后照常发 permission.resolved
+        void this.respondPermission(approvalId, "once").catch(() => undefined);
+        return;
+      }
+
       this.emit({
         kind: "permission.request",
         reqId: approvalId,
