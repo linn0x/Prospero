@@ -140,6 +140,12 @@ export class ClaudeAdapter implements AgentAdapter {
   private readonly questions = new Map<string, PendingQuestion>();
   private readonly questionToolIds = new Set<string>();
   private readonly taskAgents = new Map<string, string>();
+  /**
+   * 已知不是子 Agent 的原生任务。后台 shell 任务(task_type=local_bash 之类)与 Task
+   * 工具共用 task_started,只有后者带 subagent_type —— 早先不加区分地全登记成子 Agent,
+   * 一个长会话攒出 106 个,越过协议的 100 上限后 hello.ok 整帧作废,手机直连和中继一起连不上。
+   */
+  private readonly nonSubagentTasks = new Set<string>();
   private readonly subagents = new Map<string, { canMessage: boolean; createdAt: number }>();
   private readonly currentMessageByAgent = new Map<string, string>();
   /** 正在流式输出的消息 id(按 agent);增量事件的归并键只能来自流本身 */
@@ -209,11 +215,7 @@ export class ClaudeAdapter implements AgentAdapter {
   }
 
   private readonly canUseTool: CanUseTool = (toolName, input, options) => {
-    const rawAgentId = (options as { agentID?: unknown }).agentID;
-    const agentId =
-      typeof rawAgentId === "string"
-        ? (this.taskAgents.get(rawAgentId) ?? rawAgentId)
-        : undefined;
+    const agentId = this.resolveAgentId((options as { agentID?: unknown }).agentID);
     if (toolName === "AskUserQuestion") {
       return this.requestUserQuestion(input, options, agentId);
     }
@@ -365,10 +367,17 @@ export class ClaudeAdapter implements AgentAdapter {
   }
 
   private messageAgent(msg: SDKMessage): string | undefined {
-    const parent = (msg as { parent_tool_use_id?: unknown }).parent_tool_use_id;
-    return typeof parent === "string" && parent.length > 0
-      ? (this.taskAgents.get(parent) ?? parent)
-      : undefined;
+    return this.resolveAgentId((msg as { parent_tool_use_id?: unknown }).parent_tool_use_id);
+  }
+
+  /**
+   * 原生 id 归一成子 Agent id;不是子 Agent 的任务返回 undefined ——
+   * 它的输出与审批要留在主对话里,而不是挂到一个不存在的子 Agent 上。
+   */
+  private resolveAgentId(raw: unknown): string | undefined {
+    if (typeof raw !== "string" || raw.length === 0) return undefined;
+    const id = this.taskAgents.get(raw) ?? raw;
+    return this.nonSubagentTasks.has(id) ? undefined : id;
   }
 
   private registerSubagent(
@@ -572,28 +581,38 @@ export class ClaudeAdapter implements AgentAdapter {
           const publicId = system.tool_use_id || system.task_id;
           this.taskAgents.set(system.task_id, publicId);
           if (system.tool_use_id) this.taskAgents.set(system.tool_use_id, publicId);
-          this.registerSubagent(publicId, {
-            ...(system.subagent_type ? { name: system.subagent_type } : {}),
-            ...(system.task_type ? { role: system.task_type } : {}),
-            ...(system.prompt || system.description
-              ? { task: system.prompt || system.description }
-              : {}),
-          });
-          this.updateSubagent(publicId, "running", true, system.description);
+          // 只有 Task 工具派生的任务带 subagent_type;后台 shell 任务不是子 Agent,
+          // 记下来让后续的 progress/通知/子消息一并让开。
+          if (!system.subagent_type) {
+            this.nonSubagentTasks.add(publicId);
+          } else {
+            this.registerSubagent(publicId, {
+              name: system.subagent_type,
+              ...(system.task_type ? { role: system.task_type } : {}),
+              ...(system.prompt || system.description
+                ? { task: system.prompt || system.description }
+                : {}),
+            });
+            this.updateSubagent(publicId, "running", true, system.description);
+          }
         } else if (system.subtype === "task_progress" && system.task_id) {
           const publicId = this.taskAgents.get(system.task_id) ?? system.tool_use_id ?? system.task_id;
           this.taskAgents.set(system.task_id, publicId);
-          this.updateSubagent(publicId, "running", true, system.summary || system.description);
+          if (!this.nonSubagentTasks.has(publicId)) {
+            this.updateSubagent(publicId, "running", true, system.summary || system.description);
+          }
         } else if (system.subtype === "task_notification" && system.task_id) {
           const publicId = this.taskAgents.get(system.task_id) ?? system.tool_use_id ?? system.task_id;
-          const rawStatus = String(system.status ?? "completed");
-          const status: SubagentStatus =
-            rawStatus === "failed"
-              ? "failed"
-              : rawStatus === "stopped"
-                ? "stopped"
-                : "completed";
-          this.updateSubagent(publicId, status, false, system.summary || system.description);
+          if (!this.nonSubagentTasks.has(publicId)) {
+            const rawStatus = String(system.status ?? "completed");
+            const status: SubagentStatus =
+              rawStatus === "failed"
+                ? "failed"
+                : rawStatus === "stopped"
+                  ? "stopped"
+                  : "completed";
+            this.updateSubagent(publicId, status, false, system.summary || system.description);
+          }
         }
         if (system.subtype === "init" && !this.selectedModel && system.model) {
           this.selectedModel = system.model;
@@ -914,6 +933,7 @@ export class ClaudeAdapter implements AgentAdapter {
     this.ctx = null;
     this.subagents.clear();
     this.taskAgents.clear();
+    this.nonSubagentTasks.clear();
     this.currentMessageByAgent.clear();
     this.streamMessageByAgent.clear();
     await this.pumping?.catch(() => {});

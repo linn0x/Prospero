@@ -41,6 +41,7 @@ import {
   toB64,
   utf8Decode,
   type C2SMessage,
+  clampSessionInfo,
   type S2CMessage,
   type SecureChannel,
   type SessionInfo,
@@ -719,7 +720,7 @@ export async function createDaemonServer(
       completeSettledCoordinatorRuns();
     }
     for (const conn of conns) {
-      if (conn.device) send(conn, { type: "session.state", session });
+      if (conn.device) send(conn, { type: "session.state", session: clampSessionInfo(session) });
     }
   });
 
@@ -805,11 +806,12 @@ export async function createDaemonServer(
   }, PING_MS);
 
   function sendHelloOk(conn: Conn): void {
-    const sessions = manager.list().map((session) =>
-      conn.protocolVersion <= 5 && session.status === "completed"
-        ? { ...session, status: "idle" as const }
-        : session,
-    );
+    const sessions = manager.list().map((session) => {
+      const clamped = clampSessionInfo(session);
+      return conn.protocolVersion <= 5 && clamped.status === "completed"
+        ? { ...clamped, status: "idle" as const }
+        : clamped;
+    });
     send(conn, {
       type: "hello.ok",
       host: {
