@@ -54,8 +54,13 @@ export async function resolveWithin(root: string, rel: string): Promise<string> 
   });
 
   const candidate = path.resolve(realRoot, rel);
-  const contains = (base: string, target: string): boolean =>
-    target === base || target.startsWith(base + path.sep);
+  // 盘符根(如 realpath("D:\\") → "D:\\")本身以分隔符结尾，若再拼一个 path.sep
+  // 会得到双分隔符，导致其下所有子目录都判为“逃逸”。先归一化再比较。
+  const contains = (base: string, target: string): boolean => {
+    if (target === base) return true;
+    const prefix = base.endsWith(path.sep) ? base : base + path.sep;
+    return target.startsWith(prefix);
+  };
 
   try {
     const real = await realpath(candidate);

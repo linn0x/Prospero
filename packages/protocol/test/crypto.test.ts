@@ -191,7 +191,7 @@ describe("handshake + SecureChannel", () => {
   });
 
   it("客户端只允许显式维护的回退版本", () => {
-    expect(SUPPORTED_PROTOCOL_VERSIONS).toEqual([13, 12, 11, 10, 9, 8, 7, 5]);
+    expect(SUPPORTED_PROTOCOL_VERSIONS).toEqual([14, 13, 12, 11, 10, 9, 8, 7, 5]);
     expect(() => clientHandshakeStart(6)).toThrowError(/unsupported client protocol/);
   });
 

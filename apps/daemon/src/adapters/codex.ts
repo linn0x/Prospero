@@ -262,7 +262,6 @@ export class CodexAdapter implements AgentAdapter {
       typeof this.opts.resumeState?.["threadId"] === "string"
         ? this.opts.resumeState["threadId"]
         : null;
-    const forkThread = this.opts.resumeState?.["forkThread"] === true;
     // 实测:threadId 在 result.thread.id,不是顶层 threadId(spec 类型名有误导)。
     // Codex 自己把 thread 落在 ~/.codex；Prospero 只需保存这个 ID。
     const initialPolicy = this.executionPolicy();
@@ -274,13 +273,7 @@ export class CodexAdapter implements AgentAdapter {
     };
     let started: { thread?: { id?: string }; threadId?: string };
     if (resumeThreadId) {
-      if (forkThread) {
-        started = (await this.request("thread/fork", {
-          threadId: resumeThreadId,
-          ...baseParams,
-          deferGoalContinuation: true,
-        })) as typeof started;
-      } else try {
+      try {
         started = (await this.request("thread/resume", {
           threadId: resumeThreadId,
           ...baseParams,

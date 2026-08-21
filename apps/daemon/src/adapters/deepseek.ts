@@ -9,6 +9,8 @@
  */
 import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import os from "node:os";
+import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type {
   AgentEventBody,
@@ -302,6 +304,17 @@ function contentText(value: unknown): string {
   return parts.join("\n");
 }
 
+function assistantContent(value: unknown): { text: string; reasoning: string } {
+  const text: string[] = [];
+  const reasoning: string[] = [];
+  for (const item of Array.isArray(value) ? value : []) {
+    const block = record(item);
+    if (block["type"] === "text" && typeof block["text"] === "string") text.push(block["text"]);
+    if (block["type"] === "reasoning" && typeof block["text"] === "string") reasoning.push(block["text"]);
+  }
+  return { text: text.join("\n"), reasoning: reasoning.join("\n") };
+}
+
 interface PendingApproval {
   rpcId: string;
   approvalId: string;
@@ -328,12 +341,20 @@ export class DeepseekAdapter implements AgentAdapter {
   private ctx: AdapterContext | null = null;
   private transport: DeepseekTransport | null = null;
   private sessionId: string | null = null;
+  private currentPreset: string | null = null;
   private unsubscribe: (() => void) | null = null;
   private currentTurn = 0;
   private lastSeq = -1;
   private historySync: Promise<void> | null = null;
   private readonly bufferedEvents: Array<Record<string, unknown>> = [];
   private readonly usageByTurn = new Map<number, { input: number; output: number }>();
+  private readonly turnStartedAt = new Map<number, number>();
+  private readonly stepStartedAt = new Map<string, number>();
+  private readonly compactionStartedAt = new Map<string, number>();
+  private readonly compactionDetails = new Map<string, { detail: string; inputTokens: number; outputTokens: number }>();
+  private readonly messageByTurn = new Map<number, string>();
+  private readonly streamedText = new Map<string, { text: string; reasoning: string }>();
+  private readonly pendingUserText: string[] = [];
   private readonly approvals = new Map<string, PendingApproval>();
   private readonly questions = new Map<string, PendingQuestion>();
 
@@ -343,25 +364,55 @@ export class DeepseekAdapter implements AgentAdapter {
     this.bufferedEvents.length = 0;
     const transport = this.opts.transport ?? await startTransport(ctx);
     this.transport = transport;
+    // 模型/预设目录都有 host 级只读 RPC。目录探测绝不能先创建空会话，
+    // 否则手机每打开一次新建页，Harness 历史里就会多一条空白记录。
+    if (ctx.catalogOnly) return;
     const restored = typeof this.opts.resumeState?.["sessionId"] === "string"
       ? this.opts.resumeState["sessionId"] as string
       : undefined;
-    const created = await transport.call<{ sessionId?: string }>("session.create", {
+    const requestedPreset = typeof this.opts.resumeState?.["agentPreset"] === "string"
+      ? this.opts.resumeState["agentPreset"] as string
+      : undefined;
+    const created = await transport.call<{ sessionId?: string; agentPreset?: string }>("session.create", {
       cwd: ctx.cwd,
       ...(restored ? { sessionId: restored } : {}),
+      ...(!restored && requestedPreset ? { agentPreset: requestedPreset } : {}),
     });
     if (typeof created.sessionId !== "string" || created.sessionId.length === 0) {
       throw new AdapterError("DeepSeek Harness 未返回 sessionId");
     }
     this.sessionId = created.sessionId;
+    this.currentPreset = created.agentPreset ?? requestedPreset ?? null;
     this.unsubscribe = transport.subscribe(created.sessionId, (rpcId, frame) => this.onFrame(rpcId, frame));
     await transport.ready?.();
     await this.syncHistory().catch(() => undefined);
-    ctx.persistState?.({ sessionId: created.sessionId });
+    const requestedModel = typeof this.opts.resumeState?.["model"] === "string"
+      ? this.opts.resumeState["model"] as string
+      : undefined;
+    const requestedEffort = typeof this.opts.resumeState?.["effort"] === "string"
+      ? this.opts.resumeState["effort"] as string
+      : undefined;
+    if (!restored && requestedModel) await this.setModel(requestedModel, requestedEffort);
+    ctx.persistState?.({
+      sessionId: created.sessionId,
+      ...(this.currentPreset ? { agentPreset: this.currentPreset } : {}),
+      ...(requestedModel ? { model: requestedModel } : {}),
+      ...(requestedEffort ? { effort: requestedEffort } : {}),
+    });
   }
 
   private emit(body: AgentEventBody): void {
     this.ctx?.emit(body);
+  }
+
+  private emitTrajectory(
+    recordId: string,
+    recordKind: "turn" | "step" | "request" | "retry" | "compaction",
+    phase: "running" | "completed" | "failed" | "info",
+    title: string,
+    fields: Omit<Extract<AgentEventBody, { kind: "trajectory.record" }>, "kind" | "recordId" | "recordKind" | "phase" | "title"> = {},
+  ): void {
+    this.emit({ kind: "trajectory.record", recordId, recordKind, phase, title, ...fields });
   }
 
   private messageId(data: Record<string, unknown>): string {
@@ -521,27 +572,195 @@ export class DeepseekAdapter implements AgentAdapter {
   private onSessionEvent(event: Record<string, unknown>): void {
     const type = event["type"];
     const data = record(event["data"]);
+    const eventTime = finite(event["time"]);
+    const seq = finite(event["seq"]) ?? 0;
     if (type === "turn/start") {
       this.currentTurn = finite(data["turn"]) ?? this.currentTurn + 1;
+      if (eventTime !== undefined) this.turnStartedAt.set(this.currentTurn, eventTime);
+      this.emitTrajectory(`turn_${String(this.currentTurn)}`, "turn", "running", `第 ${String(this.currentTurn)} 轮`, {
+        turn: this.currentTurn,
+        ...(eventTime !== undefined ? { startedAt: eventTime } : {}),
+      });
+      return;
+    }
+    if (type === "step/start") {
+      const turn = finite(data["turn"]) ?? this.currentTurn;
+      const step = finite(data["step"]) ?? 0;
+      const id = `step_${String(turn)}_${String(step)}`;
+      if (eventTime !== undefined) this.stepStartedAt.set(id, eventTime);
+      this.emitTrajectory(id, "step", "running", `步骤 ${String(step + 1)}`, {
+        turn,
+        step,
+        ...(eventTime !== undefined ? { startedAt: eventTime } : {}),
+      });
+      return;
+    }
+    if (type === "step/end") {
+      const turn = finite(data["turn"]) ?? this.currentTurn;
+      const step = finite(data["step"]) ?? 0;
+      const id = `step_${String(turn)}_${String(step)}`;
+      const startedAt = this.stepStartedAt.get(id);
+      this.emitTrajectory(id, "step", "completed", `步骤 ${String(step + 1)}`, {
+        turn,
+        step,
+        ...(startedAt !== undefined ? { startedAt } : {}),
+        ...(startedAt !== undefined && eventTime !== undefined && eventTime >= startedAt
+          ? { durationMs: Math.round(eventTime - startedAt) }
+          : {}),
+      });
+      return;
+    }
+    if (type === "user/message") {
+      const source = record(data["source"]);
+      const text = contentText(data["content"]);
+      const direct = source["kind"] === "user";
+      this.emitTrajectory(`user_${String(seq)}`, "request", "info", direct ? "用户输入" : "上下文注入", {
+        ...(text ? { detail: summarize(text, 4_000) } : {}),
+        ...(eventTime !== undefined ? { startedAt: eventTime } : {}),
+      });
+      if (direct) {
+        const pendingIndex = this.pendingUserText.indexOf(text);
+        if (pendingIndex >= 0) this.pendingUserText.splice(pendingIndex, 1);
+        else this.emit({ kind: "user.message", msgId: String(data["id"] ?? `deepseek_user_${String(seq)}`), text });
+      }
       return;
     }
     if (type === "assistant/chunk") {
       const chunk = record(data["chunk"]);
       const msgId = this.messageId(data);
+      const turn = finite(data["turn"]) ?? this.currentTurn;
+      this.messageByTurn.set(turn, msgId);
+      const streamed = this.streamedText.get(msgId) ?? { text: "", reasoning: "" };
       if (chunk["type"] === "text-delta" && typeof chunk["text"] === "string" && chunk["text"].length > 0) {
+        streamed.text += chunk["text"];
         this.emit({ kind: "text.delta", msgId, textId: msgId, delta: chunk["text"] });
       } else if (chunk["type"] === "reasoning-delta" && typeof chunk["text"] === "string" && chunk["text"].length > 0) {
+        streamed.reasoning += chunk["text"];
         this.emit({ kind: "reasoning.delta", msgId, delta: chunk["text"] });
       }
+      this.streamedText.set(msgId, streamed);
       return;
     }
     if (type === "assistant/message") {
       const usage = record(data["usage"]);
       const turn = finite(data["turn"]) ?? this.currentTurn;
+      const step = finite(data["step"]) ?? 0;
+      const msgId = this.messageId(data);
+      this.messageByTurn.set(turn, msgId);
+      const assembled = assistantContent(record(data["message"])["content"]);
+      const streamed = this.streamedText.get(msgId) ?? { text: "", reasoning: "" };
+      if (assembled.reasoning && assembled.reasoning !== streamed.reasoning) {
+        const delta = assembled.reasoning.startsWith(streamed.reasoning)
+          ? assembled.reasoning.slice(streamed.reasoning.length)
+          : assembled.reasoning;
+        if (delta) this.emit({ kind: "reasoning.delta", msgId, delta });
+      }
+      if (assembled.text && assembled.text !== streamed.text) {
+        const delta = assembled.text.startsWith(streamed.text)
+          ? assembled.text.slice(streamed.text.length)
+          : assembled.text;
+        if (delta) this.emit({ kind: "text.delta", msgId, textId: msgId, delta });
+      }
+      this.streamedText.set(msgId, assembled);
       const previous = this.usageByTurn.get(turn) ?? { input: 0, output: 0 };
       previous.input += finite(usage["inputTokens"]) ?? 0;
       previous.output += finite(usage["outputTokens"]) ?? 0;
       this.usageByTurn.set(turn, previous);
+      const requestId = `request_${String(turn)}_${String(step)}`;
+      const startedAt = this.stepStartedAt.get(`step_${String(turn)}_${String(step)}`);
+      this.emitTrajectory(requestId, "request", "completed", "模型回复", {
+        turn,
+        step,
+        ...(assembled.text ? { detail: summarize(assembled.text, 2_000) } : {}),
+        ...(startedAt !== undefined ? { startedAt } : {}),
+        ...(startedAt !== undefined && eventTime !== undefined && eventTime >= startedAt
+          ? { durationMs: Math.round(eventTime - startedAt) }
+          : {}),
+        inputTokens: finite(usage["inputTokens"]) ?? 0,
+        outputTokens: finite(usage["outputTokens"]) ?? 0,
+      });
+      return;
+    }
+    if (type === "llm/retry") {
+      const turn = finite(data["turn"]) ?? this.currentTurn;
+      const step = finite(data["step"]) ?? 0;
+      const retry = finite(data["retry"]) ?? 0;
+      const delayMs = finite(data["delayMs"]);
+      this.emitTrajectory(`retry_${String(seq)}`, "retry", "failed", `模型请求重试 ${String(retry + 1)}`, {
+        turn,
+        step,
+        detail: summarize(data["failure"] ?? "模型请求失败", 2_000),
+        ...(eventTime !== undefined ? { startedAt: eventTime } : {}),
+        ...(delayMs !== undefined ? { durationMs: Math.round(delayMs) } : {}),
+      });
+      return;
+    }
+    if (type === "request/context") {
+      const provider = typeof data["provider"] === "string" ? data["provider"] : "";
+      const model = typeof data["model"] === "string" ? data["model"] : "";
+      const contextWindow = finite(data["contextWindow"]);
+      this.emitTrajectory(`context_${String(seq)}`, "request", "info", "模型上下文", {
+        detail: [
+          provider && model ? `${provider}/${model}` : provider || model,
+          contextWindow !== undefined ? `${String(Math.round(contextWindow))} tokens` : "",
+        ].filter(Boolean).join(" · "),
+        ...(eventTime !== undefined ? { startedAt: eventTime } : {}),
+      });
+      return;
+    }
+    if (type === "request/header") {
+      this.emitTrajectory(`header_${String(seq)}`, "request", "info", "模型请求参数", {
+        detail: summarize(data, 4_000),
+        ...(eventTime !== undefined ? { startedAt: eventTime } : {}),
+      });
+      return;
+    }
+    if (type === "compaction/start") {
+      const compactionId = String(data["compactionId"] ?? seq);
+      if (eventTime !== undefined) this.compactionStartedAt.set(compactionId, eventTime);
+      this.emitTrajectory(`compaction_${compactionId}`, "compaction", "running", "正在压缩上下文", {
+        ...(finite(data["turn"]) !== undefined ? { turn: finite(data["turn"]) } : {}),
+        ...(eventTime !== undefined ? { startedAt: eventTime } : {}),
+      });
+      return;
+    }
+    if (type === "compaction/summary") {
+      const compactionId = String(data["compactionId"] ?? seq);
+      const startedAt = this.compactionStartedAt.get(compactionId);
+      const summaryUsage = record(data["usage"]);
+      const summary = {
+        detail: summarize(data["summary"] ?? data, 4_000),
+        inputTokens: finite(summaryUsage["inputTokens"]) ?? 0,
+        outputTokens: finite(summaryUsage["outputTokens"]) ?? 0,
+      };
+      this.compactionDetails.set(compactionId, summary);
+      this.emitTrajectory(`compaction_${compactionId}`, "compaction", "running", "正在压缩上下文", {
+        ...summary,
+        ...(startedAt !== undefined ? { startedAt } : eventTime !== undefined ? { startedAt: eventTime } : {}),
+      });
+      return;
+    }
+    if (type === "compaction/end") {
+      const compactionId = String(data["compactionId"] ?? seq);
+      const startedAt = this.compactionStartedAt.get(compactionId);
+      const summary = this.compactionDetails.get(compactionId);
+      const failed = data["error"] !== undefined;
+      this.emitTrajectory(`compaction_${compactionId}`, "compaction", failed ? "failed" : "completed", failed ? "上下文压缩失败" : "上下文压缩完成", {
+        ...(failed ? { detail: summarize(data["error"], 2_000) } : summary ?? {}),
+        ...(startedAt !== undefined ? { startedAt } : {}),
+        ...(startedAt !== undefined && eventTime !== undefined && eventTime >= startedAt
+          ? { durationMs: Math.round(eventTime - startedAt) }
+          : {}),
+      });
+      this.compactionStartedAt.delete(compactionId);
+      this.compactionDetails.delete(compactionId);
+      return;
+    }
+    if (type === "compaction/prune") {
+      this.emitTrajectory(`compaction_prune_${String(seq)}`, "compaction", "info", "已裁剪工具输出", {
+        detail: summarize(data, 2_000),
+        ...(eventTime !== undefined ? { startedAt: eventTime } : {}),
+      });
       return;
     }
     if (type === "tool/call") {
@@ -577,17 +796,28 @@ export class DeepseekAdapter implements AgentAdapter {
       const turn = finite(data["turn"]) ?? this.currentTurn;
       const usage = this.usageByTurn.get(turn);
       this.usageByTurn.delete(turn);
+      const startedAt = this.turnStartedAt.get(turn);
       const reason = record(data["reason"]);
       const finish = typeof reason["kind"] === "string" ? reason["kind"] : "completed";
       if (finish === "error") {
         this.emit({ kind: "agent.error", message: summarize(record(reason["error"])["message"] ?? "DeepSeek Harness 运行失败") });
       }
+      this.emitTrajectory(`turn_${String(turn)}`, "turn", finish === "error" ? "failed" : "completed", `第 ${String(turn)} 轮`, {
+        turn,
+        ...(startedAt !== undefined ? { startedAt } : {}),
+        ...(startedAt !== undefined && eventTime !== undefined && eventTime >= startedAt
+          ? { durationMs: Math.round(eventTime - startedAt) }
+          : {}),
+        ...(finish !== "completed" ? { detail: finish } : {}),
+        ...(usage ? { inputTokens: usage.input, outputTokens: usage.output } : {}),
+      });
       this.emit({
         kind: "turn.end",
-        msgId: `deepseek_${String(turn)}`,
+        msgId: this.messageByTurn.get(turn) ?? `deepseek_${String(turn)}`,
         finish,
         ...(usage ? { inputTokens: usage.input, outputTokens: usage.output } : {}),
       });
+      this.turnStartedAt.delete(turn);
     }
   }
 
@@ -610,11 +840,18 @@ export class DeepseekAdapter implements AgentAdapter {
 
   async send(text: string, attachments?: Attachment[]): Promise<void> {
     const { transport, sessionId } = this.require();
-    await transport.call("session.prompt", {
-      sessionId,
-      mode: "queue",
-      content: this.promptContent(text, attachments),
-    });
+    this.pendingUserText.push(text);
+    try {
+      await transport.call("session.prompt", {
+        sessionId,
+        mode: "queue",
+        content: this.promptContent(text, attachments),
+      });
+    } catch (error) {
+      const index = this.pendingUserText.lastIndexOf(text);
+      if (index >= 0) this.pendingUserText.splice(index, 1);
+      throw error;
+    }
   }
 
   async steer(text: string, attachments?: Attachment[]): Promise<boolean> {
@@ -678,8 +915,12 @@ export class DeepseekAdapter implements AgentAdapter {
   }
 
   async listModels(): Promise<AgentModelCatalog> {
-    const { transport, sessionId } = this.require();
-    const catalog = await transport.call<Record<string, unknown>>("session.models", { sessionId });
+    const transport = this.transport;
+    if (!transport) throw new AdapterError("DeepSeek Harness 尚未启动");
+    const sessionId = this.sessionId;
+    const catalog = sessionId
+      ? await transport.call<Record<string, unknown>>("session.models", { sessionId })
+      : await transport.call<Record<string, unknown>>("llm.models", {});
     const current = record(catalog["current"]);
     const currentId = `${String(current["provider"] ?? "")}/${String(current["model"] ?? "")}`;
     const models = (Array.isArray(catalog["groups"]) ? catalog["groups"] : []).flatMap((rawGroup) => {
@@ -702,8 +943,24 @@ export class DeepseekAdapter implements AgentAdapter {
         };
       }).filter((model) => !model.id.endsWith("/"));
     });
+    const presetCatalog = await transport.call<Record<string, unknown>>("agentPreset.list", {});
+    const presets = (Array.isArray(presetCatalog["presets"]) ? presetCatalog["presets"] : [])
+      .map((raw) => record(raw))
+      .flatMap((preset) => {
+        const id = typeof preset["id"] === "string" ? preset["id"] : "";
+        if (!id || typeof preset["broken"] === "string") return [];
+        return [{
+          id,
+          name: typeof preset["name"] === "string" ? preset["name"] : id,
+          ...(typeof preset["description"] === "string" ? { description: preset["description"] } : {}),
+          ...(preset["isDefault"] === true ? { isDefault: true } : {}),
+          ...(preset["trust"] === "user" ? { custom: true } : {}),
+        }];
+      });
     return {
       models,
+      presets,
+      ...(this.currentPreset ? { currentPreset: this.currentPreset } : {}),
       ...(currentId !== "/" ? { currentModel: currentId } : {}),
       ...(typeof current["reasoningEffort"] === "string" ? { currentEffort: current["reasoningEffort"] } : {}),
     };
@@ -748,10 +1005,72 @@ export class DeepseekAdapter implements AgentAdapter {
     await this.transport?.close?.();
     this.transport = null;
     this.sessionId = null;
+    this.currentPreset = null;
     this.ctx = null;
     this.approvals.clear();
     this.questions.clear();
     this.usageByTurn.clear();
+    this.turnStartedAt.clear();
+    this.stepStartedAt.clear();
+    this.compactionStartedAt.clear();
+    this.compactionDetails.clear();
+    this.messageByTurn.clear();
+    this.streamedText.clear();
+    this.pendingUserText.length = 0;
     this.bufferedEvents.length = 0;
+  }
+
+  static async searchLocalConversations(
+    query: string,
+    requestedLimit = 20,
+  ): Promise<import("@prospero/protocol").ResumableConversation[]> {
+    const transport = await startTransport({
+      cwd: os.homedir(),
+      approvalPolicy: () => "strict",
+      emit: () => {},
+    });
+    try {
+      const listed = await transport.call<{ items?: unknown[] }>("session.list", {});
+      const items = (Array.isArray(listed.items) ? listed.items : []).map(record);
+      const needle = query.trim();
+      let snippets = new Map<string, string>();
+      let allowed: Set<string> | null = null;
+      if (needle) {
+        const searched = await transport.call<{ items?: unknown[] }>("session.search", { query: needle });
+        const rows = (Array.isArray(searched.items) ? searched.items : []).map(record);
+        allowed = new Set(rows.map((row) => String(row["sessionId"] ?? "")).filter(Boolean));
+        snippets = new Map(rows.flatMap((row) => {
+          const id = typeof row["sessionId"] === "string" ? row["sessionId"] : "";
+          const snippet = typeof row["snippet"] === "string" ? row["snippet"] : "";
+          return id ? [[id, snippet] as const] : [];
+        }));
+      }
+      const limit = Math.max(1, Math.min(50, requestedLimit));
+      return items
+        .filter((item) => item["blank"] !== true && typeof item["sessionId"] === "string")
+        .filter((item) => allowed === null || allowed.has(String(item["sessionId"])))
+        .sort((a, b) => Number(b["updatedAt"] ?? 0) - Number(a["updatedAt"] ?? 0))
+        .slice(0, limit)
+        .map((item) => {
+          const id = String(item["sessionId"]);
+          const cwd = typeof item["cwd"] === "string" && item["cwd"] ? item["cwd"] : os.homedir();
+          const preset = typeof item["agentPreset"] === "string" ? item["agentPreset"] : undefined;
+          const projectionValues = record(record(item["projections"])["values"]);
+          const projectedTitle = typeof projectionValues["title"] === "string"
+            ? projectionValues["title"].trim()
+            : "";
+          const preview = snippets.get(id)?.trim();
+          return {
+            id,
+            agent: "deepseek" as const,
+            title: (projectedTitle || preview || (preset ? `DeepSeek ${preset}` : `DeepSeek · ${path.basename(cwd)}`)).slice(0, 500),
+            ...(preview ? { preview: preview.slice(0, 4000) } : {}),
+            cwd,
+            updatedAt: Math.max(0, Math.round(Number(item["updatedAt"] ?? Date.now()))),
+          };
+        });
+    } finally {
+      await transport.close?.();
+    }
   }
 }
