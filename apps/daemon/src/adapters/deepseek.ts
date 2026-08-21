@@ -650,7 +650,12 @@ export class DeepseekAdapter implements AgentAdapter {
   async respondQuestion(reqId: string, answers: AgentQuestionAnswer[], cancelled = false): Promise<void> {
     const { transport, sessionId } = this.require();
     const pending = this.questions.get(reqId);
-    if (!pending) return;
+    // 静默 return 会让手机上的"提交回答"什么都不发生:答案丢了,调用方却当成功。
+    // 问题不在待答表里只有两种可能 —— 已经答过,或 adapter 重启丢了上下文 ——
+    // 两种都必须让用户看见,否则只能干等 dsh 那边超时取消。
+    if (!pending) {
+      throw new AdapterError(`问题 ${reqId} 已不在待回答列表中(可能已回答或会话已重启)`);
+    }
     pending.answers = answers;
     pending.cancelled = cancelled;
     await transport.respond(pending.rpcId, cancelled
