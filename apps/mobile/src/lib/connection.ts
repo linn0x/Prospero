@@ -15,6 +15,7 @@ import {
   CAPABILITY_AGENT_ACCOUNTS,
   CAPABILITY_AGENT_API_PROFILES,
   CAPABILITY_AGENT_DEEPSEEK_HARNESS,
+  CAPABILITY_DEEPSEEK_TRAJECTORY,
   CAPABILITY_CHAT_ATTACHMENT_PREVIEWS,
   CAPABILITY_ORCHESTRATION_AUTOMATION,
   CAPABILITY_ORCHESTRATION_GRAPH,
@@ -232,6 +233,10 @@ export class HostConnection {
 
   get supportsDeepseekHarness(): boolean {
     return this.supportsCapability(CAPABILITY_AGENT_DEEPSEEK_HARNESS);
+  }
+
+  get supportsDeepseekTrajectory(): boolean {
+    return this.supportsCapability(CAPABILITY_DEEPSEEK_TRAJECTORY);
   }
 
   get supportsChatAttachmentPreviews(): boolean {
@@ -940,7 +945,7 @@ export class HostConnection {
 
   /** 搜索电脑上由 Claude Code / Codex 自己保存、可原生接回的对话。 */
   async localConversations(
-    agent: "claude" | "codex",
+    agent: "claude" | "codex" | "deepseek",
     query: string,
     limit = 20,
     accountId?: string,
@@ -1280,7 +1285,7 @@ export class HostConnection {
       mode?: "default" | "plan";
       /** 从第一轮起生效；省略时 daemon 保持最保守的 strict。 */
       approvalPolicy?: ApprovalPolicy;
-      resume?: { id: string; title?: string; fork?: true };
+      resume?: { id: string; title?: string };
       /** Goal 会同时创建编排 Run，并把新会话作为协调者。 */
       goal?: string;
       /** 账号环境与 cwd 独立；多个账号可指向同一个项目。 */
@@ -1288,6 +1293,8 @@ export class HostConnection {
       /** 从创建器实时目录中选择，保证第一轮就使用该模型。 */
       model?: string;
       effort?: string;
+      /** DeepSeek Harness 启动时固定的 Agent 预设。 */
+      agentPreset?: string;
     },
   ): DeliveryResult {
     return this.send(
@@ -1304,6 +1311,7 @@ export class HostConnection {
         ...(options?.accountId ? { accountId: options.accountId } : {}),
         ...(options?.model ? { model: options.model } : {}),
         ...(options?.effort ? { effort: options.effort } : {}),
+        ...(options?.agentPreset ? { agentPreset: options.agentPreset } : {}),
         cols,
         rows,
       },
@@ -1673,7 +1681,7 @@ export class HostConnection {
   }
 
   launchModels(
-    agent: "claude" | "codex",
+    agent: "claude" | "codex" | "deepseek",
     accountId?: string,
   ): Promise<Extract<S2CMessage, { type: "launch.models" }>> {
     if (!this.supportsSessionCreateModel) {
