@@ -214,7 +214,7 @@ describeIf("Codex 结构化会话", () => {
         () => firstEvents.some((event) => event.kind === "turn.end"),
         "持久化测试首轮 turn.end",
       );
-      first.flushPersistence();
+      await first.flushPersistence();
       await first.disposeAll();
 
       second = new SessionManager({ home });

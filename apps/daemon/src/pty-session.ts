@@ -183,13 +183,16 @@ export class PtySession extends EventEmitter<PtySessionEvents> {
   /**
    * 生成一致性快照:先 flush(锁定 seq),再等 headless 终端消化完已写入数据
    * (term.write 是异步解析,用空写作为屏障),然后 serialize。
+   * 只序列化可见视口(scrollback:0):快照只承载当前画面,回滚由 1MB ring 负责,
+   * 客户端连上后按 seq 追平。不带 scrollback 会整段序列化 2000 行 scrollback,
+   * 快照成本随会话累积输出线性增长 —— tmux 越用越卡的原因之一。
    */
   snapshot(): Promise<SnapshotResult> {
     this.flushNow();
     return new Promise((resolve) => {
       this.term.write("", () => {
         resolve({
-          ansi: this.serializer.serialize(),
+          ansi: this.serializer.serialize({ scrollback: 0 }),
           seq: this.ring.lastSeq,
           cols: this.cols,
           rows: this.rows,
