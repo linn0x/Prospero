@@ -6,7 +6,7 @@
 <title>Prospero Terminal</title>
 <link rel="stylesheet" href="/assets/xterm.css" />
 <style>
-  html, body { margin: 0; padding: 0; height: 100%; background: #09090b; overflow: hidden; }
+  html, body { margin: 0; padding: 0; height: 100%; background: #1a1b26; overflow: hidden; }
   #term { height: 100%; width: 100%; padding: 6px 2px 6px 8px; box-sizing: border-box; }
   .xterm .xterm-viewport { overflow-y: auto !important; -webkit-overflow-scrolling: touch; }
 </style>
@@ -26,28 +26,30 @@
     lineHeight: 1.12,
     letterSpacing: 0.1,
     minimumContrastRatio: 4.5,
+    // Tokyo Night —— 与 iTerm2 默认 profile 的深色配色逐值一致,
+    // 让 Mac 壳里的 tmux 终端和用户平时的 iTerm 看起来是同一个终端。
     theme: {
-      background: "#09090b",
-      foreground: "#d8d8df",
-      cursor: "#9bb3ff",
-      cursorAccent: "#09090b",
-      selectionBackground: "#3956a866",
-      black: "#202027",
-      brightBlack: "#6c6c78",
-      red: "#ef6a6a",
-      brightRed: "#ff8585",
-      green: "#69cc92",
-      brightGreen: "#85dfa8",
-      yellow: "#e6b35a",
-      brightYellow: "#f3c872",
-      blue: "#82a6ff",
-      brightBlue: "#a3bcff",
-      magenta: "#c38df3",
-      brightMagenta: "#d9adff",
-      cyan: "#62c6d7",
-      brightCyan: "#86dce8",
-      white: "#d8d8df",
-      brightWhite: "#f4f4f7",
+      background: "#1a1b26",
+      foreground: "#c0caf5",
+      cursor: "#c0caf5",
+      cursorAccent: "#1a1b26",
+      selectionBackground: "#283457",
+      black: "#15161e",
+      brightBlack: "#414868",
+      red: "#f7768e",
+      brightRed: "#f7768e",
+      green: "#9ece6a",
+      brightGreen: "#9ece6a",
+      yellow: "#e0af68",
+      brightYellow: "#e0af68",
+      blue: "#7aa2f7",
+      brightBlue: "#7aa2f7",
+      magenta: "#bb9af7",
+      brightMagenta: "#bb9af7",
+      cyan: "#7dcfff",
+      brightCyan: "#7dcfff",
+      white: "#a9b1d6",
+      brightWhite: "#c0caf5",
     },
     allowProposedApi: true,
     cursorBlink: true,
@@ -179,8 +181,14 @@
   // 拼成一段 JS 源码、再由引擎 eval —— 输出流上这是每块都付一次的冤枉钱。
   window.addEventListener("message", (e) => receive(e.data));
   document.addEventListener("message", (e) => receive(e.data));
-  // 保留旧入口:RN 侧首帧仍可能用 injectJavaScript 兜底
-  window.__rx = (jsonStr) => handle(JSON.parse(jsonStr));
+  // 保留旧入口:RN 侧首帧仍可能用 injectJavaScript 兜底。
+  // Mac 壳的 WKWebView 没有 postMessage 通路,只能走 evaluateJavaScript,
+  // 所以这里也接受数组 —— 让它能和 receive 一样一次过桥送完一批。
+  window.__rx = (jsonStr) => {
+    const m = JSON.parse(jsonStr);
+    if (Array.isArray(m)) { for (let i = 0; i < m.length; i++) handle(m[i]); }
+    else handle(m);
+  };
 
   new ResizeObserver(() => doFit()).observe(document.body);
   // 点终端取得焦点唤起键盘。
