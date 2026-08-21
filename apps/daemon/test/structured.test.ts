@@ -138,7 +138,7 @@ describeIf("opencode 结构化会话", () => {
         rows: 24,
         allowShell: false,
       });
-      first.flushPersistence();
+      await first.flushPersistence();
       await first.disposeAll();
 
       second = new SessionManager({ home });

@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
-import { chmodSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, readFileSync, writeFileSync } from "node:fs";
+import { chmod, rename, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -363,6 +364,8 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   private readonly ptySupervisorLauncher: (input: LaunchPtySupervisorInput) => Promise<RemotePtySession>;
   private persistTimer: NodeJS.Timeout | null = null;
   private shuttingDown = false;
+  /** 串行化 structured-sessions.json 的异步写,避免并发写同一 .tmp 互相覆盖。 */
+  private persistChain: Promise<void> = Promise.resolve();
 
   constructor(opts: SessionManagerOptions = {}) {
     super();
@@ -536,37 +539,47 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     if (!this.structuredFile || this.shuttingDown || this.persistTimer) return;
     this.persistTimer = setTimeout(() => {
       this.persistTimer = null;
-      this.persistStructuredNow();
+      void this.persistStructuredNow();
     }, 200);
     this.persistTimer.unref?.();
   }
 
-  private persistStructuredNow(): void {
-    if (!this.structuredFile) return;
+  private persistStructuredNow(): Promise<void> {
+    // 闭包内 readonly 字段不会被 TS 收窄,先落局部变量。
+    const file = this.structuredFile;
+    if (!file) return Promise.resolve();
     if (this.persistTimer) {
       clearTimeout(this.persistTimer);
       this.persistTimer = null;
     }
-    const tmp = `${this.structuredFile}.tmp`;
-    // Supervisor-owned session.json is authoritative for detached sessions.
-    // Keeping it out of this legacy daemon file prevents daemon shutdown from
-    // overwriting/restarting a live owner on the next boot.
-    const states = [...this.structuredSessions.values()]
-      .filter((s): s is StructuredSession => s instanceof StructuredSession)
-      .map((s) => s.persistentState());
-    try {
-      writeFileSync(tmp, JSON.stringify(states, null, 2), { mode: 0o600 });
-      renameSync(tmp, this.structuredFile);
-      chmodSync(this.structuredFile, 0o600);
-    } catch {
-      // 持久化失败不能打断正在运行的 agent；下一次事件会再次尝试。
-    }
+    const tmp = `${file}.tmp`;
+    // 串行化异步写盘,一次只落一个版本;不阻塞唯一事件循环。
+    // 这里正是“tmux 越用越卡”的主因:每次结构化事件后同步全量重写
+    // ~40MB 的 structured-sessions.json,写盘越久卡得越明显。
+    const run = this.persistChain.then(async () => {
+      try {
+        // Supervisor-owned session.json is authoritative for detached sessions.
+        // Keeping it out of this legacy daemon file prevents daemon shutdown
+        // from overwriting/restarting a live owner on the next boot.
+        const states = [...this.structuredSessions.values()]
+          .filter((s): s is StructuredSession => s instanceof StructuredSession)
+          .map((s) => s.persistentState());
+        // 去掉 null,2 美化:文件 0600 私有,体积 40MB→~13MB,写盘和 stringify 都更快。
+        await writeFile(tmp, JSON.stringify(states), { mode: 0o600 });
+        await rename(tmp, file);
+        await chmod(file, 0o600);
+      } catch {
+        // 持久化失败不能打断正在运行的 agent；下一次事件会再次尝试。
+      }
+    });
+    this.persistChain = run.catch(() => {});
+    return run;
   }
 
   /** 测试和优雅退出使用；确保 debounce 中的最后一批事件已经落盘。 */
-  flushPersistence(): void {
+  async flushPersistence(): Promise<void> {
     this.persistMeta();
-    this.persistStructuredNow();
+    await this.persistStructuredNow();
   }
 
   /**
@@ -631,7 +644,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       restored.push(session.info());
       this.emit("state", session.info());
     }
-    this.persistStructuredNow();
+    await this.persistStructuredNow();
     return restored;
   }
 
@@ -1226,7 +1239,8 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       if (options.preserveHistory) {
         // 终态 worker 不能只等 200ms debounce：daemon 若在此刻崩溃，旧状态会在
         // 下次启动时被当成可恢复会话并继续消费原 worktree 的队列。
-        this.persistStructuredNow();
+        // dispose 已在上面同步把会话标为 done,这里 await 写盘,确保落的是终态快照。
+        await this.persistStructuredNow();
       } else {
         this.scheduleStructuredPersist();
       }
@@ -1258,7 +1272,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
    */
   async disposeAll(): Promise<void> {
     // 先保存“仍然存在”的集合,随后 dispose 产生的 done 状态不能把它们从磁盘抹掉。
-    this.flushPersistence();
+    await this.flushPersistence();
     this.shuttingDown = true;
     // create() 返回时 tmux 子进程可能还在和 server 握手。极快地点击“重启”时若
     // 立刻杀 client,session 尚未登记就会丢失；最多等 750ms 让 supervisor 接棒。
