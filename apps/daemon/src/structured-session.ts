@@ -229,6 +229,8 @@ export interface StructuredSessionPersistentState {
   previewMsgId: string;
   totals: { costUsd: number; inputTokens: number; outputTokens: number };
   toolOutputs: [string, string][];
+  /** 登记时已截断到 MAX_TOOL_OUTPUT 的 callId;恢复时据此还原应答里的 truncated 标志。 */
+  truncatedToolOutputs?: string[];
   adapterState: AdapterResumeState;
   /** 兼容早期 version=1 状态；新写入总会带这个字段。 */
   messageQueue?: QueuedChatPersistent[];
@@ -267,8 +269,10 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
   private busySince: number | undefined;
   /** 累计用量:每轮 turn.end 汇总 */
   private totals = { costUsd: 0, inputTokens: 0, outputTokens: 0 };
-  /** callId → 完整工具输出,供 tool.output.get 按需拉取 */
+  /** callId → 工具输出(登记时已截断到 MAX_TOOL_OUTPUT),供 tool.output.get 按需拉取 */
   private readonly toolOutputs = new Map<string, string>();
+  /** 登记时被截断过的 callId;应答时据此还原 truncated 标志(截断后长度不可再反推)。 */
+  private readonly truncatedToolOutputs = new Set<string>();
   private adapterState: AdapterResumeState = {};
   private readonly messageQueue: QueuedChatPersistent[] = [];
   private drainingQueue = false;
@@ -325,6 +329,9 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
       this.messageQueue.push(...(restored.messageQueue ?? []).slice(0, MAX_MESSAGE_QUEUE));
       for (const [callId, output] of restored.toolOutputs.slice(-MAX_TOOL_ENTRIES)) {
         this.toolOutputs.set(callId, output);
+      }
+      for (const callId of restored.truncatedToolOutputs ?? []) {
+        if (this.toolOutputs.has(callId)) this.truncatedToolOutputs.add(callId);
       }
 
       // daemon 停止时原生审批 promise/RPC 已经被拒掉,不能在恢复后继续显示成待审批。
@@ -502,13 +509,11 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     };
   }
 
-  /** 完整工具输出(应答 tool.output.get) */
+  /** 工具输出(应答 tool.output.get);登记时已截断,truncated 标志单独记录 */
   toolOutput(callId: string): { output: string; truncated: boolean } | null {
-    const full = this.toolOutputs.get(callId);
-    if (full === undefined) return null;
-    return full.length > MAX_TOOL_OUTPUT
-      ? { output: full.slice(0, MAX_TOOL_OUTPUT), truncated: true }
-      : { output: full, truncated: false };
+    const output = this.toolOutputs.get(callId);
+    if (output === undefined) return null;
+    return { output, truncated: this.truncatedToolOutputs.has(callId) };
   }
 
   /** 已发图片按需分块读取；先以 user.message 中的索引授权，再落到会话专属目录。 */
@@ -529,13 +534,23 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     return { ...chunk, mimeType: attachment.mimeType };
   }
 
-  /** 适配器登记完整输出;摘要仍走事件,全文按需拉取 */
+  /** 适配器登记工具输出;摘要仍走事件,全文按需拉取 */
   recordToolOutput(callId: string, output: string): void {
     if (this.toolOutputs.size > MAX_TOOL_ENTRIES) {
       const oldest = this.toolOutputs.keys().next().value;
-      if (oldest !== undefined) this.toolOutputs.delete(oldest);
+      if (oldest !== undefined) {
+        this.toolOutputs.delete(oldest);
+        this.truncatedToolOutputs.delete(oldest);
+      }
     }
-    this.toolOutputs.set(callId, output);
+    // 登记时即截断到既有上限:全文不再占内存与持久化体积(UI 本来也只能
+    // 拿到这 200K)。截断事实单独记,保证 tool.output 应答的 truncated 标志不变。
+    if (output.length > MAX_TOOL_OUTPUT) {
+      this.truncatedToolOutputs.add(callId);
+      this.toolOutputs.set(callId, output.slice(0, MAX_TOOL_OUTPUT));
+    } else {
+      this.toolOutputs.set(callId, output);
+    }
     this.emit("persist");
   }
 
@@ -561,6 +576,9 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
         callId,
         output.slice(0, MAX_TOOL_OUTPUT),
       ]),
+      ...(this.truncatedToolOutputs.size > 0
+        ? { truncatedToolOutputs: [...this.truncatedToolOutputs] }
+        : {}),
       adapterState: { ...this.adapterState },
       messageQueue: this.messageQueue.map((item) => ({
         ...item,

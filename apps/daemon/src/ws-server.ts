@@ -76,6 +76,7 @@ import { DispatchService } from "./orchestration/dispatch.js";
 import { GoalInitializationService } from "./orchestration/goal-initialization.js";
 import { orchestrationControlApi } from "./orchestration/control-api.js";
 import { OrchestrationError, OrchestrationStore } from "./orchestration/store.js";
+import { WorktreeAssetService } from "./orchestration/worktree-assets.js";
 import {
   FsError,
   listDir,
@@ -837,6 +838,11 @@ export async function createDaemonServer(
       }
     }
   }, CATCHUP_MS);
+
+  // 周期性 worktree GC 的句柄,在 resumePersisted 之后才 arm,但必须在
+  // 更早的 listen 失败清理里也能清除,这里先声明。
+  let worktreeGCTimer: NodeJS.Timeout | null = null;
+  let worktreeGCInterval: NodeJS.Timeout | null = null;
 
   const pingTimer = setInterval(() => {
     for (const conn of conns) {
@@ -2517,6 +2523,8 @@ export async function createDaemonServer(
     // 失败，必须把这批私有凭证和 interval 一并清掉，不能留下幽灵 daemon。
     clearInterval(catchupTimer);
     clearInterval(pingTimer);
+    if (worktreeGCTimer) clearTimeout(worktreeGCTimer);
+    if (worktreeGCInterval) clearInterval(worktreeGCInterval);
     if (structuredRuntimeHeartbeat) clearInterval(structuredRuntimeHeartbeat);
     structuredRuntime?.release();
     relayClient.close();
@@ -2622,6 +2630,59 @@ export async function createDaemonServer(
   automationService.resumePersisted();
   await goalInitialization.retryPending();
 
+  // 周期性 worktree GC:复用 worktree-assets 的只读核验与保守清理,只回收
+  // "已确认可安全清理"的资产(所属 Run 非 active、无存活 writer、分支已并入、
+  // 目录下无存活进程)。只在主 daemon 生效:worker daemon(--dev)与主 daemon
+  // 共享同一份 orchestration.json,并发 GC 会 last-writer-wins 互相覆盖。
+  if (
+    !opts.devMode &&
+    process.env["VITEST"] !== "true" &&
+    process.env["PROSPERO_WORKTREE_GC_DISABLE"] !== "1"
+  ) {
+    const hoursOf = (name: string, fallback: number): number => {
+      const parsed = Number.parseInt(process.env[name] ?? "", 10);
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+    };
+    const intervalMs = hoursOf("PROSPERO_WORKTREE_GC_INTERVAL_HOURS", 6) * 60 * 60 * 1000;
+    const minAgeHours = Number.parseInt(process.env["PROSPERO_WORKTREE_GC_MIN_AGE_HOURS"] ?? "", 10);
+    const minAgeMs =
+      (Number.isFinite(minAgeHours) && minAgeHours >= 0 ? minAgeHours : 24) * 60 * 60 * 1000;
+    const maxCleanups = hoursOf("PROSPERO_WORKTREE_GC_MAX_PER_PASS", 20);
+    const maxInspected = hoursOf("PROSPERO_WORKTREE_GC_MAX_INSPECTED", 200);
+    const worktreeGC = new WorktreeAssetService(
+      orchestrationStore,
+      undefined,
+      dispatchService.sessionInspector(),
+    );
+    const runWorktreeGC = async () => {
+      try {
+        const result = await worktreeGC.gc({ minAgeMs, maxCleanups, maxInspected });
+        console.log(
+          `[prosperod] worktree GC: cleaned=${result.cleaned} leased=${result.leased} ` +
+            `deferredActiveRun=${result.deferredActiveRun} liveProcess=${result.liveProcess} ` +
+            `notCleanable=${result.notCleanable} alreadyGone=${result.alreadyGone} ` +
+            `recent=${result.recent} scanned=${result.scanned}` +
+            (result.errors.length > 0 ? ` errors=${result.errors.length}` : ""),
+        );
+      } catch (error) {
+        console.error(
+          `[prosperod] worktree GC 失败: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    };
+    // 首轮延后 120s:放 restore/reconcile/resumePersisted 之后,等租约收敛,
+    // 避免重启窗口刚恢复的会话被误判为"无 writer"。此后按 interval 周期执行。
+    worktreeGCTimer = setTimeout(() => {
+      worktreeGCTimer = null;
+      void runWorktreeGC();
+    }, 120_000);
+    worktreeGCTimer.unref?.();
+    worktreeGCInterval = setInterval(() => {
+      void runWorktreeGC();
+    }, intervalMs);
+    worktreeGCInterval.unref?.();
+  }
+
   return {
     port,
     devToken,
@@ -2641,6 +2702,8 @@ export async function createDaemonServer(
     close: async () => {
       clearInterval(catchupTimer);
       clearInterval(pingTimer);
+      if (worktreeGCTimer) clearTimeout(worktreeGCTimer);
+      if (worktreeGCInterval) clearInterval(worktreeGCInterval);
       if (structuredRuntimeHeartbeat) clearInterval(structuredRuntimeHeartbeat);
       structuredRuntime?.release();
       relayClient.close();

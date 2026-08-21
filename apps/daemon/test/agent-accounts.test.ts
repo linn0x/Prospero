@@ -294,7 +294,7 @@ describe("Code Agent 账号隔离", () => {
     expect(right.accountId).toBe(second.id);
     expect(contexts.map((context) => context.cwd)).toEqual([project, project]);
     expect(contexts[0]?.env["CODEX_HOME"]).not.toBe(contexts[1]?.env["CODEX_HOME"]);
-    sessions.flushPersistence();
+    await sessions.flushPersistence();
     await sessions.disposeAll();
 
     const restoredContexts: AdapterContext[] = [];

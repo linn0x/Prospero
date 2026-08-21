@@ -12,6 +12,16 @@ import { SessionManager } from "../src/session-manager.js";
 import { createDaemonServer, type DaemonServer } from "../src/ws-server.js";
 import { killSession, tmuxPath } from "../src/tmux.js";
 
+/** 轮询等谓词成立;写盘已异步化,不能在同一 tick 里同步读到结果。 */
+async function waitFor(pred: () => boolean, what: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (pred()) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`超时等待:${what}`);
+}
+
 const temps: string[] = [];
 
 function tempHome(): string {
@@ -71,7 +81,7 @@ async function seedRecoverableQueuedState(home: string): Promise<string> {
     rows: 24,
     allowShell: false,
   });
-  first.flushPersistence();
+  await first.flushPersistence();
   await first.disposeAll();
 
   const stateFile = path.join(home, "structured-sessions.json");
@@ -170,12 +180,20 @@ describe("结构化会话持久化", () => {
       allowShell: false,
     });
 
-    // 不 await：模拟 worker 自己正在承载的 control RPC 令 adapter.dispose 等待，
-    // daemon 仍必须先同步落下 terminal snapshot 才能防止随后崩溃时错误恢复。
+    // 不 await：模拟 worker 自己正在承载的 control RPC 令 adapter.dispose 等待。
+    // 写盘已异步化,但仍在 dispose 挂起时独立完成 —— 轮询等终态快照落盘。
     const killing = manager.kill(created.id, { preserveHistory: true });
     expect(releaseDispose).not.toBeNull();
-    expect(JSON.parse(readFileSync(path.join(home, "structured-sessions.json"), "utf8")))
-      .toEqual([expect.objectContaining({ id: created.id, terminal: true })]);
+    await waitFor(() => {
+      try {
+        const parsed = JSON.parse(
+          readFileSync(path.join(home, "structured-sessions.json"), "utf8"),
+        ) as Array<Record<string, unknown>>;
+        return parsed.length === 1 && parsed[0]?.id === created.id && parsed[0]?.terminal === true;
+      } catch {
+        return false;
+      }
+    }, "preserveHistory 终态快照落盘");
 
     releaseDispose?.();
     await killing;
@@ -329,7 +347,7 @@ describe("结构化会话持久化", () => {
     await first.chatSend(created.id, "hello");
     firstAdapter?.askPermission();
     await first.chatSend(created.id, "queued after restart");
-    first.flushPersistence();
+    await first.flushPersistence();
 
     const disk = JSON.parse(
       readFileSync(path.join(home, "structured-sessions.json"), "utf8"),
@@ -379,7 +397,7 @@ describe("结构化会话持久化", () => {
     ).toBe(true);
 
     await second.kill(created.id);
-    second.flushPersistence();
+    await second.flushPersistence();
     expect(
       JSON.parse(readFileSync(path.join(home, "structured-sessions.json"), "utf8")),
     ).toEqual([]);

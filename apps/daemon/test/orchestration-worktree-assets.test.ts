@@ -1,5 +1,14 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  mkdtempSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -11,6 +20,7 @@ import { OrchestrationStore } from "../src/orchestration/store.js";
 import {
   WorktreeAssetError,
   WorktreeAssetService,
+  hasLiveProcessUnder,
 } from "../src/orchestration/worktree-assets.js";
 
 const roots: string[] = [];
@@ -591,5 +601,347 @@ describe("资产持久化迁移与控制 API", () => {
       targetRef: "main",
       actorSessionId: null,
     }, signal)).resolves.toMatchObject({ state: "safe_to_clean" });
+  });
+});
+
+describe("gc 周期性自动回收", () => {
+  it("gc 回收已并入目标分支、所属 Run 已结束、目录无进程的 worktree", async () => {
+    const { repo, assets } = repository();
+    const store = new OrchestrationStore();
+    const service = new WorktreeAssetService(store);
+    const { asset, created } = await registeredAsset(store, repo, assets, "gc-safe");
+    store.deleteRun(asset.runId); // Run 已删,资产保留供巡检
+
+    const result = await service.gc({
+      minAgeMs: 0,
+      maxCleanups: 5,
+      maxInspected: 10,
+      targetRef: "main",
+      liveProcessGuard: async () => false,
+    });
+    expect(result).toMatchObject({ cleaned: 1, scanned: 1, notCleanable: 0 });
+    expect(store.getWorktreeAsset(asset.id)).toMatchObject({
+      state: "cleaned",
+      cleanup: { branchDeleted: false, warning: null },
+    });
+    expect(() => readFileSync(path.join(created.path, "tracked.txt"), "utf8")).toThrow();
+    // deleteBranch:false —— 恢复分支保留,后续仍可据此找回
+    expect(git(repo, ["branch", "--list", "prospero/gc-safe"])).toBe("prospero/gc-safe");
+  });
+
+  it("gc 回收补丁已等价并入目标分支(equivalent)的工作树", async () => {
+    const { repo, assets } = repository();
+    const store = new OrchestrationStore();
+    const service = new WorktreeAssetService(store);
+    const { asset, created } = await registeredAsset(store, repo, assets, "gc-equivalent");
+    writeFileSync(path.join(created.path, "tracked.txt"), "equivalent\n");
+    git(created.path, ["add", "tracked.txt"]);
+    git(created.path, ["commit", "-m", "worker equivalent patch"]);
+    const workerCommit = git(created.path, ["rev-parse", "HEAD"]);
+    writeFileSync(path.join(repo, "main-only.txt"), "main\n");
+    git(repo, ["add", "main-only.txt"]);
+    git(repo, ["commit", "-m", "main-only"]);
+    git(repo, ["cherry-pick", workerCommit]);
+    store.deleteRun(asset.runId);
+
+    const result = await service.gc({
+      minAgeMs: 0,
+      maxCleanups: 5,
+      maxInspected: 10,
+      targetRef: "main",
+      liveProcessGuard: async () => false,
+    });
+    expect(result).toMatchObject({ cleaned: 1, scanned: 1 });
+    expect(store.getWorktreeAsset(asset.id)).toMatchObject({ state: "cleaned" });
+  });
+
+  it("gc 跳过所属 Run 仍 active 的工作树(run-mode 共享工作树的硬守卫)", async () => {
+    const { repo, assets } = repository();
+    const store = new OrchestrationStore();
+    const service = new WorktreeAssetService(store);
+    const { asset } = await registeredAsset(store, repo, assets, "gc-active-run");
+    // Run 保持 active —— 多 worker 顺序共用一个 run worktree,空档没有 live session,不得误删
+    const result = await service.gc({
+      minAgeMs: 0,
+      maxCleanups: 5,
+      maxInspected: 10,
+      targetRef: "main",
+      liveProcessGuard: async () => false,
+    });
+    expect(result).toMatchObject({ deferredActiveRun: 1, cleaned: 0 });
+    expect(readFileSync(path.join(asset.path, "tracked.txt"), "utf8")).toBe("base\n");
+  });
+
+  it("gc 跳过仍有存活 SessionManager writer 的工作树", async () => {
+    const { repo, assets } = repository();
+    const store = new OrchestrationStore();
+    const run = store.createRun({ objective: "gc live settled worker" });
+    const task = store.createTask({ runId: run.id, title: "实现", spec: "" });
+    const created = await createEsaytree({
+      repo,
+      name: "gc-live-settled",
+      at: path.join(assets, "gc-live-settled"),
+      branch: "prospero/gc-live-settled",
+      cloneIgnored: false,
+    });
+    const asset = store.registerWorktreeAsset({
+      kind: "worker",
+      runId: run.id,
+      taskId: task.id,
+      repo,
+      path: created.path,
+      branch: created.branch,
+    });
+    const dispatch = store.createDispatch({
+      taskId: task.id,
+      sessionId: "gc-settled-but-live",
+      worktreePath: created.path,
+    });
+    store.linkWorktreeAssetDispatch(asset.id, dispatch.id);
+    store.setTaskStatus(task.id, "done", "已交付");
+    store.setDispatchState(dispatch.id, "succeeded", "已交付");
+    // Run 结束(非 active)但 dispatch 与 session 保留 —— 已完结 run 的会话仍可续写 cwd
+    store.abandonRun(run.id);
+    const sessions = {
+      infoOf() {
+        return {
+          id: "gc-settled-but-live",
+          agent: "codex" as const,
+          kind: "structured" as const,
+          title: "worker",
+          cwd: created.path,
+          // completed 是结构化 worker 的本轮结束,仍可接收 chat 并写入 cwd。
+          status: "completed" as const,
+          createdAt: 1,
+          cols: 80,
+          rows: 24,
+        };
+      },
+    };
+    const service = new WorktreeAssetService(store, undefined, sessions);
+    const result = await service.gc({
+      minAgeMs: 0,
+      maxCleanups: 5,
+      maxInspected: 10,
+      targetRef: "main",
+      liveProcessGuard: async () => false,
+    });
+    expect(result).toMatchObject({ leased: 1, cleaned: 0 });
+    expect(readFileSync(path.join(created.path, "tracked.txt"), "utf8")).toBe("base\n");
+  });
+
+  it("gc 跳过太新的资产(默认 24h 冷却)", async () => {
+    const { repo, assets } = repository();
+    const store = new OrchestrationStore();
+    const service = new WorktreeAssetService(store);
+    const { asset } = await registeredAsset(store, repo, assets, "gc-fresh");
+    store.deleteRun(asset.runId);
+    const result = await service.gc({
+      targetRef: "main",
+      liveProcessGuard: async () => false,
+    });
+    expect(result).toMatchObject({ recent: 1, scanned: 0, cleaned: 0 });
+    expect(readFileSync(path.join(asset.path, "tracked.txt"), "utf8")).toBe("base\n");
+  });
+
+  it("gc 对路径已丢失的资产只对账、不删除、不标 cleaned", async () => {
+    const { repo, assets } = repository();
+    const store = new OrchestrationStore();
+    const service = new WorktreeAssetService(store);
+    const { asset, created } = await registeredAsset(store, repo, assets, "gc-missing");
+    store.deleteRun(asset.runId);
+    rmSync(created.path, { recursive: true, force: true });
+    const result = await service.gc({
+      minAgeMs: 0,
+      maxCleanups: 5,
+      maxInspected: 10,
+      targetRef: "main",
+      liveProcessGuard: async () => false,
+    });
+    expect(result).toMatchObject({ alreadyGone: 1, scanned: 1, cleaned: 0 });
+    expect(store.getWorktreeAsset(asset.id).state).not.toBe("cleaned");
+  });
+
+  it("gc 跳过 dirty 与 unmerged 状态", async () => {
+    const { repo, assets } = repository();
+    const store = new OrchestrationStore();
+    const service = new WorktreeAssetService(store);
+    const dirty = await registeredAsset(store, repo, assets, "gc-dirty");
+    store.deleteRun(dirty.asset.runId);
+    writeFileSync(path.join(dirty.asset.path, "tracked.txt"), "dirty\n");
+
+    const unmerged = await registeredAsset(store, repo, assets, "gc-unmerged");
+    store.deleteRun(unmerged.asset.runId);
+    writeFileSync(path.join(unmerged.asset.path, "tracked.txt"), "unmerged\n");
+    git(unmerged.asset.path, ["add", "tracked.txt"]);
+    git(unmerged.asset.path, ["commit", "-m", "worker patch"]);
+
+    const result = await service.gc({
+      minAgeMs: 0,
+      maxCleanups: 5,
+      maxInspected: 10,
+      targetRef: "main",
+      liveProcessGuard: async () => false,
+    });
+    expect(result).toMatchObject({ notCleanable: 2, cleaned: 0 });
+    expect(git(unmerged.asset.path, ["rev-parse", "--abbrev-ref", "HEAD"])).toBe("prospero/gc-unmerged");
+  });
+
+  it("gc 受 maxCleanups 预算截断,只删最旧的一个", async () => {
+    const { repo, assets } = repository();
+    const store = new OrchestrationStore();
+    const service = new WorktreeAssetService(store);
+    const first = await registeredAsset(store, repo, assets, "gc-first");
+    store.deleteRun(first.asset.runId);
+    const second = await registeredAsset(store, repo, assets, "gc-second");
+    store.deleteRun(second.asset.runId);
+
+    const result = await service.gc({
+      minAgeMs: 0,
+      maxCleanups: 1,
+      maxInspected: 10,
+      targetRef: "main",
+      liveProcessGuard: async () => false,
+    });
+    expect(result).toMatchObject({ cleaned: 1, scanned: 1 });
+    expect(store.getWorktreeAsset(first.asset.id).state).toBe("cleaned");
+    expect(() => readFileSync(path.join(second.asset.path, "tracked.txt"), "utf8")).not.toThrow();
+  });
+
+  it("gc 受 maxInspected 预算截断,未检查的资产不动", async () => {
+    const { repo, assets } = repository();
+    const store = new OrchestrationStore();
+    const service = new WorktreeAssetService(store);
+    // 第一个资产是 dirty:消耗唯一一次 inspect 预算但不可清理
+    const dirty = await registeredAsset(store, repo, assets, "gc-inspect-dirty");
+    store.deleteRun(dirty.asset.runId);
+    writeFileSync(path.join(dirty.asset.path, "tracked.txt"), "dirty\n");
+    const safe = await registeredAsset(store, repo, assets, "gc-inspect-safe");
+    store.deleteRun(safe.asset.runId);
+
+    const result = await service.gc({
+      minAgeMs: 0,
+      maxCleanups: 5,
+      maxInspected: 1,
+      targetRef: "main",
+      liveProcessGuard: async () => false,
+    });
+    expect(result).toMatchObject({ scanned: 1, notCleanable: 1, cleaned: 0 });
+    expect(store.getWorktreeAsset(safe.asset.id).state).not.toBe("cleaned");
+    expect(readFileSync(path.join(safe.asset.path, "tracked.txt"), "utf8")).toBe("base\n");
+  });
+
+  it("gc 尊重存活进程守卫:命中即跳过并记 error", async () => {
+    const { repo, assets } = repository();
+    const store = new OrchestrationStore();
+    const service = new WorktreeAssetService(store);
+    const { asset, created } = await registeredAsset(store, repo, assets, "gc-guarded");
+    store.deleteRun(asset.runId);
+    const result = await service.gc({
+      minAgeMs: 0,
+      maxCleanups: 5,
+      maxInspected: 10,
+      targetRef: "main",
+      // 命中即代表"目录下有存活进程持有文件或 cwd",本用例只验证命中后的行为
+      liveProcessGuard: async () => true,
+    });
+    expect(result).toMatchObject({ liveProcess: 1, cleaned: 0 });
+    expect(result.errors).toEqual([
+      expect.objectContaining({
+        assetId: asset.id,
+        message: expect.stringContaining("存活进程"),
+      }),
+    ]);
+    expect(store.getWorktreeAsset(asset.id).state).not.toBe("cleaned");
+    expect(readFileSync(path.join(created.path, "tracked.txt"), "utf8")).toBe("base\n");
+  });
+
+  it("gc 删除失败时记录 error 且资产保持未清理", async () => {
+    const { repo, assets } = repository();
+    const store = new OrchestrationStore();
+    const failing = new WorktreeAssetService(store, {
+      async remove() {
+        throw new Error("git worktree remove 失败");
+      },
+    });
+    const { asset, created } = await registeredAsset(store, repo, assets, "gc-remove-fail");
+    store.deleteRun(asset.runId);
+    const result = await failing.gc({
+      minAgeMs: 0,
+      maxCleanups: 5,
+      maxInspected: 10,
+      targetRef: "main",
+      liveProcessGuard: async () => false,
+    });
+    expect(result).toMatchObject({ cleaned: 0 });
+    expect(result.errors).toEqual([
+      expect.objectContaining({ assetId: asset.id, message: expect.stringContaining("失败") }),
+    ]);
+    expect(store.getWorktreeAsset(asset.id).state).not.toBe("cleaned");
+    expect(readFileSync(path.join(created.path, "tracked.txt"), "utf8")).toBe("base\n");
+  });
+
+  it("gc 跳过自指 legacy 资产(unknown 状态),记 notCleanable 不删除", async () => {
+    const { repo } = repository();
+    const store = new OrchestrationStore();
+    const run = store.createRun({ objective: "gc self reference" });
+    const asset = store.registerWorktreeAsset({
+      kind: "worker",
+      runId: run.id,
+      taskId: "legacy-self",
+      repo,
+      path: repo,
+      branch: "main",
+    });
+    store.deleteRun(run.id);
+    const service = new WorktreeAssetService(store);
+    const result = await service.gc({
+      minAgeMs: 0,
+      maxCleanups: 5,
+      maxInspected: 10,
+      targetRef: "main",
+      liveProcessGuard: async () => false,
+    });
+    expect(result).toMatchObject({ notCleanable: 1, cleaned: 0 });
+    expect(store.getWorktreeAsset(asset.id).state).not.toBe("cleaned");
+  });
+
+  it("探针:git worktree remove(force:false)允许移除仅含 ignored 文件的工作树 —— gc 因此必须有存活进程守卫", async () => {
+    const { repo, assets } = repository();
+    const created = await createEsaytree({
+      repo,
+      name: "probe-ignored",
+      at: path.join(assets, "probe-ignored"),
+      branch: "prospero/probe-ignored",
+      cloneIgnored: false,
+    });
+    // 工作树里唯一的差异是被忽略的文件(模拟残留的 node_modules)
+    writeFileSync(path.join(created.path, "probe-only.txt"), "ignored\n");
+    writeFileSync(path.join(created.path, ".gitignore"), "probe-only.txt\n");
+    git(created.path, ["add", ".gitignore"]);
+    git(created.path, ["commit", "-m", "gitignore only"]);
+    // tracked 树与源仓一致,唯一差异是被忽略的文件
+    expect(git(created.path, ["status", "--porcelain"])).toBe("");
+    await removeWorktree(repo, created.path, { force: false });
+    expect(() => readFileSync(path.join(created.path, "probe-only.txt"), "utf8")).toThrow();
+  });
+
+  it("存活进程守卫 hasLiveProcessUnder 用 lsof 识别持有文件或 cwd 的进程", async () => {
+    const { repo, assets } = repository();
+    const created = await createEsaytree({
+      repo,
+      name: "probe-lsof",
+      at: path.join(assets, "probe-lsof"),
+      branch: "prospero/probe-lsof",
+      cloneIgnored: false,
+    });
+    const fd = openSync(path.join(created.path, "tracked.txt"), "r");
+    try {
+      expect(await hasLiveProcessUnder(created.path)).toBe(true);
+    } finally {
+      closeSync(fd);
+    }
+    // fd 关闭后没有进程再持有该目录下的文件或 cwd
+    expect(await hasLiveProcessUnder(created.path)).toBe(false);
   });
 });
