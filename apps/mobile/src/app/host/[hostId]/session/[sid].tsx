@@ -411,6 +411,16 @@ export default function SessionScreen() {
     conn.attach(sid);
   }, [conn, runtime.status, session, sid]);
 
+  // 主机列表页会把 serverError 显示成横幅,会话页原本没有任何消费方 —— 于是在
+  // 会话里发生的服务端失败被整个咽掉:点"提交回答"没反应、没提示,卡片也不动,
+  // 只能干等对面超时。凡是在这个屏幕上发起的请求,失败都必须看得见。
+  useEffect(() => {
+    if (!conn) return;
+    return conn.events.on("serverError", (m) => {
+      toast(`${m.code}: ${m.message}`);
+    });
+  }, [conn]);
+
   // Drafts are scoped to the exact host/session/subagent route. Do not autosave the previous
   // screen's empty initial state over a draft before this read completes.
   useEffect(() => {

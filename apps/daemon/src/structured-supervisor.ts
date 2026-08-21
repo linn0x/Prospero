@@ -583,12 +583,19 @@ async function handleLine(
     write(connection.socket, { id: request.id, ok: true, result });
   } catch (error) {
     const known = error instanceof SupervisorError;
+    // supervisor 以 detached + stdio:"ignore" 运行,console 输出无处可去:这条
+    // 响应是原始错误唯一的出口。丢掉它,daemon 日志里就只剩一句通用文案,
+    // 现场永久消失 —— 排查 respondQuestion 之类的失败时完全无从下手。
     write(connection.socket, {
       id: request.id,
       ok: false,
       error: {
         code: known ? error.code : "internal_error",
-        message: known ? error.message : "supervisor 请求失败",
+        message: known
+          ? error.message
+          : `supervisor 请求失败(${request.method}): ${
+              error instanceof Error ? error.message : String(error)
+            }`,
       },
     });
   }
