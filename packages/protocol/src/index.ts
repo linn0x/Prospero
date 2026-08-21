@@ -34,6 +34,8 @@ export {
   SubagentStatusSchema,
   SubagentInfoSchema,
   MAX_SUBAGENT_SUMMARY_CHARS,
+  MAX_SUBAGENTS_PER_SESSION,
+  clampSessionInfo,
   C2SChatQueueGuideSchema,
   C2SAgentModelsGetSchema,
   C2SAgentModelSetSchema,

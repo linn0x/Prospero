@@ -39,7 +39,7 @@ import type {
   SessionStatus,
   SubagentInfo,
 } from "@prospero/protocol";
-import { MAX_SUBAGENT_SUMMARY_CHARS } from "@prospero/protocol";
+import { MAX_SUBAGENT_SUMMARY_CHARS, MAX_SUBAGENTS_PER_SESSION } from "@prospero/protocol";
 import type { AgentAdapter } from "./adapters/types.js";
 
 /** 事件日志上限:超出后丢弃最旧的(快照会带 truncated 标记) */
@@ -489,7 +489,11 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
             },
           }
         : {}),
-      ...(this.subagents.size > 0 ? { subagents: [...this.subagents.values()] } : {}),
+      // 超过协议上限就整帧作废,客户端连一次被自己的解析器踢一次 —— 宁可少报几个
+      // 早期子 Agent,也不能让一个会话把整台主机的连接拖死。留最近的。
+      ...(this.subagents.size > 0
+        ? { subagents: [...this.subagents.values()].slice(-MAX_SUBAGENTS_PER_SESSION) }
+        : {}),
       ...(this.preview ? { preview: this.preview } : {}),
       ...(this.busySince !== undefined ? { busySince: this.busySince } : {}),
       ...(this.totals.outputTokens > 0 || this.totals.costUsd > 0
