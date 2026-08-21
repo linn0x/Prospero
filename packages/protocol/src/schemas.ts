@@ -165,6 +165,13 @@ export const SubagentStatusSchema = z.enum([
 /** Native Agent SDK summaries must be bounded before they enter a wire event. */
 export const MAX_SUBAGENT_SUMMARY_CHARS = 10_000;
 
+/**
+ * 单个会话最多同步多少个子 Agent。客户端用它校验入站帧,daemon 用它截断出站帧 ——
+ * 两边必须读同一个常量:曾经这里是各写各的字面量,于是一个 106 个子 Agent 的会话
+ * 让 hello.ok 整帧校验失败,手机每次连上都被自己的解析器踢掉,直连和中继一起挂。
+ */
+export const MAX_SUBAGENTS_PER_SESSION = 100;
+
 /** 主会话下的可查看子 Agent。id 是后端可定向投递的原生身份。 */
 export const SubagentInfoSchema = z.object({
   id: z.string().min(1).max(500),
@@ -214,7 +221,7 @@ export const SessionInfoSchema = z.object({
   /** 原生 Agent 控制（压缩、模型选择）；PTY 与尚未实现的适配器可省略。 */
   agentControls: AgentControlsSchema.optional(),
   /** 生命周期内发现的子 Agent；客户端在项目会话管理中作为子会话展示。 */
-  subagents: z.array(SubagentInfoSchema).max(100).optional(),
+  subagents: z.array(SubagentInfoSchema).max(MAX_SUBAGENTS_PER_SESSION).optional(),
   /** 会话累计用量(所有轮次之和) */
   totals: z
     .object({
@@ -1886,4 +1893,15 @@ export function parseS2C(v: unknown): S2CMessage {
     throw new ProtocolError(`bad S2C message: ${summarizeZodError(r.error)}`, "format");
   }
   return r.data;
+}
+
+/**
+ * 出站前把会话摘要收进协议上限内。客户端拿整帧做 schema 校验,一个越界的数组
+ * 就让 hello.ok 全帧作废、连上即被自己的解析器踢掉;而 SessionInfo 可能来自
+ * 旧 supervisor 运行时或落盘快照,只在构造处截断挡不住 —— 这里是最后一道。
+ */
+export function clampSessionInfo(info: SessionInfo): SessionInfo {
+  const subagents = info.subagents;
+  if (!subagents || subagents.length <= MAX_SUBAGENTS_PER_SESSION) return info;
+  return { ...info, subagents: subagents.slice(-MAX_SUBAGENTS_PER_SESSION) };
 }
