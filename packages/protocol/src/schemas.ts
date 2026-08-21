@@ -135,6 +135,14 @@ export const AgentModelSchema = z.object({
   isDefault: z.boolean().optional(),
 });
 
+export const AgentPresetSchema = z.object({
+  id: z.string().min(1).max(300),
+  name: z.string().min(1).max(300),
+  description: z.string().max(2000).optional(),
+  isDefault: z.boolean().optional(),
+  custom: z.boolean().optional(),
+});
+
 /** Agent 原生协作模式。当前 Codex/Claude 都提供 default 与 plan。 */
 export const AgentModeSchema = z.object({
   id: z.string().min(1).max(100),
@@ -300,6 +308,8 @@ export const C2SSessionCreateSchema = z.object({
   model: z.string().min(1).max(300).optional(),
   /** 所选模型的推理强度；不单独存在，避免落到未知默认模型上。 */
   effort: z.string().min(1).max(100).optional(),
+  /** DeepSeek Harness 会话启动时固定的 Agent 预设。 */
+  agentPreset: z.string().min(1).max(300).optional(),
   /** 接回 Agent 已经保存在本机的原生对话。 */
   resume: z
     .object({
@@ -318,7 +328,7 @@ export const C2SSessionCreateSchema = z.object({
 /** 可由 Prospero 接回的 Agent 原生本机对话。 */
 export const ResumableConversationSchema = z.object({
   id: z.string().min(1).max(500),
-  agent: z.enum(["claude", "codex"]),
+  agent: z.enum(["claude", "codex", "deepseek"]),
   title: z.string().min(1).max(500),
   preview: z.string().max(4000).optional(),
   cwd: z.string().min(1),
@@ -329,7 +339,7 @@ export const ResumableConversationSchema = z.object({
 export const C2SConversationSearchSchema = z.object({
   type: z.literal("conversation.search"),
   requestId: z.string().min(1).max(100),
-  agent: z.enum(["claude", "codex"]),
+  agent: z.enum(["claude", "codex", "deepseek"]),
   /** 搜索对应隔离环境中的原生会话历史。 */
   accountId: z.string().min(1).max(100).optional(),
   /** 空字符串表示列出最近对话。 */
@@ -481,7 +491,7 @@ export const C2SAgentModelsGetSchema = z.object({
 export const C2SLaunchModelsGetSchema = z.object({
   type: z.literal("launch.models.get"),
   requestId: z.string().min(1).max(100),
-  agent: z.enum(["claude", "codex"]),
+  agent: z.enum(["claude", "codex", "deepseek"]),
   accountId: z.string().min(1).max(100).optional(),
 });
 
@@ -1290,6 +1300,23 @@ export const AgentTurnEndSchema = z.object({
   agentId: z.string().min(1).max(500).optional(),
 });
 
+/** DeepSeek Harness 的可视化执行轨迹。相同 recordId 的后续事件会更新原记录。 */
+export const AgentTrajectoryRecordSchema = z.object({
+  kind: z.literal("trajectory.record"),
+  recordId: z.string().min(1).max(500),
+  recordKind: z.enum(["turn", "step", "request", "retry", "compaction"]),
+  phase: z.enum(["running", "completed", "failed", "info"]),
+  title: z.string().min(1).max(500),
+  detail: z.string().max(8_000).optional(),
+  turn: z.number().int().nonnegative().optional(),
+  step: z.number().int().nonnegative().optional(),
+  startedAt: z.number().int().nonnegative().optional(),
+  durationMs: z.number().int().nonnegative().optional(),
+  inputTokens: z.number().int().nonnegative().optional(),
+  outputTokens: z.number().int().nonnegative().optional(),
+  agentId: z.string().min(1).max(500).optional(),
+});
+
 export const AgentUserMessageSchema = z.object({
   kind: z.literal("user.message"),
   msgId: z.string(),
@@ -1317,6 +1344,7 @@ export const AgentEventBodySchema = z.discriminatedUnion("kind", [
   AgentQuestionResolvedSchema,
   AgentSubagentStartedSchema,
   AgentSubagentUpdatedSchema,
+  AgentTrajectoryRecordSchema,
   AgentTurnEndSchema,
   AgentErrorSchema,
 ]);
@@ -1388,8 +1416,10 @@ export const S2CAgentModelsSchema = z.object({
 export const S2CLaunchModelsSchema = z.object({
   type: z.literal("launch.models"),
   requestId: z.string().min(1).max(100),
-  agent: z.enum(["claude", "codex"]),
+  agent: z.enum(["claude", "codex", "deepseek"]),
   models: z.array(AgentModelSchema).max(100),
+  presets: z.array(AgentPresetSchema).max(100).optional(),
+  currentPreset: z.string().min(1).max(300).optional(),
   currentModel: z.string().min(1).max(300).optional(),
   currentEffort: z.string().min(1).max(100).optional(),
   error: z.string().max(2000).optional(),
@@ -1485,7 +1515,7 @@ export const S2CWorkspaceListingSchema = z.object({
 export const S2CConversationResultsSchema = z.object({
   type: z.literal("conversation.results"),
   requestId: z.string().min(1).max(100),
-  agent: z.enum(["claude", "codex"]),
+  agent: z.enum(["claude", "codex", "deepseek"]),
   conversations: z.array(ResumableConversationSchema).max(50),
   error: z.string().max(2000).optional(),
 });
@@ -1804,6 +1834,7 @@ export type FsEntry = z.infer<typeof FsEntrySchema>;
 export type WorkspaceListing = z.infer<typeof S2CWorkspaceListingSchema>;
 export type ConversationResults = z.infer<typeof S2CConversationResultsSchema>;
 export type LaunchModels = z.infer<typeof S2CLaunchModelsSchema>;
+export type AgentPreset = z.infer<typeof AgentPresetSchema>;
 export type AgentAccountsResult = z.infer<typeof S2CAgentAccountsResultSchema>;
 export type GitFile = z.infer<typeof GitFileSchema>;
 export type ChatRole = z.infer<typeof ChatRoleSchema>;
@@ -1818,6 +1849,7 @@ export type AgentQuestionRequest = z.infer<typeof AgentQuestionRequestSchema>;
 export type AgentQuestionResolved = z.infer<typeof AgentQuestionResolvedSchema>;
 export type AgentSubagentStarted = z.infer<typeof AgentSubagentStartedSchema>;
 export type AgentSubagentUpdated = z.infer<typeof AgentSubagentUpdatedSchema>;
+export type AgentTrajectoryRecord = z.infer<typeof AgentTrajectoryRecordSchema>;
 export type AgentTurnEnd = z.infer<typeof AgentTurnEndSchema>;
 export type S2CHelloOk = z.infer<typeof S2CHelloOkSchema>;
 export type S2CConnectionPong = z.infer<typeof S2CConnectionPongSchema>;
@@ -1879,9 +1911,12 @@ export function parseC2S(v: unknown): C2SMessage {
       if (r.data.kind === "pty") {
         throw new ProtocolError("session.create model requires the structured track", "format");
       }
-      if (r.data.agent !== "claude" && r.data.agent !== "codex") {
-        throw new ProtocolError("session.create model only supports Claude/Codex", "format");
+      if (r.data.agent !== "claude" && r.data.agent !== "codex" && r.data.agent !== "deepseek") {
+        throw new ProtocolError("session.create model is unavailable for this agent", "format");
       }
+    }
+    if (r.data.agentPreset !== undefined && r.data.agent !== "deepseek") {
+      throw new ProtocolError("session.create agentPreset only supports DeepSeek Harness", "format");
     }
   }
   return r.data;

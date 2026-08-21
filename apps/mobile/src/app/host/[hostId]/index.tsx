@@ -18,6 +18,7 @@ import type {
   AgentAccount,
   AgentKind,
   AgentModel,
+  AgentPreset,
   ApprovalPolicy,
   CodeAgentKind,
   OrchestrationSnapshot,
@@ -60,7 +61,8 @@ const AGENTS: AgentKind[] = [
 ];
 /** 有结构化适配器的 agent(会话会以对话形态呈现) */
 const STRUCTURED: AgentKind[] = ["claude", "codex", "opencode", "deepseek"];
-const RESUMABLE: AgentKind[] = ["claude", "codex"];
+const RESUMABLE: AgentKind[] = ["claude", "codex", "deepseek"];
+const PLAN_CAPABLE: AgentKind[] = ["claude", "codex"];
 const APPROVAL_POLICIES: readonly {
   value: ApprovalPolicy;
   label: string;
@@ -158,6 +160,8 @@ export default function HostScreen() {
   const [launchModelsError, setLaunchModelsError] = useState<string | null>(null);
   const [selectedLaunchModel, setSelectedLaunchModel] = useState<string | null>(null);
   const [selectedLaunchEffort, setSelectedLaunchEffort] = useState<string | null>(null);
+  const [launchPresets, setLaunchPresets] = useState<AgentPreset[]>([]);
+  const [selectedLaunchPreset, setSelectedLaunchPreset] = useState<string | null>(null);
   const [launchModelsReload, setLaunchModelsReload] = useState(0);
   const [showArchived, setShowArchived] = useState(false);
   const [archivedIds, setArchivedIds] = useState<Set<string>>(() => new Set());
@@ -169,7 +173,7 @@ export default function HostScreen() {
     Record<string, boolean>
   >({});
   const pendingCreateRef = useRef(false);
-  const pendingForkCreateRef = useRef<{ title: string; run: () => void } | null>(null);
+  const pendingResumeTitleRef = useRef<string | null>(null);
   const deepLinkCreateRef = useRef<string | null>(null);
   const insets = useSafeAreaInsets();
   const { width, height, verticalPanes } = useAdaptiveLayout();
@@ -196,6 +200,7 @@ export default function HostScreen() {
     runtime.status === "connected" &&
     conn !== null;
   const codeAgent = agent === "claude" || agent === "codex" ? agent : null;
+  const launchCatalogAgent = codeAgent ?? (agent === "deepseek" ? "deepseek" : null);
   const matchingAccounts = codeAgent
     ? agentAccounts.filter((account) => account.agent === codeAgent)
     : [];
@@ -247,7 +252,7 @@ export default function HostScreen() {
     if (
       !composing ||
       sessionKind !== "structured" ||
-      codeAgent === null ||
+      launchCatalogAgent === null ||
       !conn?.supportsSessionCreateModel ||
       runtime.status !== "connected"
     ) {
@@ -257,15 +262,25 @@ export default function HostScreen() {
         setLaunchModelsError(null);
         setSelectedLaunchModel(null);
         setSelectedLaunchEffort(null);
+        setLaunchPresets([]);
+        setSelectedLaunchPreset(null);
       }, 0);
       return () => clearTimeout(reset);
     }
     let cancelled = false;
+    // 切换 agent/账号后清空上一份模型目录，避免在读取新目录期间继续显示上一个
+    // agent 的模型列表。重置与取数一起放进这个 timer：effect 体内同步 setState 会
+    // 触发级联渲染(react-hooks/set-state-in-effect)，上面的早返回分支也是这么让开的。
     const timer = setTimeout(() => {
+      setLaunchModels([]);
+      setSelectedLaunchModel(null);
+      setSelectedLaunchEffort(null);
+      setLaunchPresets([]);
+      setSelectedLaunchPreset(null);
       setLaunchModelsLoading(true);
       setLaunchModelsError(null);
       void conn
-        .launchModels(codeAgent, selectedAccount?.id)
+        .launchModels(launchCatalogAgent, selectedAccount?.id)
         .then((response) => {
           if (cancelled) return;
           setLaunchModels(response.models);
@@ -280,12 +295,21 @@ export default function HostScreen() {
               selected?.supportedEfforts[0] ??
               null,
           );
+          setLaunchPresets(response.presets ?? []);
+          setSelectedLaunchPreset(
+            response.currentPreset ??
+              response.presets?.find((preset) => preset.isDefault)?.id ??
+              response.presets?.[0]?.id ??
+              null,
+          );
         })
         .catch((error: unknown) => {
           if (cancelled) return;
           setLaunchModels([]);
           setSelectedLaunchModel(null);
           setSelectedLaunchEffort(null);
+          setLaunchPresets([]);
+          setSelectedLaunchPreset(null);
           setLaunchModelsError(error instanceof Error ? error.message : String(error));
         })
         .finally(() => {
@@ -297,7 +321,7 @@ export default function HostScreen() {
       clearTimeout(timer);
     };
   }, [
-    codeAgent,
+    launchCatalogAgent,
     composing,
     conn,
     launchModelsReload,
@@ -308,7 +332,7 @@ export default function HostScreen() {
 
   // 空查询列最近会话；输入后做短 debounce，旧请求通过 effect cleanup 丢弃。
   useEffect(() => {
-    if (!canSearchResume || !conn || (agent !== "claude" && agent !== "codex")) {
+    if (!canSearchResume || !conn) {
       const reset = setTimeout(() => {
         setResumeLoading(false);
         setResumeError(null);
@@ -322,7 +346,7 @@ export default function HostScreen() {
       setResumeLoading(true);
       setResumeError(null);
       void conn
-        .localConversations(agent, resumeQuery, 20, selectedAccount?.id)
+        .localConversations(agent as ResumableConversation["agent"], resumeQuery, 20, selectedAccount?.id)
         .then((conversations) => {
           if (!cancelled) setResumeResults(conversations);
         })
@@ -392,7 +416,7 @@ export default function HostScreen() {
     const enter = (sid: string): void => {
       if (!pendingCreateRef.current || !hostId) return;
       pendingCreateRef.current = false;
-      pendingForkCreateRef.current = null;
+      pendingResumeTitleRef.current = null;
       setComposing(false);
       setSelectedResume(null);
       setLaunchIntent("conversation");
@@ -405,11 +429,11 @@ export default function HostScreen() {
     const offChat = conn.events.on("chatSnapshot", (m) => enter(m.sid));
     const offErr = conn.events.on("serverError", (m) => {
       pendingCreateRef.current = false;
-      if (m.reason === "conversation_active_writer" && pendingForkCreateRef.current) {
-        setResumeConflictTitle(pendingForkCreateRef.current.title);
+      if (m.reason === "conversation_active_writer" && pendingResumeTitleRef.current) {
+        setResumeConflictTitle(pendingResumeTitleRef.current);
         return;
       }
-      pendingForkCreateRef.current = null;
+      pendingResumeTitleRef.current = null;
       setBanner(`${m.code}: ${m.message}`);
     });
     return () => {
@@ -517,7 +541,7 @@ export default function HostScreen() {
     const accountOption = selectedAccount ? { accountId: selectedAccount.id } : {};
     const modelOption =
       sessionKind === "structured" &&
-      codeAgent !== null &&
+      launchCatalogAgent !== null &&
       selectedLaunchModelInfo !== undefined
         ? {
             model: selectedLaunchModelInfo.id,
@@ -527,28 +551,31 @@ export default function HostScreen() {
     const sessionOptions:
       | {
           mode?: "default" | "plan";
-          resume?: { id: string; title?: string; fork?: true };
+          resume?: { id: string; title?: string };
           goal?: string;
           accountId?: string;
           approvalPolicy?: ApprovalPolicy;
           model?: string;
           effort?: string;
+          agentPreset?: string;
         }
       | undefined =
       launchIntent === "goal"
           ? {
               ...accountOption,
               ...modelOption,
+              ...(agent === "deepseek" && selectedLaunchPreset ? { agentPreset: selectedLaunchPreset } : {}),
               approvalPolicy,
               goal: objective,
-            ...(RESUMABLE.includes(agent) ? { mode: "plan" as const } : {}),
+            ...(PLAN_CAPABLE.includes(agent) ? { mode: "plan" as const } : {}),
           }
         : sessionKind === "structured" && RESUMABLE.includes(agent)
             ? {
                 ...accountOption,
                 ...modelOption,
+                ...(agent === "deepseek" && selectedLaunchPreset ? { agentPreset: selectedLaunchPreset } : {}),
                 approvalPolicy,
-                mode: launchMode,
+                ...(PLAN_CAPABLE.includes(agent) ? { mode: launchMode } : {}),
               ...(selectedResume
                 ? { resume: { id: selectedResume.id, title: selectedResume.title } }
                 : {}),
@@ -557,6 +584,7 @@ export default function HostScreen() {
             ? {
                 ...accountOption,
                 ...modelOption,
+                ...(agent === "deepseek" && selectedLaunchPreset ? { agentPreset: selectedLaunchPreset } : {}),
                 approvalPolicy,
               }
             : selectedAccount
@@ -570,19 +598,9 @@ export default function HostScreen() {
     const sendCreate = (options: typeof sessionOptions): void => {
       conn.createSession(agent, projectPath, undefined, createKind, 80, 24, options);
     };
-    pendingForkCreateRef.current =
+    pendingResumeTitleRef.current =
       agent === "codex" && sessionOptions?.resume
-        ? {
-            title: sessionOptions.resume.title ?? "这条 Codex 对话",
-            run: () => {
-              pendingCreateRef.current = true;
-              setResumeConflictTitle(null);
-              sendCreate({
-                ...sessionOptions,
-                resume: { ...sessionOptions.resume!, fork: true },
-              });
-            },
-          }
+        ? sessionOptions.resume.title ?? "这条 Codex 对话"
         : null;
     sendCreate(sessionOptions);
   };
@@ -611,10 +629,12 @@ export default function HostScreen() {
     });
   }, [hostId]);
 
-  const hideSession = (session: SessionInfo, stopOnComputer: boolean): void => {
+  const deleteSession = (session: SessionInfo): void => {
     setDeleteTarget(null);
     setHiddenIds((current) => new Set(current).add(session.id));
-    if (stopOnComputer) conn?.kill(session.id);
+    // “删除”必须结束 Prospero 持有的原生 writer；仅隐藏请使用“归档”。
+    // 否则一个看不见的 Codex app-server 仍会让电脑端永久显示占用中。
+    conn?.kill(session.id);
     void setSessionHidden(hostId, session.id, true).catch((error: unknown) => {
       setHiddenIds((current) => {
         const next = new Set(current);
@@ -968,10 +988,12 @@ export default function HostScreen() {
               </Text>
             </>
           )}
-          {STRUCTURED.includes(agent) && agent !== "deepseek" && (
+          {STRUCTURED.includes(agent) && (
             <>
-              <Text style={[styles.formLabel, styles.kindLabel]}>界面</Text>
-              <View style={styles.kindSwitch} accessibilityRole="tablist">
+              {agent !== "deepseek" && (
+                <>
+                  <Text style={[styles.formLabel, styles.kindLabel]}>界面</Text>
+                  <View style={styles.kindSwitch} accessibilityRole="tablist">
                 <Pressable
                   style={[styles.kindOption, sessionKind === "structured" && styles.kindOptionActive]}
                   onPress={() => setSessionKind("structured")}
@@ -1019,13 +1041,15 @@ export default function HostScreen() {
                     终端
                   </Text>
                 </Pressable>
-              </View>
-              <Text style={styles.kindHelp}>
-                {sessionKind === "structured"
-                  ? "消息、工具调用和审批以卡片展示"
-                  : `启动 ${agent} TUI，可直接操作完整终端`}
-              </Text>
-              {sessionKind === "structured" && codeAgent && conn?.supportsSessionCreateModel && (
+                  </View>
+                  <Text style={styles.kindHelp}>
+                    {sessionKind === "structured"
+                      ? "消息、工具调用和审批以卡片展示"
+                      : `启动 ${agent} TUI，可直接操作完整终端`}
+                  </Text>
+                </>
+              )}
+              {sessionKind === "structured" && launchCatalogAgent && conn?.supportsSessionCreateModel && (
                 <>
                   <View style={[styles.accountLabelRow, styles.kindLabel]}>
                     <Text style={styles.formLabel}>模型</Text>
@@ -1107,12 +1131,41 @@ export default function HostScreen() {
                           </View>
                         </>
                       )}
+                      {agent === "deepseek" && launchPresets.length > 0 && (
+                        <>
+                          <Text style={[styles.formLabel, styles.modelEffortLabel]}>Agent 预设</Text>
+                          <View style={styles.chips} accessibilityRole="radiogroup">
+                            {launchPresets.map((preset) => {
+                              const active = selectedLaunchPreset === preset.id;
+                              return (
+                                <Pressable
+                                  key={preset.id}
+                                  style={[styles.chip, active && styles.chipActive]}
+                                  onPress={() => setSelectedLaunchPreset(preset.id)}
+                                  accessibilityRole="radio"
+                                  accessibilityState={{ checked: active }}
+                                  accessibilityLabel={`Agent 预设 ${preset.name}`}
+                                >
+                                  <Text style={[styles.chipText, active && styles.chipTextActive]} numberOfLines={1}>
+                                    {preset.name}{preset.custom ? " · 自定义" : ""}
+                                  </Text>
+                                </Pressable>
+                              );
+                            })}
+                          </View>
+                          {launchPresets.find((preset) => preset.id === selectedLaunchPreset)?.description && (
+                            <Text style={styles.kindHelp} numberOfLines={2}>
+                              {launchPresets.find((preset) => preset.id === selectedLaunchPreset)?.description}
+                            </Text>
+                          )}
+                        </>
+                      )}
                     </>
                   )}
                 </>
               )}
               {sessionKind === "structured" &&
-                codeAgent &&
+                launchCatalogAgent &&
                 conn &&
                 !conn.supportsSessionCreateModel && (
                   <>
@@ -1222,8 +1275,10 @@ export default function HostScreen() {
               )}
               {sessionKind === "structured" && launchIntent === "conversation" && RESUMABLE.includes(agent) && (
                 <>
-                  <Text style={[styles.formLabel, styles.kindLabel]}>启动模式</Text>
-                  <View style={styles.kindSwitch} accessibilityRole="tablist">
+                  {PLAN_CAPABLE.includes(agent) && (
+                    <>
+                      <Text style={[styles.formLabel, styles.kindLabel]}>启动模式</Text>
+                      <View style={styles.kindSwitch} accessibilityRole="tablist">
                     <Pressable
                       style={[styles.kindOption, launchMode === "default" && styles.kindOptionActive]}
                       onPress={() => setLaunchMode("default")}
@@ -1264,10 +1319,12 @@ export default function HostScreen() {
                         Plan
                       </Text>
                     </Pressable>
-                  </View>
-                  <Text style={styles.kindHelp}>
-                    {launchMode === "plan" ? "先调查、提问并形成计划" : "直接执行任务并允许工具操作"}
-                  </Text>
+                      </View>
+                      <Text style={styles.kindHelp}>
+                        {launchMode === "plan" ? "先调查、提问并形成计划" : "直接执行任务并允许工具操作"}
+                      </Text>
+                    </>
+                  )}
 
                   <Text style={[styles.formLabel, styles.kindLabel]}>接回本机对话</Text>
                   <View style={styles.resumeSearch}>
@@ -1652,18 +1709,12 @@ export default function HostScreen() {
         title="电脑正在使用这条对话"
         onClose={() => {
           setResumeConflictTitle(null);
-          pendingForkCreateRef.current = null;
+          pendingResumeTitleRef.current = null;
         }}
       >
         <Text style={styles.decisionNote}>
-          「{resumeConflictTitle ?? "Codex 对话"}」当前有活动写入者。Prospero 不会抢占电脑端；可以从现有历史创建一条独立副本。
+          「{resumeConflictTitle ?? "Codex 对话"}」当前由电脑端占用。Codex 暂不支持两个进程同时写入同一条对话，请先在电脑端关闭该任务后再接回。
         </Text>
-        <SheetAction
-          label="创建独立副本"
-          detail="保留当前上下文，在手机上继续新的 Codex 对话"
-          symbol="doc.on.doc"
-          onPress={() => pendingForkCreateRef.current?.run()}
-        />
       </Sheet>
       <Sheet
         visible={deleteTarget !== null}
@@ -1671,16 +1722,10 @@ export default function HostScreen() {
         onClose={() => setDeleteTarget(null)}
       >
         <Text style={styles.decisionNote}>
-          请选择删除范围。仅手机删除不会改变电脑上的会话和进程。
+          删除会结束电脑上的 Prospero 会话并释放 Agent 占用。只想从当前列表移走时，请使用归档。
         </Text>
         <SheetAction
-          label="仅在手机上删除"
-          detail="从这台手机的列表隐藏，电脑端继续保留"
-          symbol="archivebox"
-          onPress={() => deleteTarget && hideSession(deleteTarget, false)}
-        />
-        <SheetAction
-          label="电脑和手机同时删除"
+          label="结束并删除"
           detail={
             deleteTarget?.status === "done" || deleteTarget?.status === "died"
               ? "删除电脑端持久化记录，并从手机列表隐藏"
@@ -1688,7 +1733,7 @@ export default function HostScreen() {
           }
           symbol="trash"
           destructive
-          onPress={() => deleteTarget && hideSession(deleteTarget, true)}
+          onPress={() => deleteTarget && deleteSession(deleteTarget)}
         />
       </Sheet>
     </View>
@@ -2085,12 +2130,14 @@ const styles = StyleSheet.create({
   filterContent: { gap: space.sm, paddingHorizontal: space.lg, paddingVertical: space.md },
   filterChip: {
     paddingHorizontal: space.md,
-    paddingVertical: 7,
+    minHeight: 36,
+    alignItems: "center",
+    justifyContent: "center",
     borderRadius: 999,
     backgroundColor: color.surface,
   },
   filterChipActive: { backgroundColor: color.accentDim },
-  filterChipText: { ...font.sub, color: color.textDim },
+  filterChipText: { ...font.sub, color: color.textDim, lineHeight: 18, includeFontPadding: false },
   filterChipTextActive: { color: color.text, fontWeight: "600" },
   chips: { flexDirection: "row", flexWrap: "wrap", gap: space.sm },
   chipActive: { backgroundColor: color.accentDim },

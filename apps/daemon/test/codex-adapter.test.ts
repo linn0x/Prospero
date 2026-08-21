@@ -13,8 +13,16 @@ import { SessionManager } from "../src/session-manager.js";
 import type { AdapterContext } from "../src/adapters/types.js";
 
 function hasCodex(): boolean {
+  if (process.env["PROSPERO_REAL_CODEX_TESTS"] !== "1") return false;
   try {
-    execFileSync("codex", ["--version"], { stdio: "ignore", timeout: 15_000 });
+    if (process.platform === "win32") {
+      execFileSync(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", "codex --version"], {
+        stdio: "ignore",
+        timeout: 15_000,
+      });
+    } else {
+      execFileSync("codex", ["--version"], { stdio: "ignore", timeout: 15_000 });
+    }
     return true;
   } catch {
     return false;
@@ -109,6 +117,53 @@ describeIf("Codex 结构化会话", () => {
     expect(info.kind).toBe("structured");
     expect(info.agent).toBe("codex");
     expect(info.status).toBe("idle");
+  }, 120_000);
+
+  it("真实 writer 占用会拒绝接回，释放后同一 thread 可再次接回", async () => {
+    const firstStates: Array<Record<string, unknown>> = [];
+    const firstEvents: AgentEventBody[] = [];
+    const first = new CodexAdapter();
+    let second: CodexAdapter | null = null;
+    let idlePeer: CodexAdapter | null = null;
+    let resumed: CodexAdapter | null = null;
+    const context = (
+      persistState: (state: Record<string, unknown>) => void,
+      emit: (event: AgentEventBody) => void = () => {},
+    ): AdapterContext => ({
+      cwd,
+      approvalPolicy: () => "standard",
+      emit,
+      persistState,
+    });
+
+    try {
+      await first.start(context((state) => firstStates.push(state), (event) => firstEvents.push(event)));
+      const threadId = firstStates.at(-1)?.["threadId"];
+      expect(typeof threadId).toBe("string");
+      await first.send("Reply with exactly the word WRITER and nothing else.");
+
+      second = new CodexAdapter({ resumeState: { threadId } });
+      await expect(second.start(context(() => {}))).rejects.toThrow(/active writer/i);
+      await second.dispose();
+      second = null;
+
+      await waitFor(() => firstEvents.some((event) => event.kind === "turn.end"), "writer turn.end");
+      idlePeer = new CodexAdapter({ resumeState: { threadId } });
+      await expect(idlePeer.start(context(() => {}))).rejects.toThrow(/active writer/i);
+      await idlePeer.dispose();
+      idlePeer = null;
+
+      await first.dispose();
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      resumed = new CodexAdapter({ resumeState: { threadId } });
+      await expect(resumed.start(context(() => {}))).resolves.toBeUndefined();
+    } finally {
+      await second?.dispose();
+      await idlePeer?.dispose();
+      await resumed?.dispose();
+      await first.dispose();
+    }
   }, 120_000);
 
   it("v2 批准后在隔离临时 worktree 真正写入，而不是被 Codex declined", async () => {
@@ -207,38 +262,29 @@ describeIf("Codex 结构化会话", () => {
       expect(calls.map((call) => call.method)).toEqual(["thread/resume"]);
     });
 
-    it("用户确认后直接 thread/fork 创建独立副本", async () => {
-      const persisted: Array<Record<string, unknown>> = [];
-      const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
-      const adapter = new CodexAdapter({
-        resumeState: { threadId: "busy-thread", forkThread: true },
-      });
-      const internals = adapter as unknown as {
-        startAppServer(): Promise<void>;
-        request(method: string, params: Record<string, unknown>): Promise<unknown>;
-      };
-      internals.startAppServer = async () => {};
-      internals.request = async (method, params) => {
-        calls.push({ method, params });
-        if (method === "thread/fork") return { thread: { id: "forked-thread" } };
-        if (method === "thread/list") return { data: [] };
-        throw new Error(`unexpected method ${method}`);
-      };
-
-      await adapter.start({
-        cwd,
-        approvalPolicy: () => "standard",
-        emit: () => {},
-        persistState: (state) => persisted.push(state),
+    it("拒绝旧客户端请求 fork，且不会启动任何原生会话", async () => {
+      let adapterCreated = false;
+      const manager = new SessionManager({
+        adapterFactory: () => {
+          adapterCreated = true;
+          return new CodexAdapter();
+        },
       });
 
-      expect(calls[0]?.method).toBe("thread/fork");
-      expect(calls[0]?.params).toMatchObject({
-        threadId: "busy-thread",
+      await expect(manager.create({
+        agent: "codex",
+        kind: "structured",
         cwd,
-      deferGoalContinuation: true,
-    });
-      expect(persisted.at(-1)?.["threadId"]).toBe("forked-thread");
+        resume: { id: "busy-thread", fork: true },
+        cols: 80,
+        rows: 24,
+        allowShell: false,
+      })).rejects.toMatchObject({
+        code: "conflict",
+        reason: "conversation_active_writer",
+      });
+      expect(adapterCreated).toBe(false);
+      await manager.disposeAll();
     });
 
     it("SessionManager 将 active writer 映射为手机可识别的冲突", async () => {

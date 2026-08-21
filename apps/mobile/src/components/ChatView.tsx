@@ -58,6 +58,7 @@ import {
   type QuestionItem,
   type SubagentItem,
   type ToolItem,
+  type TrajectoryItem,
   type TurnDiffSummaryItem,
   type UserItem,
 } from "@/lib/chat-model";
@@ -88,6 +89,8 @@ interface Props {
   /** 省略显示主 Agent；有值时复用同一事件流展示该子 Agent 的独立对话。 */
   subagentId?: string;
   onOpenSubagent?: (subagentId: string) => void;
+  /** DeepSeek 可在普通对话与完整执行轨迹之间切换。 */
+  viewMode?: "chat" | "trajectory";
 }
 
 const PROJECT_IMAGE_CHUNK = 192 * 1024;
@@ -117,6 +120,7 @@ export const ChatView = memo(function ChatView({
   onInterrupt,
   subagentId,
   onOpenSubagent,
+  viewMode = "chat",
 }: Props) {
   const [items, setItems] = useState<ChatItem[]>([]);
   /** 带 id 防止路由切换瞬间把上一个子 Agent 的历史短暂画到新页面。 */
@@ -342,13 +346,21 @@ export const ChatView = memo(function ChatView({
   }, [onRetry]);
 
   const visible = useMemo(() => {
+    const source = viewMode === "trajectory"
+      ? scopedItems.filter((item) =>
+          item.type === "trajectory" ||
+          item.type === "tool" ||
+          item.type === "permission" ||
+          item.type === "question" ||
+          item.type === "error")
+      : scopedItems.filter((item) => item.type !== "trajectory");
     const q = search?.trim().toLowerCase() ?? "";
     if (q.length > 0) {
       // 搜索结果逐条展开，否则命中项可能藏在活动组里。
-      return scopedItems.filter((i) => itemText(i).toLowerCase().includes(q));
+      return source.filter((i) => itemText(i).toLowerCase().includes(q));
     }
-    return foldChatItems(scopedItems);
-  }, [scopedItems, search]);
+    return viewMode === "trajectory" ? source : foldChatItems(source);
+  }, [scopedItems, search, viewMode]);
 
   const jumpToBottom = useCallback(() => {
     atBottomRef.current = true;
@@ -383,6 +395,8 @@ export const ChatView = memo(function ChatView({
           return <SubagentCard item={item} onOpen={onOpenSubagent} />;
         case "error":
           return <ErrorCard item={item} onRetry={onRetry ? retry : undefined} />;
+        case "trajectory":
+          return <TrajectoryCard item={item} />;
         case "turn-diff-summary":
           return (
             <TurnDiffSummaryBar
@@ -581,6 +595,8 @@ function itemText(i: ChatItem): string {
       return `${i.subagent.name} ${i.subagent.role ?? ""} ${i.subagent.task ?? ""} ${i.subagent.preview ?? ""}`;
     case "error":
       return i.message;
+    case "trajectory":
+      return `${i.title} ${i.detail ?? ""}`;
     case "turn-diff-summary":
       return i.files.map((file) => file.path).join(" ");
   }
@@ -1364,6 +1380,64 @@ const SubagentCard = memo(function SubagentCard({
   );
 });
 
+function durationLabel(milliseconds: number): string {
+  if (milliseconds < 1_000) return `${String(milliseconds)} ms`;
+  return `${(milliseconds / 1_000).toFixed(milliseconds < 10_000 ? 1 : 0)} s`;
+}
+
+const TrajectoryCard = memo(function TrajectoryCard({ item }: { item: TrajectoryItem }) {
+  const [expanded, setExpanded] = useState(false);
+  const tint = item.phase === "failed"
+    ? color.danger
+    : item.phase === "running"
+      ? color.accent
+      : item.phase === "info"
+        ? color.warn
+        : color.success;
+  const icon = item.phase === "failed"
+    ? "exclamationmark.triangle.fill"
+    : item.phase === "running"
+      ? "arrow.clockwise"
+      : item.phase === "info"
+        ? "ellipsis.circle"
+        : "checkmark.circle.fill";
+  const metrics = [
+    item.durationMs !== undefined ? durationLabel(item.durationMs) : "",
+    item.inputTokens !== undefined ? `${String(item.inputTokens)} in` : "",
+    item.outputTokens !== undefined ? `${String(item.outputTokens)} out` : "",
+  ].filter(Boolean).join(" · ");
+
+  return (
+    <Pressable
+      style={({ pressed }) => [styles.trajectoryCard, pressed && styles.inlinePressed]}
+      onPress={() => item.detail && setExpanded((value) => !value)}
+      accessibilityRole={item.detail ? "button" : undefined}
+      accessibilityState={item.detail ? { expanded } : undefined}
+    >
+      <View style={[styles.trajectoryRail, { backgroundColor: tint }]} />
+      <View style={styles.trajectoryIcon}>
+        <Icon name={icon} size={15} color={tint} />
+      </View>
+      <View style={styles.trajectoryCopy}>
+        <View style={styles.trajectoryTitleRow}>
+          <Text style={styles.trajectoryTitle}>{item.title}</Text>
+          {metrics.length > 0 && <Text style={styles.trajectoryMetrics}>{metrics}</Text>}
+        </View>
+        {item.detail && (
+          <Text
+            style={styles.trajectoryDetail}
+            numberOfLines={expanded ? undefined : 2}
+            selectable={expanded}
+          >
+            {item.detail}
+          </Text>
+        )}
+      </View>
+      {item.detail && <Icon name={expanded ? "chevron.down" : "chevron.right"} size={11} color={color.textFaint} />}
+    </Pressable>
+  );
+});
+
 const ErrorCard = memo(function ErrorCard({
   item,
   onRetry,
@@ -1911,6 +1985,24 @@ const styles = StyleSheet.create({
   subagentState: { color: color.textFaint, fontSize: 10 },
   subagentStateActive: { color: color.accent },
   subagentPreview: { color: color.textDim, fontSize: 11, lineHeight: 16 },
+
+  trajectoryCard: {
+    minHeight: 50,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 9,
+    borderRadius: radius.md,
+    backgroundColor: color.surface,
+    paddingRight: 11,
+    overflow: "hidden",
+  },
+  trajectoryRail: { alignSelf: "stretch", width: 3 },
+  trajectoryIcon: { width: 22, alignItems: "center", justifyContent: "center" },
+  trajectoryCopy: { flex: 1, gap: 4, paddingVertical: 9 },
+  trajectoryTitleRow: { flexDirection: "row", alignItems: "center", gap: 8 },
+  trajectoryTitle: { flex: 1, color: color.text, fontSize: 12.5, fontWeight: "700" },
+  trajectoryMetrics: { color: color.textFaint, fontSize: 9.5, fontFamily: MONOSPACE_FONT },
+  trajectoryDetail: { color: color.textDim, fontSize: 11, lineHeight: 16 },
 
   errorCard: { backgroundColor: color.dangerBg, borderRadius: radius.md, padding: 11, gap: 7 },
   errorText: { color: "#F2AAAA", fontSize: 13, lineHeight: 19 },
