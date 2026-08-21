@@ -418,8 +418,10 @@ struct LocalSessionWorkspace: View {
   let kill: () -> Void
 
   @State private var timeline = ChatTimeline()
-  @State private var terminalFrame: TerminalRenderFrame?
-  @State private var lastTerminalSeq: Int?
+  /// 终端帧走旁路,不做 @State:见 TerminalFrameStream 的说明。
+  @State private var terminalStream = TerminalFrameStream()
+  /// 仅用于"首帧到达后把占位换成终端",一次性翻转,不随每帧变化。
+  @State private var terminalReady = false
   @State private var daemonPID: Int32?
   @State private var loadError: String?
   @State private var actionError: String?
@@ -592,12 +594,13 @@ struct LocalSessionWorkspace: View {
 
   private var terminalWorkspace: some View {
     ZStack {
-      Color(red: 0.035, green: 0.035, blue: 0.043)
-      if let terminalFrame {
+      // #1a1b26 —— 与 term.html 的 xterm 主题同色,窗口留白不会在终端周围露出一圈异色。
+      Color(red: 26 / 255, green: 27 / 255, blue: 38 / 255)
+      if terminalReady {
         MacTerminalSurface(
           port: terminalPort,
           sessionID: session.id,
-          frame: terminalFrame,
+          stream: terminalStream,
           input: { dataB64 in
             await daemon.sendLocalTerminalInput(id: session.id, dataB64: dataB64)
           },
@@ -608,7 +611,7 @@ struct LocalSessionWorkspace: View {
             await daemon.resizeLocalTerminal(id: session.id, cols: cols, rows: rows)
           },
           resync: {
-            lastTerminalSeq = nil
+            terminalStream.resync()
           }
         )
         .id(terminalPort)
@@ -634,20 +637,24 @@ struct LocalSessionWorkspace: View {
       do {
         if session.kind == "structured" {
           try await refreshStructuredTimeline()
-        } else if let frame = try await daemon.loadLocalTerminalFrame(id: session.id, afterSeq: lastTerminalSeq) {
+        } else if let frame = try await daemon.loadLocalTerminalFrame(
+          id: session.id, afterSeq: terminalStream.lastSeq
+        ) {
           receivedTerminalFrame = true
           switch frame {
           case .terminalSnapshot(let seq, let ansi, let cols, let rows):
-            lastTerminalSeq = seq
-            terminalFrame = .snapshot(seq: seq, ansi: ansi, cols: cols, rows: rows)
+            terminalStream.lastSeq = seq
+            terminalStream.push(.snapshot(seq: seq, ansi: ansi, cols: cols, rows: rows))
           case .terminalDelta(let baseSeq, let seq, let dataB64):
-            guard lastTerminalSeq == baseSeq else {
-              lastTerminalSeq = nil
+            guard terminalStream.lastSeq == baseSeq else {
+              terminalStream.resync()
               throw LocalSessionControlFailure("终端增量游标不连续，正在重新同步")
             }
-            lastTerminalSeq = seq
-            terminalFrame = .output(baseSeq: baseSeq, seq: seq, dataB64: dataB64)
+            terminalStream.lastSeq = seq
+            terminalStream.push(.output(baseSeq: baseSeq, seq: seq, dataB64: dataB64))
           }
+          // 只有首帧会改状态;之后每帧都只是引用类型内部的流动,不重建视图。
+          if !terminalReady { terminalReady = true }
         }
         loadError = nil
         failedAttempts = 0
@@ -1023,12 +1030,53 @@ enum TerminalRenderFrame: Equatable {
   }
 }
 
+/// 终端帧的旁路通道:从长轮询直接送到 WebView,不经过 SwiftUI 状态。
+///
+/// 之前 terminalFrame / lastTerminalSeq 都是 LocalSessionWorkspace 上的 @State。
+/// tmux 里没有本地回显 —— 每敲一个字符都要绕一圈回来才显示,于是每个字符都
+/// 触发一次整个工作区视图体(侧栏、头部、输入框、终端)的重新求值。打字越快
+/// 帧越密,重建越频繁,表现就是"输入很多字符时卡卡的"。
+///
+/// 引用类型在这里是关键:视图只持有一个不变的引用,帧的流动不再是状态变化。
+@MainActor
+final class TerminalFrameStream {
+  /// 长轮询游标。属于循环自身的进度,不是 UI 状态。
+  var lastSeq: Int?
+
+  private weak var sink: TerminalFrameSink?
+  /// WebView 要等首帧到达后才创建,在此之前的帧先存下来,不能丢。
+  private var buffered: [TerminalRenderFrame] = []
+
+  func attach(_ sink: TerminalFrameSink) {
+    self.sink = sink
+    let queued = buffered
+    buffered.removeAll()
+    for frame in queued { sink.push(frame) }
+  }
+
+  func push(_ frame: TerminalRenderFrame) {
+    if let sink { sink.push(frame) } else { buffered.append(frame) }
+  }
+
+  /// 游标不连续时重新拉快照;缓冲里的旧帧已被新快照取代。
+  func resync() {
+    lastSeq = nil
+    buffered.removeAll()
+  }
+}
+
+/// TerminalFrameStream 的下游。由 MacTerminalSurface.Coordinator 实现。
+@MainActor
+protocol TerminalFrameSink: AnyObject {
+  func push(_ frame: TerminalRenderFrame)
+}
+
 /// 复用手机端已经验证过的 xterm 页面。画面和输入都留在 Mac App 内，
 /// daemon 只提供静态页面；会话数据仍走带本机 control token 的接口。
 private struct MacTerminalSurface: NSViewRepresentable {
   let port: Int
   let sessionID: String
-  let frame: TerminalRenderFrame
+  let stream: TerminalFrameStream
   let input: @MainActor (String) async -> String?
   let inputError: @MainActor (String) -> Void
   let resize: @MainActor (Int, Int) async -> String?
@@ -1058,7 +1106,8 @@ private struct MacTerminalSurface: NSViewRepresentable {
     if let url = URL(string: "http://127.0.0.1:\(port)/term.html") {
       webView.load(URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData))
     }
-    context.coordinator.push(frame)
+    // 帧从此直接进 Coordinator,不再经过 SwiftUI 的 updateNSView。
+    stream.attach(context.coordinator)
     return webView
   }
 
@@ -1067,7 +1116,6 @@ private struct MacTerminalSurface: NSViewRepresentable {
     context.coordinator.inputError = inputError
     context.coordinator.resize = resize
     context.coordinator.resync = resync
-    context.coordinator.push(frame)
   }
 
   static func dismantleNSView(_ webView: WKWebView, coordinator: Coordinator) {
@@ -1077,7 +1125,7 @@ private struct MacTerminalSurface: NSViewRepresentable {
   }
 
   @MainActor
-  final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
+  final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate, TerminalFrameSink {
     weak var webView: WKWebView?
     var input: @MainActor (String) async -> String?
     var inputError: @MainActor (String) -> Void
@@ -1201,21 +1249,38 @@ private struct MacTerminalSurface: NSViewRepresentable {
 
     private func drainFrames() {
       guard ready, !rendering, let webView, !pendingFrames.isEmpty else { return }
-      let frame = pendingFrames.removeFirst()
-      let message: [String: Any]
-      switch frame {
-      case .snapshot(_, let ansi, let cols, let rows):
-        message = ["kind": "snapshot", "ansi": ansi, "cols": cols, "rows": rows]
-      case .output(let baseSeq, _, let dataB64):
-        guard renderedSeq == baseSeq else {
-          pendingFrames.removeAll()
-          resync()
-          return
+      // 一次过桥送完所有已排队的帧。evaluateJavaScript 要把数据序列化两遍、
+      // 拼成 JS 源码再交给引擎 eval,每帧都付一次这笔开销;而页面侧的 handle
+      // 本来就是按批调用的。输出洪峰(或快速打字的逐字回显)下差别最明显。
+      var messages: [[String: Any]] = []
+      var cursor = renderedSeq
+      var renderedTo: Int?
+      drain: while let frame = pendingFrames.first {
+        switch frame {
+        case .snapshot(let seq, let ansi, let cols, let rows):
+          messages.append(["kind": "snapshot", "ansi": ansi, "cols": cols, "rows": rows])
+          cursor = seq
+          renderedTo = seq
+        case .output(let baseSeq, let seq, let dataB64):
+          guard cursor == baseSeq else {
+            // 第一帧就断链:整段作废,重新拉快照。若前面已攒到有效帧,
+            // 先把它们送出去,断链的那帧留到下一轮按同样规则处理。
+            if messages.isEmpty {
+              pendingFrames.removeAll()
+              resync()
+              return
+            }
+            break drain
+          }
+          messages.append(["kind": "output", "dataB64": dataB64])
+          cursor = seq
+          renderedTo = seq
         }
-        message = ["kind": "output", "dataB64": dataB64]
+        pendingFrames.removeFirst()
       }
+      guard let renderedTo, !messages.isEmpty else { return }
       guard
-        let data = try? JSONSerialization.data(withJSONObject: message),
+        let data = try? JSONSerialization.data(withJSONObject: messages),
         let json = String(data: data, encoding: .utf8),
         let quotedData = try? JSONEncoder().encode(json),
         let quoted = String(data: quotedData, encoding: .utf8)
@@ -1226,7 +1291,7 @@ private struct MacTerminalSurface: NSViewRepresentable {
           guard let self else { return }
           self.rendering = false
           if error == nil {
-            self.renderedSeq = frame.seq
+            self.renderedSeq = renderedTo
           } else {
             self.pendingFrames.removeAll()
             self.resync()
