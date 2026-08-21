@@ -229,6 +229,20 @@ describe("DeepseekAdapter", () => {
     });
   });
 
+  it("回答一个不在待答表里的问题时报错,而不是把答案悄悄丢掉", async () => {
+    const transport = new FakeTransport();
+    const events: AgentEventBody[] = [];
+    const adapter = new DeepseekAdapter({ transport });
+    await adapter.start(context(events, []));
+
+    // 手机上点了"提交回答",但这个 reqId 已经不在待答表里(已答过/会话重启)。
+    // 静默 return 会让 UI 毫无反应,用户只能干等对面超时取消。
+    await expect(adapter.respondQuestion("unknown-question", [
+      { questionId: "choice", values: ["修复"] },
+    ])).rejects.toThrow("unknown-question");
+    expect(transport.responses).toHaveLength(0);
+  });
+
   it("standard 策略只放行只读工具,写操作仍然要问", async () => {
     const transport = new FakeTransport();
     const events: AgentEventBody[] = [];
