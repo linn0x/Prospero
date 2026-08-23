@@ -78,6 +78,7 @@ Windows 11 是受支持的 daemon 平台，不只是可以打开仓库或连接�
 | 结构化聊天 | ✅ Claude Code、Codex、DeepSeek Harness、OpenCode、Grok 可用；其余 Agent 使用完整 PTY/TUI |
 | DAG / Goal / Gate / worker 编排 | ✅ 支持手工与自动编排；使用 worktree 时需安装 Git for Windows |
 | daemon 重启时保活 Agent | ✅ PTY 与 Claude Code / Codex / DeepSeek Harness / OpenCode / Grok structured 会话使用每会话 Windows Session Host；daemon 只重连已验证的 owner，不重复启动 agent |
+| Windows 桌面端 | ✅ 原生 WPF 托盘与 Dashboard，支持浅色、深色和跟随系统；可管理 daemon、会话、账号、编排、配对设备、日志和运行设置 |
 | 原生分发与 CI | ✅ x64、arm64 都有预编译 N-API 路径；PR 验证原生 ABI/加载拒绝 unsigned artifact，`v*` release 再签名、校验并在两种架构加载 signed artifact |
 
 在 Windows 上，Session Host 而非 daemon 持有 ConPTY、structured adapter、Job Object 和 append-only journal。正常退出或强制结束
@@ -92,7 +93,8 @@ journal/终态历史，但不会自动重放 native 命令或宣称 in-flight tu
 [Windows N-API native boundary](docs/windows-native-boundary.md)。macOS/Linux 仍分别使用 detached structured supervisor 与可选
 `tmux` PTY 托管。
 
-Windows 当前没有独立托盘应用，请在 PowerShell 或 cmd 中运行 `prosperod`。命令、配置目录和手机客户端与 macOS 版本一致。
+Windows 原生 WPF 桌面端位于 `apps/windows-shell`，提供与 macOS 壳对应的托盘、Dashboard 和本机管理能力，支持浅色、深色及跟随 Windows 主题，并可在
+设置或托盘菜单中开关“登录 Windows 时自动启动”。它与 PowerShell/cmd 使用同一份 daemon、配置目录和手机客户端。
 
 ## How to use
 
@@ -109,6 +111,15 @@ npm ci
 npm run build -w @prospero/daemon
 node apps/daemon/dist/cli.js start --name my-computer
 ```
+
+Windows 11 也可以构建并运行桌面端，由桌面端管理 daemon：
+
+```powershell
+npm run build:windows-shell
+apps/windows-shell/bin/Release/ProsperoShell.exe
+```
+
+关闭主窗口会隐藏到系统托盘；从托盘菜单选择“退出”才会退出。Windows 开机自启动属于当前用户设置，不需要管理员权限。
 
 使用 DeepSeek Harness 前，在运行 daemon 的同一 Node.js 环境安装官方 CLI。Prospero 会启动仅监听
 `127.0.0.1` 随机端口的 `dsh web` host，并通过官方 RPC/SSE 接入多轮会话、工具审批、问题和模型目录：
