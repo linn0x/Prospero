@@ -3,83 +3,6 @@ import SwiftUI
 import WebKit
 
 /// 项目是 Mac 工作台的第一层；会话只在其工作目录所属的项目下出现。
-struct ProjectRail: View {
-  let projects: [LocalProjectSummary]
-  @Binding var selectedProjectPath: String?
-  let addProject: () -> Void
-  let newSession: (LocalProjectSummary) -> Void
-  let removeProject: (LocalProjectSummary) -> Void
-
-  var body: some View {
-    VStack(spacing: 0) {
-      HStack(spacing: 8) {
-        VStack(alignment: .leading, spacing: 2) {
-          Text("项目")
-            .font(.headline)
-          Text("\(projects.count) 个工作目录")
-            .font(.caption)
-            .foregroundStyle(.secondary)
-        }
-        Spacer()
-        Button(action: addProject) {
-          Image(systemName: "folder.badge.plus")
-        }
-        .buttonStyle(.borderless)
-        .help("添加项目")
-      }
-      .padding(.horizontal, 13)
-      .padding(.vertical, 12)
-
-      Divider()
-
-      if projects.isEmpty {
-        VStack(spacing: 10) {
-          Image(systemName: "folder")
-            .font(.title2)
-            .foregroundStyle(.tertiary)
-          Text("还没有项目")
-            .font(.callout.weight(.medium))
-          Button("选择文件夹…", action: addProject)
-            .buttonStyle(.link)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(16)
-      } else {
-        ScrollView {
-          LazyVStack(spacing: 6) {
-            ForEach(projects) { project in
-              Button {
-                selectedProjectPath = project.path
-              } label: {
-                ProjectRailRow(
-                  project: project,
-                  selected: selectedProjectPath == project.path
-                )
-              }
-              .buttonStyle(.plain)
-              .contextMenu {
-                Button("新建会话") { newSession(project) }
-                Button("在 Finder 中显示") {
-                  NSWorkspace.shared.activateFileViewerSelecting([
-                    URL(fileURLWithPath: project.path),
-                  ])
-                }
-                Divider()
-                Button("从项目列表移除", role: .destructive) {
-                  removeProject(project)
-                }
-                .disabled(!project.sessions.isEmpty)
-              }
-            }
-          }
-          .padding(9)
-        }
-      }
-    }
-    .background(Color(nsColor: .windowBackgroundColor))
-  }
-}
-
 private struct ProjectRailRow: View {
   let project: LocalProjectSummary
   let selected: Bool
@@ -87,133 +10,51 @@ private struct ProjectRailRow: View {
   var expanded: Bool? = nil
 
   var body: some View {
-    HStack(spacing: 10) {
+    HStack(spacing: 7) {
       Image(systemName: selected ? "folder.fill" : "folder")
-        .font(.title3)
+        .font(.system(size: 11))
         .foregroundStyle(selected ? Color.accentColor : .secondary)
-        .frame(width: 25)
-      VStack(alignment: .leading, spacing: 4) {
-        Text(project.name)
-          .font(.callout.weight(selected ? .semibold : .medium))
-          .lineLimit(1)
-        HStack(spacing: 5) {
-          Text(project.path)
-            .lineLimit(1)
-            .truncationMode(.middle)
-          Spacer(minLength: 3)
-          if project.activeCount > 0 {
-            Label(String(project.activeCount), systemImage: "bolt.fill")
-              .foregroundStyle(.green)
-          } else {
-            Text("\(project.sessions.count)")
-          }
-        }
-        .font(.caption2)
-        .foregroundStyle(.secondary)
-      }
+        .frame(width: 14)
+      Text(project.name)
+        .font(.system(size: 12, weight: selected ? .semibold : .medium))
+        .lineLimit(1)
+        .truncationMode(.middle)
+      Spacer(minLength: 4)
       if project.pendingCount > 0 {
         Text(String(project.pendingCount))
-          .font(.caption2.weight(.bold))
+          .font(.system(size: 9, weight: .bold))
           .foregroundStyle(.orange)
-          .padding(.horizontal, 6)
-          .padding(.vertical, 3)
-          .background(.orange.opacity(0.13), in: Capsule())
+          .padding(.horizontal, 5)
+          .padding(.vertical, 2)
+          .background(.orange.opacity(0.16), in: Capsule())
+      } else if project.activeCount > 0 {
+        Label(String(project.activeCount), systemImage: "bolt.fill")
+          .font(.system(size: 9, weight: .semibold))
+          .foregroundStyle(.green)
+      } else {
+        Text("\(project.sessions.count)")
+          .font(.system(size: 9))
+          .foregroundStyle(.tertiary)
       }
       if let expanded {
         Image(systemName: expanded ? "chevron.down" : "chevron.right")
-          .font(.caption.weight(.semibold))
+          .font(.system(size: 9, weight: .semibold))
           .foregroundStyle(.tertiary)
-          .frame(width: 12)
+          .frame(width: 9)
       }
     }
-    .padding(9)
+    .padding(.horizontal, 8)
+    .padding(.vertical, 5)
     .background(
-      selected ? Color.accentColor.opacity(0.12) : Color.clear,
-      in: RoundedRectangle(cornerRadius: 9)
+      selected ? Color.accentColor.opacity(0.14) : Color.clear,
+      in: RoundedRectangle(cornerRadius: 7)
     )
-    .contentShape(RoundedRectangle(cornerRadius: 9))
+    .contentShape(RoundedRectangle(cornerRadius: 7))
+    // 完整路径挪进 tooltip:侧栏里每行都印一遍全路径,是最占宽度又最少被读的一列。
+    .help(project.path)
   }
 }
 
-/// Orca 式的“左侧会话、右侧工作区”，但把 Agent 身份和等待人处理的状态放到视觉第一层。
-struct SessionRail: View {
-  let projectName: String
-  let sessions: [RunningStatus.Session]
-  @Binding var selectedSessionID: String?
-  let newSession: () -> Void
-
-  var body: some View {
-    VStack(spacing: 0) {
-      HStack(spacing: 8) {
-        VStack(alignment: .leading, spacing: 2) {
-          Text("会话")
-            .font(.headline)
-          Text("\(projectName) · \(sessions.count) 个")
-            .font(.caption)
-            .foregroundStyle(.secondary)
-        }
-        Spacer()
-        let waiting = sessions.reduce(0) { $0 + $1.pendingInteractions }
-        if waiting > 0 {
-          Label(String(waiting), systemImage: "hand.raised.fill")
-            .font(.caption.weight(.bold))
-            .foregroundStyle(.orange)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(.orange.opacity(0.12), in: Capsule())
-        }
-        Button(action: newSession) {
-          Image(systemName: "plus")
-        }
-        .buttonStyle(.borderless)
-        .help("在 \(projectName) 中新建 Agent CLI")
-      }
-      .padding(.horizontal, 14)
-      .padding(.vertical, 12)
-
-      Divider()
-
-      if sessions.isEmpty {
-        VStack(spacing: 8) {
-          Image(systemName: "terminal")
-            .font(.title2)
-            .foregroundStyle(.tertiary)
-          Text("还没有会话")
-            .font(.callout.weight(.medium))
-          Button("新建会话", action: newSession)
-            .buttonStyle(.link)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(16)
-      } else {
-        ScrollView {
-          LazyVStack(spacing: 7) {
-            ForEach(sessions) { session in
-              Button {
-                selectedSessionID = session.id
-              } label: {
-                SessionRailRow(
-                  session: session,
-                  selected: selectedSessionID == session.id
-                )
-              }
-              .buttonStyle(.plain)
-            }
-          }
-          .padding(10)
-        }
-      }
-    }
-    // 侧栏和工作区共用窗口表面；只用选中态区分会话，避免出现一列一层底色。
-    .background(Color(nsColor: .windowBackgroundColor))
-  }
-}
-
-/// 把「项目」和「会话」收进同一条工作台侧栏。
-///
-/// 外层已经有全局导航；再把项目与会话拆成两列，会让一个普通会话页变成四栏，
-/// 终端反而没有足够的横向空间。项目作为分组标题，会话在其下缩进展示，既保留
-/// 项目归属，也让 Mac 的主视图始终把空间留给 CLI。
 struct ProjectSessionSidebar: View {
   let projects: [LocalProjectSummary]
   @Binding var selectedProjectPath: String?
@@ -230,14 +71,12 @@ struct ProjectSessionSidebar: View {
 
   var body: some View {
     VStack(spacing: 0) {
-      HStack(spacing: 8) {
-        VStack(alignment: .leading, spacing: 2) {
-          Text("项目与会话")
-            .font(.headline)
-          Text("\(projects.count) 个工作目录")
-            .font(.caption)
-            .foregroundStyle(.secondary)
-        }
+      HStack(spacing: 6) {
+        Text("项目与会话")
+          .font(.system(size: 12, weight: .semibold))
+        Text("\(projects.count)")
+          .font(.system(size: 10))
+          .foregroundStyle(.tertiary)
         Spacer()
         Button(action: addProject) {
           Image(systemName: "folder.badge.plus")
@@ -254,8 +93,8 @@ struct ProjectSessionSidebar: View {
           .help("在 \(selectedProject.name) 中新建 Agent CLI")
         }
       }
-      .padding(.horizontal, 13)
-      .padding(.vertical, 12)
+      .padding(.horizontal, 10)
+      .padding(.vertical, 8)
 
       Divider()
 
@@ -273,12 +112,13 @@ struct ProjectSessionSidebar: View {
         .padding(16)
       } else {
         ScrollView {
-          LazyVStack(spacing: 7) {
+          LazyVStack(spacing: 3) {
             ForEach(projects) { project in
               projectSection(project)
             }
           }
-          .padding(9)
+          .padding(.horizontal, 6)
+          .padding(.vertical, 7)
         }
       }
     }
@@ -289,7 +129,7 @@ struct ProjectSessionSidebar: View {
   private func projectSection(_ project: LocalProjectSummary) -> some View {
     let selected = selectedProjectPath == project.path
     let expanded = expandedProjectPaths.contains(project.path)
-    VStack(spacing: 5) {
+    VStack(spacing: 3) {
       Button {
         if selected {
           if expanded {
@@ -327,7 +167,7 @@ struct ProjectSessionSidebar: View {
             .font(.caption)
             .padding(.vertical, 8)
         } else {
-          LazyVStack(spacing: 5) {
+          LazyVStack(spacing: 3) {
             ForEach(project.sessions) { session in
               Button {
                 selectedProjectPath = project.path
@@ -341,7 +181,7 @@ struct ProjectSessionSidebar: View {
               .buttonStyle(.plain)
             }
           }
-          .padding(.leading, 10)
+          .padding(.leading, 12)
         }
       }
     }
@@ -353,62 +193,55 @@ private struct SessionRailRow: View {
   let selected: Bool
 
   private var accent: Color { AgentVisuals.statusColor(session) }
+  private var title: String {
+    session.preview?.isEmpty == false ? session.preview! : session.title
+  }
 
   var body: some View {
-    HStack(spacing: 10) {
-      AgentAvatar(agent: session.agent, size: 34, active: AgentVisuals.isActive(session))
-      VStack(alignment: .leading, spacing: 4) {
-        HStack(spacing: 6) {
-          Text(AgentVisuals.name(session.agent))
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(accent)
-          // tmux 会话是这个壳的主场,标签直接写它托管在哪儿,别再写笼统的 "CLI"。
-          Text(session.kind == "pty" ? "tmux" : "chat")
-            .font(.system(size: 9, weight: .bold, design: .monospaced))
-            .foregroundStyle(session.kind == "pty" ? TerminalPalette.green : Color.secondary)
-            .padding(.horizontal, 4)
-            .padding(.vertical, 2)
-            .background(
-              session.kind == "pty"
-                ? AnyShapeStyle(TerminalPalette.green.opacity(0.14))
-                : AnyShapeStyle(.quaternary),
-              in: RoundedRectangle(cornerRadius: 3)
-            )
-        }
-        Text(session.preview?.isEmpty == false ? session.preview! : session.title)
-          .font(
-            session.kind == "pty"
-              ? .system(size: 11, weight: selected ? .semibold : .regular, design: .monospaced)
-              : .callout.weight(selected ? .semibold : .regular)
-          )
-          .foregroundStyle(.primary)
-          .lineLimit(2)
+    HStack(alignment: .top, spacing: 8) {
+      AgentAvatar(agent: session.agent, size: 22, active: AgentVisuals.isActive(session))
+      VStack(alignment: .leading, spacing: 3) {
         HStack(spacing: 5) {
-          Circle().fill(accent).frame(width: 6, height: 6)
+          // Agent 名不再单独占一行:头像的字母和配色已经说明了是谁,
+          // 而预览文本里通常也带着它。
+          Text(title)
+            .font(
+              session.kind == "pty"
+                ? .system(size: 11, weight: selected ? .semibold : .regular, design: .monospaced)
+                : .system(size: 11.5, weight: selected ? .semibold : .regular)
+            )
+            .foregroundStyle(.primary)
+            .lineLimit(1)
+          Spacer(minLength: 2)
+          Text(session.kind == "pty" ? "tmux" : "chat")
+            .font(.system(size: 8.5, weight: .bold, design: .monospaced))
+            .foregroundStyle(session.kind == "pty" ? TerminalPalette.green : Color.secondary)
+        }
+        HStack(spacing: 4) {
+          Circle().fill(accent).frame(width: 5, height: 5)
           Text(AgentVisuals.shortStatus(session))
-            .font(.caption2.weight(session.pendingInteractions > 0 ? .semibold : .regular))
+            .font(.system(size: 9.5, weight: session.pendingInteractions > 0 ? .semibold : .regular))
             .foregroundStyle(session.pendingInteractions > 0 ? accent : .secondary)
-          Spacer(minLength: 4)
-          Text(URL(fileURLWithPath: session.cwd).lastPathComponent)
-            .font(.caption2)
-            .foregroundStyle(.tertiary)
             .lineLimit(1)
         }
       }
     }
-    .padding(10)
+    .padding(.horizontal, 8)
+    .padding(.vertical, 6)
     .background(
-      selected ? Color.accentColor.opacity(0.12) : Color.clear,
-      in: RoundedRectangle(cornerRadius: 11)
+      selected ? Color.accentColor.opacity(0.14) : Color.clear,
+      in: RoundedRectangle(cornerRadius: 8)
     )
     .overlay {
-      RoundedRectangle(cornerRadius: 11)
+      RoundedRectangle(cornerRadius: 8)
         .stroke(
           session.pendingInteractions > 0 ? accent.opacity(0.55) : Color.clear,
           lineWidth: 1
         )
     }
-    .contentShape(RoundedRectangle(cornerRadius: 11))
+    .contentShape(RoundedRectangle(cornerRadius: 8))
+    // 工作目录不再逐行重复 —— 会话本来就挂在项目节点下面。截断掉的预览给 tooltip。
+    .help(title)
   }
 }
 

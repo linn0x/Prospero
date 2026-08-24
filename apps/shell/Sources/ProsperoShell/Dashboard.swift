@@ -466,7 +466,7 @@ private struct SessionsDashboard: View {
   @State private var expandedProjectPaths: Set<String> = []
   /// HSplitView 在外层 NavigationSplitView 隐藏/显示后会重新计算分栏。
   /// 这里把用户拖出的宽度存进偏好，重建后仍按同一宽度排版。
-  @AppStorage("projectSessionSidebarWidth") private var storedProjectSidebarWidth = 320.0
+  @AppStorage("projectSessionSidebarWidth") private var storedProjectSidebarWidth = 248.0
   @State private var sidebarDragOrigin: CGFloat?
   /// 拖拽过程中的实时宽度。落 @AppStorage 会写一次 UserDefaults,
   /// 而拖拽每帧都触发 onChanged —— 拖一次侧栏就是上百次写盘 + 上百次视图失效。
@@ -475,8 +475,8 @@ private struct SessionsDashboard: View {
   /// 与 LocalSessionWorkspace 头部、以及工具栏那颗按钮共用同一个键。
   @AppStorage("focusTerminal") private var focusTerminal = false
 
-  private static let projectSidebarMinWidth: CGFloat = 270
-  private static let projectSidebarMaxWidth: CGFloat = 480
+  private static let projectSidebarMinWidth: CGFloat = 196
+  private static let projectSidebarMaxWidth: CGFloat = 420
   private static let workspaceMinWidth: CGFloat = 460
 
   private var sessions: [RunningStatus.Session] {
