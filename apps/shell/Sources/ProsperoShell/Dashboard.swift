@@ -442,6 +442,10 @@ private struct SessionsDashboard: View {
   /// 这里把用户拖出的宽度存进偏好，重建后仍按同一宽度排版。
   @AppStorage("projectSessionSidebarWidth") private var storedProjectSidebarWidth = 320.0
   @State private var sidebarDragOrigin: CGFloat?
+  /// 拖拽过程中的实时宽度。落 @AppStorage 会写一次 UserDefaults,
+  /// 而拖拽每帧都触发 onChanged —— 拖一次侧栏就是上百次写盘 + 上百次视图失效。
+  /// 拖动时只更新这个 @State,松手后才持久化。
+  @State private var liveSidebarWidth: CGFloat?
 
   private static let projectSidebarMinWidth: CGFloat = 270
   private static let projectSidebarMaxWidth: CGFloat = 480
@@ -460,17 +464,31 @@ private struct SessionsDashboard: View {
     projects.summaries(for: sessions)
   }
 
-  private var selectedProject: LocalProjectSummary? {
-    guard let selectedProjectPath else { return nil }
-    return projectSummaries.first { $0.path == selectedProjectPath }
+  private func project(_ summaries: [LocalProjectSummary], at path: String?) -> LocalProjectSummary? {
+    guard let path else { return nil }
+    return summaries.first { $0.path == path }
+  }
+
+  /// 会话增删/换目录的检测键。刻意用未排序的原始列表:排序只影响展示,
+  /// 拿排序后的数组做键会让单纯的状态变化(它会改变排序位次)也误报成结构变化。
+  private var sessionIdentityKey: [String] {
+    (daemon.running?.sessions ?? []).map { "\($0.id):\($0.cwd)" }
   }
 
   var body: some View {
-    GeometryReader { proxy in
+    // 一次 body 只算一次。以前 projectSummaries 是无缓存计算属性,
+    // 而 body 经由「侧栏参数 / selectedProject / selectedSession」三条路径各触发一次,
+    // 每次都要重排会话并重跑一遍 summaries —— 拖侧栏时这是逐帧成本。
+    let summaries = projectSummaries
+    let currentProject = project(summaries, at: selectedProjectPath)
+    let currentSession = currentProject.flatMap { project in
+      selectedSessionID.flatMap { id in project.sessions.first { $0.id == id } }
+    }
+    return GeometryReader { proxy in
       let sidebarWidth = projectSidebarWidth(for: proxy.size.width)
       HStack(spacing: 0) {
         ProjectSessionSidebar(
-          projects: projectSummaries,
+          projects: summaries,
           selectedProjectPath: $selectedProjectPath,
           selectedSessionID: $selectedSessionID,
           expandedProjectPaths: $expandedProjectPaths,
@@ -482,25 +500,21 @@ private struct SessionsDashboard: View {
 
         sidebarDivider(availableWidth: proxy.size.width, displayedWidth: sidebarWidth)
 
-        workspace
+        workspace(project: currentProject, session: currentSession)
           .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
       }
     }
     .navigationTitle("项目与会话")
     .onAppear {
       synchronizeProjects()
-      selectAvailableProject()
-      selectAvailableSession()
-      expandSelectedProject()
+      resynchronizeSelection()
     }
-    .onChange(of: sessions.map { "\($0.id):\($0.cwd)" }) { _, _ in
+    .onChange(of: sessionIdentityKey) { _, _ in
       synchronizeProjects()
-      selectAvailableProject()
-      selectAvailableSession()
-      expandSelectedProject()
+      resynchronizeSelection()
     }
     .onChange(of: selectedProjectPath) { _, _ in
-      selectAvailableSession()
+      selectAvailableSession(in: projectSummaries)
       expandSelectedProject()
     }
     .alert("结束会话？", isPresented: Binding(
@@ -522,22 +536,20 @@ private struct SessionsDashboard: View {
     }
   }
 
-  private var selectedSession: RunningStatus.Session? {
-    guard let selectedSessionID, let selectedProject else { return nil }
-    return selectedProject.sessions.first { $0.id == selectedSessionID }
-  }
-
   @ViewBuilder
-  private var workspace: some View {
-    if let project = selectedProject {
-      if let selected = selectedSession {
+  private func workspace(
+    project: LocalProjectSummary?,
+    session: RunningStatus.Session?
+  ) -> some View {
+    if let project {
+      if let session {
         LocalSessionWorkspace(
           daemon: daemon,
-          session: selected,
-          interrupt: { run(selected, action: .interrupt) },
-          kill: { sessionToKill = selected }
+          session: session,
+          interrupt: { run(session, action: .interrupt) },
+          kill: { sessionToKill = session }
         )
-        .id(selected.id)
+        .id(session.id)
       } else {
         EmptyProjectWorkspace(
           project: project,
@@ -558,7 +570,8 @@ private struct SessionsDashboard: View {
       Self.projectSidebarMinWidth,
       min(Self.projectSidebarMaxWidth, availableWidth - Self.workspaceMinWidth)
     )
-    return min(max(CGFloat(storedProjectSidebarWidth), Self.projectSidebarMinWidth), maxWidth)
+    let requested = liveSidebarWidth ?? CGFloat(storedProjectSidebarWidth)
+    return min(max(requested, Self.projectSidebarMinWidth), maxWidth)
   }
 
   private func sidebarDivider(availableWidth: CGFloat, displayedWidth: CGFloat) -> some View {
@@ -580,12 +593,20 @@ private struct SessionsDashboard: View {
                   Self.projectSidebarMinWidth,
                   min(Self.projectSidebarMaxWidth, availableWidth - Self.workspaceMinWidth)
                 )
-                storedProjectSidebarWidth = Double(min(
+                liveSidebarWidth = min(
                   max(sidebarDragOrigin + value.translation.width, Self.projectSidebarMinWidth),
                   maxWidth
-                ))
+                )
               }
-              .onEnded { _ in sidebarDragOrigin = nil }
+              .onEnded { _ in
+                // 松手时才落盘。拖拽中途的每一帧都写 UserDefaults 是纯粹的浪费,
+                // 而且 @AppStorage 的变更会再把整个 SessionsDashboard 失效一次。
+                if let liveSidebarWidth {
+                  storedProjectSidebarWidth = Double(liveSidebarWidth)
+                }
+                liveSidebarWidth = nil
+                sidebarDragOrigin = nil
+              }
           )
       }
   }
@@ -594,24 +615,33 @@ private struct SessionsDashboard: View {
     projects.rememberSessionDirectories(sessions.map(\.cwd))
   }
 
-  private func selectAvailableProject() {
-    if let selectedProjectPath,
-       projectSummaries.contains(where: { $0.path == selectedProjectPath }) {
-      return
-    }
-    selectedProjectPath = projectSummaries.first?.path
+  /// 项目与会话的选中态一起收敛,共用一份 summaries ——
+  /// 两个函数各自去算一遍的话,一次同步就要跑三遍 summaries。
+  private func resynchronizeSelection() {
+    let summaries = projectSummaries
+    selectAvailableProject(in: summaries)
+    selectAvailableSession(in: summaries)
+    expandSelectedProject()
   }
 
-  private func selectAvailableSession() {
-    guard let selectedProject else {
+  private func selectAvailableProject(in summaries: [LocalProjectSummary]) {
+    if let selectedProjectPath,
+       summaries.contains(where: { $0.path == selectedProjectPath }) {
+      return
+    }
+    selectedProjectPath = summaries.first?.path
+  }
+
+  private func selectAvailableSession(in summaries: [LocalProjectSummary]) {
+    guard let project = project(summaries, at: selectedProjectPath) else {
       selectedSessionID = nil
       return
     }
     if let selectedSessionID,
-       selectedProject.sessions.contains(where: { $0.id == selectedSessionID }) {
+       project.sessions.contains(where: { $0.id == selectedSessionID }) {
       return
     }
-    selectedSessionID = selectedProject.sessions.first?.id
+    selectedSessionID = project.sessions.first?.id
   }
 
   /// 选中其他项目时自然展开；用户手动收起当前项目时 selection 不会变化，
@@ -635,14 +665,13 @@ private struct SessionsDashboard: View {
     if panel.runModal() == .OK, let directory = panel.url {
       projects.add(directory.path)
       selectedProjectPath = LocalProjectStore.normalizePath(directory.path)
-      selectAvailableSession()
+      selectAvailableSession(in: projectSummaries)
     }
   }
 
   private func removeProject(_ project: LocalProjectSummary) {
     projects.remove(project.path)
-    selectAvailableProject()
-    selectAvailableSession()
+    resynchronizeSelection()
   }
 
   private func run(_ session: RunningStatus.Session, action: DaemonController.SessionAction) {
@@ -2771,7 +2800,9 @@ private struct LogsDashboard: View {
       .padding(16)
       Divider()
       ScrollView {
-        Text(daemon.recentLog.isEmpty ? "(暂无日志)" : daemon.recentLog.joined(separator: "\n"))
+        // 绑 logText 而不是当场 joined():DaemonController 已经在写入路径上
+        // 增量维护好了这份拼接结果,日志刷屏时渲染最频繁,不该每帧再拼几百行。
+        Text(daemon.recentLog.isEmpty ? "(暂无日志)" : daemon.logText)
           .font(.system(.caption, design: .monospaced))
           .textSelection(.enabled)
           .frame(maxWidth: .infinity, alignment: .leading)
