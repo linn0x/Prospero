@@ -1,6 +1,7 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import {
   closeSync,
+  existsSync,
   mkdtempSync,
   mkdirSync,
   openSync,
@@ -11,7 +12,7 @@ import {
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { CollaborationService } from "../src/orchestration/collaboration.js";
 import { orchestrationControlApi } from "../src/orchestration/control-api.js";
 import { DispatchService, type WorkerSessionManager } from "../src/orchestration/dispatch.js";
@@ -930,9 +931,8 @@ describe("gc 周期性自动回收", () => {
     expect(() => readFileSync(path.join(created.path, "probe-only.txt"), "utf8")).toThrow();
   });
 
-  // 这条断言的就是 lsof 这个实现本身，而 Windows 上没有 lsof：hasLiveProcessUnder
-  // 会以 spawn ENOENT 抛出。生产侧 gc 把守卫异常当作"不可靠就别删"处理(见
-  // WorktreeAssetService.gc 的 catch)，因此 Windows 上只是回收永远不发生，不会误删。
+  // 这条断言的是 lsof 那条实现路径,Windows 上没有 lsof、走的是改名探测,
+  // 由下面那条 Windows 专属用例覆盖。
   it.skipIf(process.platform === "win32")("存活进程守卫 hasLiveProcessUnder 用 lsof 识别持有文件或 cwd 的进程", async () => {
     const { repo, assets } = repository();
     const created = await createEsaytree({
@@ -950,5 +950,39 @@ describe("gc 周期性自动回收", () => {
     }
     // fd 关闭后没有进程再持有该目录下的文件或 cwd
     expect(await hasLiveProcessUnder(created.path)).toBe(false);
+  });
+
+  // Windows 走的是改名探测。这里用真子进程把 cwd 钉在 worktree 里 —— 这正是
+  // 守卫要拦的场景,也是 Windows 上真正能挡住 rmdir 的那种占用(Node 自己开的
+  // 文件句柄带 FILE_SHARE_DELETE,挡不住删除,所以不能拿 openSync 来测)。
+  it.runIf(process.platform === "win32")("存活进程守卫在 Windows 用改名探测识别把 cwd 钉在里面的进程", async () => {
+    const { repo, assets } = repository();
+    const created = await createEsaytree({
+      repo,
+      name: "probe-rename",
+      at: path.join(assets, "probe-rename"),
+      branch: "prospero/probe-rename",
+      cloneIgnored: false,
+    });
+
+    const child = spawn("cmd.exe", ["/c", "ping -n 31 127.0.0.1 >NUL"], {
+      cwd: created.path,
+      stdio: "ignore",
+    });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(await hasLiveProcessUnder(created.path)).toBe(true);
+      // 探测失败也必须原样还回来,否则 gc 会把好好的工作树留成一个探测名。
+      expect(existsSync(created.path)).toBe(true);
+    } finally {
+      child.kill();
+      await new Promise((resolve) => child.once("exit", resolve));
+    }
+
+    // 进程退出后目录不再被占用；改名探测应当自行复原并报告空闲。
+    await vi.waitFor(async () => {
+      expect(await hasLiveProcessUnder(created.path)).toBe(false);
+    }, { timeout: 5_000, interval: 100 });
+    expect(existsSync(created.path)).toBe(true);
   });
 });

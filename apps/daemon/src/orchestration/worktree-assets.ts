@@ -8,6 +8,8 @@
  */
 import { execFile, spawn } from "node:child_process";
 import { realpathSync, statSync } from "node:fs";
+import { rename } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { WorktreeAsset, WorktreeInspection } from "./model.js";
@@ -669,8 +671,11 @@ function shortBranch(branch: string | null): string | null {
  * 的两种情况。这是 gc() 自动回收新增的安全面:`git worktree remove` 对仅含
  * gitignored 文件(node_modules/dist)的 worktree 并不拒绝,而这类目录里可能
  * 还留着 SessionManager 之外的进程(如残留在 worktree 里的 --dev daemon)。
+ *
+ * Windows 上没有 lsof,改用目录改名探测,见 hasLiveProcessUnderWindows。
  */
 export async function hasLiveProcessUnder(target: string): Promise<boolean> {
+  if (process.platform === "win32") return hasLiveProcessUnderWindows(target);
   // 注意:macOS 的 lsof 对 +D 无论是否找到匹配都以退出码 1 结束(实测确认),
   // 退出码完全不可信 —— 只能看 stdout 是否有内容,也因此不能用会按退出码
   // reject 的 execFile。异常(找不到 lsof、超时)仍向上抛,由 gc 保守跳过。
@@ -709,6 +714,41 @@ export async function hasLiveProcessUnder(target: string): Promise<boolean> {
       resolve(out.trim().length > 0);
     });
   });
+}
+
+/**
+ * Windows 没有 lsof,也没有免管理员权限枚举任意进程 cwd 的接口(Win32_Process
+ * 不暴露 cwd,openfiles/handle.exe 都不是默认可用的)。这里换个问法:用 Windows
+ * 自己的锁语义反证 —— 一个目录只要正被某个进程当作当前工作目录,重命名就会被
+ * 拒绝。这恰好覆盖本守卫要防的主要场景(残留在 worktree 里还活着的进程)。
+ *
+ * 注意 Node 打开的文件句柄默认带 FILE_SHARE_DELETE,并不会挡住删除,所以"遍历
+ * 文件试打开"在 Windows 上既测不准也没意义;能真正拦住 rmdir 的就是 cwd 这类
+ * 目录级占用,而它同样拦得住 rename。
+ *
+ * 探测会短暂改名再改回。这看似有副作用,但调用它的 gc 此刻已经判定该资产满 24h、
+ * 所属 Run 非 active、无 lease、且 safe_to_clean —— 下一步本来就是删除它;
+ * 相比之下一次瞬时改名严格更轻。改不回来说明状态已不可信,抛给 gc 保守跳过。
+ */
+async function hasLiveProcessUnderWindows(target: string): Promise<boolean> {
+  const probe = path.join(path.dirname(target), `.prospero-gc-probe-${randomUUID()}`);
+  try {
+    await rename(target, probe);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    // 目录被占用时 Windows 会给出这三者之一,视作"有进程活在里面"。
+    if (code === "EBUSY" || code === "EPERM" || code === "EACCES") return true;
+    // 其它(如 ENOENT:目录刚消失)交给 gc 的 catch 保守处理,不擅自判定为空闲。
+    throw error;
+  }
+  try {
+    await rename(probe, target);
+  } catch (error) {
+    throw new Error(
+      `存活进程守卫改名探测后无法复原 ${probe} → ${target}(${errorMessage(error)});已保守中止回收`,
+    );
+  }
+  return false;
 }
 
 function errorMessage(error: unknown): string {
