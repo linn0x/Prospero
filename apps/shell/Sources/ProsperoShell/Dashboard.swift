@@ -1784,6 +1784,9 @@ private struct GoalRunRow: View {
   @State private var customDecisions: [String: String] = [:]
   @State private var showingTaskComposer = false
   @State private var showingGraphEditor = false
+  /// 列表 / 依赖图。选择跨 Run、跨重启保留 —— 惯用哪种视图是个人偏好,不是每个 Run 的属性。
+  @AppStorage("runTaskView") private var taskView = RunTaskView.graph
+  @State private var graphSelection: String?
   @State private var showingAutomationComposer = false
   @State private var showingDeleteConfirmation = false
   @State private var showingCompleteConfirmation = false
@@ -1977,6 +1980,48 @@ private struct GoalRunRow: View {
 
         if !tasks.isEmpty {
           Divider()
+          HStack(spacing: 8) {
+            Text("任务")
+              .font(.caption.weight(.semibold))
+              .foregroundStyle(.secondary)
+            Spacer()
+            Picker("任务视图", selection: $taskView) {
+              Image(systemName: "list.bullet").tag(RunTaskView.list)
+              Image(systemName: "point.3.connected.trianglepath.dotted").tag(RunTaskView.graph)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .fixedSize()
+          }
+        }
+
+        if !tasks.isEmpty, taskView == .graph {
+          RunGraphCanvas(
+            tasks: tasks,
+            dispatches: dispatches,
+            selection: $graphSelection
+          )
+          // 图上点中的任务,详情仍然由那张列表行给 —— 派发/停止/重试都在那里。
+          if let selected = tasks.first(where: { $0.id == graphSelection }) {
+            OrchestrationTaskRow(
+              task: selected,
+              allTasks: tasks,
+              latestDispatch: dispatches
+                .filter { $0.taskId == selected.id }
+                .sorted { $0.startedAt > $1.startedAt }
+                .first,
+              canDispatch: manual && !automationRunning && isReady(selected),
+              onDispatch: { dispatchingTask = selected },
+              onStop: { stopWorker(selected) },
+              onCancel: { cancelTask(selected) },
+              onRetry: { retryTask(selected) }
+            )
+            .padding(10)
+            .background(.quaternary.opacity(0.18), in: RoundedRectangle(cornerRadius: 10))
+          }
+        }
+
+        if !tasks.isEmpty, taskView == .list {
           VStack(spacing: 8) {
             ForEach(tasks) { task in
               OrchestrationTaskRow(
@@ -1994,7 +2039,7 @@ private struct GoalRunRow: View {
               )
             }
           }
-        } else if manual {
+        } else if tasks.isEmpty, manual {
           Text("还没有任务。添加任务后即可选择 Agent 派发。")
             .font(.callout)
             .foregroundStyle(.secondary)
