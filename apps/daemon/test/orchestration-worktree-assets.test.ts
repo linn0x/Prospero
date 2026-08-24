@@ -930,7 +930,10 @@ describe("gc 周期性自动回收", () => {
     expect(() => readFileSync(path.join(created.path, "probe-only.txt"), "utf8")).toThrow();
   });
 
-  it("存活进程守卫 hasLiveProcessUnder 用 lsof 识别持有文件或 cwd 的进程", async () => {
+  // 这条断言的就是 lsof 这个实现本身，而 Windows 上没有 lsof：hasLiveProcessUnder
+  // 会以 spawn ENOENT 抛出。生产侧 gc 把守卫异常当作"不可靠就别删"处理(见
+  // WorktreeAssetService.gc 的 catch)，因此 Windows 上只是回收永远不发生，不会误删。
+  it.skipIf(process.platform === "win32")("存活进程守卫 hasLiveProcessUnder 用 lsof 识别持有文件或 cwd 的进程", async () => {
     const { repo, assets } = repository();
     const created = await createEsaytree({
       repo,
