@@ -234,7 +234,11 @@ describe("Mac control session views", () => {
       expect(await repaired.json()).toMatchObject({ kind: "pty", mode: "snapshot", seq: secondSeq });
     } finally {
       await server?.close();
-      rmSync(home, { recursive: true, force: true });
+      // PtySession.dispose() 是同步的：proc.kill() 之后并不等子进程真正退出。
+      // 这个用例的 PTY 又把 cwd 设在 home 上，而 Windows 会锁住任何进程的 cwd
+      // 目录（POSIX 允许直接 unlink），于是 rmdir 撞上 EBUSY。重试等内核把已被
+      // kill 的进程回收完，避免清理时序把用例判负。
+      rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
     }
   });
 });
