@@ -362,24 +362,25 @@ private struct SessionRailRow: View {
           Text(AgentVisuals.name(session.agent))
             .font(.caption.weight(.semibold))
             .foregroundStyle(accent)
-          if session.kind == "pty" {
-            Text("CLI")
-              .font(.system(size: 8, weight: .bold, design: .rounded))
-              .foregroundStyle(.secondary)
-              .padding(.horizontal, 4)
-              .padding(.vertical, 2)
-              .background(.quaternary, in: RoundedRectangle(cornerRadius: 3))
-          } else {
-            Text("移动端对话")
-              .font(.system(size: 8, weight: .bold, design: .rounded))
-              .foregroundStyle(.secondary)
-              .padding(.horizontal, 4)
-              .padding(.vertical, 2)
-              .background(.quaternary, in: RoundedRectangle(cornerRadius: 3))
-          }
+          // tmux 会话是这个壳的主场,标签直接写它托管在哪儿,别再写笼统的 "CLI"。
+          Text(session.kind == "pty" ? "tmux" : "chat")
+            .font(.system(size: 9, weight: .bold, design: .monospaced))
+            .foregroundStyle(session.kind == "pty" ? TerminalPalette.green : Color.secondary)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 2)
+            .background(
+              session.kind == "pty"
+                ? AnyShapeStyle(TerminalPalette.green.opacity(0.14))
+                : AnyShapeStyle(.quaternary),
+              in: RoundedRectangle(cornerRadius: 3)
+            )
         }
         Text(session.preview?.isEmpty == false ? session.preview! : session.title)
-          .font(.callout.weight(selected ? .semibold : .regular))
+          .font(
+            session.kind == "pty"
+              ? .system(size: 11, weight: selected ? .semibold : .regular, design: .monospaced)
+              : .callout.weight(selected ? .semibold : .regular)
+          )
           .foregroundStyle(.primary)
           .lineLimit(2)
         HStack(spacing: 5) {
@@ -433,20 +434,32 @@ struct LocalSessionWorkspace: View {
   @State private var pendingActions: Set<String> = []
   @State private var selectedSubagent: ChatTimeline.Subagent?
 
+  /// 专注模式:两侧边栏让位,终端占满窗口。三处视图绑同一个键,
+  /// 头部按下时侧栏那边会跟着变 —— UserDefaults 在这里就是那根共享的线。
+  @AppStorage("focusTerminal") private var focusTerminal = false
+
   private var accent: Color { AgentVisuals.statusColor(session) }
   private var terminalPort: Int { daemon.running?.port ?? 7423 }
+  /// PTY 会话整块走终端配色:头部、提示条、错误条与画面同一片深色。
+  /// 以前是一条浅色系统外壳直接压在 #1a1b26 上,中间那道色缝正好横在视线里。
+  /// 结构化会话是文档式界面,继续用系统浅色。
+  private var terminalMode: Bool { session.kind == "pty" }
 
   var body: some View {
     VStack(spacing: 0) {
       workspaceHeader
-      Divider()
+      if terminalMode {
+        TerminalPalette.border.frame(height: 1)
+      } else {
+        Divider()
+      }
 
       if session.pendingInteractions > 0 {
         attentionBanner
       }
 
       Group {
-        if session.kind == "pty" {
+        if terminalMode {
           terminalWorkspace
         } else {
           structuredWorkspace
@@ -455,13 +468,18 @@ struct LocalSessionWorkspace: View {
       .frame(maxWidth: .infinity, maxHeight: .infinity)
 
       if let loadError {
-        Divider()
+        if terminalMode {
+          TerminalPalette.border.frame(height: 1)
+        } else {
+          Divider()
+        }
         Label(loadError, systemImage: "wifi.exclamationmark")
           .font(.caption)
-          .foregroundStyle(.orange)
+          .foregroundStyle(terminalMode ? TerminalPalette.yellow : .orange)
           .padding(.horizontal, 14)
           .padding(.vertical, 8)
           .frame(maxWidth: .infinity, alignment: .leading)
+          .background { if terminalMode { TerminalPalette.surface } }
       }
     }
     .task(id: "\(session.id):\(daemon.running?.pid ?? 0)") {
@@ -486,98 +504,170 @@ struct LocalSessionWorkspace: View {
   }
 
   private var workspaceHeader: some View {
-    HStack(spacing: 13) {
-      AgentAvatar(agent: session.agent, size: 42, active: AgentVisuals.isActive(session))
-      VStack(alignment: .leading, spacing: 4) {
-        HStack(spacing: 8) {
+    HStack(spacing: 12) {
+      AgentAvatar(
+        agent: session.agent,
+        size: terminalMode ? 30 : 42,
+        active: AgentVisuals.isActive(session)
+      )
+      VStack(alignment: .leading, spacing: 3) {
+        HStack(spacing: 7) {
           Text(AgentVisuals.name(session.agent))
-            .font(.headline)
-          Text(session.kind == "structured" ? "Chat" : "Shell · CLI")
-            .font(.caption2.weight(.medium))
-            .foregroundStyle(.secondary)
-            .padding(.horizontal, 7)
-            .padding(.vertical, 3)
-            .background(.quaternary, in: Capsule())
-          if session.kind == "pty" {
-            Label("滚轮查看历史", systemImage: "clock.arrow.circlepath")
-              .font(.caption2)
-              .foregroundStyle(.tertiary)
-              .help("滚轮进入 tmux 历史，q 返回；Option + 拖动选择文本")
+            .font(terminalMode ? .system(size: 13, weight: .semibold) : .headline)
+            .foregroundStyle(terminalMode ? TerminalPalette.foreground : .primary)
+          if terminalMode {
+            TerminalBadge(text: "tmux", tint: TerminalPalette.green)
+              .help("会话进程托管在 tmux,daemon 重启也不会断;滚轮进入历史,q 返回;Option + 拖动选择文本")
+          } else {
+            Text("Chat")
+              .font(.caption2.weight(.medium))
+              .foregroundStyle(.secondary)
+              .padding(.horizontal, 7)
+              .padding(.vertical, 3)
+              .background(.quaternary, in: Capsule())
           }
           if let policy = session.approvalPolicy {
             Text(AgentVisuals.policyName(policy))
               .font(.caption2.weight(.medium))
-              .foregroundStyle(policy == "yolo" ? .orange : .secondary)
+              .foregroundStyle(policyTint(policy))
           }
         }
-        HStack(spacing: 7) {
-          Circle().fill(accent).frame(width: 7, height: 7)
+        HStack(spacing: 6) {
+          Circle().fill(accent).frame(width: 6, height: 6)
           Text(session.statusLabel)
             .font(.caption.weight(.semibold))
             .foregroundStyle(accent)
           Text("·")
-            .foregroundStyle(.tertiary)
+            .foregroundStyle(terminalMode ? AnyShapeStyle(TerminalPalette.dim) : AnyShapeStyle(.tertiary))
+          // 终端里路径用等宽:它和画面里的 prompt 是同一件东西,对齐了才像一体。
           Text(session.cwd)
-            .font(.caption)
-            .foregroundStyle(.secondary)
+            .font(terminalMode ? .system(size: 11, design: .monospaced) : .caption)
+            .foregroundStyle(terminalMode ? TerminalPalette.dim : .secondary)
             .lineLimit(1)
             .truncationMode(.middle)
         }
       }
       Spacer(minLength: 12)
-      Button {
-        NSWorkspace.shared.open(URL(fileURLWithPath: session.cwd))
-      } label: {
-        Label("目录", systemImage: "folder")
-      }
-      .buttonStyle(.borderless)
-      Button(action: interrupt) {
-        Label("停止本轮", systemImage: "stop.circle")
-      }
-      .buttonStyle(.bordered)
-      .tint(.orange)
-      .disabled(!AgentVisuals.canInterrupt(session))
-      Menu {
-        Button("结束并删除会话", role: .destructive, action: kill)
-      } label: {
-        Image(systemName: "ellipsis.circle")
-      }
-      .menuStyle(.borderlessButton)
-      .fixedSize()
-      if let close {
-        Button("完成", action: close)
-          .buttonStyle(.borderedProminent)
-      }
+      if terminalMode { terminalHeaderActions } else { standardHeaderActions }
     }
-    .padding(.horizontal, 18)
-    .padding(.vertical, 12)
+    .padding(.horizontal, terminalMode ? 14 : 18)
+    .padding(.vertical, terminalMode ? 9 : 12)
+    .background { if terminalMode { TerminalPalette.surface } }
+  }
+
+  private func policyTint(_ policy: String) -> Color {
+    guard policy == "yolo" else { return terminalMode ? TerminalPalette.dim : .secondary }
+    return terminalMode ? TerminalPalette.yellow : .orange
+  }
+
+  /// 终端头部的控件全部走 chip 样式:系统 `.bordered` 会在深色上画出一块浅灰板。
+  @ViewBuilder
+  private var terminalHeaderActions: some View {
+    Button {
+      NSWorkspace.shared.open(URL(fileURLWithPath: session.cwd))
+    } label: {
+      Image(systemName: "folder")
+    }
+    .buttonStyle(TerminalChipButtonStyle(tint: TerminalPalette.secondary))
+    .help("在 Finder 中打开工作目录")
+
+    Button(action: interrupt) {
+      Label("停止本轮", systemImage: "stop.circle")
+    }
+    .buttonStyle(TerminalChipButtonStyle(tint: TerminalPalette.yellow))
+    .disabled(!AgentVisuals.canInterrupt(session))
+
+    if close == nil {
+      Button {
+        withAnimation(.easeInOut(duration: 0.18)) { focusTerminal.toggle() }
+      } label: {
+        Image(
+          systemName: focusTerminal
+            ? "arrow.down.right.and.arrow.up.left"
+            : "arrow.up.left.and.arrow.down.right"
+        )
+      }
+      // 快捷键只挂在工具栏那颗上:两处声明同一个 key equivalent 会打架。
+      .buttonStyle(TerminalChipButtonStyle(tint: focusTerminal ? TerminalPalette.cyan : TerminalPalette.secondary))
+      .help(focusTerminal ? "退出专注模式(⇧⌘F)" : "专注模式:隐藏侧栏,终端占满窗口(⇧⌘F)")
+    }
+
+    Menu {
+      Button("结束并删除会话", role: .destructive, action: kill)
+    } label: {
+      Image(systemName: "ellipsis")
+        .foregroundStyle(TerminalPalette.secondary)
+    }
+    .menuStyle(.borderlessButton)
+    .menuIndicator(.hidden)
+    .fixedSize()
+
+    if let close {
+      Button("完成", action: close)
+        .buttonStyle(TerminalChipButtonStyle(tint: TerminalPalette.blue, filled: true))
+    }
+  }
+
+  @ViewBuilder
+  private var standardHeaderActions: some View {
+    Button {
+      NSWorkspace.shared.open(URL(fileURLWithPath: session.cwd))
+    } label: {
+      Label("目录", systemImage: "folder")
+    }
+    .buttonStyle(.borderless)
+
+    Button(action: interrupt) {
+      Label("停止本轮", systemImage: "stop.circle")
+    }
+    .buttonStyle(.bordered)
+    .tint(.orange)
+    .disabled(!AgentVisuals.canInterrupt(session))
+
+    Menu {
+      Button("结束并删除会话", role: .destructive, action: kill)
+    } label: {
+      Image(systemName: "ellipsis.circle")
+    }
+    .menuStyle(.borderlessButton)
+    .fixedSize()
+
+    if let close {
+      Button("完成", action: close)
+        .buttonStyle(.borderedProminent)
+    }
   }
 
   private var attentionBanner: some View {
     HStack(spacing: 11) {
       Image(systemName: session.pendingPermissions > 0 ? "hand.raised.fill" : "questionmark.bubble.fill")
         .font(.title3)
-        .foregroundStyle(.orange)
+        .foregroundStyle(attentionTint)
       VStack(alignment: .leading, spacing: 2) {
         Text(session.pendingPermissions > 0 ? "\(AgentVisuals.name(session.agent)) 正在等待你的批准" : "\(AgentVisuals.name(session.agent)) 需要你的回答")
           .font(.callout.weight(.bold))
+          .foregroundStyle(terminalMode ? TerminalPalette.foreground : .primary)
         Text("处理后 Agent 会自动继续，不需要重新发送提示。")
           .font(.caption)
-          .foregroundStyle(.secondary)
+          .foregroundStyle(terminalMode ? TerminalPalette.secondary : .secondary)
       }
       Spacer()
       Text("待处理 \(session.pendingInteractions)")
         .font(.caption.weight(.bold))
-        .foregroundStyle(.orange)
+        .foregroundStyle(attentionTint)
         .padding(.horizontal, 9)
         .padding(.vertical, 5)
-        .background(.orange.opacity(0.13), in: Capsule())
+        .background(attentionTint.opacity(0.13), in: Capsule())
     }
     .padding(.horizontal, 16)
     .padding(.vertical, 11)
-    .background(.orange.opacity(0.08))
-    .overlay(alignment: .bottom) { Rectangle().fill(.orange.opacity(0.24)).frame(height: 1) }
+    .background(attentionTint.opacity(terminalMode ? 0.14 : 0.08))
+    .overlay(alignment: .bottom) {
+      Rectangle().fill(attentionTint.opacity(0.24)).frame(height: 1)
+    }
   }
+
+  private var attentionTint: Color { terminalMode ? TerminalPalette.yellow : .orange }
 
   @ViewBuilder
   private var structuredWorkspace: some View {
@@ -601,8 +691,8 @@ struct LocalSessionWorkspace: View {
 
   private var terminalWorkspace: some View {
     ZStack {
-      // #1a1b26 —— 与 term.html 的 xterm 主题同色,窗口留白不会在终端周围露出一圈异色。
-      Color(red: 26 / 255, green: 27 / 255, blue: 38 / 255)
+      // 与 term.html 的 xterm 主题同色,窗口留白不会在终端周围露出一圈异色。
+      TerminalPalette.background
       if terminalReady {
         MacTerminalSurface(
           port: terminalPort,
@@ -623,16 +713,28 @@ struct LocalSessionWorkspace: View {
         )
         .id(terminalPort)
       } else if loadError == nil {
-        ProgressView("正在载入终端…")
-          .tint(.white)
-          .foregroundStyle(.white)
+        // 等首帧的这一两秒里,别让用户盯着一块纯黑。给一行等宽提示,
+        // 和终端里将要出现的内容是同一种语言。
+        VStack(spacing: 10) {
+          ProgressView()
+            .controlSize(.small)
+            .tint(TerminalPalette.blue)
+          Text("正在接入 tmux 会话…")
+            .font(.system(size: 12, design: .monospaced))
+            .foregroundStyle(TerminalPalette.dim)
+        }
       } else {
-        ContentUnavailableView(
-          "无法载入终端",
-          systemImage: "terminal",
-          description: Text("保持会话内容不变，正在自动重试。")
-        )
-        .foregroundStyle(.white)
+        VStack(spacing: 10) {
+          Image(systemName: "terminal")
+            .font(.system(size: 30))
+            .foregroundStyle(TerminalPalette.dim)
+          Text("无法载入终端")
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(TerminalPalette.foreground)
+          Text("会话内容留在 tmux 里没有丢,正在自动重试。")
+            .font(.system(size: 11, design: .monospaced))
+            .foregroundStyle(TerminalPalette.dim)
+        }
       }
     }
   }
