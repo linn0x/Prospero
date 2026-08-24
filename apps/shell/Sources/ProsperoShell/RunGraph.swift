@@ -9,6 +9,13 @@ struct RunGraphCanvas: View {
   let dispatches: [OrchestrationStatus.Dispatch]
   @Binding var selection: String?
 
+  /// 缩放倍数。手势进行中不断变化,松手后落到 zoomBase 作为下一次捏合的基准。
+  @State private var zoom: CGFloat = 1
+  @State private var zoomBase: CGFloat = 1
+
+  private let minZoom: CGFloat = 0.35
+  private let maxZoom: CGFloat = 2.2
+
   private let nodeWidth: CGFloat = 178
   private let nodeHeight: CGFloat = 70
   private let hGap: CGFloat = 78
@@ -22,27 +29,49 @@ struct RunGraphCanvas: View {
 
   var body: some View {
     let layout = makeLayout()
-    VStack(spacing: 0) {
-      ScrollView([.horizontal, .vertical]) {
-        ZStack {
-          edges(layout)
-          ForEach(tasks) { task in
-            node(task)
-              .position(layout.positions[task.id] ?? .zero)
+    GeometryReader { proxy in
+      VStack(spacing: 0) {
+        ScrollView([.horizontal, .vertical]) {
+          ZStack {
+            edges(layout)
+            ForEach(tasks) { task in
+              node(task)
+                .position(layout.positions[task.id] ?? .zero)
+            }
           }
+          .frame(width: layout.size.width, height: layout.size.height)
+          // 先按原尺寸排版再整体缩放,外面那层 frame 把缩放后的尺寸告诉 ScrollView ——
+          // 少了它,滚动范围仍按原尺寸算,放大后就有一部分图滚不到。
+          .scaleEffect(zoom, anchor: .topLeading)
+          .frame(width: layout.size.width * zoom, height: layout.size.height * zoom)
         }
-        .frame(width: layout.size.width, height: layout.size.height)
+        .background(.quaternary.opacity(0.16))
+        .gesture(
+          MagnifyGesture()
+            .onChanged { value in zoom = clamp(zoomBase * value.magnification) }
+            .onEnded { _ in zoomBase = zoom }
+        )
+        controls(layout: layout, viewport: proxy.size)
       }
-      .background(.quaternary.opacity(0.16))
-      legend
     }
     .clipShape(RoundedRectangle(cornerRadius: 10))
     .overlay {
       RoundedRectangle(cornerRadius: 10)
         .stroke(.quaternary, lineWidth: 1)
     }
-    .frame(height: min(520, max(240, layout.size.height + 34)))
+    .frame(height: min(560, max(260, layout.size.height + 34)))
     .accessibilityLabel("任务依赖图")
+  }
+
+  private func clamp(_ value: CGFloat) -> CGFloat {
+    min(maxZoom, max(minZoom, value))
+  }
+
+  private func setZoom(_ value: CGFloat) {
+    withAnimation(.easeOut(duration: 0.15)) {
+      zoom = clamp(value)
+      zoomBase = zoom
+    }
   }
 
   private func edges(_ layout: Layout) -> some View {
@@ -132,7 +161,7 @@ struct RunGraphCanvas: View {
     .help(task.spec.isEmpty ? task.title : task.spec)
   }
 
-  private var legend: some View {
+  private func controls(layout: Layout, viewport: CGSize) -> some View {
     HStack(spacing: 12) {
       ForEach(RunTaskState.legend, id: \.label) { item in
         HStack(spacing: 4) {
@@ -140,14 +169,43 @@ struct RunGraphCanvas: View {
           Text(item.label)
         }
       }
-      Spacer()
+      Spacer(minLength: 8)
       Text("\(tasks.count) 个任务")
+      HStack(spacing: 2) {
+        Button { setZoom(zoom / 1.25) } label: { Image(systemName: "minus") }
+          .disabled(zoom <= minZoom + 0.001)
+        // 百分比本身就是"回到 100%"的按钮 —— 缩放控件里这是惯例。
+        Button { setZoom(1) } label: {
+          Text("\(Int((zoom * 100).rounded()))%")
+            .monospacedDigit()
+            .frame(width: 34)
+        }
+        .help("恢复 100%")
+        Button { setZoom(zoom * 1.25) } label: { Image(systemName: "plus") }
+          .disabled(zoom >= maxZoom - 0.001)
+        Button {
+          setZoom(fitScale(layout: layout, viewport: viewport))
+        } label: {
+          Image(systemName: "arrow.up.left.and.down.right.magnifyingglass")
+        }
+        .help("适应窗口")
+      }
+      .buttonStyle(.borderless)
+      .font(.system(size: 9))
     }
     .font(.system(size: 9))
     .foregroundStyle(.secondary)
     .padding(.horizontal, 10)
-    .padding(.vertical, 6)
+    .padding(.vertical, 5)
     .background(.quaternary.opacity(0.24))
+  }
+
+  /// 整张图塞进可视区所需的倍数。控件条自己占掉的高度要先扣掉,
+  /// 否则"适应"之后底部总有一行节点被压在条子下面。
+  private func fitScale(layout: Layout, viewport: CGSize) -> CGFloat {
+    let available = CGSize(width: viewport.width, height: max(80, viewport.height - 26))
+    guard layout.size.width > 0, layout.size.height > 0 else { return 1 }
+    return clamp(min(available.width / layout.size.width, available.height / layout.size.height))
   }
 
   /// 按依赖深度分层:x 是拓扑层级,y 是同层内的排队位次。
