@@ -40,13 +40,27 @@ final class LocalProjectStore {
     if let data = UserDefaults.standard.data(forKey: Self.defaultsKey),
        let stored = try? JSONDecoder().decode([String].self, from: data) {
       var seen = Set<String>()
-      paths = stored.compactMap { raw in
+      let deduped = stored.compactMap { raw -> String? in
         let path = Self.normalizePath(raw)
         return seen.insert(path).inserted ? path : nil
       }
+      // 编排 worker 的隔离工作树曾经也被当成项目记下来:本机实测 96 个书签里
+      // 有 87 个是它们。工作树是一次性的,daemon 建、daemon 收,书签栏留着它们
+      // 只会把真实项目挤出视野 —— 一律清掉,真实项目一个不动。
+      paths = deduped.filter { !Self.isWorktreePath($0) }
+      if paths != deduped { persist() }
     } else {
       paths = []
     }
+  }
+
+  /// 工作树是 daemon 造的临时目录,由它自己回收 —— 书签栏不该替它记住这些路径。
+  ///
+  /// 判定只认默认布局 `<父目录>/.prospero-worktrees/<仓库名>/<工作树名>`。
+  /// 设了 ESAYTREE_ROOT 的自定义根目录这里看不出来,那种情况下退回旧行为:
+  /// 记下来、但也仅仅是多一个书签。
+  nonisolated static func isWorktreePath(_ path: String) -> Bool {
+    URL(fileURLWithPath: path).pathComponents.contains(".prospero-worktrees")
   }
 
   /// 不解析符号链接，只统一 `~`、`.` 与尾部斜杠；展示和 daemon 使用同一路径语义。
@@ -68,12 +82,16 @@ final class LocalProjectStore {
   }
 
   /// 会话可能由手机或 CLI 创建；看到新的 cwd 时也记为 Mac 项目。
+  ///
+  /// 唯独工作树不记:每派发一个 worker 就会多出一个,任务做完目录就被回收,
+  /// 留下的书签指向一个不存在的地方。它们仍然会因为「有活着的会话」而出现在
+  /// 列表里(summaries 会为活跃会话的 cwd 临时建组),只是不再沉淀成书签。
   func rememberSessionDirectories(_ rawPaths: [String]) {
     var next = paths
     var seen = Set(next)
     for rawPath in rawPaths {
       let path = Self.normalizePath(rawPath)
-      guard !path.isEmpty, seen.insert(path).inserted else { continue }
+      guard !path.isEmpty, !Self.isWorktreePath(path), seen.insert(path).inserted else { continue }
       next.append(path)
     }
     guard next != paths else { return }
