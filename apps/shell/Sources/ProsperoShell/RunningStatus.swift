@@ -97,11 +97,19 @@ struct RunningStatus: Sendable, Equatable {
   }
 
   /// 读不到就是没跑 —— daemon 退出时会删掉这个文件,不会留陈旧快照。
-  static func load() -> RunningStatus? {
-    guard let data = try? Data(contentsOf: fileURL),
-          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-          let pid = obj["pid"] as? Int
-    else { return nil }
+  ///
+  /// `root` 传入已解析好的 status.json 可以省掉一次重复解析(刷新时 DaemonStatus 也要读它);
+  /// 不传则自行读取。空字典与文件缺失同义,都会因为取不到 pid 而返回 nil。
+  static func load(root: [String: Any]? = nil) -> RunningStatus? {
+    let parsed: [String: Any]?
+    if let root {
+      parsed = root
+    } else if let data = try? Data(contentsOf: fileURL) {
+      parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    } else {
+      parsed = nil
+    }
+    guard let obj = parsed, let pid = obj["pid"] as? Int else { return nil }
 
     let rawSessions = obj["sessions"] as? [[String: Any]] ?? []
     return RunningStatus(

@@ -36,8 +36,21 @@ struct DaemonStatus: Sendable, Equatable {
     return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".prospero")
   }
 
+  /// status.json 的原始解析结果。调用方拿到后可以同时喂给 `DaemonStatus.load(runtimeRoot:)`
+  /// 和 `RunningStatus.load(root:)`,避免同一个文件在一次刷新里被解析两遍。
+  /// 文件不存在时返回空字典 —— 与「daemon 没在跑」是同一个含义。
+  static func readRuntimeRoot() -> [String: Any] {
+    guard let data = try? Data(contentsOf: RunningStatus.fileURL),
+          let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return [:] }
+    return value
+  }
+
   /// 读 config.json + devices.json。文件不存在是正常状态(还没跑过 daemon),不是错误。
-  static func load() -> DaemonStatus {
+  ///
+  /// `runtimeRoot` 传入已解析好的 status.json 可以省掉一次重复解析;不传则自行读取,
+  /// 自检等一次性调用点保持原样。
+  static func load(runtimeRoot: [String: Any]? = nil) -> DaemonStatus {
     var status = DaemonStatus()
     var configRoot: [String: Any]?
 
@@ -53,13 +66,10 @@ struct DaemonStatus: Sendable, Equatable {
 
     // status.json 只提供运行中的公开 relay 快照。不要把整个对象缓存到模型中：
     // 它还含本机 control token，而 RelayStatus 只挑选允许展示的字段。
-    let runtimeRoot: [String: Any] = {
-      guard let data = try? Data(contentsOf: RunningStatus.fileURL),
-            let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-      else { return [:] }
-      return value
-    }()
-    status.relay = RelayStatus.parse(config: configRoot, runtime: runtimeRoot)
+    status.relay = RelayStatus.parse(
+      config: configRoot,
+      runtime: runtimeRoot ?? Self.readRuntimeRoot()
+    )
 
     // devices.json 是 { "devices": [...] },不是裸数组 —— 按裸数组读会永远得到 0 台,
     // 而"配对成功"提示正是靠设备列表变化触发的,所以这里错了整个功能都是哑的。

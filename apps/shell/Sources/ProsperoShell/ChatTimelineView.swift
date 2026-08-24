@@ -174,19 +174,44 @@ private struct ChatMessageView: View {
   }
 }
 
+/// Markdown 解析结果的记忆缓存。
+///
+/// 解析原本发生在 `body` 里,而 LazyVStack 会丢弃移出视口的行 —— 同一条消息每次
+/// 滚回视口都要重新解析一遍(实测一条典型回复约 0.09 ms,十几条可见消息就是毫秒级,
+/// 且随滚动持续重复)。文本本身就是键:文本没变就没有重新解析的理由。
+///
+/// 流式输出中的那条消息每次追加都会产生新键,因此仍按需解析一次 —— 这与旧行为相同,
+/// 差别只在于其余已定稿的消息不再反复付费。
+@MainActor
+private final class MarkdownCache {
+  static let shared = MarkdownCache()
+
+  private var entries: [String: AttributedString] = [:]
+  private var insertionOrder: [String] = []
+  /// 上限存在的意义是流式消息会不断产生新键;按插入顺序淘汰即可。
+  private let capacity = 128
+
+  func attributed(_ text: String) -> AttributedString {
+    if let cached = entries[text] { return cached }
+    // 解析失败时退化为普通文本,与原先的 `Text(text)` 分支等价。
+    let parsed = (try? AttributedString(markdown: text, options: .init(interpretedSyntax: .full)))
+      ?? AttributedString(text)
+    entries[text] = parsed
+    insertionOrder.append(text)
+    if insertionOrder.count > capacity {
+      entries.removeValue(forKey: insertionOrder.removeFirst())
+    }
+    return parsed
+  }
+}
+
 /// Markdown is best-effort: malformed Markdown is rendered as ordinary selectable text.
 private struct ChatMarkdownText: View {
   let text: String
 
   var body: some View {
-    Group {
-      if let markdown = try? AttributedString(markdown: text, options: .init(interpretedSyntax: .full)) {
-        Text(markdown)
-      } else {
-        Text(text)
-      }
-    }
-    .fixedSize(horizontal: false, vertical: true)
+    Text(MarkdownCache.shared.attributed(text))
+      .fixedSize(horizontal: false, vertical: true)
   }
 }
 

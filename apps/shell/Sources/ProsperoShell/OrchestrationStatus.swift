@@ -117,6 +117,22 @@ struct OrchestrationStatus: Sendable, Equatable {
     DaemonStatus.home.appendingPathComponent("orchestration.json")
   }
 
+  /// 文件版本指纹。stat 是微秒级的,而解码这个文件不是 ——
+  /// 实测 1.17 MB 的 orchestration.json 解码 + 排序要 2 ms,而它多数时候并没有变。
+  struct Stamp: Sendable, Equatable {
+    var modified: Date
+    var size: Int
+  }
+
+  /// 文件不存在时返回 nil —— 与「没有编排数据」是同一个含义。
+  static func currentStamp() -> Stamp? {
+    guard let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+          let modified = attrs[.modificationDate] as? Date,
+          let size = attrs[.size] as? Int
+    else { return nil }
+    return Stamp(modified: modified, size: size)
+  }
+
   static func load() -> OrchestrationStatus {
     guard let data = try? Data(contentsOf: fileURL),
           let stored = try? JSONDecoder().decode(Stored.self, from: data)

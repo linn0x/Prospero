@@ -86,6 +86,10 @@ final class DaemonController {
   }
   /// 端口探测在飞。慢网络下一次探测可能比刷新间隔还长,不叠着发。
   private var probing = false
+  /// 编排快照的解码在飞。和端口探测同理,不叠着发。
+  private var loadingOrchestration = false
+  /// 上一次解码所对应的文件指纹。指纹没变就连读都不必。
+  private var orchestrationStamp: OrchestrationStatus.Stamp?
 
   // nonisolated:readLogTail 在主线程外读日志尾巴,要用到这个上限
   private nonisolated static let logLineCap = 200
@@ -122,9 +126,12 @@ final class DaemonController {
 
   /// 刷新状态。壳没在管进程时,也要认出别处跑着的 daemon(终端里手动起的)。
   func refresh() {
-    status = .load()
-    running = RunningStatus.load().flatMap { $0.processAlive ? $0 : nil }
-    orchestration = .load()
+    // status.json 一次读取喂给两个解析器。以前 DaemonStatus.load() 读它取 relay 运行时快照,
+    // RunningStatus.load() 再读一次 —— 同一个 51 KB 文件每秒解析两遍。
+    let runtimeRoot = DaemonStatus.readRuntimeRoot()
+    status = .load(runtimeRoot: runtimeRoot)
+    running = RunningStatus.load(root: runtimeRoot).flatMap { $0.processAlive ? $0 : nil }
+    refreshOrchestration()
 
     // 新绑定的设备 = 刚刚配对成功。这是唯一能观察到"手机那边连上了"的信号:
     // daemon 在握手时把客户端公钥写进 devices.json。
@@ -139,6 +146,37 @@ final class DaemonController {
     if case .running = state { return }
     if case .starting = state { return }
     probePort()
+  }
+
+  /// 编排快照走后台解码,且只在文件真的变过时才解码。
+  ///
+  /// 这个文件会随编排历史无限增长(实测本机已到 1.17 MB,同目录还躺着一个 8.3 MB 的
+  /// discarded 兄弟文件)。原先每秒在主线程上 `JSONDecoder` 解一遍整份 + 五次排序,
+  /// 当前成本 2 ms/次,而且随文件增长线性恶化 —— 到 10 MB 就是每秒丢一帧。
+  /// 指纹未变时这里只付一次 stat 的钱。
+  private func refreshOrchestration() {
+    guard let stamp = OrchestrationStatus.currentStamp() else {
+      // 文件不存在 = 没有编排数据。只在状态真的需要归零时才赋值,
+      // 免得每次 tick 都白唤醒一遍观察者。
+      if orchestrationStamp != nil {
+        orchestrationStamp = nil
+        orchestration = OrchestrationStatus()
+      }
+      return
+    }
+    guard stamp != orchestrationStamp, !loadingOrchestration else { return }
+    loadingOrchestration = true
+    Task.detached(priority: .utility) {
+      let loaded = OrchestrationStatus.load()
+      await MainActor.run { [weak self] in
+        guard let self else { return }
+        self.loadingOrchestration = false
+        // 指纹取自解码之前:解码期间文件若又被改过,下一拍指纹不同会再解一次,
+        // 宁可多解一次,也不能漏掉一次更新。
+        self.orchestrationStamp = stamp
+        self.orchestration = loaded
+      }
+    }
   }
 
   /// 探测端口上有没有别人在跑 daemon。
