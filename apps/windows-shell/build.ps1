@@ -5,12 +5,24 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$msbuildCandidates = @(
-  'C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe',
-  'C:\Program Files\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\MSBuild.exe',
-  "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\MSBuild.exe"
-)
-$msbuild = $msbuildCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+# Resolve MSBuild through vswhere so any Visual Studio edition/year works
+# (GitHub runners ship Enterprise, developer machines usually Community/BuildTools).
+# The legacy Framework64\v4.0.30319\MSBuild.exe is deliberately NOT a fallback: it
+# drives the C# 5 compiler, which rejects <LangVersion>latest</LangVersion> with
+# "error CS1617" instead of failing with an actionable message.
+$msbuild = $null
+$vsInstallerRoot = if (${env:ProgramFiles(x86)}) { ${env:ProgramFiles(x86)} } else { $env:ProgramFiles }
+$vswhere = Join-Path $vsInstallerRoot 'Microsoft Visual Studio\Installer\vswhere.exe'
+if (Test-Path $vswhere) {
+  $msbuild = & $vswhere -latest -prerelease -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe' |
+    Select-Object -First 1
+}
+if (-not $msbuild -or -not (Test-Path $msbuild)) {
+  $msbuild = @(
+    'C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe',
+    'C:\Program Files\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\MSBuild.exe'
+  ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+}
 if (-not $msbuild) { throw 'MSBuild not found. Install Visual Studio Build Tools with .NET desktop development.' }
 
 $outputDirectory = Join-Path $projectRoot "bin\$Configuration"
