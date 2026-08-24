@@ -108,6 +108,22 @@ final class LocalProjectStore {
     persist()
   }
 
+  /// 收工的 worker 不再占项目栏的位置。
+  ///
+  /// 清掉工作树书签之后侧栏里仍然全是 worker-task,因为这些分组根本不是书签:
+  /// summaries 会给每个会话的 cwd 临时建一个组,而派发过的 worker 会永久留在
+  /// daemon 的会话列表里 —— 本机 87 个会话里 44 个是它们,全部 done/died,
+  /// 其中 41 个的工作树目录已经被 GC 收走。
+  ///
+  /// 这类会话属于 Run 的历史,该去编排页看(那里还有工作树资产可以检查和清理)。
+  /// 还活着的 worker 仍然留在栏里 —— 需要接管或看它卡在哪时,得能点得到。
+  ///
+  /// 只看状态、不去 stat 目录:这个函数在每秒一次的刷新路径上,一次 stat 都不该欠。
+  private static func isRetiredWorktreeSession(path: String, status: String) -> Bool {
+    guard isWorktreePath(path) else { return false }
+    return ["done", "completed", "died", "failed", "cancelled"].contains(status)
+  }
+
   /// 每个会话的 cwd 只归一化一次。
   ///
   /// 以前这里是 `orderedPaths.map { sessions.filter { normalizePath($0.cwd) == path } }`,
@@ -122,6 +138,7 @@ final class LocalProjectStore {
     for session in sessions {
       let path = Self.normalizePath(session.cwd)
       guard !path.isEmpty else { continue }
+      if Self.isRetiredWorktreeSession(path: path, status: session.status) { continue }
       grouped[path, default: []].append(session)
       if seen.insert(path).inserted { discoveredPaths.append(path) }
     }
