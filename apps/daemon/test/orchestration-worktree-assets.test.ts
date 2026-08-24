@@ -43,6 +43,10 @@ function repository(): { root: string; repo: string; assets: string } {
   git(repo, ["init", "-b", "main"]);
   git(repo, ["config", "user.email", "assets@example.test"]);
   git(repo, ["config", "user.name", "Asset Tests"]);
+  // 这些用例断言 worktree 里文件的精确字节。Windows 上 git 默认
+  // core.autocrlf=true，checkout 会把 LF 换成 CRLF，"base\n" 就变成 "base\r\n"。
+  // 固定成 false，让建出来的 worktree 在各平台上字节一致。
+  git(repo, ["config", "core.autocrlf", "false"]);
   writeFileSync(path.join(repo, "tracked.txt"), "base\n");
   git(repo, ["add", "tracked.txt"]);
   git(repo, ["commit", "-m", "base"]);

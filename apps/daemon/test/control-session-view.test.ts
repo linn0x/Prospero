@@ -178,7 +178,11 @@ describe("Mac control session views", () => {
       const pty = await create({
         agent: "custom",
         kind: "pty",
-        cwd: home,
+        // 刻意不放在 home 下：Windows 会锁住任何进程的当前工作目录，而
+        // PtySession.dispose() 只发 kill、不等子进程退出，于是 finally 里删 home
+        // 时会撞 EBUSY。cwd 与本用例要断言的东西无关，指到 home 之外即可从根上
+        // 消除这把锁，不必去赌 kill 与 rmdir 的时序。
+        cwd: os.tmpdir(),
         // Keep the process stable across both view requests. An immediate
         // exit can legitimately advance the PTY sequence between snapshots,
         // turning the no-change probe into a racy 200 response on Windows.
