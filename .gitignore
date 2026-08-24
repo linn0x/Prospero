@@ -39,6 +39,8 @@ apps/mobile/expo-env.d.ts
 
 # Swift and Xcode build state
 apps/shell/.build/
+apps/windows-shell/bin/
+apps/windows-shell/obj/
 DerivedData/
 xcuserdata/
 *.xcuserstate
