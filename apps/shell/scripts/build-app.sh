@@ -13,6 +13,7 @@ set -euo pipefail
 SHELL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="$SHELL_DIR/build"
 APP="$BUILD_DIR/Prospero.app"
+ICON="$SHELL_DIR/Resources/AppIcon.icns"
 DO_RUN=0
 
 [[ "${1:-}" == "--run" ]] && DO_RUN=1
@@ -44,10 +45,17 @@ swift build -c release --product ProsperoShell
 BINARY="$(swift build -c release --product ProsperoShell --show-bin-path)/ProsperoShell"
 [[ -f "$BINARY" ]] || { echo "编译产物不存在:$BINARY" >&2; exit 1; }
 
+# 图标是矢量脚本生成的产物,仓库里有一份;丢了就地重建,别让构建因为它失败。
+if [[ ! -f "$ICON" ]]; then
+  step "生成 App 图标"
+  swift "$SHELL_DIR/scripts/make-icon.swift" "$ICON"
+fi
+
 step "组装 Prospero.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BINARY" "$APP/Contents/MacOS/ProsperoShell"
+cp "$ICON" "$APP/Contents/Resources/AppIcon.icns"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -58,6 +66,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleDisplayName</key><string>Prospero</string>
   <key>CFBundleIdentifier</key><string>com.linn0x.prospero.shell</string>
   <key>CFBundleExecutable</key><string>ProsperoShell</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundleIconName</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.0.13</string>
   <key>CFBundleVersion</key><string>13</string>
