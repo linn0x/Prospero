@@ -965,7 +965,9 @@ describe("gc 周期性自动回收", () => {
       cloneIgnored: false,
     });
 
-    const child = spawn("cmd.exe", ["/c", "ping -n 31 127.0.0.1 >NUL"], {
+    // 直接起 node,不经 cmd.exe:套一层 shell 的话 child.kill() 只杀得掉 shell,
+    // 真正把 cwd 钉住的孙进程会活下来,后半段"释放后应报空闲"就永远等不到。
+    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 31000)"], {
       cwd: created.path,
       stdio: "ignore",
     });
