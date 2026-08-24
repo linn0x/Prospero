@@ -416,6 +416,9 @@ struct LocalSessionWorkspace: View {
   let session: RunningStatus.Session
   let interrupt: () -> Void
   let kill: () -> Void
+  /// 只有以 sheet 弹出时(账号登录终端)才给:sheet 没有标题栏关闭键,而 PTY 会话里
+  /// Esc 属于 Agent 的 TUI,不能拿去当取消键 —— 于是必须留一个显式的出口。
+  var close: (() -> Void)? = nil
 
   @State private var timeline = ChatTimeline()
   /// 终端帧走旁路,不做 @State:见 TerminalFrameStream 的说明。
@@ -541,6 +544,10 @@ struct LocalSessionWorkspace: View {
       }
       .menuStyle(.borderlessButton)
       .fixedSize()
+      if let close {
+        Button("完成", action: close)
+          .buttonStyle(.borderedProminent)
+      }
     }
     .padding(.horizontal, 18)
     .padding(.vertical, 12)

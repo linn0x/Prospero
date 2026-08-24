@@ -367,7 +367,16 @@ struct AgentAccountsDashboard: View {
           daemon: daemon,
           session: session,
           interrupt: { Task { _ = await daemon.controlSession(id: session.id, action: .interrupt) } },
-          kill: { Task { _ = await daemon.controlSession(id: session.id, action: .kill) } }
+          // 会话都结束了,再留着这张 sheet 就只剩一块死终端。
+          kill: {
+            loginSession = nil
+            Task { _ = await daemon.controlSession(id: session.id, action: .kill) }
+          },
+          close: {
+            loginSession = nil
+            // 是否登录成功只有 daemon 说了算,关掉终端后重读一次列表才会翻成"已登录"。
+            Task { await model.refresh() }
+          }
         )
         .frame(minWidth: 900, minHeight: 620)
       }
