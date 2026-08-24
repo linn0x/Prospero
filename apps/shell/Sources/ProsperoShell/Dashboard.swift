@@ -63,6 +63,12 @@ struct ProsperoDashboard: View {
   @State private var sessionLaunchAgent: String?
   @State private var selectedProjectPath: String?
   @State private var selectedSessionID: String?
+  @AppStorage("focusTerminal") private var focusTerminal = false
+  @State private var columnVisibility: NavigationSplitViewVisibility = .all
+
+  /// 专注只对「项目」页有意义。翻到设置页时导航栏必须回来 ——
+  /// 否则那页上没有任何能退出专注的入口,用户就被关在里面了。
+  private var focusApplies: Bool { focusTerminal && selection == .sessions }
 
   private var suggestedSessionDirectory: String {
     sessionLaunchDirectory
@@ -72,7 +78,7 @@ struct ProsperoDashboard: View {
   }
 
   var body: some View {
-    NavigationSplitView {
+    NavigationSplitView(columnVisibility: $columnVisibility) {
       List(DashboardPage.allCases, selection: $selection) { page in
         Label(page.title, systemImage: page.symbol)
           .tag(page)
@@ -113,6 +119,20 @@ struct ProsperoDashboard: View {
       .toolbar {
         ToolbarItemGroup(placement: .primaryAction) {
           DaemonStatusPill(daemon: daemon)
+          if selection == .sessions {
+            Button {
+              withAnimation(.easeInOut(duration: 0.18)) { focusTerminal.toggle() }
+            } label: {
+              Label(
+                "专注模式",
+                systemImage: focusTerminal
+                  ? "rectangle.inset.filled.and.person.filled"
+                  : "rectangle.inset.filled"
+              )
+            }
+            .keyboardShortcut("f", modifiers: [.command, .shift])
+            .help(focusTerminal ? "退出专注模式(⇧⌘F)" : "专注模式:只留终端(⇧⌘F)")
+          }
           Button {
             presentSessionLauncher(selectedProjectPath)
           } label: {
@@ -127,6 +147,12 @@ struct ProsperoDashboard: View {
           }
           .disabled(daemon.state == .starting)
         }
+      }
+    }
+    .onAppear { columnVisibility = focusApplies ? .detailOnly : .all }
+    .onChange(of: focusApplies) { _, focused in
+      withAnimation(.easeInOut(duration: 0.18)) {
+        columnVisibility = focused ? .detailOnly : .all
       }
     }
     .sheet(isPresented: $showingSessionLauncher, onDismiss: {
@@ -446,6 +472,8 @@ private struct SessionsDashboard: View {
   /// 而拖拽每帧都触发 onChanged —— 拖一次侧栏就是上百次写盘 + 上百次视图失效。
   /// 拖动时只更新这个 @State,松手后才持久化。
   @State private var liveSidebarWidth: CGFloat?
+  /// 与 LocalSessionWorkspace 头部、以及工具栏那颗按钮共用同一个键。
+  @AppStorage("focusTerminal") private var focusTerminal = false
 
   private static let projectSidebarMinWidth: CGFloat = 270
   private static let projectSidebarMaxWidth: CGFloat = 480
@@ -487,22 +515,27 @@ private struct SessionsDashboard: View {
     return GeometryReader { proxy in
       let sidebarWidth = projectSidebarWidth(for: proxy.size.width)
       HStack(spacing: 0) {
-        ProjectSessionSidebar(
-          projects: summaries,
-          selectedProjectPath: $selectedProjectPath,
-          selectedSessionID: $selectedSessionID,
-          expandedProjectPaths: $expandedProjectPaths,
-          addProject: chooseProject,
-          newSession: { newSession($0.path) },
-          removeProject: removeProject
-        )
-        .frame(width: sidebarWidth)
+        // 专注模式:项目/会话栏整条让位,窗口只剩终端。
+        if !focusTerminal {
+          ProjectSessionSidebar(
+            projects: summaries,
+            selectedProjectPath: $selectedProjectPath,
+            selectedSessionID: $selectedSessionID,
+            expandedProjectPaths: $expandedProjectPaths,
+            addProject: chooseProject,
+            newSession: { newSession($0.path) },
+            removeProject: removeProject
+          )
+          .frame(width: sidebarWidth)
+          .transition(.move(edge: .leading).combined(with: .opacity))
 
-        sidebarDivider(availableWidth: proxy.size.width, displayedWidth: sidebarWidth)
+          sidebarDivider(availableWidth: proxy.size.width, displayedWidth: sidebarWidth)
+        }
 
         workspace(project: currentProject, session: currentSession)
           .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
       }
+      .clipped()
     }
     .navigationTitle("项目与会话")
     .onAppear {
