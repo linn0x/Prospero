@@ -167,8 +167,46 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  windows-shell:
+    name: Windows desktop shell
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci
+      - run: npm run build --workspace=@prospero/daemon
+      - name: Build native Windows desktop UI
+        run: ./apps/windows-shell/build.ps1 -Configuration Release
+      - name: Construct all desktop pages and verify runtime discovery
+        run: |
+          $process = Start-Process -FilePath ./apps/windows-shell/bin/Release/ProsperoShell.exe -ArgumentList '--smoke-test' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Windows shell smoke test failed with exit code $($process.ExitCode)" }
+      - name: Start and stop a real daemon from the desktop controller
+        run: |
+          $smokeHome = Join-Path $env:RUNNER_TEMP 'prospero-windows-shell-smoke'
+          New-Item -ItemType Directory -Path $smokeHome -Force | Out-Null
+          try {
+            $env:PROSPERO_HOME = $smokeHome
+            $process = Start-Process -FilePath ./apps/windows-shell/bin/Release/ProsperoShell.exe -ArgumentList '--daemon-smoke-test' -Wait -PassThru
+            if ($process.ExitCode -ne 0) {
+              Get-Content -LiteralPath (Join-Path $smokeHome 'daemon-smoke-error.txt') -ErrorAction SilentlyContinue
+              Get-Content -LiteralPath (Join-Path $smokeHome 'windows-shell.log') -ErrorAction SilentlyContinue
+              throw "Windows shell daemon smoke test failed with exit code $($process.ExitCode)"
+            }
+          } finally {
+            Remove-Item Env:\PROSPERO_HOME -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $smokeHome -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
   release-stage:
-    name: Sign and package Windows native release artifacts
+    name: Sign and package Windows release artifacts
     if: startsWith(github.ref, 'refs/tags/v')
     needs: windows-native
     runs-on: windows-latest
@@ -188,6 +226,8 @@ jobs:
           cache-dependency-path: package-lock.json
       - run: npm ci
       - run: npm run build --workspace=@prospero/windows-native
+      - name: Build Windows desktop shell for release
+        run: ./apps/windows-shell/build.ps1 -Configuration Release
       - uses: actions/download-artifact@v5
         with:
           name: windows-native-unsigned-x64
@@ -219,8 +259,10 @@ jobs:
           $certificatePath = Join-Path $env:RUNNER_TEMP 'prospero-release-signing.pfx'
           try {
             [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:WINDOWS_AUTHENTICODE_PFX_BASE64))
-            $artifacts = @(Get-ChildItem 'packages/windows-native/prebuilds/win32-*/prospero_windows_native.node')
-            if ($artifacts.Count -ne 2) { throw "Expected exactly two Windows native artifacts, found $($artifacts.Count)" }
+            $artifacts = @((Get-ChildItem 'packages/windows-native/prebuilds/win32-*/prospero_windows_native.node')) + @(
+              Get-Item 'apps/windows-shell/bin/Release/ProsperoShell.exe'
+            )
+            if ($artifacts.Count -ne 3) { throw "Expected two Windows native artifacts and one desktop executable, found $($artifacts.Count)" }
             $expectedThumbprint = $env:WINDOWS_AUTHENTICODE_THUMBPRINT_SHA1.ToUpperInvariant()
             $artifacts | ForEach-Object {
               & $signTool sign /fd SHA256 /f $certificatePath /p $env:WINDOWS_AUTHENTICODE_PFX_PASSWORD /tr $env:WINDOWS_AUTHENTICODE_TIMESTAMP_URL /td SHA256 $_.FullName
@@ -252,6 +294,9 @@ jobs:
       - uses: actions/attest-build-provenance@v2
         with:
           subject-path: ${{ runner.temp }}/release-packages/*.tgz
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: apps/windows-shell/bin/Release/ProsperoShell.exe
       - uses: actions/upload-artifact@v4
         with:
           name: windows-native-signed-x64
@@ -266,6 +311,13 @@ jobs:
         with:
           name: prospero-release-packages
           path: ${{ runner.temp }}/release-packages
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prospero-windows-shell
+          path: |
+            apps/windows-shell/bin/Release/ProsperoShell.exe
+            apps/windows-shell/bin/Release/ProsperoShell.exe.config
           if-no-files-found: error
 
   release-signed-load:

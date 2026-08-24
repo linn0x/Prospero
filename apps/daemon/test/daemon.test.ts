@@ -1047,11 +1047,17 @@ describe("daemon 全链路", () => {
     // 不创建会话也要按账号返回来源；Codex 新版可直接读取账号级限流窗口，
     // 旧 CLI 则保留 available=false 和明确原因。
     expect(u.sid).toBeUndefined();
-    expect(u.accounts?.map((account) => account.accountId)).toEqual(
-      expect.arrayContaining(["native-claude", "native-codex"]),
-    );
-    expect(u.accounts?.find((account) => account.accountId === "native-codex")?.source)
-      .toMatch(/subscription|api|unknown/);
+    // 账号列表依赖本机装了哪些 CLI：usage.get 会滤掉 status === "unavailable"
+    // 的 agent（未安装的 CLI 没有额度可展示）。CI runner 上 claude/codex 都不装，
+    // 这里就是空列表，所以不能断言"两个 native 账号一定在"——那只在开发机成立。
+    // 能跨环境成立的契约是：应答里只出现真正可用的账号，且每个都自带来源。
+    const accountIds = u.accounts?.map((account) => account.accountId) ?? [];
+    expect(new Set(accountIds).size).toBe(accountIds.length);
+    for (const account of u.accounts ?? []) {
+      expect(account.source).toMatch(/subscription|api|unknown/);
+      // available=false 必须给出原因，否则手机端卡片会静默空着。
+      if (!account.available) expect(account.reason).toBeTruthy();
+    }
     c.close();
   }, 20000);
 });

@@ -187,6 +187,18 @@ describe("Mac control session views", () => {
           : "sleep 30",
       });
       const ptyViewPath = `/_prospero/control/session/${pty.id}/view`;
+      const terminal = server.manager.requirePty(pty.id);
+      // ConPTY 自己会在启动时写入 win32-input-mode / focus-tracking 之类的模式
+      // 序列(ESC[?9001h、ESC[?1004h),这些字节同样要占掉 ring 的序号。若在它们
+      // 落地之前取快照，下面“delta 只应包含刚 push 的字节”的断言就会连带收到
+      // 它们，Windows 上因此长期失败。ping 的输出重定向到 NUL，所以启动序列写完
+      // PTY 就彻底安静；等 lastSeq 稳定下来再取快照，整条 delta 链才是确定的。
+      for (let quiet = 0, seen = terminal.ring.lastSeq, deadline = Date.now() + 5_000;
+        quiet < 3 && Date.now() < deadline;) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        if (terminal.ring.lastSeq === seen) quiet++;
+        else { quiet = 0; seen = terminal.ring.lastSeq; }
+      }
       const ptyView = await request(`${ptyViewPath}?afterSeq=not-a-sequence`);
       expect(ptyView.status).toBe(200);
       const ptySnapshot = await ptyView.json() as { kind: string; seq: number };
@@ -195,7 +207,6 @@ describe("Mac control session views", () => {
       expect((await request(`${ptyViewPath}?outputAfterSeq=nope`)).status).toBe(400);
       expect((await request(`${ptyViewPath}?outputAfterSeq=0&waitMs=25001`)).status).toBe(400);
 
-      const terminal = server.manager.requirePty(pty.id);
       const firstBytes = new TextEncoder().encode("first-delta");
       const firstSeq = terminal.ring.push(firstBytes);
       const firstDeltaResponse = await request(
@@ -234,7 +245,11 @@ describe("Mac control session views", () => {
       expect(await repaired.json()).toMatchObject({ kind: "pty", mode: "snapshot", seq: secondSeq });
     } finally {
       await server?.close();
-      rmSync(home, { recursive: true, force: true });
+      // PtySession.dispose() 是同步的：proc.kill() 之后并不等子进程真正退出。
+      // 这个用例的 PTY 又把 cwd 设在 home 上，而 Windows 会锁住任何进程的 cwd
+      // 目录（POSIX 允许直接 unlink），于是 rmdir 撞上 EBUSY。重试等内核把已被
+      // kill 的进程回收完，避免清理时序把用例判负。
+      rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
     }
   });
 });
