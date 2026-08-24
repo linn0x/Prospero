@@ -188,7 +188,7 @@ export async function runPtySupervisor(): Promise<void> {
           updateManifest(config, { ownerState: "failed", status: "died" });
         }
       }
-      session.dispose();
+      await session.dispose();
       removeSocketDirectory(config);
     })();
     void closePromise.finally(() => process.exit(0));

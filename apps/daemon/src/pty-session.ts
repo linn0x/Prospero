@@ -34,6 +34,8 @@ const SCROLLBACK_LINES = 2000;
 const RING_BYTES = 1024 * 1024;
 const INPUT_CHUNK = 1024; // >1KB 粘贴经 PTY 有死锁报告,分片写入
 const KILL_ESCALATION_MS = 500;
+// 要盖过 SIGKILL 升级,否则 dispose 会在升级生效前就放弃等待。
+const DISPOSE_EXIT_TIMEOUT_MS = 2_000;
 
 export interface PtySessionOptions {
   id: string;
@@ -78,6 +80,9 @@ export class PtySession extends EventEmitter<PtySessionEvents> {
   private rows: number;
   private status: SessionStatus = "starting";
   private exited = false;
+  /** onExit 落地时 resolve;dispose() 借它等子进程真正退出而不是只发完信号。 */
+  private resolveExit!: () => void;
+  private readonly exitPromise = new Promise<void>((resolve) => { this.resolveExit = resolve; });
 
   private readonly proc: IPty;
   private readonly term: HeadlessTerminal;
@@ -125,6 +130,7 @@ export class PtySession extends EventEmitter<PtySessionEvents> {
       this.flushNow();
       this.exited = true;
       this.setStatus(exitCode === 0 ? "done" : "died");
+      this.resolveExit();
     });
   }
 
@@ -251,10 +257,34 @@ export class PtySession extends EventEmitter<PtySessionEvents> {
     this.proc.kill();
   }
 
-  dispose(): void {
+  /**
+   * kill() 只负责发信号。调用方(daemon 退出、gc、测试清理)拿到 dispose 的
+   * 返回往往紧接着就要删这个会话的工作目录,而 Windows 会锁住任何进程的 cwd,
+   * 子进程尚未落地就删会撞 EBUSY。因此这里等它真正退出,并给一个上限:超时
+   * 不抛错,POSIX 侧的 SIGKILL 升级(KILL_ESCALATION_MS)会继续收尾,dispose
+   * 不该因为一个赖着不走的子进程而永久挂住。
+   */
+  async dispose(): Promise<void> {
     this.kill();
+    await this.waitForExit();
     this.term.dispose();
     this.removeAllListeners();
+  }
+
+  private async waitForExit(): Promise<void> {
+    if (this.exited) return;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        this.exitPromise,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, DISPOSE_EXIT_TIMEOUT_MS);
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   /**

@@ -1252,7 +1252,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     const pty = this.requirePty(sid);
     const info = pty.info();
     if (pty instanceof RemotePtySession || pty instanceof RemoteWindowsPtySession) await pty.kill();
-    else pty.dispose();
+    else await pty.dispose();
     // tmux 下 dispose 只是断开 client,进程还在 server 里活着 —— kill 得说到做到
     if (this.tmuxEnabled) tmux.killSession(sid);
     this.ptySessions.delete(sid);
