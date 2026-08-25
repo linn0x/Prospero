@@ -515,7 +515,9 @@ SwiftPM 可执行目标 `ProsperoShell`（macOS 14+，Swift 6）。**存在的�
   与手机保持相同的默认值和 YOLO 二次确认。CLI 终端首次快照后走有序增量长轮询，输入按原始字节有序合并发送；
   xterm 字号就绪后会按 Mac 窗口实时 fit，不再固定在创建时的 120×40。Mac WKWebView 对 `⌘C/⌘V/⌘A/⌘K`、
   `⌘←/⌘→/⌘⌫` 提供原生兜底，Option 作为 zsh Meta 键（`⌥←/⌥→` 按词移动）；Tokyo Night truecolor、
-  OSC 52、选择/粘贴反馈与 visual bell 均由共享终端页渲染。
+  OSC 52、选择/粘贴反馈与 visual bell 均由共享终端页渲染。“设置 → 外观”可打开 macOS 原生字体面板，
+  等宽字体族和字号以单条 `terminalFontPreference` 写入 UserDefaults，并热更新所有终端；共享页面等待本机字体加载后
+  再 fit，避免 Nerd Font 与 fallback 字宽不同造成 tmux 网格错位。
 - `Bonjour`：`NetService` 发布 `_prospero._tcp`（广播从 daemon 挪到壳，TCC 归属 .app）。
 - `LoginItem`：`SMAppService.mainApp` 开机自启。
 - `scripts/build-app.sh`：`swift build -c release` → 组装 `.app`（Info.plist 写 bundle id 与 Bonjour/本地网络描述）→
