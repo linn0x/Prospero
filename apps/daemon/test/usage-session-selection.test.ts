@@ -1,11 +1,13 @@
 import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { SessionManager } from "../src/session-manager.js";
 
 const homes: string[] = [];
 
 function home(): string {
-  const value = mkdtempSync("/tmp/p-usage-sel-");
+  const value = mkdtempSync(join(tmpdir(), "p-usage-sel-"));
   homes.push(value);
   return value;
 }
