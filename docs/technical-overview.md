@@ -341,10 +341,12 @@ JSON-RPC callback。单元测试覆盖三类 v2、两个 legacy callback 与 `on
   无原生 Skill input 的 agent 注入完整 SKILL.md。
 - **`local-conversations.ts`**：codex 走 app-server `thread/search`；claude 走 `CLAUDE_CONFIG_DIR` 下 jsonl 或 SDK `listSessions`。
 - **`host-stats.ts`**：darwin 用 `sw_vers` 取人读系统名、`vm_stat` 算可用内存（对齐活动监视器）。
-- **`tmux.ts`**：`new-session -A` 托管（存在即 attach）；环境显式 `-e` 带入；server 声明 `tmux-256color/RGB`
+- **`tmux.ts`**：`new-session -A` 托管（存在即 attach）；环境显式 `-e` 带入；pane 启动边界清除 daemon/tmux
+  长驻环境继承来的 `NO_COLOR` / `FORCE_COLOR=0`，并声明 `COLORTERM=truecolor`；server 声明 `tmux-256color/RGB`
   （缺少对应 terminfo 时回退 `screen-256color`），
   `status/prefix/mouse/history/window-size` 只定向设置 Prospero session（不污染用户其他 tmux 会话）；`mouse on` 把
-  alternate-screen 的滚轮交给 tmux copy-mode，从而访问 10000 行历史（Mac 用 Option + 拖动选择文本）；未装时静默回退直接 spawn。
+  alternate-screen 的滚轮交给 tmux copy-mode，从而访问 10000 行历史（Mac 用 Option + 拖动选择文本，OSC 52 接入
+  系统剪贴板）；未装时静默回退直接 spawn。
 
 ---
 
@@ -511,7 +513,9 @@ SwiftPM 可执行目标 `ProsperoShell`（macOS 14+，Swift 6）。**存在的�
 - `Pairing`：调 `prosperod pair` 铸设备，CoreImage 渲染 QR（凭证只显示不落盘）。
 - `Dashboard`：本机新建器可选结构化 ChatUI 或原生 CLI；结构化会话在创建前选择 `strict / standard / yolo`，
   与手机保持相同的默认值和 YOLO 二次确认。CLI 终端首次快照后走有序增量长轮询，输入按原始字节有序合并发送；
-  xterm 字号就绪后会按 Mac 窗口实时 fit，不再固定在创建时的 120×40。
+  xterm 字号就绪后会按 Mac 窗口实时 fit，不再固定在创建时的 120×40。Mac WKWebView 对 `⌘C/⌘V/⌘A/⌘K`、
+  `⌘←/⌘→/⌘⌫` 提供原生兜底，Option 作为 zsh Meta 键（`⌥←/⌥→` 按词移动）；Tokyo Night truecolor、
+  OSC 52、选择/粘贴反馈与 visual bell 均由共享终端页渲染。
 - `Bonjour`：`NetService` 发布 `_prospero._tcp`（广播从 daemon 挪到壳，TCC 归属 .app）。
 - `LoginItem`：`SMAppService.mainApp` 开机自启。
 - `scripts/build-app.sh`：`swift build -c release` → 组装 `.app`（Info.plist 写 bundle id 与 Bonjour/本地网络描述）→

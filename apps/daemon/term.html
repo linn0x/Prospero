@@ -6,13 +6,95 @@
 <title>Prospero Terminal</title>
 <link rel="stylesheet" href="/assets/xterm.css" />
 <style>
-  html, body { margin: 0; padding: 0; height: 100%; background: #1a1b26; overflow: hidden; }
-  #term { height: 100%; width: 100%; padding: 6px 2px 6px 8px; box-sizing: border-box; }
-  .xterm .xterm-viewport { overflow-y: auto !important; -webkit-overflow-scrolling: touch; }
+  :root {
+    color-scheme: dark;
+    --term-bg: #1a1b26;
+    --term-surface: #1f2130;
+    --term-blue: #7aa2f7;
+    --term-cyan: #7dcfff;
+    --term-fg: #c0caf5;
+  }
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: var(--term-bg);
+    overflow: hidden;
+  }
+  body { position: relative; }
+  body::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: 4;
+    pointer-events: none;
+    box-shadow:
+      inset 0 1px rgba(125, 207, 255, 0.06),
+      inset 12px 0 28px -24px rgba(122, 162, 247, 0.4);
+  }
+  #term {
+    height: 100%;
+    width: 100%;
+    padding: 8px 3px 8px 10px;
+    box-sizing: border-box;
+  }
+  .xterm .xterm-viewport {
+    overflow-y: auto !important;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-color: rgba(122, 162, 247, 0.34) transparent;
+  }
+  .xterm .xterm-viewport::-webkit-scrollbar { width: 9px; }
+  .xterm .xterm-viewport::-webkit-scrollbar-track { background: transparent; }
+  .xterm .xterm-viewport::-webkit-scrollbar-thumb {
+    background: rgba(122, 162, 247, 0.25);
+    border: 3px solid var(--term-bg);
+    border-radius: 999px;
+  }
+  .xterm .xterm-viewport::-webkit-scrollbar-thumb:hover {
+    background: rgba(125, 207, 255, 0.48);
+  }
+  #terminal-toast {
+    position: absolute;
+    right: 14px;
+    bottom: 13px;
+    z-index: 8;
+    max-width: min(320px, calc(100vw - 28px));
+    padding: 6px 10px;
+    border: 1px solid rgba(122, 162, 247, 0.28);
+    border-radius: 7px;
+    background: rgba(31, 33, 48, 0.94);
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28);
+    color: var(--term-fg);
+    font: 11px ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+    opacity: 0;
+    transform: translateY(5px) scale(0.98);
+    transition: opacity 120ms ease, transform 120ms ease;
+    pointer-events: none;
+  }
+  #terminal-toast.visible {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  body.visual-bell::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: 7;
+    pointer-events: none;
+    border: 1px solid rgba(125, 207, 255, 0.72);
+    box-shadow: inset 0 0 26px rgba(122, 162, 247, 0.16);
+    animation: terminal-bell 150ms ease-out;
+  }
+  @keyframes terminal-bell { from { opacity: 1; } to { opacity: 0; } }
+  @media (prefers-reduced-motion: reduce) {
+    #terminal-toast { transition: none; }
+    body.visual-bell::after { animation: none; opacity: 0; }
+  }
 </style>
 </head>
 <body>
 <div id="term"></div>
+<div id="terminal-toast" role="status" aria-live="polite"></div>
 <script src="/assets/xterm.js"></script>
 <script src="/assets/fit.js"></script>
 <script src="/assets/webgl.js"></script>
@@ -22,8 +104,10 @@
   const term = new window.Terminal({
     scrollback: 3000,
     fontSize: 12,
-    fontFamily: "Menlo, Monaco, monospace",
-    lineHeight: 1.12,
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, monospace",
+    fontWeight: "400",
+    fontWeightBold: "600",
+    lineHeight: 1.16,
     letterSpacing: 0.1,
     minimumContrastRatio: 4.5,
     // Tokyo Night —— 与 iTerm2 默认 profile 的深色配色逐值一致,
@@ -34,6 +118,10 @@
       cursor: "#c0caf5",
       cursorAccent: "#1a1b26",
       selectionBackground: "#283457",
+      selectionInactiveBackground: "#242b49",
+      scrollbarSliderBackground: "#7aa2f733",
+      scrollbarSliderHoverBackground: "#7dcfff66",
+      scrollbarSliderActiveBackground: "#7dcfff88",
       black: "#15161e",
       brightBlack: "#414868",
       red: "#f7768e",
@@ -54,7 +142,17 @@
     allowProposedApi: true,
     cursorBlink: true,
     cursorStyle: "bar",
+    cursorWidth: 2,
     cursorInactiveStyle: "outline",
+    customGlyphs: true,
+    drawBoldTextInBrightColors: true,
+    rescaleOverlappingGlyphs: true,
+    smoothScrollDuration: 80,
+    fastScrollSensitivity: 4,
+    macOptionIsMeta: true,
+    macOptionClickForcesSelection: true,
+    altClickMovesCursor: false,
+    rightClickSelectsWord: true,
     scrollOnUserInput: true,
   });
   const fit = new window.FitAddon.FitAddon();
@@ -72,6 +170,7 @@
   }
 
   const te = new TextEncoder();
+  const td = new TextDecoder();
   function bytesToB64(bytes) {
     let bin = "";
     for (let i = 0; i < bytes.length; i += 0x8000) {
@@ -85,6 +184,108 @@
     for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
     return out;
   }
+
+  let toastTimer = null;
+  function showToast(message) {
+    const toast = document.getElementById("terminal-toast");
+    if (!toast || !message) return;
+    toast.textContent = message;
+    toast.classList.add("visible");
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => toast.classList.remove("visible"), 1250);
+  }
+
+  function sendInputText(text) {
+    if (replaying || !text) return;
+    post({ kind: "input", data: bytesToB64(te.encode(text)) });
+  }
+
+  // Keep macOS editing muscle memory while sending the actual zsh control
+  // sequences through the PTY. Ctrl shortcuts remain untouched for TUIs.
+  term.attachCustomKeyEventHandler((event) => {
+    if (event.type !== "keydown") return true;
+    const key = event.key.toLowerCase();
+    if (event.metaKey && !event.ctrlKey && !event.altKey) {
+      if (key === "c") {
+        if (term.hasSelection()) {
+          post({ kind: "clipboardCopy", text: term.getSelection() });
+        } else {
+          showToast("按住 ⌥ 拖动选择文本");
+        }
+        return false;
+      }
+      if (key === "v") {
+        post({ kind: "clipboardPaste" });
+        return false;
+      }
+      if (key === "a") {
+        term.selectAll();
+        showToast("已选择终端内容");
+        return false;
+      }
+      if (key === "k") {
+        term.clear();
+        sendInputText("\x0c");
+        showToast("已清屏");
+        return false;
+      }
+      if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+        sendInputText("\x01"); // zsh beginning-of-line
+        return false;
+      }
+      if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+        sendInputText("\x05"); // zsh end-of-line
+        return false;
+      }
+      if (event.key === "Backspace") {
+        sendInputText("\x15"); // zsh backward-kill-line
+        return false;
+      }
+      if (event.key === "Delete") {
+        sendInputText("\x0b"); // zsh kill-line
+        return false;
+      }
+    }
+    if (event.altKey && !event.metaKey && !event.ctrlKey) {
+      if (event.key === "ArrowLeft") {
+        sendInputText("\x1bb"); // zsh backward-word
+        return false;
+      }
+      if (event.key === "ArrowRight") {
+        sendInputText("\x1bf"); // zsh forward-word
+        return false;
+      }
+    }
+    if (event.shiftKey && event.key === "Insert") {
+      post({ kind: "clipboardPaste" });
+      return false;
+    }
+    return true;
+  });
+
+  // tmux copy-mode and modern CLIs use OSC 52 for the host clipboard. xterm
+  // intentionally leaves the OS integration to its embedder, so bridge writes
+  // to AppKit but never answer clipboard-read queries from terminal programs.
+  term.parser.registerOscHandler(52, (data) => {
+    const separator = data.indexOf(";");
+    if (separator < 0) return false;
+    const payload = data.slice(separator + 1);
+    if (payload === "?" || payload.length > 8 * 1024 * 1024) return true;
+    try {
+      post({ kind: "clipboardCopy", text: td.decode(b64ToBytes(payload)) });
+    } catch (_) {
+      showToast("无法读取终端剪贴板内容");
+    }
+    return true;
+  });
+
+  term.onBell(() => {
+    document.body.classList.remove("visual-bell");
+    // Force a style flush so repeated bells restart the short pulse.
+    void document.body.offsetWidth;
+    document.body.classList.add("visual-bell");
+    setTimeout(() => document.body.classList.remove("visual-bell"), 170);
+  });
 
   /**
    * 写快照期间屏蔽上行输入。
@@ -165,6 +366,14 @@
       term.blur();
     } else if (m.kind === "scrollBottom") {
       term.scrollToBottom();
+    } else if (m.kind === "paste") {
+      if (typeof m.text === "string" && m.text.length > 0) term.paste(m.text);
+    } else if (m.kind === "selectAll") {
+      term.selectAll();
+    } else if (m.kind === "clear") {
+      term.clear();
+    } else if (m.kind === "toast") {
+      showToast(m.text);
     }
   }
 

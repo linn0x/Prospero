@@ -164,16 +164,31 @@ export function defaultKindFor(agent: AgentKind): "pty" | "structured" {
 }
 
 /**
- * 新会话的基础环境；编排层可补入会话身份和控制 socket 信息。
- * 覆盖项放最后，确保每个 worker 都带自己的 PROSPERO_SESSION_ID。
+ * 新交互式 PTY 的基础环境。
+ *
+ * daemon 可能由另一个无色输出的工具启动（Codex 自己就是一个常见来源），
+ * 因而会继承 `NO_COLOR=1`。把这个环境原样交给真正的终端，会让 Codex、Git
+ * 和 zsh 主题误以为用户明确要求黑白输出。PTY 本身就是 TTY，所以在这里恢复
+ * 终端能力是安全的；结构化/后台进程不走这条路径，仍保留宿主环境。
  */
 export function spawnEnv(overrides: Record<string, string> = {}): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (v !== undefined) env[k] = v;
   }
+  Object.assign(env, overrides);
+
+  // `NO_COLOR` 只看变量是否存在，空字符串也会禁色。FORCE_COLOR=0 是 Node
+  // 生态里等价的显式禁色；交互终端恢复为自动探测，而不是反向强制所有管道着色。
+  delete env["NO_COLOR"];
+  if (env["FORCE_COLOR"] === "0") delete env["FORCE_COLOR"];
+
+  // 这些值描述 Prospero 外层 xterm 的真实能力。放在 overrides 之后，避免账号
+  // profile 或 daemon 启动环境把一个可显示 truecolor 的 PTY 降成 dumb/no-color。
   env["TERM"] = "xterm-256color";
   env["COLORTERM"] = "truecolor";
+  env["CLICOLOR"] = "1";
+  env["TERM_PROGRAM"] = "Prospero";
   env["LANG"] = env["LANG"] ?? "en_US.UTF-8";
-  return { ...env, ...overrides };
+  return env;
 }
