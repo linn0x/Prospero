@@ -762,6 +762,10 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   ): Promise<SessionInfo> {
     const base = spec ?? noopCommand();
     const sessionEnv = { ...(account?.environment ?? {}), ...this.sessionEnv(id) };
+    const ptyEnv = spawnEnv(sessionEnv);
+    const tmuxSessionEnv = { ...sessionEnv };
+    delete tmuxSessionEnv["NO_COLOR"];
+    if (tmuxSessionEnv["FORCE_COLOR"] === "0") delete tmuxSessionEnv["FORCE_COLOR"];
     const launch =
       this.tmuxBin && this.tmuxConfigFile
         ? tmux.wrapSpawn(base, {
@@ -771,7 +775,15 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
             rows,
             configFile: this.tmuxConfigFile,
             tmux: this.tmuxBin,
-            environment: sessionEnv,
+            // tmux servers are long-lived and do not reliably refresh these
+            // variables from attaching clients. Set the session copy as well
+            // as sanitizing the initial pane command in wrapSpawn().
+            environment: {
+              ...tmuxSessionEnv,
+              COLORTERM: ptyEnv["COLORTERM"]!,
+              CLICOLOR: ptyEnv["CLICOLOR"]!,
+              TERM_PROGRAM: ptyEnv["TERM_PROGRAM"]!,
+            },
           })
         : base;
     let session: PtySession | RemotePtySession | RemoteWindowsPtySession;
@@ -780,7 +792,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
         id, agent, title, cwd, cols, rows,
         file: launch.file,
         args: launch.args,
-        env: spawnEnv(sessionEnv),
+        env: ptyEnv,
         ...(account ? { accountId: account.id, accountName: account.name } : {}),
       };
       if (this.useWindowsPtySessionHost && this.windowsPtySessionHostRoot) {

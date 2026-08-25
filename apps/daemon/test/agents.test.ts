@@ -5,6 +5,7 @@ import {
   noopCommand,
   programCommandFor,
   shellFor,
+  spawnEnv,
 } from "../src/agents.js";
 
 function decodedWindowsArgv(spec: { file: string; args: string[] }): string[] {
@@ -107,5 +108,31 @@ describe("PTY agent startup commands", () => {
 
   it("has a portable no-op command for PTY attach fallbacks", () => {
     expect(noopCommand()).toEqual({ file: process.execPath, args: ["-e", ""] });
+  });
+
+  it("advertises truecolor and removes inherited no-color flags for interactive PTYs", () => {
+    const previousNoColor = process.env["NO_COLOR"];
+    const previousForceColor = process.env["FORCE_COLOR"];
+    try {
+      process.env["NO_COLOR"] = "1";
+      process.env["FORCE_COLOR"] = "0";
+      const env = spawnEnv({
+        TERM: "dumb",
+        COLORTERM: "",
+        CLICOLOR: "0",
+        TERM_PROGRAM: "unknown",
+      });
+      expect(env["NO_COLOR"]).toBeUndefined();
+      expect(env["FORCE_COLOR"]).toBeUndefined();
+      expect(env["TERM"]).toBe("xterm-256color");
+      expect(env["COLORTERM"]).toBe("truecolor");
+      expect(env["CLICOLOR"]).toBe("1");
+      expect(env["TERM_PROGRAM"]).toBe("Prospero");
+    } finally {
+      if (previousNoColor === undefined) delete process.env["NO_COLOR"];
+      else process.env["NO_COLOR"] = previousNoColor;
+      if (previousForceColor === undefined) delete process.env["FORCE_COLOR"];
+      else process.env["FORCE_COLOR"] = previousForceColor;
+    }
   });
 });

@@ -350,7 +350,7 @@ struct LocalSessionWorkspace: View {
             .foregroundStyle(terminalMode ? TerminalPalette.foreground : .primary)
           if terminalMode {
             TerminalBadge(text: "tmux", tint: TerminalPalette.green)
-              .help("会话进程托管在 tmux,daemon 重启也不会断;滚轮进入历史,q 返回;Option + 拖动选择文本")
+              .help("zsh 终端：⌘C/⌘V 复制粘贴，⌥←/⌥→ 按词移动；滚轮进入 tmux 历史，q 返回；⌥ 拖动直接选择")
           } else {
             Text("Chat")
               .font(.caption2.weight(.medium))
@@ -1013,6 +1013,54 @@ protocol TerminalFrameSink: AnyObject {
   func push(_ frame: TerminalRenderFrame)
 }
 
+enum MacTerminalShortcut: Equatable {
+  case copy
+  case paste
+  case selectAll
+  case clear
+  case beginningOfLine
+  case endOfLine
+  case deleteToBeginning
+  case deleteToEnd
+
+  init?(event: NSEvent) {
+    guard event.type == .keyDown else { return nil }
+    let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+    guard modifiers == .command else { return nil }
+    switch event.keyCode {
+    case 123, 126: self = .beginningOfLine // ⌘← / ⌘↑
+    case 124, 125: self = .endOfLine       // ⌘→ / ⌘↓
+    case 51: self = .deleteToBeginning    // ⌘⌫
+    case 117: self = .deleteToEnd         // ⌘⌦
+    default:
+      switch event.charactersIgnoringModifiers?.lowercased() {
+      case "c": self = .copy
+      case "v": self = .paste
+      case "a": self = .selectAll
+      case "k": self = .clear
+      default: return nil
+      }
+    }
+  }
+}
+
+/// WKWebView normally forwards pasteboard key equivalents through its hidden
+/// editor view, but that route is unreliable once xterm owns focus. Intercept
+/// only the standard terminal commands; every Ctrl/Option/TUI key still goes
+/// through xterm and the PTY unchanged.
+@MainActor
+private final class MacTerminalWebView: WKWebView {
+  var terminalShortcut: ((MacTerminalShortcut) -> Void)?
+
+  override func performKeyEquivalent(with event: NSEvent) -> Bool {
+    guard let shortcut = MacTerminalShortcut(event: event) else {
+      return super.performKeyEquivalent(with: event)
+    }
+    terminalShortcut?(shortcut)
+    return true
+  }
+}
+
 /// 复用手机端已经验证过的 xterm 页面。画面和输入都留在 Mac App 内，
 /// daemon 只提供静态页面；会话数据仍走带本机 control token 的接口。
 private struct MacTerminalSurface: NSViewRepresentable {
@@ -1028,7 +1076,7 @@ private struct MacTerminalSurface: NSViewRepresentable {
     Coordinator(input: input, inputError: inputError, resize: resize, resync: resync)
   }
 
-  func makeNSView(context: Context) -> WKWebView {
+  func makeNSView(context: Context) -> MacTerminalWebView {
     let configuration = WKWebViewConfiguration()
     let bridge = """
       window.ReactNativeWebView = {
@@ -1041,9 +1089,12 @@ private struct MacTerminalSurface: NSViewRepresentable {
       WKUserScript(source: bridge, injectionTime: .atDocumentStart, forMainFrameOnly: true)
     )
     configuration.userContentController.add(context.coordinator, name: "prospero")
-    let webView = WKWebView(frame: .zero, configuration: configuration)
+    let webView = MacTerminalWebView(frame: .zero, configuration: configuration)
     webView.navigationDelegate = context.coordinator
     webView.setValue(false, forKey: "drawsBackground")
+    webView.terminalShortcut = { [weak coordinator = context.coordinator] shortcut in
+      coordinator?.perform(shortcut)
+    }
     context.coordinator.webView = webView
     if let url = URL(string: "http://127.0.0.1:\(port)/term.html") {
       webView.load(URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData))
@@ -1053,22 +1104,23 @@ private struct MacTerminalSurface: NSViewRepresentable {
     return webView
   }
 
-  func updateNSView(_ webView: WKWebView, context: Context) {
+  func updateNSView(_ webView: MacTerminalWebView, context: Context) {
     context.coordinator.input = input
     context.coordinator.inputError = inputError
     context.coordinator.resize = resize
     context.coordinator.resync = resync
   }
 
-  static func dismantleNSView(_ webView: WKWebView, coordinator: Coordinator) {
+  static func dismantleNSView(_ webView: MacTerminalWebView, coordinator: Coordinator) {
     coordinator.cancel()
+    webView.terminalShortcut = nil
     webView.configuration.userContentController.removeScriptMessageHandler(forName: "prospero")
     webView.stopLoading()
   }
 
   @MainActor
   final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate, TerminalFrameSink {
-    weak var webView: WKWebView?
+    weak var webView: MacTerminalWebView?
     var input: @MainActor (String) async -> String?
     var inputError: @MainActor (String) -> Void
     var resize: @MainActor (Int, Int) async -> String?
@@ -1120,6 +1172,10 @@ private struct MacTerminalSurface: NSViewRepresentable {
         drainFrames()
       case "input":
         if let dataB64 = body["data"] as? String { enqueueInput(dataB64) }
+      case "clipboardCopy":
+        if let text = body["text"] as? String { copyToPasteboard(text) }
+      case "clipboardPaste":
+        pasteFromPasteboard()
       case "resized":
         if let cols = body["cols"] as? Int, let rows = body["rows"] as? Int,
            (10...500).contains(cols), (5...300).contains(rows) {
@@ -1128,6 +1184,66 @@ private struct MacTerminalSurface: NSViewRepresentable {
       default:
         break
       }
+    }
+
+    func perform(_ shortcut: MacTerminalShortcut) {
+      switch shortcut {
+      case .copy:
+        copySelection()
+      case .paste:
+        pasteFromPasteboard()
+      case .selectAll:
+        sendControl(["kind": "selectAll"])
+        sendControl(["kind": "toast", "text": "已选择终端内容"])
+      case .clear:
+        sendControl(["kind": "clear"])
+        enqueueText("\u{0c}") // zsh clear-screen; TUI 会按自己的语义重绘
+        sendControl(["kind": "toast", "text": "已清屏"])
+      case .beginningOfLine:
+        enqueueText("\u{01}") // zsh beginning-of-line
+      case .endOfLine:
+        enqueueText("\u{05}") // zsh end-of-line
+      case .deleteToBeginning:
+        enqueueText("\u{15}") // zsh backward-kill-line
+      case .deleteToEnd:
+        enqueueText("\u{0b}") // zsh kill-line
+      }
+    }
+
+    private func copySelection() {
+      webView?.evaluateJavaScript("term.hasSelection() ? term.getSelection() : ''") {
+        [weak self] result, _ in
+        Task { @MainActor in
+          guard let self else { return }
+          guard let text = result as? String, !text.isEmpty else {
+            self.sendControl(["kind": "toast", "text": "按住 ⌥ 拖动选择文本"])
+            return
+          }
+          self.copyToPasteboard(text)
+        }
+      }
+    }
+
+    private func copyToPasteboard(_ text: String) {
+      guard !text.isEmpty else { return }
+      NSPasteboard.general.clearContents()
+      NSPasteboard.general.setString(text, forType: .string)
+      sendControl(["kind": "toast", "text": "已复制"])
+    }
+
+    private func pasteFromPasteboard() {
+      guard let text = NSPasteboard.general.string(forType: .string), !text.isEmpty else {
+        sendControl(["kind": "toast", "text": "剪贴板为空"])
+        return
+      }
+      // Let xterm's public paste API add bracketed-paste markers when zsh or a
+      // TUI requested them; writing raw bytes here would lose that protection.
+      sendControl(["kind": "paste", "text": text])
+      sendControl(["kind": "toast", "text": "已粘贴"])
+    }
+
+    private func enqueueText(_ text: String) {
+      enqueueInput(Data(text.utf8).base64EncodedString())
     }
 
     func push(_ frame: TerminalRenderFrame) {

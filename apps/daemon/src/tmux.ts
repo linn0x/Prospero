@@ -16,6 +16,14 @@ import type { SpawnSpec } from "./agents.js";
 
 /** tmux 会话名前缀。带上前缀,避免误伤用户自己的 tmux 会话。 */
 const PREFIX = "prospero-";
+const CLEAN_TERMINAL_ENV = [
+  "/usr/bin/env",
+  "-u", "NO_COLOR",
+  "-u", "FORCE_COLOR",
+  "COLORTERM=truecolor",
+  "CLICOLOR=1",
+  "TERM_PROGRAM=Prospero",
+] as const;
 
 let cachedPath: string | null | undefined;
 
@@ -174,6 +182,12 @@ export function wrapSpawn(
       "-x", String(opts.cols),
       "-y", String(opts.rows),
       "--",
+      // A long-lived tmux server keeps the environment from the process which
+      // first created it. If that process had NO_COLOR=1, merely fixing the
+      // attaching client's env does not restore ANSI colors in a new pane.
+      // Sanitize at the pane process boundary and describe the outer xterm's
+      // real capabilities without globally mutating the user's tmux server.
+      ...CLEAN_TERMINAL_ENV,
       spec.file,
       ...spec.args,
     ],

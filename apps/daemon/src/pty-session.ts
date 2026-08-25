@@ -312,7 +312,10 @@ export class PtySession extends EventEmitter<PtySessionEvents> {
     });
     scan("\x1b[c", () => this.proc.write("\x1b[?6c")); // DA1 → VT102
     scan("\x1b[0c", () => this.proc.write("\x1b[?6c"));
-    scan("\x1b]10;?", () => this.proc.write("\x1b]10;rgb:ffff/ffff/ffff\x1b\\"));
-    scan("\x1b]11;?", () => this.proc.write("\x1b]11;rgb:0000/0000/0000\x1b\\"));
+    // Match the Tokyo Night palette rendered by term.html. Besides making
+    // color queries truthful, the dark-but-not-pure-black background helps
+    // TUIs choose their intended dark theme instead of a monochrome fallback.
+    scan("\x1b]10;?", () => this.proc.write("\x1b]10;rgb:c0c0/caca/f5f5\x1b\\"));
+    scan("\x1b]11;?", () => this.proc.write("\x1b]11;rgb:1a1a/1b1b/2626\x1b\\"));
   }
 }
