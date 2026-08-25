@@ -87,17 +87,31 @@ describe("tmux 托管", () => {
       "-x", "100",
       "-y", "30",
       "--",
+      "/usr/bin/env",
+      "-u", "NO_COLOR",
+      "-u", "FORCE_COLOR",
+      "COLORTERM=truecolor",
+      "CLICOLOR=1",
+      "TERM_PROGRAM=Prospero",
       "/bin/zsh", "-il",
     ]);
   });
 
-  it("原命令的参数原样透传,不被 tmux 吞掉", () => {
+  it("清理 tmux server 的禁色环境后，原命令参数仍原样透传", () => {
     const wrapped = wrapSpawn(
       { file: "/bin/zsh", args: ["-c", "sleep 600"] },
       { id: "s2", cwd: "/tmp", cols: 80, rows: 24, configFile: "/cfg", tmux: "/opt/tmux" },
     );
     const afterSeparator = wrapped.args.slice(wrapped.args.indexOf("--") + 1);
-    expect(afterSeparator).toEqual(["/bin/zsh", "-c", "sleep 600"]);
+    expect(afterSeparator).toEqual([
+      "/usr/bin/env",
+      "-u", "NO_COLOR",
+      "-u", "FORCE_COLOR",
+      "COLORTERM=truecolor",
+      "CLICOLOR=1",
+      "TERM_PROGRAM=Prospero",
+      "/bin/zsh", "-c", "sleep 600",
+    ]);
   });
 
   it("tmux 自己认这份配置 —— 断言字符串存在抓不到语法错", () => {

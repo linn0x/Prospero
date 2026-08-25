@@ -1,8 +1,57 @@
 @testable import ProsperoShell
+import AppKit
 import XCTest
 
 // Contract tests for the Mac daemon cursor boundary.
 final class LocalSessionControlTests: XCTestCase {
+  private func keyEvent(
+    keyCode: UInt16,
+    characters: String,
+    modifiers: NSEvent.ModifierFlags
+  ) throws -> NSEvent {
+    try XCTUnwrap(NSEvent.keyEvent(
+      with: .keyDown,
+      location: .zero,
+      modifierFlags: modifiers,
+      timestamp: 0,
+      windowNumber: 0,
+      context: nil,
+      characters: characters,
+      charactersIgnoringModifiers: characters,
+      isARepeat: false,
+      keyCode: keyCode
+    ))
+  }
+
+  func testMacTerminalOnlyInterceptsCommandEditingShortcuts() throws {
+    XCTAssertEqual(
+      MacTerminalShortcut(event: try keyEvent(keyCode: 8, characters: "c", modifiers: .command)),
+      .copy
+    )
+    XCTAssertEqual(
+      MacTerminalShortcut(event: try keyEvent(keyCode: 9, characters: "v", modifiers: .command)),
+      .paste
+    )
+    XCTAssertEqual(
+      MacTerminalShortcut(event: try keyEvent(keyCode: 123, characters: "", modifiers: .command)),
+      .beginningOfLine
+    )
+    XCTAssertEqual(
+      MacTerminalShortcut(event: try keyEvent(keyCode: 124, characters: "", modifiers: .command)),
+      .endOfLine
+    )
+    XCTAssertEqual(
+      MacTerminalShortcut(event: try keyEvent(keyCode: 51, characters: "", modifiers: .command)),
+      .deleteToBeginning
+    )
+    XCTAssertNil(
+      MacTerminalShortcut(event: try keyEvent(keyCode: 8, characters: "c", modifiers: .control))
+    )
+    XCTAssertNil(
+      MacTerminalShortcut(event: try keyEvent(keyCode: 123, characters: "", modifiers: .option))
+    )
+  }
+
   func testLaunchRulesPreferStructuredOnlyForInteractiveChatAdapters() {
     XCTAssertEqual(LocalSessionLaunchRules.defaultKind(for: "codex"), "structured")
     XCTAssertEqual(LocalSessionLaunchRules.defaultKind(for: "claude"), "structured")
