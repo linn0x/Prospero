@@ -2896,6 +2896,11 @@ private struct SettingsDashboard: View {
   @Bindable var daemon: DaemonController
   @State private var loginEnabled = LoginItem.isEnabled
   @State private var loginError: String?
+  @AppStorage(TerminalFontPreferences.key) private var terminalFontStorage = ""
+
+  private var terminalFontPreference: TerminalFontPreference {
+    TerminalFontPreference.fromStorage(terminalFontStorage)
+  }
 
   var body: some View {
     Form {
@@ -2910,6 +2915,25 @@ private struct SettingsDashboard: View {
         if let loginError {
           Text(loginError).foregroundStyle(.red)
         }
+      }
+
+      Section("外观") {
+        LabeledContent("字体") {
+          Text("\(terminalFontPreference.displayName) · \(terminalFontPreference.size.formatted()) pt")
+            .font(.system(.body, design: .monospaced))
+        }
+        HStack {
+          Button("选择字体…") {
+            TerminalFontPanelController.shared.present(preference: terminalFontPreference)
+          }
+          Button("恢复默认") {
+            terminalFontStorage = TerminalFontPreference.system.storageValue
+          }
+          .disabled(terminalFontStorage.isEmpty)
+        }
+        Text("使用 macOS 字体面板，选择会即时应用到所有终端。仅接受等宽字体；需要 Powerline/Nerd 图标时请选择 Nerd Font Mono 版本。")
+          .font(.caption)
+          .foregroundStyle(.secondary)
       }
 
       Section("持久化") {
