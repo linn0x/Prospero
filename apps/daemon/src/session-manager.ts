@@ -1185,9 +1185,21 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
    */
   structuredPerAgent(): Array<StructuredSession | RemoteStructuredSession | WindowsRemoteStructuredSession> {
     const byAccount = new Map<string, StructuredSession | RemoteStructuredSession | WindowsRemoteStructuredSession>();
+    const live = (s: StructuredSession | RemoteStructuredSession | WindowsRemoteStructuredSession) => {
+      const status = s.info().status;
+      return status !== "done" && status !== "died";
+    };
     for (const s of this.structuredSessions.values()) {
-      // 后来的覆盖先前的:新会话更可能刚从服务端拿到过限流推送
-      byAccount.set(`${s.agent}\u0000${s.accountId ?? "legacy"}`, s);
+      const key = `${s.agent}\u0000${s.accountId ?? "legacy"}`;
+      const previous = byAccount.get(key);
+      // 后来的覆盖先前的:新会话更可能刚从服务端拿到过限流推送。
+      //
+      // 但收工的会话(done/died)其 supervisor 早已断开,问它额度只会抛
+      // supervisor_unavailable。编排跑过几轮之后,派发出去的 worker 会话会
+      // 一直留在列表里,轮到它占住某个账号的位置,那个账号的额度就再也查不出来。
+      // 同账号下只要还有活着的会话,就别让死会话占这个位置。
+      if (previous && live(previous) && !live(s)) continue;
+      byAccount.set(key, s);
     }
     return [...byAccount.values()];
   }

@@ -62,6 +62,7 @@ import {
 import { RelayHostClient } from "./relay-host-client.js";
 import { Notifier, type NotifyConfig } from "./notify.js";
 import { SessionError, SessionManager, type SessionManagerOptions } from "./session-manager.js";
+import { RemoteSupervisorError } from "./structured-supervisor-client.js";
 import { createStructuredSupervisorRuntimeSnapshot } from "./structured-supervisor-runtime.js";
 import { StatusFile } from "./status-file.js";
 import {
@@ -1438,7 +1439,12 @@ export async function createDaemonServer(
                 (candidate.accountId === undefined && !accountMeta.managed && candidate.agent === accountMeta.agent),
               );
               const account = accounts.resolve(accountMeta.id, accountMeta.agent);
-              let r = s ? await s.usage() : null;
+              // 一个账号的会话答不出额度,不该让整份用量请求失败。
+              // 它以前会一路抛到最外层的兜底分支,手机上收到的就是
+              // "bad_message: internal error" —— 既看不出是哪个账号,也看不出为什么。
+              // supervisor 掉线、会话已收工时当作没有用量数据,
+              // 下面的 `if (!r)` 分支会给出"暂无数据"的卡片。
+              let r = s ? await s.usage().catch(() => null) : null;
               // Codex 的限流是账号级 RPC，不需要先创建 thread。这样账号管理页
               // 第一次打开就能显示额度，也不会为了查额度消耗一次对话。
               if (!account.apiProfile && account.agent === "codex" && (!r || r.windows.length === 0)) {
@@ -1512,7 +1518,21 @@ export async function createDaemonServer(
         }
 
         const s = manager.requireStructured(msg.sid);
-        const report = await s.usage();
+        let report: Awaited<ReturnType<typeof s.usage>> | null;
+        try {
+          report = await s.usage();
+        } catch (e) {
+          if (!(e instanceof RemoteSupervisorError)) throw e;
+          // 会话还在列表里,但它的 supervisor 已经退出(典型是收工的 worker)。
+          // 这是个可解释的状态,不是内部错误。
+          send(conn, {
+            type: "usage.result",
+            sid: msg.sid,
+            available: false,
+            reason: "这个会话的 Agent 进程已经退出,查不到用量了。",
+          });
+          return;
+        }
         if (!report) {
           send(conn, {
             type: "usage.result",
@@ -1908,6 +1928,12 @@ export async function createDaemonServer(
       }
       if (e instanceof AgentAccountError) {
         send(conn, { type: "error", code: "bad_message", message: e.message });
+        return;
+      }
+      if (e instanceof RemoteSupervisorError) {
+        // supervisor 掉线有明确含义(Agent 进程没了),不该混进"internal error"——
+        // 那条文案在手机上什么也说明不了,只能靠翻 daemon 日志才知道发生了什么。
+        send(conn, { type: "error", code: "agent_unavailable", message: e.message });
         return;
       }
       if (e instanceof OrchestrationError) {
