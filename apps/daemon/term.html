@@ -100,11 +100,27 @@
 <script src="/assets/webgl.js"></script>
 <script>
   const post = (o) => window.ReactNativeWebView && window.ReactNativeWebView.postMessage(JSON.stringify(o));
+  const DEFAULT_FONT_FAMILY = "ui-monospace, SFMono-Regular, Menlo, Monaco, monospace";
+
+  function quotedCSSFontFamily(name) {
+    const clean = String(name || "")
+      .replace(/[\u0000-\u001f\u007f]/g, " ")
+      .replace(/\\/g, "\\\\")
+      .replace(/"/g, "\\\"");
+    return `"${clean}"`;
+  }
+
+  function fontStack(family) {
+    const preferred = typeof family === "string" ? family.trim() : "";
+    return preferred
+      ? `${quotedCSSFontFamily(preferred)}, ${DEFAULT_FONT_FAMILY}`
+      : DEFAULT_FONT_FAMILY;
+  }
 
   const term = new window.Terminal({
     scrollback: 3000,
     fontSize: 12,
-    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, monospace",
+    fontFamily: DEFAULT_FONT_FAMILY,
     fontWeight: "400",
     fontWeightBold: "600",
     lineHeight: 1.16,
@@ -305,6 +321,7 @@
   // 首次尺寸必须等原生层发来受控字号后再计算。否则 ready 之后的默认 12px fit
   // 可能先触发 attach，随后 Dynamic Type 才改变列数，造成短暂错配。
   let fontReady = false;
+  let fontRevision = 0;
   let fitTimer = null;
   function doFit() {
     if (!fontReady || fitTimer) return;
@@ -357,9 +374,25 @@
     } else if (m.kind === "fit") {
       doFit();
     } else if (m.kind === "font") {
-      term.options.fontSize = m.size;
+      const requestedSize = Number(m.size);
+      const size = Number.isFinite(requestedSize)
+        ? Math.min(72, Math.max(6, requestedSize))
+        : 12;
+      const family = typeof m.family === "string" ? m.family.trim() : "";
+      term.options.fontFamily = fontStack(family);
+      term.options.fontSize = size;
       fontReady = true;
-      doFit();
+      const revision = ++fontRevision;
+      const fitted = () => {
+        if (revision === fontRevision) doFit();
+      };
+      // 本机字体通常立即可用；仍等 FontFaceSet 确认一次再 fit，避免先按
+      // fallback 的字宽算列数，下一帧换成 Nerd Font 后文字与 tmux 网格错位。
+      if (family && document.fonts && document.fonts.load) {
+        document.fonts.load(`${size}px ${quotedCSSFontFamily(family)}`).then(fitted, fitted);
+      } else {
+        fitted();
+      }
     } else if (m.kind === "focus") {
       term.focus();
     } else if (m.kind === "blur") {

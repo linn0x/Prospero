@@ -270,9 +270,14 @@ struct LocalSessionWorkspace: View {
   /// 专注模式:两侧边栏让位,终端占满窗口。三处视图绑同一个键,
   /// 头部按下时侧栏那边会跟着变 —— UserDefaults 在这里就是那根共享的线。
   @AppStorage("focusTerminal") private var focusTerminal = false
+  /// 字体是 App 级 profile，不跟 tmux session 绑定；一次选择即时同步所有终端。
+  @AppStorage(TerminalFontPreferences.key) private var terminalFontStorage = ""
 
   private var accent: Color { AgentVisuals.statusColor(session) }
   private var terminalPort: Int { daemon.running?.port ?? 7423 }
+  private var terminalFontPreference: TerminalFontPreference {
+    TerminalFontPreference.fromStorage(terminalFontStorage)
+  }
   /// PTY 会话整块走终端配色:头部、提示条、错误条与画面同一片深色。
   /// 以前是一条浅色系统外壳直接压在 #1a1b26 上,中间那道色缝正好横在视线里。
   /// 结构化会话是文档式界面,继续用系统浅色。
@@ -531,6 +536,7 @@ struct LocalSessionWorkspace: View {
           port: terminalPort,
           sessionID: session.id,
           stream: terminalStream,
+          font: terminalFontPreference,
           input: { dataB64 in
             await daemon.sendLocalTerminalInput(id: session.id, dataB64: dataB64)
           },
@@ -1067,13 +1073,14 @@ private struct MacTerminalSurface: NSViewRepresentable {
   let port: Int
   let sessionID: String
   let stream: TerminalFrameStream
+  let font: TerminalFontPreference
   let input: @MainActor (String) async -> String?
   let inputError: @MainActor (String) -> Void
   let resize: @MainActor (Int, Int) async -> String?
   let resync: @MainActor () -> Void
 
   func makeCoordinator() -> Coordinator {
-    Coordinator(input: input, inputError: inputError, resize: resize, resync: resync)
+    Coordinator(font: font, input: input, inputError: inputError, resize: resize, resync: resync)
   }
 
   func makeNSView(context: Context) -> MacTerminalWebView {
@@ -1105,6 +1112,7 @@ private struct MacTerminalSurface: NSViewRepresentable {
   }
 
   func updateNSView(_ webView: MacTerminalWebView, context: Context) {
+    context.coordinator.updateFont(font)
     context.coordinator.input = input
     context.coordinator.inputError = inputError
     context.coordinator.resize = resize
@@ -1133,13 +1141,16 @@ private struct MacTerminalSurface: NSViewRepresentable {
     private var inputTask: Task<Void, Never>?
     private var pendingResize: (cols: Int, rows: Int)?
     private var resizeTask: Task<Void, Never>?
+    private var terminalFont: TerminalFontPreference
 
     init(
+      font: TerminalFontPreference,
       input: @escaping @MainActor (String) async -> String?,
       inputError: @escaping @MainActor (String) -> Void,
       resize: @escaping @MainActor (Int, Int) async -> String?,
       resync: @escaping @MainActor () -> Void
     ) {
+      terminalFont = font
       self.input = input
       self.inputError = inputError
       self.resize = resize
@@ -1159,10 +1170,10 @@ private struct MacTerminalSurface: NSViewRepresentable {
       switch kind {
       case "ready":
         ready = true
-        // The shared page waits for its host-provided font before fitting. The
-        // mobile host already sends this; without it Mac stayed at the launch
-        // default 120x40 no matter how the window was resized.
-        sendControl(["kind": "font", "size": 13])
+        // The shared page waits for its host-provided font before fitting.
+        // Sending family and size together prevents a one-frame fit with stale
+        // glyph metrics when the user selected a different installed font.
+        sendControl(terminalFont.bridgeMessage)
         sendControl(["kind": "focus"])
         // tmux mouse mode owns ordinary pointer events so wheel gestures can
         // enter copy-mode. On macOS xterm requires this explicit option to
@@ -1184,6 +1195,12 @@ private struct MacTerminalSurface: NSViewRepresentable {
       default:
         break
       }
+    }
+
+    func updateFont(_ preference: TerminalFontPreference) {
+      guard preference != terminalFont else { return }
+      terminalFont = preference
+      sendControl(preference.bridgeMessage)
     }
 
     func perform(_ shortcut: MacTerminalShortcut) {
