@@ -34,8 +34,98 @@ import {
 } from "./model.js";
 
 const PERSIST_DEBOUNCE_MS = 200;
+const MAX_ORCHESTRATION_EVENTS = 2_048;
 export const MAX_TASK_SKILLS = 5;
 const SKILL_NAME = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+
+export type OrchestrationEventEntity = "run" | "task" | "dispatch" | "gate";
+export type OrchestrationEventOperation = "upsert" | "delete";
+
+export interface OrchestrationRunEvent {
+  seq: number;
+  runId: string;
+  entity: OrchestrationEventEntity;
+  entityId: string;
+  operation: OrchestrationEventOperation;
+  value: Record<string, unknown> | null;
+  occurredAt: number;
+}
+
+export interface CompactRunSnapshot {
+  protocol: "prospero.orchestration.run.v1";
+  run: Record<string, unknown>;
+  tasks: Record<string, Record<string, unknown>>;
+  dispatches: Record<string, Record<string, unknown>>;
+  gates: Record<string, Record<string, unknown>>;
+  cursor: number;
+  eventBaseSeq: number;
+}
+
+export interface OrchestrationEventsPage {
+  protocol: "prospero.orchestration.events.v1";
+  runId: string;
+  afterSeq: number;
+  nextSeq: number;
+  eventBaseSeq: number;
+  gap: boolean;
+  hasMore: boolean;
+  events: OrchestrationRunEvent[];
+}
+
+type CompactEntity = Record<string, unknown>;
+
+function compactRun(run: Run): CompactEntity {
+  return {
+    id: run.id,
+    objective: run.objective,
+    status: run.status,
+    coordinatorSessionId: run.coordinatorSessionId,
+    graphRevision: run.graphRevision,
+    createdAt: run.createdAt,
+    updatedAt: run.updatedAt,
+  };
+}
+
+function compactTask(task: Task): CompactEntity {
+  return {
+    id: task.id,
+    runId: task.runId,
+    title: task.title,
+    skills: task.skills ?? [],
+    deps: task.deps,
+    parentId: task.parentId,
+    status: task.status,
+    result: task.result,
+    createdAt: task.createdAt,
+    updatedAt: task.updatedAt,
+  };
+}
+
+function compactDispatch(dispatch: Dispatch): CompactEntity {
+  return {
+    id: dispatch.id,
+    runId: dispatch.runId,
+    taskId: dispatch.taskId,
+    sessionId: dispatch.sessionId,
+    state: dispatch.state,
+    startedAt: dispatch.startedAt,
+    settledAt: dispatch.settledAt,
+  };
+}
+
+function compactGate(gate: Gate): CompactEntity {
+  return {
+    id: gate.id,
+    runId: gate.runId,
+    taskId: gate.taskId,
+    question: gate.question,
+    options: gate.options,
+    status: gate.status,
+    decision: gate.decision,
+    createdAt: gate.createdAt,
+    resolvedAt: gate.resolvedAt,
+  };
+}
 
 export class OrchestrationError extends Error {
   constructor(message: string, readonly code: OrchestrationErrorCode) {
@@ -119,6 +209,15 @@ function id(prefix: string): string {
 
 export class OrchestrationStore {
   private state: OrchestrationState = emptyState();
+  private eventSeq = 0;
+  private eventBaseSeq = 0;
+  private events: OrchestrationRunEvent[] = [];
+  private eventShadow: Record<OrchestrationEventEntity, Map<string, CompactEntity>> = {
+    run: new Map(),
+    task: new Map(),
+    dispatch: new Map(),
+    gate: new Map(),
+  };
   private readonly file: string | null;
   private timer: NodeJS.Timeout | null = null;
   private closed = false;
@@ -128,6 +227,7 @@ export class OrchestrationStore {
   constructor(home?: string) {
     this.file = home ? path.join(home, "orchestration.json") : null;
     this.load();
+    this.resetEventShadow();
   }
 
   private load(): void {
@@ -135,6 +235,9 @@ export class OrchestrationStore {
     try {
       const parsed = JSON.parse(readFileSync(this.file, "utf8")) as Omit<Partial<OrchestrationState>, "version"> & {
         version?: number;
+        eventSeq?: unknown;
+        eventBaseSeq?: unknown;
+        events?: unknown;
       };
       if (parsed.version === 1 || parsed.version === 2) {
         const runs = parsed.runs ?? {};
@@ -205,6 +308,7 @@ export class OrchestrationStore {
           operations: parsed.operations ?? {},
           worktreeAssets,
         };
+        this.loadEventJournal(parsed.eventSeq, parsed.eventBaseSeq, parsed.events);
         // 迁移只补登记，不会触碰用户磁盘上的任何工作树。立即原子落盘，避免下一次
         // Run 删除发生在迁移结果尚未写入之前。
         if (migrated) this.persistNow();
@@ -268,7 +372,92 @@ export class OrchestrationStore {
     return changed;
   }
 
+  private loadEventJournal(rawSeq: unknown, rawBaseSeq: unknown, rawEvents: unknown): void {
+    if (!Number.isSafeInteger(rawSeq) || (rawSeq as number) < 0) return;
+    if (!Number.isSafeInteger(rawBaseSeq) || (rawBaseSeq as number) < 0) return;
+    if (!Array.isArray(rawEvents)) return;
+    const events = rawEvents.filter((value): value is OrchestrationRunEvent => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+      const event = value as Partial<OrchestrationRunEvent>;
+      return Number.isSafeInteger(event.seq) && (event.seq ?? -1) > 0 &&
+        typeof event.runId === "string" && event.runId !== "" &&
+        (event.entity === "run" || event.entity === "task" || event.entity === "dispatch" || event.entity === "gate") &&
+        typeof event.entityId === "string" && event.entityId !== "" &&
+        (event.operation === "upsert" || event.operation === "delete") &&
+        (event.value === null || (typeof event.value === "object" && !Array.isArray(event.value))) &&
+        Number.isSafeInteger(event.occurredAt) && (event.occurredAt ?? -1) >= 0;
+    }).sort((a, b) => a.seq - b.seq);
+    const seq = rawSeq as number;
+    const baseSeq = rawBaseSeq as number;
+    if (baseSeq > seq || events.some((event) => event.seq <= baseSeq || event.seq > seq)) return;
+    this.eventSeq = seq;
+    this.eventBaseSeq = baseSeq;
+    this.events = events.slice(-MAX_ORCHESTRATION_EVENTS);
+    if (events.length > this.events.length) {
+      this.eventBaseSeq = events[events.length - this.events.length - 1]!.seq;
+    }
+  }
+
+  private resetEventShadow(): void {
+    this.eventShadow = {
+      run: new Map(Object.values(this.state.runs).map((value) => [value.id, compactRun(value)])),
+      task: new Map(Object.values(this.state.tasks).map((value) => [value.id, compactTask(value)])),
+      dispatch: new Map(Object.values(this.state.dispatches).map((value) => [value.id, compactDispatch(value)])),
+      gate: new Map(Object.values(this.state.gates).map((value) => [value.id, compactGate(value)])),
+    };
+  }
+
+  private appendEvent(
+    runId: string,
+    entity: OrchestrationEventEntity,
+    entityId: string,
+    operation: OrchestrationEventOperation,
+    value: CompactEntity | null,
+  ): void {
+    this.eventSeq += 1;
+    this.events.push({
+      seq: this.eventSeq,
+      runId,
+      entity,
+      entityId,
+      operation,
+      value: value === null ? null : structuredClone(value),
+      occurredAt: Date.now(),
+    });
+    if (this.events.length > MAX_ORCHESTRATION_EVENTS) {
+      const removed = this.events.splice(0, this.events.length - MAX_ORCHESTRATION_EVENTS);
+      this.eventBaseSeq = removed.at(-1)?.seq ?? this.eventBaseSeq;
+    }
+  }
+
+  private recordEntityChanges(): void {
+    const groups: Array<{ entity: OrchestrationEventEntity; values: CompactEntity[] }> = [
+      { entity: "run", values: Object.values(this.state.runs).map(compactRun) },
+      { entity: "task", values: Object.values(this.state.tasks).map(compactTask) },
+      { entity: "dispatch", values: Object.values(this.state.dispatches).map(compactDispatch) },
+      { entity: "gate", values: Object.values(this.state.gates).map(compactGate) },
+    ];
+    for (const { entity, values } of groups) {
+      const previous = this.eventShadow[entity];
+      const current = new Map(values.map((value) => [String(value["id"]), value]));
+      for (const [id, value] of current) {
+        const old = previous.get(id);
+        if (old === undefined || JSON.stringify(old) !== JSON.stringify(value)) {
+          const runId = entity === "run" ? id : String(value["runId"]);
+          this.appendEvent(runId, entity, id, "upsert", value);
+        }
+      }
+      for (const [id, old] of previous) {
+        if (current.has(id)) continue;
+        const runId = entity === "run" ? id : String(old["runId"]);
+        this.appendEvent(runId, entity, id, "delete", null);
+      }
+      this.eventShadow[entity] = current;
+    }
+  }
+
   private schedulePersist(): void {
+    this.recordEntityChanges();
     for (const listener of this.changeListeners) {
       try {
         listener();
@@ -292,7 +481,12 @@ export class OrchestrationStore {
     }
     mkdirSync(path.dirname(this.file), { recursive: true });
     const tmp = `${this.file}.tmp.${process.pid}`;
-    writeFileSync(tmp, JSON.stringify(this.state, null, 2), { mode: 0o600 });
+    writeFileSync(tmp, JSON.stringify({
+      ...this.state,
+      eventSeq: this.eventSeq,
+      eventBaseSeq: this.eventBaseSeq,
+      events: this.events,
+    }, null, 2), { mode: 0o600 });
     renameSync(tmp, this.file);
   }
 
@@ -1521,6 +1715,58 @@ export class OrchestrationStore {
     }
     this.schedulePersist();
     return gate;
+  }
+
+  compactRunSnapshot(runId: string): CompactRunSnapshot {
+    const run = this.getRun(runId);
+    return {
+      protocol: "prospero.orchestration.run.v1",
+      run: compactRun(run),
+      tasks: Object.fromEntries(
+        this.listTasks(runId).map((value) => [value.id, compactTask(value)]),
+      ),
+      dispatches: Object.fromEntries(
+        this.listDispatches(runId).map((value) => [value.id, compactDispatch(value)]),
+      ),
+      gates: Object.fromEntries(
+        this.listGates(runId).map((value) => [value.id, compactGate(value)]),
+      ),
+      cursor: this.eventSeq,
+      eventBaseSeq: this.eventBaseSeq,
+    };
+  }
+
+  eventsSince(runId: string, afterSeq: number, limit = 128): OrchestrationEventsPage {
+    this.getRun(runId);
+    if (!Number.isSafeInteger(afterSeq) || afterSeq < 0 || afterSeq > this.eventSeq) {
+      throw new OrchestrationError(`无效事件游标 ${String(afterSeq)}`, "graph_invalid");
+    }
+    const boundedLimit = Math.min(Math.max(limit, 1), 512);
+    if (afterSeq < this.eventBaseSeq) {
+      return {
+        protocol: "prospero.orchestration.events.v1",
+        runId,
+        afterSeq,
+        nextSeq: this.eventSeq,
+        eventBaseSeq: this.eventBaseSeq,
+        gap: true,
+        hasMore: false,
+        events: [],
+      };
+    }
+    const matching = this.events.filter((event) => event.seq > afterSeq && event.runId === runId);
+    const events = matching.slice(0, boundedLimit).map((event) => structuredClone(event));
+    const hasMore = matching.length > events.length;
+    return {
+      protocol: "prospero.orchestration.events.v1",
+      runId,
+      afterSeq,
+      nextSeq: hasMore ? events.at(-1)!.seq : this.eventSeq,
+      eventBaseSeq: this.eventBaseSeq,
+      gap: false,
+      hasMore,
+      events,
+    };
   }
 
   /** 测试用:直接看一眼内部状态 */
