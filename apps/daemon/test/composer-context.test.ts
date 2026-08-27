@@ -13,6 +13,7 @@ import {
   completeComposer,
   injectPortableSkills,
   prepareComposerPrompt,
+  resolveExplicitSkills,
 } from "../src/composer-context.js";
 import { StructuredSession } from "../src/structured-session.js";
 
@@ -61,6 +62,15 @@ describe("daemon 通用输入上下文", () => {
     expect(prepared.skills).toHaveLength(1);
     expect(prepared.skills[0]?.contents).toContain(skillBody);
     expect(injectPortableSkills(prepared.text, prepared.skills)).toContain(skillBody);
+  });
+
+  it("显式 Skill 解析保持调用顺序，并对缺失项 fail-closed", async () => {
+    const resolved = await resolveExplicitSkills(root, [skillName]);
+    expect(resolved).toEqual([
+      expect.objectContaining({ name: skillName, contents: expect.stringContaining(skillBody) }),
+    ]);
+    await expect(resolveExplicitSkills(root, [skillName, "missing-skill"]))
+      .rejects.toThrow(/找不到显式指定的 Skill/);
   });
 });
 

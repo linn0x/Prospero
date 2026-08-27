@@ -148,6 +148,36 @@ describe("会话内 prospero CLI", () => {
     expect(withoutOperationId.params).not.toHaveProperty("operationId");
   });
 
+  it("task.create 与 worker.start 显式转发各自的 Skill 集合", async () => {
+    const control = await startControlSocket({
+      home: tempHome(),
+      token: "secret",
+      handle: (method, params) => ({ method, params }),
+    });
+    servers.push(control);
+
+    const task = await cli(control.path, control.tokenPath, [
+      "task", "create", "--run", "run-1", "--title", "路由探索", "--spec", "只读分析",
+      "--skill", "api-search", "psm-to-repo",
+    ], "coord") as { method: string; params: Record<string, unknown> };
+    expect(task).toMatchObject({
+      method: "task.create",
+      params: { skills: ["api-search", "psm-to-repo"], actorSessionId: "coord" },
+    });
+
+    const worker = await cli(control.path, control.tokenPath, [
+      "worker", "start", "--task", "task-1", "--agent", "codex",
+      "--kind", "structured", "--skill", "medusa-query", "simplelog-logid-query",
+    ], "coord") as { method: string; params: Record<string, unknown> };
+    expect(worker).toMatchObject({
+      method: "worker.start",
+      params: {
+        skills: ["medusa-query", "simplelog-logid-query"],
+        actorSessionId: "coord",
+      },
+    });
+  });
+
   it("status 按当前会话优先选择 active Run，并支持 --all 与空态提示", async () => {
     const home = tempHome();
     const server = await createDaemonServer({ home, port: 0 });

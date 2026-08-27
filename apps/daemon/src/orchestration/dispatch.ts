@@ -1,5 +1,7 @@
 /** 把一个 ready task 变成实际 worker 会话的唯一入口。 */
+import { createHash } from "node:crypto";
 import type { AgentKind, SessionInfo, SessionKind } from "@prospero/protocol";
+import { resolveExplicitSkills } from "../composer-context.js";
 import type { CreateSessionInput, KillSessionOptions, SessionHosting } from "../session-manager.js";
 import type { PtyStartupReadinessOptions } from "../pty-startup-readiness.js";
 import {
@@ -10,7 +12,7 @@ import {
   type EsaytreeCreateMode,
 } from "./esaytree.js";
 import { OrchestrationStore } from "./store.js";
-import type { Dispatch, Task } from "./model.js";
+import type { Dispatch, DispatchSkillBinding, Task } from "./model.js";
 import { WorktreeAssetService } from "./worktree-assets.js";
 import {
   findLiveSessionForRun,
@@ -43,6 +45,8 @@ export interface StartWorkerInput {
   taskId: string;
   agent: AgentKind;
   accountId?: string | undefined;
+  /** 省略则使用 Task 上冻结的 skills；显式传入可为本次派发覆盖。 */
+  skills?: string[] | undefined;
   /** 新 worktree 才能与其他 worker 并行改代码；none 用协调者当前 cwd。 */
   worktree: WorktreeMode;
   /** 仅在 worktree:new 时用作仓库定位；none 时就是 worker 的 cwd。 */
@@ -94,7 +98,8 @@ export class DispatchError extends Error {
       | "wrong_worker"
       | "worker_not_active"
       | "worktree_busy"
-      | "worker_session_live",
+      | "worker_session_live"
+      | "skills_invalid",
   ) {
     super(message);
   }
@@ -275,6 +280,7 @@ export class DispatchService {
     let worktree: ({ repo: string } & WorkerWorktree) | null = null;
     let session: SessionInfo | null = null;
     let dispatch: Dispatch | null = null;
+    let skillBindings: DispatchSkillBinding[] = [];
     let startingAssetId: string | null = null;
     const result = (resultSession: SessionInfo, resultDispatch: Dispatch): StartWorkerResult => ({
       task: this.store.getTask(task.id),
@@ -304,6 +310,12 @@ export class DispatchService {
         // 显式 task.done/fail 已同步落盘后，kill 的后台收尾可能仍留下一个旧的
         // live facade。交付终态比那份过渡中的内存状态更权威。
         if (isSettledDispatch(currentDispatch)) return { ...current, status: "done" };
+        // quiet PTY 可以在 readiness 总超时后成功接收完整 prompt，却仍未产生首帧，
+        // 因而 SessionManager 暂时保留 starting。worker.start 已把 prompt 写入并将
+        // Dispatch 原子推进为 running 后，成功响应不能再回传 create() 的过期状态。
+        if (currentDispatch.state === "running" && current.status === "starting") {
+          return { ...current, status: "running" };
+        }
         return current;
       } catch {
         // PTY kill 会从 SessionManager 删除会话。若 Dispatch 已落定，不能回传
@@ -373,6 +385,36 @@ export class DispatchService {
         }
       }
 
+      const requestedSkills = input.skills ?? task.skills ?? [];
+      if (requestedSkills.length > 0 && input.kind === "pty") {
+        throw new DispatchError("显式 Skill 绑定只支持 structured worker", "skills_invalid");
+      }
+      if (requestedSkills.length > 0) {
+        const allowed = new Set(requestedSkills.map((skill) => skill.trim().toLocaleLowerCase()));
+        const mentioned = [...task.spec.matchAll(/(?:^|\s)\$([A-Za-z0-9][A-Za-z0-9._:-]*)/g)]
+          .map((match) => match[1]!.toLocaleLowerCase());
+        const undeclared = [...new Set(mentioned.filter((skill) => !allowed.has(skill)))];
+        if (undeclared.length > 0) {
+          throw new DispatchError(
+            `任务 spec 引用了未显式绑定的 Skill: ${undeclared.join(", ")}`,
+            "skills_invalid",
+          );
+        }
+      }
+      try {
+        const resolvedSkills = await resolveExplicitSkills(workerCwd, requestedSkills);
+        skillBindings = resolvedSkills.map((skill) => ({
+          name: skill.name,
+          path: skill.path,
+          sha256: createHash("sha256").update(skill.contents).digest("hex"),
+        }));
+      } catch (error) {
+        throw new DispatchError(
+          `Skill 解析失败: ${error instanceof Error ? error.message : String(error)}`,
+          "skills_invalid",
+        );
+      }
+
       let coordinator: SessionInfo | null = null;
       if (run.coordinatorSessionId) {
         try {
@@ -395,6 +437,9 @@ export class DispatchService {
         // worker 是 daemon 自己创建的本地进程，不沿用某一台手机的 allowShell。
         allowShell: true,
       });
+      if (skillBindings.length > 0 && session.kind !== "structured") {
+        throw new DispatchError("显式 Skill 绑定只支持 structured worker", "skills_invalid");
+      }
       let hostOwnerIdentity: string | null | undefined;
       try {
         hostOwnerIdentity = this.sessions.hostOwnerIdentityOf?.(session.id);
@@ -407,6 +452,7 @@ export class DispatchService {
         sessionId: session.id,
         ...(hostOwnerIdentity ? { hostOwnerIdentity } : {}),
         worktreePath: worktree?.path ?? null,
+        skills: skillBindings,
       });
       if (worktree) this.store.linkWorktreeAssetDispatch(worktree.assetId, dispatch.id);
       // worker.start 的成功响应必须代表可恢复事实，而不只是内存状态。尤其是
@@ -416,7 +462,10 @@ export class DispatchService {
       // 任何可能让 agent 执行用户代码的前导词。
       this.store.persistNow();
 
-      const prompt = workerPrompt(task, session.id, workerCwd, run.coordinatorSessionId);
+      const prompt = workerPrompt(
+        task, session.id, workerCwd, run.coordinatorSessionId,
+        skillBindings.map((skill) => skill.name),
+      );
       if (session.kind === "structured") {
         await this.sessions.chatSend(session.id, prompt);
       } else {
@@ -603,6 +652,7 @@ function workerPrompt(
   sessionId: string,
   cwd: string,
   coordinatorSessionId: string | null,
+  skills: string[],
 ): string {
   return [
     "你是 Prospero 编排中的 worker。只处理下面这一个任务，不要自行创建或派发其他 worker。",
@@ -611,6 +661,9 @@ function workerPrompt(
     `协调者会话: ${coordinatorSessionId ?? "未指定"}`,
     `工作目录: ${cwd}`,
     `任务: ${task.title}`,
+    ...(skills.length > 0
+      ? [`显式 Skills: ${skills.map((skill) => `$${skill}`).join(" ")}`]
+      : []),
     `要求:\n${task.spec}`,
     "完成并自行验证后，必须执行：",
     `prospero --session ${sessionId} task done --id ${task.id} --body \"简短交付摘要\"`,

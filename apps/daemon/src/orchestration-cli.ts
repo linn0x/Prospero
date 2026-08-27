@@ -106,12 +106,14 @@ task
   .requiredOption("--run <id>", "Run ID")
   .requiredOption("--title <text>", "任务标题")
   .requiredOption("--spec <text>", "任务要求")
+  .option("--skill <name...>", "显式分配给该任务的 Skill（最多 5 个）")
   .option("--dep <taskId...>", "前置 Task ID，可重复")
   .option("--parent <taskId>", "父任务 ID")
   .action(action("task.create", (opts) => ({
     runId: requireText(opts["run"], "--run"),
     title: requireText(opts["title"], "--title"),
     spec: requireText(opts["spec"], "--spec"),
+    skills: Array.isArray(opts["skill"]) ? opts["skill"] : [],
     deps: Array.isArray(opts["dep"]) ? opts["dep"] : [],
     ...(typeof opts["parent"] === "string" ? { parentId: opts["parent"] } : {}),
     actorSessionId: optionalSession(),
@@ -165,12 +167,14 @@ worker
   .option("--cwd <path>", "任务工作目录", process.cwd())
   .option("--kind <kind>", "structured 或 pty")
   .option("--approval-policy <policy>", "strict/standard/yolo")
+  .option("--skill <name...>", "覆盖 Task 的显式 Skill（最多 5 个）")
   .option("--operation-id <id>", "调用方提供时，用于同一 worker.start 请求的幂等重试")
   .action(action("worker.start", (opts) => ({
     taskId: requireText(opts["task"], "--task"),
     agent: requireText(opts["agent"], "--agent"),
     worktree: opts["worktree"],
     cwd: requireText(opts["cwd"], "--cwd"),
+    ...(Array.isArray(opts["skill"]) ? { skills: opts["skill"] } : {}),
     ...(typeof opts["kind"] === "string" ? { kind: opts["kind"] } : {}),
     ...(typeof opts["approvalPolicy"] === "string"
       ? { approvalPolicy: opts["approvalPolicy"] }

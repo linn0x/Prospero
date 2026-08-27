@@ -14,6 +14,26 @@ const unusedSessions: WorkerSessionManager = {
 };
 
 describe("控制 API 的交付报告", () => {
+  it("task.create 将显式 Skill 保存为独立字段而不是只塞进 spec", async () => {
+    const store = new OrchestrationStore();
+    const run = store.createRun({ objective: "多 Skill", coordinatorSessionId: "coord" });
+    const api = orchestrationControlApi(
+      store,
+      new DispatchService(store, unusedSessions),
+      new CollaborationService(store),
+    );
+    const task = await api("task.create", {
+      runId: run.id,
+      title: "路由探索",
+      spec: "只读分析",
+      skills: ["api-search", "psm-to-repo"],
+      actorSessionId: "coord",
+    }, new AbortController().signal) as { spec: string; skills: string[] };
+
+    expect(task.spec).toBe("只读分析");
+    expect(task.skills).toEqual(["api-search", "psm-to-repo"]);
+  });
+
   it("worker task.done 会唤醒协调者邮箱，而不是靠 session idle 猜完成", async () => {
     const store = new OrchestrationStore();
     const run = store.createRun({ objective: "报告", coordinatorSessionId: "coord" });
