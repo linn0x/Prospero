@@ -13,6 +13,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import {
   type Dispatch,
+  type DispatchSkillBinding,
   type Gate,
   type Message,
   type OperationRecord,
@@ -33,6 +34,8 @@ import {
 } from "./model.js";
 
 const PERSIST_DEBOUNCE_MS = 200;
+export const MAX_TASK_SKILLS = 5;
+const SKILL_NAME = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 
 export class OrchestrationError extends Error {
   constructor(message: string, readonly code: OrchestrationErrorCode) {
@@ -67,8 +70,31 @@ export interface GraphNodeInput {
   clientId: string;
   title: string;
   spec: string;
+  skills?: string[];
   deps: string[];
   parentId?: string | null;
+}
+
+export function normalizeTaskSkills(values: readonly string[] | undefined): string[] {
+  const normalized: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of values ?? []) {
+    const value = raw.trim();
+    if (!SKILL_NAME.test(value)) {
+      throw new OrchestrationError(`无效 Skill 名称: ${raw}`, "graph_invalid");
+    }
+    const key = value.toLocaleLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    normalized.push(value);
+  }
+  if (normalized.length > MAX_TASK_SKILLS) {
+    throw new OrchestrationError(
+      `每个任务最多显式绑定 ${String(MAX_TASK_SKILLS)} 个 Skill`,
+      "graph_invalid",
+    );
+  }
+  return normalized;
 }
 
 export interface GraphMutationResult {
@@ -117,9 +143,22 @@ export class OrchestrationStore {
           run.automation ??= null;
           run.coordinatorPrompt ??= null;
         }
+        let migrated = parsed.version === 1;
+        const tasks = parsed.tasks ?? {};
+        for (const task of Object.values(tasks)) {
+          const legacy = task as Task & { skills?: unknown };
+          const before = legacy.skills;
+          try {
+            legacy.skills = Array.isArray(before)
+              ? normalizeTaskSkills(before.filter((value): value is string => typeof value === "string"))
+              : [];
+          } catch {
+            legacy.skills = [];
+          }
+          if (!Array.isArray(before) || JSON.stringify(before) !== JSON.stringify(legacy.skills)) migrated = true;
+        }
         const dispatches = parsed.dispatches ?? {};
         const worktreeAssets = parsed.worktreeAssets ?? {};
-        let migrated = parsed.version === 1;
 
         // v1 把 worktree 只挂在 Run automation 或 Dispatch 上；一旦删除 Run，
         // 那些路径就没有任何可发现索引。升级时只保守登记，绝不尝试检查或删除。
@@ -159,7 +198,7 @@ export class OrchestrationStore {
         this.state = {
           version: 2,
           runs,
-          tasks: parsed.tasks ?? {},
+          tasks,
           dispatches,
           messages: parsed.messages ?? {},
           gates: parsed.gates ?? {},
@@ -716,6 +755,7 @@ export class OrchestrationStore {
     runId: string;
     title: string;
     spec: string;
+    skills?: string[];
     deps?: string[];
     parentId?: string | null;
   }): Task {
@@ -734,6 +774,7 @@ export class OrchestrationStore {
       runId: input.runId,
       title: input.title,
       spec: input.spec,
+      skills: normalizeTaskSkills(input.skills),
       deps,
       parentId: input.parentId ?? null,
       status: "pending",
@@ -908,6 +949,7 @@ export class OrchestrationStore {
         runId: run.id,
         title: node.title.trim(),
         spec: node.spec.trim(),
+        skills: normalizeTaskSkills(node.skills),
         deps,
         parentId,
         status: "pending",
@@ -1019,6 +1061,7 @@ export class OrchestrationStore {
         runId: run.id,
         title: node.title.trim(),
         spec: node.spec.trim(),
+        skills: normalizeTaskSkills(node.skills),
         deps: node.deps.map((dep) => resolveReference(dep, "依赖节点")),
         parentId: node.parentId == null
           ? null
@@ -1162,6 +1205,7 @@ export class OrchestrationStore {
     sessionId: string;
     hostOwnerIdentity?: string | undefined;
     worktreePath?: string | null;
+    skills?: DispatchSkillBinding[];
   }): Dispatch {
     const task = this.getTask(input.taskId);
     this.requireActiveRun(task.runId);
@@ -1198,6 +1242,9 @@ export class OrchestrationStore {
       sessionId: input.sessionId,
       ...(input.hostOwnerIdentity ? { hostOwnerIdentity: input.hostOwnerIdentity } : {}),
       worktreePath: input.worktreePath ?? null,
+      ...(input.skills && input.skills.length > 0
+        ? { skills: input.skills.map((skill) => ({ ...skill })) }
+        : {}),
       state: "starting",
       startedAt: Date.now(),
       settledAt: null,

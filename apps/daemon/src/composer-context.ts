@@ -8,7 +8,7 @@ const FILE_CACHE_MS = 15_000;
 const SKILL_CACHE_MS = 30_000;
 const MAX_INDEX_ENTRIES = 20_000;
 const MAX_SKILLS = 500;
-const MAX_SELECTED_SKILLS = 5;
+export const MAX_SELECTED_SKILLS = 5;
 
 const SKIP_DIRS = new Set([
   ".git",
@@ -364,6 +364,35 @@ async function resolveSkillMentions(cwd: string, text: string): Promise<Resolved
       // 补全后文件恰好被删：保留用户原文，让 agent 自己解释找不到。
     }
     if (selected.length >= MAX_SELECTED_SKILLS) break;
+  }
+  return selected;
+}
+
+/**
+ * 编排派发使用的严格 Skill 解析：显式指定就必须全部存在且可读，不能像手输
+ * composer 文本那样把拼错的 `$name` 静默降级成普通文字。
+ */
+export async function resolveExplicitSkills(cwd: string, names: readonly string[]): Promise<ResolvedSkill[]> {
+  const requested = [...new Set(names.map((name) => name.trim().toLocaleLowerCase()).filter(Boolean))];
+  if (requested.length === 0) return [];
+  if (requested.length > MAX_SELECTED_SKILLS) {
+    throw new Error(`每个 worker 最多显式绑定 ${String(MAX_SELECTED_SKILLS)} 个 Skill`);
+  }
+  const skills = await discoveredSkills(cwd);
+  const selected: ResolvedSkill[] = [];
+  for (const name of requested) {
+    const match = skills.find((skill) => skill.name.toLocaleLowerCase() === name);
+    if (!match) throw new Error(`找不到显式指定的 Skill: ${name}`);
+    try {
+      selected.push({
+        name: match.name,
+        description: match.description,
+        path: match.path,
+        contents: await readFile(match.path, "utf8"),
+      });
+    } catch {
+      throw new Error(`无法读取显式指定的 Skill: ${match.name}`);
+    }
   }
   return selected;
 }

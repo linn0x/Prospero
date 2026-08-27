@@ -34,7 +34,10 @@ export class AutomationError extends Error {
 }
 
 export class AutomationService {
-  /** 同一 Run 的 tick 串成 promise 链，防止 task.done 与手机操作同时派发两个 worker。 */
+  /**
+   * 同一 Run 的 tick 串成 promise 链，防止 task.done 与手机操作同时派发两个 worker；
+   * key 是 runId，因此不同 Run 没有全局队列，可同时推进独立编排流。
+   */
   private readonly queues = new Map<string, Promise<void>>();
 
   constructor(

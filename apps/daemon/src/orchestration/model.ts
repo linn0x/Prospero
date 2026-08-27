@@ -89,6 +89,8 @@ export interface Task {
   runId: string;
   title: string;
   spec: string;
+  /** 显式分配给 worker 的 Skill 名称；派发前按 worker cwd 解析并 fail-closed。 */
+  skills?: string[];
   deps: string[];
   parentId: string | null;
   status: TaskStatus;
@@ -96,6 +98,13 @@ export interface Task {
   result: string | null;
   createdAt: number;
   updatedAt: number;
+}
+
+/** worker 启动时冻结的实际 Skill 身份，避免只靠 prompt 文本猜测。 */
+export interface DispatchSkillBinding {
+  name: string;
+  path: string;
+  sha256: string;
 }
 
 export type DispatchState =
@@ -118,6 +127,8 @@ export interface Dispatch {
    */
   hostOwnerIdentity?: string;
   worktreePath: string | null;
+  /** 本次派发实际注入的 Skill；旧 Dispatch 可省略。 */
+  skills?: DispatchSkillBinding[];
   state: DispatchState;
   startedAt: number;
   settledAt: number | null;

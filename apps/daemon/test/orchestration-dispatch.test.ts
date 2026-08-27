@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import os from "node:os";
 import path from "node:path";
@@ -73,6 +73,26 @@ class FakeSessions implements WorkerSessionManager {
   infoOf(sid: string): SessionInfo {
     const session = this.live.get(sid);
     if (!session) throw new Error(`no such session: ${sid}`);
+    return session;
+  }
+}
+
+class UniqueFakeSessions extends FakeSessions {
+  override async create(input: CreateSessionInput): Promise<SessionInfo> {
+    this.creates.push(input);
+    await this.createBarrier;
+    const session: SessionInfo = {
+      id: `worker-session-${String(this.creates.length)}`,
+      agent: input.agent,
+      kind: input.kind ?? "structured",
+      title: "worker",
+      cwd: input.cwd ?? "/tmp",
+      status: "idle",
+      createdAt: Date.now(),
+      cols: input.cols,
+      rows: input.rows,
+    };
+    this.live.set(session.id, session);
     return session;
   }
 }
@@ -181,6 +201,157 @@ async function waitForReadinessListener(sessions: InitializingTuiSessions): Prom
 }
 
 describe("DispatchService", () => {
+  it("同一 Run 可向多个 ready Task 并行派发带不同 Skill 的隔离 worker", async () => {
+    const roots = [
+      mkdtempSync(path.join(os.tmpdir(), "prospero-route-worker-")),
+      mkdtempSync(path.join(os.tmpdir(), "prospero-risk-worker-")),
+    ];
+    try {
+      for (const [index, name] of ["route-inspector", "risk-inspector"].entries()) {
+        const skillRoot = path.join(roots[index]!, ".agents", "skills", name);
+        mkdirSync(skillRoot, { recursive: true });
+        writeFileSync(
+          path.join(skillRoot, "SKILL.md"),
+          `---\nname: ${name}\ndescription: ${name}\n---\n# ${name}\n`,
+        );
+      }
+      const store = new OrchestrationStore();
+      const run = store.createRun({ objective: "并行探索" });
+      const route = store.createTask({
+        runId: run.id, title: "路由", spec: "只读查路由", skills: ["route-inspector"],
+      });
+      const risk = store.createTask({
+        runId: run.id, title: "风险", spec: "只读查风险", skills: ["risk-inspector"],
+      });
+      const sessions = new UniqueFakeSessions();
+      let release!: () => void;
+      sessions.createBarrier = new Promise<void>((resolve) => { release = resolve; });
+      const service = new DispatchService(store, sessions);
+
+      const starts = Promise.all([
+        service.startWorker({
+          taskId: route.id, agent: "codex", kind: "structured", worktree: "none", cwd: roots[0]!,
+        }),
+        service.startWorker({
+          taskId: risk.id, agent: "codex", kind: "structured", worktree: "none", cwd: roots[1]!,
+        }),
+      ]);
+      await expect.poll(() => sessions.creates.length).toBe(2);
+      release();
+      const started = await starts;
+
+      expect(started.map((item) => item.dispatch.skills?.[0]?.name).sort()).toEqual([
+        "risk-inspector", "route-inspector",
+      ]);
+      expect(store.listDispatches(run.id)).toHaveLength(2);
+      expect(sessions.messages.map((item) => item.text).join("\n")).toContain("$route-inspector");
+      expect(sessions.messages.map((item) => item.text).join("\n")).toContain("$risk-inspector");
+    } finally {
+      for (const root of roots) rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("显式 Skill 在派发前解析并以 provenance 冻结到 Dispatch", async () => {
+    const cwd = mkdtempSync(path.join(os.tmpdir(), "prospero-dispatch-skills-"));
+    try {
+      const skillRoot = path.join(cwd, ".agents", "skills", "route-inspector");
+      mkdirSync(skillRoot, { recursive: true });
+      writeFileSync(path.join(skillRoot, "SKILL.md"), [
+        "---",
+        "name: route-inspector",
+        "description: inspect routes",
+        "---",
+        "# Route inspector",
+      ].join("\n"));
+      const store = new OrchestrationStore();
+      const run = store.createRun({ objective: "显式 Skill" });
+      const task = store.createTask({
+        runId: run.id,
+        title: "查路由",
+        spec: "只读探索",
+        skills: ["task-default-is-overridden"],
+      });
+      const sessions = new FakeSessions();
+      const service = new DispatchService(store, sessions);
+
+      const started = await service.startWorker({
+        taskId: task.id,
+        agent: "codex",
+        kind: "structured",
+        worktree: "none",
+        cwd,
+        skills: ["route-inspector"],
+      });
+
+      expect(started.dispatch.skills).toEqual([{
+        name: "route-inspector",
+        path: path.join(realpathSync.native(skillRoot), "SKILL.md"),
+        sha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+      }]);
+      expect(sessions.messages[0]?.text).toContain("显式 Skills: $route-inspector");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("显式 Skill 不存在时 fail-closed，且不会创建 worker 会话", async () => {
+    const cwd = mkdtempSync(path.join(os.tmpdir(), "prospero-dispatch-missing-skill-"));
+    try {
+      const store = new OrchestrationStore();
+      const run = store.createRun({ objective: "Skill 门禁" });
+      const task = store.createTask({
+        runId: run.id,
+        title: "缺 Skill",
+        spec: "不得降级",
+        skills: ["does-not-exist"],
+      });
+      const sessions = new FakeSessions();
+      const service = new DispatchService(store, sessions);
+
+      await expect(service.startWorker({
+        taskId: task.id,
+        agent: "codex",
+        kind: "structured",
+        worktree: "none",
+        cwd,
+      })).rejects.toMatchObject({ code: "skills_invalid" } satisfies Partial<DispatchError>);
+      expect(sessions.creates).toEqual([]);
+      expect(store.getTask(task.id).status).toBe("pending");
+      expect(store.listDispatches(run.id)).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("显式 Skill 模式拒绝 spec 偷带未登记的额外 $Skill", async () => {
+    const cwd = mkdtempSync(path.join(os.tmpdir(), "prospero-dispatch-undeclared-skill-"));
+    try {
+      const store = new OrchestrationStore();
+      const run = store.createRun({ objective: "Skill provenance" });
+      const task = store.createTask({
+        runId: run.id,
+        title: "额外 Skill",
+        spec: "使用 $medusa-query 绕过声明",
+        skills: ["api-search"],
+      });
+      const sessions = new FakeSessions();
+      const service = new DispatchService(store, sessions);
+
+      await expect(service.startWorker({
+        taskId: task.id,
+        agent: "codex",
+        kind: "structured",
+        worktree: "none",
+        cwd,
+      })).rejects.toMatchObject({ code: "skills_invalid" } satisfies Partial<DispatchError>);
+      expect(sessions.creates).toEqual([]);
+      expect(store.getTask(task.id).status).toBe("pending");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+
   it("等待 PTY TUI 首帧稳定后恰好提交一次完整 worker prompt", async () => {
     vi.useFakeTimers();
     try {
