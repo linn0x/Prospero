@@ -238,6 +238,19 @@ export function orchestrationControlApi(
         }
         case "run.list":
           return store.listRuns();
+        case "run.snapshot.compact":
+          return store.compactRunSnapshot(text(params, "runId"));
+        case "run.events.since": {
+          const limit = params["limit"] === undefined ? 128 : nonnegativeInteger(params, "limit");
+          if (limit < 1 || limit > 512) {
+            throw new ControlSocketError("limit 必须在 1 到 512 之间", "bad_params");
+          }
+          return store.eventsSince(
+            text(params, "runId"),
+            nonnegativeInteger(params, "afterSeq"),
+            limit,
+          );
+        }
         case "run.complete": {
           const runId = text(params, "runId");
           const actorSessionId = optionalText(params, "actorSessionId");
@@ -342,6 +355,8 @@ export function orchestrationControlApi(
           const runId = optionalText(params, "runId");
           return store.listTasks(runId ?? undefined);
         }
+        case "task.get":
+          return store.getTask(text(params, "taskId"));
         case "task.done": {
           const actorSessionId = optionalText(params, "actorSessionId");
           const taskId = text(params, "taskId");
