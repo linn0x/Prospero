@@ -13,6 +13,39 @@ const unusedSessions: WorkerSessionManager = {
   infoOf() { throw new Error("not used"); },
 };
 
+describe("控制 API 的紧凑 Run 协议", () => {
+  it("提供 compact snapshot、events.since 和按需 task.get", async () => {
+    const store = new OrchestrationStore();
+    const run = store.createRun({ objective: "增量协议" });
+    const task = store.createTask({ runId: run.id, title: "A", spec: "完整指令" });
+    const api = orchestrationControlApi(
+      store,
+      new DispatchService(store, unusedSessions),
+      new CollaborationService(store),
+    );
+    const signal = new AbortController().signal;
+    const snapshot = await api("run.snapshot.compact", { runId: run.id }, signal) as {
+      cursor: number;
+      tasks: Record<string, Record<string, unknown>>;
+    };
+    expect(snapshot.tasks[task.id]).not.toHaveProperty("spec");
+
+    store.createDispatch({ taskId: task.id, sessionId: "worker" });
+    const events = await api("run.events.since", {
+      runId: run.id,
+      afterSeq: snapshot.cursor,
+      limit: 64,
+    }, signal) as { nextSeq: number; events: Array<{ entity: string }> };
+    expect(events.nextSeq).toBeGreaterThan(snapshot.cursor);
+    expect(events.events.map((event) => event.entity)).toEqual(expect.arrayContaining(["task", "dispatch"]));
+
+    await expect(api("task.get", { taskId: task.id }, signal)).resolves.toMatchObject({
+      id: task.id,
+      spec: "完整指令",
+    });
+  });
+});
+
 describe("控制 API 的交付报告", () => {
   it("task.create 将显式 Skill 保存为独立字段而不是只塞进 spec", async () => {
     const store = new OrchestrationStore();

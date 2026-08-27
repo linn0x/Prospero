@@ -172,6 +172,41 @@ describe("Run 与 Task", () => {
     store.updateRun(run.id, { objective: "不再通知" });
     expect(changes).toBe(2);
   });
+
+  it("按 Run 返回不含 spec 的紧凑快照，并用单调游标续传增量事件", () => {
+    const store = new OrchestrationStore();
+    const run = store.createRun({ objective: "增量编排" });
+    const task = store.createTask({
+      runId: run.id,
+      title: "探索",
+      spec: "这段很长的 worker 指令不应进入紧凑快照",
+      skills: ["api-search"],
+    });
+    const initial = store.compactRunSnapshot(run.id);
+
+    expect(initial.protocol).toBe("prospero.orchestration.run.v1");
+    expect(initial.tasks[task.id]).toMatchObject({
+      id: task.id,
+      status: "pending",
+      skills: ["api-search"],
+    });
+    expect(initial.tasks[task.id]).not.toHaveProperty("spec");
+
+    store.createDispatch({ taskId: task.id, sessionId: "worker" });
+    const page = store.eventsSince(run.id, initial.cursor, 128);
+    expect(page).toMatchObject({
+      protocol: "prospero.orchestration.events.v1",
+      runId: run.id,
+      afterSeq: initial.cursor,
+      gap: false,
+      hasMore: false,
+    });
+    expect(page.nextSeq).toBeGreaterThan(initial.cursor);
+    expect(page.events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ entity: "task", operation: "upsert" }),
+      expect.objectContaining({ entity: "dispatch", operation: "upsert" }),
+    ]));
+  });
 });
 
 describe("原子任务图", () => {
@@ -692,6 +727,11 @@ describe("落盘", () => {
     expect(reopened.activeDispatchFor(task.id)?.sessionId).toBe("s1");
     expect(reopened.activeDispatchFor(task.id)?.skills).toEqual([
       { name: "api-search", path: "/tmp/api-search/SKILL.md", sha256: "a".repeat(64) },
+    ]);
+    const cursor = reopened.compactRunSnapshot(run.id).cursor;
+    reopened.setDispatchState(reopened.activeDispatchFor(task.id)!.id, "running");
+    expect(reopened.eventsSince(run.id, cursor).events).toEqual([
+      expect.objectContaining({ entity: "dispatch", operation: "upsert" }),
     ]);
   });
 
