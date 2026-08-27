@@ -68,6 +68,10 @@ function textList(params: Params, name: string): string[] {
   return value as string[];
 }
 
+function optionalTextList(params: Params, name: string): string[] | undefined {
+  return params[name] === undefined ? undefined : textList(params, name);
+}
+
 function nonnegativeInteger(params: Params, name: string): number {
   const value = params[name];
   if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
@@ -96,6 +100,7 @@ function graphNodes(params: Params): GraphNodeInput[] {
       clientId: text(node, "clientId"),
       title: text(node, "title"),
       spec: text(node, "spec"),
+      skills: textList(node, "skills"),
       deps: textList(node, "deps"),
       ...(parentId !== null ? { parentId } : {}),
     };
@@ -287,6 +292,7 @@ export function orchestrationControlApi(
             runId,
             title: text(params, "title"),
             spec: text(params, "spec"),
+            skills: textList(params, "skills"),
             deps: textList(params, "deps"),
             ...(parentId !== null ? { parentId } : {}),
           };
@@ -383,6 +389,7 @@ export function orchestrationControlApi(
           if (rawPolicy !== null && !POLICIES.has(rawPolicy as ApprovalPolicy)) {
             throw new ControlSocketError("approvalPolicy 必须是 strict、standard 或 yolo", "bad_params");
           }
+          const skillOverride = optionalTextList(params, "skills");
           const input = {
             taskId,
             agent: agent as AgentKind,
@@ -391,6 +398,9 @@ export function orchestrationControlApi(
               : {}),
             worktree: worktree as WorktreeMode,
             cwd: text(params, "cwd"),
+            ...(skillOverride !== undefined
+              ? { skills: skillOverride }
+              : {}),
             ...(rawKind !== null ? { kind: rawKind as SessionKind } : {}),
             ...(rawPolicy !== null ? { approvalPolicy: rawPolicy as ApprovalPolicy } : {}),
           };

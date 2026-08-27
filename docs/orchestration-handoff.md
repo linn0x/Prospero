@@ -79,12 +79,18 @@ worker 显式 `prospero task done` / `task fail`。
 
   ```bash
   prospero worker start --task TASK_ID --agent codex --worktree new \
+    --skill api-search psm-to-repo \
     [--operation-id RETRY_ID]
   prospero worktree list [--run RUN_ID]
   prospero worktree inspect --id WT_ASSET_ID --target main
   prospero worktree cleanup --id WT_ASSET_ID --target main \
     --operation-id UNIQUE_ID --confirm
   ```
+
+  `task create --skill ...` 将默认 Skill 固化在 Task；`worker start --skill ...` 可只覆盖本次
+  Dispatch。每次最多 5 个，名称必须来自当前 worker cwd 可发现的项目/用户 Skill 根；派发
+  fail-closed 解析并在 Dispatch 保存实际路径和 SHA-256。多个 Run 可并行派发；自动执行只在
+  同一 Run 内串行，跨 Run 不共享全局队列。
 
   control socket 的普通短 RPC 默认等待 15 秒。只有 `worker.start` 使用命令级 5 分钟上限，
   给 esaytree CoW（或 CoW 不可用时的依赖复制）和 agent session 创建完成后再返回；这不是无限

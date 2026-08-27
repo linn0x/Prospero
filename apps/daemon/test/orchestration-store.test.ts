@@ -22,6 +22,23 @@ function seed(): { store: OrchestrationStore; runId: string } {
 }
 
 describe("Run 与 Task", () => {
+  it("显式 Skill 随 Task 持久模型保存，并按名称大小写去重", () => {
+    const { store, runId } = seed();
+    const task = store.createTask({
+      runId,
+      title: "探索",
+      spec: "按能力探索",
+      skills: ["api-search", "API-SEARCH", "psm-to-repo"],
+    });
+    expect(task.skills).toEqual(["api-search", "psm-to-repo"]);
+    expect(() => store.createTask({
+      runId,
+      title: "非法",
+      spec: "拒绝路径注入",
+      skills: ["../secret"],
+    })).toThrow(/无效 Skill 名称/);
+  });
+
   it("建任务、按 Run 列出、依赖必须真实存在", () => {
     const { store, runId } = seed();
     const a = store.createTask({ runId, title: "A", spec: "做 A" });
@@ -158,6 +175,33 @@ describe("Run 与 Task", () => {
 });
 
 describe("原子任务图", () => {
+  it("graph.create/apply 原子保存每个节点不同的 Skill 集合", () => {
+    const store = new OrchestrationStore();
+    const created = store.createRunGraph({
+      objective: "多 Skill 探索",
+      nodes: [
+        { clientId: "route", title: "路由", spec: "查路由", skills: ["api-search"], deps: [] },
+        { clientId: "risk", title: "归因", spec: "查风险", skills: ["medusa-query"], deps: [] },
+      ],
+    });
+    expect(store.getTask(created.idMap["route"]!).skills).toEqual(["api-search"]);
+    expect(store.getTask(created.idMap["risk"]!).skills).toEqual(["medusa-query"]);
+
+    const applied = store.applyTaskGraph({
+      runId: created.run.id,
+      baseRevision: created.run.graphRevision,
+      nodes: [{
+        clientId: created.idMap["route"]!,
+        title: "路由",
+        spec: "查路由",
+        skills: ["api-search", "psm-to-repo"],
+        deps: [],
+      }],
+    });
+    expect(applied.tasks.find((task) => task.id === created.idMap["route"])?.skills)
+      .toEqual(["api-search", "psm-to-repo"]);
+  });
+
   it("一次创建 Run 和整张 DAG，并把临时节点 id 映射为持久 task id", () => {
     const store = new OrchestrationStore();
     const result = store.createRunGraph({
@@ -602,18 +646,53 @@ describe("决策门", () => {
 });
 
 describe("落盘", () => {
+  it("旧 v2 Task 缺少 skills 时迁移为空数组而不丢整份编排状态", () => {
+    const home = tmpHome();
+    writeFileSync(path.join(home, "orchestration.json"), JSON.stringify({
+      version: 2,
+      runs: {
+        run_old: {
+          id: "run_old", objective: "旧编排", status: "active",
+          coordinatorSessionId: null, graphRevision: 1,
+          automation: null, coordinatorPrompt: null, createdAt: 1, updatedAt: 1,
+        },
+      },
+      tasks: {
+        task_old: {
+          id: "task_old", runId: "run_old", title: "旧任务", spec: "旧格式",
+          deps: [], parentId: null, status: "pending", result: null,
+          createdAt: 1, updatedAt: 1,
+        },
+      },
+      dispatches: {}, messages: {}, gates: {}, operations: {}, worktreeAssets: {},
+    }));
+
+    const store = new OrchestrationStore(home);
+    expect(store.getTask("task_old")).toMatchObject({ title: "旧任务", skills: [] });
+  });
+
   it("重开一个 store 能读回全部状态", () => {
     const home = tmpHome();
     const store = new OrchestrationStore(home);
     const run = store.createRun({ objective: "持久化" });
-    const task = store.createTask({ runId: run.id, title: "A", spec: "做 A" });
-    store.createDispatch({ taskId: task.id, sessionId: "s1" });
+    const task = store.createTask({
+      runId: run.id, title: "A", spec: "做 A", skills: ["api-search"],
+    });
+    store.createDispatch({
+      taskId: task.id,
+      sessionId: "s1",
+      skills: [{ name: "api-search", path: "/tmp/api-search/SKILL.md", sha256: "a".repeat(64) }],
+    });
     store.close();
 
     const reopened = new OrchestrationStore(home);
     expect(reopened.listRuns().map((r) => r.objective)).toEqual(["持久化"]);
     expect(reopened.getTask(task.id).status).toBe("dispatched");
+    expect(reopened.getTask(task.id).skills).toEqual(["api-search"]);
     expect(reopened.activeDispatchFor(task.id)?.sessionId).toBe("s1");
+    expect(reopened.activeDispatchFor(task.id)?.skills).toEqual([
+      { name: "api-search", path: "/tmp/api-search/SKILL.md", sha256: "a".repeat(64) },
+    ]);
   });
 
   it("文件坏了当空的开始 —— 编排状态坏掉不该让 daemon 起不来", () => {

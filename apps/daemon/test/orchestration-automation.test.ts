@@ -15,9 +15,11 @@ import type { CreateSessionInput } from "../src/session-manager.js";
 class FakeSessions implements WorkerSessionManager {
   readonly creates: CreateSessionInput[] = [];
   readonly messages: Array<{ sid: string; text: string }> = [];
+  createBarrier: Promise<void> | null = null;
 
   async create(input: CreateSessionInput): Promise<SessionInfo> {
     this.creates.push(input);
+    await this.createBarrier;
     return {
       id: `worker-${this.creates.length}`,
       agent: input.agent,
@@ -88,6 +90,38 @@ function graph(): {
 }
 
 describe("静态 DAG 自动执行", () => {
+  it("不同 Run 的自动编排可并行派发，不被单个全局队列串行化", async () => {
+    const store = new OrchestrationStore();
+    const first = store.createRunGraph({
+      objective: "探索流 A",
+      nodes: [{ clientId: "a", title: "A", spec: "探索 A", deps: [] }],
+    });
+    const second = store.createRunGraph({
+      objective: "探索流 B",
+      nodes: [{ clientId: "b", title: "B", spec: "探索 B", deps: [] }],
+    });
+    const sessions = new FakeSessions();
+    let release!: () => void;
+    sessions.createBarrier = new Promise<void>((resolve) => { release = resolve; });
+    const automation = new AutomationService(store, new DispatchService(store, sessions));
+    const input = {
+      agent: "codex" as const,
+      approvalPolicy: "standard" as const,
+      workspace: "current" as const,
+    };
+
+    const starts = Promise.all([
+      automation.start({ ...input, runId: first.run.id, cwd: temporaryRoot() }),
+      automation.start({ ...input, runId: second.run.id, cwd: temporaryRoot() }),
+    ]);
+    await expect.poll(() => sessions.creates.length).toBe(2);
+    release();
+    await starts;
+
+    expect(store.listDispatches(first.run.id)).toHaveLength(1);
+    expect(store.listDispatches(second.run.id)).toHaveLength(1);
+  });
+
   it("只在 worker 显式交付后派下游，全部完成后关闭 Run", async () => {
     const ctx = graph();
     const cwd = temporaryRoot();

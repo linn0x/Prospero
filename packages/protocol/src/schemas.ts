@@ -807,6 +807,8 @@ export const OrchestrationTaskSchema = z.object({
   runId: z.string().min(1).max(200),
   title: z.string().min(1).max(2_000),
   spec: z.string().max(20_000),
+  /** 显式 Skill 名称；旧 daemon/快照可省略。 */
+  skills: z.array(z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]*$/)).max(5).optional(),
   deps: z.array(z.string().min(1).max(200)).max(100),
   parentId: z.string().min(1).max(200).nullable(),
   status: z.enum(["pending", "dispatched", "blocked", "done", "failed", "cancelled"]),
@@ -821,6 +823,12 @@ export const OrchestrationDispatchSchema = z.object({
   taskId: z.string().min(1).max(200),
   sessionId: sid,
   worktreePath: z.string().max(20_000).nullable(),
+  /** 派发时解析并冻结的实际 Skill provenance；旧 Dispatch 可省略。 */
+  skills: z.array(z.object({
+    name: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]*$/),
+    path: z.string().min(1).max(20_000),
+    sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  })).max(5).optional(),
   state: z.enum(["starting", "running", "succeeded", "failed", "abandoned"]),
   startedAt: z.number().int().nonnegative(),
   settledAt: z.number().int().nonnegative().nullable(),
@@ -936,6 +944,7 @@ export const C2SOrchestrationTaskCreateSchema = z.object({
   runId: z.string().min(1).max(200),
   title: z.string().trim().min(1).max(2_000),
   spec: z.string().trim().min(1).max(20_000),
+  skills: z.array(z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]*$/)).max(5).optional(),
   deps: z.array(z.string().min(1).max(200)).max(100).optional(),
   parentId: z.string().min(1).max(200).optional(),
   operationId: z.string().min(1).max(200).optional(),
@@ -963,6 +972,8 @@ export const C2SOrchestrationWorkerStartSchema = z.object({
   cwd: z.string().trim().min(1).max(20_000),
   kind: SessionKindSchema.optional(),
   approvalPolicy: ApprovalPolicySchema.optional(),
+  /** 省略时沿用 Task.skills；提供时仅覆盖本次 Dispatch。 */
+  skills: z.array(z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]*$/)).max(5).optional(),
   operationId: z.string().min(1).max(200).optional(),
 });
 
@@ -978,6 +989,7 @@ export const OrchestrationGraphNodeInputSchema = z.object({
   clientId: z.string().min(1).max(200),
   title: z.string().trim().min(1).max(2_000),
   spec: z.string().trim().min(1).max(20_000),
+  skills: z.array(z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]*$/)).max(5).optional(),
   deps: z.array(z.string().min(1).max(200)).max(100),
   parentId: z.string().min(1).max(200).nullable().optional(),
 });

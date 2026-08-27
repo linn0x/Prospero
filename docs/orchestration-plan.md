@@ -31,10 +31,12 @@ Run       { id, objective, status: active|completed|abandoned,
             coordinatorSessionId, createdAt, updatedAt }
 
 Task      { id, runId, title, spec, deps: TaskId[], parentId,
+            skills: SkillName[],
             status: pending|ready|dispatched|blocked|done|failed|cancelled,
             result, createdAt, updatedAt }
 
 Dispatch  { id, runId, taskId, sessionId, worktreePath,
+            skills: { name, path, sha256 }[],
             state: starting|running|succeeded|failed|abandoned,
             startedAt, settledAt, outcome }
 
@@ -93,7 +95,7 @@ agent ────┴─ 控制 socket ─┘        │
 
 ```
 人:  给 coordinator 一个 objective
-coordinator:  prospero task create --spec ... (×N,带 deps)
+coordinator:  prospero task create --spec ... --skill api-search psm-to-repo (×N,带 deps)
               prospero worker start --task t1 --agent claude --worktree new
               prospero check --wait            # 阻塞等 worker 回话
 worker:       (被派发时收到任务前导词)
@@ -104,6 +106,11 @@ coordinator:  被唤醒 → 验收 → 派下一个 / 合并 worktree
 
 `check --wait` 是长轮询(服务端挂起,有消息才返回),不是轮询循环 ——
 agent 的每一次唤醒都要花 token,不能让它空转。
+
+不同 Run 使用独立的调度 promise 队列，可以同时推进多个编排流；同一静态自动 Run 仍保持
+一次一个 worker，避免共享工作区并发写。显式 Skill 最多 5 个，派发前按 worker cwd 严格
+解析；任一 Skill 不存在或不可读时不创建会话。成功派发会在 Dispatch 中冻结实际
+`name/path/SHA-256`，而不是只依赖 prompt 中的 `$name`。
 
 ## 分期
 

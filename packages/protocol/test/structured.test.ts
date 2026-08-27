@@ -268,8 +268,9 @@ describe("结构化轨协议", () => {
       runId: "run-1",
       title: "握手回退",
       spec: "支持 v9/v8/v7/v5",
+      skills: ["api-search", "psm-to-repo"],
       deps: ["task-0"],
-    })).toMatchObject({ deps: ["task-0"] });
+    })).toMatchObject({ deps: ["task-0"], skills: ["api-search", "psm-to-repo"] });
     expect(parseC2S({
       type: "orchestration.worker.start",
       taskId: "task-1",
@@ -277,7 +278,16 @@ describe("结构化轨协议", () => {
       worktree: "new",
       cwd: "/tmp/project",
       approvalPolicy: "standard",
-    })).toMatchObject({ agent: "codex", worktree: "new" });
+      skills: ["medusa-query"],
+    })).toMatchObject({ agent: "codex", worktree: "new", skills: ["medusa-query"] });
+    expect(() => parseC2S({
+      type: "orchestration.worker.start",
+      taskId: "task-1",
+      agent: "codex",
+      worktree: "new",
+      cwd: "/tmp/project",
+      skills: ["a", "b", "c", "d", "e", "f"],
+    })).toThrowError(ProtocolError);
     expect(parseC2S({
       type: "orchestration.worker.stop",
       taskId: "task-1",
@@ -302,7 +312,7 @@ describe("结构化轨协议", () => {
       operationId: "op-create",
       objective: "发布",
       nodes: [
-        { clientId: "design", title: "设计", spec: "定协议", deps: [] },
+        { clientId: "design", title: "设计", spec: "定协议", skills: ["workflow-core"], deps: [] },
         { clientId: "ship", title: "发布", spec: "发版本", deps: ["design"] },
       ],
     });
