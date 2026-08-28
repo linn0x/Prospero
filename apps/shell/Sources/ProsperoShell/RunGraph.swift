@@ -1,5 +1,21 @@
 import SwiftUI
 
+/// `parentId` 是 Prospero 的通用任务血缘。这里只解释控制协议，不理解任何业务阶段。
+func runGraphLineageLabel(parentResult: String?) -> String {
+  let signal = parentResult?.lowercased() ?? ""
+  if signal.contains("typed_feedback_replan") || signal.contains("feedback") {
+    return "反馈重规划"
+  }
+  if signal.contains("retry") || signal.contains("attempt") {
+    return "重试"
+  }
+  return "派生任务"
+}
+
+func runGraphCenteredOffset(containerHeight: CGFloat, contentHeight: CGFloat) -> CGFloat {
+  max(0, (containerHeight - contentHeight) / 2)
+}
+
 /// 一个 Run 的任务依赖图。
 ///
 /// 列表读不出 DAG 的形状:哪几个任务此刻能并行、整条链卡在谁身上、失败的那个
@@ -30,7 +46,14 @@ struct RunGraphCanvas: View {
   private let margin: CGFloat = 26
 
   private struct Layout {
+    struct FeedbackEdge {
+      var fromTaskId: String
+      var toTaskId: String
+      var label: String
+    }
+
     var positions: [String: CGPoint]
+    var feedbackEdges: [FeedbackEdge]
     var size: CGSize
   }
 
@@ -165,11 +188,12 @@ struct RunGraphCanvas: View {
 
   private func edges(_ layout: Layout) -> some View {
     Canvas { context, _ in
+      let taskById = Dictionary(uniqueKeysWithValues: tasks.map { ($0.id, $0) })
       for task in tasks {
         guard let end = layout.positions[task.id] else { continue }
         for dependency in task.deps {
           guard let start = layout.positions[dependency] else { continue }
-          let upstreamDone = tasks.first { $0.id == dependency }?.status == "done"
+          let upstreamDone = taskById[dependency]?.status == "done"
           // 选中一个节点时,只把它自己的进出边点亮 —— 图一大,全部同色就读不出链路。
           let touched = selection == task.id || selection == dependency
           let color: Color = touched ? .accentColor : (upstreamDone ? .green : .secondary)
@@ -198,6 +222,47 @@ struct RunGraphCanvas: View {
           context.fill(arrow, with: .color(color.opacity(opacity + 0.12)))
         }
       }
+
+      // parentId 表达任务反馈/重试血缘，不是执行依赖。用独立的蓝色虚线画成回路，
+      // 既保留旧取消分支，又能一眼看到替代分支从哪里派生而来。
+      for feedback in layout.feedbackEdges {
+        guard let start = layout.positions[feedback.fromTaskId],
+              let end = layout.positions[feedback.toTaskId] else { continue }
+        let touched = selection == feedback.fromTaskId || selection == feedback.toTaskId
+        let color = Color.accentColor.opacity(touched ? 0.95 : 0.72)
+        let from = CGPoint(x: start.x, y: start.y + nodeHeight / 2)
+        let to = CGPoint(x: end.x - nodeWidth / 2, y: end.y)
+        let loopY = max(from.y, to.y) + 22
+        var edge = Path()
+        edge.move(to: from)
+        edge.addCurve(
+          to: to,
+          control1: CGPoint(x: from.x, y: loopY),
+          control2: CGPoint(x: to.x - 34, y: loopY)
+        )
+        context.stroke(
+          edge,
+          with: .color(color),
+          style: StrokeStyle(
+            lineWidth: touched ? 2.5 : 1.8,
+            lineCap: .round,
+            dash: [7, 5]
+          )
+        )
+        var arrow = Path()
+        arrow.move(to: to)
+        arrow.addLine(to: CGPoint(x: to.x - 9, y: to.y - 5))
+        arrow.addLine(to: CGPoint(x: to.x - 9, y: to.y + 5))
+        arrow.closeSubpath()
+        context.fill(arrow, with: .color(color))
+        context.draw(
+          Text(feedback.label)
+            .font(.system(size: 9, weight: .semibold))
+            .foregroundStyle(Color.accentColor),
+          at: CGPoint(x: (from.x + to.x) / 2, y: loopY + 8),
+          anchor: .center
+        )
+      }
     }
   }
 
@@ -225,6 +290,11 @@ struct RunGraphCanvas: View {
               .font(.system(size: 9))
               .foregroundStyle(.green)
           }
+          if task.status == "cancelled" {
+            Image(systemName: "arrow.uturn.backward")
+              .font(.system(size: 9, weight: .semibold))
+              .foregroundStyle(.secondary)
+          }
           if !task.deps.isEmpty {
             Text("\(task.deps.count)↑")
               .font(.system(size: 9, design: .monospaced))
@@ -245,6 +315,7 @@ struct RunGraphCanvas: View {
             lineWidth: selected ? 2 : (state.ready ? 1.6 : 1)
           )
       }
+      .opacity(task.status == "cancelled" ? 0.72 : 1)
     }
     .buttonStyle(.plain)
     .help(task.spec.isEmpty ? task.title : task.spec)
@@ -257,6 +328,12 @@ struct RunGraphCanvas: View {
           Circle().fill(item.color).frame(width: 5, height: 5)
           Text(item.label)
         }
+      }
+      HStack(spacing: 4) {
+        Capsule()
+          .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 1.4, dash: [4, 3]))
+          .frame(width: 13, height: 5)
+        Text("反馈 / 重试")
       }
       Spacer(minLength: 8)
       Text("\(tasks.count) 个任务")
@@ -296,43 +373,173 @@ struct RunGraphCanvas: View {
     return clamp(min(viewport.width / layout.size.width, viewport.height / layout.size.height))
   }
 
-  /// 按依赖深度分层:x 是拓扑层级,y 是同层内的排队位次。
+  /// 通用分层 DAG 布局:x 是拓扑层级,y 是后继分支的重心。
+  ///
+  /// 叶子从上到下稳定排列，父节点落在所有后继的平均高度；因此入口会自然位于
+  /// 整体高度中线，任何中途分叉也会展开，而不是把同一列机械地从顶部往下堆。
   /// 成环由 daemon 在建图时就拒绝了,这里的 stack 只是防御 —— 快照里真出现环,
   /// 也只是画得难看,不能让 UI 递归到爆栈。
   private func makeLayout() -> Layout {
+    let taskById = Dictionary(uniqueKeysWithValues: tasks.map { ($0.id, $0) })
     var memo: [String: Int] = [:]
     func level(_ id: String, stack: Set<String> = []) -> Int {
       if let cached = memo[id] { return cached }
-      guard !stack.contains(id), let task = tasks.first(where: { $0.id == id }) else { return 0 }
+      guard !stack.contains(id), let task = taskById[id] else { return 0 }
       let nextStack = stack.union([id])
-      let value = task.deps.isEmpty
+      let ancestors = Array(Set(task.deps + [task.parentId].compactMap { $0 }))
+        .filter { taskById[$0] != nil }
+      let value = ancestors.isEmpty
         ? 0
-        : (task.deps.map { level($0, stack: nextStack) }.max() ?? -1) + 1
+        : (ancestors.map { level($0, stack: nextStack) }.max() ?? -1) + 1
       memo[id] = value
       return value
     }
 
-    var rows: [Int: Int] = [:]
-    var positions: [String: CGPoint] = [:]
+    for task in tasks { _ = level(task.id) }
+
+    var successors: [String: Set<String>] = [:]
     for task in tasks {
-      let column = level(task.id)
-      let row = rows[column, default: 0]
-      rows[column] = row + 1
-      positions[task.id] = CGPoint(
-        x: margin + nodeWidth / 2 + CGFloat(column) * (nodeWidth + hGap),
-        y: margin + nodeHeight / 2 + CGFloat(row) * (nodeHeight + vGap)
+      let ancestors = Array(Set(task.deps + [task.parentId].compactMap { $0 }))
+        .filter { taskById[$0] != nil }
+      for ancestor in ancestors {
+        successors[ancestor, default: []].insert(task.id)
+      }
+    }
+
+    func taskSort(_ lhs: OrchestrationStatus.Task, _ rhs: OrchestrationStatus.Task) -> Bool {
+      if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }
+      return lhs.id < rhs.id
+    }
+
+    var tasksByColumn: [Int: [OrchestrationStatus.Task]] = [:]
+    for task in tasks { tasksByColumn[memo[task.id] ?? 0, default: []].append(task) }
+    let columns = (memo.values.max() ?? 0) + 1
+    let maxColumnCount = max(tasksByColumn.values.map(\.count).max() ?? 1, 1)
+
+    // 以 DFS 顺序收集叶子，保证同一分支的叶子相邻，减少长距离交叉线。
+    let roots = tasks.filter { (memo[$0.id] ?? 0) == 0 }.sorted(by: taskSort)
+    var orderedLeaves: [String] = []
+    var visited: Set<String> = []
+    func collectLeaves(_ id: String, stack: Set<String> = []) {
+      guard !stack.contains(id), !visited.contains(id) else { return }
+      let children = (successors[id] ?? []).compactMap { taskById[$0] }.sorted(by: taskSort)
+      if children.isEmpty {
+        visited.insert(id)
+        orderedLeaves.append(id)
+        return
+      }
+      let nextStack = stack.union([id])
+      for child in children { collectLeaves(child.id, stack: nextStack) }
+      visited.insert(id)
+    }
+    for root in roots { collectLeaves(root.id) }
+    for task in tasks.sorted(by: taskSort) where (successors[task.id] ?? []).isEmpty {
+      if !orderedLeaves.contains(task.id) { orderedLeaves.append(task.id) }
+    }
+
+    let slotCount = max(orderedLeaves.count, maxColumnCount, 1)
+    let slotStep = nodeHeight + vGap
+    let contentHeight = CGFloat(slotCount) * nodeHeight
+      + CGFloat(max(slotCount - 1, 0)) * vGap
+    let leafContentHeight = CGFloat(max(orderedLeaves.count, 1)) * nodeHeight
+      + CGFloat(max(orderedLeaves.count - 1, 0)) * vGap
+    let leafTop = margin + runGraphCenteredOffset(
+      containerHeight: contentHeight,
+      contentHeight: leafContentHeight
+    )
+    var leafY: [String: CGFloat] = [:]
+    for (index, id) in orderedLeaves.enumerated() {
+      leafY[id] = leafTop + nodeHeight / 2 + CGFloat(index) * slotStep
+    }
+
+    var desiredMemo: [String: CGFloat] = [:]
+    func desiredY(_ id: String, stack: Set<String> = []) -> CGFloat {
+      if let cached = desiredMemo[id] { return cached }
+      if let leaf = leafY[id] { desiredMemo[id] = leaf; return leaf }
+      guard !stack.contains(id) else { return margin + contentHeight / 2 }
+      let nextStack = stack.union([id])
+      let values = (successors[id] ?? []).map { desiredY($0, stack: nextStack) }
+      let value = values.isEmpty
+        ? margin + contentHeight / 2
+        : values.reduce(0, +) / CGFloat(values.count)
+      desiredMemo[id] = value
+      return value
+    }
+    for task in tasks { _ = desiredY(task.id) }
+    if roots.count == 1, let rootId = roots.first?.id {
+      desiredMemo[rootId] = margin + contentHeight / 2
+    }
+
+    let canvasHeight = margin * 2 + contentHeight
+    let canvasWidth = margin * 2 + CGFloat(columns) * nodeWidth
+      + CGFloat(max(columns - 1, 0)) * hGap
+
+    // 同列节点按目标重心排序，再以目标平均值为轴对称压排，避免节点碰撞的同时
+    // 保持入口/分叉/合流的视觉中心不漂移到顶部或底部。
+    var positions: [String: CGPoint] = [:]
+    for (column, columnTasks) in tasksByColumn {
+      let ordered = columnTasks.sorted {
+        let left = desiredMemo[$0.id] ?? 0
+        let right = desiredMemo[$1.id] ?? 0
+        if left != right { return left < right }
+        return taskSort($0, $1)
+      }
+      var placed: [CGFloat] = []
+      for task in ordered {
+        let target = desiredMemo[task.id] ?? margin + contentHeight / 2
+        let minimum = (placed.last ?? -CGFloat.greatestFiniteMagnitude) + slotStep
+        placed.append(max(target, minimum))
+      }
+      if !placed.isEmpty {
+        let desiredAverage = ordered.map { desiredMemo[$0.id] ?? 0 }.reduce(0, +)
+          / CGFloat(ordered.count)
+        let placedAverage = placed.reduce(0, +) / CGFloat(placed.count)
+        let lowerBound = margin + nodeHeight / 2
+        let upperBound = canvasHeight - margin - nodeHeight / 2
+        var shift = desiredAverage - placedAverage
+        if let first = placed.first, first + shift < lowerBound { shift = lowerBound - first }
+        if let last = placed.last, last + shift > upperBound { shift = upperBound - last }
+        for index in placed.indices { placed[index] += shift }
+      }
+      for (index, task) in ordered.enumerated() {
+        positions[task.id] = CGPoint(
+          x: margin + nodeWidth / 2 + CGFloat(column) * (nodeWidth + hGap),
+          y: placed[index]
+        )
+      }
+    }
+
+    var feedbackGroups: [String: [OrchestrationStatus.Task]] = [:]
+    for task in tasks {
+      guard let parentId = task.parentId, taskById[parentId] != nil else { continue }
+      feedbackGroups[parentId, default: []].append(task)
+    }
+    let feedbackEdges = feedbackGroups.values.compactMap { candidates -> Layout.FeedbackEdge? in
+      guard let target = candidates.sorted(by: {
+        let leftLevel = memo[$0.id] ?? 0
+        let rightLevel = memo[$1.id] ?? 0
+        if leftLevel != rightLevel { return leftLevel < rightLevel }
+        return taskSort($0, $1)
+      }).first,
+      let parentId = target.parentId,
+      let parent = taskById[parentId] else { return nil }
+      return .init(
+        fromTaskId: parentId,
+        toTaskId: target.id,
+        label: runGraphLineageLabel(parentResult: parent.result)
       )
     }
-    let columns = (memo.values.max() ?? 0) + 1
-    let rowCount = max(rows.values.max() ?? 1, 1)
+
     return Layout(
       positions: positions,
+      feedbackEdges: feedbackEdges,
       size: CGSize(
-        width: margin * 2 + CGFloat(columns) * nodeWidth + CGFloat(max(columns - 1, 0)) * hGap,
-        height: margin * 2 + CGFloat(rowCount) * nodeHeight + CGFloat(max(rowCount - 1, 0)) * vGap
+        width: canvasWidth,
+        height: canvasHeight
       )
     )
   }
+
 }
 
 /// 图上一个节点的显示状态。
