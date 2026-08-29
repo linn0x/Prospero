@@ -97,6 +97,7 @@ import { searchLocalConversations } from "./local-conversations.js";
 import { DAEMON_VERSION } from "./version.js";
 import { AgentAccountError, AgentAccountManager } from "./agent-accounts.js";
 import { CodexAdapter } from "./adapters/codex.js";
+import { listDiscoveredSkills } from "./composer-context.js";
 
 const HIGH_WATER = 512 * 1024; // 超过则暂停向该客户端流式发送
 const LOW_WATER = 64 * 1024; //   低于则通过 ring/快照追平
@@ -414,6 +415,126 @@ export async function createDaemonServer(
       return { ...msg, session: sanitizeSessionInfo(msg.session) };
     }
     return msg;
+  }
+
+  async function collectUsage(sid?: string): Promise<Extract<S2CMessage, { type: "usage.result" }>> {
+    if (sid === undefined) {
+      const sessions = manager.structuredPerAgent();
+      const accountSnapshot = (await accounts.snapshot(manager.list())).filter(
+        (account) => account.status !== "unavailable",
+      );
+      const usageAccounts = await Promise.all(
+        accountSnapshot.map(async (accountMeta): Promise<UsageAccount> => {
+          const session = sessions.find((candidate) =>
+            candidate.accountId === accountMeta.id ||
+            (candidate.accountId === undefined && !accountMeta.managed && candidate.agent === accountMeta.agent),
+          );
+          const account = accounts.resolve(accountMeta.id, accountMeta.agent);
+          let report = session ? await session.usage().catch(() => null) : null;
+          if (!account.apiProfile && account.agent === "codex" && (!report || report.windows.length === 0)) {
+            try {
+              report = await CodexAdapter.readAccountUsage(
+                accounts.usageEnvironment(account),
+                account.codexAppServerArgs,
+              ) ?? report;
+            } catch {
+              // Older Codex CLIs may not expose account/rateLimits/read.
+            }
+          }
+          const source: UsageAccount["source"] =
+            account.apiProfile || /api/i.test(accountMeta.authMethod ?? "")
+              ? "api"
+              : report?.subscription || accountMeta.status === "signed_in"
+                ? "subscription"
+                : "unknown";
+          if (!report) {
+            return {
+              agent: accountMeta.agent,
+              accountId: accountMeta.id,
+              accountName: accountMeta.name,
+              source,
+              available: source === "api",
+              windows: [],
+              reason: source === "api"
+                ? "API 模型由服务商按 API 用量计费，不提供订阅窗口。"
+                : "暂时读不到账号额度，请确认 CLI 已登录并刷新。",
+            };
+          }
+          return {
+            agent: accountMeta.agent,
+            accountId: accountMeta.id,
+            accountName: accountMeta.name,
+            source,
+            available: true,
+            subscription: report.subscription ?? null,
+            ...(report.costUsd !== undefined ? { costUsd: report.costUsd } : {}),
+            ...(report.inputTokens !== undefined ? { inputTokens: report.inputTokens } : {}),
+            ...(report.outputTokens !== undefined ? { outputTokens: report.outputTokens } : {}),
+            ...(report.lifetimeTokens !== undefined ? { lifetimeTokens: report.lifetimeTokens } : {}),
+            ...(report.creditsUnlimited !== undefined ? { creditsUnlimited: report.creditsUnlimited } : {}),
+            ...(report.creditsBalance !== undefined ? { creditsBalance: report.creditsBalance } : {}),
+            ...(report.spendLimit !== undefined ? { spendLimit: report.spendLimit } : {}),
+            ...(report.spendUsed !== undefined ? { spendUsed: report.spendUsed } : {}),
+            ...(report.spendRemainingPercent !== undefined ? { spendRemainingPercent: report.spendRemainingPercent } : {}),
+            ...(report.dailyUsage !== undefined ? { dailyUsage: report.dailyUsage } : {}),
+            windows: report.windows,
+            ...(report.windows.length === 0 ? { reason: "这个后端不提供套餐限流窗口。" } : {}),
+          };
+        }),
+      );
+      const lead = [...usageAccounts]
+        .filter((account) => account.available)
+        .sort((a, b) => Math.max(0, ...b.windows.map((window) => window.utilization)) - Math.max(0, ...a.windows.map((window) => window.utilization)))[0]
+        ?? usageAccounts[0];
+      return {
+        type: "usage.result",
+        available: usageAccounts.some((account) => account.available),
+        ...(lead?.subscription !== undefined ? { subscription: lead.subscription } : {}),
+        ...(lead?.costUsd !== undefined ? { costUsd: lead.costUsd } : {}),
+        ...(lead?.inputTokens !== undefined ? { inputTokens: lead.inputTokens } : {}),
+        ...(lead?.outputTokens !== undefined ? { outputTokens: lead.outputTokens } : {}),
+        ...(lead?.lifetimeTokens !== undefined ? { lifetimeTokens: lead.lifetimeTokens } : {}),
+        ...(lead?.creditsUnlimited !== undefined ? { creditsUnlimited: lead.creditsUnlimited } : {}),
+        ...(lead?.creditsBalance !== undefined ? { creditsBalance: lead.creditsBalance } : {}),
+        ...(lead?.spendLimit !== undefined ? { spendLimit: lead.spendLimit } : {}),
+        ...(lead?.spendUsed !== undefined ? { spendUsed: lead.spendUsed } : {}),
+        ...(lead?.spendRemainingPercent !== undefined ? { spendRemainingPercent: lead.spendRemainingPercent } : {}),
+        ...(lead?.dailyUsage !== undefined ? { dailyUsage: lead.dailyUsage } : {}),
+        windows: lead?.windows ?? [],
+        ...(lead?.reason !== undefined ? { reason: lead.reason } : {}),
+        accounts: usageAccounts,
+      };
+    }
+
+    const session = manager.requireStructured(sid);
+    let report: Awaited<ReturnType<typeof session.usage>> | null;
+    try {
+      report = await session.usage();
+    } catch (error) {
+      if (!(error instanceof RemoteSupervisorError)) throw error;
+      return { type: "usage.result", sid, available: false, reason: "这个会话的 Agent 进程已经退出，查不到用量了。", windows: [] };
+    }
+    if (!report) {
+      return { type: "usage.result", sid, available: false, reason: "这个会话还没产生用量，发一条消息后再看。", windows: [] };
+    }
+    return {
+      type: "usage.result",
+      sid,
+      available: true,
+      subscription: report.subscription ?? null,
+      ...(report.costUsd !== undefined ? { costUsd: report.costUsd } : {}),
+      ...(report.inputTokens !== undefined ? { inputTokens: report.inputTokens } : {}),
+      ...(report.outputTokens !== undefined ? { outputTokens: report.outputTokens } : {}),
+      ...(report.lifetimeTokens !== undefined ? { lifetimeTokens: report.lifetimeTokens } : {}),
+      ...(report.creditsUnlimited !== undefined ? { creditsUnlimited: report.creditsUnlimited } : {}),
+      ...(report.creditsBalance !== undefined ? { creditsBalance: report.creditsBalance } : {}),
+      ...(report.spendLimit !== undefined ? { spendLimit: report.spendLimit } : {}),
+      ...(report.spendUsed !== undefined ? { spendUsed: report.spendUsed } : {}),
+      ...(report.spendRemainingPercent !== undefined ? { spendRemainingPercent: report.spendRemainingPercent } : {}),
+      ...(report.dailyUsage !== undefined ? { dailyUsage: report.dailyUsage } : {}),
+      windows: report.windows,
+      ...(report.windows.length === 0 ? { reason: "这个后端不提供套餐限流窗口。" } : {}),
+    };
   }
 
   function send(conn: Conn, msg: S2CMessage): void {
@@ -1422,139 +1543,7 @@ export async function createDaemonServer(
         return;
 
       case "usage.get": {
-        // 不带 sid = 账号级:每个 agent 各问一份。限流按账号走,而账号按 agent 分,
-        // 随便挑一个会话只能答出其中一家的额度,另外几家的订阅就看不见了。
-        if (msg.sid === undefined) {
-          const sessions = manager.structuredPerAgent();
-          // 未安装对应 CLI 的 agent(如本机没装 claude)不该出现在主机概览里：
-          // status === "unavailable" 正是“CLI 未安装”，这类账号没有可展示的额度，
-          // 之前会以“来源未知”混进卡片。这里只用于用量展示，账号管理页仍完整保留。
-          const accountSnapshot = (await accounts.snapshot(manager.list())).filter(
-            (account) => account.status !== "unavailable",
-          );
-          const usageAccounts = await Promise.all(
-            accountSnapshot.map(async (accountMeta): Promise<UsageAccount> => {
-              const s = sessions.find((candidate) =>
-                candidate.accountId === accountMeta.id ||
-                (candidate.accountId === undefined && !accountMeta.managed && candidate.agent === accountMeta.agent),
-              );
-              const account = accounts.resolve(accountMeta.id, accountMeta.agent);
-              // 一个账号的会话答不出额度,不该让整份用量请求失败。
-              // 它以前会一路抛到最外层的兜底分支,手机上收到的就是
-              // "bad_message: internal error" —— 既看不出是哪个账号,也看不出为什么。
-              // supervisor 掉线、会话已收工时当作没有用量数据,
-              // 下面的 `if (!r)` 分支会给出"暂无数据"的卡片。
-              let r = s ? await s.usage().catch(() => null) : null;
-              // Codex 的限流是账号级 RPC，不需要先创建 thread。这样账号管理页
-              // 第一次打开就能显示额度，也不会为了查额度消耗一次对话。
-              if (!account.apiProfile && account.agent === "codex" && (!r || r.windows.length === 0)) {
-                try {
-                  r = await CodexAdapter.readAccountUsage(
-                    account.environment,
-                    account.codexAppServerArgs,
-                  ) ?? r;
-                } catch {
-                  // 兼容尚未实现 account/rateLimits/read 的旧 Codex CLI；若已有会话
-                  // 快照仍可继续显示，没有则在该账号卡片上给出明确的暂无数据。
-                }
-              }
-              const source: UsageAccount["source"] =
-                account.apiProfile || /api/i.test(accountMeta.authMethod ?? "")
-                  ? "api"
-                  : r?.subscription || accountMeta.status === "signed_in"
-                    ? "subscription"
-                    : "unknown";
-              if (!r) {
-                return {
-                  agent: accountMeta.agent,
-                  accountId: accountMeta.id,
-                  accountName: accountMeta.name,
-                  source,
-                  available: source === "api",
-                  windows: [],
-                  reason: source === "api"
-                    ? "API 模型由服务商按 API 用量计费，不提供 ChatGPT 订阅窗口。"
-                    : "暂时读不到账号额度，请确认 Codex CLI 已登录并刷新。",
-                };
-              }
-              return {
-                agent: accountMeta.agent,
-                accountId: accountMeta.id,
-                accountName: accountMeta.name,
-                source,
-                available: true,
-                subscription: r.subscription ?? null,
-                ...(r.costUsd !== undefined ? { costUsd: r.costUsd } : {}),
-                ...(r.inputTokens !== undefined ? { inputTokens: r.inputTokens } : {}),
-                ...(r.outputTokens !== undefined ? { outputTokens: r.outputTokens } : {}),
-                windows: r.windows,
-                ...(r.windows.length === 0
-                  ? { reason: "这个后端不提供套餐限流窗口。" }
-                  : {}),
-              };
-            }),
-          );
-          // 顶层字段挑压力最大的那家:老客户端只认这几个字段,给它最该看见的一份
-          const lead =
-            [...usageAccounts]
-              .filter((a) => a.available)
-              .sort(
-                (a, b) =>
-                  Math.max(0, ...b.windows.map((w) => w.utilization)) -
-                  Math.max(0, ...a.windows.map((w) => w.utilization)),
-              )[0] ?? usageAccounts[0];
-          send(conn, {
-            type: "usage.result",
-            available: usageAccounts.some((a) => a.available),
-            ...(lead?.subscription !== undefined ? { subscription: lead.subscription } : {}),
-            ...(lead?.costUsd !== undefined ? { costUsd: lead.costUsd } : {}),
-            ...(lead?.inputTokens !== undefined ? { inputTokens: lead.inputTokens } : {}),
-            ...(lead?.outputTokens !== undefined ? { outputTokens: lead.outputTokens } : {}),
-            windows: lead?.windows ?? [],
-            ...(lead?.reason !== undefined ? { reason: lead.reason } : {}),
-            accounts: usageAccounts,
-          });
-          return;
-        }
-
-        const s = manager.requireStructured(msg.sid);
-        let report: Awaited<ReturnType<typeof s.usage>> | null;
-        try {
-          report = await s.usage();
-        } catch (e) {
-          if (!(e instanceof RemoteSupervisorError)) throw e;
-          // 会话还在列表里,但它的 supervisor 已经退出(典型是收工的 worker)。
-          // 这是个可解释的状态,不是内部错误。
-          send(conn, {
-            type: "usage.result",
-            sid: msg.sid,
-            available: false,
-            reason: "这个会话的 Agent 进程已经退出,查不到用量了。",
-          });
-          return;
-        }
-        if (!report) {
-          send(conn, {
-            type: "usage.result",
-            sid: msg.sid,
-            available: false,
-            reason: "这个会话还没产生用量 —— 发一条消息后再看。",
-          });
-          return;
-        }
-        send(conn, {
-          type: "usage.result",
-          sid: msg.sid,
-          available: true,
-          subscription: report.subscription ?? null,
-          ...(report.costUsd !== undefined ? { costUsd: report.costUsd } : {}),
-          ...(report.inputTokens !== undefined ? { inputTokens: report.inputTokens } : {}),
-          ...(report.outputTokens !== undefined ? { outputTokens: report.outputTokens } : {}),
-          windows: report.windows,
-          ...(report.windows.length === 0
-            ? { reason: "这个后端不提供套餐限流窗口(只有 claude.ai 订阅会话有)。" }
-            : {}),
-        });
+        send(conn, await collectUsage(msg.sid));
         return;
       }
 
@@ -2078,6 +2067,122 @@ export async function createDaemonServer(
       res.end(JSON.stringify({ ok: true, sessions: manager.list().length }));
       return;
     }
+    if (req.method === "GET" && url.pathname === "/_prospero/control/usage") {
+      try {
+        const sid = url.searchParams.get("sid") ?? undefined;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(await collectUsage(sid)));
+      } catch (error) {
+        const status = error instanceof SessionError && error.code === "session_not_found" ? 404 : 400;
+        res.writeHead(status).end(error instanceof Error ? error.message : String(error));
+      }
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/_prospero/control/skills") {
+      try {
+        const cwd = url.searchParams.get("cwd") ?? "";
+        if (!path.isAbsolute(cwd)) {
+          res.writeHead(400).end("invalid workspace path");
+          return;
+        }
+        const items = await listDiscoveredSkills(cwd);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ items }));
+      } catch (error) {
+        res.writeHead(400).end(error instanceof Error ? error.message : String(error));
+      }
+      return;
+    }
+    const sessionSuggestionsMatch = url.pathname.match(
+      /^\/_prospero\/control\/session\/([^/]+)\/suggestions$/,
+    );
+    if (req.method === "GET" && sessionSuggestionsMatch) {
+      try {
+        const sid = decodeURIComponent(sessionSuggestionsMatch[1]!);
+        const kind = url.searchParams.get("kind");
+        const query = url.searchParams.get("query") ?? "";
+        if (kind !== "skill" || query.length > 200) {
+          res.writeHead(400).end("invalid suggestion query");
+          return;
+        }
+        const items = await manager.requireStructured(sid).complete("skill", query);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ items }));
+      } catch (error) {
+        const status = error instanceof SessionError && error.code === "session_not_found" ? 404 : 400;
+        res.writeHead(status).end(error instanceof Error ? error.message : String(error));
+      }
+      return;
+    }
+    const sessionModesMatch = url.pathname.match(
+      /^\/_prospero\/control\/session\/([^/]+)\/modes$/,
+    );
+    if (sessionModesMatch && (req.method === "GET" || req.method === "POST")) {
+      try {
+        const sid = decodeURIComponent(sessionModesMatch[1]!);
+        const session = manager.requireStructured(sid);
+        const result = req.method === "GET"
+          ? await session.modes()
+          : await session.setMode(String((await readControlJson(req, 4 * 1024))["mode"] ?? ""));
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(result));
+      } catch (error) {
+        const status = error instanceof SessionError && error.code === "session_not_found" ? 404 : 400;
+        res.writeHead(status).end(error instanceof Error ? error.message : String(error));
+      }
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/_prospero/control/launch/models") {
+      try {
+        const agent = url.searchParams.get("agent");
+        if (agent !== "codex" && agent !== "claude" && agent !== "deepseek") {
+          res.writeHead(400).end("invalid model catalog agent");
+          return;
+        }
+        const accountId = url.searchParams.get("accountId") ?? undefined;
+        if (accountId !== undefined && (!accountId || accountId.length > 100)) {
+          res.writeHead(400).end("invalid account id");
+          return;
+        }
+        const result = await manager.launchModels(agent, accountId);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(result));
+      } catch (error) {
+        const status = error instanceof SessionError && error.code === "session_not_found" ? 404 : 400;
+        res.writeHead(status).end(error instanceof Error ? error.message : String(error));
+      }
+      return;
+    }
+    const sessionModelsMatch = url.pathname.match(
+      /^\/_prospero\/control\/session\/([^/]+)\/models$/,
+    );
+    if (sessionModelsMatch && (req.method === "GET" || req.method === "POST")) {
+      try {
+        const sid = decodeURIComponent(sessionModelsMatch[1]!);
+        const session = manager.requireStructured(sid);
+        const result = req.method === "GET"
+          ? await session.models()
+          : await (async () => {
+              const body = await readControlJson(req, 4 * 1024);
+              const model = typeof body["model"] === "string" ? body["model"].trim() : "";
+              const effort = typeof body["effort"] === "string" ? body["effort"].trim() : undefined;
+              if (!model || model.length > 160 || (effort !== undefined && (!effort || effort.length > 80))) {
+                throw new ControlRequestError("invalid model selection", 400);
+              }
+              return session.setModel(model, effort);
+            })();
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(result));
+      } catch (error) {
+        const status = error instanceof SessionError && error.code === "session_not_found"
+          ? 404
+          : error instanceof ControlRequestError
+            ? error.status
+            : 400;
+        res.writeHead(status).end(error instanceof Error ? error.message : String(error));
+      }
+      return;
+    }
     if (req.method === "POST" && url.pathname === "/_prospero/control/accounts") {
       try {
         // 8 KiB is the largest protocol credential; leave bounded JSON overhead
@@ -2114,7 +2219,10 @@ export async function createDaemonServer(
           agent: body["agent"],
           accountId: body["accountId"],
           kind: body["kind"],
-          approvalPolicy: body["approvalPolicy"],
+           approvalPolicy: body["approvalPolicy"],
+           mode: body["mode"],
+           model: body["model"],
+           effort: body["effort"],
           cwd: body["cwd"],
           command: body["command"],
           cols: body["cols"] ?? 120,
@@ -2128,6 +2236,9 @@ export async function createDaemonServer(
           accountId: message.accountId,
           kind: message.kind,
           approvalPolicy: message.approvalPolicy,
+          mode: message.mode,
+          model: message.model,
+          effort: message.effort,
           cwd: message.cwd,
           command: message.command,
           cols: message.cols,
@@ -2410,8 +2521,15 @@ export async function createDaemonServer(
           return;
         }
         const supplied = rawParams as Record<string, unknown>;
+        const requestedCoordinator = typeof supplied["coordinatorSessionId"] === "string"
+          ? supplied["coordinatorSessionId"]
+          : null;
+        if (requestedCoordinator !== null && !manager.getStructured(requestedCoordinator)) {
+          res.writeHead(400).end("协调者会话不存在或不是结构化会话");
+          return;
+        }
         const params = method === "run.create" || method === "graph.create"
-          ? { ...supplied, coordinatorSessionId: null }
+          ? { ...supplied, coordinatorSessionId: requestedCoordinator }
           : { ...supplied, actorSessionId: null };
         const result = await orchestrationApi(
           method,

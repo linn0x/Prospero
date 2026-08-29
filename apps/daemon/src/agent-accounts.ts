@@ -607,6 +607,25 @@ export class AgentAccountManager {
     };
   }
 
+  /**
+   * 额度查询只读取账号身份，不应与正在运行的 thread 共用 SQLite runtime。
+   * 本机默认账号还要直接使用用户当前的 Codex 登录目录，避免一次性迁移的
+   * auth.json 在桌面 Codex 刷新令牌后变旧。
+   */
+  usageEnvironment(binding: AccountBinding): Record<string, string> {
+    if (binding.agent !== "codex" || binding.apiProfile) return binding.environment;
+    const usageRoot = path.join(this.rootsDir, "codex-usage", binding.id);
+    mkdirSync(usageRoot, { recursive: true, mode: 0o700 });
+    chmodSync(usageRoot, 0o700);
+    return {
+      ...binding.environment,
+      ...(binding.id === NATIVE_IDS.codex
+        ? { CODEX_HOME: this.sharedCodexHome() }
+        : {}),
+      CODEX_SQLITE_HOME: usageRoot,
+    };
+  }
+
   create(agent: CodeAgentKind, rawName: string): AccountBinding {
     const now = Date.now();
     const account: StoredAccount = {
@@ -899,17 +918,37 @@ export class AgentAccountManager {
     return path.join(this.rootsDir, agent, accountId);
   }
 
+  private sharedCodexHome(): string {
+    return process.env["CODEX_HOME"] ?? path.join(os.homedir(), ".codex");
+  }
+
+  private codexAuthRefresh(file: string): number {
+    try {
+      const raw = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+      const value = raw["last_refresh"];
+      const parsed = typeof value === "string" ? Date.parse(value) : Number.NaN;
+      return Number.isFinite(parsed) ? parsed : 0;
+    } catch {
+      return 0;
+    }
+  }
+
   /**
-   * 隔离本机默认 Codex 的 home 后，一次性继承用户既有的登录凭据，避免要求用户
-   * 重新跑一遍 `codex login`。只复制 auth.json，不复制 config.toml —— 桌面应用的
-   * 全局配置(如 code_mode_host)不该泄漏进 daemon 的会话环境。
+   * 隔离本机默认 Codex 的 thread/SQLite 状态，同时让会话继承用户最新的登录凭据。
+   * 只同步 auth.json，不复制 config.toml；源凭据变新时再次同步，避免 refresh token
+   * 轮换后隔离账号仍长期使用旧副本。
    */
   private migrateNativeCodexAuth(root: string): void {
     const target = path.join(root, "auth.json");
-    if (existsSync(target)) return;
-    const sharedCodexHome = process.env["CODEX_HOME"] ?? path.join(os.homedir(), ".codex");
+    const sharedCodexHome = this.sharedCodexHome();
     const sharedAuth = path.join(sharedCodexHome, "auth.json");
     if (!existsSync(sharedAuth) || sharedAuth === target) return;
+    if (
+      existsSync(target) &&
+      this.codexAuthRefresh(sharedAuth) <= this.codexAuthRefresh(target)
+    ) {
+      return;
+    }
     try {
       copyFileSync(sharedAuth, target);
       chmodSync(target, 0o600);

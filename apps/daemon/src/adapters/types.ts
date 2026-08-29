@@ -177,6 +177,16 @@ export interface UsageReport {
   costUsd?: number;
   inputTokens?: number;
   outputTokens?: number;
+  /** Codex 账号自创建以来的累计 token；来自 account/usage/read。 */
+  lifetimeTokens?: number;
+  /** Codex credits 可能是无限，也可能返回十进制定额字符串。 */
+  creditsUnlimited?: boolean;
+  creditsBalance?: string;
+  /** 账号级 spend control；字符串保留服务端的精度。 */
+  spendLimit?: string;
+  spendUsed?: string;
+  spendRemainingPercent?: number;
+  dailyUsage?: { date: string; tokens: number }[];
   /** 套餐限流窗口;没有不代表没有用量 */
   windows: { label: string; utilization: number; resetsAt?: string }[];
 }
