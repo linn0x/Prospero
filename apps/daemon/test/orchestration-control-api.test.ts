@@ -427,5 +427,95 @@ describe("控制 API 的幂等与任务图事务", () => {
       actorSessionId: null,
     }, signal);
     expect(store.getTask(task.id)).toMatchObject({ status: "cancelled", result: "不再需要" });
+
+    const superseded = store.createTask({ runId: run.id, title: "旧 revision", spec: "" });
+    store.createDispatch({ taskId: superseded.id, sessionId: "worker-superseded" });
+    const cancelled = await api("worker.stop", {
+      taskId: superseded.id,
+      reason: "由新 revision 取代",
+      finalStatus: "cancelled",
+      operationId: "stop-superseded-worker",
+      actorSessionId: null,
+    }, signal) as { task: { status: string; result: string } };
+    expect(cancelled.task).toMatchObject({
+      status: "cancelled",
+      result: "由新 revision 取代",
+    });
+    expect(killed).toEqual(["worker", "worker-superseded"]);
+  });
+
+  it("worker.stop 在 kill 与终态投影竞争时幂等收敛", async () => {
+    const store = new OrchestrationStore();
+    const run = store.createRun({ objective: "停止竞争", coordinatorSessionId: null });
+    const task = store.createTask({ runId: run.id, title: "旧 revision", spec: "" });
+    store.createDispatch({ taskId: task.id, sessionId: "worker-terminal" });
+    const sessions: WorkerSessionManager = {
+      ...unusedSessions,
+      async kill() { throw new Error("session already closed"); },
+      infoOf() {
+        return {
+          id: "worker-terminal",
+          agent: "codex",
+          kind: "structured",
+          title: "worker",
+          cwd: "/tmp",
+          status: "done",
+          createdAt: 1,
+          cols: 80,
+          rows: 24,
+        };
+      },
+    };
+    const api = orchestrationControlApi(
+      store,
+      new DispatchService(store, sessions),
+      new CollaborationService(store),
+    );
+
+    const stopped = await api("worker.stop", {
+      taskId: task.id,
+      reason: "反馈回退",
+      finalStatus: "cancelled",
+      operationId: "terminal-race-stop",
+      actorSessionId: null,
+    }, new AbortController().signal) as { task: { status: string } };
+    expect(stopped.task.status).toBe("cancelled");
+  });
+
+  it("worker.stop 保留真正的会话终止错误码", async () => {
+    const store = new OrchestrationStore();
+    const run = store.createRun({ objective: "停止失败", coordinatorSessionId: null });
+    const task = store.createTask({ runId: run.id, title: "运行中", spec: "" });
+    store.createDispatch({ taskId: task.id, sessionId: "worker-live" });
+    const sessions: WorkerSessionManager = {
+      ...unusedSessions,
+      async kill() { throw new Error("host rejected kill"); },
+      infoOf() {
+        return {
+          id: "worker-live",
+          agent: "codex",
+          kind: "structured",
+          title: "worker",
+          cwd: "/tmp",
+          status: "running",
+          createdAt: 1,
+          cols: 80,
+          rows: 24,
+        };
+      },
+    };
+    const api = orchestrationControlApi(
+      store,
+      new DispatchService(store, sessions),
+      new CollaborationService(store),
+    );
+
+    await expect(api("worker.stop", {
+      taskId: task.id,
+      operationId: "live-stop-failure",
+      actorSessionId: null,
+    }, new AbortController().signal)).rejects.toMatchObject({
+      code: "worker_stop_failed",
+    });
   });
 });
