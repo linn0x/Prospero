@@ -254,12 +254,13 @@ export function orchestrationControlApi(
         case "run.complete": {
           const runId = text(params, "runId");
           const actorSessionId = optionalText(params, "actorSessionId");
+          const allowFailedTasks = optionalBoolean(params, "allowFailedTasks", false);
           ownerOrCoordinator(store, runId, actorSessionId);
           return idempotent(
             method,
             operationId(params),
-            { runId, actorSessionId },
-            () => store.completeRun(runId),
+            { runId, actorSessionId, allowFailedTasks },
+            () => store.completeRun(runId, { allowFailedTasks }),
           );
         }
         case "run.abandon": {

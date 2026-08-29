@@ -223,6 +223,16 @@ describe("会话内 prospero CLI", () => {
     });
     servers.push(control);
 
+    const complete = await cli(control.path, control.tokenPath, [
+      "run", "complete", "--id", "run-audited", "--allow-failed-tasks",
+    ], "coord") as { method: string; params: Record<string, unknown> };
+    expect(complete).toMatchObject({
+      method: "run.complete",
+      params: {
+        runId: "run-audited", allowFailedTasks: true, actorSessionId: "coord",
+      },
+    });
+
     const retry = await cli(control.path, control.tokenPath, [
       "task", "retry", "--id", "task-failed", "--operation-id", "retry-1",
     ], "coord") as { method: string; params: Record<string, unknown> };

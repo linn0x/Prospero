@@ -256,8 +256,9 @@ describe("结构化轨协议", () => {
     expect(parseC2S({
       type: "orchestration.run.complete",
       runId: "run-1",
+      allowFailedTasks: true,
       operationId: "complete-1",
-    })).toMatchObject({ runId: "run-1" });
+    })).toMatchObject({ runId: "run-1", allowFailedTasks: true });
     expect(parseC2S({
       type: "orchestration.run.abandon",
       runId: "run-2",
