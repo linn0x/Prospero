@@ -194,7 +194,11 @@ export class DispatchService {
     if (currentTask.status === "dispatched") {
       currentTask = this.store.setTaskStatus(taskId, finalStatus, reason);
     } else if (currentTask.status === "failed" && currentDispatch.state === "abandoned") {
-      currentTask = this.store.setTaskStatus(taskId, "failed", reason);
+      // SessionManager may project the kill event as failed before this stop
+      // request regains the actor. An abandoned dispatch proves there was no
+      // explicit task.fail delivery (that path settles the dispatch as failed),
+      // so an intentional supersede may safely converge the Task to cancelled.
+      currentTask = this.store.setTaskStatus(taskId, finalStatus, reason);
     }
     this.store.preserveWorktreeAssetsForDispatch(
       currentDispatch.id,
