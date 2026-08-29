@@ -58,6 +58,17 @@ function describeWindow(mins: number): string {
   return `${String(mins)} 分钟`;
 }
 
+function finiteNonnegative(value: unknown): number | undefined {
+  const parsed = typeof value === "bigint"
+    ? Number(value)
+    : typeof value === "string" && value.trim() !== ""
+      ? Number(value)
+      : value;
+  return typeof parsed === "number" && Number.isFinite(parsed) && parsed >= 0
+    ? Math.round(parsed)
+    : undefined;
+}
+
 function usageFromRateLimits(value: unknown): UsageReport | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const rateLimits = value as Record<string, unknown>;
@@ -81,10 +92,77 @@ function usageFromRateLimits(value: unknown): UsageReport | null {
     window(rateLimits["secondary"], "次窗口"),
   ].filter((candidate): candidate is UsageReport["windows"][number] => candidate !== null);
   const plan = typeof rateLimits["planType"] === "string" ? rateLimits["planType"] : null;
-  return windows.length > 0 || plan !== null ? { subscription: plan, windows } : null;
+  const credits = rateLimits["credits"] && typeof rateLimits["credits"] === "object" && !Array.isArray(rateLimits["credits"])
+    ? rateLimits["credits"] as Record<string, unknown>
+    : null;
+  const spend = rateLimits["individualLimit"] && typeof rateLimits["individualLimit"] === "object" && !Array.isArray(rateLimits["individualLimit"])
+    ? rateLimits["individualLimit"] as Record<string, unknown>
+    : null;
+  const report: UsageReport = {
+    subscription: plan,
+    windows,
+    ...(typeof credits?.["unlimited"] === "boolean" ? { creditsUnlimited: credits["unlimited"] } : {}),
+    ...(typeof credits?.["balance"] === "string" ? { creditsBalance: credits["balance"] } : {}),
+    ...(typeof spend?.["limit"] === "string" ? { spendLimit: spend["limit"] } : {}),
+    ...(typeof spend?.["used"] === "string" ? { spendUsed: spend["used"] } : {}),
+    ...(typeof spend?.["remainingPercent"] === "number" ? { spendRemainingPercent: spend["remainingPercent"] } : {}),
+  };
+  return windows.length > 0 || plan !== null || credits !== null || spend !== null ? report : null;
+}
+
+function usageFromTokenHistory(value: unknown): Partial<UsageReport> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const response = value as Record<string, unknown>;
+  const summary = response["summary"] && typeof response["summary"] === "object" && !Array.isArray(response["summary"])
+    ? response["summary"] as Record<string, unknown>
+    : null;
+  const lifetimeTokens = finiteNonnegative(summary?.["lifetimeTokens"]);
+  const dailyUsage = Array.isArray(response["dailyUsageBuckets"])
+    ? response["dailyUsageBuckets"].flatMap((candidate) => {
+        if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return [];
+        const bucket = candidate as Record<string, unknown>;
+        const tokens = finiteNonnegative(bucket["tokens"]);
+        return typeof bucket["startDate"] === "string" && tokens !== undefined
+          ? [{ date: bucket["startDate"], tokens }]
+          : [];
+      }).slice(-31)
+    : [];
+  return lifetimeTokens !== undefined || dailyUsage.length > 0
+    ? {
+        ...(lifetimeTokens !== undefined ? { lifetimeTokens } : {}),
+        ...(dailyUsage.length > 0 ? { dailyUsage } : {}),
+      }
+    : null;
 }
 
 const START_TIMEOUT_MS = 30_000;
+
+/**
+ * Prospero itself may be launched from Codex Desktop while being developed. Those
+ * variables describe the parent Codex task and must not leak into the independent
+ * CLI process: doing so can make account RPCs use the parent's auth/permission
+ * context instead of the CODEX_HOME selected for this Agent account.
+ */
+const CODEX_PARENT_CONTEXT_ENV = [
+  "CODEX_CI",
+  "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
+  "CODEX_PERMISSION_PROFILE",
+  "CODEX_SANDBOX_NETWORK_DISABLED",
+  "CODEX_SESSION_ID",
+  "CODEX_THREAD_ID",
+] as const;
+
+function codexChildEnvironment(
+  environment: Record<string, string> | undefined,
+): NodeJS.ProcessEnv {
+  const childEnvironment: NodeJS.ProcessEnv = { ...process.env, ...environment };
+  for (const name of CODEX_PARENT_CONTEXT_ENV) {
+    if (!environment || !Object.prototype.hasOwnProperty.call(environment, name)) {
+      delete childEnvironment[name];
+    }
+  }
+  return childEnvironment;
+}
 
 function timestampMs(value: unknown): number | undefined {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return undefined;
@@ -194,16 +272,15 @@ export class CodexAdapter implements AgentAdapter {
   /** 会话累计 token */
   private totalTokens: { input?: number | undefined; output?: number | undefined } = {};
   /** 账号级限流快照 */
-  private rateLimits: { windows: UsageReport["windows"]; plan: string | null } | null = null;
+  private rateLimits: UsageReport | null = null;
 
   /** codex 原生支持用量与限流,不必退回会话累计 */
   async usage(): Promise<UsageReport | null> {
     if (!this.rateLimits && this.totalTokens.output === undefined) return null;
     return {
-      subscription: this.rateLimits?.plan ?? null,
+      ...(this.rateLimits ?? { windows: [] }),
       ...(this.totalTokens.input !== undefined ? { inputTokens: this.totalTokens.input } : {}),
       ...(this.totalTokens.output !== undefined ? { outputTokens: this.totalTokens.output } : {}),
-      windows: this.rateLimits?.windows ?? [],
     };
   }
 
@@ -310,7 +387,7 @@ export class CodexAdapter implements AgentAdapter {
     const proc = crossSpawn("codex", ["app-server", ...(appServerArgs ?? [])], {
       stdio: ["pipe", "pipe", "pipe"],
       cwd,
-      env: { ...process.env, ...environment },
+      env: codexChildEnvironment(environment),
     });
     this.proc = proc;
     proc.stdout?.setEncoding("utf8");
@@ -456,13 +533,44 @@ export class CodexAdapter implements AgentAdapter {
     const adapter = new CodexAdapter();
     try {
       await adapter.startAppServer(os.homedir(), environment, appServerArgs);
-      const response = await adapter.request("account/rateLimits/read", {}) as {
-        rateLimits?: unknown;
-        rateLimitsByLimitId?: Record<string, unknown> | null;
+      const identity = await adapter.request("account/read", { refreshToken: true }) as {
+        account?: unknown;
+        requiresOpenaiAuth?: boolean;
       };
-      return usageFromRateLimits(
-        response.rateLimitsByLimitId?.["codex"] ?? response.rateLimits,
-      );
+      if (!identity.account) {
+        throw new AdapterError(
+          identity.requiresOpenaiAuth
+            ? "Codex CLI 尚未登录，请先完成 ChatGPT 登录"
+            : "Codex CLI 没有可读取额度的账号",
+        );
+      }
+      // 0.147 起 token 历史与额度窗口是两个 RPC。并行读取能拿到完整账号视图，
+      // 其中任一方法在旧 CLI 中不存在时仍保留另一个结果作为兼容回退。
+      const [limitsResult, usageResult] = await Promise.allSettled([
+        adapter.request("account/rateLimits/read", {}),
+        adapter.request("account/usage/read", {}),
+      ]);
+      let report: UsageReport | null = null;
+      if (limitsResult.status === "fulfilled") {
+        const response = limitsResult.value as {
+          rateLimits?: unknown;
+          rateLimitsByLimitId?: Record<string, unknown> | null;
+        };
+        report = usageFromRateLimits(
+          response.rateLimitsByLimitId?.["codex"]
+            ?? Object.values(response.rateLimitsByLimitId ?? {})[0]
+            ?? response.rateLimits,
+        );
+      }
+      const history = usageResult.status === "fulfilled"
+        ? usageFromTokenHistory(usageResult.value)
+        : null;
+      if (history) report = { ...(report ?? { windows: [] }), ...history };
+      if (report) return report;
+      if (limitsResult.status === "rejected" && usageResult.status === "rejected") {
+        throw limitsResult.reason;
+      }
+      return null;
     } finally {
       await adapter.dispose();
     }
@@ -1112,29 +1220,7 @@ export class CodexAdapter implements AgentAdapter {
       }
       case "account/rateLimits/updated": {
         const rl = (p["rateLimits"] ?? {}) as Record<string, unknown>;
-        const win = (v: unknown, label: string): UsageReport["windows"][number] | null => {
-          const w = v as {
-            usedPercent?: unknown;
-            windowDurationMins?: unknown;
-            resetsAt?: unknown;
-          } | null;
-          if (!w || typeof w.usedPercent !== "number") return null;
-          const mins = typeof w.windowDurationMins === "number" ? w.windowDurationMins : null;
-          return {
-            label: mins ? describeWindow(mins) : label,
-            utilization: w.usedPercent,
-            ...(typeof w.resetsAt === "number"
-              ? { resetsAt: new Date(w.resetsAt * 1000).toISOString() }
-              : {}),
-          };
-        };
-        const windows = [win(rl["primary"], "主窗口"), win(rl["secondary"], "次窗口")].filter(
-          (w): w is UsageReport["windows"][number] => w !== null,
-        );
-        this.rateLimits = {
-          windows,
-          plan: typeof rl["planType"] === "string" ? rl["planType"] : null,
-        };
+        this.rateLimits = usageFromRateLimits(rl);
         return;
       }
       case "turn/completed": {

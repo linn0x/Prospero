@@ -1,0 +1,556 @@
+import { existsSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { isAbsolute, resolve } from "node:path";
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, shell, Tray } from "electron";
+import type { DesktopSettings, JsonObject, SessionCreateInput, WorkflowTemplate } from "../shared/types";
+import { DaemonRuntime } from "./daemon-runtime";
+import { StateStore } from "./state-store";
+
+const SAFE_ID = /^[A-Za-z0-9._:-]{1,160}$/;
+const ORCHESTRATION_METHODS = new Set([
+  "run.create", "run.complete", "run.abandon", "run.delete",
+  "task.create", "task.cancel", "task.retry",
+  "worker.start", "worker.stop",
+  "graph.create", "graph.apply",
+  "automation.start", "automation.pause",
+  "worktree.inspect", "worktree.cleanup",
+]);
+const INTERACTION_TYPES = new Set([
+  "chat.send", "term.input", "term.resize", "permission.respond",
+  "question.respond", "approval.policy.set",
+]);
+const ACCOUNT_METHODS = new Set([
+  "agent.accounts.list", "agent.account.create", "agent.account.api.create",
+  "agent.account.api.configure", "agent.account.rename", "agent.account.default",
+  "agent.account.login", "agent.account.credential.set", "agent.account.logout",
+  "agent.account.delete",
+]);
+const SMOKE_TEST = process.argv.includes("--smoke-test");
+const START_HIDDEN = process.argv.includes("--background") || SMOKE_TEST;
+
+let mainWindow: BrowserWindow | undefined;
+let tray: Tray | undefined;
+let quitting = false;
+let previousPendingInteractions = 0;
+const store = new StateStore();
+const runtime = new DaemonRuntime(store);
+const primaryInstance = app.requestSingleInstanceLock();
+if (!primaryInstance) app.quit();
+app.on("second-instance", () => {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+});
+
+function requireId(value: unknown, label: string): string {
+  if (typeof value !== "string" || !SAFE_ID.test(value)) throw new Error(`${label} 无效`);
+  return value;
+}
+
+function requireSelection(value: unknown, label: string, max: number): string {
+  if (typeof value !== "string") throw new Error(`${label} 无效`);
+  const selection = value.trim();
+  if (!selection || selection.length > max || /[\u0000-\u001f\u007f]/.test(selection)) throw new Error(`${label} 无效`);
+  return selection;
+}
+
+function requireObject(value: unknown): JsonObject {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("参数格式无效");
+  return value as JsonObject;
+}
+
+function applyTheme(settings: DesktopSettings): void {
+  nativeTheme.themeSource = settings.theme;
+  const dark = nativeTheme.shouldUseDarkColors;
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.setTitleBarOverlay({
+      color: dark ? "#161619" : "#f8f8f9",
+      symbolColor: dark ? "#eeeef0" : "#202024",
+      height: 42,
+    });
+    mainWindow.setBackgroundColor(dark ? "#111114" : "#f4f4f5");
+  }
+}
+
+function broadcastSnapshot(): void {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const snapshot = store.snapshot();
+  mainWindow.webContents.send("snapshot:changed", snapshot);
+  const pending = snapshot.daemon.sessions.reduce((total, session) => total + (session.pendingPermissions ?? 0) + (session.pendingQuestions ?? 0), 0);
+  const active = snapshot.daemon.sessions.some((session) => session.status === "running" || session.status === "starting");
+  mainWindow.setProgressBar(pending > 0 ? 1 : active ? 2 : -1, { mode: pending > 0 ? "paused" : active ? "indeterminate" : "none" });
+  if (pending > previousPendingInteractions) {
+    mainWindow.flashFrame(true);
+    if (Notification.isSupported()) new Notification({ title: "Prospero 等待你的处理", body: `${String(pending)} 个审批或问题需要处理`, silent: false }).show();
+  }
+  previousPendingInteractions = pending;
+  refreshTrayMenu();
+}
+
+function createWindow(): BrowserWindow {
+  const dark = nativeTheme.shouldUseDarkColors;
+  const window = new BrowserWindow({
+    width: 1480,
+    height: 920,
+    minWidth: 760,
+    minHeight: 560,
+    show: false,
+    backgroundColor: dark ? "#111114" : "#f4f4f5",
+    title: "Prospero",
+    titleBarStyle: "hidden",
+    titleBarOverlay: { color: dark ? "#161619" : "#f8f8f9", symbolColor: dark ? "#eeeef0" : "#202024", height: 42 },
+    webPreferences: {
+      preload: resolve(__dirname, "../preload/index.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
+      spellcheck: false,
+    },
+  });
+
+  window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  if (SMOKE_TEST) window.webContents.on("console-message", (details) => process.stderr.write(`[renderer:${details.level}] ${details.message}\n`));
+  window.webContents.on("will-navigate", (event) => event.preventDefault());
+  window.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
+  window.webContents.session.setPermissionCheckHandler(() => false);
+  window.once("ready-to-show", () => { if (!START_HIDDEN) window.show(); });
+  window.on("close", (event) => {
+    if (!quitting && store.snapshot().settings.minimizeToTray) {
+      event.preventDefault();
+      window.hide();
+    }
+  });
+
+  if (process.env["ELECTRON_RENDERER_URL"]) {
+    void window.loadURL(process.env["ELECTRON_RENDERER_URL"]);
+  } else {
+    void window.loadFile(resolve(__dirname, "../renderer/index.html"));
+  }
+  return window;
+}
+
+function createTray(): void {
+  if (tray) return;
+  const iconPath = app.isPackaged
+    ? resolve(process.resourcesPath, "assets", "AppIcon.png")
+    : resolve(app.getAppPath(), "..", "shell", "Resources", "AppIcon-1024.png");
+  const icon = nativeImage.createFromPath(iconPath).resize({ width: 16, height: 16 });
+  if (icon.isEmpty()) return;
+  tray = new Tray(icon);
+  tray.setToolTip("Prospero · Agent 工作台");
+  refreshTrayMenu();
+  tray.on("double-click", () => { mainWindow?.show(); mainWindow?.focus(); });
+}
+
+function refreshTrayMenu(): void {
+  if (!tray) return;
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: "打开 Prospero", click: () => { mainWindow?.show(); mainWindow?.focus(); } },
+    { label: "启动 daemon", click: () => void runtime.start() },
+    { label: "重启 daemon", click: () => void runtime.restart(), enabled: runtime.managed },
+    { type: "separator" },
+    { label: "退出", click: () => { quitting = true; app.quit(); } },
+  ]));
+}
+
+async function runDesktopSelfCheck(window: BrowserWindow): Promise<void> {
+  const smoke = SMOKE_TEST;
+  const screenshotArg = process.argv.find((argument) => argument.startsWith("--screenshot="));
+  if (!smoke && !screenshotArg) return;
+  if (window.webContents.isLoading()) {
+    await new Promise<void>((done) => window.webContents.once("did-finish-load", () => done()));
+  }
+  await new Promise((done) => setTimeout(done, 600));
+  const bridgeReady = await window.webContents.executeJavaScript("typeof window.prospero?.getSnapshot === 'function'") as boolean;
+  if (!bridgeReady) throw new Error("preload bridge is unavailable");
+  if (screenshotArg) {
+    const screenshotView = process.argv.find((argument) => argument.startsWith("--screenshot-view="))?.slice("--screenshot-view=".length);
+    if (screenshotView === "settings") {
+      await window.webContents.executeJavaScript(`Array.from(document.querySelectorAll('[data-sidebar="menu-button"]')).find((button) => button.textContent?.includes('设置') || button.textContent?.includes('Settings'))?.click()`);
+      const settingsReady = await window.webContents.executeJavaScript(`new Promise((resolve) => { const started = Date.now(); const check = () => document.querySelector('.settings-page') ? resolve(true) : Date.now() - started > 5_000 ? resolve(false) : setTimeout(check, 100); check(); })`) as boolean;
+      if (!settingsReady) throw new Error("settings page did not finish loading");
+      await new Promise((done) => setTimeout(done, 250));
+    }
+    const path = screenshotArg.slice("--screenshot=".length);
+    if (!isAbsolute(path)) throw new Error("screenshot path must be absolute");
+    writeFileSync(path, (await window.webContents.capturePage()).toPNG());
+  }
+  const sidebarMenuCheck = await window.webContents.executeJavaScript(`(async () => {
+    const openAndCheck = async (selector) => {
+      const trigger = document.querySelector(selector);
+      if (!trigger) return { selector, skipped: selector === '[data-testid="workspace-project-more"]', found: false, popup: false, healthyRoot: Boolean(document.querySelector('#root')?.childElementCount) };
+      trigger.click();
+      await new Promise((done) => setTimeout(done, 120));
+      const popup = document.querySelector('[data-slot="dropdown-menu-content"]');
+      const root = document.querySelector('#root');
+      const healthyRoot = Boolean(root && root.childElementCount > 0 && document.body.innerText.includes('Prospero'));
+      trigger.click();
+      await new Promise((done) => setTimeout(done, 60));
+      return { selector, skipped: false, found: true, popup: Boolean(popup), healthyRoot };
+    };
+    const sidebar = document.querySelector('[data-slot="sidebar"][data-state]');
+    const rail = document.querySelector('[data-testid="sidebar-rail"]');
+    const beforeRail = sidebar?.getAttribute('data-state');
+    rail?.click();
+    await new Promise((done) => setTimeout(done, 240));
+    const afterRail = sidebar?.getAttribute('data-state');
+    rail?.click();
+    await new Promise((done) => setTimeout(done, 240));
+    const restoredRail = sidebar?.getAttribute('data-state');
+    const contextTrigger = document.querySelector('[data-slot="context-menu-trigger"]');
+    let context = { skipped: !contextTrigger, popup: false, healthyRoot: Boolean(document.querySelector('#root')?.childElementCount) };
+    if (contextTrigger) {
+      const bounds = contextTrigger.getBoundingClientRect();
+      contextTrigger.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2, clientX: bounds.left + 8, clientY: bounds.top + 8 }));
+      await new Promise((done) => setTimeout(done, 120));
+      context = { skipped: false, popup: Boolean(document.querySelector('[data-slot="context-menu-content"]')), healthyRoot: Boolean(document.querySelector('#root')?.childElementCount) };
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    }
+    return {
+      group: await openAndCheck('[data-testid="workspace-more"]'),
+      project: await openAndCheck('[data-testid="workspace-project-more"]'),
+      rail: { found: Boolean(rail && sidebar), before: beforeRail, after: afterRail, restored: restoredRail },
+      context,
+    };
+  })()`) as { group: { skipped: boolean; found: boolean; popup: boolean; healthyRoot: boolean }; project: { skipped: boolean; found: boolean; popup: boolean; healthyRoot: boolean }; rail: { found: boolean; before?: string; after?: string; restored?: string }; context: { skipped: boolean; popup: boolean; healthyRoot: boolean } };
+  const sidebarMenusReady = sidebarMenuCheck.group.found && sidebarMenuCheck.group.popup && sidebarMenuCheck.group.healthyRoot
+    && (sidebarMenuCheck.project.skipped || (sidebarMenuCheck.project.found && sidebarMenuCheck.project.popup && sidebarMenuCheck.project.healthyRoot))
+    && sidebarMenuCheck.rail.found && sidebarMenuCheck.rail.before !== sidebarMenuCheck.rail.after && sidebarMenuCheck.rail.before === sidebarMenuCheck.rail.restored
+    && (sidebarMenuCheck.context.skipped || (sidebarMenuCheck.context.popup && sidebarMenuCheck.context.healthyRoot));
+  if (!sidebarMenusReady) throw new Error(`workspace sidebar menu interaction failed: ${JSON.stringify(sidebarMenuCheck)}`);
+  if (smoke) process.stdout.write(`Prospero desktop interactions: ${JSON.stringify(sidebarMenuCheck)}\n`);
+  if (smoke) {
+    process.stdout.write("Prospero desktop smoke test passed\n");
+    quitting = true;
+    tray?.destroy();
+    tray = undefined;
+    window.destroy();
+    app.quit();
+  }
+}
+
+function installIpc(): void {
+  ipcMain.handle("snapshot:get", () => store.snapshot());
+  ipcMain.handle("daemon:start", () => runtime.start());
+  ipcMain.handle("daemon:stop", () => runtime.stop());
+  ipcMain.handle("daemon:restart", () => runtime.restart());
+  ipcMain.handle("project:choose", async () => {
+    const result = await dialog.showOpenDialog(mainWindow!, { title: "添加项目", properties: ["openDirectory"] });
+    if (result.canceled || !result.filePaths[0]) return null;
+    store.rememberProject(result.filePaths[0]);
+    return result.filePaths[0];
+  });
+  ipcMain.handle("project:forget", (_event, path: unknown) => {
+    if (typeof path !== "string") throw new Error("路径无效");
+    return store.forgetProject(path);
+  });
+  ipcMain.handle("project:rename", (_event, path: unknown, name: unknown) => {
+    if (typeof path !== "string" || typeof name !== "string") throw new Error("工作区名称无效");
+    return store.renameProject(path, name);
+  });
+  ipcMain.handle("project:pin", (_event, path: unknown, pinned: unknown) => {
+    if (typeof path !== "string" || typeof pinned !== "boolean") throw new Error("工作区置顶状态无效");
+    return store.setProjectPinned(path, pinned);
+  });
+  ipcMain.handle("session:rename", (_event, rawId: unknown, rawTitle: unknown) => {
+    const sessionId = requireId(rawId, "会话");
+    if (typeof rawTitle !== "string") throw new Error("会话名称无效");
+    return store.renameSession(sessionId, rawTitle);
+  });
+  ipcMain.handle("session:pin", (_event, rawId: unknown, pinned: unknown) => {
+    const sessionId = requireId(rawId, "会话");
+    if (typeof pinned !== "boolean") throw new Error("置顶状态无效");
+    if (!store.snapshot().daemon.sessions.some((session) => session.id === sessionId)) throw new Error("会话不存在");
+    return store.setSessionPinned(sessionId, pinned);
+  });
+  ipcMain.handle("session:unread", (_event, rawId: unknown, unread: unknown) => {
+    const sessionId = requireId(rawId, "会话");
+    if (typeof unread !== "boolean") throw new Error("会话未读状态无效");
+    return store.setSessionUnread(sessionId, unread);
+  });
+  ipcMain.handle("skills:list", async (_event, rawCwd: unknown) => {
+    if (typeof rawCwd !== "string") throw new Error("工作区路径无效");
+    const cwd = resolve(rawCwd);
+    if (!store.snapshot().projects.some((project) => project.toLocaleLowerCase() === cwd.toLocaleLowerCase())) throw new Error("只能查看已添加工作区的 Skills");
+    const result = await runtime.request(`/_prospero/control/skills?cwd=${encodeURIComponent(cwd)}`);
+    return Array.isArray(result?.["items"]) ? result["items"] : [];
+  });
+  ipcMain.handle("skills:reveal", async (_event, rawPath: unknown, rawCwd: unknown) => {
+    if (typeof rawPath !== "string" || typeof rawCwd !== "string" || !isAbsolute(rawPath)) throw new Error("Skill 路径无效");
+    const cwd = resolve(rawCwd);
+    if (!store.snapshot().projects.some((project) => project.toLocaleLowerCase() === cwd.toLocaleLowerCase())) throw new Error("工作区路径无效");
+    const result = await runtime.request(`/_prospero/control/skills?cwd=${encodeURIComponent(cwd)}`);
+    const items = Array.isArray(result?.["items"]) ? result["items"] : [];
+    if (!items.some((item) => item && typeof item === "object" && String((item as JsonObject)["path"]) === rawPath)) throw new Error("Skill 不属于当前工作区的有效目录");
+    shell.showItemInFolder(rawPath);
+    return { ok: true };
+  });
+  ipcMain.handle("workflow-template:save", (_event, raw: unknown) => {
+    return store.saveWorkflowTemplate(requireObject(raw) as unknown as WorkflowTemplate);
+  });
+  ipcMain.handle("workflow-template:delete", (_event, rawId: unknown) => {
+    return store.deleteWorkflowTemplate(requireId(rawId, "模板"));
+  });
+  ipcMain.handle("path:reveal", async (_event, path: unknown) => {
+    if (typeof path !== "string" || !isAbsolute(path) || !existsSync(path) || !store.isKnownPath(path)) return { ok: false, error: "路径不属于当前项目、会话或 worktree" };
+    shell.showItemInFolder(path);
+    return { ok: true };
+  });
+  ipcMain.handle("path:terminal", async (_event, path: unknown) => {
+    if (typeof path !== "string" || !isAbsolute(path) || !existsSync(path) || !store.isKnownPath(path)) return { ok: false, error: "路径不属于当前工作区" };
+    const alias = process.env["LOCALAPPDATA"]
+      ? resolve(process.env["LOCALAPPDATA"], "Microsoft", "WindowsApps", "wt.exe")
+      : undefined;
+    const candidates = [...new Set([alias, "wt.exe"].filter((candidate): candidate is string => Boolean(candidate)))];
+    let lastError = "未找到 Windows Terminal";
+    for (const executable of candidates) {
+      if (isAbsolute(executable) && !existsSync(executable)) continue;
+      const result = await new Promise<{ ok: boolean; error?: string }>((complete) => {
+        const child = spawn(executable, ["-d", path], { cwd: path, detached: true, windowsHide: false, stdio: "ignore" });
+        child.once("error", (error) => complete({ ok: false, error: error.message }));
+        child.once("spawn", () => { child.unref(); complete({ ok: true }); });
+      });
+      if (result.ok) return result;
+      lastError = result.error ?? lastError;
+    }
+    return { ok: false, error: `无法打开 Windows Terminal：${lastError}。请从 Microsoft Store 安装或修复 Windows Terminal。` };
+  });
+  ipcMain.handle("session:create", async (_event, raw: unknown) => {
+    const input = requireObject(raw) as SessionCreateInput;
+    const normalized = resolve(String(input.cwd ?? ""));
+    if (!store.snapshot().projects.some((path) => path.toLocaleLowerCase() === normalized.toLocaleLowerCase())) throw new Error("只能在已添加的项目中创建会话");
+    if (!["codex", "claude", "deepseek", "opencode", "grok", "trae", "shell"].includes(input.agent)) throw new Error("Agent 无效");
+    if (input.kind !== "structured" && input.kind !== "pty") throw new Error("会话类型无效");
+    if (!["strict", "standard", "yolo"].includes(input.approvalPolicy)) throw new Error("审批策略无效");
+    if (input.command) {
+      const confirmation = await dialog.showMessageBox(mainWindow!, {
+        type: "warning", title: "运行自定义终端命令", message: "这个会话将运行自定义命令",
+        detail: String(input.command).slice(0, 2_000), buttons: ["取消", "运行"], defaultId: 0, cancelId: 0,
+      });
+      if (confirmation.response !== 1) throw new Error("已取消运行自定义命令");
+    }
+    return runtime.request("/_prospero/control/session/create", {
+      method: "POST",
+      body: {
+        cwd: normalized,
+        agent: input.agent,
+        kind: input.kind,
+        approvalPolicy: input.approvalPolicy,
+        ...(input.mode ? { mode: input.mode } : {}),
+        ...(input.model ? { model: requireSelection(input.model, "模型", 160) } : {}),
+        ...(input.effort ? { effort: requireSelection(input.effort, "推理强度", 80) } : {}),
+        ...(input.command ? { command: String(input.command).slice(0, 2_000) } : {}),
+        ...(input.accountId ? { accountId: requireId(input.accountId, "账号") } : {}),
+        cols: Math.max(20, Math.min(500, Number(input.cols) || 120)),
+        rows: Math.max(5, Math.min(300, Number(input.rows) || 40)),
+      },
+    });
+  });
+  ipcMain.handle("session:view", (_event, rawId: unknown, rawQuery: unknown) => {
+    const sessionId = requireId(rawId, "会话");
+    const query = rawQuery === undefined ? {} : requireObject(rawQuery);
+    const params = new URLSearchParams();
+    for (const key of ["knownSeq", "afterSeq", "outputAfterSeq", "waitMs"]) {
+      const value = query[key];
+      if (value !== undefined) {
+        if (!Number.isSafeInteger(value) || Number(value) < 0) throw new Error("游标无效");
+        params.set(key, String(value));
+      }
+    }
+    return runtime.request(`/_prospero/control/session/${encodeURIComponent(sessionId)}/view${params.size ? `?${params}` : ""}`);
+  });
+  ipcMain.handle("session:interact", (_event, rawId: unknown, rawMessage: unknown) => {
+    const sessionId = requireId(rawId, "会话");
+    const message = requireObject(rawMessage);
+    if (typeof message["type"] !== "string" || !INTERACTION_TYPES.has(message["type"])) throw new Error("不支持的会话操作");
+    return runtime.request(`/_prospero/control/session/${encodeURIComponent(sessionId)}/interact`, { method: "POST", body: message });
+  });
+  ipcMain.handle("session:interrupt", (_event, rawId: unknown) => runtime.request(`/_prospero/control/session/${encodeURIComponent(requireId(rawId, "会话"))}/interrupt`, { method: "POST" }));
+  ipcMain.handle("session:kill", async (_event, rawId: unknown) => {
+    const sessionId = requireId(rawId, "会话");
+    if (!store.snapshot().daemon.sessions.some((session) => session.id === sessionId)) throw new Error("会话不存在");
+    const confirmation = await dialog.showMessageBox(mainWindow!, { type: "warning", title: "结束会话", message: "结束并删除这个会话？", detail: "运行中的 Agent 将被终止。", buttons: ["取消", "结束会话"], defaultId: 0, cancelId: 0 });
+    if (confirmation.response !== 1) return null;
+    const result = await runtime.request(`/_prospero/control/session/${encodeURIComponent(sessionId)}/kill`, { method: "POST" });
+    store.forgetSessionTitle(sessionId);
+    return result;
+  });
+  ipcMain.handle("session:tool-output", (_event, rawId: unknown, rawCallId: unknown) => {
+    const sessionId = requireId(rawId, "会话");
+    const callId = requireId(rawCallId, "工具调用");
+    return runtime.request(`/_prospero/control/session/${encodeURIComponent(sessionId)}/tool-output?callId=${encodeURIComponent(callId)}`);
+  });
+  ipcMain.handle("session:subagent", (_event, rawId: unknown, rawSubagent: unknown) => {
+    const sessionId = requireId(rawId, "会话");
+    const subagentId = requireId(rawSubagent, "子 Agent");
+    return runtime.request(`/_prospero/control/session/${encodeURIComponent(sessionId)}/subagent/${encodeURIComponent(subagentId)}/events`);
+  });
+  ipcMain.handle("usage:get", (_event, rawId: unknown) => {
+    const params = new URLSearchParams();
+    if (rawId !== undefined) {
+      const sessionId = requireId(rawId, "会话");
+      if (!store.snapshot().daemon.sessions.some((session) => session.id === sessionId && session.kind === "structured")) throw new Error("结构化会话不存在");
+      params.set("sid", sessionId);
+    }
+    return runtime.request(`/_prospero/control/usage${params.size ? `?${params}` : ""}`);
+  });
+  ipcMain.handle("session:suggestions", (_event, rawId: unknown, rawQuery: unknown) => {
+    const sessionId = requireId(rawId, "会话");
+    if (typeof rawQuery !== "string" || rawQuery.length > 200) throw new Error("Skill 查询无效");
+    return runtime.request(`/_prospero/control/session/${encodeURIComponent(sessionId)}/suggestions?kind=skill&query=${encodeURIComponent(rawQuery)}`)
+      .then((result) => Array.isArray(result?.["items"]) ? result["items"] : []);
+  });
+  ipcMain.handle("session:modes", (_event, rawId: unknown) => {
+    const sessionId = requireId(rawId, "会话");
+    return runtime.request(`/_prospero/control/session/${encodeURIComponent(sessionId)}/modes`);
+  });
+  ipcMain.handle("session:mode:set", (_event, rawId: unknown, rawMode: unknown) => {
+    const sessionId = requireId(rawId, "会话");
+    if (rawMode !== "default" && rawMode !== "plan") throw new Error("会话模式无效");
+    return runtime.request(`/_prospero/control/session/${encodeURIComponent(sessionId)}/modes`, { method: "POST", body: { mode: rawMode } });
+  });
+  ipcMain.handle("launch:models", (_event, rawAgent: unknown, rawAccountId: unknown) => {
+    if (rawAgent !== "codex" && rawAgent !== "claude" && rawAgent !== "deepseek") throw new Error("Agent 不支持模型目录");
+    const params = new URLSearchParams({ agent: rawAgent });
+    if (rawAccountId !== undefined) params.set("accountId", requireId(rawAccountId, "账号"));
+    return runtime.request(`/_prospero/control/launch/models?${params}`);
+  });
+  ipcMain.handle("session:models", (_event, rawId: unknown) => {
+    const sessionId = requireId(rawId, "会话");
+    return runtime.request(`/_prospero/control/session/${encodeURIComponent(sessionId)}/models`);
+  });
+  ipcMain.handle("session:model:set", (_event, rawId: unknown, rawModel: unknown, rawEffort: unknown) => {
+    const sessionId = requireId(rawId, "会话");
+    const model = requireSelection(rawModel, "模型", 160);
+    const effort = rawEffort === undefined ? undefined : requireSelection(rawEffort, "推理强度", 80);
+    return runtime.request(`/_prospero/control/session/${encodeURIComponent(sessionId)}/models`, {
+      method: "POST",
+      body: { model, ...(effort ? { effort } : {}) },
+    });
+  });
+  ipcMain.handle("orchestration:action", async (_event, rawMethod: unknown, rawParams: unknown) => {
+    if (typeof rawMethod !== "string" || !ORCHESTRATION_METHODS.has(rawMethod)) throw new Error("不支持的编排操作");
+    const params = requireObject(rawParams);
+    const snapshot = store.snapshot();
+    if ((rawMethod === "worker.start" || rawMethod === "automation.start") && (typeof params["cwd"] !== "string" || !snapshot.projects.some((path) => path.toLocaleLowerCase() === resolve(params["cwd"] as string).toLocaleLowerCase()))) throw new Error("编排只能从已添加的项目启动");
+    if (["task.cancel", "task.retry", "worker.start", "worker.stop"].includes(rawMethod)) {
+      if (typeof params["taskId"] !== "string" || !snapshot.orchestration.tasks.some((task) => task["id"] === params["taskId"])) throw new Error("任务不存在");
+    }
+    if (["run.complete", "run.abandon", "run.delete", "task.create", "automation.start", "automation.pause", "graph.apply"].includes(rawMethod)) {
+      if (typeof params["runId"] !== "string" || !snapshot.orchestration.runs.some((run) => run["id"] === params["runId"])) throw new Error("Run 不存在");
+    }
+    if (rawMethod.startsWith("worktree.")) {
+      if (typeof params["assetId"] !== "string" || !snapshot.orchestration.worktreeAssets.some((asset) => asset["id"] === params["assetId"])) throw new Error("worktree 资产不存在");
+    }
+    if ((rawMethod === "run.create" || rawMethod === "graph.create") && params["coordinatorSessionId"] !== undefined) {
+      const coordinatorId = requireId(params["coordinatorSessionId"], "协调者会话");
+      if (!snapshot.daemon.sessions.some((session) => session.id === coordinatorId && session.kind === "structured")) throw new Error("协调者会话不存在");
+    }
+    if (rawMethod === "run.delete" || rawMethod === "worktree.cleanup") {
+      const confirmation = await dialog.showMessageBox(mainWindow!, { type: "warning", title: rawMethod === "run.delete" ? "删除 Run" : "清理 worktree", message: "确认执行这个不可逆操作？", detail: rawMethod === "worktree.cleanup" ? "仅已通过安全检查的 worktree 可以被清理；分支默认保留。" : "Run 历史将被删除。", buttons: ["取消", "确认"], defaultId: 0, cancelId: 0 });
+      if (confirmation.response !== 1) throw new Error("操作已取消");
+    }
+    return runtime.request("/_prospero/control/orchestration/action", { method: "POST", body: { method: rawMethod, params } });
+  });
+  ipcMain.handle("orchestration:gate", (_event, rawId: unknown, rawDecision: unknown) => {
+    const id = requireId(rawId, "Gate");
+    if (!store.snapshot().orchestration.gates.some((gate) => gate["id"] === id)) throw new Error("Gate 不存在");
+    if (typeof rawDecision !== "string" || !rawDecision.trim() || rawDecision.length > 2_000) throw new Error("决策无效");
+    return runtime.request(`/_prospero/control/orchestration/gate/${encodeURIComponent(id)}/resolve`, { method: "POST", body: { decision: rawDecision.trim() } });
+  });
+  ipcMain.handle("account:action", async (_event, raw: unknown) => {
+    const message = requireObject(raw);
+    if (typeof message["type"] !== "string" || !ACCOUNT_METHODS.has(message["type"])) throw new Error("不支持的账号操作");
+    if (message["type"] !== "agent.accounts.list" && message["type"] !== "agent.account.create" && message["type"] !== "agent.account.api.create") {
+      const accountId = requireId(message["accountId"], "账号");
+      const account = store.snapshot().accounts.find((item) => item["id"] === accountId);
+      if (!account) throw new Error("账号不存在");
+      if (message["type"] === "agent.account.delete") {
+        if (account["managed"] !== true) throw new Error("本机默认账号不能删除");
+        const confirmation = await dialog.showMessageBox(mainWindow!, { type: "warning", title: "删除 Agent 账号", message: `确认删除“${String(account["name"] ?? accountId)}”？`, detail: "账号的独立凭据与配置将被删除，项目文件不会受到影响。", buttons: ["取消", "确认删除"], defaultId: 0, cancelId: 0 });
+        if (confirmation.response !== 1) throw new Error("操作已取消");
+      }
+    }
+    const result = await runtime.request("/_prospero/control/accounts", { method: "POST", body: message });
+    if (Array.isArray(result?.["accounts"])) store.setAccounts(result["accounts"]);
+    return result;
+  });
+  ipcMain.handle("device:pair", async (_event, raw: unknown) => {
+    const input = requireObject(raw);
+    const name = typeof input["name"] === "string" ? input["name"].trim().slice(0, 80) : "Windows device";
+    const args = ["pair", "--name", name || "Windows device"];
+    if (input["allowShell"] !== true) args.push("--no-shell");
+    if (input["allowOrchestration"] !== true) args.push("--no-orchestration");
+    const result = await runtime.runCli(args);
+    if (result.code !== 0) throw new Error(result.output || "配对失败");
+    const uri = result.output.match(/prospero:\/\/\S+/)?.[0];
+    return { output: result.output, uri };
+  });
+  ipcMain.handle("device:revoke", async (_event, rawName: unknown) => {
+    if (typeof rawName !== "string" || !rawName.trim()) throw new Error("设备名无效");
+    const result = await runtime.runCli(["revoke", rawName.trim()]);
+    return { ok: result.code === 0, output: result.output };
+  });
+  ipcMain.handle("relay:action", async (_event, raw: unknown) => {
+    const input = requireObject(raw);
+    const action = input["action"];
+    if (action !== "status" && action !== "enable" && action !== "disable" && action !== "rotate-key") throw new Error("Relay 操作无效");
+    const args = ["relay", action];
+    if (action === "status") args.push("--json");
+    if (action === "rotate-key") {
+      const confirmation = await dialog.showMessageBox(mainWindow!, { type: "warning", title: "轮换 Relay 密钥", message: "所有设备都需要重新配对", buttons: ["取消", "轮换密钥"], defaultId: 0, cancelId: 0 });
+      if (confirmation.response !== 1) throw new Error("已取消轮换密钥");
+      args.push("--yes");
+    }
+    if (action === "enable" && typeof input["url"] === "string" && input["url"].trim()) args.push("--url", input["url"].trim());
+    const result = await runtime.runCli(args);
+    if (result.code !== 0) throw new Error(result.output || "Relay 操作失败");
+    if (action === "status") {
+      try { return JSON.parse(result.output) as JsonObject; } catch { return { output: result.output }; }
+    }
+    return { ok: true, output: result.output };
+  });
+  ipcMain.handle("settings:update", (_event, raw: unknown) => {
+    const next = store.updateSettings(requireObject(raw));
+    applyTheme(next.settings);
+    app.setLoginItemSettings({ openAtLogin: next.settings.launchAtLogin, args: ["--background"] });
+    return next;
+  });
+  ipcMain.handle("logs:clear", () => store.clearLogs());
+}
+
+app.on("before-quit", () => { quitting = true; });
+app.on("window-all-closed", () => { /* Windows app remains available in the tray/background. */ });
+app.on("activate", () => {
+  if (!mainWindow || mainWindow.isDestroyed()) mainWindow = createWindow();
+  else { mainWindow.show(); mainWindow.focus(); }
+});
+
+void app.whenReady().then(async () => {
+  if (!primaryInstance) return;
+  app.setAppUserModelId("ai.prospero.desktop");
+  installIpc();
+  applyTheme(store.snapshot().settings);
+  mainWindow = createWindow();
+  nativeTheme.on("updated", () => applyTheme(store.snapshot().settings));
+  createTray();
+  store.on("changed", broadcastSnapshot);
+  setInterval(broadcastSnapshot, 1_000).unref();
+  if (process.argv.includes("--background")) mainWindow.hide();
+  if (store.snapshot().settings.startDaemonOnLaunch && !SMOKE_TEST) await runtime.start();
+  await runDesktopSelfCheck(mainWindow);
+}).catch((error: unknown) => {
+  process.stderr.write(`Prospero desktop startup failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
+  quitting = true;
+  app.exit(1);
+});
+
+app.on("will-quit", (event) => {
+  if (runtime.managed) {
+    event.preventDefault();
+    void runtime.stop().finally(() => { quitting = true; app.exit(0); });
+  }
+});

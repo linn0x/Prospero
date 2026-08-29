@@ -167,8 +167,8 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  windows-shell:
-    name: Windows desktop shell
+  windows-desktop:
+    name: Windows Electron desktop
     runs-on: windows-latest
     defaults:
       run:
@@ -181,29 +181,31 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
       - run: npm ci
-      - run: npm run build --workspace=@prospero/daemon
-      - name: Build native Windows desktop UI
-        run: ./apps/windows-shell/build.ps1 -Configuration Release
-      - name: Construct all desktop pages and verify runtime discovery
+      - run: npm run typecheck -w @prospero/windows-desktop
+      - name: Build the sandboxed Electron workbench and self-contained x64 package
+        run: ./apps/windows-desktop/scripts/package.ps1 -Architecture x64
+      - name: Start packaged UI and its bundled daemon
         run: |
-          $process = Start-Process -FilePath ./apps/windows-shell/bin/Release/ProsperoShell.exe -ArgumentList '--smoke-test' -Wait -PassThru
-          if ($process.ExitCode -ne 0) { throw "Windows shell smoke test failed with exit code $($process.ExitCode)" }
-      - name: Start and stop a real daemon from the desktop controller
-        run: |
-          $smokeHome = Join-Path $env:RUNNER_TEMP 'prospero-windows-shell-smoke'
+          $smokeHome = Join-Path $env:RUNNER_TEMP 'prospero-windows-electron-smoke'
           New-Item -ItemType Directory -Path $smokeHome -Force | Out-Null
           try {
             $env:PROSPERO_HOME = $smokeHome
-            $process = Start-Process -FilePath ./apps/windows-shell/bin/Release/ProsperoShell.exe -ArgumentList '--daemon-smoke-test' -Wait -PassThru
+            $process = Start-Process -FilePath ./dist/windows-desktop/win-unpacked/Prospero.exe -ArgumentList '--smoke-test' -WindowStyle Hidden -Wait -PassThru
             if ($process.ExitCode -ne 0) {
-              Get-Content -LiteralPath (Join-Path $smokeHome 'daemon-smoke-error.txt') -ErrorAction SilentlyContinue
-              Get-Content -LiteralPath (Join-Path $smokeHome 'windows-shell.log') -ErrorAction SilentlyContinue
-              throw "Windows shell daemon smoke test failed with exit code $($process.ExitCode)"
+              Get-Content -LiteralPath (Join-Path $smokeHome 'windows-desktop.log') -ErrorAction SilentlyContinue
+              throw "Windows Electron smoke test failed with exit code $($process.ExitCode)"
             }
+            if (-not (Test-Path -LiteralPath (Join-Path $smokeHome 'status.json'))) { throw 'Bundled daemon did not create status.json' }
           } finally {
             Remove-Item Env:\PROSPERO_HOME -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath $smokeHome -Recurse -Force -ErrorAction SilentlyContinue
           }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prospero-windows-x64-ci
+          path: |
+            dist/windows-desktop/Prospero-*-windows-x64.exe
+            dist/windows-desktop/Prospero-*-windows-x64.zip
+          if-no-files-found: error
 
   release-stage:
     name: Sign and package Windows release artifacts
@@ -226,8 +228,6 @@ jobs:
           cache-dependency-path: package-lock.json
       - run: npm ci
       - run: npm run build --workspace=@prospero/windows-native
-      - name: Build Windows desktop shell for release
-        run: ./apps/windows-shell/build.ps1 -Configuration Release
       - uses: actions/download-artifact@v5
         with:
           name: windows-native-unsigned-x64
@@ -259,10 +259,8 @@ jobs:
           $certificatePath = Join-Path $env:RUNNER_TEMP 'prospero-release-signing.pfx'
           try {
             [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:WINDOWS_AUTHENTICODE_PFX_BASE64))
-            $artifacts = @((Get-ChildItem 'packages/windows-native/prebuilds/win32-*/prospero_windows_native.node')) + @(
-              Get-Item 'apps/windows-shell/bin/Release/ProsperoShell.exe'
-            )
-            if ($artifacts.Count -ne 3) { throw "Expected two Windows native artifacts and one desktop executable, found $($artifacts.Count)" }
+            $artifacts = @((Get-ChildItem 'packages/windows-native/prebuilds/win32-*/prospero_windows_native.node'))
+            if ($artifacts.Count -ne 2) { throw "Expected two Windows native artifacts, found $($artifacts.Count)" }
             $expectedThumbprint = $env:WINDOWS_AUTHENTICODE_THUMBPRINT_SHA1.ToUpperInvariant()
             $artifacts | ForEach-Object {
               & $signTool sign /fd SHA256 /f $certificatePath /p $env:WINDOWS_AUTHENTICODE_PFX_PASSWORD /tr $env:WINDOWS_AUTHENTICODE_TIMESTAMP_URL /td SHA256 $_.FullName
@@ -291,12 +289,31 @@ jobs:
           npm run build --workspace=@prospero/daemon
           npm run prepack --workspace=@prospero/daemon
           node packages/windows-native/scripts/verify-release-pack.mjs --native-root packages/windows-native --daemon-root apps/daemon --output-dir $env:RUNNER_TEMP/release-packages
+      - name: Package self-contained x64 and arm64 desktop bundles
+        env:
+          CSC_LINK: ${{ secrets.WINDOWS_AUTHENTICODE_PFX_BASE64 }}
+          CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_AUTHENTICODE_PFX_PASSWORD }}
+        run: |
+          $nodeVersion = node -p "process.version"
+          $armArchive = Join-Path $env:RUNNER_TEMP "node-$nodeVersion-win-arm64.zip"
+          $armDirectory = Join-Path $env:RUNNER_TEMP 'node-arm64'
+          Invoke-WebRequest -Uri "https://nodejs.org/dist/$nodeVersion/node-$nodeVersion-win-arm64.zip" -OutFile $armArchive
+          $checksums = (Invoke-WebRequest -Uri "https://nodejs.org/dist/$nodeVersion/SHASUMS256.txt").Content
+          $expected = [regex]::Match($checksums, "(?m)^([a-f0-9]{64})\s+node-$([regex]::Escape($nodeVersion))-win-arm64\.zip$")
+          if (-not $expected.Success) { throw 'Official Node.js checksum entry for win-arm64 was not found' }
+          $actual = (Get-FileHash -LiteralPath $armArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected.Groups[1].Value) { throw 'Official Node.js arm64 archive checksum mismatch' }
+          Expand-Archive -LiteralPath $armArchive -DestinationPath $armDirectory
+          $armNode = Get-ChildItem -LiteralPath $armDirectory -Filter node.exe -Recurse | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $armNode) { throw 'The official arm64 Node.js archive did not contain node.exe' }
+          ./apps/windows-desktop/scripts/package.ps1 -Architecture x64 -NodeExecutable (Get-Command node.exe).Source
+          ./apps/windows-desktop/scripts/package.ps1 -Architecture arm64 -NodeExecutable $armNode
       - uses: actions/attest-build-provenance@v2
         with:
           subject-path: ${{ runner.temp }}/release-packages/*.tgz
       - uses: actions/attest-build-provenance@v2
         with:
-          subject-path: apps/windows-shell/bin/Release/ProsperoShell.exe
+          subject-path: dist/windows-desktop/Prospero-*-windows-*.*
       - uses: actions/upload-artifact@v4
         with:
           name: windows-native-signed-x64
@@ -314,10 +331,12 @@ jobs:
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
-          name: prospero-windows-shell
+          name: prospero-windows-desktop
           path: |
-            apps/windows-shell/bin/Release/ProsperoShell.exe
-            apps/windows-shell/bin/Release/ProsperoShell.exe.config
+            dist/windows-desktop/Prospero-*-windows-x64.exe
+            dist/windows-desktop/Prospero-*-windows-x64.zip
+            dist/windows-desktop/Prospero-*-windows-arm64.exe
+            dist/windows-desktop/Prospero-*-windows-arm64.zip
           if-no-files-found: error
 
   release-signed-load:
@@ -360,6 +379,30 @@ jobs:
         run: |
           npm run build --workspace=@prospero/daemon
           npm run test:windows-native --workspace=@prospero/daemon
+      - uses: actions/download-artifact@v5
+        with:
+          name: prospero-windows-desktop
+          path: windows-bundles
+      - name: Exercise the self-contained desktop bundle
+        run: |
+          $archive = Get-ChildItem -LiteralPath (Join-Path $PWD 'windows-bundles') -Filter "Prospero-*-windows-${{ matrix.arch }}.zip" | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $archive) { throw 'Desktop ZIP artifact was not found' }
+          $expanded = Join-Path $env:RUNNER_TEMP "prospero-windows-${{ matrix.arch }}"
+          Expand-Archive -LiteralPath $archive -DestinationPath $expanded
+          $desktop = Get-ChildItem -LiteralPath $expanded -Filter Prospero.exe -Recurse | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $desktop) { throw 'Desktop bundle did not contain Prospero.exe' }
+          $smokeHome = Join-Path $env:RUNNER_TEMP "prospero-bundle-smoke-${{ matrix.arch }}"
+          New-Item -ItemType Directory -Path $smokeHome -Force | Out-Null
+          try {
+            $env:PROSPERO_HOME = $smokeHome
+            $desktopSmoke = Start-Process -FilePath $desktop -ArgumentList '--smoke-test' -WindowStyle Hidden -Wait -PassThru
+            if ($desktopSmoke.ExitCode -ne 0) {
+              Get-Content -LiteralPath (Join-Path $smokeHome 'windows-desktop.log') -ErrorAction SilentlyContinue
+              throw "Bundled desktop smoke test failed with exit code $($desktopSmoke.ExitCode)"
+            }
+          } finally {
+            Remove-Item Env:\PROSPERO_HOME -ErrorAction SilentlyContinue
+          }
 
   release-publish:
     name: Publish Windows native npm package with provenance

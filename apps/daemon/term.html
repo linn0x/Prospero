@@ -100,7 +100,7 @@
 <script src="/assets/webgl.js"></script>
 <script>
   const post = (o) => window.ReactNativeWebView && window.ReactNativeWebView.postMessage(JSON.stringify(o));
-  const DEFAULT_FONT_FAMILY = "ui-monospace, SFMono-Regular, Menlo, Monaco, monospace";
+  const DEFAULT_FONT_FAMILY = "Cascadia Mono, Consolas, ui-monospace, SFMono-Regular, Menlo, Monaco, monospace";
 
   function quotedCSSFontFamily(name) {
     const clean = String(name || "")
@@ -221,6 +221,22 @@
   term.attachCustomKeyEventHandler((event) => {
     if (event.type !== "keydown") return true;
     const key = event.key.toLowerCase();
+    const windowsHost = /Win/i.test(navigator.platform || navigator.userAgent || "");
+    // Match Windows Terminal muscle memory without stealing Ctrl+C from shells
+    // and TUIs. Copy requires an active selection; otherwise Ctrl+C continues
+    // through xterm as the PTY interrupt byte. Ctrl+Shift+C/V always act as
+    // clipboard shortcuts.
+    if (windowsHost && event.ctrlKey && !event.metaKey && !event.altKey) {
+      if (key === "c" && (event.shiftKey || term.hasSelection())) {
+        if (term.hasSelection()) post({ kind: "clipboardCopy", text: term.getSelection() });
+        else showToast("先选择终端内容");
+        return false;
+      }
+      if (key === "v" && event.shiftKey) {
+        post({ kind: "clipboardPaste" });
+        return false;
+      }
+    }
     if (event.metaKey && !event.ctrlKey && !event.altKey) {
       if (key === "c") {
         if (term.hasSelection()) {

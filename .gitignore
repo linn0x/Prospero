@@ -8,6 +8,8 @@ node_modules/
 # TypeScript, test, and generated build outputs
 dist/
 .prospero-runtime/
+apps/windows-desktop/.runtime/
+apps/windows-desktop/out/
 build/
 coverage/
 .nyc_output/
@@ -39,8 +41,6 @@ apps/mobile/expo-env.d.ts
 
 # Swift and Xcode build state
 apps/shell/.build/
-apps/windows-shell/bin/
-apps/windows-shell/obj/
 DerivedData/
 xcuserdata/
 *.xcuserstate
