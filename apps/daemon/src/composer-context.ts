@@ -54,6 +54,13 @@ interface DiscoveredSkill extends Omit<ResolvedSkill, "contents"> {
   priority: number;
 }
 
+export interface SkillInventoryItem {
+  name: string;
+  description: string;
+  path: string;
+  scope: SkillRoot["scope"];
+}
+
 const fileCache = new Map<string, CacheEntry<IndexedPath[]>>();
 const skillCache = new Map<string, CacheEntry<DiscoveredSkill[]>>();
 
@@ -281,6 +288,16 @@ async function discoveredSkills(cwd: string): Promise<DiscoveredSkill[]> {
   const value = [...byName.values()].slice(0, MAX_SKILLS);
   skillCache.set(key, { at: Date.now(), value });
   return value;
+}
+
+/** Return the effective skill catalog after project/user/plugin precedence is applied. */
+export async function listDiscoveredSkills(cwd: string): Promise<SkillInventoryItem[]> {
+  return (await discoveredSkills(cwd)).map(({ name, description, path: skillPath, scope }) => ({
+    name,
+    description,
+    path: skillPath,
+    scope,
+  }));
 }
 
 async function completeSkills(cwd: string, query: string): Promise<ChatSuggestion[]> {

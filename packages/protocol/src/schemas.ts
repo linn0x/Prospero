@@ -1639,6 +1639,21 @@ export const UsageWindowSchema = z.object({
   resetsAt: z.string().optional(),
 });
 
+export const UsageDailyBucketSchema = z.object({
+  date: z.string().min(1).max(40),
+  tokens: z.number().int().nonnegative(),
+});
+
+const CodexAccountUsageFields = {
+  lifetimeTokens: z.number().int().nonnegative().optional(),
+  creditsUnlimited: z.boolean().optional(),
+  creditsBalance: z.string().max(120).optional(),
+  spendLimit: z.string().max(120).optional(),
+  spendUsed: z.string().max(120).optional(),
+  spendRemainingPercent: z.number().min(0).max(100).optional(),
+  dailyUsage: z.array(UsageDailyBucketSchema).max(31).optional(),
+};
+
 /**
  * 一个 agent 账号的用量。
  *
@@ -1656,6 +1671,7 @@ export const UsageAccountSchema = z.object({
   costUsd: z.number().nonnegative().optional(),
   inputTokens: z.number().int().nonnegative().optional(),
   outputTokens: z.number().int().nonnegative().optional(),
+  ...CodexAccountUsageFields,
   windows: z.array(UsageWindowSchema),
   reason: z.string().optional(),
 });
@@ -1677,6 +1693,7 @@ export const S2CUsageSchema = z.object({
   costUsd: z.number().nonnegative().optional(),
   inputTokens: z.number().int().nonnegative().optional(),
   outputTokens: z.number().int().nonnegative().optional(),
+  ...CodexAccountUsageFields,
   /** 套餐限流窗口;只有 claude.ai 订阅会话才有 */
   windows: z.array(UsageWindowSchema).optional(),
   /** 没有窗口时说明原因(不代表没有用量数据) */

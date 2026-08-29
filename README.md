@@ -78,7 +78,7 @@ Windows 11 是受支持的 daemon 平台，不只是可以打开仓库或连接�
 | 结构化聊天 | ✅ Claude Code、Codex、DeepSeek Harness、OpenCode、Grok 可用；其余 Agent 使用完整 PTY/TUI |
 | DAG / Goal / Gate / worker 编排 | ✅ 支持手工与自动编排；使用 worktree 时需安装 Git for Windows |
 | daemon 重启时保活 Agent | ✅ PTY 与 Claude Code / Codex / DeepSeek Harness / OpenCode / Grok structured 会话使用每会话 Windows Session Host；daemon 只重连已验证的 owner，不重复启动 agent |
-| Windows 桌面端 | ✅ 原生 WPF 托盘与 Dashboard，支持浅色、深色和跟随系统；可管理 daemon、会话、账号、编排、配对设备、日志和运行设置 |
+| Windows 桌面端 | ✅ Electron + React Agent 工作台；项目/会话标签、结构化 Chat、xterm 终端、DAG 编排、账号、设备、日志、托盘与系统主题 |
 | 原生分发与 CI | ✅ x64、arm64 都有预编译 N-API 路径；PR 验证原生 ABI/加载拒绝 unsigned artifact，`v*` release 再签名、校验并在两种架构加载 signed artifact |
 
 在 Windows 上，Session Host 而非 daemon 持有 ConPTY、structured adapter、Job Object 和 append-only journal。正常退出或强制结束
@@ -93,8 +93,9 @@ journal/终态历史，但不会自动重放 native 命令或宣称 in-flight tu
 [Windows N-API native boundary](docs/windows-native-boundary.md)。macOS/Linux 仍分别使用 detached structured supervisor 与可选
 `tmux` PTY 托管。
 
-Windows 原生 WPF 桌面端位于 `apps/windows-shell`，提供与 macOS 壳对应的托盘、Dashboard 和本机管理能力，支持浅色、深色及跟随 Windows 主题，并可在
-设置或托盘菜单中开关“登录 Windows 时自动启动”。它与 PowerShell/cmd 使用同一份 daemon、配置目录和手机客户端。
+Windows 桌面端位于 `apps/windows-desktop`。它参考 Orca 的项目—会话—工作台结构，但直接连接现有 Prospero daemon，
+不会复制协议或会话实现。Renderer 启用 Chromium sandbox 与 context isolation，关闭 Node integration、任意导航和页面网络；
+control token 只留在 Electron main 的白名单 IPC 内。桌面端与 PowerShell/cmd、macOS 壳和手机客户端共用 `~/.prospero`。
 
 ## How to use
 
@@ -112,11 +113,21 @@ npm run build -w @prospero/daemon
 node apps/daemon/dist/cli.js start --name my-computer
 ```
 
-Windows 11 也可以构建并运行桌面端，由桌面端管理 daemon：
+Windows 11 最终用户可直接运行与 CPU 架构匹配的 `Prospero-*-windows-*.exe` 安装器，也可使用便携 ZIP。
+正式包内置 Node.js sidecar、同一份 daemon、协议包和生产依赖，安装后会自动启动服务，不要求预装 Node.js。
+PTY 由 Electron 内的 xterm.js 渲染，保留真彩色、光标、全屏 TUI、剪贴板和窗口尺寸同步；终端与编排页面按需加载。
+
+开发者从源码构建桌面端时可执行：
 
 ```powershell
-npm run build:windows-shell
-apps/windows-shell/bin/Release/ProsperoShell.exe
+npm run build:windows
+npm run dev:windows
+```
+
+也可以生成带品牌 NSIS 安装界面和便携 ZIP 的自包含发行包：
+
+```powershell
+npm run package:windows -- -Architecture x64
 ```
 
 关闭主窗口会隐藏到系统托盘；从托盘菜单选择“退出”才会退出。Windows 开机自启动属于当前用户设置，不需要管理员权限。
