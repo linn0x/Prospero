@@ -540,7 +540,17 @@ void app.whenReady().then(async () => {
   store.on("changed", broadcastSnapshot);
   setInterval(broadcastSnapshot, 1_000).unref();
   if (process.argv.includes("--background")) mainWindow.hide();
-  if (store.snapshot().settings.startDaemonOnLaunch && !SMOKE_TEST) await runtime.start();
+  if (store.snapshot().settings.startDaemonOnLaunch) {
+    const started = await runtime.start();
+    // 冒烟测试那一步的名字就是"Start packaged UI and its bundled daemon" ——
+    // 跳过启动的话它只验证了一个空壳 UI。daemon 起不来必须让进程非零退出,
+    // 由 CI 的退出码来兜;runtime.start() 是等到 /control/health 应答才返回的,
+    // 所以"返回 ok"本身就是打包产物里 daemon 可用的证据。
+    if (SMOKE_TEST) {
+      if (!started.ok) throw new Error(`bundled daemon failed to start: ${started.error ?? "unknown error"}`);
+      process.stdout.write("Prospero bundled daemon ready\n");
+    }
+  }
   await runDesktopSelfCheck(mainWindow);
 }).catch((error: unknown) => {
   process.stderr.write(`Prospero desktop startup failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
