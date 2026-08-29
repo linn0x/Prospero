@@ -572,7 +572,10 @@ export class OrchestrationStore {
    * 显式结束 Run。Task 的完成仍只认 worker/协调者的显式交付；这里仅在整张图
    * 已经没有未决工作时汇总 Run 生命周期，避免 UI 永远停在 active。
    */
-  completeRun(runId: string, options: { fromAutomation?: boolean } = {}): Run {
+  completeRun(
+    runId: string,
+    options: { fromAutomation?: boolean; allowFailedTasks?: boolean } = {},
+  ): Run {
     const run = this.getRun(runId);
     if (run.status === "completed") return run;
     if (run.status !== "active") {
@@ -583,8 +586,10 @@ export class OrchestrationStore {
     }
 
     const tasks = this.listTasks(runId);
-    const unfinished = tasks.find(
-      (task) => task.status !== "done" && task.status !== "cancelled",
+    const unfinished = tasks.find((task) =>
+      task.status !== "done"
+      && task.status !== "cancelled"
+      && !(options.allowFailedTasks === true && task.status === "failed")
     );
     if (unfinished) {
       throw new OrchestrationError(
@@ -593,6 +598,12 @@ export class OrchestrationStore {
       );
     }
     if (options.fromAutomation) {
+      if (options.allowFailedTasks === true) {
+        throw new OrchestrationError(
+          "自动执行不能把 failed 任务计为已完成",
+          "run_not_completable",
+        );
+      }
       if (tasks.length === 0) {
         throw new OrchestrationError(
           "自动执行没有可交付的任务，Run 不能自动标记完成",

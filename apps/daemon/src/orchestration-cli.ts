@@ -88,8 +88,13 @@ run.command("list").action(action("run.list", () => ({})));
 run
   .command("complete")
   .requiredOption("--id <id>", "Run ID")
+  .option(
+    "--allow-failed-tasks",
+    "显式允许把已审计的 failed 历史节点视为终态；默认仍拒绝",
+  )
   .action(action("run.complete", (opts) => ({
     runId: requireText(opts["id"], "--id"),
+    ...(opts["allowFailedTasks"] === true ? { allowFailedTasks: true } : {}),
     actorSessionId: optionalSession(),
   })));
 run

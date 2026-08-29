@@ -181,6 +181,34 @@ describe("控制 API 的交付报告", () => {
     expect(completed.status).toBe("completed");
   });
 
+  it("failed历史节点只有在协调者显式opt-in时允许Run完成", async () => {
+    const store = new OrchestrationStore();
+    const run = store.createRun({ objective: "审计后收口", coordinatorSessionId: "coord" });
+    const task = store.createTask({ runId: run.id, title: "反馈源", spec: "" });
+    store.setTaskStatus(task.id, "dispatched");
+    store.setTaskStatus(task.id, "failed", "typed feedback source");
+    const api = orchestrationControlApi(
+      store,
+      new DispatchService(store, unusedSessions),
+      new CollaborationService(store),
+    );
+    const signal = new AbortController().signal;
+
+    await expect(api("run.complete", {
+      runId: run.id,
+      operationId: "strict-complete",
+      actorSessionId: "coord",
+    }, signal)).rejects.toMatchObject({ code: "run_not_completable" });
+
+    const completed = await api("run.complete", {
+      runId: run.id,
+      allowFailedTasks: true,
+      operationId: "audited-complete",
+      actorSessionId: "coord",
+    }, signal) as { status: string };
+    expect(completed.status).toBe("completed");
+  });
+
   it("宿主可放弃没有活动 worker 的 Run，并保持操作幂等", async () => {
     const store = new OrchestrationStore();
     const run = store.createRun({ objective: "停止目标", coordinatorSessionId: null });

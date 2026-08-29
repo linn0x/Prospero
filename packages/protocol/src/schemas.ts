@@ -924,6 +924,8 @@ export const C2SOrchestrationRunCreateSchema = z.object({
 export const C2SOrchestrationRunCompleteSchema = z.object({
   type: z.literal("orchestration.run.complete"),
   runId: z.string().min(1).max(200),
+  /** Explicit coordinator opt-in for audited graphs with terminal failed history. */
+  allowFailedTasks: z.boolean().optional(),
   operationId: z.string().min(1).max(200),
 });
 
