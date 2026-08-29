@@ -292,8 +292,17 @@ describe("结构化轨协议", () => {
       type: "orchestration.worker.stop",
       taskId: "task-1",
       reason: "先停下来检查",
+      finalStatus: "cancelled",
       operationId: "stop-1",
-    })).toMatchObject({ taskId: "task-1", reason: "先停下来检查" });
+    })).toMatchObject({
+      taskId: "task-1", reason: "先停下来检查", finalStatus: "cancelled",
+    });
+    expect(() => parseC2S({
+      type: "orchestration.worker.stop",
+      taskId: "task-1",
+      finalStatus: "done",
+      operationId: "stop-invalid",
+    })).toThrowError(ProtocolError);
     expect(parseC2S({
       type: "orchestration.task.cancel",
       taskId: "task-2",

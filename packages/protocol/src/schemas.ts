@@ -981,6 +981,8 @@ export const C2SOrchestrationWorkerStopSchema = z.object({
   type: z.literal("orchestration.worker.stop"),
   taskId: z.string().min(1).max(200),
   reason: z.string().trim().min(1).max(20_000).optional(),
+  /** failed = genuine worker failure; cancelled = intentionally superseded work. */
+  finalStatus: z.enum(["failed", "cancelled"]).optional(),
   operationId: z.string().min(1).max(200),
 });
 

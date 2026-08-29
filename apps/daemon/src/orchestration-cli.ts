@@ -184,13 +184,15 @@ worker
   })));
 worker
   .command("stop")
-  .description("停止运行中的 worker 并把 Task 标为 failed；自动编排运行中会先暂停")
+  .description("停止运行中的 worker；默认标为 failed，也可显式标为 cancelled")
   .requiredOption("--task <id>", "运行中 worker 所属的 Task ID")
   .option("--reason <text>", "停止原因；省略时使用服务端默认原因")
+  .option("--final-status <status>", "停止后的 Task 状态：failed 或 cancelled")
   .option("--operation-id <id>", "调用方提供时，用于同一 stop 请求的幂等重试")
   .action(action("worker.stop", (opts) => ({
     taskId: requireText(opts["task"], "--task"),
     ...(typeof opts["reason"] === "string" ? { reason: opts["reason"] } : {}),
+    ...(typeof opts["finalStatus"] === "string" ? { finalStatus: opts["finalStatus"] } : {}),
     ...(typeof opts["operationId"] === "string" ? { operationId: opts["operationId"] } : {}),
     actorSessionId: optionalSession(),
   })));

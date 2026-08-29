@@ -432,15 +432,22 @@ export function orchestrationControlApi(
           const actorSessionId = optionalText(params, "actorSessionId");
           ownerOrCoordinator(store, task.runId, actorSessionId);
           const reason = optionalText(params, "reason") ?? "由用户停止 worker";
+          const finalStatus = optionalText(params, "finalStatus") ?? "failed";
+          if (finalStatus !== "failed" && finalStatus !== "cancelled") {
+            throw new ControlSocketError(
+              "finalStatus 必须是 failed 或 cancelled",
+              "bad_params",
+            );
+          }
           return idempotent(
             method,
             operationId(params),
-            { taskId, reason, actorSessionId },
+            { taskId, reason, finalStatus, actorSessionId },
             async () => {
               if (store.getRun(task.runId).automation?.state === "running") {
                 automation?.pause(task.runId);
               }
-              return await dispatch.stopWorker(taskId, reason);
+              return await dispatch.stopWorker(taskId, reason, finalStatus);
             },
           );
         }
