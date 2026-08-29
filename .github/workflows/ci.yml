@@ -195,7 +195,12 @@ jobs:
               Get-Content -LiteralPath (Join-Path $smokeHome 'windows-desktop.log') -ErrorAction SilentlyContinue
               throw "Windows Electron smoke test failed with exit code $($process.ExitCode)"
             }
-            if (-not (Test-Path -LiteralPath (Join-Path $smokeHome 'status.json'))) { throw 'Bundled daemon did not create status.json' }
+            # 不要断言 status.json 还在:daemon 收到 SIGTERM 会主动删掉它
+            # (StatusFile.stop 里"删掉而不是留一份陈旧快照"),而桌面端退出时正是
+            # 这么关它的。这个断言只能靠"没来得及清理"侥幸通过。daemon 是否真的起来了,
+            # 由 --smoke-test 自己断言 —— 它等 /control/health 应答,起不来就非零退出。
+            $desktopLog = Join-Path $smokeHome 'windows-desktop.log'
+            if (-not (Test-Path -LiteralPath $desktopLog)) { throw 'Bundled daemon produced no log output' }
           } finally {
             Remove-Item Env:\PROSPERO_HOME -ErrorAction SilentlyContinue
           }
