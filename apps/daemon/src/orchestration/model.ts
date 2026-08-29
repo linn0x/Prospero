@@ -283,9 +283,11 @@ const TASK_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
   // 门解开后退回 pending 重新排队,而不是直接 dispatched ——
   // 因为挡着的这段时间里,依赖和 worker 都可能已经变了
   blocked: ["pending", "cancelled"],
-  // 终态里只有 failed 能重试;done 要改就新建任务,别改历史
+  // failed 通常只能重试；worker.stop(cancelled) 还可在“kill 先触发会话终态”
+  // 的竞争窗口里把 adapter 投影的 failed 收敛为 cancelled。公开 task.cancel
+  // 仍拒绝取消 failed，只有 DispatchService 在 abandoned dispatch 上使用该转移。
   done: [],
-  failed: ["pending"],
+  failed: ["pending", "cancelled"],
   cancelled: [],
 };
 
