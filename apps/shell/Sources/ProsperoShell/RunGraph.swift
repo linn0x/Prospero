@@ -16,6 +16,21 @@ func runGraphCenteredOffset(containerHeight: CGFloat, contentHeight: CGFloat) ->
   max(0, (containerHeight - contentHeight) / 2)
 }
 
+/// A terminal node can be historical control flow rather than a failed unit of
+/// work. Keep this derived from Prospero's generic lineage/result fields so the
+/// shell never needs to understand a plugin's material/domain/evidence types.
+func runGraphTaskWasSuperseded(
+  task: OrchestrationStatus.Task,
+  all: [OrchestrationStatus.Task]
+) -> Bool {
+  guard task.status == "failed" || task.status == "cancelled" else { return false }
+  if all.contains(where: { $0.parentId == task.id }) { return true }
+  let signal = task.result?.lowercased() ?? ""
+  return signal.contains("superseded")
+    || signal.contains("quiesced before applying typed feedback")
+    || signal.contains("typed_feedback_replan")
+}
+
 /// 一个 Run 的任务依赖图。
 ///
 /// 列表读不出 DAG 的形状:哪几个任务此刻能并行、整条链卡在谁身上、失败的那个
@@ -567,6 +582,12 @@ struct RunTaskState {
     }
     ready = task.status == "pending" && depsSatisfied
 
+    if runGraphTaskWasSuperseded(task: task, all: all) {
+      label = "已回退"
+      color = .blue
+      return
+    }
+
     switch task.status {
     case "done":
       label = "完成"
@@ -597,6 +618,7 @@ struct RunTaskState {
     ("就绪", .accentColor),
     ("运行中", .orange),
     ("完成", .green),
+    ("已回退", .blue),
     ("失败", .red),
     ("阻塞", .yellow),
   ]

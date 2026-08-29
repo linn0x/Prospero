@@ -242,12 +242,14 @@ describe("会话内 prospero CLI", () => {
     });
 
     const stop = await cli(control.path, control.tokenPath, [
-      "worker", "stop", "--task", "task-running", "--reason", "人工接管", "--operation-id", "stop-1",
+      "worker", "stop", "--task", "task-running", "--reason", "由新 revision 取代",
+      "--final-status", "cancelled", "--operation-id", "stop-1",
     ], "coord") as { method: string; params: Record<string, unknown> };
     expect(stop).toMatchObject({
       method: "worker.stop",
       params: {
-        taskId: "task-running", reason: "人工接管", operationId: "stop-1", actorSessionId: "coord",
+        taskId: "task-running", reason: "由新 revision 取代", finalStatus: "cancelled",
+        operationId: "stop-1", actorSessionId: "coord",
       },
     });
   });

@@ -23,6 +23,7 @@ import {
 } from "./worktree-leases.js";
 
 export type WorktreeMode = "new" | "none";
+export type WorkerStopFinalStatus = "failed" | "cancelled";
 
 /** kill 正在处理自我发起的 control RPC 时，不能让 task.done/fail 永久卡住。 */
 export const WORKER_TERMINATION_TIMEOUT_MS = 5_000;
@@ -97,6 +98,7 @@ export class DispatchError extends Error {
       | "not_a_repo"
       | "wrong_worker"
       | "worker_not_active"
+      | "worker_stop_failed"
       | "worktree_busy"
       | "worker_session_live"
       | "skills_invalid",
@@ -128,7 +130,11 @@ export class DispatchService {
    * 人类显式停止 worker。先终止真实会话，再把这次派发落为 abandoned；若 worker
    * 在 kill 之前已经显式交付，则尊重 done/failed，不用停止动作覆盖真实结果。
    */
-  async stopWorker(taskId: string, reason = "由用户停止 worker"): Promise<StopWorkerResult> {
+  async stopWorker(
+    taskId: string,
+    reason = "由用户停止 worker",
+    finalStatus: WorkerStopFinalStatus = "failed",
+  ): Promise<StopWorkerResult> {
     const active = this.store.activeDispatchFor(taskId);
     if (!active) {
       throw new DispatchError(`任务 ${taskId} 没有运行中的 worker`, "worker_not_active");
@@ -136,7 +142,7 @@ export class DispatchService {
     const alreadyStopping = this.stoppingDispatches.get(active.id);
     if (alreadyStopping) return alreadyStopping;
 
-    const stopping = this.stopActiveWorker(active, taskId, reason);
+    const stopping = this.stopActiveWorker(active, taskId, reason, finalStatus);
     this.stoppingDispatches.set(active.id, stopping);
     try {
       return await stopping;
@@ -151,8 +157,32 @@ export class DispatchService {
     active: Dispatch,
     taskId: string,
     reason: string,
+    finalStatus: WorkerStopFinalStatus,
   ): Promise<StopWorkerResult> {
-    await this.sessions.kill(active.sessionId);
+    try {
+      await this.sessions.kill(active.sessionId);
+    } catch (error) {
+      // Session termination races with an agent's explicit task.done/fail and
+      // with adapter-side terminal projection. If either durable orchestration
+      // state or the session registry already says the worker is terminal, the
+      // stop request has converged and must not become an opaque control_error.
+      let sessionTerminal = false;
+      try {
+        sessionTerminal = isTerminalSession(this.sessions.infoOf(active.sessionId));
+      } catch {
+        // Missing session information is not enough to claim convergence; the
+        // durable Task/Dispatch pair below remains the authority.
+      }
+      const durableDispatch = this.store.getDispatch(active.id);
+      const durableTask = this.store.getTask(taskId);
+      const durableTerminal =
+        (durableDispatch.state !== "starting" && durableDispatch.state !== "running")
+        || durableTask.status !== "dispatched";
+      if (!sessionTerminal && !durableTerminal) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new DispatchError(`停止 worker 会话失败: ${message}`, "worker_stop_failed");
+      }
+    }
     let currentDispatch = this.store.getDispatch(active.id);
     let currentTask = this.store.getTask(taskId);
     if (currentDispatch.state === "starting" || currentDispatch.state === "running") {
@@ -162,7 +192,7 @@ export class DispatchService {
       currentDispatch = this.store.setDispatchState(active.id, "abandoned", reason);
     }
     if (currentTask.status === "dispatched") {
-      currentTask = this.store.setTaskStatus(taskId, "failed", reason);
+      currentTask = this.store.setTaskStatus(taskId, finalStatus, reason);
     } else if (currentTask.status === "failed" && currentDispatch.state === "abandoned") {
       currentTask = this.store.setTaskStatus(taskId, "failed", reason);
     }
