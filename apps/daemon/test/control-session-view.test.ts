@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -121,6 +121,17 @@ describe("Mac control session views", () => {
         expect(response.status).toBe(204);
       };
 
+      // Skill 补全扫的是文件系统:项目目录逐级向上,再加上用户家目录下的
+      // ~/.claude/skills 之类。home 是空的临时目录,所以断言"有建议"实际断言的是
+      // 【跑测试这台机器的家目录里恰好装了 Skill】—— 作者机器上过,CI 上必挂。
+      // 在会话 cwd 里放一个项目级 Skill,补全结果才由用例自己决定。
+      const skillDir = path.join(home, ".claude", "skills", "control-view-probe");
+      mkdirSync(skillDir, { recursive: true });
+      writeFileSync(
+        path.join(skillDir, "SKILL.md"),
+        "---\nname: control-view-probe\ndescription: 控制面板补全用例的固定 Skill\n---\n",
+      );
+
       const structured = await create({ agent: "codex", kind: "structured", cwd: home });
       const viewPath = `/_prospero/control/session/${structured.id}/view`;
       const toolPath = `/_prospero/control/session/${structured.id}/tool-output`;
@@ -151,8 +162,8 @@ describe("Mac control session views", () => {
       const suggestions = await request(suggestionsPath);
       expect(suggestions.status).toBe(200);
       const suggestionBody = await suggestions.json() as { items: Array<{ kind: string; value: string }> };
-      expect(suggestionBody.items.length).toBeGreaterThan(0);
-      expect(suggestionBody.items[0]).toMatchObject({ kind: "skill" });
+      // 项目级 Skill 优先级高于用户级,所以哪怕开发机上另有一堆 Skill,它也排在最前。
+      expect(suggestionBody.items[0]).toMatchObject({ kind: "skill", value: "control-view-probe" });
 
       const initial = await request(viewPath);
       expect(initial.status).toBe(200);
