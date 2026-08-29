@@ -482,6 +482,37 @@ describe("控制 API 的幂等与任务图事务", () => {
     expect(stopped.task.status).toBe("cancelled");
   });
 
+  it("worker.stop(cancelled) 覆盖 kill 产生的 abandoned/failed 投影", async () => {
+    const store = new OrchestrationStore();
+    const run = store.createRun({ objective: "回退竞争", coordinatorSessionId: null });
+    const task = store.createTask({ runId: run.id, title: "旧 revision peer", spec: "" });
+    const dispatch = store.createDispatch({ taskId: task.id, sessionId: "worker-race" });
+    const sessions: WorkerSessionManager = {
+      ...unusedSessions,
+      async kill() {
+        store.setDispatchState(dispatch.id, "abandoned", "session terminated");
+        store.setTaskStatus(task.id, "failed", "session terminated");
+      },
+    };
+    const api = orchestrationControlApi(
+      store,
+      new DispatchService(store, sessions),
+      new CollaborationService(store),
+    );
+
+    const stopped = await api("worker.stop", {
+      taskId: task.id,
+      reason: "由新 revision 取代",
+      finalStatus: "cancelled",
+      operationId: "supersede-race-stop",
+      actorSessionId: null,
+    }, new AbortController().signal) as { task: { status: string; result: string } };
+    expect(stopped.task).toMatchObject({
+      status: "cancelled",
+      result: "由新 revision 取代",
+    });
+  });
+
   it("worker.stop 保留真正的会话终止错误码", async () => {
     const store = new OrchestrationStore();
     const run = store.createRun({ objective: "停止失败", coordinatorSessionId: null });
