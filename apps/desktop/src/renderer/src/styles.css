@@ -1678,3 +1678,20 @@ kbd {
   .run-views-dag { min-height: clamp(320px, calc(100svh - 310px), 500px); }
   .run-graph-minimap { width: 126px; height: 78px; }
 }
+
+/* ---------------------------------------------------------------- macOS 窗口按钮
+   红黄绿由系统绘制在窗口左上角,浮在内容之上。侧栏头部这块布局本来是按 Windows
+   设计的(那边控件在右上角,左上角是空的),所以在 macOS 上要主动让出这段高度。
+   同时把头部整条设为可拖拽区域 —— 隐藏标题栏之后,没有它窗口就拖不动了;
+   里面的按钮再单独声明为不可拖拽,否则点不动。 */
+:root[data-platform="darwin"] [data-slot="sidebar-header"] { padding-top: 42px; -webkit-app-region: drag; }
+:root[data-platform="darwin"] [data-slot="sidebar-header"] button,
+:root[data-platform="darwin"] [data-slot="sidebar-header"] a,
+:root[data-platform="darwin"] [data-slot="sidebar-header"] [role="button"] { -webkit-app-region: no-drag; }
+/* 收起成图标条时侧栏很窄,红黄绿会盖住整行,留的高度要更多一点。 */
+:root[data-platform="darwin"] [data-collapsible="icon"] [data-slot="sidebar-header"] { padding-top: 48px; }
+/* 顶栏同理:窗口拖拽在这条上也要能用。 */
+:root[data-platform="darwin"] .desktop-topbar { -webkit-app-region: drag; }
+:root[data-platform="darwin"] .desktop-topbar button,
+:root[data-platform="darwin"] .desktop-topbar input,
+:root[data-platform="darwin"] .desktop-topbar [role="button"] { -webkit-app-region: no-drag; }
