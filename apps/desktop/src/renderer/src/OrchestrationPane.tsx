@@ -19,6 +19,17 @@ import { useLocale } from "./locale";
 
 const operationId = (): string => crypto.randomUUID();
 
+type RunView = "board" | "dag" | "timeline";
+
+function initialRunView(): RunView {
+  try {
+    const saved = localStorage.getItem("prospero.run-task-view");
+    return saved === "board" || saved === "timeline" || saved === "dag" ? saved : "dag";
+  } catch {
+    return "dag";
+  }
+}
+
 export function OrchestrationPane({ snapshot, onOpenSession, coordinatorSessionId }: { snapshot: DesktopSnapshot; onOpenSession: (id: string) => void; coordinatorSessionId?: string | undefined }) {
   const { t, status } = useLocale();
   const { runs, tasks, dispatches, gates, worktreeAssets } = snapshot.orchestration;
@@ -36,7 +47,8 @@ export function OrchestrationPane({ snapshot, onOpenSession, coordinatorSessionI
   const [workerProject, setWorkerProject] = useState(snapshot.projects[0] ?? "");
   const [error, setError] = useState<string>();
   const [busy, setBusy] = useState<string>();
-  const [runView, setRunView] = useState("board");
+  // SwiftUI 默认并持久化依赖图视图；Electron 保持相同习惯，避免每次进 Run 都先切 Tab。
+  const [runView, setRunView] = useState<RunView>(initialRunView);
   const [templateLibraryOpen, setTemplateLibraryOpen] = useState(false);
   const [saveTemplateOpen, setSaveTemplateOpen] = useState(false);
   const [templateName, setTemplateName] = useState("");
@@ -146,14 +158,20 @@ export function OrchestrationPane({ snapshot, onOpenSession, coordinatorSessionI
     </CardFooter></Card>;
   };
 
-  return <div className="page orchestration-page">
+  const changeRunView = (value: string | null): void => {
+    if (value !== "board" && value !== "dag" && value !== "timeline") return;
+    setRunView(value);
+    try { localStorage.setItem("prospero.run-task-view", value); } catch { /* 偏好写入失败不影响看图。 */ }
+  };
+
+  return <div className={`page orchestration-page${runView === "dag" ? " dag-active" : ""}`}>
     <header className="flex flex-wrap items-start justify-between gap-6 border-b bg-background px-7 py-6"><div className="flex min-w-0 flex-col gap-2"><Badge variant="outline" className="w-fit">{t("目标与 Agent 编排", "GOAL & AGENT ORCHESTRATION")}</Badge><h1 className="text-2xl font-semibold tracking-tight">{t("目标与编排中心", "Runs & orchestration")}</h1><p className="max-w-2xl text-sm text-muted-foreground">{t("使用可复用 Runbook 模板，把目标拆成 DAG、绑定 Skills，并行派发隔离的 Agent worker。", "Use reusable runbook templates to break goals into DAGs, bind skills, and dispatch isolated agent workers in parallel.")}{coordinatorSessionId && <span> {t("当前会话将成为目标协调者。", "The current session will coordinate this goal.")}</span>}</p></div><div className="flex flex-wrap items-end gap-2"><label className="flex flex-col gap-1.5 text-xs text-muted-foreground">{t("项目", "Project")}<NativeSelect value={workerProject} onChange={(event) => setWorkerProject(event.target.value)}>{snapshot.projects.map((project) => <NativeSelectOption value={project} key={project}>{project.split(/[\\/]/).at(-1)}</NativeSelectOption>)}</NativeSelect></label><label className="flex flex-col gap-1.5 text-xs text-muted-foreground">Worker<NativeSelect value={workerAgent} onChange={(event) => setWorkerAgent(event.target.value)}><NativeSelectOption value="codex">Codex</NativeSelectOption><NativeSelectOption value="claude">Claude</NativeSelectOption><NativeSelectOption value="deepseek">DeepSeek</NativeSelectOption><NativeSelectOption value="opencode">OpenCode</NativeSelectOption></NativeSelect></label><Button variant="outline" onClick={() => setTemplateLibraryOpen(true)}><LibraryBig data-icon="inline-start" />{t("模板库", "Templates")}</Button><Button onClick={() => setShowCreate(true)}><Plus data-icon="inline-start" />{t("新建目标", "New goal")}</Button></div></header>
     {error && <Alert variant="destructive" className="mx-7 mt-5 w-auto"><CircleDot /><AlertTitle>{t("编排操作失败", "Orchestration action failed")}</AlertTitle><AlertDescription>{error}</AlertDescription></Alert>}
     <div className="orchestration-summary"><Card size="sm"><CardHeader><CardDescription>{t("运行", "Runs")}</CardDescription><CardTitle>{runs.length}</CardTitle></CardHeader></Card><Card size="sm"><CardHeader><CardDescription>{t("运行中任务", "Active tasks")}</CardDescription><CardTitle>{tasks.filter((task) => ["dispatched", "running", "starting"].includes(text(task["status"]))).length}</CardTitle></CardHeader></Card><Card size="sm"><CardHeader><CardDescription>{t("等待检查", "Needs review")}</CardDescription><CardTitle>{tasks.filter((task) => ["blocked", "failed", "waiting_approval"].includes(text(task["status"]))).length + gates.filter((gate) => text(gate["status"]) === "pending").length}</CardTitle></CardHeader></Card><Card size="sm"><CardHeader><CardDescription>{t("已保存模板", "Saved templates")}</CardDescription><CardTitle>{snapshot.workflowTemplates.length}</CardTitle></CardHeader></Card></div>
     <div className="orchestration-layout">
       <aside className="run-list"><div className="section-label">{t("运行", "RUNS")} · {runs.length}</div>{runs.length === 0 && <Empty><EmptyHeader><EmptyMedia variant="icon"><Workflow /></EmptyMedia><EmptyTitle>{t("还没有编排 Run", "No orchestration runs yet")}</EmptyTitle><EmptyDescription>{t("创建目标后，任务图会显示在这里。", "Create a goal and its task graph will appear here.")}</EmptyDescription></EmptyHeader></Empty>}{runs.map((run) => <Button variant={text(run["id"]) === runId ? "secondary" : "ghost"} key={text(run["id"])} className="h-auto w-full justify-start px-3 py-2 text-left" onClick={() => setSelectedRunId(text(run["id"]))}><span className={`status-dot ${text(run["status"])}`} /><span className="flex min-w-0 flex-col items-start gap-1"><strong className="max-w-full truncate">{text(run["objective"])}</strong><small className="text-muted-foreground">{status(text(run["status"]))} · rev {number(run["graphRevision"])}</small></span></Button>)}</aside>
-      <main className="run-detail">{selectedRun ? <>
-        <div className="run-hero"><div className="run-hero-copy"><div className="section-label">{t("当前运行", "CURRENT RUN")}</div><h2>{text(selectedRun["objective"])}</h2><div className="run-progress-line"><Progress value={runProgress} /><span>{completeCount} / {runTasks.length} {t("已完成", "complete")}</span></div></div><div className="button-row">
+      <main className={`run-detail${runView === "dag" ? " run-detail-dag" : ""}`}>{selectedRun ? <>
+        <div className="run-hero"><div className="run-hero-copy"><div className="section-label">{t("当前运行", "CURRENT RUN")}</div><h2 title={text(selectedRun["objective"])}>{text(selectedRun["objective"])}</h2><div className="run-progress-line"><Progress value={runProgress} /><span>{completeCount} / {runTasks.length} {t("已完成", "complete")}</span></div></div><div className="button-row">
           {runTasks.length > 0 && <button onClick={() => { setTemplateName(text(selectedRun["objective"])); setTemplateDescription(""); setSaveTemplateOpen(true); }}><Save size={14} />{t("保存为模板", "Save template")}</button>}
           {text(record(selectedRun["automation"])["state"]) !== "running" && text(selectedRun["status"]) === "active" && <button onClick={() => setShowTaskCreate(true)}><Plus size={14} />{t("添加任务", "Add task")}</button>}
           {text(record(selectedRun["automation"])["state"]) === "running" ? <button onClick={() => void perform("automation", "automation.pause", { operationId: operationId(), runId })}><Pause size={14} />{t("暂停自动执行", "Pause automation")}</button> : <button onClick={() => void perform("automation", "automation.start", { operationId: operationId(), runId, agent: "codex", approvalPolicy: "standard", workspace: "run", cwd: snapshot.projects[0] ?? "." })} disabled={!snapshot.projects[0]}><Play size={14} />{t("自动执行 DAG", "Run DAG automatically")}</button>}
@@ -161,9 +179,9 @@ export function OrchestrationPane({ snapshot, onOpenSession, coordinatorSessionI
           {text(selectedRun["status"]) === "active" && <button className="danger" onClick={() => void perform("abandon", "run.abandon", { operationId: operationId(), runId })}><Ban size={14} />{t("放弃", "Abandon")}</button>}
           {text(selectedRun["status"]) !== "active" && <button className="danger" onClick={() => void perform("delete", "run.delete", { operationId: operationId(), runId })}><Trash2 size={14} />{t("删除记录", "Delete record")}</button>}
         </div></div>
-        <Tabs value={runView} onValueChange={(value) => setRunView(value ?? "board")} className="run-views"><TabsList variant="line"><TabsTrigger value="board"><Columns3 />{t("看板", "Board")}</TabsTrigger><TabsTrigger value="dag"><Network />DAG</TabsTrigger><TabsTrigger value="timeline"><Clock3 />{t("时间线", "Timeline")}</TabsTrigger></TabsList>
+        <Tabs value={runView} onValueChange={changeRunView} className={`run-views${runView === "dag" ? " run-views-dag" : ""}`}><TabsList variant="line"><TabsTrigger value="board"><Columns3 />{t("看板", "Board")}</TabsTrigger><TabsTrigger value="dag"><Network />DAG</TabsTrigger><TabsTrigger value="timeline"><Clock3 />{t("时间线", "Timeline")}</TabsTrigger></TabsList>
           <TabsContent value="board" className="run-view-content"><div className="run-board">{boardColumns.map((column) => { const columnTasks = runTasks.filter((task) => column.statuses.includes(text(task["status"]))); return <section className="board-column" key={column.id}><header><span>{column.label}</span><Badge variant="outline">{columnTasks.length}</Badge></header><div>{columnTasks.map(taskCard)}{columnTasks.length === 0 && <div className="board-empty">{t("暂无任务", "No tasks")}</div>}</div></section>; })}</div></TabsContent>
-          <TabsContent value="dag" className="run-view-content">{runTasks.length > 0 ? <RunGraph tasks={runTasks} dispatches={runDispatches} /> : <Empty><EmptyHeader><EmptyMedia variant="icon"><Network /></EmptyMedia><EmptyTitle>{t("暂无 DAG 节点", "No DAG nodes")}</EmptyTitle><EmptyDescription>{t("添加任务后依赖图会显示在这里。", "Add tasks to populate the dependency graph.")}</EmptyDescription></EmptyHeader></Empty>}</TabsContent>
+          <TabsContent value="dag" className="run-view-content run-view-content-dag">{runTasks.length > 0 ? <RunGraph tasks={runTasks} dispatches={runDispatches} /> : <Empty><EmptyHeader><EmptyMedia variant="icon"><Network /></EmptyMedia><EmptyTitle>{t("暂无 DAG 节点", "No DAG nodes")}</EmptyTitle><EmptyDescription>{t("添加任务后依赖图会显示在这里。", "Add tasks to populate the dependency graph.")}</EmptyDescription></EmptyHeader></Empty>}</TabsContent>
           <TabsContent value="timeline" className="run-view-content"><div className="run-timeline">{[...runTasks].reverse().map((task) => <div key={text(task["id"])}><span className={`status-dot ${text(task["status"])}`} /><div><strong>{text(task["title"])}</strong><p>{t("任务", "Task")} {status(text(task["status"]))}{text(task["updatedAt"]) ? ` · ${text(task["updatedAt"])}` : ""}</p></div></div>)}{runGates.map((gate) => <div key={text(gate["id"])}><span className={`status-dot ${text(gate["status"])}`} /><div><strong>{text(gate["question"], t("请求审批", "Gate requested"))}</strong><p>{text(gate["status"]) === "pending" ? t("等待用户决定", "Waiting for a decision") : `${t("决定", "Decision")} · ${text(gate["decision"])}`}</p></div></div>)}{runTasks.length === 0 && runGates.length === 0 && <Empty><EmptyHeader><EmptyMedia variant="icon"><Clock3 /></EmptyMedia><EmptyTitle>{t("暂无事件", "No events yet")}</EmptyTitle><EmptyDescription>{t("Run 的重要事件会按时间显示。", "Important run events appear here in chronological order.")}</EmptyDescription></EmptyHeader></Empty>}</div></TabsContent>
         </Tabs>
         {runGates.length > 0 && <section className="dashboard-section"><div className="section-title"><ShieldQuestion size={16} />{t("决策 Gate", "Decision gates")} <span>{runGates.length}</span></div><div className="card-grid">{runGates.map((gate) => <article className="gate-card" key={text(gate["id"])}><strong>{text(gate["question"])}</strong><div className="button-row compact">{text(gate["status"]) === "pending" ? array(gate["options"]).map(String).map((option) => <button key={option} onClick={() => void window.prospero.resolveGate(text(gate["id"]), option).catch((reason) => setError(displayError(reason)))}>{option}</button>) : <span className="resolved"><CheckCircle2 size={13} />{text(gate["decision"], t("已处理", "Resolved"))}</span>}</div></article>)}</div></section>}

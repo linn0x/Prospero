@@ -1369,7 +1369,7 @@ kbd {
 .prospero-main .log-view { color: var(--terminal-foreground); background: var(--terminal-background); }
 
 /* Run board, dependency graph and event timeline */
-.prospero-main .orchestration-page { display: flex; flex-direction: column; }
+.prospero-main .orchestration-page { display: flex; flex-direction: column; padding: 0; }
 .prospero-main .orchestration-page > header { border-bottom-color: var(--border); background: var(--background); }
 .prospero-main .orchestration-layout { min-height: 0; flex: 1; grid-template-columns: 210px minmax(0, 1fr); border-top-color: var(--border); }
 .orchestration-summary { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap: 10px; padding: 12px 28px; background: var(--background); }
@@ -1387,6 +1387,42 @@ kbd {
 .run-progress-line span { flex: none; color: var(--muted-foreground); font-size: 10px; }
 .run-views { margin-top: 18px; }
 .run-view-content { margin-top: 12px; }
+.prospero-main .dag-active > header {
+  min-height: 58px;
+  flex: none;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 16px;
+  padding: 9px 20px;
+}
+.dag-active > header > div:first-child { flex: 1; gap: 0; }
+.dag-active > header > div:first-child > [data-slot="badge"],
+.dag-active > header > div:first-child > p { display: none; }
+.dag-active > header > div:first-child > h1 { font-size: 18px; letter-spacing: -.025em; }
+.dag-active > header > div:last-child { flex: none; flex-wrap: nowrap; align-items: center; }
+.dag-active > header > div:last-child label { gap: 3px; font-size: 9px; }
+.dag-active > header > div:last-child label:first-child { width: min(230px, 20vw); }
+.dag-active > header > div:last-child label:nth-child(2) { width: 104px; }
+.dag-active > header > div:last-child select { height: 30px; padding-top: 3px; padding-bottom: 3px; font-size: 10px; }
+.dag-active > header > div:last-child button { height: 30px; padding: 0 9px; font-size: 10px; }
+.dag-active .orchestration-summary { gap: 7px; padding: 7px 20px; }
+.dag-active .orchestration-summary > [data-slot="card"] { padding-top: 0; padding-bottom: 0; }
+.dag-active .orchestration-summary [data-slot="card-header"] { display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 10px; }
+.dag-active .orchestration-summary [data-slot="card-title"] { font-size: 15px; }
+.dag-active .orchestration-summary [data-slot="card-description"] { font-size: 9px; }
+.prospero-main .dag-active .orchestration-layout { grid-template-columns: 184px minmax(0, 1fr); }
+.prospero-main .run-detail-dag { display: flex; flex-direction: column; padding: 12px 14px 14px; }
+.run-detail-dag > .run-hero { flex: none; }
+.run-detail-dag .run-hero { gap: 10px; padding: 10px 12px; border-radius: 11px; }
+.run-detail-dag .run-hero-copy { min-width: 180px; gap: 2px; }
+.run-detail-dag .run-hero-copy > .section-label { display: none; }
+.run-detail-dag .run-hero h2 { display: -webkit-box; overflow: hidden; margin-top: 0; font-size: 15px; line-height: 1.3; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.run-detail-dag .run-progress-line { max-width: 420px; margin-top: 3px; }
+.run-detail-dag .run-hero > .button-row { flex-wrap: nowrap; justify-content: flex-end; gap: 5px; }
+.run-detail-dag .run-hero > .button-row button { min-height: 27px; padding: 5px 7px; font-size: 9.5px; white-space: nowrap; }
+.run-views-dag { min-height: clamp(420px, calc(100svh - 310px), 620px); flex: 1 1 0; margin-top: 9px; }
+.run-views-dag > [data-slot="tabs-list"] { flex: none; }
+.run-view-content-dag { display: flex; min-height: 0; overflow: hidden; }
 .run-board { display: grid; min-width: 940px; grid-template-columns: repeat(5, minmax(178px, 1fr)); gap: 9px; }
 .run-view-content:has(.run-board) { overflow-x: auto; padding-bottom: 8px; }
 .board-column { min-width: 0; padding: 7px; border-radius: 11px; background: var(--surface-sunken); }
@@ -1471,26 +1507,139 @@ kbd {
 }
 
 /* ---------------------------------------------------------------- 依赖图
-   分层 DAG:边走 SVG,节点是绝对定位的按钮。两者共用同一个被 transform 的
-   画布层,所以缩放/平移只作用一次,节点和连线不会错位。 */
-.run-graph { display: flex; flex-direction: column; height: 100%; min-height: 320px; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
-.run-graph-viewport { position: relative; flex: 1; overflow: hidden; background: color-mix(in oklab, var(--muted) 45%, transparent); cursor: grab; touch-action: none; }
+   边和低倍概览画在“可视区大小”的 Canvas 上，节点只挂载当前可见部分。这样
+   数千节点的图也不会创建超大 bitmap 或整棵离屏 DOM。 */
+.run-graph {
+  --run-graph-ready: var(--primary);
+  --run-graph-running: #d97706;
+  --run-graph-done: var(--success);
+  --run-graph-superseded: var(--info);
+  --run-graph-failed: var(--danger);
+  --run-graph-blocked: #ca8a04;
+  --run-graph-waiting: var(--muted-foreground);
+  display: flex;
+  width: 100%;
+  height: 100%;
+  min-height: 360px;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-sunken);
+}
+.run-view-content-dag .run-graph { min-height: 0; }
+.run-graph-viewport {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  overflow: hidden;
+  outline: none;
+  background-color: color-mix(in oklab, var(--muted) 38%, transparent);
+  background-image: radial-gradient(circle, color-mix(in srgb, var(--dag-edge) 30%, transparent) 1px, transparent 1px);
+  background-size: 18px 18px;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
 .run-graph-viewport:active { cursor: grabbing; }
-.run-graph-canvas { position: absolute; top: 0; left: 0; transform-origin: 0 0; }
-.run-graph-edges { position: absolute; top: 0; left: 0; overflow: visible; pointer-events: none; }
-.run-graph-edge { fill: none; stroke: currentColor; stroke-width: 1.6; color: color-mix(in oklab, var(--muted-foreground) 55%, transparent); }
-.run-graph-edge.satisfied { color: color-mix(in oklab, var(--chart-2, #22c55e) 70%, transparent); }
-.run-graph-edge.touched { color: var(--primary); stroke-width: 2.4; }
-.run-graph-node { position: absolute; display: flex; flex-direction: column; justify-content: space-between; gap: 4px; padding: 9px; text-align: left; background: var(--card); color: var(--card-foreground); border: 1px solid var(--border); border-radius: 10px; cursor: pointer; transition: border-color .12s, box-shadow .12s; }
-.run-graph-node:hover { border-color: color-mix(in oklab, var(--primary) 45%, var(--border)); }
-.run-graph-node.ready { border-color: color-mix(in oklab, var(--primary) 65%, var(--border)); border-width: 1.6px; }
+.run-graph-viewport:focus-visible { box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--primary) 65%, transparent); }
+.run-graph-render-layer { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.run-graph-canvas { position: absolute; top: 0; left: 0; transform-origin: 0 0; pointer-events: none; }
+.run-graph-node {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 4px;
+  padding: 9px;
+  color: var(--card-foreground);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--card);
+  box-shadow: 0 5px 14px #263a5e12;
+  text-align: left;
+  cursor: pointer;
+  pointer-events: auto;
+  transition: border-color .12s, background-color .12s, box-shadow .12s;
+}
+.run-graph-node:hover { border-color: color-mix(in oklab, var(--primary) 45%, var(--border)); box-shadow: 0 7px 20px #263a5e1c; }
+.run-graph-node[data-state="ready"] { border-color: color-mix(in oklab, var(--run-graph-ready) 65%, var(--border)); border-width: 1.6px; }
+.run-graph-node[data-state="cancelled"] { opacity: .72; }
 .run-graph-node.selected { border-color: var(--primary); border-width: 2px; background: color-mix(in oklab, var(--primary) 12%, var(--card)); }
-.run-graph-node strong { font-size: 12px; font-weight: 600; line-height: 1.25; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
-.run-graph-node-meta { display: flex; align-items: center; gap: 5px; font-size: 10px; color: var(--muted-foreground); }
-.run-graph-node-meta em { margin-left: auto; font-style: normal; font-family: var(--font-mono, monospace); opacity: .7; }
-.run-graph-worker { color: var(--chart-2, #22c55e); }
-.run-graph-controls { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 5px 10px; font-size: 10px; color: var(--muted-foreground); background: color-mix(in oklab, var(--muted) 60%, transparent); border-top: 1px solid var(--border); }
-.run-graph-zoom { display: flex; align-items: center; gap: 2px; }
-.run-graph-zoom button { display: inline-flex; align-items: center; justify-content: center; min-width: 26px; height: 20px; padding: 0 5px; font-size: 10px; font-variant-numeric: tabular-nums; color: inherit; background: transparent; border: 0; border-radius: 5px; cursor: pointer; }
-.run-graph-zoom button:hover:not(:disabled) { background: var(--accent); color: var(--accent-foreground); }
+.run-graph-node strong { display: -webkit-box; overflow: hidden; font-size: 12px; font-weight: 600; line-height: 1.25; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.run-graph-node-meta { display: flex; align-items: center; gap: 5px; color: var(--muted-foreground); font-size: 10px; }
+.run-graph-node-meta em { margin-left: auto; opacity: .7; font-family: var(--font-mono, monospace); font-style: normal; }
+.run-graph-state-dot,
+.run-graph-legend i:not(.lineage) { width: 6px; height: 6px; flex: none; border-radius: 999px; background: var(--run-graph-waiting); }
+.run-graph-node[data-state="ready"] .run-graph-state-dot,
+.run-graph-legend i[data-state="ready"] { background: var(--run-graph-ready); }
+.run-graph-node[data-state="running"] .run-graph-state-dot,
+.run-graph-legend i[data-state="running"] { background: var(--run-graph-running); }
+.run-graph-node[data-state="done"] .run-graph-state-dot,
+.run-graph-legend i[data-state="done"] { background: var(--run-graph-done); }
+.run-graph-node[data-state="superseded"] .run-graph-state-dot,
+.run-graph-legend i[data-state="superseded"] { background: var(--run-graph-superseded); }
+.run-graph-node[data-state="failed"] .run-graph-state-dot,
+.run-graph-legend i[data-state="failed"] { background: var(--run-graph-failed); }
+.run-graph-node[data-state="blocked"] .run-graph-state-dot,
+.run-graph-legend i[data-state="blocked"] { background: var(--run-graph-blocked); }
+.run-graph-worker { color: var(--success); }
+.run-graph-minimap {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  width: 156px;
+  height: 96px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--muted-foreground) 28%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--card) 92%, transparent);
+  box-shadow: 0 4px 14px #0000001f;
+  cursor: crosshair;
+  backdrop-filter: blur(8px);
+}
+.run-graph-minimap canvas { display: block; width: 100%; height: 100%; }
+.run-graph-controls {
+  display: flex;
+  min-height: 30px;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 4px 10px;
+  color: var(--muted-foreground);
+  border-top: 1px solid var(--border);
+  background: color-mix(in oklab, var(--muted) 52%, transparent);
+  font-size: 9px;
+}
+.run-graph-legend,
+.run-graph-legend > span,
+.run-graph-control-end,
+.run-graph-zoom { display: flex; align-items: center; }
+.run-graph-legend { min-width: 0; gap: 10px; overflow: hidden; white-space: nowrap; }
+.run-graph-legend > span { gap: 4px; }
+.run-graph-legend i.lineage { width: 13px; height: 6px; flex: none; border: 1.4px dashed var(--primary); border-radius: 999px; }
+.run-graph-control-end { flex: none; gap: 10px; }
+.run-graph-zoom { gap: 2px; }
+.run-graph-zoom button { display: inline-flex; min-width: 26px; height: 20px; align-items: center; justify-content: center; padding: 0 5px; color: inherit; border: 0; border-radius: 5px; background: transparent; font-size: 10px; font-variant-numeric: tabular-nums; cursor: pointer; }
+.run-graph-zoom button:hover:not(:disabled) { color: var(--accent-foreground); background: var(--accent); }
 .run-graph-zoom button:disabled { opacity: .4; cursor: default; }
+
+@media (max-width: 1180px) {
+  .run-graph-legend { display: none; }
+  .dag-active .orchestration-summary { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .run-detail-dag .run-hero { align-items: stretch; flex-direction: column; }
+  .run-detail-dag .run-hero-copy { width: 100%; min-width: 0; }
+  .run-detail-dag .run-hero > .button-row { justify-content: flex-start; overflow-x: auto; padding-bottom: 1px; }
+}
+
+@media (max-width: 900px) {
+  .dag-active > header > div:first-child { display: none; }
+  .dag-active > header > div:last-child { width: 100%; }
+  .dag-active > header > div:last-child label:first-child { width: auto; flex: 1; }
+  .prospero-main .dag-active .orchestration-layout { grid-template-columns: 154px minmax(0, 1fr); }
+  .dag-active .orchestration-summary { grid-template-columns: repeat(4, minmax(0, 1fr)); padding-right: 12px; padding-left: 12px; }
+  .run-views-dag { min-height: clamp(320px, calc(100svh - 310px), 500px); }
+  .run-graph-minimap { width: 126px; height: 78px; }
+}
