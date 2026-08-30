@@ -201,6 +201,27 @@ jobs:
             echo "自检报告里有缺失项，见上面的输出"
             exit 1
           fi
+      - name: Start the bundled daemon straight out of the package
+        # 自检只证明"找得到",不证明"跑得起来"。daemon 启动时会为结构化 supervisor
+        # 构建运行时镜像,而它的信任边界是从 dist 往上最近的那个 node_modules ——
+        # 打包布局稍有偏差就 fail closed。这条路径 Windows 永远走不到(ws-server
+        # 里那段显式跳过 win32),所以只能在这里守。
+        run: |
+          runtime="./dist/desktop/mac-arm64/Prospero.app/Contents/Resources/runtime"
+          # macOS 的 unix socket 路径上限是 104 字节,daemon home 必须够短。
+          home="$(mktemp -d /tmp/p-ci-XXXX)"
+          env -i HOME="$home" PROSPERO_HOME="$home" PATH=/usr/bin:/bin \
+            "$runtime/node/node" "$runtime/node_modules/@prospero/daemon/dist/cli.js" \
+            start --port 7997 --bind 127.0.0.1 --no-bonjour > "$home/daemon.log" 2>&1 &
+          for _ in $(seq 1 30); do
+            [ -f "$home/status.json" ] && break
+            sleep 1
+          done
+          cat "$home/daemon.log"
+          if [ ! -f "$home/status.json" ]; then
+            echo "打包内的 daemon 没能启动"
+            exit 1
+          fi
 
   windows-desktop:
     name: Windows Electron desktop
