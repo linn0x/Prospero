@@ -3,6 +3,7 @@ import type { DesktopApi, DesktopSettings, JsonObject, SessionCreateInput } from
 
 const api: DesktopApi = {
   platform: process.platform,
+  listNetworkInterfaces: () => ipcRenderer.invoke("network:interfaces"),
   getSnapshot: () => ipcRenderer.invoke("snapshot:get"),
   subscribeSnapshot(listener) {
     const wrapped = (_event: Electron.IpcRendererEvent, snapshot: Parameters<typeof listener>[0]): void => listener(snapshot);

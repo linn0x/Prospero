@@ -48,6 +48,8 @@ export type DesktopSettings = {
   workspaceSort: "recent" | "name";
   terminalFontFamily: string;
   terminalFontSize: number;
+  /** daemon 的监听地址;0.0.0.0 表示全部网卡。下次启动 daemon 时生效。 */
+  daemonBind: string;
 };
 
 export type WorkflowTemplateNode = {
@@ -179,6 +181,7 @@ export type DesktopApi = {
   openWindowsTerminal(path: string): Promise<{ ok: boolean; error?: string }>;
   /** 宿主平台。静态值,用来让"在资源管理器中打开"这类字样跟着系统走。 */
   platform: NodeJS.Platform;
+  listNetworkInterfaces(): Promise<Array<{ label: string; address: string }>>;
   createSession(input: SessionCreateInput): Promise<SessionInfo>;
   getSessionView(sessionId: string, query?: Record<string, number>): Promise<JsonObject | null>;
   interact(sessionId: string, message: JsonObject): Promise<void>;

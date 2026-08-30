@@ -1,8 +1,10 @@
 import { existsSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
+import { networkInterfaces } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, shell, Tray } from "electron";
 import type { DesktopSettings, JsonObject, SessionCreateInput, WorkflowTemplate } from "../shared/types";
+import { loginPath, resolveNodeExecutable } from "./host-environment.js";
 import { DaemonRuntime } from "./daemon-runtime";
 import { StateStore } from "./state-store";
 
@@ -26,6 +28,7 @@ const ACCOUNT_METHODS = new Set([
   "agent.account.delete",
 ]);
 const SMOKE_TEST = process.argv.includes("--smoke-test");
+const SELF_CHECK = process.argv.includes("--self-check");
 const START_HIDDEN = process.argv.includes("--background") || SMOKE_TEST;
 
 let mainWindow: BrowserWindow | undefined;
@@ -297,6 +300,19 @@ function installIpc(): void {
   ipcMain.handle("workflow-template:delete", (_event, rawId: unknown) => {
     return store.deleteWorkflowTemplate(requireId(rawId, "模板"));
   });
+  ipcMain.handle("network:interfaces", () => {
+    // 监听地址要能选具体网卡:手机走 LAN 直连时,绑到某一张网卡比 0.0.0.0
+    // 更容易排查(尤其同时挂着 WireGuard 之类的虚拟网卡时)。
+    const interfaces = networkInterfaces();
+    const candidates: Array<{ label: string; address: string }> = [];
+    for (const [name, entries] of Object.entries(interfaces)) {
+      for (const entry of entries ?? []) {
+        if (entry.family !== "IPv4" || entry.internal) continue;
+        candidates.push({ label: `${name} · ${entry.address}`, address: entry.address });
+      }
+    }
+    return candidates;
+  });
   ipcMain.handle("path:reveal", async (_event, path: unknown) => {
     if (typeof path !== "string" || !isAbsolute(path) || !existsSync(path) || !store.isKnownPath(path)) return { ok: false, error: "路径不属于当前项目、会话或 worktree" };
     shell.showItemInFolder(path);
@@ -541,8 +557,40 @@ app.on("activate", () => {
   else { mainWindow.show(); mainWindow.focus(); }
 });
 
+/**
+ * 不开窗口的环境自检。
+ *
+ * GUI 起不来时(找不到 node、daemon 没构建、PROSPERO_HOME 权限不对)界面上
+ * 只有一句语焉不详的失败,而这些恰恰都是在终端里一眼能看清的事实。
+ */
+function runSelfCheck(): void {
+  const daemonEntry = runtime.describeRuntime();
+  const snapshot = store.snapshot();
+  const lines = [
+    "Prospero 桌面端自检",
+    `  平台:     ${process.platform} ${process.arch}`,
+    `  打包:     ${app.isPackaged ? "已打包" : "开发模式"}`,
+    `  node:     ${resolveNodeExecutable() ?? "❌ 找不到"}`,
+    `  daemon:   ${daemonEntry ?? "❌ 找不到 dist/cli.js"}`,
+    `  PATH:     ${loginPath(resolveNodeExecutable()) ?? process.env["PATH"] ?? ""}`,
+    `  home:     ${store.home}`,
+    `  端口:     ${String(snapshot.daemon.port)}`,
+    `  监听:     ${snapshot.settings.daemonBind === "0.0.0.0" ? "全部网卡" : snapshot.settings.daemonBind}`,
+    `  运行中:   ${snapshot.daemon.running ? `是(pid ${String(snapshot.daemon.pid ?? 0)})` : "否"}`,
+    `  会话:     ${String(snapshot.daemon.sessions.length)} 个`,
+    `  已配对:   ${String(snapshot.devices.length)} 台`,
+  ];
+  process.stdout.write(`${lines.join("\n")}\n`);
+}
+
 void app.whenReady().then(async () => {
   if (!primaryInstance) return;
+  if (SELF_CHECK) {
+    runSelfCheck();
+    quitting = true;
+    app.exit(0);
+    return;
+  }
   app.setAppUserModelId("ai.prospero.desktop");
   installIpc();
   applyTheme(store.snapshot().settings);
