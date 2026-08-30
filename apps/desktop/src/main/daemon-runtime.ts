@@ -212,8 +212,15 @@ export class DaemonRuntime {
     if (app.isPackaged) {
       const runtime = resolve(process.resourcesPath, "runtime");
       const node = resolve(runtime, "node", process.platform === "win32" ? "node.exe" : "node");
-      const cli = resolve(runtime, "daemon", "dist", "cli.js");
-      return existsSync(node) && existsSync(cli) ? { node, cli, cwd: runtime } : undefined;
+      // node_modules 里的那份优先。macOS 上 daemon 必须从这里启动,否则它为
+      // 结构化 supervisor 构建运行时镜像时,依赖会落在信任边界之外而拒绝启动。
+      // runtime/daemon 是 Windows 打包脚本的布局,留作兜底。
+      const candidates = [
+        resolve(runtime, "node_modules", "@prospero", "daemon", "dist", "cli.js"),
+        resolve(runtime, "daemon", "dist", "cli.js"),
+      ];
+      const cli = candidates.find((candidate) => existsSync(candidate));
+      return existsSync(node) && cli ? { node, cli, cwd: runtime } : undefined;
     }
     const root = findRepositoryRoot(app.getAppPath()) ?? findRepositoryRoot(process.cwd());
     if (!root) return undefined;

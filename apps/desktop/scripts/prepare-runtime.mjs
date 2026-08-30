@@ -38,7 +38,7 @@ rmSync(runtimeRoot, { recursive: true, force: true });
 const nodeRoot = path.join(runtimeRoot, "node");
 const daemonRoot = path.join(runtimeRoot, "daemon");
 const packRoot = path.join(runtimeRoot, "packs");
-for (const dir of [runtimeRoot, nodeRoot, daemonRoot, packRoot]) mkdirSync(dir, { recursive: true });
+for (const dir of [runtimeRoot, nodeRoot, packRoot]) mkdirSync(dir, { recursive: true });
 
 // 打包机上正在跑这个脚本的解释器就是要随包分发的那个 —— 版本必然与构建一致。
 copyFileSync(process.execPath, path.join(nodeRoot, "node"));
@@ -83,7 +83,16 @@ const installedDaemon = path.join(runtimeRoot, "node_modules", "@prospero", "dae
 if (!existsSync(path.join(installedDaemon, "dist", "cli.js"))) {
   throw new Error("安装出的运行时里没有 daemon/dist/cli.js");
 }
-run("cp", ["-R", `${installedDaemon}/.`, daemonRoot]);
+// daemon 必须留在 node_modules 里,不能像 Windows 那样拷到 runtime/daemon。
+//
+// daemon 启动时会为结构化 supervisor 构建一份运行时镜像,而它的信任边界是
+// "从 dist 往上找到的最近一个 node_modules"。把包拷出去之后,那个边界会退化成
+// runtime/daemon 自己,它的依赖(全在 runtime/node_modules)就成了边界外的东西,
+// 于是 fail closed:"resolves outside the trusted installation root",daemon 起不来。
+//
+// Windows 上碰不到这条:ws-server 里那段镜像构建显式跳过 win32(那边走
+// Session Host 的 N-API 安全边界),所以同样的布局在 Windows 打包里一直没暴露。
+rmSync(daemonRoot, { recursive: true, force: true });
 
 // 只留本机架构需要的东西。这些删除都限定在刚重建的 .runtime 里。
 const oppositeArch = arch === "arm64" ? "x64" : "arm64";
@@ -92,7 +101,6 @@ for (const target of [
   path.join(runtimeRoot, "node_modules", "node-pty", "prebuilds", "win32-x64"),
   path.join(runtimeRoot, "node_modules", "node-pty", "prebuilds", "win32-arm64"),
   path.join(runtimeRoot, "node_modules", "node-pty", "third_party"),
-  path.join(runtimeRoot, "node_modules", "@prospero", "daemon"),
   // 自己源码的 npm tarball 只是安装过程的中间产物,没有理由跟着安装包分发。
   path.join(runtimeRoot, "packs"),
   path.join(runtimeRoot, "package-lock.json"),
