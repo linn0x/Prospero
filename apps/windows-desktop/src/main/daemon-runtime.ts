@@ -49,7 +49,9 @@ export class DaemonRuntime {
     const snapshot = this.store.snapshot();
     const args = [runtime.cli, "start", "--port", String(snapshot.daemon.port)];
     const runtimePath = loginPath(runtime.node);
-    if (snapshot.daemon.bind && snapshot.daemon.bind !== "0.0.0.0") args.push("--bind", snapshot.daemon.bind);
+    // 用户在设置里挑的网卡优先;没挑过就沿用 daemon 自己配置里的值。
+    const bind = snapshot.settings.daemonBind !== "0.0.0.0" ? snapshot.settings.daemonBind : snapshot.daemon.bind;
+    if (bind && bind !== "0.0.0.0") args.push("--bind", bind);
     const child = spawn(runtime.node, args, {
       cwd: runtime.cwd,
       env: {
@@ -199,6 +201,11 @@ export class DaemonRuntime {
       await new Promise((resolveWait) => setTimeout(resolveWait, 180));
     }
     return false;
+  }
+
+  /** 自检用:只回报定位到的 daemon 入口,不启动任何东西。 */
+  describeRuntime(): string | undefined {
+    return this.locateRuntime()?.cli;
   }
 
   private locateRuntime(): { node: string; cli: string; cwd: string } | undefined {
