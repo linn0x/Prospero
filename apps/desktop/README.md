@@ -10,6 +10,12 @@ Electron + React 实现的 Windows 11 Agent 工作台。直接连接 Prospero �
 - 安装包仅携带一份 daemon 构建产物和 Node sidecar，不复制 daemon 业务实现；
 - Electron ASAR 保持封装，仅解包必要的原生模块；xterm WebGL 不可用时自动回退 Canvas。
 
+## 完整访问权限
+
+设置页可选择通过 Windows UAC 以管理员身份启动本机托管的 daemon。开启或关闭时，正在运行的托管 daemon 会优雅重启；之后创建的 Agent 与 Windows Session Host 会继承对应权限。该设置默认关闭，外部启动的 daemon 不会被桌面端擅自提权或重启。
+
+管理员 daemon 仍只接受带控制令牌的回环控制请求。桌面端使用这一通道执行优雅停止，因此不需要从普通权限进程强杀管理员进程。
+
 ## 开发
 
 ```powershell

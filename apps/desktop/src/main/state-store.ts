@@ -27,6 +27,7 @@ const SAFE_PERSISTED_SESSION_ID = /^[A-Za-z0-9._:-]{1,160}$/;
 
 const DEFAULT_SETTINGS: DesktopSettings = {
   startDaemonOnLaunch: true,
+  fullAccessPermission: false,
   minimizeToTray: true,
   launchAtLogin: false,
   theme: "system",
@@ -72,6 +73,9 @@ function isProcessAlive(pid: number): boolean {
     process.kill(pid, 0);
     return true;
   } catch {
+    // Snapshot generation runs on Electron's main thread. Never fall back to a
+    // synchronous OS command here: a stale status file would otherwise freeze
+    // every renderer snapshot until that command exits.
     return false;
   }
 }
@@ -171,6 +175,7 @@ export class StateStore extends EventEmitter {
     const daemon: DaemonSnapshot = {
       running,
       managed: running && rawPid === this.managedPid,
+      fullAccess: running && booleanValue(status["fullAccess"]),
       starting: this.starting,
       startupProgress: this.startupProgress,
       startupStage: this.startupStage,
@@ -345,6 +350,7 @@ export class StateStore extends EventEmitter {
   updateSettings(patch: Partial<DesktopSettings>): DesktopSnapshot {
     const next = { ...this.settings };
     if (typeof patch.startDaemonOnLaunch === "boolean") next.startDaemonOnLaunch = patch.startDaemonOnLaunch;
+    if (typeof patch.fullAccessPermission === "boolean") next.fullAccessPermission = patch.fullAccessPermission;
     if (typeof patch.minimizeToTray === "boolean") next.minimizeToTray = patch.minimizeToTray;
     if (typeof patch.launchAtLogin === "boolean") next.launchAtLogin = patch.launchAtLogin;
     if (patch.theme === "system" || patch.theme === "dark" || patch.theme === "light") next.theme = patch.theme;
