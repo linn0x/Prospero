@@ -4,6 +4,7 @@ import { networkInterfaces } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, shell, Tray } from "electron";
 import type { DesktopSettings, JsonObject, SessionCreateInput, WorkflowTemplate } from "../shared/types";
+import { diffDesktopSnapshot, isEmptyDesktopSnapshotPatch } from "../shared/snapshot-patch";
 import { loginPath, resolveNodeExecutable } from "./host-environment.js";
 import { DaemonRuntime } from "./daemon-runtime";
 import { StateStore } from "./state-store";
@@ -36,6 +37,8 @@ let mainWindow: BrowserWindow | undefined;
 let tray: Tray | undefined;
 let quitting = false;
 let previousPendingInteractions = 0;
+let lastBroadcastSnapshot: ReturnType<StateStore["snapshot"]> | undefined;
+let lastBroadcastWindowId: number | undefined;
 const store = new StateStore();
 const runtime = new DaemonRuntime(store);
 const primaryInstance = app.requestSingleInstanceLock();
@@ -79,7 +82,14 @@ function applyTheme(settings: DesktopSettings): void {
 
 function broadcastSnapshot(snapshot: ReturnType<StateStore["snapshot"]> = store.snapshot()): void {
   if (!mainWindow || mainWindow.isDestroyed()) return;
-  mainWindow.webContents.send("snapshot:changed", snapshot);
+  if (snapshot === lastBroadcastSnapshot && mainWindow.id === lastBroadcastWindowId) return;
+  const patch = mainWindow.id === lastBroadcastWindowId
+    ? diffDesktopSnapshot(lastBroadcastSnapshot, snapshot)
+    : diffDesktopSnapshot(undefined, snapshot);
+  lastBroadcastSnapshot = snapshot;
+  lastBroadcastWindowId = mainWindow.id;
+  if (isEmptyDesktopSnapshotPatch(patch)) return;
+  mainWindow.webContents.send("snapshot:changed", patch);
   const pending = snapshot.daemon.sessions.reduce((total, session) => total + (session.pendingPermissions ?? 0) + (session.pendingQuestions ?? 0), 0);
   const active = snapshot.daemon.sessions.some((session) => session.status === "running" || session.status === "starting");
   mainWindow.setProgressBar(pending > 0 ? 1 : active ? 2 : -1, { mode: pending > 0 ? "paused" : active ? "indeterminate" : "none" });
@@ -791,7 +801,7 @@ void app.whenReady().then(async () => {
   nativeTheme.on("updated", () => applyTheme(store.snapshot().settings));
   createTray();
   store.on("changed", broadcastSnapshot);
-  setInterval(broadcastSnapshot, 1_000).unref();
+  setInterval(() => broadcastSnapshot(store.snapshot()), 1_000).unref();
   if (process.argv.includes("--background")) mainWindow.hide();
   if (store.snapshot().settings.startDaemonOnLaunch) {
     const started = await runtime.start();

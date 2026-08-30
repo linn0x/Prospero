@@ -1,7 +1,9 @@
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, normalize, resolve } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import type {
   DaemonSnapshot,
   DesktopSettings,
@@ -24,6 +26,36 @@ type PersistedDesktopState = {
 };
 
 const SAFE_PERSISTED_SESSION_ID = /^[A-Za-z0-9._:-]{1,160}$/;
+
+type CachedJsonFile = {
+  signature: string;
+  digest: string | undefined;
+  value: JsonObject;
+};
+
+type SnapshotInputs = {
+  config: JsonObject;
+  status: JsonObject;
+  devices: JsonObject;
+  orchestration: JsonObject;
+  running: boolean;
+  internalRevision: number;
+  projects: string[];
+  projectAliases: Record<string, string>;
+  pinnedProjectPaths: string[];
+  pinnedSessionIds: string[];
+  unreadSessionIds: string[];
+  workflowTemplates: WorkflowTemplate[];
+  accounts: JsonObject[];
+  settings: DesktopSettings;
+  sessionTitles: Record<string, string>;
+  logs: string;
+  managedPid: number | undefined;
+  starting: boolean;
+  startupProgress: number;
+  startupStage: string;
+  lastError: string | undefined;
+};
 
 const DEFAULT_SETTINGS: DesktopSettings = {
   startDaemonOnLaunch: true,
@@ -53,6 +85,19 @@ function readJson(path: string): JsonObject {
   } catch {
     return {};
   }
+}
+
+function fileSignature(path: string): string {
+  try {
+    const stats = statSync(path, { bigint: true });
+    return `${String(stats.dev)}:${String(stats.ino)}:${String(stats.size)}:${String(stats.mtimeNs)}:${String(stats.ctimeNs)}`;
+  } catch {
+    return "missing";
+  }
+}
+
+function reuseEquivalent<T>(previous: T | undefined, next: T): T {
+  return previous !== undefined && isDeepStrictEqual(previous, next) ? previous : next;
 }
 
 function stringValue(value: unknown, fallback = ""): string {
@@ -109,10 +154,16 @@ export class StateStore extends EventEmitter {
   private lastError: string | undefined;
   private logs = "";
   private readonly legacyDesktopStatePath: string;
+  private readonly jsonFiles = new Map<string, CachedJsonFile>();
+  private cachedSnapshot: DesktopSnapshot | undefined;
+  private cachedSnapshotInputs: SnapshotInputs | undefined;
+  private internalRevision = 0;
+  private discoveryStatus: JsonObject | undefined;
+  private readonly pendingProjectPaths = new Set<string>();
 
-  constructor() {
+  constructor(home = process.env["PROSPERO_HOME"] || resolve(homedir(), ".prospero")) {
     super();
-    this.home = resolve(process.env["PROSPERO_HOME"] || resolve(homedir(), ".prospero"));
+    this.home = resolve(home);
     // 这个客户端现在是跨平台的,文件名不再带 windows-。已经在用的机器上还躺着
     // 旧名字的状态(项目列表、置顶、模板),读的时候要认它,否则升级一次等于清空。
     // 写永远只写新名字,旧文件自然淘汰。
@@ -124,94 +175,171 @@ export class StateStore extends EventEmitter {
   }
 
   snapshot(): DesktopSnapshot {
-    const config = readJson(resolve(this.home, "config.json"));
-    const status = readJson(resolve(this.home, "status.json"));
+    const config = this.readExternalJson(resolve(this.home, "config.json"));
+    const status = this.readExternalJson(resolve(this.home, "status.json"));
     const rawPid = numberValue(status["pid"]);
     const running = isProcessAlive(rawPid);
-    const port = numberValue(status["port"], numberValue(config["port"], 7423));
-    const bind = stringValue(status["bind"], stringValue(config["bind"], "0.0.0.0"));
-    const persistence = objectValue(status["persistence"]);
-    const sessions = arrayValue(status["sessions"]).map((entry): SessionInfo => {
-      const value = objectValue(entry);
-      const id = stringValue(value["id"]);
-      const displayTitle = this.sessionTitles[id];
-      return {
-        id,
-        agent: stringValue(value["agent"], "shell"),
-        kind: stringValue(value["kind"], "pty"),
-        title: displayTitle || stringValue(value["title"], "未命名会话"),
-        ...(displayTitle ? { displayTitle } : {}),
-        cwd: stringValue(value["cwd"]),
-        status: stringValue(value["status"], "unknown"),
-        preview: displayTitle || stringValue(value["preview"]),
-        createdAt: numberValue(value["createdAt"]),
-        pendingPermissions: numberValue(value["pendingPermissions"]),
-        pendingQuestions: numberValue(value["pendingQuestions"]),
-        approvalPolicy: stringValue(value["approvalPolicy"]),
-        subagents: Array.isArray(value["subagents"])
-          ? (value["subagents"] as NonNullable<SessionInfo["subagents"]>)
-          : [],
-      };
-    });
-
-    for (const session of sessions) {
-      if (session.cwd && isAbsolute(session.cwd) && existsSync(session.cwd)) this.addProjectInMemory(session.cwd);
+    if (this.discoverSessionProjects(status)) this.internalRevision += 1;
+    const devicesRoot = this.readExternalJson(resolve(this.home, "devices.json"));
+    const orchestration = this.readExternalJson(resolve(this.home, "orchestration.json"));
+    const previousInputs = this.cachedSnapshotInputs;
+    if (
+      this.cachedSnapshot
+      && previousInputs?.config === config
+      && previousInputs.status === status
+      && previousInputs.devices === devicesRoot
+      && previousInputs.orchestration === orchestration
+      && previousInputs.running === running
+      && previousInputs.internalRevision === this.internalRevision
+    ) {
+      return this.cachedSnapshot;
     }
 
-    const devicesRoot = readJson(resolve(this.home, "devices.json"));
-    const devices = arrayValue(devicesRoot["devices"]).map((entry): DeviceInfo => {
-      const value = objectValue(entry);
-      const allowShell = booleanValue(value["allowShell"]);
-      return {
-        name: stringValue(value["name"], "未命名设备"),
-        allowShell,
-        allowOrchestration: booleanValue(value["allowOrchestration"], allowShell),
-        bound: typeof value["clientPubKey"] === "string",
-        lastSeenAt: numberValue(value["lastSeenAt"]),
+    const previous = this.cachedSnapshot;
+    const canReuseDaemon = previous
+      && previousInputs?.config === config
+      && previousInputs.status === status
+      && previousInputs.running === running
+      && previousInputs.sessionTitles === this.sessionTitles
+      && previousInputs.managedPid === this.managedPid
+      && previousInputs.starting === this.starting
+      && previousInputs.startupProgress === this.startupProgress
+      && previousInputs.startupStage === this.startupStage
+      && previousInputs.lastError === this.lastError;
+    const daemon = canReuseDaemon ? previous.daemon : (() => {
+      const port = numberValue(status["port"], numberValue(config["port"], 7423));
+      const bind = stringValue(status["bind"], stringValue(config["bind"], "0.0.0.0"));
+      const persistence = objectValue(status["persistence"]);
+      const sessions = arrayValue(status["sessions"]).map((entry): SessionInfo => {
+        const value = objectValue(entry);
+        const id = stringValue(value["id"]);
+        const displayTitle = this.sessionTitles[id];
+        return {
+          id,
+          agent: stringValue(value["agent"], "shell"),
+          kind: stringValue(value["kind"], "pty"),
+          title: displayTitle || stringValue(value["title"], "未命名会话"),
+          ...(displayTitle ? { displayTitle } : {}),
+          cwd: stringValue(value["cwd"]),
+          status: stringValue(value["status"], "unknown"),
+          preview: displayTitle || stringValue(value["preview"]),
+          createdAt: numberValue(value["createdAt"]),
+          pendingPermissions: numberValue(value["pendingPermissions"]),
+          pendingQuestions: numberValue(value["pendingQuestions"]),
+          approvalPolicy: stringValue(value["approvalPolicy"]),
+          subagents: Array.isArray(value["subagents"])
+            ? (value["subagents"] as NonNullable<SessionInfo["subagents"]>)
+            : [],
+        };
+      });
+      const candidate: DaemonSnapshot = {
+        running,
+        managed: running && rawPid === this.managedPid,
+        fullAccess: running && booleanValue(status["fullAccess"]),
+        starting: this.starting,
+        startupProgress: this.startupProgress,
+        startupStage: this.startupStage,
+        port,
+        bind,
+        state: running ? "running" : this.starting ? "starting" : this.lastError ? "error" : "stopped",
+        persistence: {
+          pty: booleanValue(persistence["pty"]),
+          structured: booleanValue(persistence["structured"]),
+        },
+        relay: objectValue(status["relay"] ?? config["relay"]),
+        sessions,
+        ...(running ? { pid: rawPid } : {}),
+        ...(this.lastError ? { lastError: this.lastError } : {}),
       };
-    });
+      return reuseEquivalent(previous?.daemon, candidate);
+    })();
 
-    const orchestration = readJson(resolve(this.home, "orchestration.json"));
-    const daemon: DaemonSnapshot = {
-      running,
-      managed: running && rawPid === this.managedPid,
-      fullAccess: running && booleanValue(status["fullAccess"]),
-      starting: this.starting,
-      startupProgress: this.startupProgress,
-      startupStage: this.startupStage,
-      port,
-      bind,
-      state: running ? "running" : this.starting ? "starting" : this.lastError ? "error" : "stopped",
-      persistence: {
-        pty: booleanValue(persistence["pty"]),
-        structured: booleanValue(persistence["structured"]),
-      },
-      relay: objectValue(status["relay"] ?? config["relay"]),
-      sessions,
-      ...(running ? { pid: rawPid } : {}),
-      ...(this.lastError ? { lastError: this.lastError } : {}),
-    };
-
-    return {
-      daemon,
-      projects: [...this.projects],
-      projectAliases: { ...this.projectAliases },
-      pinnedProjectPaths: [...this.pinnedProjectPaths],
-      pinnedSessionIds: [...this.pinnedSessionIds],
-      unreadSessionIds: [...this.unreadSessionIds],
-      workflowTemplates: this.workflowTemplates.map((template) => ({ ...template, nodes: template.nodes.map((node) => ({ ...node, dependencyIndexes: [...node.dependencyIndexes], skills: [...node.skills] })) })),
-      devices,
-      accounts: [...this.accounts],
-      orchestration: {
+    const devices = previous && previousInputs?.devices === devicesRoot
+      ? previous.devices
+      : reuseEquivalent(previous?.devices, arrayValue(devicesRoot["devices"]).map((entry): DeviceInfo => {
+        const value = objectValue(entry);
+        const allowShell = booleanValue(value["allowShell"]);
+        return {
+          name: stringValue(value["name"], "未命名设备"),
+          allowShell,
+          allowOrchestration: booleanValue(value["allowOrchestration"], allowShell),
+          bound: typeof value["clientPubKey"] === "string",
+          lastSeenAt: numberValue(value["lastSeenAt"]),
+        };
+      }));
+    const orchestrationSnapshot = previous && previousInputs?.orchestration === orchestration
+      ? previous.orchestration
+      : reuseEquivalent(previous?.orchestration, {
         runs: records(orchestration["runs"]),
         tasks: records(orchestration["tasks"]),
         dispatches: records(orchestration["dispatches"]),
         gates: records(orchestration["gates"]),
         worktreeAssets: records(orchestration["worktreeAssets"]),
-      },
+      });
+    const projects = previous && previousInputs?.projects === this.projects ? previous.projects : reuseEquivalent(previous?.projects, [...this.projects]);
+    const projectAliases = previous && previousInputs?.projectAliases === this.projectAliases ? previous.projectAliases : reuseEquivalent(previous?.projectAliases, { ...this.projectAliases });
+    const pinnedProjectPaths = previous && previousInputs?.pinnedProjectPaths === this.pinnedProjectPaths ? previous.pinnedProjectPaths : reuseEquivalent(previous?.pinnedProjectPaths, [...this.pinnedProjectPaths]);
+    const pinnedSessionIds = previous && previousInputs?.pinnedSessionIds === this.pinnedSessionIds ? previous.pinnedSessionIds : reuseEquivalent(previous?.pinnedSessionIds, [...this.pinnedSessionIds]);
+    const unreadSessionIds = previous && previousInputs?.unreadSessionIds === this.unreadSessionIds ? previous.unreadSessionIds : reuseEquivalent(previous?.unreadSessionIds, [...this.unreadSessionIds]);
+    const workflowTemplates = previous && previousInputs?.workflowTemplates === this.workflowTemplates
+      ? previous.workflowTemplates
+      : reuseEquivalent(previous?.workflowTemplates, this.workflowTemplates.map((template) => ({ ...template, nodes: template.nodes.map((node) => ({ ...node, dependencyIndexes: [...node.dependencyIndexes], skills: [...node.skills] })) })));
+    const accounts = previous && previousInputs?.accounts === this.accounts ? previous.accounts : reuseEquivalent(previous?.accounts, [...this.accounts]);
+    const settings = previous && previousInputs?.settings === this.settings ? previous.settings : reuseEquivalent(previous?.settings, { ...this.settings });
+    const candidate: DesktopSnapshot = {
+      daemon,
+      projects,
+      projectAliases,
+      pinnedProjectPaths,
+      pinnedSessionIds,
+      unreadSessionIds,
+      workflowTemplates,
+      devices,
+      accounts,
+      orchestration: orchestrationSnapshot,
       logs: this.logs,
-      settings: { ...this.settings },
+      settings,
     };
+    const snapshot = previous
+      && previous.daemon === candidate.daemon
+      && previous.projects === candidate.projects
+      && previous.projectAliases === candidate.projectAliases
+      && previous.pinnedProjectPaths === candidate.pinnedProjectPaths
+      && previous.pinnedSessionIds === candidate.pinnedSessionIds
+      && previous.unreadSessionIds === candidate.unreadSessionIds
+      && previous.workflowTemplates === candidate.workflowTemplates
+      && previous.devices === candidate.devices
+      && previous.accounts === candidate.accounts
+      && previous.orchestration === candidate.orchestration
+      && previous.logs === candidate.logs
+      && previous.settings === candidate.settings
+      ? previous
+      : candidate;
+    this.cachedSnapshotInputs = {
+      config,
+      status,
+      devices: devicesRoot,
+      orchestration,
+      running,
+      internalRevision: this.internalRevision,
+      projects: this.projects,
+      projectAliases: this.projectAliases,
+      pinnedProjectPaths: this.pinnedProjectPaths,
+      pinnedSessionIds: this.pinnedSessionIds,
+      unreadSessionIds: this.unreadSessionIds,
+      workflowTemplates: this.workflowTemplates,
+      accounts: this.accounts,
+      settings: this.settings,
+      sessionTitles: this.sessionTitles,
+      logs: this.logs,
+      managedPid: this.managedPid,
+      starting: this.starting,
+      startupProgress: this.startupProgress,
+      startupStage: this.startupStage,
+      lastError: this.lastError,
+    };
+    this.cachedSnapshot = snapshot;
+    return snapshot;
   }
 
   setManagedState(pid: number | undefined, starting: boolean, error?: string): void {
@@ -250,8 +378,13 @@ export class StateStore extends EventEmitter {
     const normalized = normalizeProject(path);
     if (!this.projects.some((item) => item.toLocaleLowerCase() === normalized.toLocaleLowerCase())) throw new Error("项目不在桌面端列表中");
     this.projects = this.projects.filter((item) => item.toLocaleLowerCase() !== normalized.toLocaleLowerCase());
-    delete this.projectAliases[normalized.toLocaleLowerCase()];
+    const projectAliases = { ...this.projectAliases };
+    delete projectAliases[normalized.toLocaleLowerCase()];
+    this.projectAliases = projectAliases;
     this.pinnedProjectPaths = this.pinnedProjectPaths.filter((item) => item.toLocaleLowerCase() !== normalized.toLocaleLowerCase());
+    // Preserve the existing auto-discovery behavior: a directory that still
+    // hosts an active daemon session is added back by the snapshot projection.
+    this.discoveryStatus = undefined;
     this.saveDesktopState();
     this.changed();
     return this.snapshot();
@@ -262,7 +395,7 @@ export class StateStore extends EventEmitter {
     if (!this.projects.some((item) => item.toLocaleLowerCase() === normalized.toLocaleLowerCase())) throw new Error("项目不在桌面端列表中");
     const alias = name.trim().replace(/\s+/g, " ").slice(0, 80);
     if (!alias) throw new Error("工作区名称不能为空");
-    this.projectAliases[normalized.toLocaleLowerCase()] = alias;
+    this.projectAliases = { ...this.projectAliases, [normalized.toLocaleLowerCase()]: alias };
     this.saveDesktopState();
     this.changed();
     return this.snapshot();
@@ -334,7 +467,7 @@ export class StateStore extends EventEmitter {
     if (!this.snapshot().daemon.sessions.some((session) => session.id === sessionId)) throw new Error("会话不存在");
     const normalized = title.trim().replace(/\s+/g, " ").slice(0, 120);
     if (!normalized) throw new Error("会话名称不能为空");
-    this.sessionTitles[sessionId] = normalized;
+    this.sessionTitles = { ...this.sessionTitles, [sessionId]: normalized };
     this.saveDesktopState();
     this.changed();
     return this.snapshot();
@@ -342,7 +475,9 @@ export class StateStore extends EventEmitter {
 
   forgetSessionTitle(sessionId: string): void {
     if (!(sessionId in this.sessionTitles)) return;
-    delete this.sessionTitles[sessionId];
+    const sessionTitles = { ...this.sessionTitles };
+    delete sessionTitles[sessionId];
+    this.sessionTitles = sessionTitles;
     this.saveDesktopState();
     this.changed();
   }
@@ -394,7 +529,7 @@ export class StateStore extends EventEmitter {
   }
 
   controlCredentials(): { port: number; token: string } {
-    const status = readJson(resolve(this.home, "status.json"));
+    const status = this.readExternalJson(resolve(this.home, "status.json"));
     const pid = numberValue(status["pid"]);
     const token = stringValue(status["controlToken"]);
     if (!isProcessAlive(pid) || !token) throw new Error("daemon 尚未提供本机控制接口");
@@ -419,9 +554,73 @@ export class StateStore extends EventEmitter {
 
   private addProjectInMemory(path: string, front = false): void {
     const normalized = normalizeProject(path);
-    const existing = this.projects.findIndex((item) => item.toLocaleLowerCase() === normalized.toLocaleLowerCase());
-    if (existing >= 0) this.projects.splice(existing, 1);
-    front ? this.projects.unshift(normalized) : this.projects.push(normalized);
+    const remaining = this.projects.filter((item) => item.toLocaleLowerCase() !== normalized.toLocaleLowerCase());
+    this.projects = front ? [normalized, ...remaining] : [...remaining, normalized];
+  }
+
+  private readExternalJson(path: string): JsonObject {
+    const signatureBeforeRead = fileSignature(path);
+    const cached = this.jsonFiles.get(path);
+    if (cached?.signature === signatureBeforeRead) return cached.value;
+
+    let source: string | undefined;
+    try {
+      source = readFileSync(path, "utf8");
+    } catch {
+      source = undefined;
+    }
+    const signatureAfterRead = fileSignature(path);
+    // A daemon may atomically replace a file between stat and read. Mark that
+    // sample unstable so the next poll validates it again instead of trusting a
+    // potentially mixed observation.
+    const signature = signatureBeforeRead === signatureAfterRead
+      ? signatureAfterRead
+      : `unstable:${signatureBeforeRead}:${signatureAfterRead}`;
+    const digest = source === undefined ? undefined : createHash("sha256").update(source).digest("base64url");
+    if (cached && cached.digest === digest) {
+      cached.signature = signature;
+      return cached.value;
+    }
+
+    let value: JsonObject = {};
+    if (source !== undefined) {
+      try {
+        value = objectValue(JSON.parse(source));
+      } catch {
+        // Invalid or partially-written files retain the old readJson behavior:
+        // expose an empty object until the writer publishes a valid version.
+      }
+    }
+    this.jsonFiles.set(path, { signature, digest, value });
+    return value;
+  }
+
+  private discoverSessionProjects(status: JsonObject): boolean {
+    if (status !== this.discoveryStatus) {
+      this.discoveryStatus = status;
+      this.pendingProjectPaths.clear();
+      for (const entry of arrayValue(status["sessions"])) {
+        const cwd = stringValue(objectValue(entry)["cwd"]);
+        if (!cwd || !isAbsolute(cwd)) continue;
+        const normalized = normalizeProject(cwd);
+        const known = this.projects.some((item) => item.toLocaleLowerCase() === normalized.toLocaleLowerCase());
+        if (known) continue;
+        if (existsSync(normalized)) this.projects = [...this.projects, normalized];
+        else this.pendingProjectPaths.add(normalized);
+      }
+    }
+
+    let changed = false;
+    for (const path of this.pendingProjectPaths) {
+      if (!existsSync(path)) continue;
+      this.pendingProjectPaths.delete(path);
+      const known = this.projects.some((item) => item.toLocaleLowerCase() === path.toLocaleLowerCase());
+      if (!known) {
+        this.projects = [...this.projects, path];
+        changed = true;
+      }
+    }
+    return changed;
   }
 
   private loadDesktopState(): void {
@@ -488,6 +687,7 @@ export class StateStore extends EventEmitter {
   }
 
   private changed(): void {
+    this.internalRevision += 1;
     this.emit("changed", this.snapshot());
   }
 }

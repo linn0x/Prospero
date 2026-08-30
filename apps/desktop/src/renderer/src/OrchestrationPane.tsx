@@ -1,5 +1,5 @@
-import { useMemo, useState } from "react";
-import { Ban, Bot, CheckCircle2, CircleDot, Clock3, Columns3, GitBranch, GitPullRequestArrow, LibraryBig, Network, Pause, Play, Plus, RefreshCw, Rocket, Save, ShieldQuestion, Sparkles, Square, Trash2, Workflow } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { Ban, Bot, CheckCircle2, ChevronDown, ChevronRight, CircleDot, Clock3, Columns3, GitBranch, GitPullRequestArrow, LibraryBig, Network, PanelLeftClose, PanelLeftOpen, Pause, Play, Plus, RefreshCw, Rocket, Save, ShieldQuestion, Sparkles, Square, Trash2, Workflow } from "lucide-react";
 import type { DesktopSnapshot, JsonObject, WorkflowTemplate } from "../../shared/types";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -16,10 +16,14 @@ import { Textarea } from "@/components/ui/textarea";
 import { RunGraph } from "./RunGraph";
 import { array, displayError, number, record, text } from "./state";
 import { useLocale } from "./locale";
+import { prioritizeWorktrees, worktreeNeedsAttention } from "./orchestration-utils";
 
 const operationId = (): string => crypto.randomUUID();
 
 type RunView = "board" | "dag" | "timeline";
+const COMPACT_RUN_LIST_QUERY = "(max-width: 1349px)";
+const WORKTREE_PAGE_SIZE = 12;
+const WORKTREE_ATTENTION_PREVIEW = 5;
 
 function initialRunView(): RunView {
   try {
@@ -55,18 +59,41 @@ export function OrchestrationPane({ snapshot, onOpenSession, coordinatorSessionI
   const [templateDescription, setTemplateDescription] = useState("");
   const [selectedTemplate, setSelectedTemplate] = useState<WorkflowTemplate>();
   const [templateObjective, setTemplateObjective] = useState("");
+  const [runListOpen, setRunListOpen] = useState(() => {
+    try { return !window.matchMedia(COMPACT_RUN_LIST_QUERY).matches; }
+    catch { return true; }
+  });
   const selectedRun = runs.find((run) => text(run["id"]) === selectedRunId) ?? runs[0];
   const runId = text(selectedRun?.["id"]);
+  const [worktreeView, setWorktreeView] = useState({ runId, expanded: false, limit: WORKTREE_PAGE_SIZE });
+  const worktreesExpanded = worktreeView.runId === runId && worktreeView.expanded;
+  const worktreeLimit = worktreeView.runId === runId ? worktreeView.limit : WORKTREE_PAGE_SIZE;
   const runTasks = useMemo(() => tasks.filter((task) => text(task["runId"]) === runId), [tasks, runId]);
-  const runGates = gates.filter((gate) => text(gate["runId"]) === runId);
-  const runDispatches = dispatches.filter((dispatch) => text(dispatch["runId"]) === runId);
-  const runWorktrees = worktreeAssets.filter((asset) => text(asset["runId"]) === runId);
+  const runGates = useMemo(() => gates.filter((gate) => text(gate["runId"]) === runId), [gates, runId]);
+  const runDispatches = useMemo(() => dispatches.filter((dispatch) => text(dispatch["runId"]) === runId), [dispatches, runId]);
+  const runWorktrees = useMemo(
+    () => prioritizeWorktrees(worktreeAssets.filter((asset) => text(asset["runId"]) === runId)),
+    [runId, worktreeAssets],
+  );
+  const attentionWorktrees = useMemo(
+    () => runWorktrees.filter(worktreeNeedsAttention),
+    [runWorktrees],
+  );
+  const visibleWorktrees = worktreesExpanded
+    ? runWorktrees.slice(0, worktreeLimit)
+    : attentionWorktrees.slice(0, WORKTREE_ATTENTION_PREVIEW);
+  useEffect(() => {
+    const query = window.matchMedia(COMPACT_RUN_LIST_QUERY);
+    const update = (event: MediaQueryListEvent): void => setRunListOpen(!event.matches);
+    query.addEventListener("change", update);
+    return () => query.removeEventListener("change", update);
+  }, []);
   const parseSkills = (value: string): string[] => [...new Set(value.split(/[,\s]+/).map((skill) => skill.trim().replace(/^\$/, "")).filter(Boolean))].slice(0, 5);
 
-  const perform = async (key: string, method: string, params: JsonObject): Promise<void> => {
+  const perform = async (key: string, method: string, params: JsonObject): Promise<boolean> => {
     setBusy(key);
-    try { await window.prospero.orchestrationAction(method, params); setError(undefined); }
-    catch (reason) { setError(displayError(reason)); }
+    try { await window.prospero.orchestrationAction(method, params); setError(undefined); return true; }
+    catch (reason) { setError(displayError(reason)); return false; }
     finally { setBusy(undefined); }
   };
 
@@ -80,7 +107,7 @@ export function OrchestrationPane({ snapshot, onOpenSession, coordinatorSessionI
       deps: index === 0 ? [] : [`task-${String(index)}`],
       ...(parseSkills(graphSkills).length ? { skills: parseSkills(graphSkills) } : {}),
     }));
-    await perform("create", "graph.create", { operationId: operationId(), objective: objective.trim(), nodes, ...(coordinatorSessionId ? { coordinatorSessionId } : {}) });
+    if (!await perform("create", "graph.create", { operationId: operationId(), objective: objective.trim(), nodes, ...(coordinatorSessionId ? { coordinatorSessionId } : {}) })) return;
     setShowCreate(false);
     setObjective("");
   };
@@ -93,7 +120,7 @@ export function OrchestrationPane({ snapshot, onOpenSession, coordinatorSessionI
 
   const createTask = async (): Promise<void> => {
     if (!runId || !taskTitle.trim() || !taskSpec.trim()) return;
-    await perform("task-create", "task.create", { operationId: operationId(), runId, title: taskTitle.trim(), spec: taskSpec.trim(), deps: taskDeps, ...(parseSkills(taskSkills).length ? { skills: parseSkills(taskSkills) } : {}) });
+    if (!await perform("task-create", "task.create", { operationId: operationId(), runId, title: taskTitle.trim(), spec: taskSpec.trim(), deps: taskDeps, ...(parseSkills(taskSkills).length ? { skills: parseSkills(taskSkills) } : {}) })) return;
     setShowTaskCreate(false); setTaskTitle(""); setTaskSpec(""); setTaskDeps([]); setTaskSkills("");
   };
 
@@ -132,7 +159,7 @@ export function OrchestrationPane({ snapshot, onOpenSession, coordinatorSessionI
       deps: node.dependencyIndexes.map((dependency) => `template-task-${String(dependency + 1)}`),
       ...(node.skills.length ? { skills: node.skills } : {}),
     }));
-    await perform("template-run", "graph.create", { operationId: operationId(), objective: templateObjective.trim(), nodes, ...(coordinatorSessionId ? { coordinatorSessionId } : {}) });
+    if (!await perform("template-run", "graph.create", { operationId: operationId(), objective: templateObjective.trim(), nodes, ...(coordinatorSessionId ? { coordinatorSessionId } : {}) })) return;
     setSelectedTemplate(undefined);
     setTemplateObjective("");
     setTemplateLibraryOpen(false);
@@ -168,10 +195,11 @@ export function OrchestrationPane({ snapshot, onOpenSession, coordinatorSessionI
     <header className="flex flex-wrap items-start justify-between gap-6 border-b bg-background px-7 py-6"><div className="flex min-w-0 flex-col gap-2"><Badge variant="outline" className="w-fit">{t("目标与 Agent 编排", "GOAL & AGENT ORCHESTRATION")}</Badge><h1 className="text-2xl font-semibold tracking-tight">{t("目标与编排中心", "Runs & orchestration")}</h1><p className="max-w-2xl text-sm text-muted-foreground">{t("使用可复用 Runbook 模板，把目标拆成 DAG、绑定 Skills，并行派发隔离的 Agent worker。", "Use reusable runbook templates to break goals into DAGs, bind skills, and dispatch isolated agent workers in parallel.")}{coordinatorSessionId && <span> {t("当前会话将成为目标协调者。", "The current session will coordinate this goal.")}</span>}</p></div><div className="flex flex-wrap items-end gap-2"><label className="flex flex-col gap-1.5 text-xs text-muted-foreground">{t("项目", "Project")}<NativeSelect value={workerProject} onChange={(event) => setWorkerProject(event.target.value)}>{snapshot.projects.map((project) => <NativeSelectOption value={project} key={project}>{project.split(/[\\/]/).at(-1)}</NativeSelectOption>)}</NativeSelect></label><label className="flex flex-col gap-1.5 text-xs text-muted-foreground">Worker<NativeSelect value={workerAgent} onChange={(event) => setWorkerAgent(event.target.value)}><NativeSelectOption value="codex">Codex</NativeSelectOption><NativeSelectOption value="claude">Claude</NativeSelectOption><NativeSelectOption value="deepseek">DeepSeek</NativeSelectOption><NativeSelectOption value="opencode">OpenCode</NativeSelectOption></NativeSelect></label><Button variant="outline" onClick={() => setTemplateLibraryOpen(true)}><LibraryBig data-icon="inline-start" />{t("模板库", "Templates")}</Button><Button onClick={() => setShowCreate(true)}><Plus data-icon="inline-start" />{t("新建目标", "New goal")}</Button></div></header>
     {error && <Alert variant="destructive" className="mx-7 mt-5 w-auto"><CircleDot /><AlertTitle>{t("编排操作失败", "Orchestration action failed")}</AlertTitle><AlertDescription>{error}</AlertDescription></Alert>}
     <div className="orchestration-summary"><Card size="sm"><CardHeader><CardDescription>{t("运行", "Runs")}</CardDescription><CardTitle>{runs.length}</CardTitle></CardHeader></Card><Card size="sm"><CardHeader><CardDescription>{t("运行中任务", "Active tasks")}</CardDescription><CardTitle>{tasks.filter((task) => ["dispatched", "running", "starting"].includes(text(task["status"]))).length}</CardTitle></CardHeader></Card><Card size="sm"><CardHeader><CardDescription>{t("等待检查", "Needs review")}</CardDescription><CardTitle>{tasks.filter((task) => ["blocked", "failed", "waiting_approval"].includes(text(task["status"]))).length + gates.filter((gate) => text(gate["status"]) === "pending").length}</CardTitle></CardHeader></Card><Card size="sm"><CardHeader><CardDescription>{t("已保存模板", "Saved templates")}</CardDescription><CardTitle>{snapshot.workflowTemplates.length}</CardTitle></CardHeader></Card></div>
-    <div className="orchestration-layout">
+    <div className={`orchestration-layout${runListOpen ? "" : " run-list-collapsed"}`}>
       <aside className="run-list"><div className="section-label">{t("运行", "RUNS")} · {runs.length}</div>{runs.length === 0 && <Empty><EmptyHeader><EmptyMedia variant="icon"><Workflow /></EmptyMedia><EmptyTitle>{t("还没有编排 Run", "No orchestration runs yet")}</EmptyTitle><EmptyDescription>{t("创建目标后，任务图会显示在这里。", "Create a goal and its task graph will appear here.")}</EmptyDescription></EmptyHeader></Empty>}{runs.map((run) => <Button variant={text(run["id"]) === runId ? "secondary" : "ghost"} key={text(run["id"])} className="h-auto w-full justify-start px-3 py-2 text-left" onClick={() => setSelectedRunId(text(run["id"]))}><span className={`status-dot ${text(run["status"])}`} /><span className="flex min-w-0 flex-col items-start gap-1"><strong className="max-w-full truncate">{text(run["objective"])}</strong><small className="text-muted-foreground">{status(text(run["status"]))} · rev {number(run["graphRevision"])}</small></span></Button>)}</aside>
       <main className={`run-detail${runView === "dag" ? " run-detail-dag" : ""}`}>{selectedRun ? <>
         <div className="run-hero"><div className="run-hero-copy"><div className="section-label">{t("当前运行", "CURRENT RUN")}</div><h2 title={text(selectedRun["objective"])}>{text(selectedRun["objective"])}</h2><div className="run-progress-line"><Progress value={runProgress} /><span>{completeCount} / {runTasks.length} {t("已完成", "complete")}</span></div></div><div className="button-row">
+          <button className="run-list-toggle" aria-expanded={runListOpen} onClick={() => setRunListOpen((current) => !current)}>{runListOpen ? <PanelLeftClose size={14} /> : <PanelLeftOpen size={14} />}{runListOpen ? t("隐藏运行列表", "Hide runs") : t("显示运行列表", "Show runs")}</button>
           {runTasks.length > 0 && <button onClick={() => { setTemplateName(text(selectedRun["objective"])); setTemplateDescription(""); setSaveTemplateOpen(true); }}><Save size={14} />{t("保存为模板", "Save template")}</button>}
           {text(record(selectedRun["automation"])["state"]) !== "running" && text(selectedRun["status"]) === "active" && <button onClick={() => setShowTaskCreate(true)}><Plus size={14} />{t("添加任务", "Add task")}</button>}
           {text(record(selectedRun["automation"])["state"]) === "running" ? <button onClick={() => void perform("automation", "automation.pause", { operationId: operationId(), runId })}><Pause size={14} />{t("暂停自动执行", "Pause automation")}</button> : <button onClick={() => void perform("automation", "automation.start", { operationId: operationId(), runId, agent: "codex", approvalPolicy: "standard", workspace: "run", cwd: snapshot.projects[0] ?? "." })} disabled={!snapshot.projects[0]}><Play size={14} />{t("自动执行 DAG", "Run DAG automatically")}</button>}
@@ -185,7 +213,7 @@ export function OrchestrationPane({ snapshot, onOpenSession, coordinatorSessionI
           <TabsContent value="timeline" className="run-view-content"><div className="run-timeline">{[...runTasks].reverse().map((task) => <div key={text(task["id"])}><span className={`status-dot ${text(task["status"])}`} /><div><strong>{text(task["title"])}</strong><p>{t("任务", "Task")} {status(text(task["status"]))}{text(task["updatedAt"]) ? ` · ${text(task["updatedAt"])}` : ""}</p></div></div>)}{runGates.map((gate) => <div key={text(gate["id"])}><span className={`status-dot ${text(gate["status"])}`} /><div><strong>{text(gate["question"], t("请求审批", "Gate requested"))}</strong><p>{text(gate["status"]) === "pending" ? t("等待用户决定", "Waiting for a decision") : `${t("决定", "Decision")} · ${text(gate["decision"])}`}</p></div></div>)}{runTasks.length === 0 && runGates.length === 0 && <Empty><EmptyHeader><EmptyMedia variant="icon"><Clock3 /></EmptyMedia><EmptyTitle>{t("暂无事件", "No events yet")}</EmptyTitle><EmptyDescription>{t("Run 的重要事件会按时间显示。", "Important run events appear here in chronological order.")}</EmptyDescription></EmptyHeader></Empty>}</div></TabsContent>
         </Tabs>
         {runGates.length > 0 && <section className="dashboard-section"><div className="section-title"><ShieldQuestion size={16} />{t("决策 Gate", "Decision gates")} <span>{runGates.length}</span></div><div className="card-grid">{runGates.map((gate) => <article className="gate-card" key={text(gate["id"])}><strong>{text(gate["question"])}</strong><div className="button-row compact">{text(gate["status"]) === "pending" ? array(gate["options"]).map(String).map((option) => <button key={option} onClick={() => void window.prospero.resolveGate(text(gate["id"]), option).catch((reason) => setError(displayError(reason)))}>{option}</button>) : <span className="resolved"><CheckCircle2 size={13} />{text(gate["decision"], t("已处理", "Resolved"))}</span>}</div></article>)}</div></section>}
-        {runWorktrees.length > 0 && <section className="dashboard-section"><div className="section-title"><GitBranch size={16} />Worktrees <span>{runWorktrees.length}</span></div><div className="worktree-list">{runWorktrees.map((asset) => { const inspection = record(asset["lastInspection"]); const safe = ["safe_to_clean", "equivalent"].includes(text(inspection["state"])); return <article className="worktree-row" key={text(asset["id"])}><GitBranch size={15} /><div><strong>{text(asset["branch"], t("工作树", "Worktree"))}</strong><small>{text(asset["path"])}</small></div><span className="pill">{status(text(asset["state"]))}</span><button onClick={() => void perform(text(asset["id"]), "worktree.inspect", { assetId: text(asset["id"]), targetRef: "main" })}>{t("检查", "Inspect")}</button><button className="danger" disabled={!safe} title={safe ? t("清理已确认安全的工作树", "Clean this verified worktree") : t("必须先通过安全检查", "Run a safety check first")} onClick={() => void perform(text(asset["id"]), "worktree.cleanup", { operationId: operationId(), assetId: text(asset["id"]), targetRef: text(inspection["targetRef"], "main"), confirm: true, deleteBranch: false })}><Trash2 size={13} />{t("安全清理", "Safe cleanup")}</button></article>; })}</div></section>}
+        {runWorktrees.length > 0 && <section className="dashboard-section"><div className="section-title"><GitBranch size={16} />Worktrees <span>{runWorktrees.length}</span><span className="ml-auto text-xs font-normal text-muted-foreground">{attentionWorktrees.length} {t("待处理", "need attention")} · {runWorktrees.length - attentionWorktrees.length} {t("已归档", "archived")}</span><Button variant="ghost" size="sm" className="ml-2" aria-expanded={worktreesExpanded} onClick={() => setWorktreeView({ runId, expanded: !worktreesExpanded, limit: WORKTREE_PAGE_SIZE })}>{worktreesExpanded ? <ChevronDown data-icon="inline-start" /> : <ChevronRight data-icon="inline-start" />}{worktreesExpanded ? t("收起", "Collapse") : t("查看全部", "View all")}</Button></div>{visibleWorktrees.length > 0 ? <div className="worktree-list">{visibleWorktrees.map((asset) => { const inspection = record(asset["lastInspection"]); const safe = ["safe_to_clean", "equivalent"].includes(text(inspection["state"])); const assetId = text(asset["id"]); const assetBusy = busy === assetId; return <article className="worktree-row" key={assetId}><GitBranch size={15} /><div><strong>{text(asset["branch"], t("工作树", "Worktree"))}</strong><small>{text(asset["path"])}</small></div><span className="pill">{status(text(asset["state"]))}</span><button disabled={assetBusy} onClick={() => void perform(assetId, "worktree.inspect", { assetId, targetRef: "main" })}>{t("检查", "Inspect")}</button><button className="danger" disabled={!safe || assetBusy} title={safe ? t("清理已确认安全的工作树", "Clean this verified worktree") : t("必须先通过安全检查", "Run a safety check first")} onClick={() => void perform(assetId, "worktree.cleanup", { operationId: operationId(), assetId, targetRef: text(inspection["targetRef"], "main"), confirm: true, deleteBranch: false })}><Trash2 size={13} />{t("安全清理", "Safe cleanup")}</button></article>; })}</div> : <p className="rounded-lg border border-dashed px-4 py-5 text-sm text-muted-foreground">{t("当前没有需要处理的 Worktree；展开后可查看已清理或已缺失的历史记录。", "No worktrees need attention. Expand to inspect cleaned or missing history.")}</p>}{worktreesExpanded && visibleWorktrees.length < runWorktrees.length && <div className="mt-3 flex justify-center"><Button variant="outline" size="sm" onClick={() => setWorktreeView({ runId, expanded: true, limit: worktreeLimit + WORKTREE_PAGE_SIZE })}>{t("显示更多", "Show more")} · {runWorktrees.length - visibleWorktrees.length}</Button></div>}</section>}
       </> : <Empty><EmptyHeader><EmptyMedia variant="icon"><Workflow /></EmptyMedia><EmptyTitle>{t("选择或创建一个 Run", "Choose or create a run")}</EmptyTitle><EmptyDescription>{t("用 DAG 拆解任务，再把独立节点派给并行 Agent。", "Break work into a DAG and dispatch independent nodes to agents in parallel.")}</EmptyDescription></EmptyHeader></Empty>}</main>
     </div>
     <Dialog open={templateLibraryOpen} onOpenChange={setTemplateLibraryOpen}><DialogContent className="sm:max-w-3xl"><DialogHeader><DialogTitle>{t("工作流模板库", "Workflow templates")}</DialogTitle><DialogDescription>{t("像 Runbook 一样复用任务结构、依赖与绑定的 Skills；每次运行时再填写具体目标。", "Reuse task structure, dependencies, and bound skills like a runbook, then provide a fresh objective for each run.")}</DialogDescription></DialogHeader><div className="template-library">{snapshot.workflowTemplates.map((template) => <Card size="sm" key={template.id}><CardHeader><div className="flex items-start justify-between gap-3"><div className="min-w-0"><CardTitle>{template.name}</CardTitle><CardDescription>{template.description || t("可复用的 Agent 工作流", "Reusable agent workflow")}</CardDescription></div><Badge variant="outline">{template.nodes.length} {t("个任务", "tasks")}</Badge></div></CardHeader><CardContent><div className="template-node-preview">{template.nodes.slice(0, 4).map((node, index) => <span key={`${template.id}:${String(index)}`}>{String(index + 1)}. {node.title}</span>)}</div></CardContent><CardFooter className="justify-between"><Button variant="ghost" size="sm" onClick={() => void window.prospero.deleteWorkflowTemplate(template.id).catch((reason) => setError(displayError(reason)))}><Trash2 data-icon="inline-start" />{t("删除", "Delete")}</Button><Button size="sm" onClick={() => { setSelectedTemplate(template); setTemplateObjective(""); setTemplateLibraryOpen(false); }}><Rocket data-icon="inline-start" />{t("使用模板", "Use template")}</Button></CardFooter></Card>)}{snapshot.workflowTemplates.length === 0 && <Empty><EmptyHeader><EmptyMedia variant="icon"><LibraryBig /></EmptyMedia><EmptyTitle>{t("还没有模板", "No templates yet")}</EmptyTitle><EmptyDescription>{t("打开一个已有 Run，选择“保存为模板”。", "Open an existing run and choose Save template.")}</EmptyDescription></EmptyHeader></Empty>}</div><DialogFooter><Button variant="outline" onClick={() => setTemplateLibraryOpen(false)}>{t("关闭", "Close")}</Button></DialogFooter></DialogContent></Dialog>
