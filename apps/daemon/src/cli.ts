@@ -4,6 +4,7 @@
  * M1 期间在终端里手动运行(继承终端的 TCC 权限),不装 LaunchAgent(M3 由菜单栏壳接管)。
  */
 import { createRequire } from "node:module";
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -37,6 +38,21 @@ import { DAEMON_VERSION } from "./version.js";
 const require = createRequire(import.meta.url);
 const qrcode = require("qrcode-terminal") as typeof import("qrcode-terminal");
 
+function hasWindowsAdministratorToken(): boolean {
+  if (process.platform !== "win32") return false;
+  try {
+    const whoami = path.join(process.env["SystemRoot"] ?? "C:\\Windows", "System32", "whoami.exe");
+    const groups = execFileSync(whoami, ["/groups", "/fo", "csv", "/nh"], {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 3_000,
+    });
+    return /S-1-16-(12288|16384)/.test(groups);
+  } catch {
+    return false;
+  }
+}
+
 const program = new Command();
 program.name("prosperod").description("Prospero local agent hub").version(DAEMON_VERSION);
 
@@ -52,8 +68,12 @@ program
   .option("--no-bonjour", "不做 mDNS 广播(交给菜单栏壳,由它承担本地网络 TCC)")
   .option("--tmux", "会话跑在 tmux 里,daemon 重启后进程与画面都还在(需已装 tmux)", false)
   .option("--name <name>", "对外显示的主机名")
-  .action(async (opts: { port?: number; bind?: string; dev: boolean; bonjour: boolean; tmux: boolean; name?: string }) => {
-    const home = prosperoHome();
+  .option("--home <path>", "daemon 状态目录（桌面端托管使用）")
+  .option("--full-access", "标记为由 Windows 桌面端以管理员权限启动", false)
+  .action(async (opts: { port?: number; bind?: string; dev: boolean; bonjour: boolean; tmux: boolean; name?: string; home?: string; fullAccess: boolean }) => {
+    const home = opts.home ? path.resolve(opts.home) : prosperoHome();
+    const fullAccess = opts.fullAccess && hasWindowsAdministratorToken();
+    if (opts.fullAccess && !fullAccess) throw new Error("完整访问模式需要 Windows 管理员权限");
     const config = loadConfig(home);
     const port = opts.port ?? config.port;
     // 0.0.0.0 是"取消绑定"的写法,不是一个要绑的地址
@@ -68,9 +88,17 @@ program
       saveConfig(home, { ...rest, port, ...(bindSpec ? { bind: bindSpec } : {}) });
     }
     const bindAddr = bindSpec ? resolveBindAddr(bindSpec) : undefined;
+    let shutdownRequested = false;
+    let shutdown = async (): Promise<void> => {};
     const server = await createDaemonServer({
       home,
       port,
+      fullAccess,
+      requestShutdown: () => {
+        if (shutdownRequested) return;
+        shutdownRequested = true;
+        void shutdown();
+      },
       bindAddr,
       useTmux: opts.tmux,
       devMode: opts.dev,
@@ -116,7 +144,7 @@ program
         : "推送: 未配置(运行 `prosperod notify --url <bark/ntfy 地址>` 开启)",
     );
 
-    const shutdown = async (): Promise<void> => {
+    shutdown = async (): Promise<void> => {
       console.log("\n[prosperod] 正在保存会话并退出…");
       stopAdvertise();
       await server.close();

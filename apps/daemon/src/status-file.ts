@@ -39,6 +39,8 @@ export interface StatusSession {
 
 export interface StatusSnapshot {
   pid: number;
+  /** Windows desktop-launched daemon is running with an elevated token. */
+  fullAccess: boolean;
   startedAt: number;
   /** 本进程加载的代码的构建时间 —— 壳拿它和磁盘上的 dist 比,发现"daemon 比代码旧" */
   builtAt: number;
@@ -83,6 +85,7 @@ export class StatusFile {
       port: number;
       bind: string | null;
       controlToken: string;
+      fullAccess?: boolean;
       persistence: { pty: boolean; structured: boolean };
       startedAt?: number;
     },
@@ -120,6 +123,7 @@ export class StatusFile {
   private write(): void {
     const snapshot: StatusSnapshot = {
       pid: process.pid,
+      fullAccess: this.meta.fullAccess ?? false,
       startedAt: this.meta.startedAt ?? Date.now(),
       builtAt: buildTimestamp(),
       port: this.meta.port,
