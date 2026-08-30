@@ -42,6 +42,7 @@ import {
   toB64,
   utf8Decode,
   type C2SMessage,
+  type AgentEventBody,
   clampSessionInfo,
   type S2CMessage,
   type SecureChannel,
@@ -2054,6 +2055,63 @@ export async function createDaemonServer(
     });
   }
 
+  /**
+   * Wait for a structured-session cursor to advance or for the session to
+   * become terminal. As with the PTY waiter above, listeners are installed
+   * before the authoritative re-check so an event cannot land between the
+   * empty read and the long poll.
+   */
+  function waitForStructuredSessionChange(
+    req: IncomingMessage,
+    sid: string,
+    afterSeq: number,
+    waitMs: number,
+  ): Promise<boolean> {
+    return new Promise((resolve) => {
+      let timer: NodeJS.Timeout | undefined;
+      let settled = false;
+      const finish = (changed: boolean): void => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        manager.off("agentEvent", onAgentEvent);
+        manager.off("state", onState);
+        req.off("aborted", onAbort);
+        resolve(changed);
+      };
+      const onAgentEvent = (eventSid: string, _body: AgentEventBody, evSeq: number): void => {
+        if (eventSid === sid && evSeq > afterSeq) finish(true);
+      };
+      const onState = (info: SessionInfo): void => {
+        if (info.id === sid && (info.status === "done" || info.status === "died")) finish(true);
+      };
+      const onAbort = (): void => finish(false);
+
+      manager.on("agentEvent", onAgentEvent);
+      manager.on("state", onState);
+      req.once("aborted", onAbort);
+      timer = setTimeout(() => finish(false), waitMs);
+      timer.unref?.();
+
+      // Close the race with the read that decided to wait. A concurrently
+      // removed session wakes the request so the normal path can preserve its
+      // established 404/409 response instead of hiding deletion as a timeout.
+      try {
+        const current = manager.requireStructured(sid);
+        const currentInfo = current.info();
+        if (
+          current.snapshot().evSeq !== afterSeq ||
+          currentInfo.status === "done" ||
+          currentInfo.status === "died"
+        ) {
+          finish(true);
+        }
+      } catch {
+        finish(true);
+      }
+    });
+  }
+
   async function handleControl(req: IncomingMessage, res: ServerResponse): Promise<void> {
     res.setHeader("cache-control", "no-store");
     if (!isLoopback(req)) {
@@ -2291,9 +2349,17 @@ export async function createDaemonServer(
           return;
         }
 
-        const structured = manager.getStructured(sid);
+        let structured = manager.getStructured(sid);
+        let terminal = structured ? undefined : manager.requirePty(sid);
+        const rawWaitMs = url.searchParams.get("waitMs");
+        const waitMs = rawWaitMs === null ? 0 : Number(rawWaitMs);
+        if (!Number.isSafeInteger(waitMs) || waitMs < 0 || waitMs > 25_000) {
+          res.writeHead(400).end("invalid waitMs");
+          return;
+        }
+
         if (structured) {
-          const snapshot = structured.snapshot();
+          let snapshot = structured.snapshot();
           const rawAfterSeq = url.searchParams.get("afterSeq");
           const afterSeq = rawAfterSeq === null ? undefined : Number(rawAfterSeq);
           if (
@@ -2307,6 +2373,12 @@ export async function createDaemonServer(
           // over knownSeq when both are sent, leaving existing knownSeq
           // clients and the PTY view path byte-for-byte compatible.
           if (afterSeq !== undefined) {
+            if (afterSeq === snapshot.evSeq && waitMs > 0) {
+              await waitForStructuredSessionChange(req, sid, afterSeq, waitMs);
+              if (req.aborted || res.destroyed) return;
+              structured = manager.requireStructured(sid);
+              snapshot = structured.snapshot();
+            }
             if (afterSeq === snapshot.evSeq) {
               res.writeHead(204).end();
               return;
@@ -2339,7 +2411,10 @@ export async function createDaemonServer(
           return;
         }
 
-        let terminal = manager.requirePty(sid);
+        // The existence check above preserves the established error precedence
+        // for missing sessions while sharing waitMs validation across both
+        // structured and PTY views.
+        terminal ??= manager.requirePty(sid);
         const rawOutputAfterSeq = url.searchParams.get("outputAfterSeq");
         const outputAfterSeq = rawOutputAfterSeq === null ? undefined : Number(rawOutputAfterSeq);
         if (
@@ -2349,13 +2424,6 @@ export async function createDaemonServer(
           res.writeHead(400).end("invalid outputAfterSeq");
           return;
         }
-        const rawWaitMs = url.searchParams.get("waitMs");
-        const waitMs = rawWaitMs === null ? 0 : Number(rawWaitMs);
-        if (!Number.isSafeInteger(waitMs) || waitMs < 0 || waitMs > 25_000) {
-          res.writeHead(400).end("invalid waitMs");
-          return;
-        }
-
         // outputAfterSeq is an append-only PTY cursor. It lets the Mac render
         // the initial snapshot exactly once and then feed xterm raw output,
         // preserving scroll position, selection and low-latency input echo.

@@ -1,12 +1,12 @@
 import { contextBridge, ipcRenderer } from "electron";
-import type { DesktopApi, DesktopSettings, JsonObject, SessionCreateInput } from "../shared/types";
+import type { DesktopApi, DesktopSettings, DesktopSnapshotPatch, JsonObject, SessionCreateInput } from "../shared/types";
 
 const api: DesktopApi = {
   platform: process.platform,
   listNetworkInterfaces: () => ipcRenderer.invoke("network:interfaces"),
   getSnapshot: () => ipcRenderer.invoke("snapshot:get"),
   subscribeSnapshot(listener) {
-    const wrapped = (_event: Electron.IpcRendererEvent, snapshot: Parameters<typeof listener>[0]): void => listener(snapshot);
+    const wrapped = (_event: Electron.IpcRendererEvent, patch: DesktopSnapshotPatch): void => listener(patch);
     ipcRenderer.on("snapshot:changed", wrapped);
     return () => ipcRenderer.removeListener("snapshot:changed", wrapped);
   },

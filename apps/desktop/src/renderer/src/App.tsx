@@ -63,6 +63,14 @@ import {
 } from "./account-usage-cache";
 import { displayError, shortPath, text } from "./state";
 import { useLocale, type Language } from "./locale";
+import {
+  EXPANDED_PROJECTS_STORAGE_KEY,
+  SIDEBAR_SESSION_PREVIEW_LIMIT,
+  mostRelevantProject,
+  parseExpandedProjects,
+  projectForSession,
+  sortSidebarSessions,
+} from "./workspace-sidebar-state";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
@@ -174,6 +182,7 @@ import { cn } from "@/lib/utils";
 
 /** Host platform is static and controls native menu labels and shortcuts. */
 const isMac = window.prospero.platform === "darwin";
+const COMPACT_SIDEBAR_BREAKPOINT = 1200;
 
 const ChatPane = lazy(() =>
   import("./ChatPane").then((module) => ({ default: module.ChatPane })),
@@ -299,23 +308,6 @@ function getViewCopy(
 
 function navLabel(view: View, t: (zh: string, en: string) => string): string {
   return getViewCopy(view, t).title;
-}
-
-function projectForSession(
-  projects: string[],
-  session: SessionInfo,
-): string | undefined {
-  const cwd = session.cwd.toLocaleLowerCase();
-  return [...projects]
-    .sort((a, b) => b.length - a.length)
-    .find((project) => {
-      const normalized = project.toLocaleLowerCase();
-      return (
-        cwd === normalized ||
-        cwd.startsWith(`${normalized}\\`) ||
-        cwd.startsWith(`${normalized}/`)
-      );
-    });
 }
 
 function sessionLabel(session: SessionInfo): string {
@@ -456,7 +448,27 @@ function ShellSidebar({
   const [daemonUsage, setDaemonUsage] = useState<UsageAccount[]>(getCachedAccountUsage);
   const [daemonUsageLoading, setDaemonUsageLoading] = useState(false);
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(
-    () => new Set(snapshot.projects),
+    () => {
+      let restored: string[] | undefined;
+      try {
+        restored = parseExpandedProjects(
+          localStorage.getItem(EXPANDED_PROJECTS_STORAGE_KEY),
+          snapshot.projects,
+        );
+      } catch {
+        // Storage can be unavailable in hardened or ephemeral renderer contexts.
+      }
+      const fallback = mostRelevantProject(
+        snapshot.projects,
+        snapshot.daemon.sessions,
+        snapshot.pinnedProjectPaths,
+        activeId,
+      );
+      return new Set(restored ?? (fallback ? [fallback] : []));
+    },
+  );
+  const [fullyShownProjects, setFullyShownProjects] = useState<Set<string>>(
+    () => new Set(),
   );
   const knownProjects = useRef(new Set(snapshot.projects));
   const handleDaemonCardOpen = (open: boolean): void => {
@@ -474,14 +486,92 @@ function ShellSidebar({
       const next = new Set(
         [...current].filter((project) => available.has(project)),
       );
-      for (const project of snapshot.projects)
-        if (!knownProjects.current.has(project)) next.add(project);
+      const added = snapshot.projects.filter(
+        (project) => !knownProjects.current.has(project),
+      );
+      if (added.length > 0) {
+        const relevantAdded = mostRelevantProject(
+          added,
+          snapshot.daemon.sessions,
+          snapshot.pinnedProjectPaths,
+          activeId,
+        );
+        if (relevantAdded) next.add(relevantAdded);
+      }
+      if (
+        next.size === current.size &&
+        [...next].every((project) => current.has(project))
+      )
+        return current;
       return next;
     });
     knownProjects.current = new Set(snapshot.projects);
-  }, [snapshot.projects]);
+  }, [
+    activeId,
+    snapshot.daemon.sessions,
+    snapshot.pinnedProjectPaths,
+    snapshot.projects,
+  ]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        EXPANDED_PROJECTS_STORAGE_KEY,
+        JSON.stringify([...expandedProjects]),
+      );
+    } catch {
+      // Expansion is still usable for the lifetime of this renderer.
+    }
+  }, [expandedProjects]);
+  useEffect(() => {
+    if (!activeId) return;
+    const activeSession = snapshot.daemon.sessions.find(
+      (session) => session.id === activeId,
+    );
+    const activeProject = activeSession
+      ? projectForSession(snapshot.projects, activeSession)
+      : undefined;
+    if (!activeProject) return;
+    setExpandedProjects((current) => {
+      if (current.has(activeProject)) return current;
+      return new Set([...current, activeProject]);
+    });
+  }, [activeId, snapshot.daemon.sessions, snapshot.projects]);
+  const sessionsByProject = useMemo(() => {
+    const grouped = new Map<string, SessionInfo[]>(
+      snapshot.projects.map((project) => [project, []]),
+    );
+    for (const session of snapshot.daemon.sessions) {
+      const project = projectForSession(snapshot.projects, session);
+      if (project) grouped.get(project)?.push(session);
+    }
+    for (const [project, sessions] of grouped) {
+      grouped.set(
+        project,
+        sortSidebarSessions(
+          sessions,
+          activeId,
+          snapshot.pinnedSessionIds,
+          snapshot.unreadSessionIds,
+        ),
+      );
+    }
+    return grouped;
+  }, [
+    activeId,
+    snapshot.daemon.sessions,
+    snapshot.pinnedSessionIds,
+    snapshot.projects,
+    snapshot.unreadSessionIds,
+  ]);
+  const sessionsById = useMemo(
+    () =>
+      new Map(
+        snapshot.daemon.sessions.map((session) => [session.id, session]),
+      ),
+    [snapshot.daemon.sessions],
+  );
   const pinned = snapshot.pinnedSessionIds
-    .map((id) => snapshot.daemon.sessions.find((session) => session.id === id))
+    .map((id) => sessionsById.get(id))
     .filter((session): session is SessionInfo => Boolean(session));
   const sortedProjects = useMemo(() => {
     const originalIndex = new Map(
@@ -492,11 +582,8 @@ function ShellSidebar({
       project.split(/[\\/]/).filter(Boolean).at(-1) ||
       project;
     const activity = (project: string): number =>
-      snapshot.daemon.sessions.reduce(
-        (latest, session) =>
-          projectForSession([project], session)
-            ? Math.max(latest, session.createdAt ?? 0)
-            : latest,
+      (sessionsByProject.get(project) ?? []).reduce(
+        (latest, session) => Math.max(latest, session.createdAt ?? 0),
         0,
       );
     return [...snapshot.projects].sort((left, right) => {
@@ -520,11 +607,11 @@ function ShellSidebar({
     });
   }, [
     language,
-    snapshot.daemon.sessions,
     snapshot.pinnedProjectPaths,
     snapshot.projectAliases,
     snapshot.projects,
     snapshot.settings.workspaceSort,
+    sessionsByProject,
   ]);
   const renderNav = (items: NavItem[]) =>
     items.map((item) => (
@@ -711,9 +798,7 @@ function ShellSidebar({
               <SidebarGroupContent>
                 <SidebarMenu>
                   {sortedProjects.map((project) => {
-                    const sessions = snapshot.daemon.sessions.filter(
-                      (session) => projectForSession([project], session),
-                    );
+                    const sessions = sessionsByProject.get(project) ?? [];
                     const fallback =
                       project.split(/[\\/]/).filter(Boolean).at(-1) ?? project;
                     const name =
@@ -725,6 +810,14 @@ function ShellSidebar({
                         project.toLocaleLowerCase(),
                     );
                     const projectOpen = expandedProjects.has(project);
+                    const showsAllSessions =
+                      fullyShownProjects.has(project) ||
+                      sessions.length <= SIDEBAR_SESSION_PREVIEW_LIMIT;
+                    const visibleSessions = showsAllSessions
+                      ? sessions
+                      : sessions.slice(0, SIDEBAR_SESSION_PREVIEW_LIMIT);
+                    const hiddenSessionCount =
+                      sessions.length - SIDEBAR_SESSION_PREVIEW_LIMIT;
                     return (
                       <Collapsible
                         key={project}
@@ -822,7 +915,7 @@ function ShellSidebar({
                           </DropdownMenu>
                           <CollapsibleContent>
                             <SidebarMenuSub>
-                              {sessions.map((session) => {
+                              {visibleSessions.map((session) => {
                                 const unread =
                                   snapshot.unreadSessionIds.includes(
                                     session.id,
@@ -957,6 +1050,47 @@ function ShellSidebar({
                                   </SidebarMenuSubItem>
                                 );
                               })}
+                              {sessions.length >
+                                SIDEBAR_SESSION_PREVIEW_LIMIT && (
+                                <SidebarMenuSubItem className="workspace-session-more-item">
+                                  <button
+                                    type="button"
+                                    data-slot="workspace-session-more"
+                                    className="workspace-session-more"
+                                    aria-expanded={showsAllSessions}
+                                    aria-label={
+                                      showsAllSessions
+                                        ? t(
+                                            `收起 ${name} 的会话`,
+                                            `Show fewer sessions in ${name}`,
+                                          )
+                                        : t(
+                                            `显示 ${name} 的其余 ${String(hiddenSessionCount)} 个会话`,
+                                            `Show ${String(hiddenSessionCount)} more sessions in ${name}`,
+                                          )
+                                    }
+                                    onClick={() =>
+                                      setFullyShownProjects((current) => {
+                                        const next = new Set(current);
+                                        if (showsAllSessions)
+                                          next.delete(project);
+                                        else next.add(project);
+                                        return next;
+                                      })
+                                    }
+                                  >
+                                    <ChevronRight aria-hidden="true" />
+                                    <span>
+                                      {showsAllSessions
+                                        ? t("收起会话", "Show fewer")
+                                        : t(
+                                            `显示其余 ${String(hiddenSessionCount)} 个`,
+                                            `Show ${String(hiddenSessionCount)} more`,
+                                          )}
+                                    </span>
+                                  </button>
+                                </SidebarMenuSubItem>
+                              )}
                             </SidebarMenuSub>
                           </CollapsibleContent>
                         </SidebarMenuItem>
@@ -1088,12 +1222,10 @@ function OverviewPane({
   snapshot,
   onOpenSession,
   onOpenRuns,
-  onNewSession,
 }: {
   snapshot: DesktopSnapshot;
   onOpenSession: (id: string) => void;
   onOpenRuns: () => void;
-  onNewSession: () => void;
 }) {
   const { t, status } = useLocale();
   const activeSessions = snapshot.daemon.sessions.filter((session) =>
@@ -1135,20 +1267,7 @@ function OverviewPane({
   return (
     <div className="view-scroll">
       <div className="view-container overview-view">
-        <PageHeading
-          eyebrow={t("指挥中心", "COMMAND CENTER")}
-          title={t("概览", "Overview")}
-          description={t(
-            "所有需要你决策、恢复或继续推进的工作。",
-            "Everything that needs a decision, recovery, or another push.",
-          )}
-          actions={
-            <Button onClick={onNewSession}>
-              <Plus data-icon="inline-start" />
-              {t("新建会话", "New session")}
-            </Button>
-          }
-        />
+        <h1 className="sr-only">{t("概览", "Overview")}</h1>
         <div className="overview-grid">
           <Card className="attention-card-shell">
             <CardHeader>
@@ -2292,7 +2411,11 @@ function WorkspacePane({
                       fontSize={snapshot.settings.terminalFontSize}
                     />
                   ) : (
-                    <ChatPane session={active} onOpenGoal={() => undefined} />
+                    <ChatPane
+                      key={active.id}
+                      session={active}
+                      onOpenGoal={() => undefined}
+                    />
                   )}
                 </div>
               </main>
@@ -2883,7 +3006,13 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   const [newSessionProject, setNewSessionProject] = useState<string>();
   const [editingProject, setEditingProject] = useState<string>();
   const [editingSession, setEditingSession] = useState<string>();
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const startsWithCompactSidebar =
+    window.innerWidth < COMPACT_SIDEBAR_BREAKPOINT;
+  const [sidebarOpen, setSidebarOpen] = useState(
+    () => !startsWithCompactSidebar,
+  );
+  const sidebarOpenRef = useRef(sidebarOpen);
+  const sidebarWasAutoCollapsed = useRef(startsWithCompactSidebar);
   const [launcher, setLauncher] = useState<"command" | "quick">();
   const validOpenIds = useMemo(
     () =>
@@ -2925,6 +3054,34 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   useEffect(() => {
     if (snapshot.daemon.running && accountUsageKey) prefetchAccountUsage();
   }, [snapshot.daemon.running, accountUsageKey]);
+  useEffect(() => {
+    sidebarOpenRef.current = sidebarOpen;
+  }, [sidebarOpen]);
+  useEffect(() => {
+    const compactQuery = window.matchMedia(
+      `(max-width: ${String(COMPACT_SIDEBAR_BREAKPOINT - 1)}px)`,
+    );
+    const adaptSidebar = (compact: boolean): void => {
+      if (compact) {
+        if (sidebarOpenRef.current) {
+          sidebarWasAutoCollapsed.current = true;
+          sidebarOpenRef.current = false;
+          setSidebarOpen(false);
+        }
+        return;
+      }
+      if (sidebarWasAutoCollapsed.current) {
+        sidebarWasAutoCollapsed.current = false;
+        sidebarOpenRef.current = true;
+        setSidebarOpen(true);
+      }
+    };
+    const onChange = (event: MediaQueryListEvent): void =>
+      adaptSidebar(event.matches);
+    compactQuery.addEventListener("change", onChange);
+    adaptSidebar(compactQuery.matches);
+    return () => compactQuery.removeEventListener("change", onChange);
+  }, []);
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent): void => {
       if (!(event.ctrlKey || event.metaKey)) return;
@@ -3028,7 +3185,11 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   return (
     <SidebarProvider
       open={sidebarOpen && !focus}
-      onOpenChange={setSidebarOpen}
+      onOpenChange={(open) => {
+        sidebarWasAutoCollapsed.current = false;
+        sidebarOpenRef.current = open;
+        setSidebarOpen(open);
+      }}
       style={
         {
           "--sidebar-width": "15rem",
@@ -3099,7 +3260,6 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
                 snapshot={snapshot}
                 onOpenSession={openSession}
                 onOpenRuns={() => setView("runs")}
-                onNewSession={() => openNewSession()}
               />
             ) : view === "mobile" ? (
               <DevicesPane snapshot={snapshot} />

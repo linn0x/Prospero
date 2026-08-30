@@ -98,6 +98,9 @@ export type DesktopSnapshot = {
   settings: DesktopSettings;
 };
 
+/** Top-level replacement slices sent after the initial full snapshot. */
+export type DesktopSnapshotPatch = Partial<DesktopSnapshot>;
+
 export type SessionCreateInput = {
   cwd: string;
   agent: "codex" | "claude" | "deepseek" | "opencode" | "grok" | "trae" | "shell";
@@ -168,7 +171,7 @@ export type SkillSuggestion = { value: string; label?: string; detail?: string }
 
 export type DesktopApi = {
   getSnapshot(): Promise<DesktopSnapshot>;
-  subscribeSnapshot(listener: (snapshot: DesktopSnapshot) => void): () => void;
+  subscribeSnapshot(listener: (patch: DesktopSnapshotPatch) => void): () => void;
   startDaemon(): Promise<{ ok: boolean; error?: string }>;
   stopDaemon(): Promise<{ ok: boolean; error?: string }>;
   restartDaemon(): Promise<{ ok: boolean; error?: string }>;
