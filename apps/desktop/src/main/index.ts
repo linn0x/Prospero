@@ -71,11 +71,17 @@ function applyTheme(settings: DesktopSettings): void {
   nativeTheme.themeSource = settings.theme;
   const dark = nativeTheme.shouldUseDarkColors;
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.setTitleBarOverlay({
-      color: dark ? "#161619" : "#f8f8f9",
-      symbolColor: dark ? "#eeeef0" : "#202024",
-      height: 42,
-    });
+    // setTitleBarOverlay 只存在于 Windows/Linux —— macOS 上窗口控件是系统画的
+    // 红黄绿,没有可着色的 overlay。不加这个判断,每次切换主题都会抛
+    // "setTitleBarOverlay is not a function",而它发生在主进程里,
+    // 界面上只会看到一条没头没尾的报错。
+    if (process.platform !== "darwin") {
+      mainWindow.setTitleBarOverlay({
+        color: dark ? "#161619" : "#f8f8f9",
+        symbolColor: dark ? "#eeeef0" : "#202024",
+        height: 42,
+      });
+    }
     mainWindow.setBackgroundColor(dark ? "#111114" : "#f4f4f5");
   }
 }
@@ -111,8 +117,14 @@ function createWindow(): BrowserWindow {
     show: false,
     backgroundColor: dark ? "#111114" : "#f4f4f5",
     title: "Prospero",
-    titleBarStyle: "hidden",
-    titleBarOverlay: { color: dark ? "#161619" : "#f8f8f9", symbolColor: dark ? "#eeeef0" : "#202024", height: 42 },
+    // macOS 的红黄绿按钮固定在窗口左上角,会浮在侧栏头部之上 —— 而这块布局是按
+    // Windows 设计的(那边窗口控件在右上角,左上角是空的)。hiddenInset 把按钮往内缩,
+    // 再显式给一个与侧栏头部垂直居中的位置;渲染层那边相应留出上边距。
+    // titleBarOverlay 只对 Windows/Linux 生效,macOS 传了也会被忽略。
+    titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "hidden",
+    ...(process.platform === "darwin"
+      ? { trafficLightPosition: { x: 14, y: 18 } }
+      : { titleBarOverlay: { color: dark ? "#161619" : "#f8f8f9", symbolColor: dark ? "#eeeef0" : "#202024", height: 42 } }),
     webPreferences: {
       preload: resolve(__dirname, "../preload/index.js"),
       contextIsolation: true,

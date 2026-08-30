@@ -13,4 +13,7 @@ function Root() {
   return <TooltipProvider><App snapshot={snapshot} /></TooltipProvider>;
 }
 
+// 侧栏头部要给 macOS 的红黄绿按钮让位,样式表按这个属性区分平台。
+document.documentElement.dataset["platform"] = window.prospero.platform;
+
 createRoot(document.getElementById("root")!).render(<StrictMode><LocaleProvider><Root /></LocaleProvider></StrictMode>);
