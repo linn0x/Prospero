@@ -13,7 +13,9 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "pack": "npm run build && electron-builder --dir",
     "prepare:runtime": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-runtime.ps1",
-    "dist": "npm run prepare:runtime && npm run build && electron-builder"
+    "dist": "npm run prepare:runtime && npm run build && electron-builder",
+    "prepare:runtime:mac": "node scripts/prepare-runtime.mjs",
+    "dist:mac": "npm run prepare:runtime:mac && npm run build && electron-builder --mac"
   },
   "dependencies": {
     "@base-ui/react": "^1.7.0",
@@ -125,6 +127,38 @@
       "language": "2052",
       "installerSidebar": "assets/installer-sidebar.bmp",
       "uninstallerSidebar": "assets/installer-sidebar.bmp"
+    },
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "icon": "../shell/Resources/AppIcon.icns",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "Prospero-${version}-mac-${arch}.${ext}",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "extendInfo": {
+        "NSLocalNetworkUsageDescription": "Prospero 在本地网络上广播与接受来自你手机的直连,用于远程控制 code agent 会话。",
+        "NSBonjourServices": [
+          "_prospero._tcp"
+        ],
+        "LSMinimumSystemVersion": "14.0"
+      }
     }
   }
 }
