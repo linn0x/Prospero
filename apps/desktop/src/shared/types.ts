@@ -27,6 +27,7 @@ export type DeviceInfo = {
 export type DaemonSnapshot = {
   running: boolean;
   managed: boolean;
+  fullAccess: boolean;
   starting: boolean;
   startupProgress: number;
   startupStage: string;
@@ -42,6 +43,7 @@ export type DaemonSnapshot = {
 
 export type DesktopSettings = {
   startDaemonOnLaunch: boolean;
+  fullAccessPermission: boolean;
   minimizeToTray: boolean;
   launchAtLogin: boolean;
   theme: "system" | "dark" | "light";

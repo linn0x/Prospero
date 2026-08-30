@@ -195,6 +195,10 @@ class ControlRequestError extends Error {
 export interface DaemonServerOptions {
   home: string;
   port: number;
+  /** The Windows desktop obtained an elevated token before launching us. */
+  fullAccess?: boolean;
+  /** Authenticated loopback request used by a non-elevated desktop parent. */
+  requestShutdown?: (() => void) | undefined;
   /** 新会话目录选择器的根；生产默认当前用户 home，测试可注入临时目录。 */
   workspaceRoot?: string | undefined;
   /** 监听地址;省略 = 0.0.0.0(全部网卡) */
@@ -365,6 +369,7 @@ export async function createDaemonServer(
     port: opts.port,
     bind: opts.bindAddr ?? null,
     controlToken,
+    fullAccess: opts.fullAccess ?? false,
     persistence: { pty: manager.tmuxEnabled || manager.ptySupervisorEnabled, structured: true },
   });
   const conns = new Set<Conn>();
@@ -2064,7 +2069,17 @@ export async function createDaemonServer(
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
     if (req.method === "GET" && url.pathname === "/_prospero/control/health") {
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true, sessions: manager.list().length }));
+      res.end(JSON.stringify({ ok: true, sessions: manager.list().length, fullAccess: opts.fullAccess === true }));
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/_prospero/control/shutdown") {
+      if (!opts.requestShutdown) {
+        res.writeHead(409).end("shutdown is not available");
+        return;
+      }
+      res.writeHead(202, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+      setImmediate(opts.requestShutdown);
       return;
     }
     if (req.method === "GET" && url.pathname === "/_prospero/control/usage") {
