@@ -174,6 +174,10 @@ export function LogsPane({ snapshot }: { snapshot: DesktopSnapshot }) {
 }
 
 export function SettingsPane({ snapshot }: { snapshot: DesktopSnapshot }) {
+  const [interfaces, setInterfaces] = useState<Array<{ label: string; address: string }>>([]);
+  useEffect(() => {
+    void window.prospero.listNetworkInterfaces().then(setInterfaces).catch(() => setInterfaces([]));
+  }, []);
   const { language, setLanguage, t, status } = useLocale();
   const settings = snapshot.settings;
   const [relay, setRelay] = useState<Record<string, unknown>>({});
@@ -200,11 +204,19 @@ export function SettingsPane({ snapshot }: { snapshot: DesktopSnapshot }) {
         <FieldGroup className="desktop-settings-list">
           {desktopToggle("start-daemon-on-launch", t("启动本地服务", "Start local service"), t("打开客户端时自动启动 daemon。", "Start the daemon when the client opens."), settings.startDaemonOnLaunch, (checked) => update({ startDaemonOnLaunch: checked }))}
           {desktopToggle("minimize-to-tray", t("在后台运行", "Keep running in background"), t("关闭主窗口后保留托盘进程。", "Keep the tray process running after the main window closes."), settings.minimizeToTray, (checked) => update({ minimizeToTray: checked }))}
-          {desktopToggle("launch-at-login", t("开机启动", "Launch at sign-in"), t("登录 Windows 后自动打开 Prospero。", "Open Prospero automatically after signing in to Windows."), settings.launchAtLogin, (checked) => update({ launchAtLogin: checked }))}
+          {desktopToggle("launch-at-login", t("开机启动", "Launch at sign-in"), t("登录系统后自动打开 Prospero。", "Open Prospero automatically after signing in."), settings.launchAtLogin, (checked) => update({ launchAtLogin: checked }))}
           <FieldGroup className="desktop-select-grid">
             <Field><FieldLabel htmlFor="desktop-theme">{t("主题", "Theme")}</FieldLabel><NativeSelect id="desktop-theme" value={settings.theme} onChange={(event) => update({ theme: event.target.value as typeof settings.theme })}><NativeSelectOption value="system">{t("跟随系统", "System")}</NativeSelectOption><NativeSelectOption value="dark">{t("深色", "Dark")}</NativeSelectOption><NativeSelectOption value="light">{t("浅色", "Light")}</NativeSelectOption></NativeSelect><FieldDescription>{t("侧边栏和内容区域始终使用同一主题。", "The sidebar and content area always use the same theme.")}</FieldDescription></Field>
             <Field><FieldLabel htmlFor="interface-language">{t("界面语言", "Interface language")}</FieldLabel><NativeSelect id="interface-language" value={language} onChange={(event) => setLanguage(event.target.value === "en" ? "en" : "zh")}><NativeSelectOption value="zh">中文</NativeSelectOption><NativeSelectOption value="en">English</NativeSelectOption></NativeSelect><FieldDescription>{t("语言选择会保存在这台设备上。", "Your language choice is saved on this device.")}</FieldDescription></Field>
           </FieldGroup>
+          <Field>
+            <FieldLabel htmlFor="daemon-bind">{t("监听网卡", "Listening interface")}</FieldLabel>
+            <NativeSelect id="daemon-bind" value={settings.daemonBind} onChange={(event) => update({ daemonBind: event.target.value })}>
+              <NativeSelectOption value="0.0.0.0">{t("全部网卡", "All interfaces")}</NativeSelectOption>
+              {interfaces.map((item) => <NativeSelectOption key={item.address} value={item.address}>{item.label}</NativeSelectOption>)}
+            </NativeSelect>
+            <FieldDescription>{t("下次启动 daemon 时生效。同时挂着 WireGuard 之类虚拟网卡时，绑定到具体网卡更容易排查直连问题。", "Applies the next time the daemon starts. Binding a specific interface makes direct connections easier to diagnose when virtual adapters like WireGuard are present.")}</FieldDescription>
+          </Field>
         </FieldGroup>
       </section>
       <section className="settings-card"><div className="section-title"><Server size={16} />Daemon</div><div className="runtime-state"><span className={`status-dot ${snapshot.daemon.state}`} /><div><strong>{status(snapshot.daemon.state)}</strong><p>{snapshot.daemon.pid ? `PID ${snapshot.daemon.pid} · 127.0.0.1:${snapshot.daemon.port}` : t("尚未运行", "Not running")}</p></div></div><div className="button-row"><button className="primary" onClick={() => void window.prospero.startDaemon()} disabled={snapshot.daemon.running}>{t("启动", "Start")}</button><button onClick={() => void window.prospero.restartDaemon()} disabled={!snapshot.daemon.managed}>{t("重启", "Restart")}</button><button className="danger" onClick={() => void window.prospero.stopDaemon()} disabled={!snapshot.daemon.managed}>{t("停止", "Stop")}</button></div><p className="security-note"><CircleAlert size={14} />{t("外部启动的 daemon 只连接、不强杀；控制令牌不会暴露给 UI。", "Externally started daemons are attached, never force-killed. Control tokens are not exposed to the UI.")}</p></section>
