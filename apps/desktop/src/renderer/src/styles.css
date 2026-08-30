@@ -1227,47 +1227,63 @@ kbd {
   font-size: 11px;
 }
 .workspace-tab:hover { color: var(--foreground); background: color-mix(in srgb, var(--surface-raised) 68%, transparent); }
-.workspace-tab.is-active { color: var(--foreground); background: var(--background); box-shadow: 0 1px 0 var(--background); }
-.workspace-tab-main { display: flex; min-width: 0; flex: 1; align-items: center; gap: 7px; height: 100%; padding: 0; color: inherit; border: 0; background: transparent; text-align: left; }
-.workspace-tab-action { display: grid; flex: none; width: 22px; height: 22px; place-items: center; padding: 0; color: var(--muted-foreground); border: 0; border-radius: 5px; background: transparent; opacity: .72; }
+.workspace-tab.is-active { color: var(--foreground); background: var(--background); }
+.workspace-tab-main,
+.workspace-tab-action,
+.workspace-session-pin { appearance: none; border: 0; outline: 0; box-shadow: none; background: transparent; }
+.workspace-tab-main { display: flex; min-width: 0; flex: 1; align-items: center; gap: 7px; height: 100%; padding: 0; color: inherit; border-radius: 0; text-align: left; }
+.workspace-tab-main:focus-visible { color: var(--foreground); }
+.workspace-tab-action { display: grid; flex: none; width: 22px; height: 22px; place-items: center; padding: 0; color: color-mix(in srgb, var(--muted-foreground) 82%, transparent); border-radius: 0; opacity: .72; }
 .workspace-tab-action:hover,
-.workspace-tab-action:focus-visible { color: var(--foreground); background: transparent; opacity: 1; }
+.workspace-tab-action:focus-visible { color: var(--foreground); opacity: 1; }
 .workspace-tab-action.is-pinned { color: var(--foreground); opacity: 1; }
-.workspace-tab-action svg { display: block; width: 14px; height: 14px; }
+.workspace-tab-action svg { display: block; width: 14px; height: 14px; stroke: currentColor; }
 .workspace-session-count { margin-left: auto; color: color-mix(in srgb, var(--sidebar-foreground) 48%, transparent); font-size: 10px; font-variant-numeric: tabular-nums; transition: opacity 120ms ease; }
 .workspace-sidebar-group > [data-sidebar="group-label"] { width: fit-content; padding-right: 0; cursor: pointer; }
 .workspace-group-chevron { margin-left: 2px; transition: opacity 120ms ease, transform 160ms ease; }
 [data-slot="collapsible"][data-open].group\/workspaces .workspace-group-chevron { opacity: 0; transform: rotate(90deg); }
 .workspace-project-item:hover .workspace-session-count,
-.workspace-project-item:focus-within .workspace-session-count { opacity: 0; }
+.workspace-project-item:has(> .workspace-project-more:focus-visible) .workspace-session-count,
+.workspace-project-item:has(> .workspace-project-more[data-popup-open]) .workspace-session-count { opacity: 0; }
 .workspace-project-button > svg:first-child { color: color-mix(in srgb, var(--sidebar-foreground) 72%, transparent); }
-.workspace-project-pinned { width: 11px !important; height: 11px !important; margin-left: auto; color: var(--primary) !important; }
-.workspace-project-pinned + .workspace-session-count { margin-left: 2px; }
+.workspace-project-pinned { position: absolute; top: 10px; right: 29px; width: 11px !important; height: 11px !important; color: var(--sidebar-foreground) !important; opacity: 0; pointer-events: none; transition: opacity 120ms ease; }
+.workspace-project-item:hover .workspace-project-pinned { opacity: 1; }
 .workspace-project-more { position: absolute; top: 6px; right: 4px; display: grid; width: 20px; height: 20px; place-items: center; padding: 0; color: var(--sidebar-foreground); border: 0; border-radius: 6px; background: transparent; opacity: 0; }
 .workspace-project-more:hover,
 .workspace-project-more:focus-visible,
 .workspace-project-more[data-popup-open] { color: var(--sidebar-accent-foreground); background: var(--sidebar-accent); opacity: 1; }
-.workspace-project-item:hover > .workspace-project-more,
-.workspace-project-item:focus-within > .workspace-project-more { opacity: 1; }
+.workspace-project-item:hover > .workspace-project-more { opacity: 1; }
 .workspace-project-more svg { width: 14px; height: 14px; }
 .prospero-sidebar [data-sidebar="menu-sub"] { min-width: 0; max-width: 100%; margin-right: 0; padding-right: 0; overflow: visible; }
 .prospero-sidebar [data-sidebar="menu-sub-item"] { min-width: 0; max-width: 100%; }
 .workspace-session-item { overflow: visible; }
 .workspace-session-link { width: 100%; max-width: 100%; padding-right: 28px; overflow: hidden; }
 .workspace-session-link > span:last-child { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.workspace-session-pin { position: absolute; top: 4px; right: 4px; display: grid; width: 20px; height: 20px; place-items: center; padding: 0; color: color-mix(in srgb, var(--sidebar-foreground) 52%, transparent); border: 0; border-radius: 6px; background: transparent; opacity: 0; }
+.workspace-session-pin { position: absolute; top: 4px; right: 4px; display: grid; width: 20px; height: 20px; place-items: center; padding: 0; color: color-mix(in srgb, var(--sidebar-foreground) 52%, transparent); border-radius: 0; opacity: 0; }
 .workspace-session-pin:hover,
-.workspace-session-pin:focus-visible { color: var(--sidebar-foreground); background: transparent; opacity: 1; }
-.workspace-session-item:hover > .workspace-session-pin,
-.workspace-session-item:focus-within > .workspace-session-pin { opacity: 1; }
-.workspace-session-pin.is-pinned { color: var(--sidebar-foreground); opacity: 1; }
-.workspace-session-pin svg { width: 13px; height: 13px; }
-.session-pin-action { color: color-mix(in srgb, var(--sidebar-foreground) 52%, transparent); background: transparent !important; }
+.workspace-session-pin:focus-visible { color: var(--sidebar-foreground); opacity: 1; }
+.workspace-session-item:hover > .workspace-session-pin { opacity: 1; }
+.workspace-session-pin.is-pinned { color: var(--sidebar-foreground); }
+.workspace-session-pin svg { display: block; width: 13px; height: 13px; stroke: currentColor; }
+.session-pin-action { color: color-mix(in srgb, var(--sidebar-foreground) 48%, transparent); background: transparent !important; opacity: 0; transition: color 120ms ease, opacity 120ms ease; }
+.prospero-sidebar [data-sidebar="menu-item"]:hover > .session-pin-action,
+.prospero-sidebar [data-sidebar="menu-item"]:focus-within > .session-pin-action { opacity: 1; }
 .session-pin-action:hover,
-.session-pin-action:focus-visible,
-.session-pin-action.is-pinned { color: var(--sidebar-foreground); }
-.session-agent-icon { display: grid; flex: none; place-items: center; color: var(--muted-foreground); }
-.session-agent-icon svg { display: block; width: 15px; height: 15px; stroke-width: 1.8; }
+.session-pin-action:focus-visible { color: var(--sidebar-foreground); }
+.sidebar-footer-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; }
+.sidebar-footer-actions > [data-sidebar="menu-item"] { min-width: 0; }
+.sidebar-footer-actions [data-sidebar="menu-button"] { justify-content: center; min-width: 0; padding-inline: 7px; }
+.sidebar-footer-actions [data-sidebar="menu-button"] > span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sidebar-daemon-dot { display: block; width: 7px; height: 7px; flex: none; border-radius: 50%; background: var(--danger); box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 11%, transparent); }
+.sidebar-daemon-dot.online { background: var(--success); box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 12%, transparent); }
+.daemon-agent-row { display: flex; min-width: 0; align-items: center; gap: 9px; padding: 7px 0; border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent); }
+.daemon-agent-row:last-child { border-bottom: 0; }
+.daemon-agent-row [data-slot="avatar"] { width: 28px; height: 28px; }
+.daemon-agent-row [data-slot="avatar-fallback"] { background: var(--muted); }
+.prospero-sidebar[data-collapsible="icon"] .sidebar-footer-actions { grid-template-columns: minmax(0, 1fr); }
+.session-agent-icon { display: grid; width: 15px; height: 15px; flex: none; place-items: center; color: var(--muted-foreground); }
+.session-agent-icon .agent-logo { display: block; width: 15px; height: 15px; }
+.session-agent-icon .agent-logo-fallback { display: grid; place-items: center; font-size: 7px; line-height: 1; }
 .prospero-sidebar .session-agent-icon { color: color-mix(in srgb, var(--sidebar-foreground) 62%, transparent); }
 .workspace-tab.is-active .session-agent-icon,
 .workspace-session-link[data-active] .session-agent-icon,
