@@ -1,3 +1,4 @@
+import CoreGraphics
 import Testing
 @testable import ProsperoShell
 
@@ -26,6 +27,32 @@ struct RunGraphLayoutTests {
     let offset = runGraphCenteredOffset(containerHeight: 500, contentHeight: 70)
     #expect(offset == 215)
     #expect(offset + 35 == 250)
+  }
+
+  @Test("fits very large graphs below the old 35 percent floor")
+  func fitsWholeLargeGraph() {
+    let scale = runGraphFitScale(
+      content: CGSize(width: 48_000, height: 96_000),
+      viewport: CGSize(width: 1_200, height: 600)
+    )
+    #expect(scale == 0.00625)
+    #expect(96_000 * scale == 600)
+  }
+
+  @Test("maps pan and zoom back to a content-space viewport")
+  func visibleContentRect() {
+    let rect = runGraphVisibleRect(
+      viewport: CGSize(width: 800, height: 500),
+      pan: CGSize(width: -300, height: -120),
+      zoom: 2,
+      overscan: 20
+    )
+    #expect(rect.origin.x == 130)
+    #expect(rect.origin.y == 40)
+    #expect(rect.width == 440)
+    #expect(rect.height == 290)
+    #expect(rect.contains(CGPoint(x: 150, y: 60)))
+    #expect(!rect.contains(CGPoint(x: 900, y: 900)))
   }
 
   @Test("distinguishes generic feedback lineage from a real failure")

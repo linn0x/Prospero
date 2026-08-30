@@ -16,6 +16,39 @@ func runGraphCenteredOffset(containerHeight: CGFloat, contentHeight: CGFloat) ->
   max(0, (containerHeight - contentHeight) / 2)
 }
 
+/// Keep "fit whole graph" useful for large runs. The old hard 35% floor meant
+/// a sufficiently wide or tall graph could never be shown in full.
+func runGraphFitScale(
+  content: CGSize,
+  viewport: CGSize,
+  minimum: CGFloat = 0.001,
+  maximum: CGFloat = 2.2
+) -> CGFloat {
+  guard content.width > 0, content.height > 0,
+        viewport.width > 0, viewport.height > 0 else { return 1 }
+  return min(maximum, max(minimum, min(
+    viewport.width / content.width,
+    viewport.height / content.height
+  )))
+}
+
+/// Content-space rectangle currently visible through the transformed canvas.
+/// Shared by node virtualization and the minimap viewport indicator.
+func runGraphVisibleRect(
+  viewport: CGSize,
+  pan: CGSize,
+  zoom: CGFloat,
+  overscan: CGFloat = 0
+) -> CGRect {
+  guard zoom > 0 else { return .null }
+  return CGRect(
+    x: -pan.width / zoom - overscan,
+    y: -pan.height / zoom - overscan,
+    width: viewport.width / zoom + overscan * 2,
+    height: viewport.height / zoom + overscan * 2
+  )
+}
+
 /// A terminal node can be historical control flow rather than a failed unit of
 /// work. Keep this derived from Prospero's generic lineage/result fields so the
 /// shell never needs to understand a plugin's material/domain/evidence types.
@@ -48,11 +81,15 @@ struct RunGraphCanvas: View {
   @State private var panBase: CGSize = .zero
   /// 首次出现时,图比可视区大就自动适应一次 —— 别让人一进来就先手动找图。
   @State private var didAutoFit = false
+  /// Layout is intentionally state, not a local value in `body`. Pan/zoom can
+  /// update at pointer-frame cadence and must not rerun the DAG layout.
+  @State private var layout: Layout
 
   private let controlsHeight: CGFloat = 24
 
-  private let minZoom: CGFloat = 0.35
+  private let minZoom: CGFloat = 0.001
   private let maxZoom: CGFloat = 2.2
+  private let detailZoom: CGFloat = 0.44
 
   private let nodeWidth: CGFloat = 178
   private let nodeHeight: CGFloat = 70
@@ -72,8 +109,31 @@ struct RunGraphCanvas: View {
     var size: CGSize
   }
 
+  private struct LayoutNodeKey: Equatable {
+    var id: String
+    var deps: [String]
+    var parentId: String?
+    var createdAt: Double
+  }
+
+  init(
+    tasks: [OrchestrationStatus.Task],
+    dispatches: [OrchestrationStatus.Dispatch],
+    selection: Binding<String?>
+  ) {
+    self.tasks = tasks
+    self.dispatches = dispatches
+    _selection = selection
+    _layout = State(initialValue: Self.makeLayout(tasks: tasks))
+  }
+
+  private var layoutKey: [LayoutNodeKey] {
+    tasks.map {
+      LayoutNodeKey(id: $0.id, deps: $0.deps, parentId: $0.parentId, createdAt: $0.createdAt)
+    }
+  }
+
   var body: some View {
-    let layout = makeLayout()
     GeometryReader { proxy in
       let viewport = CGSize(
         width: proxy.size.width,
@@ -88,6 +148,14 @@ struct RunGraphCanvas: View {
         didAutoFit = true
         if fitScale(layout: layout, viewport: viewport) < 1 {
           fitToWindow(layout: layout, viewport: viewport)
+        }
+      }
+      .onChange(of: layoutKey) {
+        let next = Self.makeLayout(tasks: tasks)
+        layout = next
+        didAutoFit = true
+        if fitScale(layout: next, viewport: viewport) < 1 {
+          fitToWindow(layout: next, viewport: viewport)
         }
       }
     }
@@ -112,14 +180,23 @@ struct RunGraphCanvas: View {
       Color.clear
       ZStack {
         edges(layout)
-        ForEach(tasks) { task in
-          node(task)
-            .position(layout.positions[task.id] ?? .zero)
+        if zoom < detailZoom {
+          overviewNodes(layout)
+        } else {
+          ForEach(visibleTasks(layout: layout, viewport: viewport)) { task in
+            node(task)
+              .position(layout.positions[task.id] ?? .zero)
+          }
         }
       }
       .frame(width: layout.size.width, height: layout.size.height)
       .scaleEffect(zoom, anchor: .topLeading)
       .offset(x: pan.width, y: pan.height)
+
+      minimap(layout: layout, viewport: viewport)
+        .frame(width: 156, height: 96)
+        .padding(10)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
     .background(.quaternary.opacity(0.16))
@@ -149,6 +226,145 @@ struct RunGraphCanvas: View {
     .onHover { inside in
       if inside { NSCursor.openHand.set() } else { NSCursor.arrow.set() }
     }
+  }
+
+  /// At readable zoom levels, retain only nodes intersecting the viewport.
+  /// Edges remain a single Canvas draw, so a large graph no longer creates a
+  /// full tree of off-screen Buttons and Text views.
+  private func visibleTasks(layout: Layout, viewport: CGSize) -> [OrchestrationStatus.Task] {
+    let visible = runGraphVisibleRect(
+      viewport: viewport,
+      pan: pan,
+      zoom: zoom,
+      overscan: max(nodeWidth, nodeHeight)
+    )
+    return tasks.filter { task in
+      guard let point = layout.positions[task.id] else { return false }
+      return visible.contains(point)
+    }
+  }
+
+  /// Low zoom is overview mode: draw lightweight glyphs in one Canvas rather
+  /// than hundreds of complete controls whose text cannot be read anyway.
+  private func overviewNodes(_ layout: Layout) -> some View {
+    let parentIds = Set(tasks.compactMap(\.parentId))
+    let supersededIds = Set(tasks.compactMap { task -> String? in
+      guard task.status == "failed" || task.status == "cancelled" else { return nil }
+      let signal = task.result?.lowercased() ?? ""
+      return parentIds.contains(task.id)
+        || signal.contains("superseded")
+        || signal.contains("quiesced before applying typed feedback")
+        || signal.contains("typed_feedback_replan")
+        ? task.id
+        : nil
+    })
+    return Canvas { context, _ in
+      for task in tasks {
+        guard let point = layout.positions[task.id] else { continue }
+        let fill: Color = switch task.status {
+        case "done": .green
+        case "failed": supersededIds.contains(task.id) ? .blue : .red
+        case "cancelled": .blue
+        case "dispatched": .orange
+        case "blocked": .yellow
+        default: .secondary
+        }
+        let rect = CGRect(
+          x: point.x - nodeWidth / 2,
+          y: point.y - nodeHeight / 2,
+          width: nodeWidth,
+          height: nodeHeight
+        )
+        context.fill(
+          Path(roundedRect: rect, cornerRadius: 8),
+          with: .color(fill.opacity(selection == task.id ? 0.9 : 0.68))
+        )
+        if selection == task.id {
+          context.stroke(
+            Path(roundedRect: rect.insetBy(dx: -3, dy: -3), cornerRadius: 10),
+            with: .color(.accentColor),
+            lineWidth: 4
+          )
+        }
+      }
+    }
+    .allowsHitTesting(false)
+  }
+
+  /// Always-on whole-graph overview. Dragging it recenters the main canvas,
+  /// which makes distant branches reachable without repeated blind panning.
+  private func minimap(layout: Layout, viewport: CGSize) -> some View {
+    GeometryReader { proxy in
+      let preview = proxy.size
+      let scale = min(
+        preview.width / max(layout.size.width, 1),
+        preview.height / max(layout.size.height, 1)
+      )
+      let offset = CGPoint(
+        x: (preview.width - layout.size.width * scale) / 2,
+        y: (preview.height - layout.size.height * scale) / 2
+      )
+      Canvas { context, _ in
+        let graphRect = CGRect(
+          x: offset.x,
+          y: offset.y,
+          width: layout.size.width * scale,
+          height: layout.size.height * scale
+        )
+        context.fill(
+          Path(roundedRect: graphRect, cornerRadius: 4),
+          with: .color(Color(nsColor: .controlBackgroundColor).opacity(0.96))
+        )
+        for task in tasks {
+          guard let point = layout.positions[task.id] else { continue }
+          let dot = CGRect(
+            x: offset.x + point.x * scale - 1.5,
+            y: offset.y + point.y * scale - 1.5,
+            width: 3,
+            height: 3
+          )
+          context.fill(Path(ellipseIn: dot), with: .color(.secondary.opacity(0.72)))
+        }
+        let visible = runGraphVisibleRect(viewport: viewport, pan: pan, zoom: zoom)
+        let viewportRect = CGRect(
+          x: offset.x + visible.minX * scale,
+          y: offset.y + visible.minY * scale,
+          width: visible.width * scale,
+          height: visible.height * scale
+        ).intersection(graphRect)
+        if !viewportRect.isNull {
+          context.stroke(
+            Path(roundedRect: viewportRect, cornerRadius: 2),
+            with: .color(.accentColor.opacity(0.9)),
+            lineWidth: 1.5
+          )
+        }
+      }
+      .contentShape(Rectangle())
+      .gesture(
+        DragGesture(minimumDistance: 0)
+          .onChanged { value in
+            guard scale > 0 else { return }
+            let target = CGPoint(
+              x: (value.location.x - offset.x) / scale,
+              y: (value.location.y - offset.y) / scale
+            )
+            pan = CGSize(
+              width: viewport.width / 2 - target.x * zoom,
+              height: viewport.height / 2 - target.y * zoom
+            )
+            panBase = pan
+          }
+      )
+    }
+    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 7))
+    .overlay {
+      RoundedRectangle(cornerRadius: 7)
+        .stroke(.secondary.opacity(0.28), lineWidth: 1)
+    }
+    .shadow(color: .black.opacity(0.12), radius: 5, y: 2)
+    .help("全图导航：拖动以定位分支")
+    .accessibilityLabel("任务图小地图")
   }
 
   private func clamp(_ value: CGFloat) -> CGFloat {
@@ -357,7 +573,7 @@ struct RunGraphCanvas: View {
           .disabled(zoom <= minZoom + 0.001)
         // 百分比本身就是复位按钮 —— 拖远了、缩过头了,这里一下回到原点。
         Button(action: reset) {
-          Text("\(Int((zoom * 100).rounded()))%")
+          Text(zoom < 0.01 ? "<1%" : "\(Int((zoom * 100).rounded()))%")
             .monospacedDigit()
             .frame(width: 34)
         }
@@ -383,9 +599,12 @@ struct RunGraphCanvas: View {
 
   /// 整张图塞进可视区所需的倍数。传进来的 viewport 已经扣掉控件条的高度。
   private func fitScale(layout: Layout, viewport: CGSize) -> CGFloat {
-    guard layout.size.width > 0, layout.size.height > 0,
-          viewport.width > 0, viewport.height > 0 else { return 1 }
-    return clamp(min(viewport.width / layout.size.width, viewport.height / layout.size.height))
+    runGraphFitScale(
+      content: layout.size,
+      viewport: viewport,
+      minimum: minZoom,
+      maximum: maxZoom
+    )
   }
 
   /// 通用分层 DAG 布局:x 是拓扑层级,y 是后继分支的重心。
@@ -394,7 +613,12 @@ struct RunGraphCanvas: View {
   /// 整体高度中线，任何中途分叉也会展开，而不是把同一列机械地从顶部往下堆。
   /// 成环由 daemon 在建图时就拒绝了,这里的 stack 只是防御 —— 快照里真出现环,
   /// 也只是画得难看,不能让 UI 递归到爆栈。
-  private func makeLayout() -> Layout {
+  private static func makeLayout(tasks: [OrchestrationStatus.Task]) -> Layout {
+    let nodeWidth: CGFloat = 178
+    let nodeHeight: CGFloat = 70
+    let hGap: CGFloat = 78
+    let vGap: CGFloat = 26
+    let margin: CGFloat = 26
     let taskById = Dictionary(uniqueKeysWithValues: tasks.map { ($0.id, $0) })
     var memo: [String: Int] = [:]
     func level(_ id: String, stack: Set<String> = []) -> Int {
@@ -448,8 +672,9 @@ struct RunGraphCanvas: View {
       visited.insert(id)
     }
     for root in roots { collectLeaves(root.id) }
+    var orderedLeafIds = Set(orderedLeaves)
     for task in tasks.sorted(by: taskSort) where (successors[task.id] ?? []).isEmpty {
-      if !orderedLeaves.contains(task.id) { orderedLeaves.append(task.id) }
+      if orderedLeafIds.insert(task.id).inserted { orderedLeaves.append(task.id) }
     }
 
     let slotCount = max(orderedLeaves.count, maxColumnCount, 1)
