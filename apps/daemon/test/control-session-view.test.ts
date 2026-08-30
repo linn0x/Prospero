@@ -177,6 +177,9 @@ describe("Mac control session views", () => {
       // knownSeq remains the legacy no-change probe.
       expect((await request(`${viewPath}?knownSeq=0`)).status).toBe(204);
       expect((await request(`${viewPath}?afterSeq=not-a-sequence`)).status).toBe(400);
+      expect((await request(`${viewPath}?afterSeq=0&waitMs=not-a-duration`)).status).toBe(400);
+      expect((await request(`${viewPath}?afterSeq=0&waitMs=-1`)).status).toBe(400);
+      expect((await request(`${viewPath}?afterSeq=0&waitMs=25001`)).status).toBe(400);
 
       const ahead = await request(`${viewPath}?afterSeq=1`);
       expect(ahead.status).toBe(200);
@@ -188,8 +191,36 @@ describe("Mac control session views", () => {
       });
       expect((await request(`${viewPath}?afterSeq=0`)).status).toBe(204);
 
+      // A structured long poll stays pending while the cursor is current,
+      // cleans its listeners on timeout, and returns the established 204.
+      const timeoutAgentListeners = server.manager.listenerCount("agentEvent");
+      const timeoutStateListeners = server.manager.listenerCount("state");
+      const timeoutResponsePromise = request(`${viewPath}?afterSeq=0&waitMs=500`);
+      for (let attempt = 0;
+        attempt < 100 && server.manager.listenerCount("agentEvent") === timeoutAgentListeners;
+        attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      expect(server.manager.listenerCount("agentEvent")).toBe(timeoutAgentListeners + 1);
+      expect(server.manager.listenerCount("state")).toBe(timeoutStateListeners + 1);
+      expect((await timeoutResponsePromise).status).toBe(204);
+      expect(server.manager.listenerCount("agentEvent")).toBe(timeoutAgentListeners);
+      expect(server.manager.listenerCount("state")).toBe(timeoutStateListeners);
+
+      // New agent events wake the same request immediately and are returned as
+      // a cursor-relative delta rather than waiting for the timeout.
+      const deltaAgentListeners = server.manager.listenerCount("agentEvent");
+      const deltaStateListeners = server.manager.listenerCount("state");
+      const deltaResponsePromise = request(`${viewPath}?afterSeq=0&waitMs=2000`);
+      for (let attempt = 0;
+        attempt < 100 && server.manager.listenerCount("agentEvent") === deltaAgentListeners;
+        attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      expect(server.manager.listenerCount("agentEvent")).toBe(deltaAgentListeners + 1);
+      expect(server.manager.listenerCount("state")).toBe(deltaStateListeners + 1);
       await interact(structured.id, "alpha");
-      const deltaResponse = await request(`${viewPath}?afterSeq=0`);
+      const deltaResponse = await deltaResponsePromise;
       expect(deltaResponse.status).toBe(200);
       const delta = await deltaResponse.json() as StructuredView;
       expect(delta).toMatchObject({
@@ -199,7 +230,21 @@ describe("Mac control session views", () => {
       });
       expect(delta.evSeq).toBeGreaterThan(0);
       expect(delta.events).toHaveLength(delta.evSeq);
-      expect((await request(`${viewPath}?afterSeq=${String(delta.evSeq)}`)).status).toBe(204);
+      expect(server.manager.listenerCount("agentEvent")).toBe(deltaAgentListeners);
+      expect(server.manager.listenerCount("state")).toBe(deltaStateListeners);
+      // The first emitted event is allowed to wake the poll before the same
+      // interaction emits its trailing turn.end; consume that valid follow-up
+      // delta, if present, before asserting the no-change response.
+      const catchupResponse = await request(`${viewPath}?afterSeq=${String(delta.evSeq)}`);
+      let currentEvSeq = delta.evSeq;
+      if (catchupResponse.status === 200) {
+        const catchup = await catchupResponse.json() as StructuredView;
+        expect(catchup).toMatchObject({ kind: "structured", mode: "delta", baseSeq: delta.evSeq });
+        currentEvSeq = catchup.evSeq;
+      } else {
+        expect(catchupResponse.status).toBe(204);
+      }
+      expect((await request(`${viewPath}?afterSeq=${String(currentEvSeq)}`)).status).toBe(204);
 
       const output = await request(`${toolPath}?callId=tool-alpha`);
       expect(output.status).toBe(200);
@@ -231,6 +276,22 @@ describe("Mac control session views", () => {
         evSeq: gap.evSeq,
         events: [{ kind: "turn.end" }],
       });
+
+      // A retained terminal structured session has no new event to return, so
+      // its state event wakes the poll with 204 instead of holding it open.
+      const ending = await create({ agent: "codex", kind: "structured", cwd: home });
+      const endingViewPath = `/_prospero/control/session/${ending.id}/view`;
+      const endingStateListeners = server.manager.listenerCount("state");
+      const endingResponsePromise = request(`${endingViewPath}?afterSeq=0&waitMs=2000`);
+      for (let attempt = 0;
+        attempt < 100 && server.manager.listenerCount("state") === endingStateListeners;
+        attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      expect(server.manager.listenerCount("state")).toBe(endingStateListeners + 1);
+      await server.manager.kill(ending.id, { preserveHistory: true });
+      expect((await endingResponsePromise).status).toBe(204);
+      expect(server.manager.listenerCount("state")).toBe(endingStateListeners);
 
       // afterSeq is structured-only and remains ignored for PTY compatibility.
       // The Mac-specific outputAfterSeq cursor upgrades PTY rendering without

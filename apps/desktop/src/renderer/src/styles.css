@@ -1076,6 +1076,7 @@ kbd {
 .view-heading p { color: var(--muted-foreground); font-size: 13px; }
 .view-actions { display: flex; flex: none; align-items: center; gap: 8px; }
 .eyebrow { color: var(--primary); font-size: 9px; font-weight: 750; letter-spacing: .13em; }
+.view-container.overview-view { padding-top: 12px; }
 .overview-grid { display: grid; grid-template-columns: minmax(0, 1.08fr) minmax(340px, .92fr); gap: 16px; }
 .overview-grid > [data-slot="card"],
 .agent-grid > [data-slot="card"],
@@ -1265,6 +1266,28 @@ kbd {
 .workspace-session-item:hover > .workspace-session-pin { opacity: 1; }
 .workspace-session-pin.is-pinned { color: var(--sidebar-foreground); }
 .workspace-session-pin svg { display: block; width: 13px; height: 13px; stroke: currentColor; }
+.workspace-session-more-item { padding-top: 1px; }
+.workspace-session-more {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  height: 27px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 7px;
+  color: color-mix(in srgb, var(--sidebar-foreground) 58%, transparent);
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  font-size: 10px;
+  text-align: left;
+}
+.workspace-session-more:hover,
+.workspace-session-more:focus-visible { color: var(--sidebar-accent-foreground); background: var(--sidebar-accent); }
+.workspace-session-more:focus-visible { outline: 2px solid var(--sidebar-ring); outline-offset: -2px; }
+.workspace-session-more svg { width: 12px; height: 12px; flex: none; transition: transform 140ms ease; }
+.workspace-session-more[aria-expanded="true"] svg { transform: rotate(90deg); }
+.workspace-session-more span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .session-pin-action { color: color-mix(in srgb, var(--sidebar-foreground) 48%, transparent); background: transparent !important; opacity: 0; transition: color 120ms ease, opacity 120ms ease; }
 .prospero-sidebar [data-sidebar="menu-item"]:hover > .session-pin-action,
 .prospero-sidebar [data-sidebar="menu-item"]:focus-within > .session-pin-action { opacity: 1; }
@@ -1372,6 +1395,9 @@ kbd {
 .prospero-main .orchestration-page { display: flex; flex-direction: column; padding: 0; }
 .prospero-main .orchestration-page > header { border-bottom-color: var(--border); background: var(--background); }
 .prospero-main .orchestration-layout { min-height: 0; flex: 1; grid-template-columns: 210px minmax(0, 1fr); border-top-color: var(--border); }
+.prospero-main .orchestration-layout.run-list-collapsed,
+.prospero-main .dag-active .orchestration-layout.run-list-collapsed { grid-template-columns: minmax(0, 1fr); }
+.orchestration-layout.run-list-collapsed > .run-list { display: none; }
 .orchestration-summary { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap: 10px; padding: 12px 28px; background: var(--background); }
 .orchestration-summary [data-slot="card-header"] { gap: 3px; padding: 11px 13px; }
 .orchestration-summary [data-slot="card-title"] { font-size: 19px; }
@@ -1385,6 +1411,9 @@ kbd {
 .run-progress-line { display: flex; max-width: 480px; align-items: center; gap: 10px; margin-top: 7px; }
 .run-progress-line [data-slot="progress"] { flex: 1; }
 .run-progress-line span { flex: none; color: var(--muted-foreground); font-size: 10px; }
+.run-list-toggle { color: var(--muted-foreground); background: transparent; }
+.run-list-toggle:hover:not(:disabled),
+.run-list-toggle:focus-visible { color: var(--foreground); background: var(--surface-raised); }
 .run-views { margin-top: 18px; }
 .run-view-content { margin-top: 12px; }
 .prospero-main .dag-active > header {
@@ -1632,6 +1661,12 @@ kbd {
   .run-detail-dag .run-hero { align-items: stretch; flex-direction: column; }
   .run-detail-dag .run-hero-copy { width: 100%; min-width: 0; }
   .run-detail-dag .run-hero > .button-row { justify-content: flex-start; overflow-x: auto; padding-bottom: 1px; }
+}
+
+@media (max-width: 1349px) {
+  .prospero-main .orchestration-layout:not(.run-list-collapsed),
+  .prospero-main .dag-active .orchestration-layout:not(.run-list-collapsed) { grid-template-columns: 168px minmax(0, 1fr); }
+  .prospero-main .run-list { padding-right: 6px; padding-left: 6px; }
 }
 
 @media (max-width: 900px) {
