@@ -167,6 +167,41 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  macos-desktop:
+    name: macOS Electron desktop
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci
+      - run: npm run typecheck -w @prospero/desktop
+      - run: npm run build -w @prospero/desktop
+      - name: Stage the bundled daemon runtime
+        run: node apps/desktop/scripts/prepare-runtime.mjs
+      - name: Package the unsigned macOS app
+        working-directory: apps/desktop
+        # CI 上没有证书,签名跳过;这一步要验的是"能不能装配出一个完整的 .app",
+        # 签名与公证属于发布流程,不该拦住每一次提交。
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npx electron-builder --mac dir --arm64
+      - name: Verify the packaged app resolves node, daemon and PATH
+        # --self-check 不开窗口,所以不依赖 GUI 会话。它恰好覆盖 macOS 上最容易
+        # 出问题、而 Windows 上根本不存在的那条链:GUI 进程的极简 PATH 里找不到
+        # node,也找不到各家 agent CLI。
+        run: |
+          smoke="$RUNNER_TEMP/prospero-macos-smoke"
+          mkdir -p "$smoke"
+          PROSPERO_HOME="$smoke" ./dist/desktop/mac-arm64/Prospero.app/Contents/MacOS/Prospero --self-check | tee "$smoke/self-check.log"
+          if grep -q "❌" "$smoke/self-check.log"; then
+            echo "自检报告里有缺失项，见上面的输出"
+            exit 1
+          fi
+
   windows-desktop:
     name: Windows Electron desktop
     runs-on: windows-latest
@@ -181,25 +216,25 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
       - run: npm ci
-      - run: npm run typecheck -w @prospero/windows-desktop
+      - run: npm run typecheck -w @prospero/desktop
       - name: Build the sandboxed Electron workbench and self-contained x64 package
-        run: ./apps/windows-desktop/scripts/package.ps1 -Architecture x64
+        run: ./apps/desktop/scripts/package.ps1 -Architecture x64
       - name: Start packaged UI and its bundled daemon
         run: |
           $smokeHome = Join-Path $env:RUNNER_TEMP 'prospero-windows-electron-smoke'
           New-Item -ItemType Directory -Path $smokeHome -Force | Out-Null
           try {
             $env:PROSPERO_HOME = $smokeHome
-            $process = Start-Process -FilePath ./dist/windows-desktop/win-unpacked/Prospero.exe -ArgumentList '--smoke-test' -WindowStyle Hidden -Wait -PassThru
+            $process = Start-Process -FilePath ./dist/desktop/win-unpacked/Prospero.exe -ArgumentList '--smoke-test' -WindowStyle Hidden -Wait -PassThru
             if ($process.ExitCode -ne 0) {
-              Get-Content -LiteralPath (Join-Path $smokeHome 'windows-desktop.log') -ErrorAction SilentlyContinue
+              Get-Content -LiteralPath (Join-Path $smokeHome 'desktop.log') -ErrorAction SilentlyContinue
               throw "Windows Electron smoke test failed with exit code $($process.ExitCode)"
             }
             # 不要断言 status.json 还在:daemon 收到 SIGTERM 会主动删掉它
             # (StatusFile.stop 里"删掉而不是留一份陈旧快照"),而桌面端退出时正是
             # 这么关它的。这个断言只能靠"没来得及清理"侥幸通过。daemon 是否真的起来了,
             # 由 --smoke-test 自己断言 —— 它等 /control/health 应答,起不来就非零退出。
-            $desktopLog = Join-Path $smokeHome 'windows-desktop.log'
+            $desktopLog = Join-Path $smokeHome 'desktop.log'
             if (-not (Test-Path -LiteralPath $desktopLog)) { throw 'Bundled daemon produced no log output' }
           } finally {
             Remove-Item Env:\PROSPERO_HOME -ErrorAction SilentlyContinue
@@ -208,8 +243,8 @@ jobs:
         with:
           name: prospero-windows-x64-ci
           path: |
-            dist/windows-desktop/Prospero-*-windows-x64.exe
-            dist/windows-desktop/Prospero-*-windows-x64.zip
+            dist/desktop/Prospero-*-windows-x64.exe
+            dist/desktop/Prospero-*-windows-x64.zip
           if-no-files-found: error
 
   release-stage:
@@ -311,14 +346,14 @@ jobs:
           Expand-Archive -LiteralPath $armArchive -DestinationPath $armDirectory
           $armNode = Get-ChildItem -LiteralPath $armDirectory -Filter node.exe -Recurse | Select-Object -First 1 -ExpandProperty FullName
           if (-not $armNode) { throw 'The official arm64 Node.js archive did not contain node.exe' }
-          ./apps/windows-desktop/scripts/package.ps1 -Architecture x64 -NodeExecutable (Get-Command node.exe).Source
-          ./apps/windows-desktop/scripts/package.ps1 -Architecture arm64 -NodeExecutable $armNode
+          ./apps/desktop/scripts/package.ps1 -Architecture x64 -NodeExecutable (Get-Command node.exe).Source
+          ./apps/desktop/scripts/package.ps1 -Architecture arm64 -NodeExecutable $armNode
       - uses: actions/attest-build-provenance@v2
         with:
           subject-path: ${{ runner.temp }}/release-packages/*.tgz
       - uses: actions/attest-build-provenance@v2
         with:
-          subject-path: dist/windows-desktop/Prospero-*-windows-*.*
+          subject-path: dist/desktop/Prospero-*-windows-*.*
       - uses: actions/upload-artifact@v4
         with:
           name: windows-native-signed-x64
@@ -336,12 +371,12 @@ jobs:
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
-          name: prospero-windows-desktop
+          name: prospero-desktop
           path: |
-            dist/windows-desktop/Prospero-*-windows-x64.exe
-            dist/windows-desktop/Prospero-*-windows-x64.zip
-            dist/windows-desktop/Prospero-*-windows-arm64.exe
-            dist/windows-desktop/Prospero-*-windows-arm64.zip
+            dist/desktop/Prospero-*-windows-x64.exe
+            dist/desktop/Prospero-*-windows-x64.zip
+            dist/desktop/Prospero-*-windows-arm64.exe
+            dist/desktop/Prospero-*-windows-arm64.zip
           if-no-files-found: error
 
   release-signed-load:
@@ -386,7 +421,7 @@ jobs:
           npm run test:windows-native --workspace=@prospero/daemon
       - uses: actions/download-artifact@v5
         with:
-          name: prospero-windows-desktop
+          name: prospero-desktop
           path: windows-bundles
       - name: Exercise the self-contained desktop bundle
         run: |
@@ -402,7 +437,7 @@ jobs:
             $env:PROSPERO_HOME = $smokeHome
             $desktopSmoke = Start-Process -FilePath $desktop -ArgumentList '--smoke-test' -WindowStyle Hidden -Wait -PassThru
             if ($desktopSmoke.ExitCode -ne 0) {
-              Get-Content -LiteralPath (Join-Path $smokeHome 'windows-desktop.log') -ErrorAction SilentlyContinue
+              Get-Content -LiteralPath (Join-Path $smokeHome 'desktop.log') -ErrorAction SilentlyContinue
               throw "Bundled desktop smoke test failed with exit code $($desktopSmoke.ExitCode)"
             }
           } finally {

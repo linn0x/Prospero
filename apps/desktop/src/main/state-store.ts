@@ -104,11 +104,16 @@ export class StateStore extends EventEmitter {
   private startupStage = "";
   private lastError: string | undefined;
   private logs = "";
+  private readonly legacyDesktopStatePath: string;
 
   constructor() {
     super();
     this.home = resolve(process.env["PROSPERO_HOME"] || resolve(homedir(), ".prospero"));
-    this.desktopStatePath = resolve(this.home, "windows-desktop.json");
+    // 这个客户端现在是跨平台的,文件名不再带 windows-。已经在用的机器上还躺着
+    // 旧名字的状态(项目列表、置顶、模板),读的时候要认它,否则升级一次等于清空。
+    // 写永远只写新名字,旧文件自然淘汰。
+    this.desktopStatePath = resolve(this.home, "desktop.json");
+    this.legacyDesktopStatePath = resolve(this.home, "windows-desktop.json");
     mkdirSync(this.home, { recursive: true });
     this.loadDesktopState();
     this.loadLogTail();
@@ -368,7 +373,7 @@ export class StateStore extends EventEmitter {
     const safe = value.replace(/(hostSecret|controlToken|token|ticket|authorization)(\s*[:=]\s*)([^\s,}\]]+)/gi, "$1$2[REDACTED]");
     this.logs = `${this.logs}${safe}`.split(/\r?\n/).slice(-500).join("\n");
     try {
-      writeFileSync(resolve(this.home, "windows-desktop.log"), this.logs, { encoding: "utf8", mode: 0o600 });
+      writeFileSync(resolve(this.home, "desktop.log"), this.logs, { encoding: "utf8", mode: 0o600 });
     } catch {
       // Logging must never take down the desktop host.
     }
@@ -377,7 +382,7 @@ export class StateStore extends EventEmitter {
 
   clearLogs(): DesktopSnapshot {
     this.logs = "";
-    try { writeFileSync(resolve(this.home, "windows-desktop.log"), "", { encoding: "utf8", mode: 0o600 }); } catch { /* ignored */ }
+    try { writeFileSync(resolve(this.home, "desktop.log"), "", { encoding: "utf8", mode: 0o600 }); } catch { /* ignored */ }
     this.changed();
     return this.snapshot();
   }
@@ -414,7 +419,11 @@ export class StateStore extends EventEmitter {
   }
 
   private loadDesktopState(): void {
-    const raw = readJson(this.desktopStatePath) as PersistedDesktopState;
+    // 新名字优先;它不存在(或是空对象)时回落到改名前的文件。
+    const current = readJson(this.desktopStatePath) as PersistedDesktopState;
+    const raw = Object.keys(current).length > 0
+      ? current
+      : readJson(this.legacyDesktopStatePath) as PersistedDesktopState;
     for (const path of Array.isArray(raw.projects) ? raw.projects : []) {
       if (typeof path === "string" && isAbsolute(path) && existsSync(path)) this.addProjectInMemory(path);
     }
@@ -463,7 +472,13 @@ export class StateStore extends EventEmitter {
   }
 
   private loadLogTail(): void {
-    try { this.logs = readFileSync(resolve(this.home, "windows-desktop.log"), "utf8").split(/\r?\n/).slice(-500).join("\n"); } catch { this.logs = ""; }
+    for (const name of ["desktop.log", "windows-desktop.log"]) {
+      try {
+        this.logs = readFileSync(resolve(this.home, name), "utf8").split(/\r?\n/).slice(-500).join("\n");
+        return;
+      } catch { /* 换下一个名字 */ }
+    }
+    this.logs = "";
   }
 
   private changed(): void {

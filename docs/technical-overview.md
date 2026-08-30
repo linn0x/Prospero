@@ -22,7 +22,7 @@ Prospero 把 iPhone / Android 变成 Mac / Windows 上**所有 Coding Agent 的�
   | daemon | `apps/daemon` | Node 22 + TS | 电脑上的常驻服务：会话、适配器、编排、WS/控制面 |
   | mobile | `apps/mobile` | React Native 0.86 + Expo SDK 57 | 手机客户端：会话/审批/终端/文件/Git/编排 |
   | shell | `apps/shell` | SwiftUI（macOS 14+） | 菜单栏/窗口壳：TCC 归属、Bonjour、QR、daemon 生命周期 |
-  | windows-desktop | `apps/windows-desktop` | Electron + React + shadcn/ui（Windows 11） | Agent 工作台、项目/会话、终端、编排、Skills、托盘与 daemon 生命周期 |
+  | windows-desktop | `apps/desktop` | Electron + React + shadcn/ui（Windows 11） | Agent 工作台、项目/会话、终端、编排、Skills、托盘与 daemon 生命周期 |
   | protocol | `packages/protocol` | TS + zod + tweetnacl | 共享协议：消息 schema、E2E 握手、QR、ring buffer |
   | relay | `apps/relay` | Node 22 + MySQL 8.4 + Redis 7.4 + Caddy | 可自托管的 relay v1 控制面与透明数据面 |
   | tools | `tools/` | 脚本 | `fix-node-pty-darwin-helper.mjs`（postinstall 修补） |
@@ -523,7 +523,7 @@ SwiftPM 可执行目标 `ProsperoShell`（macOS 14+，Swift 6）。**存在的�
 - `scripts/build-app.sh`：`swift build -c release` → 组装 `.app`（Info.plist 写 bundle id 与 Bonjour/本地网络描述）→
   codesign（稳定身份优先，否则 `ALLOW_ADHOC_SIGNING=1`）。
 
-## 10.1 Windows 桌面端（`apps/windows-desktop`）
+## 10.1 Windows 桌面端（`apps/desktop`）
 
 Windows 11 桌面端使用 Electron、React 和 shadcn/ui 构建，复用 daemon 的本机 loopback API，不复制会话、账号或编排的
 业务实现。它提供项目与会话、结构化 Chat、xterm 终端、Agent 编排模板、Skills、账号、设备、日志和设置页面，并支持中英文、
