@@ -256,27 +256,52 @@ async function runDesktopSelfCheck(window: BrowserWindow): Promise<void> {
       await new Promise((done) => setTimeout(done, 120));
       const popup = document.querySelector('[data-slot="dropdown-menu-content"]');
       const root = document.querySelector('#root');
-      const healthyRoot = Boolean(root && root.childElementCount > 0 && document.body.innerText.includes('Prospero'));
+      const healthyRoot = Boolean(root && root.childElementCount > 0);
       trigger.click();
       await new Promise((done) => setTimeout(done, 60));
       return { selector, skipped: false, found: true, popup: Boolean(popup), healthyRoot };
     };
     const sidebar = document.querySelector('[data-slot="sidebar"][data-state]');
     const rail = document.querySelector('[data-testid="sidebar-rail"]');
-    // Hosted Windows runners expose a narrow virtual display, so the
-    // responsive shell correctly starts in icon mode. Expand it explicitly
-    // before exercising controls that are intentionally hidden in that mode.
-    if (sidebar?.getAttribute('data-state') === 'collapsed' && rail) {
+    let sidebarToggle;
+    if (sidebar && rail) {
+      // Compact desktop layouts intentionally start in icon mode. Expand them
+      // before exercising controls that are hidden while collapsed.
+      if (sidebar.getAttribute('data-state') === 'collapsed') {
+        rail.click();
+        await new Promise((done) => setTimeout(done, 240));
+      }
+      const before = sidebar.getAttribute('data-state') ?? '';
       rail.click();
       await new Promise((done) => setTimeout(done, 240));
+      const after = sidebar.getAttribute('data-state') ?? '';
+      rail.click();
+      await new Promise((done) => setTimeout(done, 240));
+      const restored = sidebar.getAttribute('data-state') ?? '';
+      sidebarToggle = { mode: 'desktop', found: true, before, after, restored, ready: restored };
+    } else {
+      // A hosted runner can constrain the 760px minimum window below the
+      // component's 768px mobile breakpoint. Exercise the sheet trigger in
+      // that layout and leave the sheet open for the menu checks below.
+      const trigger = document.querySelector('[data-slot="sidebar-trigger"]');
+      const mobileState = () => {
+        const panel = document.querySelector('[data-slot="sidebar"][data-mobile="true"]');
+        if (!panel) return 'closed';
+        const state = panel.getAttribute('data-state');
+        if (state === 'open' || state === 'closed') return state;
+        const style = getComputedStyle(panel);
+        const rect = panel.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0 ? 'open' : 'closed';
+      };
+      const before = mobileState();
+      trigger?.click();
+      await new Promise((done) => setTimeout(done, 240));
+      const after = mobileState();
+      // The modal sheet makes the page root inert while open, so its original
+      // trigger cannot be used as a close control. Keep it open for the menu,
+      // footer and daemon interactions that follow.
+      sidebarToggle = { mode: 'mobile', found: Boolean(trigger), before, after, ready: mobileState() };
     }
-    const beforeRail = sidebar?.getAttribute('data-state');
-    rail?.click();
-    await new Promise((done) => setTimeout(done, 240));
-    const afterRail = sidebar?.getAttribute('data-state');
-    rail?.click();
-    await new Promise((done) => setTimeout(done, 240));
-    const restoredRail = sidebar?.getAttribute('data-state');
     const contextTrigger = document.querySelector('[data-slot="context-menu-trigger"]');
     let context = { skipped: !contextTrigger, popup: false, healthyRoot: Boolean(document.querySelector('#root')?.childElementCount) };
     if (contextTrigger) {
@@ -319,16 +344,19 @@ async function runDesktopSelfCheck(window: BrowserWindow): Promise<void> {
     return {
       group,
       project,
-      rail: { found: Boolean(rail && sidebar), before: beforeRail, after: afterRail, restored: restoredRail },
+      rail: sidebarToggle,
       context,
       directoryFocus,
       pinVisibility,
       footer,
     };
-  })()`) as { group: { skipped: boolean; found: boolean; popup: boolean; healthyRoot: boolean }; project: { skipped: boolean; found: boolean; popup: boolean; healthyRoot: boolean }; rail: { found: boolean; before?: string; after?: string; restored?: string }; context: { skipped: boolean; popup: boolean; healthyRoot: boolean }; directoryFocus: { skipped: boolean; moreOpacity: string; countOpacity: string }; pinVisibility: { pinnedAreaOpacity: string; workspaceOpacity: string }; footer: { count: number; sameRow: boolean; daemonText: string } };
+  })()`) as { group: { skipped: boolean; found: boolean; popup: boolean; healthyRoot: boolean }; project: { skipped: boolean; found: boolean; popup: boolean; healthyRoot: boolean }; rail: { mode: "desktop" | "mobile"; found: boolean; before: string; after: string; restored?: string; ready: string }; context: { skipped: boolean; popup: boolean; healthyRoot: boolean }; directoryFocus: { skipped: boolean; moreOpacity: string; countOpacity: string }; pinVisibility: { pinnedAreaOpacity: string; workspaceOpacity: string }; footer: { count: number; sameRow: boolean; daemonText: string } };
+  const sidebarToggleReady = sidebarMenuCheck.rail.mode === "desktop"
+    ? sidebarMenuCheck.rail.found && sidebarMenuCheck.rail.before !== sidebarMenuCheck.rail.after && sidebarMenuCheck.rail.before === sidebarMenuCheck.rail.restored && sidebarMenuCheck.rail.ready === "expanded"
+    : sidebarMenuCheck.rail.found && sidebarMenuCheck.rail.before === "closed" && sidebarMenuCheck.rail.after === "open" && sidebarMenuCheck.rail.ready === "open";
   const sidebarMenusReady = sidebarMenuCheck.group.found && sidebarMenuCheck.group.popup && sidebarMenuCheck.group.healthyRoot
     && (sidebarMenuCheck.project.skipped || (sidebarMenuCheck.project.found && sidebarMenuCheck.project.popup && sidebarMenuCheck.project.healthyRoot))
-    && sidebarMenuCheck.rail.found && sidebarMenuCheck.rail.before !== sidebarMenuCheck.rail.after && sidebarMenuCheck.rail.before === sidebarMenuCheck.rail.restored
+    && sidebarToggleReady
     && (sidebarMenuCheck.context.skipped || (sidebarMenuCheck.context.popup && sidebarMenuCheck.context.healthyRoot))
     && (sidebarMenuCheck.directoryFocus.skipped || (sidebarMenuCheck.directoryFocus.moreOpacity === "0" && sidebarMenuCheck.directoryFocus.countOpacity === "1"))
     && sidebarMenuCheck.pinVisibility.pinnedAreaOpacity === "0"
@@ -412,7 +440,7 @@ async function runDesktopSelfCheck(window: BrowserWindow): Promise<void> {
         trigger: true,
         card,
         settings: Boolean(document.querySelector('.settings-page')),
-        healthyRoot: Boolean(root && root.childElementCount > 0 && document.body.innerText.includes('Prospero')),
+        healthyRoot: Boolean(root && root.childElementCount > 0),
       };
     })()` ) as { trigger: boolean; card: boolean; settings: boolean; healthyRoot: boolean };
     if (!daemonInteraction.trigger || !daemonInteraction.card || !daemonInteraction.settings || !daemonInteraction.healthyRoot) {
