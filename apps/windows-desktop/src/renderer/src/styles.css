@@ -1453,3 +1453,28 @@ kbd {
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
 }
+
+/* ---------------------------------------------------------------- 依赖图
+   分层 DAG:边走 SVG,节点是绝对定位的按钮。两者共用同一个被 transform 的
+   画布层,所以缩放/平移只作用一次,节点和连线不会错位。 */
+.run-graph { display: flex; flex-direction: column; height: 100%; min-height: 320px; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+.run-graph-viewport { position: relative; flex: 1; overflow: hidden; background: color-mix(in oklab, var(--muted) 45%, transparent); cursor: grab; touch-action: none; }
+.run-graph-viewport:active { cursor: grabbing; }
+.run-graph-canvas { position: absolute; top: 0; left: 0; transform-origin: 0 0; }
+.run-graph-edges { position: absolute; top: 0; left: 0; overflow: visible; pointer-events: none; }
+.run-graph-edge { fill: none; stroke: currentColor; stroke-width: 1.6; color: color-mix(in oklab, var(--muted-foreground) 55%, transparent); }
+.run-graph-edge.satisfied { color: color-mix(in oklab, var(--chart-2, #22c55e) 70%, transparent); }
+.run-graph-edge.touched { color: var(--primary); stroke-width: 2.4; }
+.run-graph-node { position: absolute; display: flex; flex-direction: column; justify-content: space-between; gap: 4px; padding: 9px; text-align: left; background: var(--card); color: var(--card-foreground); border: 1px solid var(--border); border-radius: 10px; cursor: pointer; transition: border-color .12s, box-shadow .12s; }
+.run-graph-node:hover { border-color: color-mix(in oklab, var(--primary) 45%, var(--border)); }
+.run-graph-node.ready { border-color: color-mix(in oklab, var(--primary) 65%, var(--border)); border-width: 1.6px; }
+.run-graph-node.selected { border-color: var(--primary); border-width: 2px; background: color-mix(in oklab, var(--primary) 12%, var(--card)); }
+.run-graph-node strong { font-size: 12px; font-weight: 600; line-height: 1.25; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.run-graph-node-meta { display: flex; align-items: center; gap: 5px; font-size: 10px; color: var(--muted-foreground); }
+.run-graph-node-meta em { margin-left: auto; font-style: normal; font-family: var(--font-mono, monospace); opacity: .7; }
+.run-graph-worker { color: var(--chart-2, #22c55e); }
+.run-graph-controls { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 5px 10px; font-size: 10px; color: var(--muted-foreground); background: color-mix(in oklab, var(--muted) 60%, transparent); border-top: 1px solid var(--border); }
+.run-graph-zoom { display: flex; align-items: center; gap: 2px; }
+.run-graph-zoom button { display: inline-flex; align-items: center; justify-content: center; min-width: 26px; height: 20px; padding: 0 5px; font-size: 10px; font-variant-numeric: tabular-nums; color: inherit; background: transparent; border: 0; border-radius: 5px; cursor: pointer; }
+.run-graph-zoom button:hover:not(:disabled) { background: var(--accent); color: var(--accent-foreground); }
+.run-graph-zoom button:disabled { opacity: .4; cursor: default; }
