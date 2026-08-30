@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -254,6 +254,49 @@ describe("Code Agent 账号隔离", () => {
     );
     expect(calls.some((call) => call.env["CODEX_HOME"] === codex.environment["CODEX_HOME"])).toBe(true);
     expect(calls.some((call) => call.env["CLAUDE_CONFIG_DIR"] === claude.environment["CLAUDE_CONFIG_DIR"])).toBe(true);
+  });
+
+  it("原生 Codex 刷新登录副本，额度查询使用独立 SQLite runtime", () => {
+    const home = tempHome();
+    const sharedCodexHome = tempHome();
+    const sharedAuth = path.join(sharedCodexHome, "auth.json");
+    const previousCodexHome = process.env["CODEX_HOME"];
+    process.env["CODEX_HOME"] = sharedCodexHome;
+    try {
+      writeFileSync(sharedAuth, JSON.stringify({
+        auth_mode: "chatgpt",
+        last_refresh: "2026-08-20T10:00:00.000Z",
+        tokens: { account_id: "first" },
+      }));
+      const manager = new AgentAccountManager(home, signedInRunner([]));
+      const first = manager.resolve("native-codex", "codex");
+      const isolatedAuth = path.join(first.environment["CODEX_HOME"]!, "auth.json");
+      expect(JSON.parse(readFileSync(isolatedAuth, "utf8"))).toMatchObject({
+        tokens: { account_id: "first" },
+      });
+
+      writeFileSync(sharedAuth, JSON.stringify({
+        auth_mode: "chatgpt",
+        last_refresh: "2026-08-21T10:00:00.000Z",
+        tokens: { account_id: "refreshed" },
+      }));
+      const refreshed = manager.resolve("native-codex", "codex");
+      expect(JSON.parse(readFileSync(isolatedAuth, "utf8"))).toMatchObject({
+        tokens: { account_id: "refreshed" },
+      });
+
+      const usageEnvironment = manager.usageEnvironment(refreshed);
+      expect(usageEnvironment["CODEX_HOME"]).toBe(sharedCodexHome);
+      expect(usageEnvironment["CODEX_SQLITE_HOME"]).toBe(
+        path.join(home, "agent-accounts", "codex-usage", "native-codex"),
+      );
+      expect(usageEnvironment["CODEX_SQLITE_HOME"]).not.toBe(
+        refreshed.environment["CODEX_SQLITE_HOME"],
+      );
+    } finally {
+      if (previousCodexHome === undefined) delete process.env["CODEX_HOME"];
+      else process.env["CODEX_HOME"] = previousCodexHome;
+    }
   });
 
   it("两个账号能在同一个项目 cwd 工作，但适配器环境彼此隔离", async () => {

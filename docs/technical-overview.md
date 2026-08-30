@@ -22,7 +22,7 @@ Prospero 把 iPhone / Android 变成 Mac / Windows 上**所有 Coding Agent 的�
   | daemon | `apps/daemon` | Node 22 + TS | 电脑上的常驻服务：会话、适配器、编排、WS/控制面 |
   | mobile | `apps/mobile` | React Native 0.86 + Expo SDK 57 | 手机客户端：会话/审批/终端/文件/Git/编排 |
   | shell | `apps/shell` | SwiftUI（macOS 14+） | 菜单栏/窗口壳：TCC 归属、Bonjour、QR、daemon 生命周期 |
-  | windows-shell | `apps/windows-shell` | WPF（Windows 11 / .NET Framework 4.8） | 托盘/Dashboard、浅色/深色主题、QR、daemon 生命周期、登录自启动 |
+  | windows-desktop | `apps/windows-desktop` | Electron + React + shadcn/ui（Windows 11） | Agent 工作台、项目/会话、终端、编排、Skills、托盘与 daemon 生命周期 |
   | protocol | `packages/protocol` | TS + zod + tweetnacl | 共享协议：消息 schema、E2E 握手、QR、ring buffer |
   | relay | `apps/relay` | Node 22 + MySQL 8.4 + Redis 7.4 + Caddy | 可自托管的 relay v1 控制面与透明数据面 |
   | tools | `tools/` | 脚本 | `fix-node-pty-darwin-helper.mjs`（postinstall 修补） |
@@ -523,17 +523,17 @@ SwiftPM 可执行目标 `ProsperoShell`（macOS 14+，Swift 6）。**存在的�
 - `scripts/build-app.sh`：`swift build -c release` → 组装 `.app`（Info.plist 写 bundle id 与 Bonjour/本地网络描述）→
   codesign（稳定身份优先，否则 `ALLOW_ADHOC_SIGNING=1`）。
 
-## 10.1 Windows 壳（`apps/windows-shell`）
+## 10.1 Windows 桌面端（`apps/windows-desktop`）
 
-Windows 11 原生 WPF 桌面端复用 daemon 的 `status.json`、`devices.json`、`orchestration.json` 和带 control token 的
-loopback API，不复制会话、账号或编排的业务实现。它包含系统托盘，以及概览、项目与会话、账号、编排、设备、日志和设置页面；
-本机会话窗口可继续结构化聊天或 PTY 输入，并处理权限请求和 Agent 提问。
+Windows 11 桌面端使用 Electron、React 和 shadcn/ui 构建，复用 daemon 的本机 loopback API，不复制会话、账号或编排的
+业务实现。它提供项目与会话、结构化 Chat、xterm 终端、Agent 编排模板、Skills、账号、设备、日志和设置页面，并支持中英文、
+浅色/深色/跟随系统主题、托盘和当前用户登录自启动。
 
-- `ProsperoController`：定位 Node/CLI，启动、停止和重启 daemon，读取持久化状态，并执行会话、账号、Gate 和设备控制操作；
-- `ProsperoApplication`：WPF 应用、系统主题监听和后台托盘生命周期；关闭 Dashboard 只隐藏，选择“退出”才停止桌面端管理的 daemon；
-- `StartupManager`：仅写入当前用户 `HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run`，支持 UI/托盘即时开关登录自启动；
-- `build.ps1`：使用 Visual Studio Roslyn 或 .NET Framework 编译器生成 `bin/Release/ProsperoShell.exe`；
-- `--self-check` / `--smoke-test`：分别检查运行环境与无副作用构造全部 UI 页面。
+- Electron main 负责 daemon 生命周期、持久化设置、系统托盘和白名单 IPC；control token 不暴露给 renderer；
+- renderer 启用 Chromium sandbox 与 context isolation，关闭 Node integration、任意导航和页面网络；
+- `scripts/prepare-runtime.ps1` 将 Node.js、daemon、协议包和生产依赖组装为自包含 runtime；
+- `scripts/package.ps1` 生成 x64 或 arm64 的 NSIS 安装器与便携 ZIP；
+- `--smoke-test` 使用打包后的客户端验证 UI 启动及内置 daemon 生命周期。
 
 ---
 
@@ -562,9 +562,9 @@ npm run android -w @prospero/mobile              # Android
 # macOS 壳
 apps/shell/scripts/build-app.sh
 
-# Windows 11 原生桌面壳
-npm run build:windows-shell
-apps/windows-shell/bin/Release/ProsperoShell.exe --smoke-test
+# Windows 11 Electron 桌面端
+npm run build:windows
+npm run package:windows -- -Architecture x64
 
 # 类型检查 / 测试
 npm run typecheck

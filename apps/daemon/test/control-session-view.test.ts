@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -50,6 +50,30 @@ class ControlViewAdapter implements AgentAdapter {
   }
 
   async respondPermission(): Promise<void> {}
+  async usage() {
+    return { inputTokens: 12, outputTokens: 7, windows: [{ label: "5 小时", utilization: 25 }] };
+  }
+  async listModels() {
+    return {
+      models: [
+        { id: "gpt-alpha", label: "GPT Alpha", supportedEfforts: ["low", "high"], defaultEffort: "high", isDefault: true },
+        { id: "gpt-beta", label: "GPT Beta", supportedEfforts: ["medium"] },
+      ],
+      currentModel: "gpt-alpha",
+      currentEffort: "high",
+    };
+  }
+  async setModel(model: string, effort?: string) {
+    if (!model.startsWith("gpt-")) throw new Error("invalid model");
+    return { currentModel: model, ...(effort ? { currentEffort: effort } : {}) };
+  }
+  async listModes() {
+    return { modes: [{ id: "default", label: "执行" }, { id: "plan", label: "Plan" }], currentMode: "default" };
+  }
+  async setMode(mode: string) {
+    if (mode !== "default" && mode !== "plan") throw new Error("invalid mode");
+    return { currentMode: mode };
+  }
   async interrupt(): Promise<void> {}
   async dispose(): Promise<void> {
     this.context = null;
@@ -97,13 +121,49 @@ describe("Mac control session views", () => {
         expect(response.status).toBe(204);
       };
 
+      // Skill 补全扫的是文件系统:项目目录逐级向上,再加上用户家目录下的
+      // ~/.claude/skills 之类。home 是空的临时目录,所以断言"有建议"实际断言的是
+      // 【跑测试这台机器的家目录里恰好装了 Skill】—— 作者机器上过,CI 上必挂。
+      // 在会话 cwd 里放一个项目级 Skill,补全结果才由用例自己决定。
+      const skillDir = path.join(home, ".claude", "skills", "control-view-probe");
+      mkdirSync(skillDir, { recursive: true });
+      writeFileSync(
+        path.join(skillDir, "SKILL.md"),
+        "---\nname: control-view-probe\ndescription: 控制面板补全用例的固定 Skill\n---\n",
+      );
+
       const structured = await create({ agent: "codex", kind: "structured", cwd: home });
       const viewPath = `/_prospero/control/session/${structured.id}/view`;
       const toolPath = `/_prospero/control/session/${structured.id}/tool-output`;
+      const usagePath = `/_prospero/control/usage?sid=${structured.id}`;
+      const modesPath = `/_prospero/control/session/${structured.id}/modes`;
+      const modelsPath = `/_prospero/control/session/${structured.id}/models`;
+      const suggestionsPath = `/_prospero/control/session/${structured.id}/suggestions?kind=skill&query=`;
 
       // Control-token authorization applies to the newly added read endpoints.
       expect((await fetch(`${base}${viewPath}`)).status).toBe(401);
       expect((await fetch(`${base}${toolPath}?callId=tool-alpha`)).status).toBe(401);
+      expect((await fetch(`${base}${usagePath}`)).status).toBe(401);
+      expect((await fetch(`${base}/_prospero/control/launch/models?agent=codex`)).status).toBe(401);
+
+      const usage = await request(usagePath);
+      expect(usage.status).toBe(200);
+      expect(await usage.json()).toMatchObject({ available: true, inputTokens: 12, outputTokens: 7, windows: [{ label: "5 小时", utilization: 25 }] });
+      const modes = await request(modesPath);
+      expect(await modes.json()).toMatchObject({ currentMode: "default", modes: [{ id: "default" }, { id: "plan" }] });
+      const setPlan = await request(modesPath, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ mode: "plan" }) });
+      expect(await setPlan.json()).toEqual({ currentMode: "plan" });
+      const launchModels = await request("/_prospero/control/launch/models?agent=codex");
+      expect(await launchModels.json()).toMatchObject({ currentModel: "gpt-alpha", models: [{ id: "gpt-alpha" }, { id: "gpt-beta" }] });
+      const models = await request(modelsPath);
+      expect(await models.json()).toMatchObject({ currentModel: "gpt-alpha", currentEffort: "high" });
+      const setModel = await request(modelsPath, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "gpt-beta", effort: "medium" }) });
+      expect(await setModel.json()).toEqual({ currentModel: "gpt-beta", currentEffort: "medium" });
+      const suggestions = await request(suggestionsPath);
+      expect(suggestions.status).toBe(200);
+      const suggestionBody = await suggestions.json() as { items: Array<{ kind: string; value: string }> };
+      // 项目级 Skill 优先级高于用户级,所以哪怕开发机上另有一堆 Skill,它也排在最前。
+      expect(suggestionBody.items[0]).toMatchObject({ kind: "skill", value: "control-view-probe" });
 
       const initial = await request(viewPath);
       expect(initial.status).toBe(200);
