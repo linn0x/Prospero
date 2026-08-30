@@ -31,7 +31,14 @@ type CachedJsonFile = {
   signature: string;
   digest: string | undefined;
   value: JsonObject;
+  sameSignatureRechecks: number;
 };
+
+// Some Windows filesystems can report the same size and timestamp for two
+// same-length writes that happen in one clock tick. Recheck each newly
+// observed signature once before trusting metadata alone; stable files still
+// avoid reads and hashing on every one-second snapshot poll.
+const SAME_SIGNATURE_RECHECKS = 1;
 
 type SnapshotInputs = {
   config: JsonObject;
@@ -561,7 +568,8 @@ export class StateStore extends EventEmitter {
   private readExternalJson(path: string): JsonObject {
     const signatureBeforeRead = fileSignature(path);
     const cached = this.jsonFiles.get(path);
-    if (cached?.signature === signatureBeforeRead) return cached.value;
+    const signatureMatches = cached?.signature === signatureBeforeRead;
+    if (signatureMatches && cached.sameSignatureRechecks <= 0) return cached.value;
 
     let source: string | undefined;
     try {
@@ -578,7 +586,11 @@ export class StateStore extends EventEmitter {
       : `unstable:${signatureBeforeRead}:${signatureAfterRead}`;
     const digest = source === undefined ? undefined : createHash("sha256").update(source).digest("base64url");
     if (cached && cached.digest === digest) {
+      const signatureChanged = cached.signature !== signature;
       cached.signature = signature;
+      cached.sameSignatureRechecks = signatureChanged
+        ? SAME_SIGNATURE_RECHECKS
+        : Math.max(0, cached.sameSignatureRechecks - 1);
       return cached.value;
     }
 
@@ -591,7 +603,12 @@ export class StateStore extends EventEmitter {
         // expose an empty object until the writer publishes a valid version.
       }
     }
-    this.jsonFiles.set(path, { signature, digest, value });
+    this.jsonFiles.set(path, {
+      signature,
+      digest,
+      value,
+      sameSignatureRechecks: SAME_SIGNATURE_RECHECKS,
+    });
     return value;
   }
 
