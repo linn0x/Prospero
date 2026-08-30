@@ -177,6 +177,8 @@ export type DesktopApi = {
   renameSession(sessionId: string, title: string): Promise<DesktopSnapshot>;
   revealPath(path: string): Promise<{ ok: boolean; error?: string }>;
   openWindowsTerminal(path: string): Promise<{ ok: boolean; error?: string }>;
+  /** 宿主平台。静态值,用来让"在资源管理器中打开"这类字样跟着系统走。 */
+  platform: NodeJS.Platform;
   createSession(input: SessionCreateInput): Promise<SessionInfo>;
   getSessionView(sessionId: string, query?: Record<string, number>): Promise<JsonObject | null>;
   interact(sessionId: string, message: JsonObject): Promise<void>;

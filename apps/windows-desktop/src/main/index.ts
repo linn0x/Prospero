@@ -139,6 +139,9 @@ function createTray(): void {
     : resolve(app.getAppPath(), "..", "shell", "Resources", "AppIcon-1024.png");
   const icon = nativeImage.createFromPath(iconPath).resize({ width: 16, height: 16 });
   if (icon.isEmpty()) return;
+  // macOS 菜单栏图标必须是模板图:系统按明暗自动反色。不标记的话深色菜单栏上
+  // 会挂着一块彩色方块,和其它菜单栏项格格不入。
+  if (process.platform === "darwin") icon.setTemplateImage(true);
   tray = new Tray(icon);
   tray.setToolTip("Prospero · Agent 工作台");
   refreshTrayMenu();
@@ -301,6 +304,15 @@ function installIpc(): void {
   });
   ipcMain.handle("path:terminal", async (_event, path: unknown) => {
     if (typeof path !== "string" || !isAbsolute(path) || !existsSync(path) || !store.isKnownPath(path)) return { ok: false, error: "路径不属于当前工作区" };
+    if (process.platform === "darwin") {
+      // `open -a Terminal <dir>` 走 LaunchServices,不需要知道终端装在哪,
+      // 用户把默认终端换成 iTerm 之类也不影响这条路径。
+      return await new Promise<{ ok: boolean; error?: string }>((complete) => {
+        const child = spawn("/usr/bin/open", ["-a", "Terminal", path], { cwd: path, detached: true, stdio: "ignore" });
+        child.once("error", (error) => complete({ ok: false, error: error.message }));
+        child.once("spawn", () => { child.unref(); complete({ ok: true }); });
+      });
+    }
     const alias = process.env["LOCALAPPDATA"]
       ? resolve(process.env["LOCALAPPDATA"], "Microsoft", "WindowsApps", "wt.exe")
       : undefined;
