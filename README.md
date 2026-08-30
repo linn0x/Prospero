@@ -93,7 +93,7 @@ journal/终态历史，但不会自动重放 native 命令或宣称 in-flight tu
 [Windows N-API native boundary](docs/windows-native-boundary.md)。macOS/Linux 仍分别使用 detached structured supervisor 与可选
 `tmux` PTY 托管。
 
-Windows 桌面端位于 `apps/windows-desktop`。它参考 Orca 的项目—会话—工作台结构，但直接连接现有 Prospero daemon，
+Windows 桌面端位于 `apps/desktop`。它参考 Orca 的项目—会话—工作台结构，但直接连接现有 Prospero daemon，
 不会复制协议或会话实现。Renderer 启用 Chromium sandbox 与 context isolation，关闭 Node integration、任意导航和页面网络；
 control token 只留在 Electron main 的白名单 IPC 内。桌面端与 PowerShell/cmd、macOS 壳和手机客户端共用 `~/.prospero`。
 

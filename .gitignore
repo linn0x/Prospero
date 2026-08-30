@@ -8,8 +8,8 @@ node_modules/
 # TypeScript, test, and generated build outputs
 dist/
 .prospero-runtime/
-apps/windows-desktop/.runtime/
-apps/windows-desktop/out/
+apps/desktop/.runtime/
+apps/desktop/out/
 build/
 coverage/
 .nyc_output/

@@ -93,10 +93,25 @@ for (const target of [
   path.join(runtimeRoot, "node_modules", "node-pty", "prebuilds", "win32-arm64"),
   path.join(runtimeRoot, "node_modules", "node-pty", "third_party"),
   path.join(runtimeRoot, "node_modules", "@prospero", "daemon"),
+  // 自己源码的 npm tarball 只是安装过程的中间产物,没有理由跟着安装包分发。
+  path.join(runtimeRoot, "packs"),
+  path.join(runtimeRoot, "package-lock.json"),
 ]) {
   const resolved = path.resolve(target);
   if (!resolved.startsWith(runtimeRoot)) throw new Error(`拒绝删除 .runtime 之外的路径:${resolved}`);
   rmSync(resolved, { recursive: true, force: true });
+}
+
+// 上面剪掉 node_modules/@prospero/daemon 之后,.bin 里指向它的 shim 就悬空了。
+// Windows 上这些 shim 是 .cmd 文件,删掉目标只是留下一个没用的文件;macOS 上
+// 它们是符号链接,codesign 遇到悬空链接会直接失败(ENOENT),整个签名过不去。
+// 按"目标不存在就清掉"处理,不写死名字。
+const binRoot = path.join(runtimeRoot, "node_modules", ".bin");
+if (existsSync(binRoot)) {
+  for (const entry of readdirSync(binRoot)) {
+    const link = path.join(binRoot, entry);
+    if (!existsSync(link)) rmSync(link, { force: true });
+  }
 }
 
 console.log(`运行时已暂存到 ${runtimeRoot}`);
