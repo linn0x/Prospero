@@ -24,4 +24,4 @@ npm run dev:windows
 npm run package:windows -- -Architecture x64
 ```
 
-产物位于 `dist/windows-desktop`。安装后不要求用户另装 Node.js 或手动启动 daemon。
+产物位于 `dist/desktop`。安装后不要求用户另装 Node.js 或手动启动 daemon。

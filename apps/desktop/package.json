@@ -1,5 +1,5 @@
 {
-  "name": "@prospero/windows-desktop",
+  "name": "@prospero/desktop",
   "version": "0.0.13",
   "private": true,
   "description": "Prospero local agent workspace for Windows",
@@ -66,7 +66,7 @@
       "**/*.node"
     ],
     "directories": {
-      "output": "../../dist/windows-desktop"
+      "output": "../../dist/desktop"
     },
     "files": [
       "out/**/*",

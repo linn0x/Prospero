@@ -12,11 +12,11 @@
     "node": ">=22"
   },
   "scripts": {
-    "dev:windows": "npm run dev -w @prospero/windows-desktop",
-    "build:windows": "npm run build -w @prospero/daemon && npm run build -w @prospero/windows-desktop",
-    "package:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File apps/windows-desktop/scripts/package.ps1",
+    "dev:desktop": "npm run dev -w @prospero/desktop",
+    "build:desktop": "npm run build -w @prospero/daemon && npm run build -w @prospero/desktop",
+    "package:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File apps/desktop/scripts/package.ps1",
     "postinstall": "patch-package && node tools/fix-node-pty-darwin-helper.mjs",
-    "typecheck": "tsc --build --force packages/protocol packages/windows-native apps/daemon apps/relay apps/mobile && npm run typecheck -w @prospero/windows-desktop",
+    "typecheck": "tsc --build --force packages/protocol packages/windows-native apps/daemon apps/relay apps/mobile && npm run typecheck -w @prospero/desktop",
     "test": "npm run test --workspaces --if-present"
   },
   "devDependencies": {
