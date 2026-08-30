@@ -263,6 +263,13 @@ async function runDesktopSelfCheck(window: BrowserWindow): Promise<void> {
     };
     const sidebar = document.querySelector('[data-slot="sidebar"][data-state]');
     const rail = document.querySelector('[data-testid="sidebar-rail"]');
+    // Hosted Windows runners expose a narrow virtual display, so the
+    // responsive shell correctly starts in icon mode. Expand it explicitly
+    // before exercising controls that are intentionally hidden in that mode.
+    if (sidebar?.getAttribute('data-state') === 'collapsed' && rail) {
+      rail.click();
+      await new Promise((done) => setTimeout(done, 240));
+    }
     const beforeRail = sidebar?.getAttribute('data-state');
     rail?.click();
     await new Promise((done) => setTimeout(done, 240));
@@ -816,7 +823,9 @@ void app.whenReady().then(async () => {
   }
   await runDesktopSelfCheck(mainWindow);
 }).catch((error: unknown) => {
-  process.stderr.write(`Prospero desktop startup failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
+  const detail = error instanceof Error ? error.stack ?? error.message : String(error);
+  try { store.appendLog(`[desktop] startup failed: ${detail}\n`); } catch { /* Preserve the original startup failure. */ }
+  process.stderr.write(`Prospero desktop startup failed: ${detail}\n`);
   quitting = true;
   app.exit(1);
 });
