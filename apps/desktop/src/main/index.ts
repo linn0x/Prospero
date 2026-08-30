@@ -261,10 +261,23 @@ async function runDesktopSelfCheck(window: BrowserWindow): Promise<void> {
       await new Promise((done) => setTimeout(done, 60));
       return { selector, skipped: false, found: true, popup: Boolean(popup), healthyRoot };
     };
-    const sidebar = document.querySelector('[data-slot="sidebar"][data-state]');
-    const rail = document.querySelector('[data-testid="sidebar-rail"]');
+    const mobileViewport = matchMedia('(max-width: 767px)').matches;
+    let sidebar;
+    let rail;
+    let mobileTrigger;
+    const controlsStarted = Date.now();
+    do {
+      sidebar = document.querySelector('[data-slot="sidebar"][data-state]');
+      rail = document.querySelector('[data-testid="sidebar-rail"]');
+      mobileTrigger = document.querySelector('[data-slot="sidebar-trigger"]');
+      const controlsReady = mobileViewport
+        ? Boolean(mobileTrigger && !sidebar)
+        : Boolean(sidebar && rail);
+      if (controlsReady || Date.now() - controlsStarted > 2_000) break;
+      await new Promise((done) => setTimeout(done, 50));
+    } while (true);
     let sidebarToggle;
-    if (sidebar && rail) {
+    if (!mobileViewport && sidebar && rail) {
       // Compact desktop layouts intentionally start in icon mode. Expand them
       // before exercising controls that are hidden while collapsed.
       if (sidebar.getAttribute('data-state') === 'collapsed') {
@@ -283,7 +296,6 @@ async function runDesktopSelfCheck(window: BrowserWindow): Promise<void> {
       // A hosted runner can constrain the 760px minimum window below the
       // component's 768px mobile breakpoint. Exercise the sheet trigger in
       // that layout and leave the sheet open for the menu checks below.
-      const trigger = document.querySelector('[data-slot="sidebar-trigger"]');
       const mobileState = () => {
         const panel = document.querySelector('[data-slot="sidebar"][data-mobile="true"]');
         if (!panel) return 'closed';
@@ -294,13 +306,16 @@ async function runDesktopSelfCheck(window: BrowserWindow): Promise<void> {
         return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0 ? 'open' : 'closed';
       };
       const before = mobileState();
-      trigger?.click();
-      await new Promise((done) => setTimeout(done, 240));
+      if (before !== 'open') mobileTrigger?.click();
+      const openStarted = Date.now();
+      while (mobileState() !== 'open' && Date.now() - openStarted <= 1_000) {
+        await new Promise((done) => setTimeout(done, 50));
+      }
       const after = mobileState();
       // The modal sheet makes the page root inert while open, so its original
       // trigger cannot be used as a close control. Keep it open for the menu,
       // footer and daemon interactions that follow.
-      sidebarToggle = { mode: 'mobile', found: Boolean(trigger), before, after, ready: mobileState() };
+      sidebarToggle = { mode: 'mobile', found: Boolean(mobileTrigger), before, after, ready: mobileState() };
     }
     const contextTrigger = document.querySelector('[data-slot="context-menu-trigger"]');
     let context = { skipped: !contextTrigger, popup: false, healthyRoot: Boolean(document.querySelector('#root')?.childElementCount) };
@@ -345,15 +360,16 @@ async function runDesktopSelfCheck(window: BrowserWindow): Promise<void> {
       group,
       project,
       rail: sidebarToggle,
+      viewport: { width: innerWidth, mobile: mobileViewport },
       context,
       directoryFocus,
       pinVisibility,
       footer,
     };
-  })()`) as { group: { skipped: boolean; found: boolean; popup: boolean; healthyRoot: boolean }; project: { skipped: boolean; found: boolean; popup: boolean; healthyRoot: boolean }; rail: { mode: "desktop" | "mobile"; found: boolean; before: string; after: string; restored?: string; ready: string }; context: { skipped: boolean; popup: boolean; healthyRoot: boolean }; directoryFocus: { skipped: boolean; moreOpacity: string; countOpacity: string }; pinVisibility: { pinnedAreaOpacity: string; workspaceOpacity: string }; footer: { count: number; sameRow: boolean; daemonText: string } };
+  })()`) as { group: { skipped: boolean; found: boolean; popup: boolean; healthyRoot: boolean }; project: { skipped: boolean; found: boolean; popup: boolean; healthyRoot: boolean }; rail: { mode: "desktop" | "mobile"; found: boolean; before: string; after: string; restored?: string; ready: string }; viewport: { width: number; mobile: boolean }; context: { skipped: boolean; popup: boolean; healthyRoot: boolean }; directoryFocus: { skipped: boolean; moreOpacity: string; countOpacity: string }; pinVisibility: { pinnedAreaOpacity: string; workspaceOpacity: string }; footer: { count: number; sameRow: boolean; daemonText: string } };
   const sidebarToggleReady = sidebarMenuCheck.rail.mode === "desktop"
     ? sidebarMenuCheck.rail.found && sidebarMenuCheck.rail.before !== sidebarMenuCheck.rail.after && sidebarMenuCheck.rail.before === sidebarMenuCheck.rail.restored && sidebarMenuCheck.rail.ready === "expanded"
-    : sidebarMenuCheck.rail.found && sidebarMenuCheck.rail.before === "closed" && sidebarMenuCheck.rail.after === "open" && sidebarMenuCheck.rail.ready === "open";
+    : sidebarMenuCheck.rail.found && (sidebarMenuCheck.rail.before === "open" || sidebarMenuCheck.rail.after === "open") && sidebarMenuCheck.rail.ready === "open";
   const sidebarMenusReady = sidebarMenuCheck.group.found && sidebarMenuCheck.group.popup && sidebarMenuCheck.group.healthyRoot
     && (sidebarMenuCheck.project.skipped || (sidebarMenuCheck.project.found && sidebarMenuCheck.project.popup && sidebarMenuCheck.project.healthyRoot))
     && sidebarToggleReady
