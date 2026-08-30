@@ -17,15 +17,38 @@ function findRepositoryRoot(start: string): string | undefined {
   return undefined;
 }
 
+function quoteWindowsArgument(value: string): string {
+  let result = '"';
+  let backslashes = 0;
+  for (const character of value) {
+    if (character === "\\") {
+      backslashes += 1;
+      continue;
+    }
+    if (character === '"') {
+      result += `${"\\".repeat(backslashes * 2 + 1)}"`;
+    } else {
+      result += `${"\\".repeat(backslashes)}${character}`;
+    }
+    backslashes = 0;
+  }
+  return `${result}${"\\".repeat(backslashes * 2)}"`;
+}
+
+function quotePowerShellLiteral(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`;
+}
+
 export class DaemonRuntime {
   private child: ChildProcessWithoutNullStreams | undefined;
+  private elevatedManaged = false;
   private stopping = false;
   private restarting = false;
 
   constructor(private readonly store: StateStore) {}
 
   get managed(): boolean {
-    return Boolean(this.child && !this.child.killed && this.child.exitCode === null);
+    return Boolean(this.child && !this.child.killed && this.child.exitCode === null) || (this.elevatedManaged && this.store.snapshot().daemon.managed);
   }
 
   async start(): Promise<{ ok: boolean; error?: string }> {
@@ -33,8 +56,6 @@ export class DaemonRuntime {
     this.store.setStartupProgress(6, "检查 daemon 运行环境");
     const runtime = this.locateRuntime();
     if (!runtime) {
-      // 开发模式下有两种失败原因,别都说成"没构建 daemon":GUI 进程的 PATH 里
-      // 常常根本没有 node,那是完全不同的一件事,提示错了会让人白查半天。
       const error = app.isPackaged
         ? "安装包缺少 daemon 运行时，请重新安装 Prospero"
         : resolveNodeExecutable()
@@ -47,54 +68,69 @@ export class DaemonRuntime {
     this.stopping = false;
     this.store.setStartupProgress(18, "准备本地控制服务");
     const snapshot = this.store.snapshot();
-    const args = [runtime.cli, "start", "--port", String(snapshot.daemon.port)];
-    const runtimePath = loginPath(runtime.node);
-    // 用户在设置里挑的网卡优先;没挑过就沿用 daemon 自己配置里的值。
+    const fullAccess = process.platform === "win32" && snapshot.settings.fullAccessPermission;
+    const args = [runtime.cli, "start", "--home", this.store.home, "--port", String(snapshot.daemon.port)];
     const bind = snapshot.settings.daemonBind !== "0.0.0.0" ? snapshot.settings.daemonBind : snapshot.daemon.bind;
     if (bind && bind !== "0.0.0.0") args.push("--bind", bind);
-    const child = spawn(runtime.node, args, {
-      cwd: runtime.cwd,
-      env: {
-        ...process.env,
-        PROSPERO_HOME: this.store.home,
-        // daemon 要靠这份 PATH 去找 claude/codex/opencode 等 CLI。GUI 进程继承到的
-        // 是极简 PATH,不补这一步,Mac 上所有 Agent 都会"找不到可执行文件"。
-        ...(runtimePath ? { PATH: runtimePath } : {}),
-      },
-      windowsHide: true,
-      stdio: "pipe",
-    });
-    this.child = child;
-    this.store.setStartupProgress(32, "daemon 进程已启动", child.pid);
+    if (fullAccess) args.push("--full-access");
+    let launchedPid: number | undefined;
     let launchPending = true;
     let launchError: string | undefined;
     const reportUnexpectedTermination = (): void => {
       if (launchPending || this.restarting || this.stopping || this.store.snapshot().daemon.running) return;
       this.store.setManagedState(undefined, false, launchError);
     };
-    child.stdout.on("data", (chunk: Buffer) => this.store.appendLog(chunk.toString("utf8")));
-    child.stderr.on("data", (chunk: Buffer) => this.store.appendLog(chunk.toString("utf8")));
-    child.once("error", (error) => {
-      if (this.child === child) this.child = undefined;
-      launchError = error.message;
-      reportUnexpectedTermination();
-    });
-    child.once("exit", (code) => {
-      if (this.child === child) this.child = undefined;
-      if (!this.restarting && !this.stopping && code !== 0) launchError = `daemon 已退出（${String(code)}）`;
-      reportUnexpectedTermination();
-    });
+    if (fullAccess) {
+      try {
+        this.store.setStartupProgress(24, "等待 Windows 管理员授权");
+        const elevatedPid = await this.launchElevated(runtime, args);
+        launchedPid = elevatedPid;
+        this.elevatedManaged = true;
+        this.store.setStartupProgress(32, "管理员 daemon 进程已启动", elevatedPid);
+      } catch (reason) {
+        const error = reason instanceof Error ? reason.message : String(reason);
+        this.elevatedManaged = false;
+        this.store.setManagedState(undefined, false, error);
+        return { ok: false, error };
+      }
+    } else {
+      const child = spawn(runtime.node, args, {
+        cwd: runtime.cwd,
+        env: {
+          ...process.env,
+          PROSPERO_HOME: this.store.home,
+          ...(loginPath(runtime.node) ? { PATH: loginPath(runtime.node) as string } : {}),
+        },
+        windowsHide: true,
+        stdio: "pipe",
+      });
+      this.child = child;
+      launchedPid = child.pid;
+      this.store.setStartupProgress(32, "daemon 进程已启动", child.pid);
+      child.stdout.on("data", (chunk: Buffer) => this.store.appendLog(chunk.toString("utf8")));
+      child.stderr.on("data", (chunk: Buffer) => this.store.appendLog(chunk.toString("utf8")));
+      child.once("error", (error) => {
+        if (this.child === child) this.child = undefined;
+        launchError = error.message;
+        reportUnexpectedTermination();
+      });
+      child.once("exit", (code) => {
+        if (this.child === child) this.child = undefined;
+        if (!this.restarting && !this.stopping && code !== 0) launchError = `daemon 已退出（${String(code)}）`;
+        reportUnexpectedTermination();
+      });
+    }
 
     const ready = await this.waitUntilReady(30_000, (progress, stage) => {
-      this.store.setStartupProgress(progress, stage, child.pid);
+      this.store.setStartupProgress(progress, stage, launchedPid);
     });
     launchPending = false;
     if (!ready) {
       const error = launchError ?? "daemon 启动超时，请查看日志";
-      this.store.setManagedState(child.exitCode === null ? child.pid : undefined, false, error);
+      this.store.setManagedState(this.child?.exitCode === null ? this.child.pid : undefined, false, error);
       return { ok: false, error };
     }
-    const daemonPid = this.store.snapshot().daemon.pid ?? (child.exitCode === null ? child.pid : undefined);
+    const daemonPid = this.store.snapshot().daemon.pid ?? launchedPid;
     this.store.setStartupProgress(100, "daemon 已就绪", daemonPid);
     await new Promise((resolveWait) => setTimeout(resolveWait, 180));
     this.store.setManagedState(daemonPid, false);
@@ -102,6 +138,21 @@ export class DaemonRuntime {
   }
 
   async stop(): Promise<{ ok: boolean; error?: string }> {
+    if (this.elevatedManaged && this.store.snapshot().daemon.running) {
+      this.stopping = true;
+      try {
+        await this.request("/_prospero/control/shutdown", { method: "POST" });
+        const stopped = await this.waitUntilStopped(8_000);
+        if (!stopped) return { ok: false, error: "管理员 daemon 停止超时" };
+        this.elevatedManaged = false;
+        this.store.setManagedState(undefined, this.restarting);
+        return { ok: true };
+      } catch (reason) {
+        return { ok: false, error: reason instanceof Error ? reason.message : String(reason) };
+      } finally {
+        this.stopping = false;
+      }
+    }
     if (!this.managed || !this.child) {
       if (this.store.snapshot().daemon.running) return { ok: false, error: "daemon 由外部进程管理，桌面端不会强制结束它" };
       return { ok: true };
@@ -203,18 +254,66 @@ export class DaemonRuntime {
     return false;
   }
 
-  /** 自检用:只回报定位到的 daemon 入口,不启动任何东西。 */
+  private async waitUntilStopped(timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (!this.store.snapshot().daemon.running) return true;
+      await new Promise((resolveWait) => setTimeout(resolveWait, 120));
+    }
+    return !this.store.snapshot().daemon.running;
+  }
+
+  /** Self-check helper that reports the selected daemon entry without starting it. */
   describeRuntime(): string | undefined {
     return this.locateRuntime()?.cli;
+  }
+
+  private async launchElevated(
+    runtime: { node: string; cli: string; cwd: string },
+    args: string[],
+  ): Promise<number> {
+    const powershell = resolve(process.env["SystemRoot"] || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+    const argumentLine = args.map(quoteWindowsArgument).join(" ");
+    const script = `$ErrorActionPreference='Stop'; $process = Start-Process -FilePath ${quotePowerShellLiteral(runtime.node)} -ArgumentList ${quotePowerShellLiteral(argumentLine)} -WorkingDirectory ${quotePowerShellLiteral(runtime.cwd)} -Verb RunAs -WindowStyle Hidden -PassThru; [Console]::Out.Write($process.Id)`;
+    const encodedCommand = Buffer.from(script, "utf16le").toString("base64");
+    return new Promise((complete, reject) => {
+      const launcher = spawn(powershell, ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encodedCommand], {
+        cwd: runtime.cwd,
+        windowsHide: true,
+        stdio: "pipe",
+      });
+      let output = "";
+      let errorOutput = "";
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        launcher.kill();
+        reject(new Error("等待 Windows 管理员授权超时"));
+      }, 120_000);
+      launcher.stdout.on("data", (chunk: Buffer) => { output += chunk.toString("utf8"); });
+      launcher.stderr.on("data", (chunk: Buffer) => { errorOutput += chunk.toString("utf8"); });
+      launcher.once("error", (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      });
+      launcher.once("exit", (code) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        const pid = Number.parseInt(output.trim(), 10);
+        if (code === 0 && Number.isInteger(pid) && pid > 0) complete(pid);
+        else reject(new Error(errorOutput.trim() || "Windows 管理员授权已取消"));
+      });
+    });
   }
 
   private locateRuntime(): { node: string; cli: string; cwd: string } | undefined {
     if (app.isPackaged) {
       const runtime = resolve(process.resourcesPath, "runtime");
       const node = resolve(runtime, "node", process.platform === "win32" ? "node.exe" : "node");
-      // node_modules 里的那份优先。macOS 上 daemon 必须从这里启动,否则它为
-      // 结构化 supervisor 构建运行时镜像时,依赖会落在信任边界之外而拒绝启动。
-      // runtime/daemon 是 Windows 打包脚本的布局,留作兜底。
       const candidates = [
         resolve(runtime, "node_modules", "@prospero", "daemon", "dist", "cli.js"),
         resolve(runtime, "daemon", "dist", "cli.js"),
@@ -225,7 +324,6 @@ export class DaemonRuntime {
     const root = findRepositoryRoot(app.getAppPath()) ?? findRepositoryRoot(process.cwd());
     if (!root) return undefined;
     const cli = resolve(root, "apps", "daemon", "dist", "cli.js");
-    // 从 Dock/Finder 启动时 PATH 里没有 mise/nvm 装的 node,"node" 这个名字解析不出来。
     const node = resolveNodeExecutable();
     if (!node) return undefined;
     return { node, cli, cwd: root };
