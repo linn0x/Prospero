@@ -2,6 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { app } from "electron";
+import { loginPath, resolveNodeExecutable } from "./host-environment.js";
 import type { JsonObject } from "../shared/types";
 import { StateStore } from "./state-store";
 
@@ -32,9 +33,13 @@ export class DaemonRuntime {
     this.store.setStartupProgress(6, "检查 daemon 运行环境");
     const runtime = this.locateRuntime();
     if (!runtime) {
+      // 开发模式下有两种失败原因,别都说成"没构建 daemon":GUI 进程的 PATH 里
+      // 常常根本没有 node,那是完全不同的一件事,提示错了会让人白查半天。
       const error = app.isPackaged
         ? "安装包缺少 daemon 运行时，请重新安装 Prospero"
-        : "请先构建 daemon：npm run build -w @prospero/daemon";
+        : resolveNodeExecutable()
+          ? "请先构建 daemon：npm run build -w @prospero/daemon"
+          : "找不到 node。安装 Node 22+，或用 PROSPERO_NODE 环境变量指定解释器路径。";
       this.store.setManagedState(undefined, false, error);
       return { ok: false, error };
     }
@@ -43,10 +48,17 @@ export class DaemonRuntime {
     this.store.setStartupProgress(18, "准备本地控制服务");
     const snapshot = this.store.snapshot();
     const args = [runtime.cli, "start", "--port", String(snapshot.daemon.port)];
+    const runtimePath = loginPath(runtime.node);
     if (snapshot.daemon.bind && snapshot.daemon.bind !== "0.0.0.0") args.push("--bind", snapshot.daemon.bind);
     const child = spawn(runtime.node, args, {
       cwd: runtime.cwd,
-      env: { ...process.env, PROSPERO_HOME: this.store.home },
+      env: {
+        ...process.env,
+        PROSPERO_HOME: this.store.home,
+        // daemon 要靠这份 PATH 去找 claude/codex/opencode 等 CLI。GUI 进程继承到的
+        // 是极简 PATH,不补这一步,Mac 上所有 Agent 都会"找不到可执行文件"。
+        ...(runtimePath ? { PATH: runtimePath } : {}),
+      },
       windowsHide: true,
       stdio: "pipe",
     });
@@ -126,7 +138,11 @@ export class DaemonRuntime {
     return new Promise((complete) => {
       const child = spawn(runtime.node, [runtime.cli, ...args], {
         cwd: runtime.cwd,
-        env: { ...process.env, PROSPERO_HOME: this.store.home },
+        env: {
+          ...process.env,
+          PROSPERO_HOME: this.store.home,
+          ...(loginPath(runtime.node) ? { PATH: loginPath(runtime.node) as string } : {}),
+        },
         windowsHide: true,
         stdio: "pipe",
       });
@@ -188,13 +204,16 @@ export class DaemonRuntime {
   private locateRuntime(): { node: string; cli: string; cwd: string } | undefined {
     if (app.isPackaged) {
       const runtime = resolve(process.resourcesPath, "runtime");
-      const node = resolve(runtime, "node", "node.exe");
+      const node = resolve(runtime, "node", process.platform === "win32" ? "node.exe" : "node");
       const cli = resolve(runtime, "daemon", "dist", "cli.js");
       return existsSync(node) && existsSync(cli) ? { node, cli, cwd: runtime } : undefined;
     }
     const root = findRepositoryRoot(app.getAppPath()) ?? findRepositoryRoot(process.cwd());
     if (!root) return undefined;
     const cli = resolve(root, "apps", "daemon", "dist", "cli.js");
-    return { node: process.env["PROSPERO_NODE"] || "node", cli, cwd: root };
+    // 从 Dock/Finder 启动时 PATH 里没有 mise/nvm 装的 node,"node" 这个名字解析不出来。
+    const node = resolveNodeExecutable();
+    if (!node) return undefined;
+    return { node, cli, cwd: root };
   }
 }

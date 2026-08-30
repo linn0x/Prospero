@@ -2,6 +2,7 @@ import { contextBridge, ipcRenderer } from "electron";
 import type { DesktopApi, DesktopSettings, JsonObject, SessionCreateInput } from "../shared/types";
 
 const api: DesktopApi = {
+  platform: process.platform,
   getSnapshot: () => ipcRenderer.invoke("snapshot:get"),
   subscribeSnapshot(listener) {
     const wrapped = (_event: Electron.IpcRendererEvent, snapshot: Parameters<typeof listener>[0]): void => listener(snapshot);
