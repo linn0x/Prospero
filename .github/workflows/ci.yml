@@ -213,15 +213,24 @@ jobs:
           env -i HOME="$home" PROSPERO_HOME="$home" PATH=/usr/bin:/bin \
             "$runtime/node/node" "$runtime/node_modules/@prospero/daemon/dist/cli.js" \
             start --port 7997 --bind 127.0.0.1 --no-bonjour > "$home/daemon.log" 2>&1 &
-          for _ in $(seq 1 30); do
+          # daemon 起来之前要先落地一份结构化 supervisor 的运行时镜像(复制依赖包树),
+          # CI 的磁盘比本机慢得多,给足时间;超时也要把现场打出来,否则只剩一句
+          # "没能启动",查不下去。
+          for _ in $(seq 1 90); do
             [ -f "$home/status.json" ] && break
             sleep 1
           done
-          cat "$home/daemon.log"
+          echo "--- daemon 输出 ---"
+          cat "$home/daemon.log" || true
           if [ ! -f "$home/status.json" ]; then
+            echo "--- 目录现场 ---"
+            ls -la "$home" || true
+            echo "--- 进程是否还活着 ---"
+            pgrep -fl "runtime/node/node" || echo "(进程已不在)"
             echo "打包内的 daemon 没能启动"
             exit 1
           fi
+          echo "打包内的 daemon 已就绪"
 
   windows-desktop:
     name: Windows Electron desktop
