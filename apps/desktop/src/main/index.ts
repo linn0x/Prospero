@@ -30,6 +30,7 @@ const ACCOUNT_METHODS = new Set([
 const SMOKE_TEST = process.argv.includes("--smoke-test");
 const SELF_CHECK = process.argv.includes("--self-check");
 const START_HIDDEN = process.argv.includes("--background") || SMOKE_TEST;
+if (SMOKE_TEST) app.disableHardwareAcceleration();
 
 let mainWindow: BrowserWindow | undefined;
 let tray: Tray | undefined;
@@ -76,9 +77,8 @@ function applyTheme(settings: DesktopSettings): void {
   }
 }
 
-function broadcastSnapshot(): void {
+function broadcastSnapshot(snapshot: ReturnType<StateStore["snapshot"]> = store.snapshot()): void {
   if (!mainWindow || mainWindow.isDestroyed()) return;
-  const snapshot = store.snapshot();
   mainWindow.webContents.send("snapshot:changed", snapshot);
   const pending = snapshot.daemon.sessions.reduce((total, session) => total + (session.pendingPermissions ?? 0) + (session.pendingQuestions ?? 0), 0);
   const active = snapshot.daemon.sessions.some((session) => session.status === "running" || session.status === "starting");
@@ -180,6 +180,60 @@ async function runDesktopSelfCheck(window: BrowserWindow): Promise<void> {
       if (!settingsReady) throw new Error("settings page did not finish loading");
       await new Promise((done) => setTimeout(done, 250));
     }
+    if (screenshotView === "workspaces") {
+      const workspaceReady = await window.webContents.executeJavaScript(`(async () => {
+        const wait = (ms) => new Promise((done) => setTimeout(done, ms));
+        let session = document.querySelector('.workspace-session-link');
+        if (!session) {
+          document.querySelector('.workspace-project-button')?.click();
+          await wait(180);
+          session = document.querySelector('.workspace-session-link');
+        }
+        if (!session) return false;
+        session.click();
+        const started = Date.now();
+        while (!document.querySelector('.workspace-tab-main')) {
+          if (Date.now() - started > 5_000) return false;
+          await wait(100);
+        }
+        await wait(250);
+        return true;
+      })()` ) as boolean;
+      if (!workspaceReady) throw new Error("workspace page did not finish loading");
+      const workspaceStyles = await window.webContents.executeJavaScript(`(() => {
+        const inspect = (selector) => {
+          const element = document.querySelector(selector);
+          if (!element) return { found: false };
+          const style = getComputedStyle(element);
+          const svg = element.querySelector('svg');
+          const svgRect = svg?.getBoundingClientRect();
+          return {
+            found: true,
+            borderWidth: style.borderWidth,
+            boxShadow: style.boxShadow,
+            padding: style.padding,
+            svgWidth: svgRect?.width ?? 0,
+            svgHeight: svgRect?.height ?? 0,
+            svgClass: svg?.getAttribute('class') ?? '',
+          };
+        };
+        const result = {
+          sessionPin: inspect('[data-testid="workspace-session-pin"]'),
+          tabMain: inspect('.workspace-tab-main'),
+          tabPin: inspect('[data-testid="workspace-tab-pin"]'),
+          tabClose: inspect('[data-testid="workspace-tab-close"]'),
+          agentLogo: inspect('.workspace-session-link .session-agent-icon'),
+        };
+        const controls = [result.sessionPin, result.tabMain, result.tabPin, result.tabClose];
+        return {
+          ...result,
+          healthy: controls.every((item) => item.found && item.borderWidth === '0px' && item.boxShadow === 'none' && item.svgWidth >= 12 && item.svgHeight >= 12)
+            && result.agentLogo.found && result.agentLogo.svgClass.includes('agent-logo'),
+        };
+      })()`);
+      if (!workspaceStyles.healthy) throw new Error(`workspace chrome rendering failed: ${JSON.stringify(workspaceStyles)}`);
+      process.stdout.write(`Prospero workspace styles: ${JSON.stringify(workspaceStyles)}\n`);
+    }
     const path = screenshotArg.slice("--screenshot=".length);
     if (!isAbsolute(path)) throw new Error("screenshot path must be absolute");
     writeFileSync(path, (await window.webContents.capturePage()).toPNG());
@@ -215,19 +269,140 @@ async function runDesktopSelfCheck(window: BrowserWindow): Promise<void> {
       context = { skipped: false, popup: Boolean(document.querySelector('[data-slot="context-menu-content"]')), healthyRoot: Boolean(document.querySelector('#root')?.childElementCount) };
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
     }
+    const group = await openAndCheck('[data-testid="workspace-more"]');
+    const project = await openAndCheck('[data-testid="workspace-project-more"]');
+    const directoryButton = document.querySelector('.workspace-project-button');
+    const directoryMore = document.querySelector('[data-testid="workspace-project-more"]');
+    const directoryCount = document.querySelector('.workspace-session-count');
+    directoryButton?.focus();
+    await new Promise((done) => setTimeout(done, 60));
+    const directoryFocus = directoryButton && directoryMore && directoryCount
+      ? { skipped: false, moreOpacity: getComputedStyle(directoryMore).opacity, countOpacity: getComputedStyle(directoryCount).opacity }
+      : { skipped: true, moreOpacity: '', countOpacity: '' };
+    directoryButton?.blur();
+    const pinFixture = document.createElement('div');
+    pinFixture.className = 'prospero-sidebar';
+    pinFixture.style.cssText = 'position:fixed;left:-10000px;top:0;';
+    pinFixture.innerHTML = '<div data-sidebar="menu-item"><button class="session-pin-action is-pinned"></button></div><div class="workspace-session-item"><button class="workspace-session-pin is-pinned"></button></div>';
+    document.body.append(pinFixture);
+    const pinnedAreaPin = pinFixture.querySelector('.session-pin-action');
+    const workspacePin = pinFixture.querySelector('.workspace-session-pin');
+    const pinVisibility = {
+      pinnedAreaOpacity: pinnedAreaPin ? getComputedStyle(pinnedAreaPin).opacity : '',
+      workspaceOpacity: workspacePin ? getComputedStyle(workspacePin).opacity : '',
+    };
+    pinFixture.remove();
+    const footerItems = Array.from(document.querySelectorAll('.sidebar-footer-actions > [data-sidebar="menu-item"]'));
+    const footerRects = footerItems.map((item) => item.getBoundingClientRect());
+    const footer = {
+      count: footerItems.length,
+      sameRow: footerRects.length === 2 && Math.abs(footerRects[0].top - footerRects[1].top) < 1,
+      daemonText: footerItems[0]?.textContent ?? '',
+    };
     return {
-      group: await openAndCheck('[data-testid="workspace-more"]'),
-      project: await openAndCheck('[data-testid="workspace-project-more"]'),
+      group,
+      project,
       rail: { found: Boolean(rail && sidebar), before: beforeRail, after: afterRail, restored: restoredRail },
       context,
+      directoryFocus,
+      pinVisibility,
+      footer,
     };
-  })()`) as { group: { skipped: boolean; found: boolean; popup: boolean; healthyRoot: boolean }; project: { skipped: boolean; found: boolean; popup: boolean; healthyRoot: boolean }; rail: { found: boolean; before?: string; after?: string; restored?: string }; context: { skipped: boolean; popup: boolean; healthyRoot: boolean } };
+  })()`) as { group: { skipped: boolean; found: boolean; popup: boolean; healthyRoot: boolean }; project: { skipped: boolean; found: boolean; popup: boolean; healthyRoot: boolean }; rail: { found: boolean; before?: string; after?: string; restored?: string }; context: { skipped: boolean; popup: boolean; healthyRoot: boolean }; directoryFocus: { skipped: boolean; moreOpacity: string; countOpacity: string }; pinVisibility: { pinnedAreaOpacity: string; workspaceOpacity: string }; footer: { count: number; sameRow: boolean; daemonText: string } };
   const sidebarMenusReady = sidebarMenuCheck.group.found && sidebarMenuCheck.group.popup && sidebarMenuCheck.group.healthyRoot
     && (sidebarMenuCheck.project.skipped || (sidebarMenuCheck.project.found && sidebarMenuCheck.project.popup && sidebarMenuCheck.project.healthyRoot))
     && sidebarMenuCheck.rail.found && sidebarMenuCheck.rail.before !== sidebarMenuCheck.rail.after && sidebarMenuCheck.rail.before === sidebarMenuCheck.rail.restored
-    && (sidebarMenuCheck.context.skipped || (sidebarMenuCheck.context.popup && sidebarMenuCheck.context.healthyRoot));
+    && (sidebarMenuCheck.context.skipped || (sidebarMenuCheck.context.popup && sidebarMenuCheck.context.healthyRoot))
+    && (sidebarMenuCheck.directoryFocus.skipped || (sidebarMenuCheck.directoryFocus.moreOpacity === "0" && sidebarMenuCheck.directoryFocus.countOpacity === "1"))
+    && sidebarMenuCheck.pinVisibility.pinnedAreaOpacity === "0"
+    && sidebarMenuCheck.pinVisibility.workspaceOpacity === "0"
+    && sidebarMenuCheck.footer.count === 2 && sidebarMenuCheck.footer.sameRow
+    && !sidebarMenuCheck.footer.daemonText.includes("127.0.0.1");
   if (!sidebarMenusReady) throw new Error(`workspace sidebar menu interaction failed: ${JSON.stringify(sidebarMenuCheck)}`);
   if (smoke) process.stdout.write(`Prospero desktop interactions: ${JSON.stringify(sidebarMenuCheck)}\n`);
+  if (smoke) {
+    window.showInactive();
+    await new Promise((done) => setTimeout(done, 120));
+    const pinnedTarget = await window.webContents.executeJavaScript(`(() => {
+      const action = document.querySelector('.session-pin-action');
+      const item = action?.closest('[data-sidebar="menu-item"]');
+      if (!action || !item) return null;
+      const actionRect = action.getBoundingClientRect();
+      const itemRect = item.getBoundingClientRect();
+      return {
+        row: { x: itemRect.x + 12, y: itemRect.y + itemRect.height / 2 },
+        action: { x: actionRect.x + actionRect.width / 2, y: actionRect.y + actionRect.height / 2 },
+      };
+    })()` ) as { row: { x: number; y: number }; action: { x: number; y: number } } | null;
+    if (pinnedTarget) {
+      window.webContents.sendInputEvent({ type: "mouseMove", x: 1_200, y: 72 });
+      await new Promise((done) => setTimeout(done, 180));
+    }
+    const pinnedDefaultOpacity = pinnedTarget
+      ? await window.webContents.executeJavaScript(`getComputedStyle(document.querySelector('.session-pin-action')).opacity`) as string
+      : "";
+    if (pinnedTarget) {
+      window.webContents.sendInputEvent({ type: "mouseMove", x: Math.round(pinnedTarget.row.x), y: Math.round(pinnedTarget.row.y) });
+      await new Promise((done) => setTimeout(done, 180));
+    }
+    const pinnedRowStyle = pinnedTarget
+      ? await window.webContents.executeJavaScript(`(() => { const style = getComputedStyle(document.querySelector('.session-pin-action')); return { opacity: style.opacity, color: style.color }; })()`) as { opacity: string; color: string }
+      : undefined;
+    if (pinnedTarget) {
+      window.webContents.sendInputEvent({ type: "mouseMove", x: Math.round(pinnedTarget.action.x), y: Math.round(pinnedTarget.action.y) });
+      await new Promise((done) => setTimeout(done, 180));
+    }
+    const pinnedActionStyle = pinnedTarget
+      ? await window.webContents.executeJavaScript(`(() => { const style = getComputedStyle(document.querySelector('.session-pin-action')); return { opacity: style.opacity, color: style.color }; })()`) as { opacity: string; color: string }
+      : undefined;
+    const pinnedHover = {
+      skipped: !pinnedTarget,
+      defaultOpacity: pinnedDefaultOpacity,
+      rowOpacity: pinnedRowStyle?.opacity ?? "",
+      rowColor: pinnedRowStyle?.color ?? "",
+      actionOpacity: pinnedActionStyle?.opacity ?? "",
+      actionColor: pinnedActionStyle?.color ?? "",
+    };
+    if (!pinnedHover.skipped && (pinnedHover.defaultOpacity !== "0" || pinnedHover.rowOpacity !== "1" || pinnedHover.actionOpacity !== "1" || pinnedHover.rowColor === pinnedHover.actionColor)) {
+      throw new Error(`pinned session hover interaction failed: ${JSON.stringify(pinnedHover)}`);
+    }
+    process.stdout.write(`Prospero pinned session hover: ${JSON.stringify(pinnedHover)}\n`);
+    const daemonRect = await window.webContents.executeJavaScript(`(() => {
+      const daemon = document.querySelector('[data-testid="sidebar-daemon"]');
+      if (!daemon) return null;
+      const rect = daemon.getBoundingClientRect();
+      return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+    })()` ) as { x: number; y: number } | null;
+    if (daemonRect) {
+      window.webContents.sendInputEvent({ type: "mouseMove", x: Math.round(daemonRect.x), y: Math.round(daemonRect.y) });
+      await new Promise((done) => setTimeout(done, 420));
+    }
+    const daemonInteraction = await window.webContents.executeJavaScript(`(async () => {
+      const wait = (ms) => new Promise((done) => setTimeout(done, ms));
+      const daemon = document.querySelector('[data-testid="sidebar-daemon"]');
+      if (!daemon) return { trigger: false, card: false, settings: false, healthyRoot: false };
+      const card = Boolean(document.querySelector('[data-slot="hover-card-content"]'));
+      const settings = Array.from(document.querySelectorAll('[data-sidebar="menu-button"]'))
+        .find((button) => button.textContent?.includes('设置') || button.textContent?.includes('Settings'));
+      settings?.click();
+      const started = Date.now();
+      while (!document.querySelector('.settings-page')) {
+        if (Date.now() - started > 5_000) break;
+        await wait(100);
+      }
+      const root = document.querySelector('#root');
+      return {
+        trigger: true,
+        card,
+        settings: Boolean(document.querySelector('.settings-page')),
+        healthyRoot: Boolean(root && root.childElementCount > 0 && document.body.innerText.includes('Prospero')),
+      };
+    })()` ) as { trigger: boolean; card: boolean; settings: boolean; healthyRoot: boolean };
+    if (!daemonInteraction.trigger || !daemonInteraction.card || !daemonInteraction.settings || !daemonInteraction.healthyRoot) {
+      throw new Error(`daemon sidebar interaction failed: ${JSON.stringify(daemonInteraction)}`);
+    }
+    process.stdout.write(`Prospero daemon interaction: ${JSON.stringify(daemonInteraction)}\n`);
+  }
   if (smoke) {
     process.stdout.write("Prospero desktop smoke test passed\n");
     quitting = true;
@@ -541,10 +716,28 @@ function installIpc(): void {
     }
     return { ok: true, output: result.output };
   });
-  ipcMain.handle("settings:update", (_event, raw: unknown) => {
-    const next = store.updateSettings(requireObject(raw));
+  ipcMain.handle("settings:update", async (_event, raw: unknown) => {
+    const patch = requireObject(raw);
+    if (patch["fullAccessPermission"] !== undefined && process.platform !== "win32") {
+      throw new Error("完整访问权限仅在 Windows 上可用");
+    }
+    const previous = store.snapshot();
+    const next = store.updateSettings(patch);
     applyTheme(next.settings);
     app.setLoginItemSettings({ openAtLogin: next.settings.launchAtLogin, args: ["--background"] });
+    if (next.settings.fullAccessPermission !== previous.settings.fullAccessPermission && previous.daemon.running) {
+      if (!previous.daemon.managed) {
+        store.updateSettings({ fullAccessPermission: previous.settings.fullAccessPermission });
+        throw new Error("当前 daemon 由外部进程管理，请先在原启动位置停止它再修改完整访问权限");
+      }
+      const restarted = await runtime.restart();
+      if (!restarted.ok) {
+        store.updateSettings({ fullAccessPermission: previous.settings.fullAccessPermission });
+        await runtime.start();
+        throw new Error(restarted.error || "应用完整访问权限失败");
+      }
+      return store.snapshot();
+    }
     return next;
   });
   ipcMain.handle("logs:clear", () => store.clearLogs());

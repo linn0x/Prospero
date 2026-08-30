@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Check, CircleAlert, Copy, KeyRound, Link2, MonitorSmartphone, Plus, RefreshCw, Server, Settings2, Trash2, UserRound, Wifi } from "lucide-react";
+import { Check, CircleAlert, Copy, KeyRound, Link2, MonitorSmartphone, Plus, RefreshCw, Server, Settings2, ShieldCheck, Trash2, UserRound, Wifi } from "lucide-react";
 import QRCode from "qrcode";
 import type { DesktopSnapshot, UsageAccount, UsageWindow } from "../../shared/types";
 import { displayError, number, record, statusLabel, text } from "./state";
@@ -9,6 +9,7 @@ import { useLocale } from "./locale";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Field, FieldContent, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
+import { Switch } from "@/components/ui/switch";
 
 function LegacyAccountsPane({ snapshot, onOpenSession }: { snapshot: DesktopSnapshot; onOpenSession: (id: string) => void }) {
   const [agent, setAgent] = useState("codex");
@@ -179,11 +180,24 @@ export function SettingsPane({ snapshot }: { snapshot: DesktopSnapshot }) {
     void window.prospero.listNetworkInterfaces().then(setInterfaces).catch(() => setInterfaces([]));
   }, []);
   const { language, setLanguage, t, status } = useLocale();
+  const isWindows = window.prospero.platform === "win32";
   const settings = snapshot.settings;
   const [relay, setRelay] = useState<Record<string, unknown>>({});
   const [relayUrl, setRelayUrl] = useState("");
   const [error, setError] = useState<string>();
+  const [fullAccessBusy, setFullAccessBusy] = useState(false);
   const update = (patch: Partial<typeof settings>): void => { void window.prospero.updateSettings(patch).catch((reason) => setError(displayError(reason))); };
+  const updateFullAccess = async (checked: boolean): Promise<void> => {
+    setError(undefined);
+    setFullAccessBusy(true);
+    try {
+      await window.prospero.updateSettings({ fullAccessPermission: checked });
+    } catch (reason) {
+      setError(displayError(reason));
+    } finally {
+      setFullAccessBusy(false);
+    }
+  };
   const relayAction = async (action: "status" | "enable" | "disable" | "rotate-key"): Promise<void> => {
     try { const result = await window.prospero.relayAction({ action, ...(action === "enable" && relayUrl ? { url: relayUrl } : {}) }); setRelay(result); if (action !== "status") setRelay(await window.prospero.relayAction({ action: "status" })); }
     catch (reason) { setError(displayError(reason)); }
@@ -219,6 +233,29 @@ export function SettingsPane({ snapshot }: { snapshot: DesktopSnapshot }) {
           </Field>
         </FieldGroup>
       </section>
+      {isWindows && <section className="settings-card permission-settings-card">
+        <div className="section-title"><ShieldCheck size={16} />{t("权限设置", "Permissions")}</div>
+        <FieldGroup>
+          <Field orientation="horizontal" className="desktop-setting-row">
+            <FieldContent>
+              <FieldLabel htmlFor="full-access-permission">{t("完整访问权限", "Full access")}</FieldLabel>
+              <FieldDescription>{t("通过 Windows UAC 以管理员身份运行 daemon；之后启动的 Agent 会继承管理员权限。", "Run the daemon through Windows UAC. Agents launched afterward inherit administrator access.")}</FieldDescription>
+            </FieldContent>
+            <Switch id="full-access-permission" checked={settings.fullAccessPermission} disabled={fullAccessBusy} onCheckedChange={(checked) => void updateFullAccess(checked)} />
+          </Field>
+        </FieldGroup>
+        <p className="security-note"><CircleAlert size={14} />{
+          snapshot.daemon.running
+            ? snapshot.daemon.fullAccess
+              ? t("Daemon 当前正以管理员权限运行。关闭此权限会安全重启并降回标准权限。", "The daemon is currently running as administrator. Turning this off safely restarts it with standard access.")
+              : settings.fullAccessPermission
+                ? t("正在等待管理员授权或重启。", "Waiting for administrator approval or restart.")
+                : t("Daemon 当前使用标准用户权限。", "The daemon is currently using standard user access.")
+            : settings.fullAccessPermission
+              ? t("下次启动 daemon 时会显示 Windows UAC 授权提示。", "Windows UAC will ask for approval the next time the daemon starts.")
+              : t("默认使用标准用户权限；仅在确有需要时开启完整访问。", "Standard user access is the default. Enable full access only when needed.")
+        }</p>
+      </section>}
       <section className="settings-card"><div className="section-title"><Server size={16} />Daemon</div><div className="runtime-state"><span className={`status-dot ${snapshot.daemon.state}`} /><div><strong>{status(snapshot.daemon.state)}</strong><p>{snapshot.daemon.pid ? `PID ${snapshot.daemon.pid} · 127.0.0.1:${snapshot.daemon.port}` : t("尚未运行", "Not running")}</p></div></div><div className="button-row"><button className="primary" onClick={() => void window.prospero.startDaemon()} disabled={snapshot.daemon.running}>{t("启动", "Start")}</button><button onClick={() => void window.prospero.restartDaemon()} disabled={!snapshot.daemon.managed}>{t("重启", "Restart")}</button><button className="danger" onClick={() => void window.prospero.stopDaemon()} disabled={!snapshot.daemon.managed}>{t("停止", "Stop")}</button></div><p className="security-note"><CircleAlert size={14} />{t("外部启动的 daemon 只连接、不强杀；控制令牌不会暴露给 UI。", "Externally started daemons are attached, never force-killed. Control tokens are not exposed to the UI.")}</p></section>
       <section className="settings-card"><div className="section-title"><Wifi size={16} />Relay</div><div className="runtime-state"><span className={`status-dot ${text(relay["state"], "disabled")}`} /><div><strong>{text(relay["enabled"]) === "true" || relay["enabled"] === true ? t("已启用", "Enabled") : t("未启用", "Disabled")}</strong><p>{text(relay["url"], t("用于公网访问的可选自托管中继", "Optional self-hosted relay for public access"))}</p></div></div><label>{t("WSS 地址", "WSS URL")}<input value={relayUrl} onChange={(event) => setRelayUrl(event.target.value)} placeholder="wss://relay.example.com" /></label><div className="button-row"><button className="primary" onClick={() => void relayAction("enable")}>{t("启用", "Enable")}</button><button onClick={() => void relayAction("disable")}>{t("关闭", "Disable")}</button><button className="danger" onClick={() => void relayAction("rotate-key")}>{t("轮换密钥", "Rotate key")}</button></div><p className="security-note"><CircleAlert size={14} />{t("轮换后所有设备都需要重新配对，执行前会再次确认。", "All devices must pair again after rotation. You will be asked to confirm first.")}</p></section>
       <section className="settings-card"><div className="section-title"><Settings2 size={16} />{t("终端", "Terminal")}</div><label>{t("字体", "Font")}<input value={settings.terminalFontFamily} onChange={(event) => update({ terminalFontFamily: event.target.value })} /></label><label>{t("字号", "Font size")}<input type="number" min={9} max={32} value={settings.terminalFontSize} onChange={(event) => update({ terminalFontSize: Number(event.target.value) })} /></label><div className="terminal-preview" style={{ fontFamily: settings.terminalFontFamily, fontSize: settings.terminalFontSize }}>PS C:\Prospero&gt; codex</div></section>
