@@ -36,6 +36,19 @@ describe("Electron run graph layout", () => {
     expect(layout.feedbackEdges).toEqual([{ fromTaskId: "original", toTaskId: "replacement" }]);
   });
 
+  it("precomputes dependency edges for the canvas renderer", () => {
+    const layout = layoutGraph([
+      task("root", [], 0),
+      task("left", ["root"], 1),
+      task("right", ["root"], 2),
+    ]);
+
+    expect(layout.edges.map((edge) => [edge.fromTaskId, edge.toTaskId])).toEqual([
+      ["root", "left"],
+      ["root", "right"],
+    ]);
+  });
+
   it("lays out a 5,000-task chain without recursive stack overflow", () => {
     const tasks = Array.from({ length: 5_000 }, (_, index) => task(
       `task-${String(index)}`,

@@ -1587,8 +1587,8 @@ kbd {
 }
 .run-graph-viewport:active { cursor: grabbing; }
 .run-graph-viewport:focus-visible { box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--primary) 65%, transparent); }
-.run-graph-render-layer { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
-.run-graph-canvas { position: absolute; top: 0; left: 0; transform-origin: 0 0; pointer-events: none; }
+.run-graph-render-layer { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; contain: strict; }
+.run-graph-canvas { position: absolute; top: 0; left: 0; transform-origin: 0 0; pointer-events: none; contain: layout paint style; will-change: transform; }
 .run-graph-node {
   position: absolute;
   display: flex;
