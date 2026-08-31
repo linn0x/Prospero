@@ -18,7 +18,6 @@ const V_GAP = 26;
 const MARGIN = 26;
 const MIN_ZOOM = 0.001;
 const MAX_ZOOM = 2.2;
-const DETAIL_ZOOM = 0.44;
 
 interface Point {
   x: number;
@@ -494,7 +493,8 @@ export function RunGraph({ tasks, dispatches }: { tasks: JsonObject[]; dispatche
 
   const positions = useMemo(() => new Map(layout.nodes.map((node) => [node.id, node])), [layout]);
   const visibleNodes = useMemo(() => {
-    if (transform.zoom < DETAIL_ZOOM) return [];
+    // 节点始终按矢量绘制:它们在一个 scale(zoom) 的容器里,缩放本来就是矢量的,
+    // 文字和描边跟着一起缩。视口裁剪保留 —— 那只影响 DOM 数量,不改变观感。
     const visible = visibleRect(viewport, transform, Math.max(NODE_WIDTH, NODE_HEIGHT));
     return layout.nodes.filter((node) => rectsIntersect(
       node.x,
@@ -597,36 +597,6 @@ export function RunGraph({ tasks, dispatches }: { tasks: JsonObject[]; dispatche
       }
     }
 
-    if (transform.zoom < DETAIL_ZOOM) {
-      const stateColors: Record<NodeState, string> = {
-        ready: primary,
-        running,
-        done: success,
-        superseded: info,
-        failed: danger,
-        blocked,
-        cancelled: muted,
-        waiting: muted,
-      };
-      for (const node of layout.nodes) {
-        if (!rectsIntersect(node.x, node.y, node.x + NODE_WIDTH, node.y + NODE_HEIGHT, visible)) continue;
-        const task = taskById.get(node.id);
-        if (!task) continue;
-        context.save();
-        context.fillStyle = stateColors[taskState(task, done, activeWorkers, parentIds)];
-        context.globalAlpha = selected === node.id ? 0.9 : 0.68;
-        context.beginPath();
-        context.roundRect(node.x, node.y, NODE_WIDTH, NODE_HEIGHT, 8);
-        context.fill();
-        if (selected === node.id) {
-          context.strokeStyle = primary;
-          context.globalAlpha = 1;
-          context.lineWidth = 4;
-          context.stroke();
-        }
-        context.restore();
-      }
-    }
   }, [activeWorkers, done, layout, parentIds, positions, selected, t, taskById, transform, viewport]);
 
   useLayoutEffect(() => {
@@ -740,7 +710,7 @@ export function RunGraph({ tasks, dispatches }: { tasks: JsonObject[]; dispatche
         onKeyDown={onKeyDown}
       >
         <canvas className="run-graph-render-layer" ref={renderCanvasRef} aria-hidden="true" />
-        {transform.zoom >= DETAIL_ZOOM && <div
+        <div
           className="run-graph-canvas"
           style={{
             width: layout.width,
@@ -777,7 +747,7 @@ export function RunGraph({ tasks, dispatches }: { tasks: JsonObject[]; dispatche
               </button>
             );
           })}
-        </div>}
+        </div>
         <div
           className="run-graph-minimap"
           ref={minimapRef}

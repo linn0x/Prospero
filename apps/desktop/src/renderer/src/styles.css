@@ -335,7 +335,7 @@ pre { margin: 0; white-space: pre-wrap; word-break: break-word; }
 .inline-error { display: flex; align-items: center; gap: 7px; padding: 8px 11px; color: var(--red); background: color-mix(in srgb, var(--red) 8%, var(--surface-1)); border-top: 1px solid color-mix(in srgb, var(--red) 25%, var(--border)); font-size: 11px; }
 
 .page { height: 100%; overflow: auto; padding: 26px 30px 40px; }.page-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 24px; }.page-header h1 { font-size: 25px; margin: 5px 0 6px; }.page-header p { color: var(--muted); }.section-label { color: var(--muted); font-size: 9px; font-weight: 800; letter-spacing: .1em; }.section-title { display: flex; align-items: center; gap: 7px; font-weight: 650; margin-bottom: 12px; }.section-title span { color: var(--muted); font-size: 10px; }
-.orchestration-page { padding: 0; overflow: hidden; display: grid; grid-template-rows: auto auto auto 1fr; }.orchestration-page > .page-header { padding: 20px 24px 14px; margin: 0; }.orchestration-layout { min-height: 0; display: grid; grid-template-columns: 235px 1fr; border-top: 1px solid var(--border); }.run-list { overflow: auto; border-right: 1px solid var(--border); padding: 12px 8px; background: var(--surface-1); }.run-list > .section-label { display: block; padding: 0 8px 9px; }.run-row { width: 100%; justify-content: flex-start; align-items: flex-start; text-align: left; border-color: transparent; background: transparent; padding: 9px 8px; }.run-row.selected { background: var(--surface-3); border-color: var(--border); }.run-row > div { display: grid; gap: 4px; min-width: 0; }.run-row strong { line-height: 1.35; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }.run-row small { color: var(--muted); font-size: 10px; }.run-detail { overflow: auto; padding: 20px 24px 40px; }.run-hero { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; background: linear-gradient(145deg, var(--surface-1), var(--surface-2)); border: 1px solid var(--border); border-radius: 11px; padding: 16px; }.run-hero h2 { font-size: 18px; margin-top: 5px; }.dashboard-section { margin-top: 22px; }.dag-grid, .card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(245px, 1fr)); gap: 10px; }.task-node, .gate-card { border: 1px solid var(--border); border-radius: 9px; background: var(--surface-1); padding: 11px; border-left: 3px solid var(--faint); }.task-node.dispatched { border-left-color: var(--accent); }.task-node.done { border-left-color: var(--green); }.task-node.failed { border-left-color: var(--red); }.task-node.blocked { border-left-color: var(--yellow); }.task-top { display: flex; align-items: center; gap: 7px; }.task-top strong { flex: 1; }.task-node > p { color: var(--muted); font-size: 11px; margin: 8px 0 10px; }.deps { display: flex; align-items: center; gap: 4px; color: var(--faint); margin-top: 7px; }.gate-card { display: grid; gap: 10px; border-left-color: var(--yellow); }.worktree-list { display: grid; gap: 7px; }.worktree-row { display: flex; align-items: center; gap: 9px; border: 1px solid var(--border); background: var(--surface-1); border-radius: 8px; padding: 8px 10px; }.worktree-row > div { min-width: 0; display: grid; gap: 3px; flex: 1; }.worktree-row small { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.orchestration-page { padding: 0; overflow: hidden; display: flex; flex-direction: column; }.orchestration-page > .page-header { padding: 12px 22px 10px; margin: 0; }.orchestration-layout { min-height: 0; display: grid; grid-template-columns: 235px 1fr; border-top: 1px solid var(--border); }.run-list { overflow: auto; border-right: 1px solid var(--border); padding: 12px 8px; background: var(--surface-1); }.run-list > .section-label { display: block; padding: 0 8px 9px; }.run-row { width: 100%; justify-content: flex-start; align-items: flex-start; text-align: left; border-color: transparent; background: transparent; padding: 9px 8px; }.run-row.selected { background: var(--surface-3); border-color: var(--border); }.run-row > div { display: grid; gap: 4px; min-width: 0; }.run-row strong { line-height: 1.35; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }.run-row small { color: var(--muted); font-size: 10px; }.run-detail { overflow: auto; padding: 20px 24px 40px; }.run-hero { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; background: linear-gradient(145deg, var(--surface-1), var(--surface-2)); border: 1px solid var(--border); border-radius: 11px; padding: 16px; }.run-hero h2 { font-size: 18px; margin-top: 5px; }.dashboard-section { margin-top: 22px; }.dag-grid, .card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(245px, 1fr)); gap: 10px; }.task-node, .gate-card { border: 1px solid var(--border); border-radius: 9px; background: var(--surface-1); padding: 11px; border-left: 3px solid var(--faint); }.task-node.dispatched { border-left-color: var(--accent); }.task-node.done { border-left-color: var(--green); }.task-node.failed { border-left-color: var(--red); }.task-node.blocked { border-left-color: var(--yellow); }.task-top { display: flex; align-items: center; gap: 7px; }.task-top strong { flex: 1; }.task-node > p { color: var(--muted); font-size: 11px; margin: 8px 0 10px; }.deps { display: flex; align-items: center; gap: 4px; color: var(--faint); margin-top: 7px; }.gate-card { display: grid; gap: 10px; border-left-color: var(--yellow); }.worktree-list { display: grid; gap: 7px; }.worktree-row { display: flex; align-items: center; gap: 9px; border: 1px solid var(--border); background: var(--surface-1); border-radius: 8px; padding: 8px 10px; }.worktree-row > div { min-width: 0; display: grid; gap: 3px; flex: 1; }.worktree-row small { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .split-management { display: grid; grid-template-columns: minmax(0, 1fr) 330px; gap: 24px; }.card-grid, .device-list { display: grid; gap: 8px; }.account-card, .device-card { display: flex; align-items: center; gap: 10px; padding: 11px; border: 1px solid var(--border); background: var(--surface-1); border-radius: 9px; }.account-card > div:not(.avatar), .device-card > div:nth-child(2) { flex: 1; }.account-card p, .device-card p { color: var(--muted); font-size: 10px; margin-top: 3px; }.avatar, .device-icon { width: 35px; height: 35px; border-radius: 10px; background: var(--accent-bg); color: var(--accent); display: grid; place-items: center; font-weight: 800; }.form-card, .settings-card { align-content: start; display: grid; gap: 12px; background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 15px; }.security-note { display: flex; gap: 6px; align-items: flex-start; color: var(--muted); font-size: 10.5px; }.check-row { display: flex; align-items: center; gap: 8px; color: var(--text); }.check-row input { width: auto; }.pair-result { display: grid; justify-items: center; gap: 8px; }.pair-result img { width: 240px; background: #fff; padding: 6px; border-radius: 9px; }.pair-result p { color: var(--yellow); font-size: 10px; }.tag-row { display: flex; gap: 5px; margin-top: 6px; }.logs-page { display: grid; grid-template-rows: auto 1fr; overflow: hidden; }.log-view { min-height: 0; overflow: auto; padding: 14px; background: #090a0d; color: #c7cbd3; border: 1px solid #25282f; border-radius: 9px; font: 11px/1.55 "Cascadia Mono", Consolas, monospace; }.settings-grid { display: grid; grid-template-columns: repeat(2, minmax(300px, 1fr)); gap: 12px; }.runtime-state { display: flex; align-items: center; gap: 10px; padding: 9px; background: var(--surface-2); border-radius: 7px; }.runtime-state > div { display: grid; gap: 3px; }.runtime-state p { color: var(--muted); font-size: 10px; }.terminal-preview { background: #090a0d; color: #d7dae0; padding: 11px; border-radius: 7px; }
 .small-empty { padding: 24px; border: 1px dashed var(--border-strong); border-radius: 8px; text-align: center; color: var(--muted); }
 
@@ -1398,23 +1398,23 @@ kbd {
 .prospero-main .orchestration-layout.run-list-collapsed,
 .prospero-main .dag-active .orchestration-layout.run-list-collapsed { grid-template-columns: minmax(0, 1fr); }
 .orchestration-layout.run-list-collapsed > .run-list { display: none; }
-.orchestration-summary { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap: 10px; padding: 12px 28px; background: var(--background); }
-.orchestration-summary [data-slot="card-header"] { gap: 3px; padding: 11px 13px; }
-.orchestration-summary [data-slot="card-title"] { font-size: 19px; }
+.orchestration-summary { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap: 8px; padding: 8px 22px; background: var(--background); }
+.orchestration-summary [data-slot="card-header"] { gap: 1px; padding: 7px 11px; }
+.orchestration-summary [data-slot="card-title"] { font-size: 17px; line-height: 1.2; }
 .template-library { display: grid; max-height: min(560px, 66vh); grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; overflow: auto; padding: 1px; }
 .template-node-preview { display: flex; flex-direction: column; gap: 5px; }
 .template-node-preview span { overflow: hidden; color: var(--muted-foreground); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .prospero-main .run-list { border-right-color: var(--border); background: var(--surface); }
-.prospero-main .run-detail { padding: 18px 22px 40px; }
-.prospero-main .run-hero { align-items: center; border-radius: 14px; padding: 17px 18px; background: linear-gradient(145deg, var(--card), color-mix(in srgb, var(--primary-soft) 54%, var(--card))); }
+.prospero-main .run-detail { padding: 12px 18px 16px; }
+.prospero-main .run-hero { align-items: center; border-radius: 12px; padding: 11px 14px; background: linear-gradient(145deg, var(--card), color-mix(in srgb, var(--primary-soft) 54%, var(--card))); }
 .run-hero-copy { display: flex; min-width: 240px; flex: 1; flex-direction: column; gap: 5px; }
-.run-progress-line { display: flex; max-width: 480px; align-items: center; gap: 10px; margin-top: 7px; }
+.run-progress-line { display: flex; max-width: 480px; align-items: center; gap: 10px; margin-top: 4px; }
 .run-progress-line [data-slot="progress"] { flex: 1; }
 .run-progress-line span { flex: none; color: var(--muted-foreground); font-size: 10px; }
 .run-list-toggle { color: var(--muted-foreground); background: transparent; }
 .run-list-toggle:hover:not(:disabled),
 .run-list-toggle:focus-visible { color: var(--foreground); background: var(--surface-raised); }
-.run-views { margin-top: 18px; }
+.run-views { margin-top: 10px; }
 .run-view-content { margin-top: 12px; }
 .prospero-main .dag-active > header {
   min-height: 58px;
@@ -1449,7 +1449,9 @@ kbd {
 .run-detail-dag .run-progress-line { max-width: 420px; margin-top: 3px; }
 .run-detail-dag .run-hero > .button-row { flex-wrap: nowrap; justify-content: flex-end; gap: 5px; }
 .run-detail-dag .run-hero > .button-row button { min-height: 27px; padding: 5px 7px; font-size: 9.5px; white-space: nowrap; }
-.run-views-dag { min-height: clamp(420px, calc(100svh - 310px), 620px); flex: 1 1 0; margin-top: 9px; }
+/* DAG 视图吃掉剩余高度。原来这里写死了 620px 的上限,窗口再高也只给这么多 ——
+   在 1340px 高的屏幕上,一半空间是白白浪费掉的,观感就是"图很小"。 */
+.run-views-dag { min-height: max(360px, calc(100svh - 268px)); flex: 1 1 0; margin-top: 6px; }
 .run-views-dag > [data-slot="tabs-list"] { flex: none; }
 .run-view-content-dag { display: flex; min-height: 0; overflow: hidden; }
 .run-board { display: grid; min-width: 940px; grid-template-columns: repeat(5, minmax(178px, 1fr)); gap: 9px; }
@@ -1564,9 +1566,13 @@ kbd {
   flex: 1;
   overflow: hidden;
   outline: none;
-  background-color: color-mix(in oklab, var(--muted) 38%, transparent);
-  background-image: radial-gradient(circle, color-mix(in srgb, var(--dag-edge) 30%, transparent) 1px, transparent 1px);
-  background-size: 18px 18px;
+  /* 画布底色贴着卡片面走,而不是 muted —— 后者在浅色主题下是一片偏蓝的灰,
+     压在整页浅色卡片之间显得又重又脏。点阵网格给出"这是一块可拖动的画布"的
+     暗示,对比度压到刚好能看见即可,不与节点抢注意力。 */
+  background-color: var(--card);
+  background-image: radial-gradient(circle, color-mix(in srgb, var(--muted-foreground) 22%, transparent) 1px, transparent 1px);
+  background-size: 22px 22px;
+  background-position: -1px -1px;
   cursor: grab;
   touch-action: none;
   user-select: none;
@@ -1675,7 +1681,7 @@ kbd {
   .dag-active > header > div:last-child label:first-child { width: auto; flex: 1; }
   .prospero-main .dag-active .orchestration-layout { grid-template-columns: 154px minmax(0, 1fr); }
   .dag-active .orchestration-summary { grid-template-columns: repeat(4, minmax(0, 1fr)); padding-right: 12px; padding-left: 12px; }
-  .run-views-dag { min-height: clamp(320px, calc(100svh - 310px), 500px); }
+  .run-views-dag { min-height: max(300px, calc(100svh - 300px)); }
   .run-graph-minimap { width: 126px; height: 78px; }
 }
 
@@ -1695,3 +1701,52 @@ kbd {
 :root[data-platform="darwin"] .desktop-topbar button,
 :root[data-platform="darwin"] .desktop-topbar input,
 :root[data-platform="darwin"] .desktop-topbar [role="button"] { -webkit-app-region: no-drag; }
+
+/* 运行列表的收起入口。原来它挤在右侧操作行里(保存为模板/添加任务/删除记录
+   那一排),离被折叠的面板隔了大半个屏 —— 人是在被折叠的东西身上找折叠按钮的。 */
+/* 选择器要压过上面那条 `.run-list > .section-label { display: block }` ——
+   否则这行不是 flex,按钮退回默认样式,变成一大块浅色方角。 */
+.run-list > .section-label.run-list-heading {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 0 4px 9px 8px;
+}
+.run-list > .run-list-heading > .run-list-collapse {
+  display: inline-flex; align-items: center; justify-content: center;
+  flex: none; width: 20px; height: 20px; min-width: 0; padding: 0;
+  color: var(--muted-foreground); background: transparent;
+  border: 0; border-radius: 5px; box-shadow: none; cursor: pointer;
+  opacity: .5; transition: opacity .12s, background-color .12s, color .12s;
+}
+.run-list > .run-list-heading > .run-list-collapse:hover {
+  opacity: 1; background: var(--accent); color: var(--accent-foreground);
+}
+
+
+/* ---------------------------------------------------------------- 编排页头
+   原来这里是:装饰 Badge + 与顶栏重复的大标题 + 一段长描述,下面再单独一行
+   四张统计卡(只为显示四个数字)。合计约 170px,而真正要看的 DAG 被挤在下面。
+   现在标题、统计、控件挤在同一行里。 */
+.orchestration-header {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+  gap: 14px; padding: 10px 20px; border-bottom: 1px solid var(--border);
+  background: var(--background);
+}
+.orchestration-header-title { display: flex; min-width: 0; align-items: center; gap: 14px; }
+.orchestration-header-title h1 { font-size: 17px; font-weight: 650; letter-spacing: -.02em; white-space: nowrap; }
+.orchestration-stats { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.orchestration-stats span {
+  display: inline-flex; align-items: baseline; gap: 5px;
+  font-size: 11px; color: var(--muted-foreground);
+}
+.orchestration-stats b { font-size: 13px; font-weight: 650; color: var(--foreground); font-variant-numeric: tabular-nums; }
+.orchestration-header label { font-size: 11px; }
+/* 布局区吃掉页头之外的全部高度。 */
+.prospero-main .orchestration-layout { flex: 1 1 auto; min-height: 0; }
+
+/* run 标题卡:去掉"当前运行"那行小标签(标题本身已经说明了),
+   标题与进度并到一行,整块从约 90px 压到约 52px。 */
+.prospero-main .run-hero { padding: 9px 13px; border-radius: 10px; gap: 12px; }
+.prospero-main .run-hero h2 { font-size: 15px; margin-top: 0; line-height: 1.3; }
+.prospero-main .run-hero > .run-hero-copy > .section-label { display: none; }
+.prospero-main .run-hero-copy { flex-direction: row; align-items: center; gap: 14px; min-width: 0; }
+.prospero-main .run-progress-line { margin-top: 0; max-width: 300px; flex: none; }
