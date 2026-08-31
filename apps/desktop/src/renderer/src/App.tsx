@@ -51,6 +51,7 @@ import {
 import type {
   AgentModel,
   DesktopSnapshot,
+  JsonObject,
   SessionCreateInput,
   SessionInfo,
   UsageAccount,
@@ -68,8 +69,10 @@ import {
   EXPANDED_PROJECTS_STORAGE_KEY,
   SIDEBAR_SESSION_PREVIEW_LIMIT,
   mostRelevantProject,
+  nextSidebarSessionLimit,
   parseExpandedProjects,
   projectForSession,
+  sortProjectsByRecentActivity,
   sortSidebarSessions,
 } from "./workspace-sidebar-state";
 import {
@@ -226,6 +229,7 @@ const SkillsPane = lazy(() =>
 
 type View =
   | "overview"
+  | "inbox"
   | "mobile"
   | "workspaces"
   | "runs"
@@ -237,6 +241,7 @@ type NavItem = { id: View; label: string; icon: ComponentType };
 
 const primaryNav: NavItem[] = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
+  { id: "inbox", label: "Inbox", icon: Mail },
   { id: "mobile", label: "Mobile", icon: Smartphone },
   { id: "runs", label: "Runs", icon: Workflow },
 ];
@@ -258,6 +263,13 @@ function getViewCopy(
         description: t(
           "需要处理的工作与当前运行状态",
           "Work requiring attention and current runtime status",
+        ),
+      },
+      inbox: {
+        title: t("收件箱", "Inbox"),
+        description: t(
+          "审批、回复与失败恢复",
+          "Approvals, replies, and failure recovery",
         ),
       },
       mobile: {
@@ -474,8 +486,8 @@ function ShellSidebar({
       return new Set(restored ?? (fallback ? [fallback] : []));
     },
   );
-  const [fullyShownProjects, setFullyShownProjects] = useState<Set<string>>(
-    () => new Set(),
+  const [sessionLimits, setSessionLimits] = useState<Record<string, number>>(
+    {},
   );
   const knownProjects = useRef(new Set(snapshot.projects));
   const handleDaemonCardOpen = (open: boolean): void => {
@@ -665,9 +677,17 @@ function ShellSidebar({
         </SidebarGroup>
         <SidebarSeparator />
         <SidebarGroup>
-          <SidebarGroupLabel>{t("置顶", "Pinned")}</SidebarGroupLabel>
+          <SidebarGroupLabel>{t("工具", "Tools")}</SidebarGroupLabel>
           <SidebarGroupContent>
-            <SidebarMenu>
+            <SidebarMenu>{renderNav(resourceNav)}</SidebarMenu>
+          </SidebarGroupContent>
+        </SidebarGroup>
+        {pinned.length > 0 && <>
+          <SidebarSeparator />
+          <SidebarGroup>
+            <SidebarGroupLabel>{t("置顶", "Pinned")}</SidebarGroupLabel>
+            <SidebarGroupContent>
+              <SidebarMenu>
               {pinned.map((session) => {
                 const attention =
                   (session.pendingPermissions ?? 0) +
@@ -708,16 +728,10 @@ function ShellSidebar({
                   </SidebarMenuItem>
                 );
               })}
-              {pinned.length === 0 && (
-                <SidebarMenuItem>
-                  <span className="block px-2 py-1 text-xs text-sidebar-foreground/45 group-data-[collapsible=icon]:hidden">
-                    {t("暂无置顶会话", "No pinned sessions")}
-                  </span>
-                </SidebarMenuItem>
-              )}
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
+              </SidebarMenu>
+            </SidebarGroupContent>
+          </SidebarGroup>
+        </>}
         <SidebarSeparator />
         <Collapsible
           open={workspaceOpen}
@@ -817,14 +831,17 @@ function ShellSidebar({
                         project.toLocaleLowerCase(),
                     );
                     const projectOpen = expandedProjects.has(project);
-                    const showsAllSessions =
-                      fullyShownProjects.has(project) ||
-                      sessions.length <= SIDEBAR_SESSION_PREVIEW_LIMIT;
-                    const visibleSessions = showsAllSessions
-                      ? sessions
-                      : sessions.slice(0, SIDEBAR_SESSION_PREVIEW_LIMIT);
-                    const hiddenSessionCount =
-                      sessions.length - SIDEBAR_SESSION_PREVIEW_LIMIT;
+                    const sessionLimit = Math.min(
+                      sessions.length,
+                      sessionLimits[project] ?? SIDEBAR_SESSION_PREVIEW_LIMIT,
+                    );
+                    const showsAllSessions = sessionLimit >= sessions.length;
+                    const visibleSessions = sessions.slice(0, sessionLimit);
+                    const hiddenSessionCount = sessions.length - sessionLimit;
+                    const nextSessionCount = Math.min(
+                      hiddenSessionCount,
+                      24,
+                    );
                     return (
                       <Collapsible
                         key={project}
@@ -903,7 +920,9 @@ function ShellSidebar({
                                   }
                                 >
                                   <FolderOpen />
-                                  {t("在资源管理器中打开", "Open in Explorer")}
+                                  {isMac
+                                    ? t("在访达中显示", "Reveal in Finder")
+                                    : t("在资源管理器中打开", "Open in Explorer")}
                                 </DropdownMenuItem>
                               </DropdownMenuGroup>
                               <DropdownMenuSeparator />
@@ -956,7 +975,13 @@ function ShellSidebar({
                                           agent={session.agent}
                                           unread={unread}
                                         />
-                                        <span>{sessionLabel(session)}</span>
+                                        <span className="workspace-session-copy">
+                                          <strong>{sessionLabel(session)}</strong>
+                                          <small>
+                                            <StatusMark status={session.status} />
+                                            {status(session.status)} · {relativeTime(session.createdAt, language)}
+                                          </small>
+                                        </span>
                                       </ContextMenuTrigger>
                                       <ContextMenuContent>
                                         <ContextMenuGroup>
@@ -1017,10 +1042,9 @@ function ShellSidebar({
                                             }
                                           >
                                             <FolderOpen />
-                                            {t(
-                                              "在资源管理器中打开",
-                                              "Open in Explorer",
-                                            )}
+                                            {isMac
+                                              ? t("在访达中显示", "Reveal in Finder")
+                                              : t("在资源管理器中打开", "Open in Explorer")}
                                           </ContextMenuItem>
                                         </ContextMenuGroup>
                                       </ContextMenuContent>
@@ -1072,18 +1096,18 @@ function ShellSidebar({
                                             `Show fewer sessions in ${name}`,
                                           )
                                         : t(
-                                            `显示 ${name} 的其余 ${String(hiddenSessionCount)} 个会话`,
-                                            `Show ${String(hiddenSessionCount)} more sessions in ${name}`,
+                                            `在 ${name} 中再显示 ${String(nextSessionCount)} 个会话，剩余 ${String(hiddenSessionCount)} 个`,
+                                            `Show ${String(nextSessionCount)} more sessions in ${name}; ${String(hiddenSessionCount)} remaining`,
                                           )
                                     }
                                     onClick={() =>
-                                      setFullyShownProjects((current) => {
-                                        const next = new Set(current);
-                                        if (showsAllSessions)
-                                          next.delete(project);
-                                        else next.add(project);
-                                        return next;
-                                      })
+                                      setSessionLimits((current) => ({
+                                        ...current,
+                                        [project]: nextSidebarSessionLimit(
+                                          sessionLimit,
+                                          sessions.length,
+                                        ),
+                                      }))
                                     }
                                   >
                                     <ChevronRight aria-hidden="true" />
@@ -1091,8 +1115,8 @@ function ShellSidebar({
                                       {showsAllSessions
                                         ? t("收起会话", "Show fewer")
                                         : t(
-                                            `显示其余 ${String(hiddenSessionCount)} 个`,
-                                            `Show ${String(hiddenSessionCount)} more`,
+                                            `再显示 ${String(nextSessionCount)} 个 · 剩余 ${String(hiddenSessionCount)}`,
+                                            `Show ${String(nextSessionCount)} more · ${String(hiddenSessionCount)} remaining`,
                                           )}
                                     </span>
                                   </button>
@@ -1119,13 +1143,6 @@ function ShellSidebar({
             </CollapsibleContent>
           </SidebarGroup>
         </Collapsible>
-        <SidebarSeparator />
-        <SidebarGroup>
-          <SidebarGroupLabel>{t("系统", "System")}</SidebarGroupLabel>
-          <SidebarGroupContent>
-            <SidebarMenu>{renderNav(resourceNav)}</SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
       </SidebarContent>
       <SidebarFooter className="px-3 pb-3">
         <SidebarMenu className="sidebar-footer-actions">
@@ -1228,11 +1245,17 @@ function AttentionCard({
 function OverviewPane({
   snapshot,
   onOpenSession,
+  onOpenInbox,
   onOpenRuns,
+  onOpenWorkspaces,
+  onNewSession,
 }: {
   snapshot: DesktopSnapshot;
   onOpenSession: (id: string) => void;
+  onOpenInbox: () => void;
   onOpenRuns: () => void;
+  onOpenWorkspaces: () => void;
+  onNewSession: (project: string) => void;
 }) {
   const { t, status } = useLocale();
   const activeSessions = snapshot.daemon.sessions.filter((session) =>
@@ -1271,6 +1294,16 @@ function OverviewPane({
       0,
     ) +
     (snapshot.daemon.running ? 0 : 1);
+  const orderedActiveSessions = sortSidebarSessions(
+    activeSessions,
+    undefined,
+    snapshot.pinnedSessionIds,
+    snapshot.unreadSessionIds,
+  );
+  const recentProjects = sortProjectsByRecentActivity(
+    snapshot.projects,
+    snapshot.daemon.sessions,
+  ).slice(0, 4);
   return (
     <div className="view-scroll">
       <div className="view-container overview-view">
@@ -1395,8 +1428,8 @@ function OverviewPane({
             </CardContent>
             {attentionCount > 0 && (
               <CardFooter>
-                <Button variant="ghost" size="sm" onClick={onOpenRuns}>
-                  {t("查看运行", "View runs")}{" "}
+                <Button variant="ghost" size="sm" onClick={onOpenInbox}>
+                  {t("打开收件箱", "Open inbox")}{" "}
                   <ArrowRight data-icon="inline-end" />
                 </Button>
               </CardFooter>
@@ -1481,7 +1514,7 @@ function OverviewPane({
               </div>
             </CardHeader>
             <CardContent className="active-agent-list">
-              {activeSessions.slice(0, 5).map((session) => (
+              {orderedActiveSessions.slice(0, 6).map((session) => (
                 <button
                   key={session.id}
                   onClick={() => onOpenSession(session.id)}
@@ -1519,6 +1552,14 @@ function OverviewPane({
                 </div>
               )}
             </CardContent>
+            {activeSessions.length > 6 && (
+              <CardFooter>
+                <Button variant="ghost" size="sm" onClick={onOpenWorkspaces}>
+                  {t("打开工作台", "Open workspaces")}
+                  <ArrowRight data-icon="inline-end" />
+                </Button>
+              </CardFooter>
+            )}
           </Card>
         </div>
         <section className="recent-section">
@@ -1542,10 +1583,13 @@ function OverviewPane({
             </Button>
           </div>
           <div className="workspace-cards">
-            {snapshot.projects.slice(0, 4).map((project) => {
-              const sessions = snapshot.daemon.sessions.filter((session) =>
-                projectForSession([project], session),
-              );
+            {recentProjects.map((project) => {
+              const sessions = snapshot.daemon.sessions
+                .filter((session) => projectForSession([project], session))
+                .sort(
+                  (left, right) =>
+                    (right.createdAt ?? 0) - (left.createdAt ?? 0),
+                );
               const name =
                 project.split(/[\\/]/).filter(Boolean).at(-1) ?? project;
               return (
@@ -1568,7 +1612,9 @@ function OverviewPane({
                       size="icon-sm"
                       aria-label={t(`打开 ${name}`, `Open ${name}`)}
                       onClick={() =>
-                        sessions[0] ? onOpenSession(sessions[0].id) : undefined
+                        sessions[0]
+                          ? onOpenSession(sessions[0].id)
+                          : onNewSession(project)
                       }
                     >
                       <ArrowRight />
@@ -1617,6 +1663,9 @@ function InboxPane({
   onOpenRuns: () => void;
 }) {
   const { t, status } = useLocale();
+  const [gateDecisions, setGateDecisions] = useState<Record<string, string>>(
+    {},
+  );
   const gates = snapshot.orchestration.gates.filter(
     (gate) => text(gate["status"]) === "pending",
   );
@@ -1632,6 +1681,54 @@ function InboxPane({
     taskIssues.length +
     sessionIssues.length +
     (snapshot.daemon.running ? 0 : 1);
+  const gateActions = (gate: JsonObject): React.ReactNode => {
+    const gateId = text(gate["id"]);
+    const options = Array.isArray(gate["options"])
+      ? (gate["options"] as unknown[]).map(String)
+      : [];
+    if (options.length > 0) {
+      return options.map((option, index) => (
+        <Button
+          key={option}
+          variant={index === 0 ? "default" : "outline"}
+          size="sm"
+          onClick={() => void window.prospero.resolveGate(gateId, option)}
+        >
+          {option}
+        </Button>
+      ));
+    }
+    const decision = gateDecisions[gateId] ?? "";
+    return (
+      <div className="gate-freeform-row">
+        <Input
+          value={decision}
+          aria-label={t("输入 Gate 决定", "Enter gate decision")}
+          placeholder={t("输入决定", "Enter a decision")}
+          onChange={(event) =>
+            setGateDecisions((current) => ({
+              ...current,
+              [gateId]: event.target.value,
+            }))
+          }
+          onKeyDown={(event) => {
+            if (event.key !== "Enter" || !decision.trim()) return;
+            event.preventDefault();
+            void window.prospero.resolveGate(gateId, decision.trim());
+          }}
+        />
+        <Button
+          size="sm"
+          disabled={!decision.trim()}
+          onClick={() =>
+            void window.prospero.resolveGate(gateId, decision.trim())
+          }
+        >
+          {t("确认", "Confirm")}
+        </Button>
+      </div>
+    );
+  };
   return (
     <div className="view-scroll">
       <div className="view-container inbox-view">
@@ -1661,7 +1758,7 @@ function InboxPane({
                       {t("运行环境已断开", "Runtime disconnected")}
                     </CardTitle>
                     <CardDescription>
-                      Prospero daemon · {t("本机 Windows", "This Windows PC")}
+                      Prospero daemon · {isMac ? t("此 Mac", "This Mac") : t("本机 Windows", "This Windows PC")}
                     </CardDescription>
                   </div>
                   <Badge variant="destructive">{t("离线", "Offline")}</Badge>
@@ -1713,29 +1810,10 @@ function InboxPane({
                 </CardContent>
               )}
               <CardFooter className="flex-wrap">
-                {Array.isArray(gate["options"]) ? (
-                  (gate["options"] as unknown[])
-                    .map(String)
-                    .map((option, index) => (
-                      <Button
-                        key={option}
-                        variant={index === 0 ? "default" : "outline"}
-                        size="sm"
-                        onClick={() =>
-                          void window.prospero.resolveGate(
-                            text(gate["id"]),
-                            option,
-                          )
-                        }
-                      >
-                        {option}
-                      </Button>
-                    ))
-                ) : (
-                  <Button size="sm" onClick={onOpenRuns}>
-                    {t("打开运行", "Open run")}
-                  </Button>
-                )}
+                {gateActions(gate)}
+                <Button variant="ghost" size="sm" onClick={onOpenRuns}>
+                  {t("打开运行", "Open run")}
+                </Button>
               </CardFooter>
             </Card>
           ))}
@@ -2051,7 +2129,7 @@ function WorkspaceContextPane({
               </div>
               <div>
                 <dt>{t("运行环境", "Runtime")}</dt>
-                <dd>{t("本机 Windows", "This Windows PC")}</dd>
+                <dd>{isMac ? t("此 Mac", "This Mac") : t("本机 Windows", "This Windows PC")}</dd>
               </div>
               <div>
                 <dt>{t("分支", "Branch")}</dt>
@@ -2183,7 +2261,7 @@ function WorkspaceContextPane({
             }
           >
             <SquareTerminal data-icon="inline-start" />
-            Windows Terminal
+            {isMac ? t("终端", "Terminal") : "Windows Terminal"}
           </Button>
           <Button
             variant="outline"
@@ -2191,7 +2269,7 @@ function WorkspaceContextPane({
             onClick={() => void window.prospero.revealPath(session.cwd)}
           >
             <FolderOpen data-icon="inline-start" />
-            Explorer
+            {isMac ? t("在访达中显示", "Reveal in Finder") : "Explorer"}
           </Button>
         </div>
       </TabsContent>
@@ -2206,6 +2284,7 @@ function WorkspacePane({
   onActivate,
   onClose,
   onNewSession,
+  onOpenRuns,
   onTogglePin,
   focus,
 }: {
@@ -2215,11 +2294,12 @@ function WorkspacePane({
   onActivate: (id: string) => void;
   onClose: (id: string) => void;
   onNewSession: (project?: string) => void;
+  onOpenRuns: () => void;
   onTogglePin: (id: string) => void;
   focus: boolean;
 }) {
   const { t, status } = useLocale();
-  const [showContext, setShowContext] = useState(true);
+  const [showContext, setShowContext] = useState(false);
   const contextVisible = showContext && !focus;
   const [contextSheet, setContextSheet] = useState(false);
   const active = snapshot.daemon.sessions.find(
@@ -2421,7 +2501,7 @@ function WorkspacePane({
                     <ChatPane
                       key={active.id}
                       session={active}
-                      onOpenGoal={() => undefined}
+                      onOpenGoal={onOpenRuns}
                     />
                   )}
                 </div>
@@ -3357,7 +3437,20 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
       !snapshot.pinnedSessionIds.includes(id),
     );
   };
-  const [focus, setFocus] = useState(false);
+  const [focus, setFocus] = useState(() => {
+    try {
+      return localStorage.getItem("prospero.focusTerminal") === "true";
+    } catch {
+      return false;
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem("prospero.focusTerminal", String(focus));
+    } catch {
+      // Focus mode still works for this renderer lifetime.
+    }
+  }, [focus]);
   useEffect(() => {
     const onKey = (event: KeyboardEvent): void => {
       if (event.key.toLowerCase() !== "f" || !event.shiftKey) return;
@@ -3444,7 +3537,12 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
         }
       />
       <SidebarInset className="prospero-main">
-        <header className="desktop-topbar">
+        <header
+          className={cn(
+            "desktop-topbar",
+            focus && view === "workspaces" && "terminal-focus-topbar",
+          )}
+        >
           <div className="topbar-context">
             <SidebarTrigger />
             <div>
@@ -3468,7 +3566,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
             >
               <Search data-icon="inline-start" />
               <span>{t("搜索或运行命令", "Search or run a command")}</span>
-              <kbd>Ctrl K</kbd>
+              <kbd>{isMac ? "⌘K" : "Ctrl K"}</kbd>
             </Button>
             <Button onClick={() => openNewSession()}>
               <Plus data-icon="inline-start" />
@@ -3489,6 +3587,15 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
               <OverviewPane
                 snapshot={snapshot}
                 onOpenSession={openSession}
+                onOpenInbox={() => setView("inbox")}
+                onOpenRuns={() => setView("runs")}
+                onOpenWorkspaces={() => setView("workspaces")}
+                onNewSession={openNewSession}
+              />
+            ) : view === "inbox" ? (
+              <InboxPane
+                snapshot={snapshot}
+                onOpenSession={openSession}
                 onOpenRuns={() => setView("runs")}
               />
             ) : view === "mobile" ? (
@@ -3502,6 +3609,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
                 onActivate={(id) => openSession(id)}
                 onClose={closeSession}
                 onNewSession={openNewSession}
+                onOpenRuns={() => setView("runs")}
                 onTogglePin={togglePin}
               />
             ) : view === "runs" ? (

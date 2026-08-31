@@ -17,7 +17,16 @@ import { RunGraph } from "./RunGraph";
 import { array, displayError, number, record, text } from "./state";
 import { useLocale } from "./locale";
 import { prioritizeWorktrees, worktreeNeedsAttention } from "./orchestration-utils";
-import { isLaunchableWorktreeAsset } from "../../shared/session-launch-options";
+import {
+  defaultSessionLaunchAccountId,
+  isLaunchableWorktreeAsset,
+  sessionLaunchAccounts,
+} from "../../shared/session-launch-options";
+import {
+  automationStartParams,
+  type OrchestrationWorkerAgent,
+  workerStartParams,
+} from "./orchestration-launch";
 
 const operationId = (): string => crypto.randomUUID();
 
@@ -35,6 +44,43 @@ function initialRunView(): RunView {
   }
 }
 
+function FreeformGateDecision({
+  gateId,
+  onError,
+}: {
+  gateId: string;
+  onError: (message: string | undefined) => void;
+}) {
+  const { t } = useLocale();
+  const [decision, setDecision] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  const submit = async (): Promise<void> => {
+    const value = decision.trim();
+    if (!value || submitting) return;
+    setSubmitting(true);
+    try {
+      await window.prospero.resolveGate(gateId, value);
+      onError(undefined);
+    } catch (reason) {
+      onError(displayError(reason));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return <form className="flex min-w-0 flex-1 items-center gap-2" onSubmit={(event) => { event.preventDefault(); void submit(); }}>
+    <Input
+      value={decision}
+      maxLength={20_000}
+      onChange={(event) => setDecision(event.target.value)}
+      aria-label={t("输入 Gate 决策", "Enter gate decision")}
+      placeholder={t("输入决定或补充说明", "Enter a decision or additional context")}
+    />
+    <button type="submit" disabled={!decision.trim() || submitting}>{submitting ? t("提交中…", "Submitting…") : t("确认", "Confirm")}</button>
+  </form>;
+}
+
 export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coordinatorSessionId }: { snapshot: DesktopSnapshot; onOpenSession: (id: string) => void; onNewSession: (workspace: string) => void; coordinatorSessionId?: string | undefined }) {
   const { t, status } = useLocale();
   const { runs, tasks, dispatches, gates, worktreeAssets } = snapshot.orchestration;
@@ -48,8 +94,11 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
   const [taskDeps, setTaskDeps] = useState<string[]>([]);
   const [taskSkills, setTaskSkills] = useState("");
   const [graphSkills, setGraphSkills] = useState("");
-  const [workerAgent, setWorkerAgent] = useState("codex");
+  const [workerAgent, setWorkerAgent] = useState<OrchestrationWorkerAgent>("codex");
   const [workerProject, setWorkerProject] = useState(snapshot.projects[0] ?? "");
+  const [workerAccountId, setWorkerAccountId] = useState(
+    () => defaultSessionLaunchAccountId(snapshot.accounts, "codex") ?? "",
+  );
   const [error, setError] = useState<string>();
   const [busy, setBusy] = useState<string>();
   // SwiftUI 默认并持久化依赖图视图；Electron 保持相同习惯，避免每次进 Run 都先切 Tab。
@@ -83,12 +132,30 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
   const visibleWorktrees = worktreesExpanded
     ? runWorktrees.slice(0, worktreeLimit)
     : attentionWorktrees.slice(0, WORKTREE_ATTENTION_PREVIEW);
+  const workerAccounts = useMemo(
+    () => sessionLaunchAccounts(snapshot.accounts, workerAgent),
+    [snapshot.accounts, workerAgent],
+  );
+  const selectedWorkerAccountId = workerAccounts.some((account) => account.id === workerAccountId)
+    ? workerAccountId
+    : defaultSessionLaunchAccountId(snapshot.accounts, workerAgent) ?? "";
+  const workerSelection = {
+    agent: workerAgent,
+    cwd: workerProject,
+    ...(selectedWorkerAccountId ? { accountId: selectedWorkerAccountId } : {}),
+  };
   useEffect(() => {
     const query = window.matchMedia(COMPACT_RUN_LIST_QUERY);
     const update = (event: MediaQueryListEvent): void => setRunListOpen(!event.matches);
     query.addEventListener("change", update);
     return () => query.removeEventListener("change", update);
   }, []);
+  useEffect(() => {
+    setWorkerProject((current) => snapshot.projects.includes(current) ? current : snapshot.projects[0] ?? "");
+  }, [snapshot.projects]);
+  useEffect(() => {
+    setWorkerAccountId(selectedWorkerAccountId);
+  }, [selectedWorkerAccountId]);
   const parseSkills = (value: string): string[] => [...new Set(value.split(/[,\s]+/).map((skill) => skill.trim().replace(/^\$/, "")).filter(Boolean))].slice(0, 5);
 
   const perform = async (key: string, method: string, params: JsonObject): Promise<boolean> => {
@@ -114,9 +181,12 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
   };
 
   const startWorker = async (task: JsonObject): Promise<void> => {
-    const cwd = workerProject || snapshot.projects[0];
-    if (!cwd) { setError(t("请先添加一个项目作为 worker 工作目录", "Add a project to use as the worker directory first")); return; }
-    await perform(text(task["id"]), "worker.start", { operationId: operationId(), taskId: text(task["id"]), agent: workerAgent, cwd, worktree: "new", kind: "structured", approvalPolicy: "standard" });
+    if (!workerProject) { setError(t("请先添加一个项目作为 worker 工作目录", "Add a project to use as the worker directory first")); return; }
+    await perform(
+      text(task["id"]),
+      "worker.start",
+      workerStartParams(workerSelection, text(task["id"]), operationId()),
+    );
   };
 
   const createTask = async (): Promise<void> => {
@@ -186,6 +256,21 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
     </CardFooter></Card>;
   };
 
+  const gateCard = (gate: JsonObject) => {
+    const gateId = text(gate["id"]);
+    const options = array(gate["options"]).map(String);
+    return <article className="gate-card" key={gateId}>
+      <strong>{text(gate["question"])}</strong>
+      <div className="button-row compact">
+        {text(gate["status"]) !== "pending"
+          ? <span className="resolved"><CheckCircle2 size={13} />{text(gate["decision"], t("已处理", "Resolved"))}</span>
+          : options.length > 0
+            ? options.map((option) => <button key={option} onClick={() => void window.prospero.resolveGate(gateId, option).catch((reason) => setError(displayError(reason)))}>{option}</button>)
+            : <FreeformGateDecision gateId={gateId} onError={setError} />}
+      </div>
+    </article>;
+  };
+
   const changeRunView = (value: string | null): void => {
     if (value !== "board" && value !== "dag" && value !== "timeline") return;
     setRunView(value);
@@ -193,7 +278,7 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
   };
 
   return <div className={`page orchestration-page${runView === "dag" ? " dag-active" : ""}`}>
-    <header className="orchestration-header"><div className="orchestration-header-title"><h1>{t("目标与编排中心", "Runs & orchestration")}</h1><div className="orchestration-stats"><span>{t("运行", "Runs")}<b>{runs.length}</b></span><span>{t("运行中任务", "Active")}<b>{tasks.filter((task) => ["dispatched", "running", "starting"].includes(text(task["status"]))).length}</b></span><span>{t("等待检查", "Needs review")}<b>{tasks.filter((task) => ["blocked", "failed", "waiting_approval"].includes(text(task["status"]))).length + gates.filter((gate) => text(gate["status"]) === "pending").length}</b></span><span>{t("模板", "Templates")}<b>{snapshot.workflowTemplates.length}</b></span></div></div><div className="flex flex-wrap items-end gap-2"><label className="flex flex-col gap-1.5 text-xs text-muted-foreground">{t("项目", "Project")}<NativeSelect value={workerProject} onChange={(event) => setWorkerProject(event.target.value)}>{snapshot.projects.map((project) => <NativeSelectOption value={project} key={project}>{project.split(/[\\/]/).at(-1)}</NativeSelectOption>)}</NativeSelect></label><label className="flex flex-col gap-1.5 text-xs text-muted-foreground">Worker<NativeSelect value={workerAgent} onChange={(event) => setWorkerAgent(event.target.value)}><NativeSelectOption value="codex">Codex</NativeSelectOption><NativeSelectOption value="claude">Claude</NativeSelectOption><NativeSelectOption value="deepseek">DeepSeek</NativeSelectOption><NativeSelectOption value="opencode">OpenCode</NativeSelectOption></NativeSelect></label><Button variant="outline" onClick={() => setTemplateLibraryOpen(true)}><LibraryBig data-icon="inline-start" />{t("模板库", "Templates")}</Button><Button onClick={() => setShowCreate(true)}><Plus data-icon="inline-start" />{t("新建目标", "New goal")}</Button></div></header>
+    <header className="orchestration-header"><div className="orchestration-header-title"><h1>{t("目标与编排中心", "Runs & orchestration")}</h1><div className="orchestration-stats"><span>{t("运行", "Runs")}<b>{runs.length}</b></span><span>{t("运行中任务", "Active")}<b>{tasks.filter((task) => ["dispatched", "running", "starting"].includes(text(task["status"]))).length}</b></span><span>{t("等待检查", "Needs review")}<b>{tasks.filter((task) => ["blocked", "failed", "waiting_approval"].includes(text(task["status"]))).length + gates.filter((gate) => text(gate["status"]) === "pending").length}</b></span><span>{t("模板", "Templates")}<b>{snapshot.workflowTemplates.length}</b></span></div></div><div className="flex flex-wrap items-end gap-2"><label className="flex flex-col gap-1.5 text-xs text-muted-foreground">{t("项目", "Project")}<NativeSelect value={workerProject} onChange={(event) => setWorkerProject(event.target.value)}>{snapshot.projects.map((project) => <NativeSelectOption value={project} key={project}>{project.split(/[\\/]/).at(-1)}</NativeSelectOption>)}</NativeSelect></label><label className="flex flex-col gap-1.5 text-xs text-muted-foreground">Worker<NativeSelect value={workerAgent} onChange={(event) => { const agent = event.target.value as OrchestrationWorkerAgent; setWorkerAgent(agent); setWorkerAccountId(defaultSessionLaunchAccountId(snapshot.accounts, agent) ?? ""); }}><NativeSelectOption value="codex">Codex</NativeSelectOption><NativeSelectOption value="claude">Claude</NativeSelectOption><NativeSelectOption value="deepseek">DeepSeek</NativeSelectOption><NativeSelectOption value="opencode">OpenCode</NativeSelectOption></NativeSelect></label>{(workerAgent === "codex" || workerAgent === "claude") && <label className="flex flex-col gap-1.5 text-xs text-muted-foreground">{t("账号", "Account")}<NativeSelect value={selectedWorkerAccountId} onChange={(event) => setWorkerAccountId(event.target.value)}>{workerAccounts.length === 0 && <NativeSelectOption value="">{t("默认 CLI 环境", "Default CLI environment")}</NativeSelectOption>}{workerAccounts.map((account) => <NativeSelectOption value={account.id} key={account.id}>{account.name}{account.isDefault ? t("（默认）", " (default)") : ""}</NativeSelectOption>)}</NativeSelect></label>}<Button variant="outline" onClick={() => setTemplateLibraryOpen(true)}><LibraryBig data-icon="inline-start" />{t("模板库", "Templates")}</Button><Button onClick={() => setShowCreate(true)}><Plus data-icon="inline-start" />{t("新建目标", "New goal")}</Button></div></header>
     {error && <Alert variant="destructive" className="mx-7 mt-5 w-auto"><CircleDot /><AlertTitle>{t("编排操作失败", "Orchestration action failed")}</AlertTitle><AlertDescription>{error}</AlertDescription></Alert>}
     <div className={`orchestration-layout${runListOpen ? "" : " run-list-collapsed"}`}>
       <aside className="run-list"><div className="section-label run-list-heading"><span>{t("运行", "RUNS")} · {runs.length}</span><button type="button" className="run-list-collapse" aria-label={t("收起运行列表", "Collapse runs")} title={t("收起运行列表", "Collapse runs")} onClick={() => setRunListOpen(false)}><PanelLeftClose size={13} /></button></div>{runs.length === 0 && <Empty><EmptyHeader><EmptyMedia variant="icon"><Workflow /></EmptyMedia><EmptyTitle>{t("还没有编排 Run", "No orchestration runs yet")}</EmptyTitle><EmptyDescription>{t("创建目标后，任务图会显示在这里。", "Create a goal and its task graph will appear here.")}</EmptyDescription></EmptyHeader></Empty>}{runs.map((run) => <Button variant={text(run["id"]) === runId ? "secondary" : "ghost"} key={text(run["id"])} className="h-auto w-full justify-start px-3 py-2 text-left" onClick={() => setSelectedRunId(text(run["id"]))}><span className={`status-dot ${text(run["status"])}`} /><span className="flex min-w-0 flex-col items-start gap-1"><strong className="max-w-full truncate">{text(run["objective"])}</strong><small className="text-muted-foreground">{status(text(run["status"]))} · rev {number(run["graphRevision"])}</small></span></Button>)}</aside>
@@ -202,7 +287,7 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
           {!runListOpen && <button className="run-list-toggle" aria-expanded={runListOpen} onClick={() => setRunListOpen(true)}><PanelLeftOpen size={14} />{t("显示运行列表", "Show runs")}</button>}
           {runTasks.length > 0 && <button onClick={() => { setTemplateName(text(selectedRun["objective"])); setTemplateDescription(""); setSaveTemplateOpen(true); }}><Save size={14} />{t("保存为模板", "Save template")}</button>}
           {text(record(selectedRun["automation"])["state"]) !== "running" && text(selectedRun["status"]) === "active" && <button onClick={() => setShowTaskCreate(true)}><Plus size={14} />{t("添加任务", "Add task")}</button>}
-          {text(record(selectedRun["automation"])["state"]) === "running" ? <button onClick={() => void perform("automation", "automation.pause", { operationId: operationId(), runId })}><Pause size={14} />{t("暂停自动执行", "Pause automation")}</button> : <button onClick={() => void perform("automation", "automation.start", { operationId: operationId(), runId, agent: "codex", approvalPolicy: "standard", workspace: "run", cwd: snapshot.projects[0] ?? "." })} disabled={!snapshot.projects[0]}><Play size={14} />{t("自动执行 DAG", "Run DAG automatically")}</button>}
+          {text(record(selectedRun["automation"])["state"]) === "running" ? <button onClick={() => void perform("automation", "automation.pause", { operationId: operationId(), runId })}><Pause size={14} />{t("暂停自动执行", "Pause automation")}</button> : <button onClick={() => void perform("automation", "automation.start", automationStartParams(workerSelection, runId, operationId()))} disabled={!workerProject}><Play size={14} />{t("自动执行 DAG", "Run DAG automatically")}</button>}
           {text(selectedRun["status"]) === "active" && <button onClick={() => void perform("complete", "run.complete", { operationId: operationId(), runId })}><CheckCircle2 size={14} />{t("标记完成", "Mark complete")}</button>}
           {text(selectedRun["status"]) === "active" && <button className="danger" onClick={() => void perform("abandon", "run.abandon", { operationId: operationId(), runId })}><Ban size={14} />{t("放弃", "Abandon")}</button>}
           {text(selectedRun["status"]) !== "active" && <button className="danger" onClick={() => void perform("delete", "run.delete", { operationId: operationId(), runId })}><Trash2 size={14} />{t("删除记录", "Delete record")}</button>}
@@ -212,7 +297,7 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
           <TabsContent value="dag" className="run-view-content run-view-content-dag">{runTasks.length > 0 ? <RunGraph tasks={runTasks} dispatches={runDispatches} /> : <Empty><EmptyHeader><EmptyMedia variant="icon"><Network /></EmptyMedia><EmptyTitle>{t("暂无 DAG 节点", "No DAG nodes")}</EmptyTitle><EmptyDescription>{t("添加任务后依赖图会显示在这里。", "Add tasks to populate the dependency graph.")}</EmptyDescription></EmptyHeader></Empty>}</TabsContent>
           <TabsContent value="timeline" className="run-view-content"><div className="run-timeline">{[...runTasks].reverse().map((task) => <div key={text(task["id"])}><span className={`status-dot ${text(task["status"])}`} /><div><strong>{text(task["title"])}</strong><p>{t("任务", "Task")} {status(text(task["status"]))}{text(task["updatedAt"]) ? ` · ${text(task["updatedAt"])}` : ""}</p></div></div>)}{runGates.map((gate) => <div key={text(gate["id"])}><span className={`status-dot ${text(gate["status"])}`} /><div><strong>{text(gate["question"], t("请求审批", "Gate requested"))}</strong><p>{text(gate["status"]) === "pending" ? t("等待用户决定", "Waiting for a decision") : `${t("决定", "Decision")} · ${text(gate["decision"])}`}</p></div></div>)}{runTasks.length === 0 && runGates.length === 0 && <Empty><EmptyHeader><EmptyMedia variant="icon"><Clock3 /></EmptyMedia><EmptyTitle>{t("暂无事件", "No events yet")}</EmptyTitle><EmptyDescription>{t("Run 的重要事件会按时间显示。", "Important run events appear here in chronological order.")}</EmptyDescription></EmptyHeader></Empty>}</div></TabsContent>
         </Tabs>
-        {runGates.length > 0 && <section className="dashboard-section"><div className="section-title"><ShieldQuestion size={16} />{t("决策 Gate", "Decision gates")} <span>{runGates.length}</span></div><div className="card-grid">{runGates.map((gate) => <article className="gate-card" key={text(gate["id"])}><strong>{text(gate["question"])}</strong><div className="button-row compact">{text(gate["status"]) === "pending" ? array(gate["options"]).map(String).map((option) => <button key={option} onClick={() => void window.prospero.resolveGate(text(gate["id"]), option).catch((reason) => setError(displayError(reason)))}>{option}</button>) : <span className="resolved"><CheckCircle2 size={13} />{text(gate["decision"], t("已处理", "Resolved"))}</span>}</div></article>)}</div></section>}
+        {runGates.length > 0 && <section className="dashboard-section"><div className="section-title"><ShieldQuestion size={16} />{t("决策 Gate", "Decision gates")} <span>{runGates.length}</span></div><div className="card-grid">{runGates.map(gateCard)}</div></section>}
         {runWorktrees.length > 0 && <section className="dashboard-section"><div className="section-title"><GitBranch size={16} />Worktrees <span>{runWorktrees.length}</span><span className="ml-auto text-xs font-normal text-muted-foreground">{attentionWorktrees.length} {t("待处理", "need attention")} · {runWorktrees.length - attentionWorktrees.length} {t("已归档", "archived")}</span><Button variant="ghost" size="sm" className="ml-2" aria-expanded={worktreesExpanded} onClick={() => setWorktreeView({ runId, expanded: !worktreesExpanded, limit: WORKTREE_PAGE_SIZE })}>{worktreesExpanded ? <ChevronDown data-icon="inline-start" /> : <ChevronRight data-icon="inline-start" />}{worktreesExpanded ? t("收起", "Collapse") : t("查看全部", "View all")}</Button></div>{visibleWorktrees.length > 0 ? <div className="worktree-list">{visibleWorktrees.map((asset) => { const inspection = record(asset["lastInspection"]); const safe = ["safe_to_clean", "equivalent"].includes(text(inspection["state"])); const assetId = text(asset["id"]); const assetBusy = busy === assetId; const launchable = isLaunchableWorktreeAsset(asset); return <article className="worktree-row" key={assetId}><GitBranch size={15} /><div><strong>{text(asset["branch"], t("工作树", "Worktree"))}</strong><small>{text(asset["path"])}</small></div><span className="pill">{status(text(asset["state"]))}</span><button disabled={!launchable || assetBusy} title={launchable ? t("在这个 worktree 中启动 Agent", "Start an agent in this worktree") : t("工作树目录不可用", "The worktree directory is unavailable")} onClick={() => onNewSession(text(asset["path"]))}><Bot size={13} />{t("运行 Agent", "Run agent")}</button><button disabled={assetBusy} onClick={() => void perform(assetId, "worktree.inspect", { assetId, targetRef: "main" })}>{t("检查", "Inspect")}</button><button className="danger" disabled={!safe || assetBusy} title={safe ? t("清理已确认安全的工作树", "Clean this verified worktree") : t("必须先通过安全检查", "Run a safety check first")} onClick={() => void perform(assetId, "worktree.cleanup", { operationId: operationId(), assetId, targetRef: text(inspection["targetRef"], "main"), confirm: true, deleteBranch: false })}><Trash2 size={13} />{t("安全清理", "Safe cleanup")}</button></article>; })}</div> : <p className="rounded-lg border border-dashed px-4 py-5 text-sm text-muted-foreground">{t("当前没有需要处理的 Worktree；展开后可查看已清理或已缺失的历史记录。", "No worktrees need attention. Expand to inspect cleaned or missing history.")}</p>}{worktreesExpanded && visibleWorktrees.length < runWorktrees.length && <div className="mt-3 flex justify-center"><Button variant="outline" size="sm" onClick={() => setWorktreeView({ runId, expanded: true, limit: worktreeLimit + WORKTREE_PAGE_SIZE })}>{t("显示更多", "Show more")} · {runWorktrees.length - visibleWorktrees.length}</Button></div>}</section>}
       </> : <Empty><EmptyHeader><EmptyMedia variant="icon"><Workflow /></EmptyMedia><EmptyTitle>{t("选择或创建一个 Run", "Choose or create a run")}</EmptyTitle><EmptyDescription>{t("用 DAG 拆解任务，再把独立节点派给并行 Agent。", "Break work into a DAG and dispatch independent nodes to agents in parallel.")}</EmptyDescription></EmptyHeader></Empty>}</main>
     </div>
