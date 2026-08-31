@@ -1,6 +1,9 @@
 import {
   lazy,
+  memo,
   Suspense,
+  useCallback,
+  useDeferredValue,
   useEffect,
   useMemo,
   useRef,
@@ -54,6 +57,7 @@ import type {
   JsonObject,
   SessionCreateInput,
   SessionInfo,
+  SessionPage,
   UsageAccount,
   UsageReport,
 } from "../../shared/types";
@@ -194,6 +198,12 @@ import { cn } from "@/lib/utils";
 /** Host platform is static and controls native menu labels and shortcuts. */
 const isMac = window.prospero.platform === "darwin";
 const COMPACT_SIDEBAR_BREAKPOINT = 1200;
+const SIDEBAR_PROJECT_PREVIEW_LIMIT = 24;
+const SIDEBAR_PROJECT_PAGE_SIZE = 24;
+const SIDEBAR_PINNED_PREVIEW_LIMIT = 24;
+const SIDEBAR_SEARCH_PAGE_SIZE = 60;
+const SIDEBAR_SEARCH_VISIBLE_LIMIT = 120;
+const HYDRATED_SESSION_CACHE_LIMIT = 120;
 
 const ChatPane = lazy(() =>
   import("./ChatPane").then((module) => ({ default: module.ChatPane })),
@@ -359,6 +369,214 @@ function SessionAgentIcon({
   );
 }
 
+type SidebarSessionHandlers = {
+  onOpenSession: (id: string, session?: SessionInfo) => void;
+  onTogglePin: (id: string) => void;
+  onRenameSession: (id: string) => void;
+  onDuplicateSession: (session: SessionInfo) => void;
+  onSetUnread: (id: string, unread: boolean) => void;
+};
+
+type PinnedSessionRowProps = Pick<
+  SidebarSessionHandlers,
+  "onOpenSession" | "onTogglePin"
+> & {
+  session: SessionInfo;
+};
+
+/**
+ * Pinned rows remain independently mounted from the workspace preview.  This
+ * keeps a pinned session reachable even when its project has hundreds of
+ * historical sessions that are no longer part of the live snapshot.
+ */
+const PinnedSessionRow = memo(function PinnedSessionRow({
+  session,
+  onOpenSession,
+  onTogglePin,
+}: PinnedSessionRowProps) {
+  const { language, t, status } = useLocale();
+  const attention =
+    (session.pendingPermissions ?? 0) + (session.pendingQuestions ?? 0);
+  return (
+    <SidebarMenuItem>
+      <SidebarMenuButton
+        size="lg"
+        tooltip={sessionLabel(session)}
+        onClick={() => onOpenSession(session.id, session)}
+      >
+        <SessionAgentIcon agent={session.agent} />
+        <span className="flex min-w-0 flex-col gap-0.5">
+          <span className="truncate text-xs font-medium">
+            {sessionLabel(session)}
+          </span>
+          <span className="truncate text-[10px] font-normal text-sidebar-foreground/45">
+            {session.agent} · {" "}
+            {attention ? t("需要输入", "Needs input") : status(session.status)} · {" "}
+            {relativeTime(session.createdAt, language)}
+          </span>
+        </span>
+      </SidebarMenuButton>
+      <SidebarMenuAction
+        showOnHover
+        className="session-pin-action is-pinned"
+        aria-pressed="true"
+        aria-label={t(
+          `取消置顶 ${sessionLabel(session)}`,
+          `Unpin ${sessionLabel(session)}`,
+        )}
+        onClick={() => onTogglePin(session.id)}
+      >
+        <Pin className="rotate-45" fill="currentColor" />
+      </SidebarMenuAction>
+    </SidebarMenuItem>
+  );
+}, sidebarSessionRowEqual);
+
+type WorkspaceSessionRowProps = SidebarSessionHandlers & {
+  session: SessionInfo;
+  active: boolean;
+  unread: boolean;
+  pinned: boolean;
+};
+
+/**
+ * Individual session rows are intentionally memoized.  Snapshot transport may
+ * refresh an unrelated daemon field every second; preserving these DOM nodes
+ * avoids re-running all menu/context-menu work for every visible session.
+ */
+const WorkspaceSessionRow = memo(function WorkspaceSessionRow({
+  session,
+  active,
+  unread,
+  pinned,
+  onOpenSession,
+  onTogglePin,
+  onRenameSession,
+  onDuplicateSession,
+  onSetUnread,
+}: WorkspaceSessionRowProps) {
+  const { language, t, status } = useLocale();
+  return (
+    <SidebarMenuSubItem className="workspace-session-item">
+      <ContextMenu>
+        <ContextMenuTrigger
+          render={
+            <SidebarMenuSubButton
+              className="workspace-session-link"
+              isActive={active}
+              title={sessionLabel(session)}
+              onClick={() => onOpenSession(session.id, session)}
+            />
+          }
+        >
+          <SessionAgentIcon agent={session.agent} unread={unread} />
+          <span className="workspace-session-copy">
+            <strong>{sessionLabel(session)}</strong>
+            <small>
+              <StatusMark status={session.status} />
+              {status(session.status)} · {relativeTime(session.createdAt, language)}
+            </small>
+          </span>
+        </ContextMenuTrigger>
+        <ContextMenuContent>
+          <ContextMenuGroup>
+            <ContextMenuLabel>{sessionLabel(session)}</ContextMenuLabel>
+            <ContextMenuItem onClick={() => onSetUnread(session.id, !unread)}>
+              <Mail />
+              {unread
+                ? t("标记为已读", "Mark as read")
+                : t("标记为未读", "Mark as unread")}
+            </ContextMenuItem>
+            <ContextMenuItem onClick={() => onRenameSession(session.id)}>
+              <Pencil />
+              {t("编辑名称", "Rename")}
+            </ContextMenuItem>
+            <ContextMenuItem onClick={() => onDuplicateSession(session)}>
+              <Copy />
+              {t("复制会话", "Duplicate session")}
+            </ContextMenuItem>
+          </ContextMenuGroup>
+          <ContextMenuSeparator />
+          <ContextMenuGroup>
+            <ContextMenuItem onClick={() => onTogglePin(session.id)}>
+              {pinned ? <PinOff /> : <Pin />}
+              {pinned ? t("取消置顶", "Unpin") : t("置顶", "Pin")}
+            </ContextMenuItem>
+            <ContextMenuItem
+              onClick={() => void window.prospero.revealPath(session.cwd)}
+            >
+              <FolderOpen />
+              {isMac
+                ? t("在访达中显示", "Reveal in Finder")
+                : t("在资源管理器中打开", "Open in Explorer")}
+            </ContextMenuItem>
+          </ContextMenuGroup>
+        </ContextMenuContent>
+      </ContextMenu>
+      <button
+        type="button"
+        data-slot="workspace-session-pin"
+        data-testid="workspace-session-pin"
+        className={cn("workspace-session-pin", pinned && "is-pinned")}
+        aria-pressed={pinned}
+        aria-label={
+          pinned
+            ? t(
+                `取消置顶 ${sessionLabel(session)}`,
+                `Unpin ${sessionLabel(session)}`,
+              )
+            : t(`置顶 ${sessionLabel(session)}`, `Pin ${sessionLabel(session)}`)
+        }
+        title={pinned ? t("取消置顶", "Unpin") : t("置顶", "Pin")}
+        onClick={() => onTogglePin(session.id)}
+      >
+        <Pin aria-hidden="true" />
+      </button>
+    </SidebarMenuSubItem>
+  );
+}, sidebarSessionRowEqual);
+
+function sidebarSessionRowEqual(
+  previous: Readonly<PinnedSessionRowProps | WorkspaceSessionRowProps>,
+  next: Readonly<PinnedSessionRowProps | WorkspaceSessionRowProps>,
+): boolean {
+  const left = previous.session;
+  const right = next.session;
+  if (
+    left.id !== right.id ||
+    left.agent !== right.agent ||
+    left.kind !== right.kind ||
+    left.title !== right.title ||
+    left.displayTitle !== right.displayTitle ||
+    left.preview !== right.preview ||
+    left.cwd !== right.cwd ||
+    left.status !== right.status ||
+    left.createdAt !== right.createdAt ||
+    left.pendingPermissions !== right.pendingPermissions ||
+    left.pendingQuestions !== right.pendingQuestions
+  )
+    return false;
+
+  if ("active" in previous && "active" in next) {
+    if (
+      previous.active !== next.active ||
+      previous.unread !== next.unread ||
+      previous.pinned !== next.pinned
+    )
+      return false;
+  }
+
+  return (
+    previous.onOpenSession === next.onOpenSession &&
+    previous.onTogglePin === next.onTogglePin &&
+    (!("onRenameSession" in previous) ||
+      ("onRenameSession" in next &&
+        previous.onRenameSession === next.onRenameSession &&
+        previous.onDuplicateSession === next.onDuplicateSession &&
+        previous.onSetUnread === next.onSetUnread))
+  );
+}
+
 function relativeTime(value: unknown, language: Language): string {
   if (typeof value !== "number" || !Number.isFinite(value))
     return language === "zh" ? "刚刚" : "now";
@@ -466,6 +684,19 @@ function ShellSidebar({
   const { language, t, status } = useLocale();
   const [workspaceOpen, setWorkspaceOpen] = useState(true);
   const [sessionQuery, setSessionQuery] = useState("");
+  const deferredSessionQuery = useDeferredValue(sessionQuery.trim());
+  const [searchPage, setSearchPage] = useState<SessionPage>();
+  const [searchPageQuery, setSearchPageQuery] = useState("");
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [searchLimit, setSearchLimit] = useState(SIDEBAR_SEARCH_PAGE_SIZE);
+  const [pinnedPage, setPinnedPage] = useState<SessionPage>();
+  const [pinnedLoading, setPinnedLoading] = useState(false);
+  const [projectLimit, setProjectLimit] = useState(
+    SIDEBAR_PROJECT_PREVIEW_LIMIT,
+  );
+  const [pinnedLimit, setPinnedLimit] = useState(
+    SIDEBAR_PINNED_PREVIEW_LIMIT,
+  );
   const [daemonUsage, setDaemonUsage] = useState<UsageAccount[]>(getCachedAccountUsage);
   const [daemonUsageLoading, setDaemonUsageLoading] = useState(false);
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(
@@ -492,7 +723,7 @@ function ShellSidebar({
     {},
   );
   const knownProjects = useRef(new Set(snapshot.projects));
-  const normalizedSessionQuery = sessionQuery.trim().toLocaleLowerCase();
+  const normalizedSessionQuery = deferredSessionQuery.toLocaleLowerCase();
   const handleDaemonCardOpen = (open: boolean): void => {
     if (!open || !snapshot.daemon.running) return;
     setDaemonUsage(getCachedAccountUsage());
@@ -592,9 +823,120 @@ function ShellSidebar({
       ),
     [snapshot.daemon.sessions],
   );
-  const pinned = snapshot.pinnedSessionIds
-    .map((id) => sessionsById.get(id))
-    .filter((session): session is SessionInfo => Boolean(session));
+  const pinnedSessionKey = snapshot.pinnedSessionIds.join("\u0000");
+  const pinnedSessionRequestIds = useMemo(
+    () => snapshot.pinnedSessionIds.slice(0, 100),
+    [pinnedSessionKey],
+  );
+  useEffect(() => {
+    if (snapshot.pinnedSessionIds.length === 0) {
+      setPinnedPage(undefined);
+      setPinnedLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setPinnedPage(undefined);
+    setPinnedLoading(true);
+    void window.prospero
+      .listSessions({
+        ids: pinnedSessionRequestIds,
+        limit: SIDEBAR_PINNED_PREVIEW_LIMIT,
+      })
+      .then((page) => {
+        if (!cancelled) setPinnedPage(page);
+      })
+      .catch(() => {
+        // The bounded live snapshot still provides pinned active/recent rows
+        // while the daemon is reconnecting.
+        if (!cancelled) setPinnedPage(undefined);
+      })
+      .finally(() => {
+        if (!cancelled) setPinnedLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [pinnedSessionKey, pinnedSessionRequestIds]);
+  useEffect(() => {
+    if (!deferredSessionQuery) {
+      setSearchPage(undefined);
+      setSearchPageQuery("");
+      setSearchLoading(false);
+      setSearchLimit(SIDEBAR_SEARCH_PAGE_SIZE);
+      return;
+    }
+    let cancelled = false;
+    setSearchLimit(SIDEBAR_SEARCH_PAGE_SIZE);
+    setSearchLoading(true);
+    void window.prospero
+      .listSessions({
+        query: deferredSessionQuery,
+        limit: SIDEBAR_SEARCH_PAGE_SIZE,
+      })
+      .then((page) => {
+        if (!cancelled) {
+          setSearchPage(page);
+          setSearchPageQuery(deferredSessionQuery);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setSearchPage(undefined);
+          setSearchPageQuery(deferredSessionQuery);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setSearchLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [deferredSessionQuery]);
+  const pinned = useMemo(() => {
+    const byId = new Map(sessionsById);
+    for (const session of pinnedPage?.items ?? []) byId.set(session.id, session);
+    return snapshot.pinnedSessionIds
+      .map((id) => byId.get(id))
+      .filter((session): session is SessionInfo => Boolean(session));
+  }, [pinnedPage?.items, sessionsById, snapshot.pinnedSessionIds]);
+  const searchSessions = useMemo(() => {
+    if (!normalizedSessionQuery) return [];
+    const byId = new Map<string, SessionInfo>();
+    for (const session of searchPageQuery === deferredSessionQuery
+      ? searchPage?.items ?? []
+      : []) {
+      byId.set(session.id, session);
+    }
+    // Retain local active/attention sessions immediately while the first
+    // history page is in flight. The daemon page will replace duplicates.
+    for (const session of filterSessionsByQuery(
+      snapshot.daemon.sessions,
+      normalizedSessionQuery,
+      SIDEBAR_SEARCH_PAGE_SIZE,
+    )) {
+      byId.set(session.id, session);
+    }
+    return sortSidebarSessions(
+      [...byId.values()],
+      activeId,
+      snapshot.pinnedSessionIds,
+      snapshot.unreadSessionIds,
+    );
+  }, [
+    activeId,
+    deferredSessionQuery,
+    normalizedSessionQuery,
+    searchPage?.items,
+    searchPageQuery,
+    snapshot.daemon.sessions,
+    snapshot.pinnedSessionIds,
+    snapshot.unreadSessionIds,
+  ]);
+  const visibleSearchSessions = searchSessions.slice(0, searchLimit);
+  const searchResultTotal =
+    searchPageQuery === deferredSessionQuery
+      ? searchPage?.total ?? searchSessions.length
+      : searchSessions.length;
   const sortedProjects = useMemo(() => {
     const originalIndex = new Map(
       snapshot.projects.map((project, index) => [project, index]),
@@ -634,6 +976,110 @@ function ShellSidebar({
     snapshot.projects,
     snapshot.settings.workspaceSort,
     sessionsByProject,
+  ]);
+  const importantProjects = useMemo(() => {
+    const importantIds = new Set<string>([
+      ...(activeId ? [activeId] : []),
+      ...snapshot.pinnedSessionIds,
+      ...snapshot.unreadSessionIds,
+    ]);
+    for (const session of snapshot.daemon.sessions) {
+      if (
+        (session.pendingPermissions ?? 0) +
+          (session.pendingQuestions ?? 0) >
+          0 ||
+        ["running", "starting", "waiting_approval", "waiting_input"].includes(
+          session.status,
+        )
+      )
+        importantIds.add(session.id);
+    }
+    const projects = new Set<string>();
+    for (const id of importantIds) {
+      const session = sessionsById.get(id) ?? pinned.find((item) => item.id === id);
+      if (!session) continue;
+      const project = projectForSession(snapshot.projects, session);
+      if (project) projects.add(project);
+    }
+    return projects;
+  }, [
+    activeId,
+    pinned,
+    sessionsById,
+    snapshot.daemon.sessions,
+    snapshot.pinnedSessionIds,
+    snapshot.projects,
+    snapshot.unreadSessionIds,
+  ]);
+  const visibleProjects = useMemo(() => {
+    const important = sortedProjects.filter((project) =>
+      importantProjects.has(project),
+    );
+    const remaining = sortedProjects.filter(
+      (project) => !importantProjects.has(project),
+    );
+    const selected = new Set([
+      ...important,
+      ...remaining.slice(
+        0,
+        Math.max(0, projectLimit - important.length),
+      ),
+    ]);
+    return sortedProjects.filter((project) => selected.has(project));
+  }, [importantProjects, projectLimit, sortedProjects]);
+  const hiddenProjectCount = Math.max(0, sortedProjects.length - visibleProjects.length);
+  const loadMorePinned = useCallback(() => {
+    if (!pinnedPage?.nextCursor || pinnedLoading) return;
+    setPinnedLoading(true);
+    setPinnedLimit((current) => current + SIDEBAR_PINNED_PREVIEW_LIMIT);
+    void window.prospero
+      .listSessions({
+        ids: pinnedSessionRequestIds,
+        cursor: pinnedPage.nextCursor,
+        limit: SIDEBAR_PINNED_PREVIEW_LIMIT,
+      })
+      .then((next) =>
+        setPinnedPage((current) =>
+          current
+            ? {
+                ...next,
+                items: [...current.items, ...next.items],
+              }
+            : next,
+        ),
+      )
+      .finally(() => setPinnedLoading(false));
+  }, [pinnedLoading, pinnedPage?.nextCursor, pinnedSessionRequestIds]);
+  const loadMoreSearch = useCallback(() => {
+    if (
+      !searchPage?.nextCursor ||
+      searchLoading ||
+      searchPageQuery !== deferredSessionQuery
+    )
+      return;
+    setSearchLoading(true);
+    setSearchLimit((current) =>
+      Math.min(SIDEBAR_SEARCH_VISIBLE_LIMIT, current + SIDEBAR_SEARCH_PAGE_SIZE),
+    );
+    void window.prospero
+      .listSessions({
+        query: deferredSessionQuery,
+        cursor: searchPage.nextCursor,
+        limit: SIDEBAR_SEARCH_PAGE_SIZE,
+      })
+      .then((next) =>
+        setSearchPage((current) =>
+          current
+            ? { ...next, items: [...current.items, ...next.items] }
+            : next,
+        ),
+      )
+      .finally(() => setSearchLoading(false));
+  }, [
+    deferredSessionQuery,
+    searchLoading,
+    searchPage?.nextCursor,
+    searchPageQuery,
   ]);
   const renderNav = (items: NavItem[]) =>
     items.map((item) => (
@@ -685,52 +1131,58 @@ function ShellSidebar({
             <SidebarMenu>{renderNav(resourceNav)}</SidebarMenu>
           </SidebarGroupContent>
         </SidebarGroup>
-        {pinned.length > 0 && <>
+        {snapshot.pinnedSessionIds.length > 0 && <>
           <SidebarSeparator />
           <SidebarGroup>
-            <SidebarGroupLabel>{t("置顶", "Pinned")}</SidebarGroupLabel>
+            <SidebarGroupLabel>
+              {t("置顶", "Pinned")}
+              {snapshot.daemon.sessionSummary?.truncated && (
+                <span className="workspace-session-count">
+                  {pinned.length}/{snapshot.pinnedSessionIds.length}
+                </span>
+              )}
+            </SidebarGroupLabel>
             <SidebarGroupContent>
               <SidebarMenu>
-              {pinned.map((session) => {
-                const attention =
-                  (session.pendingPermissions ?? 0) +
-                  (session.pendingQuestions ?? 0);
-                return (
-                  <SidebarMenuItem key={session.id}>
-                    <SidebarMenuButton
-                      size="lg"
-                      tooltip={sessionLabel(session)}
-                      onClick={() => onOpenSession(session.id)}
-                    >
-                      <SessionAgentIcon agent={session.agent} />
-                      <span className="flex min-w-0 flex-col gap-0.5">
-                        <span className="truncate text-xs font-medium">
-                          {sessionLabel(session)}
-                        </span>
-                        <span className="truncate text-[10px] font-normal text-sidebar-foreground/45">
-                          {session.agent} ·{" "}
-                          {attention
-                            ? t("需要输入", "Needs input")
-                            : status(session.status)}{" "}
-                          · {relativeTime(session.createdAt, language)}
-                        </span>
-                      </span>
-                    </SidebarMenuButton>
-                    <SidebarMenuAction
-                      showOnHover
-                      className="session-pin-action is-pinned"
-                      aria-pressed="true"
-                      aria-label={t(
-                        `取消置顶 ${sessionLabel(session)}`,
-                        `Unpin ${sessionLabel(session)}`,
-                      )}
-                      onClick={() => onTogglePin(session.id)}
-                    >
-                      <Pin className="rotate-45" fill="currentColor" />
-                    </SidebarMenuAction>
+                {pinned.slice(0, pinnedLimit).map((session) => (
+                  <PinnedSessionRow
+                    key={session.id}
+                    session={session}
+                    onOpenSession={onOpenSession}
+                    onTogglePin={onTogglePin}
+                  />
+                ))}
+                {pinned.length === 0 && pinnedLoading && (
+                  <SidebarMenuItem className="workspace-search-summary" aria-live="polite">
+                    <Spinner />
+                    <span>{t("正在载入置顶会话…", "Loading pinned sessions…")}</span>
                   </SidebarMenuItem>
-                );
-              })}
+                )}
+                {(pinned.length > pinnedLimit || pinnedPage?.nextCursor) && (
+                  <SidebarMenuItem className="workspace-session-more-item">
+                    <button
+                      type="button"
+                      data-slot="workspace-session-more"
+                      className="workspace-session-more"
+                      aria-label={t(
+                        `显示更多置顶会话`,
+                        "Show more pinned sessions",
+                      )}
+                      onClick={() => {
+                        if (pinned.length > pinnedLimit)
+                          setPinnedLimit((current) =>
+                            current + SIDEBAR_PINNED_PREVIEW_LIMIT,
+                          );
+                        else loadMorePinned();
+                      }}
+                    >
+                      {pinnedLoading ? <Spinner /> : <ChevronRight aria-hidden="true" />}
+                      <span>
+                        {t("显示更多置顶会话", "Show more pinned sessions")}
+                      </span>
+                    </button>
+                  </SidebarMenuItem>
+                )}
               </SidebarMenu>
             </SidebarGroupContent>
           </SidebarGroup>
@@ -831,7 +1283,71 @@ function ShellSidebar({
             <CollapsibleContent>
               <SidebarGroupContent>
                 <SidebarMenu>
-                  {sortedProjects.map((project) => {
+                  {normalizedSessionQuery ? (
+                    <>
+                      <SidebarMenuItem className="workspace-search-summary" aria-live="polite">
+                        <span>
+                          {searchLoading
+                            ? t("正在搜索会话…", "Searching sessions…")
+                            : t(
+                                `找到 ${String(searchResultTotal)} 个会话`,
+                                `Found ${String(searchResultTotal)} sessions`,
+                              )}
+                        </span>
+                      </SidebarMenuItem>
+                      <SidebarMenuSub>
+                        {visibleSearchSessions.map((session) => (
+                          <WorkspaceSessionRow
+                            key={session.id}
+                            session={session}
+                            active={view === "workspaces" && activeId === session.id}
+                            unread={snapshot.unreadSessionIds.includes(session.id)}
+                            pinned={snapshot.pinnedSessionIds.includes(session.id)}
+                            onOpenSession={onOpenSession}
+                            onTogglePin={onTogglePin}
+                            onRenameSession={onRenameSession}
+                            onDuplicateSession={onDuplicateSession}
+                            onSetUnread={onSetUnread}
+                          />
+                        ))}
+                        {searchSessions.length === 0 && !searchLoading && (
+                          <SidebarMenuSubItem className="workspace-search-empty">
+                            {t("没有匹配的会话", "No matching sessions")}
+                          </SidebarMenuSubItem>
+                        )}
+                        {(searchSessions.length > visibleSearchSessions.length ||
+                          (searchPage?.nextCursor &&
+                            searchPageQuery === deferredSessionQuery &&
+                            searchLimit < SIDEBAR_SEARCH_VISIBLE_LIMIT)) && (
+                            <SidebarMenuSubItem className="workspace-session-more-item">
+                              <button
+                                type="button"
+                                data-slot="workspace-session-more"
+                                className="workspace-session-more"
+                                aria-label={t("显示更多搜索结果", "Show more search results")}
+                                onClick={() => {
+                                  if (
+                                    searchSessions.length >
+                                    visibleSearchSessions.length
+                                  )
+                                    setSearchLimit((current) =>
+                                      Math.min(
+                                        SIDEBAR_SEARCH_VISIBLE_LIMIT,
+                                        current + SIDEBAR_SEARCH_PAGE_SIZE,
+                                      ),
+                                    );
+                                  else loadMoreSearch();
+                                }}
+                              >
+                                {searchLoading ? <Spinner /> : <ChevronRight aria-hidden="true" />}
+                                <span>{t("显示更多搜索结果", "Show more search results")}</span>
+                              </button>
+                            </SidebarMenuSubItem>
+                          )}
+                      </SidebarMenuSub>
+                    </>
+                  ) : (
+                  visibleProjects.map((project) => {
                     const sessions = sessionsByProject.get(project) ?? [];
                     const matchingSessions = filterSessionsByQuery(
                       sessions,
@@ -962,146 +1478,26 @@ function ShellSidebar({
                           </DropdownMenu>
                           <CollapsibleContent>
                             <SidebarMenuSub>
-                              {visibleSessions.map((session) => {
-                                const unread =
-                                  snapshot.unreadSessionIds.includes(
+                              {visibleSessions.map((session) => (
+                                <WorkspaceSessionRow
+                                  key={session.id}
+                                  session={session}
+                                  active={
+                                    view === "workspaces" && activeId === session.id
+                                  }
+                                  unread={snapshot.unreadSessionIds.includes(
                                     session.id,
-                                  );
-                                const sessionPinned =
-                                  snapshot.pinnedSessionIds.includes(
+                                  )}
+                                  pinned={snapshot.pinnedSessionIds.includes(
                                     session.id,
-                                  );
-                                return (
-                                  <SidebarMenuSubItem
-                                    key={session.id}
-                                    className="workspace-session-item"
-                                  >
-                                    <ContextMenu>
-                                      <ContextMenuTrigger
-                                        render={
-                                          <SidebarMenuSubButton
-                                            className="workspace-session-link"
-                                            isActive={
-                                              view === "workspaces" &&
-                                              activeId === session.id
-                                            }
-                                            title={sessionLabel(session)}
-                                            onClick={() =>
-                                              onOpenSession(session.id)
-                                            }
-                                          />
-                                        }
-                                      >
-                                        <SessionAgentIcon
-                                          agent={session.agent}
-                                          unread={unread}
-                                        />
-                                        <span className="workspace-session-copy">
-                                          <strong>{sessionLabel(session)}</strong>
-                                          <small>
-                                            <StatusMark status={session.status} />
-                                            {status(session.status)} · {relativeTime(session.createdAt, language)}
-                                          </small>
-                                        </span>
-                                      </ContextMenuTrigger>
-                                      <ContextMenuContent>
-                                        <ContextMenuGroup>
-                                          <ContextMenuLabel>
-                                            {sessionLabel(session)}
-                                          </ContextMenuLabel>
-                                          <ContextMenuItem
-                                            onClick={() =>
-                                              onSetUnread(session.id, !unread)
-                                            }
-                                          >
-                                            <Mail />
-                                            {unread
-                                              ? t("标记为已读", "Mark as read")
-                                              : t(
-                                                  "标记为未读",
-                                                  "Mark as unread",
-                                                )}
-                                          </ContextMenuItem>
-                                          <ContextMenuItem
-                                            onClick={() =>
-                                              onRenameSession(session.id)
-                                            }
-                                          >
-                                            <Pencil />
-                                            {t("编辑名称", "Rename")}
-                                          </ContextMenuItem>
-                                          <ContextMenuItem
-                                            onClick={() =>
-                                              onDuplicateSession(session)
-                                            }
-                                          >
-                                            <Copy />
-                                            {t("复制会话", "Duplicate session")}
-                                          </ContextMenuItem>
-                                        </ContextMenuGroup>
-                                        <ContextMenuSeparator />
-                                        <ContextMenuGroup>
-                                          <ContextMenuItem
-                                            onClick={() =>
-                                              onTogglePin(session.id)
-                                            }
-                                          >
-                                            {sessionPinned ? (
-                                              <PinOff />
-                                            ) : (
-                                              <Pin />
-                                            )}
-                                            {sessionPinned
-                                              ? t("取消置顶", "Unpin")
-                                              : t("置顶", "Pin")}
-                                          </ContextMenuItem>
-                                          <ContextMenuItem
-                                            onClick={() =>
-                                              void window.prospero.revealPath(
-                                                session.cwd,
-                                              )
-                                            }
-                                          >
-                                            <FolderOpen />
-                                            {isMac
-                                              ? t("在访达中显示", "Reveal in Finder")
-                                              : t("在资源管理器中打开", "Open in Explorer")}
-                                          </ContextMenuItem>
-                                        </ContextMenuGroup>
-                                      </ContextMenuContent>
-                                    </ContextMenu>
-                                    <button
-                                      type="button"
-                                      data-slot="workspace-session-pin"
-                                      data-testid="workspace-session-pin"
-                                      className={cn(
-                                        "workspace-session-pin",
-                                        sessionPinned && "is-pinned",
-                                      )}
-                                      aria-pressed={sessionPinned}
-                                      aria-label={
-                                        sessionPinned
-                                          ? t(
-                                              `取消置顶 ${sessionLabel(session)}`,
-                                              `Unpin ${sessionLabel(session)}`,
-                                            )
-                                          : t(
-                                              `置顶 ${sessionLabel(session)}`,
-                                              `Pin ${sessionLabel(session)}`,
-                                            )
-                                      }
-                                      title={
-                                        sessionPinned
-                                          ? t("取消置顶", "Unpin")
-                                          : t("置顶", "Pin")
-                                      }
-                                      onClick={() => onTogglePin(session.id)}
-                                    >
-                                      <Pin aria-hidden="true" />
-                                    </button>
-                                  </SidebarMenuSubItem>
-                                );
-                              })}
+                                  )}
+                                  onOpenSession={onOpenSession}
+                                  onTogglePin={onTogglePin}
+                                  onRenameSession={onRenameSession}
+                                  onDuplicateSession={onDuplicateSession}
+                                  onSetUnread={onSetUnread}
+                                />
+                              ))}
                               {matchingSessions.length >
                                 SIDEBAR_SESSION_PREVIEW_LIMIT && (
                                 <SidebarMenuSubItem className="workspace-session-more-item">
@@ -1148,7 +1544,34 @@ function ShellSidebar({
                         </SidebarMenuItem>
                       </Collapsible>
                     );
-                  })}
+                  })
+                  )}
+                  {!normalizedSessionQuery && hiddenProjectCount > 0 && (
+                    <SidebarMenuItem className="workspace-session-more-item">
+                      <button
+                        type="button"
+                        data-slot="workspace-session-more"
+                        className="workspace-session-more"
+                        aria-label={t(
+                          `显示更多工作区，剩余 ${String(hiddenProjectCount)}`,
+                          `Show more workspaces; ${String(hiddenProjectCount)} remaining`,
+                        )}
+                        onClick={() =>
+                          setProjectLimit((current) =>
+                            current + SIDEBAR_PROJECT_PAGE_SIZE,
+                          )
+                        }
+                      >
+                        <ChevronRight aria-hidden="true" />
+                        <span>
+                          {t(
+                            `显示更多工作区 · 剩余 ${String(hiddenProjectCount)}`,
+                            `Show more workspaces · ${String(hiddenProjectCount)} remaining`,
+                          )}
+                        </span>
+                      </button>
+                    </SidebarMenuItem>
+                  )}
                   {snapshot.projects.length === 0 && (
                     <SidebarMenuItem>
                       <SidebarMenuButton
@@ -3345,7 +3768,10 @@ function CommandDialog({
 
 export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   const { t } = useLocale();
+  const snapshotRef = useRef(snapshot);
+  snapshotRef.current = snapshot;
   const [view, setView] = useState<View>("overview");
+  const [hydratedSessions, setHydratedSessions] = useState<SessionInfo[]>([]);
   const [openIds, setOpenIds] = useState<string[]>(() => {
     try {
       const stored = JSON.parse(
@@ -3372,14 +3798,29 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   const sidebarOpenRef = useRef(sidebarOpen);
   const sidebarWasAutoCollapsed = useRef(startsWithCompactSidebar);
   const [launcher, setLauncher] = useState<"command" | "quick">();
+  const sessionSnapshot = useMemo(() => {
+    if (hydratedSessions.length === 0) return snapshot;
+    const liveIds = new Set(snapshot.daemon.sessions.map((session) => session.id));
+    const historical = hydratedSessions.filter(
+      (session) => !liveIds.has(session.id),
+    );
+    if (historical.length === 0) return snapshot;
+    return {
+      ...snapshot,
+      daemon: {
+        ...snapshot.daemon,
+        sessions: [...snapshot.daemon.sessions, ...historical],
+      },
+    };
+  }, [hydratedSessions, snapshot]);
   const validOpenIds = useMemo(
     () =>
       openIds.filter((id) =>
-        snapshot.daemon.sessions.some((session) => session.id === id),
+        sessionSnapshot.daemon.sessions.some((session) => session.id === id),
       ),
-    [openIds, snapshot.daemon.sessions],
+    [openIds, sessionSnapshot.daemon.sessions],
   );
-  const activeSession = snapshot.daemon.sessions.find(
+  const activeSession = sessionSnapshot.daemon.sessions.find(
     (session) => session.id === activeId,
   );
   const accountUsageKey = snapshot.accounts
@@ -3391,10 +3832,10 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   useEffect(() => {
     if (
       activeId &&
-      !snapshot.daemon.sessions.some((session) => session.id === activeId)
+      !sessionSnapshot.daemon.sessions.some((session) => session.id === activeId)
     )
       setActiveId(validOpenIds[0]);
-  }, [snapshot.daemon.sessions, activeId, validOpenIds]);
+  }, [sessionSnapshot.daemon.sessions, activeId, validOpenIds]);
   useEffect(() => {
     const systemTheme = window.matchMedia("(prefers-color-scheme: dark)");
     const apply = (): void => {
@@ -3460,35 +3901,47 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
-  const openSession = (id: string): void => {
+  const openSession = useCallback((id: string, session?: SessionInfo): void => {
+    if (session) {
+      setHydratedSessions((current) => {
+        const next = [
+          session,
+          ...current.filter((item) => item.id !== session.id),
+        ];
+        return next.slice(0, HYDRATED_SESSION_CACHE_LIMIT);
+      });
+    }
     setOpenIds((current) =>
       current.includes(id) ? current : [...current, id],
     );
     setActiveId(id);
     setView("workspaces");
-    if (snapshot.unreadSessionIds.includes(id))
+    if (snapshotRef.current.unreadSessionIds.includes(id))
       void window.prospero.setSessionUnread(id, false);
-  };
-  const openRun = (runId?: string): void => {
+  }, []);
+  const openRun = useCallback((runId?: string): void => {
     setRunTargetId(runId);
     setView("runs");
-  };
+  }, []);
   const closeSession = (id: string): void => {
     const index = validOpenIds.indexOf(id);
     const next = validOpenIds.filter((item) => item !== id);
     setOpenIds(next);
     if (activeId === id) setActiveId(next[Math.max(0, index - 1)]);
   };
-  const openNewSession = (project?: string): void => {
+  const openNewSession = useCallback((project?: string): void => {
     setNewSessionProject(project);
     setNewSessionOpen(true);
-  };
-  const togglePin = (id: string): void => {
+  }, []);
+  const togglePin = useCallback((id: string): void => {
     void window.prospero.setSessionPinned(
       id,
-      !snapshot.pinnedSessionIds.includes(id),
+      !snapshotRef.current.pinnedSessionIds.includes(id),
     );
-  };
+  }, []);
+  const setUnread = useCallback((id: string, unread: boolean): void => {
+    void window.prospero.setSessionUnread(id, unread);
+  }, []);
   const [focus, setFocus] = useState(() => {
     try {
       return localStorage.getItem("prospero.focusTerminal") === "true";
@@ -3513,7 +3966,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
-  const duplicateSession = (session: SessionInfo): void => {
+  const duplicateSession = useCallback((session: SessionInfo): void => {
     void (async () => {
       const supportedAgents: SessionCreateInput["agent"][] = [
         "codex",
@@ -3530,7 +3983,8 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
         ? (session.agent as SessionCreateInput["agent"])
         : "shell";
       const project =
-        projectForSession(snapshot.projects, session) ?? snapshot.projects[0];
+        projectForSession(snapshotRef.current.projects, session) ??
+        snapshotRef.current.projects[0];
       if (!project) return;
       const approvalPolicy =
         session.approvalPolicy === "strict" || session.approvalPolicy === "yolo"
@@ -3555,7 +4009,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     })().catch((reason) =>
       console.error("Unable to duplicate session", reason),
     );
-  };
+  }, [openSession, t]);
   const page = getViewCopy(view, t);
   return (
     <SidebarProvider
@@ -3574,19 +4028,17 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
       className="prospero-shell"
     >
       <ShellSidebar
-        snapshot={snapshot}
+        snapshot={sessionSnapshot}
         view={view}
         activeId={activeId}
         onView={setView}
         onOpenSession={openSession}
-        onNewSession={() => openNewSession()}
+        onNewSession={openNewSession}
         onTogglePin={togglePin}
         onRenameProject={setEditingProject}
         onRenameSession={setEditingSession}
         onDuplicateSession={duplicateSession}
-        onSetUnread={(id, unread) =>
-          void window.prospero.setSessionUnread(id, unread)
-        }
+        onSetUnread={setUnread}
       />
       <SidebarInset className="prospero-main">
         <header
@@ -3637,7 +4089,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
           >
             {view === "overview" ? (
               <OverviewPane
-                snapshot={snapshot}
+                snapshot={sessionSnapshot}
                 onOpenSession={openSession}
                 onOpenInbox={() => setView("inbox")}
                 onOpenRuns={() => openRun()}
@@ -3646,16 +4098,16 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
               />
             ) : view === "inbox" ? (
               <InboxPane
-                snapshot={snapshot}
+                snapshot={sessionSnapshot}
                 onOpenSession={openSession}
                 onOpenRuns={() => openRun()}
               />
             ) : view === "mobile" ? (
-              <DevicesPane snapshot={snapshot} />
+              <DevicesPane snapshot={sessionSnapshot} />
             ) : view === "workspaces" ? (
               <WorkspacePane
                 focus={focus}
-                snapshot={snapshot}
+                snapshot={sessionSnapshot}
                 activeId={activeId}
                 openIds={validOpenIds}
                 onActivate={(id) => openSession(id)}
@@ -3666,25 +4118,25 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
               />
             ) : view === "runs" ? (
               <OrchestrationPane
-                snapshot={snapshot}
+                snapshot={sessionSnapshot}
                 onOpenSession={openSession}
                 onNewSession={openNewSession}
                 initialRunId={runTargetId}
               />
             ) : view === "providers" ? (
-              <AccountsPane snapshot={snapshot} onOpenSession={openSession} />
+              <AccountsPane snapshot={sessionSnapshot} onOpenSession={openSession} />
             ) : view === "skills" ? (
-              <SkillsPane snapshot={snapshot} />
+              <SkillsPane snapshot={sessionSnapshot} />
             ) : view === "diagnostics" ? (
-              <LogsPane snapshot={snapshot} />
+              <LogsPane snapshot={sessionSnapshot} />
             ) : (
-              <SettingsPane snapshot={snapshot} />
+              <SettingsPane snapshot={sessionSnapshot} />
             )}
           </Suspense>
         </div>
       </SidebarInset>
       <NewSessionDialog
-        snapshot={snapshot}
+        snapshot={sessionSnapshot}
         project={newSessionProject}
         open={newSessionOpen}
         onOpenChange={setNewSessionOpen}
@@ -3705,7 +4157,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
         }}
       />
       <SessionRenameDialog
-        session={snapshot.daemon.sessions.find(
+        session={sessionSnapshot.daemon.sessions.find(
           (session) => session.id === editingSession,
         )}
         open={Boolean(editingSession)}
@@ -3719,7 +4171,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
           if (!open) setLauncher(undefined);
         }}
         mode={launcher ?? "command"}
-        snapshot={snapshot}
+        snapshot={sessionSnapshot}
         onView={setView}
         onOpenSession={openSession}
         onNewSession={() => openNewSession()}

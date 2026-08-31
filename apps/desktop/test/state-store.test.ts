@@ -121,6 +121,63 @@ describe("Electron state snapshot caching", () => {
     expect(store.snapshot()).toBe(changed);
   });
 
+  it("projects only the daemon's bounded live session slice while retaining global counts", () => {
+    const home = testHome();
+    writeJson(home, "status.json", {
+      sessions: [
+        { id: "attention", cwd: home, agent: "codex", kind: "structured", status: "waiting_input", pendingQuestions: 1 },
+        { id: "recent", cwd: home, agent: "codex", kind: "structured", status: "completed" },
+      ],
+      sessionSummary: {
+        total: 3_742,
+        active: 7,
+        attention: 1,
+        terminal: 3_729,
+        included: 2,
+        omitted: 3_740,
+        activeLimit: 200,
+        attentionLimit: 100,
+        recentTerminalLimit: 50,
+        truncated: true,
+      },
+    });
+    const store = new StateStore(home);
+
+    const current = store.snapshot();
+
+    expect(current.daemon.sessions.map((session) => session.id)).toEqual(["attention", "recent"]);
+    expect(current.daemon.sessionSummary).toEqual({
+      total: 3_742,
+      active: 7,
+      attention: 1,
+      terminal: 3_729,
+      included: 2,
+      omitted: 3_740,
+      activeLimit: 200,
+      attentionLimit: 100,
+      recentTerminalLimit: 50,
+      truncated: true,
+    });
+  });
+
+  it("accepts recent paged-history IDs for local actions without widening the live snapshot", () => {
+    const home = testHome();
+    writeJson(home, "status.json", {
+      sessions: [{ id: "live", cwd: home, agent: "codex", kind: "structured", status: "running" }],
+      sessionSummary: { total: 3_742, active: 1, attention: 0, terminal: 3_741, included: 1, omitted: 3_741, activeLimit: 200, attentionLimit: 100, recentTerminalLimit: 50, truncated: true },
+    });
+    const store = new StateStore(home);
+    store.snapshot();
+
+    store.hydrateSessions([{ id: "historical" }]);
+    store.setSessionPinned("historical", true);
+
+    expect(store.snapshot().pinnedSessionIds).toEqual(["historical"]);
+    expect(store.snapshot().daemon.sessions.map((session) => session.id)).toEqual(["live"]);
+    expect(store.isKnownSession("historical")).toBe(true);
+    expect(store.isKnownSession("missing")).toBe(false);
+  });
+
   it("discovers a session project when its directory appears after the status update", () => {
     const home = testHome();
     const project = resolve(home, "late-project");

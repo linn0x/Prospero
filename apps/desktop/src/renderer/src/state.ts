@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { applyDesktopSnapshotPatch } from "../../shared/snapshot-patch";
+import { applyDesktopSnapshotPatch, mergeDesktopSnapshotPatches } from "../../shared/snapshot-patch";
 import type { DesktopSnapshot, DesktopSnapshotPatch } from "../../shared/types";
 
 export function useDesktopSnapshot(): DesktopSnapshot | undefined {
@@ -17,7 +17,7 @@ export function useDesktopSnapshot(): DesktopSnapshot | undefined {
     const unsubscribe = window.prospero.subscribeSnapshot((patch) => {
       if (!active) return;
       if (!loaded) {
-        pendingPatch = { ...pendingPatch, ...patch };
+        pendingPatch = mergeDesktopSnapshotPatches(pendingPatch, patch);
         return;
       }
       setSnapshot((current) => current ? applyDesktopSnapshotPatch(current, patch) : current);

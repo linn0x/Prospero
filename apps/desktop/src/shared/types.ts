@@ -16,6 +16,46 @@ export type SessionInfo = {
   subagents?: Array<{ id: string; name?: string; role?: string; status?: string }>;
 };
 
+/**
+ * The daemon's complete session population can be very large.  The desktop
+ * snapshot deliberately carries only the sessions that need immediate UI
+ * attention; these counters describe the complete population without making
+ * every renderer refresh pay to deserialize it.
+ */
+export type SessionSummary = {
+  total: number;
+  active: number;
+  attention: number;
+  terminal: number;
+  /** Number of session records included in the live desktop snapshot. */
+  included: number;
+  /** Number of session records available through the paged control API only. */
+  omitted: number;
+  activeLimit: number;
+  attentionLimit: number;
+  recentTerminalLimit: number;
+  truncated: boolean;
+};
+
+/** Cursor is opaque and must be returned unchanged to request the next page. */
+export type SessionPageRequest = {
+  cursor?: string;
+  limit?: number;
+  query?: string;
+  /** Exact IDs for persisted pinned sessions; bounded by the desktop IPC. */
+  ids?: string[];
+  /** Restrict the page to terminal sessions. */
+  terminal?: boolean;
+};
+
+export type SessionPage = {
+  items: SessionInfo[];
+  nextCursor?: string;
+  total: number;
+  active: number;
+  terminal: number;
+};
+
 export type DeviceInfo = {
   name: string;
   allowShell: boolean;
@@ -38,6 +78,8 @@ export type DaemonSnapshot = {
   lastError?: string;
   persistence: { pty: boolean; structured: boolean };
   relay: JsonObject;
+  /** Global counts; `sessions` below is intentionally a bounded live slice. */
+  sessionSummary?: SessionSummary;
   sessions: SessionInfo[];
 };
 
@@ -98,8 +140,23 @@ export type DesktopSnapshot = {
   settings: DesktopSettings;
 };
 
-/** Top-level replacement slices sent after the initial full snapshot. */
-export type DesktopSnapshotPatch = Partial<DesktopSnapshot>;
+/**
+ * Incremental daemon patch.  A normal status refresh changes a handful of
+ * live records, so replacing `sessions` would invalidate every session row in
+ * the renderer.  The first snapshot can still use `sessions`; later updates
+ * use ID-addressed changes and, only when needed, a lightweight order vector.
+ */
+export type DaemonSnapshotPatch = Omit<Partial<DaemonSnapshot>, "sessions"> & {
+  sessions?: SessionInfo[];
+  sessionUpserts?: SessionInfo[];
+  sessionRemovedIds?: string[];
+  sessionOrder?: string[];
+};
+
+/** Top-level snapshot slices sent after the initial full snapshot. */
+export type DesktopSnapshotPatch = Omit<Partial<DesktopSnapshot>, "daemon"> & {
+  daemon?: DaemonSnapshotPatch;
+};
 
 export type SessionCreateInput = {
   cwd: string;
@@ -188,6 +245,8 @@ export type DesktopApi = {
   platform: NodeJS.Platform;
   listNetworkInterfaces(): Promise<Array<{ label: string; address: string }>>;
   createSession(input: SessionCreateInput): Promise<SessionInfo>;
+  /** Fetch terminal/history records only when a list or search needs them. */
+  listSessions(request?: SessionPageRequest): Promise<SessionPage>;
   getSessionView(sessionId: string, query?: Record<string, number>): Promise<JsonObject | null>;
   interact(sessionId: string, message: JsonObject): Promise<void>;
   interruptSession(sessionId: string): Promise<void>;

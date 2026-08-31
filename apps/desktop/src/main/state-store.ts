@@ -11,6 +11,7 @@ import type {
   DeviceInfo,
   JsonObject,
   SessionInfo,
+  SessionSummary,
   WorkflowTemplate,
 } from "../shared/types";
 
@@ -26,6 +27,7 @@ type PersistedDesktopState = {
 };
 
 const SAFE_PERSISTED_SESSION_ID = /^[A-Za-z0-9._:-]{1,160}$/;
+const HYDRATED_SESSION_ID_LIMIT = 500;
 
 type CachedJsonFile = {
   signature: string;
@@ -137,6 +139,45 @@ function records(value: unknown): JsonObject[] {
   return Object.values(objectValue(value)).map(objectValue);
 }
 
+function nonNegativeInteger(value: unknown, fallback = 0): number {
+  return Math.max(0, Math.floor(numberValue(value, fallback)));
+}
+
+function isTerminalSessionStatus(status: string): boolean {
+  return ["completed", "done", "died", "failed", "cancelled", "killed", "idle"].includes(status);
+}
+
+function sessionSummary(value: unknown, sessions: SessionInfo[]): SessionSummary {
+  const summary = objectValue(value);
+  const included = sessions.length;
+  const observedTerminal = sessions.filter((session) => isTerminalSessionStatus(session.status)).length;
+  const observedAttention = sessions.filter((session) =>
+    session.status === "waiting_approval" || session.status === "waiting_input"
+      || (session.pendingPermissions ?? 0) > 0 || (session.pendingQuestions ?? 0) > 0,
+  ).length;
+  const total = Math.max(included, nonNegativeInteger(summary["total"], included));
+  const terminal = Math.min(total, nonNegativeInteger(summary["terminal"], observedTerminal));
+  const active = Math.min(total, nonNegativeInteger(summary["active"], Math.max(0, included - observedTerminal)));
+  const attention = Math.min(total, nonNegativeInteger(summary["attention"], observedAttention));
+  // `sessions` is the authoritative payload that this renderer received. A
+  // partially-written status file must never claim fewer included records than
+  // are actually present, otherwise the sidebar can hide a live attention row.
+  const reportedIncluded = Math.max(included, Math.min(total, nonNegativeInteger(summary["included"], included)));
+  const omitted = Math.max(total - reportedIncluded, nonNegativeInteger(summary["omitted"], total - reportedIncluded));
+  return {
+    total,
+    active,
+    attention,
+    terminal,
+    included: reportedIncluded,
+    omitted,
+    activeLimit: nonNegativeInteger(summary["activeLimit"]),
+    attentionLimit: nonNegativeInteger(summary["attentionLimit"]),
+    recentTerminalLimit: nonNegativeInteger(summary["recentTerminalLimit"]),
+    truncated: booleanValue(summary["truncated"], omitted > 0),
+  };
+}
+
 function normalizeProject(path: string): string {
   const normalized = normalize(resolve(path.trim()));
   return normalized.length > 3 ? normalized.replace(/[\\/]+$/, "") : normalized;
@@ -167,6 +208,13 @@ export class StateStore extends EventEmitter {
   private internalRevision = 0;
   private discoveryStatus: JsonObject | undefined;
   private readonly pendingProjectPaths = new Set<string>();
+  /**
+   * IDs returned by the paged control API.  They are deliberately not added to
+   * `daemon.sessions`: history browsing must not grow the global snapshot.
+   * Keeping a small LRU lets local pin/unread/rename actions validate rows the
+   * user just fetched without trusting an arbitrary renderer-supplied ID.
+   */
+  private readonly hydratedSessionIds = new Map<string, true>();
 
   constructor(home = process.env["PROSPERO_HOME"] || resolve(homedir(), ".prospero")) {
     super();
@@ -217,11 +265,12 @@ export class StateStore extends EventEmitter {
       const port = numberValue(status["port"], numberValue(config["port"], 7423));
       const bind = stringValue(status["bind"], stringValue(config["bind"], "0.0.0.0"));
       const persistence = objectValue(status["persistence"]);
-      const sessions = arrayValue(status["sessions"]).map((entry): SessionInfo => {
+      const previousSessionsById = new Map(previous?.daemon.sessions.map((session) => [session.id, session]));
+      const sessions = reuseEquivalent(previous?.daemon.sessions, arrayValue(status["sessions"]).map((entry): SessionInfo => {
         const value = objectValue(entry);
         const id = stringValue(value["id"]);
         const displayTitle = this.sessionTitles[id];
-        return {
+        return reuseEquivalent(previousSessionsById.get(id), {
           id,
           agent: stringValue(value["agent"], "shell"),
           kind: stringValue(value["kind"], "pty"),
@@ -237,8 +286,10 @@ export class StateStore extends EventEmitter {
           subagents: Array.isArray(value["subagents"])
             ? (value["subagents"] as NonNullable<SessionInfo["subagents"]>)
             : [],
-        };
-      });
+        });
+      }));
+      this.hydrateSessions(sessions);
+      const summary = reuseEquivalent(previous?.daemon.sessionSummary, sessionSummary(status["sessionSummary"], sessions));
       const candidate: DaemonSnapshot = {
         running,
         managed: running && rawPid === this.managedPid,
@@ -254,6 +305,7 @@ export class StateStore extends EventEmitter {
           structured: booleanValue(persistence["structured"]),
         },
         relay: objectValue(status["relay"] ?? config["relay"]),
+        sessionSummary: summary,
         sessions,
         ...(running ? { pid: rawPid } : {}),
         ...(this.lastError ? { lastError: this.lastError } : {}),
@@ -420,7 +472,7 @@ export class StateStore extends EventEmitter {
   }
 
   setSessionPinned(sessionId: string, pinned: boolean): DesktopSnapshot {
-    if (!SAFE_PERSISTED_SESSION_ID.test(sessionId) || !this.snapshot().daemon.sessions.some((session) => session.id === sessionId)) throw new Error("会话不存在");
+    if (!this.isKnownSession(sessionId)) throw new Error("会话不存在");
     this.pinnedSessionIds = pinned
       ? [...new Set([...this.pinnedSessionIds, sessionId])]
       : this.pinnedSessionIds.filter((id) => id !== sessionId);
@@ -430,7 +482,7 @@ export class StateStore extends EventEmitter {
   }
 
   setSessionUnread(sessionId: string, unread: boolean): DesktopSnapshot {
-    if (!SAFE_PERSISTED_SESSION_ID.test(sessionId) || !this.snapshot().daemon.sessions.some((session) => session.id === sessionId)) throw new Error("会话不存在");
+    if (!this.isKnownSession(sessionId)) throw new Error("会话不存在");
     this.unreadSessionIds = unread
       ? [...new Set([...this.unreadSessionIds, sessionId])]
       : this.unreadSessionIds.filter((id) => id !== sessionId);
@@ -471,7 +523,7 @@ export class StateStore extends EventEmitter {
   }
 
   renameSession(sessionId: string, title: string): DesktopSnapshot {
-    if (!this.snapshot().daemon.sessions.some((session) => session.id === sessionId)) throw new Error("会话不存在");
+    if (!this.isKnownSession(sessionId)) throw new Error("会话不存在");
     const normalized = title.trim().replace(/\s+/g, " ").slice(0, 120);
     if (!normalized) throw new Error("会话名称不能为空");
     this.sessionTitles = { ...this.sessionTitles, [sessionId]: normalized };
@@ -487,6 +539,26 @@ export class StateStore extends EventEmitter {
     this.sessionTitles = sessionTitles;
     this.saveDesktopState();
     this.changed();
+  }
+
+  /** Registers paged historical session rows without widening the live snapshot. */
+  hydrateSessions(sessions: readonly Pick<SessionInfo, "id">[]): void {
+    for (const session of sessions) {
+      if (!SAFE_PERSISTED_SESSION_ID.test(session.id)) continue;
+      this.hydratedSessionIds.delete(session.id);
+      this.hydratedSessionIds.set(session.id, true);
+    }
+    while (this.hydratedSessionIds.size > HYDRATED_SESSION_ID_LIMIT) {
+      const oldest = this.hydratedSessionIds.keys().next().value;
+      if (oldest === undefined) break;
+      this.hydratedSessionIds.delete(oldest);
+    }
+  }
+
+  isKnownSession(sessionId: string): boolean {
+    if (!SAFE_PERSISTED_SESSION_ID.test(sessionId)) return false;
+    if (this.hydratedSessionIds.has(sessionId)) return true;
+    return this.snapshot().daemon.sessions.some((session) => session.id === sessionId);
   }
 
   updateSettings(patch: Partial<DesktopSettings>): DesktopSnapshot {

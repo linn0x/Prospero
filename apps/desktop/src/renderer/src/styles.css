@@ -1260,6 +1260,17 @@ kbd {
 .workspace-session-search svg { width: 13px; height: 13px; flex: none; color: color-mix(in srgb, var(--sidebar-foreground) 52%, transparent); }
 .workspace-session-search input { width: 100%; min-width: 0; height: 27px; padding: 0; color: var(--sidebar-foreground); border: 0; background: transparent; box-shadow: none; font-size: 10px; }
 .workspace-session-search input:focus-visible { outline: 0; }
+.workspace-search-summary,
+.workspace-search-empty {
+  display: flex;
+  min-height: 28px;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 9px;
+  color: color-mix(in srgb, var(--sidebar-foreground) 55%, transparent);
+  font-size: 10px;
+}
+.workspace-search-summary [data-slot="spinner"] { width: 12px; height: 12px; }
 .prospero-sidebar [data-sidebar="menu-sub"] { min-width: 0; max-width: 100%; margin-right: 0; padding-right: 0; overflow: visible; }
 .prospero-sidebar [data-sidebar="menu-sub-item"] { min-width: 0; max-width: 100%; }
 .workspace-session-item { overflow: visible; }
