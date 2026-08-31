@@ -9,7 +9,7 @@
 // 已经在 CI 上跑绿了,不值得为了合并而冒险改它。等 macOS 这条也稳定之后
 // 再合成一份跨平台脚本。
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -78,6 +78,22 @@ run("npm", [
   "install", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund",
   "--cache", npmCache, "--os", "darwin", "--cpu", arch,
 ], runtimeRoot);
+
+// `npm install --ignore-scripts` preserves the node-pty binary but drops the
+// executable bit from its macOS spawn helper. The detached PTY host then exits
+// before creating its socket, which surfaces in the UI only as connect ENOENT.
+const ptySpawnHelper = path.join(
+  runtimeRoot,
+  "node_modules",
+  "node-pty",
+  "prebuilds",
+  `darwin-${arch}`,
+  "spawn-helper",
+);
+if (!existsSync(ptySpawnHelper)) {
+  throw new Error(`安装出的运行时缺少 node-pty spawn-helper: ${ptySpawnHelper}`);
+}
+chmodSync(ptySpawnHelper, 0o755);
 
 const installedDaemon = path.join(runtimeRoot, "node_modules", "@prospero", "daemon");
 if (!existsSync(path.join(installedDaemon, "dist", "cli.js"))) {
