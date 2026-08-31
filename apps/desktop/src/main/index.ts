@@ -1,8 +1,9 @@
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { networkInterfaces } from "node:os";
 import { isAbsolute, resolve } from "node:path";
-import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, shell, Tray } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, screen, shell, Tray } from "electron";
+import type { MenuItemConstructorOptions, Rectangle } from "electron";
 import type { DesktopSettings, JsonObject, SessionCreateInput, WorkflowTemplate } from "../shared/types";
 import { diffDesktopSnapshot, isEmptyDesktopSnapshotPatch } from "../shared/snapshot-patch";
 import { isSessionLaunchWorkspace } from "../shared/session-launch-options";
@@ -40,16 +41,67 @@ let quitting = false;
 let previousPendingInteractions = 0;
 let lastBroadcastSnapshot: ReturnType<StateStore["snapshot"]> | undefined;
 let lastBroadcastWindowId: number | undefined;
+let windowStateTimer: ReturnType<typeof setTimeout> | undefined;
 const store = new StateStore();
 const runtime = new DaemonRuntime(store);
 const primaryInstance = app.requestSingleInstanceLock();
 if (!primaryInstance) app.quit();
 app.on("second-instance", () => {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
-  if (mainWindow.isMinimized()) mainWindow.restore();
-  mainWindow.show();
-  mainWindow.focus();
+  showMainWindow();
 });
+
+interface PersistedWindowState extends Rectangle {
+  maximized?: boolean;
+}
+
+const DEFAULT_WINDOW_WIDTH = 1480;
+const DEFAULT_WINDOW_HEIGHT = 920;
+const MIN_WINDOW_WIDTH = 760;
+const MIN_WINDOW_HEIGHT = 560;
+
+function readWindowState(): PersistedWindowState | undefined {
+  try {
+    const value = JSON.parse(readFileSync(resolve(app.getPath("userData"), "window-state.json"), "utf8")) as Partial<PersistedWindowState>;
+    if (![value.x, value.y, value.width, value.height].every((item) => typeof item === "number" && Number.isFinite(item))) return undefined;
+    if (Number(value.width) <= 0 || Number(value.height) <= 0) return undefined;
+    return value as PersistedWindowState;
+  } catch {
+    return undefined;
+  }
+}
+
+function visibleWindowState(saved: PersistedWindowState | undefined): PersistedWindowState {
+  const candidate = saved ?? screen.getPrimaryDisplay().workArea;
+  const workArea = (saved ? screen.getDisplayMatching(candidate) : screen.getPrimaryDisplay()).workArea;
+  const minWidth = Math.min(MIN_WINDOW_WIDTH, workArea.width);
+  const minHeight = Math.min(MIN_WINDOW_HEIGHT, workArea.height);
+  const width = Math.min(workArea.width, Math.max(minWidth, saved?.width ?? DEFAULT_WINDOW_WIDTH));
+  const height = Math.min(workArea.height, Math.max(minHeight, saved?.height ?? DEFAULT_WINDOW_HEIGHT));
+  const centeredX = workArea.x + Math.round((workArea.width - width) / 2);
+  const centeredY = workArea.y + Math.round((workArea.height - height) / 2);
+  const x = Math.min(workArea.x + workArea.width - width, Math.max(workArea.x, saved?.x ?? centeredX));
+  const y = Math.min(workArea.y + workArea.height - height, Math.max(workArea.y, saved?.y ?? centeredY));
+  return { x, y, width, height, ...(saved?.maximized ? { maximized: true } : {}) };
+}
+
+function persistWindowState(window: BrowserWindow): void {
+  if (window.isDestroyed() || window.isFullScreen()) return;
+  const bounds = window.getNormalBounds();
+  try {
+    writeFileSync(resolve(app.getPath("userData"), "window-state.json"), JSON.stringify({ ...bounds, maximized: window.isMaximized() } satisfies PersistedWindowState));
+  } catch {
+    // Window placement is a convenience; a read-only profile must not block shutdown.
+  }
+}
+
+function scheduleWindowStateSave(window: BrowserWindow): void {
+  if (windowStateTimer) clearTimeout(windowStateTimer);
+  windowStateTimer = setTimeout(() => {
+    windowStateTimer = undefined;
+    persistWindowState(window);
+  }, 250);
+  windowStateTimer.unref();
+}
 
 function requireId(value: unknown, label: string): string {
   if (typeof value !== "string" || !SAFE_ID.test(value)) throw new Error(`${label} 无效`);
@@ -110,11 +162,15 @@ function broadcastSnapshot(snapshot: ReturnType<StateStore["snapshot"]> = store.
 
 function createWindow(): BrowserWindow {
   const dark = nativeTheme.shouldUseDarkColors;
+  const placement = visibleWindowState(readWindowState());
+  const display = screen.getDisplayMatching(placement);
   const window = new BrowserWindow({
-    width: 1480,
-    height: 920,
-    minWidth: 760,
-    minHeight: 560,
+    x: placement.x,
+    y: placement.y,
+    width: placement.width,
+    height: placement.height,
+    minWidth: Math.min(MIN_WINDOW_WIDTH, display.workArea.width),
+    minHeight: Math.min(MIN_WINDOW_HEIGHT, display.workArea.height),
     show: false,
     backgroundColor: dark ? "#111114" : "#f4f4f5",
     title: "Prospero",
@@ -143,10 +199,21 @@ function createWindow(): BrowserWindow {
   window.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
   window.webContents.session.setPermissionCheckHandler(() => false);
   window.once("ready-to-show", () => { if (!START_HIDDEN) window.show(); });
+  if (placement.maximized) window.maximize();
+  window.on("move", () => scheduleWindowStateSave(window));
+  window.on("resize", () => scheduleWindowStateSave(window));
   window.on("close", (event) => {
+    persistWindowState(window);
     if (!quitting && store.snapshot().settings.minimizeToTray) {
       event.preventDefault();
       window.hide();
+    }
+  });
+  window.on("closed", () => {
+    if (mainWindow === window) mainWindow = undefined;
+    if (!quitting && !store.snapshot().settings.minimizeToTray) {
+      quitting = true;
+      app.quit();
     }
   });
 
@@ -158,31 +225,87 @@ function createWindow(): BrowserWindow {
   return window;
 }
 
+function showMainWindow(): void {
+  if (!mainWindow || mainWindow.isDestroyed()) mainWindow = createWindow();
+  const window = mainWindow;
+  const reveal = (): void => {
+    if (window.isDestroyed()) return;
+    if (window.isMinimized()) window.restore();
+    window.show();
+    window.focus();
+  };
+  if (window.webContents.isLoading()) window.once("ready-to-show", reveal);
+  else reveal();
+}
+
 function createTray(): void {
   if (tray) return;
   const iconPath = app.isPackaged
     ? resolve(process.resourcesPath, "assets", "AppIcon.png")
     : resolve(app.getAppPath(), "..", "shell", "Resources", "AppIcon-1024.png");
-  const icon = nativeImage.createFromPath(iconPath).resize({ width: 16, height: 16 });
-  if (icon.isEmpty()) return;
+  const source = nativeImage.createFromPath(iconPath);
+  if (source.isEmpty()) return;
   // macOS 菜单栏图标必须是模板图:系统按明暗自动反色。不标记的话深色菜单栏上
   // 会挂着一块彩色方块,和其它菜单栏项格格不入。
+  // macOS 会从原图创建适合当前菜单栏 scale factor 的 image representation。
+  // 先缩成单一 16px 位图会让 Retina 菜单栏只能插值放大，笔画明显发糊。
+  const icon = process.platform === "darwin"
+    ? source
+    : source.resize({ width: 16, height: 16 });
   if (process.platform === "darwin") icon.setTemplateImage(true);
   tray = new Tray(icon);
   tray.setToolTip("Prospero · Agent 工作台");
   refreshTrayMenu();
-  tray.on("double-click", () => { mainWindow?.show(); mainWindow?.focus(); });
+  tray.on("double-click", showMainWindow);
 }
 
 function refreshTrayMenu(): void {
   if (!tray) return;
   tray.setContextMenu(Menu.buildFromTemplate([
-    { label: "打开 Prospero", click: () => { mainWindow?.show(); mainWindow?.focus(); } },
+    { label: "打开 Prospero", click: showMainWindow },
     { label: "启动 daemon", click: () => void runtime.start() },
     { label: "重启 daemon", click: () => void runtime.restart(), enabled: runtime.managed },
     { type: "separator" },
     { label: "退出", click: () => { quitting = true; app.quit(); } },
   ]));
+}
+
+function installApplicationMenu(): void {
+  if (process.platform !== "darwin") return;
+  const template: MenuItemConstructorOptions[] = [
+    {
+      label: app.name,
+      submenu: [
+        { role: "about" },
+        { type: "separator" },
+        { role: "services" },
+        { type: "separator" },
+        { role: "hide" },
+        { role: "hideOthers" },
+        { role: "unhide" },
+        { type: "separator" },
+        { role: "quit" },
+      ],
+    },
+    {
+      role: "editMenu",
+      submenu: [
+        { role: "undo" }, { role: "redo" }, { type: "separator" },
+        { role: "cut" }, { role: "copy" }, { role: "paste" }, { role: "pasteAndMatchStyle" },
+        { role: "delete" }, { role: "selectAll" },
+      ],
+    },
+    {
+      role: "viewMenu",
+      submenu: [
+        ...(app.isPackaged ? [] : [{ role: "reload" as const }, { role: "toggleDevTools" as const }, { type: "separator" as const }]),
+        { role: "resetZoom" }, { role: "zoomIn" }, { role: "zoomOut" },
+        { type: "separator" }, { role: "togglefullscreen" },
+      ],
+    },
+    { role: "windowMenu" },
+  ];
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
 async function runDesktopSelfCheck(window: BrowserWindow): Promise<void> {
@@ -818,10 +941,9 @@ function installIpc(): void {
 }
 
 app.on("before-quit", () => { quitting = true; });
-app.on("window-all-closed", () => { /* Windows app remains available in the tray/background. */ });
+app.on("window-all-closed", () => { /* The window close handler applies the background-running preference. */ });
 app.on("activate", () => {
-  if (!mainWindow || mainWindow.isDestroyed()) mainWindow = createWindow();
-  else { mainWindow.show(); mainWindow.focus(); }
+  showMainWindow();
 });
 
 /**
@@ -859,6 +981,7 @@ void app.whenReady().then(async () => {
     return;
   }
   app.setAppUserModelId("ai.prospero.desktop");
+  installApplicationMenu();
   installIpc();
   applyTheme(store.snapshot().settings);
   mainWindow = createWindow();
