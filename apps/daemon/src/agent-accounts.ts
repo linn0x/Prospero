@@ -609,20 +609,26 @@ export class AgentAccountManager {
 
   /**
    * 额度查询只读取账号身份，不应与正在运行的 thread 共用 SQLite runtime。
-   * 本机默认账号还要直接使用用户当前的 Codex 登录目录，避免一次性迁移的
-   * auth.json 在桌面 Codex 刷新令牌后变旧。
+   * 本机默认账号每次查询前同步最新 auth.json 到专用目录，但绝不复用用户的
+   * config.toml/plugins/MCP 配置。否则一次只读额度查询也会启动用户 MCP，甚至
+   * 让一个 Prospero MCP 用真实 ~/.prospero 覆盖正在运行的 daemon control socket。
    */
   usageEnvironment(binding: AccountBinding): Record<string, string> {
     if (binding.agent !== "codex" || binding.apiProfile) return binding.environment;
     const usageRoot = path.join(this.rootsDir, "codex-usage", binding.id);
-    mkdirSync(usageRoot, { recursive: true, mode: 0o700 });
-    chmodSync(usageRoot, 0o700);
+    const usageHome = path.join(usageRoot, "home");
+    const usageSqlite = path.join(usageRoot, "sqlite");
+    for (const directory of [usageRoot, usageHome, usageSqlite]) {
+      mkdirSync(directory, { recursive: true, mode: 0o700 });
+      chmodSync(directory, 0o700);
+    }
+    if (binding.id === NATIVE_IDS.codex) this.migrateNativeCodexAuth(usageHome);
     return {
       ...binding.environment,
       ...(binding.id === NATIVE_IDS.codex
-        ? { CODEX_HOME: this.sharedCodexHome() }
+        ? { CODEX_HOME: usageHome }
         : {}),
-      CODEX_SQLITE_HOME: usageRoot,
+      CODEX_SQLITE_HOME: usageSqlite,
     };
   }
 

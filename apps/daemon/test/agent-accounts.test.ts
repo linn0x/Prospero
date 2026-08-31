@@ -280,19 +280,28 @@ describe("Code Agent 账号隔离", () => {
         last_refresh: "2026-08-21T10:00:00.000Z",
         tokens: { account_id: "refreshed" },
       }));
+      writeFileSync(path.join(sharedCodexHome, "config.toml"), [
+        "[mcp_servers.prospero]",
+        "command = 'must-not-run-during-usage-read'",
+      ].join("\n"));
       const refreshed = manager.resolve("native-codex", "codex");
       expect(JSON.parse(readFileSync(isolatedAuth, "utf8"))).toMatchObject({
         tokens: { account_id: "refreshed" },
       });
 
       const usageEnvironment = manager.usageEnvironment(refreshed);
-      expect(usageEnvironment["CODEX_HOME"]).toBe(sharedCodexHome);
-      expect(usageEnvironment["CODEX_SQLITE_HOME"]).toBe(
-        path.join(home, "agent-accounts", "codex-usage", "native-codex"),
-      );
+      const usageRoot = path.join(home, "agent-accounts", "codex-usage", "native-codex");
+      const usageHome = path.join(usageRoot, "home");
+      const usageSqlite = path.join(usageRoot, "sqlite");
+      expect(usageEnvironment["CODEX_HOME"]).toBe(usageHome);
+      expect(usageEnvironment["CODEX_SQLITE_HOME"]).toBe(usageSqlite);
       expect(usageEnvironment["CODEX_SQLITE_HOME"]).not.toBe(
         refreshed.environment["CODEX_SQLITE_HOME"],
       );
+      expect(JSON.parse(readFileSync(path.join(usageHome, "auth.json"), "utf8"))).toMatchObject({
+        tokens: { account_id: "refreshed" },
+      });
+      expect(existsSync(path.join(usageHome, "config.toml"))).toBe(false);
     } finally {
       if (previousCodexHome === undefined) delete process.env["CODEX_HOME"];
       else process.env["CODEX_HOME"] = previousCodexHome;
