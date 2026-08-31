@@ -467,6 +467,44 @@ describe("daemon 全链路", () => {
     )).toHaveLength(1);
   });
 
+  it("Mac GUI 可按需分页读取本机会话历史，而非读取全量 status.json", async () => {
+    const status = JSON.parse(readFileSync(path.join(home, "status.json"), "utf8")) as {
+      controlToken: string;
+    };
+    const endpoint = `http://127.0.0.1:${String(server.port)}/_prospero/control/sessions?limit=1`;
+    expect((await fetch(endpoint)).status).toBe(401);
+    const response = await fetch(endpoint, {
+      headers: { authorization: `Bearer ${status.controlToken}` },
+    });
+    expect(response.status).toBe(200);
+    const page = await response.json() as {
+      items: Array<{ id: string }>;
+      nextCursor?: string;
+      total: number;
+      active: number;
+      terminal: number;
+    };
+    expect(page.items.length).toBeLessThanOrEqual(1);
+    expect(page.total).toBeGreaterThanOrEqual(page.items.length);
+    expect(page.active + page.terminal).toBeGreaterThanOrEqual(page.total);
+    if (page.nextCursor) {
+      const next = await fetch(`${endpoint}&cursor=${encodeURIComponent(page.nextCursor)}`, {
+        headers: { authorization: `Bearer ${status.controlToken}` },
+      });
+      expect(next.status).toBe(200);
+    }
+    const baseEndpoint = `http://127.0.0.1:${String(server.port)}/_prospero/control/sessions`;
+    expect((await fetch(`${baseEndpoint}?limit=101`, {
+      headers: { authorization: `Bearer ${status.controlToken}` },
+    })).status).toBe(400);
+    expect((await fetch(`${baseEndpoint}?terminal=false`, {
+      headers: { authorization: `Bearer ${status.controlToken}` },
+    })).status).toBe(400);
+    expect((await fetch(`${baseEndpoint}?id=bad%20id`, {
+      headers: { authorization: `Bearer ${status.controlToken}` },
+    })).status).toBe(400);
+  });
+
   it("新建会话前可在用户 home 内预览并选择工作目录", async () => {
     const c = await TestClient.connect(deviceToken, deviceKeys);
     await c.waitFor((m) => m.type === "hello.ok", "hello.ok");

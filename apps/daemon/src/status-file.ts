@@ -11,6 +11,7 @@ import path from "node:path";
 import type { SessionInfo } from "@prospero/protocol";
 import type { SessionManager } from "./session-manager.js";
 import type { RelayRuntimeStatus } from "./relay-host-client.js";
+import { selectStatusSessions, type SessionStatusSummary } from "./session-list.js";
 
 /** 壳只需要这些字段;完整 SessionInfo 里的 seq/totals 之类没必要外泄。 */
 export interface StatusSession {
@@ -51,6 +52,13 @@ export interface StatusSnapshot {
   persistence: { pty: boolean; structured: boolean };
   /** Deliberately safe relay observability; credentials are never copied here. */
   relay?: RelayRuntimeStatus;
+  /**
+   * `sessions` is deliberately a bounded live/recent view.  Full terminal
+   * history remains queryable via the authenticated local control API; these
+   * counts let clients render an honest "N more" affordance without reading a
+   * multi-megabyte status file once per second.
+   */
+  sessionSummary: SessionStatusSummary;
   sessions: StatusSession[];
 }
 
@@ -121,6 +129,7 @@ export class StatusFile {
   }
 
   private write(): void {
+    const selected = selectStatusSessions(this.manager.list());
     const snapshot: StatusSnapshot = {
       pid: process.pid,
       fullAccess: this.meta.fullAccess ?? false,
@@ -131,7 +140,8 @@ export class StatusFile {
       controlToken: this.meta.controlToken,
       persistence: this.meta.persistence,
       ...(this.relay ? { relay: this.relay } : {}),
-      sessions: this.manager.list().map(toStatusSession),
+      sessionSummary: selected.summary,
+      sessions: selected.sessions.map(toStatusSession),
     };
     try {
       writeFileSync(this.filePath, JSON.stringify(snapshot, null, 2));

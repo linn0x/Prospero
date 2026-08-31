@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron";
-import type { DesktopApi, DesktopSettings, DesktopSnapshotPatch, JsonObject, SessionCreateInput } from "../shared/types";
+import type { DesktopApi, DesktopSettings, DesktopSnapshotPatch, JsonObject, SessionCreateInput, SessionPageRequest } from "../shared/types";
 
 const api: DesktopApi = {
   platform: process.platform,
@@ -23,6 +23,7 @@ const api: DesktopApi = {
   revealPath: (path: string) => ipcRenderer.invoke("path:reveal", path),
   openWindowsTerminal: (path: string) => ipcRenderer.invoke("path:terminal", path),
   createSession: (input: SessionCreateInput) => ipcRenderer.invoke("session:create", input),
+  listSessions: (request?: SessionPageRequest) => ipcRenderer.invoke("sessions:list", request),
   getSessionView: (sessionId: string, query?: Record<string, number>) => ipcRenderer.invoke("session:view", sessionId, query),
   interact: (sessionId: string, message: JsonObject) => ipcRenderer.invoke("session:interact", sessionId, message),
   interruptSession: (sessionId: string) => ipcRenderer.invoke("session:interrupt", sessionId),

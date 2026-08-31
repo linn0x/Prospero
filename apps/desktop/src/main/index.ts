@@ -4,7 +4,7 @@ import { networkInterfaces } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, screen, shell, Tray } from "electron";
 import type { MenuItemConstructorOptions, Rectangle } from "electron";
-import type { DesktopSettings, JsonObject, SessionCreateInput, WorkflowTemplate } from "../shared/types";
+import type { DesktopSettings, JsonObject, SessionCreateInput, SessionInfo, SessionPage, SessionPageRequest, WorkflowTemplate } from "../shared/types";
 import { diffDesktopSnapshot, isEmptyDesktopSnapshotPatch } from "../shared/snapshot-patch";
 import { isSessionLaunchWorkspace } from "../shared/session-launch-options";
 import { loginPath, resolveNodeExecutable } from "./host-environment.js";
@@ -118,6 +118,89 @@ function requireSelection(value: unknown, label: string, max: number): string {
 function requireObject(value: unknown): JsonObject {
   if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("参数格式无效");
   return value as JsonObject;
+}
+
+function boundedText(value: unknown, fallback: string, max: number): string {
+  return typeof value === "string" ? value.slice(0, max) : fallback;
+}
+
+function boundedNonNegativeInteger(value: unknown, fallback = 0): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.max(0, Math.floor(value))
+    : fallback;
+}
+
+function sessionInfoFromControl(value: unknown): SessionInfo {
+  const item = requireObject(value);
+  const subagents = Array.isArray(item["subagents"])
+    ? item["subagents"].flatMap((raw) => {
+      if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return [];
+      const subagent = raw as JsonObject;
+      const id = typeof subagent["id"] === "string" ? subagent["id"].slice(0, 160) : "";
+      return id ? [{
+        id,
+        ...(typeof subagent["name"] === "string" ? { name: subagent["name"].slice(0, 200) } : {}),
+        ...(typeof subagent["role"] === "string" ? { role: subagent["role"].slice(0, 200) } : {}),
+        ...(typeof subagent["status"] === "string" ? { status: subagent["status"].slice(0, 80) } : {}),
+      }] : [];
+    })
+    : [];
+  return {
+    id: requireId(item["id"], "会话"),
+    agent: boundedText(item["agent"], "shell", 80),
+    kind: boundedText(item["kind"], "pty", 80),
+    title: boundedText(item["title"], "未命名会话", 500),
+    ...(typeof item["displayTitle"] === "string" ? { displayTitle: item["displayTitle"].slice(0, 500) } : {}),
+    cwd: boundedText(item["cwd"], "", 4_096),
+    status: boundedText(item["status"], "unknown", 80),
+    ...(typeof item["preview"] === "string" ? { preview: item["preview"].slice(0, 2_000) } : {}),
+    ...(typeof item["createdAt"] === "number" && Number.isFinite(item["createdAt"])
+      ? { createdAt: Math.max(0, Math.floor(item["createdAt"])) }
+      : {}),
+    ...(typeof item["pendingPermissions"] === "number" ? { pendingPermissions: boundedNonNegativeInteger(item["pendingPermissions"]) } : {}),
+    ...(typeof item["pendingQuestions"] === "number" ? { pendingQuestions: boundedNonNegativeInteger(item["pendingQuestions"]) } : {}),
+    ...(typeof item["approvalPolicy"] === "string" ? { approvalPolicy: item["approvalPolicy"].slice(0, 80) } : {}),
+    ...(subagents.length > 0 ? { subagents } : {}),
+  };
+}
+
+function sessionPageRequest(raw: unknown): SessionPageRequest {
+  if (raw === undefined) return {};
+  const request = requireObject(raw);
+  const result: SessionPageRequest = {};
+  if (request["cursor"] !== undefined) result.cursor = requireSelection(request["cursor"], "游标", 512);
+  if (request["query"] !== undefined) result.query = requireSelection(request["query"], "搜索词", 200);
+  if (request["limit"] !== undefined) {
+    if (!Number.isSafeInteger(request["limit"]) || Number(request["limit"]) < 1 || Number(request["limit"]) > 100) throw new Error("分页数量无效");
+    result.limit = Number(request["limit"]);
+  }
+  if (request["terminal"] !== undefined) {
+    if (typeof request["terminal"] !== "boolean") throw new Error("终态筛选无效");
+    result.terminal = request["terminal"];
+  }
+  if (request["ids"] !== undefined) {
+    if (!Array.isArray(request["ids"]) || request["ids"].length > 100) throw new Error("会话 ID 筛选无效");
+    result.ids = [...new Set(request["ids"].map((id) => requireId(id, "会话")))];
+  }
+  return result;
+}
+
+function sessionPageFromControl(value: JsonObject | null): SessionPage {
+  const payload = value ?? {};
+  const items = Array.isArray(payload["items"])
+    ? payload["items"].flatMap((item) => {
+      try { return [sessionInfoFromControl(item)]; } catch { return []; }
+    })
+    : [];
+  return {
+    items,
+    ...(typeof payload["nextCursor"] === "string" && payload["nextCursor"].length <= 512
+      ? { nextCursor: payload["nextCursor"] }
+      : {}),
+    total: boundedNonNegativeInteger(payload["total"], items.length),
+    active: boundedNonNegativeInteger(payload["active"]),
+    terminal: boundedNonNegativeInteger(payload["terminal"]),
+  };
 }
 
 function applyTheme(settings: DesktopSettings): void {
@@ -641,12 +724,13 @@ function installIpc(): void {
   ipcMain.handle("session:pin", (_event, rawId: unknown, pinned: unknown) => {
     const sessionId = requireId(rawId, "会话");
     if (typeof pinned !== "boolean") throw new Error("置顶状态无效");
-    if (!store.snapshot().daemon.sessions.some((session) => session.id === sessionId)) throw new Error("会话不存在");
+    if (!store.isKnownSession(sessionId)) throw new Error("会话不存在");
     return store.setSessionPinned(sessionId, pinned);
   });
   ipcMain.handle("session:unread", (_event, rawId: unknown, unread: unknown) => {
     const sessionId = requireId(rawId, "会话");
     if (typeof unread !== "boolean") throw new Error("会话未读状态无效");
+    if (!store.isKnownSession(sessionId)) throw new Error("会话不存在");
     return store.setSessionUnread(sessionId, unread);
   });
   ipcMain.handle("skills:list", async (_event, rawCwd: unknown) => {
@@ -718,6 +802,20 @@ function installIpc(): void {
     }
     return { ok: false, error: `无法打开 Windows Terminal：${lastError}。请从 Microsoft Store 安装或修复 Windows Terminal。` };
   });
+  ipcMain.handle("sessions:list", async (_event, rawRequest: unknown) => {
+    const request = sessionPageRequest(rawRequest);
+    const params = new URLSearchParams();
+    if (request.cursor) params.set("cursor", request.cursor);
+    if (request.limit !== undefined) params.set("limit", String(request.limit));
+    if (request.query) params.set("query", request.query);
+    // The daemon's default is the complete population. Omit `false` so older
+    // daemons that only recognize `terminal=true` remain compatible.
+    if (request.terminal === true) params.set("terminal", "true");
+    for (const id of request.ids ?? []) params.append("id", id);
+    const page = sessionPageFromControl(await runtime.request(`/_prospero/control/sessions${params.size ? `?${params}` : ""}`));
+    store.hydrateSessions(page.items);
+    return page;
+  });
   ipcMain.handle("session:create", async (_event, raw: unknown) => {
     const input = requireObject(raw) as SessionCreateInput;
     const normalized = resolve(String(input.cwd ?? ""));
@@ -771,7 +869,7 @@ function installIpc(): void {
   ipcMain.handle("session:interrupt", (_event, rawId: unknown) => runtime.request(`/_prospero/control/session/${encodeURIComponent(requireId(rawId, "会话"))}/interrupt`, { method: "POST" }));
   ipcMain.handle("session:kill", async (_event, rawId: unknown) => {
     const sessionId = requireId(rawId, "会话");
-    if (!store.snapshot().daemon.sessions.some((session) => session.id === sessionId)) throw new Error("会话不存在");
+    if (!store.isKnownSession(sessionId)) throw new Error("会话不存在");
     const confirmation = await dialog.showMessageBox(mainWindow!, { type: "warning", title: "结束会话", message: "结束并删除这个会话？", detail: "运行中的 Agent 将被终止。", buttons: ["取消", "结束会话"], defaultId: 0, cancelId: 0 });
     if (confirmation.response !== 1) return null;
     const result = await runtime.request(`/_prospero/control/session/${encodeURIComponent(sessionId)}/kill`, { method: "POST" });
