@@ -68,6 +68,7 @@ import { useLocale, type Language } from "./locale";
 import {
   EXPANDED_PROJECTS_STORAGE_KEY,
   SIDEBAR_SESSION_PREVIEW_LIMIT,
+  filterSessionsByQuery,
   mostRelevantProject,
   nextSidebarSessionLimit,
   parseExpandedProjects,
@@ -832,20 +833,10 @@ function ShellSidebar({
                 <SidebarMenu>
                   {sortedProjects.map((project) => {
                     const sessions = sessionsByProject.get(project) ?? [];
-                    const matchingSessions = normalizedSessionQuery
-                      ? sessions.filter((session) =>
-                          [
-                            sessionLabel(session),
-                            session.agent,
-                            session.status,
-                            session.cwd,
-                            session.preview ?? "",
-                          ]
-                            .join(" ")
-                            .toLocaleLowerCase()
-                            .includes(normalizedSessionQuery),
-                        )
-                      : sessions;
+                    const matchingSessions = filterSessionsByQuery(
+                      sessions,
+                      normalizedSessionQuery,
+                    );
                     if (normalizedSessionQuery && matchingSessions.length === 0)
                       return null;
                     const fallback =
@@ -3209,35 +3200,35 @@ function CommandDialog({
   onOpenSession: (id: string) => void;
   onNewSession: () => void;
 }) {
-  const { t } = useLocale();
+  const { status, t } = useLocale();
   const [query, setQuery] = useState("");
   useEffect(() => {
     if (!open) setQuery("");
   }, [open]);
   const actions = [
     ...primaryNav.map((item) => ({
-      key: item.id,
+      key: `view:${item.id}`,
       label: t(`打开${navLabel(item.id, t)}`, `Open ${navLabel(item.id, t)}`),
       detail: t("导航", "Navigation"),
       icon: item.icon,
       run: () => onView(item.id),
     })),
     ...resourceNav.map((item) => ({
-      key: item.id,
+      key: `view:${item.id}`,
       label: t(`打开${navLabel(item.id, t)}`, `Open ${navLabel(item.id, t)}`),
       detail: t("导航", "Navigation"),
       icon: item.icon,
       run: () => onView(item.id),
     })),
     {
-      key: "settings",
+      key: "view:settings",
       label: t("打开设置", "Open Settings"),
       detail: t("导航", "Navigation"),
       icon: Settings,
       run: () => onView("settings" as const),
     },
     {
-      key: "new",
+      key: "action:new",
       label: t("新建会话", "New Session"),
       detail: t("动作", "Action"),
       icon: Plus,
@@ -3246,25 +3237,46 @@ function CommandDialog({
   ];
   const quick = [
     ...snapshot.projects.map((project) => ({
-      key: project,
+      key: `project:${project}`,
       label: project.split(/[\\/]/).filter(Boolean).at(-1) ?? project,
       detail: shortPath(project),
       icon: FolderKanban,
       run: () => onView("workspaces" as const),
     })),
     ...snapshot.daemon.sessions.map((session) => ({
-      key: session.id,
+      key: `session:${session.id}`,
       label: sessionLabel(session),
       detail: `${session.agent} · ${shortPath(session.cwd)}`,
       icon: session.kind === "pty" ? SquareTerminal : MessageSquare,
       run: () => onOpenSession(session.id),
     })),
   ];
-  const options = (mode === "command" ? actions : quick).filter((item) =>
+  const matches = (items: typeof actions | typeof quick) => items.filter((item) =>
     `${item.label} ${item.detail}`
       .toLocaleLowerCase()
       .includes(query.toLocaleLowerCase()),
   );
+  const commandSessions = query.trim()
+    ? filterSessionsByQuery(
+        sortSidebarSessions(
+          snapshot.daemon.sessions,
+          undefined,
+          snapshot.pinnedSessionIds,
+          snapshot.unreadSessionIds,
+        ),
+        query,
+        12,
+      ).map((session) => ({
+        key: `session:${session.id}`,
+        label: sessionLabel(session),
+        detail: `${session.agent} · ${status(session.status)} · ${shortPath(session.cwd)}`,
+        icon: session.kind === "pty" ? SquareTerminal : MessageSquare,
+        run: () => onOpenSession(session.id),
+      }))
+    : [];
+  const options = mode === "command"
+    ? [...matches(actions), ...commandSessions]
+    : matches(quick);
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="command-dialog sm:max-w-xl">
@@ -3293,7 +3305,7 @@ function CommandDialog({
             onChange={(event) => setQuery(event.target.value)}
             placeholder={
               mode === "command"
-                ? t("输入命令…", "Type a command…")
+                ? t("搜索会话或输入命令…", "Search sessions or type a command…")
                 : t(
                     "打开工作区、会话或任务…",
                     "Open workspace, session, or task…",
