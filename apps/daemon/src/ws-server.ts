@@ -66,6 +66,7 @@ import { SessionError, SessionManager, type SessionManagerOptions } from "./sess
 import { RemoteSupervisorError } from "./structured-supervisor-client.js";
 import { createStructuredSupervisorRuntimeSnapshot } from "./structured-supervisor-runtime.js";
 import { StatusFile } from "./status-file.js";
+import { pageSessions } from "./session-list.js";
 import {
   ControlSocketError,
   controlSocketPath as makeControlSocketPath,
@@ -2128,6 +2129,62 @@ export async function createDaemonServer(
     if (req.method === "GET" && url.pathname === "/_prospero/control/health") {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true, sessions: manager.list().length, fullAccess: opts.fullAccess === true }));
+      return;
+    }
+    /**
+     * Full terminal history is intentionally absent from status.json: Electron
+     * reads that file on its global refresh path.  Fetch history only when a
+     * user opens/searches it, through the same loopback+Bearer boundary as
+     * every other desktop control operation.
+     */
+    if (req.method === "GET" && url.pathname === "/_prospero/control/sessions") {
+      try {
+        const rawLimit = url.searchParams.get("limit");
+        if (rawLimit !== null && !/^[1-9][0-9]{0,2}$/.test(rawLimit)) {
+          throw new ControlRequestError("invalid session page limit", 400);
+        }
+        const limit = rawLimit === null ? 50 : Number(rawLimit);
+        if (limit > 100) throw new ControlRequestError("invalid session page limit", 400);
+        const query = url.searchParams.get("query") ?? "";
+        if (query.length > 200) throw new ControlRequestError("invalid session search query", 400);
+        const cursor = url.searchParams.get("cursor") ?? undefined;
+        if (cursor !== undefined && (!cursor || cursor.length > 512)) {
+          throw new ControlRequestError("invalid session cursor", 400);
+        }
+        const rawTerminal = url.searchParams.get("terminal");
+        if (rawTerminal !== null && rawTerminal !== "true") {
+          throw new ControlRequestError("invalid terminal session filter", 400);
+        }
+        // `id` may be repeated and `ids` accepts a compact comma-delimited
+        // spelling.  Exact ids let the sidebar restore pinned historical
+        // sessions without downloading/searching all terminal history first.
+        const rawIds = [
+          ...url.searchParams.getAll("id"),
+          ...url.searchParams.getAll("ids").flatMap((value) => value.split(",")),
+        ];
+        if (
+          rawIds.length > 100
+          || rawIds.some((id) => !/^[A-Za-z0-9._:-]{1,160}$/.test(id))
+        ) {
+          throw new ControlRequestError("invalid session id filter", 400);
+        }
+        const ids = [...new Set(rawIds)];
+        const page = pageSessions(manager.list(), {
+          ...(cursor ? { cursor } : {}),
+          limit,
+          query,
+          terminalOnly: rawTerminal === "true",
+          ...(ids.length ? { ids } : {}),
+        });
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          ...page,
+          items: page.items.map((session) => sanitizeSessionInfo(clampSessionInfo(session))),
+        }));
+      } catch (error) {
+        const status = error instanceof ControlRequestError ? error.status : 400;
+        res.writeHead(status).end(error instanceof Error ? error.message : String(error));
+      }
       return;
     }
     if (req.method === "POST" && url.pathname === "/_prospero/control/shutdown") {

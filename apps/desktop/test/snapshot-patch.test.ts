@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyDesktopSnapshotPatch, diffDesktopSnapshot, isEmptyDesktopSnapshotPatch } from "../src/shared/snapshot-patch";
+import { applyDesktopSnapshotPatch, diffDesktopSnapshot, isEmptyDesktopSnapshotPatch, mergeDesktopSnapshotPatches } from "../src/shared/snapshot-patch";
 import type { DesktopSnapshot } from "../src/shared/types";
 
 function snapshot(): DesktopSnapshot {
@@ -48,7 +48,7 @@ describe("desktop snapshot patches", () => {
     const next = { ...previous, daemon: { ...previous.daemon, starting: true, state: "starting" } };
 
     expect(diffDesktopSnapshot(undefined, previous)).toBe(previous);
-    expect(diffDesktopSnapshot(previous, next)).toEqual({ daemon: next.daemon });
+    expect(diffDesktopSnapshot(previous, next)).toEqual({ daemon: { starting: true, state: "starting" } });
   });
 
   it("merges a patch without replacing unchanged slice identities", () => {
@@ -60,5 +60,51 @@ describe("desktop snapshot patches", () => {
     expect(merged.orchestration).toBe(previous.orchestration);
     expect(merged.settings).toBe(previous.settings);
     expect(isEmptyDesktopSnapshotPatch(diffDesktopSnapshot(merged, merged))).toBe(true);
+  });
+
+  it("patches only changed session IDs and preserves untouched records", () => {
+    const previous = snapshot();
+    const first = { id: "session-1", agent: "codex", kind: "structured", title: "first", cwd: "/one", status: "completed" };
+    const second = { id: "session-2", agent: "codex", kind: "structured", title: "second", cwd: "/two", status: "running" };
+    const initial = { ...previous, daemon: { ...previous.daemon, sessions: [first, second] } };
+    const changedSecond = { ...second, status: "waiting_input", pendingQuestions: 1 };
+    const next = { ...initial, daemon: { ...initial.daemon, sessions: [first, changedSecond] } };
+
+    const patch = diffDesktopSnapshot(initial, next);
+
+    expect(patch.daemon).toEqual({ sessionUpserts: [changedSecond] });
+    expect(patch.daemon).not.toHaveProperty("sessions");
+    const applied = applyDesktopSnapshotPatch(initial, patch);
+    expect(applied.daemon.sessions).toEqual(next.daemon.sessions);
+    expect(applied.daemon.sessions[0]).toBe(first);
+    expect(applied.daemon.sessions[1]).toBe(changedSecond);
+  });
+
+  it("applies removals and a compact order vector without replacing all sessions", () => {
+    const previous = snapshot();
+    const first = { id: "session-1", agent: "codex", kind: "structured", title: "first", cwd: "/one", status: "completed" };
+    const second = { id: "session-2", agent: "codex", kind: "structured", title: "second", cwd: "/two", status: "completed" };
+    const third = { id: "session-3", agent: "codex", kind: "structured", title: "third", cwd: "/three", status: "running" };
+    const initial = { ...previous, daemon: { ...previous.daemon, sessions: [first, second, third] } };
+    const next = { ...initial, daemon: { ...initial.daemon, sessions: [third, first] } };
+
+    const patch = diffDesktopSnapshot(initial, next);
+
+    expect(patch.daemon).toEqual({ sessionRemovedIds: ["session-2"], sessionOrder: ["session-3", "session-1"] });
+    const applied = applyDesktopSnapshotPatch(initial, patch);
+    expect(applied.daemon.sessions).toEqual([third, first]);
+    expect(applied.daemon.sessions[0]).toBe(third);
+  });
+
+  it("retains all session deltas received before the initial snapshot resolves", () => {
+    const first = { id: "session-1", agent: "codex", kind: "structured", title: "first", cwd: "/one", status: "running" };
+    const second = { id: "session-2", agent: "codex", kind: "structured", title: "second", cwd: "/two", status: "waiting_input" };
+    const combined = mergeDesktopSnapshotPatches(
+      { daemon: { sessionUpserts: [first] } },
+      { daemon: { sessionUpserts: [second], sessionOrder: ["session-2", "session-1"] } },
+    );
+    const current = { ...snapshot(), daemon: { ...snapshot().daemon, sessions: [] } };
+
+    expect(applyDesktopSnapshotPatch(current, combined).daemon.sessions).toEqual([second, first]);
   });
 });
