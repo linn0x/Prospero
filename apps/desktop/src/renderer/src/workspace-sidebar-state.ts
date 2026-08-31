@@ -3,6 +3,21 @@ import type { SessionInfo } from "../../shared/types";
 export const EXPANDED_PROJECTS_STORAGE_KEY =
   "prospero.workspace.expandedProjects";
 export const SIDEBAR_SESSION_PREVIEW_LIMIT = 6;
+export const SIDEBAR_SESSION_PAGE_SIZE = 24;
+
+export function nextSidebarSessionLimit(
+  currentLimit: number,
+  total: number,
+): number {
+  if (total <= SIDEBAR_SESSION_PREVIEW_LIMIT)
+    return total;
+  if (currentLimit >= total) return SIDEBAR_SESSION_PREVIEW_LIMIT;
+  return Math.min(
+    total,
+    Math.max(SIDEBAR_SESSION_PREVIEW_LIMIT, currentLimit) +
+      SIDEBAR_SESSION_PAGE_SIZE,
+  );
+}
 
 export function projectForSession(
   projects: string[],
@@ -56,6 +71,26 @@ export function mostRelevantProject(
     }
   }
   return recentProject ?? projects[0];
+}
+
+export function sortProjectsByRecentActivity(
+  projects: string[],
+  sessions: SessionInfo[],
+): string[] {
+  const originalIndex = new Map(
+    projects.map((project, index) => [project, index]),
+  );
+  const latest = new Map(projects.map((project) => [project, 0]));
+  for (const session of sessions) {
+    const project = projectForSession(projects, session);
+    if (!project) continue;
+    latest.set(project, Math.max(latest.get(project) ?? 0, session.createdAt ?? 0));
+  }
+  return [...projects].sort(
+    (left, right) =>
+      (latest.get(right) ?? 0) - (latest.get(left) ?? 0) ||
+      (originalIndex.get(left) ?? 0) - (originalIndex.get(right) ?? 0),
+  );
 }
 
 /**
