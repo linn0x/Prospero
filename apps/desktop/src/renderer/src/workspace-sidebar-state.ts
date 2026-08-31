@@ -5,6 +5,37 @@ export const EXPANDED_PROJECTS_STORAGE_KEY =
 export const SIDEBAR_SESSION_PREVIEW_LIMIT = 6;
 export const SIDEBAR_SESSION_PAGE_SIZE = 24;
 
+/**
+ * The sidebar, quick open, and command center must agree on what a session
+ * search means. Keeping the searchable fields here prevents one surface from
+ * finding a session which another surface appears to have "lost".
+ */
+export function sessionSearchText(session: SessionInfo): string {
+  return [
+    session.displayTitle,
+    session.title,
+    session.preview,
+    session.agent,
+    session.status,
+    session.cwd,
+  ]
+    .filter((value): value is string => typeof value === "string")
+    .join(" ")
+    .toLocaleLowerCase();
+}
+
+export function filterSessionsByQuery(
+  sessions: SessionInfo[],
+  query: string,
+  limit = Number.POSITIVE_INFINITY,
+): SessionInfo[] {
+  const normalized = query.trim().toLocaleLowerCase();
+  const matches = normalized
+    ? sessions.filter((session) => sessionSearchText(session).includes(normalized))
+    : sessions;
+  return matches.slice(0, Math.max(0, limit));
+}
+
 export function nextSidebarSessionLimit(
   currentLimit: number,
   total: number,

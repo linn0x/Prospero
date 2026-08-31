@@ -100,6 +100,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
       cursorBlink: true,
       cursorStyle: "bar",
       cursorWidth: 2,
+      cursorInactiveStyle: "outline",
       fontFamily,
       fontSize,
       fontWeight: "400",
