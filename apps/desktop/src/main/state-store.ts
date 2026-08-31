@@ -498,7 +498,7 @@ export class StateStore extends EventEmitter {
     if (patch.theme === "system" || patch.theme === "dark" || patch.theme === "light") next.theme = patch.theme;
     if (patch.workspaceSort === "recent" || patch.workspaceSort === "name") next.workspaceSort = patch.workspaceSort;
     if (typeof patch.terminalFontFamily === "string" && patch.terminalFontFamily.trim()) next.terminalFontFamily = patch.terminalFontFamily.trim().slice(0, 200);
-    if (typeof patch.terminalFontSize === "number" && patch.terminalFontSize >= 9 && patch.terminalFontSize <= 32) next.terminalFontSize = patch.terminalFontSize;
+    if (typeof patch.terminalFontSize === "number" && patch.terminalFontSize >= 8 && patch.terminalFontSize <= 48) next.terminalFontSize = patch.terminalFontSize;
     // 只接受点分四段的 IPv4:这个值会直接变成 daemon 的 --bind 参数,
     // 而 daemon 拿到一个不在本机的地址会启动失败,错误只出现在日志里。
     if (typeof patch.daemonBind === "string" && /^\d{1,3}(\.\d{1,3}){3}$/.test(patch.daemonBind.trim())) next.daemonBind = patch.daemonBind.trim();
