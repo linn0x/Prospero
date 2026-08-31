@@ -127,6 +127,25 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
   const runTasks = useMemo(() => tasks.filter((task) => text(task["runId"]) === runId), [tasks, runId]);
   const runGates = useMemo(() => gates.filter((gate) => text(gate["runId"]) === runId), [gates, runId]);
   const runDispatches = useMemo(() => dispatches.filter((dispatch) => text(dispatch["runId"]) === runId), [dispatches, runId]);
+  const dispatchByTaskId = useMemo(() => {
+    const latest = new Map<string, JsonObject>();
+    for (const dispatch of runDispatches) {
+      const taskId = text(dispatch["taskId"]);
+      const previous = latest.get(taskId);
+      if (!previous || number(dispatch["startedAt"]) >= number(previous["startedAt"])) latest.set(taskId, dispatch);
+    }
+    return latest;
+  }, [runDispatches]);
+  const tasksByStatus = useMemo(() => {
+    const grouped = new Map<string, JsonObject[]>();
+    for (const task of runTasks) {
+      const taskStatus = text(task["status"]);
+      const group = grouped.get(taskStatus);
+      if (group) group.push(task);
+      else grouped.set(taskStatus, [task]);
+    }
+    return grouped;
+  }, [runTasks]);
   const runWorktrees = useMemo(
     () => prioritizeWorktrees(worktreeAssets.filter((asset) => text(asset["runId"]) === runId)),
     [runId, worktreeAssets],
@@ -253,7 +272,7 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
   ];
 
   const taskCard = (task: JsonObject) => {
-    const taskId = text(task["id"]); const deps = array(task["deps"]).map(String); const dispatch = runDispatches.find((item) => text(item["taskId"]) === taskId);
+    const taskId = text(task["id"]); const deps = array(task["deps"]).map(String); const dispatch = dispatchByTaskId.get(taskId);
     return <Card size="sm" className="run-task-card" key={taskId}><CardHeader><div className="flex items-start justify-between gap-2"><CardTitle>{text(task["title"])}</CardTitle><span className={`status-dot ${text(task["status"])}`} /></div><CardDescription>{text(task["spec"])}</CardDescription></CardHeader><CardContent className="flex flex-col gap-2">{deps.length > 0 && <Badge variant="outline" className="w-fit"><GitPullRequestArrow />{deps.length} {t("个依赖", "dependencies")}</Badge>}{dispatch && <div className="task-assignee"><Bot /><span>{text(dispatch["agent"], workerAgent)}</span><small>{text(dispatch["branch"], t("隔离工作树", "isolated worktree"))}</small></div>}</CardContent><CardFooter className="flex-wrap">
       {["pending", "blocked", "ready"].includes(text(task["status"])) && <Button variant="outline" size="sm" disabled={busy === taskId} onClick={() => void startWorker(task)}><Bot data-icon="inline-start" />{t("启动", "Start")}</Button>}
       {text(task["status"]) === "failed" && <Button variant="outline" size="sm" onClick={() => void perform(taskId, "task.retry", { operationId: operationId(), taskId })}><RefreshCw data-icon="inline-start" />{t("重试", "Retry")}</Button>}
@@ -298,10 +317,24 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
           {text(selectedRun["status"]) === "active" && <button className="danger" onClick={() => void perform("abandon", "run.abandon", { operationId: operationId(), runId })}><Ban size={14} />{t("放弃", "Abandon")}</button>}
           {text(selectedRun["status"]) !== "active" && <button className="danger" onClick={() => void perform("delete", "run.delete", { operationId: operationId(), runId })}><Trash2 size={14} />{t("删除记录", "Delete record")}</button>}
         </div></div>
-        <Tabs value={runView} onValueChange={changeRunView} className={`run-views${runView === "dag" ? " run-views-dag" : ""}`}><TabsList variant="line"><TabsTrigger value="board"><Columns3 />{t("看板", "Board")}</TabsTrigger><TabsTrigger value="dag"><Network />DAG</TabsTrigger><TabsTrigger value="timeline"><Clock3 />{t("时间线", "Timeline")}</TabsTrigger></TabsList>
-          <TabsContent value="board" className="run-view-content"><div className="run-board">{boardColumns.map((column) => { const columnTasks = runTasks.filter((task) => column.statuses.includes(text(task["status"]))); return <section className="board-column" key={column.id}><header><span>{column.label}</span><Badge variant="outline">{columnTasks.length}</Badge></header><div>{columnTasks.map(taskCard)}{columnTasks.length === 0 && <div className="board-empty">{t("暂无任务", "No tasks")}</div>}</div></section>; })}</div></TabsContent>
-          <TabsContent value="dag" className="run-view-content run-view-content-dag">{runTasks.length > 0 ? <RunGraph tasks={runTasks} dispatches={runDispatches} /> : <Empty><EmptyHeader><EmptyMedia variant="icon"><Network /></EmptyMedia><EmptyTitle>{t("暂无 DAG 节点", "No DAG nodes")}</EmptyTitle><EmptyDescription>{t("添加任务后依赖图会显示在这里。", "Add tasks to populate the dependency graph.")}</EmptyDescription></EmptyHeader></Empty>}</TabsContent>
-          <TabsContent value="timeline" className="run-view-content"><div className="run-timeline">{[...runTasks].reverse().map((task) => <div key={text(task["id"])}><span className={`status-dot ${text(task["status"])}`} /><div><strong>{text(task["title"])}</strong><p>{t("任务", "Task")} {status(text(task["status"]))}{text(task["updatedAt"]) ? ` · ${text(task["updatedAt"])}` : ""}</p></div></div>)}{runGates.map((gate) => <div key={text(gate["id"])}><span className={`status-dot ${text(gate["status"])}`} /><div><strong>{text(gate["question"], t("请求审批", "Gate requested"))}</strong><p>{text(gate["status"]) === "pending" ? t("等待用户决定", "Waiting for a decision") : `${t("决定", "Decision")} · ${text(gate["decision"])}`}</p></div></div>)}{runTasks.length === 0 && runGates.length === 0 && <Empty><EmptyHeader><EmptyMedia variant="icon"><Clock3 /></EmptyMedia><EmptyTitle>{t("暂无事件", "No events yet")}</EmptyTitle><EmptyDescription>{t("Run 的重要事件会按时间显示。", "Important run events appear here in chronological order.")}</EmptyDescription></EmptyHeader></Empty>}</div></TabsContent>
+        <Tabs value={runView} onValueChange={changeRunView} className={`run-views${runView === "dag" ? " run-views-dag" : ""}`}>
+          <TabsList variant="line">
+            <TabsTrigger value="board"><Columns3 />{t("看板", "Board")}</TabsTrigger>
+            <TabsTrigger value="dag"><Network />DAG</TabsTrigger>
+            <TabsTrigger value="timeline"><Clock3 />{t("时间线", "Timeline")}</TabsTrigger>
+          </TabsList>
+          {runView === "board" && <TabsContent value="board" className="run-view-content">
+            <div className="run-board">{boardColumns.map((column) => {
+              const columnTasks = column.statuses.flatMap((taskStatus) => tasksByStatus.get(taskStatus) ?? []);
+              return <section className="board-column" key={column.id}><header><span>{column.label}</span><Badge variant="outline">{columnTasks.length}</Badge></header><div>{columnTasks.map(taskCard)}{columnTasks.length === 0 && <div className="board-empty">{t("暂无任务", "No tasks")}</div>}</div></section>;
+            })}</div>
+          </TabsContent>}
+          {runView === "dag" && <TabsContent value="dag" className="run-view-content run-view-content-dag">
+            {runTasks.length > 0 ? <RunGraph tasks={runTasks} dispatches={runDispatches} /> : <Empty><EmptyHeader><EmptyMedia variant="icon"><Network /></EmptyMedia><EmptyTitle>{t("暂无 DAG 节点", "No DAG nodes")}</EmptyTitle><EmptyDescription>{t("添加任务后，依赖图会显示在这里。", "Add tasks to populate the dependency graph.")}</EmptyDescription></EmptyHeader></Empty>}
+          </TabsContent>}
+          {runView === "timeline" && <TabsContent value="timeline" className="run-view-content">
+            <div className="run-timeline">{[...runTasks].reverse().map((task) => <div key={text(task["id"])}><span className={`status-dot ${text(task["status"])}`} /><div><strong>{text(task["title"])}</strong><p>{t("任务", "Task")} {status(text(task["status"]))}{text(task["updatedAt"]) ? ` · ${text(task["updatedAt"])}` : ""}</p></div></div>)}{runGates.map((gate) => <div key={text(gate["id"])}><span className={`status-dot ${text(gate["status"])}`} /><div><strong>{text(gate["question"], t("请求审批", "Gate requested"))}</strong><p>{text(gate["status"]) === "pending" ? t("等待用户决定", "Waiting for a decision") : `${t("决定", "Decision")} · ${text(gate["decision"])}`}</p></div></div>)}{runTasks.length === 0 && runGates.length === 0 && <Empty><EmptyHeader><EmptyMedia variant="icon"><Clock3 /></EmptyMedia><EmptyTitle>{t("暂无事件", "No events yet")}</EmptyTitle><EmptyDescription>{t("Run 的重要事件会按时间显示。", "Important run events appear here in chronological order.")}</EmptyDescription></EmptyHeader></Empty>}</div>
+          </TabsContent>}
         </Tabs>
         {runGates.length > 0 && <section className="dashboard-section"><div className="section-title"><ShieldQuestion size={16} />{t("决策 Gate", "Decision gates")} <span>{runGates.length}</span></div><div className="card-grid">{runGates.map(gateCard)}</div></section>}
         {runWorktrees.length > 0 && <section className="dashboard-section"><div className="section-title"><GitBranch size={16} />Worktrees <span>{runWorktrees.length}</span><span className="ml-auto text-xs font-normal text-muted-foreground">{attentionWorktrees.length} {t("待处理", "need attention")} · {runWorktrees.length - attentionWorktrees.length} {t("已归档", "archived")}</span><Button variant="ghost" size="sm" className="ml-2" aria-expanded={worktreesExpanded} onClick={() => setWorktreeView({ runId, expanded: !worktreesExpanded, limit: WORKTREE_PAGE_SIZE })}>{worktreesExpanded ? <ChevronDown data-icon="inline-start" /> : <ChevronRight data-icon="inline-start" />}{worktreesExpanded ? t("收起", "Collapse") : t("查看全部", "View all")}</Button></div>{visibleWorktrees.length > 0 ? <div className="worktree-list">{visibleWorktrees.map((asset) => { const inspection = record(asset["lastInspection"]); const safe = ["safe_to_clean", "equivalent"].includes(text(inspection["state"])); const assetId = text(asset["id"]); const assetBusy = busy === assetId; const launchable = isLaunchableWorktreeAsset(asset); return <article className="worktree-row" key={assetId}><GitBranch size={15} /><div><strong>{text(asset["branch"], t("工作树", "Worktree"))}</strong><small>{text(asset["path"])}</small></div><span className="pill">{status(text(asset["state"]))}</span><button disabled={!launchable || assetBusy} title={launchable ? t("在这个 worktree 中启动 Agent", "Start an agent in this worktree") : t("工作树目录不可用", "The worktree directory is unavailable")} onClick={() => onNewSession(text(asset["path"]))}><Bot size={13} />{t("运行 Agent", "Run agent")}</button><button disabled={assetBusy} onClick={() => void perform(assetId, "worktree.inspect", { assetId, targetRef: "main" })}>{t("检查", "Inspect")}</button><button className="danger" disabled={!safe || assetBusy} title={safe ? t("清理已确认安全的工作树", "Clean this verified worktree") : t("必须先通过安全检查", "Run a safety check first")} onClick={() => void perform(assetId, "worktree.cleanup", { operationId: operationId(), assetId, targetRef: text(inspection["targetRef"], "main"), confirm: true, deleteBranch: false })}><Trash2 size={13} />{t("安全清理", "Safe cleanup")}</button></article>; })}</div> : <p className="rounded-lg border border-dashed px-4 py-5 text-sm text-muted-foreground">{t("当前没有需要处理的 Worktree；展开后可查看已清理或已缺失的历史记录。", "No worktrees need attention. Expand to inspect cleaned or missing history.")}</p>}{worktreesExpanded && visibleWorktrees.length < runWorktrees.length && <div className="mt-3 flex justify-center"><Button variant="outline" size="sm" onClick={() => setWorktreeView({ runId, expanded: true, limit: worktreeLimit + WORKTREE_PAGE_SIZE })}>{t("显示更多", "Show more")} · {runWorktrees.length - visibleWorktrees.length}</Button></div>}</section>}
