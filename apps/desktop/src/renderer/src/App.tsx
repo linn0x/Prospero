@@ -49,6 +49,7 @@ import {
   X,
 } from "lucide-react";
 import type {
+  AgentModel,
   DesktopSnapshot,
   SessionCreateInput,
   SessionInfo,
@@ -71,6 +72,11 @@ import {
   projectForSession,
   sortSidebarSessions,
 } from "./workspace-sidebar-state";
+import {
+  defaultSessionLaunchAccountId,
+  sessionLaunchAccounts,
+  sessionLaunchWorkspaces,
+} from "../../shared/session-launch-options";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
@@ -143,6 +149,7 @@ import {
 } from "@/components/ui/input-group";
 import {
   NativeSelect,
+  NativeSelectOptGroup,
   NativeSelectOption,
 } from "@/components/ui/native-select";
 import { Progress } from "@/components/ui/progress";
@@ -2660,28 +2667,120 @@ function NewSessionDialog({
   onOpenChange: (open: boolean) => void;
   onCreated: (session: SessionInfo) => void;
 }) {
-  const { t } = useLocale();
+  const { t, status } = useLocale();
   const [input, setInput] = useState<SessionCreateInput>({
     cwd: project || snapshot.projects[0] || "",
     agent: "codex",
     kind: "structured",
     approvalPolicy: "standard",
+    accountId: defaultSessionLaunchAccountId(snapshot.accounts, "codex"),
   });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
+  const [launchModels, setLaunchModels] = useState<AgentModel[]>([]);
+  const [launchModelsLoading, setLaunchModelsLoading] = useState(false);
+  const [launchModelsError, setLaunchModelsError] = useState<string>();
+  const launchWorkspaces = useMemo(
+    () => sessionLaunchWorkspaces(snapshot),
+    [snapshot],
+  );
+  const launchAccounts = useMemo(
+    () => sessionLaunchAccounts(snapshot.accounts, input.agent),
+    [input.agent, snapshot.accounts],
+  );
+  const selectedAccount = launchAccounts.find(
+    (account) => account.id === input.accountId,
+  );
+  const selectedWorkspace = launchWorkspaces.find(
+    (workspace) => workspace.path === input.cwd,
+  );
+  const selectedLaunchModel = launchModels.find(
+    (model) => model.id === input.model,
+  );
   useEffect(() => {
-    if (open)
-      setInput((current) => ({
-        ...current,
-        cwd: project || current.cwd || snapshot.projects[0] || "",
-      }));
-  }, [open, project, snapshot.projects]);
+    if (!open) return;
+    setInput((current) => {
+      const workspacePaths = new Set(
+        launchWorkspaces.map((workspace) => workspace.path),
+      );
+      const cwd = project && workspacePaths.has(project)
+        ? project
+        : workspacePaths.has(current.cwd)
+          ? current.cwd
+          : launchWorkspaces[0]?.path ?? "";
+      const accounts = sessionLaunchAccounts(snapshot.accounts, current.agent);
+      const accountId = accounts.some((account) => account.id === current.accountId)
+        ? current.accountId
+        : defaultSessionLaunchAccountId(snapshot.accounts, current.agent);
+      if (cwd === current.cwd && accountId === current.accountId) return current;
+      return { ...current, cwd, accountId, model: undefined, effort: undefined };
+    });
+  }, [launchWorkspaces, open, project, snapshot.accounts]);
   const supportsStructured = [
     "codex",
     "claude",
     "deepseek",
     "opencode",
   ].includes(input.agent);
+  const supportsLaunchModels =
+    input.kind === "structured" &&
+    (input.agent === "codex" ||
+      input.agent === "claude" ||
+      input.agent === "deepseek");
+  useEffect(() => {
+    if (!open || !supportsLaunchModels) {
+      setLaunchModels([]);
+      setLaunchModelsLoading(false);
+      setLaunchModelsError(undefined);
+      return;
+    }
+    let cancelled = false;
+    const agent = input.agent as "codex" | "claude" | "deepseek";
+    const accountId = input.accountId;
+    setLaunchModels([]);
+    setLaunchModelsLoading(true);
+    setLaunchModelsError(undefined);
+    void window.prospero
+      .getLaunchModels(agent, accountId)
+      .then((catalog) => {
+        if (cancelled) return;
+        setLaunchModels(catalog.models);
+        const model =
+          catalog.models.find((candidate) => candidate.id === catalog.currentModel) ??
+          catalog.models.find((candidate) => candidate.isDefault) ??
+          catalog.models[0];
+        setInput((current) => {
+          if (
+            current.agent !== agent ||
+            current.kind !== "structured" ||
+            current.accountId !== accountId
+          ) return current;
+          return {
+            ...current,
+            model: model?.id,
+            effort:
+              catalog.currentEffort ??
+              model?.defaultEffort ??
+              model?.supportedEfforts[0],
+          };
+        });
+      })
+      .catch((reason) => {
+        if (cancelled) return;
+        setLaunchModelsError(displayError(reason));
+        setInput((current) =>
+          current.agent === agent && current.accountId === accountId
+            ? { ...current, model: undefined, effort: undefined }
+            : current,
+        );
+      })
+      .finally(() => {
+        if (!cancelled) setLaunchModelsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [input.accountId, input.agent, input.kind, open, supportsLaunchModels]);
   const create = async (): Promise<void> => {
     setBusy(true);
     setError(undefined);
@@ -2696,13 +2795,13 @@ function NewSessionDialog({
   };
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-xl">
+      <DialogContent className="sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>{t("新建 Agent 会话", "New agent session")}</DialogTitle>
           <DialogDescription>
             {t(
-              "选择工作区、Agent 与运行方式。模型和账号使用 Provider 中配置的默认值。",
-              "Choose a workspace, agent, and run mode. Model and account defaults come from Providers.",
+              "选择项目或编排 worktree，并为这次会话指定 Agent、账号与模型。",
+              "Choose a project or orchestration worktree, then select the agent, account, and model for this session.",
             )}
           </DialogDescription>
         </DialogHeader>
@@ -2728,19 +2827,33 @@ function NewSessionDialog({
               }
             >
               <NativeSelectOption value="" disabled>
-                {t("选择项目", "Choose project")}
+                {t("选择工作区", "Choose workspace")}
               </NativeSelectOption>
-              {snapshot.projects.map((item) => (
-                <NativeSelectOption value={item} key={item}>
-                  {item.split(/[\\/]/).filter(Boolean).at(-1)}
-                </NativeSelectOption>
-              ))}
-            </NativeSelect>
-            <FieldDescription>
-              {t(
-                "会话的工作目录与持久上下文。",
-                "The session working directory and persistent context.",
+              <NativeSelectOptGroup label={t("项目", "Projects")}>
+                {launchWorkspaces
+                  .filter((workspace) => workspace.kind === "project")
+                  .map((workspace) => (
+                    <NativeSelectOption value={workspace.path} key={workspace.path}>
+                      {workspace.label}
+                    </NativeSelectOption>
+                  ))}
+              </NativeSelectOptGroup>
+              {launchWorkspaces.some((workspace) => workspace.kind === "worktree") && (
+                <NativeSelectOptGroup label="Worktrees">
+                  {launchWorkspaces
+                    .filter((workspace) => workspace.kind === "worktree")
+                    .map((workspace) => (
+                      <NativeSelectOption value={workspace.path} key={workspace.path}>
+                        {workspace.label}
+                      </NativeSelectOption>
+                    ))}
+                </NativeSelectOptGroup>
               )}
+            </NativeSelect>
+            <FieldDescription className="truncate" title={selectedWorkspace?.detail}>
+              {selectedWorkspace?.kind === "worktree"
+                ? t("编排 worktree · 会话会直接在隔离分支中运行。", "Orchestration worktree · the session runs directly on the isolated branch.")
+                : t("项目根目录与持久上下文。", "Project root and persistent context.")}
             </FieldDescription>
           </Field>
           <div className="grid gap-4 sm:grid-cols-2">
@@ -2755,6 +2868,12 @@ function NewSessionDialog({
                   setInput({
                     ...input,
                     agent,
+                    accountId: defaultSessionLaunchAccountId(
+                      snapshot.accounts,
+                      agent,
+                    ),
+                    model: undefined,
+                    effort: undefined,
                     ...(!["codex", "claude", "deepseek", "opencode"].includes(
                       agent,
                     )
@@ -2783,12 +2902,16 @@ function NewSessionDialog({
               <NativeSelect
                 id="session-kind"
                 value={input.kind}
-                onChange={(event) =>
+                onChange={(event) => {
+                  const kind = event.target.value as SessionCreateInput["kind"];
                   setInput({
                     ...input,
-                    kind: event.target.value as SessionCreateInput["kind"],
-                  })
-                }
+                    kind,
+                    ...(kind === "pty"
+                      ? { model: undefined, effort: undefined }
+                      : {}),
+                  });
+                }}
               >
                 <NativeSelectOption
                   value="structured"
@@ -2802,6 +2925,113 @@ function NewSessionDialog({
               </NativeSelect>
             </Field>
           </div>
+          {(input.agent === "codex" || input.agent === "claude") && (
+            <Field>
+              <FieldLabel htmlFor="session-account">
+                {t("账号环境", "Account")}
+              </FieldLabel>
+              <NativeSelect
+                id="session-account"
+                value={input.accountId ?? ""}
+                onChange={(event) =>
+                  setInput({
+                    ...input,
+                    accountId: event.target.value || undefined,
+                    model: undefined,
+                    effort: undefined,
+                  })
+                }
+              >
+                {launchAccounts.length === 0 && (
+                  <NativeSelectOption value="" disabled>
+                    {t("没有可用账号", "No accounts available")}
+                  </NativeSelectOption>
+                )}
+                {launchAccounts.map((account) => (
+                  <NativeSelectOption value={account.id} key={account.id}>
+                    {account.name}
+                    {account.isDefault ? t("（默认）", " (default)") : ""}
+                  </NativeSelectOption>
+                ))}
+              </NativeSelect>
+              <FieldDescription>
+                {selectedAccount
+                  ? `${status(selectedAccount.status)}${selectedAccount.apiProfile ? ` · API Profile · ${text(selectedAccount.apiProfile["model"])}` : " · CLI"}`
+                  : t("在 Agents 与账号页面添加或登录账号。", "Add or sign in to an account from Agents & accounts.")}
+              </FieldDescription>
+            </Field>
+          )}
+          {supportsLaunchModels && (
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field>
+                <FieldLabel htmlFor="session-model">
+                  {t("模型", "Model")}
+                </FieldLabel>
+                <NativeSelect
+                  id="session-model"
+                  value={input.model ?? ""}
+                  disabled={launchModelsLoading || launchModels.length === 0}
+                  onChange={(event) => {
+                    const model = launchModels.find(
+                      (candidate) => candidate.id === event.target.value,
+                    );
+                    setInput({
+                      ...input,
+                      model: model?.id,
+                      effort:
+                        model?.defaultEffort ?? model?.supportedEfforts[0],
+                    });
+                  }}
+                >
+                  <NativeSelectOption value="" disabled>
+                    {launchModelsLoading
+                      ? t("读取模型中…", "Loading models…")
+                      : t("没有可用模型", "No models available")}
+                  </NativeSelectOption>
+                  {launchModels.map((model) => (
+                    <NativeSelectOption value={model.id} key={model.id}>
+                      {model.label}
+                    </NativeSelectOption>
+                  ))}
+                </NativeSelect>
+                <FieldDescription>
+                  {launchModelsError ??
+                    selectedLaunchModel?.description ??
+                    t("目录随所选账号实时读取。", "Catalog loaded for the selected account.")}
+                </FieldDescription>
+              </Field>
+              <Field>
+                <FieldLabel htmlFor="session-effort">
+                  {t("推理强度", "Reasoning effort")}
+                </FieldLabel>
+                <NativeSelect
+                  id="session-effort"
+                  value={input.effort ?? ""}
+                  disabled={!selectedLaunchModel?.supportedEfforts.length}
+                  onChange={(event) =>
+                    setInput({
+                      ...input,
+                      effort: event.target.value || undefined,
+                    })
+                  }
+                >
+                  <NativeSelectOption value="" disabled>
+                    {t("使用模型默认值", "Use model default")}
+                  </NativeSelectOption>
+                  {selectedLaunchModel?.supportedEfforts.map((effort) => (
+                    <NativeSelectOption value={effort} key={effort}>
+                      {effort}
+                    </NativeSelectOption>
+                  ))}
+                </NativeSelect>
+                <FieldDescription>
+                  {selectedLaunchModel?.supportedEfforts.length
+                    ? t("只显示该模型支持的档位。", "Only efforts supported by this model are shown.")
+                    : t("当前模型没有可选档位。", "This model has no selectable effort levels.")}
+                </FieldDescription>
+              </Field>
+            </div>
+          )}
           <Field>
             <FieldLabel htmlFor="session-approval">
               {t("权限配置", "Permission profile")}
@@ -3278,6 +3508,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
               <OrchestrationPane
                 snapshot={snapshot}
                 onOpenSession={openSession}
+                onNewSession={openNewSession}
               />
             ) : view === "providers" ? (
               <AccountsPane snapshot={snapshot} onOpenSession={openSession} />
