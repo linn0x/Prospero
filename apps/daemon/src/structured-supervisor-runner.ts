@@ -225,6 +225,34 @@ function privateWrite(file: string, value: unknown): void {
   chmodSync(file, 0o600);
 }
 
+/**
+ * A detached owner normally has stdio disabled so account material can never
+ * leak into daemon logs. Persist only a bounded, redacted startup diagnostic
+ * next to the private manifest when it dies before opening its control socket.
+ */
+function persistStartupFailure(error: unknown): void {
+  const bootstrapFile = process.env["PROSPERO_STRUCTURED_SUPERVISOR_CONFIG"];
+  if (!bootstrapFile) return;
+  const sessionDir = path.dirname(bootstrapFile);
+  if (!privateDirectory(sessionDir)) return;
+  const raw = error instanceof Error ? error.message : String(error);
+  const message = raw
+    .replace(/((?:token|key|secret|cookie|authorization)\s*[=:]\s*)\S+/gi, "$1[redacted]")
+    .slice(0, 1_024);
+  try {
+    privateWrite(path.join(sessionDir, "startup-error.json"), {
+      version: 1,
+      message,
+      at: Date.now(),
+    });
+    const file = path.join(sessionDir, "manifest.json");
+    const manifest = readLegacyManifest(sessionDir);
+    if (manifest) privateWrite(file, { ...manifest, status: "died", updatedAt: Date.now() });
+  } catch {
+    // An error reporter must never mask the runner's original terminal state.
+  }
+}
+
 function readConfig(): RunnerConfig {
   const platformGate = structuredSupervisorPlatformGate();
   if (platformGate) throw new Error(platformGate);
@@ -463,4 +491,7 @@ export async function runStructuredSupervisor(): Promise<void> {
   process.once("SIGINT", close);
 }
 
-void runStructuredSupervisor().catch(() => process.exit(1));
+void runStructuredSupervisor().catch((error) => {
+  persistStartupFailure(error);
+  process.exit(1);
+});
