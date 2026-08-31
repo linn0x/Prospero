@@ -5,6 +5,7 @@ import { isAbsolute, resolve } from "node:path";
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, shell, Tray } from "electron";
 import type { DesktopSettings, JsonObject, SessionCreateInput, WorkflowTemplate } from "../shared/types";
 import { diffDesktopSnapshot, isEmptyDesktopSnapshotPatch } from "../shared/snapshot-patch";
+import { isSessionLaunchWorkspace } from "../shared/session-launch-options";
 import { loginPath, resolveNodeExecutable } from "./host-environment.js";
 import { DaemonRuntime } from "./daemon-runtime";
 import { StateStore } from "./state-store";
@@ -597,7 +598,7 @@ function installIpc(): void {
   ipcMain.handle("session:create", async (_event, raw: unknown) => {
     const input = requireObject(raw) as SessionCreateInput;
     const normalized = resolve(String(input.cwd ?? ""));
-    if (!store.snapshot().projects.some((path) => path.toLocaleLowerCase() === normalized.toLocaleLowerCase())) throw new Error("只能在已添加的项目中创建会话");
+    if (!isSessionLaunchWorkspace(store.snapshot(), normalized)) throw new Error("只能在已添加的项目或可用 worktree 中创建会话");
     if (!["codex", "claude", "deepseek", "opencode", "grok", "trae", "shell"].includes(input.agent)) throw new Error("Agent 无效");
     if (input.kind !== "structured" && input.kind !== "pty") throw new Error("会话类型无效");
     if (!["strict", "standard", "yolo"].includes(input.approvalPolicy)) throw new Error("审批策略无效");
