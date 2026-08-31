@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { SessionInfo } from "../src/shared/types";
 import {
+  filterSessionsByQuery,
   mostRelevantProject,
+  nextSidebarSessionLimit,
   parseExpandedProjects,
   projectForSession,
+  sortProjectsByRecentActivity,
   sortSidebarSessions,
 } from "../src/renderer/src/workspace-sidebar-state";
 
@@ -73,5 +76,49 @@ describe("workspace sidebar state", () => {
         (item) => item.id,
       ),
     ).toEqual(["selected", "attention", "unread", "recent"]);
+  });
+
+  it("pages large session groups instead of mounting every session", () => {
+    expect(nextSidebarSessionLimit(6, 3_671)).toBe(30);
+    expect(nextSidebarSessionLimit(30, 3_671)).toBe(54);
+    expect(nextSidebarSessionLimit(54, 54)).toBe(6);
+    expect(nextSidebarSessionLimit(6, 4)).toBe(4);
+  });
+
+  it("uses one case-insensitive search vocabulary across session surfaces", () => {
+    const sessions = [
+      session("build", "/repo/packages/desktop", 10, {
+        displayTitle: "Desktop build",
+        agent: "claude",
+        status: "waiting_input",
+        preview: "Please choose an account",
+      }),
+      session("other", "/repo/server", 20),
+    ];
+
+    expect(filterSessionsByQuery(sessions, "ACCOUNT").map((item) => item.id)).toEqual([
+      "build",
+    ]);
+    expect(filterSessionsByQuery(sessions, "packages", 1).map((item) => item.id)).toEqual([
+      "build",
+    ]);
+    expect(filterSessionsByQuery(sessions, "", 1).map((item) => item.id)).toEqual([
+      "build",
+    ]);
+  });
+
+  it("orders recent workspaces by their latest session activity", () => {
+    const projects = ["/first", "/recent", "/empty"];
+    const sessions = [
+      session("older", "/first", 10),
+      session("newer", "/recent", 30),
+      session("nested", "/first/package", 20),
+    ];
+
+    expect(sortProjectsByRecentActivity(projects, sessions)).toEqual([
+      "/recent",
+      "/first",
+      "/empty",
+    ]);
   });
 });

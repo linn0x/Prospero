@@ -70,6 +70,10 @@ export class DaemonRuntime {
     const snapshot = this.store.snapshot();
     const fullAccess = process.platform === "win32" && snapshot.settings.fullAccessPermission;
     const args = [runtime.cli, "start", "--home", this.store.home, "--port", String(snapshot.daemon.port)];
+    // SwiftUI Shell 在 macOS 上始终请求 tmux 托管：滚轮 copy-mode、完整
+    // 历史和 daemon 重启后的进程语义都依赖这层。daemon 会在 tmux 缺失时
+    // 自动退回 detached PTY supervisor，不把它变成 Electron 启动硬依赖。
+    if (process.platform === "darwin") args.push("--tmux");
     const bind = snapshot.settings.daemonBind !== "0.0.0.0" ? snapshot.settings.daemonBind : snapshot.daemon.bind;
     if (bind && bind !== "0.0.0.0") args.push("--bind", bind);
     if (fullAccess) args.push("--full-access");
