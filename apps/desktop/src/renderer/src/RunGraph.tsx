@@ -42,8 +42,16 @@ interface FeedbackEdge {
   toTaskId: string;
 }
 
+interface Edge {
+  fromTaskId: string;
+  toTaskId: string;
+  from: Point;
+  to: Point;
+}
+
 interface Layout {
   nodes: Placed[];
+  edges: Edge[];
   feedbackEdges: FeedbackEdge[];
   width: number;
   height: number;
@@ -228,6 +236,23 @@ export function layoutGraph(tasks: JsonObject[]): Layout {
     });
   }
 
+  const edges: Edge[] = [];
+  for (const task of tasks) {
+    const toTaskId = text(task["id"]);
+    const end = positions.get(toTaskId);
+    if (!end) continue;
+    for (const fromTaskId of dependencies(task)) {
+      const start = positions.get(fromTaskId);
+      if (!start) continue;
+      edges.push({
+        fromTaskId,
+        toTaskId,
+        from: { x: start.x + NODE_WIDTH, y: start.y + NODE_HEIGHT / 2 },
+        to: { x: end.x, y: end.y + NODE_HEIGHT / 2 },
+      });
+    }
+  }
+
   const feedbackGroups = new Map<string, JsonObject[]>();
   for (const task of tasks) {
     const parentId = text(task["parentId"]);
@@ -253,13 +278,14 @@ export function layoutGraph(tasks: JsonObject[]): Layout {
       const parentId = text(task["parentId"]);
       return { id, ...position, deps: dependencies(task), ...(parentId ? { parentId } : {}) };
     }),
+    edges,
     feedbackEdges,
     width: canvasWidth,
     height: canvasHeight,
   };
 }
 
-export function fitScale(layout: Layout, viewport: Size, maximum = MAX_ZOOM): number {
+export function fitScale(layout: Pick<Layout, "width" | "height">, viewport: Size, maximum = MAX_ZOOM): number {
   if (layout.width <= 0 || layout.height <= 0 || viewport.width <= 0 || viewport.height <= 0) return 1;
   return Math.min(maximum, Math.max(MIN_ZOOM, Math.min(viewport.width / layout.width, viewport.height / layout.height)));
 }
@@ -353,12 +379,47 @@ export function RunGraph({ tasks, dispatches }: { tasks: JsonObject[]; dispatche
   const minimapCanvasRef = useRef<HTMLCanvasElement>(null);
   const [viewport, setViewport] = useState<Size>({ width: 0, height: 0 });
   const [transform, setTransform] = useState<ViewTransform>({ zoom: 1, pan: { x: 0, y: 0 } });
+  const transformRef = useRef(transform);
+  const pendingTransform = useRef<ViewTransform | undefined>(undefined);
+  const transformFrame = useRef<number | undefined>(undefined);
   const [selected, setSelected] = useState<string>();
   const drag = useRef<{ pointerId: number; origin: Point; start: Point } | undefined>(undefined);
   const fitMode = useRef(false);
   const fitMaximum = useRef(1);
   const previousLayoutKey = useRef<string | undefined>(undefined);
   const previousViewport = useRef<Size>({ width: 0, height: 0 });
+
+  useLayoutEffect(() => {
+    transformRef.current = transform;
+  }, [transform]);
+
+  useLayoutEffect(() => () => {
+    if (transformFrame.current !== undefined) cancelAnimationFrame(transformFrame.current);
+  }, []);
+
+  const commitTransform = useCallback((next: ViewTransform): void => {
+    if (transformFrame.current !== undefined) cancelAnimationFrame(transformFrame.current);
+    transformFrame.current = undefined;
+    pendingTransform.current = undefined;
+    transformRef.current = next;
+    setTransform(next);
+  }, []);
+
+  const scheduleTransform = useCallback((update: (current: ViewTransform) => ViewTransform): void => {
+    const current = pendingTransform.current ?? transformRef.current;
+    const next = update(current);
+    if (next.zoom === current.zoom && next.pan.x === current.pan.x && next.pan.y === current.pan.y) return;
+    pendingTransform.current = next;
+    if (transformFrame.current !== undefined) return;
+    transformFrame.current = requestAnimationFrame(() => {
+      transformFrame.current = undefined;
+      const latest = pendingTransform.current;
+      pendingTransform.current = undefined;
+      if (!latest) return;
+      transformRef.current = latest;
+      setTransform(latest);
+    });
+  }, []);
 
   useLayoutEffect(() => {
     const element = viewportRef.current;
@@ -376,14 +437,14 @@ export function RunGraph({ tasks, dispatches }: { tasks: JsonObject[]; dispatche
   const applyFit = useCallback((maximum: number): void => {
     if (viewport.width <= 0 || viewport.height <= 0) return;
     const zoom = fitScale(layout, viewport, maximum);
-    setTransform({
+    commitTransform({
       zoom,
       pan: {
         x: (viewport.width - layout.width * zoom) / 2,
         y: (viewport.height - layout.height * zoom) / 2,
       },
     });
-  }, [layout, viewport]);
+  }, [commitTransform, layout, viewport]);
 
   // 新 Run / 新 revision 自动完整展示；保持“适应窗口”时，窗口缩放也持续重算。
   useLayoutEffect(() => {
@@ -410,12 +471,12 @@ export function RunGraph({ tasks, dispatches }: { tasks: JsonObject[]; dispatche
 
   const reset = useCallback((): void => {
     fitMode.current = false;
-    setTransform({ zoom: 1, pan: { x: 0, y: 0 } });
-  }, []);
+    commitTransform({ zoom: 1, pan: { x: 0, y: 0 } });
+  }, [commitTransform]);
 
   const zoomBy = useCallback((factor: number, anchor: Point): void => {
     fitMode.current = false;
-    setTransform((current) => {
+    scheduleTransform((current) => {
       const zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, current.zoom * factor));
       if (zoom === current.zoom) return current;
       const ratio = zoom / current.zoom;
@@ -427,7 +488,7 @@ export function RunGraph({ tasks, dispatches }: { tasks: JsonObject[]; dispatche
         },
       };
     });
-  }, []);
+  }, [scheduleTransform]);
 
   const center = useCallback((): Point => ({ x: viewport.width / 2, y: viewport.height / 2 }), [viewport]);
 
@@ -443,7 +504,7 @@ export function RunGraph({ tasks, dispatches }: { tasks: JsonObject[]; dispatche
     }
     const multiplier = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : 1;
     fitMode.current = false;
-    setTransform((current) => ({
+    scheduleTransform((current) => ({
       ...current,
       pan: {
         x: current.pan.x - event.deltaX * multiplier,
@@ -461,7 +522,7 @@ export function RunGraph({ tasks, dispatches }: { tasks: JsonObject[]; dispatche
     const current = drag.current;
     if (!current || current.pointerId !== event.pointerId) return;
     fitMode.current = false;
-    setTransform((value) => ({
+    scheduleTransform((value) => ({
       ...value,
       pan: {
         x: current.start.x + event.clientX - current.origin.x,
@@ -538,17 +599,27 @@ export function RunGraph({ tasks, dispatches }: { tasks: JsonObject[]; dispatche
     const danger = cssColor(styles, "--run-graph-failed", "#c7484f");
     const visible = visibleRect(viewport, transform, 40 / transform.zoom);
 
-    for (const node of layout.nodes) {
-      const end = node;
-      for (const dependency of node.deps) {
-        const start = positions.get(dependency);
-        if (!start) continue;
-        const from = { x: start.x + NODE_WIDTH, y: start.y + NODE_HEIGHT / 2 };
-        const to = { x: end.x, y: end.y + NODE_HEIGHT / 2 };
+    const overviewMode = layout.nodes.length > 240 && transform.zoom < 0.14;
+    if (overviewMode) {
+      context.save();
+      context.strokeStyle = muted;
+      context.globalAlpha = 0.42;
+      context.lineWidth = 1.2;
+      context.beginPath();
+      for (const edge of layout.edges) {
+        if (!rectsIntersect(Math.min(edge.from.x, edge.to.x), Math.min(edge.from.y, edge.to.y), Math.max(edge.from.x, edge.to.x), Math.max(edge.from.y, edge.to.y), visible)) continue;
+        context.moveTo(edge.from.x, edge.from.y);
+        context.lineTo(edge.to.x, edge.to.y);
+      }
+      context.stroke();
+      context.restore();
+    } else {
+      for (const edge of layout.edges) {
+        const { from, to } = edge;
         if (!rectsIntersect(Math.min(from.x, to.x), Math.min(from.y, to.y), Math.max(from.x, to.x), Math.max(from.y, to.y), visible)) continue;
-        const touched = selected === node.id || selected === dependency;
-        const color = touched ? primary : done.has(dependency) ? success : muted;
-        const alpha = touched ? 0.9 : done.has(dependency) ? 0.5 : 0.34;
+        const touched = selected === edge.toTaskId || selected === edge.fromTaskId;
+        const color = touched ? primary : done.has(edge.fromTaskId) ? success : muted;
+        const alpha = touched ? 0.9 : done.has(edge.fromTaskId) ? 0.5 : 0.34;
         const bend = (from.x + to.x) / 2;
         context.save();
         context.strokeStyle = color;
@@ -564,7 +635,7 @@ export function RunGraph({ tasks, dispatches }: { tasks: JsonObject[]; dispatche
       }
     }
 
-    for (const feedback of layout.feedbackEdges) {
+    if (!overviewMode) for (const feedback of layout.feedbackEdges) {
       const start = positions.get(feedback.fromTaskId);
       const end = positions.get(feedback.toTaskId);
       if (!start || !end) continue;
@@ -629,11 +700,11 @@ export function RunGraph({ tasks, dispatches }: { tasks: JsonObject[]; dispatche
     context.stroke();
     context.fillStyle = muted;
     context.globalAlpha = 0.72;
+    context.beginPath();
     for (const node of layout.nodes) {
-      context.beginPath();
       context.arc(offset.x + (node.x + NODE_WIDTH / 2) * scale, offset.y + (node.y + NODE_HEIGHT / 2) * scale, 1.5, 0, Math.PI * 2);
-      context.fill();
     }
+    context.fill();
     context.globalAlpha = 1;
     const visible = visibleRect(viewport, transform);
     const left = Math.max(0, visible.left);
@@ -656,7 +727,7 @@ export function RunGraph({ tasks, dispatches }: { tasks: JsonObject[]; dispatche
     const offset = { x: (box.width - layout.width * scale) / 2, y: (box.height - layout.height * scale) / 2 };
     const target = { x: (clientX - box.left - offset.x) / scale, y: (clientY - box.top - offset.y) / scale };
     fitMode.current = false;
-    setTransform((current) => ({
+    scheduleTransform((current) => ({
       ...current,
       pan: { x: viewport.width / 2 - target.x * current.zoom, y: viewport.height / 2 - target.y * current.zoom },
     }));
