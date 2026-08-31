@@ -23,6 +23,7 @@ import {
 } from "./agents.js";
 import { PtySession } from "./pty-session.js";
 import {
+  RemotePtySupervisorError,
   RemotePtySession,
   launchPtySupervisor,
   reconnectPtySupervisors,
@@ -823,8 +824,11 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       }
     } catch (e) {
       // node-pty 对不存在的可执行文件同步抛 posix_spawnp failed
+      const reason = e instanceof Error ? e.message : String(e);
       throw new SessionError(
-        `failed to spawn "${base.file}" — is ${agent} installed? (${e instanceof Error ? e.message : String(e)})`,
+        e instanceof RemotePtySupervisorError
+          ? `PTY host 启动失败（${reason}）`
+          : `failed to spawn "${base.file}" — is ${agent} installed? (${reason})`,
         "agent_unavailable",
       );
     }
