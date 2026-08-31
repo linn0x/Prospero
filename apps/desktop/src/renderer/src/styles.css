@@ -1256,6 +1256,10 @@ kbd {
 .workspace-project-more[data-popup-open] { color: var(--sidebar-accent-foreground); background: var(--sidebar-accent); opacity: 1; }
 .workspace-project-item:hover > .workspace-project-more { opacity: 1; }
 .workspace-project-more svg { width: 14px; height: 14px; }
+.workspace-session-search { display: flex; align-items: center; gap: 6px; margin: 0 8px 6px; padding: 0 7px; border: 1px solid color-mix(in srgb, var(--sidebar-border) 72%, transparent); border-radius: 7px; background: color-mix(in srgb, var(--sidebar-accent) 52%, transparent); }
+.workspace-session-search svg { width: 13px; height: 13px; flex: none; color: color-mix(in srgb, var(--sidebar-foreground) 52%, transparent); }
+.workspace-session-search input { width: 100%; min-width: 0; height: 27px; padding: 0; color: var(--sidebar-foreground); border: 0; background: transparent; box-shadow: none; font-size: 10px; }
+.workspace-session-search input:focus-visible { outline: 0; }
 .prospero-sidebar [data-sidebar="menu-sub"] { min-width: 0; max-width: 100%; margin-right: 0; padding-right: 0; overflow: visible; }
 .prospero-sidebar [data-sidebar="menu-sub-item"] { min-width: 0; max-width: 100%; }
 .workspace-session-item { overflow: visible; }
