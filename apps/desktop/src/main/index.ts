@@ -243,10 +243,15 @@ function createTray(): void {
   const iconPath = app.isPackaged
     ? resolve(process.resourcesPath, "assets", "AppIcon.png")
     : resolve(app.getAppPath(), "..", "shell", "Resources", "AppIcon-1024.png");
-  const icon = nativeImage.createFromPath(iconPath).resize({ width: 16, height: 16 });
-  if (icon.isEmpty()) return;
+  const source = nativeImage.createFromPath(iconPath);
+  if (source.isEmpty()) return;
   // macOS 菜单栏图标必须是模板图:系统按明暗自动反色。不标记的话深色菜单栏上
   // 会挂着一块彩色方块,和其它菜单栏项格格不入。
+  // macOS 会从原图创建适合当前菜单栏 scale factor 的 image representation。
+  // 先缩成单一 16px 位图会让 Retina 菜单栏只能插值放大，笔画明显发糊。
+  const icon = process.platform === "darwin"
+    ? source
+    : source.resize({ width: 16, height: 16 });
   if (process.platform === "darwin") icon.setTemplateImage(true);
   tray = new Tray(icon);
   tray.setToolTip("Prospero · Agent 工作台");

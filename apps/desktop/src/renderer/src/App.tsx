@@ -464,6 +464,7 @@ function ShellSidebar({
 }) {
   const { language, t, status } = useLocale();
   const [workspaceOpen, setWorkspaceOpen] = useState(true);
+  const [sessionQuery, setSessionQuery] = useState("");
   const [daemonUsage, setDaemonUsage] = useState<UsageAccount[]>(getCachedAccountUsage);
   const [daemonUsageLoading, setDaemonUsageLoading] = useState(false);
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(
@@ -490,6 +491,7 @@ function ShellSidebar({
     {},
   );
   const knownProjects = useRef(new Set(snapshot.projects));
+  const normalizedSessionQuery = sessionQuery.trim().toLocaleLowerCase();
   const handleDaemonCardOpen = (open: boolean): void => {
     if (!open || !snapshot.daemon.running) return;
     setDaemonUsage(getCachedAccountUsage());
@@ -815,11 +817,37 @@ function ShellSidebar({
                 </DropdownMenuGroup>
               </DropdownMenuContent>
             </DropdownMenu>
+            <div className="workspace-session-search">
+              <Search aria-hidden="true" />
+              <Input
+                type="search"
+                value={sessionQuery}
+                onChange={(event) => setSessionQuery(event.target.value)}
+                placeholder={t("搜索会话、状态或路径", "Search sessions, status, or path")}
+                aria-label={t("搜索会话", "Search sessions")}
+              />
+            </div>
             <CollapsibleContent>
               <SidebarGroupContent>
                 <SidebarMenu>
                   {sortedProjects.map((project) => {
                     const sessions = sessionsByProject.get(project) ?? [];
+                    const matchingSessions = normalizedSessionQuery
+                      ? sessions.filter((session) =>
+                          [
+                            sessionLabel(session),
+                            session.agent,
+                            session.status,
+                            session.cwd,
+                            session.preview ?? "",
+                          ]
+                            .join(" ")
+                            .toLocaleLowerCase()
+                            .includes(normalizedSessionQuery),
+                        )
+                      : sessions;
+                    if (normalizedSessionQuery && matchingSessions.length === 0)
+                      return null;
                     const fallback =
                       project.split(/[\\/]/).filter(Boolean).at(-1) ?? project;
                     const name =
@@ -832,12 +860,12 @@ function ShellSidebar({
                     );
                     const projectOpen = expandedProjects.has(project);
                     const sessionLimit = Math.min(
-                      sessions.length,
+                      matchingSessions.length,
                       sessionLimits[project] ?? SIDEBAR_SESSION_PREVIEW_LIMIT,
                     );
-                    const showsAllSessions = sessionLimit >= sessions.length;
-                    const visibleSessions = sessions.slice(0, sessionLimit);
-                    const hiddenSessionCount = sessions.length - sessionLimit;
+                    const showsAllSessions = sessionLimit >= matchingSessions.length;
+                    const visibleSessions = matchingSessions.slice(0, sessionLimit);
+                    const hiddenSessionCount = matchingSessions.length - sessionLimit;
                     const nextSessionCount = Math.min(
                       hiddenSessionCount,
                       24,
@@ -871,7 +899,9 @@ function ShellSidebar({
                               <Pin className="workspace-project-pinned" />
                             )}
                             <span className="workspace-session-count">
-                              {sessions.length}
+                              {normalizedSessionQuery
+                                ? `${String(matchingSessions.length)}/${String(sessions.length)}`
+                                : sessions.length}
                             </span>
                           </CollapsibleTrigger>
                           <DropdownMenu>
@@ -1081,7 +1111,7 @@ function ShellSidebar({
                                   </SidebarMenuSubItem>
                                 );
                               })}
-                              {sessions.length >
+                              {matchingSessions.length >
                                 SIDEBAR_SESSION_PREVIEW_LIMIT && (
                                 <SidebarMenuSubItem className="workspace-session-more-item">
                                   <button
@@ -1105,7 +1135,7 @@ function ShellSidebar({
                                         ...current,
                                         [project]: nextSidebarSessionLimit(
                                           sessionLimit,
-                                          sessions.length,
+                                          matchingSessions.length,
                                         ),
                                       }))
                                     }
@@ -2284,7 +2314,7 @@ function WorkspacePane({
   onActivate,
   onClose,
   onNewSession,
-  onOpenRuns,
+  onOpenRun,
   onTogglePin,
   focus,
 }: {
@@ -2294,7 +2324,7 @@ function WorkspacePane({
   onActivate: (id: string) => void;
   onClose: (id: string) => void;
   onNewSession: (project?: string) => void;
-  onOpenRuns: () => void;
+  onOpenRun: (runId?: string) => void;
   onTogglePin: (id: string) => void;
   focus: boolean;
 }) {
@@ -2305,6 +2335,11 @@ function WorkspacePane({
   const active = snapshot.daemon.sessions.find(
     (session) => session.id === activeId,
   );
+  const activeDispatch = active
+    ? snapshot.orchestration.dispatches.find(
+        (dispatch) => text(dispatch["sessionId"]) === active.id,
+      )
+    : undefined;
   return (
     <div className="workspace-view workspace-view-single">
       <div className="pane-workspace">
@@ -2501,7 +2536,7 @@ function WorkspacePane({
                     <ChatPane
                       key={active.id}
                       session={active}
-                      onOpenGoal={onOpenRuns}
+                      onOpenGoal={() => onOpenRun(text(activeDispatch?.["runId"]) || undefined)}
                     />
                   )}
                 </div>
@@ -3314,6 +3349,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   const [activeId, setActiveId] = useState<string>();
   const [newSessionOpen, setNewSessionOpen] = useState(false);
   const [newSessionProject, setNewSessionProject] = useState<string>();
+  const [runTargetId, setRunTargetId] = useState<string>();
   const [editingProject, setEditingProject] = useState<string>();
   const [editingSession, setEditingSession] = useState<string>();
   const startsWithCompactSidebar =
@@ -3420,6 +3456,10 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     setView("workspaces");
     if (snapshot.unreadSessionIds.includes(id))
       void window.prospero.setSessionUnread(id, false);
+  };
+  const openRun = (runId?: string): void => {
+    setRunTargetId(runId);
+    setView("runs");
   };
   const closeSession = (id: string): void => {
     const index = validOpenIds.indexOf(id);
@@ -3588,7 +3628,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
                 snapshot={snapshot}
                 onOpenSession={openSession}
                 onOpenInbox={() => setView("inbox")}
-                onOpenRuns={() => setView("runs")}
+                onOpenRuns={() => openRun()}
                 onOpenWorkspaces={() => setView("workspaces")}
                 onNewSession={openNewSession}
               />
@@ -3596,7 +3636,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
               <InboxPane
                 snapshot={snapshot}
                 onOpenSession={openSession}
-                onOpenRuns={() => setView("runs")}
+                onOpenRuns={() => openRun()}
               />
             ) : view === "mobile" ? (
               <DevicesPane snapshot={snapshot} />
@@ -3609,7 +3649,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
                 onActivate={(id) => openSession(id)}
                 onClose={closeSession}
                 onNewSession={openNewSession}
-                onOpenRuns={() => setView("runs")}
+                onOpenRun={openRun}
                 onTogglePin={togglePin}
               />
             ) : view === "runs" ? (
@@ -3617,6 +3657,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
                 snapshot={snapshot}
                 onOpenSession={openSession}
                 onNewSession={openNewSession}
+                initialRunId={runTargetId}
               />
             ) : view === "providers" ? (
               <AccountsPane snapshot={snapshot} onOpenSession={openSession} />

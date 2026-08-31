@@ -81,10 +81,12 @@ function FreeformGateDecision({
   </form>;
 }
 
-export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coordinatorSessionId }: { snapshot: DesktopSnapshot; onOpenSession: (id: string) => void; onNewSession: (workspace: string) => void; coordinatorSessionId?: string | undefined }) {
+export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coordinatorSessionId, initialRunId }: { snapshot: DesktopSnapshot; onOpenSession: (id: string) => void; onNewSession: (workspace: string) => void; coordinatorSessionId?: string | undefined; initialRunId?: string | undefined }) {
   const { t, status } = useLocale();
   const { runs, tasks, dispatches, gates, worktreeAssets } = snapshot.orchestration;
-  const [selectedRunId, setSelectedRunId] = useState<string>(text(runs[0]?.["id"]));
+  const [selectedRunId, setSelectedRunId] = useState<string>(
+    initialRunId ?? text(runs[0]?.["id"]),
+  );
   const [showCreate, setShowCreate] = useState(false);
   const [showTaskCreate, setShowTaskCreate] = useState(false);
   const [objective, setObjective] = useState("");
@@ -118,6 +120,10 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
   const [worktreeView, setWorktreeView] = useState({ runId, expanded: false, limit: WORKTREE_PAGE_SIZE });
   const worktreesExpanded = worktreeView.runId === runId && worktreeView.expanded;
   const worktreeLimit = worktreeView.runId === runId ? worktreeView.limit : WORKTREE_PAGE_SIZE;
+  useEffect(() => {
+    if (!initialRunId || !runs.some((run) => text(run["id"]) === initialRunId)) return;
+    setSelectedRunId(initialRunId);
+  }, [initialRunId, runs]);
   const runTasks = useMemo(() => tasks.filter((task) => text(task["runId"]) === runId), [tasks, runId]);
   const runGates = useMemo(() => gates.filter((gate) => text(gate["runId"]) === runId), [gates, runId]);
   const runDispatches = useMemo(() => dispatches.filter((dispatch) => text(dispatch["runId"]) === runId), [dispatches, runId]);
