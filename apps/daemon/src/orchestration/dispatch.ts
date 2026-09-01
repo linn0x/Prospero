@@ -636,6 +636,24 @@ export class DispatchService {
     }
   }
 
+  /**
+   * Explicit force cleanup only. This removes stale orchestration ownership
+   * after a daemon crash even when
+   * the old session registry can no longer answer a safe kill request. It
+   * deliberately preserves worktree assets for manual recovery.
+   */
+  forceRetireRun(runId: string, reason: string): StopWorkerResult[] {
+    const retired: StopWorkerResult[] = [];
+    for (const dispatch of this.store.listDispatches(runId)) {
+      if (dispatch.state !== "starting" && dispatch.state !== "running") continue;
+      const result = this.store.abandonActiveDispatchForMissingSession(dispatch.id, reason);
+      if (!result) continue;
+      this.store.preserveWorktreeAssetsForDispatch(dispatch.id, reason);
+      retired.push(result);
+    }
+    return retired;
+  }
+
   /** 给 WorktreeAssetService 注入同一个 SessionManager 的只读查询面。 */
   sessionInspector(): WorktreeSessionInspector {
     return this.sessions;

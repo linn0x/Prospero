@@ -282,15 +282,24 @@ export function orchestrationControlApi(
         case "run.delete": {
           const runId = text(params, "runId");
           const actorSessionId = optionalText(params, "actorSessionId");
+          const force = optionalBoolean(params, "force", false);
           return idempotent(
             method,
             operationId(params),
-            { runId, actorSessionId },
+            { runId, actorSessionId, force },
             () => {
               ownerOrCoordinator(store, runId, actorSessionId);
-              dispatch.assertNoLiveSessionForRun(runId);
-              if (store.getRun(runId).automation?.state === "running") {
+              const run = store.getRun(runId);
+              if (run.automation?.state === "running") {
                 automation?.pause(runId);
+              }
+              if (force) {
+                dispatch.forceRetireRun(
+                  runId,
+                  "explicit historical run cleanup; preserve worktree assets for manual recovery",
+                );
+              } else {
+                dispatch.assertNoLiveSessionForRun(runId);
               }
               return store.deleteRun(runId);
             },
