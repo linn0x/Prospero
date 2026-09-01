@@ -159,28 +159,42 @@ export class DispatchService {
     reason: string,
     finalStatus: WorkerStopFinalStatus,
   ): Promise<StopWorkerResult> {
+    // A structured session can become terminal before the state listener has
+    // projected that fact into the orchestration store. Never call kill on a
+    // session already known to be done/died: several adapters correctly reject
+    // that RPC, but the user's stop intent must still converge the stale
+    // dispatched Task/Dispatch pair to its requested terminal status.
+    let terminalBeforeStop = false;
     try {
-      await this.sessions.kill(active.sessionId);
-    } catch (error) {
+      terminalBeforeStop = isTerminalSession(this.sessions.infoOf(active.sessionId));
+    } catch {
+      // A missing lookup is not proof of convergence. Preserve the existing
+      // kill-and-durable-state path below for a potentially live worker.
+    }
+    if (!terminalBeforeStop) {
+      try {
+        await this.sessions.kill(active.sessionId);
+      } catch (error) {
       // Session termination races with an agent's explicit task.done/fail and
       // with adapter-side terminal projection. If either durable orchestration
       // state or the session registry already says the worker is terminal, the
       // stop request has converged and must not become an opaque control_error.
-      let sessionTerminal = false;
-      try {
-        sessionTerminal = isTerminalSession(this.sessions.infoOf(active.sessionId));
-      } catch {
-        // Missing session information is not enough to claim convergence; the
-        // durable Task/Dispatch pair below remains the authority.
-      }
-      const durableDispatch = this.store.getDispatch(active.id);
-      const durableTask = this.store.getTask(taskId);
-      const durableTerminal =
-        (durableDispatch.state !== "starting" && durableDispatch.state !== "running")
-        || durableTask.status !== "dispatched";
-      if (!sessionTerminal && !durableTerminal) {
-        const message = error instanceof Error ? error.message : String(error);
-        throw new DispatchError(`停止 worker 会话失败: ${message}`, "worker_stop_failed");
+        let sessionTerminal = false;
+        try {
+          sessionTerminal = isTerminalSession(this.sessions.infoOf(active.sessionId));
+        } catch {
+          // Missing session information is not enough to claim convergence; the
+          // durable Task/Dispatch pair below remains the authority.
+        }
+        const durableDispatch = this.store.getDispatch(active.id);
+        const durableTask = this.store.getTask(taskId);
+        const durableTerminal =
+          (durableDispatch.state !== "starting" && durableDispatch.state !== "running")
+          || durableTask.status !== "dispatched";
+        if (!sessionTerminal && !durableTerminal) {
+          const message = error instanceof Error ? error.message : String(error);
+          throw new DispatchError(`停止 worker 会话失败: ${message}`, "worker_stop_failed");
+        }
       }
     }
     let currentDispatch = this.store.getDispatch(active.id);
