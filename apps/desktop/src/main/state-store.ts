@@ -22,6 +22,7 @@ type PersistedDesktopState = {
   projectAliases?: Record<string, string>;
   pinnedProjectPaths?: string[];
   pinnedSessionIds?: string[];
+  archivedSessionIds?: string[];
   unreadSessionIds?: string[];
   workflowTemplates?: WorkflowTemplate[];
 };
@@ -53,6 +54,7 @@ type SnapshotInputs = {
   projectAliases: Record<string, string>;
   pinnedProjectPaths: string[];
   pinnedSessionIds: string[];
+  archivedSessionIds: string[];
   unreadSessionIds: string[];
   workflowTemplates: WorkflowTemplate[];
   accounts: JsonObject[];
@@ -193,6 +195,7 @@ export class StateStore extends EventEmitter {
   private projectAliases: Record<string, string> = {};
   private pinnedProjectPaths: string[] = [];
   private pinnedSessionIds: string[] = [];
+  private archivedSessionIds: string[] = [];
   private unreadSessionIds: string[] = [];
   private workflowTemplates: WorkflowTemplate[] = [];
   private managedPid: number | undefined;
@@ -339,6 +342,7 @@ export class StateStore extends EventEmitter {
     const projectAliases = previous && previousInputs?.projectAliases === this.projectAliases ? previous.projectAliases : reuseEquivalent(previous?.projectAliases, { ...this.projectAliases });
     const pinnedProjectPaths = previous && previousInputs?.pinnedProjectPaths === this.pinnedProjectPaths ? previous.pinnedProjectPaths : reuseEquivalent(previous?.pinnedProjectPaths, [...this.pinnedProjectPaths]);
     const pinnedSessionIds = previous && previousInputs?.pinnedSessionIds === this.pinnedSessionIds ? previous.pinnedSessionIds : reuseEquivalent(previous?.pinnedSessionIds, [...this.pinnedSessionIds]);
+    const archivedSessionIds = previous && previousInputs?.archivedSessionIds === this.archivedSessionIds ? previous.archivedSessionIds : reuseEquivalent(previous?.archivedSessionIds, [...this.archivedSessionIds]);
     const unreadSessionIds = previous && previousInputs?.unreadSessionIds === this.unreadSessionIds ? previous.unreadSessionIds : reuseEquivalent(previous?.unreadSessionIds, [...this.unreadSessionIds]);
     const workflowTemplates = previous && previousInputs?.workflowTemplates === this.workflowTemplates
       ? previous.workflowTemplates
@@ -351,6 +355,7 @@ export class StateStore extends EventEmitter {
       projectAliases,
       pinnedProjectPaths,
       pinnedSessionIds,
+      archivedSessionIds,
       unreadSessionIds,
       workflowTemplates,
       devices,
@@ -365,6 +370,7 @@ export class StateStore extends EventEmitter {
       && previous.projectAliases === candidate.projectAliases
       && previous.pinnedProjectPaths === candidate.pinnedProjectPaths
       && previous.pinnedSessionIds === candidate.pinnedSessionIds
+      && previous.archivedSessionIds === candidate.archivedSessionIds
       && previous.unreadSessionIds === candidate.unreadSessionIds
       && previous.workflowTemplates === candidate.workflowTemplates
       && previous.devices === candidate.devices
@@ -385,6 +391,7 @@ export class StateStore extends EventEmitter {
       projectAliases: this.projectAliases,
       pinnedProjectPaths: this.pinnedProjectPaths,
       pinnedSessionIds: this.pinnedSessionIds,
+      archivedSessionIds: this.archivedSessionIds,
       unreadSessionIds: this.unreadSessionIds,
       workflowTemplates: this.workflowTemplates,
       accounts: this.accounts,
@@ -466,6 +473,18 @@ export class StateStore extends EventEmitter {
     this.pinnedProjectPaths = pinned
       ? [...new Set([...this.pinnedProjectPaths, normalized])]
       : this.pinnedProjectPaths.filter((item) => item.toLocaleLowerCase() !== normalized.toLocaleLowerCase());
+    this.saveDesktopState();
+    this.changed();
+    return this.snapshot();
+  }
+
+  /// 归档只是桌面端的一个本地标记 —— 会话本身照常在 daemon 里活着,
+  /// 只是从侧栏主列表里收进"已归档"分组。想真正结束会话请用"结束会话"。
+  setSessionArchived(sessionId: string, archived: boolean): DesktopSnapshot {
+    if (!this.isKnownSession(sessionId)) throw new Error("会话不存在");
+    this.archivedSessionIds = archived
+      ? [...new Set([...this.archivedSessionIds, sessionId])]
+      : this.archivedSessionIds.filter((id) => id !== sessionId);
     this.saveDesktopState();
     this.changed();
     return this.snapshot();
@@ -733,6 +752,7 @@ export class StateStore extends EventEmitter {
         .map(([path, alias]) => [normalizeProject(path).toLocaleLowerCase(), String(alias).trim().slice(0, 80)]),
     );
     this.pinnedSessionIds = arrayValue(raw.pinnedSessionIds).filter((value): value is string => typeof value === "string" && SAFE_PERSISTED_SESSION_ID.test(value));
+    this.archivedSessionIds = arrayValue(raw.archivedSessionIds).filter((value): value is string => typeof value === "string" && SAFE_PERSISTED_SESSION_ID.test(value));
     this.pinnedProjectPaths = arrayValue(raw.pinnedProjectPaths).filter((value): value is string => typeof value === "string" && isAbsolute(value)).map(normalizeProject);
     this.unreadSessionIds = arrayValue(raw.unreadSessionIds).filter((value): value is string => typeof value === "string" && SAFE_PERSISTED_SESSION_ID.test(value));
     this.workflowTemplates = arrayValue(raw.workflowTemplates).map(objectValue).flatMap((value): WorkflowTemplate[] => {
@@ -762,7 +782,7 @@ export class StateStore extends EventEmitter {
 
   private saveDesktopState(): void {
     mkdirSync(dirname(this.desktopStatePath), { recursive: true });
-    writeFileSync(this.desktopStatePath, JSON.stringify({ projects: this.projects, settings: this.settings, sessionTitles: this.sessionTitles, projectAliases: this.projectAliases, pinnedProjectPaths: this.pinnedProjectPaths, pinnedSessionIds: this.pinnedSessionIds, unreadSessionIds: this.unreadSessionIds, workflowTemplates: this.workflowTemplates }, null, 2), { encoding: "utf8", mode: 0o600 });
+    writeFileSync(this.desktopStatePath, JSON.stringify({ projects: this.projects, settings: this.settings, sessionTitles: this.sessionTitles, projectAliases: this.projectAliases, pinnedProjectPaths: this.pinnedProjectPaths, pinnedSessionIds: this.pinnedSessionIds, archivedSessionIds: this.archivedSessionIds, unreadSessionIds: this.unreadSessionIds, workflowTemplates: this.workflowTemplates }, null, 2), { encoding: "utf8", mode: 0o600 });
   }
 
   private loadLogTail(): void {

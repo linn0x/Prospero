@@ -21,6 +21,7 @@ const api: DesktopApi = {
   renameProject: (path: string, name: string) => ipcRenderer.invoke("project:rename", path, name),
   setProjectPinned: (path: string, pinned: boolean) => ipcRenderer.invoke("project:pin", path, pinned),
   setSessionPinned: (sessionId: string, pinned: boolean) => ipcRenderer.invoke("session:pin", sessionId, pinned),
+  setSessionArchived: (sessionId: string, archived: boolean) => ipcRenderer.invoke("session:archive", sessionId, archived),
   setSessionUnread: (sessionId: string, unread: boolean) => ipcRenderer.invoke("session:unread", sessionId, unread),
   renameSession: (sessionId: string, title: string) => ipcRenderer.invoke("session:rename", sessionId, title),
   revealPath: (path: string) => ipcRenderer.invoke("path:reveal", path),

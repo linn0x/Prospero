@@ -125,6 +125,8 @@ export type DesktopSnapshot = {
   projectAliases: Record<string, string>;
   pinnedProjectPaths: string[];
   pinnedSessionIds: string[];
+  /** 桌面端本地的归档标记:会话仍在 daemon 里活着,只是从主列表收起。 */
+  archivedSessionIds: string[];
   unreadSessionIds: string[];
   workflowTemplates: WorkflowTemplate[];
   devices: DeviceInfo[];
@@ -237,6 +239,7 @@ export type DesktopApi = {
   renameProject(path: string, name: string): Promise<DesktopSnapshot>;
   setProjectPinned(path: string, pinned: boolean): Promise<DesktopSnapshot>;
   setSessionPinned(sessionId: string, pinned: boolean): Promise<DesktopSnapshot>;
+  setSessionArchived(sessionId: string, archived: boolean): Promise<DesktopSnapshot>;
   setSessionUnread(sessionId: string, unread: boolean): Promise<DesktopSnapshot>;
   renameSession(sessionId: string, title: string): Promise<DesktopSnapshot>;
   revealPath(path: string): Promise<{ ok: boolean; error?: string }>;
