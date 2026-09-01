@@ -45,6 +45,22 @@ describe("terminal clipboard shortcuts", () => {
     expect(terminalShortcutAction(key({ altKey: true, code: "ArrowRight", key: "ArrowRight" }), true)).toBe("forwardWord");
   });
 
+  it("opens find on both platforms", () => {
+    // ⌘F 在 mac、Ctrl+Shift+F 在其它平台 —— 查找不该只有一个平台能用。
+    expect(terminalShortcutAction(key({ metaKey: true, code: "KeyF" }), true)).toBe("find");
+    expect(terminalShortcutAction(key({ ctrlKey: true, shiftKey: true, code: "KeyF" }), false)).toBe("find");
+  });
+
+  it("does not treat find as a clipboard action", () => {
+    // terminalClipboardAction 只该回报复制/粘贴;查找走的是另一条分支。
+    expect(terminalClipboardAction(key({ metaKey: true, code: "KeyF" }), true)).toBeUndefined();
+  });
+
+  it("leaves bare Command-F alone on non-mac", () => {
+    // 其它平台上裸 ⌘/Meta 不是剪贴板修饰键,不该被吞掉。
+    expect(terminalShortcutAction(key({ metaKey: true, code: "KeyF" }), false)).toBeUndefined();
+  });
+
   it("keeps Shift+Insert paste available outside macOS", () => {
     expect(terminalShortcutAction(key({ shiftKey: true, code: "Insert" }), false)).toBe("paste");
   });
