@@ -477,9 +477,13 @@ describe("控制 API 的幂等与任务图事务", () => {
     const run = store.createRun({ objective: "停止竞争", coordinatorSessionId: null });
     const task = store.createTask({ runId: run.id, title: "旧 revision", spec: "" });
     store.createDispatch({ taskId: task.id, sessionId: "worker-terminal" });
+    let kills = 0;
     const sessions: WorkerSessionManager = {
       ...unusedSessions,
-      async kill() { throw new Error("session already closed"); },
+      async kill() {
+        kills++;
+        throw new Error("terminal session must not be killed");
+      },
       infoOf() {
         return {
           id: "worker-terminal",
@@ -508,6 +512,48 @@ describe("控制 API 的幂等与任务图事务", () => {
       actorSessionId: null,
     }, new AbortController().signal) as { task: { status: string } };
     expect(stopped.task.status).toBe("cancelled");
+    expect(kills).toBe(0);
+  });
+
+  it("worker.stop 对已 died 但仍 dispatched 的 worker 直接收敛", async () => {
+    const store = new OrchestrationStore();
+    const run = store.createRun({ objective: "终态收敛", coordinatorSessionId: null });
+    const task = store.createTask({ runId: run.id, title: "残留 worker", spec: "" });
+    store.createDispatch({ taskId: task.id, sessionId: "worker-died-before-stop" });
+    let kills = 0;
+    const sessions: WorkerSessionManager = {
+      ...unusedSessions,
+      async kill() { kills++; },
+      infoOf() {
+        return {
+          id: "worker-died-before-stop",
+          agent: "codex",
+          kind: "structured",
+          title: "worker",
+          cwd: "/tmp",
+          status: "died",
+          createdAt: 1,
+          cols: 80,
+          rows: 24,
+        };
+      },
+    };
+    const api = orchestrationControlApi(
+      store,
+      new DispatchService(store, sessions),
+      new CollaborationService(store),
+    );
+
+    const stopped = await api("worker.stop", {
+      taskId: task.id,
+      reason: "冻结批次",
+      finalStatus: "cancelled",
+      operationId: "died-before-stop",
+      actorSessionId: null,
+    }, new AbortController().signal) as { task: { status: string }; dispatch: { state: string } };
+    expect(stopped.task.status).toBe("cancelled");
+    expect(stopped.dispatch.state).toBe("abandoned");
+    expect(kills).toBe(0);
   });
 
   it("worker.stop(cancelled) 覆盖 kill 产生的 abandoned/failed 投影", async () => {
