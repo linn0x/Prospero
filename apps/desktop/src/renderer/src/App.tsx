@@ -13,11 +13,12 @@ import {
 import {
   Activity,
   Archive,
+  ArchiveRestore,
   ArrowDownAZ,
   ArrowRight,
+  BookOpen,
   Bot,
   Boxes,
-  BookOpen,
   CheckCircle2,
   ChevronRight,
   CircleAlert,
@@ -375,6 +376,7 @@ type SidebarSessionHandlers = {
   onRenameSession: (id: string) => void;
   onDuplicateSession: (session: SessionInfo) => void;
   onSetUnread: (id: string, unread: boolean) => void;
+  onToggleArchive: (id: string) => void;
 };
 
 type PinnedSessionRowProps = Pick<
@@ -437,6 +439,7 @@ type WorkspaceSessionRowProps = SidebarSessionHandlers & {
   active: boolean;
   unread: boolean;
   pinned: boolean;
+  archived: boolean;
 };
 
 /**
@@ -449,11 +452,13 @@ const WorkspaceSessionRow = memo(function WorkspaceSessionRow({
   active,
   unread,
   pinned,
+  archived,
   onOpenSession,
   onTogglePin,
   onRenameSession,
   onDuplicateSession,
   onSetUnread,
+  onToggleArchive,
 }: WorkspaceSessionRowProps) {
   const { language, t, status } = useLocale();
   return (
@@ -502,6 +507,10 @@ const WorkspaceSessionRow = memo(function WorkspaceSessionRow({
               {pinned ? <PinOff /> : <Pin />}
               {pinned ? t("取消置顶", "Unpin") : t("置顶", "Pin")}
             </ContextMenuItem>
+          <ContextMenuItem onClick={() => onToggleArchive(session.id)}>
+            {archived ? <ArchiveRestore /> : <Archive />}
+            {archived ? t("取消归档", "Unarchive") : t("归档", "Archive")}
+          </ContextMenuItem>
             <ContextMenuItem
               onClick={() => void window.prospero.revealPath(session.cwd)}
             >
@@ -664,6 +673,7 @@ function ShellSidebar({
   onOpenSession,
   onNewSession,
   onTogglePin,
+  onToggleArchive,
   onRenameProject,
   onRenameSession,
   onDuplicateSession,
@@ -674,8 +684,9 @@ function ShellSidebar({
   activeId: string | undefined;
   onView: (view: View) => void;
   onOpenSession: (id: string) => void;
-  onNewSession: () => void;
+  onNewSession: (project?: string) => void;
   onTogglePin: (id: string) => void;
+  onToggleArchive: (id: string) => void;
   onRenameProject: (path: string) => void;
   onRenameSession: (id: string) => void;
   onDuplicateSession: (session: SessionInfo) => void;
@@ -1107,15 +1118,6 @@ function ShellSidebar({
               Agent Work OS
             </span>
           </div>
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            className="ml-auto group-data-[collapsible=icon]:hidden"
-            aria-label={t("新建会话", "New session")}
-            onClick={onNewSession}
-          >
-            <Plus />
-          </Button>
         </div>
       </SidebarHeader>
       <SidebarContent>
@@ -1302,6 +1304,8 @@ function ShellSidebar({
                             session={session}
                             active={view === "workspaces" && activeId === session.id}
                             unread={snapshot.unreadSessionIds.includes(session.id)}
+                            archived={snapshot.archivedSessionIds.includes(session.id)}
+                            onToggleArchive={onToggleArchive}
                             pinned={snapshot.pinnedSessionIds.includes(session.id)}
                             onOpenSession={onOpenSession}
                             onTogglePin={onTogglePin}
@@ -1349,8 +1353,14 @@ function ShellSidebar({
                   ) : (
                   visibleProjects.map((project) => {
                     const sessions = sessionsByProject.get(project) ?? [];
+                    // 归档的会话从主列表收起。搜索时不过滤 —— 明确搜某个东西的人
+                    // 是想找到它,而不是被"你把它归档过"挡回来。
                     const matchingSessions = filterSessionsByQuery(
-                      sessions,
+                      normalizedSessionQuery
+                        ? sessions
+                        : sessions.filter(
+                            (item) => !snapshot.archivedSessionIds.includes(item.id),
+                          ),
                       normalizedSessionQuery,
                     );
                     if (normalizedSessionQuery && matchingSessions.length === 0)
@@ -1392,6 +1402,10 @@ function ShellSidebar({
                         className="group/project"
                       >
                         <SidebarMenuItem className="workspace-project-item">
+                          <ContextMenu>
+                          <ContextMenuTrigger
+                            render={<div className="workspace-project-context" />}
+                          >
                           <CollapsibleTrigger
                             render={
                               <SidebarMenuButton
@@ -1411,6 +1425,40 @@ function ShellSidebar({
                                 : sessions.length}
                             </span>
                           </CollapsibleTrigger>
+                          </ContextMenuTrigger>
+                          <ContextMenuContent>
+                            <ContextMenuGroup>
+                              <ContextMenuLabel>{name}</ContextMenuLabel>
+                              <ContextMenuItem onClick={() => onNewSession(project)}>
+                                <Plus />
+                                {t("新建会话", "New session")}
+                              </ContextMenuItem>
+                              <ContextMenuItem onClick={() => void window.prospero.revealPath(project)}>
+                                <FolderOpen />
+                                {isMac ? t("在访达中显示", "Reveal in Finder") : t("在资源管理器中打开", "Open in Explorer")}
+                              </ContextMenuItem>
+                              <ContextMenuItem onClick={() => void window.prospero.openWindowsTerminal(project)}>
+                                <SquareTerminal />
+                                {isMac ? t("在终端中打开", "Open in Terminal") : "Windows Terminal"}
+                              </ContextMenuItem>
+                            </ContextMenuGroup>
+                            <ContextMenuSeparator />
+                            <ContextMenuGroup>
+                              <ContextMenuItem onClick={() => onRenameProject(project)}>
+                                <Pencil />
+                                {t("编辑名称", "Edit name")}
+                              </ContextMenuItem>
+                              <ContextMenuItem onClick={() => void window.prospero.setProjectPinned(project, !projectPinned)}>
+                                {projectPinned ? <PinOff /> : <Pin />}
+                                {projectPinned ? t("取消置顶", "Unpin") : t("置顶工作区", "Pin workspace")}
+                              </ContextMenuItem>
+                              <ContextMenuItem variant="destructive" onClick={() => void window.prospero.forgetProject(project)}>
+                                <X />
+                                {t("从列表移除", "Remove from list")}
+                              </ContextMenuItem>
+                            </ContextMenuGroup>
+                          </ContextMenuContent>
+                          </ContextMenu>
                           <DropdownMenu>
                             <DropdownMenuTrigger
                               render={
@@ -1488,6 +1536,10 @@ function ShellSidebar({
                                   unread={snapshot.unreadSessionIds.includes(
                                     session.id,
                                   )}
+                                  archived={snapshot.archivedSessionIds.includes(
+                                    session.id,
+                                  )}
+                                  onToggleArchive={onToggleArchive}
                                   pinned={snapshot.pinnedSessionIds.includes(
                                     session.id,
                                   )}
@@ -3226,6 +3278,14 @@ function NewSessionDialog({
   const selectedLaunchModel = launchModels.find(
     (model) => model.id === input.model,
   );
+  // 对话框打开时刷新一次账号。主进程在 daemon 就绪时已经灌过一份,但 daemon
+  // 可能是后启动的,账号也可能在别处刚被创建/删除 —— 这里兜住那些情况。
+  useEffect(() => {
+    if (!open) return;
+    void window.prospero
+      .accountAction({ type: "agent.accounts.list", requestId: crypto.randomUUID() })
+      .catch(() => undefined);
+  }, [open]);
   useEffect(() => {
     if (!open) return;
     setInput((current) => {
@@ -3933,6 +3993,12 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     setNewSessionProject(project);
     setNewSessionOpen(true);
   }, []);
+  const toggleArchive = useCallback((id: string): void => {
+    void window.prospero.setSessionArchived(
+      id,
+      !snapshotRef.current.archivedSessionIds.includes(id),
+    );
+  }, []);
   const togglePin = useCallback((id: string): void => {
     void window.prospero.setSessionPinned(
       id,
@@ -4035,6 +4101,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
         onOpenSession={openSession}
         onNewSession={openNewSession}
         onTogglePin={togglePin}
+        onToggleArchive={toggleArchive}
         onRenameProject={setEditingProject}
         onRenameSession={setEditingSession}
         onDuplicateSession={duplicateSession}

@@ -5,6 +5,7 @@ const SNAPSHOT_KEYS = [
   "projectAliases",
   "pinnedProjectPaths",
   "pinnedSessionIds",
+  "archivedSessionIds",
   "unreadSessionIds",
   "workflowTemplates",
   "devices",

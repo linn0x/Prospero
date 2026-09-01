@@ -178,6 +178,27 @@ describe("Electron state snapshot caching", () => {
     expect(store.isKnownSession("missing")).toBe(false);
   });
 
+  it("archives a session locally without touching the daemon session list", () => {
+    // 归档只是桌面端的一个标记:会话仍在 daemon 里活着,只是从侧栏主列表收起。
+    // 它必须能持久化,否则重启一次归档就白做了。
+    const home = testHome();
+    writeJson(home, "status.json", {
+      sessions: [{ id: "live", cwd: home, agent: "codex", kind: "structured", status: "running" }],
+    });
+    const store = new StateStore(home);
+    store.snapshot();
+
+    store.setSessionArchived("live", true);
+    expect(store.snapshot().archivedSessionIds).toEqual(["live"]);
+    expect(store.snapshot().daemon.sessions.map((session) => session.id)).toEqual(["live"]);
+
+    expect(new StateStore(home).snapshot().archivedSessionIds).toEqual(["live"]);
+
+    store.setSessionArchived("live", false);
+    expect(store.snapshot().archivedSessionIds).toEqual([]);
+    expect(() => store.setSessionArchived("missing", true)).toThrow();
+  });
+
   it("discovers a session project when its directory appears after the status update", () => {
     const home = testHome();
     const project = resolve(home, "late-project");

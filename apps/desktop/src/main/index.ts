@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { networkInterfaces } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, screen, shell, Tray } from "electron";
@@ -351,6 +352,17 @@ function refreshTrayMenu(): void {
     { type: "separator" },
     { label: "退出", click: () => { quitting = true; app.quit(); } },
   ]));
+}
+
+/** 拉取账号列表并写进 store。失败不打扰用户:界面上会退化成"没有可用账号"。 */
+async function refreshAccounts(): Promise<void> {
+  try {
+    const result = await runtime.request("/_prospero/control/accounts", {
+      method: "POST",
+      body: { type: "agent.accounts.list", requestId: randomUUID() },
+    });
+    if (Array.isArray(result?.["accounts"])) store.setAccounts(result["accounts"]);
+  } catch { /* daemon 还没准备好或账号服务不可用,下次打开对话框时会再拉一次 */ }
 }
 
 function installApplicationMenu(): void {
@@ -726,6 +738,11 @@ function installIpc(): void {
     const sessionId = requireId(rawId, "会话");
     if (typeof rawTitle !== "string") throw new Error("会话名称无效");
     return store.renameSession(sessionId, rawTitle);
+  });
+  ipcMain.handle("session:archive", (_event, rawId: unknown, archived: unknown) => {
+    const sessionId = requireId(rawId, "会话");
+    if (typeof archived !== "boolean") throw new Error("归档状态无效");
+    return store.setSessionArchived(sessionId, archived);
   });
   ipcMain.handle("session:pin", (_event, rawId: unknown, pinned: unknown) => {
     const sessionId = requireId(rawId, "会话");
@@ -1114,6 +1131,10 @@ void app.whenReady().then(async () => {
   if (process.argv.includes("--background")) mainWindow.hide();
   if (store.snapshot().settings.startDaemonOnLaunch) {
     const started = await runtime.start();
+    // daemon 一就绪就把账号列表灌进 store。以前它只在"账号"页被打开时才填充
+    // (setAccounts 的唯一调用点在 account:action 的响应里),于是冷启动后直接去
+    // 新建会话,账号下拉框是空的、只有一行"没有可用账号"。
+    if (started.ok) void refreshAccounts();
     // 冒烟测试那一步的名字就是"Start packaged UI and its bundled daemon" ——
     // 跳过启动的话它只验证了一个空壳 UI。daemon 起不来必须让进程非零退出,
     // 由 CI 的退出码来兜;runtime.start() 是等到 /control/health 应答才返回的,
