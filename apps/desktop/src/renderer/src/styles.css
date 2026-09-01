@@ -1775,3 +1775,24 @@ kbd {
 
 /* SwiftUI Shell 与 Electron 终端共享同一套 Tokyo Night 预览。 */
 .terminal-preview { background: #1a1b26; color: #c0caf5; }
+
+/* 终端内查找条(⌘F)。浮在终端右上角,不挤占终端行数 —— 终端的可用行数
+   是会话本身的属性,不该被一个临时 UI 改变。 */
+.terminal-find {
+  position: absolute; top: 8px; right: 12px; z-index: 5;
+  display: flex; align-items: center; gap: 4px;
+  padding: 4px 5px; border-radius: 8px;
+  background: #1f2233; border: 1px solid #2f3450;
+  box-shadow: 0 6px 18px rgb(0 0 0 / .35);
+}
+.terminal-find input {
+  width: 190px; padding: 3px 7px; font-size: 12px;
+  color: #c0caf5; background: #15161e;
+  border: 1px solid #2f3450; border-radius: 6px; outline: none;
+}
+.terminal-find input:focus { border-color: #7aa2f7; }
+.terminal-find button {
+  width: 22px; height: 22px; padding: 0; font-size: 11px; line-height: 1;
+  color: #9aa5ce; background: transparent; border: 0; border-radius: 5px; cursor: pointer;
+}
+.terminal-find button:hover { background: #292e42; color: #c0caf5; }

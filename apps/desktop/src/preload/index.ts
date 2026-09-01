@@ -4,6 +4,9 @@ import type { DesktopApi, DesktopSettings, DesktopSnapshotPatch, JsonObject, Ses
 const api: DesktopApi = {
   platform: process.platform,
   listNetworkInterfaces: () => ipcRenderer.invoke("network:interfaces"),
+  openExternal: (url: string) => ipcRenderer.invoke("external:open", url),
+  readClipboard: () => ipcRenderer.invoke("clipboard:read"),
+  writeClipboard: (value: string) => ipcRenderer.invoke("clipboard:write", value),
   getSnapshot: () => ipcRenderer.invoke("snapshot:get"),
   subscribeSnapshot(listener) {
     const wrapped = (_event: Electron.IpcRendererEvent, patch: DesktopSnapshotPatch): void => listener(patch);

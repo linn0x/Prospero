@@ -141,6 +141,11 @@ export function configureSession(id: string, tmux: string): boolean {
     // events so its own 10k-line history enters copy-mode. The Mac host enables
     // xterm's Option-drag escape hatch for native text selection.
     ["set-option", "-t", target, "mouse", "on"],
+    // 这里【刻意不设】set-clipboard。它是 server 级选项(-s),按会话设会失败,
+    // 而按 server 设又会波及用户在同一个 tmux server 上的其他会话 —— 正是本函数
+    // 开头那条约束禁止的事。默认值 external 恰好就是我们要的:应用自己发出的
+    // OSC 52(vim 的 "+y、copy-mode 里显式 yank)会透传给外层终端,而鼠标拖选
+    // 不会自动进系统剪贴板。复制只应由 ⌘C 触发,别改成 on。
     ["set-option", "-t", target, "destroy-unattached", "off"],
     ["set-option", "-t", target, "xterm-keys", "on"],
     ["set-window-option", "-t", target, "history-limit", "10000"],

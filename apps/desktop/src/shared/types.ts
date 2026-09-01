@@ -244,6 +244,11 @@ export type DesktopApi = {
   /** 宿主平台。静态值,用来让"在资源管理器中打开"这类字样跟着系统走。 */
   platform: NodeJS.Platform;
   listNetworkInterfaces(): Promise<Array<{ label: string; address: string }>>;
+  /** 剪贴板走主进程:渲染进程的权限被一律拒绝,网页 Clipboard API 在这里用不了。 */
+  /** 终端里的链接交给系统浏览器;主进程只放行 http(s)。 */
+  openExternal(url: string): Promise<{ ok: boolean }>;
+  readClipboard(): Promise<string>;
+  writeClipboard(value: string): Promise<{ ok: boolean }>;
   createSession(input: SessionCreateInput): Promise<SessionInfo>;
   /** Fetch terminal/history records only when a list or search needs them. */
   listSessions(request?: SessionPageRequest): Promise<SessionPage>;
