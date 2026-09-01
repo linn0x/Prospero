@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { FitAddon } from "@xterm/addon-fit";
+import { SearchAddon } from "@xterm/addon-search";
+import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
@@ -30,6 +32,7 @@ export type TerminalShortcutAction =
   | "paste"
   | "selectAll"
   | "clear"
+  | "find"
   | "beginningOfLine"
   | "endOfLine"
   | "deleteToBeginning"
@@ -63,6 +66,7 @@ export function terminalShortcutAction(
   }
   if (event.code === "KeyA") return "selectAll";
   if (event.code === "KeyK") return "clear";
+  if (event.code === "KeyF") return "find";
   if (event.key === "ArrowLeft" || event.key === "ArrowUp") return "beginningOfLine";
   if (event.key === "ArrowRight" || event.key === "ArrowDown") return "endOfLine";
   if (event.key === "Backspace") return "deleteToBeginning";
@@ -79,11 +83,12 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
   const { t } = useLocale();
   const isMac = navigator.platform.toLowerCase().includes("mac") || navigator.userAgent.includes("Macintosh");
   const shortcutHint = isMac
-    ? t("⌘C/⌘V 复制粘贴 · ⌥←/⌥→ 按词移动 · ⌘K 清屏", "⌘C/⌘V copy and paste · ⌥←/⌥→ move by word · ⌘K clear")
+    ? t("拖动选中 · ⌘C/⌘V 复制粘贴 · ⌘F 查找 · ⌘K 清屏", "Drag to select · ⌘C/⌘V copy and paste · ⌘F find · ⌘K clear")
     : t("Ctrl+Shift+C/V 复制粘贴 · Shift+Insert 粘贴", "Ctrl+Shift+C/V copy and paste · Shift+Insert paste");
   const host = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | undefined>(undefined);
   const fitRef = useRef<FitAddon | undefined>(undefined);
+  const searchRef = useRef<SearchAddon | undefined>(undefined);
   const cursorRef = useRef<number | undefined>(undefined);
   const writeChain = useRef(Promise.resolve());
   const interactionChain = useRef(Promise.resolve());
@@ -92,6 +97,8 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
   const [connected, setConnected] = useState(false);
   const [notice, setNotice] = useState<string>();
   const [bell, setBell] = useState(false);
+  const [findOpen, setFindOpen] = useState(false);
+  const [findText, setFindText] = useState("");
 
   useEffect(() => {
     if (!host.current) return;
@@ -132,6 +139,14 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
     });
     const fit = new FitAddon();
     terminal.loadAddon(fit);
+    const search = new SearchAddon();
+    terminal.loadAddon(search);
+    // URL 可点。在 Electron 里必须显式交给系统浏览器打开 —— 渲染进程的
+    // will-navigate 是被拦掉的,直接跳转只会是一个什么都不发生的点击。
+    terminal.loadAddon(new WebLinksAddon((event, uri) => {
+      event.preventDefault();
+      if (/^https?:\/\//i.test(uri)) void window.prospero.openExternal(uri);
+    }));
     terminal.open(host.current);
     try {
       const webgl = new WebglAddon();
@@ -142,6 +157,45 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
     terminal.focus();
     terminalRef.current = terminal;
     fitRef.current = fit;
+    searchRef.current = search;
+
+    // 普通拖动 = 在 xterm 里选中文本(然后 ⌘C 复制)。
+    //
+    // tmux 开着 mouse on(为了滚轮能进它的 10k 历史),而鼠标上报是终端层面的
+    // 开关:一旦开启,拖动就整个交给 tmux,xterm 自己没有选区,⌘C 也就无从复制。
+    // xterm 留了一个逃生口 —— macOptionClickForcesSelection:按住 ⌥ 拖动强制本地
+    // 选中。这里把普通拖动重放成"带 ⌥"的事件,等于把逃生口变成默认行为,
+    // 而滚轮事件不碰,仍旧上报给 tmux。两者因此可以共存。
+    //
+    // 代价:鼠标拖动不再送达 tmux/vim(拖 pane 边界、鼠标可视选择用不了)。
+    // Shift + 拖动保留原样交给应用,作为反向的逃生口。
+    const forceLocalSelection = (event: MouseEvent): void => {
+      if (!isMac || !event.isTrusted) return;      // 重放出来的那份不再拦,否则无限递归
+      if (event.button !== 0 || event.shiftKey || event.altKey) return;
+      if (event.type === "mousemove" && (event.buttons & 1) === 0) return;
+      event.stopImmediatePropagation();
+      event.target?.dispatchEvent(new MouseEvent(event.type, {
+        bubbles: event.bubbles,
+        cancelable: event.cancelable,
+        composed: event.composed,
+        view: window,
+        detail: event.detail,
+        screenX: event.screenX,
+        screenY: event.screenY,
+        clientX: event.clientX,
+        clientY: event.clientY,
+        button: event.button,
+        buttons: event.buttons,
+        ctrlKey: event.ctrlKey,
+        metaKey: event.metaKey,
+        shiftKey: event.shiftKey,
+        altKey: true,
+      }));
+    };
+    const mouseTypes: Array<keyof HTMLElementEventMap> = ["mousedown", "mousemove", "mouseup"];
+    for (const type of mouseTypes) {
+      host.current.addEventListener(type, forceLocalSelection as EventListener, true);
+    }
 
     let input = "";
     let inputTimer: number | undefined;
@@ -179,14 +233,14 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
       if (action === "copy") {
         const selection = terminal.getSelection();
         if (selection) {
-          void navigator.clipboard.writeText(selection)
+          void window.prospero.writeClipboard(selection)
             .then(() => showNotice(t("已复制", "Copied")))
             .catch((reason) => setError(displayError(reason)));
-        } else showNotice(t("按住 ⌥ 拖动选择文本", "Hold Option while dragging to select text"));
+        } else showNotice(t("先拖动选择要复制的内容", "Select text by dragging first"));
         return false;
       }
       if (action === "paste") {
-        void navigator.clipboard.readText()
+        void window.prospero.readClipboard()
           .then((value) => {
             if (value) {
               terminal.paste(value);
@@ -201,6 +255,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
         showNotice(t("已选择终端内容", "Terminal contents selected"));
         return false;
       }
+      if (action === "find") { setFindOpen(true); return false; }
       if (action === "clear") {
         terminal.clear();
         queueInputText("\x0c");
@@ -222,7 +277,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
       if (payload === "?" || payload.length > 8 * 1024 * 1024) return true;
       try {
         const text = fromBase64(payload);
-        if (text) void navigator.clipboard.writeText(text).then(() => showNotice(t("终端已复制到剪贴板", "Terminal copied to clipboard"))).catch((reason) => setError(displayError(reason)));
+        if (text) void window.prospero.writeClipboard(text).then(() => showNotice(t("终端已复制到剪贴板", "Terminal copied to clipboard"))).catch((reason) => setError(displayError(reason)));
       } catch {
         showNotice(t("无法读取终端剪贴板内容", "Unable to read terminal clipboard data"));
       }
@@ -244,7 +299,11 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
     });
     resize.observe(host.current);
 
+    const mouseHost = host.current;
     return () => {
+      for (const type of mouseTypes) {
+        mouseHost.removeEventListener(type, forceLocalSelection as EventListener, true);
+      }
       window.clearTimeout(inputTimer);
       window.clearTimeout(resizeTimer);
       window.clearTimeout(noticeTimer);
@@ -321,8 +380,46 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
     return () => { active = false; };
   }, [session.id, t]);
 
+  const runFind = (backwards: boolean): void => {
+    const value = findText.trim();
+    if (!value) return;
+    // 概览标尺的两个颜色是必填项:搜索命中会在右侧滚动条上留下标记。
+    const options = {
+      decorations: {
+        matchBackground: "#3d59a1",
+        matchOverviewRuler: "#3d59a1",
+        activeMatchBackground: "#7aa2f7",
+        activeMatchColorOverviewRuler: "#7aa2f7",
+      },
+    };
+    const hit = backwards
+      ? searchRef.current?.findPrevious(value, options)
+      : searchRef.current?.findNext(value, options);
+    if (hit === false) setNotice(t("没有找到匹配", "No matches"));
+  };
+  const closeFind = (): void => {
+    setFindOpen(false);
+    searchRef.current?.clearDecorations();
+    terminalRef.current?.focus();
+  };
+
   return <div className={bell ? "terminal-shell terminal-bell" : "terminal-shell"}>
     <div className="terminal-status"><span className={connected ? "live-dot" : "live-dot offline"} />{connected ? t("实时终端", "Live terminal") : t("正在重连", "Reconnecting")}<span className="terminal-shortcut" title={shortcutHint}>{isMac ? "⌘C / ⌘V" : "Ctrl+Shift+C / V"}</span></div>
+    {findOpen && <div className="terminal-find">
+      <input
+        autoFocus
+        value={findText}
+        placeholder={t("在终端中查找", "Find in terminal")}
+        onChange={(event) => setFindText(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") { event.preventDefault(); closeFind(); return; }
+          if (event.key === "Enter") { event.preventDefault(); runFind(event.shiftKey); }
+        }}
+      />
+      <button type="button" onClick={() => runFind(true)} aria-label={t("上一个", "Previous")}>↑</button>
+      <button type="button" onClick={() => runFind(false)} aria-label={t("下一个", "Next")}>↓</button>
+      <button type="button" onClick={closeFind} aria-label={t("关闭查找", "Close find")}>✕</button>
+    </div>}
     <div ref={host} className="terminal-host" />
     {notice && <div className="terminal-toast" role="status">{notice}</div>}
     {error && <div className="inline-error">{error}</div>}
