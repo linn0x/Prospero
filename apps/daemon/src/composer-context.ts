@@ -217,6 +217,10 @@ async function skillRoots(cwd: string): Promise<SkillRoot[]> {
   roots.push({ dir: path.join(home, ".config", "opencode", "skills"), scope: "OpenCode", depth: 5, priority: 130 });
   roots.push({ dir: path.join(home, ".opencode", "skills"), scope: "OpenCode", depth: 5, priority: 131 });
   roots.push({ dir: path.join(home, ".grok", "skills"), scope: "Grok", depth: 5, priority: 135 });
+  // Standalone Prospero plugin ZIPs install here.  Keep this ahead of the
+  // Codex cache so a user-installed Prospero plugin does not require a
+  // marketplace entry or a cache-internal path.
+  roots.push({ dir: path.join(home, ".prospero", "plugins"), scope: "插件", depth: 8, priority: 139 });
   roots.push({ dir: path.join(home, ".codex", "plugins", "cache"), scope: "插件", depth: 10, priority: 140 });
   return roots;
 }
