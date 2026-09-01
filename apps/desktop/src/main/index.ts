@@ -2,7 +2,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { networkInterfaces } from "node:os";
 import { isAbsolute, resolve } from "node:path";
-import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, screen, shell, Tray } from "electron";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, screen, shell, Tray } from "electron";
 import type { MenuItemConstructorOptions, Rectangle } from "electron";
 import type { DesktopSettings, JsonObject, SessionCreateInput, SessionInfo, SessionPage, SessionPageRequest, WorkflowTemplate } from "../shared/types";
 import { diffDesktopSnapshot, isEmptyDesktopSnapshotPatch } from "../shared/snapshot-patch";
@@ -374,8 +374,14 @@ function installApplicationMenu(): void {
       role: "editMenu",
       submenu: [
         { role: "undo" }, { role: "redo" }, { type: "separator" },
-        { role: "cut" }, { role: "copy" }, { role: "paste" }, { role: "pasteAndMatchStyle" },
-        { role: "delete" }, { role: "selectAll" },
+        { role: "cut" },
+        // registerAccelerator:false —— 菜单仍显示 ⌘C/⌘V/⌘A,但不再截获按键。
+        // 否则终端永远收不到这三个组合键(见 TerminalPane 的按键处理器)。
+        { role: "copy", registerAccelerator: false },
+        { role: "paste", registerAccelerator: false },
+        { role: "pasteAndMatchStyle" },
+        { role: "delete" },
+        { role: "selectAll", registerAccelerator: false },
       ],
     },
     {
@@ -755,6 +761,24 @@ function installIpc(): void {
   });
   ipcMain.handle("workflow-template:delete", (_event, rawId: unknown) => {
     return store.deleteWorkflowTemplate(requireId(rawId, "模板"));
+  });
+  // 剪贴板走主进程,不用网页的 Clipboard API。后者在这里注定失败:渲染进程的权限
+  // 被一律拒绝(见下面的 setPermissionRequestHandler / setPermissionCheckHandler),
+  // readText 拿不到 clipboard-read、writeText 拿不到 clipboard-sanitized-write。
+  // 顺带修好 OSC 52 —— tmux copy-mode 里 yank、vim 里 "+y 本该同步到系统剪贴板。
+  ipcMain.handle("external:open", async (_event, value: unknown) => {
+    // 只放行 http(s)。终端输出里什么都可能出现,file:// 或自定义 scheme 被
+    // 当成链接点开等于把任意本地路径交给 LaunchServices。
+    if (typeof value !== "string" || !/^https?:\/\//i.test(value)) throw new Error("链接无效");
+    await shell.openExternal(value);
+    return { ok: true };
+  });
+  ipcMain.handle("clipboard:read", () => clipboard.readText());
+  ipcMain.handle("clipboard:write", (_event, value: unknown) => {
+    if (typeof value !== "string") throw new Error("剪贴板内容无效");
+    // 终端可能选中极长的输出,截断避免把几百 MB 塞进系统剪贴板。
+    clipboard.writeText(value.slice(0, 4_000_000));
+    return { ok: true };
   });
   ipcMain.handle("network:interfaces", () => {
     // 监听地址要能选具体网卡:手机走 LAN 直连时,绑到某一张网卡比 0.0.0.0
