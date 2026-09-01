@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { WebLinksAddon } from "@xterm/addon-web-links";
@@ -55,6 +55,8 @@ export function terminalShortcutAction(
   if (macCommand || otherClipboard) {
     if (event.code === "KeyC") return "copy";
     if (event.code === "KeyV") return "paste";
+    // 查找在两个平台都要有:mac 是 ⌘F,其它平台跟随剪贴板的 Ctrl+Shift 约定。
+    if (event.code === "KeyF") return "find";
   }
   if (!macCommand) {
     if (event.shiftKey && !event.metaKey && !event.ctrlKey && !event.altKey && event.code === "Insert") return "paste";
@@ -66,7 +68,6 @@ export function terminalShortcutAction(
   }
   if (event.code === "KeyA") return "selectAll";
   if (event.code === "KeyK") return "clear";
-  if (event.code === "KeyF") return "find";
   if (event.key === "ArrowLeft" || event.key === "ArrowUp") return "beginningOfLine";
   if (event.key === "ArrowRight" || event.key === "ArrowDown") return "endOfLine";
   if (event.key === "Backspace") return "deleteToBeginning";
@@ -83,7 +84,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
   const { t } = useLocale();
   const isMac = navigator.platform.toLowerCase().includes("mac") || navigator.userAgent.includes("Macintosh");
   const shortcutHint = isMac
-    ? t("拖动选中 · ⌘C/⌘V 复制粘贴 · ⌘F 查找 · ⌘K 清屏", "Drag to select · ⌘C/⌘V copy and paste · ⌘F find · ⌘K clear")
+    ? t("⌥拖动选中 · ⌘C/⌘V 复制粘贴 · ⌘F 查找 · ⌘K 清屏", "⌥drag to select · ⌘C/⌘V copy and paste · ⌘F find · ⌘K clear")
     : t("Ctrl+Shift+C/V 复制粘贴 · Shift+Insert 粘贴", "Ctrl+Shift+C/V copy and paste · Shift+Insert paste");
   const host = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | undefined>(undefined);
@@ -99,6 +100,14 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
   const [bell, setBell] = useState(false);
   const [findOpen, setFindOpen] = useState(false);
   const [findText, setFindText] = useState("");
+  const findInputRef = useRef<HTMLInputElement>(null);
+  const noticeTimerRef = useRef<number | undefined>(undefined);
+  /// 提示统一走这里:直接 setNotice 的话没有定时清除,那条提示会一直挂在屏幕上。
+  const showNotice = useCallback((message: string): void => {
+    setNotice(message);
+    window.clearTimeout(noticeTimerRef.current);
+    noticeTimerRef.current = window.setTimeout(() => setNotice(undefined), 1_250);
+  }, []);
 
   useEffect(() => {
     if (!host.current) return;
@@ -159,53 +168,9 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
     fitRef.current = fit;
     searchRef.current = search;
 
-    // 普通拖动 = 在 xterm 里选中文本(然后 ⌘C 复制)。
-    //
-    // tmux 开着 mouse on(为了滚轮能进它的 10k 历史),而鼠标上报是终端层面的
-    // 开关:一旦开启,拖动就整个交给 tmux,xterm 自己没有选区,⌘C 也就无从复制。
-    // xterm 留了一个逃生口 —— macOptionClickForcesSelection:按住 ⌥ 拖动强制本地
-    // 选中。这里把普通拖动重放成"带 ⌥"的事件,等于把逃生口变成默认行为,
-    // 而滚轮事件不碰,仍旧上报给 tmux。两者因此可以共存。
-    //
-    // 代价:鼠标拖动不再送达 tmux/vim(拖 pane 边界、鼠标可视选择用不了)。
-    // Shift + 拖动保留原样交给应用,作为反向的逃生口。
-    const forceLocalSelection = (event: MouseEvent): void => {
-      if (!isMac || !event.isTrusted) return;      // 重放出来的那份不再拦,否则无限递归
-      if (event.button !== 0 || event.shiftKey || event.altKey) return;
-      if (event.type === "mousemove" && (event.buttons & 1) === 0) return;
-      event.stopImmediatePropagation();
-      event.target?.dispatchEvent(new MouseEvent(event.type, {
-        bubbles: event.bubbles,
-        cancelable: event.cancelable,
-        composed: event.composed,
-        view: window,
-        detail: event.detail,
-        screenX: event.screenX,
-        screenY: event.screenY,
-        clientX: event.clientX,
-        clientY: event.clientY,
-        button: event.button,
-        buttons: event.buttons,
-        ctrlKey: event.ctrlKey,
-        metaKey: event.metaKey,
-        shiftKey: event.shiftKey,
-        altKey: true,
-      }));
-    };
-    const mouseTypes: Array<keyof HTMLElementEventMap> = ["mousedown", "mousemove", "mouseup"];
-    for (const type of mouseTypes) {
-      host.current.addEventListener(type, forceLocalSelection as EventListener, true);
-    }
-
     let input = "";
     let inputTimer: number | undefined;
-    let noticeTimer: number | undefined;
     let bellTimer: number | undefined;
-    const showNotice = (message: string): void => {
-      setNotice(message);
-      window.clearTimeout(noticeTimer);
-      noticeTimer = window.setTimeout(() => setNotice(undefined), 1_250);
-    };
     const queueInteraction = (
       message: { type: "term.input"; dataB64: string } | { type: "term.resize"; cols: number; rows: number },
     ): void => {
@@ -236,7 +201,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
           void window.prospero.writeClipboard(selection)
             .then(() => showNotice(t("已复制", "Copied")))
             .catch((reason) => setError(displayError(reason)));
-        } else showNotice(t("先拖动选择要复制的内容", "Select text by dragging first"));
+        } else showNotice(t("按住 ⌥ 拖动选择文本", "Hold Option while dragging to select text"));
         return false;
       }
       if (action === "paste") {
@@ -255,7 +220,12 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
         showNotice(t("已选择终端内容", "Terminal contents selected"));
         return false;
       }
-      if (action === "find") { setFindOpen(true); return false; }
+      if (action === "find") {
+        setFindOpen(true);
+        // autoFocus 只在挂载那次生效;条已经开着时再按 ⌘F 得把焦点收回来。
+        window.setTimeout(() => findInputRef.current?.select(), 0);
+        return false;
+      }
       if (action === "clear") {
         terminal.clear();
         queueInputText("\x0c");
@@ -299,14 +269,10 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
     });
     resize.observe(host.current);
 
-    const mouseHost = host.current;
     return () => {
-      for (const type of mouseTypes) {
-        mouseHost.removeEventListener(type, forceLocalSelection as EventListener, true);
-      }
       window.clearTimeout(inputTimer);
       window.clearTimeout(resizeTimer);
-      window.clearTimeout(noticeTimer);
+      window.clearTimeout(noticeTimerRef.current);
       window.clearTimeout(bellTimer);
       flushInput();
       resize.disconnect();
@@ -318,7 +284,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
       fitRef.current = undefined;
       cursorRef.current = undefined;
     };
-  }, [isMac, session.id]);
+  }, [isMac, session.id, showNotice]);
 
   useEffect(() => {
     const terminal = terminalRef.current;
@@ -395,7 +361,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
     const hit = backwards
       ? searchRef.current?.findPrevious(value, options)
       : searchRef.current?.findNext(value, options);
-    if (hit === false) setNotice(t("没有找到匹配", "No matches"));
+    if (hit === false) showNotice(t("没有找到匹配", "No matches"));
   };
   const closeFind = (): void => {
     setFindOpen(false);
@@ -407,6 +373,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
     <div className="terminal-status"><span className={connected ? "live-dot" : "live-dot offline"} />{connected ? t("实时终端", "Live terminal") : t("正在重连", "Reconnecting")}<span className="terminal-shortcut" title={shortcutHint}>{isMac ? "⌘C / ⌘V" : "Ctrl+Shift+C / V"}</span></div>
     {findOpen && <div className="terminal-find">
       <input
+        ref={findInputRef}
         autoFocus
         value={findText}
         placeholder={t("在终端中查找", "Find in terminal")}
