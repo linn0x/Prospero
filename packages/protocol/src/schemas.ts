@@ -939,6 +939,7 @@ export const C2SOrchestrationRunDeleteSchema = z.object({
   type: z.literal("orchestration.run.delete"),
   runId: z.string().min(1).max(200),
   operationId: z.string().min(1).max(200),
+  force: z.boolean().optional(),
 });
 
 export const C2SOrchestrationTaskCreateSchema = z.object({

@@ -392,6 +392,42 @@ describe("控制 API 的幂等与任务图事务", () => {
     expect(store.getRun(run.id).status).toBe("active");
   });
 
+  it("force run.delete 显式清理残留 active dispatch", async () => {
+    const store = new OrchestrationStore();
+    const run = store.createRun({ objective: "历史清理", coordinatorSessionId: null });
+    const task = store.createTask({ runId: run.id, title: "残留 worker", spec: "" });
+    store.createDispatch({ taskId: task.id, sessionId: "stale-worker" });
+    const sessions: WorkerSessionManager = {
+      ...unusedSessions,
+      infoOf() {
+        return {
+          id: "stale-worker",
+          agent: "codex",
+          kind: "structured",
+          title: "stale worker",
+          cwd: "/tmp/stale-worker",
+          status: "running",
+          createdAt: 1,
+          cols: 80,
+          rows: 24,
+        };
+      },
+    };
+    const api = orchestrationControlApi(
+      store,
+      new DispatchService(store, sessions),
+      new CollaborationService(store),
+    );
+
+    await api("run.delete", {
+      runId: run.id,
+      operationId: "force-delete-abandoned",
+      actorSessionId: null,
+      force: true,
+    }, new AbortController().signal);
+    expect(store.listRuns()).toEqual([]);
+  });
+
   it("普通 worker 不能删除宿主创建的手工 Run", async () => {
     const store = new OrchestrationStore();
     const run = store.createRun({ objective: "宿主管理", coordinatorSessionId: null });
