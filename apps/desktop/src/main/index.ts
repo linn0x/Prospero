@@ -219,7 +219,8 @@ function applyTheme(settings: DesktopSettings): void {
         height: 42,
       });
     }
-    mainWindow.setBackgroundColor(dark ? "#111114" : "#f4f4f5");
+    // mac 上背景必须保持透明,否则一次主题切换就把 vibrancy 盖掉了。
+    if (process.platform !== "darwin") mainWindow.setBackgroundColor(dark ? "#111114" : "#f4f4f5");
   }
 }
 
@@ -256,7 +257,17 @@ function createWindow(): BrowserWindow {
     minWidth: Math.min(MIN_WINDOW_WIDTH, display.workArea.width),
     minHeight: Math.min(MIN_WINDOW_HEIGHT, display.workArea.height),
     show: false,
-    backgroundColor: dark ? "#111114" : "#f4f4f5",
+    // macOS:窗口底色留空,让侧栏透出系统的毛玻璃(vibrancy)。其它平台没有这个
+    // 材质,仍用实色,否则窗口会是透明的。
+    backgroundColor: process.platform === "darwin" ? "#00000000" : (dark ? "#111114" : "#f4f4f5"),
+    ...(process.platform === "darwin"
+      ? {
+        // sidebar 材质就是访达/邮件左栏那一档模糊。visualEffectState: "active"
+        // 让窗口失焦时也保持材质 —— 否则切到别的应用,侧栏会突然塌成一块灰。
+        vibrancy: "sidebar" as const,
+        visualEffectState: "active" as const,
+      }
+      : {}),
     title: "Prospero",
     // macOS 的红黄绿按钮固定在窗口左上角,会浮在侧栏头部之上 —— 而这块布局是按
     // Windows 设计的(那边窗口控件在右上角,左上角是空的)。hiddenInset 把按钮往内缩,
