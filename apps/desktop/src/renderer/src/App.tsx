@@ -45,7 +45,6 @@ import {
   Search,
   Settings,
   Smartphone,
-  Sparkles,
   SquareTerminal,
   Trash2,
   WifiOff,
@@ -511,6 +510,20 @@ const WorkspaceSessionRow = memo(function WorkspaceSessionRow({
             {archived ? <ArchiveRestore /> : <Archive />}
             {archived ? t("取消归档", "Unarchive") : t("归档", "Archive")}
           </ContextMenuItem>
+          <ContextMenuSeparator />
+          <ContextMenuGroup>
+            <ContextMenuItem onClick={() => void window.prospero.interruptSession(session.id)}>
+              <CircleStop />
+              {t("停止本轮", "Stop current turn")}
+            </ContextMenuItem>
+            <ContextMenuItem
+              variant="destructive"
+              onClick={() => void window.prospero.killSession(session.id)}
+            >
+              <X />
+              {t("结束会话", "End session")}
+            </ContextMenuItem>
+          </ContextMenuGroup>
             <ContextMenuItem
               onClick={() => void window.prospero.revealPath(session.cwd)}
             >
@@ -1107,19 +1120,10 @@ function ShellSidebar({
     ));
   return (
     <Sidebar collapsible="icon" className="prospero-sidebar">
-      <SidebarHeader className="px-3 py-3">
-        <div className="flex h-9 items-center gap-2 px-1 group-data-[collapsible=icon]:justify-center">
-          <span className="brand-orb">
-            <Sparkles />
-          </span>
-          <div className="flex min-w-0 flex-col group-data-[collapsible=icon]:hidden">
-            <strong className="text-sm tracking-tight">Prospero</strong>
-            <span className="text-[10px] text-sidebar-foreground/45">
-              Agent Work OS
-            </span>
-          </div>
-        </div>
-      </SidebarHeader>
+      {/* 品牌区已去掉,但这个头部不能删:macOS 上它负责给红黄绿让出高度
+          (见 styles.css 里 data-platform="darwin" 的规则),同时它也是窗口的
+          拖拽区 —— 标题栏是隐藏的,没有它窗口就拖不动。 */}
+      <SidebarHeader className="p-0" />
       <SidebarContent>
         <SidebarGroup>
           <SidebarGroupContent>
@@ -2810,7 +2814,7 @@ function WorkspacePane({
     <div className="workspace-view workspace-view-single">
       <div className="pane-workspace">
         <div className="workspace-tabbar">
-          <div className="workspace-tabs" role="tablist">
+          {!focus && <div className="workspace-tabs" role="tablist">
             {openIds.map((id) => {
               const session = snapshot.daemon.sessions.find(
                 (item) => item.id === id,
@@ -2877,11 +2881,11 @@ function WorkspacePane({
                 </div>
               );
             })}
-          </div>
+          </div>}
         </div>
         {active ? (
           <>
-            <header className="pane-toolbar">
+            {!focus && <header className="pane-toolbar">
               <div className="agent-identity">
                 <Avatar>
                   <AvatarFallback>
@@ -2980,7 +2984,7 @@ function WorkspacePane({
                   </DropdownMenuContent>
                 </DropdownMenu>
               </div>
-            </header>
+            </header>}
             <div className={cn("pane-grid", !contextVisible && "context-hidden")}>
               <main className="primary-pane">
                 <div className="pane-tabbar pane-tabbar-static">
@@ -4008,11 +4012,15 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   const setUnread = useCallback((id: string, unread: boolean): void => {
     void window.prospero.setSessionUnread(id, unread);
   }, []);
+  // 会话视图默认专注:顶栏、标签页条、会话工具条三条都收起,窗口只剩会话本身。
+  // 它们说的都是侧栏已经说过的事(会话名、路径、切换),而会话内容才是这个页面的
+  // 主体。⇧⌘F 随时调回来,选择会被记住。
   const [focus, setFocus] = useState(() => {
     try {
-      return localStorage.getItem("prospero.focusTerminal") === "true";
+      const stored = localStorage.getItem("prospero.focusTerminal");
+      return stored === null ? true : stored === "true";
     } catch {
-      return false;
+      return true;
     }
   });
   useEffect(() => {
