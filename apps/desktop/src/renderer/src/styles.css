@@ -818,9 +818,9 @@ input:not([data-slot]), textarea:not([data-slot]), select:not([data-slot]) { bac
 .quick-grid small { margin-top: 4px; color: var(--muted); font-size: 10px; }
 .quick-arrow { color: var(--faint); }
 .runtime-summary { color: var(--muted); font-size: 10px; }
-.page { padding: 28px 32px 44px; }
-.page-header { margin-bottom: 26px; }
-.page-header h1 { font-family: var(--ui-font); font-size: 27px; font-weight: 650; letter-spacing: -.035em; }
+.page { padding: 16px 24px 28px; }
+.page-header { margin-bottom: 14px; }
+.page-header h1 { font-family: var(--ui-font); font-size: 19px; font-weight: 650; letter-spacing: -.03em; }
 .page-header p { font-size: 12px; }
 .provider-card, .account-card, .device-card, .form-card, .settings-card, .run-hero, .task-node, .gate-card, .worktree-row, .inspector-usage, .inspector-context {
   border-color: var(--border);
@@ -1006,18 +1006,6 @@ input:not([data-slot]), textarea:not([data-slot]), select:not([data-slot]) { bac
   color: var(--sidebar-foreground);
   background: color-mix(in srgb, var(--primary) 46%, transparent);
 }
-.brand-orb {
-  display: grid;
-  flex: none;
-  place-items: center;
-  width: 30px;
-  height: 30px;
-  color: white;
-  border-radius: 9px;
-  background: linear-gradient(145deg, #6d92ff, #3d6ce6);
-  box-shadow: 0 7px 18px #4c7dff42;
-}
-.brand-orb svg { width: 15px; height: 15px; }
 .desktop-topbar {
   -webkit-app-region: drag;
   display: flex;
@@ -1025,9 +1013,9 @@ input:not([data-slot]), textarea:not([data-slot]), select:not([data-slot]) { bac
   align-items: center;
   justify-content: space-between;
   min-width: 0;
-  min-height: 64px;
-  gap: 18px;
-  padding: 10px 152px 10px 20px;
+  min-height: 44px;
+  gap: 14px;
+  padding: 5px 152px 5px 20px;
   background: var(--background);
 }
 .terminal-focus-topbar { display: none; }
@@ -1036,8 +1024,10 @@ input:not([data-slot]), textarea:not([data-slot]), select:not([data-slot]) { bac
 .desktop-topbar [role="button"] { -webkit-app-region: no-drag; }
 .topbar-context,
 .topbar-actions { display: flex; align-items: center; gap: 10px; min-width: 0; }
-.topbar-context > div { display: flex; min-width: 0; flex-direction: column; }
-.topbar-context strong { font-size: 14px; font-weight: 650; letter-spacing: -.01em; }
+/* 标题与副标题并排,不再各占一行 —— 副标题是补充说明,不值得为它多要 20px,
+   而这条顶栏在每个页面都在。 */
+.topbar-context > div { display: flex; min-width: 0; align-items: baseline; gap: 8px; }
+.topbar-context strong { flex: none; font-size: 13px; font-weight: 650; letter-spacing: -.01em; }
 .topbar-context span { overflow: hidden; color: var(--muted-foreground); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .topbar-actions { flex: none; }
 .search-trigger { min-width: 245px; justify-content: flex-start; color: var(--muted-foreground); background: color-mix(in srgb, var(--card) 72%, transparent); }
@@ -1796,3 +1786,20 @@ kbd {
   color: #9aa5ce; background: transparent; border: 0; border-radius: 5px; cursor: pointer;
 }
 .terminal-find button:hover { background: #292e42; color: #c0caf5; }
+
+/* 侧栏头部现在没有内容了,只剩两个职责:macOS 上给红黄绿让出高度,以及充当
+   窗口拖拽区。非 macOS 上没有红黄绿,给一小条高度把拖拽区留住即可。 */
+[data-slot="sidebar-header"]:empty { min-height: 10px; }
+
+/* ---------------------------------------------------------------- macOS 毛玻璃
+   窗口开了 vibrancy(见主进程的 BrowserWindow 配置),但只有当上层背景是透明的
+   时候才透得出来。只让【侧栏】透:内容区要保证长文本和终端的可读性,底下透着
+   桌面壁纸会很难看。 */
+:root[data-platform="darwin"] body,
+:root[data-platform="darwin"] .prospero-shell { background: transparent; }
+:root[data-platform="darwin"] .prospero-sidebar [data-slot="sidebar-inner"] {
+  background: color-mix(in srgb, var(--sidebar) 55%, transparent);
+}
+/* 内容区保持不透明 —— 只在与侧栏交界处留一条细线,避免两块材质糊在一起。 */
+:root[data-platform="darwin"] .prospero-main { background: var(--background); }
+:root[data-platform="darwin"] .desktop-topbar { background: transparent; }
