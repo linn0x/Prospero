@@ -4087,7 +4087,9 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   const page = getViewCopy(view, t);
   return (
     <SidebarProvider
-      open={sidebarOpen && !focus}
+      // 专注模式只收起顶栏/标签页条/会话工具条,不碰侧栏 —— 侧栏是导航和会话
+      // 操作(停止本轮、结束会话)的唯一入口,把它一起锁上等于把这些动作也锁没了。
+      open={sidebarOpen}
       onOpenChange={(open) => {
         sidebarWasAutoCollapsed.current = false;
         sidebarOpenRef.current = open;
