@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import { Ban, Bot, CheckCircle2, ChevronDown, ChevronRight, CircleDot, Clock3, Columns3, GitBranch, GitPullRequestArrow, LibraryBig, Network, PanelLeftClose, PanelLeftOpen, Pause, Play, Plus, RefreshCw, Rocket, Save, ShieldQuestion, Sparkles, Square, Trash2, Workflow } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Ban, Bot, CheckCircle2, ChevronDown, ChevronRight, CircleDot, Clock3, Columns3, GitBranch, GitPullRequestArrow, LibraryBig, LoaderCircle, Network, PanelLeftClose, PanelLeftOpen, Pause, Play, Plus, RefreshCw, Rocket, Save, ShieldQuestion, Sparkles, Square, Trash2, Workflow } from "lucide-react";
 import type { DesktopSnapshot, JsonObject, WorkflowTemplate } from "../../shared/types";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -16,7 +16,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { RunGraph } from "./RunGraph";
 import { array, displayError, number, record, text } from "./state";
 import { useLocale } from "./locale";
-import { prioritizeWorktrees, worktreeNeedsAttention } from "./orchestration-utils";
+import { deriveTaskBoardStates, prioritizeWorktrees, worktreeNeedsAttention, type TaskBoardColumnId } from "./orchestration-utils";
 import {
   defaultSessionLaunchAccountId,
   isLaunchableWorktreeAsset,
@@ -45,34 +45,26 @@ function initialRunView(): RunView {
 }
 
 function FreeformGateDecision({
-  gateId,
-  onError,
+  submitting,
+  onResolve,
 }: {
-  gateId: string;
-  onError: (message: string | undefined) => void;
+  submitting: boolean;
+  onResolve: (decision: string) => Promise<void>;
 }) {
   const { t } = useLocale();
   const [decision, setDecision] = useState("");
-  const [submitting, setSubmitting] = useState(false);
 
   const submit = async (): Promise<void> => {
     const value = decision.trim();
     if (!value || submitting) return;
-    setSubmitting(true);
-    try {
-      await window.prospero.resolveGate(gateId, value);
-      onError(undefined);
-    } catch (reason) {
-      onError(displayError(reason));
-    } finally {
-      setSubmitting(false);
-    }
+    await onResolve(value);
   };
 
   return <form className="flex min-w-0 flex-1 items-center gap-2" onSubmit={(event) => { event.preventDefault(); void submit(); }}>
     <Input
       value={decision}
       maxLength={20_000}
+      disabled={submitting}
       onChange={(event) => setDecision(event.target.value)}
       aria-label={t("输入 Gate 决策", "Enter gate decision")}
       placeholder={t("输入决定或补充说明", "Enter a decision or additional context")}
@@ -103,6 +95,9 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
   );
   const [error, setError] = useState<string>();
   const [busy, setBusy] = useState<string>();
+  const gateSubmissionRef = useRef(new Set<string>());
+  const [gateSubmissions, setGateSubmissions] = useState<Record<string, string>>({});
+  const [abandonRun, setAbandonRun] = useState<{ id: string; objective: string }>();
   // SwiftUI 默认并持久化依赖图视图；Electron 保持相同习惯，避免每次进 Run 都先切 Tab。
   const [runView, setRunView] = useState<RunView>(initialRunView);
   const [templateLibraryOpen, setTemplateLibraryOpen] = useState(false);
@@ -125,6 +120,7 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
     setSelectedRunId(initialRunId);
   }, [initialRunId, runs]);
   const runTasks = useMemo(() => tasks.filter((task) => text(task["runId"]) === runId), [tasks, runId]);
+  const taskBoardStates = useMemo(() => deriveTaskBoardStates(runTasks), [runTasks]);
   const runGates = useMemo(() => gates.filter((gate) => text(gate["runId"]) === runId), [gates, runId]);
   const runDispatches = useMemo(() => dispatches.filter((dispatch) => text(dispatch["runId"]) === runId), [dispatches, runId]);
   const dispatchByTaskId = useMemo(() => {
@@ -136,16 +132,17 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
     }
     return latest;
   }, [runDispatches]);
-  const tasksByStatus = useMemo(() => {
-    const grouped = new Map<string, JsonObject[]>();
+  const tasksByBoardColumn = useMemo(() => {
+    const grouped = new Map<TaskBoardColumnId, JsonObject[]>();
     for (const task of runTasks) {
-      const taskStatus = text(task["status"]);
-      const group = grouped.get(taskStatus);
+      const column = taskBoardStates.get(text(task["id"]));
+      if (!column) continue;
+      const group = grouped.get(column);
       if (group) group.push(task);
-      else grouped.set(taskStatus, [task]);
+      else grouped.set(column, [task]);
     }
     return grouped;
-  }, [runTasks]);
+  }, [runTasks, taskBoardStates]);
   const runWorktrees = useMemo(
     () => prioritizeWorktrees(worktreeAssets.filter((asset) => text(asset["runId"]) === runId)),
     [runId, worktreeAssets],
@@ -206,12 +203,32 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
   };
 
   const startWorker = async (task: JsonObject): Promise<void> => {
+    if (taskBoardStates.get(text(task["id"])) !== "ready") return;
     if (!workerProject) { setError(t("请先添加一个项目作为 worker 工作目录", "Add a project to use as the worker directory first")); return; }
     await perform(
       text(task["id"]),
       "worker.start",
       workerStartParams(workerSelection, text(task["id"]), operationId()),
     );
+  };
+
+  const resolveGate = async (gateId: string, decision: string): Promise<void> => {
+    if (gateSubmissionRef.current.has(gateId)) return;
+    gateSubmissionRef.current.add(gateId);
+    setGateSubmissions((current) => ({ ...current, [gateId]: decision }));
+    try {
+      await window.prospero.resolveGate(gateId, decision);
+      setError(undefined);
+    } catch (reason) {
+      setError(displayError(reason));
+    } finally {
+      gateSubmissionRef.current.delete(gateId);
+      setGateSubmissions((current) => {
+        const next = { ...current };
+        delete next[gateId];
+        return next;
+      });
+    }
   };
 
   const createTask = async (): Promise<void> => {
@@ -263,18 +280,18 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
 
   const completeCount = runTasks.filter((task) => ["done", "completed", "succeeded"].includes(text(task["status"]))).length;
   const runProgress = runTasks.length ? Math.round((completeCount / runTasks.length) * 100) : 0;
-  const boardColumns = [
-    { id: "queued", label: t("排队", "Queued"), statuses: ["pending"] },
-    { id: "ready", label: t("就绪", "Ready"), statuses: ["ready"] },
-    { id: "running", label: t("运行中", "Running"), statuses: ["dispatched", "running", "starting"] },
-    { id: "review", label: t("待检查", "Review"), statuses: ["blocked", "failed", "waiting_approval"] },
-    { id: "done", label: t("已完成", "Done"), statuses: ["done", "completed", "succeeded", "cancelled"] },
+  const boardColumns: Array<{ id: TaskBoardColumnId; label: string }> = [
+    { id: "queued", label: t("排队", "Queued") },
+    { id: "ready", label: t("就绪", "Ready") },
+    { id: "running", label: t("运行中", "Running") },
+    { id: "review", label: t("待检查", "Review") },
+    { id: "done", label: t("已完成", "Done") },
   ];
 
   const taskCard = (task: JsonObject) => {
     const taskId = text(task["id"]); const deps = array(task["deps"]).map(String); const dispatch = dispatchByTaskId.get(taskId);
     return <Card size="sm" className="run-task-card" key={taskId}><CardHeader><div className="flex items-start justify-between gap-2"><CardTitle>{text(task["title"])}</CardTitle><span className={`status-dot ${text(task["status"])}`} /></div><CardDescription>{text(task["spec"])}</CardDescription></CardHeader><CardContent className="flex flex-col gap-2">{deps.length > 0 && <Badge variant="outline" className="w-fit"><GitPullRequestArrow />{deps.length} {t("个依赖", "dependencies")}</Badge>}{dispatch && <div className="task-assignee"><Bot /><span>{text(dispatch["agent"], workerAgent)}</span><small>{text(dispatch["branch"], t("隔离工作树", "isolated worktree"))}</small></div>}</CardContent><CardFooter className="flex-wrap">
-      {["pending", "blocked", "ready"].includes(text(task["status"])) && <Button variant="outline" size="sm" disabled={busy === taskId} onClick={() => void startWorker(task)}><Bot data-icon="inline-start" />{t("启动", "Start")}</Button>}
+      {taskBoardStates.get(taskId) === "ready" && <Button variant="outline" size="sm" disabled={busy === taskId} onClick={() => void startWorker(task)}><Bot data-icon="inline-start" />{t("启动", "Start")}</Button>}
       {text(task["status"]) === "failed" && <Button variant="outline" size="sm" onClick={() => void perform(taskId, "task.retry", { operationId: operationId(), taskId })}><RefreshCw data-icon="inline-start" />{t("重试", "Retry")}</Button>}
       {dispatch && <Button variant="ghost" size="sm" onClick={() => onOpenSession(text(dispatch["sessionId"]))}>{t("打开会话", "Open session")}</Button>}
       {text(task["status"]) === "dispatched" && <Button variant="destructive" size="sm" onClick={() => void perform(taskId, "worker.stop", { operationId: operationId(), taskId, reason: "Stopped from Prospero Windows" })}><Square data-icon="inline-start" />{t("停止", "Stop")}</Button>}
@@ -284,14 +301,15 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
   const gateCard = (gate: JsonObject) => {
     const gateId = text(gate["id"]);
     const options = array(gate["options"]).map(String);
+    const submitting = gateSubmissions[gateId];
     return <article className="gate-card" key={gateId}>
       <strong>{text(gate["question"])}</strong>
       <div className="button-row compact">
         {text(gate["status"]) !== "pending"
           ? <span className="resolved"><CheckCircle2 size={13} />{text(gate["decision"], t("已处理", "Resolved"))}</span>
           : options.length > 0
-            ? options.map((option) => <button key={option} onClick={() => void window.prospero.resolveGate(gateId, option).catch((reason) => setError(displayError(reason)))}>{option}</button>)
-            : <FreeformGateDecision gateId={gateId} onError={setError} />}
+            ? options.map((option) => <Button variant="outline" size="sm" key={option} disabled={Boolean(submitting)} onClick={() => void resolveGate(gateId, option)}>{submitting === option && <LoaderCircle className="animate-spin" data-icon="inline-start" />}{option}</Button>)
+            : <FreeformGateDecision submitting={Boolean(submitting)} onResolve={(decision) => resolveGate(gateId, decision)} />}
       </div>
     </article>;
   };
@@ -314,7 +332,7 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
           {text(record(selectedRun["automation"])["state"]) !== "running" && text(selectedRun["status"]) === "active" && <button onClick={() => setShowTaskCreate(true)}><Plus size={14} />{t("添加任务", "Add task")}</button>}
           {text(record(selectedRun["automation"])["state"]) === "running" ? <button onClick={() => void perform("automation", "automation.pause", { operationId: operationId(), runId })}><Pause size={14} />{t("暂停自动执行", "Pause automation")}</button> : <button onClick={() => void perform("automation", "automation.start", automationStartParams(workerSelection, runId, operationId()))} disabled={!workerProject}><Play size={14} />{t("自动执行 DAG", "Run DAG automatically")}</button>}
           {text(selectedRun["status"]) === "active" && <button onClick={() => void perform("complete", "run.complete", { operationId: operationId(), runId })}><CheckCircle2 size={14} />{t("标记完成", "Mark complete")}</button>}
-          {text(selectedRun["status"]) === "active" && <button className="danger" onClick={() => void perform("abandon", "run.abandon", { operationId: operationId(), runId })}><Ban size={14} />{t("放弃", "Abandon")}</button>}
+          {text(selectedRun["status"]) === "active" && <button className="danger" onClick={() => setAbandonRun({ id: runId, objective: text(selectedRun["objective"]) })}><Ban size={14} />{t("放弃", "Abandon")}</button>}
           {text(selectedRun["status"]) !== "active" && <button className="danger" onClick={() => void perform("delete", "run.delete", { operationId: operationId(), runId })}><Trash2 size={14} />{t("删除记录", "Delete record")}</button>}
         </div></div>
         <Tabs value={runView} onValueChange={changeRunView} className={`run-views${runView === "dag" ? " run-views-dag" : ""}`}>
@@ -325,12 +343,12 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
           </TabsList>
           {runView === "board" && <TabsContent value="board" className="run-view-content">
             <div className="run-board">{boardColumns.map((column) => {
-              const columnTasks = column.statuses.flatMap((taskStatus) => tasksByStatus.get(taskStatus) ?? []);
+              const columnTasks = tasksByBoardColumn.get(column.id) ?? [];
               return <section className="board-column" key={column.id}><header><span>{column.label}</span><Badge variant="outline">{columnTasks.length}</Badge></header><div>{columnTasks.map(taskCard)}{columnTasks.length === 0 && <div className="board-empty">{t("暂无任务", "No tasks")}</div>}</div></section>;
             })}</div>
           </TabsContent>}
           {runView === "dag" && <TabsContent value="dag" className="run-view-content run-view-content-dag">
-            {runTasks.length > 0 ? <RunGraph tasks={runTasks} dispatches={runDispatches} /> : <Empty><EmptyHeader><EmptyMedia variant="icon"><Network /></EmptyMedia><EmptyTitle>{t("暂无 DAG 节点", "No DAG nodes")}</EmptyTitle><EmptyDescription>{t("添加任务后，依赖图会显示在这里。", "Add tasks to populate the dependency graph.")}</EmptyDescription></EmptyHeader></Empty>}
+            {runTasks.length > 0 ? <RunGraph runId={runId} tasks={runTasks} dispatches={runDispatches} /> : <Empty><EmptyHeader><EmptyMedia variant="icon"><Network /></EmptyMedia><EmptyTitle>{t("暂无 DAG 节点", "No DAG nodes")}</EmptyTitle><EmptyDescription>{t("添加任务后，依赖图会显示在这里。", "Add tasks to populate the dependency graph.")}</EmptyDescription></EmptyHeader></Empty>}
           </TabsContent>}
           {runView === "timeline" && <TabsContent value="timeline" className="run-view-content">
             <div className="run-timeline">{[...runTasks].reverse().map((task) => <div key={text(task["id"])}><span className={`status-dot ${text(task["status"])}`} /><div><strong>{text(task["title"])}</strong><p>{t("任务", "Task")} {status(text(task["status"]))}{text(task["updatedAt"]) ? ` · ${text(task["updatedAt"])}` : ""}</p></div></div>)}{runGates.map((gate) => <div key={text(gate["id"])}><span className={`status-dot ${text(gate["status"])}`} /><div><strong>{text(gate["question"], t("请求审批", "Gate requested"))}</strong><p>{text(gate["status"]) === "pending" ? t("等待用户决定", "Waiting for a decision") : `${t("决定", "Decision")} · ${text(gate["decision"])}`}</p></div></div>)}{runTasks.length === 0 && runGates.length === 0 && <Empty><EmptyHeader><EmptyMedia variant="icon"><Clock3 /></EmptyMedia><EmptyTitle>{t("暂无事件", "No events yet")}</EmptyTitle><EmptyDescription>{t("Run 的重要事件会按时间显示。", "Important run events appear here in chronological order.")}</EmptyDescription></EmptyHeader></Empty>}</div>
@@ -345,6 +363,8 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
     <Dialog open={saveTemplateOpen} onOpenChange={setSaveTemplateOpen}><DialogContent className="sm:max-w-lg"><DialogHeader><DialogTitle>{t("保存工作流模板", "Save workflow template")}</DialogTitle><DialogDescription>{t("保存当前 Run 的任务、依赖关系和 Skills，不保存运行状态或会话。", "Save tasks, dependencies, and skills from this run without runtime state or sessions.")}</DialogDescription></DialogHeader><FieldGroup><Field><FieldLabel htmlFor="template-name">{t("模板名称", "Template name")}</FieldLabel><Input id="template-name" value={templateName} onChange={(event) => setTemplateName(event.target.value)} autoFocus /></Field><Field><FieldLabel htmlFor="template-description">{t("说明", "Description")}</FieldLabel><Textarea id="template-description" rows={3} value={templateDescription} onChange={(event) => setTemplateDescription(event.target.value)} placeholder={t("何时使用这个模板", "When to use this template")} /><FieldDescription>{runTasks.length} {t("个任务会被保存", "tasks will be saved")}</FieldDescription></Field></FieldGroup><DialogFooter><Button variant="outline" onClick={() => setSaveTemplateOpen(false)}>{t("取消", "Cancel")}</Button><Button disabled={!templateName.trim() || busy === "template-save"} onClick={() => void saveRunTemplate()}><Save data-icon="inline-start" />{t("保存模板", "Save template")}</Button></DialogFooter></DialogContent></Dialog>
 
     <Dialog open={Boolean(selectedTemplate)} onOpenChange={(open) => { if (!open) setSelectedTemplate(undefined); }}><DialogContent className="sm:max-w-lg"><DialogHeader><DialogTitle>{selectedTemplate?.name}</DialogTitle><DialogDescription>{t("为这次运行填写可验收的最终目标，模板中的 DAG 与 Skills 会被复制到新 Run。", "Enter a verifiable outcome for this run. The template DAG and skills will be copied into a new run.")}</DialogDescription></DialogHeader><Field><FieldLabel htmlFor="template-objective">{t("本次目标", "Run objective")}</FieldLabel><Textarea id="template-objective" rows={4} value={templateObjective} onChange={(event) => setTemplateObjective(event.target.value)} autoFocus placeholder={t("描述这一次要交付的具体结果", "Describe the concrete result to deliver this time")} /><FieldDescription>{selectedTemplate?.nodes.length ?? 0} {t("个任务将被创建", "tasks will be created")}</FieldDescription></Field><DialogFooter><Button variant="outline" onClick={() => setSelectedTemplate(undefined)}>{t("取消", "Cancel")}</Button><Button disabled={!templateObjective.trim() || busy === "template-run"} onClick={() => void runTemplate()}><Rocket data-icon="inline-start" />{t("从模板运行", "Run from template")}</Button></DialogFooter></DialogContent></Dialog>
+
+    <Dialog open={Boolean(abandonRun)} onOpenChange={(open) => { if (!open) setAbandonRun(undefined); }}><DialogContent className="sm:max-w-md"><DialogHeader><DialogTitle>{t("放弃这个运行？", "Abandon this run?")}</DialogTitle><DialogDescription>{t("运行会停止继续派发任务，已有记录仍会保留。", "The run will stop dispatching tasks, while its history remains available.")}</DialogDescription></DialogHeader><p className="truncate text-sm font-medium" title={abandonRun?.objective}>{abandonRun?.objective}</p><DialogFooter><Button variant="outline" disabled={busy === "abandon"} onClick={() => setAbandonRun(undefined)}>{t("取消", "Cancel")}</Button><Button variant="destructive" disabled={busy === "abandon"} onClick={() => { if (!abandonRun) return; void perform("abandon", "run.abandon", { operationId: operationId(), runId: abandonRun.id }).then((done) => { if (done) setAbandonRun(undefined); }); }}><Ban data-icon="inline-start" />{busy === "abandon" ? t("正在放弃…", "Abandoning…") : t("确认放弃", "Abandon run")}</Button></DialogFooter></DialogContent></Dialog>
 
     {showCreate && <div className="modal-backdrop" onMouseDown={() => setShowCreate(false)}><div className="modal" onMouseDown={(event) => event.stopPropagation()}><div className="modal-title"><Workflow size={18} /><div><h2>{t("创建目标任务图", "Create goal graph")}</h2><p>{t("每行一个任务，默认按顺序建立依赖；Skill 会冻结到每个 worker。", "Enter one task per line. Dependencies follow the listed order and skills are pinned to each worker.")}</p></div></div><label>{t("总体目标", "Goal")}<textarea rows={3} value={objective} onChange={(event) => setObjective(event.target.value)} autoFocus placeholder={t("描述可以验收的最终结果", "Describe a verifiable final outcome")} /></label><label>{t("初始任务", "Initial tasks")}<textarea rows={7} value={nodeLines} onChange={(event) => setNodeLines(event.target.value)} /></label><label><span className="label-with-icon"><Sparkles size={13} />{t("绑定 Skill（最多 5 个）", "Bind skills (up to 5)")}</span><input value={graphSkills} onChange={(event) => setGraphSkills(event.target.value)} placeholder="$frontend-design, $playwright" /></label>{parseSkills(graphSkills).length > 0 && <div className="skill-chip-row">{parseSkills(graphSkills).map((skill) => <span key={skill}>${skill}</span>)}</div>}<div className="button-row modal-actions"><button onClick={() => setShowCreate(false)}>{t("取消", "Cancel")}</button><button className="primary" onClick={() => void createGraph()} disabled={!objective.trim() || busy === "create"}><CircleDot size={14} />{t("创建目标与 DAG", "Create goal and DAG")}</button></div></div></div>}
     {showTaskCreate && <div className="modal-backdrop" onMouseDown={() => setShowTaskCreate(false)}><div className="modal" onMouseDown={(event) => event.stopPropagation()}><div className="modal-title"><Plus size={18} /><div><h2>{t("添加任务", "Add task")}</h2><p>{t("选择前置任务和 Skill，daemon 会校验 DAG 并冻结 Skill 来源。", "Choose dependencies and skills. The daemon validates the DAG and pins skill sources.")}</p></div></div><label>{t("任务标题", "Task title")}<input value={taskTitle} onChange={(event) => setTaskTitle(event.target.value)} autoFocus /></label><label>{t("任务要求", "Task requirements")}<textarea rows={5} value={taskSpec} onChange={(event) => setTaskSpec(event.target.value)} /></label><label><span className="label-with-icon"><Sparkles size={13} />{t("任务 Skill", "Task skills")}</span><input value={taskSkills} onChange={(event) => setTaskSkills(event.target.value)} placeholder={t("$skill-name，空格或逗号分隔", "$skill-name, separated by spaces or commas")} /></label>{parseSkills(taskSkills).length > 0 && <div className="skill-chip-row">{parseSkills(taskSkills).map((skill) => <span key={skill}>${skill}</span>)}</div>}{runTasks.length > 0 && <div><div className="section-label">{t("前置依赖", "Dependencies")}</div><div className="dependency-picker">{runTasks.map((task) => { const id = text(task["id"]); return <label className="check-row" key={id}><input type="checkbox" checked={taskDeps.includes(id)} onChange={(event) => setTaskDeps((current) => event.target.checked ? [...current, id] : current.filter((item) => item !== id))} />{text(task["title"])}</label>; })}</div></div>}<div className="button-row modal-actions"><button onClick={() => setShowTaskCreate(false)}>{t("取消", "Cancel")}</button><button className="primary" onClick={() => void createTask()} disabled={!taskTitle.trim() || !taskSpec.trim() || busy === "task-create"}><Plus size={14} />{t("添加任务", "Add task")}</button></div></div></div>}

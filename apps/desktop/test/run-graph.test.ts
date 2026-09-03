@@ -72,6 +72,14 @@ describe("Electron run graph layout", () => {
     expect(96_000 * scale).toBe(600);
   });
 
+  it("keeps automatic framing readable while explicit fit can show the whole graph", () => {
+    const layout = { nodes: [], feedbackEdges: [], width: 48_000, height: 96_000 };
+    const viewport = { width: 1_200, height: 600 };
+
+    expect(fitScale(layout, viewport, 1, 0.8)).toBe(0.8);
+    expect(fitScale(layout, viewport)).toBe(0.00625);
+  });
+
   it("degrades safely if an invalid snapshot contains a cycle", () => {
     const layout = layoutGraph([
       task("left", ["right"]),

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { SessionInfo } from "../src/shared/types";
 import {
+  adaptiveSidebarOpen,
   filterSessionsByQuery,
   mostRelevantProject,
   nextSidebarSessionLimit,
@@ -29,6 +30,14 @@ function session(
 }
 
 describe("workspace sidebar state", () => {
+  it("uses hysteresis while no explicit sidebar preference exists", () => {
+    expect(adaptiveSidebarOpen(1_080, true)).toBe(false);
+    expect(adaptiveSidebarOpen(1_200, false)).toBe(false);
+    expect(adaptiveSidebarOpen(1_200, true)).toBe(true);
+    expect(adaptiveSidebarOpen(1_320, false)).toBe(true);
+    expect(adaptiveSidebarOpen(Number.NaN, true)).toBe(true);
+  });
+
   it("matches the most specific project path", () => {
     const nested = session("nested", "/repo/packages/app", 1);
 

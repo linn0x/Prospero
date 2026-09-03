@@ -72,6 +72,7 @@ import { useLocale, type Language } from "./locale";
 import {
   EXPANDED_PROJECTS_STORAGE_KEY,
   SIDEBAR_SESSION_PREVIEW_LIMIT,
+  adaptiveSidebarOpen,
   filterSessionsByQuery,
   mostRelevantProject,
   nextSidebarSessionLimit,
@@ -190,6 +191,7 @@ import {
   SidebarRail,
   SidebarSeparator,
   SidebarTrigger,
+  useSidebar,
 } from "@/components/ui/sidebar";
 import { Spinner } from "@/components/ui/spinner";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -198,12 +200,22 @@ import { cn } from "@/lib/utils";
 /** Host platform is static and controls native menu labels and shortcuts. */
 const isMac = window.prospero.platform === "darwin";
 const COMPACT_SIDEBAR_BREAKPOINT = 1200;
+const SIDEBAR_OPEN_STORAGE_KEY = "prospero.sidebarOpen";
 const SIDEBAR_PROJECT_PREVIEW_LIMIT = 24;
 const SIDEBAR_PROJECT_PAGE_SIZE = 24;
 const SIDEBAR_PINNED_PREVIEW_LIMIT = 24;
 const SIDEBAR_SEARCH_PAGE_SIZE = 60;
 const SIDEBAR_SEARCH_VISIBLE_LIMIT = 120;
 const HYDRATED_SESSION_CACHE_LIMIT = 120;
+
+function readSidebarOpenPreference(): boolean | undefined {
+  try {
+    const value = localStorage.getItem(SIDEBAR_OPEN_STORAGE_KEY);
+    return value === "true" ? true : value === "false" ? false : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 const ChatPane = lazy(() =>
   import("./ChatPane").then((module) => ({ default: module.ChatPane })),
@@ -696,7 +708,7 @@ function ShellSidebar({
   view: View;
   activeId: string | undefined;
   onView: (view: View) => void;
-  onOpenSession: (id: string) => void;
+  onOpenSession: (id: string, session?: SessionInfo) => void;
   onNewSession: (project?: string) => void;
   onTogglePin: (id: string) => void;
   onToggleArchive: (id: string) => void;
@@ -706,6 +718,29 @@ function ShellSidebar({
   onSetUnread: (id: string, unread: boolean) => void;
 }) {
   const { language, t, status } = useLocale();
+  const { isMobile, setOpenMobile } = useSidebar();
+  const closeMobileSidebar = useCallback((): void => {
+    if (isMobile) setOpenMobile(false);
+  }, [isMobile, setOpenMobile]);
+  const selectView = useCallback((next: View): void => {
+    onView(next);
+    closeMobileSidebar();
+  }, [closeMobileSidebar, onView]);
+  const selectSession = useCallback((id: string, session?: SessionInfo): void => {
+    onOpenSession(id, session);
+    closeMobileSidebar();
+  }, [closeMobileSidebar, onOpenSession]);
+  const newSession = useCallback((project?: string): void => {
+    onNewSession(project);
+    closeMobileSidebar();
+  }, [closeMobileSidebar, onNewSession]);
+  const chooseProject = useCallback((): void => {
+    void window.prospero.chooseProject()
+      .then((path) => {
+        if (path) closeMobileSidebar();
+      })
+      .catch(() => undefined);
+  }, [closeMobileSidebar]);
   const [workspaceOpen, setWorkspaceOpen] = useState(true);
   const [sessionQuery, setSessionQuery] = useState("");
   const deferredSessionQuery = useDeferredValue(sessionQuery.trim());
@@ -1111,7 +1146,7 @@ function ShellSidebar({
         <SidebarMenuButton
           isActive={view === item.id}
           tooltip={navLabel(item.id, t)}
-          onClick={() => onView(item.id)}
+          onClick={() => selectView(item.id)}
         >
           <item.icon />
           <span>{navLabel(item.id, t)}</span>
@@ -1154,7 +1189,7 @@ function ShellSidebar({
                   <PinnedSessionRow
                     key={session.id}
                     session={session}
-                    onOpenSession={onOpenSession}
+                    onOpenSession={selectSession}
                     onTogglePin={onTogglePin}
                   />
                 ))}
@@ -1208,7 +1243,7 @@ function ShellSidebar({
               className="right-10"
               aria-label={t("新增工作区", "Add workspace")}
               title={t("新增工作区", "Add workspace")}
-              onClick={() => void window.prospero.chooseProject()}
+              onClick={chooseProject}
             >
               <Plus />
             </SidebarGroupAction>
@@ -1230,7 +1265,7 @@ function ShellSidebar({
                     {t("工作区", "Workspaces")}
                   </DropdownMenuLabel>
                   <DropdownMenuItem
-                    onClick={() => void window.prospero.chooseProject()}
+                    onClick={chooseProject}
                   >
                     <FolderPlus />
                     {t("添加工作区", "Add workspace")}
@@ -1311,7 +1346,7 @@ function ShellSidebar({
                             archived={snapshot.archivedSessionIds.includes(session.id)}
                             onToggleArchive={onToggleArchive}
                             pinned={snapshot.pinnedSessionIds.includes(session.id)}
-                            onOpenSession={onOpenSession}
+                            onOpenSession={selectSession}
                             onTogglePin={onTogglePin}
                             onRenameSession={onRenameSession}
                             onDuplicateSession={onDuplicateSession}
@@ -1433,7 +1468,7 @@ function ShellSidebar({
                           <ContextMenuContent>
                             <ContextMenuGroup>
                               <ContextMenuLabel>{name}</ContextMenuLabel>
-                              <ContextMenuItem onClick={() => onNewSession(project)}>
+                              <ContextMenuItem onClick={() => newSession(project)}>
                                 <Plus />
                                 {t("新建会话", "New session")}
                               </ContextMenuItem>
@@ -1547,7 +1582,7 @@ function ShellSidebar({
                                   pinned={snapshot.pinnedSessionIds.includes(
                                     session.id,
                                   )}
-                                  onOpenSession={onOpenSession}
+                                  onOpenSession={selectSession}
                                   onTogglePin={onTogglePin}
                                   onRenameSession={onRenameSession}
                                   onDuplicateSession={onDuplicateSession}
@@ -1631,7 +1666,7 @@ function ShellSidebar({
                   {snapshot.projects.length === 0 && (
                     <SidebarMenuItem>
                       <SidebarMenuButton
-                        onClick={() => void window.prospero.chooseProject()}
+                        onClick={chooseProject}
                       >
                         <FolderPlus />
                         <span>{t("添加工作区", "Add workspace")}</span>
@@ -1657,7 +1692,7 @@ function ShellSidebar({
                     aria-label={t("Daemon 状态", "Daemon status")}
                     onClick={() =>
                       snapshot.daemon.running
-                        ? onView("settings")
+                        ? selectView("settings")
                         : void window.prospero.startDaemon()
                     }
                   />
@@ -1679,7 +1714,7 @@ function ShellSidebar({
             <SidebarMenuButton
               isActive={view === "settings"}
               tooltip={t("设置", "Settings")}
-              onClick={() => onView("settings")}
+              onClick={() => selectView("settings")}
             >
               <Settings />
               <span>{t("设置", "Settings")}</span>
@@ -2166,6 +2201,9 @@ function InboxPane({
   const [gateDecisions, setGateDecisions] = useState<Record<string, string>>(
     {},
   );
+  const gateSubmissionRef = useRef(new Set<string>());
+  const [gateSubmissions, setGateSubmissions] = useState<Record<string, string>>({});
+  const [gateErrors, setGateErrors] = useState<Record<string, string>>({});
   const gates = snapshot.orchestration.gates.filter(
     (gate) => text(gate["status"]) === "pending",
   );
@@ -2181,52 +2219,86 @@ function InboxPane({
     taskIssues.length +
     sessionIssues.length +
     (snapshot.daemon.running ? 0 : 1);
+  const resolveInboxGate = async (gateId: string, decision: string): Promise<void> => {
+    if (gateSubmissionRef.current.has(gateId)) return;
+    gateSubmissionRef.current.add(gateId);
+    setGateSubmissions((current) => ({ ...current, [gateId]: decision }));
+    setGateErrors((current) => {
+      const next = { ...current };
+      delete next[gateId];
+      return next;
+    });
+    try {
+      await window.prospero.resolveGate(gateId, decision);
+      setGateDecisions((current) => ({ ...current, [gateId]: "" }));
+    } catch (reason) {
+      setGateErrors((current) => ({ ...current, [gateId]: displayError(reason) }));
+    } finally {
+      gateSubmissionRef.current.delete(gateId);
+      setGateSubmissions((current) => {
+        const next = { ...current };
+        delete next[gateId];
+        return next;
+      });
+    }
+  };
   const gateActions = (gate: JsonObject): React.ReactNode => {
     const gateId = text(gate["id"]);
     const options = Array.isArray(gate["options"])
       ? (gate["options"] as unknown[]).map(String)
       : [];
+    const submitting = gateSubmissions[gateId];
+    const error = gateErrors[gateId];
     if (options.length > 0) {
-      return options.map((option, index) => (
-        <Button
-          key={option}
-          variant={index === 0 ? "default" : "outline"}
-          size="sm"
-          onClick={() => void window.prospero.resolveGate(gateId, option)}
-        >
-          {option}
-        </Button>
-      ));
+      return <>
+        {options.map((option) => (
+          <Button
+            key={option}
+            variant="outline"
+            size="sm"
+            disabled={Boolean(submitting)}
+            onClick={() => void resolveInboxGate(gateId, option)}
+          >
+            {submitting === option && <Spinner data-icon="inline-start" />}
+            {option}
+          </Button>
+        ))}
+        {error && <span className="w-full text-xs text-destructive" role="alert">{error}</span>}
+      </>;
     }
     const decision = gateDecisions[gateId] ?? "";
     return (
-      <div className="gate-freeform-row">
-        <Input
-          value={decision}
-          aria-label={t("输入 Gate 决定", "Enter gate decision")}
-          placeholder={t("输入决定", "Enter a decision")}
-          onChange={(event) =>
-            setGateDecisions((current) => ({
-              ...current,
-              [gateId]: event.target.value,
-            }))
-          }
-          onKeyDown={(event) => {
-            if (event.key !== "Enter" || !decision.trim()) return;
-            event.preventDefault();
-            void window.prospero.resolveGate(gateId, decision.trim());
-          }}
-        />
-        <Button
-          size="sm"
-          disabled={!decision.trim()}
-          onClick={() =>
-            void window.prospero.resolveGate(gateId, decision.trim())
-          }
-        >
-          {t("确认", "Confirm")}
-        </Button>
-      </div>
+      <>
+        <div className="gate-freeform-row">
+          <Input
+            value={decision}
+            maxLength={20_000}
+            disabled={Boolean(submitting)}
+            aria-label={t("输入 Gate 决定", "Enter gate decision")}
+            placeholder={t("输入决定", "Enter a decision")}
+            onChange={(event) =>
+              setGateDecisions((current) => ({
+                ...current,
+                [gateId]: event.target.value,
+              }))
+            }
+            onKeyDown={(event) => {
+              if (event.key !== "Enter" || !decision.trim() || submitting) return;
+              event.preventDefault();
+              void resolveInboxGate(gateId, decision.trim());
+            }}
+          />
+          <Button
+            size="sm"
+            disabled={!decision.trim() || Boolean(submitting)}
+            onClick={() => void resolveInboxGate(gateId, decision.trim())}
+          >
+            {submitting && <Spinner data-icon="inline-start" />}
+            {submitting ? t("提交中…", "Submitting…") : t("确认", "Confirm")}
+          </Button>
+        </div>
+        {error && <span className="w-full text-xs text-destructive" role="alert">{error}</span>}
+      </>
     );
   };
   return (
@@ -3261,6 +3333,7 @@ function NewSessionDialog({
     accountId: defaultSessionLaunchAccountId(snapshot.accounts, "codex"),
   });
   const [busy, setBusy] = useState(false);
+  const [choosingWorkspace, setChoosingWorkspace] = useState(false);
   const [error, setError] = useState<string>();
   const [launchModels, setLaunchModels] = useState<AgentModel[]>([]);
   const [launchModelsLoading, setLaunchModelsLoading] = useState(false);
@@ -3386,6 +3459,19 @@ function NewSessionDialog({
       setBusy(false);
     }
   };
+  const chooseWorkspace = async (): Promise<void> => {
+    if (choosingWorkspace) return;
+    setChoosingWorkspace(true);
+    setError(undefined);
+    try {
+      const cwd = await window.prospero.chooseProject();
+      if (cwd) setInput((current) => ({ ...current, cwd }));
+    } catch (reason) {
+      setError(displayError(reason));
+    } finally {
+      setChoosingWorkspace(false);
+    }
+  };
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-2xl">
@@ -3443,8 +3529,16 @@ function NewSessionDialog({
                 </NativeSelectOptGroup>
               )}
             </NativeSelect>
+            {launchWorkspaces.length === 0 && (
+              <Button variant="outline" disabled={choosingWorkspace} onClick={() => void chooseWorkspace()}>
+                {choosingWorkspace ? <Spinner data-icon="inline-start" /> : <FolderPlus data-icon="inline-start" />}
+                {choosingWorkspace ? t("正在选择…", "Choosing…") : t("添加第一个工作区", "Add your first workspace")}
+              </Button>
+            )}
             <FieldDescription className="truncate" title={selectedWorkspace?.detail}>
-              {selectedWorkspace?.kind === "worktree"
+              {launchWorkspaces.length === 0
+                ? t("选择一个本地项目后即可在此创建会话。", "Choose a local project to create a session here.")
+                : selectedWorkspace?.kind === "worktree"
                 ? t("编排 worktree · 会话会直接在隔离分支中运行。", "Orchestration worktree · the session runs directly on the isolated branch.")
                 : t("项目根目录与持久上下文。", "Project root and persistent context.")}
             </FieldDescription>
@@ -3854,13 +3948,14 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   const [runTargetId, setRunTargetId] = useState<string>();
   const [editingProject, setEditingProject] = useState<string>();
   const [editingSession, setEditingSession] = useState<string>();
+  const [sidebarPreference] = useState(readSidebarOpenPreference);
   const startsWithCompactSidebar =
     window.innerWidth < COMPACT_SIDEBAR_BREAKPOINT;
   const [sidebarOpen, setSidebarOpen] = useState(
-    () => !startsWithCompactSidebar,
+    () => sidebarPreference ?? !startsWithCompactSidebar,
   );
   const sidebarOpenRef = useRef(sidebarOpen);
-  const sidebarWasAutoCollapsed = useRef(startsWithCompactSidebar);
+  const sidebarPreferenceRef = useRef(sidebarPreference);
   const [launcher, setLauncher] = useState<"command" | "quick">();
   const sessionSnapshot = useMemo(() => {
     if (hydratedSessions.length === 0) return snapshot;
@@ -3921,29 +4016,24 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     sidebarOpenRef.current = sidebarOpen;
   }, [sidebarOpen]);
   useEffect(() => {
-    const compactQuery = window.matchMedia(
-      `(max-width: ${String(COMPACT_SIDEBAR_BREAKPOINT - 1)}px)`,
-    );
-    const adaptSidebar = (compact: boolean): void => {
-      if (compact) {
-        if (sidebarOpenRef.current) {
-          sidebarWasAutoCollapsed.current = true;
-          sidebarOpenRef.current = false;
-          setSidebarOpen(false);
-        }
-        return;
-      }
-      if (sidebarWasAutoCollapsed.current) {
-        sidebarWasAutoCollapsed.current = false;
-        sidebarOpenRef.current = true;
-        setSidebarOpen(true);
-      }
+    const adaptSidebar = (): void => {
+      if (sidebarPreferenceRef.current !== undefined) return;
+      const next = adaptiveSidebarOpen(window.innerWidth, sidebarOpenRef.current);
+      if (next === sidebarOpenRef.current) return;
+      sidebarOpenRef.current = next;
+      setSidebarOpen(next);
     };
-    const onChange = (event: MediaQueryListEvent): void =>
-      adaptSidebar(event.matches);
-    compactQuery.addEventListener("change", onChange);
-    adaptSidebar(compactQuery.matches);
-    return () => compactQuery.removeEventListener("change", onChange);
+    window.addEventListener("resize", adaptSidebar);
+    adaptSidebar();
+    return () => window.removeEventListener("resize", adaptSidebar);
+  }, []);
+  const changeSidebarOpen = useCallback((open: boolean): void => {
+    sidebarPreferenceRef.current = open;
+    sidebarOpenRef.current = open;
+    setSidebarOpen(open);
+    try {
+      localStorage.setItem(SIDEBAR_OPEN_STORAGE_KEY, String(open));
+    } catch {}
   }, []);
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent): void => {
@@ -4090,11 +4180,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
       // 专注模式只收起顶栏/标签页条/会话工具条,不碰侧栏 —— 侧栏是导航和会话
       // 操作(停止本轮、结束会话)的唯一入口,把它一起锁上等于把这些动作也锁没了。
       open={sidebarOpen}
-      onOpenChange={(open) => {
-        sidebarWasAutoCollapsed.current = false;
-        sidebarOpenRef.current = open;
-        setSidebarOpen(open);
-      }}
+      onOpenChange={changeSidebarOpen}
       style={
         {
           "--sidebar-width": "15rem",

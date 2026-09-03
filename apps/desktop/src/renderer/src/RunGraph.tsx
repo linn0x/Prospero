@@ -18,6 +18,7 @@ const V_GAP = 26;
 const MARGIN = 26;
 const MIN_ZOOM = 0.001;
 const MAX_ZOOM = 2.2;
+const INITIAL_ZOOM_FLOOR = 0.8;
 
 interface Point {
   x: number;
@@ -285,9 +286,9 @@ export function layoutGraph(tasks: JsonObject[]): Layout {
   };
 }
 
-export function fitScale(layout: Pick<Layout, "width" | "height">, viewport: Size, maximum = MAX_ZOOM): number {
+export function fitScale(layout: Pick<Layout, "width" | "height">, viewport: Size, maximum = MAX_ZOOM, minimum = MIN_ZOOM): number {
   if (layout.width <= 0 || layout.height <= 0 || viewport.width <= 0 || viewport.height <= 0) return 1;
-  return Math.min(maximum, Math.max(MIN_ZOOM, Math.min(viewport.width / layout.width, viewport.height / layout.height)));
+  return Math.min(maximum, Math.max(minimum, Math.min(viewport.width / layout.width, viewport.height / layout.height)));
 }
 
 function visibleRect(viewport: Size, transform: ViewTransform, overscan = 0) {
@@ -349,7 +350,7 @@ function drawArrow(context: CanvasRenderingContext2D, point: Point, color: strin
   context.restore();
 }
 
-export function RunGraph({ tasks, dispatches }: { tasks: JsonObject[]; dispatches: JsonObject[] }) {
+export function RunGraph({ runId, tasks, dispatches }: { runId: string; tasks: JsonObject[]; dispatches: JsonObject[] }) {
   const { t, status } = useLocale();
   const graphKey = useMemo(() => structuralKey(tasks), [tasks]);
   const layoutCache = useRef<{ key: string; layout: Layout } | undefined>(undefined);
@@ -372,6 +373,12 @@ export function RunGraph({ tasks, dispatches }: { tasks: JsonObject[]; dispatche
     }
     return new Set([...latest].filter(([, dispatch]) => ["starting", "running"].includes(dispatch.state)).map(([id]) => id));
   }, [dispatches]);
+  const initialFocusId = useMemo(() => {
+    const active = tasks.find((task) => activeWorkers.has(text(task["id"])) || ["dispatched", "running", "starting"].includes(text(task["status"])));
+    if (active) return text(active["id"]);
+    const ready = tasks.find((task) => text(task["status"]) === "pending" && dependencies(task).every((dependency) => done.has(dependency)));
+    return text(ready?.["id"] ?? tasks.find((task) => dependencies(task).length === 0)?.["id"]);
+  }, [activeWorkers, done, tasks]);
 
   const viewportRef = useRef<HTMLDivElement>(null);
   const renderCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -386,6 +393,9 @@ export function RunGraph({ tasks, dispatches }: { tasks: JsonObject[]; dispatche
   const drag = useRef<{ pointerId: number; origin: Point; start: Point } | undefined>(undefined);
   const fitMode = useRef(false);
   const fitMaximum = useRef(1);
+  const fitMinimum = useRef(INITIAL_ZOOM_FLOOR);
+  const fitFocus = useRef<string | undefined>(undefined);
+  const previousRunId = useRef<string | undefined>(undefined);
   const previousLayoutKey = useRef<string | undefined>(undefined);
   const previousViewport = useRef<Size>({ width: 0, height: 0 });
 
@@ -434,39 +444,55 @@ export function RunGraph({ tasks, dispatches }: { tasks: JsonObject[]; dispatche
     return () => observer.disconnect();
   }, []);
 
-  const applyFit = useCallback((maximum: number): void => {
+  const applyFit = useCallback((maximum: number, minimum: number, focusId?: string): void => {
     if (viewport.width <= 0 || viewport.height <= 0) return;
-    const zoom = fitScale(layout, viewport, maximum);
+    const zoom = fitScale(layout, viewport, maximum, minimum);
+    const focus = layout.width * zoom > viewport.width || layout.height * zoom > viewport.height
+      ? layout.nodes.find((node) => node.id === focusId)
+      : undefined;
+    const center = focus
+      ? { x: focus.x + NODE_WIDTH / 2, y: focus.y + NODE_HEIGHT / 2 }
+      : { x: layout.width / 2, y: layout.height / 2 };
     commitTransform({
       zoom,
       pan: {
-        x: (viewport.width - layout.width * zoom) / 2,
-        y: (viewport.height - layout.height * zoom) / 2,
+        x: viewport.width / 2 - center.x * zoom,
+        y: viewport.height / 2 - center.y * zoom,
       },
     });
   }, [commitTransform, layout, viewport]);
 
-  // 新 Run / 新 revision 自动完整展示；保持“适应窗口”时，窗口缩放也持续重算。
   useLayoutEffect(() => {
     if (viewport.width <= 0 || viewport.height <= 0) return;
+    const firstLayout = previousLayoutKey.current === undefined;
+    const runChanged = previousRunId.current !== runId;
     const layoutChanged = previousLayoutKey.current !== graphKey;
     const sizeChanged = previousViewport.current.width !== viewport.width || previousViewport.current.height !== viewport.height;
+    previousRunId.current = runId;
     previousLayoutKey.current = graphKey;
     previousViewport.current = viewport;
-    if (layoutChanged) {
+    if (firstLayout || runChanged) {
       fitMode.current = true;
       fitMaximum.current = 1;
+      fitMinimum.current = INITIAL_ZOOM_FLOOR;
+      fitFocus.current = initialFocusId;
       setSelected(undefined);
-      applyFit(1);
-    } else if (sizeChanged && fitMode.current) {
-      applyFit(fitMaximum.current);
+      applyFit(1, INITIAL_ZOOM_FLOOR, initialFocusId);
+    } else if ((layoutChanged || sizeChanged) && fitMode.current) {
+      applyFit(fitMaximum.current, fitMinimum.current, fitFocus.current);
     }
-  }, [applyFit, graphKey, viewport]);
+  }, [applyFit, graphKey, initialFocusId, runId, viewport]);
+
+  useLayoutEffect(() => {
+    if (selected && !taskById.has(selected)) setSelected(undefined);
+  }, [selected, taskById]);
 
   const fit = useCallback((): void => {
     fitMode.current = true;
     fitMaximum.current = MAX_ZOOM;
-    applyFit(MAX_ZOOM);
+    fitMinimum.current = MIN_ZOOM;
+    fitFocus.current = undefined;
+    applyFit(MAX_ZOOM, MIN_ZOOM);
   }, [applyFit]);
 
   const reset = useCallback((): void => {

@@ -22,6 +22,20 @@ describe("新建会话审批策略", () => {
     expect(source).toContain("conn.createSession(agent, projectPath");
   });
 
+  it("创建期间防重复提交并保留失败后的设置", () => {
+    expect(source).toContain("runtime.status !== \"connected\" || pendingCreateRef.current");
+    expect(source).toContain("const result = conn.createSession(agent, projectPath");
+    expect(source).toContain("sessionCreateFailureText(result)");
+    expect(source).toContain("setCreateDelivery(result.disposition)");
+    expect(source).toContain("busy: createDelivery !== null");
+  });
+
+  it("紧凑屏可从目录错误态切换到完整路径输入", () => {
+    expect(source).toContain("manualCwdOpen");
+    expect(source).toContain("手动输入完整路径");
+    expect(source).toContain("onManualInput={() =>");
+  });
+
   it("YOLO 在选中前要求二次确认并说明完整访问风险", () => {
     expect(source).toContain('title="新会话使用 YOLO？"');
     expect(source).toContain('label="我明白，选择 YOLO"');

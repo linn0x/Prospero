@@ -85,8 +85,8 @@
   --accent-strong: #2f5ed7;
   --accent-bg: #e8eeff;
   --primary-soft: #e8eeff;
-  --primary-hover: #3e70f2;
-  --primary-active: #2f5ed7;
+  --primary-hover: #5f8aff;
+  --primary-active: #527fe9;
   --selection: #dbe6ff;
   --focus: #4c7dff;
   --green: #318f73;
@@ -127,6 +127,12 @@
   --overlay: #ffffff;
   --scrim: #17203366;
   --shadow: 0 18px 50px #24345117;
+  --chrome-glass: color-mix(in srgb, var(--sidebar) 58%, transparent);
+  --overlay-glass: color-mix(in srgb, var(--popover) 84%, transparent);
+  --glass-border: color-mix(in srgb, var(--foreground) 12%, transparent);
+  --glass-filter: blur(18px) saturate(125%);
+  --glass-shadow: 0 18px 48px #24345124;
+  --glass-scrim: #1720332e;
   --background: var(--bg);
   --foreground: var(--text);
   --card: var(--surface-1);
@@ -134,7 +140,7 @@
   --popover: var(--surface-1);
   --popover-foreground: var(--text);
   --primary: #4c7dff;
-  --primary-foreground: #ffffff;
+  --primary-foreground: #10131c;
   --secondary: var(--surface-2);
   --secondary-foreground: var(--text);
   --muted-foreground: var(--muted);
@@ -182,6 +188,8 @@
   --accent-bg: #6d92ff1f;
   --primary: #6d92ff;
   --primary-soft: #6d92ff1f;
+  --primary-hover: #7ea0ff;
+  --primary-active: #6089f3;
   --selection: #6d92ff2b;
   --green: #58b99a;
   --yellow: #f0b45a;
@@ -206,10 +214,15 @@
   --secondary: var(--surface-2);
   --input: var(--border-strong);
   --shadow: 0 22px 64px #0000006e;
+  --chrome-glass: color-mix(in srgb, var(--sidebar) 68%, transparent);
+  --overlay-glass: color-mix(in srgb, var(--popover) 86%, transparent);
+  --glass-border: color-mix(in srgb, var(--foreground) 18%, transparent);
+  --glass-shadow: 0 22px 58px #00000080;
+  --glass-scrim: #050a127a;
   --sidebar: #111a29;
   --sidebar-foreground: #edf2fb;
   --sidebar-primary: #6d92ff;
-  --sidebar-primary-foreground: #ffffff;
+  --sidebar-primary-foreground: var(--primary-foreground);
   --sidebar-accent: #6d92ff1f;
   --sidebar-accent-foreground: #ffffff;
   --sidebar-border: #283650;
@@ -229,8 +242,8 @@ button, input, textarea, select { font: inherit; color: inherit; }
 button:not([data-slot]) { border: 1px solid var(--border); background: var(--surface-2); border-radius: 7px; padding: 7px 10px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
 button:not([data-slot]):hover:not(:disabled) { background: var(--surface-3); border-color: var(--border-strong); }
 button:not([data-slot]):disabled { opacity: .45; cursor: default; }
-button.primary { background: var(--accent); color: #10131c; border-color: transparent; font-weight: 650; }
-button.primary:hover:not(:disabled) { background: var(--accent-strong); }
+button.primary { background: var(--primary); color: var(--primary-foreground); border-color: transparent; font-weight: 650; }
+button.primary:hover:not(:disabled) { background: var(--primary-hover); }
 button.danger { color: var(--red); }
 button.icon-button { padding: 5px; border-color: transparent; background: transparent; }
 input:not([data-slot]), textarea:not([data-slot]), select:not([data-slot]) { width: 100%; border: 1px solid var(--border-strong); background: var(--surface-0); border-radius: 7px; padding: 8px 9px; outline: none; }
@@ -633,8 +646,8 @@ code, pre, kbd, .global-statusbar, .log-view, .detail-output, .terminal-preview,
 button:not([data-slot]), input:not([data-slot]), textarea:not([data-slot]), select:not([data-slot]) { border-radius: 6px; }
 button:not([data-slot]) { padding: 7px 10px; border-color: var(--border); background: var(--surface-2); }
 button:not([data-slot]):hover:not(:disabled) { border-color: var(--border-strong); background: var(--surface-3); }
-button.primary { color: #fff; background: var(--accent); box-shadow: 0 1px 2px #0003; }
-button.primary:hover:not(:disabled) { background: var(--accent-strong); }
+button.primary { color: var(--primary-foreground); background: var(--primary); box-shadow: 0 1px 2px #0003; }
+button.primary:hover:not(:disabled) { background: var(--primary-hover); }
 input:not([data-slot]), textarea:not([data-slot]), select:not([data-slot]) { background: var(--surface-1); }
 .app-shell { grid-template-rows: 42px minmax(0, 1fr) 23px; }
 .titlebar {
@@ -1798,8 +1811,47 @@ kbd {
 :root[data-platform="darwin"] body,
 :root[data-platform="darwin"] .prospero-shell { background: transparent; }
 :root[data-platform="darwin"] .prospero-sidebar [data-slot="sidebar-inner"] {
-  background: color-mix(in srgb, var(--sidebar) 55%, transparent);
+  background: var(--chrome-glass);
 }
 /* 内容区保持不透明 —— 只在与侧栏交界处留一条细线,避免两块材质糊在一起。 */
 :root[data-platform="darwin"] .prospero-main { background: var(--background); }
 :root[data-platform="darwin"] .desktop-topbar { background: transparent; }
+
+.overlay-glass,
+:is(
+  [data-slot="context-menu-content"],
+  [data-slot="context-menu-sub-content"],
+  [data-slot="dropdown-menu-content"],
+  [data-slot="dropdown-menu-sub-content"],
+  [data-slot="hover-card-content"]
+) {
+  background: var(--popover);
+  border-color: var(--glass-border);
+  box-shadow: 0 0 0 1px var(--glass-border), var(--glass-shadow);
+}
+
+.glass-scrim { background: var(--glass-scrim); }
+
+@supports ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
+  .overlay-glass,
+  :is(
+    [data-slot="context-menu-content"],
+    [data-slot="context-menu-sub-content"],
+    [data-slot="dropdown-menu-content"],
+    [data-slot="dropdown-menu-sub-content"],
+    [data-slot="hover-card-content"]
+  ) {
+    background: var(--overlay-glass);
+    -webkit-backdrop-filter: var(--glass-filter);
+    backdrop-filter: var(--glass-filter);
+  }
+}
+
+@media (max-width: 900px) {
+  .prospero-main .run-hero { align-items: stretch; flex-direction: column; min-width: 0; }
+  .prospero-main .run-hero-copy { width: 100%; flex-direction: column; align-items: stretch; gap: 7px; }
+  .prospero-main .run-hero h2 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .prospero-main .run-progress-line { width: 100%; max-width: none; }
+  .prospero-main .run-hero > .button-row { flex-wrap: nowrap; justify-content: flex-start; overflow-x: auto; padding-bottom: 3px; }
+  .prospero-main .run-hero > .button-row button { flex: none; white-space: nowrap; }
+}
