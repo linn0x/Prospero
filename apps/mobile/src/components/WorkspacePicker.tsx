@@ -59,6 +59,7 @@ export function WorkspacePicker({
   initialPath,
   initialCwd = "",
   onClose,
+  onManualInput,
   onSelect,
 }: {
   visible: boolean;
@@ -66,6 +67,7 @@ export function WorkspacePicker({
   initialPath: string;
   initialCwd?: string;
   onClose: () => void;
+  onManualInput?: () => void;
   onSelect: (selection: Selection) => void;
 }) {
   const insets = useSafeAreaInsets();
@@ -256,6 +258,11 @@ export function WorkspacePicker({
                   <Pressable style={styles.retryButton} onPress={() => void load(path, root)}>
                     <Text style={styles.retryText}>重新加载</Text>
                   </Pressable>
+                  {onManualInput && (
+                    <Pressable style={styles.manualButton} onPress={onManualInput}>
+                      <Text style={styles.manualText}>手动输入完整路径</Text>
+                    </Pressable>
+                  )}
                 </View>
               ) : (
                 <View style={styles.emptyState}>
@@ -409,6 +416,8 @@ const styles = StyleSheet.create({
     backgroundColor: color.surfaceRaised,
   },
   retryText: { color: color.accent, fontSize: 13, fontWeight: "600" },
+  manualButton: { minHeight: 42, paddingHorizontal: space.lg, alignItems: "center", justifyContent: "center", borderRadius: radius.sm, backgroundColor: color.surfaceRaised },
+  manualText: { color: color.text, fontSize: 13, fontWeight: "600" },
   row: {
     minHeight: 62,
     paddingHorizontal: space.md,

@@ -54,4 +54,15 @@ describe("编排 Run 当前态 UI", () => {
     expect(screen).toContain("此 Run 已结束，只读。");
     expect(screen).toContain('canManage && selectedRun.status === "active"');
   });
+
+  it("opens a coordinator Goal graph directly from its session", () => {
+    const screen = readFileSync(
+      join(import.meta.dirname, "..", "src", "app", "host", "[hostId]", "session", "[sid].tsx"),
+      "utf8",
+    );
+
+    expect(screen).toContain("orchestrationRoute(hostId, coordinatorRun.id)");
+    expect(screen).toContain('accessibilityLabel="打开 Goal 任务图"');
+    expect(screen).toContain('label="打开 Goal 任务图"');
+  });
 });

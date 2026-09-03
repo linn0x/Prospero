@@ -33,8 +33,146 @@ export type ChatHistoryCursor = {
 export const CHAT_TIMELINE_WINDOW_SIZE = 120;
 export const CHAT_TIMELINE_END_THRESHOLD = 48;
 export const MAX_RETAINED_CHAT_ITEMS = 2_000;
+export const CHAT_DRAFT_STORAGE_KEY = "prospero.chatDrafts";
+export const MAX_CHAT_DRAFT_LENGTH = 20_000;
+export const MAX_CHAT_DRAFTS = 40;
+export const CHAT_DRAFT_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
 const CHAT_TIMELINE_COMPACT_TARGET = 1_800;
 const MAX_PROTECTED_ACTIVE_ITEMS = 512;
+
+export type ChatDraftEntry = {
+  sessionId: string;
+  text: string;
+  updatedAt: number;
+};
+
+type ChatDraftStorage = Pick<Storage, "getItem" | "setItem" | "removeItem">;
+
+function draftOrder(left: ChatDraftEntry, right: ChatDraftEntry): number {
+  return right.updatedAt - left.updatedAt || left.sessionId.localeCompare(right.sessionId);
+}
+
+export function limitChatDraftText(value: string): string {
+  return value.slice(0, MAX_CHAT_DRAFT_LENGTH);
+}
+
+export function mergeFailedChatDraft(failed: string, current: string): string {
+  const latest = limitChatDraftText(current);
+  const previous = limitChatDraftText(failed);
+  if (!latest) return previous;
+  if (!previous) return latest;
+  const available = MAX_CHAT_DRAFT_LENGTH - latest.length - 1;
+  if (available <= 0) return latest;
+  return `${previous.slice(0, available)}\n${latest}`;
+}
+
+export function parseChatDraftEntries(raw: string | null, now = Date.now()): ChatDraftEntry[] {
+  if (!raw) return [];
+  const currentTime = Number.isFinite(now) ? Math.max(0, Math.floor(now)) : Date.now();
+  const oldest = Math.max(0, currentTime - CHAT_DRAFT_TTL_MS);
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(value)) return [];
+  const entries = new Map<string, ChatDraftEntry>();
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const source = item as Record<string, unknown>;
+    const sessionId = source["sessionId"];
+    const text = source["text"];
+    const updatedAt = source["updatedAt"];
+    if (
+      typeof sessionId !== "string" ||
+      sessionId.length === 0 ||
+      sessionId.length > 500 ||
+      typeof text !== "string" ||
+      text.length === 0 ||
+      typeof updatedAt !== "number" ||
+      !Number.isFinite(updatedAt) ||
+      updatedAt < oldest
+    ) continue;
+    const entry = {
+      sessionId,
+      text: limitChatDraftText(text),
+      updatedAt: Math.min(currentTime, Math.floor(updatedAt)),
+    };
+    const previous = entries.get(sessionId);
+    if (!previous || entry.updatedAt >= previous.updatedAt) entries.set(sessionId, entry);
+  }
+  return [...entries.values()].sort(draftOrder).slice(0, MAX_CHAT_DRAFTS);
+}
+
+export function updateChatDraftEntries(
+  entries: readonly ChatDraftEntry[],
+  sessionId: string,
+  text: string,
+  updatedAt: number,
+): ChatDraftEntry[] {
+  const next = entries.filter((entry) => entry.sessionId !== sessionId);
+  const limited = limitChatDraftText(text);
+  if (sessionId.length > 0 && sessionId.length <= 500 && limited.length > 0) {
+    const timestamp = Number.isFinite(updatedAt) ? Math.max(0, Math.floor(updatedAt)) : 0;
+    next.push({ sessionId, text: limited, updatedAt: timestamp });
+  }
+  return next.sort(draftOrder).slice(0, MAX_CHAT_DRAFTS);
+}
+
+function chatDraftStorage(storage?: ChatDraftStorage): ChatDraftStorage | undefined {
+  if (storage) return storage;
+  try {
+    return typeof globalThis.localStorage === "undefined" ? undefined : globalThis.localStorage;
+  } catch {
+    return undefined;
+  }
+}
+
+export function loadChatDraft(sessionId: string, storage?: ChatDraftStorage, now = Date.now()): string {
+  try {
+    const target = chatDraftStorage(storage);
+    if (!target) return "";
+    const raw = target.getItem(CHAT_DRAFT_STORAGE_KEY);
+    const entries = parseChatDraftEntries(raw, now);
+    if (raw !== null) {
+      try {
+        if (entries.length === 0) target.removeItem(CHAT_DRAFT_STORAGE_KEY);
+        else {
+          const normalized = JSON.stringify(entries);
+          if (normalized !== raw) target.setItem(CHAT_DRAFT_STORAGE_KEY, normalized);
+        }
+      } catch {}
+    }
+    return entries.find((entry) => entry.sessionId === sessionId)?.text ?? "";
+  } catch {
+    return "";
+  }
+}
+
+export function persistChatDraft(
+  sessionId: string,
+  text: string,
+  storage?: ChatDraftStorage,
+  updatedAt = Date.now(),
+): boolean {
+  try {
+    const target = chatDraftStorage(storage);
+    if (!target) return false;
+    const now = Number.isFinite(updatedAt) ? Math.max(0, Math.floor(updatedAt)) : Date.now();
+    const entries = updateChatDraftEntries(
+      parseChatDraftEntries(target.getItem(CHAT_DRAFT_STORAGE_KEY), now),
+      sessionId,
+      text,
+      now,
+    );
+    if (entries.length === 0) target.removeItem(CHAT_DRAFT_STORAGE_KEY);
+    else target.setItem(CHAT_DRAFT_STORAGE_KEY, JSON.stringify(entries));
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export function getChatPollReconnectDelay(hasFrame: boolean, elapsedMs: number): number {
   return !hasFrame && elapsedMs < 500 ? 650 : 25;

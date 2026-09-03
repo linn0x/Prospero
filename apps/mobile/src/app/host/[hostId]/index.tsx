@@ -53,6 +53,7 @@ import {
 import { sortSessions } from "@/lib/store";
 import { useHostConnection } from "@/lib/use-host-connection";
 import { useOrchestrationSnapshot } from "@/lib/use-orchestration-snapshot";
+import type { DeliveryResult } from "@/lib/outbound-queue";
 import * as theme from "@/lib/theme";
 const { color, font, radius, space } = theme;
 
@@ -77,6 +78,13 @@ const approvalPolicyHelp: Record<ApprovalPolicy, string> = {
   standard: "只读操作自动放行；修改文件、执行命令和联网仍需确认。",
   yolo: "全部操作自动批准；Codex 同时启用完整访问，操作仍会记录。",
 };
+
+function sessionCreateFailureText(result: DeliveryResult): string {
+  if (result.accepted) return "";
+  if (result.reason === "queue_full") return "离线队列已满；创建设置已保留，请恢复连接后重试。";
+  if (result.reason === "transport_error") return "连接刚刚中断；创建请求没有自动重发，请确认会话列表后重试。";
+  return "主机未连接；创建设置已保留，请恢复连接后重试。";
+}
 
 const statusLabel: Record<SessionInfo["status"], string> = {
   starting: "启动中",
@@ -168,6 +176,8 @@ export default function HostScreen() {
   const [hiddenIds, setHiddenIds] = useState<Set<string>>(() => new Set());
   const [deleteTarget, setDeleteTarget] = useState<SessionInfo | null>(null);
   const [resumeConflictTitle, setResumeConflictTitle] = useState<string | null>(null);
+  const [createDelivery, setCreateDelivery] = useState<"sent" | "queued" | null>(null);
+  const [manualCwdOpen, setManualCwdOpen] = useState(false);
   const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(() => new Set());
   const [goalRunExpansionOverrides, setGoalRunExpansionOverrides] = useState<
     Record<string, boolean>
@@ -175,6 +185,11 @@ export default function HostScreen() {
   const pendingCreateRef = useRef(false);
   const pendingResumeTitleRef = useRef<string | null>(null);
   const deepLinkCreateRef = useRef<string | null>(null);
+  const resetPendingCreate = useCallback((): void => {
+    pendingCreateRef.current = false;
+    pendingResumeTitleRef.current = null;
+    setCreateDelivery(null);
+  }, []);
   const insets = useSafeAreaInsets();
   const { width, height, verticalPanes } = useAdaptiveLayout();
   const orchestration = useOrchestrationSnapshot(conn, runtime.status, 8_000);
@@ -398,16 +413,27 @@ export default function HostScreen() {
     if (!conn || !create) return;
     const fireKey = `${create}:${typeof cmd === "string" ? cmd : ""}`;
     if (deepLinkCreateRef.current === fireKey) return;
+    if (pendingCreateRef.current) return;
     if (runtime.status !== "connected") return;
     if (!availableAgents.includes(create as AgentKind) && create !== "custom") return;
-    deepLinkCreateRef.current = fireKey;
-    pendingCreateRef.current = true;
-    conn.createSession(
-      create as AgentKind,
-      undefined,
-      typeof cmd === "string" && cmd.length > 0 ? cmd : undefined,
-    );
-  }, [availableAgents, conn, create, cmd, runtime.status]);
+    const timer = setTimeout(() => {
+      deepLinkCreateRef.current = fireKey;
+      pendingCreateRef.current = true;
+      const result = conn.createSession(
+        create as AgentKind,
+        undefined,
+        typeof cmd === "string" && cmd.length > 0 ? cmd : undefined,
+      );
+      if (!result.accepted) {
+        resetPendingCreate();
+        deepLinkCreateRef.current = null;
+        setBanner(sessionCreateFailureText(result));
+        return;
+      }
+      setCreateDelivery(result.disposition);
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [availableAgents, conn, create, cmd, resetPendingCreate, runtime.status]);
 
   // 新建会话:创建后 daemon 自动 attach 并发快照(PTY 发 term.snapshot,
   // 结构化发 chat.snapshot)→ 以快照的 sid 进入会话页
@@ -415,8 +441,7 @@ export default function HostScreen() {
     if (!conn) return;
     const enter = (sid: string): void => {
       if (!pendingCreateRef.current || !hostId) return;
-      pendingCreateRef.current = false;
-      pendingResumeTitleRef.current = null;
+      resetPendingCreate();
       setComposing(false);
       setSelectedResume(null);
       setLaunchIntent("conversation");
@@ -428,12 +453,12 @@ export default function HostScreen() {
     const offSnap = conn.events.on("snapshot", (m) => enter(m.sid));
     const offChat = conn.events.on("chatSnapshot", (m) => enter(m.sid));
     const offErr = conn.events.on("serverError", (m) => {
-      pendingCreateRef.current = false;
-      if (m.reason === "conversation_active_writer" && pendingResumeTitleRef.current) {
-        setResumeConflictTitle(pendingResumeTitleRef.current);
+      const resumeTitle = pendingResumeTitleRef.current;
+      resetPendingCreate();
+      if (m.reason === "conversation_active_writer" && resumeTitle) {
+        setResumeConflictTitle(resumeTitle);
         return;
       }
-      pendingResumeTitleRef.current = null;
       setBanner(`${m.code}: ${m.message}`);
     });
     return () => {
@@ -441,7 +466,7 @@ export default function HostScreen() {
       offChat();
       offErr();
     };
-  }, [conn, hostId]);
+  }, [conn, hostId, resetPendingCreate]);
 
   const all = useMemo(
     () => sortSessions(runtime.sessions).filter((session) => !hiddenIds.has(session.id)),
@@ -523,9 +548,20 @@ export default function HostScreen() {
           : runtime.status === "failed"
             ? (runtime.lastError ?? "连接失败")
             : "未连接";
+  const createButtonLabel = createDelivery === "queued"
+    ? "等待连接…"
+    : createDelivery === "sent"
+      ? "正在创建…"
+      : launchIntent === "goal"
+        ? "启动 Goal 协调者"
+        : sessionKind === "structured" && selectedResume
+          ? "恢复并打开对话"
+          : sessionKind === "structured" && launchMode === "plan"
+            ? "新建 Plan 会话"
+            : "新建会话";
 
   const submitCreate = (): void => {
-    if (!conn || runtime.status !== "connected") return;
+    if (!conn || runtime.status !== "connected" || pendingCreateRef.current) return;
     const projectPath = cwd.trim();
     if (projectPath.length === 0) {
       setBanner("请先选择项目目录，再新建会话。");
@@ -596,7 +632,13 @@ export default function HostScreen() {
         ? sessionKind
         : "pty";
     const sendCreate = (options: typeof sessionOptions): void => {
-      conn.createSession(agent, projectPath, undefined, createKind, 80, 24, options);
+      const result = conn.createSession(agent, projectPath, undefined, createKind, 80, 24, options);
+      if (!result.accepted) {
+        resetPendingCreate();
+        setBanner(sessionCreateFailureText(result));
+        return;
+      }
+      setCreateDelivery(result.disposition);
     };
     pendingResumeTitleRef.current =
       agent === "codex" && sessionOptions?.resume
@@ -784,6 +826,7 @@ export default function HostScreen() {
             <View
               style={[
                 styles.projectPane,
+                !wideComposer && manualCwdOpen && styles.projectPaneManual,
                 wideComposer && styles.projectPaneWide,
                 wideComposer && {
                   flex: 0,
@@ -819,7 +862,17 @@ export default function HostScreen() {
                   {!wideComposer && <Text style={styles.selectedProjectChange}>点按更换</Text>}
                 </View>
               </Pressable>
-              {wideComposer && <View style={styles.cwdRow}>
+              {!wideComposer && (
+                <Pressable
+                  style={({ pressed }) => [styles.manualCwdToggle, pressed && styles.browseBtnPressed]}
+                  onPress={() => setManualCwdOpen((open) => !open)}
+                  accessibilityRole="button"
+                  accessibilityState={{ expanded: manualCwdOpen }}
+                >
+                  <Text style={styles.manualCwdToggleText}>{manualCwdOpen ? "收起路径输入" : "手动输入完整路径"}</Text>
+                </Pressable>
+              )}
+              {(wideComposer || manualCwdOpen) && <View style={styles.cwdRow}>
                 <View style={styles.cwdField}>
                   <Icon name="folder.fill" size={16} color={color.textDim} />
                   <TextInput
@@ -1431,21 +1484,17 @@ export default function HostScreen() {
           <Pressable
             style={({ pressed }) => [
               styles.createBtn,
-              runtime.status !== "connected" && styles.btnDisabled,
+              (runtime.status !== "connected" || createDelivery !== null) && styles.btnDisabled,
               pressed && styles.createBtnPressed,
             ]}
-            disabled={runtime.status !== "connected"}
+            disabled={runtime.status !== "connected" || createDelivery !== null}
             onPress={submitCreate}
+            accessibilityState={{ disabled: runtime.status !== "connected" || createDelivery !== null, busy: createDelivery !== null }}
           >
-            <Text style={styles.createBtnText}>
-              {launchIntent === "goal"
-                ? "启动 Goal 协调者"
-                : sessionKind === "structured" && selectedResume
-                ? "恢复并打开对话"
-                : sessionKind === "structured" && launchMode === "plan"
-                  ? "新建 Plan 会话"
-                  : "新建会话"}
-            </Text>
+            <View style={styles.createBtnContent}>
+              {createDelivery !== null && <ActivityIndicator size="small" color="#0A0A0C" />}
+              <Text style={styles.createBtnText}>{createButtonLabel}</Text>
+            </View>
           </Pressable>
             </ScrollView>
           </View>
@@ -1678,9 +1727,14 @@ export default function HostScreen() {
           initialPath={workspacePath}
           initialCwd={cwd}
           onClose={() => setPickerOpen(false)}
+          onManualInput={() => {
+            setPickerOpen(false);
+            setManualCwdOpen(true);
+          }}
           onSelect={(selection) => {
             setWorkspacePath(selection.path);
             setCwd(selection.cwd);
+            setManualCwdOpen(false);
             setPickerOpen(false);
           }}
         />
@@ -2162,6 +2216,7 @@ const styles = StyleSheet.create({
     borderRightWidth: StyleSheet.hairlineWidth,
     borderRightColor: color.border,
   },
+  projectPaneManual: { maxHeight: 264 },
   configPane: { flex: 1, minHeight: 0 },
   configBox: {
     width: "100%",
@@ -2580,6 +2635,8 @@ const styles = StyleSheet.create({
   },
   browseBtnPressed: { backgroundColor: color.pressed },
   browseBtnText: { color: color.accent, fontSize: 14, fontWeight: "600" },
+  manualCwdToggle: { minHeight: 36, alignItems: "center", justifyContent: "center", borderRadius: radius.sm, backgroundColor: color.surfaceRaised },
+  manualCwdToggleText: { color: color.accent, fontSize: 12, fontWeight: "600" },
   cwdHelp: { ...font.meta, marginLeft: 2 },
   createBtn: {
     minHeight: 48,
@@ -2590,4 +2647,5 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   createBtnPressed: { opacity: 0.82 },
+  createBtnContent: { flexDirection: "row", alignItems: "center", gap: space.sm },
 });

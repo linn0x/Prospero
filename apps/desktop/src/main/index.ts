@@ -1008,7 +1008,7 @@ function installIpc(): void {
   ipcMain.handle("orchestration:gate", (_event, rawId: unknown, rawDecision: unknown) => {
     const id = requireId(rawId, "Gate");
     if (!store.snapshot().orchestration.gates.some((gate) => gate["id"] === id)) throw new Error("Gate 不存在");
-    if (typeof rawDecision !== "string" || !rawDecision.trim() || rawDecision.length > 2_000) throw new Error("决策无效");
+    if (typeof rawDecision !== "string" || !rawDecision.trim() || rawDecision.length > 20_000) throw new Error("决策无效");
     return runtime.request(`/_prospero/control/orchestration/gate/${encodeURIComponent(id)}/resolve`, { method: "POST", body: { decision: rawDecision.trim() } });
   });
   ipcMain.handle("account:action", async (_event, raw: unknown) => {

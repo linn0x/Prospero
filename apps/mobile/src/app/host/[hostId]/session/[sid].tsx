@@ -55,7 +55,7 @@ import { matchCommands } from "@/lib/slash-commands";
 import { setSessionArchived } from "@/lib/session-preferences";
 import { sortSessions } from "@/lib/store";
 import { useHostConnection } from "@/lib/use-host-connection";
-import { coordinatorRunsBySession } from "@/lib/orchestration-overview";
+import { coordinatorRunsBySession, orchestrationRoute } from "@/lib/orchestration-overview";
 import { useOrchestrationSnapshot } from "@/lib/use-orchestration-snapshot";
 import { deliveryFailureText } from "@/lib/outbound-queue";
 import { sessionLoadState } from "@/lib/session-load-state";
@@ -1101,55 +1101,60 @@ export default function SessionScreen() {
 
       {isStructured && (
         <View style={styles.modeBar}>
-          <View style={styles.chatModeLabel}>
-            {isSubagent ? (
-              <View style={styles.subagentModeIdentity}>
-                <View
-                  style={[
-                    styles.subagentModeDot,
-                    {
-                      backgroundColor:
-                        subagent?.status === "running" || subagent?.status === "starting"
-                          ? color.accent
-                          : color.textFaint,
-                    },
-                  ]}
-                />
-                <Text style={styles.subagentModeName} numberOfLines={1}>
-                  {subagent?.name ?? "子 Agent"}
-                </Text>
-              </View>
-            ) : session.agent === "deepseek" && supportsDeepseekTrajectory ? (
-              <View style={styles.deepseekViewToggle}>
-                {(["chat", "trajectory"] as const).map((mode) => (
-                  <Pressable
-                    key={mode}
-                    style={[styles.deepseekViewOption, deepseekView === mode && styles.deepseekViewOptionActive]}
-                    onPress={() => setDeepseekView(mode)}
-                    accessibilityRole="button"
-                    accessibilityState={{ selected: deepseekView === mode }}
-                  >
-                    <Text style={[styles.deepseekViewText, deepseekView === mode && styles.deepseekViewTextActive]}>
-                      {mode === "chat" ? "对话" : "轨迹"}
-                    </Text>
-                  </Pressable>
-                ))}
-              </View>
-            ) : (
-              <>
-                <Icon
-                  name={coordinatorRun
-                    ? "point.3.connected.trianglepath.dotted"
-                    : "bubble.left.and.text.bubble.right"}
-                  size={14}
-                  color={coordinatorRun ? color.accent : color.text}
-                />
-                <Text style={[styles.modeText, coordinatorRun && styles.coordinatorModeText]}>
-                  {coordinatorRun ? "Goal 编排者" : "对话"}
-                </Text>
-              </>
-            )}
-          </View>
+          {coordinatorRun && !isSubagent ? (
+            <Pressable
+              style={({ pressed }) => [styles.chatModeLabel, styles.coordinatorModeLink, pressed && styles.controlPressed]}
+              onPress={() => router.push(orchestrationRoute(hostId, coordinatorRun.id))}
+              accessibilityRole="button"
+              accessibilityLabel="打开 Goal 任务图"
+            >
+              <Icon name="point.3.connected.trianglepath.dotted" size={14} color={color.accent} />
+              <Text style={[styles.modeText, styles.coordinatorModeText]}>Goal 编排者</Text>
+              <Icon name="chevron.right" size={12} color={color.accent} />
+            </Pressable>
+          ) : (
+            <View style={styles.chatModeLabel}>
+              {isSubagent ? (
+                <View style={styles.subagentModeIdentity}>
+                  <View
+                    style={[
+                      styles.subagentModeDot,
+                      {
+                        backgroundColor:
+                          subagent?.status === "running" || subagent?.status === "starting"
+                            ? color.accent
+                            : color.textFaint,
+                      },
+                    ]}
+                  />
+                  <Text style={styles.subagentModeName} numberOfLines={1}>
+                    {subagent?.name ?? "子 Agent"}
+                  </Text>
+                </View>
+              ) : session.agent === "deepseek" && supportsDeepseekTrajectory ? (
+                <View style={styles.deepseekViewToggle}>
+                  {(["chat", "trajectory"] as const).map((mode) => (
+                    <Pressable
+                      key={mode}
+                      style={[styles.deepseekViewOption, deepseekView === mode && styles.deepseekViewOptionActive]}
+                      onPress={() => setDeepseekView(mode)}
+                      accessibilityRole="button"
+                      accessibilityState={{ selected: deepseekView === mode }}
+                    >
+                      <Text style={[styles.deepseekViewText, deepseekView === mode && styles.deepseekViewTextActive]}>
+                        {mode === "chat" ? "对话" : "轨迹"}
+                      </Text>
+                    </Pressable>
+                  ))}
+                </View>
+              ) : (
+                <>
+                  <Icon name="bubble.left.and.text.bubble.right" size={14} color={color.text} />
+                  <Text style={styles.modeText}>对话</Text>
+                </>
+              )}
+            </View>
+          )}
           {!isSubagent && agentControls && (
             <Pressable
               style={[styles.controlChip, displayedMode === "plan" && styles.controlChipPlan]}
@@ -1468,6 +1473,17 @@ export default function SessionScreen() {
       )}
 
       <Sheet visible={menuOpen} title={session.title || "会话"} onClose={() => setMenuOpen(false)}>
+        {coordinatorRun && !isSubagent ? (
+          <SheetAction
+            label="打开 Goal 任务图"
+            detail="查看任务依赖、worker 和待处理 Gate"
+            symbol="point.3.connected.trianglepath.dotted"
+            onPress={() => {
+              setMenuOpen(false);
+              router.push(orchestrationRoute(hostId, coordinatorRun.id));
+            }}
+          />
+        ) : null}
         {isStructured && session.agentControls && !isSubagent ? (
           <SheetAction
             label={session.agent === "deepseek" ? "模型与推理强度" : "模型与 Plan 模式"}
@@ -2001,6 +2017,7 @@ const styles = StyleSheet.create({
     gap: 7,
     paddingHorizontal: 8,
   },
+  coordinatorModeLink: { minHeight: MIN_TOUCH_TARGET, borderRadius: 9, backgroundColor: color.accentBg },
   deepseekViewToggle: {
     minHeight: 30,
     flexDirection: "row",

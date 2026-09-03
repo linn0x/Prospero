@@ -22,12 +22,17 @@ import { array, displayError, number, record, text } from "./state";
 import { useLocale } from "./locale";
 import {
   CHAT_TIMELINE_WINDOW_SIZE,
+  MAX_CHAT_DRAFT_LENGTH,
   ChatEventAccumulator,
   collapseChatEventHistory,
   getChatPollReconnectDelay,
   getChatTimelineItemWindow,
   hasChatResolution,
   isChatViewportNearEnd,
+  limitChatDraftText,
+  loadChatDraft,
+  mergeFailedChatDraft,
+  persistChatDraft,
   updateChatHistoryCursorFromScroll,
   type ChatHistoryCursor,
   type ChatTimelineItem,
@@ -123,6 +128,7 @@ const TimelineItem = memo(function TimelineItem({ item, ...props }: TimelineItem
 });
 
 type PendingAttachment = { id: string; name: string; mimeType: string; dataB64: string };
+type ChatDraftState = { sessionId: string; text: string };
 async function fileToAttachment(file: File): Promise<PendingAttachment> {
   const bytes = new Uint8Array(await file.arrayBuffer()); let binary = "";
   for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
@@ -136,7 +142,18 @@ export function ChatPane({ session, onOpenGoal }: { session: SessionInfo; onOpen
   const [historyCursor, setHistoryCursor] = useState<ChatHistoryCursor | null>(null); const historyCursorRef = useRef<ChatHistoryCursor | null>(null);
   const timelineEndRef = useRef(0); timelineEndRef.current = timeline.nextOrdinal;
   const timelineViewport = useRef<HTMLDivElement | null>(null); const jumpToLatestRef = useRef(false);
-  const [draft, setDraft] = useState(""); const [sending, setSending] = useState(false); const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
+  const [draftState, setDraftState] = useState<ChatDraftState>(() => ({ sessionId: session.id, text: loadChatDraft(session.id) }));
+  const draftRef = useRef(draftState); draftRef.current = draftState;
+  const draft = draftState.sessionId === session.id ? draftState.text : "";
+  const setDraft = useCallback((next: string | ((current: string) => string)): void => {
+    const current = draftRef.current.sessionId === session.id ? draftRef.current.text : "";
+    const value = limitChatDraftText(typeof next === "function" ? next(current) : next);
+    const state = { sessionId: session.id, text: value };
+    draftRef.current = state;
+    setDraftState(state);
+  }, [session.id]);
+  const sendingDraftRef = useRef<ChatDraftState | undefined>(undefined);
+  const [sending, setSending] = useState(false); const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [skills, setSkills] = useState<SkillSuggestion[]>([]); const [modes, setModes] = useState<AgentModeCatalog>(); const [modeBusy, setModeBusy] = useState(false);
   const [error, setError] = useState<string>(); const [detail, setDetail] = useState<{ title: string; content: string; loading?: boolean }>(); const fileInput = useRef<HTMLInputElement>(null);
   const historyWindow = useMemo(() => getChatTimelineItemWindow(timeline.items, timeline.nextOrdinal, historyCursor?.end ?? null), [historyCursor, timeline]);
@@ -160,6 +177,27 @@ export function ChatPane({ session, onOpenGoal }: { session: SessionInfo; onOpen
     });
     return () => window.cancelAnimationFrame(frame);
   }, [historyCursor]);
+  useEffect(() => {
+    const current = draftRef.current;
+    if (current.sessionId === session.id) return;
+    persistChatDraft(current.sessionId, current.text);
+    const next = { sessionId: session.id, text: loadChatDraft(session.id) };
+    draftRef.current = next;
+    setDraftState(next);
+  }, [session.id]);
+  useEffect(() => {
+    if (draftState.sessionId !== session.id || sending) return;
+    const timer = window.setTimeout(() => persistChatDraft(session.id, draftState.text), 180);
+    return () => window.clearTimeout(timer);
+  }, [draftState, sending, session.id]);
+  useEffect(() => () => {
+    const current = draftRef.current;
+    const pending = sendingDraftRef.current;
+    persistChatDraft(
+      current.sessionId,
+      current.text || (pending?.sessionId === current.sessionId ? pending.text : ""),
+    );
+  }, []);
   useEffect(() => { setTimeline(accumulator.current!.reset([])); cursor.current = undefined; jumpToLatestRef.current = false; selectHistoryCursor(null); setAttachments([]); setSkills([]); void window.prospero.getAgentModes(session.id).then(setModes).catch(() => setModes(undefined)); }, [selectHistoryCursor, session.id]);
   useEffect(() => { const match = draft.match(/(?:^|\s)\$([^\s]*)$/); if (!match) { setSkills([]); return; } const timer = window.setTimeout(() => void window.prospero.getSkillSuggestions(session.id, match[1] ?? "").then(setSkills).catch(() => setSkills([])), 160); return () => window.clearTimeout(timer); }, [draft, session.id]);
   useEffect(() => {
@@ -167,8 +205,30 @@ export function ChatPane({ session, onOpenGoal }: { session: SessionInfo; onOpen
     const poll = async (): Promise<void> => { let nextDelay = 25; const startedAt = performance.now(); try { const frame = await window.prospero.getSessionView(session.id, cursor.current === undefined ? {} : { afterSeq: cursor.current, waitMs: 20_000 }); if (!active) return; nextDelay = getChatPollReconnectDelay(Boolean(frame), performance.now() - startedAt); if (frame) { const incoming = array(frame.events).map(record); if (text(frame.mode) === "delta") { const next = accumulator.current!.append(incoming); if (next) setTimeline(next); } else { setTimeline(accumulator.current!.reset(incoming)); jumpToLatestRef.current = false; selectHistoryCursor(null); } cursor.current = number(frame.evSeq, number(frame.seq)); setError(undefined); } else if (pollFailed) setError(undefined); pollFailed = false; errorDelay = 1_000; } catch (reason) { if (active) setError(displayError(reason)); pollFailed = true; nextDelay = errorDelay; errorDelay = Math.min(8_000, errorDelay * 2); } if (active) timer = window.setTimeout(() => void poll(), nextDelay); };
     void poll(); return () => { active = false; if (timer !== undefined) window.clearTimeout(timer); };
   }, [selectHistoryCursor, session.id]);
-  const send = async (): Promise<void> => { const value = draft.trim(); if ((!value && !attachments.length) || sending) return; setSending(true); setDraft(""); const queued = attachments; setAttachments([]); try { await window.prospero.interact(session.id, { type: "chat.send", text: value, attachments: queued.map(({ name, mimeType, dataB64 }) => ({ name, mimeType, dataB64 })) }); setError(undefined); } catch (reason) { setDraft(value); setAttachments(queued); setError(displayError(reason)); } finally { setSending(false); } };
-  const attach = async (files: FileList | null): Promise<void> => { if (!files) return; const accepted = [...files].filter((file) => ["image/jpeg", "image/png", "image/gif", "image/webp"].includes(file.type)); if (attachments.length + accepted.length > 6) { setError(t("每条消息最多上传 6 张图片", "You can upload up to 6 images per message")); return; } const oversized = accepted.find((file) => file.size > 6 * 1024 * 1024); if (oversized) { setError(`${oversized.name} ${t("超过 6 MB", "exceeds 6 MB")}`); return; } try { const converted = await Promise.all(accepted.map(fileToAttachment)); setAttachments((current) => [...current, ...converted]); } catch (reason) { setError(displayError(reason)); } if (fileInput.current) fileInput.current.value = ""; };
+  const send = async (): Promise<void> => {
+    const value = draft.trim();
+    if ((!value && !attachments.length) || sending) return;
+    setSending(true);
+    sendingDraftRef.current = { sessionId: session.id, text: draft };
+    setDraft("");
+    const queued = attachments;
+    setAttachments([]);
+    try {
+      await window.prospero.interact(session.id, { type: "chat.send", text: value, attachments: queued.map(({ name, mimeType, dataB64 }) => ({ name, mimeType, dataB64 })) });
+      sendingDraftRef.current = undefined;
+      persistChatDraft(session.id, draftRef.current.text);
+      setError(undefined);
+    } catch (reason) {
+      const failedDraft = sendingDraftRef.current?.text ?? value;
+      sendingDraftRef.current = undefined;
+      setDraft((current) => mergeFailedChatDraft(failedDraft, current));
+      setAttachments(queued);
+      setError(displayError(reason));
+    } finally {
+      setSending(false);
+    }
+  };
+  const attach = async (files: FileList | null): Promise<void> => { if (!files) return; if (sending) { setError(t("请等待当前消息发送完成后再添加附件", "Wait for the current message to finish sending before attaching files")); if (fileInput.current) fileInput.current.value = ""; return; } const accepted = [...files].filter((file) => ["image/jpeg", "image/png", "image/gif", "image/webp"].includes(file.type)); if (attachments.length + accepted.length > 6) { setError(t("每条消息最多上传 6 张图片", "You can upload up to 6 images per message")); return; } const oversized = accepted.find((file) => file.size > 6 * 1024 * 1024); if (oversized) { setError(`${oversized.name} ${t("超过 6 MB", "exceeds 6 MB")}`); return; } try { const converted = await Promise.all(accepted.map(fileToAttachment)); setAttachments((current) => [...current, ...converted]); } catch (reason) { setError(displayError(reason)); } if (fileInput.current) fileInput.current.value = ""; };
   const chooseSkill = (skill: SkillSuggestion): void => { setDraft((current) => current.replace(/(?:^|\s)\$[^\s]*$/, (match) => `${match.startsWith(" ") ? " " : ""}$${skill.value} `)); setSkills([]); };
   const setMode = async (mode: string): Promise<void> => { setModeBusy(true); try { const result = await window.prospero.setAgentMode(session.id, mode); setModes((current) => current ? { ...current, currentMode: result.currentMode } : current); } catch (reason) { setError(displayError(reason)); } finally { setModeBusy(false); } };
   const openOutput = useCallback(async (id: string, tool: string): Promise<void> => { setDetail({ title: `${tool} · ${t("完整输出", "Full output")}`, content: "", loading: true }); try { const result = await window.prospero.getToolOutput(session.id, id); setDetail({ title: `${tool} · ${t("完整输出", "Full output")}`, content: text(result.output, t("（无输出）", "(No output)")) }); } catch (reason) { setDetail(undefined); setError(displayError(reason)); } }, [session.id, t]);
@@ -176,7 +236,7 @@ export function ChatPane({ session, onOpenGoal }: { session: SessionInfo; onOpen
   return <div className="flex size-full min-h-0 flex-col bg-background">
     <MessageScrollerProvider autoScroll><MessageScroller><MessageScrollerViewport ref={timelineViewport} onScroll={handleTimelineScroll} aria-label={t("会话消息时间线", "Conversation message timeline")}><MessageScrollerContent className="mx-auto w-full max-w-4xl px-6 py-8">{!timeline.items.length && <Empty className="my-auto"><EmptyHeader><EmptyMedia variant="icon"><Bot /></EmptyMedia><EmptyTitle>{t("开始与", "Start collaborating with")} {session.agent}</EmptyTitle><EmptyDescription>{t("消息、工具调用、审批、提问和子 Agent 过程会按时间线显示在这里。", "Messages, tool calls, approvals, questions, and subagent activity appear here in a timeline.")}</EmptyDescription></EmptyHeader></Empty>}{historyWindow.start > 0 && <div className="flex justify-center"><Button variant="outline" size="sm" onClick={() => selectHistoryCursor({ end: historyWindow.cursorStart, mode: "page" })}><ChevronDown className="rotate-180" data-icon="inline-start" />{t(`查看更早的 ${String(Math.min(CHAT_TIMELINE_WINDOW_SIZE, historyWindow.start))} 条记录`, `View ${String(Math.min(CHAT_TIMELINE_WINDOW_SIZE, historyWindow.start))} earlier events`)}</Button></div>}{visibleItems.map((item) => { const kind = text(item.event.kind); const isResolved = kind === "permission.request" ? hasChatResolution(timeline.resolutions, "permission.resolved", text(item.event.reqId)) : kind === "question.request" ? hasChatResolution(timeline.resolutions, "question.resolved", text(item.event.reqId)) : false; return <TimelineItem key={item.key} item={item} isResolved={isResolved} sessionId={session.id} onError={setError} openOutput={openOutput} openSubagent={openSubagent} />; })}{!historyWindow.isLatest && <div className="flex flex-wrap items-center justify-center gap-2 rounded-lg border bg-muted/40 p-3 text-sm text-muted-foreground"><span>{t(`当前显示 ${String(historyWindow.start + 1)}–${String(historyWindow.end)}，另有 ${String(historyWindow.newerCount)} 条较新记录`, `Showing ${String(historyWindow.start + 1)}–${String(historyWindow.end)} with ${String(historyWindow.newerCount)} newer events`)}</span><Button variant="outline" size="sm" onClick={() => { const nextEnd = Math.min(timeline.items.length, historyWindow.end + CHAT_TIMELINE_WINDOW_SIZE); if (nextEnd >= timeline.items.length) jumpToLatest(); else selectHistoryCursor({ end: timeline.items[nextEnd]?.ordinal ?? timeline.nextOrdinal, mode: "page" }); }}>{t("查看较新记录", "View newer events")}<ChevronDown data-icon="inline-end" /></Button><Button size="sm" onClick={jumpToLatest}>{t("回到最新", "Jump to latest")}</Button></div>}</MessageScrollerContent></MessageScrollerViewport><MessageScrollerButton /></MessageScroller></MessageScrollerProvider>
     <div className="border-t bg-background/95 px-4 py-3 backdrop-blur"><div className="mx-auto flex max-w-4xl flex-col gap-2">{error && <Alert variant="destructive"><CircleAlert /><AlertTitle>{t("会话操作失败", "Session action failed")}</AlertTitle><AlertDescription>{error}</AlertDescription></Alert>}{attachments.length > 0 && <AttachmentGroup>{attachments.map((item) => <Attachment state="idle" size="sm" key={item.id}><AttachmentMedia><FileImage /></AttachmentMedia><AttachmentContent><AttachmentTitle>{item.name}</AttachmentTitle><AttachmentDescription>{t("图片 · 等待发送", "Image · waiting to send")}</AttachmentDescription></AttachmentContent><AttachmentActions><AttachmentAction aria-label={`${t("移除", "Remove")} ${item.name}`} onClick={() => setAttachments((current) => current.filter((entry) => entry.id !== item.id))}><X /></AttachmentAction></AttachmentActions></Attachment>)}</AttachmentGroup>}
-      <InputGroup className="h-auto rounded-xl bg-card shadow-sm"><InputGroupTextarea value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} placeholder={t("发送消息；输入 $ 加载 Skill…", "Send a message; type $ to load a skill…")} rows={3} className="min-h-20" />{skills.length > 0 && <div className="absolute inset-x-2 bottom-full mb-2 flex max-h-56 flex-col gap-1 overflow-auto rounded-xl border bg-popover p-1 shadow-xl">{skills.map((skill) => <Button variant="ghost" className="h-auto justify-start" key={skill.value} onMouseDown={(event) => { event.preventDefault(); chooseSkill(skill); }}><span className="flex min-w-0 flex-col items-start gap-0.5"><strong>${skill.label ?? skill.value}</strong>{skill.detail && <small className="text-muted-foreground">{skill.detail}</small>}</span></Button>)}</div>}<InputGroupAddon align="block-end" className="justify-between gap-2 border-t"><div className="flex min-w-0 items-center gap-2">{modes && <ToggleGroup value={modes.currentMode ? [modes.currentMode] : []} onValueChange={(values) => values[0] && void setMode(values[0])} disabled={modeBusy} variant="outline" size="sm">{modes.modes.map((mode) => <ToggleGroupItem key={mode.id} value={mode.id} title={mode.description}>{mode.id === "plan" ? <ListChecks /> : <Bot />}{mode.label}</ToggleGroupItem>)}</ToggleGroup>}{onOpenGoal && <Button variant="outline" size="sm" onClick={onOpenGoal}><Target data-icon="inline-start" />{t("目标", "Goal")}</Button>}<InputGroupButton size="sm" title={t("上传图片", "Upload images")} onClick={() => fileInput.current?.click()}><Paperclip data-icon="inline-start" />{t("附件", "Attach")}</InputGroupButton><input ref={fileInput} hidden type="file" multiple accept="image/jpeg,image/png,image/gif,image/webp" onChange={(event) => void attach(event.target.files)} /></div><Button onClick={() => void send()} disabled={(!draft.trim() && !attachments.length) || sending}>{sending ? <Spinner data-icon="inline-start" /> : <Send data-icon="inline-start" />}{sending ? t("发送中", "Sending") : t("发送", "Send")}</Button></InputGroupAddon></InputGroup><p className="text-center text-xs text-muted-foreground">{t("Enter 发送 · Shift + Enter 换行 · 最多 6 张图片", "Enter to send · Shift + Enter for a new line · Up to 6 images")}</p></div></div>
+      <InputGroup className="h-auto rounded-xl bg-card shadow-sm"><InputGroupTextarea value={draft} maxLength={MAX_CHAT_DRAFT_LENGTH} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} placeholder={t("发送消息；输入 $ 加载 Skill…", "Send a message; type $ to load a skill…")} rows={3} className="min-h-20" />{skills.length > 0 && <div className="absolute inset-x-2 bottom-full mb-2 flex max-h-56 flex-col gap-1 overflow-auto rounded-xl border bg-popover p-1 shadow-xl">{skills.map((skill) => <Button variant="ghost" className="h-auto justify-start" key={skill.value} onMouseDown={(event) => { event.preventDefault(); chooseSkill(skill); }}><span className="flex min-w-0 flex-col items-start gap-0.5"><strong>${skill.label ?? skill.value}</strong>{skill.detail && <small className="text-muted-foreground">{skill.detail}</small>}</span></Button>)}</div>}<InputGroupAddon align="block-end" className="justify-between gap-2 border-t"><div className="flex min-w-0 items-center gap-2">{modes && <ToggleGroup value={modes.currentMode ? [modes.currentMode] : []} onValueChange={(values) => values[0] && void setMode(values[0])} disabled={modeBusy} variant="outline" size="sm">{modes.modes.map((mode) => <ToggleGroupItem key={mode.id} value={mode.id} title={mode.description}>{mode.id === "plan" ? <ListChecks /> : <Bot />}{mode.label}</ToggleGroupItem>)}</ToggleGroup>}{onOpenGoal && <Button variant="outline" size="sm" onClick={onOpenGoal}><Target data-icon="inline-start" />{t("目标", "Goal")}</Button>}<InputGroupButton size="sm" disabled={sending} title={t("上传图片", "Upload images")} onClick={() => fileInput.current?.click()}><Paperclip data-icon="inline-start" />{t("附件", "Attach")}</InputGroupButton><input ref={fileInput} hidden type="file" multiple accept="image/jpeg,image/png,image/gif,image/webp" onChange={(event) => void attach(event.target.files)} /></div><Button onClick={() => void send()} disabled={(!draft.trim() && !attachments.length) || sending}>{sending ? <Spinner data-icon="inline-start" /> : <Send data-icon="inline-start" />}{sending ? t("发送中", "Sending") : t("发送", "Send")}</Button></InputGroupAddon></InputGroup><p className="text-center text-xs text-muted-foreground">{t("Enter 发送 · Shift + Enter 换行 · 最多 6 张图片", "Enter to send · Shift + Enter for a new line · Up to 6 images")}</p></div></div>
     <Dialog open={Boolean(detail)} onOpenChange={(open) => { if (!open) setDetail(undefined); }}><DialogContent className="sm:max-w-3xl"><DialogHeader><DialogTitle>{detail?.title}</DialogTitle><DialogDescription>{t("内容按需从本机 daemon 读取，不会进入渲染进程持久存储。", "Content is read from the local daemon on demand and is not persisted by the renderer.")}</DialogDescription></DialogHeader>{detail?.loading ? <div className="flex items-center justify-center gap-2 py-16 text-muted-foreground"><Spinner />{t("正在读取…", "Loading…")}</div> : <pre className="max-h-[60vh] overflow-auto rounded-lg bg-muted p-4 text-xs leading-relaxed">{detail?.content}</pre>}<DialogFooter><Button variant="outline" onClick={() => setDetail(undefined)}>{t("关闭", "Close")}</Button></DialogFooter></DialogContent></Dialog>
   </div>;
 }
