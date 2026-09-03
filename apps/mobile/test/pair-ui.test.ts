@@ -37,4 +37,18 @@ describe("配对页错误提示", () => {
     expect(screen).toContain("const notice = pairingErrorNotice(e);");
     expect(screen).toContain("Alert.alert(notice.title, notice.message);");
   });
+
+  it("为 iOS 权限恢复、剪贴板和 Liquid Glass 提供安全降级", () => {
+    const screen = readFileSync(
+      join(import.meta.dirname, "..", "src", "app", "pair.tsx"),
+      "utf8",
+    );
+
+    expect(screen).toContain("Linking.openSettings()");
+    expect(screen).toContain("Clipboard.getStringAsync()");
+    expect(screen).toContain("isLiquidGlassAvailable() && isGlassEffectAPIAvailable()");
+    expect(screen).toContain("AccessibilityInfo.isReduceTransparencyEnabled()");
+    expect(screen).toContain('permission?.canAskAgain === false ? "打开系统设置"');
+    expect(screen).toContain('disabled={!manual.trim() || pairing}');
+  });
 });

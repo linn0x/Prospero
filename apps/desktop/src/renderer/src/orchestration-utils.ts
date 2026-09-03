@@ -9,6 +9,9 @@ const URGENT_WORKTREE_STATES = new Set([
   "failed",
   "unmerged",
 ]);
+const COMPLETED_TASK_STATES = new Set(["done", "completed", "succeeded"]);
+
+export type TaskBoardColumnId = "queued" | "ready" | "running" | "review" | "done";
 
 function valueText(value: unknown): string {
   return typeof value === "string" ? value.toLocaleLowerCase() : "";
@@ -46,4 +49,34 @@ export function prioritizeWorktrees(assets: JsonObject[]): JsonObject[] {
     const leftUpdatedAt = timestamp(left["updatedAt"] ?? left["createdAt"]);
     return rightUpdatedAt - leftUpdatedAt;
   });
+}
+
+export function deriveTaskBoardStates(tasks: JsonObject[]): Map<string, TaskBoardColumnId> {
+  const completed = new Set(
+    tasks
+      .filter((task) => COMPLETED_TASK_STATES.has(valueText(task["status"])))
+      .map((task) => String(task["id"] ?? ""))
+      .filter(Boolean),
+  );
+  const states = new Map<string, TaskBoardColumnId>();
+  for (const task of tasks) {
+    const id = String(task["id"] ?? "");
+    const status = valueText(task["status"]);
+    if (!id) continue;
+    if (status === "pending") {
+      const deps = Array.isArray(task["deps"])
+        ? task["deps"].map(String)
+        : [];
+      states.set(id, deps.every((dependency) => completed.has(dependency)) ? "ready" : "queued");
+    } else if (status === "ready") {
+      states.set(id, "ready");
+    } else if (["dispatched", "running", "starting"].includes(status)) {
+      states.set(id, "running");
+    } else if (["blocked", "failed", "waiting_approval"].includes(status)) {
+      states.set(id, "review");
+    } else if (COMPLETED_TASK_STATES.has(status) || status === "cancelled") {
+      states.set(id, "done");
+    }
+  }
+  return states;
 }

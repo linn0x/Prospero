@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { JsonObject } from "../src/shared/types";
-import { prioritizeWorktrees, worktreeNeedsAttention } from "../src/renderer/src/orchestration-utils";
+import { deriveTaskBoardStates, prioritizeWorktrees, worktreeNeedsAttention } from "../src/renderer/src/orchestration-utils";
 
 function asset(id: string, state: string, inspectionState?: string, updatedAt = 0): JsonObject {
   return {
@@ -32,5 +32,33 @@ describe("orchestration worktree presentation", () => {
       "cleaned",
       "missing",
     ]);
+  });
+});
+
+describe("orchestration task board presentation", () => {
+  it("derives ready only after every dependency is done", () => {
+    const states = deriveTaskBoardStates([
+      { id: "done", status: "done", deps: [] },
+      { id: "ready", status: "pending", deps: ["done"] },
+      { id: "queued", status: "pending", deps: ["ready"] },
+      { id: "missing", status: "pending", deps: ["unknown"] },
+    ]);
+
+    expect(Object.fromEntries(states)).toEqual({
+      done: "done",
+      ready: "ready",
+      queued: "queued",
+      missing: "queued",
+    });
+  });
+
+  it("keeps blocked tasks in review instead of making them launchable", () => {
+    const states = deriveTaskBoardStates([
+      { id: "blocked", status: "blocked", deps: [] },
+      { id: "failed", status: "failed", deps: [] },
+    ]);
+
+    expect(states.get("blocked")).toBe("review");
+    expect(states.get("failed")).toBe("review");
   });
 });

@@ -27,6 +27,10 @@ type TerminalShortcutEvent = Pick<KeyboardEvent, "type" | "code" | "metaKey" | "
   key?: string;
 };
 
+type TerminalInteraction =
+  | { type: "term.input"; dataB64: string }
+  | { type: "term.resize"; cols: number; rows: number };
+
 export type TerminalShortcutAction =
   | "copy"
   | "paste"
@@ -94,6 +98,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
   const writeChain = useRef(Promise.resolve());
   const interactionChain = useRef(Promise.resolve());
   const replayingRef = useRef(false);
+  const connectedRef = useRef(false);
   const [error, setError] = useState<string>();
   const [connected, setConnected] = useState(false);
   const [notice, setNotice] = useState<string>();
@@ -102,6 +107,17 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
   const [findText, setFindText] = useState("");
   const findInputRef = useRef<HTMLInputElement>(null);
   const noticeTimerRef = useRef<number | undefined>(undefined);
+  const queueInteraction = useCallback((message: TerminalInteraction): void => {
+    interactionChain.current = interactionChain.current
+      .then(() => connectedRef.current ? window.prospero.interact(session.id, message) : undefined)
+      .catch((reason) => {
+        connectedRef.current = false;
+        cursorRef.current = undefined;
+        if (terminalRef.current) terminalRef.current.options.disableStdin = true;
+        setConnected(false);
+        setError(displayError(reason));
+      });
+  }, [session.id]);
   /// 提示统一走这里:直接 setNotice 的话没有定时清除,那条提示会一直挂在屏幕上。
   const showNotice = useCallback((message: string): void => {
     setNotice(message);
@@ -113,6 +129,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
     if (!host.current) return;
     const terminal = new Terminal({
       allowProposedApi: true,
+      disableStdin: true,
       cursorBlink: true,
       cursorStyle: "bar",
       cursorWidth: 2,
@@ -171,15 +188,8 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
     let input = "";
     let inputTimer: number | undefined;
     let bellTimer: number | undefined;
-    const queueInteraction = (
-      message: { type: "term.input"; dataB64: string } | { type: "term.resize"; cols: number; rows: number },
-    ): void => {
-      interactionChain.current = interactionChain.current
-        .then(() => window.prospero.interact(session.id, message))
-        .catch((reason) => setError(displayError(reason)));
-    };
     const queueInputText = (value: string): void => {
-      if (value) queueInteraction({ type: "term.input", dataB64: toBase64(value) });
+      if (value && connectedRef.current) queueInteraction({ type: "term.input", dataB64: toBase64(value) });
     };
     const flushInput = (): void => {
       if (!input) return;
@@ -188,7 +198,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
       queueInputText(payload);
     };
     const inputDisposable = terminal.onData((value) => {
-      if (replayingRef.current) return;
+      if (replayingRef.current || !connectedRef.current) return;
       input += value;
       window.clearTimeout(inputTimer);
       inputTimer = window.setTimeout(flushInput, 4);
@@ -264,7 +274,9 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
       window.clearTimeout(resizeTimer);
       resizeTimer = window.setTimeout(() => {
         fit.fit();
-        queueInteraction({ type: "term.resize", cols: terminal.cols, rows: terminal.rows });
+        if (connectedRef.current) {
+          queueInteraction({ type: "term.resize", cols: terminal.cols, rows: terminal.rows });
+        }
       }, 80);
     });
     resize.observe(host.current);
@@ -280,25 +292,37 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
       osc52Disposable.dispose();
       bellDisposable.dispose();
       terminal.dispose();
+      connectedRef.current = false;
       terminalRef.current = undefined;
       fitRef.current = undefined;
       cursorRef.current = undefined;
     };
-  }, [isMac, session.id, showNotice]);
+  }, [isMac, queueInteraction, showNotice]);
 
   useEffect(() => {
     const terminal = terminalRef.current;
     if (!terminal) return;
+    let active = true;
     terminal.options.fontFamily = fontFamily;
     terminal.options.fontSize = fontSize;
-    const fit = (): void => fitRef.current?.fit();
+    const fit = (): void => {
+      if (!active) return;
+      fitRef.current?.fit();
+      const current = terminalRef.current;
+      if (current && connectedRef.current) {
+        queueInteraction({ type: "term.resize", cols: current.cols, rows: current.rows });
+      }
+    };
     const requestedFont = fontFamily.trim();
     if (requestedFont && document.fonts?.load) {
       void document.fonts
         .load(`${String(fontSize)}px ${requestedFont.split(",")[0] ?? requestedFont}`)
         .then(fit, fit);
     } else fit();
-  }, [fontFamily, fontSize]);
+    return () => {
+      active = false;
+    };
+  }, [fontFamily, fontSize, queueInteraction]);
 
   useEffect(() => {
     let active = true;
@@ -331,10 +355,21 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
           }
           await writeChain.current;
           cursorRef.current = seq;
+          connectedRef.current = true;
+          const current = terminalRef.current;
+          if (current) {
+            current.options.disableStdin = false;
+            if (mode !== "delta") {
+              fitRef.current?.fit();
+              queueInteraction({ type: "term.resize", cols: current.cols, rows: current.rows });
+            }
+          }
           setConnected(true);
           setError(undefined);
         } catch (reason) {
           if (!active) break;
+          connectedRef.current = false;
+          if (terminalRef.current) terminalRef.current.options.disableStdin = true;
           setConnected(false);
           setError(displayError(reason));
           cursorRef.current = undefined;
@@ -343,8 +378,12 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
       }
     };
     void poll();
-    return () => { active = false; };
-  }, [session.id, t]);
+    return () => {
+      active = false;
+      connectedRef.current = false;
+      if (terminalRef.current) terminalRef.current.options.disableStdin = true;
+    };
+  }, [queueInteraction, session.id, t]);
 
   const runFind = (backwards: boolean): void => {
     const value = findText.trim();

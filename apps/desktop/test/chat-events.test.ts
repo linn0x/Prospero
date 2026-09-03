@@ -2,6 +2,10 @@ import { describe, expect, it } from "vitest";
 import type { JsonObject } from "../src/shared/types";
 import {
   CHAT_TIMELINE_WINDOW_SIZE,
+  CHAT_DRAFT_STORAGE_KEY,
+  CHAT_DRAFT_TTL_MS,
+  MAX_CHAT_DRAFT_LENGTH,
+  MAX_CHAT_DRAFTS,
   MAX_RETAINED_CHAT_ITEMS,
   ChatEventAccumulator,
   collapseChatEventHistory,
@@ -10,8 +14,99 @@ import {
   getChatTimelineWindow,
   hasChatResolution,
   isChatViewportNearEnd,
+  limitChatDraftText,
+  loadChatDraft,
+  mergeFailedChatDraft,
+  parseChatDraftEntries,
+  persistChatDraft,
+  updateChatDraftEntries,
   updateChatHistoryCursorFromScroll,
 } from "../src/renderer/src/chat-events";
+
+function memoryStorage(initial?: string) {
+  const values = new Map<string, string>();
+  if (initial !== undefined) values.set(CHAT_DRAFT_STORAGE_KEY, initial);
+  return {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => { values.set(key, value); },
+    removeItem: (key: string) => { values.delete(key); },
+  };
+}
+
+describe("Electron chat drafts", () => {
+  it("normalizes corrupt, duplicate, oversized, and excessive entries", () => {
+    const entries = Array.from({ length: MAX_CHAT_DRAFTS + 5 }, (_, index) => ({
+      sessionId: `session-${String(index)}`,
+      text: index === 0 ? "x".repeat(MAX_CHAT_DRAFT_LENGTH + 5) : `draft-${String(index)}`,
+      updatedAt: index === 0 ? 9_000 : index,
+    }));
+    entries.push({ sessionId: "session-1", text: "newest", updatedAt: 10_000 });
+    const parsed = parseChatDraftEntries(JSON.stringify([...entries, null, { sessionId: "bad" }]), 10_000);
+
+    expect(parsed).toHaveLength(MAX_CHAT_DRAFTS);
+    expect(parsed[0]).toMatchObject({ sessionId: "session-1", text: "newest" });
+    expect(parsed.find((entry) => entry.sessionId === "session-0")?.text).toHaveLength(MAX_CHAT_DRAFT_LENGTH);
+    expect(parseChatDraftEntries("{", 10_000)).toEqual([]);
+  });
+
+  it("updates drafts by session, preserves whitespace, and removes empty drafts", () => {
+    const first = updateChatDraftEntries([], "a", "  draft  ", 1);
+    const second = updateChatDraftEntries(first, "b", "other", 2);
+    const replaced = updateChatDraftEntries(second, "a", "new", 3);
+
+    expect(replaced.map((entry) => entry.sessionId)).toEqual(["a", "b"]);
+    expect(updateChatDraftEntries(first, "a", "", 2)).toEqual([]);
+    expect(first[0]?.text).toBe("  draft  ");
+    expect(limitChatDraftText("x".repeat(MAX_CHAT_DRAFT_LENGTH + 1))).toHaveLength(MAX_CHAT_DRAFT_LENGTH);
+  });
+
+  it("persists independent session drafts and clears only the sent session", () => {
+    const storage = memoryStorage();
+
+    expect(persistChatDraft("a", "alpha", storage, 1)).toBe(true);
+    expect(persistChatDraft("b", "beta", storage, 2)).toBe(true);
+    expect(loadChatDraft("a", storage, 2)).toBe("alpha");
+    expect(loadChatDraft("b", storage, 2)).toBe("beta");
+    expect(persistChatDraft("a", "", storage, 3)).toBe(true);
+    expect(loadChatDraft("a", storage, 3)).toBe("");
+    expect(loadChatDraft("b", storage, 3)).toBe("beta");
+  });
+
+  it("expires old drafts and preserves text typed during a failed send", () => {
+    const now = CHAT_DRAFT_TTL_MS + 100;
+    const raw = JSON.stringify([
+      { sessionId: "expired", text: "old", updatedAt: 1 },
+      { sessionId: "fresh", text: "new", updatedAt: now - 1 },
+    ]);
+    const parsed = parseChatDraftEntries(raw, now);
+    const storage = memoryStorage(raw);
+
+    expect(parsed.map((entry) => entry.sessionId)).toEqual(["fresh"]);
+    expect(loadChatDraft("fresh", storage, now)).toBe("new");
+    expect(JSON.parse(storage.getItem(CHAT_DRAFT_STORAGE_KEY) ?? "[]")).toEqual([
+      { sessionId: "fresh", text: "new", updatedAt: now - 1 },
+    ]);
+    expect(mergeFailedChatDraft("failed message", "new draft")).toBe("failed message\nnew draft");
+    expect(mergeFailedChatDraft("failed message", "x".repeat(MAX_CHAT_DRAFT_LENGTH))).toBe("x".repeat(MAX_CHAT_DRAFT_LENGTH));
+  });
+
+  it("degrades safely when storage access fails", () => {
+    const readBlocked = {
+      getItem: () => { throw new Error("blocked"); },
+      setItem: () => { throw new Error("blocked"); },
+      removeItem: () => { throw new Error("blocked"); },
+    };
+    const writeBlocked = {
+      getItem: () => null,
+      setItem: () => { throw new Error("full"); },
+      removeItem: () => {},
+    };
+
+    expect(loadChatDraft("a", readBlocked)).toBe("");
+    expect(persistChatDraft("a", "draft", readBlocked)).toBe(false);
+    expect(persistChatDraft("a", "draft", writeBlocked)).toBe(false);
+  });
+});
 
 describe("Electron chat event accumulator", () => {
   it("folds initial history and incrementally updates only the affected render items", () => {

@@ -4,6 +4,15 @@ export const EXPANDED_PROJECTS_STORAGE_KEY =
   "prospero.workspace.expandedProjects";
 export const SIDEBAR_SESSION_PREVIEW_LIMIT = 6;
 export const SIDEBAR_SESSION_PAGE_SIZE = 24;
+export const SIDEBAR_COLLAPSE_WIDTH = 1_080;
+export const SIDEBAR_EXPAND_WIDTH = 1_320;
+
+export function adaptiveSidebarOpen(width: number, current: boolean): boolean {
+  if (!Number.isFinite(width)) return current;
+  if (width <= SIDEBAR_COLLAPSE_WIDTH) return false;
+  if (width >= SIDEBAR_EXPAND_WIDTH) return true;
+  return current;
+}
 
 /**
  * The sidebar, quick open, and command center must agree on what a session
