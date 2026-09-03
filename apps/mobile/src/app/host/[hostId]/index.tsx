@@ -151,6 +151,7 @@ export default function HostScreen() {
   const [banner, setBanner] = useState<string | null>(null);
   const [filter, setFilter] = useState<"all" | AgentKind>("all");
   const [composing, setComposing] = useState(false);
+  const [toolsOpen, setToolsOpen] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [workspacePath, setWorkspacePath] = useState("");
   const [resumeQuery, setResumeQuery] = useState("");
@@ -519,6 +520,11 @@ export default function HostScreen() {
   const runningCount = all.filter(
     (s) => s.status === "running" || s.status === "starting",
   ).length;
+  // 账号与编排都是偶尔才用一次的功能。摆在列表上方会把每次都要看的会话推下去,
+  // 收进标题栏菜单后开屏第一眼就是会话,说明文字也能在菜单里完整保留。
+  const hasHostTools = Boolean(
+    conn?.supportsAgentAccounts || conn?.supportsOrchestrationSnapshot,
+  );
   const usedAgents = useMemo(
     () => [...new Set(selectedPool.map((s) => s.agent))],
     [selectedPool],
@@ -775,20 +781,34 @@ export default function HostScreen() {
                 <Text style={styles.headerCancel}>取消</Text>
               </Pressable>
             ) : (
-              <Pressable
-                onPress={() => {
-                  setLaunchIntent("conversation");
-                  setGoal("");
-                  setSelectedResume(null);
-                  setApprovalPolicy("strict");
-                  setCreateYoloConfirmOpen(false);
-                  setCwd((current) => current.trim() || currentSessions[0]?.cwd || "");
-                  setComposing(true);
-                }}
-                hitSlop={8}
-              >
-                <Icon name="plus" size={19} color="#7aa2f7" weight="semibold" />
-              </Pressable>
+              <View style={styles.headerActions}>
+                <Pressable
+                  onPress={() => {
+                    setLaunchIntent("conversation");
+                    setGoal("");
+                    setSelectedResume(null);
+                    setApprovalPolicy("strict");
+                    setCreateYoloConfirmOpen(false);
+                    setCwd((current) => current.trim() || currentSessions[0]?.cwd || "");
+                    setComposing(true);
+                  }}
+                  hitSlop={8}
+                  accessibilityRole="button"
+                  accessibilityLabel="新建会话"
+                >
+                  <Icon name="plus" size={19} color={color.accent} weight="semibold" />
+                </Pressable>
+                {hasHostTools && (
+                  <Pressable
+                    onPress={() => setToolsOpen(true)}
+                    hitSlop={8}
+                    accessibilityRole="button"
+                    accessibilityLabel="更多主机功能"
+                  >
+                    <Icon name="ellipsis.circle" size={21} color={color.accent} />
+                  </Pressable>
+                )}
+              </View>
             ),
         }}
       />
@@ -1570,46 +1590,6 @@ export default function HostScreen() {
               sessionCount={currentSessions.length}
               runningCount={runningCount}
             />
-            {conn?.supportsAgentAccounts && (
-              <Pressable
-                style={({ pressed }) => [styles.orchestrationEntry, pressed && styles.cardPressed]}
-                onPress={() => router.push(`/host/${hostId}/accounts`)}
-                accessibilityRole="button"
-                accessibilityLabel="管理 Code Agent 账号"
-              >
-                <View style={styles.orchestrationEntryIcon}>
-                  <Icon name="square.stack.3d.up" size={19} color={color.accent} />
-                </View>
-                <View style={styles.orchestrationEntryCopy}>
-                  <Text style={styles.orchestrationEntryTitle}>Code Agent 账号</Text>
-                  <Text style={styles.orchestrationEntryDetail}>
-                    Codex 与 Claude Code 独立登录环境，可共享同一项目目录
-                  </Text>
-                </View>
-                <Icon name="chevron.right" size={13} color={color.textFaint} />
-              </Pressable>
-            )}
-            {conn?.supportsOrchestrationSnapshot && (
-              <Pressable
-                style={({ pressed }) => [styles.orchestrationEntry, pressed && styles.cardPressed]}
-                onPress={() => router.push(`/host/${hostId}/orchestration`)}
-                accessibilityRole="button"
-                accessibilityLabel="打开 Agent 编排中心"
-              >
-                <View style={styles.orchestrationEntryIcon}>
-                  <Icon name="point.3.connected.trianglepath.dotted" size={19} color={color.accent} />
-                </View>
-                <View style={styles.orchestrationEntryCopy}>
-                  <Text style={styles.orchestrationEntryTitle}>Agent 编排</Text>
-                  <Text style={styles.orchestrationEntryDetail}>
-                    {conn.supportsManualOrchestration
-                      ? "手工创建 Run、任务依赖并指定 worker"
-                      : "查看 Run、worker 与人工 Gate"}
-                  </Text>
-                </View>
-                <Icon name="chevron.right" size={13} color={color.textFaint} />
-              </Pressable>
-            )}
             <GoalRunsPanel
               snapshot={orchestration}
               hostId={hostId}
@@ -1739,6 +1719,34 @@ export default function HostScreen() {
           }}
         />
       )}
+      <Sheet visible={toolsOpen} title={host?.name ?? "主机"} onClose={() => setToolsOpen(false)}>
+        {conn?.supportsAgentAccounts && (
+          <SheetAction
+            label="Agent 账号"
+            detail="Codex 与 Claude Code 独立登录环境，可共享同一项目目录"
+            symbol="square.stack.3d.up"
+            onPress={() => {
+              setToolsOpen(false);
+              router.push(`/host/${hostId}/accounts`);
+            }}
+          />
+        )}
+        {conn?.supportsOrchestrationSnapshot && (
+          <SheetAction
+            label="Agent 编排"
+            detail={
+              conn.supportsManualOrchestration
+                ? "手工创建 Run、任务依赖并指定 worker"
+                : "查看 Run、worker 与人工 Gate"
+            }
+            symbol="point.3.connected.trianglepath.dotted"
+            onPress={() => {
+              setToolsOpen(false);
+              router.push(`/host/${hostId}/orchestration`);
+            }}
+          />
+        )}
+      </Sheet>
       <Sheet
         visible={createYoloConfirmOpen}
         title="新会话使用 YOLO？"
@@ -2163,6 +2171,7 @@ function GoalRunsPanel({
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: color.bg },
   headerTitle: { ...font.body, fontWeight: "700", textAlign: "center" },
+  headerActions: { flexDirection: "row", alignItems: "center", gap: 14 },
   headerBack: { width: 40, height: 40, alignItems: "center", justifyContent: "center" },
   headerCancel: { color: color.accent, fontSize: 15 },
   statusBar: {
@@ -2382,25 +2391,6 @@ const styles = StyleSheet.create({
     padding: space.lg,
     gap: space.md,
   },
-  orchestrationEntry: {
-    padding: space.md,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: space.md,
-    borderRadius: radius.lg,
-    backgroundColor: color.surface,
-  },
-  orchestrationEntryIcon: {
-    width: 40,
-    height: 40,
-    alignItems: "center",
-    justifyContent: "center",
-    borderRadius: radius.sm,
-    backgroundColor: color.accentBg,
-  },
-  orchestrationEntryCopy: { flex: 1, gap: 3 },
-  orchestrationEntryTitle: { ...font.body, fontWeight: "700" },
-  orchestrationEntryDetail: { ...font.meta, color: color.textDim },
   goalPanel: {
     gap: space.sm,
     padding: space.md,
