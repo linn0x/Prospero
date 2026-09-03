@@ -994,20 +994,63 @@ input:not([data-slot]), textarea:not([data-slot]), select:not([data-slot]) { bac
 
 /* Prospero Agent Work OS shell */
 .prospero-shell {
+  height: 100%;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
   background: var(--background);
 }
 .prospero-main {
-  height: 100svh;
+  height: 100%;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
   background: var(--background);
 }
+.prospero-shell [data-slot="sidebar-container"] { height: 100%; }
 .prospero-sidebar [data-slot="sidebar-inner"] { background: var(--sidebar); }
-.prospero-sidebar [data-sidebar="menu-button"] { min-height: 34px; border-radius: 8px; }
+.sidebar-shell-header {
+  -webkit-app-region: drag;
+  min-height: 56px;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px 8px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--sidebar-border) 72%, transparent);
+}
+.sidebar-shell-header button { -webkit-app-region: no-drag; }
+.sidebar-brand { display: flex; min-width: 0; align-items: center; gap: 9px; overflow: hidden; }
+.sidebar-brand-mark {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  flex: none;
+  place-items: center;
+  color: var(--primary);
+  border: 1px solid color-mix(in srgb, var(--primary) 30%, var(--sidebar-border));
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--primary) 11%, transparent);
+}
+.sidebar-brand-mark svg { width: 16px; height: 16px; }
+.sidebar-brand-copy { display: flex; min-width: 0; flex-direction: column; line-height: 1.15; }
+.sidebar-brand-copy strong { overflow: hidden; color: var(--sidebar-foreground); font-size: 12px; font-weight: 680; text-overflow: ellipsis; white-space: nowrap; }
+.sidebar-brand-copy small { overflow: hidden; margin-top: 2px; color: color-mix(in srgb, var(--sidebar-foreground) 48%, transparent); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.sidebar-header-toggle {
+  width: 30px;
+  height: 30px;
+  flex: none;
+  color: color-mix(in srgb, var(--sidebar-foreground) 72%, var(--sidebar));
+  background: color-mix(in srgb, var(--sidebar-foreground) 6%, var(--sidebar));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--sidebar-foreground) 10%, var(--sidebar));
+}
+.sidebar-header-toggle:hover { color: var(--sidebar-foreground); }
+.prospero-sidebar [data-sidebar="menu-button"] { min-height: 36px; border-radius: 9px; }
+.prospero-sidebar [data-sidebar="menu-button"][data-active] {
+  color: var(--sidebar-accent-foreground);
+  background: color-mix(in srgb, var(--sidebar-primary) 14%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--sidebar-primary) 20%, transparent);
+}
 .prospero-sidebar [data-sidebar="menu-button"][data-size="lg"] { min-height: 48px; }
 .prospero-sidebar [data-sidebar="group-label"] {
   color: color-mix(in srgb, var(--sidebar-foreground) 46%, transparent);
@@ -1026,7 +1069,7 @@ input:not([data-slot]), textarea:not([data-slot]), select:not([data-slot]) { bac
   align-items: center;
   justify-content: space-between;
   min-width: 0;
-  min-height: 44px;
+  min-height: 56px;
   gap: 14px;
   padding: 5px 152px 5px 20px;
   background: var(--background);
@@ -1037,11 +1080,10 @@ input:not([data-slot]), textarea:not([data-slot]), select:not([data-slot]) { bac
 .desktop-topbar [role="button"] { -webkit-app-region: no-drag; }
 .topbar-context,
 .topbar-actions { display: flex; align-items: center; gap: 10px; min-width: 0; }
-/* 标题与副标题并排,不再各占一行 —— 副标题是补充说明,不值得为它多要 20px,
-   而这条顶栏在每个页面都在。 */
-.topbar-context > div { display: flex; min-width: 0; align-items: baseline; gap: 8px; }
+.topbar-context > div { display: flex; min-width: 0; flex-direction: column; align-items: flex-start; gap: 1px; }
 .topbar-context strong { flex: none; font-size: 13px; font-weight: 650; letter-spacing: -.01em; }
 .topbar-context span { overflow: hidden; color: var(--muted-foreground); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.topbar-sidebar-trigger { display: none; }
 .topbar-actions { flex: none; }
 .search-trigger { min-width: 245px; justify-content: flex-start; color: var(--muted-foreground); background: color-mix(in srgb, var(--card) 72%, transparent); }
 .search-trigger span { flex: 1; text-align: left; }
@@ -1325,7 +1367,14 @@ kbd {
 .daemon-agent-row:last-child { border-bottom: 0; }
 .daemon-agent-row [data-slot="avatar"] { width: 28px; height: 28px; }
 .daemon-agent-row [data-slot="avatar-fallback"] { background: var(--muted); }
-.prospero-sidebar[data-collapsible="icon"] .sidebar-footer-actions { grid-template-columns: minmax(0, 1fr); }
+[data-collapsible="icon"] .prospero-sidebar .sidebar-shell-header { justify-content: center; padding-right: 16px; padding-left: 16px; }
+[data-collapsible="icon"] .prospero-sidebar .sidebar-brand,
+[data-collapsible="icon"] .prospero-sidebar .sidebar-detail-section { display: none; }
+[data-collapsible="icon"] .prospero-sidebar [data-sidebar="group"] { padding-right: 16px; padding-left: 16px; }
+[data-collapsible="icon"] .prospero-sidebar [data-sidebar="menu-item"] { display: flex; justify-content: center; }
+[data-collapsible="icon"] .prospero-sidebar [data-sidebar="menu-button"] { width: 40px !important; height: 40px !important; padding: 10px !important; }
+[data-collapsible="icon"] .prospero-sidebar [data-sidebar="menu-button"] > svg { width: 17px; height: 17px; }
+[data-collapsible="icon"] .prospero-sidebar .sidebar-footer-actions { grid-template-columns: minmax(0, 1fr); }
 .session-agent-icon { display: grid; width: 15px; height: 15px; flex: none; place-items: center; color: var(--muted-foreground); }
 .session-agent-icon .agent-logo { display: block; width: 15px; height: 15px; }
 .session-agent-icon .agent-logo-fallback { display: grid; place-items: center; font-size: 7px; line-height: 1; }
@@ -1707,18 +1756,8 @@ kbd {
   .run-graph-minimap { width: 126px; height: 78px; }
 }
 
-/* ---------------------------------------------------------------- macOS 窗口按钮
-   红黄绿由系统绘制在窗口左上角,浮在内容之上。侧栏头部这块布局本来是按 Windows
-   设计的(那边控件在右上角,左上角是空的),所以在 macOS 上要主动让出这段高度。
-   同时把头部整条设为可拖拽区域 —— 隐藏标题栏之后,没有它窗口就拖不动了;
-   里面的按钮再单独声明为不可拖拽,否则点不动。 */
-:root[data-platform="darwin"] [data-slot="sidebar-header"] { min-height: 64px; padding-top: 12px; padding-left: 78px; -webkit-app-region: drag; }
-:root[data-platform="darwin"] [data-slot="sidebar-header"] button,
-:root[data-platform="darwin"] [data-slot="sidebar-header"] a,
-:root[data-platform="darwin"] [data-slot="sidebar-header"] [role="button"] { -webkit-app-region: no-drag; }
-/* 收起成图标条时侧栏很窄,红黄绿会盖住整行,留的高度要更多一点。 */
-:root[data-platform="darwin"] [data-collapsible="icon"] [data-slot="sidebar-header"] { min-height: 84px; padding-top: 40px; padding-left: 12px; }
-/* 顶栏同理:窗口拖拽在这条上也要能用。 */
+:root[data-platform="darwin"] .sidebar-shell-header { min-height: 56px; padding-left: 78px; }
+:root[data-platform="darwin"] [data-collapsible="icon"] .prospero-sidebar .sidebar-shell-header { min-height: 84px; padding: 40px 16px 8px; }
 :root[data-platform="darwin"] .desktop-topbar { padding-right: 20px; -webkit-app-region: drag; }
 
 .gate-freeform-row { display: flex; flex: 1 1 280px; gap: 8px; }
@@ -1726,6 +1765,11 @@ kbd {
 :root[data-platform="darwin"] .desktop-topbar button,
 :root[data-platform="darwin"] .desktop-topbar input,
 :root[data-platform="darwin"] .desktop-topbar [role="button"] { -webkit-app-region: no-drag; }
+
+@media (max-width: 767px) {
+  .topbar-sidebar-trigger { display: inline-flex; }
+  :root[data-platform="darwin"] .desktop-topbar { padding-left: 80px; }
+}
 
 /* 运行列表的收起入口。原来它挤在右侧操作行里(保存为模板/添加任务/删除记录
    那一排),离被折叠的面板隔了大半个屏 —— 人是在被折叠的东西身上找折叠按钮的。 */
@@ -1799,10 +1843,6 @@ kbd {
   color: #9aa5ce; background: transparent; border: 0; border-radius: 5px; cursor: pointer;
 }
 .terminal-find button:hover { background: #292e42; color: #c0caf5; }
-
-/* 侧栏头部现在没有内容了,只剩两个职责:macOS 上给红黄绿让出高度,以及充当
-   窗口拖拽区。非 macOS 上没有红黄绿,给一小条高度把拖拽区留住即可。 */
-[data-slot="sidebar-header"]:empty { min-height: 10px; }
 
 /* ---------------------------------------------------------------- macOS 毛玻璃
    窗口开了 vibrancy(见主进程的 BrowserWindow 配置),但只有当上层背景是透明的

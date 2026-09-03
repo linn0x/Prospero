@@ -71,6 +71,7 @@ import { displayError, shortPath, text } from "./state";
 import { useLocale, type Language } from "./locale";
 import {
   EXPANDED_PROJECTS_STORAGE_KEY,
+  SIDEBAR_COLLAPSE_WIDTH,
   SIDEBAR_SESSION_PREVIEW_LIMIT,
   adaptiveSidebarOpen,
   filterSessionsByQuery,
@@ -199,7 +200,6 @@ import { cn } from "@/lib/utils";
 
 /** Host platform is static and controls native menu labels and shortcuts. */
 const isMac = window.prospero.platform === "darwin";
-const COMPACT_SIDEBAR_BREAKPOINT = 1200;
 const SIDEBAR_OPEN_STORAGE_KEY = "prospero.sidebarOpen";
 const SIDEBAR_PROJECT_PREVIEW_LIMIT = 24;
 const SIDEBAR_PROJECT_PAGE_SIZE = 24;
@@ -266,6 +266,7 @@ const primaryNav: NavItem[] = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
   { id: "inbox", label: "Inbox", icon: Mail },
   { id: "mobile", label: "Mobile", icon: Smartphone },
+  { id: "workspaces", label: "Workspaces", icon: FolderKanban },
   { id: "runs", label: "Runs", icon: Workflow },
 ];
 
@@ -1155,10 +1156,18 @@ function ShellSidebar({
     ));
   return (
     <Sidebar collapsible="icon" className="prospero-sidebar">
-      {/* 品牌区已去掉,但这个头部不能删:macOS 上它负责给红黄绿让出高度
-          (见 styles.css 里 data-platform="darwin" 的规则),同时它也是窗口的
-          拖拽区 —— 标题栏是隐藏的,没有它窗口就拖不动。 */}
-      <SidebarHeader className="p-0" />
+      <SidebarHeader className="sidebar-shell-header">
+        <div className="sidebar-brand">
+          <span className="sidebar-brand-mark" aria-hidden="true">
+            <Bot />
+          </span>
+          <span className="sidebar-brand-copy">
+            <strong>Prospero</strong>
+            <small>{t("Agent 工作台", "Agent workspace")}</small>
+          </span>
+        </div>
+        <SidebarTrigger className="sidebar-header-toggle" />
+      </SidebarHeader>
       <SidebarContent>
         <SidebarGroup>
           <SidebarGroupContent>
@@ -1173,8 +1182,8 @@ function ShellSidebar({
           </SidebarGroupContent>
         </SidebarGroup>
         {snapshot.pinnedSessionIds.length > 0 && <>
-          <SidebarSeparator />
-          <SidebarGroup>
+          <SidebarSeparator className="sidebar-detail-section" />
+          <SidebarGroup className="sidebar-detail-section">
             <SidebarGroupLabel>
               {t("置顶", "Pinned")}
               {snapshot.daemon.sessionSummary?.truncated && (
@@ -1228,11 +1237,11 @@ function ShellSidebar({
             </SidebarGroupContent>
           </SidebarGroup>
         </>}
-        <SidebarSeparator />
+        <SidebarSeparator className="sidebar-detail-section" />
         <Collapsible
           open={workspaceOpen}
           onOpenChange={setWorkspaceOpen}
-          className="group/workspaces"
+          className="group/workspaces sidebar-detail-section"
         >
           <SidebarGroup className="workspace-sidebar-group">
             <SidebarGroupLabel render={<CollapsibleTrigger />}>
@@ -3950,7 +3959,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   const [editingSession, setEditingSession] = useState<string>();
   const [sidebarPreference] = useState(readSidebarOpenPreference);
   const startsWithCompactSidebar =
-    window.innerWidth < COMPACT_SIDEBAR_BREAKPOINT;
+    window.innerWidth <= SIDEBAR_COLLAPSE_WIDTH;
   const [sidebarOpen, setSidebarOpen] = useState(
     () => sidebarPreference ?? !startsWithCompactSidebar,
   );
@@ -4184,7 +4193,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
       style={
         {
           "--sidebar-width": "15rem",
-          "--sidebar-width-icon": "3.5rem",
+          "--sidebar-width-icon": "4.5rem",
         } as React.CSSProperties
       }
       className="prospero-shell"
@@ -4211,7 +4220,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
           )}
         >
           <div className="topbar-context">
-            <SidebarTrigger />
+            <SidebarTrigger className="topbar-sidebar-trigger" />
             <div>
               <strong>
                 {activeSession && view === "workspaces"
