@@ -15,7 +15,7 @@ import {
   resolveProjectFileReference,
   type ProjectFileReference,
 } from "@/lib/file-references";
-import { parseMarkdown, type InlineSpan, type MdBlock } from "@/lib/markdown";
+import { parseMarkdownCached, type InlineSpan, type MdBlock } from "@/lib/markdown";
 import { MONOSPACE_FONT } from "@/lib/theme";
 
 export type ProjectImageLoader = (reference: ProjectFileReference) => Promise<string>;
@@ -32,7 +32,9 @@ export const Markdown = memo(function Markdown({
   onOpenFile?: (reference: ProjectFileReference) => void;
   loadProjectImage?: ProjectImageLoader;
 }) {
-  const blocks = useMemo(() => parseMarkdown(source), [source]);
+  // 流式期间 source 每帧变长,整段重解析的总开销随长度平方增长。改成只解析仍在
+  // 增长的尾部,已定稿的块连同它们的对象引用一起复用。
+  const blocks = useMemo(() => parseMarkdownCached(source), [source]);
   return (
     <View style={styles.root}>
       {blocks.map((b, i) => (
@@ -48,7 +50,9 @@ export const Markdown = memo(function Markdown({
   );
 });
 
-function Block({
+// 增量解析让定稿的块保持同一个对象引用,memo 的浅比较据此整段跳过重渲染;
+// 少了这层,流式期间前面所有块仍会跟着每帧重新渲染,缓存解析结果就白做了。
+const Block = memo(function Block({
   block,
   projectRoot,
   onOpenFile,
@@ -137,7 +141,7 @@ function Block({
         </Text>
       );
   }
-}
+});
 
 function hasMath(spans: InlineSpan[]): boolean {
   return spans.some((span) => span.math === true);

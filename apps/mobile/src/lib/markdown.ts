@@ -257,3 +257,139 @@ export function parseMarkdown(src: string): MdBlock[] {
   flushParagraph();
   return blocks;
 }
+
+/**
+ * 流式增量解析的中间状态。字段只应由 parseMarkdownStream 维护。
+ */
+export interface MarkdownStream {
+  /** 上一次解析过的完整源文本 */
+  source: string;
+  /** 完整解析结果;源文本没变时原样复用 */
+  blocks: MdBlock[];
+  /** 安全重启点之前、不会再被后续输入改写的块 */
+  settled: MdBlock[];
+  /** settled 覆盖到的字符偏移 */
+  boundary: number;
+  /** 已按【整行】扫描过的字符偏移;末尾未写完的半行留到下次 */
+  scanned: number;
+  /** 扫描位置是否位于未闭合的围栏代码块内 */
+  inFence: boolean;
+  /** 扫描位置若在未闭合的展示公式内,记录其结束定界符 */
+  mathClose: "$$" | "\\]" | null;
+}
+
+const FENCE_OPEN = /^\s*```(\w*)\s*$/;
+const FENCE_CLOSE = /^\s*```\s*$/;
+const BLANK_LINE = /^\s*$/;
+
+function emptyStream(): MarkdownStream {
+  return {
+    source: "",
+    blocks: [],
+    settled: [],
+    boundary: 0,
+    scanned: 0,
+    inFence: false,
+    mathClose: null,
+  };
+}
+
+/**
+ * 只解析仍在增长的尾巴。
+ *
+ * 流式气泡每帧拿到的是一段更长的文本,整段重解析的总开销随长度平方增长,长回答
+ * 的后半段会明显掉帧。这里把不可能再变的前缀定稿下来,之后每帧只解析尾部。
+ *
+ * 安全重启点定义为【空行之后、且不在围栏代码块或展示公式内部】的位置。解析器在
+ * 这些位置必然处于中性状态:段落已经 flush,没有跨行块正在累积,表格也已经结束。
+ * 解析器唯一的前瞻是表格分隔行,而空行走不到表格分支,所以尾部的内容不可能改写
+ * 前缀已经产出的块 —— parse(前缀) ++ parse(尾部) 与 parse(整段) 等价。
+ *
+ * 传入的文本若不是上一次的追加(被改写或截短),整个缓存作废并重新完整解析。
+ */
+export function parseMarkdownStream(
+  src: string,
+  previous: MarkdownStream | null,
+): MarkdownStream {
+  if (previous && previous.source === src) return previous;
+
+  const base = previous && src.startsWith(previous.source) ? previous : emptyStream();
+
+  let scanned = base.scanned;
+  let inFence = base.inFence;
+  let mathClose = base.mathClose;
+  let boundary = base.boundary;
+  let settled = base.settled;
+  let safe = boundary;
+
+  while (scanned < src.length) {
+    const newline = src.indexOf("\n", scanned);
+    // 末行还没写完,它的形态仍可能变化(比如 ``` 还差最后一个反引号),不能扫。
+    if (newline < 0) break;
+    const line = src.slice(scanned, newline);
+    scanned = newline + 1;
+
+    if (inFence) {
+      if (FENCE_CLOSE.test(line)) inFence = false;
+      continue;
+    }
+    if (mathClose !== null) {
+      if (line.includes(mathClose)) mathClose = null;
+      continue;
+    }
+    if (FENCE_OPEN.test(line)) {
+      inFence = true;
+      continue;
+    }
+    const math = displayMathStart(line);
+    if (math) {
+      if (!math.rest.includes(math.close)) mathClose = math.close;
+      continue;
+    }
+    if (BLANK_LINE.test(line)) safe = scanned;
+  }
+
+  if (safe > boundary) {
+    settled = settled.concat(parseMarkdown(src.slice(boundary, safe)));
+    boundary = safe;
+  }
+
+  const blocks =
+    boundary === 0 ? parseMarkdown(src) : settled.concat(parseMarkdown(src.slice(boundary)));
+
+  return { source: src, blocks, settled, boundary, scanned, inFence, mathClose };
+}
+
+/**
+ * 模块级的流式解析缓存。
+ *
+ * 组件不该在渲染里改 ref,而每个气泡又需要各自的增量状态,所以缓存放在这里:
+ * 按"新文本是否以某条缓存的源文本开头"挑最长的那条续着解析。这只是记忆化,
+ * 命中与否都返回同样的结果,未命中时退化成一次完整解析。
+ *
+ * 同时流式的气泡通常只有一个,容量取 8 足够覆盖切换会话时的重叠。
+ */
+const STREAM_CACHE_LIMIT = 8;
+const streamCache: MarkdownStream[] = [];
+
+export function parseMarkdownCached(src: string): MdBlock[] {
+  let bestIndex = -1;
+  let bestLength = -1;
+  for (let i = 0; i < streamCache.length; i++) {
+    const entry = streamCache[i]!;
+    if (entry.source.length > bestLength && src.startsWith(entry.source)) {
+      bestIndex = i;
+      bestLength = entry.source.length;
+    }
+  }
+  const next = parseMarkdownStream(src, bestIndex >= 0 ? streamCache[bestIndex]! : null);
+  if (bestIndex >= 0) streamCache.splice(bestIndex, 1);
+  streamCache.unshift(next);
+  if (streamCache.length > STREAM_CACHE_LIMIT) streamCache.length = STREAM_CACHE_LIMIT;
+  return next.blocks;
+}
+
+/** 仅供测试:清空缓存,避免用例之间互相影响。 */
+export function resetMarkdownCache(): void {
+  streamCache.length = 0;
+}
