@@ -42,7 +42,9 @@ export type IconName =
   | "command"
   | "point.3.connected.trianglepath.dotted"
   | "square.stack.3d.up"
-  | "play.fill";
+  | "play.fill"
+  | "speedometer"
+  | "arrow.triangle.branch";
 
 const FALLBACK: Record<IconName, string> = {
   magnifyingglass: "🔍",
@@ -76,6 +78,8 @@ const FALLBACK: Record<IconName, string> = {
   "point.3.connected.trianglepath.dotted": "⌘",
   "square.stack.3d.up": "▱",
   "play.fill": "▶︎",
+  speedometer: "FPS",
+  "arrow.triangle.branch": "⑂",
 };
 
 type MaterialIconName = ComponentProps<typeof MaterialIcons>["name"];
@@ -112,6 +116,8 @@ const ANDROID_ICON: Record<IconName, MaterialIconName> = {
   "point.3.connected.trianglepath.dotted": "account-tree",
   "square.stack.3d.up": "layers",
   "play.fill": "play-arrow",
+  speedometer: "speed",
+  "arrow.triangle.branch": "call-split",
 };
 
 export function Icon({

@@ -285,16 +285,12 @@ export const ChatView = memo(function ChatView({
     [items, subagentId, subagentHistory],
   );
 
-  // 新内容到达时,只有用户已在底部才自动跟随(避免打断向上翻阅)
+  // 自动跟随只留 onContentSizeChange 一条路径。这里再排一次 rAF 会在同一帧里
+  // 重复滚动,而且它跑在列表重新布局【之前】,量到的还是上一帧的内容高度。
+  const pendingCount = useMemo(() => pendingInteractions(scopedItems).length, [scopedItems]);
   useEffect(() => {
-    onPendingChange?.(pendingInteractions(scopedItems).length);
-    if (atBottomRef.current && scopedItems.length > 0) {
-      const frame = requestAnimationFrame(() => {
-        listRef.current?.scrollToEnd({ animated: false });
-      });
-      return () => cancelAnimationFrame(frame);
-    }
-  }, [scopedItems, onPendingChange]);
+    onPendingChange?.(pendingCount);
+  }, [pendingCount, onPendingChange]);
 
   const respond = useCallback(
     (reqId: string, reply: PermissionReply) => {
@@ -494,7 +490,9 @@ export const ChatView = memo(function ChatView({
         removeClippedSubviews={Platform.OS === "android"}
         initialNumToRender={12}
         maxToRenderPerBatch={8}
-        windowSize={11}
+        // iOS 上 removeClippedSubviews 不可靠,只能靠窗口本身收窄挂载量。气泡里
+        // 有 Markdown、diff 和图片,十一屏的量在长会话里就是白挂着的原生视图。
+        windowSize={7}
         ListEmptyComponent={listEmpty}
         ListFooterComponent={listFooter}
         renderItem={renderItem}

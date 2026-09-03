@@ -36,6 +36,7 @@ import { ChatView } from "@/components/ChatView";
 import { DismissKey } from "@/components/DismissKey";
 import { Icon } from "@/components/Icon";
 import { KeyBar } from "@/components/KeyBar";
+import { PerfHud } from "@/components/PerfHud";
 import { QuickReplies } from "@/components/QuickReplies";
 import { Terminal, type TerminalHandle } from "@/components/Terminal";
 import { VoiceButton } from "@/components/VoiceButton";
@@ -50,8 +51,13 @@ import {
 } from "@/lib/attach";
 import { Meter, Row, Sheet, SheetAction } from "@/components/Sheet";
 import { toast } from "@/components/Toast";
-import { color, font, MONOSPACE_FONT, quotaRemainingColor, quotaRemainingPct, statusColor } from "@/lib/theme";
+import { color, font, MONOSPACE_FONT, quotaRemainingColor, quotaRemainingPct, radius, statusColor } from "@/lib/theme";
 import { matchCommands } from "@/lib/slash-commands";
+import {
+  getPerfHudEnabled,
+  setPerfHudEnabled,
+  type TerminalPerf,
+} from "@/lib/perf-hud";
 import { setSessionArchived } from "@/lib/session-preferences";
 import { sortSessions } from "@/lib/store";
 import { useHostConnection } from "@/lib/use-host-connection";
@@ -161,11 +167,14 @@ function SessionHeaderTitle({
   pending,
   tightest,
   subagent,
+  onSwitch,
 }: {
   session?: SessionInfo;
   pending: number;
   tightest: UsageWindow | null;
   subagent?: SubagentInfo;
+  /** 传入时标题可点,展开同一主机的会话切换器。 */
+  onSwitch?: () => void;
 }) {
   const busy = !subagent && (session?.status === "running" || session?.status === "starting");
   const elapsed = useElapsed(
@@ -189,11 +198,25 @@ function SessionHeaderTitle({
         ].filter(Boolean)
     : [];
 
+  const Container = onSwitch ? Pressable : View;
   return (
-    <View style={styles.headerTitle}>
-      <Text style={styles.headerName} numberOfLines={1}>
-        {subagent?.name ?? session?.title ?? "会话"}
-      </Text>
+    <Container
+      style={styles.headerTitle}
+      {...(onSwitch
+        ? {
+            onPress: onSwitch,
+            hitSlop: 8,
+            accessibilityRole: "button" as const,
+            accessibilityLabel: `当前会话 ${session?.title ?? ""}，切换到其他会话`,
+          }
+        : {})}
+    >
+      <View style={styles.headerNameRow}>
+        <Text style={styles.headerName} numberOfLines={1}>
+          {subagent?.name ?? session?.title ?? "会话"}
+        </Text>
+        {onSwitch && <Icon name="chevron.down" size={11} color={color.textDim} />}
+      </View>
       {session && (
         <View style={styles.headerMetaRow}>
           <View
@@ -215,7 +238,76 @@ function SessionHeaderTitle({
           </Text>
         </View>
       )}
-    </View>
+    </Container>
+  );
+}
+
+/**
+ * 会话切换器。
+ *
+ * 折叠屏和平板上常驻着 FoldableSessionRail,手机上没有,换一个会话要走
+ * 返回、找项目、点开三步。标题栏本来就是"我在哪"的位置,点它列出同一主机的
+ * 会话最省事,而且不占任何常驻空间。
+ */
+function SessionSwitcherSheet({
+  visible,
+  sessions,
+  currentId,
+  hostId,
+  onClose,
+}: {
+  visible: boolean;
+  sessions: readonly SessionInfo[];
+  currentId: string;
+  hostId: string;
+  onClose: () => void;
+}) {
+  return (
+    <Sheet visible={visible} title="切换会话" onClose={onClose}>
+      {sessions.map((item) => {
+        const selected = item.id === currentId;
+        return (
+          <Pressable
+            key={item.id}
+            disabled={selected}
+            style={({ pressed }) => [
+              styles.switcherItem,
+              selected && styles.switcherItemCurrent,
+              pressed && styles.controlPressed,
+            ]}
+            onPress={() => {
+              onClose();
+              // replace 而不是 push:来回切几次也不会把返回栈堆成一串会话。
+              router.replace({
+                pathname: "/host/[hostId]/session/[sid]",
+                params: { hostId, sid: item.id },
+              });
+            }}
+            accessibilityRole="button"
+            accessibilityState={{ selected }}
+            accessibilityLabel={`打开会话 ${item.title}`}
+          >
+            <View
+              style={[
+                styles.switcherStatus,
+                { backgroundColor: statusColor[item.status] ?? color.textFaint },
+              ]}
+            />
+            <View style={styles.switcherCopy}>
+              <Text style={styles.switcherTitle} numberOfLines={1}>{item.title}</Text>
+              <Text style={styles.switcherMeta} numberOfLines={1} ellipsizeMode="middle">
+                {[item.agent, statusText[item.status], item.cwd].filter(Boolean).join(" · ")}
+              </Text>
+            </View>
+            {selected ? (
+              <Text style={styles.switcherCurrent}>当前</Text>
+            ) : (
+              <Icon name="chevron.right" size={13} color={color.textFaint} />
+            )}
+          </Pressable>
+        );
+      })}
+    </Sheet>
   );
 }
 
@@ -360,6 +452,7 @@ export default function SessionScreen() {
   const [usageError, setUsageError] = useState<string | null>(null);
   const [controlsOpen, setControlsOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [switcherOpen, setSwitcherOpen] = useState(false);
   const [policyOpen, setPolicyOpen] = useState(false);
   const [yoloConfirmOpen, setYoloConfirmOpen] = useState(false);
   const [killConfirmOpen, setKillConfirmOpen] = useState(false);
@@ -381,6 +474,8 @@ export default function SessionScreen() {
   );
   const [terminalFontPreferenceHydrated, setTerminalFontPreferenceHydrated] = useState(false);
   const terminalFontPreferenceChanged = useRef(false);
+  const [perfHud, setPerfHud] = useState(false);
+  const [terminalPerf, setTerminalPerf] = useState<TerminalPerf | null>(null);
   const fontSize = terminalFontSizeForPreference(terminalFontPreference, fontScale);
   const composerToken = useMemo(
     () => activeComposerToken(draft, selection.start),
@@ -504,6 +599,46 @@ export default function SessionScreen() {
     setTerminalFontPreference(resetTerminalFontPreference());
     void AsyncStorage.removeItem(TERMINAL_FONT_PREFERENCE_STORAGE_KEY);
   }, []);
+
+  useEffect(() => {
+    let alive = true;
+    void getPerfHudEnabled().then((enabled) => {
+      if (alive) setPerfHud(enabled);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const togglePerfHud = useCallback((): void => {
+    const next = !perfHud;
+    setPerfHud(next);
+    // 关掉时丢掉上一次读数,下次打开不会先闪一个过期的数字。
+    if (!next) setTerminalPerf(null);
+    void setPerfHudEnabled(next);
+  }, [perfHud]);
+
+  // 内联箭头会让 Terminal 的 memo 每次渲染都失效,顶部计时每秒一跳就会连带
+  // 重渲染 WebView 包装层。
+  const retryTerminalConnection = useCallback((): void => {
+    conn?.kick();
+  }, [conn]);
+
+  // 侧栏常驻时标题再挂一个切换器只是重复;子 Agent 视图里标题说的是子 Agent,
+  // 给它加"切换会话"的箭头会指错对象。
+  const canSwitchSession = !showSessionRail && !isSubagent && orderedSessions.length > 1;
+
+  const openSwitcher = useCallback((): void => {
+    setSwitcherOpen(true);
+  }, []);
+
+  const openSessionFiles = useCallback((): void => {
+    router.push(`/host/${hostId}/files/${sid}`);
+  }, [hostId, sid]);
+
+  const openSessionGit = useCallback((): void => {
+    router.push(`/host/${hostId}/git/${sid}`);
+  }, [hostId, sid]);
 
   useEffect(() => {
     const sequence = ++completionSequence.current;
@@ -1056,11 +1191,13 @@ export default function SessionScreen() {
               pending={pending}
               tightest={tightest}
               {...(subagent ? { subagent } : {})}
+              {...(canSwitchSession ? { onSwitch: openSwitcher } : {})}
             />
           ),
           headerRight: () => (
             <View style={styles.headerRight}>
-              {/* 只有"停止"留在外面 —— 它是唯一分秒必争的操作 */}
+              {/* "停止"分秒必争;文件与改动是看完回答后最常走的两步,
+                  藏进 ⋯ 会让每次查看都多一次展开。 */}
               {busy && !isSubagent && (
                 <Pressable
                   onPress={() => conn.interrupt(sid)}
@@ -1071,6 +1208,22 @@ export default function SessionScreen() {
                   <Icon name="stop.circle" size={21} color={color.warn} />
                 </Pressable>
               )}
+              <Pressable
+                onPress={openSessionFiles}
+                hitSlop={8}
+                accessibilityRole="button"
+                accessibilityLabel="浏览项目文件"
+              >
+                <Icon name="folder.fill" size={19} color={color.accent} />
+              </Pressable>
+              <Pressable
+                onPress={openSessionGit}
+                hitSlop={8}
+                accessibilityRole="button"
+                accessibilityLabel="查看项目改动"
+              >
+                <Icon name="arrow.triangle.branch" size={19} color={color.accent} />
+              </Pressable>
               <Pressable
                 onPress={openMenu}
                 hitSlop={8}
@@ -1272,16 +1425,20 @@ export default function SessionScreen() {
       ) : (
         terminalFontPreferenceHydrated ? (
           <>
-            <Terminal
-              ref={termRef}
-              conn={conn}
-              sid={sid}
-              fontSize={fontSize}
-              onFontSize={setCustomTerminalFontSize}
-              inputEnabled={terminalInputEnabled}
-              disconnectedMessage="主机未连接；终端输入已冻结，断线期间的按键不会自动重放。"
-              onRetryConnection={() => conn.kick()}
-            />
+            <View style={styles.terminalStack}>
+              <Terminal
+                ref={termRef}
+                conn={conn}
+                sid={sid}
+                fontSize={fontSize}
+                onFontSize={setCustomTerminalFontSize}
+                inputEnabled={terminalInputEnabled}
+                disconnectedMessage="主机未连接；终端输入已冻结，断线期间的按键不会自动重放。"
+                onRetryConnection={retryTerminalConnection}
+                {...(perfHud ? { onPerf: setTerminalPerf } : {})}
+              />
+              {perfHud && <PerfHud perf={terminalPerf} />}
+            </View>
             <KeyBar
               onKey={(seq) => conn.inputText(sid, seq)}
               enabled={terminalInputEnabled}
@@ -1472,6 +1629,14 @@ export default function SessionScreen() {
         </ScrollView>
       )}
 
+      <SessionSwitcherSheet
+        visible={switcherOpen}
+        sessions={orderedSessions}
+        currentId={sid}
+        hostId={hostId}
+        onClose={() => setSwitcherOpen(false)}
+      />
+
       <Sheet visible={menuOpen} title={session.title || "会话"} onClose={() => setMenuOpen(false)}>
         {coordinatorRun && !isSubagent ? (
           <SheetAction
@@ -1518,24 +1683,18 @@ export default function SessionScreen() {
             />
           </>
         ) : null}
-        <SheetAction
-          label="查看项目改动"
-          detail="检查当前项目的 Git 变更"
-          symbol="doc.on.doc"
-          onPress={() => {
-            setMenuOpen(false);
-            router.push(`/host/${hostId}/git/${sid}`);
-          }}
-        />
-        <SheetAction
-          label="浏览项目文件"
-          detail="打开当前会话的工作目录"
-          symbol="folder.fill"
-          onPress={() => {
-            setMenuOpen(false);
-            router.push(`/host/${hostId}/files/${sid}`);
-          }}
-        />
+        {!isChat ? (
+          <SheetAction
+            label={perfHud ? "关闭性能读数" : "显示性能读数"}
+            detail="终端右上角显示帧率、吞吐和实际渲染器"
+            symbol="speedometer"
+            onPress={() => {
+              setMenuOpen(false);
+              togglePerfHud();
+            }}
+          />
+        ) : null}
+        {/* 文件与改动已提到标题栏,这里不再重复。 */}
         <SheetAction
           label="归档会话"
           detail="仅从手机当前列表移入归档，电脑端保持运行"
@@ -1994,11 +2153,27 @@ const styles = StyleSheet.create({
   loadButtonPressed: { opacity: 0.55 },
 
   headerTitle: { alignItems: "center", maxWidth: 238 },
-  headerName: { color: color.text, fontSize: 16, fontWeight: "600" },
+  headerNameRow: { flexDirection: "row", alignItems: "center", gap: 4, maxWidth: "100%" },
+  headerName: { color: color.text, fontSize: 16, fontWeight: "600", flexShrink: 1 },
+  switcherItem: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    paddingVertical: 11,
+    paddingHorizontal: 12,
+    borderRadius: radius.md,
+  },
+  switcherItemCurrent: { backgroundColor: color.surfaceRaised },
+  switcherStatus: { width: 8, height: 8, borderRadius: 4 },
+  switcherCopy: { flex: 1, gap: 2 },
+  switcherTitle: { color: color.text, fontSize: 14.5, fontWeight: "600" },
+  switcherMeta: { color: color.textDim, fontSize: 11.5 },
+  switcherCurrent: { color: color.textFaint, fontSize: 11.5 },
   headerMetaRow: { flexDirection: "row", alignItems: "center", gap: 5, marginTop: 2 },
   headerDot: { width: 5, height: 5, borderRadius: 3 },
   headerSub: { color: color.textDim, fontSize: 10.5, flexShrink: 1 },
-  headerRight: { flexDirection: "row", gap: 16, alignItems: "center" },
+  // 四个图标(忙时含"停止")挤在右侧,间距收窄才不会把居中标题压没。
+  headerRight: { flexDirection: "row", gap: 12, alignItems: "center" },
 
   modeBar: {
     flexDirection: "row",
@@ -2113,6 +2288,7 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     backgroundColor: "#09090b",
   },
+  terminalStack: { flex: 1 },
 
   reconnBar: {
     flexDirection: "row",
