@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, useWindowDimensions, View } from "react-native";
 import { Stack, router, useFocusEffect } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -23,9 +23,11 @@ import {
 import { getDeviceKeys, getHosts, removeHost, type StoredHost } from "@/lib/hosts";
 import { clearSessionPreferences } from "@/lib/session-preferences";
 import { useApp } from "@/lib/store";
-import { color, font, radius, space } from "@/lib/theme";
+import { font, radius, space, useMobileTheme, type ThemePalette } from "@/lib/theme";
 
 export default function HostsScreen() {
+  const { palette } = useMobileTheme();
+  const styles = useMemo(() => createStyles(palette), [palette]);
   const insets = useSafeAreaInsets();
   const { fontScale } = useWindowDimensions();
   const adaptiveLayout = useAdaptiveLayout();
@@ -39,7 +41,18 @@ export default function HostsScreen() {
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
   const [devicePickerOpen, setDevicePickerOpen] = useState(false);
   const setHosts = useApp((state) => state.setHosts);
-  const homeSettings = useApp((state) => state.homeSettings) ?? DEFAULT_HOME_SETTINGS;
+  // 首页设置只消费这两个业务字段；主题由显式上下文单独驱动，避免订阅整个
+  // 设置对象时把无关配置变化也扩散到设备和工作区列表。
+  const recentSessionLimit = useApp(
+    (state) => state.homeSettings?.recentSessionLimit ?? DEFAULT_HOME_SETTINGS.recentSessionLimit,
+  );
+  const workspaceAliases = useApp(
+    (state) => state.homeSettings?.workspaceAliases ?? DEFAULT_HOME_SETTINGS.workspaceAliases,
+  );
+  const homeSettings = useMemo<HomeSettings>(
+    () => ({ ...DEFAULT_HOME_SETTINGS, recentSessionLimit, workspaceAliases }),
+    [recentSessionLimit, workspaceAliases],
+  );
   const setHomeSettings = useApp((state) => state.setHomeSettings);
   const runtimes = useApp((state) => state.runtimes);
   const effectiveSelectedHostId = resolveHomeHostSelection(hosts, selectedHostId);
@@ -110,7 +123,7 @@ export default function HostsScreen() {
                 onPress={() => router.push("/settings")}
                 style={styles.headerButton}
               >
-                <Icon name="gearshape.fill" size={20} color={color.accent} />
+                <Icon name="gearshape.fill" size={20} color={palette.accent} />
               </Pressable>
               <Pressable
                 accessibilityRole="button"
@@ -119,7 +132,7 @@ export default function HostsScreen() {
                 onPress={() => router.push("/pair")}
                 style={styles.headerButton}
               >
-                <Icon name="qrcode.viewfinder" size={21} color={color.accent} />
+                <Icon name="qrcode.viewfinder" size={21} color={palette.accent} />
               </Pressable>
             </View>
           ),
@@ -141,7 +154,7 @@ export default function HostsScreen() {
           showsVerticalScrollIndicator={false}
         >
           <View style={[styles.emptyWrap, emptyStateLayout.body]}>
-            <Icon name="desktopcomputer" size={52} color={color.textFaint} />
+            <Icon name="desktopcomputer" size={52} color={palette.textFaint} />
             <Text style={styles.emptyTitle}>还没有配对的电脑</Text>
             <Text style={styles.emptyText}>在电脑上运行 prosperod 并生成配对码：</Text>
             <Text style={styles.code}>prosperod start{"\n"}prosperod pair</Text>
@@ -198,18 +211,24 @@ export default function HostsScreen() {
   );
 }
 
-const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: color.bg },
+function createStyles(palette: ThemePalette) {
+  const themedFont = {
+    title: { ...font.title, color: palette.text },
+    sub: { ...font.sub, color: palette.textDim },
+    mono: { ...font.mono, color: palette.text },
+  };
+  return StyleSheet.create({
+  container: { flex: 1, backgroundColor: palette.bg },
   headerActions: { flexDirection: "row", alignItems: "center", gap: 2 },
   headerButton: { width: 44, height: 44, alignItems: "center", justifyContent: "center" },
   emptyScroll: { flex: 1 },
   emptyWrap: { alignItems: "center", gap: space.md },
-  emptyTitle: { ...font.title, textAlign: "center" },
-  emptyText: { ...font.sub, textAlign: "center", alignSelf: "stretch" },
+  emptyTitle: { ...themedFont.title, textAlign: "center" },
+  emptyText: { ...themedFont.sub, textAlign: "center", alignSelf: "stretch" },
   code: {
-    ...font.mono,
-    color: color.textDim,
-    backgroundColor: color.surfaceRaised,
+    ...themedFont.mono,
+    color: palette.textDim,
+    backgroundColor: palette.surfaceRaised,
     borderRadius: radius.sm,
     padding: space.md,
     alignSelf: "stretch",
@@ -223,8 +242,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: space.xl,
     paddingVertical: space.md,
     borderRadius: radius.md,
-    backgroundColor: color.accentDim,
+    backgroundColor: palette.accentDim,
   },
-  ctaPressed: { backgroundColor: color.pressed },
-  ctaText: { color: color.text, fontSize: 15, fontWeight: "600", textAlign: "center" },
-});
+  ctaPressed: { backgroundColor: palette.pressed },
+  ctaText: { color: palette.text, fontSize: 15, fontWeight: "600", textAlign: "center" },
+  });
+}

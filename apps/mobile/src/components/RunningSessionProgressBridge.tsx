@@ -21,7 +21,16 @@ import { useApp } from "@/lib/store";
 export function RunningSessionProgressBridge() {
   const hosts = useApp((state) => state.hosts);
   const runtimes = useApp((state) => state.runtimes);
-  const settings = useApp((state) => state.homeSettings) ?? DEFAULT_HOME_SETTINGS;
+  // 后台进度只订阅自身开关；themeMode 等无关设置变化不应触发原生服务同步。
+  const backgroundProgressEnabled = useApp(
+    (state) =>
+      state.homeSettings?.backgroundProgressEnabled ??
+      DEFAULT_HOME_SETTINGS.backgroundProgressEnabled,
+  );
+  const overlayProgressEnabled = useApp(
+    (state) =>
+      state.homeSettings?.overlayProgressEnabled ?? DEFAULT_HOME_SETTINGS.overlayProgressEnabled,
+  );
   const setHomeSettings = useApp((state) => state.setHomeSettings);
   const [appState, setAppState] = useState<AppStateStatus>(AppState.currentState);
   const [approvals, setApprovals] = useState<Map<string, PendingOverlayApproval>>(new Map());
@@ -161,20 +170,20 @@ export function RunningSessionProgressBridge() {
       Platform.OS === "android" &&
       appState === "active" &&
       effectiveProgress !== null &&
-      settings.backgroundProgressEnabled
+      backgroundProgressEnabled
     ) {
       void requestProgressNotificationPermission();
     }
-  }, [appState, effectiveProgress, settings.backgroundProgressEnabled]);
+  }, [appState, backgroundProgressEnabled, effectiveProgress]);
 
   useEffect(() => {
     syncRunningSessionProgress(
       effectiveProgress,
-      settings.backgroundProgressEnabled,
-      settings.overlayProgressEnabled,
+      backgroundProgressEnabled,
+      overlayProgressEnabled,
       approval,
     );
-  }, [appState, approval, effectiveProgress, settings.backgroundProgressEnabled, settings.overlayProgressEnabled]);
+  }, [appState, approval, backgroundProgressEnabled, effectiveProgress, overlayProgressEnabled]);
 
   return null;
 }

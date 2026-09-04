@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   AppState,
   Platform,
@@ -7,6 +7,7 @@ import {
   StyleSheet,
   Switch,
   Text,
+  useColorScheme,
   View,
 } from "react-native";
 import { router, Stack, useFocusEffect } from "expo-router";
@@ -30,7 +31,15 @@ import {
   openProgressOverlaySettings,
 } from "@/lib/running-session-progress";
 import { useApp, type ConnStatus, type HostRuntime } from "@/lib/store";
-import { color, font, radius, space, statusColor } from "@/lib/theme";
+import {
+  paletteForScheme,
+  radius,
+  resolveThemeScheme,
+  space,
+  type ThemePalette,
+} from "@/lib/theme";
+
+type SettingsStyles = ReturnType<typeof createStyles>;
 
 const themeOptions: readonly { value: HomeThemeMode; label: string }[] = [
   { value: "system", label: "跟随系统" },
@@ -57,17 +66,21 @@ function SettingsSection({
   title,
   detail,
   children,
+  palette,
+  styles,
 }: {
   icon: IconName;
   title: string;
   detail?: string;
   children: React.ReactNode;
+  palette: ThemePalette;
+  styles: SettingsStyles;
 }): React.ReactElement {
   return (
     <View style={styles.section}>
       <View style={styles.sectionHeading}>
         <View style={styles.sectionIcon}>
-          <Icon name={icon} size={18} color={color.accent} />
+          <Icon name={icon} size={18} color={palette.accent} />
         </View>
         <View style={styles.sectionCopy}>
           <Text style={styles.sectionTitle}>{title}</Text>
@@ -83,11 +96,13 @@ function SettingRow({
   title,
   detail,
   children,
+  styles,
   last = false,
 }: {
   title: string;
   detail: string;
   children: React.ReactNode;
+  styles: SettingsStyles;
   last?: boolean;
 }): React.ReactElement {
   return (
@@ -106,11 +121,13 @@ function SegmentedOptions<T extends string | number>({
   options,
   onChange,
   label,
+  styles,
 }: {
   value: T;
   options: readonly { value: T; label: string }[];
   onChange: (value: T) => void;
   label: string;
+  styles: SettingsStyles;
 }): React.ReactElement {
   return (
     <View accessibilityRole="radiogroup" accessibilityLabel={label} style={styles.segments}>
@@ -146,9 +163,13 @@ function relaySummary(host: StoredHost): string {
 function DeviceConnectionRow({
   host,
   runtime,
+  palette,
+  styles,
 }: {
   host: StoredHost;
   runtime: HostRuntime | undefined;
+  palette: ThemePalette;
+  styles: SettingsStyles;
 }): React.ReactElement {
   const status = runtime?.status ?? "idle";
   const activePath =
@@ -168,10 +189,10 @@ function DeviceConnectionRow({
       accessibilityLabel={`${host.name} 的连接与 Relay 设置`}
     >
       <View style={styles.deviceTop}>
-        <View style={[styles.statusDot, { backgroundColor: statusColor[status] }]} />
+        <View style={[styles.statusDot, { backgroundColor: connectionStatusColor(status, palette) }]} />
         <Text style={styles.deviceName} numberOfLines={1}>{host.name}</Text>
         <Text style={styles.deviceStatus}>{connectionStatusLabel[status]}</Text>
-        <Icon name="chevron.right" size={17} color={color.textFaint} />
+        <Icon name="chevron.right" size={17} color={palette.textFaint} />
       </View>
       <Text style={styles.deviceMode}>
         {connectionModeLabel[host.connectionMode]}
@@ -188,6 +209,13 @@ function DeviceConnectionRow({
   );
 }
 
+function connectionStatusColor(status: ConnStatus, palette: ThemePalette): string {
+  if (status === "connected") return palette.success;
+  if (status === "connecting" || status === "reconnecting") return palette.warn;
+  if (status === "failed") return palette.danger;
+  return palette.accent;
+}
+
 export default function SettingsScreen(): React.ReactElement {
   const insets = useSafeAreaInsets();
   const [hosts, setLocalHosts] = useState<StoredHost[]>(() => useApp.getState().hosts);
@@ -197,6 +225,10 @@ export default function SettingsScreen(): React.ReactElement {
   const settings = normalizeHomeSettings(
     useApp((state) => state.homeSettings) ?? DEFAULT_HOME_SETTINGS,
   );
+  const systemScheme = useColorScheme();
+  const activeScheme = resolveThemeScheme(settings.themeMode, systemScheme);
+  const palette = paletteForScheme(activeScheme);
+  const styles = useMemo(() => createStyles(palette), [palette]);
   const runtimes = useApp((state) => state.runtimes);
   const setHosts = useApp((state) => state.setHosts);
   const setHomeSettings = useApp((state) => state.setHomeSettings);
@@ -259,6 +291,15 @@ export default function SettingsScreen(): React.ReactElement {
     updateSettings({ recentSessionLimit });
   };
 
+  const updateThemeMode = useCallback(
+    (themeMode: HomeThemeMode): void => {
+      // 先发布 React 状态，让本页和根导航在同一帧完成重绘；根布局会在提交后
+      // 再同步 Android uiMode，避免原生配置更新阻塞用户看到的第一帧。
+      updateSettings({ themeMode });
+    },
+    [updateSettings],
+  );
+
   return (
     <View style={styles.screen}>
       <Stack.Screen options={{ title: "设置", headerBackButtonDisplayMode: "minimal" }} />
@@ -270,14 +311,17 @@ export default function SettingsScreen(): React.ReactElement {
           icon="circle.lefthalf.filled"
           title="外观"
           detail="主题会立即应用到整个移动端"
+          palette={palette}
+          styles={styles}
         >
           <View style={styles.optionBlock}>
             <Text style={styles.optionLabel}>主题</Text>
             <SegmentedOptions
               value={settings.themeMode}
               options={themeOptions}
-              onChange={(themeMode) => updateSettings({ themeMode })}
+              onChange={updateThemeMode}
               label="主题模式"
+              styles={styles}
             />
           </View>
         </SettingsSection>
@@ -286,6 +330,8 @@ export default function SettingsScreen(): React.ReactElement {
           icon="clock.fill"
           title="首页显示"
           detail="控制首页信息密度"
+          palette={palette}
+          styles={styles}
         >
           <View style={styles.optionBlock}>
             <Text style={styles.optionLabel}>最近对话数量</Text>
@@ -297,6 +343,7 @@ export default function SettingsScreen(): React.ReactElement {
               }))}
               onChange={updateRecentLimit}
               label="首页最近对话数量"
+              styles={styles}
             />
             <Text style={styles.optionHint}>首页仅改变展示数量，不会删除历史会话。</Text>
           </View>
@@ -307,10 +354,13 @@ export default function SettingsScreen(): React.ReactElement {
             icon="bell.fill"
             title="后台任务"
             detail="离开 Prospero 后继续查看 Agent 进度"
+            palette={palette}
+            styles={styles}
           >
             <SettingRow
               title="持续通知"
               detail="运行中显示状态，点按直接返回对话"
+              styles={styles}
             >
               <Switch
                 value={settings.backgroundProgressEnabled}
@@ -320,8 +370,8 @@ export default function SettingsScreen(): React.ReactElement {
                     ...(!value ? { overlayProgressEnabled: false } : {}),
                   })
                 }
-                trackColor={{ false: color.border, true: color.accentDim }}
-                thumbColor={settings.backgroundProgressEnabled ? color.accent : color.textDim}
+                trackColor={{ false: palette.border, true: palette.accentDim }}
+                thumbColor={settings.backgroundProgressEnabled ? palette.accent : palette.textDim}
               />
             </SettingRow>
             <SettingRow
@@ -335,6 +385,7 @@ export default function SettingsScreen(): React.ReactElement {
                       ? "后台显示进度；待审批时可拒绝或允许一次"
                       : "开启时将前往系统页面授予悬浮窗权限"
               }
+              styles={styles}
               last
             >
               <Switch
@@ -364,11 +415,11 @@ export default function SettingsScreen(): React.ReactElement {
                   });
                   openProgressOverlaySettings();
                 }}
-                trackColor={{ false: color.border, true: color.accentDim }}
+                trackColor={{ false: palette.border, true: palette.accentDim }}
                 thumbColor={
                   settings.overlayProgressEnabled || overlayPermissionPending
-                    ? color.accent
-                    : color.textDim
+                    ? palette.accent
+                    : palette.textDim
                 }
               />
             </SettingRow>
@@ -382,10 +433,18 @@ export default function SettingsScreen(): React.ReactElement {
           icon="network"
           title="设备与连接"
           detail="每台设备分别保存直连地址、端口和 Relay 凭证"
+          palette={palette}
+          styles={styles}
         >
           {hosts.length > 0 ? (
             hosts.map((host) => (
-              <DeviceConnectionRow key={host.id} host={host} runtime={runtimes[host.id]} />
+              <DeviceConnectionRow
+                key={host.id}
+                host={host}
+                runtime={runtimes[host.id]}
+                palette={palette}
+                styles={styles}
+              />
             ))
           ) : (
             <View style={styles.noDevices}>
@@ -399,7 +458,7 @@ export default function SettingsScreen(): React.ReactElement {
             accessibilityRole="button"
             accessibilityLabel="添加设备"
           >
-            <Icon name="plus" size={17} color={color.accent} />
+            <Icon name="plus" size={17} color={palette.accent} />
             <Text style={styles.addDeviceText}>添加设备</Text>
           </Pressable>
         </SettingsSection>
@@ -412,8 +471,9 @@ export default function SettingsScreen(): React.ReactElement {
   );
 }
 
-const styles = StyleSheet.create({
-  screen: { flex: 1, backgroundColor: color.bg },
+function createStyles(palette: ThemePalette) {
+  return StyleSheet.create({
+  screen: { flex: 1, backgroundColor: palette.bg },
   content: { gap: 22, paddingHorizontal: 14, paddingTop: 18 },
   section: { gap: 10 },
   sectionHeading: { flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 2 },
@@ -423,22 +483,22 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
     borderRadius: 10,
-    backgroundColor: color.accentBg,
+    backgroundColor: palette.accentBg,
   },
   sectionCopy: { flex: 1, gap: 2 },
-  sectionTitle: { ...font.body, fontSize: 15, fontWeight: "700" },
-  sectionDetail: { ...font.meta, color: color.textDim, lineHeight: 15 },
+  sectionTitle: { color: palette.text, fontSize: 15, fontWeight: "700" },
+  sectionDetail: { color: palette.textDim, fontSize: 11, lineHeight: 15 },
   card: {
     overflow: "hidden",
     borderRadius: radius.md,
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: color.border,
-    backgroundColor: color.surface,
+    borderColor: palette.border,
+    backgroundColor: palette.surface,
   },
   optionBlock: { gap: 11, padding: 13 },
-  optionLabel: { color: color.text, fontSize: 13, fontWeight: "600" },
-  optionHint: { ...font.meta, color: color.textFaint, lineHeight: 15 },
-  segments: { flexDirection: "row", gap: 6, padding: 3, borderRadius: 10, backgroundColor: color.bg },
+  optionLabel: { color: palette.text, fontSize: 13, fontWeight: "600" },
+  optionHint: { color: palette.textFaint, fontSize: 11, lineHeight: 15 },
+  segments: { flexDirection: "row", gap: 6, padding: 3, borderRadius: 10, backgroundColor: palette.bg },
   segment: {
     flex: 1,
     minHeight: 38,
@@ -446,9 +506,9 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     borderRadius: 8,
   },
-  segmentSelected: { backgroundColor: color.accentDim },
-  segmentText: { color: color.textDim, fontSize: 12.5, fontWeight: "600" },
-  segmentTextSelected: { color: color.text },
+  segmentSelected: { backgroundColor: palette.accentDim },
+  segmentText: { color: palette.textDim, fontSize: 12.5, fontWeight: "600" },
+  segmentTextSelected: { color: palette.text },
   settingRow: {
     minHeight: 68,
     flexDirection: "row",
@@ -456,49 +516,49 @@ const styles = StyleSheet.create({
     gap: space.md,
     paddingHorizontal: 13,
     borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: color.border,
+    borderBottomColor: palette.border,
   },
   rowLast: { borderBottomWidth: 0 },
   settingCopy: { flex: 1, gap: 3 },
-  settingTitle: { color: color.text, fontSize: 13.5, fontWeight: "600" },
-  settingDetail: { color: color.textDim, fontSize: 10.5, lineHeight: 15 },
+  settingTitle: { color: palette.text, fontSize: 13.5, fontWeight: "600" },
+  settingDetail: { color: palette.textDim, fontSize: 10.5, lineHeight: 15 },
   privacyNote: {
-    color: color.textFaint,
+    color: palette.textFaint,
     fontSize: 10,
     lineHeight: 15,
     paddingHorizontal: 13,
     paddingVertical: 10,
     borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: color.border,
+    borderTopColor: palette.border,
   },
   deviceRow: {
     gap: 7,
     paddingHorizontal: 13,
     paddingVertical: 13,
     borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: color.border,
+    borderBottomColor: palette.border,
   },
-  deviceRowPressed: { backgroundColor: color.pressed },
+  deviceRowPressed: { backgroundColor: palette.pressed },
   deviceTop: { flexDirection: "row", alignItems: "center", gap: 8 },
   statusDot: { width: 8, height: 8, borderRadius: 4 },
-  deviceName: { flex: 1, color: color.text, fontSize: 14, fontWeight: "700" },
-  deviceStatus: { color: color.textDim, fontSize: 10.5 },
-  deviceMode: { marginLeft: 16, color: color.textDim, fontSize: 10.5 },
+  deviceName: { flex: 1, color: palette.text, fontSize: 14, fontWeight: "700" },
+  deviceStatus: { color: palette.textDim, fontSize: 10.5 },
+  deviceMode: { marginLeft: 16, color: palette.textDim, fontSize: 10.5 },
   relayLine: { marginLeft: 16, flexDirection: "row", alignItems: "center", gap: 7 },
   relayLabel: {
-    color: color.accent,
+    color: palette.accent,
     fontSize: 9,
     fontWeight: "800",
     paddingHorizontal: 5,
     paddingVertical: 2,
     overflow: "hidden",
     borderRadius: 5,
-    backgroundColor: color.accentBg,
+    backgroundColor: palette.accentBg,
   },
-  relayValue: { flex: 1, color: color.textFaint, fontSize: 10 },
+  relayValue: { flex: 1, color: palette.textFaint, fontSize: 10 },
   noDevices: { gap: 4, alignItems: "center", padding: 22 },
-  noDevicesTitle: { color: color.text, fontSize: 13, fontWeight: "600" },
-  noDevicesDetail: { color: color.textDim, fontSize: 10.5, textAlign: "center" },
+  noDevicesTitle: { color: palette.text, fontSize: 13, fontWeight: "600" },
+  noDevicesDetail: { color: palette.textDim, fontSize: 10.5, textAlign: "center" },
   addDevice: {
     minHeight: 48,
     flexDirection: "row",
@@ -506,7 +566,8 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     gap: 7,
   },
-  addDeviceText: { color: color.accent, fontSize: 13, fontWeight: "600" },
-  footer: { color: color.textFaint, fontSize: 10, lineHeight: 15, textAlign: "center", paddingHorizontal: 12 },
+  addDeviceText: { color: palette.accent, fontSize: 13, fontWeight: "600" },
+  footer: { color: palette.textFaint, fontSize: 10, lineHeight: 15, textAlign: "center", paddingHorizontal: 12 },
   pressed: { opacity: 0.64 },
-});
+  });
+}

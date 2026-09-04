@@ -31,7 +31,15 @@ import {
 } from "@/lib/home-preferences";
 import type { SessionProject } from "@/lib/session-projects";
 import type { ConnStatus, HostRuntime } from "@/lib/store";
-import { color, font, radius, space, statusColor } from "@/lib/theme";
+import {
+  font,
+  radius,
+  space,
+  useMobileTheme,
+  type ThemePalette,
+} from "@/lib/theme";
+
+type HomeDashboardStyles = ReturnType<typeof createStyles>;
 
 const statusLabel: Record<ConnStatus, string> = {
   idle: "未连接",
@@ -88,6 +96,17 @@ function recentTime(timestamp: number): string {
   return `${String(date.getMonth() + 1)}/${String(date.getDate())} ${time}`;
 }
 
+function statusTone(status: string, palette: ThemePalette): string {
+  if (status === "running" || status === "starting" || status === "waiting_approval") {
+    return palette.warn;
+  }
+  if (status === "waiting_input" || status === "idle") return palette.accent;
+  if (status === "completed" || status === "connected") return palette.success;
+  if (status === "died" || status === "failed") return palette.danger;
+  if (status === "connecting" || status === "reconnecting") return palette.warn;
+  return palette.textFaint;
+}
+
 export function HomeDashboard({
   hosts,
   runtimes,
@@ -127,6 +146,8 @@ export function HomeDashboard({
   onChangeHomeSettings: (patch: Partial<HomeSettings>) => void;
   onOpenSettings: () => void;
 }) {
+  const { palette } = useMobileTheme();
+  const styles = useMemo(() => createStyles(palette), [palette]);
   const selectedHost = hosts.find((host) => host.id === selectedHostId) ?? hosts[0];
   const selectedRuntime = selectedHost ? runtimes[selectedHost.id] : undefined;
   // Fast Refresh 会保留旧版 Zustand 状态；标准化可补全后续新增的设置字段。
@@ -172,7 +193,7 @@ export function HomeDashboard({
         <RefreshControl
           refreshing={refreshing}
           onRefresh={() => onRefreshHost(selectedHost.id)}
-          tintColor={color.accent}
+          tintColor={palette.accent}
         />
       }
       ListHeaderComponent={
@@ -187,7 +208,7 @@ export function HomeDashboard({
               onPress={onToggleDevicePicker}
             >
                 <View style={styles.sectionIcon}>
-                  <Icon name="desktopcomputer" size={18} color={color.accent} />
+                  <Icon name="desktopcomputer" size={18} color={palette.accent} />
                 </View>
                 <View style={styles.deviceHeaderCopy}>
                   <Text style={styles.deviceHeaderName} numberOfLines={1}>
@@ -202,26 +223,26 @@ export function HomeDashboard({
                     <View
                       style={[
                         styles.statusDot,
-                        { backgroundColor: statusColor[selectedRuntime?.status ?? "idle"] },
+                        { backgroundColor: statusTone(selectedRuntime?.status ?? "idle", palette) },
                       ]}
                     />
                     <Text style={styles.connectionBadgeText}>
                       {statusLabel[selectedRuntime?.status ?? "idle"]}
                     </Text>
                   </View>
-                  <Icon name="chevron.down" size={17} color={color.textDim} />
+                  <Icon name="chevron.down" size={17} color={palette.textDim} />
                 </View>
             </Pressable>
 
             <View style={styles.statsRow}>
-              <DeviceStat value={stats.activeAgentCount} label="Agent" />
-              <DeviceStat value={stats.sessionCount} label="会话" />
-              <DeviceStat value={hosts.length} label="设备" />
+              <DeviceStat value={stats.activeAgentCount} label="Agent" styles={styles} />
+              <DeviceStat value={stats.sessionCount} label="会话" styles={styles} />
+              <DeviceStat value={hosts.length} label="设备" styles={styles} />
               <View style={[styles.runningPill, stats.runningCount === 0 && styles.runningPillIdle]}>
                 <View
                   style={[
                     styles.sessionStatusDot,
-                    { backgroundColor: stats.runningCount > 0 ? color.warn : color.textFaint },
+                    { backgroundColor: stats.runningCount > 0 ? palette.warn : palette.textFaint },
                   ]}
                 />
                 <Text style={styles.runningPillText}>
@@ -246,7 +267,7 @@ export function HomeDashboard({
                 hitSlop={8}
                 style={({ pressed }) => [styles.iconButton, pressed && styles.pressed]}
               >
-                <Icon name="gearshape.fill" size={18} color={color.textDim} />
+                <Icon name="gearshape.fill" size={18} color={palette.textDim} />
               </Pressable>
             </View>
             {recentSessions.length > 0 ? (
@@ -275,7 +296,7 @@ export function HomeDashboard({
                     <View
                       style={[
                         styles.sessionStatusDot,
-                        { backgroundColor: statusColor[session.status] },
+                        { backgroundColor: statusTone(session.status, palette) },
                       ]}
                     />
                   </Pressable>
@@ -302,7 +323,7 @@ export function HomeDashboard({
                   onPress={() => onOpenHost(selectedHost.id)}
                   style={({ pressed }) => [styles.iconButton, pressed && styles.pressed]}
                 >
-                  <Icon name="ellipsis.circle" size={18} color={color.textDim} />
+                  <Icon name="ellipsis.circle" size={18} color={palette.textDim} />
                 </Pressable>
                 <Pressable
                   accessibilityRole="button"
@@ -310,7 +331,7 @@ export function HomeDashboard({
                   onPress={() => setQuickCreateOpen(true)}
                   style={({ pressed }) => [styles.createButton, pressed && styles.createButtonPressed]}
                 >
-                  <Icon name="plus" size={16} color={color.text} weight="semibold" />
+                  <Icon name="plus" size={16} color={palette.text} weight="semibold" />
                   <Text style={styles.createButtonText}>新建</Text>
                 </Pressable>
               </View>
@@ -325,6 +346,8 @@ export function HomeDashboard({
           runtime={selectedRuntime}
           onOpenHost={() => onOpenHost(selectedHost.id)}
           onRefresh={() => onRefreshHost(selectedHost.id)}
+          palette={palette}
+          styles={styles}
         />
       }
       ItemSeparatorComponent={() => <View style={styles.projectGap} />}
@@ -344,16 +367,16 @@ export function HomeDashboard({
                   id: "create-session",
                   label: "新会话",
                   symbol: "plus",
-                  color: color.accent,
-                  foregroundColor: color.onAccent,
+                  color: palette.accent,
+                  foregroundColor: palette.onAccent,
                   onPress: () => onCreateSession(selectedHost.id, project.path),
                 },
                 {
                   id: "edit-workspace",
                   label: "编辑",
                   symbol: "pencil",
-                  color: color.surfaceRaised,
-                  foregroundColor: color.text,
+                  color: palette.surfaceRaised,
+                  foregroundColor: palette.text,
                   onPress: () => {
                     setEditingProject(project);
                     setProjectAlias(displayName);
@@ -370,7 +393,7 @@ export function HomeDashboard({
                 style={({ pressed }) => [styles.projectHeader, pressed && styles.projectCardPressed]}
               >
                 <View style={styles.projectIcon}>
-                  <Icon name="folder.fill" size={18} color={color.accent} />
+                  <Icon name="folder.fill" size={18} color={palette.accent} />
                 </View>
                 <View style={styles.projectCopy}>
                   <Text style={styles.projectName} numberOfLines={1}>
@@ -396,7 +419,7 @@ export function HomeDashboard({
                   <Icon
                     name={expanded ? "chevron.down" : "chevron.right"}
                     size={15}
-                    color={color.textFaint}
+                    color={palette.textFaint}
                   />
                 </View>
               </Pressable>
@@ -428,14 +451,14 @@ export function HomeDashboard({
                       <View
                         style={[
                           styles.sessionStatusDot,
-                          { backgroundColor: statusColor[session.status] },
+                          { backgroundColor: statusTone(session.status, palette) },
                         ]}
                       />
                       <Text style={styles.sessionStatusText}>
                         {sessionStatusLabel[session.status]}
                       </Text>
                     </View>
-                    <Icon name="chevron.right" size={14} color={color.textFaint} />
+                    <Icon name="chevron.right" size={14} color={palette.textFaint} />
                   </Pressable>
                 ))}
               </View>
@@ -469,7 +492,7 @@ export function HomeDashboard({
                   <View
                     style={[
                       styles.statusDot,
-                      { backgroundColor: statusColor[runtime?.status ?? "idle"] },
+                      { backgroundColor: statusTone(runtime?.status ?? "idle", palette) },
                     ]}
                   />
                   <View style={styles.deviceRowCopy}>
@@ -480,7 +503,7 @@ export function HomeDashboard({
                       {hostDetail(host, runtime)}
                     </Text>
                   </View>
-                  {selected && <Icon name="checkmark.circle.fill" size={18} color={color.accent} />}
+                  {selected && <Icon name="checkmark.circle.fill" size={18} color={palette.accent} />}
                 </Pressable>
                 <View style={styles.deviceRowActions}>
                   <Pressable
@@ -492,7 +515,7 @@ export function HomeDashboard({
                     }}
                     style={({ pressed }) => [styles.deviceAction, pressed && styles.pressed]}
                   >
-                    <Icon name="pencil" size={17} color={color.textDim} />
+                    <Icon name="pencil" size={17} color={palette.textDim} />
                   </Pressable>
                   <Pressable
                     accessibilityRole="button"
@@ -509,7 +532,7 @@ export function HomeDashboard({
                     }
                     style={({ pressed }) => [styles.deviceAction, pressed && styles.dangerPressed]}
                   >
-                    <Icon name="trash" size={17} color={color.danger} />
+                    <Icon name="trash" size={17} color={palette.danger} />
                   </Pressable>
                 </View>
               </View>
@@ -577,7 +600,15 @@ export function HomeDashboard({
   );
 }
 
-function DeviceStat({ value, label }: { value: number; label: string }) {
+function DeviceStat({
+  value,
+  label,
+  styles,
+}: {
+  value: number;
+  label: string;
+  styles: HomeDashboardStyles;
+}) {
   return (
     <View style={styles.stat}>
       <Text style={styles.statValue}>{String(value)}</Text>
@@ -591,11 +622,15 @@ function WorkspaceEmptyState({
   runtime,
   onOpenHost,
   onRefresh,
+  palette,
+  styles,
 }: {
   host: StoredHost;
   runtime: HostRuntime | undefined;
   onOpenHost: () => void;
   onRefresh: () => void;
+  palette: ThemePalette;
+  styles: HomeDashboardStyles;
 }) {
   const status = runtime?.status ?? "idle";
   const unavailable = status === "failed" || status === "idle";
@@ -605,7 +640,7 @@ function WorkspaceEmptyState({
         <Icon
           name={unavailable ? "exclamationmark.triangle.fill" : "folder.fill"}
           size={25}
-          color={unavailable ? color.warn : color.textFaint}
+          color={unavailable ? palette.warn : palette.textFaint}
         />
       </View>
       <Text style={styles.emptyTitle}>
@@ -635,7 +670,14 @@ function WorkspaceEmptyState({
   );
 }
 
-const styles = StyleSheet.create({
+function createStyles(palette: ThemePalette) {
+  const themedFont = {
+    title: { ...font.title, color: palette.text },
+    body: { ...font.body, color: palette.text },
+    sub: { ...font.sub, color: palette.textDim },
+    meta: { ...font.meta, color: palette.textFaint },
+  };
+  return StyleSheet.create({
   list: {
     flexGrow: 1,
     width: "100%",
@@ -647,7 +689,7 @@ const styles = StyleSheet.create({
   devicePanel: {
     overflow: "hidden",
     borderRadius: radius.md,
-    backgroundColor: color.surface,
+    backgroundColor: palette.surface,
   },
   deviceSelector: {
     minHeight: 52,
@@ -663,11 +705,11 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
     borderRadius: radius.sm,
-    backgroundColor: color.accentBg,
+    backgroundColor: palette.accentBg,
   },
   deviceHeaderCopy: { flex: 1, gap: 2 },
-  deviceHeaderName: { ...font.body, fontSize: 15, fontWeight: "700" },
-  deviceOs: { color: color.textDim, fontSize: 10.5 },
+  deviceHeaderName: { ...themedFont.body, fontSize: 15, fontWeight: "700" },
+  deviceOs: { color: palette.textDim, fontSize: 10.5 },
   deviceSelectorEnd: { flexDirection: "row", alignItems: "center", gap: space.sm },
   connectionBadge: {
     flexDirection: "row",
@@ -676,9 +718,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: space.sm,
     paddingVertical: 4,
     borderRadius: 999,
-    backgroundColor: color.surfaceRaised,
+    backgroundColor: palette.surfaceRaised,
   },
-  connectionBadgeText: { color: color.textDim, fontSize: 10, fontWeight: "600" },
+  connectionBadgeText: { color: palette.textDim, fontSize: 10, fontWeight: "600" },
   statusDot: { width: 8, height: 8, borderRadius: 4 },
   statsRow: {
     minHeight: 34,
@@ -687,11 +729,11 @@ const styles = StyleSheet.create({
     gap: space.md,
     paddingHorizontal: space.md,
     borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: color.border,
+    borderTopColor: palette.border,
   },
   stat: { flexDirection: "row", alignItems: "baseline", gap: 3 },
-  statValue: { color: color.text, fontSize: 13, fontWeight: "700" },
-  statLabel: { color: color.textDim, fontSize: 10 },
+  statValue: { color: palette.text, fontSize: 13, fontWeight: "700" },
+  statLabel: { color: palette.textDim, fontSize: 10 },
   runningPill: {
     flexDirection: "row",
     alignItems: "center",
@@ -699,7 +741,7 @@ const styles = StyleSheet.create({
     marginLeft: "auto",
   },
   runningPillIdle: { opacity: 0.72 },
-  runningPillText: { color: color.textDim, fontSize: 10, fontWeight: "600" },
+  runningPillText: { color: palette.textDim, fontSize: 10, fontWeight: "600" },
   deviceList: {
     gap: 2,
     paddingBottom: space.lg,
@@ -719,10 +761,10 @@ const styles = StyleSheet.create({
     paddingVertical: space.sm,
     borderRadius: radius.sm,
   },
-  deviceRowSelected: { backgroundColor: color.accentBg },
+  deviceRowSelected: { backgroundColor: palette.accentBg },
   deviceRowCopy: { flex: 1, gap: 2 },
-  deviceRowName: { ...font.body, fontWeight: "600" },
-  deviceRowDetail: font.meta,
+  deviceRowName: { ...themedFont.body, fontWeight: "600" },
+  deviceRowDetail: themedFont.meta,
   deviceRowActions: { flexDirection: "row", alignItems: "center", paddingRight: space.xs },
   deviceAction: {
     width: 42,
@@ -731,13 +773,13 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     borderRadius: radius.sm,
   },
-  dangerPressed: { backgroundColor: color.dangerBg },
+  dangerPressed: { backgroundColor: palette.dangerBg },
   deviceSheetDivider: {
     height: StyleSheet.hairlineWidth,
     marginTop: space.sm,
-    backgroundColor: color.border,
+    backgroundColor: palette.border,
   },
-  pressed: { backgroundColor: color.pressed },
+  pressed: { backgroundColor: palette.pressed },
   recentSection: { gap: space.sm },
   sectionHeading: {
     minHeight: 36,
@@ -745,8 +787,8 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "space-between",
   },
-  sectionTitle: { ...font.title, fontSize: 17 },
-  sectionSubtitle: { color: color.textDim, fontSize: 10, marginTop: 1 },
+  sectionTitle: { ...themedFont.title, fontSize: 17 },
+  sectionSubtitle: { color: palette.textDim, fontSize: 10, marginTop: 1 },
   iconButton: {
     width: 36,
     height: 36,
@@ -764,16 +806,16 @@ const styles = StyleSheet.create({
     paddingHorizontal: space.md,
     paddingVertical: space.sm,
     borderRadius: radius.md,
-    backgroundColor: color.surface,
+    backgroundColor: palette.surface,
   },
-  recentCardPressed: { backgroundColor: color.pressed },
+  recentCardPressed: { backgroundColor: palette.pressed },
   recentCopy: { flex: 1, minWidth: 0, gap: 3 },
-  recentTitle: { ...font.body, fontSize: 13, fontWeight: "600" },
-  recentMeta: { color: color.textDim, fontSize: 10.5 },
+  recentTitle: { ...themedFont.body, fontSize: 13, fontWeight: "600" },
+  recentMeta: { color: palette.textDim, fontSize: 10.5 },
   recentEmpty: {
-    ...font.meta,
+    ...themedFont.meta,
     paddingVertical: space.sm,
-    color: color.textDim,
+    color: palette.textDim,
   },
   workspaceSection: { gap: space.md },
   workspaceHeading: {
@@ -782,8 +824,8 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     gap: space.md,
   },
-  workspaceTitle: { ...font.title, fontSize: 19 },
-  workspaceSubtitle: { ...font.meta, marginTop: 3 },
+  workspaceTitle: { ...themedFont.title, fontSize: 19 },
+  workspaceSubtitle: { ...themedFont.meta, marginTop: 3 },
   workspaceActions: { flexDirection: "row", alignItems: "center", gap: space.xs },
   createButton: {
     minHeight: 34,
@@ -793,19 +835,19 @@ const styles = StyleSheet.create({
     gap: 4,
     paddingHorizontal: space.md,
     borderRadius: radius.sm,
-    backgroundColor: color.accentDim,
+    backgroundColor: palette.accentDim,
   },
   createButtonPressed: { opacity: 0.8 },
-  createButtonText: { color: color.text, fontSize: 12, fontWeight: "700" },
+  createButtonText: { color: palette.text, fontSize: 12, fontWeight: "700" },
   projectGap: { height: space.sm },
   projectCard: {
     minHeight: 64,
     borderRadius: radius.md,
-    backgroundColor: color.surface,
+    backgroundColor: palette.surface,
   },
   projectCardExpanded: {
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: color.accentDim,
+    borderColor: palette.accentDim,
   },
   projectHeader: {
     minHeight: 64,
@@ -813,30 +855,30 @@ const styles = StyleSheet.create({
     alignItems: "center",
     gap: space.sm,
     padding: space.md,
-    backgroundColor: color.surface,
+    backgroundColor: palette.surface,
   },
   // 不依赖父层 overflow 裁剪：它在 Android/Fabric 动态高度列表中会再次造成文字消失。
-  projectCardPressed: { borderRadius: radius.md, backgroundColor: color.pressed },
+  projectCardPressed: { borderRadius: radius.md, backgroundColor: palette.pressed },
   projectIcon: {
     width: 38,
     height: 38,
     alignItems: "center",
     justifyContent: "center",
     borderRadius: radius.md,
-    backgroundColor: color.accentBg,
+    backgroundColor: palette.accentBg,
   },
   projectCopy: { flex: 1, minWidth: 0, gap: 2 },
-  projectName: { ...font.body, fontSize: 15, fontWeight: "700" },
-  projectPath: { ...font.meta, color: color.textDim },
+  projectName: { ...themedFont.body, fontSize: 15, fontWeight: "700" },
+  projectPath: { ...themedFont.meta, color: palette.textDim },
   projectMeta: { alignItems: "flex-end", gap: space.sm, maxWidth: 112 },
-  projectState: { ...font.meta, textAlign: "right" },
-  projectPending: { color: color.warn, fontWeight: "600" },
-  projectRunning: { color: color.success, fontWeight: "600" },
+  projectState: { ...themedFont.meta, textAlign: "right" },
+  projectPending: { color: palette.warn, fontWeight: "600" },
+  projectRunning: { color: palette.success, fontWeight: "600" },
   sessionList: {
     paddingHorizontal: space.sm,
     paddingBottom: space.sm,
     borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: color.border,
+    borderTopColor: palette.border,
   },
   sessionRow: {
     minHeight: 62,
@@ -847,13 +889,13 @@ const styles = StyleSheet.create({
     paddingVertical: space.sm,
     borderRadius: radius.sm,
   },
-  sessionRowPressed: { backgroundColor: color.pressed },
+  sessionRowPressed: { backgroundColor: palette.pressed },
   sessionCopy: { flex: 1, minWidth: 0, gap: 3 },
-  sessionTitle: { ...font.body, fontSize: 14, fontWeight: "600" },
-  sessionPreview: { ...font.meta, color: color.textDim },
+  sessionTitle: { ...themedFont.body, fontSize: 14, fontWeight: "600" },
+  sessionPreview: { ...themedFont.meta, color: palette.textDim },
   sessionState: { flexDirection: "row", alignItems: "center", gap: 5 },
   sessionStatusDot: { width: 6, height: 6, borderRadius: 3 },
-  sessionStatusText: { ...font.meta, color: color.textDim },
+  sessionStatusText: { ...themedFont.meta, color: palette.textDim },
   workspaceEmpty: {
     flex: 1,
     minHeight: 270,
@@ -863,7 +905,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: space.xl,
     paddingVertical: space.xl,
     borderRadius: radius.lg,
-    backgroundColor: color.surface,
+    backgroundColor: palette.surface,
   },
   emptyIcon: {
     width: 54,
@@ -871,18 +913,19 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
     borderRadius: radius.lg,
-    backgroundColor: color.surfaceRaised,
+    backgroundColor: palette.surfaceRaised,
   },
-  emptyTitle: { ...font.title, fontSize: 17, textAlign: "center" },
-  emptyDetail: { ...font.sub, maxWidth: 360, lineHeight: 19, textAlign: "center" },
+  emptyTitle: { ...themedFont.title, fontSize: 17, textAlign: "center" },
+  emptyDetail: { ...themedFont.sub, maxWidth: 360, lineHeight: 19, textAlign: "center" },
   emptyAction: {
     minHeight: 44,
     alignItems: "center",
     justifyContent: "center",
     paddingHorizontal: space.xl,
     borderRadius: radius.md,
-    backgroundColor: color.accentBg,
+    backgroundColor: palette.accentBg,
   },
-  emptyActionPressed: { backgroundColor: color.pressed },
-  emptyActionText: { color: color.accent, fontSize: 14, fontWeight: "600" },
-});
+  emptyActionPressed: { backgroundColor: palette.pressed },
+  emptyActionText: { color: palette.accent, fontSize: 14, fontWeight: "600" },
+  });
+}

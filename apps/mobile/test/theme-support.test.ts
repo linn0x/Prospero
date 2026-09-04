@@ -52,10 +52,64 @@ describe("mobile theme support", () => {
 
   it("keeps navigation and system bars synchronized with the selected mode", () => {
     const layout = readFileSync(join(mobileRoot, "src", "app", "_layout.tsx"), "utf8");
-    expect(layout).toContain("Appearance.setColorScheme");
+    expect(layout).toContain("applyNativeThemeMode(themeMode)");
+    expect(layout).toContain("const activeScheme = resolveThemeScheme(themeMode, systemScheme)");
+    expect(layout).not.toContain("function NativeThemeModeController");
     expect(layout).toContain("paletteForScheme(activeScheme)");
     expect(layout).toContain("<NavigationBar style={activeScheme}");
     expect(layout).toContain('activeScheme === "dark" ? "light" : "dark"');
+  });
+
+  it("provides an explicit React theme without remounting the navigation stack", () => {
+    const layout = readFileSync(join(mobileRoot, "src", "app", "_layout.tsx"), "utf8");
+
+    expect(layout).toContain("<MobileThemeContext.Provider value={mobileTheme}>");
+    expect(layout).not.toContain("nativeThemeEpoch");
+    expect(layout).not.toContain("screenLayout=");
+    expect(layout).not.toContain("<Stack key={activeScheme}");
+  });
+
+  it("renders the mounted home screen from the explicit palette", () => {
+    const home = readFileSync(join(mobileRoot, "src", "app", "index.tsx"), "utf8");
+    const dashboard = readFileSync(
+      join(mobileRoot, "src", "components", "HomeDashboard.tsx"),
+      "utf8",
+    );
+
+    for (const source of [home, dashboard]) {
+      expect(source).toContain("useMobileTheme()");
+      expect(source).toContain("createStyles(palette)");
+    }
+    expect(home).not.toContain("backgroundColor: color.");
+    expect(dashboard).not.toContain("backgroundColor: color.");
+    expect(dashboard).not.toContain("statusColor[");
+  });
+
+  it("publishes the selected palette before syncing Android appearance", () => {
+    const settings = readFileSync(join(mobileRoot, "src", "app", "settings.tsx"), "utf8");
+    const layout = readFileSync(join(mobileRoot, "src", "app", "_layout.tsx"), "utf8");
+
+    expect(settings).toContain("updateSettings({ themeMode });");
+    expect(settings).not.toContain("applyNativeThemeMode(themeMode);");
+    expect(settings).toContain("const styles = useMemo(() => createStyles(palette), [palette])");
+    expect(settings).toContain("function createStyles(palette: ThemePalette)");
+    expect(layout).toContain("useEffect(() => {");
+    expect(layout).toContain("applyNativeThemeMode(themeMode);");
+  });
+
+  it("does not rerender unrelated home and progress trees for a theme-only change", () => {
+    const home = readFileSync(join(mobileRoot, "src", "app", "index.tsx"), "utf8");
+    const progressBridge = readFileSync(
+      join(mobileRoot, "src", "components", "RunningSessionProgressBridge.tsx"),
+      "utf8",
+    );
+
+    expect(home).not.toContain("useApp((state) => state.homeSettings) ??");
+    expect(home).toContain("state.homeSettings?.recentSessionLimit");
+    expect(home).toContain("state.homeSettings?.workspaceAliases");
+    expect(progressBridge).not.toContain("useApp((state) => state.homeSettings) ??");
+    expect(progressBridge).toContain("state.homeSettings?.backgroundProgressEnabled");
+    expect(progressBridge).toContain("state.homeSettings?.overlayProgressEnabled");
   });
 
   it.each(["light", "dark"] as const)("keeps %s theme text at readable contrast", (scheme) => {
@@ -95,16 +149,20 @@ describe("mobile theme support", () => {
     }
   });
 
-  it("offers an expanded composer with quick character input", () => {
+  it("offers a full-width expanded composer with reliable in-field controls", () => {
     const source = readFileSync(
       join(mobileRoot, "src", "app", "host", "[hostId]", "session", "[sid].tsx"),
       "utf8",
     );
-    expect(source).toContain('accessibilityLabel="放大输入框"');
-    expect(source).toContain('accessibilityLabel="收起输入框"');
-    expect(source).toContain('["@", "/", "$", "#", "`"]');
-    expect(source).toContain("insertQuickCharacter(value)");
-    expect(source).toContain("styles.inputExpanded");
+    expect(source).toContain('composerExpanded ? "收起输入框" : "放大输入框"');
+    expect(source).toContain("styles.composerResizeButton");
+    expect(source).toContain("hitSlop={10}");
+    expect(source).toContain("styles.inputShellExpanded");
+    expect(source).toContain("styles.expandedComposerActions");
+    expect(source).toContain('label: "@ 文件"');
+    expect(source).toContain('label: "``` 代码块"');
+    expect(source).toContain("insertQuickCharacter(tool.value, tool.cursorOffset ?? 0)");
+    expect(source).toContain("adaptiveLayout.height * 0.22");
   });
 });
 

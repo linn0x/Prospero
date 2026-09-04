@@ -1,4 +1,11 @@
-import { DynamicColorIOS, Platform, PlatformColor } from "react-native";
+import { createContext, useContext } from "react";
+import {
+  Appearance,
+  DynamicColorIOS,
+  Platform,
+  PlatformColor,
+  type ColorSchemeName,
+} from "react-native";
 
 /** Menlo 不随 Android 分发；monospace 会映射到设备自带的等宽字体。 */
 export const MONOSPACE_FONT = Platform.OS === "ios" ? "Menlo" : "monospace";
@@ -51,6 +58,36 @@ export const lightColor: { [Key in keyof typeof darkColor]: string } = {
 
 export type ThemePalette = { [Key in keyof typeof darkColor]: string };
 export type ThemeScheme = "light" | "dark";
+export type ThemeMode = ThemeScheme | "system";
+export type MobileTheme = { scheme: ThemeScheme; palette: ThemePalette };
+export const MobileThemeContext = createContext<MobileTheme>({
+  scheme: "dark",
+  palette: darkColor,
+});
+let lastAppliedNativeThemeMode: ThemeMode | undefined;
+
+/** 显式主题上下文用于需要在同一 React 提交内完成换色的页面。 */
+export function useMobileTheme(): MobileTheme {
+  return useContext(MobileThemeContext);
+}
+
+/** 应用主题使用用户偏好作为即时状态；系统模式才读取设备外观。 */
+export function resolveThemeScheme(
+  mode: ThemeMode,
+  systemScheme: ColorSchemeName,
+): ThemeScheme {
+  return mode === "system" ? (systemScheme === "light" ? "light" : "dark") : mode;
+}
+
+/**
+ * 在 React 提交后同步 Android uiMode。Appearance.setColorScheme 本身不会主动派发
+ * change 事件，因此固定明/暗模式的界面状态不能依赖 useColorScheme 回传。
+ */
+export function applyNativeThemeMode(mode: ThemeMode): void {
+  if (lastAppliedNativeThemeMode === mode) return;
+  lastAppliedNativeThemeMode = mode;
+  Appearance.setColorScheme(mode === "system" ? "unspecified" : mode);
+}
 
 const androidResource: Record<keyof ThemePalette, string> = {
   bg: "prospero_bg",
