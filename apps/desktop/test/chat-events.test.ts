@@ -4,14 +4,20 @@ import {
   CHAT_TIMELINE_WINDOW_SIZE,
   CHAT_DRAFT_STORAGE_KEY,
   CHAT_DRAFT_TTL_MS,
+  MAX_CHAT_ATTACHMENT_BYTES,
+  MAX_CHAT_ATTACHMENT_NAME_LENGTH,
+  MAX_CHAT_ATTACHMENT_TOTAL_BYTES,
   MAX_CHAT_DRAFT_LENGTH,
   MAX_CHAT_DRAFTS,
   MAX_RETAINED_CHAT_ITEMS,
   ChatEventAccumulator,
   collapseChatEventHistory,
+  getChatAttachmentSelectionIssue,
+  getChatComposerKeyAction,
   getChatPollReconnectDelay,
   getChatTimelineItemWindow,
   getChatTimelineWindow,
+  getNextChatSkillIndex,
   hasChatResolution,
   isChatViewportNearEnd,
   limitChatDraftText,
@@ -19,6 +25,7 @@ import {
   mergeFailedChatDraft,
   parseChatDraftEntries,
   persistChatDraft,
+  splitChatTextBlocks,
   updateChatDraftEntries,
   updateChatHistoryCursorFromScroll,
 } from "../src/renderer/src/chat-events";
@@ -105,6 +112,51 @@ describe("Electron chat drafts", () => {
     expect(loadChatDraft("a", readBlocked)).toBe("");
     expect(persistChatDraft("a", "draft", readBlocked)).toBe(false);
     expect(persistChatDraft("a", "draft", writeBlocked)).toBe(false);
+  });
+});
+
+describe("Electron chat composer", () => {
+  it("separates fenced code from readable assistant text", () => {
+    expect(splitChatTextBlocks("Before\n```ts\nconst value = 1;\n```\nAfter")).toEqual([
+      { kind: "text", value: "Before\n" },
+      { kind: "code", language: "ts", value: "const value = 1;" },
+      { kind: "text", value: "\nAfter" },
+    ]);
+    expect(splitChatTextBlocks("```unfinished")).toEqual([
+      { kind: "text", value: "```unfinished" },
+    ]);
+  });
+
+  it("does not submit while an IME composition is being confirmed", () => {
+    expect(getChatComposerKeyAction("Enter", false, true, 0)).toBeUndefined();
+    expect(getChatComposerKeyAction("Enter", false, false, 0)).toBe("send");
+    expect(getChatComposerKeyAction("Enter", true, false, 0)).toBeUndefined();
+  });
+
+  it("supports keyboard navigation for skill suggestions", () => {
+    expect(getChatComposerKeyAction("ArrowDown", false, false, 3)).toBe("nextSkill");
+    expect(getChatComposerKeyAction("ArrowUp", false, false, 3)).toBe("previousSkill");
+    expect(getChatComposerKeyAction("Enter", false, false, 3)).toBe("selectSkill");
+    expect(getChatComposerKeyAction("Escape", false, false, 3)).toBe("dismissSkills");
+    expect(getNextChatSkillIndex(-1, 3, 1)).toBe(0);
+    expect(getNextChatSkillIndex(-1, 3, -1)).toBe(2);
+    expect(getNextChatSkillIndex(2, 3, 1)).toBe(0);
+    expect(getNextChatSkillIndex(0, 3, -1)).toBe(2);
+  });
+
+  it("rejects unsupported, oversized, excessive, and over-budget attachments", () => {
+    const image = { name: "image.png", type: "image/png", size: 1024 };
+
+    expect(getChatAttachmentSelectionIssue([], [{ ...image, name: "image.heic", type: "image/heic" }])).toEqual({ kind: "type", name: "image.heic" });
+    const longName = `${"x".repeat(MAX_CHAT_ATTACHMENT_NAME_LENGTH)}.png`;
+    expect(getChatAttachmentSelectionIssue([], [{ ...image, name: longName }])).toEqual({ kind: "name", name: longName });
+    expect(getChatAttachmentSelectionIssue([], [{ ...image, name: "large.png", size: MAX_CHAT_ATTACHMENT_BYTES + 1 }])).toEqual({ kind: "size", name: "large.png" });
+    expect(getChatAttachmentSelectionIssue(Array.from({ length: 6 }, () => image), [image])).toEqual({ kind: "count" });
+    expect(getChatAttachmentSelectionIssue(
+      [{ size: MAX_CHAT_ATTACHMENT_TOTAL_BYTES - 512 }],
+      [{ ...image, size: 1024 }],
+    )).toEqual({ kind: "total" });
+    expect(getChatAttachmentSelectionIssue([{ size: 1024 }], [image])).toBeUndefined();
   });
 });
 

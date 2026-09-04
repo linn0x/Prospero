@@ -29,6 +29,8 @@ type PersistedDesktopState = {
 
 const SAFE_PERSISTED_SESSION_ID = /^[A-Za-z0-9._:-]{1,160}$/;
 const HYDRATED_SESSION_ID_LIMIT = 500;
+const MAX_DESKTOP_LOG_CHARS = 500_000;
+const LOG_FLUSH_DELAY_MS = 120;
 
 type CachedJsonFile = {
   signature: string;
@@ -204,6 +206,7 @@ export class StateStore extends EventEmitter {
   private startupStage = "";
   private lastError: string | undefined;
   private logs = "";
+  private logFlushTimer: ReturnType<typeof setTimeout> | undefined;
   private readonly legacyDesktopStatePath: string;
   private readonly jsonFiles = new Map<string, CachedJsonFile>();
   private cachedSnapshot: DesktopSnapshot | undefined;
@@ -232,6 +235,10 @@ export class StateStore extends EventEmitter {
     this.loadLogTail();
   }
 
+  settingsSnapshot(): DesktopSettings {
+    return { ...this.settings };
+  }
+
   snapshot(): DesktopSnapshot {
     const config = this.readExternalJson(resolve(this.home, "config.json"));
     const status = this.readExternalJson(resolve(this.home, "status.json"));
@@ -239,7 +246,7 @@ export class StateStore extends EventEmitter {
     const running = isProcessAlive(rawPid);
     if (this.discoverSessionProjects(status)) this.internalRevision += 1;
     const devicesRoot = this.readExternalJson(resolve(this.home, "devices.json"));
-    const orchestration = this.readExternalJson(resolve(this.home, "orchestration.json"));
+    const orchestration = this.readOrchestrationProjection();
     const previousInputs = this.cachedSnapshotInputs;
     if (
       this.cachedSnapshot
@@ -610,7 +617,15 @@ export class StateStore extends EventEmitter {
   appendLog(value: string): void {
     if (!value) return;
     const safe = value.replace(/(hostSecret|controlToken|token|ticket|authorization)(\s*[:=]\s*)([^\s,}\]]+)/gi, "$1$2[REDACTED]");
-    this.logs = `${this.logs}${safe}`.split(/\r?\n/).slice(-500).join("\n");
+    this.logs = `${this.logs}${safe}`.split(/\r?\n/).slice(-500).join("\n").slice(-MAX_DESKTOP_LOG_CHARS);
+    if (this.logFlushTimer) return;
+    this.logFlushTimer = setTimeout(() => this.flushLogs(), LOG_FLUSH_DELAY_MS);
+    this.logFlushTimer.unref?.();
+  }
+
+  flushLogs(): void {
+    if (this.logFlushTimer) clearTimeout(this.logFlushTimer);
+    this.logFlushTimer = undefined;
     try {
       writeFileSync(resolve(this.home, "desktop.log"), this.logs, { encoding: "utf8", mode: 0o600 });
     } catch {
@@ -620,6 +635,8 @@ export class StateStore extends EventEmitter {
   }
 
   clearLogs(): DesktopSnapshot {
+    if (this.logFlushTimer) clearTimeout(this.logFlushTimer);
+    this.logFlushTimer = undefined;
     this.logs = "";
     try { writeFileSync(resolve(this.home, "desktop.log"), "", { encoding: "utf8", mode: 0o600 }); } catch { /* ignored */ }
     this.changed();
@@ -701,6 +718,12 @@ export class StateStore extends EventEmitter {
       sameSignatureRechecks: SAME_SIGNATURE_RECHECKS,
     });
     return value;
+  }
+
+  private readOrchestrationProjection(): JsonObject {
+    const projectionPath = resolve(this.home, "orchestration-desktop.json");
+    const projection = this.readExternalJson(projectionPath);
+    return numberValue(projection["version"]) === 1 ? projection : {};
   }
 
   private discoverSessionProjects(status: JsonObject): boolean {

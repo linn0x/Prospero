@@ -35,6 +35,8 @@ import {
 
 const PERSIST_DEBOUNCE_MS = 200;
 const MAX_ORCHESTRATION_EVENTS = 2_048;
+const DESKTOP_TASK_SPEC_LIMIT = 320;
+const DESKTOP_TASK_RESULT_LIMIT = 400;
 export const MAX_TASK_SKILLS = 5;
 const SKILL_NAME = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 
@@ -124,6 +126,34 @@ function compactGate(gate: Gate): CompactEntity {
     decision: gate.decision,
     createdAt: gate.createdAt,
     resolvedAt: gate.resolvedAt,
+  };
+}
+
+function limitedText(value: string, limit: number): string {
+  return value.length <= limit ? value : `${value.slice(0, limit - 1)}…`;
+}
+
+function desktopProjection(state: OrchestrationState, revision: number): Record<string, unknown> {
+  return {
+    version: 1,
+    revision,
+    runs: Object.values(state.runs).map((run) => ({
+      ...compactRun(run),
+      automation: run.automation ?? null,
+    })),
+    tasks: Object.values(state.tasks).map((task) => ({
+      ...compactTask(task),
+      spec: limitedText(task.spec, DESKTOP_TASK_SPEC_LIMIT),
+      specTruncated: task.spec.length > DESKTOP_TASK_SPEC_LIMIT,
+      result: task.result === null ? null : limitedText(task.result, DESKTOP_TASK_RESULT_LIMIT),
+      resultTruncated: task.result !== null && task.result.length > DESKTOP_TASK_RESULT_LIMIT,
+    })),
+    dispatches: Object.values(state.dispatches).map((dispatch) => ({
+      ...compactDispatch(dispatch),
+      worktreePath: dispatch.worktreePath,
+    })),
+    gates: Object.values(state.gates).map(compactGate),
+    worktreeAssets: Object.values(state.worktreeAssets),
   };
 }
 
@@ -219,6 +249,7 @@ export class OrchestrationStore {
     gate: new Map(),
   };
   private readonly file: string | null;
+  private readonly desktopFile: string | null;
   private timer: NodeJS.Timeout | null = null;
   private closed = false;
   private readonly changeListeners = new Set<() => void>();
@@ -226,8 +257,10 @@ export class OrchestrationStore {
   /** home 省略时纯内存(测试用) */
   constructor(home?: string) {
     this.file = home ? path.join(home, "orchestration.json") : null;
+    this.desktopFile = home ? path.join(home, "orchestration-desktop.json") : null;
     this.load();
     this.resetEventShadow();
+    this.persistDesktopProjection();
   }
 
   private load(): void {
@@ -488,6 +521,15 @@ export class OrchestrationStore {
       events: this.events,
     }, null, 2), { mode: 0o600 });
     renameSync(tmp, this.file);
+    this.persistDesktopProjection();
+  }
+
+  private persistDesktopProjection(): void {
+    if (!this.desktopFile) return;
+    mkdirSync(path.dirname(this.desktopFile), { recursive: true });
+    const tmp = `${this.desktopFile}.tmp.${process.pid}`;
+    writeFileSync(tmp, JSON.stringify(desktopProjection(this.state, this.eventSeq)), { mode: 0o600 });
+    renameSync(tmp, this.desktopFile);
   }
 
   close(): void {

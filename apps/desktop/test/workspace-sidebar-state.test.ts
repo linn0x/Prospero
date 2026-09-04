@@ -3,10 +3,12 @@ import type { SessionInfo } from "../src/shared/types";
 import {
   adaptiveSidebarOpen,
   filterSessionsByQuery,
+  matchesDesktopShortcut,
   mostRelevantProject,
   nextSidebarSessionLimit,
   parseExpandedProjects,
   projectForSession,
+  sessionRestoreRetryDelay,
   sortProjectsByRecentActivity,
   sortSidebarSessions,
 } from "../src/renderer/src/workspace-sidebar-state";
@@ -30,6 +32,56 @@ function session(
 }
 
 describe("workspace sidebar state", () => {
+  it("backs off historical session restoration before releasing startup", () => {
+    expect(sessionRestoreRetryDelay(0)).toBe(500);
+    expect(sessionRestoreRetryDelay(3)).toBe(4_000);
+    expect(sessionRestoreRetryDelay(5)).toBeUndefined();
+  });
+
+  it("keeps global shortcuts out of shell control keys", () => {
+    const event = {
+      altKey: false,
+      ctrlKey: true,
+      defaultPrevented: false,
+      key: "k",
+      metaKey: false,
+      repeat: false,
+      shiftKey: false,
+      target: null,
+    };
+
+    expect(matchesDesktopShortcut(event, "k", "win32")).toBe(false);
+    expect(
+      matchesDesktopShortcut({ ...event, shiftKey: true }, "k", "win32"),
+    ).toBe(true);
+    expect(
+      matchesDesktopShortcut(
+        {
+          ...event,
+          shiftKey: true,
+          target: { closest: () => ({}) } as unknown as EventTarget,
+        },
+        "k",
+        "win32",
+      ),
+    ).toBe(false);
+    expect(
+      matchesDesktopShortcut(
+        { ...event, ctrlKey: false, metaKey: true },
+        "k",
+        "darwin",
+      ),
+    ).toBe(true);
+    expect(
+      matchesDesktopShortcut(
+        { ...event, ctrlKey: false, key: "f", metaKey: true, shiftKey: true },
+        "f",
+        "darwin",
+        true,
+      ),
+    ).toBe(true);
+  });
+
   it("uses hysteresis while no explicit sidebar preference exists", () => {
     expect(adaptiveSidebarOpen(1_080, true)).toBe(false);
     expect(adaptiveSidebarOpen(1_200, false)).toBe(false);

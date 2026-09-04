@@ -13,6 +13,13 @@ const COMPLETED_TASK_STATES = new Set(["done", "completed", "succeeded"]);
 
 export type TaskBoardColumnId = "queued" | "ready" | "running" | "review" | "done";
 
+export type RunTimelineItem = {
+  id: string;
+  kind: "task" | "gate";
+  item: JsonObject;
+  time: number;
+};
+
 function valueText(value: unknown): string {
   return typeof value === "string" ? value.toLocaleLowerCase() : "";
 }
@@ -48,6 +55,36 @@ export function prioritizeWorktrees(assets: JsonObject[]): JsonObject[] {
     const rightUpdatedAt = timestamp(right["updatedAt"] ?? right["createdAt"]);
     const leftUpdatedAt = timestamp(left["updatedAt"] ?? left["createdAt"]);
     return rightUpdatedAt - leftUpdatedAt;
+  });
+}
+
+export function runTimelineItems(tasks: JsonObject[], gates: JsonObject[]): RunTimelineItem[] {
+  return [
+    ...tasks.map((item): RunTimelineItem => ({
+      id: String(item["id"] ?? ""),
+      kind: "task",
+      item,
+      time: timestamp(item["updatedAt"] ?? item["createdAt"]),
+    })),
+    ...gates.map((item): RunTimelineItem => ({
+      id: String(item["id"] ?? ""),
+      kind: "gate",
+      item,
+      time: timestamp(item["resolvedAt"] ?? item["createdAt"]),
+    })),
+  ].sort((left, right) => right.time - left.time || left.kind.localeCompare(right.kind) || left.id.localeCompare(right.id));
+}
+
+export function runListLabel(objective: string): string {
+  return objective.match(/\bsupervise PSM\s+([^\s]+)/i)?.[1] ?? objective;
+}
+
+export function prioritizeRuns(runs: JsonObject[]): JsonObject[] {
+  return [...runs].sort((left, right) => {
+    const active = Number(valueText(right["status"]) === "active") - Number(valueText(left["status"]) === "active");
+    if (active !== 0) return active;
+    const updated = timestamp(right["updatedAt"] ?? right["createdAt"]) - timestamp(left["updatedAt"] ?? left["createdAt"]);
+    return updated || String(left["id"] ?? "").localeCompare(String(right["id"] ?? ""));
   });
 }
 
