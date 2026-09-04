@@ -7,6 +7,55 @@ export const SIDEBAR_SESSION_PAGE_SIZE = 24;
 export const SIDEBAR_COLLAPSE_WIDTH = 1_080;
 export const SIDEBAR_EXPAND_WIDTH = 1_320;
 
+export function sessionRestoreRetryDelay(attempt: number): number | undefined {
+  if (!Number.isInteger(attempt) || attempt < 0 || attempt >= 5) return undefined;
+  return 500 * 2 ** attempt;
+}
+
+type DesktopShortcutEvent = Pick<
+  KeyboardEvent,
+  | "altKey"
+  | "ctrlKey"
+  | "defaultPrevented"
+  | "key"
+  | "metaKey"
+  | "repeat"
+  | "shiftKey"
+  | "target"
+>;
+
+export function matchesDesktopShortcut(
+  event: DesktopShortcutEvent,
+  key: string,
+  platform: string,
+  macShift = false,
+): boolean {
+  if (
+    event.defaultPrevented ||
+    event.repeat ||
+    event.altKey ||
+    event.key.toLocaleLowerCase() !== key.toLocaleLowerCase()
+  )
+    return false;
+  const target = event.target as
+    | (EventTarget & { closest?: (selector: string) => Element | null })
+    | null;
+  if (
+    target?.closest?.(
+      ".xterm,input,textarea,select,[contenteditable]:not([contenteditable='false']),[role='dialog']",
+    )
+  )
+    return false;
+  if (
+    typeof document !== "undefined" &&
+    document.querySelector("[role='dialog']")
+  )
+    return false;
+  return platform === "darwin"
+    ? event.metaKey && !event.ctrlKey && event.shiftKey === macShift
+    : event.ctrlKey && !event.metaKey && event.shiftKey;
+}
+
 export function adaptiveSidebarOpen(width: number, current: boolean): boolean {
   if (!Number.isFinite(width)) return current;
   if (width <= SIDEBAR_COLLAPSE_WIDTH) return false;

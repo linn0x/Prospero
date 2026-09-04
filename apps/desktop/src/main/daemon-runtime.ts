@@ -6,6 +6,8 @@ import { loginPath, resolveNodeExecutable } from "./host-environment.js";
 import type { JsonObject } from "../shared/types";
 import { StateStore } from "./state-store";
 
+const DAEMON_START_TIMEOUT_MS = 90_000;
+
 function findRepositoryRoot(start: string): string | undefined {
   let current = resolve(start);
   for (let depth = 0; depth < 10; depth += 1) {
@@ -125,7 +127,7 @@ export class DaemonRuntime {
       });
     }
 
-    const ready = await this.waitUntilReady(30_000, (progress, stage) => {
+    const ready = await this.waitUntilReady(DAEMON_START_TIMEOUT_MS, (progress, stage) => {
       this.store.setStartupProgress(progress, stage, launchedPid);
     });
     launchPending = false;
@@ -211,7 +213,7 @@ export class DaemonRuntime {
     });
   }
 
-  async request(path: string, init?: { method?: "GET" | "POST"; body?: JsonObject }): Promise<JsonObject | null> {
+  async request(path: string, init?: { method?: "GET" | "POST"; body?: JsonObject; signal?: AbortSignal }): Promise<JsonObject | null> {
     const { port, token } = this.store.controlCredentials();
     const request: RequestInit = {
       method: init?.method ?? "GET",
@@ -219,7 +221,9 @@ export class DaemonRuntime {
         authorization: `Bearer ${token}`,
         ...(init?.body ? { "content-type": "application/json" } : {}),
       },
-      signal: AbortSignal.timeout(path.includes("waitMs=") ? 30_000 : 18_000),
+      signal: init?.signal
+        ? AbortSignal.any([init.signal, AbortSignal.timeout(path.includes("waitMs=") ? 30_000 : 18_000)])
+        : AbortSignal.timeout(path.includes("waitMs=") ? 30_000 : 18_000),
     };
     if (init?.body) request.body = JSON.stringify(init.body);
     const response = await fetch(`http://127.0.0.1:${String(port)}${path}`, request);

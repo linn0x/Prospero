@@ -37,8 +37,100 @@ export const CHAT_DRAFT_STORAGE_KEY = "prospero.chatDrafts";
 export const MAX_CHAT_DRAFT_LENGTH = 20_000;
 export const MAX_CHAT_DRAFTS = 40;
 export const CHAT_DRAFT_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
+export const MAX_CHAT_ATTACHMENTS = 6;
+export const MAX_CHAT_ATTACHMENT_BYTES = 5 * 1024 * 1024;
+export const MAX_CHAT_ATTACHMENT_TOTAL_BYTES = 10 * 1024 * 1024;
+export const MAX_CHAT_ATTACHMENT_NAME_LENGTH = 200;
 const CHAT_TIMELINE_COMPACT_TARGET = 1_800;
 const MAX_PROTECTED_ACTIVE_ITEMS = 512;
+
+export type ChatComposerKeyAction = "dismissSkills" | "nextSkill" | "previousSkill" | "selectSkill" | "send";
+
+export type ChatAttachmentSelectionIssue = {
+  kind: "count" | "name" | "size" | "total" | "type";
+  name?: string;
+};
+
+export type ChatTextBlock =
+  | { kind: "text"; value: string }
+  | { kind: "code"; value: string; language: string };
+
+type ChatAttachmentCandidate = {
+  name: string;
+  size: number;
+  type: string;
+};
+
+const CHAT_ATTACHMENT_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+
+export function splitChatTextBlocks(value: string): ChatTextBlock[] {
+  const blocks: ChatTextBlock[] = [];
+  let cursor = 0;
+  while (cursor < value.length) {
+    const start = value.indexOf("```", cursor);
+    if (start < 0) {
+      blocks.push({ kind: "text", value: value.slice(cursor) });
+      break;
+    }
+    if (start > cursor) blocks.push({ kind: "text", value: value.slice(cursor, start) });
+    const lineEnd = value.indexOf("\n", start + 3);
+    if (lineEnd < 0) {
+      blocks.push({ kind: "text", value: value.slice(start) });
+      break;
+    }
+    const end = value.indexOf("```", lineEnd + 1);
+    if (end < 0) {
+      blocks.push({ kind: "text", value: value.slice(start) });
+      break;
+    }
+    blocks.push({
+      kind: "code",
+      language: value.slice(start + 3, lineEnd).trim().slice(0, 40),
+      value: value.slice(lineEnd + 1, end).replace(/\n$/, ""),
+    });
+    cursor = end + 3;
+  }
+  return blocks.length > 0 ? blocks : [{ kind: "text", value }];
+}
+
+export function getChatComposerKeyAction(
+  key: string,
+  shiftKey: boolean,
+  composing: boolean,
+  skillCount: number,
+): ChatComposerKeyAction | undefined {
+  if (composing) return undefined;
+  if (skillCount > 0) {
+    if (key === "ArrowDown") return "nextSkill";
+    if (key === "ArrowUp") return "previousSkill";
+    if (key === "Escape") return "dismissSkills";
+    if (key === "Enter" && !shiftKey) return "selectSkill";
+  }
+  if (key === "Enter" && !shiftKey) return "send";
+  return undefined;
+}
+
+export function getNextChatSkillIndex(current: number, count: number, direction: -1 | 1): number {
+  if (count <= 0) return -1;
+  if (current < 0 || current >= count) return direction > 0 ? 0 : count - 1;
+  return (current + direction + count) % count;
+}
+
+export function getChatAttachmentSelectionIssue(
+  current: readonly Pick<ChatAttachmentCandidate, "size">[],
+  incoming: readonly ChatAttachmentCandidate[],
+): ChatAttachmentSelectionIssue | undefined {
+  const unsupported = incoming.find((file) => !CHAT_ATTACHMENT_MIME_TYPES.has(file.type));
+  if (unsupported) return { kind: "type", name: unsupported.name };
+  const longName = incoming.find((file) => file.name.length > MAX_CHAT_ATTACHMENT_NAME_LENGTH);
+  if (longName) return { kind: "name", name: longName.name };
+  if (current.length + incoming.length > MAX_CHAT_ATTACHMENTS) return { kind: "count" };
+  const oversized = incoming.find((file) => file.size > MAX_CHAT_ATTACHMENT_BYTES);
+  if (oversized) return { kind: "size", name: oversized.name };
+  const total = [...current, ...incoming].reduce((sum, file) => sum + Math.max(0, file.size), 0);
+  if (total > MAX_CHAT_ATTACHMENT_TOTAL_BYTES) return { kind: "total" };
+  return undefined;
+}
 
 export type ChatDraftEntry = {
   sessionId: string;

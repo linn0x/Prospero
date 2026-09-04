@@ -1,30 +1,88 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { applyDesktopSnapshotPatch, mergeDesktopSnapshotPatches } from "../../shared/snapshot-patch";
 import type { DesktopSnapshot, DesktopSnapshotPatch } from "../../shared/types";
 
-export function useDesktopSnapshot(): DesktopSnapshot | undefined {
+const snapshotKeys = [
+  "daemon",
+  "projects",
+  "projectAliases",
+  "pinnedProjectPaths",
+  "pinnedSessionIds",
+  "archivedSessionIds",
+  "unreadSessionIds",
+  "workflowTemplates",
+  "devices",
+  "accounts",
+  "orchestration",
+  "logs",
+  "settings",
+] as const satisfies readonly (keyof DesktopSnapshot)[];
+
+export function desktopSnapshotFromPatch(
+  patch: DesktopSnapshotPatch,
+): DesktopSnapshot | undefined {
+  if (!snapshotKeys.every((key) => Object.hasOwn(patch, key))) return undefined;
+  if (!patch.daemon || !Object.hasOwn(patch.daemon, "sessions")) return undefined;
+  return patch as DesktopSnapshot;
+}
+
+export type DesktopSnapshotState = {
+  snapshot: DesktopSnapshot | undefined;
+  error: string | undefined;
+  retry: () => void;
+};
+
+export function useDesktopSnapshot(): DesktopSnapshotState {
   const [snapshot, setSnapshot] = useState<DesktopSnapshot>();
+  const [error, setError] = useState<string>();
+  const [attempt, setAttempt] = useState(0);
+  const retry = useCallback((): void => {
+    setError(undefined);
+    setAttempt((current) => current + 1);
+  }, []);
   useEffect(() => {
     let active = true;
     let loaded = false;
     let pendingPatch: DesktopSnapshotPatch = {};
-    void window.prospero.getSnapshot().then((next) => {
-      if (!active) return;
-      loaded = true;
-      setSnapshot(applyDesktopSnapshotPatch(next, pendingPatch));
-      pendingPatch = {};
-    });
+    void window.prospero.getSnapshot()
+      .then((next) => {
+        if (!active || loaded) return;
+        loaded = true;
+        setError(undefined);
+        setSnapshot(applyDesktopSnapshotPatch(next, pendingPatch));
+        pendingPatch = {};
+      })
+      .catch((reason: unknown) => {
+        if (!active || loaded) return;
+        const initial = desktopSnapshotFromPatch(pendingPatch);
+        if (initial) {
+          loaded = true;
+          pendingPatch = {};
+          setError(undefined);
+          setSnapshot(initial);
+          return;
+        }
+        setError(displayError(reason));
+      });
     const unsubscribe = window.prospero.subscribeSnapshot((patch) => {
       if (!active) return;
       if (!loaded) {
+        const initial = desktopSnapshotFromPatch(patch);
+        if (initial) {
+          loaded = true;
+          pendingPatch = {};
+          setError(undefined);
+          setSnapshot(initial);
+          return;
+        }
         pendingPatch = mergeDesktopSnapshotPatches(pendingPatch, patch);
         return;
       }
       setSnapshot((current) => current ? applyDesktopSnapshotPatch(current, patch) : current);
     });
     return () => { active = false; unsubscribe(); };
-  }, []);
-  return snapshot;
+  }, [attempt]);
+  return { snapshot, error, retry };
 }
 
 export function displayError(error: unknown): string {
@@ -52,7 +110,8 @@ export function record(value: unknown): Record<string, unknown> {
 
 export function shortPath(path: string): string {
   const parts = path.split(/[\\/]/).filter(Boolean);
-  return parts.slice(-2).join("\\") || path;
+  const separator = path.includes("/") ? "/" : "\\";
+  return parts.slice(-2).join(separator) || path;
 }
 
 export function statusLabel(status: string): string {

@@ -2570,7 +2570,7 @@ export async function createDaemonServer(
     if (req.method === "POST" && sessionInteractMatch) {
       try {
         const sid = decodeURIComponent(sessionInteractMatch[1]!);
-        const body = await readControlJson(req);
+        const body = await readControlJson(req, 16 * 1024 * 1024);
         // 复用手机协议校验，Mac 本地工作台不会悄悄形成第三套输入语义。
         const message = parseC2S({ ...body, sid });
         switch (message.type) {
@@ -2638,6 +2638,56 @@ export async function createDaemonServer(
           res.writeHead(400).end("invalid session or subagent id");
         } else {
           res.writeHead(400).end(e instanceof Error ? e.message : String(e));
+        }
+      }
+      return;
+    }
+    const orchestrationTaskMatch = url.pathname.match(
+      /^\/_prospero\/control\/orchestration\/task\/([^/]+)$/,
+    );
+    if (req.method === "GET" && orchestrationTaskMatch) {
+      try {
+        const task = orchestrationStore.getTask(
+          decodeURIComponent(orchestrationTaskMatch[1]!),
+        );
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(task));
+      } catch (error) {
+        if (error instanceof OrchestrationError) {
+          res.writeHead(error.code === "task_not_found" ? 404 : 409).end(error.message);
+        } else if (error instanceof URIError) {
+          res.writeHead(400).end("invalid task id");
+        } else {
+          res.writeHead(400).end(error instanceof Error ? error.message : String(error));
+        }
+      }
+      return;
+    }
+    const orchestrationRunTasksMatch = url.pathname.match(
+      /^\/_prospero\/control\/orchestration\/run\/([^/]+)\/tasks$/,
+    );
+    if (req.method === "GET" && orchestrationRunTasksMatch) {
+      try {
+        const runId = decodeURIComponent(orchestrationRunTasksMatch[1]!);
+        orchestrationStore.getRun(runId);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          items: orchestrationStore.listTasks(runId).map((task) => ({
+            id: task.id,
+            runId: task.runId,
+            title: task.title,
+            spec: task.spec,
+            deps: task.deps,
+            skills: task.skills ?? [],
+          })),
+        }));
+      } catch (error) {
+        if (error instanceof OrchestrationError) {
+          res.writeHead(error.code === "run_not_found" ? 404 : 409).end(error.message);
+        } else if (error instanceof URIError) {
+          res.writeHead(400).end("invalid run id");
+        } else {
+          res.writeHead(400).end(error instanceof Error ? error.message : String(error));
         }
       }
       return;
