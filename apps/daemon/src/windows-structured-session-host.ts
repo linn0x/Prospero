@@ -38,6 +38,7 @@ export interface WindowsStructuredHostBootstrap {
   readonly createdAt: number;
   readonly approvalPolicy?: ApprovalPolicy;
   readonly environment: Record<string, string>;
+  readonly adapterAgent?: AgentKind;
   readonly codexAppServerArgs?: readonly string[];
   readonly accountId?: string;
   readonly accountName?: string;
@@ -65,12 +66,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function bootstrap(value: unknown): WindowsStructuredHostBootstrap {
-  const keys = ["version", "agent", "title", "cwd", "createdAt", "approvalPolicy", "environment", "codexAppServerArgs", "accountId", "accountName", "initialAdapterState"];
+  const keys = ["version", "agent", "title", "cwd", "createdAt", "approvalPolicy", "environment", "adapterAgent", "codexAppServerArgs", "accountId", "accountName", "initialAdapterState"];
   if (!isRecord(value) || !Object.keys(value).every((key) => keys.includes(key)) || value["version"] !== 1 || typeof value["agent"] !== "string" ||
     typeof value["title"] !== "string" || typeof value["cwd"] !== "string" ||
     typeof value["createdAt"] !== "number" || !Number.isFinite(value["createdAt"]) ||
     !isRecord(value["environment"]) ||
     (value["approvalPolicy"] !== undefined && value["approvalPolicy"] !== "strict" && value["approvalPolicy"] !== "standard" && value["approvalPolicy"] !== "yolo") ||
+    (value["adapterAgent"] !== undefined && value["adapterAgent"] !== "opencode") ||
     (value["accountId"] !== undefined && typeof value["accountId"] !== "string") ||
     (value["accountName"] !== undefined && typeof value["accountName"] !== "string") ||
     (value["initialAdapterState"] !== undefined && !isRecord(value["initialAdapterState"]))) {
@@ -241,7 +243,7 @@ export async function createWindowsStructuredSessionHostHandler(
 ): Promise<WindowsSessionHostCommandHandler> {
   const config = bootstrap(context.handlerOptions);
   const job = await context.createProviderJob();
-  const selectedAdapter = adapter ?? adapterFor(config.agent, config.initialAdapterState);
+  const selectedAdapter = adapter ?? adapterFor(config.adapterAgent ?? config.agent, config.initialAdapterState);
   const session = new StructuredSession({
     id: context.sessionId,
     agent: config.agent,

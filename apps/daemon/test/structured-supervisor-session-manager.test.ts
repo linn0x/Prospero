@@ -142,6 +142,44 @@ afterEach(async () => {
 });
 
 describe("SessionManager structured supervisor facade", () => {
+  it.skipIf(process.platform === "win32")("routes a Chat Completions account to the detached OpenCode adapter", async () => {
+    const value = home();
+    let adapterAgent: string | undefined;
+    const manager = new SessionManager({
+      home: value,
+      accountResolver: (accountId) => ({
+        id: accountId,
+        agent: "codex",
+        name: "Chat API",
+        managed: true,
+        environment: {},
+        adapterAgent: "opencode",
+        apiProfile: {
+          provider: "openai_compatible",
+          protocol: "openai_chat_completions",
+          baseUrl: "https://chat.example.com/v1",
+          model: "chat-coder",
+        },
+      }),
+      supervisorLauncher: async (input) => {
+        adapterAgent = input.adapterAgent;
+        return fakeLauncher(input);
+      },
+    });
+    const info = await manager.create({
+      agent: "codex",
+      accountId: "chat-profile",
+      kind: "structured",
+      cwd: value,
+      cols: 80,
+      rows: 24,
+      allowShell: false,
+    });
+    expect(adapterAgent).toBe("opencode");
+    await manager.kill(info.id);
+    await manager.disposeAll();
+  });
+
   it.skipIf(process.platform === "win32")("creates, reconnects after daemon client disposal, serves cached tool output, and only kill terminates the owner", async () => {
     const value = home();
     const first = new SessionManager({ home: value, supervisorLauncher: fakeLauncher });

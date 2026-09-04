@@ -11,6 +11,7 @@ export {
   parseS2C,
   AgentKindSchema,
   AgentApiProviderSchema,
+  AgentApiProtocolSchema,
   AgentApiProfileSchema,
   SessionKindSchema,
   SessionStatusSchema,
@@ -102,6 +103,7 @@ export {
 export type {
   ApprovalPolicy,
   AgentApiProvider,
+  AgentApiProtocol,
   AgentApiProfile,
   ChatDelivery,
   ChatSuggestionKind,

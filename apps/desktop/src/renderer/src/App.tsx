@@ -88,10 +88,15 @@ import {
   sessionRestoreRetryDelay,
   sortProjectsByRecentActivity,
   sortSidebarSessions,
+  upsertHydratedSession,
+  validOpenSessionIds,
+  workspaceChromeVisible,
 } from "./workspace-sidebar-state";
 import {
   defaultSessionLaunchAccountId,
+  duplicateSessionAccountState,
   sessionLaunchAccounts,
+  sessionLaunchRequiresStructured,
   sessionLaunchWorkspaces,
 } from "../../shared/session-launch-options";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -1249,15 +1254,6 @@ function ShellSidebar({
       mobileDescription={t("主导航、工作区与会话", "Main navigation, workspaces, and sessions")}
     >
       <SidebarHeader className="sidebar-shell-header">
-        <div className="sidebar-brand">
-          <span className="sidebar-brand-mark" aria-hidden="true">
-            <Bot />
-          </span>
-          <span className="sidebar-brand-copy">
-            <strong>Prospero</strong>
-            <small>{t("Agent 工作台", "Agent workspace")}</small>
-          </span>
-        </div>
         <SidebarTrigger
           className="sidebar-header-toggle"
           aria-label={t("切换侧边栏", "Toggle sidebar")}
@@ -3090,9 +3086,13 @@ function WorkspacePane({
   focus: boolean;
 }) {
   const { t, status } = useLocale();
+  const chromeVisible = workspaceChromeVisible(focus);
   const [showContext, setShowContext] = useState(false);
-  const contextVisible = showContext && !focus;
+  const contextVisible = showContext && chromeVisible;
   const [contextSheet, setContextSheet] = useState(false);
+  useEffect(() => {
+    if (!chromeVisible) setContextSheet(false);
+  }, [chromeVisible]);
   const active = snapshot.daemon.sessions.find(
     (session) => session.id === activeId,
   );
@@ -3117,7 +3117,7 @@ function WorkspacePane({
   return (
     <div className="workspace-view workspace-view-single">
       <div className={cn("pane-workspace", focus && "is-focus")}>
-        {!focus && <div className="workspace-tabbar">
+        {chromeVisible && <div className="workspace-tabbar">
           <div className="workspace-tabs" role="tablist">
             {openIds.map((id) => {
               const session = snapshot.daemon.sessions.find(
@@ -3205,7 +3205,7 @@ function WorkspacePane({
         </div>}
         {active ? (
           <>
-            {!focus && <header className="pane-toolbar">
+            {chromeVisible && <header className="pane-toolbar">
               <div className="agent-identity">
                 <Avatar>
                   <AvatarFallback>
@@ -3316,14 +3316,14 @@ function WorkspacePane({
             </header>}
             <div className={cn("pane-grid", !contextVisible && "context-hidden")}>
               <main id="workspace-session-panel" role="tabpanel" aria-labelledby={!focus && activeId ? `workspace-tab-${activeId}` : undefined} aria-label={focus ? sessionLabel(active) : undefined} className="primary-pane">
-                <div className="pane-tabbar pane-tabbar-static">
+                {chromeVisible && <div className="pane-tabbar pane-tabbar-static">
                   <span>
                     {active.kind === "pty"
                       ? t("终端", "Terminal")
                       : t("对话", "Conversation")}
                   </span>
                   <Badge variant="outline">{active.agent}</Badge>
-                </div>
+                </div>}
                 <div className="pane-content">
                   {active.kind === "pty" ? (
                     <TerminalPane
@@ -3347,7 +3347,7 @@ function WorkspacePane({
                 </aside>
               )}
             </div>
-            <Sheet open={contextSheet} onOpenChange={setContextSheet}>
+            <Sheet open={chromeVisible && contextSheet} onOpenChange={setContextSheet}>
               <SheetContent
                 side="right"
                 className="w-[min(520px,92vw)] sm:max-w-xl"
@@ -3621,6 +3621,8 @@ function NewSessionDialog({
   const selectedAccount = launchAccounts.find(
     (account) => account.id === input.accountId,
   );
+  const requiresStructured = sessionLaunchRequiresStructured(selectedAccount);
+  const selectedKind: SessionCreateInput["kind"] = requiresStructured ? "structured" : input.kind;
   const selectedWorkspace = launchWorkspaces.find(
     (workspace) => workspace.path === input.cwd,
   );
@@ -3661,10 +3663,14 @@ function NewSessionDialog({
     "opencode",
   ].includes(input.agent);
   const supportsLaunchModels =
-    input.kind === "structured" &&
+    selectedKind === "structured" &&
     (input.agent === "codex" ||
       input.agent === "claude" ||
       input.agent === "deepseek");
+  useEffect(() => {
+    if (!requiresStructured) return;
+    setInput((current) => current.kind === "structured" ? current : { ...current, kind: "structured" });
+  }, [requiresStructured]);
   useEffect(() => {
     if (!open || !supportsLaunchModels) {
       setLaunchModels([]);
@@ -3725,7 +3731,7 @@ function NewSessionDialog({
     setBusy(true);
     setError(undefined);
     try {
-      onCreated(await window.prospero.createSession(input));
+      onCreated(await window.prospero.createSession({ ...input, kind: selectedKind }));
       onOpenChange(false);
     } catch (reason) {
       setError(displayError(reason));
@@ -3868,7 +3874,7 @@ function NewSessionDialog({
               </FieldLabel>
               <NativeSelect
                 id="session-kind"
-                value={input.kind}
+                value={selectedKind}
                 onChange={(event) => {
                   const kind = event.target.value as SessionCreateInput["kind"];
                   setInput({
@@ -3886,10 +3892,11 @@ function NewSessionDialog({
                 >
                   {t("对话", "Conversation")}
                 </NativeSelectOption>
-                <NativeSelectOption value="pty">
+                <NativeSelectOption value="pty" disabled={requiresStructured}>
                   {t("终端", "Terminal")}
                 </NativeSelectOption>
               </NativeSelect>
+              {requiresStructured && <FieldDescription>{t("Chat Completions Profile 使用 OpenCode 结构化引擎，不支持 PTY 终端。", "Chat Completions profiles use the structured OpenCode engine and do not support PTY terminals.")}</FieldDescription>}
             </Field>
           </div>
           {(input.agent === "codex" || input.agent === "claude") && (
@@ -4374,14 +4381,8 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     };
   }, [hydratedSessions, snapshot]);
   const validOpenIds = useMemo(
-    () =>
-      openIds.filter((id) =>
-        sessionSnapshot.daemon.sessions.some((session) => session.id === id),
-      ),
+    () => validOpenSessionIds(openIds, sessionSnapshot.daemon.sessions),
     [openIds, sessionSnapshot.daemon.sessions],
-  );
-  const activeSession = sessionSnapshot.daemon.sessions.find(
-    (session) => session.id === activeId,
   );
   const accountUsageKey = snapshot.accounts
     .map((account) => `${text(account["id"])}:${text(account["status"])}`)
@@ -4535,13 +4536,9 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   }, []);
   const openSession = useCallback((id: string, session?: SessionInfo): void => {
     if (session) {
-      setHydratedSessions((current) => {
-        const next = [
-          session,
-          ...current.filter((item) => item.id !== session.id),
-        ];
-        return next.slice(0, HYDRATED_SESSION_CACHE_LIMIT);
-      });
+      setHydratedSessions((current) =>
+        upsertHydratedSession(current, session, HYDRATED_SESSION_CACHE_LIMIT),
+      );
     }
     setOpenIds((current) =>
       current.includes(id) ? current : [...current, id],
@@ -4604,10 +4601,11 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     const onKey = (event: KeyboardEvent): void => {
       if (view !== "workspaces" || !matchesFocusShortcut(event, window.prospero.platform)) return;
       event.preventDefault();
+      event.stopPropagation();
       setFocus((current) => !current);
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
   }, [view]);
   const duplicateSession = useCallback((session: SessionInfo): void => {
     setSessionActionError(undefined);
@@ -4639,11 +4637,25 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
         ["codex", "claude", "deepseek", "opencode"].includes(agent)
           ? "structured"
           : "pty";
+      const accountState = duplicateSessionAccountState(snapshotRef.current.accounts, session);
+      if (accountState === "missing") {
+        throw new Error(t(
+          `原会话账号“${session.accountName ?? session.accountId}”已删除，无法安全复制`,
+          `The source account “${session.accountName ?? session.accountId}” was deleted and cannot be copied safely`,
+        ));
+      }
+      if (accountState === "unavailable") {
+        throw new Error(t(
+          `原会话账号“${session.accountName ?? session.accountId}”当前不可用`,
+          `The source account “${session.accountName ?? session.accountId}” is unavailable`,
+        ));
+      }
       const created = await window.prospero.createSession({
         cwd: project,
         agent,
         kind,
         approvalPolicy,
+        ...(session.accountId ? { accountId: session.accountId } : {}),
       });
       openSession(created.id, created);
       try {
@@ -4664,6 +4676,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   }, [openSession, t]);
   const page = getViewCopy(view, t);
   const workspaceFocus = focus && view === "workspaces";
+  const shellChromeVisible = workspaceChromeVisible(workspaceFocus);
   return (
     <TooltipProvider>
     <SidebarProvider
@@ -4680,7 +4693,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
       <a className="skip-link" href="#main-content">
         {t("跳到主内容", "Skip to main content")}
       </a>
-      <ShellSidebar
+      {shellChromeVisible && <ShellSidebar
         snapshot={sessionSnapshot}
         view={view}
         activeId={activeId}
@@ -4693,67 +4706,34 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
         onRenameSession={setEditingSession}
         onDuplicateSession={duplicateSession}
         onSetUnread={setUnread}
-      />
+      />}
       <SidebarInset id="main-content" tabIndex={-1} className="prospero-main">
-        <header
-          className={cn(
-            "desktop-topbar",
-            workspaceFocus && "terminal-focus-topbar",
-          )}
-        >
-          <div className="topbar-context">
+        {!workspaceFocus && <header className="desktop-topbar">
+          {shellChromeVisible && <div className="topbar-context">
             <SidebarTrigger
               className="topbar-sidebar-trigger"
               aria-label={t("打开侧边栏", "Open sidebar")}
               title={t("打开侧边栏", "Open sidebar")}
             />
-            {(view === "overview" || workspaceFocus) && <div>
+            {view === "overview" && <div>
               <strong>
-                {activeSession && view === "workspaces"
-                  ? sessionLabel(activeSession)
-                  : page.title}
+                {page.title}
               </strong>
               <span>
-                {activeSession && view === "workspaces"
-                  ? shortPath(activeSession.cwd)
-                  : page.description}
+                {page.description}
               </span>
             </div>}
-          </div>
+          </div>}
           <div className="topbar-actions">
-            {workspaceFocus ? (
-              <Button
-                variant="outline"
-                className="focus-exit"
-                aria-label={t("退出专注", "Exit focus")}
-                onClick={() => setFocus(false)}
-              >
-                <Minimize2 data-icon="inline-start" />
-                <span>{t("退出专注", "Exit focus")}</span>
-                <kbd>{isMac ? "⇧⌘F" : "Ctrl Alt F"}</kbd>
-              </Button>
-            ) : (
-              <>
-                <Button
-                  variant="outline"
-                  className="search-trigger"
-                  aria-label={t("搜索或运行命令", "Search or run a command")}
-                  onClick={() => setLauncher("command")}
-                >
-                  <Search data-icon="inline-start" />
-                  <span>{t("搜索或运行命令", "Search or run a command")}</span>
-                  <kbd>{isMac ? "⌘K" : "Ctrl Shift K"}</kbd>
-                </Button>
-                <Button onClick={() => openNewSession()}>
-                  <Plus data-icon="inline-start" />
-                  {t("新建会话", "New session")}
-                </Button>
-              </>
-            )}
+            <Button onClick={() => openNewSession()}>
+              <Plus data-icon="inline-start" />
+              {t("新建会话", "New session")}
+            </Button>
           </div>
-        </header>
+        </header>}
+        {workspaceFocus && <><div className="focus-drag-region" aria-hidden="true" /><Button variant="outline" size="icon-sm" className="focus-exit-overlay" aria-label={t("退出专注", "Exit focus")} title={t(`退出专注（${isMac ? "⇧⌘F" : "Ctrl+Alt+F"}）`, `Exit focus (${isMac ? "⇧⌘F" : "Ctrl+Alt+F"})`)} onClick={() => setFocus(false)}><Minimize2 /></Button></>}
         <div className="main-viewport">
-          {sessionActionError && <Alert variant="destructive" className="mx-7 mt-5 w-auto"><CircleAlert /><AlertTitle>{t("会话操作失败", "Session action failed")}</AlertTitle><AlertDescription>{sessionActionError}</AlertDescription><Button variant="ghost" size="sm" className="ml-auto" onClick={() => setSessionActionError(undefined)}>{t("关闭", "Dismiss")}</Button></Alert>}
+          {sessionActionError && !workspaceFocus && <Alert variant="destructive" className="mx-7 mt-5 w-auto"><CircleAlert /><AlertTitle>{t("会话操作失败", "Session action failed")}</AlertTitle><AlertDescription>{sessionActionError}</AlertDescription><Button variant="ghost" size="sm" className="ml-auto" onClick={() => setSessionActionError(undefined)}>{t("关闭", "Dismiss")}</Button></Alert>}
           <Suspense
             fallback={
               <div className="boot-screen">

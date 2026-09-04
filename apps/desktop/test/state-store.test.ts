@@ -24,6 +24,27 @@ afterEach(() => {
 });
 
 describe("Electron state snapshot caching", () => {
+  it("exposes only explicitly advertised daemon capabilities", () => {
+    const current = testHome();
+    const legacy = testHome();
+    writeJson(current, "status.json", {
+      pid: process.pid,
+      port: 7423,
+      controlToken: "token",
+      capabilities: ["agent.api-protocols.v1", "", "x".repeat(201)],
+      sessions: [],
+    });
+    writeJson(legacy, "status.json", {
+      pid: process.pid,
+      port: 7424,
+      controlToken: "token",
+      sessions: [],
+    });
+
+    expect(new StateStore(current).snapshot().daemon.capabilities).toEqual(["agent.api-protocols.v1"]);
+    expect(new StateStore(legacy).snapshot().daemon.capabilities).toBeUndefined();
+  });
+
   it("preserves workflow templates up to the orchestration graph limits", () => {
     const store = new StateStore(testHome());
     const title = "t".repeat(2_000);
@@ -268,6 +289,8 @@ describe("Electron state snapshot caching", () => {
           status: "waiting_input",
           pendingQuestions: 1,
           busySince: 10,
+          accountId: "profile-1",
+          accountName: "Work API",
           messageQueue: [{ id: "queue-1", text: "next", kind: "queue", createdAt: 11, attachmentCount: 0 }],
         },
         { id: "recent", cwd: home, agent: "codex", kind: "structured", status: "completed" },
@@ -292,6 +315,8 @@ describe("Electron state snapshot caching", () => {
     expect(current.daemon.sessions.map((session) => session.id)).toEqual(["attention", "recent"]);
     expect(current.daemon.sessions[0]).toMatchObject({
       busySince: 10,
+      accountId: "profile-1",
+      accountName: "Work API",
       messageQueue: [{ id: "queue-1", text: "next", kind: "queue" }],
     });
     expect(current.daemon.sessionSummary).toEqual({

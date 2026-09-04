@@ -18,6 +18,8 @@ export type SessionInfo = {
   status: string;
   preview?: string;
   createdAt?: number;
+  accountId?: string;
+  accountName?: string;
   pendingPermissions?: number;
   pendingQuestions?: number;
   approvalPolicy?: string;
@@ -88,6 +90,7 @@ export type DaemonSnapshot = {
   state: string;
   lastError?: string;
   persistence: { pty: boolean; structured: boolean };
+  capabilities?: string[];
   relay: JsonObject;
   /** Global counts; `sessions` below is intentionally a bounded live slice. */
   sessionSummary?: SessionSummary;

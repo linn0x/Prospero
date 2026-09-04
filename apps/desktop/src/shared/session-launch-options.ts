@@ -1,4 +1,4 @@
-import type { DesktopSnapshot, JsonObject, SessionCreateInput } from "./types";
+import type { DesktopSnapshot, JsonObject, SessionCreateInput, SessionInfo } from "./types";
 
 export type SessionLaunchWorkspace = {
   path: string;
@@ -111,4 +111,18 @@ export function defaultSessionLaunchAccountId(
 ): string | undefined {
   const matches = sessionLaunchAccounts(accounts, agent);
   return matches.find((account) => account.isDefault)?.id ?? matches[0]?.id;
+}
+
+export function sessionLaunchRequiresStructured(account?: SessionLaunchAccount): boolean {
+  return account?.apiProfile?.["protocol"] === "openai_chat_completions";
+}
+
+export function duplicateSessionAccountState(
+  accounts: JsonObject[],
+  session: Pick<SessionInfo, "accountId">,
+): "legacy" | "ready" | "missing" | "unavailable" {
+  if (!session.accountId) return "legacy";
+  const account = accounts.find((item) => stringValue(item["id"]) === session.accountId);
+  if (!account) return "missing";
+  return stringValue(account["status"]) === "unavailable" ? "unavailable" : "ready";
 }

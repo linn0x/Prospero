@@ -13,6 +13,7 @@ import { WebSocketServer, WebSocket, type RawData } from "ws";
 import {
   CAPABILITY_AGENT_ACCOUNTS,
   CAPABILITY_AGENT_API_PROFILES,
+  CAPABILITY_AGENT_API_PROTOCOLS,
   CAPABILITY_AGENT_DEEPSEEK_HARNESS,
   CAPABILITY_CHAT_ATTACHMENT_PREVIEWS,
   CAPABILITY_DEEPSEEK_TRAJECTORY,
@@ -623,25 +624,31 @@ export async function createDaemonServer(
     const action = accountAction(message);
     try {
       let sessionId: string | undefined;
+      let accountId: string | undefined;
       switch (message.type) {
         case "agent.accounts.list":
           break;
         case "agent.account.create":
-          accounts.create(message.agent, message.name);
+          accountId = accounts.create(message.agent, message.name).id;
           break;
         case "agent.account.api.create":
-          await accounts.createApi(message.agent, message.name, {
+          accountId = (await accounts.createApi(message.agent, message.name, {
+            ...(message.provider ? { provider: message.provider } : {}),
+            ...(message.protocol ? { protocol: message.protocol } : {}),
             baseUrl: message.baseUrl,
             model: message.model,
             apiKey: message.apiKey,
-          });
+          })).id;
           break;
         case "agent.account.api.configure":
           await accounts.configureApi(message.accountId, {
-            baseUrl: message.baseUrl,
-            model: message.model,
-            apiKey: message.apiKey,
-          });
+            ...(message.name ? { name: message.name } : {}),
+            ...(message.provider ? { provider: message.provider } : {}),
+            ...(message.protocol ? { protocol: message.protocol } : {}),
+            ...(message.baseUrl ? { baseUrl: message.baseUrl } : {}),
+            ...(message.model ? { model: message.model } : {}),
+            ...(message.apiKey !== undefined ? { apiKey: message.apiKey } : {}),
+          }, manager.list(), manager.accountInUse(message.accountId));
           break;
         case "agent.account.rename":
           accounts.rename(message.accountId, message.name);
@@ -663,13 +670,23 @@ export async function createDaemonServer(
             message.accountId,
             message.credentialKind,
             message.credential,
+            manager.list(),
+            manager.accountInUse(message.accountId),
           );
           break;
         case "agent.account.logout":
-          await accounts.logout(message.accountId);
+          await accounts.logout(
+            message.accountId,
+            manager.list(),
+            manager.accountInUse(message.accountId),
+          );
           break;
         case "agent.account.delete":
-          await accounts.delete(message.accountId, manager.list());
+          await accounts.delete(
+            message.accountId,
+            manager.list(),
+            manager.accountInUse(message.accountId),
+          );
           break;
       }
       return {
@@ -680,6 +697,7 @@ export async function createDaemonServer(
           action,
           ok: true,
           accounts: await accounts.snapshot(manager.list()),
+          ...(accountId ? { accountId } : {}),
           ...(sessionId ? { sessionId } : {}),
         },
       };
@@ -703,6 +721,7 @@ export async function createDaemonServer(
 
   function orchestrationCapabilities(conn: Conn): string[] {
     const capabilities: string[] = [];
+    if (conn.protocolVersion >= 16 && conn.device?.allowShell) capabilities.push(CAPABILITY_AGENT_API_PROTOCOLS);
     if (conn.protocolVersion >= 15) capabilities.push(CAPABILITY_FS_PUT_ACK);
     capabilities.push(CAPABILITY_AGENT_DEEPSEEK_HARNESS);
     if (conn.protocolVersion >= 14) capabilities.push(CAPABILITY_DEEPSEEK_TRAJECTORY);
@@ -1163,6 +1182,9 @@ export async function createDaemonServer(
           const account = msg.accountId && msg.agent !== "deepseek"
             ? accounts.resolve(msg.accountId, msg.agent)
             : undefined;
+          if (account?.adapterAgent) {
+            throw new AgentAccountError("OpenAI Chat Completions Profile 暂不支持接回历史对话", "account_invalid");
+          }
           const conversations = await conversationSearch(
             msg.agent,
             msg.query,
@@ -1208,6 +1230,20 @@ export async function createDaemonServer(
             type: "error",
             code: "bad_message",
             message: "当前协商协议不支持第三方 API Profile",
+          });
+          return;
+        }
+        if (
+          conn.protocolVersion < 16 &&
+          ((msg.type === "agent.account.api.create" && (msg.provider !== undefined || msg.protocol !== undefined)) ||
+            (msg.type === "agent.account.api.configure" &&
+              (msg.name !== undefined || msg.provider !== undefined || msg.protocol !== undefined ||
+                msg.baseUrl === undefined || msg.model === undefined || msg.apiKey === undefined || msg.apiKey.trim().length === 0)))
+        ) {
+          send(conn, {
+            type: "error",
+            code: "bad_message",
+            message: "当前协商协议不支持 API Profile 协议选择或保留凭据更新",
           });
           return;
         }

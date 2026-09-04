@@ -40,6 +40,7 @@ const DAEMON_KEYS = [
   "state",
   "lastError",
   "persistence",
+  "capabilities",
   "relay",
   "sessionSummary",
 ] as const satisfies readonly Exclude<keyof DaemonSnapshot, "sessions">[];

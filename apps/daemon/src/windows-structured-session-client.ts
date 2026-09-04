@@ -111,6 +111,7 @@ export interface LaunchWindowsStructuredSessionInput {
   readonly createdAt: number;
   readonly approvalPolicy?: ApprovalPolicy;
   readonly environment: Record<string, string>;
+  readonly adapterAgent?: AgentKind;
   readonly codexAppServerArgs?: readonly string[];
   readonly accountId?: string;
   readonly accountName?: string;
@@ -821,6 +822,7 @@ async function launchWindowsStructuredSessionUnlocked(input: LaunchWindowsStruct
   const bootstrap: WindowsStructuredHostBootstrap = {
     version: 1, agent: input.agent, title: input.title, cwd: input.cwd, createdAt: input.createdAt,
     ...(input.approvalPolicy ? { approvalPolicy: input.approvalPolicy } : {}), environment: input.environment,
+    ...(input.adapterAgent ? { adapterAgent: input.adapterAgent } : {}),
     ...(input.codexAppServerArgs ? { codexAppServerArgs: input.codexAppServerArgs } : {}),
     ...(input.accountId ? { accountId: input.accountId } : {}), ...(input.accountName ? { accountName: input.accountName } : {}),
     ...(input.initialAdapterState ? { initialAdapterState: input.initialAdapterState } : {}),

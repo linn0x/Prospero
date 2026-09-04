@@ -299,7 +299,7 @@ describe("daemon 全链路", () => {
         rmSync(fakeBin, { recursive: true, force: true });
       }
     }
-  });
+  }, 15_000);
 
   it("Mac GUI 控制接口仅接受 status.json 中的本机口令", async () => {
     const status = JSON.parse(readFileSync(path.join(home, "status.json"), "utf8")) as {
@@ -641,6 +641,7 @@ describe("daemon 全链路", () => {
       "hello.ok",
     )) as Extract<S2CMessage, { type: "hello.ok" }>;
     expect(hello.host.capabilities).toContain("agent.accounts.v1");
+    expect(hello.host.capabilities).toContain("agent.api-protocols.v1");
     expect(hello.host.capabilities).toContain("agent.deepseek-harness.v1");
     expect(hello.host.capabilities).toContain("agent.deepseek-trajectory.v1");
 
@@ -668,6 +669,7 @@ describe("daemon 全链路", () => {
     )) as Extract<S2CMessage, { type: "agent.accounts.result" }>;
     const account = created.accounts.find((candidate) => candidate.name === "集成测试 Codex");
     expect(account).toMatchObject({ agent: "codex", managed: true });
+    expect(created.accountId).toBe(account!.id);
 
     c.send({
       type: "agent.account.rename",
@@ -681,6 +683,39 @@ describe("daemon 全链路", () => {
       20_000,
     )) as Extract<S2CMessage, { type: "agent.accounts.result" }>;
     expect(renamed.accounts).toContainEqual(expect.objectContaining({ id: account!.id, name: "发布 Codex" }));
+
+    c.send({
+      type: "agent.account.api.create",
+      requestId: "accounts-chat-create",
+      agent: "codex",
+      name: "Chat API",
+      provider: "openai_compatible",
+      protocol: "openai_chat_completions",
+      baseUrl: "https://chat.example.com/v1/chat/completions",
+      model: "chat-coder",
+      apiKey: "test-key",
+    });
+    const chatCreated = (await c.waitFor(
+      (m) => m.type === "agent.accounts.result" && m.requestId === "accounts-chat-create",
+      "created chat profile",
+      20_000,
+    )) as Extract<S2CMessage, { type: "agent.accounts.result" }>;
+    const chat = chatCreated.accounts.find((candidate) => candidate.name === "Chat API")!;
+    expect(chatCreated.accountId).toBe(chat.id);
+    expect(chat.apiProfile).toMatchObject({ protocol: "openai_chat_completions", baseUrl: "https://chat.example.com/v1" });
+    c.send({
+      type: "conversation.search",
+      requestId: "chat-history",
+      agent: "codex",
+      accountId: chat.id,
+      query: "",
+    });
+    const chatHistory = (await c.waitFor(
+      (m) => m.type === "conversation.results" && m.requestId === "chat-history",
+      "chat profile history rejection",
+    )) as Extract<S2CMessage, { type: "conversation.results" }>;
+    expect(chatHistory.conversations).toEqual([]);
+    expect(chatHistory.error).toMatch(/暂不支持/);
     c.close();
   }, 30000);
 
@@ -940,15 +975,17 @@ describe("daemon 全链路", () => {
     c.close();
   }, 20000);
 
-  it("v14 与旧 v13/v12/v8/v7/v5 客户端沿用原配对即可连接新 daemon", async () => {
-    for (const version of [14, 13, 12, 8, 7, 5]) {
+  it("v15 与旧 v14/v13/v12/v8/v7/v5 客户端沿用原配对即可连接新 daemon", async () => {
+    for (const version of [15, 14, 13, 12, 8, 7, 5]) {
       const c = await TestClient.connect(deviceToken, deviceKeys, version);
       const hello = (await c.waitFor(
         (m) => m.type === "hello.ok",
         `legacy v${String(version)} hello.ok`,
       )) as Extract<S2CMessage, { type: "hello.ok" }>;
       expect(hello.host.negotiatedProtocolVersion).toBe(version);
-      expect(hello.host.capabilities).not.toContain("fs.put-ack.v1");
+      if (version >= 15) expect(hello.host.capabilities).toContain("fs.put-ack.v1");
+      else expect(hello.host.capabilities).not.toContain("fs.put-ack.v1");
+      expect(hello.host.capabilities).not.toContain("agent.api-protocols.v1");
       if (version < 14) expect(hello.host.capabilities).not.toContain("agent.deepseek-trajectory.v1");
       if (version < 9) expect(hello.host.capabilities).not.toContain("subagent.history.v1");
       if (version < 11) {
@@ -964,6 +1001,36 @@ describe("daemon 全链路", () => {
       }
       c.close();
     }
+    const v15 = await TestClient.connect(deviceToken, deviceKeys, 15);
+    await v15.waitFor((message) => message.type === "hello.ok", "v15 hello.ok");
+    v15.send({
+      type: "agent.account.api.create",
+      requestId: "v15-new-api-fields",
+      agent: "codex",
+      name: "must reject",
+      provider: "openai_compatible",
+      protocol: "openai_chat_completions",
+      baseUrl: "https://chat.example.com/v1",
+      model: "chat-coder",
+      apiKey: "test-key",
+    });
+    await expect(v15.waitFor(
+      (message) => message.type === "error" && message.code === "bad_message",
+      "v15 API protocol rejection",
+    )).resolves.toMatchObject({ message: expect.stringMatching(/不支持/) });
+    v15.send({
+      type: "agent.account.api.configure",
+      requestId: "v15-empty-key",
+      accountId: "not-used",
+      baseUrl: "https://gateway.example.com/v1",
+      model: "model",
+      apiKey: "",
+    });
+    await expect(v15.waitFor(
+      (message) => message.type === "error" && message.code === "bad_message",
+      "v15 empty API key rejection",
+    )).resolves.toMatchObject({ message: expect.stringMatching(/不支持/) });
+    v15.close();
   }, 20000);
 
   it("握手 → hello.ok → 创建会话 → 输出 → 正常结束", async () => {

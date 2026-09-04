@@ -13,6 +13,9 @@ import {
   sessionRestoreRetryDelay,
   sortProjectsByRecentActivity,
   sortSidebarSessions,
+  upsertHydratedSession,
+  validOpenSessionIds,
+  workspaceChromeVisible,
 } from "../src/renderer/src/workspace-sidebar-state";
 
 function session(
@@ -38,6 +41,28 @@ describe("workspace sidebar state", () => {
     expect(sessionRestoreRetryDelay(0)).toBe(500);
     expect(sessionRestoreRetryDelay(3)).toBe(4_000);
     expect(sessionRestoreRetryDelay(5)).toBeUndefined();
+  });
+
+  it("keeps a newly created session open before the next daemon snapshot", () => {
+    const created: SessionInfo = {
+      id: "new-session",
+      agent: "codex",
+      kind: "structured",
+      title: "New session",
+      cwd: "/repo",
+      status: "starting",
+    };
+    const hydrated = upsertHydratedSession([], created, 120);
+
+    expect(validOpenSessionIds(["new-session"], hydrated)).toEqual(["new-session"]);
+    expect(upsertHydratedSession(hydrated, { ...created, status: "running" }, 120)).toEqual([
+      { ...created, status: "running" },
+    ]);
+  });
+
+  it("leaves only the primary workspace content visible in focus mode", () => {
+    expect(workspaceChromeVisible(false)).toBe(true);
+    expect(workspaceChromeVisible(true)).toBe(false);
   });
 
   it("keeps the active session inside the bounded restore set", () => {
