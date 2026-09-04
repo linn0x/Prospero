@@ -208,6 +208,66 @@ describe("Electron chat event accumulator", () => {
     expect(model.snapshot().items).toEqual(first.items);
   });
 
+  it("updates trajectory records and subagents in place", () => {
+    const model = new ChatEventAccumulator();
+    const initial = model.reset([
+      {
+        kind: "trajectory.record",
+        recordId: "step-1",
+        recordKind: "step",
+        phase: "running",
+        title: "Analyze",
+      },
+      {
+        kind: "subagent.started",
+        subagent: {
+          id: "child-1",
+          name: "Reviewer",
+          status: "starting",
+          canMessage: true,
+        },
+      },
+    ]);
+    const trajectoryKey = initial.items[0]?.key;
+    const subagentKey = initial.items[1]?.key;
+
+    const updated = model.append([
+      {
+        kind: "trajectory.record",
+        recordId: "step-1",
+        recordKind: "step",
+        phase: "completed",
+        title: "Analyze",
+        detail: "Done",
+      },
+      {
+        kind: "subagent.updated",
+        subagentId: "child-1",
+        status: "completed",
+        summary: "Reviewed",
+      },
+    ]);
+
+    expect(updated?.items).toHaveLength(2);
+    expect(updated?.items[0]).toMatchObject({
+      key: trajectoryKey,
+      event: { phase: "completed", detail: "Done" },
+    });
+    expect(updated?.items[1]).toMatchObject({
+      key: subagentKey,
+      event: {
+        kind: "subagent.updated",
+        subagent: {
+          id: "child-1",
+          name: "Reviewer",
+          status: "completed",
+          canMessage: true,
+          preview: "Reviewed",
+        },
+      },
+    });
+  });
+
   it("keeps thousands of raw text deltas as one stable timeline item", () => {
     const model = new ChatEventAccumulator();
     const deltas = Array.from({ length: 5_000 }, () => ({
@@ -267,6 +327,8 @@ describe("Electron chat event accumulator", () => {
       { kind: "tool.start", msgId: "active", callId: "active-tool", tool: "bash", summary: "run" },
       { kind: "permission.request", reqId: "active-permission", summary: "approve", resources: [] },
       { kind: "question.request", reqId: "active-question", questions: [] },
+      { kind: "trajectory.record", recordId: "active-step", recordKind: "step", phase: "running", title: "Step" },
+      { kind: "subagent.started", subagent: { id: "active-child", name: "Child", status: "starting", canMessage: true } },
     ]);
     model.append(Array.from({ length: 3_000 }, (_, index) => ({ kind: "user.message", msgId: `noise-${String(index)}`, text: "noise" })));
 
@@ -276,12 +338,18 @@ describe("Electron chat event accumulator", () => {
       { kind: "tool.end", callId: "active-tool", state: "success", summary: "done" },
       { kind: "permission.resolved", reqId: "active-permission", reply: "once" },
       { kind: "question.resolved", reqId: "active-question", answers: [] },
+      { kind: "trajectory.record", recordId: "active-step", recordKind: "step", phase: "completed", title: "Step" },
+      { kind: "subagent.updated", subagentId: "active-child", status: "completed", summary: "Done" },
     ]);
 
     expect(snapshot?.items.length).toBeLessThanOrEqual(MAX_RETAINED_CHAT_ITEMS);
     expect(snapshot?.items.find(({ event }) => event.kind === "assistant.text")?.event.text).toBe("ab");
     expect(snapshot?.items.find(({ event }) => event.kind === "reasoning")?.event.text).toBe("rs");
     expect(snapshot?.items.find(({ event }) => event.callId === "active-tool")?.event).toMatchObject({ kind: "tool.end", state: "success" });
+    expect(snapshot?.items.filter(({ event }) => event.recordId === "active-step")).toHaveLength(1);
+    expect(snapshot?.items.find(({ event }) => event.recordId === "active-step")?.event.phase).toBe("completed");
+    expect(snapshot?.items.filter(({ event }) => (event.subagent as JsonObject | undefined)?.id === "active-child")).toHaveLength(1);
+    expect(snapshot?.items.find(({ event }) => (event.subagent as JsonObject | undefined)?.id === "active-child")?.event).toMatchObject({ subagent: { status: "completed", preview: "Done" } });
     expect(hasChatResolution(snapshot?.resolutions ?? new Set(), "permission.resolved", "active-permission")).toBe(true);
     expect(hasChatResolution(snapshot?.resolutions ?? new Set(), "question.resolved", "active-question")).toBe(true);
   });

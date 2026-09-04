@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { chmodSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { chmod, rename, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import os from "node:os";
@@ -69,6 +69,7 @@ import {
   waitForPtyStartupReadiness,
   type PtyStartupReadinessOptions,
 } from "./pty-startup-readiness.js";
+import { writePrivateFileAtomic } from "./filesystem-store.js";
 
 export type SessionErrorCode =
   | "shell_not_allowed"
@@ -343,6 +344,8 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
 
   private readonly metaFile: string | null;
   private readonly structuredFile: string | null;
+  private readonly deletedFile: string | null;
+  private readonly deletedSessionIds: Set<string>;
   private readonly adapterFactory: (agent: AgentKind, state?: AdapterResumeState) => AgentAdapter;
   private readonly sessionEnv: (sessionId: string) => Record<string, string>;
   private readonly accountResolver:
@@ -382,6 +385,8 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     this.metaFile = opts.tmux ? path.join(opts.tmux.home, "pty-sessions.json") : null;
     const home = opts.home ?? opts.tmux?.home;
     this.structuredFile = home ? path.join(home, "structured-sessions.json") : null;
+    this.deletedFile = home ? path.join(home, "deleted-sessions.json") : null;
+    this.deletedSessionIds = this.loadDeletedSessionIds();
     this.structuredSupervisorRoot = home ? path.join(home, "structured-supervisor") : null;
     this.windowsStructuredRoot = home ?? null;
     this.ptySupervisorRoot = home ? path.join(home, "pty-supervisor") : null;
@@ -434,7 +439,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     }
     const restored: SessionInfo[] = [];
     for (const meta of this.loadMeta()) {
-      if (!alive.has(meta.id) || this.ptySessions.has(meta.id)) continue;
+      if (this.deletedSessionIds.has(meta.id) || !alive.has(meta.id) || this.ptySessions.has(meta.id)) continue;
       try {
         // `new-session -A` 存在即 attach,所以恢复和新建走同一条命令
         const account = meta.accountId
@@ -469,6 +474,10 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     if (this.useWindowsPtySessionHost && this.windowsPtySessionHostRoot) {
       const restored: SessionInfo[] = [];
       for (const session of await reconnectWindowsPtySessions(this.windowsPtySessionHostRoot)) {
+        if (this.deletedSessionIds.has(session.id)) {
+          await session.dispose();
+          continue;
+        }
         if (this.ptySessions.has(session.id)) continue;
         this.wirePtySession(session);
         this.ptySessions.set(session.id, session);
@@ -479,13 +488,21 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       return restored;
     }
     if (!this.ptySupervisorRoot) return [];
+    await this.cleanupDeletedSessionDirectories(this.ptySupervisorRoot);
     const restored: SessionInfo[] = [];
     for (const session of await reconnectPtySupervisors(this.ptySupervisorRoot)) {
+      if (this.deletedSessionIds.has(session.id)) {
+        await session.dispose();
+        continue;
+      }
       if (this.ptySessions.has(session.id)) continue;
       this.wirePtySession(session);
       this.ptySessions.set(session.id, session);
       restored.push(session.info());
       this.emit("state", session.info());
+    }
+    for (const sid of [...this.deletedSessionIds]) {
+      if (this.canForgetDeletedSession(sid)) this.forgetDeletedSession(sid);
     }
     return restored;
   }
@@ -499,6 +516,153 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     } catch {
       return [];
     }
+  }
+
+  private loadDeletedSessionIds(): Set<string> {
+    if (!this.deletedFile) return new Set();
+    if (!existsSync(this.deletedFile)) return new Set();
+    try {
+      const value: unknown = JSON.parse(readFileSync(this.deletedFile, "utf8"));
+      if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid deleted session state");
+      const stored = value as { version?: unknown; ids?: unknown };
+      if (stored.version !== 1 || !Array.isArray(stored.ids)) throw new Error("invalid deleted session state");
+      const ids = stored.ids;
+      if (ids.some((id) => typeof id !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(id))) {
+        throw new Error("invalid deleted session id");
+      }
+      return new Set(ids as string[]);
+    } catch (error) {
+      throw new Error("deleted session state is corrupted", { cause: error });
+    }
+  }
+
+  private markSessionDeleted(sid: string): void {
+    if (!this.deletedFile || this.deletedSessionIds.has(sid)) return;
+    this.deletedSessionIds.add(sid);
+    try {
+      writePrivateFileAtomic(this.deletedFile, JSON.stringify({ version: 1, ids: [...this.deletedSessionIds].sort() }));
+    } catch (error) {
+      this.deletedSessionIds.delete(sid);
+      throw error;
+    }
+  }
+
+  private sessionDirectoryCleanup(root: string | null, sid: string): {
+    target: string;
+    dev: number;
+    ino: number;
+    pid: number | null;
+    socket: string | null;
+  } | null {
+    if (!root || !/^[A-Za-z0-9._-]{1,128}$/.test(sid)) return null;
+    const resolvedRoot = path.resolve(root);
+    const target = path.resolve(resolvedRoot, sid);
+    if (path.dirname(target) !== resolvedRoot || path.basename(target) !== sid) return null;
+    try {
+      const rootMetadata = lstatSync(resolvedRoot);
+      const targetMetadata = lstatSync(target);
+      const uid = process.getuid?.();
+      if (!rootMetadata.isDirectory() || rootMetadata.isSymbolicLink() || (rootMetadata.mode & 0o022) !== 0) return null;
+      if (!targetMetadata.isDirectory() || targetMetadata.isSymbolicLink() || (targetMetadata.mode & 0o022) !== 0) return null;
+      if (uid !== undefined && (rootMetadata.uid !== uid || targetMetadata.uid !== uid)) return null;
+      const manifestFile = path.join(target, "manifest.json");
+      const manifestMetadata = lstatSync(manifestFile);
+      if (!manifestMetadata.isFile() || manifestMetadata.isSymbolicLink()) return null;
+      if (uid !== undefined && manifestMetadata.uid !== uid) return null;
+      const value: unknown = JSON.parse(readFileSync(manifestFile, "utf8"));
+      if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+      const manifest = value as Record<string, unknown>;
+      if (manifest["sessionId"] !== sid) return null;
+      if (manifest["sessionDir"] !== undefined && path.resolve(String(manifest["sessionDir"])) !== target) return null;
+      const pid = Number.isSafeInteger(manifest["supervisorPid"]) && Number(manifest["supervisorPid"]) > 1
+        ? Number(manifest["supervisorPid"])
+        : null;
+      const socket = typeof manifest["socket"] === "string" && path.isAbsolute(manifest["socket"])
+        ? manifest["socket"]
+        : null;
+      return { target, dev: targetMetadata.dev, ino: targetMetadata.ino, pid, socket };
+    } catch {
+      return null;
+    }
+  }
+
+  private processAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code !== "ESRCH";
+    }
+  }
+
+  private async removeSessionDirectory(cleanup: ReturnType<SessionManager["sessionDirectoryCleanup"]>): Promise<boolean> {
+    if (!cleanup) return false;
+    const deadline = Date.now() + 4_000;
+    while (cleanup.pid && this.processAlive(cleanup.pid)) {
+      if (cleanup.pid === process.pid && cleanup.socket && !existsSync(cleanup.socket)) break;
+      if (Date.now() >= deadline) return false;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    try {
+      const metadata = lstatSync(cleanup.target);
+      if (!metadata.isDirectory() || metadata.isSymbolicLink()) return false;
+      if (metadata.dev !== cleanup.dev || metadata.ino !== cleanup.ino) return false;
+      const manifest: unknown = JSON.parse(readFileSync(path.join(cleanup.target, "manifest.json"), "utf8"));
+      if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) return false;
+      if ((manifest as { sessionId?: unknown }).sessionId !== path.basename(cleanup.target)) return false;
+      rmSync(cleanup.target, { recursive: true, force: true });
+      return !existsSync(cleanup.target);
+    } catch {
+      return false;
+    }
+  }
+
+  private async cleanupDeletedSessionDirectories(root: string): Promise<void> {
+    for (const sid of [...this.deletedSessionIds]) {
+      const cleanup = this.sessionDirectoryCleanup(root, sid);
+      if (cleanup) await this.removeSessionDirectory(cleanup);
+    }
+  }
+
+  private persistDeletedSessionIds(): void {
+    if (!this.deletedFile) return;
+    writePrivateFileAtomic(this.deletedFile, JSON.stringify({ version: 1, ids: [...this.deletedSessionIds].sort() }));
+  }
+
+  private forgetDeletedSession(sid: string): void {
+    if (!this.deletedSessionIds.delete(sid)) return;
+    try {
+      this.persistDeletedSessionIds();
+    } catch {
+      this.deletedSessionIds.add(sid);
+    }
+  }
+
+  private structuredStateExcludes(sid: string): boolean {
+    if (!this.structuredFile) return true;
+    try {
+      const value: unknown = JSON.parse(readFileSync(this.structuredFile, "utf8"));
+      return Array.isArray(value) && !value.some((state) => state && typeof state === "object" && (state as { id?: unknown }).id === sid);
+    } catch {
+      return false;
+    }
+  }
+
+  private ptyMetaExcludes(sid: string): boolean {
+    if (!this.metaFile) return true;
+    try {
+      const value: unknown = JSON.parse(readFileSync(this.metaFile, "utf8"));
+      return Array.isArray(value) && !value.some((meta) => meta && typeof meta === "object" && (meta as { id?: unknown }).id === sid);
+    } catch {
+      return false;
+    }
+  }
+
+  private canForgetDeletedSession(sid: string): boolean {
+    if (process.platform === "win32") return false;
+    if (!this.structuredStateExcludes(sid) || !this.ptyMetaExcludes(sid)) return false;
+    return [this.structuredSupervisorRoot, this.ptySupervisorRoot]
+      .every((root) => !root || !existsSync(path.join(root, sid)));
   }
 
   private persistMeta(): void {
@@ -595,6 +759,10 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     if (this.useWindowsStructuredHost && this.windowsStructuredRoot) {
       try {
         for (const session of await reconnectWindowsStructuredSessions(this.windowsStructuredRoot)) {
+          if (this.deletedSessionIds.has(session.id)) {
+            await session.dispose();
+            continue;
+          }
           if (this.structuredSessions.has(session.id)) continue;
           this.wireStructuredSession(session);
           this.structuredSessions.set(session.id, session);
@@ -606,7 +774,12 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
         // explicitly non-durable; do not infer or recreate a durable owner.
       }
     } else if (this.structuredSupervisorRoot) {
+      await this.cleanupDeletedSessionDirectories(this.structuredSupervisorRoot);
       for (const session of await reconnectStructuredSupervisors(this.structuredSupervisorRoot)) {
+        if (this.deletedSessionIds.has(session.id)) {
+          await session.dispose();
+          continue;
+        }
         if (this.structuredSessions.has(session.id)) continue;
         this.wireStructuredSession(session);
         this.structuredSessions.set(session.id, session);
@@ -615,6 +788,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       }
     }
     for (const loaded of this.loadStructuredStates()) {
+      if (this.deletedSessionIds.has(loaded.id)) continue;
       // Store 已经落下 worker 交付、但还没来得及 kill 就崩溃时，这里先封存而
       // 不能让 session.start() 接回 native thread 并从 messageQueue 取走一条。
       const state = !loaded.terminal && options.preserveHistoryWhen?.(loaded)
@@ -646,6 +820,9 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       this.emit("state", session.info());
     }
     await this.persistStructuredNow();
+    for (const sid of [...this.deletedSessionIds]) {
+      if (this.canForgetDeletedSession(sid)) this.forgetDeletedSession(sid);
+    }
     return restored;
   }
 
@@ -1254,10 +1431,19 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     if (structured) {
       const info = structured.info();
       if (structured instanceof RemoteStructuredSession || structured instanceof WindowsRemoteStructuredSession) {
+        const cleanup = structured instanceof RemoteStructuredSession && !options.preserveHistory
+          ? this.sessionDirectoryCleanup(this.structuredSupervisorRoot, sid)
+          : null;
         // The only daemon operation allowed to terminate a detached owner.
         // disposeAll() below deliberately calls dispose() instead.
-        await structured.kill();
-        if (!options.preserveHistory) this.structuredSessions.delete(sid);
+        if (info.status === "done" || info.status === "died") await structured.dispose();
+        else await structured.kill();
+        if (!options.preserveHistory) {
+          this.markSessionDeleted(sid);
+          this.structuredSessions.delete(sid);
+          await this.removeSessionDirectory(cleanup);
+          if (this.canForgetDeletedSession(sid)) this.forgetDeletedSession(sid);
+        }
         this.emit("state", { ...info, status: "done" });
         return;
       }
@@ -1270,21 +1456,32 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
         // dispose 已在上面同步把会话标为 done,这里 await 写盘,确保落的是终态快照。
         await this.persistStructuredNow();
       } else {
-        this.scheduleStructuredPersist();
+        this.markSessionDeleted(sid);
+        this.structuredSessions.delete(sid);
+        await this.persistStructuredNow();
+        if (this.canForgetDeletedSession(sid)) this.forgetDeletedSession(sid);
       }
       await disposing;
-      if (!options.preserveHistory) this.structuredSessions.delete(sid);
       this.emit("state", { ...info, status: "done" });
       return;
     }
     const pty = this.requirePty(sid);
     const info = pty.info();
-    if (pty instanceof RemotePtySession || pty instanceof RemoteWindowsPtySession) await pty.kill();
+    const cleanup = pty instanceof RemotePtySession
+      ? this.sessionDirectoryCleanup(this.ptySupervisorRoot, sid)
+      : null;
+    if (pty instanceof RemotePtySession || pty instanceof RemoteWindowsPtySession) {
+      if (info.status === "done" || info.status === "died") await pty.dispose();
+      else await pty.kill();
+    }
     else await pty.dispose();
     // tmux 下 dispose 只是断开 client,进程还在 server 里活着 —— kill 得说到做到
     if (this.tmuxEnabled) tmux.killSession(sid);
+    this.markSessionDeleted(sid);
     this.ptySessions.delete(sid);
     this.persistMeta();
+    await this.removeSessionDirectory(cleanup);
+    if (this.canForgetDeletedSession(sid)) this.forgetDeletedSession(sid);
     this.emit("state", {
       ...info,
       // A detached facade already records an explicit kill as `done`; retain

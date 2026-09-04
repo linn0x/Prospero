@@ -24,6 +24,67 @@ afterEach(() => {
 });
 
 describe("Electron state snapshot caching", () => {
+  it("preserves workflow templates up to the orchestration graph limits", () => {
+    const store = new StateStore(testHome());
+    const title = "t".repeat(2_000);
+    const spec = "s".repeat(20_000);
+    const nodes = Array.from({ length: 200 }, () => ({
+      title,
+      spec,
+      dependencyIndexes: [],
+      skills: [],
+    }));
+
+    const saved = store.saveWorkflowTemplate({
+      id: "template-200",
+      name: "Large template",
+      description: "",
+      nodes,
+      createdAt: 1,
+      updatedAt: 1,
+    });
+
+    expect(saved.workflowTemplates[0]?.nodes).toHaveLength(200);
+    expect(saved.workflowTemplates[0]?.nodes[0]).toMatchObject({ title, spec });
+    expect(() => store.saveWorkflowTemplate({
+      id: "template-201",
+      name: "Too large",
+      description: "",
+      nodes: [...nodes, nodes[0]!],
+      createdAt: 1,
+      updatedAt: 1,
+    })).toThrow("模板任务数量无效");
+  });
+
+  it("projects a stable opaque id for each paired device", () => {
+    const home = testHome();
+    writeJson(home, "devices.json", {
+      devices: [{
+        name: "My phone",
+        token: "device-secret",
+        allowShell: true,
+        createdAt: 1,
+      }],
+    });
+
+    const snapshot = new StateStore(home).snapshot();
+
+    expect(snapshot.devices[0]?.id).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(JSON.stringify(snapshot.devices)).not.toContain("device-secret");
+  });
+
+  it("never projects the relay host secret into the renderer snapshot", () => {
+    const home = testHome();
+    writeJson(home, "config.json", {
+      relay: { enabled: true, url: "wss://relay.example", hostSecret: "relay-host-secret" },
+    });
+
+    const relay = new StateStore(home).snapshot().daemon.relay;
+
+    expect(relay).toMatchObject({ enabled: true, state: "offline", url: "wss://relay.example" });
+    expect(JSON.stringify(relay)).not.toContain("relay-host-secret");
+  });
+
   it("reads settings without constructing the full desktop snapshot", () => {
     const home = testHome();
     writeJson(home, "desktop.json", {
@@ -199,7 +260,16 @@ describe("Electron state snapshot caching", () => {
     const home = testHome();
     writeJson(home, "status.json", {
       sessions: [
-        { id: "attention", cwd: home, agent: "codex", kind: "structured", status: "waiting_input", pendingQuestions: 1 },
+        {
+          id: "attention",
+          cwd: home,
+          agent: "codex",
+          kind: "structured",
+          status: "waiting_input",
+          pendingQuestions: 1,
+          busySince: 10,
+          messageQueue: [{ id: "queue-1", text: "next", kind: "queue", createdAt: 11, attachmentCount: 0 }],
+        },
         { id: "recent", cwd: home, agent: "codex", kind: "structured", status: "completed" },
       ],
       sessionSummary: {
@@ -220,6 +290,10 @@ describe("Electron state snapshot caching", () => {
     const current = store.snapshot();
 
     expect(current.daemon.sessions.map((session) => session.id)).toEqual(["attention", "recent"]);
+    expect(current.daemon.sessions[0]).toMatchObject({
+      busySince: 10,
+      messageQueue: [{ id: "queue-1", text: "next", kind: "queue" }],
+    });
     expect(current.daemon.sessionSummary).toEqual({
       total: 3_742,
       active: 7,
@@ -250,6 +324,17 @@ describe("Electron state snapshot caching", () => {
     expect(store.snapshot().daemon.sessions.map((session) => session.id)).toEqual(["live"]);
     expect(store.isKnownSession("historical")).toBe(true);
     expect(store.isKnownSession("missing")).toBe(false);
+  });
+
+  it("keeps display titles for paged historical sessions", () => {
+    const home = testHome();
+    const store = new StateStore(home);
+    store.hydrateSessions([{ id: "historical" }]);
+
+    store.renameSession("historical", "Renamed history");
+
+    expect(store.sessionTitle("historical")).toBe("Renamed history");
+    expect(new StateStore(home).sessionTitle("historical")).toBe("Renamed history");
   });
 
   it("archives a session locally without touching the daemon session list", () => {

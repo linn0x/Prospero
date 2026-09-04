@@ -79,10 +79,12 @@ import {
   adaptiveSidebarOpen,
   filterSessionsByQuery,
   matchesDesktopShortcut,
+  matchesFocusShortcut,
   mostRelevantProject,
   nextSidebarSessionLimit,
   parseExpandedProjects,
   projectForSession,
+  restoredSessionIds,
   sessionRestoreRetryDelay,
   sortProjectsByRecentActivity,
   sortSidebarSessions,
@@ -823,6 +825,7 @@ function ShellSidebar({
   const [searchPage, setSearchPage] = useState<SessionPage>();
   const [searchPageQuery, setSearchPageQuery] = useState("");
   const [searchLoading, setSearchLoading] = useState(false);
+  const searchGeneration = useRef(0);
   const [searchLimit, setSearchLimit] = useState(SIDEBAR_SEARCH_PAGE_SIZE);
   const [pinnedPage, setPinnedPage] = useState<SessionPage>();
   const [pinnedLoading, setPinnedLoading] = useState(false);
@@ -993,6 +996,7 @@ function ShellSidebar({
     };
   }, [pinnedSessionKey, pinnedSessionRequestIds]);
   useEffect(() => {
+    const generation = ++searchGeneration.current;
     if (!deferredSessionQuery) {
       setSearchPage(undefined);
       setSearchPageQuery("");
@@ -1009,19 +1013,19 @@ function ShellSidebar({
         limit: SIDEBAR_SEARCH_PAGE_SIZE,
       })
       .then((page) => {
-        if (!cancelled) {
+        if (!cancelled && searchGeneration.current === generation) {
           setSearchPage(page);
           setSearchPageQuery(deferredSessionQuery);
         }
       })
       .catch(() => {
-        if (!cancelled) {
+        if (!cancelled && searchGeneration.current === generation) {
           setSearchPage(undefined);
           setSearchPageQuery(deferredSessionQuery);
         }
       })
       .finally(() => {
-        if (!cancelled) setSearchLoading(false);
+        if (!cancelled && searchGeneration.current === generation) setSearchLoading(false);
       });
     return () => {
       cancelled = true;
@@ -1193,23 +1197,30 @@ function ShellSidebar({
     )
       return;
     setSearchLoading(true);
+    const generation = searchGeneration.current;
+    const query = deferredSessionQuery;
+    const cursor = searchPage.nextCursor;
     setSearchLimit((current) =>
       Math.min(SIDEBAR_SEARCH_VISIBLE_LIMIT, current + SIDEBAR_SEARCH_PAGE_SIZE),
     );
     void window.prospero
       .listSessions({
-        query: deferredSessionQuery,
-        cursor: searchPage.nextCursor,
+        query,
+        cursor,
         limit: SIDEBAR_SEARCH_PAGE_SIZE,
       })
-      .then((next) =>
+      .then((next) => {
+        if (searchGeneration.current !== generation) return;
         setSearchPage((current) =>
-          current
+          current && searchPageQuery === query
             ? { ...next, items: [...current.items, ...next.items] }
-            : next,
-        ),
-      )
-      .finally(() => setSearchLoading(false));
+            : current,
+        );
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (searchGeneration.current === generation) setSearchLoading(false);
+      });
   }, [
     deferredSessionQuery,
     searchLoading,
@@ -4318,7 +4329,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
         ? stored.filter((value): value is string => typeof value === "string")
         : [];
       const active = readStoredActiveSession();
-      return active && !ids.includes(active) ? [...ids, active] : ids;
+      return restoredSessionIds(ids, active);
     } catch {
       return [];
     }
@@ -4337,6 +4348,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   const [taskTargetId, setTaskTargetId] = useState<string>();
   const [editingProject, setEditingProject] = useState<string>();
   const [editingSession, setEditingSession] = useState<string>();
+  const [sessionActionError, setSessionActionError] = useState<string>();
   const [sidebarPreference] = useState(readSidebarOpenPreference);
   const startsWithCompactSidebar =
     window.innerWidth <= SIDEBAR_COLLAPSE_WIDTH;
@@ -4590,19 +4602,15 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   }, [focus]);
   useEffect(() => {
     const onKey = (event: KeyboardEvent): void => {
-      if (!matchesDesktopShortcut(
-        event,
-        "f",
-        window.prospero.platform,
-        true,
-      )) return;
+      if (view !== "workspaces" || !matchesFocusShortcut(event, window.prospero.platform)) return;
       event.preventDefault();
       setFocus((current) => !current);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [view]);
   const duplicateSession = useCallback((session: SessionInfo): void => {
+    setSessionActionError(undefined);
     void (async () => {
       const supportedAgents: SessionCreateInput["agent"][] = [
         "codex",
@@ -4637,14 +4645,22 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
         kind,
         approvalPolicy,
       });
-      await window.prospero.renameSession(
-        created.id,
-        t(`${sessionLabel(session)} 副本`, `${sessionLabel(session)} Copy`),
-      );
-      openSession(created.id);
-    })().catch((reason) =>
-      console.error("Unable to duplicate session", reason),
-    );
+      openSession(created.id, created);
+      try {
+        await window.prospero.renameSession(
+          created.id,
+          t(`${sessionLabel(session)} 副本`, `${sessionLabel(session)} Copy`),
+        );
+      } catch (reason) {
+        setSessionActionError(t(
+          `副本已打开，但名称保存失败：${displayError(reason)}`,
+          `The copy opened, but its name could not be saved: ${displayError(reason)}`,
+        ));
+      }
+    })().catch((reason) => setSessionActionError(t(
+      `无法复制会话：${displayError(reason)}`,
+      `Unable to duplicate the session: ${displayError(reason)}`,
+    )));
   }, [openSession, t]);
   const page = getViewCopy(view, t);
   const workspaceFocus = focus && view === "workspaces";
@@ -4714,7 +4730,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
               >
                 <Minimize2 data-icon="inline-start" />
                 <span>{t("退出专注", "Exit focus")}</span>
-                <kbd>{isMac ? "⇧⌘F" : "Ctrl Shift F"}</kbd>
+                <kbd>{isMac ? "⇧⌘F" : "Ctrl Alt F"}</kbd>
               </Button>
             ) : (
               <>
@@ -4737,6 +4753,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
           </div>
         </header>
         <div className="main-viewport">
+          {sessionActionError && <Alert variant="destructive" className="mx-7 mt-5 w-auto"><CircleAlert /><AlertTitle>{t("会话操作失败", "Session action failed")}</AlertTitle><AlertDescription>{sessionActionError}</AlertDescription><Button variant="ghost" size="sm" className="ml-auto" onClick={() => setSessionActionError(undefined)}>{t("关闭", "Dismiss")}</Button></Alert>}
           <Suspense
             fallback={
               <div className="boot-screen">

@@ -6,9 +6,10 @@
  * 每个响应一行，连接可以短暂也可以复用。socket 与 token 文件都只允许当前用户读写。
  */
 import { createHash, timingSafeEqual } from "node:crypto";
-import { chmodSync, lstatSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { createConnection, createServer, type Socket } from "node:net";
 import path from "node:path";
+import { acquireFilesystemLock, writePrivateFileAtomic } from "./filesystem-store.js";
 
 const MAX_LINE_BYTES = 1024 * 1024;
 
@@ -98,6 +99,50 @@ function write(socket: Socket, response: ControlResponse): void {
   }
 }
 
+interface FileIdentity {
+  dev: number;
+  ino: number;
+}
+
+function fileIdentity(file: string): FileIdentity | null {
+  try {
+    const metadata = lstatSync(file);
+    return { dev: metadata.dev, ino: metadata.ino };
+  } catch {
+    return null;
+  }
+}
+
+function sameFile(file: string, expected: FileIdentity | null): boolean {
+  if (!expected) return false;
+  const actual = fileIdentity(file);
+  return actual?.dev === expected.dev && actual.ino === expected.ino;
+}
+
+async function socketIsStale(socketPath: string): Promise<boolean> {
+  return new Promise<boolean>((resolve, reject) => {
+    const socket = createConnection(socketPath);
+    let settled = false;
+    const finish = (result: boolean, error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      if (error) reject(error);
+      else resolve(result);
+    };
+    socket.setTimeout(250, () => finish(false));
+    socket.once("connect", () => finish(false));
+    socket.once("error", (error: NodeJS.ErrnoException) => {
+      if (error.code === "ECONNREFUSED" || error.code === "ENOENT") finish(true);
+      else finish(false, error);
+    });
+  });
+}
+
+async function closeServer(server: ReturnType<typeof createServer>): Promise<void> {
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+}
+
 /** 启动 socket，并同步写下给 CLI 读取的 0600 token 文件。 */
 export async function startControlSocket(opts: ControlSocketOptions): Promise<ControlSocketServer> {
   mkdirSync(opts.home, { recursive: true, mode: 0o700 });
@@ -105,90 +150,112 @@ export async function startControlSocket(opts: ControlSocketOptions): Promise<Co
   const socketPath = controlSocketPath(opts.home);
   const legacySocketPath = path.join(opts.home, "control.sock");
   const tokenPath = path.join(opts.home, "control.token");
-
-  // Unix socket 不能复用旧路径；daemon 异常退出时留下的是 socket 文件。若路径
-  // 被普通文件占住，宁可报错也不覆盖同目录中可能由用户放进去的内容。
-  if (process.platform === "win32") {
-    try {
-      if (!lstatSync(legacySocketPath).isSocket()) {
-        throw new ControlSocketError(`${legacySocketPath} 已被非 socket 文件占用`, "socket_path_occupied");
-      }
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-  } else {
-    try {
-      if (!lstatSync(socketPath).isSocket()) {
-        throw new ControlSocketError(`${socketPath} 已被非 socket 文件占用`, "socket_path_occupied");
-      }
-      rmSync(socketPath, { force: true });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-  }
-  writeFileSync(tokenPath, `${opts.token}\n`, { mode: 0o600 });
-  chmodSync(tokenPath, 0o600);
-
-  const clients = new Set<Socket>();
-  const server = createServer((socket) => {
-    clients.add(socket);
-    socket.once("close", () => clients.delete(socket));
-    // write() 的 EPIPE 是异步从 Socket 发出的，try/catch 接不住。每条本地
-    // client 连接都必须消费它；close 回调会清理 clients，并会中止长请求。
-    socket.on("error", () => {});
-    socket.setEncoding("utf8");
-    let buffer = "";
-    let closedForSize = false;
-
-    socket.on("data", (chunk: string) => {
-      if (closedForSize) return;
-      buffer += chunk;
-      if (Buffer.byteLength(buffer, "utf8") > MAX_LINE_BYTES) {
-        closedForSize = true;
-        write(socket, {
-          id: null,
-          ok: false,
-          error: { code: "request_too_large", message: "控制请求过大" },
-        });
-        socket.end();
-        return;
-      }
-
-      let newline: number;
-      while ((newline = buffer.indexOf("\n")) >= 0) {
-        const line = buffer.slice(0, newline).trim();
-        buffer = buffer.slice(newline + 1);
-        if (line === "") continue;
-        void handleLine(socket, line, opts);
-      }
-    });
-  });
+  const startupLock = await acquireFilesystemLock(opts.home, "control-startup");
 
   try {
-    await new Promise<void>((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(socketPath, () => {
-        server.off("error", reject);
-        resolve();
+    if (process.platform === "win32") {
+      try {
+        if (!lstatSync(legacySocketPath).isSocket()) {
+          throw new ControlSocketError(`${legacySocketPath} 已被非 socket 文件占用`, "socket_path_occupied");
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    } else {
+      try {
+        if (!lstatSync(socketPath).isSocket()) {
+          throw new ControlSocketError(`${socketPath} 已被非 socket 文件占用`, "socket_path_occupied");
+        }
+        if (!(await socketIsStale(socketPath))) {
+          throw new ControlSocketError("daemon 控制 socket 已在运行", "already_running");
+        }
+        rmSync(socketPath, { force: true });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
+
+    const clients = new Set<Socket>();
+    const server = createServer((socket) => {
+      clients.add(socket);
+      socket.once("close", () => clients.delete(socket));
+      socket.on("error", () => {});
+      socket.setEncoding("utf8");
+      let buffer = "";
+      let closedForSize = false;
+
+      socket.on("data", (chunk: string) => {
+        if (closedForSize) return;
+        buffer += chunk;
+        if (Buffer.byteLength(buffer, "utf8") > MAX_LINE_BYTES) {
+          closedForSize = true;
+          write(socket, {
+            id: null,
+            ok: false,
+            error: { code: "request_too_large", message: "控制请求过大" },
+          });
+          socket.end();
+          return;
+        }
+
+        let newline: number;
+        while ((newline = buffer.indexOf("\n")) >= 0) {
+          const line = buffer.slice(0, newline).trim();
+          buffer = buffer.slice(newline + 1);
+          if (line === "") continue;
+          void handleLine(socket, line, opts);
+        }
       });
     });
-  } catch (error) {
-    rmSync(tokenPath, { force: true });
-    throw error;
-  }
-  if (process.platform !== "win32") chmodSync(socketPath, 0o600);
 
-  return {
-    path: socketPath,
-    tokenPath,
-    close: async () => {
-      // 一个半写请求的本地 client 不能让 daemon 关机永远卡在 server.close()。
-      for (const client of clients) client.destroy();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      if (process.platform !== "win32") rmSync(socketPath, { force: true });
-      rmSync(tokenPath, { force: true });
-    },
-  };
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(socketPath, () => {
+          server.off("error", reject);
+          resolve();
+        });
+      });
+    } catch (error) {
+      throw error;
+    }
+    if (process.platform !== "win32") chmodSync(socketPath, 0o600);
+    const socketIdentity = process.platform === "win32" ? null : fileIdentity(socketPath);
+    try {
+      writePrivateFileAtomic(tokenPath, `${opts.token}\n`);
+    } catch (error) {
+      await closeServer(server);
+      if (process.platform !== "win32" && sameFile(socketPath, socketIdentity)) {
+        rmSync(socketPath, { force: true });
+      }
+      throw error;
+    }
+    const tokenIdentity = fileIdentity(tokenPath);
+    let closePromise: Promise<void> | null = null;
+
+    return {
+      path: socketPath,
+      tokenPath,
+      close: () => {
+        if (closePromise) return closePromise;
+        closePromise = (async () => {
+          for (const client of clients) client.destroy();
+          await closeServer(server);
+          if (process.platform !== "win32" && sameFile(socketPath, socketIdentity)) {
+            rmSync(socketPath, { force: true });
+          }
+          if (sameFile(tokenPath, tokenIdentity)) {
+            try {
+              if (readFileSync(tokenPath, "utf8") === `${opts.token}\n`) rmSync(tokenPath, { force: true });
+            } catch {}
+          }
+        })();
+        return closePromise;
+      },
+    };
+  } finally {
+    startupLock.release();
+  }
 }
 
 async function handleLine(socket: Socket, line: string, opts: ControlSocketOptions): Promise<void> {

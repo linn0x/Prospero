@@ -9,7 +9,7 @@
  * 读操作永远不碰磁盘。
  */
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync } from "node:fs";
 import path from "node:path";
 import {
   type Dispatch,
@@ -32,6 +32,7 @@ import {
   findCycle,
   isReady,
 } from "./model.js";
+import { writePrivateFileAtomic } from "../filesystem-store.js";
 
 const PERSIST_DEBOUNCE_MS = 200;
 const MAX_ORCHESTRATION_EVENTS = 2_048;
@@ -164,6 +165,13 @@ export class OrchestrationError extends Error {
   }
 }
 
+export class OrchestrationStorageError extends Error {
+  constructor(message: string, readonly cause?: unknown) {
+    super(message);
+    this.name = "OrchestrationStorageError";
+  }
+}
+
 export type OrchestrationErrorCode =
   | "run_not_found"
   | "task_not_found"
@@ -252,6 +260,8 @@ export class OrchestrationStore {
   private readonly desktopFile: string | null;
   private timer: NodeJS.Timeout | null = null;
   private closed = false;
+  private persistenceFailures = 0;
+  private lastPersistenceError: Error | null = null;
   private readonly changeListeners = new Set<() => void>();
 
   /** home 省略时纯内存(测试用) */
@@ -260,96 +270,125 @@ export class OrchestrationStore {
     this.desktopFile = home ? path.join(home, "orchestration-desktop.json") : null;
     this.load();
     this.resetEventShadow();
+    if (this.file && existsSync(this.file)) {
+      const backup = `${this.file}.bak`;
+      const serialized = this.serializedState();
+      let current = false;
+      try { current = readFileSync(backup, "utf8") === serialized; } catch {}
+      if (!current) writePrivateFileAtomic(backup, serialized);
+    }
     this.persistDesktopProjection();
   }
 
   private load(): void {
     if (!this.file) return;
+    let primaryError: unknown = null;
     try {
-      const parsed = JSON.parse(readFileSync(this.file, "utf8")) as Omit<Partial<OrchestrationState>, "version"> & {
-        version?: number;
-        eventSeq?: unknown;
-        eventBaseSeq?: unknown;
-        events?: unknown;
-      };
-      if (parsed.version === 1 || parsed.version === 2) {
-        const runs = parsed.runs ?? {};
-        for (const run of Object.values(runs)) {
-          run.graphRevision = Number.isInteger(run.graphRevision) ? run.graphRevision : 0;
-          run.automation ??= null;
-          run.coordinatorPrompt ??= null;
-        }
-        let migrated = parsed.version === 1;
-        const tasks = parsed.tasks ?? {};
-        for (const task of Object.values(tasks)) {
-          const legacy = task as Task & { skills?: unknown };
-          const before = legacy.skills;
-          try {
-            legacy.skills = Array.isArray(before)
-              ? normalizeTaskSkills(before.filter((value): value is string => typeof value === "string"))
-              : [];
-          } catch {
-            legacy.skills = [];
-          }
-          if (!Array.isArray(before) || JSON.stringify(before) !== JSON.stringify(legacy.skills)) migrated = true;
-        }
-        const dispatches = parsed.dispatches ?? {};
-        const worktreeAssets = parsed.worktreeAssets ?? {};
-
-        // v1 把 worktree 只挂在 Run automation 或 Dispatch 上；一旦删除 Run，
-        // 那些路径就没有任何可发现索引。升级时只保守登记，绝不尝试检查或删除。
-        if (parsed.version === 1) {
-          for (const run of Object.values(runs)) {
-            const automation = run.automation;
-            if (automation?.workspace !== "run") continue;
-            const asset = this.legacyWorktreeAsset({
-              kind: "run",
-              runId: run.id,
-              repo: automation.cwd,
-              path: automation.workspacePath,
-              branch: automation.branch,
-              createdAt: automation.startedAt,
-            });
-            worktreeAssets[asset.id] = asset;
-          }
-          for (const dispatch of Object.values(dispatches)) {
-            if (!dispatch.worktreePath) continue;
-            const asset = this.legacyWorktreeAsset({
-              kind: "worker",
-              runId: dispatch.runId,
-              taskId: dispatch.taskId,
-              dispatchId: dispatch.id,
-              // v1 没有 repo/branch；path 是唯一安全的候选，后续 inspect 会复核。
-              repo: dispatch.worktreePath,
-              path: dispatch.worktreePath,
-              branch: null,
-              createdAt: dispatch.startedAt,
-            });
-            worktreeAssets[asset.id] = asset;
-          }
-        }
-        for (const asset of Object.values(worktreeAssets)) {
-          if (this.normalizeWorktreeAsset(asset)) migrated = true;
-        }
-        this.state = {
-          version: 2,
-          runs,
-          tasks,
-          dispatches,
-          messages: parsed.messages ?? {},
-          gates: parsed.gates ?? {},
-          operations: parsed.operations ?? {},
-          worktreeAssets,
-        };
-        this.loadEventJournal(parsed.eventSeq, parsed.eventBaseSeq, parsed.events);
-        // 迁移只补登记，不会触碰用户磁盘上的任何工作树。立即原子落盘，避免下一次
-        // Run 删除发生在迁移结果尚未写入之前。
-        if (migrated) this.persistNow();
-      }
-    } catch {
-      // 文件不在或者坏了都当空的开始。编排状态坏掉不该让 daemon 起不来 ——
-      // 手机上还有一堆正常会话等着连。
+      const migrated = this.loadFile(this.file);
+      if (migrated) this.persistNow();
+      return;
+    } catch (error) {
+      primaryError = error;
     }
+    const backup = `${this.file}.bak`;
+    try {
+      this.loadFile(backup);
+      if (existsSync(this.file)) {
+        renameSync(this.file, `${this.file}.corrupt.${String(Date.now())}.${randomUUID()}`);
+      }
+      this.persistNow();
+      return;
+    } catch (backupError) {
+      const primaryMissing = (primaryError as NodeJS.ErrnoException | null)?.code === "ENOENT";
+      const backupMissing = (backupError as NodeJS.ErrnoException).code === "ENOENT";
+      if (primaryMissing && backupMissing && (!this.desktopFile || !existsSync(this.desktopFile))) return;
+      throw new OrchestrationStorageError(
+        "编排状态损坏且没有可恢复备份，已停止加载以保护原文件",
+        primaryMissing ? backupError : primaryError,
+      );
+    }
+  }
+
+  private loadFile(file: string): boolean {
+    const parsed = JSON.parse(readFileSync(file, "utf8")) as Omit<Partial<OrchestrationState>, "version"> & {
+      version?: number;
+      eventSeq?: unknown;
+      eventBaseSeq?: unknown;
+      events?: unknown;
+    };
+    if (parsed.version !== 1 && parsed.version !== 2) {
+      throw new OrchestrationStorageError("编排状态版本无效");
+    }
+    const runs = parsed.runs ?? {};
+    for (const run of Object.values(runs)) {
+      run.graphRevision = Number.isInteger(run.graphRevision) ? run.graphRevision : 0;
+      run.automation ??= null;
+      run.coordinatorPrompt ??= null;
+    }
+    let migrated = parsed.version === 1;
+    const tasks = parsed.tasks ?? {};
+    for (const task of Object.values(tasks)) {
+      const legacy = task as Task & { skills?: unknown };
+      const before = legacy.skills;
+      try {
+        legacy.skills = Array.isArray(before)
+          ? normalizeTaskSkills(before.filter((value): value is string => typeof value === "string"))
+          : [];
+      } catch {
+        legacy.skills = [];
+      }
+      if (!Array.isArray(before) || JSON.stringify(before) !== JSON.stringify(legacy.skills)) migrated = true;
+    }
+    const dispatches = parsed.dispatches ?? {};
+    const worktreeAssets = parsed.worktreeAssets ?? {};
+
+    // v1 把 worktree 只挂在 Run automation 或 Dispatch 上；一旦删除 Run，
+    // 那些路径就没有任何可发现索引。升级时只保守登记，绝不尝试检查或删除。
+    if (parsed.version === 1) {
+      for (const run of Object.values(runs)) {
+        const automation = run.automation;
+        if (automation?.workspace !== "run") continue;
+        const asset = this.legacyWorktreeAsset({
+          kind: "run",
+          runId: run.id,
+          repo: automation.cwd,
+          path: automation.workspacePath,
+          branch: automation.branch,
+          createdAt: automation.startedAt,
+        });
+        worktreeAssets[asset.id] = asset;
+      }
+      for (const dispatch of Object.values(dispatches)) {
+        if (!dispatch.worktreePath) continue;
+        const asset = this.legacyWorktreeAsset({
+          kind: "worker",
+          runId: dispatch.runId,
+          taskId: dispatch.taskId,
+          dispatchId: dispatch.id,
+          // v1 没有 repo/branch；path 是唯一安全的候选，后续 inspect 会复核。
+          repo: dispatch.worktreePath,
+          path: dispatch.worktreePath,
+          branch: null,
+          createdAt: dispatch.startedAt,
+        });
+        worktreeAssets[asset.id] = asset;
+      }
+    }
+    for (const asset of Object.values(worktreeAssets)) {
+      if (this.normalizeWorktreeAsset(asset)) migrated = true;
+    }
+    this.state = {
+      version: 2,
+      runs,
+      tasks,
+      dispatches,
+      messages: parsed.messages ?? {},
+      gates: parsed.gates ?? {},
+      operations: parsed.operations ?? {},
+      worktreeAssets,
+    };
+    this.loadEventJournal(parsed.eventSeq, parsed.eventBaseSeq, parsed.events);
+    return migrated;
   }
 
   private legacyWorktreeAsset(input: {
@@ -498,12 +537,30 @@ export class OrchestrationStore {
         // 观察者只负责刷新外部视图；失败不能回滚已经完成的状态变更。
       }
     }
+    this.schedulePersistAttempt(PERSIST_DEBOUNCE_MS);
+  }
+
+  private schedulePersistAttempt(delayMs: number): void {
     if (!this.file || this.closed || this.timer) return;
     this.timer = setTimeout(() => {
       this.timer = null;
-      this.persistNow();
-    }, PERSIST_DEBOUNCE_MS);
+      try {
+        this.persistNow();
+      } catch {
+        this.persistenceFailures += 1;
+        this.schedulePersistAttempt(Math.min(30_000, 250 * (2 ** Math.min(this.persistenceFailures, 7))));
+      }
+    }, delayMs);
     this.timer.unref?.();
+  }
+
+  private serializedState(): string {
+    return JSON.stringify({
+      ...this.state,
+      eventSeq: this.eventSeq,
+      eventBaseSeq: this.eventBaseSeq,
+      events: this.events,
+    }, null, 2);
   }
 
   persistNow(): void {
@@ -512,29 +569,38 @@ export class OrchestrationStore {
       clearTimeout(this.timer);
       this.timer = null;
     }
-    mkdirSync(path.dirname(this.file), { recursive: true });
-    const tmp = `${this.file}.tmp.${process.pid}`;
-    writeFileSync(tmp, JSON.stringify({
-      ...this.state,
-      eventSeq: this.eventSeq,
-      eventBaseSeq: this.eventBaseSeq,
-      events: this.events,
-    }, null, 2), { mode: 0o600 });
-    renameSync(tmp, this.file);
-    this.persistDesktopProjection();
+    try {
+      const serialized = this.serializedState();
+      writePrivateFileAtomic(this.file, serialized);
+      writePrivateFileAtomic(`${this.file}.bak`, serialized);
+      this.persistDesktopProjection();
+      this.persistenceFailures = 0;
+      this.lastPersistenceError = null;
+    } catch (error) {
+      this.lastPersistenceError = error instanceof Error ? error : new Error(String(error));
+      throw error;
+    }
   }
 
   private persistDesktopProjection(): void {
     if (!this.desktopFile) return;
-    mkdirSync(path.dirname(this.desktopFile), { recursive: true });
-    const tmp = `${this.desktopFile}.tmp.${process.pid}`;
-    writeFileSync(tmp, JSON.stringify(desktopProjection(this.state, this.eventSeq)), { mode: 0o600 });
-    renameSync(tmp, this.desktopFile);
+    writePrivateFileAtomic(
+      this.desktopFile,
+      JSON.stringify(desktopProjection(this.state, this.eventSeq)),
+    );
   }
 
   close(): void {
-    this.persistNow();
     this.closed = true;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    this.persistNow();
+  }
+
+  persistenceError(): Error | null {
+    return this.lastPersistenceError;
   }
 
   /** 状态变更通知只表示“快照可能变了”；调用方应自行防抖并读取完整快照。 */

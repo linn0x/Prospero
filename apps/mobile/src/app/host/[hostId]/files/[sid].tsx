@@ -14,17 +14,18 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Stack, useLocalSearchParams, useNavigation } from "expo-router";
-import { File, Paths } from "expo-file-system";
+import { File, FileMode, Paths } from "expo-file-system";
 import * as Sharing from "expo-sharing";
 import * as DocumentPicker from "expo-document-picker";
 import * as Haptics from "expo-haptics";
-import type { FsEntry } from "@prospero/protocol";
+import { fromB64, toB64, type FsEntry } from "@prospero/protocol";
 import { DismissKey } from "@/components/DismissKey";
 import { Icon } from "@/components/Icon";
 import { PromptDialog } from "@/components/PromptDialog";
 import { SwipeRow, type SwipeAction } from "@/components/SwipeRow";
 import { primaryPaneWidth, useAdaptiveLayout } from "@/lib/adaptive-layout";
 import { getEditorExitPlan, resolveEditorExitConfirmation } from "@/lib/editor-exit";
+import { downloadFileChunks, uploadFileChunks } from "@/lib/file-transfer";
 import { validateFileName } from "@/lib/file-names";
 import { color, MONOSPACE_FONT } from "@/lib/theme";
 import { useHostConnection } from "@/lib/use-host-connection";
@@ -188,19 +189,29 @@ export default function FilesScreen(): React.ReactElement {
     const rel = dir === "" ? entry.name : `${dir}/${entry.name}`;
     setBusy(entry.name);
     try {
-      const parts: string[] = [];
-      let offset = 0;
-      for (;;) {
-        const chunk = await conn.fsGetChunk(sid, rel, offset, CHUNK);
-        parts.push(chunk.dataB64);
-        offset += base64Bytes(chunk.dataB64);
-        if (chunk.eof) break;
-      }
       // 新版 expo-file-system 用 File/Paths 类,不再是模块级函数
       const local = new File(Paths.cache, entry.name);
       if (local.exists) local.delete();
       local.create();
-      local.write(parts.join(""), { encoding: "base64" });
+      let complete = false;
+      try {
+        const output = local.open(FileMode.WriteOnly);
+        try {
+          await downloadFileChunks(
+            (offset, length) => conn.fsGetChunk(sid, rel, offset, length),
+            (bytes) => output.writeBytes(bytes),
+            CHUNK,
+          );
+          complete = true;
+        } finally {
+          output.close();
+        }
+      } catch (error) {
+        if (!complete && local.exists) {
+          try { local.delete(); } catch {}
+        }
+        throw error;
+      }
 
       if (await Sharing.isAvailableAsync()) {
         await Sharing.shareAsync(local.uri);
@@ -224,15 +235,16 @@ export default function FilesScreen(): React.ReactElement {
     setBusy(asset.name);
     try {
       const local = new File(asset.uri);
-      const b64 = await local.base64();
-      const total = base64Bytes(b64);
-      // 按解码后的字节切块,再逐块转回 base64
-      const bytes = decodeBase64ToBytes(b64);
       const target = dir === "" ? asset.name : `${dir}/${asset.name}`;
-      for (let offset = 0; offset < Math.max(total, 1); offset += CHUNK) {
-        const slice = bytes.subarray(offset, Math.min(offset + CHUNK, total));
-        const final = offset + CHUNK >= total;
-        await conn.fsPutChunk(sid, target, offset, encodeBase64(slice), final);
+      const input = local.open(FileMode.ReadOnly);
+      try {
+        await uploadFileChunks(
+          input,
+          (offset, dataB64, final) => conn.fsPutChunk(sid, target, offset, dataB64, final),
+          CHUNK,
+        );
+      } finally {
+        input.close();
       }
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       void load(dir);
@@ -493,32 +505,12 @@ export default function FilesScreen(): React.ReactElement {
   );
 }
 
-// ---------------------------------------------------------------- base64 / utf8
-// RN 没有 Buffer;这些是围绕 atob/btoa 的最小封装。
-
-function decodeBase64ToBytes(b64: string): Uint8Array {
-  const bin = globalThis.atob(b64);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
-}
-
-function encodeBase64(bytes: Uint8Array): string {
-  let bin = "";
-  for (const b of bytes) bin += String.fromCharCode(b);
-  return globalThis.btoa(bin);
-}
-
-function base64Bytes(b64: string): number {
-  return b64.length === 0 ? 0 : decodeBase64ToBytes(b64).length;
-}
-
 function decodeUtf8(b64: string): string {
-  return new TextDecoder().decode(decodeBase64ToBytes(b64));
+  return new TextDecoder().decode(fromB64(b64));
 }
 
 function encodeUtf8(text: string): string {
-  return encodeBase64(new TextEncoder().encode(text));
+  return toB64(new TextEncoder().encode(text));
 }
 
 const styles = StyleSheet.create({

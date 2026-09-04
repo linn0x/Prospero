@@ -100,6 +100,13 @@ async function seedRecoverableQueuedState(home: string): Promise<string> {
 }
 
 describe("结构化会话持久化", () => {
+  it("损坏的删除栅栏不会静默恢复已删除会话", () => {
+    const home = tempHome();
+    writeFileSync(path.join(home, "deleted-sessions.json"), "{");
+
+    expect(() => new SessionManager({ home })).toThrow("deleted session state is corrupted");
+  });
+
   it("worker 交付后终止原生会话但保留只读历史，重启后也不会复活队列", async () => {
     const home = tempHome();
     const first = new SessionManager({
@@ -397,10 +404,11 @@ describe("结构化会话持久化", () => {
     ).toBe(true);
 
     await second.kill(created.id);
-    await second.flushPersistence();
     expect(
       JSON.parse(readFileSync(path.join(home, "structured-sessions.json"), "utf8")),
     ).toEqual([]);
+    expect(JSON.parse(readFileSync(path.join(home, "deleted-sessions.json"), "utf8")))
+      .toEqual({ version: 1, ids: [] });
     await second.disposeAll();
   });
 

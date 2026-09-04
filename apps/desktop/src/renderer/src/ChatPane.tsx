@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type UIEvent } from "react";
-import { Bot, Check, ChevronDown, CircleAlert, Code2, Copy, ExternalLink, FileImage, ListChecks, Paperclip, Send, ShieldAlert, Target, UserRound, X } from "lucide-react";
+import { Bot, Check, ChevronDown, CircleAlert, Clock3, Code2, Copy, ExternalLink, FileImage, ListChecks, Paperclip, Send, ShieldAlert, Target, Trash2, UserRound, X } from "lucide-react";
 import type { AgentModeCatalog, JsonObject, SessionInfo, SkillSuggestion } from "../../shared/types";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Attachment, AttachmentAction, AttachmentActions, AttachmentContent, AttachmentDescription, AttachmentGroup, AttachmentMedia, AttachmentTitle } from "@/components/ui/attachment";
@@ -102,7 +102,7 @@ function QuestionCard({ event, isDone, sessionId, onError }: { event: JsonObject
 function ToolCard({ event, openOutput }: { event: JsonObject; openOutput: (id: string, tool: string) => void }) {
   const { t, status } = useLocale();
   const kind = text(event.kind); const state = text(event.state, kind === "tool.start" ? "running" : "success"); const callId = text(event.callId);
-  return <Card size="sm"><CardHeader><CardTitle className="flex items-center gap-2"><Code2 className="size-4" />{text(event.tool, t("工具调用", "Tool call"))}</CardTitle><CardDescription>{text(event.summary, state === "running" ? t("正在执行…", "Running…") : t("执行完成", "Completed"))}</CardDescription></CardHeader><CardContent className="flex flex-col gap-3"><DiffBlock value={event.diff} />{kind === "tool.end" && event.hasMore === true && callId && <Button variant="outline" size="sm" className="w-fit" onClick={() => openOutput(callId, text(event.tool, t("工具输出", "Tool output")))}><ExternalLink data-icon="inline-start" />{t("查看完整输出", "View full output")}</Button>}</CardContent><CardFooter><Badge variant={state === "error" || state === "failed" ? "destructive" : "secondary"}>{status(state)}</Badge></CardFooter></Card>;
+  return <Card size="sm"><CardHeader><CardTitle className="flex items-center gap-2"><Code2 className="size-4" />{text(event.tool, t("工具调用", "Tool call"))}</CardTitle><CardDescription>{text(event.summary, state === "running" ? t("正在执行…", "Running…") : t("执行完成", "Completed"))}</CardDescription></CardHeader><CardContent className="flex flex-col gap-3"><DiffBlock value={event.diff} />{kind === "tool.end" && event.hasMore === true && callId && <Button variant="outline" size="sm" className="w-fit" onClick={() => openOutput(callId, text(event.tool, t("工具输出", "Tool output")))}><ExternalLink data-icon="inline-start" />{t("查看输出", "View output")}</Button>}</CardContent><CardFooter><Badge variant={state === "error" || state === "failed" ? "destructive" : "secondary"}>{status(state)}</Badge></CardFooter></Card>;
 }
 
 function PermissionCard({ event, isDone, sessionId, onError }: { event: JsonObject; isDone: boolean; sessionId: string; onError: (message?: string) => void }) {
@@ -129,7 +129,10 @@ type EventProps = { event: JsonObject; isResolved: boolean; sessionId: string; o
 const EventCard = memo(function EventCard({ event, isResolved, sessionId, onError, openOutput, openSubagent }: EventProps) {
   const { t, status } = useLocale();
   const kind = text(event.kind);
-  if (kind === "user.message") return <Message align="end"><MessageAvatar><Avatar><AvatarFallback><UserRound className="size-4" /></AvatarFallback></Avatar></MessageAvatar><MessageContent><MessageHeader>{t("你", "You")}</MessageHeader><Bubble align="end"><BubbleContent className="whitespace-pre-wrap">{text(event.text)}</BubbleContent></Bubble></MessageContent></Message>;
+  if (kind === "user.message") {
+    const attachments = array(event.attachments).map(record);
+    return <Message align="end"><MessageAvatar><Avatar><AvatarFallback><UserRound className="size-4" /></AvatarFallback></Avatar></MessageAvatar><MessageContent><MessageHeader>{t("你", "You")}</MessageHeader><Bubble align="end"><BubbleContent className="grid gap-2 whitespace-pre-wrap">{text(event.text) && <span>{text(event.text)}</span>}{attachments.length > 0 && <AttachmentGroup>{attachments.map((attachment, index) => <Attachment state="done" size="sm" key={text(attachment.id, String(index))}><AttachmentMedia><FileImage /></AttachmentMedia><AttachmentContent><AttachmentTitle>{text(attachment.name, t(`图片 ${String(index + 1)}`, `Image ${String(index + 1)}`))}</AttachmentTitle><AttachmentDescription>{text(attachment.mimeType, t("图片", "Image"))}</AttachmentDescription></AttachmentContent></Attachment>)}</AttachmentGroup>}</BubbleContent></Bubble></MessageContent></Message>;
+  }
   if (kind === "assistant.text") return <Message><MessageAvatar><Avatar><AvatarFallback><Bot className="size-4" /></AvatarFallback></Avatar></MessageAvatar><MessageContent><MessageHeader>Agent</MessageHeader><Bubble variant="ghost"><BubbleContent><AssistantText value={text(event.text)} onError={onError} /></BubbleContent></Bubble></MessageContent></Message>;
   if (kind === "reasoning") return <Collapsible><CollapsibleTrigger render={<Button variant="ghost" size="sm" />}><ChevronDown data-icon="inline-start" />{t("思考过程", "Reasoning")}</CollapsibleTrigger><CollapsibleContent><pre className="mt-2 max-h-64 overflow-auto rounded-lg bg-muted p-3 text-xs text-muted-foreground">{text(event.text)}</pre></CollapsibleContent></Collapsible>;
   if (kind === "tool.start" || kind === "tool.end") return <ToolCard event={event} openOutput={openOutput} />;
@@ -138,8 +141,8 @@ const EventCard = memo(function EventCard({ event, isResolved, sessionId, onErro
   if (kind === "question.request") return <QuestionCard event={event} isDone={isResolved} sessionId={sessionId} onError={onError} />;
   if (kind === "agent.error") return <Alert variant="destructive"><X /><AlertTitle>{t("Agent 运行错误", "Agent runtime error")}</AlertTitle><AlertDescription>{text(event.message)}</AlertDescription></Alert>;
   if (kind === "subagent.started" || kind === "subagent.updated") {
-    const subagent = record(event.subagent); const id = text(subagent.id, text(event.subagentId)); const label = text(subagent.name, text(event.summary, id));
-    return <Card size="sm"><CardHeader><CardTitle className="flex items-center gap-2"><Bot className="size-4" />{t("子 Agent", "Subagent")}</CardTitle><CardDescription>{label}</CardDescription></CardHeader><CardContent>{id && <Button variant="outline" size="sm" onClick={() => openSubagent(id, label)}><ExternalLink data-icon="inline-start" />{t("查看执行详情", "View execution details")}</Button>}</CardContent><CardFooter><Badge variant="secondary">{status(text(subagent.status, text(event.status, "active")))}</Badge></CardFooter></Card>;
+    const subagent = record(event.subagent); const id = text(subagent.id, text(event.subagentId)); const label = text(subagent.name, id); const summary = text(event.summary, text(subagent.preview));
+    return <Card size="sm"><CardHeader><CardTitle className="flex items-center gap-2"><Bot className="size-4" />{t("子 Agent", "Subagent")}</CardTitle><CardDescription>{label}</CardDescription></CardHeader><CardContent className="flex flex-col items-start gap-3">{summary && <p className="text-sm text-muted-foreground">{summary}</p>}{id && <Button variant="outline" size="sm" onClick={() => openSubagent(id, label)}><ExternalLink data-icon="inline-start" />{t("查看执行详情", "View execution details")}</Button>}</CardContent><CardFooter><Badge variant="secondary">{status(text(subagent.status, text(event.status, "active")))}</Badge></CardFooter></Card>;
   }
   if (kind === "trajectory.record") return <Alert><Bot /><AlertTitle>{text(event.title)}</AlertTitle><AlertDescription>{text(event.detail)} · {text(event.phase)}</AlertDescription></Alert>;
   if (kind === "turn.end") return <Marker variant="separator"><MarkerIcon><Check /></MarkerIcon><MarkerContent>{text(event.finish) === "failed" ? t("本轮失败", "Turn failed") : text(event.finish) === "interrupted" ? t("本轮已停止", "Turn stopped") : t("本轮完成", "Turn complete")}{number(event.outputTokens) > 0 && ` · ${String(number(event.outputTokens))} tokens`}</MarkerContent></Marker>;
@@ -183,7 +186,12 @@ export function ChatPane({ session, onOpenGoal }: { session: SessionInfo; onOpen
   const [skills, setSkills] = useState<SkillSuggestion[]>([]); const [activeSkillIndex, setActiveSkillIndex] = useState(-1); const skillLookupRef = useRef(0); const skillListId = useId();
   const [modes, setModes] = useState<AgentModeCatalog>(); const [modeBusy, setModeBusy] = useState(false);
   const [operationError, setOperationError] = useState<string>(); const [connectionError, setConnectionError] = useState<string>();
-  const [detail, setDetail] = useState<{ title: string; content: string; loading?: boolean }>(); const fileInput = useRef<HTMLInputElement>(null);
+  const [detail, setDetail] = useState<{ title: string; content: string; loading?: boolean; truncated?: boolean }>(); const detailRequest = useRef(0); const fileInput = useRef<HTMLInputElement>(null);
+  const [busyDelivery, setBusyDelivery] = useState<"queue" | "steer">("queue");
+  const [queueBusy, setQueueBusy] = useState<Record<string, "remove" | "guide">>({});
+  const queueBusyRef = useRef(new Set<string>());
+  const messageQueue = session.messageQueue ?? [];
+  const sessionBusy = ["starting", "running", "waiting_approval", "waiting_input"].includes(session.status);
   const historyWindow = useMemo(() => getChatTimelineItemWindow(timeline.items, timeline.nextOrdinal, historyCursor?.end ?? null), [historyCursor, timeline]);
   const visibleItems = useMemo(() => timeline.items.slice(historyWindow.start, historyWindow.end), [historyWindow.end, historyWindow.start, timeline]);
   const selectHistoryCursor = useCallback((next: ChatHistoryCursor | null): void => { historyCursorRef.current = next; setHistoryCursor(next); }, []);
@@ -239,6 +247,8 @@ export function ChatPane({ session, onOpenGoal }: { session: SessionInfo; onOpen
     setAttachments([]);
     setSkills([]);
     setActiveSkillIndex(-1);
+    queueBusyRef.current.clear();
+    setQueueBusy({});
     setOperationError(undefined);
     setConnectionError(undefined);
     void window.prospero.getAgentModes(session.id).then((next) => {
@@ -246,7 +256,7 @@ export function ChatPane({ session, onOpenGoal }: { session: SessionInfo; onOpen
     }).catch(() => {
       if (active) setModes(undefined);
     });
-    return () => { active = false; };
+    return () => { active = false; detailRequest.current += 1; };
   }, [selectHistoryCursor, session.id]);
   useEffect(() => {
     const requestId = ++skillLookupRef.current;
@@ -274,6 +284,17 @@ export function ChatPane({ session, onOpenGoal }: { session: SessionInfo; onOpen
     };
   }, [draft, session.id]);
   useEffect(() => {
+    const byId = new Map(messageQueue.map((item) => [item.id, item]));
+    setQueueBusy((current) => {
+      const next = Object.fromEntries(Object.entries(current).filter(([id, action]) => {
+        const item = byId.get(id);
+        return Boolean(item && !(action === "guide" && item.kind === "guide"));
+      })) as Record<string, "remove" | "guide">;
+      queueBusyRef.current = new Set(Object.keys(next));
+      return Object.keys(next).length === Object.keys(current).length ? current : next;
+    });
+  }, [messageQueue]);
+  useEffect(() => {
     if (activeSkillIndex < 0) return;
     document.getElementById(`${skillListId}-${String(activeSkillIndex)}`)?.scrollIntoView({ block: "nearest" });
   }, [activeSkillIndex, skillListId]);
@@ -291,10 +312,13 @@ export function ChatPane({ session, onOpenGoal }: { session: SessionInfo; onOpen
     const queued = attachments;
     setAttachments([]);
     try {
-      await window.prospero.interact(session.id, { type: "chat.send", text: value, attachments: queued.map(({ name, mimeType, dataB64 }) => ({ name, mimeType, dataB64 })) });
+      const result = await window.prospero.interact(session.id, { type: "chat.send", text: value, attachments: queued.map(({ name, mimeType, dataB64 }) => ({ name, mimeType, dataB64 })), ...(sessionBusy ? { delivery: busyDelivery } : {}) });
+      if (result?.accepted === false) throw new Error(text(result.error, t("消息未被接收", "The message was not accepted")));
       sendingDraftRef.current = undefined;
       persistChatDraft(session.id, draftRef.current.text);
-      setOperationError(undefined);
+      setOperationError(result?.accepted === true && text(result.error)
+        ? t(`消息已被接收，但 Agent 执行失败：${text(result.error)}`, `The message was accepted, but the agent failed: ${text(result.error)}`)
+        : undefined);
     } catch (reason) {
       const failedDraft = sendingDraftRef.current?.text ?? value;
       sendingDraftRef.current = undefined;
@@ -348,8 +372,60 @@ export function ChatPane({ session, onOpenGoal }: { session: SessionInfo; onOpen
   };
   const chooseSkill = (skill: SkillSuggestion): void => { skillLookupRef.current += 1; setDraft((current) => current.replace(/(?:^|\s)\$[^\s]*$/, (match) => `${match.startsWith(" ") ? " " : ""}$${skill.value} `)); setSkills([]); setActiveSkillIndex(-1); };
   const setMode = async (mode: string): Promise<void> => { setModeBusy(true); try { const result = await window.prospero.setAgentMode(session.id, mode); setModes((current) => current ? { ...current, currentMode: result.currentMode } : current); setOperationError(undefined); } catch (reason) { setOperationError(displayError(reason)); } finally { setModeBusy(false); } };
-  const openOutput = useCallback(async (id: string, tool: string): Promise<void> => { setDetail({ title: `${tool} · ${t("完整输出", "Full output")}`, content: "", loading: true }); try { const result = await window.prospero.getToolOutput(session.id, id); setDetail({ title: `${tool} · ${t("完整输出", "Full output")}`, content: text(result.output, t("（无输出）", "(No output)")) }); setOperationError(undefined); } catch (reason) { setDetail(undefined); setOperationError(displayError(reason)); } }, [session.id, t]);
-  const openSubagent = useCallback(async (id: string, label: string): Promise<void> => { setDetail({ title: `${t("子 Agent", "Subagent")} · ${label}`, content: "", loading: true }); try { const result = await window.prospero.getSubagentEvents(session.id, id); const lines = collapseChatEventHistory(array(result.events).map(record)).map((event) => `${text(event.kind)}${text(event.text, text(event.summary, text(event.message, text(event.detail)))) ? `\n${text(event.text, text(event.summary, text(event.message, text(event.detail))))}` : ""}`); setDetail({ title: `${t("子 Agent", "Subagent")} · ${label}`, content: lines.join("\n\n") || t("（尚无事件）", "(No events yet)") }); setOperationError(undefined); } catch (reason) { setDetail(undefined); setOperationError(displayError(reason)); } }, [session.id, t]);
+  const queueAction = async (queueId: string, action: "remove" | "guide"): Promise<void> => {
+    if (queueBusyRef.current.has(queueId)) return;
+    queueBusyRef.current.add(queueId);
+    setQueueBusy((current) => ({ ...current, [queueId]: action }));
+    setOperationError(undefined);
+    let succeeded = false;
+    try {
+      await window.prospero.interact(session.id, { type: action === "remove" ? "chat.queue.remove" : "chat.queue.guide", queueId });
+      succeeded = true;
+    } catch (reason) {
+      setOperationError(displayError(reason));
+    } finally {
+      if (!succeeded) {
+        queueBusyRef.current.delete(queueId);
+        setQueueBusy((current) => {
+          const next = { ...current };
+          delete next[queueId];
+          return next;
+        });
+      }
+    }
+  };
+  const closeDetail = useCallback((): void => { detailRequest.current += 1; setDetail(undefined); }, []);
+  const openOutput = useCallback(async (id: string, tool: string): Promise<void> => {
+    const request = ++detailRequest.current;
+    const title = `${tool} · ${t("工具输出", "Tool output")}`;
+    setDetail({ title, content: "", loading: true });
+    try {
+      const result = await window.prospero.getToolOutput(session.id, id);
+      if (detailRequest.current !== request) return;
+      setDetail({ title, content: text(result.output, t("（无输出）", "(No output)")), truncated: result.truncated === true });
+      setOperationError(undefined);
+    } catch (reason) {
+      if (detailRequest.current !== request) return;
+      setDetail(undefined);
+      setOperationError(displayError(reason));
+    }
+  }, [session.id, t]);
+  const openSubagent = useCallback(async (id: string, label: string): Promise<void> => {
+    const request = ++detailRequest.current;
+    const title = `${t("子 Agent", "Subagent")} · ${label}`;
+    setDetail({ title, content: "", loading: true });
+    try {
+      const result = await window.prospero.getSubagentEvents(session.id, id);
+      if (detailRequest.current !== request) return;
+      const lines = collapseChatEventHistory(array(result.events).map(record)).map((event) => `${text(event.kind)}${text(event.text, text(event.summary, text(event.message, text(event.detail)))) ? `\n${text(event.text, text(event.summary, text(event.message, text(event.detail))))}` : ""}`);
+      setDetail({ title, content: lines.join("\n\n") || t("（尚无事件）", "(No events yet)") });
+      setOperationError(undefined);
+    } catch (reason) {
+      if (detailRequest.current !== request) return;
+      setDetail(undefined);
+      setOperationError(displayError(reason));
+    }
+  }, [session.id, t]);
   const handleComposerKeyDown = (event: ReactKeyboardEvent<HTMLTextAreaElement>): void => {
     const native = event.nativeEvent;
     const action = getChatComposerKeyAction(event.key, event.shiftKey, native.isComposing || native.keyCode === 229, skills.length);
@@ -367,9 +443,9 @@ export function ChatPane({ session, onOpenGoal }: { session: SessionInfo; onOpen
   };
   return <div className="flex size-full min-h-0 flex-col bg-background">
     <MessageScrollerProvider autoScroll><MessageScroller><MessageScrollerViewport ref={timelineViewport} onScroll={handleTimelineScroll} aria-label={t("会话消息时间线", "Conversation message timeline")}><MessageScrollerContent className="mx-auto w-full max-w-4xl px-6 py-8">{!timeline.items.length && <Empty className="my-auto"><EmptyHeader><EmptyMedia variant="icon"><Bot /></EmptyMedia><EmptyTitle>{t("开始与", "Start collaborating with")} {session.agent}</EmptyTitle><EmptyDescription>{t("消息、工具调用、审批、提问和子 Agent 过程会按时间线显示在这里。", "Messages, tool calls, approvals, questions, and subagent activity appear here in a timeline.")}</EmptyDescription></EmptyHeader></Empty>}{historyWindow.start > 0 && <div className="flex justify-center"><Button variant="outline" size="sm" onClick={() => selectHistoryCursor({ end: historyWindow.cursorStart, mode: "page" })}><ChevronDown className="rotate-180" data-icon="inline-start" />{t(`查看更早的 ${String(Math.min(CHAT_TIMELINE_WINDOW_SIZE, historyWindow.start))} 条记录`, `View ${String(Math.min(CHAT_TIMELINE_WINDOW_SIZE, historyWindow.start))} earlier events`)}</Button></div>}{visibleItems.map((item) => { const kind = text(item.event.kind); const isResolved = kind === "permission.request" ? hasChatResolution(timeline.resolutions, "permission.resolved", text(item.event.reqId)) : kind === "question.request" ? hasChatResolution(timeline.resolutions, "question.resolved", text(item.event.reqId)) : false; return <TimelineItem key={item.key} item={item} isResolved={isResolved} sessionId={session.id} onError={setOperationError} openOutput={openOutput} openSubagent={openSubagent} />; })}{!historyWindow.isLatest && <div className="flex flex-wrap items-center justify-center gap-2 rounded-lg border bg-muted/40 p-3 text-sm text-muted-foreground"><span>{t(`当前显示 ${String(historyWindow.start + 1)}–${String(historyWindow.end)}，另有 ${String(historyWindow.newerCount)} 条较新记录`, `Showing ${String(historyWindow.start + 1)}–${String(historyWindow.end)} with ${String(historyWindow.newerCount)} newer events`)}</span><Button variant="outline" size="sm" onClick={() => { const nextEnd = Math.min(timeline.items.length, historyWindow.end + CHAT_TIMELINE_WINDOW_SIZE); if (nextEnd >= timeline.items.length) jumpToLatest(); else selectHistoryCursor({ end: timeline.items[nextEnd]?.ordinal ?? timeline.nextOrdinal, mode: "page" }); }}>{t("查看较新记录", "View newer events")}<ChevronDown data-icon="inline-end" /></Button><Button size="sm" onClick={jumpToLatest}>{t("回到最新", "Jump to latest")}</Button></div>}</MessageScrollerContent></MessageScrollerViewport><MessageScrollerButton /></MessageScroller></MessageScrollerProvider>
-    <div className="border-t bg-background/95 px-4 py-3 backdrop-blur"><div className="mx-auto flex max-w-4xl flex-col gap-2">{connectionError && <Alert variant="destructive"><CircleAlert /><AlertTitle>{t("会话连接中断", "Session connection interrupted")}</AlertTitle><AlertDescription>{connectionError}</AlertDescription></Alert>}{operationError && <Alert variant="destructive"><CircleAlert /><AlertTitle>{t("会话操作失败", "Session action failed")}</AlertTitle><AlertDescription>{operationError}</AlertDescription></Alert>}{attachments.length > 0 && <AttachmentGroup>{attachments.map((item) => <Attachment state="idle" size="sm" key={item.id}><AttachmentMedia><FileImage /></AttachmentMedia><AttachmentContent><AttachmentTitle>{item.name}</AttachmentTitle><AttachmentDescription>{t(`图片 · ${(item.size / 1024 / 1024).toFixed(1)} MB · 等待发送`, `Image · ${(item.size / 1024 / 1024).toFixed(1)} MB · waiting to send`)}</AttachmentDescription></AttachmentContent><AttachmentActions><AttachmentAction aria-label={`${t("移除", "Remove")} ${item.name}`} onClick={() => setAttachments((current) => current.filter((entry) => entry.id !== item.id))}><X /></AttachmentAction></AttachmentActions></Attachment>)}</AttachmentGroup>}
+    <div className="border-t bg-background/95 px-4 py-3 backdrop-blur"><div className="mx-auto flex max-w-4xl flex-col gap-2">{connectionError && <Alert variant="destructive"><CircleAlert /><AlertTitle>{t("会话连接中断", "Session connection interrupted")}</AlertTitle><AlertDescription>{connectionError}</AlertDescription></Alert>}{operationError && <Alert variant="destructive"><CircleAlert /><AlertTitle>{t("会话操作失败", "Session action failed")}</AlertTitle><AlertDescription>{operationError}</AlertDescription></Alert>}{messageQueue.length > 0 && <section className="grid gap-2 rounded-xl border bg-muted/35 p-3" aria-label={t("待发送消息", "Queued messages")} aria-live="polite"><header className="flex flex-wrap items-center justify-between gap-2"><strong className="flex items-center gap-2 text-sm"><Clock3 className="size-4" />{t("待发送", "Queued")} · {messageQueue.length}</strong><span className="text-xs text-muted-foreground">{t("当前轮结束后依次发送", "Sent in order after the current turn")}</span></header><div className="grid max-h-52 gap-1.5 overflow-y-auto">{messageQueue.map((item) => <div className="flex min-w-0 items-center gap-2 rounded-lg border bg-background/80 px-2.5 py-2" key={item.id}><Badge variant="outline">{item.kind === "guide" ? t("引导", "Guide") : t("排队", "Queue")}</Badge><span className="min-w-0 flex-1 truncate text-sm" title={item.text}>{item.text || t(`${String(item.attachmentCount)} 张图片`, `${String(item.attachmentCount)} images`)}</span>{item.attachmentCount > 0 && <span className="flex items-center gap-1 text-xs text-muted-foreground"><FileImage className="size-3.5" />{item.attachmentCount}</span>}{item.kind !== "guide" && <Button variant="ghost" size="xs" aria-busy={queueBusy[item.id] === "guide"} disabled={Boolean(queueBusy[item.id])} onClick={() => void queueAction(item.id, "guide")}>{queueBusy[item.id] === "guide" ? <Spinner data-icon="inline-start" /> : <Send data-icon="inline-start" />}{t("现在引导", "Guide now")}</Button>}<Button variant="ghost" size="icon-xs" aria-label={t("取消待发送消息", "Cancel queued message")} aria-busy={queueBusy[item.id] === "remove"} disabled={Boolean(queueBusy[item.id])} onClick={() => void queueAction(item.id, "remove")}>{queueBusy[item.id] === "remove" ? <Spinner /> : <Trash2 />}</Button></div>)}</div></section>}{attachments.length > 0 && <AttachmentGroup>{attachments.map((item) => <Attachment state="idle" size="sm" key={item.id}><AttachmentMedia><FileImage /></AttachmentMedia><AttachmentContent><AttachmentTitle>{item.name}</AttachmentTitle><AttachmentDescription>{t(`图片 · ${(item.size / 1024 / 1024).toFixed(1)} MB · 等待发送`, `Image · ${(item.size / 1024 / 1024).toFixed(1)} MB · waiting to send`)}</AttachmentDescription></AttachmentContent><AttachmentActions><AttachmentAction aria-label={`${t("移除", "Remove")} ${item.name}`} onClick={() => setAttachments((current) => current.filter((entry) => entry.id !== item.id))}><X /></AttachmentAction></AttachmentActions></Attachment>)}</AttachmentGroup>}
       {attachmentProgress && <div className="flex items-center gap-2 text-xs text-muted-foreground" role="status"><Spinner />{t(`正在处理图片 ${String(attachmentProgress.current)}/${String(attachmentProgress.total)}…`, `Processing image ${String(attachmentProgress.current)}/${String(attachmentProgress.total)}…`)}</div>}
-      <InputGroup className="h-auto rounded-xl bg-card shadow-sm"><InputGroupTextarea value={draft} maxLength={MAX_CHAT_DRAFT_LENGTH} onChange={(event) => setDraft(event.target.value)} onKeyDown={handleComposerKeyDown} role="combobox" aria-label={t("消息", "Message")} aria-autocomplete="list" aria-expanded={skills.length > 0} aria-controls={skills.length ? skillListId : undefined} aria-activedescendant={skills.length ? `${skillListId}-${String(Math.max(0, activeSkillIndex))}` : undefined} placeholder={t("发送消息；输入 $ 加载 Skill…", "Send a message; type $ to load a skill…")} rows={3} className="min-h-20" />{skills.length > 0 && <div id={skillListId} role="listbox" className="absolute inset-x-2 bottom-full mb-2 flex max-h-56 flex-col gap-1 overflow-auto rounded-xl border bg-popover p-1 shadow-xl">{skills.map((skill, index) => <Button id={`${skillListId}-${String(index)}`} role="option" aria-selected={index === activeSkillIndex} variant={index === activeSkillIndex ? "secondary" : "ghost"} className="h-auto justify-start" key={skill.value} onMouseEnter={() => setActiveSkillIndex(index)} onMouseDown={(event) => { event.preventDefault(); chooseSkill(skill); }} onClick={() => chooseSkill(skill)}><span className="flex min-w-0 flex-col items-start gap-0.5"><strong>${skill.label ?? skill.value}</strong>{skill.detail && <small className="text-muted-foreground">{skill.detail}</small>}</span></Button>)}</div>}<InputGroupAddon align="block-end" className="justify-between gap-2 border-t"><div className="flex min-w-0 items-center gap-2">{modes && <ToggleGroup value={modes.currentMode ? [modes.currentMode] : []} onValueChange={(values) => values[0] && void setMode(values[0])} disabled={modeBusy} variant="outline" size="sm">{modes.modes.map((mode) => <ToggleGroupItem key={mode.id} value={mode.id} title={mode.description}>{mode.id === "plan" ? <ListChecks /> : <Bot />}{mode.label}</ToggleGroupItem>)}</ToggleGroup>}{onOpenGoal && <Button variant="outline" size="sm" onClick={onOpenGoal}><Target data-icon="inline-start" />{t("目标", "Goal")}</Button>}<InputGroupButton size="sm" disabled={sending || attaching} title={t("上传图片", "Upload images")} onClick={() => fileInput.current?.click()}><Paperclip data-icon="inline-start" />{attaching ? t("处理中", "Processing") : t("附件", "Attach")}</InputGroupButton><input ref={fileInput} hidden type="file" multiple accept="image/jpeg,image/png,image/gif,image/webp" onChange={(event) => void attach(event.target.files)} /></div><Button onClick={() => void send()} disabled={(!draft.trim() && !attachments.length) || sending || attaching}>{sending ? <Spinner data-icon="inline-start" /> : <Send data-icon="inline-start" />}{sending ? t("发送中", "Sending") : t("发送", "Send")}</Button></InputGroupAddon></InputGroup><p className="text-center text-xs text-muted-foreground">{t("Enter 发送 · Shift + Enter 换行 · 最多 6 张，单张 5 MB / 共 10 MB", "Enter to send · Shift + Enter for a new line · Up to 6 images, 5 MB each / 10 MB total")}</p></div></div>
-    <Dialog open={Boolean(detail)} onOpenChange={(open) => { if (!open) setDetail(undefined); }}><DialogContent className="sm:max-w-3xl"><DialogHeader><DialogTitle>{detail?.title}</DialogTitle><DialogDescription>{t("内容按需从本机 daemon 读取，不会进入渲染进程持久存储。", "Content is read from the local daemon on demand and is not persisted by the renderer.")}</DialogDescription></DialogHeader>{detail?.loading ? <div className="flex items-center justify-center gap-2 py-16 text-muted-foreground"><Spinner />{t("正在读取…", "Loading…")}</div> : <pre className="max-h-[60vh] overflow-auto rounded-lg bg-muted p-4 text-xs leading-relaxed">{detail?.content}</pre>}<DialogFooter><Button variant="outline" onClick={() => setDetail(undefined)}>{t("关闭", "Close")}</Button></DialogFooter></DialogContent></Dialog>
+      <InputGroup className="h-auto rounded-xl bg-card shadow-sm"><InputGroupTextarea value={draft} maxLength={MAX_CHAT_DRAFT_LENGTH} onChange={(event) => setDraft(event.target.value)} onKeyDown={handleComposerKeyDown} role="combobox" aria-label={t("消息", "Message")} aria-autocomplete="list" aria-expanded={skills.length > 0} aria-controls={skills.length ? skillListId : undefined} aria-activedescendant={skills.length ? `${skillListId}-${String(Math.max(0, activeSkillIndex))}` : undefined} placeholder={t("发送消息；输入 $ 加载 Skill…", "Send a message; type $ to load a skill…")} rows={3} className="min-h-20" />{skills.length > 0 && <div id={skillListId} role="listbox" className="absolute inset-x-2 bottom-full mb-2 flex max-h-56 flex-col gap-1 overflow-auto rounded-xl border bg-popover p-1 shadow-xl">{skills.map((skill, index) => <Button id={`${skillListId}-${String(index)}`} role="option" aria-selected={index === activeSkillIndex} variant={index === activeSkillIndex ? "secondary" : "ghost"} className="h-auto justify-start" key={skill.value} onMouseEnter={() => setActiveSkillIndex(index)} onMouseDown={(event) => { event.preventDefault(); chooseSkill(skill); }} onClick={() => chooseSkill(skill)}><span className="flex min-w-0 flex-col items-start gap-0.5"><strong>${skill.label ?? skill.value}</strong>{skill.detail && <small className="text-muted-foreground">{skill.detail}</small>}</span></Button>)}</div>}<InputGroupAddon align="block-end" className="justify-between gap-2 border-t"><div className="flex min-w-0 items-center gap-2">{sessionBusy && <ToggleGroup value={[busyDelivery]} onValueChange={(values) => { if (values[0] === "queue" || values[0] === "steer") setBusyDelivery(values[0]); }} variant="outline" size="sm" aria-label={t("发送方式", "Delivery mode")}><ToggleGroupItem value="queue" title={t("当前轮结束后发送", "Send after the current turn")}>{t("排队", "Queue")}</ToggleGroupItem><ToggleGroupItem value="steer" title={t("尝试引导当前轮；无法引导时排到队首", "Try to steer the current turn; queue first if unavailable")}>{t("引导", "Steer")}</ToggleGroupItem></ToggleGroup>}{modes && <ToggleGroup value={modes.currentMode ? [modes.currentMode] : []} onValueChange={(values) => values[0] && void setMode(values[0])} disabled={modeBusy} variant="outline" size="sm">{modes.modes.map((mode) => <ToggleGroupItem key={mode.id} value={mode.id} title={mode.description}>{mode.id === "plan" ? <ListChecks /> : <Bot />}{mode.label}</ToggleGroupItem>)}</ToggleGroup>}{onOpenGoal && <Button variant="outline" size="sm" onClick={onOpenGoal}><Target data-icon="inline-start" />{t("目标", "Goal")}</Button>}<InputGroupButton size="sm" disabled={sending || attaching} title={t("上传图片", "Upload images")} onClick={() => fileInput.current?.click()}><Paperclip data-icon="inline-start" />{attaching ? t("处理中", "Processing") : t("附件", "Attach")}</InputGroupButton><input ref={fileInput} hidden type="file" multiple accept="image/jpeg,image/png,image/gif,image/webp" onChange={(event) => void attach(event.target.files)} /></div><Button onClick={() => void send()} disabled={(!draft.trim() && !attachments.length) || sending || attaching}>{sending ? <Spinner data-icon="inline-start" /> : <Send data-icon="inline-start" />}{sending ? t("发送中", "Sending") : t("发送", "Send")}</Button></InputGroupAddon></InputGroup><p className="text-center text-xs text-muted-foreground">{t("Enter 发送 · Shift + Enter 换行 · 最多 6 张，单张 5 MB / 共 10 MB", "Enter to send · Shift + Enter for a new line · Up to 6 images, 5 MB each / 10 MB total")}</p></div></div>
+    <Dialog open={Boolean(detail)} onOpenChange={(open) => { if (!open) closeDetail(); }}><DialogContent className="sm:max-w-3xl"><DialogHeader><DialogTitle>{detail?.title}</DialogTitle><DialogDescription>{t("内容按需从本机 daemon 读取，不会进入渲染进程持久存储。", "Content is read from the local daemon on demand and is not persisted by the renderer.")}</DialogDescription></DialogHeader>{detail?.loading ? <div className="flex items-center justify-center gap-2 py-16 text-muted-foreground"><Spinner />{t("正在读取…", "Loading…")}</div> : <>{detail?.truncated && <Alert><CircleAlert /><AlertTitle>{t("输出已截断", "Output truncated")}</AlertTitle><AlertDescription>{t("daemon 仅保留了这次工具输出的前 200,000 个字符。", "The daemon retained only the first 200,000 characters of this tool output.")}</AlertDescription></Alert>}<pre className="max-h-[60vh] overflow-auto rounded-lg bg-muted p-4 text-xs leading-relaxed">{detail?.content}</pre></>}<DialogFooter><Button variant="outline" onClick={closeDetail}>{t("关闭", "Close")}</Button></DialogFooter></DialogContent></Dialog>
   </div>;
 }

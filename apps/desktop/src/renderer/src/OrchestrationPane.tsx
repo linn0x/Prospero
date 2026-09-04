@@ -99,6 +99,11 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
     () => defaultSessionLaunchAccountId(snapshot.accounts, "codex") ?? "",
   );
   const [error, setError] = useState<string>();
+  const [createError, setCreateError] = useState<string>();
+  const [taskCreateError, setTaskCreateError] = useState<string>();
+  const [saveTemplateError, setSaveTemplateError] = useState<string>();
+  const [templateRunError, setTemplateRunError] = useState<string>();
+  const [abandonError, setAbandonError] = useState<string>();
   const [busy, setBusy] = useState<string>();
   const busyRef = useRef<string | undefined>(undefined);
   const gateSubmissionRef = useRef(new Set<string>());
@@ -215,12 +220,17 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
   }, [selectedWorkerAccountId]);
   const parseSkills = (value: string): string[] => [...new Set(value.split(/[,\s]+/).map((skill) => skill.trim().replace(/^\$/, "")).filter(Boolean))].slice(0, 5);
 
-  const perform = async (key: string, method: string, params: JsonObject): Promise<JsonObject | undefined> => {
+  const perform = async (
+    key: string,
+    method: string,
+    params: JsonObject,
+    reportError: (message?: string) => void = setError,
+  ): Promise<JsonObject | undefined> => {
     if (busyRef.current) return undefined;
     busyRef.current = key;
     setBusy(key);
-    try { const result = await window.prospero.orchestrationAction(method, params); setError(undefined); return result; }
-    catch (reason) { setError(displayError(reason)); return undefined; }
+    try { const result = await window.prospero.orchestrationAction(method, params); reportError(undefined); return result; }
+    catch (reason) { reportError(displayError(reason)); return undefined; }
     finally { busyRef.current = undefined; setBusy(undefined); }
   };
 
@@ -270,9 +280,9 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
   const createGraph = async (): Promise<void> => {
     const titles = nodeLines.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
     if (!objective.trim() || titles.length === 0) return;
-    if (objective.trim().length > 20_000) { setError(t("目标不能超过 20,000 个字符", "The goal cannot exceed 20,000 characters")); return; }
-    if (titles.length > 200) { setError(t("一次最多创建 200 个任务", "You can create up to 200 tasks at once")); return; }
-    if (titles.some((title) => title.length > 2_000)) { setError(t("单个任务标题不能超过 2,000 个字符", "Task titles cannot exceed 2,000 characters")); return; }
+    if (objective.trim().length > 20_000) { setCreateError(t("目标不能超过 20,000 个字符", "The goal cannot exceed 20,000 characters")); return; }
+    if (titles.length > 200) { setCreateError(t("一次最多创建 200 个任务", "You can create up to 200 tasks at once")); return; }
+    if (titles.some((title) => title.length > 2_000)) { setCreateError(t("单个任务标题不能超过 2,000 个字符", "Task titles cannot exceed 2,000 characters")); return; }
     const nodes = titles.map((title, index) => ({
       clientId: `task-${String(index + 1)}`,
       title,
@@ -280,10 +290,11 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
       deps: index === 0 ? [] : [`task-${String(index)}`],
       ...(parseSkills(graphSkills).length ? { skills: parseSkills(graphSkills) } : {}),
     }));
-    const result = await perform("create", "graph.create", { operationId: operationId(), objective: objective.trim(), nodes, ...(coordinatorSessionId ? { coordinatorSessionId } : {}) });
+    const result = await perform("create", "graph.create", { operationId: operationId(), objective: objective.trim(), nodes, ...(coordinatorSessionId ? { coordinatorSessionId } : {}) }, setCreateError);
     if (!result) return;
     const createdRunId = text(record(result["run"])["id"]);
     if (createdRunId) setSelectedRunId(createdRunId);
+    setCreateError(undefined);
     setShowCreate(false);
     setObjective("");
   };
@@ -319,15 +330,16 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
 
   const createTask = async (): Promise<void> => {
     if (!runId || !taskTitle.trim() || !taskSpec.trim()) return;
-    if (taskTitle.trim().length > 2_000 || taskSpec.trim().length > 20_000) { setError(t("任务标题最多 2,000 字符，要求最多 20,000 字符", "Task titles are limited to 2,000 characters and requirements to 20,000")); return; }
-    if (!await perform("task-create", "task.create", { operationId: operationId(), runId, title: taskTitle.trim(), spec: taskSpec.trim(), deps: taskDeps, ...(parseSkills(taskSkills).length ? { skills: parseSkills(taskSkills) } : {}) })) return;
-    setShowTaskCreate(false); setTaskTitle(""); setTaskSpec(""); setTaskDeps([]); setTaskSkills(""); setTaskDependencyQuery("");
+    if (taskTitle.trim().length > 2_000 || taskSpec.trim().length > 20_000) { setTaskCreateError(t("任务标题最多 2,000 字符，要求最多 20,000 字符", "Task titles are limited to 2,000 characters and requirements to 20,000")); return; }
+    if (!await perform("task-create", "task.create", { operationId: operationId(), runId, title: taskTitle.trim(), spec: taskSpec.trim(), deps: taskDeps, ...(parseSkills(taskSkills).length ? { skills: parseSkills(taskSkills) } : {}) }, setTaskCreateError)) return;
+    setTaskCreateError(undefined); setShowTaskCreate(false); setTaskTitle(""); setTaskSpec(""); setTaskDeps([]); setTaskSkills(""); setTaskDependencyQuery("");
   };
 
   const saveRunTemplate = async (): Promise<void> => {
     if (!templateName.trim() || runTasks.length === 0 || busyRef.current) return;
     busyRef.current = "template-save";
     setBusy("template-save");
+    setSaveTemplateError(undefined);
     try {
       const sourceTasks = await window.prospero.getOrchestrationRunTasks(runId);
       const indexes = new Map(sourceTasks.map((task, index) => [text(task["id"]), index]));
@@ -347,14 +359,14 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
       setSaveTemplateOpen(false);
       setTemplateName("");
       setTemplateDescription("");
-      setError(undefined);
-    } catch (reason) { setError(displayError(reason)); }
+      setSaveTemplateError(undefined);
+    } catch (reason) { setSaveTemplateError(displayError(reason)); }
     finally { busyRef.current = undefined; setBusy(undefined); }
   };
 
   const runTemplate = async (): Promise<void> => {
     if (!selectedTemplate || !templateObjective.trim()) return;
-    if (templateObjective.trim().length > 20_000) { setError(t("目标不能超过 20,000 个字符", "The goal cannot exceed 20,000 characters")); return; }
+    if (templateObjective.trim().length > 20_000) { setTemplateRunError(t("目标不能超过 20,000 个字符", "The goal cannot exceed 20,000 characters")); return; }
     const nodes = selectedTemplate.nodes.map((node, index) => ({
       clientId: `template-task-${String(index + 1)}`,
       title: node.title,
@@ -362,7 +374,7 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
       deps: node.dependencyIndexes.map((dependency) => `template-task-${String(dependency + 1)}`),
       ...(node.skills.length ? { skills: node.skills } : {}),
     }));
-    const result = await perform("template-run", "graph.create", { operationId: operationId(), objective: templateObjective.trim(), nodes, ...(coordinatorSessionId ? { coordinatorSessionId } : {}) });
+    const result = await perform("template-run", "graph.create", { operationId: operationId(), objective: templateObjective.trim(), nodes, ...(coordinatorSessionId ? { coordinatorSessionId } : {}) }, setTemplateRunError);
     if (!result) return;
     const createdRunId = text(record(result["run"])["id"]);
     if (createdRunId) setSelectedRunId(createdRunId);
@@ -389,7 +401,7 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
     }
   };
 
-  const completeCount = runTasks.filter((task) => ["done", "completed", "succeeded"].includes(text(task["status"]))).length;
+  const completeCount = runTasks.filter((task) => ["done", "completed", "succeeded", "cancelled"].includes(text(task["status"]))).length;
   const runProgress = runTasks.length ? Math.round((completeCount / runTasks.length) * 100) : 0;
   const boardColumns: Array<{ id: TaskBoardColumnId; label: string }> = [
     { id: "queued", label: t("排队", "Queued") },
@@ -455,8 +467,8 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
       <main className={`run-detail${runView === "dag" ? " run-detail-dag" : ""}`}>{selectedRun ? <>
         <div className="run-hero"><div className="run-hero-copy"><div className="section-label">{t("当前运行", "CURRENT RUN")}</div><h2 title={text(selectedRun["objective"])}>{text(selectedRun["objective"])}</h2><div className="run-progress-line"><Progress value={runProgress} /><span>{completeCount} / {runTasks.length} {t("已完成", "complete")}</span></div></div><div className="button-row">
           {!runListOpen && <button className="run-list-toggle" aria-expanded={runListOpen} onClick={() => setRunListOpen(true)}><PanelLeftOpen size={14} />{t("显示运行列表", "Show runs")}</button>}
-          {runTasks.length > 0 && <button onClick={() => { setTemplateName(text(selectedRun["objective"])); setTemplateDescription(""); setSaveTemplateOpen(true); }}><Save size={14} />{t("保存为模板", "Save template")}</button>}
-          {text(record(selectedRun["automation"])["state"]) !== "running" && text(selectedRun["status"]) === "active" && <button onClick={() => setShowTaskCreate(true)}><Plus size={14} />{t("添加任务", "Add task")}</button>}
+          {runTasks.length > 0 && <button onClick={() => { setTemplateName(text(selectedRun["objective"])); setTemplateDescription(""); setSaveTemplateError(undefined); setSaveTemplateOpen(true); }}><Save size={14} />{t("保存为模板", "Save template")}</button>}
+          {text(record(selectedRun["automation"])["state"]) !== "running" && text(selectedRun["status"]) === "active" && <button onClick={() => { setTaskCreateError(undefined); setShowTaskCreate(true); }}><Plus size={14} />{t("添加任务", "Add task")}</button>}
           {text(record(selectedRun["automation"])["state"]) === "running" ? <button disabled={Boolean(busy)} onClick={() => void perform("automation", "automation.pause", { operationId: operationId(), runId })}><Pause size={14} />{t("暂停自动执行", "Pause automation")}</button> : <button onClick={() => void perform("automation", "automation.start", automationStartParams(workerSelection, runId, operationId()))} disabled={!workerProject || Boolean(busy)}><Play size={14} />{t("自动执行 DAG", "Run DAG automatically")}</button>}
           {text(selectedRun["status"]) === "active" && <button disabled={Boolean(busy)} onClick={() => void perform("complete", "run.complete", { operationId: operationId(), runId })}><CheckCircle2 size={14} />{t("标记完成", "Mark complete")}</button>}
           {text(selectedRun["status"]) === "active" && <button className="danger" disabled={Boolean(busy)} onClick={() => setAbandonRun({ id: runId, objective: text(selectedRun["objective"]) })}><Ban size={14} />{t("放弃", "Abandon")}</button>}
@@ -484,7 +496,7 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
           </TabsContent>}
         </Tabs>
         {pendingRunGates.length > 0 && <section className="dashboard-section"><div className="section-title"><ShieldQuestion size={16} />{t("待处理 Gate", "Pending gates")} <span>{pendingRunGates.length}</span></div><div className="card-grid">{pendingRunGates.map(gateCard)}</div></section>}
-        {runWorktrees.length > 0 && <section className="dashboard-section"><div className="section-title"><GitBranch size={16} />Worktrees <span>{runWorktrees.length}</span><span className="ml-auto text-xs font-normal text-muted-foreground">{attentionWorktrees.length} {t("待处理", "need attention")} · {runWorktrees.length - attentionWorktrees.length} {t("已归档", "archived")}</span><Button variant="ghost" size="sm" className="ml-2" aria-expanded={worktreesExpanded} onClick={() => setWorktreeView({ runId, expanded: !worktreesExpanded, limit: WORKTREE_PAGE_SIZE })}>{worktreesExpanded ? <ChevronDown data-icon="inline-start" /> : <ChevronRight data-icon="inline-start" />}{worktreesExpanded ? t("收起", "Collapse") : t("查看全部", "View all")}</Button></div>{visibleWorktrees.length > 0 ? <div className="worktree-list">{visibleWorktrees.map((asset) => { const inspection = record(asset["lastInspection"]); const safe = ["safe_to_clean", "equivalent"].includes(text(inspection["state"])); const assetId = text(asset["id"]); const assetBusy = busy === assetId; const launchable = isLaunchableWorktreeAsset(asset); return <article className="worktree-row" key={assetId}><GitBranch size={15} /><div><strong>{text(asset["branch"], t("工作树", "Worktree"))}</strong><small>{text(asset["path"])}</small></div><span className="pill">{status(text(asset["state"]))}</span><button disabled={!launchable || assetBusy} title={launchable ? t("在这个 worktree 中启动 Agent", "Start an agent in this worktree") : t("工作树目录不可用", "The worktree directory is unavailable")} onClick={() => onNewSession(text(asset["path"]))}><Bot size={13} />{t("运行 Agent", "Run agent")}</button><button disabled={assetBusy} onClick={() => void perform(assetId, "worktree.inspect", { assetId, targetRef: "main" })}>{t("检查", "Inspect")}</button><button className="danger" disabled={!safe || assetBusy} title={safe ? t("清理已确认安全的工作树", "Clean this verified worktree") : t("必须先通过安全检查", "Run a safety check first")} onClick={() => void perform(assetId, "worktree.cleanup", { operationId: operationId(), assetId, targetRef: text(inspection["targetRef"], "main"), confirm: true, deleteBranch: false })}><Trash2 size={13} />{t("安全清理", "Safe cleanup")}</button></article>; })}</div> : <p className="rounded-lg border border-dashed px-4 py-5 text-sm text-muted-foreground">{t("当前没有需要处理的 Worktree；展开后可查看已清理或已缺失的历史记录。", "No worktrees need attention. Expand to inspect cleaned or missing history.")}</p>}{worktreesExpanded && visibleWorktrees.length < runWorktrees.length && <div className="mt-3 flex justify-center"><Button variant="outline" size="sm" onClick={() => setWorktreeView({ runId, expanded: true, limit: worktreeLimit + WORKTREE_PAGE_SIZE })}>{t("显示更多", "Show more")} · {runWorktrees.length - visibleWorktrees.length}</Button></div>}</section>}
+        {runWorktrees.length > 0 && <section className="dashboard-section"><div className="section-title"><GitBranch size={16} />Worktrees <span>{runWorktrees.length}</span><span className="ml-auto text-xs font-normal text-muted-foreground">{attentionWorktrees.length} {t("待处理", "need attention")} · {runWorktrees.length - attentionWorktrees.length} {t("已归档", "archived")}</span><Button variant="ghost" size="sm" className="ml-2" aria-expanded={worktreesExpanded} onClick={() => setWorktreeView({ runId, expanded: !worktreesExpanded, limit: WORKTREE_PAGE_SIZE })}>{worktreesExpanded ? <ChevronDown data-icon="inline-start" /> : <ChevronRight data-icon="inline-start" />}{worktreesExpanded ? t("收起", "Collapse") : t("查看全部", "View all")}</Button></div>{visibleWorktrees.length > 0 ? <div className="worktree-list">{visibleWorktrees.map((asset) => { const inspection = record(asset["lastInspection"]); const safe = ["safe_to_clean", "equivalent"].includes(text(inspection["state"])); const assetId = text(asset["id"]); const assetBusy = busy === assetId; const launchable = isLaunchableWorktreeAsset(asset); return <article className="worktree-row" key={assetId}><GitBranch size={15} /><div><strong>{text(asset["branch"], t("工作树", "Worktree"))}</strong><small>{text(asset["path"])}</small></div><span className="pill">{status(text(asset["state"]))}</span><button disabled={!launchable || assetBusy} title={launchable ? t("在这个 worktree 中启动 Agent", "Start an agent in this worktree") : t("工作树目录不可用", "The worktree directory is unavailable")} onClick={() => onNewSession(text(asset["path"]))}><Bot size={13} />{t("运行 Agent", "Run agent")}</button><button disabled={assetBusy} onClick={() => void perform(assetId, "worktree.inspect", { assetId })}>{t("检查", "Inspect")}</button><button className="danger" disabled={!safe || assetBusy} title={safe ? t("清理已确认安全的工作树", "Clean this verified worktree") : t("必须先通过安全检查", "Run a safety check first")} onClick={() => void perform(assetId, "worktree.cleanup", { operationId: operationId(), assetId, ...(text(inspection["targetRef"]) ? { targetRef: text(inspection["targetRef"]) } : {}), confirm: true, deleteBranch: false })}><Trash2 size={13} />{t("安全清理", "Safe cleanup")}</button></article>; })}</div> : <p className="rounded-lg border border-dashed px-4 py-5 text-sm text-muted-foreground">{t("当前没有需要处理的 Worktree；展开后可查看已清理或已缺失的历史记录。", "No worktrees need attention. Expand to inspect cleaned or missing history.")}</p>}{worktreesExpanded && visibleWorktrees.length < runWorktrees.length && <div className="mt-3 flex justify-center"><Button variant="outline" size="sm" onClick={() => setWorktreeView({ runId, expanded: true, limit: worktreeLimit + WORKTREE_PAGE_SIZE })}>{t("显示更多", "Show more")} · {runWorktrees.length - visibleWorktrees.length}</Button></div>}</section>}
       </> : <Empty><EmptyHeader><EmptyMedia variant="icon"><Workflow /></EmptyMedia><EmptyTitle>{t("选择或创建一个 Run", "Choose or create a run")}</EmptyTitle><EmptyDescription>{t("用 DAG 拆解任务，再把独立节点派给并行 Agent。", "Break work into a DAG and dispatch independent nodes to agents in parallel.")}</EmptyDescription></EmptyHeader></Empty>}</main>
     </div>
     <Dialog open={Boolean(taskDetail)} onOpenChange={(open) => { if (!open) closeTaskDetail(); }}>
@@ -530,35 +542,58 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
       </DialogContent>
     </Dialog>
 
-    <Dialog open={saveTemplateOpen} onOpenChange={setSaveTemplateOpen}><DialogContent className="sm:max-w-lg"><DialogHeader><DialogTitle>{t("保存工作流模板", "Save workflow template")}</DialogTitle><DialogDescription>{t("保存当前 Run 的任务、依赖关系和 Skills，不保存运行状态或会话。", "Save tasks, dependencies, and skills from this run without runtime state or sessions.")}</DialogDescription></DialogHeader><FieldGroup><Field><FieldLabel htmlFor="template-name">{t("模板名称", "Template name")}</FieldLabel><Input id="template-name" value={templateName} onChange={(event) => setTemplateName(event.target.value)} autoFocus /></Field><Field><FieldLabel htmlFor="template-description">{t("说明", "Description")}</FieldLabel><Textarea id="template-description" rows={3} value={templateDescription} onChange={(event) => setTemplateDescription(event.target.value)} placeholder={t("何时使用这个模板", "When to use this template")} /><FieldDescription>{runTasks.length} {t("个任务会被保存", "tasks will be saved")}</FieldDescription></Field></FieldGroup><DialogFooter><Button variant="outline" onClick={() => setSaveTemplateOpen(false)}>{t("取消", "Cancel")}</Button><Button disabled={!templateName.trim() || busy === "template-save"} onClick={() => void saveRunTemplate()}><Save data-icon="inline-start" />{t("保存模板", "Save template")}</Button></DialogFooter></DialogContent></Dialog>
+    <Dialog open={saveTemplateOpen} onOpenChange={(open) => { setSaveTemplateOpen(open); if (!open) setSaveTemplateError(undefined); }}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader><DialogTitle>{t("保存工作流模板", "Save workflow template")}</DialogTitle><DialogDescription>{t("保存当前 Run 的任务、依赖关系和 Skills，不保存运行状态或会话。", "Save tasks, dependencies, and skills from this run without runtime state or sessions.")}</DialogDescription></DialogHeader>
+        <FieldGroup><Field><FieldLabel htmlFor="template-name">{t("模板名称", "Template name")}</FieldLabel><Input id="template-name" maxLength={120} value={templateName} onChange={(event) => setTemplateName(event.target.value)} autoFocus /></Field><Field><FieldLabel htmlFor="template-description">{t("说明", "Description")}</FieldLabel><Textarea id="template-description" maxLength={500} rows={3} value={templateDescription} onChange={(event) => setTemplateDescription(event.target.value)} placeholder={t("何时使用这个模板", "When to use this template")} /><FieldDescription>{runTasks.length} {t("个任务会被保存", "tasks will be saved")}</FieldDescription></Field></FieldGroup>
+        {saveTemplateError && <Alert variant="destructive"><CircleDot /><AlertTitle>{t("无法保存模板", "Unable to save template")}</AlertTitle><AlertDescription>{saveTemplateError}</AlertDescription></Alert>}
+        <DialogFooter><Button variant="outline" onClick={() => { setSaveTemplateOpen(false); setSaveTemplateError(undefined); }}>{t("取消", "Cancel")}</Button><Button disabled={!templateName.trim() || busy === "template-save"} onClick={() => void saveRunTemplate()}><Save data-icon="inline-start" />{t("保存模板", "Save template")}</Button></DialogFooter>
+      </DialogContent>
+    </Dialog>
 
-    <Dialog open={Boolean(selectedTemplate)} onOpenChange={(open) => { if (!open) setSelectedTemplate(undefined); }}><DialogContent className="sm:max-w-lg"><DialogHeader><DialogTitle>{selectedTemplate?.name}</DialogTitle><DialogDescription>{t("为这次运行填写可验收的最终目标，模板中的 DAG 与 Skills 会被复制到新 Run。", "Enter a verifiable outcome for this run. The template DAG and skills will be copied into a new run.")}</DialogDescription></DialogHeader><Field><FieldLabel htmlFor="template-objective">{t("本次目标", "Run objective")}</FieldLabel><Textarea id="template-objective" rows={4} value={templateObjective} onChange={(event) => setTemplateObjective(event.target.value)} autoFocus placeholder={t("描述这一次要交付的具体结果", "Describe the concrete result to deliver this time")} /><FieldDescription>{selectedTemplate?.nodes.length ?? 0} {t("个任务将被创建", "tasks will be created")}</FieldDescription></Field><DialogFooter><Button variant="outline" onClick={() => setSelectedTemplate(undefined)}>{t("取消", "Cancel")}</Button><Button disabled={!templateObjective.trim() || busy === "template-run"} onClick={() => void runTemplate()}><Rocket data-icon="inline-start" />{t("从模板运行", "Run from template")}</Button></DialogFooter></DialogContent></Dialog>
+    <Dialog open={Boolean(selectedTemplate)} onOpenChange={(open) => { if (!open) { setSelectedTemplate(undefined); setTemplateRunError(undefined); } }}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader><DialogTitle>{selectedTemplate?.name}</DialogTitle><DialogDescription>{t("为这次运行填写可验收的最终目标，模板中的 DAG 与 Skills 会被复制到新 Run。", "Enter a verifiable outcome for this run. The template DAG and skills will be copied into a new run.")}</DialogDescription></DialogHeader>
+        <Field><FieldLabel htmlFor="template-objective">{t("本次目标", "Run objective")}</FieldLabel><Textarea id="template-objective" maxLength={20_000} rows={4} value={templateObjective} onChange={(event) => setTemplateObjective(event.target.value)} autoFocus placeholder={t("描述这一次要交付的具体结果", "Describe the concrete result to deliver this time")} /><FieldDescription>{selectedTemplate?.nodes.length ?? 0} {t("个任务将被创建", "tasks will be created")}</FieldDescription></Field>
+        {templateRunError && <Alert variant="destructive"><CircleDot /><AlertTitle>{t("无法运行模板", "Unable to run template")}</AlertTitle><AlertDescription>{templateRunError}</AlertDescription></Alert>}
+        <DialogFooter><Button variant="outline" onClick={() => { setSelectedTemplate(undefined); setTemplateRunError(undefined); }}>{t("取消", "Cancel")}</Button><Button disabled={!templateObjective.trim() || busy === "template-run"} onClick={() => void runTemplate()}><Rocket data-icon="inline-start" />{t("从模板运行", "Run from template")}</Button></DialogFooter>
+      </DialogContent>
+    </Dialog>
 
-    <Dialog open={Boolean(abandonRun)} onOpenChange={(open) => { if (!open) setAbandonRun(undefined); }}><DialogContent className="sm:max-w-md"><DialogHeader><DialogTitle>{t("放弃这个运行？", "Abandon this run?")}</DialogTitle><DialogDescription>{t("运行会停止继续派发任务，已有记录仍会保留。", "The run will stop dispatching tasks, while its history remains available.")}</DialogDescription></DialogHeader><p className="truncate text-sm font-medium" title={abandonRun?.objective}>{abandonRun?.objective}</p><DialogFooter><Button variant="outline" disabled={busy === "abandon"} onClick={() => setAbandonRun(undefined)}>{t("取消", "Cancel")}</Button><Button variant="destructive" disabled={busy === "abandon"} onClick={() => { if (!abandonRun) return; void perform("abandon", "run.abandon", { operationId: operationId(), runId: abandonRun.id }).then((done) => { if (done) setAbandonRun(undefined); }); }}><Ban data-icon="inline-start" />{busy === "abandon" ? t("正在放弃…", "Abandoning…") : t("确认放弃", "Abandon run")}</Button></DialogFooter></DialogContent></Dialog>
+    <Dialog open={Boolean(abandonRun)} onOpenChange={(open) => { if (!open) { setAbandonRun(undefined); setAbandonError(undefined); } }}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader><DialogTitle>{t("放弃这个运行？", "Abandon this run?")}</DialogTitle><DialogDescription>{t("运行会停止继续派发任务，已有记录仍会保留。", "The run will stop dispatching tasks, while its history remains available.")}</DialogDescription></DialogHeader>
+        <p className="truncate text-sm font-medium" title={abandonRun?.objective}>{abandonRun?.objective}</p>
+        {abandonError && <Alert variant="destructive"><CircleDot /><AlertTitle>{t("无法放弃运行", "Unable to abandon run")}</AlertTitle><AlertDescription>{abandonError}</AlertDescription></Alert>}
+        <DialogFooter><Button variant="outline" disabled={busy === "abandon"} onClick={() => { setAbandonRun(undefined); setAbandonError(undefined); }}>{t("取消", "Cancel")}</Button><Button variant="destructive" disabled={busy === "abandon"} onClick={() => { if (!abandonRun) return; void perform("abandon", "run.abandon", { operationId: operationId(), runId: abandonRun.id }, setAbandonError).then((done) => { if (done) setAbandonRun(undefined); }); }}><Ban data-icon="inline-start" />{busy === "abandon" ? t("正在放弃…", "Abandoning…") : t("确认放弃", "Abandon run")}</Button></DialogFooter>
+      </DialogContent>
+    </Dialog>
 
-    <Dialog open={showCreate} onOpenChange={setShowCreate}>
+    <Dialog open={showCreate} onOpenChange={(open) => { setShowCreate(open); if (!open) setCreateError(undefined); }}>
       <DialogContent className="sm:max-w-xl">
         <DialogHeader><DialogTitle>{t("创建目标任务图", "Create goal graph")}</DialogTitle><DialogDescription>{t("每行一个任务，默认按顺序建立依赖；Skill 会冻结到每个 worker。", "Enter one task per line. Dependencies follow the listed order and skills are pinned to each worker.")}</DialogDescription></DialogHeader>
         <FieldGroup>
-          <Field><FieldLabel htmlFor="run-objective">{t("总体目标", "Goal")}</FieldLabel><Textarea id="run-objective" rows={3} value={objective} onChange={(event) => setObjective(event.target.value)} autoFocus placeholder={t("描述可以验收的最终结果", "Describe a verifiable final outcome")} /></Field>
+          <Field><FieldLabel htmlFor="run-objective">{t("总体目标", "Goal")}</FieldLabel><Textarea id="run-objective" maxLength={20_000} rows={3} value={objective} onChange={(event) => setObjective(event.target.value)} autoFocus placeholder={t("描述可以验收的最终结果", "Describe a verifiable final outcome")} /></Field>
           <Field><FieldLabel htmlFor="run-initial-tasks">{t("初始任务", "Initial tasks")}</FieldLabel><Textarea id="run-initial-tasks" rows={7} value={nodeLines} onChange={(event) => setNodeLines(event.target.value)} /></Field>
           <Field><FieldLabel htmlFor="run-skills"><Sparkles />{t("绑定 Skill（最多 5 个）", "Bind skills (up to 5)")}</FieldLabel><Input id="run-skills" value={graphSkills} onChange={(event) => setGraphSkills(event.target.value)} placeholder="$frontend-design, $playwright" /></Field>
         </FieldGroup>
         {parseSkills(graphSkills).length > 0 && <div className="skill-chip-row">{parseSkills(graphSkills).map((skill) => <span key={skill}>${skill}</span>)}</div>}
-        <DialogFooter><Button variant="outline" disabled={Boolean(busy)} onClick={() => setShowCreate(false)}>{t("取消", "Cancel")}</Button><Button onClick={() => void createGraph()} disabled={!objective.trim() || Boolean(busy)}><CircleDot data-icon="inline-start" />{busy === "create" ? t("正在创建…", "Creating…") : t("创建目标与 DAG", "Create goal and DAG")}</Button></DialogFooter>
+        {createError && <Alert variant="destructive"><CircleDot /><AlertTitle>{t("无法创建任务图", "Unable to create graph")}</AlertTitle><AlertDescription>{createError}</AlertDescription></Alert>}
+        <DialogFooter><Button variant="outline" disabled={Boolean(busy)} onClick={() => { setShowCreate(false); setCreateError(undefined); }}>{t("取消", "Cancel")}</Button><Button onClick={() => void createGraph()} disabled={!objective.trim() || Boolean(busy)}><CircleDot data-icon="inline-start" />{busy === "create" ? t("正在创建…", "Creating…") : t("创建目标与 DAG", "Create goal and DAG")}</Button></DialogFooter>
       </DialogContent>
     </Dialog>
-    <Dialog open={showTaskCreate} onOpenChange={setShowTaskCreate}>
+    <Dialog open={showTaskCreate} onOpenChange={(open) => { setShowTaskCreate(open); if (!open) setTaskCreateError(undefined); }}>
       <DialogContent className="sm:max-w-xl">
         <DialogHeader><DialogTitle>{t("添加任务", "Add task")}</DialogTitle><DialogDescription>{t("选择前置任务和 Skill，daemon 会校验 DAG 并冻结 Skill 来源。", "Choose dependencies and skills. The daemon validates the DAG and pins skill sources.")}</DialogDescription></DialogHeader>
         <FieldGroup>
-          <Field><FieldLabel htmlFor="task-title">{t("任务标题", "Task title")}</FieldLabel><Input id="task-title" value={taskTitle} onChange={(event) => setTaskTitle(event.target.value)} autoFocus /></Field>
-          <Field><FieldLabel htmlFor="task-spec">{t("任务要求", "Task requirements")}</FieldLabel><Textarea id="task-spec" rows={5} value={taskSpec} onChange={(event) => setTaskSpec(event.target.value)} /></Field>
+          <Field><FieldLabel htmlFor="task-title">{t("任务标题", "Task title")}</FieldLabel><Input id="task-title" maxLength={2_000} value={taskTitle} onChange={(event) => setTaskTitle(event.target.value)} autoFocus /></Field>
+          <Field><FieldLabel htmlFor="task-spec">{t("任务要求", "Task requirements")}</FieldLabel><Textarea id="task-spec" maxLength={20_000} rows={5} value={taskSpec} onChange={(event) => setTaskSpec(event.target.value)} /></Field>
           <Field><FieldLabel htmlFor="task-skills"><Sparkles />{t("任务 Skill", "Task skills")}</FieldLabel><Input id="task-skills" value={taskSkills} onChange={(event) => setTaskSkills(event.target.value)} placeholder={t("$skill-name，空格或逗号分隔", "$skill-name, separated by spaces or commas")} /></Field>
         </FieldGroup>
         {parseSkills(taskSkills).length > 0 && <div className="skill-chip-row">{parseSkills(taskSkills).map((skill) => <span key={skill}>${skill}</span>)}</div>}
         {runTasks.length > 0 && <div className="grid gap-2"><div className="section-label">{t("前置依赖", "Dependencies")}</div><Input value={taskDependencyQuery} onChange={(event) => setTaskDependencyQuery(event.target.value)} placeholder={t("搜索任务标题或 ID", "Search task title or ID")} /><div className="dependency-picker">{dependencyTasks.map((task) => { const id = text(task["id"]); return <label className="check-row" key={id}><input type="checkbox" checked={taskDeps.includes(id)} onChange={(event) => setTaskDeps((current) => event.target.checked ? [...current, id] : current.filter((item) => item !== id))} />{text(task["title"])}</label>; })}</div>{dependencyTasks.length < runTasks.length && <small className="text-muted-foreground">{t(`显示前 ${String(dependencyTasks.length)} 个匹配任务`, `Showing the first ${String(dependencyTasks.length)} matching tasks`)}</small>}</div>}
-        <DialogFooter><Button variant="outline" disabled={Boolean(busy)} onClick={() => setShowTaskCreate(false)}>{t("取消", "Cancel")}</Button><Button onClick={() => void createTask()} disabled={!taskTitle.trim() || !taskSpec.trim() || Boolean(busy)}><Plus data-icon="inline-start" />{busy === "task-create" ? t("正在添加…", "Adding…") : t("添加任务", "Add task")}</Button></DialogFooter>
+        {taskCreateError && <Alert variant="destructive"><CircleDot /><AlertTitle>{t("无法添加任务", "Unable to add task")}</AlertTitle><AlertDescription>{taskCreateError}</AlertDescription></Alert>}
+        <DialogFooter><Button variant="outline" disabled={Boolean(busy)} onClick={() => { setShowTaskCreate(false); setTaskCreateError(undefined); }}>{t("取消", "Cancel")}</Button><Button onClick={() => void createTask()} disabled={!taskTitle.trim() || !taskSpec.trim() || Boolean(busy)}><Plus data-icon="inline-start" />{busy === "task-create" ? t("正在添加…", "Adding…") : t("添加任务", "Add task")}</Button></DialogFooter>
       </DialogContent>
     </Dialog>
   </div>;

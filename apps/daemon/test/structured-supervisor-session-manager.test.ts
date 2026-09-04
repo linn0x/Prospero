@@ -187,7 +187,14 @@ describe("SessionManager structured supervisor facade", () => {
     // The explicit kill closes the fake supervisor endpoint; disposeAll above
     // intentionally did not. This guards test/daemon teardown leaks.
     expect(existsSync(path.join(value, "structured-supervisor", info.id, "s.sock"))).toBe(false);
+    expect(existsSync(path.join(value, "structured-supervisor", info.id))).toBe(false);
     await second.disposeAll();
+
+    const third = new SessionManager({ home: value, supervisorLauncher: fakeLauncher });
+    expect(await third.restoreStructured()).toEqual([]);
+    expect(JSON.parse(readFileSync(path.join(value, "deleted-sessions.json"), "utf8")))
+      .toEqual({ version: 1, ids: [] });
+    await third.disposeAll();
   });
 
   it.skipIf(process.platform === "win32")("keeps a dead/stale supervisor visible as read-only history instead of starting a duplicate turn", async () => {

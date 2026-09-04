@@ -195,11 +195,12 @@ export class PtySession extends EventEmitter<PtySessionEvents> {
    */
   snapshot(): Promise<SnapshotResult> {
     this.flushNow();
+    const seq = this.ring.lastSeq;
     return new Promise((resolve) => {
       this.term.write("", () => {
         resolve({
           ansi: this.serializer.serialize({ scrollback: 0 }),
-          seq: this.ring.lastSeq,
+          seq,
           cols: this.cols,
           rows: this.rows,
         });
