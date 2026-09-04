@@ -1130,8 +1130,8 @@ kbd {
 :root[data-platform="darwin"] [data-collapsible="icon"] .prospero-sidebar .sidebar-shell-header { min-height: 78px; justify-content: center; padding: 40px 0 8px; }
 :root[data-platform="darwin"] .desktop-topbar { padding-right: 20px; -webkit-app-region: drag; }
 :root[data-platform="darwin"] .focus-exit-overlay { right: 10px; }
-:root[data-platform="darwin"] .focus-drag-region { right: 52px; left: 80px; }
-:root[data-platform="darwin"] .pane-workspace.is-focus .terminal-status { padding-right: 10px; padding-left: 80px; }
+:root[data-platform="darwin"] .focus-drag-region { right: 12px; left: 12px; }
+:root[data-platform="darwin"] .pane-workspace.is-focus .terminal-status { padding-right: 10px; }
 
 .gate-freeform-row { display: flex; flex: 1 1 280px; gap: 8px; }
 .gate-freeform-row input { min-width: 0; flex: 1; }
