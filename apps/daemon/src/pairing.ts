@@ -4,8 +4,8 @@
  * - devices.json   已配对设备:token、TOFU 绑定的客户端公钥与能力(0600)
  * - config.json    { port }
  */
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -20,6 +20,7 @@ import {
   type PairingPayload,
 } from "@prospero/protocol";
 import { candidateAddrs, resolveBindAddr } from "./discovery.js";
+import { acquireFilesystemLockSync, writePrivateFileAtomic } from "./filesystem-store.js";
 
 export const DEFAULT_PORT = 7423;
 
@@ -96,18 +97,22 @@ function readJson<T>(file: string): T | null {
 }
 
 function writeJsonPrivate(file: string, value: unknown): void {
-  writeFileSync(file, JSON.stringify(value, null, 2) + "\n", { mode: 0o600 });
-  chmodSync(file, 0o600);
+  writePrivateFileAtomic(file, JSON.stringify(value, null, 2) + "\n");
 }
 
 export function loadIdentity(home: string): KeyPairB64 {
   ensureHome(home);
-  const file = path.join(home, "identity.json");
-  const existing = readJson<KeyPairB64>(file);
-  if (existing) return existing;
-  const kp = generateKeyPairB64();
-  writeJsonPrivate(file, kp);
-  return kp;
+  const lock = acquireFilesystemLockSync(home, "identity");
+  try {
+    const file = path.join(home, "identity.json");
+    const existing = readJson<KeyPairB64>(file);
+    if (existing) return existing;
+    const kp = generateKeyPairB64();
+    writeJsonPrivate(file, kp);
+    return kp;
+  } finally {
+    lock.release();
+  }
 }
 
 export function loadConfig(home: string): DaemonConfig {
@@ -142,9 +147,32 @@ export function loadDevices(home: string): DeviceRecord[] {
   return readJson<DevicesFile>(path.join(home, "devices.json"))?.devices ?? [];
 }
 
-export function saveDevices(home: string, devices: DeviceRecord[]): void {
+function saveDevicesUnlocked(home: string, devices: DeviceRecord[]): void {
   ensureHome(home);
   writeJsonPrivate(path.join(home, "devices.json"), { devices });
+}
+
+function mutateDevices<T>(home: string, mutation: (devices: DeviceRecord[]) => T): T {
+  ensureHome(home);
+  const lock = acquireFilesystemLockSync(home, "devices");
+  try {
+    const devices = loadDevices(home);
+    const result = mutation(devices);
+    saveDevicesUnlocked(home, devices);
+    return result;
+  } finally {
+    lock.release();
+  }
+}
+
+export function saveDevices(home: string, devices: DeviceRecord[]): void {
+  ensureHome(home);
+  const lock = acquireFilesystemLockSync(home, "devices");
+  try {
+    saveDevicesUnlocked(home, devices);
+  } finally {
+    lock.release();
+  }
 }
 
 export function mintDevice(
@@ -158,9 +186,9 @@ export function mintDevice(
     allowOrchestration: opts.allowOrchestration ?? opts.allowShell,
     createdAt: Date.now(),
   };
-  const devices = loadDevices(home);
-  devices.push(device);
-  saveDevices(home, devices);
+  mutateDevices(home, (devices) => {
+    devices.push(device);
+  });
   return device;
 }
 
@@ -183,11 +211,11 @@ export function persistRelayCredentials(home: string, issued: DeviceRecord): voi
   if (!deviceRelayCredentials(issued)) {
     throw new Error("cannot persist relay credentials that were not issued in a pairing QR");
   }
-  const devices = loadDevices(home);
-  const index = devices.findIndex((device) => tokenEqual(device.token, issued.token));
-  if (index < 0) throw new Error("paired device disappeared before relay credentials could be saved");
-  devices[index] = issued;
-  saveDevices(home, devices);
+  mutateDevices(home, (devices) => {
+    const index = devices.findIndex((device) => tokenEqual(device.token, issued.token));
+    if (index < 0) throw new Error("paired device disappeared before relay credentials could be saved");
+    devices[index] = issued;
+  });
 }
 
 /** 人工派发会在本机启动 agent，权限至少应与 shell 会话同级。 */
@@ -208,8 +236,16 @@ export function canDeviceOrchestrate(device: DeviceRecord): boolean {
 export function rotateIdentity(home: string): KeyPairB64 {
   ensureHome(home);
   const fresh = generateKeyPairB64();
-  writeJsonPrivate(path.join(home, "identity.json"), fresh);
-  saveDevices(home, []);
+  const deviceLock = acquireFilesystemLockSync(home, "devices");
+  let identityLock: ReturnType<typeof acquireFilesystemLockSync> | undefined;
+  try {
+    identityLock = acquireFilesystemLockSync(home, "identity");
+    writeJsonPrivate(path.join(home, "identity.json"), fresh);
+    saveDevicesUnlocked(home, []);
+  } finally {
+    identityLock?.release();
+    deviceLock.release();
+  }
   return fresh;
 }
 
@@ -217,6 +253,11 @@ export interface RelayRotationStorage {
   saveConfig(home: string, config: DaemonConfig): void;
   saveDevices(home: string, devices: DeviceRecord[]): void;
 }
+
+const defaultRelayRotationStorage: RelayRotationStorage = {
+  saveConfig,
+  saveDevices: saveDevicesUnlocked,
+};
 
 /**
  * Clear device credentials before publishing a new route key.  This ordering
@@ -227,26 +268,36 @@ export interface RelayRotationStorage {
 export function rotateRelayKey(
   home: string,
   config: DaemonConfig,
-  storage: RelayRotationStorage = { saveConfig, saveDevices },
+  storage: RelayRotationStorage = defaultRelayRotationStorage,
 ): DaemonConfig {
-  const devices = loadDevices(home);
-  const cleared = devices.map(({
-    relayDeviceId: _relayDeviceId,
-    relayToken: _relayToken,
-    relayCredentialIssued: _relayCredentialIssued,
-    ...device
-  }) => device);
-  storage.saveDevices(home, cleared);
-  const next: DaemonConfig = {
-    ...config,
-    relay: {
-      enabled: config.relay?.enabled ?? false,
-      ...(config.relay?.url ? { url: config.relay.url } : {}),
-      hostSecret: generateRelayHostSecret(),
-    },
+  const rotate = (): DaemonConfig => {
+    const devices = loadDevices(home);
+    const cleared = devices.map(({
+      relayDeviceId: _relayDeviceId,
+      relayToken: _relayToken,
+      relayCredentialIssued: _relayCredentialIssued,
+      ...device
+    }) => device);
+    storage.saveDevices(home, cleared);
+    const next: DaemonConfig = {
+      ...config,
+      relay: {
+        enabled: config.relay?.enabled ?? false,
+        ...(config.relay?.url ? { url: config.relay.url } : {}),
+        hostSecret: generateRelayHostSecret(),
+      },
+    };
+    storage.saveConfig(home, next);
+    return next;
   };
-  storage.saveConfig(home, next);
-  return next;
+  if (storage !== defaultRelayRotationStorage) return rotate();
+  ensureHome(home);
+  const lock = acquireFilesystemLockSync(home, "devices");
+  try {
+    return rotate();
+  } finally {
+    lock.release();
+  }
 }
 
 /**
@@ -255,14 +306,24 @@ export function rotateRelayKey(
  * 返回被撤掉的记录,便于 CLI 如实报告撤了几台。
  */
 export function revokeDevices(home: string, name: string): DeviceRecord[] {
-  const devices = loadDevices(home);
-  const removed = devices.filter((d) => d.name === name);
-  if (removed.length === 0) return [];
-  saveDevices(
-    home,
-    devices.filter((d) => d.name !== name),
-  );
-  return removed;
+  return mutateDevices(home, (devices) => {
+    const removed = devices.filter((device) => device.name === name);
+    if (removed.length === 0) return [];
+    devices.splice(0, devices.length, ...devices.filter((device) => device.name !== name));
+    return removed;
+  });
+}
+
+export function deviceId(device: DeviceRecord): string {
+  return createHash("sha256").update(device.token).digest("base64url");
+}
+
+export function revokeDevice(home: string, id: string): DeviceRecord | null {
+  return mutateDevices(home, (devices) => {
+    const index = devices.findIndex((device) => deviceId(device) === id);
+    if (index < 0) return null;
+    return devices.splice(index, 1)[0] ?? null;
+  });
 }
 
 function tokenEqual(a: string, b: string): boolean {
@@ -291,20 +352,20 @@ export function authenticate(
   hello: C2SHello,
   onFail?: (reason: AuthFailure) => void,
 ): DeviceRecord | null {
-  const devices = loadDevices(home);
-  const device = devices.find((d) => tokenEqual(d.token, hello.token));
-  if (!device) {
-    onFail?.("unknown_token");
-    return null;
-  }
-  if (device.clientPubKey && device.clientPubKey !== hello.clientPubKey) {
-    onFail?.("key_mismatch"); // 公钥变化:可能是 token 泄漏被他人使用
-    return null;
-  }
-  device.clientPubKey = hello.clientPubKey;
-  device.lastSeenAt = Date.now();
-  saveDevices(home, devices);
-  return device;
+  return mutateDevices(home, (devices) => {
+    const device = devices.find((candidate) => tokenEqual(candidate.token, hello.token));
+    if (!device) {
+      onFail?.("unknown_token");
+      return null;
+    }
+    if (device.clientPubKey && device.clientPubKey !== hello.clientPubKey) {
+      onFail?.("key_mismatch");
+      return null;
+    }
+    device.clientPubKey = hello.clientPubKey;
+    device.lastSeenAt = Date.now();
+    return device;
+  });
 }
 
 export function buildPairingPayload(

@@ -23,6 +23,7 @@ import {
   loadConfig,
   loadDevices,
   loadIdentity,
+  revokeDevice,
   revokeDevices,
   rotateIdentity,
   mintDevice,
@@ -393,12 +394,25 @@ program
 
 program
   .command("revoke")
-  .argument("<name>", "要撤销的设备名(见 `prosperod status`)")
+  .argument("[name]", "要撤销的设备名(见 `prosperod status`)")
+  .option("--id <id>", "精确撤销一台设备")
   .description("撤销设备:删除凭证,并立刻断开它当前的连接")
-  .action((name: string) => {
+  .action((name: string | undefined, opts: { id?: string }) => {
     const home = prosperoHome();
-    const removed = revokeDevices(home, name);
+    if ((!name && !opts.id) || (name && opts.id)) {
+      console.error("请提供设备名或 --id，且只能选择一种");
+      process.exitCode = 1;
+      return;
+    }
+    const removed = opts.id
+      ? [revokeDevice(home, opts.id)].filter((device) => device !== null)
+      : revokeDevices(home, name!);
     if (removed.length === 0) {
+      if (opts.id) {
+        console.error(`没有 id 为「${opts.id}」的设备`);
+        process.exitCode = 1;
+        return;
+      }
       const names = loadDevices(home).map((d) => d.name);
       console.error(
         names.length === 0
@@ -408,7 +422,7 @@ program
       process.exitCode = 1;
       return;
     }
-    console.log(`已撤销 ${removed.length} 台名为「${name}」的设备`);
+    console.log(opts.id ? `已撤销设备「${removed[0]!.name}」` : `已撤销 ${removed.length} 台名为「${name}」的设备`);
     console.log("运行中的 daemon 会立刻断开它;手机需要重新扫码才能再连。");
   });
 

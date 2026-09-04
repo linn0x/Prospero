@@ -4,10 +4,12 @@ import {
   adaptiveSidebarOpen,
   filterSessionsByQuery,
   matchesDesktopShortcut,
+  matchesFocusShortcut,
   mostRelevantProject,
   nextSidebarSessionLimit,
   parseExpandedProjects,
   projectForSession,
+  restoredSessionIds,
   sessionRestoreRetryDelay,
   sortProjectsByRecentActivity,
   sortSidebarSessions,
@@ -36,6 +38,16 @@ describe("workspace sidebar state", () => {
     expect(sessionRestoreRetryDelay(0)).toBe(500);
     expect(sessionRestoreRetryDelay(3)).toBe(4_000);
     expect(sessionRestoreRetryDelay(5)).toBeUndefined();
+  });
+
+  it("keeps the active session inside the bounded restore set", () => {
+    const stored = Array.from({ length: 100 }, (_, index) => `session-${String(index)}`);
+
+    const restored = restoredSessionIds(stored, "active", 100);
+
+    expect(restored).toHaveLength(100);
+    expect(restored[0]).toBe("active");
+    expect(restored).not.toContain("session-99");
   });
 
   it("keeps global shortcuts out of shell control keys", () => {
@@ -80,6 +92,25 @@ describe("workspace sidebar state", () => {
         true,
       ),
     ).toBe(true);
+  });
+
+  it("keeps focus mode available from the terminal without stealing form input", () => {
+    const terminal = { closest: (selector: string) => selector.includes(".xterm") || selector.includes("textarea") ? {} : null } as unknown as EventTarget;
+    const input = { closest: (selector: string) => selector.includes("input") ? {} : null } as unknown as EventTarget;
+    const event = {
+      altKey: false,
+      ctrlKey: false,
+      defaultPrevented: false,
+      key: "f",
+      metaKey: true,
+      repeat: false,
+      shiftKey: true,
+      target: terminal,
+    };
+
+    expect(matchesFocusShortcut(event, "darwin")).toBe(true);
+    expect(matchesFocusShortcut({ ...event, target: input }, "darwin")).toBe(false);
+    expect(matchesFocusShortcut({ ...event, altKey: true, ctrlKey: true, metaKey: false, shiftKey: false }, "win32")).toBe(true);
   });
 
   it("uses hysteresis while no explicit sidebar preference exists", () => {

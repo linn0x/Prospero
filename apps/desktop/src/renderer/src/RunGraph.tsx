@@ -19,6 +19,7 @@ const MARGIN = 26;
 const MIN_ZOOM = 0.001;
 const MAX_ZOOM = 2.2;
 const INITIAL_ZOOM_FLOOR = 0.8;
+const OVERVIEW_INTERACTION_ZOOM = 0.35;
 
 interface Point {
   x: number;
@@ -289,6 +290,19 @@ export function layoutGraph(tasks: JsonObject[]): Layout {
 export function fitScale(layout: Pick<Layout, "width" | "height">, viewport: Size, maximum = MAX_ZOOM, minimum = MIN_ZOOM): number {
   if (layout.width <= 0 || layout.height <= 0 || viewport.width <= 0 || viewport.height <= 0) return 1;
   return Math.min(maximum, Math.max(minimum, Math.min(viewport.width / layout.width, viewport.height / layout.height)));
+}
+
+export function nextGraphOverviewTaskId(
+  ids: readonly string[],
+  selected: string | undefined,
+  fallback: string | undefined,
+  direction: -1 | 0 | 1,
+): string | undefined {
+  if (ids.length === 0) return undefined;
+  const selectedIndex = selected ? ids.indexOf(selected) : -1;
+  const fallbackIndex = fallback ? ids.indexOf(fallback) : -1;
+  const index = selectedIndex >= 0 ? selectedIndex : fallbackIndex >= 0 ? fallbackIndex : 0;
+  return ids[(index + direction + ids.length) % ids.length];
 }
 
 function visibleRect(viewport: Size, transform: ViewTransform, overscan = 0) {
@@ -580,6 +594,31 @@ export function RunGraph({ runId, tasks, dispatches, onActivateTask }: { runId: 
 
   const positions = useMemo(() => new Map(layout.nodes.map((node) => [node.id, node])), [layout]);
   const overviewMode = layout.nodes.length > 240 && transform.zoom < 0.14;
+  const overviewTaskIds = useMemo(() => layout.nodes.map((node) => node.id), [layout]);
+  const overviewTaskId = nextGraphOverviewTaskId(overviewTaskIds, selected, initialFocusId, 0);
+  const overviewTaskIndex = overviewTaskId ? overviewTaskIds.indexOf(overviewTaskId) : -1;
+  const overviewTask = overviewTaskId ? taskById.get(overviewTaskId) : undefined;
+  const moveOverviewTask = (direction: -1 | 1): void => {
+    const id = nextGraphOverviewTaskId(overviewTaskIds, overviewTaskId, initialFocusId, direction);
+    if (id) setSelected(id);
+  };
+  const zoomToOverviewTask = (): void => {
+    if (!overviewTaskId) return;
+    const node = positions.get(overviewTaskId);
+    if (!node) return;
+    fitMode.current = false;
+    setSelected(overviewTaskId);
+    scheduleTransform((current) => {
+      const zoom = Math.max(OVERVIEW_INTERACTION_ZOOM, current.zoom);
+      return {
+        zoom,
+        pan: {
+          x: viewport.width / 2 - (node.x + NODE_WIDTH / 2) * zoom,
+          y: viewport.height / 2 - (node.y + NODE_HEIGHT / 2) * zoom,
+        },
+      };
+    });
+  };
   const visibleNodes = useMemo(() => {
     if (overviewMode) return [];
     // 节点始终按矢量绘制:它们在一个 scale(zoom) 的容器里,缩放本来就是矢量的,
@@ -826,7 +865,9 @@ export function RunGraph({ runId, tasks, dispatches, onActivateTask }: { runId: 
         className="run-graph-viewport"
         ref={viewportRef}
         tabIndex={0}
-        aria-label={t("任务依赖图。拖动平移，捏合或按加减号缩放，按 F 适应窗口。", "Task dependency graph. Drag to pan, pinch or press plus and minus to zoom, and press F to fit.")}
+        aria-label={overviewMode
+          ? t("任务依赖图概览。使用任务导航查看或放大到一个节点。", "Task dependency graph overview. Use the task navigation to inspect or zoom to a node.")
+          : t("任务依赖图。拖动平移，捏合或按加减号缩放，按 F 适应窗口。", "Task dependency graph. Drag to pan, pinch or press plus and minus to zoom, and press F to fit.")}
         onWheel={onWheel}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
@@ -877,6 +918,25 @@ export function RunGraph({ runId, tasks, dispatches, onActivateTask }: { runId: 
             );
           })}
         </div>
+        {overviewMode && overviewTask && (
+          <div
+            className="absolute top-3 left-1/2 z-2 flex max-w-[calc(100%_-_1.5rem)] -translate-x-1/2 flex-wrap items-center justify-center gap-1.5 rounded-lg border bg-card/95 p-2 shadow-lg backdrop-blur"
+            role="group"
+            aria-label={t("概览任务导航", "Overview task navigation")}
+            onPointerDown={(event) => event.stopPropagation()}
+            onDoubleClick={(event) => event.stopPropagation()}
+            onKeyDown={(event) => event.stopPropagation()}
+          >
+            <button type="button" disabled={overviewTaskIds.length < 2} aria-label={t("上一个任务", "Previous task")} onClick={() => moveOverviewTask(-1)}>←</button>
+            <span className="min-w-0 max-w-64 px-1 text-center" aria-live="polite">
+              <strong className="block truncate" title={text(overviewTask["title"])}>{text(overviewTask["title"], t("未命名任务", "Untitled task"))}</strong>
+              <small className="text-muted-foreground">{overviewTaskIndex + 1} / {overviewTaskIds.length} · {status(text(overviewTask["status"]))}</small>
+            </span>
+            <button type="button" disabled={overviewTaskIds.length < 2} aria-label={t("下一个任务", "Next task")} onClick={() => moveOverviewTask(1)}>→</button>
+            <button type="button" disabled={!onActivateTask} onClick={() => overviewTaskId && onActivateTask?.(overviewTaskId)}>{t("查看任务", "View task")}</button>
+            <button type="button" onClick={zoomToOverviewTask}><Plus size={12} />{t("放大后操作", "Zoom in to interact")}</button>
+          </div>
+        )}
         <div
           className="run-graph-minimap"
           ref={minimapRef}

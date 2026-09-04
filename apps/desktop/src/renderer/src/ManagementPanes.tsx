@@ -18,7 +18,7 @@ function terminalFontSize(value: string): number | undefined {
 type TerminalSaveState = "idle" | "dirty" | "saving" | "saved" | "error";
 
 function deviceRenderKey(device: DeviceInfo, index: number): string {
-  return `${device.name}:${String(index)}`;
+  return device.id || `${device.name}:${String(index)}`;
 }
 
 function relayPresentation(state: string, enabled: boolean): { dot: string; zh: string; en: string } {
@@ -257,7 +257,7 @@ export function DevicesPane({ snapshot }: { snapshot: DesktopSnapshot }) {
     setError(undefined);
     setNotice(undefined);
     try {
-      const result = await window.prospero.revokeDevice(device.name);
+      const result = await window.prospero.revokeDevice(device.id, device.name);
       if (result.cancelled) return;
       if (!result.ok) throw new Error(result.output || t("撤销设备失败", "Unable to revoke device"));
       setNotice(t(`已撤销设备“${device.name}”`, `Revoked “${device.name}”`));
@@ -453,7 +453,7 @@ export function SettingsPane({ snapshot }: { snapshot: DesktopSnapshot }) {
   const terminalFontSizeGeneration = useRef(0);
   const terminalFontFamilySaveStateRef = useRef<TerminalSaveState>("idle");
   const terminalFontSizeSaveStateRef = useRef<TerminalSaveState>("idle");
-  const [relay, setRelay] = useState<Record<string, unknown>>({});
+  const [relay, setRelay] = useState<Record<string, unknown>>(snapshot.daemon.relay);
   const [relayUrl, setRelayUrl] = useState("");
   const [relayBusy, setRelayBusy] = useState<"status" | "enable" | "disable" | "rotate-key">();
   const relayBusyRef = useRef(false);
@@ -476,6 +476,12 @@ export function SettingsPane({ snapshot }: { snapshot: DesktopSnapshot }) {
     if (["dirty", "saving", "error"].includes(terminalFontSizeSaveStateRef.current)) return;
     setTerminalFontSizeDraft(String(settings.terminalFontSize));
   }, [settings.terminalFontSize]);
+  useEffect(() => {
+    setRelay(snapshot.daemon.relay);
+    if (!relayUrlDirtyRef.current && typeof snapshot.daemon.relay["url"] === "string") {
+      setRelayUrl(snapshot.daemon.relay["url"]);
+    }
+  }, [snapshot.daemon.relay]);
   const update = async (patch: Partial<typeof settings>): Promise<void> => {
     if (settingsBusyRef.current) return;
     settingsBusyRef.current = true;
@@ -579,17 +585,26 @@ export function SettingsPane({ snapshot }: { snapshot: DesktopSnapshot }) {
       const result = await window.prospero.relayAction({ action, ...(action === "enable" && relayUrl.trim() ? { url: relayUrl.trim() } : {}) });
       if (result["cancelled"] === true) return;
       if (result["ok"] === false) throw new Error(text(result["output"], t("Relay 操作失败", "Relay action failed")));
-      const statusResult = action === "status" ? result : await window.prospero.relayAction({ action: "status" });
-      setRelay(statusResult);
-      if (!relayUrlDirtyRef.current && typeof statusResult["url"] === "string") setRelayUrl(statusResult["url"]);
-      if (action !== "status") {
-        relayUrlDirtyRef.current = false;
+      if (action === "status") {
+        setRelay(result);
+        if (!relayUrlDirtyRef.current && typeof result["url"] === "string") setRelayUrl(result["url"]);
+        return;
+      }
+      relayUrlDirtyRef.current = false;
+      setNotice(action === "enable"
+        ? t("Relay 已启用", "Relay enabled")
+        : action === "disable"
+          ? t("Relay 已关闭", "Relay disabled")
+          : t("Relay 密钥已轮换", "Relay key rotated"));
+      try {
+        const statusResult = await window.prospero.relayAction({ action: "status" });
+        setRelay(statusResult);
         if (typeof statusResult["url"] === "string") setRelayUrl(statusResult["url"]);
-        setNotice(action === "enable"
-          ? t("Relay 已启用", "Relay enabled")
-          : action === "disable"
-            ? t("Relay 已关闭", "Relay disabled")
-            : t("Relay 密钥已轮换", "Relay key rotated"));
+      } catch (reason) {
+        setError(t(
+          `操作已完成，但状态刷新失败：${displayError(reason)}`,
+          `The action completed, but status refresh failed: ${displayError(reason)}`,
+        ));
       }
     } catch (reason) {
       setError(displayError(reason));

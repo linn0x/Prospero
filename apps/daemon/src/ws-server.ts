@@ -16,6 +16,7 @@ import {
   CAPABILITY_AGENT_DEEPSEEK_HARNESS,
   CAPABILITY_CHAT_ATTACHMENT_PREVIEWS,
   CAPABILITY_DEEPSEEK_TRAJECTORY,
+  CAPABILITY_FS_PUT_ACK,
   CAPABILITY_ORCHESTRATION_AUTOMATION,
   CAPABILITY_ORCHESTRATION_GRAPH,
   CAPABILITY_ORCHESTRATION_LIFECYCLE,
@@ -105,6 +106,8 @@ const HIGH_WATER = 512 * 1024; // 超过则暂停向该客户端流式发送
 const LOW_WATER = 64 * 1024; //   低于则通过 ring/快照追平
 const CATCHUP_MS = 250;
 const PING_MS = 15_000;
+const HANDSHAKE_TIMEOUT_MS = 10_000;
+const MAX_UNAUTHENTICATED_CONNECTIONS = 128;
 
 function windowsWorkspaceDrives(): FsEntry[] {
   if (process.platform !== "win32") return [];
@@ -214,6 +217,8 @@ export interface DaemonServerOptions {
   /** Windows N-API Session Host feature gate; false keeps both tracks direct. */
   windowsSessionHost?: boolean | undefined;
   devMode?: boolean;
+  handshakeTimeoutMs?: number;
+  maxUnauthenticatedConnections?: number;
   hostName?: string | undefined;
   /** 推送通道配置;省略则不推送 */
   notify?: NotifyConfig | null;
@@ -375,6 +380,8 @@ export async function createDaemonServer(
     persistence: { pty: manager.tmuxEnabled || manager.ptySupervisorEnabled, structured: true },
   });
   const conns = new Set<Conn>();
+  const fsPutChains = new Map<string, Promise<void>>();
+  let unauthenticatedConnections = 0;
   const devMode = opts.devMode ?? false;
   const notifier = new Notifier(opts.notify ?? null);
   const conversationSearch = opts.conversationSearch ?? searchLocalConversations;
@@ -696,6 +703,7 @@ export async function createDaemonServer(
 
   function orchestrationCapabilities(conn: Conn): string[] {
     const capabilities: string[] = [];
+    if (conn.protocolVersion >= 15) capabilities.push(CAPABILITY_FS_PUT_ACK);
     capabilities.push(CAPABILITY_AGENT_DEEPSEEK_HARNESS);
     if (conn.protocolVersion >= 14) capabilities.push(CAPABILITY_DEEPSEEK_TRAJECTORY);
     if (conn.protocolVersion >= 11) {
@@ -895,17 +903,31 @@ export async function createDaemonServer(
     att.snapshotInflight = true;
     att.paused = true; // 快照生成期间挡住流式输出,避免乱序
     try {
-      const snap = await session.snapshot();
-      send(conn, {
-        type: "term.snapshot",
-        sid,
-        ansi: snap.ansi,
-        seq: snap.seq,
-        cols: snap.cols,
-        rows: snap.rows,
-      });
-      att.lastSentSeq = snap.seq;
-      att.paused = false;
+      for (;;) {
+        const snap = await session.snapshot();
+        const chunks = session.ring.since(snap.seq);
+        if (chunks === null) continue;
+        send(conn, {
+          type: "term.snapshot",
+          sid,
+          ansi: snap.ansi,
+          seq: snap.seq,
+          cols: snap.cols,
+          rows: snap.rows,
+        });
+        att.lastSentSeq = snap.seq;
+        if (chunks.length > 0) {
+          send(conn, {
+            type: "term.output",
+            sid,
+            dataB64: toB64(concatBytes(chunks)),
+            seq: session.ring.lastSeq,
+          });
+          att.lastSentSeq = session.ring.lastSeq;
+        }
+        att.paused = false;
+        return;
+      }
     } finally {
       att.snapshotInflight = false;
     }
@@ -943,7 +965,7 @@ export async function createDaemonServer(
   const catchupTimer = setInterval(() => {
     for (const conn of conns) {
       for (const [sid, att] of conn.attachments) {
-        if (!att.paused || conn.ws.bufferedAmount > LOW_WATER) continue;
+        if (!att.paused || att.snapshotInflight || conn.ws.bufferedAmount > LOW_WATER) continue;
         const session = manager.getPty(sid);
         if (!session) {
           conn.attachments.delete(sid);
@@ -1719,11 +1741,13 @@ export async function createDaemonServer(
       case "fs.read":
       case "fs.write":
       case "fs.get":
-      case "fs.put":
       case "fs.mkdir":
       case "fs.remove":
       case "fs.rename":
         await handleFs(conn, msg);
+        return;
+      case "fs.put":
+        await handleFsPut(conn, msg);
         return;
 
       case "git.status":
@@ -1873,7 +1897,7 @@ export async function createDaemonServer(
             msg.offset,
             Buffer.from(msg.dataB64, "base64"),
           );
-          if (msg.final) {
+          if (msg.final || conn.protocolVersion >= 15) {
             send(conn, { type: "fs.written", sid: msg.sid, path: msg.path, size });
           }
           return;
@@ -1887,6 +1911,21 @@ export async function createDaemonServer(
         message: e instanceof Error ? e.message : String(e),
         sid: msg.sid,
       });
+    }
+  }
+
+  async function handleFsPut(
+    conn: Conn,
+    msg: Extract<C2SMessage, { type: "fs.put" }>,
+  ): Promise<void> {
+    const key = `${msg.sid}\u0000${msg.path}`;
+    const previous = fsPutChains.get(key) ?? Promise.resolve();
+    const current = previous.then(() => handleFs(conn, msg));
+    fsPutChains.set(key, current);
+    try {
+      await current;
+    } finally {
+      if (fsPutChains.get(key) === current) fsPutChains.delete(key);
     }
   }
 
@@ -1968,6 +2007,20 @@ export async function createDaemonServer(
 
   /** Both a direct inbound socket and a relay-ready outbound socket use this exact E2E path. */
   function attachIncomingSocket(ws: WebSocket, allowDevPlaintext: boolean): void {
+    const unauthenticatedLimit = opts.maxUnauthenticatedConnections ?? MAX_UNAUTHENTICATED_CONNECTIONS;
+    if (unauthenticatedConnections >= unauthenticatedLimit) {
+      ws.terminate();
+      return;
+    }
+    unauthenticatedConnections += 1;
+    let countedUnauthenticated = true;
+    let handshakeTimer: NodeJS.Timeout | undefined;
+    const releaseUnauthenticated = (): void => {
+      if (!countedUnauthenticated) return;
+      countedUnauthenticated = false;
+      unauthenticatedConnections -= 1;
+      if (handshakeTimer !== undefined) clearTimeout(handshakeTimer);
+    };
     const conn: Conn = {
       ws,
       channel: null,
@@ -1978,14 +2031,22 @@ export async function createDaemonServer(
       chatAttachments: new Map(),
       alive: true,
     };
+    handshakeTimer = setTimeout(
+      () => { if (conn.device === null) ws.terminate(); },
+      opts.handshakeTimeoutMs ?? HANDSHAKE_TIMEOUT_MS,
+    );
+    handshakeTimer.unref();
     conns.add(conn);
     ws.on("pong", () => {
       conn.alive = true;
     });
     ws.on("message", (raw) => {
-      void onMessage(conn, raw, allowDevPlaintext);
+      void onMessage(conn, raw, allowDevPlaintext).finally(() => {
+        if (conn.device !== null) releaseUnauthenticated();
+      });
     });
     ws.on("close", () => {
+      releaseUnauthenticated();
       conns.delete(conn);
     });
     ws.on("error", () => {
@@ -2498,12 +2559,15 @@ export async function createDaemonServer(
               res.writeHead(204).end();
               return;
             }
+            const info = terminal.info();
             res.writeHead(200, { "content-type": "application/json" });
             res.end(JSON.stringify({
               kind: "pty",
               mode: "delta",
               baseSeq: outputAfterSeq,
               seq: terminal.ring.lastSeq,
+              cols: info.cols,
+              rows: info.rows,
               dataB64: toB64(concatBytes(chunks)),
             }));
             return;
@@ -2574,10 +2638,30 @@ export async function createDaemonServer(
         // 复用手机协议校验，Mac 本地工作台不会悄悄形成第三套输入语义。
         const message = parseC2S({ ...body, sid });
         switch (message.type) {
-          case "chat.send":
-            await manager
-              .requireStructured(sid)
-              .send(message.text, message.attachments, message.delivery);
+          case "chat.send": {
+            const session = manager.requireStructured(sid);
+            const beforeSeq = session.snapshot().evSeq;
+            try {
+              await session.send(message.text, message.attachments, message.delivery);
+            } catch (error) {
+              const accepted = session.since(beforeSeq)?.some(
+                (event) => event.kind === "user.message" && event.text === message.text,
+              ) === true;
+              if (!accepted) throw error;
+              res.writeHead(200, { "content-type": "application/json" });
+              res.end(JSON.stringify({
+                accepted: true,
+                error: error instanceof Error ? error.message : String(error),
+              }));
+              return;
+            }
+            break;
+          }
+          case "chat.queue.remove":
+            manager.requireStructured(sid).removeQueued(message.queueId);
+            break;
+          case "chat.queue.guide":
+            await manager.requireStructured(sid).guideQueued(message.queueId);
             break;
           case "term.input":
             await manager.requirePty(sid).writeInput(utf8Decode(fromB64(message.dataB64)));
@@ -2721,15 +2805,23 @@ export async function createDaemonServer(
         const params = method === "run.create" || method === "graph.create"
           ? { ...supplied, coordinatorSessionId: requestedCoordinator }
           : { ...supplied, actorSessionId: null };
-        const result = await orchestrationApi(
-          method,
-          params,
-          new AbortController().signal,
-        );
+        const controller = new AbortController();
+        const abort = (): void => controller.abort();
+        req.once("aborted", abort);
+        res.once("close", abort);
+        let result;
+        try {
+          result = await orchestrationApi(method, params, controller.signal);
+        } finally {
+          req.off("aborted", abort);
+          res.off("close", abort);
+        }
+        if (req.aborted || res.destroyed) return;
         broadcastOrchestrationSnapshot();
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify(result));
       } catch (e) {
+        if (req.aborted || res.destroyed) return;
         if (e instanceof ControlSocketError) {
           res.writeHead(e.code === "forbidden" ? 403 : 409).end(e.message);
         } else {
@@ -2869,7 +2961,7 @@ export async function createDaemonServer(
     await manager.disposeAll();
     goalInitialization.close();
     stopOrchestrationBroadcasts();
-    orchestrationStore.close();
+    try { orchestrationStore.close(); } catch {}
     throw error;
   }
   const address = httpServer.address();
@@ -3054,8 +3146,10 @@ export async function createDaemonServer(
       wss.close();
       await manager.disposeAll();
       stopOrchestrationBroadcasts();
-      orchestrationStore.close();
+      let orchestrationCloseError: unknown;
+      try { orchestrationStore.close(); } catch (error) { orchestrationCloseError = error; }
       await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      if (orchestrationCloseError) throw orchestrationCloseError;
     },
   };
 }

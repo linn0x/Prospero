@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { AdapterContext, AgentAdapter } from "../src/adapters/types.js";
 import { createDaemonServer, type DaemonServer } from "../src/ws-server.js";
 
@@ -24,6 +24,7 @@ class ControlViewAdapter implements AgentAdapter {
   async send(text: string): Promise<void> {
     const context = this.context;
     if (!context) throw new Error("adapter is not started");
+    if (text === "fail-after-accept") throw new Error("adapter failed after acceptance");
     if (text === "overflow") {
       // StructuredSession only retains 4,000 events. This deliberately
       // crosses that boundary so the HTTP endpoint must return a snapshot.
@@ -140,6 +141,39 @@ describe("Mac control session views", () => {
       const modesPath = `/_prospero/control/session/${structured.id}/modes`;
       const modelsPath = `/_prospero/control/session/${structured.id}/models`;
       const suggestionsPath = `/_prospero/control/session/${structured.id}/suggestions?kind=skill&query=`;
+
+      const structuredSession = server.manager.requireStructured(structured.id);
+      const removeQueued = vi.spyOn(structuredSession, "removeQueued").mockReturnValue(true);
+      const guideQueued = vi.spyOn(structuredSession, "guideQueued").mockResolvedValue(true);
+      expect((await request(interactPath, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ type: "chat.queue.remove", queueId: "remove-queued-message" }),
+      })).status).toBe(204);
+      expect((await request(interactPath, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ type: "chat.queue.guide", queueId: "guide-queued-message" }),
+      })).status).toBe(204);
+      expect(removeQueued).toHaveBeenCalledWith("remove-queued-message");
+      expect(guideQueued).toHaveBeenCalledWith("guide-queued-message");
+      removeQueued.mockRestore();
+      guideQueued.mockRestore();
+
+      const acceptedSession = await create({ agent: "codex", kind: "structured", cwd: home });
+      const acceptedFailure = await request(
+        `/_prospero/control/session/${acceptedSession.id}/interact`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ type: "chat.send", text: "fail-after-accept" }),
+        },
+      );
+      expect(acceptedFailure.status).toBe(200);
+      expect(await acceptedFailure.json()).toEqual({
+        accepted: true,
+        error: "adapter failed after acceptance",
+      });
 
       // Control-token authorization applies to the newly added read endpoints.
       expect((await fetch(`${base}${viewPath}`)).status).toBe(401);
@@ -351,6 +385,8 @@ describe("Mac control session views", () => {
         mode: "delta",
         baseSeq: ptySnapshot.seq,
         seq: firstSeq,
+        cols: 120,
+        rows: 40,
         dataB64: Buffer.from(firstBytes).toString("base64"),
       });
 
@@ -367,6 +403,8 @@ describe("Mac control session views", () => {
         mode: "delta",
         baseSeq: firstSeq,
         seq: secondSeq,
+        cols: 120,
+        rows: 40,
         dataB64: Buffer.from(secondBytes).toString("base64"),
       });
 

@@ -116,6 +116,22 @@ export function getTerminalEmptyFrameDelay(elapsedMs: number): number {
   return elapsedMs < 500 ? 650 : 0;
 }
 
+export function terminalSessionIsReadOnly(status: string): boolean {
+  return ["idle", "completed", "done", "died"].includes(status);
+}
+
+export function canDeliverTerminalInteraction(
+  connected: boolean,
+  readOnly: boolean,
+  accepted = false,
+): boolean {
+  return !readOnly && (connected || accepted);
+}
+
+export function terminalBootstrapCursor(cachedCursor?: number): number {
+  return typeof cachedCursor === "number" && Number.isSafeInteger(cachedCursor) && cachedCursor >= 0 ? cachedCursor : 0;
+}
+
 export function TerminalPane({ session, fontFamily, fontSize }: { session: SessionInfo; fontFamily: string; fontSize: number }) {
   const { t } = useLocale();
   const tRef = useRef(t);
@@ -137,6 +153,9 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
   const stableBufferRef = useRef(true);
   const replayingRef = useRef(false);
   const connectedRef = useRef(false);
+  const readOnly = terminalSessionIsReadOnly(session.status);
+  const readOnlyRef = useRef(readOnly);
+  readOnlyRef.current = readOnly;
   const [operationError, setOperationError] = useState<string>();
   const [connectionError, setConnectionError] = useState<string>();
   const [connected, setConnected] = useState(false);
@@ -147,12 +166,12 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
   const [findText, setFindText] = useState("");
   const findInputRef = useRef<HTMLInputElement>(null);
   const noticeTimerRef = useRef<number | undefined>(undefined);
-  const queueInteraction = useCallback((message: TerminalInteraction): Promise<boolean> => {
+  const queueInteraction = useCallback((message: TerminalInteraction, accepted = false): Promise<boolean> => {
     const result = interactionChain.current
       .then(async () => {
-        if (!connectedRef.current) return false;
+        if (!canDeliverTerminalInteraction(connectedRef.current, readOnlyRef.current, accepted)) return false;
         await window.prospero.interact(session.id, message);
-        if (message.type === "term.input") setOperationError(undefined);
+        setOperationError(undefined);
         return true;
       })
       .catch((reason): false => {
@@ -230,7 +249,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
     fitRef.current = fit;
     searchRef.current = search;
     if (cached) {
-      cursorRef.current = cached.cursor;
+      cursorRef.current = terminalBootstrapCursor(cached.cursor);
       replayingRef.current = true;
       stableBufferRef.current = false;
       restoreReadyRef.current = new Promise<void>((done) => {
@@ -246,9 +265,9 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
         });
       });
     } else {
-      cursorRef.current = undefined;
-      stableBufferRef.current = true;
-      setSyncing(false);
+      cursorRef.current = terminalBootstrapCursor();
+      stableBufferRef.current = false;
+      setSyncing(true);
       restoreReadyRef.current = Promise.resolve();
     }
     terminal.open(host.current);
@@ -265,15 +284,15 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
     let input = "";
     let inputTimer: number | undefined;
     let bellTimer: number | undefined;
-    const queueInputText = (value: string): Promise<boolean> => {
-      if (!value || !connectedRef.current) return Promise.resolve(false);
-      return queueInteraction({ type: "term.input", dataB64: toBase64(value) });
+    const queueInputText = (value: string, accepted = false): Promise<boolean> => {
+      if (!value || !canDeliverTerminalInteraction(connectedRef.current, readOnlyRef.current, accepted)) return Promise.resolve(false);
+      return queueInteraction({ type: "term.input", dataB64: toBase64(value) }, true);
     };
-    const flushInput = (): Promise<boolean> | undefined => {
+    const flushInput = (accepted = false): Promise<boolean> | undefined => {
       if (!input) return undefined;
       const payload = input;
       input = "";
-      return queueInputText(payload);
+      return queueInputText(payload, accepted);
     };
     const inputDisposable = terminal.onData((value) => {
       if (replayingRef.current || !connectedRef.current) return;
@@ -283,6 +302,10 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
     });
     terminal.attachCustomKeyEventHandler((event) => {
       const action = terminalShortcutAction(event, isMac);
+      if (readOnlyRef.current && action && action !== "copy" && action !== "selectAll" && action !== "find") {
+        showNotice(t("会话已结束，终端为只读", "The session has ended; the terminal is read-only"));
+        return false;
+      }
       if (action === "copy") {
         const selection = terminal.getSelection();
         if (selection) {
@@ -304,7 +327,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
               showNotice(t("剪贴板为空", "Clipboard is empty"));
               return;
             }
-            if (!connectedRef.current) {
+            if (!connectedRef.current || readOnlyRef.current) {
               showNotice(t("终端断线，未粘贴", "Terminal disconnected; nothing was pasted"));
               return;
             }
@@ -388,7 +411,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
           persistTerminalSession(session.id, terminal, serialize, cursor);
         } catch {}
       }
-      void flushInput();
+      if (connectedRef.current && !readOnlyRef.current) void flushInput(true);
       resize.disconnect();
       inputDisposable.dispose();
       osc52Disposable.dispose();
@@ -403,6 +426,11 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
       cursorRef.current = undefined;
     };
   }, [isMac, queueInteraction, showNotice]);
+
+  useEffect(() => {
+    const terminal = terminalRef.current;
+    if (terminal) terminal.options.disableStdin = readOnly || !connectedRef.current;
+  }, [readOnly]);
 
   useEffect(() => {
     const terminal = terminalRef.current;
@@ -467,7 +495,8 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
           if (!frame) {
             if (cursor !== undefined) {
               connectedRef.current = true;
-              if (terminalRef.current) terminalRef.current.options.disableStdin = false;
+              stableBufferRef.current = true;
+              if (terminalRef.current) terminalRef.current.options.disableStdin = readOnlyRef.current;
               setConnected(true);
               setSyncing(false);
               setConnectionError(undefined);
@@ -479,6 +508,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
           if (text(frame["kind"]) !== "pty") throw new Error(tRef.current("daemon 返回了错误的会话类型", "The daemon returned the wrong session type"));
           const mode = text(frame["mode"], "snapshot");
           const seq = number(frame["seq"]);
+          const bootstrapDelta = mode === "delta" && cursorRef.current === 0 && number(frame["baseSeq"], -1) === 0;
           if (mode === "delta") {
             if (number(frame["baseSeq"], -1) !== cursorRef.current) {
               deleteTerminalSessionCache(session.id);
@@ -493,6 +523,12 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
             stableBufferRef.current = false;
             writeChain.current = writeChain.current.then(() => new Promise<void>((done) => {
               if (!isCurrent() || !target || terminalRef.current !== target) { done(); return; }
+              if (bootstrapDelta) {
+                target.resize(
+                  Math.max(20, number(frame["cols"], target.cols)),
+                  Math.max(5, number(frame["rows"], target.rows)),
+                );
+              }
               target.write(output, done);
             }));
           } else {
@@ -519,10 +555,10 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
           connectedRef.current = true;
           const current = terminalRef.current;
           if (current) {
-            current.options.disableStdin = false;
-            if (mode !== "delta") {
+            current.options.disableStdin = readOnlyRef.current;
+            if (mode !== "delta" || bootstrapDelta) {
               fitRef.current?.fit();
-              void queueInteraction({ type: "term.resize", cols: current.cols, rows: current.rows });
+              if (!readOnlyRef.current) void queueInteraction({ type: "term.resize", cols: current.cols, rows: current.rows });
             }
           }
           setConnected(true);
@@ -576,7 +612,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
   };
 
   return <div className={bell ? "terminal-shell terminal-bell" : "terminal-shell"}>
-    <div className="terminal-status"><span className={connected ? "live-dot" : syncing ? "live-dot syncing" : "live-dot offline"} />{connected ? t("实时终端", "Live terminal") : syncing ? t("正在同步", "Syncing") : t("正在重连", "Reconnecting")}<span className="terminal-shortcut" title={shortcutHint}>{isMac ? "⌘C / ⌘V" : "Ctrl+Shift+C / V"}</span></div>
+    <div className="terminal-status" role="status" aria-live="polite"><span className={readOnly ? "live-dot offline" : connected ? "live-dot" : syncing ? "live-dot syncing" : "live-dot offline"} />{readOnly ? t("会话已结束 · 只读", "Session ended · Read only") : connected ? t("实时终端", "Live terminal") : syncing ? t("正在同步", "Syncing") : t("正在重连", "Reconnecting")}<span className="terminal-shortcut" title={shortcutHint}>{isMac ? "⌘C / ⌘V" : "Ctrl+Shift+C / V"}</span></div>
     {findOpen && <div className="terminal-find">
       <input
         ref={findInputRef}
@@ -585,6 +621,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
         placeholder={t("在终端中查找", "Find in terminal")}
         onChange={(event) => setFindText(event.target.value)}
         onKeyDown={(event) => {
+          if (event.nativeEvent.isComposing || event.keyCode === 229) return;
           if (event.key === "Escape") { event.preventDefault(); closeFind(); return; }
           if (event.key === "Enter") { event.preventDefault(); runFind(event.shiftKey); }
         }}

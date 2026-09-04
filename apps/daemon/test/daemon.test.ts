@@ -157,6 +157,41 @@ afterAll(async () => {
 });
 
 describe("daemon 全链路", () => {
+  it("expires stalled handshakes and caps unauthenticated sockets", async () => {
+    const isolatedHome = mkdtempSync(path.join(os.tmpdir(), "prospero-auth-limit-"));
+    const isolated = await createDaemonServer({
+      home: isolatedHome,
+      port: 0,
+      workspaceRoot: isolatedHome,
+      structuredSupervisor: false,
+      ptySupervisor: false,
+      handshakeTimeoutMs: 200,
+      maxUnauthenticatedConnections: 1,
+    });
+    try {
+      const first = new WebSocket(`ws://127.0.0.1:${String(isolated.port)}/ws`);
+      const firstClosed = new Promise<void>((resolve) => first.once("close", () => resolve()));
+      await new Promise<void>((resolve, reject) => {
+        first.once("open", () => resolve());
+        first.once("error", reject);
+      });
+      const second = new WebSocket(`ws://127.0.0.1:${String(isolated.port)}/ws`);
+      second.on("error", () => undefined);
+      const secondClosed = new Promise<void>((resolve) => second.once("close", () => resolve()));
+      await expect(Promise.race([
+        secondClosed.then(() => true),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 150)),
+      ])).resolves.toBe(true);
+      await expect(Promise.race([
+        firstClosed.then(() => true),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 1_000)),
+      ])).resolves.toBe(true);
+    } finally {
+      await isolated.close();
+      rmSync(isolatedHome, { recursive: true, force: true });
+    }
+  });
+
   it("Mac 账号控制接口复用协议、鉴权并且不回显凭据", async () => {
     const status = JSON.parse(readFileSync(path.join(home, "status.json"), "utf8")) as {
       controlToken: string;
@@ -905,15 +940,16 @@ describe("daemon 全链路", () => {
     c.close();
   }, 20000);
 
-  it("v13 与旧 v12/v8/v7/v5 客户端沿用原配对即可连接新 daemon", async () => {
-    for (const version of [13, 12, 8, 7, 5]) {
+  it("v14 与旧 v13/v12/v8/v7/v5 客户端沿用原配对即可连接新 daemon", async () => {
+    for (const version of [14, 13, 12, 8, 7, 5]) {
       const c = await TestClient.connect(deviceToken, deviceKeys, version);
       const hello = (await c.waitFor(
         (m) => m.type === "hello.ok",
         `legacy v${String(version)} hello.ok`,
       )) as Extract<S2CMessage, { type: "hello.ok" }>;
       expect(hello.host.negotiatedProtocolVersion).toBe(version);
-      expect(hello.host.capabilities).not.toContain("agent.deepseek-trajectory.v1");
+      expect(hello.host.capabilities).not.toContain("fs.put-ack.v1");
+      if (version < 14) expect(hello.host.capabilities).not.toContain("agent.deepseek-trajectory.v1");
       if (version < 9) expect(hello.host.capabilities).not.toContain("subagent.history.v1");
       if (version < 11) {
         expect(hello.host.capabilities).not.toContain("chat.attachment-previews.v1");
@@ -949,6 +985,115 @@ describe("daemon 全链路", () => {
     );
     c.close();
   }, 20000);
+
+  it("按网络帧顺序写入并确认每个上传分块", async () => {
+    const c = await TestClient.connect(deviceToken, deviceKeys);
+    const hello = await c.waitFor((m) => m.type === "hello.ok", "hello.ok") as Extract<
+      S2CMessage,
+      { type: "hello.ok" }
+    >;
+    expect(hello.host.capabilities).toContain("fs.put-ack.v1");
+    c.send({
+      type: "session.create",
+      agent: "custom",
+      command: markerCommand,
+      cwd: workspaceRoot,
+      cols: 80,
+      rows: 24,
+    });
+    const snapshot = await c.waitFor((m) => m.type === "term.snapshot", "snapshot");
+    const sid = (snapshot as { sid: string }).sid;
+    const payload = Buffer.allocUnsafe(256 * 1024 * 8 + 17);
+    for (let index = 0; index < payload.length; index += 1) payload[index] = (index * 31 + 7) % 256;
+    const file = `ordered-upload-${String(Date.now())}.bin`;
+    const chunkSize = 256 * 1024;
+
+    for (let offset = 0; offset < payload.length; offset += chunkSize) {
+      const chunk = payload.subarray(offset, Math.min(offset + chunkSize, payload.length));
+      c.send({
+        type: "fs.put",
+        sid,
+        path: file,
+        offset,
+        dataB64: chunk.toString("base64"),
+        final: offset + chunk.length === payload.length,
+      });
+    }
+
+    await c.waitFor(
+      (message) => message.type === "fs.written" && message.path === file && message.size === payload.length,
+      "final fs.written",
+    );
+    expect(readFileSync(path.join(workspaceRoot, file))).toEqual(payload);
+    c.send({ type: "session.kill", sid });
+    await c.waitFor(
+      (message) => message.type === "session.state" && message.session.id === sid && message.session.status !== "running",
+      "killed",
+    );
+    c.close();
+  }, 30000);
+
+  it("快照完成前不提前 catch-up 且在快照后补齐增量", async () => {
+    const owner = await TestClient.connect(deviceToken, deviceKeys);
+    await owner.waitFor((m) => m.type === "hello.ok", "owner hello.ok");
+    owner.send({
+      type: "session.create",
+      agent: "custom",
+      command: markerCommand,
+      cols: 80,
+      rows: 24,
+    });
+    const initial = await owner.waitFor((m) => m.type === "term.snapshot", "initial snapshot");
+    const sid = (initial as { sid: string }).sid;
+    await owner.collectText(sid, "MARKER_ONE");
+    const terminal = server.manager.requirePty(sid);
+    const originalSnapshot = terminal.snapshot.bind(terminal);
+    let startSnapshot!: () => void;
+    let resolveSnapshot!: (value: Awaited<ReturnType<typeof terminal.snapshot>>) => void;
+    const started = new Promise<void>((resolve) => { startSnapshot = resolve; });
+    const pendingSnapshot = new Promise<Awaited<ReturnType<typeof terminal.snapshot>>>((resolve) => {
+      resolveSnapshot = resolve;
+    });
+    let baseline = terminal.ring.lastSeq;
+    terminal.snapshot = () => {
+      baseline = terminal.ring.lastSeq;
+      startSnapshot();
+      return pendingSnapshot;
+    };
+    const viewer = await TestClient.connect(deviceToken, deviceKeys);
+
+    try {
+      await viewer.waitFor((m) => m.type === "hello.ok", "viewer hello.ok");
+      viewer.send({ type: "session.attach", sid });
+      await started;
+      const bytes = Buffer.from("DURING_SNAPSHOT");
+      const seq = terminal.ring.push(bytes);
+      server.manager.emit("output", sid, bytes.toString("base64"), seq);
+      const premature = await viewer.waitFor(
+        (message) => message.type === "term.output" && message.sid === sid,
+        "premature catch-up",
+        400,
+      ).then(() => true, () => false);
+      resolveSnapshot({ ansi: "BASE", seq: baseline, cols: 80, rows: 24 });
+      expect(premature).toBe(false);
+      await expect(viewer.waitFor(
+        (message) => message.type === "term.snapshot" && message.sid === sid,
+        "delayed snapshot",
+      )).resolves.toMatchObject({ ansi: "BASE", seq: baseline });
+      const output = await viewer.waitFor(
+        (message) => message.type === "term.output" && message.sid === sid,
+        "post-snapshot catch-up",
+      ) as Extract<S2CMessage, { type: "term.output" }>;
+      expect(output.seq).toBe(seq);
+      expect(Buffer.from(output.dataB64, "base64").toString()).toBe("DURING_SNAPSHOT");
+    } finally {
+      terminal.snapshot = originalSnapshot;
+      resolveSnapshot({ ansi: "BASE", seq: baseline, cols: 80, rows: 24 });
+      viewer.close();
+      await server.manager.kill(sid);
+      owner.close();
+    }
+  }, 30000);
 
   it("断线重连:lastSeq 增量续传;新 attach 走快照", async () => {
     const c1 = await TestClient.connect(deviceToken, deviceKeys);

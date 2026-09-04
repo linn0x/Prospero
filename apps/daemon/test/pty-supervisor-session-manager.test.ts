@@ -76,14 +76,17 @@ describe("detached PTY session host", () => {
     await second.kill(created.id);
     live.splice(live.findIndex((item) => item.manager === second), 1);
     await eventually(() => {
-      const manifest = JSON.parse(readFileSync(manifestFile, "utf8")) as { ownerState?: string };
-      return manifest.ownerState === "killed";
-    }, "explicit kill manifest fence");
-    await eventually(() => {
       try { process.kill(originalPid, 0); return false; }
       catch { return true; }
     }, "explicit kill owner exit");
+    expect(existsSync(path.dirname(manifestFile))).toBe(false);
     await second.disposeAll();
+
+    const third = new SessionManager({ home: value, ptySupervisor: true });
+    expect(await third.restorePtySupervisors()).toEqual([]);
+    expect(JSON.parse(readFileSync(path.join(value, "deleted-sessions.json"), "utf8")))
+      .toEqual({ version: 1, ids: [] });
+    await third.disposeAll();
   });
 
   it.skipIf(process.platform === "win32")("exposes a stale owner as failed history and never launches a duplicate", async () => {

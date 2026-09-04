@@ -1,8 +1,8 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { OrchestrationError, OrchestrationStore } from "../src/orchestration/store.js";
+import { OrchestrationError, OrchestrationStorageError, OrchestrationStore } from "../src/orchestration/store.js";
 import { canTransition, findCycle, isReady, type Task } from "../src/orchestration/model.js";
 
 const dirs: string[] = [];
@@ -761,12 +761,54 @@ describe("落盘", () => {
     ]);
   });
 
-  it("文件坏了当空的开始 —— 编排状态坏掉不该让 daemon 起不来", () => {
+  it("主文件损坏时从备份恢复并保留损坏原件", () => {
     const home = tmpHome();
+    const seeded = new OrchestrationStore(home);
+    seeded.createRun({ objective: "不能丢失" });
+    seeded.close();
+    writeFileSync(path.join(home, "orchestration.json.bak"), "broken-backup");
+    const refreshed = new OrchestrationStore(home);
+    expect(() => JSON.parse(readFileSync(path.join(home, "orchestration.json.bak"), "utf8"))).not.toThrow();
+    refreshed.close();
     writeFileSync(path.join(home, "orchestration.json"), "{ 这不是 json");
+
+    const recovered = new OrchestrationStore(home);
+    expect(recovered.listRuns().map((run) => run.objective)).toEqual(["不能丢失"]);
+    expect(readdirSync(home).some((name) => name.startsWith("orchestration.json.corrupt."))).toBe(true);
+    expect(() => JSON.parse(readFileSync(path.join(home, "orchestration.json"), "utf8"))).not.toThrow();
+    recovered.close();
+  });
+
+  it("主文件与备份都损坏时失败关闭且不覆盖桌面投影", () => {
+    const home = tmpHome();
+    const projection = path.join(home, "orchestration-desktop.json");
+    writeFileSync(path.join(home, "orchestration.json"), "broken-primary");
+    writeFileSync(path.join(home, "orchestration.json.bak"), "broken-backup");
+    writeFileSync(projection, "preserve-me");
+
+    expect(() => new OrchestrationStore(home)).toThrow(OrchestrationStorageError);
+    expect(readFileSync(path.join(home, "orchestration.json"), "utf8")).toBe("broken-primary");
+    expect(readFileSync(path.join(home, "orchestration.json.bak"), "utf8")).toBe("broken-backup");
+    expect(readFileSync(projection, "utf8")).toBe("preserve-me");
+  });
+
+  it("延迟持久化失败不会成为未捕获异常", async () => {
+    const home = tmpHome();
     const store = new OrchestrationStore(home);
-    expect(store.listRuns()).toEqual([]);
-    expect(() => store.createRun({ objective: "自愈" })).not.toThrow();
+    rmSync(home, { recursive: true, force: true });
+    writeFileSync(home, "not-a-directory");
+
+    store.createRun({ objective: "内存仍可用" });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(store.listRuns().map((run) => run.objective)).toEqual(["内存仍可用"]);
+    expect(store.persistenceError()).toBeInstanceOf(Error);
+    rmSync(home, { force: true });
+    mkdirSync(home);
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    expect(store.persistenceError()).toBeNull();
+    expect(JSON.parse(readFileSync(path.join(home, "orchestration.json"), "utf8")))
+      .toMatchObject({ runs: expect.any(Object) });
+    store.close();
   });
 
   it("幂等操作记录会落盘，且同一个 id 不能换参数复用", () => {

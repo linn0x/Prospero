@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { JsonObject } from "../src/shared/types";
-import { fitScale, layoutGraph } from "../src/renderer/src/RunGraph";
+import { fitScale, layoutGraph, nextGraphOverviewTaskId } from "../src/renderer/src/RunGraph";
 
 function task(id: string, deps: string[] = [], createdAt = 0, parentId?: string): JsonObject {
   return { id, deps, createdAt, ...(parentId ? { parentId } : {}) };
@@ -89,5 +89,15 @@ describe("Electron run graph layout", () => {
     expect(layout.nodes).toHaveLength(2);
     expect(layout.width).toBeGreaterThan(0);
     expect(layout.height).toBeGreaterThan(0);
+  });
+
+  it("navigates every overview task without mounting every node", () => {
+    const ids = ["first", "second", "third"];
+
+    expect(nextGraphOverviewTaskId(ids, undefined, "second", 0)).toBe("second");
+    expect(nextGraphOverviewTaskId(ids, "second", undefined, 1)).toBe("third");
+    expect(nextGraphOverviewTaskId(ids, "third", undefined, 1)).toBe("first");
+    expect(nextGraphOverviewTaskId(ids, "first", undefined, -1)).toBe("third");
+    expect(nextGraphOverviewTaskId([], undefined, undefined, 0)).toBeUndefined();
   });
 });

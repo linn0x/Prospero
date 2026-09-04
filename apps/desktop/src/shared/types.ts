@@ -1,5 +1,13 @@
 export type JsonObject = Record<string, unknown>;
 
+export type QueuedChatMessage = {
+  id: string;
+  text: string;
+  kind: "queue" | "guide";
+  createdAt: number;
+  attachmentCount: number;
+};
+
 export type SessionInfo = {
   id: string;
   agent: string;
@@ -13,6 +21,8 @@ export type SessionInfo = {
   pendingPermissions?: number;
   pendingQuestions?: number;
   approvalPolicy?: string;
+  busySince?: number;
+  messageQueue?: QueuedChatMessage[];
   subagents?: Array<{ id: string; name?: string; role?: string; status?: string }>;
 };
 
@@ -57,6 +67,7 @@ export type SessionPage = {
 };
 
 export type DeviceInfo = {
+  id: string;
   name: string;
   allowShell: boolean;
   allowOrchestration: boolean;
@@ -271,7 +282,7 @@ export type DesktopApi = {
   listSessions(request?: SessionPageRequest): Promise<SessionPage>;
   getSessionView(sessionId: string, query?: Record<string, number>): Promise<JsonObject | null>;
   cancelSessionView(sessionId: string): Promise<{ ok: boolean }>;
-  interact(sessionId: string, message: JsonObject): Promise<void>;
+  interact(sessionId: string, message: JsonObject): Promise<JsonObject | null>;
   interruptSession(sessionId: string): Promise<void>;
   killSession(sessionId: string): Promise<void>;
   getToolOutput(sessionId: string, callId: string): Promise<JsonObject>;
@@ -293,7 +304,7 @@ export type DesktopApi = {
   resolveGate(gateId: string, decision: string): Promise<void>;
   accountAction(message: JsonObject): Promise<JsonObject>;
   pairDevice(input: { name: string; allowShell: boolean; allowOrchestration: boolean }): Promise<{ output: string; uri?: string }>;
-  revokeDevice(name: string): Promise<{ ok: boolean; output: string; cancelled?: boolean }>;
+  revokeDevice(id: string, name: string): Promise<{ ok: boolean; output: string; cancelled?: boolean }>;
   relayAction(input: { action: "status" | "enable" | "disable" | "rotate-key"; url?: string }): Promise<JsonObject>;
   updateSettings(patch: Partial<DesktopSettings>): Promise<{ settings: DesktopSettings }>;
   clearLogs(): Promise<{ ok: boolean; cancelled?: boolean }>;

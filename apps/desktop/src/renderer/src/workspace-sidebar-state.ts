@@ -12,6 +12,17 @@ export function sessionRestoreRetryDelay(attempt: number): number | undefined {
   return 500 * 2 ** attempt;
 }
 
+export function restoredSessionIds(
+  ids: readonly string[],
+  activeId: string | undefined,
+  limit = 100,
+): string[] {
+  const ordered = activeId
+    ? [activeId, ...ids.filter((id) => id !== activeId)]
+    : [...ids];
+  return [...new Set(ordered)].slice(0, Math.max(0, limit));
+}
+
 type DesktopShortcutEvent = Pick<
   KeyboardEvent,
   | "altKey"
@@ -54,6 +65,37 @@ export function matchesDesktopShortcut(
   return platform === "darwin"
     ? event.metaKey && !event.ctrlKey && event.shiftKey === macShift
     : event.ctrlKey && !event.metaKey && event.shiftKey;
+}
+
+export function matchesFocusShortcut(
+  event: DesktopShortcutEvent,
+  platform: string,
+): boolean {
+  if (
+    event.defaultPrevented ||
+    event.repeat ||
+    event.key.toLocaleLowerCase() !== "f"
+  )
+    return false;
+  const target = event.target as
+    | (EventTarget & { closest?: (selector: string) => Element | null })
+    | null;
+  const inTerminal = Boolean(target?.closest?.(".xterm"));
+  if (
+    !inTerminal &&
+    target?.closest?.(
+      "input,textarea,select,[contenteditable]:not([contenteditable='false']),[role='dialog']",
+    )
+  )
+    return false;
+  if (
+    typeof document !== "undefined" &&
+    document.querySelector("[role='dialog']")
+  )
+    return false;
+  return platform === "darwin"
+    ? event.metaKey && event.shiftKey && !event.ctrlKey && !event.altKey
+    : event.ctrlKey && event.altKey && !event.metaKey && !event.shiftKey;
 }
 
 export function adaptiveSidebarOpen(width: number, current: boolean): boolean {

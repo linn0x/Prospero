@@ -1,5 +1,6 @@
 import { once } from "node:events";
 import { randomBytes } from "node:crypto";
+import { createServer } from "node:http";
 import { deriveRelayRouteId, MAX_RELAY_CONTROL_FRAME_BYTES, MAX_RELAY_DATA_FRAME_BYTES } from "@prospero/protocol";
 import { createLogger } from "../src/log.js";
 import { RelayServer } from "../src/relay.js";
@@ -158,6 +159,26 @@ describe("relay v1 independent data-plane service", () => {
     await relay.listen(); running.push(relay); const address = relay.address(); if (address === undefined) throw new Error("missing address");
     return { relay, routes, ephemeral, url: `ws://127.0.0.1:${address.port}` };
   }
+
+  it("rolls back startup resources when TCP bind fails", async () => {
+    const blocker = createServer();
+    await new Promise<void>((resolve) => blocker.listen(0, "127.0.0.1", resolve));
+    const address = blocker.address();
+    if (address === null || typeof address === "string") throw new Error("missing blocker address");
+    const ephemeral = new MemoryEphemeralStore();
+    const relay = new RelayServer({
+      routes: new MemoryRouteStore(),
+      ephemeral,
+      config: { ...config(), port: address.port },
+      logger: createLogger("silent"),
+    });
+    await expect(relay.listen()).rejects.toMatchObject({ code: "EADDRINUSE" });
+    expect(ephemeral.listeners.size).toBe(0);
+    const started = Date.now();
+    await relay.close();
+    expect(Date.now() - started).toBeLessThan(500);
+    await new Promise<void>((resolve, reject) => blocker.close((error) => error ? reject(error) : resolve()));
+  });
 
   async function hostOnline(url: string, generation = 1): Promise<WebSocket> {
     const host = await open(`${url}/v1/host`);

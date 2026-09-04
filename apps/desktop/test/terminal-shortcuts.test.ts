@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  canDeliverTerminalInteraction,
   getTerminalEmptyFrameDelay,
+  terminalBootstrapCursor,
   terminalClipboardAction,
+  terminalSessionIsReadOnly,
   terminalShortcutAction,
 } from "../src/renderer/src/TerminalPane";
 
@@ -21,6 +24,21 @@ describe("terminal clipboard shortcuts", () => {
   it("backs off when an older daemon returns an immediate empty frame", () => {
     expect(getTerminalEmptyFrameDelay(5)).toBe(650);
     expect(getTerminalEmptyFrameDelay(20_000)).toBe(0);
+  });
+
+  it("bootstraps a cache miss from the output ring", () => {
+    expect(terminalBootstrapCursor()).toBe(0);
+    expect(terminalBootstrapCursor(42)).toBe(42);
+    expect(terminalBootstrapCursor(-1)).toBe(0);
+  });
+
+  it("keeps ended terminals read-only while draining accepted input", () => {
+    expect(terminalSessionIsReadOnly("done")).toBe(true);
+    expect(terminalSessionIsReadOnly("died")).toBe(true);
+    expect(terminalSessionIsReadOnly("running")).toBe(false);
+    expect(canDeliverTerminalInteraction(false, false, true)).toBe(true);
+    expect(canDeliverTerminalInteraction(false, false)).toBe(false);
+    expect(canDeliverTerminalInteraction(true, true, true)).toBe(false);
   });
 
   it("uses native Command shortcuts on macOS without swallowing Control-C", () => {
