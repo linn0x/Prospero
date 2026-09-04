@@ -25,6 +25,7 @@ import {
   type StoredHost,
 } from "@/lib/hosts";
 import { useApp } from "@/lib/store";
+import { color } from "@/lib/theme";
 
 /**
  * 编辑主机的连接方式。
@@ -199,7 +200,7 @@ export default function EditHostScreen(): React.ReactElement {
                 });
               }}
             >
-              <Icon name="trash" size={16} color="#e5534b" />
+              <Icon name="trash" size={16} color={color.danger} />
             </Pressable>
           </View>
         ))}
@@ -210,7 +211,7 @@ export default function EditHostScreen(): React.ReactElement {
             value={newAddr}
             onChangeText={setNewAddr}
             placeholder="新增地址(IP 或主机名)"
-            placeholderTextColor="#5a5a66"
+            placeholderTextColor={color.textFaint}
             autoCapitalize="none"
             autoCorrect={false}
             keyboardType="numbers-and-punctuation"
@@ -229,7 +230,7 @@ export default function EditHostScreen(): React.ReactElement {
             value={portText}
             onChangeText={setPortText}
             keyboardType="number-pad"
-            placeholderTextColor="#5a5a66"
+            placeholderTextColor={color.textFaint}
             onSubmitEditing={savePort}
             returnKeyType="done"
           />
@@ -250,7 +251,7 @@ export default function EditHostScreen(): React.ReactElement {
                 value={relayUrl}
                 onChangeText={setRelayUrl}
                 placeholder="wss://relay.example.com/v1"
-                placeholderTextColor="#5a5a66"
+                placeholderTextColor={color.textFaint}
                 autoCapitalize="none"
                 autoCorrect={false}
                 keyboardType="url"
@@ -286,10 +287,10 @@ export default function EditHostScreen(): React.ReactElement {
 }
 
 const styles = StyleSheet.create({
-  screen: { flex: 1, backgroundColor: "#0b0b0e" },
+  screen: { flex: 1, backgroundColor: color.bg },
   body: { padding: 16, gap: 10 },
-  section: { color: "#e8e8ee", fontSize: 15, fontWeight: "600", marginTop: 12 },
-  note: { color: "#8a8a96", fontSize: 12, lineHeight: 17 },
+  section: { color: color.text, fontSize: 15, fontWeight: "600", marginTop: 12 },
+  note: { color: color.textDim, fontSize: 12, lineHeight: 17 },
   modeGroup: { gap: 8, marginTop: 2 },
   mode: {
     flexDirection: "row",
@@ -298,46 +299,46 @@ const styles = StyleSheet.create({
     minHeight: 48,
     borderRadius: 8,
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#292932",
-    backgroundColor: "#121218",
+    borderColor: color.border,
+    backgroundColor: color.surface,
     paddingHorizontal: 12,
   },
-  modeSelected: { borderColor: "#587bd8", backgroundColor: "#17203a" },
-  radio: { width: 18, height: 18, borderRadius: 9, borderWidth: 2, borderColor: "#737382" },
-  radioSelected: { borderColor: "#7aa2f7", backgroundColor: "#7aa2f7" },
+  modeSelected: { borderColor: color.accent, backgroundColor: color.accentBg },
+  radio: { width: 18, height: 18, borderRadius: 9, borderWidth: 2, borderColor: color.textFaint },
+  radioSelected: { borderColor: color.accent, backgroundColor: color.accent },
   modeCopy: { flex: 1 },
-  modeTitle: { color: "#e8e8ee", fontSize: 14, fontWeight: "600" },
-  modeHint: { color: "#8a8a96", fontSize: 11, marginTop: 2 },
-  actualPath: { color: "#a7b8e7", fontSize: 12, lineHeight: 18 },
-  warn: { color: "#e5534b", fontSize: 13, paddingVertical: 6 },
+  modeTitle: { color: color.text, fontSize: 14, fontWeight: "600" },
+  modeHint: { color: color.textDim, fontSize: 11, marginTop: 2 },
+  actualPath: { color: color.accent, fontSize: 12, lineHeight: 18 },
+  warn: { color: color.danger, fontSize: 13, paddingVertical: 6 },
   row: {
     flexDirection: "row",
     alignItems: "center",
     gap: 12,
     paddingVertical: 11,
     borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: "#1c1c22",
+    borderBottomColor: color.border,
   },
-  addr: { color: "#e8e8ee", fontSize: 14, flex: 1, fontVariant: ["tabular-nums"] },
+  addr: { color: color.text, fontSize: 14, flex: 1, fontVariant: ["tabular-nums"] },
   addRow: { flexDirection: "row", gap: 8, alignItems: "center" },
   input: {
     flex: 1,
-    backgroundColor: "#16161c",
+    backgroundColor: color.surface,
     borderRadius: 8,
     paddingHorizontal: 12,
     paddingVertical: 10,
-    color: "#e8e8ee",
+    color: color.text,
     fontSize: 14,
   },
   addBtn: {
-    backgroundColor: "#26262e",
+    backgroundColor: color.surfaceRaised,
     borderRadius: 8,
     paddingHorizontal: 16,
     paddingVertical: 10,
   },
-  addBtnText: { color: "#7aa2f7", fontSize: 14 },
+  addBtnText: { color: color.accent, fontSize: 14 },
   repairBox: { gap: 8, paddingVertical: 4 },
   repairBtn: { alignSelf: "flex-start", paddingVertical: 10, paddingHorizontal: 12 },
-  footer: { color: "#5a5a66", fontSize: 11, marginTop: 18, lineHeight: 16 },
-  dim: { color: "#8a8a96", padding: 16 },
+  footer: { color: color.textFaint, fontSize: 11, marginTop: 18, lineHeight: 16 },
+  dim: { color: color.textDim, padding: 16 },
 });

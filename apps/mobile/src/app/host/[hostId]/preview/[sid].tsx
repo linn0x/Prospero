@@ -213,7 +213,7 @@ const styles = StyleSheet.create({
     paddingVertical: 9,
     backgroundColor: color.accentBg,
     borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: "#2C3A62",
+    borderBottomColor: color.accentDim,
   },
   referenceLabel: { color: color.accent, fontSize: 11, fontWeight: "700", fontFamily: MONOSPACE_FONT },
   referenceCode: { flex: 1, color: color.text, fontSize: 11, lineHeight: 16, fontFamily: MONOSPACE_FONT },
@@ -222,7 +222,7 @@ const styles = StyleSheet.create({
   dim: { color: color.textDim, fontSize: 13, textAlign: "center" },
   error: { color: color.warn, fontSize: 13, lineHeight: 19, textAlign: "center" },
   retry: { marginTop: 4, backgroundColor: color.accentDim, borderRadius: 10, paddingHorizontal: 18, paddingVertical: 9 },
-  retryText: { color: "#fff", fontSize: 13, fontWeight: "600" },
+  retryText: { color: color.onAccent, fontSize: 13, fontWeight: "600" },
   code: {
     flex: 1,
     color: color.text,

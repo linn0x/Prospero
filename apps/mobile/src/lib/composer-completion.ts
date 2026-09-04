@@ -9,6 +9,20 @@ export interface ComposerToken {
   trigger: "@" | "$" | "/skills" | "/";
 }
 
+/** 在当前选择区插入快捷字符，并把光标移动到插入内容之后。 */
+export function insertComposerText(
+  text: string,
+  selection: { start: number; end: number },
+  inserted: string,
+): { text: string; cursor: number } {
+  const start = Math.max(0, Math.min(selection.start, text.length));
+  const end = Math.max(start, Math.min(selection.end, text.length));
+  return {
+    text: `${text.slice(0, start)}${inserted}${text.slice(end)}`,
+    cursor: start + inserted.length,
+  };
+}
+
 /** 找光标处正在输入的 @文件、$Skill 或 /命令。 */
 export function activeComposerToken(text: string, cursor = text.length): ComposerToken | null {
   const safeCursor = Math.max(0, Math.min(cursor, text.length));

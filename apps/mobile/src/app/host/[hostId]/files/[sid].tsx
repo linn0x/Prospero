@@ -26,7 +26,7 @@ import { SwipeRow, type SwipeAction } from "@/components/SwipeRow";
 import { primaryPaneWidth, useAdaptiveLayout } from "@/lib/adaptive-layout";
 import { getEditorExitPlan, resolveEditorExitConfirmation } from "@/lib/editor-exit";
 import { validateFileName } from "@/lib/file-names";
-import { MONOSPACE_FONT } from "@/lib/theme";
+import { color, MONOSPACE_FONT } from "@/lib/theme";
 import { useHostConnection } from "@/lib/use-host-connection";
 
 /** 一次传 256KB;协议单块上限是 1MB,留足编码膨胀余量 */
@@ -302,7 +302,7 @@ export default function FilesScreen(): React.ReactElement {
             headerRight: () => (
               <Pressable onPress={() => void save()} disabled={!dirty || saving}>
                 {saving ? (
-                  <ActivityIndicator size="small" color="#7aa2f7" />
+                  <ActivityIndicator size="small" color={color.accent} />
                 ) : (
                   <Text style={[styles.headerAction, !dirty && styles.headerActionOff]}>保存</Text>
                 )}
@@ -397,7 +397,7 @@ export default function FilesScreen(): React.ReactElement {
           keyExtractor={(e) => e.name}
           contentContainerStyle={{ paddingBottom: insets.bottom + 16 }}
           refreshControl={
-            <RefreshControl refreshing={loading} onRefresh={() => void load(dir)} tintColor="#7aa2f7" />
+            <RefreshControl refreshing={loading} onRefresh={() => void load(dir)} tintColor={color.accent} />
           }
           ListEmptyComponent={
             loading ? null : <Text style={styles.empty}>这个目录是空的</Text>
@@ -410,7 +410,8 @@ export default function FilesScreen(): React.ReactElement {
               id: "download-file",
               label: "下载",
               symbol: "arrow.up",
-              color: "#3a6ea5",
+              color: color.accent,
+              foregroundColor: color.onAccent,
               onPress: () => void download(item),
             });
           }
@@ -418,14 +419,16 @@ export default function FilesScreen(): React.ReactElement {
             id: "rename-entry",
             label: "重命名",
             symbol: "doc.on.doc",
-            color: "#5a5a66",
+            color: color.surfaceRaised,
+            foregroundColor: color.text,
             onPress: () => promptRename(item),
           });
           actions.push({
             id: "delete-entry",
             label: "删除",
             symbol: "trash",
-            color: "#e5534b",
+            color: color.danger,
+            foregroundColor: color.onAccent,
             onPress: () => void remove(item),
             confirm: {
               title: `删除「${item.name}」?`,
@@ -444,14 +447,14 @@ export default function FilesScreen(): React.ReactElement {
               <Icon
                 name={iconFor(item)}
                 size={17}
-                color={item.kind === "dir" ? "#7aa2f7" : "#8a8a96"}
+                color={item.kind === "dir" ? color.accent : color.textDim}
               />
               <Text style={styles.name} numberOfLines={1}>
                 {item.name}
                 {item.kind === "dir" ? "/" : ""}
               </Text>
               {busy === item.name ? (
-                <ActivityIndicator size="small" color="#7aa2f7" />
+                <ActivityIndicator size="small" color={color.accent} />
               ) : (
                 item.kind === "file" && <Text style={styles.size}>{humanSize(item.size)}</Text>
               )}
@@ -519,7 +522,7 @@ function encodeUtf8(text: string): string {
 }
 
 const styles = StyleSheet.create({
-  screen: { flex: 1, backgroundColor: "#0b0b0e" },
+  screen: { flex: 1, backgroundColor: color.bg },
   contentPane: { flex: 1, minWidth: 0, overflow: "hidden" },
   pathBar: {
     flexDirection: "row",
@@ -528,11 +531,11 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical: 10,
     borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: "#26262e",
+    borderBottomColor: color.border,
   },
-  up: { color: "#7aa2f7", fontSize: 14 },
-  upOff: { color: "#3a3a44" },
-  path: { color: "#8a8a96", fontSize: 13, flex: 1 },
+  up: { color: color.accent, fontSize: 14 },
+  upOff: { color: color.textFaint },
+  path: { color: color.textDim, fontSize: 13, flex: 1 },
   row: {
     flexDirection: "row",
     alignItems: "center",
@@ -540,35 +543,35 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical: 13,
     borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: "#1c1c22",
+    borderBottomColor: color.border,
   },
-  rowPressed: { backgroundColor: "#16161c" },
-  name: { color: "#e8e8ee", fontSize: 15, flex: 1 },
-  size: { color: "#5a5a66", fontSize: 12 },
-  empty: { color: "#5a5a66", textAlign: "center", marginTop: 40 },
-  error: { color: "#e5534b", paddingHorizontal: 16, paddingVertical: 10, fontSize: 13 },
+  rowPressed: { backgroundColor: color.pressed },
+  name: { color: color.text, fontSize: 15, flex: 1 },
+  size: { color: color.textFaint, fontSize: 12 },
+  empty: { color: color.textDim, textAlign: "center", marginTop: 40 },
+  error: { color: color.danger, paddingHorizontal: 16, paddingVertical: 10, fontSize: 13 },
   hint: {
-    color: "#5a5a66",
+    color: color.textFaint,
     fontSize: 11,
     textAlign: "center",
     paddingVertical: 8,
   },
   editor: {
     flex: 1,
-    color: "#e8e8ee",
+    color: color.text,
     fontFamily: MONOSPACE_FONT,
     fontSize: 13,
     padding: 14,
     textAlignVertical: "top",
   },
   warnBar: {
-    backgroundColor: "#3a2f14",
-    color: "#d9a441",
+    backgroundColor: color.warnBg,
+    color: color.warn,
     fontSize: 12,
     paddingHorizontal: 14,
     paddingVertical: 8,
   },
   headerActions: { flexDirection: "row", gap: 16, alignItems: "center" },
-  headerAction: { color: "#7aa2f7", fontSize: 16 },
-  headerActionOff: { color: "#3a3a44" },
+  headerAction: { color: color.accent, fontSize: 16 },
+  headerActionOff: { color: color.textFaint },
 });

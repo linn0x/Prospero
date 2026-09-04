@@ -452,5 +452,5 @@ const styles = StyleSheet.create({
   },
   chooseDisabled: { opacity: 0.4 },
   choosePressed: { opacity: 0.82 },
-  chooseText: { color: "#0A0A0C", fontSize: 15, fontWeight: "700" },
+  chooseText: { color: color.onAccent, fontSize: 15, fontWeight: "700" },
 });

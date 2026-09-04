@@ -16,7 +16,7 @@ import {
   type ProjectFileReference,
 } from "@/lib/file-references";
 import { parseMarkdownCached, type InlineSpan, type MdBlock } from "@/lib/markdown";
-import { MONOSPACE_FONT } from "@/lib/theme";
+import { color, MONOSPACE_FONT } from "@/lib/theme";
 
 export type ProjectImageLoader = (reference: ProjectFileReference) => Promise<string>;
 
@@ -229,7 +229,7 @@ const MarkdownImage = memo(function MarkdownImage({
       >
         {loading ? (
           <View style={styles.imagePlaceholder}>
-            <ActivityIndicator color="#7aa2f7" />
+            <ActivityIndicator color={color.accent} />
             <Text style={styles.imageStatus}>正在从电脑读取图片…</Text>
           </View>
         ) : uri !== null && error === null ? (
@@ -246,7 +246,7 @@ const MarkdownImage = memo(function MarkdownImage({
           />
         ) : (
           <View style={styles.imagePlaceholder}>
-            <Icon name="photo" size={25} color="#696979" />
+            <Icon name="photo" size={25} color={color.textFaint} />
             <Text style={styles.imageError}>{error ?? "图片无法显示"}</Text>
             {open && <Text style={styles.imageOpen}>点按打开文件预览</Text>}
           </View>
@@ -348,39 +348,39 @@ function Spans({
 
 const styles = StyleSheet.create({
   root: { gap: 6 },
-  body: { color: "#e8e8ee", fontSize: 15, lineHeight: 22 },
+  body: { color: color.text, fontSize: 15, lineHeight: 22 },
   bold: { fontWeight: "700" },
   italic: { fontStyle: "italic" },
-  heading: { color: "#fff", fontSize: 17, fontWeight: "700", lineHeight: 24, marginTop: 2 },
+  heading: { color: color.text, fontSize: 17, fontWeight: "700", lineHeight: 24, marginTop: 2 },
   headingSmall: { fontSize: 15 },
   mathHeading: { marginTop: 2 },
   bulletRow: { flexDirection: "row", gap: 8, paddingLeft: 2 },
-  bulletMark: { color: "#7aa2f7", fontSize: 15, lineHeight: 22, minWidth: 14 },
+  bulletMark: { color: color.accent, fontSize: 15, lineHeight: 22, minWidth: 14 },
   mathBulletBody: { flex: 1 },
   inlineCode: {
     fontFamily: MONOSPACE_FONT,
     fontSize: 13,
-    color: "#9ad0a5",
-    backgroundColor: "#1a1f1b",
+    color: color.success,
+    backgroundColor: color.successBg,
   },
   fileReference: {
-    color: "#8EB2FF",
-    backgroundColor: "#17203A",
+    color: color.accent,
+    backgroundColor: color.accentBg,
     textDecorationLine: "underline",
-    textDecorationColor: "#526FAE",
+    textDecorationColor: color.accent,
   },
-  quote: { borderLeftWidth: 3, borderLeftColor: "#3a3a46", paddingLeft: 10 },
-  quoteText: { color: "#a8a8b4", fontSize: 14, lineHeight: 21 },
-  rule: { height: 1, backgroundColor: "#26262e", marginVertical: 4 },
+  quote: { borderLeftWidth: 3, borderLeftColor: color.border, paddingLeft: 10 },
+  quoteText: { color: color.textDim, fontSize: 14, lineHeight: 21 },
+  rule: { height: 1, backgroundColor: color.border, marginVertical: 4 },
   imageCard: {
     width: "100%",
     overflow: "hidden",
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#363642",
+    borderColor: color.border,
     borderRadius: 10,
-    backgroundColor: "#111116",
+    backgroundColor: color.surface,
   },
-  image: { width: "100%", minHeight: 120, maxHeight: 420, backgroundColor: "#0b0b0e" },
+  image: { width: "100%", minHeight: 120, maxHeight: 420, backgroundColor: color.surfaceRaised },
   imagePlaceholder: {
     minHeight: 150,
     padding: 18,
@@ -388,29 +388,29 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     gap: 8,
   },
-  imageStatus: { color: "#a8a8b4", fontSize: 12 },
-  imageError: { color: "#c8a56a", fontSize: 12, lineHeight: 17, textAlign: "center" },
-  imageOpen: { color: "#8eb2ff", fontSize: 11 },
+  imageStatus: { color: color.textDim, fontSize: 12 },
+  imageError: { color: color.warn, fontSize: 12, lineHeight: 17, textAlign: "center" },
+  imageOpen: { color: color.accent, fontSize: 11 },
   imageCaption: {
-    color: "#8d8d99",
+    color: color.textFaint,
     fontSize: 11,
     lineHeight: 16,
     paddingHorizontal: 10,
     paddingVertical: 7,
     borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: "#2b2b34",
+    borderTopColor: color.border,
   },
   tableScroll: {
     maxWidth: "100%",
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#363642",
+    borderColor: color.border,
     borderRadius: 9,
   },
   tableScrollContent: { minWidth: "100%" },
   table: { minWidth: "100%" },
-  tableRow: { flexDirection: "row", backgroundColor: "#15151B" },
-  tableHeaderRow: { backgroundColor: "#20202A" },
-  tableAlternateRow: { backgroundColor: "#1A1A21" },
+  tableRow: { flexDirection: "row", backgroundColor: color.surface },
+  tableHeaderRow: { backgroundColor: color.surfaceRaised },
+  tableAlternateRow: { backgroundColor: color.bg },
   tableCell: {
     width: 148,
     minHeight: 38,
@@ -419,9 +419,9 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
     borderRightWidth: StyleSheet.hairlineWidth,
     borderBottomWidth: StyleSheet.hairlineWidth,
-    borderColor: "#363642",
+    borderColor: color.border,
   },
   tableHeaderCell: { minHeight: 40 },
-  tableHeaderText: { color: "#F3F3F8", fontSize: 12.5, lineHeight: 18, fontWeight: "700" },
-  tableText: { color: "#D8D8E1", fontSize: 12.5, lineHeight: 18 },
+  tableHeaderText: { color: color.text, fontSize: 12.5, lineHeight: 18, fontWeight: "700" },
+  tableText: { color: color.textDim, fontSize: 12.5, lineHeight: 18 },
 });

@@ -22,6 +22,7 @@ import { SwipeRow, type SwipeAction } from "@/components/SwipeRow";
 import { toast } from "@/components/Toast";
 import { useAdaptiveLayout } from "@/lib/adaptive-layout";
 import { getGitCommitBarPadding } from "@/lib/git-layout";
+import { color } from "@/lib/theme";
 import { useHostConnection } from "@/lib/use-host-connection";
 
 /**
@@ -190,7 +191,7 @@ export default function GitScreen(): React.ReactElement {
               disabled={loading}
               style={styles.headerButton}
             >
-              <Icon name="arrow.clockwise" size={18} color={loading ? "#3a3a44" : "#7aa2f7"} />
+              <Icon name="arrow.clockwise" size={18} color={loading ? color.textFaint : color.accent} />
             </Pressable>
           ),
         }}
@@ -223,7 +224,7 @@ export default function GitScreen(): React.ReactElement {
             keyExtractor={(f) => f.path}
             contentContainerStyle={{ paddingBottom: 8 }}
             refreshControl={
-              <RefreshControl refreshing={loading} onRefresh={() => void refresh()} tintColor="#7aa2f7" />
+              <RefreshControl refreshing={loading} onRefresh={() => void refresh()} tintColor={color.accent} />
             }
             ListEmptyComponent={
               loading ? null : <Text style={styles.empty}>工作区干净,没有改动。</Text>
@@ -235,7 +236,8 @@ export default function GitScreen(): React.ReactElement {
                   id: "toggle-stage",
                   label: isStaged ? "取消暂存" : "暂存",
                   symbol: isStaged ? "arrow.clockwise" : "checkmark.circle.fill",
-                  color: isStaged ? "#5a5a66" : "#3a6ea5",
+                  color: isStaged ? color.surfaceRaised : color.accent,
+                  foregroundColor: isStaged ? color.text : color.onAccent,
                   onPress: () => void toggleStage(item),
                 },
               ];
@@ -245,7 +247,8 @@ export default function GitScreen(): React.ReactElement {
                   id: "discard-change",
                   label: "丢弃",
                   symbol: "trash",
-                  color: "#e5534b",
+                  color: color.danger,
+                  foregroundColor: color.onAccent,
                   onPress: () => void discard(item),
                   confirm: {
                     title: `丢弃「${item.path}」的改动?`,
@@ -295,7 +298,7 @@ export default function GitScreen(): React.ReactElement {
                 </Pressable>
               </View>
               {patch === null ? (
-                <ActivityIndicator style={styles.diffLoading} color="#7aa2f7" />
+                <ActivityIndicator style={styles.diffLoading} color={color.accent} />
               ) : patch.length === 0 ? (
                 <Text style={styles.empty}>没有可显示的差异。</Text>
               ) : (
@@ -304,7 +307,7 @@ export default function GitScreen(): React.ReactElement {
             </View>
           ) : splitLayout ? (
             <View style={styles.diffPlaceholder}>
-              <Icon name="doc.fill" size={28} color="#3a3a44" />
+              <Icon name="doc.fill" size={28} color={color.textFaint} />
               <Text style={styles.empty}>从左侧选择文件查看改动</Text>
             </View>
           ) : null}
@@ -316,7 +319,7 @@ export default function GitScreen(): React.ReactElement {
               value={message}
               onChangeText={setMessage}
               placeholder={hasStaged ? "提交信息" : "先暂存一些改动"}
-              placeholderTextColor="#5a5a66"
+              placeholderTextColor={color.textFaint}
               editable={hasStaged}
               multiline
               onFocus={() => { setFocused(true); }}
@@ -331,7 +334,7 @@ export default function GitScreen(): React.ReactElement {
               ]}
             >
               {committing ? (
-                <ActivityIndicator size="small" color="#fff" />
+                <ActivityIndicator size="small" color={color.onAccent} />
               ) : (
                 <Text style={styles.commitBtnText}>提交</Text>
               )}
@@ -344,17 +347,17 @@ export default function GitScreen(): React.ReactElement {
 }
 
 const styles = StyleSheet.create({
-  screen: { flex: 1, backgroundColor: "#0b0b0e" },
+  screen: { flex: 1, backgroundColor: color.bg },
   gitWorkspace: { flex: 1, minHeight: 0 },
   gitWorkspaceSplit: { flexDirection: "row" },
   filePane: { flex: 1, minHeight: 0 },
   gitDetailPane: { flexShrink: 0, minWidth: 0 },
   gitFoldGutter: {
     flexShrink: 0,
-    backgroundColor: "#0b0b0e",
+    backgroundColor: color.bg,
     borderLeftWidth: StyleSheet.hairlineWidth,
     borderRightWidth: StyleSheet.hairlineWidth,
-    borderColor: "#26262e",
+    borderColor: color.border,
   },
   branchBar: {
     flexDirection: "row",
@@ -363,11 +366,11 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical: 10,
     borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: "#26262e",
+    borderBottomColor: color.border,
   },
-  branch: { color: "#7aa2f7", fontSize: 14, flexShrink: 1 },
-  counts: { color: "#d9a441", fontSize: 12, fontVariant: ["tabular-nums"] },
-  changed: { color: "#8a8a96", fontSize: 12, marginLeft: "auto" },
+  branch: { color: color.accent, fontSize: 14, flexShrink: 1 },
+  counts: { color: color.warn, fontSize: 12, fontVariant: ["tabular-nums"] },
+  changed: { color: color.textDim, fontSize: 12, marginLeft: "auto" },
   row: {
     flexDirection: "row",
     alignItems: "center",
@@ -375,9 +378,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical: 12,
     borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: "#1c1c22",
+    borderBottomColor: color.border,
   },
-  rowPressed: { backgroundColor: "#16161c" },
+  rowPressed: { backgroundColor: color.pressed },
   badge: {
     width: 22,
     textAlign: "center",
@@ -387,15 +390,15 @@ const styles = StyleSheet.create({
     paddingVertical: 2,
     overflow: "hidden",
   },
-  badgeStaged: { color: "#0b0b0e", backgroundColor: "#4dbd74" },
-  badgeDirty: { color: "#0b0b0e", backgroundColor: "#d9a441" },
-  path: { color: "#e8e8ee", fontSize: 13, flex: 1 },
-  empty: { color: "#5a5a66", textAlign: "center", padding: 28, fontSize: 13 },
+  badgeStaged: { color: color.onAccent, backgroundColor: color.success },
+  badgeDirty: { color: color.onAccent, backgroundColor: color.warn },
+  path: { color: color.text, fontSize: 13, flex: 1 },
+  empty: { color: color.textDim, textAlign: "center", padding: 28, fontSize: 13 },
   diffPane: {
     maxHeight: "50%",
     borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: "#26262e",
-    backgroundColor: "#0e0e13",
+    borderTopColor: color.border,
+    backgroundColor: color.surface,
   },
   diffPaneWide: { flex: 1, maxHeight: undefined },
   diffPlaceholder: { flex: 1, alignItems: "center", justifyContent: "center" },
@@ -406,8 +409,8 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
     gap: 10,
   },
-  diffTitle: { color: "#8a8a96", fontSize: 12, flex: 1 },
-  close: { color: "#7aa2f7", fontSize: 13 },
+  diffTitle: { color: color.textDim, fontSize: 12, flex: 1 },
+  close: { color: color.accent, fontSize: 13 },
   diffLoading: { paddingVertical: 24 },
   headerButton: { width: 44, height: 44, alignItems: "center", justifyContent: "center" },
   commitBar: {
@@ -415,24 +418,24 @@ const styles = StyleSheet.create({
     alignItems: "flex-end",
     gap: 8,
     borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: "#26262e",
+    borderTopColor: color.border,
   },
   commitInput: {
     flex: 1,
     maxHeight: 90,
-    backgroundColor: "#16161c",
+    backgroundColor: color.surfaceRaised,
     borderRadius: 10,
     paddingHorizontal: 12,
     paddingVertical: 9,
-    color: "#e8e8ee",
+    color: color.text,
     fontSize: 14,
   },
   commitBtn: {
-    backgroundColor: "#3557b7",
+    backgroundColor: color.accent,
     borderRadius: 10,
     paddingHorizontal: 18,
     paddingVertical: 11,
   },
-  commitBtnOff: { backgroundColor: "#26262e" },
-  commitBtnText: { color: "#fff", fontSize: 14, fontWeight: "600" },
+  commitBtnOff: { backgroundColor: color.pressed },
+  commitBtnText: { color: color.onAccent, fontSize: 14, fontWeight: "600" },
 });

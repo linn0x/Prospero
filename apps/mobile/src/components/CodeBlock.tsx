@@ -2,7 +2,7 @@ import { memo, useState } from "react";
 import * as Clipboard from "expo-clipboard";
 import * as Haptics from "expo-haptics";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
-import { MONOSPACE_FONT } from "@/lib/theme";
+import { color, MONOSPACE_FONT } from "@/lib/theme";
 
 /**
  * 代码块。带复制按钮 —— 手机上长按选中再拖两端去选一段命令是最折磨的操作之一,
@@ -43,28 +43,28 @@ export const CodeBlock = memo(function CodeBlock({
 
 const styles = StyleSheet.create({
   wrap: {
-    backgroundColor: "#15151b",
+    backgroundColor: color.surfaceRaised,
     borderRadius: 10,
     overflow: "hidden",
     borderWidth: 1,
-    borderColor: "#22222c",
+    borderColor: color.border,
   },
   bar: {
     flexDirection: "row",
     alignItems: "center",
     paddingHorizontal: 10,
     paddingVertical: 5,
-    backgroundColor: "#1a1a22",
+    backgroundColor: color.surface,
   },
-  lang: { color: "#6a6a76", fontSize: 11, flex: 1 },
+  lang: { color: color.textFaint, fontSize: 11, flex: 1 },
   copyBtn: { paddingHorizontal: 4 },
-  copyText: { color: "#7aa2f7", fontSize: 11, fontWeight: "600" },
-  copiedText: { color: "#4dbd74" },
+  copyText: { color: color.accent, fontSize: 11, fontWeight: "600" },
+  copiedText: { color: color.success },
   scroll: { maxHeight: 280 },
   code: {
     fontFamily: MONOSPACE_FONT,
     fontSize: 12,
-    color: "#c8c8d4",
+    color: color.text,
     lineHeight: 18,
     padding: 10,
   },

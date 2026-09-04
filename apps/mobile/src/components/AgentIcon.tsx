@@ -1,4 +1,4 @@
-import { StyleSheet, View } from "react-native";
+import { Appearance, StyleSheet, useColorScheme, View, type ColorSchemeName } from "react-native";
 import Svg, { Path } from "react-native-svg";
 import type { AgentKind } from "@prospero/protocol";
 import { agentLogoPath } from "@/components/agent-logos";
@@ -15,19 +15,22 @@ import { color, radius } from "@/lib/theme";
  * 颜色取各家品牌色,但压过一道:原色是给白底做主视觉用的,直接摆到深色界面上
  * 会亮得跳出来,六个并排更是一片吵。识别靠色相,不靠饱和度。
  */
-const AGENTS: Record<AgentKind, { tint: string; symbol?: IconName }> = {
-  claude: { tint: "#D97757" },
-  codex: { tint: "#8AB4F8" },
-  deepseek: { tint: "#6B8CFF" },
-  opencode: { tint: "#5BC98C" },
-  grok: { tint: "#C9C9D4" },
-  trae: { tint: "#3ED592" },
-  shell: { tint: "#9B9BA6", symbol: "terminal.fill" },
-  custom: { tint: "#9B9BA6", symbol: "command" },
+const AGENTS: Record<AgentKind, { dark: string; light: string; symbol?: IconName }> = {
+  claude: { dark: "#D97757", light: "#A94F31" },
+  codex: { dark: "#8AB4F8", light: "#315EA8" },
+  deepseek: { dark: "#829BFF", light: "#3D57C8" },
+  opencode: { dark: "#5BC98C", light: "#1E7049" },
+  grok: { dark: "#C9C9D4", light: "#404957" },
+  trae: { dark: "#3ED592", light: "#147A50" },
+  shell: { dark: "#C1C7D0", light: "#404957", symbol: "terminal.fill" },
+  custom: { dark: "#C1C7D0", light: "#404957", symbol: "command" },
 };
 
-export function agentTint(agent: AgentKind): string {
-  return AGENTS[agent].tint;
+export function agentTint(
+  agent: AgentKind,
+  scheme: ColorSchemeName | null | undefined = Appearance.getColorScheme(),
+): string {
+  return scheme === "light" ? AGENTS[agent].light : AGENTS[agent].dark;
 }
 
 /**
@@ -43,7 +46,9 @@ export function AgentIcon({
   size?: number;
   badge?: boolean;
 }) {
-  const { tint, symbol } = AGENTS[agent];
+  const scheme = useColorScheme();
+  const { symbol } = AGENTS[agent];
+  const tint = agentTint(agent, scheme);
   const path = agentLogoPath[agent];
   const glyph =
     path !== undefined ? (

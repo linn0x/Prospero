@@ -11,6 +11,8 @@ import {
   View,
 } from "react-native";
 
+import { color } from "@/lib/theme";
+
 interface PromptDialogProps {
   visible: boolean;
   title: string;
@@ -152,7 +154,7 @@ export function PromptDialog({
                 disabled={validationError !== null || submitting}
               >
                 {submitting ? (
-                  <ActivityIndicator size="small" color="#fff" />
+                  <ActivityIndicator size="small" color={color.onAccent} />
                 ) : (
                   <Text style={styles.confirmText}>{confirmLabel}</Text>
                 )}
@@ -181,25 +183,25 @@ const styles = StyleSheet.create({
     maxWidth: 420,
     borderRadius: 16,
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#34343f",
-    backgroundColor: "#1a1a21",
+    borderColor: color.border,
+    backgroundColor: color.surface,
     padding: 18,
   },
-  title: { color: "#f0f0f5", fontSize: 18, fontWeight: "600" },
-  message: { color: "#9a9aa6", fontSize: 13, lineHeight: 18, marginTop: 6 },
+  title: { color: color.text, fontSize: 18, fontWeight: "600" },
+  message: { color: color.textDim, fontSize: 13, lineHeight: 18, marginTop: 6 },
   input: {
     marginTop: 14,
     borderWidth: 1,
-    borderColor: "#3a3a46",
+    borderColor: color.border,
     borderRadius: 10,
-    backgroundColor: "#101014",
-    color: "#f0f0f5",
+    backgroundColor: color.bg,
+    color: color.text,
     fontSize: 16,
     paddingHorizontal: 12,
     paddingVertical: 10,
   },
-  inputError: { borderColor: "#e5534b" },
-  error: { color: "#f08a84", fontSize: 12, lineHeight: 17, marginTop: 5 },
+  inputError: { borderColor: color.danger },
+  error: { color: color.danger, fontSize: 12, lineHeight: 17, marginTop: 5 },
   errorHidden: { opacity: 0 },
   actions: { flexDirection: "row", justifyContent: "flex-end", gap: 10, marginTop: 6 },
   button: {
@@ -210,9 +212,9 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     paddingHorizontal: 16,
   },
-  confirmButton: { backgroundColor: "#3557b7" },
+  confirmButton: { backgroundColor: color.accent },
   buttonPressed: { opacity: 0.72 },
   buttonDisabled: { opacity: 0.42 },
-  cancelText: { color: "#b5b5c0", fontSize: 15 },
-  confirmText: { color: "#fff", fontSize: 15, fontWeight: "600" },
+  cancelText: { color: color.textDim, fontSize: 15 },
+  confirmText: { color: color.onAccent, fontSize: 15, fontWeight: "600" },
 });

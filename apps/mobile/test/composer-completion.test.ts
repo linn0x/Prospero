@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   activeComposerToken,
+  insertComposerText,
   replaceComposerToken,
 } from "../src/lib/composer-completion";
 import { commandsFor } from "../src/lib/slash-commands";
@@ -68,5 +69,16 @@ describe("对话输入补全", () => {
       label: "openai-docs",
     });
     expect(result.text).toBe("请用 $openai-docs ");
+  });
+
+  it("快捷字符会替换选择区并把光标留在字符后", () => {
+    expect(insertComposerText("打开 file", { start: 3, end: 3 }, "@")).toEqual({
+      text: "打开 @file",
+      cursor: 4,
+    });
+    expect(insertComposerText("运行 old command", { start: 3, end: 6 }, "/")).toEqual({
+      text: "运行 / command",
+      cursor: 4,
+    });
   });
 });

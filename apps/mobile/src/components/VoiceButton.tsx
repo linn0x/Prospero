@@ -22,6 +22,7 @@ import type {
 } from "../../modules/prospero-mixed-speech/src/ProsperoMixedSpeech.types";
 import { Icon } from "@/components/Icon";
 import { toast } from "@/components/Toast";
+import { color } from "@/lib/theme";
 import {
   abortAndroidOfflineSpeech,
   prepareAndroidOfflineSpeech,
@@ -880,17 +881,19 @@ export function VoiceButton({ onTranscript }: Props) {
         : null;
   const buttonColor =
     phase === "recording"
-      ? "#a9363e"
+      ? color.danger
       : processing
-        ? "#3557b7"
+        ? color.accent
         : unavailable
-          ? "#2d2920"
-          : "#24242c";
+          ? color.warnBg
+          : color.surfaceRaised;
   const iconColor = unavailable
-    ? "#9b8754"
+    ? color.warn
     : phase === "recording"
-      ? "#fff"
-      : "#c8c8d2";
+      ? color.onAccent
+      : processing
+        ? color.onAccent
+        : color.textDim;
 
   return (
     <View style={styles.wrapper}>
@@ -904,7 +907,7 @@ export function VoiceButton({ onTranscript }: Props) {
           ) : (
             <ActivityIndicator
               size="small"
-              color={phase === "cancelling" ? "#d9a441" : "#7aa2f7"}
+              color={phase === "cancelling" ? color.warn : color.accent}
             />
           )}
           <View style={styles.statusCopy}>
@@ -1004,7 +1007,7 @@ function VolumeBars({ volume, cancel }: { volume: number; cancel: boolean }) {
             styles.bar,
             {
               height: 5 + strength * weight * 17,
-              backgroundColor: cancel ? "#e5534b" : "#7aa2f7",
+              backgroundColor: cancel ? color.danger : color.accent,
             },
           ]}
         />
@@ -1032,17 +1035,17 @@ const styles = StyleSheet.create({
     paddingHorizontal: 3,
     borderRadius: 8,
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#63637a",
-    backgroundColor: "#30303c",
+    borderColor: color.border,
+    backgroundColor: color.surfaceRaised,
     alignItems: "center",
     justifyContent: "center",
   },
   languageBadgeUnavailable: {
-    borderColor: "#685a35",
-    backgroundColor: "#37301e",
+    borderColor: color.warn,
+    backgroundColor: color.warnBg,
   },
   languageBadgeText: {
-    color: "#e8e8ee",
+    color: color.text,
     fontSize: 8,
     lineHeight: 10,
     fontWeight: "700",
@@ -1055,8 +1058,8 @@ const styles = StyleSheet.create({
     minHeight: 56,
     borderRadius: 14,
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#343441",
-    backgroundColor: "#1c1c24",
+    borderColor: color.border,
+    backgroundColor: color.surface,
     flexDirection: "row",
     alignItems: "center",
     paddingHorizontal: 13,
@@ -1069,11 +1072,11 @@ const styles = StyleSheet.create({
     elevation: 8,
     zIndex: 20,
   },
-  statusCancel: { borderColor: "#7d3338", backgroundColor: "#2b191c" },
+  statusCancel: { borderColor: color.danger, backgroundColor: color.dangerBg },
   statusCopy: { flex: 1, minWidth: 0 },
-  statusTitle: { color: "#e8e8ee", fontSize: 13, fontWeight: "600" },
-  statusTitleCancel: { color: "#ff9a9f" },
-  statusHint: { color: "#8a8a96", fontSize: 11, marginTop: 3 },
+  statusTitle: { color: color.text, fontSize: 13, fontWeight: "600" },
+  statusTitleCancel: { color: color.danger },
+  statusHint: { color: color.textDim, fontSize: 11, marginTop: 3 },
   bars: {
     width: 38,
     height: 24,
