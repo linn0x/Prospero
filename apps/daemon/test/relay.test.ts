@@ -911,7 +911,10 @@ describe("daemon relay hot reload and status redaction", () => {
       expect(daemon.port).toBe(port);
       await waitFor(() => {
         try {
-          return Boolean(JSON.parse(readFileSync(path.join(dir, "status.json"), "utf8")).relay);
+          const relayStatus = JSON.parse(readFileSync(path.join(dir, "status.json"), "utf8")).relay as
+            | { state?: unknown; url?: unknown }
+            | undefined;
+          return relayStatus?.state === "online" && relayStatus.url === relay.url;
         } catch {
           return false;
         }
