@@ -1,5 +1,7 @@
 import { Pressable, ScrollView, StyleSheet, Text } from "react-native";
 
+import { color } from "@/lib/theme";
+
 /**
  * 快捷回复:手机上打字成本高,把高频短回复做成一键。
  * 会话忙碌与空闲时给出不同组合。
@@ -48,16 +50,16 @@ export function QuickReplies({
 }
 
 const styles = StyleSheet.create({
-  bar: { flexGrow: 0, backgroundColor: "#141419" },
+  bar: { flexGrow: 0, backgroundColor: color.surface },
   content: { paddingHorizontal: 10, paddingTop: 7, paddingBottom: 3, gap: 7 },
   chip: {
     minHeight: 32,
     justifyContent: "center",
-    backgroundColor: "#24242B",
+    backgroundColor: color.surfaceRaised,
     borderRadius: 16,
     paddingHorizontal: 14,
     paddingVertical: 7,
   },
-  chipPressed: { backgroundColor: "#34343E", transform: [{ scale: 0.98 }] },
-  chipText: { color: "#C6C6D0", fontSize: 12.5, fontWeight: "500" },
+  chipPressed: { backgroundColor: color.pressed, transform: [{ scale: 0.98 }] },
+  chipText: { color: color.textDim, fontSize: 12.5, fontWeight: "500" },
 });

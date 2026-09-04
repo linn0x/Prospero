@@ -2,16 +2,16 @@
   "expo": {
     "name": "Prospero",
     "slug": "prospero",
-    "version": "0.0.13",
+    "version": "0.0.19",
     "orientation": "default",
     "icon": "./assets/images/icon.png",
     "backgroundColor": "#0B0B0E",
     "scheme": "prospero",
-    "userInterfaceStyle": "dark",
+    "userInterfaceStyle": "automatic",
     "ios": {
       "icon": "./assets/expo.icon",
       "bundleIdentifier": "com.linn0x.prospero.remote",
-      "buildNumber": "13",
+      "buildNumber": "19",
       "supportsTablet": true,
       "infoPlist": {
         "NSLocalNetworkUsageDescription": "Prospero 通过本地网络直连你电脑上的 prosperod，以控制 code agent 会话。",
@@ -25,18 +25,21 @@
     },
     "android": {
       "package": "com.linn0x.prospero",
-      "versionCode": 13,
+      "versionCode": 19,
       "backgroundColor": "#0B0B0E",
-      "userInterfaceStyle": "dark",
+      "userInterfaceStyle": "automatic",
       "softwareKeyboardLayoutMode": "resize",
       "allowBackup": false,
       "permissions": [
         "android.permission.INTERNET",
         "android.permission.ACCESS_NETWORK_STATE",
         "android.permission.ACCESS_WIFI_STATE",
-        "android.permission.CHANGE_WIFI_MULTICAST_STATE"
+        "android.permission.CHANGE_WIFI_MULTICAST_STATE",
+        "android.permission.POST_NOTIFICATIONS",
+        "android.permission.SYSTEM_ALERT_WINDOW",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_DATA_SYNC"
       ],
-      "blockedPermissions": ["android.permission.POST_NOTIFICATIONS"],
       "adaptiveIcon": {
         "backgroundColor": "#0B0B0E",
         "foregroundImage": "./assets/images/android-icon-foreground.png",
@@ -94,7 +97,8 @@
           "androidSpeechServicePackages": ["com.google.android.as"]
         }
       ],
-      "./plugins/with-foldable-support"
+      "./plugins/with-foldable-support",
+      "./plugins/with-theme-colors"
     ],
     "experiments": {
       "typedRoutes": false,

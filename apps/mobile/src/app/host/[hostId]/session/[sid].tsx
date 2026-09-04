@@ -3,6 +3,7 @@ import {
   ActivityIndicator,
   Alert,
   Image,
+  Keyboard,
   Platform,
   Pressable,
   ScrollView,
@@ -16,6 +17,12 @@ import * as Haptics from "expo-haptics";
 import * as Linking from "expo-linking";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { KeyboardAvoidingView } from "react-native-keyboard-controller";
+import ReanimatedDrawerLayout, {
+  DrawerKeyboardDismissMode,
+  DrawerPosition,
+  DrawerType,
+  type DrawerLayoutMethods,
+} from "react-native-gesture-handler/ReanimatedDrawerLayout";
 import { useHeaderHeight } from "expo-router/build/react-navigation/elements";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Stack, router, useLocalSearchParams } from "expo-router";
@@ -38,6 +45,7 @@ import { Icon } from "@/components/Icon";
 import { KeyBar } from "@/components/KeyBar";
 import { PerfHud } from "@/components/PerfHud";
 import { QuickReplies } from "@/components/QuickReplies";
+import { SessionQuickPanel } from "@/components/SessionQuickPanel";
 import { Terminal, type TerminalHandle } from "@/components/Terminal";
 import { VoiceButton } from "@/components/VoiceButton";
 import { useAdaptiveLayout } from "@/lib/adaptive-layout";
@@ -469,6 +477,8 @@ export default function SessionScreen() {
   const [images, setImages] = useState<PickedImage[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const termRef = useRef<TerminalHandle>(null);
+  const quickPanelRef = useRef<DrawerLayoutMethods>(null);
+  const [quickPanelActive, setQuickPanelActive] = useState(false);
   const [terminalFontPreference, setTerminalFontPreference] = useState<TerminalFontPreference>(
     SYSTEM_TERMINAL_FONT_PREFERENCE,
   );
@@ -631,14 +641,6 @@ export default function SessionScreen() {
   const openSwitcher = useCallback((): void => {
     setSwitcherOpen(true);
   }, []);
-
-  const openSessionFiles = useCallback((): void => {
-    router.push(`/host/${hostId}/files/${sid}`);
-  }, [hostId, sid]);
-
-  const openSessionGit = useCallback((): void => {
-    router.push(`/host/${hostId}/git/${sid}`);
-  }, [hostId, sid]);
 
   useEffect(() => {
     const sequence = ++completionSequence.current;
@@ -1106,6 +1108,21 @@ export default function SessionScreen() {
     setMenuOpen(true);
   };
 
+  const openQuickPanel = (): void => {
+    Keyboard.dismiss();
+    setQuickPanelActive(true);
+    quickPanelRef.current?.openDrawer();
+  };
+
+  const closeQuickPanel = (): void => {
+    quickPanelRef.current?.closeDrawer();
+  };
+
+  const leaveQuickPanel = (open: () => void): void => {
+    closeQuickPanel();
+    open();
+  };
+
   // 输入以 / 开头时给命令候选；@/$ 候选由 daemon 按当前项目生成。
   const commandHints =
     isChat && !isSubagent && session && composerToken?.kind === "command"
@@ -1138,7 +1155,40 @@ export default function SessionScreen() {
     void Haptics.selectionAsync();
   };
 
+  const quickPanelWidth = Math.min(380, Math.max(280, adaptiveLayout.width * 0.88), adaptiveLayout.width);
+
   return (
+    <ReanimatedDrawerLayout
+      ref={quickPanelRef}
+      drawerPosition={DrawerPosition.RIGHT}
+      drawerType={DrawerType.FRONT}
+      drawerWidth={quickPanelWidth}
+      drawerBackgroundColor={color.surface}
+      overlayColor="rgba(0, 0, 0, 0.48)"
+      edgeWidth={28}
+      minSwipeDistance={12}
+      keyboardDismissMode={DrawerKeyboardDismissMode.ON_DRAG}
+      onDrawerOpen={() => setQuickPanelActive(true)}
+      onDrawerClose={() => setQuickPanelActive(false)}
+      renderNavigationView={() => (
+        <SessionQuickPanel
+          active={quickPanelActive}
+          connected={runtime.status === "connected"}
+          conn={conn}
+          session={session}
+          pending={pending}
+          coordinatorAvailable={coordinatorRun !== null && !isSubagent}
+          onClose={closeQuickPanel}
+          onOpenGit={() => leaveQuickPanel(() => router.push(`/host/${hostId}/git/${sid}`))}
+          onOpenFiles={() => leaveQuickPanel(() => router.push(`/host/${hostId}/files/${sid}`))}
+          onOpenCoordinator={() => {
+            if (coordinatorRun) {
+              leaveQuickPanel(() => router.push(orchestrationRoute(hostId, coordinatorRun.id)));
+            }
+          }}
+        />
+      )}
+    >
     <View style={[styles.adaptiveRoot, showSessionRail && styles.adaptiveRootSplit]}>
       {showSessionRail && (
         <FoldableSessionRail
@@ -1196,8 +1246,7 @@ export default function SessionScreen() {
           ),
           headerRight: () => (
             <View style={styles.headerRight}>
-              {/* "停止"分秒必争;文件与改动是看完回答后最常走的两步,
-                  藏进 ⋯ 会让每次查看都多一次展开。 */}
+              {/* "停止"分秒必争；文件、改动和分支统一放进右侧快捷面板。 */}
               {busy && !isSubagent && (
                 <Pressable
                   onPress={() => conn.interrupt(sid)}
@@ -1209,20 +1258,13 @@ export default function SessionScreen() {
                 </Pressable>
               )}
               <Pressable
-                onPress={openSessionFiles}
+                onPress={openQuickPanel}
                 hitSlop={8}
                 accessibilityRole="button"
-                accessibilityLabel="浏览项目文件"
+                accessibilityLabel="打开会话工具"
+                accessibilityHint="查看文件改动、Git 分支和项目文件"
               >
-                <Icon name="folder.fill" size={19} color={color.accent} />
-              </Pressable>
-              <Pressable
-                onPress={openSessionGit}
-                hitSlop={8}
-                accessibilityRole="button"
-                accessibilityLabel="查看项目改动"
-              >
-                <Icon name="arrow.triangle.branch" size={19} color={color.accent} />
+                <Icon name="square.stack.3d.up" size={20} color={color.accent} />
               </Pressable>
               <Pressable
                 onPress={openMenu}
@@ -2057,6 +2099,7 @@ export default function SessionScreen() {
       </View>
       </KeyboardAvoidingView>
     </View>
+    </ReanimatedDrawerLayout>
   );
 }
 

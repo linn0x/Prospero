@@ -208,7 +208,7 @@ export default function PairScreen() {
             accessibilityLabel="添加配对电脑"
             accessibilityState={{ disabled: !manual.trim() || pairing, busy: pairing }}
           >
-            {pairing ? <ActivityIndicator size="small" color="#0A0A0C" /> : <Text style={styles.btnText}>添加</Text>}
+            {pairing ? <ActivityIndicator size="small" color={color.onAccent} /> : <Text style={styles.btnText}>添加</Text>}
           </Pressable>
         </View>
         <Text style={styles.note}>
@@ -265,7 +265,7 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   btnPressed: { opacity: 0.82 },
-  btnText: { color: "#0A0A0C", fontWeight: "700" },
+  btnText: { color: color.onAccent, fontWeight: "700" },
   iconButton: { minWidth: 48, minHeight: 44, alignItems: "center", justifyContent: "center", borderRadius: radius.sm, backgroundColor: color.surfaceRaised },
   iconButtonText: { color: color.accent, fontSize: 12, fontWeight: "700" },
   disabled: { opacity: 0.45 },

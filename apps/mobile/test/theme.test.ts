@@ -1,7 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 
-vi.mock("react-native", () => ({ Platform: { OS: "android" } }));
+vi.mock("react-native", () => ({
+  Platform: { OS: "android" },
+  PlatformColor: (name: string) => name,
+}));
 
+// Mock must be registered before the theme module evaluates its native colors.
+// eslint-disable-next-line import/first
 import { color, quotaRemainingColor, quotaRemainingPct } from "../src/lib/theme";
 
 describe("subscription quota presentation", () => {

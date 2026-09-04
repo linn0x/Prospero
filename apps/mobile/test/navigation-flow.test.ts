@@ -7,13 +7,17 @@ const read = (...parts: string[]): string =>
 
 const sessionScreen = read("app", "host", "[hostId]", "session", "[sid].tsx");
 const hostScreen = read("app", "host", "[hostId]", "index.tsx");
+const quickPanel = read("components", "SessionQuickPanel.tsx");
 
 describe("会话页动线", () => {
-  it("文件与项目改动在标题栏直达", () => {
-    expect(sessionScreen).toContain('accessibilityLabel="浏览项目文件"');
-    expect(sessionScreen).toContain('accessibilityLabel="查看项目改动"');
-    expect(sessionScreen).toContain("const openSessionFiles = useCallback");
-    expect(sessionScreen).toContain("const openSessionGit = useCallback");
+  it("文件与项目改动从标题栏打开的右侧快捷面板直达", () => {
+    expect(sessionScreen).toContain('accessibilityLabel="打开会话工具"');
+    expect(sessionScreen).toContain("drawerPosition={DrawerPosition.RIGHT}");
+    expect(sessionScreen).toContain("onOpenGit={() => leaveQuickPanel");
+    expect(sessionScreen).toContain("onOpenFiles={() => leaveQuickPanel");
+    expect(quickPanel).toContain("onPress={onOpenGit}");
+    expect(quickPanel).toContain('label="项目文件"');
+    expect(quickPanel).toContain("onPress={onOpenFiles}");
   });
 
   it("移到标题栏之后菜单里不再重复同两项", () => {

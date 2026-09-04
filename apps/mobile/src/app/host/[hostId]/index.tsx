@@ -128,10 +128,12 @@ function projectNameFor(path: string): string {
 }
 
 export default function HostScreen() {
-  const { hostId, create, cmd } = useLocalSearchParams<{
+  const { hostId, create, cmd, quickCreate, cwd: quickCreateCwd } = useLocalSearchParams<{
     hostId: string;
     create?: string;
     cmd?: string;
+    quickCreate?: string;
+    cwd?: string;
   }>();
   const { host, conn, runtime } = useHostConnection(hostId);
   const supportsDeepseekHarness =
@@ -186,6 +188,7 @@ export default function HostScreen() {
   const pendingCreateRef = useRef(false);
   const pendingResumeTitleRef = useRef<string | null>(null);
   const deepLinkCreateRef = useRef<string | null>(null);
+  const homeQuickCreateRef = useRef<string | null>(null);
   const resetPendingCreate = useCallback((): void => {
     pendingCreateRef.current = false;
     pendingResumeTitleRef.current = null;
@@ -435,6 +438,30 @@ export default function HostScreen() {
     }, 0);
     return () => clearTimeout(timer);
   }, [availableAgents, conn, create, cmd, resetPendingCreate, runtime.status]);
+
+  // 首页快速入口复用完整创建器：指定目录时直接进入 Agent 设置，未指定目录或
+  // 选择“新建目录”时先打开 WorkspacePicker（其中包含 mkdir）。
+  useEffect(() => {
+    if (!conn || runtime.status !== "connected") return;
+    if (quickCreate !== "conversation" && quickCreate !== "directory") return;
+    const requestedCwd = typeof quickCreateCwd === "string" ? quickCreateCwd.trim() : "";
+    const fireKey = `${quickCreate}:${requestedCwd}`;
+    if (homeQuickCreateRef.current === fireKey) return;
+    homeQuickCreateRef.current = fireKey;
+    const timer = setTimeout(() => {
+      setLaunchIntent("conversation");
+      setGoal("");
+      setSelectedResume(null);
+      setApprovalPolicy("strict");
+      setCreateYoloConfirmOpen(false);
+      setWorkspacePath("");
+      setManualCwdOpen(false);
+      if (requestedCwd) setCwd(requestedCwd);
+      setComposing(true);
+      if (quickCreate === "directory" || !requestedCwd) setPickerOpen(true);
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [conn, quickCreate, quickCreateCwd, runtime.status]);
 
   // 新建会话:创建后 daemon 自动 attach 并发快照(PTY 发 term.snapshot,
   // 结构化发 chat.snapshot)→ 以快照的 sid 进入会话页
@@ -1623,7 +1650,8 @@ export default function HostScreen() {
                     id: "create-session",
                     label: "新会话",
                     symbol: "plus",
-                    color: color.accentDim,
+                    color: color.accent,
+                    foregroundColor: color.onAccent,
                     onPress: () => {
                       setCwd(project.path);
                       setWorkspacePath("");
@@ -2360,7 +2388,7 @@ const styles = StyleSheet.create({
   resumePreview: { color: color.textDim, fontSize: 11.5 },
   resumeMeta: { color: color.textFaint, fontSize: 10 },
   cwdLabel: { marginTop: space.xs },
-  createBtnText: { color: "#0A0A0C", fontSize: 15, fontWeight: "700" },
+  createBtnText: { color: color.onAccent, fontSize: 15, fontWeight: "700" },
   btnDisabled: { opacity: 0.45 },
   center: { flex: 1, alignItems: "center", justifyContent: "center" },
   dim: font.sub,

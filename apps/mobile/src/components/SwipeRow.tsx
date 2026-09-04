@@ -15,6 +15,8 @@ export interface SwipeAction {
   /** SF Symbol;Icon 组件自带非 iOS 回落 */
   symbol: IconName;
   color: string;
+  /** Action foreground; use theme onAccent when the background is the accent token. */
+  foregroundColor?: string;
   onPress: () => void;
   /** 需要二次确认(不可逆动作) */
   confirm?: { title: string; message: string; confirmLabel: string };
@@ -71,8 +73,8 @@ export function SwipeRow({
                 ]}
                 onPress={() => run(action)}
               >
-                <Icon name={action.symbol} size={18} color="#fff" />
-                <Text style={styles.actionLabel}>{action.label}</Text>
+                <Icon name={action.symbol} size={18} color={action.foregroundColor ?? "#fff"} />
+                <Text style={[styles.actionLabel, { color: action.foregroundColor ?? "#fff" }]}>{action.label}</Text>
               </Pressable>
             ))}
           </View>
@@ -119,6 +121,6 @@ const styles = StyleSheet.create({
     gap: 4,
   },
   actionPressed: { opacity: 0.75 },
-  actionLabel: { color: "#fff", fontSize: 11, fontWeight: "600" },
+  actionLabel: { fontSize: 11, fontWeight: "600" },
   confirmMessage: { ...font.sub, color: color.textDim, lineHeight: 20 },
 });

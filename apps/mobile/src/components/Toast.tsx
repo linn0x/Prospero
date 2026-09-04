@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { Animated, StyleSheet, Text } from "react-native";
 
+import { color } from "@/lib/theme";
+
 /**
  * 一句话的短提示。
  *
@@ -52,7 +54,7 @@ const styles = StyleSheet.create({
     position: "absolute",
     bottom: 90,
     alignSelf: "center",
-    backgroundColor: "#2a2a33",
+    backgroundColor: color.text,
     paddingHorizontal: 16,
     paddingVertical: 9,
     borderRadius: 18,
@@ -61,5 +63,5 @@ const styles = StyleSheet.create({
     shadowRadius: 8,
     shadowOffset: { width: 0, height: 2 },
   },
-  text: { color: "#e8e8ee", fontSize: 13 },
+  text: { color: color.bg, fontSize: 13 },
 });

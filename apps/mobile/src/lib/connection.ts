@@ -97,7 +97,7 @@ import { useApp } from "./store";
 
 export type { DeliveryResult } from "./outbound-queue";
 
-const APP_VERSION = "0.0.13";
+const APP_VERSION = "0.0.19";
 const ATTEMPT_TIMEOUT_MS = 6000;
 const BACKOFF_MIN = 400;
 const BACKOFF_MAX = 8000;

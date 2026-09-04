@@ -12,6 +12,12 @@ import { SymbolView, type SymbolViewProps } from "expo-symbols";
  */
 export type IconName =
   | "magnifyingglass"
+  | "gearshape.fill"
+  | "pencil"
+  | "bell.fill"
+  | "circle.lefthalf.filled"
+  | "clock.fill"
+  | "network"
   | "plus"
   | "arrow.up"
   | "mic.fill"
@@ -48,6 +54,12 @@ export type IconName =
 
 const FALLBACK: Record<IconName, string> = {
   magnifyingglass: "🔍",
+  "gearshape.fill": "⚙",
+  pencil: "✎",
+  "bell.fill": "●",
+  "circle.lefthalf.filled": "◐",
+  "clock.fill": "◷",
+  network: "⌁",
   plus: "＋",
   "arrow.up": "↑",
   "mic.fill": "🎙",
@@ -86,6 +98,12 @@ type MaterialIconName = ComponentProps<typeof MaterialIcons>["name"];
 
 const ANDROID_ICON: Record<IconName, MaterialIconName> = {
   magnifyingglass: "search",
+  "gearshape.fill": "settings",
+  pencil: "edit",
+  "bell.fill": "notifications",
+  "circle.lefthalf.filled": "brightness-6",
+  "clock.fill": "history",
+  network: "router",
   plus: "add",
   "arrow.up": "arrow-upward",
   "mic.fill": "mic",

@@ -1677,7 +1677,7 @@ const styles = StyleSheet.create({
     backgroundColor: color.accent,
   },
   selectionDisabled: { opacity: 0.42 },
-  selectionPrimaryText: { color: color.bg, fontSize: 13, fontWeight: "700" },
+  selectionPrimaryText: { color: color.onAccent, fontSize: 13, fontWeight: "700" },
   selectionSecondary: {
     minHeight: 42,
     paddingHorizontal: 14,
