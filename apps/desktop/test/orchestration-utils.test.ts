@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { JsonObject } from "../src/shared/types";
-import { deriveTaskBoardStates, prioritizeWorktrees, worktreeNeedsAttention } from "../src/renderer/src/orchestration-utils";
+import { deriveTaskBoardStates, prioritizeRuns, prioritizeWorktrees, runListLabel, runTimelineItems, worktreeNeedsAttention } from "../src/renderer/src/orchestration-utils";
 
 function asset(id: string, state: string, inspectionState?: string, updatedAt = 0): JsonObject {
   return {
@@ -32,6 +32,41 @@ describe("orchestration worktree presentation", () => {
       "cleaned",
       "missing",
     ]);
+  });
+});
+
+describe("orchestration timeline presentation", () => {
+  it("merges tasks and gates into a stable newest-first timeline", () => {
+    const items = runTimelineItems(
+      [
+        { id: "task-old", createdAt: 100, updatedAt: 200 },
+        { id: "task-new", createdAt: 500 },
+      ],
+      [
+        { id: "gate-resolved", createdAt: 150, resolvedAt: 600 },
+        { id: "gate-middle", createdAt: 300 },
+      ],
+    );
+
+    expect(items.map((item) => `${item.kind}:${item.id}`)).toEqual([
+      "gate:gate-resolved",
+      "task:task-new",
+      "gate:gate-middle",
+      "task:task-old",
+    ]);
+  });
+
+  it("uses the meaningful service name for repeated crawler run prefixes", () => {
+    expect(runListLabel("Crawler POC batch x: supervise PSM gs.pop.product_growth_api with 3 APIs")).toBe("gs.pop.product_growth_api");
+    expect(runListLabel("Ship the desktop experience")).toBe("Ship the desktop experience");
+  });
+
+  it("puts active and recently updated runs first", () => {
+    expect(prioritizeRuns([
+      { id: "old-active", status: "active", updatedAt: 10 },
+      { id: "new-complete", status: "completed", updatedAt: 100 },
+      { id: "new-active", status: "active", updatedAt: 20 },
+    ]).map((run) => run["id"])).toEqual(["new-active", "old-active", "new-complete"]);
   });
 });
 

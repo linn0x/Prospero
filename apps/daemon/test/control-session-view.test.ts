@@ -134,6 +134,7 @@ describe("Mac control session views", () => {
 
       const structured = await create({ agent: "codex", kind: "structured", cwd: home });
       const viewPath = `/_prospero/control/session/${structured.id}/view`;
+      const interactPath = `/_prospero/control/session/${structured.id}/interact`;
       const toolPath = `/_prospero/control/session/${structured.id}/tool-output`;
       const usagePath = `/_prospero/control/usage?sid=${structured.id}`;
       const modesPath = `/_prospero/control/session/${structured.id}/modes`;
@@ -145,6 +146,13 @@ describe("Mac control session views", () => {
       expect((await fetch(`${base}${toolPath}?callId=tool-alpha`)).status).toBe(401);
       expect((await fetch(`${base}${usagePath}`)).status).toBe(401);
       expect((await fetch(`${base}/_prospero/control/launch/models?agent=codex`)).status).toBe(401);
+
+      const largeInteraction = await request(interactPath, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ type: "approval.policy.set", policy: "standard", padding: "x".repeat(4 * 1024 * 1024) }),
+      });
+      expect(largeInteraction.status).toBe(204);
 
       const usage = await request(usagePath);
       expect(usage.status).toBe(200);

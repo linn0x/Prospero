@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  getTerminalEmptyFrameDelay,
   terminalClipboardAction,
   terminalShortcutAction,
 } from "../src/renderer/src/TerminalPane";
@@ -17,6 +18,11 @@ function key(overrides: Partial<KeyboardEvent> = {}): Pick<KeyboardEvent, "type"
 }
 
 describe("terminal clipboard shortcuts", () => {
+  it("backs off when an older daemon returns an immediate empty frame", () => {
+    expect(getTerminalEmptyFrameDelay(5)).toBe(650);
+    expect(getTerminalEmptyFrameDelay(20_000)).toBe(0);
+  });
+
   it("uses native Command shortcuts on macOS without swallowing Control-C", () => {
     expect(terminalClipboardAction(key({ metaKey: true }), true)).toBe("copy");
     expect(terminalClipboardAction(key({ metaKey: true, code: "KeyV" }), true)).toBe("paste");

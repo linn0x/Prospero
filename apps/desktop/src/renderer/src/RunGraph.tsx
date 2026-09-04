@@ -350,7 +350,7 @@ function drawArrow(context: CanvasRenderingContext2D, point: Point, color: strin
   context.restore();
 }
 
-export function RunGraph({ runId, tasks, dispatches }: { runId: string; tasks: JsonObject[]; dispatches: JsonObject[] }) {
+export function RunGraph({ runId, tasks, dispatches, onActivateTask }: { runId: string; tasks: JsonObject[]; dispatches: JsonObject[]; onActivateTask?: (taskId: string) => void }) {
   const { t, status } = useLocale();
   const graphKey = useMemo(() => structuralKey(tasks), [tasks]);
   const layoutCache = useRef<{ key: string; layout: Layout } | undefined>(undefined);
@@ -579,7 +579,9 @@ export function RunGraph({ runId, tasks, dispatches }: { runId: string; tasks: J
   };
 
   const positions = useMemo(() => new Map(layout.nodes.map((node) => [node.id, node])), [layout]);
+  const overviewMode = layout.nodes.length > 240 && transform.zoom < 0.14;
   const visibleNodes = useMemo(() => {
+    if (overviewMode) return [];
     // 节点始终按矢量绘制:它们在一个 scale(zoom) 的容器里,缩放本来就是矢量的,
     // 文字和描边跟着一起缩。视口裁剪保留 —— 那只影响 DOM 数量,不改变观感。
     const visible = visibleRect(viewport, transform, Math.max(NODE_WIDTH, NODE_HEIGHT));
@@ -590,7 +592,7 @@ export function RunGraph({ runId, tasks, dispatches }: { runId: string; tasks: J
       node.y + NODE_HEIGHT,
       visible,
     ));
-  }, [layout, transform, viewport]);
+  }, [layout, overviewMode, transform, viewport]);
 
   // 主画布只分配可视区大小，避免超大 DAG 创建几万像素的 bitmap。
   useLayoutEffect(() => {
@@ -625,7 +627,6 @@ export function RunGraph({ runId, tasks, dispatches }: { runId: string; tasks: J
     const danger = cssColor(styles, "--run-graph-failed", "#c7484f");
     const visible = visibleRect(viewport, transform, 40 / transform.zoom);
 
-    const overviewMode = layout.nodes.length > 240 && transform.zoom < 0.14;
     if (overviewMode) {
       context.save();
       context.strokeStyle = muted;
@@ -638,6 +639,29 @@ export function RunGraph({ runId, tasks, dispatches }: { runId: string; tasks: J
         context.lineTo(edge.to.x, edge.to.y);
       }
       context.stroke();
+      context.restore();
+      const colors: Record<NodeState, string> = {
+        ready: primary,
+        running,
+        done: success,
+        superseded: info,
+        failed: danger,
+        blocked,
+        cancelled: muted,
+        waiting: muted,
+      };
+      const radius = Math.max(4, 2.2 / transform.zoom);
+      context.save();
+      context.globalAlpha = 0.9;
+      for (const node of layout.nodes) {
+        if (!rectsIntersect(node.x, node.y, node.x + NODE_WIDTH, node.y + NODE_HEIGHT, visible)) continue;
+        const task = taskById.get(node.id);
+        if (!task) continue;
+        context.fillStyle = colors[taskState(task, done, activeWorkers, parentIds)];
+        context.beginPath();
+        context.arc(node.x + NODE_WIDTH / 2, node.y + NODE_HEIGHT / 2, radius, 0, Math.PI * 2);
+        context.fill();
+      }
       context.restore();
     } else {
       for (const edge of layout.edges) {
@@ -694,7 +718,7 @@ export function RunGraph({ runId, tasks, dispatches }: { runId: string; tasks: J
       }
     }
 
-  }, [activeWorkers, done, layout, parentIds, positions, selected, t, taskById, transform, viewport]);
+  }, [activeWorkers, done, layout, overviewMode, parentIds, positions, selected, t, taskById, transform, viewport]);
 
   useLayoutEffect(() => {
     const canvas = minimapCanvasRef.current;
@@ -703,8 +727,10 @@ export function RunGraph({ runId, tasks, dispatches }: { runId: string; tasks: J
     const width = host.clientWidth;
     const height = host.clientHeight;
     const dpr = window.devicePixelRatio || 1;
-    canvas.width = Math.max(1, Math.round(width * dpr));
-    canvas.height = Math.max(1, Math.round(height * dpr));
+    const pixelWidth = Math.max(1, Math.round(width * dpr));
+    const pixelHeight = Math.max(1, Math.round(height * dpr));
+    if (canvas.width !== pixelWidth) canvas.width = pixelWidth;
+    if (canvas.height !== pixelHeight) canvas.height = pixelHeight;
     const context = canvas.getContext("2d");
     if (!context) return;
     context.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -728,7 +754,10 @@ export function RunGraph({ runId, tasks, dispatches }: { runId: string; tasks: J
     context.globalAlpha = 0.72;
     context.beginPath();
     for (const node of layout.nodes) {
-      context.arc(offset.x + (node.x + NODE_WIDTH / 2) * scale, offset.y + (node.y + NODE_HEIGHT / 2) * scale, 1.5, 0, Math.PI * 2);
+      const x = offset.x + (node.x + NODE_WIDTH / 2) * scale;
+      const y = offset.y + (node.y + NODE_HEIGHT / 2) * scale;
+      context.moveTo(x + 1.5, y);
+      context.arc(x, y, 1.5, 0, Math.PI * 2);
     }
     context.fill();
     context.globalAlpha = 1;
@@ -831,7 +860,10 @@ export function RunGraph({ runId, tasks, dispatches }: { runId: string; tasks: J
                 aria-pressed={selected === node.id}
                 onPointerDown={(event) => event.stopPropagation()}
                 onDoubleClick={(event) => event.stopPropagation()}
-                onClick={() => setSelected((current) => current === node.id ? undefined : node.id)}
+                onClick={() => {
+                  setSelected((current) => current === node.id ? undefined : node.id);
+                  onActivateTask?.(node.id);
+                }}
               >
                 <strong>{text(task["title"], t("未命名任务", "Untitled task"))}</strong>
                 <span className="run-graph-node-meta">

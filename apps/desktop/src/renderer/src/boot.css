@@ -1,0 +1,33 @@
+:root {
+  color-scheme: light;
+  --boot-background: #f3f6fb;
+  --boot-border: #c9d3e2;
+  --boot-accent: #4c7dff;
+  --boot-text: #66728a;
+  --boot-danger: #c7484f;
+  --boot-danger-soft: #fde9ea;
+  font-family: "Segoe UI Variable Text", "PingFang SC", "Microsoft YaHei UI", system-ui, sans-serif;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+body { background: var(--boot-background); color: var(--boot-text); font-size: 13px; }
+button { font: inherit; color: inherit; }
+.boot-screen { width: 100%; height: 100%; display: grid; place-content: center; justify-items: center; gap: 12px; padding: 24px; text-align: center; }
+.boot-screen p { max-width: 520px; margin: 0; color: var(--boot-danger); font-size: 11px; overflow-wrap: anywhere; }
+.boot-screen button { min-width: 88px; padding: 7px 10px; border: 1px solid var(--boot-border); border-radius: 7px; background: transparent; cursor: pointer; }
+.boot-mark { width: 28px; height: 28px; border: 3px solid var(--boot-border); border-top-color: var(--boot-accent); border-radius: 50%; animation: boot-spin .8s linear infinite; }
+.boot-error-mark { display: grid; width: 32px; height: 32px; place-items: center; color: var(--boot-danger); border: 1px solid var(--boot-danger); border-radius: 50%; background: var(--boot-danger-soft); font-weight: 700; }
+@keyframes boot-spin { to { transform: rotate(360deg); } }
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --boot-background: #0f1624;
+    --boot-border: #3a4a69;
+    --boot-accent: #6d92ff;
+    --boot-text: #9aa8bd;
+    --boot-danger: #e16767;
+    --boot-danger-soft: #e167671a;
+  }
+}

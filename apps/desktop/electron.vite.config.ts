@@ -6,12 +6,12 @@ import { defineConfig, externalizeDepsPlugin } from "electron-vite";
 export default defineConfig({
   main: {
     plugins: [externalizeDepsPlugin()],
-    build: { sourcemap: true },
+    build: { sourcemap: false },
   },
   preload: {
     plugins: [externalizeDepsPlugin()],
     build: {
-      sourcemap: true,
+      sourcemap: false,
       rollupOptions: {
         output: { format: "cjs", entryFileNames: "[name].js" },
       },
@@ -25,6 +25,6 @@ export default defineConfig({
         "@": resolve("src/renderer/src"),
       },
     },
-    build: { sourcemap: true },
+    build: { sourcemap: false },
   },
 });

@@ -107,4 +107,48 @@ describe("desktop snapshot patches", () => {
 
     expect(applyDesktopSnapshotPatch(current, combined).daemon.sessions).toEqual([second, first]);
   });
+
+  it("patches orchestration entities without replacing unchanged records", () => {
+    const base = snapshot();
+    const run = { id: "run-1", status: "active" };
+    const first = { id: "task-1", runId: "run-1", status: "pending" };
+    const second = { id: "task-2", runId: "run-1", status: "pending" };
+    const previous = {
+      ...base,
+      orchestration: { ...base.orchestration, runs: [run], tasks: [first, second] },
+    };
+    const changedSecond = { ...second, status: "done" };
+    const next = {
+      ...previous,
+      orchestration: { ...previous.orchestration, tasks: [first, changedSecond] },
+    };
+
+    const patch = diffDesktopSnapshot(previous, next);
+
+    expect(patch).toEqual({ orchestrationDelta: { tasks: { upserts: [changedSecond] } } });
+    const applied = applyDesktopSnapshotPatch(previous, patch);
+    expect(applied.orchestration.runs).toBe(previous.orchestration.runs);
+    expect(applied.orchestration.tasks[0]).toBe(first);
+    expect(applied.orchestration.tasks[1]).toBe(changedSecond);
+  });
+
+  it("merges orchestration upserts and removals received before initialization", () => {
+    const combined = mergeDesktopSnapshotPatches(
+      { orchestrationDelta: { tasks: { upserts: [{ id: "task-1", status: "pending" }] } } },
+      {
+        orchestrationDelta: {
+          tasks: {
+            upserts: [{ id: "task-2", status: "done" }],
+            removedIds: ["task-1"],
+            order: ["task-2"],
+          },
+        },
+      },
+    );
+    const current = snapshot();
+
+    expect(applyDesktopSnapshotPatch(current, combined).orchestration.tasks).toEqual([
+      { id: "task-2", status: "done" },
+    ]);
+  });
 });

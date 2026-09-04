@@ -407,6 +407,27 @@ describe("daemon 全链路", () => {
     expect(server.orchestration.store.listTasks(createdRun.id)).toContainEqual(
       expect.objectContaining({ title: "Mac 创建任务", status: "pending" }),
     );
+    const createdTask = server.orchestration.store.listTasks(createdRun.id)[0]!;
+    const taskDetailUrl = `http://127.0.0.1:${String(server.port)}/_prospero/control/orchestration/task/${createdTask.id}`;
+    expect((await fetch(taskDetailUrl)).status).toBe(401);
+    const taskDetailResponse = await fetch(taskDetailUrl, {
+      headers: { authorization: `Bearer ${status.controlToken}` },
+    });
+    expect(taskDetailResponse.status).toBe(200);
+    expect(await taskDetailResponse.json()).toMatchObject({
+      id: createdTask.id,
+      spec: "验证本机控制 token 保护的写入",
+    });
+    const runTasksResponse = await fetch(
+      `http://127.0.0.1:${String(server.port)}/_prospero/control/orchestration/run/${createdRun.id}/tasks`,
+      { headers: { authorization: `Bearer ${status.controlToken}` } },
+    );
+    expect(runTasksResponse.status).toBe(200);
+    const runTasksBody = await runTasksResponse.json() as { items: Array<Record<string, unknown>> };
+    expect(runTasksBody).toMatchObject({
+      items: [expect.objectContaining({ id: createdTask.id })],
+    });
+    expect(runTasksBody.items[0]).not.toHaveProperty("result");
 
     // PTY worker.create 最初返回的是 starting；worker.start 会等待首帧/quiet
     // window 后再写 prompt，HTTP 响应必须重新读取同一 sid 的实时状态，不能把

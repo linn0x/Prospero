@@ -18,15 +18,29 @@ function writeJson(home: string, name: string, value: JsonObject): void {
 }
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
   for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true });
 });
 
 describe("Electron state snapshot caching", () => {
+  it("reads settings without constructing the full desktop snapshot", () => {
+    const home = testHome();
+    writeJson(home, "desktop.json", {
+      settings: { theme: "dark" },
+    });
+    const store = new StateStore(home);
+    const settings = store.settingsSnapshot();
+
+    expect(settings.theme).toBe("dark");
+    settings.theme = "light";
+    expect(store.settingsSnapshot().theme).toBe("dark");
+  });
+
   it("reuses the snapshot while external inputs are unchanged", () => {
     const home = testHome();
     writeJson(home, "config.json", { port: 7423 });
-    writeJson(home, "orchestration.json", { runs: [{ id: "run-1" }] });
+    writeJson(home, "orchestration-desktop.json", { version: 1, runs: [{ id: "run-1" }] });
     const store = new StateStore(home);
 
     const first = store.snapshot();
@@ -37,11 +51,11 @@ describe("Electron state snapshot caching", () => {
 
   it("publishes changed external JSON once and then becomes stable again", () => {
     const home = testHome();
-    writeJson(home, "orchestration.json", { runs: [{ id: "run-1" }] });
+    writeJson(home, "orchestration-desktop.json", { version: 1, runs: [{ id: "run-1" }] });
     const store = new StateStore(home);
     const first = store.snapshot();
 
-    writeJson(home, "orchestration.json", { runs: [{ id: "run-1" }, { id: "run-2" }] });
+    writeJson(home, "orchestration-desktop.json", { version: 1, runs: [{ id: "run-1" }, { id: "run-2" }] });
     const changed = store.snapshot();
 
     expect(changed).not.toBe(first);
@@ -49,10 +63,51 @@ describe("Electron state snapshot caching", () => {
     expect(store.snapshot()).toBe(changed);
   });
 
+  it("reads the compact desktop orchestration projection", () => {
+    const home = testHome();
+    writeJson(home, "orchestration.json", {
+      runs: { "run-1": { id: "run-1", objective: "full" } },
+      tasks: { "task-1": { id: "task-1", runId: "run-1", spec: "full task specification" } },
+    });
+    writeJson(home, "orchestration-desktop.json", {
+      version: 1,
+      runs: [{ id: "run-1", objective: "compact" }],
+      tasks: [{ id: "task-1", runId: "run-1", spec: "preview", specTruncated: true }],
+      dispatches: [],
+      gates: [],
+      worktreeAssets: [],
+    });
+    const store = new StateStore(home);
+
+    expect(store.snapshot().orchestration.runs[0]?.["objective"]).toBe("compact");
+    expect(store.snapshot().orchestration.tasks[0]?.["spec"]).toBe("preview");
+  });
+
+  it("uses an available projection without synchronously reading the full source", () => {
+    const home = testHome();
+    writeJson(home, "orchestration-desktop.json", {
+      version: 1,
+      runs: [{ id: "run-1", objective: "stale" }],
+    });
+    writeJson(home, "orchestration.json", {
+      runs: [{ id: "run-1", objective: "current" }],
+    });
+    expect(new StateStore(home).snapshot().orchestration.runs[0]?.["objective"]).toBe("stale");
+  });
+
+  it("does not read the full orchestration source when no projection exists", () => {
+    const home = testHome();
+    writeJson(home, "orchestration.json", {
+      runs: [{ id: "run-1", objective: "full" }],
+    });
+
+    expect(new StateStore(home).snapshot().orchestration.runs).toEqual([]);
+  });
+
   it("keeps unchanged top-level slices stable across external updates", () => {
     const home = testHome();
     writeJson(home, "status.json", { port: 7423, sessions: [] });
-    writeJson(home, "orchestration.json", { runs: [{ id: "run-1" }] });
+    writeJson(home, "orchestration-desktop.json", { version: 1, runs: [{ id: "run-1" }] });
     const store = new StateStore(home);
     const first = store.snapshot();
 
@@ -101,6 +156,25 @@ describe("Electron state snapshot caching", () => {
     expect(emitted).toBe(updated);
     expect(updated.settings.theme).toBe("dark");
     expect(store.snapshot()).toBe(updated);
+  });
+
+  it("batches log updates and bounds a single unbroken line", () => {
+    vi.useFakeTimers();
+    const store = new StateStore(testHome());
+    store.snapshot();
+    let changes = 0;
+    store.on("changed", () => { changes += 1; });
+
+    store.appendLog("first");
+    store.appendLog("second");
+    expect(changes).toBe(0);
+    vi.advanceTimersByTime(120);
+    expect(changes).toBe(1);
+    expect(store.snapshot().logs).toBe("firstsecond");
+
+    store.appendLog("x".repeat(600_000));
+    vi.advanceTimersByTime(120);
+    expect(store.snapshot().logs).toHaveLength(500_000);
   });
 
   it("detects daemon liveness changes even when status.json is unchanged", () => {

@@ -119,6 +119,24 @@ export type SkillInfo = {
   scope: string;
 };
 
+export type OrchestrationSnapshot = {
+  runs: JsonObject[];
+  tasks: JsonObject[];
+  dispatches: JsonObject[];
+  gates: JsonObject[];
+  worktreeAssets: JsonObject[];
+};
+
+export type JsonEntityCollectionPatch = {
+  upserts?: JsonObject[];
+  removedIds?: string[];
+  order?: string[];
+};
+
+export type OrchestrationSnapshotPatch = Partial<
+  Record<keyof OrchestrationSnapshot, JsonEntityCollectionPatch>
+>;
+
 export type DesktopSnapshot = {
   daemon: DaemonSnapshot;
   projects: string[];
@@ -131,13 +149,7 @@ export type DesktopSnapshot = {
   workflowTemplates: WorkflowTemplate[];
   devices: DeviceInfo[];
   accounts: JsonObject[];
-  orchestration: {
-    runs: JsonObject[];
-    tasks: JsonObject[];
-    dispatches: JsonObject[];
-    gates: JsonObject[];
-    worktreeAssets: JsonObject[];
-  };
+  orchestration: OrchestrationSnapshot;
   logs: string;
   settings: DesktopSettings;
 };
@@ -156,8 +168,10 @@ export type DaemonSnapshotPatch = Omit<Partial<DaemonSnapshot>, "sessions"> & {
 };
 
 /** Top-level snapshot slices sent after the initial full snapshot. */
-export type DesktopSnapshotPatch = Omit<Partial<DesktopSnapshot>, "daemon"> & {
+export type DesktopSnapshotPatch = Omit<Partial<DesktopSnapshot>, "daemon" | "orchestration"> & {
   daemon?: DaemonSnapshotPatch;
+  orchestration?: OrchestrationSnapshot;
+  orchestrationDelta?: OrchestrationSnapshotPatch;
 };
 
 export type SessionCreateInput = {
@@ -256,6 +270,7 @@ export type DesktopApi = {
   /** Fetch terminal/history records only when a list or search needs them. */
   listSessions(request?: SessionPageRequest): Promise<SessionPage>;
   getSessionView(sessionId: string, query?: Record<string, number>): Promise<JsonObject | null>;
+  cancelSessionView(sessionId: string): Promise<{ ok: boolean }>;
   interact(sessionId: string, message: JsonObject): Promise<void>;
   interruptSession(sessionId: string): Promise<void>;
   killSession(sessionId: string): Promise<void>;
@@ -271,13 +286,15 @@ export type DesktopApi = {
   getAgentModels(sessionId: string): Promise<AgentModelCatalog>;
   setAgentModel(sessionId: string, model: string, effort?: string): Promise<{ currentModel: string; currentEffort?: string }>;
   orchestrationAction(method: string, params: JsonObject): Promise<JsonObject>;
+  getOrchestrationTask(taskId: string): Promise<JsonObject>;
+  getOrchestrationRunTasks(runId: string): Promise<JsonObject[]>;
   saveWorkflowTemplate(template: WorkflowTemplate): Promise<DesktopSnapshot>;
   deleteWorkflowTemplate(templateId: string): Promise<DesktopSnapshot>;
   resolveGate(gateId: string, decision: string): Promise<void>;
   accountAction(message: JsonObject): Promise<JsonObject>;
   pairDevice(input: { name: string; allowShell: boolean; allowOrchestration: boolean }): Promise<{ output: string; uri?: string }>;
-  revokeDevice(name: string): Promise<{ ok: boolean; output: string }>;
+  revokeDevice(name: string): Promise<{ ok: boolean; output: string; cancelled?: boolean }>;
   relayAction(input: { action: "status" | "enable" | "disable" | "rotate-key"; url?: string }): Promise<JsonObject>;
-  updateSettings(patch: Partial<DesktopSettings>): Promise<DesktopSnapshot>;
-  clearLogs(): Promise<DesktopSnapshot>;
+  updateSettings(patch: Partial<DesktopSettings>): Promise<{ settings: DesktopSettings }>;
+  clearLogs(): Promise<{ ok: boolean; cancelled?: boolean }>;
 };
