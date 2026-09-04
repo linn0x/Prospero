@@ -1,0 +1,14 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+  <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+  <application>
+    <service
+      android:name="com.linn0x.prospero.progressoverlay.ProsperoProgressService"
+      android:exported="false"
+      android:foregroundServiceType="dataSync"
+      android:stopWithTask="false" />
+  </application>
+</manifest>

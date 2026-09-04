@@ -3,6 +3,7 @@ import {
   ActivityIndicator,
   Alert,
   Image,
+  Keyboard,
   Platform,
   Pressable,
   ScrollView,
@@ -16,6 +17,12 @@ import * as Haptics from "expo-haptics";
 import * as Linking from "expo-linking";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { KeyboardAvoidingView } from "react-native-keyboard-controller";
+import ReanimatedDrawerLayout, {
+  DrawerKeyboardDismissMode,
+  DrawerPosition,
+  DrawerType,
+  type DrawerLayoutMethods,
+} from "react-native-gesture-handler/ReanimatedDrawerLayout";
 import { useHeaderHeight } from "expo-router/build/react-navigation/elements";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Stack, router, useLocalSearchParams } from "expo-router";
@@ -38,6 +45,7 @@ import { Icon } from "@/components/Icon";
 import { KeyBar } from "@/components/KeyBar";
 import { PerfHud } from "@/components/PerfHud";
 import { QuickReplies } from "@/components/QuickReplies";
+import { SessionQuickPanel } from "@/components/SessionQuickPanel";
 import { Terminal, type TerminalHandle } from "@/components/Terminal";
 import { VoiceButton } from "@/components/VoiceButton";
 import { useAdaptiveLayout } from "@/lib/adaptive-layout";
@@ -84,6 +92,7 @@ import {
 import type { ProjectFileReference } from "@/lib/file-references";
 import {
   activeComposerToken,
+  insertComposerText,
   replaceComposerToken,
 } from "@/lib/composer-completion";
 import {
@@ -130,6 +139,19 @@ const subagentStatusText: Record<SubagentStatus, string> = {
   failed: "失败",
   stopped: "已停止",
 };
+
+const EXPANDED_COMPOSER_TOOLS: readonly {
+  label: string;
+  value: string;
+  cursorOffset?: number;
+}[] = [
+  { label: "@ 文件", value: "@" },
+  { label: "/ 命令", value: "/" },
+  { label: "$ Skill", value: "$" },
+  { label: "# 标题", value: "# " },
+  { label: "` 代码", value: "`" },
+  { label: "``` 代码块", value: "```\n\n```", cursorOffset: -4 },
+];
 
 /** 每秒刷新耗时;计时只重渲染标题,不牵动终端 WebView 与聊天列表。 */
 function useElapsed(since: number | undefined): string {
@@ -397,6 +419,7 @@ export default function SessionScreen() {
   /** 被连接层拒绝的消息留在编辑器中，直到用户确认修改或重试。 */
   const [deliveryError, setDeliveryError] = useState<string | null>(null);
   const [selection, setSelection] = useState({ start: 0, end: 0 });
+  const [composerExpanded, setComposerExpanded] = useState(false);
   const inputRef = useRef<TextInput>(null);
   const appendTranscript = useCallback((text: string): void => {
     // 使用函数式更新，转写期间用户新打的字也不会被旧闭包覆盖。
@@ -469,6 +492,8 @@ export default function SessionScreen() {
   const [images, setImages] = useState<PickedImage[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const termRef = useRef<TerminalHandle>(null);
+  const quickPanelRef = useRef<DrawerLayoutMethods>(null);
+  const [quickPanelActive, setQuickPanelActive] = useState(false);
   const [terminalFontPreference, setTerminalFontPreference] = useState<TerminalFontPreference>(
     SYSTEM_TERMINAL_FONT_PREFERENCE,
   );
@@ -528,6 +553,7 @@ export default function SessionScreen() {
       setDraftHydratedFor("");
       setDraft("");
       setSelection({ start: 0, end: 0 });
+      setComposerExpanded(false);
       setImages([]);
       setAttachmentError(null);
       void loadComposerDraft(composerScope)
@@ -631,14 +657,6 @@ export default function SessionScreen() {
   const openSwitcher = useCallback((): void => {
     setSwitcherOpen(true);
   }, []);
-
-  const openSessionFiles = useCallback((): void => {
-    router.push(`/host/${hostId}/files/${sid}`);
-  }, [hostId, sid]);
-
-  const openSessionGit = useCallback((): void => {
-    router.push(`/host/${hostId}/git/${sid}`);
-  }, [hostId, sid]);
 
   useEffect(() => {
     const sequence = ++completionSequence.current;
@@ -1106,6 +1124,21 @@ export default function SessionScreen() {
     setMenuOpen(true);
   };
 
+  const openQuickPanel = (): void => {
+    Keyboard.dismiss();
+    setQuickPanelActive(true);
+    quickPanelRef.current?.openDrawer();
+  };
+
+  const closeQuickPanel = (): void => {
+    quickPanelRef.current?.closeDrawer();
+  };
+
+  const leaveQuickPanel = (open: () => void): void => {
+    closeQuickPanel();
+    open();
+  };
+
   // 输入以 / 开头时给命令候选；@/$ 候选由 daemon 按当前项目生成。
   const commandHints =
     isChat && !isSubagent && session && composerToken?.kind === "command"
@@ -1120,6 +1153,14 @@ export default function SessionScreen() {
   const focusComposer = (cursor: number): void => {
     setSelection({ start: cursor, end: cursor });
     requestAnimationFrame(() => inputRef.current?.focus());
+  };
+
+  const insertQuickCharacter = (value: string, cursorOffset = 0): void => {
+    const next = insertComposerText(draft, selection, value);
+    setDraft(next.text);
+    setDeliveryError(null);
+    focusComposer(Math.max(0, next.cursor + cursorOffset));
+    void Haptics.selectionAsync();
   };
 
   const chooseCommand = (command: string): void => {
@@ -1138,7 +1179,69 @@ export default function SessionScreen() {
     void Haptics.selectionAsync();
   };
 
+  const quickPanelWidth = Math.min(380, Math.max(280, adaptiveLayout.width * 0.88), adaptiveLayout.width);
+  const composerSendButton = (
+    <Pressable
+      style={({ pressed }) => [
+        styles.sendBtn,
+        !canSend && styles.sendBtnDim,
+        pressed && canSend && styles.sendBtnPressed,
+      ]}
+      onPress={() => send(draft)}
+      disabled={!canSend}
+      accessibilityRole="button"
+      accessibilityLabel={
+        isChat
+          ? busyDelivery === "steer" && busy
+            ? "发送引导"
+            : busy
+              ? "加入消息队列"
+              : "发送消息"
+          : "执行命令"
+      }
+      accessibilityState={{ disabled: !canSend }}
+    >
+      <Icon
+        name="arrow.up"
+        size={17}
+        color={canSend ? color.onAccent : color.textFaint}
+        weight="semibold"
+      />
+    </Pressable>
+  );
+
   return (
+    <ReanimatedDrawerLayout
+      ref={quickPanelRef}
+      drawerPosition={DrawerPosition.RIGHT}
+      drawerType={DrawerType.FRONT}
+      drawerWidth={quickPanelWidth}
+      drawerBackgroundColor={color.surface}
+      overlayColor="rgba(0, 0, 0, 0.48)"
+      edgeWidth={28}
+      minSwipeDistance={12}
+      keyboardDismissMode={DrawerKeyboardDismissMode.ON_DRAG}
+      onDrawerOpen={() => setQuickPanelActive(true)}
+      onDrawerClose={() => setQuickPanelActive(false)}
+      renderNavigationView={() => (
+        <SessionQuickPanel
+          active={quickPanelActive}
+          connected={runtime.status === "connected"}
+          conn={conn}
+          session={session}
+          pending={pending}
+          coordinatorAvailable={coordinatorRun !== null && !isSubagent}
+          onClose={closeQuickPanel}
+          onOpenGit={() => leaveQuickPanel(() => router.push(`/host/${hostId}/git/${sid}`))}
+          onOpenFiles={() => leaveQuickPanel(() => router.push(`/host/${hostId}/files/${sid}`))}
+          onOpenCoordinator={() => {
+            if (coordinatorRun) {
+              leaveQuickPanel(() => router.push(orchestrationRoute(hostId, coordinatorRun.id)));
+            }
+          }}
+        />
+      )}
+    >
     <View style={[styles.adaptiveRoot, showSessionRail && styles.adaptiveRootSplit]}>
       {showSessionRail && (
         <FoldableSessionRail
@@ -1196,8 +1299,7 @@ export default function SessionScreen() {
           ),
           headerRight: () => (
             <View style={styles.headerRight}>
-              {/* "停止"分秒必争;文件与改动是看完回答后最常走的两步,
-                  藏进 ⋯ 会让每次查看都多一次展开。 */}
+              {/* "停止"分秒必争；文件、改动和分支统一放进右侧快捷面板。 */}
               {busy && !isSubagent && (
                 <Pressable
                   onPress={() => conn.interrupt(sid)}
@@ -1209,20 +1311,13 @@ export default function SessionScreen() {
                 </Pressable>
               )}
               <Pressable
-                onPress={openSessionFiles}
+                onPress={openQuickPanel}
                 hitSlop={8}
                 accessibilityRole="button"
-                accessibilityLabel="浏览项目文件"
+                accessibilityLabel="打开会话工具"
+                accessibilityHint="查看文件改动、Git 分支和项目文件"
               >
-                <Icon name="folder.fill" size={19} color={color.accent} />
-              </Pressable>
-              <Pressable
-                onPress={openSessionGit}
-                hitSlop={8}
-                accessibilityRole="button"
-                accessibilityLabel="查看项目改动"
-              >
-                <Icon name="arrow.triangle.branch" size={19} color={color.accent} />
+                <Icon name="square.stack.3d.up" size={20} color={color.accent} />
               </Pressable>
               <Pressable
                 onPress={openMenu}
@@ -1387,7 +1482,7 @@ export default function SessionScreen() {
           <TextInput
             style={styles.searchInput}
             placeholder="在本会话中搜索…"
-            placeholderTextColor="#5a5a66"
+            placeholderTextColor={color.textFaint}
             value={search}
             onChangeText={setSearch}
             autoFocus
@@ -1981,82 +2076,141 @@ export default function SessionScreen() {
         </View>
       )}
       <View style={[styles.composer, { paddingBottom: Math.max(insets.bottom, 8) }]}>
-        <DismissKey visible={focused} />
-        {isChat && !isSubagent && (
-          <Pressable
-            style={({ pressed }) => [styles.iconBtn, pressed && styles.composerBtnPressed]}
-            onPress={attach}
-            accessibilityRole="button"
-            accessibilityLabel="添加图片"
+        <View style={[styles.composerRow, composerExpanded && styles.composerRowExpanded]}>
+          {!composerExpanded && <DismissKey visible={focused} />}
+          {isChat && !isSubagent && !composerExpanded && (
+            <Pressable
+              style={({ pressed }) => [styles.iconBtn, pressed && styles.composerBtnPressed]}
+              onPress={attach}
+              accessibilityRole="button"
+              accessibilityLabel="添加图片"
+            >
+              <Icon name="paperclip" size={17} color={color.textDim} />
+            </Pressable>
+          )}
+          <View
+            style={[
+              styles.inputShell,
+              composerExpanded && [
+                styles.inputShellExpanded,
+                { height: Math.min(220, Math.max(160, adaptiveLayout.height * 0.22)) },
+              ],
+            ]}
           >
-            <Icon name="paperclip" size={17} color={color.textDim} />
-          </Pressable>
+            <TextInput
+              ref={inputRef}
+              style={[
+                styles.input,
+                isChat && styles.inputChat,
+                composerExpanded && styles.inputExpanded,
+                !isChat && !terminalInputEnabled && styles.inputDisabled,
+              ]}
+              placeholder={
+                isChat
+                  ? isSubagent
+                    ? `给 ${subagent?.name ?? "子 Agent"} 发消息`
+                    : busy
+                      ? busyDelivery === "steer"
+                        ? "立即引导当前任务…"
+                        : "消息将排到队尾…"
+                      : `给 ${session?.agent ?? "agent"} 发消息 · @文件 · $Skill · /命令`
+                  : terminalInputEnabled
+                    ? "输入命令，回车执行"
+                    : "主机未连接；终端输入已冻结"
+              }
+              placeholderTextColor={color.textFaint}
+              value={draft}
+              onChangeText={(next) => {
+                setDraft(next);
+                setDeliveryError(null);
+              }}
+              selection={selection}
+              onSelectionChange={(event) => setSelection(event.nativeEvent.selection)}
+              onFocus={() => { setFocused(true); }}
+              onBlur={() => { setFocused(false); }}
+              onSubmitEditing={() => send(draft)}
+              submitBehavior={isChat ? "newline" : "submit"}
+              returnKeyType={isChat ? "default" : "send"}
+              autoCapitalize="none"
+              autoCorrect={false}
+              multiline={isChat}
+              editable={isChat || terminalInputEnabled}
+              accessibilityHint={
+                !isChat && !terminalInputEnabled
+                  ? "连接恢复前不能执行命令；输入内容不会自动发送。"
+                  : undefined
+              }
+            />
+            {isChat && (
+              <Pressable
+                style={({ pressed }) => [
+                  styles.composerResizeButton,
+                  composerExpanded && styles.composerResizeButtonExpanded,
+                  pressed && styles.composerBtnPressed,
+                ]}
+                onPress={() => {
+                  setComposerExpanded((expanded) => !expanded);
+                  requestAnimationFrame(() => inputRef.current?.focus());
+                }}
+                hitSlop={10}
+                accessibilityRole="button"
+                accessibilityLabel={composerExpanded ? "收起输入框" : "放大输入框"}
+              >
+                <Icon
+                  name={
+                    composerExpanded
+                      ? "arrow.down.right.and.arrow.up.left"
+                      : "arrow.up.left.and.arrow.down.right"
+                  }
+                  size={17}
+                  color={color.textDim}
+                />
+              </Pressable>
+            )}
+          </View>
+          {isChat && !composerExpanded && <VoiceButton onTranscript={appendTranscript} />}
+          {!composerExpanded && composerSendButton}
+        </View>
+        {isChat && composerExpanded && (
+          <View style={styles.expandedComposerActions}>
+            <DismissKey visible={focused} />
+            {!isSubagent && (
+              <Pressable
+                style={({ pressed }) => [styles.iconBtn, pressed && styles.composerBtnPressed]}
+                onPress={attach}
+                accessibilityRole="button"
+                accessibilityLabel="添加图片"
+              >
+                <Icon name="paperclip" size={17} color={color.textDim} />
+              </Pressable>
+            )}
+            <ScrollView
+              horizontal
+              style={styles.composerQuickScroll}
+              keyboardShouldPersistTaps="always"
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={styles.composerQuickChars}
+            >
+              {EXPANDED_COMPOSER_TOOLS.map((tool) => (
+                <Pressable
+                  key={tool.label}
+                  style={({ pressed }) => [styles.quickChar, pressed && styles.composerBtnPressed]}
+                  onPress={() => insertQuickCharacter(tool.value, tool.cursorOffset ?? 0)}
+                  accessibilityRole="button"
+                  accessibilityLabel={`插入${tool.label}`}
+                >
+                  <Text style={styles.quickCharText}>{tool.label}</Text>
+                </Pressable>
+              ))}
+            </ScrollView>
+            <VoiceButton onTranscript={appendTranscript} />
+            {composerSendButton}
+          </View>
         )}
-        <TextInput
-          ref={inputRef}
-          style={[styles.input, isChat && styles.inputChat, !isChat && !terminalInputEnabled && styles.inputDisabled]}
-          placeholder={
-            isChat
-              ? isSubagent
-                ? `给 ${subagent?.name ?? "子 Agent"} 发消息`
-                : busy
-                ? busyDelivery === "steer"
-                  ? "立即引导当前任务…"
-                  : "消息将排到队尾…"
-                : `给 ${session?.agent ?? "agent"} 发消息 · @文件 · $Skill · /命令`
-              : terminalInputEnabled
-                ? "输入命令，回车执行"
-                : "主机未连接；终端输入已冻结"
-          }
-          placeholderTextColor={color.textFaint}
-          value={draft}
-          onChangeText={(next) => {
-            setDraft(next);
-            setDeliveryError(null);
-          }}
-          selection={selection}
-          onSelectionChange={(event) => setSelection(event.nativeEvent.selection)}
-          onFocus={() => { setFocused(true); }}
-          onBlur={() => { setFocused(false); }}
-          onSubmitEditing={() => send(draft)}
-          submitBehavior={isChat ? "newline" : "submit"}
-          returnKeyType={isChat ? "default" : "send"}
-          autoCapitalize="none"
-          autoCorrect={false}
-          multiline={isChat}
-          editable={isChat || terminalInputEnabled}
-          accessibilityHint={
-            !isChat && !terminalInputEnabled
-              ? "连接恢复前不能执行命令；输入内容不会自动发送。"
-              : undefined
-          }
-        />
-        {isChat && <VoiceButton onTranscript={appendTranscript} />}
-        <Pressable
-          style={({ pressed }) => [
-            styles.sendBtn,
-            !canSend && styles.sendBtnDim,
-            pressed && canSend && styles.sendBtnPressed,
-          ]}
-          onPress={() => send(draft)}
-          disabled={!canSend}
-          accessibilityRole="button"
-          accessibilityLabel={
-            isChat
-              ? busyDelivery === "steer" && busy
-                ? "发送引导"
-                : busy
-                  ? "加入消息队列"
-                  : "发送消息"
-              : "执行命令"
-          }
-          accessibilityState={{ disabled: !canSend }}
-        >
-          <Icon name="arrow.up" size={17} color="#fff" weight="semibold" />
-        </Pressable>
       </View>
       </KeyboardAvoidingView>
     </View>
+    </ReanimatedDrawerLayout>
   );
 }
 
@@ -2139,9 +2293,9 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     borderRadius: 10,
     paddingHorizontal: 14,
-    backgroundColor: color.accentDim,
+    backgroundColor: color.accent,
   },
-  loadRetryText: { color: "#fff", fontSize: 13, fontWeight: "700" },
+  loadRetryText: { color: color.onAccent, fontSize: 13, fontWeight: "700" },
   loadBack: {
     minHeight: 40,
     justifyContent: "center",
@@ -2210,7 +2364,7 @@ const styles = StyleSheet.create({
   },
   deepseekViewOptionActive: { backgroundColor: color.accentDim },
   deepseekViewText: { color: color.textDim, fontSize: 11.5, fontWeight: "600" },
-  deepseekViewTextActive: { color: "#fff" },
+  deepseekViewTextActive: { color: color.text },
   modeText: { color: color.text, fontSize: 13, fontWeight: "600" },
   coordinatorModeText: { color: color.accent },
   subagentModeIdentity: {
@@ -2223,7 +2377,7 @@ const styles = StyleSheet.create({
     borderRadius: 999,
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: color.accentDim,
-    backgroundColor: "#18223A",
+    backgroundColor: color.accentBg,
   },
   subagentModeDot: { width: 7, height: 7, borderRadius: 4 },
   subagentModeName: { flexShrink: 1, color: color.text, fontSize: 12, fontWeight: "700" },
@@ -2245,7 +2399,7 @@ const styles = StyleSheet.create({
     borderColor: color.border,
     backgroundColor: color.surface,
   },
-  subagentRailChipActive: { borderColor: color.accentDim, backgroundColor: "#18223A" },
+  subagentRailChipActive: { borderColor: color.accent, backgroundColor: color.accentBg },
   subagentRailDot: { width: 7, height: 7, borderRadius: 4 },
   subagentRailName: { flexShrink: 1, color: color.text, fontSize: 12, fontWeight: "700" },
   subagentRailState: { color: color.textFaint, fontSize: 9.5 },
@@ -2301,7 +2455,7 @@ const styles = StyleSheet.create({
   },
   reconnCopy: { flex: 1, flexDirection: "row", alignItems: "center", gap: 8 },
   reconnDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: color.warn },
-  reconnText: { flex: 1, color: "#EAC77C", fontSize: 12, lineHeight: 16 },
+  reconnText: { flex: 1, color: color.warn, fontSize: 12, lineHeight: 16 },
   reconnAction: { color: color.text, fontSize: 12, fontWeight: "600" },
 
   searchBar: {
@@ -2561,16 +2715,36 @@ const styles = StyleSheet.create({
   windowPct: { fontSize: 15, fontWeight: "600", fontVariant: ["tabular-nums"] },
 
   composer: {
-    flexDirection: "row",
     gap: 8,
     paddingHorizontal: 10,
     paddingTop: 8,
     paddingBottom: 10,
     backgroundColor: color.surface,
-    alignItems: "flex-end",
     borderTopWidth: StyleSheet.hairlineWidth,
     borderTopColor: color.border,
   },
+  composerRow: { flexDirection: "row", alignItems: "flex-end", gap: 8 },
+  composerRowExpanded: { flexDirection: "column", alignItems: "stretch", gap: 0 },
+  expandedComposerActions: {
+    minHeight: 44,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 7,
+  },
+  composerQuickScroll: { flex: 1 },
+  composerQuickChars: { alignItems: "center", gap: 7, paddingHorizontal: 2 },
+  quickChar: {
+    minWidth: 54,
+    height: 36,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 10,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
+    backgroundColor: color.surfaceRaised,
+    paddingHorizontal: 10,
+  },
+  quickCharText: { color: color.text, fontSize: 11.5, fontWeight: "600", fontFamily: MONOSPACE_FONT },
   iconBtn: {
     width: 40,
     height: 40,
@@ -2580,12 +2754,27 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   composerBtnPressed: { backgroundColor: color.pressed },
+  inputShell: {
+    flex: 1,
+    minWidth: 0,
+    flexDirection: "row",
+    alignItems: "stretch",
+    overflow: "hidden",
+    borderRadius: 20,
+    backgroundColor: color.surfaceRaised,
+  },
+  inputShellExpanded: {
+    flex: 0,
+    width: "100%",
+    borderRadius: 14,
+  },
   input: {
     flex: 1,
+    minWidth: 0,
     minHeight: 40,
-    backgroundColor: color.surfaceRaised,
-    borderRadius: 20,
+    backgroundColor: "transparent",
     paddingHorizontal: 14,
+    paddingRight: 8,
     paddingTop: 9,
     paddingBottom: 9,
     color: color.text,
@@ -2593,9 +2782,29 @@ const styles = StyleSheet.create({
     lineHeight: 21,
   },
   inputChat: { maxHeight: 132 },
+  inputExpanded: {
+    minHeight: 160,
+    maxHeight: 220,
+    paddingTop: 14,
+    paddingBottom: 14,
+    textAlignVertical: "top",
+  },
+  composerResizeButton: {
+    flexShrink: 0,
+    alignSelf: "flex-start",
+    width: 34,
+    height: 34,
+    marginTop: 3,
+    marginRight: 3,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 17,
+    backgroundColor: color.surface,
+  },
+  composerResizeButtonExpanded: { marginTop: 7, marginRight: 7 },
   inputDisabled: { color: color.textFaint, opacity: 0.7 },
   sendBtn: {
-    backgroundColor: color.accentDim,
+    backgroundColor: color.accent,
     borderRadius: 20,
     width: 40,
     height: 40,

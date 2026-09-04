@@ -2382,7 +2382,7 @@ const styles = StyleSheet.create({
     backgroundColor: color.accent,
   },
   inlineGateConfirmPressed: { opacity: 0.82 },
-  inlineGateConfirmText: { color: "#08101F", fontSize: 12, fontWeight: "800" },
+  inlineGateConfirmText: { color: color.onAccent, fontSize: 12, fontWeight: "800" },
   automationStatus: {
     gap: 5,
     padding: space.md,
@@ -2580,7 +2580,7 @@ const styles = StyleSheet.create({
     borderRadius: radius.md,
     backgroundColor: color.accent,
   },
-  primaryText: { color: "#08101F", fontSize: 14, fontWeight: "800" },
+  primaryText: { color: color.onAccent, fontSize: 14, fontWeight: "800" },
   primaryPressed: { opacity: 0.82 },
   disabled: { opacity: 0.35 },
   topologyFrame: {

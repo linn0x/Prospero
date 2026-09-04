@@ -1,49 +1,150 @@
-import { Platform } from "react-native";
-
-/**
- * 视觉语言的单一来源。
- *
- * 之前每个屏各写各的十六进制色和边距,结果是同一个"次要文字"在不同页面
- * 有三种灰,卡片圆角有 8/10/12 三档 —— 单看每屏都说得过去,连起来就显得脏。
- *
- * 取值原则:
- * - 层级靠【表面亮度】拉开,不靠边框。深色界面里堆边框会显得脏。
- * - 文字只有三级(主/次/弱)。第四级永远是设计没想清楚的信号。
- * - 间距走 4 的倍数,圆角只有三档。约束越少,越不容易走样。
- */
+import { createContext, useContext } from "react";
+import {
+  Appearance,
+  DynamicColorIOS,
+  Platform,
+  PlatformColor,
+  type ColorSchemeName,
+} from "react-native";
 
 /** Menlo 不随 Android 分发；monospace 会映射到设备自带的等宽字体。 */
 export const MONOSPACE_FONT = Platform.OS === "ios" ? "Menlo" : "monospace";
 
-export const color = {
-  /** 页面底色 */
-  bg: "#0A0A0C",
-  /** 卡片、输入框 */
-  surface: "#16161A",
-  /** 卡片上再叠一层(代码块、缩略图底) */
-  surfaceRaised: "#1F1F25",
-  /** 按下态 */
-  pressed: "#26262D",
-  /** 分隔线 —— 极低对比,只做暗示 */
-  border: "#26262D",
-
-  text: "#F2F2F5",
-  textDim: "#9B9BA6",
-  textFaint: "#61616B",
-
-  accent: "#7AA2F7",
-  accentDim: "#3A5BA8",
-
+/**
+ * 明暗两套视觉令牌。字符串版本用于导航主题等要求普通字符串的 API；
+ * `color` 则在原生层使用动态颜色，已有 StyleSheet 无需逐页重建也会随主题切换。
+ */
+export const darkColor = {
+  bg: "#0B0D12",
+  surface: "#151820",
+  surfaceRaised: "#20242D",
+  pressed: "#2A303B",
+  border: "#343A46",
+  text: "#F5F7FA",
+  textDim: "#C1C7D0",
+  textFaint: "#929BA8",
+  accent: "#7EA7FF",
+  accentDim: "#294A82",
+  onAccent: "#071224",
   success: "#5BC98C",
   warn: "#E5A341",
   danger: "#EF5F5F",
-
-  /** 状态点/徽标用的低饱和底色 */
   successBg: "#16301F",
   warnBg: "#33270F",
   dangerBg: "#3A1A1A",
   accentBg: "#17203A",
 } as const;
+
+export const lightColor: { [Key in keyof typeof darkColor]: string } = {
+  bg: "#F2F4F7",
+  surface: "#FFFFFF",
+  surfaceRaised: "#E8ECF2",
+  pressed: "#DCE2EA",
+  border: "#C4CBD5",
+  text: "#11151B",
+  textDim: "#404957",
+  textFaint: "#667180",
+  accent: "#315EA8",
+  accentDim: "#D7E3F8",
+  onAccent: "#FFFFFF",
+  success: "#1E7049",
+  warn: "#87530A",
+  danger: "#AD3030",
+  successBg: "#DDF1E7",
+  warnBg: "#F7E8CC",
+  dangerBg: "#F8DEDE",
+  accentBg: "#E4ECFB",
+};
+
+export type ThemePalette = { [Key in keyof typeof darkColor]: string };
+export type ThemeScheme = "light" | "dark";
+export type ThemeMode = ThemeScheme | "system";
+export type MobileTheme = { scheme: ThemeScheme; palette: ThemePalette };
+export const MobileThemeContext = createContext<MobileTheme>({
+  scheme: "dark",
+  palette: darkColor,
+});
+let lastAppliedNativeThemeMode: ThemeMode | undefined;
+
+/** 显式主题上下文用于需要在同一 React 提交内完成换色的页面。 */
+export function useMobileTheme(): MobileTheme {
+  return useContext(MobileThemeContext);
+}
+
+/** 应用主题使用用户偏好作为即时状态；系统模式才读取设备外观。 */
+export function resolveThemeScheme(
+  mode: ThemeMode,
+  systemScheme: ColorSchemeName,
+): ThemeScheme {
+  return mode === "system" ? (systemScheme === "light" ? "light" : "dark") : mode;
+}
+
+/**
+ * 在 React 提交后同步 Android uiMode。Appearance.setColorScheme 本身不会主动派发
+ * change 事件，因此固定明/暗模式的界面状态不能依赖 useColorScheme 回传。
+ */
+export function applyNativeThemeMode(mode: ThemeMode): void {
+  if (lastAppliedNativeThemeMode === mode) return;
+  lastAppliedNativeThemeMode = mode;
+  Appearance.setColorScheme(mode === "system" ? "unspecified" : mode);
+}
+
+const androidResource: Record<keyof ThemePalette, string> = {
+  bg: "prospero_bg",
+  surface: "prospero_surface",
+  surfaceRaised: "prospero_surface_raised",
+  pressed: "prospero_pressed",
+  border: "prospero_border",
+  text: "prospero_text",
+  textDim: "prospero_text_dim",
+  textFaint: "prospero_text_faint",
+  accent: "prospero_accent",
+  accentDim: "prospero_accent_dim",
+  onAccent: "prospero_on_accent",
+  success: "prospero_success",
+  warn: "prospero_warn",
+  danger: "prospero_danger",
+  successBg: "prospero_success_bg",
+  warnBg: "prospero_warn_bg",
+  dangerBg: "prospero_danger_bg",
+  accentBg: "prospero_accent_bg",
+};
+
+function adaptiveColor(name: keyof ThemePalette): string {
+  if (Platform.OS === "ios") {
+    return DynamicColorIOS({ light: lightColor[name], dark: darkColor[name] }) as unknown as string;
+  }
+  if (Platform.OS === "android") {
+    return PlatformColor(`@color/${androidResource[name]}`) as unknown as string;
+  }
+  // Web 仍有完整的深色基线；移动端的 iOS / Android 使用真正的原生动态颜色。
+  return darkColor[name];
+}
+
+export const color: ThemePalette = {
+  bg: adaptiveColor("bg"),
+  surface: adaptiveColor("surface"),
+  surfaceRaised: adaptiveColor("surfaceRaised"),
+  pressed: adaptiveColor("pressed"),
+  border: adaptiveColor("border"),
+  text: adaptiveColor("text"),
+  textDim: adaptiveColor("textDim"),
+  textFaint: adaptiveColor("textFaint"),
+  accent: adaptiveColor("accent"),
+  accentDim: adaptiveColor("accentDim"),
+  onAccent: adaptiveColor("onAccent"),
+  success: adaptiveColor("success"),
+  warn: adaptiveColor("warn"),
+  danger: adaptiveColor("danger"),
+  successBg: adaptiveColor("successBg"),
+  warnBg: adaptiveColor("warnBg"),
+  dangerBg: adaptiveColor("dangerBg"),
+  accentBg: adaptiveColor("accentBg"),
+};
+
+export function paletteForScheme(scheme: ThemeScheme): ThemePalette {
+  return scheme === "light" ? lightColor : darkColor;
+}
 
 export const space = {
   xs: 4,
@@ -60,18 +161,14 @@ export const radius = {
 } as const;
 
 export const font = {
-  /** 屏内大标题 */
   title: { fontSize: 20, fontWeight: "700" as const, color: color.text },
-  /** 卡片标题、列表主文本 */
   body: { fontSize: 15, fontWeight: "500" as const, color: color.text },
-  /** 次要说明 */
   sub: { fontSize: 13, color: color.textDim },
-  /** 元信息、时间戳 */
   meta: { fontSize: 11, color: color.textFaint },
   mono: { fontFamily: MONOSPACE_FONT, fontSize: 12, color: color.text },
 } as const;
 
-/** 会话/连接状态到颜色 —— 全 App 一套,不再各屏各写 */
+/** 会话/连接状态到颜色 —— 全 App 一套。 */
 export const statusColor: Record<string, string> = {
   running: color.warn,
   starting: color.warn,

@@ -2,6 +2,7 @@ import MaterialIcons from "@expo/vector-icons/MaterialIcons";
 import type { ComponentProps } from "react";
 import { Platform, Text, type StyleProp, type TextStyle } from "react-native";
 import { SymbolView, type SymbolViewProps } from "expo-symbols";
+import { color as themeColor } from "@/lib/theme";
 
 /**
  * 跨平台系统图标。
@@ -12,6 +13,12 @@ import { SymbolView, type SymbolViewProps } from "expo-symbols";
  */
 export type IconName =
   | "magnifyingglass"
+  | "gearshape.fill"
+  | "pencil"
+  | "bell.fill"
+  | "circle.lefthalf.filled"
+  | "clock.fill"
+  | "network"
   | "plus"
   | "arrow.up"
   | "mic.fill"
@@ -44,10 +51,18 @@ export type IconName =
   | "square.stack.3d.up"
   | "play.fill"
   | "speedometer"
-  | "arrow.triangle.branch";
+  | "arrow.triangle.branch"
+  | "arrow.up.left.and.arrow.down.right"
+  | "arrow.down.right.and.arrow.up.left";
 
 const FALLBACK: Record<IconName, string> = {
   magnifyingglass: "🔍",
+  "gearshape.fill": "⚙",
+  pencil: "✎",
+  "bell.fill": "●",
+  "circle.lefthalf.filled": "◐",
+  "clock.fill": "◷",
+  network: "⌁",
   plus: "＋",
   "arrow.up": "↑",
   "mic.fill": "🎙",
@@ -80,12 +95,20 @@ const FALLBACK: Record<IconName, string> = {
   "play.fill": "▶︎",
   speedometer: "FPS",
   "arrow.triangle.branch": "⑂",
+  "arrow.up.left.and.arrow.down.right": "⤢",
+  "arrow.down.right.and.arrow.up.left": "⤡",
 };
 
 type MaterialIconName = ComponentProps<typeof MaterialIcons>["name"];
 
 const ANDROID_ICON: Record<IconName, MaterialIconName> = {
   magnifyingglass: "search",
+  "gearshape.fill": "settings",
+  pencil: "edit",
+  "bell.fill": "notifications",
+  "circle.lefthalf.filled": "brightness-6",
+  "clock.fill": "history",
+  network: "router",
   plus: "add",
   "arrow.up": "arrow-upward",
   "mic.fill": "mic",
@@ -118,12 +141,14 @@ const ANDROID_ICON: Record<IconName, MaterialIconName> = {
   "play.fill": "play-arrow",
   speedometer: "speed",
   "arrow.triangle.branch": "call-split",
+  "arrow.up.left.and.arrow.down.right": "open-in-full",
+  "arrow.down.right.and.arrow.up.left": "close-fullscreen",
 };
 
 export function Icon({
   name,
   size = 20,
-  color = "#e8e8ee",
+  color = themeColor.text,
   weight = "regular",
   style,
 }: {
