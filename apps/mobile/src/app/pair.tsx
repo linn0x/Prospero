@@ -208,7 +208,7 @@ export default function PairScreen() {
             accessibilityLabel="添加配对电脑"
             accessibilityState={{ disabled: !manual.trim() || pairing, busy: pairing }}
           >
-            {pairing ? <ActivityIndicator size="small" color="#0A0A0C" /> : <Text style={styles.btnText}>添加</Text>}
+            {pairing ? <ActivityIndicator size="small" color={color.onAccent} /> : <Text style={styles.btnText}>添加</Text>}
           </Pressable>
         </View>
         <Text style={styles.note}>
@@ -227,7 +227,7 @@ const styles = StyleSheet.create({
   camera: { flex: 1 },
   noCam: { flex: 1, alignItems: "center", justifyContent: "center", padding: space.xl },
   permissionCard: { width: "100%", maxWidth: 360, alignItems: "center", gap: space.lg, padding: space.xl, borderRadius: radius.lg, borderWidth: StyleSheet.hairlineWidth, borderColor: "#FFFFFF20" },
-  permissionFallback: { backgroundColor: color.surface },
+  permissionFallback: { backgroundColor: color.surface, borderColor: color.border },
   noCamText: { color: color.textDim, textAlign: "center", lineHeight: 20 },
   hintWrap: { position: "absolute", bottom: 16, left: 0, right: 0, alignItems: "center" },
   hint: {
@@ -240,12 +240,12 @@ const styles = StyleSheet.create({
   },
   hintFallback: { backgroundColor: "rgba(0,0,0,0.62)" },
   hintText: {
-    color: color.text,
+    color: "#FFFFFF",
     fontSize: 12,
     textAlign: "center",
   },
   bottomPanel: { paddingHorizontal: space.md, paddingTop: space.md, gap: space.sm, borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: "#FFFFFF1A" },
-  bottomFallback: { backgroundColor: color.surface },
+  bottomFallback: { backgroundColor: color.surface, borderTopColor: color.border },
   manual: { flexDirection: "row", alignItems: "center", gap: space.sm },
   input: {
     flex: 1,
@@ -265,7 +265,7 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   btnPressed: { opacity: 0.82 },
-  btnText: { color: "#0A0A0C", fontWeight: "700" },
+  btnText: { color: color.onAccent, fontWeight: "700" },
   iconButton: { minWidth: 48, minHeight: 44, alignItems: "center", justifyContent: "center", borderRadius: radius.sm, backgroundColor: color.surfaceRaised },
   iconButtonText: { color: color.accent, fontSize: 12, fontWeight: "700" },
   disabled: { opacity: 0.45 },

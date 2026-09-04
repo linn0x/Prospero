@@ -15,6 +15,7 @@ import {
   StyleSheet,
   Text,
   TextInput,
+  useColorScheme,
   View,
   type NativeScrollEvent,
   type NativeSyntheticEvent,
@@ -536,6 +537,8 @@ function AgentWorkingIndicator({
   status: SessionStatus | SubagentStatus;
   onInterrupt?: () => void;
 }) {
+  const scheme = useColorScheme();
+  const tint = agentTint(agent, scheme);
   const waiting = status === "waiting_approval" || status === "waiting_input";
   const label = waiting
     ? status === "waiting_input"
@@ -552,8 +555,8 @@ function AgentWorkingIndicator({
       accessibilityLabel={label}
     >
       <AgentIcon agent={agent} size={14} badge />
-      {!waiting && <ActivityIndicator size="small" color={agentTint(agent)} />}
-      <Text style={[styles.agentWorkingText, { color: waiting ? color.warn : agentTint(agent) }]}>
+      {!waiting && <ActivityIndicator size="small" color={tint} />}
+      <Text style={[styles.agentWorkingText, { color: waiting ? color.warn : tint }]}>
         {label}
       </Text>
       <Text style={styles.agentWorkingHint} numberOfLines={1}>
@@ -769,9 +772,9 @@ const UserAttachmentPreview = memo(function UserAttachmentPreview({
         : "图片加载中，暂时不可点按"}
     >
       {failed ? (
-        <Icon name="photo" size={16} color="#C8D7FF" />
+        <Icon name="photo" size={16} color={color.text} />
       ) : (
-        <ActivityIndicator size="small" color="#E5EEFF" />
+        <ActivityIndicator size="small" color={color.text} />
       )}
       <Text style={styles.userAttachmentLabel} numberOfLines={2}>
         {failed
@@ -1585,7 +1588,7 @@ const styles = StyleSheet.create({
 
   userRow: { alignItems: "flex-end" },
   userBubble: {
-    backgroundColor: color.accentDim,
+    backgroundColor: color.accent,
     borderRadius: radius.lg,
     borderBottomRightRadius: 6,
     paddingHorizontal: 14,
@@ -1593,13 +1596,13 @@ const styles = StyleSheet.create({
     maxWidth: "86%",
     gap: 8,
   },
-  userText: { color: "#fff", fontSize: 15, lineHeight: 22 },
+  userText: { color: color.onAccent, fontSize: 15, lineHeight: 22 },
   userAttachments: { flexDirection: "row", flexWrap: "wrap", gap: 7 },
   userAttachmentImage: {
     width: 168,
     height: 126,
     borderRadius: 8,
-    backgroundColor: "#20345F",
+    backgroundColor: color.accentDim,
   },
   userAttachmentPlaceholder: {
     width: 168,
@@ -1609,10 +1612,10 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
     gap: 6,
-    backgroundColor: "#294375",
+    backgroundColor: color.accentDim,
   },
-  userAttachmentRetry: { borderWidth: 1, borderColor: "#8FB6FF" },
-  userAttachmentLabel: { color: "#E5EEFF", fontSize: 10.5, lineHeight: 14, textAlign: "center" },
+  userAttachmentRetry: { borderWidth: 1, borderColor: color.text },
+  userAttachmentLabel: { color: color.text, fontSize: 10.5, lineHeight: 14, textAlign: "center" },
 
   assistantRow: { gap: 7, paddingHorizontal: 2 },
   thinkingRow: { flexDirection: "row", alignItems: "center", gap: 8, paddingVertical: 4 },
@@ -1677,7 +1680,7 @@ const styles = StyleSheet.create({
     backgroundColor: color.accent,
   },
   selectionDisabled: { opacity: 0.42 },
-  selectionPrimaryText: { color: color.bg, fontSize: 13, fontWeight: "700" },
+  selectionPrimaryText: { color: color.onAccent, fontSize: 13, fontWeight: "700" },
   selectionSecondary: {
     minHeight: 42,
     paddingHorizontal: 14,
@@ -1707,7 +1710,7 @@ const styles = StyleSheet.create({
     borderTopColor: color.border,
   },
   toolResult: {
-    color: "#A9B4A9",
+    color: color.textDim,
     fontSize: 12,
     fontFamily: MONOSPACE_FONT,
     lineHeight: 18,
@@ -1722,7 +1725,7 @@ const styles = StyleSheet.create({
     backgroundColor: color.surface,
     borderRadius: radius.md,
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#254333",
+    borderColor: color.success,
     overflow: "hidden",
   },
   diffSummaryHeader: {
@@ -1810,7 +1813,7 @@ const styles = StyleSheet.create({
     backgroundColor: color.warnBg,
     borderRadius: radius.md,
     borderWidth: 1,
-    borderColor: "#624A22",
+    borderColor: color.warn,
     padding: 13,
     gap: 10,
   },
@@ -1830,12 +1833,12 @@ const styles = StyleSheet.create({
   permHeaderCopy: { flex: 1, gap: 2 },
   permKicker: { color: color.warn, fontSize: 11, fontWeight: "700" },
   permTitle: { color: color.text, fontSize: 14, fontWeight: "600", lineHeight: 20 },
-  permAction: { color: "#DABF87", fontSize: 12, fontFamily: MONOSPACE_FONT },
+  permAction: { color: color.warn, fontSize: 12, fontFamily: MONOSPACE_FONT },
   permResource: {
     color: color.text,
     fontSize: 12,
     fontFamily: MONOSPACE_FONT,
-    backgroundColor: "#1B1712",
+    backgroundColor: color.surface,
     borderRadius: 8,
     padding: 9,
     lineHeight: 17,
@@ -1843,19 +1846,19 @@ const styles = StyleSheet.create({
   permButtons: { gap: 8, marginTop: 2 },
   permPrimaryRow: { flexDirection: "row", gap: 8 },
   permBtn: { flex: 1, borderRadius: 9, paddingVertical: 11, alignItems: "center" },
-  permAllow: { backgroundColor: color.accentDim },
+  permAllow: { backgroundColor: color.accent },
   permReject: { backgroundColor: color.dangerBg },
-  permRejectText: { color: "#FF9A9A", fontSize: 13, fontWeight: "600" },
+  permRejectText: { color: color.danger, fontSize: 13, fontWeight: "600" },
   permAlways: {
     borderRadius: 9,
     paddingVertical: 10,
     alignItems: "center",
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#6D5830",
+    borderColor: color.warn,
   },
-  permAlwaysText: { color: "#DABF87", fontSize: 12, fontWeight: "500" },
+  permAlwaysText: { color: color.warn, fontSize: 12, fontWeight: "500" },
   permBtnPressed: { opacity: 0.72 },
-  permBtnText: { color: "#fff", fontSize: 13, fontWeight: "600" },
+  permBtnText: { color: color.onAccent, fontSize: 13, fontWeight: "600" },
   permResolved: { color: color.textDim, fontSize: 12, fontWeight: "500" },
 
   questionCard: {
@@ -1881,7 +1884,7 @@ const styles = StyleSheet.create({
     borderRadius: 9,
     overflow: "hidden",
   },
-  questionOptionActive: { borderColor: color.accent, backgroundColor: "#172035" },
+  questionOptionActive: { borderColor: color.accent, backgroundColor: color.accentBg },
   questionOptionSelect: {
     flexDirection: "row",
     alignItems: "flex-start",
@@ -1899,7 +1902,7 @@ const styles = StyleSheet.create({
   questionChoiceActive: { borderWidth: 4, borderColor: color.accent },
   questionOptionCopy: { flex: 1, gap: 2 },
   questionOptionLabel: { color: color.text, fontSize: 12.5, fontWeight: "500" },
-  questionOptionLabelActive: { color: "#DCE6FF" },
+  questionOptionLabelActive: { color: color.text },
   questionOptionDescription: { color: color.textDim, fontSize: 11, lineHeight: 16 },
   questionPreviewToggle: {
     alignSelf: "flex-start",
@@ -1944,13 +1947,13 @@ const styles = StyleSheet.create({
   questionCancel: { paddingHorizontal: 13, paddingVertical: 9 },
   questionCancelText: { color: color.textDim, fontSize: 12, fontWeight: "600" },
   questionSubmit: {
-    backgroundColor: color.accentDim,
+    backgroundColor: color.accent,
     borderRadius: 9,
     paddingHorizontal: 15,
     paddingVertical: 9,
   },
   questionSubmitDisabled: { opacity: 0.38 },
-  questionSubmitText: { color: "#fff", fontSize: 12, fontWeight: "700" },
+  questionSubmitText: { color: color.onAccent, fontSize: 12, fontWeight: "700" },
 
   subagentCard: {
     minHeight: 62,
@@ -1976,7 +1979,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 9,
     paddingVertical: 5,
   },
-  subagentIdentityActive: { borderColor: color.accentDim, backgroundColor: "#18223A" },
+  subagentIdentityActive: { borderColor: color.accent, backgroundColor: color.accentBg },
   subagentName: { flexShrink: 1, color: color.text, fontSize: 12, fontWeight: "700" },
   subagentRole: { maxWidth: "25%", color: color.textFaint, fontSize: 10 },
   subagentTitleSpacer: { flex: 1 },
@@ -2003,7 +2006,7 @@ const styles = StyleSheet.create({
   trajectoryDetail: { color: color.textDim, fontSize: 11, lineHeight: 16 },
 
   errorCard: { backgroundColor: color.dangerBg, borderRadius: radius.md, padding: 11, gap: 7 },
-  errorText: { color: "#F2AAAA", fontSize: 13, lineHeight: 19 },
+  errorText: { color: color.danger, fontSize: 13, lineHeight: 19 },
   retryBtn: { alignSelf: "flex-start" },
   retryText: { color: color.accent, fontSize: 12, fontWeight: "600" },
 });

@@ -243,7 +243,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
   readonly hosting = "in_process" as const;
   readonly id: string;
   readonly agent: AgentKind;
-  readonly title: string;
+  title: string;
   readonly cwd: string;
   readonly createdAt: number;
   readonly accountId: string | undefined;
@@ -278,6 +278,8 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
   private drainingQueue = false;
   private previewStateTimer: NodeJS.Timeout | null = null;
   private lastPreviewStateAt = 0;
+  /** Generic new-session labels are replaced once, by the first real user prompt. */
+  private deriveTitleFromFirstUserMessage: boolean;
 
   constructor(opts: StructuredSessionOptions) {
     super();
@@ -285,6 +287,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     this.agent = opts.agent;
     this.title = opts.title;
     this.cwd = opts.cwd;
+    this.deriveTitleFromFirstUserMessage = opts.title === titleFor(opts.agent, opts.cwd);
     this.accountId = opts.accountId ?? opts.restored?.accountId;
     this.accountName = opts.accountName ?? opts.restored?.accountName;
     this.adapter = opts.adapter;
@@ -316,13 +319,27 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
         return true;
       });
       this.log.push(...restoredEvents.slice(-MAX_EVENTS));
+      if (this.deriveTitleFromFirstUserMessage) {
+        const firstUserMessage = this.log.find(
+          (body) => body.kind === "user.message" && body.agentId === undefined && body.text.trim(),
+        );
+        if (firstUserMessage?.kind === "user.message") {
+          const restoredTitle = titleFromUserPrompt(firstUserMessage.text);
+          if (restoredTitle) {
+            this.title = restoredTitle;
+            this.deriveTitleFromFirstUserMessage = false;
+          }
+        }
+      }
       // 清理过历史时主动重建事件序号。仍持有旧游标的客户端会因 afterSeq 过大
       // 自动回退全量快照，不会按已经不连续的旧序号错误增量续传。
       this.evSeq = restoredEvents.length === restored.events.length
         ? Math.max(restored.evSeq, this.log.length)
         : this.log.length;
-      this.preview = restored.preview;
       this.previewRaw = restored.previewRaw;
+      this.preview = this.previewRaw
+        ? latestReplyPreview(this.previewRaw, PREVIEW_CHARS)
+        : restored.preview.replace(/^…+/, "").trimStart();
       this.previewMsgId = restored.previewMsgId;
       this.totals = { ...restored.totals };
       this.adapterState = { ...restored.adapterState };
@@ -740,6 +757,19 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
   private record(body: AgentEventBody): void {
     if (this.disposed) return;
     body = normalizeAgentEvent(body);
+    let titleChanged = false;
+    if (
+      this.deriveTitleFromFirstUserMessage &&
+      body.kind === "user.message" &&
+      body.agentId === undefined
+    ) {
+      const nextTitle = titleFromUserPrompt(body.text);
+      if (nextTitle) {
+        this.title = nextTitle;
+        this.deriveTitleFromFirstUserMessage = false;
+        titleChanged = true;
+      }
+    }
     this.evSeq++;
     this.log.push(body);
     if (this.log.length > MAX_EVENTS) this.log.shift();
@@ -752,7 +782,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
         this.previewMsgId = body.msgId;
         this.previewRaw = "";
       }
-      this.previewRaw = (this.previewRaw + body.delta).slice(-PREVIEW_RAW_CHARS);
+      this.previewRaw = (this.previewRaw + body.delta).slice(0, PREVIEW_RAW_CHARS);
       this.preview = latestReplyPreview(this.previewRaw, PREVIEW_CHARS);
     }
 
@@ -794,6 +824,10 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
       this.setStatus("running");
     }
 
+    if (titleChanged) {
+      this.emit("state", this.info());
+      this.emit("persist");
+    }
     if (body.kind === "text.delta" || body.kind === "subagent.updated") this.schedulePreviewState();
     this.emit("event", body, this.evSeq);
     if (body.kind === "turn.end" || body.kind === "agent.error") void this.drainQueue();
@@ -1289,13 +1323,18 @@ export function stripMarkdown(src: string): string {
     .trim();
 }
 
-/** 会话卡片展示最后一条回复的尾部；开头被截掉时用省略号明确标示。 */
+/** New conversations use the user's first prompt as their stable list title. */
+export function titleFromUserPrompt(src: string, max = 500): string {
+  return stripMarkdown(src).slice(0, max).trimEnd();
+}
+
+/** 会话卡片展示最后一条回复的开头；内容过长时只在末尾标示省略。 */
 export function latestReplyPreview(src: string, max = PREVIEW_CHARS): string {
   const plain = stripMarkdown(src);
   if (plain.length <= max) return plain;
-  let tail = plain.slice(-(max - 1));
-  // 尽量不从半个单词开始；中文没有空格时仍按字符精确保留末尾。
-  const boundary = tail.indexOf(" ");
-  if (boundary > 0 && boundary < 24) tail = tail.slice(boundary + 1);
-  return `…${tail}`;
+  let head = plain.slice(0, max - 1);
+  // 英文尽量不截断最后一个单词；中文没有空格时仍按字符精确保留开头。
+  const boundary = head.lastIndexOf(" ");
+  if (boundary > max - 24) head = head.slice(0, boundary);
+  return `${head.trimEnd()}…`;
 }

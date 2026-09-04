@@ -1,22 +1,28 @@
 import { memo, useMemo, useState } from "react";
-import { StyleSheet, Text, View } from "react-native";
+import { StyleSheet, Text, useColorScheme, View } from "react-native";
 import { WebView } from "react-native-webview";
 import type { InlineSpan } from "@/lib/markdown";
 import { mathMl } from "@/lib/math";
+import { color, paletteForScheme, type ThemePalette, type ThemeScheme } from "@/lib/theme";
 
 type TextVariant = "body" | "heading" | "headingSmall" | "quote" | "table" | "tableHeader";
 
 const variants: Record<
   TextVariant,
-  { color: string; fontSize: number; lineHeight: number; weight: number }
+  { fontSize: number; lineHeight: number; weight: number }
 > = {
-  body: { color: "#e8e8ee", fontSize: 15, lineHeight: 22, weight: 400 },
-  heading: { color: "#ffffff", fontSize: 17, lineHeight: 24, weight: 700 },
-  headingSmall: { color: "#ffffff", fontSize: 15, lineHeight: 22, weight: 700 },
-  quote: { color: "#a8a8b4", fontSize: 14, lineHeight: 21, weight: 400 },
-  table: { color: "#d8d8e1", fontSize: 12.5, lineHeight: 18, weight: 400 },
-  tableHeader: { color: "#f3f3f8", fontSize: 12.5, lineHeight: 18, weight: 700 },
+  body: { fontSize: 15, lineHeight: 22, weight: 400 },
+  heading: { fontSize: 17, lineHeight: 24, weight: 700 },
+  headingSmall: { fontSize: 15, lineHeight: 22, weight: 700 },
+  quote: { fontSize: 14, lineHeight: 21, weight: 400 },
+  table: { fontSize: 12.5, lineHeight: 18, weight: 400 },
+  tableHeader: { fontSize: 12.5, lineHeight: 18, weight: 700 },
 };
+
+function variantColor(palette: ThemePalette, variant: TextVariant): string {
+  if (variant === "quote" || variant === "table") return palette.textDim;
+  return palette.text;
+}
 
 function escapeHtml(value: string): string {
   return value
@@ -78,7 +84,12 @@ const RESIZE_SCRIPT = `
 
 function documentHtml(
   markup: string,
-  options: { display: boolean; variant: TextVariant },
+  options: {
+    display: boolean;
+    variant: TextVariant;
+    palette: ThemePalette;
+    scheme: ThemeScheme;
+  },
 ): string {
   const style = variants[options.variant];
   return `<!doctype html>
@@ -87,7 +98,7 @@ function documentHtml(
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
   <style>
-    :root { color-scheme: dark; }
+    :root { color-scheme: ${options.scheme}; }
     html, body {
       margin: 0;
       padding: 0;
@@ -98,7 +109,7 @@ function documentHtml(
       user-select: text;
     }
     body {
-      color: ${style.color};
+      color: ${variantColor(options.palette, options.variant)};
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       font-size: ${String(style.fontSize)}px;
       font-weight: ${String(style.weight)};
@@ -115,14 +126,14 @@ function documentHtml(
     }
     math { color: inherit; font-size: 1.08em; font-family: serif; }
     code, .code {
-      color: #9ad0a5;
-      background: #1a1f1b;
+      color: ${options.palette.success};
+      background: ${options.palette.successBg};
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       font-size: 0.88em;
     }
     .bold { font-weight: 700; }
     .italic { font-style: italic; }
-    .link { color: #8eb2ff; text-decoration: underline; }
+    .link { color: ${options.palette.accent}; text-decoration: underline; }
   </style>
 </head>
 <body><div id="root">${markup}</div></body>
@@ -141,9 +152,14 @@ function AutoHeightMath({
   fallback: string;
 }) {
   const lineHeight = variants[variant].lineHeight;
+  const scheme: ThemeScheme = useColorScheme() === "light" ? "light" : "dark";
+  const palette = paletteForScheme(scheme);
   const [height, setHeight] = useState(display ? 52 : lineHeight + 2);
   const [failed, setFailed] = useState(false);
-  const html = useMemo(() => documentHtml(markup, { display, variant }), [markup, display, variant]);
+  const html = useMemo(
+    () => documentHtml(markup, { display, variant, palette, scheme }),
+    [markup, display, variant, palette, scheme],
+  );
   // WebView 会把 source 对象身份变化视为新文档；高度回报触发重渲染时不能反复重载。
   const source = useMemo(() => ({ html }), [html]);
 
@@ -219,11 +235,11 @@ export const MathSpans = memo(function MathSpans({
 const styles = StyleSheet.create({
   container: { width: "100%", overflow: "hidden", backgroundColor: "transparent" },
   webView: { flex: 1, backgroundColor: "transparent" },
-  fallback: { color: "#e8e8ee", fontSize: 15, lineHeight: 22 },
+  fallback: { color: color.text, fontSize: 15, lineHeight: 22 },
   displayFallback: {
     fontFamily: "monospace",
-    color: "#d8d8e1",
-    backgroundColor: "#15151b",
+    color: color.textDim,
+    backgroundColor: color.surfaceRaised,
     padding: 8,
   },
 });

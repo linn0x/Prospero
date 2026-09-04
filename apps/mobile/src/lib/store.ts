@@ -2,6 +2,7 @@ import { create } from "zustand";
 import type { HostInfo, SessionInfo } from "@prospero/protocol";
 import type { StoredHost } from "./hosts";
 import type { ConnectionPath } from "./connection-candidates";
+import { DEFAULT_HOME_SETTINGS, type HomeSettings } from "./home-preferences";
 
 export type ConnStatus =
   | "idle"
@@ -35,7 +36,9 @@ export const emptyRuntime: HostRuntime = {
 interface AppState {
   hosts: StoredHost[];
   runtimes: Record<string, HostRuntime>;
+  homeSettings: HomeSettings;
   setHosts(hosts: StoredHost[]): void;
+  setHomeSettings(settings: HomeSettings): void;
   patchRuntime(hostId: string, patch: Partial<Omit<HostRuntime, "sessions">>): void;
   setSessions(hostId: string, sessions: SessionInfo[]): void;
   upsertSession(hostId: string, session: SessionInfo): void;
@@ -44,7 +47,9 @@ interface AppState {
 export const useApp = create<AppState>()((set) => ({
   hosts: [],
   runtimes: {},
+  homeSettings: DEFAULT_HOME_SETTINGS,
   setHosts: (hosts) => set({ hosts }),
+  setHomeSettings: (homeSettings) => set({ homeSettings }),
   patchRuntime: (hostId, patch) =>
     set((s) => ({
       runtimes: {
