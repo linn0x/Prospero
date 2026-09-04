@@ -99,7 +99,11 @@ import type { RemotePtySession } from "./pty-supervisor-client.js";
 import type { RemoteWindowsPtySession } from "./windows-pty-session.js";
 import { searchLocalConversations } from "./local-conversations.js";
 import { DAEMON_VERSION } from "./version.js";
-import { AgentAccountError, AgentAccountManager } from "./agent-accounts.js";
+import {
+  AgentAccountError,
+  AgentAccountManager,
+  type AccountCommandRunner,
+} from "./agent-accounts.js";
 import { CodexAdapter } from "./adapters/codex.js";
 import { listDiscoveredSkills } from "./composer-context.js";
 
@@ -231,6 +235,7 @@ export interface DaemonServerOptions {
     environment?: Record<string, string>,
     codexAppServerArgs?: string[],
   ) => Promise<ResumableConversation[]>;
+  accountRunner?: AccountCommandRunner;
   /**
    * Structured-session test seam. Injected adapters stay in-process, so this
    * is intentionally for deterministic daemon integration tests only.
@@ -309,7 +314,7 @@ export async function createDaemonServer(
   // `apps/daemon/bin/prospero` 是 package 安装前的本地入口；npm 安装后仍由
   // package bin 指向同一文件。每个 agent 的 PATH 都优先找到它。
   const cliBinDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "bin");
-  const accounts = new AgentAccountManager(opts.home);
+  const accounts = new AgentAccountManager(opts.home, opts.accountRunner);
   const structuredSupervisorEnabled = opts.structuredSupervisor ?? process.env["VITEST"] !== "true";
   // Freeze the POSIX executable boundary before any Unix session launcher is
   // created. Falling back to mutable dist after a snapshot error would

@@ -139,6 +139,11 @@ beforeAll(async () => {
     home,
     port: 0,
     workspaceRoot,
+    accountRunner: async (_file, args) => ({
+      stdout: args.includes("--json") ? '{"loggedIn":false}' : "Not logged in",
+      stderr: "",
+      exitCode: 0,
+    }),
     conversationSearch: async (agent, query, limit) => [{
       id: `${agent}-native-1`,
       agent,

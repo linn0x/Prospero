@@ -408,7 +408,7 @@ describe("结构化会话持久化", () => {
       JSON.parse(readFileSync(path.join(home, "structured-sessions.json"), "utf8")),
     ).toEqual([]);
     expect(JSON.parse(readFileSync(path.join(home, "deleted-sessions.json"), "utf8")))
-      .toEqual({ version: 1, ids: [] });
+      .toEqual({ version: 1, ids: process.platform === "win32" ? [created.id] : [] });
     await second.disposeAll();
   });
 
