@@ -4,7 +4,10 @@ import { describe, expect, it } from "vitest";
 
 const sourceRoot = resolve(import.meta.dirname, "../src/renderer/src");
 const app = readFileSync(resolve(sourceRoot, "App.tsx"), "utf8");
-const styles = readFileSync(resolve(sourceRoot, "styles.css"), "utf8");
+const styles = readFileSync(resolve(sourceRoot, "styles.css"), "utf8").replaceAll(
+  "\r\n",
+  "\n",
+);
 const sidebar = readFileSync(
   resolve(sourceRoot, "components/ui/sidebar.tsx"),
   "utf8",
