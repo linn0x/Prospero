@@ -54,6 +54,8 @@ describe("bounded daemon session views", () => {
   it("keeps queued message state in the desktop status projection", () => {
     const projected = toStatusSession(session("queued", 1, "running", {
       busySince: 10,
+      accountId: "profile-1",
+      accountName: "Work API",
       messageQueue: [{
         id: "queue-1",
         text: "follow up",
@@ -65,6 +67,8 @@ describe("bounded daemon session views", () => {
 
     expect(projected).toMatchObject({
       busySince: 10,
+      accountId: "profile-1",
+      accountName: "Work API",
       messageQueue: [{ id: "queue-1", text: "follow up", kind: "guide", attachmentCount: 2 }],
     });
   });
@@ -123,6 +127,7 @@ describe("bounded daemon session views", () => {
 
     status.start();
     const snapshot = JSON.parse(readFileSync(path.join(home, "status.json"), "utf8")) as {
+      capabilities: string[];
       sessions: Array<{ id: string }>;
       sessionSummary: { total: number; terminal: number; included: number; omitted: number; truncated: boolean };
     };
@@ -135,6 +140,7 @@ describe("bounded daemon session views", () => {
     }));
     expect(snapshot.sessions).toHaveLength(STATUS_RECENT_TERMINAL_LIMIT);
     expect(snapshot.sessions[0]?.id).toBe("done-003");
+    expect(snapshot.capabilities).toContain("agent.api-protocols.v1");
     status.stop();
   });
 

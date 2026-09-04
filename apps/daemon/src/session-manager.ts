@@ -339,6 +339,7 @@ export interface RestoreStructuredOptions {
 export class SessionManager extends EventEmitter<SessionManagerEvents> {
   private readonly ptySessions = new Map<string, PtySession | RemotePtySession | RemoteWindowsPtySession>();
   private readonly structuredSessions = new Map<string, StructuredSession | RemoteStructuredSession | WindowsRemoteStructuredSession>();
+  private readonly startingAccountLeases = new Map<string, number>();
   private readonly tmuxConfigFile: string | null;
   private readonly tmuxBin: string | null;
 
@@ -849,6 +850,21 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     const account = input.accountId
       ? this.resolveAccount(input.agent, input.accountId)
       : undefined;
+    if (kind === "pty" && account?.adapterAgent) {
+      throw new SessionError("OpenAI Chat Completions Profile 仅支持结构化会话", "agent_unavailable");
+    }
+    if (input.resume && account?.adapterAgent) {
+      throw new SessionError("OpenAI Chat Completions Profile 暂不支持接回 Codex 原生对话", "agent_unavailable");
+    }
+    if (input.mode === "plan" && account?.adapterAgent) {
+      throw new SessionError("OpenAI Chat Completions Profile 暂不支持 Plan 模式", "agent_unavailable");
+    }
+    if (account?.apiProfile && input.model && input.model !== account.apiProfile.model) {
+      throw new SessionError("API Profile 只能使用已配置的模型", "agent_unavailable");
+    }
+    if (account?.apiProfile && input.effort) {
+      throw new SessionError("API Profile 不支持单独覆盖推理强度", "agent_unavailable");
+    }
     if (kind === "structured" && !structuredCapable(input.agent)) {
       throw new SessionError(`agent "${input.agent}" 暂无结构化适配器`, "agent_unavailable");
     }
@@ -874,19 +890,24 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     if (input.effort && !input.model) {
       throw new SessionError("推理强度必须和启动模型一起指定", "agent_unavailable");
     }
-    return kind === "structured"
-      ? this.createStructured(
-          input.agent,
-          cwd,
-          input.approvalPolicy,
-          input.mode,
-          input.model,
-          input.effort,
-          input.agentPreset,
-          input.resume,
-          account,
-        )
-      : await this.createPty(input, cwd, account);
+    const release = input.accountId ? this.acquireAccountStart(input.accountId) : null;
+    try {
+      return kind === "structured"
+        ? await this.createStructured(
+            input.agent,
+            cwd,
+            input.approvalPolicy,
+            input.mode,
+            input.model,
+            input.effort,
+            input.agentPreset,
+            input.resume,
+            account,
+          )
+        : await this.createPty(input, cwd, account);
+    } finally {
+      release?.();
+    }
   }
 
   private async createPty(
@@ -1066,6 +1087,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
           createdAt: Date.now(),
           ...(approvalPolicy !== undefined ? { approvalPolicy } : {}),
           environment: { ...(account?.environment ?? {}), ...this.sessionEnv(id) },
+          ...(account?.adapterAgent ? { adapterAgent: account.adapterAgent } : {}),
           ...(account?.codexAppServerArgs ? { codexAppServerArgs: account.codexAppServerArgs } : {}),
           ...(account ? { accountId: account.id, accountName: account.name } : {}),
           ...(hasInitialAdapterState ? { initialAdapterState } : {}),
@@ -1104,6 +1126,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
           createdAt: Date.now(),
           ...(approvalPolicy !== undefined ? { approvalPolicy } : {}),
           environment: { ...(account?.environment ?? {}), ...this.sessionEnv(id) },
+          ...(account?.adapterAgent ? { adapterAgent: account.adapterAgent } : {}),
           ...(account?.codexAppServerArgs ? { codexAppServerArgs: account.codexAppServerArgs } : {}),
           ...(account ? { accountId: account.id, accountName: account.name } : {}),
           ...(hasInitialAdapterState ? { initialAdapterState } : {}),
@@ -1170,7 +1193,14 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     accountId?: string,
   ): Promise<AgentModelCatalog> {
     const account = accountId && agent !== "deepseek" ? this.resolveAccount(agent, accountId) : undefined;
-    const adapter = this.adapterFactory(agent);
+    if (account?.apiProfile) {
+      const model = account.apiProfile.model;
+      return {
+        models: [{ id: model, label: model, supportedEfforts: [], isDefault: true }],
+        currentModel: model,
+      };
+    }
+    const adapter = this.adapterFactory(account?.adapterAgent ?? agent);
     try {
       await adapter.start({
         cwd: os.homedir(),
@@ -1206,15 +1236,20 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     initialAdapterState?: AdapterResumeState,
     initialAccount?: AccountBinding,
   ): StructuredSession {
-    const account = restored?.accountId
-      ? this.resolveAccount(agent, restored.accountId)
-      : initialAccount;
+    let account = initialAccount;
+    if (restored?.accountId) {
+      try {
+        account = this.resolveAccount(agent, restored.accountId);
+      } catch (error) {
+        if (!restored.terminal) throw error;
+      }
+    }
     const session = new StructuredSession({
       id,
       agent,
       title,
       cwd,
-      adapter: this.adapterFactory(agent, restored?.adapterState ?? initialAdapterState),
+      adapter: this.adapterFactory(account?.adapterAgent ?? agent, restored?.adapterState ?? initialAdapterState),
       environment: { ...(account?.environment ?? {}), ...this.sessionEnv(id) },
       ...(account?.codexAppServerArgs ? { codexAppServerArgs: account.codexAppServerArgs } : {}),
       ...(account ? { accountId: account.id, accountName: account.name } : {}),
@@ -1243,19 +1278,36 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
 
   /** 用官方 CLI 打开登录终端；managed Claude 在这里生成之后要安全导入的令牌。 */
   async createAccountLogin(spec: AccountLoginSpec, cols: number, rows: number): Promise<SessionInfo> {
-    const id = randomUUID();
-    const info = await this.spawnPty(
-      id,
-      spec.binding.agent,
-      `${spec.binding.name} · 登录`,
-      os.homedir(),
-      cols,
-      rows,
-      programCommandFor(spec.command.file, spec.command.args),
-      spec.binding,
-    );
-    this.persistMeta();
-    return info;
+    const release = this.acquireAccountStart(spec.binding.id);
+    try {
+      const id = randomUUID();
+      const info = await this.spawnPty(
+        id,
+        spec.binding.agent,
+        `${spec.binding.name} · 登录`,
+        os.homedir(),
+        cols,
+        rows,
+        programCommandFor(spec.command.file, spec.command.args),
+        spec.binding,
+      );
+      this.persistMeta();
+      return info;
+    } finally {
+      release();
+    }
+  }
+
+  private acquireAccountStart(accountId: string): () => void {
+    this.startingAccountLeases.set(accountId, (this.startingAccountLeases.get(accountId) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const remaining = (this.startingAccountLeases.get(accountId) ?? 1) - 1;
+      if (remaining > 0) this.startingAccountLeases.set(accountId, remaining);
+      else this.startingAccountLeases.delete(accountId);
+    };
   }
 
   private resolveAccount(agent: AgentKind, accountId: string): AccountBinding {
@@ -1365,6 +1417,13 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       ...[...this.ptySessions.values()].map((s) => s.info()),
       ...[...this.structuredSessions.values()].map((s) => s.info()),
     ].sort((a, b) => a.createdAt - b.createdAt);
+  }
+
+  accountInUse(accountId: string): boolean {
+    if ((this.startingAccountLeases.get(accountId) ?? 0) > 0) return true;
+    return this.list().some(
+      (session) => session.accountId === accountId && session.status !== "done" && session.status !== "died",
+    );
   }
 
   /** 任意一个结构化会话;账号级查询(用量/限流)用它当入口 */

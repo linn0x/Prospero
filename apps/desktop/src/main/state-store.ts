@@ -329,6 +329,12 @@ export class StateStore extends EventEmitter {
           status: stringValue(value["status"], "unknown"),
           preview: displayTitle || stringValue(value["preview"]),
           createdAt: numberValue(value["createdAt"]),
+          ...(typeof value["accountId"] === "string" && value["accountId"].length > 0 && value["accountId"].length <= 100
+            ? { accountId: value["accountId"] }
+            : {}),
+          ...(typeof value["accountName"] === "string" && value["accountName"].length > 0 && value["accountName"].length <= 80
+            ? { accountName: value["accountName"] }
+            : {}),
           pendingPermissions: numberValue(value["pendingPermissions"]),
           pendingQuestions: numberValue(value["pendingQuestions"]),
           approvalPolicy: stringValue(value["approvalPolicy"]),
@@ -341,6 +347,9 @@ export class StateStore extends EventEmitter {
       }));
       this.hydrateSessions(sessions);
       const summary = reuseEquivalent(previous?.daemon.sessionSummary, sessionSummary(status["sessionSummary"], sessions));
+      const capabilities = arrayValue(status["capabilities"])
+        .filter((value): value is string => typeof value === "string" && value.length > 0 && value.length <= 200)
+        .slice(0, 100);
       const candidate: DaemonSnapshot = {
         running,
         managed: running && rawPid === this.managedPid,
@@ -355,6 +364,7 @@ export class StateStore extends EventEmitter {
           pty: booleanValue(persistence["pty"]),
           structured: booleanValue(persistence["structured"]),
         },
+        ...(capabilities.length > 0 ? { capabilities } : {}),
         relay: relaySnapshot(status["relay"], config["relay"]),
         sessionSummary: summary,
         sessions,

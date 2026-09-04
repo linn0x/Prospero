@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 import type { DesktopSnapshot, JsonObject } from "../src/shared/types";
 import {
   defaultSessionLaunchAccountId,
+  duplicateSessionAccountState,
   isSessionLaunchWorkspace,
   sessionLaunchAccounts,
+  sessionLaunchRequiresStructured,
   sessionLaunchWorkspaces,
 } from "../src/shared/session-launch-options";
 
@@ -77,5 +79,28 @@ describe("session launch options", () => {
     expect(defaultSessionLaunchAccountId(accounts, "codex")).toBe("work-codex");
     expect(defaultSessionLaunchAccountId(accounts, "claude")).toBe("native-claude");
     expect(defaultSessionLaunchAccountId(accounts, "shell")).toBeUndefined();
+  });
+
+  it("forces Chat Completions profiles onto the structured pane", () => {
+    const [chat, responses] = sessionLaunchAccounts([
+      { id: "chat", agent: "codex", name: "Chat", status: "signed_in", apiProfile: { protocol: "openai_chat_completions" } },
+      { id: "responses", agent: "codex", name: "Responses", status: "signed_in", apiProfile: { protocol: "openai_responses" } },
+    ], "codex");
+
+    expect(sessionLaunchRequiresStructured(chat)).toBe(true);
+    expect(sessionLaunchRequiresStructured(responses)).toBe(false);
+    expect(sessionLaunchRequiresStructured()).toBe(false);
+  });
+
+  it("never falls back when a duplicated session names an unavailable account", () => {
+    const accounts = [
+      { id: "profile-ready", status: "signed_in" },
+      { id: "profile-offline", status: "unavailable" },
+    ];
+
+    expect(duplicateSessionAccountState(accounts, {})).toBe("legacy");
+    expect(duplicateSessionAccountState(accounts, { accountId: "profile-ready" })).toBe("ready");
+    expect(duplicateSessionAccountState(accounts, { accountId: "profile-offline" })).toBe("unavailable");
+    expect(duplicateSessionAccountState(accounts, { accountId: "deleted" })).toBe("missing");
   });
 });

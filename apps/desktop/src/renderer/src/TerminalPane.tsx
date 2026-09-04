@@ -87,7 +87,6 @@ export function terminalShortcutAction(
   if (macCommand || otherClipboard) {
     if (event.code === "KeyC") return "copy";
     if (event.code === "KeyV") return "paste";
-    // 查找在两个平台都要有:mac 是 ⌘F,其它平台跟随剪贴板的 Ctrl+Shift 约定。
     if (event.code === "KeyF") return "find";
   }
   if (!macCommand) {
@@ -139,7 +138,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
   const isMac = navigator.platform.toLowerCase().includes("mac") || navigator.userAgent.includes("Macintosh");
   const shortcutHint = isMac
     ? t("⌥拖动选中 · ⌘C/⌘V 复制粘贴 · ⌘F 查找 · ⌘K 清屏", "⌥drag to select · ⌘C/⌘V copy and paste · ⌘F find · ⌘K clear")
-    : t("Ctrl+Shift+C/V 复制粘贴 · Shift+Insert 粘贴", "Ctrl+Shift+C/V copy and paste · Shift+Insert paste");
+    : t("Ctrl+Shift+C/V 复制粘贴 · Ctrl+Shift+F 查找 · Shift+Insert 粘贴", "Ctrl+Shift+C/V copy and paste · Ctrl+Shift+F find · Shift+Insert paste");
   const host = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | undefined>(undefined);
   const fitRef = useRef<FitAddon | undefined>(undefined);

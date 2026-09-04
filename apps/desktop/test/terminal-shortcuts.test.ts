@@ -70,9 +70,9 @@ describe("terminal clipboard shortcuts", () => {
   });
 
   it("opens find on both platforms", () => {
-    // ⌘F 在 mac、Ctrl+Shift+F 在其它平台 —— 查找不该只有一个平台能用。
     expect(terminalShortcutAction(key({ metaKey: true, code: "KeyF" }), true)).toBe("find");
     expect(terminalShortcutAction(key({ ctrlKey: true, shiftKey: true, code: "KeyF" }), false)).toBe("find");
+    expect(terminalShortcutAction(key({ ctrlKey: true, code: "KeyF" }), false)).toBeUndefined();
   });
 
   it("does not treat find as a clipboard action", () => {

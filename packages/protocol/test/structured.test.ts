@@ -191,12 +191,43 @@ describe("结构化轨协议", () => {
       agent: "opencode",
       name: "不支持",
     })).toThrowError(ProtocolError);
+    expect(parseC2S({
+      type: "agent.account.api.create",
+      requestId: "api-create-1",
+      agent: "codex",
+      name: "Chat API",
+      provider: "openai_compatible",
+      protocol: "openai_chat_completions",
+      baseUrl: "https://gateway.example.com/v1",
+      model: "coder",
+      apiKey: "secret",
+    })).toMatchObject({ protocol: "openai_chat_completions" });
+    expect(parseC2S({
+      type: "agent.account.api.configure",
+      requestId: "api-configure-1",
+      accountId: "account-1",
+      name: "新名称",
+      protocol: "openai_responses",
+      apiKey: "",
+    })).toMatchObject({ name: "新名称", protocol: "openai_responses", apiKey: "" });
+    expect(() => parseC2S({
+      type: "agent.account.api.create",
+      requestId: "api-create-invalid",
+      agent: "codex",
+      name: "Invalid",
+      provider: "openai_compatible",
+      protocol: "chat",
+      baseUrl: "https://gateway.example.com/v1",
+      model: "coder",
+      apiKey: "secret",
+    })).toThrowError(ProtocolError);
 
     expect(parseS2C({
       type: "agent.accounts.result",
       requestId: "account-list-1",
       action: "list",
       ok: true,
+      accountId: "created-account",
       accounts: [{
         id: "native-codex",
         agent: "codex",
@@ -209,7 +240,25 @@ describe("结构化轨协议", () => {
         updatedAt: 0,
         activeSessions: 0,
       }],
-    })).toMatchObject({ accounts: [{ id: "native-codex", status: "signed_in" }] });
+    })).toMatchObject({ accountId: "created-account", accounts: [{ id: "native-codex", status: "signed_in" }] });
+    expect(parseS2C({
+      type: "agent.accounts.result",
+      requestId: "legacy-profile",
+      action: "list",
+      ok: true,
+      accounts: [{
+        id: "profile",
+        agent: "codex",
+        name: "旧 Profile",
+        managed: true,
+        isDefault: false,
+        status: "signed_in",
+        apiProfile: { provider: "openai_compatible", baseUrl: "https://gateway.example.com/v1", model: "coder" },
+        createdAt: 1,
+        updatedAt: 1,
+        activeSessions: 0,
+      }],
+    })).toMatchObject({ accounts: [{ apiProfile: { provider: "openai_compatible" } }] });
   });
 
   it("编排快照与手机 Gate 决策可往返校验", () => {

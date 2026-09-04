@@ -12,6 +12,7 @@ import {
 import { Stack, router, useFocusEffect, useLocalSearchParams } from "expo-router";
 import type {
   AgentAccount,
+  AgentApiProtocol,
   AgentCredentialKind,
   CodeAgentKind,
   S2CMessage,
@@ -20,6 +21,12 @@ import type {
 import { AgentIcon } from "@/components/AgentIcon";
 import { Icon } from "@/components/Icon";
 import { PromptDialog } from "@/components/PromptDialog";
+import {
+  accountApiProtocolDefaults,
+  accountApiProtocolFromProfile,
+  accountApiProtocolLabel,
+  accountApiProtocolsForAgent,
+} from "@/lib/account-api-profile";
 import { useHostConnection } from "@/lib/use-host-connection";
 import { untilLabel } from "@/lib/format";
 import { color, font, quotaRemainingColor, quotaRemainingPct, radius, space } from "@/lib/theme";
@@ -62,7 +69,7 @@ type Editor =
       agent: CodeAgentKind;
       account?: AgentAccount;
       phase: "name" | "baseUrl" | "model" | "apiKey";
-      draft: { name: string; baseUrl: string; model: string };
+      draft: { name: string; protocol: AgentApiProtocol; baseUrl: string; model: string };
     }
   | null;
 
@@ -211,20 +218,65 @@ export default function AgentAccountsScreen() {
   };
 
   const openCreateApi = (agent: CodeAgentKind): void => {
-    setName("");
-    setEditor({ kind: "api", agent, phase: "name", draft: { name: "", baseUrl: "", model: "" } });
+    const open = (protocol: AgentApiProtocol): void => {
+      const defaults = accountApiProtocolDefaults(protocol);
+      setName("");
+      setEditor({
+        kind: "api",
+        agent,
+        phase: "name",
+        draft: { name: "", protocol, ...defaults },
+      });
+    };
+    const protocols = accountApiProtocolsForAgent(
+      agent,
+      conn?.supportsAgentApiProtocols === true,
+    );
+    if (conn?.supportsAgentApiProtocols !== true) {
+      open(protocols[0]!);
+      return;
+    }
+    Alert.alert("选择 API 协议", "请选择服务端实际提供的接口。", [
+      ...protocols.map((protocol) => ({
+        text: accountApiProtocolLabel(protocol),
+        onPress: () => open(protocol),
+      })),
+      { text: "取消", style: "cancel" as const },
+    ]);
   };
 
   const openConfigureApi = (account: AgentAccount): void => {
-    if (!account.apiProfile) return;
-    setName(account.apiProfile.baseUrl);
-    setEditor({
-      kind: "api",
-      agent: account.agent,
-      account,
-      phase: "baseUrl",
-      draft: { name: account.name, baseUrl: "", model: account.apiProfile.model },
-    });
+    const profile = account.apiProfile;
+    if (!profile) return;
+    const current = accountApiProtocolFromProfile(
+      account.agent,
+      profile.protocol,
+    );
+    const open = (protocol: AgentApiProtocol): void => {
+      const defaults = protocol === current
+        ? { baseUrl: profile.baseUrl, model: profile.model }
+        : accountApiProtocolDefaults(protocol);
+      setName(defaults.baseUrl);
+      setEditor({
+        kind: "api",
+        agent: account.agent,
+        account,
+        phase: "baseUrl",
+        draft: { name: account.name, protocol, ...defaults },
+      });
+    };
+    if (conn?.supportsAgentApiProtocols !== true) {
+      open(current);
+      return;
+    }
+    const protocols = accountApiProtocolsForAgent(account.agent, true);
+    Alert.alert("选择 API 协议", "更换协议会同时切换默认地址和模型。", [
+      ...protocols.map((protocol) => ({
+        text: `${protocol === current ? "✓ " : ""}${accountApiProtocolLabel(protocol)}`,
+        onPress: () => open(protocol),
+      })),
+      { text: "取消", style: "cancel" as const },
+    ]);
   };
 
   const chooseCredential = (account: AgentAccount): void => {
@@ -254,7 +306,7 @@ export default function AgentAccountsScreen() {
     } else {
       const trimmedValue = value.trim();
       if (editor.phase === "name") {
-        setName("");
+        setName(editor.draft.baseUrl);
         setEditor({ ...editor, phase: "baseUrl", draft: { ...editor.draft, name: trimmedValue } });
         return;
       }
@@ -271,13 +323,15 @@ export default function AgentAccountsScreen() {
       const result = editor.account
         ? await conn.configureAgentApiProfile(
             editor.account.id,
+            editor.draft.protocol,
             editor.draft.baseUrl,
             editor.draft.model,
-            trimmedValue,
+            trimmedValue || undefined,
           )
         : await conn.createAgentApiProfile(
             editor.agent,
             editor.draft.name,
+            editor.draft.protocol,
             editor.draft.baseUrl,
             editor.draft.model,
             trimmedValue,
@@ -414,10 +468,10 @@ export default function AgentAccountsScreen() {
                         <Text style={styles.meta}>{statusText[account.status]}</Text>
                         {account.authMethod && <Text style={styles.meta}>· {account.authMethod}</Text>}
                       </View>
-                      {account.detail && <Text style={styles.environment}>{account.detail}</Text>}
+                      {account.detail && !account.apiProfile && <Text style={styles.environment}>{account.detail}</Text>}
                       <Text style={styles.environment}>
                         {account.apiProfile
-                          ? `${account.apiProfile.provider === "openai_compatible" ? "OpenAI" : "Anthropic"} 兼容 API · ${account.apiProfile.model}\n${account.apiProfile.baseUrl}`
+                          ? `${accountApiProtocolLabel(accountApiProtocolFromProfile(account.agent, account.apiProfile.protocol))} · ${account.apiProfile.model}\n${account.apiProfile.baseUrl}`
                           : account.managed ? "Prospero 独立环境" : "现有本机环境（兼容旧会话）"}
                         {account.activeSessions > 0 ? ` · ${String(account.activeSessions)} 个活动会话` : ""}
                       </Text>
@@ -433,8 +487,16 @@ export default function AgentAccountsScreen() {
                   <View style={styles.actions}>
                     {account.apiProfile ? (
                       <>
-                        <Action label="重新配置" onPress={() => openConfigureApi(account)} disabled={busy} />
-                        <Action label="替换 API Key" onPress={() => openCredential(account, "api_key")} disabled={busy} />
+                        <Action
+                          label={account.activeSessions > 0 ? "结束会话后配置" : "重新配置"}
+                          onPress={() => openConfigureApi(account)}
+                          disabled={busy || account.activeSessions > 0}
+                        />
+                        <Action
+                          label={account.activeSessions > 0 ? "结束会话后换 Key" : "替换 API Key"}
+                          onPress={() => openCredential(account, "api_key")}
+                          disabled={busy || account.activeSessions > 0}
+                        />
                       </>
                     ) : (
                       <>
@@ -464,8 +526,8 @@ export default function AgentAccountsScreen() {
                       />
                     )}
                     {account.managed && <Action label="重命名" onPress={() => openRename(account)} disabled={busy} />}
-                    {account.status === "signed_in" && <Action label={account.apiProfile ? "移除密钥" : "注销"} onPress={() => confirmLogout(account)} disabled={busy} danger />}
-                    {account.managed && <Action label="删除" onPress={() => confirmDelete(account)} disabled={busy} danger />}
+                    {account.status === "signed_in" && <Action label={account.apiProfile && account.activeSessions > 0 ? "结束会话后移除密钥" : account.apiProfile ? "移除密钥" : "注销"} onPress={() => confirmLogout(account)} disabled={busy || Boolean(account.apiProfile && account.activeSessions > 0)} danger />}
+                    {account.managed && <Action label={account.activeSessions > 0 ? "结束会话后删除" : "删除"} onPress={() => confirmDelete(account)} disabled={busy || account.activeSessions > 0} danger />}
                   </View>
                 </View>
               );
@@ -519,12 +581,14 @@ export default function AgentAccountsScreen() {
                 : "导入 Anthropic API Key"
               : editor?.kind === "api"
                 ? editor.phase === "name"
-                  ? `新增 ${agentTitle[editor.agent]} API 配置`
+                  ? `新增 ${accountApiProtocolLabel(editor.draft.protocol)} 配置`
                   : editor.phase === "baseUrl"
                     ? "API Base URL"
                     : editor.phase === "model"
                       ? "默认模型"
-                      : "保存 API Key"
+                      : editor.account && conn?.supportsAgentApiProtocols
+                        ? "API Key（可选）"
+                        : "保存 API Key"
               : `新增 ${editor ? agentTitle[editor.agent] : ""} 账号`
         }
         message={
@@ -540,16 +604,20 @@ export default function AgentAccountsScreen() {
                 : "粘贴该账号自己的 Anthropic Console API Key。"
               : editor?.kind === "api"
                 ? editor.phase === "name"
-                  ? `${editor.agent === "codex" ? "OpenAI Responses" : "Anthropic Messages"} 兼容服务将只供这个独立环境使用。`
+                  ? `${accountApiProtocolLabel(editor.draft.protocol)} 兼容服务将只供这个独立环境使用。`
                   : editor.phase === "baseUrl"
-                    ? "输入服务 API 的根地址，例如 https://gateway.example.com/v1。"
+                    ? editor.draft.protocol === "anthropic"
+                      ? "输入 API 根地址，例如 https://api.anthropic.com，不要包含 /v1/messages。"
+                      : `输入 API 前缀，例如 https://gateway.example.com/v1，不要包含 ${editor.draft.protocol === "openai_responses" ? "/responses" : "/chat/completions"}。`
                     : editor.phase === "model"
                       ? "输入该服务中要作为默认模型使用的精确模型 ID。"
-                      : "Key 仅写入电脑端安全存储，不会保存在账号配置或聊天记录中。"
+                      : editor.account && conn?.supportsAgentApiProtocols
+                        ? "留空会保留现有 Key；新 Key 仅写入电脑端安全存储。"
+                        : "Key 仅写入电脑端安全存储，不会保存在账号配置或聊天记录中。"
               : undefined
         }
         value={name}
-        confirmLabel={editor?.kind === "credential" || editor?.kind === "api" && editor.phase === "apiKey" ? "安全保存" : editor?.kind === "rename" ? "保存" : editor?.kind === "api" ? "下一步" : "创建"}
+        confirmLabel={editor?.kind === "api" && editor.phase === "apiKey" && editor.account && conn?.supportsAgentApiProtocols ? "保存配置" : editor?.kind === "credential" || editor?.kind === "api" && editor.phase === "apiKey" ? "安全保存" : editor?.kind === "rename" ? "保存" : editor?.kind === "api" ? "下一步" : "创建"}
         secureTextEntry={editor?.kind === "credential" || editor?.kind === "api" && editor.phase === "apiKey"}
         onChangeText={setName}
         onCancel={() => {
@@ -559,7 +627,8 @@ export default function AgentAccountsScreen() {
         onSubmit={submitName}
         validate={(value) => {
           const trimmed = value.trim();
-          if (!trimmed) return editor?.kind === "credential" || editor?.kind === "api" && editor.phase === "apiKey" ? "请粘贴凭据" : "请输入内容";
+          const optionalApiKey = editor?.kind === "api" && editor.phase === "apiKey" && editor.account !== undefined && conn?.supportsAgentApiProtocols === true;
+          if (!trimmed && !optionalApiKey) return editor?.kind === "credential" || editor?.kind === "api" && editor.phase === "apiKey" ? "请粘贴凭据" : "请输入内容";
           if (editor?.kind === "api") {
             if (editor.phase === "name" && trimmed.length > 80) return "名称不能超过 80 个字符";
             if (editor.phase === "baseUrl" && (trimmed.length > 2000 || /[\r\n\0]/.test(trimmed))) return "API 地址格式不正确";

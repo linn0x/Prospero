@@ -14,6 +14,7 @@ import { randomUUID } from "expo-crypto";
 import {
   CAPABILITY_AGENT_ACCOUNTS,
   CAPABILITY_AGENT_API_PROFILES,
+  CAPABILITY_AGENT_API_PROTOCOLS,
   CAPABILITY_AGENT_DEEPSEEK_HARNESS,
   CAPABILITY_DEEPSEEK_TRAJECTORY,
   CAPABILITY_FS_PUT_ACK,
@@ -43,6 +44,7 @@ import {
   type AgentKind,
   type AgentAccount,
   type AgentAccountsResult,
+  type AgentApiProtocol,
   type AgentCredentialKind,
   type CodeAgentKind,
   type AgentEventBody,
@@ -69,6 +71,7 @@ import {
   type SecureChannel,
   type SessionKind,
 } from "@prospero/protocol";
+import { accountApiProviderForProtocol } from "./account-api-profile";
 import { diagnose, type AttemptResult, type Diagnosis } from "./connect-diagnosis";
 import {
   selectConnectionCandidates,
@@ -181,6 +184,7 @@ export class HostConnection {
     if (capability === CAPABILITY_SUBAGENT_HISTORY) return version >= 9;
     if (capability === CAPABILITY_AGENT_ACCOUNTS) return version >= 10;
     if (capability === CAPABILITY_AGENT_API_PROFILES) return version >= 12;
+    if (capability === CAPABILITY_AGENT_API_PROTOCOLS) return version >= 16;
     if (capability === CAPABILITY_CHAT_ATTACHMENT_PREVIEWS) return version >= 11;
     if (capability === CAPABILITY_SESSION_CREATE_MODEL) return version >= 11;
     if (capability === CAPABILITY_WORKSPACE_ROOTS) return false;
@@ -230,6 +234,10 @@ export class HostConnection {
 
   get supportsAgentApiProfiles(): boolean {
     return this.supportsCapability(CAPABILITY_AGENT_API_PROFILES);
+  }
+
+  get supportsAgentApiProtocols(): boolean {
+    return this.supportsCapability(CAPABILITY_AGENT_API_PROTOCOLS);
   }
 
   get supportsDeepseekHarness(): boolean {
@@ -1012,6 +1020,7 @@ export class HostConnection {
   createAgentApiProfile(
     agent: CodeAgentKind,
     name: string,
+    protocol: AgentApiProtocol,
     baseUrl: string,
     model: string,
     apiKey: string,
@@ -1022,6 +1031,9 @@ export class HostConnection {
       requestId: this.agentRequestId(),
       agent,
       name,
+      ...(this.supportsAgentApiProtocols
+        ? { provider: accountApiProviderForProtocol(protocol), protocol }
+        : {}),
       baseUrl,
       model,
       apiKey,
@@ -1030,18 +1042,25 @@ export class HostConnection {
 
   configureAgentApiProfile(
     accountId: string,
+    protocol: AgentApiProtocol,
     baseUrl: string,
     model: string,
-    apiKey: string,
+    apiKey?: string,
   ): Promise<AgentAccountsResult> {
     if (!this.supportsAgentApiProfiles) throw new Error("请先升级电脑端以使用第三方 API Profile");
+    if (!this.supportsAgentApiProtocols && !apiKey?.trim()) {
+      throw new Error("当前电脑端修改 API Profile 时需要重新输入 API Key");
+    }
     return this.accountRequest({
       type: "agent.account.api.configure",
       requestId: this.agentRequestId(),
       accountId,
+      ...(this.supportsAgentApiProtocols
+        ? { provider: accountApiProviderForProtocol(protocol), protocol }
+        : {}),
       baseUrl,
       model,
-      apiKey,
+      ...(apiKey?.trim() ? { apiKey: apiKey.trim() } : {}),
     });
   }
 

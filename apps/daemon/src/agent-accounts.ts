@@ -1,5 +1,5 @@
 import { execFile as execFileCallback, execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
   copyFileSync,
@@ -17,6 +17,7 @@ import { promisify } from "node:util";
 import type {
   AgentAccount,
   AgentApiProfile,
+  AgentApiProtocol,
   AgentApiProvider,
   AgentAccountStatus,
   AgentCredentialKind,
@@ -46,6 +47,8 @@ interface StoredAccount {
 }
 
 interface StoredApiProfile {
+  provider: AgentApiProvider;
+  protocol: AgentApiProtocol;
   baseUrl: string;
   model: string;
 }
@@ -64,6 +67,7 @@ export interface AccountBinding {
   environment: Record<string, string>;
   /** 已配置的 API Profile，不含 secret，供状态与会话启动区分。 */
   apiProfile?: AgentApiProfile;
+  adapterAgent?: "opencode";
   /** Codex app-server 的受控配置覆盖；避免修改用户的全局 config.toml。 */
   codexAppServerArgs?: string[];
   /** Never contains the secret itself; only lets status/UI describe the configured source. */
@@ -87,9 +91,12 @@ export interface AgentAccountCredential {
 }
 
 export interface ApiProfileInput {
-  baseUrl: string;
-  model: string;
-  apiKey: string;
+  name?: string;
+  provider?: AgentApiProvider;
+  protocol?: AgentApiProtocol;
+  baseUrl?: string;
+  model?: string;
+  apiKey?: string;
 }
 
 /** Injectable so tests can exercise account behavior without writing credentials to disk. */
@@ -139,7 +146,7 @@ function parseStore(value: unknown): AccountStore {
         ) {
           return [];
         }
-        const apiProfile = parseStoredApiProfile(account["apiProfile"]);
+        const apiProfile = parseStoredApiProfile(account["agent"], account["apiProfile"]);
         return [{
           id: account["id"],
           agent: account["agent"],
@@ -200,7 +207,17 @@ function apiProviderFor(agent: CodeAgentKind): AgentApiProvider {
   return agent === "codex" ? "openai_compatible" : "anthropic_compatible";
 }
 
-function cleanApiProfile(rawBaseUrl: string, rawModel: string): StoredApiProfile {
+function apiProtocolFor(agent: CodeAgentKind): AgentApiProtocol {
+  return agent === "codex" ? "openai_responses" : "anthropic";
+}
+
+function cleanApiProfile(
+  agent: CodeAgentKind,
+  rawBaseUrl: string,
+  rawModel: string,
+  provider: AgentApiProvider = apiProviderFor(agent),
+  protocol: AgentApiProtocol = apiProtocolFor(agent),
+): StoredApiProfile {
   const baseUrl = rawBaseUrl.trim();
   const model = rawModel.trim();
   if (baseUrl.length === 0 || baseUrl.length > 2000 || /[\r\n\0]/.test(baseUrl)) {
@@ -221,23 +238,44 @@ function cleanApiProfile(rawBaseUrl: string, rawModel: string): StoredApiProfile
     throw new AgentAccountError("API 地址必须使用 HTTPS（localhost 可使用 HTTP）", "account_invalid");
   }
   url.pathname = url.pathname.replace(/\/+$/, "");
+  const suffixes = protocol === "openai_responses"
+    ? ["/responses"]
+    : protocol === "openai_chat_completions"
+      ? ["/chat/completions"]
+      : ["/v1/messages", "/v1"];
+  const suffix = suffixes.find((candidate) => url.pathname.toLowerCase().endsWith(candidate));
+  if (suffix) {
+    url.pathname = url.pathname.slice(0, -suffix.length) || "/";
+  }
   const normalized = url.toString().replace(/\/$/, "");
-  return { baseUrl: normalized, model };
+  const valid = agent === "codex"
+    ? provider === "openai_compatible" && (protocol === "openai_responses" || protocol === "openai_chat_completions")
+    : provider === "anthropic_compatible" && protocol === "anthropic";
+  if (!valid) throw new AgentAccountError("所选 Agent、Provider 与 API 协议不兼容", "account_invalid");
+  return { provider, protocol, baseUrl: normalized, model };
 }
 
-function parseStoredApiProfile(value: unknown): StoredApiProfile | undefined {
+function parseStoredApiProfile(agent: CodeAgentKind, value: unknown): StoredApiProfile | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const raw = value as Record<string, unknown>;
   if (typeof raw["baseUrl"] !== "string" || typeof raw["model"] !== "string") return undefined;
   try {
-    return cleanApiProfile(raw["baseUrl"], raw["model"]);
+    const provider = raw["provider"] === "openai_compatible" || raw["provider"] === "anthropic_compatible"
+      ? raw["provider"]
+      : apiProviderFor(agent);
+    const protocol = raw["protocol"] === "openai_responses" || raw["protocol"] === "openai_chat_completions" || raw["protocol"] === "anthropic"
+      ? raw["protocol"]
+      : agent === "codex" && /\/chat\/completions\/*$/i.test(raw["baseUrl"])
+        ? "openai_chat_completions"
+        : apiProtocolFor(agent);
+    return cleanApiProfile(agent, raw["baseUrl"], raw["model"], provider, protocol);
   } catch {
     return undefined;
   }
 }
 
 function publicApiProfile(agent: CodeAgentKind, profile: StoredApiProfile): AgentApiProfile {
-  return { provider: apiProviderFor(agent), ...profile };
+  return { ...profile, provider: profile.provider ?? apiProviderFor(agent) };
 }
 
 function tomlString(value: string): string {
@@ -254,6 +292,56 @@ function codexProviderArgs(profile: StoredApiProfile): string[] {
     "-c", `model_providers.prospero.wire_api=${tomlString("responses")}`,
     "-c", "model_providers.prospero.requires_openai_auth=false",
   ];
+}
+
+function opencodeProfileEnvironment(
+  root: string,
+  profile: StoredApiProfile,
+  apiKey: string,
+): Record<string, string> {
+  const data = path.join(root, "xdg-data");
+  const cache = path.join(root, "xdg-cache");
+  const state = path.join(root, "xdg-state");
+  const config = path.join(root, "xdg-config");
+  const configDirectory = path.join(config, "opencode");
+  const configFile = path.join(configDirectory, "opencode.json");
+  for (const directory of [data, cache, state, config, configDirectory]) {
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    chmodSync(directory, 0o700);
+  }
+  const contents = JSON.stringify({
+    $schema: "https://opencode.ai/config.json",
+    model: `prospero/${profile.model}`,
+    small_model: `prospero/${profile.model}`,
+    provider: {
+      prospero: {
+        npm: "@ai-sdk/openai-compatible",
+        name: "Prospero API Profile",
+        env: ["OPENAI_API_KEY"],
+        options: {
+          baseURL: profile.baseUrl,
+        },
+        models: {
+          [profile.model]: { name: profile.model, tool_call: true },
+        },
+      },
+    },
+  });
+  let current = "";
+  try { current = readFileSync(configFile, "utf8"); } catch {}
+  if (current !== contents) writePrivateFile(configFile, contents);
+  const fingerprint = createHash("sha256").update(contents).update("\0").update(apiKey).digest("hex");
+  return {
+    XDG_DATA_HOME: data,
+    XDG_CACHE_HOME: cache,
+    XDG_STATE_HOME: state,
+    XDG_CONFIG_HOME: config,
+    OPENCODE_DISABLE_PROJECT_CONFIG: "1",
+    PROSPERO_API_PROFILE_CONFIG: configFile,
+    PROSPERO_API_PROFILE_FINGERPRINT: fingerprint,
+    PROSPERO_API_PROFILE_MODEL: `prospero/${profile.model}`,
+    OPENAI_API_KEY: apiKey,
+  };
 }
 
 function parseCredential(raw: string): AgentAccountCredential | null {
@@ -533,8 +621,14 @@ export class AgentAccountManager {
       ? publicApiProfile(account.agent, account.apiProfile)
       : undefined;
     const environment = apiProfile
-      ? account.agent === "codex"
-        ? {
+      ? apiProfile.protocol === "openai_chat_completions" && account.apiProfile
+        ? opencodeProfileEnvironment(
+            root,
+            account.apiProfile,
+            credential?.kind === "api_key" ? credential.secret : "",
+          )
+        : account.agent === "codex"
+          ? {
             // 自定义 provider 只从本 Profile 的 key 取值，不能回退 daemon 的全局环境。
             OPENAI_API_KEY: credential?.kind === "api_key" ? credential.secret : "",
             OPENAI_BASE_URL: "",
@@ -546,12 +640,12 @@ export class AgentAccountManager {
             CODEX_HOME: root,
             CODEX_SQLITE_HOME: root,
           }
-        : {
+          : {
             ANTHROPIC_API_KEY: credential?.kind === "api_key" ? credential.secret : "",
             ANTHROPIC_AUTH_TOKEN: "",
             ANTHROPIC_BASE_URL: apiProfile.baseUrl,
             ANTHROPIC_MODEL: apiProfile.model,
-            CLAUDE_CODE_API_BASE_URL: apiProfile.baseUrl,
+            CLAUDE_CODE_API_BASE_URL: "",
             CLAUDE_CODE_OAUTH_TOKEN: "",
             CLAUDE_CODE_OAUTH_REFRESH_TOKEN: "",
             CLAUDE_CODE_OAUTH_SCOPES: "",
@@ -600,7 +694,8 @@ export class AgentAccountManager {
       managed: true,
       environment,
       ...(apiProfile ? { apiProfile } : {}),
-      ...(apiProfile && account.agent === "codex" && account.apiProfile
+      ...(apiProfile?.protocol === "openai_chat_completions" ? { adapterAgent: "opencode" as const } : {}),
+      ...(apiProfile?.protocol === "openai_responses" && account.agent === "codex" && account.apiProfile
         ? { codexAppServerArgs: codexProviderArgs(account.apiProfile) }
         : {}),
       ...(credential ? { credentialKind: credential.kind } : {}),
@@ -654,7 +749,16 @@ export class AgentAccountManager {
     input: ApiProfileInput,
   ): Promise<AccountBinding> {
     const now = Date.now();
-    const profile = cleanApiProfile(input.baseUrl, input.model);
+    if (input.baseUrl === undefined || input.model === undefined || input.apiKey === undefined) {
+      throw new AgentAccountError("API Profile 缺少连接信息", "account_invalid");
+    }
+    const profile = cleanApiProfile(
+      agent,
+      input.baseUrl,
+      input.model,
+      input.provider,
+      input.protocol,
+    );
     const credential = cleanApiKey(input.apiKey);
     const account: StoredAccount = {
       id: randomUUID(),
@@ -675,19 +779,46 @@ export class AgentAccountManager {
     return this.resolve(account.id, agent);
   }
 
-  async configureApi(accountId: string, input: ApiProfileInput): Promise<void> {
+  async configureApi(
+    accountId: string,
+    input: ApiProfileInput,
+    sessions: SessionInfo[] = [],
+    inUse = false,
+  ): Promise<void> {
     const account = this.requireManaged(accountId);
     if (!account.apiProfile) {
       throw new AgentAccountError("这个账号不是第三方 API Profile", "account_invalid");
     }
-    const profile = cleanApiProfile(input.baseUrl, input.model);
-    const credential = cleanApiKey(input.apiKey);
+    const profile = cleanApiProfile(
+      account.agent,
+      input.baseUrl ?? account.apiProfile.baseUrl,
+      input.model ?? account.apiProfile.model,
+      input.provider ?? account.apiProfile.provider,
+      input.protocol ?? account.apiProfile.protocol,
+    );
+    const name = input.name === undefined ? account.name : cleanName(input.name);
+    const apiKey = input.apiKey?.trim() ?? "";
+    const updatesCredential = apiKey.length > 0;
+    if (
+      (inUse || activeCount(sessions, accountId) > 0) &&
+      (updatesCredential ||
+        profile.provider !== account.apiProfile.provider ||
+        profile.protocol !== account.apiProfile.protocol ||
+        profile.baseUrl !== account.apiProfile.baseUrl ||
+        profile.model !== account.apiProfile.model)
+    ) {
+      throw new AgentAccountError("这个 Profile 仍有活动会话，只能更新名称", "account_in_use");
+    }
     const root = this.rootFor(account.agent, account.id);
     mkdirSync(root, { recursive: true, mode: 0o700 });
     chmodSync(root, 0o700);
-    await this.credentialStore.write(account.id, root, credential);
-    this.credentialCache.set(account.id, credential);
+    if (updatesCredential) {
+      const credential = cleanApiKey(apiKey);
+      await this.credentialStore.write(account.id, root, credential);
+      this.credentialCache.set(account.id, credential);
+    }
     account.apiProfile = profile;
+    account.name = name;
     account.updatedAt = Date.now();
     this.persist();
   }
@@ -709,9 +840,14 @@ export class AgentAccountManager {
     accountId: string,
     kind: AgentCredentialKind,
     rawSecret: string,
+    sessions: SessionInfo[] = [],
+    inUse = false,
   ): Promise<void> {
     const account = this.requireManaged(accountId);
     if (account.apiProfile) {
+      if (inUse || activeCount(sessions, accountId) > 0) {
+        throw new AgentAccountError("这个 Profile 仍有活动会话，不能更新 API Key", "account_in_use");
+      }
       if (kind !== "api_key") {
         throw new AgentAccountError("第三方 API Profile 只能使用 API Key", "account_invalid");
       }
@@ -762,8 +898,11 @@ export class AgentAccountManager {
     };
   }
 
-  async logout(accountId: string): Promise<void> {
+  async logout(accountId: string, sessions: SessionInfo[] = [], inUse = false): Promise<void> {
     const binding = this.resolve(accountId);
+    if (binding.apiProfile && (inUse || activeCount(sessions, accountId) > 0)) {
+      throw new AgentAccountError("这个 Profile 仍有活动会话，不能移除 API Key", "account_in_use");
+    }
     if ((binding.agent === "claude" && binding.managed) || binding.apiProfile) {
       const root = this.rootFor(binding.agent, binding.id);
       await this.credentialStore.delete(binding.id, root);
@@ -794,11 +933,11 @@ export class AgentAccountManager {
     }
   }
 
-  async delete(accountId: string, sessions: SessionInfo[]): Promise<void> {
+  async delete(accountId: string, sessions: SessionInfo[], inUse = false): Promise<void> {
     const account = this.requireManaged(accountId);
     const count = activeCount(sessions, accountId);
-    if (count > 0) {
-      throw new AgentAccountError(`这个账号仍有 ${String(count)} 个会话，请先结束会话`, "account_in_use");
+    if (inUse || count > 0) {
+      throw new AgentAccountError(`这个账号仍有${count > 0 ? ` ${String(count)} 个会话` : "会话正在启动"}，请先结束会话`, "account_in_use");
     }
     // logout clears the account-specific credential before its isolated root.
     await this.logout(accountId);
@@ -849,9 +988,9 @@ export class AgentAccountManager {
   ): Promise<{ status: AgentAccountStatus; authMethod?: string; detail?: string }> {
     try {
       if (binding.apiProfile) {
-        const version = await this.runner(binding.agent, ["--version"], binding.environment);
+        const version = await this.runner(binding.adapterAgent ?? binding.agent, ["--version"], binding.environment);
         if (version.exitCode !== 0) {
-          return { status: "unavailable", detail: `${binding.agent} CLI 不可用` };
+          return { status: "unavailable", detail: `${binding.adapterAgent ?? binding.agent} CLI 不可用` };
         }
         if (binding.credentialKind !== "api_key") {
           return { status: "signed_out", detail: "需要配置该 Profile 的 API Key" };
@@ -859,7 +998,7 @@ export class AgentAccountManager {
         return {
           status: "signed_in",
           authMethod: "API Key",
-          detail: `${binding.apiProfile.provider} · ${new URL(binding.apiProfile.baseUrl).host}`,
+          detail: `${binding.apiProfile.protocol ?? binding.apiProfile.provider} · ${new URL(binding.apiProfile.baseUrl).host}`,
         };
       }
       if (binding.agent === "claude") {

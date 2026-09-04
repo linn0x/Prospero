@@ -23,7 +23,13 @@ vi.mock("expo-secure-store", () => ({
   deleteItemAsync: vi.fn(),
 }));
 
-import { CAPABILITY_FS_PUT_ACK, generateKeyPairB64 } from "@prospero/protocol";
+import {
+  CAPABILITY_AGENT_ACCOUNTS,
+  CAPABILITY_AGENT_API_PROFILES,
+  CAPABILITY_AGENT_API_PROTOCOLS,
+  CAPABILITY_FS_PUT_ACK,
+  generateKeyPairB64,
+} from "@prospero/protocol";
 import { dropConnection, getConnection, HostConnection, wireAppStateReconnect } from "../src/lib/connection";
 import type { StoredHost } from "../src/lib/hosts";
 
@@ -155,6 +161,69 @@ describe("HostConnection WebSocket candidates", () => {
       }),
       true,
     );
+  });
+
+  it("sends explicit API protocols and preserves the key on empty reconfiguration", async () => {
+    const socket = new FakeWebSocket("ws://192.168.1.8:7423/ws");
+    socket.readyState = 1;
+    const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
+    const internals = connection as unknown as {
+      ws: FakeWebSocket;
+      channel: { seal(message: unknown): string; open(message: string): unknown };
+      advertisedCapabilities: Set<string>;
+      onMessage(message: string): void;
+    };
+    internals.ws = socket;
+    internals.channel = {
+      seal: (message) => JSON.stringify(message),
+      open: (message) => JSON.parse(message),
+    };
+    internals.advertisedCapabilities = new Set([
+      CAPABILITY_AGENT_ACCOUNTS,
+      CAPABILITY_AGENT_API_PROFILES,
+      CAPABILITY_AGENT_API_PROTOCOLS,
+    ]);
+
+    const pending = connection.configureAgentApiProfile(
+      "account",
+      "openai_chat_completions",
+      "https://gateway.example.com/v1",
+      "model",
+    );
+    const request = JSON.parse(socket.sent[0]!) as Record<string, unknown>;
+    expect(request).toMatchObject({
+      type: "agent.account.api.configure",
+      accountId: "account",
+      provider: "openai_compatible",
+      protocol: "openai_chat_completions",
+      baseUrl: "https://gateway.example.com/v1",
+      model: "model",
+    });
+    expect(request).not.toHaveProperty("apiKey");
+    internals.onMessage(JSON.stringify({
+      type: "agent.accounts.result",
+      requestId: request["requestId"],
+      action: "api_configure",
+      ok: true,
+      accounts: [],
+    }));
+    await expect(pending).resolves.toMatchObject({ ok: true });
+    connection.stop();
+  });
+
+  it("keeps legacy API profile updates on the old required-key contract", () => {
+    const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
+    const internals = connection as unknown as { advertisedCapabilities: Set<string> };
+    internals.advertisedCapabilities = new Set([
+      CAPABILITY_AGENT_ACCOUNTS,
+      CAPABILITY_AGENT_API_PROFILES,
+    ]);
+    expect(() => connection.configureAgentApiProfile(
+      "account",
+      "openai_responses",
+      "https://gateway.example.com/v1",
+      "model",
+    )).toThrow("需要重新输入 API Key");
   });
 
   it("waits for every acknowledged upload chunk", async () => {
