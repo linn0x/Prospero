@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -681,6 +681,32 @@ describe("决策门", () => {
 });
 
 describe("落盘", () => {
+  it("为桌面端写入不含完整任务正文的轻量投影", () => {
+    const home = tmpHome();
+    const store = new OrchestrationStore(home);
+    const run = store.createRun({ objective: "桌面投影" });
+    const created = store.createTask({
+      runId: run.id,
+      title: "大任务",
+      spec: "x".repeat(4_000),
+    });
+    store.setTaskStatus(created.id, "dispatched");
+    store.setTaskStatus(created.id, "failed", "y".repeat(4_000));
+    store.close();
+
+    const projection = JSON.parse(
+      readFileSync(path.join(home, "orchestration-desktop.json"), "utf8"),
+    ) as Record<string, unknown>;
+    const task = (projection["tasks"] as Array<Record<string, unknown>>)[0];
+
+    expect(projection["version"]).toBe(1);
+    expect(projection).not.toHaveProperty("events");
+    expect(task?.["specTruncated"]).toBe(true);
+    expect(String(task?.["spec"])).toHaveLength(320);
+    expect(task?.["resultTruncated"]).toBe(true);
+    expect(String(task?.["result"])).toHaveLength(400);
+  });
+
   it("旧 v2 Task 缺少 skills 时迁移为空数组而不丢整份编排状态", () => {
     const home = tmpHome();
     writeFileSync(path.join(home, "orchestration.json"), JSON.stringify({

@@ -1,4 +1,14 @@
-import type { DaemonSnapshot, DaemonSnapshotPatch, DesktopSnapshot, DesktopSnapshotPatch, SessionInfo } from "./types";
+import type {
+  DaemonSnapshot,
+  DaemonSnapshotPatch,
+  DesktopSnapshot,
+  DesktopSnapshotPatch,
+  JsonEntityCollectionPatch,
+  JsonObject,
+  OrchestrationSnapshot,
+  OrchestrationSnapshotPatch,
+  SessionInfo,
+} from "./types";
 
 const SNAPSHOT_KEYS = [
   "projects",
@@ -10,11 +20,10 @@ const SNAPSHOT_KEYS = [
   "workflowTemplates",
   "devices",
   "accounts",
-  "orchestration",
   "logs",
   "settings",
-] as const satisfies readonly Exclude<keyof DesktopSnapshot, "daemon">[];
-type MissingSnapshotKey = Exclude<keyof DesktopSnapshot, "daemon" | (typeof SNAPSHOT_KEYS)[number]>;
+] as const satisfies readonly Exclude<keyof DesktopSnapshot, "daemon" | "orchestration">[];
+type MissingSnapshotKey = Exclude<keyof DesktopSnapshot, "daemon" | "orchestration" | (typeof SNAPSHOT_KEYS)[number]>;
 const SNAPSHOT_KEYS_ARE_EXHAUSTIVE: MissingSnapshotKey extends never ? true : never = true;
 void SNAPSHOT_KEYS_ARE_EXHAUSTIVE;
 
@@ -52,6 +61,14 @@ const REQUIRED_DAEMON_KEYS = [
   "relay",
 ] as const satisfies readonly (keyof DaemonSnapshot)[];
 
+const ORCHESTRATION_KEYS = [
+  "runs",
+  "tasks",
+  "dispatches",
+  "gates",
+  "worktreeAssets",
+] as const satisfies readonly (keyof OrchestrationSnapshot)[];
+
 function ids(sessions: SessionInfo[]): string[] {
   return sessions.map((session) => session.id);
 }
@@ -63,6 +80,33 @@ function sameStringArray(left: string[], right: string[]): boolean {
 /** Snapshot payloads are bounded, JSON-only records and must also run in the renderer. */
 function sameSnapshotValue(left: unknown, right: unknown): boolean {
   return left === right || JSON.stringify(left) === JSON.stringify(right);
+}
+
+function entityId(value: JsonObject): string {
+  return typeof value["id"] === "string" ? value["id"] : "";
+}
+
+function diffEntityCollection(previous: JsonObject[], next: JsonObject[]): JsonEntityCollectionPatch | undefined {
+  const previousById = new Map(previous.map((value) => [entityId(value), value]));
+  const nextById = new Map(next.map((value) => [entityId(value), value]));
+  const upserts = next.filter((value) => !sameSnapshotValue(previousById.get(entityId(value)), value));
+  const removedIds = previous.map(entityId).filter((id) => !nextById.has(id));
+  const previousOrder = previous.map(entityId);
+  const nextOrder = next.map(entityId);
+  const patch: JsonEntityCollectionPatch = {};
+  if (upserts.length > 0) patch.upserts = upserts;
+  if (removedIds.length > 0) patch.removedIds = removedIds;
+  if (!sameStringArray(previousOrder, nextOrder)) patch.order = nextOrder;
+  return Object.keys(patch).length > 0 ? patch : undefined;
+}
+
+function diffOrchestrationSnapshot(previous: OrchestrationSnapshot, next: OrchestrationSnapshot): OrchestrationSnapshotPatch | undefined {
+  const patch: OrchestrationSnapshotPatch = {};
+  for (const key of ORCHESTRATION_KEYS) {
+    const collection = diffEntityCollection(previous[key], next[key]);
+    if (collection) patch[key] = collection;
+  }
+  return Object.keys(patch).length > 0 ? patch : undefined;
 }
 
 function diffDaemonSnapshot(previous: DaemonSnapshot, next: DaemonSnapshot): DaemonSnapshotPatch | undefined {
@@ -91,6 +135,10 @@ export function diffDesktopSnapshot(previous: DesktopSnapshot | undefined, next:
   const patch: DesktopSnapshotPatch = {};
   const daemon = diffDaemonSnapshot(previous.daemon, next.daemon);
   if (daemon) patch.daemon = daemon;
+  const orchestrationDelta = previous.orchestration === next.orchestration
+    ? undefined
+    : diffOrchestrationSnapshot(previous.orchestration, next.orchestration);
+  if (orchestrationDelta) patch.orchestrationDelta = orchestrationDelta;
   for (const key of SNAPSHOT_KEYS) {
     if (previous[key] !== next[key]) Object.assign(patch, { [key]: next[key] });
   }
@@ -136,11 +184,89 @@ function applyDaemonSnapshotPatch(snapshot: DaemonSnapshot, patch: DaemonSnapsho
   return { ...snapshot, ...fields, sessions: applied };
 }
 
+function applyEntityCollection(snapshot: JsonObject[], patch: JsonEntityCollectionPatch | undefined): JsonObject[] {
+  if (!patch) return snapshot;
+  const upserts = patch.upserts ?? [];
+  const removedIds = patch.removedIds ?? [];
+  if (upserts.length === 0 && removedIds.length === 0 && patch.order === undefined) return snapshot;
+  const byId = new Map(snapshot.map((value) => [entityId(value), value]));
+  for (const value of upserts) byId.set(entityId(value), value);
+  for (const id of removedIds) byId.delete(id);
+  const sourceOrder = patch.order ?? snapshot.map(entityId);
+  const applied = sourceOrder.flatMap((id) => {
+    const value = byId.get(id);
+    return value ? [value] : [];
+  });
+  const appliedIds = new Set(applied.map(entityId));
+  for (const value of upserts) {
+    const id = entityId(value);
+    if (!appliedIds.has(id)) {
+      applied.push(value);
+      appliedIds.add(id);
+    }
+  }
+  return applied;
+}
+
+function applyOrchestrationSnapshotPatch(snapshot: OrchestrationSnapshot, patch: OrchestrationSnapshotPatch): OrchestrationSnapshot {
+  return {
+    runs: applyEntityCollection(snapshot.runs, patch.runs),
+    tasks: applyEntityCollection(snapshot.tasks, patch.tasks),
+    dispatches: applyEntityCollection(snapshot.dispatches, patch.dispatches),
+    gates: applyEntityCollection(snapshot.gates, patch.gates),
+    worktreeAssets: applyEntityCollection(snapshot.worktreeAssets, patch.worktreeAssets),
+  };
+}
+
 export function applyDesktopSnapshotPatch(snapshot: DesktopSnapshot, patch: DesktopSnapshotPatch): DesktopSnapshot {
   if (Object.keys(patch).length === 0) return snapshot;
-  const { daemon, ...fields } = patch;
-  if (!daemon) return { ...snapshot, ...fields };
-  return { ...snapshot, ...fields, daemon: applyDaemonSnapshotPatch(snapshot.daemon, daemon) };
+  const { daemon, orchestrationDelta, ...fields } = patch;
+  const applied = { ...snapshot, ...fields };
+  return {
+    ...applied,
+    ...(daemon ? { daemon: applyDaemonSnapshotPatch(applied.daemon, daemon) } : {}),
+    ...(orchestrationDelta
+      ? { orchestration: applyOrchestrationSnapshotPatch(applied.orchestration, orchestrationDelta) }
+      : {}),
+  };
+}
+
+function mergeEntityCollectionPatches(
+  previous: JsonEntityCollectionPatch | undefined,
+  next: JsonEntityCollectionPatch | undefined,
+): JsonEntityCollectionPatch | undefined {
+  if (!previous) return next;
+  if (!next) return previous;
+  const upserts = new Map((previous.upserts ?? []).map((value) => [entityId(value), value]));
+  const removed = new Set(previous.removedIds ?? []);
+  for (const id of next.removedIds ?? []) {
+    upserts.delete(id);
+    removed.add(id);
+  }
+  for (const value of next.upserts ?? []) {
+    removed.delete(entityId(value));
+    upserts.set(entityId(value), value);
+  }
+  const merged: JsonEntityCollectionPatch = {
+    ...(upserts.size > 0 ? { upserts: [...upserts.values()] } : {}),
+    ...(removed.size > 0 ? { removedIds: [...removed] } : {}),
+    ...(next.order !== undefined ? { order: next.order } : previous.order !== undefined ? { order: previous.order } : {}),
+  };
+  return Object.keys(merged).length > 0 ? merged : undefined;
+}
+
+function mergeOrchestrationPatches(
+  previous: OrchestrationSnapshotPatch | undefined,
+  next: OrchestrationSnapshotPatch | undefined,
+): OrchestrationSnapshotPatch | undefined {
+  if (!previous) return next;
+  if (!next) return previous;
+  const merged: OrchestrationSnapshotPatch = {};
+  for (const key of ORCHESTRATION_KEYS) {
+    const collection = mergeEntityCollectionPatches(previous[key], next[key]);
+    if (collection) merged[key] = collection;
+  }
+  return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
 /**
@@ -149,11 +275,20 @@ export function applyDesktopSnapshotPatch(snapshot: DesktopSnapshot, patch: Desk
  * producing a one-frame stale sidebar right after startup.
  */
 export function mergeDesktopSnapshotPatches(previous: DesktopSnapshotPatch, next: DesktopSnapshotPatch): DesktopSnapshotPatch {
-  const { daemon: previousDaemon, ...previousFields } = previous;
-  const { daemon: nextDaemon, ...nextFields } = next;
+  const { daemon: previousDaemon, orchestrationDelta: previousOrchestration, ...previousFields } = previous;
+  const { daemon: nextDaemon, orchestrationDelta: nextOrchestration, ...nextFields } = next;
+  const orchestrationDelta = mergeOrchestrationPatches(
+    Object.prototype.hasOwnProperty.call(nextFields, "orchestration") ? undefined : previousOrchestration,
+    nextOrchestration,
+  );
   if (!previousDaemon || !nextDaemon) {
     const daemon = nextDaemon ?? previousDaemon;
-    return { ...previousFields, ...nextFields, ...(daemon ? { daemon } : {}) };
+    return {
+      ...previousFields,
+      ...nextFields,
+      ...(daemon ? { daemon } : {}),
+      ...(orchestrationDelta ? { orchestrationDelta } : {}),
+    };
   }
   const {
     sessionUpserts: previousUpserts = [],
@@ -187,7 +322,12 @@ export function mergeDesktopSnapshotPatches(previous: DesktopSnapshotPatch, next
     ...(removed.size > 0 ? { sessionRemovedIds: [...removed] } : {}),
     ...(nextOrder !== undefined ? { sessionOrder: nextOrder } : previousOrder !== undefined ? { sessionOrder: previousOrder } : {}),
   };
-  return { ...previousFields, ...nextFields, daemon };
+  return {
+    ...previousFields,
+    ...nextFields,
+    daemon,
+    ...(orchestrationDelta ? { orchestrationDelta } : {}),
+  };
 }
 
 export function isEmptyDesktopSnapshotPatch(patch: DesktopSnapshotPatch): boolean {

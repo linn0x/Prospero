@@ -35,7 +35,9 @@ import {
   ListChecks,
   LoaderCircle,
   Mail,
+  Maximize2,
   MessageSquare,
+  Minimize2,
   MoreHorizontal,
   PanelRight,
   Pencil,
@@ -72,13 +74,16 @@ import { useLocale, type Language } from "./locale";
 import {
   EXPANDED_PROJECTS_STORAGE_KEY,
   SIDEBAR_COLLAPSE_WIDTH,
+  SIDEBAR_EXPAND_WIDTH,
   SIDEBAR_SESSION_PREVIEW_LIMIT,
   adaptiveSidebarOpen,
   filterSessionsByQuery,
+  matchesDesktopShortcut,
   mostRelevantProject,
   nextSidebarSessionLimit,
   parseExpandedProjects,
   projectForSession,
+  sessionRestoreRetryDelay,
   sortProjectsByRecentActivity,
   sortSidebarSessions,
 } from "./workspace-sidebar-state";
@@ -196,7 +201,9 @@ import {
 } from "@/components/ui/sidebar";
 import { Spinner } from "@/components/ui/spinner";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
+import "./styles.css";
 
 /** Host platform is static and controls native menu labels and shortcuts. */
 const isMac = window.prospero.platform === "darwin";
@@ -207,6 +214,13 @@ const SIDEBAR_PINNED_PREVIEW_LIMIT = 24;
 const SIDEBAR_SEARCH_PAGE_SIZE = 60;
 const SIDEBAR_SEARCH_VISIBLE_LIMIT = 120;
 const HYDRATED_SESSION_CACHE_LIMIT = 120;
+const INBOX_TASK_PAGE_SIZE = 50;
+const COMMAND_RESULT_LIMIT = 60;
+const SEARCH_QUERY_MAX_LENGTH = 500;
+const OPEN_SESSIONS_STORAGE_KEY = "prospero.openSessions";
+const ACTIVE_SESSION_STORAGE_KEY = "prospero.activeSession";
+const ACTIVE_VIEW_STORAGE_KEY = "prospero.activeView";
+const FOCUS_STORAGE_KEY = "prospero.workspaceFocus";
 
 function readSidebarOpenPreference(): boolean | undefined {
   try {
@@ -260,6 +274,34 @@ type View =
   | "skills"
   | "diagnostics"
   | "settings";
+const views = new Set<View>([
+  "overview",
+  "inbox",
+  "mobile",
+  "workspaces",
+  "runs",
+  "providers",
+  "skills",
+  "diagnostics",
+  "settings",
+]);
+
+function readStoredView(): View {
+  try {
+    const value = localStorage.getItem(ACTIVE_VIEW_STORAGE_KEY) as View | null;
+    return value && views.has(value) ? value : "overview";
+  } catch {
+    return "overview";
+  }
+}
+
+function readStoredActiveSession(): string | undefined {
+  try {
+    return localStorage.getItem(ACTIVE_SESSION_STORAGE_KEY) || undefined;
+  } catch {
+    return undefined;
+  }
+}
 type NavItem = { id: View; label: string; icon: ComponentType };
 
 const primaryNav: NavItem[] = [
@@ -318,14 +360,14 @@ function getViewCopy(
         ),
       },
       providers: {
-        title: "Agents",
+        title: t("Agent 与账号", "Agents & accounts"),
         description: t(
           "Agent、模型、账号与额度",
           "Agents, models, accounts, and usage",
         ),
       },
       skills: {
-        title: "Skills",
+        title: t("技能", "Skills"),
         description: t(
           "发现并管理工作区可用的技能",
           "Discover and manage skills available to each workspace",
@@ -396,6 +438,7 @@ type PinnedSessionRowProps = Pick<
   "onOpenSession" | "onTogglePin"
 > & {
   session: SessionInfo;
+  active: boolean;
 };
 
 /**
@@ -405,6 +448,7 @@ type PinnedSessionRowProps = Pick<
  */
 const PinnedSessionRow = memo(function PinnedSessionRow({
   session,
+  active,
   onOpenSession,
   onTogglePin,
 }: PinnedSessionRowProps) {
@@ -415,6 +459,8 @@ const PinnedSessionRow = memo(function PinnedSessionRow({
     <SidebarMenuItem>
       <SidebarMenuButton
         size="lg"
+        isActive={active}
+        aria-current={active ? "page" : undefined}
         tooltip={sessionLabel(session)}
         onClick={() => onOpenSession(session.id, session)}
       >
@@ -479,8 +525,10 @@ const WorkspaceSessionRow = memo(function WorkspaceSessionRow({
         <ContextMenuTrigger
           render={
             <SidebarMenuSubButton
+              render={<button type="button" />}
               className="workspace-session-link"
               isActive={active}
+              aria-current={active ? "page" : undefined}
               title={sessionLabel(session)}
               onClick={() => onOpenSession(session.id, session)}
             />
@@ -519,10 +567,19 @@ const WorkspaceSessionRow = memo(function WorkspaceSessionRow({
               {pinned ? <PinOff /> : <Pin />}
               {pinned ? t("取消置顶", "Unpin") : t("置顶", "Pin")}
             </ContextMenuItem>
-          <ContextMenuItem onClick={() => onToggleArchive(session.id)}>
-            {archived ? <ArchiveRestore /> : <Archive />}
-            {archived ? t("取消归档", "Unarchive") : t("归档", "Archive")}
-          </ContextMenuItem>
+            <ContextMenuItem onClick={() => onToggleArchive(session.id)}>
+              {archived ? <ArchiveRestore /> : <Archive />}
+              {archived ? t("取消归档", "Unarchive") : t("归档", "Archive")}
+            </ContextMenuItem>
+            <ContextMenuItem
+              onClick={() => void window.prospero.revealPath(session.cwd)}
+            >
+              <FolderOpen />
+              {isMac
+                ? t("在访达中显示", "Reveal in Finder")
+                : t("在资源管理器中打开", "Open in Explorer")}
+            </ContextMenuItem>
+          </ContextMenuGroup>
           <ContextMenuSeparator />
           <ContextMenuGroup>
             <ContextMenuItem onClick={() => void window.prospero.interruptSession(session.id)}>
@@ -535,15 +592,6 @@ const WorkspaceSessionRow = memo(function WorkspaceSessionRow({
             >
               <X />
               {t("结束会话", "End session")}
-            </ContextMenuItem>
-          </ContextMenuGroup>
-            <ContextMenuItem
-              onClick={() => void window.prospero.revealPath(session.cwd)}
-            >
-              <FolderOpen />
-              {isMac
-                ? t("在访达中显示", "Reveal in Finder")
-                : t("在资源管理器中打开", "Open in Explorer")}
             </ContextMenuItem>
           </ContextMenuGroup>
         </ContextMenuContent>
@@ -592,11 +640,18 @@ function sidebarSessionRowEqual(
   )
     return false;
 
-  if ("active" in previous && "active" in next) {
+  if (
+    "active" in previous &&
+    "active" in next &&
+    previous.active !== next.active
+  )
+    return false;
+
+  if ("unread" in previous && "unread" in next) {
     if (
-      previous.active !== next.active ||
       previous.unread !== next.unread ||
-      previous.pinned !== next.pinned
+      previous.pinned !== next.pinned ||
+      previous.archived !== next.archived
     )
       return false;
   }
@@ -608,7 +663,8 @@ function sidebarSessionRowEqual(
       ("onRenameSession" in next &&
         previous.onRenameSession === next.onRenameSession &&
         previous.onDuplicateSession === next.onDuplicateSession &&
-        previous.onSetUnread === next.onSetUnread))
+        previous.onSetUnread === next.onSetUnread &&
+        previous.onToggleArchive === next.onToggleArchive))
   );
 }
 
@@ -622,6 +678,16 @@ function relativeTime(value: unknown, language: Language): string {
   return hours < 24
     ? `${String(hours)}h`
     : `${String(Math.floor(hours / 24))}d`;
+}
+
+function newestRecord(records: JsonObject[]): JsonObject | undefined {
+  return records.reduce<JsonObject | undefined>((latest, record) => {
+    const value = record["updatedAt"] ?? record["createdAt"];
+    const latestValue = latest?.["updatedAt"] ?? latest?.["createdAt"];
+    const time = typeof value === "number" ? value : Date.parse(String(value ?? ""));
+    const latestTime = typeof latestValue === "number" ? latestValue : Date.parse(String(latestValue ?? ""));
+    return !latest || (Number.isFinite(time) ? time : 0) > (Number.isFinite(latestTime) ? latestTime : 0) ? record : latest;
+  }, undefined);
 }
 
 function DaemonAgentsCard({
@@ -674,7 +740,16 @@ function DaemonAgentsCard({
                       ? t("读取额度中…", "Loading usage…")
                       : accountUsage?.reason ?? t("额度不可用", "Usage unavailable")}
                 </span>
-                {remaining !== undefined && <Progress value={remaining} className="h-1" />}
+                {remaining !== undefined && (
+                  <Progress
+                    value={remaining}
+                    className="h-1"
+                    aria-label={t(
+                      `${agent} 剩余额度 ${String(remaining)}%`,
+                      `${agent} usage remaining: ${String(remaining)}%`,
+                    )}
+                  />
+                )}
               </div>
             </div>
           );
@@ -1146,6 +1221,7 @@ function ShellSidebar({
       <SidebarMenuItem key={item.id}>
         <SidebarMenuButton
           isActive={view === item.id}
+          aria-current={view === item.id ? "page" : undefined}
           tooltip={navLabel(item.id, t)}
           onClick={() => selectView(item.id)}
         >
@@ -1155,7 +1231,12 @@ function ShellSidebar({
       </SidebarMenuItem>
     ));
   return (
-    <Sidebar collapsible="icon" className="prospero-sidebar">
+    <Sidebar
+      collapsible="icon"
+      className="prospero-sidebar"
+      mobileTitle={t("侧边栏", "Sidebar")}
+      mobileDescription={t("主导航、工作区与会话", "Main navigation, workspaces, and sessions")}
+    >
       <SidebarHeader className="sidebar-shell-header">
         <div className="sidebar-brand">
           <span className="sidebar-brand-mark" aria-hidden="true">
@@ -1166,21 +1247,28 @@ function ShellSidebar({
             <small>{t("Agent 工作台", "Agent workspace")}</small>
           </span>
         </div>
-        <SidebarTrigger className="sidebar-header-toggle" />
+        <SidebarTrigger
+          className="sidebar-header-toggle"
+          aria-label={t("切换侧边栏", "Toggle sidebar")}
+          title={t("切换侧边栏", "Toggle sidebar")}
+        />
       </SidebarHeader>
-      <SidebarContent>
-        <SidebarGroup>
-          <SidebarGroupContent>
-            <SidebarMenu>{renderNav(primaryNav)}</SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
-        <SidebarSeparator />
-        <SidebarGroup>
-          <SidebarGroupLabel>{t("工具", "Tools")}</SidebarGroupLabel>
-          <SidebarGroupContent>
-            <SidebarMenu>{renderNav(resourceNav)}</SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
+      <SidebarContent className="sidebar-content-shell">
+        <nav className="sidebar-nav-fixed" aria-label={t("主导航", "Main navigation")}>
+          <SidebarGroup>
+            <SidebarGroupContent>
+              <SidebarMenu>{renderNav(primaryNav)}</SidebarMenu>
+            </SidebarGroupContent>
+          </SidebarGroup>
+          <SidebarSeparator />
+          <SidebarGroup>
+            <SidebarGroupLabel>{t("工具", "Tools")}</SidebarGroupLabel>
+            <SidebarGroupContent>
+              <SidebarMenu>{renderNav(resourceNav)}</SidebarMenu>
+            </SidebarGroupContent>
+          </SidebarGroup>
+        </nav>
+        <div className="sidebar-workspace-scroll" role="region" aria-label={t("工作区与会话", "Workspaces and sessions")}>
         {snapshot.pinnedSessionIds.length > 0 && <>
           <SidebarSeparator className="sidebar-detail-section" />
           <SidebarGroup className="sidebar-detail-section">
@@ -1198,6 +1286,7 @@ function ShellSidebar({
                   <PinnedSessionRow
                     key={session.id}
                     session={session}
+                    active={view === "workspaces" && activeId === session.id}
                     onOpenSession={selectSession}
                     onTogglePin={onTogglePin}
                   />
@@ -1324,6 +1413,7 @@ function ShellSidebar({
               <Search aria-hidden="true" />
               <Input
                 type="search"
+                maxLength={SEARCH_QUERY_MAX_LENGTH}
                 value={sessionQuery}
                 onChange={(event) => setSessionQuery(event.target.value)}
                 placeholder={t("搜索会话、状态或路径", "Search sessions, status, or path")}
@@ -1687,6 +1777,7 @@ function ShellSidebar({
             </CollapsibleContent>
           </SidebarGroup>
         </Collapsible>
+        </div>
       </SidebarContent>
       <SidebarFooter className="px-3 pb-3">
         <SidebarMenu className="sidebar-footer-actions">
@@ -1722,6 +1813,7 @@ function ShellSidebar({
           <SidebarMenuItem>
             <SidebarMenuButton
               isActive={view === "settings"}
+              aria-current={view === "settings" ? "page" : undefined}
               tooltip={t("设置", "Settings")}
               onClick={() => selectView("settings")}
             >
@@ -1731,7 +1823,10 @@ function ShellSidebar({
           </SidebarMenuItem>
         </SidebarMenu>
       </SidebarFooter>
-      <SidebarRail />
+      <SidebarRail
+        aria-label={t("切换侧边栏", "Toggle sidebar")}
+        title={t("切换侧边栏", "Toggle sidebar")}
+      />
     </Sidebar>
   );
 }
@@ -1774,14 +1869,14 @@ function AttentionCard({
 }) {
   return (
     <div className="attention-row">
-      <span className={cn("attention-icon", `tone-${status}`)}>
+      <span className={cn("attention-icon", `tone-${status}`)} aria-hidden="true">
         <Icon />
       </span>
       <div className="min-w-0 flex-1">
         <strong>{title}</strong>
         <p>{description}</p>
       </div>
-      {action ?? <ChevronRight className="text-muted-foreground" />}
+      {action ?? <ChevronRight className="text-muted-foreground" aria-hidden="true" />}
     </div>
   );
 }
@@ -1797,7 +1892,7 @@ function OverviewPane({
   snapshot: DesktopSnapshot;
   onOpenSession: (id: string) => void;
   onOpenInbox: () => void;
-  onOpenRuns: () => void;
+  onOpenRuns: (runId?: string, taskId?: string) => void;
   onOpenWorkspaces: () => void;
   onNewSession: (project: string) => void;
 }) {
@@ -1807,16 +1902,25 @@ function OverviewPane({
       session.status,
     ),
   );
+  const activeRunIds = new Set(
+    snapshot.orchestration.runs
+      .filter((run) => text(run["status"]) === "active")
+      .map((run) => text(run["id"])),
+  );
   const failedTasks = snapshot.orchestration.tasks.filter((task) =>
+    activeRunIds.has(text(task["runId"])) &&
     ["failed", "blocked"].includes(text(task["status"])),
-  );
+  ).sort((left, right) => (Number(right["updatedAt"]) || 0) - (Number(left["updatedAt"]) || 0));
   const pendingGates = snapshot.orchestration.gates.filter(
-    (gate) => text(gate["status"]) === "pending",
-  );
-  const activeRun =
-    snapshot.orchestration.runs.find(
+    (gate) =>
+      activeRunIds.has(text(gate["runId"])) &&
+      text(gate["status"]) === "pending",
+  ).sort((left, right) => (Number(right["createdAt"]) || 0) - (Number(left["createdAt"]) || 0));
+  const activeRun = newestRecord(
+    snapshot.orchestration.runs.filter(
       (run) => text(run["status"]) === "active",
-    ) ?? snapshot.orchestration.runs[0];
+    ),
+  ) ?? newestRecord(snapshot.orchestration.runs);
   const runId = text(activeRun?.["id"]);
   const runTasks = snapshot.orchestration.tasks.filter(
     (task) => text(task["runId"]) === runId,
@@ -1853,11 +1957,11 @@ function OverviewPane({
       <div className="view-container overview-view">
         <h1 className="sr-only">{t("概览", "Overview")}</h1>
         <div className="overview-grid">
-          <Card className="attention-card-shell">
+          <Card className="attention-card-shell" role="region" aria-labelledby="overview-attention-title">
             <CardHeader>
               <div className="flex items-center justify-between gap-3">
                 <div>
-                  <CardTitle>
+                  <CardTitle id="overview-attention-title" role="heading" aria-level={2}>
                     {t("需要你处理", "Needs your attention")}
                   </CardTitle>
                   <CardDescription>
@@ -1867,7 +1971,13 @@ function OverviewPane({
                     )}
                   </CardDescription>
                 </div>
-                <Badge variant={attentionCount ? "secondary" : "outline"}>
+                <Badge
+                  variant={attentionCount ? "secondary" : "outline"}
+                  aria-label={t(
+                    `${String(attentionCount)} 项需要处理`,
+                    `${String(attentionCount)} items need attention`,
+                  )}
+                >
                   {attentionCount}
                 </Badge>
               </div>
@@ -1906,7 +2016,7 @@ function OverviewPane({
                   )}
                   status="warning"
                   action={
-                    <Button variant="outline" size="sm" onClick={onOpenRuns}>
+                    <Button variant="outline" size="sm" onClick={() => onOpenRuns(text(gate["runId"]), text(gate["taskId"]) || undefined)}>
                       {t("处理", "Review")}
                     </Button>
                   }
@@ -1920,7 +2030,7 @@ function OverviewPane({
                   description={`${status(text(task["status"]))} · ${t("打开 Run 查看上下文", "Open the run for context")}`}
                   status="danger"
                   action={
-                    <Button variant="outline" size="sm" onClick={onOpenRuns}>
+                    <Button variant="outline" size="sm" onClick={() => onOpenRuns(text(task["runId"]), text(task["id"]))}>
                       {t("查看", "View")}
                     </Button>
                   }
@@ -1979,7 +2089,7 @@ function OverviewPane({
               </CardFooter>
             )}
           </Card>
-          <Card className="run-focus-card">
+          <Card className="run-focus-card" role="region" aria-labelledby="overview-run-title">
             <CardHeader>
               <div className="flex items-center justify-between gap-3">
                 <Badge variant="outline">{t("当前运行", "CURRENT RUN")}</Badge>
@@ -1989,7 +2099,7 @@ function OverviewPane({
                   </Badge>
                 )}
               </div>
-              <CardTitle>
+              <CardTitle id="overview-run-title" role="heading" aria-level={2}>
                 {text(
                   activeRun?.["objective"],
                   t("还没有正在运行的 Run", "No active run yet"),
@@ -2015,7 +2125,13 @@ function OverviewPane({
                   </span>
                   <strong>{progress}%</strong>
                 </div>
-                <Progress value={progress} />
+                <Progress
+                  value={progress}
+                  aria-label={t(
+                    `运行进度 ${String(progress)}%`,
+                    `Run progress: ${String(progress)}%`,
+                  )}
+                />
               </div>
               <div className="run-task-preview">
                 {runTasks.slice(0, 4).map((task) => (
@@ -2036,17 +2152,17 @@ function OverviewPane({
               </div>
             </CardContent>
             <CardFooter>
-              <Button variant="outline" onClick={onOpenRuns}>
+              <Button variant="outline" onClick={() => onOpenRuns(runId || undefined)}>
                 {t("打开运行", "Open run")}{" "}
                 <ArrowRight data-icon="inline-end" />
               </Button>
             </CardFooter>
           </Card>
-          <Card className="active-work-card">
+          <Card className="active-work-card" role="region" aria-labelledby="overview-active-title">
             <CardHeader>
               <div className="flex items-center justify-between gap-3">
                 <div>
-                  <CardTitle>{t("活跃工作", "Active work")}</CardTitle>
+                  <CardTitle id="overview-active-title" role="heading" aria-level={2}>{t("活跃工作", "Active work")}</CardTitle>
                   <CardDescription>
                     {t(
                       "正在工作的 Agent 与最近上下文",
@@ -2060,7 +2176,9 @@ function OverviewPane({
             <CardContent className="active-agent-list">
               {orderedActiveSessions.slice(0, 6).map((session) => (
                 <button
+                  type="button"
                   key={session.id}
+                  title={`${sessionLabel(session)} · ${shortPath(session.cwd)}`}
                   onClick={() => onOpenSession(session.id)}
                 >
                   <Avatar>
@@ -2078,7 +2196,7 @@ function OverviewPane({
                       {shortPath(session.cwd)}
                     </small>
                   </span>
-                  <ChevronRight />
+                  <ChevronRight aria-hidden="true" />
                 </button>
               ))}
               {activeSessions.length === 0 && (
@@ -2106,10 +2224,10 @@ function OverviewPane({
             )}
           </Card>
         </div>
-        <section className="recent-section">
+        <section className="recent-section" aria-labelledby="recent-workspaces-title">
           <div className="section-heading">
             <div>
-              <h2>{t("最近的工作区", "Recent workspaces")}</h2>
+              <h2 id="recent-workspaces-title">{t("最近的工作区", "Recent workspaces")}</h2>
               <p>
                 {t(
                   "回到上次离开的项目与会话",
@@ -2142,7 +2260,7 @@ function OverviewPane({
                     <div className="workspace-symbol">
                       <FolderKanban />
                     </div>
-                    <CardTitle>{name}</CardTitle>
+                    <CardTitle title={name}>{name}</CardTitle>
                     <CardDescription title={project}>
                       {shortPath(project)}
                     </CardDescription>
@@ -2204,7 +2322,7 @@ function InboxPane({
 }: {
   snapshot: DesktopSnapshot;
   onOpenSession: (id: string) => void;
-  onOpenRuns: () => void;
+  onOpenRuns: (runId?: string, taskId?: string) => void;
 }) {
   const { t, status } = useLocale();
   const [gateDecisions, setGateDecisions] = useState<Record<string, string>>(
@@ -2213,12 +2331,25 @@ function InboxPane({
   const gateSubmissionRef = useRef(new Set<string>());
   const [gateSubmissions, setGateSubmissions] = useState<Record<string, string>>({});
   const [gateErrors, setGateErrors] = useState<Record<string, string>>({});
+  const taskSubmissionRef = useRef(new Set<string>());
+  const [taskSubmissions, setTaskSubmissions] = useState<Set<string>>(new Set());
+  const [taskErrors, setTaskErrors] = useState<Record<string, string>>({});
+  const [taskIssueLimit, setTaskIssueLimit] = useState(INBOX_TASK_PAGE_SIZE);
+  const activeRunIds = new Set(
+    snapshot.orchestration.runs
+      .filter((run) => text(run["status"]) === "active")
+      .map((run) => text(run["id"])),
+  );
   const gates = snapshot.orchestration.gates.filter(
-    (gate) => text(gate["status"]) === "pending",
-  );
+    (gate) =>
+      activeRunIds.has(text(gate["runId"])) &&
+      text(gate["status"]) === "pending",
+  ).sort((left, right) => (Number(right["createdAt"]) || 0) - (Number(left["createdAt"]) || 0));
   const taskIssues = snapshot.orchestration.tasks.filter((task) =>
+    activeRunIds.has(text(task["runId"])) &&
     ["failed", "blocked"].includes(text(task["status"])),
-  );
+  ).sort((left, right) => (Number(right["updatedAt"]) || 0) - (Number(left["updatedAt"]) || 0));
+  const visibleTaskIssues = taskIssues.slice(0, taskIssueLimit);
   const sessionIssues = snapshot.daemon.sessions.filter(
     (session) =>
       (session.pendingPermissions ?? 0) + (session.pendingQuestions ?? 0) > 0,
@@ -2251,8 +2382,34 @@ function InboxPane({
       });
     }
   };
+  const retryInboxTask = async (taskId: string): Promise<void> => {
+    if (taskSubmissionRef.current.has(taskId)) return;
+    taskSubmissionRef.current.add(taskId);
+    setTaskSubmissions((current) => new Set(current).add(taskId));
+    setTaskErrors((current) => {
+      const next = { ...current };
+      delete next[taskId];
+      return next;
+    });
+    try {
+      await window.prospero.orchestrationAction("task.retry", {
+        operationId: crypto.randomUUID(),
+        taskId,
+      });
+    } catch (reason) {
+      setTaskErrors((current) => ({ ...current, [taskId]: displayError(reason) }));
+    } finally {
+      taskSubmissionRef.current.delete(taskId);
+      setTaskSubmissions((current) => {
+        const next = new Set(current);
+        next.delete(taskId);
+        return next;
+      });
+    }
+  };
   const gateActions = (gate: JsonObject): React.ReactNode => {
     const gateId = text(gate["id"]);
+    const errorId = `gate-error-${encodeURIComponent(gateId)}`;
     const options = Array.isArray(gate["options"])
       ? (gate["options"] as unknown[]).map(String)
       : [];
@@ -2284,6 +2441,8 @@ function InboxPane({
             maxLength={20_000}
             disabled={Boolean(submitting)}
             aria-label={t("输入 Gate 决定", "Enter gate decision")}
+            aria-describedby={error ? errorId : undefined}
+            aria-invalid={Boolean(error)}
             placeholder={t("输入决定", "Enter a decision")}
             onChange={(event) =>
               setGateDecisions((current) => ({
@@ -2292,7 +2451,7 @@ function InboxPane({
               }))
             }
             onKeyDown={(event) => {
-              if (event.key !== "Enter" || !decision.trim() || submitting) return;
+              if (event.nativeEvent.isComposing || event.key !== "Enter" || !decision.trim() || submitting) return;
               event.preventDefault();
               void resolveInboxGate(gateId, decision.trim());
             }}
@@ -2306,7 +2465,7 @@ function InboxPane({
             {submitting ? t("提交中…", "Submitting…") : t("确认", "Confirm")}
           </Button>
         </div>
-        {error && <span className="w-full text-xs text-destructive" role="alert">{error}</span>}
+        {error && <span id={errorId} className="w-full text-xs text-destructive" role="alert">{error}</span>}
       </>
     );
   };
@@ -2321,21 +2480,21 @@ function InboxPane({
             "Only actionable events appear here, so routine activity never hides a decision.",
           )}
           actions={
-            <Badge variant="secondary">
+            <Badge variant="secondary" aria-live="polite">
               {total} {t("项待处理", "open")}
             </Badge>
           }
         />
         <div className="inbox-list">
           {!snapshot.daemon.running && (
-            <Card className="inbox-item tone-danger">
+            <Card className="inbox-item tone-danger" role="article">
               <CardHeader>
                 <div className="inbox-item-head">
-                  <span className="attention-icon tone-danger">
+                  <span className="attention-icon tone-danger" aria-hidden="true">
                     <WifiOff />
                   </span>
                   <div>
-                    <CardTitle>
+                    <CardTitle role="heading" aria-level={2}>
                       {t("运行环境已断开", "Runtime disconnected")}
                     </CardTitle>
                     <CardDescription>
@@ -2355,21 +2514,27 @@ function InboxPane({
                 </p>
               </CardContent>
               <CardFooter>
-                <Button onClick={() => void window.prospero.startDaemon()}>
-                  {t("重新连接", "Reconnect")}
+                <Button
+                  aria-busy={snapshot.daemon.starting}
+                  disabled={snapshot.daemon.starting}
+                  onClick={() => void window.prospero.startDaemon()}
+                >
+                  {snapshot.daemon.starting
+                    ? t("正在连接…", "Connecting…")
+                    : t("重新连接", "Reconnect")}
                 </Button>
               </CardFooter>
             </Card>
           )}
           {gates.map((gate) => (
-            <Card className="inbox-item tone-warning" key={text(gate["id"])}>
+            <Card className="inbox-item tone-warning" key={text(gate["id"])} role="article">
               <CardHeader>
                 <div className="inbox-item-head">
-                  <span className="attention-icon tone-warning">
+                  <span className="attention-icon tone-warning" aria-hidden="true">
                     <ListChecks />
                   </span>
                   <div>
-                    <CardTitle>
+                    <CardTitle role="heading" aria-level={2} title={text(gate["question"])}>
                       {text(
                         gate["question"],
                         t("请求审批", "Review requested"),
@@ -2392,21 +2557,21 @@ function InboxPane({
               )}
               <CardFooter className="flex-wrap">
                 {gateActions(gate)}
-                <Button variant="ghost" size="sm" onClick={onOpenRuns}>
+                <Button variant="ghost" size="sm" onClick={() => onOpenRuns(text(gate["runId"]), text(gate["taskId"]) || undefined)}>
                   {t("打开运行", "Open run")}
                 </Button>
               </CardFooter>
             </Card>
           ))}
           {sessionIssues.map((session) => (
-            <Card className="inbox-item tone-warning" key={session.id}>
+            <Card className="inbox-item tone-warning" key={session.id} role="article">
               <CardHeader>
                 <div className="inbox-item-head">
-                  <span className="attention-icon tone-warning">
+                  <span className="attention-icon tone-warning" aria-hidden="true">
                     <MessageSquare />
                   </span>
                   <div>
-                    <CardTitle>{sessionLabel(session)}</CardTitle>
+                    <CardTitle role="heading" aria-level={2} title={sessionLabel(session)}>{sessionLabel(session)}</CardTitle>
                     <CardDescription>
                       {session.agent} · {shortPath(session.cwd)}
                     </CardDescription>
@@ -2417,7 +2582,7 @@ function InboxPane({
                 </div>
               </CardHeader>
               <CardContent>
-                <p>
+                <p className="line-clamp-3">
                   {(session.pendingPermissions ?? 0) > 0
                     ? t(
                         `${String(session.pendingPermissions)} 个权限请求等待处理`,
@@ -2436,15 +2601,15 @@ function InboxPane({
               </CardFooter>
             </Card>
           ))}
-          {taskIssues.map((task) => (
-            <Card className="inbox-item tone-danger" key={text(task["id"])}>
+          {visibleTaskIssues.map((task) => (
+            <Card className="inbox-item tone-danger" key={text(task["id"])} role="article">
               <CardHeader>
                 <div className="inbox-item-head">
-                  <span className="attention-icon tone-danger">
+                  <span className="attention-icon tone-danger" aria-hidden="true">
                     <CircleAlert />
                   </span>
                   <div>
-                    <CardTitle>
+                    <CardTitle role="heading" aria-level={2} title={text(task["title"])}>
                       {text(task["title"], t("任务失败", "Task failed"))}
                     </CardTitle>
                     <CardDescription>
@@ -2457,7 +2622,7 @@ function InboxPane({
                 </div>
               </CardHeader>
               <CardContent>
-                <p>
+                <p className="line-clamp-3">
                   {text(
                     task["spec"],
                     t(
@@ -2467,26 +2632,32 @@ function InboxPane({
                   )}
                 </p>
               </CardContent>
-              <CardFooter>
-                <Button variant="outline" size="sm" onClick={onOpenRuns}>
+              <CardFooter className="flex-wrap">
+                <Button variant="outline" size="sm" onClick={() => onOpenRuns(text(task["runId"]), text(task["id"]))}>
                   {t("查看运行", "View run")}
                 </Button>
                 {text(task["status"]) === "failed" && (
                   <Button
                     size="sm"
-                    onClick={() =>
-                      void window.prospero.orchestrationAction("task.retry", {
-                        operationId: crypto.randomUUID(),
-                        taskId: text(task["id"]),
-                      })
-                    }
+                    disabled={taskSubmissions.has(text(task["id"]))}
+                    onClick={() => void retryInboxTask(text(task["id"]))}
                   >
-                    {t("重试", "Retry")}
+                    {taskSubmissions.has(text(task["id"])) && <Spinner data-icon="inline-start" />}
+                    {taskSubmissions.has(text(task["id"])) ? t("重试中…", "Retrying…") : t("重试", "Retry")}
                   </Button>
                 )}
+                {taskErrors[text(task["id"])] && <span className="w-full text-xs text-destructive" role="alert">{taskErrors[text(task["id"])]}</span>}
               </CardFooter>
             </Card>
           ))}
+          {visibleTaskIssues.length < taskIssues.length && (
+            <Button
+              variant="outline"
+              onClick={() => setTaskIssueLimit((current) => current + INBOX_TASK_PAGE_SIZE)}
+            >
+              {t("显示更多失败任务", "Show more failed tasks")} · {taskIssues.length - visibleTaskIssues.length}
+            </Button>
+          )}
           {total === 0 && (
             <Empty className="inbox-empty">
               <EmptyHeader>
@@ -2670,20 +2841,46 @@ function WorkspaceContextPane({
   const { t, status } = useLocale();
   const [usage, setUsage] = useState<UsageReport>();
   useEffect(() => {
+    let cancelled = false;
     setUsage(undefined);
     void window.prospero
       .getUsage(session.id)
-      .then(setUsage)
-      .catch(() => setUsage(undefined));
+      .then((value) => { if (!cancelled) setUsage(value); })
+      .catch(() => { if (!cancelled) setUsage(undefined); });
+    return () => { cancelled = true; };
   }, [session.id]);
   const dispatch = snapshot.orchestration.dispatches.find(
     (item) => text(item["sessionId"]) === session.id,
   );
-  const task = dispatch
+  const taskPreview = dispatch
     ? snapshot.orchestration.tasks.find(
         (item) => text(item["id"]) === text(dispatch["taskId"]),
       )
     : undefined;
+  const taskId = text(taskPreview?.["id"]);
+  const taskPreviewUpdatedAt = Number(taskPreview?.["updatedAt"]) || 0;
+  const [fullTask, setFullTask] = useState<{
+    task: JsonObject;
+    previewUpdatedAt: number;
+  }>();
+  useEffect(() => {
+    let cancelled = false;
+    setFullTask(undefined);
+    if (!taskId || taskPreview?.["specTruncated"] !== true) return;
+    void window.prospero.getOrchestrationTask(taskId)
+      .then((value) => {
+        if (!cancelled) setFullTask({ task: value, previewUpdatedAt: taskPreviewUpdatedAt });
+      })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [taskId, taskPreview?.["specTruncated"], taskPreviewUpdatedAt]);
+  const task = fullTask?.previewUpdatedAt === taskPreviewUpdatedAt && taskPreview
+    ? {
+        ...fullTask.task,
+        ...taskPreview,
+        spec: fullTask.task["spec"],
+      }
+    : taskPreview;
   const tokens = (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0);
   return (
     <Tabs defaultValue="task" className="context-pane-tabs">
@@ -2867,6 +3064,7 @@ function WorkspacePane({
   onNewSession,
   onOpenRun,
   onTogglePin,
+  onToggleFocus,
   focus,
 }: {
   snapshot: DesktopSnapshot;
@@ -2877,6 +3075,7 @@ function WorkspacePane({
   onNewSession: (project?: string) => void;
   onOpenRun: (runId?: string) => void;
   onTogglePin: (id: string) => void;
+  onToggleFocus: () => void;
   focus: boolean;
 }) {
   const { t, status } = useLocale();
@@ -2891,11 +3090,24 @@ function WorkspacePane({
         (dispatch) => text(dispatch["sessionId"]) === active.id,
       )
     : undefined;
+  const moveSessionTab = (id: string, direction: -1 | 1 | "first" | "last"): void => {
+    const index = openIds.indexOf(id);
+    if (index < 0 || openIds.length === 0) return;
+    const nextIndex = direction === "first"
+      ? 0
+      : direction === "last"
+        ? openIds.length - 1
+        : (index + direction + openIds.length) % openIds.length;
+    const nextId = openIds[nextIndex];
+    if (!nextId) return;
+    onActivate(nextId);
+    window.requestAnimationFrame(() => document.getElementById(`workspace-tab-${nextId}`)?.focus());
+  };
   return (
     <div className="workspace-view workspace-view-single">
-      <div className="pane-workspace">
-        <div className="workspace-tabbar">
-          {!focus && <div className="workspace-tabs" role="tablist">
+      <div className={cn("pane-workspace", focus && "is-focus")}>
+        {!focus && <div className="workspace-tabbar">
+          <div className="workspace-tabs" role="tablist">
             {openIds.map((id) => {
               const session = snapshot.daemon.sessions.find(
                 (item) => item.id === id,
@@ -2914,10 +3126,26 @@ function WorkspacePane({
                     type="button"
                     data-slot="workspace-tab-main"
                     className="workspace-tab-main"
+                    id={`workspace-tab-${id}`}
                     role="tab"
+                    aria-controls="workspace-session-panel"
                     aria-selected={id === activeId}
                     tabIndex={id === activeId ? 0 : -1}
                     onClick={() => onActivate(id)}
+                    onKeyDown={(event) => {
+                      const direction = event.key === "ArrowLeft"
+                        ? -1
+                        : event.key === "ArrowRight"
+                          ? 1
+                          : event.key === "Home"
+                            ? "first"
+                            : event.key === "End"
+                              ? "last"
+                              : undefined;
+                      if (direction === undefined) return;
+                      event.preventDefault();
+                      moveSessionTab(id, direction);
+                    }}
                   >
                     <SessionAgentIcon agent={session.agent} />
                     <span className="truncate">{sessionLabel(session)}</span>
@@ -2962,8 +3190,8 @@ function WorkspacePane({
                 </div>
               );
             })}
-          </div>}
-        </div>
+          </div>
+        </div>}
         {active ? (
           <>
             {!focus && <header className="pane-toolbar">
@@ -2982,6 +3210,15 @@ function WorkspacePane({
                 </div>
               </div>
               <div className="pane-toolbar-actions">
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label={t("进入专注模式", "Enter focus mode")}
+                  title={t("进入专注模式", "Enter focus mode")}
+                  onClick={onToggleFocus}
+                >
+                  <Maximize2 />
+                </Button>
                 <Badge variant="outline">
                   <GitBranch />
                   {shortPath(active.cwd)}
@@ -3067,7 +3304,7 @@ function WorkspacePane({
               </div>
             </header>}
             <div className={cn("pane-grid", !contextVisible && "context-hidden")}>
-              <main className="primary-pane">
+              <main id="workspace-session-panel" role="tabpanel" aria-labelledby={!focus && activeId ? `workspace-tab-${activeId}` : undefined} aria-label={focus ? sessionLabel(active) : undefined} className="primary-pane">
                 <div className="pane-tabbar pane-tabbar-static">
                   <span>
                     {active.kind === "pty"
@@ -3079,6 +3316,7 @@ function WorkspacePane({
                 <div className="pane-content">
                   {active.kind === "pty" ? (
                     <TerminalPane
+                      key={active.id}
                       session={active}
                       fontFamily={snapshot.settings.terminalFontFamily}
                       fontSize={snapshot.settings.terminalFontSize}
@@ -3166,6 +3404,7 @@ function ProjectRenameDialog({
   const { t } = useLocale();
   const [name, setName] = useState(currentName);
   const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
   const [error, setError] = useState<string>();
   useEffect(() => {
     if (open) {
@@ -3174,7 +3413,8 @@ function ProjectRenameDialog({
     }
   }, [open, currentName]);
   const save = async (): Promise<void> => {
-    if (!project) return;
+    if (busyRef.current || !project || !name.trim()) return;
+    busyRef.current = true;
     setBusy(true);
     setError(undefined);
     try {
@@ -3183,12 +3423,13 @@ function ProjectRenameDialog({
     } catch (reason) {
       setError(displayError(reason));
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   };
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md">
+    <Dialog open={open} onOpenChange={(next) => { if (next || !busy) onOpenChange(next); }}>
+      <DialogContent className="sm:max-w-md" showCloseButton={!busy} closeLabel={t("关闭", "Close")} aria-busy={busy}>
         <DialogHeader>
           <DialogTitle>
             {t("编辑工作区名称", "Edit workspace name")}
@@ -3204,7 +3445,7 @@ function ProjectRenameDialog({
           <Alert variant="destructive">
             <CircleAlert />
             <AlertTitle>{t("无法保存", "Unable to save")}</AlertTitle>
-            <AlertDescription>{error}</AlertDescription>
+            <AlertDescription id="workspace-rename-error">{error}</AlertDescription>
           </Alert>
         )}
         <Field>
@@ -3214,18 +3455,21 @@ function ProjectRenameDialog({
           <Input
             id="workspace-name"
             autoFocus
+            maxLength={80}
+            aria-invalid={Boolean(error)}
+            aria-describedby={error ? "workspace-rename-error workspace-path-description" : "workspace-path-description"}
             value={name}
             onChange={(event) => setName(event.target.value)}
             onKeyDown={(event) => {
-              if (event.key === "Enter") void save();
+              if (!event.nativeEvent.isComposing && event.key === "Enter" && !busy) void save();
             }}
           />
-          <FieldDescription className="truncate" title={project}>
+          <FieldDescription id="workspace-path-description" className="truncate" title={project}>
             {project}
           </FieldDescription>
         </Field>
         <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
+          <Button variant="outline" disabled={busy} onClick={() => onOpenChange(false)}>
             {t("取消", "Cancel")}
           </Button>
           <Button disabled={busy || !name.trim()} onClick={() => void save()}>
@@ -3250,6 +3494,7 @@ function SessionRenameDialog({
   const { t } = useLocale();
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
   const [error, setError] = useState<string>();
   useEffect(() => {
     if (open) {
@@ -3258,7 +3503,8 @@ function SessionRenameDialog({
     }
   }, [open, session]);
   const save = async (): Promise<void> => {
-    if (!session) return;
+    if (busyRef.current || !session || !name.trim()) return;
+    busyRef.current = true;
     setBusy(true);
     setError(undefined);
     try {
@@ -3267,12 +3513,13 @@ function SessionRenameDialog({
     } catch (reason) {
       setError(displayError(reason));
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   };
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md">
+    <Dialog open={open} onOpenChange={(next) => { if (next || !busy) onOpenChange(next); }}>
+      <DialogContent className="sm:max-w-md" showCloseButton={!busy} closeLabel={t("关闭", "Close")} aria-busy={busy}>
         <DialogHeader>
           <DialogTitle>{t("编辑会话名称", "Rename session")}</DialogTitle>
           <DialogDescription>
@@ -3286,7 +3533,7 @@ function SessionRenameDialog({
           <Alert variant="destructive">
             <CircleAlert />
             <AlertTitle>{t("无法保存", "Unable to save")}</AlertTitle>
-            <AlertDescription>{error}</AlertDescription>
+            <AlertDescription id="session-rename-error">{error}</AlertDescription>
           </Alert>
         )}
         <Field>
@@ -3296,18 +3543,21 @@ function SessionRenameDialog({
           <Input
             id="session-name"
             autoFocus
+            maxLength={120}
+            aria-invalid={Boolean(error)}
+            aria-describedby={error ? "session-rename-error session-path-description" : "session-path-description"}
             value={name}
             onChange={(event) => setName(event.target.value)}
             onKeyDown={(event) => {
-              if (event.key === "Enter") void save();
+              if (!event.nativeEvent.isComposing && event.key === "Enter" && !busy) void save();
             }}
           />
-          <FieldDescription className="truncate" title={session?.cwd}>
+          <FieldDescription id="session-path-description" className="truncate" title={session?.cwd}>
             {session?.cwd}
           </FieldDescription>
         </Field>
         <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
+          <Button variant="outline" disabled={busy} onClick={() => onOpenChange(false)}>
             {t("取消", "Cancel")}
           </Button>
           <Button disabled={busy || !name.trim()} onClick={() => void save()}>
@@ -3342,11 +3592,13 @@ function NewSessionDialog({
     accountId: defaultSessionLaunchAccountId(snapshot.accounts, "codex"),
   });
   const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
   const [choosingWorkspace, setChoosingWorkspace] = useState(false);
   const [error, setError] = useState<string>();
   const [launchModels, setLaunchModels] = useState<AgentModel[]>([]);
   const [launchModelsLoading, setLaunchModelsLoading] = useState(false);
   const [launchModelsError, setLaunchModelsError] = useState<string>();
+  const workspaceSelectRef = useRef<HTMLSelectElement>(null);
   const launchWorkspaces = useMemo(
     () => sessionLaunchWorkspaces(snapshot),
     [snapshot],
@@ -3457,6 +3709,8 @@ function NewSessionDialog({
     };
   }, [input.accountId, input.agent, input.kind, open, supportsLaunchModels]);
   const create = async (): Promise<void> => {
+    if (busyRef.current || !input.cwd) return;
+    busyRef.current = true;
     setBusy(true);
     setError(undefined);
     try {
@@ -3465,6 +3719,7 @@ function NewSessionDialog({
     } catch (reason) {
       setError(displayError(reason));
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   };
@@ -3482,8 +3737,14 @@ function NewSessionDialog({
     }
   };
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-2xl">
+    <Dialog open={open} onOpenChange={(next) => { if (next || !busy) onOpenChange(next); }}>
+      <DialogContent
+        className="new-session-dialog sm:max-w-2xl"
+        showCloseButton={!busy && !choosingWorkspace}
+        closeLabel={t("关闭", "Close")}
+        initialFocus={workspaceSelectRef}
+        aria-busy={busy || choosingWorkspace}
+      >
         <DialogHeader>
           <DialogTitle>{t("新建 Agent 会话", "New agent session")}</DialogTitle>
           <DialogDescription>
@@ -3508,6 +3769,7 @@ function NewSessionDialog({
               {t("工作区", "Workspace")}
             </FieldLabel>
             <NativeSelect
+              ref={workspaceSelectRef}
               id="session-project"
               value={input.cwd}
               onChange={(event) =>
@@ -3538,12 +3800,10 @@ function NewSessionDialog({
                 </NativeSelectOptGroup>
               )}
             </NativeSelect>
-            {launchWorkspaces.length === 0 && (
-              <Button variant="outline" disabled={choosingWorkspace} onClick={() => void chooseWorkspace()}>
-                {choosingWorkspace ? <Spinner data-icon="inline-start" /> : <FolderPlus data-icon="inline-start" />}
-                {choosingWorkspace ? t("正在选择…", "Choosing…") : t("添加第一个工作区", "Add your first workspace")}
-              </Button>
-            )}
+            <Button variant={launchWorkspaces.length === 0 ? "outline" : "ghost"} size="sm" className="w-fit" disabled={choosingWorkspace} onClick={() => void chooseWorkspace()}>
+              {choosingWorkspace ? <Spinner data-icon="inline-start" /> : <FolderPlus data-icon="inline-start" />}
+              {choosingWorkspace ? t("正在选择…", "Choosing…") : launchWorkspaces.length === 0 ? t("添加第一个工作区", "Add your first workspace") : t("添加其他工作区", "Add another workspace")}
+            </Button>
             <FieldDescription className="truncate" title={selectedWorkspace?.detail}>
               {launchWorkspaces.length === 0
                 ? t("选择一个本地项目后即可在此创建会话。", "Choose a local project to create a session here.")
@@ -3667,6 +3927,9 @@ function NewSessionDialog({
                   id="session-model"
                   value={input.model ?? ""}
                   disabled={launchModelsLoading || launchModels.length === 0}
+                  aria-busy={launchModelsLoading}
+                  aria-describedby={launchModelsError ? "session-model-error" : undefined}
+                  aria-invalid={Boolean(launchModelsError)}
                   onChange={(event) => {
                     const model = launchModels.find(
                       (candidate) => candidate.id === event.target.value,
@@ -3690,7 +3953,10 @@ function NewSessionDialog({
                     </NativeSelectOption>
                   ))}
                 </NativeSelect>
-                <FieldDescription>
+                <FieldDescription
+                  id={launchModelsError ? "session-model-error" : undefined}
+                  role={launchModelsError ? "alert" : undefined}
+                >
                   {launchModelsError ??
                     selectedLaunchModel?.description ??
                     t("目录随所选账号实时读取。", "Catalog loaded for the selected account.")}
@@ -3748,18 +4014,23 @@ function NewSessionDialog({
               <NativeSelectOption value="yolo">YOLO</NativeSelectOption>
             </NativeSelect>
             <FieldDescription>
-              {t(
-                "Standard 会在高风险操作前请求确认。",
-                "Standard asks for confirmation before high-risk actions.",
-              )}
+              {input.approvalPolicy === "strict"
+                ? t("严格确认所有可能修改系统或文件的操作。", "Ask before operations that may modify files or the system.")
+                : input.approvalPolicy === "yolo"
+                  ? t("高风险：自动批准操作，仅用于可信工作区。", "High risk: approve operations automatically; use only in trusted workspaces.")
+                  : t("在高风险操作前请求确认。", "Ask for confirmation before high-risk actions.")}
             </FieldDescription>
           </Field>
         </FieldGroup>
         <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
+          <Button variant="outline" disabled={busy || choosingWorkspace} onClick={() => onOpenChange(false)}>
             {t("取消", "Cancel")}
           </Button>
-          <Button disabled={busy || !input.cwd} onClick={() => void create()}>
+          <Button
+            aria-busy={busy}
+            disabled={busy || choosingWorkspace || !input.cwd || (supportsLaunchModels && launchModelsLoading)}
+            onClick={() => void create()}
+          >
             {busy ? (
               <Spinner data-icon="inline-start" />
             ) : (
@@ -3788,13 +4059,35 @@ function CommandDialog({
   snapshot: DesktopSnapshot;
   onView: (view: View) => void;
   onOpenSession: (id: string) => void;
-  onNewSession: () => void;
+  onNewSession: (project?: string) => void;
 }) {
   const { status, t } = useLocale();
   const [query, setQuery] = useState("");
+  const [activeOption, setActiveOption] = useState(0);
+  const resultsRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!open) setQuery("");
+    setActiveOption(0);
   }, [open]);
+  useEffect(() => setActiveOption(0), [mode, query]);
+  const recentSessionByProject = useMemo(() => {
+    const recent = new Map<string, SessionInfo>();
+    for (const session of sortSidebarSessions(
+      snapshot.daemon.sessions,
+      undefined,
+      snapshot.pinnedSessionIds,
+      snapshot.unreadSessionIds,
+    )) {
+      const project = projectForSession(snapshot.projects, session);
+      if (project && !recent.has(project)) recent.set(project, session);
+    }
+    return recent;
+  }, [
+    snapshot.daemon.sessions,
+    snapshot.pinnedSessionIds,
+    snapshot.projects,
+    snapshot.unreadSessionIds,
+  ]);
   const actions = [
     ...primaryNav.map((item) => ({
       key: `view:${item.id}`,
@@ -3826,13 +4119,16 @@ function CommandDialog({
     },
   ];
   const quick = [
-    ...snapshot.projects.map((project) => ({
-      key: `project:${project}`,
-      label: project.split(/[\\/]/).filter(Boolean).at(-1) ?? project,
-      detail: shortPath(project),
-      icon: FolderKanban,
-      run: () => onView("workspaces" as const),
-    })),
+    ...snapshot.projects.map((project) => {
+      const recent = recentSessionByProject.get(project);
+      return {
+        key: `project:${project}`,
+        label: project.split(/[\\/]/).filter(Boolean).at(-1) ?? project,
+        detail: shortPath(project),
+        icon: FolderKanban,
+        run: () => recent ? onOpenSession(recent.id) : onNewSession(project),
+      };
+    }),
     ...snapshot.daemon.sessions.map((session) => ({
       key: `session:${session.id}`,
       label: sessionLabel(session),
@@ -3864,12 +4160,30 @@ function CommandDialog({
         run: () => onOpenSession(session.id),
       }))
     : [];
-  const options = mode === "command"
+  const allOptions = mode === "command"
     ? [...matches(actions), ...commandSessions]
     : matches(quick);
+  const options = allOptions.slice(0, COMMAND_RESULT_LIMIT);
+  const hiddenOptionCount = allOptions.length - options.length;
+  useEffect(() => {
+    setActiveOption((current) =>
+      Math.min(current, Math.max(0, options.length - 1)),
+    );
+  }, [options.length]);
+  useEffect(() => {
+    resultsRef.current
+      ?.querySelector('[data-active="true"]')
+      ?.scrollIntoView({ block: "nearest" });
+  }, [activeOption]);
+  const runOption = (index: number): void => {
+    const item = options[index];
+    if (!item) return;
+    item.run();
+    onOpenChange(false);
+  };
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="command-dialog sm:max-w-xl">
+      <DialogContent className="command-dialog sm:max-w-xl" showCloseButton={false}>
         <DialogHeader className="sr-only">
           <DialogTitle>
             {mode === "command"
@@ -3887,12 +4201,48 @@ function CommandDialog({
         </DialogHeader>
         <InputGroup className="command-search">
           <InputGroupAddon>
-            <Search />
+            <Search aria-hidden="true" />
           </InputGroupAddon>
           <InputGroupInput
             autoFocus
+            maxLength={SEARCH_QUERY_MAX_LENGTH}
+            role="combobox"
+            aria-label={
+              mode === "command"
+                ? t("搜索会话或命令", "Search sessions or commands")
+                : t("快速打开工作区或会话", "Quickly open a workspace or session")
+            }
+            aria-controls="command-results"
+            aria-describedby="command-results-summary"
+            aria-expanded={open}
+            aria-autocomplete="list"
+            aria-haspopup="listbox"
+            aria-activedescendant={
+              options.length > 0
+                ? `command-option-${String(activeOption)}`
+                : undefined
+            }
             value={query}
             onChange={(event) => setQuery(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.nativeEvent.isComposing) return;
+              if (event.key === "ArrowDown") {
+                event.preventDefault();
+                setActiveOption((current) =>
+                  options.length === 0 ? 0 : (current + 1) % options.length,
+                );
+              } else if (event.key === "ArrowUp") {
+                event.preventDefault();
+                setActiveOption((current) =>
+                  options.length === 0
+                    ? 0
+                    : (current - 1 + options.length) % options.length,
+                );
+              } else if (event.key === "Enter" && options.length > 0) {
+                event.preventDefault();
+                runOption(activeOption);
+              }
+            }}
             placeholder={
               mode === "command"
                 ? t("搜索会话或输入命令…", "Search sessions or type a command…")
@@ -3906,15 +4256,37 @@ function CommandDialog({
             <kbd>Esc</kbd>
           </InputGroupAddon>
         </InputGroup>
-        <div className="command-results">
-          {options.map((item) => (
+        <div id="command-results-summary" className="command-results-summary" role="status" aria-live="polite">
+          {allOptions.length === 0
+            ? t("没有匹配结果", "No matching results")
+            : hiddenOptionCount > 0
+              ? t(
+                  `显示前 ${String(options.length)} 项，共 ${String(allOptions.length)} 项；继续输入可缩小范围`,
+                  `Showing the first ${String(options.length)} of ${String(allOptions.length)} results; type more to narrow the list`,
+                )
+              : t(`${String(options.length)} 项结果`, `${String(options.length)} results`)}
+        </div>
+        <div
+          id="command-results"
+          className="command-results"
+          role="listbox"
+          tabIndex={-1}
+          aria-label={mode === "command" ? t("命令结果", "Command results") : t("快速打开结果", "Quick Open results")}
+          ref={resultsRef}
+        >
+          {options.map((item, index) => (
             <Button
               variant="ghost"
               key={item.key}
-              onClick={() => {
-                item.run();
-                onOpenChange(false);
-              }}
+              id={`command-option-${String(index)}`}
+              role="option"
+              tabIndex={-1}
+              aria-selected={index === activeOption}
+              aria-posinset={index + 1}
+              aria-setsize={allOptions.length}
+              data-active={index === activeOption ? "true" : undefined}
+              onMouseEnter={() => setActiveOption(index)}
+              onClick={() => runOption(index)}
             >
               <item.icon data-icon="inline-start" />
               <span>
@@ -3924,9 +4296,7 @@ function CommandDialog({
               <ChevronRight data-icon="inline-end" />
             </Button>
           ))}
-          {options.length === 0 && (
-            <p>{t("没有匹配结果", "No matching results")}</p>
-          )}
+          {options.length === 0 && <p aria-hidden="true">{t("没有匹配结果", "No matching results")}</p>}
         </div>
       </DialogContent>
     </Dialog>
@@ -3937,31 +4307,41 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   const { t } = useLocale();
   const snapshotRef = useRef(snapshot);
   snapshotRef.current = snapshot;
-  const [view, setView] = useState<View>("overview");
+  const [view, setView] = useState<View>(readStoredView);
   const [hydratedSessions, setHydratedSessions] = useState<SessionInfo[]>([]);
   const [openIds, setOpenIds] = useState<string[]>(() => {
     try {
       const stored = JSON.parse(
-        localStorage.getItem("prospero.openSessions") || "[]",
+        localStorage.getItem(OPEN_SESSIONS_STORAGE_KEY) || "[]",
       ) as unknown;
-      return Array.isArray(stored)
+      const ids = Array.isArray(stored)
         ? stored.filter((value): value is string => typeof value === "string")
         : [];
+      const active = readStoredActiveSession();
+      return active && !ids.includes(active) ? [...ids, active] : ids;
     } catch {
       return [];
     }
   });
-  const [activeId, setActiveId] = useState<string>();
+  const restoredOpenIds = useRef(openIds);
+  const [restoredSessionsReady, setRestoredSessionsReady] = useState(
+    openIds.length === 0,
+  );
+  const [sessionRestoreAttempt, setSessionRestoreAttempt] = useState(0);
+  const [activeId, setActiveId] = useState<string | undefined>(
+    readStoredActiveSession,
+  );
   const [newSessionOpen, setNewSessionOpen] = useState(false);
   const [newSessionProject, setNewSessionProject] = useState<string>();
   const [runTargetId, setRunTargetId] = useState<string>();
+  const [taskTargetId, setTaskTargetId] = useState<string>();
   const [editingProject, setEditingProject] = useState<string>();
   const [editingSession, setEditingSession] = useState<string>();
   const [sidebarPreference] = useState(readSidebarOpenPreference);
   const startsWithCompactSidebar =
     window.innerWidth <= SIDEBAR_COLLAPSE_WIDTH;
   const [sidebarOpen, setSidebarOpen] = useState(
-    () => sidebarPreference ?? !startsWithCompactSidebar,
+    () => startsWithCompactSidebar ? false : sidebarPreference ?? true,
   );
   const sidebarOpenRef = useRef(sidebarOpen);
   const sidebarPreferenceRef = useRef(sidebarPreference);
@@ -3995,15 +4375,91 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     .map((account) => `${text(account["id"])}:${text(account["status"])}`)
     .join("|");
   useEffect(() => {
-    localStorage.setItem("prospero.openSessions", JSON.stringify(validOpenIds));
-  }, [validOpenIds]);
+    if (restoredSessionsReady) return;
+    let retryTimer: number | undefined;
+    const ids = restoredOpenIds.current.slice(0, 100);
+    if (ids.length === 0) {
+      setRestoredSessionsReady(true);
+      return;
+    }
+    const liveIds = new Set(snapshotRef.current.daemon.sessions.map((session) => session.id));
+    const missingIds = ids.filter((id) => !liveIds.has(id));
+    if (missingIds.length === 0) {
+      setRestoredSessionsReady(true);
+      return;
+    }
+    if (!snapshot.daemon.running) return;
+    let cancelled = false;
+    void window.prospero.listSessions({ ids: missingIds, limit: 100 })
+      .then((page) => {
+        if (cancelled) return;
+        setHydratedSessions((current) => [
+          ...page.items,
+          ...current.filter((session) => !page.items.some((item) => item.id === session.id)),
+        ].slice(0, HYDRATED_SESSION_CACHE_LIMIT));
+        const available = new Set([
+          ...snapshotRef.current.daemon.sessions.map((session) => session.id),
+          ...page.items.map((session) => session.id),
+        ]);
+        const restored = new Set(ids);
+        setOpenIds((current) =>
+          current.filter((id) => !restored.has(id) || available.has(id)),
+        );
+        setRestoredSessionsReady(true);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        const delay = sessionRestoreRetryDelay(sessionRestoreAttempt);
+        if (delay === undefined) {
+          setRestoredSessionsReady(true);
+          return;
+        }
+        retryTimer = window.setTimeout(
+          () => setSessionRestoreAttempt((current) => current + 1),
+          delay,
+        );
+      });
+    return () => {
+      cancelled = true;
+      if (retryTimer !== undefined) window.clearTimeout(retryTimer);
+    };
+  }, [restoredSessionsReady, sessionRestoreAttempt, snapshot.daemon.running]);
   useEffect(() => {
+    if (!restoredSessionsReady) return;
+    try {
+      localStorage.setItem(
+        OPEN_SESSIONS_STORAGE_KEY,
+        JSON.stringify(validOpenIds),
+      );
+    } catch {}
+  }, [restoredSessionsReady, validOpenIds]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(ACTIVE_VIEW_STORAGE_KEY, view);
+    } catch {}
+  }, [view]);
+  useEffect(() => {
+    if (!restoredSessionsReady) return;
+    try {
+      if (activeId) localStorage.setItem(ACTIVE_SESSION_STORAGE_KEY, activeId);
+      else localStorage.removeItem(ACTIVE_SESSION_STORAGE_KEY);
+    } catch {}
+  }, [activeId, restoredSessionsReady]);
+  useEffect(() => {
+    if (!restoredSessionsReady) return;
     if (
       activeId &&
       !sessionSnapshot.daemon.sessions.some((session) => session.id === activeId)
     )
       setActiveId(validOpenIds[0]);
-  }, [sessionSnapshot.daemon.sessions, activeId, validOpenIds]);
+    else if (!activeId && validOpenIds.length > 0)
+      setActiveId(validOpenIds[0]);
+  }, [
+    sessionSnapshot.daemon.sessions,
+    activeId,
+    restoredSessionsReady,
+    validOpenIds,
+  ]);
   useEffect(() => {
     const systemTheme = window.matchMedia("(prefers-color-scheme: dark)");
     const apply = (): void => {
@@ -4026,8 +4482,12 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   }, [sidebarOpen]);
   useEffect(() => {
     const adaptSidebar = (): void => {
-      if (sidebarPreferenceRef.current !== undefined) return;
-      const next = adaptiveSidebarOpen(window.innerWidth, sidebarOpenRef.current);
+      const preference = sidebarPreferenceRef.current;
+      const next = window.innerWidth <= SIDEBAR_COLLAPSE_WIDTH
+        ? false
+        : window.innerWidth >= SIDEBAR_EXPAND_WIDTH
+          ? preference ?? true
+          : adaptiveSidebarOpen(window.innerWidth, sidebarOpenRef.current);
       if (next === sidebarOpenRef.current) return;
       sidebarOpenRef.current = next;
       setSidebarOpen(next);
@@ -4046,16 +4506,13 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   }, []);
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent): void => {
-      if (!(event.ctrlKey || event.metaKey)) return;
-      if (event.key.toLocaleLowerCase() === "k") {
+      if (matchesDesktopShortcut(event, "k", window.prospero.platform)) {
         event.preventDefault();
         setLauncher("command");
-      }
-      if (event.key.toLocaleLowerCase() === "p") {
+      } else if (matchesDesktopShortcut(event, "p", window.prospero.platform)) {
         event.preventDefault();
         setLauncher("quick");
-      }
-      if (event.key.toLocaleLowerCase() === "n") {
+      } else if (matchesDesktopShortcut(event, "n", window.prospero.platform)) {
         event.preventDefault();
         setNewSessionProject(undefined);
         setNewSessionOpen(true);
@@ -4082,9 +4539,17 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     if (snapshotRef.current.unreadSessionIds.includes(id))
       void window.prospero.setSessionUnread(id, false);
   }, []);
-  const openRun = useCallback((runId?: string): void => {
+  const openRun = useCallback((runId?: string, taskId?: string): void => {
     setRunTargetId(runId);
+    setTaskTargetId(taskId);
     setView("runs");
+  }, []);
+  const selectView = useCallback((next: View): void => {
+    if (next === "runs") {
+      setRunTargetId(undefined);
+      setTaskTargetId(undefined);
+    }
+    setView(next);
   }, []);
   const closeSession = (id: string): void => {
     const index = validOpenIds.indexOf(id);
@@ -4111,28 +4576,26 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   const setUnread = useCallback((id: string, unread: boolean): void => {
     void window.prospero.setSessionUnread(id, unread);
   }, []);
-  // 会话视图默认专注:顶栏、标签页条、会话工具条三条都收起,窗口只剩会话本身。
-  // 它们说的都是侧栏已经说过的事(会话名、路径、切换),而会话内容才是这个页面的
-  // 主体。⇧⌘F 随时调回来,选择会被记住。
   const [focus, setFocus] = useState(() => {
     try {
-      const stored = localStorage.getItem("prospero.focusTerminal");
-      return stored === null ? true : stored === "true";
+      return localStorage.getItem(FOCUS_STORAGE_KEY) === "true";
     } catch {
-      return true;
+      return false;
     }
   });
   useEffect(() => {
     try {
-      localStorage.setItem("prospero.focusTerminal", String(focus));
-    } catch {
-      // Focus mode still works for this renderer lifetime.
-    }
+      localStorage.setItem(FOCUS_STORAGE_KEY, String(focus));
+    } catch {}
   }, [focus]);
   useEffect(() => {
     const onKey = (event: KeyboardEvent): void => {
-      if (event.key.toLowerCase() !== "f" || !event.shiftKey) return;
-      if (!(isMac ? event.metaKey : event.ctrlKey)) return;
+      if (!matchesDesktopShortcut(
+        event,
+        "f",
+        window.prospero.platform,
+        true,
+      )) return;
       event.preventDefault();
       setFocus((current) => !current);
     };
@@ -4184,12 +4647,12 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     );
   }, [openSession, t]);
   const page = getViewCopy(view, t);
+  const workspaceFocus = focus && view === "workspaces";
   return (
+    <TooltipProvider>
     <SidebarProvider
-      // 专注模式只收起顶栏/标签页条/会话工具条,不碰侧栏 —— 侧栏是导航和会话
-      // 操作(停止本轮、结束会话)的唯一入口,把它一起锁上等于把这些动作也锁没了。
-      open={sidebarOpen}
-      onOpenChange={changeSidebarOpen}
+      open={workspaceFocus ? false : sidebarOpen}
+      {...(workspaceFocus ? {} : { onOpenChange: changeSidebarOpen })}
       style={
         {
           "--sidebar-width": "15rem",
@@ -4198,11 +4661,14 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
       }
       className="prospero-shell"
     >
+      <a className="skip-link" href="#main-content">
+        {t("跳到主内容", "Skip to main content")}
+      </a>
       <ShellSidebar
         snapshot={sessionSnapshot}
         view={view}
         activeId={activeId}
-        onView={setView}
+        onView={selectView}
         onOpenSession={openSession}
         onNewSession={openNewSession}
         onTogglePin={togglePin}
@@ -4212,16 +4678,20 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
         onDuplicateSession={duplicateSession}
         onSetUnread={setUnread}
       />
-      <SidebarInset className="prospero-main">
+      <SidebarInset id="main-content" tabIndex={-1} className="prospero-main">
         <header
           className={cn(
             "desktop-topbar",
-            focus && view === "workspaces" && "terminal-focus-topbar",
+            workspaceFocus && "terminal-focus-topbar",
           )}
         >
           <div className="topbar-context">
-            <SidebarTrigger className="topbar-sidebar-trigger" />
-            <div>
+            <SidebarTrigger
+              className="topbar-sidebar-trigger"
+              aria-label={t("打开侧边栏", "Open sidebar")}
+              title={t("打开侧边栏", "Open sidebar")}
+            />
+            {(view === "overview" || workspaceFocus) && <div>
               <strong>
                 {activeSession && view === "workspaces"
                   ? sessionLabel(activeSession)
@@ -4232,22 +4702,38 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
                   ? shortPath(activeSession.cwd)
                   : page.description}
               </span>
-            </div>
+            </div>}
           </div>
           <div className="topbar-actions">
-            <Button
-              variant="outline"
-              className="search-trigger"
-              onClick={() => setLauncher("command")}
-            >
-              <Search data-icon="inline-start" />
-              <span>{t("搜索或运行命令", "Search or run a command")}</span>
-              <kbd>{isMac ? "⌘K" : "Ctrl K"}</kbd>
-            </Button>
-            <Button onClick={() => openNewSession()}>
-              <Plus data-icon="inline-start" />
-              {t("新建会话", "New session")}
-            </Button>
+            {workspaceFocus ? (
+              <Button
+                variant="outline"
+                className="focus-exit"
+                aria-label={t("退出专注", "Exit focus")}
+                onClick={() => setFocus(false)}
+              >
+                <Minimize2 data-icon="inline-start" />
+                <span>{t("退出专注", "Exit focus")}</span>
+                <kbd>{isMac ? "⇧⌘F" : "Ctrl Shift F"}</kbd>
+              </Button>
+            ) : (
+              <>
+                <Button
+                  variant="outline"
+                  className="search-trigger"
+                  aria-label={t("搜索或运行命令", "Search or run a command")}
+                  onClick={() => setLauncher("command")}
+                >
+                  <Search data-icon="inline-start" />
+                  <span>{t("搜索或运行命令", "Search or run a command")}</span>
+                  <kbd>{isMac ? "⌘K" : "Ctrl Shift K"}</kbd>
+                </Button>
+                <Button onClick={() => openNewSession()}>
+                  <Plus data-icon="inline-start" />
+                  {t("新建会话", "New session")}
+                </Button>
+              </>
+            )}
           </div>
         </header>
         <div className="main-viewport">
@@ -4264,7 +4750,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
                 snapshot={sessionSnapshot}
                 onOpenSession={openSession}
                 onOpenInbox={() => setView("inbox")}
-                onOpenRuns={() => openRun()}
+                onOpenRuns={openRun}
                 onOpenWorkspaces={() => setView("workspaces")}
                 onNewSession={openNewSession}
               />
@@ -4272,7 +4758,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
               <InboxPane
                 snapshot={sessionSnapshot}
                 onOpenSession={openSession}
-                onOpenRuns={() => openRun()}
+                onOpenRuns={openRun}
               />
             ) : view === "mobile" ? (
               <DevicesPane snapshot={sessionSnapshot} />
@@ -4287,6 +4773,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
                 onNewSession={openNewSession}
                 onOpenRun={openRun}
                 onTogglePin={togglePin}
+                onToggleFocus={() => setFocus((current) => !current)}
               />
             ) : view === "runs" ? (
               <OrchestrationPane
@@ -4294,6 +4781,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
                 onOpenSession={openSession}
                 onNewSession={openNewSession}
                 initialRunId={runTargetId}
+                initialTaskId={taskTargetId}
               />
             ) : view === "providers" ? (
               <AccountsPane snapshot={sessionSnapshot} onOpenSession={openSession} />
@@ -4307,47 +4795,54 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
           </Suspense>
         </div>
       </SidebarInset>
-      <NewSessionDialog
-        snapshot={sessionSnapshot}
-        project={newSessionProject}
-        open={newSessionOpen}
-        onOpenChange={setNewSessionOpen}
-        onCreated={(session) => openSession(session.id)}
-      />
-      <ProjectRenameDialog
-        project={editingProject}
-        currentName={
-          editingProject
-            ? snapshot.projectAliases[editingProject.toLocaleLowerCase()] ||
-              editingProject.split(/[\\/]/).filter(Boolean).at(-1) ||
-              editingProject
-            : ""
-        }
-        open={Boolean(editingProject)}
-        onOpenChange={(open) => {
-          if (!open) setEditingProject(undefined);
-        }}
-      />
-      <SessionRenameDialog
-        session={sessionSnapshot.daemon.sessions.find(
-          (session) => session.id === editingSession,
-        )}
-        open={Boolean(editingSession)}
-        onOpenChange={(open) => {
-          if (!open) setEditingSession(undefined);
-        }}
-      />
-      <CommandDialog
-        open={Boolean(launcher)}
-        onOpenChange={(open) => {
-          if (!open) setLauncher(undefined);
-        }}
-        mode={launcher ?? "command"}
-        snapshot={sessionSnapshot}
-        onView={setView}
-        onOpenSession={openSession}
-        onNewSession={() => openNewSession()}
-      />
+      {newSessionOpen && (
+        <NewSessionDialog
+          snapshot={sessionSnapshot}
+          project={newSessionProject}
+          open
+          onOpenChange={setNewSessionOpen}
+          onCreated={(session) => openSession(session.id, session)}
+        />
+      )}
+      {editingProject && (
+        <ProjectRenameDialog
+          project={editingProject}
+          currentName={
+            snapshot.projectAliases[editingProject.toLocaleLowerCase()] ||
+            editingProject.split(/[\\/]/).filter(Boolean).at(-1) ||
+            editingProject
+          }
+          open
+          onOpenChange={(open) => {
+            if (!open) setEditingProject(undefined);
+          }}
+        />
+      )}
+      {editingSession && (
+        <SessionRenameDialog
+          session={sessionSnapshot.daemon.sessions.find(
+            (session) => session.id === editingSession,
+          )}
+          open
+          onOpenChange={(open) => {
+            if (!open) setEditingSession(undefined);
+          }}
+        />
+      )}
+      {launcher && (
+        <CommandDialog
+          open
+          onOpenChange={(open) => {
+            if (!open) setLauncher(undefined);
+          }}
+          mode={launcher}
+          snapshot={sessionSnapshot}
+          onView={selectView}
+          onOpenSession={openSession}
+          onNewSession={openNewSession}
+        />
+      )}
     </SidebarProvider>
+    </TooltipProvider>
   );
 }
