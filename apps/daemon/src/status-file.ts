@@ -27,6 +27,13 @@ export interface StatusSession {
   approvalPolicy?: string;
   preview?: string;
   busySince?: number;
+  messageQueue?: Array<{
+    id: string;
+    text: string;
+    kind: "queue" | "guide";
+    createdAt: number;
+    attachmentCount: number;
+  }>;
   subagents?: Array<{
     id: string;
     name: string;
@@ -182,6 +189,13 @@ export function toStatusSession(info: SessionInfo): StatusSession {
   if (info.approvalPolicy !== undefined) session.approvalPolicy = info.approvalPolicy;
   if (info.preview !== undefined) session.preview = info.preview;
   if (info.busySince !== undefined) session.busySince = info.busySince;
+  if (info.messageQueue?.length) {
+    session.messageQueue = info.messageQueue.slice(0, 50).map((item) => ({
+      ...item,
+      id: item.id.slice(0, 500),
+      text: item.text.slice(0, 1_000),
+    }));
+  }
   if (info.subagents?.length) {
     session.subagents = info.subagents.map((subagent) => ({
       id: subagent.id,

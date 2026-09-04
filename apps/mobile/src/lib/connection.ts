@@ -16,6 +16,7 @@ import {
   CAPABILITY_AGENT_API_PROFILES,
   CAPABILITY_AGENT_DEEPSEEK_HARNESS,
   CAPABILITY_DEEPSEEK_TRAJECTORY,
+  CAPABILITY_FS_PUT_ACK,
   CAPABILITY_CHAT_ATTACHMENT_PREVIEWS,
   CAPABILITY_ORCHESTRATION_AUTOMATION,
   CAPABILITY_ORCHESTRATION_GRAPH,
@@ -1184,19 +1185,15 @@ export class HostConnection {
     offset: number,
     dataB64: string,
     final: boolean,
-  ): Promise<Extract<S2CMessage, { type: "fs.written" }> | null> {
-    if (!final) {
-      // 非末块没有应答,直接发
-      this.send({ type: "fs.put", sid, path, offset, dataB64, final }, true);
-      return Promise.resolve(null);
-    }
+  ): Promise<Extract<S2CMessage, { type: "fs.written" }>> {
+    const acknowledgedFinal = this.supportsCapability(CAPABILITY_FS_PUT_ACK) ? final : true;
     return this.fsRequest<Extract<S2CMessage, { type: "fs.written" }>>(sid, path, {
       type: "fs.put",
       sid,
       path,
       offset,
       dataB64,
-      final,
+      final: acknowledgedFinal,
     });
   }
 

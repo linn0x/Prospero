@@ -4,7 +4,7 @@ import path from "node:path";
 import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it } from "vitest";
 import type { SessionInfo } from "@prospero/protocol";
-import { StatusFile } from "../src/status-file.js";
+import { StatusFile, toStatusSession } from "../src/status-file.js";
 import {
   STATUS_ACTIVE_LIMIT,
   STATUS_ATTENTION_LIMIT,
@@ -51,6 +51,24 @@ afterEach(() => {
 });
 
 describe("bounded daemon session views", () => {
+  it("keeps queued message state in the desktop status projection", () => {
+    const projected = toStatusSession(session("queued", 1, "running", {
+      busySince: 10,
+      messageQueue: [{
+        id: "queue-1",
+        text: "follow up",
+        kind: "guide",
+        createdAt: 11,
+        attachmentCount: 2,
+      }],
+    }));
+
+    expect(projected).toMatchObject({
+      busySince: 10,
+      messageQueue: [{ id: "queue-1", text: "follow up", kind: "guide", attachmentCount: 2 }],
+    });
+  });
+
   it("keeps status.json small while exposing honest counts and recent history", () => {
     const sessions: SessionInfo[] = [
       ...Array.from({ length: STATUS_ATTENTION_LIMIT + 25 }, (_, i) => session(

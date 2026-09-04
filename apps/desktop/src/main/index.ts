@@ -25,7 +25,7 @@ const ORCHESTRATION_METHODS = new Set([
 ]);
 const INTERACTION_TYPES = new Set([
   "chat.send", "term.input", "term.resize", "permission.respond",
-  "question.respond", "approval.policy.set",
+  "question.respond", "approval.policy.set", "chat.queue.remove", "chat.queue.guide",
 ]);
 const ACCOUNT_METHODS = new Set([
   "agent.accounts.list", "agent.account.create", "agent.account.api.create",
@@ -148,6 +148,22 @@ function boundedNonNegativeInteger(value: unknown, fallback = 0): number {
 
 function sessionInfoFromControl(value: unknown): SessionInfo {
   const item = requireObject(value);
+  const messageQueue: NonNullable<SessionInfo["messageQueue"]> = Array.isArray(item["messageQueue"])
+    ? item["messageQueue"].slice(0, 50).flatMap((raw) => {
+      if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return [];
+      const queued = raw as JsonObject;
+      const id = boundedText(queued["id"], "", 500);
+      const kind = queued["kind"];
+      if (!id || (kind !== "queue" && kind !== "guide")) return [];
+      return [{
+        id,
+        text: boundedText(queued["text"], "", 20_000),
+        kind: kind as "queue" | "guide",
+        createdAt: boundedNonNegativeInteger(queued["createdAt"]),
+        attachmentCount: boundedNonNegativeInteger(queued["attachmentCount"]),
+      }];
+    })
+    : [];
   const subagents = Array.isArray(item["subagents"])
     ? item["subagents"].flatMap((raw) => {
       if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return [];
@@ -176,6 +192,8 @@ function sessionInfoFromControl(value: unknown): SessionInfo {
     ...(typeof item["pendingPermissions"] === "number" ? { pendingPermissions: boundedNonNegativeInteger(item["pendingPermissions"]) } : {}),
     ...(typeof item["pendingQuestions"] === "number" ? { pendingQuestions: boundedNonNegativeInteger(item["pendingQuestions"]) } : {}),
     ...(typeof item["approvalPolicy"] === "string" ? { approvalPolicy: item["approvalPolicy"].slice(0, 80) } : {}),
+    ...(typeof item["busySince"] === "number" ? { busySince: boundedNonNegativeInteger(item["busySince"]) } : {}),
+    ...(messageQueue.length > 0 ? { messageQueue } : {}),
     ...(subagents.length > 0 ? { subagents } : {}),
   };
 }
@@ -201,11 +219,20 @@ function sessionPageRequest(raw: unknown): SessionPageRequest {
   return result;
 }
 
-function sessionPageFromControl(value: JsonObject | null): SessionPage {
+function sessionPageFromControl(
+  value: JsonObject | null,
+  titleFor: (sessionId: string) => string | undefined = () => undefined,
+): SessionPage {
   const payload = value ?? {};
   const items = Array.isArray(payload["items"])
     ? payload["items"].flatMap((item) => {
-      try { return [sessionInfoFromControl(item)]; } catch { return []; }
+      try {
+        const session = sessionInfoFromControl(item);
+        const displayTitle = titleFor(session.id);
+        return [displayTitle
+          ? { ...session, title: displayTitle, displayTitle, preview: displayTitle }
+          : session];
+      } catch { return []; }
     })
     : [];
   return {
@@ -879,7 +906,10 @@ function installIpc(): void {
     // daemons that only recognize `terminal=true` remain compatible.
     if (request.terminal === true) params.set("terminal", "true");
     for (const id of request.ids ?? []) params.append("id", id);
-    const page = sessionPageFromControl(await runtime.request(`/_prospero/control/sessions${params.size ? `?${params}` : ""}`));
+    const page = sessionPageFromControl(
+      await runtime.request(`/_prospero/control/sessions${params.size ? `?${params}` : ""}`),
+      (sessionId) => store.sessionTitle(sessionId),
+    );
     store.hydrateSessions(page.items);
     return page;
   });
@@ -897,8 +927,9 @@ function installIpc(): void {
       });
       if (confirmation.response !== 1) throw new Error("已取消运行自定义命令");
     }
-    return runtime.request("/_prospero/control/session/create", {
+    const created = sessionInfoFromControl(await runtime.request("/_prospero/control/session/create", {
       method: "POST",
+      timeoutMs: 180_000,
       body: {
         cwd: normalized,
         agent: input.agent,
@@ -912,7 +943,9 @@ function installIpc(): void {
         cols: Math.max(20, Math.min(500, Number(input.cols) || 120)),
         rows: Math.max(5, Math.min(300, Number(input.rows) || 40)),
       },
-    });
+    }));
+    store.hydrateSessions([created]);
+    return created;
   });
   ipcMain.handle("session:view", async (event, rawId: unknown, rawQuery: unknown) => {
     const sessionId = requireId(rawId, "会话");
@@ -1035,7 +1068,11 @@ function installIpc(): void {
       const confirmation = await dialog.showMessageBox(mainWindow!, { type: "warning", title: rawMethod === "run.delete" ? "删除 Run" : "清理 worktree", message: "确认执行这个不可逆操作？", detail: rawMethod === "worktree.cleanup" ? "仅已通过安全检查的 worktree 可以被清理；分支默认保留。" : "Run 历史将被删除。", buttons: ["取消", "确认"], defaultId: 0, cancelId: 0 });
       if (confirmation.response !== 1) return { cancelled: true };
     }
-    return runtime.request("/_prospero/control/orchestration/action", { method: "POST", body: { method: rawMethod, params } });
+    return runtime.request("/_prospero/control/orchestration/action", {
+      method: "POST",
+      body: { method: rawMethod, params },
+      timeoutMs: ["worker.start", "automation.start", "worktree.inspect", "worktree.cleanup"].includes(rawMethod) ? 180_000 : 60_000,
+    });
   });
   ipcMain.handle("orchestration:task", async (_event, rawId: unknown) => {
     const taskId = requireId(rawId, "任务");
@@ -1085,12 +1122,14 @@ function installIpc(): void {
     const uri = result.output.match(/prospero:\/\/\S+/)?.[0];
     return { output: result.output, uri };
   });
-  ipcMain.handle("device:revoke", async (_event, rawName: unknown) => {
-    if (typeof rawName !== "string" || !rawName.trim()) throw new Error("设备名无效");
-    const name = rawName.trim();
+  ipcMain.handle("device:revoke", async (_event, raw: unknown) => {
+    const input = requireObject(raw);
+    const id = requireId(input["id"], "设备");
+    if (typeof input["name"] !== "string" || !input["name"].trim()) throw new Error("设备名无效");
+    const name = input["name"].trim();
     const confirmation = await dialog.showMessageBox(mainWindow!, { type: "warning", title: "撤销设备", message: `确认撤销“${name}”？`, detail: "撤销后，该设备需要重新配对才能访问 Prospero。", buttons: ["取消", "确认撤销"], defaultId: 0, cancelId: 0 });
     if (confirmation.response !== 1) return { ok: false, output: "", cancelled: true };
-    const result = await runtime.runCli(["revoke", name]);
+    const result = await runtime.runCli(["revoke", "--id", id]);
     return { ok: result.code === 0, output: result.output };
   });
   ipcMain.handle("relay:action", async (_event, raw: unknown) => {

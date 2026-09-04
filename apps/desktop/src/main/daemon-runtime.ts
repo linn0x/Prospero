@@ -213,7 +213,7 @@ export class DaemonRuntime {
     });
   }
 
-  async request(path: string, init?: { method?: "GET" | "POST"; body?: JsonObject; signal?: AbortSignal }): Promise<JsonObject | null> {
+  async request(path: string, init?: { method?: "GET" | "POST"; body?: JsonObject; signal?: AbortSignal; timeoutMs?: number }): Promise<JsonObject | null> {
     const { port, token } = this.store.controlCredentials();
     const request: RequestInit = {
       method: init?.method ?? "GET",
@@ -222,8 +222,8 @@ export class DaemonRuntime {
         ...(init?.body ? { "content-type": "application/json" } : {}),
       },
       signal: init?.signal
-        ? AbortSignal.any([init.signal, AbortSignal.timeout(path.includes("waitMs=") ? 30_000 : 18_000)])
-        : AbortSignal.timeout(path.includes("waitMs=") ? 30_000 : 18_000),
+        ? AbortSignal.any([init.signal, AbortSignal.timeout(init.timeoutMs ?? (path.includes("waitMs=") ? 30_000 : 18_000))])
+        : AbortSignal.timeout(init?.timeoutMs ?? (path.includes("waitMs=") ? 30_000 : 18_000)),
     };
     if (init?.body) request.body = JSON.stringify(init.body);
     const response = await fetch(`http://127.0.0.1:${String(port)}${path}`, request);

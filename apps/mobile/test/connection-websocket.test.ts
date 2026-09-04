@@ -23,7 +23,7 @@ vi.mock("expo-secure-store", () => ({
   deleteItemAsync: vi.fn(),
 }));
 
-import { generateKeyPairB64 } from "@prospero/protocol";
+import { CAPABILITY_FS_PUT_ACK, generateKeyPairB64 } from "@prospero/protocol";
 import { dropConnection, getConnection, HostConnection, wireAppStateReconnect } from "../src/lib/connection";
 import type { StoredHost } from "../src/lib/hosts";
 
@@ -155,5 +155,78 @@ describe("HostConnection WebSocket candidates", () => {
       }),
       true,
     );
+  });
+
+  it("waits for every acknowledged upload chunk", async () => {
+    const socket = new FakeWebSocket("ws://192.168.1.8:7423/ws");
+    socket.readyState = 1;
+    const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
+    const internals = connection as unknown as {
+      ws: FakeWebSocket;
+      channel: { seal(message: unknown): string; open(message: string): unknown };
+      advertisedCapabilities: Set<string>;
+      onMessage(message: string): void;
+    };
+    internals.ws = socket;
+    internals.channel = {
+      seal: (message) => JSON.stringify(message),
+      open: (message) => JSON.parse(message),
+    };
+    internals.advertisedCapabilities = new Set([CAPABILITY_FS_PUT_ACK]);
+
+    let settled = false;
+    const pending = connection.fsPutChunk("sid", "file.bin", 0, "AQ==", false)
+      .then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(JSON.parse(socket.sent[0]!)).toMatchObject({ type: "fs.put", final: false });
+
+    internals.onMessage(JSON.stringify({
+      type: "fs.written",
+      sid: "sid",
+      path: "file.bin",
+      size: 1,
+    }));
+    await pending;
+    expect(settled).toBe(true);
+
+    const failed = connection.fsPutChunk("sid", "denied.bin", 0, "Ag==", false);
+    internals.onMessage(JSON.stringify({
+      type: "error",
+      code: "fs_error",
+      message: "cannot write file",
+      sid: "sid",
+    }));
+    await expect(failed).rejects.toThrow("cannot write file");
+    connection.stop();
+  });
+
+  it("uses legacy final acknowledgements to serialize upload chunks", async () => {
+    const socket = new FakeWebSocket("ws://192.168.1.8:7423/ws");
+    socket.readyState = 1;
+    const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
+    const internals = connection as unknown as {
+      ws: FakeWebSocket;
+      channel: { seal(message: unknown): string; open(message: string): unknown };
+      advertisedCapabilities: Set<string>;
+      onMessage(message: string): void;
+    };
+    internals.ws = socket;
+    internals.channel = {
+      seal: (message) => JSON.stringify(message),
+      open: (message) => JSON.parse(message),
+    };
+    internals.advertisedCapabilities = new Set();
+
+    const pending = connection.fsPutChunk("sid", "file.bin", 0, "AQ==", false);
+    expect(JSON.parse(socket.sent[0]!)).toMatchObject({ type: "fs.put", final: true });
+    internals.onMessage(JSON.stringify({
+      type: "fs.written",
+      sid: "sid",
+      path: "file.bin",
+      size: 1,
+    }));
+    await expect(pending).resolves.toMatchObject({ size: 1 });
+    connection.stop();
   });
 });

@@ -331,6 +331,8 @@ export class ChatEventAccumulator {
   private toolIndex = new Map<string, number>();
   private permissionIndex = new Map<string, number>();
   private questionIndex = new Map<string, number>();
+  private subagentIndex = new Map<string, number>();
+  private trajectoryIndex = new Map<string, number>();
   private textIdsByMessage = new Map<string, Set<string>>();
   private nextOrdinal = 0;
   private revision = 0;
@@ -343,6 +345,8 @@ export class ChatEventAccumulator {
     this.toolIndex = new Map();
     this.permissionIndex = new Map();
     this.questionIndex = new Map();
+    this.subagentIndex = new Map();
+    this.trajectoryIndex = new Map();
     this.textIdsByMessage = new Map();
     this.nextOrdinal = 0;
     this.apply(events);
@@ -478,6 +482,48 @@ export class ChatEventAccumulator {
         continue;
       }
 
+      if (kind === "subagent.started" || kind === "subagent.updated") {
+        const sourceSubagent = source.subagent !== null && typeof source.subagent === "object" && !Array.isArray(source.subagent)
+          ? source.subagent as JsonObject
+          : {};
+        const id = stringValue(sourceSubagent.id, stringValue(source.subagentId));
+        const index = this.subagentIndex.get(id);
+        if (!id || index === undefined) {
+          const nextIndex = this.push(kind, { ...source });
+          if (id) this.subagentIndex.set(id, nextIndex);
+        } else {
+          const prior = this.items[index]?.event ?? {};
+          const priorSubagent = prior.subagent !== null && typeof prior.subagent === "object" && !Array.isArray(prior.subagent)
+            ? prior.subagent as JsonObject
+            : {};
+          const subagent = {
+            ...priorSubagent,
+            ...sourceSubagent,
+            id,
+            ...(source.status !== undefined ? { status: source.status } : {}),
+            ...(source.canMessage !== undefined ? { canMessage: source.canMessage } : {}),
+            ...(source.summary !== undefined ? { preview: source.summary } : {}),
+          };
+          this.replace(index, { ...prior, ...source, subagent });
+        }
+        changed = true;
+        continue;
+      }
+
+      if (kind === "trajectory.record") {
+        const id = stringValue(source.recordId);
+        const index = this.trajectoryIndex.get(id);
+        if (!id || index === undefined) {
+          const nextIndex = this.push(kind, { ...source });
+          if (id) this.trajectoryIndex.set(id, nextIndex);
+        } else {
+          const prior = this.items[index]?.event ?? {};
+          this.replace(index, { ...prior, ...source });
+        }
+        changed = true;
+        continue;
+      }
+
       if (kind === "turn.end") {
         const msgId = stringValue(source.msgId);
         for (const id of this.textIdsByMessage.get(msgId) ?? []) this.textIndex.delete(id);
@@ -502,6 +548,8 @@ export class ChatEventAccumulator {
       ...this.toolIndex.values(),
       ...this.permissionIndex.values(),
       ...this.questionIndex.values(),
+      ...this.subagentIndex.values(),
+      ...this.trajectoryIndex.values(),
     ];
     const allActiveKeys = new Set(activeIndexes.map((index) => this.items[index]?.key).filter((key): key is string => Boolean(key)));
     const protectedActiveKeys = new Set<string>();
@@ -522,6 +570,8 @@ export class ChatEventAccumulator {
     this.toolIndex = new Map();
     this.permissionIndex = new Map();
     this.questionIndex = new Map();
+    this.subagentIndex = new Map();
+    this.trajectoryIndex = new Map();
     this.textIdsByMessage = new Map();
     for (let index = 0; index < this.items.length; index++) {
       const item = this.items[index]!;
@@ -537,6 +587,15 @@ export class ChatEventAccumulator {
         this.reasoningIndex.set(stringValue(item.event.msgId), index);
       } else if (kind === "tool.start") {
         this.toolIndex.set(stringValue(item.event.callId), index);
+      } else if (kind === "subagent.started" || kind === "subagent.updated") {
+        const subagent = item.event.subagent !== null && typeof item.event.subagent === "object" && !Array.isArray(item.event.subagent)
+          ? item.event.subagent as JsonObject
+          : {};
+        const id = stringValue(subagent.id, stringValue(item.event.subagentId));
+        if (id) this.subagentIndex.set(id, index);
+      } else if (kind === "trajectory.record") {
+        const id = stringValue(item.event.recordId);
+        if (id) this.trajectoryIndex.set(id, index);
       }
     }
     const retainedRequests = new Set(this.items.flatMap(({ event }) => {

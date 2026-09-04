@@ -22,7 +22,12 @@ async function main(): Promise<void> {
   };
   process.once("SIGTERM", () => shutdown("SIGTERM"));
   process.once("SIGINT", () => shutdown("SIGINT"));
-  await relay.listen();
+  try {
+    await relay.listen();
+  } catch (error) {
+    await Promise.allSettled([relay.close(), routes.close(), ephemeral.close()]);
+    throw error;
+  }
 }
 
 void main().catch((error: unknown) => {

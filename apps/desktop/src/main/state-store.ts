@@ -147,6 +147,44 @@ function nonNegativeInteger(value: unknown, fallback = 0): number {
   return Math.max(0, Math.floor(numberValue(value, fallback)));
 }
 
+function queuedChatMessages(value: unknown): NonNullable<SessionInfo["messageQueue"]> {
+  return arrayValue(value).slice(0, 50).flatMap((entry) => {
+    const item = objectValue(entry);
+    const id = stringValue(item["id"]).slice(0, 500);
+    const kind = item["kind"];
+    if (!id || (kind !== "queue" && kind !== "guide")) return [];
+    return [{
+      id,
+      text: stringValue(item["text"]).slice(0, 20_000),
+      kind,
+      createdAt: nonNegativeInteger(item["createdAt"]),
+      attachmentCount: nonNegativeInteger(item["attachmentCount"]),
+    }];
+  });
+}
+
+function relaySnapshot(statusValue: unknown, configValue: unknown): JsonObject {
+  const runtime = objectValue(statusValue);
+  const config = objectValue(configValue);
+  const source = Object.keys(runtime).length > 0 ? runtime : config;
+  const enabled = booleanValue(source["enabled"]);
+  const devices = objectValue(runtime["devices"]);
+  return {
+    enabled,
+    state: stringValue(runtime["state"], enabled ? "offline" : "disabled"),
+    url: typeof source["url"] === "string" ? source["url"] : null,
+    routeId: typeof runtime["routeId"] === "string" ? runtime["routeId"] : null,
+    updatedAt: nonNegativeInteger(runtime["updatedAt"]),
+    ...(typeof runtime["lastConnectedAt"] === "number" ? { lastConnectedAt: nonNegativeInteger(runtime["lastConnectedAt"]) } : {}),
+    ...(typeof runtime["lastError"] === "string" ? { lastError: runtime["lastError"].slice(0, 2_000) } : {}),
+    devices: {
+      total: nonNegativeInteger(devices["total"]),
+      ready: nonNegativeInteger(devices["ready"]),
+      needsRePair: nonNegativeInteger(devices["needsRePair"]),
+    },
+  };
+}
+
 function isTerminalSessionStatus(status: string): boolean {
   return ["completed", "done", "died", "failed", "cancelled", "killed", "idle"].includes(status);
 }
@@ -280,6 +318,7 @@ export class StateStore extends EventEmitter {
         const value = objectValue(entry);
         const id = stringValue(value["id"]);
         const displayTitle = this.sessionTitles[id];
+        const messageQueue = queuedChatMessages(value["messageQueue"]);
         return reuseEquivalent(previousSessionsById.get(id), {
           id,
           agent: stringValue(value["agent"], "shell"),
@@ -293,6 +332,8 @@ export class StateStore extends EventEmitter {
           pendingPermissions: numberValue(value["pendingPermissions"]),
           pendingQuestions: numberValue(value["pendingQuestions"]),
           approvalPolicy: stringValue(value["approvalPolicy"]),
+          ...(typeof value["busySince"] === "number" ? { busySince: nonNegativeInteger(value["busySince"]) } : {}),
+          ...(messageQueue.length > 0 ? { messageQueue } : {}),
           subagents: Array.isArray(value["subagents"])
             ? (value["subagents"] as NonNullable<SessionInfo["subagents"]>)
             : [],
@@ -314,7 +355,7 @@ export class StateStore extends EventEmitter {
           pty: booleanValue(persistence["pty"]),
           structured: booleanValue(persistence["structured"]),
         },
-        relay: objectValue(status["relay"] ?? config["relay"]),
+        relay: relaySnapshot(status["relay"], config["relay"]),
         sessionSummary: summary,
         sessions,
         ...(running ? { pid: rawPid } : {}),
@@ -328,7 +369,9 @@ export class StateStore extends EventEmitter {
       : reuseEquivalent(previous?.devices, arrayValue(devicesRoot["devices"]).map((entry): DeviceInfo => {
         const value = objectValue(entry);
         const allowShell = booleanValue(value["allowShell"]);
+        const token = stringValue(value["token"]);
         return {
+          id: createHash("sha256").update(token).digest("base64url"),
           name: stringValue(value["name"], "未命名设备"),
           allowShell,
           allowOrchestration: booleanValue(value["allowOrchestration"], allowShell),
@@ -522,10 +565,10 @@ export class StateStore extends EventEmitter {
     const name = template.name.trim().replace(/\s+/g, " ").slice(0, 120);
     if (!name) throw new Error("模板名称不能为空");
     const description = template.description.trim().slice(0, 500);
-    if (!Array.isArray(template.nodes) || template.nodes.length === 0 || template.nodes.length > 100) throw new Error("模板任务数量无效");
+    if (!Array.isArray(template.nodes) || template.nodes.length === 0 || template.nodes.length > 200) throw new Error("模板任务数量无效");
     const nodes = template.nodes.map((node, index) => {
-      const title = node.title.trim().slice(0, 200);
-      const spec = node.spec.trim().slice(0, 4_000);
+      const title = node.title.trim().slice(0, 2_000);
+      const spec = node.spec.trim().slice(0, 20_000);
       if (!title || !spec) throw new Error(`模板任务 ${String(index + 1)} 无效`);
       const dependencyIndexes = [...new Set(node.dependencyIndexes.filter((value) => Number.isInteger(value) && value >= 0 && value < template.nodes.length && value !== index))];
       const skills = [...new Set(node.skills.map((skill) => skill.trim()).filter(Boolean))].slice(0, 5);
@@ -556,6 +599,10 @@ export class StateStore extends EventEmitter {
     this.saveDesktopState();
     this.changed();
     return this.snapshot();
+  }
+
+  sessionTitle(sessionId: string): string | undefined {
+    return this.sessionTitles[sessionId];
   }
 
   forgetSessionTitle(sessionId: string): void {
@@ -780,14 +827,14 @@ export class StateStore extends EventEmitter {
     this.unreadSessionIds = arrayValue(raw.unreadSessionIds).filter((value): value is string => typeof value === "string" && SAFE_PERSISTED_SESSION_ID.test(value));
     this.workflowTemplates = arrayValue(raw.workflowTemplates).map(objectValue).flatMap((value): WorkflowTemplate[] => {
       const id = stringValue(value["id"]); const name = stringValue(value["name"]); const nodes = arrayValue(value["nodes"]).map(objectValue);
-      if (!SAFE_PERSISTED_SESSION_ID.test(id) || !name.trim() || nodes.length === 0 || nodes.length > 100) return [];
+      if (!SAFE_PERSISTED_SESSION_ID.test(id) || !name.trim() || nodes.length === 0 || nodes.length > 200) return [];
       return [{
         id,
         name: name.trim().slice(0, 120),
         description: stringValue(value["description"]).trim().slice(0, 500),
         nodes: nodes.map((node) => ({
-          title: stringValue(node["title"]).trim().slice(0, 200),
-          spec: stringValue(node["spec"]).trim().slice(0, 4_000),
+          title: stringValue(node["title"]).trim().slice(0, 2_000),
+          spec: stringValue(node["spec"]).trim().slice(0, 20_000),
           dependencyIndexes: arrayValue(node["dependencyIndexes"]).filter((item): item is number => Number.isInteger(item) && Number(item) >= 0).map(Number),
           skills: arrayValue(node["skills"]).filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean).slice(0, 5),
         })).filter((node) => node.title && node.spec),

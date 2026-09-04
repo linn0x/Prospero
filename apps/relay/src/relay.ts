@@ -140,13 +140,22 @@ export class RelayServer {
 
   async listen(): Promise<number> {
     await this.requireDependencies();
-    this.unsubscribe = await this.ephemeral.subscribe((event) => this.applyEvent(event));
-    this.cleanupTimer = setInterval(() => void this.runCleanup(), this.config.cleanupIntervalMs).unref();
-    await new Promise<void>((resolve, reject) => { this.http.once("error", reject); this.http.listen(this.config.port, this.config.host, () => { this.http.off("error", reject); resolve(); }); });
-    const address = this.address();
-    if (address === undefined) throw new Error("relay did not bind TCP");
-    this.logger.info({ event: "relay.listening", port: address.port }, "relay listening");
-    return address.port;
+    try {
+      this.unsubscribe = await this.ephemeral.subscribe((event) => this.applyEvent(event));
+      this.cleanupTimer = setInterval(() => void this.runCleanup(), this.config.cleanupIntervalMs).unref();
+      await new Promise<void>((resolve, reject) => { this.http.once("error", reject); this.http.listen(this.config.port, this.config.host, () => { this.http.off("error", reject); resolve(); }); });
+      const address = this.address();
+      if (address === undefined) throw new Error("relay did not bind TCP");
+      this.logger.info({ event: "relay.listening", port: address.port }, "relay listening");
+      return address.port;
+    } catch (error) {
+      if (this.cleanupTimer !== undefined) clearInterval(this.cleanupTimer);
+      this.cleanupTimer = undefined;
+      const unsubscribe = this.unsubscribe;
+      this.unsubscribe = undefined;
+      await unsubscribe?.().catch(() => undefined);
+      throw error;
+    }
   }
 
   async close(): Promise<void> {
@@ -245,6 +254,12 @@ export class RelayServer {
     socket.once("close", () => { this.tcpSockets.delete(socket); this.shutdownDrain?.(); });
   }
   private async closeHttpWithDeadline(): Promise<void> {
+    if (!this.http.listening) {
+      for (const socket of this.sockets) { try { socket.terminate(); } catch {} }
+      for (const socket of this.upgradingSockets) { try { socket.destroy(); } catch {} }
+      for (const socket of this.tcpSockets) { try { socket.destroy(); } catch {} }
+      return;
+    }
     await new Promise<void>((resolve) => {
       let finished = false;
       let deadline: NodeJS.Timeout | undefined;

@@ -163,4 +163,47 @@ describe("control socket", () => {
       .rejects.toMatchObject({ code: "socket_path_occupied" });
     expect(readFileSync(occupied, "utf8")).toBe("do not remove");
   });
+
+  it.skipIf(process.platform === "win32")("重复启动不破坏已运行 daemon 的 socket 和 token", async () => {
+    const dir = home();
+    const first = await startControlSocket({
+      home: dir,
+      token: "first-secret",
+      handle: () => "first",
+    });
+    servers.push(first);
+
+    await expect(startControlSocket({
+      home: dir,
+      token: "second-secret",
+      handle: () => "second",
+    })).rejects.toMatchObject({ code: "already_running" });
+
+    expect(readFileSync(first.tokenPath, "utf8")).toBe("first-secret\n");
+    await expect(controlRequest({ socketPath: first.path, token: "first-secret" }, "health"))
+      .resolves.toBe("first");
+  });
+
+  it.skipIf(process.platform === "win32")("启动失败保留既有 token 文件", async () => {
+    const dir = home();
+    const occupied = path.join(dir, "control.sock");
+    const token = path.join(dir, "control.token");
+    writeFileSync(occupied, "occupied");
+    writeFileSync(token, "existing-secret\n", { mode: 0o600 });
+
+    await expect(startControlSocket({ home: dir, token: "replacement", handle: () => null }))
+      .rejects.toMatchObject({ code: "socket_path_occupied" });
+    expect(readFileSync(token, "utf8")).toBe("existing-secret\n");
+  });
+
+  it("关闭时不删除已被其他所有者替换的 token", async () => {
+    const dir = home();
+    const server = await startControlSocket({ home: dir, token: "owned", handle: () => null });
+    servers.push(server);
+    rmSync(server.tokenPath);
+    writeFileSync(server.tokenPath, "replacement\n", { mode: 0o600 });
+
+    await server.close();
+    expect(readFileSync(server.tokenPath, "utf8")).toBe("replacement\n");
+  });
 });
