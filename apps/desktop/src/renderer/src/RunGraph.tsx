@@ -3,6 +3,7 @@ import { Maximize2, Minus, Plus, Zap } from "lucide-react";
 import type { JsonObject } from "../../shared/types";
 import { array, number, text } from "./state";
 import { useLocale } from "./locale";
+import { projectGraphView, taskWasSuperseded } from "./run-graph-projection";
 
 /**
  * 一个 Run 的任务依赖图。
@@ -324,16 +325,6 @@ function rectsIntersect(
   return right >= visible.left && left <= visible.right && bottom >= visible.top && top <= visible.bottom;
 }
 
-function taskWasSuperseded(task: JsonObject, parentIds: Set<string>): boolean {
-  const taskStatus = text(task["status"]);
-  if (taskStatus !== "failed" && taskStatus !== "cancelled") return false;
-  if (parentIds.has(text(task["id"]))) return true;
-  const signal = text(task["result"]).toLocaleLowerCase();
-  return signal.includes("superseded")
-    || signal.includes("quiesced before applying typed feedback")
-    || signal.includes("typed_feedback_replan");
-}
-
 function taskState(task: JsonObject, done: Set<string>, activeWorkers: Set<string>, parentIds: Set<string>): NodeState {
   const id = text(task["id"]);
   const taskStatus = text(task["status"]);
@@ -366,18 +357,21 @@ function drawArrow(context: CanvasRenderingContext2D, point: Point, color: strin
 
 export function RunGraph({ runId, tasks, dispatches, onActivateTask }: { runId: string; tasks: JsonObject[]; dispatches: JsonObject[]; onActivateTask?: (taskId: string) => void }) {
   const { t, status } = useLocale();
-  const graphKey = useMemo(() => structuralKey(tasks), [tasks]);
+  const [historyView, setHistoryView] = useState(false);
+  const projection = useMemo(() => projectGraphView(tasks, historyView ? "history" : "current"), [historyView, tasks]);
+  const graphTasks = projection.tasks;
+  const graphKey = useMemo(() => `${historyView ? "history" : "current"}:${structuralKey(graphTasks)}`, [graphTasks, historyView]);
   const layoutCache = useRef<{ key: string; layout: Layout } | undefined>(undefined);
   if (!layoutCache.current || layoutCache.current.key !== graphKey) {
-    layoutCache.current = { key: graphKey, layout: layoutGraph(tasks) };
+    layoutCache.current = { key: graphKey, layout: layoutGraph(graphTasks) };
   }
   const layout = layoutCache.current.layout;
-  const taskById = useMemo(() => new Map(tasks.map((task) => [text(task["id"]), task])), [tasks]);
+  const taskById = useMemo(() => new Map(graphTasks.map((task) => [text(task["id"]), task])), [graphTasks]);
   const done = useMemo(
-    () => new Set(tasks.filter((task) => ["done", "completed", "succeeded"].includes(text(task["status"]))).map((task) => text(task["id"]))),
-    [tasks],
+    () => new Set(graphTasks.filter((task) => ["done", "completed", "succeeded"].includes(text(task["status"]))).map((task) => text(task["id"]))),
+    [graphTasks],
   );
-  const parentIds = useMemo(() => new Set(tasks.map((task) => text(task["parentId"])).filter(Boolean)), [tasks]);
+  const parentIds = useMemo(() => new Set(graphTasks.map((task) => text(task["parentId"])).filter(Boolean)), [graphTasks]);
   const activeWorkers = useMemo(() => {
     const latest = new Map<string, { startedAt: number; state: string }>();
     for (const dispatch of dispatches) {
@@ -388,11 +382,11 @@ export function RunGraph({ runId, tasks, dispatches, onActivateTask }: { runId: 
     return new Set([...latest].filter(([, dispatch]) => ["starting", "running"].includes(dispatch.state)).map(([id]) => id));
   }, [dispatches]);
   const initialFocusId = useMemo(() => {
-    const active = tasks.find((task) => activeWorkers.has(text(task["id"])) || ["dispatched", "running", "starting"].includes(text(task["status"])));
+    const active = graphTasks.find((task) => activeWorkers.has(text(task["id"])) || ["dispatched", "running", "starting"].includes(text(task["status"])));
     if (active) return text(active["id"]);
-    const ready = tasks.find((task) => text(task["status"]) === "pending" && dependencies(task).every((dependency) => done.has(dependency)));
-    return text(ready?.["id"] ?? tasks.find((task) => dependencies(task).length === 0)?.["id"]);
-  }, [activeWorkers, done, tasks]);
+    const ready = graphTasks.find((task) => text(task["status"]) === "pending" && dependencies(task).every((dependency) => done.has(dependency)));
+    return text(ready?.["id"] ?? graphTasks.find((task) => dependencies(task).length === 0)?.["id"]);
+  }, [activeWorkers, done, graphTasks]);
 
   const viewportRef = useRef<HTMLDivElement>(null);
   const renderCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -414,12 +408,25 @@ export function RunGraph({ runId, tasks, dispatches, onActivateTask }: { runId: 
   const previousViewport = useRef<Size>({ width: 0, height: 0 });
 
   useLayoutEffect(() => {
+    setHistoryView(false);
+  }, [runId]);
+
+  useLayoutEffect(() => {
     transformRef.current = transform;
   }, [transform]);
 
   useLayoutEffect(() => () => {
     if (transformFrame.current !== undefined) cancelAnimationFrame(transformFrame.current);
   }, []);
+
+  const changeHistoryView = useCallback((next: boolean): void => {
+    if (next === historyView) return;
+    fitMode.current = true;
+    fitMaximum.current = MAX_ZOOM;
+    fitMinimum.current = MIN_ZOOM;
+    fitFocus.current = undefined;
+    setHistoryView(next);
+  }, [historyView]);
 
   const commitTransform = useCallback((next: ViewTransform): void => {
     if (transformFrame.current !== undefined) cancelAnimationFrame(transformFrame.current);
@@ -838,13 +845,11 @@ export function RunGraph({ runId, tasks, dispatches, onActivateTask }: { runId: 
     recenterFromMinimap(event.clientX, event.clientY);
   };
 
-  if (layout.nodes.length === 0) return null;
-
   const stateLabel = (state: NodeState, taskStatus: string): string => ({
     ready: t("就绪", "Ready"),
     running: t("运行中", "Running"),
     done: t("完成", "Done"),
-    superseded: t("已回退", "Superseded"),
+    superseded: t("已被新修订取代", "Superseded"),
     failed: t("失败", "Failed"),
     blocked: t("阻塞", "Blocked"),
     cancelled: t("已取消", "Cancelled"),
@@ -854,7 +859,7 @@ export function RunGraph({ runId, tasks, dispatches, onActivateTask }: { runId: 
     { state: "ready", label: t("就绪", "Ready") },
     { state: "running", label: t("运行中", "Running") },
     { state: "done", label: t("完成", "Done") },
-    { state: "superseded", label: t("已回退", "Superseded") },
+    { state: "superseded", label: t("已被新修订取代", "Superseded") },
     { state: "failed", label: t("失败", "Failed") },
     { state: "blocked", label: t("阻塞", "Blocked") },
   ];
@@ -877,6 +882,9 @@ export function RunGraph({ runId, tasks, dispatches, onActivateTask }: { runId: 
         onKeyDown={onKeyDown}
       >
         <canvas className="run-graph-render-layer" ref={renderCanvasRef} aria-hidden="true" />
+        {layout.nodes.length === 0 && (
+          <div className="run-graph-empty" role="status">{t("当前修订暂无节点", "No nodes in the current revision")}</div>
+        )}
         <div
           className="run-graph-canvas"
           style={{
@@ -911,7 +919,7 @@ export function RunGraph({ runId, tasks, dispatches, onActivateTask }: { runId: 
                   <span className="run-graph-state-dot" />
                   {stateLabel(visualState, taskStatus)}
                   {activeWorkers.has(node.id) && <Zap size={11} className="run-graph-worker" />}
-                  {taskStatus === "cancelled" && <span aria-hidden="true">↩</span>}
+                  {visualState === "cancelled" && <span aria-hidden="true">↩</span>}
                   {node.deps.length > 0 && <em>{node.deps.length}↑</em>}
                 </span>
               </button>
@@ -930,7 +938,7 @@ export function RunGraph({ runId, tasks, dispatches, onActivateTask }: { runId: 
             <button type="button" disabled={overviewTaskIds.length < 2} aria-label={t("上一个任务", "Previous task")} onClick={() => moveOverviewTask(-1)}>←</button>
             <span className="min-w-0 max-w-64 px-1 text-center" aria-live="polite">
               <strong className="block truncate" title={text(overviewTask["title"])}>{text(overviewTask["title"], t("未命名任务", "Untitled task"))}</strong>
-              <small className="text-muted-foreground">{overviewTaskIndex + 1} / {overviewTaskIds.length} · {status(text(overviewTask["status"]))}</small>
+              <small className="text-muted-foreground">{overviewTaskIndex + 1} / {overviewTaskIds.length} · {stateLabel(taskState(overviewTask, done, activeWorkers, parentIds), text(overviewTask["status"]))}</small>
             </span>
             <button type="button" disabled={overviewTaskIds.length < 2} aria-label={t("下一个任务", "Next task")} onClick={() => moveOverviewTask(1)}>→</button>
             <button type="button" disabled={!onActivateTask} onClick={() => overviewTaskId && onActivateTask?.(overviewTaskId)}>{t("查看任务", "View task")}</button>
@@ -952,6 +960,15 @@ export function RunGraph({ runId, tasks, dispatches, onActivateTask }: { runId: 
       <div className="run-graph-controls">
         <div className="run-graph-legend" aria-label={t("任务状态图例", "Task status legend")}>{legend.map((item) => <span key={item.state}><i data-state={item.state} />{item.label}</span>)}<span><i className="lineage" />{t("反馈 / 重试", "Feedback / retry")}</span></div>
         <div className="run-graph-control-end">
+          {!historyView && projection.hiddenCount > 0 && (
+            <span className="run-graph-history-count" role="status" aria-live="polite">
+              {t(`已隐藏 ${String(projection.hiddenCount)} 个历史修订节点`, `Hidden ${String(projection.hiddenCount)} historical revision nodes`)}
+            </span>
+          )}
+          <div className="run-graph-revision-toggle" role="group" aria-label={t("修订视图", "Revision view")}>
+            <button type="button" aria-pressed={!historyView} onClick={() => changeHistoryView(false)}>{t("当前修订", "Current revision")}</button>
+            <button type="button" aria-pressed={historyView} onClick={() => changeHistoryView(true)}>{t("完整历史", "Full history")}</button>
+          </div>
           <span>{layout.nodes.length} {t("个任务", "tasks")}</span>
           <div className="run-graph-zoom">
             <button type="button" aria-label={t("缩小", "Zoom out")} disabled={transform.zoom <= MIN_ZOOM + 0.001}
