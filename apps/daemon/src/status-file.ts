@@ -8,7 +8,7 @@
 import { chmodSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import type { SessionInfo } from "@prospero/protocol";
+import { CAPABILITY_AGENT_API_PROTOCOLS, type SessionInfo } from "@prospero/protocol";
 import type { SessionManager } from "./session-manager.js";
 import type { RelayRuntimeStatus } from "./relay-host-client.js";
 import { selectStatusSessions, type SessionStatusSummary } from "./session-list.js";
@@ -24,6 +24,8 @@ export interface StatusSession {
   pendingPermissions: number;
   pendingQuestions: number;
   createdAt: number;
+  accountId?: string;
+  accountName?: string;
   approvalPolicy?: string;
   preview?: string;
   busySince?: number;
@@ -57,6 +59,7 @@ export interface StatusSnapshot {
   /** 仅供同用户 Mac GUI 调用回环控制接口；status.json 权限固定为 0600。 */
   controlToken: string;
   persistence: { pty: boolean; structured: boolean };
+  capabilities: string[];
   /** Deliberately safe relay observability; credentials are never copied here. */
   relay?: RelayRuntimeStatus;
   /**
@@ -146,6 +149,7 @@ export class StatusFile {
       bind: this.meta.bind,
       controlToken: this.meta.controlToken,
       persistence: this.meta.persistence,
+      capabilities: [CAPABILITY_AGENT_API_PROTOCOLS],
       ...(this.relay ? { relay: this.relay } : {}),
       sessionSummary: selected.summary,
       sessions: selected.sessions.map(toStatusSession),
@@ -186,6 +190,8 @@ export function toStatusSession(info: SessionInfo): StatusSession {
     pendingQuestions: info.pendingQuestions ?? 0,
     createdAt: info.createdAt,
   };
+  if (info.accountId !== undefined) session.accountId = info.accountId;
+  if (info.accountName !== undefined) session.accountName = info.accountName;
   if (info.approvalPolicy !== undefined) session.approvalPolicy = info.approvalPolicy;
   if (info.preview !== undefined) session.preview = info.preview;
   if (info.busySince !== undefined) session.busySince = info.busySince;

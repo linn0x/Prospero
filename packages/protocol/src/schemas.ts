@@ -27,9 +27,16 @@ export const AgentCredentialKindSchema = z.enum(["oauth_token", "api_key"]);
 /** 外部 API Profile 按 Agent 的原生兼容协议连接，不另造一套 Agent。 */
 export const AgentApiProviderSchema = z.enum(["anthropic_compatible", "openai_compatible"]);
 
+export const AgentApiProtocolSchema = z.enum([
+  "openai_chat_completions",
+  "openai_responses",
+  "anthropic",
+]);
+
 /** 只同步可展示的连接元数据；API Key 永远不进入协议快照。 */
 export const AgentApiProfileSchema = z.object({
   provider: AgentApiProviderSchema,
+  protocol: AgentApiProtocolSchema.optional(),
   baseUrl: z.string().url().max(2000),
   model: z.string().min(1).max(300),
 });
@@ -365,6 +372,8 @@ export const C2SAgentAccountApiCreateSchema = z.object({
   requestId: z.string().min(1).max(100),
   agent: CodeAgentKindSchema,
   name: z.string().trim().min(1).max(80),
+  provider: AgentApiProviderSchema.optional(),
+  protocol: AgentApiProtocolSchema.optional(),
   baseUrl: z.string().trim().url().max(2000),
   model: z.string().trim().min(1).max(300),
   apiKey: z.string().trim().min(1).max(8192),
@@ -375,9 +384,12 @@ export const C2SAgentAccountApiConfigureSchema = z.object({
   type: z.literal("agent.account.api.configure"),
   requestId: z.string().min(1).max(100),
   accountId: z.string().min(1).max(100),
-  baseUrl: z.string().trim().url().max(2000),
-  model: z.string().trim().min(1).max(300),
-  apiKey: z.string().trim().min(1).max(8192),
+  name: z.string().trim().min(1).max(80).optional(),
+  provider: AgentApiProviderSchema.optional(),
+  protocol: AgentApiProtocolSchema.optional(),
+  baseUrl: z.string().trim().url().max(2000).optional(),
+  model: z.string().trim().min(1).max(300).optional(),
+  apiKey: z.string().max(8192).optional(),
 });
 
 export const C2SAgentAccountRenameSchema = z.object({
@@ -1554,6 +1566,7 @@ export const S2CAgentAccountsResultSchema = z.object({
   ]),
   ok: z.boolean(),
   accounts: z.array(AgentAccountSchema).max(100),
+  accountId: z.string().min(1).max(100).optional(),
   /** login 会新建官方 CLI 的交互终端，客户端可直接打开。 */
   sessionId: sid.optional(),
   error: z.string().max(2000).optional(),
@@ -1775,6 +1788,7 @@ export type AgentKind = z.infer<typeof AgentKindSchema>;
 export type CodeAgentKind = z.infer<typeof CodeAgentKindSchema>;
 export type AgentCredentialKind = z.infer<typeof AgentCredentialKindSchema>;
 export type AgentApiProvider = z.infer<typeof AgentApiProviderSchema>;
+export type AgentApiProtocol = z.infer<typeof AgentApiProtocolSchema>;
 export type AgentApiProfile = z.infer<typeof AgentApiProfileSchema>;
 export type AgentAccountStatus = z.infer<typeof AgentAccountStatusSchema>;
 export type AgentAccount = z.infer<typeof AgentAccountSchema>;

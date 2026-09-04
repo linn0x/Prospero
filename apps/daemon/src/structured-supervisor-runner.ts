@@ -80,6 +80,7 @@ interface RunnerConfig {
   /** Atomically-created /tmp parent, removed only by this runner on exit. */
   socketDir?: string;
   environment: Record<string, string>;
+  adapterAgent?: AgentKind;
   codexAppServerArgs?: string[];
   accountId?: string;
   accountName?: string;
@@ -89,7 +90,7 @@ interface RunnerConfig {
 const RUNNER_CONFIG_KEYS = new Set([
   "version", "sessionId", "agent", "title", "cwd", "createdAt", "approvalPolicy",
   "sessionDir", "attachmentRoot", "socketPath", "transport", "lifecycleEpoch", "socketDir",
-  "environment", "codexAppServerArgs", "accountId", "accountName", "initialAdapterState",
+  "environment", "adapterAgent", "codexAppServerArgs", "accountId", "accountName", "initialAdapterState",
 ]);
 const LEGACY_RUNNER_CONFIG_KEYS = new Set([...RUNNER_CONFIG_KEYS].filter(
   (key) => key !== "transport" && key !== "lifecycleEpoch",
@@ -137,6 +138,7 @@ function validConfigShape(value: Record<string, unknown>, allowLegacyTransport: 
     typeof value["attachmentRoot"] === "string" && typeof value["socketPath"] === "string" &&
     (value["socketDir"] === undefined || typeof value["socketDir"] === "string") &&
     stringRecord(value["environment"]) &&
+    (value["adapterAgent"] === undefined || value["adapterAgent"] === "opencode") &&
     (value["codexAppServerArgs"] === undefined || stringArray(value["codexAppServerArgs"])) &&
     (value["accountId"] === undefined || typeof value["accountId"] === "string") &&
     (value["accountName"] === undefined || typeof value["accountName"] === "string") &&
@@ -428,7 +430,7 @@ export async function runStructuredSupervisor(): Promise<void> {
     agent: config.agent,
     title: config.title,
     cwd: config.cwd,
-    adapter: adapterFor(config.agent, config.initialAdapterState),
+    adapter: adapterFor(config.adapterAgent ?? config.agent, config.initialAdapterState),
     environment: config.environment,
     ...(config.codexAppServerArgs ? { codexAppServerArgs: config.codexAppServerArgs } : {}),
     ...(config.accountId ? { accountId: config.accountId } : {}),

@@ -34,6 +34,7 @@ import { Sheet, SheetAction } from "@/components/Sheet";
 import { SwipeRow, type SwipeAction } from "@/components/SwipeRow";
 import { WorkspacePicker } from "@/components/WorkspacePicker";
 import { useAdaptiveLayout } from "@/lib/adaptive-layout";
+import { accountApiProfileRequiresStructured } from "@/lib/account-api-profile";
 import {
   getSessionPreferences,
   setProjectCollapsed,
@@ -211,13 +212,6 @@ export default function HostScreen() {
     end: width - balancedPaneWidth,
   };
 
-  const canSearchResume =
-    composing &&
-    launchIntent === "conversation" &&
-    sessionKind === "structured" &&
-    RESUMABLE.includes(agent) &&
-    runtime.status === "connected" &&
-    conn !== null;
   const codeAgent = agent === "claude" || agent === "codex" ? agent : null;
   const launchCatalogAgent = codeAgent ?? (agent === "deepseek" ? "deepseek" : null);
   const matchingAccounts = codeAgent
@@ -228,9 +222,25 @@ export default function HostScreen() {
       matchingAccounts.find((account) => account.isDefault) ??
       matchingAccounts[0]
     : undefined;
+  const selectedAccountUsesChat = selectedAccount?.apiProfile !== undefined &&
+    accountApiProfileRequiresStructured(selectedAccount.agent, selectedAccount.apiProfile.protocol);
+  const effectiveSessionKind: SessionKind = selectedAccountUsesChat ? "structured" : sessionKind;
+  const canSearchResume =
+    composing &&
+    launchIntent === "conversation" &&
+    effectiveSessionKind === "structured" &&
+    !selectedAccountUsesChat &&
+    RESUMABLE.includes(agent) &&
+    runtime.status === "connected" &&
+    conn !== null;
   const selectedLaunchModelInfo = launchModels.find(
     (model) => model.id === selectedLaunchModel,
   );
+
+  useEffect(() => {
+    const reset = setTimeout(() => setSelectedResume(null), 0);
+    return () => clearTimeout(reset);
+  }, [selectedAccount?.id, selectedAccountUsesChat]);
 
   // 账号目录属于电脑端；每次回到主机页重读，确保账号管理页的新增/默认/删除立即生效。
   useFocusEffect(
@@ -270,7 +280,7 @@ export default function HostScreen() {
   useEffect(() => {
     if (
       !composing ||
-      sessionKind !== "structured" ||
+      effectiveSessionKind !== "structured" ||
       launchCatalogAgent === null ||
       !conn?.supportsSessionCreateModel ||
       runtime.status !== "connected"
@@ -346,7 +356,8 @@ export default function HostScreen() {
     launchModelsReload,
     runtime.status,
     selectedAccount?.id,
-    sessionKind,
+    selectedAccount?.updatedAt,
+    effectiveSessionKind,
   ]);
 
   // 空查询列最近会话；输入后做短 debounce，旧请求通过 effect cleanup 丢弃。
@@ -587,9 +598,9 @@ export default function HostScreen() {
       ? "正在创建…"
       : launchIntent === "goal"
         ? "启动 Goal 协调者"
-        : sessionKind === "structured" && selectedResume
+        : effectiveSessionKind === "structured" && !selectedAccountUsesChat && selectedResume
           ? "恢复并打开对话"
-          : sessionKind === "structured" && launchMode === "plan"
+          : effectiveSessionKind === "structured" && !selectedAccountUsesChat && launchMode === "plan"
             ? "新建 Plan 会话"
             : "新建会话";
 
@@ -609,7 +620,7 @@ export default function HostScreen() {
     pendingCreateRef.current = true;
     const accountOption = selectedAccount ? { accountId: selectedAccount.id } : {};
     const modelOption =
-      sessionKind === "structured" &&
+      effectiveSessionKind === "structured" &&
       launchCatalogAgent !== null &&
       selectedLaunchModelInfo !== undefined
         ? {
@@ -636,20 +647,20 @@ export default function HostScreen() {
               ...(agent === "deepseek" && selectedLaunchPreset ? { agentPreset: selectedLaunchPreset } : {}),
               approvalPolicy,
               goal: objective,
-            ...(PLAN_CAPABLE.includes(agent) ? { mode: "plan" as const } : {}),
+            ...(PLAN_CAPABLE.includes(agent) && !selectedAccountUsesChat ? { mode: "plan" as const } : {}),
           }
-        : sessionKind === "structured" && RESUMABLE.includes(agent)
+        : effectiveSessionKind === "structured" && RESUMABLE.includes(agent)
             ? {
                 ...accountOption,
                 ...modelOption,
                 ...(agent === "deepseek" && selectedLaunchPreset ? { agentPreset: selectedLaunchPreset } : {}),
                 approvalPolicy,
-                ...(PLAN_CAPABLE.includes(agent) ? { mode: launchMode } : {}),
-              ...(selectedResume
+                ...(PLAN_CAPABLE.includes(agent) && !selectedAccountUsesChat ? { mode: launchMode } : {}),
+              ...(!selectedAccountUsesChat && selectedResume
                 ? { resume: { id: selectedResume.id, title: selectedResume.title } }
                 : {}),
             }
-          : sessionKind === "structured"
+          : effectiveSessionKind === "structured"
             ? {
                 ...accountOption,
                 ...modelOption,
@@ -662,7 +673,7 @@ export default function HostScreen() {
     const createKind = launchIntent === "goal"
       ? "structured"
       : STRUCTURED.includes(agent)
-        ? sessionKind
+        ? effectiveSessionKind
         : "pty";
     const sendCreate = (options: typeof sessionOptions): void => {
       const result = conn.createSession(agent, projectPath, undefined, createKind, 80, 24, options);
@@ -1098,47 +1109,48 @@ export default function HostScreen() {
                   <Text style={[styles.formLabel, styles.kindLabel]}>界面</Text>
                   <View style={styles.kindSwitch} accessibilityRole="tablist">
                 <Pressable
-                  style={[styles.kindOption, sessionKind === "structured" && styles.kindOptionActive]}
+                  style={[styles.kindOption, effectiveSessionKind === "structured" && styles.kindOptionActive]}
                   onPress={() => setSessionKind("structured")}
                   accessibilityRole="tab"
-                  accessibilityState={{ selected: sessionKind === "structured" }}
+                  accessibilityState={{ selected: effectiveSessionKind === "structured" }}
                   accessibilityLabel="创建对话会话"
                 >
                   <Icon
                     name="bubble.left.and.text.bubble.right"
                     size={14}
-                    color={sessionKind === "structured" ? color.text : color.textDim}
+                    color={effectiveSessionKind === "structured" ? color.text : color.textDim}
                   />
                   <Text
                     style={[
                       styles.kindOptionText,
-                      sessionKind === "structured" && styles.kindOptionTextActive,
+                      effectiveSessionKind === "structured" && styles.kindOptionTextActive,
                     ]}
                   >
                     对话
                   </Text>
                 </Pressable>
                 <Pressable
-                  style={[styles.kindOption, sessionKind === "pty" && styles.kindOptionActive]}
+                  style={[styles.kindOption, effectiveSessionKind === "pty" && styles.kindOptionActive]}
                   onPress={() => {
                     setSessionKind("pty");
                     setApprovalPolicy("strict");
                     setLaunchIntent("conversation");
                     setSelectedResume(null);
                   }}
+                  disabled={selectedAccountUsesChat}
                   accessibilityRole="tab"
-                  accessibilityState={{ selected: sessionKind === "pty" }}
+                  accessibilityState={{ selected: effectiveSessionKind === "pty", disabled: selectedAccountUsesChat }}
                   accessibilityLabel="创建终端会话"
                 >
                   <Icon
                     name="terminal"
                     size={14}
-                    color={sessionKind === "pty" ? color.text : color.textDim}
+                    color={effectiveSessionKind === "pty" ? color.text : color.textDim}
                   />
                   <Text
                     style={[
                       styles.kindOptionText,
-                      sessionKind === "pty" && styles.kindOptionTextActive,
+                      effectiveSessionKind === "pty" && styles.kindOptionTextActive,
                     ]}
                   >
                     终端
@@ -1146,13 +1158,15 @@ export default function HostScreen() {
                 </Pressable>
                   </View>
                   <Text style={styles.kindHelp}>
-                    {sessionKind === "structured"
-                      ? "消息、工具调用和审批以卡片展示"
+                    {selectedAccountUsesChat
+                      ? "Chat Completions API Profile 仅支持对话界面"
+                      : effectiveSessionKind === "structured"
+                        ? "消息、工具调用和审批以卡片展示"
                       : `启动 ${agent} TUI，可直接操作完整终端`}
                   </Text>
                 </>
               )}
-              {sessionKind === "structured" && launchCatalogAgent && conn?.supportsSessionCreateModel && (
+              {effectiveSessionKind === "structured" && launchCatalogAgent && conn?.supportsSessionCreateModel && (
                 <>
                   <View style={[styles.accountLabelRow, styles.kindLabel]}>
                     <Text style={styles.formLabel}>模型</Text>
@@ -1267,7 +1281,7 @@ export default function HostScreen() {
                   )}
                 </>
               )}
-              {sessionKind === "structured" &&
+              {effectiveSessionKind === "structured" &&
                 launchCatalogAgent &&
                 conn &&
                 !conn.supportsSessionCreateModel && (
@@ -1278,7 +1292,7 @@ export default function HostScreen() {
                     </Text>
                   </>
                 )}
-              {sessionKind === "structured" && (
+              {effectiveSessionKind === "structured" && (
                 <>
                   <Text style={[styles.formLabel, styles.kindLabel]}>发起方式</Text>
                   <View style={styles.kindSwitch} accessibilityRole="tablist">
@@ -1324,7 +1338,7 @@ export default function HostScreen() {
                   </Text>
                 </>
               )}
-              {sessionKind === "structured" && (
+              {effectiveSessionKind === "structured" && (
                 <>
                   <Text style={[styles.formLabel, styles.kindLabel]}>审批策略</Text>
                   <View style={styles.kindSwitch} accessibilityRole="radiogroup">
@@ -1376,9 +1390,9 @@ export default function HostScreen() {
                   </Text>
                 </>
               )}
-              {sessionKind === "structured" && launchIntent === "conversation" && RESUMABLE.includes(agent) && (
+              {effectiveSessionKind === "structured" && !selectedAccountUsesChat && launchIntent === "conversation" && RESUMABLE.includes(agent) && (
                 <>
-                  {PLAN_CAPABLE.includes(agent) && (
+                  {PLAN_CAPABLE.includes(agent) && !selectedAccountUsesChat && (
                     <>
                       <Text style={[styles.formLabel, styles.kindLabel]}>启动模式</Text>
                       <View style={styles.kindSwitch} accessibilityRole="tablist">
@@ -1508,7 +1522,7 @@ export default function HostScreen() {
                   )}
                 </>
               )}
-              {sessionKind === "structured" && launchIntent === "goal" && (
+              {effectiveSessionKind === "structured" && launchIntent === "goal" && (
                 <>
                   <Text style={[styles.formLabel, styles.kindLabel]}>Goal</Text>
                   <TextInput
@@ -1525,7 +1539,9 @@ export default function HostScreen() {
                     accessibilityLabel="Goal 目标"
                   />
                   <Text style={styles.kindHelp}>
-                    Goal 会创建新的协调者会话，不能接回已有原生对话；Claude 和 Codex 会从 Plan 开始。
+                    {selectedAccountUsesChat
+                      ? "Goal 会创建新的 OpenCode 协调者会话，不能接回已有原生对话。"
+                      : "Goal 会创建新的协调者会话，不能接回已有原生对话；Claude 和 Codex 会从 Plan 开始。"}
                   </Text>
                 </>
               )}

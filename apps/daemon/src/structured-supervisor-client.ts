@@ -694,6 +694,7 @@ export interface LaunchStructuredSupervisorInput {
   createdAt: number;
   approvalPolicy?: ApprovalPolicy;
   environment: Record<string, string>;
+  adapterAgent?: AgentKind;
   codexAppServerArgs?: string[];
   accountId?: string;
   accountName?: string;
@@ -1003,6 +1004,7 @@ export async function launchStructuredSupervisor(input: LaunchStructuredSupervis
       createdAt: input.createdAt, approvalPolicy: input.approvalPolicy, sessionDir,
       attachmentRoot: path.join(sessionDir, "attachments"), socketPath, transport, lifecycleEpoch,
       socketDir, environment: input.environment,
+      ...(input.adapterAgent ? { adapterAgent: input.adapterAgent } : {}),
       ...(input.codexAppServerArgs ? { codexAppServerArgs: input.codexAppServerArgs } : {}),
       ...(input.accountId ? { accountId: input.accountId } : {}), ...(input.accountName ? { accountName: input.accountName } : {}),
       ...(input.initialAdapterState ? { initialAdapterState: input.initialAdapterState } : {}),

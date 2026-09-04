@@ -163,9 +163,9 @@ describe("handshake + SecureChannel", () => {
     }
   });
 
-  it("daemon 与 v12/v11/.../v5 回退版本协商，并为 v8+ 认证协商结果", () => {
+  it("daemon 与 v15/v14/.../v5 回退版本协商，并为 v8+ 认证协商结果", () => {
     const daemon = generateKeyPairB64();
-    for (const version of [12, 11, 10, 9, 8, 7, 5]) {
+    for (const version of [15, 14, 13, 12, 11, 10, 9, 8, 7, 5]) {
       const start = clientHandshakeStart(version);
       const responded = serverHandshakeRespond(start.frame, daemon.secretKey);
       expect(responded.state.protocolVersion).toBe(version);
@@ -191,7 +191,7 @@ describe("handshake + SecureChannel", () => {
   });
 
   it("客户端只允许显式维护的回退版本", () => {
-    expect(SUPPORTED_PROTOCOL_VERSIONS).toEqual([15, 14, 13, 12, 11, 10, 9, 8, 7, 5]);
+    expect(SUPPORTED_PROTOCOL_VERSIONS).toEqual([16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 5]);
     expect(() => clientHandshakeStart(6)).toThrowError(/unsupported client protocol/);
   });
 

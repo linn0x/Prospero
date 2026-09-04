@@ -23,6 +23,27 @@ export function restoredSessionIds(
   return [...new Set(ordered)].slice(0, Math.max(0, limit));
 }
 
+export function upsertHydratedSession(
+  sessions: readonly SessionInfo[],
+  session: SessionInfo,
+  limit: number,
+): SessionInfo[] {
+  return [session, ...sessions.filter((item) => item.id !== session.id)]
+    .slice(0, Math.max(0, Math.floor(limit)));
+}
+
+export function validOpenSessionIds(
+  openIds: readonly string[],
+  sessions: readonly Pick<SessionInfo, "id">[],
+): string[] {
+  const available = new Set(sessions.map((session) => session.id));
+  return openIds.filter((id) => available.has(id));
+}
+
+export function workspaceChromeVisible(focus: boolean): boolean {
+  return !focus;
+}
+
 type DesktopShortcutEvent = Pick<
   KeyboardEvent,
   | "altKey"

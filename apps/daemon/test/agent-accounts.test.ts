@@ -371,7 +371,7 @@ describe("Code Agent 账号隔离", () => {
     const codexKey = "codex-third-party-key";
     const claudeKey = "claude-third-party-key";
     const codex = await accounts.createApi("codex", "公司网关", {
-      baseUrl: "https://openai-gateway.example.com/v1/",
+      baseUrl: "https://openai-gateway.example.com/v1/responses",
       model: "acme-coder",
       apiKey: codexKey,
     });
@@ -383,6 +383,7 @@ describe("Code Agent 账号隔离", () => {
 
     expect(codex.apiProfile).toEqual({
       provider: "openai_compatible",
+      protocol: "openai_responses",
       baseUrl: "https://openai-gateway.example.com/v1",
       model: "acme-coder",
     });
@@ -399,13 +400,14 @@ describe("Code Agent 账号隔离", () => {
     ]));
     expect(claude.apiProfile).toEqual({
       provider: "anthropic_compatible",
-      baseUrl: "https://anthropic-gateway.example.com/v1",
+      protocol: "anthropic",
+      baseUrl: "https://anthropic-gateway.example.com",
       model: "acme-claude",
     });
     expect(claude.environment).toMatchObject({
       ANTHROPIC_API_KEY: claudeKey,
-      ANTHROPIC_BASE_URL: "https://anthropic-gateway.example.com/v1",
-      CLAUDE_CODE_API_BASE_URL: "https://anthropic-gateway.example.com/v1",
+      ANTHROPIC_BASE_URL: "https://anthropic-gateway.example.com",
+      CLAUDE_CODE_API_BASE_URL: "",
       ANTHROPIC_MODEL: "acme-claude",
       CLAUDE_CODE_OAUTH_TOKEN: "",
       CLAUDE_CONFIG_DIR: path.join(home, "agent-accounts", "claude", claude.id),
@@ -451,6 +453,183 @@ describe("Code Agent 账号隔离", () => {
     expect(accounts.resolve(codex.id, "codex").environment["OPENAI_API_KEY"]).toBe("");
   });
 
+  it("Chat Completions Profile 使用隔离 OpenCode runtime 且空 key 更新保留凭据", async () => {
+    const home = tempHome();
+    const calls: Array<{ file: string; args: string[]; env: Record<string, string> }> = [];
+    const credentialStore = new MemoryCredentialStore();
+    const accounts = new AgentAccountManager(home, signedInRunner(calls), credentialStore);
+    const apiKey = "chat-profile-secret";
+    const profile = await accounts.createApi("codex", "Chat 网关", {
+      provider: "openai_compatible",
+      protocol: "openai_chat_completions",
+      baseUrl: "https://chat.example.com/v1/chat/completions/",
+      model: "chat-coder",
+      apiKey,
+    });
+
+    expect(profile.apiProfile).toEqual({
+      provider: "openai_compatible",
+      protocol: "openai_chat_completions",
+      baseUrl: "https://chat.example.com/v1",
+      model: "chat-coder",
+    });
+    expect(profile.adapterAgent).toBe("opencode");
+    expect(profile.codexAppServerArgs).toBeUndefined();
+    expect(profile.environment).toMatchObject({
+      OPENAI_API_KEY: apiKey,
+      OPENCODE_DISABLE_PROJECT_CONFIG: "1",
+    });
+    expect(new Set([
+      profile.environment["XDG_CONFIG_HOME"],
+      profile.environment["XDG_DATA_HOME"],
+      profile.environment["XDG_CACHE_HOME"],
+      profile.environment["XDG_STATE_HOME"],
+    ]).size).toBe(4);
+    const config = readFileSync(profile.environment["PROSPERO_API_PROFILE_CONFIG"]!, "utf8");
+    expect(config).not.toContain(apiKey);
+    expect(JSON.parse(config)).toMatchObject({
+      model: "prospero/chat-coder",
+      provider: {
+        prospero: {
+          npm: "@ai-sdk/openai-compatible",
+          env: ["OPENAI_API_KEY"],
+          options: { baseURL: "https://chat.example.com/v1" },
+          models: { "chat-coder": { name: "chat-coder", tool_call: true } },
+        },
+      },
+    });
+    const secondProfile = await accounts.createApi("codex", "Chat 网关副本", {
+      provider: "openai_compatible",
+      protocol: "openai_chat_completions",
+      baseUrl: "https://chat.example.com/v1",
+      model: "chat-coder",
+      apiKey,
+    });
+    expect(secondProfile.environment["PROSPERO_API_PROFILE_CONFIG"])
+      .not.toBe(profile.environment["PROSPERO_API_PROFILE_CONFIG"]);
+    expect(secondProfile.environment["XDG_DATA_HOME"]).not.toBe(profile.environment["XDG_DATA_HOME"]);
+
+    await accounts.configureApi(profile.id, {
+      name: "Chat 网关 2",
+      baseUrl: "https://chat-2.example.com/v1/chat/completions",
+      model: "chat-coder-2",
+      apiKey: "",
+    });
+    expect(credentialStore.values.get(profile.id)?.secret).toBe(apiKey);
+    expect(accounts.resolve(profile.id, "codex")).toMatchObject({
+      name: "Chat 网关 2",
+      apiProfile: {
+        protocol: "openai_chat_completions",
+        baseUrl: "https://chat-2.example.com/v1",
+        model: "chat-coder-2",
+      },
+    });
+    await expect(accounts.configureApi(profile.id, {
+      name: "",
+      apiKey: "must-not-be-written",
+    })).rejects.toMatchObject({ code: "account_invalid" });
+    expect(credentialStore.values.get(profile.id)?.secret).toBe(apiKey);
+
+    const selectedAdapters: string[] = [];
+    const sessions = new SessionManager({
+      home,
+      accountResolver: (accountId, agent) => accounts.resolve(accountId, agent),
+      adapterFactory: (agent) => {
+        selectedAdapters.push(agent);
+        return new EnvAdapter([]);
+      },
+    });
+    await expect(sessions.launchModels("codex", profile.id)).resolves.toEqual({
+      models: [{ id: "chat-coder-2", label: "chat-coder-2", supportedEfforts: [], isDefault: true }],
+      currentModel: "chat-coder-2",
+    });
+    expect(selectedAdapters).toEqual([]);
+    await expect(sessions.create({
+      agent: "codex",
+      accountId: profile.id,
+      kind: "structured",
+      resume: { id: "native-codex-thread" },
+      cwd: home,
+      cols: 80,
+      rows: 24,
+      allowShell: false,
+    })).rejects.toThrow(/暂不支持接回/);
+    expect(selectedAdapters).toEqual([]);
+    await expect(sessions.create({
+      agent: "codex",
+      accountId: profile.id,
+      kind: "structured",
+      mode: "plan",
+      cwd: home,
+      cols: 80,
+      rows: 24,
+      allowShell: false,
+    })).rejects.toThrow(/暂不支持 Plan/);
+    await expect(sessions.create({
+      agent: "codex",
+      accountId: profile.id,
+      kind: "structured",
+      model: "another-model",
+      cwd: home,
+      cols: 80,
+      rows: 24,
+      allowShell: false,
+    })).rejects.toThrow(/只能使用已配置的模型/);
+    await sessions.create({
+      agent: "codex",
+      accountId: profile.id,
+      kind: "structured",
+      cwd: home,
+      cols: 80,
+      rows: 24,
+      allowShell: false,
+    });
+    expect(selectedAdapters).toEqual(["opencode"]);
+    await expect(accounts.configureApi(profile.id, {
+      protocol: "openai_responses",
+    }, sessions.list())).rejects.toMatchObject({ code: "account_in_use" });
+    await expect(accounts.configureApi(profile.id, {
+      name: "运行中的 Chat",
+      apiKey: "rotated-chat-key",
+    }, sessions.list())).rejects.toMatchObject({ code: "account_in_use" });
+    await expect(accounts.configureApi(profile.id, {
+      name: "运行中的 Chat",
+    }, sessions.list())).resolves.toBeUndefined();
+    await expect(accounts.setCredential(
+      profile.id,
+      "api_key",
+      "rotated-through-credential-action",
+      sessions.list(),
+    )).rejects.toMatchObject({ code: "account_in_use" });
+    await expect(accounts.logout(profile.id, sessions.list()))
+      .rejects.toMatchObject({ code: "account_in_use" });
+    expect(credentialStore.values.get(profile.id)?.secret).toBe(apiKey);
+    await sessions.disposeAll();
+    await accounts.snapshot([]);
+    expect(calls.some((call) => call.file === "opencode" && call.args[0] === "--version")).toBe(true);
+  });
+
+  it("旧 API Profile 推断协议并迁移 endpoint", () => {
+    const home = tempHome();
+    writeFileSync(path.join(home, "agent-accounts.json"), JSON.stringify({
+      version: 1,
+      accounts: [
+        { id: "legacy-chat", agent: "codex", name: "旧 Chat", apiProfile: { baseUrl: "https://chat.example.com/v1/chat/completions", model: "chat" }, createdAt: 1, updatedAt: 1 },
+        { id: "legacy-responses", agent: "codex", name: "旧 Responses", apiProfile: { provider: "openai_compatible", baseUrl: "https://responses.example.com/v1", model: "responses" }, createdAt: 1, updatedAt: 1 },
+        { id: "legacy-anthropic", agent: "claude", name: "旧 Anthropic", apiProfile: { provider: "anthropic_compatible", baseUrl: "https://anthropic.example.com/v1/messages", model: "claude" }, createdAt: 1, updatedAt: 1 },
+      ],
+      defaults: {},
+    }));
+
+    const accounts = new AgentAccountManager(home, signedInRunner([]), new MemoryCredentialStore());
+    expect(accounts.resolve("legacy-chat").apiProfile).toMatchObject({ protocol: "openai_chat_completions", baseUrl: "https://chat.example.com/v1" });
+    expect(accounts.resolve("legacy-responses").apiProfile).toMatchObject({ protocol: "openai_responses", baseUrl: "https://responses.example.com/v1" });
+    expect(accounts.resolve("legacy-anthropic").apiProfile).toMatchObject({ protocol: "anthropic", baseUrl: "https://anthropic.example.com" });
+    accounts.rename("legacy-chat", "迁移后的 Chat");
+    const persisted = JSON.parse(readFileSync(path.join(home, "agent-accounts.json"), "utf8")) as { accounts: unknown[] };
+    expect(persisted.accounts[0]).toMatchObject({ name: "迁移后的 Chat", apiProfile: { protocol: "openai_chat_completions" } });
+  });
+
   it("第三方 API Profile 拒绝会将密钥发送到非本机 HTTP 或 URL 查询参数的地址", async () => {
     const home = tempHome();
     const accounts = new AgentAccountManager(home, signedInRunner([]), new MemoryCredentialStore());
@@ -461,6 +640,13 @@ describe("Code Agent 账号隔离", () => {
     })).rejects.toMatchObject({ code: "account_invalid" } satisfies Partial<AgentAccountError>);
     await expect(accounts.createApi("claude", "含查询", {
       baseUrl: "https://gateway.example.com/v1?token=do-not-store",
+      model: "test-model",
+      apiKey: "key",
+    })).rejects.toMatchObject({ code: "account_invalid" } satisfies Partial<AgentAccountError>);
+    await expect(accounts.createApi("codex", "协议错配", {
+      provider: "anthropic_compatible",
+      protocol: "anthropic",
+      baseUrl: "https://gateway.example.com",
       model: "test-model",
       apiKey: "key",
     })).rejects.toMatchObject({ code: "account_invalid" } satisfies Partial<AgentAccountError>);
@@ -500,5 +686,131 @@ describe("Code Agent 账号隔离", () => {
     expect(() => statSync(account.environment["CLAUDE_CONFIG_DIR"]!)).toThrow();
     expect(credentialStore.deleted).toContain(account.id);
     expect(calls.some((call) => call.file === "claude" && call.args.join(" ") === "auth logout")).toBe(false);
+  });
+
+  it("删除账号后终态历史仍可在 daemon 重启时只读恢复", async () => {
+    const home = tempHome();
+    const accounts = new AgentAccountManager(home, signedInRunner([]), new MemoryCredentialStore());
+    const account = await accounts.createApi("codex", "可删除 Profile", {
+      baseUrl: "https://gateway.example.com/v1",
+      model: "coder",
+      apiKey: "profile-key",
+    });
+    const first = new SessionManager({
+      home,
+      accountResolver: (accountId, agent) => accounts.resolve(accountId, agent),
+      adapterFactory: () => new EnvAdapter([]),
+    });
+    const session = await first.create({
+      agent: "codex",
+      accountId: account.id,
+      kind: "structured",
+      cwd: home,
+      cols: 80,
+      rows: 24,
+      allowShell: false,
+    });
+    await first.kill(session.id, { preserveHistory: true });
+    await accounts.delete(account.id, first.list());
+    await first.disposeAll();
+
+    const starts: AdapterContext[] = [];
+    const restarted = new SessionManager({
+      home,
+      accountResolver: (accountId, agent) => accounts.resolve(accountId, agent),
+      adapterFactory: () => new EnvAdapter(starts),
+    });
+    expect(await restarted.restoreStructured()).toEqual([
+      expect.objectContaining({ id: session.id, status: "done", accountId: account.id }),
+    ]);
+    expect(starts).toEqual([]);
+    await restarted.disposeAll();
+  });
+
+  it.skipIf(process.platform === "win32")("账号会话启动期间拒绝破坏配置并在启动失败后释放 lease", async () => {
+    const home = tempHome();
+    const accounts = new AgentAccountManager(home, signedInRunner([]), new MemoryCredentialStore());
+    const account = await accounts.createApi("codex", "启动中 Profile", {
+      baseUrl: "https://gateway.example.com/v1",
+      model: "coder",
+      apiKey: "profile-key",
+    });
+    let entered!: () => void;
+    let rejectLaunch!: (error: Error) => void;
+    const launchEntered = new Promise<void>((resolve) => { entered = resolve; });
+    const launch = new Promise<never>((_resolve, reject) => { rejectLaunch = reject; });
+    const sessions = new SessionManager({
+      home,
+      accountResolver: (accountId, agent) => accounts.resolve(accountId, agent),
+      supervisorLauncher: async () => {
+        entered();
+        return launch;
+      },
+    });
+    const creating = sessions.create({
+      agent: "codex",
+      accountId: account.id,
+      kind: "structured",
+      cwd: home,
+      cols: 80,
+      rows: 24,
+      allowShell: false,
+    });
+    await launchEntered;
+
+    expect(sessions.list()).toEqual([]);
+    expect(sessions.accountInUse(account.id)).toBe(true);
+    await expect(accounts.configureApi(account.id, {
+      baseUrl: "https://other.example.com/v1",
+    }, sessions.list(), sessions.accountInUse(account.id))).rejects.toMatchObject({ code: "account_in_use" });
+    await expect(accounts.setCredential(
+      account.id,
+      "api_key",
+      "replacement-key",
+      sessions.list(),
+      sessions.accountInUse(account.id),
+    )).rejects.toMatchObject({ code: "account_in_use" });
+    await expect(accounts.logout(account.id, sessions.list(), sessions.accountInUse(account.id)))
+      .rejects.toMatchObject({ code: "account_in_use" });
+    await expect(accounts.delete(account.id, sessions.list(), sessions.accountInUse(account.id)))
+      .rejects.toMatchObject({ code: "account_in_use" });
+
+    rejectLaunch(new Error("launch failed"));
+    await expect(creating).rejects.toThrow(/launch failed/);
+    expect(sessions.accountInUse(account.id)).toBe(false);
+    await expect(accounts.configureApi(account.id, {
+      baseUrl: "https://other.example.com/v1",
+    }, sessions.list(), sessions.accountInUse(account.id))).resolves.toBeUndefined();
+  });
+
+  it.skipIf(process.platform === "win32")("账号登录 PTY 启动期间持有相同 lease", async () => {
+    const home = tempHome();
+    const accounts = new AgentAccountManager(home, signedInRunner([]), new MemoryCredentialStore());
+    const account = accounts.create("claude", "登录中账号");
+    let entered!: () => void;
+    let rejectLaunch!: (error: Error) => void;
+    const launchEntered = new Promise<void>((resolve) => { entered = resolve; });
+    const launch = new Promise<never>((_resolve, reject) => { rejectLaunch = reject; });
+    const sessions = new SessionManager({
+      home,
+      ptySupervisorLauncher: async () => {
+        entered();
+        return launch;
+      },
+    });
+    const creating = sessions.createAccountLogin({
+      binding: account,
+      command: { file: "claude", args: ["auth", "login"] },
+    }, 80, 24);
+    await launchEntered;
+
+    expect(sessions.list()).toEqual([]);
+    expect(sessions.accountInUse(account.id)).toBe(true);
+    await expect(accounts.delete(account.id, sessions.list(), sessions.accountInUse(account.id)))
+      .rejects.toMatchObject({ code: "account_in_use" });
+    rejectLaunch(new Error("login launch failed"));
+    await expect(creating).rejects.toThrow(/login launch failed/);
+    expect(sessions.accountInUse(account.id)).toBe(false);
+    await expect(accounts.delete(account.id, [], sessions.accountInUse(account.id))).resolves.toBeUndefined();
   });
 });
