@@ -1020,6 +1020,7 @@ kbd {
 }
 .run-graph-viewport:active { cursor: grabbing; }
 .run-graph-viewport:focus-visible { box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--primary) 65%, transparent); }
+.run-graph-empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted-foreground); font-size: 12px; pointer-events: none; }
 .run-graph-render-layer { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; contain: strict; }
 .run-graph-canvas { position: absolute; top: 0; left: 0; transform-origin: 0 0; pointer-events: none; contain: layout paint style; will-change: transform; }
 .run-graph-node {
@@ -1096,7 +1097,13 @@ kbd {
 .run-graph-legend { min-width: 0; gap: 10px; overflow: hidden; white-space: nowrap; }
 .run-graph-legend > span { gap: 4px; }
 .run-graph-legend i.lineage { width: 13px; height: 6px; flex: none; border: 1.4px dashed var(--primary); border-radius: 999px; }
-.run-graph-control-end { flex: none; gap: 10px; }
+.run-graph-control-end { max-width: 100%; flex: none; flex-wrap: wrap; justify-content: flex-end; gap: 4px 10px; }
+.run-graph-history-count { white-space: nowrap; }
+.run-graph-revision-toggle { display: flex; padding: 2px; border: 1px solid var(--border); border-radius: 7px; background: var(--card); }
+.run-graph-revision-toggle button { min-height: 23px; padding: 0 7px; color: var(--muted-foreground); border: 0; border-radius: 5px; background: transparent; font-size: inherit; cursor: pointer; }
+.run-graph-revision-toggle button:hover { color: var(--foreground); }
+.run-graph-revision-toggle button:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+.run-graph-revision-toggle button[aria-pressed="true"] { color: var(--foreground); background: var(--accent); }
 .run-graph-zoom { gap: 2px; }
 .run-graph-zoom button { display: inline-flex; min-width: 28px; height: 28px; align-items: center; justify-content: center; padding: 0 6px; color: inherit; border: 0; border-radius: 6px; background: transparent; font-size: 11px; font-variant-numeric: tabular-nums; cursor: pointer; }
 .run-graph-zoom button:hover:not(:disabled) { color: var(--accent-foreground); background: var(--accent); }
@@ -1104,6 +1111,7 @@ kbd {
 
 @media (max-width: 1180px) {
   .run-graph-legend { display: none; }
+  .run-graph-control-end { width: 100%; }
   .dag-active .orchestration-summary { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .run-detail-dag .run-hero { align-items: stretch; flex-direction: column; }
   .run-detail-dag .run-hero-copy { width: 100%; min-width: 0; }
@@ -1124,6 +1132,8 @@ kbd {
   .dag-active .orchestration-summary { grid-template-columns: repeat(4, minmax(0, 1fr)); padding-right: 12px; padding-left: 12px; }
   .run-views-dag { min-height: max(300px, calc(100svh - 300px)); }
   .run-graph-minimap { width: 126px; height: 78px; }
+  .run-graph-history-count { flex-basis: 100%; text-align: right; }
+  .run-graph-control-end > span:not(.run-graph-history-count) { display: none; }
 }
 
 :root[data-platform="darwin"] .sidebar-shell-header { min-height: 56px; padding-left: 78px; }
