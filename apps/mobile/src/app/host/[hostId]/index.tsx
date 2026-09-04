@@ -729,21 +729,24 @@ export default function HostScreen() {
         id: "toggle-archive",
         label: archived ? "恢复" : "归档",
         symbol: "archivebox",
-        color: "#766A45",
+        color: color.warn,
+        foregroundColor: color.onAccent,
         onPress: () => changeArchive(session.id, !archived),
       },
       {
         id: "open-files",
         label: "文件",
         symbol: "doc.on.doc",
-        color: "#3a6ea5",
+        color: color.accent,
+        foregroundColor: color.onAccent,
         onPress: () => router.push(`/host/${hostId}/files/${session.id}`),
       },
       {
         id: "end-session",
         label: "删除",
         symbol: "trash",
-        color: "#e5534b",
+        color: color.danger,
+        foregroundColor: color.onAccent,
         onPress: () => setDeleteTarget(session),
       },
     ];
@@ -936,7 +939,7 @@ export default function HostScreen() {
                     autoCorrect={false}
                     spellCheck={false}
                     clearButtonMode="while-editing"
-                    keyboardAppearance="dark"
+                    keyboardAppearance="default"
                     accessibilityLabel="工作目录"
                   />
                 </View>
@@ -1443,7 +1446,7 @@ export default function HostScreen() {
                       autoCapitalize="none"
                       autoCorrect={false}
                       clearButtonMode="while-editing"
-                      keyboardAppearance="dark"
+                      keyboardAppearance="default"
                       accessibilityLabel="搜索本机可恢复对话"
                     />
                     {resumeLoading && <ActivityIndicator size="small" color={color.accent} />}
@@ -1518,7 +1521,7 @@ export default function HostScreen() {
                     multiline
                     textAlignVertical="top"
                     autoCorrect
-                    keyboardAppearance="dark"
+                    keyboardAppearance="default"
                     accessibilityLabel="Goal 目标"
                   />
                   <Text style={styles.kindHelp}>
@@ -1539,7 +1542,7 @@ export default function HostScreen() {
             accessibilityState={{ disabled: runtime.status !== "connected" || createDelivery !== null, busy: createDelivery !== null }}
           >
             <View style={styles.createBtnContent}>
-              {createDelivery !== null && <ActivityIndicator size="small" color="#0A0A0C" />}
+              {createDelivery !== null && <ActivityIndicator size="small" color={color.onAccent} />}
               <Text style={styles.createBtnText}>{createButtonLabel}</Text>
             </View>
           </Pressable>
@@ -1603,7 +1606,7 @@ export default function HostScreen() {
           <RefreshControl
             refreshing={runtime.status === "connecting" || runtime.status === "reconnecting"}
             onRefresh={() => conn?.kick()}
-            tintColor="#7aa2f7"
+            tintColor={color.accent}
           />
         }
         ListHeaderComponent={
@@ -1883,7 +1886,7 @@ const SessionRow = memo(function SessionRow({
             <View
               style={[
                 styles.dot,
-                { backgroundColor: stale ? "#3a3a44" : statusColor[session.status] },
+                { backgroundColor: stale ? color.textFaint : statusColor[session.status] },
               ]}
             />
             <Text style={styles.cardTitle} numberOfLines={1}>{session.title}</Text>
@@ -1897,7 +1900,7 @@ const SessionRow = memo(function SessionRow({
             <Text
               style={[
                 styles.cardStatus,
-                { color: stale ? "#5a5a66" : statusColor[session.status] },
+                { color: stale ? color.textFaint : statusColor[session.status] },
               ]}
             >
               {statusLabel[session.status]}{stale ? "(离线前)" : ""}

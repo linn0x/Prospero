@@ -1,5 +1,6 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
+  AppState,
   Platform,
   Pressable,
   ScrollView,
@@ -25,6 +26,7 @@ import {
 import { getHosts, type StoredHost } from "@/lib/hosts";
 import {
   canDisplayProgressOverlay,
+  isProgressOverlaySupported,
   openProgressOverlaySettings,
 } from "@/lib/running-session-progress";
 import { useApp, type ConnStatus, type HostRuntime } from "@/lib/store";
@@ -190,6 +192,8 @@ export default function SettingsScreen(): React.ReactElement {
   const insets = useSafeAreaInsets();
   const [hosts, setLocalHosts] = useState<StoredHost[]>(() => useApp.getState().hosts);
   const [overlayAvailable, setOverlayAvailable] = useState(canDisplayProgressOverlay());
+  const [overlayPermissionPending, setOverlayPermissionPending] = useState(false);
+  const overlaySupported = isProgressOverlaySupported();
   const settings = normalizeHomeSettings(
     useApp((state) => state.homeSettings) ?? DEFAULT_HOME_SETTINGS,
   );
@@ -219,6 +223,37 @@ export default function SettingsScreen(): React.ReactElement {
     },
     [setHomeSettings],
   );
+
+  useEffect(() => {
+    if (Platform.OS !== "android") return undefined;
+    const reconcileOverlayPermission = (): void => {
+      const available = canDisplayProgressOverlay();
+      setOverlayAvailable(available);
+
+      if (overlayPermissionPending) {
+        setOverlayPermissionPending(false);
+        if (available) {
+          updateSettings({
+            backgroundProgressEnabled: true,
+            overlayProgressEnabled: true,
+          });
+        }
+        return;
+      }
+
+      if (!available && useApp.getState().homeSettings?.overlayProgressEnabled) {
+        updateSettings({ overlayProgressEnabled: false });
+      }
+    };
+    const stateSubscription = AppState.addEventListener("change", (nextState) => {
+      if (nextState === "active") reconcileOverlayPermission();
+    });
+    const focusSubscription = AppState.addEventListener("focus", reconcileOverlayPermission);
+    return () => {
+      stateSubscription.remove();
+      focusSubscription.remove();
+    };
+  }, [overlayPermissionPending, updateSettings]);
 
   const updateRecentLimit = (recentSessionLimit: HomeRecentSessionLimit): void => {
     updateSettings({ recentSessionLimit });
@@ -292,27 +327,53 @@ export default function SettingsScreen(): React.ReactElement {
             <SettingRow
               title="其他应用上层悬浮框"
               detail={
-                overlayAvailable
-                  ? "切到后台时显示，可拖动或点按返回"
-                  : "需要授予“显示在其他应用上层”权限"
+                !overlaySupported
+                  ? "当前安装包不包含悬浮窗模块，请更新应用"
+                  : overlayPermissionPending
+                    ? "请在系统页面允许显示在其他应用上层"
+                    : overlayAvailable
+                      ? "后台显示进度；待审批时可拒绝或允许一次"
+                      : "开启时将前往系统页面授予悬浮窗权限"
               }
               last
             >
               <Switch
-                value={settings.overlayProgressEnabled}
+                disabled={!overlaySupported || overlayPermissionPending}
+                value={settings.overlayProgressEnabled || overlayPermissionPending}
                 onValueChange={(value) => {
+                  if (!value) {
+                    setOverlayPermissionPending(false);
+                    updateSettings({ overlayProgressEnabled: false });
+                    return;
+                  }
+
+                  const available = canDisplayProgressOverlay();
+                  setOverlayAvailable(available);
+                  if (available) {
+                    updateSettings({
+                      backgroundProgressEnabled: true,
+                      overlayProgressEnabled: true,
+                    });
+                    return;
+                  }
+
+                  setOverlayPermissionPending(true);
                   updateSettings({
-                    backgroundProgressEnabled: value || settings.backgroundProgressEnabled,
-                    overlayProgressEnabled: value,
+                    backgroundProgressEnabled: true,
+                    overlayProgressEnabled: false,
                   });
-                  if (value && !overlayAvailable) openProgressOverlaySettings();
+                  openProgressOverlaySettings();
                 }}
                 trackColor={{ false: color.border, true: color.accentDim }}
-                thumbColor={settings.overlayProgressEnabled ? color.accent : color.textDim}
+                thumbColor={
+                  settings.overlayProgressEnabled || overlayPermissionPending
+                    ? color.accent
+                    : color.textDim
+                }
               />
             </SettingRow>
             <Text style={styles.privacyNote}>
-              锁屏仅显示任务数量；会话标题和设备信息只在解锁后展示。
+              锁屏仅显示任务数量；悬浮窗会显示审批摘要和首个资源，只提供“拒绝”和“允许一次”。
             </Text>
           </SettingsSection>
         )}

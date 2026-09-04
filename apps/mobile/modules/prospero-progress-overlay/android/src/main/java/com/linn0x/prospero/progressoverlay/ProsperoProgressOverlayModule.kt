@@ -6,10 +6,22 @@ import android.os.Build
 import android.provider.Settings
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
+import org.json.JSONObject
 
 class ProsperoProgressOverlayModule : Module() {
   override fun definition() = ModuleDefinition {
     Name("ProsperoProgressOverlay")
+    Events("onApprovalAction")
+
+    OnCreate {
+      ProsperoProgressService.approvalActionHandler = { event ->
+        sendEvent("onApprovalAction", event)
+      }
+    }
+
+    OnDestroy {
+      ProsperoProgressService.approvalActionHandler = null
+    }
 
     Function("canDrawOverlays") {
       val context = appContext.reactContext
@@ -35,8 +47,10 @@ class ProsperoProgressOverlayModule : Module() {
         runningCount: Int,
         waitingCount: Int,
         showOverlay: Boolean,
+        approvalJson: String,
       ->
       val context = appContext.reactContext ?: return@Function
+      val approval = runCatching { JSONObject(approvalJson) }.getOrNull()
       val intent = ProsperoProgressService.syncIntent(
         context,
         title,
@@ -45,6 +59,12 @@ class ProsperoProgressOverlayModule : Module() {
         runningCount,
         waitingCount,
         showOverlay,
+        approval?.optString("hostId").orEmpty(),
+        approval?.optString("sid").orEmpty(),
+        approval?.optString("reqId").orEmpty(),
+        approval?.optString("action").orEmpty(),
+        approval?.optString("summary").orEmpty(),
+        approval?.optString("resource").orEmpty(),
       )
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
         context.startForegroundService(intent)

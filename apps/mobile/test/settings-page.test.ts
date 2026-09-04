@@ -11,6 +11,11 @@ describe("mobile settings page", () => {
     expect(settings).toContain('title="外观"');
     expect(settings).toContain("HOME_RECENT_SESSION_LIMITS.map");
     expect(settings).toContain('title="后台任务"');
+    expect(settings).toContain('title="其他应用上层悬浮框"');
+    expect(settings).toContain("overlayPermissionPending");
+    expect(settings).toContain('nextState === "active"');
+    expect(settings).toContain('AppState.addEventListener("focus"');
+    expect(settings).toContain("canDisplayProgressOverlay()");
     expect(settings).toContain('title="设备与连接"');
     expect(settings).toContain("host.relay.url");
     expect(settings).toContain('pathname: "/host/[hostId]/edit"');

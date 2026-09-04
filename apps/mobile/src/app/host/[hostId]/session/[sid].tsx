@@ -92,6 +92,7 @@ import {
 import type { ProjectFileReference } from "@/lib/file-references";
 import {
   activeComposerToken,
+  insertComposerText,
   replaceComposerToken,
 } from "@/lib/composer-completion";
 import {
@@ -405,6 +406,7 @@ export default function SessionScreen() {
   /** 被连接层拒绝的消息留在编辑器中，直到用户确认修改或重试。 */
   const [deliveryError, setDeliveryError] = useState<string | null>(null);
   const [selection, setSelection] = useState({ start: 0, end: 0 });
+  const [composerExpanded, setComposerExpanded] = useState(false);
   const inputRef = useRef<TextInput>(null);
   const appendTranscript = useCallback((text: string): void => {
     // 使用函数式更新，转写期间用户新打的字也不会被旧闭包覆盖。
@@ -538,6 +540,7 @@ export default function SessionScreen() {
       setDraftHydratedFor("");
       setDraft("");
       setSelection({ start: 0, end: 0 });
+      setComposerExpanded(false);
       setImages([]);
       setAttachmentError(null);
       void loadComposerDraft(composerScope)
@@ -1139,6 +1142,14 @@ export default function SessionScreen() {
     requestAnimationFrame(() => inputRef.current?.focus());
   };
 
+  const insertQuickCharacter = (value: string): void => {
+    const next = insertComposerText(draft, selection, value);
+    setDraft(next.text);
+    setDeliveryError(null);
+    focusComposer(next.cursor);
+    void Haptics.selectionAsync();
+  };
+
   const chooseCommand = (command: string): void => {
     const next = command === "/skills" ? "$" : command;
     setDraft(next);
@@ -1429,7 +1440,7 @@ export default function SessionScreen() {
           <TextInput
             style={styles.searchInput}
             placeholder="在本会话中搜索…"
-            placeholderTextColor="#5a5a66"
+            placeholderTextColor={color.textFaint}
             value={search}
             onChangeText={setSearch}
             autoFocus
@@ -2023,20 +2034,74 @@ export default function SessionScreen() {
         </View>
       )}
       <View style={[styles.composer, { paddingBottom: Math.max(insets.bottom, 8) }]}>
-        <DismissKey visible={focused} />
-        {isChat && !isSubagent && (
-          <Pressable
-            style={({ pressed }) => [styles.iconBtn, pressed && styles.composerBtnPressed]}
-            onPress={attach}
-            accessibilityRole="button"
-            accessibilityLabel="添加图片"
-          >
-            <Icon name="paperclip" size={17} color={color.textDim} />
-          </Pressable>
+        {isChat && composerExpanded && (
+          <View style={styles.composerToolbar}>
+            <Text style={styles.composerToolbarLabel}>快捷输入</Text>
+            <ScrollView
+              horizontal
+              style={styles.composerQuickScroll}
+              keyboardShouldPersistTaps="always"
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={styles.composerQuickChars}
+            >
+              {["@", "/", "$", "#", "`"].map((value) => (
+                <Pressable
+                  key={value}
+                  style={({ pressed }) => [styles.quickChar, pressed && styles.composerBtnPressed]}
+                  onPress={() => insertQuickCharacter(value)}
+                  accessibilityRole="button"
+                  accessibilityLabel={`插入 ${value}`}
+                >
+                  <Text style={styles.quickCharText}>{value}</Text>
+                </Pressable>
+              ))}
+            </ScrollView>
+            <Pressable
+              style={({ pressed }) => [styles.toolbarCollapse, pressed && styles.composerBtnPressed]}
+              onPress={() => setComposerExpanded(false)}
+              accessibilityRole="button"
+              accessibilityLabel="收起输入框"
+            >
+              <Icon name="arrow.down.right.and.arrow.up.left" size={18} color={color.textDim} />
+            </Pressable>
+          </View>
         )}
-        <TextInput
-          ref={inputRef}
-          style={[styles.input, isChat && styles.inputChat, !isChat && !terminalInputEnabled && styles.inputDisabled]}
+        <View style={styles.composerRow}>
+          <DismissKey visible={focused} />
+          {isChat && !isSubagent && (
+            <Pressable
+              style={({ pressed }) => [styles.iconBtn, pressed && styles.composerBtnPressed]}
+              onPress={attach}
+              accessibilityRole="button"
+              accessibilityLabel="添加图片"
+            >
+              <Icon name="paperclip" size={17} color={color.textDim} />
+            </Pressable>
+          )}
+          {isChat && !composerExpanded && (
+            <Pressable
+              style={({ pressed }) => [styles.iconBtn, pressed && styles.composerBtnPressed]}
+              onPress={() => {
+                setComposerExpanded(true);
+                requestAnimationFrame(() => inputRef.current?.focus());
+              }}
+              accessibilityRole="button"
+              accessibilityLabel="放大输入框"
+            >
+              <Icon name="arrow.up.left.and.arrow.down.right" size={17} color={color.textDim} />
+            </Pressable>
+          )}
+          <TextInput
+            ref={inputRef}
+            style={[
+              styles.input,
+              isChat && styles.inputChat,
+              composerExpanded && [
+                styles.inputExpanded,
+                { height: Math.min(300, Math.max(180, adaptiveLayout.height * 0.36)) },
+              ],
+              !isChat && !terminalInputEnabled && styles.inputDisabled,
+            ]}
           placeholder={
             isChat
               ? isSubagent
@@ -2072,30 +2137,31 @@ export default function SessionScreen() {
               ? "连接恢复前不能执行命令；输入内容不会自动发送。"
               : undefined
           }
-        />
-        {isChat && <VoiceButton onTranscript={appendTranscript} />}
-        <Pressable
-          style={({ pressed }) => [
-            styles.sendBtn,
-            !canSend && styles.sendBtnDim,
-            pressed && canSend && styles.sendBtnPressed,
-          ]}
-          onPress={() => send(draft)}
-          disabled={!canSend}
-          accessibilityRole="button"
-          accessibilityLabel={
-            isChat
-              ? busyDelivery === "steer" && busy
-                ? "发送引导"
-                : busy
-                  ? "加入消息队列"
-                  : "发送消息"
-              : "执行命令"
-          }
-          accessibilityState={{ disabled: !canSend }}
-        >
-          <Icon name="arrow.up" size={17} color="#fff" weight="semibold" />
-        </Pressable>
+          />
+          {isChat && <VoiceButton onTranscript={appendTranscript} />}
+          <Pressable
+            style={({ pressed }) => [
+              styles.sendBtn,
+              !canSend && styles.sendBtnDim,
+              pressed && canSend && styles.sendBtnPressed,
+            ]}
+            onPress={() => send(draft)}
+            disabled={!canSend}
+            accessibilityRole="button"
+            accessibilityLabel={
+              isChat
+                ? busyDelivery === "steer" && busy
+                  ? "发送引导"
+                  : busy
+                    ? "加入消息队列"
+                    : "发送消息"
+                : "执行命令"
+            }
+            accessibilityState={{ disabled: !canSend }}
+          >
+            <Icon name="arrow.up" size={17} color={canSend ? color.onAccent : color.textFaint} weight="semibold" />
+          </Pressable>
+        </View>
       </View>
       </KeyboardAvoidingView>
     </View>
@@ -2182,9 +2248,9 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     borderRadius: 10,
     paddingHorizontal: 14,
-    backgroundColor: color.accentDim,
+    backgroundColor: color.accent,
   },
-  loadRetryText: { color: "#fff", fontSize: 13, fontWeight: "700" },
+  loadRetryText: { color: color.onAccent, fontSize: 13, fontWeight: "700" },
   loadBack: {
     minHeight: 40,
     justifyContent: "center",
@@ -2253,7 +2319,7 @@ const styles = StyleSheet.create({
   },
   deepseekViewOptionActive: { backgroundColor: color.accentDim },
   deepseekViewText: { color: color.textDim, fontSize: 11.5, fontWeight: "600" },
-  deepseekViewTextActive: { color: "#fff" },
+  deepseekViewTextActive: { color: color.text },
   modeText: { color: color.text, fontSize: 13, fontWeight: "600" },
   coordinatorModeText: { color: color.accent },
   subagentModeIdentity: {
@@ -2266,7 +2332,7 @@ const styles = StyleSheet.create({
     borderRadius: 999,
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: color.accentDim,
-    backgroundColor: "#18223A",
+    backgroundColor: color.accentBg,
   },
   subagentModeDot: { width: 7, height: 7, borderRadius: 4 },
   subagentModeName: { flexShrink: 1, color: color.text, fontSize: 12, fontWeight: "700" },
@@ -2288,7 +2354,7 @@ const styles = StyleSheet.create({
     borderColor: color.border,
     backgroundColor: color.surface,
   },
-  subagentRailChipActive: { borderColor: color.accentDim, backgroundColor: "#18223A" },
+  subagentRailChipActive: { borderColor: color.accent, backgroundColor: color.accentBg },
   subagentRailDot: { width: 7, height: 7, borderRadius: 4 },
   subagentRailName: { flexShrink: 1, color: color.text, fontSize: 12, fontWeight: "700" },
   subagentRailState: { color: color.textFaint, fontSize: 9.5 },
@@ -2344,7 +2410,7 @@ const styles = StyleSheet.create({
   },
   reconnCopy: { flex: 1, flexDirection: "row", alignItems: "center", gap: 8 },
   reconnDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: color.warn },
-  reconnText: { flex: 1, color: "#EAC77C", fontSize: 12, lineHeight: 16 },
+  reconnText: { flex: 1, color: color.warn, fontSize: 12, lineHeight: 16 },
   reconnAction: { color: color.text, fontSize: 12, fontWeight: "600" },
 
   searchBar: {
@@ -2604,15 +2670,42 @@ const styles = StyleSheet.create({
   windowPct: { fontSize: 15, fontWeight: "600", fontVariant: ["tabular-nums"] },
 
   composer: {
-    flexDirection: "row",
     gap: 8,
     paddingHorizontal: 10,
     paddingTop: 8,
     paddingBottom: 10,
     backgroundColor: color.surface,
-    alignItems: "flex-end",
     borderTopWidth: StyleSheet.hairlineWidth,
     borderTopColor: color.border,
+  },
+  composerRow: { flexDirection: "row", alignItems: "flex-end", gap: 8 },
+  composerToolbar: {
+    minHeight: 40,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  composerToolbarLabel: { color: color.textDim, fontSize: 11, fontWeight: "600" },
+  composerQuickScroll: { flex: 1 },
+  composerQuickChars: { alignItems: "center", gap: 7, paddingRight: 4 },
+  quickChar: {
+    minWidth: 38,
+    height: 34,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 10,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
+    backgroundColor: color.surfaceRaised,
+  },
+  quickCharText: { color: color.text, fontSize: 16, fontWeight: "600", fontFamily: MONOSPACE_FONT },
+  toolbarCollapse: {
+    width: 38,
+    height: 34,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 10,
+    backgroundColor: color.surfaceRaised,
   },
   iconBtn: {
     width: 40,
@@ -2636,9 +2729,16 @@ const styles = StyleSheet.create({
     lineHeight: 21,
   },
   inputChat: { maxHeight: 132 },
+  inputExpanded: {
+    minHeight: 180,
+    maxHeight: 300,
+    borderRadius: 14,
+    paddingTop: 12,
+    textAlignVertical: "top",
+  },
   inputDisabled: { color: color.textFaint, opacity: 0.7 },
   sendBtn: {
-    backgroundColor: color.accentDim,
+    backgroundColor: color.accent,
     borderRadius: 20,
     width: 40,
     height: 40,

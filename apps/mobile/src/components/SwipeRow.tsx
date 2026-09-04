@@ -73,8 +73,8 @@ export function SwipeRow({
                 ]}
                 onPress={() => run(action)}
               >
-                <Icon name={action.symbol} size={18} color={action.foregroundColor ?? "#fff"} />
-                <Text style={[styles.actionLabel, { color: action.foregroundColor ?? "#fff" }]}>{action.label}</Text>
+                <Icon name={action.symbol} size={18} color={action.foregroundColor ?? color.onAccent} />
+                <Text style={[styles.actionLabel, { color: action.foregroundColor ?? color.onAccent }]}>{action.label}</Text>
               </Pressable>
             ))}
           </View>

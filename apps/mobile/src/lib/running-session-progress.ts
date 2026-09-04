@@ -1,7 +1,13 @@
 import { AppState, PermissionsAndroid, Platform } from "react-native";
 
 import ProsperoProgressOverlayModule from "../../modules/prospero-progress-overlay/src/ProsperoProgressOverlayModule";
+import type { ProgressOverlayApprovalAction } from "../../modules/prospero-progress-overlay/src/ProsperoProgressOverlay.types";
+import type { PendingOverlayApproval } from "./pending-overlay-approvals";
 import type { RunningSessionProgress } from "./running-session-summary";
+
+export function isProgressOverlaySupported(): boolean {
+  return Platform.OS === "android" && ProsperoProgressOverlayModule !== null;
+}
 
 export function canDisplayProgressOverlay(): boolean {
   return Platform.OS === "android" &&
@@ -36,6 +42,7 @@ export function syncRunningSessionProgress(
   progress: RunningSessionProgress | null,
   backgroundProgressEnabled: boolean,
   overlayProgressEnabled: boolean,
+  approval: PendingOverlayApproval | null = null,
 ): void {
   if (Platform.OS !== "android" || !ProsperoProgressOverlayModule) return;
   try {
@@ -51,8 +58,17 @@ export function syncRunningSessionProgress(
       progress.runningCount,
       progress.waitingCount,
       overlayProgressEnabled && AppState.currentState !== "active" && canDisplayProgressOverlay(),
+      JSON.stringify(approval),
     );
   } catch {
     // 某些 ROM 会在切后台的瞬间拒绝启动前台服务；下一次状态更新会重试。
   }
+}
+
+export function subscribeProgressApprovalActions(
+  listener: (event: ProgressOverlayApprovalAction) => void,
+): () => void {
+  if (Platform.OS !== "android" || !ProsperoProgressOverlayModule) return () => undefined;
+  const subscription = ProsperoProgressOverlayModule.addListener("onApprovalAction", listener);
+  return () => subscription.remove();
 }

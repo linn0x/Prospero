@@ -352,7 +352,8 @@ export function HomeDashboard({
                   id: "edit-workspace",
                   label: "编辑",
                   symbol: "pencil",
-                  color: "#596273",
+                  color: color.surfaceRaised,
+                  foregroundColor: color.text,
                   onPress: () => {
                     setEditingProject(project);
                     setProjectAlias(displayName);

@@ -67,6 +67,7 @@
           "style": "dark"
         }
       ],
+      "./plugins/with-theme-colors",
       [
         "expo-splash-screen",
         {
@@ -97,8 +98,7 @@
           "androidSpeechServicePackages": ["com.google.android.as"]
         }
       ],
-      "./plugins/with-foldable-support",
-      "./plugins/with-theme-colors"
+      "./plugins/with-foldable-support"
     ],
     "experiments": {
       "typedRoutes": false,

@@ -28,4 +28,31 @@ describe("Android 会话进度服务", () => {
     expect(service).toContain("installDragAndOpen");
     expect(service).toContain("Intent.ACTION_VIEW");
   });
+
+  it("悬浮框只提供单次放行和拒绝，并把带身份的审批事件发回 JS", () => {
+    const nativeRoot = join(
+      moduleRoot,
+      "android",
+      "src",
+      "main",
+      "java",
+      "com",
+      "linn0x",
+      "prospero",
+      "progressoverlay",
+    );
+    const service = readFileSync(join(nativeRoot, "ProsperoProgressService.kt"), "utf8");
+    const module = readFileSync(join(nativeRoot, "ProsperoProgressOverlayModule.kt"), "utf8");
+
+    expect(service).toContain('approvalButton("拒绝"');
+    expect(service).toContain('approvalButton("允许一次"');
+    expect(service).not.toContain("始终允许");
+    expect(service).toContain('"hostId" to approvalHostId');
+    expect(service).toContain('"reqId" to approvalRequestId');
+    expect(service).toContain("approvalSubmitting");
+    expect(module).toContain('Events("onApprovalAction")');
+    expect(module).toContain('sendEvent("onApprovalAction", event)');
+    expect(module).toContain("approvalJson: String");
+    expect(module).toContain("JSONObject(approvalJson)");
+  });
 });
