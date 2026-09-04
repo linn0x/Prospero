@@ -60,7 +60,7 @@ describe("workspace sidebar state", () => {
     ]);
   });
 
-  it("leaves only the primary workspace content visible in focus mode", () => {
+  it("hides only workspace-internal chrome in focus mode", () => {
     expect(workspaceChromeVisible(false)).toBe(true);
     expect(workspaceChromeVisible(true)).toBe(false);
   });

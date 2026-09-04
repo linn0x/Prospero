@@ -4676,12 +4676,11 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   }, [openSession, t]);
   const page = getViewCopy(view, t);
   const workspaceFocus = focus && view === "workspaces";
-  const shellChromeVisible = workspaceChromeVisible(workspaceFocus);
   return (
     <TooltipProvider>
     <SidebarProvider
-      open={workspaceFocus ? false : sidebarOpen}
-      {...(workspaceFocus ? {} : { onOpenChange: changeSidebarOpen })}
+      open={sidebarOpen}
+      onOpenChange={changeSidebarOpen}
       style={
         {
           "--sidebar-width": "15rem",
@@ -4693,7 +4692,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
       <a className="skip-link" href="#main-content">
         {t("跳到主内容", "Skip to main content")}
       </a>
-      {shellChromeVisible && <ShellSidebar
+      <ShellSidebar
         snapshot={sessionSnapshot}
         view={view}
         activeId={activeId}
@@ -4706,10 +4705,10 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
         onRenameSession={setEditingSession}
         onDuplicateSession={duplicateSession}
         onSetUnread={setUnread}
-      />}
+      />
       <SidebarInset id="main-content" tabIndex={-1} className="prospero-main">
         {!workspaceFocus && <header className="desktop-topbar">
-          {shellChromeVisible && <div className="topbar-context">
+          <div className="topbar-context">
             <SidebarTrigger
               className="topbar-sidebar-trigger"
               aria-label={t("打开侧边栏", "Open sidebar")}
@@ -4723,7 +4722,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
                 {page.description}
               </span>
             </div>}
-          </div>}
+          </div>
           <div className="topbar-actions">
             <Button onClick={() => openNewSession()}>
               <Plus data-icon="inline-start" />
