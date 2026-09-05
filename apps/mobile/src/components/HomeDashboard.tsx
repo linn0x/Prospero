@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import FontAwesome6 from "@expo/vector-icons/FontAwesome6";
 import {
   Alert,
   FlatList,
@@ -18,7 +19,6 @@ import { Sheet, SheetAction } from "@/components/Sheet";
 import { SwipeRow } from "@/components/SwipeRow";
 import type { StoredHost } from "@/lib/hosts";
 import {
-  homeHostOsLabel,
   homeHostStats,
   homeRecentSessions,
   homeWorkspaceProjects,
@@ -107,6 +107,57 @@ function statusTone(status: string, palette: ThemePalette): string {
   return palette.textFaint;
 }
 
+function hostConnectionTone(runtime: HostRuntime | undefined, palette: ThemePalette): string {
+  const status = runtime?.status ?? "idle";
+  if (status === "connected") {
+    return runtime?.rttMs !== null && runtime?.rttMs !== undefined && runtime.rttMs >= 300
+      ? palette.warn
+      : palette.success;
+  }
+  if (status === "connecting" || status === "reconnecting") return palette.warn;
+  return palette.danger;
+}
+
+function hostConnectionLabel(runtime: HostRuntime | undefined): string {
+  const status = runtime?.status ?? "idle";
+  if (status === "connected") {
+    return runtime?.rttMs !== null && runtime?.rttMs !== undefined
+      ? `${String(runtime.rttMs)}ms`
+      : "在线";
+  }
+  if (status === "connecting") return "连接中";
+  if (status === "reconnecting") return "重连中";
+  if (status === "failed") return "失败";
+  return "离线";
+}
+
+function HostPlatformIcon({
+  platform,
+  palette,
+}: {
+  platform: string | undefined;
+  palette: ThemePalette;
+}) {
+  const normalized = platform?.toLowerCase() ?? "";
+  const brand = normalized === "win32" || normalized.includes("windows")
+    ? "windows"
+    : normalized === "darwin" || normalized.includes("mac")
+      ? "apple"
+      : normalized.includes("linux")
+        ? "linux"
+        : null;
+
+  return brand ? (
+    <FontAwesome6
+      name={brand}
+      size={18}
+      color={brand === "linux" ? palette.warn : palette.accent}
+    />
+  ) : (
+    <Icon name="desktopcomputer" size={18} color={palette.accent} />
+  );
+}
+
 export function HomeDashboard({
   hosts,
   runtimes,
@@ -164,6 +215,12 @@ export function HomeDashboard({
     () => homeRecentSessions(selectedRuntime?.sessions, effectiveHomeSettings.recentSessionLimit),
     [effectiveHomeSettings.recentSessionLimit, selectedRuntime?.sessions],
   );
+  const orderedDeviceHosts = useMemo(
+    () => selectedHost
+      ? [selectedHost, ...hosts.filter((host) => host.id !== selectedHost.id)]
+      : hosts,
+    [hosts, selectedHost],
+  );
   const [expandedProjectKey, setExpandedProjectKey] = useState<string | null>(null);
   const [quickCreateOpen, setQuickCreateOpen] = useState(false);
   const [editingProject, setEditingProject] = useState<SessionProject | null>(null);
@@ -199,55 +256,58 @@ export function HomeDashboard({
       ListHeaderComponent={
         <View style={styles.headerContent}>
           <View style={styles.devicePanel}>
-            <Pressable
-              accessibilityRole="button"
-              accessibilityState={{ expanded: devicePickerOpen }}
-              accessibilityLabel={`选择设备，当前为 ${selectedHost.name}`}
-              accessibilityHint="从屏幕底部打开设备列表"
-              style={({ pressed }) => [styles.deviceSelector, pressed && styles.pressed]}
-              onPress={onToggleDevicePicker}
-            >
-                <View style={styles.sectionIcon}>
-                  <Icon name="desktopcomputer" size={18} color={palette.accent} />
-                </View>
-                <View style={styles.deviceHeaderCopy}>
-                  <Text style={styles.deviceHeaderName} numberOfLines={1}>
-                    {selectedHost.name}
-                  </Text>
-                  <Text style={styles.deviceOs} numberOfLines={1}>
-                    {homeHostOsLabel(selectedRuntime?.hostInfo)}
-                  </Text>
-                </View>
-                <View style={styles.deviceSelectorEnd}>
-                  <View style={styles.connectionBadge}>
+            <View style={styles.deviceSelector}>
+              <View style={styles.sectionIcon}>
+                <HostPlatformIcon
+                  platform={selectedRuntime?.hostInfo?.platform}
+                  palette={palette}
+                />
+              </View>
+              <View style={styles.deviceHeaderCopy}>
+                <Text style={styles.deviceHeaderName} numberOfLines={1}>
+                  {selectedHost.name}
+                </Text>
+                <Text style={styles.deviceMeta} numberOfLines={1}>
+                  {`${String(stats.activeAgentCount)} Agent · ${String(stats.sessionCount)} 会话 · ${stats.runningCount > 0 ? `${String(stats.runningCount)} 项工作中` : "空闲"}`}
+                </Text>
+              </View>
+              <View style={styles.deviceSelectorEnd}>
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityState={{ expanded: devicePickerOpen }}
+                  accessibilityLabel={`选择设备，${String(hosts.length)} 台已配对，当前为 ${selectedHost.name}，${hostConnectionLabel(selectedRuntime)}`}
+                  accessibilityHint="从屏幕底部打开设备列表"
+                  hitSlop={8}
+                  style={({ pressed }) => [
+                    styles.deviceFleetPill,
+                    pressed && styles.deviceFleetPillPressed,
+                  ]}
+                  onPress={onToggleDevicePicker}
+                >
+                  <Icon name="desktopcomputer" size={14} color={palette.textDim} />
+                  <View style={styles.deviceFleetDots}>
                     <View
                       style={[
-                        styles.statusDot,
-                        { backgroundColor: statusTone(selectedRuntime?.status ?? "idle", palette) },
+                        styles.fleetStatusDot,
+                        styles.fleetStatusDotSelected,
+                        { backgroundColor: hostConnectionTone(selectedRuntime, palette) },
                       ]}
                     />
-                    <Text style={styles.connectionBadgeText}>
-                      {statusLabel[selectedRuntime?.status ?? "idle"]}
+                    <Text style={styles.fleetCurrentStatus} numberOfLines={1}>
+                      {hostConnectionLabel(selectedRuntime)}
                     </Text>
+                    {orderedDeviceHosts.slice(1).map((host) => (
+                      <View
+                        key={host.id}
+                        style={[
+                          styles.fleetStatusDot,
+                          { backgroundColor: hostConnectionTone(runtimes[host.id], palette) },
+                        ]}
+                      />
+                    ))}
                   </View>
-                  <Icon name="chevron.down" size={17} color={palette.textDim} />
-                </View>
-            </Pressable>
-
-            <View style={styles.statsRow}>
-              <DeviceStat value={stats.activeAgentCount} label="Agent" styles={styles} />
-              <DeviceStat value={stats.sessionCount} label="会话" styles={styles} />
-              <DeviceStat value={hosts.length} label="设备" styles={styles} />
-              <View style={[styles.runningPill, stats.runningCount === 0 && styles.runningPillIdle]}>
-                <View
-                  style={[
-                    styles.sessionStatusDot,
-                    { backgroundColor: stats.runningCount > 0 ? palette.warn : palette.textFaint },
-                  ]}
-                />
-                <Text style={styles.runningPillText}>
-                  {stats.runningCount > 0 ? `${String(stats.runningCount)} 项进行中` : "当前空闲"}
-                </Text>
+                  <Icon name="chevron.down" size={14} color={palette.textFaint} />
+                </Pressable>
               </View>
             </View>
           </View>
@@ -492,7 +552,7 @@ export function HomeDashboard({
                   <View
                     style={[
                       styles.statusDot,
-                      { backgroundColor: statusTone(runtime?.status ?? "idle", palette) },
+                      { backgroundColor: hostConnectionTone(runtime, palette) },
                     ]}
                   />
                   <View style={styles.deviceRowCopy}>
@@ -600,23 +660,6 @@ export function HomeDashboard({
   );
 }
 
-function DeviceStat({
-  value,
-  label,
-  styles,
-}: {
-  value: number;
-  label: string;
-  styles: HomeDashboardStyles;
-}) {
-  return (
-    <View style={styles.stat}>
-      <Text style={styles.statValue}>{String(value)}</Text>
-      <Text style={styles.statLabel}>{label}</Text>
-    </View>
-  );
-}
-
 function WorkspaceEmptyState({
   host,
   runtime,
@@ -692,16 +735,16 @@ function createStyles(palette: ThemePalette) {
     backgroundColor: palette.surface,
   },
   deviceSelector: {
-    minHeight: 52,
+    minHeight: 64,
     flexDirection: "row",
     alignItems: "center",
     gap: space.sm,
     paddingHorizontal: space.md,
-    paddingVertical: space.sm,
+    paddingVertical: 5,
   },
   sectionIcon: {
-    width: 32,
-    height: 32,
+    width: 30,
+    height: 30,
     alignItems: "center",
     justifyContent: "center",
     borderRadius: radius.sm,
@@ -709,39 +752,32 @@ function createStyles(palette: ThemePalette) {
   },
   deviceHeaderCopy: { flex: 1, gap: 2 },
   deviceHeaderName: { ...themedFont.body, fontSize: 15, fontWeight: "700" },
-  deviceOs: { color: palette.textDim, fontSize: 10.5 },
-  deviceSelectorEnd: { flexDirection: "row", alignItems: "center", gap: space.sm },
-  connectionBadge: {
+  deviceMeta: { color: palette.textDim, fontSize: 10.5 },
+  deviceSelectorEnd: { alignItems: "flex-end", justifyContent: "center" },
+  statusDot: { width: 6, height: 6, borderRadius: 3 },
+  deviceFleetPill: {
+    minHeight: 25,
     flexDirection: "row",
     alignItems: "center",
-    gap: 5,
-    paddingHorizontal: space.sm,
-    paddingVertical: 4,
+    gap: 6,
+    paddingHorizontal: 8,
     borderRadius: 999,
     backgroundColor: palette.surfaceRaised,
   },
-  connectionBadgeText: { color: palette.textDim, fontSize: 10, fontWeight: "600" },
-  statusDot: { width: 8, height: 8, borderRadius: 4 },
-  statsRow: {
-    minHeight: 34,
+  deviceFleetPillPressed: { backgroundColor: palette.pressed },
+  deviceFleetDots: {
     flexDirection: "row",
     alignItems: "center",
-    gap: space.md,
-    paddingHorizontal: space.md,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: palette.border,
+    gap: 4,
   },
-  stat: { flexDirection: "row", alignItems: "baseline", gap: 3 },
-  statValue: { color: palette.text, fontSize: 13, fontWeight: "700" },
-  statLabel: { color: palette.textDim, fontSize: 10 },
-  runningPill: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 5,
-    marginLeft: "auto",
+  fleetStatusDot: { width: 6, height: 6, borderRadius: 3 },
+  fleetStatusDotSelected: { borderWidth: 1, borderColor: palette.text },
+  fleetCurrentStatus: {
+    color: palette.textDim,
+    fontSize: 9,
+    fontWeight: "600",
+    fontVariant: ["tabular-nums"],
   },
-  runningPillIdle: { opacity: 0.72 },
-  runningPillText: { color: palette.textDim, fontSize: 10, fontWeight: "600" },
   deviceList: {
     gap: 2,
     paddingBottom: space.lg,
