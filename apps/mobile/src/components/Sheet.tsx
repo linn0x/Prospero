@@ -1,4 +1,14 @@
-import { Modal, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { useEffect, useState } from "react";
+import {
+  Animated,
+  Easing,
+  Modal,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  View,
+} from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Icon, type IconName } from "@/components/Icon";
 import { color, font, radius, space } from "@/lib/theme";
@@ -21,21 +31,85 @@ export function Sheet({
   children: React.ReactNode;
 }) {
   const insets = useSafeAreaInsets();
+  const [mounted, setMounted] = useState(visible);
+  const [backdropOpacity] = useState(() => new Animated.Value(visible ? 1 : 0));
+  const [sheetProgress] = useState(() => new Animated.Value(visible ? 1 : 0));
+
+  useEffect(() => {
+    if (!visible || mounted) return;
+    const frame = requestAnimationFrame(() => setMounted(true));
+    return () => cancelAnimationFrame(frame);
+  }, [mounted, visible]);
+
+  useEffect(() => {
+    if (!mounted) return;
+    const animation = Animated.parallel([
+      Animated.timing(backdropOpacity, {
+        toValue: visible ? 1 : 0,
+        duration: visible ? 160 : 130,
+        easing: visible ? Easing.out(Easing.quad) : Easing.in(Easing.quad),
+        useNativeDriver: true,
+      }),
+      Animated.timing(sheetProgress, {
+        toValue: visible ? 1 : 0,
+        duration: visible ? 230 : 180,
+        easing: visible ? Easing.out(Easing.cubic) : Easing.in(Easing.cubic),
+        useNativeDriver: true,
+      }),
+    ]);
+    animation.start(({ finished }) => {
+      if (finished && !visible) setMounted(false);
+    });
+    return () => animation.stop();
+  }, [backdropOpacity, mounted, sheetProgress, visible]);
+
+  if (!mounted) return null;
+
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
-      {/* 点背景关闭 —— 比只给一个按钮更符合手势直觉 */}
-      <Pressable style={styles.backdrop} onPress={onClose} />
-      <View style={[styles.sheet, { paddingBottom: insets.bottom + space.lg }]}>
-        <View style={styles.grabber} />
-        <View style={styles.head}>
-          <Text style={font.title}>{title}</Text>
-          <Pressable onPress={onClose} hitSlop={10}>
-            <Text style={styles.close}>关闭</Text>
-          </Pressable>
-        </View>
-        <ScrollView style={styles.body} showsVerticalScrollIndicator={false}>
-          {children}
-        </ScrollView>
+    <Modal
+      visible={mounted}
+      transparent
+      animationType="none"
+      hardwareAccelerated
+      statusBarTranslucent
+      onRequestClose={onClose}
+    >
+      <View style={styles.modalRoot}>
+        {/* 遮罩只原地淡入，不再和面板一起从屏幕底部滑上来。 */}
+        <Animated.View style={[styles.backdropLayer, { opacity: backdropOpacity }]}>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="关闭弹层"
+            style={styles.backdrop}
+            onPress={onClose}
+          />
+        </Animated.View>
+        <Animated.View
+          style={[
+            styles.sheet,
+            { paddingBottom: insets.bottom + space.lg },
+            {
+              opacity: sheetProgress,
+              transform: [{
+                translateY: sheetProgress.interpolate({
+                  inputRange: [0, 1],
+                  outputRange: [28, 0],
+                }),
+              }],
+            },
+          ]}
+        >
+          <View style={styles.grabber} />
+          <View style={styles.head}>
+            <Text style={font.title}>{title}</Text>
+            <Pressable onPress={onClose} hitSlop={10}>
+              <Text style={styles.close}>关闭</Text>
+            </Pressable>
+          </View>
+          <ScrollView style={styles.body} showsVerticalScrollIndicator={false}>
+            {children}
+          </ScrollView>
+        </Animated.View>
       </View>
     </Modal>
   );
@@ -99,7 +173,9 @@ export function SheetAction({
 }
 
 const styles = StyleSheet.create({
-  backdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.55)" },
+  modalRoot: { flex: 1, justifyContent: "flex-end" },
+  backdropLayer: { position: "absolute", inset: 0 },
+  backdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.5)" },
   sheet: {
     backgroundColor: color.surface,
     borderTopLeftRadius: radius.lg,
