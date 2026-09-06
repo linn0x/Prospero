@@ -70,6 +70,7 @@ import {
   prefetchAccountUsage,
 } from "./account-usage-cache";
 import { displayError, shortPath, text } from "./state";
+import { installLiquidGlass } from "./liquid-glass";
 import { useLocale, type Language } from "./locale";
 import {
   EXPANDED_PROJECTS_STORAGE_KEY,
@@ -1236,6 +1237,7 @@ function ShellSidebar({
     items.map((item) => (
       <SidebarMenuItem key={item.id}>
         <SidebarMenuButton
+          data-liquid-glass="nav"
           isActive={view === item.id}
           aria-current={view === item.id ? "page" : undefined}
           tooltip={navLabel(item.id, t)}
@@ -3136,6 +3138,7 @@ function WorkspacePane({
                   <button
                     type="button"
                     data-slot="workspace-tab-main"
+                    data-liquid-glass="tab"
                     className="workspace-tab-main"
                     id={`workspace-tab-${id}`}
                     role="tab"
@@ -4324,6 +4327,7 @@ function CommandDialog({
 }
 
 export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
+  useEffect(() => installLiquidGlass(), []);
   const { t } = useLocale();
   const snapshotRef = useRef(snapshot);
   snapshotRef.current = snapshot;
@@ -4712,6 +4716,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
         {!workspaceFocus && <header className="desktop-topbar">
           <div className="topbar-context">
             <SidebarTrigger
+              data-liquid-glass="control"
               className="topbar-sidebar-trigger"
               aria-label={t("打开侧边栏", "Open sidebar")}
               title={t("打开侧边栏", "Open sidebar")}
@@ -4726,7 +4731,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
             </div>}
           </div>
           <div className="topbar-actions">
-            <Button onClick={() => openNewSession()}>
+            <Button variant="glass-primary" onClick={() => openNewSession()}>
               <Plus data-icon="inline-start" />
               {t("新建会话", "New session")}
             </Button>

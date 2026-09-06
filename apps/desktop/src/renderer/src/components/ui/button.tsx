@@ -8,6 +8,8 @@ const buttonVariants = cva(
   {
     variants: {
       variant: {
+        glass: "liquid-button text-foreground",
+        "glass-primary": "liquid-button liquid-primary text-primary-foreground",
         default: "bg-primary text-primary-foreground hover:bg-[var(--primary-hover)]",
         outline:
           "border-border bg-background hover:bg-muted hover:text-foreground aria-expanded:bg-muted aria-expanded:text-foreground dark:border-input dark:bg-input/30 dark:hover:bg-input/50",
@@ -53,6 +55,7 @@ function Button({
   return (
     <ButtonPrimitive
       data-slot="button"
+      data-liquid-glass={variant === "glass" || variant === "glass-primary" ? "control" : undefined}
       className={cn(buttonVariants({ variant, size, className }))}
       {...props}
     />
