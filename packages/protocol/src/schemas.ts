@@ -348,7 +348,8 @@ export const C2SHelloSchema = z.object({
   /** 客户端设备身份 X25519 公钥(base64),预留给按设备撤销/审计 */
   clientPubKey: b64Key32,
   clientInfo: z.object({
-    platform: z.enum(["ios", "android"]),
+    /** desktop is a first-class Prospero client, not a local-daemon shortcut. */
+    platform: z.enum(["ios", "android", "desktop"]),
     appVersion: z.string(),
   }),
 });
