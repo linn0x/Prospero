@@ -9,6 +9,7 @@ import {
   ActivityIndicator,
   FlatList,
   Image,
+  InteractionManager,
   Platform,
   Pressable,
   ScrollView,
@@ -151,6 +152,7 @@ const ChatViewContent = memo(function ChatViewContent({
   const [selectionSource, setSelectionSource] = useState<string | null>(null);
   const pendingOutgoingRef = useRef(pendingOutgoing);
   const [acknowledgedPendingToken, setAcknowledgedPendingToken] = useState<string | null>(null);
+  const snapshotGeneration = useRef(0);
   useEffect(() => {
     pendingOutgoingRef.current = pendingOutgoing;
   }, [pendingOutgoing]);
@@ -222,7 +224,16 @@ const ChatViewContent = memo(function ChatViewContent({
       if (events.some((event) => event.kind === "user.message")) {
         setAcknowledgedPendingToken(pendingOutgoingRef.current?.token ?? null);
       }
-      setItems(applyEvents([], events));
+      // Do not parse a large history in the same JS turn as the route transition.
+      // Let the native navigation and the first frame become interactive first;
+      // this is especially important on iOS where Markdown/tool folding can
+      // otherwise make a successful tap look lost.
+      const generation = ++snapshotGeneration.current;
+      setItems([]);
+      InteractionManager.runAfterInteractions(() => {
+        if (generation !== snapshotGeneration.current) return;
+        setItems(applyEvents([], events));
+      });
     },
     events: (events) => {
       if (events.some((event) => event.kind === "user.message")) {
