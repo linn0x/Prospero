@@ -96,6 +96,39 @@ describe("HostConnection WebSocket candidates", () => {
     expect(connection.diagnosis?.summary).toContain("TLS");
   });
 
+  it("classifies sockets that never open as unreachable instead of claiming the daemon did not respond", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
+    const raced = (connection as unknown as { race(): Promise<unknown> }).race();
+    const rejected = expect(raced).rejects.toThrow();
+
+    await vi.advanceTimersByTimeAsync(6_000);
+    await rejected;
+
+    expect(connection.diagnosis?.summary).toContain("无法连接");
+    expect(connection.diagnosis?.hint).toContain("本地网络");
+    expect(connection.diagnosis?.hint).not.toContain("prosperod 没有响应");
+  });
+
+  it("keeps an opened socket with no E2E handshake response classified as a daemon timeout", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
+    const raced = (connection as unknown as { race(): Promise<unknown> }).race();
+    const rejected = expect(raced).rejects.toThrow();
+    for (const socket of FakeWebSocket.sockets) {
+      socket.readyState = 1;
+      socket.onopen?.();
+    }
+
+    await vi.advanceTimersByTimeAsync(6_000);
+    await rejected;
+
+    expect(connection.diagnosis?.summary).toContain("无应答");
+    expect(connection.diagnosis?.hint).toContain("prosperod 没有响应");
+  });
+
   it("restarts a stopped candidate on foreground / network recovery", () => {
     vi.stubGlobal("WebSocket", FakeWebSocket);
     const host = makeHost("direct");
