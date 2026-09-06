@@ -144,8 +144,9 @@ export class RemoteShellClient {
       let channel: SecureChannel | null = null;
       const { frame, state } = clientHandshakeStart(SUPPORTED_PROTOCOL_VERSIONS[0]);
       const timer = setTimeout(() => fail(new Error("remote host handshake timed out")), HANDSHAKE_TIMEOUT_MS);
+      const clearHandshakeTimer = (): void => { clearTimeout(timer); };
       const cleanup = (): void => {
-        clearTimeout(timer);
+        clearHandshakeTimer();
         socket.onopen = null; socket.onmessage = null; socket.onerror = null; socket.onclose = null;
       };
       const fail = (error: Error): void => {
@@ -160,7 +161,10 @@ export class RemoteShellClient {
           } else socket.send(frame);
         } catch (error) { fail(error instanceof Error ? error : new Error(String(error))); }
       };
-      socket.onerror = () => fail(new Error(`unable to reach remote host at ${url}`));
+      socket.onerror = () => {
+        if (settled) this.handleClosed();
+        else fail(new Error(`unable to reach remote host at ${url}`));
+      };
       socket.onclose = (event) => {
         if (!settled) fail(new Error(event.reason || (opened ? "remote host closed during handshake" : "remote host is offline")));
         else this.handleClosed();
@@ -190,14 +194,22 @@ export class RemoteShellClient {
             return;
           }
           const message = parseS2C(channel.open(text));
-          if (message.type !== "hello.ok") {
-            fail(new Error(`unexpected remote handshake message: ${message.type}`));
+          if (!settled) {
+            if (message.type !== "hello.ok") {
+              fail(new Error(`unexpected remote handshake message: ${message.type}`));
+              return;
+            }
+            // Keep the socket handlers installed after hello.ok. The same
+            // handlers deliver shell output and observe later transport drops.
+            settled = true; clearHandshakeTimer(); this.channel = channel; this.connected = true;
+            this.emit("connected", message); resolve(message);
             return;
           }
-          settled = true; cleanup(); this.channel = channel; this.connected = true;
-          this.emit("connected", message); resolve(message);
+          this.emit("message", message as RemoteShellMessage);
         } catch (error) {
-          fail(error instanceof Error ? error : new Error(String(error)));
+          const failure = error instanceof Error ? error : new Error(String(error));
+          if (settled) this.emit("error", failure);
+          else fail(failure);
         }
       };
     });

@@ -47,14 +47,21 @@ class FakeSocket implements RemoteSocket {
   }
 
   sendHelloOk(): void {
+    this.sendServer({
+      type: "hello.ok",
+      host: { name: "test-host", daemonVersion: "0.0.13", protocolVersion: 16 },
+      sessions: [],
+    });
+  }
+
+  sendServer(message: Parameters<NonNullable<SecureChannel["seal"]>>[0]): void {
     if (!this.serverChannel) throw new Error("missing server channel");
-    queueMicrotask(() => this.onmessage?.({
-      data: this.serverChannel?.seal({
-        type: "hello.ok",
-        host: { name: "test-host", daemonVersion: "0.0.13", protocolVersion: 16 },
-        sessions: [],
-      }),
-    }));
+    queueMicrotask(() => this.onmessage?.({ data: this.serverChannel?.seal(message) }));
+  }
+
+  drop(reason = "network drop"): void {
+    this.readyState = 3;
+    this.onclose?.({ code: 1006, reason });
   }
 
   close(): void { this.readyState = 3; }
@@ -99,5 +106,44 @@ describe("RemoteShellClient", () => {
     expect(client.isConnected).toBe(true);
     client.createShell("/tmp", 100, 30);
     expect(socket.sent).toHaveLength(3);
+  });
+
+  it("keeps post-handshake handlers and emits output and close events", async () => {
+    const daemon = generateKeyPairB64();
+    const socket = new FakeSocket(daemon);
+    let serverState: ReturnType<typeof serverHandshakeRespond>["state"] | undefined;
+    const originalSend = socket.send.bind(socket);
+    socket.send = (data: string) => {
+      if (socket.sent.length === 0) {
+        const response = serverHandshakeRespond(data, daemon.secretKey);
+        serverState = response.state;
+        socket.sent.push(data);
+        queueMicrotask(() => socket.onmessage?.({ data: response.frame }));
+        return;
+      }
+      if (socket.sent.length === 1) {
+        socket.sent.push(data);
+        if (!serverState) throw new Error("missing server state");
+        socket.acceptClientFrame(data, serverState);
+        socket.sendHelloOk();
+        return;
+      }
+      originalSend(data);
+    };
+    const client = new RemoteShellClient(
+      { id: "h", name: "host", addrs: ["127.0.0.1"], port: 7423, token: "0123456789abcdef", daemonPubKey: daemon.publicKey },
+      () => { queueMicrotask(() => socket.open()); return socket; },
+    );
+    const messages: string[] = [];
+    let closed = 0;
+    client.on("message", (message) => { if (message.type === "term.output") messages.push(message.dataB64); });
+    client.on("closed", () => { closed += 1; });
+    await client.connect();
+    socket.sendServer({ type: "term.output", sid: "s", dataB64: "aGk=", seq: 7 });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(messages).toEqual(["aGk="]);
+    socket.drop();
+    expect(closed).toBe(1);
+    expect(client.isConnected).toBe(false);
   });
 });
