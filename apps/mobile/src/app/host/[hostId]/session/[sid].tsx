@@ -431,6 +431,7 @@ export default function SessionScreen() {
     if (hostId && sid) recentSessions.opened(hostId, sid);
   }, [hostId, sid]));
   const [draft, setDraft] = useState("");
+  const [pendingOutgoing, setPendingOutgoing] = useState<{ token: string; text: string } | null>(null);
   const [draftHydratedFor, setDraftHydratedFor] = useState("");
   /** 被连接层拒绝的消息留在编辑器中，直到用户确认修改或重试。 */
   const [deliveryError, setDeliveryError] = useState<string | null>(null);
@@ -454,6 +455,7 @@ export default function SessionScreen() {
   const completionSequence = useRef(0);
   const sendGuard = useRef(false);
   const sendGuardTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const outgoingSequence = useRef(0);
 
   useEffect(() => () => {
     if (sendGuardTimer.current !== null) clearTimeout(sendGuardTimer.current);
@@ -957,6 +959,10 @@ export default function SessionScreen() {
             toast(message);
             return;
           }
+          setPendingOutgoing({
+            token: `${String(Date.now())}-${String(++outgoingSequence.current)}`,
+            text: t,
+          });
           recentSessions.activity(hostId, sid, t);
         } else {
           const result = conn.chatSend(
@@ -976,6 +982,10 @@ export default function SessionScreen() {
             toast(message);
             return;
           }
+          setPendingOutgoing({
+            token: `${String(Date.now())}-${String(++outgoingSequence.current)}`,
+            text: t || "图片附件",
+          });
           recentSessions.activity(hostId, sid, t || "发送了图片");
           if (result.disposition === "queued") {
             toast("连接已断开，消息已在本机排队，恢复后会按顺序发送。");
@@ -991,6 +1001,7 @@ export default function SessionScreen() {
           toast(message);
           return;
         }
+        setPendingOutgoing(null);
         recentSessions.activity(hostId, sid, t);
       }
       void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
@@ -1550,6 +1561,7 @@ export default function SessionScreen() {
         <ChatView
           conn={conn}
           sid={sid}
+          pendingOutgoing={pendingOutgoing}
           agent={session.agent}
           workingStatus={busy ? (subagent?.status ?? session.status) : undefined}
           onInterrupt={isSubagent ? undefined : interruptCurrent}
