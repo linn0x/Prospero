@@ -16,7 +16,7 @@ export function ModelCapabilitiesFields({ value, onChange, disabled, protocol }:
   return <details>
     <summary className="cursor-pointer">{t("模型能力（可选）", "Model capabilities (optional)")}</summary>
     <FieldGroup className="mt-3 gap-3">
-      <FieldDescription>{t("按服务商文档填写。留空或未知不代表已验证。", "Use the provider's documented limits. Empty or unknown values are unverified.")}</FieldDescription>
+      <FieldDescription>{t("按服务商文档填写。留空或未知不代表已验证；保存后查看当前引擎的生效情况。", "Use the provider's documented limits. Empty or unknown values are unverified. Engine support is shown after saving.")}</FieldDescription>
       {protocol === "openai_chat_completions" && <FieldDescription>{t("Chat Completions 的两个 Token 上限须同时填写或同时留空。", "Chat Completions requires both token limits or neither.")}</FieldDescription>}
       {(["contextWindow", "maxOutputTokens"] as const).map((key) => <Field key={key}>
         <FieldLabel htmlFor={`${id}-${key}`}>{key === "contextWindow" ? t("上下文窗口（Tokens）", "Context window (tokens)") : t("最大输出（Tokens）", "Maximum output (tokens)")}</FieldLabel>

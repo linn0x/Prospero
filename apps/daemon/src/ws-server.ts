@@ -15,6 +15,7 @@ import {
   CAPABILITY_AGENT_API_PROFILES,
   CAPABILITY_AGENT_API_PROTOCOLS,
   CAPABILITY_AGENT_API_VALIDATION,
+  CAPABILITY_AGENT_API_ENGINE_VALIDATION,
   CAPABILITY_AGENT_DEEPSEEK_HARNESS,
   CAPABILITY_CHAT_ATTACHMENT_PREVIEWS,
   CAPABILITY_DEEPSEEK_TRAJECTORY,
@@ -47,6 +48,7 @@ import {
   type C2SMessage,
   type AgentEventBody,
   type AgentApiValidation,
+  type AgentApiEngineValidation,
   clampSessionInfo,
   type S2CMessage,
   type SecureChannel,
@@ -71,6 +73,7 @@ import { RemoteSupervisorError } from "./structured-supervisor-client.js";
 import { createStructuredSupervisorRuntimeSnapshot } from "./structured-supervisor-runtime.js";
 import { StatusFile } from "./status-file.js";
 import { probeApiProfile } from "./api-profile-probe.js";
+import { probeApiProfileEngine } from "./api-profile-engine-probe.js";
 import { pageSessions } from "./session-list.js";
 import {
   ControlSocketError,
@@ -243,6 +246,7 @@ export interface DaemonServerOptions {
   accountRunner?: AccountCommandRunner;
   /** Deterministic test seam; production only probes on explicit account actions. */
   apiProfileProbe?: typeof probeApiProfile;
+  apiProfileEngineProbe?: typeof probeApiProfileEngine;
   /**
    * Structured-session test seam. Injected adapters stay in-process, so this
    * is intentionally for deterministic daemon integration tests only.
@@ -321,7 +325,11 @@ export async function createDaemonServer(
   // `apps/daemon/bin/prospero` 是 package 安装前的本地入口；npm 安装后仍由
   // package bin 指向同一文件。每个 agent 的 PATH 都优先找到它。
   const cliBinDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "bin");
-  const accounts = new AgentAccountManager(opts.home, opts.accountRunner);
+  let accountSessionsRestored = false;
+  const accounts: AgentAccountManager = new AgentAccountManager(opts.home, opts.accountRunner, undefined, {
+    accountInUse: (accountId) => manager.accountInUse(accountId),
+  });
+  await accounts.ready();
   const apiTests = new Map<string, AbortController>();
   const structuredSupervisorEnabled = opts.structuredSupervisor ?? process.env["VITEST"] !== "true";
   // Freeze the POSIX executable boundary before any Unix session launcher is
@@ -345,7 +353,7 @@ export async function createDaemonServer(
     }, 30_000)
     : undefined;
   structuredRuntimeHeartbeat?.unref();
-  const manager = new SessionManager({
+  const manager: SessionManager = new SessionManager({
     home: opts.home,
     // Direct SessionManager users (notably unit tests) remain in-process by
     // default. The production daemon is the opt-in authority; Vitest's own
@@ -363,7 +371,7 @@ export async function createDaemonServer(
       PROSPERO_CONTROL_TOKEN_PATH: controlTokenPath,
       PATH: [cliBinDir, process.env["PATH"] ?? ""].filter((part) => part !== "").join(path.delimiter),
     }),
-    accountResolver: (accountId, agent) => accounts.resolve(accountId, agent),
+    accountResolver: (accountId, agent) => accounts.resolveForSession(accountId, agent),
     accountCapabilitiesResolver: (accountId, agent) => accounts.capabilitiesFor(accountId, agent),
   });
   const orchestrationStore = new OrchestrationStore(opts.home);
@@ -641,9 +649,15 @@ export async function createDaemonServer(
   ): Promise<{ status: number; result: AgentAccountControlResult }> {
     const action = accountAction(message);
     try {
+      // HTTP/WS listen before detached sessions are adopted. During that window
+      // active-account leases are incomplete, so account writes must wait.
+      if (!accountSessionsRestored && message.type !== "agent.accounts.list") {
+        throw new AgentAccountError("正在恢复已有会话，请稍后修改账号或测试连接", "account_in_use");
+      }
       let sessionId: string | undefined;
       let accountId: string | undefined;
       let validation: AgentApiValidation | undefined;
+      let engineValidation: AgentApiEngineValidation | undefined;
       if ("accountId" in message && apiTests.has(message.accountId)) {
         throw new AgentAccountError("这个 Profile 正在测试连接，请等待测试结束", "account_in_use");
       }
@@ -685,8 +699,15 @@ export async function createDaemonServer(
           if (signal?.aborted) controller.abort();
           apiTests.set(message.accountId, controller);
           try {
-            validation = await (opts.apiProfileProbe ?? probeApiProfile)(binding, { signal: controller.signal });
-            if (!accounts.recordApiValidation(message.accountId, revision, validation)) {
+            let recorded: boolean;
+            if (message.scope === "engine") {
+              engineValidation = await (opts.apiProfileEngineProbe ?? probeApiProfileEngine)(binding, { signal: controller.signal });
+              recorded = accounts.recordApiEngineValidation(message.accountId, revision, engineValidation);
+            } else {
+              validation = await (opts.apiProfileProbe ?? probeApiProfile)(binding, { signal: controller.signal });
+              recorded = accounts.recordApiValidation(message.accountId, revision, validation);
+            }
+            if (!recorded) {
               throw new AgentAccountError("Profile 已变更，请重新测试连接", "account_invalid");
             }
             accountId = message.accountId;
@@ -746,6 +767,7 @@ export async function createDaemonServer(
           ...(accountId ? { accountId } : {}),
           ...(sessionId ? { sessionId } : {}),
           ...(validation ? { validation } : {}),
+          ...(engineValidation ? { engineValidation } : {}),
         },
       };
     } catch (error) {
@@ -769,7 +791,7 @@ export async function createDaemonServer(
   function orchestrationCapabilities(conn: Conn): string[] {
     const capabilities: string[] = [];
     if (conn.protocolVersion >= 16 && conn.device?.allowShell) {
-      capabilities.push(CAPABILITY_AGENT_API_PROTOCOLS, CAPABILITY_AGENT_API_VALIDATION);
+      capabilities.push(CAPABILITY_AGENT_API_PROTOCOLS, CAPABILITY_AGENT_API_VALIDATION, CAPABILITY_AGENT_API_ENGINE_VALIDATION);
     }
     if (conn.protocolVersion >= 15) capabilities.push(CAPABILITY_FS_PUT_ACK);
     capabilities.push(CAPABILITY_AGENT_DEEPSEEK_HARNESS);
@@ -3155,6 +3177,7 @@ export async function createDaemonServer(
   // 已早于 daemon 启动发生的 worker 必须主动逐条对账，不能永久卡在 running。
   await dispatchService.reconcilePersistedSessions();
   completeSettledCoordinatorRuns();
+  accountSessionsRestored = true;
   statusFile.start(port);
   relayClient.update(loadConfig(opts.home), loadDevices(opts.home));
   automationService.resumePersisted();

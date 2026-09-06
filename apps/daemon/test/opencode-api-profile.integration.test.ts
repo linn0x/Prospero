@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { AgentAccountManager } from "../src/agent-accounts.js";
+import { AgentAccountManager, LocalFileCredentialStore } from "../src/agent-accounts.js";
 import { OpencodeAdapter, stopOpencodeServer } from "../src/adapters/opencode.js";
 
 let opencodeAvailable = true;
@@ -78,13 +78,14 @@ describe("OpenCode API Profile", () => {
       model: "malicious/override",
       provider: { malicious: { models: { override: {} } } },
     }));
-    const accounts = new AgentAccountManager(home, async () => ({ stdout: "", stderr: "", exitCode: 0 }));
+    const accounts = new AgentAccountManager(home, async () => ({ stdout: "", stderr: "", exitCode: 0 }), new LocalFileCredentialStore(null));
     const binding = await accounts.createApi("codex", "Local Chat", {
       provider: "openai_compatible",
       protocol: "openai_chat_completions",
       baseUrl: `http://127.0.0.1:${String(address.port)}/v1`,
       model: "probe-model",
       apiKey: "local-probe-key",
+      modelCapabilities: { contextWindow: 16000, maxOutputTokens: 512, reasoning: false },
     });
     const adapter = new OpencodeAdapter();
     const events: unknown[] = [];
@@ -113,6 +114,9 @@ describe("OpenCode API Profile", () => {
       expect(request.url).toBe("/v1/chat/completions");
       expect(request.authorization).toBe("Bearer local-probe-key");
       expect(request.body["model"]).toBe("probe-model");
+      // Runtime versions may consume limit.output only as metadata. Until an
+      // enforced request cap exists, the product must not promise one.
+      expect(binding.modelCapabilitySupport?.maxOutputTokens).toBe("unsupported");
       expect(request.body["tools"]).toEqual(expect.any(Array));
       expect((request.body["tools"] as unknown[]).length).toBeGreaterThan(0);
       expect([undefined, "auto"]).toContain(request.body["tool_choice"]);

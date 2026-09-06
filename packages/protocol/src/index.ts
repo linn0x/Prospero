@@ -18,6 +18,8 @@ export {
   AgentAccountCapabilitiesSchema,
   AgentModelCapabilitiesSchema,
   AgentApiValidationSchema,
+  AgentApiEngineValidationSchema,
+  AgentModelCapabilitySupportSchema,
   SessionKindSchema,
   SessionStatusSchema,
   SessionInfoSchema,

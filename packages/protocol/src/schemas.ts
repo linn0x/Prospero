@@ -50,6 +50,32 @@ export const AgentModelCapabilitiesSchema = z.object({
 }).refine((value) => value.contextWindow === undefined || value.maxOutputTokens === undefined ||
   value.maxOutputTokens <= value.contextWindow, { message: "maxOutputTokens must not exceed contextWindow" });
 const AgentApiValidationCheckSchema = z.enum(["passed", "failed", "not_tested"]);
+const AgentModelCapabilitySupportValueSchema = z.enum(["enforced", "unsupported"]);
+/** Reports only explicitly declared capabilities; enforcement is engine-specific. */
+export const AgentModelCapabilitySupportSchema = z.object({
+  contextWindow: AgentModelCapabilitySupportValueSchema.optional(),
+  maxOutputTokens: AgentModelCapabilitySupportValueSchema.optional(),
+  tools: AgentModelCapabilitySupportValueSchema.optional(),
+  vision: AgentModelCapabilitySupportValueSchema.optional(),
+  reasoning: AgentModelCapabilitySupportValueSchema.optional(),
+});
+/** A separate, isolated native-engine execution check, never inferred from a wire probe. */
+export const AgentApiEngineValidationSchema = z.object({
+  status: z.enum(["passed", "failed"]),
+  checkedAt: z.number().int().nonnegative(),
+  engine: AgentExecutionEngineSchema,
+  cliVersion: z.string().min(1).max(100).optional(),
+  checks: z.object({
+    runtime: AgentApiValidationCheckSchema,
+    configuration: AgentApiValidationCheckSchema,
+    streaming: AgentApiValidationCheckSchema,
+    tools: AgentApiValidationCheckSchema,
+  }),
+  code: z.string().min(1).max(100).optional(),
+  detail: z.string().max(1000),
+  latencyMs: z.number().nonnegative().optional(),
+}).refine((value) => value.status !== "passed" || Object.values(value.checks).every((check) => check === "passed"),
+  { message: "passed engine validation requires all checks to pass" });
 export const AgentApiValidationSchema = z.object({
   status: z.enum(["passed", "failed"]),
   checkedAt: z.number().int().nonnegative(),
@@ -99,6 +125,8 @@ export const AgentAccountSchema = z.object({
   engine: AgentExecutionEngineSchema.optional(),
   capabilities: AgentAccountCapabilitiesSchema.optional(),
   apiValidation: AgentApiValidationSchema.optional(),
+  apiEngineValidation: AgentApiEngineValidationSchema.optional(),
+  modelCapabilitySupport: AgentModelCapabilitySupportSchema.optional(),
   authMethod: z.string().max(200).optional(),
   detail: z.string().max(1000).optional(),
   createdAt: z.number().int().nonnegative(),
@@ -436,6 +464,7 @@ export const C2SAgentAccountApiTestSchema = z.object({
   type: z.literal("agent.account.api.test"),
   requestId: z.string().min(1).max(100),
   accountId: z.string().min(1).max(100),
+  scope: z.enum(["protocol", "engine"]).optional(),
 });
 
 export const C2SAgentAccountRenameSchema = z.object({
@@ -1616,6 +1645,7 @@ export const S2CAgentAccountsResultSchema = z.object({
   accounts: z.array(AgentAccountSchema).max(100),
   accountId: z.string().min(1).max(100).optional(),
   validation: AgentApiValidationSchema.optional(),
+  engineValidation: AgentApiEngineValidationSchema.optional(),
   /** login 会新建官方 CLI 的交互终端，客户端可直接打开。 */
   sessionId: sid.optional(),
   error: z.string().max(2000).optional(),
@@ -1843,6 +1873,8 @@ export type AgentExecutionEngine = z.infer<typeof AgentExecutionEngineSchema>;
 export type AgentAccountCapabilities = z.infer<typeof AgentAccountCapabilitiesSchema>;
 export type AgentModelCapabilities = z.infer<typeof AgentModelCapabilitiesSchema>;
 export type AgentApiValidation = z.infer<typeof AgentApiValidationSchema>;
+export type AgentApiEngineValidation = z.infer<typeof AgentApiEngineValidationSchema>;
+export type AgentModelCapabilitySupport = z.infer<typeof AgentModelCapabilitySupportSchema>;
 export type AgentAccountStatus = z.infer<typeof AgentAccountStatusSchema>;
 export type AgentAccount = z.infer<typeof AgentAccountSchema>;
 export type SessionKind = z.infer<typeof SessionKindSchema>;

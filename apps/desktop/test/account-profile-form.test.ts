@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   accountApiStatus,
+  accountApiEngineStatus,
+  accountApiTestAction,
+  supportsAccountApiEngineValidation,
+  modelCapabilitySupportRows,
   modelCapabilityDraft,
   parseModelCapabilities,
   supportsAccountApiValidation,
@@ -122,5 +126,28 @@ describe("API validation and optional model metadata", () => {
     expect(() => parseModelCapabilities({ ...modelCapabilityDraft(), contextWindow: "100", maxOutputTokens: "101" })).toThrow("Output limit");
     expect(() => parseModelCapabilities({ ...modelCapabilityDraft(), contextWindow: "100" }, {}, "openai_chat_completions")).toThrow("both token limits");
     expect(parseModelCapabilities({ ...modelCapabilityDraft(), contextWindow: "100" }, {}, "openai_responses")).toEqual({ contextWindow: 100 });
+  });
+});
+
+
+describe("independent Agent execution validation", () => {
+  it("preserves protocol compatibility and opts into engine requests explicitly", () => {
+    expect(accountApiTestAction("profile", "protocol")).toEqual({ type: "agent.account.api.test", accountId: "profile" });
+    expect(accountApiTestAction("profile", "engine")).toEqual({ type: "agent.account.api.test", accountId: "profile", scope: "engine" });
+    expect(supportsAccountApiEngineValidation(["agent.api-validation.v1"])).toBe(false);
+    expect(supportsAccountApiEngineValidation(["agent.api-engine-validation.v1"])).toBe(true);
+  });
+
+  it("does not confuse a passing protocol check with a passing engine check", () => {
+    const account = { status: "signed_in", apiValidation: { status: "passed" }, apiEngineValidation: { status: "failed" } };
+    expect(accountApiStatus(account, true)).toBe("API checks passed");
+    expect(accountApiEngineStatus(account, true)).toBe("Agent execution failed");
+    expect(accountApiEngineStatus({ apiValidation: { status: "passed" } }, true)).toBe("Agent execution unverified");
+  });
+
+  it("reports only declared model fields and leaves missing support unknown", () => {
+    expect(modelCapabilitySupportRows({ modelCapabilities: { contextWindow: 1000, tools: false, vision: false } }, { contextWindow: "unsupported", tools: "enforced", reasoning: "enforced" })).toEqual([
+      { key: "contextWindow", status: "unsupported" }, { key: "tools", status: "enforced" }, { key: "vision", status: "unknown" },
+    ]);
   });
 });

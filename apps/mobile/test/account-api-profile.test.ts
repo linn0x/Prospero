@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   accountApiProtocolDefaults,
   accountApiStatus,
+  accountApiEngineStatus,
+  modelCapabilitySupportRows,
   modelTokenLimit,
   updateModelTokenLimit,
   accountApiProfileRequiresStructured,
@@ -67,5 +69,24 @@ describe("API validation presentation and token limits", () => {
     for (const raw of ["0", "-1", "1.5", "1e3", "9007199254740992"]) {
       expect(() => modelTokenLimit(raw)).toThrow();
     }
+  });
+});
+
+
+describe("engine validation and model capability support", () => {
+  it("keeps engine validation independent of protocol validation", () => {
+    expect(accountApiEngineStatus({})).toBe("Agent 执行未验证");
+    expect(accountApiEngineStatus({ apiEngineValidation: { status: "failed", checkedAt: 1, engine: "codex", checks: { runtime: "passed", configuration: "passed", streaming: "failed", tools: "not_tested" }, detail: "No stream" } })).toBe("Agent 执行验证失败");
+  });
+
+  it("does not call unsupported or unreported declarations enforced", () => {
+    expect(modelCapabilitySupportRows({
+      apiProfile: { provider: "openai_compatible", protocol: "openai_responses", baseUrl: "https://example.test/v1", model: "sample", modelCapabilities: { contextWindow: 1000, tools: true, vision: false } },
+      modelCapabilitySupport: { contextWindow: "unsupported", tools: "enforced", reasoning: "enforced" },
+    })).toEqual([
+      { key: "contextWindow", label: "上下文窗口", detail: "已保存，当前引擎未应用" },
+      { key: "tools", label: "工具调用", detail: "已接入本地配置" },
+      { key: "vision", label: "图片输入", detail: "未报告生效情况" },
+    ]);
   });
 });

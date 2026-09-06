@@ -1052,7 +1052,7 @@ function installIpc(): void {
         if (confirmation.response !== 1) return { ok: false, cancelled: true };
       }
     }
-    const result = await runtime.request("/_prospero/control/accounts", { method: "POST", body: message, ...(message["type"] === "agent.account.api.test" ? { timeoutMs: 45_000 } : {}) });
+    const result = await runtime.request("/_prospero/control/accounts", { method: "POST", body: message, ...(message["type"] === "agent.account.api.test" ? { timeoutMs: message["scope"] === "engine" ? 90_000 : 45_000 } : {}) });
     if (Array.isArray(result?.["accounts"])) store.setAccounts(result["accounts"]);
     return result;
   }));

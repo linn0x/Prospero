@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   AgentModelCapabilitiesSchema,
   CAPABILITY_AGENT_API_VALIDATION,
+  CAPABILITY_AGENT_API_ENGINE_VALIDATION,
+  AgentApiEngineValidationSchema,
   getAgentAccountCapabilities,
   getAgentAccountEngine,
   parseC2S,
@@ -9,6 +11,20 @@ import {
 } from "../src/index.js";
 
 describe("API Profile capabilities and validation protocol", () => {
+  it("separates engine verification from wire validation and requires configuration evidence", () => {
+    expect(CAPABILITY_AGENT_API_ENGINE_VALIDATION).toBe("agent.api-engine-validation.v1");
+    const action = { type: "agent.account.api.test", requestId: "engine", accountId: "a", scope: "engine" };
+    expect(parseC2S(action)).toMatchObject({ scope: "engine" });
+    expect(() => parseC2S({ ...action, scope: "unknown" })).toThrow();
+    const engineValidation = { status: "passed", engine: "codex", checkedAt: 1, cliVersion: "0.153.0",
+      checks: { runtime: "passed", configuration: "passed", streaming: "passed", tools: "passed" }, detail: "Fixture" };
+    expect(parseS2C({ type: "agent.accounts.result", requestId: "engine", action: "api_test", ok: true,
+      accounts: [], engineValidation })).toMatchObject({ engineValidation });
+    expect(AgentApiEngineValidationSchema.safeParse({ ...engineValidation,
+      checks: { ...engineValidation.checks, configuration: "not_tested" } }).success).toBe(false);
+    expect(AgentApiEngineValidationSchema.safeParse({ ...engineValidation, cliVersion: "x".repeat(101) }).success).toBe(false);
+  });
+
   it("derives legacy engine restrictions when metadata is absent", () => {
     expect(getAgentAccountCapabilities({ agent: "codex" })).toEqual({
       sessionKinds: ["pty", "structured"], plan: true, resume: true, modelSelection: true, reasoningEffort: true,
