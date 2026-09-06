@@ -71,6 +71,9 @@ const api: DesktopApi = {
   relayAction: (input) => ipcRenderer.invoke("relay:action", input),
   updateSettings: (patch: Partial<DesktopSettings>) => ipcRenderer.invoke("settings:update", patch),
   clearLogs: () => ipcRenderer.invoke("logs:clear"),
+  listRemoteHosts: () => ipcRenderer.invoke("remote-host:list"),
+  importRemoteHost: (pairingUri: string) => ipcRenderer.invoke("remote-host:import", pairingUri),
+  removeRemoteHost: (id: string) => ipcRenderer.invoke("remote-host:remove", id),
 };
 
 contextBridge.exposeInMainWorld("prospero", Object.freeze(api));

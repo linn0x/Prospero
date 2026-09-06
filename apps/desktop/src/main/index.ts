@@ -15,6 +15,7 @@ import { DaemonRuntime } from "./daemon-runtime";
 import { LegacyOrchestrationProjection } from "./legacy-orchestration-projection";
 import { sessionInfoFromControl } from "./session-control";
 import { StateStore } from "./state-store";
+import { RemoteHostStore } from "./remote-host-store";
 
 const SAFE_ID = /^[A-Za-z0-9._:-]{1,160}$/;
 const ORCHESTRATION_METHODS = new Set([
@@ -50,6 +51,7 @@ let lastBroadcastWindowId: number | undefined;
 let windowStateTimer: ReturnType<typeof setTimeout> | undefined;
 let accountActionTail: Promise<void> = Promise.resolve();
 const store = new StateStore();
+const remoteHostStore = new RemoteHostStore(resolve(app.getPath("userData"), "remote-hosts.json"));
 const runtime = new DaemonRuntime(store);
 const legacyProjection = new LegacyOrchestrationProjection(
   store.home,
@@ -731,6 +733,15 @@ async function runDesktopSelfCheck(window: BrowserWindow): Promise<void> {
 function installIpc(): void {
   ipcMain.handle("appearance:get", () => windowAppearance(process.platform, nativeTheme));
   ipcMain.handle("snapshot:get", () => store.snapshot());
+  ipcMain.handle("remote-host:list", () => remoteHostStore.list());
+  ipcMain.handle("remote-host:import", (_event, raw: unknown) => {
+    if (typeof raw !== "string" || raw.trim().length === 0) throw new Error("配对二维码内容无效");
+    return remoteHostStore.importPairing(raw);
+  });
+  ipcMain.handle("remote-host:remove", (_event, raw: unknown) => {
+    if (typeof raw !== "string" || !SAFE_ID.test(raw)) throw new Error("远程主机 ID 无效");
+    return { ok: remoteHostStore.remove(raw) };
+  });
   ipcMain.handle("daemon:start", () => runtime.start());
   ipcMain.handle("daemon:stop", () => runtime.stop());
   ipcMain.handle("daemon:restart", () => runtime.restart());
