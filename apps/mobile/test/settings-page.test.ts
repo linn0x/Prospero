@@ -10,6 +10,8 @@ describe("mobile settings page", () => {
 
     expect(settings).toContain('title="外观"');
     expect(settings).toContain("HOME_RECENT_SESSION_LIMITS.map");
+    expect(settings).toContain('title="设备切换震动"');
+    expect(settings).toContain("settings.deviceSwitcherHapticsEnabled");
     expect(settings).toContain('title="后台任务"');
     expect(settings).toContain('title="其他应用上层悬浮框"');
     expect(settings).toContain("overlayPermissionPending");
@@ -31,6 +33,8 @@ describe("mobile settings page", () => {
 
     expect(home).toContain('router.push("/settings")');
     expect(home).toContain('accessibilityLabel="设置"');
+    expect(dashboard).not.toContain("onOpenSettings");
+    expect(dashboard).not.toContain('accessibilityLabel="打开设置"');
     expect(dashboard).not.toContain("首页设置");
   });
 });

@@ -4,6 +4,27 @@ import { describe, expect, it } from "vitest";
 import { ORCHESTRATION_ACTION_MIN_HIT_TARGET } from "../src/lib/orchestration-overview";
 
 describe("编排 Run 当前态 UI", () => {
+  it("loads, saves, reuses, and deletes local orchestration templates", () => {
+    const screen = readFileSync(
+      join(import.meta.dirname, "..", "src", "app", "host", "[hostId]", "orchestration.tsx"),
+      "utf8",
+    );
+    const store = readFileSync(
+      join(import.meta.dirname, "..", "src", "lib", "orchestration-template-store.ts"),
+      "utf8",
+    );
+
+    expect(screen).toContain("listOrchestrationTemplates()");
+    expect(screen).toContain("saveOrchestrationTemplate(");
+    expect(screen).toContain("instantiateOrchestrationTemplate(template.payload, randomUUID)");
+    expect(screen).toContain("deleteOrchestrationTemplate(template.id)");
+    expect(screen).toContain('title="保存编排模板"');
+    expect(store).toContain('ORCHESTRATION_DATABASE_NAME = "prospero.db"');
+    expect(store).toContain("CREATE TABLE IF NOT EXISTS ${ORCHESTRATION_TEMPLATE_TABLE}");
+    expect(store).toContain("schema_version INTEGER NOT NULL");
+    expect(store).toContain("app_schema_migrations");
+  });
+
   it("keeps progress, direct Gate resolution, and task targeting in the orchestration screen", () => {
     const screen = readFileSync(
       join(import.meta.dirname, "..", "src", "app", "host", "[hostId]", "orchestration.tsx"),

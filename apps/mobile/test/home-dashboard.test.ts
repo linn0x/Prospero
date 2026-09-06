@@ -106,9 +106,17 @@ describe("home dashboard", () => {
     ).toBe("darwin · 15.6 · arm64");
   });
 
-  it("动态目录关闭 Android cell 裁剪，并把设备列表放进底部弹层", () => {
+  it("动态目录关闭 Android cell 裁剪，并把设备区放在首页顶部", () => {
     const dashboard = readFileSync(
       join(import.meta.dirname, "..", "src", "components", "HomeDashboard.tsx"),
+      "utf8",
+    );
+    const quickSwitcher = readFileSync(
+      join(import.meta.dirname, "..", "src", "components", "DeviceQuickSwitcher.tsx"),
+      "utf8",
+    );
+    const detailCarousel = readFileSync(
+      join(import.meta.dirname, "..", "src", "components", "DeviceDetailCarousel.tsx"),
       "utf8",
     );
 
@@ -119,6 +127,9 @@ describe("home dashboard", () => {
     expect(dashboard).toContain("onOpenSession(selectedHost.id, session.id)");
     expect(dashboard).toContain('label="添加设备"');
     expect(dashboard).toContain('label="新建目录"');
+    expect(dashboard).not.toContain("onOpenSettings");
+    expect(dashboard).not.toContain("sectionSubtitle");
+    expect(dashboard).not.toContain("最近 {String(effectiveHomeSettings.recentSessionLimit)} 条");
     expect(dashboard).not.toContain("visible={settingsOpen}");
     expect(dashboard).toContain("normalizeHomeSettings(homeSettings ?? DEFAULT_HOME_SETTINGS)");
     expect(dashboard).toContain("projectCardPressed: { borderRadius: radius.md");
@@ -133,8 +144,68 @@ describe("home dashboard", () => {
     expect(dashboard).toContain("styles.deviceFleetPill");
     expect(dashboard).toContain("hostConnectionTone(runtime, palette)");
     expect(dashboard).toContain('`${String(runtime.rttMs)}ms`');
-    expect(dashboard).toContain("hostConnectionLabel(selectedRuntime)");
+    expect(dashboard).toContain("orderedHosts.slice(1).map");
+    expect(dashboard).toContain("styles.fleetCurrentStatus");
+    expect(dashboard).toContain("hostConnectionLabel(runtime)");
     expect(dashboard).not.toContain("styles.deviceIdentityMark");
+    expect(dashboard).toContain("<DeviceQuickSwitcher");
+    expect(dashboard).not.toContain("DevicePreviewCarousel");
+    expect(dashboard).toContain("<DeviceDetailCarousel");
+    expect(dashboard).toMatch(/<View style=\{styles\.headerContent\}>\s*\{devicePanel\}/u);
+    expect(dashboard).not.toContain("styles.deviceFooter");
+    expect(dashboard).toContain("duration: 180");
+    expect(dashboard).toContain("setPreviewHostId(hostId)");
+    expect(dashboard).toContain("const homeSwipeActive = quickSwitchActive || deviceDetailsOpen");
+    expect(dashboard).toContain("const deviceCardStride = deviceCardWidth * 0.94");
+    expect(dashboard).toContain("{ width: viewportWidth, marginLeft: -deviceViewportBleed }");
+    expect(dashboard).toContain("deviceCardSideInset - clampedPosition * deviceCardStride");
+    expect(dashboard).toContain("onSwipePosition={handleDetailSwipePosition}");
+    expect(dashboard).toContain("outputRange: [1, 0.9]");
+    expect(dashboard).toContain("homeSwipeProgress.interpolate");
+    expect(dashboard).toContain("deviceDetailsOpen && detailHostId");
+    expect(dashboard).toContain("setDetailHostId(hostId)");
+    expect(dashboard).toContain("hosts.map(renderHomeDeviceCard)");
+    expect(quickSwitcher).toContain("hosts.length <= 1");
+    expect(quickSwitcher).toContain("activateAfterLongPress(DEVICE_QUICK_SWITCH_LONG_PRESS_MS)");
+    expect(quickSwitcher).toContain("Gesture.Exclusive(panGesture, tapGesture)");
+    expect(quickSwitcher).toContain("quickSwitchShouldCancel(event.translationY");
+    expect(quickSwitcher).toMatch(
+      /deviceIndexForTranslation\(\s*session\.startIndex\(\),\s*event\.translationX/u,
+    );
+    expect(quickSwitcher).toContain("Haptics.selectionAsync()");
+    expect(quickSwitcher).toContain("if (!enabled) return");
+    expect(quickSwitcher).toContain("toValue: quickSwitchActive ? 1.2 : 1");
+    expect(quickSwitcher).toContain("onOpenDeviceDetails()");
+    expect(dashboard).toContain("hapticsEnabled={effectiveHomeSettings.deviceSwitcherHapticsEnabled}");
+    expect(detailCarousel).toContain('testID="device-detail-carousel"');
+    expect(detailCarousel).toContain('testID="device-detail-backdrop"');
+    expect(detailCarousel).toContain("snapToInterval={cardStride}");
+    expect(detailCarousel).toContain('testID="device-os-rail"');
+    expect(detailCarousel).toContain("deviceIndexForRailPosition(");
+    expect(detailCarousel).toContain("onTouchMove={handleTouchMove}");
+    expect(detailCarousel).toContain("卡片内容可上下滚动");
+    expect(detailCarousel).toContain("nestedScrollEnabled");
+    expect(detailCarousel).toContain("工作目录");
+    expect(detailCarousel).toContain('label="设备详情"');
+    expect(detailCarousel).toContain('label="新建会话"');
+    expect(detailCarousel).toContain('label="刷新"');
+    expect(detailCarousel).toContain("const RAIL_ITEM_WIDTH = 38");
+    expect(detailCarousel).toContain("const RAIL_HEIGHT = 42");
+    expect(detailCarousel).toContain("size={16}");
+    expect(detailCarousel).toContain("pendingScrollIndexRef.current = animated ? index : null");
+    expect(detailCarousel).toContain("visibleIndexRef.current = index");
+    expect(detailCarousel).toContain("onScroll={handleCarouselScroll}");
+    expect(detailCarousel).toContain("scrollEventThrottle={16}");
+    expect(detailCarousel).toContain("if (!visible) return");
+    expect(detailCarousel).not.toContain("cardAdjacent: { borderColor: palette.border, opacity:");
+    expect(quickSwitcher).toContain('flexDirection: "row"');
+    expect(quickSwitcher).toContain('justifyContent: "space-evenly"');
+    const railStyle = quickSwitcher.slice(
+      quickSwitcher.indexOf("railCapsule: {"),
+      quickSwitcher.indexOf("railDots: {"),
+    );
+    expect(railStyle).not.toContain("borderWidth");
+    expect(railStyle).not.toContain("borderColor");
   });
 
   it("底部弹层由原生可见性负责关闭，不依赖可能中断的动画回调", () => {
