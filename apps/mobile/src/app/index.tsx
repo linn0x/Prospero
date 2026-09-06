@@ -23,6 +23,7 @@ import {
 import { getDeviceKeys, getHosts, removeHost, type StoredHost } from "@/lib/hosts";
 import { clearSessionPreferences } from "@/lib/session-preferences";
 import { useApp } from "@/lib/store";
+import { useOrchestrationSnapshot } from "@/lib/use-orchestration-snapshot";
 import { font, radius, space, useMobileTheme, type ThemePalette } from "@/lib/theme";
 
 export default function HostsScreen() {
@@ -56,6 +57,17 @@ export default function HostsScreen() {
   const setHomeSettings = useApp((state) => state.setHomeSettings);
   const runtimes = useApp((state) => state.runtimes);
   const effectiveSelectedHostId = resolveHomeHostSelection(hosts, selectedHostId);
+  const selectedConnection = effectiveSelectedHostId ? peekConnection(effectiveSelectedHostId) ?? null : null;
+  const orchestration = useOrchestrationSnapshot(
+    selectedConnection,
+    effectiveSelectedHostId ? runtimes[effectiveSelectedHostId]?.status ?? "idle" : "idle",
+    15_000,
+  );
+  const managedWorkspacePaths = useMemo(
+    () => orchestration?.worktreeAssets?.map((asset) => asset.path) ?? [],
+    [orchestration],
+  );
+  const closeDevicePicker = useCallback(() => setDevicePickerOpen(false), []);
 
   useFocusEffect(
     useCallback(() => {
@@ -177,6 +189,8 @@ export default function HostsScreen() {
           devicePickerOpen={devicePickerOpen}
           bottomInset={insets.bottom}
           onToggleDevicePicker={() => setDevicePickerOpen((open) => !open)}
+          onCloseDevicePicker={closeDevicePicker}
+          managedWorkspacePaths={managedWorkspacePaths}
           onSelectHost={onSelectHost}
           onOpenHost={(hostId) => router.push(`/host/${hostId}`)}
           onOpenSession={(hostId, sessionId) =>
@@ -204,7 +218,6 @@ export default function HostsScreen() {
           }
           homeSettings={homeSettings}
           onChangeHomeSettings={onChangeHomeSettings}
-          onOpenSettings={() => router.push("/settings")}
         />
       )}
     </View>

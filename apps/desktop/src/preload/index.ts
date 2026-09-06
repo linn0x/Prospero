@@ -1,5 +1,20 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type { DesktopApi, DesktopSettings, DesktopSnapshotPatch, JsonObject, SessionCreateInput, SessionPageRequest } from "../shared/types";
+import type { WindowAppearance } from "../shared/window-appearance";
+
+// Apply appearance to the shared DOM without granting the renderer another
+// native API. Starting opaque also avoids a transparent flash before IPC loads.
+let appearance: WindowAppearance | undefined;
+function applyAppearance(value: WindowAppearance): void {
+  appearance = value;
+  if (!document.documentElement) return;
+  document.documentElement.dataset["nativeGlass"] = String(value.nativeGlass);
+  document.documentElement.dataset["reducedTransparency"] = String(value.reducedTransparency);
+  document.documentElement.dataset["highContrast"] = String(value.highContrast);
+}
+ipcRenderer.on("appearance:changed", (_event, value: WindowAppearance) => applyAppearance(value));
+void ipcRenderer.invoke("appearance:get").then(applyAppearance).catch(() => { /* Retain opaque fallback. */ });
+document.addEventListener("DOMContentLoaded", () => { if (appearance) applyAppearance(appearance); }, { once: true });
 
 const api: DesktopApi = {
   platform: process.platform,

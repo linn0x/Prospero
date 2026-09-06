@@ -119,7 +119,6 @@ describe("home dashboard", () => {
     expect(dashboard).toContain("onOpenSession(selectedHost.id, session.id)");
     expect(dashboard).toContain('label="添加设备"');
     expect(dashboard).toContain('label="新建目录"');
-    expect(dashboard).toContain("onOpenSettings");
     expect(dashboard).not.toContain("visible={settingsOpen}");
     expect(dashboard).toContain("normalizeHomeSettings(homeSettings ?? DEFAULT_HOME_SETTINGS)");
     expect(dashboard).toContain("projectCardPressed: { borderRadius: radius.md");
@@ -132,10 +131,8 @@ describe("home dashboard", () => {
     expect(dashboard).not.toContain("{devicePickerOpen && (");
     expect(dashboard).toContain('name={brand}');
     expect(dashboard).toContain("styles.deviceFleetPill");
-    expect(dashboard).toContain("hostConnectionTone(runtimes[host.id], palette)");
+    expect(dashboard).toContain("hostConnectionTone(runtime, palette)");
     expect(dashboard).toContain('`${String(runtime.rttMs)}ms`');
-    expect(dashboard).toContain("orderedDeviceHosts.slice(1).map");
-    expect(dashboard).toContain("styles.fleetCurrentStatus");
     expect(dashboard).toContain("hostConnectionLabel(selectedRuntime)");
     expect(dashboard).not.toContain("styles.deviceIdentityMark");
   });
