@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, CircleAlert, Copy, KeyRound, Link2, MonitorSmartphone, Pencil, Plus, RefreshCw, Server, Settings2, ShieldCheck, Trash2, UserRound, Wifi } from "lucide-react";
-import type { DesktopSnapshot, DeviceInfo, JsonObject, SessionInfo, UsageAccount, UsageWindow } from "../../shared/types";
+import type { DesktopSnapshot, DeviceInfo, JsonObject, RemoteHostSummary, RemoteShellEvent, SessionInfo, UsageAccount, UsageWindow } from "../../shared/types";
 import { displayError, number, record, text } from "./state";
 import { AgentLogo } from "./AgentLogo";
 import { accountEngine } from "../../shared/account-capabilities";
@@ -374,6 +374,58 @@ export function DevicesPane({ snapshot }: { snapshot: DesktopSnapshot }) {
   const revokeBusyRef = useRef(false);
   const pairResultRef = useRef<HTMLDivElement>(null);
   const deviceNameRef = useRef<HTMLInputElement>(null);
+  const [remoteHosts, setRemoteHosts] = useState<RemoteHostSummary[]>([]);
+  const [remotePairing, setRemotePairing] = useState("");
+  const [remoteSelected, setRemoteSelected] = useState<string>();
+  const [remoteSid, setRemoteSid] = useState<string>();
+  const [remoteTerminal, setRemoteTerminal] = useState("");
+  const [remoteInput, setRemoteInput] = useState("");
+  const [remoteBusy, setRemoteBusy] = useState(false);
+  const [remoteError, setRemoteError] = useState<string>();
+  const remoteTerminalRef = useRef<HTMLPreElement>(null);
+  const refreshRemoteHosts = useCallback(async (): Promise<void> => {
+    try { setRemoteHosts(await window.prospero.listRemoteHosts()); } catch (reason) { setRemoteError(displayError(reason)); }
+  }, []);
+  useEffect(() => {
+    void refreshRemoteHosts();
+    return window.prospero.subscribeRemoteShell((event: RemoteShellEvent) => {
+      if (event.hostId !== remoteSelected) return;
+      const message = event.message;
+      if (message.type === "remote.error") { setRemoteError(String(message.message ?? "Remote connection failed")); return; }
+      if (message.type === "term.snapshot") { setRemoteSid(String(message.sid)); setRemoteTerminal(String(message.ansi ?? "")); return; }
+      if (message.type === "term.output") {
+        setRemoteSid(String(message.sid));
+        try {
+          const bytes = Uint8Array.from(atob(String(message.dataB64)), (char) => char.charCodeAt(0));
+          setRemoteTerminal((current) => current + new TextDecoder().decode(bytes));
+        } catch { setRemoteError(t("远程终端输出无法解码", "Unable to decode remote terminal output")); }
+        return;
+      }
+      if (message.type === "session.create.result" && message.ok !== true) setRemoteError(String(message.error || t("远程 Shell 创建失败", "Unable to create remote shell")));
+    });
+  }, [refreshRemoteHosts, remoteSelected, t]);
+  useEffect(() => { remoteTerminalRef.current?.scrollIntoView({ block: "end" }); }, [remoteTerminal]);
+  const importRemote = async (): Promise<void> => {
+    if (!remotePairing.trim() || remoteBusy) return;
+    setRemoteBusy(true); setRemoteError(undefined);
+    try { const host = await window.prospero.importRemoteHost(remotePairing.trim()); setRemotePairing(""); setRemoteSelected(host.id); await refreshRemoteHosts(); }
+    catch (reason) { setRemoteError(displayError(reason)); }
+    finally { setRemoteBusy(false); }
+  };
+  const openRemoteShell = async (hostId: string): Promise<void> => {
+    if (remoteBusy) return;
+    setRemoteBusy(true); setRemoteError(undefined); setRemoteSelected(hostId); setRemoteSid(undefined); setRemoteTerminal("");
+    try { await window.prospero.connectRemoteHost(hostId); await window.prospero.createRemoteShell(hostId); }
+    catch (reason) { setRemoteError(displayError(reason)); }
+    finally { setRemoteBusy(false); }
+  };
+  const sendRemoteInput = async (): Promise<void> => {
+    if (!remoteSelected || !remoteSid || !remoteInput) return;
+    const bytes = new TextEncoder().encode(remoteInput);
+    let binary = ""; for (const byte of bytes) binary += String.fromCharCode(byte);
+    setRemoteInput("");
+    try { await window.prospero.sendRemoteShellInput(remoteSelected, remoteSid, btoa(binary)); } catch (reason) { setRemoteError(displayError(reason)); }
+  };
   useEffect(() => {
     if (pair?.uri) pairResultRef.current?.focus();
   }, [pair?.uri]);
@@ -572,6 +624,14 @@ export function DevicesPane({ snapshot }: { snapshot: DesktopSnapshot }) {
           )}
         </section>
       </div>
+      <section className="form-card remote-control-card" aria-labelledby="remote-hosts-title">
+        <div className="section-title"><Server size={16} aria-hidden="true" /><span id="remote-hosts-title">{t("远程电脑 Shell", "Remote computer Shell")}</span><span>{remoteHosts.length}</span></div>
+        <p className="security-note">{t("导入另一台电脑生成的 Prospero 配对串。凭据只留在桌面端主进程，默认打开 agent CLI shell。", "Import a Prospero pairing code from another computer. Credentials stay in the desktop main process; the default action opens an agent CLI shell.")}</p>
+        <div className="remote-host-import"><input value={remotePairing} onChange={(event) => setRemotePairing(event.target.value)} placeholder="prospero://pair?d=…" spellCheck={false} /><button disabled={!remotePairing.trim() || remoteBusy} onClick={() => void importRemote()}>{t("导入主机", "Import host")}</button></div>
+        {remoteError && <div className="inline-error" role="alert">{remoteError}</div>}
+        <div className="remote-host-list">{remoteHosts.map((host) => <article className="device-card" key={host.id}><div className="device-icon"><Server size={20} /></div><div><strong>{host.name}</strong><p>{host.addrs.join(" · ")}:{String(host.port)}</p></div><button disabled={remoteBusy} onClick={() => void openRemoteShell(host.id)}>{t("打开 Shell", "Open Shell")}</button><button className="icon-button danger" title={t("删除远程主机", "Remove remote host")} onClick={() => void window.prospero.removeRemoteHost(host.id).then(refreshRemoteHosts)}><Trash2 size={15} /></button></article>)}</div>
+        {remoteSelected && <div className="remote-terminal" aria-label={t("远程终端", "Remote terminal")}><pre ref={remoteTerminalRef}>{remoteTerminal || t("正在等待远程 Shell…", "Waiting for remote shell…")}</pre>{remoteSid && <div className="remote-terminal-input"><input value={remoteInput} onChange={(event) => setRemoteInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); void sendRemoteInput(); } }} placeholder={t("输入命令并回车", "Type a command and press Enter")} autoComplete="off" /><button onClick={() => void sendRemoteInput()} disabled={!remoteInput}>{t("发送", "Send")}</button></div>}</div>}
+      </section>
     </div>
   );
 }
