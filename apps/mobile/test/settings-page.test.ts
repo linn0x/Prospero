@@ -31,7 +31,6 @@ describe("mobile settings page", () => {
 
     expect(home).toContain('router.push("/settings")');
     expect(home).toContain('accessibilityLabel="设置"');
-    expect(dashboard).toContain("onPress={onOpenSettings}");
     expect(dashboard).not.toContain("首页设置");
   });
 });

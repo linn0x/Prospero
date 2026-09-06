@@ -14,7 +14,7 @@ export function useOrchestrationSnapshot(
   refreshEveryMs: number,
   onServerError?: (message: string) => void,
 ): OrchestrationSnapshot | null {
-  const [snapshot, setSnapshot] = useState<OrchestrationSnapshot | null>(null);
+  const [received, setReceived] = useState<{ conn: HostConnection; snapshot: OrchestrationSnapshot } | null>(null);
   const activeCleanup = useRef<(() => void) | null>(null);
 
   useFocusEffect(
@@ -28,7 +28,7 @@ export function useOrchestrationSnapshot(
       let active = true;
       const refresh = (): void => conn.orchestrationSnapshot();
       const offSnapshot = conn.events.on("orchestrationSnapshot", (message) => {
-        if (active) setSnapshot(message.snapshot);
+        if (active) setReceived({ conn, snapshot: message.snapshot });
       });
       const offError = onServerError
         ? conn.events.on("serverError", (message) => {
@@ -50,5 +50,6 @@ export function useOrchestrationSnapshot(
     }, [conn, onServerError, refreshEveryMs, status]),
   );
 
-  return snapshot;
+  // Switching hosts must not briefly classify the new host using the old host's worktrees.
+  return received?.conn === conn ? received.snapshot : null;
 }

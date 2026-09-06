@@ -21,6 +21,68 @@ export function homeWorkspaceProjects(
   return groupSessionsByProject(sortSessions(sessions ?? {}));
 }
 
+interface WorkspacePath {
+  root: string;
+  parts: string[];
+  absolute: boolean;
+  windows: boolean;
+}
+
+/** Lexical display/matching only: never resolve .. or assume a symlink's target. */
+function workspacePath(value: string): WorkspacePath {
+  const input = value.trim();
+  const drive = /^([A-Za-z]):[\\/]/u.exec(input);
+  if (drive) return { root: `${drive[1]!.toUpperCase()}:/`, parts: input.slice(3).split(/[\\/]+/u).filter(Boolean), absolute: true, windows: true };
+  if (/^(?:\\\\|\/\/)[^\\/]/u.test(input)) {
+    const parts = input.slice(2).split(/[\\/]+/u).filter(Boolean);
+    // Preserve the server/share identity rather than displaying a local root.
+    if (parts.length >= 2) return { root: `//${parts[0]}/${parts[1]}`, parts: parts.slice(2), absolute: true, windows: true };
+    return { root: "//", parts, absolute: false, windows: true };
+  }
+  const absolute = input.startsWith("/");
+  return { root: absolute ? "/" : "", parts: input.split(/\/+/u).filter(Boolean), absolute, windows: false };
+}
+
+function joinWorkspacePath(root: string, parts: readonly string[]): string {
+  return parts.length === 0 ? root : `${root}${root && !root.endsWith("/") ? "/" : ""}${parts.join("/")}`;
+}
+
+function workspacePathIdentity(value: string): string | null {
+  if (!value.trim()) return null;
+  const parsed = workspacePath(value);
+  return parsed.absolute ? joinWorkspacePath(parsed.root, parsed.parts) : null;
+}
+
+/** A task workspace is identified only by the selected host's authoritative asset paths. */
+export function partitionHomeProjects(
+  projects: readonly SessionProject[],
+  managedWorkspacePaths: readonly string[],
+): { projects: SessionProject[]; taskProjects: SessionProject[] } {
+  const managed = new Set(managedWorkspacePaths.map(workspacePathIdentity).filter((value): value is string => value !== null));
+  const result: { projects: SessionProject[]; taskProjects: SessionProject[] } = { projects: [], taskProjects: [] };
+  for (const project of projects) {
+    const identity = workspacePathIdentity(project.path);
+    (identity !== null && managed.has(identity) ? result.taskProjects : result.projects).push(project);
+  }
+  return result;
+}
+
+/** Display label only. Callers must keep the original path for every operation. */
+export function compactWorkspacePath(value: string): string {
+  const parsed = workspacePath(value);
+  let root = parsed.root;
+  let parts = parsed.parts;
+  const knownHomeUser = parts.length >= 2 && parts[1] !== "." && !parts.includes("..");
+  const standardPosixHome = root === "/" && (parts[0] === "Users" || parts[0] === "home") &&
+    knownHomeUser && parts[1] !== "Shared";
+  const standardWindowsHome = parsed.windows && /^[A-Z]:\/$/u.test(root) && parts[0]?.toLowerCase() === "users" &&
+    knownHomeUser && !["public", "default", "default user", "all users"].includes(parts[1]!.toLowerCase());
+  if (standardPosixHome || standardWindowsHome) { root = "~"; parts = parts.slice(2); }
+  else if (root === "" && parts[0] === "~") { root = "~"; parts = parts.slice(1); }
+  if (parts.length > 2) parts = ["…", ...parts.slice(-2)];
+  return joinWorkspacePath(root, parts);
+}
+
 /** 最近会话严格按创建时间排列，不让运行优先级改变“最近”的含义。 */
 export function homeRecentSessions(
   sessions: Record<string, SessionInfo> | undefined,
