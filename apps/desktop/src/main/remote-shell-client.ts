@@ -4,10 +4,14 @@ import {
   clientHandshakeStart,
   generateKeyPairB64,
   parseS2C,
+  parseRelayControlMessage,
+  RELAY_PROTOCOL_VERSION,
+  validateRelayUrl,
   type C2SMessage,
   type KeyPairB64,
   type S2CMessage,
   type SecureChannel,
+  type RelayPairing,
 } from "@prospero/protocol";
 
 export type RemoteShellHost = {
@@ -17,6 +21,7 @@ export type RemoteShellHost = {
   port: number;
   token: string;
   daemonPubKey: string;
+  relay?: RelayPairing;
 };
 
 export type RemoteShellMessage = Extract<
@@ -83,7 +88,19 @@ export class RemoteShellClient {
     let lastError: Error | undefined;
     for (const addr of this.host.addrs) {
       try {
-        return await this.connectAddress(addr);
+        return await this.connectAddress(`ws://${addr}:${String(this.host.port)}/ws`);
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+        this.closeSocket();
+      }
+    }
+    if (this.host.relay) {
+      try {
+        const relayUrl = validateRelayUrl(this.host.relay.url);
+        const parsed = new URL(relayUrl);
+        const path = parsed.pathname.replace(/\/$/, "");
+        parsed.pathname = path.endsWith("/v1/client") ? path : path.endsWith("/v1") ? `${path}/client` : "/v1/client";
+        return await this.connectAddress(parsed.toString(), this.host.relay);
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
         this.closeSocket();
@@ -117,13 +134,13 @@ export class RemoteShellClient {
     this.send({ type: "session.kill", sid });
   }
 
-  private async connectAddress(addr: string): Promise<Extract<S2CMessage, { type: "hello.ok" }>> {
-    const url = `ws://${addr}:${String(this.host.port)}/ws`;
+  private async connectAddress(url: string, relay?: RelayPairing): Promise<Extract<S2CMessage, { type: "hello.ok" }>> {
     const socket = this.openSocket(url);
     this.socket = socket;
     return await new Promise((resolve, reject) => {
       let settled = false;
       let opened = false;
+      let relayReady = relay === undefined;
       let channel: SecureChannel | null = null;
       const { frame, state } = clientHandshakeStart(SUPPORTED_PROTOCOL_VERSIONS[0]);
       const timer = setTimeout(() => fail(new Error("remote host handshake timed out")), HANDSHAKE_TIMEOUT_MS);
@@ -137,9 +154,13 @@ export class RemoteShellClient {
       };
       socket.onopen = () => {
         opened = true;
-        try { socket.send(frame); } catch (error) { fail(error instanceof Error ? error : new Error(String(error))); }
+        try {
+          if (relay) {
+            socket.send(JSON.stringify({ type: "client.open", v: RELAY_PROTOCOL_VERSION, routeId: relay.routeId, deviceId: relay.deviceId, token: relay.token }));
+          } else socket.send(frame);
+        } catch (error) { fail(error instanceof Error ? error : new Error(String(error))); }
       };
-      socket.onerror = () => fail(new Error(`unable to reach remote host at ${addr}`));
+      socket.onerror = () => fail(new Error(`unable to reach remote host at ${url}`));
       socket.onclose = (event) => {
         if (!settled) fail(new Error(event.reason || (opened ? "remote host closed during handshake" : "remote host is offline")));
         else this.handleClosed();
@@ -147,6 +168,16 @@ export class RemoteShellClient {
       socket.onmessage = (event) => {
         try {
           const text = String(event.data);
+          if (!relayReady) {
+            const control = parseRelayControlMessage(JSON.parse(text));
+            if (control.type === "stream.ready") {
+              relayReady = true;
+              socket.send(frame);
+              return;
+            }
+            if (control.type === "client.status" && control.status === "pending") return;
+            throw new Error(control.type === "error" ? control.message : "relay handshake failed");
+          }
           if (channel === null) {
             const finished = clientHandshakeFinish(state, text, this.host.daemonPubKey, {
               type: "hello",
