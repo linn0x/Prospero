@@ -77,6 +77,14 @@ export type DeviceInfo = {
   lastSeenAt?: number;
 };
 
+export type RemoteHostSummary = {
+  id: string;
+  name: string;
+  addrs: string[];
+  port: number;
+  lastConnectedAt?: number;
+};
+
 export type DaemonSnapshot = {
   running: boolean;
   managed: boolean;
@@ -311,4 +319,7 @@ export type DesktopApi = {
   relayAction(input: { action: "status" | "enable" | "disable" | "rotate-key"; url?: string }): Promise<JsonObject>;
   updateSettings(patch: Partial<DesktopSettings>): Promise<{ settings: DesktopSettings }>;
   clearLogs(): Promise<{ ok: boolean; cancelled?: boolean }>;
+  listRemoteHosts(): Promise<RemoteHostSummary[]>;
+  importRemoteHost(pairingUri: string): Promise<RemoteHostSummary>;
+  removeRemoteHost(id: string): Promise<{ ok: boolean }>;
 };
