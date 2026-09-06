@@ -42,6 +42,7 @@ import type {
 } from "@prospero/protocol";
 import { MAX_SUBAGENT_SUMMARY_CHARS, MAX_SUBAGENTS_PER_SESSION } from "@prospero/protocol";
 import type { AgentAdapter } from "./adapters/types.js";
+import { queueDisplayText } from "./queue-display.js";
 
 /** 事件日志上限:超出后丢弃最旧的(快照会带 truncated 标记) */
 const MAX_EVENTS = 4000;
@@ -547,7 +548,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
       messageQueue: this.messageQueue.map(
         (item): QueuedChatMessage => ({
           id: item.id,
-          text: item.displayText,
+          text: queueDisplayText(item.displayText),
           kind: item.kind,
           createdAt: item.createdAt,
           attachmentCount: item.attachmentCount,

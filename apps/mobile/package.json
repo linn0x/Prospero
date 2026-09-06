@@ -1,13 +1,12 @@
 {
   "name": "@prospero/mobile",
   "main": "expo-router/entry",
-  "version": "0.0.19",
+  "version": "0.0.20",
   "license": "MIT",
   "dependencies": {
     "@expo/vector-icons": "^15.0.2",
     "@prospero/protocol": "*",
     "@react-native-async-storage/async-storage": "2.2.0",
-    "@react-navigation/native": "^7.3.14",
     "buffer": "^6.0.3",
     "expo": "~57.0.12",
     "expo-build-properties": "~57.0.10",
