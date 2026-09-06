@@ -24,6 +24,21 @@ export interface HostRuntime {
   sessions: Record<string, SessionInfo>;
 }
 
+const SESSION_UPDATE_FRAME_MS = 16;
+const pendingSessionUpdates = new Map<string, SessionInfo>();
+let sessionUpdateTimer: ReturnType<typeof setTimeout> | undefined;
+
+export function flushSessionUpdates(): void {
+  sessionUpdateTimer = undefined;
+  if (pendingSessionUpdates.size === 0) return;
+  const updates = [...pendingSessionUpdates.entries()];
+  pendingSessionUpdates.clear();
+  const app = useApp.getState();
+  for (const [key, session] of updates) {
+    app.upsertSession(key.slice(0, key.indexOf("\u0000")), session);
+  }
+}
+
 export const emptyRuntime: HostRuntime = {
   status: "idle",
   hostInfo: null,
@@ -43,6 +58,7 @@ interface AppState {
   patchRuntime(hostId: string, patch: Partial<Omit<HostRuntime, "sessions">>): void;
   setSessions(hostId: string, sessions: SessionInfo[]): void;
   upsertSession(hostId: string, session: SessionInfo): void;
+  queueSessionUpdate(hostId: string, session: SessionInfo): void;
 }
 
 export const useApp = create<AppState>()((set, get) => ({
@@ -86,6 +102,12 @@ export const useApp = create<AppState>()((set, get) => ({
         },
       };
     });
+  },
+  queueSessionUpdate: (hostId, session) => {
+    pendingSessionUpdates.set(`${hostId}\u0000${session.id}`, session);
+    if (sessionUpdateTimer === undefined) {
+      sessionUpdateTimer = setTimeout(flushSessionUpdates, SESSION_UPDATE_FRAME_MS);
+    }
   },
 }));
 

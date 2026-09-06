@@ -101,14 +101,14 @@ import {
   rejectedDelivery,
   type DeliveryResult,
 } from "./outbound-queue";
-import { useApp } from "./store";
+import { flushSessionUpdates, useApp } from "./store";
 import { SessionCreateTracker, type SessionCreateTask } from "./session-create";
 export { SessionCreateError } from "./session-create";
 export type { SessionCreateTask } from "./session-create";
 
 export type { DeliveryResult } from "./outbound-queue";
 
-const APP_VERSION = "0.0.19";
+const APP_VERSION = "0.0.20";
 const ATTEMPT_TIMEOUT_MS = 6000;
 const BACKOFF_MIN = 400;
 const BACKOFF_MAX = 8000;
@@ -782,13 +782,16 @@ export class HostConnection {
         if (msg.id === this.pendingPingId) this.pendingPingId = null;
         return;
       case "session.state":
-        useApp.getState().upsertSession(this.host.id, msg.session);
+        useApp.getState().queueSessionUpdate(this.host.id, msg.session);
         this.sessionCreates.state(msg.session);
         return;
       case "session.create.result":
         // Live session.state may already have advanced beyond the creation
         // snapshot (for example starting -> idle). Do not roll it back.
+        flushSessionUpdates();
         if (msg.session && !useApp.getState().runtimes[this.host.id]?.sessions[msg.session.id]) {
+          // Creation is a navigation boundary: publish it immediately so the
+          // caller can open the new route without waiting for the next frame.
           useApp.getState().upsertSession(this.host.id, msg.session);
         }
         this.sessionCreates.result(msg);
