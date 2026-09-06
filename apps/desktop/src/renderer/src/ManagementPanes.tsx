@@ -29,6 +29,11 @@ import {
   selectCreatedAccount,
   supportsAccountApiProtocols,
   supportsAccountApiValidation,
+  supportsAccountApiEngineValidation,
+  accountApiTestAction,
+  accountApiEngineStatus,
+  modelCapabilitySupportRows,
+  modelCapabilityLabel,
   accountApiStatus,
   modelCapabilityDraft,
   parseModelCapabilities,
@@ -66,20 +71,38 @@ function UsageMeters({ usage }: { usage?: UsageAccount | undefined }) {
   })}{usage.spendRemainingPercent !== undefined && <div className="usage-meter"><div><span>{t("消费上限", "Spend limit")} {usage.spendUsed ?? "—"} / {usage.spendLimit ?? "—"}</span><strong>{Math.round(usage.spendRemainingPercent)}% {t("可用", "available")}</strong></div><div className="usage-track"><i style={{ width: `${String(usage.spendRemainingPercent)}%` }} /></div></div>}{usage.windows.length === 0 && <p className="usage-note">{usage.reason ?? t("账号已连接，但未返回套餐限流窗口。", "The account is connected, but no plan rate-limit windows were returned.")}</p>}</div>;
 }
 
-function ApiValidationDetails({ account }: { account: JsonObject }) {
+function ApiValidationDetails({ account, engineValidationSupported }: { account: JsonObject; engineValidationSupported: boolean }) {
   const { t } = useLocale();
   const validation = record(account["apiValidation"]);
   const checks = record(validation["checks"]);
+  const engineValidation = record(account["apiEngineValidation"]);
+  const engineChecks = record(engineValidation["checks"]);
+  const support = modelCapabilitySupportRows(record(account["apiProfile"]), record(account["modelCapabilitySupport"]));
   const label = (value: unknown): string => value === "passed" ? t("通过", "Passed") : value === "failed" ? t("失败", "Failed") : t("未测试", "Not tested");
-  return <div className="usage-note" role="status">
-    <strong>{t(accountApiStatus(account), accountApiStatus(account, true))}</strong>
-    {account["apiProfileError"] ? <p>{text(account["apiProfileError"])}</p> : <>
-      {Object.keys(validation).length > 0 && <>
+  const timestamp = (value: JsonObject): string => typeof value["checkedAt"] === "number" ? new Date(value["checkedAt"]).toLocaleString() : "";
+  return <div className="usage-note grid gap-2" role="status">
+    <div>
+      <strong>{t("API 协议", "API protocol")} · {t(accountApiStatus(account), accountApiStatus(account, true))}</strong>
+      {account["apiProfileError"] ? <p>{text(account["apiProfileError"])}</p> : Object.keys(validation).length > 0 && <>
         <p>{t("运行环境", "Runtime")}: {label(checks["runtime"])} · {t("流式响应", "Streaming")}: {label(checks["streaming"])} · {t("工具调用", "Tool calls")}: {label(checks["tools"])}</p>
-        <p>{text(validation["detail"])} {typeof validation["checkedAt"] === "number" ? new Date(validation["checkedAt"]).toLocaleString() : ""}</p>
+        <p>{text(validation["detail"])} {timestamp(validation)}</p>
       </>}
-      <p>{t("测试会向配置的服务发送少量请求，可能消耗额度；检查 API 协议，不代表完整 Agent 执行已验证。", "Testing sends small requests to the configured service and may use credits. API protocol checks do not verify full agent execution.")}</p>
-    </>}
+    </div>
+    {(engineValidationSupported || Object.keys(engineValidation).length > 0) && <div>
+      <strong className={engineValidation["status"] === "failed" ? "text-destructive" : undefined}>{t(accountApiEngineStatus(account), accountApiEngineStatus(account, true))}</strong>
+      {Object.keys(engineValidation).length > 0 && <>
+        <p>{t("运行环境", "Runtime")}: {label(engineChecks["runtime"])} · {t("配置加载", "Configuration")}: {label(engineChecks["configuration"])} · {t("流式响应", "Streaming")}: {label(engineChecks["streaming"])} · {t("工具执行", "Tool execution")}: {label(engineChecks["tools"])}</p>
+        <p>{text(engineValidation["engine"])} {text(engineValidation["cliVersion"])} · {timestamp(engineValidation)}</p>
+        <p>{text(engineValidation["detail"])}</p>
+      </>}
+    </div>}
+    {support.length > 0 && <div>
+      <strong>{t("模型能力生效情况", "Model capability support")}</strong>
+      {support.map(({ key, status }) => <p key={key}>{t(modelCapabilityLabel(key), modelCapabilityLabel(key, true))}: {status === "enforced" ? t("已接入本地配置", "Applied to local configuration") : status === "unsupported" ? t("已保存，当前引擎未应用", "Saved, but not applied by this engine") : t("未报告生效情况", "Enforcement not reported")}</p>)}
+    </div>}
+    {!account["apiProfileError"] && <p>{engineValidationSupported
+      ? t("两项验证均会发送少量真实请求，可能消耗额度。API 检查验证协议；Agent 验证在隔离环境中检查实际引擎的配置、响应和工具执行。", "Both checks send small real requests and may use credits. API checks verify the protocol; Agent checks validate the actual engine's configuration, responses, and tool execution in an isolated environment.")
+      : t("测试会向配置的服务发送少量请求，可能消耗额度；检查 API 协议，不代表完整 Agent 执行已验证。", "Testing sends small requests to the configured service and may use credits. API protocol checks do not verify full agent execution.")}</p>}
   </div>;
 }
 
@@ -166,6 +189,7 @@ export function AccountsPane({ snapshot, onOpenSession }: { snapshot: DesktopSna
   const { t, status } = useLocale();
   const apiProtocolsSupported = supportsAccountApiProtocols(snapshot.daemon.capabilities);
   const apiValidationSupported = supportsAccountApiValidation(snapshot.daemon.capabilities);
+  const engineValidationSupported = supportsAccountApiEngineValidation(snapshot.daemon.capabilities);
   const [modelCapabilities, setModelCapabilities] = useState(() => modelCapabilityDraft());
   const [agent, setAgent] = useState<"codex" | "claude">("codex");
   const [protocol, setProtocol] = useState<AccountApiProtocol>("openai_responses");
@@ -246,15 +270,15 @@ export function AccountsPane({ snapshot, onOpenSession }: { snapshot: DesktopSna
     }).catch(() => undefined);
   };
 
-  const runAction = async (account: JsonObject, type: "agent.account.default" | "agent.account.login" | "agent.account.logout" | "agent.account.delete" | "agent.account.api.test"): Promise<void> => {
+  const runAction = async (account: JsonObject, type: "agent.account.default" | "agent.account.login" | "agent.account.logout" | "agent.account.delete" | "agent.account.api.test", scope: "protocol" | "engine" = "protocol"): Promise<void> => {
     const accountId = text(account["id"]);
-    const key = `${accountId}:${type}`;
+    const key = `${accountId}:${type}${type === "agent.account.api.test" ? `:${scope}` : ""}`;
     if (!begin(key)) return;
     try {
-      const result = await window.prospero.accountAction({ type, requestId: crypto.randomUUID(), accountId, ...(type === "agent.account.login" ? { cols: 120, rows: 40 } : {}) });
+      const result = await window.prospero.accountAction({ ...(type === "agent.account.api.test" ? accountApiTestAction(accountId, scope) : { type, accountId }), requestId: crypto.randomUUID(), ...(type === "agent.account.login" ? { cols: 120, rows: 40 } : {}) });
       if (result["cancelled"] === true) return;
-      if (result["ok"] === false && (type !== "agent.account.api.test" || !Object.keys(record(result["validation"])).length)) throw new Error(text(result["error"], t("账号操作失败", "Account action failed")));
-      if (type === "agent.account.api.test") setNotice(text(record(result["validation"])["detail"], text(result["error"], t("API 检查已完成", "API checks completed"))));
+      if (result["ok"] === false && (type !== "agent.account.api.test" || !Object.keys(record(result[scope === "engine" ? "engineValidation" : "validation"])).length)) throw new Error(text(result["error"], t("账号操作失败", "Account action failed")));
+      if (type === "agent.account.api.test") setNotice(text(record(result[scope === "engine" ? "engineValidation" : "validation"])["detail"], text(result["error"], scope === "engine" ? t("Agent 执行验证已完成", "Agent execution check completed") : t("API 检查已完成", "API checks completed"))));
       const sessionId = text(result["sessionId"]);
       if (sessionId) openAccountSession(sessionId, account);
       if (type === "agent.account.default") setNotice(t("已设为默认账号", "Default account updated"));
@@ -326,7 +350,7 @@ export function AccountsPane({ snapshot, onOpenSession }: { snapshot: DesktopSna
       const accountUsage = usage.find((item) => item.accountId === id) ?? usage.find((item) => !item.accountId && item.agent === accountAgent);
       const accountProfile = record(account["apiProfile"]); const accountProtocol = account["apiProfile"] ? accountApiProtocolFromProfile(accountProfile, accountAgent) : undefined; const displayAgent = accountEngine(account);
       const hasApiProfile = Boolean(account["apiProfile"] || account["apiProfileError"]);
-      return <article className={`account-card account-card-rich provider-${displayAgent}`} key={id}><div className="account-card-head"><div className="provider-logo"><AgentLogo agent={displayAgent} size={24} /></div><div><strong>{text(account["name"], accountAgent)}</strong><p>{accountProtocol ? `${accountApiProtocolLabel(accountProtocol)} · ${displayAgent} engine` : accountAgent}{!hasApiProfile && <> · {status(text(account["status"]))}</>}{number(account["activeSessions"]) > 0 ? ` · ${String(number(account["activeSessions"]))} ${t("个会话", "sessions")}` : ""}</p></div>{account["isDefault"] === true && <span className="pill"><Check size={12} />{t("默认", "Default")}</span>}</div>{hasApiProfile && <ApiValidationDetails account={account} />}{!hasApiProfile ? <UsageMeters usage={accountUsage} /> : accountUsage ? <UsageMeters usage={accountUsage} /> : <p className="usage-note">{t("API 额度由服务商管理", "API usage is managed by the provider")}</p>}<div className="button-row compact">{hasApiProfile && apiValidationSupported && <button aria-busy={busy === `${id}:agent.account.api.test`} disabled={actionsDisabled || Boolean(account["apiProfileError"]) || account["status"] === "signed_out"} onClick={() => void runAction(account, "agent.account.api.test")}>{t("测试 API 连接", "Test API connection")}</button>}{account["isDefault"] !== true && <button aria-busy={busy === `${id}:agent.account.default`} disabled={actionsDisabled} onClick={() => void runAction(account, "agent.account.default")}>{t("设为默认", "Set default")}</button>}{managed && <button disabled={actionsDisabled} onClick={() => { setActionError(undefined); setNotice(undefined); setEditingAccount(account); }}><Pencil size={12} />{t("编辑", "Edit")}</button>}{managed && !hasApiProfile && <button aria-busy={busy === `${id}:${signedIn ? "agent.account.logout" : "agent.account.login"}`} disabled={actionsDisabled} onClick={() => void runAction(account, signedIn ? "agent.account.logout" : "agent.account.login")}>{signedIn ? t("退出登录", "Sign out") : t("登录", "Sign in")}</button>}{managed && <button className="danger" aria-busy={busy === `${id}:agent.account.delete`} disabled={actionsDisabled || number(account["activeSessions"]) > 0} onClick={() => void runAction(account, "agent.account.delete")}><Trash2 size={12} />{t("删除", "Delete")}</button>}</div></article>;
+      return <article className={`account-card account-card-rich provider-${displayAgent}`} key={id}><div className="account-card-head"><div className="provider-logo"><AgentLogo agent={displayAgent} size={24} /></div><div><strong>{text(account["name"], accountAgent)}</strong><p>{accountProtocol ? `${accountApiProtocolLabel(accountProtocol)} · ${displayAgent} engine` : accountAgent}{!hasApiProfile && <> · {status(text(account["status"]))}</>}{number(account["activeSessions"]) > 0 ? ` · ${String(number(account["activeSessions"]))} ${t("个会话", "sessions")}` : ""}</p></div>{account["isDefault"] === true && <span className="pill"><Check size={12} />{t("默认", "Default")}</span>}</div>{hasApiProfile && <ApiValidationDetails account={account} engineValidationSupported={engineValidationSupported} />}{!hasApiProfile ? <UsageMeters usage={accountUsage} /> : accountUsage ? <UsageMeters usage={accountUsage} /> : <p className="usage-note">{t("API 额度由服务商管理", "API usage is managed by the provider")}</p>}<div className="button-row compact">{hasApiProfile && apiValidationSupported && <button aria-busy={busy === `${id}:agent.account.api.test:protocol`} disabled={actionsDisabled || Boolean(account["apiProfileError"]) || account["status"] === "signed_out"} onClick={() => void runAction(account, "agent.account.api.test")}>{t("测试 API 连接", "Test API connection")}</button>}{hasApiProfile && engineValidationSupported && <button aria-busy={busy === `${id}:agent.account.api.test:engine`} disabled={actionsDisabled || Boolean(account["apiProfileError"]) || account["status"] === "signed_out"} onClick={() => void runAction(account, "agent.account.api.test", "engine")}>{t("验证 Agent 执行", "Validate Agent execution")}</button>}{account["isDefault"] !== true && <button aria-busy={busy === `${id}:agent.account.default`} disabled={actionsDisabled} onClick={() => void runAction(account, "agent.account.default")}>{t("设为默认", "Set default")}</button>}{managed && <button disabled={actionsDisabled} onClick={() => { setActionError(undefined); setNotice(undefined); setEditingAccount(account); }}><Pencil size={12} />{t("编辑", "Edit")}</button>}{managed && !hasApiProfile && <button aria-busy={busy === `${id}:${signedIn ? "agent.account.logout" : "agent.account.login"}`} disabled={actionsDisabled} onClick={() => void runAction(account, signedIn ? "agent.account.logout" : "agent.account.login")}>{signedIn ? t("退出登录", "Sign out") : t("登录", "Sign in")}</button>}{managed && <button className="danger" aria-busy={busy === `${id}:agent.account.delete`} disabled={actionsDisabled || number(account["activeSessions"]) > 0} onClick={() => void runAction(account, "agent.account.delete")}><Trash2 size={12} />{t("删除", "Delete")}</button>}</div></article>;
     })}{snapshot.accounts.length === 0 && <div className="small-empty">{t("还没有账号。可在右侧创建独立 CLI 登录或 API Profile。", "No accounts yet. Create an isolated CLI login or API profile on the right.")}</div>}</div></section>
       <section className="form-card account-form"><div className="section-title"><Plus size={16} />{t("添加账号", "Add account")}</div><label>{t("CLI Agent", "CLI agent")}<select disabled={actionsDisabled} value={agent} onChange={(event) => { const next = event.target.value as "codex" | "claude"; setAgent(next); if (!apiProtocolsSupported) { const nextProtocol: AccountApiProtocol = next === "claude" ? "anthropic" : "openai_responses"; const defaults = accountApiProtocolDefaults(nextProtocol); setProtocol(nextProtocol); setBaseUrl(defaults.baseUrl); setModel(defaults.model); } }}><option value="codex">Codex</option><option value="claude">Claude</option></select></label><label>{t("显示名称", "Display name")}<input maxLength={80} disabled={actionsDisabled} value={name} onChange={(event) => setName(event.target.value)} placeholder={t("工作账号", "Work account")} /></label><button aria-busy={busy === "managed-create"} onClick={() => void createManaged()} disabled={!name.trim() || actionsDisabled}>{t("创建独立 CLI 账号并登录", "Create isolated CLI account and sign in")}</button><div className="section-label">{t("或添加 API PROFILE", "OR ADD AN API PROFILE")}</div>{apiProtocolsSupported && <label>{t("API 协议", "API protocol")}<select disabled={actionsDisabled} value={protocol} onChange={(event) => { const next = event.target.value as AccountApiProtocol; const defaults = accountApiProtocolDefaults(next); setProtocol(next); setBaseUrl(defaults.baseUrl); setModel(defaults.model); }}>{accountApiProtocols.map((item) => <option key={item} value={item}>{accountApiProtocolLabel(item)}</option>)}</select></label>}<p className="security-note">Agent · {accountApiEngineLabel(effectiveProtocol)} · {effectiveProtocol === "openai_responses" ? t("Responses API，适合 OpenAI 新版模型与兼容服务。", "Responses API for newer OpenAI models and compatible services.") : effectiveProtocol === "openai_chat_completions" ? t("Chat Completions API，使用 OpenCode 引擎。", "Chat Completions API powered by the OpenCode engine.") : t("Anthropic Messages API，适合 Claude 与兼容服务。", "Anthropic Messages API for Claude and compatible services.")}</p><label>{t("API 地址", "API URL")}<input type="url" inputMode="url" maxLength={2_000} spellCheck={false} disabled={actionsDisabled} value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} /></label><label>{t("模型", "Model")}<input maxLength={300} spellCheck={false} disabled={actionsDisabled} value={model} onChange={(event) => setModel(event.target.value)} /></label><label>{effectiveProtocol === "anthropic" ? "Anthropic API Key" : "OpenAI API Key"}<input type="password" maxLength={8_192} disabled={actionsDisabled} value={credential} onChange={(event) => setCredential(event.target.value)} autoComplete="off" /></label>{apiValidationSupported && <ModelCapabilitiesFields value={modelCapabilities} onChange={setModelCapabilities} protocol={effectiveProtocol} disabled={actionsDisabled} />}<p className="security-note"><KeyRound size={14} />{t("凭据只发送给本机 daemon。", "Credentials are only sent to the local daemon.")}</p><button className="primary" aria-busy={busy === "api-create"} onClick={() => void createApi()} disabled={!name.trim() || !credential || !baseUrl || !model || actionsDisabled}>{t("保存 API Profile", "Save API profile")}</button></section>
     </div>

@@ -2,12 +2,19 @@ import { execFile as execFileCallback, execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
+  accessSync,
+  closeSync,
+  constants,
   copyFileSync,
   existsSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -20,6 +27,8 @@ import type {
   AgentApiProtocol,
   AgentApiProvider,
   AgentApiValidation,
+  AgentApiEngineValidation,
+  AgentModelCapabilitySupport,
   AgentExecutionEngine,
   AgentAccountCapabilities,
   AgentModelCapabilities,
@@ -28,8 +37,9 @@ import type {
   CodeAgentKind,
   SessionInfo,
 } from "@prospero/protocol";
-import { AgentApiValidationSchema, AgentModelCapabilitiesSchema, getAgentAccountCapabilities, getAgentAccountEngine } from "@prospero/protocol";
+import { AgentApiEngineValidationSchema, AgentApiValidationSchema, AgentModelCapabilitiesSchema, getAgentAccountCapabilities, getAgentAccountEngine } from "@prospero/protocol";
 import { programCommandFor } from "./agents.js";
+import { claudeModelCapabilityEnvironment, codexModelCapabilityArgs, getModelCapabilitySupport } from "./api-profile-capabilities.js";
 
 const execFile = promisify(execFileCallback);
 const LEGACY_MACOS_KEYCHAIN_SERVICE = "com.prospero.code-agent.claude";
@@ -51,6 +61,8 @@ interface StoredAccount {
   invalidApiProfile?: { raw: unknown };
   apiValidation?: AgentApiValidation;
   apiValidationRevision?: string;
+  apiEngineValidation?: AgentApiEngineValidation;
+  apiEngineValidationRevision?: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -79,6 +91,7 @@ export interface AccountBinding {
   apiProfile?: AgentApiProfile;
   engine?: AgentExecutionEngine;
   capabilities?: AgentAccountCapabilities;
+  modelCapabilitySupport?: AgentModelCapabilitySupport;
   adapterAgent?: "opencode";
   /** Codex app-server 的受控配置覆盖；避免修改用户的全局 config.toml。 */
   codexAppServerArgs?: string[];
@@ -112,9 +125,53 @@ export interface ApiProfileInput {
   modelCapabilities?: AgentModelCapabilities | null;
 }
 
+export interface AgentAccountManagerOptions {
+  /** Test seam for storage faults; a production writer must durably replace this file. */
+  metadataWriter?: (file: string, contents: string) => void;
+  now?: () => number;
+  runtimeTtlMs?: number;
+  runtimeFailureTtlMs?: number;
+  /** Rechecked after a queued mutation starts, so a stale request snapshot cannot miss a new session lease. */
+  accountInUse?: (accountId: string) => boolean;
+}
+
+interface AccountTransaction {
+  version: 1;
+  metadata: unknown;
+  credential: { accountId: string; agent: CodeAgentKind; value: AgentAccountCredential | null };
+}
+
+function validAccountIdentities(accounts: StoredAccount[]): boolean {
+  return new Set(accounts.map((account) => account.id)).size === accounts.length &&
+    accounts.every((account) => /^[A-Za-z0-9-]{1,100}$/.test(account.id) && !Object.values(NATIVE_IDS).includes(account.id));
+}
+
+function validAccountDefaults(store: AccountStore): boolean {
+  return (["claude", "codex"] as const).every((agent) => {
+    const id = store.defaults[agent];
+    return id === undefined || id === NATIVE_IDS[agent] || store.accounts.some((account) => account.id === id && account.agent === agent);
+  });
+}
+
+function serializeStore(store: AccountStore): unknown {
+  return { ...store, accounts: store.accounts.map(({ invalidApiProfile, ...account }) => ({
+    ...account, ...(invalidApiProfile ? { apiProfile: invalidApiProfile.raw } : {}),
+  })) };
+}
+
+function canonical(value: unknown): string {
+  const ordered = (entry: unknown): unknown => Array.isArray(entry) ? entry.map(ordered)
+    : entry && typeof entry === "object" ? Object.fromEntries(Object.entries(entry).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => [key, ordered(item)]))
+      : entry;
+  return JSON.stringify(ordered(value));
+}
+
 /** Injectable so tests can exercise account behavior without writing credentials to disk. */
 export interface AgentAccountCredentialStore {
+  /** Implementations without readStrict must return null only for confirmed absence and throw on I/O errors. */
   read(accountId: string, root: string): AgentAccountCredential | null;
+  /** A transaction must distinguish an absent key from an unreadable/corrupt key. */
+  readStrict?(accountId: string, root: string): AgentAccountCredential | null;
   write(accountId: string, root: string, credential: AgentAccountCredential): Promise<void>;
   delete(accountId: string, root: string): Promise<void>;
 }
@@ -155,13 +212,15 @@ function parseStore(value: unknown): AccountStore {
           typeof account["name"] !== "string" ||
           account["name"].trim().length === 0 ||
           typeof account["createdAt"] !== "number" ||
-          typeof account["updatedAt"] !== "number"
+          typeof account["updatedAt"] !== "number" ||
+          !Number.isFinite(account["createdAt"]) || !Number.isFinite(account["updatedAt"])
         ) {
           return [];
         }
         const hasApiProfile = Object.hasOwn(account, "apiProfile");
         const apiProfile = parseStoredApiProfile(account["agent"], account["apiProfile"]);
         const validation = AgentApiValidationSchema.safeParse(account["apiValidation"]);
+        const engineValidation = AgentApiEngineValidationSchema.safeParse(account["apiEngineValidation"]);
         return [{
           id: account["id"],
           agent: account["agent"],
@@ -170,6 +229,8 @@ function parseStore(value: unknown): AccountStore {
           ...(hasApiProfile && !apiProfile ? { invalidApiProfile: { raw: account["apiProfile"] } } : {}),
           ...(apiProfile && validation.success && typeof account["apiValidationRevision"] === "string"
             ? { apiValidation: validation.data, apiValidationRevision: account["apiValidationRevision"] } : {}),
+          ...(apiProfile && engineValidation.success && typeof account["apiEngineValidationRevision"] === "string"
+            ? { apiEngineValidation: engineValidation.data, apiEngineValidationRevision: account["apiEngineValidationRevision"] } : {}),
           createdAt: Math.max(0, Math.round(account["createdAt"])),
           updatedAt: Math.max(0, Math.round(account["updatedAt"])),
         }];
@@ -322,6 +383,7 @@ function codexProviderArgs(profile: StoredApiProfile): string[] {
     "-c", `model_providers.prospero.env_key=${tomlString("OPENAI_API_KEY")}`,
     "-c", `model_providers.prospero.wire_api=${tomlString("responses")}`,
     "-c", "model_providers.prospero.requires_openai_auth=false",
+    ...codexModelCapabilityArgs(profile),
   ];
 }
 
@@ -410,11 +472,39 @@ function writePrivateFile(target: string, contents: string): void {
   const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
   try {
     writeFileSync(temporary, contents, { mode: 0o600, flag: "wx" });
+    const file = openSync(temporary, "r");
+    try { fsyncSync(file); } finally { closeSync(file); }
     renameSync(temporary, target);
     chmodSync(target, 0o600);
+    syncDirectory(path.dirname(target));
   } finally {
     rmSync(temporary, { force: true });
   }
+}
+
+function syncDirectory(directory: string): void {
+  // Node does not support opening directories for fsync on Windows.
+  if (process.platform === "win32") return;
+  const fd = openSync(directory, "r");
+  try { fsyncSync(fd); } finally { closeSync(fd); }
+}
+
+function executableIdentity(file: string, environment: Record<string, string>): string {
+  const searchPath = environment["PATH"] ?? process.env["PATH"] ?? "";
+  const extensions = process.platform === "win32"
+    ? ["", ...(environment["PATHEXT"] ?? process.env["PATHEXT"] ?? ".EXE;.CMD;.BAT;.PS1").split(";")]
+    : [""];
+  const bases = path.isAbsolute(file) ? [file] : searchPath.split(path.delimiter).filter(Boolean).map((directory) => path.join(directory, file));
+  for (const base of bases) for (const extension of extensions) {
+    try {
+      const candidate = `${base}${extension}`;
+      accessSync(candidate, process.platform === "win32" ? constants.F_OK : constants.X_OK);
+      const resolved = realpathSync(candidate);
+      const stat = statSync(resolved);
+      if (stat.isFile()) return `${resolved}:${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+    } catch {}
+  }
+  return `missing:${file}:${searchPath}`;
 }
 
 /** Read-only bridge for credentials saved by older macOS builds. Never writes or deletes Keychain items. */
@@ -470,9 +560,18 @@ export class LocalFileCredentialStore implements AgentAccountCredentialStore {
   ) {}
 
   read(accountId: string, root: string): AgentAccountCredential | null {
+    return this.readLocal(accountId, root, false);
+  }
+
+  readStrict(accountId: string, root: string): AgentAccountCredential | null {
+    return this.readLocal(accountId, root, true);
+  }
+
+  private readLocal(accountId: string, root: string, strict: boolean): AgentAccountCredential | null {
     const target = credentialFile(root);
     try {
       const credential = parseCredential(readFileSync(target, "utf8"));
+      if (strict && !credential) throw new AgentAccountError("账号凭据文件损坏，尚未修改配置", "account_invalid");
       try {
         chmodSync(target, 0o600);
         this.markLocal(root);
@@ -481,7 +580,10 @@ export class LocalFileCredentialStore implements AgentAccountCredentialStore {
       }
       return credential;
     } catch (error) {
-      if (!isMissingFile(error)) return null;
+      if (!isMissingFile(error)) {
+        if (strict) throw new AgentAccountError("账号凭据文件不可读或损坏，尚未修改配置", "account_invalid");
+        return null;
+      }
     }
 
     if (existsSync(localCredentialMarker(root)) || this.legacyReader === null) {
@@ -494,6 +596,7 @@ export class LocalFileCredentialStore implements AgentAccountCredentialStore {
     } catch {
       // A locked/slow Keychain is not a definitive miss. Do not create the marker,
       // so the user can unlock it or simply save a new local credential and retry.
+      if (strict) throw new AgentAccountError("旧账号凭据暂时不可读取，尚未修改配置", "account_invalid");
       return null;
     }
     try {
@@ -523,8 +626,12 @@ export class LocalFileCredentialStore implements AgentAccountCredentialStore {
   }
 
   private writeLocal(root: string, credential: AgentAccountCredential): void {
-    this.markLocal(root);
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    chmodSync(root, 0o700);
+    // A migration marker must never become durable before its recovered secret:
+    // after a crash, an absent credential still needs to retry the legacy reader.
     writePrivateFile(credentialFile(root), JSON.stringify(credential));
+    this.markLocal(root);
   }
 
   private markLocal(root: string): void {
@@ -597,18 +704,61 @@ export class AgentAccountManager {
   private readonly storeFile: string;
   private readonly rootsDir: string;
   private readonly credentialCache = new Map<string, AgentAccountCredential | null>();
+  private readonly journalFile: string;
+  private recoveryPending = false;
+  private recoveryPromise: Promise<void> = Promise.resolve();
+  private failedClosed = false;
+  private mutationQueue: Promise<void> = Promise.resolve();
+  private queuedMutations = 0;
+  private readonly runtimeVersions = new Map<string, { expiresAt: number; result: Promise<boolean> }>();
+  private readonly pendingCredentials = new Map<string, AgentAccountCredential | null>();
   private store: AccountStore;
 
   constructor(
     private readonly home: string,
     private readonly runner: AccountCommandRunner = defaultRunner,
     private readonly credentialStore: AgentAccountCredentialStore = new LocalFileCredentialStore(),
+    private readonly options: AgentAccountManagerOptions = {},
   ) {
     this.storeFile = path.join(home, "agent-accounts.json");
+    this.journalFile = path.join(home, ".agent-accounts-transaction.json");
     this.rootsDir = path.join(home, "agent-accounts");
     mkdirSync(this.rootsDir, { recursive: true, mode: 0o700 });
     chmodSync(this.rootsDir, 0o700);
     this.store = this.load();
+    if (existsSync(this.journalFile)) {
+      this.recoveryPending = true;
+      this.recoveryPromise = this.recoverTransaction().catch(() => { this.failedClosed = true; }).finally(() => { this.recoveryPending = false; });
+    }
+  }
+
+  /** Daemon startup must await this before opening account/session controls. */
+  async ready(): Promise<void> {
+    await this.recoveryPromise;
+    this.assertHealthy();
+  }
+
+  private assertHealthy(): void {
+    if (this.recoveryPending) throw new AgentAccountError("账号存储事务正在恢复，请稍后重试", "account_in_use");
+    if (this.failedClosed) throw new AgentAccountError("账号存储事务恢复失败，已停止所有账号操作；请修复存储后重启", "account_invalid");
+  }
+
+  private assertSynchronousWrite(): void {
+    this.assertHealthy();
+    if (this.queuedMutations > 0) throw new AgentAccountError("账号配置正在保存，请稍后重试", "account_in_use");
+  }
+
+  private serializeMutation<T>(operation: () => Promise<T>): Promise<T> {
+    this.queuedMutations += 1;
+    const result = this.mutationQueue.then(async () => {
+      await this.ready();
+      return operation();
+    });
+    this.mutationQueue = result.then(() => {}, () => {});
+    return result.catch((error: unknown) => {
+      if (error instanceof AgentAccountError) throw error;
+      throw new AgentAccountError("账号存储操作失败，请检查存储后重试", "account_invalid");
+    }).finally(() => { this.queuedMutations -= 1; });
   }
 
   nativeId(agent: CodeAgentKind): string {
@@ -616,6 +766,7 @@ export class AgentAccountManager {
   }
 
   defaultId(agent: CodeAgentKind): string {
+    this.assertHealthy();
     const selected = this.store.defaults[agent];
     if (selected === NATIVE_IDS[agent]) return selected;
     if (selected && this.store.accounts.some((account) => account.id === selected && account.agent === agent)) {
@@ -626,6 +777,7 @@ export class AgentAccountManager {
 
   /** Metadata-only lookup for frequent session snapshots; never reads credentials or writes runtime config. */
   capabilitiesFor(accountId: string, expectedAgent?: CodeAgentKind): AgentAccountCapabilities {
+    this.assertHealthy();
     const nativeAgent = (["claude", "codex"] as const).find((agent) => NATIVE_IDS[agent] === accountId);
     const account = nativeAgent ? { agent: nativeAgent } : this.store.accounts.find((entry) => entry.id === accountId);
     if (!account) throw new AgentAccountError("账号不存在或已删除", "account_not_found");
@@ -637,6 +789,7 @@ export class AgentAccountManager {
   }
 
   resolve(accountId: string, expectedAgent?: CodeAgentKind): AccountBinding {
+    this.assertHealthy();
     for (const agent of ["claude", "codex"] as const) {
       if (accountId === NATIVE_IDS[agent]) {
         if (expectedAgent && expectedAgent !== agent) {
@@ -712,6 +865,7 @@ export class AgentAccountManager {
             CLAUDE_CODE_USE_FOUNDRY: "",
             CLAUDE_CODE_USE_GATEWAY: "",
             CLAUDE_CONFIG_DIR: root,
+            ...claudeModelCapabilityEnvironment(apiProfile),
           }
       :
         account.agent === "codex"
@@ -750,16 +904,23 @@ export class AgentAccountManager {
       agent: account.agent,
       name: account.name,
       managed: true,
-      environment,
+      environment: { ...environment, ...(apiProfile ? { PROSPERO_API_PROFILE_VISION: apiProfile.modelCapabilities?.vision === false ? "0" : "1" } : {}) },
       ...(apiProfile ? { apiProfile } : {}),
       engine: getAgentAccountEngine({ agent: account.agent, apiProfile }),
       capabilities: getAgentAccountCapabilities({ agent: account.agent, apiProfile }),
+      ...(apiProfile ? { modelCapabilitySupport: getModelCapabilitySupport(apiProfile) } : {}),
       ...(apiProfile?.protocol === "openai_chat_completions" ? { adapterAgent: "opencode" as const } : {}),
       ...(apiProfile?.protocol === "openai_responses" && account.agent === "codex" && account.apiProfile
         ? { codexAppServerArgs: codexProviderArgs(account.apiProfile) }
         : {}),
       ...(credential ? { credentialKind: credential.kind } : {}),
     };
+  }
+
+  /** Session creation must not race a credential transaction; ordinary snapshots may read its old version. */
+  resolveForSession(accountId: string, expectedAgent?: CodeAgentKind): AccountBinding {
+    this.assertSynchronousWrite();
+    return this.resolve(accountId, expectedAgent);
   }
 
   /**
@@ -788,6 +949,7 @@ export class AgentAccountManager {
   }
 
   create(agent: CodeAgentKind, rawName: string): AccountBinding {
+    this.assertSynchronousWrite();
     const now = Date.now();
     const account: StoredAccount = {
       id: randomUUID(),
@@ -796,11 +958,11 @@ export class AgentAccountManager {
       createdAt: now,
       updatedAt: now,
     };
-    this.store.accounts.push(account);
-    if (!this.store.defaults[agent]) this.store.defaults[agent] = account.id;
-    const binding = this.resolve(account.id, agent);
-    this.persist();
-    return binding;
+    const next = structuredClone(this.store);
+    next.accounts.push(account);
+    if (!next.defaults[agent]) next.defaults[agent] = account.id;
+    this.commitMetadata(next);
+    return this.resolve(account.id, agent);
   }
 
   async createApi(
@@ -808,6 +970,10 @@ export class AgentAccountManager {
     rawName: string,
     input: ApiProfileInput,
   ): Promise<AccountBinding> {
+    return this.serializeMutation(() => this.createApiUnlocked(agent, rawName, input));
+  }
+
+  private async createApiUnlocked(agent: CodeAgentKind, rawName: string, input: ApiProfileInput): Promise<AccountBinding> {
     const now = Date.now();
     if (input.baseUrl === undefined || input.model === undefined || input.apiKey === undefined) {
       throw new AgentAccountError("API Profile 缺少连接信息", "account_invalid");
@@ -832,14 +998,10 @@ export class AgentAccountManager {
       createdAt: now,
       updatedAt: now,
     };
-    const root = this.rootFor(agent, account.id);
-    mkdirSync(root, { recursive: true, mode: 0o700 });
-    chmodSync(root, 0o700);
-    await this.credentialStore.write(account.id, root, credential);
-    this.credentialCache.set(account.id, credential);
-    this.store.accounts.push(account);
-    if (!this.store.defaults[agent]) this.store.defaults[agent] = account.id;
-    this.persist();
+    const next = structuredClone(this.store);
+    next.accounts.push(account);
+    if (!next.defaults[agent]) next.defaults[agent] = account.id;
+    await this.commitAccountChange(next, account, credential);
     return this.resolve(account.id, agent);
   }
 
@@ -849,7 +1011,11 @@ export class AgentAccountManager {
     sessions: SessionInfo[] = [],
     inUse = false,
   ): Promise<void> {
-    const account = this.requireManaged(accountId);
+    return this.serializeMutation(() => this.configureApiUnlocked(accountId, input, sessions, inUse));
+  }
+
+  private async configureApiUnlocked(accountId: string, input: ApiProfileInput, sessions: SessionInfo[], inUse: boolean): Promise<void> {
+    const account = structuredClone(this.requireManaged(accountId));
     if (!account.apiProfile && !account.invalidApiProfile) {
       throw new AgentAccountError("这个账号不是第三方 API Profile", "account_invalid");
     }
@@ -866,38 +1032,37 @@ export class AgentAccountManager {
     const updatesCredential = apiKey.length > 0;
     const connectionChanged = JSON.stringify(profile) !== JSON.stringify(account.apiProfile);
     if (
-      (inUse || activeCount(sessions, accountId) > 0) &&
+      (inUse || this.options.accountInUse?.(accountId) || activeCount(sessions, accountId) > 0) &&
       (updatesCredential || connectionChanged)
     ) {
       throw new AgentAccountError("这个 Profile 仍有活动会话，只能更新名称", "account_in_use");
-    }
-    const root = this.rootFor(account.agent, account.id);
-    mkdirSync(root, { recursive: true, mode: 0o700 });
-    chmodSync(root, 0o700);
-    if (updatesCredential) {
-      const credential = cleanApiKey(apiKey);
-      await this.credentialStore.write(account.id, root, credential);
-      this.credentialCache.set(account.id, credential);
     }
     account.apiProfile = profile;
     delete account.invalidApiProfile;
     if (connectionChanged || updatesCredential) this.clearApiValidation(account);
     account.name = name;
     account.updatedAt = Date.now();
-    this.persist();
+    const next = structuredClone(this.store);
+    next.accounts = next.accounts.map((entry) => entry.id === account.id ? account : entry);
+    await this.commitAccountChange(next, account, updatesCredential ? cleanApiKey(apiKey) : undefined);
   }
 
   rename(accountId: string, rawName: string): void {
-    const account = this.requireManaged(accountId);
+    this.assertSynchronousWrite();
+    const account = structuredClone(this.requireManaged(accountId));
     account.name = cleanName(rawName);
     account.updatedAt = Date.now();
-    this.persist();
+    const next = structuredClone(this.store);
+    next.accounts = next.accounts.map((entry) => entry.id === account.id ? account : entry);
+    this.commitMetadata(next);
   }
 
   setDefault(accountId: string): void {
+    this.assertSynchronousWrite();
     const binding = this.resolve(accountId);
-    this.store.defaults[binding.agent] = binding.id;
-    this.persist();
+    const next = structuredClone(this.store);
+    next.defaults[binding.agent] = binding.id;
+    this.commitMetadata(next);
   }
 
   async setCredential(
@@ -907,12 +1072,16 @@ export class AgentAccountManager {
     sessions: SessionInfo[] = [],
     inUse = false,
   ): Promise<void> {
-    const account = this.requireManaged(accountId);
+    return this.serializeMutation(() => this.setCredentialUnlocked(accountId, kind, rawSecret, sessions, inUse));
+  }
+
+  private async setCredentialUnlocked(accountId: string, kind: AgentCredentialKind, rawSecret: string, sessions: SessionInfo[], inUse: boolean): Promise<void> {
+    const account = structuredClone(this.requireManaged(accountId));
     if (account.invalidApiProfile) {
       throw new AgentAccountError("API Profile 配置损坏，请先修复连接配置", "account_invalid");
     }
     if (account.apiProfile) {
-      if (inUse || activeCount(sessions, accountId) > 0) {
+      if (inUse || this.options.accountInUse?.(accountId) || activeCount(sessions, accountId) > 0) {
         throw new AgentAccountError("这个 Profile 仍有活动会话，不能更新 API Key", "account_in_use");
       }
       if (kind !== "api_key") {
@@ -921,17 +1090,14 @@ export class AgentAccountManager {
     } else if (account.agent !== "claude") {
       throw new AgentAccountError("Codex 请使用官方设备登录流程", "account_invalid");
     }
-    const root = this.rootFor(account.agent, account.id);
-    mkdirSync(root, { recursive: true, mode: 0o700 });
-    chmodSync(root, 0o700);
     const credential = account.apiProfile
       ? cleanApiKey(rawSecret)
       : cleanCredential(kind, rawSecret);
-    await this.credentialStore.write(account.id, root, credential);
-    this.credentialCache.set(account.id, credential);
     this.clearApiValidation(account);
     account.updatedAt = Date.now();
-    this.persist();
+    const next = structuredClone(this.store);
+    next.accounts = next.accounts.map((entry) => entry.id === account.id ? account : entry);
+    await this.commitAccountChange(next, account, credential);
   }
 
   loginSpec(accountId: string): AccountLoginSpec {
@@ -967,19 +1133,23 @@ export class AgentAccountManager {
   }
 
   async logout(accountId: string, sessions: SessionInfo[] = [], inUse = false): Promise<void> {
+    return this.serializeMutation(() => this.logoutUnlocked(accountId, sessions, inUse));
+  }
+
+  private async logoutUnlocked(accountId: string, sessions: SessionInfo[] = [], inUse = false): Promise<void> {
     const binding = this.resolve(accountId);
-    if (binding.apiProfile && (inUse || activeCount(sessions, accountId) > 0)) {
+    if (binding.apiProfile && (inUse || this.options.accountInUse?.(accountId) || activeCount(sessions, accountId) > 0)) {
       throw new AgentAccountError("这个 Profile 仍有活动会话，不能移除 API Key", "account_in_use");
     }
     if ((binding.agent === "claude" && binding.managed) || binding.apiProfile) {
       const root = this.rootFor(binding.agent, binding.id);
-      await this.credentialStore.delete(binding.id, root);
-      this.credentialCache.set(binding.id, null);
-      if (binding.apiProfile) {
-        this.clearApiValidation(this.requireManaged(binding.id));
-        this.persist();
-        return;
-      }
+      const account = structuredClone(this.requireManaged(binding.id));
+      this.clearApiValidation(account);
+      account.updatedAt = Date.now();
+      const next = structuredClone(this.store);
+      next.accounts = next.accounts.map((entry) => entry.id === account.id ? account : entry);
+      await this.commitAccountChange(next, account, null);
+      if (binding.apiProfile) return;
       // Clean credentials created by older Prospero builds on Linux/Windows. On
       // macOS we deliberately do not call `claude auth logout`: that command would
       // mutate Claude's shared native Keychain identity.
@@ -1006,35 +1176,35 @@ export class AgentAccountManager {
   }
 
   async delete(accountId: string, sessions: SessionInfo[], inUse = false): Promise<void> {
+    return this.serializeMutation(() => this.deleteUnlocked(accountId, sessions, inUse));
+  }
+
+  private async deleteUnlocked(accountId: string, sessions: SessionInfo[], inUse: boolean): Promise<void> {
     const account = this.requireManaged(accountId);
     const count = activeCount(sessions, accountId);
-    if (inUse || count > 0) {
+    if (inUse || this.options.accountInUse?.(accountId) || count > 0) {
       throw new AgentAccountError(`这个账号仍有${count > 0 ? ` ${String(count)} 个会话` : "会话正在启动"}，请先结束会话`, "account_in_use");
     }
-    // logout clears the account-specific credential before its isolated root.
-    if (account.invalidApiProfile) {
-      await this.credentialStore.delete(account.id, this.rootFor(account.agent, account.id));
-      this.credentialCache.delete(account.id);
-    } else {
-      await this.logout(accountId);
+    if (account.agent === "codex" && !account.apiProfile && !account.invalidApiProfile) {
+      await this.logoutUnlocked(accountId);
     }
-    const root = this.rootFor(account.agent, account.id);
-    rmSync(root, { recursive: true, force: true });
-    this.store.accounts = this.store.accounts.filter((candidate) => candidate.id !== accountId);
-    if (this.store.defaults[account.agent] === accountId) {
-      this.store.defaults[account.agent] = NATIVE_IDS[account.agent];
-    }
-    this.persist();
+    const next = structuredClone(this.store);
+    next.accounts = next.accounts.filter((candidate) => candidate.id !== accountId);
+    if (next.defaults[account.agent] === accountId) next.defaults[account.agent] = NATIVE_IDS[account.agent];
+    await this.commitAccountChange(next, account, null);
+    this.credentialCache.delete(account.id);
+    rmSync(this.rootFor(account.agent, account.id), { recursive: true, force: true });
   }
 
   async snapshot(sessions: SessionInfo[]): Promise<AgentAccount[]> {
+    await this.ready();
     const records = [
       ...(["claude", "codex"] as const).map((agent) => ({
         id: NATIVE_IDS[agent], agent, name: "本机默认", createdAt: 0, updatedAt: 0, managed: false,
       })),
       ...this.store.accounts.map((account) => ({ ...account, managed: true })),
     ];
-    return Promise.all(records.map(async (record): Promise<AgentAccount> => {
+    const snapshot = await Promise.all(records.map(async (record): Promise<AgentAccount> => {
       const base = {
         id: record.id, agent: record.agent, name: record.name, managed: record.managed,
         isDefault: this.defaultId(record.agent) === record.id,
@@ -1048,18 +1218,38 @@ export class AgentAccountManager {
           capabilities: getAgentAccountCapabilities({ agent: record.agent, apiProfileError }),
         };
       }
-      const apiValidation = stored?.apiValidation && stored.apiValidationRevision === this.captureApiValidationRevision(record.id)
-        ? stored.apiValidation : undefined;
-      const binding = this.resolve(record.id, record.agent);
-      return {
-        ...base,
-        ...(binding.apiProfile ? { apiProfile: binding.apiProfile } : {}),
-        engine: getAgentAccountEngine(binding),
-        capabilities: getAgentAccountCapabilities(binding),
-        ...(apiValidation ? { apiValidation } : {}),
-        ...await this.status(binding, apiValidation),
-      };
+      try {
+        if (stored && (stored.agent === "claude" || stored.apiProfile)) {
+          this.credentialCache.set(stored.id, this.pendingCredentials.has(stored.id)
+            ? this.pendingCredentials.get(stored.id) ?? null
+            : this.readCredential(stored.id, this.rootFor(stored.agent, stored.id)));
+        }
+        const revision = stored?.apiProfile && (stored.apiValidation || stored.apiEngineValidation)
+          ? this.captureApiValidationRevision(record.id) : undefined;
+        const apiValidation = stored?.apiValidation && stored.apiValidationRevision === revision
+          ? stored.apiValidation : undefined;
+        const apiEngineValidation = stored?.apiEngineValidation && stored.apiEngineValidationRevision === revision
+          ? stored.apiEngineValidation : undefined;
+        const binding = this.resolve(record.id, record.agent);
+        return {
+          ...base,
+          ...(binding.apiProfile ? { apiProfile: binding.apiProfile } : {}),
+          engine: getAgentAccountEngine(binding),
+          capabilities: getAgentAccountCapabilities(binding),
+          ...(apiValidation ? { apiValidation } : {}),
+          ...(apiEngineValidation ? { apiEngineValidation } : {}),
+          ...(binding.modelCapabilitySupport ? { modelCapabilitySupport: binding.modelCapabilitySupport } : {}),
+          ...await this.status(binding, apiValidation, apiEngineValidation),
+        };
+      } catch {
+        return { ...base, ...(stored?.apiProfile ? { apiProfile: publicApiProfile(stored.agent, stored.apiProfile) } : {}),
+          status: "error", detail: "无法读取账号运行配置或凭据，请检查本地账号存储",
+          capabilities: getAgentAccountCapabilities({ agent: record.agent, apiProfileError: "storage unavailable" }),
+        };
+      }
     }));
+    this.assertHealthy();
+    return snapshot;
   }
 
   /** Opaque connection/key revision. Never include this value in a client snapshot. */
@@ -1069,7 +1259,8 @@ export class AgentAccountManager {
       throw new AgentAccountError("此账号没有有效的 API Profile", "account_invalid");
     }
     // Re-read before accepting a result so a replaced/removed credential cannot keep an old green badge.
-    const credential = this.credentialStore.read(account.id, this.rootFor(account.agent, account.id));
+    const credential = this.pendingCredentials.has(account.id) ? this.pendingCredentials.get(account.id) ?? null
+      : this.readCredential(account.id, this.rootFor(account.agent, account.id));
     this.credentialCache.set(account.id, credential);
     return createHash("sha256").update(JSON.stringify({
       agent: account.agent, profile: account.apiProfile,
@@ -1078,30 +1269,52 @@ export class AgentAccountManager {
   }
 
   recordApiValidation(accountId: string, revision: string, validation: AgentApiValidation): boolean {
+    this.assertHealthy();
+    if (this.queuedMutations > 0) return false;
     const parsed = AgentApiValidationSchema.safeParse(validation);
     const account = this.store.accounts.find((candidate) => candidate.id === accountId);
     if (!account?.apiProfile || account.invalidApiProfile || !parsed.success ||
         parsed.data.engine !== getAgentAccountEngine({ agent: account.agent, apiProfile: account.apiProfile }) ||
         revision !== this.captureApiValidationRevision(accountId)) return false;
-    account.apiValidation = parsed.data;
-    account.apiValidationRevision = revision;
-    this.persist();
+    const next = structuredClone(this.store);
+    const updated = next.accounts.find((entry) => entry.id === accountId)!;
+    updated.apiValidation = parsed.data;
+    updated.apiValidationRevision = revision;
+    this.commitMetadata(next);
+    return true;
+  }
+
+  recordApiEngineValidation(accountId: string, revision: string, validation: AgentApiEngineValidation): boolean {
+    this.assertHealthy();
+    if (this.queuedMutations > 0) return false;
+    const parsed = AgentApiEngineValidationSchema.safeParse(validation);
+    const account = this.store.accounts.find((candidate) => candidate.id === accountId);
+    if (!account?.apiProfile || account.invalidApiProfile || !parsed.success ||
+        parsed.data.engine !== getAgentAccountEngine({ agent: account.agent, apiProfile: account.apiProfile }) ||
+        revision !== this.captureApiValidationRevision(accountId)) return false;
+    const next = structuredClone(this.store);
+    const updated = next.accounts.find((entry) => entry.id === accountId)!;
+    updated.apiEngineValidation = parsed.data;
+    updated.apiEngineValidationRevision = revision;
+    this.commitMetadata(next);
     return true;
   }
 
   private clearApiValidation(account: StoredAccount): void {
     delete account.apiValidation;
     delete account.apiValidationRevision;
+    delete account.apiEngineValidation;
+    delete account.apiEngineValidationRevision;
   }
 
   private async status(
     binding: AccountBinding,
     validation?: AgentApiValidation,
+    engineValidation?: AgentApiEngineValidation,
   ): Promise<{ status: AgentAccountStatus; authMethod?: string; detail?: string }> {
     try {
       if (binding.apiProfile) {
-        const version = await this.runner(binding.adapterAgent ?? binding.agent, ["--version"], binding.environment);
-        if (version.exitCode !== 0) {
+        if (!await this.runtimeAvailable(binding)) {
           return { status: "unavailable", detail: `${binding.adapterAgent ?? binding.agent} CLI 不可用` };
         }
         if (binding.credentialKind !== "api_key") {
@@ -1110,12 +1323,12 @@ export class AgentAccountManager {
         return {
           status: "signed_in",
           authMethod: "API Key",
-          detail: `${validation ? validation.status === "passed" ? "协议测试通过" : "连接测试失败" : "已配置，尚未测试连接"} · ${binding.apiProfile.protocol ?? binding.apiProfile.provider} · ${new URL(binding.apiProfile.baseUrl).host}`,
+          detail: `${engineValidation ? engineValidation.status === "passed" ? "引擎验证通过" : "引擎验证失败" : validation ? validation.status === "passed" ? "协议测试通过" : "连接测试失败" : "已配置，尚未测试连接"} · ${binding.apiProfile.protocol ?? binding.apiProfile.provider} · ${new URL(binding.apiProfile.baseUrl).host}`,
         };
       }
       if (binding.agent === "claude") {
         if (binding.managed && !binding.credentialKind) {
-          await this.runner("claude", ["--version"], binding.environment);
+          if (!await this.runtimeAvailable(binding)) return { status: "unavailable", detail: "claude CLI 不可用" };
           return { status: "signed_out", detail: "需要生成并导入独立凭据" };
         }
         const result = await this.runner("claude", ["auth", "status", "--json"], binding.environment);
@@ -1150,7 +1363,26 @@ export class AgentAccountManager {
     }
   }
 
+  private runtimeAvailable(binding: AccountBinding): Promise<boolean> {
+    const engine = binding.adapterAgent ?? binding.agent;
+    const command = programCommandFor(engine, ["--version"], process.platform, binding.environment);
+    const key = JSON.stringify([engine, executableIdentity(engine, binding.environment), executableIdentity(command.file, binding.environment)]);
+    const now = this.options.now ?? Date.now;
+    const current = this.runtimeVersions.get(key);
+    if (current && current.expiresAt > now()) return current.result;
+    // Cache only CLI availability, never per-account credentials or provider validation.
+    const entry = { expiresAt: Number.POSITIVE_INFINITY, result: Promise.resolve(false) };
+    entry.result = this.runner(engine, ["--version"], binding.environment).then((result) => result.exitCode === 0, () => false).then((available) => {
+      entry.expiresAt = now() + (available ? this.options.runtimeTtlMs ?? 60_000 : this.options.runtimeFailureTtlMs ?? 5_000);
+      return available;
+    });
+    this.runtimeVersions.set(key, entry);
+    if (this.runtimeVersions.size > 32) this.runtimeVersions.delete(this.runtimeVersions.keys().next().value!);
+    return entry.result;
+  }
+
   private requireManaged(accountId: string): StoredAccount {
+    this.assertHealthy();
     if (Object.values(NATIVE_IDS).includes(accountId)) {
       throw new AgentAccountError("本机默认环境不能重命名或删除", "account_not_managed");
     }
@@ -1160,12 +1392,23 @@ export class AgentAccountManager {
   }
 
   private claudeCredential(accountId: string, root: string): AgentAccountCredential | null {
+    if (this.pendingCredentials.has(accountId)) return this.pendingCredentials.get(accountId) ?? null;
     if (this.credentialCache.has(accountId)) {
       return this.credentialCache.get(accountId) ?? null;
     }
-    const credential = this.credentialStore.read(accountId, root);
+    const credential = this.readCredential(accountId, root);
     this.credentialCache.set(accountId, credential);
     return credential;
+  }
+
+  private readCredential(accountId: string, root: string): AgentAccountCredential | null {
+    try {
+      const credential = this.credentialStore.readStrict
+        ? this.credentialStore.readStrict(accountId, root)
+        : this.credentialStore.read(accountId, root);
+      return credential ? { ...credential } : null;
+    }
+    catch { throw new AgentAccountError("读取账号凭据失败", "account_invalid"); }
   }
 
   private rootFor(agent: CodeAgentKind, accountId: string): string {
@@ -1216,20 +1459,152 @@ export class AgentAccountManager {
 
   private load(): AccountStore {
     try {
-      return parseStore(JSON.parse(readFileSync(this.storeFile, "utf8")));
-    } catch {
+      const raw: unknown = JSON.parse(readFileSync(this.storeFile, "utf8"));
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("invalid account metadata");
+      const metadata = raw as Record<string, unknown>;
+      if (!Array.isArray(metadata["accounts"]) || (metadata["version"] !== undefined && metadata["version"] !== 1) ||
+          (metadata["defaults"] !== undefined && (!metadata["defaults"] || typeof metadata["defaults"] !== "object" || Array.isArray(metadata["defaults"])))) {
+        throw new Error("invalid account metadata structure");
+      }
+      const store = parseStore(raw);
+      const rawDefaults = (metadata["defaults"] ?? {}) as Record<string, unknown>;
+      if (store.accounts.length !== metadata["accounts"].length || !validAccountIdentities(store.accounts) || !validAccountDefaults(store) ||
+          (["claude", "codex"] as const).some((agent) => rawDefaults[agent] !== undefined && rawDefaults[agent] !== store.defaults[agent])) {
+        throw new Error("invalid account metadata entries");
+      }
+      return store;
+    } catch (error) {
+      if (!isMissingFile(error)) this.failedClosed = true;
       return { version: 1, accounts: [], defaults: {} };
     }
   }
 
-  private persist(): void {
+  private writeMetadata(store: AccountStore): void {
     mkdirSync(this.home, { recursive: true, mode: 0o700 });
-    const temp = `${this.storeFile}.tmp`;
-    const persisted = { ...this.store, accounts: this.store.accounts.map(({ invalidApiProfile, ...account }) => ({
-      ...account, ...(invalidApiProfile ? { apiProfile: invalidApiProfile.raw } : {}),
-    })) };
-    writeFileSync(temp, JSON.stringify(persisted, null, 2), { mode: 0o600 });
-    renameSync(temp, this.storeFile);
-    chmodSync(this.storeFile, 0o600);
+    (this.options.metadataWriter ?? writePrivateFile)(this.storeFile, JSON.stringify(serializeStore(store), null, 2));
+  }
+
+  private commitMetadata(store: AccountStore): void {
+    const readCurrent = (): string | undefined => {
+      try { return readFileSync(this.storeFile, "utf8"); }
+      catch (error) { if (isMissingFile(error)) return undefined; throw error; }
+    };
+    let previous: string | undefined;
+    try { previous = readCurrent(); }
+    catch { throw new AgentAccountError("无法读取账号元数据，尚未修改配置", "account_invalid"); }
+    try { this.writeMetadata(store); }
+    catch {
+      // Atomic rename may have completed before chmod/directory fsync failed.
+      // A metadata-only write has no key transition to replay; refuse all reads
+      // if its observed file changed or became unreadable rather than publishing stale memory.
+      try { this.failedClosed ||= readCurrent() !== previous; }
+      catch { this.failedClosed = true; }
+      throw new AgentAccountError(this.failedClosed
+        ? "账号元数据保存结果不确定，已停止所有账号操作；请检查存储后重启"
+        : "账号元数据保存失败，原配置已保留", "account_invalid");
+    }
+    this.store = store;
+  }
+
+  private writeJournal(transaction: AccountTransaction): void {
+    const contents = JSON.stringify(transaction);
+    if (Buffer.byteLength(contents) > 4 * 1024 * 1024) throw new AgentAccountError("账号事务超出存储大小上限，尚未修改配置", "account_invalid");
+    writePrivateFile(this.journalFile, contents);
+  }
+
+  private clearJournal(): void {
+    unlinkSync(this.journalFile);
+    syncDirectory(this.home);
+  }
+
+  private async writeTransactionCredential(change: AccountTransaction["credential"]): Promise<void> {
+    const root = this.rootFor(change.agent, change.accountId);
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    chmodSync(root, 0o700);
+    if (change.value) await this.credentialStore.write(change.accountId, root, { ...change.value });
+    else await this.credentialStore.delete(change.accountId, root);
+    syncDirectory(root);
+    syncDirectory(path.dirname(root));
+    syncDirectory(this.rootsDir);
+  }
+
+  private readTransaction(): { transaction: AccountTransaction; store: AccountStore } {
+    const stat = statSync(this.journalFile);
+    if (!stat.isFile() || stat.size > 4 * 1024 * 1024) throw new Error("invalid account transaction file");
+    const raw = JSON.parse(readFileSync(this.journalFile, "utf8")) as AccountTransaction;
+    if (!raw || raw.version !== 1 || !raw.credential || !isCodeAgent(raw.credential.agent) ||
+        typeof raw.credential.accountId !== "string" ||
+        !/^[A-Za-z0-9-]{1,100}$/.test(raw.credential.accountId) || Object.values(NATIVE_IDS).includes(raw.credential.accountId)) {
+      throw new Error("invalid account transaction");
+    }
+    const store = parseStore(raw.metadata);
+    if (!validAccountIdentities(store.accounts) || !validAccountDefaults(store) || canonical(serializeStore(store)) !== canonical(raw.metadata)) throw new Error("invalid account transaction metadata");
+    if (raw.credential.value !== null) {
+      const credential = parseCredential(JSON.stringify(raw.credential.value));
+      if (!credential || canonical(credential) !== canonical(raw.credential.value)) throw new Error("invalid account transaction credential");
+    }
+    const account = store.accounts.find((entry) => entry.id === raw.credential.accountId);
+    if (account && account.agent !== raw.credential.agent) throw new Error("invalid account transaction agent");
+    if (!account && raw.credential.value !== null) throw new Error("invalid orphan transaction credential");
+    if (account?.apiProfile && raw.credential.value && raw.credential.value.kind !== "api_key") throw new Error("invalid profile transaction credential");
+    if (canonical(raw) !== canonical({ version: 1, metadata: raw.metadata, credential: raw.credential })) throw new Error("invalid transaction fields");
+    chmodSync(this.journalFile, 0o600);
+    return { transaction: raw, store };
+  }
+
+  private async recoverTransaction(): Promise<void> {
+    const { transaction, store } = this.readTransaction();
+    await this.writeTransactionCredential(transaction.credential);
+    this.writeMetadata(store);
+    this.clearJournal();
+    this.store = store;
+    this.credentialCache.set(transaction.credential.accountId, transaction.credential.value);
+    this.failedClosed = false;
+  }
+
+  /** Journal is durable before either resource changes; recovery redoes its complete target state. */
+  private async commitAccountChange(next: AccountStore, account: StoredAccount, credential?: AgentAccountCredential | null): Promise<void> {
+    if (credential === undefined) {
+      this.commitMetadata(next);
+      return;
+    }
+    const previous = this.store;
+    const previousCredential = previous.accounts.some((entry) => entry.id === account.id)
+      ? this.readCredential(account.id, this.rootFor(account.agent, account.id)) : null;
+    const change = { accountId: account.id, agent: account.agent, value: credential };
+    const transaction: AccountTransaction = { version: 1, metadata: serializeStore(next), credential: change };
+    this.pendingCredentials.set(account.id, previousCredential);
+    this.credentialCache.set(account.id, previousCredential);
+    let journalWritten = false;
+    let committed = false;
+    try {
+      this.writeJournal(transaction);
+      journalWritten = true;
+      await this.writeTransactionCredential(change);
+      this.writeMetadata(next);
+      committed = true;
+      this.store = next;
+      this.credentialCache.set(account.id, credential);
+      this.clearJournal();
+    } catch {
+      if (committed) {
+        // Metadata commit succeeded: retain the redo journal and fail the entire manager closed.
+        this.failedClosed = true;
+      } else if (journalWritten || existsSync(this.journalFile)) {
+        try {
+          const rollback = { accountId: account.id, agent: account.agent, value: previousCredential };
+          this.writeJournal({ version: 1, metadata: serializeStore(previous), credential: rollback });
+          await this.writeTransactionCredential(rollback);
+          this.writeMetadata(previous);
+          this.clearJournal();
+          this.credentialCache.set(account.id, previousCredential);
+        } catch { this.failedClosed = true; }
+      }
+      throw new AgentAccountError(this.failedClosed
+        ? "账号保存失败且恢复尚未完成，已停止所有账号操作；请修复存储后重启"
+        : "账号保存失败，原配置和凭据已保留", "account_invalid");
+    } finally {
+      this.pendingCredentials.delete(account.id);
+    }
   }
 }

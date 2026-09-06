@@ -1580,6 +1580,13 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   ): Promise<void> {
     const s = this.structuredSessions.get(sid);
     if (!s) throw new SessionError(`no structured session: ${sid}`, "session_not_found");
+    if (attachments?.length && s.accountId && (s.agent === "codex" || s.agent === "claude")) {
+      // Covers already-running detached owners created by an older daemon too.
+      const account = this.resolveAccount(s.agent, s.accountId);
+      if (account?.apiProfile?.modelCapabilities?.vision === false) {
+        throw new SessionError("这个 API Profile 已关闭图片能力，无法发送图片附件", "agent_unavailable");
+      }
+    }
     await s.send(text, attachments, delivery);
   }
 

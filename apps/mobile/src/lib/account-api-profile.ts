@@ -70,6 +70,19 @@ export function accountApiStatus(account: Pick<AgentAccount, "status" | "apiProf
   return "已配置 · 未验证";
 }
 
+export function accountApiEngineStatus(account: Pick<AgentAccount, "apiEngineValidation">): string {
+  if (account.apiEngineValidation?.status === "passed") return "Agent 执行验证通过";
+  if (account.apiEngineValidation?.status === "failed") return "Agent 执行验证失败";
+  return "Agent 执行未验证";
+}
+
+export function modelCapabilitySupportRows(account: Pick<AgentAccount, "apiProfile" | "modelCapabilitySupport">): { key: string; label: string; detail: string }[] {
+  const labels = { contextWindow: "上下文窗口", maxOutputTokens: "最大输出", tools: "工具调用", vision: "图片输入", reasoning: "推理" };
+  return (Object.keys(labels) as (keyof typeof labels)[]).filter((key) => account.apiProfile?.modelCapabilities?.[key] !== undefined).map((key) => ({
+    key, label: labels[key], detail: account.modelCapabilitySupport?.[key] === "enforced" ? "已接入本地配置" : account.modelCapabilitySupport?.[key] === "unsupported" ? "已保存，当前引擎未应用" : "未报告生效情况",
+  }));
+}
+
 export function modelTokenLimit(value: string): number | undefined {
   const raw = value.trim();
   if (!raw) return undefined;

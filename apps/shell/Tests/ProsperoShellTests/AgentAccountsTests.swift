@@ -114,4 +114,32 @@ final class AgentAccountsTests: XCTestCase {
     XCTAssertEqual(RunningStatus.load(root: ["pid": 1])?.capabilities, [])
     XCTAssertEqual(RunningStatus.load(root: ["pid": 1, "capabilities": ["agent.api-validation.v1"]])?.capabilities, ["agent.api-validation.v1"])
   }
+
+  func testEngineValidationIsSeparateAndUsesExplicitScope() throws {
+    var payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(accountJSON.utf8)) as? [String: Any])
+    payload["apiValidation"] = ["status": "passed", "checkedAt": 1000, "engine": "codex", "checks": ["runtime": "passed", "streaming": "passed", "tools": "passed"], "detail": "协议通过"]
+    payload["apiEngineValidation"] = ["status": "failed", "checkedAt": 2000, "engine": "codex", "cliVersion": "1.2.3", "checks": ["runtime": "passed", "configuration": "passed", "streaming": "passed", "tools": "failed"], "detail": "实际引擎工具失败"]
+    let account = try JSONDecoder().decode(CodeAgentAccount.self, from: JSONSerialization.data(withJSONObject: payload))
+    XCTAssertEqual(account.statusLabel, "API 验证通过")
+    XCTAssertEqual(account.engineValidationLabel, "Agent 执行验证失败")
+    XCTAssertEqual(account.apiEngineValidation?.cliVersion, "1.2.3")
+    XCTAssertEqual(account.apiEngineValidation?.summary, "运行环境 通过 · 配置加载 通过 · 流式响应 通过 · 工具执行 失败")
+    XCTAssertNil(AgentAccountOperation.testAPI(accountID: account.id).body["scope"])
+    XCTAssertEqual(AgentAccountOperation.testAgent(accountID: account.id).body["scope"] as? String, "engine")
+    XCTAssertEqual(AgentAccountOperation.testAgent(accountID: account.id).timeoutInterval, 90)
+    XCTAssertEqual(AgentAccountOperation.testAPI(accountID: account.id).timeoutInterval, 45)
+    let legacy = try JSONDecoder().decode(CodeAgentAccount.self, from: Data(accountJSON.utf8))
+    XCTAssertEqual(legacy.engineValidationLabel, "Agent 执行未验证")
+  }
+
+  func testModelSupportDoesNotTreatSavedDeclarationsAsEnforced() throws {
+    var payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(accountJSON.utf8)) as? [String: Any])
+    var profile = try XCTUnwrap(payload["apiProfile"] as? [String: Any])
+    profile["modelCapabilities"] = ["contextWindow": 1000, "tools": true, "vision": false]
+    payload["apiProfile"] = profile
+    payload["modelCapabilitySupport"] = ["contextWindow": "unsupported", "tools": "enforced", "reasoning": "enforced"]
+    let account = try JSONDecoder().decode(CodeAgentAccount.self, from: JSONSerialization.data(withJSONObject: payload))
+    XCTAssertEqual(account.modelCapabilitySupportRows, ["上下文窗口：已保存，当前引擎未应用", "工具调用：已接入本地配置", "图片输入：未报告生效情况"])
+  }
+
 }

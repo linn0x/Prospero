@@ -15,6 +15,7 @@ import {
   CAPABILITY_AGENT_ACCOUNTS,
   CAPABILITY_AGENT_API_PROFILES,
   CAPABILITY_AGENT_API_PROTOCOLS,
+  CAPABILITY_AGENT_API_ENGINE_VALIDATION,
   CAPABILITY_AGENT_DEEPSEEK_HARNESS,
   CAPABILITY_DEEPSEEK_TRAJECTORY,
   CAPABILITY_FS_PUT_ACK,
@@ -243,6 +244,10 @@ export class HostConnection {
 
   get supportsAgentApiValidation(): boolean {
     return this.supportsCapability("agent.api-validation.v1");
+  }
+
+  get supportsAgentApiEngineValidation(): boolean {
+    return this.supportsCapability(CAPABILITY_AGENT_API_ENGINE_VALIDATION);
   }
 
   get supportsDeepseekHarness(): boolean {
@@ -1008,10 +1013,10 @@ export class HostConnection {
       "#accounts",
       `#agent.accounts:${message.requestId}`,
       message,
-      45_000,
+      message.type === "agent.account.api.test" && message.scope === "engine" ? 90_000 : 45_000,
       false,
     );
-    if (!result.ok && !(message.type === "agent.account.api.test" && result.validation)) throw new Error(result.error ?? "账号操作失败");
+    if (!result.ok && !(message.type === "agent.account.api.test" && (message.scope === "engine" ? result.engineValidation : result.validation))) throw new Error(result.error ?? "账号操作失败");
     return result;
   }
 
@@ -1080,9 +1085,11 @@ export class HostConnection {
     });
   }
 
-  testAgentApiProfile(accountId: string): Promise<AgentAccountsResult> {
-    if (!this.supportsAgentApiValidation) throw new Error("请先升级电脑端以测试 API 连接");
-    return this.accountRequest({ type: "agent.account.api.test", requestId: this.agentRequestId(), accountId });
+  testAgentApiProfile(accountId: string, scope: "protocol" | "engine" = "protocol"): Promise<AgentAccountsResult> {
+    if (scope === "engine" ? !this.supportsAgentApiEngineValidation : !this.supportsAgentApiValidation) {
+      throw new Error(scope === "engine" ? "请先升级电脑端以验证 Agent 执行" : "请先升级电脑端以测试 API 连接");
+    }
+    return this.accountRequest({ type: "agent.account.api.test", requestId: this.agentRequestId(), accountId, ...(scope === "engine" ? { scope } : {}) });
   }
 
   renameAgentAccount(accountId: string, name: string): Promise<AgentAccountsResult> {

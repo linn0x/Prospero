@@ -868,6 +868,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
   ): Promise<void> {
     if (this.disposed) throw new Error("会话已经结束，历史只读");
     if (!this.backendAvailable) throw new Error("会话后端未恢复;重启 daemon 后会再次尝试");
+    this.assertImageInputAllowed(attachments?.length ?? 0);
     const busy =
       this.status === "starting" ||
       this.status === "running" ||
@@ -1051,6 +1052,8 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
   private async queuedAttachmentsForAdapter(
     item: QueuedChatPersistent,
   ): Promise<Attachment[] | undefined> {
+    // Recheck restored queues before loading files or falling back to file paths.
+    this.assertImageInputAllowed(Math.max(item.attachmentCount, item.attachments.length));
     if (this.adapter.acceptsImages !== true || item.attachments.length === 0) return undefined;
     const root = path.resolve(this.attachmentRoot);
     const loaded: Attachment[] = [];
@@ -1069,6 +1072,12 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
       }
     }
     return loaded.length > 0 ? loaded : undefined;
+  }
+
+  private assertImageInputAllowed(count: number): void {
+    if (count > 0 && this.environment["PROSPERO_API_PROFILE_VISION"] === "0") {
+      throw new Error("这个 API Profile 已关闭图片能力，无法发送图片附件");
+    }
   }
 
   private async dispatchQueued(item: QueuedChatPersistent): Promise<void> {

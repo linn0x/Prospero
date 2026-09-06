@@ -71,6 +71,30 @@ struct CodeAgentAccount: Codable, Sendable, Equatable, Identifiable {
     }
   }
 
+  struct APIEngineValidation: Codable, Sendable, Equatable {
+    struct Checks: Codable, Sendable, Equatable {
+      let runtime: String
+      let configuration: String
+      let streaming: String
+      let tools: String
+    }
+    let status: String
+    let checkedAt: Double
+    let engine: String
+    let cliVersion: String?
+    let checks: Checks
+    let code: String?
+    let detail: String
+    let latencyMs: Double?
+
+    var summary: String {
+      func label(_ value: String) -> String {
+        value == "passed" ? "通过" : value == "failed" ? "失败" : "未测试"
+      }
+      return "运行环境 \(label(checks.runtime)) · 配置加载 \(label(checks.configuration)) · 流式响应 \(label(checks.streaming)) · 工具执行 \(label(checks.tools))"
+    }
+  }
+
   enum Agent: String, Codable, Sendable, CaseIterable {
     case claude
     case codex
@@ -129,6 +153,8 @@ struct CodeAgentAccount: Codable, Sendable, Equatable, Identifiable {
   let apiProfile: APIProfile?
   let apiProfileError: String?
   let apiValidation: APIValidation?
+  let apiEngineValidation: APIEngineValidation?
+  let modelCapabilitySupport: [String: String]?
   let engine: String?
   let capabilities: Capabilities?
   let authMethod: String?
@@ -150,6 +176,22 @@ struct CodeAgentAccount: Codable, Sendable, Equatable, Identifiable {
     return status.color
   }
 
+  var engineValidationLabel: String {
+    guard let validation = apiEngineValidation else { return "Agent 执行未验证" }
+    return validation.status == "passed" ? "Agent 执行验证通过" : "Agent 执行验证失败"
+  }
+
+  var modelCapabilitySupportRows: [String] {
+    let labels = [("contextWindow", "上下文窗口"), ("maxOutputTokens", "最大输出"), ("tools", "工具调用"), ("vision", "图片输入"), ("reasoning", "推理")]
+    let declared = apiProfile?.modelCapabilities?.body ?? [:]
+    return labels.compactMap { key, label in
+      guard declared[key] != nil else { return nil }
+      let status = modelCapabilitySupport?[key]
+      let detail = status == "enforced" ? "已接入本地配置" : status == "unsupported" ? "已保存，当前引擎未应用" : "未报告生效情况"
+      return "\(label)：\(detail)"
+    }
+  }
+
   var environmentLabel: String {
     if isAPI { return "Prospero API Profile · \(engine ?? apiProfile?.apiProtocol?.engine ?? agent.title)" }
     return managed ? "Prospero 独立环境" : "现有本机环境（兼容旧会话）"
@@ -164,6 +206,8 @@ struct AgentAccountControlResponse: Codable, Sendable, Equatable {
   let accounts: [CodeAgentAccount]
   let sessionId: String?
   let error: String?
+  let validation: CodeAgentAccount.APIValidation?
+  let engineValidation: CodeAgentAccount.APIEngineValidation?
 }
 
 /// Exact C2S account message shapes accepted by `/_prospero/control/accounts`.
@@ -174,6 +218,7 @@ enum AgentAccountOperation: Sendable, Equatable {
   case createAPI(agent: CodeAgentAccount.Agent, name: String, baseURL: String, model: String, apiKey: String, apiProtocol: CodeAgentAccount.APIProtocol? = nil, modelCapabilities: CodeAgentAccount.ModelCapabilities? = nil)
   case configureAPI(accountID: String, baseURL: String, model: String, apiKey: String, apiProtocol: CodeAgentAccount.APIProtocol? = nil, modelCapabilities: CodeAgentAccount.ModelCapabilities? = nil)
   case testAPI(accountID: String)
+  case testAgent(accountID: String)
   case rename(accountID: String, name: String)
   case setDefault(accountID: String)
   case login(accountID: String, cols: Int = 120, rows: Int = 40)
@@ -184,6 +229,14 @@ enum AgentAccountOperation: Sendable, Equatable {
   enum CredentialKind: String, Sendable, Equatable {
     case oauthToken = "oauth_token"
     case apiKey = "api_key"
+  }
+
+  var timeoutInterval: TimeInterval {
+    switch self {
+    case .testAgent: 90
+    case .testAPI: 45
+    default: 60
+    }
   }
 
   var body: [String: Any] {
@@ -210,6 +263,8 @@ enum AgentAccountOperation: Sendable, Equatable {
       return value
     case let .testAPI(accountID):
       return ["type": "agent.account.api.test", "accountId": accountID]
+    case let .testAgent(accountID):
+      return ["type": "agent.account.api.test", "accountId": accountID, "scope": "engine"]
     case let .rename(accountID, name):
       return ["type": "agent.account.rename", "accountId": accountID, "name": name]
     case let .setDefault(accountID):
@@ -419,6 +474,9 @@ extension DaemonController {
     guard let running, !running.controlToken.isEmpty else {
       throw AgentAccountControlFailure(message: "daemon 未运行或版本过旧，无法管理本机账号")
     }
+    if case .testAgent = operation, !running.capabilities.contains("agent.api-engine-validation.v1") {
+      throw AgentAccountControlFailure(message: "请升级电脑端 daemon 以验证 Agent 执行")
+    }
     guard let url = URL(string: "http://127.0.0.1:\(running.port)/_prospero/control/accounts") else {
       throw AgentAccountControlFailure(message: "无法构造账号控制地址")
     }
@@ -426,6 +484,7 @@ extension DaemonController {
     let requestID = UUID().uuidString
     body["requestId"] = requestID
     var request = URLRequest(url: url)
+    request.timeoutInterval = operation.timeoutInterval
     request.httpMethod = "POST"
     request.setValue("Bearer \(running.controlToken)", forHTTPHeaderField: "Authorization")
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -618,7 +677,7 @@ struct AgentAccountsDashboard: View {
   }
 
   private func accountCard(_ account: CodeAgentAccount) -> some View {
-    let busy = model.busyAccountID == account.id
+    let busy = model.busyAccountID != nil
     return VStack(alignment: .leading, spacing: 9) {
       HStack(alignment: .firstTextBaseline) {
         Text(account.name).font(.headline)
@@ -643,11 +702,48 @@ struct AgentAccountsDashboard: View {
       if let detail = account.detail {
         Text(detail).font(.caption).foregroundStyle(.secondary)
       }
+      if account.isAPI { Text("API 协议 · \(account.statusLabel)").font(.caption.weight(.semibold)) }
       if let validation = account.apiValidation {
         Text(validation.summary).font(.caption)
         Text(validation.detail).font(.caption).foregroundStyle(.secondary)
         Text(Date(timeIntervalSince1970: validation.checkedAt / 1000), style: .date)
           .font(.caption).foregroundStyle(.secondary)
+      }
+      if account.isAPI && (daemon.running?.capabilities.contains("agent.api-engine-validation.v1") == true || account.apiEngineValidation != nil) {
+        Text(account.engineValidationLabel).font(.caption.weight(.semibold))
+          .foregroundStyle(account.apiEngineValidation?.status == "failed" ? Color.red : Color.primary)
+      }
+      if let validation = account.apiEngineValidation {
+        Text(validation.summary).font(.caption)
+        Text("\(validation.engine) \(validation.cliVersion ?? "")").font(.caption).foregroundStyle(.secondary)
+        Text(validation.detail).font(.caption).foregroundStyle(.secondary)
+        Text(Date(timeIntervalSince1970: validation.checkedAt / 1000), format: .dateTime)
+          .font(.caption).foregroundStyle(.secondary)
+      }
+      if !account.modelCapabilitySupportRows.isEmpty {
+        Text("模型能力生效情况").font(.caption.weight(.semibold))
+        ForEach(account.modelCapabilitySupportRows, id: \.self) { row in
+          Text(row).font(.caption).foregroundStyle(.secondary)
+        }
+      }
+      if account.isAPI && account.apiProfileError == nil {
+        HStack(spacing: 10) {
+          if daemon.running?.capabilities.contains("agent.api-validation.v1") == true {
+            Button("测试 API 连接") { Task { _ = await model.perform(.testAPI(accountID: account.id), accountID: account.id) } }
+          }
+          if daemon.running?.capabilities.contains("agent.api-engine-validation.v1") == true {
+            Button("验证 Agent 执行") { Task { _ = await model.perform(.testAgent(accountID: account.id), accountID: account.id) } }
+          }
+        }
+        .disabled(busy || account.status == .signedOut)
+        .buttonStyle(.bordered)
+        if daemon.running?.capabilities.contains("agent.api-engine-validation.v1") == true {
+          Text("两项验证均发送少量真实请求，可能消耗额度。API 检查验证协议；Agent 验证在隔离环境中检查实际引擎的配置、响应和工具执行。")
+            .font(.caption).foregroundStyle(.secondary)
+        } else if daemon.running?.capabilities.contains("agent.api-validation.v1") == true {
+          Text("测试发送少量请求，可能消耗额度；API 协议检查不代表完整 Agent 执行已验证。")
+            .font(.caption).foregroundStyle(.secondary)
+        }
       }
       Divider()
       HStack(spacing: 10) {
@@ -657,10 +753,6 @@ struct AgentAccountsDashboard: View {
           if account.apiProfileError == nil {
             Button("替换 API Key") { editor = AgentAccountEditorState(mode: .credential(account, .apiKey)) }
               .disabled(account.activeSessions > 0)
-            if daemon.running?.capabilities.contains("agent.api-validation.v1") == true {
-              Button("测试 API 连接") { Task { _ = await model.perform(.testAPI(accountID: account.id), accountID: account.id) } }
-                .disabled(account.status != .signedIn)
-            }
           }
         } else {
           Button(account.agent == .claude && account.managed ? "生成导入令牌" : account.status == .signedIn ? "重新登录" : "登录") {
@@ -690,7 +782,7 @@ struct AgentAccountsDashboard: View {
             }
           }
         }
-        if busy { ProgressView().controlSize(.small) }
+        if model.busyAccountID == account.id { ProgressView().controlSize(.small) }
       }
       .disabled(busy)
       .buttonStyle(.bordered)

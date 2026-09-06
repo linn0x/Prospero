@@ -25,6 +25,39 @@ export function supportsAccountApiValidation(capabilities?: readonly string[]): 
   return capabilities?.includes("agent.api-validation.v1") === true;
 }
 
+export function supportsAccountApiEngineValidation(capabilities?: readonly string[]): boolean {
+  return capabilities?.includes("agent.api-engine-validation.v1") === true;
+}
+
+export function accountApiTestAction(accountId: string, scope: "protocol" | "engine"): JsonObject {
+  return { type: "agent.account.api.test", accountId, ...(scope === "engine" ? { scope } : {}) };
+}
+
+export function accountApiEngineStatus(account: JsonObject, english = false): string {
+  const validation = account["apiEngineValidation"] as JsonObject | undefined;
+  if (validation?.["status"] === "passed") return english ? "Agent execution passed" : "Agent 执行验证通过";
+  if (validation?.["status"] === "failed") return english ? "Agent execution failed" : "Agent 执行验证失败";
+  return english ? "Agent execution unverified" : "Agent 执行未验证";
+}
+
+const modelCapabilityKeys = ["contextWindow", "maxOutputTokens", "tools", "vision", "reasoning"] as const;
+
+export function modelCapabilitySupportRows(profile: JsonObject, support: JsonObject): { key: string; status: "enforced" | "unsupported" | "unknown" }[] {
+  const declarations = profile["modelCapabilities"];
+  if (!declarations || typeof declarations !== "object" || Array.isArray(declarations)) return [];
+  return modelCapabilityKeys.filter((key) => (declarations as JsonObject)[key] !== undefined).map((key) => ({
+    key, status: support[key] === "enforced" || support[key] === "unsupported" ? support[key] : "unknown",
+  }));
+}
+
+export function modelCapabilityLabel(key: string, english = false): string {
+  const labels: Record<string, [string, string]> = {
+    contextWindow: ["上下文窗口", "Context window"], maxOutputTokens: ["最大输出", "Maximum output"],
+    tools: ["工具调用", "Tool calls"], vision: ["图片输入", "Image input"], reasoning: ["推理", "Reasoning"],
+  };
+  return labels[key]?.[english ? 1 : 0] ?? key;
+}
+
 export function accountApiStatus(account: JsonObject, english = false): string {
   if (account["apiProfileError"]) return english ? "Profile needs repair" : "配置需要修复";
   if (account["status"] === "signed_out") return english ? "API key missing" : "未配置密钥";
