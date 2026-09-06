@@ -40,6 +40,13 @@ function handshake(daemon = generateKeyPairB64(), hello = makeHello()) {
 }
 
 describe("handshake + SecureChannel", () => {
+  it("接受桌面端作为受信客户端平台", () => {
+    const hello = makeHello();
+    hello.clientInfo = { platform: "desktop", appVersion: "0.0.13" };
+    const { accepted } = handshake(generateKeyPairB64(), hello);
+    expect(accepted.hello.clientInfo.platform).toBe("desktop");
+  });
+
   it("完成握手并双向收发", () => {
     const { hello, accepted, client, server } = handshake();
     expect(accepted.hello).toEqual(hello);
