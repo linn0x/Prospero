@@ -9,6 +9,8 @@ import { WebView, type WebViewMessageEvent } from "react-native-webview";
 import type { HostConnection } from "@/lib/connection";
 import { toast } from "@/components/Toast";
 import { deliveryFailureText } from "@/lib/outbound-queue";
+import { subscribeFocusedTerminal } from "@/lib/focused-session-stream";
+import { useFocusedSessionEffect } from "@/lib/use-focused-session-effect";
 import { TERMINAL_HTML } from "./terminal-html";
 
 // source 对象保持稳定,避免会话状态刷新时让原生 WebView 误判为需要重新加载。
@@ -61,11 +63,12 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
 ) {
   const webRef = useRef<WebView>(null);
   const readyRef = useRef(false);
+  const activeRef = useRef(false);
+  const metricsRef = useRef(onPerf !== undefined);
   const attachedRef = useRef(false);
   const lastSeqRef = useRef(0);
   const queueRef = useRef<object[]>([]);
   const sizeRef = useRef<{ cols: number; rows: number } | null>(null);
-  const ackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fontSizeRef = useRef(fontSize);
 
   const batchRef = useRef<object[]>([]);
@@ -79,6 +82,7 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
    * 会在当前 tick 结束就立刻发出,只有真正堆积时才会合并。
    */
   const flush = useCallback(() => {
+    if (flushRef.current !== null) clearTimeout(flushRef.current);
     flushRef.current = null;
     const batch = batchRef.current;
     if (batch.length === 0) return;
@@ -99,7 +103,7 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
   );
 
   const tryAttach = useCallback(() => {
-    if (!readyRef.current || !conn.isConnected || !sizeRef.current) return;
+    if (!activeRef.current || !readyRef.current || !conn.isConnected || !sizeRef.current) return;
     conn.resize(sid, sizeRef.current.cols, sizeRef.current.rows);
     conn.attach(sid, lastSeqRef.current > 0 ? lastSeqRef.current : undefined);
     attachedRef.current = true;
@@ -114,32 +118,31 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
   }, [fontSize, rx]);
 
   useEffect(() => {
-    const offSnap = conn.events.on("snapshot", (m) => {
-      if (m.sid !== sid) return;
-      lastSeqRef.current = m.seq;
-      rx({ kind: "snapshot", ansi: m.ansi, cols: m.cols, rows: m.rows });
+    metricsRef.current = onPerf !== undefined;
+    if (readyRef.current) rx({ kind: "activity", active: activeRef.current, metrics: metricsRef.current });
+  }, [onPerf, rx]);
+
+  useFocusedSessionEffect(useCallback(() => {
+    activeRef.current = true;
+    if (readyRef.current) rx({ kind: "activity", active: true, metrics: metricsRef.current });
+    const cleanup = subscribeFocusedTerminal({
+      conn, sid, cursor: lastSeqRef,
+      snapshot: (message) => rx({ kind: "snapshot", ansi: message.ansi, cols: message.cols, rows: message.rows }),
+      output: (message) => rx({ kind: "output", dataB64: message.dataB64 }),
+      flush,
+      attach: tryAttach,
     });
-    const offOut = conn.events.on("output", (m) => {
-      if (m.sid !== sid) return;
-      lastSeqRef.current = m.seq;
-      rx({ kind: "output", dataB64: m.dataB64 });
-      if (!ackTimerRef.current) {
-        ackTimerRef.current = setTimeout(() => {
-          ackTimerRef.current = null;
-          conn.ack(sid, lastSeqRef.current);
-        }, 500);
-      }
-    });
-    // 重连成功 → 带 lastSeq 重新 attach(增量续传或快照,由服务端裁决)
-    const offConn = conn.events.on("connected", () => tryAttach());
     return () => {
-      offSnap();
-      offOut();
-      offConn();
-      if (ackTimerRef.current) clearTimeout(ackTimerRef.current);
-      if (flushRef.current) clearTimeout(flushRef.current);
+      activeRef.current = false;
+      cleanup();
+      attachedRef.current = false;
+      if (readyRef.current) {
+        rx({ kind: "blur" });
+        rx({ kind: "activity", active: false, metrics: false });
+        flush();
+      }
     };
-  }, [conn, sid, rx, tryAttach]);
+  }, [conn, sid, flush, rx, tryAttach]));
 
   const onMessage = useCallback(
     (e: WebViewMessageEvent) => {
@@ -155,6 +158,7 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
           readyRef.current = true;
           attachedRef.current = false;
           lastSeqRef.current = 0;
+          rx({ kind: "activity", active: activeRef.current, metrics: metricsRef.current });
           // term.html 在收到 font 后才允许首次 fit，因此它产生的 resized/attach
           // 必然反映这一受控字号。字体消息排在重放输出之前，避免初始帧闪回默认值。
           rx({ kind: "font", size: fontSizeRef.current });
@@ -169,21 +173,22 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
         case "resized":
           if (typeof msg.cols !== "number" || typeof msg.rows !== "number") return;
           sizeRef.current = { cols: msg.cols, rows: msg.rows };
+          if (!activeRef.current) break;
           if (!attachedRef.current) tryAttach();
           else conn.resize(sid, msg.cols, msg.rows);
           break;
         case "input":
-          if (typeof msg.data === "string" && inputEnabled) {
+          if (activeRef.current && typeof msg.data === "string" && inputEnabled) {
             const result = conn.inputB64(sid, msg.data);
             if (!result.accepted) toast(deliveryFailureText(result));
           }
           break;
         case "fontSize":
-          if (typeof msg.size === "number") onFontSize?.(msg.size);
+          if (activeRef.current && typeof msg.size === "number") onFontSize?.(msg.size);
           break;
         case "perf":
           // Release 构建里 console.log 被剥掉,验收要看数就必须走 UI
-          if (typeof msg.fps === "number" && typeof msg.kb === "number") {
+          if (activeRef.current && typeof msg.fps === "number" && typeof msg.kb === "number") {
             onPerf?.({ fps: msg.fps, kb: msg.kb, renderer: msg.renderer ?? "?" });
           }
           break;
@@ -246,7 +251,9 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
  * 顶部状态计时每秒都会更新;终端连接和 sid 没变时不应连带重渲染 WebView。
  * 这既避免无意义的原生属性同步,也守住正在进行的输入法组合态。
  */
-export const Terminal = memo(TerminalInner);
+export const Terminal = memo(forwardRef<TerminalHandle, Props>(function Terminal(props, ref) {
+  return <TerminalInner key={`${props.conn.host.id}\u0000${props.sid}`} {...props} ref={ref} />;
+}));
 
 const styles = StyleSheet.create({
   wrap: { flex: 1, backgroundColor: "#09090b" },

@@ -352,8 +352,14 @@
   let perfBytes = 0;
   let perfFrames = 0;
   let perfLast = performance.now();
-  (function perfLoop() {
-    requestAnimationFrame(() => {
+  // Older desktop/Swift bridges keep their existing behavior until they send activity.
+  let perfActive = true;
+  let perfEnabled = true;
+  let perfFrame = null;
+  function perfLoop() {
+    if (!perfActive || !perfEnabled || perfFrame !== null) return;
+    perfFrame = requestAnimationFrame(() => {
+      perfFrame = null;
       perfFrames++;
       const now = performance.now();
       if (now - perfLast >= 1000) {
@@ -371,10 +377,20 @@
       }
       perfLoop();
     });
-  })();
+  }
+  perfLoop();
 
   function handle(m) {
-    if (m.kind === "snapshot") {
+    if (m.kind === "activity") {
+      perfActive = m.active !== false;
+      perfEnabled = m.metrics !== false;
+      if (perfFrame !== null) cancelAnimationFrame(perfFrame);
+      perfFrame = null;
+      perfFrames = 0;
+      perfBytes = 0;
+      perfLast = performance.now();
+      perfLoop();
+    } else if (m.kind === "snapshot") {
       replaying = true;
       term.reset();
       if (m.cols && m.rows && (m.cols !== term.cols || m.rows !== term.rows)) {

@@ -14,8 +14,7 @@ import {
   View,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { useIsFocused } from "@react-navigation/native";
-import { Stack, router, useFocusEffect, useLocalSearchParams } from "expo-router";
+import { Stack, router, useFocusEffect, useIsFocused, useLocalSearchParams } from "expo-router";
 import type {
   AgentAccount,
   AgentKind,
@@ -45,6 +44,7 @@ import {
   setSessionHidden,
 } from "@/lib/session-preferences";
 import { groupSessionsByProject } from "@/lib/session-projects";
+import { flattenHostSessionProjects } from "@/lib/host-session-list";
 import {
   coordinatorRunsBySession,
   goalSessionGroups,
@@ -608,6 +608,10 @@ export default function HostScreen() {
     [contextualGoalCoordinators, goalVisibility, sessions],
   );
   const projects = useMemo(() => groupSessionsByProject(topLevelSessions), [topLevelSessions]);
+  const sessionListItems = useMemo(
+    () => flattenHostSessionProjects(projects, collapsedProjects),
+    [projects, collapsedProjects],
+  );
   const runningCount = all.filter(
     (s) => s.status === "running" || s.status === "starting",
   ).length;
@@ -1682,12 +1686,12 @@ export default function HostScreen() {
       ) : null}
 
       {!composing && <FlatList
-        data={projects}
-        keyExtractor={(project) => project.path}
+        data={sessionListItems}
+        keyExtractor={(item) => item.key}
         keyboardDismissMode="interactive"
         keyboardShouldPersistTaps="handled"
-        // 一行 = 一个项目,展开后含它全部会话与 subagent,单行成本远高于普通列表。
-        // 默认 windowSize=21(约 21 屏)会把几十个项目的整棵子树都挂在原生侧。
+        // 项目标题与顶层会话分别虚拟化，大项目不会一次挂载全部会话。
+        // Goal 工作会话与 subagent 保留在所属会话行内。
         initialNumToRender={6}
         maxToRenderPerBatch={4}
         windowSize={7}
@@ -1735,10 +1739,44 @@ export default function HostScreen() {
             </Text>
           ) : null
         }
-        renderItem={({ item: project }) => {
-          const collapsed = collapsedProjects.has(project.path);
+        renderItem={({ item }) => {
+          if (item.kind === "session") {
+            const session = item.session;
+            const goalGroup = goalGroups.get(session.id);
+            const goalWorkers = (goalGroup?.workers ?? []).flatMap((worker) => {
+              const workerSession = visibleSessionsById.get(worker.sessionId);
+              return workerSession ? [{ link: worker, session: workerSession }] : [];
+            });
+            return (
+              <View style={[styles.projectSessionCell, item.lastInProject && styles.projectSessionCellLast]}>
+                <SessionRow
+                  session={session}
+                  hostId={hostId}
+                  beforeNavigate={resetPendingCreate}
+                  // 断线时状态只代表上次连接，不能伪装成实时状态。
+                  stale={runtime.status !== "connected"}
+                  isCoordinator={coordinatorRuns.get(session.id) !== undefined}
+                  goalGroup={goalGroup}
+                  goalWorkers={goalWorkers}
+                  goalWorkersExpanded={
+                    goalGroup
+                      ? (goalRunExpansionOverrides[goalGroup.run.id] ??
+                        goalGroup.run.status === "active")
+                      : false
+                  }
+                  onToggleGoalWorkers={toggleGoalWorkers}
+                  swipeActionsFor={sessionSwipeActions}
+                />
+              </View>
+            );
+          }
+          const { project, collapsed } = item;
           return (
-            <View style={styles.projectSection}>
+            <View style={[
+              styles.projectSection,
+              styles.projectHeaderCell,
+              !collapsed && project.sessions.length > 0 && styles.projectHeaderExpanded,
+            ]}>
               <SwipeRow
                 actions={[
                   {
@@ -1789,38 +1827,6 @@ export default function HostScreen() {
                   />
                 </Pressable>
               </SwipeRow>
-              {!collapsed && (
-                <View style={styles.projectSessions}>
-                  {project.sessions.map((session) => {
-                    const goalGroup = goalGroups.get(session.id);
-                    const goalWorkers = (goalGroup?.workers ?? []).flatMap((worker) => {
-                      const workerSession = visibleSessionsById.get(worker.sessionId);
-                      return workerSession ? [{ link: worker, session: workerSession }] : [];
-                    });
-                    return (
-                      <SessionRow
-                        key={session.id}
-                        session={session}
-                        hostId={hostId}
-                        beforeNavigate={resetPendingCreate}
-                        // 断线时状态只代表上次连接，不能伪装成实时状态。
-                        stale={runtime.status !== "connected"}
-                        isCoordinator={coordinatorRuns.get(session.id) !== undefined}
-                        goalGroup={goalGroup}
-                        goalWorkers={goalWorkers}
-                        goalWorkersExpanded={
-                          goalGroup
-                            ? (goalRunExpansionOverrides[goalGroup.run.id] ??
-                              goalGroup.run.status === "active")
-                            : false
-                        }
-                        onToggleGoalWorkers={toggleGoalWorkers}
-                        swipeActionsFor={sessionSwipeActions}
-                      />
-                    );
-                  })}
-                </View>
-              )}
             </View>
           );
         }}
@@ -2531,7 +2537,6 @@ const styles = StyleSheet.create({
     maxWidth: 920,
     alignSelf: "center",
     padding: space.lg,
-    gap: space.md,
   },
   goalPanel: {
     gap: space.sm,
@@ -2622,6 +2627,17 @@ const styles = StyleSheet.create({
     borderColor: color.border,
     overflow: "hidden",
   },
+  projectHeaderCell: { marginTop: space.md },
+  projectHeaderExpanded: { borderBottomLeftRadius: 0, borderBottomRightRadius: 0 },
+  projectSessionCell: {
+    backgroundColor: color.surface,
+    borderLeftWidth: StyleSheet.hairlineWidth,
+    borderRightWidth: StyleSheet.hairlineWidth,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
+    overflow: "hidden",
+  },
+  projectSessionCellLast: { borderBottomLeftRadius: radius.lg, borderBottomRightRadius: radius.lg },
   projectHeader: {
     minHeight: 66,
     paddingHorizontal: space.md,
@@ -2650,12 +2666,6 @@ const styles = StyleSheet.create({
     fontVariant: ["tabular-nums"],
     minWidth: 20,
     textAlign: "right",
-  },
-  projectSessions: {
-    gap: StyleSheet.hairlineWidth,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: color.border,
-    backgroundColor: color.border,
   },
   card: {
     backgroundColor: color.surface,

@@ -39,6 +39,7 @@ describe("recent conversation index", () => {
     expect(homeRecentSessions(sessions, 2, f.store.getHost("pc")).map((s) => s.id)).toEqual(["newer", "old"]);
     f.time(110);
     f.store.activity("mac", "newer", "Fix connection timeout");
+    await f.store.flush();
     expect(homeRecentSessions(sessions, 1, f.store.getHost("mac"))[0]?.id).toBe("newer");
     expect(f.store.getHost("mac").newer?.summary).toBe("Fix connection timeout");
     expect(f.store.getHost("pc").newer?.summary).toBe("Windows build failure");
@@ -219,8 +220,58 @@ describe("recent conversation index", () => {
     expect(f.store.getHost("mac")).toBe(mac);
     unsubscribe();
     f.store.activity("mac", "same-id", "Mac work");
-    expect(f.store.getHost("mac")).not.toBe(mac);
     await f.store.flush();
+    expect(f.store.getHost("mac")).not.toBe(mac);
+  });
+
+  it("coalesces streaming activity while explicit opens stay immediate and the latest summary is retained", async () => {
+    vi.useFakeTimers();
+    const f = fixture();
+    await f.store.load();
+    for (let i = 0; i < 122; i++) f.store.opened("mac", `session-${i}`);
+    await f.store.flush();
+    const snapshot = f.store.getHost("mac");
+    const notify = vi.fn();
+    const unsubscribe = f.store.subscribe(notify);
+    for (let i = 0; i < 1000; i++) {
+      f.time(1000 + i);
+      f.store.activity("mac", "session-121", `Latest streamed response ${i}`);
+    }
+    expect(notify).not.toHaveBeenCalled();
+    expect(f.store.getHost("mac")).toBe(snapshot);
+    await vi.advanceTimersByTimeAsync(250);
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(f.store.getHost("mac")["session-121"]).toMatchObject({ activityAt: 1999, summary: "Latest streamed response 999" });
+    f.store.activity("mac", "session-121", "Final response");
+    f.time(3000);
+    f.store.opened("mac", "session-120");
+    expect(notify).toHaveBeenCalledTimes(2);
+    expect(f.store.getHost("mac")["session-120"]?.openedAt).toBe(3000);
+    expect(f.store.getHost("mac")["session-121"]?.summary).toBe("Final response");
+    await f.store.flush();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(notify).toHaveBeenCalledTimes(2);
+    unsubscribe();
+  });
+
+  it("keeps capacity and coalesced notifications when all 122 sessions stream beyond the recent limit", async () => {
+    vi.useFakeTimers();
+    const f = fixture();
+    await f.store.load();
+    const notify = vi.fn();
+    const unsubscribe = f.store.subscribe(notify);
+    for (let i = 0; i < 1000; i++) {
+      f.time(1000 + i);
+      f.store.activity("mac", `session-${i % 122}`, `Response ${i}`);
+    }
+    expect(notify).not.toHaveBeenCalled();
+    expect(Object.keys(f.store.getHost("mac"))).toHaveLength(RECENT_SESSION_HOST_LIMIT);
+    await vi.advanceTimersByTimeAsync(250);
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(f.store.getHost("mac")[`session-${999 % 122}`]?.summary).toBe("Response 999");
+    await f.store.flush();
+    expect(JSON.parse(f.raw()!).entries).toHaveLength(RECENT_SESSION_HOST_LIMIT);
+    unsubscribe();
   });
 
   it("invalidates a cached host snapshot when capacity eviction removes its last record", async () => {

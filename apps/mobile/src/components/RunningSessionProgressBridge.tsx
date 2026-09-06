@@ -10,28 +10,56 @@ import {
   type PendingOverlayApproval,
 } from "@/lib/pending-overlay-approvals";
 import {
+  canDisplayProgressOverlay,
   requestProgressNotificationPermission,
   subscribeProgressApprovalActions,
   syncRunningSessionProgress,
 } from "@/lib/running-session-progress";
+import {
+  needsProgressApprovalSubscription,
+  ProgressApprovalSubscriptions,
+} from "@/lib/progress-approval-subscriptions";
 import { runningSessionProgress } from "@/lib/running-session-summary";
 import { useApp } from "@/lib/store";
 
-/** 把实时会话状态同步到 Android 前台服务；本组件本身不渲染界面。 */
+/** 保留全平台偏好恢复；iOS 不挂载 Android 服务的会话订阅树。 */
 export function RunningSessionProgressBridge() {
-  const hosts = useApp((state) => state.hosts);
-  const runtimes = useApp((state) => state.runtimes);
+  const setHomeSettings = useApp((state) => state.setHomeSettings);
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    void getHomeSettings().then((saved) => {
+      if (!cancelled) {
+        setHomeSettings(saved);
+        setSettingsLoaded(true);
+      }
+    });
+    return () => { cancelled = true; };
+  }, [setHomeSettings]);
+  return Platform.OS === "android" && settingsLoaded ? <AndroidProgressSettingsBridge /> : null;
+}
+
+function AndroidProgressSettingsBridge() {
   // 后台进度只订阅自身开关；themeMode 等无关设置变化不应触发原生服务同步。
   const backgroundProgressEnabled = useApp(
     (state) =>
       state.homeSettings?.backgroundProgressEnabled ??
       DEFAULT_HOME_SETTINGS.backgroundProgressEnabled,
   );
+  useEffect(() => {
+    if (!backgroundProgressEnabled) syncRunningSessionProgress(null, false, false);
+  }, [backgroundProgressEnabled]);
+  return backgroundProgressEnabled ? <AndroidRunningSessionProgressBridge /> : null;
+}
+
+/** 普通通知只读会话元数据；仅可见的后台悬浮窗需要审批正文。 */
+function AndroidRunningSessionProgressBridge() {
+  const hosts = useApp((state) => state.hosts);
+  const runtimes = useApp((state) => state.runtimes);
   const overlayProgressEnabled = useApp(
     (state) =>
       state.homeSettings?.overlayProgressEnabled ?? DEFAULT_HOME_SETTINGS.overlayProgressEnabled,
   );
-  const setHomeSettings = useApp((state) => state.setHomeSettings);
   const [appState, setAppState] = useState<AppStateStatus>(AppState.currentState);
   const [approvals, setApprovals] = useState<Map<string, PendingOverlayApproval>>(new Map());
   const approvalsRef = useRef(approvals);
@@ -39,14 +67,17 @@ export function RunningSessionProgressBridge() {
     () => runningSessionProgress(hosts, runtimes),
     [hosts, runtimes],
   );
+  const overlayActive = needsProgressApprovalSubscription(
+    Platform.OS, true, overlayProgressEnabled, appState, canDisplayProgressOverlay(),
+  );
   // 连接由首页/会话页异步创建；把注册表是否已有实例纳入订阅生命周期，
   // 避免 Bridge 首次渲染时连接尚不存在而永久漏订阅。
-  const connectionSignature = hosts
+  const connectionSignature = overlayActive ? hosts
     .map((host) => `${host.id}:${peekConnection(host.id) === null ? "0" : "1"}`)
     .sort()
-    .join("|");
+    .join("|") : "";
   const approvalTargetSignature = useMemo(
-    () => hosts.flatMap((host) => {
+    () => overlayActive ? hosts.flatMap((host) => {
       const runtime = runtimes[host.id];
       if (!runtime) return [];
       return Object.values(runtime.sessions)
@@ -55,17 +86,19 @@ export function RunningSessionProgressBridge() {
           (session.status === "waiting_approval" || (session.pendingPermissions ?? 0) > 0),
         )
         .map((session) => `${host.id}\u0000${session.id}`);
-    }).sort().join("\u0001"),
-    [hosts, runtimes],
+    }).sort().join("\u0001") : "",
+    [hosts, overlayActive, runtimes],
   );
 
   const activeApprovals = useMemo(() => {
+    if (!overlayActive) return new Map<string, PendingOverlayApproval>();
     const hostIds = new Set(hosts.map((host) => host.id));
-    return new Map([...approvals].filter(([, candidate]) =>
-      hostIds.has(candidate.hostId) &&
-      runtimes[candidate.hostId]?.sessions[candidate.sid] !== undefined,
-    ));
-  }, [approvals, hosts, runtimes]);
+    return new Map([...approvals].filter(([, candidate]) => {
+      const session = runtimes[candidate.hostId]?.sessions[candidate.sid];
+      return hostIds.has(candidate.hostId) && session?.kind === "structured" &&
+        (session.status === "waiting_approval" || (session.pendingPermissions ?? 0) > 0);
+    }));
+  }, [approvals, hosts, overlayActive, runtimes]);
 
   const approval = useMemo(() => {
     const candidates = [...activeApprovals.values()];
@@ -91,99 +124,86 @@ export function RunningSessionProgressBridge() {
   }, [activeApprovals]);
 
   useEffect(() => {
-    let cancelled = false;
-    void getHomeSettings().then((saved) => {
-      if (!cancelled) setHomeSettings(saved);
+    const subscription = AppState.addEventListener("change", (nextState) => {
+      // Returning to the app ends this overlay interaction. Clear its cache at
+      // the native transition, rather than scheduling a second render from an effect.
+      if (nextState === "active") {
+        approvalsRef.current = new Map();
+        setApprovals((current) => current.size ? new Map() : current);
+      }
+      setAppState(nextState);
     });
-    return () => {
-      cancelled = true;
-    };
-  }, [setHomeSettings]);
-
-  useEffect(() => {
-    const subscription = AppState.addEventListener("change", setAppState);
     return () => subscription.remove();
   }, []);
 
+  const approvalSubscriptions = useMemo(() => new ProgressApprovalSubscriptions({
+    snapshot(hostId, message) {
+      setApprovals((current) =>
+        applyOverlayApprovalEvents(current, hostId, message.sid, message.events, true),
+      );
+    },
+    event(hostId, message) {
+      setApprovals((current) =>
+        applyOverlayApprovalEvents(current, hostId, message.sid, [message.body]),
+      );
+    },
+  }), []);
+
+  useEffect(() => () => approvalSubscriptions.dispose(), [approvalSubscriptions]);
+
   useEffect(() => {
-    const targetsByHost = new Map<string, string[]>();
+    const targetsByHost = new Map<string, Set<string>>();
     for (const target of approvalTargetSignature.split("\u0001")) {
       if (!target) continue;
       const [hostId, sid] = target.split("\u0000");
       if (!hostId || !sid) continue;
-      const current = targetsByHost.get(hostId) ?? [];
-      current.push(sid);
+      const current = targetsByHost.get(hostId) ?? new Set<string>();
+      current.add(sid);
       targetsByHost.set(hostId, current);
     }
 
-    const unsubscribe: (() => void)[] = [];
-    for (const host of hosts) {
-      const conn = peekConnection(host.id);
-      if (!conn) continue;
-      unsubscribe.push(conn.events.on("chatSnapshot", (message) => {
-        setApprovals((current) =>
-          applyOverlayApprovalEvents(current, host.id, message.sid, message.events, true),
-        );
-      }));
-      unsubscribe.push(conn.events.on("agentEvent", (message) => {
-        if (
-          message.body.kind !== "permission.request" &&
-          message.body.kind !== "permission.resolved" &&
-          message.body.kind !== "permission.auto"
-        ) return;
-        setApprovals((current) =>
-          applyOverlayApprovalEvents(current, host.id, message.sid, [message.body]),
-        );
-      }));
+    approvalSubscriptions.update(targetsByHost, peekConnection);
+  }, [approvalSubscriptions, approvalTargetSignature, connectionSignature, hosts, overlayActive, runtimes]);
 
-      const attachTargets = () => {
-        for (const sid of targetsByHost.get(host.id) ?? []) conn.attach(sid);
-      };
-      unsubscribe.push(conn.events.on("connected", attachTargets));
-      if (conn.isConnected) attachTargets();
-    }
-    return () => {
-      for (const off of unsubscribe) off();
-    };
-  }, [approvalTargetSignature, connectionSignature, hosts]);
-
-  useEffect(() => subscribeProgressApprovalActions((event) => {
-    const key = overlayApprovalKey(event.hostId, event.sid, event.reqId);
-    if (!approvalsRef.current.has(key)) return;
-    const result = peekConnection(event.hostId)?.respondPermission(
-      event.sid,
-      event.reqId,
-      event.reply,
-    );
-    if (result?.accepted) {
-      setApprovals((current) =>
-        removeOverlayApproval(current, event.hostId, event.sid, event.reqId),
+  useEffect(() => {
+    if (!overlayActive) return;
+    return subscribeProgressApprovalActions((event) => {
+      const key = overlayApprovalKey(event.hostId, event.sid, event.reqId);
+      if (!approvalsRef.current.has(key)) return;
+      const result = peekConnection(event.hostId)?.respondPermission(
+        event.sid,
+        event.reqId,
+        event.reply,
       );
-      return;
-    }
-    // 连接已被移除或无法排队时，打开原会话让用户看到完整上下文并重试。
-    if (event.deepLink) void Linking.openURL(event.deepLink);
-  }), []);
+      if (result?.accepted) {
+        setApprovals((current) =>
+          removeOverlayApproval(current, event.hostId, event.sid, event.reqId),
+        );
+        return;
+      }
+      // 连接已被移除或无法排队时，打开原会话让用户看到完整上下文并重试。
+      if (event.deepLink) void Linking.openURL(event.deepLink);
+    });
+  }, [overlayActive]);
 
   useEffect(() => {
     if (
       Platform.OS === "android" &&
       appState === "active" &&
-      effectiveProgress !== null &&
-      backgroundProgressEnabled
+      effectiveProgress !== null
     ) {
       void requestProgressNotificationPermission();
     }
-  }, [appState, backgroundProgressEnabled, effectiveProgress]);
+  }, [appState, effectiveProgress]);
 
   useEffect(() => {
     syncRunningSessionProgress(
       effectiveProgress,
-      backgroundProgressEnabled,
+      true,
       overlayProgressEnabled,
       approval,
     );
-  }, [appState, approval, backgroundProgressEnabled, effectiveProgress, overlayProgressEnabled]);
+  }, [appState, approval, effectiveProgress, overlayProgressEnabled]);
 
   return null;
 }
