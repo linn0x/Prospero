@@ -17,7 +17,7 @@ export class RemoteHostStore {
 
   list(): RemoteHostSummary[] {
     this.load();
-    return [...this.hosts.values()].map(({ token: _token, daemonPubKey: _key, ...summary }) => ({ ...summary }));
+    return [...this.hosts.values()].map(({ token: _token, daemonPubKey: _key, relay: _relay, ...summary }) => ({ ...summary }));
   }
 
   importPairing(uri: string): RemoteHostSummary {
@@ -26,7 +26,7 @@ export class RemoteHostStore {
     const record = this.recordFromPayload(payload);
     this.hosts.set(record.id, record);
     this.save();
-    const { token: _token, daemonPubKey: _key, ...summary } = record;
+    const { token: _token, daemonPubKey: _key, relay: _relay, ...summary } = record;
     return { ...summary };
   }
 
