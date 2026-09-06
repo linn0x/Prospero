@@ -61,4 +61,57 @@ final class AgentAccountsTests: XCTestCase {
     XCTAssertNotNil(AgentAccountInputValidator.credential("short", apiKey: false))
     XCTAssertNil(AgentAccountInputValidator.credential("one-character-key", apiKey: true))
   }
+
+  func testProtocolSelectionAndCredentialPreservationAreCapabilityGated() throws {
+    let account = try JSONDecoder().decode(CodeAgentAccount.self, from: Data(accountJSON.utf8))
+    let legacy = AgentAccountEditorState(mode: .configureAPI(account))
+    XCTAssertEqual(legacy.availableProtocols, [.responses])
+    XCTAssertNotNil(legacy.apiValidationError)
+    var editor = AgentAccountEditorState(mode: .configureAPI(account), supportsProtocols: true, supportsValidation: true)
+    XCTAssertEqual(editor.availableProtocols, [.responses, .chat])
+    XCTAssertTrue(editor.keepsCredential)
+    XCTAssertNil(editor.apiValidationError)
+    editor.apiProtocol = .chat
+    editor.contextWindow = "32000"
+    editor.maxOutputTokens = "4096"
+    let body = AgentAccountOperation.configureAPI(
+      accountID: account.id, baseURL: editor.baseURL, model: editor.model, apiKey: "",
+      apiProtocol: editor.apiProtocol, modelCapabilities: editor.configuredModelCapabilities
+    ).body
+    XCTAssertEqual(body["protocol"] as? String, "openai_chat_completions")
+    XCTAssertEqual(body["provider"] as? String, "openai_compatible")
+    XCTAssertEqual((body["modelCapabilities"] as? [String: Any])?["contextWindow"] as? Int, 32000)
+    XCTAssertEqual(body["apiKey"] as? String, "")
+    editor.maxOutputTokens = "32001"
+    XCTAssertNotNil(editor.apiValidationError)
+    editor.maxOutputTokens = "0"
+    XCTAssertNotNil(editor.apiValidationError)
+  }
+
+  func testNewMetadataReportsProtocolValidationWithoutClaimingLogin() throws {
+    var payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(accountJSON.utf8)) as? [String: Any])
+    let legacy = try JSONDecoder().decode(CodeAgentAccount.self, from: Data(accountJSON.utf8))
+    XCTAssertEqual(legacy.statusLabel, "已配置 · 未验证")
+    payload["engine"] = "opencode"
+    payload["apiValidation"] = [
+      "status": "failed", "checkedAt": 1000, "engine": "opencode",
+      "checks": ["runtime": "passed", "streaming": "passed", "tools": "failed"],
+      "detail": "工具回传测试失败。",
+    ]
+    let account = try JSONDecoder().decode(CodeAgentAccount.self, from: JSONSerialization.data(withJSONObject: payload))
+    XCTAssertEqual(account.statusLabel, "API 验证失败")
+    XCTAssertTrue(account.environmentLabel.contains("opencode"))
+    XCTAssertEqual(account.apiValidation?.summary, "CLI 通过 · 流式响应 通过 · 工具回传 失败")
+    XCTAssertEqual(AgentAccountOperation.testAPI(accountID: account.id).body["type"] as? String, "agent.account.api.test")
+    payload.removeValue(forKey: "apiProfile")
+    payload["apiProfileError"] = "配置无效"
+    let invalid = try JSONDecoder().decode(CodeAgentAccount.self, from: JSONSerialization.data(withJSONObject: payload))
+    XCTAssertTrue(invalid.isAPI)
+    XCTAssertEqual(invalid.statusLabel, "配置无效")
+  }
+
+  func testRunningCapabilitiesDefaultToLegacy() {
+    XCTAssertEqual(RunningStatus.load(root: ["pid": 1])?.capabilities, [])
+    XCTAssertEqual(RunningStatus.load(root: ["pid": 1, "capabilities": ["agent.api-validation.v1"]])?.capabilities, ["agent.api-validation.v1"])
+  }
 }

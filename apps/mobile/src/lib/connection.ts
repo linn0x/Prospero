@@ -43,6 +43,7 @@ import {
   ProtocolError,
   type AgentKind,
   type AgentAccount,
+  type AgentModelCapabilities,
   type AgentAccountsResult,
   type AgentApiProtocol,
   type AgentCredentialKind,
@@ -238,6 +239,10 @@ export class HostConnection {
 
   get supportsAgentApiProtocols(): boolean {
     return this.supportsCapability(CAPABILITY_AGENT_API_PROTOCOLS);
+  }
+
+  get supportsAgentApiValidation(): boolean {
+    return this.supportsCapability("agent.api-validation.v1");
   }
 
   get supportsDeepseekHarness(): boolean {
@@ -984,6 +989,7 @@ export class HostConnection {
       | Extract<C2SMessage, { type: "agent.account.create" }>
       | Extract<C2SMessage, { type: "agent.account.api.create" }>
       | Extract<C2SMessage, { type: "agent.account.api.configure" }>
+      | Extract<C2SMessage, { type: "agent.account.api.test" }>
       | Extract<C2SMessage, { type: "agent.account.rename" }>
       | Extract<C2SMessage, { type: "agent.account.default" }>
       | Extract<C2SMessage, { type: "agent.account.login" }>
@@ -999,7 +1005,7 @@ export class HostConnection {
       45_000,
       false,
     );
-    if (!result.ok) throw new Error(result.error ?? "账号操作失败");
+    if (!result.ok && !(message.type === "agent.account.api.test" && result.validation)) throw new Error(result.error ?? "账号操作失败");
     return result;
   }
 
@@ -1024,6 +1030,7 @@ export class HostConnection {
     baseUrl: string,
     model: string,
     apiKey: string,
+    modelCapabilities?: AgentModelCapabilities,
   ): Promise<AgentAccountsResult> {
     if (!this.supportsAgentApiProfiles) throw new Error("请先升级电脑端以使用第三方 API Profile");
     return this.accountRequest({
@@ -1037,6 +1044,7 @@ export class HostConnection {
       baseUrl,
       model,
       apiKey,
+      ...(this.supportsAgentApiValidation && modelCapabilities !== undefined ? { modelCapabilities } : {}),
     });
   }
 
@@ -1046,6 +1054,7 @@ export class HostConnection {
     baseUrl: string,
     model: string,
     apiKey?: string,
+    modelCapabilities?: AgentModelCapabilities | null,
   ): Promise<AgentAccountsResult> {
     if (!this.supportsAgentApiProfiles) throw new Error("请先升级电脑端以使用第三方 API Profile");
     if (!this.supportsAgentApiProtocols && !apiKey?.trim()) {
@@ -1061,7 +1070,13 @@ export class HostConnection {
       baseUrl,
       model,
       ...(apiKey?.trim() ? { apiKey: apiKey.trim() } : {}),
+      ...(this.supportsAgentApiValidation && modelCapabilities !== undefined ? { modelCapabilities } : {}),
     });
+  }
+
+  testAgentApiProfile(accountId: string): Promise<AgentAccountsResult> {
+    if (!this.supportsAgentApiValidation) throw new Error("请先升级电脑端以测试 API 连接");
+    return this.accountRequest({ type: "agent.account.api.test", requestId: this.agentRequestId(), accountId });
   }
 
   renameAgentAccount(accountId: string, name: string): Promise<AgentAccountsResult> {

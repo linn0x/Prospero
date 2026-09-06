@@ -226,6 +226,59 @@ describe("HostConnection WebSocket candidates", () => {
     )).toThrow("需要重新输入 API Key");
   });
 
+  it("requires advertised API validation and returns failed checks for presentation", async () => {
+    const socket = new FakeWebSocket("ws://192.168.1.8:7423/ws");
+    socket.readyState = 1;
+    const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
+    const internals = connection as unknown as {
+      ws: FakeWebSocket;
+      channel: { seal(message: unknown): string; open(message: string): unknown };
+      advertisedCapabilities: Set<string>;
+      onMessage(message: string): void;
+    };
+    internals.ws = socket;
+    internals.channel = { seal: JSON.stringify, open: JSON.parse };
+    internals.advertisedCapabilities = new Set([CAPABILITY_AGENT_ACCOUNTS, CAPABILITY_AGENT_API_PROFILES, CAPABILITY_AGENT_API_PROTOCOLS]);
+    expect(connection.supportsAgentApiValidation).toBe(false);
+    expect(() => connection.testAgentApiProfile("account")).toThrow("升级电脑端");
+    expect(socket.sent).toHaveLength(0);
+
+    internals.advertisedCapabilities.add("agent.api-validation.v1");
+    const pending = connection.testAgentApiProfile("account");
+    const request = JSON.parse(socket.sent[0]!);
+    expect(request).toMatchObject({ type: "agent.account.api.test", accountId: "account" });
+    expect(request).not.toHaveProperty("apiKey");
+    const validation = { status: "failed", engine: "opencode", checkedAt: 123, checks: { runtime: "passed", streaming: "passed", tools: "failed" }, detail: "Tool roundtrip failed" };
+    internals.onMessage(JSON.stringify({ type: "agent.accounts.result", requestId: request.requestId, action: "api_test", ok: false, error: "Validation failed", validation, accounts: [] }));
+    await expect(pending).resolves.toMatchObject({ ok: false, validation });
+    connection.stop();
+  });
+
+  it("only sends model metadata to daemons advertising support", async () => {
+    const socket = new FakeWebSocket("ws://192.168.1.8:7423/ws");
+    socket.readyState = 1;
+    const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
+    const internals = connection as unknown as {
+      ws: FakeWebSocket;
+      channel: { seal(message: unknown): string; open(message: string): unknown };
+      advertisedCapabilities: Set<string>;
+      onMessage(message: string): void;
+    };
+    internals.ws = socket;
+    internals.channel = { seal: JSON.stringify, open: JSON.parse };
+    internals.advertisedCapabilities = new Set([CAPABILITY_AGENT_ACCOUNTS, CAPABILITY_AGENT_API_PROFILES, CAPABILITY_AGENT_API_PROTOCOLS]);
+    for (const supported of [false, true]) {
+      if (supported) internals.advertisedCapabilities.add("agent.api-validation.v1");
+      const pending = connection.configureAgentApiProfile("account", "openai_responses", "https://example.com/v1", "model", undefined, { contextWindow: 2000, tools: false });
+      const request = JSON.parse(socket.sent.at(-1)!);
+      if (supported) expect(request.modelCapabilities).toEqual({ contextWindow: 2000, tools: false });
+      else expect(request).not.toHaveProperty("modelCapabilities");
+      internals.onMessage(JSON.stringify({ type: "agent.accounts.result", requestId: request.requestId, action: "api_configure", ok: true, accounts: [] }));
+      await pending;
+    }
+    connection.stop();
+  });
+
   it("waits for every acknowledged upload chunk", async () => {
     const socket = new FakeWebSocket("ws://192.168.1.8:7423/ws");
     socket.readyState = 1;

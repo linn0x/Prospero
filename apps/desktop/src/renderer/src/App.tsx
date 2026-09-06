@@ -3623,6 +3623,7 @@ function NewSessionDialog({
   );
   const requiresStructured = sessionLaunchRequiresStructured(selectedAccount);
   const selectedKind: SessionCreateInput["kind"] = requiresStructured ? "structured" : input.kind;
+  const accountCanLaunch = !selectedAccount?.apiProfileError && (selectedAccount?.capabilities?.sessionKinds.includes(selectedKind) ?? true);
   const selectedWorkspace = launchWorkspaces.find(
     (workspace) => workspace.path === input.cwd,
   );
@@ -3664,6 +3665,7 @@ function NewSessionDialog({
   ].includes(input.agent);
   const supportsLaunchModels =
     selectedKind === "structured" &&
+    (selectedAccount?.capabilities?.modelSelection ?? true) &&
     (input.agent === "codex" ||
       input.agent === "claude" ||
       input.agent === "deepseek");
@@ -3726,12 +3728,12 @@ function NewSessionDialog({
     };
   }, [input.accountId, input.agent, input.kind, open, supportsLaunchModels]);
   const create = async (): Promise<void> => {
-    if (busyRef.current || !input.cwd) return;
+    if (busyRef.current || !input.cwd || !accountCanLaunch) return;
     busyRef.current = true;
     setBusy(true);
     setError(undefined);
     try {
-      onCreated(await window.prospero.createSession({ ...input, kind: selectedKind }));
+      onCreated(await window.prospero.createSession({ ...input, kind: selectedKind, model: selectedAccount?.capabilities?.modelSelection === false ? undefined : input.model, effort: selectedAccount?.capabilities?.reasoningEffort === false ? undefined : input.effort }));
       onOpenChange(false);
     } catch (reason) {
       setError(displayError(reason));
@@ -3888,15 +3890,15 @@ function NewSessionDialog({
               >
                 <NativeSelectOption
                   value="structured"
-                  disabled={!supportsStructured}
+                  disabled={!supportsStructured || selectedAccount?.capabilities?.sessionKinds.includes("structured") === false}
                 >
                   {t("对话", "Conversation")}
                 </NativeSelectOption>
-                <NativeSelectOption value="pty" disabled={requiresStructured}>
+                <NativeSelectOption value="pty" disabled={selectedAccount?.capabilities?.sessionKinds.includes("pty") === false || requiresStructured}>
                   {t("终端", "Terminal")}
                 </NativeSelectOption>
               </NativeSelect>
-              {requiresStructured && <FieldDescription>{t("Chat Completions Profile 使用 OpenCode 结构化引擎，不支持 PTY 终端。", "Chat Completions profiles use the structured OpenCode engine and do not support PTY terminals.")}</FieldDescription>}
+              {requiresStructured && <FieldDescription>{t("当前账号仅支持对话会话。", "This account supports conversation sessions only.")}</FieldDescription>}
             </Field>
           </div>
           {(input.agent === "codex" || input.agent === "claude") && (
@@ -3930,7 +3932,7 @@ function NewSessionDialog({
               </NativeSelect>
               <FieldDescription>
                 {selectedAccount
-                  ? `${status(selectedAccount.status)}${selectedAccount.apiProfile ? ` · API Profile · ${text(selectedAccount.apiProfile["model"])}` : " · CLI"}`
+                  ? selectedAccount.apiProfileError ?? `${selectedAccount.engine ?? input.agent} · ${selectedAccount.apiProfile ? `${t("使用 Profile 模型", "Profile model")} · ${text(selectedAccount.apiProfile["model"])}` : status(selectedAccount.status) + " · CLI"}`
                   : t("在 Agents 与账号页面添加或登录账号。", "Add or sign in to an account from Agents & accounts.")}
               </FieldDescription>
             </Field>
@@ -3987,7 +3989,7 @@ function NewSessionDialog({
                 <NativeSelect
                   id="session-effort"
                   value={input.effort ?? ""}
-                  disabled={!selectedLaunchModel?.supportedEfforts.length}
+                  disabled={selectedAccount?.capabilities?.reasoningEffort === false || !selectedLaunchModel?.supportedEfforts.length}
                   onChange={(event) =>
                     setInput({
                       ...input,
@@ -4046,7 +4048,7 @@ function NewSessionDialog({
           </Button>
           <Button
             aria-busy={busy}
-            disabled={busy || choosingWorkspace || !input.cwd || (supportsLaunchModels && launchModelsLoading)}
+            disabled={busy || choosingWorkspace || !accountCanLaunch || !input.cwd || (supportsLaunchModels && launchModelsLoading)}
             onClick={() => void create()}
           >
             {busy ? (
