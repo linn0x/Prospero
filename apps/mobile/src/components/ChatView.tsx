@@ -82,6 +82,8 @@ interface Props {
   search?: string;
   /** 出错时可重发上一条用户消息 */
   onRetry?: (text: string) => void;
+  /** 本地即时回显；服务端出现对应 user event 后自动移除。 */
+  pendingOutgoing?: { token: string; text: string } | null;
   /** agent 回复里的项目文件引用可直接打开只读预览。 */
   projectRoot?: string;
   onOpenFile?: (reference: ProjectFileReference) => void;
@@ -124,6 +126,7 @@ const ChatViewContent = memo(function ChatViewContent({
   onPendingChange,
   search,
   onRetry,
+  pendingOutgoing,
   projectRoot,
   onOpenFile,
   agent,
@@ -146,6 +149,11 @@ const ChatViewContent = memo(function ChatViewContent({
   const scrollFollow = useRef(new ChatScrollFollow());
   const [hasUnread, setHasUnread] = useState(false);
   const [selectionSource, setSelectionSource] = useState<string | null>(null);
+  const pendingOutgoingRef = useRef(pendingOutgoing);
+  const [acknowledgedPendingToken, setAcknowledgedPendingToken] = useState<string | null>(null);
+  useEffect(() => {
+    pendingOutgoingRef.current = pendingOutgoing;
+  }, [pendingOutgoing]);
 
   const loadProjectImage = useCallback<ProjectImageLoader>(
     (reference) => {
@@ -210,8 +218,18 @@ const ChatViewContent = memo(function ChatViewContent({
 
   useFocusedSessionEffect(useCallback(() => subscribeFocusedChat({
     conn, sid, cursor: evSeqRef,
-    snapshot: (events) => setItems(applyEvents([], events)),
-    events: (events) => setItems((previous) => applyEvents(previous, events)),
+    snapshot: (events) => {
+      if (events.some((event) => event.kind === "user.message")) {
+        setAcknowledgedPendingToken(pendingOutgoingRef.current?.token ?? null);
+      }
+      setItems(applyEvents([], events));
+    },
+    events: (events) => {
+      if (events.some((event) => event.kind === "user.message")) {
+        setAcknowledgedPendingToken(pendingOutgoingRef.current?.token ?? null);
+      }
+      setItems((previous) => applyEvents(previous, events));
+    },
     toolOutput: (message) => setItems((previous) =>
       applyToolOutput(previous, message.callId, message.output, message.truncated === true)),
     unread: () => { if (!scrollFollow.current.following) setHasUnread(true); },
@@ -232,6 +250,10 @@ const ChatViewContent = memo(function ChatViewContent({
         : itemsForAgent(items, subagentId),
     [items, subagentId, subagentHistory],
   );
+  const visiblePendingOutgoing = pendingOutgoing &&
+    pendingOutgoing.token !== acknowledgedPendingToken
+    ? pendingOutgoing
+    : null;
 
   // 自动跟随只留 onContentSizeChange 一条路径。这里再排一次 rAF 会在同一帧里
   // 重复滚动,而且它跑在列表重新布局【之前】,量到的还是上一帧的内容高度。
@@ -402,6 +424,20 @@ const ChatViewContent = memo(function ChatViewContent({
       ) : null,
     [agent, workingStatus, onInterrupt],
   );
+  const listHeaderWithPending = useMemo(
+    () => (
+      <>
+        {visiblePendingOutgoing && (
+          <View style={styles.pendingOutgoingBubble} accessibilityLiveRegion="polite">
+            <Text style={styles.pendingOutgoingText}>{visiblePendingOutgoing.text}</Text>
+            <Text style={styles.pendingOutgoingStatus}>发送中…</Text>
+          </View>
+        )}
+        {listHeader}
+      </>
+    ),
+    [listHeader, visiblePendingOutgoing],
+  );
 
   const handleContentSizeChange = useCallback(() => {
     if (!scrollFollow.current.following) return;
@@ -462,7 +498,7 @@ const ChatViewContent = memo(function ChatViewContent({
         // 有 Markdown、diff 和图片,十一屏的量在长会话里就是白挂着的原生视图。
         windowSize={7}
         ListEmptyComponent={listEmpty}
-        ListHeaderComponent={listHeader}
+        ListHeaderComponent={listHeaderWithPending}
         renderItem={renderItem}
       />
       {hasUnread && (
@@ -1555,6 +1591,18 @@ const styles = StyleSheet.create({
   jumpText: { color: color.bg, fontSize: 12, fontWeight: "700" },
 
   userRow: { alignItems: "flex-end" },
+  pendingOutgoingBubble: {
+    alignSelf: "flex-end",
+    maxWidth: "88%",
+    marginBottom: 4,
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+    borderRadius: 15,
+    backgroundColor: color.accentDim,
+    opacity: 0.82,
+  },
+  pendingOutgoingText: { color: color.text, fontSize: 14, lineHeight: 20 },
+  pendingOutgoingStatus: { marginTop: 3, color: color.textDim, fontSize: 10 },
   userBubble: {
     backgroundColor: color.accent,
     borderRadius: radius.lg,
