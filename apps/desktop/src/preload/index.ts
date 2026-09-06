@@ -74,6 +74,17 @@ const api: DesktopApi = {
   listRemoteHosts: () => ipcRenderer.invoke("remote-host:list"),
   importRemoteHost: (pairingUri: string) => ipcRenderer.invoke("remote-host:import", pairingUri),
   removeRemoteHost: (id: string) => ipcRenderer.invoke("remote-host:remove", id),
+  connectRemoteHost: (id: string) => ipcRenderer.invoke("remote-shell:connect", id),
+  createRemoteShell: (hostId: string, cwd?: string) => ipcRenderer.invoke("remote-shell:create", hostId, cwd),
+  sendRemoteShellInput: (hostId: string, sid: string, dataB64: string) => ipcRenderer.invoke("remote-shell:input", hostId, sid, dataB64),
+  resizeRemoteShell: (hostId: string, sid: string, cols: number, rows: number) => ipcRenderer.invoke("remote-shell:resize", hostId, sid, cols, rows),
+  killRemoteShell: (hostId: string, sid: string) => ipcRenderer.invoke("remote-shell:kill", hostId, sid),
+  disconnectRemoteHost: (id: string) => ipcRenderer.invoke("remote-shell:disconnect", id),
+  subscribeRemoteShell(listener) {
+    const wrapped = (_event: Electron.IpcRendererEvent, value: import("../shared/types").RemoteShellEvent): void => listener(value);
+    ipcRenderer.on("remote-shell:event", wrapped);
+    return () => ipcRenderer.removeListener("remote-shell:event", wrapped);
+  },
 };
 
 contextBridge.exposeInMainWorld("prospero", Object.freeze(api));
