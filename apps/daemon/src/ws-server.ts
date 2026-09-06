@@ -14,6 +14,7 @@ import {
   CAPABILITY_AGENT_ACCOUNTS,
   CAPABILITY_AGENT_API_PROFILES,
   CAPABILITY_AGENT_API_PROTOCOLS,
+  CAPABILITY_AGENT_API_VALIDATION,
   CAPABILITY_AGENT_DEEPSEEK_HARNESS,
   CAPABILITY_CHAT_ATTACHMENT_PREVIEWS,
   CAPABILITY_DEEPSEEK_TRAJECTORY,
@@ -45,6 +46,7 @@ import {
   utf8Decode,
   type C2SMessage,
   type AgentEventBody,
+  type AgentApiValidation,
   clampSessionInfo,
   type S2CMessage,
   type SecureChannel,
@@ -68,6 +70,7 @@ import { SessionError, SessionManager, type SessionManagerOptions } from "./sess
 import { RemoteSupervisorError } from "./structured-supervisor-client.js";
 import { createStructuredSupervisorRuntimeSnapshot } from "./structured-supervisor-runtime.js";
 import { StatusFile } from "./status-file.js";
+import { probeApiProfile } from "./api-profile-probe.js";
 import { pageSessions } from "./session-list.js";
 import {
   ControlSocketError,
@@ -176,6 +179,7 @@ interface Conn {
   attachments: Map<string, AttachState>;
   chatAttachments: Map<string, ChatAttachState>;
   alive: boolean;
+  disconnect: AbortController;
 }
 
 /** The local control plane accepts exactly the account messages the paired clients use. */
@@ -185,6 +189,7 @@ type AgentAccountControlMessage = Extract<C2SMessage, {
     | "agent.account.create"
     | "agent.account.api.create"
     | "agent.account.api.configure"
+    | "agent.account.api.test"
     | "agent.account.rename"
     | "agent.account.default"
     | "agent.account.login"
@@ -236,6 +241,8 @@ export interface DaemonServerOptions {
     codexAppServerArgs?: string[],
   ) => Promise<ResumableConversation[]>;
   accountRunner?: AccountCommandRunner;
+  /** Deterministic test seam; production only probes on explicit account actions. */
+  apiProfileProbe?: typeof probeApiProfile;
   /**
    * Structured-session test seam. Injected adapters stay in-process, so this
    * is intentionally for deterministic daemon integration tests only.
@@ -315,6 +322,7 @@ export async function createDaemonServer(
   // package bin 指向同一文件。每个 agent 的 PATH 都优先找到它。
   const cliBinDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "bin");
   const accounts = new AgentAccountManager(opts.home, opts.accountRunner);
+  const apiTests = new Map<string, AbortController>();
   const structuredSupervisorEnabled = opts.structuredSupervisor ?? process.env["VITEST"] !== "true";
   // Freeze the POSIX executable boundary before any Unix session launcher is
   // created. Falling back to mutable dist after a snapshot error would
@@ -356,6 +364,7 @@ export async function createDaemonServer(
       PATH: [cliBinDir, process.env["PATH"] ?? ""].filter((part) => part !== "").join(path.delimiter),
     }),
     accountResolver: (accountId, agent) => accounts.resolve(accountId, agent),
+    accountCapabilitiesResolver: (accountId, agent) => accounts.capabilitiesFor(accountId, agent),
   });
   const orchestrationStore = new OrchestrationStore(opts.home);
   const dispatchService = new DispatchService(orchestrationStore, manager);
@@ -411,6 +420,7 @@ export async function createDaemonServer(
     value.length <= max ? value : `…${value.slice(-(max - 1))}`;
 
   function sanitizeSessionInfo(session: SessionInfo): SessionInfo {
+    session = manager.sessionInfoWithCapabilities(session);
     if (!session.subagents?.some((subagent) =>
       subagent.preview !== undefined && subagent.preview.length > SUBAGENT_PREVIEW_WIRE_CHARS
     )) {
@@ -580,6 +590,7 @@ export async function createDaemonServer(
       case "agent.account.create":
       case "agent.account.api.create":
       case "agent.account.api.configure":
+      case "agent.account.api.test":
       case "agent.account.rename":
       case "agent.account.default":
       case "agent.account.login":
@@ -598,6 +609,7 @@ export async function createDaemonServer(
       case "agent.account.create": return "create";
       case "agent.account.api.create": return "api_create";
       case "agent.account.api.configure": return "api_configure";
+      case "agent.account.api.test": return "api_test";
       case "agent.account.rename": return "rename";
       case "agent.account.default": return "default";
       case "agent.account.login": return "login";
@@ -625,11 +637,16 @@ export async function createDaemonServer(
    */
   async function performAccountControl(
     message: AgentAccountControlMessage,
+    signal?: AbortSignal,
   ): Promise<{ status: number; result: AgentAccountControlResult }> {
     const action = accountAction(message);
     try {
       let sessionId: string | undefined;
       let accountId: string | undefined;
+      let validation: AgentApiValidation | undefined;
+      if ("accountId" in message && apiTests.has(message.accountId)) {
+        throw new AgentAccountError("这个 Profile 正在测试连接，请等待测试结束", "account_in_use");
+      }
       switch (message.type) {
         case "agent.accounts.list":
           break;
@@ -643,6 +660,7 @@ export async function createDaemonServer(
             baseUrl: message.baseUrl,
             model: message.model,
             apiKey: message.apiKey,
+            ...(message.modelCapabilities !== undefined ? { modelCapabilities: message.modelCapabilities } : {}),
           })).id;
           break;
         case "agent.account.api.configure":
@@ -653,8 +671,31 @@ export async function createDaemonServer(
             ...(message.baseUrl ? { baseUrl: message.baseUrl } : {}),
             ...(message.model ? { model: message.model } : {}),
             ...(message.apiKey !== undefined ? { apiKey: message.apiKey } : {}),
+            ...(message.modelCapabilities !== undefined ? { modelCapabilities: message.modelCapabilities } : {}),
           }, manager.list(), manager.accountInUse(message.accountId));
           break;
+        case "agent.account.api.test": {
+          if (apiTests.size >= 4) throw new AgentAccountError("连接测试繁忙，请稍后重试", "account_in_use");
+          const revision = accounts.captureApiValidationRevision(message.accountId);
+          const binding = accounts.resolve(message.accountId);
+          if (!binding.apiProfile) throw new AgentAccountError("这个账号不是 API Profile", "account_invalid");
+          const controller = new AbortController();
+          const abort = (): void => controller.abort();
+          signal?.addEventListener("abort", abort, { once: true });
+          if (signal?.aborted) controller.abort();
+          apiTests.set(message.accountId, controller);
+          try {
+            validation = await (opts.apiProfileProbe ?? probeApiProfile)(binding, { signal: controller.signal });
+            if (!accounts.recordApiValidation(message.accountId, revision, validation)) {
+              throw new AgentAccountError("Profile 已变更，请重新测试连接", "account_invalid");
+            }
+            accountId = message.accountId;
+          } finally {
+            signal?.removeEventListener("abort", abort);
+            apiTests.delete(message.accountId);
+          }
+          break;
+        }
         case "agent.account.rename":
           accounts.rename(message.accountId, message.name);
           break;
@@ -704,6 +745,7 @@ export async function createDaemonServer(
           accounts: await accounts.snapshot(manager.list()),
           ...(accountId ? { accountId } : {}),
           ...(sessionId ? { sessionId } : {}),
+          ...(validation ? { validation } : {}),
         },
       };
     } catch (error) {
@@ -726,7 +768,9 @@ export async function createDaemonServer(
 
   function orchestrationCapabilities(conn: Conn): string[] {
     const capabilities: string[] = [];
-    if (conn.protocolVersion >= 16 && conn.device?.allowShell) capabilities.push(CAPABILITY_AGENT_API_PROTOCOLS);
+    if (conn.protocolVersion >= 16 && conn.device?.allowShell) {
+      capabilities.push(CAPABILITY_AGENT_API_PROTOCOLS, CAPABILITY_AGENT_API_VALIDATION);
+    }
     if (conn.protocolVersion >= 15) capabilities.push(CAPABILITY_FS_PUT_ACK);
     capabilities.push(CAPABILITY_AGENT_DEEPSEEK_HARNESS);
     if (conn.protocolVersion >= 14) capabilities.push(CAPABILITY_DEEPSEEK_TRAJECTORY);
@@ -1215,18 +1259,28 @@ export async function createDaemonServer(
         return;
       }
       case "agent.accounts.list": {
-        send(conn, (await performAccountControl(msg)).result);
+        send(conn, (await performAccountControl(msg, conn.disconnect.signal)).result);
         return;
       }
       case "agent.account.create":
       case "agent.account.api.create":
       case "agent.account.api.configure":
+      case "agent.account.api.test":
       case "agent.account.rename":
       case "agent.account.default":
       case "agent.account.login":
       case "agent.account.credential.set":
       case "agent.account.logout":
       case "agent.account.delete": {
+        if (
+          conn.protocolVersion < 16 &&
+          (msg.type === "agent.account.api.test" ||
+            ((msg.type === "agent.account.api.create" || msg.type === "agent.account.api.configure") &&
+              msg.modelCapabilities !== undefined))
+        ) {
+          send(conn, { type: "error", code: "bad_message", message: "当前协商协议不支持 API 连接测试或模型能力配置" });
+          return;
+        }
         if (
           conn.protocolVersion < 12 &&
           (msg.type === "agent.account.api.create" || msg.type === "agent.account.api.configure")
@@ -1264,7 +1318,7 @@ export async function createDaemonServer(
           });
           return;
         }
-        send(conn, (await performAccountControl(msg)).result);
+        send(conn, (await performAccountControl(msg, conn.disconnect.signal)).result);
         return;
       }
       case "session.create": {
@@ -1402,7 +1456,7 @@ export async function createDaemonServer(
       }
       case "agent.models.get": {
         try {
-          const catalog = await manager.requireStructured(msg.sid).models();
+          const catalog = await manager.models(msg.sid);
           send(conn, {
             type: "agent.models",
             sid: msg.sid,
@@ -1423,9 +1477,7 @@ export async function createDaemonServer(
       }
       case "agent.model.set": {
         try {
-          const selection = await manager
-            .requireStructured(msg.sid)
-            .setModel(msg.model, msg.effort);
+          const selection = await manager.setModel(msg.sid, msg.model, msg.effort);
           send(conn, {
             type: "agent.control.result",
             sid: msg.sid,
@@ -1452,7 +1504,7 @@ export async function createDaemonServer(
       }
       case "agent.modes.get": {
         try {
-          const catalog = await manager.requireStructured(msg.sid).modes();
+          const catalog = await manager.modes(msg.sid);
           send(conn, {
             type: "agent.modes",
             sid: msg.sid,
@@ -1472,7 +1524,7 @@ export async function createDaemonServer(
       }
       case "agent.mode.set": {
         try {
-          const selection = await manager.requireStructured(msg.sid).setMode(msg.mode);
+          const selection = await manager.setMode(msg.sid, msg.mode);
           send(conn, {
             type: "agent.control.result",
             sid: msg.sid,
@@ -2071,6 +2123,7 @@ export async function createDaemonServer(
       attachments: new Map(),
       chatAttachments: new Map(),
       alive: true,
+      disconnect: new AbortController(),
     };
     handshakeTimer = setTimeout(
       () => { if (conn.device === null) ws.terminate(); },
@@ -2087,6 +2140,7 @@ export async function createDaemonServer(
       });
     });
     ws.on("close", () => {
+      conn.disconnect.abort();
       releaseUnauthenticated();
       conns.delete(conn);
     });
@@ -2352,10 +2406,9 @@ export async function createDaemonServer(
     if (sessionModesMatch && (req.method === "GET" || req.method === "POST")) {
       try {
         const sid = decodeURIComponent(sessionModesMatch[1]!);
-        const session = manager.requireStructured(sid);
         const result = req.method === "GET"
-          ? await session.modes()
-          : await session.setMode(String((await readControlJson(req, 4 * 1024))["mode"] ?? ""));
+          ? await manager.modes(sid)
+          : await manager.setMode(sid, String((await readControlJson(req, 4 * 1024))["mode"] ?? ""));
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify(result));
       } catch (error) {
@@ -2391,9 +2444,8 @@ export async function createDaemonServer(
     if (sessionModelsMatch && (req.method === "GET" || req.method === "POST")) {
       try {
         const sid = decodeURIComponent(sessionModelsMatch[1]!);
-        const session = manager.requireStructured(sid);
         const result = req.method === "GET"
-          ? await session.models()
+          ? await manager.models(sid)
           : await (async () => {
               const body = await readControlJson(req, 4 * 1024);
               const model = typeof body["model"] === "string" ? body["model"].trim() : "";
@@ -2401,7 +2453,7 @@ export async function createDaemonServer(
               if (!model || model.length > 160 || (effort !== undefined && (!effort || effort.length > 80))) {
                 throw new ControlRequestError("invalid model selection", 400);
               }
-              return session.setModel(model, effort);
+              return manager.setModel(sid, model, effort);
             })();
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify(result));
@@ -2424,7 +2476,16 @@ export async function createDaemonServer(
         if (!isAgentAccountControlMessage(message)) {
           throw new ControlRequestError("expected an agent account protocol message", 400);
         }
-        const outcome = await performAccountControl(message);
+        const requestAbort = new AbortController();
+        const abortRequest = (): void => { if (!res.writableEnded) requestAbort.abort(); };
+        res.once("close", abortRequest);
+        let outcome: Awaited<ReturnType<typeof performAccountControl>>;
+        try {
+          outcome = await performAccountControl(message, requestAbort.signal);
+        } finally {
+          res.removeListener("close", abortRequest);
+        }
+        if (res.destroyed) return;
         res.writeHead(outcome.status, { "content-type": "application/json" });
         // Account snapshots contain public metadata only. In particular this never
         // includes apiKey / credential from the incoming JSON body.
@@ -3169,6 +3230,7 @@ export async function createDaemonServer(
     collaboration,
     controlSocket,
     close: async () => {
+      for (const controller of apiTests.values()) controller.abort();
       clearInterval(catchupTimer);
       clearInterval(pingTimer);
       if (worktreeGCTimer) clearTimeout(worktreeGCTimer);

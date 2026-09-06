@@ -1,4 +1,5 @@
 import type { DesktopSnapshot, JsonObject, SessionCreateInput, SessionInfo } from "./types";
+import { accountCapabilities, accountEngine, type AccountCapabilities } from "./account-capabilities";
 
 export type SessionLaunchWorkspace = {
   path: string;
@@ -13,6 +14,9 @@ export type SessionLaunchAccount = {
   status: string;
   isDefault: boolean;
   apiProfile: JsonObject | undefined;
+  engine?: string;
+  capabilities?: AccountCapabilities;
+  apiProfileError?: string;
 };
 
 function stringValue(value: unknown): string {
@@ -101,6 +105,9 @@ export function sessionLaunchAccounts(
       status: stringValue(account["status"]),
       isDefault: account["isDefault"] === true,
       apiProfile: Object.keys(profile).length > 0 ? profile : undefined,
+      engine: accountEngine(account),
+      capabilities: accountCapabilities(account),
+      ...(typeof account["apiProfileError"] === "string" ? { apiProfileError: account["apiProfileError"] } : {}),
     }];
   });
 }
@@ -114,6 +121,7 @@ export function defaultSessionLaunchAccountId(
 }
 
 export function sessionLaunchRequiresStructured(account?: SessionLaunchAccount): boolean {
+  if (account?.capabilities) return account.capabilities.sessionKinds.includes("structured") && !account.capabilities.sessionKinds.includes("pty");
   return account?.apiProfile?.["protocol"] === "openai_chat_completions";
 }
 

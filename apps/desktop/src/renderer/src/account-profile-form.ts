@@ -21,6 +21,62 @@ export const accountApiProtocols: AccountApiProtocol[] = [
 
 export const ACCOUNT_API_PROTOCOLS_CAPABILITY = "agent.api-protocols.v1";
 
+export function supportsAccountApiValidation(capabilities?: readonly string[]): boolean {
+  return capabilities?.includes("agent.api-validation.v1") === true;
+}
+
+export function accountApiStatus(account: JsonObject, english = false): string {
+  if (account["apiProfileError"]) return english ? "Profile needs repair" : "配置需要修复";
+  if (account["status"] === "signed_out") return english ? "API key missing" : "未配置密钥";
+  if (account["status"] === "unavailable") return english ? "Runtime unavailable" : "运行环境不可用";
+  const validation = account["apiValidation"] as JsonObject | undefined;
+  if (validation?.["status"] === "passed") return english ? "API checks passed" : "API 检查通过";
+  if (validation?.["status"] === "failed") return english ? "API checks failed" : "API 检查失败";
+  return english ? "Configured · unverified" : "已配置 · 未验证";
+}
+
+export type ModelCapabilityDraft = {
+  contextWindow: string;
+  maxOutputTokens: string;
+  tools: "unknown" | "true" | "false";
+  vision: "unknown" | "true" | "false";
+  reasoning: "unknown" | "true" | "false";
+};
+
+export function modelCapabilityDraft(value: JsonObject = {}): ModelCapabilityDraft {
+  const bool = (key: string): "unknown" | "true" | "false" => typeof value[key] === "boolean" ? value[key] ? "true" : "false" : "unknown";
+  return {
+    contextWindow: typeof value["contextWindow"] === "number" ? String(value["contextWindow"]) : "",
+    maxOutputTokens: typeof value["maxOutputTokens"] === "number" ? String(value["maxOutputTokens"]) : "",
+    tools: bool("tools"), vision: bool("vision"), reasoning: bool("reasoning"),
+  };
+}
+
+/** Preserve fields introduced by newer daemons when editing known model settings. */
+export function parseModelCapabilities(draft: ModelCapabilityDraft, initial: JsonObject = {}, protocol?: AccountApiProtocol): JsonObject | null {
+  const value = { ...initial };
+  for (const key of ["contextWindow", "maxOutputTokens"] as const) {
+    const raw = draft[key].trim();
+    if (!raw) delete value[key];
+    else {
+      const parsed = Number(raw);
+      if (!/^\d+$/.test(raw) || !Number.isSafeInteger(parsed) || parsed <= 0) throw new Error("Token limits must be positive whole numbers / Token 上限必须是正整数");
+      value[key] = parsed;
+    }
+  }
+  if (protocol === "openai_chat_completions" && (value["contextWindow"] === undefined) !== (value["maxOutputTokens"] === undefined)) {
+    throw new Error("Chat Completions requires both token limits or neither / Chat Completions 的两个 Token 上限须同时填写或同时留空");
+  }
+  if (typeof value["contextWindow"] === "number" && typeof value["maxOutputTokens"] === "number" && value["maxOutputTokens"] > value["contextWindow"]) {
+    throw new Error("Output limit cannot exceed the context window / 输出上限不能大于上下文窗口");
+  }
+  for (const key of ["tools", "vision", "reasoning"] as const) {
+    if (draft[key] === "unknown") delete value[key];
+    else value[key] = draft[key] === "true";
+  }
+  return Object.keys(value).length ? value : null;
+}
+
 export function supportsAccountApiProtocols(capabilities?: readonly string[]): boolean {
   return capabilities?.includes(ACCOUNT_API_PROTOCOLS_CAPABILITY) === true;
 }

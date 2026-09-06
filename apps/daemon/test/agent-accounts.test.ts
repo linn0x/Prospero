@@ -2,7 +2,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync 
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import type { SessionInfo } from "@prospero/protocol";
+import type { AgentApiValidation, SessionInfo } from "@prospero/protocol";
 import {
   AgentAccountError,
   AgentAccountManager,
@@ -79,6 +79,173 @@ class MemoryCredentialStore implements AgentAccountCredentialStore {
 }
 
 describe("Code Agent 账号隔离", () => {
+  it.each([
+    null, "malformed", [], {},
+    { provider: "unsupported", baseUrl: "https://gateway.example/v1", model: "coder" },
+    { protocol: "unsupported", baseUrl: "https://gateway.example/v1", model: "coder" },
+    { protocol: null, baseUrl: "https://gateway.example/v1", model: "coder" },
+    { baseUrl: "http://remote.example/v1", model: "coder" },
+    { baseUrl: "https://gateway.example/v1", model: "coder", modelCapabilities: { tools: "true" } },
+  ])("损坏 Profile 保留身份和原始配置，并拒绝启动: %j", async (raw) => {
+    const home = tempHome();
+    const storeFile = path.join(home, "agent-accounts.json");
+    const original = { id: "broken-profile", agent: "codex", name: "损坏 Profile", apiProfile: raw, createdAt: 1, updatedAt: 1 };
+    writeFileSync(storeFile, JSON.stringify({ version: 1, accounts: [original], defaults: { codex: original.id } }));
+    const accounts = new AgentAccountManager(home, signedInRunner([]), new MemoryCredentialStore());
+    expect(() => accounts.resolve(original.id)).toThrow(/配置损坏/);
+    expect(() => accounts.loginSpec(original.id)).toThrow(/配置损坏/);
+    expect(await accounts.snapshot([])).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: original.id, name: original.name, status: "error", isDefault: true,
+        apiProfileError: expect.stringContaining("配置损坏"), capabilities: { sessionKinds: [], plan: false, resume: false, modelSelection: false, reasoningEffort: false } }),
+    ]));
+    accounts.rename(original.id, "仍待修复");
+    expect(JSON.parse(readFileSync(storeFile, "utf8")).accounts[0].apiProfile).toEqual(raw);
+    expect(readFileSync(storeFile, "utf8")).not.toContain("invalidApiProfile");
+    const contexts: AdapterContext[] = [];
+    const sessions = new SessionManager({ home, accountResolver: (id, agent) => accounts.resolve(id, agent), adapterFactory: () => new EnvAdapter(contexts) });
+    await expect(sessions.create({ agent: "codex", accountId: original.id, kind: "structured", cwd: home, cols: 80, rows: 24, allowShell: false })).rejects.toThrow(/配置损坏/);
+    expect(contexts).toEqual([]);
+    await expect(accounts.configureApi(original.id, { name: "只有名称" })).rejects.toMatchObject({ code: "account_invalid" });
+    await accounts.configureApi(original.id, { protocol: "openai_responses", baseUrl: "https://repaired.example/v1", model: "repaired", apiKey: "new-key" });
+    expect(accounts.resolve(original.id).apiProfile).toMatchObject({ model: "repaired" });
+    expect((await accounts.snapshot([])).find((account) => account.id === original.id)?.apiProfileError).toBeUndefined();
+    await accounts.delete(original.id, []);
+    await sessions.disposeAll();
+  });
+
+  it("损坏 Profile 可以直接删除，不调用本机 CLI 注销", async () => {
+    const home = tempHome();
+    const calls: Array<{ file: string; args: string[]; env: Record<string, string> }> = [];
+    writeFileSync(path.join(home, "agent-accounts.json"), JSON.stringify({ accounts: [
+      { id: "broken-delete", agent: "codex", name: "broken", apiProfile: null, createdAt: 1, updatedAt: 1 },
+    ], defaults: { codex: "broken-delete" } }));
+    const credentials = new MemoryCredentialStore();
+    const accounts = new AgentAccountManager(home, signedInRunner(calls), credentials);
+    await accounts.delete("broken-delete", []);
+    expect(calls).toEqual([]);
+    expect(credentials.deleted).toEqual(["broken-delete"]);
+    expect(accounts.defaultId("codex")).toBe("native-codex");
+  });
+
+  it("损坏 Profile 恢复会话保留历史且不会启动本机 Agent", async () => {
+    const home = tempHome();
+    const accounts = new AgentAccountManager(home, signedInRunner([]), new MemoryCredentialStore());
+    const profile = await accounts.createApi("codex", "Profile", { baseUrl: "https://gateway.example/v1", model: "coder", apiKey: "key" });
+    const first = new SessionManager({ home, accountResolver: (id, agent) => accounts.resolve(id, agent), adapterFactory: () => new EnvAdapter([]) });
+    const session = await first.create({ agent: "codex", accountId: profile.id, kind: "structured", cwd: home, cols: 80, rows: 24, allowShell: false });
+    await first.disposeAll();
+    const storeFile = path.join(home, "agent-accounts.json");
+    const stored = JSON.parse(readFileSync(storeFile, "utf8"));
+    stored.accounts[0].apiProfile.protocol = "unsupported";
+    writeFileSync(storeFile, JSON.stringify(stored));
+    const reloaded = new AgentAccountManager(home, signedInRunner([]), new MemoryCredentialStore());
+    const contexts: AdapterContext[] = [];
+    const restored = new SessionManager({ home, accountResolver: (id, agent) => reloaded.resolve(id, agent), adapterFactory: () => new EnvAdapter(contexts) });
+    expect(await restored.restoreStructured()).toEqual([expect.objectContaining({ id: session.id, accountId: profile.id, status: "died" })]);
+    expect(contexts).toEqual([]);
+    await restored.disposeAll();
+  });
+
+  it("模型能力持久化、限制 OpenCode 配置和禁用工具的 Agent 启动", async () => {
+    const home = tempHome();
+    const credentials = new MemoryCredentialStore();
+    const accounts = new AgentAccountManager(home, signedInRunner([]), credentials);
+    const profile = await accounts.createApi("codex", "能力配置", {
+      protocol: "openai_chat_completions", baseUrl: "https://gateway.example/v1", model: "coder", apiKey: "key",
+      modelCapabilities: { contextWindow: 100_000, maxOutputTokens: 8_192, vision: false },
+    });
+    const model = JSON.parse(readFileSync(profile.environment["PROSPERO_API_PROFILE_CONFIG"]!, "utf8")).provider.prospero.models.coder;
+    expect(model).toMatchObject({ limit: { context: 100_000, output: 8_192 }, modalities: { input: ["text"], output: ["text"] } });
+    expect(profile.apiProfile?.modelCapabilities?.tools).toBeUndefined();
+    expect(new AgentAccountManager(home, signedInRunner([]), credentials).resolve(profile.id).apiProfile?.modelCapabilities).toEqual({ contextWindow: 100_000, maxOutputTokens: 8_192, vision: false });
+    await expect(accounts.configureApi(profile.id, { modelCapabilities: { contextWindow: 4, maxOutputTokens: 5 } })).rejects.toMatchObject({ code: "account_invalid" });
+    await expect(accounts.configureApi(profile.id, { modelCapabilities: { contextWindow: 100_000 } })).rejects.toThrow(/必须同时填写/);
+    await expect(accounts.configureApi(profile.id, { modelCapabilities: { maxOutputTokens: 8192 } })).rejects.toThrow(/必须同时填写/);
+    await expect(accounts.configureApi(profile.id, { modelCapabilities: { tools: false } }, [], true)).rejects.toMatchObject({ code: "account_in_use" });
+    await accounts.configureApi(profile.id, { modelCapabilities: { tools: false } });
+    expect((await accounts.snapshot([])).find((item) => item.id === profile.id)).toMatchObject({ engine: "opencode", capabilities: { sessionKinds: [] }, apiProfile: { modelCapabilities: { tools: false } } });
+    const sessions = new SessionManager({ home, accountResolver: (id, agent) => accounts.resolve(id, agent), adapterFactory: () => new EnvAdapter([]) });
+    await expect(sessions.create({ agent: "codex", accountId: profile.id, kind: "structured", cwd: home, cols: 80, rows: 24, allowShell: false })).rejects.toThrow(/不支持工具调用/);
+    await accounts.configureApi(profile.id, { modelCapabilities: null });
+    expect(accounts.resolve(profile.id).apiProfile?.modelCapabilities).toBeUndefined();
+    expect(accounts.resolve(profile.id).capabilities?.sessionKinds).toEqual(["structured"]);
+    await sessions.disposeAll();
+  });
+
+  it("连接验证仅适用于当前连接和凭据，并在修改或重启后保持正确状态", async () => {
+    const home = tempHome();
+    const credentials = new MemoryCredentialStore();
+    const accounts = new AgentAccountManager(home, signedInRunner([]), credentials);
+    const profile = await accounts.createApi("codex", "验证 Profile", { baseUrl: "https://gateway.example/v1", model: "coder", apiKey: "first-key" });
+    const valid: AgentApiValidation = { status: "passed", checkedAt: 1, engine: "codex", checks: { runtime: "passed", streaming: "passed", tools: "passed" }, detail: "已验证", latencyMs: 10 };
+    const initial = accounts.captureApiValidationRevision(profile.id);
+    expect((await accounts.snapshot([])).find((item) => item.id === profile.id)).toMatchObject({ detail: expect.stringContaining("尚未测试连接") });
+    expect(accounts.recordApiValidation(profile.id, initial, { ...valid, engine: "claude" })).toBe(false);
+    expect(accounts.recordApiValidation(profile.id, initial, { ...valid, checks: { ...valid.checks, tools: "not_tested" } })).toBe(false);
+    expect(accounts.recordApiValidation(profile.id, initial, valid)).toBe(true);
+    accounts.rename(profile.id, "改名保留验证");
+    expect((await accounts.snapshot([])).find((item) => item.id === profile.id)?.apiValidation).toEqual(valid);
+    expect((await new AgentAccountManager(home, signedInRunner([]), credentials).snapshot([])).find((item) => item.id === profile.id)?.apiValidation).toEqual(valid);
+    await accounts.configureApi(profile.id, { model: "updated-coder" });
+    expect(accounts.recordApiValidation(profile.id, initial, valid)).toBe(false);
+    expect((await accounts.snapshot([])).find((item) => item.id === profile.id)?.apiValidation).toBeUndefined();
+    const changed = accounts.captureApiValidationRevision(profile.id);
+    await accounts.setCredential(profile.id, "api_key", "second-key");
+    expect(accounts.recordApiValidation(profile.id, changed, valid)).toBe(false);
+    const rotated = accounts.captureApiValidationRevision(profile.id);
+    expect(accounts.recordApiValidation(profile.id, rotated, valid)).toBe(true);
+    credentials.values.set(profile.id, { kind: "api_key", secret: "externally-replaced-key" });
+    expect(accounts.recordApiValidation(profile.id, rotated, valid)).toBe(false);
+    expect((await accounts.snapshot([])).find((item) => item.id === profile.id)?.apiValidation).toBeUndefined();
+    const latest = accounts.captureApiValidationRevision(profile.id);
+    expect(accounts.recordApiValidation(profile.id, latest, valid)).toBe(true);
+    await accounts.logout(profile.id);
+    expect((await accounts.snapshot([])).find((item) => item.id === profile.id)).toMatchObject({ status: "signed_out" });
+    expect((await accounts.snapshot([])).find((item) => item.id === profile.id)?.apiValidation).toBeUndefined();
+    expect(readFileSync(path.join(home, "agent-accounts.json"), "utf8")).not.toMatch(/first-key|second-key|externally-replaced-key/);
+  });
+
+  it("API Profile 实时模型控制与启动使用同一限制，且不读取原生模型目录", async () => {
+    const home = tempHome();
+    const accounts = new AgentAccountManager(home, signedInRunner([]), new MemoryCredentialStore());
+    const profile = await accounts.createApi("codex", "模型固定", { baseUrl: "https://gateway.example/v1", model: "profile-model", apiKey: "key" });
+    const adapterStates: unknown[] = [];
+    const sessions = new SessionManager({
+      home, accountResolver: (id, agent) => accounts.resolve(id, agent),
+      accountCapabilitiesResolver: (id, agent) => accounts.capabilitiesFor(id, agent),
+      adapterFactory: (_agent, state) => {
+        adapterStates.push(state);
+        return Object.assign(new EnvAdapter([]), {
+          listModels: async () => { throw new Error("must not read native model catalog"); },
+          setModel: async () => { throw new Error("must not change native model"); },
+          listModes: async () => ({ modes: [{ id: "default", label: "执行" }], currentMode: "default" }),
+          setMode: async () => ({ currentMode: "default" }),
+        });
+      },
+    });
+    const session = await sessions.create({ agent: "codex", accountId: profile.id, kind: "structured", mode: "plan", cwd: home, cols: 80, rows: 24, allowShell: false });
+    expect(adapterStates).toEqual([{ model: "profile-model", mode: "plan" }]);
+    expect(sessions.list().find((info) => info.id === session.id)?.agentControls).toMatchObject({ model: false, mode: true });
+    expect(sessions.infoOf(session.id).agentControls?.model).toBe(false);
+    await expect(sessions.models(session.id)).resolves.toEqual({ models: [{ id: "profile-model", label: "profile-model", supportedEfforts: [], isDefault: true }], currentModel: "profile-model" });
+    await expect(sessions.setModel(session.id, "native-model")).rejects.toThrow(/只能使用已配置的模型/);
+    await expect(sessions.setModel(session.id, "profile-model", "high")).rejects.toThrow(/不支持单独覆盖推理强度/);
+    await expect(sessions.setModel(session.id, "profile-model")).resolves.toEqual({ currentModel: "profile-model" });
+    const chat = await accounts.createApi("codex", "Chat", { protocol: "openai_chat_completions", baseUrl: "https://gateway.example/v1", model: "chat-model", apiKey: "key" });
+    const chatSession = await sessions.create({ agent: "codex", accountId: chat.id, kind: "structured", cwd: home, cols: 80, rows: 24, allowShell: false });
+    expect(sessions.list().find((info) => info.id === chatSession.id)?.agentControls).toMatchObject({ model: false, mode: false });
+    await expect(sessions.modes(chatSession.id)).resolves.toEqual({ modes: [{ id: "default", label: "执行" }], currentMode: "default" });
+    await expect(sessions.setMode(chatSession.id, "plan")).rejects.toThrow(/不支持 Plan/);
+    await expect(sessions.setMode(chatSession.id, "default")).resolves.toEqual({ currentMode: "default" });
+    // Simulates a newly loaded/repaired account whose model cannot run tools.
+    await accounts.configureApi(chat.id, { modelCapabilities: { tools: false } });
+    await expect(sessions.models(chatSession.id)).rejects.toThrow(/不允许使用结构化/);
+    await expect(sessions.setModel(chatSession.id, "chat-model")).rejects.toThrow(/不允许使用结构化/);
+    await expect(sessions.modes(chatSession.id)).rejects.toThrow(/不允许使用结构化/);
+    await expect(sessions.setMode(chatSession.id, "default")).rejects.toThrow(/不允许使用结构化/);
+    await sessions.disposeAll();
+  });
+
   it("默认凭据存储使用账号私有文件并可在 daemon 重启后读取", async () => {
     const home = tempHome();
     const apiKey = "local-profile-api-key";

@@ -6,6 +6,71 @@ import SwiftUI
 /// This deliberately mirrors `AgentAccountSchema`; credentials are write-only and
 /// never become part of a SwiftUI model, status file, or diagnostic string.
 struct CodeAgentAccount: Codable, Sendable, Equatable, Identifiable {
+  enum APIProtocol: String, Codable, Sendable, CaseIterable {
+    case responses = "openai_responses"
+    case chat = "openai_chat_completions"
+    case anthropic
+
+    var label: String {
+      switch self {
+      case .responses: "OpenAI Responses"
+      case .chat: "OpenAI Chat Completions"
+      case .anthropic: "Anthropic Messages"
+      }
+    }
+    var engine: String {
+      switch self { case .responses: "Codex"; case .chat: "OpenCode"; case .anthropic: "Claude" }
+    }
+    var provider: String { self == .anthropic ? "anthropic_compatible" : "openai_compatible" }
+  }
+
+  struct Capabilities: Codable, Sendable, Equatable {
+    let sessionKinds: [String]
+    let plan: Bool
+    let resume: Bool
+    let modelSelection: Bool
+    let reasoningEffort: Bool
+  }
+
+  struct ModelCapabilities: Codable, Sendable, Equatable {
+    var contextWindow: Int?
+    var maxOutputTokens: Int?
+    var tools: Bool?
+    var vision: Bool?
+    var reasoning: Bool?
+
+    var body: [String: Any] {
+      var value: [String: Any] = [:]
+      if let contextWindow { value["contextWindow"] = contextWindow }
+      if let maxOutputTokens { value["maxOutputTokens"] = maxOutputTokens }
+      if let tools { value["tools"] = tools }
+      if let vision { value["vision"] = vision }
+      if let reasoning { value["reasoning"] = reasoning }
+      return value
+    }
+  }
+
+  struct APIValidation: Codable, Sendable, Equatable {
+    struct Checks: Codable, Sendable, Equatable {
+      let runtime: String
+      let streaming: String
+      let tools: String
+    }
+    let status: String
+    let checkedAt: Double
+    let engine: String
+    let checks: Checks
+    let detail: String
+    let latencyMs: Double?
+
+    var summary: String {
+      func label(_ value: String) -> String {
+        value == "passed" ? "通过" : value == "failed" ? "失败" : "未测试"
+      }
+      return "CLI \(label(checks.runtime)) · 流式响应 \(label(checks.streaming)) · 工具回传 \(label(checks.tools))"
+    }
+  }
+
   enum Agent: String, Codable, Sendable, CaseIterable {
     case claude
     case codex
@@ -40,11 +105,18 @@ struct CodeAgentAccount: Codable, Sendable, Equatable, Identifiable {
 
   struct APIProfile: Codable, Sendable, Equatable {
     let provider: String
+    let apiProtocol: APIProtocol?
     let baseUrl: String
     let model: String
+    let modelCapabilities: ModelCapabilities?
+
+    enum CodingKeys: String, CodingKey {
+      case provider, baseUrl, model, modelCapabilities
+      case apiProtocol = "protocol"
+    }
 
     var providerLabel: String {
-      provider == "openai_compatible" ? "OpenAI 兼容 API" : "Anthropic 兼容 API"
+      apiProtocol?.label ?? (provider == "openai_compatible" ? "OpenAI Responses" : "Anthropic Messages")
     }
   }
 
@@ -55,14 +127,31 @@ struct CodeAgentAccount: Codable, Sendable, Equatable, Identifiable {
   let isDefault: Bool
   let status: Status
   let apiProfile: APIProfile?
+  let apiProfileError: String?
+  let apiValidation: APIValidation?
+  let engine: String?
+  let capabilities: Capabilities?
   let authMethod: String?
   let detail: String?
   let createdAt: Int
   let updatedAt: Int
   let activeSessions: Int
 
+  var isAPI: Bool { apiProfile != nil || apiProfileError != nil }
+  var statusLabel: String {
+    if apiProfileError != nil { return "配置无效" }
+    guard isAPI && status == .signedIn else { return status.label }
+    guard let apiValidation else { return "已配置 · 未验证" }
+    return apiValidation.status == "passed" ? "API 验证通过" : "API 验证失败"
+  }
+  var statusColor: Color {
+    if apiProfileError != nil || apiValidation?.status == "failed" { return .red }
+    if isAPI && status == .signedIn && apiValidation == nil { return .secondary }
+    return status.color
+  }
+
   var environmentLabel: String {
-    if apiProfile != nil { return "Prospero API Profile" }
+    if isAPI { return "Prospero API Profile · \(engine ?? apiProfile?.apiProtocol?.engine ?? agent.title)" }
     return managed ? "Prospero 独立环境" : "现有本机环境（兼容旧会话）"
   }
 }
@@ -82,8 +171,9 @@ struct AgentAccountControlResponse: Codable, Sendable, Equatable {
 enum AgentAccountOperation: Sendable, Equatable {
   case list
   case create(agent: CodeAgentAccount.Agent, name: String)
-  case createAPI(agent: CodeAgentAccount.Agent, name: String, baseURL: String, model: String, apiKey: String)
-  case configureAPI(accountID: String, baseURL: String, model: String, apiKey: String)
+  case createAPI(agent: CodeAgentAccount.Agent, name: String, baseURL: String, model: String, apiKey: String, apiProtocol: CodeAgentAccount.APIProtocol? = nil, modelCapabilities: CodeAgentAccount.ModelCapabilities? = nil)
+  case configureAPI(accountID: String, baseURL: String, model: String, apiKey: String, apiProtocol: CodeAgentAccount.APIProtocol? = nil, modelCapabilities: CodeAgentAccount.ModelCapabilities? = nil)
+  case testAPI(accountID: String)
   case rename(accountID: String, name: String)
   case setDefault(accountID: String)
   case login(accountID: String, cols: Int = 120, rows: Int = 40)
@@ -99,34 +189,42 @@ enum AgentAccountOperation: Sendable, Equatable {
   var body: [String: Any] {
     switch self {
     case .list:
-      ["type": "agent.accounts.list"]
+      return ["type": "agent.accounts.list"]
     case let .create(agent, name):
-      ["type": "agent.account.create", "agent": agent.rawValue, "name": name]
-    case let .createAPI(agent, name, baseURL, model, apiKey):
-      [
+      return ["type": "agent.account.create", "agent": agent.rawValue, "name": name]
+    case let .createAPI(agent, name, baseURL, model, apiKey, apiProtocol, modelCapabilities):
+      var value: [String: Any] = [
         "type": "agent.account.api.create", "agent": agent.rawValue, "name": name,
         "baseUrl": baseURL, "model": model, "apiKey": apiKey,
       ]
-    case let .configureAPI(accountID, baseURL, model, apiKey):
-      [
+      if let apiProtocol { value["protocol"] = apiProtocol.rawValue; value["provider"] = apiProtocol.provider }
+      if let modelCapabilities { value["modelCapabilities"] = modelCapabilities.body }
+      return value
+    case let .configureAPI(accountID, baseURL, model, apiKey, apiProtocol, modelCapabilities):
+      var value: [String: Any] = [
         "type": "agent.account.api.configure", "accountId": accountID,
         "baseUrl": baseURL, "model": model, "apiKey": apiKey,
       ]
+      if let apiProtocol { value["protocol"] = apiProtocol.rawValue; value["provider"] = apiProtocol.provider }
+      if let modelCapabilities { value["modelCapabilities"] = modelCapabilities.body }
+      return value
+    case let .testAPI(accountID):
+      return ["type": "agent.account.api.test", "accountId": accountID]
     case let .rename(accountID, name):
-      ["type": "agent.account.rename", "accountId": accountID, "name": name]
+      return ["type": "agent.account.rename", "accountId": accountID, "name": name]
     case let .setDefault(accountID):
-      ["type": "agent.account.default", "accountId": accountID]
+      return ["type": "agent.account.default", "accountId": accountID]
     case let .login(accountID, cols, rows):
-      ["type": "agent.account.login", "accountId": accountID, "cols": cols, "rows": rows]
+      return ["type": "agent.account.login", "accountId": accountID, "cols": cols, "rows": rows]
     case let .setCredential(accountID, kind, credential):
-      [
+      return [
         "type": "agent.account.credential.set", "accountId": accountID,
         "credentialKind": kind.rawValue, "credential": credential,
       ]
     case let .logout(accountID):
-      ["type": "agent.account.logout", "accountId": accountID]
+      return ["type": "agent.account.logout", "accountId": accountID]
     case let .delete(accountID):
-      ["type": "agent.account.delete", "accountId": accountID]
+      return ["type": "agent.account.delete", "accountId": accountID]
     }
   }
 }
@@ -184,17 +282,75 @@ struct AgentAccountEditorState: Equatable, Identifiable {
   var baseURL: String = ""
   var model: String = ""
   var secret: String = ""
+  var apiProtocol: CodeAgentAccount.APIProtocol = .responses
+  var contextWindow: String = ""
+  var maxOutputTokens: String = ""
+  var modelCapabilities = CodeAgentAccount.ModelCapabilities()
+  let supportsProtocols: Bool
+  let supportsValidation: Bool
 
-  init(mode: Mode) {
+  init(mode: Mode, supportsProtocols: Bool = false, supportsValidation: Bool = false) {
     self.mode = mode
+    self.supportsProtocols = supportsProtocols
+    self.supportsValidation = supportsValidation
     switch mode {
     case let .rename(account): name = account.name
+    case let .createAPI(agent):
+      apiProtocol = agent == .claude ? .anthropic : .responses
+      baseURL = agent == .claude ? "https://api.anthropic.com" : "https://api.openai.com/v1"
     case let .configureAPI(account):
       name = account.name
       baseURL = account.apiProfile?.baseUrl ?? ""
       model = account.apiProfile?.model ?? ""
+      apiProtocol = account.apiProfile?.apiProtocol ?? (account.agent == .claude ? .anthropic : .responses)
+      modelCapabilities = account.apiProfile?.modelCapabilities ?? .init()
+      contextWindow = modelCapabilities.contextWindow.map(String.init) ?? ""
+      maxOutputTokens = modelCapabilities.maxOutputTokens.map(String.init) ?? ""
     default: break
     }
+  }
+
+  var availableProtocols: [CodeAgentAccount.APIProtocol] {
+    let agent: CodeAgentAccount.Agent
+    switch mode {
+    case let .createAPI(value): agent = value
+    case let .configureAPI(account): agent = account.agent
+    default: return []
+    }
+    if !supportsProtocols { return [agent == .claude ? .anthropic : .responses] }
+    return agent == .claude ? [.anthropic] : [.responses, .chat]
+  }
+
+  var keepsCredential: Bool {
+    if case .configureAPI = mode { return supportsProtocols && secret.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    return false
+  }
+
+  var configuredModelCapabilities: CodeAgentAccount.ModelCapabilities? {
+    guard supportsValidation else { return nil }
+    var result = modelCapabilities
+    result.contextWindow = Int(contextWindow.trimmingCharacters(in: .whitespacesAndNewlines))
+    result.maxOutputTokens = Int(maxOutputTokens.trimmingCharacters(in: .whitespacesAndNewlines))
+    return result
+  }
+
+  var apiValidationError: String? {
+    if let error = AgentAccountInputValidator.apiProfile(baseURL: baseURL, model: model) { return error }
+    for raw in supportsValidation ? [contextWindow, maxOutputTokens] : [] {
+      let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !value.isEmpty && (Int(value) == nil || Int(value)! <= 0 || Int(value)! > 100_000_000) {
+        return "Token 限制应为 1–100000000 的整数，未知可留空"
+      }
+    }
+    if supportsValidation && apiProtocol == .chat &&
+      (configuredModelCapabilities?.contextWindow == nil) != (configuredModelCapabilities?.maxOutputTokens == nil) {
+      return "Chat Completions 的上下文窗口和最大输出需要一起填写，或都留空"
+    }
+    if let context = configuredModelCapabilities?.contextWindow,
+       let output = configuredModelCapabilities?.maxOutputTokens, output > context {
+      return "最大输出不能超过上下文窗口"
+    }
+    return keepsCredential ? nil : AgentAccountInputValidator.credential(secret, apiKey: true)
   }
 
   var title: String {
@@ -444,7 +600,7 @@ struct AgentAccountsDashboard: View {
           editor = AgentAccountEditorState(mode: .create(agent))
         }
         Button("新增 API Profile") {
-          editor = AgentAccountEditorState(mode: .createAPI(agent))
+          editor = apiEditor(.createAPI(agent))
         }
       }
       if accounts.isEmpty {
@@ -471,8 +627,8 @@ struct AgentAccountsDashboard: View {
             .background(.blue.opacity(0.16), in: Capsule())
         }
         Spacer()
-        Circle().fill(account.status.color).frame(width: 8, height: 8)
-        Text(account.status.label).font(.caption).foregroundStyle(.secondary)
+        Circle().fill(account.statusColor).frame(width: 8, height: 8)
+        Text(account.statusLabel).font(.caption).foregroundStyle(.secondary)
       }
       HStack(spacing: 5) {
         Text(account.environmentLabel)
@@ -487,11 +643,25 @@ struct AgentAccountsDashboard: View {
       if let detail = account.detail {
         Text(detail).font(.caption).foregroundStyle(.secondary)
       }
+      if let validation = account.apiValidation {
+        Text(validation.summary).font(.caption)
+        Text(validation.detail).font(.caption).foregroundStyle(.secondary)
+        Text(Date(timeIntervalSince1970: validation.checkedAt / 1000), style: .date)
+          .font(.caption).foregroundStyle(.secondary)
+      }
       Divider()
       HStack(spacing: 10) {
-        if account.apiProfile != nil {
-          Button("重新配置") { editor = AgentAccountEditorState(mode: .configureAPI(account)) }
-          Button("替换 API Key") { editor = AgentAccountEditorState(mode: .credential(account, .apiKey)) }
+        if account.isAPI {
+          Button(account.apiProfileError == nil ? "重新配置" : "修复配置") { editor = apiEditor(.configureAPI(account)) }
+            .disabled(account.activeSessions > 0)
+          if account.apiProfileError == nil {
+            Button("替换 API Key") { editor = AgentAccountEditorState(mode: .credential(account, .apiKey)) }
+              .disabled(account.activeSessions > 0)
+            if daemon.running?.capabilities.contains("agent.api-validation.v1") == true {
+              Button("测试 API 连接") { Task { _ = await model.perform(.testAPI(accountID: account.id), accountID: account.id) } }
+                .disabled(account.status != .signedIn)
+            }
+          }
         } else {
           Button(account.agent == .claude && account.managed ? "生成导入令牌" : account.status == .signedIn ? "重新登录" : "登录") {
             login(account)
@@ -529,6 +699,14 @@ struct AgentAccountsDashboard: View {
     .background(.background, in: RoundedRectangle(cornerRadius: 10))
   }
 
+  private func apiEditor(_ mode: AgentAccountEditorState.Mode) -> AgentAccountEditorState {
+    AgentAccountEditorState(
+      mode: mode,
+      supportsProtocols: daemon.running?.capabilities.contains("agent.api-protocols.v1") == true,
+      supportsValidation: daemon.running?.capabilities.contains("agent.api-validation.v1") == true
+    )
+  }
+
   private func submitEditor(_ state: AgentAccountEditorState) async -> Bool {
     let result: String?
     switch state.mode {
@@ -540,8 +718,7 @@ struct AgentAccountsDashboard: View {
       result = AgentAccountInputValidator.credential(state.secret, apiKey: kind == .apiKey)
     case .createAPI, .configureAPI:
       result = AgentAccountInputValidator.name(state.name)
-        ?? AgentAccountInputValidator.apiProfile(baseURL: state.baseURL, model: state.model)
-        ?? AgentAccountInputValidator.credential(state.secret, apiKey: true)
+        ?? state.apiValidationError
     }
     if let result { model.actionError = result; return false }
 
@@ -553,9 +730,9 @@ struct AgentAccountsDashboard: View {
     case let .credential(account, kind):
       _ = await model.perform(.setCredential(accountID: account.id, kind: kind, credential: state.secret.trimmingCharacters(in: .whitespacesAndNewlines)), accountID: "editor")
     case let .createAPI(agent):
-      _ = await model.perform(.createAPI(agent: agent, name: state.name.trimmingCharacters(in: .whitespacesAndNewlines), baseURL: state.baseURL.trimmingCharacters(in: .whitespacesAndNewlines), model: state.model.trimmingCharacters(in: .whitespacesAndNewlines), apiKey: state.secret.trimmingCharacters(in: .whitespacesAndNewlines)), accountID: "editor")
+      _ = await model.perform(.createAPI(agent: agent, name: state.name.trimmingCharacters(in: .whitespacesAndNewlines), baseURL: state.baseURL.trimmingCharacters(in: .whitespacesAndNewlines), model: state.model.trimmingCharacters(in: .whitespacesAndNewlines), apiKey: state.secret.trimmingCharacters(in: .whitespacesAndNewlines), apiProtocol: state.supportsProtocols ? state.apiProtocol : nil, modelCapabilities: state.configuredModelCapabilities), accountID: "editor")
     case let .configureAPI(account):
-      _ = await model.perform(.configureAPI(accountID: account.id, baseURL: state.baseURL.trimmingCharacters(in: .whitespacesAndNewlines), model: state.model.trimmingCharacters(in: .whitespacesAndNewlines), apiKey: state.secret.trimmingCharacters(in: .whitespacesAndNewlines)), accountID: "editor")
+      _ = await model.perform(.configureAPI(accountID: account.id, baseURL: state.baseURL.trimmingCharacters(in: .whitespacesAndNewlines), model: state.model.trimmingCharacters(in: .whitespacesAndNewlines), apiKey: state.secret.trimmingCharacters(in: .whitespacesAndNewlines), apiProtocol: state.supportsProtocols ? state.apiProtocol : nil, modelCapabilities: state.configuredModelCapabilities), accountID: "editor")
     }
     return model.actionError == nil
   }
@@ -684,10 +861,26 @@ private struct AgentAccountEditorSheet: View {
 
   private var apiFields: some View {
     Group {
+      if state.supportsProtocols {
+        Picker("API 协议", selection: $state.apiProtocol) {
+          ForEach(state.availableProtocols, id: \.self) { item in
+            Text(item.label).tag(item)
+          }
+        }
+        Text("执行引擎：\(state.apiProtocol.engine)").font(.caption).foregroundStyle(.secondary)
+      }
       TextField("API 地址", text: $state.baseURL)
       TextField("模型", text: $state.model)
+      if state.supportsValidation {
+        DisclosureGroup("模型限制（可选）") {
+          TextField("上下文窗口（Token）", text: $state.contextWindow)
+          TextField("最大输出（Token）", text: $state.maxOutputTokens)
+          Text(state.apiProtocol == .chat ? "两项一起填写，或都留空。已保存的其他模型能力会保留。" : "未知可留空；已保存的工具、图片和推理能力设置会保留。")
+            .font(.caption).foregroundStyle(.secondary)
+        }
+      }
       SecureField("API Key", text: $state.secret)
-      Text("地址和模型可查看；API Key 仅写入账号私有安全存储，替换时必须重新输入。")
+      Text(state.supportsProtocols ? "编辑时 API Key 留空会保留现有凭据。测试连接会验证 CLI 可用性、API 流式响应和工具回传，不代表完整 Agent 执行验证。" : "API Key 仅写入账号私有存储；修改连接时需要重新输入。")
         .font(.caption).foregroundStyle(.secondary)
     }
   }
@@ -700,11 +893,9 @@ private struct AgentAccountEditorSheet: View {
       AgentAccountInputValidator.credential(state.secret, apiKey: kind == .apiKey)
     case .createAPI:
       AgentAccountInputValidator.name(state.name)
-        ?? AgentAccountInputValidator.apiProfile(baseURL: state.baseURL, model: state.model)
-        ?? AgentAccountInputValidator.credential(state.secret, apiKey: true)
+        ?? state.apiValidationError
     case .configureAPI:
-      AgentAccountInputValidator.apiProfile(baseURL: state.baseURL, model: state.model)
-        ?? AgentAccountInputValidator.credential(state.secret, apiKey: true)
+      state.apiValidationError
     }
   }
 }

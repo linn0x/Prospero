@@ -33,12 +33,45 @@ export const AgentApiProtocolSchema = z.enum([
   "anthropic",
 ]);
 
+export const AgentExecutionEngineSchema = z.enum(["codex", "claude", "opencode"]);
+export const AgentAccountCapabilitiesSchema = z.object({
+  sessionKinds: z.array(z.enum(["pty", "structured"])).max(2),
+  plan: z.boolean(),
+  resume: z.boolean(),
+  modelSelection: z.boolean(),
+  reasoningEffort: z.boolean(),
+});
+export const AgentModelCapabilitiesSchema = z.object({
+  contextWindow: z.number().int().positive().max(100_000_000).optional(),
+  maxOutputTokens: z.number().int().positive().max(100_000_000).optional(),
+  tools: z.boolean().optional(),
+  vision: z.boolean().optional(),
+  reasoning: z.boolean().optional(),
+}).refine((value) => value.contextWindow === undefined || value.maxOutputTokens === undefined ||
+  value.maxOutputTokens <= value.contextWindow, { message: "maxOutputTokens must not exceed contextWindow" });
+const AgentApiValidationCheckSchema = z.enum(["passed", "failed", "not_tested"]);
+export const AgentApiValidationSchema = z.object({
+  status: z.enum(["passed", "failed"]),
+  checkedAt: z.number().int().nonnegative(),
+  engine: AgentExecutionEngineSchema,
+  checks: z.object({
+    runtime: AgentApiValidationCheckSchema,
+    streaming: AgentApiValidationCheckSchema,
+    tools: AgentApiValidationCheckSchema,
+  }),
+  code: z.string().min(1).max(100).optional(),
+  detail: z.string().max(1000),
+  latencyMs: z.number().nonnegative().optional(),
+}).refine((value) => value.status !== "passed" || Object.values(value.checks).every((check) => check === "passed"),
+  { message: "passed validation requires all checks to pass" });
+
 /** 只同步可展示的连接元数据；API Key 永远不进入协议快照。 */
 export const AgentApiProfileSchema = z.object({
   provider: AgentApiProviderSchema,
   protocol: AgentApiProtocolSchema.optional(),
   baseUrl: z.string().url().max(2000),
   model: z.string().min(1).max(300),
+  modelCapabilities: AgentModelCapabilitiesSchema.optional(),
 });
 
 export const AgentAccountStatusSchema = z.enum([
@@ -61,6 +94,11 @@ export const AgentAccountSchema = z.object({
   status: AgentAccountStatusSchema,
   /** 已配置的第三方 API；缺省表示官方 CLI 账号环境。 */
   apiProfile: AgentApiProfileSchema.optional(),
+  /** Invalid persisted profiles remain visible and repairable without exposing malformed data. */
+  apiProfileError: z.string().max(1000).optional(),
+  engine: AgentExecutionEngineSchema.optional(),
+  capabilities: AgentAccountCapabilitiesSchema.optional(),
+  apiValidation: AgentApiValidationSchema.optional(),
   authMethod: z.string().max(200).optional(),
   detail: z.string().max(1000).optional(),
   createdAt: z.number().int().nonnegative(),
@@ -377,6 +415,7 @@ export const C2SAgentAccountApiCreateSchema = z.object({
   baseUrl: z.string().trim().url().max(2000),
   model: z.string().trim().min(1).max(300),
   apiKey: z.string().trim().min(1).max(8192),
+  modelCapabilities: AgentModelCapabilitiesSchema.optional(),
 });
 
 /** 更新 API Profile 的连接地址、模型与凭据；不会读取或回传既有 key。 */
@@ -390,6 +429,13 @@ export const C2SAgentAccountApiConfigureSchema = z.object({
   baseUrl: z.string().trim().url().max(2000).optional(),
   model: z.string().trim().min(1).max(300).optional(),
   apiKey: z.string().max(8192).optional(),
+  modelCapabilities: AgentModelCapabilitiesSchema.nullable().optional(),
+});
+
+export const C2SAgentAccountApiTestSchema = z.object({
+  type: z.literal("agent.account.api.test"),
+  requestId: z.string().min(1).max(100),
+  accountId: z.string().min(1).max(100),
 });
 
 export const C2SAgentAccountRenameSchema = z.object({
@@ -1074,6 +1120,7 @@ export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SAgentAccountCreateSchema,
   C2SAgentAccountApiCreateSchema,
   C2SAgentAccountApiConfigureSchema,
+  C2SAgentAccountApiTestSchema,
   C2SAgentAccountRenameSchema,
   C2SAgentAccountSetDefaultSchema,
   C2SAgentAccountLoginSchema,
@@ -1557,6 +1604,7 @@ export const S2CAgentAccountsResultSchema = z.object({
     "create",
     "api_create",
     "api_configure",
+    "api_test",
     "rename",
     "default",
     "login",
@@ -1567,6 +1615,7 @@ export const S2CAgentAccountsResultSchema = z.object({
   ok: z.boolean(),
   accounts: z.array(AgentAccountSchema).max(100),
   accountId: z.string().min(1).max(100).optional(),
+  validation: AgentApiValidationSchema.optional(),
   /** login 会新建官方 CLI 的交互终端，客户端可直接打开。 */
   sessionId: sid.optional(),
   error: z.string().max(2000).optional(),
@@ -1790,6 +1839,10 @@ export type AgentCredentialKind = z.infer<typeof AgentCredentialKindSchema>;
 export type AgentApiProvider = z.infer<typeof AgentApiProviderSchema>;
 export type AgentApiProtocol = z.infer<typeof AgentApiProtocolSchema>;
 export type AgentApiProfile = z.infer<typeof AgentApiProfileSchema>;
+export type AgentExecutionEngine = z.infer<typeof AgentExecutionEngineSchema>;
+export type AgentAccountCapabilities = z.infer<typeof AgentAccountCapabilitiesSchema>;
+export type AgentModelCapabilities = z.infer<typeof AgentModelCapabilitiesSchema>;
+export type AgentApiValidation = z.infer<typeof AgentApiValidationSchema>;
 export type AgentAccountStatus = z.infer<typeof AgentAccountStatusSchema>;
 export type AgentAccount = z.infer<typeof AgentAccountSchema>;
 export type SessionKind = z.infer<typeof SessionKindSchema>;
@@ -1834,6 +1887,7 @@ export type C2SAgentAccountsList = z.infer<typeof C2SAgentAccountsListSchema>;
 export type C2SAgentAccountCreate = z.infer<typeof C2SAgentAccountCreateSchema>;
 export type C2SAgentAccountApiCreate = z.infer<typeof C2SAgentAccountApiCreateSchema>;
 export type C2SAgentAccountApiConfigure = z.infer<typeof C2SAgentAccountApiConfigureSchema>;
+export type C2SAgentAccountApiTest = z.infer<typeof C2SAgentAccountApiTestSchema>;
 export type C2SAgentAccountRename = z.infer<typeof C2SAgentAccountRenameSchema>;
 export type C2SAgentAccountSetDefault = z.infer<typeof C2SAgentAccountSetDefaultSchema>;
 export type C2SAgentAccountLogin = z.infer<typeof C2SAgentAccountLoginSchema>;

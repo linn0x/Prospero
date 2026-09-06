@@ -34,7 +34,7 @@ import { Sheet, SheetAction } from "@/components/Sheet";
 import { SwipeRow, type SwipeAction } from "@/components/SwipeRow";
 import { WorkspacePicker } from "@/components/WorkspacePicker";
 import { useAdaptiveLayout } from "@/lib/adaptive-layout";
-import { accountApiProfileRequiresStructured } from "@/lib/account-api-profile";
+import { getAgentAccountCapabilities, getAgentAccountEngine } from "@prospero/protocol";
 import {
   getSessionPreferences,
   setProjectCollapsed,
@@ -222,14 +222,19 @@ export default function HostScreen() {
       matchingAccounts.find((account) => account.isDefault) ??
       matchingAccounts[0]
     : undefined;
-  const selectedAccountUsesChat = selectedAccount?.apiProfile !== undefined &&
-    accountApiProfileRequiresStructured(selectedAccount.agent, selectedAccount.apiProfile.protocol);
-  const effectiveSessionKind: SessionKind = selectedAccountUsesChat ? "structured" : sessionKind;
+  const selectedAccountCapabilities = selectedAccount ? getAgentAccountCapabilities(selectedAccount) : undefined;
+  const accountRequiresStructured = selectedAccountCapabilities?.sessionKinds.length === 1 && selectedAccountCapabilities.sessionKinds[0] === "structured";
+  const effectiveSessionKind: SessionKind = accountRequiresStructured ? "structured" : sessionKind;
+  const accountCanPlan = selectedAccountCapabilities?.plan ?? true;
+  const accountCanResume = selectedAccountCapabilities?.resume ?? true;
+  const accountCanSelectModel = selectedAccountCapabilities?.modelSelection ?? true;
+  const accountCanSelectEffort = selectedAccountCapabilities?.reasoningEffort ?? true;
+  const accountCanLaunch = selectedAccountCapabilities?.sessionKinds.includes(effectiveSessionKind) ?? true;
   const canSearchResume =
     composing &&
     launchIntent === "conversation" &&
     effectiveSessionKind === "structured" &&
-    !selectedAccountUsesChat &&
+    accountCanResume &&
     RESUMABLE.includes(agent) &&
     runtime.status === "connected" &&
     conn !== null;
@@ -240,7 +245,7 @@ export default function HostScreen() {
   useEffect(() => {
     const reset = setTimeout(() => setSelectedResume(null), 0);
     return () => clearTimeout(reset);
-  }, [selectedAccount?.id, selectedAccountUsesChat]);
+  }, [selectedAccount?.id, accountRequiresStructured]);
 
   // 账号目录属于电脑端；每次回到主机页重读，确保账号管理页的新增/默认/删除立即生效。
   useFocusEffect(
@@ -283,6 +288,7 @@ export default function HostScreen() {
       effectiveSessionKind !== "structured" ||
       launchCatalogAgent === null ||
       !conn?.supportsSessionCreateModel ||
+      !accountCanSelectModel ||
       runtime.status !== "connected"
     ) {
       const reset = setTimeout(() => {
@@ -357,6 +363,7 @@ export default function HostScreen() {
     runtime.status,
     selectedAccount?.id,
     selectedAccount?.updatedAt,
+    accountCanSelectModel,
     effectiveSessionKind,
   ]);
 
@@ -598,14 +605,15 @@ export default function HostScreen() {
       ? "正在创建…"
       : launchIntent === "goal"
         ? "启动 Goal 协调者"
-        : effectiveSessionKind === "structured" && !selectedAccountUsesChat && selectedResume
+        : effectiveSessionKind === "structured" && accountCanResume && selectedResume
           ? "恢复并打开对话"
-          : effectiveSessionKind === "structured" && !selectedAccountUsesChat && launchMode === "plan"
+          : effectiveSessionKind === "structured" && accountCanPlan && launchMode === "plan"
             ? "新建 Plan 会话"
             : "新建会话";
 
   const submitCreate = (): void => {
     if (!conn || runtime.status !== "connected" || pendingCreateRef.current) return;
+    if (!accountCanLaunch) { setBanner(selectedAccount?.apiProfileError ?? "当前账号不支持此会话，请检查配置和模型工具能力。"); return; }
     const projectPath = cwd.trim();
     if (projectPath.length === 0) {
       setBanner("请先选择项目目录，再新建会话。");
@@ -622,10 +630,10 @@ export default function HostScreen() {
     const modelOption =
       effectiveSessionKind === "structured" &&
       launchCatalogAgent !== null &&
-      selectedLaunchModelInfo !== undefined
+      accountCanSelectModel && selectedLaunchModelInfo !== undefined
         ? {
             model: selectedLaunchModelInfo.id,
-            ...(selectedLaunchEffort ? { effort: selectedLaunchEffort } : {}),
+            ...(accountCanSelectEffort && selectedLaunchEffort ? { effort: selectedLaunchEffort } : {}),
           }
         : {};
     const sessionOptions:
@@ -647,7 +655,7 @@ export default function HostScreen() {
               ...(agent === "deepseek" && selectedLaunchPreset ? { agentPreset: selectedLaunchPreset } : {}),
               approvalPolicy,
               goal: objective,
-            ...(PLAN_CAPABLE.includes(agent) && !selectedAccountUsesChat ? { mode: "plan" as const } : {}),
+            ...(PLAN_CAPABLE.includes(agent) && accountCanPlan ? { mode: "plan" as const } : {}),
           }
         : effectiveSessionKind === "structured" && RESUMABLE.includes(agent)
             ? {
@@ -655,8 +663,8 @@ export default function HostScreen() {
                 ...modelOption,
                 ...(agent === "deepseek" && selectedLaunchPreset ? { agentPreset: selectedLaunchPreset } : {}),
                 approvalPolicy,
-                ...(PLAN_CAPABLE.includes(agent) && !selectedAccountUsesChat ? { mode: launchMode } : {}),
-              ...(!selectedAccountUsesChat && selectedResume
+                ...(PLAN_CAPABLE.includes(agent) && accountCanPlan ? { mode: launchMode } : {}),
+              ...(accountCanResume && selectedResume
                 ? { resume: { id: selectedResume.id, title: selectedResume.title } }
                 : {}),
             }
@@ -1098,8 +1106,9 @@ export default function HostScreen() {
                 </Pressable>
               </View>
               <Text style={styles.kindHelp}>
-                配置和凭据彼此隔离；项目目录仍使用左侧所选路径。
+                {selectedAccount ? `${getAgentAccountEngine(selectedAccount)} 引擎${selectedAccount.apiProfile ? ` · Profile 模型：${selectedAccount.apiProfile.model}` : ""}` : "配置和凭据彼此隔离；项目目录仍使用左侧所选路径。"}
               </Text>
+              {!accountCanLaunch && <Text style={styles.resumeError}>{selectedAccount?.apiProfileError ?? "当前账号不支持此会话，请检查配置和模型工具能力。"}</Text>}
             </>
           )}
           {STRUCTURED.includes(agent) && (
@@ -1111,6 +1120,7 @@ export default function HostScreen() {
                 <Pressable
                   style={[styles.kindOption, effectiveSessionKind === "structured" && styles.kindOptionActive]}
                   onPress={() => setSessionKind("structured")}
+                  disabled={selectedAccountCapabilities?.sessionKinds.includes("structured") === false}
                   accessibilityRole="tab"
                   accessibilityState={{ selected: effectiveSessionKind === "structured" }}
                   accessibilityLabel="创建对话会话"
@@ -1137,9 +1147,9 @@ export default function HostScreen() {
                     setLaunchIntent("conversation");
                     setSelectedResume(null);
                   }}
-                  disabled={selectedAccountUsesChat}
+                  disabled={selectedAccountCapabilities?.sessionKinds.includes("pty") === false}
                   accessibilityRole="tab"
-                  accessibilityState={{ selected: effectiveSessionKind === "pty", disabled: selectedAccountUsesChat }}
+                  accessibilityState={{ selected: effectiveSessionKind === "pty", disabled: selectedAccountCapabilities?.sessionKinds.includes("pty") === false }}
                   accessibilityLabel="创建终端会话"
                 >
                   <Icon
@@ -1158,15 +1168,15 @@ export default function HostScreen() {
                 </Pressable>
                   </View>
                   <Text style={styles.kindHelp}>
-                    {selectedAccountUsesChat
-                      ? "Chat Completions API Profile 仅支持对话界面"
+                    {accountRequiresStructured
+                      ? "当前账号仅支持对话界面"
                       : effectiveSessionKind === "structured"
                         ? "消息、工具调用和审批以卡片展示"
                       : `启动 ${agent} TUI，可直接操作完整终端`}
                   </Text>
                 </>
               )}
-              {effectiveSessionKind === "structured" && launchCatalogAgent && conn?.supportsSessionCreateModel && (
+              {effectiveSessionKind === "structured" && launchCatalogAgent && accountCanSelectModel && conn?.supportsSessionCreateModel && (
                 <>
                   <View style={[styles.accountLabelRow, styles.kindLabel]}>
                     <Text style={styles.formLabel}>模型</Text>
@@ -1225,7 +1235,7 @@ export default function HostScreen() {
                           {selectedLaunchModelInfo.description}
                         </Text>
                       )}
-                      {(selectedLaunchModelInfo?.supportedEfforts.length ?? 0) > 0 && (
+                      {accountCanSelectEffort && (selectedLaunchModelInfo?.supportedEfforts.length ?? 0) > 0 && (
                         <>
                           <Text style={[styles.formLabel, styles.modelEffortLabel]}>推理强度</Text>
                           <View style={styles.chips} accessibilityRole="radiogroup">
@@ -1390,9 +1400,9 @@ export default function HostScreen() {
                   </Text>
                 </>
               )}
-              {effectiveSessionKind === "structured" && !selectedAccountUsesChat && launchIntent === "conversation" && RESUMABLE.includes(agent) && (
+              {effectiveSessionKind === "structured" && (accountCanPlan || accountCanResume) && launchIntent === "conversation" && RESUMABLE.includes(agent) && (
                 <>
-                  {PLAN_CAPABLE.includes(agent) && !selectedAccountUsesChat && (
+                  {PLAN_CAPABLE.includes(agent) && accountCanPlan && (
                     <>
                       <Text style={[styles.formLabel, styles.kindLabel]}>启动模式</Text>
                       <View style={styles.kindSwitch} accessibilityRole="tablist">
@@ -1443,6 +1453,7 @@ export default function HostScreen() {
                     </>
                   )}
 
+                  {accountCanResume && <>
                   <Text style={[styles.formLabel, styles.kindLabel]}>接回本机对话</Text>
                   <View style={styles.resumeSearch}>
                     <Icon name="magnifyingglass" size={14} color={color.textDim} />
@@ -1520,6 +1531,7 @@ export default function HostScreen() {
                       })}
                     </ScrollView>
                   )}
+                  </>}
                 </>
               )}
               {effectiveSessionKind === "structured" && launchIntent === "goal" && (
@@ -1539,7 +1551,7 @@ export default function HostScreen() {
                     accessibilityLabel="Goal 目标"
                   />
                   <Text style={styles.kindHelp}>
-                    {selectedAccountUsesChat
+                    {accountRequiresStructured
                       ? "Goal 会创建新的 OpenCode 协调者会话，不能接回已有原生对话。"
                       : "Goal 会创建新的协调者会话，不能接回已有原生对话；Claude 和 Codex 会从 Plan 开始。"}
                   </Text>

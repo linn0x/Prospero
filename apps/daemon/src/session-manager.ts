@@ -9,9 +9,11 @@ import type {
   Attachment,
   AgentEventBody,
   AgentKind,
+  AgentAccountCapabilities,
   SessionInfo,
   SessionKind,
 } from "@prospero/protocol";
+import { getAgentAccountCapabilities } from "@prospero/protocol";
 import {
   commandFor,
   defaultKindFor,
@@ -63,6 +65,9 @@ import type {
   AdapterResumeState,
   AgentAdapter,
   AgentModelCatalog,
+  AgentModelSelection,
+  AgentModeCatalog,
+  AgentModeSelection,
 } from "./adapters/types.js";
 import type { AccountBinding, AccountLoginSpec } from "./agent-accounts.js";
 import {
@@ -306,6 +311,8 @@ export interface SessionManagerOptions {
   sessionEnv?: ((sessionId: string) => Record<string, string>) | undefined;
   /** 账号目录由 daemon 的元数据层解析；SessionManager 只负责注入会话。 */
   accountResolver?: ((accountId: string, agent: "claude" | "codex") => AccountBinding) | undefined;
+  /** Metadata-only account lookup for state projection; does not touch keys or runtime config. */
+  accountCapabilitiesResolver?: ((accountId: string, agent: "claude" | "codex") => AgentAccountCapabilities) | undefined;
   /**
    * Production Unix defaults to detached per-session supervisors when a home
    * exists. Tests that inject adapters and unsupported platforms stay safely
@@ -352,6 +359,8 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   private readonly accountResolver:
     | ((accountId: string, agent: "claude" | "codex") => AccountBinding)
     | undefined;
+  private readonly accountCapabilitiesResolver: SessionManagerOptions["accountCapabilitiesResolver"];
+  private readonly resolvedAccountCapabilities = new Map<string, AgentAccountCapabilities>();
   private readonly structuredSupervisorRoot: string | null;
   /** Native secure-state directories must be direct children of an existing root. */
   private readonly windowsStructuredRoot: string | null;
@@ -395,6 +404,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     this.adapterFactory = opts.adapterFactory ?? makeAdapter;
     this.sessionEnv = opts.sessionEnv ?? (() => ({}));
     this.accountResolver = opts.accountResolver;
+    this.accountCapabilitiesResolver = opts.accountCapabilitiesResolver;
     this.supervisorLauncher = opts.supervisorLauncher ?? launchStructuredSupervisor;
     this.windowsStructuredLauncher = opts.windowsStructuredLauncher ?? launchWindowsStructuredSession;
     this.supervisorRunnerPath = opts.supervisorRunnerPath;
@@ -484,7 +494,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
         this.ptySessions.set(session.id, session);
         if (session.hosting === "windows-session-host") this.windowsPtySessionHostDurable = true;
         restored.push(session.info());
-        this.emit("state", session.info());
+        this.emit("state", this.sessionInfoWithCapabilities(session.info()));
       }
       return restored;
     }
@@ -500,7 +510,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       this.wirePtySession(session);
       this.ptySessions.set(session.id, session);
       restored.push(session.info());
-      this.emit("state", session.info());
+      this.emit("state", this.sessionInfoWithCapabilities(session.info()));
     }
     for (const sid of [...this.deletedSessionIds]) {
       if (this.canForgetDeletedSession(sid)) this.forgetDeletedSession(sid);
@@ -768,7 +778,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
           this.wireStructuredSession(session);
           this.structuredSessions.set(session.id, session);
           restored.push(session.info());
-          this.emit("state", session.info());
+          this.emit("state", this.sessionInfoWithCapabilities(session.info()));
         }
       } catch {
         // No native N-API host means legacy in-process sessions remain
@@ -785,7 +795,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
         this.wireStructuredSession(session);
         this.structuredSessions.set(session.id, session);
         restored.push(session.info());
-        this.emit("state", session.info());
+        this.emit("state", this.sessionInfoWithCapabilities(session.info()));
       }
     }
     for (const loaded of this.loadStructuredStates()) {
@@ -796,12 +806,23 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
         ? { ...loaded, terminal: true as const }
         : loaded;
       if (this.structuredSessions.has(state.id)) continue;
-      const session = this.makeStructuredSession(state.id, state.agent, state.cwd, state.title, state);
+      let session: StructuredSession;
+      try {
+        session = this.makeStructuredSession(state.id, state.agent, state.cwd, state.title, state);
+      } catch (error) {
+        // A broken/deleted profile must preserve history without launching a fallback native account.
+        session = this.makeStructuredSession(state.id, state.agent, state.cwd, state.title, { ...state, terminal: true });
+        this.structuredSessions.set(state.id, session);
+        await session.markRestoreFailed(error instanceof Error ? error.message : String(error));
+        restored.push(session.info());
+        this.emit("state", this.sessionInfoWithCapabilities(session.info()));
+        continue;
+      }
       this.structuredSessions.set(state.id, session);
       if (state.terminal) {
         // 已交付 worker 只保留本地审计历史，不能在重启后接回 native thread。
         restored.push(session.info());
-        this.emit("state", session.info());
+        this.emit("state", this.sessionInfoWithCapabilities(session.info()));
         continue;
       }
       try {
@@ -818,7 +839,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
         await session.markRestoreFailed(e instanceof Error ? e.message : String(e));
       }
       restored.push(session.info());
-      this.emit("state", session.info());
+      this.emit("state", this.sessionInfoWithCapabilities(session.info()));
     }
     await this.persistStructuredNow();
     for (const sid of [...this.deletedSessionIds]) {
@@ -850,19 +871,23 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     const account = input.accountId
       ? this.resolveAccount(input.agent, input.accountId)
       : undefined;
-    if (kind === "pty" && account?.adapterAgent) {
-      throw new SessionError("OpenAI Chat Completions Profile 仅支持结构化会话", "agent_unavailable");
+    const capabilities = account ? getAgentAccountCapabilities(account) : undefined;
+    if (account?.apiProfile?.modelCapabilities?.tools === false) {
+      throw new SessionError("该模型已配置为不支持工具调用，无法启动 Code Agent；请修复模型能力配置", "agent_unavailable");
     }
-    if (input.resume && account?.adapterAgent) {
-      throw new SessionError("OpenAI Chat Completions Profile 暂不支持接回 Codex 原生对话", "agent_unavailable");
+    if (capabilities && !capabilities.sessionKinds.includes(kind)) {
+      throw new SessionError("这个账号仅支持其声明的会话类型（OpenCode Profile 仅支持结构化会话）", "agent_unavailable");
     }
-    if (input.mode === "plan" && account?.adapterAgent) {
-      throw new SessionError("OpenAI Chat Completions Profile 暂不支持 Plan 模式", "agent_unavailable");
+    if (input.resume && capabilities && !capabilities.resume) {
+      throw new SessionError("这个账号暂不支持接回原生对话", "agent_unavailable");
     }
-    if (account?.apiProfile && input.model && input.model !== account.apiProfile.model) {
+    if (input.mode === "plan" && capabilities && !capabilities.plan) {
+      throw new SessionError("这个账号暂不支持 Plan 模式", "agent_unavailable");
+    }
+    if (capabilities && !capabilities.modelSelection && input.model && input.model !== account?.apiProfile?.model) {
       throw new SessionError("API Profile 只能使用已配置的模型", "agent_unavailable");
     }
-    if (account?.apiProfile && input.effort) {
+    if (capabilities && !capabilities.reasoningEffort && input.effort) {
       throw new SessionError("API Profile 不支持单独覆盖推理强度", "agent_unavailable");
     }
     if (kind === "structured" && !structuredCapable(input.agent)) {
@@ -1045,13 +1070,13 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     }
     this.ptySessions.set(id, session);
     this.wirePtySession(session);
-    this.emit("state", session.info());
+    this.emit("state", this.sessionInfoWithCapabilities(session.info()));
     return session.info();
   }
 
   private wirePtySession(session: PtySession | RemotePtySession | RemoteWindowsPtySession): void {
     session.on("output", (dataB64: string, seq: number) => this.emit("output", session.id, dataB64, seq));
-    session.on("state", (info: SessionInfo) => this.emit("state", info));
+    session.on("state", (info: SessionInfo) => this.emit("state", this.sessionInfoWithCapabilities(info)));
   }
 
   private async createStructured(
@@ -1066,9 +1091,10 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     account?: AccountBinding,
   ): Promise<SessionInfo> {
     const id = randomUUID();
+    const configuredModel = account?.apiProfile?.model ?? model;
     const initialAdapterState: AdapterResumeState = {
       ...(mode ? { mode } : {}),
-      ...(model ? { model } : {}),
+      ...(configuredModel ? { model: configuredModel } : {}),
       ...(effort ? { effort } : {}),
       ...(agentPreset && agent === "deepseek" ? { agentPreset } : {}),
       ...(resume && agent === "deepseek" ? { sessionId: resume.id } : {}),
@@ -1094,7 +1120,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
         });
         this.wireStructuredSession(session);
         this.structuredSessions.set(id, session);
-        this.emit("state", session.info());
+        this.emit("state", this.sessionInfoWithCapabilities(session.info()));
         return session.info();
       } catch (error) {
         if (isConversationActiveWriterError(error)) {
@@ -1134,7 +1160,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
         });
         this.wireStructuredSession(session);
         this.structuredSessions.set(id, session);
-        this.emit("state", session.info());
+        this.emit("state", this.sessionInfoWithCapabilities(session.info()));
         return session.info();
       } catch (e) {
         if (isConversationActiveWriterError(e)) {
@@ -1180,7 +1206,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       );
     }
     this.scheduleStructuredPersist();
-    this.emit("state", session.info());
+    this.emit("state", this.sessionInfoWithCapabilities(session.info()));
     return session.info();
   }
 
@@ -1244,6 +1270,16 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
         if (!restored.terminal) throw error;
       }
     }
+    if (account && !restored?.terminal && !getAgentAccountCapabilities(account).sessionKinds.includes("structured")) {
+      throw new SessionError("账号能力配置不允许启动结构化 Code Agent 会话", "agent_unavailable");
+    }
+    if (account?.apiProfile && !restored?.terminal) {
+      // Persisted native controls must never override this profile's configured model or effort.
+      const { effort: _effort, ...state } = restored?.adapterState ?? initialAdapterState ?? {};
+      const configuredState = { ...state, model: account.apiProfile.model };
+      if (restored) restored = { ...restored, adapterState: configuredState };
+      else initialAdapterState = configuredState;
+    }
     const session = new StructuredSession({
       id,
       agent,
@@ -1268,7 +1304,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       this.scheduleStructuredPersist();
     });
     session.on("state", (info: SessionInfo) => {
-      this.emit("state", info);
+      this.emit("state", this.sessionInfoWithCapabilities(info));
       this.scheduleStructuredPersist();
     });
     if (session instanceof StructuredSession) {
@@ -1317,7 +1353,9 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     if (!this.accountResolver) {
       throw new SessionError("daemon 尚未启用账号管理", "agent_unavailable");
     }
-    return this.accountResolver(accountId, agent);
+    const binding = this.accountResolver(accountId, agent);
+    this.resolvedAccountCapabilities.set(accountId, getAgentAccountCapabilities(binding));
+    return binding;
   }
 
   getPty(sid: string): PtySession | RemotePtySession | RemoteWindowsPtySession | undefined {
@@ -1367,10 +1405,87 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     return s;
   }
 
+  private accountForControls(sid: string): AccountBinding | undefined {
+    const info = this.requireStructured(sid).info();
+    if (info.status === "done" || info.status === "died") {
+      throw new SessionError("会话后端不可用，无法修改或读取 Agent 控制项", "agent_unavailable");
+    }
+    const account = info.accountId ? this.resolveAccount(info.agent, info.accountId) : undefined;
+    if (account && !getAgentAccountCapabilities(account).sessionKinds.includes("structured")) {
+      throw new SessionError("账号能力配置不允许使用结构化 Code Agent", "agent_unavailable");
+    }
+    return account;
+  }
+
+  async models(sid: string): Promise<AgentModelCatalog> {
+    const account = this.accountForControls(sid);
+    if (account?.apiProfile) {
+      const model = account.apiProfile.model;
+      return { models: [{ id: model, label: model, supportedEfforts: [], isDefault: true }], currentModel: model };
+    }
+    if (account && !getAgentAccountCapabilities(account).modelSelection) {
+      throw new SessionError("这个账号不支持模型选择", "agent_unavailable");
+    }
+    return this.requireStructured(sid).models();
+  }
+
+  async setModel(sid: string, model: string, effort?: string): Promise<AgentModelSelection> {
+    const account = this.accountForControls(sid);
+    const capabilities = account ? getAgentAccountCapabilities(account) : undefined;
+    if (effort && capabilities && !capabilities.reasoningEffort) {
+      throw new SessionError("API Profile 不支持单独覆盖推理强度", "agent_unavailable");
+    }
+    if (capabilities && !capabilities.modelSelection) {
+      if (model !== account?.apiProfile?.model) {
+        throw new SessionError("API Profile 只能使用已配置的模型", "agent_unavailable");
+      }
+      return { currentModel: model };
+    }
+    return this.requireStructured(sid).setModel(model, effort);
+  }
+
+  async modes(sid: string): Promise<AgentModeCatalog> {
+    const account = this.accountForControls(sid);
+    if (account && !getAgentAccountCapabilities(account).plan) {
+      return { modes: [{ id: "default", label: "执行" }], currentMode: "default" };
+    }
+    return this.requireStructured(sid).modes();
+  }
+
+  async setMode(sid: string, mode: string): Promise<AgentModeSelection> {
+    const account = this.accountForControls(sid);
+    if (account && !getAgentAccountCapabilities(account).plan) {
+      if (mode !== "default") throw new SessionError("这个账号暂不支持 Plan 模式", "agent_unavailable");
+      return { currentMode: "default" };
+    }
+    return this.requireStructured(sid).setMode(mode);
+  }
+
   infoOf(sid: string): SessionInfo {
     const s = this.ptySessions.get(sid) ?? this.structuredSessions.get(sid);
     if (!s) throw new SessionError(`no such session: ${sid}`, "session_not_found");
-    return s.info();
+    return this.sessionInfoWithCapabilities(s.info());
+  }
+
+  /** Intersect native controls with account restrictions for every client, including older clients. */
+  sessionInfoWithCapabilities(info: SessionInfo): SessionInfo {
+    if (!info.agentControls || !info.accountId || (info.agent !== "claude" && info.agent !== "codex")) return info;
+    let capabilities: AgentAccountCapabilities;
+    try {
+      const cached = this.resolvedAccountCapabilities.get(info.accountId);
+      if (this.accountCapabilitiesResolver) capabilities = this.accountCapabilitiesResolver(info.accountId, info.agent);
+      else if (cached) capabilities = cached;
+      else return info;
+    } catch {
+      return { ...info, agentControls: { ...info.agentControls, compact: false, model: false, mode: false } };
+    }
+    const available = capabilities.sessionKinds.includes("structured");
+    return { ...info, agentControls: {
+      ...info.agentControls,
+      compact: info.agentControls.compact && available,
+      model: info.agentControls.model && available && capabilities.modelSelection,
+      mode: info.agentControls.mode && available && capabilities.plan,
+    } };
   }
 
   /**
@@ -1416,7 +1531,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     return [
       ...[...this.ptySessions.values()].map((s) => s.info()),
       ...[...this.structuredSessions.values()].map((s) => s.info()),
-    ].sort((a, b) => a.createdAt - b.createdAt);
+    ].map((info) => this.sessionInfoWithCapabilities(info)).sort((a, b) => a.createdAt - b.createdAt);
   }
 
   accountInUse(accountId: string): boolean {

@@ -1,4 +1,4 @@
-import type { AgentApiProtocol, AgentApiProvider, CodeAgentKind } from "@prospero/protocol";
+import type { AgentAccount, AgentApiProtocol, AgentApiProvider, AgentModelCapabilities, CodeAgentKind } from "@prospero/protocol";
 
 export interface AccountApiDefaults {
   baseUrl: string;
@@ -59,4 +59,29 @@ export function accountApiProfileRequiresStructured(
   protocol: string | undefined,
 ): boolean {
   return accountApiProtocolFromProfile(agent, protocol) === "openai_chat_completions";
+}
+
+export function accountApiStatus(account: Pick<AgentAccount, "status" | "apiProfileError" | "apiValidation">): string {
+  if (account.apiProfileError) return "配置需要修复";
+  if (account.status === "signed_out") return "未配置密钥";
+  if (account.status === "unavailable") return "运行环境不可用";
+  if (account.apiValidation?.status === "passed") return "API 检查通过";
+  if (account.apiValidation?.status === "failed") return "API 检查失败";
+  return "已配置 · 未验证";
+}
+
+export function modelTokenLimit(value: string): number | undefined {
+  const raw = value.trim();
+  if (!raw) return undefined;
+  const parsed = Number(raw);
+  if (!/^\d+$/.test(raw) || !Number.isSafeInteger(parsed) || parsed <= 0) throw new Error("Token 上限必须是正整数；未知可留空");
+  return parsed;
+}
+
+export function updateModelTokenLimit(initial: AgentModelCapabilities | undefined, key: "contextWindow" | "maxOutputTokens", raw: string): AgentModelCapabilities {
+  const result = { ...initial };
+  const parsed = modelTokenLimit(raw);
+  if (parsed === undefined) delete result[key];
+  else result[key] = parsed;
+  return result;
 }

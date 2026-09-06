@@ -13,16 +13,21 @@ import { Stack, router, useFocusEffect, useLocalSearchParams } from "expo-router
 import type {
   AgentAccount,
   AgentApiProtocol,
+  AgentModelCapabilities,
   AgentCredentialKind,
   CodeAgentKind,
   S2CMessage,
   UsageAccount,
 } from "@prospero/protocol";
+import { getAgentAccountEngine } from "@prospero/protocol";
 import { AgentIcon } from "@/components/AgentIcon";
 import { Icon } from "@/components/Icon";
 import { PromptDialog } from "@/components/PromptDialog";
 import {
   accountApiProtocolDefaults,
+  accountApiStatus,
+  modelTokenLimit,
+  updateModelTokenLimit,
   accountApiProtocolFromProfile,
   accountApiProtocolLabel,
   accountApiProtocolsForAgent,
@@ -68,8 +73,8 @@ type Editor =
       kind: "api";
       agent: CodeAgentKind;
       account?: AgentAccount;
-      phase: "name" | "baseUrl" | "model" | "apiKey";
-      draft: { name: string; protocol: AgentApiProtocol; baseUrl: string; model: string };
+      phase: "name" | "baseUrl" | "model" | "contextWindow" | "maxOutputTokens" | "apiKey";
+      draft: { name: string; protocol: AgentApiProtocol; baseUrl: string; model: string; modelCapabilities?: AgentModelCapabilities };
     }
   | null;
 
@@ -247,22 +252,22 @@ export default function AgentAccountsScreen() {
 
   const openConfigureApi = (account: AgentAccount): void => {
     const profile = account.apiProfile;
-    if (!profile) return;
+    if (!profile && !account.apiProfileError) return;
     const current = accountApiProtocolFromProfile(
       account.agent,
-      profile.protocol,
+      profile?.protocol,
     );
     const open = (protocol: AgentApiProtocol): void => {
-      const defaults = protocol === current
+      const defaults = protocol === current && profile
         ? { baseUrl: profile.baseUrl, model: profile.model }
-        : accountApiProtocolDefaults(protocol);
+        : account.apiProfileError ? { baseUrl: "", model: "" } : accountApiProtocolDefaults(protocol);
       setName(defaults.baseUrl);
       setEditor({
         kind: "api",
         agent: account.agent,
         account,
         phase: "baseUrl",
-        draft: { name: account.name, protocol, ...defaults },
+        draft: { name: account.name, protocol, ...defaults, ...(profile?.modelCapabilities ? { modelCapabilities: profile.modelCapabilities } : {}) },
       });
     };
     if (conn?.supportsAgentApiProtocols !== true) {
@@ -316,8 +321,15 @@ export default function AgentAccountsScreen() {
         return;
       }
       if (editor.phase === "model") {
-        setName("");
-        setEditor({ ...editor, phase: "apiKey", draft: { ...editor.draft, model: trimmedValue } });
+        const nextPhase = conn.supportsAgentApiValidation ? "contextWindow" : "apiKey";
+        setName(conn.supportsAgentApiValidation ? String(editor.draft.modelCapabilities?.contextWindow ?? "") : "");
+        setEditor({ ...editor, phase: nextPhase, draft: { ...editor.draft, model: trimmedValue } });
+        return;
+      }
+      if (editor.phase === "contextWindow" || editor.phase === "maxOutputTokens") {
+        const modelCapabilities = updateModelTokenLimit(editor.draft.modelCapabilities, editor.phase, trimmedValue);
+        setName(editor.phase === "contextWindow" ? String(modelCapabilities.maxOutputTokens ?? "") : "");
+        setEditor({ ...editor, phase: editor.phase === "contextWindow" ? "maxOutputTokens" : "apiKey", draft: { ...editor.draft, modelCapabilities } });
         return;
       }
       const result = editor.account
@@ -327,6 +339,7 @@ export default function AgentAccountsScreen() {
             editor.draft.baseUrl,
             editor.draft.model,
             trimmedValue || undefined,
+            JSON.stringify(editor.draft.modelCapabilities ?? {}) === JSON.stringify(editor.account.apiProfile?.modelCapabilities ?? {}) ? undefined : editor.draft.modelCapabilities && Object.keys(editor.draft.modelCapabilities).length ? editor.draft.modelCapabilities : null,
           )
         : await conn.createAgentApiProfile(
             editor.agent,
@@ -335,6 +348,7 @@ export default function AgentAccountsScreen() {
             editor.draft.baseUrl,
             editor.draft.model,
             trimmedValue,
+            editor.draft.modelCapabilities,
           );
       rememberAccounts(result.accounts);
       setName("");
@@ -454,7 +468,8 @@ export default function AgentAccountsScreen() {
             </View>
 
             {grouped[agent].map((account) => {
-              const busy = busyId === account.id;
+              const busy = busyId !== null;
+              const hasApiProfile = Boolean(account.apiProfile || account.apiProfileError);
               return (
                 <View key={account.id} style={styles.card}>
                   <View style={styles.cardTop}>
@@ -465,37 +480,46 @@ export default function AgentAccountsScreen() {
                       </View>
                       <View style={styles.metaRow}>
                         <View style={[styles.statusDot, { backgroundColor: statusColor[account.status] }]} />
-                        <Text style={styles.meta}>{statusText[account.status]}</Text>
+                        <Text style={styles.meta}>{hasApiProfile ? accountApiStatus(account) : statusText[account.status]}</Text>
                         {account.authMethod && <Text style={styles.meta}>· {account.authMethod}</Text>}
                       </View>
-                      {account.detail && !account.apiProfile && <Text style={styles.environment}>{account.detail}</Text>}
+                      {account.detail && !hasApiProfile && <Text style={styles.environment}>{account.detail}</Text>}
                       <Text style={styles.environment}>
                         {account.apiProfile
-                          ? `${accountApiProtocolLabel(accountApiProtocolFromProfile(account.agent, account.apiProfile.protocol))} · ${account.apiProfile.model}\n${account.apiProfile.baseUrl}`
-                          : account.managed ? "Prospero 独立环境" : "现有本机环境（兼容旧会话）"}
+                          ? `${getAgentAccountEngine(account)} · ${accountApiProtocolLabel(accountApiProtocolFromProfile(account.agent, account.apiProfile.protocol))} · ${account.apiProfile.model}\n${account.apiProfile.baseUrl}`
+                          : account.apiProfileError ? "API Profile · 等待修复" : account.managed ? "Prospero 独立环境" : "现有本机环境（兼容旧会话）"}
                         {account.activeSessions > 0 ? ` · ${String(account.activeSessions)} 个活动会话` : ""}
                       </Text>
+                      {hasApiProfile && <View>
+                        {account.apiProfileError && <Text style={styles.error}>{account.apiProfileError}</Text>}
+                        {account.apiValidation && <>
+                          <Text style={styles.environment}>{(["runtime", "streaming", "tools"] as const).map((key) => `${key === "runtime" ? "运行环境" : key === "streaming" ? "流式响应" : "工具调用"}：${account.apiValidation!.checks[key] === "passed" ? "通过" : account.apiValidation!.checks[key] === "failed" ? "失败" : "未测试"}`).join(" · ")}</Text>
+                          <Text style={styles.environment}>{account.apiValidation.detail}{"\n"}{new Date(account.apiValidation.checkedAt).toLocaleString()}</Text>
+                        </>}
+                        {conn?.supportsAgentApiValidation && <Text style={styles.environment}>测试会向服务商发送少量请求，可能消耗额度；API 协议检查不代表完整 Agent 执行已验证。</Text>}
+                      </View>}
                       <AccountUsage
                         account={account}
                         usage={usageByAccount.get(account.id)}
                         now={now}
                       />
                     </View>
-                    {busy && <ActivityIndicator size="small" color={color.accent} />}
+                    {busyId === account.id && <ActivityIndicator size="small" color={color.accent} />}
                   </View>
 
                   <View style={styles.actions}>
-                    {account.apiProfile ? (
+                    {hasApiProfile ? (
                       <>
+                        {conn?.supportsAgentApiValidation && <Action label="测试 API 连接" disabled={busy || Boolean(account.apiProfileError) || account.status === "signed_out"} onPress={() => { if (conn) void mutate(account.id, () => conn.testAgentApiProfile(account.id)).catch(() => {}); }} />}
                         <Action
-                          label={account.activeSessions > 0 ? "结束会话后配置" : "重新配置"}
+                          label={account.activeSessions > 0 ? "结束会话后配置" : account.apiProfileError ? "修复配置" : "重新配置"}
                           onPress={() => openConfigureApi(account)}
                           disabled={busy || account.activeSessions > 0}
                         />
                         <Action
                           label={account.activeSessions > 0 ? "结束会话后换 Key" : "替换 API Key"}
                           onPress={() => openCredential(account, "api_key")}
-                          disabled={busy || account.activeSessions > 0}
+                          disabled={busy || account.activeSessions > 0 || Boolean(account.apiProfileError)}
                         />
                       </>
                     ) : (
@@ -586,6 +610,10 @@ export default function AgentAccountsScreen() {
                     ? "API Base URL"
                     : editor.phase === "model"
                       ? "默认模型"
+                      : editor.phase === "contextWindow"
+                        ? "上下文窗口（可选）"
+                        : editor.phase === "maxOutputTokens"
+                          ? "最大输出（可选）"
                       : editor.account && conn?.supportsAgentApiProtocols
                         ? "API Key（可选）"
                         : "保存 API Key"
@@ -611,6 +639,8 @@ export default function AgentAccountsScreen() {
                       : `输入 API 前缀，例如 https://gateway.example.com/v1，不要包含 ${editor.draft.protocol === "openai_responses" ? "/responses" : "/chat/completions"}。`
                     : editor.phase === "model"
                       ? "输入该服务中要作为默认模型使用的精确模型 ID。"
+                      : editor.phase === "contextWindow" || editor.phase === "maxOutputTokens"
+                        ? `按服务商文档填写 Token 正整数上限；未知可留空。${editor.draft.protocol === "openai_chat_completions" ? "Chat Completions 的两个上限须同时填写或同时留空。" : ""}其他已保存的模型能力保持原值。`
                       : editor.account && conn?.supportsAgentApiProtocols
                         ? "留空会保留现有 Key；新 Key 仅写入电脑端安全存储。"
                         : "Key 仅写入电脑端安全存储，不会保存在账号配置或聊天记录中。"
@@ -628,8 +658,17 @@ export default function AgentAccountsScreen() {
         validate={(value) => {
           const trimmed = value.trim();
           const optionalApiKey = editor?.kind === "api" && editor.phase === "apiKey" && editor.account !== undefined && conn?.supportsAgentApiProtocols === true;
-          if (!trimmed && !optionalApiKey) return editor?.kind === "credential" || editor?.kind === "api" && editor.phase === "apiKey" ? "请粘贴凭据" : "请输入内容";
+          const optionalLimit = editor?.kind === "api" && (editor.phase === "contextWindow" || editor.phase === "maxOutputTokens");
+          if (!trimmed && !optionalApiKey && !optionalLimit) return editor?.kind === "credential" || editor?.kind === "api" && editor.phase === "apiKey" ? "请粘贴凭据" : "请输入内容";
           if (editor?.kind === "api") {
+            if (editor.phase === "contextWindow" || editor.phase === "maxOutputTokens") {
+              try {
+                const limit = modelTokenLimit(trimmed);
+                if (editor.phase === "maxOutputTokens" && editor.draft.protocol === "openai_chat_completions" && (limit === undefined) !== (editor.draft.modelCapabilities?.contextWindow === undefined)) return "Chat Completions 的两个 Token 上限须同时填写或同时留空";
+                if (editor.phase === "maxOutputTokens" && limit !== undefined && editor.draft.modelCapabilities?.contextWindow !== undefined && limit > editor.draft.modelCapabilities.contextWindow) return "输出上限不能大于上下文窗口";
+              } catch (error) { return error instanceof Error ? error.message : String(error); }
+              return null;
+            }
             if (editor.phase === "name" && trimmed.length > 80) return "名称不能超过 80 个字符";
             if (editor.phase === "baseUrl" && (trimmed.length > 2000 || /[\r\n\0]/.test(trimmed))) return "API 地址格式不正确";
             if (editor.phase === "model" && (trimmed.length > 300 || /[\r\n\0]/.test(trimmed))) return "模型名称格式不正确";
