@@ -679,6 +679,17 @@ kbd {
 .workspace-project-more[data-popup-open] { color: var(--sidebar-accent-foreground); background: var(--sidebar-accent); opacity: 1; }
 .workspace-project-item:hover > .workspace-project-more { opacity: 1; }
 .workspace-project-more svg { width: 14px; height: 14px; }
+.workspace-task-group { min-width: 0; }
+.workspace-task-cleaned { flex-shrink: 0; margin-right: 12px; color: var(--muted-foreground); font-size: 10px; }
+.workspace-project-item > [data-slot="collapsible-content"] > .workspace-task-group { margin-left: 10px; }
+.workspace-task-group-button { min-height: 42px; height: auto; }
+.workspace-task-group-copy { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 2px; }
+.workspace-task-summary { color: var(--muted-foreground); font-size: 10px; font-weight: 400; font-variant-numeric: tabular-nums; }
+.workspace-task-summary.has-pending { color: var(--warning, var(--foreground)); }
+.workspace-task-chevron { width: 13px; height: 13px; flex: none; transition: transform 160ms ease; }
+.workspace-task-chevron.is-open { transform: rotate(90deg); }
+.workspace-task-children { margin-right: 0; padding-right: 0; }
+.workspace-task-search-parent { display: flex; min-width: 0; padding: 6px 6px 1px; color: var(--muted-foreground); font-size: 10px; }
 .workspace-session-search { display: flex; align-items: center; gap: 6px; margin: 0 8px 6px; padding: 0 7px; border: 1px solid color-mix(in srgb, var(--sidebar-border) 72%, transparent); border-radius: 7px; background: color-mix(in srgb, var(--sidebar-accent) 52%, transparent); }
 .workspace-session-search svg { width: 13px; height: 13px; flex: none; color: color-mix(in srgb, var(--sidebar-foreground) 66%, var(--sidebar)); }
 .workspace-session-search input { width: 100%; min-width: 0; height: 30px; padding: 0; color: var(--sidebar-foreground); border: 0; background: transparent; box-shadow: none; font-size: 11px; }

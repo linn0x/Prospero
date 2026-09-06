@@ -31,6 +31,7 @@ import type {
 } from "@prospero/protocol";
 import { AgentIcon } from "@/components/AgentIcon";
 import { HostSummary } from "@/components/HostSummary";
+import { SessionCreateProgress } from "@/components/SessionCreateProgress";
 import { Icon } from "@/components/Icon";
 import { Sheet, SheetAction } from "@/components/Sheet";
 import { SwipeRow, type SwipeAction } from "@/components/SwipeRow";
@@ -186,6 +187,7 @@ export default function HostScreen() {
   const [deleteTarget, setDeleteTarget] = useState<SessionInfo | null>(null);
   const [resumeConflictTitle, setResumeConflictTitle] = useState<string | null>(null);
   const [createDelivery, setCreateDelivery] = useState<"sent" | "queued" | null>(null);
+  const [createStartedAt, setCreateStartedAt] = useState<number | null>(null);
   const [manualCwdOpen, setManualCwdOpen] = useState(false);
   const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(() => new Set());
   const [goalRunExpansionOverrides, setGoalRunExpansionOverrides] = useState<
@@ -200,6 +202,7 @@ export default function HostScreen() {
     pendingCreate.cancel();
     pendingResumeTitleRef.current = null;
     setCreateDelivery(null);
+    setCreateStartedAt(null);
   }, [pendingCreate]);
   const insets = useSafeAreaInsets();
   const { width, height, verticalPanes } = useAdaptiveLayout();
@@ -490,6 +493,7 @@ export default function HostScreen() {
       return;
     }
     setCreateDelivery(result.disposition);
+    setCreateStartedAt(Date.now());
   }, [hostId, pendingCreate, resetPendingCreate]);
 
   // 深链 prospero://host/<id>?create=shell&cmd=…:连上后自动建会话(自动化测试/快捷指令用)
@@ -736,6 +740,7 @@ export default function HostScreen() {
   };
 
   const leaveHost = (): void => {
+    resetPendingCreate();
     if (router.canGoBack()) router.back();
     else router.replace("/");
   };
@@ -794,7 +799,7 @@ export default function HostScreen() {
         symbol: "doc.on.doc",
         color: color.accent,
         foregroundColor: color.onAccent,
-        onPress: () => router.push(`/host/${hostId}/files/${session.id}`),
+        onPress: () => { resetPendingCreate(); router.push(`/host/${hostId}/files/${session.id}`); },
       },
       {
         id: "end-session",
@@ -805,7 +810,7 @@ export default function HostScreen() {
         onPress: () => setDeleteTarget(session),
       },
     ];
-  }, [archivedIds, changeArchive, hostId]);
+  }, [archivedIds, changeArchive, hostId, resetPendingCreate]);
 
   const toggleGoalWorkers = useCallback((runId: string, expanded: boolean): void => {
     setGoalRunExpansionOverrides((current) => ({ ...current, [runId]: expanded }));
@@ -872,6 +877,9 @@ export default function HostScreen() {
             ) : (
               <View style={styles.headerActions}>
                 <Pressable
+                  disabled={createDelivery !== null}
+                  accessibilityState={{ disabled: createDelivery !== null }}
+                  style={createDelivery !== null && styles.btnDisabled}
                   onPress={() => {
                     setLaunchIntent("conversation");
                     setGoal("");
@@ -924,6 +932,20 @@ export default function HostScreen() {
         <Pressable style={styles.banner} onPress={() => setBanner(null)}>
           <Text style={styles.bannerText}>{banner}(点击关闭)</Text>
         </Pressable>
+      )}
+
+      {createDelivery !== null && createStartedAt !== null && (
+        <SessionCreateProgress
+          key={createStartedAt}
+          startedAt={createStartedAt}
+          delivery={createDelivery}
+          onBrowse={composing ? () => setComposing(false) : undefined}
+          onStop={() => {
+            resetPendingCreate();
+            setComposing(false);
+            setBanner("已停止等待；电脑可能已创建会话，请先查看列表再重试。");
+          }}
+        />
       )}
 
       {composing ? (
@@ -1019,7 +1041,7 @@ export default function HostScreen() {
                 <Pressable
                   key={session.id}
                   style={({ pressed }) => [styles.projectSessionHint, pressed && styles.cardPressed]}
-                  onPress={() => router.push(`/host/${hostId}/session/${session.id}`)}
+                  onPress={() => { resetPendingCreate(); router.push(`/host/${hostId}/session/${session.id}`); }}
                   accessibilityLabel={`打开已有会话 ${session.title}`}
                 >
                   <View style={[styles.dot, { backgroundColor: statusColor[session.status] }]} />
@@ -1092,7 +1114,7 @@ export default function HostScreen() {
               <View style={[styles.accountLabelRow, styles.kindLabel]}>
                 <Text style={styles.formLabel}>账号环境</Text>
                 <Pressable
-                  onPress={() => router.push(`/host/${hostId}/accounts`)}
+                  onPress={() => { resetPendingCreate(); router.push(`/host/${hostId}/accounts`); }}
                   hitSlop={8}
                   accessibilityLabel="管理 Code Agent 账号"
                 >
@@ -1139,7 +1161,7 @@ export default function HostScreen() {
                 })}
                 <Pressable
                   style={styles.chip}
-                  onPress={() => router.push(`/host/${hostId}/accounts`)}
+                  onPress={() => { resetPendingCreate(); router.push(`/host/${hostId}/accounts`); }}
                 >
                   <Icon name="plus" size={12} color={color.accent} />
                   <Text style={[styles.chipText, { color: color.accent }]}>新增</Text>
@@ -1692,6 +1714,7 @@ export default function HostScreen() {
             <GoalRunsPanel
               snapshot={orchestration}
               hostId={hostId}
+              beforeNavigate={resetPendingCreate}
               onResolveGate={(gateId, decision) => conn?.resolveOrchestrationGate(gateId, decision)}
             />
           </>
@@ -1725,6 +1748,7 @@ export default function HostScreen() {
                     color: color.accent,
                     foregroundColor: color.onAccent,
                     onPress: () => {
+                      resetPendingCreate();
                       setCwd(project.path);
                       setWorkspacePath("");
                       setLaunchIntent("conversation");
@@ -1778,6 +1802,7 @@ export default function HostScreen() {
                         key={session.id}
                         session={session}
                         hostId={hostId}
+                        beforeNavigate={resetPendingCreate}
                         // 断线时状态只代表上次连接，不能伪装成实时状态。
                         stale={runtime.status !== "connected"}
                         isCoordinator={coordinatorRuns.get(session.id) !== undefined}
@@ -1831,6 +1856,7 @@ export default function HostScreen() {
             detail="Codex 与 Claude Code 独立登录环境，可共享同一项目目录"
             symbol="square.stack.3d.up"
             onPress={() => {
+              resetPendingCreate();
               toolsNavigation.defer(() => router.push(`/host/${hostId}/accounts`));
               setToolsOpen(false);
             }}
@@ -1846,6 +1872,7 @@ export default function HostScreen() {
             }
             symbol="point.3.connected.trianglepath.dotted"
             onPress={() => {
+              resetPendingCreate();
               toolsNavigation.defer(() => router.push(`/host/${hostId}/orchestration`));
               setToolsOpen(false);
             }}
@@ -1915,6 +1942,7 @@ interface GoalWorkerEntry {
 interface SessionRowProps {
   session: SessionInfo;
   hostId: string;
+  beforeNavigate: () => void;
   stale: boolean;
   isCoordinator: boolean;
   goalGroup: GoalSessionGroup | undefined;
@@ -1935,6 +1963,7 @@ interface SessionRowProps {
 const SessionRow = memo(function SessionRow({
   session,
   hostId,
+  beforeNavigate,
   stale,
   isCoordinator,
   goalGroup,
@@ -1954,7 +1983,7 @@ const SessionRow = memo(function SessionRow({
             (session.status === "waiting_approval" || session.status === "waiting_input") &&
               styles.cardAttention,
           ]}
-          onPress={() => router.push(`/host/${hostId}/session/${session.id}`)}
+          onPress={() => { beforeNavigate(); router.push(`/host/${hostId}/session/${session.id}`); }}
         >
           <View style={styles.cardTop}>
             <View
@@ -2002,12 +2031,13 @@ const SessionRow = memo(function SessionRow({
               <Pressable
                 key={child.id}
                 style={({ pressed }) => [styles.childRow, pressed && styles.cardPressed]}
-                onPress={() =>
+                onPress={() => {
+                  beforeNavigate();
                   router.push({
                     pathname: "/host/[hostId]/session/[sid]",
                     params: { hostId, sid: session.id, subagentId: child.id },
-                  })
-                }
+                  });
+                }}
                 accessibilityRole="button"
                 accessibilityLabel={`查看子 Agent ${child.name}`}
               >
@@ -2075,9 +2105,10 @@ const SessionRow = memo(function SessionRow({
                   <SwipeRow key={workerSession.id} actions={swipeActionsFor(workerSession)}>
                     <Pressable
                       style={({ pressed }) => [styles.childRow, pressed && styles.cardPressed]}
-                      onPress={() =>
-                        router.push(`/host/${hostId}/session/${workerSession.id}`)
-                      }
+                      onPress={() => {
+                        beforeNavigate();
+                        router.push(`/host/${hostId}/session/${workerSession.id}`);
+                      }}
                       accessibilityRole="button"
                       accessibilityLabel={`打开 Goal 工作会话：${link.taskTitle}，${workerLabel}`}
                     >
@@ -2125,6 +2156,7 @@ const SessionRow = memo(function SessionRow({
   // 它通常是空的,按内容比较代价极小。
   prev.session === next.session &&
   prev.hostId === next.hostId &&
+  prev.beforeNavigate === next.beforeNavigate &&
   prev.stale === next.stale &&
   prev.isCoordinator === next.isCoordinator &&
   prev.goalGroup === next.goalGroup &&
@@ -2157,10 +2189,12 @@ function FilterChip({
 function GoalRunsPanel({
   snapshot,
   hostId,
+  beforeNavigate,
   onResolveGate,
 }: {
   snapshot: OrchestrationSnapshot | null;
   hostId: string;
+  beforeNavigate: () => void;
   onResolveGate: (gateId: string, decision: string) => void;
 }) {
   const [otherDecisions, setOtherDecisions] = useState<Record<string, string>>({});
@@ -2188,7 +2222,10 @@ function GoalRunsPanel({
             <Pressable
               disabled={run.coordinatorSessionId === null}
               onPress={() => {
-                if (run.coordinatorSessionId) router.push(`/host/${hostId}/session/${run.coordinatorSessionId}`);
+                if (run.coordinatorSessionId) {
+                  beforeNavigate();
+                  router.push(`/host/${hostId}/session/${run.coordinatorSessionId}`);
+                }
               }}
               style={({ pressed }) => [styles.goalRunTop, pressed && run.coordinatorSessionId && styles.cardPressed]}
               accessibilityLabel="打开 Goal 协调者会话"
@@ -2247,7 +2284,7 @@ function GoalRunsPanel({
       {overview.truncatedRunCount > 0 && (
         <Pressable
           style={({ pressed }) => [styles.goalOverflow, pressed && styles.cardPressed]}
-          onPress={() => router.push(orchestrationRoute(hostId, overview.firstTruncatedGateRunId))}
+          onPress={() => { beforeNavigate(); router.push(orchestrationRoute(hostId, overview.firstTruncatedGateRunId)); }}
           accessibilityRole="button"
           accessibilityLabel={overview.firstTruncatedGateRunId
             ? `打开 Agent 编排中心，并预选包含待处理 Gate 的 Run；另有 ${String(overview.truncatedRunCount)} 个 Run 未显示`

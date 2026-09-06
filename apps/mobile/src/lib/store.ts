@@ -3,6 +3,7 @@ import type { HostInfo, SessionInfo } from "@prospero/protocol";
 import type { StoredHost } from "./hosts";
 import type { ConnectionPath } from "./connection-candidates";
 import { DEFAULT_HOME_SETTINGS, type HomeSettings } from "./home-preferences";
+import { recentSessions, sessionActivityChanged } from "./recent-sessions";
 
 export type ConnStatus =
   | "idle"
@@ -44,7 +45,7 @@ interface AppState {
   upsertSession(hostId: string, session: SessionInfo): void;
 }
 
-export const useApp = create<AppState>()((set) => ({
+export const useApp = create<AppState>()((set, get) => ({
   hosts: [],
   runtimes: {},
   homeSettings: DEFAULT_HOME_SETTINGS,
@@ -68,7 +69,11 @@ export const useApp = create<AppState>()((set) => ({
         },
       };
     }),
-  upsertSession: (hostId, session) =>
+  upsertSession: (hostId, session) => {
+    const runtime = get().runtimes[hostId];
+    if (runtime?.status === "connected" && sessionActivityChanged(runtime.sessions[session.id], session)) {
+      recentSessions.activity(hostId, session.id, session.preview);
+    }
     set((s) => {
       const rt = s.runtimes[hostId] ?? emptyRuntime;
       return {
@@ -80,7 +85,8 @@ export const useApp = create<AppState>()((set) => ({
           },
         },
       };
-    }),
+    });
+  },
 }));
 
 /** 会话列表排序:待审批 > 运行中 > 其他,同组按创建时间倒序 */

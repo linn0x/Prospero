@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import FontAwesome6 from "@expo/vector-icons/FontAwesome6";
 import { useFocusEffect } from "expo-router";
 import {
@@ -24,6 +24,7 @@ import {
   compactWorkspacePath,
   homeHostStats,
   homeRecentSessions,
+  homeRecentSummary,
   homeWorkspaceProjects,
   partitionHomeProjects,
 } from "@/lib/home-dashboard";
@@ -36,6 +37,7 @@ import {
 } from "@/lib/home-preferences";
 import type { SessionProject } from "@/lib/session-projects";
 import type { ConnStatus, HostRuntime } from "@/lib/store";
+import { recentSessions as recentSessionStore, recentSessionTime } from "@/lib/recent-sessions";
 import {
   font,
   radius,
@@ -209,6 +211,12 @@ export function HomeDashboard({
   const styles = useMemo(() => createStyles(palette), [palette]);
   const selectedHost = hosts.find((host) => host.id === selectedHostId) ?? hosts[0];
   const selectedRuntime = selectedHost ? runtimes[selectedHost.id] : undefined;
+  const recentUsage = useSyncExternalStore(
+    recentSessionStore.subscribe,
+    () => recentSessionStore.getHost(selectedHost?.id),
+    () => recentSessionStore.getHost(selectedHost?.id),
+  );
+  useEffect(() => { void recentSessionStore.load(); }, []);
   // Fast Refresh 会保留旧版 Zustand 状态；标准化可补全后续新增的设置字段。
   const effectiveHomeSettings = normalizeHomeSettings(homeSettings ?? DEFAULT_HOME_SETTINGS);
   const allProjects = useMemo(
@@ -224,8 +232,8 @@ export function HomeDashboard({
     [selectedRuntime?.sessions],
   );
   const recentSessions = useMemo(
-    () => homeRecentSessions(selectedRuntime?.sessions, effectiveHomeSettings.recentSessionLimit),
-    [effectiveHomeSettings.recentSessionLimit, selectedRuntime?.sessions],
+    () => homeRecentSessions(selectedRuntime?.sessions, effectiveHomeSettings.recentSessionLimit, recentUsage),
+    [effectiveHomeSettings.recentSessionLimit, selectedRuntime?.sessions, recentUsage],
   );
   const [expandedProjectKey, setExpandedProjectKey] = useState<string | null>(null);
   const [expandedTaskHostId, setExpandedTaskHostId] = useState<string | null>(null);
@@ -484,7 +492,7 @@ export function HomeDashboard({
                   <Pressable
                     key={session.id}
                     accessibilityRole="button"
-                    accessibilityLabel={`打开最近对话 ${session.title || session.agent}`}
+                    accessibilityLabel={`打开最近对话 ${session.title || session.agent}，${homeRecentSummary(session, recentUsage[session.id])}`}
                     onPress={() => onOpenSession(selectedHost.id, session.id)}
                     style={({ pressed }) => [styles.recentCard, pressed && styles.recentCardPressed]}
                   >
@@ -493,8 +501,11 @@ export function HomeDashboard({
                       <Text style={styles.recentTitle} numberOfLines={1}>
                         {session.title || session.agent}
                       </Text>
+                      <Text style={styles.recentPreview} numberOfLines={2}>
+                        {homeRecentSummary(session, recentUsage[session.id])}
+                      </Text>
                       <Text style={styles.recentMeta} numberOfLines={1}>
-                        {displayProjectName(session.cwd, projectName(session.cwd))} · {recentTime(session.createdAt)}
+                        {displayProjectName(session.cwd, projectName(session.cwd))} · {recentTime(recentSessionTime(session, recentUsage[session.id]))}
                       </Text>
                     </View>
                     <View
@@ -919,6 +930,7 @@ function createStyles(palette: ThemePalette) {
   recentCardPressed: { backgroundColor: palette.pressed },
   recentCopy: { flex: 1, minWidth: 0, gap: 3 },
   recentTitle: { ...themedFont.body, fontSize: 13, fontWeight: "600" },
+  recentPreview: { color: palette.textDim, fontSize: 12, lineHeight: 17 },
   recentMeta: { color: palette.textDim, fontSize: 10.5 },
   recentEmpty: {
     ...themedFont.meta,
