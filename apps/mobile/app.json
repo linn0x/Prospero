@@ -83,6 +83,7 @@
         }
       ],
       "expo-sharing",
+      "expo-sqlite",
       [
         "expo-image-picker",
         {

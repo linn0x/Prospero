@@ -4,18 +4,26 @@ import { useFocusEffect } from "expo-router";
 import {
   Alert,
   AppState,
+  Animated,
+  Easing,
   FlatList,
   Pressable,
   RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
-  View,
+  useAnimatedValue,
   useWindowDimensions,
+  View,
 } from "react-native";
 import type { SessionInfo } from "@prospero/protocol";
 
 import { AgentIcon } from "@/components/AgentIcon";
+import { DeviceDetailCarousel } from "@/components/DeviceDetailCarousel";
+import {
+  DeviceQuickSwitcher,
+  type DeviceSwitchDirection,
+} from "@/components/DeviceQuickSwitcher";
 import { Icon } from "@/components/Icon";
 import { PromptDialog } from "@/components/PromptDialog";
 import { Sheet, SheetAction } from "@/components/Sheet";
@@ -209,8 +217,9 @@ export function HomeDashboard({
   managedWorkspacePaths?: readonly string[];
 }) {
   const { palette } = useMobileTheme();
+  const { width: viewportWidth } = useWindowDimensions();
   const styles = useMemo(() => createStyles(palette), [palette]);
-  const { width: windowWidth } = useWindowDimensions();
+  const windowWidth = viewportWidth;
   const compactWorkspaceActions = windowWidth < 390;
   const recentCardWidth = Math.min(232, Math.max(196, windowWidth - 72));
   const selectedHost = hosts.find((host) => host.id === selectedHostId) ?? hosts[0];
@@ -221,6 +230,26 @@ export function HomeDashboard({
     () => recentSessionStore.getHost(selectedHost?.id),
   );
   useEffect(() => { void recentSessionStore.load(); }, []);
+  const [previewHostId, setPreviewHostId] = useState<string | null>(null);
+  const [quickSwitchActive, setQuickSwitchActive] = useState(false);
+  const [deviceDetailsOpen, setDeviceDetailsOpen] = useState(false);
+  const [detailHostId, setDetailHostId] = useState<string | null>(null);
+  const homeListWidth = Math.min(840, viewportWidth);
+  const deviceViewportBleed = (viewportWidth - homeListWidth) / 2 + space.lg;
+  const deviceCardWidth = Math.max(280, homeListWidth - space.lg * 2);
+  const deviceCardSideInset = (viewportWidth - deviceCardWidth) / 2;
+  const deviceCardStride = deviceCardWidth * 0.94;
+  const homeSwipeActive = quickSwitchActive || deviceDetailsOpen;
+  const homeActiveHostId = quickSwitchActive && previewHostId
+    ? previewHostId
+    : deviceDetailsOpen && detailHostId
+      ? detailHostId
+      : selectedHost?.id ?? hosts[0]?.id ?? "";
+  const homeActiveIndex = Math.max(0, hosts.findIndex((host) => host.id === homeActiveHostId));
+  const homeCarouselX = useAnimatedValue(
+    deviceCardSideInset - homeActiveIndex * deviceCardStride,
+  );
+  const homeSwipeProgress = useAnimatedValue(0);
   // Fast Refresh 会保留旧版 Zustand 状态；标准化可补全后续新增的设置字段。
   const effectiveHomeSettings = normalizeHomeSettings(homeSettings ?? DEFAULT_HOME_SETTINGS);
   const allProjects = useMemo(
@@ -230,10 +259,6 @@ export function HomeDashboard({
   const { projects, taskProjects } = useMemo(
     () => partitionHomeProjects(allProjects, managedWorkspacePaths),
     [allProjects, managedWorkspacePaths],
-  );
-  const stats = useMemo(
-    () => homeHostStats(selectedRuntime?.sessions),
-    [selectedRuntime?.sessions],
   );
   const recentSessions = useMemo(
     () => homeRecentSessions(selectedRuntime?.sessions, effectiveHomeSettings.recentSessionLimit, recentUsage),
@@ -259,6 +284,7 @@ export function HomeDashboard({
     closeDevicePickerRef.current();
     setQuickCreateOpen(false);
     setEditingProject(null);
+    setDeviceDetailsOpen(false);
   }, [createNavigation, deviceNavigation]);
   useFocusEffect(useCallback(() => cancelOverlays, [cancelOverlays]));
   useEffect(() => {
@@ -272,6 +298,74 @@ export function HomeDashboard({
   }, [deviceNavigation, devicePickerOpen]);
   const refreshing =
     selectedRuntime?.status === "connecting" || selectedRuntime?.status === "reconnecting";
+
+  useEffect(() => {
+    homeCarouselX.stopAnimation();
+    if (deviceDetailsOpen) return;
+    Animated.timing(homeCarouselX, {
+      toValue: deviceCardSideInset - homeActiveIndex * deviceCardStride,
+      duration: 180,
+      easing: Easing.out(Easing.cubic),
+      useNativeDriver: true,
+    }).start();
+  }, [deviceCardSideInset, deviceCardStride, deviceDetailsOpen, homeActiveIndex, homeCarouselX]);
+
+  useEffect(() => {
+    homeSwipeProgress.stopAnimation();
+    Animated.spring(homeSwipeProgress, {
+      toValue: homeSwipeActive ? 1 : 0,
+      speed: 26,
+      bounciness: 4,
+      useNativeDriver: true,
+    }).start();
+  }, [homeSwipeActive, homeSwipeProgress]);
+
+  useEffect(() => () => {
+    homeCarouselX.stopAnimation();
+    homeSwipeProgress.stopAnimation();
+  }, [homeCarouselX, homeSwipeProgress]);
+
+  const handlePreviewHost = useCallback((
+    hostId: string,
+    _direction: DeviceSwitchDirection,
+  ): void => {
+    setPreviewHostId(hostId);
+  }, []);
+
+  const handleCancelPreview = useCallback((_direction: DeviceSwitchDirection): void => {
+    setPreviewHostId(null);
+  }, []);
+
+  const handleConfirmHost = useCallback((hostId: string): void => {
+    setPreviewHostId(null);
+    onSelectHost(hostId);
+  }, [onSelectHost]);
+
+  const handleQuickSwitchStateChange = useCallback((
+    active: boolean,
+    _cancelled: boolean,
+  ): void => {
+    setQuickSwitchActive(active);
+  }, []);
+
+  const handleOpenDeviceDetails = useCallback((): void => {
+    if (!selectedHost) return;
+    setDetailHostId(selectedHost.id);
+    setDeviceDetailsOpen(true);
+  }, [selectedHost]);
+
+  const handleDetailHostSelect = useCallback((hostId: string): void => {
+    setDetailHostId(hostId);
+    onSelectHost(hostId);
+  }, [onSelectHost]);
+
+  const handleDetailSwipePosition = useCallback((position: number): void => {
+    const maximumPosition = Math.max(0, hosts.length - 1);
+    const clampedPosition = Math.min(maximumPosition, Math.max(0, position));
+    homeCarouselX.setValue(
+      deviceCardSideInset - clampedPosition * deviceCardStride,
+    );
+  }, [deviceCardSideInset, deviceCardStride, homeCarouselX, hosts.length]);
 
   if (!selectedHost) return null;
 
@@ -402,6 +496,129 @@ export function HomeDashboard({
     );
   };
 
+  const renderHomeDeviceCard = (host: StoredHost, index: number) => {
+    const runtime = runtimes[host.id];
+    const stats = homeHostStats(runtime?.sessions);
+    const orderedHosts = [host, ...hosts.filter((candidate) => candidate.id !== host.id)];
+    const active = index === homeActiveIndex;
+    return (
+      <Animated.View
+        key={host.id}
+        pointerEvents={active ? "auto" : "none"}
+        accessibilityElementsHidden={!active}
+        importantForAccessibility={active ? "auto" : "no-hide-descendants"}
+        style={[
+          styles.deviceCarouselCard,
+          {
+            width: deviceCardWidth,
+            marginRight: -(deviceCardWidth - deviceCardStride),
+            zIndex: active ? 2 : 1,
+            opacity: active
+              ? 1
+              : homeSwipeProgress.interpolate({
+                inputRange: [0, 1],
+                outputRange: [0, 0.72],
+              }),
+            transform: [
+              {
+                scale: homeSwipeProgress.interpolate({
+                  inputRange: [0, 1],
+                  outputRange: [1, 0.9],
+                }),
+              },
+            ],
+          },
+        ]}
+      >
+        <View style={styles.devicePanel}>
+          <View style={styles.deviceSelector}>
+            <View style={styles.sectionIcon}>
+              <HostPlatformIcon platform={runtime?.hostInfo?.platform} palette={palette} />
+            </View>
+            <View style={styles.deviceHeaderCopy}>
+              <Text style={styles.deviceHeaderName} numberOfLines={1}>{host.name}</Text>
+              <Text style={styles.deviceMeta} numberOfLines={1}>
+                {`${String(stats.activeAgentCount)} Agent · ${String(stats.sessionCount)} 会话 · ${stats.runningCount > 0 ? `${String(stats.runningCount)} 项工作中` : "空闲"}`}
+              </Text>
+            </View>
+            <View style={styles.deviceSelectorEnd}>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityState={{ expanded: devicePickerOpen }}
+                accessibilityLabel={`选择设备，${String(hosts.length)} 台已配对，当前为 ${host.name}，${hostConnectionLabel(runtime)}`}
+                accessibilityHint="从屏幕底部打开设备列表"
+                hitSlop={8}
+                style={({ pressed }) => [
+                  styles.deviceFleetPill,
+                  pressed && styles.deviceFleetPillPressed,
+                ]}
+                onPress={() => {
+                  deviceNavigation.cancel();
+                  onToggleDevicePicker();
+                }}
+              >
+                <Icon name="desktopcomputer" size={14} color={palette.textDim} />
+                <View style={styles.deviceFleetDots}>
+                  <View
+                    style={[
+                      styles.fleetStatusDot,
+                      { backgroundColor: hostConnectionTone(runtime, palette) },
+                    ]}
+                  />
+                  <Text style={styles.fleetCurrentStatus} numberOfLines={1}>
+                    {hostConnectionLabel(runtime)}
+                  </Text>
+                  {orderedHosts.slice(1).map((candidate) => (
+                    <View
+                      key={candidate.id}
+                      style={[
+                        styles.fleetStatusDot,
+                        { backgroundColor: hostConnectionTone(runtimes[candidate.id], palette) },
+                      ]}
+                    />
+                  ))}
+                </View>
+                <Icon name="chevron.down" size={14} color={palette.textFaint} />
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Animated.View>
+    );
+  };
+
+  const devicePanel = (
+    <View
+      style={[
+        styles.devicePanelStage,
+        hosts.length > 1 && styles.devicePanelStageWithRail,
+        { width: viewportWidth, marginLeft: -deviceViewportBleed },
+      ]}
+    >
+      <View style={styles.deviceCarouselViewport}>
+        <Animated.View
+          style={[
+            styles.deviceCarouselTrack,
+            { transform: [{ translateX: homeCarouselX }] },
+          ]}
+        >
+          {hosts.map(renderHomeDeviceCard)}
+        </Animated.View>
+      </View>
+      <DeviceQuickSwitcher
+        hosts={hosts}
+        runtimes={runtimes}
+        selectedHostId={selectedHost.id}
+        hapticsEnabled={effectiveHomeSettings.deviceSwitcherHapticsEnabled}
+        onOpenDeviceDetails={handleOpenDeviceDetails}
+        onPreviewHost={handlePreviewHost}
+        onCancelPreview={handleCancelPreview}
+        onConfirmHost={handleConfirmHost}
+        onQuickSwitchStateChange={handleQuickSwitchStateChange}
+      />
+    </View>
+  );
+
   return (
     <>
       <FlatList
@@ -424,67 +641,11 @@ export function HomeDashboard({
       }
       ListHeaderComponent={
         <View style={styles.headerContent}>
-          <View style={styles.devicePanel}>
-            <View style={styles.deviceSelector}>
-              <View style={styles.sectionIcon}>
-                <HostPlatformIcon
-                  platform={selectedRuntime?.hostInfo?.platform}
-                  palette={palette}
-                />
-              </View>
-              <View style={styles.deviceHeaderCopy}>
-                <Text style={styles.deviceHeaderName} numberOfLines={1}>
-                  {selectedHost.name}
-                </Text>
-                <Text style={styles.deviceMeta} numberOfLines={1}>
-                  {`${String(stats.sessionCount)} 个会话 · ${String(stats.runningCount)} 个运行中`}
-                </Text>
-              </View>
-              <View style={styles.deviceSelectorEnd}>
-                <Pressable
-                  accessibilityRole="button"
-                  accessibilityState={{ expanded: devicePickerOpen }}
-                  accessibilityLabel={`选择设备，${String(hosts.length)} 台已配对，当前为 ${selectedHost.name}，${hostConnectionLabel(selectedRuntime)}`}
-                  accessibilityHint="从屏幕底部打开设备列表"
-                  style={({ pressed }) => [
-                    styles.deviceFleetPill,
-                    pressed && styles.deviceFleetPillPressed,
-                  ]}
-                  onPress={() => {
-                    deviceNavigation.cancel();
-                    onToggleDevicePicker();
-                  }}
-                >
-                  <Icon name="desktopcomputer" size={14} color={palette.textDim} />
-                  <Text style={styles.deviceFleetCount}>{String(hosts.length)}</Text>
-                  <Icon name="chevron.down" size={14} color={palette.textFaint} />
-                </Pressable>
-              </View>
-            </View>
-            <View style={styles.deviceConnection}>
-              <View
-                style={[
-                  styles.statusDot,
-                  { backgroundColor: hostConnectionTone(selectedRuntime, palette) },
-                ]}
-              />
-              <Text style={styles.deviceConnectionText} numberOfLines={1}>
-                {hostDetail(selectedHost, selectedRuntime)}
-                {selectedRuntime?.status === "connected" && selectedRuntime.rttMs != null
-                  ? ` · ${hostConnectionLabel(selectedRuntime)}`
-                  : ""}
-              </Text>
-            </View>
-          </View>
+          {devicePanel}
 
           <View style={styles.recentSection}>
             <View style={styles.sectionHeading}>
-              <View>
-                <Text style={styles.sectionTitle}>最近对话</Text>
-                <Text style={styles.sectionSubtitle}>
-                  最近 {String(effectiveHomeSettings.recentSessionLimit)} 条
-                </Text>
-              </View>
+              <Text style={styles.sectionTitle}>最近对话</Text>
             </View>
             {recentSessions.length > 0 ? (
               <ScrollView
@@ -504,7 +665,7 @@ export function HomeDashboard({
                       pressed && styles.recentCardPressed,
                     ]}
                   >
-                    <AgentIcon agent={session.agent} size={18} badge />
+                    <AgentIcon agent={session.agent} size={18} badge badgeOutline={false} />
                     <View style={styles.recentCopy}>
                       <Text style={styles.recentTitle} numberOfLines={1}>
                         {session.title || session.agent}
@@ -608,6 +769,20 @@ export function HomeDashboard({
           )}
         </View>
       ) : null}
+      />
+
+      <DeviceDetailCarousel
+        visible={deviceDetailsOpen}
+        hosts={hosts}
+        runtimes={runtimes}
+        activeHostId={detailHostId ?? selectedHost.id}
+        onClose={() => setDeviceDetailsOpen(false)}
+        onSelectHost={handleDetailHostSelect}
+        onSwipePosition={handleDetailSwipePosition}
+        onOpenHost={onOpenHost}
+        onOpenSession={onOpenSession}
+        onCreateSession={onCreateSession}
+        onRefreshHost={onRefreshHost}
       />
 
       <Sheet
@@ -821,8 +996,26 @@ function createStyles(palette: ThemePalette) {
     alignSelf: "center",
     paddingHorizontal: space.lg,
   },
-  headerContent: { gap: space.lg, paddingTop: space.sm, paddingBottom: space.md },
+  headerContent: { gap: space.xs, paddingTop: space.sm, paddingBottom: space.md },
+  devicePanelStage: {
+    position: "relative",
+    zIndex: 20,
+  },
+  devicePanelStageWithRail: { paddingBottom: 23 },
+  deviceCarouselViewport: {
+    height: 64,
+    overflow: "hidden",
+  },
+  deviceCarouselTrack: {
+    height: 64,
+    flexDirection: "row",
+  },
+  deviceCarouselCard: {
+    height: 64,
+    flexShrink: 0,
+  },
   devicePanel: {
+    height: 64,
     overflow: "hidden",
     borderRadius: radius.md,
     backgroundColor: palette.surface,
@@ -867,9 +1060,15 @@ function createStyles(palette: ThemePalette) {
     backgroundColor: palette.surfaceRaised,
   },
   deviceFleetPillPressed: { backgroundColor: palette.pressed },
-  deviceFleetCount: {
+  deviceFleetDots: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+  },
+  fleetStatusDot: { width: 6, height: 6, borderRadius: 3 },
+  fleetCurrentStatus: {
     color: palette.textDim,
-    fontSize: 12,
+    fontSize: 9,
     fontWeight: "600",
     fontVariant: ["tabular-nums"],
   },
@@ -919,7 +1118,6 @@ function createStyles(palette: ThemePalette) {
     justifyContent: "space-between",
   },
   sectionTitle: { ...themedFont.title, fontSize: 17 },
-  sectionSubtitle: { color: palette.textDim, fontSize: 10, marginTop: 1 },
   iconButton: {
     width: 44,
     height: 44,

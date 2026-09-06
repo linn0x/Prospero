@@ -7,7 +7,15 @@ const read = (...parts: string[]): string =>
 
 const sessionScreen = read("app", "host", "[hostId]", "session", "[sid].tsx");
 const hostScreen = read("app", "host", "[hostId]", "index.tsx");
+const homeScreen = read("app", "index.tsx");
 const quickPanel = read("components", "SessionQuickPanel.tsx");
+
+describe("首页动线", () => {
+  it("标题栏可直达当前设备的 Agent 编排", () => {
+    expect(homeScreen).toContain('accessibilityLabel="Agent 编排"');
+    expect(homeScreen).toContain("`/host/${effectiveSelectedHostId}/orchestration`");
+  });
+});
 
 describe("会话页动线", () => {
   it("文件与项目改动从标题栏打开的右侧快捷面板直达", () => {

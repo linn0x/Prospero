@@ -41,10 +41,12 @@ export function AgentIcon({
   agent,
   size = 15,
   badge = false,
+  badgeOutline = true,
 }: {
   agent: AgentKind;
   size?: number;
   badge?: boolean;
+  badgeOutline?: boolean;
 }) {
   const scheme = useColorScheme();
   const { symbol } = AGENTS[agent];
@@ -63,6 +65,7 @@ export function AgentIcon({
     <View
       style={[
         styles.badge,
+        badgeOutline && styles.badgeOutline,
         { width: size * 1.8, height: size * 1.8, backgroundColor: `${tint}22` },
       ]}
     >
@@ -76,6 +79,8 @@ const styles = StyleSheet.create({
     borderRadius: radius.sm,
     alignItems: "center",
     justifyContent: "center",
+  },
+  badgeOutline: {
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: color.border,
   },
