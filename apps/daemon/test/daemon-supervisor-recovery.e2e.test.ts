@@ -24,6 +24,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { SessionDatabase } from "../src/session-database.js";
 
 interface DaemonProcess {
   child: ChildProcess;
@@ -468,12 +469,13 @@ async function exerciseSignalRecovery(signal: NodeJS.Signals): Promise<void> {
   });
   await stopDaemon(second, signal);
   await delay(180);
-  const offlineState = JSON.parse(readFileSync(
-    path.join(home, "structured-supervisor", sessionId, "session.json"),
-    "utf8",
-  )) as { events: Array<Record<string, unknown>> };
-  expect(offlineState.events.filter((event) => event["kind"] === "permission.resolved" && event["reqId"] === approvalId)).toHaveLength(0);
-  expect(offlineState.events.filter((event) => event["kind"] === "question.resolved" && event["reqId"] === questionId)).toHaveLength(0);
+  const offlineDatabase = new SessionDatabase(path.join(home, "structured-supervisor", sessionId, "session.sqlite"), { readOnly: true });
+  const offlineState = (() => {
+    try { return offlineDatabase.readSession(sessionId, { toolOutputs: false, messageQueue: false, limit: 4_000, maxBytes: Number.MAX_SAFE_INTEGER })!; }
+    finally { offlineDatabase.close(); }
+  })();
+  expect(offlineState.events.filter((event) => event["kind"] === "permission.resolved" && (event as { reqId?: string }).reqId === approvalId)).toHaveLength(0);
+  expect(offlineState.events.filter((event) => event["kind"] === "question.resolved" && (event as { reqId?: string }).reqId === questionId)).toHaveLength(0);
 
   const third = await startDaemon(home, port3, fakeBin);
   await waitForSessionStatus(home, sessionId, {

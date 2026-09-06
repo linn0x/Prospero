@@ -13,6 +13,7 @@ import { createServer, type Server } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { SessionDatabase } from "../src/session-database.js";
 import {
   launchStructuredSupervisor,
   RemoteStructuredSession,
@@ -262,6 +263,19 @@ describe("structured supervisor launch rollback", () => {
       const recovered = JSON.parse(readFileSync(path.join(fixture.manifest.sessionDir!, "manifest.json"), "utf8")) as StructuredSupervisorManifest;
       expect(recovered.lifecycleEpoch).toBe(fixture.manifest.lifecycleEpoch);
       expect(recovered.transport).toBe("unix_socket");
+      expect(recovered.storageVersion).toBe(2);
+      await eventually(() => session!.info().status === "idle", "synthetic native initialization");
+      await session.send("synthetic persistence check");
+      await eventually(() => session!.info().status === "completed", "synthetic completed turn");
+      expect(existsSync(path.join(fixture.manifest.sessionDir!, "session.json"))).toBe(false);
+      const database = new SessionDatabase(path.join(fixture.manifest.sessionDir!, "session.sqlite"), { readOnly: true });
+      try {
+        const saved = database.readSession(fixture.manifest.sessionId);
+        expect(saved?.events).toContainEqual(expect.objectContaining({ kind: "user.message", text: "synthetic persistence check" }));
+        expect(saved?.events).toContainEqual(expect.objectContaining({ kind: "text.delta", delta: "fake:worker-prompt-completed" }));
+        expect(saved?.adapterState.threadId).toBe("fake-thread");
+      } finally { database.close(); }
+      expect(session.historyPage().events.length).toBeGreaterThan(0);
       await session.kill();
       await eventually(() => !processAlive(groupId), "legacy runner process group exit", 3_000);
     } finally {

@@ -7,13 +7,10 @@
  */
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import {
-  appendFileSync,
   chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
-  readFileSync,
-  renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -26,9 +23,14 @@ import {
   structuredSupervisorTransport,
 } from "./structured-supervisor-platform.js";
 
+import {
+  migrateSupervisorReplay,
+  SupervisorEventDatabase,
+  SUPERVISOR_REPLAY_LIMIT,
+  type ReplaySession,
+} from "./supervisor-event-database.js";
+
 const MAX_LINE_BYTES = 1024 * 1024;
-const MAX_EVENTS_PER_SESSION = 4_000;
-const STATE_VERSION = 1;
 const SESSION_ID = /^[A-Za-z0-9._-]{1,128}$/;
 /** Bump only with a backwards-compatible server/client migration plan. */
 export const SUPERVISOR_PROTOCOL_VERSION = 1;
@@ -92,25 +94,15 @@ export interface StructuredSupervisor {
   close(): Promise<void>;
 }
 
-interface PersistedSession {
-  id: string;
-  status: SupervisorSessionStatus;
-  /** Sequence immediately before events[0] when retention compacted history. */
-  oldestSeq: number;
-  lastSeq: number;
-  /** Bounded/terminal snapshot; events.jsonl is canonical between snapshots. */
-  events: SupervisorEvent[];
-}
+type PersistedSession = ReplaySession;
 
-interface PersistedState {
-  version: number;
-  sessions: PersistedSession[];
-}
+function isKilled(status: SupervisorSessionStatus): boolean { return status === "killed"; }
 
 interface RuntimeSession {
   persisted: PersistedSession;
   adapter: SupervisorAdapter | null;
   started: boolean;
+  storageFailed?: boolean;
 }
 
 interface RpcRequest {
@@ -187,8 +179,8 @@ function write(socket: Socket, value: Record<string, unknown>): void {
 }
 
 class SupervisorState {
-  private readonly statePath: string;
-  private readonly eventsPath: string;
+  private database: SupervisorEventDatabase | null = null;
+  private readonly databasePath: string;
   readonly sessions = new Map<string, RuntimeSession>();
 
   constructor(
@@ -196,9 +188,22 @@ class SupervisorState {
     private readonly broadcast: (event: SupervisorEvent) => void,
     private readonly broadcastInfo: (sessionId: string, info: SessionInfo) => void,
   ) {
-    this.statePath = path.join(home, "state.json");
-    this.eventsPath = path.join(home, "events.jsonl");
-    this.load();
+    this.databasePath = path.join(home, "supervisor.sqlite");
+    // Metadata only: replay is loaded on demand, never parsed at process start.
+    for (const persisted of this.store().sessions()) {
+      this.sessions.set(persisted.id, { persisted, adapter: null, started: false });
+    }
+  }
+
+  private store(): SupervisorEventDatabase {
+    return this.database ??= new SupervisorEventDatabase(this.databasePath);
+  }
+
+  closePersistence(): void {
+    this.database?.close();
+    this.database = null;
+    // If an adapter emits after IPC closes, store() reopens its journal. Closing
+    // a daemon-facing endpoint is still not an adapter cancellation operation.
   }
 
   create(sessionId: string, adapter: SupervisorAdapter): Promise<void> {
@@ -214,12 +219,12 @@ class SupervisorState {
       return this.start(existing);
     }
     const runtime: RuntimeSession = {
-      persisted: { id: sessionId, status: "created", oldestSeq: 0, lastSeq: 0, events: [] },
+      persisted: { id: sessionId, status: "created", oldestSeq: 0, lastSeq: 0 },
       adapter,
       started: false,
     };
     this.sessions.set(sessionId, runtime);
-    this.persist();
+    this.store().saveSession(runtime.persisted);
     return this.start(runtime);
   }
 
@@ -229,7 +234,7 @@ class SupervisorState {
     if (!adapter) throw new SupervisorError("session 没有可接管的 adapter", "adapter_missing");
     runtime.started = true;
     runtime.persisted.status = "running";
-    this.persist();
+    this.store().saveSession(runtime.persisted);
     try {
       await adapter.start({
         emit: (body) => this.record(runtime, body),
@@ -243,7 +248,7 @@ class SupervisorState {
       // reports an expected cancellation/startup error.
       if (!isKilled(runtime.persisted.status)) {
         runtime.persisted.status = "failed";
-        this.persist(true);
+        this.store().saveSession(runtime.persisted);
       }
       throw error;
     }
@@ -251,6 +256,7 @@ class SupervisorState {
 
   async send(sessionId: string, text: string): Promise<void> {
     const session = this.require(sessionId);
+    this.requireWritable(session);
     if (session.persisted.status === "killed") throw new SupervisorError("session 已被显式终止", "session_killed");
     if (!session.adapter?.send) throw new SupervisorError("adapter 不支持 send", "unsupported");
     await session.adapter.send(text);
@@ -268,13 +274,15 @@ class SupervisorState {
     // Persist the termination fence before touching native work. An adapter
     // can still emit during (or even after) cancellation; those late events
     // must not revive a session or leak into a subsequent daemon attachment.
-    session.persisted.status = "killed";
-    this.persist(true);
+    const killed: PersistedSession = { ...session.persisted, status: "killed" };
+    this.store().saveSession(killed);
+    session.persisted = killed;
     await session.adapter?.kill?.();
   }
 
   async call(sessionId: string, method: string, params: unknown): Promise<unknown> {
     const session = this.require(sessionId);
+    this.requireWritable(session);
     if (session.persisted.status === "killed") {
       throw new SupervisorError("session 已被显式终止", "session_killed");
     }
@@ -283,8 +291,8 @@ class SupervisorState {
   }
 
   status(sessionId: string): { status: SupervisorSessionStatus; lastSeq: number } {
-    const session = this.require(sessionId).persisted;
-    return { status: session.status, lastSeq: session.lastSeq };
+    const runtime = this.require(sessionId);
+    return { status: runtime.storageFailed ? "failed" : runtime.persisted.status, lastSeq: runtime.persisted.lastSeq };
   }
 
   stateNotifications(sessionId: string): boolean {
@@ -295,7 +303,7 @@ class SupervisorState {
     const session = this.require(sessionId).persisted;
     const gap = afterSeq < session.oldestSeq;
     return {
-      events: gap ? [...session.events] : session.events.filter((event) => event.seq > afterSeq),
+      events: this.store().replay(session, gap ? session.oldestSeq : afterSeq),
       lastSeq: session.lastSeq,
       gap,
     };
@@ -304,33 +312,29 @@ class SupervisorState {
   private record(runtime: RuntimeSession, body: AgentEventBody): void {
     const persisted = runtime.persisted;
     if (persisted.status === "killed") return;
+    this.requireWritable(runtime);
     const event: SupervisorEvent = {
       sessionId: persisted.id,
       seq: persisted.lastSeq + 1,
       at: Date.now(),
       body,
     };
-    // Appending one framed record is O(1) in the number of streamed deltas.
-    // It is completed before clients are notified, preserving the replay
-    // contract without repeatedly serializing a 4,000-event JSON array.
-    appendFileSync(this.eventsPath, `${JSON.stringify(event)}\n`, { mode: 0o600 });
-    chmodSync(this.eventsPath, 0o600);
+    // Commit the event and durable cursor together, before acknowledging it.
+    // No in-memory replay array and no full JSON snapshot on turn boundaries.
+    try { this.store().append(event, persisted); }
+    catch {
+      // The session checkpoint may already contain this body. Never assign its
+      // sequence to a later event if this independent replay commit failed.
+      runtime.storageFailed = true;
+      throw new SupervisorError("会话历史写入失败，已停止接受新操作；原始数据保留", "storage_failed");
+    }
     persisted.lastSeq = event.seq;
-    persisted.events.push(event);
-    while (persisted.events.length > MAX_EVENTS_PER_SESSION) {
-      const removed = persisted.events.shift();
-      if (removed) persisted.oldestSeq = removed.seq;
-    }
-    // State snapshots remain bounded and are only rewritten for terminal or
-    // interaction boundaries; events.jsonl above is the durable hot path.
-    if (isSnapshotBoundary(body)) {
-      // Snapshot first, then atomically discard exactly the journal prefix it
-      // contains. A crash before this point replays the harmless duplicate
-      // prefix; a crash after it has the complete bounded snapshot.
-      this.persist(true);
-      this.compactJournal();
-    }
+    persisted.oldestSeq = Math.max(persisted.oldestSeq, event.seq - SUPERVISOR_REPLAY_LIMIT);
     this.broadcast(event);
+  }
+
+  private requireWritable(runtime: RuntimeSession): void {
+    if (runtime.storageFailed) throw new SupervisorError("会话历史写入失败，已停止接受新操作；原始数据保留", "storage_failed");
   }
 
   private require(sessionId: string): RuntimeSession {
@@ -339,119 +343,6 @@ class SupervisorState {
     return session;
   }
 
-  private load(): void {
-    if (!existsSync(this.statePath)) return;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(readFileSync(this.statePath, "utf8"));
-    } catch {
-      throw new SupervisorError("supervisor state.json 损坏，拒绝覆盖", "state_invalid");
-    }
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      throw new SupervisorError("supervisor state.json 无效，拒绝覆盖", "state_invalid");
-    }
-    const state = parsed as Partial<PersistedState>;
-    if (state.version !== STATE_VERSION || !Array.isArray(state.sessions)) {
-      throw new SupervisorError("supervisor state 版本不兼容", "state_invalid");
-    }
-    for (const candidate of state.sessions) {
-      if (!candidate || typeof candidate !== "object" || !SESSION_ID.test(candidate.id)) continue;
-      if (typeof candidate.lastSeq !== "number" || typeof candidate.oldestSeq !== "number") continue;
-      if (!isStatus(candidate.status)) continue;
-      const events = Array.isArray(candidate.events) ? candidate.events.filter(isSupervisorEvent) : [];
-      this.sessions.set(candidate.id, {
-        persisted: {
-          id: candidate.id,
-          status: candidate.status,
-          oldestSeq: candidate.oldestSeq,
-          lastSeq: candidate.lastSeq,
-          events,
-        },
-        adapter: null,
-        started: false,
-      });
-    }
-    this.loadJournal();
-  }
-
-  private loadJournal(): void {
-    if (!existsSync(this.eventsPath)) return;
-    let raw: string;
-    try { raw = readFileSync(this.eventsPath, "utf8"); } catch { return; }
-    for (const line of raw.split("\n")) {
-      if (!line) continue;
-      try {
-        const event: unknown = JSON.parse(line);
-        if (!isSupervisorEvent(event)) continue;
-        const runtime = this.sessions.get(event.sessionId);
-        if (!runtime || event.seq <= runtime.persisted.lastSeq) continue;
-        // A corrupt/truncated tail must never create a synthetic gap.
-        if (event.seq !== runtime.persisted.lastSeq + 1) continue;
-        runtime.persisted.lastSeq = event.seq;
-        runtime.persisted.events.push(event);
-        while (runtime.persisted.events.length > MAX_EVENTS_PER_SESSION) {
-          const removed = runtime.persisted.events.shift();
-          if (removed) runtime.persisted.oldestSeq = removed.seq;
-        }
-      } catch {
-        // An interrupted final append is ignored; no later entry can bridge it.
-      }
-    }
-  }
-
-  private persist(includeEvents = false): void {
-    const state: PersistedState = {
-      version: STATE_VERSION,
-      sessions: [...this.sessions.values()].map((runtime) => ({
-        ...runtime.persisted,
-        ...(includeEvents ? { events: runtime.persisted.events } : { events: [] }),
-      })),
-    };
-    const temp = `${this.statePath}.${process.pid}.${randomBytes(5).toString("hex")}.tmp`;
-    writeFileSync(temp, JSON.stringify(state), { mode: 0o600 });
-    chmodSync(temp, 0o600);
-    renameSync(temp, this.statePath);
-    chmodSync(this.statePath, 0o600);
-  }
-
-  private compactJournal(): void {
-    const temp = `${this.eventsPath}.${process.pid}.${randomBytes(5).toString("hex")}.tmp`;
-    writeFileSync(temp, "", { mode: 0o600 });
-    chmodSync(temp, 0o600);
-    renameSync(temp, this.eventsPath);
-    chmodSync(this.eventsPath, 0o600);
-  }
-}
-
-function isSnapshotBoundary(body: AgentEventBody): boolean {
-  return body.kind === "turn.end" || body.kind === "agent.error" ||
-    body.kind === "permission.request" || body.kind === "permission.resolved" ||
-    body.kind === "question.request" || body.kind === "question.resolved";
-}
-
-function isStatus(value: unknown): value is SupervisorSessionStatus {
-  return value === "created" || value === "running" || value === "killed" || value === "failed";
-}
-
-// This function deliberately keeps TypeScript from treating the pre-await
-// `running` assignment in start() as proof about the mutable runtime state.
-function isKilled(status: SupervisorSessionStatus): boolean {
-  return status === "killed";
-}
-
-function isSupervisorEvent(value: unknown): value is SupervisorEvent {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const event = value as Partial<SupervisorEvent>;
-  return (
-    typeof event.sessionId === "string" &&
-    SESSION_ID.test(event.sessionId) &&
-    typeof event.seq === "number" &&
-    Number.isSafeInteger(event.seq) &&
-    event.seq > 0 &&
-    typeof event.at === "number" &&
-    !!event.body &&
-    typeof event.body === "object"
-  );
 }
 
 /**
@@ -499,6 +390,10 @@ export async function startStructuredSupervisor(
   const tokenPath = opts.tokenPath ?? path.join(opts.home, "supervisor.token");
   const token = opts.token ?? randomBytes(32).toString("base64url");
 
+  await removeVerifiedStaleSocket(socketPath);
+  try { await migrateSupervisorReplay(opts.home); }
+  catch { throw new SupervisorError("supervisor 历史迁移失败，原始数据保留", "state_invalid"); }
+
   const connections = new Set<Connection>();
   const state = new SupervisorState(opts.home, (event) => {
     for (const connection of connections) {
@@ -534,21 +429,26 @@ export async function startStructuredSupervisor(
       }
     });
   });
-  await removeVerifiedStaleSocket(socketPath);
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(socketPath, () => {
-      server.off("error", reject);
-      resolve();
-    });
-  });
-  chmodSync(socketPath, 0o600);
   try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(socketPath, () => {
+        server.off("error", reject);
+        resolve();
+      });
+    });
+  } catch (error) {
+    state.closePersistence();
+    throw error;
+  }
+  try {
+    chmodSync(socketPath, 0o600);
     writeFileSync(tokenPath, `${token}\n`, { mode: 0o600 });
     chmodSync(tokenPath, 0o600);
   } catch (error) {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     rmSync(socketPath, { force: true });
+    state.closePersistence();
     throw error;
   }
 
@@ -562,6 +462,7 @@ export async function startStructuredSupervisor(
       for (const connection of connections) connection.socket.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
       rmSync(socketPath, { force: true });
+      state.closePersistence();
     },
   };
 }
@@ -624,7 +525,9 @@ async function route(connection: Connection, request: RpcRequest, state: Supervi
   const sessionId = safeSessionId(params["sessionId"]);
   switch (request.method) {
     case "session.subscribe": {
-      const replay = state.replay(sessionId, cursor(params["afterSeq"]));
+      const replay = params["tailOnly"] === true
+        ? { events: [], lastSeq: state.status(sessionId).lastSeq, gap: false }
+        : state.replay(sessionId, cursor(params["afterSeq"]));
       // Register before the response so the next event has exactly one cursor.
       connection.subscriptions.set(sessionId, replay.lastSeq);
       return { sessionId, ...replay, stateNotifications: state.stateNotifications(sessionId) };

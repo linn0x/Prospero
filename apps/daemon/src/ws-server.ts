@@ -71,6 +71,7 @@ import { RelayHostClient } from "./relay-host-client.js";
 import { Notifier, type NotifyConfig } from "./notify.js";
 import { SessionError, SessionManager, type SessionManagerOptions } from "./session-manager.js";
 import { RemoteSupervisorError } from "./structured-supervisor-client.js";
+import { SessionDatabaseError } from "./session-database.js";
 import { createStructuredSupervisorRuntimeSnapshot } from "./structured-supervisor-runtime.js";
 import { StatusFile } from "./status-file.js";
 import { probeApiProfile } from "./api-profile-probe.js";
@@ -1383,7 +1384,7 @@ export async function createDaemonServer(
             ...(info ? { session: clampSessionInfo(info) } : {}),
             error: info ? "会话已经创建，但 Goal 初始化失败；请先查看会话列表。" : error instanceof SessionError || error instanceof AgentAccountError || error instanceof RemoteSupervisorError || error instanceof OrchestrationError
               ? error.message.slice(0, 2000) : "创建会话失败，请查看电脑端状态",
-            code: error instanceof SessionError ? error.code : error instanceof RemoteSupervisorError ? "agent_unavailable" : "bad_message",
+            code: error instanceof SessionError ? (error.code === "storage_unavailable" ? "agent_unavailable" : error.code) : error instanceof RemoteSupervisorError ? "agent_unavailable" : "bad_message",
             ...(error instanceof SessionError && error.reason ? { reason: error.reason } : {}),
           });
           return;
@@ -2090,10 +2091,14 @@ export async function createDaemonServer(
       if (e instanceof SessionError) {
         send(conn, {
           type: "error",
-          code: e.code,
+          code: e.code === "storage_unavailable" ? "agent_unavailable" : e.code,
           message: e.message,
           ...(e.reason ? { reason: e.reason } : {}),
         });
+        return;
+      }
+      if (e instanceof SessionDatabaseError) {
+        send(conn, { type: "error", code: "agent_unavailable", message: "会话数据库暂时不可用，历史数据已保留。" });
         return;
       }
       if (e instanceof AgentAccountError) {
@@ -2731,6 +2736,35 @@ export async function createDaemonServer(
         } else {
           res.writeHead(400).end(e instanceof Error ? e.message : String(e));
         }
+      }
+      return;
+    }
+    const sessionHistoryMatch = url.pathname.match(/^\/_prospero\/control\/session\/([^/]+)\/history$/);
+    if (req.method === "GET" && sessionHistoryMatch) {
+      try {
+        const sid = decodeURIComponent(sessionHistoryMatch[1]!);
+        const beforeRaw = url.searchParams.get("beforeSeq");
+        const beforeSeq = beforeRaw === null ? undefined : Number(beforeRaw);
+        const limit = Number(url.searchParams.get("limit") ?? 200);
+        const maxBytes = Number(url.searchParams.get("maxBytes") ?? 512 * 1024);
+        if ((beforeSeq !== undefined && (!Number.isSafeInteger(beforeSeq) || beforeSeq < 1))
+          || !Number.isSafeInteger(limit) || limit < 1 || limit > 200
+          || !Number.isSafeInteger(maxBytes) || maxBytes < 1024 || maxBytes > 512 * 1024) {
+          res.writeHead(400).end("invalid history page bounds");
+          return;
+        }
+        const session = manager.requireStructured(sid);
+        if (!("historyPage" in session)) {
+          res.writeHead(409).end("history paging unavailable for this owner");
+          return;
+        }
+        const page = session.historyPage({ ...(beforeSeq === undefined ? {} : { beforeSeq }), limit, maxBytes });
+        res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+        res.end(JSON.stringify(page));
+      } catch (error) {
+        if (error instanceof URIError) res.writeHead(400).end("invalid session id");
+        else if (error instanceof SessionError && error.code === "session_not_found") res.writeHead(404).end(error.message);
+        else res.writeHead(409).end("会话历史分页暂时不可用，原始数据已保留。");
       }
       return;
     }

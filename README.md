@@ -100,7 +100,7 @@ control token 只留在 Electron main 的白名单 IPC 内。桌面端与 PowerS
 ## How to use
 
 > 以下 daemon 命令可在 Mac 终端或 Windows PowerShell/cmd 中执行。需要 macOS 14+ 或 Windows 11、
-> Node.js 22+，以及至少一个已登录的 Agent CLI。构建 iOS 客户端需要 Xcode；Android 客户端需要
+> Node.js 22.13+，以及至少一个已登录的 Agent CLI。构建 iOS 客户端需要 Xcode；Android 客户端需要
 > JDK 17 与 Android SDK。
 
 ### 1. 在电脑上启动 Prospero
@@ -115,6 +115,7 @@ node apps/daemon/dist/cli.js start --name my-computer
 
 Windows 11 最终用户可直接运行与 CPU 架构匹配的 `Prospero-*-windows-*.exe` 安装器，也可使用便携 ZIP。
 正式包内置 Node.js sidecar、同一份 daemon、协议包和生产依赖，安装后会自动启动服务，不要求预装 Node.js。
+结构化会话采用 SQLite 增量存储；旧数据迁移和兼容边界见 [SQLite 会话存储](docs/sqlite-session-storage.md)。
 PTY 由 Electron 内的 xterm.js 渲染，保留真彩色、光标、全屏 TUI、剪贴板和窗口尺寸同步；终端与编排页面按需加载。
 
 开发者从源码构建桌面端时可执行：

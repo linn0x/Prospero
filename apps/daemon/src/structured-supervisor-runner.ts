@@ -24,7 +24,8 @@ import { DeepseekAdapter } from "./adapters/deepseek.js";
 import { GrokAdapter } from "./adapters/grok.js";
 import { OpencodeAdapter } from "./adapters/opencode.js";
 import type { AdapterResumeState, AgentAdapter } from "./adapters/types.js";
-import { StructuredSession, type StructuredSessionPersistentState } from "./structured-session.js";
+import { StructuredSession, StructuredSessionWriteFence } from "./structured-session.js";
+import { SessionDatabase } from "./session-database.js";
 import { SUPERVISOR_PROTOCOL_VERSION, startStructuredSupervisor, type SupervisorAdapter } from "./structured-supervisor.js";
 import {
   hasPrivateSupervisorDirectoryMode,
@@ -43,6 +44,7 @@ export const SUPERVISOR_MANIFEST_VERSION = 1;
 
 export interface StructuredSupervisorManifest {
   version: 1;
+  storageVersion?: 2;
   protocolVersion: number;
   implementation: "supervisor";
   sessionId: string;
@@ -98,7 +100,7 @@ const LEGACY_RUNNER_CONFIG_KEYS = new Set([...RUNNER_CONFIG_KEYS].filter(
 const MANIFEST_KEYS = new Set([
   "version", "protocolVersion", "implementation", "sessionId", "agent", "title", "cwd", "createdAt",
   "approvalPolicy", "socket", "transport", "tokenFile", "sessionDir", "supervisorPid", "lifecycleEpoch",
-  "status", "updatedAt", "accountId", "accountName",
+  "status", "updatedAt", "accountId", "accountName", "storageVersion",
 ]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -154,6 +156,7 @@ function readLegacyManifest(sessionDir: string): StructuredSupervisorManifest | 
     if (!isRecord(raw) || !hasOnlyKeys(raw, MANIFEST_KEYS)) return null;
     if (
       raw["version"] !== SUPERVISOR_MANIFEST_VERSION || raw["protocolVersion"] !== SUPERVISOR_PROTOCOL_VERSION ||
+      (raw["storageVersion"] !== undefined && raw["storageVersion"] !== 2) ||
       raw["implementation"] !== "supervisor" || typeof raw["sessionId"] !== "string" ||
       typeof raw["agent"] !== "string" || typeof raw["title"] !== "string" || typeof raw["cwd"] !== "string" ||
       typeof raw["createdAt"] !== "number" || !Number.isFinite(raw["createdAt"]) ||
@@ -352,6 +355,11 @@ async function control(session: StructuredSession, method: string, raw: unknown)
     case "info": return session.info();
     case "snapshot": return session.snapshot();
     case "transportSnapshot": return session.transportSnapshot();
+    case "historyPage": return session.historyPage({
+      ...(typeof params["beforeSeq"] === "number" ? { beforeSeq: params["beforeSeq"] } : {}),
+      ...(typeof params["limit"] === "number" ? { limit: params["limit"] } : {}),
+      ...(typeof params["maxBytes"] === "number" ? { maxBytes: params["maxBytes"] } : {}),
+    });
     case "send":
       if (typeof params["text"] !== "string") throw new Error("text must be a string");
       await session.send(params["text"], params["attachments"] as Attachment[] | undefined, params["delivery"] as ChatDelivery | undefined);
@@ -419,27 +427,56 @@ export async function runStructuredSupervisor(): Promise<void> {
   const token = readFileSync(tokenPath, "utf8").trim();
   if (!token) throw new Error("empty supervisor capability token");
 
-  const statePath = path.join(config.sessionDir, "session.json");
+  // This executable is used only for new owners. Already-running schema-1
+  // owners keep their immutable runner and legacy JSON until they exit.
+  const database = new SessionDatabase(path.join(config.sessionDir, "session.sqlite"));
+  process.once("exit", () => database.close());
+  const nativeAdapter = adapterFor(config.adapterAgent ?? config.agent, config.initialAdapterState);
+  const writeFence = new StructuredSessionWriteFence(() => {
+    // Cooperative cancellation reduces ongoing work; the permanent write guard
+    // is what prevents late callbacks from growing buffers or moving cursors.
+    void nativeAdapter.interrupt().catch(() => {});
+  });
   const persist = (session: StructuredSession) => {
-    const state: StructuredSessionPersistentState = session.persistentState();
-    privateWrite(statePath, state);
-    updateManifest(config, { status: session.info().status });
+    writeFence.run(() => {
+      const state = session.persistentState({ incremental: true });
+      database.saveSession(state);
+      session.acknowledgePersistence(state.evSeq);
+    });
   };
   const session = new StructuredSession({
     id: config.sessionId,
     agent: config.agent,
     title: config.title,
     cwd: config.cwd,
-    adapter: adapterFor(config.adapterAgent ?? config.agent, config.initialAdapterState),
+    adapter: nativeAdapter,
     environment: config.environment,
     ...(config.codexAppServerArgs ? { codexAppServerArgs: config.codexAppServerArgs } : {}),
     ...(config.accountId ? { accountId: config.accountId } : {}),
     ...(config.accountName ? { accountName: config.accountName } : {}),
     ...(config.approvalPolicy ? { approvalPolicy: config.approvalPolicy } : {}),
     attachmentRoot: config.attachmentRoot,
+    storage: {
+      assertWritable: () => writeFence.assertWritable(),
+      historyPage: (options) => database.readEventsPage(config.sessionId, options),
+      readEvents: () => {
+        const stored = database.readSession(config.sessionId, {
+          events: true, toolOutputs: false, messageQueue: false, limit: 4_000, maxBytes: Number.MAX_SAFE_INTEGER,
+        });
+        return { events: stored?.events ?? [], evSeq: stored?.evSeq ?? 0 };
+      },
+      toolOutput: (callId) => database.toolOutput(config.sessionId, callId),
+      saveToolOutput: (callId, output) => writeFence.run(() => database.saveToolOutput(config.sessionId, callId, output)),
+    },
   });
+  // Establish the parent row before an adapter can save its first tool body.
+  persist(session);
   session.on("persist", () => persist(session));
-  session.on("state", () => persist(session));
+  session.on("event", () => persist(session));
+  session.on("state", () => {
+    persist(session);
+    updateManifest(config, { status: session.info().status, storageVersion: 2 });
+  });
 
   let supervisor: Awaited<ReturnType<typeof startStructuredSupervisor>> | null = null;
   const exitAfterClose = () => {
@@ -459,20 +496,23 @@ export async function runStructuredSupervisor(): Promise<void> {
   const adapter: SupervisorAdapter = {
     stateNotifications: true,
     async start(context) {
-      session.on("event", (body) => context.emit(body));
+      session.on("event", (body) => { writeFence.assertWritable(); context.emit(body); });
       session.on("state", (info) => context.state(info));
       await session.start();
       persist(session);
     },
     interrupt: () => session.interrupt(),
     async kill() {
-      await session.dispose();
-      persist(session);
-      // Allow the kill response to flush first.  This is the only path where a
-      // daemon request terminates the supervisor process group.
-      setTimeout(exitAfterClose, 25).unref();
+      try {
+        await session.dispose();
+        persist(session);
+      } finally {
+        // Even a failed checkpoint must not block explicit cancellation/exit.
+        // Allow the kill response (including an error) to flush first.
+        setTimeout(exitAfterClose, 25).unref();
+      }
     },
-    call: (method, params) => control(session, method, params),
+    call: (method, params) => { writeFence.assertWritable(); return control(session, method, params); },
   };
 
   supervisor = await startStructuredSupervisor({
@@ -481,7 +521,7 @@ export async function runStructuredSupervisor(): Promise<void> {
     tokenPath,
     token,
   });
-  updateManifest(config, { supervisorPid: process.pid, status: "starting" });
+  updateManifest(config, { supervisorPid: process.pid, status: "starting", storageVersion: 2 });
   await supervisor.createSession(config.sessionId, adapter);
   updateManifest(config, { status: session.info().status });
 
