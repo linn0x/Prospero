@@ -6,6 +6,7 @@ export * from "./crypto.js";
 export * from "./qr.js";
 export * from "./ring.js";
 export * from "./relay.js";
+export * from "./account-capabilities.js";
 export {
   parseC2S,
   parseS2C,
@@ -13,6 +14,10 @@ export {
   AgentApiProviderSchema,
   AgentApiProtocolSchema,
   AgentApiProfileSchema,
+  AgentExecutionEngineSchema,
+  AgentAccountCapabilitiesSchema,
+  AgentModelCapabilitiesSchema,
+  AgentApiValidationSchema,
   SessionKindSchema,
   SessionStatusSchema,
   SessionInfoSchema,
@@ -21,6 +26,7 @@ export {
   C2SLaunchModelsGetSchema,
   C2SAgentAccountApiCreateSchema,
   C2SAgentAccountApiConfigureSchema,
+  C2SAgentAccountApiTestSchema,
   S2CConversationResultsSchema,
   HostInfoSchema,
   PermissionReplySchema,

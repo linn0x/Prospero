@@ -9,6 +9,7 @@ struct RunningStatus: Sendable, Equatable {
   var port: Int
   var bind: String?
   var controlToken: String
+  var capabilities: [String]
   var persistence: Persistence
   var sessions: [Session]
 
@@ -119,6 +120,7 @@ struct RunningStatus: Sendable, Equatable {
       port: obj["port"] as? Int ?? 7423,
       bind: obj["bind"] as? String,
       controlToken: obj["controlToken"] as? String ?? "",
+      capabilities: obj["capabilities"] as? [String] ?? [],
       persistence: {
         let raw = obj["persistence"] as? [String: Any]
         return Persistence(

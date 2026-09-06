@@ -51,6 +51,7 @@ export const CAPABILITY_SESSION_CREATE_MODEL = "session.create-model.v1";
 /** Claude/Codex 的第三方兼容 API Profile 与独立运行环境。 */
 export const CAPABILITY_AGENT_API_PROFILES = "agent.api-profiles.v1";
 export const CAPABILITY_AGENT_API_PROTOCOLS = "agent.api-protocols.v1";
+export const CAPABILITY_AGENT_API_VALIDATION = "agent.api-validation.v1";
 /** DeepSeek Harness 官方本机 RPC/SSE 结构化会话与编排 worker。 */
 export const CAPABILITY_AGENT_DEEPSEEK_HARNESS = "agent.deepseek-harness.v1";
 /** DeepSeek Harness 执行轨迹事件与移动端时间线。 */
@@ -68,6 +69,10 @@ export type {
   AgentApiProvider,
   AgentApiProtocol,
   AgentApiProfile,
+  AgentExecutionEngine,
+  AgentAccountCapabilities,
+  AgentModelCapabilities,
+  AgentApiValidation,
   AgentAccount,
   AgentAccountStatus,
   SessionKind,
@@ -105,6 +110,7 @@ export type {
   C2SAgentAccountCreate,
   C2SAgentAccountApiCreate,
   C2SAgentAccountApiConfigure,
+  C2SAgentAccountApiTest,
   C2SAgentAccountRename,
   C2SAgentAccountSetDefault,
   C2SAgentAccountLogin,

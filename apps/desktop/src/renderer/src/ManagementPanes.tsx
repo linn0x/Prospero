@@ -3,6 +3,8 @@ import { Check, CircleAlert, Copy, KeyRound, Link2, MonitorSmartphone, Pencil, P
 import type { DesktopSnapshot, DeviceInfo, JsonObject, SessionInfo, UsageAccount, UsageWindow } from "../../shared/types";
 import { displayError, number, record, text } from "./state";
 import { AgentLogo } from "./AgentLogo";
+import { accountEngine } from "../../shared/account-capabilities";
+import { ModelCapabilitiesFields } from "./ModelCapabilitiesFields";
 import { getCachedAccountUsage, loadAccountUsage } from "./account-usage-cache";
 import { useLocale } from "./locale";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -26,6 +28,10 @@ import {
   provisionalAccountLoginSession,
   selectCreatedAccount,
   supportsAccountApiProtocols,
+  supportsAccountApiValidation,
+  accountApiStatus,
+  modelCapabilityDraft,
+  parseModelCapabilities,
   type AccountApiProtocol,
 } from "./account-profile-form";
 
@@ -60,10 +66,27 @@ function UsageMeters({ usage }: { usage?: UsageAccount | undefined }) {
   })}{usage.spendRemainingPercent !== undefined && <div className="usage-meter"><div><span>{t("消费上限", "Spend limit")} {usage.spendUsed ?? "—"} / {usage.spendLimit ?? "—"}</span><strong>{Math.round(usage.spendRemainingPercent)}% {t("可用", "available")}</strong></div><div className="usage-track"><i style={{ width: `${String(usage.spendRemainingPercent)}%` }} /></div></div>}{usage.windows.length === 0 && <p className="usage-note">{usage.reason ?? t("账号已连接，但未返回套餐限流窗口。", "The account is connected, but no plan rate-limit windows were returned.")}</p>}</div>;
 }
 
-function AccountEditDialog({ account, apiProtocolsSupported, onClose, onSaved }: { account: JsonObject; apiProtocolsSupported: boolean; onClose: () => void; onSaved: () => void }) {
+function ApiValidationDetails({ account }: { account: JsonObject }) {
+  const { t } = useLocale();
+  const validation = record(account["apiValidation"]);
+  const checks = record(validation["checks"]);
+  const label = (value: unknown): string => value === "passed" ? t("通过", "Passed") : value === "failed" ? t("失败", "Failed") : t("未测试", "Not tested");
+  return <div className="usage-note" role="status">
+    <strong>{t(accountApiStatus(account), accountApiStatus(account, true))}</strong>
+    {account["apiProfileError"] ? <p>{text(account["apiProfileError"])}</p> : <>
+      {Object.keys(validation).length > 0 && <>
+        <p>{t("运行环境", "Runtime")}: {label(checks["runtime"])} · {t("流式响应", "Streaming")}: {label(checks["streaming"])} · {t("工具调用", "Tool calls")}: {label(checks["tools"])}</p>
+        <p>{text(validation["detail"])} {typeof validation["checkedAt"] === "number" ? new Date(validation["checkedAt"]).toLocaleString() : ""}</p>
+      </>}
+      <p>{t("测试会向配置的服务发送少量请求，可能消耗额度；检查 API 协议，不代表完整 Agent 执行已验证。", "Testing sends small requests to the configured service and may use credits. API protocol checks do not verify full agent execution.")}</p>
+    </>}
+  </div>;
+}
+
+function AccountEditDialog({ account, apiProtocolsSupported, apiValidationSupported, onClose, onSaved }: { account: JsonObject; apiProtocolsSupported: boolean; apiValidationSupported: boolean; onClose: () => void; onSaved: () => void }) {
   const { t } = useLocale();
   const profile = record(account["apiProfile"]);
-  const apiProfile = Object.keys(profile).length > 0;
+  const apiProfile = Object.keys(profile).length > 0 || Boolean(account["apiProfileError"]);
   const accountId = text(account["id"]);
   const agent = text(account["agent"]);
   const connectionLocked = accountApiConnectionLocked(account);
@@ -71,17 +94,22 @@ function AccountEditDialog({ account, apiProtocolsSupported, onClose, onSaved }:
   const initialProtocol = accountApiProtocolFromProfile(profile, agent);
   const [name, setName] = useState(initialName);
   const [protocol, setProtocol] = useState<AccountApiProtocol>(initialProtocol);
-  const [baseUrl, setBaseUrl] = useState(text(profile["baseUrl"], accountApiProtocolDefaults(initialProtocol).baseUrl));
-  const [model, setModel] = useState(text(profile["model"], accountApiProtocolDefaults(initialProtocol).model));
+  const [baseUrl, setBaseUrl] = useState(text(profile["baseUrl"], account["apiProfileError"] ? "" : accountApiProtocolDefaults(initialProtocol).baseUrl));
+  const [model, setModel] = useState(text(profile["model"], account["apiProfileError"] ? "" : accountApiProtocolDefaults(initialProtocol).model));
   const [apiKey, setApiKey] = useState("");
+  const initialCapabilities = record(profile["modelCapabilities"]);
+  const [modelCapabilities, setModelCapabilities] = useState(() => modelCapabilityDraft(initialCapabilities));
+  const capabilitiesChanged = apiValidationSupported && JSON.stringify(modelCapabilities) !== JSON.stringify(modelCapabilityDraft(initialCapabilities));
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
   const [error, setError] = useState<string>();
+  const errorRef = useRef<HTMLDivElement>(null);
+  useEffect(() => { if (error) errorRef.current?.focus(); }, [error]);
   const protocols = accountApiProtocolsForAgent(agent);
   const apiSettingsChanged = (apiProtocolsSupported && protocol !== initialProtocol)
     || baseUrl.trim() !== text(profile["baseUrl"])
     || model.trim() !== text(profile["model"])
-    || Boolean(apiKey.trim());
+    || Boolean(apiKey.trim()) || capabilitiesChanged || Boolean(account["apiProfileError"]);
   const legacyCredentialMissing = apiProfile && !connectionLocked && !apiProtocolsSupported && apiSettingsChanged && !apiKey.trim();
   const save = async (): Promise<void> => {
     const nextName = name.trim();
@@ -92,6 +120,7 @@ function AccountEditDialog({ account, apiProtocolsSupported, onClose, onSaved }:
     setBusy(true);
     setError(undefined);
     try {
+      if (apiProfile && !connectionLocked && apiValidationSupported) parseModelCapabilities(modelCapabilities, initialCapabilities, protocol);
       if (apiProfile && connectionLocked && nextName !== initialName) {
         const result = await window.prospero.accountAction({
           ...accountApiProfileNameAction(accountId, nextName, apiProtocolsSupported),
@@ -99,7 +128,7 @@ function AccountEditDialog({ account, apiProtocolsSupported, onClose, onSaved }:
         });
         if (result["ok"] === false) throw new Error(text(result["error"], t("账号名称更新失败", "Unable to rename account")));
       } else if (apiProfile && !connectionLocked && apiProtocolsSupported && (nextName !== initialName || apiSettingsChanged)) {
-        const result = await window.prospero.accountAction({ type: "agent.account.api.configure", requestId: crypto.randomUUID(), accountId, name: nextName, provider: accountApiProvider(protocol), protocol, baseUrl: nextBaseUrl, model: nextModel, ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}) });
+        const result = await window.prospero.accountAction({ type: "agent.account.api.configure", requestId: crypto.randomUUID(), accountId, name: nextName, provider: accountApiProvider(protocol), protocol, baseUrl: nextBaseUrl, model: nextModel, ...(capabilitiesChanged ? { modelCapabilities: parseModelCapabilities(modelCapabilities, initialCapabilities, protocol) } : {}), ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}) });
         if (result["ok"] === false) throw new Error(text(result["error"], t("API Profile 更新失败", "Unable to update API profile")));
       } else if (apiProfile && !connectionLocked && !apiProtocolsSupported) {
         if (apiSettingsChanged) {
@@ -130,12 +159,14 @@ function AccountEditDialog({ account, apiProtocolsSupported, onClose, onSaved }:
     setBaseUrl(defaults.baseUrl);
     setModel(defaults.model);
   };
-  return <Dialog open onOpenChange={(open) => { if (!open && !busyRef.current) onClose(); }}><DialogContent className="sm:max-w-lg" showCloseButton={!busy} closeLabel={t("关闭", "Close")} aria-busy={busy}><DialogHeader><DialogTitle>{t("编辑账号", "Edit account")}</DialogTitle><DialogDescription>{apiProfile ? connectionLocked ? t("当前存在活动会话，仅可修改显示名称。", "Only the display name can be changed while sessions are active.") : apiProtocolsSupported ? t("修改名称和 API 连接设置。API Key 留空会保留现有凭据。", "Update the name and API connection. Leave API Key empty to keep the current credential.") : t("当前 daemon 使用旧版 API Profile；修改连接设置时需要重新输入 API Key。", "This daemon uses legacy API profiles. Re-enter the API Key when changing connection settings.") : t("修改这个独立 CLI 账号在 Prospero 中的显示名称。", "Change the display name for this isolated CLI account.")}</DialogDescription></DialogHeader>{error && <div id="account-edit-error" className="inline-error" role="alert">{error}</div>}{apiProfile && connectionLocked && <p className="security-note" role="status">{t("结束活动会话后，才能更新协议、API 地址、模型或 API Key。", "End active sessions before updating the protocol, API URL, model, or API Key.")}</p>}<form className="grid gap-4" onSubmit={(event) => { event.preventDefault(); void save(); }}><FieldGroup><Field><FieldLabel htmlFor="account-edit-name">{t("显示名称", "Display name")}</FieldLabel><Input id="account-edit-name" maxLength={80} disabled={busy} value={name} onChange={(event) => setName(event.target.value)} aria-invalid={Boolean(error)} aria-describedby={error ? "account-edit-error" : undefined} autoFocus /></Field>{apiProfile && <>{apiProtocolsSupported && <Field><FieldLabel htmlFor="account-edit-protocol">{t("API 协议", "API protocol")}</FieldLabel><NativeSelect id="account-edit-protocol" disabled={busy || connectionLocked || protocols.length < 2} value={protocol} onChange={(event) => changeProtocol(event.target.value as AccountApiProtocol)}>{protocols.map((item) => <NativeSelectOption key={item} value={item}>{accountApiProtocolLabel(item)}</NativeSelectOption>)}</NativeSelect><FieldDescription>{accountApiEngineLabel(protocol)} engine · {protocol === "openai_responses" ? t("OpenAI Responses API 及兼容服务", "OpenAI Responses API and compatible services") : protocol === "openai_chat_completions" ? t("OpenAI Chat Completions 兼容服务", "OpenAI Chat Completions-compatible services") : t("Anthropic Messages API 及兼容服务", "Anthropic Messages API and compatible services")}</FieldDescription></Field>}<Field><FieldLabel htmlFor="account-edit-base-url">{t("API 地址", "Base URL")}</FieldLabel><Input id="account-edit-base-url" type="url" inputMode="url" maxLength={2_000} spellCheck={false} disabled={busy || connectionLocked} value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} /></Field><Field><FieldLabel htmlFor="account-edit-model">{t("模型", "Model")}</FieldLabel><Input id="account-edit-model" maxLength={300} spellCheck={false} disabled={busy || connectionLocked} value={model} onChange={(event) => setModel(event.target.value)} /></Field><Field><FieldLabel htmlFor="account-edit-api-key">API Key</FieldLabel><Input id="account-edit-api-key" type="password" maxLength={8_192} autoComplete="new-password" disabled={busy || connectionLocked} value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={apiProtocolsSupported ? t("留空以保留现有凭据", "Leave empty to keep the current credential") : t("修改连接设置时必须重新输入", "Required when changing connection settings")} /></Field></>}</FieldGroup><DialogFooter><Button type="button" variant="outline" disabled={busy} onClick={onClose}>{t("取消", "Cancel")}</Button><Button type="submit" disabled={busy || legacyCredentialMissing || !name.trim() || (apiProfile && !connectionLocked && (!baseUrl.trim() || !model.trim()))}>{busy && <Spinner data-icon="inline-start" />}{busy ? t("保存中…", "Saving…") : t("保存", "Save")}</Button></DialogFooter></form></DialogContent></Dialog>;
+  return <Dialog open onOpenChange={(open) => { if (!open && !busyRef.current) onClose(); }}><DialogContent className="sm:max-w-lg" showCloseButton={!busy} closeLabel={t("关闭", "Close")} aria-busy={busy}><DialogHeader><DialogTitle>{t("编辑账号", "Edit account")}</DialogTitle><DialogDescription>{account["apiProfileError"] ? t("原配置无法读取。请重新填写服务地址和模型；API Key 留空会保留现有凭据。", "The saved profile could not be read. Re-enter the service URL and model; leave API Key empty to retain the existing credential.") : apiProfile ? connectionLocked ? t("当前存在活动会话，仅可修改显示名称。", "Only the display name can be changed while sessions are active.") : apiProtocolsSupported ? t("修改名称和 API 连接设置。API Key 留空会保留现有凭据。", "Update the name and API connection. Leave API Key empty to keep the current credential.") : t("当前 daemon 使用旧版 API Profile；修改连接设置时需要重新输入 API Key。", "This daemon uses legacy API profiles. Re-enter the API Key when changing connection settings.") : t("修改这个独立 CLI 账号在 Prospero 中的显示名称。", "Change the display name for this isolated CLI account.")}</DialogDescription></DialogHeader>{apiProfile && connectionLocked && <p className="security-note" role="status">{t("结束活动会话后，才能更新协议、API 地址、模型或 API Key。", "End active sessions before updating the protocol, API URL, model, or API Key.")}</p>}<form className="grid gap-4" onSubmit={(event) => { event.preventDefault(); void save(); }}><FieldGroup><Field><FieldLabel htmlFor="account-edit-name">{t("显示名称", "Display name")}</FieldLabel><Input id="account-edit-name" maxLength={80} disabled={busy} value={name} onChange={(event) => setName(event.target.value)} aria-invalid={Boolean(error)} aria-describedby={error ? "account-edit-error" : undefined} autoFocus /></Field>{apiProfile && <>{apiProtocolsSupported && <Field><FieldLabel htmlFor="account-edit-protocol">{t("API 协议", "API protocol")}</FieldLabel><NativeSelect id="account-edit-protocol" disabled={busy || connectionLocked || protocols.length < 2} value={protocol} onChange={(event) => changeProtocol(event.target.value as AccountApiProtocol)}>{protocols.map((item) => <NativeSelectOption key={item} value={item}>{accountApiProtocolLabel(item)}</NativeSelectOption>)}</NativeSelect><FieldDescription>{accountApiEngineLabel(protocol)} engine · {protocol === "openai_responses" ? t("OpenAI Responses API 及兼容服务", "OpenAI Responses API and compatible services") : protocol === "openai_chat_completions" ? t("OpenAI Chat Completions 兼容服务", "OpenAI Chat Completions-compatible services") : t("Anthropic Messages API 及兼容服务", "Anthropic Messages API and compatible services")}</FieldDescription></Field>}<Field><FieldLabel htmlFor="account-edit-base-url">{t("API 地址", "Base URL")}</FieldLabel><Input id="account-edit-base-url" type="url" inputMode="url" maxLength={2_000} spellCheck={false} disabled={busy || connectionLocked} value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} /></Field><Field><FieldLabel htmlFor="account-edit-model">{t("模型", "Model")}</FieldLabel><Input id="account-edit-model" maxLength={300} spellCheck={false} disabled={busy || connectionLocked} value={model} onChange={(event) => setModel(event.target.value)} /></Field><Field><FieldLabel htmlFor="account-edit-api-key">API Key</FieldLabel><Input id="account-edit-api-key" type="password" maxLength={8_192} autoComplete="new-password" disabled={busy || connectionLocked} value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={apiProtocolsSupported ? t("留空以保留现有凭据", "Leave empty to keep the current credential") : t("修改连接设置时必须重新输入", "Required when changing connection settings")} /></Field>{apiValidationSupported && <ModelCapabilitiesFields value={modelCapabilities} onChange={setModelCapabilities} protocol={protocol} disabled={busy || connectionLocked} />}</>}</FieldGroup>{error && <div ref={errorRef} id="account-edit-error" className="inline-error" role="alert" tabIndex={-1}>{error}</div>}<DialogFooter><Button type="button" variant="outline" disabled={busy} onClick={onClose}>{t("取消", "Cancel")}</Button><Button type="submit" disabled={busy || legacyCredentialMissing || !name.trim() || (apiProfile && !connectionLocked && (!baseUrl.trim() || !model.trim()))}>{busy && <Spinner data-icon="inline-start" />}{busy ? t("保存中…", "Saving…") : t("保存", "Save")}</Button></DialogFooter></form></DialogContent></Dialog>;
 }
 
 export function AccountsPane({ snapshot, onOpenSession }: { snapshot: DesktopSnapshot; onOpenSession: (id: string, session?: SessionInfo) => void }) {
   const { t, status } = useLocale();
   const apiProtocolsSupported = supportsAccountApiProtocols(snapshot.daemon.capabilities);
+  const apiValidationSupported = supportsAccountApiValidation(snapshot.daemon.capabilities);
+  const [modelCapabilities, setModelCapabilities] = useState(() => modelCapabilityDraft());
   const [agent, setAgent] = useState<"codex" | "claude">("codex");
   const [protocol, setProtocol] = useState<AccountApiProtocol>("openai_responses");
   const [name, setName] = useState("");
@@ -215,14 +246,15 @@ export function AccountsPane({ snapshot, onOpenSession }: { snapshot: DesktopSna
     }).catch(() => undefined);
   };
 
-  const runAction = async (account: JsonObject, type: "agent.account.default" | "agent.account.login" | "agent.account.logout" | "agent.account.delete"): Promise<void> => {
+  const runAction = async (account: JsonObject, type: "agent.account.default" | "agent.account.login" | "agent.account.logout" | "agent.account.delete" | "agent.account.api.test"): Promise<void> => {
     const accountId = text(account["id"]);
     const key = `${accountId}:${type}`;
     if (!begin(key)) return;
     try {
       const result = await window.prospero.accountAction({ type, requestId: crypto.randomUUID(), accountId, ...(type === "agent.account.login" ? { cols: 120, rows: 40 } : {}) });
       if (result["cancelled"] === true) return;
-      if (result["ok"] === false) throw new Error(text(result["error"], t("账号操作失败", "Account action failed")));
+      if (result["ok"] === false && (type !== "agent.account.api.test" || !Object.keys(record(result["validation"])).length)) throw new Error(text(result["error"], t("账号操作失败", "Account action failed")));
+      if (type === "agent.account.api.test") setNotice(text(record(result["validation"])["detail"], text(result["error"], t("API 检查已完成", "API checks completed"))));
       const sessionId = text(result["sessionId"]);
       if (sessionId) openAccountSession(sessionId, account);
       if (type === "agent.account.default") setNotice(t("已设为默认账号", "Default account updated"));
@@ -265,7 +297,7 @@ export function AccountsPane({ snapshot, onOpenSession }: { snapshot: DesktopSna
     const requestedModel = model.trim();
     if (!requestedName || !credential || !requestedBaseUrl || !requestedModel || !begin(key)) return;
     try {
-      const result = await window.prospero.accountAction({ type: "agent.account.api.create", requestId: crypto.randomUUID(), agent: accountApiProtocolDefaults(effectiveProtocol).agent, ...(apiProtocolsSupported ? { provider: accountApiProvider(effectiveProtocol), protocol: effectiveProtocol } : {}), name: requestedName, baseUrl: requestedBaseUrl, model: requestedModel, apiKey: credential });
+      const result = await window.prospero.accountAction({ type: "agent.account.api.create", requestId: crypto.randomUUID(), agent: accountApiProtocolDefaults(effectiveProtocol).agent, ...(apiProtocolsSupported ? { provider: accountApiProvider(effectiveProtocol), protocol: effectiveProtocol } : {}), name: requestedName, baseUrl: requestedBaseUrl, model: requestedModel, apiKey: credential, ...(apiValidationSupported && parseModelCapabilities(modelCapabilities, {}, effectiveProtocol) ? { modelCapabilities: parseModelCapabilities(modelCapabilities, {}, effectiveProtocol) } : {}) });
       if (result["ok"] === false) throw new Error(text(result["error"], t("保存 API Profile 失败", "Unable to save API profile")));
       setName("");
       setCredential("");
@@ -285,25 +317,20 @@ export function AccountsPane({ snapshot, onOpenSession }: { snapshot: DesktopSna
     {error && <div className="inline-error" role="alert">{error}</div>}
     {notice && <p className="security-note" role="status" aria-live="polite">{notice}</p>}
     <div className="provider-strip">{providers.map((provider) => {
-      const configured = snapshot.accounts.filter((account) => {
-        const profile = record(account["apiProfile"]);
-        const accountAgent = Object.keys(profile).length > 0
-          ? accountApiEngineLabel(accountApiProtocolFromProfile(profile, text(account["agent"]))).toLocaleLowerCase()
-          : text(account["agent"]);
-        return accountAgent === provider.id;
-      }).length;
+      const configured = snapshot.accounts.filter((account) => accountEngine(account) === provider.id).length;
       const running = snapshot.daemon.sessions.filter((session) => session.agent === provider.id).length;
       return <article className={`provider-card provider-${provider.id}`} key={provider.id}><div className="provider-logo"><AgentLogo agent={provider.id} size={26} /></div><div><strong>{provider.name}</strong><p>{provider.detail}</p></div><span>{configured ? `${String(configured)} ${t("个账号", "accounts")}` : running ? `${String(running)} ${t("个会话", "sessions")}` : t("待配置", "Not configured")}</span></article>;
     })}</div>
     <div className="split-management account-layout"><section><div className="section-title"><UserRound size={16} />{t("已配置账号", "Configured accounts")} <span>{snapshot.accounts.length}</span></div><div className="card-grid account-grid">{snapshot.accounts.map((account) => {
       const id = text(account["id"]); const accountAgent = text(account["agent"]); const managed = account["managed"] === true; const signedIn = text(account["status"]) === "signed_in";
       const accountUsage = usage.find((item) => item.accountId === id) ?? usage.find((item) => !item.accountId && item.agent === accountAgent);
-      const accountProfile = record(account["apiProfile"]); const accountProtocol = account["apiProfile"] ? accountApiProtocolFromProfile(accountProfile, accountAgent) : undefined; const displayAgent = accountProtocol ? accountApiEngineLabel(accountProtocol).toLocaleLowerCase() : accountAgent;
-      return <article className={`account-card account-card-rich provider-${displayAgent}`} key={id}><div className="account-card-head"><div className="provider-logo"><AgentLogo agent={displayAgent} size={24} /></div><div><strong>{text(account["name"], accountAgent)}</strong><p>{accountProtocol ? `${accountApiProtocolLabel(accountProtocol)} · ${accountApiEngineLabel(accountProtocol)} engine` : accountAgent} · {status(text(account["status"]))}{number(account["activeSessions"]) > 0 ? ` · ${String(number(account["activeSessions"]))} ${t("个会话", "sessions")}` : ""}</p></div>{account["isDefault"] === true && <span className="pill"><Check size={12} />{t("默认", "Default")}</span>}</div><UsageMeters usage={accountUsage} /><div className="button-row compact">{account["isDefault"] !== true && <button aria-busy={busy === `${id}:agent.account.default`} disabled={actionsDisabled} onClick={() => void runAction(account, "agent.account.default")}>{t("设为默认", "Set default")}</button>}{managed && <button disabled={actionsDisabled} onClick={() => { setActionError(undefined); setNotice(undefined); setEditingAccount(account); }}><Pencil size={12} />{t("编辑", "Edit")}</button>}{managed && !account["apiProfile"] && <button aria-busy={busy === `${id}:${signedIn ? "agent.account.logout" : "agent.account.login"}`} disabled={actionsDisabled} onClick={() => void runAction(account, signedIn ? "agent.account.logout" : "agent.account.login")}>{signedIn ? t("退出登录", "Sign out") : t("登录", "Sign in")}</button>}{managed && <button className="danger" aria-busy={busy === `${id}:agent.account.delete`} disabled={actionsDisabled || number(account["activeSessions"]) > 0} onClick={() => void runAction(account, "agent.account.delete")}><Trash2 size={12} />{t("删除", "Delete")}</button>}</div></article>;
+      const accountProfile = record(account["apiProfile"]); const accountProtocol = account["apiProfile"] ? accountApiProtocolFromProfile(accountProfile, accountAgent) : undefined; const displayAgent = accountEngine(account);
+      const hasApiProfile = Boolean(account["apiProfile"] || account["apiProfileError"]);
+      return <article className={`account-card account-card-rich provider-${displayAgent}`} key={id}><div className="account-card-head"><div className="provider-logo"><AgentLogo agent={displayAgent} size={24} /></div><div><strong>{text(account["name"], accountAgent)}</strong><p>{accountProtocol ? `${accountApiProtocolLabel(accountProtocol)} · ${displayAgent} engine` : accountAgent}{!hasApiProfile && <> · {status(text(account["status"]))}</>}{number(account["activeSessions"]) > 0 ? ` · ${String(number(account["activeSessions"]))} ${t("个会话", "sessions")}` : ""}</p></div>{account["isDefault"] === true && <span className="pill"><Check size={12} />{t("默认", "Default")}</span>}</div>{hasApiProfile && <ApiValidationDetails account={account} />}{!hasApiProfile ? <UsageMeters usage={accountUsage} /> : accountUsage ? <UsageMeters usage={accountUsage} /> : <p className="usage-note">{t("API 额度由服务商管理", "API usage is managed by the provider")}</p>}<div className="button-row compact">{hasApiProfile && apiValidationSupported && <button aria-busy={busy === `${id}:agent.account.api.test`} disabled={actionsDisabled || Boolean(account["apiProfileError"]) || account["status"] === "signed_out"} onClick={() => void runAction(account, "agent.account.api.test")}>{t("测试 API 连接", "Test API connection")}</button>}{account["isDefault"] !== true && <button aria-busy={busy === `${id}:agent.account.default`} disabled={actionsDisabled} onClick={() => void runAction(account, "agent.account.default")}>{t("设为默认", "Set default")}</button>}{managed && <button disabled={actionsDisabled} onClick={() => { setActionError(undefined); setNotice(undefined); setEditingAccount(account); }}><Pencil size={12} />{t("编辑", "Edit")}</button>}{managed && !hasApiProfile && <button aria-busy={busy === `${id}:${signedIn ? "agent.account.logout" : "agent.account.login"}`} disabled={actionsDisabled} onClick={() => void runAction(account, signedIn ? "agent.account.logout" : "agent.account.login")}>{signedIn ? t("退出登录", "Sign out") : t("登录", "Sign in")}</button>}{managed && <button className="danger" aria-busy={busy === `${id}:agent.account.delete`} disabled={actionsDisabled || number(account["activeSessions"]) > 0} onClick={() => void runAction(account, "agent.account.delete")}><Trash2 size={12} />{t("删除", "Delete")}</button>}</div></article>;
     })}{snapshot.accounts.length === 0 && <div className="small-empty">{t("还没有账号。可在右侧创建独立 CLI 登录或 API Profile。", "No accounts yet. Create an isolated CLI login or API profile on the right.")}</div>}</div></section>
-      <section className="form-card account-form"><div className="section-title"><Plus size={16} />{t("添加账号", "Add account")}</div><label>{t("CLI Agent", "CLI agent")}<select disabled={actionsDisabled} value={agent} onChange={(event) => { const next = event.target.value as "codex" | "claude"; setAgent(next); if (!apiProtocolsSupported) { const nextProtocol: AccountApiProtocol = next === "claude" ? "anthropic" : "openai_responses"; const defaults = accountApiProtocolDefaults(nextProtocol); setProtocol(nextProtocol); setBaseUrl(defaults.baseUrl); setModel(defaults.model); } }}><option value="codex">Codex</option><option value="claude">Claude</option></select></label><label>{t("显示名称", "Display name")}<input maxLength={80} disabled={actionsDisabled} value={name} onChange={(event) => setName(event.target.value)} placeholder={t("工作账号", "Work account")} /></label><button aria-busy={busy === "managed-create"} onClick={() => void createManaged()} disabled={!name.trim() || actionsDisabled}>{t("创建独立 CLI 账号并登录", "Create isolated CLI account and sign in")}</button><div className="section-label">{t("或添加 API PROFILE", "OR ADD AN API PROFILE")}</div>{apiProtocolsSupported && <label>{t("API 协议", "API protocol")}<select disabled={actionsDisabled} value={protocol} onChange={(event) => { const next = event.target.value as AccountApiProtocol; const defaults = accountApiProtocolDefaults(next); setProtocol(next); setBaseUrl(defaults.baseUrl); setModel(defaults.model); }}>{accountApiProtocols.map((item) => <option key={item} value={item}>{accountApiProtocolLabel(item)}</option>)}</select></label>}<p className="security-note">Agent · {accountApiEngineLabel(effectiveProtocol)} · {effectiveProtocol === "openai_responses" ? t("Responses API，适合 OpenAI 新版模型与兼容服务。", "Responses API for newer OpenAI models and compatible services.") : effectiveProtocol === "openai_chat_completions" ? t("Chat Completions API，使用 OpenCode 引擎。", "Chat Completions API powered by the OpenCode engine.") : t("Anthropic Messages API，适合 Claude 与兼容服务。", "Anthropic Messages API for Claude and compatible services.")}</p><label>{t("API 地址", "API URL")}<input type="url" inputMode="url" maxLength={2_000} spellCheck={false} disabled={actionsDisabled} value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} /></label><label>{t("模型", "Model")}<input maxLength={300} spellCheck={false} disabled={actionsDisabled} value={model} onChange={(event) => setModel(event.target.value)} /></label><label>{effectiveProtocol === "anthropic" ? "Anthropic API Key" : "OpenAI API Key"}<input type="password" maxLength={8_192} disabled={actionsDisabled} value={credential} onChange={(event) => setCredential(event.target.value)} autoComplete="off" /></label><p className="security-note"><KeyRound size={14} />{t("凭据只发送给本机 daemon。", "Credentials are only sent to the local daemon.")}</p><button className="primary" aria-busy={busy === "api-create"} onClick={() => void createApi()} disabled={!name.trim() || !credential || !baseUrl || !model || actionsDisabled}>{t("保存 API Profile", "Save API profile")}</button></section>
+      <section className="form-card account-form"><div className="section-title"><Plus size={16} />{t("添加账号", "Add account")}</div><label>{t("CLI Agent", "CLI agent")}<select disabled={actionsDisabled} value={agent} onChange={(event) => { const next = event.target.value as "codex" | "claude"; setAgent(next); if (!apiProtocolsSupported) { const nextProtocol: AccountApiProtocol = next === "claude" ? "anthropic" : "openai_responses"; const defaults = accountApiProtocolDefaults(nextProtocol); setProtocol(nextProtocol); setBaseUrl(defaults.baseUrl); setModel(defaults.model); } }}><option value="codex">Codex</option><option value="claude">Claude</option></select></label><label>{t("显示名称", "Display name")}<input maxLength={80} disabled={actionsDisabled} value={name} onChange={(event) => setName(event.target.value)} placeholder={t("工作账号", "Work account")} /></label><button aria-busy={busy === "managed-create"} onClick={() => void createManaged()} disabled={!name.trim() || actionsDisabled}>{t("创建独立 CLI 账号并登录", "Create isolated CLI account and sign in")}</button><div className="section-label">{t("或添加 API PROFILE", "OR ADD AN API PROFILE")}</div>{apiProtocolsSupported && <label>{t("API 协议", "API protocol")}<select disabled={actionsDisabled} value={protocol} onChange={(event) => { const next = event.target.value as AccountApiProtocol; const defaults = accountApiProtocolDefaults(next); setProtocol(next); setBaseUrl(defaults.baseUrl); setModel(defaults.model); }}>{accountApiProtocols.map((item) => <option key={item} value={item}>{accountApiProtocolLabel(item)}</option>)}</select></label>}<p className="security-note">Agent · {accountApiEngineLabel(effectiveProtocol)} · {effectiveProtocol === "openai_responses" ? t("Responses API，适合 OpenAI 新版模型与兼容服务。", "Responses API for newer OpenAI models and compatible services.") : effectiveProtocol === "openai_chat_completions" ? t("Chat Completions API，使用 OpenCode 引擎。", "Chat Completions API powered by the OpenCode engine.") : t("Anthropic Messages API，适合 Claude 与兼容服务。", "Anthropic Messages API for Claude and compatible services.")}</p><label>{t("API 地址", "API URL")}<input type="url" inputMode="url" maxLength={2_000} spellCheck={false} disabled={actionsDisabled} value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} /></label><label>{t("模型", "Model")}<input maxLength={300} spellCheck={false} disabled={actionsDisabled} value={model} onChange={(event) => setModel(event.target.value)} /></label><label>{effectiveProtocol === "anthropic" ? "Anthropic API Key" : "OpenAI API Key"}<input type="password" maxLength={8_192} disabled={actionsDisabled} value={credential} onChange={(event) => setCredential(event.target.value)} autoComplete="off" /></label>{apiValidationSupported && <ModelCapabilitiesFields value={modelCapabilities} onChange={setModelCapabilities} protocol={effectiveProtocol} disabled={actionsDisabled} />}<p className="security-note"><KeyRound size={14} />{t("凭据只发送给本机 daemon。", "Credentials are only sent to the local daemon.")}</p><button className="primary" aria-busy={busy === "api-create"} onClick={() => void createApi()} disabled={!name.trim() || !credential || !baseUrl || !model || actionsDisabled}>{t("保存 API Profile", "Save API profile")}</button></section>
     </div>
-    {currentEditingAccount && <AccountEditDialog account={currentEditingAccount} apiProtocolsSupported={apiProtocolsSupported} onClose={() => setEditingAccount(undefined)} onSaved={() => { setActionError(undefined); setNotice(t("账号设置已保存", "Account settings saved")); refresh(); }} />}
+    {currentEditingAccount && <AccountEditDialog account={currentEditingAccount} apiProtocolsSupported={apiProtocolsSupported} apiValidationSupported={apiValidationSupported} onClose={() => setEditingAccount(undefined)} onSaved={() => { setActionError(undefined); setNotice(t("账号设置已保存", "Account settings saved")); refresh(); }} />}
   </div>;
 }
 

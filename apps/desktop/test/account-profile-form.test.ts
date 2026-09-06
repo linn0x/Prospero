@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  accountApiStatus,
+  modelCapabilityDraft,
+  parseModelCapabilities,
+  supportsAccountApiValidation,
   accountApiConnectionLocked,
   accountApiProfileNameAction,
   accountApiProtocolDefaults,
@@ -89,5 +93,34 @@ describe("desktop API profile form", () => {
     expect(selectCreatedAccount(accounts, "created", "Work", "codex", new Set())).toEqual(accounts[1]);
     expect(selectCreatedAccount(accounts, "missing", "Work", "codex", new Set())).toBeUndefined();
     expect(selectCreatedAccount(accounts, "", "Work", "codex", new Set(["older"]))).toEqual(accounts[1]);
+  });
+});
+
+describe("API validation and optional model metadata", () => {
+  it("does not present a configured key as a validated connection", () => {
+    expect(accountApiStatus({ status: "signed_in" }, true)).toBe("Configured · unverified");
+    expect(accountApiStatus({ status: "signed_in", apiValidation: { status: "failed" } }, true)).toBe("API checks failed");
+    expect(accountApiStatus({ status: "signed_in", apiValidation: { status: "passed" } }, true)).toBe("API checks passed");
+    expect(accountApiStatus({ status: "unavailable", apiProfileError: "bad" }, true)).toBe("Profile needs repair");
+    expect(supportsAccountApiValidation(["agent.api-protocols.v1"])).toBe(false);
+    expect(supportsAccountApiValidation(["agent.api-validation.v1"])).toBe(true);
+  });
+
+  it("retains false and unknown fields while changing token limits", () => {
+    const initial = { contextWindow: 1000, tools: false, extraFromNewDaemon: "preserve" };
+    const draft = modelCapabilityDraft(initial);
+    expect(draft.vision).toBe("unknown");
+    expect(parseModelCapabilities({ ...draft, contextWindow: "2000", maxOutputTokens: "500" }, initial))
+      .toEqual({ contextWindow: 2000, maxOutputTokens: 500, tools: false, extraFromNewDaemon: "preserve" });
+    expect(parseModelCapabilities(modelCapabilityDraft())).toBeNull();
+  });
+
+  it("rejects invalid limits instead of silently saving them", () => {
+    for (const contextWindow of ["-1", "0", "1.5", "2e3", "9007199254740992"]) {
+      expect(() => parseModelCapabilities({ ...modelCapabilityDraft(), contextWindow })).toThrow();
+    }
+    expect(() => parseModelCapabilities({ ...modelCapabilityDraft(), contextWindow: "100", maxOutputTokens: "101" })).toThrow("Output limit");
+    expect(() => parseModelCapabilities({ ...modelCapabilityDraft(), contextWindow: "100" }, {}, "openai_chat_completions")).toThrow("both token limits");
+    expect(parseModelCapabilities({ ...modelCapabilityDraft(), contextWindow: "100" }, {}, "openai_responses")).toEqual({ contextWindow: 100 });
   });
 });

@@ -1,6 +1,6 @@
 /**
  * Claude Code 结构化适配器集成测试(跑真实 SDK/CLI)。
- * 未安装 claude 或未登录时跳过。
+ * 仅 PROSPERO_REAL_CLAUDE_TESTS=1 时允许使用本机登录态调用真实模型。
  */
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync } from "node:fs";
@@ -18,6 +18,7 @@ import { SessionManager } from "../src/session-manager.js";
  * 所以探一次真实往返 —— 能拿到非空输出才算可用。
  */
 function hasClaude(): boolean {
+  if (process.env["PROSPERO_REAL_CLAUDE_TESTS"] !== "1") return false;
   try {
     execFileSync("claude", ["--version"], { stdio: "ignore", timeout: 15_000 });
     const out = execFileSync("claude", ["-p", "reply with OK"], {

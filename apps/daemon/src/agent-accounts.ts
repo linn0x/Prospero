@@ -19,11 +19,16 @@ import type {
   AgentApiProfile,
   AgentApiProtocol,
   AgentApiProvider,
+  AgentApiValidation,
+  AgentExecutionEngine,
+  AgentAccountCapabilities,
+  AgentModelCapabilities,
   AgentAccountStatus,
   AgentCredentialKind,
   CodeAgentKind,
   SessionInfo,
 } from "@prospero/protocol";
+import { AgentApiValidationSchema, AgentModelCapabilitiesSchema, getAgentAccountCapabilities, getAgentAccountEngine } from "@prospero/protocol";
 import { programCommandFor } from "./agents.js";
 
 const execFile = promisify(execFileCallback);
@@ -42,6 +47,10 @@ interface StoredAccount {
   name: string;
   /** 非敏感的第三方 API 连接信息；key 单独存账号目录的私有文件。 */
   apiProfile?: StoredApiProfile;
+  /** Present only when apiProfile was explicitly saved but failed validation. Never sent to clients. */
+  invalidApiProfile?: { raw: unknown };
+  apiValidation?: AgentApiValidation;
+  apiValidationRevision?: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -51,6 +60,7 @@ interface StoredApiProfile {
   protocol: AgentApiProtocol;
   baseUrl: string;
   model: string;
+  modelCapabilities?: AgentModelCapabilities;
 }
 
 interface AccountStore {
@@ -67,6 +77,8 @@ export interface AccountBinding {
   environment: Record<string, string>;
   /** 已配置的 API Profile，不含 secret，供状态与会话启动区分。 */
   apiProfile?: AgentApiProfile;
+  engine?: AgentExecutionEngine;
+  capabilities?: AgentAccountCapabilities;
   adapterAgent?: "opencode";
   /** Codex app-server 的受控配置覆盖；避免修改用户的全局 config.toml。 */
   codexAppServerArgs?: string[];
@@ -97,6 +109,7 @@ export interface ApiProfileInput {
   baseUrl?: string;
   model?: string;
   apiKey?: string;
+  modelCapabilities?: AgentModelCapabilities | null;
 }
 
 /** Injectable so tests can exercise account behavior without writing credentials to disk. */
@@ -146,12 +159,17 @@ function parseStore(value: unknown): AccountStore {
         ) {
           return [];
         }
+        const hasApiProfile = Object.hasOwn(account, "apiProfile");
         const apiProfile = parseStoredApiProfile(account["agent"], account["apiProfile"]);
+        const validation = AgentApiValidationSchema.safeParse(account["apiValidation"]);
         return [{
           id: account["id"],
           agent: account["agent"],
           name: account["name"].trim().slice(0, 80),
           ...(apiProfile ? { apiProfile } : {}),
+          ...(hasApiProfile && !apiProfile ? { invalidApiProfile: { raw: account["apiProfile"] } } : {}),
+          ...(apiProfile && validation.success && typeof account["apiValidationRevision"] === "string"
+            ? { apiValidation: validation.data, apiValidationRevision: account["apiValidationRevision"] } : {}),
           createdAt: Math.max(0, Math.round(account["createdAt"])),
           updatedAt: Math.max(0, Math.round(account["updatedAt"])),
         }];
@@ -217,6 +235,7 @@ function cleanApiProfile(
   rawModel: string,
   provider: AgentApiProvider = apiProviderFor(agent),
   protocol: AgentApiProtocol = apiProtocolFor(agent),
+  modelCapabilities?: AgentModelCapabilities | null,
 ): StoredApiProfile {
   const baseUrl = rawBaseUrl.trim();
   const model = rawModel.trim();
@@ -252,7 +271,18 @@ function cleanApiProfile(
     ? provider === "openai_compatible" && (protocol === "openai_responses" || protocol === "openai_chat_completions")
     : provider === "anthropic_compatible" && protocol === "anthropic";
   if (!valid) throw new AgentAccountError("所选 Agent、Provider 与 API 协议不兼容", "account_invalid");
-  return { provider, protocol, baseUrl: normalized, model };
+  const capabilities = modelCapabilities == null ? undefined : AgentModelCapabilitiesSchema.safeParse(modelCapabilities);
+  if (capabilities && !capabilities.success) {
+    throw new AgentAccountError("模型能力配置无效：上下文和输出上限须为正整数，输出不能超过上下文", "account_invalid");
+  }
+  if (protocol === "openai_chat_completions" && capabilities?.success &&
+      ((capabilities.data.contextWindow === undefined) !== (capabilities.data.maxOutputTokens === undefined))) {
+    // OpenCode's limit object requires both fields; avoid inventing an unknown model limit.
+    throw new AgentAccountError("Chat Completions Profile 的上下文窗口与最大输出必须同时填写或同时留空", "account_invalid");
+  }
+  return { provider, protocol, baseUrl: normalized, model,
+    ...(capabilities?.success ? { modelCapabilities: capabilities.data } : {}),
+  };
 }
 
 function parseStoredApiProfile(agent: CodeAgentKind, value: unknown): StoredApiProfile | undefined {
@@ -260,15 +290,16 @@ function parseStoredApiProfile(agent: CodeAgentKind, value: unknown): StoredApiP
   const raw = value as Record<string, unknown>;
   if (typeof raw["baseUrl"] !== "string" || typeof raw["model"] !== "string") return undefined;
   try {
-    const provider = raw["provider"] === "openai_compatible" || raw["provider"] === "anthropic_compatible"
-      ? raw["provider"]
-      : apiProviderFor(agent);
-    const protocol = raw["protocol"] === "openai_responses" || raw["protocol"] === "openai_chat_completions" || raw["protocol"] === "anthropic"
-      ? raw["protocol"]
+    if (Object.hasOwn(raw, "provider") && raw["provider"] !== "openai_compatible" && raw["provider"] !== "anthropic_compatible") return undefined;
+    if (Object.hasOwn(raw, "protocol") && raw["protocol"] !== "openai_responses" && raw["protocol"] !== "openai_chat_completions" && raw["protocol"] !== "anthropic") return undefined;
+    if (Object.hasOwn(raw, "modelCapabilities") && !AgentModelCapabilitiesSchema.safeParse(raw["modelCapabilities"]).success) return undefined;
+    const provider = (raw["provider"] ?? apiProviderFor(agent)) as AgentApiProvider;
+    const protocol = raw["protocol"] !== undefined
+      ? raw["protocol"] as AgentApiProtocol
       : agent === "codex" && /\/chat\/completions\/*$/i.test(raw["baseUrl"])
         ? "openai_chat_completions"
         : apiProtocolFor(agent);
-    return cleanApiProfile(agent, raw["baseUrl"], raw["model"], provider, protocol);
+    return cleanApiProfile(agent, raw["baseUrl"], raw["model"], provider, protocol, raw["modelCapabilities"] as AgentModelCapabilities | undefined);
   } catch {
     return undefined;
   }
@@ -322,7 +353,19 @@ function opencodeProfileEnvironment(
           baseURL: profile.baseUrl,
         },
         models: {
-          [profile.model]: { name: profile.model, tool_call: true },
+          [profile.model]: {
+            name: profile.model,
+            // Keep the adapter's existing tool runtime enabled until a profile explicitly disables it.
+            tool_call: profile.modelCapabilities?.tools ?? true,
+            ...(profile.modelCapabilities?.reasoning !== undefined ? { reasoning: profile.modelCapabilities.reasoning } : {}),
+            ...(profile.modelCapabilities?.vision !== undefined
+              ? { modalities: { input: profile.modelCapabilities.vision ? ["text", "image"] : ["text"], output: ["text"] } } : {}),
+            ...(profile.modelCapabilities?.contextWindow !== undefined || profile.modelCapabilities?.maxOutputTokens !== undefined
+              ? { limit: {
+                  ...(profile.modelCapabilities.contextWindow !== undefined ? { context: profile.modelCapabilities.contextWindow } : {}),
+                  ...(profile.modelCapabilities.maxOutputTokens !== undefined ? { output: profile.modelCapabilities.maxOutputTokens } : {}),
+                } } : {}),
+          },
         },
       },
     },
@@ -581,6 +624,18 @@ export class AgentAccountManager {
     return NATIVE_IDS[agent];
   }
 
+  /** Metadata-only lookup for frequent session snapshots; never reads credentials or writes runtime config. */
+  capabilitiesFor(accountId: string, expectedAgent?: CodeAgentKind): AgentAccountCapabilities {
+    const nativeAgent = (["claude", "codex"] as const).find((agent) => NATIVE_IDS[agent] === accountId);
+    const account = nativeAgent ? { agent: nativeAgent } : this.store.accounts.find((entry) => entry.id === accountId);
+    if (!account) throw new AgentAccountError("账号不存在或已删除", "account_not_found");
+    if (expectedAgent && expectedAgent !== account.agent) throw new AgentAccountError("账号与所选 Agent 不匹配", "account_invalid");
+    const stored = account as StoredAccount;
+    return getAgentAccountCapabilities({ agent: account.agent, apiProfile: stored.apiProfile,
+      ...(stored.invalidApiProfile ? { apiProfileError: "invalid" } : {}),
+    });
+  }
+
   resolve(accountId: string, expectedAgent?: CodeAgentKind): AccountBinding {
     for (const agent of ["claude", "codex"] as const) {
       if (accountId === NATIVE_IDS[agent]) {
@@ -610,6 +665,9 @@ export class AgentAccountManager {
     if (!account) throw new AgentAccountError("账号不存在或已删除", "account_not_found");
     if (expectedAgent && expectedAgent !== account.agent) {
       throw new AgentAccountError("账号与所选 Agent 不匹配", "account_invalid");
+    }
+    if (account.invalidApiProfile) {
+      throw new AgentAccountError("API Profile 配置损坏，请修复连接配置或删除此账号", "account_invalid");
     }
     const root = this.rootFor(account.agent, account.id);
     mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -694,6 +752,8 @@ export class AgentAccountManager {
       managed: true,
       environment,
       ...(apiProfile ? { apiProfile } : {}),
+      engine: getAgentAccountEngine({ agent: account.agent, apiProfile }),
+      capabilities: getAgentAccountCapabilities({ agent: account.agent, apiProfile }),
       ...(apiProfile?.protocol === "openai_chat_completions" ? { adapterAgent: "opencode" as const } : {}),
       ...(apiProfile?.protocol === "openai_responses" && account.agent === "codex" && account.apiProfile
         ? { codexAppServerArgs: codexProviderArgs(account.apiProfile) }
@@ -752,12 +812,16 @@ export class AgentAccountManager {
     if (input.baseUrl === undefined || input.model === undefined || input.apiKey === undefined) {
       throw new AgentAccountError("API Profile 缺少连接信息", "account_invalid");
     }
+    if (input.modelCapabilities === null) {
+      throw new AgentAccountError("创建 Profile 时模型能力须为配置对象或省略", "account_invalid");
+    }
     const profile = cleanApiProfile(
       agent,
       input.baseUrl,
       input.model,
       input.provider,
       input.protocol,
+      input.modelCapabilities,
     );
     const credential = cleanApiKey(input.apiKey);
     const account: StoredAccount = {
@@ -786,26 +850,24 @@ export class AgentAccountManager {
     inUse = false,
   ): Promise<void> {
     const account = this.requireManaged(accountId);
-    if (!account.apiProfile) {
+    if (!account.apiProfile && !account.invalidApiProfile) {
       throw new AgentAccountError("这个账号不是第三方 API Profile", "account_invalid");
     }
     const profile = cleanApiProfile(
       account.agent,
-      input.baseUrl ?? account.apiProfile.baseUrl,
-      input.model ?? account.apiProfile.model,
-      input.provider ?? account.apiProfile.provider,
-      input.protocol ?? account.apiProfile.protocol,
+      input.baseUrl ?? account.apiProfile?.baseUrl ?? "",
+      input.model ?? account.apiProfile?.model ?? "",
+      input.provider ?? account.apiProfile?.provider,
+      input.protocol ?? account.apiProfile?.protocol,
+      input.modelCapabilities === undefined ? account.apiProfile?.modelCapabilities : input.modelCapabilities,
     );
     const name = input.name === undefined ? account.name : cleanName(input.name);
     const apiKey = input.apiKey?.trim() ?? "";
     const updatesCredential = apiKey.length > 0;
+    const connectionChanged = JSON.stringify(profile) !== JSON.stringify(account.apiProfile);
     if (
       (inUse || activeCount(sessions, accountId) > 0) &&
-      (updatesCredential ||
-        profile.provider !== account.apiProfile.provider ||
-        profile.protocol !== account.apiProfile.protocol ||
-        profile.baseUrl !== account.apiProfile.baseUrl ||
-        profile.model !== account.apiProfile.model)
+      (updatesCredential || connectionChanged)
     ) {
       throw new AgentAccountError("这个 Profile 仍有活动会话，只能更新名称", "account_in_use");
     }
@@ -818,6 +880,8 @@ export class AgentAccountManager {
       this.credentialCache.set(account.id, credential);
     }
     account.apiProfile = profile;
+    delete account.invalidApiProfile;
+    if (connectionChanged || updatesCredential) this.clearApiValidation(account);
     account.name = name;
     account.updatedAt = Date.now();
     this.persist();
@@ -844,6 +908,9 @@ export class AgentAccountManager {
     inUse = false,
   ): Promise<void> {
     const account = this.requireManaged(accountId);
+    if (account.invalidApiProfile) {
+      throw new AgentAccountError("API Profile 配置损坏，请先修复连接配置", "account_invalid");
+    }
     if (account.apiProfile) {
       if (inUse || activeCount(sessions, accountId) > 0) {
         throw new AgentAccountError("这个 Profile 仍有活动会话，不能更新 API Key", "account_in_use");
@@ -862,6 +929,7 @@ export class AgentAccountManager {
       : cleanCredential(kind, rawSecret);
     await this.credentialStore.write(account.id, root, credential);
     this.credentialCache.set(account.id, credential);
+    this.clearApiValidation(account);
     account.updatedAt = Date.now();
     this.persist();
   }
@@ -907,7 +975,11 @@ export class AgentAccountManager {
       const root = this.rootFor(binding.agent, binding.id);
       await this.credentialStore.delete(binding.id, root);
       this.credentialCache.set(binding.id, null);
-      if (binding.apiProfile) return;
+      if (binding.apiProfile) {
+        this.clearApiValidation(this.requireManaged(binding.id));
+        this.persist();
+        return;
+      }
       // Clean credentials created by older Prospero builds on Linux/Windows. On
       // macOS we deliberately do not call `claude auth logout`: that command would
       // mutate Claude's shared native Keychain identity.
@@ -940,7 +1012,12 @@ export class AgentAccountManager {
       throw new AgentAccountError(`这个账号仍有${count > 0 ? ` ${String(count)} 个会话` : "会话正在启动"}，请先结束会话`, "account_in_use");
     }
     // logout clears the account-specific credential before its isolated root.
-    await this.logout(accountId);
+    if (account.invalidApiProfile) {
+      await this.credentialStore.delete(account.id, this.rootFor(account.agent, account.id));
+      this.credentialCache.delete(account.id);
+    } else {
+      await this.logout(accountId);
+    }
     const root = this.rootFor(account.agent, account.id);
     rmSync(root, { recursive: true, force: true });
     this.store.accounts = this.store.accounts.filter((candidate) => candidate.id !== accountId);
@@ -951,40 +1028,75 @@ export class AgentAccountManager {
   }
 
   async snapshot(sessions: SessionInfo[]): Promise<AgentAccount[]> {
-    const stored = [...this.store.accounts];
-    const records: Array<{
-      binding: AccountBinding;
-      createdAt: number;
-      updatedAt: number;
-    }> = [
+    const records = [
       ...(["claude", "codex"] as const).map((agent) => ({
-        binding: this.resolve(NATIVE_IDS[agent], agent),
-        createdAt: 0,
-        updatedAt: 0,
+        id: NATIVE_IDS[agent], agent, name: "本机默认", createdAt: 0, updatedAt: 0, managed: false,
       })),
-      ...stored.map((account) => ({
-        binding: this.resolve(account.id, account.agent),
-        createdAt: account.createdAt,
-        updatedAt: account.updatedAt,
-      })),
+      ...this.store.accounts.map((account) => ({ ...account, managed: true })),
     ];
-    const statuses = await Promise.all(records.map(({ binding }) => this.status(binding)));
-    return records.map(({ binding, createdAt, updatedAt }, index) => ({
-      id: binding.id,
-      agent: binding.agent,
-      name: binding.name,
-      managed: binding.managed,
-      isDefault: this.defaultId(binding.agent) === binding.id,
-      ...(binding.apiProfile ? { apiProfile: binding.apiProfile } : {}),
-      ...statuses[index]!,
-      createdAt,
-      updatedAt,
-      activeSessions: activeCount(sessions, binding.id),
+    return Promise.all(records.map(async (record): Promise<AgentAccount> => {
+      const base = {
+        id: record.id, agent: record.agent, name: record.name, managed: record.managed,
+        isDefault: this.defaultId(record.agent) === record.id,
+        createdAt: record.createdAt, updatedAt: record.updatedAt,
+        activeSessions: activeCount(sessions, record.id),
+      };
+      const stored = this.store.accounts.find((account) => account.id === record.id);
+      if (stored?.invalidApiProfile) {
+        const apiProfileError = "API Profile 配置损坏，请修复连接配置或删除此账号";
+        return { ...base, status: "error", apiProfileError, detail: apiProfileError,
+          capabilities: getAgentAccountCapabilities({ agent: record.agent, apiProfileError }),
+        };
+      }
+      const apiValidation = stored?.apiValidation && stored.apiValidationRevision === this.captureApiValidationRevision(record.id)
+        ? stored.apiValidation : undefined;
+      const binding = this.resolve(record.id, record.agent);
+      return {
+        ...base,
+        ...(binding.apiProfile ? { apiProfile: binding.apiProfile } : {}),
+        engine: getAgentAccountEngine(binding),
+        capabilities: getAgentAccountCapabilities(binding),
+        ...(apiValidation ? { apiValidation } : {}),
+        ...await this.status(binding, apiValidation),
+      };
     }));
+  }
+
+  /** Opaque connection/key revision. Never include this value in a client snapshot. */
+  captureApiValidationRevision(accountId: string): string {
+    const account = this.requireManaged(accountId);
+    if (!account.apiProfile || account.invalidApiProfile) {
+      throw new AgentAccountError("此账号没有有效的 API Profile", "account_invalid");
+    }
+    // Re-read before accepting a result so a replaced/removed credential cannot keep an old green badge.
+    const credential = this.credentialStore.read(account.id, this.rootFor(account.agent, account.id));
+    this.credentialCache.set(account.id, credential);
+    return createHash("sha256").update(JSON.stringify({
+      agent: account.agent, profile: account.apiProfile,
+      credential: credential ?? null,
+    })).digest("hex");
+  }
+
+  recordApiValidation(accountId: string, revision: string, validation: AgentApiValidation): boolean {
+    const parsed = AgentApiValidationSchema.safeParse(validation);
+    const account = this.store.accounts.find((candidate) => candidate.id === accountId);
+    if (!account?.apiProfile || account.invalidApiProfile || !parsed.success ||
+        parsed.data.engine !== getAgentAccountEngine({ agent: account.agent, apiProfile: account.apiProfile }) ||
+        revision !== this.captureApiValidationRevision(accountId)) return false;
+    account.apiValidation = parsed.data;
+    account.apiValidationRevision = revision;
+    this.persist();
+    return true;
+  }
+
+  private clearApiValidation(account: StoredAccount): void {
+    delete account.apiValidation;
+    delete account.apiValidationRevision;
   }
 
   private async status(
     binding: AccountBinding,
+    validation?: AgentApiValidation,
   ): Promise<{ status: AgentAccountStatus; authMethod?: string; detail?: string }> {
     try {
       if (binding.apiProfile) {
@@ -998,7 +1110,7 @@ export class AgentAccountManager {
         return {
           status: "signed_in",
           authMethod: "API Key",
-          detail: `${binding.apiProfile.protocol ?? binding.apiProfile.provider} · ${new URL(binding.apiProfile.baseUrl).host}`,
+          detail: `${validation ? validation.status === "passed" ? "协议测试通过" : "连接测试失败" : "已配置，尚未测试连接"} · ${binding.apiProfile.protocol ?? binding.apiProfile.provider} · ${new URL(binding.apiProfile.baseUrl).host}`,
         };
       }
       if (binding.agent === "claude") {
@@ -1113,7 +1225,10 @@ export class AgentAccountManager {
   private persist(): void {
     mkdirSync(this.home, { recursive: true, mode: 0o700 });
     const temp = `${this.storeFile}.tmp`;
-    writeFileSync(temp, JSON.stringify(this.store, null, 2), { mode: 0o600 });
+    const persisted = { ...this.store, accounts: this.store.accounts.map(({ invalidApiProfile, ...account }) => ({
+      ...account, ...(invalidApiProfile ? { apiProfile: invalidApiProfile.raw } : {}),
+    })) };
+    writeFileSync(temp, JSON.stringify(persisted, null, 2), { mode: 0o600 });
     renameSync(temp, this.storeFile);
     chmodSync(this.storeFile, 0o600);
   }

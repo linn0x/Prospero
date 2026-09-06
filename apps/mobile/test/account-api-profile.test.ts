@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   accountApiProtocolDefaults,
+  accountApiStatus,
+  modelTokenLimit,
+  updateModelTokenLimit,
   accountApiProfileRequiresStructured,
   accountApiProtocolForAgent,
   accountApiProtocolFromProfile,
@@ -43,5 +46,26 @@ describe("account API profiles", () => {
     expect(accountApiProfileRequiresStructured("codex", "openai_chat_completions")).toBe(true);
     expect(accountApiProfileRequiresStructured("codex", "openai_responses")).toBe(false);
     expect(accountApiProfileRequiresStructured("claude", "anthropic")).toBe(false);
+  });
+});
+
+
+describe("API validation presentation and token limits", () => {
+  it("keeps configured and validated states distinct", () => {
+    expect(accountApiStatus({ status: "signed_in" })).toBe("已配置 · 未验证");
+    expect(accountApiStatus({ status: "unavailable" })).toBe("运行环境不可用");
+    expect(accountApiStatus({ status: "error", apiProfileError: "Invalid profile" })).toBe("配置需要修复");
+  });
+
+  it("preserves declared capabilities while allowing unknown token limits", () => {
+    const metadata = { tools: false, vision: true, contextWindow: 1000 };
+    expect(updateModelTokenLimit(metadata, "maxOutputTokens", "200"))
+      .toEqual({ ...metadata, maxOutputTokens: 200 });
+    expect(updateModelTokenLimit(metadata, "contextWindow", ""))
+      .toEqual({ tools: false, vision: true });
+    expect(modelTokenLimit(" ")).toBeUndefined();
+    for (const raw of ["0", "-1", "1.5", "1e3", "9007199254740992"]) {
+      expect(() => modelTokenLimit(raw)).toThrow();
+    }
   });
 });

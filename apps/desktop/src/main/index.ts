@@ -30,7 +30,7 @@ const INTERACTION_TYPES = new Set([
 ]);
 const ACCOUNT_METHODS = new Set([
   "agent.accounts.list", "agent.account.create", "agent.account.api.create",
-  "agent.account.api.configure", "agent.account.rename", "agent.account.default",
+  "agent.account.api.configure", "agent.account.api.test", "agent.account.rename", "agent.account.default",
   "agent.account.login", "agent.account.credential.set", "agent.account.logout",
   "agent.account.delete",
 ]);
@@ -1052,7 +1052,7 @@ function installIpc(): void {
         if (confirmation.response !== 1) return { ok: false, cancelled: true };
       }
     }
-    const result = await runtime.request("/_prospero/control/accounts", { method: "POST", body: message });
+    const result = await runtime.request("/_prospero/control/accounts", { method: "POST", body: message, ...(message["type"] === "agent.account.api.test" ? { timeoutMs: 45_000 } : {}) });
     if (Array.isArray(result?.["accounts"])) store.setAccounts(result["accounts"]);
     return result;
   }));
