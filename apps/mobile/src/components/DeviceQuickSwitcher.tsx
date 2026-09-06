@@ -18,6 +18,7 @@ import {
 } from "@/lib/device-quick-switcher";
 import type { StoredHost } from "@/lib/hosts";
 import {
+  completionBaselineHostKey,
   deviceAttentionMotion,
   type DeviceAttentionMotion,
   useSessionAttention,
@@ -130,32 +131,41 @@ function DeviceStatusDot({
   reduceMotion: boolean;
   styles: ReturnType<typeof createStyles>;
 }) {
-  const motionValue = useAnimatedValue(1);
+  const opacity = useAnimatedValue(1);
+  const scale = useAnimatedValue(1);
+  const translateY = useAnimatedValue(0);
 
   useEffect(() => {
-    motionValue.stopAnimation();
-    motionValue.setValue(motion === "unread-completed" ? 0 : 1);
+    const reset = (): void => {
+      opacity.stopAnimation();
+      scale.stopAnimation();
+      translateY.stopAnimation();
+      opacity.setValue(1);
+      scale.setValue(1);
+      translateY.setValue(0);
+    };
+    reset();
     if (!motion || reduceMotion) return;
 
     let animation: Animated.CompositeAnimation;
     if (motion === "approval") {
       animation = Animated.loop(Animated.sequence([
-        doubleFlash(motionValue),
+        doubleFlash(opacity),
         Animated.delay(140),
-        doubleFlash(motionValue),
+        doubleFlash(opacity),
         Animated.delay(140),
-        doubleFlash(motionValue),
+        doubleFlash(opacity),
         Animated.delay(720),
       ]));
     } else if (motion === "working") {
       animation = Animated.loop(Animated.sequence([
-        Animated.timing(motionValue, {
+        Animated.timing(scale, {
           toValue: 1.5,
           duration: 820,
           easing: Easing.inOut(Easing.sin),
           useNativeDriver: true,
         }),
-        Animated.timing(motionValue, {
+        Animated.timing(scale, {
           toValue: 1,
           duration: 820,
           easing: Easing.inOut(Easing.sin),
@@ -164,25 +174,25 @@ function DeviceStatusDot({
       ]));
     } else {
       animation = Animated.loop(Animated.sequence([
-        Animated.timing(motionValue, {
+        Animated.timing(translateY, {
           toValue: -3.5,
           duration: 170,
           easing: Easing.out(Easing.quad),
           useNativeDriver: true,
         }),
-        Animated.timing(motionValue, {
+        Animated.timing(translateY, {
           toValue: 0,
           duration: 210,
           easing: Easing.in(Easing.quad),
           useNativeDriver: true,
         }),
-        Animated.timing(motionValue, {
+        Animated.timing(translateY, {
           toValue: -1.8,
           duration: 120,
           easing: Easing.out(Easing.quad),
           useNativeDriver: true,
         }),
-        Animated.timing(motionValue, {
+        Animated.timing(translateY, {
           toValue: 0,
           duration: 150,
           easing: Easing.in(Easing.quad),
@@ -194,20 +204,20 @@ function DeviceStatusDot({
     animation.start();
     return () => {
       animation.stop();
-      motionValue.stopAnimation();
+      animation.reset();
+      reset();
     };
-  }, [motion, motionValue, reduceMotion]);
+  }, [motion, opacity, reduceMotion, scale, translateY]);
 
   return (
     <Animated.View
       style={[
         styles.railDot,
         current && styles.railDotCurrent,
-        { backgroundColor: color },
-        motion === "approval" && !reduceMotion && { opacity: motionValue },
-        motion === "working" && !reduceMotion && { transform: [{ scale: motionValue }] },
-        motion === "unread-completed" && !reduceMotion && {
-          transform: [{ translateY: motionValue }],
+        {
+          backgroundColor: color,
+          opacity,
+          transform: [{ translateY }, { scale }],
         },
       ]}
     />
@@ -243,8 +253,14 @@ export function DeviceQuickSwitcher({
   const [reduceMotion, setReduceMotion] = useState(false);
   const railScale = useAnimatedValue(1);
   const completionReads = useSessionAttention((state) => state.completionReads);
+  const completionBaselineHosts = useSessionAttention(
+    (state) => state.completionBaselineHosts,
+  );
   const completionReadsHydrated = useSessionAttention((state) => state.hydrated);
   const hydrateSessionAttention = useSessionAttention((state) => state.hydrate);
+  const baselineHostCompletions = useSessionAttention(
+    (state) => state.baselineHostCompletions,
+  );
 
   const activeIndex = quickSwitchActive ? candidateIndex : selectedIndex;
   const railIndices = useMemo(
@@ -256,6 +272,14 @@ export function DeviceQuickSwitcher({
   useEffect(() => {
     void hydrateSessionAttention();
   }, [hydrateSessionAttention]);
+
+  useEffect(() => {
+    if (!completionReadsHydrated) return;
+    for (const host of hosts) {
+      const runtime = runtimes[host.id];
+      if (runtime?.sessionsLoaded) baselineHostCompletions(host.id, runtime.sessions);
+    }
+  }, [baselineHostCompletions, completionReadsHydrated, hosts, runtimes]);
 
   useEffect(() => {
     let mounted = true;
@@ -405,6 +429,7 @@ export function DeviceQuickSwitcher({
                     host.id,
                     runtime?.sessions,
                     completionReadsHydrated ? completionReads : null,
+                    Boolean(completionBaselineHosts[completionBaselineHostKey(host.id)]),
                   )}
                   reduceMotion={reduceMotion}
                   styles={styles}
@@ -453,9 +478,9 @@ function createStyles(palette: ThemePalette) {
     },
     railDot: { width: 5, height: 5, borderRadius: 3 },
     railDotCurrent: {
-      width: 8,
-      height: 8,
-      borderRadius: 4,
+      width: 7,
+      height: 7,
+      borderRadius: 3.5,
     },
   });
 }

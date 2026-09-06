@@ -32,6 +32,11 @@ import {
 } from "@/lib/home-dashboard";
 import type { StoredHost } from "@/lib/hosts";
 import type { ConnStatus, HostRuntime } from "@/lib/store";
+import {
+  completionBaselineHostKey,
+  unreadCompletedSessionCount,
+  useSessionAttention,
+} from "@/lib/session-attention";
 import { radius, space, useMobileTheme, type ThemePalette } from "@/lib/theme";
 
 const CARD_GAP = 8;
@@ -195,6 +200,7 @@ function LargeDeviceCard({
   palette,
   styles,
   onSelect,
+  onConfirmSelect,
   onOpenHost,
   onOpenSession,
   onCreateSession,
@@ -208,6 +214,7 @@ function LargeDeviceCard({
   palette: ThemePalette;
   styles: DetailStyles;
   onSelect: () => void;
+  onConfirmSelect: () => void;
   onOpenHost: () => void;
   onOpenSession: (sessionId: string) => void;
   onCreateSession: () => void;
@@ -220,6 +227,16 @@ function LargeDeviceCard({
     .slice(0, 3);
   const recentSessions = homeRecentSessions(runtime?.sessions, 4);
   const projects = homeWorkspaceProjects(runtime?.sessions);
+  const completionReads = useSessionAttention((state) => state.completionReads);
+  const completionBaselineReady = useSessionAttention((state) => Boolean(
+    state.completionBaselineHosts[completionBaselineHostKey(host.id)],
+  ));
+  const markHostCompletionsRead = useSessionAttention(
+    (state) => state.markHostCompletionsRead,
+  );
+  const unreadCompletionCount = completionBaselineReady
+    ? unreadCompletedSessionCount(host.id, runtime?.sessions, completionReads)
+    : 0;
 
   return (
     <Pressable
@@ -233,13 +250,26 @@ function LargeDeviceCard({
       ]}
     >
       <View style={styles.cardHeader}>
-        <View style={styles.platformIcon}>
-          <PlatformIcon platform={runtime?.hostInfo?.platform} palette={palette} size={28} />
-        </View>
-        <View style={styles.hostCopy}>
-          <Text style={styles.hostName} numberOfLines={1}>{host.name}</Text>
-          <Text style={styles.osLabel} numberOfLines={1}>{homeHostOsLabel(runtime?.hostInfo)}</Text>
-        </View>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={`选择 ${host.name} 并关闭设备详情`}
+          onPress={(event) => {
+            event.stopPropagation();
+            onConfirmSelect();
+          }}
+          style={({ pressed }) => [
+            styles.deviceIdentity,
+            pressed && styles.rowPressed,
+          ]}
+        >
+          <View style={styles.platformIcon}>
+            <PlatformIcon platform={runtime?.hostInfo?.platform} palette={palette} size={28} />
+          </View>
+          <View style={styles.hostCopy}>
+            <Text style={styles.hostName} numberOfLines={1}>{host.name}</Text>
+            <Text style={styles.osLabel} numberOfLines={1}>{homeHostOsLabel(runtime?.hostInfo)}</Text>
+          </View>
+        </Pressable>
         <View style={styles.connectionPill}>
           <View style={[styles.connectionDot, { backgroundColor: connectionTone(runtime, palette) }]} />
           <Text style={styles.connectionText}>{connectionLabel(runtime)}</Text>
@@ -322,7 +352,27 @@ function LargeDeviceCard({
         <View style={styles.detailSection}>
           <View style={styles.sectionHeading}>
             <Text style={styles.sectionTitle}>最近会话</Text>
-            <Text style={styles.sectionCount}>{String(stats.sessionCount)} 个</Text>
+            <View style={styles.sectionHeadingMeta}>
+              <Text style={styles.sectionCount}>{String(stats.sessionCount)} 个</Text>
+              {unreadCompletionCount > 0 && (
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={`将 ${host.name} 的 ${String(unreadCompletionCount)} 个已完成会话标为已读`}
+                  onPress={(event) => {
+                    event.stopPropagation();
+                    markHostCompletionsRead(host.id, runtime?.sessions ?? {});
+                  }}
+                  hitSlop={6}
+                  style={({ pressed }) => [
+                    styles.markReadButton,
+                    pressed && styles.rowPressed,
+                  ]}
+                >
+                  <Icon name="checkmark.circle.fill" size={13} color={palette.success} />
+                  <Text style={styles.markReadText}>一键已读</Text>
+                </Pressable>
+              )}
+            </View>
           </View>
           {recentSessions.length > 0 ? (
             recentSessions.map((session) => (
@@ -631,8 +681,9 @@ export function DeviceDetailCarousel({
       >
         <Pressable
           accessible={false}
-          onPress={(event) => event.stopPropagation()}
+          onPress={onClose}
           style={styles.stageShield}
+          testID="device-detail-stage-backdrop"
         />
         <View style={[styles.modeHeader, { width: cardWidth }]}>
           <View>
@@ -683,6 +734,10 @@ export function DeviceDetailCarousel({
               palette={palette}
               styles={styles}
               onSelect={() => selectIndex(index)}
+              onConfirmSelect={() => {
+                onSelectHost(host.id);
+                onClose();
+              }}
               onOpenHost={() => {
                 onSelectHost(host.id);
                 onClose();
@@ -800,6 +855,14 @@ function createStyles(palette: ThemePalette) {
     cardActive: { borderColor: palette.accent },
     cardAdjacent: { borderColor: palette.border },
     cardHeader: { flexDirection: "row", alignItems: "center", gap: space.sm },
+    deviceIdentity: {
+      flex: 1,
+      minWidth: 0,
+      flexDirection: "row",
+      alignItems: "center",
+      gap: space.sm,
+      borderRadius: radius.sm,
+    },
     platformIcon: {
       width: 48,
       height: 48,
@@ -862,6 +925,17 @@ function createStyles(palette: ThemePalette) {
     },
     sectionTitle: { color: palette.text, fontSize: 13, fontWeight: "700" },
     sectionCount: { color: palette.textFaint, fontSize: 9.5 },
+    sectionHeadingMeta: { flexDirection: "row", alignItems: "center", gap: 7 },
+    markReadButton: {
+      minHeight: 25,
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 3,
+      paddingHorizontal: 7,
+      borderRadius: 999,
+      backgroundColor: palette.successBg,
+    },
+    markReadText: { color: palette.success, fontSize: 9, fontWeight: "700" },
     sessionRow: {
       minHeight: 38,
       flexDirection: "row",

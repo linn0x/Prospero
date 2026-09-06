@@ -96,6 +96,21 @@ export function homeRecentSessions(
     .slice(0, Math.max(0, limit));
 }
 
+/** 待授权入口只收操作审批，不把普通等待输入误报为权限请求。 */
+export function homeApprovalSessions(
+  sessions: Record<string, SessionInfo> | undefined,
+): SessionInfo[] {
+  return Object.values(sessions ?? {})
+    .filter((session) =>
+      session.status === "waiting_approval" || (session.pendingPermissions ?? 0) > 0
+    )
+    .sort((left, right) =>
+      (right.pendingPermissions ?? 0) - (left.pendingPermissions ?? 0)
+      || right.createdAt - left.createdAt
+      || right.id.localeCompare(left.id)
+    );
+}
+
 export function homeRecentSummary(session: SessionInfo, recent?: RecentSession): string {
   return recentSessionSummary(session.preview) || recent?.summary || "尚无内容摘要";
 }
