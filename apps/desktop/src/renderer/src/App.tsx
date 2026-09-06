@@ -4784,7 +4784,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
       style={
         {
           "--sidebar-width": "15rem",
-          "--sidebar-width-icon": "4.5rem",
+          "--sidebar-width-icon": "4rem",
         } as React.CSSProperties
       }
       className="prospero-shell"
