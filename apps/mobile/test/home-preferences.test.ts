@@ -12,6 +12,7 @@ describe("home preferences", () => {
     const { normalizeHomeSettings } = await import("../src/lib/home-preferences");
     expect(normalizeHomeSettings({ recentSessionLimit: 8 })).toEqual({
       recentSessionLimit: 8,
+      deviceSwitcherHapticsEnabled: true,
       backgroundProgressEnabled: true,
       overlayProgressEnabled: false,
       themeMode: "system",
@@ -27,8 +28,12 @@ describe("home preferences", () => {
     expect(
       normalizeHomeSettings({
         themeMode: "light",
+        deviceSwitcherHapticsEnabled: false,
         workspaceAliases: { good: "  客户端  ", empty: "   ", huge: "x".repeat(61) },
-      }).workspaceAliases,
-    ).toEqual({ good: "客户端" });
+      }),
+    ).toMatchObject({
+      deviceSwitcherHapticsEnabled: false,
+      workspaceAliases: { good: "客户端" },
+    });
   });
 });

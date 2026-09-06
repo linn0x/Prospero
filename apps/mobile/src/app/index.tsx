@@ -42,7 +42,7 @@ export default function HostsScreen() {
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
   const [devicePickerOpen, setDevicePickerOpen] = useState(false);
   const setHosts = useApp((state) => state.setHosts);
-  // 首页设置只消费这两个业务字段；主题由显式上下文单独驱动，避免订阅整个
+  // 首页设置只消费这三个业务字段；主题由显式上下文单独驱动，避免订阅整个
   // 设置对象时把无关配置变化也扩散到设备和工作区列表。
   const recentSessionLimit = useApp(
     (state) => state.homeSettings?.recentSessionLimit ?? DEFAULT_HOME_SETTINGS.recentSessionLimit,
@@ -50,9 +50,18 @@ export default function HostsScreen() {
   const workspaceAliases = useApp(
     (state) => state.homeSettings?.workspaceAliases ?? DEFAULT_HOME_SETTINGS.workspaceAliases,
   );
+  const deviceSwitcherHapticsEnabled = useApp(
+    (state) => state.homeSettings?.deviceSwitcherHapticsEnabled
+      ?? DEFAULT_HOME_SETTINGS.deviceSwitcherHapticsEnabled,
+  );
   const homeSettings = useMemo<HomeSettings>(
-    () => ({ ...DEFAULT_HOME_SETTINGS, recentSessionLimit, workspaceAliases }),
-    [recentSessionLimit, workspaceAliases],
+    () => ({
+      ...DEFAULT_HOME_SETTINGS,
+      recentSessionLimit,
+      workspaceAliases,
+      deviceSwitcherHapticsEnabled,
+    }),
+    [deviceSwitcherHapticsEnabled, recentSessionLimit, workspaceAliases],
   );
   const setHomeSettings = useApp((state) => state.setHomeSettings);
   const runtimes = useApp((state) => state.runtimes);
@@ -98,6 +107,9 @@ export default function HostsScreen() {
     setDevicePickerOpen(false);
     void rememberLastHomeHost(hostId);
   }, []);
+  const onToggleDevicePicker = useCallback((): void => {
+    setDevicePickerOpen((open) => !open);
+  }, []);
 
   const onDelete = (host: StoredHost): void => {
     void Promise.all([
@@ -128,6 +140,21 @@ export default function HostsScreen() {
           title: "Prospero",
           headerRight: () => (
             <View style={styles.headerActions}>
+              {effectiveSelectedHostId !== null && (
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel="Agent 编排"
+                  accessibilityHint="打开当前设备的 Agent 编排页面"
+                  onPress={() => router.push(`/host/${effectiveSelectedHostId}/orchestration`)}
+                  style={styles.headerButton}
+                >
+                  <Icon
+                    name="point.3.connected.trianglepath.dotted"
+                    size={21}
+                    color={palette.accent}
+                  />
+                </Pressable>
+              )}
               <Pressable
                 accessibilityRole="button"
                 accessibilityLabel="设置"
@@ -188,7 +215,7 @@ export default function HostsScreen() {
           selectedHostId={effectiveSelectedHostId}
           devicePickerOpen={devicePickerOpen}
           bottomInset={insets.bottom}
-          onToggleDevicePicker={() => setDevicePickerOpen((open) => !open)}
+          onToggleDevicePicker={onToggleDevicePicker}
           onCloseDevicePicker={closeDevicePicker}
           managedWorkspacePaths={managedWorkspacePaths}
           onSelectHost={onSelectHost}
