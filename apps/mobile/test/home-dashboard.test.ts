@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import type { SessionInfo } from "@prospero/protocol";
 
 import {
+  homeApprovalSessions,
   homeHostOsLabel,
   homeHostStats,
   homeRecentSessions,
@@ -90,6 +91,17 @@ describe("home dashboard", () => {
         2,
       ).map((item) => item.id),
     ).toEqual(["latest", "middle"]);
+  });
+
+  it("待授权入口只显示真正需要操作授权的对话并优先展示请求数更多的项", () => {
+    const waiting = session("waiting", "/work", "waiting_approval", 2);
+    const explicit = session("explicit", "/work", "idle", 3);
+    explicit.pendingPermissions = 2;
+    const question = session("question", "/work", "waiting_input", 4);
+    question.pendingQuestions = 1;
+
+    expect(homeApprovalSessions({ waiting, explicit, question }).map((item) => item.id))
+      .toEqual(["explicit", "waiting"]);
   });
 
   it("系统摘要在未连接时给出明确占位，连接后组合系统和架构", () => {
@@ -197,6 +209,11 @@ describe("home dashboard", () => {
     expect(detailCarousel).toContain("onScroll={handleCarouselScroll}");
     expect(detailCarousel).toContain("scrollEventThrottle={16}");
     expect(detailCarousel).toContain("if (!visible) return");
+    expect(detailCarousel).toContain('testID="device-detail-stage-backdrop"');
+    expect(detailCarousel).toContain("onPress={onClose}");
+    expect(detailCarousel).toContain("onConfirmSelect()");
+    expect(detailCarousel).toContain("一键已读");
+    expect(detailCarousel).toContain("markHostCompletionsRead(host.id");
     expect(detailCarousel).not.toContain("cardAdjacent: { borderColor: palette.border, opacity:");
     expect(quickSwitcher).toContain('flexDirection: "row"');
     expect(quickSwitcher).toContain('justifyContent: "space-evenly"');
@@ -206,6 +223,20 @@ describe("home dashboard", () => {
     );
     expect(railStyle).not.toContain("borderWidth");
     expect(railStyle).not.toContain("borderColor");
+    expect(quickSwitcher).toContain("width: 7");
+    expect(dashboard).toContain("height: 28");
+    expect(dashboard).toContain('testID="home-approval-sessions"');
+    expect(dashboard).toContain("homeApprovalSessions(selectedRuntime?.sessions)");
+    expect(dashboard).toContain("iconDoubleWiggle(locatorWiggle)");
+    expect(dashboard).toContain("Animated.delay(1_000)");
+    expect(dashboard).toContain("sessionNeedsLocatorMotion(");
+    expect(dashboard).toContain("sessionNeedsMotion(session) ? locatorWiggleStyle");
+    expect(dashboard).toContain("completionBaselineReady");
+    expect(quickSwitcher).toContain("const opacity = useAnimatedValue(1)");
+    expect(quickSwitcher).toContain("const scale = useAnimatedValue(1)");
+    expect(quickSwitcher).toContain("const translateY = useAnimatedValue(0)");
+    expect(quickSwitcher).toContain("animation.reset()");
+    expect(quickSwitcher).toContain("translateY.setValue(0)");
   });
 
   it("底部弹层由原生可见性负责关闭，不依赖可能中断的动画回调", () => {

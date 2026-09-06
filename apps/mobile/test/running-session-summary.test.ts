@@ -33,6 +33,7 @@ function runtime(sessions: SessionInfo[]): HostRuntime {
     lastError: null,
     rttMs: 10,
     sessions: Object.fromEntries(sessions.map((item) => [item.id, item])),
+    sessionsLoaded: true,
   };
 }
 

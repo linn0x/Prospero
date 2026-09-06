@@ -439,6 +439,7 @@ export default function SessionScreen() {
   const [selection, setSelection] = useState({ start: 0, end: 0 });
   const [composerExpanded, setComposerExpanded] = useState(false);
   const inputRef = useRef<TextInput>(null);
+  const draftRef = useRef("");
   const appendTranscript = useCallback((text: string): void => {
     // 使用函数式更新，转写期间用户新打的字也不会被旧闭包覆盖。
     setDraft((current) => appendVoiceTranscript(current, text));
@@ -461,6 +462,10 @@ export default function SessionScreen() {
   useEffect(() => () => {
     if (sendGuardTimer.current !== null) clearTimeout(sendGuardTimer.current);
   }, []);
+
+  useEffect(() => {
+    draftRef.current = draft;
+  }, [draft]);
 
   const session = sid ? runtime.sessions[sid] : undefined;
   const markCompletionRead = useSessionAttention((state) => state.markCompletionRead);
@@ -953,6 +958,7 @@ export default function SessionScreen() {
         } else if (!isSubagent && images.length === 0 && t === "/skills") {
           setDraft("$");
           setSelection({ start: 1, end: 1 });
+          releaseSendGuard();
           requestAnimationFrame(() => inputRef.current?.focus());
           return;
         } else if (isSubagent && subagentId) {
@@ -1207,6 +1213,7 @@ export default function SessionScreen() {
       : [];
   const terminalInputEnabled = runtime.status === "connected";
   const canSend =
+    Boolean(conn && sid) &&
     draftHydrated &&
     (draft.trim().length > 0 || (isChat && !isSubagent && images.length > 0)) &&
     (isChat || terminalInputEnabled);
@@ -1248,8 +1255,9 @@ export default function SessionScreen() {
         !canSend && styles.sendBtnDim,
         pressed && canSend && styles.sendBtnPressed,
       ]}
-      onPress={() => send(draft)}
+      onPress={() => send(draftRef.current)}
       disabled={!canSend}
+      hitSlop={6}
       accessibilityRole="button"
       accessibilityLabel={
         isChat
@@ -2183,6 +2191,7 @@ export default function SessionScreen() {
               placeholderTextColor={color.textFaint}
               value={draft}
               onChangeText={(next) => {
+                draftRef.current = next;
                 setDraft(next);
                 setDeliveryError(null);
               }}
@@ -2190,7 +2199,7 @@ export default function SessionScreen() {
               onSelectionChange={(event) => setSelection(event.nativeEvent.selection)}
               onFocus={() => { setFocused(true); }}
               onBlur={() => { setFocused(false); }}
-              onSubmitEditing={() => send(draft)}
+              onSubmitEditing={isChat ? undefined : () => send(draftRef.current)}
               submitBehavior={isChat ? "newline" : "submit"}
               returnKeyType={isChat ? "default" : "send"}
               autoCapitalize="none"

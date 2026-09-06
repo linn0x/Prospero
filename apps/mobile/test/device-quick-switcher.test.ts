@@ -51,11 +51,13 @@ describe("device quick switcher", () => {
     );
 
     expect(switcher).toContain('motion === "approval"');
-    expect(switcher).toContain("doubleFlash(motionValue)");
+    expect(switcher).toContain("doubleFlash(opacity)");
     expect(switcher).toContain('motion === "working"');
-    expect(switcher).toContain("transform: [{ scale: motionValue }]");
-    expect(switcher).toContain('motion === "unread-completed"');
-    expect(switcher).toContain("transform: [{ translateY: motionValue }]");
+    expect(switcher).toContain("Animated.timing(scale");
+    expect(switcher).toContain("Animated.timing(translateY");
+    expect(switcher).toContain("transform: [{ translateY }, { scale }]");
+    expect(switcher).toContain("animation.reset()");
+    expect(switcher).toContain("translateY.setValue(0)");
     expect(switcher).toContain("AccessibilityInfo.isReduceMotionEnabled()");
   });
 });

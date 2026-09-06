@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 import FontAwesome6 from "@expo/vector-icons/FontAwesome6";
 import { useFocusEffect } from "expo-router";
 import {
+  AccessibilityInfo,
   Alert,
   AppState,
   Animated,
@@ -31,6 +32,7 @@ import { SwipeRow } from "@/components/SwipeRow";
 import type { StoredHost } from "@/lib/hosts";
 import {
   compactWorkspacePath,
+  homeApprovalSessions,
   homeHostStats,
   homeRecentSessions,
   homeRecentSummary,
@@ -44,6 +46,11 @@ import {
   workspaceAliasKey,
   type HomeSettings,
 } from "@/lib/home-preferences";
+import {
+  completionBaselineHostKey,
+  sessionNeedsLocatorMotion,
+  useSessionAttention,
+} from "@/lib/session-attention";
 import type { SessionProject } from "@/lib/session-projects";
 import type { ConnStatus, HostRuntime } from "@/lib/store";
 import { recentSessions as recentSessionStore, recentSessionTime } from "@/lib/recent-sessions";
@@ -148,6 +155,30 @@ function hostConnectionLabel(runtime: HostRuntime | undefined): string {
   return "离线";
 }
 
+function iconDoubleWiggle(value: Animated.Value): Animated.CompositeAnimation {
+  const wiggle = () => Animated.sequence([
+    Animated.timing(value, {
+      toValue: -1,
+      duration: 70,
+      easing: Easing.linear,
+      useNativeDriver: true,
+    }),
+    Animated.timing(value, {
+      toValue: 1,
+      duration: 110,
+      easing: Easing.linear,
+      useNativeDriver: true,
+    }),
+    Animated.timing(value, {
+      toValue: 0,
+      duration: 70,
+      easing: Easing.linear,
+      useNativeDriver: true,
+    }),
+  ]);
+  return Animated.sequence([wiggle(), Animated.delay(90), wiggle()]);
+}
+
 function HostPlatformIcon({
   platform,
   palette,
@@ -250,6 +281,8 @@ export function HomeDashboard({
     deviceCardSideInset - homeActiveIndex * deviceCardStride,
   );
   const homeSwipeProgress = useAnimatedValue(0);
+  const locatorWiggle = useAnimatedValue(0);
+  const [reduceMotion, setReduceMotion] = useState(false);
   // Fast Refresh 会保留旧版 Zustand 状态；标准化可补全后续新增的设置字段。
   const effectiveHomeSettings = normalizeHomeSettings(homeSettings ?? DEFAULT_HOME_SETTINGS);
   const allProjects = useMemo(
@@ -263,6 +296,27 @@ export function HomeDashboard({
   const recentSessions = useMemo(
     () => homeRecentSessions(selectedRuntime?.sessions, effectiveHomeSettings.recentSessionLimit, recentUsage),
     [effectiveHomeSettings.recentSessionLimit, selectedRuntime?.sessions, recentUsage],
+  );
+  const approvalSessions = useMemo(
+    () => homeApprovalSessions(selectedRuntime?.sessions),
+    [selectedRuntime?.sessions],
+  );
+  const completionReads = useSessionAttention((state) => state.completionReads);
+  const completionBaselineReady = useSessionAttention((state) => Boolean(
+    selectedHost && state.completionBaselineHosts[completionBaselineHostKey(selectedHost.id)],
+  ));
+  const sessionNeedsMotion = useCallback(
+    (session: SessionInfo): boolean => Boolean(selectedHost) && sessionNeedsLocatorMotion(
+      selectedHost.id,
+      session,
+      completionReads,
+      completionBaselineReady,
+    ),
+    [completionBaselineReady, completionReads, selectedHost],
+  );
+  const hasLocatorMotion = useMemo(
+    () => allProjects.some((project) => project.sessions.some(sessionNeedsMotion)),
+    [allProjects, sessionNeedsMotion],
   );
   const [expandedProjectKey, setExpandedProjectKey] = useState<string | null>(null);
   const [expandedTaskHostId, setExpandedTaskHostId] = useState<string | null>(null);
@@ -320,6 +374,38 @@ export function HomeDashboard({
     }).start();
   }, [homeSwipeActive, homeSwipeProgress]);
 
+  useEffect(() => {
+    let mounted = true;
+    void AccessibilityInfo.isReduceMotionEnabled().then((enabled) => {
+      if (mounted) setReduceMotion(enabled);
+    });
+    const subscription = AccessibilityInfo.addEventListener(
+      "reduceMotionChanged",
+      setReduceMotion,
+    );
+    return () => {
+      mounted = false;
+      subscription.remove();
+    };
+  }, []);
+
+  useEffect(() => {
+    locatorWiggle.stopAnimation();
+    locatorWiggle.setValue(0);
+    if (!hasLocatorMotion || reduceMotion) return;
+    const animation = Animated.loop(Animated.sequence([
+      iconDoubleWiggle(locatorWiggle),
+      Animated.delay(1_000),
+    ]));
+    animation.start();
+    return () => {
+      animation.stop();
+      animation.reset();
+      locatorWiggle.stopAnimation();
+      locatorWiggle.setValue(0);
+    };
+  }, [hasLocatorMotion, locatorWiggle, reduceMotion]);
+
   useEffect(() => () => {
     homeCarouselX.stopAnimation();
     homeSwipeProgress.stopAnimation();
@@ -374,11 +460,20 @@ export function HomeDashboard({
   const taskProjectsExpanded = expandedTaskHostId === selectedHost.id;
   const taskRunningCount = taskProjects.reduce((total, project) => total + project.runningCount, 0);
   const taskPendingCount = taskProjects.reduce((total, project) => total + project.pendingCount, 0);
+  const locatorWiggleStyle = {
+    transform: [{
+      rotate: locatorWiggle.interpolate({
+        inputRange: [-1, 0, 1],
+        outputRange: ["-6deg", "0deg", "6deg"],
+      }),
+    }],
+  };
 
   const renderProject = (project: SessionProject) => {
     const projectKey = `${selectedHost.id}:${project.path}`;
     const expanded = expandedProjectKey === projectKey;
     const displayName = displayProjectName(project.path, project.name);
+    const projectHasLocatorMotion = project.sessions.some(sessionNeedsMotion);
     return (
       <View
         key={projectKey}
@@ -418,7 +513,9 @@ export function HomeDashboard({
             style={({ pressed }) => [styles.projectHeader, pressed && styles.projectCardPressed]}
           >
             <View style={styles.projectIcon}>
-              <Icon name="folder.fill" size={18} color={palette.accent} />
+              <Animated.View style={projectHasLocatorMotion ? locatorWiggleStyle : undefined}>
+                <Icon name="folder.fill" size={18} color={palette.accent} />
+              </Animated.View>
             </View>
             <View style={styles.projectCopy}>
               <Text style={styles.projectName} numberOfLines={1}>
@@ -467,7 +564,11 @@ export function HomeDashboard({
                   pressed && styles.sessionRowPressed,
                 ]}
               >
-                <AgentIcon agent={session.agent} size={17} badge />
+                <Animated.View
+                  style={sessionNeedsMotion(session) ? locatorWiggleStyle : undefined}
+                >
+                  <AgentIcon agent={session.agent} size={17} badge badgeOutline={false} />
+                </Animated.View>
                 <View style={styles.sessionCopy}>
                   <Text style={styles.sessionTitle} numberOfLines={1}>
                     {session.title || session.agent}
@@ -557,7 +658,7 @@ export function HomeDashboard({
                   onToggleDevicePicker();
                 }}
               >
-                <Icon name="desktopcomputer" size={14} color={palette.textDim} />
+                <Icon name="desktopcomputer" size={12} color={palette.textDim} />
                 <View style={styles.deviceFleetDots}>
                   <View
                     style={[
@@ -578,7 +679,7 @@ export function HomeDashboard({
                     />
                   ))}
                 </View>
-                <Icon name="chevron.down" size={14} color={palette.textFaint} />
+                <Icon name="chevron.down" size={11} color={palette.textFaint} />
               </Pressable>
             </View>
           </View>
@@ -643,6 +744,55 @@ export function HomeDashboard({
         <View style={styles.headerContent}>
           {devicePanel}
 
+          {approvalSessions.length > 0 && (
+            <View style={styles.approvalSection} testID="home-approval-sessions">
+              <View style={styles.sectionHeading}>
+                <Text style={styles.sectionTitle}>待授权对话</Text>
+                <Text style={styles.approvalCount}>{String(approvalSessions.length)} 项</Text>
+              </View>
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.recentList}
+              >
+                {approvalSessions.map((session) => {
+                  const pendingCount = session.pendingPermissions ?? 0;
+                  return (
+                    <Pressable
+                      key={session.id}
+                      accessibilityRole="button"
+                      accessibilityLabel={`打开待授权对话 ${session.title || session.agent}`}
+                      onPress={() => onOpenSession(selectedHost.id, session.id)}
+                      style={({ pressed }) => [
+                        styles.approvalCard,
+                        { width: recentCardWidth },
+                        pressed && styles.recentCardPressed,
+                      ]}
+                    >
+                      <Animated.View style={locatorWiggleStyle}>
+                        <AgentIcon agent={session.agent} size={18} badge badgeOutline={false} />
+                      </Animated.View>
+                      <View style={styles.recentCopy}>
+                        <Text style={styles.recentTitle} numberOfLines={1}>
+                          {session.title || session.agent}
+                        </Text>
+                        <Text style={styles.approvalDetail} numberOfLines={1}>
+                          {pendingCount > 0
+                            ? `${String(pendingCount)} 项操作等待授权`
+                            : "等待授权操作"}
+                        </Text>
+                        <Text style={styles.recentMeta} numberOfLines={1}>
+                          {displayProjectName(session.cwd, projectName(session.cwd))}
+                        </Text>
+                      </View>
+                      <Icon name="exclamationmark.triangle.fill" size={16} color={palette.warn} />
+                    </Pressable>
+                  );
+                })}
+              </ScrollView>
+            </View>
+          )}
+
           <View style={styles.recentSection}>
             <View style={styles.sectionHeading}>
               <Text style={styles.sectionTitle}>最近对话</Text>
@@ -665,7 +815,9 @@ export function HomeDashboard({
                       pressed && styles.recentCardPressed,
                     ]}
                   >
-                    <AgentIcon agent={session.agent} size={18} badge badgeOutline={false} />
+                    <Animated.View style={sessionNeedsMotion(session) ? locatorWiggleStyle : undefined}>
+                      <AgentIcon agent={session.agent} size={18} badge badgeOutline={false} />
+                    </Animated.View>
                     <View style={styles.recentCopy}>
                       <Text style={styles.recentTitle} numberOfLines={1}>
                         {session.title || session.agent}
@@ -1050,12 +1202,12 @@ function createStyles(palette: ThemePalette) {
   deviceConnectionText: { flex: 1, minWidth: 0, color: palette.textDim, fontSize: 11 },
   statusDot: { width: 6, height: 6, borderRadius: 3 },
   deviceFleetPill: {
-    minHeight: 44,
-    minWidth: 44,
+    height: 28,
+    minWidth: 36,
     flexDirection: "row",
     alignItems: "center",
-    gap: 6,
-    paddingHorizontal: 8,
+    gap: 4,
+    paddingHorizontal: 6,
     borderRadius: 999,
     backgroundColor: palette.surfaceRaised,
   },
@@ -1063,12 +1215,12 @@ function createStyles(palette: ThemePalette) {
   deviceFleetDots: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 4,
+    gap: 3,
   },
-  fleetStatusDot: { width: 6, height: 6, borderRadius: 3 },
+  fleetStatusDot: { width: 5, height: 5, borderRadius: 2.5 },
   fleetCurrentStatus: {
     color: palette.textDim,
-    fontSize: 9,
+    fontSize: 8.5,
     fontWeight: "600",
     fontVariant: ["tabular-nums"],
   },
@@ -1110,6 +1262,19 @@ function createStyles(palette: ThemePalette) {
     backgroundColor: palette.border,
   },
   pressed: { backgroundColor: palette.pressed },
+  approvalSection: { gap: space.sm },
+  approvalCount: { color: palette.warn, fontSize: 11, fontWeight: "700" },
+  approvalCard: {
+    minHeight: 62,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: space.sm,
+    paddingHorizontal: space.md,
+    paddingVertical: space.sm,
+    borderRadius: radius.md,
+    backgroundColor: palette.warnBg,
+  },
+  approvalDetail: { color: palette.warn, fontSize: 11, fontWeight: "600" },
   recentSection: { gap: space.sm },
   sectionHeading: {
     minHeight: 36,
