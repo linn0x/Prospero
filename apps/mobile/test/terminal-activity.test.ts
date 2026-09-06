@@ -4,7 +4,8 @@ import { runInNewContext } from "node:vm";
 import { describe, expect, it, vi } from "vitest";
 
 function terminalActivity() {
-  const html = readFileSync(join(import.meta.dirname, "../../daemon/term.html"), "utf8");
+  const html = readFileSync(join(import.meta.dirname, "../../daemon/term.html"), "utf8")
+    .replaceAll("\r\n", "\n");
   const start = html.indexOf("  // 性能打点");
   const end = html.indexOf("  /**\n   * 入口", start);
   expect(start).toBeGreaterThan(0);

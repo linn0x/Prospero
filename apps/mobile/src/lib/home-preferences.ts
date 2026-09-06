@@ -10,6 +10,7 @@ export type HomeThemeMode = (typeof HOME_THEME_MODES)[number];
 
 export interface HomeSettings {
   recentSessionLimit: HomeRecentSessionLimit;
+  deviceSwitcherHapticsEnabled: boolean;
   backgroundProgressEnabled: boolean;
   overlayProgressEnabled: boolean;
   themeMode: HomeThemeMode;
@@ -19,6 +20,7 @@ export interface HomeSettings {
 
 export const DEFAULT_HOME_SETTINGS: HomeSettings = {
   recentSessionLimit: 5,
+  deviceSwitcherHapticsEnabled: true,
   backgroundProgressEnabled: true,
   overlayProgressEnabled: false,
   themeMode: "system",
@@ -52,6 +54,10 @@ export function normalizeHomeSettings(value: unknown): HomeSettings {
     )
       ? (settings.recentSessionLimit as HomeRecentSessionLimit)
       : DEFAULT_HOME_SETTINGS.recentSessionLimit,
+    deviceSwitcherHapticsEnabled:
+      typeof settings.deviceSwitcherHapticsEnabled === "boolean"
+        ? settings.deviceSwitcherHapticsEnabled
+        : DEFAULT_HOME_SETTINGS.deviceSwitcherHapticsEnabled,
     backgroundProgressEnabled:
       typeof settings.backgroundProgressEnabled === "boolean"
         ? settings.backgroundProgressEnabled
