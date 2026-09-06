@@ -382,6 +382,7 @@ export function DevicesPane({ snapshot }: { snapshot: DesktopSnapshot }) {
   const [remoteInput, setRemoteInput] = useState("");
   const [remoteBusy, setRemoteBusy] = useState(false);
   const [remoteError, setRemoteError] = useState<string>();
+  const [remoteStatus, setRemoteStatus] = useState<string>();
   const remoteTerminalRef = useRef<HTMLPreElement>(null);
   const refreshRemoteHosts = useCallback(async (): Promise<void> => {
     try { setRemoteHosts(await window.prospero.listRemoteHosts()); } catch (reason) { setRemoteError(displayError(reason)); }
@@ -392,6 +393,9 @@ export function DevicesPane({ snapshot }: { snapshot: DesktopSnapshot }) {
       if (event.hostId !== remoteSelected) return;
       const message = event.message;
       if (message.type === "remote.error") { setRemoteError(String(message.message ?? "Remote connection failed")); return; }
+      if (message.type === "remote.connected") { setRemoteStatus(t("已连接", "Connected")); setRemoteError(undefined); return; }
+      if (message.type === "remote.closed") { setRemoteStatus(t("连接已断开，准备重连", "Disconnected; reconnecting")); return; }
+      if (message.type === "remote.reconnecting") { setRemoteStatus(t(`重连中（第 ${String(message.attempt)} 次）`, `Reconnecting (attempt ${String(message.attempt)})`)); return; }
       if (message.type === "term.snapshot") { setRemoteSid(String(message.sid)); setRemoteTerminal(String(message.ansi ?? "")); return; }
       if (message.type === "term.output") {
         setRemoteSid(String(message.sid));
@@ -414,7 +418,7 @@ export function DevicesPane({ snapshot }: { snapshot: DesktopSnapshot }) {
   };
   const openRemoteShell = async (hostId: string): Promise<void> => {
     if (remoteBusy) return;
-    setRemoteBusy(true); setRemoteError(undefined); setRemoteSelected(hostId); setRemoteSid(undefined); setRemoteTerminal("");
+    setRemoteBusy(true); setRemoteError(undefined); setRemoteStatus(t("连接中…", "Connecting…")); setRemoteSelected(hostId); setRemoteSid(undefined); setRemoteTerminal("");
     try { await window.prospero.connectRemoteHost(hostId); await window.prospero.createRemoteShell(hostId); }
     catch (reason) { setRemoteError(displayError(reason)); }
     finally { setRemoteBusy(false); }
@@ -625,7 +629,7 @@ export function DevicesPane({ snapshot }: { snapshot: DesktopSnapshot }) {
         </section>
       </div>
       <section className="form-card remote-control-card" aria-labelledby="remote-hosts-title">
-        <div className="section-title"><Server size={16} aria-hidden="true" /><span id="remote-hosts-title">{t("远程电脑 Shell", "Remote computer Shell")}</span><span>{remoteHosts.length}</span></div>
+        <div className="section-title"><Server size={16} aria-hidden="true" /><span id="remote-hosts-title">{t("远程电脑 Shell", "Remote computer Shell")}</span><span>{remoteHosts.length}</span>{remoteSelected && remoteStatus && <span className="pill" role="status" aria-live="polite">{remoteStatus}</span>}</div>
         <p className="security-note">{t("导入另一台电脑生成的 Prospero 配对串。凭据只留在桌面端主进程，默认打开 agent CLI shell。", "Import a Prospero pairing code from another computer. Credentials stay in the desktop main process; the default action opens an agent CLI shell.")}</p>
         <div className="remote-host-import"><input value={remotePairing} onChange={(event) => setRemotePairing(event.target.value)} placeholder="prospero://pair?d=…" spellCheck={false} /><button disabled={!remotePairing.trim() || remoteBusy} onClick={() => void importRemote()}>{t("导入主机", "Import host")}</button></div>
         {remoteError && <div className="inline-error" role="alert">{remoteError}</div>}
