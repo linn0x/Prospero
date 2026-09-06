@@ -1,8 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef } from "react";
 import {
-  Animated,
-  Easing,
   Modal,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -23,80 +22,56 @@ export function Sheet({
   visible,
   title,
   onClose,
+  onDismiss,
   children,
 }: {
   visible: boolean;
   title: string;
   onClose: () => void;
+  /** Navigation must wait until the iOS presenter has released its native modal. */
+  onDismiss?: () => void;
   children: React.ReactNode;
 }) {
   const insets = useSafeAreaInsets();
-  const [mounted, setMounted] = useState(visible);
-  const [backdropOpacity] = useState(() => new Animated.Value(visible ? 1 : 0));
-  const [sheetProgress] = useState(() => new Animated.Value(visible ? 1 : 0));
-
+  const wasVisible = useRef(visible);
+  const dismissCallback = useRef(onDismiss);
   useEffect(() => {
-    if (!visible || mounted) return;
-    const frame = requestAnimationFrame(() => setMounted(true));
+    dismissCallback.current = onDismiss;
+  }, [onDismiss]);
+  useEffect(() => {
+    const closed = wasVisible.current && !visible;
+    wasVisible.current = visible;
+    // RN exposes native onDismiss on iOS only. Elsewhere the invisible modal is
+    // removed in this commit, so a later frame can safely perform the action.
+    if (!closed || Platform.OS === "ios") return;
+    const frame = requestAnimationFrame(() => dismissCallback.current?.());
     return () => cancelAnimationFrame(frame);
-  }, [mounted, visible]);
-
-  useEffect(() => {
-    if (!mounted) return;
-    const animation = Animated.parallel([
-      Animated.timing(backdropOpacity, {
-        toValue: visible ? 1 : 0,
-        duration: visible ? 160 : 130,
-        easing: visible ? Easing.out(Easing.quad) : Easing.in(Easing.quad),
-        useNativeDriver: true,
-      }),
-      Animated.timing(sheetProgress, {
-        toValue: visible ? 1 : 0,
-        duration: visible ? 230 : 180,
-        easing: visible ? Easing.out(Easing.cubic) : Easing.in(Easing.cubic),
-        useNativeDriver: true,
-      }),
-    ]);
-    animation.start(({ finished }) => {
-      if (finished && !visible) setMounted(false);
-    });
-    return () => animation.stop();
-  }, [backdropOpacity, mounted, sheetProgress, visible]);
-
-  if (!mounted) return null;
+  }, [visible]);
 
   return (
     <Modal
-      visible={mounted}
+      visible={visible}
       transparent
-      animationType="none"
+      animationType="fade"
       hardwareAccelerated
       statusBarTranslucent
       onRequestClose={onClose}
+      onDismiss={() => { if (!visible) onDismiss?.(); }}
     >
       <View style={styles.modalRoot}>
-        {/* 遮罩只原地淡入，不再和面板一起从屏幕底部滑上来。 */}
-        <Animated.View style={[styles.backdropLayer, { opacity: backdropOpacity }]}>
+        {/* Native visibility owns dismissal, including interrupted/background transitions. */}
+        <View style={styles.backdropLayer}>
           <Pressable
             accessibilityRole="button"
             accessibilityLabel="关闭弹层"
             style={styles.backdrop}
             onPress={onClose}
           />
-        </Animated.View>
-        <Animated.View
+        </View>
+        <View
           style={[
             styles.sheet,
             { paddingBottom: insets.bottom + space.lg },
-            {
-              opacity: sheetProgress,
-              transform: [{
-                translateY: sheetProgress.interpolate({
-                  inputRange: [0, 1],
-                  outputRange: [28, 0],
-                }),
-              }],
-            },
           ]}
         >
           <View style={styles.grabber} />
@@ -109,7 +84,7 @@ export function Sheet({
           <ScrollView style={styles.body} showsVerticalScrollIndicator={false}>
             {children}
           </ScrollView>
-        </Animated.View>
+        </View>
       </View>
     </Modal>
   );
