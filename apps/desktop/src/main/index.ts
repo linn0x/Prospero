@@ -16,6 +16,7 @@ import { LegacyOrchestrationProjection } from "./legacy-orchestration-projection
 import { sessionInfoFromControl } from "./session-control";
 import { StateStore } from "./state-store";
 import { RemoteHostStore } from "./remote-host-store";
+import { RemoteShellManager } from "./remote-shell-manager";
 
 const SAFE_ID = /^[A-Za-z0-9._:-]{1,160}$/;
 const ORCHESTRATION_METHODS = new Set([
@@ -52,6 +53,9 @@ let windowStateTimer: ReturnType<typeof setTimeout> | undefined;
 let accountActionTail: Promise<void> = Promise.resolve();
 const store = new StateStore();
 const remoteHostStore = new RemoteHostStore(resolve(app.getPath("userData"), "remote-hosts.json"));
+const remoteShellManager = new RemoteShellManager(remoteHostStore, (event) => {
+  mainWindow?.webContents.send("remote-shell:event", event);
+});
 const runtime = new DaemonRuntime(store);
 const legacyProjection = new LegacyOrchestrationProjection(
   store.home,
@@ -742,6 +746,24 @@ function installIpc(): void {
     if (typeof raw !== "string" || !SAFE_ID.test(raw)) throw new Error("远程主机 ID 无效");
     return { ok: remoteHostStore.remove(raw) };
   });
+  ipcMain.handle("remote-shell:connect", (_event, raw: unknown) => remoteShellManager.connect(requireId(raw, "远程主机")));
+  ipcMain.handle("remote-shell:create", (_event, rawHost: unknown, rawCwd: unknown) => {
+    const cwd = rawCwd === undefined ? undefined : typeof rawCwd === "string" ? rawCwd : (() => { throw new Error("远程工作目录无效"); })();
+    return remoteShellManager.createShell(requireId(rawHost, "远程主机"), cwd);
+  });
+  ipcMain.handle("remote-shell:input", (_event, rawHost: unknown, rawSid: unknown, rawData: unknown) => {
+    if (typeof rawSid !== "string" || typeof rawData !== "string") throw new Error("远程终端输入无效");
+    return remoteShellManager.input(requireId(rawHost, "远程主机"), rawSid, rawData);
+  });
+  ipcMain.handle("remote-shell:resize", (_event, rawHost: unknown, rawSid: unknown, rawCols: unknown, rawRows: unknown) => {
+    if (typeof rawSid !== "string" || typeof rawCols !== "number" || typeof rawRows !== "number") throw new Error("远程终端尺寸无效");
+    return remoteShellManager.resize(requireId(rawHost, "远程主机"), rawSid, rawCols, rawRows);
+  });
+  ipcMain.handle("remote-shell:kill", (_event, rawHost: unknown, rawSid: unknown) => {
+    if (typeof rawSid !== "string") throw new Error("远程会话无效");
+    return remoteShellManager.kill(requireId(rawHost, "远程主机"), rawSid);
+  });
+  ipcMain.handle("remote-shell:disconnect", (_event, raw: unknown) => remoteShellManager.disconnect(requireId(raw, "远程主机")));
   ipcMain.handle("daemon:start", () => runtime.start());
   ipcMain.handle("daemon:stop", () => runtime.stop());
   ipcMain.handle("daemon:restart", () => runtime.restart());
