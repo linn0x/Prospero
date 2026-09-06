@@ -749,10 +749,13 @@ kbd {
 .session-pin-action.is-pinned { color: var(--sidebar-foreground); opacity: 1; }
 .sidebar-content-shell { overflow: hidden !important; }
 .sidebar-nav-fixed { flex: none; }
+.prospero-sidebar .sidebar-nav-fixed [data-sidebar="group"] { padding-block: 4px; }
+.prospero-sidebar .sidebar-nav-fixed [data-sidebar="menu-button"] { height: 30px; min-height: 30px; padding-block: 5px; }
+.prospero-sidebar .sidebar-nav-fixed [data-sidebar="group-label"] { height: 24px; }
 .sidebar-workspace-scroll { min-height: 0; flex: 1; overflow: auto; scrollbar-width: thin; }
 .sidebar-footer-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; }
 .sidebar-footer-actions > [data-sidebar="menu-item"] { min-width: 0; }
-.sidebar-footer-actions [data-sidebar="menu-button"] { justify-content: center; min-width: 0; padding-inline: 7px; }
+.prospero-sidebar .sidebar-footer-actions [data-sidebar="menu-button"] { justify-content: center; min-width: 0; min-height: 32px; padding-inline: 7px; }
 .sidebar-footer-actions [data-sidebar="menu-button"] > span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sidebar-daemon-dot { display: block; width: 7px; height: 7px; flex: none; border-radius: 50%; background: var(--danger); box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 11%, transparent); }
 .sidebar-daemon-dot.online { background: var(--success); box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 12%, transparent); }
@@ -764,7 +767,8 @@ kbd {
 [data-collapsible="icon"] .prospero-sidebar .sidebar-detail-section { display: none; }
 [data-collapsible="icon"] .prospero-sidebar [data-sidebar="group"] { padding-right: 16px; padding-left: 16px; }
 [data-collapsible="icon"] .prospero-sidebar [data-sidebar="menu-item"] { display: flex; justify-content: center; }
-[data-collapsible="icon"] .prospero-sidebar [data-sidebar="menu-button"] { width: 40px !important; height: 40px !important; padding: 10px !important; }
+[data-collapsible="icon"] .prospero-sidebar .sidebar-nav-fixed [data-sidebar="group-label"] { margin-top: -24px; }
+[data-collapsible="icon"] .prospero-sidebar [data-sidebar="menu-button"] { width: 36px !important; height: 36px !important; padding: 8px !important; }
 [data-collapsible="icon"] .prospero-sidebar [data-sidebar="menu-button"] > svg { width: 17px; height: 17px; }
 [data-collapsible="icon"] .prospero-sidebar .sidebar-footer-actions { grid-template-columns: minmax(0, 1fr); }
 .session-agent-icon { display: grid; width: 15px; height: 15px; flex: none; place-items: center; color: var(--muted-foreground); }
