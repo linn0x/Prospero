@@ -11,6 +11,7 @@ import {
   StyleSheet,
   Text,
   View,
+  useWindowDimensions,
 } from "react-native";
 import type { SessionInfo } from "@prospero/protocol";
 
@@ -209,6 +210,9 @@ export function HomeDashboard({
 }) {
   const { palette } = useMobileTheme();
   const styles = useMemo(() => createStyles(palette), [palette]);
+  const { width: windowWidth } = useWindowDimensions();
+  const compactWorkspaceActions = windowWidth < 390;
+  const recentCardWidth = Math.min(232, Math.max(196, windowWidth - 72));
   const selectedHost = hosts.find((host) => host.id === selectedHostId) ?? hosts[0];
   const selectedRuntime = selectedHost ? runtimes[selectedHost.id] : undefined;
   const recentUsage = useSyncExternalStore(
@@ -494,7 +498,11 @@ export function HomeDashboard({
                     accessibilityRole="button"
                     accessibilityLabel={`打开最近对话 ${session.title || session.agent}，${homeRecentSummary(session, recentUsage[session.id])}`}
                     onPress={() => onOpenSession(selectedHost.id, session.id)}
-                    style={({ pressed }) => [styles.recentCard, pressed && styles.recentCardPressed]}
+                    style={({ pressed }) => [
+                      styles.recentCard,
+                      { width: recentCardWidth },
+                      pressed && styles.recentCardPressed,
+                    ]}
                   >
                     <AgentIcon agent={session.agent} size={18} badge />
                     <View style={styles.recentCopy}>
@@ -546,10 +554,14 @@ export function HomeDashboard({
                     createNavigation.cancel();
                     setQuickCreateOpen(true);
                   }}
-                  style={({ pressed }) => [styles.createButton, pressed && styles.createButtonPressed]}
+                  style={({ pressed }) => [
+                    styles.createButton,
+                    compactWorkspaceActions && styles.createButtonCompact,
+                    pressed && styles.createButtonPressed,
+                  ]}
                 >
                   <Icon name="plus" size={16} color={palette.text} weight="semibold" />
-                  <Text style={styles.createButtonText}>新建</Text>
+                  {!compactWorkspaceActions && <Text style={styles.createButtonText}>新建</Text>}
                 </Pressable>
               </View>
             </View>
@@ -957,6 +969,10 @@ function createStyles(palette: ThemePalette) {
     paddingHorizontal: space.md,
     borderRadius: radius.sm,
     backgroundColor: palette.accentDim,
+  },
+  createButtonCompact: {
+    width: 44,
+    paddingHorizontal: 0,
   },
   createButtonPressed: { opacity: 0.8 },
   createButtonText: { color: palette.text, fontSize: 12, fontWeight: "700" },
