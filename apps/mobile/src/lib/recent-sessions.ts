@@ -6,6 +6,7 @@ export const RECENT_SESSION_HOST_LIMIT = 100;
 export const RECENT_SUMMARY_LIMIT = 160;
 const STORAGE_KEY = "prospero.recentSessions.v1";
 const MAX_STORED_CHARS = 256 * 1024;
+const ACTIVITY_PUBLISH_MS = 250;
 const EMPTY: Readonly<Record<string, RecentSession>> = Object.freeze({});
 
 export interface RecentSession {
@@ -90,9 +91,11 @@ export function createRecentSessionStore(storage: Storage, now: () => number = D
   let loaded = false;
   let dirty = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let publishTimer: ReturnType<typeof setTimeout> | undefined;
+  let pendingPublish = false;
   let writing: Promise<void> | undefined;
 
-  const publish = () => {
+  const retain = () => {
     const hostCounts = new Map<string, number>();
     let storedChars = 32;
     const ordered = [...entries.values()].sort((a, b) =>
@@ -106,6 +109,41 @@ export function createRecentSessionStore(storage: Storage, now: () => number = D
       storedChars += chars;
       return true;
     }).slice(0, RECENT_SESSION_LIMIT).map((entry) => [identity(entry), entry]));
+  };
+
+  const trimOnInsert = (hostId: string) => {
+    // More active sessions than the recent-list capacity must not put full JSON
+    // serialization back on every event. Evict at most one row per insertion.
+    const oldest = (host?: string): string | undefined => {
+      let key: string | undefined;
+      let time = Infinity;
+      for (const [candidate, entry] of entries) {
+        if (host !== undefined && entry.hostId !== host) continue;
+        const usedAt = Math.max(entry.openedAt, entry.activityAt);
+        if (usedAt < time || (usedAt === time && key !== undefined && candidate.localeCompare(key) > 0)) {
+          key = candidate;
+          time = usedAt;
+        }
+      }
+      return key;
+    };
+    let hostCount = 0;
+    for (const entry of entries.values()) if (entry.hostId === hostId) hostCount++;
+    if (hostCount > RECENT_SESSION_HOST_LIMIT) {
+      const key = oldest(hostId);
+      if (key !== undefined) entries.delete(key);
+    }
+    if (entries.size > RECENT_SESSION_LIMIT) {
+      const key = oldest();
+      if (key !== undefined) entries.delete(key);
+    }
+  };
+
+  const publish = () => {
+    if (publishTimer !== undefined) clearTimeout(publishTimer);
+    publishTimer = undefined;
+    pendingPublish = false;
+    retain();
     // useSyncExternalStore compares snapshot identity. Another host's activity must
     // not invalidate the current home's snapshot; eviction still invalidates its owner.
     const retainedCounts = new Map<string, number>();
@@ -124,6 +162,7 @@ export function createRecentSessionStore(storage: Storage, now: () => number = D
     await load();
     if (timer !== undefined) clearTimeout(timer);
     timer = undefined;
+    if (pendingPublish) publish();
     if (writing) return writing;
     if (!dirty) return;
     let failed = false;
@@ -133,6 +172,7 @@ export function createRecentSessionStore(storage: Storage, now: () => number = D
       while (dirty) {
         dirty = false;
         try {
+          if (pendingPublish) retain();
           await storage.setItem(STORAGE_KEY, JSON.stringify({ version: 1, entries: [...entries.values()] }));
         } catch {
           // Keep dirty state for the next activity/explicit flush; do not spin on failure.
@@ -177,7 +217,15 @@ export function createRecentSessionStore(storage: Storage, now: () => number = D
       summaryAt: summary ? time : 0, summary,
     }));
     dirty = true;
-    publish();
+    if (kind === "open") {
+      // Explicit navigation should reorder immediately. Streaming metadata only
+      // replaces one bounded row here; sorting/serialization/notification is batched.
+      publish();
+    } else {
+      if (!current) trimOnInsert(hostId);
+      pendingPublish = true;
+      if (publishTimer === undefined) publishTimer = setTimeout(publish, ACTIVITY_PUBLISH_MS);
+    }
     if (loaded) schedule();
     else void load();
   };

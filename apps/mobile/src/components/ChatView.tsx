@@ -23,7 +23,6 @@ import {
 import {
   fromB64,
   toB64,
-  type AgentEventBody,
   type AgentKind,
   type AgentQuestionAnswer,
   type AgentUserAttachment,
@@ -31,6 +30,9 @@ import {
   type SessionStatus,
   type SubagentStatus,
 } from "@prospero/protocol";
+import { pollFocusedSubagent, subscribeFocusedChat } from "@/lib/focused-session-stream";
+import { useFocusedSessionEffect } from "@/lib/use-focused-session-effect";
+import { ChatScrollFollow, isAtLatestChatOffset, newestChatItemsFirst } from "@/lib/chat-scroll-follow";
 import { AgentIcon, agentTint } from "@/components/AgentIcon";
 import { DiffView } from "@/components/DiffView";
 import { Icon } from "@/components/Icon";
@@ -107,8 +109,16 @@ function projectImageMime(path: string): string {
 }
 
 const chatKeyExtractor = (i: ChatDisplayItem): string => i.key;
+const isScrollAtBottom = (event: NativeScrollEvent): boolean =>
+  isAtLatestChatOffset(event.contentOffset.y);
+const CHAT_VISIBLE_POSITION = { minIndexForVisible: 0 } as const;
 
-export const ChatView = memo(function ChatView({
+export const ChatView = memo(function ChatView(props: Props) {
+  // Router can reuse this component for another session; its state/cursor must not follow it.
+  return <ChatViewContent key={`${props.conn.host.id}\u0000${props.sid}`} {...props} />;
+});
+
+const ChatViewContent = memo(function ChatViewContent({
   conn,
   sid,
   onPendingChange,
@@ -133,7 +143,7 @@ export const ChatView = memo(function ChatView({
   const imageCacheRef = useRef(new Map<string, Promise<string>>());
   const attachmentCacheRef = useRef(new Map<string, Promise<string>>());
   const evSeqRef = useRef(0);
-  const atBottomRef = useRef(true);
+  const scrollFollow = useRef(new ChatScrollFollow());
   const [hasUnread, setHasUnread] = useState(false);
   const [selectionSource, setSelectionSource] = useState<string | null>(null);
 
@@ -198,85 +208,22 @@ export const ChatView = memo(function ChatView({
     [conn, sid],
   );
 
-  useEffect(() => {
-    // 文本 delta 往往几十次/秒。逐条 setState 会反复解析 Markdown、布局列表并
-    // 启动滚动动画;按约一帧半合并后仍像实时打字,但 JS/原生桥压力小很多。
-    let queued: AgentEventBody[] = [];
-    let flushTimer: ReturnType<typeof setTimeout> | null = null;
-    const flush = (): void => {
-      if (flushTimer !== null) clearTimeout(flushTimer);
-      flushTimer = null;
-      if (queued.length === 0) return;
-      const batch = queued;
-      queued = [];
-      setItems((prev) => applyEvents(prev, batch));
-    };
-    const discardQueued = (): void => {
-      if (flushTimer !== null) clearTimeout(flushTimer);
-      flushTimer = null;
-      queued = [];
-    };
+  useFocusedSessionEffect(useCallback(() => subscribeFocusedChat({
+    conn, sid, cursor: evSeqRef,
+    snapshot: (events) => setItems(applyEvents([], events)),
+    events: (events) => setItems((previous) => applyEvents(previous, events)),
+    toolOutput: (message) => setItems((previous) =>
+      applyToolOutput(previous, message.callId, message.output, message.truncated === true)),
+    unread: () => { if (!scrollFollow.current.following) setHasUnread(true); },
+  }), [conn, sid]));
 
-    // 快照重建整个列表(attach / 重连后的权威状态)
-    const offSnap = conn.events.on("chatSnapshot", (m) => {
-      if (m.sid !== sid) return;
-      discardQueued();
-      evSeqRef.current = m.evSeq;
-      setItems(applyEvents([], m.events));
+  useFocusedSessionEffect(useCallback(() => {
+    if (!subagentId) return () => undefined;
+    return pollFocusedSubagent({
+      conn, sid, subagentId,
+      receive: (events) => setSubagentHistory({ subagentId, items: applyEvents([], events) }),
     });
-    const offEv = conn.events.on("agentEvent", (m) => {
-      if (m.sid !== sid) return;
-      evSeqRef.current = m.evSeq;
-      queued.push(m.body);
-      if (flushTimer === null) flushTimer = setTimeout(flush, 32);
-      if (!atBottomRef.current) setHasUnread(true);
-    });
-    const offOut = conn.events.on("toolOutput", (m) => {
-      if (m.sid !== sid) return;
-      // tool.start 可能还在 32ms 合并窗里;先提交它,再回填完整输出。
-      if (queued.length > 0) flush();
-      setItems((prev) => applyToolOutput(prev, m.callId, m.output, m.truncated === true));
-    });
-    const attach = (): void => conn.attach(sid, evSeqRef.current || undefined);
-    const offConn = conn.events.on("connected", attach);
-    if (conn.isConnected) attach();
-    return () => {
-      offSnap();
-      offEv();
-      offOut();
-      offConn();
-      discardQueued();
-    };
-  }, [conn, sid]);
-
-  useEffect(() => {
-    if (!subagentId) return;
-    let cancelled = false;
-    let loading = false;
-    const refresh = async (): Promise<void> => {
-      if (cancelled || loading || !conn.isConnected || !conn.supportsSubagentHistory) return;
-      loading = true;
-      try {
-        const events = await conn.subagentHistory(sid, subagentId);
-        if (!cancelled) {
-          setSubagentHistory({ subagentId, items: applyEvents([], events) });
-        }
-      } catch {
-        // 断线、重连或 Codex 正在落盘时保留上一次内容；父会话实时事件仍是降级视图。
-      }
-      // 不用 finally:带 finalizer 的 try 会让 React Compiler 放弃优化整个 ChatView。
-      // catch 吞掉了所有异常,控制流必然到达这里,语义等价。
-      loading = false;
-    };
-    void refresh();
-    const timer = setInterval(() => void refresh(), 1_200);
-    const offConnected = conn.events.on("connected", () => void refresh());
-    return () => {
-      cancelled = true;
-      clearInterval(timer);
-      offConnected();
-    };
-  }, [conn, sid, subagentId]);
+  }, [conn, sid, subagentId]));
 
   const scopedItems = useMemo(
     () =>
@@ -358,11 +305,13 @@ export const ChatView = memo(function ChatView({
     }
     return viewMode === "trajectory" ? source : foldChatItems(source);
   }, [scopedItems, search, viewMode]);
+  // The latest cells mount first at offset zero; no estimated long-history end is needed.
+  const newestFirst = useMemo(() => newestChatItemsFirst(visible), [visible]);
 
   const jumpToBottom = useCallback(() => {
-    atBottomRef.current = true;
+    scrollFollow.current.followLatest();
     setHasUnread(false);
-    listRef.current?.scrollToEnd({ animated: true });
+    listRef.current?.scrollToOffset({ offset: 0, animated: true });
   }, []);
 
   // 内联写在 JSX 里的话每次渲染都是新函数,FlatList 会据此重建所有 cell,
@@ -442,7 +391,7 @@ export const ChatView = memo(function ChatView({
     [workingStatus, search],
   );
 
-  const listFooter = useMemo(
+  const listHeader = useMemo(
     () =>
       agent && workingStatus ? (
         <AgentWorkingIndicator
@@ -455,7 +404,10 @@ export const ChatView = memo(function ChatView({
   );
 
   const handleContentSizeChange = useCallback(() => {
-    if (atBottomRef.current) listRef.current?.scrollToEnd({ animated: false });
+    if (!scrollFollow.current.following) return;
+    // Inversion makes the latest edge exact even while older Markdown rows are unmeasured.
+    scrollFollow.current.followLatest();
+    listRef.current?.scrollToOffset({ offset: 0, animated: false });
   }, []);
 
   // hasUnread 走 ref:直接读 state 会让 onScroll 在每次未读标记变化时换引用。
@@ -466,25 +418,40 @@ export const ChatView = memo(function ChatView({
 
   const handleScroll = useCallback(
     (e: NativeSyntheticEvent<NativeScrollEvent>) => {
-      const { layoutMeasurement, contentOffset, contentSize } = e.nativeEvent;
-      const bottom =
-        layoutMeasurement.height + contentOffset.y >= contentSize.height - 60;
-      atBottomRef.current = bottom;
+      const bottom = isScrollAtBottom(e.nativeEvent);
+      scrollFollow.current.scrolled(bottom);
       if (bottom && hasUnreadRef.current) setHasUnread(false);
     },
     [],
   );
 
+  const handleScrollBeginDrag = useCallback(() => scrollFollow.current.beginDrag(), []);
+  const handleScrollEndDrag = useCallback((e: NativeSyntheticEvent<NativeScrollEvent>) => {
+    scrollFollow.current.endDrag(isScrollAtBottom(e.nativeEvent), e.nativeEvent.velocity?.y);
+    if (scrollFollow.current.following) setHasUnread(false);
+  }, []);
+  const handleMomentumScrollBegin = useCallback(() => scrollFollow.current.beginMomentum(), []);
+  const handleMomentumScrollEnd = useCallback((e: NativeSyntheticEvent<NativeScrollEvent>) => {
+    scrollFollow.current.endMomentum(isScrollAtBottom(e.nativeEvent));
+    if (scrollFollow.current.following) setHasUnread(false);
+  }, []);
+
   return (
     <View style={styles.root}>
       <FlatList
         ref={listRef}
-        data={visible}
+        data={newestFirst}
+        inverted
+        maintainVisibleContentPosition={CHAT_VISIBLE_POSITION}
         keyExtractor={chatKeyExtractor}
         style={styles.list}
         contentContainerStyle={styles.content}
         onContentSizeChange={handleContentSizeChange}
         onScroll={handleScroll}
+        onScrollBeginDrag={handleScrollBeginDrag}
+        onScrollEndDrag={handleScrollEndDrag}
+        onMomentumScrollBegin={handleMomentumScrollBegin}
+        onMomentumScrollEnd={handleMomentumScrollEnd}
         scrollEventThrottle={32}
         keyboardShouldPersistTaps="handled"
         keyboardDismissMode={Platform.OS === "ios" ? "interactive" : "on-drag"}
@@ -495,7 +462,7 @@ export const ChatView = memo(function ChatView({
         // 有 Markdown、diff 和图片,十一屏的量在长会话里就是白挂着的原生视图。
         windowSize={7}
         ListEmptyComponent={listEmpty}
-        ListFooterComponent={listFooter}
+        ListHeaderComponent={listHeader}
         renderItem={renderItem}
       />
       {hasUnread && (
@@ -1531,8 +1498,9 @@ const styles = StyleSheet.create({
     maxWidth: 920,
     alignSelf: "center",
     paddingHorizontal: 14,
-    paddingTop: 14,
-    paddingBottom: 28,
+    // Inverted content: logical top is the visual bottom next to the composer.
+    paddingTop: 28,
+    paddingBottom: 14,
     gap: 14,
   },
   empty: { minHeight: 280, alignItems: "center", justifyContent: "center", gap: 7 },

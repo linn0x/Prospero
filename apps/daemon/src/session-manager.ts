@@ -75,6 +75,7 @@ import {
 import { writePrivateFileAtomic } from "./filesystem-store.js";
 import { SessionDatabase } from "./session-database.js";
 import { migrateLegacySessionFile } from "./legacy-session-import.js";
+import { projectSessionQueue } from "./queue-display.js";
 
 export type SessionErrorCode =
   | "storage_unavailable"
@@ -1377,8 +1378,9 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     return this.sessionInfoWithCapabilities(s.info());
   }
 
-  /** Intersect native controls with account restrictions for every client, including older clients. */
+  /** Bound display metadata and apply account restrictions, including for active older owners. */
   sessionInfoWithCapabilities(info: SessionInfo): SessionInfo {
+    info = projectSessionQueue(info);
     if (!info.agentControls || !info.accountId || (info.agent !== "claude" && info.agent !== "codex")) return info;
     let capabilities: AgentAccountCapabilities;
     try {
