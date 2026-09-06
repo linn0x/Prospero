@@ -75,6 +75,7 @@ import { coordinatorRunsBySession, orchestrationRoute } from "@/lib/orchestratio
 import { useOrchestrationSnapshot } from "@/lib/use-orchestration-snapshot";
 import { deliveryFailureText } from "@/lib/outbound-queue";
 import { sessionLoadState } from "@/lib/session-load-state";
+import { useSessionAttention } from "@/lib/session-attention";
 import { appendVoiceTranscript } from "@/lib/voice-input";
 import {
   SYSTEM_TERMINAL_FONT_PREFERENCE,
@@ -460,6 +461,10 @@ export default function SessionScreen() {
   }, []);
 
   const session = sid ? runtime.sessions[sid] : undefined;
+  const markCompletionRead = useSessionAttention((state) => state.markCompletionRead);
+  useEffect(() => {
+    if (session) markCompletionRead(hostId, session);
+  }, [hostId, markCompletionRead, session]);
   const supportsDeepseekTrajectory = conn?.supportsDeepseekTrajectory ?? false;
   const effectiveDeepseekView = supportsDeepseekTrajectory ? deepseekView : "chat";
   const orchestration = useOrchestrationSnapshot(conn, runtime.status, 8_000);

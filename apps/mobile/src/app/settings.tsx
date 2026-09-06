@@ -333,7 +333,7 @@ export default function SettingsScreen(): React.ReactElement {
           palette={palette}
           styles={styles}
         >
-          <View style={styles.optionBlock}>
+          <View style={[styles.optionBlock, styles.optionBlockDivider]}>
             <Text style={styles.optionLabel}>最近对话数量</Text>
             <SegmentedOptions
               value={settings.recentSessionLimit}
@@ -347,6 +347,21 @@ export default function SettingsScreen(): React.ReactElement {
             />
             <Text style={styles.optionHint}>首页仅改变展示数量，不会删除历史会话。</Text>
           </View>
+          <SettingRow
+            title="设备切换震动"
+            detail="长按进入快速切换、滑过设备时提供轻微反馈"
+            styles={styles}
+            last
+          >
+            <Switch
+              value={settings.deviceSwitcherHapticsEnabled}
+              onValueChange={(deviceSwitcherHapticsEnabled) =>
+                updateSettings({ deviceSwitcherHapticsEnabled })
+              }
+              trackColor={{ false: palette.border, true: palette.accentDim }}
+              thumbColor={settings.deviceSwitcherHapticsEnabled ? palette.accent : palette.textDim}
+            />
+          </SettingRow>
         </SettingsSection>
 
         {Platform.OS === "android" && (
@@ -496,6 +511,10 @@ function createStyles(palette: ThemePalette) {
     backgroundColor: palette.surface,
   },
   optionBlock: { gap: 11, padding: 13 },
+  optionBlockDivider: {
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: palette.border,
+  },
   optionLabel: { color: palette.text, fontSize: 13, fontWeight: "600" },
   optionHint: { color: palette.textFaint, fontSize: 11, lineHeight: 15 },
   segments: { flexDirection: "row", gap: 6, padding: 3, borderRadius: 10, backgroundColor: palette.bg },

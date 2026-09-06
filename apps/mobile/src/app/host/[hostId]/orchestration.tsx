@@ -24,8 +24,19 @@ import type {
 } from "@prospero/protocol";
 import { AgentIcon } from "@/components/AgentIcon";
 import { Icon } from "@/components/Icon";
+import { PromptDialog } from "@/components/PromptDialog";
 import { WorkspacePicker } from "@/components/WorkspacePicker";
 import { primaryPaneWidth, useAdaptiveLayout } from "@/lib/adaptive-layout";
+import {
+  createOrchestrationTemplatePayload,
+  instantiateOrchestrationTemplate,
+  type OrchestrationTemplate,
+} from "@/lib/orchestration-template";
+import {
+  deleteOrchestrationTemplate,
+  listOrchestrationTemplates,
+  saveOrchestrationTemplate,
+} from "@/lib/orchestration-template-store";
 import { useHostConnection } from "@/lib/use-host-connection";
 import {
   groupOrchestrationRuns,
@@ -193,6 +204,10 @@ export default function OrchestrationScreen() {
   const [policy, setPolicy] = useState<ApprovalPolicy>("standard");
   const [pickerOpen, setPickerOpen] = useState(false);
   const [agentAccounts, setAgentAccounts] = useState<AgentAccount[]>([]);
+  const [templates, setTemplates] = useState<OrchestrationTemplate[]>([]);
+  const [templatesLoading, setTemplatesLoading] = useState(true);
+  const [templateNameDialogOpen, setTemplateNameDialogOpen] = useState(false);
+  const [templateName, setTemplateName] = useState("");
   const adaptiveLayout = useAdaptiveLayout();
   const contentPaneWidth = primaryPaneWidth(adaptiveLayout.width, adaptiveLayout.verticalPanes);
   const snapshot = useOrchestrationSnapshot(conn, runtime.status, 5_000, setBanner);
@@ -216,6 +231,28 @@ export default function OrchestrationScreen() {
         cancelled = true;
       };
     }, [conn, runtime.status]),
+  );
+
+  useFocusEffect(
+    useCallback(() => {
+      let cancelled = false;
+      setTemplatesLoading(true);
+      void listOrchestrationTemplates()
+        .then((nextTemplates) => {
+          if (!cancelled) setTemplates(nextTemplates);
+        })
+        .catch((error: unknown) => {
+          if (!cancelled) {
+            setBanner(`无法读取本机编排模板：${error instanceof Error ? error.message : String(error)}`);
+          }
+        })
+        .finally(() => {
+          if (!cancelled) setTemplatesLoading(false);
+        });
+      return () => {
+        cancelled = true;
+      };
+    }, []),
   );
 
   const runGroups = useMemo(
@@ -304,6 +341,17 @@ export default function OrchestrationScreen() {
           : !graphHasChanges
             ? "尚未修改"
           : null;
+  const templateIssue = objective.trim().length === 0
+    ? "先填写编排目标"
+    : draftNodes.length === 0
+      ? "至少添加一个任务"
+      : draftNodes.some((node) => node.title.trim().length === 0)
+        ? "每个任务都需要标题"
+        : draftNodes.some((node) => node.spec.trim().length === 0)
+          ? "每个任务都需要交付说明"
+          : graphHasCycle(draftNodes)
+            ? "依赖关系不能形成环"
+            : null;
 
   const graphSnapshot = (): DraftSnapshot => ({
     objective,
@@ -391,6 +439,62 @@ export default function OrchestrationScreen() {
     setGraphBaseline(cloneDraftNodes(existing));
     resetGraphHistory();
     setEditor({ kind: "graph" });
+  };
+
+  const openTemplate = (template: OrchestrationTemplate): void => {
+    if (!canCreateGraph) {
+      setBanner("连接支持任务图编排的设备后，才能使用模板创建新的 Run。");
+      return;
+    }
+    const draft = instantiateOrchestrationTemplate(template.payload, randomUUID);
+    setObjective(draft.objective);
+    setDraftNodes(draft.nodes);
+    setSelectedDraftId(draft.nodes[0]?.id ?? null);
+    setGraphOperationId(randomUUID());
+    setGraphEditingRunId(null);
+    setGraphBaseRevision(0);
+    setGraphPersistedIds([]);
+    setGraphLockedIds([]);
+    setGraphBaseline([]);
+    resetGraphHistory();
+    setEditor({ kind: "graph" });
+  };
+
+  const saveCurrentTemplate = async (name: string): Promise<void> => {
+    if (templateIssue !== null) throw new Error(templateIssue);
+    const saved = await saveOrchestrationTemplate(
+      name,
+      createOrchestrationTemplatePayload(objective, draftNodes),
+    );
+    setTemplates((current) => [
+      saved,
+      ...current.filter((template) => template.id !== saved.id),
+    ]);
+    setTemplateNameDialogOpen(false);
+    setBanner(`编排模板“${saved.name}”已保存到本机。`);
+  };
+
+  const confirmDeleteTemplate = (template: OrchestrationTemplate): void => {
+    Alert.alert(
+      "删除编排模板？",
+      `“${template.name}”只会从这台移动设备删除，不会影响已经发布的 Run。`,
+      [
+        { text: "取消", style: "cancel" },
+        {
+          text: "删除",
+          style: "destructive",
+          onPress: () => {
+            void deleteOrchestrationTemplate(template.id)
+              .then(() => setTemplates((current) => current.filter(
+                (candidate) => candidate.id !== template.id,
+              )))
+              .catch((error: unknown) => {
+                setBanner(`无法删除模板：${error instanceof Error ? error.message : String(error)}`);
+              });
+          },
+        },
+      ],
+    );
   };
 
   const openTaskEditor = (): void => {
@@ -845,6 +949,73 @@ export default function OrchestrationScreen() {
           </View>
         </View>
 
+        {editor?.kind !== "graph" && (
+          <View style={styles.templateSection}>
+            <View style={styles.templateHeader}>
+              <View style={styles.templateHeaderIcon}>
+                <Icon name="square.stack.3d.up" size={16} color={color.accent} />
+              </View>
+              <View style={styles.templateHeaderCopy}>
+                <Text style={styles.templateTitle}>编排模板</Text>
+                <Text style={styles.templateSubtitle}>保存在本机，可为不同电脑复用任务图</Text>
+              </View>
+              {templates.length > 0 && (
+                <Text style={styles.templateCount}>{templates.length}</Text>
+              )}
+            </View>
+            {templatesLoading ? (
+              <Text style={styles.templateEmpty}>正在读取本机模板…</Text>
+            ) : templates.length === 0 ? (
+              <Text style={styles.templateEmpty}>在任务图编辑器中完成编排后，可存为模板。</Text>
+            ) : (
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.templateStrip}
+              >
+                {templates.map((template) => (
+                  <View key={template.id} style={styles.templateCard}>
+                    <Text style={styles.templateCardName} numberOfLines={1}>{template.name}</Text>
+                    <Text style={styles.templateCardObjective} numberOfLines={2}>
+                      {template.payload.objective}
+                    </Text>
+                    <Text style={styles.templateCardMeta}>
+                      {template.payload.nodes.length} 个任务 · 本机模板
+                    </Text>
+                    <View style={styles.templateCardActions}>
+                      <Pressable
+                        accessibilityRole="button"
+                        accessibilityLabel={`使用编排模板 ${template.name}`}
+                        disabled={!canCreateGraph}
+                        style={({ pressed }) => [
+                          styles.templateUseButton,
+                          !canCreateGraph && styles.disabled,
+                          pressed && styles.primaryPressed,
+                        ]}
+                        onPress={() => openTemplate(template)}
+                      >
+                        <Text style={styles.templateUseText}>使用模板</Text>
+                      </Pressable>
+                      <Pressable
+                        accessibilityRole="button"
+                        accessibilityLabel={`删除编排模板 ${template.name}`}
+                        hitSlop={8}
+                        style={({ pressed }) => [
+                          styles.templateDeleteButton,
+                          pressed && styles.primaryPressed,
+                        ]}
+                        onPress={() => confirmDeleteTemplate(template)}
+                      >
+                        <Icon name="trash" size={14} color={color.textFaint} />
+                      </Pressable>
+                    </View>
+                  </View>
+                ))}
+              </ScrollView>
+            )}
+          </View>
+        )}
+
         {connectionNotice !== null ? (
           <View
             style={[
@@ -1033,6 +1204,23 @@ export default function OrchestrationScreen() {
                 ? `将原子更新 ${editableDraftNodes.length} 个待派发任务，删除 ${deletedPersistedIds.length} 个`
                 : `将一次性创建 ${draftNodes.length} 个任务`)}
             </Text>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="将当前任务图存为编排模板"
+              disabled={templateIssue !== null}
+              style={({ pressed }) => [
+                styles.templateSaveButton,
+                templateIssue !== null && styles.disabled,
+                pressed && styles.primaryPressed,
+              ]}
+              onPress={() => {
+                setTemplateName(objective.trim().slice(0, 48));
+                setTemplateNameDialogOpen(true);
+              }}
+            >
+              <Icon name="square.stack.3d.up" size={16} color={color.accent} />
+              <Text style={styles.templateSaveText}>存为本机模板</Text>
+            </Pressable>
             <PrimaryButton
               label={graphIsEditing ? "保存任务图" : "发布任务图"}
               disabled={graphIssue !== null || !canCreateGraph}
@@ -1841,6 +2029,22 @@ export default function OrchestrationScreen() {
           }}
         />
       )}
+      <PromptDialog
+        visible={templateNameDialogOpen}
+        title="保存编排模板"
+        message="模板保存在本机；同名模板会更新为当前任务图。"
+        value={templateName}
+        confirmLabel="保存"
+        onChangeText={setTemplateName}
+        onCancel={() => setTemplateNameDialogOpen(false)}
+        onSubmit={saveCurrentTemplate}
+        validate={(value) => {
+          const normalized = value.trim();
+          if (normalized.length === 0) return "请输入模板名称";
+          if (normalized.length > 60) return "模板名称不能超过 60 个字符";
+          return null;
+        }}
+      />
     </KeyboardAvoidingView>
   );
 }
@@ -2168,6 +2372,67 @@ const styles = StyleSheet.create({
   heroCopy: { flex: 1, gap: 5 },
   heroTitle: { ...font.body, fontWeight: "700" },
   heroDetail: { ...font.sub, lineHeight: 19 },
+  templateSection: {
+    gap: space.md,
+    padding: space.md,
+    borderRadius: radius.lg,
+    backgroundColor: color.surface,
+  },
+  templateHeader: { flexDirection: "row", alignItems: "center", gap: space.sm },
+  templateHeaderIcon: {
+    width: 32,
+    height: 32,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: radius.sm,
+    backgroundColor: color.accentBg,
+  },
+  templateHeaderCopy: { flex: 1, gap: 2 },
+  templateTitle: { color: color.text, fontSize: 14, fontWeight: "700" },
+  templateSubtitle: { color: color.textDim, fontSize: 11, lineHeight: 15 },
+  templateCount: {
+    minWidth: 24,
+    paddingHorizontal: 7,
+    paddingVertical: 3,
+    overflow: "hidden",
+    borderRadius: 999,
+    backgroundColor: color.surfaceRaised,
+    color: color.textDim,
+    fontSize: 10,
+    fontWeight: "700",
+    textAlign: "center",
+  },
+  templateEmpty: { color: color.textFaint, fontSize: 12, lineHeight: 17 },
+  templateStrip: { gap: space.sm, paddingRight: space.sm },
+  templateCard: {
+    width: 220,
+    minHeight: 138,
+    gap: 5,
+    padding: space.md,
+    borderRadius: radius.md,
+    backgroundColor: color.surfaceRaised,
+  },
+  templateCardName: { color: color.text, fontSize: 14, fontWeight: "700" },
+  templateCardObjective: { flex: 1, color: color.textDim, fontSize: 12, lineHeight: 17 },
+  templateCardMeta: { color: color.textFaint, fontSize: 10 },
+  templateCardActions: { flexDirection: "row", alignItems: "center", gap: space.sm },
+  templateUseButton: {
+    flex: 1,
+    minHeight: 34,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 17,
+    backgroundColor: color.accentBg,
+  },
+  templateUseText: { color: color.accent, fontSize: 12, fontWeight: "700" },
+  templateDeleteButton: {
+    width: 34,
+    height: 34,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 17,
+    backgroundColor: color.surface,
+  },
   notice: {
     padding: space.md,
     borderRadius: radius.md,
@@ -2527,6 +2792,16 @@ const styles = StyleSheet.create({
   },
   graphValidation: { color: color.warn, fontSize: 12, lineHeight: 17 },
   graphValidationReady: { color: color.success },
+  templateSaveButton: {
+    minHeight: 42,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: space.sm,
+    borderRadius: radius.md,
+    backgroundColor: color.accentBg,
+  },
+  templateSaveText: { color: color.accent, fontSize: 13, fontWeight: "700" },
   input: {
     minHeight: 46,
     paddingHorizontal: space.md,
