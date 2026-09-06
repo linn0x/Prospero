@@ -26,6 +26,8 @@ import { PromptDialog } from "@/components/PromptDialog";
 import {
   accountApiProtocolDefaults,
   accountApiStatus,
+  accountApiEngineStatus,
+  modelCapabilitySupportRows,
   modelTokenLimit,
   updateModelTokenLimit,
   accountApiProtocolFromProfile,
@@ -492,11 +494,20 @@ export default function AgentAccountsScreen() {
                       </Text>
                       {hasApiProfile && <View>
                         {account.apiProfileError && <Text style={styles.error}>{account.apiProfileError}</Text>}
+                        <Text style={styles.environment}>API 协议 · {accountApiStatus(account)}</Text>
                         {account.apiValidation && <>
                           <Text style={styles.environment}>{(["runtime", "streaming", "tools"] as const).map((key) => `${key === "runtime" ? "运行环境" : key === "streaming" ? "流式响应" : "工具调用"}：${account.apiValidation!.checks[key] === "passed" ? "通过" : account.apiValidation!.checks[key] === "failed" ? "失败" : "未测试"}`).join(" · ")}</Text>
                           <Text style={styles.environment}>{account.apiValidation.detail}{"\n"}{new Date(account.apiValidation.checkedAt).toLocaleString()}</Text>
                         </>}
-                        {conn?.supportsAgentApiValidation && <Text style={styles.environment}>测试会向服务商发送少量请求，可能消耗额度；API 协议检查不代表完整 Agent 执行已验证。</Text>}
+                        {(conn?.supportsAgentApiEngineValidation || account.apiEngineValidation) && <Text style={[styles.environment, account.apiEngineValidation?.status === "failed" && { color: color.danger }]}>{accountApiEngineStatus(account)}</Text>}
+                        {account.apiEngineValidation && <>
+                          <Text style={styles.environment}>{(["runtime", "configuration", "streaming", "tools"] as const).map((key) => `${key === "runtime" ? "运行环境" : key === "configuration" ? "配置加载" : key === "streaming" ? "流式响应" : "工具执行"}：${account.apiEngineValidation!.checks[key] === "passed" ? "通过" : account.apiEngineValidation!.checks[key] === "failed" ? "失败" : "未测试"}`).join(" · ")}</Text>
+                          <Text style={styles.environment}>{account.apiEngineValidation.engine} {account.apiEngineValidation.cliVersion ?? ""} · {new Date(account.apiEngineValidation.checkedAt).toLocaleString()}{"\n"}{account.apiEngineValidation.detail}</Text>
+                        </>}
+                        {modelCapabilitySupportRows(account).map((row) => <Text key={row.key} style={styles.environment}>{row.label}：{row.detail}</Text>)}
+                        {conn?.supportsAgentApiEngineValidation
+                          ? <Text style={styles.environment}>两项验证均发送少量真实请求，可能消耗额度。API 检查验证协议；Agent 验证在隔离环境中检查实际引擎的配置、响应和工具执行。</Text>
+                          : conn?.supportsAgentApiValidation && <Text style={styles.environment}>测试会向服务商发送少量请求，可能消耗额度；API 协议检查不代表完整 Agent 执行已验证。</Text>}
                       </View>}
                       <AccountUsage
                         account={account}
@@ -511,6 +522,7 @@ export default function AgentAccountsScreen() {
                     {hasApiProfile ? (
                       <>
                         {conn?.supportsAgentApiValidation && <Action label="测试 API 连接" disabled={busy || Boolean(account.apiProfileError) || account.status === "signed_out"} onPress={() => { if (conn) void mutate(account.id, () => conn.testAgentApiProfile(account.id)).catch(() => {}); }} />}
+                        {conn?.supportsAgentApiEngineValidation && <Action label="验证 Agent 执行" disabled={busy || Boolean(account.apiProfileError) || account.status === "signed_out"} onPress={() => { if (conn) void mutate(account.id, () => conn.testAgentApiProfile(account.id, "engine")).catch(() => {}); }} />}
                         <Action
                           label={account.activeSessions > 0 ? "结束会话后配置" : account.apiProfileError ? "修复配置" : "重新配置"}
                           onPress={() => openConfigureApi(account)}

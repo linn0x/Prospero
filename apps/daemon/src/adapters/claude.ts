@@ -194,6 +194,7 @@ export class ClaudeAdapter implements AgentAdapter {
           ...(this.sessionId ? { resume: this.sessionId } : {}),
           ...(this.selectedModel ? { model: this.selectedModel } : {}),
           ...(this.selectedEffort ? { effort: this.selectedEffort as EffortLevel } : {}),
+          ...(ctx.env?.["MAX_THINKING_TOKENS"] === "0" ? { thinking: { type: "disabled" as const } } : {}),
           ...(this.opts.disallowedTools
             ? { disallowedTools: this.opts.disallowedTools }
             : {}),
@@ -632,7 +633,9 @@ export class ClaudeAdapter implements AgentAdapter {
   }
 
   /** SDK 原生收图,不必落盘再让模型去读 */
-  readonly acceptsImages = true;
+  get acceptsImages(): boolean {
+    return this.ctx?.env?.["PROSPERO_API_PROFILE_VISION"] !== "0";
+  }
 
   async listModels(): Promise<AgentModelCatalog> {
     if (!this.q) throw new AdapterError("Claude 会话尚未就绪");

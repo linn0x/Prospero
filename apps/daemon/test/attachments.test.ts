@@ -44,11 +44,12 @@ const png: Attachment = {
   name: "shot.png",
 };
 
-async function makeSession(acceptsImages: boolean) {
+async function makeSession(acceptsImages: boolean, environment?: Record<string, string>) {
   const { adapter, seen } = fakeAdapter(acceptsImages);
   const events: AgentEventBody[] = [];
   const s = new StructuredSession({
     id: "att-test", agent: "claude", title: "t", cwd: os.tmpdir(), adapter,
+    ...(environment ? { environment } : {}),
   });
   s.on("event", (b) => events.push(b));
   await s.start();
@@ -56,6 +57,39 @@ async function makeSession(acceptsImages: boolean) {
 }
 
 describe("消息附件", () => {
+  it.each([true, false])("vision:false blocks images before persistence, queueing or path fallback (adapter=%s)", async (acceptsImages) => {
+    const home = isolateHome();
+    const { s, seen, events } = await makeSession(acceptsImages, { PROSPERO_API_PROFILE_VISION: "0" });
+    await expect(s.send("image", [png])).rejects.toThrow("已关闭图片能力");
+    expect(seen).toEqual([]);
+    expect(events.some((event) => event.kind === "user.message")).toBe(false);
+    expect(existsSync(path.join(home, "attachments", s.id))).toBe(false);
+    await s.send("text only");
+    await expect(s.send("queued image", [png], "queue")).rejects.toThrow("已关闭图片能力");
+    await expect(s.send("steered image", [png], "steer")).rejects.toThrow("已关闭图片能力");
+    expect(s.info().messageQueue).toEqual([]);
+    expect(seen).toHaveLength(1);
+    await s.dispose();
+  });
+
+  it("rechecks disabled vision when draining a restored attachment queue", async () => {
+    isolateHome();
+    const original = await makeSession(false);
+    await original.s.send("first");
+    await original.s.send("queued image", [png], "queue");
+    const restored = original.s.persistentState();
+    await original.s.dispose();
+    const { adapter, seen } = fakeAdapter(false);
+    const events: AgentEventBody[] = [];
+    const next = new StructuredSession({ id: "att-test", agent: "claude", title: "t", cwd: os.tmpdir(), adapter,
+      environment: { PROSPERO_API_PROFILE_VISION: "0" }, restored });
+    next.on("event", (body) => events.push(body));
+    await next.start();
+    expect(seen).toEqual([]);
+    expect(events.some((event) => event.kind === "agent.error" && event.message.includes("已关闭图片能力"))).toBe(true);
+    await next.dispose();
+  });
+
   it("后端能收图时，原样交给适配器，并保留可按需读取的历史索引", async () => {
     isolateHome();
     const { s, seen, events } = await makeSession(true);

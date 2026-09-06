@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { WebSocket } from "ws";
 import {
   clientHandshakeFinish, clientHandshakeStart, generateKeyPairB64, parseS2C,
-  type AgentApiValidation, type S2CMessage, type SecureChannel,
+  type AgentApiValidation, type AgentApiEngineValidation, type S2CMessage, type SecureChannel,
 } from "@prospero/protocol";
 import { loadIdentity, mintDevice } from "../src/pairing.js";
 import { createDaemonServer, type DaemonServer, type DaemonServerOptions } from "../src/ws-server.js";
@@ -70,13 +70,14 @@ function passed(): AgentApiValidation {
     detail: "Synthetic CLI and protocol check only.", latencyMs: 1 };
 }
 
-async function setup(allowShell: boolean, protocolVersion: number, probe: NonNullable<DaemonServerOptions["apiProfileProbe"]>) {
+async function setup(allowShell: boolean, protocolVersion: number, probe: NonNullable<DaemonServerOptions["apiProfileProbe"]>, engineProbe?: NonNullable<DaemonServerOptions["apiProfileEngineProbe"]>) {
   const home = mkdtempSync(path.join(os.tmpdir(), "prospero-api-profile-ws-"));
   const server = await createDaemonServer({
     home, port: 0, bindAddr: "127.0.0.1", workspaceRoot: home,
     useTmux: false, structuredSupervisor: false, ptySupervisor: false, windowsSessionHost: false,
     accountRunner: async () => ({ stdout: "not logged in", stderr: "", exitCode: 0 }),
     apiProfileProbe: probe,
+    ...(engineProbe ? { apiProfileEngineProbe: engineProbe } : {}),
   });
   const account = await server.accounts.createApi("codex", "Synthetic WebSocket profile", {
     protocol: "openai_chat_completions", baseUrl: "http://127.0.0.1:1/v1", model: "synthetic-model", apiKey: "synthetic-private-key",
@@ -89,6 +90,40 @@ async function setup(allowShell: boolean, protocolVersion: number, probe: NonNul
 }
 
 describe("API Profile WebSocket authorization boundary", () => {
+  it.each([false, true])("keeps explicit engine validation behind account authorization (allowShell=%s)", async (allowShell) => {
+    const wire = vi.fn(async () => passed());
+    const engineResult: AgentApiEngineValidation = { ...passed(), cliVersion: "1.2.3", checks: { ...passed().checks, configuration: "passed" } };
+    const engine = vi.fn(async () => engineResult);
+    const { client, accountId, hello } = await setup(allowShell, 16, wire, engine);
+    expect(hello.host.capabilities?.includes("agent.api-engine-validation.v1")).toBe(allowShell);
+    client.send({ type: "agent.account.api.test", requestId: "engine-check", scope: "engine", accountId });
+    const result = await client.waitFor((message) => message.type === "agent.accounts.result" && message.requestId === "engine-check");
+    expect(result).toMatchObject({ ok: allowShell });
+    expect(wire).not.toHaveBeenCalled();
+    expect(engine).toHaveBeenCalledTimes(allowShell ? 1 : 0);
+    if (allowShell) expect(result).toMatchObject({ engineValidation: engineResult });
+    expect(JSON.stringify(result)).not.toContain("synthetic-private-key");
+  });
+
+  it("cancels a native-engine check when the requesting client disconnects", async () => {
+    let entered!: (signal: AbortSignal) => void;
+    const started = new Promise<AbortSignal>((resolve) => { entered = resolve; });
+    const engine = vi.fn<NonNullable<DaemonServerOptions["apiProfileEngineProbe"]>>(async (_binding, options) => {
+      const signal = options!.signal!;
+      entered(signal);
+      return new Promise<AgentApiEngineValidation>((resolve) => signal.addEventListener("abort", () => resolve({
+        ...passed(), status: "failed", code: "cancelled", checks: { runtime: "passed", configuration: "passed", streaming: "failed", tools: "not_tested" },
+      }), { once: true }));
+    });
+    const { client, accountId, server } = await setup(true, 16, async () => passed(), engine);
+    client.send({ type: "agent.account.api.test", requestId: "cancel-engine", scope: "engine", accountId });
+    const signal = await started;
+    await client.close();
+    await vi.waitFor(() => expect(signal.aborted).toBe(true));
+    await vi.waitFor(async () => expect((await server.accounts.snapshot([])).find((item) => item.id === accountId)?.apiEngineValidation?.code).toBe("cancelled"));
+    expect(engine).toHaveBeenCalledOnce();
+  });
+
   it("denies allowShell=false devices before any probe can start", async () => {
     const probe = vi.fn(async () => passed());
     const { client, accountId, hello, server } = await setup(false, 16, probe);

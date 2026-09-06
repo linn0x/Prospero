@@ -287,6 +287,33 @@ describe("HostConnection WebSocket candidates", () => {
     connection.stop();
   });
 
+  it("uses explicit engine scope and a longer budget without confusing protocol results", async () => {
+    vi.useFakeTimers();
+    const socket = new FakeWebSocket("ws://192.168.1.8:7423/ws");
+    socket.readyState = 1;
+    const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
+    const internals = connection as unknown as {
+      ws: FakeWebSocket;
+      channel: { seal(message: unknown): string; open(message: string): unknown };
+      advertisedCapabilities: Set<string>;
+      onMessage(message: string): void;
+    };
+    internals.ws = socket;
+    internals.channel = { seal: JSON.stringify, open: JSON.parse };
+    internals.advertisedCapabilities = new Set([CAPABILITY_AGENT_ACCOUNTS, "agent.api-validation.v1"]);
+    expect(() => connection.testAgentApiProfile("account", "engine")).toThrow("验证 Agent 执行");
+    expect(socket.sent).toHaveLength(0);
+    internals.advertisedCapabilities.add("agent.api-engine-validation.v1");
+    const pending = connection.testAgentApiProfile("account", "engine");
+    const request = JSON.parse(socket.sent.at(-1)!);
+    expect(request).toMatchObject({ type: "agent.account.api.test", accountId: "account", scope: "engine" });
+    await vi.advanceTimersByTimeAsync(46_000);
+    const engineValidation = { status: "failed", engine: "opencode", cliVersion: "1.0", checkedAt: 123, checks: { runtime: "passed", configuration: "passed", streaming: "passed", tools: "failed" }, detail: "Engine tool failed" };
+    internals.onMessage(JSON.stringify({ type: "agent.accounts.result", requestId: request.requestId, action: "api_test", ok: false, error: "Engine failed", engineValidation, accounts: [] }));
+    await expect(pending).resolves.toMatchObject({ ok: false, engineValidation });
+    connection.stop();
+  });
+
   it("only sends model metadata to daemons advertising support", async () => {
     const socket = new FakeWebSocket("ws://192.168.1.8:7423/ws");
     socket.readyState = 1;
