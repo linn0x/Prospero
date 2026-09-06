@@ -59,6 +59,7 @@ export class RemoteHostStore {
       port: payload.port,
       token: payload.token,
       daemonPubKey: payload.pubKey,
+      ...(payload.relay ? { relay: payload.relay } : {}),
     };
   }
 
