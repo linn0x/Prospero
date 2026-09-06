@@ -25,7 +25,8 @@ import ReanimatedDrawerLayout, {
 } from "react-native-gesture-handler/ReanimatedDrawerLayout";
 import { useHeaderHeight } from "expo-router/build/react-navigation/elements";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { Stack, router, useLocalSearchParams } from "expo-router";
+import { Stack, router, useFocusEffect, useLocalSearchParams } from "expo-router";
+import { DismissedModalAction } from "@/lib/host-screen-flow";
 import type {
   ApprovalPolicy,
   AgentMode,
@@ -284,8 +285,19 @@ function SessionSwitcherSheet({
   hostId: string;
   onClose: () => void;
 }) {
+  const [navigation] = useState(() => new DismissedModalAction());
+  useEffect(() => {
+    // A rapid reopen invalidates any action from the previous presentation.
+    if (visible) navigation.cancel();
+  }, [navigation, visible]);
+  useFocusEffect(useCallback(() => () => navigation.cancel(), [navigation]));
   return (
-    <Sheet visible={visible} title="切换会话" onClose={onClose}>
+    <Sheet
+      visible={visible}
+      title="切换会话"
+      onClose={() => { navigation.cancel(); onClose(); }}
+      onDismiss={() => navigation.dismiss()}
+    >
       {sessions.map((item) => {
         const selected = item.id === currentId;
         return (
@@ -298,12 +310,12 @@ function SessionSwitcherSheet({
               pressed && styles.controlPressed,
             ]}
             onPress={() => {
-              onClose();
               // replace 而不是 push:来回切几次也不会把返回栈堆成一串会话。
-              router.replace({
+              navigation.defer(() => router.replace({
                 pathname: "/host/[hostId]/session/[sid]",
                 params: { hostId, sid: item.id },
-              });
+              }));
+              onClose();
             }}
             accessibilityRole="button"
             accessibilityState={{ selected }}

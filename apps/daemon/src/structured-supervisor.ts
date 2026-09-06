@@ -19,7 +19,7 @@ import {
 } from "node:fs";
 import { createConnection, createServer, type Socket } from "node:net";
 import path from "node:path";
-import type { AgentEventBody } from "@prospero/protocol";
+import type { AgentEventBody, SessionInfo } from "@prospero/protocol";
 import {
   isStructuredSupervisorEndpoint,
   structuredSupervisorPlatformGate,
@@ -45,10 +45,13 @@ export interface SupervisorEvent {
 
 export interface SupervisorAdapterContext {
   emit(body: AgentEventBody): void;
+  state(info: SessionInfo): void;
 }
 
 /** The supervisor owns this adapter's process/SDK handles, never the daemon. */
 export interface SupervisorAdapter {
+  /** Optional v1 extension: lifecycle metadata is pushed separately from replayable agent events. */
+  stateNotifications?: boolean;
   start(context: SupervisorAdapterContext): Promise<void>;
   send?(text: string): Promise<void>;
   interrupt?(): Promise<void>;
@@ -191,6 +194,7 @@ class SupervisorState {
   constructor(
     home: string,
     private readonly broadcast: (event: SupervisorEvent) => void,
+    private readonly broadcastInfo: (sessionId: string, info: SessionInfo) => void,
   ) {
     this.statePath = path.join(home, "state.json");
     this.eventsPath = path.join(home, "events.jsonl");
@@ -227,7 +231,13 @@ class SupervisorState {
     runtime.persisted.status = "running";
     this.persist();
     try {
-      await adapter.start({ emit: (body) => this.record(runtime, body) });
+      await adapter.start({
+        emit: (body) => this.record(runtime, body),
+        state: (info) => {
+          if (info.id !== runtime.persisted.id || (isKilled(runtime.persisted.status) && info.status !== "done" && info.status !== "died")) return;
+          this.broadcastInfo(runtime.persisted.id, info);
+        },
+      });
     } catch (error) {
       // A concurrent explicit kill remains terminal even if its adapter then
       // reports an expected cancellation/startup error.
@@ -275,6 +285,10 @@ class SupervisorState {
   status(sessionId: string): { status: SupervisorSessionStatus; lastSeq: number } {
     const session = this.require(sessionId).persisted;
     return { status: session.status, lastSeq: session.lastSeq };
+  }
+
+  stateNotifications(sessionId: string): boolean {
+    return this.require(sessionId).adapter?.stateNotifications === true;
   }
 
   replay(sessionId: string, afterSeq: number): SupervisorReplay {
@@ -493,6 +507,10 @@ export async function startStructuredSupervisor(
       write(connection.socket, { method: "session.event", params: event });
       connection.subscriptions.set(event.sessionId, event.seq);
     }
+  }, (sessionId, info) => {
+    for (const connection of connections) {
+      if (connection.subscriptions.has(sessionId)) write(connection.socket, { method: "session.info", params: { sessionId, info } });
+    }
   });
   const server = createServer((socket) => {
     const connection: Connection = { socket, subscriptions: new Map() };
@@ -609,7 +627,7 @@ async function route(connection: Connection, request: RpcRequest, state: Supervi
       const replay = state.replay(sessionId, cursor(params["afterSeq"]));
       // Register before the response so the next event has exactly one cursor.
       connection.subscriptions.set(sessionId, replay.lastSeq);
-      return { sessionId, ...replay };
+      return { sessionId, ...replay, stateNotifications: state.stateNotifications(sessionId) };
     }
     case "session.send": {
       if (typeof params["text"] !== "string") throw new SupervisorError("text 必须是字符串", "bad_request");

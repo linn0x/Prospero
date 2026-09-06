@@ -365,6 +365,8 @@ export const C2SConnectionPingSchema = z.object({
 
 export const C2SSessionCreateSchema = z.object({
   type: z.literal("session.create"),
+  /** Opt-in correlated completion; gated by session.create-result.v1. */
+  requestId: z.string().min(1).max(100).optional(),
   agent: AgentKindSchema,
   /** 仅 Claude Code / Codex 有效；cwd 仍是所选项目，不随账号改变。 */
   accountId: z.string().min(1).max(100).optional(),
@@ -1582,6 +1584,16 @@ export const S2CErrorSchema = z.object({
   reason: z.literal("conversation_active_writer").optional(),
 });
 
+export const S2CSessionCreateResultSchema = z.object({
+  type: z.literal("session.create.result"),
+  requestId: z.string().min(1).max(100),
+  ok: z.boolean(),
+  session: SessionInfoSchema.optional(),
+  error: z.string().max(2000).optional(),
+  code: S2CErrorSchema.shape.code.optional(),
+  reason: S2CErrorSchema.shape.reason,
+});
+
 // ---------------------------------------------------------------- 文件操作应答
 
 export const FsEntrySchema = z.object({
@@ -1806,6 +1818,7 @@ export const S2COrchestrationSnapshotSchema = z.object({
 });
 
 export const S2CMessageSchema = z.discriminatedUnion("type", [
+  S2CSessionCreateResultSchema,
   S2CHelloOkSchema,
   S2CConnectionPongSchema,
   S2CSessionStateSchema,
@@ -1988,6 +2001,7 @@ export type AgentTurnEnd = z.infer<typeof AgentTurnEndSchema>;
 export type S2CHelloOk = z.infer<typeof S2CHelloOkSchema>;
 export type S2CConnectionPong = z.infer<typeof S2CConnectionPongSchema>;
 export type S2CSessionState = z.infer<typeof S2CSessionStateSchema>;
+export type S2CSessionCreateResult = z.infer<typeof S2CSessionCreateResultSchema>;
 export type S2CTermSnapshot = z.infer<typeof S2CTermSnapshotSchema>;
 export type S2CTermOutput = z.infer<typeof S2CTermOutputSchema>;
 export type S2CAgentEvent = z.infer<typeof S2CAgentEventSchema>;

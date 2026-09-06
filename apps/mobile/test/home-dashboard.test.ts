@@ -140,16 +140,17 @@ describe("home dashboard", () => {
     expect(dashboard).not.toContain("styles.deviceIdentityMark");
   });
 
-  it("底部弹层让遮罩淡入、面板独立位移", () => {
+  it("底部弹层由原生可见性负责关闭，不依赖可能中断的动画回调", () => {
     const sheet = readFileSync(
       join(import.meta.dirname, "..", "src", "components", "Sheet.tsx"),
       "utf8",
     );
 
-    expect(sheet).toContain('animationType="none"');
-    expect(sheet).toContain("opacity: backdropOpacity");
-    expect(sheet).toContain("translateY: sheetProgress.interpolate");
-    expect(sheet).toContain("useNativeDriver: true");
+    expect(sheet).toContain('animationType="fade"');
+    expect(sheet).toContain("visible={visible}");
+    expect(sheet).toContain("onDismiss={() => { if (!visible) onDismiss?.(); }}");
+    expect(sheet).not.toContain("setMounted");
+    expect(sheet).not.toContain("finished");
     expect(sheet).not.toContain('animationType="slide"');
   });
 });

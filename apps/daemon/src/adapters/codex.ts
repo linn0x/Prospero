@@ -136,6 +136,8 @@ function usageFromTokenHistory(value: unknown): Partial<UsageReport> | null {
 }
 
 const START_TIMEOUT_MS = 30_000;
+/** Historical child discovery is optional and must not hold session readiness. */
+const SUBAGENT_DISCOVERY_TIMEOUT_MS = 5_000;
 
 /**
  * Prospero itself may be launched from Codex Desktop while being developed. Those
@@ -349,12 +351,14 @@ export class CodexAdapter implements AgentAdapter {
       ...(this.selectedModel ? { model: this.selectedModel } : {}),
     };
     let started: { thread?: { id?: string }; threadId?: string };
+    let resumed = false;
     if (resumeThreadId) {
       try {
         started = (await this.request("thread/resume", {
           threadId: resumeThreadId,
           ...baseParams,
         })) as typeof started;
+        resumed = true;
       } catch (error) {
         // Codex 会清理损坏/过期的 rollout。Prospero 的本地聊天历史仍然有价值，
         // 因此只对“原生上下文已不存在”做新 thread 降级，让同一会话还能继续用；
@@ -373,7 +377,10 @@ export class CodexAdapter implements AgentAdapter {
     }
     this.threadId = threadId;
     this.persistNativeState();
-    await this.discoverSubagents();
+    // A new thread cannot have historical children. Restored child metadata is
+    // supplementary: a slow account-wide index must not keep a ready thread in
+    // "starting" or prevent the first message from being sent.
+    if (resumed) void this.discoverSubagents();
   }
 
   /** 启动并初始化 app-server；普通会话和只读本机索引查询共用同一握手。 */
@@ -684,7 +691,10 @@ export class CodexAdapter implements AgentAdapter {
   }
 
   private async discoverSubagents(): Promise<void> {
-    if (!this.threadId) return;
+    const threadId = this.threadId;
+    const context = this.ctx;
+    if (!threadId) return;
+    const deadline = Date.now() + SUBAGENT_DISCOVERY_TIMEOUT_MS;
     try {
       let cursor: string | undefined;
       const seenCursors = new Set<string>();
@@ -692,6 +702,8 @@ export class CodexAdapter implements AgentAdapter {
       // server 发送未知字段会被静默忽略，曾因此把普通线程（甚至父线程自己）
       // 误列为子 Agent。先限定原生子线程来源，再对返回值做严格父 id 校验。
       for (let page = 0; page < 100; page++) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0 || this.threadId !== threadId || this.ctx !== context) return;
         const raw = (await this.request("thread/list", {
           limit: 100,
           sortKey: "updated_at",
@@ -704,11 +716,14 @@ export class CodexAdapter implements AgentAdapter {
             "subAgentOther",
           ],
           ...(cursor ? { cursor } : {}),
-        })) as { data?: unknown[]; nextCursor?: unknown };
+        }, remaining)) as { data?: unknown[]; nextCursor?: unknown };
+        // Disposal/restart can happen while the native index is being read.
+        // Never apply a late response to a different session generation.
+        if (this.threadId !== threadId || this.ctx !== context) return;
         for (const value of raw.data ?? []) {
           if (!value || typeof value !== "object") continue;
           const row = value as Record<string, unknown>;
-          if (row["parentThreadId"] !== this.threadId) continue;
+          if (row["parentThreadId"] !== threadId) continue;
           const id = typeof row["id"] === "string" ? row["id"] : "";
           if (!id) continue;
           const status = this.subagentStatus(row["status"]);

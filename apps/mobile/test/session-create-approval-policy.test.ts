@@ -19,12 +19,12 @@ describe("新建会话审批策略", () => {
 
   it("把选择写入普通、Goal 和恢复会话的创建参数", () => {
     expect(source.match(/approvalPolicy,/g)?.length ?? 0).toBeGreaterThanOrEqual(3);
-    expect(source).toContain("conn.createSession(agent, projectPath");
+    expect(source).toContain("conn.createSessionTracked(agent, projectPath");
   });
 
   it("创建期间防重复提交并保留失败后的设置", () => {
-    expect(source).toContain("runtime.status !== \"connected\" || pendingCreateRef.current");
-    expect(source).toContain("const result = conn.createSession(agent, projectPath");
+    expect(source).toContain("runtime.status !== \"connected\" || pendingCreate.pending");
+    expect(source).toContain("const task = conn.createSessionTracked(agent, projectPath");
     expect(source).toContain("sessionCreateFailureText(result)");
     expect(source).toContain("setCreateDelivery(result.disposition)");
     expect(source).toContain("busy: createDelivery !== null");

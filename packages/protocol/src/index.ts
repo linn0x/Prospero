@@ -23,6 +23,7 @@ export {
   SessionKindSchema,
   SessionStatusSchema,
   SessionInfoSchema,
+  S2CSessionCreateResultSchema,
   ResumableConversationSchema,
   C2SConversationSearchSchema,
   C2SLaunchModelsGetSchema,
