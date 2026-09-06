@@ -7,6 +7,7 @@ import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, nati
 import type { MenuItemConstructorOptions, Rectangle } from "electron";
 import type { DesktopSettings, JsonObject, SessionCreateInput, SessionPage, SessionPageRequest, WorkflowTemplate } from "../shared/types";
 import { desktopSettingsPatch } from "../shared/desktop-settings";
+import { windowAppearance } from "../shared/window-appearance";
 import { diffDesktopSnapshot, isEmptyDesktopSnapshotPatch } from "../shared/snapshot-patch";
 import { isSessionLaunchWorkspace } from "../shared/session-launch-options";
 import { loginPath, resolveNodeExecutable } from "./host-environment.js";
@@ -194,6 +195,7 @@ function sessionPageFromControl(
 function applyTheme(settings: DesktopSettings): void {
   nativeTheme.themeSource = settings.theme;
   const dark = nativeTheme.shouldUseDarkColors;
+  const appearance = windowAppearance(process.platform, nativeTheme);
   if (mainWindow && !mainWindow.isDestroyed()) {
     // setTitleBarOverlay 只存在于 Windows/Linux —— macOS 上窗口控件是系统画的
     // 红黄绿,没有可着色的 overlay。不加这个判断,每次切换主题都会抛
@@ -206,8 +208,9 @@ function applyTheme(settings: DesktopSettings): void {
         height: 42,
       });
     }
-    // mac 上背景必须保持透明,否则一次主题切换就把 vibrancy 盖掉了。
-    if (process.platform !== "darwin") mainWindow.setBackgroundColor(dark ? "#111114" : "#f4f4f5");
+    if (process.platform === "darwin") mainWindow.setVibrancy(appearance.nativeGlass ? "sidebar" : null);
+    mainWindow.setBackgroundColor(appearance.nativeGlass ? "#00000000" : (dark ? "#0f1624" : "#f3f6fb"));
+    mainWindow.webContents.send("appearance:changed", appearance);
   }
 }
 
@@ -234,6 +237,7 @@ function broadcastSnapshot(snapshot: ReturnType<StateStore["snapshot"]> = store.
 
 function createWindow(): BrowserWindow {
   const dark = nativeTheme.shouldUseDarkColors;
+  const appearance = windowAppearance(process.platform, nativeTheme);
   const placement = visibleWindowState(readWindowState());
   const display = screen.getDisplayMatching(placement);
   const window = new BrowserWindow({
@@ -246,8 +250,8 @@ function createWindow(): BrowserWindow {
     show: false,
     // macOS:窗口底色留空,让侧栏透出系统的毛玻璃(vibrancy)。其它平台没有这个
     // 材质,仍用实色,否则窗口会是透明的。
-    backgroundColor: process.platform === "darwin" ? "#00000000" : (dark ? "#111114" : "#f4f4f5"),
-    ...(process.platform === "darwin"
+    backgroundColor: appearance.nativeGlass ? "#00000000" : (dark ? "#0f1624" : "#f3f6fb"),
+    ...(appearance.nativeGlass
       ? {
         // sidebar 材质就是访达/邮件左栏那一档模糊。visualEffectState: "active"
         // 让窗口失焦时也保持材质 —— 否则切到别的应用,侧栏会突然塌成一块灰。
@@ -617,6 +621,21 @@ async function runDesktopSelfCheck(window: BrowserWindow): Promise<void> {
   if (!sidebarMenusReady) throw new Error(`workspace sidebar menu interaction failed: ${JSON.stringify(sidebarMenuCheck)}`);
   if (smoke) process.stdout.write(`Prospero desktop interactions: ${JSON.stringify(sidebarMenuCheck)}\n`);
   if (smoke) {
+    // Inspect the built renderer, not a stylesheet fixture: one opaque ancestor
+    // is enough to hide native vibrancy despite all the intended CSS being present.
+    const material = await window.webContents.executeJavaScript(`(() => {
+      const color = (selector) => { const element = document.querySelector(selector); return element ? getComputedStyle(element).backgroundColor : null; };
+      return { nativeGlass: document.documentElement.dataset.nativeGlass === 'true',
+        body: color('body'), shell: color('.prospero-shell'), main: color('.prospero-main'),
+        content: color('.main-viewport'), sidebar: color('[data-slot="sidebar-inner"]'), topbar: color('.desktop-topbar') };
+    })()`) as { nativeGlass: boolean; body: string; shell: string; main: string; content: string; sidebar: string | null; topbar: string | null };
+    const transparent = "rgba(0, 0, 0, 0)";
+    if (material.nativeGlass !== windowAppearance(process.platform, nativeTheme).nativeGlass ||
+      (material.nativeGlass && [material.body, material.shell, material.main].some((color) => color !== transparent)) ||
+      material.content === transparent) throw new Error(`desktop material background chain failed: ${JSON.stringify(material)}`);
+    process.stdout.write(`Prospero desktop material: ${JSON.stringify(material)}\n`);
+  }
+  if (smoke) {
     window.showInactive();
     await new Promise((done) => setTimeout(done, 120));
     const pinnedTarget = await window.webContents.executeJavaScript(`(() => {
@@ -710,6 +729,7 @@ async function runDesktopSelfCheck(window: BrowserWindow): Promise<void> {
 }
 
 function installIpc(): void {
+  ipcMain.handle("appearance:get", () => windowAppearance(process.platform, nativeTheme));
   ipcMain.handle("snapshot:get", () => store.snapshot());
   ipcMain.handle("daemon:start", () => runtime.start());
   ipcMain.handle("daemon:stop", () => runtime.stop());

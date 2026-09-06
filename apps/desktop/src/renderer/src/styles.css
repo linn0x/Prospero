@@ -125,7 +125,8 @@
   --overlay: #ffffff;
   --scrim: #17203366;
   --shadow: 0 18px 50px #24345117;
-  --chrome-glass: color-mix(in srgb, var(--sidebar) 58%, transparent);
+  --chrome-glass: color-mix(in srgb, var(--sidebar) 36%, transparent);
+  --chrome-highlight: #ffffff66;
   --overlay-glass: color-mix(in srgb, var(--popover) 84%, transparent);
   --glass-border: color-mix(in srgb, var(--foreground) 12%, transparent);
   --glass-filter: blur(18px) saturate(125%);
@@ -212,7 +213,8 @@
   --secondary: var(--surface-2);
   --input: var(--border-strong);
   --shadow: 0 22px 64px #0000006e;
-  --chrome-glass: color-mix(in srgb, var(--sidebar) 68%, transparent);
+  --chrome-glass: color-mix(in srgb, var(--sidebar) 46%, transparent);
+  --chrome-highlight: #ffffff0d;
   --overlay-glass: color-mix(in srgb, var(--popover) 86%, transparent);
   --glass-border: color-mix(in srgb, var(--foreground) 18%, transparent);
   --glass-shadow: 0 22px 58px #00000080;
@@ -479,7 +481,7 @@ kbd {
   font-size: 8px;
   font-style: normal;
 }
-.main-viewport { min-width: 0; min-height: 0; flex: 1; overflow: hidden; }
+.main-viewport { min-width: 0; min-height: 0; flex: 1; overflow: hidden; background: var(--background); }
 .view-scroll { height: 100%; overflow: auto; }
 .view-container { width: min(1280px, 100%); min-height: 100%; margin: 0 auto; padding: 28px 34px 52px; }
 .view-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; margin-bottom: 26px; }
@@ -1227,18 +1229,24 @@ kbd {
 }
 .terminal-find button:hover { background: #292e42; color: #c0caf5; }
 
-/* ---------------------------------------------------------------- macOS 毛玻璃
-   窗口开了 vibrancy(见主进程的 BrowserWindow 配置),但只有当上层背景是透明的
-   时候才透得出来。只让【侧栏】透:内容区要保证长文本和终端的可读性,底下透着
-   桌面壁纸会很难看。 */
-:root[data-platform="darwin"] body,
-:root[data-platform="darwin"] .prospero-shell { background: transparent; }
-:root[data-platform="darwin"] .prospero-sidebar [data-slot="sidebar-inner"] {
-  background: var(--chrome-glass);
+/* Native macOS vibrancy supplies the blur behind the window. The transparent
+   parent chain exposes it only in the sidebar and title area; main-viewport,
+   chat and terminal surfaces keep their opaque reading backgrounds. No overlay
+   elements are added, so hit testing, drag regions and scrolling are unchanged. */
+.prospero-sidebar [data-slot="sidebar-inner"],
+.desktop-topbar {
+  background-image: linear-gradient(160deg, var(--chrome-highlight), transparent 72%);
+  box-shadow: inset 0 1px 0 var(--chrome-highlight);
 }
-/* 内容区保持不透明 —— 只在与侧栏交界处留一条细线,避免两块材质糊在一起。 */
-:root[data-platform="darwin"] .prospero-main { background: var(--background); }
-:root[data-platform="darwin"] .desktop-topbar { background: transparent; }
+.desktop-topbar { border-bottom: 1px solid var(--glass-border); }
+:root[data-native-glass="true"],
+:root[data-native-glass="true"] body,
+:root[data-native-glass="true"] .prospero-shell,
+:root[data-native-glass="true"] .prospero-main { background: transparent; }
+:root[data-native-glass="true"] .prospero-sidebar [data-slot="sidebar-inner"],
+:root[data-native-glass="true"] .desktop-topbar {
+  background-color: var(--chrome-glass);
+}
 
 .overlay-glass,
 :is(
@@ -1267,6 +1275,29 @@ kbd {
     background: var(--overlay-glass);
     -webkit-backdrop-filter: var(--glass-filter);
     backdrop-filter: var(--glass-filter);
+  }
+}
+
+/* Native preferences also reach this stylesheet through preload, including
+   macOS Increase Contrast. Media queries cover Chromium's own forced-colors
+   and reduced-transparency changes without waiting for the native IPC update. */
+:root[data-reduced-transparency="true"],
+:root[data-high-contrast="true"] {
+  --chrome-glass: var(--sidebar);
+  --overlay-glass: var(--popover);
+  --glass-filter: none;
+  --chrome-highlight: transparent;
+  --glass-border: var(--border-strong);
+  --glass-scrim: var(--scrim);
+}
+@media (prefers-reduced-transparency: reduce), (prefers-contrast: more), (forced-colors: active) {
+  :root, :root[data-theme] {
+    --chrome-glass: var(--sidebar);
+    --overlay-glass: var(--popover);
+    --glass-filter: none;
+    --chrome-highlight: transparent;
+    --glass-border: var(--border-strong);
+    --glass-scrim: var(--scrim);
   }
 }
 

@@ -1,7 +1,9 @@
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import FontAwesome6 from "@expo/vector-icons/FontAwesome6";
+import { useFocusEffect } from "expo-router";
 import {
   Alert,
+  AppState,
   FlatList,
   Pressable,
   RefreshControl,
@@ -19,10 +21,13 @@ import { Sheet, SheetAction } from "@/components/Sheet";
 import { SwipeRow } from "@/components/SwipeRow";
 import type { StoredHost } from "@/lib/hosts";
 import {
+  compactWorkspacePath,
   homeHostStats,
   homeRecentSessions,
   homeWorkspaceProjects,
+  partitionHomeProjects,
 } from "@/lib/home-dashboard";
+import { DismissedModalAction } from "@/lib/host-screen-flow";
 import {
   DEFAULT_HOME_SETTINGS,
   normalizeHomeSettings,
@@ -40,6 +45,7 @@ import {
 } from "@/lib/theme";
 
 type HomeDashboardStyles = ReturnType<typeof createStyles>;
+const NO_MANAGED_WORKSPACES: readonly string[] = [];
 
 const statusLabel: Record<ConnStatus, string> = {
   idle: "未连接",
@@ -165,6 +171,7 @@ export function HomeDashboard({
   devicePickerOpen,
   bottomInset,
   onToggleDevicePicker,
+  onCloseDevicePicker,
   onSelectHost,
   onOpenHost,
   onOpenSession,
@@ -176,7 +183,7 @@ export function HomeDashboard({
   onCreateDirectory,
   homeSettings,
   onChangeHomeSettings,
-  onOpenSettings,
+  managedWorkspacePaths = NO_MANAGED_WORKSPACES,
 }: {
   hosts: StoredHost[];
   runtimes: Record<string, HostRuntime>;
@@ -184,6 +191,7 @@ export function HomeDashboard({
   devicePickerOpen: boolean;
   bottomInset: number;
   onToggleDevicePicker: () => void;
+  onCloseDevicePicker: () => void;
   onSelectHost: (hostId: string) => void;
   onOpenHost: (hostId: string) => void;
   onOpenSession: (hostId: string, sessionId: string) => void;
@@ -195,7 +203,7 @@ export function HomeDashboard({
   onCreateDirectory: (hostId: string) => void;
   homeSettings?: HomeSettings;
   onChangeHomeSettings: (patch: Partial<HomeSettings>) => void;
-  onOpenSettings: () => void;
+  managedWorkspacePaths?: readonly string[];
 }) {
   const { palette } = useMobileTheme();
   const styles = useMemo(() => createStyles(palette), [palette]);
@@ -203,9 +211,13 @@ export function HomeDashboard({
   const selectedRuntime = selectedHost ? runtimes[selectedHost.id] : undefined;
   // Fast Refresh 会保留旧版 Zustand 状态；标准化可补全后续新增的设置字段。
   const effectiveHomeSettings = normalizeHomeSettings(homeSettings ?? DEFAULT_HOME_SETTINGS);
-  const projects = useMemo(
+  const allProjects = useMemo(
     () => homeWorkspaceProjects(selectedRuntime?.sessions),
     [selectedRuntime?.sessions],
+  );
+  const { projects, taskProjects } = useMemo(
+    () => partitionHomeProjects(allProjects, managedWorkspacePaths),
+    [allProjects, managedWorkspacePaths],
   );
   const stats = useMemo(
     () => homeHostStats(selectedRuntime?.sessions),
@@ -215,16 +227,37 @@ export function HomeDashboard({
     () => homeRecentSessions(selectedRuntime?.sessions, effectiveHomeSettings.recentSessionLimit),
     [effectiveHomeSettings.recentSessionLimit, selectedRuntime?.sessions],
   );
-  const orderedDeviceHosts = useMemo(
-    () => selectedHost
-      ? [selectedHost, ...hosts.filter((host) => host.id !== selectedHost.id)]
-      : hosts,
-    [hosts, selectedHost],
-  );
   const [expandedProjectKey, setExpandedProjectKey] = useState<string | null>(null);
+  const [expandedTaskHostId, setExpandedTaskHostId] = useState<string | null>(null);
   const [quickCreateOpen, setQuickCreateOpen] = useState(false);
   const [editingProject, setEditingProject] = useState<SessionProject | null>(null);
   const [projectAlias, setProjectAlias] = useState("");
+  const [deviceNavigation] = useState(() => new DismissedModalAction());
+  const [createNavigation] = useState(() => new DismissedModalAction());
+  const closeDevicePickerRef = useRef(onCloseDevicePicker);
+  useEffect(() => {
+    closeDevicePickerRef.current = onCloseDevicePicker;
+  }, [onCloseDevicePicker]);
+
+  // Keep this callback independent of sheet state and parent callback identities:
+  // a normal close must leave its deferred route alive until native onDismiss.
+  const cancelOverlays = useCallback(() => {
+    deviceNavigation.cancel();
+    createNavigation.cancel();
+    closeDevicePickerRef.current();
+    setQuickCreateOpen(false);
+    setEditingProject(null);
+  }, [createNavigation, deviceNavigation]);
+  useFocusEffect(useCallback(() => cancelOverlays, [cancelOverlays]));
+  useEffect(() => {
+    const subscription = AppState.addEventListener("change", (state) => {
+      if (state !== "active") cancelOverlays();
+    });
+    return () => subscription.remove();
+  }, [cancelOverlays]);
+  useEffect(() => {
+    if (devicePickerOpen) deviceNavigation.cancel();
+  }, [deviceNavigation, devicePickerOpen]);
   const refreshing =
     selectedRuntime?.status === "connecting" || selectedRuntime?.status === "reconnecting";
 
@@ -232,6 +265,130 @@ export function HomeDashboard({
 
   const displayProjectName = (path: string, fallback: string): string =>
     effectiveHomeSettings.workspaceAliases[workspaceAliasKey(selectedHost.id, path)] ?? fallback;
+  const taskProjectsExpanded = expandedTaskHostId === selectedHost.id;
+  const taskRunningCount = taskProjects.reduce((total, project) => total + project.runningCount, 0);
+  const taskPendingCount = taskProjects.reduce((total, project) => total + project.pendingCount, 0);
+
+  const renderProject = (project: SessionProject) => {
+    const projectKey = `${selectedHost.id}:${project.path}`;
+    const expanded = expandedProjectKey === projectKey;
+    const displayName = displayProjectName(project.path, project.name);
+    return (
+      <View
+        key={projectKey}
+        collapsable={false}
+        style={[styles.projectCard, expanded && styles.projectCardExpanded]}
+      >
+        <SwipeRow
+          clipRadius={radius.md}
+          actions={[
+            {
+              id: "create-session",
+              label: "新会话",
+              symbol: "plus",
+              color: palette.accent,
+              foregroundColor: palette.onAccent,
+              onPress: () => onCreateSession(selectedHost.id, project.path),
+            },
+            {
+              id: "edit-workspace",
+              label: "编辑",
+              symbol: "pencil",
+              color: palette.surfaceRaised,
+              foregroundColor: palette.text,
+              onPress: () => {
+                setEditingProject(project);
+                setProjectAlias(displayName);
+              },
+            },
+          ]}
+        >
+          <Pressable
+            accessibilityRole="button"
+            accessibilityState={{ expanded }}
+            accessibilityLabel={`${displayName}，${workspaceDetail(project)}`}
+            accessibilityHint={`${expanded ? "收起这个目录的会话" : "展开这个目录的会话"}；左滑可新建会话或编辑名称`}
+            onPress={() => setExpandedProjectKey(expanded ? null : projectKey)}
+            style={({ pressed }) => [styles.projectHeader, pressed && styles.projectCardPressed]}
+          >
+            <View style={styles.projectIcon}>
+              <Icon name="folder.fill" size={18} color={palette.accent} />
+            </View>
+            <View style={styles.projectCopy}>
+              <Text style={styles.projectName} numberOfLines={1}>
+                {displayName}
+              </Text>
+              <Text
+                style={styles.projectPath}
+                numberOfLines={expanded ? undefined : 1}
+                ellipsizeMode="middle"
+              >
+                {expanded ? project.path : compactWorkspacePath(project.path)}
+              </Text>
+            </View>
+            <View style={styles.projectMeta}>
+              <Text
+                style={[
+                  styles.projectState,
+                  project.pendingCount > 0
+                    ? styles.projectPending
+                    : project.runningCount > 0
+                      ? styles.projectRunning
+                      : undefined,
+                ]}
+              >
+                {workspaceDetail(project)}
+              </Text>
+              <Icon
+                name={expanded ? "chevron.down" : "chevron.right"}
+                size={15}
+                color={palette.textFaint}
+              />
+            </View>
+          </Pressable>
+        </SwipeRow>
+
+        {expanded && (
+          <View style={styles.sessionList}>
+            {project.sessions.map((session) => (
+              <Pressable
+                key={session.id}
+                accessibilityRole="button"
+                accessibilityLabel={`打开会话 ${session.title}，${sessionStatusLabel[session.status]}`}
+                onPress={() => onOpenSession(selectedHost.id, session.id)}
+                style={({ pressed }) => [
+                  styles.sessionRow,
+                  pressed && styles.sessionRowPressed,
+                ]}
+              >
+                <AgentIcon agent={session.agent} size={17} badge />
+                <View style={styles.sessionCopy}>
+                  <Text style={styles.sessionTitle} numberOfLines={1}>
+                    {session.title || session.agent}
+                  </Text>
+                  <Text style={styles.sessionPreview} numberOfLines={1}>
+                    {session.preview?.trim() || `${session.agent} · ${session.kind}`}
+                  </Text>
+                </View>
+                <View style={styles.sessionState}>
+                  <View
+                    style={[
+                      styles.sessionStatusDot,
+                      { backgroundColor: statusTone(session.status, palette) },
+                    ]}
+                  />
+                  <Text style={styles.sessionStatusText}>
+                    {sessionStatusLabel[session.status]}
+                  </Text>
+                </View>
+                <Icon name="chevron.right" size={14} color={palette.textFaint} />
+              </Pressable>
+            ))}
+          </View>
+        )}
+      </View>
+    );
+  };
 
   return (
     <>
@@ -268,7 +425,7 @@ export function HomeDashboard({
                   {selectedHost.name}
                 </Text>
                 <Text style={styles.deviceMeta} numberOfLines={1}>
-                  {`${String(stats.activeAgentCount)} Agent · ${String(stats.sessionCount)} 会话 · ${stats.runningCount > 0 ? `${String(stats.runningCount)} 项工作中` : "空闲"}`}
+                  {`${String(stats.sessionCount)} 个会话 · ${String(stats.runningCount)} 个运行中`}
                 </Text>
               </View>
               <View style={styles.deviceSelectorEnd}>
@@ -277,38 +434,34 @@ export function HomeDashboard({
                   accessibilityState={{ expanded: devicePickerOpen }}
                   accessibilityLabel={`选择设备，${String(hosts.length)} 台已配对，当前为 ${selectedHost.name}，${hostConnectionLabel(selectedRuntime)}`}
                   accessibilityHint="从屏幕底部打开设备列表"
-                  hitSlop={8}
                   style={({ pressed }) => [
                     styles.deviceFleetPill,
                     pressed && styles.deviceFleetPillPressed,
                   ]}
-                  onPress={onToggleDevicePicker}
+                  onPress={() => {
+                    deviceNavigation.cancel();
+                    onToggleDevicePicker();
+                  }}
                 >
                   <Icon name="desktopcomputer" size={14} color={palette.textDim} />
-                  <View style={styles.deviceFleetDots}>
-                    <View
-                      style={[
-                        styles.fleetStatusDot,
-                        styles.fleetStatusDotSelected,
-                        { backgroundColor: hostConnectionTone(selectedRuntime, palette) },
-                      ]}
-                    />
-                    <Text style={styles.fleetCurrentStatus} numberOfLines={1}>
-                      {hostConnectionLabel(selectedRuntime)}
-                    </Text>
-                    {orderedDeviceHosts.slice(1).map((host) => (
-                      <View
-                        key={host.id}
-                        style={[
-                          styles.fleetStatusDot,
-                          { backgroundColor: hostConnectionTone(runtimes[host.id], palette) },
-                        ]}
-                      />
-                    ))}
-                  </View>
+                  <Text style={styles.deviceFleetCount}>{String(hosts.length)}</Text>
                   <Icon name="chevron.down" size={14} color={palette.textFaint} />
                 </Pressable>
               </View>
+            </View>
+            <View style={styles.deviceConnection}>
+              <View
+                style={[
+                  styles.statusDot,
+                  { backgroundColor: hostConnectionTone(selectedRuntime, palette) },
+                ]}
+              />
+              <Text style={styles.deviceConnectionText} numberOfLines={1}>
+                {hostDetail(selectedHost, selectedRuntime)}
+                {selectedRuntime?.status === "connected" && selectedRuntime.rttMs != null
+                  ? ` · ${hostConnectionLabel(selectedRuntime)}`
+                  : ""}
+              </Text>
             </View>
           </View>
 
@@ -320,15 +473,6 @@ export function HomeDashboard({
                   最近 {String(effectiveHomeSettings.recentSessionLimit)} 条
                 </Text>
               </View>
-              <Pressable
-                accessibilityRole="button"
-                accessibilityLabel="打开设置"
-                onPress={onOpenSettings}
-                hitSlop={8}
-                style={({ pressed }) => [styles.iconButton, pressed && styles.pressed]}
-              >
-                <Icon name="gearshape.fill" size={18} color={palette.textDim} />
-              </Pressable>
             </View>
             {recentSessions.length > 0 ? (
               <ScrollView
@@ -369,17 +513,16 @@ export function HomeDashboard({
 
           <View style={styles.workspaceSection}>
             <View style={styles.workspaceHeading}>
-              <View>
+              <View style={styles.workspaceHeadingCopy}>
                 <Text style={styles.workspaceTitle}>工作目录</Text>
                 <Text style={styles.workspaceSubtitle} numberOfLines={1}>
-                  {selectedHost.name} · 点按展开 · 左滑操作
+                  点按展开 · 左滑操作
                 </Text>
               </View>
               <View style={styles.workspaceActions}>
                 <Pressable
                   accessibilityRole="button"
                   accessibilityLabel={`打开 ${selectedHost.name} 详情`}
-                  hitSlop={8}
                   onPress={() => onOpenHost(selectedHost.id)}
                   style={({ pressed }) => [styles.iconButton, pressed && styles.pressed]}
                 >
@@ -388,7 +531,10 @@ export function HomeDashboard({
                 <Pressable
                   accessibilityRole="button"
                   accessibilityLabel="新建对话或目录"
-                  onPress={() => setQuickCreateOpen(true)}
+                  onPress={() => {
+                    createNavigation.cancel();
+                    setQuickCreateOpen(true);
+                  }}
                   style={({ pressed }) => [styles.createButton, pressed && styles.createButtonPressed]}
                 >
                   <Icon name="plus" size={16} color={palette.text} weight="semibold" />
@@ -400,7 +546,7 @@ export function HomeDashboard({
           </View>
         </View>
       }
-      ListEmptyComponent={
+      ListEmptyComponent={taskProjects.length === 0 ? (
         <WorkspaceEmptyState
           host={selectedHost}
           runtime={selectedRuntime}
@@ -409,129 +555,46 @@ export function HomeDashboard({
           palette={palette}
           styles={styles}
         />
-      }
+      ) : null}
       ItemSeparatorComponent={() => <View style={styles.projectGap} />}
-      renderItem={({ item: project }) => {
-        const projectKey = `${selectedHost.id}:${project.path}`;
-        const expanded = expandedProjectKey === projectKey;
-        const displayName = displayProjectName(project.path, project.name);
-        return (
-          <View
-            collapsable={false}
-            style={[styles.projectCard, expanded && styles.projectCardExpanded]}
+      renderItem={({ item }) => renderProject(item)}
+      ListFooterComponent={taskProjects.length > 0 ? (
+        <View style={styles.taskSection}>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityState={{ expanded: taskProjectsExpanded }}
+            accessibilityLabel={`任务工作区，${String(taskProjects.length)} 个目录，${String(taskRunningCount)} 个运行中，${String(taskPendingCount)} 项待处理`}
+            accessibilityHint={taskProjectsExpanded ? "收起任务目录" : "展开后可进入会话或左滑操作"}
+            onPress={() => setExpandedTaskHostId(taskProjectsExpanded ? null : selectedHost.id)}
+            style={({ pressed }) => [styles.taskHeading, pressed && styles.pressed]}
           >
-            <SwipeRow
-              clipRadius={radius.md}
-              actions={[
-                {
-                  id: "create-session",
-                  label: "新会话",
-                  symbol: "plus",
-                  color: palette.accent,
-                  foregroundColor: palette.onAccent,
-                  onPress: () => onCreateSession(selectedHost.id, project.path),
-                },
-                {
-                  id: "edit-workspace",
-                  label: "编辑",
-                  symbol: "pencil",
-                  color: palette.surfaceRaised,
-                  foregroundColor: palette.text,
-                  onPress: () => {
-                    setEditingProject(project);
-                    setProjectAlias(displayName);
-                  },
-                },
-              ]}
-            >
-              <Pressable
-                accessibilityRole="button"
-                accessibilityState={{ expanded }}
-                accessibilityLabel={`${displayName}，${workspaceDetail(project)}`}
-                accessibilityHint={`${expanded ? "收起这个目录的会话" : "展开这个目录的会话"}；左滑可新建会话或编辑名称`}
-                onPress={() => setExpandedProjectKey(expanded ? null : projectKey)}
-                style={({ pressed }) => [styles.projectHeader, pressed && styles.projectCardPressed]}
-              >
-                <View style={styles.projectIcon}>
-                  <Icon name="folder.fill" size={18} color={palette.accent} />
-                </View>
-                <View style={styles.projectCopy}>
-                  <Text style={styles.projectName} numberOfLines={1}>
-                    {displayName}
-                  </Text>
-                  <Text style={styles.projectPath} numberOfLines={1}>
-                    {project.path}
-                  </Text>
-                </View>
-                <View style={styles.projectMeta}>
-                  <Text
-                    style={[
-                      styles.projectState,
-                      project.pendingCount > 0
-                        ? styles.projectPending
-                        : project.runningCount > 0
-                          ? styles.projectRunning
-                          : undefined,
-                    ]}
-                  >
-                    {workspaceDetail(project)}
-                  </Text>
-                  <Icon
-                    name={expanded ? "chevron.down" : "chevron.right"}
-                    size={15}
-                    color={palette.textFaint}
-                  />
-                </View>
-              </Pressable>
-            </SwipeRow>
-
-            {expanded && (
-              <View style={styles.sessionList}>
-                {project.sessions.map((session) => (
-                  <Pressable
-                    key={session.id}
-                    accessibilityRole="button"
-                    accessibilityLabel={`打开会话 ${session.title}，${sessionStatusLabel[session.status]}`}
-                    onPress={() => onOpenSession(selectedHost.id, session.id)}
-                    style={({ pressed }) => [
-                      styles.sessionRow,
-                      pressed && styles.sessionRowPressed,
-                    ]}
-                  >
-                    <AgentIcon agent={session.agent} size={17} badge />
-                    <View style={styles.sessionCopy}>
-                      <Text style={styles.sessionTitle} numberOfLines={1}>
-                        {session.title || session.agent}
-                      </Text>
-                      <Text style={styles.sessionPreview} numberOfLines={1}>
-                        {session.preview?.trim() || `${session.agent} · ${session.kind}`}
-                      </Text>
-                    </View>
-                    <View style={styles.sessionState}>
-                      <View
-                        style={[
-                          styles.sessionStatusDot,
-                          { backgroundColor: statusTone(session.status, palette) },
-                        ]}
-                      />
-                      <Text style={styles.sessionStatusText}>
-                        {sessionStatusLabel[session.status]}
-                      </Text>
-                    </View>
-                    <Icon name="chevron.right" size={14} color={palette.textFaint} />
-                  </Pressable>
-                ))}
-              </View>
-            )}
-          </View>
-        );
-      }}
+            <View style={styles.taskHeadingCopy}>
+              <Text style={styles.taskTitle}>任务工作区 · {String(taskProjects.length)}</Text>
+              <Text style={[styles.taskSummary, taskPendingCount > 0 && styles.projectPending]}>
+                {`${String(taskRunningCount)} 个运行中 · ${String(taskPendingCount)} 项待处理`}
+              </Text>
+            </View>
+            <Icon
+              name={taskProjectsExpanded ? "chevron.down" : "chevron.right"}
+              size={15}
+              color={palette.textFaint}
+            />
+          </Pressable>
+          {taskProjectsExpanded && (
+            <View style={styles.taskProjects}>{taskProjects.map(renderProject)}</View>
+          )}
+        </View>
+      ) : null}
       />
 
       <Sheet
         visible={devicePickerOpen}
         title="设备"
-        onClose={onToggleDevicePicker}
+        onClose={() => {
+          deviceNavigation.cancel();
+          onCloseDevicePicker();
+        }}
+        onDismiss={() => deviceNavigation.dismiss()}
       >
         <View style={styles.deviceList}>
           {hosts.map((host) => {
@@ -543,7 +606,10 @@ export function HomeDashboard({
                   accessibilityRole="radio"
                   accessibilityState={{ selected }}
                   accessibilityLabel={`${host.name}，${hostDetail(host, runtime)}`}
-                  onPress={() => onSelectHost(host.id)}
+                  onPress={() => {
+                    deviceNavigation.cancel();
+                    onSelectHost(host.id);
+                  }}
                   style={({ pressed }) => [
                     styles.deviceRow,
                     pressed && styles.pressed,
@@ -570,8 +636,8 @@ export function HomeDashboard({
                     accessibilityRole="button"
                     accessibilityLabel={`编辑 ${host.name}`}
                     onPress={() => {
-                      onToggleDevicePicker();
-                      onEditHost(host.id);
+                      deviceNavigation.defer(() => onEditHost(host.id));
+                      onCloseDevicePicker();
                     }}
                     style={({ pressed }) => [styles.deviceAction, pressed && styles.pressed]}
                   >
@@ -604,8 +670,8 @@ export function HomeDashboard({
             detail="扫描电脑上的 Prospero 配对二维码"
             symbol="qrcode.viewfinder"
             onPress={() => {
-              onToggleDevicePicker();
-              onAddHost();
+              deviceNavigation.defer(onAddHost);
+              onCloseDevicePicker();
             }}
           />
         </View>
@@ -614,15 +680,19 @@ export function HomeDashboard({
       <Sheet
         visible={quickCreateOpen}
         title="新建"
-        onClose={() => setQuickCreateOpen(false)}
+        onClose={() => {
+          createNavigation.cancel();
+          setQuickCreateOpen(false);
+        }}
+        onDismiss={() => createNavigation.dismiss()}
       >
         <SheetAction
           label="新建对话"
           detail={`在 ${selectedHost.name} 选择工作目录并启动 Agent`}
           symbol="bubble.left.and.text.bubble.right"
           onPress={() => {
+            createNavigation.defer(() => onCreateSession(selectedHost.id));
             setQuickCreateOpen(false);
-            onCreateSession(selectedHost.id);
           }}
         />
         <SheetAction
@@ -630,8 +700,8 @@ export function HomeDashboard({
           detail="浏览电脑目录，并可在任意位置创建文件夹"
           symbol="folder.fill"
           onPress={() => {
+            createNavigation.defer(() => onCreateDirectory(selectedHost.id));
             setQuickCreateOpen(false);
-            onCreateDirectory(selectedHost.id);
           }}
         />
       </Sheet>
@@ -750,13 +820,22 @@ function createStyles(palette: ThemePalette) {
     borderRadius: radius.sm,
     backgroundColor: palette.accentBg,
   },
-  deviceHeaderCopy: { flex: 1, gap: 2 },
+  deviceHeaderCopy: { flex: 1, minWidth: 0, gap: 3 },
   deviceHeaderName: { ...themedFont.body, fontSize: 15, fontWeight: "700" },
-  deviceMeta: { color: palette.textDim, fontSize: 10.5 },
-  deviceSelectorEnd: { alignItems: "flex-end", justifyContent: "center" },
+  deviceMeta: { color: palette.textDim, fontSize: 11 },
+  deviceSelectorEnd: { flexShrink: 0, alignItems: "flex-end", justifyContent: "center" },
+  deviceConnection: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: space.md,
+    paddingBottom: space.md,
+  },
+  deviceConnectionText: { flex: 1, minWidth: 0, color: palette.textDim, fontSize: 11 },
   statusDot: { width: 6, height: 6, borderRadius: 3 },
   deviceFleetPill: {
-    minHeight: 25,
+    minHeight: 44,
+    minWidth: 44,
     flexDirection: "row",
     alignItems: "center",
     gap: 6,
@@ -765,16 +844,9 @@ function createStyles(palette: ThemePalette) {
     backgroundColor: palette.surfaceRaised,
   },
   deviceFleetPillPressed: { backgroundColor: palette.pressed },
-  deviceFleetDots: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 4,
-  },
-  fleetStatusDot: { width: 6, height: 6, borderRadius: 3 },
-  fleetStatusDotSelected: { borderWidth: 1, borderColor: palette.text },
-  fleetCurrentStatus: {
+  deviceFleetCount: {
     color: palette.textDim,
-    fontSize: 9,
+    fontSize: 12,
     fontWeight: "600",
     fontVariant: ["tabular-nums"],
   },
@@ -798,13 +870,13 @@ function createStyles(palette: ThemePalette) {
     borderRadius: radius.sm,
   },
   deviceRowSelected: { backgroundColor: palette.accentBg },
-  deviceRowCopy: { flex: 1, gap: 2 },
+  deviceRowCopy: { flex: 1, minWidth: 0, gap: 2 },
   deviceRowName: { ...themedFont.body, fontWeight: "600" },
   deviceRowDetail: themedFont.meta,
   deviceRowActions: { flexDirection: "row", alignItems: "center", paddingRight: space.xs },
   deviceAction: {
-    width: 42,
-    height: 42,
+    width: 44,
+    height: 44,
     alignItems: "center",
     justifyContent: "center",
     borderRadius: radius.sm,
@@ -826,8 +898,8 @@ function createStyles(palette: ThemePalette) {
   sectionTitle: { ...themedFont.title, fontSize: 17 },
   sectionSubtitle: { color: palette.textDim, fontSize: 10, marginTop: 1 },
   iconButton: {
-    width: 36,
-    height: 36,
+    width: 44,
+    height: 44,
     alignItems: "center",
     justifyContent: "center",
     borderRadius: radius.sm,
@@ -856,15 +928,16 @@ function createStyles(palette: ThemePalette) {
   workspaceSection: { gap: space.md },
   workspaceHeading: {
     flexDirection: "row",
-    alignItems: "flex-end",
+    alignItems: "center",
     justifyContent: "space-between",
     gap: space.md,
   },
+  workspaceHeadingCopy: { flex: 1, minWidth: 0 },
   workspaceTitle: { ...themedFont.title, fontSize: 19 },
   workspaceSubtitle: { ...themedFont.meta, marginTop: 3 },
-  workspaceActions: { flexDirection: "row", alignItems: "center", gap: space.xs },
+  workspaceActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: space.xs },
   createButton: {
-    minHeight: 34,
+    minHeight: 44,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
@@ -875,6 +948,21 @@ function createStyles(palette: ThemePalette) {
   },
   createButtonPressed: { opacity: 0.8 },
   createButtonText: { color: palette.text, fontSize: 12, fontWeight: "700" },
+  taskSection: { paddingTop: space.lg, gap: space.sm },
+  taskHeading: {
+    minHeight: 56,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: space.sm,
+    paddingHorizontal: space.md,
+    paddingVertical: space.sm,
+    borderRadius: radius.md,
+    backgroundColor: palette.surface,
+  },
+  taskHeadingCopy: { flex: 1, minWidth: 0, gap: 3 },
+  taskTitle: { ...themedFont.body, fontSize: 14, fontWeight: "600" },
+  taskSummary: { ...themedFont.meta, color: palette.textDim },
+  taskProjects: { gap: space.sm },
   projectGap: { height: space.sm },
   projectCard: {
     minHeight: 64,
