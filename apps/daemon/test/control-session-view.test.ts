@@ -423,4 +423,43 @@ describe("Mac control session views", () => {
       rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
     }
   });
+  it("serves bounded SQLite pages without decoding oversized event bodies", async () => {
+    const home = mkdtempSync(path.join(os.tmpdir(), "prospero-history-page-"));
+    let server: DaemonServer | undefined;
+    try {
+      server = await createDaemonServer({ home, port: 0, workspaceRoot: home,
+        structuredSupervisor: false, ptySupervisor: false, adapterFactory: () => new ControlViewAdapter() });
+      const { controlToken } = JSON.parse(readFileSync(path.join(home, "status.json"), "utf8"));
+      const base = `http://127.0.0.1:${server.port}`;
+      const headers = { authorization: `Bearer ${controlToken}`, "content-type": "application/json" };
+      const created = await fetch(`${base}/_prospero/control/session/create`, {
+        method: "POST", headers, body: JSON.stringify({ agent: "codex", kind: "structured", cwd: home }),
+      });
+      expect(created.status).toBe(201);
+      const { id } = await created.json() as { id: string };
+      const endpoint = `${base}/_prospero/control/session/${id}/history`;
+      const sent = await fetch(`${base}/_prospero/control/session/${id}/interact`, {
+        method: "POST", headers, body: JSON.stringify({ type: "chat.send", text: "大提示词😀".repeat(5000) }),
+      });
+      expect(sent.status).toBe(204);
+      await server.manager.flushPersistence();
+      expect((await fetch(endpoint)).status).toBe(401);
+      for (const query of ["limit=201", "maxBytes=524289", "beforeSeq=-1", "beforeSeq=", "limit=0"]) {
+        expect((await fetch(`${endpoint}?${query}`, { headers })).status).toBe(400);
+      }
+      const response = await fetch(`${endpoint}?maxBytes=1024`, { headers });
+      expect(response.status).toBe(200);
+      const page = await response.json() as { events: Array<{ seq: number }>; oversized?: { seq: number; bytes: number }; hasMore: boolean; lastSeq: number };
+      expect(page.hasMore).toBe(true);
+      expect(page.oversized?.bytes).toBeGreaterThan(1024);
+      expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThan(2048);
+      const older = await fetch(`${endpoint}?maxBytes=1024&beforeSeq=${page.oversized!.seq}`, { headers });
+      expect(older.status).toBe(200);
+      expect((await older.json() as { lastSeq: number }).lastSeq).toBe(page.lastSeq);
+    } finally {
+      await server?.close();
+      rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+    }
+  });
+
 });

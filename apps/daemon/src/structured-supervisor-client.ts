@@ -33,6 +33,8 @@ import type {
   SubagentInfo,
 } from "@prospero/protocol";
 import { completeComposer } from "./composer-context.js";
+import { SessionDatabase, type SessionEventsPage, type SessionEventsPageOptions } from "./session-database.js";
+import { migrateLegacySessionFile } from "./legacy-session-import.js";
 import { compactAgentSnapshotEvents, type StructuredSessionPersistentState } from "./structured-session.js";
 import type {
   AdapterResumeState,
@@ -60,6 +62,7 @@ export const SUPERVISOR_MANIFEST_VERSION = 1;
 
 export interface StructuredSupervisorManifest {
   version: 1;
+  storageVersion?: 2;
   protocolVersion: number;
   implementation: "supervisor";
   sessionId: string;
@@ -153,7 +156,7 @@ class SupervisorRpc {
     });
   }
 
-  async request<T>(method: string, params: Record<string, unknown>, timeoutMs?: number): Promise<T> {
+  async request<T>(method: string, params: Record<string, unknown>, timeoutMs?: number, onReply?: (value: T) => void): Promise<T> {
     const startedAt = Date.now();
     await this.connect(timeoutMs);
     const socket = this.socket;
@@ -170,7 +173,15 @@ class SupervisorRpc {
         // The caller will either retry or tear down the newly spawned owner.
         this.socket?.destroy();
       }, remaining);
-      this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject, timeout });
+      this.pending.set(id, {
+        resolve: (value) => {
+          // Establish a subscribe cursor before onData processes another line
+          // in the same socket chunk; awaiting the Promise alone is too late.
+          try { onReply?.(value as T); resolve(value as T); }
+          catch (error) { reject(error instanceof Error ? error : new Error(String(error))); }
+        },
+        reject, timeout,
+      });
     });
     try {
       socket.write(`${JSON.stringify({
@@ -291,6 +302,7 @@ export function readSupervisorManifest(file: string): StructuredSupervisorManife
     const v = raw as Partial<StructuredSupervisorManifest>;
     if (
       v.version !== SUPERVISOR_MANIFEST_VERSION || v.protocolVersion !== SUPERVISOR_PROTOCOL_VERSION ||
+      (v.storageVersion !== undefined && v.storageVersion !== 2) ||
       v.implementation !== "supervisor" || typeof v.sessionId !== "string" || !SESSION_ID.test(v.sessionId) ||
       typeof v.agent !== "string" || typeof v.title !== "string" || typeof v.cwd !== "string" ||
       typeof v.createdAt !== "number" || typeof v.approvalPolicy !== "string" ||
@@ -349,6 +361,8 @@ export class RemoteStructuredSession extends EventEmitter {
   private infoRevision = 0;
   private stateNotifications = false;
   private reconnecting: Promise<void> | null = null;
+  private historyLoaded = false;
+  private storageError: RemoteSupervisorError | null = null;
 
   private constructor(private readonly manifest: StructuredSupervisorManifest, hosting: StructuredHosting) {
     super();
@@ -364,32 +378,115 @@ export class RemoteStructuredSession extends EventEmitter {
     if (hosting === "unavailable") this.loadReadonlyCache();
   }
 
+  private usesSqlite(): boolean {
+    return this.manifest.storageVersion === 2 || existsSync(path.join(this.ownerDir(), "session.sqlite"));
+  }
+
+  private withDatabase<T>(read: (database: SessionDatabase) => T): T {
+    // Opening an existing authoritative database must fail closed. A retained
+    // JSON file is a pre-migration backup, never a fallback for corrupt SQLite.
+    const database = new SessionDatabase(path.join(this.ownerDir(), "session.sqlite"), { readOnly: true });
+    try { return read(database); } finally { database.close(); }
+  }
+
   private loadReadonlyCache(): void {
-    const file = path.join(this.ownerDir(), "session.json");
-    if (!privateMode(file)) return;
+    if (!this.usesSqlite()) return; // Legacy live owners stay untouched and lazy.
     try {
-      const raw: unknown = JSON.parse(readFileSync(file, "utf8"));
-      if (!raw || typeof raw !== "object" || Array.isArray(raw)) return;
-      const state = raw as Partial<StructuredSessionPersistentState>;
-      if (!Array.isArray(state.events) || typeof state.evSeq !== "number") return;
-      this.log.push(...state.events.slice(-MAX_EVENTS));
-      this.evSeq = Math.max(0, state.evSeq);
-      this.rebuildPending();
-      this.infoValue = {
-        ...this.infoValue,
-        ...(this.infoValue.status === "done" ? {} : { status: "died" }),
-        ...(typeof state.preview === "string" && state.preview ? { preview: state.preview } : {}),
-        ...(state.totals ? { totals: state.totals } : {}),
-        ...(Array.isArray(state.messageQueue) ? {
-          messageQueue: state.messageQueue.map((item) => ({
-            id: item.id, text: item.displayText, kind: item.kind,
-            createdAt: item.createdAt, attachmentCount: item.attachmentCount,
-          })),
-        } : {}),
-      };
+      const { state, queue } = this.withDatabase((database) => ({
+        state: database.readSession(this.id, {
+          events: false, toolOutputs: false, messageQueue: false, maxBytes: Number.MAX_SAFE_INTEGER,
+        }),
+        queue: database.readQueueSummary(this.id),
+      }));
+      if (!state) throw new Error("missing session metadata");
+      this.applyReadonlyMetadata(state);
+      this.infoValue.messageQueue = queue.map((item) => ({
+        id: item.id, text: item.displayText, kind: item.kind, createdAt: item.createdAt, attachmentCount: item.attachmentCount,
+      }));
     } catch {
-      // A damaged cache remains unavailable/read-only; do not overwrite it.
+      this.storageError = new RemoteSupervisorError("会话历史数据库不可用；未读取迁移前备份", "session_storage_unavailable");
+      this.infoValue = { ...this.infoValue, preview: this.storageError.message };
     }
+  }
+
+  /** Background import may finish after the archive facade is already visible. */
+  refreshArchiveMetadata(): void {
+    if (this.hosting !== "unavailable" || !this.usesSqlite()) return;
+    this.manifest.storageVersion = 2;
+    this.loadReadonlyCache();
+    this.emit("state", this.info());
+  }
+
+  private applyReadonlyMetadata(state: Partial<StructuredSessionPersistentState>): void {
+    if (state.historySummary) {
+      this.pendingPermissions.clear();
+      this.pendingQuestions.clear();
+      for (const item of state.historySummary.pendingPermissions) this.pendingPermissions.add(item.reqId);
+      for (const item of state.historySummary.pendingQuestions) this.pendingQuestions.add(item.reqId);
+    }
+    this.evSeq = Math.max(0, state.evSeq ?? 0);
+    this.infoValue = {
+      ...this.infoValue,
+      ...(typeof state.title === "string" ? { title: state.title } : {}),
+      ...(state.approvalPolicy ? { approvalPolicy: state.approvalPolicy } : {}),
+      ...(typeof state.preview === "string" && state.preview ? { preview: state.preview } : {}),
+      ...(state.totals ? { totals: state.totals } : {}),
+      ...(state.historySummary ? {
+        pendingPermissions: state.historySummary.pendingPermissions.length,
+        pendingQuestions: state.historySummary.pendingQuestions.length,
+        subagents: state.historySummary.subagents,
+      } : {}),
+      ...(Array.isArray(state.messageQueue) ? {
+        messageQueue: state.messageQueue.map((item) => ({
+          id: item.id, text: item.displayText, kind: item.kind,
+          createdAt: item.createdAt, attachmentCount: item.attachmentCount,
+        })),
+      } : {}),
+    };
+  }
+
+  private ensureReadonlyHistory(): void {
+    if (this.historyLoaded || (this.hosting !== "unavailable" && !this.usesSqlite())) return;
+    if (this.storageError) throw this.storageError;
+    let state: Partial<StructuredSessionPersistentState> | null;
+    if (this.usesSqlite()) {
+      try {
+        // Compatibility snapshots retain the existing 4,000-event window and
+        // full event bodies. Byte-bounded browsing is exposed separately.
+        state = this.withDatabase((database) => database.readSession(this.id, {
+          events: true, toolOutputs: false, messageQueue: true, limit: MAX_EVENTS, maxBytes: Number.MAX_SAFE_INTEGER,
+        }));
+        if (!state) throw new Error("missing session metadata");
+      } catch {
+        throw new RemoteSupervisorError("会话历史数据库不可用；未读取迁移前备份", "session_storage_unavailable");
+      }
+    } else {
+      // An unavailable but still-live schema-1 owner cannot be migrated. Its
+      // complete legacy file is read only for an explicit history request.
+      const file = path.join(this.ownerDir(), "session.json");
+      if (!privateMode(file)) { this.historyLoaded = true; return; }
+      try { state = JSON.parse(readFileSync(file, "utf8")) as Partial<StructuredSessionPersistentState>; }
+      catch { throw new RemoteSupervisorError("旧会话历史不可读", "session_storage_unavailable"); }
+    }
+    if (!state || !Array.isArray(state.events) || typeof state.evSeq !== "number") {
+      throw new RemoteSupervisorError("会话历史格式无效", "session_storage_unavailable");
+    }
+    if (this.usesSqlite() && state.evSeq < this.evSeq) {
+      throw new RemoteSupervisorError("会话历史游标尚未持久化", "session_storage_unavailable");
+    }
+    // The runner commits UI events before publishing them over IPC. Reading
+    // the durable window therefore includes every observed in-memory tail,
+    // including events committed while the subscribe response was in flight.
+    this.applyReadonlyMetadata(state);
+    this.log.splice(0, this.log.length, ...state.events.slice(-MAX_EVENTS));
+    this.rebuildPending();
+    this.historyLoaded = true;
+  }
+
+  /** Explicit bounded historical query; never clips an event's body. */
+  historyPage(options: SessionEventsPageOptions = {}): SessionEventsPage {
+    if (!this.usesSqlite()) throw new RemoteSupervisorError("旧 owner 尚未切换历史分页存储", "history_paging_unavailable");
+    return this.withDatabase((database) => database.readEventsPage(this.id, options));
   }
 
   static async attach(manifest: StructuredSupervisorManifest, timeoutMs?: number): Promise<RemoteStructuredSession> {
@@ -461,16 +558,32 @@ export class RemoteStructuredSession extends EventEmitter {
     const deadline = timeoutMs === undefined ? undefined : Date.now() + timeoutMs;
     const remaining = (): number | undefined => deadline === undefined ? undefined : Math.max(1, deadline - Date.now());
     try {
+      const lazy = this.usesSqlite() && !this.historyLoaded;
+      if (lazy) {
+        this.loadReadonlyCache();
+        if (this.storageError) throw this.storageError;
+      }
       const replay = await this.rpc.request<{ events: SupervisorEvent[]; lastSeq: number; gap: boolean; stateNotifications?: boolean }>(
-        "session.subscribe", { sessionId: this.id, afterSeq: this.evSeq }, remaining(),
+        "session.subscribe", { sessionId: this.id, afterSeq: this.evSeq, ...(lazy ? { tailOnly: true } : {}) }, remaining(),
+        lazy ? (reply) => {
+          if (!Number.isSafeInteger(reply.lastSeq) || reply.lastSeq < 0) throw new RemoteSupervisorError("invalid supervisor cursor");
+          // tailOnly atomically registers this protocol's own current cursor,
+          // without reading any historical event or guessing a SQLite offset.
+          this.evSeq = reply.lastSeq;
+          this.log.length = 0;
+        } : undefined,
       );
       this.stateNotifications = replay.stateNotifications === true;
-      if (replay.gap) {
+      if (replay.gap && this.usesSqlite() && !this.historyLoaded) {
+        this.evSeq = replay.lastSeq;
+        this.log.length = 0;
+      } else if (replay.gap) {
         // A restart with compacted history must never claim a partial exact
         // replay.  The runner's full snapshot is the authoritative recovery.
         const snap = await this.call<{ events: AgentEventBody[]; evSeq: number }>("snapshot", {}, remaining());
         this.log.splice(0, this.log.length, ...snap.events.slice(-MAX_EVENTS));
         this.evSeq = snap.evSeq;
+        this.historyLoaded = true;
         this.rebuildPending();
       } else {
         for (const event of replay.events) this.acceptEvent(event);
@@ -628,12 +741,15 @@ export class RemoteStructuredSession extends EventEmitter {
   get resumeState(): AdapterResumeState { return {}; }
 
   snapshot(): { events: AgentEventBody[]; evSeq: number } {
+    this.ensureReadonlyHistory();
     return { events: [...this.log], evSeq: this.evSeq };
   }
   transportSnapshot(): { events: AgentEventBody[]; evSeq: number } {
+    this.ensureReadonlyHistory();
     return { events: compactAgentSnapshotEvents(this.log), evSeq: this.evSeq };
   }
   since(afterSeq: number): AgentEventBody[] | null {
+    this.ensureReadonlyHistory();
     if (afterSeq > this.evSeq) return null;
     const oldest = this.evSeq - this.log.length + 1;
     if (afterSeq + 1 < oldest && afterSeq < this.evSeq) return null;
@@ -677,9 +793,9 @@ export class RemoteStructuredSession extends EventEmitter {
   }
   async compact(): Promise<void> { await this.call("compact", {}); this.scheduleInfoRefresh(true); }
   toolOutput(callId: string): { output: string; truncated: boolean } | null {
-    // Tool output is deliberately read from the supervisor-owned, 0600 state
-    // file. WS needs this synchronous method and the file is a bounded cache
-    // written by StructuredSession itself; never read daemon-provided paths.
+    if (this.usesSqlite()) return this.withDatabase((database) => database.toolOutput(this.id, callId));
+    // Only existing schema-1 owners retain this explicit legacy read path.
+    // New owners use an indexed, byte-bounded tool query above.
     const file = path.join(this.ownerDir(), "session.json");
     if (!privateMode(file)) return null;
     try {
@@ -693,7 +809,9 @@ export class RemoteStructuredSession extends EventEmitter {
       if (!match) return null;
       const output = match[1];
       const max = 200_000;
-      return output.length > max ? { output: output.slice(0, max), truncated: true } : { output, truncated: false };
+      const truncatedIds = (parsed as { truncatedToolOutputs?: unknown }).truncatedToolOutputs;
+      const truncated = output.length > max || (Array.isArray(truncatedIds) && truncatedIds.includes(callId));
+      return { output: output.slice(0, max), truncated };
     } catch { return null; }
   }
   async attachmentChunk(msgId: string, attachmentId: string, offset: number, length: number): Promise<{ data: Buffer; total: number; eof: boolean; mimeType: Attachment["mimeType"] } | null> {
@@ -1123,40 +1241,83 @@ export async function launchStructuredSupervisor(input: LaunchStructuredSupervis
   }
 }
 
+/** Only ESRCH establishes owner death; EPERM and unknown PID remain live/unknown. */
+function processDefinitelyExited(pid: number | undefined): boolean {
+  if (!pid || !Number.isSafeInteger(pid) || pid <= 1) return false;
+  try { process.kill(pid, 0); return false; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
+}
+
+async function migrateDeadOwner(dir: string, manifest: StructuredSupervisorManifest, isDeleted: () => boolean): Promise<void> {
+  if (manifest.storageVersion === 2 || !processDefinitelyExited(manifest.supervisorPid) || isDeleted()) return;
+  const databaseExists = existsSync(path.join(dir, "session.sqlite"));
+  if (!databaseExists && !privateMode(path.join(dir, "session.json"))) return;
+  const ownerDirectory = lstatSync(dir);
+  const stillDead = (): StructuredSupervisorManifest | null => {
+    if (isDeleted()) return null;
+    try {
+      const directory = lstatSync(dir);
+      if (!directory.isDirectory() || directory.isSymbolicLink() || directory.dev !== ownerDirectory.dev || directory.ino !== ownerDirectory.ino) return null;
+    } catch { return null; }
+    const current = readSupervisorManifest(path.join(dir, "manifest.json"));
+    return current && current.sessionId === manifest.sessionId &&
+      current.supervisorPid === manifest.supervisorPid && current.lifecycleEpoch === manifest.lifecycleEpoch &&
+      current.storageVersion === undefined && processDefinitelyExited(current.supervisorPid) ? current : null;
+  };
+  if (!databaseExists) {
+    await migrateLegacySessionFile(path.join(dir, "session.json"), path.join(dir, "session.sqlite"), {
+      array: false, isSafeToPublish: () => !!stillDead(),
+    });
+  }
+  const current = stillDead();
+  if (current && existsSync(path.join(dir, "session.sqlite"))) {
+    privateWrite(path.join(dir, "manifest.json"), { ...current, storageVersion: 2, updatedAt: Date.now() });
+  }
+}
+
 /** Scan only private per-session directories; never launch a replacement here. */
-export async function reconnectStructuredSupervisors(root: string, timeoutMs = SUPERVISOR_RECONNECT_TIMEOUT_MS): Promise<RemoteStructuredSession[]> {
+export async function reconnectStructuredSupervisors(
+  root: string,
+  timeoutMs = SUPERVISOR_RECONNECT_TIMEOUT_MS,
+  options: { isDeleted?: (sessionId: string) => boolean } = {},
+): Promise<RemoteStructuredSession[]> {
   if (structuredSupervisorPlatformGate() || !existsSync(root)) return [];
-  const entries = readdirSync(root, { withFileTypes: true });
+  const entries = readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
+    if (!entry.isDirectory() || !SESSION_ID.test(entry.name)) return [];
+    const dir = path.join(root, entry.name);
+    if (!privateDirectory(dir)) return [];
+    const manifest = readSupervisorManifest(path.join(dir, "manifest.json"));
+    if (!manifest || manifest.sessionId !== entry.name || options.isDeleted?.(entry.name)) return [];
+    const live = manifest.status !== "done" && manifest.status !== "died" && processAlive(manifest.supervisorPid);
+    return [{ dir, manifest, live }];
+  }).sort((left, right) => Number(right.live) - Number(left.live));
   const sessions: Array<RemoteStructuredSession | undefined> = new Array(entries.length);
+  const archive = (dir: string, manifest: StructuredSupervisorManifest): RemoteStructuredSession => {
+    const session = RemoteStructuredSession.unavailable({ ...manifest, sessionDir: dir });
+    // Large inactive archives cannot occupy the live reconnect worker slots.
+    // Publication rechecks PID/epoch, directory identity and deletion tombstones.
+    // A quit may interrupt this staging import; the original file stays intact.
+    void migrateDeadOwner(dir, manifest, () => options.isDeleted?.(manifest.sessionId) === true).then(() => {
+      if (!options.isDeleted?.(manifest.sessionId)) session.refreshArchiveMetadata();
+    }).catch(() => { /* Explicit legacy inspection remains available; never launch or overwrite an owner. */ });
+    return session;
+  };
   let nextEntry = 0;
   await Promise.all(Array.from({ length: Math.min(4, entries.length) }, async () => {
     for (;;) {
-      const index = nextEntry++;
-      const entry = entries[index];
+      const entryIndex = nextEntry++;
+      const entry = entries[entryIndex];
       if (!entry) return;
-      if (!entry.isDirectory() || !SESSION_ID.test(entry.name)) continue;
-      const dir = path.join(root, entry.name);
-      if (!privateDirectory(dir)) continue;
-      const manifest = readSupervisorManifest(path.join(dir, "manifest.json"));
-      if (!manifest || manifest.sessionId !== entry.name) continue;
-      // A dead PID, stale socket or protocol mismatch is historical/read-only.
-      // Crucially this path does not call the launcher, preventing duplicate turns.
+      const { dir, manifest } = entry;
       const withOwnerDir = { ...manifest, sessionDir: dir };
-      // A failed-launch/explicitly-ended audit is permanently read-only.  Even
-      // if rollback could not confirm process exit, a later daemon must never
-      // attach the owner of a create() call that already returned failure.
-      if (
-        manifest.status === "died" || manifest.status === "done" ||
-        !manifestMatchesPlatform(manifest) ||
-        !processAlive(manifest.supervisorPid) ||
-        !privateMode(path.join(dir, "token")) ||
-        (manifestTransport(manifest) === "unix_socket" && !privateMode(manifest.socket))
-      ) {
-        sessions[index] = RemoteStructuredSession.unavailable(withOwnerDir);
+      if (!entry.live || !manifestMatchesPlatform(manifest) ||
+          !privateMode(path.join(dir, "token")) ||
+          (manifestTransport(manifest) === "unix_socket" && !privateMode(manifest.socket))) {
+        sessions[entryIndex] = archive(dir, manifest);
         continue;
       }
-      try { sessions[index] = await RemoteStructuredSession.attach(withOwnerDir, timeoutMs); }
-      catch { sessions[index] = RemoteStructuredSession.unavailable(withOwnerDir); }
+      try { sessions[entryIndex] = await RemoteStructuredSession.attach(withOwnerDir, timeoutMs); }
+      catch { sessions[entryIndex] = archive(dir, manifest); }
     }
   }));
   return sessions.filter((session): session is RemoteStructuredSession => session !== undefined);

@@ -9,8 +9,18 @@ import type {
   AgentAdapter,
 } from "../src/adapters/types.js";
 import { SessionManager } from "../src/session-manager.js";
+import { SessionDatabase } from "../src/session-database.js";
 import { createDaemonServer, type DaemonServer } from "../src/ws-server.js";
 import { killSession, tmuxPath } from "../src/tmux.js";
+
+function readStoredSessions(home: string) {
+  const database = new SessionDatabase(path.join(home, "sessions.sqlite"), { readOnly: true });
+  try {
+    return database.listSessionIds().map((id) => database.readSession(id, {
+      limit: Number.MAX_SAFE_INTEGER, maxBytes: Number.MAX_SAFE_INTEGER,
+    })!);
+  } finally { database.close(); }
+}
 
 /** 轮询等谓词成立;写盘已异步化,不能在同一 tick 里同步读到结果。 */
 async function waitFor(pred: () => boolean, what: string, timeoutMs = 5_000): Promise<void> {
@@ -84,9 +94,8 @@ async function seedRecoverableQueuedState(home: string): Promise<string> {
   await first.flushPersistence();
   await first.disposeAll();
 
-  const stateFile = path.join(home, "structured-sessions.json");
-  const states = JSON.parse(readFileSync(stateFile, "utf8")) as Array<Record<string, unknown>>;
-  states[0]!["messageQueue"] = [{
+  const states = readStoredSessions(home);
+  states[0]!.messageQueue = [{
     id: "queued-after-delivery",
     displayText: "绝不能在重启后写入 worktree",
     outgoingText: "绝不能在重启后写入 worktree",
@@ -95,7 +104,8 @@ async function seedRecoverableQueuedState(home: string): Promise<string> {
     attachmentCount: 0,
     attachments: [],
   }];
-  writeFileSync(stateFile, JSON.stringify(states));
+  const database = new SessionDatabase(path.join(home, "sessions.sqlite"));
+  try { database.saveSession(states[0]!); } finally { database.close(); }
   return created.id;
 }
 
@@ -136,7 +146,7 @@ describe("结构化会话持久化", () => {
       .rejects.toThrow("历史只读");
     // preserveHistory kill 自己就必须同步写 terminal 快照；这里刻意不手动 flush，
     // 模拟 kill 返回后 daemon 立刻崩溃。
-    expect(JSON.parse(readFileSync(path.join(home, "structured-sessions.json"), "utf8")))
+    expect(readStoredSessions(home))
       .toEqual([expect.objectContaining({
         id: created.id,
         terminal: true,
@@ -193,9 +203,7 @@ describe("结构化会话持久化", () => {
     expect(releaseDispose).not.toBeNull();
     await waitFor(() => {
       try {
-        const parsed = JSON.parse(
-          readFileSync(path.join(home, "structured-sessions.json"), "utf8"),
-        ) as Array<Record<string, unknown>>;
+        const parsed = readStoredSessions(home);
         return parsed.length === 1 && parsed[0]?.id === created.id && parsed[0]?.terminal === true;
       } catch {
         return false;
@@ -240,7 +248,7 @@ describe("结构化会话持久化", () => {
     expect(second.infoOf(sessionId).messageQueue).toEqual([
       expect.objectContaining({ text: "绝不能在重启后写入 worktree" }),
     ]);
-    expect(JSON.parse(readFileSync(path.join(home, "structured-sessions.json"), "utf8")))
+    expect(readStoredSessions(home))
       .toEqual([expect.objectContaining({ id: sessionId, terminal: true })]);
     await expect(second.chatSend(sessionId, "不得在恢复时重连"))
       .rejects.toThrow("历史只读");
@@ -285,7 +293,7 @@ describe("结构化会话持久化", () => {
     expect(second.infoOf(sessionId).messageQueue).toEqual([
       expect.objectContaining({ text: "绝不能在重启后写入 worktree" }),
     ]);
-    expect(JSON.parse(readFileSync(path.join(home, "structured-sessions.json"), "utf8")))
+    expect(readStoredSessions(home))
       .toEqual([expect.objectContaining({ id: sessionId, terminal: true })]);
     await second.disposeAll();
   });
@@ -356,9 +364,7 @@ describe("结构化会话持久化", () => {
     await first.chatSend(created.id, "queued after restart");
     await first.flushPersistence();
 
-    const disk = JSON.parse(
-      readFileSync(path.join(home, "structured-sessions.json"), "utf8"),
-    ) as unknown[];
+    const disk = readStoredSessions(home);
     expect(disk).toHaveLength(1);
     expect(disk[0]).toMatchObject({
       messageQueue: [
@@ -405,7 +411,7 @@ describe("结构化会话持久化", () => {
 
     await second.kill(created.id);
     expect(
-      JSON.parse(readFileSync(path.join(home, "structured-sessions.json"), "utf8")),
+      readStoredSessions(home),
     ).toEqual([]);
     expect(JSON.parse(readFileSync(path.join(home, "deleted-sessions.json"), "utf8")))
       .toEqual({ version: 1, ids: process.platform === "win32" ? [created.id] : [] });

@@ -1,6 +1,5 @@
 import { EventEmitter } from "node:events";
 import { chmodSync, existsSync, lstatSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { chmod, rename, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -40,7 +39,6 @@ import * as tmux from "./tmux.js";
 import {
   StructuredSession,
   titleFor,
-  type QueuedChatPersistent,
   type StructuredSessionPersistentState,
 } from "./structured-session.js";
 import {
@@ -75,8 +73,11 @@ import {
   type PtyStartupReadinessOptions,
 } from "./pty-startup-readiness.js";
 import { writePrivateFileAtomic } from "./filesystem-store.js";
+import { SessionDatabase } from "./session-database.js";
+import { migrateLegacySessionFile } from "./legacy-session-import.js";
 
 export type SessionErrorCode =
+  | "storage_unavailable"
   | "shell_not_allowed"
   | "agent_unavailable"
   | "conflict"
@@ -162,144 +163,6 @@ interface PtyMeta {
   accountName?: string;
 }
 
-function parseStructuredState(value: unknown): StructuredSessionPersistentState | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const v = value as Record<string, unknown>;
-  const agents = new Set<AgentKind>(["claude", "codex", "opencode", "grok", "deepseek"]);
-  const policies = new Set<ApprovalPolicy>(["strict", "standard", "yolo"]);
-  if (
-    v["version"] !== 1 ||
-    typeof v["id"] !== "string" ||
-    typeof v["agent"] !== "string" ||
-    !agents.has(v["agent"] as AgentKind) ||
-    typeof v["title"] !== "string" ||
-    typeof v["cwd"] !== "string" ||
-    typeof v["createdAt"] !== "number" ||
-    typeof v["approvalPolicy"] !== "string" ||
-    !policies.has(v["approvalPolicy"] as ApprovalPolicy) ||
-    !Array.isArray(v["events"])
-  ) {
-    return null;
-  }
-  const rawTotals =
-    v["totals"] && typeof v["totals"] === "object"
-      ? (v["totals"] as Record<string, unknown>)
-      : {};
-  const number = (x: unknown): number =>
-    typeof x === "number" && Number.isFinite(x) ? x : 0;
-  const toolOutputs = Array.isArray(v["toolOutputs"])
-    ? v["toolOutputs"].filter(
-        (entry): entry is [string, string] =>
-          Array.isArray(entry) &&
-          typeof entry[0] === "string" &&
-          typeof entry[1] === "string",
-      )
-    : [];
-  const adapterState =
-    v["adapterState"] &&
-    typeof v["adapterState"] === "object" &&
-    !Array.isArray(v["adapterState"])
-      ? (v["adapterState"] as AdapterResumeState)
-      : {};
-  const imageMimes = new Set<Attachment["mimeType"]>([
-    "image/jpeg",
-    "image/png",
-    "image/gif",
-    "image/webp",
-  ]);
-  const messageQueue: QueuedChatPersistent[] = Array.isArray(v["messageQueue"])
-    ? v["messageQueue"]
-        .flatMap((raw): QueuedChatPersistent[] => {
-          if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
-          const item = raw as Record<string, unknown>;
-          if (
-            typeof item["id"] !== "string" ||
-            typeof item["displayText"] !== "string" ||
-            typeof item["outgoingText"] !== "string" ||
-            (item["kind"] !== "queue" && item["kind"] !== "guide") ||
-            typeof item["createdAt"] !== "number" ||
-            !Number.isFinite(item["createdAt"]) ||
-            typeof item["attachmentCount"] !== "number" ||
-            !Number.isInteger(item["attachmentCount"]) ||
-            item["attachmentCount"] < 0
-          ) {
-            return [];
-          }
-          const attachments = Array.isArray(item["attachments"])
-            ? item["attachments"].flatMap((rawAttachment) => {
-                if (
-                  !rawAttachment ||
-                  typeof rawAttachment !== "object" ||
-                  Array.isArray(rawAttachment)
-                ) {
-                  return [];
-                }
-                const attachment = rawAttachment as Record<string, unknown>;
-                if (
-                  typeof attachment["mimeType"] !== "string" ||
-                  !imageMimes.has(attachment["mimeType"] as Attachment["mimeType"]) ||
-                  typeof attachment["path"] !== "string"
-                ) {
-                  return [];
-                }
-                const id =
-                  typeof attachment["id"] === "string" && /^[A-Za-z0-9._-]+$/.test(attachment["id"])
-                    ? attachment["id"]
-                    : path.basename(attachment["path"]);
-                if (!/^[A-Za-z0-9._-]+$/.test(id)) return [];
-                return [
-                  {
-                    id,
-                    mimeType: attachment["mimeType"] as Attachment["mimeType"],
-                    path: attachment["path"],
-                    ...(typeof attachment["name"] === "string"
-                      ? { name: attachment["name"] }
-                      : {}),
-                  },
-                ];
-              })
-            : [];
-          return [
-            {
-              id: item["id"],
-              displayText: item["displayText"],
-              outgoingText: item["outgoingText"],
-              kind: item["kind"],
-              createdAt: item["createdAt"],
-              attachmentCount: item["attachmentCount"],
-              attachments,
-            },
-          ];
-        })
-        .slice(0, 50)
-    : [];
-  return {
-    version: 1,
-    id: v["id"],
-    agent: v["agent"] as AgentKind,
-    title: v["title"],
-    cwd: v["cwd"],
-    ...(typeof v["accountId"] === "string" ? { accountId: v["accountId"] } : {}),
-    ...(typeof v["accountName"] === "string" ? { accountName: v["accountName"] } : {}),
-    createdAt: v["createdAt"],
-    approvalPolicy: v["approvalPolicy"] as ApprovalPolicy,
-    events: v["events"] as AgentEventBody[],
-    evSeq: Math.max(0, number(v["evSeq"])),
-    preview: typeof v["preview"] === "string" ? v["preview"] : "",
-    previewRaw: typeof v["previewRaw"] === "string" ? v["previewRaw"] : "",
-    previewMsgId: typeof v["previewMsgId"] === "string" ? v["previewMsgId"] : "",
-    totals: {
-      costUsd: number(rawTotals["costUsd"]),
-      inputTokens: number(rawTotals["inputTokens"]),
-      outputTokens: number(rawTotals["outputTokens"]),
-    },
-    toolOutputs,
-    adapterState,
-    messageQueue,
-    ...(v["terminal"] === true ? { terminal: true as const } : {}),
-  };
-}
-
 export interface SessionManagerOptions {
   /** 结构化会话事件与原生恢复 ID 的持久化目录。 */
   home?: string | undefined;
@@ -352,6 +215,11 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
 
   private readonly metaFile: string | null;
   private readonly structuredFile: string | null;
+  private readonly sessionDatabaseFile: string | null;
+  private sessionDatabase: SessionDatabase | null = null;
+  private databaseReady: Promise<void> | undefined;
+  private databaseError: SessionError | undefined;
+  private readonly dirtyStructuredIds = new Set<string>();
   private readonly deletedFile: string | null;
   private readonly deletedSessionIds: Set<string>;
   private readonly adapterFactory: (agent: AgentKind, state?: AdapterResumeState) => AgentAdapter;
@@ -378,7 +246,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   private readonly ptySupervisorLauncher: (input: LaunchPtySupervisorInput) => Promise<RemotePtySession>;
   private persistTimer: NodeJS.Timeout | null = null;
   private shuttingDown = false;
-  /** 串行化 structured-sessions.json 的异步写,避免并发写同一 .tmp 互相覆盖。 */
+  /** Serialize dirty-session transactions; old JSON is migration input only. */
   private persistChain: Promise<void> = Promise.resolve();
 
   constructor(opts: SessionManagerOptions = {}) {
@@ -395,6 +263,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     this.metaFile = opts.tmux ? path.join(opts.tmux.home, "pty-sessions.json") : null;
     const home = opts.home ?? opts.tmux?.home;
     this.structuredFile = home ? path.join(home, "structured-sessions.json") : null;
+    this.sessionDatabaseFile = home ? path.join(home, "sessions.sqlite") : null;
     this.deletedFile = home ? path.join(home, "deleted-sessions.json") : null;
     this.deletedSessionIds = this.loadDeletedSessionIds();
     this.structuredSupervisorRoot = home ? path.join(home, "structured-supervisor") : null;
@@ -650,13 +519,17 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   }
 
   private structuredStateExcludes(sid: string): boolean {
-    if (!this.structuredFile) return true;
+    // The immutable legacy file can still contain this ID. Keep its tombstone
+    // until that rollback source is removed rather than re-importing a deletion.
+    if (this.structuredFile && existsSync(this.structuredFile)) return false;
+    if (this.sessionDatabase) return !this.sessionDatabase.hasSession(sid);
+    if (!this.sessionDatabaseFile || !existsSync(this.sessionDatabaseFile)) return true;
+    // PTY-only restoration does not open the central structured archive. An
+    // indexed read can still retire its deleted ID without importing history.
     try {
-      const value: unknown = JSON.parse(readFileSync(this.structuredFile, "utf8"));
-      return Array.isArray(value) && !value.some((state) => state && typeof state === "object" && (state as { id?: unknown }).id === sid);
-    } catch {
-      return false;
-    }
+      const database = new SessionDatabase(this.sessionDatabaseFile, { readOnly: true });
+      try { return !database.hasSession(sid); } finally { database.close(); }
+    } catch { return false; }
   }
 
   private ptyMetaExcludes(sid: string): boolean {
@@ -699,54 +572,60 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     }
   }
 
-  private loadStructuredStates(): StructuredSessionPersistentState[] {
-    if (!this.structuredFile) return [];
-    try {
-      const parsed: unknown = JSON.parse(readFileSync(this.structuredFile, "utf8"));
-      return Array.isArray(parsed)
-        ? parsed.map(parseStructuredState).filter((x): x is StructuredSessionPersistentState => x !== null)
-        : [];
-    } catch {
-      return [];
+  private async ensureSessionDatabase(): Promise<void> {
+    if (!this.sessionDatabaseFile) return;
+    if (!this.databaseReady) this.databaseReady = (async () => {
+      if (this.structuredFile && existsSync(this.structuredFile)) {
+        await migrateLegacySessionFile(this.structuredFile, this.sessionDatabaseFile!, {
+          array: true, excludeSessionIds: this.deletedSessionIds,
+        });
+      }
+      this.sessionDatabase = new SessionDatabase(this.sessionDatabaseFile!);
+      for (const id of this.deletedSessionIds) this.sessionDatabase.deleteSession(id);
+    })();
+    try { await this.databaseReady; }
+    catch {
+      this.databaseError ??= new SessionError("会话历史数据库不可用；旧数据已保留，未恢复中央会话", "storage_unavailable");
+      throw this.databaseError;
     }
   }
 
-  private scheduleStructuredPersist(): void {
-    if (!this.structuredFile || this.shuttingDown || this.persistTimer) return;
+  private scheduleStructuredPersist(sid?: string): void {
+    if (!this.sessionDatabaseFile || this.shuttingDown) return;
+    if (sid) this.dirtyStructuredIds.add(sid);
+    else for (const [id, session] of this.structuredSessions) {
+      if (session instanceof StructuredSession) this.dirtyStructuredIds.add(id);
+    }
+    if (this.persistTimer) return;
     this.persistTimer = setTimeout(() => {
       this.persistTimer = null;
-      void this.persistStructuredNow();
+      void this.persistStructuredNow().catch(() => {
+        // Keep dirty events until a later write or explicit flush can retry.
+      });
     }, 200);
     this.persistTimer.unref?.();
   }
 
   private persistStructuredNow(): Promise<void> {
-    // 闭包内 readonly 字段不会被 TS 收窄,先落局部变量。
-    const file = this.structuredFile;
-    if (!file) return Promise.resolve();
-    if (this.persistTimer) {
-      clearTimeout(this.persistTimer);
-      this.persistTimer = null;
-    }
-    const tmp = `${file}.tmp`;
-    // 串行化异步写盘,一次只落一个版本;不阻塞唯一事件循环。
-    // 这里正是“tmux 越用越卡”的主因:每次结构化事件后同步全量重写
-    // ~40MB 的 structured-sessions.json,写盘越久卡得越明显。
+    if (!this.sessionDatabaseFile) return Promise.resolve();
+    if (this.persistTimer) { clearTimeout(this.persistTimer); this.persistTimer = null; }
     const run = this.persistChain.then(async () => {
-      try {
-        // Supervisor-owned session.json is authoritative for detached sessions.
-        // Keeping it out of this legacy daemon file prevents daemon shutdown
-        // from overwriting/restarting a live owner on the next boot.
-        const states = [...this.structuredSessions.values()]
-          .filter((s): s is StructuredSession => s instanceof StructuredSession)
-          .map((s) => s.persistentState());
-        // 去掉 null,2 美化:文件 0600 私有,体积 40MB→~13MB,写盘和 stringify 都更快。
-        await writeFile(tmp, JSON.stringify(states), { mode: 0o600 });
-        await rename(tmp, file);
-        await chmod(file, 0o600);
-      } catch {
-        // 持久化失败不能打断正在运行的 agent；下一次事件会再次尝试。
+      await this.ensureSessionDatabase();
+      const database = this.sessionDatabase!;
+      for (const id of [...this.dirtyStructuredIds]) {
+        const session = this.structuredSessions.get(id);
+        if (!(session instanceof StructuredSession)) { this.dirtyStructuredIds.delete(id); continue; }
+        try {
+          const state = session.persistentState({ incremental: true });
+          database.saveSession(state);
+          session.acknowledgePersistence(state.evSeq);
+          this.dirtyStructuredIds.delete(id);
+        } catch (error) {
+          // Retain this exact dirty session for the next transaction attempt.
+          throw error;
+        }
       }
+      for (const id of this.deletedSessionIds) database.deleteSession(id);
     });
     this.persistChain = run.catch(() => {});
     return run;
@@ -786,7 +665,9 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       }
     } else if (this.structuredSupervisorRoot) {
       await this.cleanupDeletedSessionDirectories(this.structuredSupervisorRoot);
-      for (const session of await reconnectStructuredSupervisors(this.structuredSupervisorRoot)) {
+      for (const session of await reconnectStructuredSupervisors(this.structuredSupervisorRoot, undefined, {
+        isDeleted: (id) => this.deletedSessionIds.has(id),
+      })) {
         if (this.deletedSessionIds.has(session.id)) {
           await session.dispose();
           continue;
@@ -798,7 +679,21 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
         this.emit("state", this.sessionInfoWithCapabilities(session.info()));
       }
     }
-    for (const loaded of this.loadStructuredStates()) {
+    // Independent detached owners must remain available even if this daemon's
+    // separate legacy import/database is corrupt. A central storage failure
+    // still surfaces explicitly, after those owners have been reattached.
+    try { await this.ensureSessionDatabase(); }
+    catch {
+      // A broken central archive must not take already-live independent owners
+      // or the daemon's phone connection offline. Create/flush still fail closed.
+      console.warn("[sessions] central session storage unavailable; detached owners remain connected");
+      return restored;
+    }
+    for (const id of this.sessionDatabase?.listSessionIds() ?? []) {
+      // Queue bodies must remain complete: partial restoration could silently
+      // drop a user message when the next authoritative queue is persisted.
+      const loaded = this.sessionDatabase!.readSession(id, { events: false, toolOutputs: false, messageQueue: true, maxBytes: Number.MAX_SAFE_INTEGER });
+      if (!loaded) continue;
       if (this.deletedSessionIds.has(loaded.id)) continue;
       // Store 已经落下 worker 交付、但还没来得及 kill 就崩溃时，这里先封存而
       // 不能让 session.start() 接回 native thread 并从 messageQueue 取走一条。
@@ -866,6 +761,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
         "shell_not_allowed",
       );
     }
+    await this.ensureSessionDatabase();
     const cwd = input.cwd ?? os.homedir();
     const kind: SessionKind = input.kind ?? defaultKindFor(input.agent);
     const account = input.accountId
@@ -1292,7 +1188,21 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       ...(approvalPolicy !== undefined ? { approvalPolicy } : {}),
       ...(restored ? { restored } : {}),
       ...(initialAdapterState ? { initialAdapterState } : {}),
+      ...(this.sessionDatabase ? { storage: {
+        historyPage: (options) => this.sessionDatabase!.readEventsPage(id, options),
+        readEvents: () => {
+          const stored = this.sessionDatabase!.readSession(id, { events: true, toolOutputs: false, messageQueue: false, limit: 4000, maxBytes: Number.MAX_SAFE_INTEGER });
+          return { events: stored?.events ?? [], evSeq: stored?.evSeq ?? 0 };
+        },
+        toolOutput: (callId: string) => this.sessionDatabase!.toolOutput(id, callId),
+        saveToolOutput: (callId: string, output: string) => this.sessionDatabase!.saveToolOutput(id, callId, output),
+      } } : {}),
     });
+    if (this.sessionDatabase) {
+      const checkpoint = session.persistentState({ incremental: true });
+      this.sessionDatabase.saveSession(checkpoint);
+      session.acknowledgePersistence(checkpoint.evSeq);
+    }
     this.wireStructuredSession(session);
     return session;
   }
@@ -1301,14 +1211,14 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     session.on("event", (body: AgentEventBody, evSeq: number) => {
       const id = session.id;
       this.emit("agentEvent", id, body, evSeq);
-      this.scheduleStructuredPersist();
+      this.scheduleStructuredPersist(id);
     });
     session.on("state", (info: SessionInfo) => {
       this.emit("state", this.sessionInfoWithCapabilities(info));
-      this.scheduleStructuredPersist();
+      this.scheduleStructuredPersist(session.id);
     });
     if (session instanceof StructuredSession) {
-      session.on("persist", () => this.scheduleStructuredPersist());
+      session.on("persist", () => this.scheduleStructuredPersist(session.id));
     }
   }
 
@@ -1678,7 +1588,12 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
    */
   async disposeAll(): Promise<void> {
     // 先保存“仍然存在”的集合,随后 dispose 产生的 done 状态不能把它们从磁盘抹掉。
-    await this.flushPersistence();
+    try { await this.flushPersistence(); }
+    catch (error) {
+      // An unavailable archive has no live in-process sessions to checkpoint;
+      // it must not prevent detaching clients from independent owners.
+      if (!this.databaseError) throw error;
+    }
     this.shuttingDown = true;
     // create() 返回时 tmux 子进程可能还在和 server 握手。极快地点击“重启”时若
     // 立刻杀 client,session 尚未登记就会丢失；最多等 750ms 让 supervisor 接棒。
@@ -1701,5 +1616,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     const disposals = [...this.structuredSessions.values()].map((s) => s.dispose());
     this.structuredSessions.clear();
     await Promise.allSettled([...ptyDisposals, ...disposals]);
+    this.sessionDatabase?.close();
+    this.sessionDatabase = null;
   }
 }

@@ -4,7 +4,7 @@
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { WebSocket } from "ws";
 import {
   clientHandshakeFinish,
@@ -18,6 +18,7 @@ import {
   type S2CMessage,
 } from "@prospero/protocol";
 import { loadIdentity, mintDevice } from "../src/pairing.js";
+import { CodexAdapter } from "../src/adapters/codex.js";
 import { createDaemonServer, type DaemonServer } from "../src/ws-server.js";
 
 const home = mkdtempSync(path.join(os.tmpdir(), "prospero-test-"));
@@ -1313,27 +1314,32 @@ describe("daemon 全链路", () => {
   }, 20000);
 
   it("usage.get 不带 sid 也要有应答 —— 限流是账号级的", async () => {
-    // 主机页在进任何会话之前就要显示额度。以前 sid 是必填,导致"想看用量
-    // 得先随便开一个会话",而开会话本身就在烧额度。
-    const c = await TestClient.connect(deviceToken, deviceKeys);
-    await c.waitFor((m) => m.type === "hello.ok", "hello.ok");
-    c.send({ type: "usage.get" });
-    const r = await c.waitFor((m) => m.type === "usage.result", "usage.result");
-    const u = r as Extract<S2CMessage, { type: "usage.result" }>;
-    // 不创建会话也要按账号返回来源；Codex 新版可直接读取账号级限流窗口，
-    // 旧 CLI 则保留 available=false 和明确原因。
-    expect(u.sid).toBeUndefined();
-    // 账号列表依赖本机装了哪些 CLI：usage.get 会滤掉 status === "unavailable"
-    // 的 agent（未安装的 CLI 没有额度可展示）。CI runner 上 claude/codex 都不装，
-    // 这里就是空列表，所以不能断言"两个 native 账号一定在"——那只在开发机成立。
-    // 能跨环境成立的契约是：应答里只出现真正可用的账号，且每个都自带来源。
-    const accountIds = u.accounts?.map((account) => account.accountId) ?? [];
-    expect(new Set(accountIds).size).toBe(accountIds.length);
-    for (const account of u.accounts ?? []) {
-      expect(account.source).toMatch(/subscription|api|unknown/);
-      // available=false 必须给出原因，否则手机端卡片会静默空着。
-      if (!account.available) expect(account.reason).toBeTruthy();
-    }
-    c.close();
+    // Keep this encrypted response contract independent of the developer's
+    // installed CLI/account/network. Codex RPC usage has separate fixture tests.
+    const usage = vi.spyOn(CodexAdapter, "readAccountUsage").mockResolvedValue(null);
+    try {
+      // 主机页在进任何会话之前就要显示额度。以前 sid 是必填,导致"想看用量
+      // 得先随便开一个会话",而开会话本身就在烧额度。
+      const c = await TestClient.connect(deviceToken, deviceKeys);
+      await c.waitFor((m) => m.type === "hello.ok", "hello.ok");
+      c.send({ type: "usage.get" });
+      const r = await c.waitFor((m) => m.type === "usage.result", "usage.result");
+      const u = r as Extract<S2CMessage, { type: "usage.result" }>;
+      // 不创建会话也要按账号返回来源；Codex 新版可直接读取账号级限流窗口，
+      // 旧 CLI 则保留 available=false 和明确原因。
+      expect(u.sid).toBeUndefined();
+      // 账号列表依赖本机装了哪些 CLI：usage.get 会滤掉 status === "unavailable"
+      // 的 agent（未安装的 CLI 没有额度可展示）。CI runner 上 claude/codex 都不装，
+      // 这里就是空列表，所以不能断言"两个 native 账号一定在"——那只在开发机成立。
+      // 能跨环境成立的契约是：应答里只出现真正可用的账号，且每个都自带来源。
+      const accountIds = u.accounts?.map((account) => account.accountId) ?? [];
+      expect(new Set(accountIds).size).toBe(accountIds.length);
+      for (const account of u.accounts ?? []) {
+        expect(account.source).toMatch(/subscription|api|unknown/);
+        // available=false 必须给出原因，否则手机端卡片会静默空着。
+        if (!account.available) expect(account.reason).toBeTruthy();
+      }
+      c.close();
+    } finally { usage.mockRestore(); }
   }, 20000);
 });

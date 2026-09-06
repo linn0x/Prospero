@@ -4,6 +4,7 @@
  * attach 时用 chat.snapshot 一次性重放 —— 同样是"秒开",同样支持增量续传。
  */
 import { EventEmitter } from "node:events";
+import type { SessionEventsPage, SessionEventsPageOptions } from "./session-database.js";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
@@ -201,6 +202,40 @@ export interface StructuredSessionOptions {
   attachmentRoot?: string;
   /** Native Session Host-only provider Job registration callback. */
   registerProviderProcess?: ((process: { pid?: number | undefined }) => Promise<void>) | undefined;
+  /** SQLite owner callbacks; history and tool bodies stay off the startup heap. */
+  storage?: StructuredSessionStorage;
+}
+
+export interface StructuredSessionStorage {
+  /** A failed owner write permanently fences future mutations. */
+  assertWritable?(): void;
+  readEvents(): { events: AgentEventBody[]; evSeq: number };
+  historyPage(options: SessionEventsPageOptions): SessionEventsPage;
+  toolOutput(callId: string): { output: string; truncated: boolean } | null;
+  saveToolOutput(callId: string, output: string): void;
+}
+
+/** A recovered disk write must never silently resume a diverged owner cursor. */
+export class StructuredSessionWriteFence {
+  private failure: Error | undefined;
+  constructor(private readonly onFailure?: () => void) {}
+  assertWritable(): void { if (this.failure) throw this.failure; }
+  run<T>(write: () => T): T {
+    this.assertWritable();
+    try { return write(); }
+    catch {
+      this.failure = Object.assign(new Error("会话历史持久化失败；已停止接受新的会话操作"), { code: "session_storage_unavailable" });
+      try { this.onFailure?.(); } catch { /* The fence does not rely on cooperative cancellation. */ }
+      throw this.failure;
+    }
+  }
+}
+
+export interface StructuredHistorySummary {
+  pendingPermissions: Array<{ reqId: string; agentId?: string }>;
+  pendingQuestions: Array<{ reqId: string; agentId?: string }>;
+  subagents: SubagentInfo[];
+  lastTurnCompleted: boolean;
 }
 
 export interface StructuredSessionEvents {
@@ -236,6 +271,8 @@ export interface StructuredSessionPersistentState {
   messageQueue?: QueuedChatPersistent[];
   /** 已终止 worker 的本地审计历史；恢复时不可重启或接受新 chat。 */
   terminal?: true;
+  /** Small materialized state for metadata-only restoration. */
+  historySummary?: StructuredHistorySummary;
 }
 
 export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
@@ -254,11 +291,15 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
   private readonly codexAppServerArgs: string[] | undefined;
   private readonly attachmentRoot: string;
   private readonly registerProviderProcess: ((process: { pid?: number | undefined }) => Promise<void>) | undefined;
+  private readonly storage: StructuredSessionStorage | undefined;
+  private historyLoaded = true;
+  private readonly pendingEvents: AgentEventBody[] = [];
+  private lastTurnCompleted = false;
   private readonly log: AgentEventBody[] = [];
   private evSeq = 0;
   private status: SessionStatus = "starting";
-  private readonly pending = new Set<string>();
-  private readonly pendingQuestions = new Set<string>();
+  private readonly pending = new Map<string, string | undefined>();
+  private readonly pendingQuestions = new Map<string, string | undefined>();
   private readonly subagents = new Map<string, SubagentInfo>();
   private disposed = false;
   private backendAvailable = true;
@@ -295,6 +336,8 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     this.codexAppServerArgs = opts.codexAppServerArgs;
     this.attachmentRoot = opts.attachmentRoot ?? path.join(prosperoHome(), "attachments", this.id);
     this.registerProviderProcess = opts.registerProviderProcess;
+    this.storage = opts.storage;
+    this.historyLoaded = !opts.storage || !opts.restored || opts.restored.events.length > 0;
     const restored = opts.restored;
     if (restored?.terminal) {
       this.status = "done";
@@ -305,10 +348,17 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     this.policy = restored?.approvalPolicy ?? opts.approvalPolicy ?? DEFAULT_POLICY;
     this.adapterState = { ...(opts.initialAdapterState ?? {}) };
     if (restored) {
+      const summary = restored.historySummary ?? deriveStructuredHistorySummary(restored.events);
+      this.lastTurnCompleted = summary.lastTurnCompleted;
       const nativeThreadId =
         typeof restored.adapterState["threadId"] === "string"
           ? restored.adapterState["threadId"]
           : "";
+      // The summary is already a fold of the complete durable log. Do not
+      // apply the loaded suffix a second time (text previews would duplicate).
+      for (const subagent of summary.subagents) {
+        if (subagent.id !== nativeThreadId) this.subagents.set(subagent.id, { ...subagent });
+      }
       const restoredEvents = restored.events.map(normalizeAgentEvent).filter((body) => {
         // 0.0.10 曾给 thread/list 发送本机 app-server 不认识的 ancestorThreadId。
         // Codex 静默忽略后返回父线程自己，旧 daemon 随即把它持久化成了伪子 Agent。
@@ -336,14 +386,14 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
       this.evSeq = restoredEvents.length === restored.events.length
         ? Math.max(restored.evSeq, this.log.length)
         : this.log.length;
-      this.previewRaw = restored.previewRaw;
+      this.previewRaw = restored.previewRaw.slice(0, PREVIEW_RAW_CHARS);
       this.preview = this.previewRaw
         ? latestReplyPreview(this.previewRaw, PREVIEW_CHARS)
         : restored.preview.replace(/^…+/, "").trimStart();
       this.previewMsgId = restored.previewMsgId;
       this.totals = { ...restored.totals };
       this.adapterState = { ...restored.adapterState };
-      this.messageQueue.push(...(restored.messageQueue ?? []).slice(0, MAX_MESSAGE_QUEUE));
+      this.messageQueue.push(...(restored.messageQueue ?? []));
       for (const [callId, output] of restored.toolOutputs.slice(-MAX_TOOL_ENTRIES)) {
         this.toolOutputs.set(callId, output);
       }
@@ -353,14 +403,13 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
 
       // daemon 停止时原生审批 promise/RPC 已经被拒掉,不能在恢复后继续显示成待审批。
       // 补一条 resolved 既保留审计轨迹,也让手机侧卡片回到可读的终态。
-      const unresolved = new Map<string, string | undefined>();
-      const unanswered = new Map<string, string | undefined>();
+      const unresolved = new Map<string, string | undefined>(summary.pendingPermissions.map((item) => [item.reqId, item.agentId]));
+      const unanswered = new Map<string, string | undefined>(summary.pendingQuestions.map((item) => [item.reqId, item.agentId]));
       for (const body of this.log) {
         if (body.kind === "permission.request") unresolved.set(body.reqId, body.agentId);
         else if (body.kind === "permission.resolved") unresolved.delete(body.reqId);
         else if (body.kind === "question.request") unanswered.set(body.reqId, body.agentId);
         else if (body.kind === "question.resolved") unanswered.delete(body.reqId);
-        this.applySubagentEvent(body);
       }
       for (const [reqId, agentId] of unresolved) {
         const resolved: AgentEventBody = {
@@ -371,6 +420,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
         };
         this.evSeq++;
         this.log.push(resolved);
+        if (this.storage) this.pendingEvents.push(resolved);
         this.applySubagentEvent(resolved);
         if (this.log.length > MAX_EVENTS) this.log.shift();
       }
@@ -384,6 +434,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
         };
         this.evSeq++;
         this.log.push(resolved);
+        if (this.storage) this.pendingEvents.push(resolved);
         this.applySubagentEvent(resolved);
         if (this.log.length > MAX_EVENTS) this.log.shift();
       }
@@ -402,6 +453,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
       emit: (body) => this.record(body),
       recordOutput: (callId, output) => this.recordToolOutput(callId, output),
       persistState: (state) => {
+        this.storage?.assertWritable?.();
         // sessionId/threadId 与模型选择可能由不同通知分别到达；浅合并避免后到的
         // 单字段更新把另一半恢复游标抹掉。
         this.adapterState = { ...this.adapterState, ...state };
@@ -429,7 +481,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
         return "idle";
       }
     }
-    return "idle";
+    return this.lastTurnCompleted ? "completed" : "idle";
   }
 
   /** 保留可浏览的历史,但明确标记原生会话这次没有恢复成功。 */
@@ -453,7 +505,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     // 用户很可能是在审批卡片已经挡住会话后切到 YOLO。只影响下一次请求会让
     // 界面显示 YOLO、当前轮次却依旧卡住,看起来就像设置没有生效。
     if (policy === "yolo") {
-      for (const reqId of [...this.pending]) {
+      for (const reqId of [...this.pending.keys()]) {
         await this.adapter.respondPermission(reqId, "once");
       }
     }
@@ -528,6 +580,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
 
   /** 工具输出(应答 tool.output.get);登记时已截断,truncated 标志单独记录 */
   toolOutput(callId: string): { output: string; truncated: boolean } | null {
+    if (this.storage) return this.storage.toolOutput(callId);
     const output = this.toolOutputs.get(callId);
     if (output === undefined) return null;
     return { output, truncated: this.truncatedToolOutputs.has(callId) };
@@ -540,6 +593,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     offset: number,
     length: number,
   ): Promise<{ data: Buffer; total: number; eof: boolean; mimeType: Attachment["mimeType"] } | null> {
+    this.ensureHistoryLoaded();
     const message = [...this.log]
       .reverse()
       .find((body) => body.kind === "user.message" && body.msgId === msgId);
@@ -553,6 +607,14 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
 
   /** 适配器登记工具输出;摘要仍走事件,全文按需拉取 */
   recordToolOutput(callId: string, output: string): void {
+    this.storage?.assertWritable?.();
+    if (this.storage) {
+      // Preserve the complete body in SQLite. The read API applies its own
+      // explicit byte budget and returns the truncation flag to the caller.
+      this.storage.saveToolOutput(callId, output);
+      this.emit("persist");
+      return;
+    }
     if (this.toolOutputs.size > MAX_TOOL_ENTRIES) {
       const oldest = this.toolOutputs.keys().next().value;
       if (oldest !== undefined) {
@@ -572,7 +634,8 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
   }
 
   /** daemon 重启恢复所需的完整本地状态；原生模型上下文由 adapterState 指向。 */
-  persistentState(): StructuredSessionPersistentState {
+  persistentState(options: { incremental?: boolean } = {}): StructuredSessionPersistentState {
+    if (!options.incremental) this.ensureHistoryLoaded();
     return {
       version: 1,
       id: this.id,
@@ -583,7 +646,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
       ...(this.accountName ? { accountName: this.accountName } : {}),
       createdAt: this.createdAt,
       approvalPolicy: this.policy,
-      events: [...this.log],
+      events: [...(options.incremental && this.storage ? this.pendingEvents : this.log)],
       evSeq: this.evSeq,
       preview: this.preview,
       previewRaw: this.previewRaw,
@@ -597,12 +660,35 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
         ? { truncatedToolOutputs: [...this.truncatedToolOutputs] }
         : {}),
       adapterState: { ...this.adapterState },
+      historySummary: {
+        pendingPermissions: [...this.pending].map(([reqId, agentId]) => ({ reqId, ...(agentId ? { agentId } : {}) })),
+        pendingQuestions: [...this.pendingQuestions].map(([reqId, agentId]) => ({ reqId, ...(agentId ? { agentId } : {}) })),
+        subagents: [...this.subagents.values()].map((value) => ({ ...value })),
+        lastTurnCompleted: this.lastTurnCompleted,
+      },
       messageQueue: this.messageQueue.map((item) => ({
         ...item,
         attachments: item.attachments.map((attachment) => ({ ...attachment })),
       })),
       ...(this.disposed ? { terminal: true as const } : {}),
     };
+  }
+
+  /** Clear only the events covered by a successful SQLite transaction. */
+  acknowledgePersistence(evSeq: number): void {
+    const first = this.evSeq - this.pendingEvents.length + 1;
+    this.pendingEvents.splice(0, Math.max(0, evSeq - first + 1));
+  }
+
+  private ensureHistoryLoaded(): void {
+    if (this.historyLoaded || !this.storage) return;
+    const stored = this.storage.readEvents();
+    const memoryFirst = this.evSeq - this.log.length + 1;
+    const storedFirst = stored.evSeq - stored.events.length + 1;
+    const prefix = stored.events.slice(0, Math.max(0, memoryFirst - storedFirst));
+    const events = [...prefix, ...this.log].slice(-MAX_EVENTS);
+    this.log.splice(0, this.log.length, ...events);
+    this.historyLoaded = true;
   }
 
   get resumeState(): AdapterResumeState {
@@ -693,11 +779,19 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
 
   /** attach 用:全量事件历史 + 当前 evSeq */
   snapshot(): { events: AgentEventBody[]; evSeq: number } {
+    this.ensureHistoryLoaded();
     return { events: [...this.log], evSeq: this.evSeq };
+  }
+
+  /** Explicit byte-bounded history access; full bodies remain in SQLite. */
+  historyPage(options: SessionEventsPageOptions = {}): SessionEventsPage {
+    if (!this.storage) throw new Error("会话尚未切换历史分页存储");
+    return this.storage.historyPage(options);
   }
 
   /** attach 传输用：保持最终聊天状态等价，同时压掉高频增量与进度摘要。 */
   transportSnapshot(): { events: AgentEventBody[]; evSeq: number } {
+    this.ensureHistoryLoaded();
     return { events: compactAgentSnapshotEvents(this.log), evSeq: this.evSeq };
   }
 
@@ -709,6 +803,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
   async subagentSnapshot(
     subagentId: string,
   ): Promise<{ subagent: SubagentInfo; events: AgentEventBody[]; evSeq: number }> {
+    this.ensureHistoryLoaded();
     const subagent = this.subagents.get(subagentId);
     if (!subagent) throw new Error("子 Agent 已不存在");
     const stored = this.log.filter(
@@ -747,6 +842,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
 
   /** 增量续传:返回 afterSeq 之后的事件;历史已被截断时返回 null(需全量快照) */
   since(afterSeq: number): AgentEventBody[] | null {
+    this.ensureHistoryLoaded();
     if (afterSeq > this.evSeq) return null;
     const oldest = this.evSeq - this.log.length + 1;
     if (afterSeq + 1 < oldest && afterSeq < this.evSeq) return null;
@@ -756,6 +852,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
 
   private record(body: AgentEventBody): void {
     if (this.disposed) return;
+    this.storage?.assertWritable?.();
     body = normalizeAgentEvent(body);
     let titleChanged = false;
     if (
@@ -772,6 +869,11 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     }
     this.evSeq++;
     this.log.push(body);
+    if (this.storage) this.pendingEvents.push(body);
+    if (!("agentId" in body) || body.agentId === undefined) {
+      if (body.kind === "turn.end" || body.kind === "agent.error") this.lastTurnCompleted = true;
+      else if (body.kind === "user.message") this.lastTurnCompleted = false;
+    }
     if (this.log.length > MAX_EVENTS) this.log.shift();
     this.applySubagentEvent(body);
 
@@ -788,7 +890,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
 
     // 审批状态直接驱动会话状态,列表里才能把"待审批"置顶
     if (body.kind === "permission.request") {
-      this.pending.add(body.reqId);
+      this.pending.set(body.reqId, body.agentId);
       this.setStatus("waiting_approval");
     } else if (body.kind === "permission.resolved") {
       this.pending.delete(body.reqId);
@@ -796,7 +898,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
         this.setStatus(this.pendingQuestions.size > 0 ? "waiting_input" : "running");
       }
     } else if (body.kind === "question.request") {
-      this.pendingQuestions.add(body.reqId);
+      this.pendingQuestions.set(body.reqId, body.agentId);
       if (this.pending.size === 0) this.setStatus("waiting_input");
     } else if (body.kind === "question.resolved") {
       this.pendingQuestions.delete(body.reqId);
@@ -830,7 +932,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     }
     if (body.kind === "text.delta" || body.kind === "subagent.updated") this.schedulePreviewState();
     this.emit("event", body, this.evSeq);
-    if (body.kind === "turn.end" || body.kind === "agent.error") void this.drainQueue();
+    if (body.kind === "turn.end" || body.kind === "agent.error") void this.drainQueue().catch(() => { /* A storage fence leaves the remaining queue untouched. */ });
   }
 
   private setStatus(s: SessionStatus): void {
@@ -867,6 +969,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     delivery: ChatDelivery = "auto",
   ): Promise<void> {
     if (this.disposed) throw new Error("会话已经结束，历史只读");
+    this.storage?.assertWritable?.();
     if (!this.backendAvailable) throw new Error("会话后端未恢复;重启 daemon 后会再次尝试");
     this.assertImageInputAllowed(attachments?.length ?? 0);
     const busy =
@@ -885,6 +988,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
         try {
           const forAdapter = await this.queuedAttachmentsForAdapter(queued);
           const prepared = await this.prepareForAdapter(queued.outgoingText);
+          this.storage?.assertWritable?.();
           const steered =
             (await this.adapter.steer?.(prepared.text, forAdapter, prepared.skills)) ?? false;
           if (steered) {
@@ -907,6 +1011,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
   /** 取消尚未发给 agent 的消息。已经 steer/发送的内容不能假装撤回。 */
   removeQueued(queueId: string): boolean {
     if (this.disposed) return false;
+    this.storage?.assertWritable?.();
     const index = this.messageQueue.findIndex((item) => item.id === queueId);
     if (index < 0) return false;
     this.messageQueue.splice(index, 1);
@@ -921,6 +1026,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
    */
   async guideQueued(queueId: string): Promise<boolean> {
     if (this.disposed) throw new Error("会话已经结束，历史只读");
+    this.storage?.assertWritable?.();
     if (!this.backendAvailable) throw new Error("会话后端未恢复;无法发送引导");
     if (this.drainingQueue) throw new Error("队列正在发送，请稍后再试");
     const initial = this.messageQueue.find((item) => item.id === queueId);
@@ -938,6 +1044,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
         try {
           const attachments = await this.queuedAttachmentsForAdapter(initial);
           const prepared = await this.prepareForAdapter(initial.outgoingText);
+          this.storage?.assertWritable?.();
           steered =
             (await this.adapter.steer?.(prepared.text, attachments, prepared.skills)) ?? false;
         } catch {
@@ -945,6 +1052,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
         }
       }
 
+      this.storage?.assertWritable?.();
       const index = this.messageQueue.findIndex((item) => item.id === queueId);
       if (index < 0) {
         // 另一个客户端可能在 RPC 等待期间点了删除；已经 steer 成功的内容无法撤回，
@@ -966,7 +1074,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     } finally {
       this.drainingQueue = false;
       // steer 期间原轮可能已结束；失败时立即把队首消息作为下一轮发出。
-      void this.drainQueue();
+      void this.drainQueue().catch(() => { /* A storage fence leaves the remaining queue untouched. */ });
     }
   }
 
@@ -989,6 +1097,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     this.setStatus("running");
     const prepared = await this.prepareForAdapter(outgoing);
     try {
+      this.storage?.assertWritable?.();
       await this.adapter.send(prepared.text, forAdapter, prepared.skills);
     } catch (error) {
       this.record({
@@ -1040,6 +1149,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
   }
 
   private enqueue(item: QueuedChatPersistent, front: boolean): void {
+    this.storage?.assertWritable?.();
     if (this.messageQueue.length >= MAX_MESSAGE_QUEUE) {
       throw new Error(`消息队列已满（最多 ${String(MAX_MESSAGE_QUEUE)} 条）`);
     }
@@ -1090,6 +1200,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     // prepare/附件读取中可能有外部 control RPC 同步封存 session。不能在那个
     // await 间隙之后继续把旧 worktree 的队列消息交给原生 adapter。
     if (this.disposed || !this.backendAvailable) return;
+    this.storage?.assertWritable?.();
     await this.adapter.send(prepared.text, attachments, prepared.skills);
   }
 
@@ -1121,6 +1232,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
         (this.status === "idle" || this.status === "completed") &&
         this.messageQueue.length > 0
       ) {
+        this.storage?.assertWritable?.();
         const item = this.messageQueue.shift();
         if (!item) break;
         this.emit("state", this.info());
@@ -1233,58 +1345,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
   }
 
   private applySubagentEvent(body: AgentEventBody): void {
-    if (body.kind === "subagent.started") {
-      this.subagents.set(body.subagent.id, { ...body.subagent });
-      return;
-    }
-    if (body.kind === "subagent.updated") {
-      const previous = this.subagents.get(body.subagentId);
-      if (!previous) return;
-      this.subagents.set(body.subagentId, {
-        ...previous,
-        status: body.status,
-        updatedAt: Date.now(),
-        ...(body.canMessage !== undefined ? { canMessage: body.canMessage } : {}),
-        ...(body.summary ? { preview: latestReplyPreview(body.summary, 220) } : {}),
-      });
-      return;
-    }
-    if (body.kind === "text.delta" && body.agentId) {
-      const previous = this.subagents.get(body.agentId);
-      if (!previous) return;
-      this.subagents.set(body.agentId, {
-        ...previous,
-        status: previous.status === "starting" ? "running" : previous.status,
-        updatedAt: Date.now(),
-        preview: latestReplyPreview(`${previous.preview ?? ""}${body.delta}`, 220),
-      });
-      return;
-    }
-    if (
-      (body.kind === "question.request" || body.kind === "permission.request") &&
-      body.agentId
-    ) {
-      const previous = this.subagents.get(body.agentId);
-      if (!previous) return;
-      this.subagents.set(body.agentId, {
-        ...previous,
-        status: "waiting_input",
-        updatedAt: Date.now(),
-      });
-      return;
-    }
-    if (
-      (body.kind === "question.resolved" || body.kind === "permission.resolved") &&
-      body.agentId
-    ) {
-      const previous = this.subagents.get(body.agentId);
-      if (!previous) return;
-      this.subagents.set(body.agentId, {
-        ...previous,
-        status: "running",
-        updatedAt: Date.now(),
-      });
-    }
+    applySubagentHistoryEvent(this.subagents, body);
   }
 
   async interrupt(): Promise<void> {
@@ -1302,13 +1363,15 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     // 先把会话封存为 done，再等待原生 adapter 释放。worker 的 control RPC 可能
     // 正由 adapter 自己承载；若此处等待形成自杀式死锁，SessionManager 仍能立即
     // 落盘只读终态，避免重启后消费旧 worktree 的排队消息。
-    this.setStatus("done");
+    let stateError: unknown;
+    try { this.setStatus("done"); } catch (error) { stateError = error; }
     // Callers that own an external containment boundary (the Windows Session
     // Host Job) need the real adapter failure so they can preserve it while
     // still running their finally cleanup.  The session is terminal either
     // way, and listeners must not leak if disposal rejects.
     try { await this.adapter.dispose(); }
     finally { this.removeAllListeners(); }
+    if (stateError) throw stateError;
   }
 }
 
@@ -1346,4 +1409,97 @@ export function latestReplyPreview(src: string, max = PREVIEW_CHARS): string {
   const boundary = head.lastIndexOf(" ");
   if (boundary > max - 24) head = head.slice(0, boundary);
   return `${head.trimEnd()}…`;
+}
+
+function applySubagentHistoryEvent(subagents: Map<string, SubagentInfo>, body: AgentEventBody): void {
+  if (body.kind === "subagent.started") {
+    subagents.set(body.subagent.id, { ...body.subagent });
+    return;
+  }
+  if (body.kind === "subagent.updated") {
+    const previous = subagents.get(body.subagentId);
+    if (!previous) return;
+    subagents.set(body.subagentId, {
+      ...previous,
+      status: body.status,
+      updatedAt: Date.now(),
+      ...(body.canMessage !== undefined ? { canMessage: body.canMessage } : {}),
+      ...(body.summary ? { preview: latestReplyPreview(body.summary, 220) } : {}),
+    });
+    return;
+  }
+  if (body.kind === "text.delta" && body.agentId) {
+    const previous = subagents.get(body.agentId);
+    if (!previous) return;
+    subagents.set(body.agentId, {
+      ...previous,
+      status: previous.status === "starting" ? "running" : previous.status,
+      updatedAt: Date.now(),
+      preview: latestReplyPreview(`${previous.preview ?? ""}${body.delta}`, 220),
+    });
+    return;
+  }
+  if (
+    (body.kind === "question.request" || body.kind === "permission.request") &&
+    body.agentId
+  ) {
+    const previous = subagents.get(body.agentId);
+    if (!previous) return;
+    subagents.set(body.agentId, {
+      ...previous,
+      status: "waiting_input",
+      updatedAt: Date.now(),
+    });
+    return;
+  }
+  if (
+    (body.kind === "question.resolved" || body.kind === "permission.resolved") &&
+    body.agentId
+  ) {
+    const previous = subagents.get(body.agentId);
+    if (!previous) return;
+    subagents.set(body.agentId, {
+      ...previous,
+      status: "running",
+      updatedAt: Date.now(),
+    });
+  }
+}
+
+/** Incremental fold shared by streaming imports and metadata restoration. */
+export function createStructuredHistorySummaryAccumulator(): {
+  push(body: AgentEventBody): void;
+  snapshot(): StructuredHistorySummary;
+} {
+  const permissions = new Map<string, string | undefined>();
+  const questions = new Map<string, string | undefined>();
+  const subagents = new Map<string, SubagentInfo>();
+  let lastTurnCompleted = false;
+  const interactions = (values: Map<string, string | undefined>) => [...values].map(([reqId, agentId]) => ({
+    reqId, ...(agentId ? { agentId } : {}),
+  }));
+  return {
+    push(body) {
+      if (body.kind === "permission.request") permissions.set(body.reqId, body.agentId);
+      else if (body.kind === "permission.resolved") permissions.delete(body.reqId);
+      else if (body.kind === "question.request") questions.set(body.reqId, body.agentId);
+      else if (body.kind === "question.resolved") questions.delete(body.reqId);
+      if (!("agentId" in body) || body.agentId === undefined) {
+        if (body.kind === "turn.end" || body.kind === "agent.error") lastTurnCompleted = true;
+        else if (body.kind === "user.message") lastTurnCompleted = false;
+      }
+      applySubagentHistoryEvent(subagents, body);
+    },
+    snapshot: () => ({
+      pendingPermissions: interactions(permissions), pendingQuestions: interactions(questions),
+      subagents: [...subagents.values()].map((value) => ({ ...value })), lastTurnCompleted,
+    }),
+  };
+}
+
+/** Derived during legacy import so startup never needs to materialize bodies. */
+export function deriveStructuredHistorySummary(events: readonly AgentEventBody[]): StructuredHistorySummary {
+  const summary = createStructuredHistorySummaryAccumulator();
+  for (const body of events) summary.push(body);
+  return summary.snapshot();
 }

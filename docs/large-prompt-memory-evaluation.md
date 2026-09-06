@@ -101,4 +101,4 @@ Measure cold-open and next-page p50/p95, event-loop stalls, peak JS heap and nat
 
 Run final UI memory measurements on the actual iPhone using Hermes/native instrumentation. The Node codec regression and RN-web layout checks cannot stand in for that measurement. If the reported OOM is inside the underlying coding agent's model context handling, Prospero's history database does not by itself solve that separate problem.
 
-Status: codec allocation fix implemented; SQLite, paged history, body references, draft coalescing, and device memory profiling remain proposed follow-up work.
+Status: codec allocation fix and daemon SQLite persistence migration are implemented. See [SQLite session storage](sqlite-session-storage.md) for the actual schema, compatibility boundaries, migration/recovery behavior, and measured memory results. Client history pagination, event-body references, draft coalescing, and device memory profiling remain follow-up work.
