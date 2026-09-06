@@ -2,6 +2,7 @@ import type { HostInfo, SessionInfo } from "@prospero/protocol";
 
 import { groupSessionsByProject, type SessionProject } from "./session-projects";
 import { sortSessions } from "./store";
+import { recentSessionSummary, recentSessionTime, type RecentSession } from "./recent-sessions";
 
 /** 地址簿刷新时保持用户选择；只有设备确实消失时才回退到第一台。 */
 export function resolveHomeHostSelection(
@@ -83,14 +84,20 @@ export function compactWorkspacePath(value: string): string {
   return joinWorkspacePath(root, parts);
 }
 
-/** 最近会话严格按创建时间排列，不让运行优先级改变“最近”的含义。 */
+/** 最近打开/实际活动优先；没有使用记录的旧客户端才回退到创建时间。 */
 export function homeRecentSessions(
   sessions: Record<string, SessionInfo> | undefined,
   limit: number,
+  recent: Readonly<Record<string, RecentSession>> = {},
 ): SessionInfo[] {
   return Object.values(sessions ?? {})
-    .sort((a, b) => b.createdAt - a.createdAt || b.id.localeCompare(a.id))
+    .sort((a, b) => recentSessionTime(b, recent[b.id]) - recentSessionTime(a, recent[a.id])
+      || b.createdAt - a.createdAt || b.id.localeCompare(a.id))
     .slice(0, Math.max(0, limit));
+}
+
+export function homeRecentSummary(session: SessionInfo, recent?: RecentSession): string {
+  return recentSessionSummary(session.preview) || recent?.summary || "尚无内容摘要";
 }
 
 const LIVE_SESSION_STATUSES = new Set<SessionInfo["status"]>([
