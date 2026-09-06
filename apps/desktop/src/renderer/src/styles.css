@@ -125,13 +125,18 @@
   --overlay: #ffffff;
   --scrim: #17203366;
   --shadow: 0 18px 50px #24345117;
-  --chrome-glass: color-mix(in srgb, var(--sidebar) 36%, transparent);
+  --chrome-glass: color-mix(in srgb, var(--sidebar) 30%, transparent);
   --chrome-highlight: #ffffff66;
   --overlay-glass: color-mix(in srgb, var(--popover) 84%, transparent);
   --glass-border: color-mix(in srgb, var(--foreground) 12%, transparent);
   --glass-filter: blur(18px) saturate(125%);
   --glass-shadow: 0 18px 48px #24345124;
   --glass-scrim: #1720332e;
+  --liquid-fill: color-mix(in srgb, var(--surface-1) 76%, transparent);
+  --liquid-edge: #ffffffb8;
+  --liquid-light: #ffffff8c;
+  --liquid-shadow: #1d305c1c;
+  --liquid-tint: color-mix(in srgb, var(--primary) 14%, transparent);
   --background: var(--bg);
   --foreground: var(--text);
   --card: var(--surface-1);
@@ -213,12 +218,17 @@
   --secondary: var(--surface-2);
   --input: var(--border-strong);
   --shadow: 0 22px 64px #0000006e;
-  --chrome-glass: color-mix(in srgb, var(--sidebar) 46%, transparent);
-  --chrome-highlight: #ffffff0d;
+  --chrome-glass: color-mix(in srgb, var(--sidebar) 36%, transparent);
+  --chrome-highlight: #ffffff1f;
   --overlay-glass: color-mix(in srgb, var(--popover) 86%, transparent);
   --glass-border: color-mix(in srgb, var(--foreground) 18%, transparent);
   --glass-shadow: 0 22px 58px #00000080;
   --glass-scrim: #050a127a;
+  --liquid-fill: color-mix(in srgb, var(--surface-raised) 76%, transparent);
+  --liquid-edge: #ffffff38;
+  --liquid-light: #ffffff38;
+  --liquid-shadow: #02081540;
+  --liquid-tint: color-mix(in srgb, var(--primary) 22%, transparent);
   --sidebar: #111a29;
   --sidebar-foreground: #edf2fb;
   --sidebar-primary: #6d92ff;
@@ -1239,6 +1249,10 @@ kbd {
   box-shadow: inset 0 1px 0 var(--chrome-highlight);
 }
 .desktop-topbar { border-bottom: 1px solid var(--glass-border); }
+.prospero-sidebar [data-slot="sidebar-inner"] {
+  background-image: linear-gradient(118deg, var(--chrome-highlight), transparent 46%, #8ab5ff06);
+  box-shadow: inset -1px 0 0 var(--glass-border), inset 0 1px 0 var(--chrome-highlight);
+}
 :root[data-native-glass="true"],
 :root[data-native-glass="true"] body,
 :root[data-native-glass="true"] .prospero-shell,
@@ -1262,6 +1276,100 @@ kbd {
 }
 
 .glass-scrim { background: var(--glass-scrim); }
+
+/* Interactive material stays on controls and floating surfaces. These two
+   decorative layers never receive input; pointer movement updates only the
+   hovered surface, once per frame, with no persistent animation or GPU hint. */
+[data-liquid-glass] {
+  --liquid-x: 50%;
+  --liquid-y: 50%;
+  --liquid-active: 0;
+  --liquid-resting: 0;
+  isolation: isolate;
+}
+:is([data-liquid-glass="nav"], [data-liquid-glass="control"], [data-liquid-glass="tab"]) {
+  position: relative;
+}
+[data-liquid-glass]::before,
+[data-liquid-glass]::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  -webkit-app-region: no-drag;
+}
+[data-liquid-glass]::before {
+  background: radial-gradient(ellipse 130px 85px at var(--liquid-x) var(--liquid-y), var(--liquid-light), transparent 78%);
+  opacity: var(--liquid-active);
+  transition: opacity 180ms ease-out;
+}
+[data-liquid-glass]::after {
+  border: 1px solid var(--liquid-edge);
+  box-shadow: inset 0 1px 0 #ffffff24, inset 0 -1px 0 #00000012;
+  opacity: max(var(--liquid-active), var(--liquid-resting));
+  transition: opacity 180ms ease-out;
+}
+.prospero-sidebar [data-liquid-glass="nav"] {
+  min-height: 38px;
+  border-radius: 13px;
+  transition: background-color 160ms ease, box-shadow 180ms ease, transform 180ms cubic-bezier(.2,.8,.2,1);
+}
+.prospero-sidebar [data-liquid-glass="nav"][data-active] {
+  --liquid-resting: 1;
+  color: var(--sidebar-foreground);
+  background-color: var(--liquid-tint);
+  background-image: linear-gradient(125deg, #ffffff1f, transparent 65%);
+  box-shadow: 0 3px 9px var(--liquid-shadow), inset 0 1px 0 var(--chrome-highlight);
+}
+.liquid-button {
+  --liquid-resting: 1;
+  border-radius: 999px;
+  border-color: transparent;
+  background-color: var(--liquid-fill);
+  background-image: linear-gradient(145deg, #ffffff24, transparent 65%);
+  box-shadow: 0 4px 12px var(--liquid-shadow), inset 0 1px 0 var(--chrome-highlight);
+  transition: transform 180ms cubic-bezier(.2,.8,.2,1), box-shadow 180ms ease, background-color 180ms ease;
+}
+.liquid-button.liquid-primary {
+  --liquid-edge: #ffffff52;
+  --liquid-light: #ffffff47;
+  min-height: 34px;
+  padding-inline: 14px;
+  color: var(--primary-foreground);
+  background-color: var(--primary);
+  background-image: linear-gradient(160deg, #ffffff28, transparent 60%, #18357716);
+  box-shadow: 0 4px 12px color-mix(in srgb, var(--primary) 22%, transparent), inset 0 1px 0 #ffffff4d;
+}
+.workspace-tab.is-active [data-liquid-glass="tab"] { --liquid-resting: .6; }
+[data-liquid-glass="tab"] { border-radius: 9px; }
+[data-liquid-glass="panel"] {
+  --liquid-resting: 1;
+  background-image: linear-gradient(145deg, #ffffff0d, transparent 38%, #172c5808);
+}
+[data-liquid-glass="panel"]::before {
+  background: radial-gradient(ellipse 240px 160px at var(--liquid-x) var(--liquid-y), var(--chrome-highlight), transparent 80%);
+}
+:is([data-liquid-glass="nav"], .liquid-button):focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 3px;
+}
+@media (hover: hover) and (pointer: fine) and (prefers-reduced-motion: no-preference) {
+  .liquid-button:not(:disabled):not([aria-disabled="true"]):hover {
+    transform: translateY(-1px);
+    box-shadow: 0 6px 16px var(--liquid-shadow), inset 0 1px 0 var(--liquid-edge);
+  }
+  :is([data-liquid-glass="nav"], .liquid-button):not(:disabled):not([aria-disabled="true"]):active {
+    transform: translateY(1px) scale(.985);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-liquid-glass], [data-liquid-glass]::before, [data-liquid-glass]::after {
+    transition: none !important;
+    animation: none !important;
+  }
+  [data-liquid-glass]::before { display: none; }
+}
 
 @supports ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
   .overlay-glass,
@@ -1289,7 +1397,17 @@ kbd {
   --chrome-highlight: transparent;
   --glass-border: var(--border-strong);
   --glass-scrim: var(--scrim);
+  --liquid-fill: var(--secondary);
+  --liquid-tint: var(--sidebar-accent);
 }
+:root:is([data-reduced-transparency="true"], [data-high-contrast="true"]) [data-liquid-glass] {
+  background-image: none;
+  box-shadow: none;
+  transform: none;
+}
+:root:is([data-reduced-transparency="true"], [data-high-contrast="true"]) [data-liquid-glass]::before,
+:root:is([data-reduced-transparency="true"], [data-high-contrast="true"]) [data-liquid-glass]::after { display: none; }
+:root:is([data-reduced-transparency="true"], [data-high-contrast="true"]) .liquid-button { border-color: var(--border-strong); }
 @media (prefers-reduced-transparency: reduce), (prefers-contrast: more), (forced-colors: active) {
   :root, :root[data-theme] {
     --chrome-glass: var(--sidebar);
@@ -1298,7 +1416,12 @@ kbd {
     --chrome-highlight: transparent;
     --glass-border: var(--border-strong);
     --glass-scrim: var(--scrim);
+    --liquid-fill: var(--secondary);
+    --liquid-tint: var(--sidebar-accent);
   }
+  [data-liquid-glass] { background-image: none !important; box-shadow: none !important; transform: none !important; }
+  [data-liquid-glass]::before, [data-liquid-glass]::after { display: none; }
+  .liquid-button { border-color: var(--border-strong); }
 }
 
 @media (max-width: 900px) {
