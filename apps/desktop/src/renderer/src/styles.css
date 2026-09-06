@@ -411,8 +411,8 @@ input:not([data-slot]), textarea:not([data-slot]), select:not([data-slot]) { bac
 }
 .sidebar-shell-header button { -webkit-app-region: no-drag; }
 .sidebar-header-toggle {
-  width: 30px;
-  height: 30px;
+  width: 28px;
+  height: 28px;
   flex: none;
   color: color-mix(in srgb, var(--sidebar-foreground) 72%, var(--sidebar));
   background: color-mix(in srgb, var(--sidebar-foreground) 6%, var(--sidebar));
@@ -763,13 +763,13 @@ kbd {
 .daemon-agent-row:last-child { border-bottom: 0; }
 .daemon-agent-row [data-slot="avatar"] { width: 28px; height: 28px; }
 .daemon-agent-row [data-slot="avatar-fallback"] { background: var(--muted); }
-[data-collapsible="icon"] .prospero-sidebar .sidebar-shell-header { justify-content: center; padding-right: 16px; padding-left: 16px; }
+[data-collapsible="icon"] .prospero-sidebar .sidebar-shell-header { justify-content: center; padding-right: 12px; padding-left: 12px; }
 [data-collapsible="icon"] .prospero-sidebar .sidebar-detail-section { display: none; }
-[data-collapsible="icon"] .prospero-sidebar [data-sidebar="group"] { padding-right: 16px; padding-left: 16px; }
+[data-collapsible="icon"] .prospero-sidebar [data-sidebar="group"] { padding-right: 12px; padding-left: 12px; }
 [data-collapsible="icon"] .prospero-sidebar [data-sidebar="menu-item"] { display: flex; justify-content: center; }
 [data-collapsible="icon"] .prospero-sidebar .sidebar-nav-fixed [data-sidebar="group-label"] { margin-top: -24px; }
-[data-collapsible="icon"] .prospero-sidebar [data-sidebar="menu-button"] { width: 36px !important; height: 36px !important; padding: 8px !important; }
-[data-collapsible="icon"] .prospero-sidebar [data-sidebar="menu-button"] > svg { width: 17px; height: 17px; }
+[data-collapsible="icon"] .prospero-sidebar [data-sidebar="menu-button"] { width: 32px !important; height: 32px !important; padding: 7px !important; }
+[data-collapsible="icon"] .prospero-sidebar [data-sidebar="menu-button"] > svg { width: 16px; height: 16px; }
 [data-collapsible="icon"] .prospero-sidebar .sidebar-footer-actions { grid-template-columns: minmax(0, 1fr); }
 .session-agent-icon { display: grid; width: 15px; height: 15px; flex: none; place-items: center; color: var(--muted-foreground); }
 .session-agent-icon .agent-logo { display: block; width: 15px; height: 15px; }
