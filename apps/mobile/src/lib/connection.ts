@@ -168,6 +168,14 @@ export class HostConnection {
   private queue = new BoundedQueue<C2SMessage>(MAX_OFFLINE_QUEUE);
   private racingAttempts: ManagedAttempt<Won>[] | null = null;
   private readonly sessionCreates = new SessionCreateTracker();
+  /**
+   * A cold session route can request the same chat twice: the route asks for
+   * missing session metadata, then ChatView asks for the chat snapshot when it
+   * mounts. Keep the last request per socket so that duplicate attaches do not
+   * make the daemon replay and decode the history twice.
+   * null means a full snapshot (no cursor).
+   */
+  private attachedChatSessions = new Map<string, number | null>();
 
   constructor(
     readonly host: StoredHost,
@@ -301,6 +309,7 @@ export class HostConnection {
     this.ws?.close();
     this.ws = null;
     this.channel = null;
+    this.attachedChatSessions.clear();
     this.activeAddr = null;
     this.activePath = null;
     this.queue.clear();
@@ -697,6 +706,7 @@ export class HostConnection {
     this.diagnosis = null;
     this.ws = won.ws;
     this.channel = won.channel;
+    this.attachedChatSessions.clear();
     this.fatalReceiveError = null;
     this.activeAddr = won.endpoint;
     this.activePath = won.path;
@@ -1278,6 +1288,7 @@ export class HostConnection {
     this.clearTimers();
     this.ws = null;
     this.channel = null;
+    this.attachedChatSessions.clear();
     this.activeAddr = null;
     this.activePath = null;
     if (this.stopped) return;
@@ -1394,6 +1405,12 @@ export class HostConnection {
   private attachStartedAt = new Map<string, number>();
 
   attach(sid: string, lastSeq?: number): void {
+    const requested = lastSeq ?? null;
+    const previous = this.attachedChatSessions.get(sid);
+    if (previous === null || (previous !== undefined && requested !== null && requested <= previous)) {
+      return;
+    }
+    this.attachedChatSessions.set(sid, requested);
     this.attachStartedAt.set(sid, Date.now());
     this.send({ type: "session.attach", sid, ...(lastSeq !== undefined ? { lastSeq } : {}) });
   }
