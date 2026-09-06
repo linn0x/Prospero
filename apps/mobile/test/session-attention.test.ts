@@ -11,9 +11,15 @@ vi.mock("@react-native-async-storage/async-storage", () => ({
 }));
 
 import {
+  completionBaselineHostKey,
   deviceAttentionMotion,
+  readCompletedSessions,
+  sessionHasUnreadCompletion,
+  sessionNeedsLocatorMotion,
+  sessionRequiresApproval,
   sessionCompletionFingerprint,
   sessionCompletionReadKey,
+  unreadCompletedSessionCount,
 } from "../src/lib/session-attention";
 
 function session(
@@ -80,5 +86,47 @@ describe("session attention", () => {
     expect(deviceAttentionMotion("pc", {
       completed: session("completed", "completed"),
     }, null)).toBeNull();
+  });
+
+  it("baselines historical completions and only raises later completions", () => {
+    const historical = session("historical", "completed", { preview: "old" });
+    const reads = readCompletedSessions("pc", { historical }, {});
+
+    expect(completionBaselineHostKey("pc/desk")).toBe("pc%2Fdesk");
+    expect(unreadCompletedSessionCount("pc", { historical }, reads)).toBe(0);
+    expect(deviceAttentionMotion("pc", { historical }, reads, true)).toBeNull();
+
+    const newlyCompleted = session("new", "completed", { preview: "new" });
+    expect(unreadCompletedSessionCount("pc", { historical, newlyCompleted }, reads)).toBe(1);
+    expect(deviceAttentionMotion("pc", { historical, newlyCompleted }, reads, true))
+      .toBe("unread-completed");
+    expect(deviceAttentionMotion("pc", { historical, newlyCompleted }, reads, false)).toBeNull();
+  });
+
+  it("marks every completion read while keeping approval and locator predicates precise", () => {
+    const first = session("first", "completed", { preview: "first" });
+    const second = session("second", "completed", { preview: "second" });
+    const approval = session("approval", "idle", { pendingPermissions: 1 });
+    const question = session("question", "waiting_input", { pendingQuestions: 1 });
+
+    expect(unreadCompletedSessionCount("pc", { first, second }, {})).toBe(2);
+    const reads = readCompletedSessions("pc", { first, second }, {});
+    expect(unreadCompletedSessionCount("pc", { first, second }, reads)).toBe(0);
+    expect(sessionRequiresApproval(approval)).toBe(true);
+    expect(sessionRequiresApproval(question)).toBe(false);
+    expect(sessionHasUnreadCompletion("pc", first, reads, true)).toBe(false);
+    expect(sessionNeedsLocatorMotion("pc", first, reads, true)).toBe(false);
+    expect(sessionNeedsLocatorMotion("pc", second, {}, false)).toBe(false);
+    expect(sessionNeedsLocatorMotion("pc", approval, reads, true)).toBe(true);
+    expect(sessionNeedsLocatorMotion("pc", question, reads, true)).toBe(false);
+  });
+
+  it("only wiggles unread completions and stops after opening marks the revision read", () => {
+    const completed = session("done", "completed", { preview: "new result" });
+
+    expect(sessionNeedsLocatorMotion("pc", completed, {}, true)).toBe(true);
+    const reads = readCompletedSessions("pc", { completed }, {});
+    expect(sessionNeedsLocatorMotion("pc", completed, reads, true)).toBe(false);
+    expect(sessionNeedsLocatorMotion("pc", completed, {}, false)).toBe(false);
   });
 });

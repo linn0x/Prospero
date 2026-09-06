@@ -22,6 +22,8 @@ export interface HostRuntime {
   /** 握手往返耗时,用于显示连接质量 */
   rttMs: number | null;
   sessions: Record<string, SessionInfo>;
+  /** 已收到过 daemon 的完整会话快照；用于区分历史基线和后续增量。 */
+  sessionsLoaded: boolean;
 }
 
 const SESSION_UPDATE_FRAME_MS = 16;
@@ -47,6 +49,7 @@ export const emptyRuntime: HostRuntime = {
   lastError: null,
   rttMs: null,
   sessions: {},
+  sessionsLoaded: false,
 };
 
 interface AppState {
@@ -55,7 +58,10 @@ interface AppState {
   homeSettings: HomeSettings;
   setHosts(hosts: StoredHost[]): void;
   setHomeSettings(settings: HomeSettings): void;
-  patchRuntime(hostId: string, patch: Partial<Omit<HostRuntime, "sessions">>): void;
+  patchRuntime(
+    hostId: string,
+    patch: Partial<Omit<HostRuntime, "sessions" | "sessionsLoaded">>,
+  ): void;
   setSessions(hostId: string, sessions: SessionInfo[]): void;
   upsertSession(hostId: string, session: SessionInfo): void;
   queueSessionUpdate(hostId: string, session: SessionInfo): void;
@@ -81,7 +87,11 @@ export const useApp = create<AppState>()((set, get) => ({
       return {
         runtimes: {
           ...s.runtimes,
-          [hostId]: { ...(s.runtimes[hostId] ?? emptyRuntime), sessions: map },
+          [hostId]: {
+            ...(s.runtimes[hostId] ?? emptyRuntime),
+            sessions: map,
+            sessionsLoaded: true,
+          },
         },
       };
     }),

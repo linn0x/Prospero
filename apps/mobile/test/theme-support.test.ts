@@ -163,6 +163,11 @@ describe("mobile theme support", () => {
     expect(source).toContain('label: "``` 代码块"');
     expect(source).toContain("insertQuickCharacter(tool.value, tool.cursorOffset ?? 0)");
     expect(source).toContain("adaptiveLayout.height * 0.22");
+    expect(source).toContain("Boolean(conn && sid)");
+    expect(source).toContain("onPress={() => send(draftRef.current)}");
+    expect(source).toContain("onSubmitEditing={isChat ? undefined");
+    expect(source).toContain("draftRef.current = next");
+    expect(source).toContain("releaseSendGuard();");
   });
 });
 

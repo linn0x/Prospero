@@ -49,4 +49,10 @@ describe("session update batching", () => {
     expect(useApp.getState().runtimes.mac.sessions.s1?.preview).toBe("mac");
     expect(useApp.getState().runtimes.pc.sessions.s2?.preview).toBe("pc");
   });
+
+  it("marks the first authoritative session snapshot as loaded", () => {
+    expect(useApp.getState().runtimes.mac).toBeUndefined();
+    useApp.getState().setSessions("mac", [session("s1", "snapshot")]);
+    expect(useApp.getState().runtimes.mac.sessionsLoaded).toBe(true);
+  });
 });
