@@ -452,6 +452,12 @@ export default function SessionScreen() {
     loading: boolean;
   }>({ key: "", items: [], loading: false });
   const completionSequence = useRef(0);
+  const sendGuard = useRef(false);
+  const sendGuardTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => () => {
+    if (sendGuardTimer.current !== null) clearTimeout(sendGuardTimer.current);
+  }, []);
 
   const session = sid ? runtime.sessions[sid] : undefined;
   const supportsDeepseekTrajectory = conn?.supportsDeepseekTrajectory ?? false;
@@ -914,6 +920,22 @@ export default function SessionScreen() {
       const t = text.trim();
       // 只带图不带字是合理的:一张报错截图本身就是问题
       if (!conn || !sid || (t.length === 0 && (!isChat || images.length === 0))) return;
+      // Native taps and submitEditing can arrive twice during keyboard dismissal.
+      // Guard only the short duplicate-tap window; a later intentional send is unaffected.
+      if (sendGuard.current) return;
+      sendGuard.current = true;
+      if (sendGuardTimer.current !== null) clearTimeout(sendGuardTimer.current);
+      sendGuardTimer.current = setTimeout(() => {
+        sendGuard.current = false;
+        sendGuardTimer.current = null;
+      }, 240);
+      const releaseSendGuard = (): void => {
+        sendGuard.current = false;
+        if (sendGuardTimer.current !== null) {
+          clearTimeout(sendGuardTimer.current);
+          sendGuardTimer.current = null;
+        }
+      };
       if (isChat) {
         if (!isSubagent && images.length === 0 && t === "/model") {
           openControls();
@@ -929,6 +951,7 @@ export default function SessionScreen() {
         } else if (isSubagent && subagentId) {
           const result = conn.sendToSubagent(sid, subagentId, t);
           if (!result.accepted) {
+            releaseSendGuard();
             const message = deliveryFailureText(result);
             setDeliveryError(message);
             toast(message);
@@ -947,6 +970,7 @@ export default function SessionScreen() {
             deliveryOverride ?? (busy ? busyDelivery : "auto"),
           );
           if (!result.accepted) {
+            releaseSendGuard();
             const message = deliveryFailureText(result);
             setDeliveryError(message);
             toast(message);
@@ -961,6 +985,7 @@ export default function SessionScreen() {
       } else {
         const result = conn.inputText(sid, t + "\r");
         if (!result.accepted) {
+          releaseSendGuard();
           const message = deliveryFailureText(result);
           setDeliveryError(message);
           toast(message);
