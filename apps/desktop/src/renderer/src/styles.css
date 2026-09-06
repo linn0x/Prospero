@@ -748,6 +748,15 @@ kbd {
 .session-pin-action:focus-visible { color: var(--sidebar-foreground); }
 .session-pin-action.is-pinned { color: var(--sidebar-foreground); opacity: 1; }
 .sidebar-content-shell { overflow: hidden !important; }
+.remote-control-card { margin: 18px 0 0; }
+.remote-host-import { display: flex; gap: 8px; margin: 12px 0; }
+.remote-host-import input { min-width: 0; flex: 1; }
+.remote-host-list { display: grid; gap: 8px; }
+.remote-host-list .device-card { margin: 0; }
+.remote-terminal { margin-top: 14px; overflow: hidden; border: 1px solid var(--border); border-radius: 10px; background: #0a0f18; }
+.remote-terminal pre { max-height: 320px; min-height: 160px; margin: 0; overflow: auto; padding: 12px; color: #d8e4f5; font: 12px/1.45 var(--terminal-font-family, ui-monospace, monospace); white-space: pre-wrap; }
+.remote-terminal-input { display: flex; gap: 8px; padding: 8px; border-top: 1px solid #263246; }
+.remote-terminal-input input { min-width: 0; flex: 1; color: #d8e4f5; background: #111a28; border-color: #263246; }
 .sidebar-nav-fixed { flex: none; }
 .prospero-sidebar .sidebar-nav-fixed [data-sidebar="group"] { padding-block: 4px; }
 .prospero-sidebar .sidebar-nav-fixed [data-sidebar="menu-button"] { height: 30px; min-height: 30px; padding-block: 5px; }
