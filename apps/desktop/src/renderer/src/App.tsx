@@ -1,4 +1,5 @@
 import {
+  Fragment,
   lazy,
   memo,
   Suspense,
@@ -9,6 +10,7 @@ import {
   useRef,
   useState,
   type ComponentType,
+  type ReactNode,
 } from "react";
 import {
   Activity,
@@ -93,6 +95,12 @@ import {
   validOpenSessionIds,
   workspaceChromeVisible,
 } from "./workspace-sidebar-state";
+import {
+  groupManagedWorkspaces,
+  managedWorkspaceActivity,
+  managedWorkspaceParent,
+  type ManagedWorkspaceGroup,
+} from "./managed-workspaces";
 import {
   defaultSessionLaunchAccountId,
   duplicateSessionAccountState,
@@ -826,6 +834,11 @@ function ShellSidebar({
       .catch(() => undefined);
   }, [closeMobileSidebar]);
   const [workspaceOpen, setWorkspaceOpen] = useState(true);
+  const managedLayout = useMemo(
+    () => groupManagedWorkspaces(snapshot.projects, snapshot.orchestration),
+    [snapshot.projects, snapshot.orchestration],
+  );
+  const [expandedTaskGroups, setExpandedTaskGroups] = useState<Set<string>>(() => new Set());
   const [sessionQuery, setSessionQuery] = useState("");
   const deferredSessionQuery = useDeferredValue(sessionQuery.trim());
   const [searchPage, setSearchPage] = useState<SessionPage>();
@@ -855,7 +868,7 @@ function ShellSidebar({
         // Storage can be unavailable in hardened or ephemeral renderer contexts.
       }
       const fallback = mostRelevantProject(
-        snapshot.projects,
+        managedLayout.projects,
         snapshot.daemon.sessions,
         snapshot.pinnedProjectPaths,
         activeId,
@@ -884,7 +897,7 @@ function ShellSidebar({
         [...current].filter((project) => available.has(project)),
       );
       const added = snapshot.projects.filter(
-        (project) => !knownProjects.current.has(project),
+        (project) => !knownProjects.current.has(project) && !managedLayout.byPath.has(project),
       );
       if (added.length > 0) {
         const relevantAdded = mostRelevantProject(
@@ -908,6 +921,7 @@ function ShellSidebar({
     snapshot.daemon.sessions,
     snapshot.pinnedProjectPaths,
     snapshot.projects,
+    managedLayout,
   ]);
   useEffect(() => {
     try {
@@ -933,6 +947,16 @@ function ShellSidebar({
       return new Set([...current, activeProject]);
     });
   }, [activeId, snapshot.daemon.sessions, snapshot.projects]);
+  const selectedSession = snapshot.daemon.sessions.find((session) => session.id === activeId);
+  const activeSessionProject = selectedSession ? projectForSession(snapshot.projects, selectedSession) : undefined;
+  const activeTaskGroup = activeSessionProject ? managedLayout.byPath.get(activeSessionProject)?.group : undefined;
+  const activeTaskGroupKey = activeTaskGroup?.key;
+  const activeTaskParent = activeTaskGroup?.project;
+  useEffect(() => {
+    if (!activeTaskGroupKey) return;
+    setExpandedTaskGroups((current) => current.has(activeTaskGroupKey) ? current : new Set([...current, activeTaskGroupKey]));
+    if (activeTaskParent) setExpandedProjects((current) => current.has(activeTaskParent) ? current : new Set([...current, activeTaskParent]));
+  }, [activeId, activeTaskGroupKey, activeTaskParent]);
   const sessionsByProject = useMemo(() => {
     const grouped = new Map<string, SessionInfo[]>(
       snapshot.projects.map((project) => [project, []]),
@@ -1090,18 +1114,17 @@ function ShellSidebar({
       snapshot.projectAliases[project.toLocaleLowerCase()] ||
       project.split(/[\\/]/).filter(Boolean).at(-1) ||
       project;
-    const activity = (project: string): number =>
-      (sessionsByProject.get(project) ?? []).reduce(
-        (latest, session) => Math.max(latest, session.createdAt ?? 0),
-        0,
-      );
-    return [...snapshot.projects].sort((left, right) => {
-      const leftPinned = snapshot.pinnedProjectPaths.some(
-        (path) => path.toLocaleLowerCase() === left.toLocaleLowerCase(),
-      );
-      const rightPinned = snapshot.pinnedProjectPaths.some(
-        (path) => path.toLocaleLowerCase() === right.toLocaleLowerCase(),
-      );
+    const latestByProject = new Map<string, number>();
+    for (const [project, sessions] of sessionsByProject) {
+      const parent = managedWorkspaceParent(managedLayout, project);
+      if (!parent) continue;
+      const latest = sessions.reduce((value, session) => Math.max(value, session.createdAt ?? 0), 0);
+      latestByProject.set(parent, Math.max(latestByProject.get(parent) ?? 0, latest));
+    }
+    const pinnedParents = new Set(snapshot.pinnedProjectPaths.map((project) => managedWorkspaceParent(managedLayout, project)?.toLocaleLowerCase()));
+    return [...managedLayout.projects].sort((left, right) => {
+      const leftPinned = pinnedParents.has(left.toLocaleLowerCase());
+      const rightPinned = pinnedParents.has(right.toLocaleLowerCase());
       if (leftPinned !== rightPinned) return leftPinned ? -1 : 1;
       if (snapshot.settings.workspaceSort === "name")
         return projectName(left).localeCompare(
@@ -1110,7 +1133,7 @@ function ShellSidebar({
           { sensitivity: "base" },
         );
       return (
-        activity(right) - activity(left) ||
+        (latestByProject.get(right) ?? 0) - (latestByProject.get(left) ?? 0) ||
         (originalIndex.get(left) ?? 0) - (originalIndex.get(right) ?? 0)
       );
     });
@@ -1121,6 +1144,7 @@ function ShellSidebar({
     snapshot.projects,
     snapshot.settings.workspaceSort,
     sessionsByProject,
+    managedLayout,
   ]);
   const importantProjects = useMemo(() => {
     const importantIds = new Set<string>([
@@ -1144,7 +1168,10 @@ function ShellSidebar({
       const session = sessionsById.get(id) ?? pinned.find((item) => item.id === id);
       if (!session) continue;
       const project = projectForSession(snapshot.projects, session);
-      if (project) projects.add(project);
+      if (project) {
+        const parent = managedWorkspaceParent(managedLayout, project);
+        if (parent) projects.add(parent);
+      }
     }
     return projects;
   }, [
@@ -1155,6 +1182,7 @@ function ShellSidebar({
     snapshot.pinnedSessionIds,
     snapshot.projects,
     snapshot.unreadSessionIds,
+    managedLayout,
   ]);
   const visibleProjects = useMemo(() => {
     const important = sortedProjects.filter((project) =>
@@ -1248,6 +1276,300 @@ function ShellSidebar({
         </SidebarMenuButton>
       </SidebarMenuItem>
     ));
+  const renderProject = (project: string): ReactNode => {
+    const managedWorkspace = managedLayout.byPath.get(project)?.workspace;
+    const childGroups = managedLayout.groups.filter((group) => group.project === project);
+    const sessions = sessionsByProject.get(project) ?? [];
+    const projectSessionCount = sessions.length + childGroups.reduce((total, group) => total + group.workspaces.reduce(
+      (count, workspace) => count + (sessionsByProject.get(workspace.path)?.length ?? 0), 0,
+    ), 0);
+    // 归档的会话从主列表收起。搜索时不过滤 —— 明确搜某个东西的人
+    // 是想找到它,而不是被"你把它归档过"挡回来。
+    const matchingSessions = filterSessionsByQuery(
+      normalizedSessionQuery
+        ? sessions
+        : sessions.filter(
+            (item) => item.id === activeId || !snapshot.archivedSessionIds.includes(item.id),
+          ),
+      normalizedSessionQuery,
+    );
+    if (normalizedSessionQuery && matchingSessions.length === 0)
+      return null;
+    const fallback =
+      project.split(/[\\/]/).filter(Boolean).at(-1) ?? project;
+    const name =
+      snapshot.projectAliases[project.toLocaleLowerCase()] ||
+      managedWorkspace?.taskTitle ||
+      fallback;
+    const projectPinned = snapshot.pinnedProjectPaths.some(
+      (path) =>
+        path.toLocaleLowerCase() ===
+        project.toLocaleLowerCase(),
+    );
+    const projectOpen = expandedProjects.has(project);
+    const sessionLimit = Math.min(
+      matchingSessions.length,
+      sessionLimits[project] ?? SIDEBAR_SESSION_PREVIEW_LIMIT,
+    );
+    const showsAllSessions = sessionLimit >= matchingSessions.length;
+    const visibleSessions = matchingSessions.slice(0, sessionLimit);
+    const hiddenSessionCount = matchingSessions.length - sessionLimit;
+    const nextSessionCount = Math.min(
+      hiddenSessionCount,
+      24,
+    );
+    return (
+      <Collapsible
+        key={project}
+        open={expandedProjects.has(project)}
+        onOpenChange={(open) =>
+          setExpandedProjects((current) => {
+            const next = new Set(current);
+            if (open) next.add(project);
+            else next.delete(project);
+            return next;
+          })
+        }
+        className="group/project"
+      >
+        <SidebarMenuItem className="workspace-project-item">
+          <ContextMenu>
+          <ContextMenuTrigger
+            render={<div className="workspace-project-context" />}
+          >
+          <CollapsibleTrigger
+            render={
+              <SidebarMenuButton
+                className="workspace-project-button"
+                tooltip={`${name}\n${project}`}
+                title={project}
+              />
+            }
+          >
+            {projectOpen ? <FolderOpen /> : <Folder />}
+            <span className="truncate">{name}</span>
+            {projectPinned && (
+              <Pin className="workspace-project-pinned" />
+            )}
+            {managedWorkspace?.cleaned && (
+              <span className="workspace-task-cleaned">{t("已清理", "Cleaned")}</span>
+            )}
+            <span className="workspace-session-count">
+              {normalizedSessionQuery
+                ? `${String(matchingSessions.length)}/${String(sessions.length)}`
+                    : projectSessionCount}
+            </span>
+          </CollapsibleTrigger>
+          </ContextMenuTrigger>
+          <ContextMenuContent>
+            <ContextMenuGroup>
+              <ContextMenuLabel>{name}</ContextMenuLabel>
+              <ContextMenuItem onClick={() => newSession(project)}>
+                <Plus />
+                {t("新建会话", "New session")}
+              </ContextMenuItem>
+              <ContextMenuItem onClick={() => void window.prospero.revealPath(project)}>
+                <FolderOpen />
+                {isMac ? t("在访达中显示", "Reveal in Finder") : t("在资源管理器中打开", "Open in Explorer")}
+              </ContextMenuItem>
+              <ContextMenuItem onClick={() => void window.prospero.openWindowsTerminal(project)}>
+                <SquareTerminal />
+                {isMac ? t("在终端中打开", "Open in Terminal") : "Windows Terminal"}
+              </ContextMenuItem>
+            </ContextMenuGroup>
+            <ContextMenuSeparator />
+            <ContextMenuGroup>
+              <ContextMenuItem onClick={() => onRenameProject(project)}>
+                <Pencil />
+                {t("编辑名称", "Edit name")}
+              </ContextMenuItem>
+              <ContextMenuItem onClick={() => void window.prospero.setProjectPinned(project, !projectPinned)}>
+                {projectPinned ? <PinOff /> : <Pin />}
+                {projectPinned ? t("取消置顶", "Unpin") : t("置顶工作区", "Pin workspace")}
+              </ContextMenuItem>
+              <ContextMenuItem variant="destructive" onClick={() => void window.prospero.forgetProject(project)}>
+                <X />
+                {t("从列表移除", "Remove from list")}
+              </ContextMenuItem>
+            </ContextMenuGroup>
+          </ContextMenuContent>
+          </ContextMenu>
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              render={
+                <button
+                  type="button"
+                  data-slot="workspace-project-more"
+                  data-testid="workspace-project-more"
+                  className="workspace-project-more"
+                  aria-label={t(
+                    `${name} 操作`,
+                    `${name} actions`,
+                  )}
+                  title={t("更多", "More")}
+                >
+                  <MoreHorizontal />
+                </button>
+              }
+            />
+            <DropdownMenuContent align="start" side="right">
+              <DropdownMenuGroup>
+                <DropdownMenuLabel>{name}</DropdownMenuLabel>
+                <DropdownMenuItem
+                  onClick={() =>
+                    void window.prospero.setProjectPinned(
+                      project,
+                      !projectPinned,
+                    )
+                  }
+                >
+                  {projectPinned ? <PinOff /> : <Pin />}
+                  {projectPinned
+                    ? t("取消置顶", "Unpin")
+                    : t("置顶工作区", "Pin workspace")}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => onRenameProject(project)}
+                >
+                  <Pencil />
+                  {t("编辑名称", "Edit name")}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() =>
+                    void window.prospero.revealPath(project)
+                  }
+                >
+                  <FolderOpen />
+                  {isMac
+                    ? t("在访达中显示", "Reveal in Finder")
+                    : t("在资源管理器中打开", "Open in Explorer")}
+                </DropdownMenuItem>
+              </DropdownMenuGroup>
+              <DropdownMenuSeparator />
+              <DropdownMenuGroup>
+                <DropdownMenuItem
+                  variant="destructive"
+                  onClick={() =>
+                    void window.prospero.forgetProject(project)
+                  }
+                >
+                  <Trash2 />
+                  {t("移除工作区", "Remove workspace")}
+                </DropdownMenuItem>
+              </DropdownMenuGroup>
+            </DropdownMenuContent>
+          </DropdownMenu>
+          <CollapsibleContent>
+            <SidebarMenuSub>
+              {visibleSessions.map((session) => (
+                <WorkspaceSessionRow
+                  key={session.id}
+                  session={session}
+                  active={
+                    view === "workspaces" && activeId === session.id
+                  }
+                  unread={snapshot.unreadSessionIds.includes(
+                    session.id,
+                  )}
+                  archived={snapshot.archivedSessionIds.includes(
+                    session.id,
+                  )}
+                  onToggleArchive={onToggleArchive}
+                  pinned={snapshot.pinnedSessionIds.includes(
+                    session.id,
+                  )}
+                  onOpenSession={selectSession}
+                  onTogglePin={onTogglePin}
+                  onRenameSession={onRenameSession}
+                  onDuplicateSession={onDuplicateSession}
+                  onSetUnread={onSetUnread}
+                />
+              ))}
+              {matchingSessions.length >
+                SIDEBAR_SESSION_PREVIEW_LIMIT && (
+                <SidebarMenuSubItem className="workspace-session-more-item">
+                  <button
+                    type="button"
+                    data-slot="workspace-session-more"
+                    className="workspace-session-more"
+                    aria-expanded={showsAllSessions}
+                    aria-label={
+                      showsAllSessions
+                        ? t(
+                            `收起 ${name} 的会话`,
+                            `Show fewer sessions in ${name}`,
+                          )
+                        : t(
+                            `在 ${name} 中再显示 ${String(nextSessionCount)} 个会话，剩余 ${String(hiddenSessionCount)} 个`,
+                            `Show ${String(nextSessionCount)} more sessions in ${name}; ${String(hiddenSessionCount)} remaining`,
+                          )
+                    }
+                    onClick={() =>
+                      setSessionLimits((current) => ({
+                        ...current,
+                        [project]: nextSidebarSessionLimit(
+                          sessionLimit,
+                          matchingSessions.length,
+                        ),
+                      }))
+                    }
+                  >
+                    <ChevronRight aria-hidden="true" />
+                    <span>
+                      {showsAllSessions
+                        ? t("收起会话", "Show fewer")
+                        : t(
+                            `再显示 ${String(nextSessionCount)} 个 · 剩余 ${String(hiddenSessionCount)}`,
+                            `Show ${String(nextSessionCount)} more · ${String(hiddenSessionCount)} remaining`,
+                          )}
+                    </span>
+                  </button>
+                </SidebarMenuSubItem>
+              )}
+            </SidebarMenuSub>
+            {childGroups.map(renderTaskGroup)}
+          </CollapsibleContent>
+        </SidebarMenuItem>
+      </Collapsible>
+    );
+  };
+
+  const renderTaskGroup = (group: ManagedWorkspaceGroup): ReactNode => {
+    const activity = managedWorkspaceActivity(group.workspaces.flatMap((workspace) => sessionsByProject.get(workspace.path) ?? []));
+    const repoName = group.repo.split(/[\\/]/).filter(Boolean).at(-1) ?? group.repo;
+    const label = group.project ? t("任务工作区", "Task workspaces") : t(`任务工作区 · ${repoName}`, `Task workspaces · ${repoName}`);
+    const open = expandedTaskGroups.has(group.key);
+    return (
+      <Collapsible
+        key={group.key}
+        open={open}
+        onOpenChange={(expanded) => setExpandedTaskGroups((current) => {
+          const next = new Set(current);
+          if (expanded) next.add(group.key); else next.delete(group.key);
+          return next;
+        })}
+        className="workspace-task-group"
+      >
+        <SidebarMenuItem>
+          <CollapsibleTrigger render={<SidebarMenuButton className="workspace-task-group-button" tooltip={group.repo} />}>
+            <ChevronRight className={cn("workspace-task-chevron", open && "is-open")} />
+            <span className="workspace-task-group-copy">
+              <span className="truncate">{label} · {group.workspaces.length}</span>
+              <span className={cn("workspace-task-summary", activity.pending > 0 && "has-pending")}>
+                {t(`${activity.running} 运行 · ${activity.pending} 待处理`, `${activity.running} running · ${activity.pending} pending`)}
+              </span>
+            </span>
+          </CollapsibleTrigger>
+          <CollapsibleContent>
+            <SidebarMenuSub className="workspace-task-children">
+              {group.workspaces.map((workspace) => renderProject(workspace.path))}
+            </SidebarMenuSub>
+          </CollapsibleContent>
+        </SidebarMenuItem>
+      </Collapsible>
+    );
+  };
+
   return (
     <Sidebar
       collapsible="icon"
@@ -1378,15 +1700,19 @@ function ShellSidebar({
                     {t("添加工作区", "Add workspace")}
                   </DropdownMenuItem>
                   <DropdownMenuItem
-                    onClick={() =>
-                      setExpandedProjects(new Set(snapshot.projects))
-                    }
+                    onClick={() => {
+                      setExpandedProjects(new Set(snapshot.projects));
+                      setExpandedTaskGroups(new Set(managedLayout.groups.map((group) => group.key)));
+                    }}
                   >
                     <FolderOpen />
                     {t("全部展开", "Expand all")}
                   </DropdownMenuItem>
                   <DropdownMenuItem
-                    onClick={() => setExpandedProjects(new Set())}
+                    onClick={() => {
+                      setExpandedProjects(new Set());
+                      setExpandedTaskGroups(new Set());
+                    }}
                   >
                     <Folder />
                     {t("全部折叠", "Collapse all")}
@@ -1445,9 +1771,18 @@ function ShellSidebar({
                         </span>
                       </SidebarMenuItem>
                       <SidebarMenuSub>
-                        {visibleSearchSessions.map((session) => (
+                        {visibleSearchSessions.map((session) => {
+                          const project = projectForSession(snapshot.projects, session);
+                          const managed = project ? managedLayout.byPath.get(project) : undefined;
+                          const parent = managed?.group.project ?? managed?.group.repo;
+                          const parentName = parent ? snapshot.projectAliases[parent.toLocaleLowerCase()] || parent.split(/[\\/]/).filter(Boolean).at(-1) || parent : undefined;
+                          return <Fragment key={session.id}>
+                          {managed && (
+                            <SidebarMenuSubItem className="workspace-task-search-parent" title={`${parent}\n${project}`}>
+                              <span className="truncate">{parentName} / {managed.workspace.taskTitle ?? t("任务工作区", "Task workspace")}</span>
+                            </SidebarMenuSubItem>
+                          )}
                           <WorkspaceSessionRow
-                            key={session.id}
                             session={session}
                             active={view === "workspaces" && activeId === session.id}
                             unread={snapshot.unreadSessionIds.includes(session.id)}
@@ -1460,7 +1795,8 @@ function ShellSidebar({
                             onDuplicateSession={onDuplicateSession}
                             onSetUnread={onSetUnread}
                           />
-                        ))}
+                          </Fragment>;
+                        })}
                         {searchSessions.length === 0 && !searchLoading && (
                           <SidebarMenuSubItem className="workspace-search-empty">
                             {t("没有匹配的会话", "No matching sessions")}
@@ -1498,252 +1834,10 @@ function ShellSidebar({
                       </SidebarMenuSub>
                     </>
                   ) : (
-                  visibleProjects.map((project) => {
-                    const sessions = sessionsByProject.get(project) ?? [];
-                    // 归档的会话从主列表收起。搜索时不过滤 —— 明确搜某个东西的人
-                    // 是想找到它,而不是被"你把它归档过"挡回来。
-                    const matchingSessions = filterSessionsByQuery(
-                      normalizedSessionQuery
-                        ? sessions
-                        : sessions.filter(
-                            (item) => !snapshot.archivedSessionIds.includes(item.id),
-                          ),
-                      normalizedSessionQuery,
-                    );
-                    if (normalizedSessionQuery && matchingSessions.length === 0)
-                      return null;
-                    const fallback =
-                      project.split(/[\\/]/).filter(Boolean).at(-1) ?? project;
-                    const name =
-                      snapshot.projectAliases[project.toLocaleLowerCase()] ||
-                      fallback;
-                    const projectPinned = snapshot.pinnedProjectPaths.some(
-                      (path) =>
-                        path.toLocaleLowerCase() ===
-                        project.toLocaleLowerCase(),
-                    );
-                    const projectOpen = expandedProjects.has(project);
-                    const sessionLimit = Math.min(
-                      matchingSessions.length,
-                      sessionLimits[project] ?? SIDEBAR_SESSION_PREVIEW_LIMIT,
-                    );
-                    const showsAllSessions = sessionLimit >= matchingSessions.length;
-                    const visibleSessions = matchingSessions.slice(0, sessionLimit);
-                    const hiddenSessionCount = matchingSessions.length - sessionLimit;
-                    const nextSessionCount = Math.min(
-                      hiddenSessionCount,
-                      24,
-                    );
-                    return (
-                      <Collapsible
-                        key={project}
-                        open={expandedProjects.has(project)}
-                        onOpenChange={(open) =>
-                          setExpandedProjects((current) => {
-                            const next = new Set(current);
-                            if (open) next.add(project);
-                            else next.delete(project);
-                            return next;
-                          })
-                        }
-                        className="group/project"
-                      >
-                        <SidebarMenuItem className="workspace-project-item">
-                          <ContextMenu>
-                          <ContextMenuTrigger
-                            render={<div className="workspace-project-context" />}
-                          >
-                          <CollapsibleTrigger
-                            render={
-                              <SidebarMenuButton
-                                className="workspace-project-button"
-                                tooltip={name}
-                              />
-                            }
-                          >
-                            {projectOpen ? <FolderOpen /> : <Folder />}
-                            <span className="truncate">{name}</span>
-                            {projectPinned && (
-                              <Pin className="workspace-project-pinned" />
-                            )}
-                            <span className="workspace-session-count">
-                              {normalizedSessionQuery
-                                ? `${String(matchingSessions.length)}/${String(sessions.length)}`
-                                : sessions.length}
-                            </span>
-                          </CollapsibleTrigger>
-                          </ContextMenuTrigger>
-                          <ContextMenuContent>
-                            <ContextMenuGroup>
-                              <ContextMenuLabel>{name}</ContextMenuLabel>
-                              <ContextMenuItem onClick={() => newSession(project)}>
-                                <Plus />
-                                {t("新建会话", "New session")}
-                              </ContextMenuItem>
-                              <ContextMenuItem onClick={() => void window.prospero.revealPath(project)}>
-                                <FolderOpen />
-                                {isMac ? t("在访达中显示", "Reveal in Finder") : t("在资源管理器中打开", "Open in Explorer")}
-                              </ContextMenuItem>
-                              <ContextMenuItem onClick={() => void window.prospero.openWindowsTerminal(project)}>
-                                <SquareTerminal />
-                                {isMac ? t("在终端中打开", "Open in Terminal") : "Windows Terminal"}
-                              </ContextMenuItem>
-                            </ContextMenuGroup>
-                            <ContextMenuSeparator />
-                            <ContextMenuGroup>
-                              <ContextMenuItem onClick={() => onRenameProject(project)}>
-                                <Pencil />
-                                {t("编辑名称", "Edit name")}
-                              </ContextMenuItem>
-                              <ContextMenuItem onClick={() => void window.prospero.setProjectPinned(project, !projectPinned)}>
-                                {projectPinned ? <PinOff /> : <Pin />}
-                                {projectPinned ? t("取消置顶", "Unpin") : t("置顶工作区", "Pin workspace")}
-                              </ContextMenuItem>
-                              <ContextMenuItem variant="destructive" onClick={() => void window.prospero.forgetProject(project)}>
-                                <X />
-                                {t("从列表移除", "Remove from list")}
-                              </ContextMenuItem>
-                            </ContextMenuGroup>
-                          </ContextMenuContent>
-                          </ContextMenu>
-                          <DropdownMenu>
-                            <DropdownMenuTrigger
-                              render={
-                                <button
-                                  type="button"
-                                  data-slot="workspace-project-more"
-                                  data-testid="workspace-project-more"
-                                  className="workspace-project-more"
-                                  aria-label={t(
-                                    `${name} 操作`,
-                                    `${name} actions`,
-                                  )}
-                                  title={t("更多", "More")}
-                                >
-                                  <MoreHorizontal />
-                                </button>
-                              }
-                            />
-                            <DropdownMenuContent align="start" side="right">
-                              <DropdownMenuGroup>
-                                <DropdownMenuLabel>{name}</DropdownMenuLabel>
-                                <DropdownMenuItem
-                                  onClick={() =>
-                                    void window.prospero.setProjectPinned(
-                                      project,
-                                      !projectPinned,
-                                    )
-                                  }
-                                >
-                                  {projectPinned ? <PinOff /> : <Pin />}
-                                  {projectPinned
-                                    ? t("取消置顶", "Unpin")
-                                    : t("置顶工作区", "Pin workspace")}
-                                </DropdownMenuItem>
-                                <DropdownMenuItem
-                                  onClick={() => onRenameProject(project)}
-                                >
-                                  <Pencil />
-                                  {t("编辑名称", "Edit name")}
-                                </DropdownMenuItem>
-                                <DropdownMenuItem
-                                  onClick={() =>
-                                    void window.prospero.revealPath(project)
-                                  }
-                                >
-                                  <FolderOpen />
-                                  {isMac
-                                    ? t("在访达中显示", "Reveal in Finder")
-                                    : t("在资源管理器中打开", "Open in Explorer")}
-                                </DropdownMenuItem>
-                              </DropdownMenuGroup>
-                              <DropdownMenuSeparator />
-                              <DropdownMenuGroup>
-                                <DropdownMenuItem
-                                  variant="destructive"
-                                  onClick={() =>
-                                    void window.prospero.forgetProject(project)
-                                  }
-                                >
-                                  <Trash2 />
-                                  {t("移除工作区", "Remove workspace")}
-                                </DropdownMenuItem>
-                              </DropdownMenuGroup>
-                            </DropdownMenuContent>
-                          </DropdownMenu>
-                          <CollapsibleContent>
-                            <SidebarMenuSub>
-                              {visibleSessions.map((session) => (
-                                <WorkspaceSessionRow
-                                  key={session.id}
-                                  session={session}
-                                  active={
-                                    view === "workspaces" && activeId === session.id
-                                  }
-                                  unread={snapshot.unreadSessionIds.includes(
-                                    session.id,
-                                  )}
-                                  archived={snapshot.archivedSessionIds.includes(
-                                    session.id,
-                                  )}
-                                  onToggleArchive={onToggleArchive}
-                                  pinned={snapshot.pinnedSessionIds.includes(
-                                    session.id,
-                                  )}
-                                  onOpenSession={selectSession}
-                                  onTogglePin={onTogglePin}
-                                  onRenameSession={onRenameSession}
-                                  onDuplicateSession={onDuplicateSession}
-                                  onSetUnread={onSetUnread}
-                                />
-                              ))}
-                              {matchingSessions.length >
-                                SIDEBAR_SESSION_PREVIEW_LIMIT && (
-                                <SidebarMenuSubItem className="workspace-session-more-item">
-                                  <button
-                                    type="button"
-                                    data-slot="workspace-session-more"
-                                    className="workspace-session-more"
-                                    aria-expanded={showsAllSessions}
-                                    aria-label={
-                                      showsAllSessions
-                                        ? t(
-                                            `收起 ${name} 的会话`,
-                                            `Show fewer sessions in ${name}`,
-                                          )
-                                        : t(
-                                            `在 ${name} 中再显示 ${String(nextSessionCount)} 个会话，剩余 ${String(hiddenSessionCount)} 个`,
-                                            `Show ${String(nextSessionCount)} more sessions in ${name}; ${String(hiddenSessionCount)} remaining`,
-                                          )
-                                    }
-                                    onClick={() =>
-                                      setSessionLimits((current) => ({
-                                        ...current,
-                                        [project]: nextSidebarSessionLimit(
-                                          sessionLimit,
-                                          matchingSessions.length,
-                                        ),
-                                      }))
-                                    }
-                                  >
-                                    <ChevronRight aria-hidden="true" />
-                                    <span>
-                                      {showsAllSessions
-                                        ? t("收起会话", "Show fewer")
-                                        : t(
-                                            `再显示 ${String(nextSessionCount)} 个 · 剩余 ${String(hiddenSessionCount)}`,
-                                            `Show ${String(nextSessionCount)} more · ${String(hiddenSessionCount)} remaining`,
-                                          )}
-                                    </span>
-                                  </button>
-                                </SidebarMenuSubItem>
-                              )}
-                            </SidebarMenuSub>
-                          </CollapsibleContent>
-                        </SidebarMenuItem>
-                      </Collapsible>
-                    );
-                  })
+                  <>
+                    {visibleProjects.map(renderProject)}
+                    {managedLayout.groups.filter((group) => !group.project).map(renderTaskGroup)}
+                  </>
                   )}
                   {!normalizedSessionQuery && hiddenProjectCount > 0 && (
                     <SidebarMenuItem className="workspace-session-more-item">

@@ -69,6 +69,7 @@ import {
 } from "@/lib/perf-hud";
 import { setSessionArchived } from "@/lib/session-preferences";
 import { sortSessions } from "@/lib/store";
+import { recentSessions } from "@/lib/recent-sessions";
 import { useHostConnection } from "@/lib/use-host-connection";
 import { coordinatorRunsBySession, orchestrationRoute } from "@/lib/orchestration-overview";
 import { useOrchestrationSnapshot } from "@/lib/use-orchestration-snapshot";
@@ -426,6 +427,9 @@ export default function SessionScreen() {
     subagentId?: string;
   }>();
   const { conn, runtime } = useHostConnection(hostId);
+  useFocusEffect(useCallback(() => {
+    if (hostId && sid) recentSessions.opened(hostId, sid);
+  }, [hostId, sid]));
   const [draft, setDraft] = useState("");
   const [draftHydratedFor, setDraftHydratedFor] = useState("");
   /** 被连接层拒绝的消息留在编辑器中，直到用户确认修改或重试。 */
@@ -930,6 +934,7 @@ export default function SessionScreen() {
             toast(message);
             return;
           }
+          recentSessions.activity(hostId, sid, t);
         } else {
           const result = conn.chatSend(
             sid,
@@ -947,6 +952,7 @@ export default function SessionScreen() {
             toast(message);
             return;
           }
+          recentSessions.activity(hostId, sid, t || "发送了图片");
           if (result.disposition === "queued") {
             toast("连接已断开，消息已在本机排队，恢复后会按顺序发送。");
           }
@@ -960,6 +966,7 @@ export default function SessionScreen() {
           toast(message);
           return;
         }
+        recentSessions.activity(hostId, sid, t);
       }
       void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
       setDraft("");
@@ -970,6 +977,7 @@ export default function SessionScreen() {
     },
     [
       conn,
+      hostId,
       sid,
       isChat,
       images,
