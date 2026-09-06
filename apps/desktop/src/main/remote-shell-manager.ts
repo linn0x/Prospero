@@ -28,7 +28,15 @@ export class RemoteShellManager {
       // full host/session snapshot is not broadcast to the renderer.
       void message;
     });
-    client.on("message", (message) => this.publish({ hostId, message }));
+    client.on("message", (message) => {
+      // Shell creation is correlated by the daemon's result message. Attach
+      // immediately so the first terminal snapshot follows without a second
+      // renderer round-trip.
+      if (message.type === "session.create.result" && message.ok && message.session) {
+        client.attach(message.session.id);
+      }
+      this.publish({ hostId, message });
+    });
     client.on("closed", () => {
       this.clients.delete(hostId);
       this.publish({ hostId, message: { type: "remote.closed" } });
