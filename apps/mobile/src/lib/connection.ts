@@ -538,7 +538,13 @@ export class HostConnection {
           failAttempt(failure, detail);
         };
         const timer = setTimeout(() => {
-          failVersion(e2eReady ? "timeout" : input.beforeE2EFailure());
+          // A direct candidate is E2E-ready before the TCP/WebSocket socket is
+          // open, so `e2eReady` alone cannot tell us that the host answered.
+          // Classifying a socket-open timeout as an application handshake
+          // timeout produced the misleading "computer online" diagnosis when
+          // the phone was actually on another subnet (or blocked by a
+          // firewall). Only an opened byte stream may be called unresponsive.
+          failVersion(opened && e2eReady ? "timeout" : input.beforeE2EFailure());
         }, ATTEMPT_TIMEOUT_MS);
 
         ws.onopen = () => {
