@@ -1,15 +1,17 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { createConnection, type Socket } from "node:net";
 import { once } from "node:events";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   SUPERVISOR_PROTOCOL_VERSION,
   startStructuredSupervisor,
   type SupervisorEvent,
+  type SupervisorAdapterContext,
 } from "../src/structured-supervisor.js";
+import { SupervisorEventDatabase } from "../src/supervisor-event-database.js";
 
 const homes: string[] = [];
 const children: ChildProcess[] = [];
@@ -174,14 +176,12 @@ describe("structured supervisor transport", () => {
     const all = [...initial.events, ...replay.events, ...second.events];
     expect(all.map((event) => event.seq)).toEqual([1, 2, 3]);
     expect(new Set(all.map((event) => event.seq)).size).toBe(all.length);
-    expect(JSON.parse(readFileSync(path.join(home, "state.json"), "utf8")))
-      .toEqual(expect.objectContaining({
-        sessions: [expect.objectContaining({
-          id: "fake-long-turn",
-          lastSeq: 3,
-          events: expect.arrayContaining([expect.objectContaining({ seq: 1 }), expect.objectContaining({ seq: 3 })]),
-        })],
-      }));
+    const database = new SupervisorEventDatabase(path.join(home, "supervisor.sqlite"), { readOnly: true });
+    try {
+      expect(database.sessions()).toEqual([expect.objectContaining({ id: "fake-long-turn", lastSeq: 3 })]);
+      expect(database.replay(database.sessions()[0]!, 0).map((event) => event.seq)).toEqual([1, 2, 3]);
+    } finally { database.close(); }
+    expect(existsSync(path.join(home, "state.json"))).toBe(false);
     second.close();
   });
 
@@ -214,7 +214,7 @@ describe("structured supervisor transport", () => {
     }
   });
 
-  it.skipIf(process.platform === "win32")("append-journals dense deltas, snapshots a bounded window, then reloads the post-snapshot tail in order", async () => {
+  it.skipIf(process.platform === "win32")("stores dense deltas incrementally and restores the compatibility replay window without discarding durable events", async () => {
     const home = tempHome();
     let first = await startStructuredSupervisor({ home });
     try {
@@ -228,14 +228,13 @@ describe("structured supervisor transport", () => {
         },
       });
       await delay(30);
-      const snapshot = JSON.parse(readFileSync(path.join(home, "state.json"), "utf8")) as {
-        sessions: Array<{ events: SupervisorEvent[]; lastSeq: number }>;
-      };
-      expect(snapshot.sessions[0]?.events).toHaveLength(4_000);
-      expect(snapshot.sessions[0]?.lastSeq).toBe(4_201);
-      // turn.end compacts the incorporated prefix; only the later tail stays
-      // in the append-only journal, avoiding a full history scan at restart.
-      expect(readFileSync(path.join(home, "events.jsonl"), "utf8").trim().split("\n")).toHaveLength(1);
+      const database = new SupervisorEventDatabase(path.join(home, "supervisor.sqlite"), { readOnly: true });
+      try {
+        expect(database.sessions()[0]?.lastSeq).toBe(4_202);
+        expect(database.countEvents("dense")).toBe(4_202);
+      } finally { database.close(); }
+      expect(existsSync(path.join(home, "state.json"))).toBe(false);
+      expect(existsSync(path.join(home, "events.jsonl"))).toBe(false);
 
       await first.close();
       first = await startStructuredSupervisor({ home });
@@ -248,5 +247,63 @@ describe("structured supervisor transport", () => {
     } finally {
       await first.close();
     }
+  });
+});
+
+
+describe("supervisor durable-write failures", () => {
+  it("allows retrying an explicit kill after its durable fence could not be written", async () => {
+    const owner = await startStructuredSupervisor({ home: tempHome() });
+    const kill = vi.fn(async () => {});
+    let client: SupervisorClient | undefined;
+    try {
+      await owner.createSession("kill-retry", { start: async () => {}, kill });
+      client = await SupervisorClient.connect(owner.socketPath, owner.token);
+      const save = vi.spyOn(SupervisorEventDatabase.prototype, "saveSession").mockImplementationOnce(() => { throw new Error("disk full"); });
+      try { await expect(client.request("session.kill", { sessionId: "kill-retry" })).rejects.toThrow("disk full"); }
+      finally { save.mockRestore(); }
+      expect(kill).not.toHaveBeenCalled();
+      expect(await client.request("session.status", { sessionId: "kill-retry" })).toMatchObject({ status: "running" });
+      await client.request("session.kill", { sessionId: "kill-retry" });
+      expect(kill).toHaveBeenCalledTimes(1);
+      expect(await client.request("session.status", { sessionId: "kill-retry" })).toMatchObject({ status: "killed" });
+    } finally { client?.close(); await owner.close(); }
+  });
+  it("subscribes to the current cursor without materializing existing bodies", async () => {
+    const owner = await startStructuredSupervisor({ home: tempHome() });
+    let context!: SupervisorAdapterContext;
+    let client: SupervisorClient | undefined;
+    try {
+      await owner.createSession("tail-only", { start: async (value) => { context = value; } });
+      context.emit({ kind: "user.message", msgId: "large", text: "x".repeat(1024 * 1024) });
+      client = await SupervisorClient.connect(owner.socketPath, owner.token);
+      const replay = vi.spyOn(SupervisorEventDatabase.prototype, "replay").mockImplementation(() => { throw new Error("historical bodies must stay on disk"); });
+      try {
+        expect(await client.request("session.subscribe", { sessionId: "tail-only", tailOnly: true })).toMatchObject({ events: [], lastSeq: 1, gap: false });
+        expect(replay).not.toHaveBeenCalled();
+      } finally { replay.mockRestore(); }
+      context.emit({ kind: "text.delta", msgId: "next", textId: "t", delta: "next" });
+      await client.waitForEvents(1);
+      expect(client.events.map((event) => event.seq)).toEqual([2]);
+    } finally { client?.close(); await owner.close(); }
+  });
+  it("fences further commands and events after a replay commit fails", async () => {
+    const home = tempHome();
+    const owner = await startStructuredSupervisor({ home });
+    let context!: SupervisorAdapterContext;
+    const send = vi.fn(async () => {});
+    let client: SupervisorClient | undefined;
+    try {
+      await owner.createSession("write-failure", { start: async (value) => { context = value; }, send });
+      const append = vi.spyOn(SupervisorEventDatabase.prototype, "append").mockImplementationOnce(() => { throw new Error("disk full"); });
+      try { expect(() => context.emit({ kind: "text.delta", msgId: "m", textId: "t", delta: "first" })).toThrow("历史写入失败"); }
+      finally { append.mockRestore(); }
+      expect(() => context.emit({ kind: "text.delta", msgId: "m", textId: "t", delta: "later" })).toThrow("历史写入失败");
+      expect(owner.replay("write-failure", 0).lastSeq).toBe(0);
+      client = await SupervisorClient.connect(owner.socketPath, owner.token);
+      await expect(client.request("session.send", { sessionId: "write-failure", text: "must-not-run" })).rejects.toThrow("历史写入失败");
+      expect(send).not.toHaveBeenCalled();
+      expect(await client.request("session.status", { sessionId: "write-failure" })).toMatchObject({ status: "failed", lastSeq: 0 });
+    } finally { client?.close(); await owner.close(); }
   });
 });

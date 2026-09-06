@@ -261,13 +261,15 @@ App 不在前台（iOS 挂起后 WS 断）时的锁屏通道：**Bark / ntfy** �
   `structuredCapable`（opencode/claude/codex/grok）、`resume/mode/model/effort` 的 agent 限制；按 `kind` 分支到
   结构化或 PTY。`defaultKindFor`：grok→`pty`，其余 structuredCapable→`structured`。
 - **恢复**：PTY 走 tmux（`restoreFromTmux`，元数据 `pty-sessions.json` ∩ tmux session）；结构化走
-  `restoreStructured`（`structured-sessions.json`，`version===1` 严格校验，`preserveHistoryWhen` 命中则封存为只读历史）。
+  `restoreStructured`：先重连独立 owner，再从 `sessions.sqlite` 读取中央会话摘要；旧 `structured-sessions.json`
+  逐条迁入 SQLite 并保留原文件。`preserveHistoryWhen` 命中则封存为只读历史。
 - **状态** `SessionStatus`：`starting | running | waiting_approval | waiting_input | idle | completed | done | died`。
 - **kill**：结构化先 `dispose()` 标 `done` 只读，`preserveHistory` 时立即落盘；PTY 关 client 并 `tmux.killSession`
   （tmux 托管下关 client ≠ 杀进程）。`disposeAll()` 先 `flushPersistence()`，tmux 托管下最多等 750ms 让子进程登记，
   之后 dispose 但**不 killSession**（进程留在 server 里）。
-- **持久化**：结构化 `scheduleStructuredPersist()`（200ms 防抖）写 `structured-sessions.json`；PTY `persistMeta()`
-  写 `pty-sessions.json`；均为 `.tmp` + `renameSync`、`0600`。
+- **持久化**：中央结构化会话以 `scheduleStructuredPersist()` 防抖后按脏会话增量写入 `sessions.sqlite`；新独立 owner
+  使用私有 `session.sqlite` 和 `supervisor.sqlite`。活跃旧 owner 保持 JSON，退出后后台迁移；PTY 元数据仍为
+  `pty-sessions.json`。迁移、分页上限、兼容边界和回滚说明见 [SQLite 会话存储](sqlite-session-storage.md)。
 
 ### 6.2 双轨模型
 
@@ -573,7 +575,7 @@ npm test -w @prospero/relay
 npm run test:e2e -w @prospero/relay  # 需要 Docker
 ```
 
-- 运行时要求：macOS 14+ / Windows 11、Node.js 22+，至少一个已登录的 Agent CLI。
+- 运行时要求：macOS 14+ / Windows 11、Node.js 22.13+，至少一个已登录的 Agent CLI。
 - daemon 集成测试会拉起真实 agent 子进程，`vitest.config.ts` 设为**串行**执行（并行资源抢占会偶发超时）。
 - 测试覆盖：协议（crypto/qr/ring/schemas）、daemon 会话与适配器（claude/codex/grok/opencode 端到端）、
   编排（store/dispatch/recovery/automation/worktree-assets/control-api/collaboration）、esaytree（真实 `git init` 仓库）。
