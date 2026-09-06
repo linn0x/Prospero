@@ -87,6 +87,7 @@ const INFO_REFRESH_MS = 250;
 const SESSION_ID = /^[A-Za-z0-9._-]{1,128}$/;
 const SUPERVISOR_STARTUP_TIMEOUT_MS = 8_000;
 const SUPERVISOR_ATTACH_ATTEMPT_TIMEOUT_MS = 250;
+const SUPERVISOR_RECONNECT_TIMEOUT_MS = 2_000;
 const SUPERVISOR_TERM_GRACE_MS = 500;
 const SUPERVISOR_KILL_GRACE_MS = 2_000;
 
@@ -123,6 +124,7 @@ class SupervisorRpc {
     private readonly token: string,
     private readonly onEvent: (event: SupervisorEvent) => void,
     private readonly onDisconnect: () => void,
+    private readonly onInfo: (sessionId: string, info: SessionInfo) => void,
   ) {}
 
   async connect(timeoutMs?: number): Promise<void> {
@@ -207,6 +209,11 @@ class SupervisorRpc {
       }
       if (message.method === "session.event" && message.params) {
         this.onEvent(message.params as SupervisorEvent);
+        continue;
+      }
+      if (message.method === "session.info" && message.params) {
+        const params = message.params as { sessionId?: unknown; info?: SessionInfo };
+        if (typeof params.sessionId === "string" && params.info) this.onInfo(params.sessionId, params.info);
         continue;
       }
       if (typeof message.id !== "number") continue;
@@ -337,6 +344,11 @@ export class RemoteStructuredSession extends EventEmitter {
   private evSeq = 0;
   private disconnected = false;
   private infoRefreshTimer: NodeJS.Timeout | null = null;
+  private infoRefresh: Promise<void> | null = null;
+  private infoRefreshPending = false;
+  private infoRevision = 0;
+  private stateNotifications = false;
+  private reconnecting: Promise<void> | null = null;
 
   private constructor(private readonly manifest: StructuredSupervisorManifest, hosting: StructuredHosting) {
     super();
@@ -413,9 +425,19 @@ export class RemoteStructuredSession extends EventEmitter {
     return this.manifest.sessionDir ?? path.dirname(this.manifest.socket);
   }
 
-  async reconnect(timeoutMs?: number): Promise<void> {
+  async reconnect(timeoutMs = SUPERVISOR_RECONNECT_TIMEOUT_MS): Promise<void> {
+    if (this.reconnecting) return this.reconnecting;
+    const pending = this.reconnectNow(timeoutMs);
+    this.reconnecting = pending;
+    try { await pending; }
+    finally { if (this.reconnecting === pending) this.reconnecting = null; }
+  }
+
+  private async reconnectNow(timeoutMs: number): Promise<void> {
     if (this.hosting === "unavailable") throw new RemoteSupervisorError("supervisor is unavailable");
     this.rpc?.close();
+    this.infoRefresh = null;
+    this.infoRefreshPending = false;
     this.disconnected = false;
     let rpc: SupervisorRpc;
     rpc = new SupervisorRpc(
@@ -424,16 +446,25 @@ export class RemoteStructuredSession extends EventEmitter {
       (event) => this.acceptEvent(event),
       () => {
         // Ignore close notifications from the deliberately replaced client.
-        if (this.rpc === rpc) this.disconnected = true;
+        if (this.rpc === rpc) {
+          this.disconnected = true;
+          if (this.infoValue.status !== "done" && this.infoValue.status !== "died") this.updateInfo({ ...this.infoValue, status: "died", busySince: undefined });
+        }
+      },
+      (sessionId, info) => {
+        if (this.rpc !== rpc || sessionId !== this.id || info.id !== this.id) return;
+        this.infoRevision += 1;
+        this.updateInfo(info);
       },
     );
     this.rpc = rpc;
     const deadline = timeoutMs === undefined ? undefined : Date.now() + timeoutMs;
     const remaining = (): number | undefined => deadline === undefined ? undefined : Math.max(1, deadline - Date.now());
     try {
-      const replay = await this.rpc.request<{ events: SupervisorEvent[]; lastSeq: number; gap: boolean }>(
+      const replay = await this.rpc.request<{ events: SupervisorEvent[]; lastSeq: number; gap: boolean; stateNotifications?: boolean }>(
         "session.subscribe", { sessionId: this.id, afterSeq: this.evSeq }, remaining(),
       );
+      this.stateNotifications = replay.stateNotifications === true;
       if (replay.gap) {
         // A restart with compacted history must never claim a partial exact
         // replay.  The runner's full snapshot is the authoritative recovery.
@@ -470,7 +501,7 @@ export class RemoteStructuredSession extends EventEmitter {
     if (this.log.length > MAX_EVENTS) this.log.shift();
     this.applyEventToInfo(event.body);
     this.emit("event", event.body, this.evSeq);
-    this.scheduleInfoRefresh(
+    if (!this.stateNotifications) this.scheduleInfoRefresh(
       event.body.kind !== "text.delta" && event.body.kind !== "reasoning.delta",
     );
   }
@@ -504,20 +535,22 @@ export class RemoteStructuredSession extends EventEmitter {
       // session. Only explicit kill/orphan reconciliation reaches done/died.
       status = "completed";
     } else if (
-      body.kind !== "tool.end" && body.kind !== "subagent.started" && body.kind !== "subagent.updated" &&
+      body.kind !== "tool.end" && body.kind !== "trajectory.record" && body.kind !== "subagent.started" && body.kind !== "subagent.updated" &&
       body.agentId === undefined && (status === "idle" || status === "completed" || status === "starting")
     ) {
       status = "running";
     }
     const waiting = status === "running" || status === "waiting_approval" || status === "waiting_input";
-    this.infoValue = {
+    if (status === current.status && current.pendingPermissions === this.pendingPermissions.size &&
+        current.pendingQuestions === this.pendingQuestions.size && (waiting ? current.busySince !== undefined : current.busySince === undefined)) return;
+    this.infoRevision += 1;
+    this.updateInfo({
       ...current,
       status,
       pendingPermissions: this.pendingPermissions.size,
       pendingQuestions: this.pendingQuestions.size,
       ...(waiting ? { busySince: current.busySince ?? Date.now() } : { busySince: undefined }),
-    };
-    this.emit("state", this.info());
+    });
   }
 
   private rebuildPending(): void {
@@ -538,10 +571,31 @@ export class RemoteStructuredSession extends EventEmitter {
     } catch (error) { throw error; }
   }
 
-  private async refreshInfo(timeoutMs?: number): Promise<void> {
-    const info = await this.call<SessionInfo>("info", {}, timeoutMs);
+  private updateInfo(info: SessionInfo): void {
+    if (JSON.stringify(this.infoValue) === JSON.stringify(info)) return;
     this.infoValue = info;
     this.emit("state", this.info());
+  }
+
+  private async refreshInfo(timeoutMs = SUPERVISOR_RECONNECT_TIMEOUT_MS): Promise<void> {
+    if (this.infoRefresh) return this.infoRefresh;
+    const revision = this.infoRevision;
+    const pending = this.call<SessionInfo>("info", {}, timeoutMs).then((info) => {
+      // A lifecycle notification can overtake an older asynchronous RPC response.
+      if (revision === this.infoRevision) this.updateInfo(info);
+      if (!this.stateNotifications && this.infoValue.status === "starting") this.scheduleInfoRefresh(false);
+    });
+    this.infoRefresh = pending;
+    try { await pending; }
+    finally {
+      if (this.infoRefresh === pending) {
+        this.infoRefresh = null;
+        if (this.infoRefreshPending) {
+          this.infoRefreshPending = false;
+          this.scheduleInfoRefresh(true);
+        }
+      }
+    }
   }
 
   /**
@@ -552,6 +606,7 @@ export class RemoteStructuredSession extends EventEmitter {
    */
   private scheduleInfoRefresh(immediate: boolean): void {
     if (!this.rpc || this.disconnected) return;
+    if (immediate && this.infoRefresh) { this.infoRefreshPending = true; return; }
     if (immediate) {
       if (this.infoRefreshTimer) {
         clearTimeout(this.infoRefreshTimer);
@@ -599,13 +654,12 @@ export class RemoteStructuredSession extends EventEmitter {
   async start(): Promise<void> { await this.reconnect(); }
   async send(text: string, attachments?: Attachment[], delivery?: ChatDelivery): Promise<void> {
     const result = await this.call<{ info?: SessionInfo }>("send", { text, ...(attachments ? { attachments } : {}), ...(delivery ? { delivery } : {}) });
-    if (result.info) this.infoValue = result.info;
+    if (result.info) this.updateInfo(result.info);
     this.scheduleInfoRefresh(true);
   }
   async setApprovalPolicy(policy: ApprovalPolicy): Promise<void> {
     const result = await this.call<{ info?: SessionInfo }>("setApprovalPolicy", { policy });
-    if (result.info) this.infoValue = result.info;
-    this.emit("state", this.info());
+    if (result.info) this.updateInfo(result.info);
     this.scheduleInfoRefresh(true);
   }
   complete(kind: ChatSuggestionKind, query: string): Promise<ChatSuggestion[]> { return completeComposer(this.cwd, kind, query); }
@@ -671,8 +725,7 @@ export class RemoteStructuredSession extends EventEmitter {
     await this.rpc.request("session.kill", { sessionId: this.id });
     if (this.infoRefreshTimer) clearTimeout(this.infoRefreshTimer);
     this.infoRefreshTimer = null;
-    this.infoValue = { ...this.infoValue, status: "done" };
-    this.emit("state", this.info());
+    this.updateInfo({ ...this.infoValue, status: "done" });
     this.rpc.close();
     this.disconnected = true;
   }
@@ -680,7 +733,9 @@ export class RemoteStructuredSession extends EventEmitter {
   async dispose(): Promise<void> {
     if (this.infoRefreshTimer) clearTimeout(this.infoRefreshTimer);
     this.infoRefreshTimer = null;
-    this.rpc?.close();
+    const rpc = this.rpc;
+    this.rpc = null;
+    rpc?.close();
     this.disconnected = true;
   }
 }
@@ -1044,11 +1099,17 @@ export async function launchStructuredSupervisor(input: LaunchStructuredSupervis
     while (Date.now() < deadline) {
       const remaining = Math.max(1, deadline - Date.now());
       try {
-        return await RemoteStructuredSession.attach(
+        const session = await RemoteStructuredSession.attach(
           readyManifest,
           Math.min(SUPERVISOR_ATTACH_ATTEMPT_TIMEOUT_MS, remaining),
         );
+        if (session.info().status === "died" || session.info().status === "done") {
+          await session.dispose();
+          throw new RemoteSupervisorError("supervisor session ended during startup", "startup_failed");
+        }
+        return session;
       } catch (error) {
+        if (error instanceof RemoteSupervisorError && error.code === "startup_failed") throw error;
         lastError = error;
         if (Date.now() < deadline) await delay(Math.min(40, Math.max(1, deadline - Date.now())));
       }
@@ -1063,33 +1124,40 @@ export async function launchStructuredSupervisor(input: LaunchStructuredSupervis
 }
 
 /** Scan only private per-session directories; never launch a replacement here. */
-export async function reconnectStructuredSupervisors(root: string): Promise<RemoteStructuredSession[]> {
+export async function reconnectStructuredSupervisors(root: string, timeoutMs = SUPERVISOR_RECONNECT_TIMEOUT_MS): Promise<RemoteStructuredSession[]> {
   if (structuredSupervisorPlatformGate() || !existsSync(root)) return [];
-  const sessions: RemoteStructuredSession[] = [];
-  for (const entry of readdirSync(root, { withFileTypes: true })) {
-    if (!entry.isDirectory() || !SESSION_ID.test(entry.name)) continue;
-    const dir = path.join(root, entry.name);
-    if (!privateDirectory(dir)) continue;
-    const manifest = readSupervisorManifest(path.join(dir, "manifest.json"));
-    if (!manifest || manifest.sessionId !== entry.name) continue;
-    // A dead PID, stale socket or protocol mismatch is historical/read-only.
-    // Crucially this path does not call the launcher, preventing duplicate turns.
-    const withOwnerDir = { ...manifest, sessionDir: dir };
-    // A failed-launch/explicitly-ended audit is permanently read-only.  Even
-    // if rollback could not confirm process exit, a later daemon must never
-    // attach the owner of a create() call that already returned failure.
-    if (
-      manifest.status === "died" || manifest.status === "done" ||
-      !manifestMatchesPlatform(manifest) ||
-      !processAlive(manifest.supervisorPid) ||
-      !privateMode(path.join(dir, "token")) ||
-      (manifestTransport(manifest) === "unix_socket" && !privateMode(manifest.socket))
-    ) {
-      sessions.push(RemoteStructuredSession.unavailable(withOwnerDir));
-      continue;
+  const entries = readdirSync(root, { withFileTypes: true });
+  const sessions: Array<RemoteStructuredSession | undefined> = new Array(entries.length);
+  let nextEntry = 0;
+  await Promise.all(Array.from({ length: Math.min(4, entries.length) }, async () => {
+    for (;;) {
+      const index = nextEntry++;
+      const entry = entries[index];
+      if (!entry) return;
+      if (!entry.isDirectory() || !SESSION_ID.test(entry.name)) continue;
+      const dir = path.join(root, entry.name);
+      if (!privateDirectory(dir)) continue;
+      const manifest = readSupervisorManifest(path.join(dir, "manifest.json"));
+      if (!manifest || manifest.sessionId !== entry.name) continue;
+      // A dead PID, stale socket or protocol mismatch is historical/read-only.
+      // Crucially this path does not call the launcher, preventing duplicate turns.
+      const withOwnerDir = { ...manifest, sessionDir: dir };
+      // A failed-launch/explicitly-ended audit is permanently read-only.  Even
+      // if rollback could not confirm process exit, a later daemon must never
+      // attach the owner of a create() call that already returned failure.
+      if (
+        manifest.status === "died" || manifest.status === "done" ||
+        !manifestMatchesPlatform(manifest) ||
+        !processAlive(manifest.supervisorPid) ||
+        !privateMode(path.join(dir, "token")) ||
+        (manifestTransport(manifest) === "unix_socket" && !privateMode(manifest.socket))
+      ) {
+        sessions[index] = RemoteStructuredSession.unavailable(withOwnerDir);
+        continue;
+      }
+      try { sessions[index] = await RemoteStructuredSession.attach(withOwnerDir, timeoutMs); }
+      catch { sessions[index] = RemoteStructuredSession.unavailable(withOwnerDir); }
     }
-    try { sessions.push(await RemoteStructuredSession.attach(withOwnerDir)); }
-    catch { sessions.push(RemoteStructuredSession.unavailable(withOwnerDir)); }
-  }
-  return sessions;
+  }));
+  return sessions.filter((session): session is RemoteStructuredSession => session !== undefined);
 }

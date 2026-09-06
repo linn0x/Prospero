@@ -1,6 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  AppState,
   FlatList,
   KeyboardAvoidingView,
   Platform,
@@ -13,6 +14,7 @@ import {
   View,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { useIsFocused } from "@react-navigation/native";
 import { Stack, router, useFocusEffect, useLocalSearchParams } from "expo-router";
 import type {
   AgentAccount,
@@ -55,6 +57,8 @@ import { sortSessions } from "@/lib/store";
 import { useHostConnection } from "@/lib/use-host-connection";
 import { useOrchestrationSnapshot } from "@/lib/use-orchestration-snapshot";
 import type { DeliveryResult } from "@/lib/outbound-queue";
+import { SessionCreateError, type HostConnection } from "@/lib/connection";
+import { DismissedModalAction, PendingSessionCreation } from "@/lib/host-screen-flow";
 import * as theme from "@/lib/theme";
 const { color, font, radius, space } = theme;
 
@@ -137,6 +141,7 @@ export default function HostScreen() {
     cwd?: string;
   }>();
   const { host, conn, runtime } = useHostConnection(hostId);
+  const isFocused = useIsFocused();
   const supportsDeepseekHarness =
     runtime.status === "connected" && conn?.supportsDeepseekHarness === true;
   const availableAgents = useMemo(
@@ -186,15 +191,16 @@ export default function HostScreen() {
   const [goalRunExpansionOverrides, setGoalRunExpansionOverrides] = useState<
     Record<string, boolean>
   >({});
-  const pendingCreateRef = useRef(false);
+  const [pendingCreate] = useState(() => new PendingSessionCreation());
+  const [toolsNavigation] = useState(() => new DismissedModalAction());
   const pendingResumeTitleRef = useRef<string | null>(null);
   const deepLinkCreateRef = useRef<string | null>(null);
   const homeQuickCreateRef = useRef<string | null>(null);
   const resetPendingCreate = useCallback((): void => {
-    pendingCreateRef.current = false;
+    pendingCreate.cancel();
     pendingResumeTitleRef.current = null;
     setCreateDelivery(null);
-  }, []);
+  }, [pendingCreate]);
   const insets = useSafeAreaInsets();
   const { width, height, verticalPanes } = useAdaptiveLayout();
   const orchestration = useOrchestrationSnapshot(conn, runtime.status, 8_000);
@@ -430,37 +436,10 @@ export default function HostScreen() {
     }, [hostId]),
   );
 
-  // 深链 prospero://host/<id>?create=shell&cmd=…:连上后自动建会话(自动化测试/快捷指令用)
-  useEffect(() => {
-    if (!conn || !create) return;
-    const fireKey = `${create}:${typeof cmd === "string" ? cmd : ""}`;
-    if (deepLinkCreateRef.current === fireKey) return;
-    if (pendingCreateRef.current) return;
-    if (runtime.status !== "connected") return;
-    if (!availableAgents.includes(create as AgentKind) && create !== "custom") return;
-    const timer = setTimeout(() => {
-      deepLinkCreateRef.current = fireKey;
-      pendingCreateRef.current = true;
-      const result = conn.createSession(
-        create as AgentKind,
-        undefined,
-        typeof cmd === "string" && cmd.length > 0 ? cmd : undefined,
-      );
-      if (!result.accepted) {
-        resetPendingCreate();
-        deepLinkCreateRef.current = null;
-        setBanner(sessionCreateFailureText(result));
-        return;
-      }
-      setCreateDelivery(result.disposition);
-    }, 0);
-    return () => clearTimeout(timer);
-  }, [availableAgents, conn, create, cmd, resetPendingCreate, runtime.status]);
-
   // 首页快速入口复用完整创建器：指定目录时直接进入 Agent 设置，未指定目录或
   // 选择“新建目录”时先打开 WorkspacePicker（其中包含 mkdir）。
   useEffect(() => {
-    if (!conn || runtime.status !== "connected") return;
+    if (!isFocused || !conn || runtime.status !== "connected") return;
     if (quickCreate !== "conversation" && quickCreate !== "directory") return;
     const requestedCwd = typeof quickCreateCwd === "string" ? quickCreateCwd.trim() : "";
     const fireKey = `${quickCreate}:${requestedCwd}`;
@@ -479,14 +458,14 @@ export default function HostScreen() {
       if (quickCreate === "directory" || !requestedCwd) setPickerOpen(true);
     }, 0);
     return () => clearTimeout(timer);
-  }, [conn, quickCreate, quickCreateCwd, runtime.status]);
+  }, [conn, isFocused, quickCreate, quickCreateCwd, runtime.status]);
 
-  // 新建会话:创建后 daemon 自动 attach 并发快照(PTY 发 term.snapshot,
-  // 结构化发 chat.snapshot)→ 以快照的 sid 进入会话页
-  useEffect(() => {
-    if (!conn) return;
-    const enter = (sid: string): void => {
-      if (!pendingCreateRef.current || !hostId) return;
+  // Create completion belongs to a request, not whichever snapshot happened to arrive first.
+  const trackCreate = useCallback((
+    task: ReturnType<HostConnection["createSessionTracked"]>,
+    resumeTitle: string | null = null,
+  ): void => {
+    pendingCreate.track(task, (session) => {
       resetPendingCreate();
       setComposing(false);
       setSelectedResume(null);
@@ -494,25 +473,88 @@ export default function HostScreen() {
       setGoal("");
       setApprovalPolicy("strict");
       setCreateYoloConfirmOpen(false);
-      router.push(`/host/${hostId}/session/${sid}`);
-    };
-    const offSnap = conn.events.on("snapshot", (m) => enter(m.sid));
-    const offChat = conn.events.on("chatSnapshot", (m) => enter(m.sid));
-    const offErr = conn.events.on("serverError", (m) => {
-      const resumeTitle = pendingResumeTitleRef.current;
+      if (hostId) router.push(`/host/${hostId}/session/${session.id}`);
+    }, (error) => {
       resetPendingCreate();
-      if (m.reason === "conversation_active_writer" && resumeTitle) {
+      if (error instanceof SessionCreateError && error.reason === "conversation_active_writer" && resumeTitle) {
         setResumeConflictTitle(resumeTitle);
         return;
       }
-      setBanner(`${m.code}: ${m.message}`);
+      setBanner(error instanceof Error ? error.message : "创建会话失败，请检查会话列表后重试。");
+    });
+    // Observe the rejection before checking delivery, including a synchronous send failure.
+    const result = task.delivery;
+    if (!result.accepted) {
+      resetPendingCreate();
+      setBanner(sessionCreateFailureText(result));
+      return;
+    }
+    setCreateDelivery(result.disposition);
+  }, [hostId, pendingCreate, resetPendingCreate]);
+
+  // 深链 prospero://host/<id>?create=shell&cmd=…:连上后自动建会话(自动化测试/快捷指令用)
+  useEffect(() => {
+    if (!isFocused || !conn || !create) return;
+    const fireKey = `${create}:${typeof cmd === "string" ? cmd : ""}`;
+    if (deepLinkCreateRef.current === fireKey) return;
+    if (pendingCreate.pending) return;
+    if (runtime.status !== "connected") return;
+    if (!availableAgents.includes(create as AgentKind) && create !== "custom") return;
+    const timer = setTimeout(() => {
+      deepLinkCreateRef.current = fireKey;
+      const task = conn.createSessionTracked(
+        create as AgentKind,
+        undefined,
+        typeof cmd === "string" && cmd.length > 0 ? cmd : undefined,
+      );
+      trackCreate(task);
+      if (!task.delivery.accepted) {
+        deepLinkCreateRef.current = null;
+        return;
+      }
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [availableAgents, conn, create, cmd, isFocused, pendingCreate, runtime.status, trackCreate]);
+
+  useFocusEffect(useCallback(() => () => {
+    resetPendingCreate();
+    toolsNavigation.cancel();
+    setToolsOpen(false);
+    setPickerOpen(false);
+    setCreateYoloConfirmOpen(false);
+    setResumeConflictTitle(null);
+    setDeleteTarget(null);
+  }, [resetPendingCreate, toolsNavigation]));
+
+  useEffect(() => {
+    const stopWaiting = (): void => {
+      if (!pendingCreate.pending) return;
+      resetPendingCreate();
+      setBanner("已停止等待创建结果；请求可能已在电脑完成，请查看会话列表后再重试。");
+    };
+    const timer = runtime.status === "connected" ? undefined : setTimeout(stopWaiting, 0);
+    const subscription = AppState.addEventListener("change", (state) => {
+      if (state === "active") return;
+      stopWaiting();
+      if (state !== "background") return;
+      toolsNavigation.cancel();
+      setToolsOpen(false);
+      setPickerOpen(false);
+      setCreateYoloConfirmOpen(false);
     });
     return () => {
-      offSnap();
-      offChat();
-      offErr();
+      clearTimeout(timer);
+      subscription.remove();
     };
-  }, [conn, hostId, resetPendingCreate]);
+  }, [pendingCreate, resetPendingCreate, runtime.status, toolsNavigation]);
+
+  useFocusEffect(useCallback(() => {
+    if (!conn) return undefined;
+    // Request-scoped errors are handled by trackCreate; unrelated errors cannot end its wait.
+    return conn.events.on("serverError", (message) => {
+      if (!pendingCreate.pending) setBanner(`${message.code}: ${message.message}`);
+    });
+  }, [conn, pendingCreate]));
 
   const all = useMemo(
     () => sortSessions(runtime.sessions).filter((session) => !hiddenIds.has(session.id)),
@@ -612,7 +654,7 @@ export default function HostScreen() {
             : "新建会话";
 
   const submitCreate = (): void => {
-    if (!conn || runtime.status !== "connected" || pendingCreateRef.current) return;
+    if (!conn || runtime.status !== "connected" || pendingCreate.pending) return;
     if (!accountCanLaunch) { setBanner(selectedAccount?.apiProfileError ?? "当前账号不支持此会话，请检查配置和模型工具能力。"); return; }
     const projectPath = cwd.trim();
     if (projectPath.length === 0) {
@@ -625,7 +667,6 @@ export default function HostScreen() {
       setBanner("请先写下 Goal，协调者才知道要完成什么。");
       return;
     }
-    pendingCreateRef.current = true;
     const accountOption = selectedAccount ? { accountId: selectedAccount.id } : {};
     const modelOption =
       effectiveSessionKind === "structured" &&
@@ -684,13 +725,8 @@ export default function HostScreen() {
         ? effectiveSessionKind
         : "pty";
     const sendCreate = (options: typeof sessionOptions): void => {
-      const result = conn.createSession(agent, projectPath, undefined, createKind, 80, 24, options);
-      if (!result.accepted) {
-        resetPendingCreate();
-        setBanner(sessionCreateFailureText(result));
-        return;
-      }
-      setCreateDelivery(result.disposition);
+      const task = conn.createSessionTracked(agent, projectPath, undefined, createKind, 80, 24, options);
+      trackCreate(task, pendingResumeTitleRef.current);
     };
     pendingResumeTitleRef.current =
       agent === "codex" && sessionOptions?.resume
@@ -818,6 +854,8 @@ export default function HostScreen() {
             composing ? (
               <Pressable
                 onPress={() => {
+                  if (pendingCreate.pending) setBanner("已停止等待；请求可能已在电脑完成，请先查看会话列表。");
+                  resetPendingCreate();
                   setComposing(false);
                   setSelectedResume(null);
                   setLaunchIntent("conversation");
@@ -826,8 +864,10 @@ export default function HostScreen() {
                   setCreateYoloConfirmOpen(false);
                 }}
                 hitSlop={8}
+                accessibilityRole="button"
+                accessibilityHint={createDelivery !== null ? "停止手机等待并返回列表；电脑可能仍在创建会话" : undefined}
               >
-                <Text style={styles.headerCancel}>取消</Text>
+                <Text style={styles.headerCancel}>{createDelivery !== null ? "停止等待" : "取消"}</Text>
               </Pressable>
             ) : (
               <View style={styles.headerActions}>
@@ -849,7 +889,7 @@ export default function HostScreen() {
                 </Pressable>
                 {hasHostTools && (
                   <Pressable
-                    onPress={() => setToolsOpen(true)}
+                    onPress={() => { toolsNavigation.cancel(); setToolsOpen(true); }}
                     hitSlop={8}
                     accessibilityRole="button"
                     accessibilityLabel="更多主机功能"
@@ -914,7 +954,7 @@ export default function HostScreen() {
               <Pressable
                 style={({ pressed }) => [styles.selectedProjectCard, pressed && styles.cardPressed]}
                 onPress={() => setPickerOpen(true)}
-                disabled={runtime.status !== "connected"}
+                disabled={runtime.status !== "connected" || createDelivery !== null}
                 accessibilityRole="button"
                 accessibilityLabel={cwd.trim() ? "更换项目目录" : "选择项目目录"}
               >
@@ -968,7 +1008,7 @@ export default function HostScreen() {
                     runtime.status !== "connected" && styles.btnDisabled,
                     pressed && styles.browseBtnPressed,
                   ]}
-                  disabled={runtime.status !== "connected"}
+                  disabled={runtime.status !== "connected" || createDelivery !== null}
                   onPress={() => setPickerOpen(true)}
                   accessibilityLabel="浏览电脑上的目录"
                 >
@@ -1363,6 +1403,7 @@ export default function HostScreen() {
                             active && styles.kindOptionActive,
                             active && danger && styles.policyOptionDangerActive,
                           ]}
+                          disabled={createDelivery !== null}
                           onPress={() => {
                             if (danger) setCreateYoloConfirmOpen(true);
                             else setApprovalPolicy(option.value);
@@ -1778,15 +1819,20 @@ export default function HostScreen() {
           }}
         />
       )}
-      <Sheet visible={toolsOpen} title={host?.name ?? "主机"} onClose={() => setToolsOpen(false)}>
+      <Sheet
+        visible={toolsOpen}
+        title={host?.name ?? "主机"}
+        onClose={() => { toolsNavigation.cancel(); setToolsOpen(false); }}
+        onDismiss={() => toolsNavigation.dismiss()}
+      >
         {conn?.supportsAgentAccounts && (
           <SheetAction
             label="Agent 账号"
             detail="Codex 与 Claude Code 独立登录环境，可共享同一项目目录"
             symbol="square.stack.3d.up"
             onPress={() => {
+              toolsNavigation.defer(() => router.push(`/host/${hostId}/accounts`));
               setToolsOpen(false);
-              router.push(`/host/${hostId}/accounts`);
             }}
           />
         )}
@@ -1800,8 +1846,8 @@ export default function HostScreen() {
             }
             symbol="point.3.connected.trianglepath.dotted"
             onPress={() => {
+              toolsNavigation.defer(() => router.push(`/host/${hostId}/orchestration`));
               setToolsOpen(false);
-              router.push(`/host/${hostId}/orchestration`);
             }}
           />
         )}

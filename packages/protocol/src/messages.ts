@@ -48,6 +48,7 @@ export const CAPABILITY_SUBAGENT_HISTORY = "subagent.history.v1";
 export const CAPABILITY_AGENT_ACCOUNTS = "agent.accounts.v1";
 /** 新会话创建前读取原生模型目录，并把模型/推理强度原子地带入 session.create。 */
 export const CAPABILITY_SESSION_CREATE_MODEL = "session.create-model.v1";
+export const CAPABILITY_SESSION_CREATE_RESULT = "session.create-result.v1";
 /** Claude/Codex 的第三方兼容 API Profile 与独立运行环境。 */
 export const CAPABILITY_AGENT_API_PROFILES = "agent.api-profiles.v1";
 export const CAPABILITY_AGENT_API_PROTOCOLS = "agent.api-protocols.v1";
@@ -171,6 +172,7 @@ export type {
   S2CHelloOk,
   S2CConnectionPong,
   S2CSessionState,
+  S2CSessionCreateResult,
   S2CTermSnapshot,
   S2CTermOutput,
   S2CAgentEvent,

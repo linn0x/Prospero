@@ -28,10 +28,12 @@ import {
   CAPABILITY_AGENT_API_PROFILES,
   CAPABILITY_AGENT_API_PROTOCOLS,
   CAPABILITY_FS_PUT_ACK,
+  CAPABILITY_SESSION_CREATE_RESULT,
   generateKeyPairB64,
 } from "@prospero/protocol";
 import { dropConnection, getConnection, HostConnection, wireAppStateReconnect } from "../src/lib/connection";
 import type { StoredHost } from "../src/lib/hosts";
+import { useApp } from "../src/lib/store";
 
 class FakeWebSocket {
   static sockets: FakeWebSocket[] = [];
@@ -194,6 +196,38 @@ describe("HostConnection WebSocket candidates", () => {
       }),
       true,
     );
+  });
+
+  it("routes a correlated creation result without regressing a newer live state", async () => {
+    const socket = new FakeWebSocket("ws://192.168.1.8:7423/ws"); socket.readyState = 1;
+    const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
+    const internals = connection as unknown as {
+      ws: FakeWebSocket; channel: { seal(message: unknown): string; open(message: string): unknown };
+      advertisedCapabilities: Set<string>; onMessage(message: string): void;
+    };
+    internals.ws = socket;
+    internals.channel = { seal: JSON.stringify, open: JSON.parse };
+    internals.advertisedCapabilities = new Set([CAPABILITY_SESSION_CREATE_RESULT]);
+    const task = connection.createSessionTracked("codex", "/work", undefined, "structured");
+    expect(JSON.parse(socket.sent[0]!)).toMatchObject({ type: "session.create", requestId: task.requestId });
+    const session = { id: "created-fixture", agent: "codex", kind: "structured", cwd: "/work", title: "Fixture", cols: 80, rows: 24, status: "idle", createdAt: 1 };
+    internals.onMessage(JSON.stringify({ type: "session.state", session }));
+    internals.onMessage(JSON.stringify({ type: "session.create.result", requestId: task.requestId, ok: true, session: { ...session, status: "starting" } }));
+    await expect(task.completion).resolves.toMatchObject({ id: session.id });
+    expect(useApp.getState().runtimes[connection.host.id]?.sessions[session.id]?.status).toBe("idle");
+    connection.stop();
+  });
+
+  it("does not queue a tracked creation offline and terminates waiting on connection stop", async () => {
+    const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
+    const offline = connection.createSessionTracked("codex");
+    await expect(offline.completion).rejects.toMatchObject({ reason: "offline" });
+    expect(connection.queuedCount).toBe(0);
+    vi.spyOn(connection, "send").mockReturnValue({ accepted: true, disposition: "sent" });
+    const task = connection.createSessionTracked("codex");
+    connection.stop();
+    await expect(task.completion).rejects.toMatchObject({ reason: "disconnected" });
+    expect(connection.queuedCount).toBe(0);
   });
 
   it("sends explicit API protocols and preserves the key on empty reconfiguration", async () => {

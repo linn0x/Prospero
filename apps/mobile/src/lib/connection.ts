@@ -29,6 +29,7 @@ import {
   CAPABILITY_ORCHESTRATION_SNAPSHOT,
   CAPABILITY_ORCHESTRATION_WORKTREES,
   CAPABILITY_SESSION_CREATE_MODEL,
+  CAPABILITY_SESSION_CREATE_RESULT,
   CAPABILITY_SUBAGENT_HISTORY,
   CAPABILITY_WORKSPACE_ROOTS,
   CLOSE_AUTH_FAILED,
@@ -56,6 +57,7 @@ import {
   type ChatDelivery,
   type ChatSuggestionKind,
   type C2SMessage,
+  type C2SSessionCreate,
   type KeyPairB64,
   type PermissionReply,
   type OrchestrationGraphNodeInput,
@@ -100,6 +102,9 @@ import {
   type DeliveryResult,
 } from "./outbound-queue";
 import { useApp } from "./store";
+import { SessionCreateTracker, type SessionCreateTask } from "./session-create";
+export { SessionCreateError } from "./session-create";
+export type { SessionCreateTask } from "./session-create";
 
 export type { DeliveryResult } from "./outbound-queue";
 
@@ -162,6 +167,7 @@ export class HostConnection {
   /** 断线期间排队的消息,重连后按序补发 */
   private queue = new BoundedQueue<C2SMessage>(MAX_OFFLINE_QUEUE);
   private racingAttempts: ManagedAttempt<Won>[] | null = null;
+  private readonly sessionCreates = new SessionCreateTracker();
 
   constructor(
     readonly host: StoredHost,
@@ -289,6 +295,7 @@ export class HostConnection {
 
   stop(): void {
     this.stopped = true;
+    this.sessionCreates.disconnect();
     this.clearTimers();
     this.abortRacingAttempts();
     this.ws?.close();
@@ -776,8 +783,18 @@ export class HostConnection {
         return;
       case "session.state":
         useApp.getState().upsertSession(this.host.id, msg.session);
+        this.sessionCreates.state(msg.session);
+        return;
+      case "session.create.result":
+        // Live session.state may already have advanced beyond the creation
+        // snapshot (for example starting -> idle). Do not roll it back.
+        if (msg.session && !useApp.getState().runtimes[this.host.id]?.sessions[msg.session.id]) {
+          useApp.getState().upsertSession(this.host.id, msg.session);
+        }
+        this.sessionCreates.result(msg);
         return;
       case "term.snapshot": {
+        this.sessionCreates.snapshot(msg.sid);
         // A1 验收:attach → 快照到达。真机上没有别的办法拿到这个数,
         // 靠"主观秒开"是填不了验收表的。
         const started = this.attachStartedAt.get(msg.sid);
@@ -793,6 +810,7 @@ export class HostConnection {
         this.events.emit("output", msg);
         return;
       case "chat.snapshot":
+        this.sessionCreates.snapshot(msg.sid);
         this.events.emit("chatSnapshot", msg);
         return;
       case "agent.event":
@@ -828,6 +846,7 @@ export class HostConnection {
         this.resolveFs(msg);
         return;
       case "error":
+        this.sessionCreates.legacyError(msg);
         // 文件请求在等应答时,错误要回到那个 Promise,而不是只飘一个全局提示
         if (msg.sid !== undefined && this.rejectFsFor(msg.sid, msg.message)) return;
         // workspace.list 发生在会话创建前,协议里没有 sid。旧版 daemon 不认识
@@ -1245,6 +1264,7 @@ export class HostConnection {
   }
 
   private onClose(): void {
+    this.sessionCreates.disconnect();
     // close 事件触发时 readyState 已不是 OPEN，不能再用 isConnected 判断旧状态。
     const wasConnected = this.ws !== null && this.channel !== null;
     const fatalReceiveError = this.fatalReceiveError;
@@ -1325,21 +1345,7 @@ export class HostConnection {
     kind?: SessionKind,
     cols = 80,
     rows = 24,
-    options?: {
-      mode?: "default" | "plan";
-      /** 从第一轮起生效；省略时 daemon 保持最保守的 strict。 */
-      approvalPolicy?: ApprovalPolicy;
-      resume?: { id: string; title?: string };
-      /** Goal 会同时创建编排 Run，并把新会话作为协调者。 */
-      goal?: string;
-      /** 账号环境与 cwd 独立；多个账号可指向同一个项目。 */
-      accountId?: string;
-      /** 从创建器实时目录中选择，保证第一轮就使用该模型。 */
-      model?: string;
-      effort?: string;
-      /** DeepSeek Harness 启动时固定的 Agent 预设。 */
-      agentPreset?: string;
-    },
+    options?: Pick<C2SSessionCreate, "mode" | "approvalPolicy" | "resume" | "goal" | "accountId" | "model" | "effort" | "agentPreset">,
   ): DeliveryResult {
     return this.send(
       {
@@ -1361,6 +1367,15 @@ export class HostConnection {
       },
       true,
     );
+  }
+
+  createSessionTracked(...args: Parameters<HostConnection["createSession"]>): SessionCreateTask {
+    const [agent, cwd, command, kind, cols = 80, rows = 24, options] = args;
+    return this.sessionCreates.begin({
+      type: "session.create", requestId: this.agentRequestId(), agent, cols, rows,
+      ...(cwd ? { cwd } : {}), ...(command ? { command } : {}), ...(kind ? { kind } : {}), ...options,
+    }, this.supportsCapability(CAPABILITY_SESSION_CREATE_RESULT),
+    Object.keys(useApp.getState().runtimes[this.host.id]?.sessions ?? {}), (message) => this.send(message, false));
   }
 
   /** 最近一次 attach 到快照上屏的耗时(ms);A1 验收指标 */

@@ -457,8 +457,10 @@ export async function runStructuredSupervisor(): Promise<void> {
     });
   };
   const adapter: SupervisorAdapter = {
+    stateNotifications: true,
     async start(context) {
       session.on("event", (body) => context.emit(body));
+      session.on("state", (info) => context.state(info));
       await session.start();
       persist(session);
     },

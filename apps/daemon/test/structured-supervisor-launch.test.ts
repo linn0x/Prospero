@@ -206,6 +206,33 @@ afterEach(async () => {
 });
 
 describe("structured supervisor launch rollback", () => {
+  it.skipIf(process.platform === "win32")("publishes delayed native initialization through the real runner without requiring an agent event", async () => {
+    const home = temp("prospero-runner-state-");
+    const fakeBin = temp("prospero-runner-state-bin-");
+    const gate = path.join(home, "ready");
+    const fixture = path.join(fakeBin, "gated-codex.mjs");
+    writeFileSync(fixture, `import readline from "node:readline";\nimport { existsSync } from "node:fs";\nconst reply=(id,result={})=>process.stdout.write(JSON.stringify({id,result})+"\\n");\nreadline.createInterface({input:process.stdin}).on("line",line=>{const request=JSON.parse(line);if(request.method==="initialize"){const timer=setInterval(()=>{if(existsSync(process.env.PROSPERO_TEST_READY_FILE)){clearInterval(timer);reply(request.id);}},10);}else if(request.method==="thread/start")reply(request.id,{thread:{id:"gated-fake-thread"}});else if(request.id!==undefined)reply(request.id);});\n`);
+    const executable = path.join(fakeBin, "codex");
+    writeFileSync(executable, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(fixture)} "$@"\n`, { mode: 0o700 });
+    chmodSync(executable, 0o700);
+    const root = path.join(home, "owners");
+    const session = await launchStructuredSupervisor({ root, sessionId: "delayed-native", agent: "codex", title: "synthetic delayed startup", cwd: home, createdAt: Date.now(), environment: { PATH: `${fakeBin}${path.delimiter}${process.env["PATH"] ?? ""}`, PROSPERO_TEST_READY_FILE: gate } });
+    const manifest = JSON.parse(readFileSync(path.join(root, "delayed-native", "manifest.json"), "utf8")) as StructuredSupervisorManifest;
+    const groupId = manifest.supervisorPid!; ownedGroups.add(groupId);
+    try {
+      expect(session.info().status).toBe("starting");
+      writeFileSync(gate, "ready");
+      await eventually(() => session.info().status === "idle", "native initialization lifecycle notification");
+      expect(session.snapshot().evSeq).toBe(0);
+      await session.kill();
+      await eventually(() => !processAlive(groupId), "synthetic owner termination");
+    } finally {
+      await session.dispose();
+      if (processAlive(groupId)) await stopOwnedGroup(groupId);
+      else ownedGroups.delete(groupId);
+    }
+  });
+
   it.skipIf(process.platform === "win32")("recovers an exact legacy live bootstrap only from its matching private manifest", async () => {
     const home = temp("prospero-legacy-live-launcher-");
     const fakeBin = temp("prospero-legacy-live-bin-");

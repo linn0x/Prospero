@@ -16,6 +16,7 @@ import {
   CAPABILITY_AGENT_API_PROTOCOLS,
   CAPABILITY_AGENT_API_VALIDATION,
   CAPABILITY_AGENT_API_ENGINE_VALIDATION,
+  CAPABILITY_SESSION_CREATE_RESULT,
   CAPABILITY_AGENT_DEEPSEEK_HARNESS,
   CAPABILITY_CHAT_ATTACHMENT_PREVIEWS,
   CAPABILITY_DEEPSEEK_TRAJECTORY,
@@ -790,6 +791,7 @@ export async function createDaemonServer(
 
   function orchestrationCapabilities(conn: Conn): string[] {
     const capabilities: string[] = [];
+    if (conn.protocolVersion >= 16) capabilities.push(CAPABILITY_SESSION_CREATE_RESULT);
     if (conn.protocolVersion >= 16 && conn.device?.allowShell) {
       capabilities.push(CAPABILITY_AGENT_API_PROTOCOLS, CAPABILITY_AGENT_API_VALIDATION, CAPABILITY_AGENT_API_ENGINE_VALIDATION);
     }
@@ -1344,33 +1346,49 @@ export async function createDaemonServer(
         return;
       }
       case "session.create": {
-        const info = await manager.create({
-          agent: msg.agent,
-          accountId: msg.accountId,
-          kind: msg.kind,
-          approvalPolicy: msg.approvalPolicy,
-          cwd: msg.cwd,
-          command: msg.command,
-          mode: msg.mode,
-          model: msg.model,
-          effort: msg.effort,
-          agentPreset: msg.agentPreset,
-          resume: msg.resume,
-          cols: msg.cols,
-          rows: msg.rows,
-          allowShell: device.allowShell,
-        });
-        if (msg.goal !== undefined) {
-          const run = orchestrationStore.createRun({
-            objective: msg.goal,
-            coordinatorSessionId: info.id,
-            coordinatorPrompt: true,
+        const requestId = conn.protocolVersion >= 16 ? msg.requestId : undefined;
+        let info: SessionInfo | undefined;
+        try {
+          info = await manager.create({
+            agent: msg.agent,
+            accountId: msg.accountId,
+            kind: msg.kind,
+            approvalPolicy: msg.approvalPolicy,
+            cwd: msg.cwd,
+            command: msg.command,
+            mode: msg.mode,
+            model: msg.model,
+            effort: msg.effort,
+            agentPreset: msg.agentPreset,
+            resume: msg.resume,
+            cols: msg.cols,
+            rows: msg.rows,
+            allowShell: device.allowShell,
           });
-          // Goal 的 Run 与 pending 投递账本已同次落盘；失败会由服务重试并在下次
-          // daemon 启动恢复，不能再只打一条日志就把协调者饿死。
-          void goalInitialization.deliver(run.id);
-          sendOrchestrationSnapshot(conn);
+          if (msg.goal !== undefined) {
+            const run = orchestrationStore.createRun({
+              objective: msg.goal,
+              coordinatorSessionId: info.id,
+              coordinatorPrompt: true,
+            });
+            // Goal 的 Run 与 pending 投递账本已同次落盘；失败会由服务重试并在下次
+            // daemon 启动恢复，不能再只打一条日志就把协调者饿死。
+            void goalInitialization.deliver(run.id);
+            sendOrchestrationSnapshot(conn);
+          }
+        } catch (error) {
+          if (!requestId) throw error;
+          send(conn, {
+            type: "session.create.result", requestId, ok: false,
+            ...(info ? { session: clampSessionInfo(info) } : {}),
+            error: info ? "会话已经创建，但 Goal 初始化失败；请先查看会话列表。" : error instanceof SessionError || error instanceof AgentAccountError || error instanceof RemoteSupervisorError || error instanceof OrchestrationError
+              ? error.message.slice(0, 2000) : "创建会话失败，请查看电脑端状态",
+            code: error instanceof SessionError ? error.code : error instanceof RemoteSupervisorError ? "agent_unavailable" : "bad_message",
+            ...(error instanceof SessionError && error.reason ? { reason: error.reason } : {}),
+          });
+          return;
         }
+        if (requestId) send(conn, { type: "session.create.result", requestId, ok: true, session: clampSessionInfo(info) });
         // 创建者自动 attach:结构化会话发 chat.snapshot,PTY 发画面快照(锚定 seq 基线)
         if (info.kind === "structured") {
           attachChat(conn, info.id);
