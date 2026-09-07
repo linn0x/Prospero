@@ -279,6 +279,10 @@ describe.skipIf(process.platform === "win32")("owner migration continuity", () =
     }) as typeof process.kill);
     const sessions = await reconnectStructuredSupervisors(root);
     expect(sessions).toHaveLength(3);
+    // Archive discovery must publish before background SQLite work begins.
+    // With thousands of dead owners, eagerly opening every staging database
+    // here starves daemon startup and prevents status.json publication.
+    expect(existsSync(path.join(root, "dead", "session.sqlite"))).toBe(false);
     await vi.waitFor(() => expect(JSON.parse(readFileSync(path.join(root, "dead", "manifest.json"), "utf8")).storageVersion).toBe(2));
     expect(existsSync(path.join(root, "dead", "session.sqlite"))).toBe(true);
     expect(existsSync(path.join(root, "live", "session.sqlite"))).toBe(false);
