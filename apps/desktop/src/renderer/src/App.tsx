@@ -14,6 +14,7 @@ import {
 } from "react";
 import {
   Activity,
+  Monitor,
   Archive,
   ArchiveRestore,
   ArrowDownAZ,
@@ -263,6 +264,7 @@ const AccountsPane = lazy(() =>
     default: module.AccountsPane,
   })),
 );
+const RemoteHostsPane = lazy(() => import("./RemoteHostsPane"));
 const DevicesPane = lazy(() =>
   import("./ManagementPanes").then((module) => ({
     default: module.DevicesPane,
@@ -283,6 +285,7 @@ const SkillsPane = lazy(() =>
 type View =
   | "overview"
   | "inbox"
+  | "remote"
   | "mobile"
   | "workspaces"
   | "runs"
@@ -293,6 +296,7 @@ type View =
 const views = new Set<View>([
   "overview",
   "inbox",
+  "remote",
   "mobile",
   "workspaces",
   "runs",
@@ -323,7 +327,8 @@ type NavItem = { id: View; label: string; icon: ComponentType };
 const primaryNav: NavItem[] = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
   { id: "inbox", label: "Inbox", icon: Mail },
-  { id: "mobile", label: "Remote control", icon: Smartphone },
+  { id: "remote", label: "Remote computers", icon: Monitor },
+  { id: "mobile", label: "Mobile", icon: Smartphone },
   { id: "workspaces", label: "Workspaces", icon: FolderKanban },
   { id: "runs", label: "Runs", icon: Workflow },
 ];
@@ -354,12 +359,13 @@ function getViewCopy(
           "Approvals, replies, and failure recovery",
         ),
       },
+      remote: {
+        title: t("远程电脑", "Remote computers"),
+        description: t("通过局域网或中继控制其他电脑的 Shell", "Control another computer’s Shell over LAN or relay"),
+      },
       mobile: {
-        title: t("远程控制", "Remote control"),
-        description: t(
-          "连接远程电脑或配对手机",
-          "Connect remote computers or pair phones",
-        ),
+        title: t("移动端", "Mobile"),
+        description: t("配对手机并管理远程访问权限", "Pair phones and manage remote access permissions"),
       },
       workspaces: {
         title: t("工作台", "Workspaces"),
@@ -4857,6 +4863,8 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
                 onOpenSession={openSession}
                 onOpenRuns={openRun}
               />
+            ) : view === "remote" ? (
+              <RemoteHostsPane />
             ) : view === "mobile" ? (
               <DevicesPane snapshot={sessionSnapshot} />
             ) : view === "workspaces" ? (
