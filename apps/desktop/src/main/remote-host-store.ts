@@ -1,7 +1,8 @@
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, rmSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import { safeStorage } from "electron";
-import { decodePairingQR, hostIdForDaemonPublicKey, type PairingPayload } from "@prospero/protocol";
+import { decodePairingQR, encodePairingQR, generateKeyPairB64, hostIdForDaemonPublicKey, type PairingPayload } from "@prospero/protocol";
 import type { RemoteHostSummary } from "../shared/types";
 import type { RemoteShellHost } from "./remote-shell-client";
 
@@ -17,23 +18,26 @@ export class RemoteHostStore {
 
   list(): RemoteHostSummary[] {
     this.load();
-    return [...this.hosts.values()].map(({ token: _token, daemonPubKey: _key, relay: _relay, ...summary }) => ({ ...summary }));
+    return [...this.hosts.values()].map((host) => this.summary(host));
   }
 
   importPairing(uri: string): RemoteHostSummary {
     this.load();
     const payload = decodePairingQR(uri.trim());
     const record = this.recordFromPayload(payload);
-    this.hosts.set(record.id, record);
-    this.save();
-    const { token: _token, daemonPubKey: _key, relay: _relay, ...summary } = record;
-    return { ...summary };
+    const previous = this.hosts.get(record.id);
+    record.clientKeys = previous?.clientKeys ?? generateKeyPairB64();
+    const next = new Map(this.hosts).set(record.id, record);
+    this.save(next);
+    this.hosts = next;
+    return this.summary(record);
   }
 
   remove(id: string): boolean {
     this.load();
-    const removed = this.hosts.delete(id);
-    if (removed) this.save();
+    const next = new Map(this.hosts);
+    const removed = next.delete(id);
+    if (removed) { this.save(next); this.hosts = next; }
     return removed;
   }
 
@@ -47,8 +51,14 @@ export class RemoteHostStore {
     this.load();
     const host = this.hosts.get(id);
     if (!host) return;
-    host.lastConnectedAt = at;
-    this.save();
+    const next = new Map(this.hosts).set(id, { ...host, lastConnectedAt: at });
+    this.save(next);
+    this.hosts = next;
+  }
+
+  private summary(host: StoredRemoteHost): RemoteHostSummary {
+    return { id: host.id, name: host.name, addrs: [...host.addrs], port: host.port,
+      hasRelay: Boolean(host.relay), ...(host.lastConnectedAt === undefined ? {} : { lastConnectedAt: host.lastConnectedAt }) };
   }
 
   private recordFromPayload(payload: PairingPayload): StoredRemoteHost {
@@ -65,28 +75,41 @@ export class RemoteHostStore {
 
   private load(): void {
     if (this.loaded) return;
-    this.loaded = true;
-    if (!existsSync(this.filePath)) return;
+    if (!existsSync(this.filePath)) { this.loaded = true; return; }
+    if (!safeStorage.isEncryptionAvailable()) throw new Error("系统安全存储不可用，请解锁后重试");
     try {
       const envelope = JSON.parse(readFileSync(this.filePath, "utf8")) as EncryptedFile;
-      if (envelope.v !== 1 || !safeStorage.isEncryptionAvailable()) return;
+      if (envelope.v !== 1) throw new Error("unsupported credential file");
       const records = JSON.parse(safeStorage.decryptString(Buffer.from(envelope.data, "base64"))) as StoredRemoteHost[];
-      if (!Array.isArray(records)) return;
+      if (!Array.isArray(records)) throw new Error("invalid credential file");
+      const next = new Map<string, StoredRemoteHost>();
+      let migrated = false;
       for (const record of records) {
-        if (record && typeof record.id === "string" && typeof record.token === "string" && typeof record.daemonPubKey === "string") {
-          this.hosts.set(record.id, record);
-        }
+        // Validate credentials without ever returning arbitrary disk fields to IPC.
+        decodePairingQR(encodePairingQR({ v: 7, name: record.name, addrs: record.addrs, port: record.port,
+          token: record.token, pubKey: record.daemonPubKey, ...(record.relay ? { relay: record.relay } : {}) }));
+        if (record.id !== hostIdForDaemonPublicKey(record.daemonPubKey)) throw new Error("invalid host identity");
+        if (!record.clientKeys) { record.clientKeys = generateKeyPairB64(); migrated = true; }
+        if (Buffer.from(record.clientKeys.publicKey, "base64").length !== 32 || Buffer.from(record.clientKeys.secretKey, "base64").length !== 32) throw new Error("invalid client identity");
+        next.set(record.id, record);
       }
+      if (migrated) this.save(next);
+      this.hosts = next;
+      this.loaded = true;
     } catch {
-      // Corrupt or unavailable credentials fail closed; the user can re-pair.
+      throw new Error("远程配对存储无法读取，原文件已保留，请检查系统钥匙串");
     }
   }
 
-  private save(): void {
+  private save(hosts: Map<string, StoredRemoteHost>): void {
     if (!safeStorage.isEncryptionAvailable()) throw new Error("系统安全存储不可用，无法保存远程主机配对");
     mkdirSync(dirname(this.filePath), { recursive: true });
-    const encrypted = safeStorage.encryptString(JSON.stringify([...this.hosts.values()]));
+    const encrypted = safeStorage.encryptString(JSON.stringify([...hosts.values()]));
     const envelope: EncryptedFile = { v: 1, data: encrypted.toString("base64") };
-    writeFileSync(this.filePath, JSON.stringify(envelope) + "\n", { mode: 0o600 });
+    const temporary = `${this.filePath}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(temporary, JSON.stringify(envelope) + "\n", { mode: 0o600, flag: "wx" });
+      renameSync(temporary, this.filePath);
+    } finally { rmSync(temporary, { force: true }); }
   }
 }

@@ -1,12 +1,13 @@
 import type { RemoteShellHost, RemoteShellMessage, RemoteShellClient } from "./remote-shell-client";
 import { RemoteShellClient as DefaultRemoteShellClient } from "./remote-shell-client";
-import { RemoteHostStore } from "./remote-host-store";
+import type { RemoteHostStore } from "./remote-host-store";
+import { randomUUID } from "node:crypto";
 
 export type RemoteShellEvent = {
   hostId: string;
   message:
     | RemoteShellMessage
-    | { type: "remote.connected" }
+    | { type: "remote.connected"; transport?: "direct" | "relay" | undefined }
     | { type: "remote.closed" }
     | { type: "remote.reconnecting"; attempt: number; delayMs: number }
     | { type: "remote.error"; message: string };
@@ -21,6 +22,8 @@ type RemoteConnection = {
   reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   reconnectAttempt: number;
   intentionalClose: boolean;
+  creating?: Promise<string> | undefined;
+  pendingCreate?: { requestId: string; resolve: (sid: string) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> } | undefined;
 };
 
 export type RemoteShellClientFactory = (host: RemoteShellHost) => RemoteShellClient;
@@ -70,9 +73,22 @@ export class RemoteShellManager {
     return this.startConnect(hostId, connection, true);
   }
 
-  async createShell(hostId: string, cwd?: string): Promise<void> {
-    const client = await this.connected(hostId);
-    client.createShell(cwd);
+  async createShell(hostId: string, cwd?: string): Promise<string> {
+    await this.connected(hostId);
+    const connection = this.clients.get(hostId)!;
+    if (connection.creating) return connection.creating;
+    const requestId = randomUUID();
+    const creating = new Promise<string>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        connection.pendingCreate = undefined;
+        reject(new Error("远程 Shell 创建超时，请先检查远程会话，避免重复创建"));
+      }, 15_000);
+      connection.pendingCreate = { requestId, resolve, reject, timer };
+      try { connection.client.createShell(cwd, 120, 36, requestId); }
+      catch (error) { this.rejectCreate(connection, error as Error); }
+    }).finally(() => { connection.creating = undefined; });
+    connection.creating = creating;
+    return creating;
   }
 
   input(hostId: string, sid: string, dataB64: string): void {
@@ -93,30 +109,44 @@ export class RemoteShellManager {
     const connection = this.clients.get(hostId);
     if (!connection) return;
     connection.intentionalClose = true;
+    this.rejectCreate(connection, new Error("连接已取消"));
     if (connection.reconnectTimer) clearTimeout(connection.reconnectTimer);
     this.clients.delete(hostId);
     connection.client.close();
+    this.publish({ hostId, message: { type: "remote.closed" } });
+  }
+
+  close(): void { for (const hostId of [...this.clients.keys()]) this.disconnect(hostId); }
+
+  private rejectCreate(connection: RemoteConnection, error: Error): void {
+    const pending = connection.pendingCreate;
+    if (pending) { clearTimeout(pending.timer); connection.pendingCreate = undefined; pending.reject(error); }
   }
 
   private bindClient(hostId: string, connection: RemoteConnection): void {
     const client = connection.client;
     client.on("connected", () => {
-      this.hosts.markConnected(hostId);
-      this.publish({ hostId, message: { type: "remote.connected" } });
+      if (connection.intentionalClose || this.clients.get(hostId) !== connection) return;
+      try { this.hosts.markConnected(hostId); }
+      catch (error) { this.publish({ hostId, message: { type: "remote.error", message: (error as Error).message } }); }
+      this.publish({ hostId, message: { type: "remote.connected", transport: client.transport } });
     });
     client.on("message", (message) => {
+      if (connection.intentionalClose || this.clients.get(hostId) !== connection) return;
       this.trackMessage(connection, message);
-      // Shell creation is correlated by the daemon's result message. Attach
-      // immediately so the first terminal snapshot follows without a second
-      // renderer round-trip.
-      if (message.type === "session.create.result" && message.ok && message.session) {
-        connection.sessions.set(message.session.id, { lastSeq: 0 });
-        client.attach(message.session.id);
+      const pending = connection.pendingCreate;
+      if (message.type === "session.create.result" && pending?.requestId === message.requestId) {
+        clearTimeout(pending.timer); connection.pendingCreate = undefined;
+        if (message.ok && message.session) pending.resolve(message.session.id);
+        else pending.reject(new Error(message.error ?? "远程 Shell 创建失败"));
+      } else if (message.type === "error" && pending) {
+        this.rejectCreate(connection, new Error(message.message));
       }
       this.publish({ hostId, message });
     });
     client.on("closed", () => {
       if (connection.intentionalClose || this.clients.get(hostId) !== connection) return;
+      this.rejectCreate(connection, new Error("连接中断，Shell 可能已经创建，请检查远程会话"));
       this.publish({ hostId, message: { type: "remote.closed" } });
       this.scheduleReconnect(hostId, connection);
     });
@@ -124,7 +154,7 @@ export class RemoteShellManager {
   }
 
   private trackMessage(connection: RemoteConnection, message: RemoteShellMessage): void {
-    if (message.type === "session.create.result" && message.ok && message.session) {
+    if (message.type === "session.create.result" && message.ok && message.session?.kind === "pty") {
       connection.sessions.set(message.session.id, { lastSeq: 0 });
       return;
     }
@@ -136,12 +166,14 @@ export class RemoteShellManager {
     if (message.type === "term.snapshot" || message.type === "term.output") {
       const tracked = connection.sessions.get(message.sid);
       if (tracked) tracked.lastSeq = Math.max(tracked.lastSeq, message.seq);
+      else connection.sessions.set(message.sid, { lastSeq: message.seq });
     }
   }
 
   private startConnect(hostId: string, connection: RemoteConnection, initial: boolean): Promise<{ name: string; sessions: number }> {
     const connecting = connection.client.connect()
       .then((hello) => {
+        if (connection.intentionalClose || this.clients.get(hostId) !== connection) { connection.client.close(); throw new Error("连接已取消"); }
         connection.reconnectAttempt = 0;
         if (connection.reconnectTimer) {
           clearTimeout(connection.reconnectTimer);
@@ -157,20 +189,21 @@ export class RemoteShellManager {
       })
       .catch((error: unknown) => {
         if (initial) {
-          this.clients.delete(hostId);
+          if (this.clients.get(hostId) === connection) this.clients.delete(hostId);
           connection.intentionalClose = true;
-        } else {
-          this.scheduleReconnect(hostId, connection);
         }
         throw error;
       })
-      .finally(() => { connection.connecting = undefined; });
+      .finally(() => {
+        connection.connecting = undefined;
+        if (!connection.client.isConnected) this.scheduleReconnect(hostId, connection);
+      });
     connection.connecting = connecting;
     return connecting;
   }
 
   private scheduleReconnect(hostId: string, connection: RemoteConnection): void {
-    if (connection.intentionalClose || this.clients.get(hostId) !== connection || connection.reconnectTimer || connection.connecting) return;
+    if (connection.intentionalClose || connection.client.retryable === false || this.clients.get(hostId) !== connection || connection.reconnectTimer || connection.connecting) return;
     const attempt = connection.reconnectAttempt + 1;
     connection.reconnectAttempt = attempt;
     const delayMs = RECONNECT_DELAYS_MS[Math.min(attempt - 1, RECONNECT_DELAYS_MS.length - 1)]!;

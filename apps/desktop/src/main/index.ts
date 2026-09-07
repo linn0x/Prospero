@@ -740,10 +740,13 @@ function installIpc(): void {
   ipcMain.handle("remote-host:list", () => remoteHostStore.list());
   ipcMain.handle("remote-host:import", (_event, raw: unknown) => {
     if (typeof raw !== "string" || raw.trim().length === 0) throw new Error("配对二维码内容无效");
-    return remoteHostStore.importPairing(raw);
+    const host = remoteHostStore.importPairing(raw);
+    remoteShellManager.disconnect(host.id);
+    return host;
   });
   ipcMain.handle("remote-host:remove", (_event, raw: unknown) => {
     if (typeof raw !== "string" || !SAFE_ID.test(raw)) throw new Error("远程主机 ID 无效");
+    remoteShellManager.disconnect(raw);
     return { ok: remoteHostStore.remove(raw) };
   });
   ipcMain.handle("remote-shell:connect", (_event, raw: unknown) => remoteShellManager.connect(requireId(raw, "远程主机")));
@@ -1177,7 +1180,7 @@ function installIpc(): void {
   });
 }
 
-app.on("before-quit", () => { quitting = true; });
+app.on("before-quit", () => { quitting = true; remoteShellManager.close(); });
 app.on("window-all-closed", () => { /* The window close handler applies the background-running preference. */ });
 app.on("activate", () => {
   showMainWindow();
