@@ -14,7 +14,7 @@ const sidebar = readFileSync(
 );
 
 describe("desktop shell structure", () => {
-  it("removes persistent brand and search chrome", () => {
+  it("keeps the wordmark without the old workbench icon or search chrome", () => {
     expect(app).not.toContain('className="sidebar-brand"');
     expect(app).not.toContain('className="search-trigger"');
     expect(app).toContain('setLauncher("command")');
