@@ -323,7 +323,7 @@ type NavItem = { id: View; label: string; icon: ComponentType };
 const primaryNav: NavItem[] = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
   { id: "inbox", label: "Inbox", icon: Mail },
-  { id: "mobile", label: "Mobile", icon: Smartphone },
+  { id: "mobile", label: "Remote control", icon: Smartphone },
   { id: "workspaces", label: "Workspaces", icon: FolderKanban },
   { id: "runs", label: "Runs", icon: Workflow },
 ];
@@ -355,10 +355,10 @@ function getViewCopy(
         ),
       },
       mobile: {
-        title: t("移动端", "Mobile"),
+        title: t("远程控制", "Remote control"),
         description: t(
-          "配对手机并管理远程访问权限",
-          "Pair phones and manage remote access permissions",
+          "连接远程电脑或配对手机",
+          "Connect remote computers or pair phones",
         ),
       },
       workspaces: {
