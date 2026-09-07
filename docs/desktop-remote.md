@@ -1,8 +1,8 @@
 # Desktop remote Shell
 
-Prospero desktop can act as both a host and a remote client. Open **远程控制 / Remote control** in the sidebar.
+Prospero desktop can act as both a host and a remote client. Open the dedicated **远程电脑 / Remote computers** tab in the sidebar. **移动端 / Mobile** remains a separate page for incoming device pairing.
 
-1. On the computer to control, generate a new pairing code under **让其他设备连接本机**. Keep **允许 Shell / Agent 会话** enabled. Copy the pairing code.
+1. On the computer to control, generate a new pairing code under **移动端 → 让其他设备连接本机**. Keep **允许 Shell / Agent 会话** enabled. Copy the pairing code.
 2. On the controlling computer, expand **添加远程电脑**, paste the code and select **导入电脑**.
 3. Select **连接 Shell**. An existing live PTY is offered first; otherwise a new Shell is created. Run `codex`, `claude` or another installed CLI inside that terminal.
 
