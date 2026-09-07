@@ -1,6 +1,6 @@
 {
   "name": "@prospero/desktop",
-  "version": "0.0.13",
+  "version": "0.0.14",
   "private": true,
   "description": "Prospero local agent workspace for Windows",
   "author": "Prospero contributors",

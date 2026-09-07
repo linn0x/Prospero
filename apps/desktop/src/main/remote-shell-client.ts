@@ -158,7 +158,7 @@ export class RemoteShellClient {
               if (!channel) {
                 const finished = clientHandshakeFinish(state, text, this.host.daemonPubKey, {
                   type: "hello", token: this.host.token, clientPubKey: this.clientKeys.publicKey,
-                  clientInfo: { platform: "desktop", appVersion: "0.0.13" },
+                  clientInfo: { platform: "desktop", appVersion: "0.0.14" },
                 });
                 channel = finished.channel;
                 socket!.send(finished.frame);
