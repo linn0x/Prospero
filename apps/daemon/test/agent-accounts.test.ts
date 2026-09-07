@@ -523,11 +523,11 @@ describe("Code Agent 账号隔离", () => {
       adapterFactory: () => new EnvAdapter(restoredContexts),
     });
     const restored = await restoredManager.restoreStructured();
-    expect(restored.map((session) => session.accountId)).toEqual([first.id, second.id]);
-    expect(restoredContexts.map((context) => context.env["CODEX_HOME"])).toEqual([
+    expect(new Map(restored.map((session) => [session.id, session.accountId]))).toEqual(new Map([[left.id, first.id], [right.id, second.id]]));
+    expect(restoredContexts.map((context) => context.env["CODEX_HOME"]).sort()).toEqual([
       first.environment["CODEX_HOME"],
       second.environment["CODEX_HOME"],
-    ]);
+    ].sort());
     await restoredManager.disposeAll();
   });
 
