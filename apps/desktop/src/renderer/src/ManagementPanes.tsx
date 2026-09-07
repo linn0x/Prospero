@@ -837,7 +837,6 @@ export function SettingsPane({ snapshot }: { snapshot: DesktopSnapshot }) {
     <div className="page settings-page">
       <header className="page-header">
         <div>
-          <span className="eyebrow">{t("偏好设置", "PREFERENCES")}</span>
           <h1>{t("设置", "Settings")}</h1>
           <p>{t("桌面行为、终端外观、daemon 与 Relay。", "Desktop behavior, terminal appearance, daemon, and relay.")}</p>
         </div>
