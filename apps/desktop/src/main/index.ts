@@ -495,7 +495,7 @@ async function runDesktopSelfCheck(window: BrowserWindow): Promise<void> {
   const sidebarMenuCheck = await window.webContents.executeJavaScript(`(async () => {
     const openAndCheck = async (selector) => {
       const trigger = document.querySelector(selector);
-      if (!trigger) return { selector, skipped: selector === '[data-testid="workspace-project-more"]', found: false, popup: false, healthyRoot: Boolean(document.querySelector('#root')?.childElementCount) };
+      if (!trigger) return { selector, skipped: false, found: false, popup: false, healthyRoot: Boolean(document.querySelector('#root')?.childElementCount) };
       trigger.click();
       await new Promise((done) => setTimeout(done, 120));
       const popup = document.querySelector('[data-slot="dropdown-menu-content"]');
@@ -571,15 +571,13 @@ async function runDesktopSelfCheck(window: BrowserWindow): Promise<void> {
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
     }
     const group = await openAndCheck('[data-testid="workspace-more"]');
-    const project = await openAndCheck('[data-testid="workspace-project-more"]');
     const directoryButton = document.querySelector('.workspace-project-button');
-    const directoryMore = document.querySelector('[data-testid="workspace-project-more"]');
-    const directoryCount = document.querySelector('.workspace-session-count');
+    const directoryCount = directoryButton?.querySelector('.workspace-session-count');
     directoryButton?.focus();
     await new Promise((done) => setTimeout(done, 60));
-    const directoryFocus = directoryButton && directoryMore && directoryCount
-      ? { skipped: false, moreOpacity: getComputedStyle(directoryMore).opacity, countOpacity: getComputedStyle(directoryCount).opacity }
-      : { skipped: true, moreOpacity: '', countOpacity: '' };
+    const directoryFocus = directoryButton && directoryCount
+      ? { skipped: false, countOpacity: getComputedStyle(directoryCount).opacity }
+      : { skipped: true, countOpacity: '' };
     directoryButton?.blur();
     const pinFixture = document.createElement('div');
     pinFixture.className = 'prospero-sidebar';
@@ -602,7 +600,6 @@ async function runDesktopSelfCheck(window: BrowserWindow): Promise<void> {
     };
     return {
       group,
-      project,
       rail: sidebarToggle,
       viewport: { width: innerWidth, mobile: mobileViewport },
       context,
@@ -610,15 +607,14 @@ async function runDesktopSelfCheck(window: BrowserWindow): Promise<void> {
       pinVisibility,
       footer,
     };
-  })()`) as { group: { skipped: boolean; found: boolean; popup: boolean; healthyRoot: boolean }; project: { skipped: boolean; found: boolean; popup: boolean; healthyRoot: boolean }; rail: { mode: "desktop" | "mobile"; found: boolean; before: string; after: string; restored?: string; ready: string }; viewport: { width: number; mobile: boolean }; context: { skipped: boolean; popup: boolean; healthyRoot: boolean }; directoryFocus: { skipped: boolean; moreOpacity: string; countOpacity: string }; pinVisibility: { pinnedAreaOpacity: string; workspaceOpacity: string }; footer: { count: number; sameRow: boolean; daemonText: string } };
+  })()`) as { group: { skipped: boolean; found: boolean; popup: boolean; healthyRoot: boolean }; rail: { mode: "desktop" | "mobile"; found: boolean; before: string; after: string; restored?: string; ready: string }; viewport: { width: number; mobile: boolean }; context: { skipped: boolean; popup: boolean; healthyRoot: boolean }; directoryFocus: { skipped: boolean; countOpacity: string }; pinVisibility: { pinnedAreaOpacity: string; workspaceOpacity: string }; footer: { count: number; sameRow: boolean; daemonText: string } };
   const sidebarToggleReady = sidebarMenuCheck.rail.mode === "desktop"
     ? sidebarMenuCheck.rail.found && sidebarMenuCheck.rail.before !== sidebarMenuCheck.rail.after && sidebarMenuCheck.rail.before === sidebarMenuCheck.rail.restored && sidebarMenuCheck.rail.ready === "expanded"
     : sidebarMenuCheck.rail.found && (sidebarMenuCheck.rail.before === "open" || sidebarMenuCheck.rail.after === "open") && sidebarMenuCheck.rail.ready === "open";
   const sidebarMenusReady = sidebarMenuCheck.group.found && sidebarMenuCheck.group.popup && sidebarMenuCheck.group.healthyRoot
-    && (sidebarMenuCheck.project.skipped || (sidebarMenuCheck.project.found && sidebarMenuCheck.project.popup && sidebarMenuCheck.project.healthyRoot))
     && sidebarToggleReady
     && (sidebarMenuCheck.context.skipped || (sidebarMenuCheck.context.popup && sidebarMenuCheck.context.healthyRoot))
-    && (sidebarMenuCheck.directoryFocus.skipped || (Number(sidebarMenuCheck.directoryFocus.moreOpacity) <= 0.01 && Number(sidebarMenuCheck.directoryFocus.countOpacity) >= 0.99))
+    && (sidebarMenuCheck.directoryFocus.skipped || Number(sidebarMenuCheck.directoryFocus.countOpacity) >= 0.99)
     && Number(sidebarMenuCheck.pinVisibility.pinnedAreaOpacity) >= 0.99
     && Number(sidebarMenuCheck.pinVisibility.workspaceOpacity) >= 0.99
     && sidebarMenuCheck.footer.count === 2 && sidebarMenuCheck.footer.sameRow
