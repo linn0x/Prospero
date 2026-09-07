@@ -31,6 +31,7 @@ const SIDEBAR_COOKIE_MAX_AGE = 60 * 60 * 24 * 7
 const SIDEBAR_WIDTH_STORAGE_KEY = "prospero.sidebarWidth"
 const SIDEBAR_DEFAULT_WIDTH = 240
 const SIDEBAR_MIN_WIDTH = 200
+const SIDEBAR_DRAG_COLLAPSE_WIDTH = 144
 const SIDEBAR_MAX_WIDTH = 420
 const SIDEBAR_WIDTH_MOBILE = "18rem"
 const SIDEBAR_WIDTH_ICON = "52px"
@@ -322,7 +323,7 @@ function SidebarRail({ className, onClick, onKeyDown, ...props }: React.Componen
   const { open, setOpen, toggleSidebar, width, setWidth, wrapperRef } = useSidebar()
   const drag = React.useRef<{
     pointerId: number; startX: number; startWidth: number; width: number;
-    wasOpen: boolean; moved: boolean; element: HTMLButtonElement; side: number;
+    wasOpen: boolean; expanded: boolean; moved: boolean; element: HTMLButtonElement; side: number;
   } | null>(null)
   const frame = React.useRef<number | undefined>(undefined)
   const suppressClick = React.useRef(false)
@@ -337,13 +338,13 @@ function SidebarRail({ className, onClick, onKeyDown, ...props }: React.Componen
     const wrapper = wrapperRef.current
     if (wrapper) {
       delete wrapper.dataset.sidebarResizing
-      const next = cancel ? width : current.width
+      const next = cancel || !current.expanded ? width : current.width
       wrapper.style.setProperty("--sidebar-width", `min(${next}px, max(${SIDEBAR_MIN_WIDTH}px, calc(100vw - 480px)))`)
     }
     suppressClick.current = current.moved
     if (current.moved) {
-      if (cancel) setOpen(current.wasOpen)
-      else setWidth(current.width)
+      setOpen(cancel ? current.wasOpen : current.expanded)
+      if (!cancel && current.expanded) setWidth(current.width)
     }
     if (current.element.hasPointerCapture(current.pointerId)) current.element.releasePointerCapture(current.pointerId)
   }, [setOpen, setWidth, width, wrapperRef])
@@ -383,7 +384,7 @@ function SidebarRail({ className, onClick, onKeyDown, ...props }: React.Componen
         drag.current = {
           pointerId: event.pointerId, startX: event.clientX,
           startWidth: sidebar.getBoundingClientRect().width, width,
-          wasOpen: open, moved: false, element,
+          wasOpen: open, expanded: open, moved: false, element,
           side: sidebar.dataset.side === "right" ? -1 : 1,
         }
       }}
@@ -396,9 +397,14 @@ function SidebarRail({ className, onClick, onKeyDown, ...props }: React.Componen
           current.moved = true
           document.documentElement.dataset.sidebarResizing = "true"
           if (wrapperRef.current) wrapperRef.current.dataset.sidebarResizing = "true"
-          if (!current.wasOpen) setOpen(true)
         }
-        current.width = Math.round(Math.max(SIDEBAR_MIN_WIDTH, Math.min(sidebarWidthLimit(), current.startWidth + delta)))
+        const targetWidth = current.startWidth + delta
+        const expanded = targetWidth >= (current.expanded ? SIDEBAR_DRAG_COLLAPSE_WIDTH : SIDEBAR_MIN_WIDTH)
+        if (expanded !== current.expanded) {
+          current.expanded = expanded
+          setOpen(expanded)
+        }
+        current.width = Math.round(Math.max(SIDEBAR_MIN_WIDTH, Math.min(sidebarWidthLimit(), targetWidth)))
         if (frame.current === undefined) frame.current = requestAnimationFrame(() => {
           frame.current = undefined
           if (drag.current) wrapperRef.current?.style.setProperty("--sidebar-width", `${drag.current.width}px`)
@@ -430,7 +436,7 @@ function SidebarRail({ className, onClick, onKeyDown, ...props }: React.Componen
       }}
       title="Drag to resize; double-click to reset"
       className={cn(
-        "absolute inset-y-0 z-20 hidden w-2 touch-none cursor-col-resize group-data-[side=left]:-right-1 group-data-[side=right]:-left-1 after:absolute after:inset-y-0 after:left-1/2 after:w-px hover:after:bg-sidebar-ring focus-visible:after:bg-sidebar-ring sm:flex",
+        "absolute inset-y-0 z-20 hidden w-2 touch-none cursor-col-resize group-data-[side=left]:-right-1 group-data-[side=right]:-left-1 after:absolute after:left-1/2 sm:flex",
         className
       )}
       {...props}
