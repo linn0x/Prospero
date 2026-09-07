@@ -16,6 +16,8 @@ import {
   CAPABILITY_AGENT_API_PROTOCOLS,
   CAPABILITY_AGENT_API_VALIDATION,
   CAPABILITY_AGENT_API_ENGINE_VALIDATION,
+  CAPABILITY_AGENT_API_MODELS,
+  CAPABILITY_AGENT_ACCOUNT_CONFIG,
   CAPABILITY_SESSION_CREATE_RESULT,
   CAPABILITY_AGENT_DEEPSEEK_HARNESS,
   CAPABILITY_CHAT_ATTACHMENT_PREVIEWS,
@@ -112,6 +114,7 @@ import {
   AgentAccountManager,
   type AccountCommandRunner,
 } from "./agent-accounts.js";
+import { AgentAccountFeatureError } from "./agent-account-feature-error.js";
 import { CodexAdapter } from "./adapters/codex.js";
 import { listDiscoveredSkills } from "./composer-context.js";
 
@@ -204,6 +207,8 @@ type AgentAccountControlMessage = Extract<C2SMessage, {
 }>;
 
 type AgentAccountControlResult = Extract<S2CMessage, { type: "agent.accounts.result" }>;
+type AgentAccountFeatureMessage = Extract<C2SMessage, { type: "agent.account.api.models.get" | "agent.account.config.get" | "agent.account.config.set" }>;
+type AgentAccountFeatureResult = Extract<S2CMessage, { type: "agent.account.api.models.result" | "agent.account.config.result" }>;
 
 class ControlRequestError extends Error {
   constructor(message: string, readonly status: number) {
@@ -406,6 +411,7 @@ export async function createDaemonServer(
   });
   const conns = new Set<Conn>();
   const fsPutChains = new Map<string, Promise<void>>();
+  let accountFeatureRequests = 0;
   let unauthenticatedConnections = 0;
   const devMode = opts.devMode ?? false;
   const notifier = new Notifier(opts.notify ?? null);
@@ -790,11 +796,42 @@ export async function createDaemonServer(
     }
   }
 
+  async function performAccountFeature(message: AgentAccountFeatureMessage, signal?: AbortSignal): Promise<{ status: number; result: AgentAccountFeatureResult }> {
+    const models = message.type === "agent.account.api.models.get";
+    if (accountFeatureRequests >= 4) {
+      const error = { code: "busy" as const, message: "账号工具繁忙，请稍后重试" };
+      return { status: 429, result: models ? { type: "agent.account.api.models.result", requestId: message.requestId, ok: false, models: [], error }
+        : { type: "agent.account.config.result", requestId: message.requestId, ok: false, error } };
+    }
+    accountFeatureRequests++;
+    try {
+      if (!accountSessionsRestored) throw new AgentAccountFeatureError("busy", "正在恢复已有会话，请稍后重试");
+      if (message.type === "agent.account.api.models.get") {
+        const entries = await accounts.apiModels(message, { ...(signal ? { signal } : {}) });
+        return { status: 200, result: { type: "agent.account.api.models.result", requestId: message.requestId, ok: true, models: entries } };
+      }
+      await accounts.getConfig(message.accountId, manager.list());
+      const binding = accounts.resolve(message.accountId);
+      const catalog = binding.apiProfile ? undefined : await manager.launchModels(binding.agent, binding.id).catch(() => undefined);
+      const config = message.type === "agent.account.config.get"
+        ? await accounts.getConfig(message.accountId, manager.list(), catalog)
+        : await accounts.setConfig(message, manager.list(), catalog);
+      return { status: 200, result: { type: "agent.account.config.result", requestId: message.requestId, ok: true, config } };
+    } catch (error) {
+      const feature = error instanceof AgentAccountFeatureError ? error.toJSON()
+        : error instanceof AgentAccountError ? { code: error.code === "account_not_found" ? "not_found" as const : error.code === "account_not_managed" ? "forbidden" as const : error.code === "account_in_use" ? "busy" as const : "invalid_request" as const, message: error.message }
+          : { code: "storage" as const, message: "账号工具操作失败，请重试" };
+      return { status: feature.code === "conflict" ? 409 : feature.code === "forbidden" ? 403 : feature.code === "not_found" ? 404 : 400,
+        result: models ? { type: "agent.account.api.models.result", requestId: message.requestId, ok: false, models: [], error: feature }
+          : { type: "agent.account.config.result", requestId: message.requestId, ok: false, error: feature } };
+    } finally { accountFeatureRequests--; }
+  }
+
   function orchestrationCapabilities(conn: Conn): string[] {
     const capabilities: string[] = [];
     if (conn.protocolVersion >= 16) capabilities.push(CAPABILITY_SESSION_CREATE_RESULT);
     if (conn.protocolVersion >= 16 && conn.device?.allowShell) {
-      capabilities.push(CAPABILITY_AGENT_API_PROTOCOLS, CAPABILITY_AGENT_API_VALIDATION, CAPABILITY_AGENT_API_ENGINE_VALIDATION);
+      capabilities.push(CAPABILITY_AGENT_API_PROTOCOLS, CAPABILITY_AGENT_API_VALIDATION, CAPABILITY_AGENT_API_ENGINE_VALIDATION, CAPABILITY_AGENT_API_MODELS, CAPABILITY_AGENT_ACCOUNT_CONFIG);
     }
     if (conn.protocolVersion >= 15) capabilities.push(CAPABILITY_FS_PUT_ACK);
     capabilities.push(CAPABILITY_AGENT_DEEPSEEK_HARNESS);
@@ -1285,6 +1322,19 @@ export async function createDaemonServer(
       }
       case "agent.accounts.list": {
         send(conn, (await performAccountControl(msg, conn.disconnect.signal)).result);
+        return;
+      }
+      case "agent.account.api.models.get":
+      case "agent.account.config.get":
+      case "agent.account.config.set": {
+        if (conn.protocolVersion < 16 || !device.allowShell) {
+          const error = { code: "forbidden" as const, message: "当前协议或设备权限不支持账号模型目录与高级配置，请升级或检查权限" };
+          send(conn, msg.type === "agent.account.api.models.get"
+            ? { type: "agent.account.api.models.result", requestId: msg.requestId, ok: false, models: [], error }
+            : { type: "agent.account.config.result", requestId: msg.requestId, ok: false, error });
+          return;
+        }
+        send(conn, (await performAccountFeature(msg, conn.disconnect.signal)).result);
         return;
       }
       case "agent.account.create":
@@ -2516,8 +2566,21 @@ export async function createDaemonServer(
       try {
         // 8 KiB is the largest protocol credential; leave bounded JSON overhead
         // rather than letting a local caller hold the daemon in a huge body read.
-        const body = await readControlJson(req, 24 * 1024);
+        const body = await readControlJson(req, 32 * 1024, body => body["type"] === "agent.account.config.set" ? 32 * 1024 : 16 * 1024);
         const message = parseC2S(body);
+        if (message.type === "agent.account.api.models.get" || message.type === "agent.account.config.get" || message.type === "agent.account.config.set") {
+          const controller = new AbortController();
+          const abort = (): void => { if (!res.writableEnded) controller.abort(); };
+          res.once("close", abort);
+          try {
+            const outcome = await performAccountFeature(message, controller.signal);
+            if (!res.destroyed) {
+              res.writeHead(outcome.status, { "content-type": "application/json" });
+              res.end(JSON.stringify(outcome.result));
+            }
+          } finally { res.removeListener("close", abort); }
+          return;
+        }
         if (!isAgentAccountControlMessage(message)) {
           throw new ControlRequestError("expected an agent account protocol message", 400);
         }
@@ -3054,6 +3117,7 @@ export async function createDaemonServer(
   async function readControlJson(
     req: IncomingMessage,
     maxBytes = 4 * 1024 * 1024,
+    limitForBody?: (body: Record<string, unknown>) => number,
   ): Promise<Record<string, unknown>> {
     const chunks: Buffer[] = [];
     let bytes = 0;
@@ -3072,6 +3136,7 @@ export async function createDaemonServer(
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       throw new ControlRequestError("控制请求必须是 JSON 对象", 400);
     }
+    if (limitForBody && bytes > limitForBody(parsed as Record<string, unknown>)) throw new ControlRequestError("控制请求过大", 413);
     return parsed as Record<string, unknown>;
   }
 

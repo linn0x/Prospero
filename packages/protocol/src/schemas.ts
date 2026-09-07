@@ -34,6 +34,7 @@ export const AgentApiProtocolSchema = z.enum([
 ]);
 
 export const AgentExecutionEngineSchema = z.enum(["codex", "claude", "opencode"]);
+export const AgentReasoningEffortSchema = z.enum(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
 export const AgentAccountCapabilitiesSchema = z.object({
   sessionKinds: z.array(z.enum(["pty", "structured"])).max(2),
   plan: z.boolean(),
@@ -47,6 +48,7 @@ export const AgentModelCapabilitiesSchema = z.object({
   tools: z.boolean().optional(),
   vision: z.boolean().optional(),
   reasoning: z.boolean().optional(),
+  supportedEfforts: z.array(AgentReasoningEffortSchema).max(10).optional(),
 }).refine((value) => value.contextWindow === undefined || value.maxOutputTokens === undefined ||
   value.maxOutputTokens <= value.contextWindow, { message: "maxOutputTokens must not exceed contextWindow" });
 const AgentApiValidationCheckSchema = z.enum(["passed", "failed", "not_tested"]);
@@ -468,6 +470,80 @@ export const C2SAgentAccountApiTestSchema = z.object({
   requestId: z.string().min(1).max(100),
   accountId: z.string().min(1).max(100),
   scope: z.enum(["protocol", "engine"]).optional(),
+});
+
+export const C2SAgentAccountApiModelsGetSchema = z.object({
+  type: z.literal("agent.account.api.models.get"),
+  requestId: z.string().min(1).max(100),
+  accountId: z.string().min(1).max(100).optional(),
+  protocol: AgentApiProtocolSchema.optional(),
+  baseUrl: z.string().trim().url().max(2000).optional(),
+  apiKey: z.string().trim().min(1).max(8192).optional(),
+}).strict();
+
+export const C2SAgentAccountConfigGetSchema = z.object({
+  type: z.literal("agent.account.config.get"),
+  requestId: z.string().min(1).max(100),
+  accountId: z.string().min(1).max(100),
+}).strict();
+
+export const C2SAgentAccountConfigSetSchema = z.object({
+  type: z.literal("agent.account.config.set"),
+  requestId: z.string().min(1).max(100),
+  accountId: z.string().min(1).max(100),
+  documentId: z.string().regex(/^[a-z][a-z0-9-]{0,79}$/),
+  revision: z.string().regex(/^[a-f0-9]{64}$/),
+  content: z.string().max(16_384).optional(),
+  defaultEffort: AgentReasoningEffortSchema.nullable().optional(),
+}).strict();
+
+export const AgentAccountFeatureErrorSchema = z.object({
+  code: z.enum(["authentication", "unsupported", "network", "timeout", "invalid_format", "empty_catalog", "limit_exceeded", "invalid_request", "not_found", "forbidden", "conflict", "syntax", "invalid_config", "storage", "busy"]),
+  message: z.string().min(1).max(500),
+  line: z.number().int().positive().optional(),
+  column: z.number().int().positive().optional(),
+});
+
+export const AgentApiCatalogModelSchema = z.object({
+  id: z.string().min(1).max(300),
+  label: z.string().max(300).optional(),
+  owner: z.string().max(300).optional(),
+  description: z.string().max(1000).optional(),
+});
+
+export const AgentAccountConfigSchema = z.object({
+  accountId: z.string().min(1).max(100),
+  documents: z.array(z.object({
+    id: z.string().min(1).max(80),
+    label: z.string().min(1).max(120),
+    format: z.enum(["yaml", "toml"]),
+    content: z.string().max(16_384),
+    revision: z.string().regex(/^[a-f0-9]{64}$/),
+    writable: z.boolean(),
+    generated: z.boolean(),
+    editableKeys: z.array(z.string().max(80)).max(20),
+  })).max(4),
+  defaultEffort: AgentReasoningEffortSchema.optional(),
+  defaultModel: z.string().min(1).max(300).optional(),
+  supportedEfforts: z.array(AgentReasoningEffortSchema).max(10),
+  appliesTo: z.literal("new_sessions"),
+  activeSessions: z.number().int().nonnegative(),
+});
+
+export const S2CAgentAccountApiModelsResultSchema = z.object({
+  type: z.literal("agent.account.api.models.result"),
+  requestId: z.string().min(1).max(100),
+  ok: z.boolean(),
+  models: z.array(AgentApiCatalogModelSchema).max(1000),
+  error: AgentAccountFeatureErrorSchema.optional(),
+});
+
+export const S2CAgentAccountConfigResultSchema = z.object({
+  type: z.literal("agent.account.config.result"),
+  requestId: z.string().min(1).max(100),
+  ok: z.boolean(),
+  config: AgentAccountConfigSchema.optional(),
+  error: AgentAccountFeatureErrorSchema.optional(),
 });
 
 export const C2SAgentAccountRenameSchema = z.object({
@@ -1153,6 +1229,9 @@ export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SAgentAccountApiCreateSchema,
   C2SAgentAccountApiConfigureSchema,
   C2SAgentAccountApiTestSchema,
+  C2SAgentAccountApiModelsGetSchema,
+  C2SAgentAccountConfigGetSchema,
+  C2SAgentAccountConfigSetSchema,
   C2SAgentAccountRenameSchema,
   C2SAgentAccountSetDefaultSchema,
   C2SAgentAccountLoginSchema,
@@ -1840,6 +1919,8 @@ export const S2CMessageSchema = z.discriminatedUnion("type", [
   S2CWorkspaceListingSchema,
   S2CConversationResultsSchema,
   S2CAgentAccountsResultSchema,
+  S2CAgentAccountApiModelsResultSchema,
+  S2CAgentAccountConfigResultSchema,
   S2CFsListingSchema,
   S2CFsContentSchema,
   S2CFsWrittenSchema,
@@ -1882,6 +1963,15 @@ export type CodeAgentKind = z.infer<typeof CodeAgentKindSchema>;
 export type AgentCredentialKind = z.infer<typeof AgentCredentialKindSchema>;
 export type AgentApiProvider = z.infer<typeof AgentApiProviderSchema>;
 export type AgentApiProtocol = z.infer<typeof AgentApiProtocolSchema>;
+export type AgentReasoningEffort = z.infer<typeof AgentReasoningEffortSchema>;
+export type AgentApiCatalogModel = z.infer<typeof AgentApiCatalogModelSchema>;
+export type AgentAccountFeatureError = z.infer<typeof AgentAccountFeatureErrorSchema>;
+export type AgentAccountConfig = z.infer<typeof AgentAccountConfigSchema>;
+export type C2SAgentAccountApiModelsGet = z.infer<typeof C2SAgentAccountApiModelsGetSchema>;
+export type C2SAgentAccountConfigGet = z.infer<typeof C2SAgentAccountConfigGetSchema>;
+export type C2SAgentAccountConfigSet = z.infer<typeof C2SAgentAccountConfigSetSchema>;
+export type S2CAgentAccountApiModelsResult = z.infer<typeof S2CAgentAccountApiModelsResultSchema>;
+export type S2CAgentAccountConfigResult = z.infer<typeof S2CAgentAccountConfigResultSchema>;
 export type AgentApiProfile = z.infer<typeof AgentApiProfileSchema>;
 export type AgentExecutionEngine = z.infer<typeof AgentExecutionEngineSchema>;
 export type AgentAccountCapabilities = z.infer<typeof AgentAccountCapabilitiesSchema>;

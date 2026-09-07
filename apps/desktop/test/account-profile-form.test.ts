@@ -120,12 +120,25 @@ describe("API validation and optional model metadata", () => {
   });
 
   it("rejects invalid limits instead of silently saving them", () => {
-    for (const contextWindow of ["-1", "0", "1.5", "2e3", "9007199254740992"]) {
+    for (const contextWindow of ["-1", "0", "1.5", "2e3", "100000001", "9007199254740992"]) {
       expect(() => parseModelCapabilities({ ...modelCapabilityDraft(), contextWindow })).toThrow();
     }
     expect(() => parseModelCapabilities({ ...modelCapabilityDraft(), contextWindow: "100", maxOutputTokens: "101" })).toThrow("Output limit");
     expect(() => parseModelCapabilities({ ...modelCapabilityDraft(), contextWindow: "100" }, {}, "openai_chat_completions")).toThrow("both token limits");
     expect(parseModelCapabilities({ ...modelCapabilityDraft(), contextWindow: "100" }, {}, "openai_responses")).toEqual({ contextWindow: 100 });
+  });
+
+  it("normalizes explicit supported efforts separately from boolean reasoning", () => {
+    const draft = { ...modelCapabilityDraft(), supportedEfforts: "LOW, high，low medium" };
+    expect(parseModelCapabilities(draft)).toEqual({ supportedEfforts: ["low", "high", "medium"] });
+    expect(() => parseModelCapabilities({ ...draft, reasoning: "false" })).toThrow("non-reasoning");
+    expect(() => parseModelCapabilities({ ...draft, supportedEfforts: "unknown" })).toThrow("Unsupported");
+    expect(() => parseModelCapabilities({ ...draft, supportedEfforts: "none" }, {}, "anthropic")).toThrow("Unsupported");
+    const initial = { reasoning: true, supportedEfforts: ["low", "high"], futureCapability: "preserve" };
+    expect(modelCapabilityDraft(initial).supportedEfforts).toBe("low, high");
+    expect(parseModelCapabilities({ ...modelCapabilityDraft(initial), supportedEfforts: "" }, initial)).toEqual({ reasoning: true, futureCapability: "preserve" });
+    expect(() => parseModelCapabilities({ ...modelCapabilityDraft(initial), reasoning: "false" }, initial)).toThrow("Clear effort");
+    expect(parseModelCapabilities(modelCapabilityDraft({ supportedEfforts: ["future-effort"] }), { supportedEfforts: ["future-effort"] })).toEqual({ supportedEfforts: ["future-effort"] });
   });
 });
 

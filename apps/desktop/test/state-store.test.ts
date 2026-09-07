@@ -24,6 +24,15 @@ afterEach(() => {
 });
 
 describe("Electron state snapshot caching", () => {
+  it("retains live session model controls without granting missing capabilities", () => {
+    const home = testHome();
+    const agentControls = { compact: false, model: true, mode: false, currentModel: "provider/model", currentEffort: "high" };
+    writeJson(home, "status.json", { sessions: [{ id: "current", agentControls }, { id: "legacy" }] });
+    const snapshot = new StateStore(home).snapshot();
+    expect(snapshot.daemon.sessions[0]?.agentControls).toEqual(agentControls);
+    expect(snapshot.daemon.sessions[1]).not.toHaveProperty("agentControls");
+  });
+
   it("exposes only explicitly advertised daemon capabilities", () => {
     const current = testHome();
     const legacy = testHome();

@@ -3,8 +3,10 @@ import {
   SUPPORTED_PROTOCOL_VERSIONS, clientHandshakeFinish, clientHandshakeStart, generateKeyPairB64,
   parseS2C, parseRelayControlMessage, RELAY_PROTOCOL_VERSION, validateRelayUrl,
   CLOSE_AUTH_FAILED, CLOSE_REVOKED, ProtocolError,
+  CAPABILITY_WORKSPACE_ROOTS,
   type C2SMessage, type KeyPairB64, type S2CMessage, type SecureChannel, type RelayPairing,
 } from "@prospero/protocol";
+import type { RemoteDirectoryRoot } from "../shared/remote-workspaces";
 
 export type RemoteShellHost = {
   id: string; name: string; addrs: string[]; port: number; token: string; daemonPubKey: string;
@@ -13,7 +15,7 @@ export type RemoteShellHost = {
   clientKeys?: KeyPairB64;
 };
 export type RemoteShellMessage = Extract<S2CMessage,
-  { type: "session.state" | "session.create.result" | "term.snapshot" | "term.output" | "error" }>;
+  { type: "session.state" | "session.create.result" | "term.snapshot" | "term.output" | "workspace.listing" | "error" }>;
 export interface RemoteSocket {
   readyState: number;
   binaryType?: string;
@@ -35,7 +37,7 @@ export type RemoteShellClientEvents = {
 export class RemoteConnectionError extends Error {
   constructor(message: string, readonly retryable = true) { super(message); }
 }
-const terminalMessageTypes = new Set(["session.state", "session.create.result", "term.snapshot", "term.output", "error"]);
+const terminalMessageTypes = new Set(["session.state", "session.create.result", "term.snapshot", "term.output", "workspace.listing", "error"]);
 
 /** E2E desktop client. LAN candidates race; relay joins after a short head start. */
 export class RemoteShellClient {
@@ -61,6 +63,8 @@ export class RemoteShellClient {
   ) { this.clientKeys = clientKeys; }
 
   get isConnected(): boolean { return this.channel !== null && this.socket?.readyState === 1; }
+  get supportsWorkspaceRoots(): boolean { return this.hello?.host.capabilities?.includes(CAPABILITY_WORKSPACE_ROOTS) === true; }
+  get supportsCorrelatedCreate(): boolean { return (this.hello?.host.negotiatedProtocolVersion ?? this.hello?.host.protocolVersion ?? 0) >= 16; }
   on<K extends keyof RemoteShellClientEvents>(event: K, listener: RemoteShellClientEvents[K]): () => void {
     this.listeners[event].add(listener);
     return () => { this.listeners[event].delete(listener); };
@@ -104,6 +108,7 @@ export class RemoteShellClient {
     this.emit("closed");
   }
   createShell(cwd?: string, cols = 120, rows = 36, requestId = randomUUID()): string {
+    if (!this.supportsCorrelatedCreate) throw new Error("远程 daemon 不支持可关联的会话创建，请升级 / Upgrade the remote daemon to create sessions");
     this.send({ type: "session.create", requestId, agent: "shell", kind: "pty", cols, rows, ...(cwd ? { cwd } : {}) });
     return requestId;
   }
@@ -111,6 +116,10 @@ export class RemoteShellClient {
   input(sid: string, dataB64: string): void { this.send({ type: "term.input", sid, dataB64 }); }
   resize(sid: string, cols: number, rows: number): void { this.send({ type: "term.resize", sid, cols, rows }); }
   kill(sid: string): void { this.send({ type: "session.kill", sid }); }
+  listWorkspace(path: string, root: RemoteDirectoryRoot = "home"): void {
+    if (root !== "home" && !this.supportsWorkspaceRoots) throw new Error("远程 daemon 不支持盘符浏览 / Remote daemon does not support drive browsing");
+    this.send({ type: "workspace.list", path, ...(this.supportsWorkspaceRoots ? { root } : {}) });
+  }
 
   private connectAddress(url: string, generation: number, relay?: RelayPairing): Promise<Hello> {
     return new Promise((resolve, reject) => {

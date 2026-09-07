@@ -130,10 +130,13 @@ function processGroupAlive(groupId: number | undefined): boolean {
 
 async function waitForExit(child: ChildProcess, label: string): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return;
-  await Promise.race([
-    once(child, "exit").then(() => undefined),
-    delay(10_000).then(() => { throw new Error(`${label} did not exit`); }),
-  ]);
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      once(child, "exit").then(() => undefined),
+      new Promise<never>((_resolve, reject) => { timeout = setTimeout(() => reject(new Error(`${label} did not exit`)), 10_000); }),
+    ]);
+  } finally { if (timeout) clearTimeout(timeout); }
 }
 
 async function stopDaemon(daemon: DaemonProcess, signal: NodeJS.Signals): Promise<void> {
@@ -308,6 +311,7 @@ async function startDaemon(home: string, port: number, fakeBin: string): Promise
       // `prosperoHome()` appends `.prospero`; `home` in this test names that
       // final private directory, so pass its parent as the process HOME.
       HOME: path.dirname(home),
+      PROSPERO_HOME: home,
       PATH: `${fakeBin}${path.delimiter}${process.env["PATH"] ?? ""}`,
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -366,6 +370,8 @@ async function createDispatchedWorker(home: string, port: number, repo: string):
     kind: "structured",
     approvalPolicy: "standard",
   });
+  const owned = manifest(home, started.session.id);
+  supervisorGroups.add(owned.supervisorPid!);
   return { sessionId: started.session.id, taskId: task.id, dispatchId: started.dispatch.id };
 }
 
@@ -671,6 +677,8 @@ describe.sequential("daemon supervisor SIGTERM/SIGKILL full-process recovery", (
       cols: 80,
       rows: 24,
     });
+    const startedOwner = manifest(orphanHome, created.id);
+    supervisorGroups.add(startedOwner.supervisorPid!);
     await sendChat(orphanHome, first.port, created.id, "T7 orphan cache");
     await eventually(async () => (await sessionView(orphanHome, first.port, created.id)).events.some(
       (event) => event["kind"] === "turn.end",

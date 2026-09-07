@@ -244,6 +244,21 @@ describe("SessionDatabase", () => {
     expect(db.readEventsPage("session").events.map((entry) => entry.seq)).toEqual([11, 12]);
     expect(db.readSession("session")).toMatchObject({ terminal: true, messageQueue: [queued("q")], truncatedToolOutputs: ["tool"] });
   });
+  it("binds identity before bulk writes and asynchronously preserves retained cursor and all collections", async () => {
+    const { file } = fixture(); const db = database(file); const token = db.beginSessionImport();
+    db.identifySessionImport(token, "early-identity");
+    for (let index = 1; index <= 2000; index++) db.appendSessionImportEvent(token, event(index));
+    db.setSessionImportToolOutput(token, "tool", "complete tool output 🧪");
+    db.appendSessionImportQueueEntry(token, queued("q"));
+    await db.finishSessionImportAsync(token, state({ id: "early-identity", evSeq: 3000, truncatedToolOutputs: ["tool"] }));
+    const stored = db.readSession("early-identity", { limit: 3000, maxBytes: Number.MAX_SAFE_INTEGER });
+    expect(stored?.events).toHaveLength(2000);
+    expect(stored?.historyPage?.oldestSeq).toBe(1001);
+    expect(stored?.messageQueue).toEqual([queued("q")]);
+    expect(stored?.toolOutputs).toEqual([["tool", "complete tool output 🧪"]]);
+    expect(stored?.truncatedToolOutputs).toEqual(["tool"]);
+    expect(db.listSessionIds()).toEqual(["early-identity"]);
+  });
 
   it("rolls back invalid imports and close rolls back an unfinished import", () => {
     const { file } = fixture(); const db = database(file); db.saveSession(state());

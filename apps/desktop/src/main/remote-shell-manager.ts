@@ -3,6 +3,7 @@ import { RemoteShellClient as DefaultRemoteShellClient } from "./remote-shell-cl
 import type { RemoteHostStore } from "./remote-host-store";
 import { randomUUID } from "node:crypto";
 import type { SessionInfo } from "@prospero/protocol";
+import { normalizedRemoteCwd, remoteDirectoryRequest, type RemoteDirectoryListing, type RemoteDirectoryRequest } from "../shared/remote-workspaces";
 
 export type RemoteShellEvent = {
   hostId: string;
@@ -24,8 +25,11 @@ type RemoteConnection = {
   reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   reconnectAttempt: number;
   intentionalClose: boolean;
-  creating?: Promise<string> | undefined;
-  pendingCreate?: { requestId: string; resolve: (sid: string) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> } | undefined;
+  creating: Map<string, Promise<string>>;
+  uncertainCreates: Map<string, string>;
+  controlTail: Promise<void>;
+  pendingBrowse?: { path: string; root: string; resolve: (listing: RemoteDirectoryListing) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> } | undefined;
+  pendingCreate?: { requestId: string; cwd: string; resolve: (sid: string) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> } | undefined;
 };
 
 export type RemoteShellClientFactory = (host: RemoteShellHost) => RemoteShellClient;
@@ -41,6 +45,8 @@ const TERMINAL_SESSION_STATUSES = new Set(["completed", "done", "died", "failed"
  */
 export class RemoteShellManager {
   private readonly clients = new Map<string, RemoteConnection>();
+  private readonly owners = new Map<string, Map<string, number>>();
+  private ownerSequence = 0;
 
   constructor(
     private readonly hosts: RemoteHostStore,
@@ -70,6 +76,9 @@ export class RemoteShellManager {
       reconnectTimer: undefined,
       reconnectAttempt: 0,
       intentionalClose: false,
+      creating: new Map(),
+      uncertainCreates: new Map(),
+      controlTail: Promise.resolve(),
     };
     this.clients.set(hostId, connection);
     this.bindClient(hostId, connection);
@@ -79,18 +88,24 @@ export class RemoteShellManager {
   async createShell(hostId: string, cwd?: string): Promise<string> {
     await this.connected(hostId);
     const connection = this.clients.get(hostId)!;
-    if (connection.creating) return connection.creating;
-    const requestId = randomUUID();
-    const creating = new Promise<string>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        connection.pendingCreate = undefined;
-        reject(new Error("远程 Shell 创建超时，请先检查远程会话，避免重复创建"));
-      }, 15_000);
-      connection.pendingCreate = { requestId, resolve, reject, timer };
-      try { connection.client.createShell(cwd, 120, 36, requestId); }
-      catch (error) { this.rejectCreate(connection, error as Error); }
-    }).finally(() => { connection.creating = undefined; });
-    connection.creating = creating;
+    const key = cwd ?? "";
+    if (connection.uncertainCreates.has(key)) throw new Error("上次 Shell 创建结果尚未确认，请检查远程会话后重连 / Previous shell creation is unconfirmed; check remote sessions and reconnect");
+    const previous = connection.creating.get(key);
+    if (previous) return previous;
+    const creating = this.control(hostId, connection, async () => {
+      const requestId = randomUUID();
+      return new Promise<string>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          connection.pendingCreate = undefined;
+          connection.uncertainCreates.set(key, requestId);
+          reject(new Error("远程 Shell 创建超时，请先检查远程会话，避免重复创建"));
+        }, 15_000);
+        connection.pendingCreate = { requestId, cwd: key, resolve, reject, timer };
+        try { connection.client.createShell(cwd, 120, 36, requestId); }
+        catch (error) { this.rejectCreate(connection, error as Error); }
+      });
+    }).finally(() => { if (connection.creating.get(key) === creating) connection.creating.delete(key); });
+    connection.creating.set(key, creating);
     return creating;
   }
 
@@ -99,19 +114,58 @@ export class RemoteShellManager {
     return [...this.clients.get(hostId)!.catalog.values()].slice(0, 128);
   }
 
-  async attach(hostId: string, sid: string): Promise<void> {
+  async listWorkspaceShells(hostId: string, cwd: string): Promise<SessionInfo[]> {
+    await this.connected(hostId);
+    const target = normalizedRemoteCwd(cwd);
+    return [...this.clients.get(hostId)!.catalog.values()].filter(session => {
+      try { return session.agent === "shell" && normalizedRemoteCwd(session.cwd) === target; } catch { return false; }
+    }).slice(0, 128);
+  }
+
+  async listWorkspace(input: RemoteDirectoryRequest): Promise<RemoteDirectoryListing> {
+    const request = remoteDirectoryRequest(input);
+    await this.connected(request.hostId);
+    const connection = this.clients.get(request.hostId)!;
+    return this.control(request.hostId, connection, async () => new Promise<RemoteDirectoryListing>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        connection.pendingBrowse = undefined;
+        reject(new Error("远程目录读取超时，请重试 / Remote directory request timed out"));
+        connection.client.close();
+      }, 10_000);
+      connection.pendingBrowse = { path: request.path, root: request.root, resolve, reject, timer };
+      try { connection.client.listWorkspace(request.path, request.root); }
+      catch (error) { this.rejectBrowse(connection, error instanceof Error ? error : new Error("远程目录读取失败")); }
+    }));
+  }
+
+  async attach(hostId: string, sid: string, ownerId = "legacy"): Promise<void> {
+    const key = `${hostId}\0${sid}`;
+    const owners = this.owners.get(key) ?? new Map<string, number>();
+    if (!owners.has(ownerId)) owners.set(ownerId, ++this.ownerSequence);
+    const sequence = owners.get(ownerId);
+    this.owners.set(key, owners);
     const client = await this.connected(hostId);
+    if (this.owners.get(key)?.get(ownerId) !== sequence) return;
     const connection = this.clients.get(hostId)!;
-    if (!connection.catalog.has(sid)) throw new Error("远程终端不存在，请刷新会话列表");
-    connection.sessions.set(sid, { lastSeq: 0 });
+    if (!connection.catalog.has(sid)) { this.detach(hostId, sid, ownerId); throw new Error("远程终端不存在，请刷新会话列表"); }
+    if (!connection.sessions.has(sid)) connection.sessions.set(sid, { lastSeq: 0 });
     client.attach(sid);
   }
 
-  input(hostId: string, sid: string, dataB64: string): void {
+  detach(hostId: string, sid: string, ownerId = "legacy"): void {
+    const key = `${hostId}\0${sid}`;
+    const owners = this.owners.get(key);
+    if (!owners?.delete(ownerId)) return;
+    if (owners.size === 0) { this.owners.delete(key); this.clients.get(hostId)?.sessions.delete(sid); }
+  }
+
+  input(hostId: string, sid: string, dataB64: string, ownerId?: string): void {
+    if (ownerId && !this.activeOwner(hostId, sid, ownerId)) throw new Error("终端当前由另一视图控制 / Another view controls this terminal");
     void this.require(hostId).input(sid, dataB64);
   }
 
-  resize(hostId: string, sid: string, cols: number, rows: number): void {
+  resize(hostId: string, sid: string, cols: number, rows: number, ownerId?: string): void {
+    if (ownerId && !this.activeOwner(hostId, sid, ownerId)) return;
     void this.require(hostId).resize(sid, cols, rows);
   }
 
@@ -126,6 +180,8 @@ export class RemoteShellManager {
     if (!connection) return;
     connection.intentionalClose = true;
     this.rejectCreate(connection, new Error("连接已取消"));
+    this.rejectBrowse(connection, new Error("连接已取消"));
+    for (const key of this.owners.keys()) if (key.startsWith(`${hostId}\0`)) this.owners.delete(key);
     if (connection.reconnectTimer) clearTimeout(connection.reconnectTimer);
     this.clients.delete(hostId);
     connection.client.close();
@@ -139,6 +195,27 @@ export class RemoteShellManager {
     if (pending) { clearTimeout(pending.timer); connection.pendingCreate = undefined; pending.reject(error); }
   }
 
+  private rejectBrowse(connection: RemoteConnection, error: Error): void {
+    const pending = connection.pendingBrowse;
+    if (pending) { clearTimeout(pending.timer); connection.pendingBrowse = undefined; pending.reject(error); }
+  }
+
+  private activeOwner(hostId: string, sid: string, ownerId: string): boolean {
+    const owners = this.owners.get(`${hostId}\0${sid}`);
+    return Boolean(owners?.has(ownerId) && owners.get(ownerId) === Math.max(...owners.values()));
+  }
+
+  private control<T>(hostId: string, connection: RemoteConnection, action: () => Promise<T>): Promise<T> {
+    const result = connection.controlTail.then(async () => {
+      if (connection.intentionalClose || this.clients.get(hostId) !== connection) throw new Error("远程连接已取消");
+      await this.connected(hostId);
+      if (connection.intentionalClose || this.clients.get(hostId) !== connection) throw new Error("远程连接已取消");
+      return action();
+    });
+    connection.controlTail = result.then(() => {}, () => {});
+    return result;
+  }
+
   private bindClient(hostId: string, connection: RemoteConnection): void {
     const client = connection.client;
     client.on("connected", () => {
@@ -150,6 +227,19 @@ export class RemoteShellManager {
     client.on("message", (message) => {
       if (connection.intentionalClose || this.clients.get(hostId) !== connection) return;
       this.trackMessage(connection, message);
+      if (message.type === "session.create.result") {
+        for (const [cwd, requestId] of connection.uncertainCreates) if (requestId === message.requestId) connection.uncertainCreates.delete(cwd);
+      }
+      const browse = connection.pendingBrowse;
+      if (message.type === "workspace.listing") {
+        if (!browse || message.path !== browse.path || (message.root ?? "home") !== browse.root) return;
+        clearTimeout(browse.timer); connection.pendingBrowse = undefined;
+        if (message.error) browse.reject(new Error(message.error.slice(0, 2000)));
+        else browse.resolve({ hostId, path: message.path, root: (message.root ?? "home") as RemoteDirectoryListing["root"], cwd: message.cwd,
+          entries: message.entries.slice(0, 10_000), supportsRoots: connection.client.supportsWorkspaceRoots });
+        return;
+      }
+      if (message.type === "error" && !message.sid && browse) this.rejectBrowse(connection, new Error(message.message));
       const pending = connection.pendingCreate;
       if (message.type === "session.create.result" && pending?.requestId === message.requestId) {
         clearTimeout(pending.timer); connection.pendingCreate = undefined;
@@ -158,11 +248,14 @@ export class RemoteShellManager {
       } else if (message.type === "error" && pending) {
         this.rejectCreate(connection, new Error(message.message));
       }
+      if ((message.type === "term.output" || message.type === "term.snapshot") && !connection.sessions.has(message.sid)) return;
       this.publish({ hostId, message });
     });
     client.on("closed", () => {
       if (connection.intentionalClose || this.clients.get(hostId) !== connection) return;
+      if (connection.pendingCreate) connection.uncertainCreates.set(connection.pendingCreate.cwd, connection.pendingCreate.requestId);
       this.rejectCreate(connection, new Error("连接中断，Shell 可能已经创建，请检查远程会话"));
+      this.rejectBrowse(connection, new Error("远程目录读取时连接中断，请重试 / Remote connection interrupted"));
       this.publish({ hostId, message: { type: "remote.closed" } });
       this.scheduleReconnect(hostId, connection);
     });
@@ -189,7 +282,6 @@ export class RemoteShellManager {
     if (message.type === "term.snapshot" || message.type === "term.output") {
       const tracked = connection.sessions.get(message.sid);
       if (tracked) tracked.lastSeq = Math.max(tracked.lastSeq, message.seq);
-      else connection.sessions.set(message.sid, { lastSeq: message.seq });
     }
   }
 
@@ -199,6 +291,7 @@ export class RemoteShellManager {
         if (connection.intentionalClose || this.clients.get(hostId) !== connection) { connection.client.close(); throw new Error("连接已取消"); }
         connection.reconnectAttempt = 0;
         connection.catalog = new Map(hello.sessions.filter((session) => session.kind === "pty" && !TERMINAL_SESSION_STATUSES.has(session.status)).map((session) => [session.id, session]));
+        for (const cwd of connection.uncertainCreates.keys()) if ([...connection.catalog.values()].some(session => session.agent === "shell" && session.cwd === cwd)) connection.uncertainCreates.delete(cwd);
         if (connection.reconnectTimer) {
           clearTimeout(connection.reconnectTimer);
           connection.reconnectTimer = undefined;

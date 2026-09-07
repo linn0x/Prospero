@@ -5,11 +5,12 @@ import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
 import { useLocale } from "./locale";
 import type { AccountApiProtocol, ModelCapabilityDraft } from "./account-profile-form";
 
-export function ModelCapabilitiesFields({ value, onChange, disabled, protocol }: {
+export function ModelCapabilitiesFields({ value, onChange, disabled, protocol, effortSupported = false }: {
   value: ModelCapabilityDraft;
   onChange: (value: ModelCapabilityDraft) => void;
   disabled: boolean;
   protocol: AccountApiProtocol;
+  effortSupported?: boolean;
 }) {
   const { t } = useLocale();
   const id = useId();
@@ -29,6 +30,12 @@ export function ModelCapabilitiesFields({ value, onChange, disabled, protocol }:
         </NativeSelect>
       </Field>)}
       {value.tools === "false" && <FieldDescription>{t("Agent 需要工具调用；此设置将停用会话启动。", "Agents require tool calls; this setting disables session launch.")}</FieldDescription>}
+      {effortSupported && <Field>
+        <FieldLabel htmlFor={`${id}-efforts`}>{t("支持的推理强度", "Supported reasoning efforts")}</FieldLabel>
+        <Input id={`${id}-efforts`} value={value.supportedEfforts} maxLength={160} disabled={disabled} autoComplete="off" spellCheck={false} placeholder="low, medium, high" onChange={event => onChange({ ...value, supportedEfforts: event.target.value })} />
+        <FieldDescription>{t("按当前模型的服务商文档填写，以逗号分隔。留空表示未知；默认推理强度在高级配置中选择。", "Enter values documented for this model, separated by commas. Empty means unknown; choose the default effort in advanced configuration.")}</FieldDescription>
+        {protocol === "openai_chat_completions" && <FieldDescription>{t("当前 OpenCode 引擎尚不应用推理强度设置。", "The current OpenCode engine does not apply reasoning effort settings.")}</FieldDescription>}
+      </Field>}
     </FieldGroup>
   </details>;
 }
