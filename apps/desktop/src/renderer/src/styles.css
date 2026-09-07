@@ -384,10 +384,12 @@ input:not([data-slot]), textarea:not([data-slot]), select:not([data-slot]) { bac
 :root[data-theme="light"] .form-card,
 :root[data-theme="light"] .settings-card { box-shadow: 0 8px 25px #31314b0a; }
 .prospero-shell {
+  --desktop-toolbar-height: 44px;
   height: 100%;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+  padding-top: var(--desktop-toolbar-height);
   background: var(--background);
 }
 .prospero-main {
@@ -397,11 +399,12 @@ input:not([data-slot]), textarea:not([data-slot]), select:not([data-slot]) { bac
   overflow: hidden;
   background: var(--background);
 }
-.prospero-shell [data-slot="sidebar-container"] { height: 100%; }
+.prospero-shell [data-slot="sidebar-container"] { top: var(--desktop-toolbar-height); height: calc(100% - var(--desktop-toolbar-height)); }
 .prospero-sidebar [data-slot="sidebar-inner"] { background: var(--sidebar); }
+.prospero-sidebar .sidebar-shell-header { display: none; }
 .sidebar-shell-header {
   -webkit-app-region: drag;
-  min-height: 56px;
+  min-height: 44px;
   flex-direction: row;
   align-items: center;
   justify-content: flex-end;
@@ -419,7 +422,7 @@ input:not([data-slot]), textarea:not([data-slot]), select:not([data-slot]) { bac
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--sidebar-foreground) 10%, var(--sidebar));
 }
 .sidebar-header-toggle:hover { color: var(--sidebar-foreground); }
-.prospero-sidebar [data-sidebar="menu-button"] { min-height: 36px; border-radius: 9px; }
+.prospero-sidebar [data-sidebar="menu-button"] { min-height: 28px; border-radius: 7px; font-size: 13px; }
 .prospero-sidebar [data-sidebar="menu-button"][data-active] {
   color: var(--sidebar-accent-foreground);
   background: color-mix(in srgb, var(--sidebar-primary) 14%, transparent);
@@ -438,15 +441,19 @@ input:not([data-slot]), textarea:not([data-slot]), select:not([data-slot]) { bac
   background: color-mix(in srgb, var(--primary) 46%, transparent);
 }
 .desktop-topbar {
+  position: fixed;
+  inset: 0 0 auto;
+  z-index: 30;
   -webkit-app-region: drag;
   display: flex;
   flex: none;
   align-items: center;
   justify-content: space-between;
   min-width: 0;
-  min-height: 56px;
-  gap: 14px;
-  padding: 5px 152px 5px 20px;
+  height: var(--desktop-toolbar-height);
+  min-height: var(--desktop-toolbar-height);
+  gap: 10px;
+  padding: 0 152px 0 12px;
   background: var(--background);
 }
 .desktop-topbar button,
@@ -458,12 +465,9 @@ input:not([data-slot]), textarea:not([data-slot]), select:not([data-slot]) { bac
 .topbar-context > div { display: flex; min-width: 0; flex: 1; flex-direction: column; align-items: flex-start; gap: 1px; overflow: hidden; }
 .topbar-context strong { max-width: 100%; overflow: hidden; flex: none; font-size: 13px; font-weight: 650; letter-spacing: -.01em; text-overflow: ellipsis; white-space: nowrap; }
 .topbar-context span { overflow: hidden; color: var(--muted-foreground); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
-.topbar-sidebar-trigger { display: none; }
+.topbar-sidebar-trigger { display: inline-flex; color: var(--muted-foreground); }
 .topbar-actions { flex: none; }
-.focus-exit-overlay { position: absolute; top: 48px; right: 12px; z-index: 40; opacity: .3; transition: opacity 120ms ease, background-color 120ms ease; -webkit-app-region: no-drag; }
-.focus-exit-overlay:hover,
-.focus-exit-overlay:focus-visible { opacity: 1; }
-.focus-drag-region { position: absolute; top: 0; right: 152px; left: 12px; z-index: 30; height: 10px; -webkit-app-region: drag; }
+.desktop-topbar [data-slot="button"] { height: 28px; min-height: 28px; padding-block: 0; }
 kbd {
   min-width: 26px;
   padding: 2px 5px;
@@ -754,12 +758,12 @@ kbd {
 .remote-host-list .device-card { margin: 0; }
 .sidebar-nav-fixed { flex: none; }
 .prospero-sidebar .sidebar-nav-fixed [data-sidebar="group"] { padding-block: 4px; }
-.prospero-sidebar .sidebar-nav-fixed [data-sidebar="menu-button"] { height: 30px; min-height: 30px; padding-block: 5px; }
-.prospero-sidebar .sidebar-nav-fixed [data-sidebar="group-label"] { height: 24px; }
+.prospero-sidebar .sidebar-nav-fixed [data-sidebar="menu-button"] { height: 28px; min-height: 28px; padding-block: 4px; }
+.prospero-sidebar .sidebar-nav-fixed [data-sidebar="group-label"] { height: 22px; }
 .sidebar-workspace-scroll { min-height: 0; flex: 1; overflow: auto; scrollbar-width: thin; }
 .sidebar-footer-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; }
 .sidebar-footer-actions > [data-sidebar="menu-item"] { min-width: 0; }
-.prospero-sidebar .sidebar-footer-actions [data-sidebar="menu-button"] { justify-content: center; min-width: 0; min-height: 32px; padding-inline: 7px; }
+.prospero-sidebar .sidebar-footer-actions [data-sidebar="menu-button"] { justify-content: center; min-width: 0; height: 28px; min-height: 28px; padding-inline: 6px; }
 .sidebar-footer-actions [data-sidebar="menu-button"] > span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sidebar-daemon-dot { display: block; width: 7px; height: 7px; flex: none; border-radius: 50%; background: var(--danger); box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 11%, transparent); }
 .sidebar-daemon-dot.online { background: var(--success); box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 12%, transparent); }
@@ -767,12 +771,11 @@ kbd {
 .daemon-agent-row:last-child { border-bottom: 0; }
 .daemon-agent-row [data-slot="avatar"] { width: 28px; height: 28px; }
 .daemon-agent-row [data-slot="avatar-fallback"] { background: var(--muted); }
-[data-collapsible="icon"] .prospero-sidebar .sidebar-shell-header { justify-content: center; padding-right: 12px; padding-left: 12px; }
 [data-collapsible="icon"] .prospero-sidebar .sidebar-detail-section { display: none; }
-[data-collapsible="icon"] .prospero-sidebar [data-sidebar="group"] { padding-right: 12px; padding-left: 12px; }
+[data-collapsible="icon"] .prospero-sidebar [data-sidebar="group"] { padding-right: 8px; padding-left: 8px; }
 [data-collapsible="icon"] .prospero-sidebar [data-sidebar="menu-item"] { display: flex; justify-content: center; }
-[data-collapsible="icon"] .prospero-sidebar .sidebar-nav-fixed [data-sidebar="group-label"] { margin-top: -24px; }
-[data-collapsible="icon"] .prospero-sidebar [data-sidebar="menu-button"] { width: 32px !important; height: 32px !important; padding: 7px !important; }
+[data-collapsible="icon"] .prospero-sidebar .sidebar-nav-fixed [data-sidebar="group-label"] { display: none; }
+[data-collapsible="icon"] .prospero-sidebar [data-sidebar="menu-button"] { width: 28px !important; height: 28px !important; min-height: 28px; padding: 6px !important; }
 [data-collapsible="icon"] .prospero-sidebar [data-sidebar="menu-button"] > svg { width: 16px; height: 16px; }
 [data-collapsible="icon"] .prospero-sidebar .sidebar-footer-actions { grid-template-columns: minmax(0, 1fr); }
 .session-agent-icon { display: grid; width: 15px; height: 15px; flex: none; place-items: center; color: var(--muted-foreground); }
@@ -782,7 +785,9 @@ kbd {
 .workspace-tab.is-active .session-agent-icon,
 .workspace-session-link[data-active] .session-agent-icon,
 .session-agent-icon.is-unread { color: var(--foreground); }
-.prospero-sidebar [data-sidebar="rail"] { pointer-events: auto; }
+.prospero-sidebar [data-sidebar="rail"] { pointer-events: auto; outline: none; -webkit-app-region: no-drag; }
+.prospero-shell[data-sidebar-resizing="true"] :is([data-slot="sidebar-gap"], [data-slot="sidebar-container"], [data-sidebar="menu-button"]) { transition: none !important; }
+:root[data-sidebar-resizing="true"] * { cursor: col-resize !important; user-select: none !important; }
 .desktop-settings-list { gap: 0; }
 .desktop-setting-row { min-height: 62px; padding: 10px 2px; border-bottom: 1px solid color-mix(in srgb, var(--border) 72%, transparent); }
 .desktop-setting-row [data-slot="field-content"] { min-width: 0; padding-right: 18px; }
@@ -982,7 +987,6 @@ kbd {
   .context-sheet-trigger { display: inline-flex; }
 }
 @media (max-width: 900px) {
-  .desktop-topbar { min-height: 58px; padding-left: 12px; }
   .topbar-context span { display: none; }
   .view-container { padding: 22px 20px 40px; }
   .view-heading { align-items: flex-start; }
@@ -1167,11 +1171,8 @@ kbd {
   .run-graph-control-end > span:not(.run-graph-history-count) { display: none; }
 }
 
-:root[data-platform="darwin"] .sidebar-shell-header { min-height: 56px; padding-left: 78px; }
-:root[data-platform="darwin"] [data-collapsible="icon"] .prospero-sidebar .sidebar-shell-header { min-height: 78px; justify-content: center; padding: 40px 0 8px; }
-:root[data-platform="darwin"] .desktop-topbar { padding-right: 20px; -webkit-app-region: drag; }
-:root[data-platform="darwin"] .focus-exit-overlay { right: 10px; }
-:root[data-platform="darwin"] .focus-drag-region { right: 12px; left: 12px; }
+:root[data-platform="darwin"] .sidebar-shell-header { padding-left: 82px; }
+:root[data-platform="darwin"] .desktop-topbar { padding-right: 12px; padding-left: 82px; }
 :root[data-platform="darwin"] .pane-workspace.is-focus .terminal-status { padding-right: 10px; }
 
 .gate-freeform-row { display: flex; flex: 1 1 280px; gap: 8px; }
@@ -1179,11 +1180,6 @@ kbd {
 :root[data-platform="darwin"] .desktop-topbar button,
 :root[data-platform="darwin"] .desktop-topbar input,
 :root[data-platform="darwin"] .desktop-topbar [role="button"] { -webkit-app-region: no-drag; }
-
-@media (max-width: 767px) {
-  .topbar-sidebar-trigger { display: inline-flex; }
-  :root[data-platform="darwin"] .desktop-topbar { padding-left: 80px; }
-}
 
 /* 运行列表的收起入口。原来它挤在右侧操作行里(保存为模板/添加任务/删除记录
    那一排),离被折叠的面板隔了大半个屏 —— 人是在被折叠的东西身上找折叠按钮的。 */
@@ -1330,8 +1326,7 @@ kbd {
   transition: opacity 180ms ease-out;
 }
 .prospero-sidebar [data-liquid-glass="nav"] {
-  min-height: 38px;
-  border-radius: 13px;
+  border-radius: 7px;
   transition: background-color 160ms ease, box-shadow 180ms ease, transform 180ms cubic-bezier(.2,.8,.2,1);
 }
 .prospero-sidebar [data-liquid-glass="nav"][data-active] {

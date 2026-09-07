@@ -12,6 +12,7 @@
     "preview": "electron-vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run test",
+    "check:chrome": "npm run build && electron scripts/check-window-chrome.cjs",
     "pack": "npm run build && electron-builder --dir",
     "prepare:runtime": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-runtime.ps1",
     "dist": "npm run prepare:runtime && npm run build && electron-builder",
