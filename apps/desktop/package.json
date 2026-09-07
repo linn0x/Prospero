@@ -8,8 +8,10 @@
   "main": "out/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
+    "prebuild": "npm run build -w @prospero/protocol",
     "build": "electron-vite build",
     "preview": "electron-vite preview",
+    "pretypecheck": "npm run build -w @prospero/protocol",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run test",
     "check:chrome": "npm run build && electron scripts/check-window-chrome.cjs",
