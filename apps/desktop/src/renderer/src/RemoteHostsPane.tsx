@@ -137,6 +137,12 @@ export default function RemoteHostsPane() {
   };
   const connect = async (hostId: string) => {
     if (pairingDetails.current) pairingDetails.current.open = false;
+    if (selectedRef.current === hostId && connected) {
+      const available = await window.prospero.listRemoteShells(hostId);
+      setSessions(available);
+      if (!sid && available[0]) setSid(available[0].id);
+      return;
+    }
     if (selectedRef.current && selectedRef.current !== hostId) await window.prospero.disconnectRemoteHost(selectedRef.current);
     selectedRef.current = hostId; setSelected(hostId); setSid(undefined); setSessions([]); setStatus(t("连接中…", "Connecting…")); setConnected(false);
     await window.prospero.connectRemoteHost(hostId);
