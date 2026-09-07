@@ -277,7 +277,9 @@ describe.skipIf(process.platform === "win32")("owner migration continuity", () =
       if (pid === inaccessiblePid && signal === 0) throw Object.assign(new Error("not permitted"), { code: "EPERM" });
       return kill(pid, signal);
     }) as typeof process.kill);
-    const sessions = await reconnectStructuredSupervisors(root);
+    const sessions = await reconnectStructuredSupervisors(root, undefined, {
+      archiveMigrationDelayMs: 0,
+    });
     expect(sessions).toHaveLength(3);
     // Archive discovery must publish before background SQLite work begins.
     // With thousands of dead owners, eagerly opening every staging database
