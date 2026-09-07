@@ -691,6 +691,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       return restored;
     }
     for (const id of this.sessionDatabase?.listSessionIds() ?? []) {
+      if (this.structuredSessions.has(id) || this.deletedSessionIds.has(id)) continue;
       // Queue bodies must remain complete: partial restoration could silently
       // drop a user message when the next authoritative queue is persisted.
       const loaded = this.sessionDatabase!.readSession(id, { events: false, toolOutputs: false, messageQueue: true, maxBytes: Number.MAX_SAFE_INTEGER });
@@ -844,7 +845,11 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
         input.command,
         process.platform,
         process.env,
-        input.agent === "codex" ? (account?.codexAppServerArgs ?? []) : [],
+        input.agent === "codex" ? [
+          ...(account?.codexAppServerArgs ?? []),
+          ...(account?.defaultModel && !account.apiProfile ? ["-c", `model=${JSON.stringify(account.defaultModel)}`] : []),
+          ...(account?.defaultEffort ? ["-c", `model_reasoning_effort=${JSON.stringify(account.defaultEffort)}`] : []),
+        ] : [],
       );
     } catch (e) {
       throw new SessionError(
@@ -988,11 +993,13 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     account?: AccountBinding,
   ): Promise<SessionInfo> {
     const id = randomUUID();
-    const configuredModel = account?.apiProfile?.model ?? model;
+    const configuredModel = account?.apiProfile?.model ?? model ?? (!resume ? account?.defaultModel : undefined);
+    const configuredEffort = effort ?? (!resume && (!model || model === account?.defaultModel) ? account?.defaultEffort : undefined);
     const initialAdapterState: AdapterResumeState = {
       ...(mode ? { mode } : {}),
       ...(configuredModel ? { model: configuredModel } : {}),
-      ...(effort ? { effort } : {}),
+      ...(configuredEffort ? { effort: configuredEffort } : {}),
+      ...(account?.apiProfile && configuredEffort ? { prosperoAccountDefaults: true } : {}),
       ...(agentPreset && agent === "deepseek" ? { agentPreset } : {}),
       ...(resume && agent === "deepseek" ? { sessionId: resume.id } : {}),
       ...(resume && agent === "claude" ? { sessionId: resume.id } : {}),
@@ -1009,7 +1016,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
           title: resume?.title || titleFor(agent, cwd),
           createdAt: Date.now(),
           ...(approvalPolicy !== undefined ? { approvalPolicy } : {}),
-          environment: { ...(account?.environment ?? {}), ...this.sessionEnv(id) },
+          environment: { ...this.structuredAccountEnvironment(account), ...this.sessionEnv(id) },
           ...(account?.adapterAgent ? { adapterAgent: account.adapterAgent } : {}),
           ...(account?.codexAppServerArgs ? { codexAppServerArgs: account.codexAppServerArgs } : {}),
           ...(account ? { accountId: account.id, accountName: account.name } : {}),
@@ -1048,7 +1055,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
           title: resume?.title || titleFor(agent, cwd),
           createdAt: Date.now(),
           ...(approvalPolicy !== undefined ? { approvalPolicy } : {}),
-          environment: { ...(account?.environment ?? {}), ...this.sessionEnv(id) },
+          environment: { ...this.structuredAccountEnvironment(account), ...this.sessionEnv(id) },
           ...(account?.adapterAgent ? { adapterAgent: account.adapterAgent } : {}),
           ...(account?.codexAppServerArgs ? { codexAppServerArgs: account.codexAppServerArgs } : {}),
           ...(account ? { accountId: account.id, accountName: account.name } : {}),
@@ -1171,9 +1178,9 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       throw new SessionError("账号能力配置不允许启动结构化 Code Agent 会话", "agent_unavailable");
     }
     if (account?.apiProfile && !restored?.terminal) {
-      // Persisted native controls must never override this profile's configured model or effort.
-      const { effort: _effort, ...state } = restored?.adapterState ?? initialAdapterState ?? {};
-      const configuredState = { ...state, model: account.apiProfile.model };
+      const { effort, ...state } = restored?.adapterState ?? initialAdapterState ?? {};
+      const configuredEffort = state["prosperoAccountDefaults"] === true && typeof effort === "string" ? effort : undefined;
+      const configuredState = { ...state, model: account.apiProfile.model, ...(configuredEffort ? { effort: configuredEffort } : {}) };
       if (restored) restored = { ...restored, adapterState: configuredState };
       else initialAdapterState = configuredState;
     }
@@ -1183,7 +1190,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       title,
       cwd,
       adapter: this.adapterFactory(account?.adapterAgent ?? agent, restored?.adapterState ?? initialAdapterState),
-      environment: { ...(account?.environment ?? {}), ...this.sessionEnv(id) },
+      environment: { ...this.structuredAccountEnvironment(account), ...this.sessionEnv(id) },
       ...(account?.codexAppServerArgs ? { codexAppServerArgs: account.codexAppServerArgs } : {}),
       ...(account ? { accountId: account.id, accountName: account.name } : {}),
       ...(approvalPolicy !== undefined ? { approvalPolicy } : {}),
@@ -1255,6 +1262,15 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       if (remaining > 0) this.startingAccountLeases.set(accountId, remaining);
       else this.startingAccountLeases.delete(accountId);
     };
+  }
+
+  private structuredAccountEnvironment(account?: AccountBinding): Record<string, string> {
+    const environment = { ...(account?.environment ?? {}) };
+    if (account?.managed) {
+      environment["CLAUDE_CODE_EFFORT_LEVEL"] = "";
+      if (!account.apiProfile) delete environment["ANTHROPIC_MODEL"];
+    }
+    return environment;
   }
 
   private resolveAccount(agent: AgentKind, accountId: string): AccountBinding {

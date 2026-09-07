@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "no
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, normalize, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import { sessionAgentControls } from "./session-control";
 import type {
   DaemonSnapshot,
   DesktopSettings,
@@ -319,6 +320,7 @@ export class StateStore extends EventEmitter {
         const id = stringValue(value["id"]);
         const displayTitle = this.sessionTitles[id];
         const messageQueue = queuedChatMessages(value["messageQueue"]);
+        const agentControls = sessionAgentControls(value["agentControls"]);
         return reuseEquivalent(previousSessionsById.get(id), {
           id,
           agent: stringValue(value["agent"], "shell"),
@@ -327,6 +329,7 @@ export class StateStore extends EventEmitter {
           ...(displayTitle ? { displayTitle } : {}),
           cwd: stringValue(value["cwd"]),
           status: stringValue(value["status"], "unknown"),
+          ...(agentControls ? { agentControls } : {}),
           preview: displayTitle || stringValue(value["preview"]),
           createdAt: numberValue(value["createdAt"]),
           ...(typeof value["accountId"] === "string" && value["accountId"].length > 0 && value["accountId"].length <= 100

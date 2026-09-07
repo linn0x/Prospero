@@ -50,6 +50,38 @@ async function setup(probe: NonNullable<DaemonServerOptions["apiProfileProbe"]>,
 }
 
 describe("API Profile control actions", () => {
+  it("keeps the ordinary account body limit while permitting bounded configuration source", async () => {
+    const { request, accountId } = await setup(async () => passed());
+    expect((await request({ type: "agent.accounts.list", padding: "x".repeat(25 * 1024) })).response.status).toBe(413);
+    const current = JSON.parse((await request({ type: "agent.account.config.get", accountId })).text);
+    const document = current.config.documents[0];
+    const saved = await request({ type: "agent.account.config.set", accountId, documentId: document.id, revision: document.revision, content: "#" + "x".repeat(16_300) });
+    expect(saved.response.status).toBe(200);
+    expect(JSON.parse(saved.text)).toMatchObject({ ok: true });
+  });
+
+  it("exposes separately validated model catalogs and advanced configuration on the authenticated control route", async () => {
+    const { request, accountId, server, status } = await setup(async () => passed());
+    expect(status.capabilities).toEqual(expect.arrayContaining(["agent.account.api.models", "agent.account.config"]));
+    const catalog = vi.spyOn(server.accounts, "apiModels").mockResolvedValue([{ id: "fixture", label: "Fixture" }]);
+    expect((await request({ type: "agent.account.api.models.get", accountId }, false)).response.status).toBe(401);
+    expect(catalog).not.toHaveBeenCalled();
+    const models = await request({ type: "agent.account.api.models.get", accountId });
+    expect(JSON.parse(models.text)).toMatchObject({ type: "agent.account.api.models.result", ok: true, models: [{ id: "fixture" }] });
+    expect(models.text).not.toContain("private-fixture-key");
+    const current = JSON.parse((await request({ type: "agent.account.config.get", accountId })).text);
+    expect(current).toMatchObject({ type: "agent.account.config.result", ok: true, config: { accountId, appliesTo: "new_sessions" } });
+    const document = current.config.documents[0];
+    const saved = JSON.parse((await request({ type: "agent.account.config.set", accountId, documentId: document.id, revision: document.revision, defaultEffort: null })).text);
+    expect(saved).toMatchObject({ type: "agent.account.config.result", ok: true });
+    const denied = await request({ type: "agent.account.config.set", accountId, documentId: "auth", revision: document.revision, content: "" });
+    expect(JSON.parse(denied.text)).toMatchObject({ ok: false, error: { code: "forbidden" } });
+    expect(denied.response.status).toBe(403);
+    const invalid = await request({ type: "agent.account.config.set", accountId, documentId: "../auth.json", revision: document.revision, content: "private-secret" });
+    expect(invalid.response.status).toBe(400);
+    expect(invalid.text).not.toContain("private-secret");
+  });
+
   it("blocks account mutations while existing sessions are still being restored", async () => {
     const home = mkdtempSync(path.join(os.tmpdir(), "prospero-profile-startup-"));
     const accounts = new AgentAccountManager(home, async () => ({ stdout: "1.0.0", stderr: "", exitCode: 0 }), new LocalFileCredentialStore(null));

@@ -66,6 +66,9 @@ const api: DesktopApi = {
   deleteWorkflowTemplate: (templateId: string) => ipcRenderer.invoke("workflow-template:delete", templateId),
   resolveGate: (gateId: string, decision: string) => ipcRenderer.invoke("orchestration:gate", gateId, decision),
   accountAction: (message: JsonObject) => ipcRenderer.invoke("account:action", message),
+  getAccountModels: (input) => ipcRenderer.invoke("account:models", input),
+  getAccountConfig: (accountId) => ipcRenderer.invoke("account:config:get", accountId),
+  setAccountConfig: (input) => ipcRenderer.invoke("account:config:set", input),
   pairDevice: (input) => ipcRenderer.invoke("device:pair", input),
   revokeDevice: (id: string, name: string) => ipcRenderer.invoke("device:revoke", { id, name }),
   relayAction: (input) => ipcRenderer.invoke("relay:action", input),
@@ -75,11 +78,24 @@ const api: DesktopApi = {
   importRemoteHost: (pairingUri: string) => ipcRenderer.invoke("remote-host:import", pairingUri),
   removeRemoteHost: (id: string) => ipcRenderer.invoke("remote-host:remove", id),
   connectRemoteHost: (id: string) => ipcRenderer.invoke("remote-shell:connect", id),
+  listRemoteWorkspaces: () => ipcRenderer.invoke("remote-workspace:list"),
+  listRemoteDirectories: (input) => ipcRenderer.invoke("remote-workspace:directories", input),
+  addRemoteWorkspace: (input) => ipcRenderer.invoke("remote-workspace:add", input),
+  forgetRemoteWorkspace: (id: string) => ipcRenderer.invoke("remote-workspace:forget", id),
+  renameRemoteWorkspace: (id: string, name: string) => ipcRenderer.invoke("remote-workspace:rename", id, name),
+  listRemoteWorkspaceShells: (id: string) => ipcRenderer.invoke("remote-workspace:shells", id),
+  openRemoteWorkspace: (id: string, options) => ipcRenderer.invoke("remote-workspace:open", id, options),
+  subscribeRemoteWorkspaces: (listener) => {
+    const wrapped = (_event: Electron.IpcRendererEvent, workspaces: Parameters<typeof listener>[0]) => listener(workspaces);
+    ipcRenderer.on("remote-workspace:changed", wrapped);
+    return () => ipcRenderer.removeListener("remote-workspace:changed", wrapped);
+  },
   createRemoteShell: (hostId: string, cwd?: string) => ipcRenderer.invoke("remote-shell:create", hostId, cwd),
   listRemoteShells: (hostId: string) => ipcRenderer.invoke("remote-shell:list", hostId),
-  attachRemoteShell: (hostId: string, sid: string) => ipcRenderer.invoke("remote-shell:attach", hostId, sid),
-  sendRemoteShellInput: (hostId: string, sid: string, dataB64: string) => ipcRenderer.invoke("remote-shell:input", hostId, sid, dataB64),
-  resizeRemoteShell: (hostId: string, sid: string, cols: number, rows: number) => ipcRenderer.invoke("remote-shell:resize", hostId, sid, cols, rows),
+  attachRemoteShell: (hostId: string, sid: string, ownerId?: string) => ipcRenderer.invoke("remote-shell:attach", hostId, sid, ownerId),
+  detachRemoteShell: (hostId: string, sid: string, ownerId?: string) => ipcRenderer.invoke("remote-shell:detach", hostId, sid, ownerId),
+  sendRemoteShellInput: (hostId: string, sid: string, dataB64: string, ownerId?: string) => ipcRenderer.invoke("remote-shell:input", hostId, sid, dataB64, ownerId),
+  resizeRemoteShell: (hostId: string, sid: string, cols: number, rows: number, ownerId?: string) => ipcRenderer.invoke("remote-shell:resize", hostId, sid, cols, rows, ownerId),
   killRemoteShell: (hostId: string, sid: string) => ipcRenderer.invoke("remote-shell:kill", hostId, sid),
   disconnectRemoteHost: (id: string) => ipcRenderer.invoke("remote-shell:disconnect", id),
   subscribeRemoteShell(listener) {

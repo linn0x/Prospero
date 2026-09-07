@@ -1,100 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Terminal } from "@xterm/xterm";
-import { FitAddon } from "@xterm/addon-fit";
-import "@xterm/xterm/css/xterm.css";
 import { Link2, Plus, RefreshCw, Server, Trash2, Unplug } from "lucide-react";
 import type { RemoteHostSummary, SessionInfo } from "../../shared/types";
 import { useLocale } from "./locale";
 import { displayError } from "./state";
+import { RemoteTerminal, type RemoteTerminalHandle, type RemoteTerminalSettings } from "./remote-workspaces/RemoteTerminal";
 
-function encodeInput(data: string): string {
-  const bytes = new TextEncoder().encode(data);
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary);
-}
 
-function RemoteTerminal({ hostId, sid, connected, onError }: {
-  hostId: string; sid: string; connected: boolean; onError: (error: string) => void;
-}) {
-  const container = useRef<HTMLDivElement>(null);
-  const terminalRef = useRef<Terminal | undefined>(undefined);
-  useEffect(() => { if (terminalRef.current) terminalRef.current.options.disableStdin = !connected; }, [connected]);
-  useEffect(() => {
-    if (!container.current) return;
-    const term = new Terminal({ cols: 120, rows: 36, scrollback: 3000, fontSize: 13,
-      fontFamily: '"SFMono-Regular", Consolas, monospace', cursorBlink: true,
-      theme: { background: "#0a0f18", foreground: "#d8e4f5", cursor: "#88aaff" } });
-    terminalRef.current = term;
-    const fit = new FitAddon(); term.loadAddon(fit); term.open(container.current);
-    let disposed = false;
-    let resizeTimer: ReturnType<typeof setTimeout> | undefined;
-    let lastSeq = -1;
-    let pendingBytes = 0;
-    let resync = false;
-    let snapshotRequested = false;
-    const fitTerminal = () => {
-      if (resizeTimer) clearTimeout(resizeTimer);
-      resizeTimer = setTimeout(() => {
-        if (disposed || !container.current?.clientWidth) return;
-        fit.fit();
-        void window.prospero.resizeRemoteShell(hostId, sid, term.cols, term.rows).catch((reason) => onError(displayError(reason)));
-      }, 100);
-    };
-    const requestSnapshot = () => {
-      if (snapshotRequested || disposed) return;
-      snapshotRequested = true;
-      void window.prospero.attachRemoteShell(hostId, sid).catch((reason) => onError(displayError(reason)));
-    };
-    const write = (data: string | Uint8Array) => {
-      const size = typeof data === "string" ? data.length * 2 : data.byteLength;
-      pendingBytes += size;
-      term.write(data, () => {
-        pendingBytes -= size;
-        if (resync && pendingBytes === 0) requestSnapshot();
-      });
-    };
-    const unsubscribe = window.prospero.subscribeRemoteShell((event) => {
-      if (event.hostId !== hostId) return;
-      const message = event.message;
-      if (message.type === "remote.connected") { term.options.disableStdin = false; fitTerminal(); return; }
-      if (message.type === "remote.closed") { term.options.disableStdin = true; return; }
-      if (message.sid !== sid) return;
-      try {
-        if (message.type === "term.snapshot") {
-          resync = false; snapshotRequested = false;
-          lastSeq = Number(message.seq);
-          term.reset(); write(String(message.ansi ?? "")); fitTerminal();
-        } else if (message.type === "term.output") {
-          const seq = Number(message.seq);
-          if (seq <= lastSeq || resync) return;
-          if (pendingBytes > 2 * 1024 * 1024) { resync = true; return; }
-          lastSeq = seq;
-          const raw = atob(String(message.dataB64));
-          write(Uint8Array.from(raw, (char) => char.charCodeAt(0)));
-        }
-      } catch (reason) { onError(displayError(reason)); }
-    });
-    const input = term.onData((data) => {
-      // Preserve Enter, arrows, Ctrl-C and bracketed paste exactly as xterm emits them.
-      void window.prospero.sendRemoteShellInput(hostId, sid, encodeInput(data)).catch((reason) => onError(displayError(reason)));
-    });
-    const observer = new ResizeObserver(fitTerminal); observer.observe(container.current);
-    requestSnapshot(); term.focus();
-    return () => {
-      disposed = true; unsubscribe(); input.dispose(); observer.disconnect();
-      if (resizeTimer) clearTimeout(resizeTimer);
-      terminalRef.current = undefined; term.dispose();
-    };
-  }, [hostId, sid, onError]);
-  return <div className="remote-xterm" ref={container} aria-label="Remote Shell terminal" />;
-}
-
-export default function RemoteHostsPane() {
+export default function RemoteHostsPane({ settings = { terminalFontFamily: "monospace", terminalFontSize: 13, theme: "system" } }: { settings?: RemoteTerminalSettings } = {}) {
   const { t } = useLocale();
   const [hosts, setHosts] = useState<RemoteHostSummary[]>([]);
   const [pairing, setPairing] = useState("");
   const pairingDetails = useRef<HTMLDetailsElement | null>(null);
+  const terminalControls = useRef<RemoteTerminalHandle>(null);
   const [selected, setSelected] = useState<string>();
   const selectedRef = useRef<string | undefined>(undefined);
   const [sid, setSid] = useState<string>();
@@ -105,7 +22,6 @@ export default function RemoteHostsPane() {
   const [error, setError] = useState<string>();
   const [status, setStatus] = useState("");
   const [connected, setConnected] = useState(false);
-  const onError = useCallback((message: string) => setError(message), []);
   const refreshHosts = useCallback(async () => setHosts(await window.prospero.listRemoteHosts()), []);
   useEffect(() => { void refreshHosts().catch((reason) => setError(displayError(reason))); }, [refreshHosts]);
   useEffect(() => window.prospero.subscribeRemoteShell((event) => {
@@ -143,7 +59,6 @@ export default function RemoteHostsPane() {
       if (!sid && available[0]) setSid(available[0].id);
       return;
     }
-    if (selectedRef.current && selectedRef.current !== hostId) await window.prospero.disconnectRemoteHost(selectedRef.current);
     selectedRef.current = hostId; setSelected(hostId); setSid(undefined); setSessions([]); setStatus(t("连接中…", "Connecting…")); setConnected(false);
     await window.prospero.connectRemoteHost(hostId);
     const available = await window.prospero.listRemoteShells(hostId);
@@ -186,8 +101,8 @@ export default function RemoteHostsPane() {
         <button disabled={busy} onClick={() => void run(async () => { await window.prospero.disconnectRemoteHost(selected); setConnected(false); })}><Unplug size={14} />{t("断开", "Disconnect")}</button>
       </div>
       {sessions.length > 0 && <div className="remote-session-tabs" aria-label={t("远程会话", "Remote sessions")}>{sessions.map((session) => <button key={session.id} aria-pressed={sid === session.id} disabled={busy || !connected} onClick={() => setSid(session.id)} title={session.cwd}>{session.title || session.agent}</button>)}</div>}
-      {sid && <RemoteTerminal key={`${selected}:${sid}`} hostId={selected} sid={sid} connected={connected} onError={onError} />}
-      {sid && <div className="button-row compact"><button disabled={busy || !connected} onClick={() => void run(async () => { await window.prospero.sendRemoteShellInput(selected, sid, "Aw=="); })}>Ctrl+C</button><button className="danger" disabled={busy || !connected} onClick={() => void run(async () => { await window.prospero.killRemoteShell(selected, sid); setSessions((current) => current.filter((s) => s.id !== sid)); setSid(undefined); })}>{t("结束当前 Shell", "End current Shell")}</button></div>}
+      {sid && <RemoteTerminal key={`${selected}:${sid}`} hostId={selected} sid={sid} connected={connected} settings={settings} controlRef={terminalControls} />}
+      {sid && <div className="button-row compact"><button disabled={busy || !connected} onClick={() => terminalControls.current?.interrupt()}>Ctrl+C</button><button className="danger" disabled={busy || !connected} onClick={() => void run(async () => { await window.prospero.killRemoteShell(selected, sid); setSessions((current) => current.filter((s) => s.id !== sid)); setSid(undefined); })}>{t("结束当前 Shell", "End current Shell")}</button></div>}
     </div>}
   </section></div>;
 }

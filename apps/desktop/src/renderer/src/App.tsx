@@ -6,6 +6,7 @@ import {
   useCallback,
   useDeferredValue,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -28,30 +29,26 @@ import {
   CircleStop,
   Clock3,
   Copy,
-  FileDiff,
   Folder,
   FolderKanban,
   FolderOpen,
   FolderPlus,
-  GitBranch,
   LayoutDashboard,
   ListChecks,
   LoaderCircle,
   Mail,
-  Maximize2,
   MessageSquare,
   Minimize2,
   MoreHorizontal,
-  PanelRight,
   Pencil,
   Pin,
   PinOff,
   Plus,
+  RefreshCw,
   Search,
   Settings,
   Smartphone,
   SquareTerminal,
-  Trash2,
   WifiOff,
   Workflow,
   X,
@@ -64,7 +61,7 @@ import type {
   SessionInfo,
   SessionPage,
   UsageAccount,
-  UsageReport,
+  RemoteWorkspace,
 } from "../../shared/types";
 import { AgentLogo } from "./AgentLogo";
 import {
@@ -94,7 +91,6 @@ import {
   sortSidebarSessions,
   upsertHydratedSession,
   validOpenSessionIds,
-  workspaceChromeVisible,
 } from "./workspace-sidebar-state";
 import {
   groupManagedWorkspaces,
@@ -185,14 +181,6 @@ import {
   NativeSelectOption,
 } from "@/components/ui/native-select";
 import { Progress } from "@/components/ui/progress";
-import { Separator } from "@/components/ui/separator";
-import {
-  Sheet,
-  SheetContent,
-  SheetDescription,
-  SheetHeader,
-  SheetTitle,
-} from "@/components/ui/sheet";
 import {
   Sidebar,
   SidebarContent,
@@ -217,10 +205,16 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar";
 import { Spinner } from "@/components/ui/spinner";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import "./styles.css";
+import "./workspace/workspace.css";
+import { WorkspacePane } from "./workspace/WorkspacePane";
+import { WorkspaceTabs } from "./app-shell/WorkspaceTabs";
+import { AddWorkspaceDialog } from "./remote-workspaces/AddWorkspaceDialog";
+import { RemoteWorkspaceList } from "./remote-workspaces/RemoteWorkspaceList";
+import { useRemoteWorkspaces } from "./remote-workspaces/use-remote-workspaces";
+import { sessionLabel, SessionAgentIcon, StatusMark } from "./workspace/session-presentation";
 
 /** Host platform is static and controls native menu labels and shortcuts. */
 const isMac = window.prospero.platform === "darwin";
@@ -248,23 +242,18 @@ function readSidebarOpenPreference(): boolean | undefined {
   }
 }
 
-const ChatPane = lazy(() =>
-  import("./ChatPane").then((module) => ({ default: module.ChatPane })),
-);
-const TerminalPane = lazy(() =>
-  import("./TerminalPane").then((module) => ({ default: module.TerminalPane })),
-);
 const OrchestrationPane = lazy(() =>
   import("./OrchestrationPane").then((module) => ({
     default: module.OrchestrationPane,
   })),
 );
 const AccountsPane = lazy(() =>
-  import("./ManagementPanes").then((module) => ({
+  import("./accounts/AccountsPane").then((module) => ({
     default: module.AccountsPane,
   })),
 );
 const RemoteHostsPane = lazy(() => import("./RemoteHostsPane"));
+const RemoteWorkspacePane = lazy(() => import("./remote-workspaces/RemoteWorkspacePane").then(module => ({ default: module.RemoteWorkspacePane })));
 const DevicesPane = lazy(() =>
   import("./ManagementPanes").then((module) => ({
     default: module.DevicesPane,
@@ -274,7 +263,7 @@ const LogsPane = lazy(() =>
   import("./ManagementPanes").then((module) => ({ default: module.LogsPane })),
 );
 const SettingsPane = lazy(() =>
-  import("./ManagementPanes").then((module) => ({
+  import("./settings/SettingsPane").then((module) => ({
     default: module.SettingsPane,
   })),
 );
@@ -415,35 +404,6 @@ function getViewCopy(
 
 function navLabel(view: View, t: (zh: string, en: string) => string): string {
   return getViewCopy(view, t).title;
-}
-
-function sessionLabel(session: SessionInfo): string {
-  return (
-    session.displayTitle || session.title || session.preview || session.agent
-  );
-}
-
-function StatusMark({ status }: { status: string }) {
-  return (
-    <span className={cn("status-mark", `is-${status}`)} aria-hidden="true" />
-  );
-}
-
-function SessionAgentIcon({
-  agent,
-  unread = false,
-}: {
-  agent: string;
-  unread?: boolean;
-}) {
-  return (
-    <span
-      className={cn("session-agent-icon", unread && "is-unread")}
-      aria-hidden="true"
-    >
-      <AgentLogo agent={agent} size={15} decorative />
-    </span>
-  );
 }
 
 type SidebarSessionHandlers = {
@@ -801,6 +761,17 @@ function ShellSidebar({
   onRenameSession,
   onDuplicateSession,
   onSetUnread,
+  onAddWorkspace,
+  remoteWorkspaces,
+  activeRemoteId,
+  onOpenRemote,
+  onUpdateRemote,
+  onForgetRemote,
+  focus,
+  onExitFocus,
+  remoteError,
+  remoteLoading,
+  onRetryRemote,
 }: {
   snapshot: DesktopSnapshot;
   view: View;
@@ -814,6 +785,17 @@ function ShellSidebar({
   onRenameSession: (id: string) => void;
   onDuplicateSession: (session: SessionInfo) => void;
   onSetUnread: (id: string, unread: boolean) => void;
+  onAddWorkspace: () => void;
+  remoteWorkspaces: RemoteWorkspace[];
+  activeRemoteId: string | undefined;
+  onOpenRemote: (workspace: RemoteWorkspace, newSession?: boolean) => void;
+  onUpdateRemote: (workspace: RemoteWorkspace) => void;
+  onForgetRemote: (id: string) => Promise<void>;
+  focus: boolean;
+  onExitFocus: () => void;
+  remoteError: string | undefined;
+  remoteLoading: boolean;
+  onRetryRemote: () => void;
 }) {
   const { language, t, status } = useLocale();
   const { open, isMobile, setOpenMobile } = useSidebar();
@@ -833,12 +815,9 @@ function ShellSidebar({
     closeMobileSidebar();
   }, [closeMobileSidebar, onNewSession]);
   const chooseProject = useCallback((): void => {
-    void window.prospero.chooseProject()
-      .then((path) => {
-        if (path) closeMobileSidebar();
-      })
-      .catch(() => undefined);
-  }, [closeMobileSidebar]);
+    onAddWorkspace();
+    closeMobileSidebar();
+  }, [closeMobileSidebar, onAddWorkspace]);
   const [workspaceOpen, setWorkspaceOpen] = useState(true);
   const managedLayout = useMemo(
     () => groupManagedWorkspaces(snapshot.projects, snapshot.orchestration),
@@ -1519,12 +1498,13 @@ function ShellSidebar({
       mobileDescription={t("主导航、工作区与会话", "Main navigation, workspaces, and sessions")}
     >
       <SidebarHeader className="sidebar-shell-header">
-        <span className="sidebar-wordmark">Prospero</span>
+        <Button className="sidebar-new-session" variant="ghost" size="icon-sm" aria-label={t("新建会话", "New session")} title={t("新建会话", "New session")} onClick={() => newSession()}><Plus /></Button>
         <SidebarTrigger
           className="sidebar-header-toggle"
           aria-label={open || isMobile ? t("收起侧边栏", "Collapse sidebar") : t("展开侧边栏", "Expand sidebar")}
           title={open || isMobile ? t("收起侧边栏", "Collapse sidebar") : t("展开侧边栏", "Expand sidebar")}
         />
+        {focus && <Button className="sidebar-exit-focus" variant="ghost" size="icon-sm" aria-label={t("退出专注", "Exit focus")} title={t("退出专注", "Exit focus")} onClick={onExitFocus}><Minimize2 /></Button>}
       </SidebarHeader>
       <SidebarContent className="sidebar-content-shell">
         <nav className="sidebar-nav-fixed" aria-label={t("主导航", "Main navigation")}>
@@ -1807,7 +1787,9 @@ function ShellSidebar({
                       </button>
                     </SidebarMenuItem>
                   )}
-                  {snapshot.projects.length === 0 && (
+                  <RemoteWorkspaceList workspaces={remoteWorkspaces} activeId={activeRemoteId} query={normalizedSessionQuery} sort={snapshot.settings.workspaceSort} onOpen={(workspace, newShell) => { onOpenRemote(workspace, newShell); closeMobileSidebar(); }} onUpdate={onUpdateRemote} onForget={onForgetRemote} />
+                  {remoteError && <SidebarMenuItem className="remote-workspace-load-error"><p role="alert">{remoteError}</p><Button size="sm" variant="ghost" disabled={remoteLoading} onClick={onRetryRemote}>{remoteLoading ? <Spinner /> : <RefreshCw />}{t("重试远程工作区", "Retry remote workspaces")}</Button></SidebarMenuItem>}
+                  {snapshot.projects.length === 0 && remoteWorkspaces.length === 0 && (
                     <SidebarMenuItem>
                       <SidebarMenuButton
                         onClick={chooseProject}
@@ -1935,6 +1917,7 @@ function OverviewPane({
   onOpenRuns,
   onOpenWorkspaces,
   onNewSession,
+  onAddWorkspace,
 }: {
   snapshot: DesktopSnapshot;
   onOpenSession: (id: string) => void;
@@ -1942,6 +1925,7 @@ function OverviewPane({
   onOpenRuns: (runId?: string, taskId?: string) => void;
   onOpenWorkspaces: () => void;
   onNewSession: (project: string) => void;
+  onAddWorkspace: () => void;
 }) {
   const { t, status } = useLocale();
   const activeSessions = snapshot.daemon.sessions.filter((session) =>
@@ -2281,7 +2265,7 @@ function OverviewPane({
             <Button
               variant="ghost"
               size="sm"
-              onClick={() => void window.prospero.chooseProject()}
+              onClick={onAddWorkspace}
             >
               <FolderPlus data-icon="inline-start" />
               {t("添加工作区", "Add workspace")}
@@ -2345,7 +2329,7 @@ function OverviewPane({
                   </EmptyDescription>
                 </EmptyHeader>
                 <EmptyContent>
-                  <Button onClick={() => void window.prospero.chooseProject()}>
+                  <Button onClick={onAddWorkspace}>
                     {t("选择文件夹", "Choose folder")}
                   </Button>
                 </EmptyContent>
@@ -2874,570 +2858,6 @@ function AgentsPane({
   );
 }
 
-function WorkspaceContextPane({
-  session,
-  snapshot,
-}: {
-  session: SessionInfo;
-  snapshot: DesktopSnapshot;
-}) {
-  const { t, status } = useLocale();
-  const [usage, setUsage] = useState<UsageReport>();
-  useEffect(() => {
-    let cancelled = false;
-    setUsage(undefined);
-    void window.prospero
-      .getUsage(session.id)
-      .then((value) => { if (!cancelled) setUsage(value); })
-      .catch(() => { if (!cancelled) setUsage(undefined); });
-    return () => { cancelled = true; };
-  }, [session.id]);
-  const dispatch = snapshot.orchestration.dispatches.find(
-    (item) => text(item["sessionId"]) === session.id,
-  );
-  const taskPreview = dispatch
-    ? snapshot.orchestration.tasks.find(
-        (item) => text(item["id"]) === text(dispatch["taskId"]),
-      )
-    : undefined;
-  const taskId = text(taskPreview?.["id"]);
-  const taskPreviewUpdatedAt = Number(taskPreview?.["updatedAt"]) || 0;
-  const [fullTask, setFullTask] = useState<{
-    task: JsonObject;
-    previewUpdatedAt: number;
-  }>();
-  useEffect(() => {
-    let cancelled = false;
-    setFullTask(undefined);
-    if (!taskId || taskPreview?.["specTruncated"] !== true) return;
-    void window.prospero.getOrchestrationTask(taskId)
-      .then((value) => {
-        if (!cancelled) setFullTask({ task: value, previewUpdatedAt: taskPreviewUpdatedAt });
-      })
-      .catch(() => undefined);
-    return () => { cancelled = true; };
-  }, [taskId, taskPreview?.["specTruncated"], taskPreviewUpdatedAt]);
-  const task = fullTask?.previewUpdatedAt === taskPreviewUpdatedAt && taskPreview
-    ? {
-        ...fullTask.task,
-        ...taskPreview,
-        spec: fullTask.task["spec"],
-      }
-    : taskPreview;
-  const tokens = (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0);
-  return (
-    <Tabs defaultValue="task" className="context-pane-tabs">
-      <div className="pane-tabbar">
-        <TabsList variant="line">
-          <TabsTrigger value="task">{t("任务", "Task")}</TabsTrigger>
-          <TabsTrigger value="diff">Diff</TabsTrigger>
-          <TabsTrigger value="execution">{t("执行", "Execution")}</TabsTrigger>
-        </TabsList>
-      </div>
-      <TabsContent value="task" className="context-pane-content">
-        {task ? (
-          <>
-            <div className="context-pane-heading">
-              <Badge variant="secondary">{status(text(task["status"]))}</Badge>
-              <h2>{text(task["title"])}</h2>
-              <p>{text(task["spec"])}</p>
-            </div>
-            <Separator />
-            <dl className="detail-list">
-              <div>
-                <dt>Agent</dt>
-                <dd>{session.agent}</dd>
-              </div>
-              <div>
-                <dt>{t("运行环境", "Runtime")}</dt>
-                <dd>{isMac ? t("此 Mac", "This Mac") : t("本机 Windows", "This Windows PC")}</dd>
-              </div>
-              <div>
-                <dt>{t("分支", "Branch")}</dt>
-                <dd className="font-mono">
-                  {text(dispatch?.["branch"], "workspace")}
-                </dd>
-              </div>
-              <div>
-                <dt>Worktree</dt>
-                <dd
-                  className="truncate font-mono"
-                  title={text(dispatch?.["worktreePath"])}
-                >
-                  {shortPath(text(dispatch?.["worktreePath"], session.cwd))}
-                </dd>
-              </div>
-              <div>
-                <dt>{t("依赖", "Dependencies")}</dt>
-                <dd>{Array.isArray(task["deps"]) ? task["deps"].length : 0}</dd>
-              </div>
-            </dl>
-          </>
-        ) : (
-          <Empty>
-            <EmptyHeader>
-              <EmptyMedia variant="icon">
-                <ListChecks />
-              </EmptyMedia>
-              <EmptyTitle>{t("未关联任务", "No linked task")}</EmptyTitle>
-              <EmptyDescription>
-                {t(
-                  "这个会话尚未绑定到编排任务，仍可作为独立工作上下文使用。",
-                  "This session is not linked to an orchestration task and can still be used independently.",
-                )}
-              </EmptyDescription>
-            </EmptyHeader>
-          </Empty>
-        )}
-      </TabsContent>
-      <TabsContent value="diff" className="context-pane-content">
-        <div className="context-pane-heading">
-          <Badge variant="outline">{t("变更文件", "CHANGED FILES")}</Badge>
-          <h2>{t("工作树差异", "Working tree diff")}</h2>
-          <p>
-            {t(
-              "Diff 是独立 Pane，不再嵌入 Conversation。",
-              "Diff is an independent pane rather than part of the conversation.",
-            )}
-          </p>
-        </div>
-        <div className="diff-placeholder">
-          <FileDiff />
-          <strong>
-            {task
-              ? t(
-                  "等待 daemon 提供结构化变更摘要",
-                  "Waiting for a structured change summary",
-                )
-              : t("暂无任务 Diff", "No task diff available")}
-          </strong>
-          <p>
-            {t(
-              "打开相关 worktree 可查看当前文件变更。",
-              "Open the related worktree to inspect current file changes.",
-            )}
-          </p>
-          {text(dispatch?.["worktreePath"]) && (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() =>
-                void window.prospero.revealPath(
-                  text(dispatch?.["worktreePath"]),
-                )
-              }
-            >
-              <FolderOpen data-icon="inline-start" />
-              {t("打开工作树", "Open worktree")}
-            </Button>
-          )}
-        </div>
-      </TabsContent>
-      <TabsContent value="execution" className="context-pane-content">
-        <div className="context-pane-heading">
-          <Badge variant="outline">{t("执行", "EXECUTION")}</Badge>
-          <h2>{t("会话运行环境", "Session runtime")}</h2>
-          <p>
-            {t(
-              "会话、模型、额度与运行位置。",
-              "Session, model, usage, and execution location.",
-            )}
-          </p>
-        </div>
-        <dl className="detail-list">
-          <div>
-            <dt>{t("状态", "Status")}</dt>
-            <dd>
-              <StatusMark status={session.status} />
-              {status(session.status)}
-            </dd>
-          </div>
-          <div>
-            <dt>{t("模式", "Mode")}</dt>
-            <dd>
-              {session.kind === "pty"
-                ? t("PTY 终端", "PTY terminal")
-                : t("结构化会话", "Structured conversation")}
-            </dd>
-          </div>
-          <div>
-            <dt>{t("审批", "Approval")}</dt>
-            <dd>{session.approvalPolicy || "standard"}</dd>
-          </div>
-          <div>
-            <dt>Tokens</dt>
-            <dd>{tokens.toLocaleString()}</dd>
-          </div>
-          <div>
-            <dt>{t("会话", "Session")}</dt>
-            <dd className="font-mono">{session.id.slice(0, 10)}…</dd>
-          </div>
-        </dl>
-        <div className="context-actions">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() =>
-              void window.prospero.openWindowsTerminal(session.cwd)
-            }
-          >
-            <SquareTerminal data-icon="inline-start" />
-            {isMac ? t("终端", "Terminal") : "Windows Terminal"}
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => void window.prospero.revealPath(session.cwd)}
-          >
-            <FolderOpen data-icon="inline-start" />
-            {isMac ? t("在访达中显示", "Reveal in Finder") : "Explorer"}
-          </Button>
-        </div>
-      </TabsContent>
-    </Tabs>
-  );
-}
-
-function WorkspacePane({
-  snapshot,
-  activeId,
-  openIds,
-  onActivate,
-  onClose,
-  onNewSession,
-  onOpenRun,
-  onTogglePin,
-  onToggleFocus,
-  focus,
-}: {
-  snapshot: DesktopSnapshot;
-  activeId: string | undefined;
-  openIds: string[];
-  onActivate: (id: string) => void;
-  onClose: (id: string) => void;
-  onNewSession: (project?: string) => void;
-  onOpenRun: (runId?: string) => void;
-  onTogglePin: (id: string) => void;
-  onToggleFocus: () => void;
-  focus: boolean;
-}) {
-  const { t, status } = useLocale();
-  const chromeVisible = workspaceChromeVisible(focus);
-  const [showContext, setShowContext] = useState(false);
-  const contextVisible = showContext && chromeVisible;
-  const [contextSheet, setContextSheet] = useState(false);
-  useEffect(() => {
-    if (!chromeVisible) setContextSheet(false);
-  }, [chromeVisible]);
-  const active = snapshot.daemon.sessions.find(
-    (session) => session.id === activeId,
-  );
-  const activeDispatch = active
-    ? snapshot.orchestration.dispatches.find(
-        (dispatch) => text(dispatch["sessionId"]) === active.id,
-      )
-    : undefined;
-  const moveSessionTab = (id: string, direction: -1 | 1 | "first" | "last"): void => {
-    const index = openIds.indexOf(id);
-    if (index < 0 || openIds.length === 0) return;
-    const nextIndex = direction === "first"
-      ? 0
-      : direction === "last"
-        ? openIds.length - 1
-        : (index + direction + openIds.length) % openIds.length;
-    const nextId = openIds[nextIndex];
-    if (!nextId) return;
-    onActivate(nextId);
-    window.requestAnimationFrame(() => document.getElementById(`workspace-tab-${nextId}`)?.focus());
-  };
-  return (
-    <div className="workspace-view workspace-view-single">
-      <div className={cn("pane-workspace", focus && "is-focus")}>
-        {chromeVisible && <div className="workspace-tabbar">
-          <div className="workspace-tabs" role="tablist">
-            {openIds.map((id) => {
-              const session = snapshot.daemon.sessions.find(
-                (item) => item.id === id,
-              );
-              if (!session) return null;
-              const pinned = snapshot.pinnedSessionIds.includes(id);
-              return (
-                <div
-                  key={id}
-                  className={cn(
-                    "workspace-tab",
-                    id === activeId && "is-active",
-                  )}
-                >
-                  <button
-                    type="button"
-                    data-slot="workspace-tab-main"
-                    data-liquid-glass="tab"
-                    className="workspace-tab-main"
-                    id={`workspace-tab-${id}`}
-                    role="tab"
-                    aria-controls="workspace-session-panel"
-                    aria-selected={id === activeId}
-                    tabIndex={id === activeId ? 0 : -1}
-                    onClick={() => onActivate(id)}
-                    onKeyDown={(event) => {
-                      const direction = event.key === "ArrowLeft"
-                        ? -1
-                        : event.key === "ArrowRight"
-                          ? 1
-                          : event.key === "Home"
-                            ? "first"
-                            : event.key === "End"
-                              ? "last"
-                              : undefined;
-                      if (direction === undefined) return;
-                      event.preventDefault();
-                      moveSessionTab(id, direction);
-                    }}
-                  >
-                    <SessionAgentIcon agent={session.agent} />
-                    <span className="truncate">{sessionLabel(session)}</span>
-                  </button>
-                  <button
-                    type="button"
-                    data-slot="workspace-tab-pin"
-                    data-testid="workspace-tab-pin"
-                    className={cn(
-                      "workspace-tab-action",
-                      pinned && "is-pinned",
-                    )}
-                    aria-pressed={pinned}
-                    aria-label={
-                      pinned
-                        ? t(
-                            `取消置顶 ${sessionLabel(session)}`,
-                            `Unpin ${sessionLabel(session)}`,
-                          )
-                        : t(
-                            `置顶 ${sessionLabel(session)}`,
-                            `Pin ${sessionLabel(session)}`,
-                          )
-                    }
-                    onClick={() => onTogglePin(id)}
-                  >
-                    <Pin aria-hidden="true" />
-                  </button>
-                  <button
-                    type="button"
-                    data-slot="workspace-tab-close"
-                    data-testid="workspace-tab-close"
-                    className="workspace-tab-action"
-                    aria-label={t(
-                      `关闭 ${sessionLabel(session)}`,
-                      `Close ${sessionLabel(session)}`,
-                    )}
-                    onClick={() => onClose(id)}
-                  >
-                    <X aria-hidden="true" />
-                  </button>
-                </div>
-              );
-            })}
-          </div>
-        </div>}
-        {active ? (
-          <>
-            {chromeVisible && <header className="pane-toolbar">
-              <div className="agent-identity">
-                <Avatar>
-                  <AvatarFallback>
-                    <AgentLogo agent={active.agent} size={18} />
-                  </AvatarFallback>
-                </Avatar>
-                <div>
-                  <strong>{sessionLabel(active)}</strong>
-                  <small>
-                    <StatusMark status={active.status} />
-                    {status(active.status)} · {shortPath(active.cwd)}
-                  </small>
-                </div>
-              </div>
-              <div className="pane-toolbar-actions">
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  aria-label={t("进入专注模式", "Enter focus mode")}
-                  title={t("进入专注模式", "Enter focus mode")}
-                  onClick={onToggleFocus}
-                >
-                  <Maximize2 />
-                </Button>
-                <Badge variant="outline">
-                  <GitBranch />
-                  {shortPath(active.cwd)}
-                </Badge>
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  aria-label={t("停止当前轮次", "Stop current turn")}
-                  onClick={() =>
-                    void window.prospero.interruptSession(active.id)
-                  }
-                >
-                  <CircleStop />
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  aria-label={t("切换上下文 Pane", "Toggle context pane")}
-                  className="context-pane-toggle"
-                  onClick={() => setShowContext((current) => !current)}
-                >
-                  <PanelRight />
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  aria-label={t("打开上下文", "Open context")}
-                  className="context-sheet-trigger"
-                  onClick={() => setContextSheet(true)}
-                >
-                  <PanelRight />
-                </Button>
-                <DropdownMenu>
-                  <DropdownMenuTrigger
-                    render={
-                      <Button
-                        variant="ghost"
-                        size="icon-sm"
-                        aria-label={t("会话操作", "Session actions")}
-                      />
-                    }
-                  >
-                    <MoreHorizontal />
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="end">
-                    <DropdownMenuGroup>
-                      <DropdownMenuLabel>
-                        {t("会话", "Session")}
-                      </DropdownMenuLabel>
-                      <DropdownMenuItem
-                        onClick={() =>
-                          void window.prospero.revealPath(active.cwd)
-                        }
-                      >
-                        <FolderOpen />
-                        {isMac
-                          ? t("在访达中显示", "Reveal in Finder")
-                          : t("在资源管理器中打开", "Open in Explorer")}
-                      </DropdownMenuItem>
-                      <DropdownMenuItem
-                        onClick={() =>
-                          void window.prospero.openWindowsTerminal(active.cwd)
-                        }
-                      >
-                        <SquareTerminal />
-                        {isMac ? t("终端", "Terminal") : "Windows Terminal"}
-                      </DropdownMenuItem>
-                    </DropdownMenuGroup>
-                    <DropdownMenuSeparator />
-                    <DropdownMenuGroup>
-                      <DropdownMenuItem
-                        variant="destructive"
-                        onClick={() =>
-                          void window.prospero.killSession(active.id)
-                        }
-                      >
-                        <X />
-                        {t("结束会话", "End session")}
-                      </DropdownMenuItem>
-                    </DropdownMenuGroup>
-                  </DropdownMenuContent>
-                </DropdownMenu>
-              </div>
-            </header>}
-            <div className={cn("pane-grid", !contextVisible && "context-hidden")}>
-              <main id="workspace-session-panel" role="tabpanel" aria-labelledby={!focus && activeId ? `workspace-tab-${activeId}` : undefined} aria-label={focus ? sessionLabel(active) : undefined} className="primary-pane">
-                {chromeVisible && <div className="pane-tabbar pane-tabbar-static">
-                  <span>
-                    {active.kind === "pty"
-                      ? t("终端", "Terminal")
-                      : t("对话", "Conversation")}
-                  </span>
-                  <Badge variant="outline">{active.agent}</Badge>
-                </div>}
-                <div className="pane-content">
-                  {active.kind === "pty" ? (
-                    <TerminalPane
-                      key={active.id}
-                      session={active}
-                      fontFamily={snapshot.settings.terminalFontFamily}
-                      fontSize={snapshot.settings.terminalFontSize}
-                    />
-                  ) : (
-                    <ChatPane
-                      key={active.id}
-                      session={active}
-                      onOpenGoal={() => onOpenRun(text(activeDispatch?.["runId"]) || undefined)}
-                    />
-                  )}
-                </div>
-              </main>
-              {contextVisible && (
-                <aside className="secondary-pane">
-                  <WorkspaceContextPane session={active} snapshot={snapshot} />
-                </aside>
-              )}
-            </div>
-            <Sheet open={chromeVisible && contextSheet} onOpenChange={setContextSheet}>
-              <SheetContent
-                side="right"
-                className="w-[min(520px,92vw)] sm:max-w-xl"
-              >
-                <SheetHeader>
-                  <SheetTitle>{t("任务上下文", "Task context")}</SheetTitle>
-                  <SheetDescription>
-                    {t(
-                      "任务、Diff 与执行信息",
-                      "Task, diff, and execution details",
-                    )}
-                  </SheetDescription>
-                </SheetHeader>
-                <WorkspaceContextPane session={active} snapshot={snapshot} />
-              </SheetContent>
-            </Sheet>
-          </>
-        ) : (
-          <Empty className="workspace-empty">
-            <EmptyHeader>
-              <EmptyMedia variant="icon">
-                <FolderKanban />
-              </EmptyMedia>
-              <EmptyTitle>
-                {t("选择工作上下文", "Choose a work context")}
-              </EmptyTitle>
-              <EmptyDescription>
-                {t(
-                  "打开已有会话，或在项目中创建新的 Agent 会话。",
-                  "Open an existing session or create a new agent session in a project.",
-                )}
-              </EmptyDescription>
-            </EmptyHeader>
-            <EmptyContent className="flex gap-2">
-              <Button onClick={() => onNewSession()}>
-                <Plus data-icon="inline-start" />
-                {t("新建会话", "New session")}
-              </Button>
-              <Button
-                variant="outline"
-                onClick={() => void window.prospero.chooseProject()}
-              >
-                <FolderPlus data-icon="inline-start" />
-                {t("添加工作区", "Add workspace")}
-              </Button>
-            </EmptyContent>
-          </Empty>
-        )}
-      </div>
-    </div>
-  );
-}
-
 function ProjectRenameDialog({
   project,
   currentName,
@@ -3624,12 +3044,18 @@ function NewSessionDialog({
   open,
   onOpenChange,
   onCreated,
+  remoteWorkspaces,
+  onRemoteWorkspace,
+  onManageHosts,
 }: {
   snapshot: DesktopSnapshot;
   project: string | undefined;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onCreated: (session: SessionInfo) => void;
+  remoteWorkspaces: RemoteWorkspace[];
+  onRemoteWorkspace: (workspace: RemoteWorkspace, newSession?: boolean) => void;
+  onManageHosts: () => void;
 }) {
   const { t, status } = useLocale();
   const [input, setInput] = useState<SessionCreateInput>({
@@ -3642,6 +3068,8 @@ function NewSessionDialog({
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
   const [choosingWorkspace, setChoosingWorkspace] = useState(false);
+  const [remoteId, setRemoteId] = useState<string>();
+  const remoteTarget = remoteWorkspaces.find(workspace => workspace.id === remoteId);
   const [error, setError] = useState<string>();
   const [launchModels, setLaunchModels] = useState<AgentModel[]>([]);
   const [launchModelsLoading, setLaunchModelsLoading] = useState(false);
@@ -3701,6 +3129,7 @@ function NewSessionDialog({
     "opencode",
   ].includes(input.agent);
   const supportsLaunchModels =
+    !remoteId &&
     selectedKind === "structured" &&
     (selectedAccount?.capabilities?.modelSelection ?? true) &&
     (input.agent === "codex" ||
@@ -3765,6 +3194,10 @@ function NewSessionDialog({
     };
   }, [input.accountId, input.agent, input.kind, open, supportsLaunchModels]);
   const create = async (): Promise<void> => {
+    if (remoteId) {
+      if (!busyRef.current && remoteTarget) { onRemoteWorkspace(remoteTarget, true); onOpenChange(false); }
+      return;
+    }
     if (busyRef.current || !input.cwd || !accountCanLaunch) return;
     busyRef.current = true;
     setBusy(true);
@@ -3779,19 +3212,6 @@ function NewSessionDialog({
       setBusy(false);
     }
   };
-  const chooseWorkspace = async (): Promise<void> => {
-    if (choosingWorkspace) return;
-    setChoosingWorkspace(true);
-    setError(undefined);
-    try {
-      const cwd = await window.prospero.chooseProject();
-      if (cwd) setInput((current) => ({ ...current, cwd }));
-    } catch (reason) {
-      setError(displayError(reason));
-    } finally {
-      setChoosingWorkspace(false);
-    }
-  };
   return (
     <Dialog open={open} onOpenChange={(next) => { if (next || !busy) onOpenChange(next); }}>
       <DialogContent
@@ -3802,7 +3222,7 @@ function NewSessionDialog({
         aria-busy={busy || choosingWorkspace}
       >
         <DialogHeader>
-          <DialogTitle>{t("新建 Agent 会话", "New agent session")}</DialogTitle>
+          <DialogTitle>{remoteId ? t("新建远程 Shell", "New remote Shell") : t("新建 Agent 会话", "New agent session")}</DialogTitle>
           <DialogDescription>
             {t(
               "选择项目或编排 worktree，并为这次会话指定 Agent、账号与模型。",
@@ -3827,10 +3247,13 @@ function NewSessionDialog({
             <NativeSelect
               ref={workspaceSelectRef}
               id="session-project"
-              value={input.cwd}
-              onChange={(event) =>
-                setInput({ ...input, cwd: event.target.value })
-              }
+              value={remoteId ?? input.cwd}
+              disabled={busy}
+              onChange={(event) => {
+                const remoteWorkspace = remoteWorkspaces.find(workspace => workspace.id === event.target.value);
+                setRemoteId(remoteWorkspace?.id);
+                if (!remoteWorkspace) setInput({ ...input, cwd: event.target.value });
+              }}
             >
               <NativeSelectOption value="" disabled>
                 {t("选择工作区", "Choose workspace")}
@@ -3855,19 +3278,21 @@ function NewSessionDialog({
                     ))}
                 </NativeSelectOptGroup>
               )}
+              {remoteWorkspaces.length > 0 && <NativeSelectOptGroup label={t("远程工作区", "Remote workspaces")}>{remoteWorkspaces.map(workspace => <NativeSelectOption key={workspace.id} value={workspace.id}>{workspace.name} · {workspace.hostName}</NativeSelectOption>)}</NativeSelectOptGroup>}
             </NativeSelect>
-            <Button variant={launchWorkspaces.length === 0 ? "outline" : "ghost"} size="sm" className="w-fit" disabled={choosingWorkspace} onClick={() => void chooseWorkspace()}>
+            <Button variant={launchWorkspaces.length === 0 ? "outline" : "ghost"} size="sm" className="w-fit" disabled={busy || choosingWorkspace} onClick={() => setChoosingWorkspace(true)}>
               {choosingWorkspace ? <Spinner data-icon="inline-start" /> : <FolderPlus data-icon="inline-start" />}
               {choosingWorkspace ? t("正在选择…", "Choosing…") : launchWorkspaces.length === 0 ? t("添加第一个工作区", "Add your first workspace") : t("添加其他工作区", "Add another workspace")}
             </Button>
-            <FieldDescription className="truncate" title={selectedWorkspace?.detail}>
-              {launchWorkspaces.length === 0
+            <FieldDescription className="truncate" title={remoteTarget?.cwd ?? selectedWorkspace?.detail}>
+              {remoteTarget ? `${remoteTarget.hostName} · ${remoteTarget.cwd}` : launchWorkspaces.length === 0
                 ? t("选择一个本地项目后即可在此创建会话。", "Choose a local project to create a session here.")
                 : selectedWorkspace?.kind === "worktree"
                 ? t("编排 worktree · 会话会直接在隔离分支中运行。", "Orchestration worktree · the session runs directly on the isolated branch.")
                 : t("项目根目录与持久上下文。", "Project root and persistent context.")}
             </FieldDescription>
           </Field>
+          {remoteId ? <p className="workspace-picker-hint">{t("在远程电脑的此目录新建交互式 Shell，可运行远端已安装的 codex、claude 等 CLI。不会使用本机账号或本机模型配置。", "Create an interactive Shell in this folder on the remote computer, where you can run its installed codex, claude or other CLI. Local accounts and model settings are not used.")}</p> : <>
           <div className="grid gap-4 sm:grid-cols-2">
             <Field>
               <FieldLabel htmlFor="session-agent">Agent</FieldLabel>
@@ -4078,6 +3503,7 @@ function NewSessionDialog({
                   : t("在高风险操作前请求确认。", "Ask for confirmation before high-risk actions.")}
             </FieldDescription>
           </Field>
+          </>}
         </FieldGroup>
         <DialogFooter>
           <Button variant="outline" disabled={busy || choosingWorkspace} onClick={() => onOpenChange(false)}>
@@ -4085,7 +3511,7 @@ function NewSessionDialog({
           </Button>
           <Button
             aria-busy={busy}
-            disabled={busy || choosingWorkspace || !accountCanLaunch || !input.cwd || (supportsLaunchModels && launchModelsLoading)}
+            disabled={busy || choosingWorkspace || (remoteId ? !remoteTarget : !accountCanLaunch || !input.cwd || (supportsLaunchModels && launchModelsLoading))}
             onClick={() => void create()}
           >
             {busy ? (
@@ -4093,9 +3519,10 @@ function NewSessionDialog({
             ) : (
               <Plus data-icon="inline-start" />
             )}
-            {busy ? t("正在创建", "Creating") : t("创建会话", "Create session")}
+            {busy ? t("正在创建", "Creating") : remoteId ? t("创建远程 Shell", "Create remote Shell") : t("创建会话", "Create session")}
           </Button>
         </DialogFooter>
+        {choosingWorkspace && <AddWorkspaceDialog onClose={() => setChoosingWorkspace(false)} onLocalAdded={cwd => { setRemoteId(undefined); setInput(current => ({ ...current, cwd })); }} onRemoteAdded={workspace => { onRemoteWorkspace(workspace); onOpenChange(false); }} onManageHosts={() => { onOpenChange(false); onManageHosts(); }} />}
       </DialogContent>
     </Dialog>
   );
@@ -4366,6 +3793,32 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   const snapshotRef = useRef(snapshot);
   snapshotRef.current = snapshot;
   const [view, setView] = useState<View>(readStoredView);
+  const remote = useRemoteWorkspaces();
+  const [addWorkspaceOpen, setAddWorkspaceOpen] = useState(false);
+  const [activeRemoteId, setActiveRemoteId] = useState<string | undefined>(() => {
+    try { return localStorage.getItem("prospero.activeRemoteWorkspace") || undefined; } catch { return undefined; }
+  });
+  const [remoteSessionRequest, setRemoteSessionRequest] = useState(0);
+  const activeRemote = remote.workspaces.find(workspace => workspace.id === activeRemoteId);
+  const openRemoteWorkspace = useCallback((workspace: RemoteWorkspace, newSession = false) => {
+    remote.upsert(workspace);
+    setRemoteSessionRequest(request => activeRemoteId === workspace.id ? request + (newSession ? 1 : 0) : newSession ? 1 : 0);
+    setActiveRemoteId(workspace.id);
+    setView("workspaces");
+  }, [activeRemoteId, remote.upsert]);
+  const openAddWorkspace = useCallback(() => setAddWorkspaceOpen(true), []);
+  useEffect(() => {
+    if (view !== "workspaces") { setActiveRemoteId(undefined); setRemoteSessionRequest(0); }
+  }, [view]);
+  useEffect(() => {
+    if (remote.ready && activeRemoteId && !activeRemote) setActiveRemoteId(undefined);
+  }, [activeRemote, activeRemoteId, remote.ready]);
+  useEffect(() => {
+    try {
+      if (activeRemoteId) localStorage.setItem("prospero.activeRemoteWorkspace", activeRemoteId);
+      else localStorage.removeItem("prospero.activeRemoteWorkspace");
+    } catch {}
+  }, [activeRemoteId]);
   const [hydratedSessions, setHydratedSessions] = useState<SessionInfo[]>([]);
   const [openIds, setOpenIds] = useState<string[]>(() => {
     try {
@@ -4513,7 +3966,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     restoredSessionsReady,
     validOpenIds,
   ]);
-  useEffect(() => {
+  useLayoutEffect(() => {
     const systemTheme = window.matchMedia("(prefers-color-scheme: dark)");
     const apply = (): void => {
       document.documentElement.dataset.theme = snapshot.settings.theme;
@@ -4567,14 +4020,16 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
         setLauncher("quick");
       } else if (matchesDesktopShortcut(event, "n", window.prospero.platform)) {
         event.preventDefault();
+        if (view === "workspaces" && activeRemote) { setRemoteSessionRequest(request => request + 1); return; }
         setNewSessionProject(undefined);
         setNewSessionOpen(true);
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
+  }, [activeRemote, view]);
   const openSession = useCallback((id: string, session?: SessionInfo): void => {
+    setActiveRemoteId(undefined);
     if (session) {
       setHydratedSessions((current) =>
         upsertHydratedSession(current, session, HYDRATED_SESSION_CACHE_LIMIT),
@@ -4594,12 +4049,14 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     setView("runs");
   }, []);
   const selectView = useCallback((next: View): void => {
+    if (next !== "workspaces") setActiveRemoteId(undefined);
+    void remote.refresh();
     if (next === "runs") {
       setRunTargetId(undefined);
       setTaskTargetId(undefined);
     }
     setView(next);
-  }, []);
+  }, [remote.refresh]);
   const closeSession = (id: string): void => {
     const index = validOpenIds.indexOf(id);
     const next = validOpenIds.filter((item) => item !== id);
@@ -4607,9 +4064,10 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     if (activeId === id) setActiveId(next[Math.max(0, index - 1)]);
   };
   const openNewSession = useCallback((project?: string): void => {
+    if (!project && view === "workspaces" && activeRemote) { setRemoteSessionRequest(request => request + 1); return; }
     setNewSessionProject(project);
     setNewSessionOpen(true);
-  }, []);
+  }, [activeRemote, view]);
   const toggleArchive = useCallback((id: string): void => {
     void window.prospero.setSessionArchived(
       id,
@@ -4714,7 +4172,6 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
       `Unable to duplicate the session: ${displayError(reason)}`,
     )));
   }, [openSession, t]);
-  const page = getViewCopy(view, t);
   const workspaceFocus = focus && view === "workspaces";
   return (
     <TooltipProvider>
@@ -4726,33 +4183,11 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
       <a className="skip-link" href="#main-content">
         {t("跳到主内容", "Skip to main content")}
       </a>
-      <header className="desktop-topbar">
-        <div className="topbar-context">
-          <SidebarTrigger
-            className="topbar-sidebar-trigger"
-            aria-label={t("切换侧边栏", "Toggle sidebar")}
-            title={t("切换侧边栏", "Toggle sidebar")}
-          />
-          <div>
-            <strong>{page.title}</strong>
-            {!workspaceFocus && <span>{page.description}</span>}
-          </div>
-        </div>
-        <div className="topbar-actions">
-          {workspaceFocus ? (
-            <Button variant="ghost" size="icon-sm" aria-label={t("退出专注", "Exit focus")} title={t(`退出专注（${isMac ? "⇧⌘F" : "Ctrl+Alt+F"}）`, `Exit focus (${isMac ? "⇧⌘F" : "Ctrl+Alt+F"})`)} onClick={() => setFocus(false)}><Minimize2 /></Button>
-          ) : (
-            <Button variant="glass-primary" size="sm" aria-label={t("新建会话", "New session")} onClick={() => openNewSession()}>
-              <Plus data-icon="inline-start" />
-              {t("新建会话", "New session")}
-            </Button>
-          )}
-        </div>
-      </header>
+      <SidebarTrigger className="sidebar-drawer-trigger" aria-label={t("打开侧边栏", "Open sidebar")} />
       <ShellSidebar
         snapshot={sessionSnapshot}
         view={view}
-        activeId={activeId}
+        activeId={activeRemoteId ? undefined : activeId}
         onView={selectView}
         onOpenSession={openSession}
         onNewSession={openNewSession}
@@ -4762,8 +4197,20 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
         onRenameSession={setEditingSession}
         onDuplicateSession={duplicateSession}
         onSetUnread={setUnread}
+        onAddWorkspace={openAddWorkspace}
+        remoteWorkspaces={remote.workspaces}
+        activeRemoteId={view === "workspaces" ? activeRemoteId : undefined}
+        onOpenRemote={openRemoteWorkspace}
+        onUpdateRemote={remote.upsert}
+        onForgetRemote={remote.forget}
+        focus={workspaceFocus}
+        onExitFocus={() => setFocus(false)}
+        remoteError={remote.error}
+        remoteLoading={remote.loading}
+        onRetryRemote={() => void remote.refresh()}
       />
       <SidebarInset id="main-content" tabIndex={-1} className="prospero-main">
+        <div className="native-window-drag-region" aria-hidden="true" />
         <div className="main-viewport">
           {sessionActionError && !workspaceFocus && <Alert variant="destructive" className="mx-7 mt-5 w-auto"><CircleAlert /><AlertTitle>{t("会话操作失败", "Session action failed")}</AlertTitle><AlertDescription>{sessionActionError}</AlertDescription><Button variant="ghost" size="sm" className="ml-auto" onClick={() => setSessionActionError(undefined)}>{t("关闭", "Dismiss")}</Button></Alert>}
           <Suspense
@@ -4782,6 +4229,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
                 onOpenRuns={openRun}
                 onOpenWorkspaces={() => setView("workspaces")}
                 onNewSession={openNewSession}
+                onAddWorkspace={openAddWorkspace}
               />
             ) : view === "inbox" ? (
               <InboxPane
@@ -4790,10 +4238,12 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
                 onOpenRuns={openRun}
               />
             ) : view === "remote" ? (
-              <RemoteHostsPane />
+              <RemoteHostsPane settings={sessionSnapshot.settings} />
             ) : view === "mobile" ? (
               <DevicesPane snapshot={sessionSnapshot} />
             ) : view === "workspaces" ? (
+              activeRemote ? <RemoteWorkspacePane key={activeRemote.id} workspace={activeRemote} settings={sessionSnapshot.settings} focus={focus} onToggleFocus={() => setFocus(current => !current)} newSessionRequest={remoteSessionRequest} /> : activeRemoteId && !remote.ready ? <div className="boot-screen"><p role={remote.error ? "alert" : "status"}>{remote.error ?? t("正在恢复远程工作区…", "Restoring remote workspace…")}</p>{remote.error && <Button onClick={() => void remote.refresh()}>{t("重试", "Retry")}</Button>}</div> : <div className="local-workspace-container">
+              {!workspaceFocus && validOpenIds.length > 0 && <WorkspaceTabs snapshot={sessionSnapshot} openIds={openIds} activeId={activeId} onActivate={openSession} onClose={closeSession} onTogglePin={togglePin} />}
               <WorkspacePane
                 focus={focus}
                 snapshot={sessionSnapshot}
@@ -4805,7 +4255,8 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
                 onOpenRun={openRun}
                 onTogglePin={togglePin}
                 onToggleFocus={() => setFocus((current) => !current)}
-              />
+                onAddWorkspace={openAddWorkspace}
+              /></div>
             ) : view === "runs" ? (
               <OrchestrationPane
                 snapshot={sessionSnapshot}
@@ -4821,7 +4272,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
             ) : view === "diagnostics" ? (
               <LogsPane snapshot={sessionSnapshot} />
             ) : (
-              <SettingsPane snapshot={sessionSnapshot} />
+              <SettingsPane snapshot={sessionSnapshot} onOpenAccounts={() => selectView("providers")} />
             )}
           </Suspense>
         </div>
@@ -4833,8 +4284,12 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
           open
           onOpenChange={setNewSessionOpen}
           onCreated={(session) => openSession(session.id, session)}
+          remoteWorkspaces={remote.workspaces}
+          onRemoteWorkspace={openRemoteWorkspace}
+          onManageHosts={() => selectView("remote")}
         />
       )}
+      {addWorkspaceOpen && <AddWorkspaceDialog onClose={() => setAddWorkspaceOpen(false)} onLocalAdded={cwd => openNewSession(cwd)} onRemoteAdded={openRemoteWorkspace} onManageHosts={() => selectView("remote")} />}
       {editingProject && (
         <ProjectRenameDialog
           project={editingProject}

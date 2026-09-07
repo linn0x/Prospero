@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { sessionInfoFromControl } from "../src/main/session-control";
+import { sessionAgentControls, sessionInfoFromControl } from "../src/main/session-control";
 
 describe("desktop session control projection", () => {
   it("preserves account identity returned by create and history endpoints", () => {
@@ -31,5 +31,15 @@ describe("desktop session control projection", () => {
 
     expect(session).not.toHaveProperty("accountId");
     expect(session).not.toHaveProperty("accountName");
+    expect(session).not.toHaveProperty("agentControls");
+  });
+
+  it("preserves supported controls and the current model selection", () => {
+    const controls = { compact: false, model: true, mode: false, currentModel: "provider/model", currentEffort: "high" };
+    expect(sessionInfoFromControl({ id: "modeled-session", agentControls: controls }).agentControls).toEqual(controls);
+    expect(sessionAgentControls({ ...controls, model: "true" })).toBeUndefined();
+    expect(sessionAgentControls({ ...controls, currentModel: "a".repeat(400), currentEffort: "b".repeat(200) })).toMatchObject({
+      currentModel: "a".repeat(300), currentEffort: "b".repeat(100),
+    });
   });
 });

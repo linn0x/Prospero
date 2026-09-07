@@ -44,6 +44,31 @@ describe("legacy JSON streaming import boundaries", () => {
     expect(entries).toEqual([{ path: ["sessions", 0, "events", 0], value: { kind: "x", nested: [1, { text: "🧪" }] } }]);
     expect(shapes).toContain("sessions:array"); expect(shapes).toContain("sessions.0.events.0.nested:array");
   });
+  it("preserves complete collections when the identity arrives after history", async () => {
+    const original = state();
+    const { id, ...remaining } = original;
+    const f = fixture(JSON.stringify({ ...remaining, id }));
+    await migrateLegacySessionFile(f.source, f.database, { array: false });
+    const restored = read(f.database)!;
+    expect(restored.events).toEqual(original.events);
+    expect(restored.toolOutputs).toEqual(original.toolOutputs);
+    expect(restored.messageQueue).toEqual(original.messageQueue);
+    expect(restored.historyPage?.oldestSeq).toBe(5);
+  });
+  it("awaits an asynchronous container checkpoint before consuming the next session", async () => {
+    const f = fixture('[{"value":1},{"value":2}]');
+    const order: string[] = [];
+    for await (const entry of streamJsonValues(f.source, p => p.length === 2, {
+      onContainerEnd: p => p.length === 1 ? new Promise<void>(resolve => setImmediate(() => { order.push(`commit-${p[0]}`); resolve(); })) : undefined,
+    })) order.push(`value-${entry.value}`);
+    expect(order).toEqual(["value-1", "commit-0", "value-2", "commit-1"]);
+  });
+  it("rejects duplicate session identities without publishing a partial database", async () => {
+    const f = fixture(JSON.stringify([state(), state()]));
+    await expect(migrateLegacySessionFile(f.source, f.database, { array: true })).rejects.toThrow();
+    expect(existsSync(f.database)).toBe(false);
+    expect(readdirSync(f.dir)).toEqual(["legacy.json"]);
+  });
   it("keeps prototype-looking keys as ordinary own data", async () => {
     const text = '{"__proto__":{"polluted":true},"constructor":{"prototype":{"x":1}}}';
     const f = fixture(text), entries = await values(f.source, p => p.length === 0) as { value: object }[];

@@ -1,3 +1,11 @@
+import type { AgentAccountConfig, AgentAccountFeatureError, AgentApiCatalogModel, AgentReasoningEffort, C2SAgentAccountApiModelsGet, C2SAgentAccountConfigSet, S2CAgentAccountApiModelsResult, S2CAgentAccountConfigResult } from "@prospero/protocol";
+
+export type { AgentAccountConfig, AgentAccountFeatureError, AgentApiCatalogModel, AgentReasoningEffort };
+import type { RemoteWorkspace, RemoteDirectoryRequest, RemoteDirectoryListing, RemoteWorkspaceInput, RemoteWorkspaceOpenOptions, RemoteWorkspaceOpenResult } from "./remote-workspaces";
+export type { RemoteWorkspace, RemoteDirectoryRoot, RemoteDirectoryRequest, RemoteDirectoryListing, RemoteWorkspaceInput, RemoteWorkspaceOpenOptions, RemoteWorkspaceOpenResult } from "./remote-workspaces";
+export type AccountModelsInput = Omit<C2SAgentAccountApiModelsGet, "type" | "requestId">;
+export type AccountConfigInput = Omit<C2SAgentAccountConfigSet, "type" | "requestId">;
+
 export type JsonObject = Record<string, unknown>;
 
 export type QueuedChatMessage = {
@@ -24,6 +32,14 @@ export type SessionInfo = {
   pendingQuestions?: number;
   approvalPolicy?: string;
   busySince?: number;
+  agentControls?: {
+    compact: boolean;
+    model: boolean;
+    mode: boolean;
+    currentModel?: string;
+    currentEffort?: string;
+    currentMode?: string;
+  };
   messageQueue?: QueuedChatMessage[];
   subagents?: Array<{ id: string; name?: string; role?: string; status?: string }>;
 };
@@ -320,6 +336,9 @@ export type DesktopApi = {
   deleteWorkflowTemplate(templateId: string): Promise<DesktopSnapshot>;
   resolveGate(gateId: string, decision: string): Promise<void>;
   accountAction(message: JsonObject): Promise<JsonObject>;
+  getAccountModels(input: AccountModelsInput): Promise<S2CAgentAccountApiModelsResult>;
+  getAccountConfig(accountId: string): Promise<S2CAgentAccountConfigResult>;
+  setAccountConfig(input: AccountConfigInput): Promise<S2CAgentAccountConfigResult>;
   pairDevice(input: { name: string; allowShell: boolean; allowOrchestration: boolean }): Promise<{ output: string; uri?: string }>;
   revokeDevice(id: string, name: string): Promise<{ ok: boolean; output: string; cancelled?: boolean }>;
   relayAction(input: { action: "status" | "enable" | "disable" | "rotate-key"; url?: string }): Promise<JsonObject>;
@@ -329,11 +348,20 @@ export type DesktopApi = {
   importRemoteHost(pairingUri: string): Promise<RemoteHostSummary>;
   removeRemoteHost(id: string): Promise<{ ok: boolean }>;
   connectRemoteHost(id: string): Promise<{ name: string; sessions: number }>;
+  listRemoteWorkspaces(): Promise<RemoteWorkspace[]>;
+  listRemoteDirectories(input: RemoteDirectoryRequest): Promise<RemoteDirectoryListing>;
+  addRemoteWorkspace(input: RemoteWorkspaceInput): Promise<RemoteWorkspace>;
+  forgetRemoteWorkspace(id: string): Promise<{ ok: boolean }>;
+  renameRemoteWorkspace(id: string, name: string): Promise<RemoteWorkspace>;
+  listRemoteWorkspaceShells(id: string): Promise<SessionInfo[]>;
+  openRemoteWorkspace(id: string, options?: RemoteWorkspaceOpenOptions): Promise<RemoteWorkspaceOpenResult>;
+  subscribeRemoteWorkspaces(listener: (workspaces: RemoteWorkspace[]) => void): () => void;
   createRemoteShell(hostId: string, cwd?: string): Promise<string>;
   listRemoteShells(hostId: string): Promise<SessionInfo[]>;
-  attachRemoteShell(hostId: string, sid: string): Promise<void>;
-  sendRemoteShellInput(hostId: string, sid: string, dataB64: string): Promise<void>;
-  resizeRemoteShell(hostId: string, sid: string, cols: number, rows: number): Promise<void>;
+  attachRemoteShell(hostId: string, sid: string, ownerId?: string): Promise<void>;
+  detachRemoteShell(hostId: string, sid: string, ownerId?: string): Promise<void>;
+  sendRemoteShellInput(hostId: string, sid: string, dataB64: string, ownerId?: string): Promise<void>;
+  resizeRemoteShell(hostId: string, sid: string, cols: number, rows: number, ownerId?: string): Promise<void>;
   killRemoteShell(hostId: string, sid: string): Promise<void>;
   disconnectRemoteHost(id: string): Promise<void>;
   subscribeRemoteShell(listener: (event: RemoteShellEvent) => void): () => void;

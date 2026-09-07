@@ -17,6 +17,7 @@ import {
 } from "node:fs";
 import { createConnection, type Socket } from "node:net";
 import { once } from "node:events";
+import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
@@ -1275,7 +1276,7 @@ async function migrateDeadOwner(dir: string, manifest: StructuredSupervisorManif
   }
 }
 
-const DEAD_OWNER_MIGRATION_CONCURRENCY = 2;
+const DEAD_OWNER_MIGRATION_CONCURRENCY = 1;
 const DEAD_OWNER_MIGRATION_START_DELAY_MS = 120_000;
 
 async function drainDeadOwnerMigrations(jobs: Array<() => Promise<void>>): Promise<void> {
@@ -1302,19 +1303,27 @@ export async function reconnectStructuredSupervisors(
   } = {},
 ): Promise<RemoteStructuredSession[]> {
   if (structuredSupervisorPlatformGate() || !existsSync(root)) return [];
-  const entries = readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
-    if (!entry.isDirectory() || !SESSION_ID.test(entry.name)) return [];
+  const entries: Array<{ dir: string; manifest: StructuredSupervisorManifest; live: boolean }> = [];
+  let scanStarted = performance.now();
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    if (performance.now() - scanStarted >= 8) {
+      await yieldToEventLoop();
+      scanStarted = performance.now();
+    }
+    if (!entry.isDirectory() || !SESSION_ID.test(entry.name)) continue;
     const dir = path.join(root, entry.name);
-    if (!privateDirectory(dir)) return [];
+    if (!privateDirectory(dir)) continue;
     const manifest = readSupervisorManifest(path.join(dir, "manifest.json"));
-    if (!manifest || manifest.sessionId !== entry.name || options.isDeleted?.(entry.name)) return [];
+    if (!manifest || manifest.sessionId !== entry.name || options.isDeleted?.(entry.name)) continue;
     const live = manifest.status !== "done" && manifest.status !== "died" && processAlive(manifest.supervisorPid);
-    return [{ dir, manifest, live }];
-  }).sort((left, right) => Number(right.live) - Number(left.live));
+    entries.push({ dir, manifest, live });
+  }
+  entries.sort((left, right) => Number(right.live) - Number(left.live));
   const sessions: Array<RemoteStructuredSession | undefined> = new Array(entries.length);
   const deadOwnerMigrations: Array<() => Promise<void>> = [];
   const archive = (dir: string, manifest: StructuredSupervisorManifest): RemoteStructuredSession => {
     const session = RemoteStructuredSession.unavailable({ ...manifest, sessionDir: dir });
+    if (manifest.storageVersion === 2) return session;
     // Large inactive archives cannot occupy the live reconnect worker slots.
     // Publication rechecks PID/epoch, directory identity and deletion tombstones.
     // Queue migration instead of creating one eager Promise per dead owner.
@@ -1339,7 +1348,12 @@ export async function reconnectStructuredSupervisors(
   };
   let nextEntry = 0;
   await Promise.all(Array.from({ length: Math.min(4, entries.length) }, async () => {
+    let sliceStarted = performance.now();
     for (;;) {
+      if (performance.now() - sliceStarted >= 8) {
+        await yieldToEventLoop();
+        sliceStarted = performance.now();
+      }
       const entryIndex = nextEntry++;
       const entry = entries[entryIndex];
       if (!entry) return;
@@ -1359,11 +1373,6 @@ export async function reconnectStructuredSupervisors(
     (session): session is RemoteStructuredSession => session !== undefined
   );
   if (deadOwnerMigrations.length > 0) {
-    // Publish the live reconnect result and let the daemon finish dispatch
-    // reconciliation plus status.json/health publication before any archive
-    // migration performs synchronous SQLite open/fsync work. Two jobs then
-    // advance in background. The timer is not a daemon-lifetime obligation;
-    // interrupted imports retain their source JSON and retry on a later start.
     const migrationTimer = setTimeout(
       () => { void drainDeadOwnerMigrations(deadOwnerMigrations); },
       options.archiveMigrationDelayMs ?? DEAD_OWNER_MIGRATION_START_DELAY_MS,

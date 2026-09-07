@@ -34,7 +34,7 @@ const SIDEBAR_MIN_WIDTH = 200
 const SIDEBAR_DRAG_COLLAPSE_WIDTH = 144
 const SIDEBAR_MAX_WIDTH = 420
 const SIDEBAR_WIDTH_MOBILE = "18rem"
-const SIDEBAR_WIDTH_ICON = "52px"
+function sidebarIconWidth() { return typeof window !== "undefined" && window.prospero?.platform === "darwin" ? 88 : 52 }
 const SIDEBAR_KEYBOARD_SHORTCUT = "b"
 
 function sidebarWidthLimit() {
@@ -170,7 +170,7 @@ function SidebarProvider({
         style={
           {
             "--sidebar-width": `min(${width}px, max(${SIDEBAR_MIN_WIDTH}px, calc(100vw - 480px)))`,
-            "--sidebar-width-icon": SIDEBAR_WIDTH_ICON,
+            "--sidebar-width-icon": `${sidebarIconWidth()}px`,
             ...style,
           } as React.CSSProperties
         }
@@ -367,9 +367,9 @@ function SidebarRail({ className, onClick, onKeyDown, ...props }: React.Componen
       role="separator"
       aria-label="Resize sidebar"
       aria-orientation="vertical"
-      aria-valuemin={open ? SIDEBAR_MIN_WIDTH : 52}
+      aria-valuemin={open ? SIDEBAR_MIN_WIDTH : sidebarIconWidth()}
       aria-valuemax={sidebarWidthLimit()}
-      aria-valuenow={open ? Math.min(width, sidebarWidthLimit()) : 52}
+      aria-valuenow={open ? Math.min(width, sidebarWidthLimit()) : sidebarIconWidth()}
       aria-expanded={open}
       tabIndex={0}
       onPointerDown={(event) => {

@@ -8,6 +8,7 @@ import {
 import {
   RemoteShellClient,
   type RemoteSocket,
+  type RemoteShellMessage,
 } from "../src/main/remote-shell-client";
 
 class FakeSocket implements RemoteSocket {
@@ -17,6 +18,7 @@ class FakeSocket implements RemoteSocket {
   onerror: (() => void) | null = null;
   onclose: ((event: { code?: number; reason?: string }) => void) | null = null;
   readonly sent: string[] = [];
+  readonly clientMessages: unknown[] = [];
   private serverChannel: SecureChannel | null = null;
 
   constructor(private readonly daemon: ReturnType<typeof generateKeyPairB64>) {}
@@ -39,6 +41,7 @@ class FakeSocket implements RemoteSocket {
       return;
     }
     if (!this.serverChannel) throw new Error("missing server channel");
+    this.clientMessages.push(this.serverChannel.open(data));
   }
 
   acceptClientFrame(frame: string, state: ReturnType<typeof serverHandshakeRespond>["state"]): void {
@@ -106,6 +109,15 @@ describe("RemoteShellClient", () => {
     expect(client.isConnected).toBe(true);
     client.createShell("/tmp", 100, 30);
     expect(socket.sent).toHaveLength(3);
+    client.listWorkspace("projects");
+    expect(socket.clientMessages.at(-1)).toEqual({ type: "workspace.list", path: "projects" });
+    expect(() => client.listWorkspace("", "computer")).toThrow("drive browsing");
+    const listings: RemoteShellMessage[] = [];
+    client.on("message", message => listings.push(message));
+    socket.sendServer({ type: "workspace.listing", path: "projects", cwd: "/remote/projects", entries: [] });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(listings).toEqual([{ type: "workspace.listing", path: "projects", cwd: "/remote/projects", entries: [] }]);
+    client.close();
   });
 
   it("keeps post-handshake handlers and emits output and close events", async () => {

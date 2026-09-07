@@ -2,6 +2,7 @@ import { createReadStream, existsSync, linkSync, lstatSync, openSync, closeSync,
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
+import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import makeParser from "stream-json";
 import type { AgentEventBody } from "@prospero/protocol";
 import { SessionDatabase } from "./session-database.js";
@@ -10,7 +11,7 @@ import { createStructuredHistorySummaryAccumulator, type QueuedChatPersistent, t
 export type JsonPath = readonly (string | number)[];
 export interface JsonStreamObserver {
   onContainer?: (path: JsonPath, kind: "array" | "object") => void;
-  onContainerEnd?: (path: JsonPath, kind: "array" | "object") => void;
+  onContainerEnd?: (path: JsonPath, kind: "array" | "object") => void | Promise<void>;
   onValue?: (path: JsonPath, kind: "null" | "string" | "number" | "boolean") => void;
 }
 type Frame = { path: (string | number)[]; kind: "array" | "object"; index: number; key?: string; keys: Set<string>; value?: unknown[] | Record<string, unknown>; selected: boolean };
@@ -35,6 +36,8 @@ export async function* streamJsonValues(
   const frames: Frame[] = [];
   let capturing = false;
   let roots = 0;
+  let sliceStarted = performance.now();
+  let tokensSinceCheck = 0;
   const nextPath = (): (string | number)[] => {
     const parent = frames.at(-1);
     if (!parent) return [];
@@ -47,43 +50,55 @@ export async function* streamJsonValues(
     if (!parent) { roots++; return; }
     if (parent.value !== undefined) {
       if (Array.isArray(parent.value)) parent.value.push(value);
-      else Object.defineProperty(parent.value, parent.key!, { value, enumerable: true, writable: true, configurable: true });
+      else parent.value[parent.key!] = value;
     }
     if (parent.kind === "array") parent.index++;
     else delete parent.key;
   };
   try {
     for await (const raw of parser) {
-      const token = raw as Token;
-      if (token.name === "keyValue") {
-        const parent = frames.at(-1);
-        if (!parent || parent.kind !== "object" || typeof token.value !== "string") throw new Error("Invalid JSON key");
-        if (parent.keys.has(token.value)) throw new Error("Duplicate JSON object key");
-        parent.keys.add(token.value); parent.key = token.value;
-      } else if (token.name === "startObject" || token.name === "startArray") {
-        const currentPath = nextPath();
-        const kind = token.name === "startArray" ? "array" : "object";
-        observer.onContainer?.(currentPath, kind);
-        const selected: boolean = !capturing && select(currentPath);
-        capturing ||= selected;
-        frames.push({ path: currentPath, kind, index: 0, keys: new Set(), selected,
-          ...(capturing ? { value: kind === "array" ? [] : Object.create(null) as Record<string, unknown> } : {}) });
-      } else if (token.name === "endObject" || token.name === "endArray") {
-        const frame = frames.pop();
-        if (!frame) throw new Error("Unexpected JSON container end");
-        observer.onContainerEnd?.(frame.path, frame.kind);
-        accept(frame.value);
-        if (frame.selected) { capturing = false; yield { path: frame.path, value: frame.value }; }
-      } else if (["stringValue", "numberValue", "trueValue", "falseValue", "nullValue"].includes(token.name)) {
-        const currentPath = nextPath();
-        const value = token.name === "numberValue" ? Number(token.value)
-          : token.name === "trueValue" ? true : token.name === "falseValue" ? false
-            : token.name === "nullValue" ? null : token.value;
-        observer.onValue?.(currentPath, value === null ? "null" : typeof value as "string" | "number" | "boolean");
-        const selected: boolean = !capturing && select(currentPath);
-        accept(value);
-        if (selected) yield { path: currentPath, value };
-      }
+      let buffered: unknown = raw;
+      do {
+        const token = buffered as Token;
+        if (token.name === "keyValue") {
+          const parent = frames.at(-1);
+          if (!parent || parent.kind !== "object" || typeof token.value !== "string") throw new Error("Invalid JSON key");
+          if (parent.keys.has(token.value)) throw new Error("Duplicate JSON object key");
+          parent.keys.add(token.value); parent.key = token.value;
+        } else if (token.name === "startObject" || token.name === "startArray") {
+          const currentPath = nextPath();
+          const kind = token.name === "startArray" ? "array" : "object";
+          observer.onContainer?.(currentPath, kind);
+          const selected: boolean = !capturing && select(currentPath);
+          capturing ||= selected;
+          frames.push({ path: currentPath, kind, index: 0, keys: new Set(), selected,
+            ...(capturing ? { value: kind === "array" ? [] : Object.create(null) as Record<string, unknown> } : {}) });
+        } else if (token.name === "endObject" || token.name === "endArray") {
+          const frame = frames.pop();
+          if (!frame) throw new Error("Unexpected JSON container end");
+          const observed = observer.onContainerEnd?.(frame.path, frame.kind);
+          if (observed) await observed;
+          accept(frame.value);
+          if (frame.selected) { capturing = false; yield { path: frame.path, value: frame.value }; }
+        } else if (token.name === "stringValue" || token.name === "numberValue" || token.name === "trueValue" || token.name === "falseValue" || token.name === "nullValue") {
+          const currentPath = nextPath();
+          const value = token.name === "numberValue" ? Number(token.value)
+            : token.name === "trueValue" ? true : token.name === "falseValue" ? false
+              : token.name === "nullValue" ? null : token.value;
+          observer.onValue?.(currentPath, value === null ? "null" : typeof value as "string" | "number" | "boolean");
+          const selected: boolean = !capturing && select(currentPath);
+          accept(value);
+          if (selected) yield { path: currentPath, value };
+        }
+        if (++tokensSinceCheck === 128) {
+          tokensSinceCheck = 0;
+          if (performance.now() - sliceStarted >= 8) {
+            await yieldToEventLoop();
+            sliceStarted = performance.now();
+          }
+        }
+        buffered = parser.read();
+      } while (buffered !== null);
     }
     await completed;
     if (roots !== 1 || frames.length) throw new Error("Incomplete JSON document");
@@ -119,7 +134,7 @@ export async function migrateLegacySessionFile(
   let current: { token: string; metadata: Record<string, unknown>; fields: Set<string>; summary: ReturnType<typeof createStructuredHistorySummaryAccumulator>; events: number } | undefined;
   const base = options.array ? 1 : 0;
   let rootSeen = false;
-  const finish = (): void => {
+  const finish = async (): Promise<void> => {
     if (!current || !db) throw new Error("Missing legacy session object");
     if (!current.fields.has("events") || !current.fields.has("toolOutputs")) throw new Error("Missing legacy session collections");
     const metadata = current.metadata;
@@ -127,7 +142,7 @@ export async function migrateLegacySessionFile(
     if (metadata.historySummary === undefined) metadata.historySummary = current.summary.snapshot();
     if (options.excludeSessionIds?.has(metadata.id)) db.abortSessionImport(current.token);
     else {
-      db.finishSessionImport(current.token, metadata as unknown as Omit<StructuredSessionPersistentState, "events" | "toolOutputs" | "messageQueue">);
+      await db.finishSessionImportAsync(current.token, metadata as unknown as Omit<StructuredSessionPersistentState, "events" | "toolOutputs" | "messageQueue">);
       sessionCount++; eventCount += current.events;
     }
     current = undefined;
@@ -153,12 +168,13 @@ export async function migrateLegacySessionFile(
         : p.length === base + 2 && collections.has(String(p[base])), {
       onContainer: validateShape,
       onValue: validateShape,
-      onContainerEnd: (p) => { if (p.length === base) finish(); },
+      onContainerEnd: (p) => p.length === base ? finish() : undefined,
     })) {
       if (!current) throw new Error("Legacy value outside a session");
       const field = String(entry.path[base]);
       if (entry.path.length === base + 1) {
-        Object.defineProperty(current.metadata, field, { value: entry.value, enumerable: true, writable: true, configurable: true });
+        current.metadata[field] = entry.value;
+        if (field === "id" && typeof entry.value === "string") db.identifySessionImport(current.token, entry.value);
       } else if (field === "events") {
         if (!record(entry.value) || typeof entry.value.kind !== "string") throw new Error("Invalid legacy event");
         const body = entry.value as unknown as AgentEventBody;

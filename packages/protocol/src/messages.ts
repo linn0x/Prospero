@@ -54,6 +54,8 @@ export const CAPABILITY_AGENT_API_PROFILES = "agent.api-profiles.v1";
 export const CAPABILITY_AGENT_API_PROTOCOLS = "agent.api-protocols.v1";
 export const CAPABILITY_AGENT_API_VALIDATION = "agent.api-validation.v1";
 export const CAPABILITY_AGENT_API_ENGINE_VALIDATION = "agent.api-engine-validation.v1";
+export const CAPABILITY_AGENT_API_MODELS = "agent.account.api.models";
+export const CAPABILITY_AGENT_ACCOUNT_CONFIG = "agent.account.config";
 /** DeepSeek Harness 官方本机 RPC/SSE 结构化会话与编排 worker。 */
 export const CAPABILITY_AGENT_DEEPSEEK_HARNESS = "agent.deepseek-harness.v1";
 /** DeepSeek Harness 执行轨迹事件与移动端时间线。 */

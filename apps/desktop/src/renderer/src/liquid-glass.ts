@@ -3,13 +3,18 @@ export function installLiquidGlass(root: Document = document): () => void {
   const view = root.defaultView;
   if (!view) return () => {};
 
-  const reducedMotion = view.matchMedia('(prefers-reduced-motion: reduce)');
+  const mediaPreferences = [
+    '(prefers-reduced-motion: reduce)',
+    '(prefers-reduced-transparency: reduce)',
+    '(prefers-contrast: more)',
+    '(forced-colors: active)',
+  ].map((query) => view.matchMedia(query));
   let active: HTMLElement | null = null;
   let pending: { element: HTMLElement; x: number; y: number } | null = null;
   let frame: number | null = null;
   let disposed = false;
 
-  const disabled = (): boolean => disposed || root.hidden || reducedMotion.matches
+  const disabled = (): boolean => disposed || root.hidden || mediaPreferences.some((preference) => preference.matches)
     || root.documentElement.dataset.reducedTransparency === 'true'
     || root.documentElement.dataset.highContrast === 'true';
 
@@ -89,7 +94,7 @@ export function installLiquidGlass(root: Document = document): () => void {
   root.addEventListener('pointercancel', reset, { passive: true });
   root.addEventListener('visibilitychange', preferencesChanged);
   view.addEventListener('blur', reset);
-  reducedMotion.addEventListener('change', preferencesChanged);
+  for (const preference of mediaPreferences) preference.addEventListener('change', preferencesChanged);
 
   return () => {
     if (disposed) return;
@@ -99,7 +104,7 @@ export function installLiquidGlass(root: Document = document): () => void {
     root.removeEventListener('pointercancel', reset);
     root.removeEventListener('visibilitychange', preferencesChanged);
     view.removeEventListener('blur', reset);
-    reducedMotion.removeEventListener('change', preferencesChanged);
+    for (const preference of mediaPreferences) preference.removeEventListener('change', preferencesChanged);
     preferences.disconnect();
     reset();
   };

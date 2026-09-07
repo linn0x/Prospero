@@ -20,6 +20,7 @@ export const accountApiProtocols: AccountApiProtocol[] = [
 ];
 
 export const ACCOUNT_API_PROTOCOLS_CAPABILITY = "agent.api-protocols.v1";
+export const accountReasoningEfforts = ["none", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
 export function supportsAccountApiValidation(capabilities?: readonly string[]): boolean {
   return capabilities?.includes("agent.api-validation.v1") === true;
@@ -74,6 +75,7 @@ export type ModelCapabilityDraft = {
   tools: "unknown" | "true" | "false";
   vision: "unknown" | "true" | "false";
   reasoning: "unknown" | "true" | "false";
+  supportedEfforts: string;
 };
 
 export function modelCapabilityDraft(value: JsonObject = {}): ModelCapabilityDraft {
@@ -82,6 +84,7 @@ export function modelCapabilityDraft(value: JsonObject = {}): ModelCapabilityDra
     contextWindow: typeof value["contextWindow"] === "number" ? String(value["contextWindow"]) : "",
     maxOutputTokens: typeof value["maxOutputTokens"] === "number" ? String(value["maxOutputTokens"]) : "",
     tools: bool("tools"), vision: bool("vision"), reasoning: bool("reasoning"),
+    supportedEfforts: Array.isArray(value["supportedEfforts"]) ? value["supportedEfforts"].filter((effort): effort is string => typeof effort === "string").join(", ") : "",
   };
 }
 
@@ -93,7 +96,7 @@ export function parseModelCapabilities(draft: ModelCapabilityDraft, initial: Jso
     if (!raw) delete value[key];
     else {
       const parsed = Number(raw);
-      if (!/^\d+$/.test(raw) || !Number.isSafeInteger(parsed) || parsed <= 0) throw new Error("Token limits must be positive whole numbers / Token 上限必须是正整数");
+      if (!/^\d+$/.test(raw) || !Number.isSafeInteger(parsed) || parsed <= 0 || parsed > 100_000_000) throw new Error("Token limits must be positive whole numbers up to 100,000,000 / Token 上限必须是 1–100,000,000 的正整数");
       value[key] = parsed;
     }
   }
@@ -106,6 +109,16 @@ export function parseModelCapabilities(draft: ModelCapabilityDraft, initial: Jso
   for (const key of ["tools", "vision", "reasoning"] as const) {
     if (draft[key] === "unknown") delete value[key];
     else value[key] = draft[key] === "true";
+  }
+  if (draft.supportedEfforts !== modelCapabilityDraft(initial).supportedEfforts) {
+    const efforts = [...new Set(draft.supportedEfforts.split(/[,，\s]+/).map((value) => value.trim().toLowerCase()).filter(Boolean))];
+    const allowed: readonly string[] = protocol === "anthropic" ? ["low", "medium", "high", "xhigh", "max"] : accountReasoningEfforts;
+    if (efforts.some((effort) => !allowed.includes(effort))) throw new Error("Unsupported reasoning effort value / 包含不支持的推理强度值");
+    if (efforts.length && draft.reasoning === "false") throw new Error("A non-reasoning model cannot declare effort levels / 不支持推理的模型不能声明推理强度");
+    if (efforts.length) value["supportedEfforts"] = efforts;
+    else delete value["supportedEfforts"];
+  } else if (draft.reasoning === "false" && initial["reasoning"] !== false && Array.isArray(value["supportedEfforts"]) && value["supportedEfforts"].length) {
+    throw new Error("Clear effort levels before disabling reasoning / 禁用推理前请清空推理强度声明");
   }
   return Object.keys(value).length ? value : null;
 }

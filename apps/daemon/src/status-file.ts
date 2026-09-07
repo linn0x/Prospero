@@ -8,7 +8,7 @@
 import { chmodSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { CAPABILITY_AGENT_API_PROTOCOLS, CAPABILITY_AGENT_API_VALIDATION, CAPABILITY_AGENT_API_ENGINE_VALIDATION, type SessionInfo } from "@prospero/protocol";
+import { CAPABILITY_AGENT_API_PROTOCOLS, CAPABILITY_AGENT_API_VALIDATION, CAPABILITY_AGENT_API_ENGINE_VALIDATION, CAPABILITY_AGENT_API_MODELS, CAPABILITY_AGENT_ACCOUNT_CONFIG, type SessionInfo } from "@prospero/protocol";
 import type { SessionManager } from "./session-manager.js";
 import type { RelayRuntimeStatus } from "./relay-host-client.js";
 import { selectStatusSessions, type SessionStatusSummary } from "./session-list.js";
@@ -149,7 +149,7 @@ export class StatusFile {
       bind: this.meta.bind,
       controlToken: this.meta.controlToken,
       persistence: this.meta.persistence,
-      capabilities: [CAPABILITY_AGENT_API_PROTOCOLS, CAPABILITY_AGENT_API_VALIDATION, CAPABILITY_AGENT_API_ENGINE_VALIDATION],
+      capabilities: [CAPABILITY_AGENT_API_PROTOCOLS, CAPABILITY_AGENT_API_VALIDATION, CAPABILITY_AGENT_API_ENGINE_VALIDATION, CAPABILITY_AGENT_API_MODELS, CAPABILITY_AGENT_ACCOUNT_CONFIG],
       ...(this.relay ? { relay: this.relay } : {}),
       sessionSummary: selected.summary,
       sessions: selected.sessions.map(toStatusSession),
