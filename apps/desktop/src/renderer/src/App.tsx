@@ -816,7 +816,7 @@ function ShellSidebar({
   onSetUnread: (id: string, unread: boolean) => void;
 }) {
   const { language, t, status } = useLocale();
-  const { isMobile, setOpenMobile } = useSidebar();
+  const { open, isMobile, setOpenMobile } = useSidebar();
   const closeMobileSidebar = useCallback((): void => {
     if (isMobile) setOpenMobile(false);
   }, [isMobile, setOpenMobile]);
@@ -1584,10 +1584,11 @@ function ShellSidebar({
       mobileDescription={t("主导航、工作区与会话", "Main navigation, workspaces, and sessions")}
     >
       <SidebarHeader className="sidebar-shell-header">
+        <span className="sidebar-wordmark">Prospero</span>
         <SidebarTrigger
           className="sidebar-header-toggle"
-          aria-label={t("切换侧边栏", "Toggle sidebar")}
-          title={t("切换侧边栏", "Toggle sidebar")}
+          aria-label={open || isMobile ? t("收起侧边栏", "Collapse sidebar") : t("展开侧边栏", "Expand sidebar")}
+          title={open || isMobile ? t("收起侧边栏", "Collapse sidebar") : t("展开侧边栏", "Expand sidebar")}
         />
       </SidebarHeader>
       <SidebarContent className="sidebar-content-shell">
@@ -1888,7 +1889,7 @@ function ShellSidebar({
         </Collapsible>
         </div>
       </SidebarContent>
-      <SidebarFooter className="px-3 pb-3">
+      <SidebarFooter className="sidebar-shell-footer">
         <SidebarMenu className="sidebar-footer-actions">
           <SidebarMenuItem>
             <HoverCard onOpenChange={handleDaemonCardOpen}>
@@ -4799,13 +4800,16 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
             aria-label={t("切换侧边栏", "Toggle sidebar")}
             title={t("切换侧边栏", "Toggle sidebar")}
           />
-          {view === "overview" && <strong>{page.title}</strong>}
+          <div>
+            <strong>{page.title}</strong>
+            {!workspaceFocus && <span>{page.description}</span>}
+          </div>
         </div>
         <div className="topbar-actions">
           {workspaceFocus ? (
             <Button variant="ghost" size="icon-sm" aria-label={t("退出专注", "Exit focus")} title={t(`退出专注（${isMac ? "⇧⌘F" : "Ctrl+Alt+F"}）`, `Exit focus (${isMac ? "⇧⌘F" : "Ctrl+Alt+F"})`)} onClick={() => setFocus(false)}><Minimize2 /></Button>
           ) : (
-            <Button variant="glass-primary" size="sm" onClick={() => openNewSession()}>
+            <Button variant="glass-primary" size="sm" aria-label={t("新建会话", "New session")} onClick={() => openNewSession()}>
               <Plus data-icon="inline-start" />
               {t("新建会话", "New session")}
             </Button>
