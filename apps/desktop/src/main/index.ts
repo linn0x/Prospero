@@ -266,13 +266,12 @@ function createWindow(): BrowserWindow {
       }
       : {}),
     title: "Prospero",
-    // macOS 的红黄绿按钮固定在窗口左上角,会浮在侧栏头部之上 —— 而这块布局是按
-    // Windows 设计的(那边窗口控件在右上角,左上角是空的)。hiddenInset 把按钮往内缩,
-    // 再显式给一个与侧栏头部垂直居中的位置;渲染层那边相应留出上边距。
+    // Keep native traffic lights centered in the renderer's 44px window toolbar.
+    // The sidebar begins below it, so collapsing/resizing never splits the controls.
     // titleBarOverlay 只对 Windows/Linux 生效,macOS 传了也会被忽略。
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "hidden",
     ...(process.platform === "darwin"
-      ? { trafficLightPosition: { x: 14, y: 18 } }
+      ? { trafficLightPosition: { x: 14, y: 16 } }
       : { titleBarOverlay: { color: dark ? "#161619" : "#f8f8f9", symbolColor: dark ? "#eeeef0" : "#202024", height: 42 } }),
     webPreferences: {
       preload: resolve(__dirname, "../preload/index.js"),

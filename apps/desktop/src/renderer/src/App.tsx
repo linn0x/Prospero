@@ -1933,8 +1933,8 @@ function ShellSidebar({
         </SidebarMenu>
       </SidebarFooter>
       <SidebarRail
-        aria-label={t("切换侧边栏", "Toggle sidebar")}
-        title={t("切换侧边栏", "Toggle sidebar")}
+        aria-label={t("调整侧栏宽度", "Resize sidebar")}
+        title={t("拖动调整宽度 · 双击恢复默认", "Drag to resize · Double-click to reset")}
       />
     </Sidebar>
   );
@@ -4787,17 +4787,31 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     <SidebarProvider
       open={sidebarOpen}
       onOpenChange={changeSidebarOpen}
-      style={
-        {
-          "--sidebar-width": "15rem",
-          "--sidebar-width-icon": "4rem",
-        } as React.CSSProperties
-      }
       className="prospero-shell"
     >
       <a className="skip-link" href="#main-content">
         {t("跳到主内容", "Skip to main content")}
       </a>
+      <header className="desktop-topbar">
+        <div className="topbar-context">
+          <SidebarTrigger
+            className="topbar-sidebar-trigger"
+            aria-label={t("切换侧边栏", "Toggle sidebar")}
+            title={t("切换侧边栏", "Toggle sidebar")}
+          />
+          {view === "overview" && <strong>{page.title}</strong>}
+        </div>
+        <div className="topbar-actions">
+          {workspaceFocus ? (
+            <Button variant="ghost" size="icon-sm" aria-label={t("退出专注", "Exit focus")} title={t(`退出专注（${isMac ? "⇧⌘F" : "Ctrl+Alt+F"}）`, `Exit focus (${isMac ? "⇧⌘F" : "Ctrl+Alt+F"})`)} onClick={() => setFocus(false)}><Minimize2 /></Button>
+          ) : (
+            <Button variant="glass-primary" size="sm" onClick={() => openNewSession()}>
+              <Plus data-icon="inline-start" />
+              {t("新建会话", "New session")}
+            </Button>
+          )}
+        </div>
+      </header>
       <ShellSidebar
         snapshot={sessionSnapshot}
         view={view}
@@ -4813,31 +4827,6 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
         onSetUnread={setUnread}
       />
       <SidebarInset id="main-content" tabIndex={-1} className="prospero-main">
-        {!workspaceFocus && <header className="desktop-topbar">
-          <div className="topbar-context">
-            <SidebarTrigger
-              data-liquid-glass="control"
-              className="topbar-sidebar-trigger"
-              aria-label={t("打开侧边栏", "Open sidebar")}
-              title={t("打开侧边栏", "Open sidebar")}
-            />
-            {view === "overview" && <div>
-              <strong>
-                {page.title}
-              </strong>
-              <span>
-                {page.description}
-              </span>
-            </div>}
-          </div>
-          <div className="topbar-actions">
-            <Button variant="glass-primary" onClick={() => openNewSession()}>
-              <Plus data-icon="inline-start" />
-              {t("新建会话", "New session")}
-            </Button>
-          </div>
-        </header>}
-        {workspaceFocus && <><div className="focus-drag-region" aria-hidden="true" /><Button variant="outline" size="icon-sm" className="focus-exit-overlay" aria-label={t("退出专注", "Exit focus")} title={t(`退出专注（${isMac ? "⇧⌘F" : "Ctrl+Alt+F"}）`, `Exit focus (${isMac ? "⇧⌘F" : "Ctrl+Alt+F"})`)} onClick={() => setFocus(false)}><Minimize2 /></Button></>}
         <div className="main-viewport">
           {sessionActionError && !workspaceFocus && <Alert variant="destructive" className="mx-7 mt-5 w-auto"><CircleAlert /><AlertTitle>{t("会话操作失败", "Session action failed")}</AlertTitle><AlertDescription>{sessionActionError}</AlertDescription><Button variant="ghost" size="sm" className="ml-auto" onClick={() => setSessionActionError(undefined)}>{t("关闭", "Dismiss")}</Button></Alert>}
           <Suspense
