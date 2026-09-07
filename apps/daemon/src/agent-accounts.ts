@@ -36,10 +36,19 @@ import type {
   AgentCredentialKind,
   CodeAgentKind,
   SessionInfo,
+  AgentAccountConfig,
+  AgentApiCatalogModel,
+  AgentReasoningEffort,
+  C2SAgentAccountApiModelsGet,
+  C2SAgentAccountConfigSet,
 } from "@prospero/protocol";
 import { AgentApiEngineValidationSchema, AgentApiValidationSchema, AgentModelCapabilitiesSchema, getAgentAccountCapabilities, getAgentAccountEngine } from "@prospero/protocol";
 import { programCommandFor } from "./agents.js";
 import { claudeModelCapabilityEnvironment, codexModelCapabilityArgs, getModelCapabilitySupport } from "./api-profile-capabilities.js";
+import { fetchApiModels, type ApiModelCatalogOptions } from "./agent-api-models.js";
+import { getAccountConfig, readAccountOverrides, saveAccountConfig, supportedAccountEfforts, type AccountConfigTarget } from "./agent-account-config.js";
+import { AgentAccountFeatureError } from "./agent-account-feature-error.js";
+import type { AgentModelCatalog } from "./adapters/types.js";
 
 const execFile = promisify(execFileCallback);
 const LEGACY_MACOS_KEYCHAIN_SERVICE = "com.prospero.code-agent.claude";
@@ -86,6 +95,8 @@ export interface AccountBinding {
   agent: CodeAgentKind;
   name: string;
   managed: boolean;
+  defaultModel?: string;
+  defaultEffort?: AgentReasoningEffort;
   environment: Record<string, string>;
   /** 已配置的 API Profile，不含 secret，供状态与会话启动区分。 */
   apiProfile?: AgentApiProfile;
@@ -756,7 +767,7 @@ export class AgentAccountManager {
     });
     this.mutationQueue = result.then(() => {}, () => {});
     return result.catch((error: unknown) => {
-      if (error instanceof AgentAccountError) throw error;
+      if (error instanceof AgentAccountError || error instanceof AgentAccountFeatureError) throw error;
       throw new AgentAccountError("账号存储操作失败，请检查存储后重试", "account_invalid");
     }).finally(() => { this.queuedMutations -= 1; });
   }
@@ -831,6 +842,11 @@ export class AgentAccountManager {
     const apiProfile = account.apiProfile
       ? publicApiProfile(account.agent, account.apiProfile)
       : undefined;
+    const configTarget = this.configurationTarget(account);
+    const overrides = readAccountOverrides(configTarget);
+    const defaultEffort = overrides.default_effort && (!apiProfile || supportedAccountEfforts(configTarget, overrides).includes(overrides.default_effort))
+      ? overrides.default_effort : undefined;
+    const defaultModel = apiProfile?.model ?? overrides.default_model;
     const environment = apiProfile
       ? apiProfile.protocol === "openai_chat_completions" && account.apiProfile
         ? opencodeProfileEnvironment(
@@ -904,7 +920,12 @@ export class AgentAccountManager {
       agent: account.agent,
       name: account.name,
       managed: true,
-      environment: { ...environment, ...(apiProfile ? { PROSPERO_API_PROFILE_VISION: apiProfile.modelCapabilities?.vision === false ? "0" : "1" } : {}) },
+      environment: { ...environment, ...(apiProfile ? { PROSPERO_API_PROFILE_VISION: apiProfile.modelCapabilities?.vision === false ? "0" : "1" } : {}),
+        ...(account.agent === "claude" && defaultModel ? { ANTHROPIC_MODEL: defaultModel } : {}),
+        ...(account.agent === "claude" && defaultEffort ? { CLAUDE_CODE_EFFORT_LEVEL: defaultEffort } : {}),
+      },
+      ...(defaultModel ? { defaultModel } : {}),
+      ...(defaultEffort ? { defaultEffort } : {}),
       ...(apiProfile ? { apiProfile } : {}),
       engine: getAgentAccountEngine({ agent: account.agent, apiProfile }),
       capabilities: getAgentAccountCapabilities({ agent: account.agent, apiProfile }),
@@ -921,6 +942,37 @@ export class AgentAccountManager {
   resolveForSession(accountId: string, expectedAgent?: CodeAgentKind): AccountBinding {
     this.assertSynchronousWrite();
     return this.resolve(accountId, expectedAgent);
+  }
+
+  async apiModels(input: Omit<C2SAgentAccountApiModelsGet, "type" | "requestId">, options: ApiModelCatalogOptions = {}): Promise<AgentApiCatalogModel[]> {
+    await this.ready();
+    if (input.accountId) {
+      if (input.protocol !== undefined || input.baseUrl !== undefined || input.apiKey !== undefined) throw new AgentAccountFeatureError("invalid_request", "使用保存凭据时不能替换连接地址；请先保存 Profile 或使用独立草稿凭据");
+      const account = this.requireManaged(input.accountId);
+      if (!account.apiProfile) throw new AgentAccountFeatureError("invalid_request", "此账号不是有效的 API Profile");
+      const credential = this.claudeCredential(account.id, this.rootFor(account.agent, account.id));
+      if (credential?.kind !== "api_key") throw new AgentAccountFeatureError("authentication", "请先保存此 Profile 的 API Key");
+      return fetchApiModels({ protocol: account.apiProfile.protocol, baseUrl: account.apiProfile.baseUrl, apiKey: credential.secret }, options);
+    }
+    if (!input.protocol || !input.baseUrl || !input.apiKey) throw new AgentAccountFeatureError("invalid_request", "请填写协议、API 地址和 API Key 后拉取模型");
+    return fetchApiModels({ protocol: input.protocol, baseUrl: input.baseUrl, apiKey: input.apiKey }, options);
+  }
+
+  private configurationTarget(account: StoredAccount): AccountConfigTarget {
+    if (account.invalidApiProfile) throw new AgentAccountFeatureError("invalid_config", "请先修复 API Profile 连接配置");
+    return { rootsDir: this.rootsDir, agent: account.agent, accountId: account.id,
+      ...(account.apiProfile ? { model: account.apiProfile.model, reasoningDisabled: account.apiProfile.modelCapabilities?.reasoning === false,
+        declaredEfforts: account.apiProfile.modelCapabilities?.supportedEfforts ?? [], engine: getAgentAccountEngine(account) } : {}),
+    };
+  }
+
+  async getConfig(accountId: string, sessions: SessionInfo[] = [], catalog?: AgentModelCatalog): Promise<AgentAccountConfig> {
+    await this.ready();
+    return getAccountConfig(this.configurationTarget(this.requireManaged(accountId)), activeCount(sessions, accountId), catalog);
+  }
+
+  async setConfig(input: Omit<C2SAgentAccountConfigSet, "type" | "requestId">, sessions: SessionInfo[] = [], catalog?: AgentModelCatalog): Promise<AgentAccountConfig> {
+    return this.serializeMutation(async () => saveAccountConfig(this.configurationTarget(this.requireManaged(input.accountId)), input, activeCount(sessions, input.accountId), catalog));
   }
 
   /**

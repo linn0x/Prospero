@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import type { DatabaseSync, StatementSync } from "node:sqlite";
 import type { AgentEventBody } from "@prospero/protocol";
 import type { QueuedChatPersistent, StructuredSessionPersistentState } from "./structured-session.js";
@@ -93,7 +94,7 @@ export class SessionDatabase {
   private readonly statements = new Map<string, StatementSync>();
   private readonly readOnly: boolean;
   private closed = false;
-  private importing: { token: string; events: number; queue: number } | null = null;
+  private importing: { token: string; id: string; events: number; queue: number } | null = null;
 
   constructor(file: string, options: { readOnly?: boolean } = {}) {
     this.readOnly = options.readOnly === true;
@@ -418,7 +419,7 @@ export class SessionDatabase {
     if (this.closed || this.importing || this.readOnly) fail("import_unavailable", "Session import cannot start");
     const token = `import_${randomUUID()}`;
     this.db.exec("BEGIN IMMEDIATE");
-    this.importing = { token, events: 0, queue: 0 };
+    this.importing = { token, id: token, events: 0, queue: 0 };
     this.statement("INSERT INTO sessions(id,metadata,metadata_bytes,ev_seq) VALUES(?,?,?,?)").run(token, "{}", 2, 0);
     return token;
   }
@@ -426,18 +427,25 @@ export class SessionDatabase {
     if (!this.importing || this.importing.token !== token) fail("invalid_import", "Unknown session import");
     return this.importing;
   }
+  identifySessionImport(token: string, id: string): void {
+    const context = this.importContext(token);
+    if (typeof id !== "string" || !id) fail("invalid_state", "Invalid session identity");
+    if (context.id === id) return;
+    this.statement("UPDATE sessions SET id=? WHERE id=?").run(id, context.id);
+    context.id = id;
+  }
   appendSessionImportEvent(token: string, body: AgentEventBody): void {
     const context = this.importContext(token);
-    this.writeEvent(token, context.events + 1, body); context.events++;
+    this.writeEvent(context.id, context.events + 1, body); context.events++;
   }
   setSessionImportToolOutput(token: string, callId: string, output: string, truncated = false): void {
-    this.importContext(token); this.writeTool(token, callId, output, truncated);
+    this.writeTool(this.importContext(token).id, callId, output, truncated);
   }
   appendSessionImportQueueEntry(token: string, item: QueuedChatPersistent): void {
     const context = this.importContext(token);
-    this.writeQueueEntry(token, context.queue, item); context.queue++;
+    this.writeQueueEntry(context.id, context.queue, item); context.queue++;
   }
-  finishSessionImport(token: string, state: SessionMetadata): void {
+  private *finishImportBatches(token: string, state: SessionMetadata): Generator<void> {
     const context = this.importContext(token);
     try {
       const meta = metadata(state);
@@ -447,19 +455,34 @@ export class SessionDatabase {
         // Descending updates avoid primary-key collisions when a retained suffix
         // starts above 1, keeping memory fixed and CHECK(seq>0) valid.
         const update = this.statement("UPDATE session_events SET seq=? WHERE session_id=? AND seq=?");
-        for (let seq = context.events; seq > 0; seq--) update.run(seq + offset, token, seq);
+        for (let seq = context.events; seq > 0; seq--) {
+          update.run(seq + offset, context.id, seq);
+          if (seq % 128 === 0) yield;
+        }
       }
       for (const callId of state.truncatedToolOutputs ?? []) {
-        this.statement("UPDATE session_tool_outputs SET truncated=1 WHERE session_id=? AND call_id=?").run(token, callId);
+        this.statement("UPDATE session_tool_outputs SET truncated=1 WHERE session_id=? AND call_id=?").run(context.id, callId);
       }
       const serialized = json(meta);
       this.statement("UPDATE sessions SET id=?,metadata=?,metadata_bytes=?,ev_seq=? WHERE id=?")
-        .run(state.id, serialized, Buffer.byteLength(serialized), state.evSeq, token);
+        .run(state.id, serialized, Buffer.byteLength(serialized), state.evSeq, context.id);
       this.db.exec("COMMIT"); this.importing = null;
     } catch (error) {
       this.abortSessionImport(token);
       if (error instanceof SessionDatabaseError) throw error;
       fail("import_failed", "Session import could not be committed");
+    }
+  }
+  finishSessionImport(token: string, state: SessionMetadata): void {
+    for (const _batch of this.finishImportBatches(token, state)) {}
+  }
+  async finishSessionImportAsync(token: string, state: SessionMetadata): Promise<void> {
+    let sliceStarted = performance.now();
+    for (const _batch of this.finishImportBatches(token, state)) {
+      if (performance.now() - sliceStarted >= 8) {
+        await yieldToEventLoop();
+        sliceStarted = performance.now();
+      }
     }
   }
   abortSessionImport(token: string): void {

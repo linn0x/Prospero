@@ -13,12 +13,16 @@ class Surface extends EventTarget {
 function fixture() {
   const callbacks = new Map<number, FrameRequestCallback>();
   const motion = Object.assign(new EventTarget(), { matches: false });
+  const media = new Map<string, typeof motion>([['(prefers-reduced-motion: reduce)', motion]]);
   const surfaces = new Set<Surface>();
   let nextFrame = 0;
   let preferenceCallback: (() => void) | undefined;
   let observerDisconnected = false;
   const view = Object.assign(new EventTarget(), {
-    matchMedia: () => motion,
+    matchMedia: (query: string) => {
+      if (!media.has(query)) media.set(query, Object.assign(new EventTarget(), { matches: false }));
+      return media.get(query)!;
+    },
     requestAnimationFrame: (callback: FrameRequestCallback) => {
       callbacks.set(++nextFrame, callback);
       return nextFrame;
@@ -55,7 +59,7 @@ function fixture() {
     for (const callback of batch) callback(0);
   };
   return {
-    root, view, motion, surfaces, addSurface, pointer, flush, callbacks,
+    root, view, motion, media, surfaces, addSurface, pointer, flush, callbacks,
     preferencesChanged: () => preferenceCallback?.(),
     observerDisconnected: () => observerDisconnected,
     install: () => installLiquidGlass(root as unknown as Document),
@@ -162,6 +166,32 @@ describe('liquid glass pointer lifecycle', () => {
     }
     cleanup();
   });
+
+  it.each(['(prefers-reduced-transparency: reduce)', '(prefers-contrast: more)', '(forced-colors: active)'])(
+    'stops tracking immediately when %s changes without a native appearance update', (query) => {
+      const f = fixture();
+      const target = f.addSurface();
+      const cleanup = f.install();
+      f.pointer('pointermove', target);
+      f.flush();
+      f.pointer('pointermove', target);
+      const preference = f.media.get(query)!;
+      preference.matches = true;
+      preference.dispatchEvent(new Event('change'));
+      expect(f.callbacks.size).toBe(0);
+      expect(target.values.get('--liquid-active')).toBe('0');
+      f.pointer('pointermove', target);
+      expect(f.callbacks.size).toBe(0);
+      preference.matches = false;
+      preference.dispatchEvent(new Event('change'));
+      expect(f.callbacks.size).toBe(0);
+      f.pointer('pointermove', target);
+      f.flush();
+      expect(target.values.get('--liquid-active')).toBe('1');
+      cleanup();
+      for (const media of f.media.values()) expect(getEventListeners(media, 'change')).toHaveLength(0);
+    },
+  );
 
   it('cleans up listeners, the preference observer, pending frames and active styles idempotently', () => {
     const f = fixture();

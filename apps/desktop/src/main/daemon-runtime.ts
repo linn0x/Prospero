@@ -213,7 +213,7 @@ export class DaemonRuntime {
     });
   }
 
-  async request(path: string, init?: { method?: "GET" | "POST"; body?: JsonObject; signal?: AbortSignal; timeoutMs?: number }): Promise<JsonObject | null> {
+  async request(path: string, init?: { method?: "GET" | "POST"; body?: JsonObject; signal?: AbortSignal; timeoutMs?: number; acceptJsonError?: boolean }): Promise<JsonObject | null> {
     const { port, token } = this.store.controlCredentials();
     const request: RequestInit = {
       method: init?.method ?? "GET",
@@ -229,7 +229,7 @@ export class DaemonRuntime {
     const response = await fetch(`http://127.0.0.1:${String(port)}${path}`, request);
     if (response.status === 204) return null;
     const text = await response.text();
-    if (!response.ok) throw new Error(text || `daemon 请求失败（${String(response.status)}）`);
+    if (!response.ok && !init?.acceptJsonError) throw new Error(text || `daemon 请求失败（${String(response.status)}）`);
     if (!text) return {};
     try { return JSON.parse(text) as JsonObject; } catch { return { output: text }; }
   }

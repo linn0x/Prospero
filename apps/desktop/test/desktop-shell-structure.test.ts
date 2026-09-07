@@ -4,6 +4,8 @@ import { describe, expect, it } from "vitest";
 
 const sourceRoot = resolve(import.meta.dirname, "../src/renderer/src");
 const app = readFileSync(resolve(sourceRoot, "App.tsx"), "utf8");
+const workspace = readFileSync(resolve(sourceRoot, "workspace/WorkspacePane.tsx"), "utf8");
+const tabs = readFileSync(resolve(sourceRoot, "app-shell/WorkspaceTabs.tsx"), "utf8");
 const styles = readFileSync(resolve(sourceRoot, "styles.css"), "utf8").replaceAll(
   "\r\n",
   "\n",
@@ -14,20 +16,27 @@ const sidebar = readFileSync(
 );
 
 describe("desktop shell structure", () => {
-  it("keeps the wordmark without the old workbench icon or search chrome", () => {
+  it("removes the full-width topbar while retaining command shortcuts", () => {
     expect(app).not.toContain('className="sidebar-brand"');
     expect(app).not.toContain('className="search-trigger"');
+    expect(app).not.toContain('className="desktop-topbar"');
     expect(app).toContain('setLauncher("command")');
+    expect(app).toContain('className="sidebar-new-session"');
+    expect(app).toContain('className="sidebar-drawer-trigger"');
   });
 
   it("keeps the shell sidebar while hiding workspace chrome in focus mode", () => {
     expect(app).toMatch(/<ShellSidebar\s+snapshot=\{sessionSnapshot\}/);
     expect(app).not.toContain("{shellChromeVisible && <ShellSidebar");
-    expect(app).toContain('{chromeVisible && <div className="workspace-tabbar">');
-    expect(app).toContain('{chromeVisible && <header className="pane-toolbar">');
-    expect(app).toContain('{chromeVisible && <div className="pane-tabbar pane-tabbar-static">');
-    expect(app).toContain('<Sheet open={chromeVisible && contextSheet}');
-    expect(styles).toContain(".pane-workspace.is-focus .primary-pane { grid-template-rows: minmax(0, 1fr); }");
+    expect(app).toContain('!workspaceFocus && validOpenIds.length > 0 && <WorkspaceTabs');
+    expect(app).toContain('className="local-workspace-container"');
+    expect(app).toContain('{focus && <Button className="sidebar-exit-focus"');
+    expect(workspace).toContain('{chromeVisible && <SessionToolbar');
+    expect(workspace).not.toContain('pane-tabbar-static');
+    expect(workspace).not.toContain('workspace-tabbar');
+    expect(workspace).toContain('const visible = chromeVisible && dock.visible && available > 0;');
+    expect(workspace).toContain('<Sheet open={visible && overlay}');
+    expect(tabs).toContain('role="tablist"');
   });
 
   it("keeps the sidebar collapsible and able to switch sessions", () => {
@@ -49,10 +58,17 @@ describe("desktop shell structure", () => {
       '"relative flex w-full flex-1 flex-col bg-background',
     );
     expect(styles).toContain(".prospero-main {\n  height: 100%;\n  min-width: 0;");
+    expect(styles).toContain('[data-slot="sidebar-container"] { top: 0; height: 100%;');
   });
 
-  // Native traffic-light clearance and pointer resizing are exercised in
-  // scripts/check-window-chrome.cjs, against actual rendered bounds.
+  it("keeps native control clearance and independent narrow-window navigation", () => {
+    expect(sidebar).toContain('window.prospero?.platform === "darwin" ? 88 : 52');
+    expect(styles).toContain('.sidebar-shell-header button { -webkit-app-region: no-drag; }');
+    expect(styles).toContain('[data-platform="darwin"] .sidebar-shell-header { padding-left: 88px;');
+    expect(styles).toContain('[data-state="collapsed"] .sidebar-shell-header { padding: 44px 8px 8px;');
+    expect(styles).toContain('@media (max-width: 767px)');
+    expect(styles).toContain('.sidebar-drawer-trigger { display: inline-flex; position: fixed;');
+  });
 
   it("copies sessions with their original account binding", () => {
     expect(app).toContain("...(session.accountId ? { accountId: session.accountId } : {}),");

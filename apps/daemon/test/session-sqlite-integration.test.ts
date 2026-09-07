@@ -210,6 +210,48 @@ function ownerManifest(root: string, id: string, pid: number): StructuredSupervi
 }
 
 describe.skipIf(process.platform === "win32")("owner migration continuity", () => {
+  it("skips duplicate central history before loading its complete queue", async () => {
+    const dir = home();
+    const root = path.join(dir, "structured-supervisor");
+    mkdirSync(root, { mode: 0o700 });
+    const id = "duplicate-owner";
+    const manifest = ownerManifest(root, id, process.pid);
+    manifest.storageVersion = 2;
+    writeFileSync(path.join(manifest.sessionDir!, "manifest.json"), JSON.stringify(manifest), { mode: 0o600 });
+    const archive = new SessionDatabase(path.join(manifest.sessionDir!, "session.sqlite"));
+    archive.saveSession(state(id)); archive.close();
+    const central = new SessionDatabase(path.join(dir, "sessions.sqlite"));
+    central.saveSession(state(id)); central.close();
+    const reads = vi.spyOn(SessionDatabase.prototype, "readSession");
+    const owner = new SessionManager({ home: dir, supervisor: true });
+    managers.push(owner);
+    expect((await owner.restoreStructured()).map(session => session.id)).toEqual([id]);
+    expect(reads).toHaveBeenCalledTimes(1);
+    expect(reads.mock.calls[0]?.[1]?.messageQueue).toBe(false);
+  });
+  it("opens SQLite metadata once per reconnect without delayed archive rereads", async () => {
+    const root = home();
+    for (let index = 0; index < 3; index++) {
+      const id = `sqlite-archive-${index}`;
+      const manifest = ownerManifest(root, id, process.pid);
+      manifest.storageVersion = 2;
+      writeFileSync(path.join(manifest.sessionDir!, "manifest.json"), JSON.stringify(manifest), { mode: 0o600 });
+      const db = new SessionDatabase(path.join(manifest.sessionDir!, "session.sqlite"));
+      db.saveSession(state(id)); db.close();
+      writeFileSync(path.join(manifest.sessionDir!, "session.json"), "must not read legacy JSON", { mode: 0o600 });
+    }
+    const reads = vi.spyOn(SessionDatabase.prototype, "readSession");
+    const refresh = vi.spyOn(RemoteStructuredSession.prototype, "refreshArchiveMetadata");
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const sessions = await reconnectStructuredSupervisors(root, 5, { archiveMigrationDelayMs: 0 });
+      expect(sessions).toHaveLength(3);
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(reads).toHaveBeenCalledTimes((attempt + 1) * 3);
+      expect(refresh).not.toHaveBeenCalled();
+      expect(reads.mock.calls.every(([, options]) => options?.events === false && options.toolOutputs === false && options.messageQueue === false)).toBe(true);
+      for (const session of sessions) await session.dispose();
+    }
+  });
   it("reattaches a live SQLite owner despite central corruption without loading history or losing a concurrent tail", async () => {
     const dir = home();
     const root = path.join(dir, "structured-supervisor");
@@ -291,6 +333,34 @@ describe.skipIf(process.platform === "win32")("owner migration continuity", () =
     expect(existsSync(path.join(root, "unknown", "session.sqlite"))).toBe(false);
     expect(sessions.find((session) => session.id === "dead")!.snapshot().events[0]).toEqual({ kind: "user.message", msgId: "u", text: "Owner text" });
     expect(sessions.find((session) => session.id === "live")!.snapshot().events[0]).toEqual({ kind: "user.message", msgId: "u", text: "Owner text" });
+    for (const session of sessions) await session.dispose();
+  });
+  it("migrates one archive at a time and checkpoints each completed owner", async () => {
+    const root = home();
+    const deadPid = 2_147_480_003;
+    const kill = process.kill.bind(process);
+    vi.spyOn(process, "kill").mockImplementation(((pid: number, signal?: NodeJS.Signals | number) => {
+      if (pid === deadPid && signal === 0) throw Object.assign(new Error("not running"), { code: "ESRCH" });
+      return kill(pid, signal);
+    }) as typeof process.kill);
+    for (const id of ["archive-a", "archive-b", "archive-c"]) ownerManifest(root, id, deadPid);
+    let active = 0, peak = 0;
+    const begin = SessionDatabase.prototype.beginSessionImport;
+    const finish = SessionDatabase.prototype.finishSessionImportAsync;
+    vi.spyOn(SessionDatabase.prototype, "beginSessionImport").mockImplementation(function (this: SessionDatabase) {
+      const token = begin.call(this);
+      peak = Math.max(peak, ++active);
+      return token;
+    });
+    vi.spyOn(SessionDatabase.prototype, "finishSessionImportAsync").mockImplementation(async function (this: SessionDatabase, ...args: Parameters<SessionDatabase["finishSessionImportAsync"]>) {
+      try { await finish.apply(this, args); } finally { active--; }
+    });
+    const sessions = await reconnectStructuredSupervisors(root, 5, { archiveMigrationDelayMs: 0 });
+    await vi.waitFor(() => {
+      for (const id of ["archive-a", "archive-b", "archive-c"]) expect(JSON.parse(readFileSync(path.join(root, id, "manifest.json"), "utf8")).storageVersion).toBe(2);
+    });
+    expect(peak).toBe(1);
+    expect(active).toBe(0);
     for (const session of sessions) await session.dispose();
   });
 

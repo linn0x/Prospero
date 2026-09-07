@@ -12,9 +12,24 @@ function boundedNonNegativeInteger(value: unknown, fallback = 0): number {
     : fallback;
 }
 
+export function sessionAgentControls(value: unknown): SessionInfo["agentControls"] {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const controls = value as JsonObject;
+  if (typeof controls["compact"] !== "boolean" || typeof controls["model"] !== "boolean" || typeof controls["mode"] !== "boolean") return undefined;
+  return {
+    compact: controls["compact"],
+    model: controls["model"],
+    mode: controls["mode"],
+    ...(typeof controls["currentModel"] === "string" && controls["currentModel"] ? { currentModel: controls["currentModel"].slice(0, 300) } : {}),
+    ...(typeof controls["currentEffort"] === "string" && controls["currentEffort"] ? { currentEffort: controls["currentEffort"].slice(0, 100) } : {}),
+    ...(typeof controls["currentMode"] === "string" && controls["currentMode"] ? { currentMode: controls["currentMode"].slice(0, 100) } : {}),
+  };
+}
+
 export function sessionInfoFromControl(value: unknown): SessionInfo {
   if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("参数格式无效");
   const item = value as JsonObject;
+  const agentControls = sessionAgentControls(item["agentControls"]);
   if (typeof item["id"] !== "string" || !SAFE_ID.test(item["id"])) throw new Error("会话无效");
   const messageQueue: NonNullable<SessionInfo["messageQueue"]> = Array.isArray(item["messageQueue"])
     ? item["messageQueue"].slice(0, 50).flatMap((raw) => {
@@ -53,6 +68,7 @@ export function sessionInfoFromControl(value: unknown): SessionInfo {
     ...(typeof item["displayTitle"] === "string" ? { displayTitle: item["displayTitle"].slice(0, 500) } : {}),
     cwd: boundedText(item["cwd"], "", 4_096),
     status: boundedText(item["status"], "unknown", 80),
+    ...(agentControls ? { agentControls } : {}),
     ...(typeof item["preview"] === "string" ? { preview: item["preview"].slice(0, 2_000) } : {}),
     ...(typeof item["createdAt"] === "number" && Number.isFinite(item["createdAt"])
       ? { createdAt: Math.max(0, Math.floor(item["createdAt"])) }

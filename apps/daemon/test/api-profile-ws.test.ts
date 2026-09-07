@@ -90,6 +90,22 @@ async function setup(allowShell: boolean, protocolVersion: number, probe: NonNul
 }
 
 describe("API Profile WebSocket authorization boundary", () => {
+  it.each([[true, 16], [false, 16], [true, 15]])("gates model/config features by protocol and permission: allowShell=%s protocol=%s", async (allowShell, protocolVersion) => {
+    const { client, server, accountId, hello } = await setup(allowShell as boolean, protocolVersion as number, async () => passed());
+    const fetchModels = vi.spyOn(server.accounts, "apiModels").mockResolvedValue([{ id: "synthetic-model" }]);
+    const allowed = allowShell === true && protocolVersion === 16;
+    expect(hello.host.capabilities?.includes("agent.account.api.models") ?? false).toBe(allowed);
+    expect(hello.host.capabilities?.includes("agent.account.config") ?? false).toBe(allowed);
+    client.send({ type: "agent.account.api.models.get", requestId: "models", accountId });
+    const models = await client.waitFor((message) => message.type === "agent.account.api.models.result");
+    expect(models).toMatchObject({ ok: allowed });
+    expect(fetchModels).toHaveBeenCalledTimes(allowed ? 1 : 0);
+    client.send({ type: "agent.account.config.get", requestId: "config", accountId });
+    const config = await client.waitFor((message) => message.type === "agent.account.config.result");
+    expect(config).toMatchObject({ ok: allowed });
+    expect(JSON.stringify([models, config])).not.toContain("synthetic-private-key");
+  });
+
   it.each([false, true])("keeps explicit engine validation behind account authorization (allowShell=%s)", async (allowShell) => {
     const wire = vi.fn(async () => passed());
     const engineResult: AgentApiEngineValidation = { ...passed(), cliVersion: "1.2.3", checks: { ...passed().checks, configuration: "passed" } };

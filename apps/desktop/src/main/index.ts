@@ -7,6 +7,7 @@ import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, nati
 import type { MenuItemConstructorOptions, Rectangle } from "electron";
 import type { DesktopSettings, JsonObject, SessionCreateInput, SessionPage, SessionPageRequest, WorkflowTemplate } from "../shared/types";
 import { desktopSettingsPatch } from "../shared/desktop-settings";
+import { accountModelsRequest, accountModelsResult, accountConfigRequest, accountConfigResult } from "../shared/account-features";
 import { windowAppearance } from "../shared/window-appearance";
 import { diffDesktopSnapshot, isEmptyDesktopSnapshotPatch } from "../shared/snapshot-patch";
 import { isSessionLaunchWorkspace } from "../shared/session-launch-options";
@@ -17,6 +18,8 @@ import { sessionInfoFromControl } from "./session-control";
 import { StateStore } from "./state-store";
 import { RemoteHostStore } from "./remote-host-store";
 import { RemoteShellManager } from "./remote-shell-manager";
+import { RemoteWorkspaces, RemoteWorkspaceStore } from "./remote-workspaces";
+import { remoteDirectoryRequest } from "../shared/remote-workspaces";
 
 const SAFE_ID = /^[A-Za-z0-9._:-]{1,160}$/;
 const ORCHESTRATION_METHODS = new Set([
@@ -56,6 +59,8 @@ const remoteHostStore = new RemoteHostStore(resolve(app.getPath("userData"), "re
 const remoteShellManager = new RemoteShellManager(remoteHostStore, (event) => {
   mainWindow?.webContents.send("remote-shell:event", event);
 });
+const remoteWorkspaces = new RemoteWorkspaces(new RemoteWorkspaceStore(resolve(app.getPath("userData"), "remote-workspaces.json")), remoteHostStore, remoteShellManager);
+const publishRemoteWorkspaces = (): void => { mainWindow?.webContents.send("remote-workspace:changed", remoteWorkspaces.list()); };
 const runtime = new DaemonRuntime(store);
 const legacyProjection = new LegacyOrchestrationProjection(
   store.home,
@@ -266,8 +271,6 @@ function createWindow(): BrowserWindow {
       }
       : {}),
     title: "Prospero",
-    // Keep native traffic lights centered in the renderer's 44px window toolbar.
-    // The sidebar begins below it, so collapsing/resizing never splits the controls.
     // titleBarOverlay 只对 Windows/Linux 生效,macOS 传了也会被忽略。
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "hidden",
     ...(process.platform === "darwin"
@@ -430,7 +433,7 @@ async function runDesktopSelfCheck(window: BrowserWindow): Promise<void> {
     const screenshotView = process.argv.find((argument) => argument.startsWith("--screenshot-view="))?.slice("--screenshot-view=".length);
     if (screenshotView === "settings") {
       await window.webContents.executeJavaScript(`Array.from(document.querySelectorAll('[data-sidebar="menu-button"]')).find((button) => button.textContent?.includes('设置') || button.textContent?.includes('Settings'))?.click()`);
-      const settingsReady = await window.webContents.executeJavaScript(`new Promise((resolve) => { const started = Date.now(); const check = () => document.querySelector('.settings-page') ? resolve(true) : Date.now() - started > 5_000 ? resolve(false) : setTimeout(check, 100); check(); })`) as boolean;
+      const settingsReady = await window.webContents.executeJavaScript(`new Promise((resolve) => { const started = Date.now(); const check = () => document.querySelector('.settings-shell') ? resolve(true) : Date.now() - started > 5_000 ? resolve(false) : setTimeout(check, 100); check(); })`) as boolean;
       if (!settingsReady) throw new Error("settings page did not finish loading");
       await new Promise((done) => setTimeout(done, 250));
     }
@@ -702,7 +705,7 @@ async function runDesktopSelfCheck(window: BrowserWindow): Promise<void> {
         .find((button) => button.textContent?.includes('设置') || button.textContent?.includes('Settings'));
       settings?.click();
       const started = Date.now();
-      while (!document.querySelector('.settings-page')) {
+      while (!document.querySelector('.settings-shell')) {
         if (Date.now() - started > 5_000) break;
         await wait(100);
       }
@@ -710,7 +713,7 @@ async function runDesktopSelfCheck(window: BrowserWindow): Promise<void> {
       return {
         trigger: true,
         card,
-        settings: Boolean(document.querySelector('.settings-page')),
+        settings: Boolean(document.querySelector('.settings-shell')),
         healthyRoot: Boolean(root && root.childElementCount > 0),
       };
     })()` ) as { trigger: boolean; card: boolean; settings: boolean; healthyRoot: boolean };
@@ -742,22 +745,53 @@ function installIpc(): void {
   ipcMain.handle("remote-host:remove", (_event, raw: unknown) => {
     if (typeof raw !== "string" || !SAFE_ID.test(raw)) throw new Error("远程主机 ID 无效");
     remoteShellManager.disconnect(raw);
-    return { ok: remoteHostStore.remove(raw) };
+    const removed = remoteHostStore.remove(raw);
+    if (removed) { remoteWorkspaces.store.removeHost(raw); publishRemoteWorkspaces(); }
+    return { ok: removed };
+  });
+  ipcMain.handle("remote-workspace:list", () => remoteWorkspaces.list());
+  ipcMain.handle("remote-workspace:directories", (_event, raw: unknown) => remoteWorkspaces.directories(remoteDirectoryRequest(raw)));
+  ipcMain.handle("remote-workspace:add", async (_event, raw: unknown) => {
+    const input = requireObject(raw);
+    const request = remoteDirectoryRequest(input);
+    const name = input["name"] === undefined ? undefined : requireSelection(input["name"], "远程工作区名称", 80);
+    const result = await remoteWorkspaces.add({ ...request, ...(name ? { name } : {}) });
+    publishRemoteWorkspaces();
+    return result;
+  });
+  ipcMain.handle("remote-workspace:forget", (_event, raw: unknown) => {
+    const ok = remoteWorkspaces.store.remove(requireId(raw, "远程工作区"));
+    publishRemoteWorkspaces();
+    return { ok };
+  });
+  ipcMain.handle("remote-workspace:rename", (_event, raw: unknown, rawName: unknown) => {
+    const result = remoteWorkspaces.store.rename(requireId(raw, "远程工作区"), requireSelection(rawName, "远程工作区名称", 80));
+    publishRemoteWorkspaces();
+    return result;
+  });
+  ipcMain.handle("remote-workspace:shells", (_event, raw: unknown) => remoteWorkspaces.listShells(requireId(raw, "远程工作区")));
+  ipcMain.handle("remote-workspace:open", async (_event, raw: unknown, rawOptions: unknown) => {
+    const options = rawOptions === undefined ? {} : requireObject(rawOptions);
+    if (options["newSession"] !== undefined && typeof options["newSession"] !== "boolean") throw new Error("远程会话选项无效");
+    const result = await remoteWorkspaces.open(requireId(raw, "远程工作区"), { ...(options["newSession"] === true ? { newSession: true } : {}) });
+    publishRemoteWorkspaces();
+    return result;
   });
   ipcMain.handle("remote-shell:connect", (_event, raw: unknown) => remoteShellManager.connect(requireId(raw, "远程主机")));
   ipcMain.handle("remote-shell:list", (_event, raw: unknown) => remoteShellManager.listShells(requireId(raw, "远程主机")));
-  ipcMain.handle("remote-shell:attach", (_event, host: unknown, sid: unknown) => remoteShellManager.attach(requireId(host, "远程主机"), requireId(sid, "远程会话")));
+  ipcMain.handle("remote-shell:attach", (_event, host: unknown, sid: unknown, owner: unknown) => remoteShellManager.attach(requireId(host, "远程主机"), requireId(sid, "远程会话"), owner === undefined ? undefined : requireId(owner, "终端视图")));
+  ipcMain.handle("remote-shell:detach", (_event, host: unknown, sid: unknown, owner: unknown) => remoteShellManager.detach(requireId(host, "远程主机"), requireId(sid, "远程会话"), owner === undefined ? undefined : requireId(owner, "终端视图")));
   ipcMain.handle("remote-shell:create", (_event, rawHost: unknown, rawCwd: unknown) => {
     const cwd = rawCwd === undefined ? undefined : typeof rawCwd === "string" && rawCwd.length <= 4096 ? rawCwd : (() => { throw new Error("远程工作目录无效"); })();
     return remoteShellManager.createShell(requireId(rawHost, "远程主机"), cwd);
   });
-  ipcMain.handle("remote-shell:input", (_event, rawHost: unknown, rawSid: unknown, rawData: unknown) => {
+  ipcMain.handle("remote-shell:input", (_event, rawHost: unknown, rawSid: unknown, rawData: unknown, owner: unknown) => {
     if (typeof rawSid !== "string" || !SAFE_ID.test(rawSid) || typeof rawData !== "string" || rawData.length > 350_000 || !/^[A-Za-z0-9+/]*={0,2}$/.test(rawData)) throw new Error("远程终端输入无效或粘贴内容过大");
-    return remoteShellManager.input(requireId(rawHost, "远程主机"), rawSid, rawData);
+    return remoteShellManager.input(requireId(rawHost, "远程主机"), rawSid, rawData, owner === undefined ? undefined : requireId(owner, "终端视图"));
   });
-  ipcMain.handle("remote-shell:resize", (_event, rawHost: unknown, rawSid: unknown, rawCols: unknown, rawRows: unknown) => {
+  ipcMain.handle("remote-shell:resize", (_event, rawHost: unknown, rawSid: unknown, rawCols: unknown, rawRows: unknown, owner: unknown) => {
     if (typeof rawSid !== "string" || !SAFE_ID.test(rawSid) || typeof rawCols !== "number" || !Number.isInteger(rawCols) || rawCols < 2 || rawCols > 500 || typeof rawRows !== "number" || !Number.isInteger(rawRows) || rawRows < 2 || rawRows > 300) throw new Error("远程终端尺寸无效");
-    return remoteShellManager.resize(requireId(rawHost, "远程主机"), rawSid, rawCols, rawRows);
+    return remoteShellManager.resize(requireId(rawHost, "远程主机"), rawSid, rawCols, rawRows, owner === undefined ? undefined : requireId(owner, "终端视图"));
   });
   ipcMain.handle("remote-shell:kill", (_event, rawHost: unknown, rawSid: unknown) => {
     if (typeof rawSid !== "string") throw new Error("远程会话无效");
@@ -1092,6 +1126,30 @@ function installIpc(): void {
     if (typeof rawDecision !== "string" || !rawDecision.trim() || rawDecision.length > 20_000) throw new Error("决策无效");
     return runtime.request(`/_prospero/control/orchestration/gate/${encodeURIComponent(id)}/resolve`, { method: "POST", body: { decision: rawDecision.trim() } });
   });
+  ipcMain.handle("account:models", async (_event, raw: unknown) => {
+    const message = accountModelsRequest(raw, randomUUID());
+    const failed = (code: "unsupported" | "network" | "not_found", detail: string) => ({ type: "agent.account.api.models.result", requestId: message.requestId, ok: false, models: [], error: { code, message: detail } });
+    if (!store.snapshot().daemon.capabilities?.includes("agent.account.api.models")) return failed("unsupported", "请升级 daemon 后拉取模型 / Upgrade the daemon to fetch models");
+    if (message.accountId && !store.snapshot().accounts.some((account) => account["id"] === message.accountId)) return failed("not_found", "账号不存在 / Account not found");
+    try {
+      return accountModelsResult(await runtime.request("/_prospero/control/accounts", { method: "POST", body: message, timeoutMs: 35_000, acceptJsonError: true }), message.requestId);
+    } catch {
+      return failed("network", "无法读取模型目录，请重试 / Unable to fetch the model catalog; retry");
+    }
+  });
+  const accountConfiguration = async (raw: unknown, write: boolean) => {
+    const message = accountConfigRequest(raw, randomUUID(), write);
+    const failed = (code: "unsupported" | "network" | "not_found", detail: string) => ({ type: "agent.account.config.result", requestId: message.requestId, ok: false, error: { code, message: detail } });
+    if (!store.snapshot().daemon.capabilities?.includes("agent.account.config")) return failed("unsupported", "请升级 daemon 后编辑高级配置 / Upgrade the daemon to edit advanced configuration");
+    if (!store.snapshot().accounts.some((account) => account["id"] === message.accountId)) return failed("not_found", "账号不存在 / Account not found");
+    try {
+      return accountConfigResult(await runtime.request("/_prospero/control/accounts", { method: "POST", body: message, timeoutMs: 35_000, acceptJsonError: true }), message.requestId, message.accountId);
+    } catch {
+      return failed("network", "无法读取或保存配置，请重试 / Unable to read or save configuration; retry");
+    }
+  };
+  ipcMain.handle("account:config:get", (_event, accountId: unknown) => accountConfiguration({ accountId }, false));
+  ipcMain.handle("account:config:set", (_event, raw: unknown) => enqueueAccountAction(() => accountConfiguration(raw, true)));
   ipcMain.handle("account:action", (_event, raw: unknown) => enqueueAccountAction(async () => {
     const message = requireObject(raw);
     if (typeof message["type"] !== "string" || !ACCOUNT_METHODS.has(message["type"])) throw new Error("不支持的账号操作");
