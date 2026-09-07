@@ -1275,6 +1275,22 @@ async function migrateDeadOwner(dir: string, manifest: StructuredSupervisorManif
   }
 }
 
+const DEAD_OWNER_MIGRATION_CONCURRENCY = 2;
+
+async function drainDeadOwnerMigrations(jobs: Array<() => Promise<void>>): Promise<void> {
+  let nextJob = 0;
+  await Promise.all(Array.from(
+    { length: Math.min(DEAD_OWNER_MIGRATION_CONCURRENCY, jobs.length) },
+    async () => {
+      for (;;) {
+        const job = jobs[nextJob++];
+        if (!job) return;
+        await job();
+      }
+    },
+  ));
+}
+
 /** Scan only private per-session directories; never launch a replacement here. */
 export async function reconnectStructuredSupervisors(
   root: string,
@@ -1292,14 +1308,29 @@ export async function reconnectStructuredSupervisors(
     return [{ dir, manifest, live }];
   }).sort((left, right) => Number(right.live) - Number(left.live));
   const sessions: Array<RemoteStructuredSession | undefined> = new Array(entries.length);
+  const deadOwnerMigrations: Array<() => Promise<void>> = [];
   const archive = (dir: string, manifest: StructuredSupervisorManifest): RemoteStructuredSession => {
     const session = RemoteStructuredSession.unavailable({ ...manifest, sessionDir: dir });
     // Large inactive archives cannot occupy the live reconnect worker slots.
     // Publication rechecks PID/epoch, directory identity and deletion tombstones.
-    // A quit may interrupt this staging import; the original file stays intact.
-    void migrateDeadOwner(dir, manifest, () => options.isDeleted?.(manifest.sessionId) === true).then(() => {
-      if (!options.isDeleted?.(manifest.sessionId)) session.refreshArchiveMetadata();
-    }).catch(() => { /* Explicit legacy inspection remains available; never launch or overwrite an owner. */ });
+    // Queue migration instead of creating one eager Promise per dead owner.
+    // Hosts with thousands of archived sessions otherwise open thousands of
+    // SQLite staging databases at startup, starving status publication and
+    // exhausting descriptors/disk before the desktop can connect. A quit may
+    // interrupt an individual staging import; the original JSON stays intact.
+    deadOwnerMigrations.push(async () => {
+      try {
+        await migrateDeadOwner(
+          dir,
+          manifest,
+          () => options.isDeleted?.(manifest.sessionId) === true,
+        );
+        if (!options.isDeleted?.(manifest.sessionId)) session.refreshArchiveMetadata();
+      } catch {
+        // Explicit legacy inspection remains available; never launch or
+        // overwrite an owner merely because its background migration failed.
+      }
+    });
     return session;
   };
   let nextEntry = 0;
@@ -1320,5 +1351,13 @@ export async function reconnectStructuredSupervisors(
       catch { sessions[entryIndex] = archive(dir, manifest); }
     }
   }));
-  return sessions.filter((session): session is RemoteStructuredSession => session !== undefined);
+  const restored = sessions.filter(
+    (session): session is RemoteStructuredSession => session !== undefined
+  );
+  if (deadOwnerMigrations.length > 0) {
+    // Publish the live reconnect result before any archive migration performs
+    // synchronous SQLite open/fsync work. Two jobs then advance in background.
+    setImmediate(() => { void drainDeadOwnerMigrations(deadOwnerMigrations); });
+  }
+  return restored;
 }
