@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, CircleAlert, Copy, KeyRound, Link2, MonitorSmartphone, Pencil, Plus, RefreshCw, Server, Settings2, ShieldCheck, Trash2, UserRound, Wifi } from "lucide-react";
 import type { DesktopSnapshot, DeviceInfo, JsonObject, SessionInfo, UsageAccount, UsageWindow } from "../../shared/types";
 import { displayError, number, record, text } from "./state";
@@ -358,8 +358,6 @@ export function AccountsPane({ snapshot, onOpenSession }: { snapshot: DesktopSna
   </div>;
 }
 
-const RemoteHostsPane = lazy(() => import("./RemoteHostsPane"));
-
 export function DevicesPane({ snapshot }: { snapshot: DesktopSnapshot }) {
   const { language, t } = useLocale();
   const [name, setName] = useState(() => t("我的手机", "My phone"));
@@ -444,13 +442,12 @@ export function DevicesPane({ snapshot }: { snapshot: DesktopSnapshot }) {
       <header className="page-header">
         <div>
           <span className="eyebrow">{t("远程控制", "REMOTE CONTROL")}</span>
-          <h1>{t("远程控制", "Remote control")}</h1>
-          <p>{t("连接其他电脑的 Shell，或配对手机来管理这台电脑上的 Agent。", "Connect to another computer’s Shell, or pair a phone to manage agents on this computer.")}</p>
+          <h1>{t("移动端", "Mobile")}</h1>
+          <p>{t("配对手机，查看会话、回复问题并管理这台电脑上的 Agent。", "Pair a phone to inspect sessions, answer questions and manage agents on this computer.")}</p>
         </div>
       </header>
       {error && <div className="inline-error" role="alert">{error}</div>}
       {notice && <p className="security-note" role="status" aria-live="polite">{notice}</p>}
-      <Suspense fallback={<p role="status">{t("正在加载远程终端…", "Loading remote terminal…")}</p>}><RemoteHostsPane /></Suspense>
       <div className="split-management">
         <section aria-labelledby="paired-devices-title">
           <h2 id="paired-devices-title" className="section-title">

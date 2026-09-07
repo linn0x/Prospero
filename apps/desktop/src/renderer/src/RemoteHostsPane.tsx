@@ -159,10 +159,12 @@ export default function RemoteHostsPane() {
     if (selected === hostId) { selectedRef.current = undefined; setSelected(undefined); setSid(undefined); setSessions([]); setConnected(false); }
     await refreshHosts();
   };
-  return <section className="form-card remote-control-card" aria-labelledby="remote-hosts-title">
-    <div className="section-title"><Server size={16} /><h2 id="remote-hosts-title">{t("远程电脑", "Remote computers")}</h2><span>{hosts.length}</span></div>
+  return <div className="page remote-computers-page">
+    <header className="page-header"><div><span className="eyebrow">DESKTOP TO DESKTOP</span><h1>{t("远程电脑", "Remote computers")}</h1><p>{t("通过局域网或中继连接其他电脑，在交互式 Shell 中使用 Agent CLI。", "Connect to another computer over LAN or relay and use its agent CLI in an interactive Shell.")}</p></div></header>
+    <section className="form-card remote-control-card" aria-labelledby="remote-hosts-title">
+    <div className="section-title"><Server size={16} /><h2 id="remote-hosts-title">{t("已配对电脑", "Paired computers")}</h2><span>{hosts.length}</span></div>
     <details ref={pairingDetails} className="remote-pairing-details" open={hosts.length === 0}><summary>{t("添加远程电脑", "Add remote computer")}</summary>
-    <p className="security-note">{t("在另一台电脑的「远程控制」中生成配对串，粘贴到这里。连接后可在 Shell 中运行 codex、claude 或其他 CLI。", "Generate a pairing code under Remote control on another computer and paste it here. Run codex, claude or another CLI in its Shell.")}</p>
+    <p className="security-note">{t("在另一台电脑的「移动端 → 让其他设备连接本机」中生成配对串，粘贴到这里。连接后可在 Shell 中运行 codex、claude 或其他 CLI。", "Generate a pairing code under Mobile → Pair a device with this computer on another computer and paste it here. Run codex, claude or another CLI in its Shell.")}</p>
     <form className="remote-host-import" onSubmit={(event) => { event.preventDefault(); void run(async () => {
       await window.prospero.importRemoteHost(pairing.trim()); setPairing(""); await refreshHosts();
     }); }}>
@@ -187,5 +189,5 @@ export default function RemoteHostsPane() {
       {sid && <RemoteTerminal key={`${selected}:${sid}`} hostId={selected} sid={sid} connected={connected} onError={onError} />}
       {sid && <div className="button-row compact"><button disabled={busy || !connected} onClick={() => void run(async () => { await window.prospero.sendRemoteShellInput(selected, sid, "Aw=="); })}>Ctrl+C</button><button className="danger" disabled={busy || !connected} onClick={() => void run(async () => { await window.prospero.killRemoteShell(selected, sid); setSessions((current) => current.filter((s) => s.id !== sid)); setSid(undefined); })}>{t("结束当前 Shell", "End current Shell")}</button></div>}
     </div>}
-  </section>;
+  </section></div>;
 }
