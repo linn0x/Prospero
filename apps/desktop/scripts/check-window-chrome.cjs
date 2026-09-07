@@ -76,6 +76,15 @@ app.on("browser-window-created", (_event, window) => {
       assert.equal(cancelled.sidebar.width, resized.sidebar.width);
       assert.equal(cancelled.resizing, undefined);
       assert.equal(cancelled.saves, 1);
+      await drag(130 - resized.sidebar.width, true);
+      assert.equal((await measure()).sidebar.width, resized.sidebar.width, "Cancelling a collapse restores the previous width");
+      await drag(130 - resized.sidebar.width);
+      const dragCollapsed = await measure();
+      assert.equal(dragCollapsed.sidebar.width, 52, "Dragging left past the threshold collapses the sidebar");
+      assert.equal(dragCollapsed.savedWidth, resized.sidebar.width, "Collapsing preserves the expanded width");
+      assert.equal(dragCollapsed.resizing, undefined);
+      await toggle();
+      assert.equal((await measure()).sidebar.width, resized.sidebar.width);
       await toggle();
       const collapsed = await measure();
       assert.equal(collapsed.sidebar.width, 52);

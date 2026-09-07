@@ -1843,11 +1843,13 @@ function ShellSidebar({
                   />
                 }
               >
-                {snapshot.daemon.starting ? (
-                  <LoaderCircle className="daemon-spinner" />
-                ) : (
-                  <span className={cn("sidebar-daemon-dot", snapshot.daemon.running ? "online" : "offline")} />
-                )}
+                <span className="sidebar-daemon-indicator" aria-hidden="true">
+                  {snapshot.daemon.starting ? (
+                    <LoaderCircle className="daemon-spinner" />
+                  ) : (
+                    <span className={cn("sidebar-daemon-dot", snapshot.daemon.running ? "online" : "offline")} />
+                  )}
+                </span>
                 <span>{snapshot.daemon.starting ? t("启动中", "Starting") : "Daemon"}</span>
               </HoverCardTrigger>
               <HoverCardContent side="right" align="end" sideOffset={10} className="w-80 p-0">
@@ -2002,7 +2004,7 @@ function OverviewPane({
       <div className="view-container overview-view">
         <h1 className="sr-only">{t("概览", "Overview")}</h1>
         <div className="overview-grid">
-          <Card className="attention-card-shell" role="region" aria-labelledby="overview-attention-title">
+          <Card className="attention-card-shell" data-liquid-glass="panel" role="region" aria-labelledby="overview-attention-title">
             <CardHeader>
               <div className="flex items-center justify-between gap-3">
                 <div>
@@ -2125,16 +2127,14 @@ function OverviewPane({
                 </div>
               )}
             </CardContent>
-            {attentionCount > 0 && (
-              <CardFooter>
-                <Button variant="ghost" size="sm" onClick={onOpenInbox}>
-                  {t("打开收件箱", "Open inbox")}{" "}
-                  <ArrowRight data-icon="inline-end" />
-                </Button>
-              </CardFooter>
-            )}
+            <CardFooter>
+              <Button variant="ghost" size="sm" onClick={onOpenInbox}>
+                {t("打开收件箱", "Open inbox")}{" "}
+                <ArrowRight data-icon="inline-end" />
+              </Button>
+            </CardFooter>
           </Card>
-          <Card className="run-focus-card" role="region" aria-labelledby="overview-run-title">
+          <Card className="run-focus-card" data-liquid-glass="panel" role="region" aria-labelledby="overview-run-title">
             <CardHeader>
               <div className="flex items-center justify-between gap-3">
                 <Badge variant="outline">{t("当前运行", "CURRENT RUN")}</Badge>
@@ -2197,13 +2197,13 @@ function OverviewPane({
               </div>
             </CardContent>
             <CardFooter>
-              <Button variant="outline" onClick={() => onOpenRuns(runId || undefined)}>
+              <Button variant="ghost" size="sm" onClick={() => onOpenRuns(runId || undefined)}>
                 {t("打开运行", "Open run")}{" "}
                 <ArrowRight data-icon="inline-end" />
               </Button>
             </CardFooter>
           </Card>
-          <Card className="active-work-card" role="region" aria-labelledby="overview-active-title">
+          <Card className="active-work-card" data-liquid-glass="panel" role="region" aria-labelledby="overview-active-title">
             <CardHeader>
               <div className="flex items-center justify-between gap-3">
                 <div>
@@ -2259,14 +2259,12 @@ function OverviewPane({
                 </div>
               )}
             </CardContent>
-            {activeSessions.length > 6 && (
-              <CardFooter>
-                <Button variant="ghost" size="sm" onClick={onOpenWorkspaces}>
-                  {t("打开工作台", "Open workspaces")}
-                  <ArrowRight data-icon="inline-end" />
-                </Button>
-              </CardFooter>
-            )}
+            <CardFooter>
+              <Button variant="ghost" size="sm" onClick={onOpenWorkspaces}>
+                {t("打开工作台", "Open workspaces")}
+                <ArrowRight data-icon="inline-end" />
+              </Button>
+            </CardFooter>
           </Card>
         </div>
         <section className="recent-section" aria-labelledby="recent-workspaces-title">
@@ -2300,7 +2298,7 @@ function OverviewPane({
               const name =
                 project.split(/[\\/]/).filter(Boolean).at(-1) ?? project;
               return (
-                <Card size="sm" key={project}>
+                <Card size="sm" key={project} data-liquid-glass="panel">
                   <CardHeader>
                     <div className="workspace-symbol">
                       <FolderKanban />
