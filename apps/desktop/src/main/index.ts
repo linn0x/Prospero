@@ -739,7 +739,7 @@ function installIpc(): void {
   ipcMain.handle("snapshot:get", () => store.snapshot());
   ipcMain.handle("remote-host:list", () => remoteHostStore.list());
   ipcMain.handle("remote-host:import", (_event, raw: unknown) => {
-    if (typeof raw !== "string" || raw.trim().length === 0) throw new Error("配对二维码内容无效");
+    if (typeof raw !== "string" || raw.trim().length === 0 || raw.length > 65_536) throw new Error("配对二维码内容无效");
     const host = remoteHostStore.importPairing(raw);
     remoteShellManager.disconnect(host.id);
     return host;
@@ -750,16 +750,18 @@ function installIpc(): void {
     return { ok: remoteHostStore.remove(raw) };
   });
   ipcMain.handle("remote-shell:connect", (_event, raw: unknown) => remoteShellManager.connect(requireId(raw, "远程主机")));
+  ipcMain.handle("remote-shell:list", (_event, raw: unknown) => remoteShellManager.listShells(requireId(raw, "远程主机")));
+  ipcMain.handle("remote-shell:attach", (_event, host: unknown, sid: unknown) => remoteShellManager.attach(requireId(host, "远程主机"), requireId(sid, "远程会话")));
   ipcMain.handle("remote-shell:create", (_event, rawHost: unknown, rawCwd: unknown) => {
-    const cwd = rawCwd === undefined ? undefined : typeof rawCwd === "string" ? rawCwd : (() => { throw new Error("远程工作目录无效"); })();
+    const cwd = rawCwd === undefined ? undefined : typeof rawCwd === "string" && rawCwd.length <= 4096 ? rawCwd : (() => { throw new Error("远程工作目录无效"); })();
     return remoteShellManager.createShell(requireId(rawHost, "远程主机"), cwd);
   });
   ipcMain.handle("remote-shell:input", (_event, rawHost: unknown, rawSid: unknown, rawData: unknown) => {
-    if (typeof rawSid !== "string" || typeof rawData !== "string") throw new Error("远程终端输入无效");
+    if (typeof rawSid !== "string" || !SAFE_ID.test(rawSid) || typeof rawData !== "string" || rawData.length > 350_000 || !/^[A-Za-z0-9+/]*={0,2}$/.test(rawData)) throw new Error("远程终端输入无效或粘贴内容过大");
     return remoteShellManager.input(requireId(rawHost, "远程主机"), rawSid, rawData);
   });
   ipcMain.handle("remote-shell:resize", (_event, rawHost: unknown, rawSid: unknown, rawCols: unknown, rawRows: unknown) => {
-    if (typeof rawSid !== "string" || typeof rawCols !== "number" || typeof rawRows !== "number") throw new Error("远程终端尺寸无效");
+    if (typeof rawSid !== "string" || !SAFE_ID.test(rawSid) || typeof rawCols !== "number" || !Number.isInteger(rawCols) || rawCols < 2 || rawCols > 500 || typeof rawRows !== "number" || !Number.isInteger(rawRows) || rawRows < 2 || rawRows > 300) throw new Error("远程终端尺寸无效");
     return remoteShellManager.resize(requireId(rawHost, "远程主机"), rawSid, rawCols, rawRows);
   });
   ipcMain.handle("remote-shell:kill", (_event, rawHost: unknown, rawSid: unknown) => {

@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { generateKeyPairB64 } from "@prospero/protocol";
 import { RemoteShellClient, type RemoteSocket } from "../../desktop/src/main/remote-shell-client";
 import { RemoteShellManager, type RemoteShellEvent } from "../../desktop/src/main/remote-shell-manager";
-import { createDaemonServer, type DaemonServer } from "../src/ws-server.js";
+import { createDaemonServer } from "../src/ws-server.js";
 import { loadIdentity, mintDevice, issueRelayCredentials, persistRelayCredentials, generateRelayHostSecret, relayPairingForDevice, saveConfig } from "../src/pairing.js";
 import { RelayServer } from "../../relay/src/relay.js";
 import { readConfig } from "../../relay/src/config.js";
@@ -75,6 +75,9 @@ describe.skipIf(process.platform === "win32")("desktop remote shell actual data 
     const ids = await Promise.all([f.manager.createShell(f.host.id, f.dir), f.manager.createShell(f.host.id, f.dir)]);
     expect(ids[0]).toBe(ids[1]); expect(f.daemon.manager.list()).toHaveLength(1);
     const sid = ids[0]!;
+    expect((await f.manager.listShells(f.host.id)).map((session) => session.id)).toContain(sid);
+    await f.manager.attach(f.host.id, sid);
+    await expect(f.manager.attach(f.host.id, "missing-session")).rejects.toThrow("不存在");
     await wait(() => f.events.some((e) => e.message.type === "term.snapshot"));
     f.manager.input(f.host.id, sid, Buffer.from("printf 'DESKTOP_%s\\n' 'E2E_OK'\n").toString("base64"));
     await wait(() => f.text().includes("DESKTOP_E2E_OK"));

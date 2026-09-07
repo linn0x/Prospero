@@ -2,6 +2,7 @@ import type { RemoteShellHost, RemoteShellMessage, RemoteShellClient } from "./r
 import { RemoteShellClient as DefaultRemoteShellClient } from "./remote-shell-client";
 import type { RemoteHostStore } from "./remote-host-store";
 import { randomUUID } from "node:crypto";
+import type { SessionInfo } from "@prospero/protocol";
 
 export type RemoteShellEvent = {
   hostId: string;
@@ -18,6 +19,7 @@ type RemoteConnection = {
   host: RemoteShellHost;
   client: RemoteShellClient;
   sessions: Map<string, TrackedSession>;
+  catalog: Map<string, SessionInfo>;
   connecting: Promise<{ name: string; sessions: number }> | undefined;
   reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   reconnectAttempt: number;
@@ -63,6 +65,7 @@ export class RemoteShellManager {
       host,
       client: this.createClient(host),
       sessions: new Map(),
+      catalog: new Map(),
       connecting: undefined,
       reconnectTimer: undefined,
       reconnectAttempt: 0,
@@ -89,6 +92,19 @@ export class RemoteShellManager {
     }).finally(() => { connection.creating = undefined; });
     connection.creating = creating;
     return creating;
+  }
+
+  async listShells(hostId: string): Promise<SessionInfo[]> {
+    await this.connected(hostId);
+    return [...this.clients.get(hostId)!.catalog.values()].slice(0, 128);
+  }
+
+  async attach(hostId: string, sid: string): Promise<void> {
+    const client = await this.connected(hostId);
+    const connection = this.clients.get(hostId)!;
+    if (!connection.catalog.has(sid)) throw new Error("远程终端不存在，请刷新会话列表");
+    connection.sessions.set(sid, { lastSeq: 0 });
+    client.attach(sid);
   }
 
   input(hostId: string, sid: string, dataB64: string): void {
@@ -154,6 +170,13 @@ export class RemoteShellManager {
   }
 
   private trackMessage(connection: RemoteConnection, message: RemoteShellMessage): void {
+    if (message.type === "session.state" || message.type === "session.create.result") {
+      const session = message.session;
+      if (session?.kind === "pty") {
+        if (TERMINAL_SESSION_STATUSES.has(session.status)) connection.catalog.delete(session.id);
+        else connection.catalog.set(session.id, session);
+      }
+    }
     if (message.type === "session.create.result" && message.ok && message.session?.kind === "pty") {
       connection.sessions.set(message.session.id, { lastSeq: 0 });
       return;
@@ -175,6 +198,7 @@ export class RemoteShellManager {
       .then((hello) => {
         if (connection.intentionalClose || this.clients.get(hostId) !== connection) { connection.client.close(); throw new Error("连接已取消"); }
         connection.reconnectAttempt = 0;
+        connection.catalog = new Map(hello.sessions.filter((session) => session.kind === "pty" && !TERMINAL_SESSION_STATUSES.has(session.status)).map((session) => [session.id, session]));
         if (connection.reconnectTimer) {
           clearTimeout(connection.reconnectTimer);
           connection.reconnectTimer = undefined;

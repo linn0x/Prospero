@@ -330,6 +330,8 @@ export type DesktopApi = {
   removeRemoteHost(id: string): Promise<{ ok: boolean }>;
   connectRemoteHost(id: string): Promise<{ name: string; sessions: number }>;
   createRemoteShell(hostId: string, cwd?: string): Promise<string>;
+  listRemoteShells(hostId: string): Promise<SessionInfo[]>;
+  attachRemoteShell(hostId: string, sid: string): Promise<void>;
   sendRemoteShellInput(hostId: string, sid: string, dataB64: string): Promise<void>;
   resizeRemoteShell(hostId: string, sid: string, cols: number, rows: number): Promise<void>;
   killRemoteShell(hostId: string, sid: string): Promise<void>;
