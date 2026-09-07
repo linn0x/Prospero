@@ -40,6 +40,8 @@ interface SessionView {
 }
 
 interface StatusFile {
+  pid: number;
+  port: number;
   sessions: Array<{
     id: string;
     status: string;
@@ -188,6 +190,12 @@ function status(home: string): StatusFile {
   return JSON.parse(readFileSync(path.join(home, "status.json"), "utf8")) as StatusFile;
 }
 
+function currentDaemonStatus(home: string, pid: number | undefined, port: number): boolean {
+  if (!pid || !existsSync(path.join(home, "status.json"))) return false;
+  const current = status(home);
+  return current.pid === pid && current.port === port;
+}
+
 function manifest(home: string, sessionId: string): Manifest {
   const value = JSON.parse(readFileSync(
     path.join(home, "structured-supervisor", sessionId, "manifest.json"),
@@ -329,7 +337,7 @@ async function startDaemon(home: string, port: number, fakeBin: string): Promise
       }
       if (!existsSync(path.join(home, "control.token"))) return false;
       const health = await control(home, port, "GET", "/_prospero/control/health");
-      return health.status === 200;
+      return health.status === 200 && currentDaemonStatus(home, child.pid, port);
     // A complete immutable image includes package assets and platform runtime
     // dependencies; a cold first snapshot can legitimately exceed the normal
     // request/recovery polling window without indicating a failed daemon.
@@ -557,6 +565,18 @@ afterEach(async () => {
 });
 
 describe.sequential("daemon supervisor SIGTERM/SIGKILL full-process recovery", () => {
+  it("does not treat a previous daemon's status file as restored-session readiness", () => {
+    const home = temp("prospero-readiness-status-");
+    expect(currentDaemonStatus(home, 20, 7424)).toBe(false);
+    writeFileSync(path.join(home, "status.json"), JSON.stringify({ pid: 10, port: 7424, sessions: [] }));
+    expect(currentDaemonStatus(home, 20, 7424)).toBe(false);
+    writeFileSync(path.join(home, "status.json"), JSON.stringify({ pid: 20, port: 7423, sessions: [] }));
+    expect(currentDaemonStatus(home, 20, 7424)).toBe(false);
+    writeFileSync(path.join(home, "status.json"), JSON.stringify({ pid: 20, port: 7424, sessions: [] }));
+    expect(currentDaemonStatus(home, 20, 7424)).toBe(true);
+    expect(currentDaemonStatus(home, undefined, 7424)).toBe(false);
+  });
+
   it.skipIf(process.platform === "win32")("launches a new owner from the daemon-start runtime snapshot after dist is overwritten", async () => {
     const home = path.join(temp("prospero-snapshot-home-"), ".prospero");
     const repo = temp("prospero-snapshot-repo-");
