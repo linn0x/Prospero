@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   generateKeyPairB64,
   serverHandshakeAccept,
@@ -146,4 +146,19 @@ describe("RemoteShellClient", () => {
     expect(closed).toBe(1);
     expect(client.isConnected).toBe(false);
   });
+  it("settles a cancelled handshake immediately and never reconnects afterwards", async () => {
+    vi.useFakeTimers();
+    try {
+      const socket = new FakeSocket(generateKeyPairB64());
+      const factory = vi.fn(() => socket);
+      const client = new RemoteShellClient({ id: "h", name: "host", addrs: ["127.0.0.1"], port: 7423, token: "0123456789abcdef", daemonPubKey: "key" }, factory);
+      const connecting = client.connect();
+      const rejected = expect(connecting).rejects.toThrow("连接已取消");
+      client.close(); await rejected;
+      await vi.advanceTimersByTimeAsync(10000);
+      expect(factory).not.toHaveBeenCalled();
+      expect(client.isConnected).toBe(false);
+    } finally { vi.useRealTimers(); }
+  });
+
 });

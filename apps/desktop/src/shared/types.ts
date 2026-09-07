@@ -83,6 +83,7 @@ export type RemoteHostSummary = {
   addrs: string[];
   port: number;
   lastConnectedAt?: number;
+  hasRelay?: boolean;
 };
 
 export type RemoteShellEvent = {
@@ -328,7 +329,7 @@ export type DesktopApi = {
   importRemoteHost(pairingUri: string): Promise<RemoteHostSummary>;
   removeRemoteHost(id: string): Promise<{ ok: boolean }>;
   connectRemoteHost(id: string): Promise<{ name: string; sessions: number }>;
-  createRemoteShell(hostId: string, cwd?: string): Promise<void>;
+  createRemoteShell(hostId: string, cwd?: string): Promise<string>;
   sendRemoteShellInput(hostId: string, sid: string, dataB64: string): Promise<void>;
   resizeRemoteShell(hostId: string, sid: string, cols: number, rows: number): Promise<void>;
   killRemoteShell(hostId: string, sid: string): Promise<void>;
