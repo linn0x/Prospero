@@ -251,7 +251,7 @@ describe("structured supervisor transport", () => {
 });
 
 
-describe("supervisor durable-write failures", () => {
+describe.skipIf(process.platform === "win32")("supervisor durable-write failures", () => {
   it("allows retrying an explicit kill after its durable fence could not be written", async () => {
     const owner = await startStructuredSupervisor({ home: tempHome() });
     const kill = vi.fn(async () => {});

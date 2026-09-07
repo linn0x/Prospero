@@ -472,7 +472,7 @@ function writePrivateFile(target: string, contents: string): void {
   const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
   try {
     writeFileSync(temporary, contents, { mode: 0o600, flag: "wx" });
-    const file = openSync(temporary, "r");
+    const file = openSync(temporary, "r+");
     try { fsyncSync(file); } finally { closeSync(file); }
     renameSync(temporary, target);
     chmodSync(target, 0o600);

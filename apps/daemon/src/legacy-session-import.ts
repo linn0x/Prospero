@@ -176,7 +176,7 @@ export async function migrateLegacySessionFile(
     const after = lstatSync(jsonPath);
     if (original.dev !== after.dev || original.ino !== after.ino || original.size !== after.size || original.mtimeMs !== after.mtimeMs || original.ctimeMs !== after.ctimeMs) throw new Error("Legacy session source changed during import");
     if (options.isSafeToPublish && !options.isSafeToPublish()) return absentResult();
-    const fd = openSync(staging, "r");
+    const fd = openSync(staging, "r+");
     try { fsyncSync(fd); } finally { closeSync(fd); }
     try { linkSync(staging, dbPath); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") return absentResult(); throw error; }

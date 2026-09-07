@@ -67,7 +67,13 @@ function harness(scenario: Scenario = {}) {
       return child as unknown as ChildProcess;
     }
     // Windows passes CLI arguments inside an encoded PowerShell launcher.
-    const command = args.includes("-EncodedCommand") ? Buffer.from(args.at(-1)!, "base64").toString("utf16le") : args.join("\n");
+    let command = args.join("\n");
+    if (args.includes("-EncodedCommand")) {
+      const script = Buffer.from(args.at(-1)!, "base64").toString("utf16le");
+      const payload = script.match(/FromBase64String\('([^']+)'\)/)?.[1];
+      if (!payload) throw new Error("fixture did not receive encoded arguments");
+      command = (JSON.parse(Buffer.from(payload, "base64").toString("utf8")) as string[]).join("\n");
+    }
     const baseUrl = command.match(/base_url="([^"]+)"/)?.[1];
     if (!baseUrl) throw new Error("fixture did not receive a configured gateway");
     let thread: Json;
