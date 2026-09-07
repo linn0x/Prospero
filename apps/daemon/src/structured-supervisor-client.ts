@@ -1276,6 +1276,7 @@ async function migrateDeadOwner(dir: string, manifest: StructuredSupervisorManif
 }
 
 const DEAD_OWNER_MIGRATION_CONCURRENCY = 2;
+const DEAD_OWNER_MIGRATION_START_DELAY_MS = 120_000;
 
 async function drainDeadOwnerMigrations(jobs: Array<() => Promise<void>>): Promise<void> {
   let nextJob = 0;
@@ -1295,7 +1296,10 @@ async function drainDeadOwnerMigrations(jobs: Array<() => Promise<void>>): Promi
 export async function reconnectStructuredSupervisors(
   root: string,
   timeoutMs = SUPERVISOR_RECONNECT_TIMEOUT_MS,
-  options: { isDeleted?: (sessionId: string) => boolean } = {},
+  options: {
+    isDeleted?: (sessionId: string) => boolean;
+    archiveMigrationDelayMs?: number;
+  } = {},
 ): Promise<RemoteStructuredSession[]> {
   if (structuredSupervisorPlatformGate() || !existsSync(root)) return [];
   const entries = readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
@@ -1355,9 +1359,16 @@ export async function reconnectStructuredSupervisors(
     (session): session is RemoteStructuredSession => session !== undefined
   );
   if (deadOwnerMigrations.length > 0) {
-    // Publish the live reconnect result before any archive migration performs
-    // synchronous SQLite open/fsync work. Two jobs then advance in background.
-    setImmediate(() => { void drainDeadOwnerMigrations(deadOwnerMigrations); });
+    // Publish the live reconnect result and let the daemon finish dispatch
+    // reconciliation plus status.json/health publication before any archive
+    // migration performs synchronous SQLite open/fsync work. Two jobs then
+    // advance in background. The timer is not a daemon-lifetime obligation;
+    // interrupted imports retain their source JSON and retry on a later start.
+    const migrationTimer = setTimeout(
+      () => { void drainDeadOwnerMigrations(deadOwnerMigrations); },
+      options.archiveMigrationDelayMs ?? DEAD_OWNER_MIGRATION_START_DELAY_MS,
+    );
+    migrationTimer.unref();
   }
   return restored;
 }
