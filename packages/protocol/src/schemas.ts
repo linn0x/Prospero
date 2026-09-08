@@ -113,6 +113,16 @@ export const AgentAccountStatusSchema = z.enum([
  * Prospero 只同步账号元数据和 CLI 自己报告的登录状态，不在快照中同步 token/key。
  * managed=false 是兼容既有 ~/.codex / ~/.claude 的本机默认环境，不能删除。
  */
+export const ModelSourceBindingSchema = z.object({
+  sourceId: z.string().min(1).max(100),
+  routeId: z.string().min(1).max(100),
+  revision: z.number().int().positive(),
+  sourceName: z.string().max(80),
+  routeName: z.string().max(80),
+  legacy: z.boolean(),
+  current: z.boolean(),
+});
+
 export const AgentAccountSchema = z.object({
   id: z.string().min(1).max(100),
   agent: CodeAgentKindSchema,
@@ -122,6 +132,7 @@ export const AgentAccountSchema = z.object({
   status: AgentAccountStatusSchema,
   /** 已配置的第三方 API；缺省表示官方 CLI 账号环境。 */
   apiProfile: AgentApiProfileSchema.optional(),
+  modelSource: ModelSourceBindingSchema.optional(),
   /** Invalid persisted profiles remain visible and repairable without exposing malformed data. */
   apiProfileError: z.string().max(1000).optional(),
   engine: AgentExecutionEngineSchema.optional(),
@@ -509,6 +520,7 @@ export const AgentApiCatalogModelSchema = z.object({
   label: z.string().max(300).optional(),
   owner: z.string().max(300).optional(),
   description: z.string().max(1000).optional(),
+  modelCapabilities: AgentModelCapabilitiesSchema.optional(),
 });
 
 export const AgentAccountConfigSchema = z.object({
@@ -545,6 +557,78 @@ export const S2CAgentAccountConfigResultSchema = z.object({
   config: AgentAccountConfigSchema.optional(),
   error: AgentAccountFeatureErrorSchema.optional(),
 });
+
+const modelSourceId = z.string().regex(/^[A-Za-z0-9-]{1,100}$/);
+const modelSourceName = z.string().trim().min(1).max(80).regex(/^[^\u0000-\u001f\u007f]+$/);
+const modelSourceRevision = z.number().int().positive();
+export const ModelSourceEndpointSchema = z.object({ protocol: AgentApiProtocolSchema, baseUrl: z.string().trim().url().max(2000) }).strict();
+export const ModelSourceRouteSchema = z.object({
+  id: modelSourceId,
+  name: modelSourceName,
+  model: z.string().trim().min(1).max(300).regex(/^[^\u0000-\u001f\u007f]+$/),
+  protocol: AgentApiProtocolSchema,
+  credentialId: modelSourceId,
+  enabled: z.boolean(),
+  modelCapabilities: AgentModelCapabilitiesSchema.optional(),
+  defaultEffort: AgentReasoningEffortSchema.optional(),
+}).strict();
+export const ModelSourceSchema = z.object({
+  id: modelSourceId,
+  name: modelSourceName,
+  revision: modelSourceRevision,
+  enabled: z.boolean(),
+  endpoints: z.array(ModelSourceEndpointSchema).min(1).max(3),
+  credentials: z.array(z.object({ id: modelSourceId, name: modelSourceName, revision: modelSourceRevision })).max(32),
+  routes: z.array(ModelSourceRouteSchema).max(500),
+  defaultRouteId: modelSourceId.optional(),
+  createdAt: z.number().int().nonnegative(),
+  updatedAt: z.number().int().nonnegative(),
+});
+export const ModelSourceMigrationSchema = z.object({
+  id: modelSourceId,
+  name: modelSourceName,
+  protocol: AgentApiProtocolSchema,
+  baseUrl: z.string().max(2000),
+  credentialCount: z.number().int().positive(),
+  accounts: z.array(z.object({ id: modelSourceId, name: modelSourceName, model: z.string().max(300) })).min(1).max(500),
+});
+const modelSourceWrite = { sourceId: modelSourceId, revision: modelSourceRevision };
+export const ModelSourceActionSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("list") }).strict(),
+  z.object({ kind: z.literal("create"), operationId: modelSourceId.optional(), name: modelSourceName, endpoints: z.array(ModelSourceEndpointSchema).min(1).max(3), credential: z.object({ name: modelSourceName, apiKey: z.string().trim().min(1).max(8192) }).strict(), routes: z.array(ModelSourceRouteSchema.omit({ id: true, credentialId: true })).max(100).optional() }).strict(),
+  z.object({ kind: z.literal("update"), ...modelSourceWrite, name: modelSourceName.optional(), enabled: z.boolean().optional(), endpoints: z.array(ModelSourceEndpointSchema).min(1).max(3).optional(), defaultRouteId: modelSourceId.optional() }).strict(),
+  z.object({ kind: z.literal("credential.set"), ...modelSourceWrite, credentialId: modelSourceId.optional(), name: modelSourceName, apiKey: z.string().trim().min(1).max(8192).optional() }).strict(),
+  z.object({ kind: z.literal("credential.remove"), ...modelSourceWrite, credentialId: modelSourceId }).strict(),
+  z.object({ kind: z.literal("routes.set"), ...modelSourceWrite, routes: z.array(ModelSourceRouteSchema.omit({ id: true }).extend({ id: modelSourceId.optional() })).min(1).max(100) }).strict(),
+  z.object({ kind: z.literal("route.remove"), ...modelSourceWrite, routeId: modelSourceId }).strict(),
+  z.object({ kind: z.literal("delete"), ...modelSourceWrite }).strict(),
+  z.object({ kind: z.literal("models"), ...modelSourceWrite, protocol: AgentApiProtocolSchema, credentialId: modelSourceId }).strict(),
+  z.object({ kind: z.literal("bind"), ...modelSourceWrite, routeId: modelSourceId }).strict(),
+  z.object({ kind: z.literal("migration.preview") }).strict(),
+  z.object({ kind: z.literal("migration.apply"), migrationId: modelSourceId, name: modelSourceName, target: z.object(modelSourceWrite).strict().optional() }).strict(),
+  z.object({ kind: z.literal("migration.rollback"), accountIds: z.array(modelSourceId).min(1).max(500) }).strict(),
+]);
+export const C2SModelSourceActionSchema = z.object({ type: z.literal("model.source.action"), requestId: modelSourceId, action: ModelSourceActionSchema }).strict();
+export const S2CModelSourceResultSchema = z.object({
+  type: z.literal("model.source.result"),
+  requestId: modelSourceId,
+  ok: z.boolean(),
+  sources: z.array(ModelSourceSchema).max(100).optional(),
+  models: z.array(AgentApiCatalogModelSchema).max(1000).optional(),
+  migrations: z.array(ModelSourceMigrationSchema).max(500).optional(),
+  skippedAccounts: z.number().int().nonnegative().optional(),
+  accountId: modelSourceId.optional(),
+  accounts: z.array(AgentAccountSchema).optional(),
+  error: AgentAccountFeatureErrorSchema.optional(),
+});
+
+export type ModelSource = z.infer<typeof ModelSourceSchema>;
+export type ModelSourceRoute = z.infer<typeof ModelSourceRouteSchema>;
+export type ModelSourceAction = z.infer<typeof ModelSourceActionSchema>;
+export type ModelSourceBinding = z.infer<typeof ModelSourceBindingSchema>;
+export type ModelSourceMigration = z.infer<typeof ModelSourceMigrationSchema>;
+export type C2SModelSourceAction = z.infer<typeof C2SModelSourceActionSchema>;
+export type S2CModelSourceResult = z.infer<typeof S2CModelSourceResultSchema>;
 
 export const C2SAgentAccountRenameSchema = z.object({
   type: z.literal("agent.account.rename"),
@@ -1232,6 +1316,7 @@ export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SAgentAccountApiModelsGetSchema,
   C2SAgentAccountConfigGetSchema,
   C2SAgentAccountConfigSetSchema,
+  C2SModelSourceActionSchema,
   C2SAgentAccountRenameSchema,
   C2SAgentAccountSetDefaultSchema,
   C2SAgentAccountLoginSchema,
@@ -1921,6 +2006,7 @@ export const S2CMessageSchema = z.discriminatedUnion("type", [
   S2CAgentAccountsResultSchema,
   S2CAgentAccountApiModelsResultSchema,
   S2CAgentAccountConfigResultSchema,
+  S2CModelSourceResultSchema,
   S2CFsListingSchema,
   S2CFsContentSchema,
   S2CFsWrittenSchema,

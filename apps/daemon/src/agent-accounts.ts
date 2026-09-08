@@ -41,14 +41,19 @@ import type {
   AgentReasoningEffort,
   C2SAgentAccountApiModelsGet,
   C2SAgentAccountConfigSet,
+  ModelSourceAction,
+  ModelSourceBinding,
+  ModelSourceMigration,
+  S2CModelSourceResult,
 } from "@prospero/protocol";
-import { AgentApiEngineValidationSchema, AgentApiValidationSchema, AgentModelCapabilitiesSchema, getAgentAccountCapabilities, getAgentAccountEngine } from "@prospero/protocol";
+import { AgentApiEngineValidationSchema, AgentApiValidationSchema, AgentModelCapabilitiesSchema, ModelSourceBindingSchema, getAgentAccountCapabilities, getAgentAccountEngine } from "@prospero/protocol";
 import { programCommandFor } from "./agents.js";
 import { claudeModelCapabilityEnvironment, codexModelCapabilityArgs, getModelCapabilitySupport } from "./api-profile-capabilities.js";
 import { fetchApiModels, type ApiModelCatalogOptions } from "./agent-api-models.js";
 import { getAccountConfig, readAccountOverrides, saveAccountConfig, supportedAccountEfforts, type AccountConfigTarget } from "./agent-account-config.js";
 import { AgentAccountFeatureError } from "./agent-account-feature-error.js";
 import type { AgentModelCatalog } from "./adapters/types.js";
+import { ModelSources, type SourceMigrationEntry } from "./model-sources.js";
 
 const execFile = promisify(execFileCallback);
 const LEGACY_MACOS_KEYCHAIN_SERVICE = "com.prospero.code-agent.claude";
@@ -66,6 +71,7 @@ interface StoredAccount {
   name: string;
   /** 非敏感的第三方 API 连接信息；key 单独存账号目录的私有文件。 */
   apiProfile?: StoredApiProfile;
+  modelSource?: ModelSourceBinding;
   /** Present only when apiProfile was explicitly saved but failed validation. Never sent to clients. */
   invalidApiProfile?: { raw: unknown };
   apiValidation?: AgentApiValidation;
@@ -95,11 +101,13 @@ export interface AccountBinding {
   agent: CodeAgentKind;
   name: string;
   managed: boolean;
+  sourceAllowsNewSessions?: boolean;
   defaultModel?: string;
   defaultEffort?: AgentReasoningEffort;
   environment: Record<string, string>;
   /** 已配置的 API Profile，不含 secret，供状态与会话启动区分。 */
   apiProfile?: AgentApiProfile;
+  modelSource?: ModelSourceBinding;
   engine?: AgentExecutionEngine;
   capabilities?: AgentAccountCapabilities;
   modelCapabilitySupport?: AgentModelCapabilitySupport;
@@ -237,6 +245,7 @@ function parseStore(value: unknown): AccountStore {
           agent: account["agent"],
           name: account["name"].trim().slice(0, 80),
           ...(apiProfile ? { apiProfile } : {}),
+          ...(account["modelSource"] !== undefined ? { modelSource: ModelSourceBindingSchema.parse(account["modelSource"]) } : {}),
           ...(hasApiProfile && !apiProfile ? { invalidApiProfile: { raw: account["apiProfile"] } } : {}),
           ...(apiProfile && validation.success && typeof account["apiValidationRevision"] === "string"
             ? { apiValidation: validation.data, apiValidationRevision: account["apiValidationRevision"] } : {}),
@@ -724,6 +733,8 @@ export class AgentAccountManager {
   private readonly runtimeVersions = new Map<string, { expiresAt: number; result: Promise<boolean> }>();
   private readonly pendingCredentials = new Map<string, AgentAccountCredential | null>();
   private store: AccountStore;
+  readonly modelSources: ModelSources;
+  private readonly sourceMigrations = new Map<string, { at: number; accounts: Array<{ id: string; revision: string }>; preview: ModelSourceMigration }>();
 
   constructor(
     private readonly home: string,
@@ -734,6 +745,7 @@ export class AgentAccountManager {
     this.storeFile = path.join(home, "agent-accounts.json");
     this.journalFile = path.join(home, ".agent-accounts-transaction.json");
     this.rootsDir = path.join(home, "agent-accounts");
+    this.modelSources = new ModelSources(home, (protocol, baseUrl, model, capabilities) => cleanApiProfile(protocol === "anthropic" ? "claude" : "codex", baseUrl, model, protocol === "anthropic" ? "anthropic_compatible" : "openai_compatible", protocol, capabilities));
     mkdirSync(this.rootsDir, { recursive: true, mode: 0o700 });
     chmodSync(this.rootsDir, 0o700);
     this.store = this.load();
@@ -844,8 +856,10 @@ export class AgentAccountManager {
       : undefined;
     const configTarget = this.configurationTarget(account);
     const overrides = readAccountOverrides(configTarget);
-    const defaultEffort = overrides.default_effort && (!apiProfile || supportedAccountEfforts(configTarget, overrides).includes(overrides.default_effort))
-      ? overrides.default_effort : undefined;
+    const sourceBinding = this.sourceBinding(account);
+    const requestedEffort = overrides.default_effort ?? sourceBinding?.defaultEffort;
+    const defaultEffort = requestedEffort && (!apiProfile || supportedAccountEfforts(configTarget, overrides).includes(requestedEffort))
+      ? requestedEffort : undefined;
     const defaultModel = apiProfile?.model ?? overrides.default_model;
     const environment = apiProfile
       ? apiProfile.protocol === "openai_chat_completions" && account.apiProfile
@@ -927,6 +941,7 @@ export class AgentAccountManager {
       ...(defaultModel ? { defaultModel } : {}),
       ...(defaultEffort ? { defaultEffort } : {}),
       ...(apiProfile ? { apiProfile } : {}),
+      ...(sourceBinding ? { modelSource: this.modelSources.publicBinding(account.id)!, sourceAllowsNewSessions: this.modelSources.allowsNewSessions(sourceBinding) } : {}),
       engine: getAgentAccountEngine({ agent: account.agent, apiProfile }),
       capabilities: getAgentAccountCapabilities({ agent: account.agent, apiProfile }),
       ...(apiProfile ? { modelCapabilitySupport: getModelCapabilitySupport(apiProfile) } : {}),
@@ -958,6 +973,83 @@ export class AgentAccountManager {
     return fetchApiModels({ protocol: input.protocol, baseUrl: input.baseUrl, apiKey: input.apiKey }, options);
   }
 
+  async modelSourceAction(action: ModelSourceAction): Promise<Omit<S2CModelSourceResult, "type" | "requestId" | "ok" | "accounts">> {
+    await this.ready();
+    if (action.kind === "list") return { sources: this.modelSources.list() };
+    if (action.kind === "models") return { models: await this.modelSources.models(action) };
+    return this.serializeMutation(async () => {
+      const knownAccounts = new Set(this.store.accounts.map(account => account.id));
+      if (action.kind === "migration.preview") return this.previewSourceMigrations();
+      if (action.kind === "migration.apply") {
+        const plan = this.sourceMigrations.get(action.migrationId);
+        if (!plan || Date.now() - plan.at > 300_000) throw new AgentAccountFeatureError("conflict", "迁移预览已过期，请重新预览 / Migration preview expired; preview again");
+        const entries: SourceMigrationEntry[] = plan.accounts.map(({ id, revision }) => {
+          const account = this.requireManaged(id);
+          if (!account.apiProfile || this.modelSources.binding(id) || this.captureApiValidationRevision(id) !== revision) throw new AgentAccountFeatureError("conflict", "Profile 已修改，请重新预览 / Profile changed; preview again");
+          const credential = this.readCredential(id, this.rootFor(account.agent, id));
+          if (credential?.kind !== "api_key") throw new AgentAccountFeatureError("authentication", "Profile 的凭据不可用 / Profile credential is unavailable");
+          const binding = this.resolve(id);
+          return { accountId: id, name: account.name, profile: account.apiProfile, secret: credential.secret, ...(binding.defaultEffort ? { defaultEffort: binding.defaultEffort } : {}) };
+        });
+        this.modelSources.migrate(action.name, entries, action.target);
+        this.sourceMigrations.delete(action.migrationId);
+      } else if (action.kind === "migration.rollback") {
+        for (const id of action.accountIds) {
+          const account = this.requireManaged(id);
+          const binding = this.modelSources.binding(id);
+          if (!binding?.legacy || !account.apiProfile) throw new AgentAccountFeatureError("invalid_request", "只能还原迁移前的独立 Profile / Only migrated profiles can be restored");
+          const credential = this.credentialStore.readStrict ? this.credentialStore.readStrict(id, this.rootFor(account.agent, id)) : this.credentialStore.read(id, this.rootFor(account.agent, id));
+          if (credential?.kind !== "api_key" || credential.secret !== this.modelSources.bindingCredential(id) || canonical(account.apiProfile) !== canonical(binding.profile)) throw new AgentAccountFeatureError("conflict", "原 Profile 或凭据已修改，未执行还原 / Original profile or credential changed; restore was not applied");
+        }
+        this.modelSources.unbind(action.accountIds);
+        for (const id of action.accountIds) this.credentialCache.delete(id);
+      } else if (action.kind === "bind") {
+        const { source, route, profile } = this.modelSources.route(action.sourceId, action.routeId, action.revision);
+        if (profile.modelCapabilities?.tools === false) throw new AgentAccountFeatureError("unsupported", "此模型未启用 Agent 所需的工具调用 / This model does not enable agent tool calls");
+        const existing = this.modelSources.currentBinding(action.sourceId, action.routeId, action.revision, knownAccounts);
+        if (existing) return { accountId: existing.accountId };
+        const id = randomUUID();
+        this.modelSources.bind(id, source.id, route.id, source.revision);
+        const now = Date.now();
+        const account: StoredAccount = { id, agent: profile.protocol === "anthropic" ? "claude" : "codex", name: `${source.name} / ${route.name}`.slice(0, 80), apiProfile: profile, modelSource: this.modelSources.publicBinding(id)!, createdAt: now, updatedAt: now };
+        const next = structuredClone(this.store);
+        next.accounts.push(account);
+        try { this.commitMetadata(next); }
+        catch (error) { this.modelSources.unbind([id]); throw error; }
+        return { accountId: id };
+      } else if (action.kind === "create") this.modelSources.create(action);
+      else this.modelSources.change(action, knownAccounts);
+      return { sources: this.modelSources.list() };
+    });
+  }
+
+  private previewSourceMigrations(): { migrations: ModelSourceMigration[]; skippedAccounts: number } {
+    this.sourceMigrations.clear();
+    const groups = new Map<string, Array<{ account: StoredAccount; secret: string; revision: string }>>();
+    let skippedAccounts = 0;
+    for (const account of this.store.accounts) {
+      if (!account.apiProfile || this.modelSources.binding(account.id)) continue;
+      try {
+        const credential = this.readCredential(account.id, this.rootFor(account.agent, account.id));
+        if (credential?.kind !== "api_key") { skippedAccounts++; continue; }
+        const key = JSON.stringify([account.apiProfile.protocol, account.apiProfile.baseUrl]);
+        const group = groups.get(key) ?? [];
+        group.push({ account, secret: credential.secret, revision: this.captureApiValidationRevision(account.id) });
+        groups.set(key, group);
+      } catch { skippedAccounts++; }
+    }
+    const migrations: ModelSourceMigration[] = [];
+    for (const group of groups.values()) {
+      if (group.length > 500 || migrations.length >= 100) { skippedAccounts += group.length; continue; }
+      const profile = group[0]!.account.apiProfile!;
+      const preview: ModelSourceMigration = { id: randomUUID(), name: new URL(profile.baseUrl).host.slice(0, 80), baseUrl: profile.baseUrl, protocol: profile.protocol, credentialCount: new Set(group.map(item => item.secret)).size,
+        accounts: group.map(item => ({ id: item.account.id, name: item.account.name, model: item.account.apiProfile!.model })) };
+      this.sourceMigrations.set(preview.id, { at: Date.now(), preview, accounts: group.map(item => ({ id: item.account.id, revision: item.revision })) });
+      migrations.push(preview);
+    }
+    return { migrations, skippedAccounts };
+  }
+
   private configurationTarget(account: StoredAccount): AccountConfigTarget {
     if (account.invalidApiProfile) throw new AgentAccountFeatureError("invalid_config", "请先修复 API Profile 连接配置");
     return { rootsDir: this.rootsDir, agent: account.agent, accountId: account.id,
@@ -972,7 +1064,11 @@ export class AgentAccountManager {
   }
 
   async setConfig(input: Omit<C2SAgentAccountConfigSet, "type" | "requestId">, sessions: SessionInfo[] = [], catalog?: AgentModelCatalog): Promise<AgentAccountConfig> {
-    return this.serializeMutation(async () => saveAccountConfig(this.configurationTarget(this.requireManaged(input.accountId)), input, activeCount(sessions, input.accountId), catalog));
+    return this.serializeMutation(async () => {
+      const account = this.requireManaged(input.accountId);
+      if (this.sourceBinding(account)) throw new AgentAccountFeatureError("forbidden", "请在模型源中编辑模型默认参数 / Edit model defaults in the model source");
+      return saveAccountConfig(this.configurationTarget(account), input, activeCount(sessions, input.accountId), catalog);
+    });
   }
 
   /**
@@ -1083,6 +1179,7 @@ export class AgentAccountManager {
     const apiKey = input.apiKey?.trim() ?? "";
     const updatesCredential = apiKey.length > 0;
     const connectionChanged = JSON.stringify(profile) !== JSON.stringify(account.apiProfile);
+    if (this.sourceBinding(account) && (updatesCredential || connectionChanged)) throw new AgentAccountError("请在模型源中编辑连接；旧会话绑定不会改写", "account_in_use");
     if (
       (inUse || this.options.accountInUse?.(accountId) || activeCount(sessions, accountId) > 0) &&
       (updatesCredential || connectionChanged)
@@ -1129,6 +1226,7 @@ export class AgentAccountManager {
 
   private async setCredentialUnlocked(accountId: string, kind: AgentCredentialKind, rawSecret: string, sessions: SessionInfo[], inUse: boolean): Promise<void> {
     const account = structuredClone(this.requireManaged(accountId));
+    if (this.sourceBinding(account)) throw new AgentAccountError("请在模型源中更新共享凭据", "account_in_use");
     if (account.invalidApiProfile) {
       throw new AgentAccountError("API Profile 配置损坏，请先修复连接配置", "account_invalid");
     }
@@ -1190,6 +1288,7 @@ export class AgentAccountManager {
 
   private async logoutUnlocked(accountId: string, sessions: SessionInfo[] = [], inUse = false): Promise<void> {
     const binding = this.resolve(accountId);
+    if (binding.modelSource) throw new AgentAccountError("请在模型源中管理共享凭据", "account_in_use");
     if (binding.apiProfile && (inUse || this.options.accountInUse?.(accountId) || activeCount(sessions, accountId) > 0)) {
       throw new AgentAccountError("这个 Profile 仍有活动会话，不能移除 API Key", "account_in_use");
     }
@@ -1286,6 +1385,7 @@ export class AgentAccountManager {
         return {
           ...base,
           ...(binding.apiProfile ? { apiProfile: binding.apiProfile } : {}),
+          ...(binding.modelSource ? { modelSource: binding.modelSource } : {}),
           engine: getAgentAccountEngine(binding),
           capabilities: getAgentAccountCapabilities(binding),
           ...(apiValidation ? { apiValidation } : {}),
@@ -1453,8 +1553,23 @@ export class AgentAccountManager {
     return credential;
   }
 
+  private sourceBinding(account: StoredAccount) {
+    if (!account.apiProfile || !account.modelSource && !this.modelSources.isBound(account.id)) return undefined;
+    const binding = this.modelSources.binding(account.id);
+    if (!binding) throw new AgentAccountError("模型源绑定缺失，已停止连接", "account_invalid");
+    return binding;
+  }
+
   private readCredential(accountId: string, root: string): AgentAccountCredential | null {
     try {
+      const account = this.store.accounts.find(item => item.id === accountId);
+      if (account?.apiProfile) {
+        const binding = this.sourceBinding(account);
+        if (binding) {
+          if (canonical(binding.profile) !== canonical(account.apiProfile)) throw new AgentAccountError("模型源绑定与账号不一致", "account_invalid");
+          return { kind: "api_key", secret: this.modelSources.bindingCredential(accountId)! };
+        }
+      }
       const credential = this.credentialStore.readStrict
         ? this.credentialStore.readStrict(accountId, root)
         : this.credentialStore.read(accountId, root);
