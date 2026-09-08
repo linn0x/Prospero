@@ -14,7 +14,7 @@ export function installLiquidGlass(root: Document = document): () => void {
   let frame: number | null = null;
   let disposed = false;
 
-  const disabled = (): boolean => disposed || root.hidden || mediaPreferences.some((preference) => preference.matches)
+  const disabled = (): boolean => disposed || root.hidden || root.documentElement.dataset.platform !== 'darwin' || root.documentElement.dataset.nativeGlass !== 'true' || mediaPreferences.some((preference) => preference.matches)
     || root.documentElement.dataset.reducedTransparency === 'true'
     || root.documentElement.dataset.highContrast === 'true';
 
@@ -87,7 +87,7 @@ export function installLiquidGlass(root: Document = document): () => void {
   const preferences = new view.MutationObserver(preferencesChanged);
   preferences.observe(root.documentElement, {
     attributes: true,
-    attributeFilter: ['data-reduced-transparency', 'data-high-contrast'],
+    attributeFilter: ['data-platform', 'data-native-glass', 'data-reduced-transparency', 'data-high-contrast'],
   });
   root.addEventListener('pointermove', move, { passive: true });
   root.addEventListener('pointerout', leave, { passive: true });

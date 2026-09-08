@@ -1,11 +1,12 @@
 import { useEffect, useImperativeHandle, useRef, useState, type Ref } from "react";
+import { terminalFontFamilyWithFallbacks, TERMINAL_LINE_HEIGHT } from "../../../shared/terminal-typography";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import type { DesktopSettings } from "../../../shared/types";
 import { DesktopIcon } from "../design-system/icons";
 import { useLocale } from "../locale";
-import { displayError } from "../state";
+import { reportError } from "../state";
 import { RemoteTerminalBuffer, remoteInputBase64, remoteTerminalTheme } from "./remote-terminal-state";
 import "./remote-workspaces.css";
 
@@ -37,8 +38,8 @@ export function RemoteTerminal({ hostId, sid, connected, settings, label, contro
     const ownerId = crypto.randomUUID();
     const motion = window.matchMedia("(prefers-reduced-motion: reduce)");
     const term = new Terminal({ cols: 120, rows: 36, scrollback: 3000, disableStdin: true,
-      fontSize: settingsRef.current.terminalFontSize, fontFamily: settingsRef.current.terminalFontFamily,
-      cursorBlink: !motion.matches, cursorStyle: "bar", lineHeight: 1.16, minimumContrastRatio: 4.5,
+      fontSize: settingsRef.current.terminalFontSize, fontFamily: terminalFontFamilyWithFallbacks(settingsRef.current.terminalFontFamily),
+      cursorBlink: !motion.matches, cursorStyle: "bar", lineHeight: TERMINAL_LINE_HEIGHT, letterSpacing: 0, fontWeight: "400", fontWeightBold: "700", minimumContrastRatio: 4.5,
       theme: remoteTerminalTheme(getComputedStyle(document.documentElement)) });
     terminal.current = term;
     const fit = new FitAddon();
@@ -53,7 +54,7 @@ export function RemoteTerminal({ hostId, sid, connected, settings, label, contro
     let inputQueue = Promise.resolve();
     const canInput = () => !disposed && attached && connectedRef.current;
     const updateInput = () => { term.options.disableStdin = !canInput(); };
-    const fail = (reason: unknown) => { if (!disposed) setError(displayError(reason)); };
+    const fail = (reason: unknown) => { if (!disposed) setError(reportError(reason)); };
     const fitTerminal = () => {
       clearTimeout(resizeTimer);
       resizeTimer = setTimeout(() => {
@@ -146,7 +147,7 @@ export function RemoteTerminal({ hostId, sid, connected, settings, label, contro
   useEffect(() => { updateInputRef.current?.(); }, [connected]);
   useEffect(() => {
     if (!terminal.current) return;
-    terminal.current.options.fontFamily = settings.terminalFontFamily;
+    terminal.current.options.fontFamily = terminalFontFamilyWithFallbacks(settings.terminalFontFamily);
     terminal.current.options.fontSize = settings.terminalFontSize;
     terminal.current.options.theme = remoteTerminalTheme(getComputedStyle(document.documentElement));
     refit.current?.();

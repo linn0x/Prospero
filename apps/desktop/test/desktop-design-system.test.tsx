@@ -44,7 +44,7 @@ describe("desktop design tokens", () => {
     expect(styles).toContain(':root:is([data-reduced-transparency="true"], [data-high-contrast="true"]) :is(body, .prospero-shell, .prospero-main) { background: var(--bg); }');
     expect(styles).toContain(':root[data-native-glass] :is(body, .prospero-shell, .prospero-main) { background: var(--bg); }');
     expect(styles.match(/--overview-card-fill: var\(--card\)/g)).toHaveLength(2);
-    expect(styles.match(/--glass-filter: none/g)).toHaveLength(2);
+    expect(styles.match(/--glass-filter: none/g)).toHaveLength(3);
   });
 
   it("anchors each glass panel's decorative border to the panel instead of the whole workspace", () => {

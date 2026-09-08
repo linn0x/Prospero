@@ -37,7 +37,7 @@ function fixture() {
   const root = Object.assign(new EventTarget(), {
     defaultView: view,
     hidden: false,
-    documentElement: { dataset: {} as Record<string, string> },
+    documentElement: { dataset: { platform: "darwin", nativeGlass: "true" } as Record<string, string> },
     contains: (element: Surface) => surfaces.has(element),
   });
   const addSurface = (parent: Surface | null = null) => {
@@ -67,6 +67,12 @@ function fixture() {
 }
 
 describe('liquid glass pointer lifecycle', () => {
+  it.each(['win32', 'linux'])('does not animate native glass on %s', (platform) => {
+    const f = fixture(); f.root.documentElement.dataset.platform = platform;
+    const target = f.addSurface(); const cleanup = f.install();
+    f.pointer('pointermove', target); f.flush();
+    expect(f.callbacks.size).toBe(0); expect(target.values.size).toBe(0); cleanup();
+  });
   it('delegates through child elements and coalesces movement into the latest local coordinates', () => {
     const f = fixture();
     const target = f.addSurface();

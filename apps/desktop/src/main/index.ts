@@ -1,3 +1,5 @@
+import { windowMenuRequest } from "../shared/window-menu";
+import { popupWindowMenu } from "./window-menu";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -215,9 +217,9 @@ function applyTheme(settings: DesktopSettings): void {
     // 界面上只会看到一条没头没尾的报错。
     if (process.platform !== "darwin") {
       mainWindow.setTitleBarOverlay({
-        color: dark ? "#161619" : "#f8f8f9",
+        color: dark ? "#111a29" : "#fbfdff",
         symbolColor: dark ? "#eeeef0" : "#202024",
-        height: 42,
+        height: 44,
       });
     }
     if (process.platform === "darwin") mainWindow.setVibrancy(appearance.nativeGlass ? "sidebar" : null);
@@ -276,7 +278,7 @@ function createWindow(): BrowserWindow {
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "hidden",
     ...(process.platform === "darwin"
       ? { trafficLightPosition: { x: 14, y: 16 } }
-      : { titleBarOverlay: { color: dark ? "#161619" : "#f8f8f9", symbolColor: dark ? "#eeeef0" : "#202024", height: 42 } }),
+      : { titleBarOverlay: { color: dark ? "#111a29" : "#fbfdff", symbolColor: dark ? "#eeeef0" : "#202024", height: 44 } }),
     webPreferences: {
       preload: resolve(__dirname, "../preload/index.js"),
       contextIsolation: true,
@@ -289,7 +291,10 @@ function createWindow(): BrowserWindow {
   });
 
   window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
-  if (SMOKE_TEST) window.webContents.on("console-message", (details) => process.stderr.write(`[renderer:${details.level}] ${details.message}\n`));
+  if (SMOKE_TEST) {
+    window.setOpacity(0);
+    window.webContents.on("console-message", (details) => process.stderr.write(`[renderer:${details.level}] ${details.message}\n`));
+  }
   window.webContents.on("will-navigate", (event) => event.preventDefault());
   window.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
   window.webContents.session.setPermissionCheckHandler(() => false);
@@ -377,7 +382,7 @@ async function refreshAccounts(): Promise<void> {
 }
 
 function installApplicationMenu(): void {
-  if (process.platform !== "darwin") return;
+  if (process.platform !== "darwin") { Menu.setApplicationMenu(null); return; }
   const template: MenuItemConstructorOptions[] = [
     {
       label: app.name,
@@ -734,6 +739,13 @@ async function runDesktopSelfCheck(window: BrowserWindow): Promise<void> {
 }
 
 function installIpc(): void {
+  ipcMain.handle("window:menu", (event, raw: unknown) => {
+    const window = BrowserWindow.fromWebContents(event.sender);
+    if (!window || window !== mainWindow || event.senderFrame !== event.sender.mainFrame) throw new Error("无效的窗口");
+    const request = windowMenuRequest(raw);
+    const zoom = event.sender.getZoomFactor();
+    return popupWindowMenu(window, { ...request, x: Math.round(request.x * zoom), y: Math.round(request.y * zoom) });
+  });
   ipcMain.handle("appearance:get", () => windowAppearance(process.platform, nativeTheme));
   ipcMain.handle("snapshot:get", () => store.snapshot());
   ipcMain.handle("remote-host:list", () => remoteHostStore.list());

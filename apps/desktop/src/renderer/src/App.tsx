@@ -1,3 +1,6 @@
+import { WindowsTitlebar } from "./app-shell/WindowsTitlebar";
+import { notify } from "./notifications/notifications";
+import { useNavigationHistory } from "./app-shell/use-navigation-history";
 import {
   Fragment,
   lazy,
@@ -69,7 +72,7 @@ import {
   loadAccountUsage,
   prefetchAccountUsage,
 } from "./account-usage-cache";
-import { displayError, shortPath, text } from "./state";
+import { reportError, shortPath, text } from "./state";
 import { installLiquidGlass } from "./liquid-glass";
 import { useLocale, type Language } from "./locale";
 import {
@@ -205,13 +208,14 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar";
 import { Spinner } from "@/components/ui/spinner";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import "./styles.css";
 import "./workspace/workspace.css";
 import { WorkspacePane } from "./workspace/WorkspacePane";
 import { WorkspaceTabs } from "./app-shell/WorkspaceTabs";
-import { AddWorkspaceDialog } from "./remote-workspaces/AddWorkspaceDialog";
+import { WorkspacePicker } from "./remote-workspaces/AddWorkspaceDialog";
 import { RemoteWorkspaceList } from "./remote-workspaces/RemoteWorkspaceList";
 import { useRemoteWorkspaces } from "./remote-workspaces/use-remote-workspaces";
 import { SourceSelector } from "./model-sources/SourceSelector";
@@ -451,10 +455,10 @@ const PinnedSessionRow = memo(function PinnedSessionRow({
       >
         <SessionAgentIcon agent={session.agent} />
         <span className="flex min-w-0 flex-col gap-0.5">
-          <span className="truncate text-xs font-medium">
+          <span className="truncate text-sm font-medium">
             {sessionLabel(session)}
           </span>
-          <span className="truncate text-[10px] font-normal text-sidebar-foreground/45">
+          <span className="truncate text-xs font-normal text-muted-foreground">
             {session.agent} · {" "}
             {attention ? t("需要输入", "Needs input") : status(session.status)} · {" "}
             {relativeTime(session.createdAt, language)}
@@ -718,7 +722,7 @@ function DaemonAgentsCard({
                   <strong className="truncate capitalize">{agent}</strong>
                   <Badge variant="outline">{sessions.length}</Badge>
                 </div>
-                <span className="truncate text-[10px] text-muted-foreground">
+                <span className="truncate text-xs text-muted-foreground">
                   {status(sessions[0]?.status ?? "running")} · {remaining !== undefined
                     ? t(`${String(remaining)}% 可用`, `${String(remaining)}% available`)
                     : loading
@@ -1500,15 +1504,17 @@ function ShellSidebar({
       mobileTitle={t("侧边栏", "Sidebar")}
       mobileDescription={t("主导航、工作区与会话", "Main navigation, workspaces, and sessions")}
     >
-      <SidebarHeader className="sidebar-shell-header">
+      {(isMac || focus) && <SidebarHeader className="sidebar-shell-header">
+        {isMac && <>
         <Button className="sidebar-new-session" variant="ghost" size="icon-sm" aria-label={t("新建会话", "New session")} title={t("新建会话", "New session")} onClick={() => newSession()}><Plus /></Button>
         <SidebarTrigger
           className="sidebar-header-toggle"
           aria-label={open || isMobile ? t("收起侧边栏", "Collapse sidebar") : t("展开侧边栏", "Expand sidebar")}
           title={open || isMobile ? t("收起侧边栏", "Collapse sidebar") : t("展开侧边栏", "Expand sidebar")}
         />
+        </>}
         {focus && <Button className="sidebar-exit-focus" variant="ghost" size="icon-sm" aria-label={t("退出专注", "Exit focus")} title={t("退出专注", "Exit focus")} onClick={onExitFocus}><Minimize2 /></Button>}
-      </SidebarHeader>
+      </SidebarHeader>}
       <SidebarContent className="sidebar-content-shell">
         <nav className="sidebar-nav-fixed" aria-label={t("主导航", "Main navigation")}>
           <SidebarGroup>
@@ -2402,7 +2408,7 @@ function InboxPane({
       await window.prospero.resolveGate(gateId, decision);
       setGateDecisions((current) => ({ ...current, [gateId]: "" }));
     } catch (reason) {
-      setGateErrors((current) => ({ ...current, [gateId]: displayError(reason) }));
+      setGateErrors((current) => ({ ...current, [gateId]: reportError(reason) }));
     } finally {
       gateSubmissionRef.current.delete(gateId);
       setGateSubmissions((current) => {
@@ -2427,7 +2433,7 @@ function InboxPane({
         taskId,
       });
     } catch (reason) {
-      setTaskErrors((current) => ({ ...current, [taskId]: displayError(reason) }));
+      setTaskErrors((current) => ({ ...current, [taskId]: reportError(reason) }));
     } finally {
       taskSubmissionRef.current.delete(taskId);
       setTaskSubmissions((current) => {
@@ -2892,7 +2898,7 @@ function ProjectRenameDialog({
       await window.prospero.renameProject(project, name);
       onOpenChange(false);
     } catch (reason) {
-      setError(displayError(reason));
+      setError(reportError(reason));
     } finally {
       busyRef.current = false;
       setBusy(false);
@@ -2982,7 +2988,7 @@ function SessionRenameDialog({
       await window.prospero.renameSession(session.id, name);
       onOpenChange(false);
     } catch (reason) {
-      setError(displayError(reason));
+      setError(reportError(reason));
     } finally {
       busyRef.current = false;
       setBusy(false);
@@ -3051,7 +3057,9 @@ function NewSessionDialog({
   onRemoteWorkspace,
   onManageHosts,
   initialSource,
+  initialTab,
 }: {
+  initialTab: "session" | "workspace";
   snapshot: DesktopSnapshot;
   project: string | undefined;
   open: boolean;
@@ -3063,6 +3071,7 @@ function NewSessionDialog({
   initialSource: SourceSelection | undefined;
 }) {
   const { t, status } = useLocale();
+  const [tab, setTab] = useState(initialTab);
   const independentAccounts = useMemo(() => snapshot.accounts.filter(account => !account.modelSource), [snapshot.accounts]);
   const sourceSupported = snapshot.daemon.running && snapshot.daemon.capabilities?.includes("model.sources.v1") === true && typeof window.prospero.modelSourceAction === "function";
   const [useSource, setUseSource] = useState(() => sourceSupported && Boolean(initialSource || rememberedSourceSelection()));
@@ -3085,6 +3094,7 @@ function NewSessionDialog({
   const [launchModels, setLaunchModels] = useState<AgentModel[]>([]);
   const [launchModelsLoading, setLaunchModelsLoading] = useState(false);
   const [launchModelsError, setLaunchModelsError] = useState<string>();
+  const launchCatalogKey = useRef<string | undefined>(undefined);
   const workspaceSelectRef = useRef<HTMLSelectElement>(null);
   const launchWorkspaces = useMemo(
     () => sessionLaunchWorkspaces(snapshot),
@@ -3109,11 +3119,11 @@ function NewSessionDialog({
   // 对话框打开时刷新一次账号。主进程在 daemon 就绪时已经灌过一份,但 daemon
   // 可能是后启动的,账号也可能在别处刚被创建/删除 —— 这里兜住那些情况。
   useEffect(() => {
-    if (!open) return;
+    if (!open || tab !== "session") return;
     void window.prospero
       .accountAction({ type: "agent.accounts.list", requestId: crypto.randomUUID() })
       .catch(() => undefined);
-  }, [open]);
+  }, [open, tab]);
   useEffect(() => {
     if (!open) return;
     setInput((current) => {
@@ -3153,11 +3163,15 @@ function NewSessionDialog({
   }, [requiresStructured]);
   useEffect(() => {
     if (!open || !supportsLaunchModels) {
+      launchCatalogKey.current = undefined;
       setLaunchModels([]);
       setLaunchModelsLoading(false);
       setLaunchModelsError(undefined);
       return;
     }
+    if (tab !== "session") return;
+    const catalogKey = JSON.stringify([input.agent, input.accountId, input.kind]);
+    if (launchCatalogKey.current === catalogKey) return;
     let cancelled = false;
     const agent = input.agent as "codex" | "claude" | "deepseek";
     const accountId = input.accountId;
@@ -3168,6 +3182,7 @@ function NewSessionDialog({
       .getLaunchModels(agent, accountId)
       .then((catalog) => {
         if (cancelled) return;
+        launchCatalogKey.current = catalogKey;
         setLaunchModels(catalog.models);
         const model =
           catalog.models.find((candidate) => candidate.id === catalog.currentModel) ??
@@ -3191,7 +3206,7 @@ function NewSessionDialog({
       })
       .catch((reason) => {
         if (cancelled) return;
-        setLaunchModelsError(displayError(reason));
+        setLaunchModelsError(reportError(reason));
         setInput((current) =>
           current.agent === agent && current.accountId === accountId
             ? { ...current, model: undefined, effort: undefined }
@@ -3204,7 +3219,7 @@ function NewSessionDialog({
     return () => {
       cancelled = true;
     };
-  }, [input.accountId, input.agent, input.kind, open, supportsLaunchModels]);
+  }, [input.accountId, input.agent, input.kind, open, supportsLaunchModels, tab]);
   const create = async (): Promise<void> => {
     if (remoteId) {
       if (!busyRef.current && remoteTarget) { onRemoteWorkspace(remoteTarget, true); onOpenChange(false); }
@@ -3227,30 +3242,31 @@ function NewSessionDialog({
       }
       onOpenChange(false);
     } catch (reason) {
-      setError(displayError(reason));
+      setError(reportError(reason));
     } finally {
       busyRef.current = false;
       setBusy(false);
     }
   };
   return (
-    <Dialog open={open} onOpenChange={(next) => { if (next || !busy) onOpenChange(next); }}>
+    <Dialog open={open} onOpenChange={(next) => { if (next || (!busy && !choosingWorkspace)) onOpenChange(next); }}>
       <DialogContent
         className="new-session-dialog sm:max-w-2xl"
         showCloseButton={!busy && !choosingWorkspace}
         closeLabel={t("关闭", "Close")}
-        initialFocus={workspaceSelectRef}
+        initialFocus={tab === "session" ? workspaceSelectRef : undefined}
         aria-busy={busy || choosingWorkspace}
       >
         <DialogHeader>
-          <DialogTitle>{remoteId ? t("新建远程 Shell", "New remote Shell") : t("新建 Agent 会话", "New agent session")}</DialogTitle>
-          <DialogDescription>
-            {t(
-              "选择项目或编排 worktree，并为这次会话指定 Agent、账号与模型。",
-              "Choose a project or orchestration worktree, then select the agent, account, and model for this session.",
-            )}
-          </DialogDescription>
+          <DialogTitle>{t("新建", "Create")}</DialogTitle>
+          <DialogDescription>{tab === "workspace" ? t("添加本机或远程文件夹，继续创建会话。", "Add a local or remote folder, then start a conversation.") : t("选择工作区、Agent 和模型。", "Choose a workspace, agent, and model.")}</DialogDescription>
         </DialogHeader>
+        <Tabs className="create-dialog-tabs" value={tab} onValueChange={(value) => { if (!busy && !choosingWorkspace && (value === "session" || value === "workspace")) setTab(value); }}>
+          <TabsList variant="line" aria-label={t("创建类型", "Create type")}>
+            <TabsTrigger value="session" disabled={busy || choosingWorkspace}><MessageSquare />{t("新增会话", "New session")}</TabsTrigger>
+            <TabsTrigger value="workspace" disabled={busy || choosingWorkspace}><FolderPlus />{t("新增工作区", "New workspace")}</TabsTrigger>
+          </TabsList>
+          <TabsContent value="session" keepMounted className="create-dialog-panel">
         {error && (
           <Alert variant="destructive">
             <CircleAlert />
@@ -3301,7 +3317,7 @@ function NewSessionDialog({
               )}
               {remoteWorkspaces.length > 0 && <NativeSelectOptGroup label={t("远程工作区", "Remote workspaces")}>{remoteWorkspaces.map(workspace => <NativeSelectOption key={workspace.id} value={workspace.id}>{workspace.name} · {workspace.hostName}</NativeSelectOption>)}</NativeSelectOptGroup>}
             </NativeSelect>
-            <Button variant={launchWorkspaces.length === 0 ? "outline" : "ghost"} size="sm" className="w-fit" disabled={busy || choosingWorkspace} onClick={() => setChoosingWorkspace(true)}>
+            <Button variant={launchWorkspaces.length === 0 ? "outline" : "ghost"} size="sm" className="w-fit" disabled={busy || choosingWorkspace} onClick={() => setTab("workspace")}>
               {choosingWorkspace ? <Spinner data-icon="inline-start" /> : <FolderPlus data-icon="inline-start" />}
               {choosingWorkspace ? t("正在选择…", "Choosing…") : launchWorkspaces.length === 0 ? t("添加第一个工作区", "Add your first workspace") : t("添加其他工作区", "Add another workspace")}
             </Button>
@@ -3546,7 +3562,11 @@ function NewSessionDialog({
             {busy ? t("正在创建", "Creating") : remoteId ? t("创建远程 Shell", "Create remote Shell") : t("创建会话", "Create session")}
           </Button>
         </DialogFooter>
-        {choosingWorkspace && <AddWorkspaceDialog onClose={() => setChoosingWorkspace(false)} onLocalAdded={cwd => { setRemoteId(undefined); setInput(current => ({ ...current, cwd })); }} onRemoteAdded={workspace => { onRemoteWorkspace(workspace); onOpenChange(false); }} onManageHosts={() => { onOpenChange(false); onManageHosts(); }} />}
+          </TabsContent>
+          <TabsContent value="workspace" className="create-dialog-panel">
+            <WorkspacePicker onBusyChange={setChoosingWorkspace} onClose={() => onOpenChange(false)} onLocalAdded={(cwd) => { setRemoteId(undefined); setInput((current) => ({ ...current, cwd })); setTab("session"); }} onRemoteAdded={(workspace) => { onRemoteWorkspace(workspace); setRemoteId(workspace.id); setTab("session"); }} onManageHosts={() => { onOpenChange(false); onManageHosts(); }} />
+          </TabsContent>
+        </Tabs>
       </DialogContent>
     </Dialog>
   );
@@ -3814,11 +3834,14 @@ function CommandDialog({
 export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   useEffect(() => installLiquidGlass(), []);
   const { t } = useLocale();
+  useEffect(() => {
+    if (snapshot.daemon.lastError) notify({ kind: "error", title: t("本地服务异常", "Local service error"), message: snapshot.daemon.lastError });
+  }, [snapshot.daemon.lastError, t]);
   const snapshotRef = useRef(snapshot);
   snapshotRef.current = snapshot;
   const [view, setView] = useState<View>(readStoredView);
   const remote = useRemoteWorkspaces();
-  const [addWorkspaceOpen, setAddWorkspaceOpen] = useState(false);
+  const [createTab, setCreateTab] = useState<"session" | "workspace">("session");
   const [activeRemoteId, setActiveRemoteId] = useState<string | undefined>(() => {
     try { return localStorage.getItem("prospero.activeRemoteWorkspace") || undefined; } catch { return undefined; }
   });
@@ -3830,7 +3853,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     setActiveRemoteId(workspace.id);
     setView("workspaces");
   }, [activeRemoteId, remote.upsert]);
-  const openAddWorkspace = useCallback(() => setAddWorkspaceOpen(true), []);
+  const openAddWorkspace = useCallback(() => { setCreateTab("workspace"); setNewSessionOpen(true); }, []);
   useEffect(() => {
     if (view !== "workspaces") { setActiveRemoteId(undefined); setRemoteSessionRequest(0); }
   }, [view]);
@@ -4048,7 +4071,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
         if (view === "workspaces" && activeRemote) { setRemoteSessionRequest(request => request + 1); return; }
         setNewSessionProject(undefined);
         setNewSessionSource(undefined);
-        setNewSessionOpen(true);
+        setCreateTab("session"); setNewSessionOpen(true);
       }
     };
     window.addEventListener("keydown", onKeyDown);
@@ -4093,7 +4116,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     if (!project && view === "workspaces" && activeRemote) { setRemoteSessionRequest(request => request + 1); return; }
     setNewSessionProject(project);
     setNewSessionSource(undefined);
-    setNewSessionOpen(true);
+    setCreateTab("session"); setNewSessionOpen(true);
   }, [activeRemote, view]);
   const toggleArchive = useCallback((id: string): void => {
     void window.prospero.setSessionArchived(
@@ -4190,15 +4213,26 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
         );
       } catch (reason) {
         setSessionActionError(t(
-          `副本已打开，但名称保存失败：${displayError(reason)}`,
-          `The copy opened, but its name could not be saved: ${displayError(reason)}`,
+          `副本已打开，但名称保存失败：${reportError(reason)}`,
+          `The copy opened, but its name could not be saved: ${reportError(reason)}`,
         ));
       }
     })().catch((reason) => setSessionActionError(t(
-      `无法复制会话：${displayError(reason)}`,
-      `Unable to duplicate the session: ${displayError(reason)}`,
+      `无法复制会话：${reportError(reason)}`,
+      `Unable to duplicate the session: ${reportError(reason)}`,
     )));
   }, [openSession, t]);
+  const navigation = useNavigationHistory({ view, activeId: view === "workspaces" && !activeRemoteId ? activeId : undefined, activeRemoteId, runTargetId: view === "runs" ? runTargetId : undefined, taskTargetId: view === "runs" ? taskTargetId : undefined }, (destination) => {
+    setView(destination.view); setActiveRemoteId(destination.activeRemoteId);
+    if (destination.view === "workspaces") setActiveId(destination.activeId);
+    if (destination.activeId) { setActiveId(destination.activeId); setOpenIds((ids) => ids.includes(destination.activeId!) ? ids : [...ids, destination.activeId!]); }
+    setRunTargetId(destination.runTargetId); setTaskTargetId(destination.taskTargetId);
+  });
+  useEffect(() => {
+    const navigate = (event: KeyboardEvent): void => { if (!event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return; if (event.key === "ArrowLeft" && navigation.canBack) { event.preventDefault(); navigation.back(); } if (event.key === "ArrowRight" && navigation.canForward) { event.preventDefault(); navigation.forward(); } };
+    window.addEventListener("keydown", navigate);
+    return () => window.removeEventListener("keydown", navigate);
+  }, [navigation]);
   const workspaceFocus = focus && view === "workspaces";
   return (
     <TooltipProvider>
@@ -4207,6 +4241,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
       onOpenChange={changeSidebarOpen}
       className="prospero-shell"
     >
+      <WindowsTitlebar canBack={navigation.canBack} canForward={navigation.canForward} onBack={navigation.back} onForward={navigation.forward} onAction={(action) => { if (action === "new-session") openNewSession(); if (action === "settings") selectView("settings"); if (action === "command") setLauncher("command"); }} />
       <a className="skip-link" href="#main-content">
         {t("跳到主内容", "Skip to main content")}
       </a>
@@ -4237,7 +4272,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
         onRetryRemote={() => void remote.refresh()}
       />
       <SidebarInset id="main-content" tabIndex={-1} className="prospero-main">
-        <div className="native-window-drag-region" aria-hidden="true" />
+
         <div className="main-viewport">
           {sessionActionError && !workspaceFocus && <Alert variant="destructive" className="mx-7 mt-5 w-auto"><CircleAlert /><AlertTitle>{t("会话操作失败", "Session action failed")}</AlertTitle><AlertDescription>{sessionActionError}</AlertDescription><Button variant="ghost" size="sm" className="ml-auto" onClick={() => setSessionActionError(undefined)}>{t("关闭", "Dismiss")}</Button></Alert>}
           <Suspense
@@ -4293,7 +4328,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
                 initialTaskId={taskTargetId}
               />
             ) : view === "providers" ? (
-              <AccountsPane snapshot={sessionSnapshot} onOpenSession={openSession} onUseModelSource={selection => { setNewSessionProject(undefined); setNewSessionSource(selection); setNewSessionOpen(true); }} />
+              <AccountsPane snapshot={sessionSnapshot} onOpenSession={openSession} onUseModelSource={selection => { setNewSessionProject(undefined); setNewSessionSource(selection); setCreateTab("session"); setNewSessionOpen(true); }} />
             ) : view === "skills" ? (
               <SkillsPane snapshot={sessionSnapshot} />
             ) : view === "diagnostics" ? (
@@ -4314,10 +4349,10 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
           remoteWorkspaces={remote.workspaces}
           onRemoteWorkspace={openRemoteWorkspace}
           onManageHosts={() => selectView("remote")}
+          initialTab={createTab}
           initialSource={newSessionSource}
         />
       )}
-      {addWorkspaceOpen && <AddWorkspaceDialog onClose={() => setAddWorkspaceOpen(false)} onLocalAdded={cwd => openNewSession(cwd)} onRemoteAdded={openRemoteWorkspace} onManageHosts={() => selectView("remote")} />}
       {editingProject && (
         <ProjectRenameDialog
           project={editingProject}

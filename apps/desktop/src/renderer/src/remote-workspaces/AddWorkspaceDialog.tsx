@@ -7,11 +7,12 @@ import { NativeSelect, NativeSelectOption } from "../components/ui/native-select
 import { Spinner } from "../components/ui/spinner";
 import { DesktopIcon } from "../design-system/icons";
 import { useLocale } from "../locale";
-import { displayError } from "../state";
+import { reportError } from "../state";
 import { remoteChildLocation, remoteParentLocation } from "./workspace-location";
 import "./workspace-picker.css";
 
-export function AddWorkspaceDialog({ onClose, onLocalAdded, onRemoteAdded, onManageHosts }: {
+export function WorkspacePicker({ onClose, onLocalAdded, onRemoteAdded, onManageHosts, onBusyChange }: {
+  onBusyChange?: (busy: boolean) => void;
   onClose: () => void;
   onLocalAdded: (cwd: string) => void;
   onRemoteAdded: (workspace: RemoteWorkspace) => void;
@@ -28,6 +29,7 @@ export function AddWorkspaceDialog({ onClose, onLocalAdded, onRemoteAdded, onMan
   const [hostsError, setHostsError] = useState<string>();
   const [busy, setBusy] = useState(false);
   const [query, setQuery] = useState("");
+  useEffect(() => { onBusyChange?.(busy); return () => onBusyChange?.(false); }, [busy, onBusyChange]);
   const generation = useRef(0);
   const hostGeneration = useRef(0);
   const mutation = useRef(false);
@@ -42,7 +44,7 @@ export function AddWorkspaceDialog({ onClose, onLocalAdded, onRemoteAdded, onMan
       setHosts(next);
       setHostId(current => next.some(host => host.id === current) ? current : next[0]?.id ?? "");
     } catch (reason) {
-      if (token === hostGeneration.current) setHostsError(displayError(reason));
+      if (token === hostGeneration.current) setHostsError(reportError(reason));
     } finally {
       if (token === hostGeneration.current) setHostsLoading(false);
     }
@@ -64,7 +66,7 @@ export function AddWorkspaceDialog({ onClose, onLocalAdded, onRemoteAdded, onMan
       if (result.hostId !== hostId || result.path !== path || result.root !== root) throw new Error("远程目录响应不匹配，请重试 / Remote directory response does not match the selection");
       if (token === generation.current) setListing(result);
     } catch (reason) {
-      if (token === generation.current) setError(displayError(reason));
+      if (token === generation.current) setError(reportError(reason));
     } finally {
       if (token === generation.current) setLoading(false);
     }
@@ -84,13 +86,13 @@ export function AddWorkspaceDialog({ onClose, onLocalAdded, onRemoteAdded, onMan
     try {
       if (location === "local") {
         const cwd = await window.prospero.chooseProject();
-        if (cwd && mounted.current) { onLocalAdded(cwd); onClose(); }
+        if (cwd && mounted.current) { onLocalAdded(cwd); }
       } else if (listing) {
         const workspace = await window.prospero.addRemoteWorkspace({ hostId: listing.hostId, path: listing.path, root: listing.root });
-        if (mounted.current) { onRemoteAdded(workspace); onClose(); }
+        if (mounted.current) { onRemoteAdded(workspace); }
       }
     } catch (reason) {
-      if (mounted.current) setError(displayError(reason));
+      if (mounted.current) setError(reportError(reason));
     } finally {
       mutation.current = false;
       if (mounted.current) setBusy(false);
@@ -98,9 +100,7 @@ export function AddWorkspaceDialog({ onClose, onLocalAdded, onRemoteAdded, onMan
   };
   const parent = listing && remoteParentLocation(listing);
   const directories = listing?.entries.filter(entry => entry.kind === "dir" && entry.name.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase())) ?? [];
-  return <Dialog open onOpenChange={open => { if (!open && !mutation.current) onClose(); }}>
-    <DialogContent className="workspace-picker-dialog" showCloseButton={!busy} closeLabel={t("关闭", "Close")}>
-      <DialogHeader><DialogTitle>{t("添加工作区", "Add workspace")}</DialogTitle><DialogDescription>{t("选择本机或远程电脑上的文件夹。会话会在对应电脑上运行。", "Choose a folder on this computer or a remote computer. Sessions run on the selected computer.")}</DialogDescription></DialogHeader>
+  return <>
       <div className="workspace-location-toggle" role="radiogroup" aria-label={t("工作区位置", "Workspace location")} onKeyDown={event => {
         if (busy || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
         event.preventDefault();
@@ -132,6 +132,16 @@ export function AddWorkspaceDialog({ onClose, onLocalAdded, onRemoteAdded, onMan
       </div>}
       {error && <div role="alert" className="workspace-picker-error">{error}{location === "remote" && <Button size="sm" variant="ghost" disabled={busy || loading} onClick={() => void load()}>{t("重试", "Retry")}</Button>}</div>}
       <DialogFooter><Button variant="outline" disabled={busy} onClick={onClose}>{t("取消", "Cancel")}</Button><Button disabled={busy || (location === "remote" && (loading || !listing?.cwd || listing.hostId !== hostId || !!error))} onClick={() => void choose()}>{busy && <Spinner />}{location === "local" ? t("选择本机文件夹", "Choose local folder") : t("添加当前远程文件夹", "Add current remote folder")}</Button></DialogFooter>
+  </>;
+}
+
+export function AddWorkspaceDialog(props: Parameters<typeof WorkspacePicker>[0]) {
+  const { t } = useLocale();
+  const [busy, setBusy] = useState(false);
+  return <Dialog open onOpenChange={(open) => { if (!open && !busy) props.onClose(); }}>
+    <DialogContent className="workspace-picker-dialog" showCloseButton={!busy} closeLabel={t("关闭", "Close")}>
+      <DialogHeader><DialogTitle>{t("添加工作区", "Add workspace")}</DialogTitle><DialogDescription>{t("选择本机或远程电脑上的文件夹。", "Choose a folder on this computer or a remote computer.")}</DialogDescription></DialogHeader>
+      <WorkspacePicker {...props} onBusyChange={setBusy} onLocalAdded={(cwd) => { props.onLocalAdded(cwd); props.onClose(); }} onRemoteAdded={(workspace) => { props.onRemoteAdded(workspace); props.onClose(); }} />
     </DialogContent>
   </Dialog>;
 }

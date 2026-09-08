@@ -1,6 +1,14 @@
 :root {
   color-scheme: light;
-  --ui-font: "Segoe UI Variable Text", "PingFang SC", "Microsoft YaHei UI", system-ui, sans-serif;
+  --ui-font: "Segoe UI Variable Text", "Segoe UI", -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", "Noto Sans SC", system-ui, sans-serif;
+  --ui-font-mono: "Cascadia Mono", Consolas, "SFMono-Regular", Menlo, "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", "Noto Sans SC", monospace;
+  --ui-text-caption: 12px;
+  --ui-text-small: 13px;
+  --ui-text-body: 14px;
+  --ui-text-lead: 15px;
+  --ui-text-chat: 16px;
+  --ui-leading-body: 1.6;
+  --ui-leading-chat: 1.75;
   font-family: var(--ui-font);
   --bg: #f3f6fb;
   --surface-0: #eef2f8;
@@ -93,7 +101,10 @@
   --destructive: var(--red);
   --input: var(--border-strong);
   --ring: var(--accent-strong);
-  --radius: 0.625rem;
+  --radius: 6px;
+  --ui-radius-control: 4px;
+  --ui-radius-panel: 6px;
+  --ui-radius-window: 8px;
   --chart-1: #4c7dff;
   --chart-2: var(--cyan);
   --chart-3: var(--green);
@@ -178,4 +189,9 @@
   --sidebar-accent-foreground: #ffffff;
   --sidebar-border: var(--border);
   --sidebar-ring: #6d92ff;
+}
+
+:root[data-platform="darwin"] {
+  --ui-font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Noto Sans CJK SC", system-ui, sans-serif;
+  --ui-font-mono: "SFMono-Regular", Menlo, Monaco, "PingFang SC", "Noto Sans CJK SC", monospace;
 }

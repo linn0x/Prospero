@@ -11,7 +11,7 @@ import { DesktopIcon } from "../design-system/icons";
 import { ModelCapabilitiesFields } from "../ModelCapabilitiesFields";
 import { accountApiProtocolDefaults, accountApiProtocolLabel, accountReasoningEfforts, modelCapabilityDraft, parseModelCapabilities, type AccountApiProtocol } from "../account-profile-form";
 import { useLocale } from "../locale";
-import { displayError } from "../state";
+import { reportError } from "../state";
 import { runModelSourceAction } from "./use-model-sources";
 import { SourceOnboardingModels } from "./SourceOnboardingModels";
 import { retainSourceRouteDrafts, sourceDraftRoutes, type SourceRouteDraft } from "./source-state";
@@ -30,7 +30,7 @@ function EditorFrame({ title, children, onClose, action, dirty, valid = true }: 
     if (pending.current || !valid) return;
     pending.current = true; setBusy(true); setError(undefined);
     try { await runModelSourceAction(action()); onClose(); }
-    catch (reason) { setError(displayError(reason)); }
+    catch (reason) { setError(reportError(reason)); }
     finally { pending.current = false; setBusy(false); }
   };
   return <Dialog open onOpenChange={open => { if (!open) close(); }}>

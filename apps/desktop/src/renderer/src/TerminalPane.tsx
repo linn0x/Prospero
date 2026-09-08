@@ -3,11 +3,12 @@ import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { SerializeAddon } from "@xterm/addon-serialize";
 import { WebLinksAddon } from "@xterm/addon-web-links";
+import { terminalFontFamilyWithFallbacks, TERMINAL_LINE_HEIGHT } from "../../shared/terminal-typography";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import type { SessionInfo } from "../../shared/types";
-import { displayError, number, text } from "./state";
+import { reportError, number, text } from "./state";
 import { useLocale } from "./locale";
 import {
   deleteTerminalSessionCache,
@@ -178,7 +179,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
         if (terminalRef.current) terminalRef.current.options.disableStdin = true;
         setConnected(false);
         setSyncing(false);
-        setOperationError(displayError(reason));
+        setOperationError(reportError(reason));
         return false;
       });
     interactionChain.current = result.then(() => undefined);
@@ -202,12 +203,12 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
       cursorStyle: "bar",
       cursorWidth: 2,
       cursorInactiveStyle: "outline",
-      fontFamily,
+      fontFamily: terminalFontFamilyWithFallbacks(fontFamily),
       fontSize,
       fontWeight: "400",
-      fontWeightBold: "600",
-      lineHeight: 1.16,
-      letterSpacing: 0.1,
+      fontWeightBold: "700",
+      lineHeight: TERMINAL_LINE_HEIGHT,
+      letterSpacing: 0,
       scrollback: 3_000,
       minimumContrastRatio: 4.5,
       customGlyphs: true,
@@ -310,7 +311,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
         if (selection) {
           void window.prospero.writeClipboard(selection)
             .then(() => showNotice(t("已复制", "Copied")))
-            .catch((reason) => setOperationError(displayError(reason)));
+            .catch((reason) => setOperationError(reportError(reason)));
         } else showNotice(t("按住 ⌥ 拖动选择文本", "Hold Option while dragging to select text"));
         return false;
       }
@@ -339,7 +340,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
             }
             void delivered.then((ok) => showNotice(ok ? t("已粘贴", "Pasted") : t("终端断线，未粘贴", "Terminal disconnected; nothing was pasted")));
           })
-          .catch((reason) => setOperationError(displayError(reason)));
+          .catch((reason) => setOperationError(reportError(reason)));
         return false;
       }
       if (action === "selectAll") {
@@ -374,7 +375,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
       if (payload === "?" || payload.length > 8 * 1024 * 1024) return true;
       try {
         const text = fromBase64(payload);
-        if (text) void window.prospero.writeClipboard(text).then(() => showNotice(t("终端已复制到剪贴板", "Terminal copied to clipboard"))).catch((reason) => setOperationError(displayError(reason)));
+        if (text) void window.prospero.writeClipboard(text).then(() => showNotice(t("终端已复制到剪贴板", "Terminal copied to clipboard"))).catch((reason) => setOperationError(reportError(reason)));
       } catch {
         showNotice(t("无法读取终端剪贴板内容", "Unable to read terminal clipboard data"));
       }
@@ -435,7 +436,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
     const terminal = terminalRef.current;
     if (!terminal) return;
     let active = true;
-    terminal.options.fontFamily = fontFamily;
+    terminal.options.fontFamily = terminalFontFamilyWithFallbacks(fontFamily);
     terminal.options.fontSize = fontSize;
     const fit = (): void => {
       if (!active) return;
@@ -570,7 +571,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
           if (terminalRef.current) terminalRef.current.options.disableStdin = true;
           setConnected(false);
           setSyncing(false);
-          setConnectionError(displayError(reason));
+          setConnectionError(reportError(reason));
           await new Promise((wait) => window.setTimeout(wait, 900));
         }
       }

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Copy, Link2, MonitorSmartphone, Plus, Trash2 } from "lucide-react";
 import type { DesktopSnapshot, DeviceInfo } from "../../shared/types";
-import { displayError } from "./state";
+import { reportError } from "./state";
 import { useLocale } from "./locale";
 
 function deviceRenderKey(device: DeviceInfo, index: number): string {
@@ -44,10 +44,10 @@ export function DevicesPane({ snapshot }: { snapshot: DesktopSnapshot }) {
         setNotice(t("配对二维码已生成", "Pairing QR code generated"));
       } catch (reason) {
         setPair(result);
-        setError(t(`二维码生成失败，仍可复制配对串：${displayError(reason)}`, `QR code generation failed. You can still copy the pairing code: ${displayError(reason)}`));
+        setError(t(`二维码生成失败，仍可复制配对串：${reportError(reason)}`, `QR code generation failed. You can still copy the pairing code: ${reportError(reason)}`));
       }
     } catch (reason) {
-      setError(displayError(reason));
+      setError(reportError(reason));
     } finally {
       pairBusyRef.current = false;
       setPairBusy(false);
@@ -64,7 +64,7 @@ export function DevicesPane({ snapshot }: { snapshot: DesktopSnapshot }) {
       if (!result.ok) throw new Error(t("复制失败", "Copy failed"));
       setNotice(t("配对串已复制", "Pairing code copied"));
     } catch (reason) {
-      setError(displayError(reason));
+      setError(reportError(reason));
     } finally {
       copyBusyRef.current = false;
       setCopyBusy(false);
@@ -82,7 +82,7 @@ export function DevicesPane({ snapshot }: { snapshot: DesktopSnapshot }) {
       if (!result.ok) throw new Error(result.output || t("撤销设备失败", "Unable to revoke device"));
       setNotice(t(`已撤销设备“${device.name}”`, `Revoked “${device.name}”`));
     } catch (reason) {
-      setError(displayError(reason));
+      setError(reportError(reason));
     } finally {
       revokeBusyRef.current = false;
       setRevokeBusy(undefined);
@@ -246,7 +246,7 @@ export function LogsPane({ snapshot }: { snapshot: DesktopSnapshot }) {
       if (!result.ok) throw new Error(t("日志未能清空", "Logs could not be cleared"));
       setNotice(t("诊断日志已清空", "Diagnostic logs cleared"));
     } catch (reason) {
-      setError(displayError(reason));
+      setError(reportError(reason));
     } finally {
       busyRef.current = false;
       setBusy(false);

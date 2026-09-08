@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Link2, Plus, RefreshCw, Server, Trash2, Unplug } from "lucide-react";
 import type { RemoteHostSummary, SessionInfo } from "../../shared/types";
 import { useLocale } from "./locale";
-import { displayError } from "./state";
+import { reportError } from "./state";
 import { RemoteTerminal, type RemoteTerminalHandle, type RemoteTerminalSettings } from "./remote-workspaces/RemoteTerminal";
 
 
@@ -23,7 +23,7 @@ export default function RemoteHostsPane({ settings = { terminalFontFamily: "mono
   const [status, setStatus] = useState("");
   const [connected, setConnected] = useState(false);
   const refreshHosts = useCallback(async () => setHosts(await window.prospero.listRemoteHosts()), []);
-  useEffect(() => { void refreshHosts().catch((reason) => setError(displayError(reason))); }, [refreshHosts]);
+  useEffect(() => { void refreshHosts().catch((reason) => setError(reportError(reason))); }, [refreshHosts]);
   useEffect(() => window.prospero.subscribeRemoteShell((event) => {
     if (event.hostId !== selectedRef.current) return;
     const message = event.message;
@@ -48,7 +48,7 @@ export default function RemoteHostsPane({ settings = { terminalFontFamily: "mono
   const run = async (action: () => Promise<void>) => {
     if (busyRef.current) return;
     busyRef.current = true; setBusy(true); setError(undefined);
-    try { await action(); } catch (reason) { setError(displayError(reason)); }
+    try { await action(); } catch (reason) { setError(reportError(reason)); }
     finally { busyRef.current = false; setBusy(false); }
   };
   const connect = async (hostId: string) => {

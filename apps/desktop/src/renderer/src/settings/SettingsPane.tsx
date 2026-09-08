@@ -1,7 +1,10 @@
+import { terminalFontFamilyWithFallbacks, TERMINAL_LINE_HEIGHT } from "../../../shared/terminal-typography";
+import { useConversationFont } from "../chat/use-conversation-font";
+import { DEFAULT_CONVERSATION_FONT_SIZE } from "../chat/display";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { DesktopIcon } from "../design-system/icons";
 import type { DesktopSettings, DesktopSnapshot } from "../../../shared/types";
-import { displayError, text } from "../state";
+import { reportError, text } from "../state";
 import { useLocale } from "../locale";
 import { SettingRow, SettingsSection } from "./SettingRow";
 import { SettingsNav } from "./SettingsNav";
@@ -23,8 +26,9 @@ export function SettingsPane({ snapshot, onOpenAccounts }: { snapshot: DesktopSn
   const mounted = useRef(true);
   const [actions] = useState(() => new SettingsActions((id, value) => {
     if (mounted.current) setFeedback((previous) => ({ ...previous, [id]: value }));
-  }, displayError));
+  }, reportError));
   const settings = snapshot.settings;
+  const [conversationSize, setConversationSize] = useConversationFont();
   const isWindows = window.prospero.platform === "win32";
   const [interfaces, setInterfaces] = useState<Array<{ label: string; address: string }>>([]);
   const interfacesLoaded = useRef(false);
@@ -134,10 +138,21 @@ export function SettingsPane({ snapshot, onOpenAccounts }: { snapshot: DesktopSn
           }}><option value="zh">中文</option><option value="en">English</option></select>
         </SettingRow>
       </SettingsSection>}
-      {category.id === "appearance" && <SettingsSection id="appearance" title={t("外观", "Appearance")} description={t("保留桌面端的玻璃层次，并统一窗口和内容主题。", "Keep the desktop glass appearance with a consistent window and content theme.")}>
+      {category.id === "appearance" && <SettingsSection id="appearance" title={t("外观", "Appearance")} description={t("调整主题与阅读体验。", "Adjust your theme and reading experience.")}>
         <SettingRow id="desktop-theme" title={t("主题", "Theme")} description={t("立即应用于侧栏、面板和窗口。", "Applies immediately to the sidebar, panels, and window.")} {...rowFeedback("desktop-theme")}>
           <select id="desktop-theme" value={settings.theme} disabled={busy("desktop-theme")} aria-describedby={description("desktop-theme")} onChange={(event) => { void update("desktop-theme", { theme: event.target.value as DesktopSettings["theme"] }); }}><option value="system">{t("跟随系统", "System")}</option><option value="light">{t("浅色", "Light")}</option><option value="dark">{t("深色", "Dark")}</option></select>
         </SettingRow>
+        <SettingRow id="conversation-font-size" title={t("对话字号", "Conversation text size")} description={t("应用到所有会话，即时保存。", "Applies to all conversations and saves immediately.")}>
+          <div className="settings-font-control">
+            <input id="conversation-font-size" type="range" min={13} max={24} step={1} value={conversationSize} aria-describedby="conversation-font-size-description" aria-valuetext={`${conversationSize} px`} onChange={(event) => setConversationSize(Number(event.target.value))} />
+            <output htmlFor="conversation-font-size">{conversationSize}<span>px</span></output>
+            <button type="button" data-slot="conversation-font-reset" className="settings-font-reset" disabled={conversationSize === DEFAULT_CONVERSATION_FONT_SIZE} onClick={() => setConversationSize(DEFAULT_CONVERSATION_FONT_SIZE)}>{t("恢复默认", "Reset")}</button>
+          </div>
+        </SettingRow>
+        <div className="settings-conversation-preview" style={{ fontSize: conversationSize }} aria-label={t("对话字号预览", "Conversation text preview")}>
+          <p>{t("让文字清晰，让阅读自然。", "Clear text, comfortable reading.")}</p>
+          <p>Prospero · Aa Bb 0123456789</p>
+        </div>
         <p className="settings-detail-note">{t("界面会遵循系统的降低动态效果、高对比度和降低透明度偏好。", "The interface follows system preferences for reduced motion, high contrast, and reduced transparency.")}</p>
       </SettingsSection>}
       {category.id === "accounts" && <SettingsSection id="accounts" title={t("Agent 与账号", "Agents and accounts")} description={t("管理登录账号、API 连接与模型配置。", "Manage signed-in accounts, API connections, and model configuration.")}>
@@ -152,7 +167,7 @@ export function SettingsPane({ snapshot, onOpenAccounts }: { snapshot: DesktopSn
         <SettingRow id="terminal-font-size" title={t("字号", "Font size")} description={t("8–48 之间的整数。", "An integer from 8 to 48.")} {...rowFeedback("terminal-font-size")}>
           <input id="terminal-font-size" type="number" min={8} max={48} value={fontSize} disabled={busy("terminal-font-size")} aria-describedby={description("terminal-font-size")} aria-invalid={feedback["terminal-font-size"]?.state === "error"} onChange={(event) => { fontSizeDirty.current = true; setFontSize(event.target.value); actions.clear("terminal-font-size"); }} onBlur={saveFontSize} onKeyDown={(event) => { if (!event.nativeEvent.isComposing && event.keyCode !== 229 && event.key === "Enter") event.currentTarget.blur(); }} />
         </SettingRow>
-        <div className="settings-terminal-preview" aria-label={t("终端预览", "Terminal preview")} style={{ fontFamily: fontFamily || settings.terminalFontFamily, fontSize: terminalFontSize(fontSize) ?? settings.terminalFontSize }}>{window.prospero.platform === "darwin" ? "zsh % codex" : isWindows ? "PS C:\\Prospero> codex" : "$ codex"}</div>
+        <div className="settings-terminal-preview" aria-label={t("终端预览", "Terminal preview")} style={{ fontFamily: terminalFontFamilyWithFallbacks(fontFamily || settings.terminalFontFamily), lineHeight: TERMINAL_LINE_HEIGHT, fontSize: terminalFontSize(fontSize) ?? settings.terminalFontSize }}>{window.prospero.platform === "darwin" ? "zsh % codex" : isWindows ? "PS C:\\Prospero> codex" : "$ codex"}{"\n"}{t("中文预览：工作区 · 会话记录 · 正在运行", "Font preview: Workspace · Session history · Running")}{"\nAa Bb 0123456789  {} [] () =>"}</div>
       </SettingsSection>}
       {category.id === "runtime" && <SettingsSection id="runtime" title={t("运行时与网络", "Runtime and network")} description={t("本地服务、直连网卡与运行权限。", "Local service, direct connection interface, and runtime permissions.")}>
         <SettingRow id="daemon-control" title="Daemon" description={snapshot.daemon.pid ? `PID ${snapshot.daemon.pid} · 127.0.0.1:${snapshot.daemon.port}` : t("尚未运行", "Not running")} {...rowFeedback("daemon-control")} stacked group>

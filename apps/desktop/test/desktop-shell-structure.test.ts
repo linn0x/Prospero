@@ -16,10 +16,10 @@ const sidebar = readFileSync(
 );
 
 describe("desktop shell structure", () => {
-  it("removes the full-width topbar while retaining command shortcuts", () => {
+  it("provides platform chrome while retaining command shortcuts", () => {
     expect(app).not.toContain('className="sidebar-brand"');
     expect(app).not.toContain('className="search-trigger"');
-    expect(app).not.toContain('className="desktop-topbar"');
+    expect(app).toContain("<WindowsTitlebar");
     expect(app).toContain('setLauncher("command")');
     expect(app).toContain('className="sidebar-new-session"');
     expect(app).toContain('className="sidebar-drawer-trigger"');
