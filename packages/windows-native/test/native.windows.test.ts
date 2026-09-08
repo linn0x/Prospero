@@ -1,4 +1,6 @@
 import { createRequire } from "node:module";
+import { spawn } from "node:child_process";
+import { createInterface } from "node:readline";
 import { createConnection, type Socket } from "node:net";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -43,6 +45,30 @@ const CANCELLATION_TIMEOUT_MS = 5_000;
 const PIPE_ROUND_TRIP_TIMEOUT_MS = 10_000;
 const PIPE_ROUND_TRIP_REQUEST = Buffer.from("pipe-round-trip");
 const PIPE_ROUND_TRIP_ACK = Buffer.from("pipe-round-trip-ack");
+
+async function lockStateFile(statePath: string) {
+  const child = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-File",
+    join(packageRoot, "test", "fixtures", "native-state-lock.ps1"), "-StatePath", statePath],
+  { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+  let stderr = "";
+  child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+  const exited = new Promise<number | null>((resolve) => child.once("exit", resolve));
+  await new Promise<void>((resolve, reject) => {
+    const lines = createInterface({ input: child.stdout });
+    const timer = setTimeout(() => { child.kill(); reject(new Error("State lock helper did not become ready")); }, 10_000);
+    const fail = (error: Error) => { clearTimeout(timer); lines.close(); reject(error); };
+    child.once("error", fail);
+    child.once("exit", () => fail(new Error(`State lock helper exited before ready: ${stderr}`)));
+    lines.once("line", (line) => {
+      clearTimeout(timer);
+      lines.close();
+      if (line === "locked") resolve();
+      else fail(new Error(`Unexpected state lock helper output: ${line}`));
+    });
+  });
+  let released = false;
+  return { release: () => { if (!released) { released = true; child.stdin.end("release\n"); } }, exited };
+}
 
 async function connectPipe(pipeName: string): Promise<Socket> {
   return new Promise<Socket>((resolve, reject) => {
@@ -349,6 +375,43 @@ describe.runIf(process.platform === "win32")("Windows identity, secure pipe, DPA
     expect(() => binding.dpapiProtectCurrentUser(plaintext, new Uint8Array())).toThrow(/invalid argument/i);
     expect(() => (binding as unknown as { dpapiProtectCurrentUser(data: Uint8Array): Uint8Array })
       .dpapiProtectCurrentUser(plaintext)).toThrow(/invalid argument/i);
+  });
+
+  it("waits for a published state file's exclusive writer to close before reading", async () => {
+    const root = mkdtempSync(join(tmpdir(), "prospero-state-publication-"));
+    const state = join(root, "state");
+    const directory = binding.openSecureStateDirectory({ path: state });
+    let locker: Awaited<ReturnType<typeof lockStateFile>> | undefined;
+    try {
+      binding.writeSecureStateFileAtomically(directory, "manifest.json", encoder.encode('{"epoch":7}'));
+      locker = await lockStateFile(join(state, "manifest.json"));
+      locker.release();
+      expect(decoder.decode(binding.readSecureStateFile(directory, "manifest.json"))).toBe('{"epoch":7}');
+    } finally {
+      locker?.release();
+      if (locker) expect(await locker.exited).toBe(0);
+      binding.closeSecureStateDirectory(directory);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("bounds waiting for a state file that remains exclusively locked", async () => {
+    const root = mkdtempSync(join(tmpdir(), "prospero-state-locked-"));
+    const state = join(root, "state");
+    const directory = binding.openSecureStateDirectory({ path: state });
+    let locker: Awaited<ReturnType<typeof lockStateFile>> | undefined;
+    try {
+      binding.writeSecureStateFileAtomically(directory, "manifest.json", encoder.encode('{"epoch":7}'));
+      locker = await lockStateFile(join(state, "manifest.json"));
+      const start = Date.now();
+      expect(() => binding.readSecureStateFile(directory, "manifest.json")).toThrow();
+      expect(Date.now() - start).toBeLessThan(2_000);
+    } finally {
+      locker?.release();
+      if (locker) expect(await locker.exited).toBe(0);
+      binding.closeSecureStateDirectory(directory);
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("first-writes, round-trips, and atomically replaces state in a reparse-free current-user-only directory", () => {
