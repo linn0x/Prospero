@@ -1,7 +1,8 @@
 import { memo, useState } from "react";
 import * as Clipboard from "expo-clipboard";
 import * as Haptics from "expo-haptics";
-import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { Pressable, ScrollView, StyleSheet, View } from "react-native";
+import { ConversationText as Text } from "./ConversationTypography";
 import { color, MONOSPACE_FONT } from "@/lib/theme";
 
 /**

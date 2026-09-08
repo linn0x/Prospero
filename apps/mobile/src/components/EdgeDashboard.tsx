@@ -7,6 +7,7 @@ import { Sheet, SheetAction } from "./Sheet";
 import { PromptDialog } from "./PromptDialog";
 import { SwipeRow } from "./SwipeRow";
 import { WorkspaceHeader } from "./WorkspaceHeader";
+import { WorkspaceDisclosure, WorkspaceFolderIcon, WorkspaceChevron } from "./WorkspaceDisclosure";
 import { projectName } from "@/lib/session-projects";
 import { buildEdgeDashboard, createEdgeRecentReader, type EdgeProject, type EdgeSession } from "@/lib/edge-dashboard";
 import { edgeDeviceConnectionLabel } from "@/lib/edge-devices";
@@ -58,7 +59,7 @@ export function EdgeDashboard({ hosts, selectedHosts, runtimes, bottomInset, hom
   }, [choosingOrchestration]);
   const [createKind, setCreateKind] = useState<"session" | "directory" | null>(null);
   const [navigation] = useState(() => new DismissedModalAction());
-  const [expandedKey, setExpandedKey] = useState<string | null>(null);
+  const [expandedKeys, setExpandedKeys] = useState<Set<string>>(() => new Set());
   const [editing, setEditing] = useState<EdgeProject | null>(null);
   const [alias, setAlias] = useState("");
   const [managedPaths, setManagedPaths] = useState<Record<string, readonly string[]>>({});
@@ -105,33 +106,38 @@ export function EdgeDashboard({ hosts, selectedHosts, runtimes, bottomInset, hom
         <Text style={styles.itemTitle} numberOfLines={1}>{session.title || "未命名对话"}</Text>
         <Text style={[styles.meta, session.status === "waiting_approval" && { color: palette.warn }]}>{sessionLabels[session.status]}</Text>
       </View>
-      <Text style={styles.summary} numberOfLines={2}>{homeRecentSummary(session, recent)}</Text>
+      <Text style={styles.summary} numberOfLines={1}>{homeRecentSummary(session, recent)}</Text>
       <Text style={styles.meta} numberOfLines={1}>{host.name}{offline ? " · 离线缓存" : ""} · {new Date(time).toLocaleString(undefined, { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })}</Text>
     </Pressable>;
   };
   const projectRow = (value: EdgeProject) => {
     const { host, project, key, managed } = value;
-    const expanded = expandedKey === key;
+    const expanded = expandedKeys.has(key);
     const online = runtimes[host.id]?.status === "connected";
     const title = homeSettings.workspaceAliases[workspaceAliasKey(host.id, project.path)]
       || projectName(project.path);
     return <View style={styles.project}>
-      <SwipeRow actions={[
+      <WorkspaceDisclosure expanded={expanded} header={(progress) => <SwipeRow actions={[
         ...(online ? [{ id: "create-session", label: "新建对话", symbol: "plus" as const, color: palette.accent, onPress: () => onCreateSession(host.id, project.path) }] : []),
         { id: "edit-workspace", label: "修改名称", symbol: "pencil" as const, color: palette.accentDim, foregroundColor: palette.text, onPress: () => { setEditing(value); setAlias(homeSettings.workspaceAliases[workspaceAliasKey(host.id, project.path)] ?? ""); } },
       ]}>
         <Pressable accessibilityRole="button" accessibilityLabel={`${title}，${host.name}，${project.sessions.length} 个对话`}
-          accessibilityState={{ expanded }} onPress={() => setExpandedKey(expanded ? null : key)}
+          accessibilityState={{ expanded }} onPress={() => setExpandedKeys((current) => {
+            const next = new Set(current);
+            if (next.has(key)) next.delete(key);
+            else next.add(key);
+            return next;
+          })}
           style={({ pressed }) => [styles.item, pressed && styles.pressed]}>
-          <View style={styles.projectIdentity}><Icon name="folder.fill" size={18} color={palette.accent} />
+          <View style={styles.projectIdentity}><WorkspaceFolderIcon progress={progress} size={18} color={palette.accent} />
             <WorkspaceHeader hostId={host.id} path={project.path} sid={project.sessions[0]?.id}
               name={title} sessionCount={project.sessions.length} />
-            <Icon name={expanded ? "chevron.down" : "chevron.right"} size={16} color={palette.textFaint} />
+            <WorkspaceChevron progress={progress} size={16} color={palette.textFaint} />
           </View>
           <Text style={styles.meta} numberOfLines={1}>{host.name}{!online ? " · 离线缓存" : ""}{managed ? " · 任务工作区" : ""}{project.runningCount > 0 ? ` · ${project.runningCount} 个运行中` : ""}{project.pendingCount > 0 ? ` · ${project.pendingCount} 项待处理` : ""}</Text>
         </Pressable>
-      </SwipeRow>
-      {expanded && <View style={styles.projectSessions}>{project.sessions.map((session) =>
+      </SwipeRow>}>
+      <View style={styles.projectSessions}>{project.sessions.map((session) =>
         <Pressable key={session.id} accessibilityRole="button" onPress={() => onOpenSession(host.id, session.id)}
           style={({ pressed }) => [styles.child, pressed && styles.pressed]}>
           <AgentIcon agent={session.agent} size={16} /><Text style={styles.itemTitle} numberOfLines={1}>{session.title || "未命名对话"}</Text>
@@ -140,7 +146,8 @@ export function EdgeDashboard({ hosts, selectedHosts, runtimes, bottomInset, hom
         {online && <Pressable accessibilityRole="button" onPress={() => onCreateSession(host.id, project.path)} style={styles.button}>
           <Text style={styles.link}>在此目录新建对话</Text>
         </Pressable>}
-      </View>}
+      </View>
+      </WorkspaceDisclosure>
     </View>;
   };
 

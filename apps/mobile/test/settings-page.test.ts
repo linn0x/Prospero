@@ -8,11 +8,16 @@ describe("mobile settings page", () => {
   it("routes each category to its own page and keeps device actions under device management", () => {
     const settings = readFileSync(join(mobileRoot, "src", "app", "settings.tsx"), "utf8");
 
-    for (const page of ["appearance", "home", "notifications", "devices"]) {
+    for (const page of ["appearance", "notifications", "devices"]) {
       expect(settings).toContain(`router.push("/settings/${page}")`);
       expect(readFileSync(join(mobileRoot, "src", "app", "settings", `${page}.tsx`), "utf8")).toContain("<SettingsPage");
     }
     expect(settings).not.toContain("<Switch");
+    expect(settings).not.toContain('router.push("/settings/home")');
+    const appearance = readFileSync(join(mobileRoot, "src", "app", "settings", "appearance.tsx"), "utf8");
+    expect(appearance).toContain("settings.recentSessionLimit");
+    expect(appearance).toContain("settings.deviceSwitcherHapticsEnabled");
+    expect(appearance).toContain("settings.conversationFontSize");
     expect(settings).not.toContain("<DeviceConnectionRow");
     const devices = readFileSync(join(mobileRoot, "src", "app", "settings", "devices.tsx"), "utf8");
     expect(devices).toContain('router.push("/device-order")');
