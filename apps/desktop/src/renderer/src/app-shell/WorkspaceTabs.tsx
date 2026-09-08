@@ -15,7 +15,7 @@ export function WorkspaceTabs({ snapshot, openIds, activeId, onActivate, onClose
       const pinned = snapshot.pinnedSessionIds.includes(id);
       const label = sessionLabel(session);
       return <div key={id} className={cn("workspace-tab", id === activeId && "is-active")}>
-        <button type="button" data-slot="workspace-tab-main" data-liquid-glass="tab" className="workspace-tab-main" id={`workspace-tab-${id}`} role="tab" aria-controls="workspace-session-panel" aria-selected={id === activeId} tabIndex={id === activeId || !activeId && index === 0 ? 0 : -1} title={label} onClick={() => onActivate(id)} onKeyDown={(event) => {
+        <button type="button" data-slot="workspace-tab-main" className="workspace-tab-main" id={`workspace-tab-${id}`} role="tab" aria-controls="workspace-session-panel" aria-selected={id === activeId} tabIndex={id === activeId || !activeId && index === 0 ? 0 : -1} title={label} onClick={() => onActivate(id)} onKeyDown={(event) => {
           const next = event.key === "ArrowLeft" ? ids[(index - 1 + ids.length) % ids.length] : event.key === "ArrowRight" ? ids[(index + 1) % ids.length] : event.key === "Home" ? ids[0] : event.key === "End" ? ids.at(-1) : undefined;
           if (next) { event.preventDefault(); focus(next); }
           if (event.key === "Delete") { event.preventDefault(); onClose(id); focus(ids[index + 1] ?? ids[index - 1]); }

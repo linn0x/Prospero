@@ -3,7 +3,7 @@ import type { DesktopSnapshot, JsonObject, SessionInfo, UsageAccount } from "../
 import { getCachedAccountUsage, loadAccountUsage } from "../account-usage-cache";
 import { accountApiTestAction, provisionalAccountLoginSession } from "../account-profile-form";
 import { useLocale } from "../locale";
-import { displayError, record, text } from "../state";
+import { reportError, record, text } from "../state";
 import { createManagedAccountFlow } from "./account-request-state";
 
 export type AccountAction = "agent.account.default" | "agent.account.login" | "agent.account.logout" | "agent.account.delete" | "agent.account.api.test";
@@ -39,7 +39,7 @@ export function useAccountActions(snapshot: DesktopSnapshot, onOpenSession: (id:
       ]);
       if (!alive.current || generation.current !== token) return;
       if (results[1].status === "fulfilled") setUsage(results[1].value);
-      const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected").map(result => displayError(result.reason));
+      const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected").map(result => reportError(result.reason));
       if (results[0].status === "fulfilled" && results[0].value["ok"] === false) failures.push(t("无法读取账号列表，请重试。", "Unable to read the account list. Retry."));
       setRefreshError(failures.join(" · "));
     } finally {
@@ -70,7 +70,7 @@ export function useAccountActions(snapshot: DesktopSnapshot, onOpenSession: (id:
       if (alive.current) void refresh();
       return true;
     } catch (reason) {
-      if (alive.current) setError({ key, message: failureMessage ?? displayError(reason) });
+      if (alive.current) setError({ key, message: failureMessage ?? reportError(reason) });
       return false;
     } finally {
       if (busyRef.current === key) { busyRef.current = undefined; if (alive.current) setBusy(undefined); }

@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, normalize, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { sessionAgentControls } from "./session-control";
+import { DEFAULT_TERMINAL_FONT_FAMILY, DEFAULT_TERMINAL_FONT_SIZE } from "../shared/terminal-typography";
 import type {
   DaemonSnapshot,
   DesktopSettings,
@@ -78,8 +79,8 @@ const DEFAULT_SETTINGS: DesktopSettings = {
   launchAtLogin: false,
   theme: "system",
   workspaceSort: "recent",
-  terminalFontFamily: "Cascadia Mono, Consolas, monospace",
-  terminalFontSize: 13,
+  terminalFontFamily: DEFAULT_TERMINAL_FONT_FAMILY,
+  terminalFontSize: DEFAULT_TERMINAL_FONT_SIZE,
   daemonBind: "0.0.0.0",
 };
 

@@ -11,6 +11,8 @@ type LocaleContextValue = {
 
 const statusCopy: Record<string, [string, string]> = {
   running: ["运行中", "Running"],
+  success: ["已完成", "Succeeded"],
+  info: ["记录", "Info"],
   starting: ["启动中", "Starting"],
   idle: ["空闲", "Idle"],
   waiting_approval: ["等待审批", "Needs approval"],

@@ -5,17 +5,17 @@
 .workspace-remote-picker { display: grid; gap: 10px; min-width: 0; }
 .workspace-location-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .workspace-location-row > [data-slot="native-select-wrapper"] { flex: 1; min-width: 0; }
-.workspace-location-path { overflow-wrap: anywhere; font-size: 12px; color: var(--muted-foreground); }
+.workspace-location-path { overflow-wrap: anywhere; font-size: var(--ui-text-small); color: var(--muted-foreground); }
 .workspace-directory-list { display: flex; flex-direction: column; gap: 2px; min-height: 100px; max-height: min(280px, 32vh); overflow-y: auto; border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 6px; }
 .workspace-directory-list > button { flex: 0 0 auto; justify-content: flex-start; }
 .workspace-directory-list > button > span { flex: 1; overflow: hidden; text-overflow: ellipsis; text-align: left; }
 .workspace-directory-list > p, .workspace-directory-list > [role="status"] { padding: 12px; color: var(--muted-foreground); }
 .workspace-directory-list > [role="status"] { display: flex; align-items: center; gap: 8px; }
-.workspace-picker-hint { font-size: 12px; color: var(--muted-foreground); }
+.workspace-picker-hint { font-size: var(--ui-text-small); color: var(--muted-foreground); }
 .workspace-picker-error { color: var(--destructive); overflow-wrap: anywhere; }
 .remote-workspace-sidebar-copy { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 2px; }
 .remote-workspace-sidebar-copy > span { overflow: hidden; text-overflow: ellipsis; }
-.remote-workspace-sidebar-copy > small { overflow: hidden; text-overflow: ellipsis; color: var(--muted-foreground); font-size: 11px; }
+.remote-workspace-sidebar-copy > small { overflow: hidden; text-overflow: ellipsis; color: var(--muted-foreground); font-size: var(--ui-text-caption); }
 .remote-workspace-sidebar-button { height: 48px; }
-.remote-workspace-list-label { padding: 12px 8px 4px; font-size: 11px; color: var(--muted-foreground); }
-.remote-workspace-load-error { padding: 8px; font-size: 11px; color: var(--destructive); overflow-wrap: anywhere; }
+.remote-workspace-list-label { padding: 12px 8px 4px; font-size: var(--ui-text-caption); color: var(--muted-foreground); }
+.remote-workspace-load-error { padding: 8px; font-size: var(--ui-text-caption); color: var(--destructive); overflow-wrap: anywhere; }

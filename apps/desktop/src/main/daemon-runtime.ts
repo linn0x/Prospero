@@ -82,6 +82,7 @@ export class DaemonRuntime {
     let launchedPid: number | undefined;
     let launchPending = true;
     let launchError: string | undefined;
+    let startupStderr = "";
     const reportUnexpectedTermination = (): void => {
       if (launchPending || this.restarting || this.stopping || this.store.snapshot().daemon.running) return;
       this.store.setManagedState(undefined, false, launchError);
@@ -114,7 +115,11 @@ export class DaemonRuntime {
       launchedPid = child.pid;
       this.store.setStartupProgress(32, "daemon 进程已启动", child.pid);
       child.stdout.on("data", (chunk: Buffer) => this.store.appendLog(chunk.toString("utf8")));
-      child.stderr.on("data", (chunk: Buffer) => this.store.appendLog(chunk.toString("utf8")));
+      child.stderr.on("data", (chunk: Buffer) => {
+        const message = chunk.toString("utf8");
+        this.store.appendLog(message);
+        if (launchPending) startupStderr = (startupStderr + message).slice(-4_096);
+      });
       child.once("error", (error) => {
         if (this.child === child) this.child = undefined;
         launchError = error.message;
@@ -122,14 +127,16 @@ export class DaemonRuntime {
       });
       child.once("exit", (code) => {
         if (this.child === child) this.child = undefined;
-        if (!this.restarting && !this.stopping && code !== 0) launchError = `daemon 已退出（${String(code)}）`;
+        if (!this.restarting && !this.stopping && (launchPending || code !== 0)) {
+          launchError = `daemon 已退出（${String(code)}）${startupStderr.trim() ? `：${startupStderr.trim()}` : ""}`;
+        }
         reportUnexpectedTermination();
       });
     }
 
     const ready = await this.waitUntilReady(DAEMON_START_TIMEOUT_MS, (progress, stage) => {
       this.store.setStartupProgress(progress, stage, launchedPid);
-    });
+    }, () => launchError !== undefined);
     launchPending = false;
     if (!ready) {
       const error = launchError ?? "daemon 启动超时，请查看日志";
@@ -237,13 +244,15 @@ export class DaemonRuntime {
   private async waitUntilReady(
     timeoutMs: number,
     onProgress: (progress: number, stage: string) => void,
+    terminated: () => boolean,
   ): Promise<boolean> {
     const startedAt = Date.now();
     const deadline = Date.now() + timeoutMs;
     let lastProgress = 32;
     while (Date.now() < deadline) {
+      if (terminated()) return false;
       try {
-        const result = await this.request("/_prospero/control/health");
+        const result = await this.request("/_prospero/control/health", { timeoutMs: 1_000 });
         if (result?.["ok"] === true) return true;
       } catch {
         // status.json/control token may not exist yet.

@@ -8,7 +8,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { ModelCapabilitiesFields } from "../ModelCapabilitiesFields";
 import { accountApiEngineLabel, accountApiProtocolDefaults, accountApiProtocolLabel, accountApiProtocols, modelCapabilityDraft, supportsAccountApiProtocols, supportsAccountApiValidation, type AccountApiProtocol } from "../account-profile-form";
 import { useLocale } from "../locale";
-import { displayError } from "../state";
+import { reportError } from "../state";
 import { accountCreateApiInput, accountModelCatalogRequest } from "./account-form-actions";
 import { ModelCatalogPicker } from "./ModelCatalogPicker";
 
@@ -68,7 +68,7 @@ export function AccountCreateForm({ capabilities, disabled, busy, error, onCreat
         const saved = await onCreateApi(accountCreateApiInput({ name: apiName, protocol: effectiveProtocol, baseUrl, model, apiKey, modelCapabilities }, protocolsSupported, validationSupported));
         if (saved && mounted.current) { setApiName(""); setApiKey(""); }
       }
-    } catch (reason) { if (mounted.current) setLocalError(displayError(reason)); }
+    } catch (reason) { if (mounted.current) setLocalError(reportError(reason)); }
     finally { pending.current = false; if (mounted.current) setSubmitting(false); }
   };
   return <section className="account-create-form" aria-label={t("添加账号", "Add account")} aria-busy={inactive}>

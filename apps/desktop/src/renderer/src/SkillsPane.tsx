@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { BookOpen, CircleAlert, FolderOpen, RefreshCw, Search, Sparkles } from "lucide-react";
 import type { DesktopSnapshot, SkillInfo } from "../../shared/types";
-import { displayError, shortPath } from "./state";
+import { reportError, shortPath } from "./state";
 import { useLocale } from "./locale";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -65,7 +65,7 @@ export function SkillsPane({ snapshot }: { snapshot: DesktopSnapshot }) {
     } catch (reason) {
       if (generation !== requestGeneration.current) return;
       setSkills([]);
-      setLoadError(displayError(reason));
+      setLoadError(reportError(reason));
     } finally {
       if (generation === requestGeneration.current) {
         loadingProjectRef.current = undefined;
@@ -88,7 +88,7 @@ export function SkillsPane({ snapshot }: { snapshot: DesktopSnapshot }) {
       if (!result.ok) throw new Error(result.error || t("无法显示 Skill", "Unable to reveal skill"));
       setNotice(t(`已在文件管理器中显示 ${skill.name}`, `Revealed ${skill.name} in the file manager`));
     } catch (reason) {
-      if (generation === actionGeneration.current) setActionError(displayError(reason));
+      if (generation === actionGeneration.current) setActionError(reportError(reason));
     } finally {
       if (generation === actionGeneration.current) {
         revealBusyRef.current = false;
@@ -106,7 +106,7 @@ export function SkillsPane({ snapshot }: { snapshot: DesktopSnapshot }) {
     try {
       await window.prospero.chooseProject();
     } catch (reason) {
-      setActionError(displayError(reason));
+      setActionError(reportError(reason));
     } finally {
       chooseBusyRef.current = false;
       setChooseBusy(false);

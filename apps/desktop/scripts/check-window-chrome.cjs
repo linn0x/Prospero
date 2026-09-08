@@ -25,10 +25,10 @@ app.on("browser-window-created", (_event, window) => {
         const r = document.querySelector(selector)?.getBoundingClientRect();
         return r ? {x:r.x, y:r.y, width:r.width, height:r.height} : null;
       };
-      return { sidebar: rect('[data-slot="sidebar-container"]'), toolbar: rect('.desktop-topbar'),
+      return { sidebar: rect('[data-slot="sidebar-container"]'), toolbar: rect('.windows-titlebar'),
         main: rect('.prospero-main'), viewport: rect('.main-viewport'), header: rect('.sidebar-shell-header'),
         trigger: rect('.sidebar-header-toggle'), drawerTrigger: rect('.sidebar-drawer-trigger'),
-        nativeDrag: rect('.native-window-drag-region'),
+        nativeDrag: rect('.windows-titlebar'),
         headerDrag: document.querySelector('.sidebar-shell-header') && getComputedStyle(document.querySelector('.sidebar-shell-header')).webkitAppRegion,
         headerButtons: [...document.querySelectorAll('.sidebar-shell-header button')].map(element => ({ label: element.getAttribute('aria-label'), region: getComputedStyle(element).webkitAppRegion, x: element.getBoundingClientRect().x, y: element.getBoundingClientRect().y })),
         expanded: document.querySelector('[data-slot="sidebar"][data-state]')?.dataset.state === 'expanded',
@@ -44,7 +44,7 @@ app.on("browser-window-created", (_event, window) => {
       wc.sendInputEvent({ type: "mouseUp", ...point, button: "left", clickCount });
       await delay(250);
     };
-    const toggle = async () => { await click('.sidebar-header-toggle, .sidebar-drawer-trigger'); };
+    const toggle = async () => { await click(isMac ? '.sidebar-header-toggle, .sidebar-drawer-trigger' : '.windows-titlebar > button:first-child'); };
     const key = async (keyCode, modifiers = []) => {
       wc.sendInputEvent({ type: "keyDown", keyCode, modifiers });
       wc.sendInputEvent({ type: "keyUp", keyCode, modifiers });
@@ -52,9 +52,14 @@ app.on("browser-window-created", (_event, window) => {
     };
     const assertHeader = async () => {
       const state = await measure();
-      assert.equal(state.toolbar, null, "No full-width application topbar may return");
-      assert.equal(state.headerDrag, "drag");
-      assert(state.headerButtons.length >= 2);
+      if (isMac) assert.equal(state.toolbar, null, "macOS uses native traffic lights and menu bar");
+      else { assert.equal(state.toolbar.y, 0); assert(state.toolbar.height >= 40); }
+      if (isMac) {
+        assert.equal(state.headerDrag, "drag");
+        assert(state.headerButtons.length >= 2);
+      } else if (!await run(`Boolean(document.querySelector('.sidebar-exit-focus'))`)) {
+        assert.equal(state.header, null, "Windows navigation starts without a duplicate titlebar header");
+      }
       assert(state.headerButtons.every(button => button.region === "no-drag"), "Sidebar actions must remain clickable inside native drag chrome");
       if (isMac) assert(state.headerButtons.every(button => button.x >= 88 || button.y >= 44), "Sidebar controls must avoid native traffic lights");
       return state;
@@ -82,16 +87,16 @@ app.on("browser-window-created", (_event, window) => {
       if (!(await measure()).expanded) await toggle();
       await run(`window.widthSaves=0;const originalSetItem=Storage.prototype.setItem;Storage.prototype.setItem=function(key,value){if(key==='prospero.sidebarWidth')window.widthSaves++;return originalSetItem.call(this,key,value)};void 0;`);
       const initial = await assertHeader();
-      assert.equal(initial.sidebar.y, 0);
-      assert.equal(initial.main.y, 0);
-      assert.equal(initial.viewport.y, isMac ? 0 : 44);
-      assert(initial.header.width <= initial.sidebar.width);
+      assert.equal(initial.sidebar.y, isMac ? 0 : initial.toolbar.height);
+      assert.equal(initial.main.y, isMac ? 0 : initial.toolbar.height);
+      assert.equal(initial.viewport.y, isMac ? 0 : initial.toolbar.height);
+      if (isMac) assert(initial.header.width <= initial.sidebar.width);
       assert(initial.navHeights.every(h => h === 28));
       if (isMac) {
         assert.deepEqual(window.getWindowButtonPosition(), { x: 14, y: 16 });
         assert(initial.trigger.x >= 88);
       }
-      await click('.sidebar-new-session');
+      await click(isMac ? '.sidebar-new-session' : '[data-slot="sidebar-group-action"][aria-label="新增工作区"]');
       assert(await run(`Boolean(document.querySelector('[role="dialog"]'))`), "The sidebar new-session button must open its dialog");
       await key("Escape");
       await drag(100);
@@ -118,7 +123,7 @@ app.on("browser-window-created", (_event, window) => {
       await toggle();
       const collapsed = await assertHeader();
       assert.equal(collapsed.sidebar.width, collapsedWidth);
-      assert.equal(collapsed.sidebar.y, 0);
+      assert.equal(collapsed.sidebar.y, isMac ? 0 : collapsed.toolbar.height);
       assert(collapsed.navHeights.every(h => h === 28));
       await screenshot("collapsed");
       await toggle();
@@ -148,7 +153,7 @@ app.on("browser-window-created", (_event, window) => {
       await delay(300);
       if (!(await measure()).expanded) await toggle();
       const narrow = await assertHeader();
-      assert.equal(narrow.sidebar.y, 0);
+      assert.equal(narrow.sidebar.y, isMac ? 0 : narrow.toolbar.height);
       assert.equal(narrow.sidebar.width, 320, "Keep at least 480px for content");
       assert.equal(narrow.main.width, 480);
       await screenshot("narrow");
@@ -165,14 +170,14 @@ app.on("browser-window-created", (_event, window) => {
       await key("F", focusShortcut);
       window.setSize(720, 780);
       await delay(250);
-      await click('.sidebar-drawer-trigger');
+      await click(isMac ? '.sidebar-drawer-trigger' : '.windows-titlebar > button:first-child');
       assert(await run(`Boolean(document.querySelector('[data-slot="sidebar"][data-mobile="true"]'))`), "A floating trigger opens the drawer in a narrow window");
-      assert.equal((await measure()).toolbar, null);
+      if (isMac) assert.equal((await measure()).toolbar, null);
       await assertHeader();
       await screenshot("narrow-drawer");
       await click('.sidebar-exit-focus');
       assert.equal(await run(`Boolean(document.querySelector('.sidebar-exit-focus'))`), false);
-      await click('.sidebar-header-toggle');
+      await click(isMac ? '.sidebar-header-toggle' : '.prospero-sidebar[data-mobile="true"] > [data-slot="sheet-close"]');
       assert.equal(await run(`Boolean(document.querySelector('[data-slot="sidebar"][data-mobile="true"]'))`), false, "The drawer can be collapsed from its own header");
       await screenshot("narrow-floating-trigger");
       console.log(JSON.stringify({ ok: true, root, initial, resized, collapsed, narrow }));

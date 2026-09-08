@@ -14,7 +14,7 @@ import { Progress } from "@/components/ui/progress";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { RunGraph } from "./RunGraph";
-import { array, displayError, number, record, text } from "./state";
+import { array, reportError, number, record, text } from "./state";
 import { useLocale } from "./locale";
 import { deriveTaskBoardStates, prioritizeRuns, prioritizeWorktrees, runListLabel, runTimelineItems, worktreeNeedsAttention, type TaskBoardColumnId } from "./orchestration-utils";
 import {
@@ -224,13 +224,13 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
     key: string,
     method: string,
     params: JsonObject,
-    reportError: (message?: string) => void = setError,
+    setActionError: (message?: string) => void = setError,
   ): Promise<JsonObject | undefined> => {
     if (busyRef.current) return undefined;
     busyRef.current = key;
     setBusy(key);
-    try { const result = await window.prospero.orchestrationAction(method, params); reportError(undefined); return result; }
-    catch (reason) { reportError(displayError(reason)); return undefined; }
+    try { const result = await window.prospero.orchestrationAction(method, params); setActionError(undefined); return result; }
+    catch (reason) { setActionError(reportError(reason)); return undefined; }
     finally { busyRef.current = undefined; setBusy(undefined); }
   };
 
@@ -245,7 +245,7 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
       const full = await window.prospero.getOrchestrationTask(text(task["id"]));
       if (taskDetailRequest.current === request) setTaskDetail({ task: full, loading: false, full: true, previewUpdatedAt });
     } catch (reason) {
-      if (taskDetailRequest.current === request) setTaskDetail({ task, loading: false, full: false, previewUpdatedAt, error: displayError(reason) });
+      if (taskDetailRequest.current === request) setTaskDetail({ task, loading: false, full: false, previewUpdatedAt, error: reportError(reason) });
     }
   }, []);
 
@@ -317,7 +317,7 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
       await window.prospero.resolveGate(gateId, decision);
       setError(undefined);
     } catch (reason) {
-      setError(displayError(reason));
+      setError(reportError(reason));
     } finally {
       gateSubmissionRef.current.delete(gateId);
       setGateSubmissions((current) => {
@@ -360,7 +360,7 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
       setTemplateName("");
       setTemplateDescription("");
       setSaveTemplateError(undefined);
-    } catch (reason) { setSaveTemplateError(displayError(reason)); }
+    } catch (reason) { setSaveTemplateError(reportError(reason)); }
     finally { busyRef.current = undefined; setBusy(undefined); }
   };
 
@@ -394,7 +394,7 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
       setTemplateLibraryOpen(true);
       setError(undefined);
     } catch (reason) {
-      setTemplateDeleteError(displayError(reason));
+      setTemplateDeleteError(reportError(reason));
     } finally {
       busyRef.current = undefined;
       setBusy(undefined);

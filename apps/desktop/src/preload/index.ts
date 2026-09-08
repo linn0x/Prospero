@@ -25,6 +25,7 @@ const api: DesktopApi = {
   },
   platform: process.platform,
   listNetworkInterfaces: () => ipcRenderer.invoke("network:interfaces"),
+  openWindowMenu: (request) => ipcRenderer.invoke("window:menu", request),
   openExternal: (url: string) => ipcRenderer.invoke("external:open", url),
   readClipboard: () => ipcRenderer.invoke("clipboard:read"),
   writeClipboard: (value: string) => ipcRenderer.invoke("clipboard:write", value),

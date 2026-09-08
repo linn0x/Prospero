@@ -3,7 +3,7 @@ import { RefreshCw } from "lucide-react";
 import type { DesktopSnapshot, SessionInfo } from "../../../shared/types";
 import { Button } from "../components/ui/button";
 import { useLocale } from "../locale";
-import { displayError } from "../state";
+import { reportError } from "../state";
 import { shellIsLive, workspaceShell } from "./shell-session";
 
 const TerminalPane = lazy(() => import("../TerminalPane").then((module) => ({ default: module.TerminalPane })));
@@ -21,7 +21,7 @@ export function DockTerminal({ session, snapshot }: { session: SessionInfo; snap
     setLoading(true);
     setError(undefined);
     setShell(undefined);
-    void workspaceShell(window.prospero, session.cwd, sessions.current).then((created) => { if (active) setShell(created); }).catch((reason) => { if (active) setError(displayError(reason)); }).finally(() => { if (active) setLoading(false); });
+    void workspaceShell(window.prospero, session.cwd, sessions.current).then((created) => { if (active) setShell(created); }).catch((reason) => { if (active) setError(reportError(reason)); }).finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, [session.cwd, attempt]);
   const current = snapshot.daemon.sessions.find((item) => item.id === shell?.id) ?? shell;

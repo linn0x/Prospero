@@ -8,7 +8,7 @@ import { Spinner } from "../components/ui/spinner";
 import { DesktopIcon } from "../design-system/icons";
 import { accountApiEngineLabel, accountApiProtocolLabel } from "../account-profile-form";
 import { useLocale } from "../locale";
-import { displayError, record, text } from "../state";
+import { reportError, record, text } from "../state";
 import { catalogRouteUpdates, hasPartialCatalogLimits, type SourceSelection } from "./source-state";
 import { SourceConnectionDialog, SourceCredentialDialog, SourceRouteDialog } from "./SourceDialogs";
 import { runModelSourceAction, useModelSources } from "./use-model-sources";
@@ -37,7 +37,7 @@ function SourceCatalog({ source, disabled, onRun }: { source: ModelSource; disab
     try {
       const result = await runModelSourceAction({ kind: "models", sourceId: source.id, revision: source.revision, protocol: selectedProtocol, credentialId: selectedCredential });
       if (generation.current === token) { setModels(result.models ?? []); setLoaded(true); }
-    } catch (reason) { if (generation.current === token) setError(displayError(reason)); }
+    } catch (reason) { if (generation.current === token) setError(reportError(reason)); }
     finally { if (generation.current === token) setLoading(false); }
   };
   const results = models.filter(model => `${model.id} ${model.label ?? ""}`.toLowerCase().includes(query.trim().toLowerCase()));
@@ -105,7 +105,7 @@ export function ModelSourcesPane({ snapshot, onUse }: { snapshot: DesktopSnapsho
         if (action.kind === "migration.apply") setMigration(current => current && { ...current, groups: current.groups.filter(group => group.id !== action.migrationId) });
       }
       return true;
-    } catch (reason) { setError(displayError(reason)); return false; }
+    } catch (reason) { setError(reportError(reason)); return false; }
     finally { pending.current = false; setBusy(false); }
   };
   const disabled = busy || state.loading || !supported;

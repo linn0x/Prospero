@@ -761,6 +761,45 @@ describe("落盘", () => {
     ]);
   });
 
+  it("首次启动尚未 close 就已保存主文件和备份，强制退出后仍能重启", () => {
+    const home = tmpHome();
+    const first = new OrchestrationStore(home);
+    expect(JSON.parse(readFileSync(path.join(home, "orchestration.json"), "utf8")).runs).toEqual({});
+    expect(readFileSync(path.join(home, "orchestration.json.bak"), "utf8"))
+      .toBe(readFileSync(path.join(home, "orchestration.json"), "utf8"));
+    const restarted = new OrchestrationStore(home);
+    expect(restarted.listRuns()).toEqual([]);
+    restarted.close();
+    first.close();
+  });
+
+  it("兼容旧版本强制退出后仅留下的初始空投影", () => {
+    const home = tmpHome();
+    writeFileSync(path.join(home, "orchestration-desktop.json"), JSON.stringify({
+      version: 1, revision: 0, runs: [], tasks: [], dispatches: [], gates: [], worktreeAssets: [],
+    }));
+    const recovered = new OrchestrationStore(home);
+    expect(recovered.listRuns()).toEqual([]);
+    expect(JSON.parse(readFileSync(path.join(home, "orchestration.json"), "utf8")).runs).toEqual({});
+    recovered.close();
+    const restarted = new OrchestrationStore(home);
+    expect(restarted.listRuns()).toEqual([]);
+    restarted.close();
+  });
+
+  it.each([
+    { revision: 1 }, { runs: [{ id: "saved-run" }] }, { tasks: [{ id: "saved-task" }] },
+    { worktreeAssets: [{ id: "saved-worktree" }] }, { worktreeAssets: undefined }, { unknown: [] },
+  ])("主文件缺失时不覆盖有历史或格式不完整的投影 %j", (changes) => {
+    const home = tmpHome();
+    const projection = path.join(home, "orchestration-desktop.json");
+    const original = JSON.stringify({ version: 1, revision: 0, runs: [], tasks: [], dispatches: [], gates: [], worktreeAssets: [], ...changes });
+    writeFileSync(projection, original);
+    expect(() => new OrchestrationStore(home)).toThrow(OrchestrationStorageError);
+    expect(readFileSync(projection, "utf8")).toBe(original);
+    expect(readdirSync(home)).toEqual(["orchestration-desktop.json"]);
+  });
+
   it("主文件损坏时从备份恢复并保留损坏原件", () => {
     const home = tmpHome();
     const seeded = new OrchestrationStore(home);

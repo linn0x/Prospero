@@ -1,29 +1,29 @@
 .remote-workspace-pane { display: flex; flex-direction: column; height: 100%; min-width: 0; min-height: 0; position: relative; background: var(--surface-sunken); }
 .remote-workspace-toolbar { display: flex; align-items: center; gap: 8px; height: 38px; min-height: 38px; padding: 0 10px; border-bottom: 1px solid var(--border); background: var(--surface); }
-.remote-workspace-title { display: flex; flex: 1; align-items: center; gap: 7px; min-width: 0; font-size: 12px; }
+.remote-workspace-title { display: flex; flex: 1; align-items: center; gap: 7px; min-width: 0; font-size: var(--ui-text-small); }
 .remote-workspace-title > svg { flex: none; color: var(--muted); }
 .remote-workspace-title strong, .remote-workspace-title span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .remote-workspace-title strong { flex: none; max-width: 180px; font-weight: 600; }
-.remote-workspace-title span { color: var(--muted); font-size: 11px; }
+.remote-workspace-title span { color: var(--muted); font-size: var(--ui-text-caption); }
 .remote-workspace-toolbar button { flex: none; min-height: 28px; padding: 4px 7px; }
 .remote-workspace-tabs { display: flex; align-items: center; flex: none; gap: 3px; min-height: 32px; max-height: 38px; padding: 3px 8px; overflow-x: auto; border-bottom: 1px solid var(--border); background: var(--surface); }
 .remote-workspace-tabs button { min-width: 84px; max-width: 210px; min-height: 26px; padding: 4px 8px; border-color: transparent; background: transparent; }
 .remote-workspace-tabs button span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .remote-workspace-tabs button[aria-selected="true"] { background: var(--surface-3); border-color: var(--border); }
-.remote-workspace-status { display: flex; align-items: center; flex: none; gap: 7px; min-height: 28px; padding: 5px 12px; color: var(--muted); font-size: 11px; background: var(--surface); }
+.remote-workspace-status { display: flex; align-items: center; flex: none; gap: 7px; min-height: 28px; padding: 5px 12px; color: var(--muted); font-size: var(--ui-text-caption); background: var(--surface); }
 .remote-workspace-status.is-error { color: var(--danger); }
-.remote-workspace-status button { margin-left: auto; padding: 2px 6px; font-size: 11px; }
+.remote-workspace-status button { margin-left: auto; padding: 2px 6px; font-size: var(--ui-text-caption); }
 .remote-workspace-empty { display: flex; flex: 1; min-height: 0; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 24px; color: var(--muted); text-align: center; }
-.remote-workspace-empty > p { max-width: 440px; font-size: 12px; line-height: 1.5; }
+.remote-workspace-empty > p { max-width: 440px; font-size: var(--ui-text-small); line-height: 1.5; }
 .remote-workspace-focus-exit { position: absolute; top: 8px; right: 12px; z-index: 5; }
 .remote-terminal { display: flex; flex-direction: column; flex: 1; min-height: 0; min-width: 0; overflow: hidden; background: var(--surface-sunken); color: var(--foreground); }
 .remote-terminal-canvas { flex: 1; min-height: 0; min-width: 0; padding: 8px 10px; overflow: hidden; background: var(--surface-sunken); }
 .remote-terminal-canvas > .xterm { height: 100%; }
 .remote-terminal-canvas .xterm .xterm-viewport { background-color: var(--surface-sunken); }
-.remote-terminal-error { display: flex; flex: none; align-items: center; gap: 8px; padding: 8px 12px; color: var(--danger); background: var(--surface); font-size: 11px; overflow-wrap: anywhere; }
+.remote-terminal-error { display: flex; flex: none; align-items: center; gap: 8px; padding: 8px 12px; color: var(--danger); background: var(--surface); font-size: var(--ui-text-caption); overflow-wrap: anywhere; }
 .remote-terminal-error button { flex: none; margin-left: auto; padding: 3px 7px; }
 .remote-terminal-error[role="status"] { color: var(--muted); }
-.remote-computers-page .remote-terminal { height: clamp(320px, 50vh, 640px); min-height: 320px; border: 1px solid var(--border); border-radius: 10px; }
+.remote-computers-page .remote-terminal { height: clamp(320px, 50vh, 640px); min-height: 320px; border: 1px solid var(--border); border-radius: var(--ui-radius-panel); }
 .remote-computers-page .remote-session-tabs button[aria-pressed="true"] { color: var(--foreground); background: var(--surface-3); }
 .remote-computers-page .remote-host-selected { border-color: var(--accent); }
 @media (max-width: 900px) { .remote-workspace-title strong { max-width: 120px; } .remote-workspace-toolbar { gap: 4px; padding-inline: 6px; } }

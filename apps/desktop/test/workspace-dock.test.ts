@@ -1,7 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { clampDockWidth, closeDockTool, defaultDockState, dockNeedsOverlay, openDockTool, parseDockPreferences, updateDockPreferences } from "../src/renderer/src/workspace/dock-state";
+import { clampDockWidth, closeDockTool, defaultDockState, dockNeedsOverlay, openDockTool, parseDockPreferences, updateDockPreferences, sessionDockState, supportsTrajectory } from "../src/renderer/src/workspace/dock-state";
 
 describe("workspace dock preferences", () => {
+  it("only offers trajectory for structured DeepSeek sessions and cleans stale preferences", () => {
+    expect(supportsTrajectory({ agent: "deepseek", kind: "structured" })).toBe(true);
+    for (const session of [{ agent: "codex", kind: "structured" }, { agent: "claude", kind: "structured" }, { agent: "deepseek", kind: "pty" }]) expect(supportsTrajectory(session)).toBe(false);
+    const deepseek = openDockTool(sessionDockState(undefined, true), "trajectory");
+    expect(deepseek.tabs).toContain("trajectory");
+    const ordinary = sessionDockState(deepseek, false);
+    expect(ordinary.tabs).not.toContain("trajectory");
+    expect(ordinary.active).toBe("task");
+    expect(sessionDockState({ ...deepseek, tabs: [], active: undefined }, true).tabs).toEqual([]);
+  });
   it("closes and reopens tools while preserving neighboring selection", () => {
     const opened = openDockTool(defaultDockState(), "terminal");
     expect(opened.tabs).toEqual(["task", "diff", "execution", "terminal"]);

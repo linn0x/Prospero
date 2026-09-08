@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { DesktopSettings, RemoteWorkspace, SessionInfo } from "../../../shared/types";
 import { DesktopIcon } from "../design-system/icons";
 import { useLocale } from "../locale";
-import { displayError, record, text } from "../state";
+import { reportError, record, text } from "../state";
 import { RemoteTerminal } from "./RemoteTerminal";
 import { RemoteWorkspaceOpenQueue, chooseRemoteShell, rememberRemoteShell, rememberedRemoteShell, remoteShellEnded, remoteWorkspaceShells } from "./remote-workspace-state";
 import "./remote-workspaces.css";
@@ -40,7 +40,7 @@ export function RemoteWorkspacePane({ workspace, settings, focus, onToggleFocus,
       if (token !== generation.current || current.current.id !== id) return;
       setSessions(available); setConnected(true);
       if (selected.current && !available.some(session => session.id === selected.current)) { selected.current = undefined; setSid(undefined); }
-    } catch (reason) { if (token === generation.current) setError(displayError(reason)); }
+    } catch (reason) { if (token === generation.current) setError(reportError(reason)); }
     finally { if (token === generation.current) { pending.current = false; setBusy(undefined); } }
   };
   const open = async (newSession: boolean) => {
@@ -61,7 +61,7 @@ export function RemoteWorkspacePane({ workspace, settings, focus, onToggleFocus,
       if (token !== generation.current || current.current.id !== id) return;
       setSessions(available);
       select(chooseRemoteShell(available, preferred, result.sessionId));
-    } catch (reason) { if (token === generation.current) setError(displayError(reason)); }
+    } catch (reason) { if (token === generation.current) setError(reportError(reason)); }
     finally {
       if (token === generation.current) {
         if (!selected.current && confirmed) select(confirmed);

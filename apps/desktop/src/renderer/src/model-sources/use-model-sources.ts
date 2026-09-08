@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ModelSource, ModelSourceAction, S2CModelSourceResult } from "../../../shared/types";
-import { displayError } from "../state";
+import { reportError } from "../state";
 
 export async function runModelSourceAction(action: ModelSourceAction): Promise<S2CModelSourceResult> {
   const result = await window.prospero.modelSourceAction(action);
@@ -20,7 +20,7 @@ export function useModelSources(supported: boolean) {
     try {
       const result = await runModelSourceAction({ kind: "list" });
       if (generation.current === token) setSources(result.sources ?? []);
-    } catch (reason) { if (generation.current === token) setError(displayError(reason)); }
+    } catch (reason) { if (generation.current === token) setError(reportError(reason)); }
     finally { if (generation.current === token) setLoading(false); }
   }, [supported]);
   useEffect(() => {

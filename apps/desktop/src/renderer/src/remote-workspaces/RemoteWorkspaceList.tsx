@@ -7,7 +7,7 @@ import { Input } from "../components/ui/input";
 import { SidebarMenuButton, SidebarMenuItem } from "../components/ui/sidebar";
 import { DesktopIcon } from "../design-system/icons";
 import { useLocale } from "../locale";
-import { displayError } from "../state";
+import { reportError } from "../state";
 
 export function RemoteWorkspaceList({ workspaces, activeId, query, sort, onOpen, onUpdate, onForget }: {
   workspaces: RemoteWorkspace[];
@@ -36,7 +36,7 @@ export function RemoteWorkspaceList({ workspaces, activeId, query, sort, onOpen,
     try {
       if (editing) { onUpdate(await window.prospero.renameRemoteWorkspace(editing.id, name.trim())); setEditing(undefined); }
       else if (removing) { await onForget(removing.id); setRemoving(undefined); }
-    } catch (reason) { setError(displayError(reason)); }
+    } catch (reason) { setError(reportError(reason)); }
     finally { mutation.current = false; setBusy(false); }
   };
   return <>
