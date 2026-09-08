@@ -1,5 +1,19 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import {
+  CAPABILITY_AGENT_ACCOUNTS,
+  CAPABILITY_AGENT_API_PROFILES,
+  CAPABILITY_AGENT_API_PROTOCOLS,
+  CAPABILITY_FS_PUT_ACK,
+  CAPABILITY_SESSION_CREATE_RESULT,
+  CAPABILITY_WORKSPACE_SUMMARY,
+  generateKeyPairB64,
+} from "@prospero/protocol";
+import { dropConnection, getConnection, HostConnection, wireAppStateReconnect } from "../src/lib/connection";
+import type { StoredHost } from "../src/lib/hosts";
+import { useApp } from "../src/lib/store";
+import { randomUUID } from "expo-crypto";
+
 const appState = vi.hoisted(() => ({ callback: null as ((state: string) => void) | null }));
 
 vi.mock("react-native", () => ({
@@ -11,7 +25,7 @@ vi.mock("react-native", () => ({
   },
   Platform: { OS: "ios" },
 }));
-vi.mock("expo-crypto", () => ({ randomUUID: () => "ping-0123456789" }));
+vi.mock("expo-crypto", () => ({ randomUUID: vi.fn(() => "ping-0123456789") }));
 vi.mock("@react-native-async-storage/async-storage", () => ({
   default: { getItem: vi.fn(), setItem: vi.fn(), removeItem: vi.fn() },
 }));
@@ -22,18 +36,6 @@ vi.mock("expo-secure-store", () => ({
   setItemAsync: vi.fn(),
   deleteItemAsync: vi.fn(),
 }));
-
-import {
-  CAPABILITY_AGENT_ACCOUNTS,
-  CAPABILITY_AGENT_API_PROFILES,
-  CAPABILITY_AGENT_API_PROTOCOLS,
-  CAPABILITY_FS_PUT_ACK,
-  CAPABILITY_SESSION_CREATE_RESULT,
-  generateKeyPairB64,
-} from "@prospero/protocol";
-import { dropConnection, getConnection, HostConnection, wireAppStateReconnect } from "../src/lib/connection";
-import type { StoredHost } from "../src/lib/hosts";
-import { useApp } from "../src/lib/store";
 
 class FakeWebSocket {
   static sockets: FakeWebSocket[] = [];
@@ -76,6 +78,35 @@ afterEach(() => {
 });
 
 describe("HostConnection WebSocket candidates", () => {
+  it("correlates concurrent workspace summaries independently of git status and response order", async () => {
+    vi.mocked(randomUUID).mockReturnValueOnce("11111111-1111-4111-8111-111111111111").mockReturnValueOnce("22222222-2222-4222-8222-222222222222");
+    const socket = new FakeWebSocket("ws://192.168.1.8:7423/ws");
+    socket.readyState = 1;
+    const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
+    const internals = connection as unknown as {
+      ws: FakeWebSocket; channel: { seal(message: unknown): string; open(message: string): unknown };
+      advertisedCapabilities: Set<string>; onMessage(message: string): void;
+    };
+    internals.ws = socket;
+    internals.channel = { seal: JSON.stringify, open: JSON.parse };
+    expect(connection.supportsWorkspaceSummary).toBe(false);
+    internals.advertisedCapabilities = new Set([CAPABILITY_WORKSPACE_SUMMARY]);
+    expect(connection.supportsWorkspaceSummary).toBe(true);
+    try {
+      const first = connection.workspaceSummary("session");
+      const second = connection.workspaceSummary("session");
+      const status = connection.gitStatus("session");
+      const requests = socket.sent.map((message) => JSON.parse(message));
+      const reply = { type: "workspace.summary.result", sid: "session", branch: "main", sizeBytes: 23, sizeComplete: true, checkedAt: 1 };
+      internals.onMessage(JSON.stringify({ ...reply, requestId: requests[1].requestId }));
+      await expect(second).resolves.toMatchObject({ sizeBytes: 23 });
+      internals.onMessage(JSON.stringify({ type: "git.status.result", sid: "session", branch: "main", files: [], ahead: 0, behind: 0, staged: false }));
+      await expect(status).resolves.toMatchObject({ branch: "main" });
+      internals.onMessage(JSON.stringify({ ...reply, requestId: requests[0].requestId, sizeBytes: 12 }));
+      await expect(first).resolves.toMatchObject({ sizeBytes: 12 });
+    } finally { connection.stop(); }
+  });
+
   it.each([
     ["direct", 2, ["ws://192.168.1.8:7423/ws", "ws://10.0.0.8:7423/ws"]],
     ["relay", 1, ["wss://relay.example.com/v1/client"]],
@@ -143,6 +174,10 @@ describe("HostConnection WebSocket candidates", () => {
       "ws://10.0.0.8:7423/ws",
     ]);
     dropConnection(host.id);
+    // Edge exclusions must leave the reconnect registry, not merely stop a socket.
+    FakeWebSocket.sockets = [];
+    appState.callback?.("active");
+    expect(FakeWebSocket.sockets).toEqual([]);
   });
 
   it("sends an encrypted v13 ping at fifteen seconds and reconnects after silence", () => {

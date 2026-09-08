@@ -1,8 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import * as Haptics from "expo-haptics";
+import { useFocusEffect } from "expo-router";
 import {
   AccessibilityInfo,
   Animated,
+  AppState,
   Easing,
   StyleSheet,
   useAnimatedValue,
@@ -252,6 +254,49 @@ export function DeviceQuickSwitcher({
   const [candidateIndex, setCandidateIndex] = useState(selectedIndex);
   const [reduceMotion, setReduceMotion] = useState(false);
   const railScale = useAnimatedValue(1);
+  const [gestureSession] = useState(() => new QuickSwitchGestureSession(selectedIndex));
+  const focusedRef = useRef(false);
+  const appActiveRef = useRef(!AppState.currentState || AppState.currentState === "active");
+  const lifecycleGenerationRef = useRef(0);
+  const panGenerationRef = useRef(-1);
+  const tapGenerationRef = useRef(-1);
+  const latestRef = useRef({ selectedIndex, hosts, hapticsEnabled, onOpenDeviceDetails,
+    onPreviewHost, onCancelPreview, onConfirmHost, onQuickSwitchStateChange });
+  useLayoutEffect(() => {
+    latestRef.current = { selectedIndex, hosts, hapticsEnabled, onOpenDeviceDetails,
+      onPreviewHost, onCancelPreview, onConfirmHost, onQuickSwitchStateChange };
+  }, [selectedIndex, hosts, hapticsEnabled, onOpenDeviceDetails,
+    onPreviewHost, onCancelPreview, onConfirmHost, onQuickSwitchStateChange]);
+
+  // A retained screen can leave before native gesture/animation completion arrives.
+  // Invalidate that gesture synchronously; ordinary parent renders keep this callback stable.
+  const resetQuickSwitch = useCallback(() => {
+    lifecycleGenerationRef.current += 1;
+    const result = gestureSession.finish(true);
+    const latest = latestRef.current;
+    setQuickSwitchActive(false);
+    setCandidateIndex(latest.selectedIndex);
+    railScale.stopAnimation();
+    railScale.setValue(1);
+    latest.onQuickSwitchStateChange(false, true);
+    latest.onCancelPreview(result ? switchDirection(result.finalIndex, result.initialIndex) : 0);
+  }, [gestureSession, railScale]);
+
+  useFocusEffect(useCallback(() => {
+    focusedRef.current = true;
+    resetQuickSwitch();
+    return () => {
+      focusedRef.current = false;
+      resetQuickSwitch();
+    };
+  }, [resetQuickSwitch]));
+  useEffect(() => {
+    const subscription = AppState.addEventListener("change", (state) => {
+      appActiveRef.current = state === "active";
+      resetQuickSwitch();
+    });
+    return () => subscription.remove();
+  }, [resetQuickSwitch]);
   const completionReads = useSessionAttention((state) => state.completionReads);
   const completionBaselineHosts = useSessionAttention(
     (state) => state.completionBaselineHosts,
@@ -298,6 +343,10 @@ export function DeviceQuickSwitcher({
 
   useEffect(() => {
     railScale.stopAnimation();
+    if (!quickSwitchActive) {
+      railScale.setValue(1);
+      return;
+    }
     Animated.spring(railScale, {
       toValue: quickSwitchActive ? 1.2 : 1,
       speed: 28,
@@ -308,25 +357,31 @@ export function DeviceQuickSwitcher({
 
   useEffect(() => () => railScale.stopAnimation(), [railScale]);
 
+  // RNGH registers these callbacks during render but invokes them only for native input.
+  /* eslint-disable react-hooks/refs -- Gesture builders do not execute event callbacks. */
   const panGesture = useMemo(
     () => {
-      const session = new QuickSwitchGestureSession(selectedIndex);
+      const session = gestureSession;
+      const canHandle = () => focusedRef.current && appActiveRef.current
+        && panGenerationRef.current === lifecycleGenerationRef.current;
 
       const finish = (forceCancel = false): void => {
+        if (!canHandle()) return;
         const result = session.finish(forceCancel);
         if (!result) return;
+        const latest = latestRef.current;
         setQuickSwitchActive(false);
-        onQuickSwitchStateChange(false, false);
+        latest.onQuickSwitchStateChange(false, false);
         if (result.cancelled || result.finalIndex === result.initialIndex) {
-          onCancelPreview(switchDirection(result.finalIndex, result.initialIndex));
+          latest.onCancelPreview(switchDirection(result.finalIndex, result.initialIndex));
           return;
         }
-        const nextHost = hosts[result.finalIndex];
+        const nextHost = latest.hosts[result.finalIndex];
         if (!nextHost) {
-          onCancelPreview(switchDirection(result.finalIndex, result.initialIndex));
+          latest.onCancelPreview(switchDirection(result.finalIndex, result.initialIndex));
           return;
         }
-        onConfirmHost(nextHost.id);
+        latest.onConfirmHost(nextHost.id);
       };
 
       return Gesture.Pan()
@@ -334,67 +389,67 @@ export function DeviceQuickSwitcher({
         .maxPointers(1)
         .shouldCancelWhenOutside(false)
         .runOnJS(true)
+        .onBegin(() => { panGenerationRef.current = lifecycleGenerationRef.current; })
         .onStart(() => {
-          session.begin(selectedIndex);
-          setCandidateIndex(selectedIndex);
+          if (!canHandle()) return;
+          const latest = latestRef.current;
+          session.begin(latest.selectedIndex);
+          setCandidateIndex(latest.selectedIndex);
           setQuickSwitchActive(true);
-          onQuickSwitchStateChange(true, false);
-          if (hapticsEnabled) {
+          latest.onQuickSwitchStateChange(true, false);
+          if (latest.hapticsEnabled) {
             void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => undefined);
           }
         })
         .onUpdate((event) => {
-          if (!session.canUpdate()) return;
+          if (!canHandle() || !session.canUpdate()) return;
+          const latest = latestRef.current;
           if (quickSwitchShouldCancel(event.translationY, DEVICE_QUICK_SWITCH_CANCEL_Y)) {
             const returnDirection = session.cancel();
             setCandidateIndex(session.currentIndex());
-            onQuickSwitchStateChange(true, true);
-            onCancelPreview(returnDirection);
-            selectionHaptic(hapticsEnabled);
+            latest.onQuickSwitchStateChange(true, true);
+            latest.onCancelPreview(returnDirection);
+            selectionHaptic(latest.hapticsEnabled);
             return;
           }
           const nextIndex = deviceIndexForTranslation(
             session.startIndex(),
             event.translationX,
-            hosts.length,
+            latest.hosts.length,
           );
           if (nextIndex < 0 || nextIndex === session.currentIndex()) return;
           const direction = session.move(nextIndex);
           setCandidateIndex(nextIndex);
-          const nextHost = hosts[nextIndex];
-          if (nextHost) onPreviewHost(nextHost.id, direction);
-          selectionHaptic(hapticsEnabled);
+          const nextHost = latest.hosts[nextIndex];
+          if (nextHost) latest.onPreviewHost(nextHost.id, direction);
+          selectionHaptic(latest.hapticsEnabled);
         })
         .onEnd(() => finish())
         .onFinalize((_event, success) => {
           if (!success) finish(true);
         });
-    }, [
-      hapticsEnabled,
-      hosts,
-      onCancelPreview,
-      onConfirmHost,
-      onPreviewHost,
-      onQuickSwitchStateChange,
-      selectedIndex,
-    ],
+    }, [gestureSession],
   );
-  const tapGesture = useMemo(
-    () => Gesture.Tap()
-      .maxDuration(DEVICE_QUICK_SWITCH_LONG_PRESS_MS - 10)
-      .maxDistance(10)
-      .runOnJS(true)
-      .onEnd((_event, success) => {
-        if (success) onOpenDeviceDetails();
-      }),
-    [onOpenDeviceDetails],
+  const [tapGesture] = useState(
+    () => {
+      return Gesture.Tap()
+        .maxDuration(DEVICE_QUICK_SWITCH_LONG_PRESS_MS - 10)
+        .maxDistance(10)
+        .runOnJS(true)
+        .onBegin(() => { tapGenerationRef.current = lifecycleGenerationRef.current; })
+        .onEnd((_event, success) => {
+          if (success && focusedRef.current && appActiveRef.current
+            && tapGenerationRef.current === lifecycleGenerationRef.current) latestRef.current.onOpenDeviceDetails();
+        });
+    },
   );
+  /* eslint-enable react-hooks/refs */
   const composedGesture = useMemo(
     () => Gesture.Exclusive(panGesture, tapGesture),
     [panGesture, tapGesture],
   );
 
-  if (hosts.length <= 1) return null;
+  if (hosts.length === 0) return null;
 
   return (
     <GestureDetector gesture={composedGesture}>
@@ -411,7 +466,7 @@ export function DeviceQuickSwitcher({
           style={[
             styles.railCapsule,
             quickSwitchActive && styles.railCapsuleActive,
-            { width: railWidth, transform: [{ scale: railScale }] },
+            { width: railWidth, transform: [{ scale: quickSwitchActive ? railScale : 1 }] },
           ]}
         >
           <View style={styles.railDots}>

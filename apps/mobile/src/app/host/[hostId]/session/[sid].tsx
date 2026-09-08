@@ -1287,7 +1287,10 @@ export default function SessionScreen() {
       drawerWidth={quickPanelWidth}
       drawerBackgroundColor={color.surface}
       overlayColor="rgba(0, 0, 0, 0.48)"
-      edgeWidth={28}
+      // The send button occupies the rightmost 50 px. Android's drawer pan handler used to
+      // claim taps in the 28 px edge strip while the composer was active, so nearly half of
+      // the button intermittently stopped receiving onPress. The header menu remains usable.
+      edgeWidth={Platform.OS === "android" && focused ? 0 : 28}
       minSwipeDistance={12}
       keyboardDismissMode={DrawerKeyboardDismissMode.ON_DRAG}
       onDrawerOpen={() => setQuickPanelActive(true)}
@@ -1613,7 +1616,7 @@ export default function SessionScreen() {
               onResetFontSize={followSystemTerminalFontSize}
               fontSizeMode={terminalFontPreference.mode}
               onScrollBottom={() => termRef.current?.scrollToBottom()}
-              onDismissKeyboard={() => termRef.current?.blur()}
+              onDismissKeyboard={Platform.OS === "android" ? undefined : () => termRef.current?.blur()}
             />
           </>
         ) : (

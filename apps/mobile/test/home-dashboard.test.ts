@@ -174,10 +174,13 @@ describe("home dashboard", () => {
     expect(dashboard).toContain("onSwipePosition={handleDetailSwipePosition}");
     expect(dashboard).toContain("outputRange: [1, 0.9]");
     expect(dashboard).toContain("homeSwipeProgress.interpolate");
-    expect(dashboard).toContain("deviceDetailsOpen && detailHostId");
+    expect(dashboard).toContain("homeDevicePreviewIndex(hosts, selectedHost?.id, previewState)");
+    expect(dashboard).toContain("addDeviceSide={detailAddDeviceSide}");
+    expect(dashboard).toContain('showAddDevicePreviews && renderAddDevicePreview("before")');
+    expect(dashboard).toContain('showAddDevicePreviews && renderAddDevicePreview("after")');
     expect(dashboard).toContain("setDetailHostId(hostId)");
     expect(dashboard).toContain("hosts.map(renderHomeDeviceCard)");
-    expect(quickSwitcher).toContain("hosts.length <= 1");
+    expect(quickSwitcher).toContain("hosts.length === 0");
     expect(quickSwitcher).toContain("activateAfterLongPress(DEVICE_QUICK_SWITCH_LONG_PRESS_MS)");
     expect(quickSwitcher).toContain("Gesture.Exclusive(panGesture, tapGesture)");
     expect(quickSwitcher).toContain("quickSwitchShouldCancel(event.translationY");
@@ -195,7 +198,7 @@ describe("home dashboard", () => {
     expect(detailCarousel).toContain('testID="device-os-rail"');
     expect(detailCarousel).toContain("deviceIndexForRailPosition(");
     expect(detailCarousel).toContain("onTouchMove={handleTouchMove}");
-    expect(detailCarousel).toContain("卡片内容可上下滚动");
+    expect(detailCarousel).toContain("滑到两端添加新设备");
     expect(detailCarousel).toContain("nestedScrollEnabled");
     expect(detailCarousel).toContain("工作目录");
     expect(detailCarousel).toContain('label="设备详情"');
@@ -227,10 +230,9 @@ describe("home dashboard", () => {
     expect(dashboard).toContain("height: 28");
     expect(dashboard).toContain('testID="home-approval-sessions"');
     expect(dashboard).toContain("homeApprovalSessions(selectedRuntime?.sessions)");
-    expect(dashboard).toContain("iconDoubleWiggle(locatorWiggle)");
-    expect(dashboard).toContain("Animated.delay(1_000)");
+    expect(dashboard).toContain("useHomeLocatorMotion(");
     expect(dashboard).toContain("sessionNeedsLocatorMotion(");
-    expect(dashboard).toContain("sessionNeedsMotion(session) ? locatorWiggleStyle");
+    expect(dashboard).toContain("sessionNeedsMotion(session) ? locatorWiggleStyle : styles.locatorRest");
     expect(dashboard).toContain("completionBaselineReady");
     expect(quickSwitcher).toContain("const opacity = useAnimatedValue(1)");
     expect(quickSwitcher).toContain("const scale = useAnimatedValue(1)");

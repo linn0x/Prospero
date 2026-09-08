@@ -67,6 +67,10 @@ xcuserdata/
 *.temp
 *.orig.*
 
+# Local browser previews, screenshots, and interaction recordings
+/.playwright-cli/
+/output/
+
 # Release-only Windows prebuilds staged into the daemon npm tarball. They are
 # copied from signed CI artifacts immediately before `npm pack`, never kept in
 # source control.

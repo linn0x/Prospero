@@ -48,4 +48,18 @@ describe("session projects", () => {
     expect(projectName("/Users/me/Prospero/")).toBe("Prospero");
     expect(projectName("/")).toBe("/");
   });
+
+  it("uses only the directory name on Windows without changing POSIX backslash filenames", () => {
+    expect(projectName("D:\\projects\\Prospero\\")).toBe("Prospero");
+    expect(projectName("C:/Users/power/Projects/Prospero/")).toBe("Prospero");
+    expect(projectName("\\\\server\\share\\Prospero\\")).toBe("Prospero");
+    expect(projectName("C:\\")).toBe("C:\\");
+    expect(projectName("/Users/alice/Projects/Prospero/")).toBe("Prospero");
+    expect(projectName("/Users/alice/name\\with\\backslash")).toBe("name\\with\\backslash");
+    expect(projectName("/Users/alice/name\\")).toBe("name\\");
+    const groups = groupSessionsByProject([session("a", "D:\\work\\repo"), session("b", "D:\\work\\repo\\")]);
+    expect(groups).toHaveLength(1);
+    expect(groups[0]!.path).toBe("D:\\work\\repo");
+    expect(groups[0]!.name).toBe("repo");
+  });
 });
