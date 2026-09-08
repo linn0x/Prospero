@@ -23,6 +23,8 @@
 40c9a65baf64b6d99f01fd072d523303011c7bf9:packages/protocol/test/relay.test.ts:generic-api-key:15
 40c9a65baf64b6d99f01fd072d523303011c7bf9:packages/protocol/test/schemas.test.ts:generic-api-key:120
 78e1d16a458e4970a7228d989f53513dfb010aaa:apps/mobile/test/hosts.test.ts:generic-api-key:473
+a04cef9ef396c527c7955023e3dbad7dc2ad3fad:apps/mobile/test/manual-pairing.test.ts:generic-api-key:10
+a04cef9ef396c527c7955023e3dbad7dc2ad3fad:apps/mobile/test/manual-pairing.test.ts:generic-api-key:51
 a75ba23e7e9542186176a693e50d9e4b1111de79:apps/mobile/test/connection-candidates.test.ts:generic-api-key:10
 a75ba23e7e9542186176a693e50d9e4b1111de79:apps/mobile/test/connection-websocket.test.ts:generic-api-key:54
 a75ba23e7e9542186176a693e50d9e4b1111de79:apps/mobile/test/hosts.test.ts:generic-api-key:216
