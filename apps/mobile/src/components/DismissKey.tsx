@@ -1,4 +1,4 @@
-import { Keyboard, Pressable, StyleSheet, View } from "react-native";
+import { Keyboard, Platform, Pressable, StyleSheet, View } from "react-native";
 import { Icon } from "@/components/Icon";
 import { color, radius, space } from "@/lib/theme";
 
@@ -13,7 +13,8 @@ import { color, radius, space } from "@/lib/theme";
  * 只在输入框有焦点时给出来:没在打字的时候,它只是个碍眼的按钮。
  */
 export function DismissKey({ visible, floating = false }: { visible: boolean; floating?: boolean }) {
-  if (!visible) return null;
+  // Android's system navigation already exposes an IME-dismiss affordance.
+  if (!visible || Platform.OS === "android") return null;
   const button = (
     <Pressable
       style={({ pressed }) => [styles.btn, pressed && styles.pressed]}

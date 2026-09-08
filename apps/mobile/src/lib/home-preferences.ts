@@ -2,6 +2,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 
 const LAST_HOME_HOST_KEY = "prospero.home.lastHost.v1";
 const HOME_SETTINGS_KEY = "prospero.home.settings.v1";
+let settingsWrites = Promise.resolve();
 
 export const HOME_RECENT_SESSION_LIMITS = [3, 5, 8, 10] as const;
 export type HomeRecentSessionLimit = (typeof HOME_RECENT_SESSION_LIMITS)[number];
@@ -102,16 +103,17 @@ export async function rememberLastHomeHost(hostId: string): Promise<void> {
 
 export async function getHomeSettings(): Promise<HomeSettings> {
   try {
+    await settingsWrites;
     return parseHomeSettings(await AsyncStorage.getItem(HOME_SETTINGS_KEY));
   } catch {
     return DEFAULT_HOME_SETTINGS;
   }
 }
 
-export async function rememberHomeSettings(settings: HomeSettings): Promise<void> {
-  try {
-    await AsyncStorage.setItem(HOME_SETTINGS_KEY, JSON.stringify(settings));
-  } catch {
-    // 设置已经在内存中生效；持久化失败不应阻塞首页交互。
-  }
+export function rememberHomeSettings(settings: HomeSettings): Promise<void> {
+  const serialized = JSON.stringify(settings);
+  // Fast edits across category pages retain their order; returning pages wait for the latest write.
+  settingsWrites = settingsWrites.then(() => AsyncStorage.setItem(HOME_SETTINGS_KEY, serialized))
+    .catch(() => { /* Live settings remain usable when storage is temporarily unavailable. */ });
+  return settingsWrites;
 }

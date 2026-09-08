@@ -1,4 +1,5 @@
 import { RelayCredentialsMissingError } from "./hosts";
+import { PairingAddressError } from "./manual-pairing";
 
 export interface PairingErrorNotice {
   title: string;
@@ -7,6 +8,9 @@ export interface PairingErrorNotice {
 
 /** Copy kept outside the screen so the scanner and pasted-payload flows agree. */
 export function pairingErrorNotice(error: unknown): PairingErrorNotice {
+  if (error instanceof PairingAddressError) {
+    return { title: "设备地址无效", message: error.message };
+  }
   if (error instanceof RelayCredentialsMissingError) {
     return {
       title: "中继凭证缺失",
