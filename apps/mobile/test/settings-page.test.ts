@@ -5,23 +5,21 @@ import { describe, expect, it } from "vitest";
 const mobileRoot = join(import.meta.dirname, "..");
 
 describe("mobile settings page", () => {
-  it("collects appearance, home, progress and per-device connection settings", () => {
+  it("routes each category to its own page and keeps device actions under device management", () => {
     const settings = readFileSync(join(mobileRoot, "src", "app", "settings.tsx"), "utf8");
 
-    expect(settings).toContain('title="外观"');
-    expect(settings).toContain("HOME_RECENT_SESSION_LIMITS.map");
-    expect(settings).toContain('title="设备切换震动"');
-    expect(settings).toContain("settings.deviceSwitcherHapticsEnabled");
-    expect(settings).toContain('title="后台任务"');
-    expect(settings).toContain('title="其他应用上层悬浮框"');
-    expect(settings).toContain("overlayPermissionPending");
-    expect(settings).toContain('nextState === "active"');
-    expect(settings).toContain('AppState.addEventListener("focus"');
-    expect(settings).toContain("canDisplayProgressOverlay()");
-    expect(settings).toContain('title="设备与连接"');
-    expect(settings).toContain("host.relay.url");
-    expect(settings).toContain('pathname: "/host/[hostId]/edit"');
-    expect(settings).toContain("rememberHomeSettings(next)");
+    for (const page of ["appearance", "home", "notifications", "devices"]) {
+      expect(settings).toContain(`router.push("/settings/${page}")`);
+      expect(readFileSync(join(mobileRoot, "src", "app", "settings", `${page}.tsx`), "utf8")).toContain("<SettingsPage");
+    }
+    expect(settings).not.toContain("<Switch");
+    expect(settings).not.toContain("<DeviceConnectionRow");
+    const devices = readFileSync(join(mobileRoot, "src", "app", "settings", "devices.tsx"), "utf8");
+    expect(devices).toContain('router.push("/device-order")');
+    expect(devices).toContain('router.push("/pair")');
+    const connections = readFileSync(join(mobileRoot, "src", "components", "settings", "DeviceConnectionRow.tsx"), "utf8");
+    expect(connections).toContain('pathname: "/host/[hostId]/edit"');
+    expect(connections).toContain("host.relay.url");
   });
 
   it("keeps settings reachable with or without a paired device", () => {

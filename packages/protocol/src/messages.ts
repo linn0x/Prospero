@@ -65,6 +65,8 @@ export const CAPABILITY_DEEPSEEK_TRAJECTORY = "agent.deepseek-trajectory.v1";
 export const CAPABILITY_CHAT_ATTACHMENT_PREVIEWS = "chat.attachment-previews.v1";
 /** Windows 工作目录选择器可浏览盘符并在选中目录中新建文件夹。 */
 export const CAPABILITY_WORKSPACE_ROOTS = "workspace.roots-mkdir.v1";
+/** Read-only per-session workspace branch and bounded directory size summary. */
+export const CAPABILITY_WORKSPACE_SUMMARY = "workspace.summary.v1";
 export const CAPABILITY_FS_PUT_ACK = "fs.put-ack.v1";
 
 export type {

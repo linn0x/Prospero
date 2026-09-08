@@ -37,6 +37,7 @@ import {
   CAPABILITY_SESSION_CREATE_MODEL,
   CAPABILITY_SUBAGENT_HISTORY,
   CAPABILITY_WORKSPACE_ROOTS,
+  CAPABILITY_WORKSPACE_SUMMARY,
   MIN_PROTOCOL_VERSION,
   PROTOCOL_VERSION,
   ProtocolError,
@@ -107,6 +108,7 @@ import {
   writeFileAt,
 } from "./fs-ops.js";
 import * as gitOps from "./git-ops.js";
+import { readWorkspaceSummary } from "./workspace-summary.js";
 import type { PtySession } from "./pty-session.js";
 import type { RemotePtySession } from "./pty-supervisor-client.js";
 import type { RemoteWindowsPtySession } from "./windows-pty-session.js";
@@ -865,6 +867,7 @@ export async function createDaemonServer(
       capabilities.push(CAPABILITY_AGENT_API_PROFILES);
     }
     if (process.platform === "win32") capabilities.push(CAPABILITY_WORKSPACE_ROOTS);
+    capabilities.push(CAPABILITY_WORKSPACE_SUMMARY);
     if (conn.protocolVersion >= 9) capabilities.push(CAPABILITY_SUBAGENT_HISTORY);
     if (conn.protocolVersion >= 7) capabilities.push(CAPABILITY_ORCHESTRATION_SNAPSHOT);
     if (
@@ -1946,6 +1949,15 @@ export async function createDaemonServer(
       case "approval.policy.set":
         await manager.setApprovalPolicy(msg.sid, msg.policy);
         return;
+
+      case "workspace.summary": {
+        const root = manager.cwdOf(msg.sid);
+        const summary = root === null
+          ? { branch: null, sizeBytes: null, sizeComplete: false, checkedAt: Date.now() }
+          : await readWorkspaceSummary(root);
+        send(conn, { type: "workspace.summary.result", sid: msg.sid, requestId: msg.requestId, ...summary });
+        return;
+      }
 
       case "fs.list":
       case "fs.read":

@@ -6,6 +6,7 @@ import {
   KeyboardAvoidingView,
   Platform,
   Pressable,
+  ScrollView,
   type StyleProp,
   StyleSheet,
   Text,
@@ -23,6 +24,7 @@ import { decodePairingQR } from "@prospero/protocol";
 import { useDiscovery } from "@/lib/discovery";
 import { upsertHostFromPairing } from "@/lib/hosts";
 import { pairingErrorNotice } from "@/lib/pairing-error-notice";
+import { decodeManualPairing } from "@/lib/manual-pairing";
 import { color, radius, space } from "@/lib/theme";
 
 const glassApiAvailable = Platform.OS === "ios" && isLiquidGlassAvailable() && isGlassEffectAPIAvailable();
@@ -48,13 +50,15 @@ export default function PairScreen() {
   const [permission, requestPermission] = useCameraPermissions();
   const insets = useSafeAreaInsets();
   const [manual, setManual] = useState("");
+  const [address, setAddress] = useState("");
   const [pairing, setPairing] = useState(false);
   const [reduceTransparency, setReduceTransparency] = useState(false);
   const scannedRef = useRef(false);
-  const { d } = useLocalSearchParams<{ d?: string }>();
+  const { d, mode: requestedMode } = useLocalSearchParams<{ d?: string; mode?: string }>();
+  const mode = requestedMode === "manual" ? "manual" : "scan";
   const glassEnabled = glassApiAvailable && !reduceTransparency;
   // 扫描同网段的 prosperod:让用户确认这台电脑确实在线，再去扫码。
-  const { hosts: discovered, scanning, unavailable, timedOut } = useDiscovery(true);
+  const { hosts: discovered, scanning, unavailable, timedOut } = useDiscovery(mode === "scan");
 
   const discoveryHint =
     discovered.length > 0
@@ -71,16 +75,17 @@ export default function PairScreen() {
             ? "正在发现同一网络里的电脑…也可以直接扫描配对码"
             : "对准电脑终端里 prosperod pair 打印的二维码";
 
-  const handle = useCallback(async (text: string): Promise<void> => {
+  const handle = useCallback(async (text: string, manualAddress?: string): Promise<void> => {
     if (scannedRef.current) return;
     scannedRef.current = true;
     setPairing(true);
     try {
       // Production pairing must reject cleartext relay URLs.  The only
       // development exception mirrors the protocol policy: loopback ws://.
-      const payload = decodePairingQR(text.trim(), {
-        allowInsecureLoopback: typeof __DEV__ !== "undefined" && __DEV__,
-      });
+      const allowInsecureLoopback = typeof __DEV__ !== "undefined" && __DEV__;
+      const payload = manualAddress === undefined
+        ? decodePairingQR(text.trim(), { allowInsecureLoopback })
+        : decodeManualPairing(text, manualAddress, allowInsecureLoopback);
       const host = await upsertHostFromPairing(payload);
       // 深链每次都会把 /pair 压进栈,replace 只换掉这一层 —— 反复扫码/点深链
       // 会攒出一摞 host 页,返回要点很多下。先退回根再进。
@@ -131,10 +136,10 @@ export default function PairScreen() {
 
   useEffect(() => {
     // 外部相机/配对链接已经带了完整 payload，不应再弹内部相机权限遮住跳转。
-    if (typeof d !== "string" && permission && !permission.granted && permission.canAskAgain) {
+    if (mode === "scan" && typeof d !== "string" && permission && !permission.granted && permission.canAskAgain) {
       void requestPermission();
     }
-  }, [d, permission, requestPermission]);
+  }, [d, mode, permission, requestPermission]);
 
   return (
     <KeyboardAvoidingView
@@ -142,6 +147,87 @@ export default function PairScreen() {
       behavior={Platform.OS === "ios" ? "padding" : "height"}
     >
       <Stack.Screen options={{ title: "配对电脑" }} />
+      <View style={styles.modeTabs} accessibilityRole="tablist">
+        {(["scan", "manual"] as const).map((tab) => (
+          <Pressable
+            key={tab}
+            style={[styles.modeTab, mode === tab && styles.modeTabActive]}
+            disabled={pairing}
+            onPress={() => router.setParams({ mode: tab })}
+            accessibilityRole="tab"
+            accessibilityLabel={tab === "scan" ? "扫码配对" : "IP + 配对码"}
+            accessibilityState={{ selected: mode === tab, disabled: pairing }}
+          >
+            <Text style={[styles.modeTabText, mode === tab && styles.modeTabTextActive]}>{tab === "scan" ? "扫码配对" : "IP + 配对码"}</Text>
+          </Pressable>
+        ))}
+      </View>
+      {mode === "manual" ? (
+        <ScrollView
+          contentContainerStyle={[styles.manualPage, { paddingBottom: Math.max(insets.bottom, space.lg) }]}
+          keyboardShouldPersistTaps="handled"
+          keyboardDismissMode="on-drag"
+        >
+          <View style={styles.manualIntro}>
+            <Text style={styles.manualTitle}>连接你的电脑</Text>
+            <Text style={styles.note}>在电脑打开配对页面，或运行 prosperod pair，复制二维码下方的完整配对码。</Text>
+          </View>
+          <View style={styles.field}>
+            <Text style={styles.fieldLabel}>IP 地址</Text>
+            <TextInput
+              style={[styles.input, styles.fieldInput]}
+              placeholder="192.168.1.20 或 192.168.1.20:7423"
+              placeholderTextColor={color.textFaint}
+              accessibilityLabel="电脑 IP 地址，可包含端口"
+              value={address}
+              onChangeText={setAddress}
+              autoCapitalize="none"
+              autoCorrect={false}
+              editable={!pairing}
+              keyboardType={Platform.OS === "ios" ? "ascii-capable" : "default"}
+            />
+            <Text style={styles.fieldHint}>选填；留空使用配对码中的地址。未填写端口时使用配对码中的端口。</Text>
+          </View>
+          <View style={styles.field}>
+            <View style={styles.fieldHeader}>
+              <Text style={styles.fieldLabel}>配对码</Text>
+              <Pressable
+                style={({ pressed }) => [styles.pasteButton, pressed && styles.btnPressed]}
+                disabled={pairing}
+                onPress={() => void pastePairingCode()}
+                accessibilityRole="button"
+                accessibilityLabel="从剪贴板粘贴配对串"
+              >
+                <Text style={styles.iconButtonText}>粘贴</Text>
+              </Pressable>
+            </View>
+            <TextInput
+              style={[styles.input, styles.fieldInput, styles.codeInput]}
+              placeholder="prospero://pair?d=…（电脑生成的完整配对码）"
+              placeholderTextColor={color.textFaint}
+              accessibilityLabel="电脑生成的完整配对码"
+              value={manual}
+              onChangeText={setManual}
+              autoCapitalize="none"
+              autoCorrect={false}
+              editable={!pairing}
+              multiline
+              textAlignVertical="top"
+            />
+          </View>
+          <Pressable
+            style={({ pressed }) => [styles.btn, (!manual.trim() || pairing) && styles.disabled, pressed && styles.btnPressed]}
+            disabled={!manual.trim() || pairing}
+            onPress={() => void handle(manual, address)}
+            accessibilityRole="button"
+            accessibilityLabel="添加配对电脑"
+            accessibilityState={{ disabled: !manual.trim() || pairing, busy: pairing }}
+          >
+            {pairing ? <ActivityIndicator size="small" color={color.onAccent} /> : <Text style={styles.btnText}>添加设备</Text>}
+          </Pressable>
+        </ScrollView>
+      ) : (
+      <>
       <View style={styles.cameraWrap}>
         {permission?.granted ? (
           <CameraView
@@ -217,12 +303,29 @@ export default function PairScreen() {
             : "Android 的 mDNS 发现可能受 ROM 或 VPN 限制；发现失败时直接扫码即可。"}
         </Text>
       </GlassSurface>
+      </>
+      )}
     </KeyboardAvoidingView>
   );
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: color.bg },
+  modeTabs: { flexDirection: "row", padding: 4, marginHorizontal: space.md, marginVertical: space.sm, backgroundColor: color.surface, borderRadius: radius.md },
+  modeTab: { flex: 1, minHeight: 44, borderRadius: radius.sm, alignItems: "center", justifyContent: "center" },
+  modeTabActive: { backgroundColor: color.surfaceRaised },
+  modeTabText: { color: color.textDim, fontSize: 13, fontWeight: "600" },
+  modeTabTextActive: { color: color.text },
+  manualPage: { padding: space.lg, gap: space.lg },
+  manualIntro: { gap: space.sm, paddingVertical: space.sm },
+  manualTitle: { color: color.text, fontSize: 22, fontWeight: "700" },
+  field: { gap: space.sm },
+  fieldHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+  fieldLabel: { color: color.text, fontSize: 13, fontWeight: "600" },
+  fieldHint: { color: color.textDim, fontSize: 11, lineHeight: 17 },
+  fieldInput: { flex: 0, paddingVertical: 12, borderWidth: StyleSheet.hairlineWidth, borderColor: color.border },
+  codeInput: { minHeight: 112, maxHeight: 180, fontSize: 12 },
+  pasteButton: { minHeight: 44, minWidth: 52, justifyContent: "center", alignItems: "flex-end" },
   cameraWrap: { flex: 1, overflow: "hidden" },
   camera: { flex: 1 },
   noCam: { flex: 1, alignItems: "center", justifyContent: "center", padding: space.xl },

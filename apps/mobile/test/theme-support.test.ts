@@ -86,13 +86,14 @@ describe("mobile theme support", () => {
   });
 
   it("publishes the selected palette before syncing Android appearance", () => {
-    const settings = readFileSync(join(mobileRoot, "src", "app", "settings.tsx"), "utf8");
+    const settings = readFileSync(join(mobileRoot, "src", "app", "settings", "appearance.tsx"), "utf8");
+    const shared = readFileSync(join(mobileRoot, "src", "components", "settings", "SettingsLayout.tsx"), "utf8");
     const layout = readFileSync(join(mobileRoot, "src", "app", "_layout.tsx"), "utf8");
 
     expect(settings).toContain("updateSettings({ themeMode });");
     expect(settings).not.toContain("applyNativeThemeMode(themeMode);");
-    expect(settings).toContain("const styles = useMemo(() => createStyles(palette), [palette])");
-    expect(settings).toContain("function createStyles(palette: ThemePalette)");
+    expect(shared).toContain("const styles = useMemo(() => createStyles(palette), [palette])");
+    expect(shared).toContain("function createStyles(palette: ThemePalette)");
     expect(layout).toContain("useEffect(() => {");
     expect(layout).toContain("applyNativeThemeMode(themeMode);");
   });

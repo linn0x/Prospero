@@ -885,6 +885,13 @@ const relPath = z
     message: "path must be relative and must not contain '..'",
   });
 
+/** The daemon derives the directory from this session; no arbitrary client path is accepted. */
+export const C2SWorkspaceSummarySchema = z.object({
+  type: z.literal("workspace.summary"),
+  sid,
+  requestId: z.string().min(1).max(100),
+});
+
 /**
  * 新建会话前浏览工作目录。
  *
@@ -1347,6 +1354,7 @@ export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SSessionKillSchema,
   C2SApprovalPolicySetSchema,
   C2SWorkspaceListSchema,
+  C2SWorkspaceSummarySchema,
   C2SFsListSchema,
   C2SFsReadSchema,
   C2SFsWriteSchema,
@@ -1776,6 +1784,18 @@ export const S2CFsListingSchema = z.object({
   entries: z.array(FsEntrySchema),
 });
 
+/** Read-only metadata for a session's workspace, correlated separately from Git operations. */
+export const S2CWorkspaceSummarySchema = z.object({
+  type: z.literal("workspace.summary.result"),
+  sid,
+  requestId: z.string().min(1).max(100),
+  branch: z.string().max(2000).nullable(),
+  /** Total regular-file bytes, excluding symlinks; incomplete scans are lower bounds. */
+  sizeBytes: z.number().int().nonnegative().nullable(),
+  sizeComplete: z.boolean(),
+  checkedAt: z.number().int().nonnegative(),
+});
+
 /** 新建会话目录选择器的浏览结果;失败也原路返回,避免无 sid 请求只能超时。 */
 export const S2CWorkspaceListingSchema = z.object({
   type: z.literal("workspace.listing"),
@@ -2002,6 +2022,7 @@ export const S2CMessageSchema = z.discriminatedUnion("type", [
   S2CPermissionRequestSchema,
   S2CErrorSchema,
   S2CWorkspaceListingSchema,
+  S2CWorkspaceSummarySchema,
   S2CConversationResultsSchema,
   S2CAgentAccountsResultSchema,
   S2CAgentAccountApiModelsResultSchema,
