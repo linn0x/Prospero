@@ -19,6 +19,8 @@ The DPAPI API exposes only current-user `CryptProtectData`/`CryptUnprotectData` 
 
 Process-tree termination must use Job Object semantics; `taskkill` is not an acceptable replacement. `getParentJobCompatibility()` checks whether the parent Job permits breakaway. Detached launch is specified around `CreateProcessW`, never a command shell, and returns `parent_job_prevents_detach` rather than claiming a child is detached when the enclosing Job prevents it.
 
+Secure-state reads tolerate the short sharing conflict between an atomic rename publishing a filename and the writer closing its exclusive handle. Only `STATUS_SHARING_VIOLATION` is retried, for at most 250 ms, with the same directory handle, access flags, DACL and reparse checks. Persistent locks and other native errors still fail closed; no partial contents or absence result is substituted.
+
 All APIs except `getAbiInfo()` are synchronous and can block. The loader's trusted wrapper rejects them on Node's main thread; callers must use a scheduler-owned dedicated worker thread.
 
 ## Prebuild release format
