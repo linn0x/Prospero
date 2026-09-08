@@ -2,6 +2,7 @@ import { lazy, StrictMode, Suspense } from "react";
 import { createRoot } from "react-dom/client";
 import { useDesktopSnapshot } from "./state";
 import { LocaleProvider, useLocale } from "./locale";
+import { DesktopToasts } from "./notifications/DesktopToasts";
 import "./boot.css";
 
 const App = lazy(() =>
@@ -40,4 +41,4 @@ function Root() {
 // 侧栏头部要给 macOS 的红黄绿按钮让位,样式表按这个属性区分平台。
 document.documentElement.dataset["platform"] = window.prospero.platform;
 
-createRoot(document.getElementById("root")!).render(<StrictMode><LocaleProvider><Root /></LocaleProvider></StrictMode>);
+createRoot(document.getElementById("root")!).render(<StrictMode><LocaleProvider><DesktopToasts><Root /></DesktopToasts></LocaleProvider></StrictMode>);

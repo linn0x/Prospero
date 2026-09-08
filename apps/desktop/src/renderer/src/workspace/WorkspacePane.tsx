@@ -9,7 +9,7 @@ import { cn } from "../lib/utils";
 import { text } from "../state";
 import { workspaceChromeVisible } from "../workspace-sidebar-state";
 import { ContextDock } from "./ContextDock";
-import { clampDockWidth, defaultDockState, dockNeedsOverlay, readDockPreferences, updateDockPreferences, writeDockPreferences, type DockState } from "./dock-state";
+import { clampDockWidth, sessionDockState, supportsTrajectory, dockNeedsOverlay, readDockPreferences, updateDockPreferences, writeDockPreferences, type DockState } from "./dock-state";
 import { SessionToolbar } from "./SessionToolbar";
 import { sessionLabel } from "./session-presentation";
 
@@ -21,7 +21,9 @@ function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus }
   const host = useRef<HTMLDivElement>(null);
   const [available, setAvailable] = useState(0);
   const [width, setWidth] = useState(() => readDockPreferences().width);
-  const [dock, setDock] = useState<DockState>(() => readDockPreferences().sessions.find((item) => item.id === session.id)?.state ?? defaultDockState());
+  const trajectory = supportsTrajectory(session);
+  const [dock, setDock] = useState<DockState>(() => sessionDockState(readDockPreferences().sessions.find((item) => item.id === session.id)?.state, trajectory));
+  const [trajectoryHost, setTrajectoryHost] = useState<HTMLDivElement | null>(null);
   const [resizing, setResizing] = useState(false);
   const drag = useRef<{ pointerId: number; startX: number; width: number } | undefined>(undefined);
   const widthRef = useRef(width);
@@ -61,7 +63,7 @@ function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus }
     <div className={cn("workspace-grid", visible && !overlay && "has-dock")} style={{ "--context-dock-width": `${width}px` } as CSSProperties}>
       <main id="workspace-session-panel" role="tabpanel" aria-labelledby={chromeVisible ? `workspace-tab-${session.id}` : undefined} aria-label={focus ? sessionLabel(session) : undefined} className="workspace-primary">
         <Suspense fallback={<div className="dock-empty" role="status">{t("正在加载会话…", "Loading session…")}</div>}>
-          {session.kind === "pty" ? <TerminalPane key={session.id} session={session} fontFamily={snapshot.settings.terminalFontFamily} fontSize={snapshot.settings.terminalFontSize} /> : <ChatPane key={session.id} session={session} onOpenGoal={() => onOpenRun(text(dispatch?.["runId"]) || undefined)} />}
+          {session.kind === "pty" ? <TerminalPane key={session.id} session={session} fontFamily={snapshot.settings.terminalFontFamily} fontSize={snapshot.settings.terminalFontSize} /> : <ChatPane key={session.id} session={session} account={account} trajectoryHost={trajectory ? trajectoryHost : null} onOpenGoal={() => onOpenRun(text(dispatch?.["runId"]) || undefined)} />}
         </Suspense>
       </main>
       {visible && !overlay && <>
@@ -80,13 +82,13 @@ function WorkspaceSession({ session, snapshot, focus, onOpenRun, onToggleFocus }
           const next = event.key === "Home" ? 300 : event.key === "End" ? 560 : event.key === "ArrowLeft" ? width + 20 : event.key === "ArrowRight" ? width - 20 : undefined;
           if (next !== undefined) { event.preventDefault(); saveWidth(Math.min(available - 428, next)); }
         }} />
-        <aside className="workspace-dock-aside" aria-label={t("会话工具", "Session tools")}><ContextDock session={session} snapshot={snapshot} state={dock} onChange={setState} /></aside>
+        <aside className="workspace-dock-aside" aria-label={t("会话工具", "Session tools")}><ContextDock session={session} snapshot={snapshot} state={dock} onChange={setState} onTrajectoryHost={setTrajectoryHost} /></aside>
       </>}
     </div>
     <Sheet open={visible && overlay} onOpenChange={(next) => setState({ ...dock, visible: next })}>
       <SheetContent side="right" className="workspace-dock-sheet" showCloseButton={false}>
         <SheetHeader className="sr-only"><SheetTitle>{t("会话工具", "Session tools")}</SheetTitle><SheetDescription>{t("任务、Diff、执行与工作区终端", "Task, diff, execution and workspace terminal")}</SheetDescription></SheetHeader>
-        {visible && overlay && <ContextDock session={session} snapshot={snapshot} state={dock} onChange={setState} />}
+        {visible && overlay && <ContextDock session={session} snapshot={snapshot} state={dock} onChange={setState} onTrajectoryHost={setTrajectoryHost} />}
       </SheetContent>
     </Sheet>
   </div>;

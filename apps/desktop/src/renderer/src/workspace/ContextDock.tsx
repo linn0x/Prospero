@@ -4,13 +4,13 @@ import type { DesktopSnapshot, JsonObject, SessionInfo, UsageReport } from "../.
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { useLocale } from "../locale";
-import { displayError, shortPath, text } from "../state";
-import { type DockState, openDockTool } from "./dock-state";
+import { reportError, shortPath, text } from "../state";
+import { type DockState, openDockTool, supportsTrajectory } from "./dock-state";
 import { ContextTabs } from "./ContextTabs";
 import { DockTerminal } from "./DockTerminal";
 import { StatusMark } from "./session-presentation";
 
-export function ContextDock({ session, snapshot, state, onChange }: { session: SessionInfo; snapshot: DesktopSnapshot; state: DockState; onChange: (value: DockState) => void }) {
+export function ContextDock({ session, snapshot, state, onChange, onTrajectoryHost }: { session: SessionInfo; snapshot: DesktopSnapshot; state: DockState; onChange: (value: DockState) => void; onTrajectoryHost?: (host: HTMLDivElement | null) => void }) {
   const { t, status } = useLocale();
   const [usage, setUsage] = useState<UsageReport>();
   const [error, setError] = useState<string>();
@@ -28,7 +28,7 @@ export function ContextDock({ session, snapshot, state, onChange }: { session: S
     if (state.active !== "execution") return;
     setLoading(true);
     setError(undefined);
-    void window.prospero.getUsage(session.id).then((value) => { if (active) setUsage(value); }).catch((reason) => { if (active) setError(displayError(reason)); }).finally(() => { if (active) setLoading(false); });
+    void window.prospero.getUsage(session.id).then((value) => { if (active) setUsage(value); }).catch((reason) => { if (active) setError(reportError(reason)); }).finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, [session.id, state.active, revision]);
   useEffect(() => {
@@ -36,7 +36,7 @@ export function ContextDock({ session, snapshot, state, onChange }: { session: S
     if (!taskId || !truncated || state.active !== "task") return;
     setLoading(true);
     setError(undefined);
-    void window.prospero.getOrchestrationTask(taskId).then((task) => { if (active) setFullTask({ id: taskId, updatedAt, task }); }).catch((reason) => { if (active) setError(displayError(reason)); }).finally(() => { if (active) setLoading(false); });
+    void window.prospero.getOrchestrationTask(taskId).then((task) => { if (active) setFullTask({ id: taskId, updatedAt, task }); }).catch((reason) => { if (active) setError(reportError(reason)); }).finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, [taskId, truncated, updatedAt, state.active, revision]);
   const task = preview && fullTask?.id === taskId && fullTask.updatedAt === updatedAt ? { ...fullTask.task, ...preview, spec: fullTask.task["spec"] } : preview;
@@ -46,12 +46,12 @@ export function ContextDock({ session, snapshot, state, onChange }: { session: S
     try {
       const result = await window.prospero.revealPath(text(dispatch?.["worktreePath"], session.cwd));
       if (!result.ok) throw new Error(result.error || t("无法打开工作区", "Unable to open workspace"));
-    } catch (reason) { setError(displayError(reason)); } finally { setLoading(false); }
+    } catch (reason) { setError(reportError(reason)); } finally { setLoading(false); }
   };
   return <div className="context-dock">
-    <ContextTabs state={state} onChange={onChange} onHide={() => onChange({ ...state, visible: false })} />
+    <ContextTabs state={state} onChange={onChange} onHide={() => onChange({ ...state, visible: false })} trajectory={supportsTrajectory(session)} />
     {state.active ? <div className="context-dock-panel" role="tabpanel" id={`dock-panel-${state.active}`} aria-labelledby={`dock-tab-${state.active}`} tabIndex={0}>
-      {state.active === "terminal" ? <DockTerminal session={session} snapshot={snapshot} /> : <div className="context-dock-content">
+      {state.active === "trajectory" && supportsTrajectory(session) ? <div className="context-trajectory-host" ref={onTrajectoryHost} /> : state.active === "terminal" ? <DockTerminal session={session} snapshot={snapshot} /> : <div className="context-dock-content">
         {error && <div className="workspace-action-error" role="alert"><span>{error}</span><Button size="xs" variant="ghost" disabled={loading} onClick={() => state.active === "diff" ? void reveal() : setRevision((value) => value + 1)}>{t("重试", "Retry")}</Button></div>}
         {state.active === "task" && (task ? <>
           <div className="dock-task-title"><Badge variant="secondary">{status(text(task["status"]))}</Badge><strong>{text(task["title"])}</strong></div>

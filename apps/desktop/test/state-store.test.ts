@@ -24,6 +24,13 @@ afterEach(() => {
 });
 
 describe("Electron state snapshot caching", () => {
+  it("uses the larger terminal default without overwriting saved font preferences", () => {
+    const home = testHome();
+    expect(new StateStore(home).settingsSnapshot().terminalFontSize).toBe(14);
+    writeJson(home, "desktop.json", { settings: { terminalFontFamily: "My Mono, monospace", terminalFontSize: 18 } });
+    expect(new StateStore(home).settingsSnapshot()).toMatchObject({ terminalFontFamily: "My Mono, monospace", terminalFontSize: 18 });
+  });
+
   it("retains live session model controls without granting missing capabilities", () => {
     const home = testHome();
     const agentControls = { compact: false, model: true, mode: false, currentModel: "provider/model", currentEffort: "high" };

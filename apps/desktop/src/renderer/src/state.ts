@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { notify } from "./notifications/notifications";
 import { applyDesktopSnapshotPatch, mergeDesktopSnapshotPatches } from "../../shared/snapshot-patch";
 import type { DesktopSnapshot, DesktopSnapshotPatch } from "../../shared/types";
 
@@ -62,7 +63,7 @@ export function useDesktopSnapshot(): DesktopSnapshotState {
           setSnapshot(initial);
           return;
         }
-        setError(displayError(reason));
+        setError(reportError(reason));
       });
     const unsubscribe = window.prospero.subscribeSnapshot((patch) => {
       if (!active) return;
@@ -83,6 +84,12 @@ export function useDesktopSnapshot(): DesktopSnapshotState {
     return () => { active = false; unsubscribe(); };
   }, [attempt]);
   return { snapshot, error, retry };
+}
+
+export function reportError(error: unknown): string {
+  const message = displayError(error);
+  notify({ kind: "error", message });
+  return message;
 }
 
 export function displayError(error: unknown): string {

@@ -1,3 +1,4 @@
+import type { WindowMenuAction, WindowMenuRequest } from "./window-menu";
 import type { AgentAccountConfig, AgentAccountFeatureError, AgentApiCatalogModel, AgentReasoningEffort, C2SAgentAccountApiModelsGet, C2SAgentAccountConfigSet, S2CAgentAccountApiModelsResult, S2CAgentAccountConfigResult } from "@prospero/protocol";
 import type { ModelSource, ModelSourceAction, S2CModelSourceResult } from "@prospero/protocol";
 export type { ModelSource, ModelSourceRoute, ModelSourceAction, ModelSourceMigration, ModelSourceBinding, S2CModelSourceResult } from "@prospero/protocol";
@@ -308,6 +309,7 @@ export type DesktopApi = {
   openWindowsTerminal(path: string): Promise<{ ok: boolean; error?: string }>;
   /** 宿主平台。静态值,用来让"在资源管理器中打开"这类字样跟着系统走。 */
   platform: NodeJS.Platform;
+  openWindowMenu(request: WindowMenuRequest): Promise<WindowMenuAction | null>;
   listNetworkInterfaces(): Promise<Array<{ label: string; address: string }>>;
   /** 剪贴板走主进程:渲染进程的权限被一律拒绝,网页 Clipboard API 在这里用不了。 */
   /** 终端里的链接交给系统浏览器;主进程只放行 http(s)。 */

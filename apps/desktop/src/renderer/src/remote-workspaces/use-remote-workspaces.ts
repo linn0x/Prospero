@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { RemoteWorkspace } from "../../../shared/types";
-import { displayError } from "../state";
+import { reportError } from "../state";
 
 export function useRemoteWorkspaces() {
   const [workspaces, setWorkspaces] = useState<RemoteWorkspace[]>([]);
@@ -15,7 +15,7 @@ export function useRemoteWorkspaces() {
       const next = await window.prospero.listRemoteWorkspaces();
       if (token === generation.current) { setWorkspaces(next); setError(undefined); setReady(true); }
     } catch (reason) {
-      if (token === generation.current) setError(displayError(reason));
+      if (token === generation.current) setError(reportError(reason));
     } finally {
       if (token === generation.current) setLoading(false);
     }

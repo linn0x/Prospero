@@ -1,22 +1,22 @@
 .account-model-input { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .account-model-input > input { flex: 1; min-width: 0; }
 .account-model-input > button { flex: none; }
-.account-inline-error { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 10px; border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent); border-radius: 8px; background: var(--danger-soft); color: var(--danger); font-size: 12px; overflow-wrap: anywhere; }
+.account-inline-error { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 10px; border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent); border-radius: var(--ui-radius-panel); background: var(--danger-soft); color: var(--danger); font-size: var(--ui-text-small); overflow-wrap: anywhere; }
 .account-inline-error:focus { outline: 2px solid var(--ring); outline-offset: 2px; }
-.model-catalog { display: grid; gap: 8px; padding: 8px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-sunken); }
+.model-catalog { display: grid; gap: 8px; padding: 8px; border: 1px solid var(--border); border-radius: var(--ui-radius-panel); background: var(--surface-sunken); }
 .model-catalog-options { max-height: 220px; overflow: auto; overscroll-behavior: contain; }
 .model-catalog-options > button { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 8px; min-height: 36px; padding: 7px 8px; border: 0; background: transparent; text-align: left; }
 .model-catalog-options > button > span { display: grid; min-width: 0; gap: 2px; }
 .model-catalog-options strong, .model-catalog-options small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.model-catalog-options small { color: var(--muted-foreground); font-size: 11px; }
+.model-catalog-options small { color: var(--muted-foreground); font-size: var(--ui-text-caption); }
 .model-catalog-options > button[aria-selected="true"] { background: var(--primary-soft); color: var(--foreground); }
 .model-catalog-options > button:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
-.model-catalog-summary { display: flex; align-items: center; justify-content: space-between; min-height: 24px; color: var(--muted-foreground); font-size: 11px; }
+.model-catalog-summary { display: flex; align-items: center; justify-content: space-between; min-height: 24px; color: var(--muted-foreground); font-size: var(--ui-text-caption); }
 .account-config-dialog { width: min(680px, calc(100vw - 32px)); max-width: 680px; }
 .account-config-fields { display: grid; gap: 16px; min-height: 0; max-height: 58vh; overflow: auto; padding: 2px; }
-.account-config-fields summary { cursor: pointer; font-size: 12px; font-weight: 600; }
-.account-config-source { width: 100%; min-height: 200px; margin-top: 8px; resize: vertical; font: 12px/1.6 "Cascadia Mono", Consolas, monospace; tab-size: 2; }
-.account-config-effect, .account-feature-state { display: flex; align-items: center; gap: 8px; color: var(--muted-foreground); font-size: 12px; }
+.account-config-fields summary { cursor: pointer; font-size: var(--ui-text-small); font-weight: 600; }
+.account-config-source { width: 100%; min-height: 200px; margin-top: 8px; resize: vertical; font: var(--ui-text-small)/1.6 var(--ui-font-mono); tab-size: 2; }
+.account-config-effect, .account-feature-state { display: flex; align-items: center; gap: 8px; color: var(--muted-foreground); font-size: var(--ui-text-small); }
 .account-card-status { display: grid; gap: 8px; }
 .account-create-form { display: grid; gap: 16px; min-width: 0; }
 .account-create-form form { display: grid; gap: 12px; }
@@ -27,10 +27,10 @@
 @media (max-width: 760px) { .account-model-input { flex-wrap: wrap; } .account-model-input > input { flex-basis: 100%; } }
 .accounts-page .provider-strip { display: flex; gap: 8px; margin-bottom: 16px; overflow-x: auto; padding-block: 2px; scrollbar-width: thin; }
 .accounts-page .provider-card { display: flex; flex: 1 0 128px; min-width: 128px; align-items: center; gap: 8px; padding: 8px; }
-.accounts-page .provider-card .provider-logo { width: 28px; height: 28px; border-radius: 8px; }
+.accounts-page .provider-card .provider-logo { width: 28px; height: 28px; border-radius: var(--ui-radius-panel); }
 .accounts-page .provider-card > div:last-child { min-width: 0; }
-.accounts-page .provider-card strong { font-size: 12px; }
-.accounts-page .provider-card p { margin: 2px 0 0; font-size: 11px; }
+.accounts-page .provider-card strong { font-size: var(--ui-text-small); }
+.accounts-page .provider-card p { margin: 2px 0 0; font-size: var(--ui-text-caption); }
 .accounts-page .account-form { grid-row: auto; order: 0; }
 .accounts-page .account-layout > section:first-child { grid-row: auto; }
 .accounts-page .account-card-rich { grid-template-rows: auto minmax(0, 1fr) auto; align-content: start; }

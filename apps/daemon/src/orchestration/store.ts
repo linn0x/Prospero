@@ -269,6 +269,9 @@ export class OrchestrationStore {
     this.desktopFile = home ? path.join(home, "orchestration-desktop.json") : null;
     this.load();
     this.resetEventShadow();
+    // Persist the authoritative empty state before publishing its projection.
+    // Windows may terminate the child without running close() on app exit.
+    if (this.file && !existsSync(this.file)) this.persistNow();
     if (this.file && existsSync(this.file)) {
       const backup = `${this.file}.bak`;
       const serialized = this.serializedState();
@@ -300,11 +303,26 @@ export class OrchestrationStore {
     } catch (backupError) {
       const primaryMissing = (primaryError as NodeJS.ErrnoException | null)?.code === "ENOENT";
       const backupMissing = (backupError as NodeJS.ErrnoException).code === "ENOENT";
-      if (primaryMissing && backupMissing && (!this.desktopFile || !existsSync(this.desktopFile))) return;
+      if (primaryMissing && backupMissing && this.hasOnlyInitialProjection()) return;
       throw new OrchestrationStorageError(
         "编排状态损坏且没有可恢复备份，已停止加载以保护原文件",
         primaryMissing ? backupError : primaryError,
       );
+    }
+  }
+
+  private hasOnlyInitialProjection(): boolean {
+    if (!this.desktopFile || !existsSync(this.desktopFile)) return true;
+    try {
+      // Older releases could leave only this exact, untouched empty projection.
+      // A nonzero revision or any saved entity is evidence of missing user data.
+      const projection = JSON.parse(readFileSync(this.desktopFile, "utf8")) as Record<string, unknown>;
+      const collections = ["runs", "tasks", "dispatches", "gates", "worktreeAssets"];
+      return projection.version === 1 && projection.revision === 0
+        && Object.keys(projection).every((key) => ["version", "revision", ...collections].includes(key))
+        && collections.every((key) => Array.isArray(projection[key]) && projection[key].length === 0);
+    } catch {
+      return false;
     }
   }
 

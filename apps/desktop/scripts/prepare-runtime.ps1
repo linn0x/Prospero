@@ -14,6 +14,18 @@ if (-not $runtimeFull.StartsWith($appRoot, [StringComparison]::OrdinalIgnoreCase
   throw "Refusing to stage runtime outside the Windows desktop package"
 }
 
+if ([string]::IsNullOrWhiteSpace($NodeExecutable)) {
+  $NodeExecutable = (Get-Command node.exe -ErrorAction Stop).Source
+}
+$nodeResolved = (Resolve-Path $NodeExecutable).Path
+$nodeBytes = [IO.File]::ReadAllBytes($nodeResolved)
+$peOffset = [BitConverter]::ToInt32($nodeBytes, 60)
+$machine = [BitConverter]::ToUInt16($nodeBytes, $peOffset + 4)
+$expectedMachine = if ($Architecture -eq "arm64") { 0xAA64 } else { 0x8664 }
+if ($machine -ne $expectedMachine) {
+  throw "Node executable does not match Windows $Architecture. Supply -NodeExecutable with the matching Node build."
+}
+
 if (-not $SkipBuild) {
   & npm.cmd run build --workspace=@prospero/protocol
   if ($LASTEXITCODE -ne 0) { throw "Protocol build failed" }
@@ -31,10 +43,6 @@ $nodeRoot = Join-Path $runtimeFull "node"
 $daemonRoot = Join-Path $runtimeFull "daemon"
 New-Item -ItemType Directory -Path $nodeRoot, $daemonRoot | Out-Null
 
-if ([string]::IsNullOrWhiteSpace($NodeExecutable)) {
-  $NodeExecutable = (Get-Command node.exe -ErrorAction Stop).Source
-}
-$nodeResolved = (Resolve-Path $NodeExecutable).Path
 Copy-Item -LiteralPath $nodeResolved -Destination (Join-Path $nodeRoot "node.exe")
 $nodeLicense = Join-Path (Split-Path $nodeResolved) "LICENSE"
 if (Test-Path -LiteralPath $nodeLicense) {
@@ -64,6 +72,7 @@ if (-not $protocolPack -or -not $nativePack -or -not $daemonPack) { throw "Runti
 $runtimeManifest = @{
   private = $true
   type = "module"
+  prosperoRuntime = @{ platform = "win32"; architecture = $Architecture }
   dependencies = @{
     "@prospero/protocol" = "file:packs/$($protocolPack.Name)"
     "@prospero/windows-native" = "file:packs/$($nativePack.Name)"

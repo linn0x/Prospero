@@ -6,14 +6,14 @@ const catalog: AgentModelCatalog = { models: [{ id: "test/model", label: "Test m
 const session: SessionInfo = { id: "s", cwd: "/repo", agent: "codex", kind: "structured", title: "Session", status: "running", agentControls: { model: true, mode: false, compact: false } };
 
 describe("workspace model catalog", () => {
-  it("requires explicit daemon and account capability, and never supports PTY", () => {
+  it("uses the active session capability, including API accounts, and never supports PTY", () => {
     expect(modelSwitchSupported(session)).toBe(true);
     expect(modelSwitchSupported({ ...session, kind: "pty" })).toBe(false);
     expect(modelSwitchSupported({ ...session, agentControls: { model: false, mode: false, compact: false } })).toBe(false);
     const legacy = { ...session };
     delete legacy.agentControls;
     expect(modelSwitchSupported(legacy)).toBe(false);
-    expect(modelSwitchSupported(session, { capabilities: { modelSelection: false } })).toBe(false);
+    expect(modelSwitchSupported(session, { capabilities: { modelSelection: false } })).toBe(true);
   });
 
   it("filters efforts against the chosen model and allows model default", () => {

@@ -9,7 +9,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { ModelCapabilitiesFields } from "../ModelCapabilitiesFields";
 import { accountApiConnectionLocked, accountApiEngineLabel, accountApiProtocolDefaults, accountApiProtocolFromProfile, accountApiProtocolLabel, accountApiProtocolsForAgent, modelCapabilityDraft, type AccountApiProtocol } from "../account-profile-form";
 import { useLocale } from "../locale";
-import { displayError, record, text } from "../state";
+import { reportError, record, text } from "../state";
 import { accountEditActions, accountModelCatalogRequest, type AccountEditDraft } from "./account-form-actions";
 import { ModelCatalogPicker } from "./ModelCatalogPicker";
 
@@ -65,7 +65,7 @@ function AccountEditForm({ account, apiProtocolsSupported, apiValidationSupporte
         onSaved();
         onClose();
       }
-    } catch (reason) { if (mounted.current) setError(displayError(reason)); }
+    } catch (reason) { if (mounted.current) setError(reportError(reason)); }
     finally { pending.current = false; if (mounted.current) setBusy(false); }
   };
   const close = () => { if (!pending.current) { change("apiKey", ""); onClose(); } };

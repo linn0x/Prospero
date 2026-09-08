@@ -1,13 +1,13 @@
-import { FileDiff, ListChecks, Play, Plus, SquareTerminal, X } from "lucide-react";
+import { FileDiff, ListChecks, Play, Plus, Route, SquareTerminal, X } from "lucide-react";
 import { Button } from "../components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuTrigger } from "../components/ui/dropdown-menu";
 import { useLocale } from "../locale";
 import { DOCK_TOOLS, closeDockTool, openDockTool, type DockState, type DockTool } from "./dock-state";
 
-export function ContextTabs({ state, onChange, onHide }: { state: DockState; onChange: (value: DockState) => void; onHide: () => void }) {
+export function ContextTabs({ state, onChange, onHide, trajectory = false }: { state: DockState; onChange: (value: DockState) => void; onHide: () => void; trajectory?: boolean }) {
   const { t } = useLocale();
-  const labels: Record<DockTool, string> = { task: t("任务", "Task"), diff: "Diff", execution: t("执行", "Execution"), terminal: t("终端", "Terminal") };
-  const icons = { task: ListChecks, diff: FileDiff, execution: Play, terminal: SquareTerminal };
+  const labels: Record<DockTool, string> = { task: t("任务", "Task"), diff: "Diff", execution: t("执行", "Execution"), terminal: t("终端", "Terminal"), trajectory: t("轨迹", "Trajectory") };
+  const icons = { task: ListChecks, diff: FileDiff, execution: Play, terminal: SquareTerminal, trajectory: Route };
   const focus = (tool: DockTool | undefined): void => { if (tool) window.requestAnimationFrame(() => document.getElementById(`dock-tab-${tool}`)?.focus()); };
   const close = (tool: DockTool): void => { const next = closeDockTool(state, tool); onChange(next); focus(next.active); };
   return <div className="context-dock-tabbar">
@@ -24,7 +24,7 @@ export function ContextTabs({ state, onChange, onHide }: { state: DockState; onC
         </div>;
       })}
     </div>
-    <DropdownMenu><DropdownMenuTrigger render={<Button size="icon-xs" variant="ghost" aria-label={t("打开工具标签", "Open tool tab")} />}><Plus /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuGroup>{DOCK_TOOLS.map((tool) => { const Icon = icons[tool]; return <DropdownMenuItem key={tool} onClick={() => { onChange(openDockTool(state, tool)); focus(tool); }}><Icon />{labels[tool]}</DropdownMenuItem>; })}</DropdownMenuGroup></DropdownMenuContent></DropdownMenu>
+    <DropdownMenu><DropdownMenuTrigger render={<Button size="icon-xs" variant="ghost" aria-label={t("打开工具标签", "Open tool tab")} />}><Plus /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuGroup>{DOCK_TOOLS.filter((tool) => tool !== "trajectory" || trajectory).map((tool) => { const Icon = icons[tool]; return <DropdownMenuItem key={tool} onClick={() => { onChange(openDockTool(state, tool)); focus(tool); }}><Icon />{labels[tool]}</DropdownMenuItem>; })}</DropdownMenuGroup></DropdownMenuContent></DropdownMenu>
     <Button size="icon-xs" variant="ghost" aria-label={t("隐藏工具栏", "Hide tools")} onClick={onHide}><X /></Button>
   </div>;
 }

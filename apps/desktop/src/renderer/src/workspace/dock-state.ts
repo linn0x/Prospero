@@ -1,4 +1,4 @@
-export const DOCK_TOOLS = ["task", "diff", "execution", "terminal"] as const;
+export const DOCK_TOOLS = ["task", "diff", "execution", "terminal", "trajectory"] as const;
 export type DockTool = typeof DOCK_TOOLS[number];
 export type DockState = { tabs: DockTool[]; active: DockTool | undefined; visible: boolean };
 export type DockPreferences = { version: 1; width: number; sessions: Array<{ id: string; state: DockState }> };
@@ -15,6 +15,16 @@ export function dockNeedsOverlay(available: number, width: number): boolean {
 
 export function defaultDockState(): DockState {
   return { tabs: ["task", "diff", "execution"], active: "task", visible: false };
+}
+
+export function supportsTrajectory(session: { agent: string; kind: string }): boolean {
+  return session.kind === "structured" && session.agent.trim().toLowerCase() === "deepseek";
+}
+
+export function sessionDockState(state: DockState | undefined, trajectory: boolean): DockState {
+  const current = state ?? (trajectory ? { tabs: ["task", "trajectory", "execution"] as DockTool[], active: "task" as const, visible: false } : defaultDockState());
+  const tabs = current.tabs.filter((tool) => tool !== "trajectory" || trajectory);
+  return { ...current, tabs, active: current.active && tabs.includes(current.active) ? current.active : tabs[0] };
 }
 
 export function parseDockPreferences(raw: string | null): DockPreferences {
