@@ -769,6 +769,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     const account = input.accountId
       ? this.resolveAccount(input.agent, input.accountId)
       : undefined;
+    if (account?.sourceAllowsNewSessions === false) throw new SessionError("模型源或模型已停用新会话；已有会话仍可继续", "agent_unavailable");
     const capabilities = account ? getAgentAccountCapabilities(account) : undefined;
     if (account?.apiProfile?.modelCapabilities?.tools === false) {
       throw new SessionError("该模型已配置为不支持工具调用，无法启动 Code Agent；请修复模型能力配置", "agent_unavailable");

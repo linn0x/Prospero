@@ -79,6 +79,7 @@ function AccountEditForm({ account, apiProtocolsSupported, apiValidationSupporte
     <DialogContent className="sm:max-w-xl" showCloseButton={!busy} closeLabel={t("关闭", "Close")} aria-busy={busy}>
       <DialogHeader><DialogTitle>{t("编辑账号", "Edit account")}</DialogTitle><DialogDescription>
         {!apiProfile ? t("修改这个独立 CLI 账号的显示名称。", "Change the display name of this isolated CLI account.")
+          : account.modelSource ? t("这是模型源的固定版本绑定，此处仅修改账号别名。", "This is a pinned model-source binding. Only its account alias can be changed here.")
           : connectionLocked ? t("当前存在活动会话，仅可修改显示名称。", "Only the display name can be changed while sessions are active.")
             : apiProtocolsSupported ? t("API Key 留空会保留已保存的凭据。", "Leave API Key empty to retain the saved credential.")
               : t("旧版 daemon 修改连接设置时需要重新输入 API Key。", "The older daemon requires the API Key again when changing connection settings.")}
@@ -98,7 +99,7 @@ function AccountEditForm({ account, apiProtocolsSupported, apiValidationSupporte
             <ModelCatalogPicker value={draft.model} onChange={value => change("model", value)} request={request} supported={modelCatalogSupported} disabled={busy || connectionLocked}
               unavailableReason={t("连接已更改。请先保存后拉取目录，或输入新 API Key 来测试当前草稿。", "The connection has changed. Save before fetching models, or enter a new API key to test this draft.")} />
             {apiValidationSupported && <ModelCapabilitiesFields value={draft.modelCapabilities} onChange={value => change("modelCapabilities", value)} protocol={draft.protocol} disabled={busy || connectionLocked} effortSupported={modelCatalogSupported} />}
-            {connectionLocked && <FieldDescription>{t("结束活动会话后才能更改连接或模型。", "End active sessions before changing the connection or model.")}</FieldDescription>}
+            {connectionLocked && <FieldDescription>{account.modelSource ? t("请在同页的模型源中修改连接或模型，新会话会使用新版本。", "Edit the connection or model in the source on this page. New sessions use the new version.") : t("结束活动会话后才能更改连接或模型。", "End active sessions before changing the connection or model.")}</FieldDescription>}
           </>}
         </FieldGroup>
         {error && <div ref={errorRef} className="account-inline-error" role="alert" tabIndex={-1}>{error}</div>}

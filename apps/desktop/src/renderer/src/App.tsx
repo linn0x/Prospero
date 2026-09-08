@@ -214,6 +214,9 @@ import { WorkspaceTabs } from "./app-shell/WorkspaceTabs";
 import { AddWorkspaceDialog } from "./remote-workspaces/AddWorkspaceDialog";
 import { RemoteWorkspaceList } from "./remote-workspaces/RemoteWorkspaceList";
 import { useRemoteWorkspaces } from "./remote-workspaces/use-remote-workspaces";
+import { SourceSelector } from "./model-sources/SourceSelector";
+import { useModelSources, runModelSourceAction } from "./model-sources/use-model-sources";
+import { rememberSourceSelection, rememberedSourceSelection, selectedSourceRoute, sourceRouteAgent, type SourceSelection } from "./model-sources/source-state";
 import { sessionLabel, SessionAgentIcon, StatusMark } from "./workspace/session-presentation";
 
 /** Host platform is static and controls native menu labels and shortcuts. */
@@ -3047,6 +3050,7 @@ function NewSessionDialog({
   remoteWorkspaces,
   onRemoteWorkspace,
   onManageHosts,
+  initialSource,
 }: {
   snapshot: DesktopSnapshot;
   project: string | undefined;
@@ -3056,14 +3060,21 @@ function NewSessionDialog({
   remoteWorkspaces: RemoteWorkspace[];
   onRemoteWorkspace: (workspace: RemoteWorkspace, newSession?: boolean) => void;
   onManageHosts: () => void;
+  initialSource: SourceSelection | undefined;
 }) {
   const { t, status } = useLocale();
+  const independentAccounts = useMemo(() => snapshot.accounts.filter(account => !account.modelSource), [snapshot.accounts]);
+  const sourceSupported = snapshot.daemon.running && snapshot.daemon.capabilities?.includes("model.sources.v1") === true && typeof window.prospero.modelSourceAction === "function";
+  const [useSource, setUseSource] = useState(() => sourceSupported && Boolean(initialSource || rememberedSourceSelection()));
+  const [sourceSelection, setSourceSelection] = useState<SourceSelection | undefined>(initialSource);
+  const sourceState = useModelSources(sourceSupported && useSource);
+  const sourceChoice = selectedSourceRoute(sourceState.sources, sourceSelection);
   const [input, setInput] = useState<SessionCreateInput>({
     cwd: project || snapshot.projects[0] || "",
     agent: "codex",
     kind: "structured",
     approvalPolicy: "standard",
-    accountId: defaultSessionLaunchAccountId(snapshot.accounts, "codex"),
+    accountId: defaultSessionLaunchAccountId(independentAccounts, "codex"),
   });
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
@@ -3080,15 +3091,15 @@ function NewSessionDialog({
     [snapshot],
   );
   const launchAccounts = useMemo(
-    () => sessionLaunchAccounts(snapshot.accounts, input.agent),
-    [input.agent, snapshot.accounts],
+    () => sessionLaunchAccounts(independentAccounts, input.agent),
+    [input.agent, independentAccounts],
   );
   const selectedAccount = launchAccounts.find(
     (account) => account.id === input.accountId,
   );
   const requiresStructured = sessionLaunchRequiresStructured(selectedAccount);
-  const selectedKind: SessionCreateInput["kind"] = requiresStructured ? "structured" : input.kind;
-  const accountCanLaunch = !selectedAccount?.apiProfileError && (selectedAccount?.capabilities?.sessionKinds.includes(selectedKind) ?? true);
+  const selectedKind: SessionCreateInput["kind"] = useSource ? sourceChoice?.route.protocol === "openai_chat_completions" ? "structured" : input.kind : requiresStructured ? "structured" : input.kind;
+  const accountCanLaunch = useSource ? sourceSupported && Boolean(sourceChoice) : !selectedAccount?.apiProfileError && (selectedAccount?.capabilities?.sessionKinds.includes(selectedKind) ?? true);
   const selectedWorkspace = launchWorkspaces.find(
     (workspace) => workspace.path === input.cwd,
   );
@@ -3114,14 +3125,14 @@ function NewSessionDialog({
         : workspacePaths.has(current.cwd)
           ? current.cwd
           : launchWorkspaces[0]?.path ?? "";
-      const accounts = sessionLaunchAccounts(snapshot.accounts, current.agent);
+      const accounts = sessionLaunchAccounts(independentAccounts, current.agent);
       const accountId = accounts.some((account) => account.id === current.accountId)
         ? current.accountId
-        : defaultSessionLaunchAccountId(snapshot.accounts, current.agent);
+        : defaultSessionLaunchAccountId(independentAccounts, current.agent);
       if (cwd === current.cwd && accountId === current.accountId) return current;
       return { ...current, cwd, accountId, model: undefined, effort: undefined };
     });
-  }, [launchWorkspaces, open, project, snapshot.accounts]);
+  }, [launchWorkspaces, open, project, independentAccounts]);
   const supportsStructured = [
     "codex",
     "claude",
@@ -3129,6 +3140,7 @@ function NewSessionDialog({
     "opencode",
   ].includes(input.agent);
   const supportsLaunchModels =
+    !useSource &&
     !remoteId &&
     selectedKind === "structured" &&
     (selectedAccount?.capabilities?.modelSelection ?? true) &&
@@ -3203,7 +3215,16 @@ function NewSessionDialog({
     setBusy(true);
     setError(undefined);
     try {
-      onCreated(await window.prospero.createSession({ ...input, kind: selectedKind, model: selectedAccount?.capabilities?.modelSelection === false ? undefined : input.model, effort: selectedAccount?.capabilities?.reasoningEffort === false ? undefined : input.effort }));
+      if (useSource) {
+        if (!sourceChoice || !sourceSelection) throw new Error(t("请选择有效的模型源和模型。", "Choose a valid model source and model."));
+        const bound = await runModelSourceAction({ kind: "bind", sourceId: sourceSelection.sourceId, routeId: sourceSelection.routeId, revision: sourceSelection.revision });
+        if (!bound.accountId) throw new Error(t("模型源没有返回会话绑定。", "The source did not return an account binding."));
+        onCreated(await window.prospero.createSession({ cwd: input.cwd, agent: sourceRouteAgent(sourceChoice.route), accountId: bound.accountId, kind: selectedKind, approvalPolicy: input.approvalPolicy }));
+        rememberSourceSelection(sourceSelection);
+      } else {
+        onCreated(await window.prospero.createSession({ ...input, kind: selectedKind, model: selectedAccount?.capabilities?.modelSelection === false ? undefined : input.model, effort: selectedAccount?.capabilities?.reasoningEffort === false ? undefined : input.effort }));
+        rememberSourceSelection(undefined);
+      }
       onOpenChange(false);
     } catch (reason) {
       setError(displayError(reason));
@@ -3293,6 +3314,8 @@ function NewSessionDialog({
             </FieldDescription>
           </Field>
           {remoteId ? <p className="workspace-picker-hint">{t("在远程电脑的此目录新建交互式 Shell，可运行远端已安装的 codex、claude 等 CLI。不会使用本机账号或本机模型配置。", "Create an interactive Shell in this folder on the remote computer, where you can run its installed codex, claude or other CLI. Local accounts and model settings are not used.")}</p> : <>
+          <div className="model-source-session-mode" role="group" aria-label={t("模型连接方式", "Model connection")}><Button variant={useSource ? "secondary" : "ghost"} aria-pressed={useSource} disabled={busy || !sourceSupported} onClick={() => setUseSource(true)}>{t("共享模型源", "Shared model source")}</Button><Button variant={!useSource ? "secondary" : "ghost"} aria-pressed={!useSource} disabled={busy} onClick={() => setUseSource(false)}>{t("CLI / 独立 Profile", "CLI / independent profile")}</Button></div>
+          {useSource ? <><SourceSelector sources={sourceState.sources} loading={sourceState.loading} error={sourceState.error} value={sourceSelection} onChange={setSourceSelection} onRefresh={() => void sourceState.refresh()} disabled={busy} /><Field><FieldLabel htmlFor="source-session-kind">{t("会话类型", "Session type")}</FieldLabel><NativeSelect id="source-session-kind" value={selectedKind} disabled={busy || sourceChoice?.route.protocol === "openai_chat_completions"} onChange={event => setInput(current => ({ ...current, kind: event.target.value as SessionCreateInput["kind"] }))}><NativeSelectOption value="structured">{t("对话", "Conversation")}</NativeSelectOption><NativeSelectOption value="pty">{t("终端", "Terminal")}</NativeSelectOption></NativeSelect></Field></> : <>
           <div className="grid gap-4 sm:grid-cols-2">
             <Field>
               <FieldLabel htmlFor="session-agent">Agent</FieldLabel>
@@ -3306,7 +3329,7 @@ function NewSessionDialog({
                     ...input,
                     agent,
                     accountId: defaultSessionLaunchAccountId(
-                      snapshot.accounts,
+                      independentAccounts,
                       agent,
                     ),
                     model: undefined,
@@ -3476,6 +3499,7 @@ function NewSessionDialog({
               </Field>
             </div>
           )}
+          </>}
           <Field>
             <FieldLabel htmlFor="session-approval">
               {t("权限配置", "Permission profile")}
@@ -3844,6 +3868,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   );
   const [newSessionOpen, setNewSessionOpen] = useState(false);
   const [newSessionProject, setNewSessionProject] = useState<string>();
+  const [newSessionSource, setNewSessionSource] = useState<SourceSelection>();
   const [runTargetId, setRunTargetId] = useState<string>();
   const [taskTargetId, setTaskTargetId] = useState<string>();
   const [editingProject, setEditingProject] = useState<string>();
@@ -4022,6 +4047,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
         event.preventDefault();
         if (view === "workspaces" && activeRemote) { setRemoteSessionRequest(request => request + 1); return; }
         setNewSessionProject(undefined);
+        setNewSessionSource(undefined);
         setNewSessionOpen(true);
       }
     };
@@ -4066,6 +4092,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   const openNewSession = useCallback((project?: string): void => {
     if (!project && view === "workspaces" && activeRemote) { setRemoteSessionRequest(request => request + 1); return; }
     setNewSessionProject(project);
+    setNewSessionSource(undefined);
     setNewSessionOpen(true);
   }, [activeRemote, view]);
   const toggleArchive = useCallback((id: string): void => {
@@ -4266,7 +4293,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
                 initialTaskId={taskTargetId}
               />
             ) : view === "providers" ? (
-              <AccountsPane snapshot={sessionSnapshot} onOpenSession={openSession} />
+              <AccountsPane snapshot={sessionSnapshot} onOpenSession={openSession} onUseModelSource={selection => { setNewSessionProject(undefined); setNewSessionSource(selection); setNewSessionOpen(true); }} />
             ) : view === "skills" ? (
               <SkillsPane snapshot={sessionSnapshot} />
             ) : view === "diagnostics" ? (
@@ -4287,6 +4314,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
           remoteWorkspaces={remote.workspaces}
           onRemoteWorkspace={openRemoteWorkspace}
           onManageHosts={() => selectView("remote")}
+          initialSource={newSessionSource}
         />
       )}
       {addWorkspaceOpen && <AddWorkspaceDialog onClose={() => setAddWorkspaceOpen(false)} onLocalAdded={cwd => openNewSession(cwd)} onRemoteAdded={openRemoteWorkspace} onManageHosts={() => selectView("remote")} />}

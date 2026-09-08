@@ -41,6 +41,36 @@ describe("API profile model catalogs", () => {
     expect(fetcher.mock.calls[0]?.[1]?.headers).not.toHaveProperty("authorization");
   });
 
+  it("imports explicitly reported gateway limits and capabilities without inferring them from model names", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(response({ data: [
+      { id: "gpt-unknown-thinking-vision" },
+      { id: "gateway", context_window: 128000, max_output_tokens: 16000, capabilities: { tools: true, vision: false, reasoning: true }, supported_reasoning_efforts: ["low", "high", "high"] },
+      { id: "extension", model_capabilities: { contextWindow: 64000, tools: false, api_key: input.apiKey } },
+    ] }));
+    const models = await fetchApiModels(input, { fetch: fetcher });
+    expect(models.find(model => model.id.startsWith("gpt-"))).toEqual({ id: "gpt-unknown-thinking-vision" });
+    expect(models.find(model => model.id === "gateway")?.modelCapabilities).toEqual({ contextWindow: 128000, maxOutputTokens: 16000, tools: true, vision: false, reasoning: true, supportedEfforts: ["low", "high"] });
+    expect(models.find(model => model.id === "extension")?.modelCapabilities).toEqual({ contextWindow: 64000, tools: false });
+    expect(JSON.stringify(models)).not.toContain(input.apiKey);
+  });
+
+  it("reads Anthropic model limits and explicit capability flags without treating code execution as tool support", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(response({ data: [{ id: "claude-example", max_input_tokens: 200000, max_tokens: 64000,
+      capabilities: { code_execution: { supported: true }, image_input: { supported: true }, thinking: { supported: true }, effort: { supported: true, low: { supported: true }, medium: { supported: false }, high: { supported: true }, max: { supported: true } } },
+    }] }));
+    const [model] = await fetchApiModels({ ...input, protocol: "anthropic" }, { fetch: fetcher });
+    expect(model?.modelCapabilities).toEqual({ contextWindow: 200000, maxOutputTokens: 64000, vision: true, reasoning: true, supportedEfforts: ["low", "high", "max"] });
+    expect(model?.modelCapabilities).not.toHaveProperty("tools");
+  });
+
+  it("keeps invalid and contradictory provider parameters unknown while retaining valid flags", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(response({ data: [
+      { id: "invalid", context_window: "128000", max_output_tokens: -1, capabilities: { tools: "true", vision: true }, supported_reasoning_efforts: [input.apiKey] },
+      { id: "conflict", context_window: 100, max_output_tokens: 200, capabilities: { reasoning: false }, supported_reasoning_efforts: ["high"] },
+    ] }));
+    expect(await fetchApiModels(input, { fetch: fetcher })).toEqual([{ id: "conflict", modelCapabilities: { reasoning: false } }, { id: "invalid", modelCapabilities: { vision: true } }]);
+  });
+
   it.each([[401, "authentication"], [403, "authentication"], [404, "unsupported"], [405, "unsupported"], [503, "network"]])("returns a safe typed error for status %s", async (status, code) => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(input.apiKey, { status: status as number }));
     const error = await fetchApiModels(input, { fetch: fetcher }).catch((error: unknown) => error);

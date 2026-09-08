@@ -17,6 +17,7 @@ import { LegacyOrchestrationProjection } from "./legacy-orchestration-projection
 import { sessionInfoFromControl } from "./session-control";
 import { StateStore } from "./state-store";
 import { RemoteHostStore } from "./remote-host-store";
+import { modelSourceRequest, modelSourceResult } from "../shared/model-sources";
 import { RemoteShellManager } from "./remote-shell-manager";
 import { RemoteWorkspaces, RemoteWorkspaceStore } from "./remote-workspaces";
 import { remoteDirectoryRequest } from "../shared/remote-workspaces";
@@ -1136,6 +1137,20 @@ function installIpc(): void {
     } catch {
       return failed("network", "无法读取模型目录，请重试 / Unable to fetch the model catalog; retry");
     }
+  });
+  ipcMain.handle("model-source:action", async (_event, raw: unknown) => {
+    const message = modelSourceRequest(raw, randomUUID());
+    const failed = (code: "unsupported" | "network", detail: string) => ({ type: "model.source.result", requestId: message.requestId, ok: false, error: { code, message: detail } });
+    if (!store.snapshot().daemon.capabilities?.includes("model.sources.v1")) return failed("unsupported", "请更新 daemon 后使用模型源 / Update the daemon to use model sources");
+    const execute = async () => {
+      try {
+        const result = modelSourceResult(await runtime.request("/_prospero/control/model-sources", { method: "POST", body: message, timeoutMs: 45_000, acceptJsonError: true }), message.requestId, message.action.kind);
+        if (result.accounts) store.setAccounts(result.accounts);
+        if (result.sources && result.ok) mainWindow?.webContents.send("model-source:changed", result.sources);
+        return result;
+      } catch { return failed("network", "模型源请求失败，请刷新确认后重试 / Model source request failed; refresh before retrying"); }
+    };
+    return message.action.kind === "list" || message.action.kind === "models" ? execute() : enqueueAccountAction(execute);
   });
   const accountConfiguration = async (raw: unknown, write: boolean) => {
     const message = accountConfigRequest(raw, randomUUID(), write);

@@ -17,6 +17,12 @@ void ipcRenderer.invoke("appearance:get").then(applyAppearance).catch(() => { /*
 document.addEventListener("DOMContentLoaded", () => { if (appearance) applyAppearance(appearance); }, { once: true });
 
 const api: DesktopApi = {
+  modelSourceAction: action => ipcRenderer.invoke("model-source:action", action),
+  subscribeModelSources: listener => {
+    const wrapped = (_event: Electron.IpcRendererEvent, sources: Parameters<typeof listener>[0]) => listener(sources);
+    ipcRenderer.on("model-source:changed", wrapped);
+    return () => ipcRenderer.removeListener("model-source:changed", wrapped);
+  },
   platform: process.platform,
   listNetworkInterfaces: () => ipcRenderer.invoke("network:interfaces"),
   openExternal: (url: string) => ipcRenderer.invoke("external:open", url),
