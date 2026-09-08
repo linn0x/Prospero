@@ -100,6 +100,7 @@ constexpr ULONG kFileRenameInformation =
 constexpr NtStatus kStatusSuccess = 0;
 constexpr NtStatus kStatusPending = 0x00000103L;
 constexpr NtStatus kStatusObjectNameCollision = static_cast<NtStatus>(0xC0000035UL);
+constexpr NtStatus kStatusSharingViolation = static_cast<NtStatus>(0xC0000043UL);
 constexpr NtStatus kStatusNoMoreFiles = static_cast<NtStatus>(0x80000006UL);
 constexpr uint64_t kMaximumStateFileBytes = 64ULL * 1024ULL * 1024ULL;
 // ACLs persisted on file-system objects use the file-specific full-access
@@ -478,7 +479,9 @@ prospero_status OpenRelative(const NtApi* api,
                              ULONG create_options,
                              HANDLE* out_handle,
                              ULONG_PTR* out_information,
-                             PVOID security_descriptor = nullptr) {
+                             PVOID security_descriptor = nullptr,
+                             NtStatus* out_native_status = nullptr) {
+  if (out_native_status != nullptr) *out_native_status = kStatusSuccess;
   if (out_handle != nullptr) *out_handle = INVALID_HANDLE_VALUE;
   if (api == nullptr || name.empty() || name.size() > 32767 || out_handle == nullptr) {
     return PROSPERO_STATUS_INVALID_ARGUMENT;
@@ -498,6 +501,7 @@ prospero_status OpenRelative(const NtApi* api,
   const NtStatus status = api->create_file(&opened, desired_access, &attributes, &status_block,
                                            nullptr, FILE_ATTRIBUTE_NORMAL, share_access,
                                            create_disposition, create_options, nullptr, 0);
+  if (out_native_status != nullptr) *out_native_status = status;
   if (!NtSucceeded(status)) return StatusFromNt(status);
   *out_handle = opened;
   if (out_information != nullptr) *out_information = status_block.information;
@@ -510,12 +514,26 @@ prospero_status OpenStateFile(const NtApi* api,
                               ACCESS_MASK desired_access,
                               ULONG create_disposition,
                               ULONG create_options,
-                              HANDLE* out_file) {
-  const prospero_status opened = OpenRelative(
-      api, directory.directory, file_name, desired_access, FILE_SHARE_READ,
-      create_disposition, create_options | kFileOpenReparsePoint |
-                              kFileSynchronousIoNonalert,
-      out_file, nullptr);
+                              HANDLE* out_file,
+                              bool wait_for_published_writer = false) {
+  // Atomic rename publishes the name before the writer's exclusive handle
+  // closes. A different process can poll that name during this short window.
+  // Retry only that sharing conflict, under the same anchored directory and
+  // unchanged sharing/ACL policy. Persistent locks still fail within 250 ms;
+  // access-denied, reparse and other errors are never retried or downgraded.
+  const ULONGLONG deadline = GetTickCount64() + 250;
+  prospero_status opened;
+  for (;;) {
+    NtStatus native_status = kStatusSuccess;
+    opened = OpenRelative(
+        api, directory.directory, file_name, desired_access, FILE_SHARE_READ,
+        create_disposition, create_options | kFileOpenReparsePoint |
+                                kFileSynchronousIoNonalert,
+        out_file, nullptr, nullptr, &native_status);
+    if (!wait_for_published_writer || native_status != kStatusSharingViolation ||
+        GetTickCount64() >= deadline) break;
+    Sleep(5);
+  }
   if (opened != PROSPERO_STATUS_OK) return opened;
   if (HasReparsePoint(*out_file)) {
     CloseHandle(*out_file);
@@ -967,7 +985,7 @@ extern "C" prospero_status prospero_secure_state_directory_read(
     const prospero_status open_status = OpenStateFile(
         api, *directory, file_name, FILE_READ_DATA | FILE_READ_ATTRIBUTES |
             READ_CONTROL | SYNCHRONIZE,
-        kFileOpen, kFileNonDirectoryFile, &file);
+        kFileOpen, kFileNonDirectoryFile, &file, true);
     if (open_status != PROSPERO_STATUS_OK) return open_status;
     const prospero_status read_status = ReadAll(file, out_data);
     CloseHandle(file);
