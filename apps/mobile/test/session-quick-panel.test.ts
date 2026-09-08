@@ -41,7 +41,9 @@ describe("session quick panel", () => {
 
     expect(source).toContain("<ReanimatedDrawerLayout");
     expect(source).toContain("drawerPosition={DrawerPosition.RIGHT}");
-    expect(source).toContain("edgeWidth={28}");
+    expect(source).toContain(
+      'edgeWidth={Platform.OS === "android" && focused ? 0 : 28}',
+    );
     expect(source).toContain("<SessionQuickPanel");
     expect(source).toContain('accessibilityLabel="打开会话工具"');
   });

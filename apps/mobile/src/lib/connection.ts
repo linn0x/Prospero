@@ -32,6 +32,7 @@ import {
   CAPABILITY_SESSION_CREATE_RESULT,
   CAPABILITY_SUBAGENT_HISTORY,
   CAPABILITY_WORKSPACE_ROOTS,
+  CAPABILITY_WORKSPACE_SUMMARY,
   CLOSE_AUTH_FAILED,
   CLOSE_REVOKED,
   SUPPORTED_PROTOCOL_VERSIONS,
@@ -108,7 +109,7 @@ export type { SessionCreateTask } from "./session-create";
 
 export type { DeliveryResult } from "./outbound-queue";
 
-const APP_VERSION = "0.0.21";
+const APP_VERSION = "0.0.14";
 const ATTEMPT_TIMEOUT_MS = 6000;
 const BACKOFF_MIN = 400;
 const BACKOFF_MAX = 8000;
@@ -282,6 +283,10 @@ export class HostConnection {
 
   get supportsWorkspaceRoots(): boolean {
     return this.supportsCapability(CAPABILITY_WORKSPACE_ROOTS);
+  }
+
+  get supportsWorkspaceSummary(): boolean {
+    return this.supportsCapability(CAPABILITY_WORKSPACE_SUMMARY);
   }
 
   start(): void {
@@ -839,6 +844,7 @@ export class HostConnection {
         this.events.emit("orchestrationSnapshot", msg);
         return;
       case "workspace.listing":
+      case "workspace.summary.result":
       case "conversation.results":
       case "agent.accounts.result":
       case "fs.listing":
@@ -901,7 +907,9 @@ export class HostConnection {
             ? "#accounts"
           : (msg.sid ?? "#account");
     const responsePath =
-      msg.type === "chat.suggestions"
+      msg.type === "workspace.summary.result"
+        ? `#workspace.summary:${msg.requestId}`
+        : msg.type === "chat.suggestions"
         ? `#chat.suggestions:${msg.requestId}`
         : msg.type === "chat.attachment.chunk"
           ? `#chat.attachment:${msg.requestId}`
@@ -1216,6 +1224,11 @@ export class HostConnection {
 
   gitStatus(sid: string): Promise<Extract<S2CMessage, { type: "git.status.result" }>> {
     return this.fsRequest(sid, "#git.status.result", { type: "git.status", sid });
+  }
+
+  workspaceSummary(sid: string): Promise<Extract<S2CMessage, { type: "workspace.summary.result" }>> {
+    const requestId = randomUUID();
+    return this.fsRequest(sid, `#workspace.summary:${requestId}`, { type: "workspace.summary", sid, requestId }, 15_000, false);
   }
 
   gitDiff(

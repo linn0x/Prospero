@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import FontAwesome6 from "@expo/vector-icons/FontAwesome6";
 import type { SessionInfo } from "@prospero/protocol";
 import {
@@ -19,11 +19,18 @@ import {
 } from "react-native";
 
 import { AgentIcon } from "@/components/AgentIcon";
+import { AddDeviceCard } from "@/components/AddDeviceCard";
 import { Icon } from "@/components/Icon";
 import {
-  deviceIndexForCarouselOffset,
-  deviceIndexForRailPosition,
-} from "@/lib/device-quick-switcher";
+  deviceDetailPage,
+  deviceDetailLayout,
+  deviceDetailPageIndex,
+  deviceDetailPosition,
+  settledDeviceDetailPage,
+  type AddDeviceSide,
+  type DeviceDetailPage,
+} from "@/lib/device-detail-pages";
+import { deviceIndexForRailPosition } from "@/lib/device-quick-switcher";
 import {
   homeHostOsLabel,
   homeHostStats,
@@ -205,6 +212,8 @@ function LargeDeviceCard({
   onOpenSession,
   onCreateSession,
   onRefreshHost,
+  onAddBefore,
+  onAddAfter,
 }: {
   host: StoredHost;
   runtime: HostRuntime | undefined;
@@ -219,6 +228,8 @@ function LargeDeviceCard({
   onOpenSession: (sessionId: string) => void;
   onCreateSession: () => void;
   onRefreshHost: () => void;
+  onAddBefore?: () => void;
+  onAddAfter?: () => void;
 }) {
   const stats = homeHostStats(runtime?.sessions);
   const activeSessions = Object.values(runtime?.sessions ?? {})
@@ -237,18 +248,11 @@ function LargeDeviceCard({
   const unreadCompletionCount = completionBaselineReady
     ? unreadCompletedSessionCount(host.id, runtime?.sessions, completionReads)
     : 0;
+  const compact = height < 360;
+  const DetailsContainer = compact ? View : ScrollView;
 
-  return (
-    <Pressable
-      accessibilityRole="button"
-      accessibilityLabel={`${host.name} 设备卡片，点击切换到此设备`}
-      onPress={onSelect}
-      style={[
-        styles.card,
-        { width, height },
-        active ? styles.cardActive : styles.cardAdjacent,
-      ]}
-    >
+  const content = (
+    <>
       <View style={styles.cardHeader}>
         <Pressable
           accessibilityRole="button"
@@ -323,11 +327,13 @@ function LargeDeviceCard({
         />
       </View>
 
-      <ScrollView
-        style={styles.detailsScroll}
-        contentContainerStyle={styles.detailsContent}
-        nestedScrollEnabled
-        showsVerticalScrollIndicator={false}
+      <DetailsContainer
+        style={[styles.detailsScroll, compact && styles.detailsCompact]}
+        {...(!compact ? {
+          contentContainerStyle: styles.detailsContent,
+          nestedScrollEnabled: true,
+          showsVerticalScrollIndicator: false,
+        } : {})}
       >
         <View style={styles.detailSection}>
           <View style={styles.sectionHeading}>
@@ -420,7 +426,66 @@ function LargeDeviceCard({
             <Text style={styles.emptyLine}>连接设备并创建会话后，目录会显示在这里</Text>
           )}
         </View>
-      </ScrollView>
+      </DetailsContainer>
+      {(onAddBefore || onAddAfter) && (
+        <View style={styles.addEdgeHints}>
+          {onAddBefore ? (
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="左侧新增设备"
+              onPress={(event) => {
+                event.stopPropagation();
+                onAddBefore();
+              }}
+              hitSlop={4}
+              style={({ pressed }) => [styles.addEdgeHint, pressed && styles.rowPressed]}
+            >
+              <Icon name="chevron.left" size={12} color={palette.textFaint} />
+              <Text style={styles.addEdgeHintText}>左侧添加新设备</Text>
+            </Pressable>
+          ) : <View />}
+          {onAddAfter && (
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="右侧新增设备"
+              onPress={(event) => {
+                event.stopPropagation();
+                onAddAfter();
+              }}
+              hitSlop={4}
+              style={({ pressed }) => [styles.addEdgeHint, pressed && styles.rowPressed]}
+            >
+              <Text style={styles.addEdgeHintText}>右侧添加新设备</Text>
+              <Icon name="chevron.right" size={12} color={palette.textFaint} />
+            </Pressable>
+          )}
+        </View>
+      )}
+    </>
+  );
+
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={`${host.name} 设备卡片，点击切换到此设备`}
+      onPress={onSelect}
+      style={[
+        styles.card,
+        { width, height },
+        active ? styles.cardActive : styles.cardAdjacent,
+      ]}
+    >
+      {compact ? (
+        <ScrollView
+          style={styles.compactCardScroll}
+          contentContainerStyle={styles.compactCardContent}
+          nestedScrollEnabled
+          showsVerticalScrollIndicator={false}
+          testID="compact-device-detail-scroll"
+        >
+          {content}
+        </ScrollView>
+      ) : content}
     </Pressable>
   );
 }
@@ -450,6 +515,7 @@ function DeviceOsRail({
 
   useEffect(() => {
     lastDragIndexRef.current = activeIndex;
+    if (activeIndex < 0) return;
     const centered = activeIndex * RAIL_ITEM_WIDTH - (width - RAIL_ITEM_WIDTH) / 2 + RAIL_PADDING;
     scrollRef.current?.scrollTo({
       x: Math.min(maximumOffset, Math.max(0, centered)),
@@ -520,8 +586,11 @@ export function DeviceDetailCarousel({
   hosts,
   runtimes,
   activeHostId,
+  addDeviceSide = null,
   onClose,
   onSelectHost,
+  onSelectAddDevice,
+  onPairDevice,
   onSwipePosition,
   onOpenHost,
   onOpenSession,
@@ -532,8 +601,11 @@ export function DeviceDetailCarousel({
   hosts: StoredHost[];
   runtimes: Record<string, HostRuntime>;
   activeHostId: string;
+  addDeviceSide?: AddDeviceSide | null;
   onClose: () => void;
   onSelectHost: (hostId: string) => void;
+  onSelectAddDevice: (side: AddDeviceSide) => void;
+  onPairDevice: (mode: "scan" | "manual") => void;
   onSwipePosition: (position: number) => void;
   onOpenHost: (hostId: string) => void;
   onOpenSession: (hostId: string, sessionId: string) => void;
@@ -543,36 +615,70 @@ export function DeviceDetailCarousel({
   const { palette } = useMobileTheme();
   const styles = useMemo(() => createStyles(palette), [palette]);
   const { width: viewportWidth, height: viewportHeight } = useWindowDimensions();
-  const cardWidth = Math.min(720, Math.max(300, viewportWidth - 32));
-  const cardHeight = Math.min(540, Math.max(430, viewportHeight - 270));
+  const [overlaySize, setOverlaySize] = useState<{ width: number; height: number } | null>(null);
+  const availableWidth = Math.min(viewportWidth, overlaySize?.width ?? viewportWidth);
+  // Navigation and safe-area chrome can reduce the dashboard's height below the window.
+  const availableHeight = Math.min(viewportHeight, overlaySize?.height ?? viewportHeight - 128);
+  const { cardWidth, cardHeight, stageHeight, stageTop } = deviceDetailLayout(availableWidth, availableHeight);
   const cardStride = cardWidth + CARD_GAP;
-  const stageHeight = cardHeight + 98;
-  const sideInset = (viewportWidth - cardWidth) / 2;
-  const railWidth = Math.min(viewportWidth - 48, hosts.length * RAIL_ITEM_WIDTH + RAIL_PADDING * 2);
-  const activeIndex = Math.max(0, hosts.findIndex((host) => host.id === activeHostId));
-  const listRef = useRef<FlatList<StoredHost>>(null);
+  const sideInset = (availableWidth - cardWidth) / 2;
+  const railWidth = Math.min(availableWidth - 48, hosts.length * RAIL_ITEM_WIDTH + RAIL_PADDING * 2);
+  const hostIndex = Math.max(0, hosts.findIndex((host) => host.id === activeHostId));
+  const activeIndex = deviceDetailPageIndex(hostIndex, hosts.length, addDeviceSide);
+  const pages = useMemo(() => Array.from(
+    { length: hosts.length + 2 },
+    (_, index) => deviceDetailPage(index, hosts.length),
+  ), [hosts.length]);
+  const listRef = useRef<FlatList<DeviceDetailPage>>(null);
   const wasVisibleRef = useRef(false);
   const visibleIndexRef = useRef(activeIndex);
   const pendingScrollIndexRef = useRef<number | null>(null);
+  const scrollOffsetRef = useRef(activeIndex * cardStride);
+  const layoutStrideRef = useRef(cardStride);
+  const isDraggingRef = useRef(false);
+  const visibleRef = useRef(visible);
+  const settleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const progress = useAnimatedValue(0);
+
+  useLayoutEffect(() => {
+    visibleRef.current = visible;
+    return () => { visibleRef.current = false; };
+  }, [visible]);
+
+  const clearSettleTimer = useCallback(() => {
+    if (settleTimerRef.current !== null) clearTimeout(settleTimerRef.current);
+    settleTimerRef.current = null;
+  }, []);
 
   useEffect(() => {
     progress.stopAnimation();
-    Animated.timing(progress, {
-      toValue: visible ? 1 : 0,
-      duration: visible ? 220 : 160,
-      easing: visible ? Easing.out(Easing.cubic) : Easing.in(Easing.quad),
+    progress.setValue(0);
+    if (!visible) return undefined;
+    const animation = Animated.timing(progress, {
+      toValue: 1,
+      duration: 220,
+      easing: Easing.out(Easing.cubic),
       useNativeDriver: true,
-    }).start();
+    });
+    animation.start();
+    return () => {
+      animation.stop();
+      progress.stopAnimation();
+      progress.setValue(0);
+    };
   }, [progress, visible]);
 
   useEffect(() => {
     if (!visible) {
       wasVisibleRef.current = false;
       pendingScrollIndexRef.current = null;
+      isDraggingRef.current = false;
+      clearSettleTimer();
       return undefined;
     }
-    if (wasVisibleRef.current) {
+    const layoutChanged = layoutStrideRef.current !== cardStride;
+    layoutStrideRef.current = cardStride;
+    if (wasVisibleRef.current && !layoutChanged) {
       if (
         visibleIndexRef.current === activeIndex
         || pendingScrollIndexRef.current === activeIndex
@@ -583,6 +689,9 @@ export function DeviceDetailCarousel({
     } else {
       wasVisibleRef.current = true;
       visibleIndexRef.current = activeIndex;
+      pendingScrollIndexRef.current = null;
+      scrollOffsetRef.current = activeIndex * cardStride;
+      onSwipePosition(activeIndex - 1);
     }
     const frame = requestAnimationFrame(() => {
       listRef.current?.scrollToOffset({
@@ -591,7 +700,7 @@ export function DeviceDetailCarousel({
       });
     });
     return () => cancelAnimationFrame(frame);
-  }, [activeIndex, cardStride, visible]);
+  }, [activeIndex, cardStride, clearSettleTimer, onSwipePosition, visible]);
 
   useEffect(() => {
     if (!visible) return undefined;
@@ -602,42 +711,81 @@ export function DeviceDetailCarousel({
     return () => subscription.remove();
   }, [onClose, visible]);
 
-  useEffect(() => () => progress.stopAnimation(), [progress]);
+  useEffect(() => () => {
+    clearSettleTimer();
+    progress.stopAnimation();
+    progress.setValue(0);
+  }, [clearSettleTimer, progress]);
+
+  const publishPage = useCallback((index: number): void => {
+    if (!visibleRef.current) return;
+    const page = deviceDetailPage(index, hosts.length);
+    if (page.kind === "add") {
+      onSelectAddDevice(page.side);
+    } else {
+      const host = hosts[page.hostIndex];
+      if (host) onSelectHost(host.id);
+    }
+  }, [hosts, onSelectAddDevice, onSelectHost]);
 
   const selectIndex = useCallback((index: number, animated = true): void => {
-    const host = hosts[index];
-    if (!host) return;
+    if (!visibleRef.current || index < 0 || index >= pages.length) return;
+    clearSettleTimer();
+    isDraggingRef.current = false;
     pendingScrollIndexRef.current = animated ? index : null;
-    if (!animated) visibleIndexRef.current = index;
+    if (!animated) {
+      visibleIndexRef.current = index;
+      scrollOffsetRef.current = index * cardStride;
+      onSwipePosition(index - 1);
+    }
     listRef.current?.scrollToOffset({ offset: index * cardStride, animated });
-    onSelectHost(host.id);
-  }, [cardStride, hosts, onSelectHost]);
+    publishPage(index);
+  }, [cardStride, clearSettleTimer, onSwipePosition, pages.length, publishPage]);
 
-  const handleCarouselEnd = useCallback((event: NativeSyntheticEvent<NativeScrollEvent>): void => {
-    const index = deviceIndexForCarouselOffset(
-      event.nativeEvent.contentOffset.x,
+  const settleCarousel = useCallback((): void => {
+    clearSettleTimer();
+    if (!visibleRef.current || isDraggingRef.current) return;
+    const index = settledDeviceDetailPage(
+      scrollOffsetRef.current,
       cardStride,
       hosts.length,
+      pendingScrollIndexRef.current,
     );
-    if (index < 0) return;
+    if (index === null) return;
     visibleIndexRef.current = index;
-    const pendingIndex = pendingScrollIndexRef.current;
-    if (pendingIndex !== null) {
-      if (index === pendingIndex) pendingScrollIndexRef.current = null;
-      return;
+    pendingScrollIndexRef.current = null;
+    if (index !== activeIndex) publishPage(index);
+    const targetOffset = index * cardStride;
+    if (Math.abs(scrollOffsetRef.current - targetOffset) > 1) {
+      pendingScrollIndexRef.current = index;
+      listRef.current?.scrollToOffset({ offset: targetOffset, animated: true });
+    } else {
+      onSwipePosition(index - 1);
     }
-    const host = hosts[index];
-    if (host && index !== activeIndex) onSelectHost(host.id);
-  }, [activeIndex, cardStride, hosts, onSelectHost]);
+  }, [activeIndex, cardStride, clearSettleTimer, hosts.length, onSwipePosition, publishPage]);
+
+  const scheduleSettle = useCallback(() => {
+    clearSettleTimer();
+    // Android may omit momentum callbacks for a slow drag. Settle only after scrolling is quiet.
+    settleTimerRef.current = setTimeout(settleCarousel, 160);
+  }, [clearSettleTimer, settleCarousel]);
+
+  const handleCarouselEnd = useCallback((event: NativeSyntheticEvent<NativeScrollEvent>): void => {
+    scrollOffsetRef.current = event.nativeEvent.contentOffset.x;
+    settleCarousel();
+  }, [settleCarousel]);
 
   const handleCarouselScroll = useCallback((
     event: NativeSyntheticEvent<NativeScrollEvent>,
   ): void => {
-    if (!visible) return;
-    onSwipePosition(event.nativeEvent.contentOffset.x / cardStride);
-  }, [cardStride, onSwipePosition, visible]);
+    if (!visibleRef.current) return;
+    scrollOffsetRef.current = event.nativeEvent.contentOffset.x;
+    onSwipePosition(deviceDetailPosition(scrollOffsetRef.current, cardStride, hosts.length));
+    if (!isDraggingRef.current) scheduleSettle();
+  }, [cardStride, hosts.length, onSwipePosition, scheduleSettle]);
 
-  if (hosts.length <= 1) return null;
+  // Removing the native overlay is independent of animation completion or interruption.
+  if (!visible || hosts.length === 0) return null;
 
   return (
     <View
@@ -646,6 +794,11 @@ export function DeviceDetailCarousel({
       importantForAccessibility={visible ? "yes" : "no-hide-descendants"}
       accessibilityViewIsModal={visible}
       style={styles.overlay}
+      onLayout={({ nativeEvent }) => {
+        const { width, height } = nativeEvent.layout;
+        setOverlaySize((previous) => previous?.width === width && previous.height === height
+          ? previous : { width, height });
+      }}
       testID="device-detail-carousel"
     >
       <Animated.View
@@ -664,11 +817,12 @@ export function DeviceDetailCarousel({
       />
       <Animated.View
         pointerEvents="auto"
+        testID="device-detail-stage"
         style={[
           styles.stage,
           {
             height: stageHeight,
-            marginTop: -stageHeight / 2,
+            top: stageTop,
             opacity: progress,
             transform: [
               {
@@ -685,10 +839,12 @@ export function DeviceDetailCarousel({
           style={styles.stageShield}
           testID="device-detail-stage-backdrop"
         />
-        <View style={[styles.modeHeader, { width: cardWidth }]}>
-          <View>
-            <Text style={styles.modeTitle}>设备详情</Text>
-            <Text style={styles.modeHint}>左右滑动设备 · 卡片内容可上下滚动</Text>
+        <View style={[styles.modeHeader, { width: cardWidth }]} testID="device-detail-heading">
+          <View style={styles.modeCopy}>
+            <Text style={styles.modeTitle}>{addDeviceSide ? "新增设备" : "设备详情"}</Text>
+            <Text style={styles.modeHint}>
+              {addDeviceSide ? "选择一种方式连接电脑" : "左右滑动设备 · 滑到两端添加新设备"}
+            </Text>
           </View>
           <Pressable
             accessibilityRole="button"
@@ -703,7 +859,8 @@ export function DeviceDetailCarousel({
 
         <FlatList
           ref={listRef}
-          data={hosts}
+          data={pages}
+          initialScrollIndex={activeIndex}
           horizontal
           showsHorizontalScrollIndicator={false}
           decelerationRate="fast"
@@ -711,7 +868,9 @@ export function DeviceDetailCarousel({
           snapToInterval={cardStride}
           snapToAlignment="start"
           nestedScrollEnabled
-          keyExtractor={(host) => host.id}
+          keyExtractor={(page) => page.kind === "add"
+            ? `add-device-${page.side}`
+            : `device-${hosts[page.hostIndex].id}`}
           getItemLayout={(_data, index) => ({
             length: cardStride,
             offset: cardStride * index,
@@ -721,54 +880,80 @@ export function DeviceDetailCarousel({
           ItemSeparatorComponent={() => <View style={{ width: CARD_GAP }} />}
           onScroll={handleCarouselScroll}
           scrollEventThrottle={16}
+          onScrollBeginDrag={() => {
+            clearSettleTimer();
+            pendingScrollIndexRef.current = null;
+            isDraggingRef.current = true;
+          }}
+          onScrollEndDrag={(event) => {
+            scrollOffsetRef.current = event.nativeEvent.contentOffset.x;
+            isDraggingRef.current = false;
+            scheduleSettle();
+          }}
           onMomentumScrollEnd={handleCarouselEnd}
-          extraData={activeHostId}
-          style={{ flexGrow: 0, height: cardHeight }}
-          renderItem={({ item: host, index }) => (
-            <LargeDeviceCard
-              host={host}
-              runtime={runtimes[host.id]}
-              active={index === activeIndex}
-              width={cardWidth}
-              height={cardHeight}
-              palette={palette}
-              styles={styles}
-              onSelect={() => selectIndex(index)}
-              onConfirmSelect={() => {
-                onSelectHost(host.id);
-                onClose();
-              }}
-              onOpenHost={() => {
-                onSelectHost(host.id);
-                onClose();
-                onOpenHost(host.id);
-              }}
-              onOpenSession={(sessionId) => {
-                onSelectHost(host.id);
-                onClose();
-                onOpenSession(host.id, sessionId);
-              }}
-              onCreateSession={() => {
-                onSelectHost(host.id);
-                onClose();
-                onCreateSession(host.id);
-              }}
-              onRefreshHost={() => {
-                onSelectHost(host.id);
-                onRefreshHost(host.id);
-              }}
-            />
-          )}
+          extraData={`${activeHostId}:${addDeviceSide ?? "device"}`}
+          style={{ width: availableWidth, flexGrow: 0, height: cardHeight }}
+          renderItem={({ item: page, index }) => {
+            if (page.kind === "add") {
+              return (
+                <AddDeviceCard
+                  width={cardWidth}
+                  height={cardHeight}
+                  active={index === activeIndex}
+                  onPairDevice={onPairDevice}
+                />
+              );
+            }
+            const host = hosts[page.hostIndex];
+            return (
+              <LargeDeviceCard
+                host={host}
+                runtime={runtimes[host.id]}
+                active={index === activeIndex}
+                width={cardWidth}
+                height={cardHeight}
+                palette={palette}
+                styles={styles}
+                onSelect={() => selectIndex(index)}
+                onAddBefore={page.hostIndex === 0 ? () => selectIndex(0) : undefined}
+                onAddAfter={page.hostIndex === hosts.length - 1
+                  ? () => selectIndex(hosts.length + 1) : undefined}
+                onConfirmSelect={() => {
+                  onSelectHost(host.id);
+                  onClose();
+                }}
+                onOpenHost={() => {
+                  onSelectHost(host.id);
+                  onClose();
+                  onOpenHost(host.id);
+                }}
+                onOpenSession={(sessionId) => {
+                  onSelectHost(host.id);
+                  onClose();
+                  onOpenSession(host.id, sessionId);
+                }}
+                onCreateSession={() => {
+                  onSelectHost(host.id);
+                  onClose();
+                  onCreateSession(host.id);
+                }}
+                onRefreshHost={() => {
+                  onSelectHost(host.id);
+                  onRefreshHost(host.id);
+                }}
+              />
+            );
+          }}
         />
 
         <DeviceOsRail
           hosts={hosts}
           runtimes={runtimes}
-          activeIndex={activeIndex}
+          activeIndex={addDeviceSide ? -1 : hostIndex}
           width={railWidth}
           palette={palette}
           styles={styles}
-          onSelectIndex={selectIndex}
+          onSelectIndex={(index) => selectIndex(index + 1)}
         />
       </Animated.View>
     </View>
@@ -806,7 +991,6 @@ function createStyles(palette: ThemePalette) {
     },
     stage: {
       position: "absolute",
-      top: "50%",
       right: 0,
       left: 0,
       zIndex: 2,
@@ -823,20 +1007,22 @@ function createStyles(palette: ThemePalette) {
       left: 0,
     },
     modeHeader: {
-      minHeight: 38,
+      height: 44,
+      flexShrink: 0,
       flexDirection: "row",
       alignItems: "center",
       justifyContent: "space-between",
       paddingHorizontal: 4,
     },
+    modeCopy: { flex: 1, minWidth: 0 },
     modeTitle: { color: "#FFFFFF", fontSize: 15, fontWeight: "700" },
-    modeHint: { color: "#D7DCE3", fontSize: 9.5, marginTop: 2 },
+    modeHint: { color: "#D7DCE3", fontSize: 11, marginTop: 2 },
     closeButton: {
-      width: 34,
-      height: 34,
+      width: 44,
+      height: 44,
       alignItems: "center",
       justifyContent: "center",
-      borderRadius: 17,
+      borderRadius: 22,
       backgroundColor: palette.surface,
     },
     card: {
@@ -915,6 +1101,9 @@ function createStyles(palette: ThemePalette) {
     },
     actionLabel: { color: palette.accent, fontSize: 10, fontWeight: "600" },
     detailsScroll: { flex: 1, marginTop: space.sm },
+    detailsCompact: { flex: 0, gap: space.md, paddingBottom: space.md },
+    compactCardScroll: { flex: 1 },
+    compactCardContent: { paddingBottom: 2 },
     detailsContent: { gap: space.md, paddingBottom: space.md },
     detailSection: { gap: 5 },
     sectionHeading: {
@@ -946,6 +1135,19 @@ function createStyles(palette: ThemePalette) {
       backgroundColor: palette.surfaceRaised,
     },
     rowPressed: { opacity: 0.62 },
+    addEdgeHints: {
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "space-between",
+      marginTop: 3,
+    },
+    addEdgeHint: {
+      minHeight: 36,
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 3,
+    },
+    addEdgeHintText: { color: palette.textFaint, fontSize: 9.5 },
     sessionCopy: { flex: 1, minWidth: 0, gap: 1 },
     sessionTitle: { color: palette.text, fontSize: 11, fontWeight: "600" },
     sessionPreview: { color: palette.textFaint, fontSize: 8.5 },
@@ -983,6 +1185,7 @@ function createStyles(palette: ThemePalette) {
     projectCount: { color: palette.textDim, fontSize: 9 },
     rail: {
       height: RAIL_HEIGHT,
+      flexShrink: 0,
       overflow: "hidden",
       borderRadius: 999,
       backgroundColor: palette.surface,
