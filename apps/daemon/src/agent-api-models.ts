@@ -1,4 +1,4 @@
-import type { AgentApiCatalogModel, AgentApiProtocol } from "@prospero/protocol";
+import { AgentModelCapabilitiesSchema, AgentReasoningEffortSchema, type AgentApiCatalogModel, type AgentApiProtocol, type AgentModelCapabilities } from "@prospero/protocol";
 import { AgentAccountFeatureError } from "./agent-account-feature-error.js";
 
 export interface ApiModelCatalogInput {
@@ -40,6 +40,39 @@ function safeText(value: unknown, max: number, secret: string): string | undefin
   const text = value.trim();
   if (!text || text.length > max || /[\u0000-\u001f\u007f]/.test(text) || text.includes(secret)) return undefined;
   return text;
+}
+
+function catalogCapabilities(row: Record<string, unknown>, protocol: AgentApiProtocol): AgentModelCapabilities | undefined {
+  const explicit = record(row["model_capabilities"]);
+  const capabilities = record(row["capabilities"]);
+  const result: AgentModelCapabilities = {};
+  const limits = {
+    contextWindow: explicit?.["contextWindow"] ?? (protocol === "anthropic" ? row["max_input_tokens"] : row["context_window"]),
+    maxOutputTokens: explicit?.["maxOutputTokens"] ?? (protocol === "anthropic" ? row["max_tokens"] : row["max_output_tokens"]),
+  };
+  for (const field of ["contextWindow", "maxOutputTokens"] as const) {
+    const value = limits[field];
+    if (typeof value === "number" && Number.isSafeInteger(value) && value > 0 && value <= 100_000_000) result[field] = value;
+  }
+  if (result.contextWindow && result.maxOutputTokens && result.maxOutputTokens > result.contextWindow) {
+    delete result.contextWindow; delete result.maxOutputTokens;
+  }
+  for (const field of ["tools", "vision", "reasoning"] as const) {
+    const native = protocol === "anthropic" ? capabilities?.[field === "vision" ? "image_input" : field === "reasoning" ? "thinking" : "tools"] : capabilities?.[field];
+    const value = explicit?.[field] ?? (typeof native === "boolean" ? native : record(native)?.["supported"]);
+    if (typeof value === "boolean") result[field] = value;
+  }
+  const effort = protocol === "anthropic" ? record(capabilities?.["effort"]) : null;
+  const reported = explicit?.["supportedEfforts"] ?? row["supported_reasoning_efforts"];
+  if (Array.isArray(reported) && reported.length <= 10 && reported.every(value => AgentReasoningEffortSchema.safeParse(value).success)) {
+    result.supportedEfforts = [...new Set(reported)] as AgentModelCapabilities["supportedEfforts"];
+  } else if (effort?.["supported"] === false) result.supportedEfforts = [];
+  else if (effort?.["supported"] === true) {
+    const values = AgentReasoningEffortSchema.options.filter(value => record(effort[value])?.["supported"] === true);
+    if (values.length) result.supportedEfforts = values;
+  }
+  if (result.reasoning === false) delete result.supportedEfforts;
+  return Object.keys(result).length ? AgentModelCapabilitiesSchema.parse(result) : undefined;
 }
 
 export async function fetchApiModels(input: ApiModelCatalogInput, options: ApiModelCatalogOptions = {}): Promise<AgentApiCatalogModel[]> {
@@ -120,7 +153,8 @@ export async function fetchApiModels(input: ApiModelCatalogInput, options: ApiMo
         const label = safeText(row["display_name"] ?? row["name"], 300, input.apiKey);
         const owner = safeText(row["owned_by"], 300, input.apiKey);
         const description = safeText(row["description"], 1000, input.apiKey);
-        if (!models.has(id)) models.set(id, { id, ...(label ? { label } : {}), ...(owner ? { owner } : {}), ...(description ? { description } : {}) });
+        const modelCapabilities = catalogCapabilities(row, input.protocol);
+        if (!models.has(id)) models.set(id, { id, ...(label ? { label } : {}), ...(owner ? { owner } : {}), ...(description ? { description } : {}), ...(modelCapabilities ? { modelCapabilities } : {}) });
         if (models.size > maxModels) throw new AgentAccountFeatureError("limit_exceeded", "模型数量超过目录限制，请手动填写模型 ID");
       }
       if (payload["has_more"] !== true) {

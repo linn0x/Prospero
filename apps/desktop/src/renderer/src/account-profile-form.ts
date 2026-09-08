@@ -129,7 +129,7 @@ export function supportsAccountApiProtocols(capabilities?: readonly string[]): b
 
 export function accountApiConnectionLocked(account: JsonObject): boolean {
   const activeSessions = account["activeSessions"];
-  return typeof activeSessions === "number" && Number.isFinite(activeSessions) && activeSessions > 0;
+  return Boolean(account["modelSource"]) || typeof activeSessions === "number" && Number.isFinite(activeSessions) && activeSessions > 0;
 }
 
 export function accountApiProfileNameAction(

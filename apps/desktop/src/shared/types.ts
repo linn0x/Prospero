@@ -1,4 +1,6 @@
 import type { AgentAccountConfig, AgentAccountFeatureError, AgentApiCatalogModel, AgentReasoningEffort, C2SAgentAccountApiModelsGet, C2SAgentAccountConfigSet, S2CAgentAccountApiModelsResult, S2CAgentAccountConfigResult } from "@prospero/protocol";
+import type { ModelSource, ModelSourceAction, S2CModelSourceResult } from "@prospero/protocol";
+export type { ModelSource, ModelSourceRoute, ModelSourceAction, ModelSourceMigration, ModelSourceBinding, S2CModelSourceResult } from "@prospero/protocol";
 
 export type { AgentAccountConfig, AgentAccountFeatureError, AgentApiCatalogModel, AgentReasoningEffort };
 import type { RemoteWorkspace, RemoteDirectoryRequest, RemoteDirectoryListing, RemoteWorkspaceInput, RemoteWorkspaceOpenOptions, RemoteWorkspaceOpenResult } from "./remote-workspaces";
@@ -287,6 +289,8 @@ export type AgentModelCatalog = { models: AgentModel[]; currentModel?: string; c
 export type SkillSuggestion = { value: string; label?: string; detail?: string };
 
 export type DesktopApi = {
+  modelSourceAction(action: ModelSourceAction): Promise<S2CModelSourceResult>;
+  subscribeModelSources(listener: (sources: ModelSource[]) => void): () => void;
   getSnapshot(): Promise<DesktopSnapshot>;
   subscribeSnapshot(listener: (patch: DesktopSnapshotPatch) => void): () => void;
   startDaemon(): Promise<{ ok: boolean; error?: string }>;

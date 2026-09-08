@@ -33,6 +33,7 @@ export function AccountCard({ account, usage, disabled, busy, error, apiValidati
       {account["isDefault"] === true && <span className="pill"><DesktopIcon name="check" size={12} />{t("默认", "Default")}</span>}
     </div>
     <div className="account-card-status">
+      {Boolean(account.modelSource) && <p className="usage-note">{text(record(account.modelSource).sourceName)} · {text(record(account.modelSource).routeName)} · v{String(record(account.modelSource).revision)}{record(account.modelSource).current !== true ? t(" · 历史绑定", " · Historical binding") : ""}</p>}
       {hasApi && <ApiValidationDetails account={account} engineValidationSupported={engineValidationSupported} />}
       {usage || !hasApi ? <UsageMeters usage={usage} /> : <p className="usage-note">{t("API 额度由服务商管理", "API usage is managed by the provider")}</p>}
     </div>
@@ -41,7 +42,7 @@ export function AccountCard({ account, usage, disabled, busy, error, apiValidati
       {hasApi && engineValidationSupported && <Button variant="outline" size="sm" aria-busy={pending("agent.account.api.test:engine")} disabled={disabled || Boolean(account["apiProfileError"]) || account["status"] === "signed_out"} onClick={() => action("agent.account.api.test", "engine")}>{pending("agent.account.api.test:engine") && <DesktopIcon name="refresh" className="daemon-spinner" />}{t("验证 Agent", "Validate Agent")}</Button>}
       {account["isDefault"] !== true && <Button variant="outline" size="sm" disabled={disabled} onClick={() => action("agent.account.default")}>{t("设为默认", "Set default")}</Button>}
       {managed && <Button variant="outline" size="sm" disabled={disabled} onClick={onEdit}>{t("编辑", "Edit")}</Button>}
-      {managed && configSupported && <Button variant="outline" size="sm" disabled={disabled} onClick={onConfig}><DesktopIcon name="settings" />{t("高级配置", "Advanced")}</Button>}
+      {managed && configSupported && !account.modelSource && <Button variant="outline" size="sm" disabled={disabled} onClick={onConfig}><DesktopIcon name="settings" />{t("高级配置", "Advanced")}</Button>}
       {managed && !hasApi && <Button variant="outline" size="sm" disabled={disabled} onClick={() => action(signedIn ? "agent.account.logout" : "agent.account.login")}>{signedIn ? t("退出登录", "Sign out") : t("登录", "Sign in")}</Button>}
       {managed && <Button variant="ghost" size="sm" className="text-destructive" disabled={disabled || number(account["activeSessions"]) > 0} onClick={() => action("agent.account.delete")}><DesktopIcon name="delete" />{t("删除", "Delete")}</Button>}
     </div>

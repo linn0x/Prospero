@@ -18,6 +18,9 @@ import {
   CAPABILITY_AGENT_API_ENGINE_VALIDATION,
   CAPABILITY_AGENT_API_MODELS,
   CAPABILITY_AGENT_ACCOUNT_CONFIG,
+  CAPABILITY_MODEL_SOURCES,
+  type C2SModelSourceAction,
+  type S2CModelSourceResult,
   CAPABILITY_SESSION_CREATE_RESULT,
   CAPABILITY_AGENT_DEEPSEEK_HARNESS,
   CAPABILITY_CHAT_ATTACHMENT_PREVIEWS,
@@ -827,11 +830,26 @@ export async function createDaemonServer(
     } finally { accountFeatureRequests--; }
   }
 
+  let modelSourceRequests = 0;
+  async function performModelSource(message: C2SModelSourceAction): Promise<{ status: number; result: S2CModelSourceResult }> {
+    if (modelSourceRequests >= 4) return { status: 429, result: { type: "model.source.result", requestId: message.requestId, ok: false, error: { code: "busy", message: "模型源繁忙，请稍后重试 / Model sources are busy" } } };
+    modelSourceRequests++;
+    try {
+      if (!accountSessionsRestored) throw new AgentAccountFeatureError("busy", "正在恢复已有会话，请稍后重试 / Sessions are being restored");
+      const data = await accounts.modelSourceAction(message.action);
+      const changedAccounts = ["bind", "migration.apply", "migration.rollback"].includes(message.action.kind);
+      return { status: 200, result: { type: "model.source.result", requestId: message.requestId, ok: true, ...data, ...(changedAccounts ? { accounts: await accounts.snapshot(manager.list()) } : {}) } };
+    } catch (error) {
+      const feature = error instanceof AgentAccountFeatureError ? error.toJSON() : error instanceof AgentAccountError ? { code: "invalid_request" as const, message: error.message } : { code: "storage" as const, message: "模型源操作失败，请刷新后重试 / Model source operation failed; refresh and retry" };
+      return { status: feature.code === "conflict" ? 409 : feature.code === "busy" ? 429 : feature.code === "not_found" ? 404 : 400, result: { type: "model.source.result", requestId: message.requestId, ok: false, error: feature } };
+    } finally { modelSourceRequests--; }
+  }
+
   function orchestrationCapabilities(conn: Conn): string[] {
     const capabilities: string[] = [];
     if (conn.protocolVersion >= 16) capabilities.push(CAPABILITY_SESSION_CREATE_RESULT);
     if (conn.protocolVersion >= 16 && conn.device?.allowShell) {
-      capabilities.push(CAPABILITY_AGENT_API_PROTOCOLS, CAPABILITY_AGENT_API_VALIDATION, CAPABILITY_AGENT_API_ENGINE_VALIDATION, CAPABILITY_AGENT_API_MODELS, CAPABILITY_AGENT_ACCOUNT_CONFIG);
+      capabilities.push(CAPABILITY_AGENT_API_PROTOCOLS, CAPABILITY_AGENT_API_VALIDATION, CAPABILITY_AGENT_API_ENGINE_VALIDATION, CAPABILITY_AGENT_API_MODELS, CAPABILITY_AGENT_ACCOUNT_CONFIG, CAPABILITY_MODEL_SOURCES);
     }
     if (conn.protocolVersion >= 15) capabilities.push(CAPABILITY_FS_PUT_ACK);
     capabilities.push(CAPABILITY_AGENT_DEEPSEEK_HARNESS);
@@ -1335,6 +1353,14 @@ export async function createDaemonServer(
           return;
         }
         send(conn, (await performAccountFeature(msg, conn.disconnect.signal)).result);
+        return;
+      }
+      case "model.source.action": {
+        if (conn.protocolVersion < 16 || !device.allowShell) {
+          send(conn, { type: "model.source.result", requestId: msg.requestId, ok: false, error: { code: "forbidden", message: "当前协议或设备权限不支持模型源 / Model sources require a newer protocol and shell permission" } });
+          return;
+        }
+        send(conn, (await performModelSource(msg)).result);
         return;
       }
       case "agent.account.create":
@@ -2559,6 +2585,17 @@ export async function createDaemonServer(
             ? error.status
             : 400;
         res.writeHead(status).end(error instanceof Error ? error.message : String(error));
+      }
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/_prospero/control/model-sources") {
+      try {
+        const message = parseC2S(await readControlJson(req, 64 * 1024));
+        if (message.type !== "model.source.action") throw new ControlRequestError("expected model source action", 400);
+        const outcome = await performModelSource(message);
+        if (!res.destroyed) res.writeHead(outcome.status, { "content-type": "application/json" }).end(JSON.stringify(outcome.result));
+      } catch (error) {
+        if (!res.destroyed) res.writeHead(error instanceof ControlRequestError ? error.status : 400).end("Invalid model source request");
       }
       return;
     }
