@@ -35,6 +35,7 @@ import { Icon } from "@/components/Icon";
 import { Sheet, SheetAction } from "@/components/Sheet";
 import { SwipeRow, type SwipeAction } from "@/components/SwipeRow";
 import { WorkspacePicker } from "@/components/WorkspacePicker";
+import { WorkspaceFolderIcon } from "@/components/WorkspaceDisclosure";
 import { useAdaptiveLayout } from "@/lib/adaptive-layout";
 import { getAgentAccountCapabilities, getAgentAccountEngine } from "@prospero/protocol";
 import {
@@ -1807,7 +1808,7 @@ export default function HostScreen() {
                   accessibilityLabel={`${project.name} 项目，${String(project.sessions.length)} 个会话；左滑可新建会话`}
                 >
                   <View style={styles.projectIcon}>
-                    <Icon name="folder.fill" size={17} color={color.accent} />
+                    <WorkspaceFolderIcon expanded={!collapsed} size={17} color={color.accent} />
                   </View>
                   <View style={styles.projectCopy}>
                     <Text style={styles.projectName} numberOfLines={1}>{project.name}</Text>

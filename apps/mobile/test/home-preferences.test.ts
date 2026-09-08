@@ -36,6 +36,7 @@ describe("home preferences", () => {
       backgroundProgressEnabled: true,
       overlayProgressEnabled: false,
       themeMode: "system",
+      conversationFontSize: 15,
       workspaceAliases: {},
     });
   });

@@ -1,4 +1,5 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { DEFAULT_CONVERSATION_FONT_SIZE, normalizeConversationFontSize } from "./conversation-font-size";
 
 const LAST_HOME_HOST_KEY = "prospero.home.lastHost.v1";
 const HOME_SETTINGS_KEY = "prospero.home.settings.v1";
@@ -15,6 +16,7 @@ export interface HomeSettings {
   backgroundProgressEnabled: boolean;
   overlayProgressEnabled: boolean;
   themeMode: HomeThemeMode;
+  conversationFontSize: number;
   /** 仅改变本机 UI 的显示名称，不修改远端目录或已有会话 cwd。 */
   workspaceAliases: Record<string, string>;
 }
@@ -25,6 +27,7 @@ export const DEFAULT_HOME_SETTINGS: HomeSettings = {
   backgroundProgressEnabled: true,
   overlayProgressEnabled: false,
   themeMode: "system",
+  conversationFontSize: DEFAULT_CONVERSATION_FONT_SIZE,
   workspaceAliases: {},
 };
 
@@ -70,6 +73,7 @@ export function normalizeHomeSettings(value: unknown): HomeSettings {
     themeMode: HOME_THEME_MODES.includes(settings.themeMode as HomeThemeMode)
       ? (settings.themeMode as HomeThemeMode)
       : DEFAULT_HOME_SETTINGS.themeMode,
+    conversationFontSize: normalizeConversationFontSize(settings.conversationFontSize),
     workspaceAliases: validWorkspaceAliases(settings.workspaceAliases),
   };
 }

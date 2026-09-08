@@ -123,12 +123,18 @@ function doubleFlash(value: Animated.Value): Animated.CompositeAnimation {
 function DeviceStatusDot({
   color,
   current,
+  position,
+  index,
+  hostId,
   motion,
   reduceMotion,
   styles,
 }: {
   color: string;
   current: boolean;
+  position?: Animated.Value | Animated.AnimatedInterpolation<number>;
+  index: number;
+  hostId: string;
   motion: DeviceAttentionMotion;
   reduceMotion: boolean;
   styles: ReturnType<typeof createStyles>;
@@ -212,10 +218,13 @@ function DeviceStatusDot({
   }, [motion, opacity, reduceMotion, scale, translateY]);
 
   return (
+    <View style={styles.railDotSlot}>
+    <Animated.View testID={`device-status-dot-${hostId}`} style={{ transform: [{ scale: position
+      ? position.interpolate({ inputRange: [index - 1, index, index + 1], outputRange: [1, 1.4, 1], extrapolate: "clamp" })
+      : current ? 1.4 : 1 }] }}>
     <Animated.View
       style={[
         styles.railDot,
-        current && styles.railDotCurrent,
         {
           backgroundColor: color,
           opacity,
@@ -223,6 +232,8 @@ function DeviceStatusDot({
         },
       ]}
     />
+    </Animated.View>
+    </View>
   );
 }
 
@@ -230,6 +241,7 @@ export function DeviceQuickSwitcher({
   hosts,
   runtimes,
   selectedHostId,
+  position,
   hapticsEnabled,
   onOpenDeviceDetails,
   onPreviewHost,
@@ -240,6 +252,8 @@ export function DeviceQuickSwitcher({
   hosts: StoredHost[];
   runtimes: Record<string, HostRuntime>;
   selectedHostId: string;
+  /** Fractional card index shared with the home carousel, including its settling animation. */
+  position?: Animated.Value | Animated.AnimatedInterpolation<number>;
   hapticsEnabled: boolean;
   onOpenDeviceDetails: () => void;
   onPreviewHost: (hostId: string, direction: DeviceSwitchDirection) => void;
@@ -480,6 +494,9 @@ export function DeviceQuickSwitcher({
                   key={host.id}
                   color={connectionTone(runtime, palette)}
                   current={current}
+                  position={position}
+                  index={index}
+                  hostId={host.id}
                   motion={deviceAttentionMotion(
                     host.id,
                     runtime?.sessions,
@@ -532,10 +549,6 @@ function createStyles(palette: ThemePalette) {
       justifyContent: "space-evenly",
     },
     railDot: { width: 5, height: 5, borderRadius: 3 },
-    railDotCurrent: {
-      width: 7,
-      height: 7,
-      borderRadius: 3.5,
-    },
+    railDotSlot: { width: 7, height: 7, alignItems: "center", justifyContent: "center" },
   });
 }
