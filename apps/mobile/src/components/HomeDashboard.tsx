@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import FontAwesome6 from "@expo/vector-icons/FontAwesome6";
 import { useFocusEffect } from "expo-router";
 import {
@@ -29,9 +29,10 @@ import { Icon } from "@/components/Icon";
 import { PromptDialog } from "@/components/PromptDialog";
 import { Sheet, SheetAction } from "@/components/Sheet";
 import { SwipeRow } from "@/components/SwipeRow";
+import { WorkspaceHeader } from "@/components/WorkspaceHeader";
 import type { StoredHost } from "@/lib/hosts";
+import { clampDetailPreviewPosition, homeDevicePreviewIndex, showsAddDevicePreview, type AddDeviceSide } from "@/lib/home-device-preview";
 import {
-  compactWorkspacePath,
   homeApprovalSessions,
   homeHostStats,
   homeRecentSessions,
@@ -51,9 +52,10 @@ import {
   sessionNeedsLocatorMotion,
   useSessionAttention,
 } from "@/lib/session-attention";
-import type { SessionProject } from "@/lib/session-projects";
+import { projectName, type SessionProject } from "@/lib/session-projects";
 import type { ConnStatus, HostRuntime } from "@/lib/store";
 import { recentSessions as recentSessionStore, recentSessionTime } from "@/lib/recent-sessions";
+import { useHomeLocatorMotion } from "@/lib/use-home-locator-motion";
 import {
   font,
   radius,
@@ -107,10 +109,6 @@ function workspaceDetail(project: SessionProject): string {
   return `${String(project.sessions.length)} 个会话`;
 }
 
-function projectName(path: string): string {
-  return path.split(/[\\/]/).filter(Boolean).at(-1) ?? "工作区";
-}
-
 function recentTime(timestamp: number): string {
   const date = new Date(timestamp);
   if (Number.isNaN(date.getTime())) return "时间未知";
@@ -153,30 +151,6 @@ function hostConnectionLabel(runtime: HostRuntime | undefined): string {
   if (status === "reconnecting") return "重连中";
   if (status === "failed") return "失败";
   return "离线";
-}
-
-function iconDoubleWiggle(value: Animated.Value): Animated.CompositeAnimation {
-  const wiggle = () => Animated.sequence([
-    Animated.timing(value, {
-      toValue: -1,
-      duration: 70,
-      easing: Easing.linear,
-      useNativeDriver: true,
-    }),
-    Animated.timing(value, {
-      toValue: 1,
-      duration: 110,
-      easing: Easing.linear,
-      useNativeDriver: true,
-    }),
-    Animated.timing(value, {
-      toValue: 0,
-      duration: 70,
-      easing: Easing.linear,
-      useNativeDriver: true,
-    }),
-  ]);
-  return Animated.sequence([wiggle(), Animated.delay(90), wiggle()]);
 }
 
 function HostPlatformIcon({
@@ -239,7 +213,7 @@ export function HomeDashboard({
   onOpenSession: (hostId: string, sessionId: string) => void;
   onEditHost: (hostId: string) => void;
   onDeleteHost: (host: StoredHost) => void;
-  onAddHost: () => void;
+  onAddHost: (mode?: "scan" | "manual") => void;
   onRefreshHost: (hostId: string) => void;
   onCreateSession: (hostId: string, cwd?: string) => void;
   onCreateDirectory: (hostId: string) => void;
@@ -265,23 +239,24 @@ export function HomeDashboard({
   const [quickSwitchActive, setQuickSwitchActive] = useState(false);
   const [deviceDetailsOpen, setDeviceDetailsOpen] = useState(false);
   const [detailHostId, setDetailHostId] = useState<string | null>(null);
+  const [detailAddDeviceSide, setDetailAddDeviceSide] = useState<AddDeviceSide | null>(null);
   const homeListWidth = Math.min(840, viewportWidth);
   const deviceViewportBleed = (viewportWidth - homeListWidth) / 2 + space.lg;
   const deviceCardWidth = Math.max(280, homeListWidth - space.lg * 2);
   const deviceCardSideInset = (viewportWidth - deviceCardWidth) / 2;
   const deviceCardStride = deviceCardWidth * 0.94;
   const homeSwipeActive = quickSwitchActive || deviceDetailsOpen;
-  const homeActiveHostId = quickSwitchActive && previewHostId
-    ? previewHostId
-    : deviceDetailsOpen && detailHostId
-      ? detailHostId
-      : selectedHost?.id ?? hosts[0]?.id ?? "";
-  const homeActiveIndex = Math.max(0, hosts.findIndex((host) => host.id === homeActiveHostId));
+  const previewState = { detailsOpen: deviceDetailsOpen, detailHostId, addDeviceSide: detailAddDeviceSide, quickSwitchActive, previewHostId };
+  const showAddDevicePreviews = showsAddDevicePreview(previewState);
+  const homeActiveIndex = homeDevicePreviewIndex(hosts, selectedHost?.id, previewState);
+  const detailSwipePositionRef = useRef(homeActiveIndex);
   const homeCarouselX = useAnimatedValue(
     deviceCardSideInset - homeActiveIndex * deviceCardStride,
   );
   const homeSwipeProgress = useAnimatedValue(0);
-  const locatorWiggle = useAnimatedValue(0);
+  const neutralHomePosition = deviceCardSideInset - Math.max(0, hosts.findIndex((host) => host.id === selectedHost?.id)) * deviceCardStride;
+  const neutralHomePositionRef = useRef(neutralHomePosition);
+  useLayoutEffect(() => { neutralHomePositionRef.current = neutralHomePosition; }, [neutralHomePosition]);
   const [reduceMotion, setReduceMotion] = useState(false);
   // Fast Refresh 会保留旧版 Zustand 状态；标准化可补全后续新增的设置字段。
   const effectiveHomeSettings = normalizeHomeSettings(homeSettings ?? DEFAULT_HOME_SETTINGS);
@@ -318,6 +293,10 @@ export function HomeDashboard({
     () => allProjects.some((project) => project.sessions.some(sessionNeedsMotion)),
     [allProjects, sessionNeedsMotion],
   );
+  const locatorWiggleStyle = useHomeLocatorMotion(
+    selectedHost?.id,
+    hasLocatorMotion && !reduceMotion && !deviceDetailsOpen,
+  );
   const [expandedProjectKey, setExpandedProjectKey] = useState<string | null>(null);
   const [expandedTaskHostId, setExpandedTaskHostId] = useState<string | null>(null);
   const [quickCreateOpen, setQuickCreateOpen] = useState(false);
@@ -332,15 +311,29 @@ export function HomeDashboard({
 
   // Keep this callback independent of sheet state and parent callback identities:
   // a normal close must leave its deferred route alive until native onDismiss.
+  const resetHomeDevicePreview = useCallback(() => {
+    homeSwipeProgress.stopAnimation();
+    homeSwipeProgress.setValue(0);
+    homeCarouselX.stopAnimation();
+    homeCarouselX.setValue(neutralHomePositionRef.current);
+    setQuickSwitchActive(false);
+    setPreviewHostId(null);
+    setDetailHostId(null);
+    setDeviceDetailsOpen(false);
+    setDetailAddDeviceSide(null);
+  }, [homeCarouselX, homeSwipeProgress]);
   const cancelOverlays = useCallback(() => {
     deviceNavigation.cancel();
     createNavigation.cancel();
     closeDevicePickerRef.current();
     setQuickCreateOpen(false);
     setEditingProject(null);
-    setDeviceDetailsOpen(false);
-  }, [createNavigation, deviceNavigation]);
-  useFocusEffect(useCallback(() => cancelOverlays, [cancelOverlays]));
+    resetHomeDevicePreview();
+  }, [createNavigation, deviceNavigation, resetHomeDevicePreview]);
+  useFocusEffect(useCallback(() => {
+    resetHomeDevicePreview();
+    return cancelOverlays;
+  }, [cancelOverlays, resetHomeDevicePreview]));
   useEffect(() => {
     const subscription = AppState.addEventListener("change", (state) => {
       if (state !== "active") cancelOverlays();
@@ -355,24 +348,35 @@ export function HomeDashboard({
 
   useEffect(() => {
     homeCarouselX.stopAnimation();
-    if (deviceDetailsOpen) return;
+    if (!homeSwipeActive) {
+      homeCarouselX.setValue(neutralHomePosition);
+      return;
+    }
+    if (deviceDetailsOpen) {
+      homeCarouselX.setValue(deviceCardSideInset - detailSwipePositionRef.current * deviceCardStride);
+      return;
+    }
     Animated.timing(homeCarouselX, {
       toValue: deviceCardSideInset - homeActiveIndex * deviceCardStride,
       duration: 180,
       easing: Easing.out(Easing.cubic),
       useNativeDriver: true,
     }).start();
-  }, [deviceCardSideInset, deviceCardStride, deviceDetailsOpen, homeActiveIndex, homeCarouselX]);
+  }, [deviceCardSideInset, deviceCardStride, deviceDetailsOpen, homeActiveIndex, homeCarouselX, homeSwipeActive, neutralHomePosition]);
 
   useEffect(() => {
     homeSwipeProgress.stopAnimation();
+    if (!homeSwipeActive || reduceMotion) {
+      homeSwipeProgress.setValue(homeSwipeActive ? 1 : 0);
+      return;
+    }
     Animated.spring(homeSwipeProgress, {
       toValue: homeSwipeActive ? 1 : 0,
       speed: 26,
       bounciness: 4,
       useNativeDriver: true,
     }).start();
-  }, [homeSwipeActive, homeSwipeProgress]);
+  }, [homeSwipeActive, homeSwipeProgress, reduceMotion]);
 
   useEffect(() => {
     let mounted = true;
@@ -388,23 +392,6 @@ export function HomeDashboard({
       subscription.remove();
     };
   }, []);
-
-  useEffect(() => {
-    locatorWiggle.stopAnimation();
-    locatorWiggle.setValue(0);
-    if (!hasLocatorMotion || reduceMotion) return;
-    const animation = Animated.loop(Animated.sequence([
-      iconDoubleWiggle(locatorWiggle),
-      Animated.delay(1_000),
-    ]));
-    animation.start();
-    return () => {
-      animation.stop();
-      animation.reset();
-      locatorWiggle.stopAnimation();
-      locatorWiggle.setValue(0);
-    };
-  }, [hasLocatorMotion, locatorWiggle, reduceMotion]);
 
   useEffect(() => () => {
     homeCarouselX.stopAnimation();
@@ -436,22 +423,31 @@ export function HomeDashboard({
 
   const handleOpenDeviceDetails = useCallback((): void => {
     if (!selectedHost) return;
+    setDetailAddDeviceSide(null);
+    detailSwipePositionRef.current = Math.max(0, hosts.findIndex((host) => host.id === selectedHost.id));
     setDetailHostId(selectedHost.id);
     setDeviceDetailsOpen(true);
-  }, [selectedHost]);
+  }, [hosts, selectedHost]);
 
   const handleDetailHostSelect = useCallback((hostId: string): void => {
+    setDetailAddDeviceSide(null);
     setDetailHostId(hostId);
     onSelectHost(hostId);
   }, [onSelectHost]);
 
   const handleDetailSwipePosition = useCallback((position: number): void => {
-    const maximumPosition = Math.max(0, hosts.length - 1);
-    const clampedPosition = Math.min(maximumPosition, Math.max(0, position));
+    const clampedPosition = clampDetailPreviewPosition(position, hosts.length);
+    detailSwipePositionRef.current = clampedPosition;
     homeCarouselX.setValue(
       deviceCardSideInset - clampedPosition * deviceCardStride,
     );
   }, [deviceCardSideInset, deviceCardStride, homeCarouselX, hosts.length]);
+
+  const closeDeviceDetails = resetHomeDevicePreview;
+  const handlePairDevice = useCallback((mode: "scan" | "manual") => {
+    closeDeviceDetails();
+    onAddHost(mode);
+  }, [closeDeviceDetails, onAddHost]);
 
   if (!selectedHost) return null;
 
@@ -460,15 +456,6 @@ export function HomeDashboard({
   const taskProjectsExpanded = expandedTaskHostId === selectedHost.id;
   const taskRunningCount = taskProjects.reduce((total, project) => total + project.runningCount, 0);
   const taskPendingCount = taskProjects.reduce((total, project) => total + project.pendingCount, 0);
-  const locatorWiggleStyle = {
-    transform: [{
-      rotate: locatorWiggle.interpolate({
-        inputRange: [-1, 0, 1],
-        outputRange: ["-6deg", "0deg", "6deg"],
-      }),
-    }],
-  };
-
   const renderProject = (project: SessionProject) => {
     const projectKey = `${selectedHost.id}:${project.path}`;
     const expanded = expandedProjectKey === projectKey;
@@ -507,47 +494,21 @@ export function HomeDashboard({
           <Pressable
             accessibilityRole="button"
             accessibilityState={{ expanded }}
-            accessibilityLabel={`${displayName}，${workspaceDetail(project)}`}
+            accessibilityLabel={`${displayName}，${workspaceDetail(project)}，${project.path}`}
             accessibilityHint={`${expanded ? "收起这个目录的会话" : "展开这个目录的会话"}；左滑可新建会话或编辑名称`}
             onPress={() => setExpandedProjectKey(expanded ? null : projectKey)}
             style={({ pressed }) => [styles.projectHeader, pressed && styles.projectCardPressed]}
           >
             <View style={styles.projectIcon}>
-              <Animated.View style={projectHasLocatorMotion ? locatorWiggleStyle : undefined}>
+              <Animated.View style={projectHasLocatorMotion ? locatorWiggleStyle : styles.locatorRest}>
                 <Icon name="folder.fill" size={18} color={palette.accent} />
               </Animated.View>
             </View>
-            <View style={styles.projectCopy}>
-              <Text style={styles.projectName} numberOfLines={1}>
-                {displayName}
-              </Text>
-              <Text
-                style={styles.projectPath}
-                numberOfLines={expanded ? undefined : 1}
-                ellipsizeMode="middle"
-              >
-                {expanded ? project.path : compactWorkspacePath(project.path)}
-              </Text>
-            </View>
-            <View style={styles.projectMeta}>
-              <Text
-                style={[
-                  styles.projectState,
-                  project.pendingCount > 0
-                    ? styles.projectPending
-                    : project.runningCount > 0
-                      ? styles.projectRunning
-                      : undefined,
-                ]}
-              >
-                {workspaceDetail(project)}
-              </Text>
-              <Icon
-                name={expanded ? "chevron.down" : "chevron.right"}
-                size={15}
-                color={palette.textFaint}
-              />
-            </View>
+            <WorkspaceHeader hostId={selectedHost.id} path={project.path} sid={project.sessions[0]?.id}
+              name={displayName} sessionCount={project.sessions.length}
+              activity={project.pendingCount > 0 || project.runningCount > 0
+                ? { label: workspaceDetail(project), pending: project.pendingCount > 0 } : undefined} />
+            <Icon name={expanded ? "chevron.down" : "chevron.right"} size={15} color={palette.textFaint} />
           </Pressable>
         </SwipeRow>
 
@@ -565,7 +526,7 @@ export function HomeDashboard({
                 ]}
               >
                 <Animated.View
-                  style={sessionNeedsMotion(session) ? locatorWiggleStyle : undefined}
+                  style={sessionNeedsMotion(session) ? locatorWiggleStyle : styles.locatorRest}
                 >
                   <AgentIcon agent={session.agent} size={17} badge badgeOutline={false} />
                 </Animated.View>
@@ -605,6 +566,7 @@ export function HomeDashboard({
     return (
       <Animated.View
         key={host.id}
+        testID={`home-device-card-${host.id}`}
         pointerEvents={active ? "auto" : "none"}
         accessibilityElementsHidden={!active}
         importantForAccessibility={active ? "auto" : "no-hide-descendants"}
@@ -616,16 +578,16 @@ export function HomeDashboard({
             zIndex: active ? 2 : 1,
             opacity: active
               ? 1
-              : homeSwipeProgress.interpolate({
+              : homeSwipeActive ? homeSwipeProgress.interpolate({
                 inputRange: [0, 1],
                 outputRange: [0, 0.72],
-              }),
+              }) : 0,
             transform: [
               {
-                scale: homeSwipeProgress.interpolate({
+                scale: homeSwipeActive ? homeSwipeProgress.interpolate({
                   inputRange: [0, 1],
                   outputRange: [1, 0.9],
-                }),
+                }) : 1,
               },
             ],
           },
@@ -688,11 +650,34 @@ export function HomeDashboard({
     );
   };
 
+  const renderAddDevicePreview = (side: AddDeviceSide) => {
+    const index = side === "before" ? -1 : hosts.length;
+    const active = homeActiveIndex === index;
+    return <Animated.View key={`add:${side}`} testID={`home-add-device-${side}`} pointerEvents="none"
+      accessibilityElementsHidden importantForAccessibility="no-hide-descendants"
+      style={[styles.deviceCarouselCard, {
+        position: "absolute", left: index * deviceCardStride, width: deviceCardWidth,
+        zIndex: active ? 2 : 1, opacity: active ? 1 : 0.72,
+        transform: [{ scale: homeSwipeProgress.interpolate({ inputRange: [0, 1], outputRange: [1, 0.9] }) }],
+      }]}>
+      <View style={[styles.devicePanel, styles.addDevicePanel]}>
+        <View style={styles.deviceSelector}>
+          <View style={styles.sectionIcon}><Icon name="plus" size={18} color={palette.accent} /></View>
+          <View style={styles.deviceHeaderCopy}>
+            <Text style={styles.deviceHeaderName}>新增设备</Text>
+            <Text style={styles.deviceMeta}>扫码或使用 IP + 配对码</Text>
+          </View>
+          <Icon name="qrcode.viewfinder" size={20} color={palette.textDim} />
+        </View>
+      </View>
+    </Animated.View>;
+  };
+
   const devicePanel = (
     <View
       style={[
         styles.devicePanelStage,
-        hosts.length > 1 && styles.devicePanelStageWithRail,
+        hosts.length > 0 && styles.devicePanelStageWithRail,
         { width: viewportWidth, marginLeft: -deviceViewportBleed },
       ]}
     >
@@ -700,10 +685,12 @@ export function HomeDashboard({
         <Animated.View
           style={[
             styles.deviceCarouselTrack,
-            { transform: [{ translateX: homeCarouselX }] },
+            { transform: [{ translateX: homeSwipeActive ? homeCarouselX : neutralHomePosition }] },
           ]}
         >
+          {showAddDevicePreviews && renderAddDevicePreview("before")}
           {hosts.map(renderHomeDeviceCard)}
+          {showAddDevicePreviews && renderAddDevicePreview("after")}
         </Animated.View>
       </View>
       <DeviceQuickSwitcher
@@ -793,8 +780,8 @@ export function HomeDashboard({
             </View>
           )}
 
-          <View style={styles.recentSection}>
-            <View style={styles.sectionHeading}>
+          <View style={styles.recentSection} testID="home-recent-section">
+            <View style={[styles.sectionHeading, styles.recentHeading]}>
               <Text style={styles.sectionTitle}>最近对话</Text>
             </View>
             {recentSessions.length > 0 ? (
@@ -815,7 +802,7 @@ export function HomeDashboard({
                       pressed && styles.recentCardPressed,
                     ]}
                   >
-                    <Animated.View style={sessionNeedsMotion(session) ? locatorWiggleStyle : undefined}>
+                    <Animated.View style={sessionNeedsMotion(session) ? locatorWiggleStyle : styles.locatorRest}>
                       <AgentIcon agent={session.agent} size={18} badge badgeOutline={false} />
                     </Animated.View>
                     <View style={styles.recentCopy}>
@@ -928,7 +915,10 @@ export function HomeDashboard({
         hosts={hosts}
         runtimes={runtimes}
         activeHostId={detailHostId ?? selectedHost.id}
-        onClose={() => setDeviceDetailsOpen(false)}
+        addDeviceSide={detailAddDeviceSide}
+        onSelectAddDevice={setDetailAddDeviceSide}
+        onPairDevice={handlePairDevice}
+        onClose={closeDeviceDetails}
         onSelectHost={handleDetailHostSelect}
         onSwipePosition={handleDetailSwipePosition}
         onOpenHost={onOpenHost}
@@ -1059,7 +1049,7 @@ export function HomeDashboard({
       <PromptDialog
         visible={editingProject !== null}
         title="编辑工作区名称"
-        message="只修改这台手机上的显示名称，不会移动电脑目录或更改已有会话。清空可恢复目录原名。"
+        message={`${editingProject?.path ?? ""}\n\n只修改这台手机上的显示名称，不会移动电脑目录或更改已有会话。清空可恢复目录原名。`}
         value={projectAlias}
         confirmLabel="保存"
         onChangeText={setProjectAlias}
@@ -1153,7 +1143,7 @@ function createStyles(palette: ThemePalette) {
     position: "relative",
     zIndex: 20,
   },
-  devicePanelStageWithRail: { paddingBottom: 23 },
+  devicePanelStageWithRail: { paddingBottom: 17 },
   deviceCarouselViewport: {
     height: 64,
     overflow: "hidden",
@@ -1172,6 +1162,7 @@ function createStyles(palette: ThemePalette) {
     borderRadius: radius.md,
     backgroundColor: palette.surface,
   },
+  addDevicePanel: { borderWidth: 1, borderStyle: "dashed", borderColor: palette.border },
   deviceSelector: {
     minHeight: 64,
     flexDirection: "row",
@@ -1275,7 +1266,8 @@ function createStyles(palette: ThemePalette) {
     backgroundColor: palette.warnBg,
   },
   approvalDetail: { color: palette.warn, fontSize: 11, fontWeight: "600" },
-  recentSection: { gap: space.sm },
+  recentSection: { gap: space.xs },
+  recentHeading: { minHeight: 28 },
   sectionHeading: {
     minHeight: 36,
     flexDirection: "row",
@@ -1382,13 +1374,8 @@ function createStyles(palette: ThemePalette) {
     borderRadius: radius.md,
     backgroundColor: palette.accentBg,
   },
-  projectCopy: { flex: 1, minWidth: 0, gap: 2 },
-  projectName: { ...themedFont.body, fontSize: 15, fontWeight: "700" },
-  projectPath: { ...themedFont.meta, color: palette.textDim },
-  projectMeta: { alignItems: "flex-end", gap: space.sm, maxWidth: 112 },
-  projectState: { ...themedFont.meta, textAlign: "right" },
   projectPending: { color: palette.warn, fontWeight: "600" },
-  projectRunning: { color: palette.success, fontWeight: "600" },
+  locatorRest: { transform: [{ rotate: "0deg" }] },
   sessionList: {
     paddingHorizontal: space.sm,
     paddingBottom: space.sm,

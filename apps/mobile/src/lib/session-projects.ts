@@ -9,17 +9,25 @@ export interface SessionProject {
   pendingCount: number;
 }
 
-/** 去掉尾部斜杠，避免 `/repo` 与 `/repo/` 被拆成两个项目。 */
+function isWindowsPath(path: string): boolean {
+  return /^[A-Za-z]:[\\/]/u.test(path) || /^\\\\[^\\]/u.test(path);
+}
+
+/** Trim directory separators without treating a POSIX filename's backslash as a separator. */
 export function normalizeProjectPath(cwd: string): string {
   const trimmed = cwd.trim();
   if (trimmed === "" || /^\/+$/u.test(trimmed)) return "/";
+  if (isWindowsPath(trimmed)) {
+    if (/^[A-Za-z]:[\\/]+$/u.test(trimmed)) return trimmed.slice(0, 3);
+    return trimmed.replace(/[\\/]+$/u, "");
+  }
   return trimmed.replace(/\/+$/u, "");
 }
 
 export function projectName(path: string): string {
   const normalized = normalizeProjectPath(path);
-  if (normalized === "/") return "/";
-  const parts = normalized.split("/").filter(Boolean);
+  if (normalized === "/" || /^[A-Za-z]:[\\/]$/u.test(normalized)) return normalized;
+  const parts = normalized.split(isWindowsPath(normalized) ? /[\\/]/u : /\//u).filter(Boolean);
   return parts.at(-1) ?? normalized;
 }
 

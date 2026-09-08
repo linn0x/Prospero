@@ -1,12 +1,16 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, useWindowDimensions, View } from "react-native";
 import { Stack, router, useFocusEffect } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { HomeDashboard } from "@/components/HomeDashboard";
+import { EdgeDashboard } from "@/components/EdgeDashboard";
+import { HomeModeTitle } from "@/components/HomeModeTitle";
+import { toast } from "@/components/Toast";
 import { Icon } from "@/components/Icon";
 import { useAdaptiveLayout } from "@/lib/adaptive-layout";
-import { getConnection, peekConnection, wireAppStateReconnect } from "@/lib/connection";
+import { dropConnection, getConnection, peekConnection, wireAppStateReconnect } from "@/lib/connection";
+import { selectedEdgeHosts, useEdgePreferences } from "@/lib/edge-preferences";
 import { resolveHomeHostSelection } from "@/lib/home-dashboard";
 import {
   DEFAULT_HOME_SETTINGS,
@@ -23,6 +27,7 @@ import {
 import { getDeviceKeys, getHosts, removeHost, type StoredHost } from "@/lib/hosts";
 import { clearSessionPreferences } from "@/lib/session-preferences";
 import { useApp } from "@/lib/store";
+import { useOrderedDevices } from "@/lib/device-order-preferences";
 import { useOrchestrationSnapshot } from "@/lib/use-orchestration-snapshot";
 import { font, radius, space, useMobileTheme, type ThemePalette } from "@/lib/theme";
 
@@ -38,9 +43,19 @@ export default function HostsScreen() {
     bottomInset: insets.bottom,
     fontScale,
   });
-  const [hosts, setLocal] = useState<StoredHost[]>([]);
+  const [storedHosts, setLocal] = useState<StoredHost[]>([]);
+  const hosts = useOrderedDevices(storedHosts);
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
   const [devicePickerOpen, setDevicePickerOpen] = useState(false);
+  const [choosingEdgeOrchestration, setChoosingEdgeOrchestration] = useState(false);
+  const mode = useEdgePreferences((state) => state.mode);
+  const edgeHostIds = useEdgePreferences((state) => state.selectedHostIds);
+  const edgeHydrated = useEdgePreferences((state) => state.hydrated);
+  const hydrateEdge = useEdgePreferences((state) => state.hydrate);
+  const setMode = useEdgePreferences((state) => state.setMode);
+  const selectEdgeHosts = useEdgePreferences((state) => state.selectHosts);
+  const edgeHosts = useMemo(() => selectedEdgeHosts(hosts, edgeHostIds), [hosts, edgeHostIds]);
+  useEffect(() => { void hydrateEdge(); }, [hydrateEdge]);
   const setHosts = useApp((state) => state.setHosts);
   // 首页设置只消费这三个业务字段；主题由显式上下文单独驱动，避免订阅整个
   // 设置对象时把无关配置变化也扩散到设备和工作区列表。
@@ -66,7 +81,7 @@ export default function HostsScreen() {
   const setHomeSettings = useApp((state) => state.setHomeSettings);
   const runtimes = useApp((state) => state.runtimes);
   const effectiveSelectedHostId = resolveHomeHostSelection(hosts, selectedHostId);
-  const selectedConnection = effectiveSelectedHostId ? peekConnection(effectiveSelectedHostId) ?? null : null;
+  const selectedConnection = mode === "normal" && effectiveSelectedHostId ? peekConnection(effectiveSelectedHostId) ?? null : null;
   const orchestration = useOrchestrationSnapshot(
     selectedConnection,
     effectiveSelectedHostId ? runtimes[effectiveSelectedHostId]?.status ?? "idle" : "idle",
@@ -89,18 +104,50 @@ export default function HostsScreen() {
           resolveHomeHostSelection(nextHosts, current ?? lastHostId),
         );
         setHosts(nextHosts);
-        // 首页是跨设备控制台：并行连接全部设备，握手会把各自的会话写入 store，
-        // 下方工作目录页签随即刷新，不再要求用户先进入设备详情页。
-        const keys = await getDeviceKeys();
-        if (cancelled) return;
-        wireAppStateReconnect();
-        for (const host of nextHosts) getConnection(host, keys).start();
-      })();
+      })().catch(() => { if (!cancelled) toast("读取设备失败，请重新打开首页"); });
       return () => {
         cancelled = true;
       };
     }, [setHosts]),
   );
+
+  useFocusEffect(useCallback(() => {
+    if (!edgeHydrated) return;
+    let cancelled = false;
+    const activeHosts = mode === "edge" ? edgeHosts : hosts;
+    // Drop excluded sockets from the reconnect registry as well as the live connection.
+    // This runs only on the home screen; opening a device still permits a direct connection.
+    if (mode === "edge") {
+      const included = new Set(activeHosts.map((host) => host.id));
+      for (const host of hosts) if (!included.has(host.id)) dropConnection(host.id);
+    }
+    void getDeviceKeys().then((keys) => {
+      if (cancelled) return;
+      wireAppStateReconnect();
+      for (const host of activeHosts) getConnection(host, keys).start();
+    }).catch(() => { if (!cancelled) toast("读取配对凭证失败，请重新打开首页"); });
+    return () => { cancelled = true; };
+  }, [edgeHosts, edgeHydrated, hosts, mode]));
+
+  const toggleMode = useCallback(() => {
+    setDevicePickerOpen(false);
+    setChoosingEdgeOrchestration(false);
+    setMode(mode === "edge" ? "normal" : "edge");
+  }, [mode, setMode]);
+
+  const openOrchestration = useCallback(() => {
+    if (mode === "normal") {
+      if (effectiveSelectedHostId) router.push(`/host/${effectiveSelectedHostId}/orchestration`);
+      return;
+    }
+    if (edgeHosts.length === 0) {
+      toast("请先点击设备卡片，选择要编排的设备");
+    } else if (edgeHosts.length === 1) {
+      router.push(`/host/${edgeHosts[0]!.id}/orchestration`);
+    } else {
+      setChoosingEdgeOrchestration((current) => !current);
+    }
+  }, [edgeHosts, effectiveSelectedHostId, mode]);
 
   const onSelectHost = useCallback((hostId: string): void => {
     setSelectedHostId(hostId);
@@ -138,14 +185,17 @@ export default function HostsScreen() {
       <Stack.Screen
         options={{
           title: "Prospero",
+          headerTitleAlign: "left",
+          headerTitle: () => <HomeModeTitle edge={mode === "edge"} onToggle={toggleMode} />,
           headerRight: () => (
             <View style={styles.headerActions}>
               {effectiveSelectedHostId !== null && (
                 <Pressable
                   accessibilityRole="button"
                   accessibilityLabel="Agent 编排"
-                  accessibilityHint="打开当前设备的 Agent 编排页面"
-                  onPress={() => router.push(`/host/${effectiveSelectedHostId}/orchestration`)}
+                  accessibilityHint={mode === "edge" ? "打开所选设备的 Agent 编排，多台设备时在设备卡片中选择" : "打开当前设备的 Agent 编排页面"}
+                  accessibilityState={{ expanded: mode === "edge" && choosingEdgeOrchestration }}
+                  onPress={openOrchestration}
                   style={styles.headerButton}
                 >
                   <Icon
@@ -163,15 +213,6 @@ export default function HostsScreen() {
                 style={styles.headerButton}
               >
                 <Icon name="gearshape.fill" size={20} color={palette.accent} />
-              </Pressable>
-              <Pressable
-                accessibilityRole="button"
-                accessibilityLabel="扫码配对"
-                accessibilityHint="打开相机扫描电脑上的配对二维码"
-                onPress={() => router.push("/pair")}
-                style={styles.headerButton}
-              >
-                <Icon name="qrcode.viewfinder" size={21} color={palette.accent} />
               </Pressable>
             </View>
           ),
@@ -208,6 +249,30 @@ export default function HostsScreen() {
             </Pressable>
           </View>
         </ScrollView>
+      ) : mode === "edge" ? (
+        <EdgeDashboard
+          hosts={hosts}
+          selectedHosts={edgeHosts}
+          runtimes={runtimes}
+          bottomInset={insets.bottom}
+          homeSettings={homeSettings}
+          onSelectHosts={(ids) => { setChoosingEdgeOrchestration(false); selectEdgeHosts(ids); }}
+          choosingOrchestration={choosingEdgeOrchestration}
+          onCancelOrchestration={() => setChoosingEdgeOrchestration(false)}
+          onOpenOrchestration={(hostId) => {
+            if (!edgeHosts.some((host) => host.id === hostId)) return;
+            setChoosingEdgeOrchestration(false);
+            router.push(`/host/${hostId}/orchestration`);
+          }}
+          onOpenHost={(hostId) => router.push(`/host/${hostId}`)}
+          onOpenSession={(hostId, sessionId) => router.push(`/host/${hostId}/session/${sessionId}`)}
+          onRefreshHost={(hostId) => peekConnection(hostId)?.kick()}
+          onCreateSession={(hostId, cwd) => router.push({ pathname: "/host/[hostId]", params: {
+            hostId, quickCreate: "conversation", ...(cwd ? { cwd } : {}),
+          } })}
+          onCreateDirectory={(hostId) => router.push({ pathname: "/host/[hostId]", params: { hostId, quickCreate: "directory" } })}
+          onChangeHomeSettings={onChangeHomeSettings}
+        />
       ) : (
         <HomeDashboard
           hosts={hosts}
@@ -225,7 +290,7 @@ export default function HostsScreen() {
           }
           onEditHost={(hostId) => router.push(`/host/${hostId}/edit`)}
           onDeleteHost={onDelete}
-          onAddHost={() => router.push("/pair")}
+          onAddHost={(mode) => router.push({ pathname: "/pair", params: { mode: mode ?? "scan" } })}
           onRefreshHost={(hostId) => peekConnection(hostId)?.kick()}
           onCreateSession={(hostId, cwd) =>
             router.push({
