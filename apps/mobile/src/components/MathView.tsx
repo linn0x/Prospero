@@ -1,5 +1,6 @@
 import { memo, useMemo, useState } from "react";
-import { StyleSheet, Text, useColorScheme, View } from "react-native";
+import { StyleSheet, useColorScheme, View, useWindowDimensions } from "react-native";
+import { ConversationText as Text, useConversationFontScale } from "./ConversationTypography";
 import { WebView } from "react-native-webview";
 import type { InlineSpan } from "@/lib/markdown";
 import { mathMl } from "@/lib/math";
@@ -89,9 +90,11 @@ function documentHtml(
     variant: TextVariant;
     palette: ThemePalette;
     scheme: ThemeScheme;
+    scale: number;
   },
 ): string {
-  const style = variants[options.variant];
+  const base = variants[options.variant];
+  const style = { ...base, fontSize: base.fontSize * options.scale, lineHeight: base.lineHeight * options.scale };
   return `<!doctype html>
 <html>
 <head>
@@ -151,14 +154,17 @@ function AutoHeightMath({
   variant: TextVariant;
   fallback: string;
 }) {
-  const lineHeight = variants[variant].lineHeight;
+  const readingScale = useConversationFontScale();
+  const { fontScale } = useWindowDimensions();
+  const scale = readingScale * fontScale;
+  const lineHeight = variants[variant].lineHeight * scale;
   const scheme: ThemeScheme = useColorScheme() === "light" ? "light" : "dark";
   const palette = paletteForScheme(scheme);
   const [height, setHeight] = useState(display ? 52 : lineHeight + 2);
   const [failed, setFailed] = useState(false);
   const html = useMemo(
-    () => documentHtml(markup, { display, variant, palette, scheme }),
-    [markup, display, variant, palette, scheme],
+    () => documentHtml(markup, { display, variant, palette, scheme, scale }),
+    [markup, display, variant, palette, scheme, scale],
   );
   // WebView 会把 source 对象身份变化视为新文档；高度回报触发重渲染时不能反复重载。
   const source = useMemo(() => ({ html }), [html]);

@@ -30,6 +30,7 @@ import { PromptDialog } from "@/components/PromptDialog";
 import { Sheet, SheetAction } from "@/components/Sheet";
 import { SwipeRow } from "@/components/SwipeRow";
 import { WorkspaceHeader } from "@/components/WorkspaceHeader";
+import { WorkspaceDisclosure, WorkspaceFolderIcon, WorkspaceChevron } from "@/components/WorkspaceDisclosure";
 import type { StoredHost } from "@/lib/hosts";
 import { clampDetailPreviewPosition, homeDevicePreviewIndex, showsAddDevicePreview, type AddDeviceSide } from "@/lib/home-device-preview";
 import {
@@ -228,6 +229,10 @@ export function HomeDashboard({
   const compactWorkspaceActions = windowWidth < 390;
   const recentCardWidth = Math.min(232, Math.max(196, windowWidth - 72));
   const selectedHost = hosts.find((host) => host.id === selectedHostId) ?? hosts[0];
+  const homeListRef = useRef<FlatList<SessionProject>>(null);
+  useEffect(() => {
+    homeListRef.current?.scrollToOffset({ offset: 0, animated: false });
+  }, [selectedHost?.id]);
   const selectedRuntime = selectedHost ? runtimes[selectedHost.id] : undefined;
   const recentUsage = useSyncExternalStore(
     recentSessionStore.subscribe,
@@ -254,6 +259,10 @@ export function HomeDashboard({
     deviceCardSideInset - homeActiveIndex * deviceCardStride,
   );
   const homeSwipeProgress = useAnimatedValue(0);
+  const homeDevicePosition = useMemo(() => homeCarouselX.interpolate({
+    inputRange: [deviceCardSideInset - deviceCardStride, deviceCardSideInset],
+    outputRange: [1, 0],
+  }), [deviceCardSideInset, deviceCardStride, homeCarouselX]);
   const neutralHomePosition = deviceCardSideInset - Math.max(0, hosts.findIndex((host) => host.id === selectedHost?.id)) * deviceCardStride;
   const neutralHomePositionRef = useRef(neutralHomePosition);
   useLayoutEffect(() => { neutralHomePositionRef.current = neutralHomePosition; }, [neutralHomePosition]);
@@ -297,7 +306,7 @@ export function HomeDashboard({
     selectedHost?.id,
     hasLocatorMotion && !reduceMotion && !deviceDetailsOpen,
   );
-  const [expandedProjectKey, setExpandedProjectKey] = useState<string | null>(null);
+  const [expandedProjectKeys, setExpandedProjectKeys] = useState<Set<string>>(() => new Set());
   const [expandedTaskHostId, setExpandedTaskHostId] = useState<string | null>(null);
   const [quickCreateOpen, setQuickCreateOpen] = useState(false);
   const [editingProject, setEditingProject] = useState<SessionProject | null>(null);
@@ -358,24 +367,22 @@ export function HomeDashboard({
     }
     Animated.timing(homeCarouselX, {
       toValue: deviceCardSideInset - homeActiveIndex * deviceCardStride,
-      duration: 180,
+      duration: reduceMotion ? 0 : 180,
       easing: Easing.out(Easing.cubic),
       useNativeDriver: true,
     }).start();
-  }, [deviceCardSideInset, deviceCardStride, deviceDetailsOpen, homeActiveIndex, homeCarouselX, homeSwipeActive, neutralHomePosition]);
+  }, [deviceCardSideInset, deviceCardStride, deviceDetailsOpen, homeActiveIndex, homeCarouselX, homeSwipeActive, neutralHomePosition, reduceMotion]);
 
   useEffect(() => {
-    homeSwipeProgress.stopAnimation();
-    if (!homeSwipeActive || reduceMotion) {
+    if (reduceMotion) {
       homeSwipeProgress.setValue(homeSwipeActive ? 1 : 0);
       return;
     }
-    Animated.spring(homeSwipeProgress, {
-      toValue: homeSwipeActive ? 1 : 0,
-      speed: 26,
-      bounciness: 4,
-      useNativeDriver: true,
-    }).start();
+    const animation = Animated.spring(homeSwipeProgress, {
+      toValue: homeSwipeActive ? 1 : 0, speed: 26, bounciness: 4, useNativeDriver: true,
+    });
+    animation.start();
+    return () => animation.stop();
   }, [homeSwipeActive, homeSwipeProgress, reduceMotion]);
 
   useEffect(() => {
@@ -395,8 +402,7 @@ export function HomeDashboard({
 
   useEffect(() => () => {
     homeCarouselX.stopAnimation();
-    homeSwipeProgress.stopAnimation();
-  }, [homeCarouselX, homeSwipeProgress]);
+  }, [homeCarouselX]);
 
   const handlePreviewHost = useCallback((
     hostId: string,
@@ -458,7 +464,7 @@ export function HomeDashboard({
   const taskPendingCount = taskProjects.reduce((total, project) => total + project.pendingCount, 0);
   const renderProject = (project: SessionProject) => {
     const projectKey = `${selectedHost.id}:${project.path}`;
-    const expanded = expandedProjectKey === projectKey;
+    const expanded = expandedProjectKeys.has(projectKey);
     const displayName = displayProjectName(project.path, project.name);
     const projectHasLocatorMotion = project.sessions.some(sessionNeedsMotion);
     return (
@@ -467,7 +473,7 @@ export function HomeDashboard({
         collapsable={false}
         style={[styles.projectCard, expanded && styles.projectCardExpanded]}
       >
-        <SwipeRow
+        <WorkspaceDisclosure expanded={expanded} header={(disclosureProgress) => <SwipeRow
           clipRadius={radius.md}
           actions={[
             {
@@ -496,23 +502,26 @@ export function HomeDashboard({
             accessibilityState={{ expanded }}
             accessibilityLabel={`${displayName}，${workspaceDetail(project)}，${project.path}`}
             accessibilityHint={`${expanded ? "收起这个目录的会话" : "展开这个目录的会话"}；左滑可新建会话或编辑名称`}
-            onPress={() => setExpandedProjectKey(expanded ? null : projectKey)}
+            onPress={() => setExpandedProjectKeys((current) => {
+              const next = new Set(current);
+              if (next.has(projectKey)) next.delete(projectKey);
+              else next.add(projectKey);
+              return next;
+            })}
             style={({ pressed }) => [styles.projectHeader, pressed && styles.projectCardPressed]}
           >
             <View style={styles.projectIcon}>
               <Animated.View style={projectHasLocatorMotion ? locatorWiggleStyle : styles.locatorRest}>
-                <Icon name="folder.fill" size={18} color={palette.accent} />
+                <WorkspaceFolderIcon progress={disclosureProgress} size={18} color={palette.accent} />
               </Animated.View>
             </View>
             <WorkspaceHeader hostId={selectedHost.id} path={project.path} sid={project.sessions[0]?.id}
               name={displayName} sessionCount={project.sessions.length}
               activity={project.pendingCount > 0 || project.runningCount > 0
                 ? { label: workspaceDetail(project), pending: project.pendingCount > 0 } : undefined} />
-            <Icon name={expanded ? "chevron.down" : "chevron.right"} size={15} color={palette.textFaint} />
+            <WorkspaceChevron progress={disclosureProgress} size={15} color={palette.textFaint} />
           </Pressable>
-        </SwipeRow>
-
-        {expanded && (
+        </SwipeRow>}>
           <View style={styles.sessionList}>
             {project.sessions.map((session) => (
               <Pressable
@@ -553,7 +562,7 @@ export function HomeDashboard({
               </Pressable>
             ))}
           </View>
-        )}
+        </WorkspaceDisclosure>
       </View>
     );
   };
@@ -576,20 +585,9 @@ export function HomeDashboard({
             width: deviceCardWidth,
             marginRight: -(deviceCardWidth - deviceCardStride),
             zIndex: active ? 2 : 1,
-            opacity: active
-              ? 1
-              : homeSwipeActive ? homeSwipeProgress.interpolate({
-                inputRange: [0, 1],
-                outputRange: [0, 0.72],
-              }) : 0,
-            transform: [
-              {
-                scale: homeSwipeActive ? homeSwipeProgress.interpolate({
-                  inputRange: [0, 1],
-                  outputRange: [1, 0.9],
-                }) : 1,
-              },
-            ],
+            // Preserve the switcher's scale motion without a translucent settlement flash.
+            opacity: active || homeSwipeActive ? 1 : 0,
+            transform: [{ scale: homeSwipeProgress.interpolate({ inputRange: [0, 1], outputRange: [1, 0.9] }) }],
           },
         ]}
       >
@@ -657,7 +655,7 @@ export function HomeDashboard({
       accessibilityElementsHidden importantForAccessibility="no-hide-descendants"
       style={[styles.deviceCarouselCard, {
         position: "absolute", left: index * deviceCardStride, width: deviceCardWidth,
-        zIndex: active ? 2 : 1, opacity: active ? 1 : 0.72,
+        zIndex: active ? 2 : 1,
         transform: [{ scale: homeSwipeProgress.interpolate({ inputRange: [0, 1], outputRange: [1, 0.9] }) }],
       }]}>
       <View style={[styles.devicePanel, styles.addDevicePanel]}>
@@ -697,6 +695,7 @@ export function HomeDashboard({
         hosts={hosts}
         runtimes={runtimes}
         selectedHostId={selectedHost.id}
+        position={homeDevicePosition}
         hapticsEnabled={effectiveHomeSettings.deviceSwitcherHapticsEnabled}
         onOpenDeviceDetails={handleOpenDeviceDetails}
         onPreviewHost={handlePreviewHost}
@@ -710,10 +709,10 @@ export function HomeDashboard({
   return (
     <>
       <FlatList
-      key={selectedHost.id}
+      ref={homeListRef}
       testID="home-workspace-list"
       data={projects}
-      extraData={expandedProjectKey}
+      extraData={expandedProjectKeys}
       keyExtractor={(project) => project.path}
       // Android/Fabric 会缓存动态高度 cell 的裁剪边界；目录反复展开后文字会被
       // 当成仍在旧边界之外而消失。首页项目量有限，关闭裁剪换取稳定的重排。
@@ -809,7 +808,7 @@ export function HomeDashboard({
                       <Text style={styles.recentTitle} numberOfLines={1}>
                         {session.title || session.agent}
                       </Text>
-                      <Text style={styles.recentPreview} numberOfLines={2}>
+                      <Text style={styles.recentPreview} numberOfLines={1}>
                         {homeRecentSummary(session, recentUsage[session.id])}
                       </Text>
                       <Text style={styles.recentMeta} numberOfLines={1}>

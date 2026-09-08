@@ -5,9 +5,9 @@ import {
   Pressable,
   ScrollView,
   StyleSheet,
-  Text,
   View,
 } from "react-native";
+import { ConversationText as Text } from "./ConversationTypography";
 import { CodeBlock } from "@/components/CodeBlock";
 import { Icon } from "@/components/Icon";
 import { MathFormula, MathSpans } from "@/components/MathView";

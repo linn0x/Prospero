@@ -14,13 +14,14 @@ import {
   Pressable,
   ScrollView,
   StyleSheet,
-  Text,
   TextInput,
   useColorScheme,
   View,
   type NativeScrollEvent,
   type NativeSyntheticEvent,
 } from "react-native";
+import { ConversationText as Text, useConversationFontScale } from "./ConversationTypography";
+import { scaleConversationTextStyle } from "@/lib/conversation-font-size";
 import {
   fromB64,
   toB64,
@@ -637,6 +638,7 @@ function SelectionCopySheet({
   onClose: () => void;
 }) {
   const [selection, setSelection] = useState<TextSelectionRange>({ start: 0, end: 0 });
+  const readingScale = useConversationFontScale();
   const copy = useCopy();
   const selected = textInSelection(source, selection);
 
@@ -655,7 +657,7 @@ function SelectionCopySheet({
         value={source}
         onChangeText={() => {}}
         onSelectionChange={(event) => setSelection(event.nativeEvent.selection)}
-        style={styles.selectionInput}
+        style={scaleConversationTextStyle(styles.selectionInput, readingScale)}
         multiline
         scrollEnabled
         showSoftInputOnFocus={false}

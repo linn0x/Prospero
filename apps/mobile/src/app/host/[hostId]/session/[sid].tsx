@@ -41,6 +41,10 @@ import type {
   UsageWindow,
 } from "@prospero/protocol";
 import { ChatView } from "@/components/ChatView";
+import { ConversationFontControl } from "@/components/ConversationFontControl";
+import { ConversationFontScale } from "@/components/ConversationTypography";
+import { DEFAULT_CONVERSATION_FONT_SIZE } from "@/lib/conversation-font-size";
+import { useSettingsPreferences } from "@/lib/use-settings-preferences";
 import { DismissKey } from "@/components/DismissKey";
 import { Icon } from "@/components/Icon";
 import { KeyBar } from "@/components/KeyBar";
@@ -418,6 +422,7 @@ function FoldableSessionRail({
 }
 
 export default function SessionScreen() {
+  const { settings, updateSettings } = useSettingsPreferences();
   const insets = useSafeAreaInsets();
   const headerHeight = useHeaderHeight();
   const adaptiveLayout = useAdaptiveLayout();
@@ -1574,6 +1579,7 @@ export default function SessionScreen() {
       )}
 
       {isChat ? (
+        <ConversationFontScale value={settings.conversationFontSize / DEFAULT_CONVERSATION_FONT_SIZE}>
         <ChatView
           conn={conn}
           sid={sid}
@@ -1590,6 +1596,7 @@ export default function SessionScreen() {
           {...(search !== null ? { search } : {})}
           onRetry={send}
         />
+        </ConversationFontScale>
       ) : (
         terminalFontPreferenceHydrated ? (
           <>
@@ -1806,6 +1813,8 @@ export default function SessionScreen() {
       />
 
       <Sheet visible={menuOpen} title={session.title || "会话"} onClose={() => setMenuOpen(false)}>
+        {isChat && <ConversationFontControl value={settings.conversationFontSize}
+          onChange={(conversationFontSize) => updateSettings({ conversationFontSize })} />}
         {coordinatorRun && !isSubagent ? (
           <SheetAction
             label="打开 Goal 任务图"
@@ -2175,6 +2184,7 @@ export default function SessionScreen() {
               style={[
                 styles.input,
                 isChat && styles.inputChat,
+                isChat && { fontSize: settings.conversationFontSize, lineHeight: Math.round(settings.conversationFontSize * 1.5) },
                 composerExpanded && styles.inputExpanded,
                 !isChat && !terminalInputEnabled && styles.inputDisabled,
               ]}

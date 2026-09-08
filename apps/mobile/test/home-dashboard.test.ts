@@ -165,7 +165,7 @@ describe("home dashboard", () => {
     expect(dashboard).toContain("<DeviceDetailCarousel");
     expect(dashboard).toMatch(/<View style=\{styles\.headerContent\}>\s*\{devicePanel\}/u);
     expect(dashboard).not.toContain("styles.deviceFooter");
-    expect(dashboard).toContain("duration: 180");
+    expect(dashboard).toContain("duration: reduceMotion ? 0 : 180");
     expect(dashboard).toContain("setPreviewHostId(hostId)");
     expect(dashboard).toContain("const homeSwipeActive = quickSwitchActive || deviceDetailsOpen");
     expect(dashboard).toContain("const deviceCardStride = deviceCardWidth * 0.94");
@@ -173,7 +173,7 @@ describe("home dashboard", () => {
     expect(dashboard).toContain("deviceCardSideInset - clampedPosition * deviceCardStride");
     expect(dashboard).toContain("onSwipePosition={handleDetailSwipePosition}");
     expect(dashboard).toContain("outputRange: [1, 0.9]");
-    expect(dashboard).toContain("homeSwipeProgress.interpolate");
+    expect(dashboard).toContain("position={homeDevicePosition}");
     expect(dashboard).toContain("homeDevicePreviewIndex(hosts, selectedHost?.id, previewState)");
     expect(dashboard).toContain("addDeviceSide={detailAddDeviceSide}");
     expect(dashboard).toContain('showAddDevicePreviews && renderAddDevicePreview("before")');

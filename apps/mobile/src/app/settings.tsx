@@ -10,10 +10,8 @@ export default function SettingsScreen() {
   const { hosts } = useSettingsDevices();
   return <SettingsPage title="设置">
     <SettingsGroup title="偏好设置">
-      <SettingsLink title="外观" detail={`${themeLabels[settings.themeMode]} · 显示主题`}
+      <SettingsLink title="外观" detail={`${themeLabels[settings.themeMode]} · 字体、首页与操作反馈`}
         icon="circle.lefthalf.filled" onPress={() => router.push("/settings/appearance")} />
-      <SettingsLink title="首页与交互" detail={`最近 ${settings.recentSessionLimit} 条对话 · 操作反馈`}
-        icon="house.fill" onPress={() => router.push("/settings/home")} />
       <SettingsLink title="通知" detail="后台任务进度与悬浮窗"
         icon="bell.fill" onPress={() => router.push("/settings/notifications")} last />
     </SettingsGroup>

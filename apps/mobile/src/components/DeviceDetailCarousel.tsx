@@ -109,10 +109,12 @@ function PlatformIcon({
   platform,
   palette,
   size = 24,
+  color,
 }: {
   platform: string | undefined;
   palette: ThemePalette;
   size?: number;
+  color?: string;
 }) {
   const normalized = platform?.toLowerCase() ?? "";
   const brand = normalized === "win32" || normalized.includes("windows")
@@ -126,10 +128,10 @@ function PlatformIcon({
     <FontAwesome6
       name={brand}
       size={size}
-      color={brand === "linux" ? palette.warn : palette.accent}
+      color={color ?? (brand === "linux" ? palette.warn : palette.accent)}
     />
   ) : (
-    <Icon name="desktopcomputer" size={size} color={palette.accent} />
+    <Icon name="desktopcomputer" size={size} color={color ?? palette.accent} />
   );
 }
 
@@ -494,6 +496,7 @@ function DeviceOsRail({
   hosts,
   runtimes,
   activeIndex,
+  position,
   width,
   palette,
   styles,
@@ -502,6 +505,7 @@ function DeviceOsRail({
   hosts: StoredHost[];
   runtimes: Record<string, HostRuntime>;
   activeIndex: number;
+  position: Animated.Value;
   width: number;
   palette: ThemePalette;
   styles: DetailStyles;
@@ -553,6 +557,8 @@ function DeviceOsRail({
         {hosts.map((host, index) => {
           const runtime = runtimes[host.id];
           const active = index === activeIndex;
+          const highlight = position.interpolate({ inputRange: [index - 1, index, index + 1], outputRange: [0, 1, 0], extrapolate: "clamp" });
+          const muted = position.interpolate({ inputRange: [index - 1, index, index + 1], outputRange: [1, 0, 1], extrapolate: "clamp" });
           return (
             <Pressable
               key={host.id}
@@ -562,11 +568,19 @@ function DeviceOsRail({
               onPress={() => onSelectIndex(index)}
               style={({ pressed }) => [
                 styles.railItem,
-                active && styles.railItemActive,
                 pressed && styles.railItemPressed,
               ]}
             >
-              <PlatformIcon platform={runtime?.hostInfo?.platform} palette={palette} size={16} />
+              <Animated.View pointerEvents="none" testID={`device-rail-highlight-${host.id}`}
+                style={[styles.railHighlight, { opacity: highlight }]} />
+              <View style={styles.railIcon} pointerEvents="none" accessibilityElementsHidden importantForAccessibility="no-hide-descendants">
+                <Animated.View style={[styles.railIconLayer, { opacity: muted }]}>
+                  <PlatformIcon platform={runtime?.hostInfo?.platform} palette={palette} size={16} color={palette.textFaint} />
+                </Animated.View>
+                <Animated.View testID={`device-rail-icon-${host.id}`} style={[styles.railIconLayer, { opacity: highlight }]}>
+                  <PlatformIcon platform={runtime?.hostInfo?.platform} palette={palette} size={16} color={palette.accent} />
+                </Animated.View>
+              </View>
               <View
                 style={[
                   styles.railStatusDot,
@@ -639,6 +653,11 @@ export function DeviceDetailCarousel({
   const visibleRef = useRef(visible);
   const settleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const progress = useAnimatedValue(0);
+  const swipePosition = useAnimatedValue(activeIndex - 1);
+  const publishSwipePosition = useCallback((position: number) => {
+    swipePosition.setValue(position);
+    onSwipePosition(position);
+  }, [onSwipePosition, swipePosition]);
 
   useLayoutEffect(() => {
     visibleRef.current = visible;
@@ -691,7 +710,7 @@ export function DeviceDetailCarousel({
       visibleIndexRef.current = activeIndex;
       pendingScrollIndexRef.current = null;
       scrollOffsetRef.current = activeIndex * cardStride;
-      onSwipePosition(activeIndex - 1);
+      publishSwipePosition(activeIndex - 1);
     }
     const frame = requestAnimationFrame(() => {
       listRef.current?.scrollToOffset({
@@ -700,7 +719,7 @@ export function DeviceDetailCarousel({
       });
     });
     return () => cancelAnimationFrame(frame);
-  }, [activeIndex, cardStride, clearSettleTimer, onSwipePosition, visible]);
+  }, [activeIndex, cardStride, clearSettleTimer, publishSwipePosition, visible]);
 
   useEffect(() => {
     if (!visible) return undefined;
@@ -736,11 +755,11 @@ export function DeviceDetailCarousel({
     if (!animated) {
       visibleIndexRef.current = index;
       scrollOffsetRef.current = index * cardStride;
-      onSwipePosition(index - 1);
+      publishSwipePosition(index - 1);
     }
     listRef.current?.scrollToOffset({ offset: index * cardStride, animated });
     publishPage(index);
-  }, [cardStride, clearSettleTimer, onSwipePosition, pages.length, publishPage]);
+  }, [cardStride, clearSettleTimer, publishSwipePosition, pages.length, publishPage]);
 
   const settleCarousel = useCallback((): void => {
     clearSettleTimer();
@@ -760,9 +779,9 @@ export function DeviceDetailCarousel({
       pendingScrollIndexRef.current = index;
       listRef.current?.scrollToOffset({ offset: targetOffset, animated: true });
     } else {
-      onSwipePosition(index - 1);
+      publishSwipePosition(index - 1);
     }
-  }, [activeIndex, cardStride, clearSettleTimer, hosts.length, onSwipePosition, publishPage]);
+  }, [activeIndex, cardStride, clearSettleTimer, hosts.length, publishSwipePosition, publishPage]);
 
   const scheduleSettle = useCallback(() => {
     clearSettleTimer();
@@ -780,9 +799,9 @@ export function DeviceDetailCarousel({
   ): void => {
     if (!visibleRef.current) return;
     scrollOffsetRef.current = event.nativeEvent.contentOffset.x;
-    onSwipePosition(deviceDetailPosition(scrollOffsetRef.current, cardStride, hosts.length));
+    publishSwipePosition(deviceDetailPosition(scrollOffsetRef.current, cardStride, hosts.length));
     if (!isDraggingRef.current) scheduleSettle();
-  }, [cardStride, hosts.length, onSwipePosition, scheduleSettle]);
+  }, [cardStride, hosts.length, publishSwipePosition, scheduleSettle]);
 
   // Removing the native overlay is independent of animation completion or interruption.
   if (!visible || hosts.length === 0) return null;
@@ -950,6 +969,7 @@ export function DeviceDetailCarousel({
           hosts={hosts}
           runtimes={runtimes}
           activeIndex={addDeviceSide ? -1 : hostIndex}
+          position={swipePosition}
           width={railWidth}
           palette={palette}
           styles={styles}
@@ -1210,7 +1230,9 @@ function createStyles(palette: ThemePalette) {
       gap: 2,
       borderRadius: 16,
     },
-    railItemActive: { backgroundColor: palette.accentBg },
+    railHighlight: { position: "absolute", top: 0, left: 0, right: 0, bottom: 0, borderRadius: 16, backgroundColor: palette.accentBg },
+    railIcon: { width: 20, height: 18 },
+    railIconLayer: { position: "absolute", top: 0, left: 0, right: 0, bottom: 0, alignItems: "center", justifyContent: "center" },
     railItemPressed: { backgroundColor: palette.pressed },
     railStatusDot: { width: 3, height: 3, borderRadius: 2 },
   });
