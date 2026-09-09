@@ -11,13 +11,9 @@ export function terminalFontFamilyWithFallbacks(fontFamily: string): string {
   const families = (fontFamily.match(/(?:"[^"]*"|'[^']*'|[^,])+/g) ?? [])
     .map((family) => family.trim()).filter(Boolean);
   const name = (family: string) => family.replace(/^(["'])(.*)\1$/, "$2").toLowerCase();
-  const chosen = families.filter((family) => !GENERIC_FONT_FAMILIES.has(family.toLowerCase()));
+  const cjkFamilies = new Set(CJK_FONT_FAMILIES.map((family) => family.toLowerCase()));
+  const chosen = families.filter((family) => !GENERIC_FONT_FAMILIES.has(family.toLowerCase()) && !cjkFamilies.has(name(family)));
   const generic = families.filter((family) => GENERIC_FONT_FAMILIES.has(family.toLowerCase()));
-  // CJK fonts also contain Latin glyphs. Keep terminal columns monospaced even
-  // when a saved preference only names a generic family.
   if (!chosen.length) chosen.push("Cascadia Mono", "Consolas", "SFMono-Regular", "Menlo");
-  const available = new Set(families.map(name));
-  const fallback = CJK_FONT_FAMILIES.filter((family) => !available.has(name(family)))
-    .map((family) => `"${family}"`);
-  return [...chosen, ...fallback, ...(generic.length ? generic : ["monospace"])].join(", ");
+  return [...chosen, ...(generic.length ? generic : ["monospace"]), ...CJK_FONT_FAMILIES.map((family) => `"${family}"`)].join(", ");
 }
