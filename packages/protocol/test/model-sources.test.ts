@@ -5,8 +5,16 @@ describe("model source protocol", () => {
   it("validates actions and does not accept arbitrary credential destinations", () => {
     const message = { type: "model.source.action", requestId: "request", action: { kind: "models", sourceId: "source", revision: 1, protocol: "openai_responses", credentialId: "credential" } };
     expect(parseC2S(message).type).toBe("model.source.action");
+    expect(parseC2S({ ...message, action: { ...message.action, refresh: true } }).action.refresh).toBe(true);
     expect(C2SModelSourceActionSchema.safeParse({ ...message, action: { ...message.action, baseUrl: "https://unexpected.invalid" } }).success).toBe(false);
     expect(C2SModelSourceActionSchema.safeParse({ ...message, action: { kind: "migration.apply", migrationId: "preview", name: "source", accountIds: ["unexpected"] } }).success).toBe(false);
+  });
+  it("allows one sync to update every route a source can store", () => {
+    const route = { name: "Model", model: "model", protocol: "openai_responses", credentialId: "credential", enabled: true };
+    const action = { kind: "routes.set", sourceId: "source", revision: 1, routes: Array.from({ length: 500 }, (_, index) => ({ ...route, id: `route-${String(index)}`, model: `model-${String(index)}` })) };
+    const message = { type: "model.source.action", requestId: "request", action };
+    expect(C2SModelSourceActionSchema.safeParse(message).success).toBe(true);
+    expect(C2SModelSourceActionSchema.safeParse({ ...message, action: { ...action, routes: [...action.routes, { ...route, id: "route-500", model: "model-500" }] } }).success).toBe(false);
   });
   it("strips secret fields from public responses", () => {
     const result = { type: "model.source.result", requestId: "request", ok: true, sources: [{ id: "source", name: "Source", revision: 1, enabled: true, endpoints: [{ protocol: "openai_responses", baseUrl: "https://models.invalid" }], credentials: [{ id: "credential", name: "Key", revision: 1, secret: "synthetic-private" }], routes: [], createdAt: 1, updatedAt: 1, secret: "synthetic-private" }], secret: "synthetic-private" };

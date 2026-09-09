@@ -30,30 +30,40 @@ function SourceCatalog({ source, disabled, onRun }: { source: ModelSource; disab
   const selectedProtocol = source.endpoints.some(item => item.protocol === protocol) ? protocol : source.endpoints[0]!.protocol;
   const selectedCredential = source.credentials.some(item => item.id === credentialId) ? credentialId : source.credentials[0]?.id ?? "";
   useEffect(() => { generation.current++; setModels([]); setSelected(new Set()); setLoaded(false); setLoading(false); setError(undefined); return () => { generation.current++; }; }, [source.id, source.revision, selectedProtocol, selectedCredential]);
-  const load = async () => {
+  const load = async (refresh = false): Promise<AgentApiCatalogModel[] | undefined> => {
     if (loading || !selectedCredential) return;
     const token = ++generation.current;
     setLoading(true); setError(undefined);
     try {
-      const result = await runModelSourceAction({ kind: "models", sourceId: source.id, revision: source.revision, protocol: selectedProtocol, credentialId: selectedCredential });
-      if (generation.current === token) { setModels(result.models ?? []); setLoaded(true); }
+      const result = await runModelSourceAction({ kind: "models", sourceId: source.id, revision: source.revision, protocol: selectedProtocol, credentialId: selectedCredential, ...(refresh ? { refresh: true } : {}) });
+      const next = result.models ?? [];
+      if (generation.current === token) { setModels(next); setLoaded(true); }
+      return next;
     } catch (reason) { if (generation.current === token) setError(reportError(reason)); }
     finally { if (generation.current === token) setLoading(false); }
+  };
+  const syncAll = async () => {
+    const next = await load(true);
+    if (!next?.length) return;
+    const all = new Set(next.map(model => model.id));
+    setSelected(all);
+    await onRun({ kind: "routes.set", sourceId: source.id, revision: source.revision, routes: catalogRouteUpdates(source, selectedProtocol, selectedCredential, next, all) });
   };
   const results = models.filter(model => `${model.id} ${model.label ?? ""}`.toLowerCase().includes(query.trim().toLowerCase()));
   return <details className="model-source-catalog"><summary>{t("从服务商读取模型目录", "Read the provider model catalog")}</summary>
     <div className="model-source-catalog-controls"><NativeSelect value={selectedProtocol} disabled={disabled || loading} aria-label={t("目录协议", "Catalog protocol")} onChange={event => setProtocol(event.target.value as typeof protocol)}>{source.endpoints.map(item => <NativeSelectOption key={item.protocol} value={item.protocol}>{accountApiProtocolLabel(item.protocol)}</NativeSelectOption>)}</NativeSelect>
       <NativeSelect value={selectedCredential} disabled={disabled || loading} aria-label={t("目录凭据", "Catalog credential")} onChange={event => setCredentialId(event.target.value)}>{!source.credentials.length && <NativeSelectOption value="">{t("请先添加凭据", "Add a credential first")}</NativeSelectOption>}{source.credentials.map(item => <NativeSelectOption key={item.id} value={item.id}>{item.name}</NativeSelectOption>)}</NativeSelect>
-      <Button variant="outline" size="sm" disabled={disabled || loading || !selectedCredential} onClick={() => void load()}>{loading ? <Spinner /> : <DesktopIcon name="refresh" />}{t("读取目录", "Fetch models")}</Button></div>
+      <Button variant="outline" size="sm" disabled={disabled || loading || !selectedCredential} onClick={() => void load()}>{loading ? <Spinner /> : <DesktopIcon name="refresh" />}{t("读取目录", "Fetch models")}</Button>
+      <Button size="sm" disabled={disabled || loading || !selectedCredential} onClick={() => void syncAll()}>{loading ? <Spinner /> : <DesktopIcon name="refresh" />}{t("同步并启用全部模型", "Sync and enable all models")}</Button></div>
     {error && <p className="model-source-error" role="alert">{error}</p>}
     <p className="model-source-hint">{t("目录按连接和凭据版本缓存；新模型自动填入上游返回的能力参数，已配置模型保留你的设置。未知项可手动补充。", "Catalogs are cached per connection and credential version. New models inherit reported parameters; existing configurations are preserved. Unknown values can be entered manually.")}</p>
     {models.some(model => selected.has(model.id) && hasPartialCatalogLimits(model, selectedProtocol)) && <p className="model-source-hint" role="status">{t("部分模型只返回一个 Token 上限。Chat Completions 引擎要求两个上限同时配置，批量启用时暂不应用这对限制；启用后可编辑补齐，其他能力仍保留。", "Some models report only one token limit. Chat Completions requires both, so bulk enabling omits that pair. Other capabilities are retained; edit the model afterward to supply both limits.")}</p>}
     {loaded && <><Input type="search" maxLength={200} placeholder={t("筛选模型 ID 或名称", "Filter model ID or name")} aria-label={t("筛选目录", "Filter catalog")} value={query} onChange={event => setQuery(event.target.value)} />
       <div className="model-source-catalog-list">{results.slice(0, 100).map(model => {
         const enabled = source.routes.some(route => route.model === model.id && route.protocol === selectedProtocol && route.credentialId === selectedCredential && route.enabled);
-        return <label key={model.id}><input type="checkbox" checked={enabled || selected.has(model.id)} disabled={disabled || enabled || !selected.has(model.id) && selected.size >= 100} onChange={() => setSelected(current => { const next = new Set(current); if (next.has(model.id)) next.delete(model.id); else next.add(model.id); return next; })} /><span><strong>{model.label || model.id}</strong><small>{model.id}</small></span>{enabled && <small>{t("已启用", "Enabled")}</small>}</label>;
+        return <label key={model.id}><input type="checkbox" checked={enabled || selected.has(model.id)} disabled={disabled || enabled || !selected.has(model.id) && selected.size >= 500} onChange={() => setSelected(current => { const next = new Set(current); if (next.has(model.id)) next.delete(model.id); else next.add(model.id); return next; })} /><span><strong>{model.label || model.id}</strong><small>{model.id}</small></span>{enabled && <small>{t("已启用", "Enabled")}</small>}</label>;
       })}{!results.length && <p>{t("没有匹配模型，可手动添加。", "No matching models. You can add one manually.")}</p>}</div>
-      {results.length > 100 && <p className="model-source-hint">{t(`显示前 100 个，共 ${results.length} 个；输入名称缩小范围。`, `Showing 100 of ${results.length}; narrow the search by name.`)}</p>}
+      {results.length > 500 && <p className="model-source-hint">{t(`显示前 500 个，共 ${results.length} 个；输入名称缩小范围。`, `Showing 500 of ${results.length}; narrow the search by name.`)}</p>}
       <Button size="sm" disabled={disabled || !selected.size} onClick={() => void onRun({ kind: "routes.set", sourceId: source.id, revision: source.revision, routes: catalogRouteUpdates(source, selectedProtocol, selectedCredential, models, selected) })}>{t(`启用所选模型（${selected.size}）`, `Enable selected models (${selected.size})`)}</Button>
     </>}
   </details>;
