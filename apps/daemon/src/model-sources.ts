@@ -273,7 +273,7 @@ export class ModelSources {
     if (!endpoint || !credential) fail("not_found", "连接或凭据不存在 / Endpoint or credential not found");
     const cacheKey = JSON.stringify([source.id, endpoint.protocol, endpoint.baseUrl, credential.id, credential.revision]);
     const cached = this.catalogs.get(cacheKey);
-    if (cached && this.now() - cached.at < 300_000) return structuredClone(cached.models);
+    if (!input.refresh && cached && this.now() - cached.at < 300_000) return structuredClone(cached.models);
     const pending = this.requests.get(cacheKey);
     if (pending) return structuredClone(await pending);
     if (this.requests.size >= 4) fail("busy", "模型目录繁忙，请稍后重试 / Model catalog is busy");

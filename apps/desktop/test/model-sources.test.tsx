@@ -90,6 +90,13 @@ describe("model source selection and IPC", () => {
     expect(updates[1]?.modelCapabilities).toEqual({ tools: true, contextWindow: 64000 });
   });
 
+  it("prepares every model that fits within a source route limit", () => {
+    const models = Array.from({ length: 501 }, (_, index) => ({ id: `model-${String(index)}` }));
+    const updates = catalogRouteUpdates(source, "openai_responses", "credential", models, new Set(models.map(model => model.id)));
+    expect(updates).toHaveLength(500);
+    expect(updates.at(-1)?.model).toBe("model-499");
+  });
+
   it("offers model discovery and parameter editing before saving a source", () => {
     const draft = catalogRouteDraft({ id: "discovered", modelCapabilities: { contextWindow: 64000, tools: true } }, "openai_responses");
     const html = renderToStaticMarkup(<SourceOnboardingModels endpoints={source.endpoints} apiKey="synthetic-onboarding-secret" value={[draft]} onChange={() => {}} onBusy={() => {}} />);
