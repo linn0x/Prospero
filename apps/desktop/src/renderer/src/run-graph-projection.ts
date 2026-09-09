@@ -1,6 +1,65 @@
 import type { JsonObject } from "../../shared/types";
 import { array, text } from "./state";
 
+export function groupParallelTasks(tasks: JsonObject[], expanded: ReadonlySet<string>) {
+  const ids = new Set(tasks.map(task => text(task.id)));
+  const successors = new Map<string, string[]>();
+  for (const task of tasks) for (const dep of dependencies(task)) successors.set(dep, [...(successors.get(dep) ?? []), text(task.id)]);
+  const buckets = new Map<string, JsonObject[]>();
+  for (const task of tasks) {
+    const deps = [...new Set(dependencies(task).filter(id => ids.has(id)))].sort();
+    if (!deps.length) continue;
+    const key = JSON.stringify([deps, [...(successors.get(text(task.id)) ?? [])].sort()]);
+    buckets.set(key, [...(buckets.get(key) ?? []), task]);
+  }
+  const groups = new Map<string, JsonObject[]>();
+  const replacements = new Map<string, string>();
+  for (const members of buckets.values()) {
+    if (members.length < 3) continue;
+    const id = `parallel:${members.map(task => text(task.id)).sort().join(':')}`;
+    if (expanded.has(id)) continue;
+    groups.set(id, members);
+    for (const member of members) replacements.set(text(member.id), id);
+  }
+  const emitted = new Set<string>();
+  const projected: JsonObject[] = [];
+  for (const task of tasks) {
+    const id = replacements.get(text(task.id)) ?? text(task.id);
+    if (emitted.has(id)) continue;
+    emitted.add(id);
+    const members = groups.get(id);
+    const statuses = members?.map(member => text(member.status)) ?? [];
+    const status = ['running', 'dispatched', 'starting', 'failed', 'blocked', 'pending', 'cancelled'].find(value => statuses.includes(value)) ?? 'done';
+    projected.push({ ...task, id, deps: [...new Set(dependencies(task).map(dep => replacements.get(dep) ?? dep))], ...(members ? { parentId: null, status } : {}) });
+  }
+  return { tasks: projected, groups };
+}
+
+export function graphNeighborhood(tasks: JsonObject[], focusId: string | undefined, depth = 2): JsonObject[] {
+  if (!focusId || !tasks.some(task => text(task.id) === focusId)) return tasks;
+  const upstream = new Map<string, string[]>();
+  const downstream = new Map<string, string[]>();
+  for (const task of tasks) {
+    const id = text(task.id);
+    upstream.set(id, dependencies(task));
+    for (const dep of dependencies(task)) downstream.set(dep, [...(downstream.get(dep) ?? []), id]);
+  }
+  const visible = new Set([focusId]);
+  for (const adjacency of [upstream, downstream]) {
+    let frontier = [focusId];
+    const visited = new Set(frontier);
+    for (let level = 0; level < depth; level++) {
+      const next: string[] = [];
+      for (const id of frontier) for (const neighbor of adjacency.get(id) ?? []) {
+        if (visited.has(neighbor)) continue;
+        visited.add(neighbor); visible.add(neighbor); next.push(neighbor);
+      }
+      frontier = next;
+    }
+  }
+  return tasks.filter(task => visible.has(text(task.id)));
+}
+
 const CURRENT_STATUSES = new Set(["pending", "dispatched", "running", "starting", "blocked"]);
 const TERMINAL_STATUSES = new Set(["done", "completed", "succeeded", "failed", "cancelled"]);
 
