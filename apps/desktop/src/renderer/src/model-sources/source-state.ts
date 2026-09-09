@@ -55,7 +55,7 @@ export function sourceDraftRoutes(drafts: readonly SourceRouteDraft[]): NonNulla
 }
 
 export function catalogRouteUpdates(source: ModelSource, protocol: ModelSourceRoute["protocol"], credentialId: string, models: readonly AgentApiCatalogModel[], selected: ReadonlySet<string>): Extract<ModelSourceAction, { kind: "routes.set" }>["routes"] {
-  return models.filter(model => selected.has(model.id)).slice(0, 100).map(model => {
+  return models.filter(model => selected.has(model.id)).slice(0, 500).map(model => {
     const existing = source.routes.find(route => route.protocol === protocol && route.credentialId === credentialId && route.model === model.id);
     const modelCapabilities = catalogCapabilities(model, protocol);
     return existing ? { ...existing, enabled: true } : { name: (model.label?.trim() || model.id).slice(0, 80), model: model.id, protocol, credentialId, enabled: true, ...(modelCapabilities ? { modelCapabilities } : {}) };
