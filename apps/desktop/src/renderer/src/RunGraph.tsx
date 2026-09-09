@@ -3,7 +3,7 @@ import { Maximize2, Minus, Plus, Zap } from "lucide-react";
 import type { JsonObject } from "../../shared/types";
 import { array, number, text } from "./state";
 import { useLocale } from "./locale";
-import { projectGraphView, taskWasSuperseded } from "./run-graph-projection";
+import { graphNeighborhood, groupParallelTasks, projectGraphView, taskWasSuperseded } from "./run-graph-projection";
 
 /**
  * 一个 Run 的任务依赖图。
@@ -100,8 +100,7 @@ export function layoutGraph(tasks: JsonObject[]): Layout {
     return time || text(left["id"]).localeCompare(text(right["id"]));
   };
   const ancestors = (task: JsonObject): string[] => {
-    const parentId = text(task["parentId"]);
-    return [...new Set([...dependencies(task), ...(parentId ? [parentId] : [])])]
+    return [...new Set(dependencies(task))]
       .filter((id) => byId.has(id));
   };
   const upstreamById = new Map<string, string[]>();
@@ -181,7 +180,7 @@ export function layoutGraph(tasks: JsonObject[]): Layout {
     }
   }
 
-  const slotCount = Math.max(orderedLeaves.length, maxColumnCount, 1);
+  const slotCount = Math.max(maxColumnCount, 1);
   const slotStep = NODE_HEIGHT + V_GAP;
   const contentHeight = slotCount * NODE_HEIGHT + Math.max(slotCount - 1, 0) * V_GAP;
   const leafContentHeight = Math.max(orderedLeaves.length, 1) * NODE_HEIGHT
@@ -206,6 +205,23 @@ export function layoutGraph(tasks: JsonObject[]): Layout {
     }
   }
   if (roots.length === 1) desiredMemo.set(text(roots[0]?.["id"]), MARGIN + contentHeight / 2);
+
+  for (let pass = 0; pass < 4; pass++) {
+    const forward = pass % 2 === 0;
+    for (let step = 0; step < columns; step++) {
+      const column = forward ? step : columns - step - 1;
+      const entries = tasksByColumn.get(column) ?? [];
+      const desired = new Map(entries.map(task => {
+        const id = text(task.id);
+        const neighbors = forward ? upstreamById.get(id) ?? [] : [...(successors.get(id) ?? [])];
+        const ys = neighbors.map(neighbor => desiredMemo.get(neighbor)).filter((y): y is number => y !== undefined);
+        return [id, ys.length ? ys.reduce((a, b) => a + b, 0) / ys.length : desiredMemo.get(id) ?? 0];
+      }));
+      const ordered = [...entries].sort((a, b) => desired.get(text(a.id))! - desired.get(text(b.id))! || taskSort(a, b));
+      const top = MARGIN + (contentHeight - ordered.length * slotStep + V_GAP) / 2;
+      ordered.forEach((task, index) => desiredMemo.set(text(task.id), top + NODE_HEIGHT / 2 + index * slotStep));
+    }
+  }
 
   const canvasHeight = MARGIN * 2 + contentHeight;
   const canvasWidth = MARGIN * 2 + columns * NODE_WIDTH + Math.max(columns - 1, 0) * H_GAP;
@@ -358,8 +374,13 @@ function drawArrow(context: CanvasRenderingContext2D, point: Point, color: strin
 export function RunGraph({ runId, tasks, dispatches, onActivateTask }: { runId: string; tasks: JsonObject[]; dispatches: JsonObject[]; onActivateTask?: (taskId: string) => void }) {
   const { t, status } = useLocale();
   const [historyView, setHistoryView] = useState(false);
+  const [focusId, setFocusId] = useState<string>();
+  const [showLineage, setShowLineage] = useState(false);
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   const projection = useMemo(() => projectGraphView(tasks, historyView ? "history" : "current"), [historyView, tasks]);
-  const graphTasks = projection.tasks;
+  const neighborhood = useMemo(() => graphNeighborhood(projection.tasks, focusId), [projection.tasks, focusId]);
+  const grouped = useMemo(() => groupParallelTasks(neighborhood, expandedGroups), [neighborhood, expandedGroups]);
+  const graphTasks = grouped.tasks;
   const graphKey = useMemo(() => `${historyView ? "history" : "current"}:${structuralKey(graphTasks)}`, [graphTasks, historyView]);
   const layoutCache = useRef<{ key: string; layout: Layout } | undefined>(undefined);
   if (!layoutCache.current || layoutCache.current.key !== graphKey) {
@@ -409,6 +430,8 @@ export function RunGraph({ runId, tasks, dispatches, onActivateTask }: { runId: 
 
   useLayoutEffect(() => {
     setHistoryView(false);
+    setFocusId(undefined);
+    setExpandedGroups(new Set());
   }, [runId]);
 
   useLayoutEffect(() => {
@@ -616,7 +639,7 @@ export function RunGraph({ runId, tasks, dispatches, onActivateTask }: { runId: 
     fitMode.current = false;
     setSelected(overviewTaskId);
     scheduleTransform((current) => {
-      const zoom = Math.max(OVERVIEW_INTERACTION_ZOOM, current.zoom);
+      const zoom = Math.max(INITIAL_ZOOM_FLOOR, current.zoom);
       return {
         zoom,
         pan: {
@@ -731,7 +754,7 @@ export function RunGraph({ runId, tasks, dispatches, onActivateTask }: { runId: 
       }
     }
 
-    if (!overviewMode) for (const feedback of layout.feedbackEdges) {
+    if (!overviewMode && showLineage) for (const feedback of layout.feedbackEdges) {
       const start = positions.get(feedback.fromTaskId);
       const end = positions.get(feedback.toTaskId);
       if (!start || !end) continue;
@@ -764,7 +787,7 @@ export function RunGraph({ runId, tasks, dispatches, onActivateTask }: { runId: 
       }
     }
 
-  }, [activeWorkers, done, layout, overviewMode, parentIds, positions, selected, t, taskById, transform, viewport]);
+  }, [activeWorkers, done, layout, overviewMode, parentIds, positions, selected, showLineage, t, taskById, transform, viewport]);
 
   useLayoutEffect(() => {
     const canvas = minimapCanvasRef.current;
@@ -898,6 +921,8 @@ export function RunGraph({ runId, tasks, dispatches, onActivateTask }: { runId: 
             if (!task) return null;
             const taskStatus = text(task["status"]);
             const visualState = taskState(task, done, activeWorkers, parentIds);
+            const members = grouped.groups.get(node.id);
+            const counts = members ? [...new Set(members.map(member => text(member.status)))].map(value => `${status(value)} ${members.filter(member => text(member.status) === value).length}`).join(' · ') : '';
             return (
               <button
                 type="button"
@@ -905,19 +930,20 @@ export function RunGraph({ runId, tasks, dispatches, onActivateTask }: { runId: 
                 className={`run-graph-node${selected === node.id ? " selected" : ""}`}
                 data-state={visualState}
                 style={{ left: node.x, top: node.y, width: NODE_WIDTH, height: NODE_HEIGHT }}
-                title={text(task["spec"], text(task["title"]))}
+                title={members ? members.map(member => text(member.title)).join('\n') : text(task["spec"], text(task["title"]))}
                 aria-pressed={selected === node.id}
                 onPointerDown={(event) => event.stopPropagation()}
                 onDoubleClick={(event) => event.stopPropagation()}
                 onClick={() => {
+                  if (members) { setExpandedGroups(current => new Set([...current, node.id])); return; }
                   setSelected((current) => current === node.id ? undefined : node.id);
                   onActivateTask?.(node.id);
                 }}
               >
-                <strong>{text(task["title"], t("未命名任务", "Untitled task"))}</strong>
+                <strong>{members ? t(`并行任务 × ${members.length} · 点击展开`, `Parallel tasks × ${members.length} · Expand`) : text(task["title"], t("未命名任务", "Untitled task"))}</strong>
                 <span className="run-graph-node-meta">
                   <span className="run-graph-state-dot" />
-                  {stateLabel(visualState, taskStatus)}
+                  {members ? counts : stateLabel(visualState, taskStatus)}
                   {activeWorkers.has(node.id) && <Zap size={11} className="run-graph-worker" />}
                   {visualState === "cancelled" && <span aria-hidden="true">↩</span>}
                   {node.deps.length > 0 && <em>{node.deps.length}↑</em>}
@@ -969,9 +995,13 @@ export function RunGraph({ runId, tasks, dispatches, onActivateTask }: { runId: 
             <button type="button" aria-pressed={!historyView} onClick={() => changeHistoryView(false)}>{t("当前修订", "Current revision")}</button>
             <button type="button" aria-pressed={historyView} onClick={() => changeHistoryView(true)}>{t("完整历史", "Full history")}</button>
           </div>
-          <span>{layout.nodes.length} {t("个任务", "tasks")}</span>
+          <span>{neighborhood.length} {t("个任务", "tasks")} · {layout.nodes.length} {t("个节点", "nodes")}</span>
+          <button type="button" disabled={!expandedGroups.size} onClick={() => setExpandedGroups(new Set())}>{t("收起并行分组", "Collapse parallel groups")}</button>
+          <button type="button" aria-pressed={showLineage} onClick={() => setShowLineage(value => !value)}>{t("派生关系", "Lineage")}</button>
+          <button type="button" disabled={!selected && !focusId} aria-pressed={Boolean(focusId)} onClick={() => { setFocusId(focusId ? undefined : selected); }}>{focusId ? t("返回全图", "Show full graph") : t("聚焦上下游两层", "Focus two dependency levels")}</button>
+          {focusId && <span>{t(`范围外 ${projection.tasks.length - neighborhood.length} 个任务`, `${projection.tasks.length - neighborhood.length} tasks outside focus`)}</span>}
           <div className="run-graph-zoom">
-            <button type="button" aria-label={t("缩小", "Zoom out")} disabled={transform.zoom <= MIN_ZOOM + 0.001}
+            <button type="button" aria-label={t("缩小", "Zoom out")} disabled={transform.zoom <= MIN_ZOOM}
               onClick={() => zoomBy(1 / 1.25, center())}><Minus size={12} /></button>
             <button type="button" title={t("复位：100% 并回到起点", "Reset to 100% and origin")}
               onClick={reset}>{transform.zoom < 0.01 ? "<1%" : `${String(Math.round(transform.zoom * 100))}%`}</button>
