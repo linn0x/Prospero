@@ -17,3 +17,25 @@ export function ctrlCode(seq: string): string {
   if (ch < "a" || ch > "z") return seq;
   return String.fromCharCode(ch.charCodeAt(0) - 96);
 }
+
+export interface TerminalModifiers { ctrl: boolean; option: boolean }
+export const NO_TERMINAL_MODIFIERS: TerminalModifiers = { ctrl: false, option: false };
+
+/** Option is the terminal's Alt/Meta key (ESC prefix), including macOS word navigation. */
+export function terminalKeySequence(seq: string, { ctrl, option }: TerminalModifiers): string {
+  if (!ctrl && !option) return seq;
+  if (option && !ctrl && seq === "\x1b[D") return "\x1bb";
+  if (option && !ctrl && seq === "\x1b[C") return "\x1bf";
+  const cursor = /^\x1b\[([ABCDHF])$/u.exec(seq);
+  const paging = /^\x1b\[([2356])~$/u.exec(seq);
+  const modifier = 1 + (option ? 2 : 0) + (ctrl ? 4 : 0);
+  if (cursor) return `\x1b[1;${modifier}${cursor[1]}`;
+  if (paging) return `\x1b[${paging[1]};${modifier}~`;
+  // Pasted/IME text and already modified escape sequences pass through untouched.
+  if (seq.length !== 1) return seq;
+  let key = ctrl ? ctrlCode(seq) : seq;
+  if (ctrl && (seq === " " || seq === "@")) key = "\x00";
+  if (ctrl && /^[\[\\\]\^_]$/u.test(seq)) key = String.fromCharCode(seq.charCodeAt(0) - 64);
+  if (ctrl && seq === "?") key = "\x7f";
+  return option ? `\x1b${key}` : key;
+}

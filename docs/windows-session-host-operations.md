@@ -16,6 +16,24 @@
 
 host session pipe 不是 daemon 的 worker control pipe。它由 native layer 创建，并同时要求 current-logon DACL、拒绝 remote client、pipe peer PID+FILETIME/SID/session identity、DPAPI-held capability challenge 和 single mutation lease。随机 pipe 名或 PID 本身都不足以授权。不要复制 token、修改 manifest，或将 host pipe 公开给 LAN、WebSocket 或 Agent provider。
 
+## Codex app-server 的 Windows 启动与排障
+
+Windows 下，Codex adapter 按当前工作目录、PATH 和 PATHEXT 选择安装；识别到官方 npm/pnpm shim 时，直接启动该安装附带的原生 `codex.exe`（兼容 x64/arm64、新旧 vendor 布局）。`windowsHide` 因此作用于真正的 provider，注册的 PID 也属于它，避免 `cmd → node → codex.exe` 包装链的窗口和生命周期问题。未识别的自定义启动器仍由原启动器执行；macOS/Linux 保持原有启动路径。
+
+Windows 环境变量合并按大小写不敏感处理，保证账号指定的 PATH、CODEX_HOME 等覆盖父进程配置。启动/初始化失败会清理子进程；正常关闭先结束 stdin，等待退出，超过 1.5 秒再结束所持有的 child，并最多等待 0.5 秒。hosted provider 始终继承 Session Host 的 Job；这条路径不会使用 detached、breakaway 或按名称结束进程。
+
+退出诊断保留十进制退出码，并在 Windows 上补充十六进制状态码。`1073807364` 即 `0x40010004 / DBG_TERMINATE_PROCESS`，表示进程被终止，单凭该码无法确定终止来源。最近的 stderr 会去掉 ANSI 颜色控制码，并作为单独的诊断附在后面；`failed to refresh available models: timeout waiting for child process to exit` 本身不足以证明 app-server 退出的原因。
+
+可在安装了 Codex 的 Windows 开发机运行无模型调用的启动验收：
+
+```powershell
+$env:PROSPERO_CODEX_STARTUP_SMOKE = '1'
+npm run test -w @prospero/daemon -- test/codex-startup.windows.test.ts
+Remove-Item Env:PROSPERO_CODEX_STARTUP_SMOKE
+```
+
+该测试使用独立临时 CODEX_HOME，检查初始化、模型列表、新建/恢复会话启动和原生进程正常退出，不读取用户的 Codex 登录文件，也不发送 turn。
+
 ## 状态与恢复
 
 | Provenance | 含义 | daemon 重启后的处理 |

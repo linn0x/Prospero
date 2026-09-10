@@ -22,6 +22,7 @@
 import type { ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import os from "node:os";
+import { stripVTControlCharacters } from "node:util";
 import type {
   AgentEventBody,
   AgentQuestionAnswer,
@@ -37,6 +38,8 @@ import { needsApproval } from "../approval-policy.js";
 import type { ResolvedSkill } from "../composer-context.js";
 import { DAEMON_VERSION } from "../version.js";
 import { fromUnifiedPatch } from "./diff.js";
+import { codexFileChanges, codexTurnDiffs } from "./codex-turn-diff.js";
+import { stopWindowsCodexProcess, windowsCodexCommand } from "./codex-windows-process.js";
 import {
   AdapterError,
   summarize,
@@ -157,6 +160,19 @@ const CODEX_PARENT_CONTEXT_ENV = [
 function codexChildEnvironment(
   environment: Record<string, string> | undefined,
 ): NodeJS.ProcessEnv {
+  if (process.platform === "win32") {
+    // Windows environment keys are case-insensitive. Sending both Path and PATH
+    // makes Node choose one by lexical order, ignoring the selected account env.
+    const childEnvironment: NodeJS.ProcessEnv = {};
+    for (const [key, value] of Object.entries(process.env)) {
+      const name = key.toUpperCase();
+      if (CODEX_PARENT_CONTEXT_ENV.some(parent => parent === name)) continue;
+      childEnvironment[name] = value;
+    }
+    // Explicit account overrides win, including intentionally supplied context.
+    for (const [key, value] of Object.entries(environment ?? {})) childEnvironment[key.toUpperCase()] = value;
+    return childEnvironment;
+  }
   const childEnvironment: NodeJS.ProcessEnv = { ...process.env, ...environment };
   for (const name of CODEX_PARENT_CONTEXT_ENV) {
     if (!environment || !Object.prototype.hasOwnProperty.call(environment, name)) {
@@ -269,6 +285,10 @@ export class CodexAdapter implements AgentAdapter {
   private readonly subagents = new Map<string, SubagentInfo>();
   private readonly currentTurns = new Map<string, string>();
   private readonly lastTextByThread = new Map<string, string>();
+  private readonly finalTextByThread = new Map<string, string>();
+  private readonly streamedText = new Map<string, Map<string, string>>();
+  private readonly turnDiffs = new Map<string, Map<string, FileDiff>>();
+  private readonly aggregateDiffs = new Map<string, FileDiff[]>();
   /** 本轮 token(来自 thread/tokenUsage/updated,turn/completed 时随事件带出) */
   private lastTurnTokens: { input?: number | undefined; output?: number | undefined } = {};
   /** 会话累计 token */
@@ -322,6 +342,15 @@ export class CodexAdapter implements AgentAdapter {
   }
 
   async start(ctx: AdapterContext): Promise<void> {
+    try {
+      await this.startSession(ctx);
+    } catch (error) {
+      await this.dispose();
+      throw error;
+    }
+  }
+
+  private async startSession(ctx: AdapterContext): Promise<void> {
     this.ctx = ctx;
     this.selectedModel =
       typeof this.opts.resumeState?.["model"] === "string"
@@ -391,22 +420,31 @@ export class CodexAdapter implements AgentAdapter {
   ): Promise<void> {
     this.stderrTail = "";
     this.buf = "";
-    const proc = crossSpawn("codex", ["app-server", ...(appServerArgs ?? [])], {
+    const env = codexChildEnvironment(environment);
+    const command = process.platform === "win32"
+      ? windowsCodexCommand(env, cwd)
+      : { file: "codex", env };
+    const proc = crossSpawn(command.file, ["app-server", ...(appServerArgs ?? [])], {
       stdio: ["pipe", "pipe", "pipe"],
       cwd,
-      env: codexChildEnvironment(environment),
+      env: command.env,
+      ...(process.platform === "win32" ? { windowsHide: true } : {}),
     });
     this.proc = proc;
     proc.stdout?.setEncoding("utf8");
-    proc.stdout?.on("data", (chunk: string) => this.onStdout(chunk));
+    proc.stdout?.on("data", (chunk: string) => {
+      if (this.proc === proc) this.onStdout(chunk);
+    });
     proc.stderr?.setEncoding("utf8");
     proc.stderr?.on("data", (chunk: string) => {
+      if (this.proc !== proc) return;
       // 不把鉴权/路径等诊断整段持久化，只保留足够解释退出原因的尾部。
       this.stderrTail = (this.stderrTail + chunk).slice(-2_000);
     });
+    let processError: string | undefined;
     const failProcess = (message: string): void => {
-      if (this.proc !== proc) return;
-      this.proc = null;
+      if (this.proc !== proc || processError) return;
+      processError = message;
       this.failPending(message);
       this.emit({ kind: "agent.error", message });
     };
@@ -415,13 +453,20 @@ export class CodexAdapter implements AgentAdapter {
     // 它升级为 uncaught exception，连只读账号用量查询也会拖垮整个 daemon。
     proc.stdin?.on("error", (error: Error) => {
       failProcess(this.processFailure(`codex app-server stdin 写入失败:${error.message}`));
+      if (process.platform === "win32") void stopWindowsCodexProcess(proc);
     });
     proc.once("error", (e) => {
       failProcess(this.processFailure(`codex app-server 启动失败:${e.message}`));
     });
     proc.once("exit", (code, signal) => {
-      const reason = code !== null ? `code=${String(code)}` : `signal=${signal ?? "unknown"}`;
+      let reason = code !== null ? `code=${String(code)}` : `signal=${signal ?? "unknown"}`;
+      if (process.platform === "win32" && code !== null && code !== 0) {
+        const status = code >>> 0;
+        reason += ` (0x${status.toString(16).toUpperCase().padStart(8, "0")})`;
+        if (status === 0x40010004) reason += "，Windows DBG_TERMINATE_PROCESS（进程被终止）";
+      }
       failProcess(this.processFailure(`codex app-server 意外退出,${reason}`));
+      if (this.proc === proc) this.proc = null;
     });
     // 监听器必须在这个可能异步等待的注册动作之前安装；否则进程可在窗口内
     // 退出，随后 initialize 才写入一条已经没有接收端的管道。
@@ -432,8 +477,8 @@ export class CodexAdapter implements AgentAdapter {
       await terminateUnregisteredProviderProcess(proc);
       throw error;
     }
-    if (this.proc !== proc) {
-      throw new AdapterError(this.processFailure("codex app-server 在初始化前退出"));
+    if (processError || this.proc !== proc) {
+      throw new AdapterError(processError ?? this.processFailure("codex app-server 在初始化前退出"));
     }
 
     await this.request("initialize", {
@@ -1103,6 +1148,10 @@ export class CodexAdapter implements AgentAdapter {
         const turnId = String(turn["id"] ?? p["turnId"] ?? "");
         if (notificationThreadId) this.currentTurns.set(notificationThreadId, turnId);
         this.lastTextByThread.delete(notificationThreadId);
+        this.finalTextByThread.delete(notificationThreadId);
+        this.streamedText.set(notificationThreadId, new Map());
+        this.turnDiffs.set(notificationThreadId, new Map());
+        this.aggregateDiffs.delete(notificationThreadId);
         if (agentId && this.subagents.has(agentId)) this.updateSubagent(agentId, "running", true);
         else {
           this.currentTurnMsgId = turnId;
@@ -1119,6 +1168,9 @@ export class CodexAdapter implements AgentAdapter {
           );
           this.lastTextByThread.set(notificationThreadId, msgId);
           if (!agentId) this.lastTextMsgId = msgId;
+          const texts = this.streamedText.get(notificationThreadId) ?? new Map<string, string>();
+          texts.set(msgId, (texts.get(msgId) ?? "") + delta);
+          this.streamedText.set(notificationThreadId, texts);
           this.emit({ kind: "text.delta", msgId, textId: msgId, delta, ...agentField });
         }
         return;
@@ -1191,6 +1243,21 @@ export class CodexAdapter implements AgentAdapter {
         const item = (p["item"] ?? {}) as Record<string, unknown>;
         const itemType = String(item["type"] ?? item["item_type"] ?? "");
         const itemId = String(item["id"] ?? p["itemId"] ?? "");
+        if (itemType === "agentMessage" || itemType === "plan") {
+          const phase = itemType === "plan" ? "final_answer" : item["phase"];
+          if (phase === "final_answer") this.finalTextByThread.set(notificationThreadId, itemId);
+          this.lastTextByThread.set(notificationThreadId, itemId);
+          if (!agentId) this.lastTextMsgId = itemId;
+          if (typeof item["text"] === "string") {
+            const streamed = this.streamedText.get(notificationThreadId)?.get(itemId) ?? "";
+            const replace = !item["text"].startsWith(streamed);
+            this.emit({ kind: "text.delta", msgId: itemId, textId: itemId,
+              delta: replace ? item["text"] : item["text"].slice(streamed.length), ...(replace ? { replace: true } : {}),
+              ...(phase === "commentary" || phase === "final_answer" ? { phase } : {}), ...agentField });
+            this.streamedText.get(notificationThreadId)?.delete(itemId);
+          }
+          return;
+        }
         if (itemType === "collabAgentToolCall") {
           const rawStatus = String(item["status"] ?? "completed");
           const status: SubagentStatus = rawStatus === "failed" ? "failed" : "completed";
@@ -1202,19 +1269,25 @@ export class CodexAdapter implements AgentAdapter {
           }
           return;
         }
-        if (!this.toolItems.has(itemId)) return;
+        if (!this.toolItems.has(itemId) && itemType !== "fileChange") return;
         this.toolItems.delete(itemId);
         const status = String(item["status"] ?? "completed");
         const raw = item["output"] ?? item["aggregatedOutput"] ?? item["result"] ?? status;
         const full = typeof raw === "string" ? raw : JSON.stringify(raw, null, 2);
         if (full.length > 0) this.ctx?.recordOutput?.(itemId, full);
         const summary = summarize(raw);
-        const diff = this.pendingDiffs.get(itemId);
+        const changes = itemType === "fileChange" ? codexFileChanges(item) : [];
+        const diff = changes[0] ?? this.pendingDiffs.get(itemId);
+        if (status === "completed" && itemType === "fileChange") {
+          const files = this.turnDiffs.get(notificationThreadId) ?? new Map<string, FileDiff>();
+          for (const change of changes.length ? changes : diff ? [diff] : []) files.set(change.path, change);
+          this.turnDiffs.set(notificationThreadId, files);
+        }
         this.pendingDiffs.delete(itemId);
         this.emit({
           kind: "tool.end",
           callId: itemId,
-          state: status === "failed" || status === "error" ? "failed" : "success",
+          state: ["failed", "error", "declined", "cancelled"].includes(status) ? "failed" : "success",
           summary,
           ...(full.length > summary.length ? { hasMore: true } : {}),
           ...(diff ? { diff } : {}),
@@ -1238,13 +1311,24 @@ export class CodexAdapter implements AgentAdapter {
         this.rateLimits = usageFromRateLimits(rl);
         return;
       }
+      case "turn/diff/updated": {
+        const currentTurn = this.currentTurns.get(notificationThreadId);
+        if (currentTurn && typeof p["turnId"] === "string" && p["turnId"] !== currentTurn) return;
+        if (typeof p["diff"] === "string") {
+          this.aggregateDiffs.set(notificationThreadId, codexTurnDiffs(p["diff"]));
+        }
+        return;
+      }
       case "turn/completed": {
         const turn = (p["turn"] ?? {}) as Record<string, unknown>;
         const turnId = String(turn["id"] ?? p["turnId"] ?? "");
-        const textMsgId = this.lastTextByThread.get(notificationThreadId);
+        const textMsgId = this.finalTextByThread.get(notificationThreadId) ?? this.lastTextByThread.get(notificationThreadId);
+        const diffs = this.aggregateDiffs.get(notificationThreadId) ?? [...(this.turnDiffs.get(notificationThreadId)?.values() ?? [])];
         this.emit({
           kind: "turn.end",
           msgId: textMsgId || (!agentId ? this.lastTextMsgId : "") || turnId,
+          turnId,
+          ...(this.aggregateDiffs.has(notificationThreadId) || diffs.length ? { diffs } : {}),
           ...(typeof turn["status"] === "string"
             ? { finish: turn["status"] }
             : typeof p["status"] === "string"
@@ -1260,6 +1344,10 @@ export class CodexAdapter implements AgentAdapter {
         });
         this.currentTurns.delete(notificationThreadId);
         this.lastTextByThread.delete(notificationThreadId);
+        this.finalTextByThread.delete(notificationThreadId);
+        this.streamedText.delete(notificationThreadId);
+        this.turnDiffs.delete(notificationThreadId);
+        this.aggregateDiffs.delete(notificationThreadId);
         if (agentId && this.subagents.has(agentId)) this.updateSubagent(agentId, "idle", true);
         else {
           this.lastTurnTokens = {};
@@ -1306,8 +1394,8 @@ export class CodexAdapter implements AgentAdapter {
   }
 
   private processFailure(prefix: string): string {
-    const tail = this.stderrTail.trim().split("\n").at(-1)?.trim();
-    return tail ? `${prefix}: ${tail}` : prefix;
+    const tail = stripVTControlCharacters(this.stderrTail).trim().split(/\r?\n/).at(-1)?.trim();
+    return tail ? `${prefix}；最近的 stderr：${tail}` : prefix;
   }
 
   /** 子进程已死时立刻结束所有 RPC，不能让“启动中”再空等 30 秒。 */
@@ -1338,7 +1426,7 @@ export class CodexAdapter implements AgentAdapter {
         timeoutMs > 0
           ? setTimeout(() => {
               this.pendingRpc.delete(id);
-              reject(new AdapterError(`codex ${method} 超时`));
+              reject(new AdapterError(this.processFailure(`codex ${method} 超时`)));
             }, timeoutMs)
           : null;
       this.pendingRpc.set(id, (m) => {
@@ -1645,6 +1733,8 @@ export class CodexAdapter implements AgentAdapter {
       const turn = value as Record<string, unknown>;
       const turnId = typeof turn["id"] === "string" ? turn["id"] : `turn-${events.length}`;
       let lastMessageId = turnId;
+      let finalMessageId: string | undefined;
+      const diffs = new Map<string, FileDiff>();
       const items = Array.isArray(turn["items"]) ? turn["items"] : [];
       for (const itemValue of items) {
         if (!itemValue || typeof itemValue !== "object") continue;
@@ -1654,6 +1744,10 @@ export class CodexAdapter implements AgentAdapter {
         events.push(...itemEvents);
         if (item["type"] === "agentMessage" || item["type"] === "plan") {
           lastMessageId = itemId;
+          if (item["phase"] === "final_answer" || item["type"] === "plan") finalMessageId = itemId;
+        }
+        if (item["type"] === "fileChange" && item["status"] === "completed") {
+          for (const diff of codexFileChanges(item)) diffs.set(diff.path, diff);
         }
       }
 
@@ -1670,7 +1764,9 @@ export class CodexAdapter implements AgentAdapter {
       if (status !== "inProgress") {
         events.push({
           kind: "turn.end",
-          msgId: lastMessageId,
+          msgId: finalMessageId ?? lastMessageId,
+          turnId,
+          ...(diffs.size ? { diffs: [...diffs.values()] } : {}),
           finish: status,
           agentId: subagentId,
         });
@@ -1713,7 +1809,9 @@ export class CodexAdapter implements AgentAdapter {
     if (type === "agentMessage" || type === "plan") {
       const text = typeof item["text"] === "string" ? item["text"] : "";
       return text
-        ? [{ kind: "text.delta", msgId: itemId, textId: itemId, delta: text, ...agentField }]
+        ? [{ kind: "text.delta", msgId: itemId, textId: itemId, delta: text,
+            ...(item["phase"] === "commentary" || item["phase"] === "final_answer" ? { phase: item["phase"] }
+              : type === "plan" ? { phase: "final_answer" as const } : {}), ...agentField }]
         : [];
     }
     if (type === "reasoning") {
@@ -1922,12 +2020,19 @@ export class CodexAdapter implements AgentAdapter {
     const proc = this.proc;
     this.proc = null;
     this.failPending("codex 会话已关闭");
-    proc?.kill();
     this.ctx = null;
     this.threadId = null;
     this.modelCache = null;
     this.currentTurns.clear();
     this.lastTextByThread.clear();
+    this.finalTextByThread.clear();
+    this.streamedText.clear();
+    this.turnDiffs.clear();
+    this.aggregateDiffs.clear();
     this.subagents.clear();
+    if (proc) {
+      if (process.platform === "win32") await stopWindowsCodexProcess(proc);
+      else proc.kill();
+    }
   }
 }

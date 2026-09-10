@@ -11,8 +11,8 @@ import {
 export const MONOSPACE_FONT = Platform.OS === "ios" ? "Menlo" : "monospace";
 
 /**
- * 明暗两套视觉令牌。字符串版本用于导航主题等要求普通字符串的 API；
- * `color` 则在原生层使用动态颜色，已有 StyleSheet 无需逐页重建也会随主题切换。
+ * 明暗两套视觉令牌。页面通过 useMobileTheme / createThemedStyles 读取应用主题，
+ * 确保同一次 React 提交内完成换色。`color` 仅供尚未迁移的原生动态颜色调用使用。
  */
 export const darkColor = {
   bg: "#0B0D12",
@@ -69,6 +69,16 @@ let lastAppliedNativeThemeMode: ThemeMode | undefined;
 /** 显式主题上下文用于需要在同一 React 提交内完成换色的页面。 */
 export function useMobileTheme(): MobileTheme {
   return useContext(MobileThemeContext);
+}
+
+/** Cache each palette's stylesheet once; every consumer still subscribes to theme changes. */
+export function createThemedStyles<T>(factory: (palette: ThemePalette) => T): () => T {
+  const cache = new WeakMap<ThemePalette, T>();
+  return function useThemedStyles(): T {
+    const { palette } = useMobileTheme();
+    if (!cache.has(palette)) cache.set(palette, factory(palette));
+    return cache.get(palette)!;
+  };
 }
 
 /** 应用主题使用用户偏好作为即时状态；系统模式才读取设备外观。 */
@@ -168,21 +178,34 @@ export const font = {
   mono: { fontFamily: MONOSPACE_FONT, fontSize: 12, color: color.text },
 } as const;
 
+export function fontForPalette(palette: ThemePalette) {
+  return {
+    title: { ...font.title, color: palette.text },
+    body: { ...font.body, color: palette.text },
+    sub: { ...font.sub, color: palette.textDim },
+    meta: { ...font.meta, color: palette.textFaint },
+    mono: { ...font.mono, color: palette.text },
+  };
+}
+
 /** 会话/连接状态到颜色 —— 全 App 一套。 */
-export const statusColor: Record<string, string> = {
-  running: color.warn,
-  starting: color.warn,
-  waiting_approval: color.warn,
-  waiting_input: color.accent,
-  idle: color.accent,
-  completed: color.success,
-  done: color.textFaint,
-  died: color.danger,
-  connected: color.success,
-  connecting: color.warn,
-  reconnecting: color.warn,
-  failed: color.danger,
-};
+export function statusColors(palette: ThemePalette): Record<string, string> {
+  return {
+    running: palette.warn,
+    starting: palette.warn,
+    waiting_approval: palette.warn,
+    waiting_input: palette.accent,
+    idle: palette.accent,
+    completed: palette.success,
+    done: palette.textFaint,
+    died: palette.danger,
+    connected: palette.success,
+    connecting: palette.warn,
+    reconnecting: palette.warn,
+    failed: palette.danger,
+  };
+}
+export const statusColor = statusColors(color);
 
 /** 利用率 → 颜色。80% 起变暖,95% 起告警 */
 export function utilizationColor(pct: number): string {
@@ -192,10 +215,10 @@ export function utilizationColor(pct: number): string {
 }
 
 /** 订阅余额颜色：余额越少越紧急，低于 15% 明确标红。 */
-export function quotaRemainingColor(remaining: number): string {
-  if (remaining < 15) return color.danger;
-  if (remaining < 35) return color.warn;
-  return color.accent;
+export function quotaRemainingColor(remaining: number, palette: ThemePalette = color): string {
+  if (remaining < 15) return palette.danger;
+  if (remaining < 35) return palette.warn;
+  return palette.accent;
 }
 
 /** 服务端上报已用比例；进度条统一表达为 100% → 0% 的剩余额度。 */

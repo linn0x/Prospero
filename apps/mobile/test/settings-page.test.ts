@@ -8,7 +8,7 @@ describe("mobile settings page", () => {
   it("routes each category to its own page and keeps device actions under device management", () => {
     const settings = readFileSync(join(mobileRoot, "src", "app", "settings.tsx"), "utf8");
 
-    for (const page of ["appearance", "notifications", "devices"]) {
+    for (const page of ["appearance", "notifications", "devices", "quick-replies"]) {
       expect(settings).toContain(`router.push("/settings/${page}")`);
       expect(readFileSync(join(mobileRoot, "src", "app", "settings", `${page}.tsx`), "utf8")).toContain("<SettingsPage");
     }

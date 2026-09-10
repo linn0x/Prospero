@@ -66,6 +66,7 @@ function ToggleGroupItem({
   return (
     <TogglePrimitive
       data-slot="toggle-group-item"
+      data-liquid-glass="tab"
       data-variant={context.variant || variant}
       data-size={context.size || size}
       data-spacing={context.spacing}

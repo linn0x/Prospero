@@ -2,7 +2,7 @@ import MaterialIcons from "@expo/vector-icons/MaterialIcons";
 import type { ComponentProps } from "react";
 import { Platform, Text, type StyleProp, type TextStyle } from "react-native";
 import { SymbolView, type SymbolViewProps } from "expo-symbols";
-import { color as themeColor } from "@/lib/theme";
+import { useMobileTheme } from "@/lib/theme";
 
 /**
  * 跨平台系统图标。
@@ -148,7 +148,7 @@ const ANDROID_ICON: Record<IconName, MaterialIconName> = {
 export function Icon({
   name,
   size = 20,
-  color = themeColor.text,
+  color: requestedColor,
   weight = "regular",
   style,
 }: {
@@ -158,6 +158,8 @@ export function Icon({
   weight?: SymbolViewProps["weight"];
   style?: StyleProp<TextStyle>;
 }) {
+  const { palette } = useMobileTheme();
+  const color = requestedColor ?? palette.text;
   if (Platform.OS === "ios") {
     return (
       <SymbolView

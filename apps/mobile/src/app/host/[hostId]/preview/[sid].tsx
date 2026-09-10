@@ -1,11 +1,10 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Image,
   Pressable,
   StyleSheet,
   Text,
-  TextInput,
   View,
 } from "react-native";
 import * as Clipboard from "expo-clipboard";
@@ -13,11 +12,13 @@ import * as Haptics from "expo-haptics";
 import { Stack, useLocalSearchParams } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Icon } from "@/components/Icon";
+import { FileContentView } from "@/components/FileContentView";
 import { toast } from "@/components/Toast";
 import { color, MONOSPACE_FONT } from "@/lib/theme";
 import { useHostConnection } from "@/lib/use-host-connection";
 
 interface PreviewResult {
+  key: string;
   contentB64: string;
   text: string | null;
   size: number;
@@ -62,9 +63,12 @@ export default function FilePreviewScreen(): React.ReactElement {
       line?: string;
       column?: string;
     }>();
-  const { conn } = useHostConnection(hostId);
+  const { conn, runtime } = useHostConnection(hostId);
   const insets = useSafeAreaInsets();
-  const [result, setResult] = useState<PreviewResult | null>(null);
+  const [loadedResult, setResult] = useState<PreviewResult | null>(null);
+  const fileKey = JSON.stringify([hostId, sid, filePath]);
+  const result = loadedResult?.key === fileKey ? loadedResult : null;
+  const requestGeneration = useRef(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const line = positiveInt(rawLine);
@@ -72,12 +76,15 @@ export default function FilePreviewScreen(): React.ReactElement {
 
   const load = useCallback((): void => {
     if (!conn || !sid || !filePath) return;
+    const generation = ++requestGeneration.current;
     setLoading(true);
     setError(null);
     void conn
       .fsRead(sid, filePath)
       .then((response) => {
+        if (generation !== requestGeneration.current) return;
         setResult({
+          key: fileKey,
           contentB64: response.contentB64,
           text: response.binary ? null : decodeUtf8(response.contentB64),
           size: response.size,
@@ -86,16 +93,17 @@ export default function FilePreviewScreen(): React.ReactElement {
         });
       })
       .catch((reason: unknown) => {
+        if (generation !== requestGeneration.current) return;
         setResult(null);
         setError(reason instanceof Error ? reason.message : String(reason));
       })
-      .finally(() => setLoading(false));
-  }, [conn, sid, filePath]);
+      .finally(() => { if (generation === requestGeneration.current) setLoading(false); });
+  }, [conn, sid, filePath, fileKey]);
 
   useEffect(() => {
     // 延后一拍启动，避免在 effect 主体同步触发多次状态更新。
     const timer = setTimeout(load, 0);
-    return () => clearTimeout(timer);
+    return () => { clearTimeout(timer); requestGeneration.current += 1; };
   }, [load]);
 
   const previewText = result?.text;
@@ -151,7 +159,7 @@ export default function FilePreviewScreen(): React.ReactElement {
         <Text style={styles.warn}>文件超过 1 MB，只预览前 1 MB。</Text>
       )}
 
-      {loading ? (
+      {loading || (!result && !error) ? (
         <View style={styles.center}>
           <ActivityIndicator color={color.accent} />
           <Text style={styles.dim}>正在从电脑读取…</Text>
@@ -165,14 +173,8 @@ export default function FilePreviewScreen(): React.ReactElement {
           </Pressable>
         </View>
       ) : result?.text !== null && result ? (
-        <TextInput
-          style={[styles.code, { paddingBottom: insets.bottom + 16 }]}
-          value={result.text}
-          editable={false}
-          multiline
-          autoCapitalize="none"
-          autoCorrect={false}
-          spellCheck={false}
+        <FileContentView key={`${sid}:${filePath}`} filePath={filePath} text={result.text}
+          bottomInset={insets.bottom} conn={conn} hostId={hostId} sid={sid} projectRoot={runtime.sessions[sid]?.cwd}
         />
       ) : result && mime && !result.truncated ? (
         <Image
@@ -223,15 +225,5 @@ const styles = StyleSheet.create({
   error: { color: color.warn, fontSize: 13, lineHeight: 19, textAlign: "center" },
   retry: { marginTop: 4, backgroundColor: color.accentDim, borderRadius: 10, paddingHorizontal: 18, paddingVertical: 9 },
   retryText: { color: color.onAccent, fontSize: 13, fontWeight: "600" },
-  code: {
-    flex: 1,
-    color: color.text,
-    backgroundColor: color.bg,
-    fontFamily: MONOSPACE_FONT,
-    fontSize: 12,
-    lineHeight: 18,
-    padding: 14,
-    textAlignVertical: "top",
-  },
   image: { flex: 1, margin: 14, backgroundColor: color.surface },
 });

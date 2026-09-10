@@ -343,6 +343,7 @@
     if (!fontReady || fitTimer) return;
     fitTimer = setTimeout(() => {
       fitTimer = null;
+      if (!fontReady) return;
       try { fit.fit(); } catch (e) {}
       post({ kind: "resized", cols: term.cols, rows: term.rows });
     }, 50);
@@ -413,10 +414,12 @@
       const family = typeof m.family === "string" ? m.family.trim() : "";
       term.options.fontFamily = fontStack(family);
       term.options.fontSize = size;
-      fontReady = true;
+      fontReady = false;
       const revision = ++fontRevision;
       const fitted = () => {
-        if (revision === fontRevision) doFit();
+        if (revision !== fontRevision) return;
+        fontReady = true;
+        doFit();
       };
       // 本机字体通常立即可用；仍等 FontFaceSet 确认一次再 fit，避免先按
       // fallback 的字宽算列数，下一帧换成 Nerd Font 后文字与 tmux 网格错位。

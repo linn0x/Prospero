@@ -1,31 +1,24 @@
 import { Pressable, ScrollView, StyleSheet, Text } from "react-native";
 
-import { color } from "@/lib/theme";
+import { createThemedStyles } from "@/lib/theme";
+import { DEFAULT_QUICK_REPLIES, type QuickReplySettings } from "@/lib/quick-replies";
 
 /**
  * 快捷回复:手机上打字成本高,把高频短回复做成一键。
  * 会话忙碌与空闲时给出不同组合。
  */
-const IDLE_REPLIES = [
-  "继续",
-  "go ahead",
-  "看起来不错",
-  "跑一下测试",
-  "解释一下",
-  "总结一下",
-  "提交这些改动",
-];
-
-const BUSY_REPLIES = ["等一下", "换个思路", "先别改文件"];
-
 export function QuickReplies({
   busy,
   onPick,
+  replies = DEFAULT_QUICK_REPLIES,
 }: {
   busy: boolean;
   onPick: (text: string) => void;
+  replies?: QuickReplySettings;
 }) {
-  const items = busy ? BUSY_REPLIES : IDLE_REPLIES;
+  const styles = useStyles();
+  const items = busy ? replies.busy : replies.idle;
+  if (items.length === 0) return null;
   return (
     <ScrollView
       horizontal
@@ -49,7 +42,7 @@ export function QuickReplies({
   );
 }
 
-const styles = StyleSheet.create({
+const useStyles = createThemedStyles((color) => StyleSheet.create({
   bar: { flexGrow: 0, backgroundColor: color.surface },
   content: { paddingHorizontal: 10, paddingTop: 7, paddingBottom: 3, gap: 7 },
   chip: {
@@ -62,4 +55,4 @@ const styles = StyleSheet.create({
   },
   chipPressed: { backgroundColor: color.pressed, transform: [{ scale: 0.98 }] },
   chipText: { color: color.textDim, fontSize: 12.5, fontWeight: "500" },
-});
+}));

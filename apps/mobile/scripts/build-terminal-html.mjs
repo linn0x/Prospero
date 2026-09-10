@@ -27,6 +27,17 @@ const assets = {
 };
 
 let html = read(path.join(repoRoot, "apps/daemon/term.html"));
+const terminalFontFamily = "JetBrainsMono Nerd Font Mono";
+const font = readFileSync(path.join(here, "../assets/fonts/JetBrainsMonoNerdFontMono-Regular.ttf"));
+// Android has no bundled Nerd Font. Inline it so Expo refresh and offline use
+// both work without fetching fonts from the Mac or installing a native font.
+html = html.replace("</head>", () => `<style>@font-face {
+  font-family: "${terminalFontFamily}";
+  src: url("data:font/ttf;base64,${font.toString("base64")}") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: block;
+}</style></head>`);
 
 // 注意:替换串必须走函数形式 —— vendor 代码里的 `$'` / `$&` 在字符串形式的
 // replace 里会被当作特殊模式展开,导致内容错乱。
@@ -50,6 +61,7 @@ if (leftover) {
 
 const out = `// 本文件由 scripts/build-terminal-html.mjs 自动生成,请勿手工编辑。
 // 源:apps/daemon/term.html + node_modules/@xterm/*
+export const TERMINAL_FONT_FAMILY = ${JSON.stringify(terminalFontFamily)};
 export const TERMINAL_HTML = ${JSON.stringify(html)};
 `;
 

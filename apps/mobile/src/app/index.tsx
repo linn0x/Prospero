@@ -8,6 +8,9 @@ import { EdgeDashboard } from "@/components/EdgeDashboard";
 import { HomeModeTitle } from "@/components/HomeModeTitle";
 import { toast } from "@/components/Toast";
 import { Icon } from "@/components/Icon";
+import { Sheet, SheetAction } from "@/components/Sheet";
+import { DismissedModalAction } from "@/lib/host-screen-flow";
+import { supportsMacTerminal, MAC_TERMINAL_ONLY } from "@/lib/terminal-session";
 import { useAdaptiveLayout } from "@/lib/adaptive-layout";
 import { dropConnection, getConnection, peekConnection, wireAppStateReconnect } from "@/lib/connection";
 import { selectedEdgeHosts, useEdgePreferences } from "@/lib/edge-preferences";
@@ -47,6 +50,9 @@ export default function HostsScreen() {
   const hosts = useOrderedDevices(storedHosts);
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
   const [devicePickerOpen, setDevicePickerOpen] = useState(false);
+  const [terminalPickerOpen, setTerminalPickerOpen] = useState(false);
+  const [terminalNavigation] = useState(() => new DismissedModalAction());
+  useEffect(() => () => terminalNavigation.cancel(), [terminalNavigation]);
   const [choosingEdgeOrchestration, setChoosingEdgeOrchestration] = useState(false);
   const mode = useEdgePreferences((state) => state.mode);
   const edgeHostIds = useEdgePreferences((state) => state.selectedHostIds);
@@ -81,6 +87,10 @@ export default function HostsScreen() {
   const setHomeSettings = useApp((state) => state.setHomeSettings);
   const runtimes = useApp((state) => state.runtimes);
   const effectiveSelectedHostId = resolveHomeHostSelection(hosts, selectedHostId);
+  const terminalHosts = useMemo(() => {
+    const candidates = mode === "edge" ? edgeHosts : hosts.filter((host) => host.id === effectiveSelectedHostId);
+    return candidates.filter((host) => supportsMacTerminal(runtimes[host.id]?.hostInfo));
+  }, [mode, edgeHosts, hosts, effectiveSelectedHostId, runtimes]);
   const selectedConnection = mode === "normal" && effectiveSelectedHostId ? peekConnection(effectiveSelectedHostId) ?? null : null;
   const orchestration = useOrchestrationSnapshot(
     selectedConnection,
@@ -134,6 +144,16 @@ export default function HostsScreen() {
     setChoosingEdgeOrchestration(false);
     setMode(mode === "edge" ? "normal" : "edge");
   }, [mode, setMode]);
+
+  const openTerminal = (): void => {
+    if (terminalHosts.length === 1) {
+      router.push(`/host/${terminalHosts[0]!.id}/terminals`);
+    } else if (terminalHosts.length > 1) {
+      setTerminalPickerOpen(true);
+    } else {
+      toast(MAC_TERMINAL_ONLY);
+    }
+  };
 
   const openOrchestration = useCallback(() => {
     if (mode === "normal") {
@@ -189,6 +209,11 @@ export default function HostsScreen() {
           headerTitle: () => <HomeModeTitle edge={mode === "edge"} onToggle={toggleMode} />,
           headerRight: () => (
             <View style={styles.headerActions}>
+              {terminalHosts.length > 0 && <Pressable accessibilityRole="button" accessibilityLabel="远程终端"
+                accessibilityHint="打开设备的 Shell 终端，可新建或返回已有终端"
+                onPress={openTerminal} style={styles.headerButton}>
+                <Icon name="terminal" size={21} color={palette.accent} />
+              </Pressable>}
               {effectiveSelectedHostId !== null && (
                 <Pressable
                   accessibilityRole="button"
@@ -312,6 +337,13 @@ export default function HostsScreen() {
           onChangeHomeSettings={onChangeHomeSettings}
         />
       )}
+      <Sheet visible={terminalPickerOpen} title="选择终端设备"
+        onClose={() => { terminalNavigation.cancel(); setTerminalPickerOpen(false); }}
+        onDismiss={() => terminalNavigation.dismiss()}>
+        {terminalHosts.map((host) => <SheetAction key={host.id} label={host.name} symbol="terminal"
+          detail={runtimes[host.id]?.status === "connected" ? "打开远程终端" : "打开后尝试连接设备"}
+          onPress={() => { terminalNavigation.defer(() => router.push(`/host/${host.id}/terminals`)); setTerminalPickerOpen(false); }} />)}
+      </Sheet>
     </View>
   );
 }

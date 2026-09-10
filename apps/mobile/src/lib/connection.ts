@@ -75,6 +75,7 @@ import {
   type S2CToolOutput,
   type SecureChannel,
   type SessionKind,
+  type SessionInfo,
 } from "@prospero/protocol";
 import { accountApiProviderForProtocol } from "./account-api-profile";
 import { diagnose, type AttemptResult, type Diagnosis } from "./connect-diagnosis";
@@ -104,6 +105,8 @@ import {
 } from "./outbound-queue";
 import { flushSessionUpdates, useApp } from "./store";
 import { SessionCreateTracker, type SessionCreateTask } from "./session-create";
+import { TerminalCloseTracker } from "./terminal-close";
+import { isShellTerminal, isTerminalEnded, supportsMacTerminal, MAC_TERMINAL_ONLY } from "./terminal-session";
 export { SessionCreateError } from "./session-create";
 export type { SessionCreateTask } from "./session-create";
 
@@ -169,6 +172,8 @@ export class HostConnection {
   private queue = new BoundedQueue<C2SMessage>(MAX_OFFLINE_QUEUE);
   private racingAttempts: ManagedAttempt<Won>[] | null = null;
   private readonly sessionCreates = new SessionCreateTracker();
+  private readonly terminalCloses = new TerminalCloseTracker();
+  private readonly deletedTerminalIds = new Set<string>();
   /**
    * A cold session route can request the same chat twice: the route asks for
    * missing session metadata, then ChatView asks for the chat snapshot when it
@@ -309,6 +314,7 @@ export class HostConnection {
   stop(): void {
     this.stopped = true;
     this.sessionCreates.disconnect();
+    this.terminalCloses.disconnect();
     this.clearTimers();
     this.abortRacingAttempts();
     this.ws?.close();
@@ -725,7 +731,7 @@ export class HostConnection {
       ? null
       : new Set(won.helloOk.host.capabilities);
 
-    useApp.getState().setSessions(this.host.id, won.helloOk.sessions);
+    useApp.getState().setSessions(this.host.id, won.helloOk.sessions.filter((session) => !this.deletedTerminalIds.has(session.id)));
     this.patch({
       status: "connected",
       hostInfo: won.helloOk.host,
@@ -797,8 +803,10 @@ export class HostConnection {
         if (msg.id === this.pendingPingId) this.pendingPingId = null;
         return;
       case "session.state":
+        if (this.deletedTerminalIds.has(msg.session.id)) return;
         useApp.getState().queueSessionUpdate(this.host.id, msg.session);
         this.sessionCreates.state(msg.session);
+        this.terminalCloses.state(msg.session);
         return;
       case "session.create.result":
         // Live session.state may already have advanced beyond the creation
@@ -865,6 +873,7 @@ export class HostConnection {
         this.resolveFs(msg);
         return;
       case "error":
+        if (this.terminalCloses.error(msg)) return;
         this.sessionCreates.legacyError(msg);
         // 文件请求在等应答时,错误要回到那个 Promise,而不是只飘一个全局提示
         if (msg.sid !== undefined && this.rejectFsFor(msg.sid, msg.message)) return;
@@ -1291,6 +1300,7 @@ export class HostConnection {
 
   private onClose(): void {
     this.sessionCreates.disconnect();
+    this.terminalCloses.disconnect();
     // close 事件触发时 readyState 已不是 OPEN，不能再用 isConnected 判断旧状态。
     const wasConnected = this.ws !== null && this.channel !== null;
     const fatalReceiveError = this.fatalReceiveError;
@@ -1864,6 +1874,41 @@ export class HostConnection {
 
   kill(sid: string): DeliveryResult {
     return this.send({ type: "session.kill", sid }, true);
+  }
+
+  closeTerminal(sid: string): Promise<void> {
+    const runtime = useApp.getState().runtimes[this.host.id];
+    if (!supportsMacTerminal(runtime?.hostInfo)) return Promise.reject(new Error(MAC_TERMINAL_ONLY));
+    const session = runtime?.sessions[sid];
+    if (!isShellTerminal(session)) return Promise.reject(new Error("找不到此 Shell 终端，请刷新设备列表。"));
+    if (isTerminalEnded(session)) return Promise.resolve();
+    // A terminal close is sent once on this connection and never replayed offline.
+    return this.terminalCloses.begin(sid, () => this.send({ type: "session.kill", sid }, false));
+  }
+
+  private endedTerminal(sid: string): SessionInfo {
+    const runtime = useApp.getState().runtimes[this.host.id];
+    if (!supportsMacTerminal(runtime?.hostInfo)) throw new Error(MAC_TERMINAL_ONLY);
+    const session = runtime?.sessions[sid];
+    if (!session || !isShellTerminal(session)) throw new Error("找不到此 Shell 终端，请刷新设备列表。");
+    if (!isTerminalEnded(session)) throw new Error("请先关闭终端，再重启或删除。");
+    return session;
+  }
+
+  restartTerminal(sid: string): SessionCreateTask {
+    const session = this.endedTerminal(sid);
+    // A fresh login shell keeps the original directory and dimensions, without
+    // replaying commands from the previous process.
+    return this.createSessionTracked("shell", session.cwd, undefined, "pty", session.cols, session.rows);
+  }
+
+  async deleteTerminal(sid: string): Promise<void> {
+    this.endedTerminal(sid);
+    // Explicit close may already have removed the remote session. Natural exit
+    // can leave its metadata behind, so request cleanup and accept either reply.
+    await this.terminalCloses.begin(sid, () => this.send({ type: "session.kill", sid }, false), { allowMissing: true });
+    this.deletedTerminalIds.add(sid);
+    useApp.getState().removeSession(this.host.id, sid);
   }
 }
 

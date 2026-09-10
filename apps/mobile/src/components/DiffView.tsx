@@ -2,7 +2,7 @@ import { memo, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import type { FileDiff } from "@prospero/protocol";
 import { numberDiffLines, type NumberedDiffLine } from "@/lib/diff-lines";
-import { color, MONOSPACE_FONT } from "@/lib/theme";
+import { MONOSPACE_FONT, createThemedStyles } from "@/lib/theme";
 
 /**
  * 改动查看。手机屏窄,所以:
@@ -13,6 +13,7 @@ import { color, MONOSPACE_FONT } from "@/lib/theme";
 const COLLAPSED_LINES = 14;
 
 export const DiffView = memo(function DiffView({ diff }: { diff: FileDiff }) {
+  const styles = useStyles();
   const [expanded, setExpanded] = useState(false);
   const lines = diff.patch.length > 0 ? diff.patch.split("\n") : [];
   const numbered = numberDiffLines(lines);
@@ -51,6 +52,7 @@ export const DiffView = memo(function DiffView({ diff }: { diff: FileDiff }) {
 });
 
 function DiffLine({ line }: { line: NumberedDiffLine }) {
+  const styles = useStyles();
   if (line.line === "@@") {
     return (
       <View style={styles.gapRow}>
@@ -83,7 +85,7 @@ function DiffLine({ line }: { line: NumberedDiffLine }) {
   );
 }
 
-const styles = StyleSheet.create({
+const useStyles = createThemedStyles((color) => StyleSheet.create({
   wrap: {
     backgroundColor: color.surface,
     borderRadius: 10,
@@ -137,4 +139,4 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     paddingBottom: 7,
   },
-});
+}));

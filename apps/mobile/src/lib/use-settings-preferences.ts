@@ -18,11 +18,11 @@ export function useSettingsPreferences() {
     });
     return () => { active = false; };
   }, []));
-  const updateSettings = useCallback((patch: Partial<HomeSettings>) => {
+  const updateSettings = useCallback((patch: Partial<HomeSettings>, reportErrors = false) => {
     revision.current += 1;
     const next = normalizeHomeSettings({ ...useApp.getState().homeSettings, ...patch });
     useApp.getState().setHomeSettings(next);
-    void rememberHomeSettings(next);
+    return rememberHomeSettings(next, reportErrors);
   }, []);
   return { settings, updateSettings };
 }

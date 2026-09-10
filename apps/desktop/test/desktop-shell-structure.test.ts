@@ -31,12 +31,12 @@ describe("desktop shell structure", () => {
     expect(app).toContain('!workspaceFocus && validOpenIds.length > 0 && <WorkspaceTabs');
     expect(app).toContain('className="local-workspace-container"');
     expect(app).toContain('{focus && <Button className="sidebar-exit-focus"');
-    expect(workspace).toContain('{chromeVisible && <SessionToolbar');
+    expect(workspace).toContain('{chromeVisible && session && <SessionToolbar');
     expect(workspace).not.toContain('pane-tabbar-static');
     expect(workspace).not.toContain('workspace-tabbar');
     expect(workspace).toContain('const visible = chromeVisible && dock.visible && available > 0;');
     expect(workspace).toContain('<Sheet open={visible && overlay}');
-    expect(tabs).toContain('role="tablist"');
+    expect(tabs).toContain('<TabStrip');
   });
 
   it("keeps the sidebar collapsible and able to switch sessions", () => {

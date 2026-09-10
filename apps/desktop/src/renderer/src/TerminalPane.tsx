@@ -259,7 +259,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
             stableBufferRef.current = true;
             setSyncing(true);
             fit.fit();
-            terminal.focus();
+            if (host.current?.getClientRects().length) terminal.focus();
           }
           done();
         });
@@ -278,7 +278,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
     } catch { /* Canvas renderer remains available. */ }
     if (!cached) {
       fit.fit();
-      terminal.focus();
+      if (host.current?.getClientRects().length) terminal.focus();
     }
 
     let input = "";
@@ -391,7 +391,8 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
     const resize = new ResizeObserver(() => {
       window.clearTimeout(resizeTimer);
       resizeTimer = window.setTimeout(() => {
-        if (replayingRef.current) return;
+        const element = host.current;
+        if (replayingRef.current || !element?.isConnected || element.clientWidth === 0 || element.clientHeight === 0) return;
         fit.fit();
         if (connectedRef.current) {
           void queueInteraction({ type: "term.resize", cols: terminal.cols, rows: terminal.rows });
@@ -439,7 +440,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
     terminal.options.fontFamily = terminalFontFamilyWithFallbacks(fontFamily);
     terminal.options.fontSize = fontSize;
     const fit = (): void => {
-      if (!active) return;
+      if (!active || !host.current?.getClientRects().length) return;
       fitRef.current?.fit();
       const current = terminalRef.current;
       if (current && connectedRef.current) {
@@ -556,7 +557,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
           const current = terminalRef.current;
           if (current) {
             current.options.disableStdin = readOnlyRef.current;
-            if (mode !== "delta" || bootstrapDelta) {
+            if ((mode !== "delta" || bootstrapDelta) && host.current?.getClientRects().length) {
               fitRef.current?.fit();
               if (!readOnlyRef.current) void queueInteraction({ type: "term.resize", cols: current.cols, rows: current.rows });
             }

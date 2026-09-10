@@ -1,9 +1,9 @@
-import { Appearance, StyleSheet, useColorScheme, View, type ColorSchemeName } from "react-native";
+import { Appearance, StyleSheet, View, type ColorSchemeName } from "react-native";
 import Svg, { Path } from "react-native-svg";
 import type { AgentKind } from "@prospero/protocol";
 import { agentLogoPath } from "@/components/agent-logos";
 import { Icon, type IconName } from "@/components/Icon";
-import { color, radius } from "@/lib/theme";
+import { radius, createThemedStyles, useMobileTheme } from "@/lib/theme";
 
 /**
  * agent 的标识与识别色。
@@ -48,7 +48,8 @@ export function AgentIcon({
   badge?: boolean;
   badgeOutline?: boolean;
 }) {
-  const scheme = useColorScheme();
+  const styles = useStyles();
+  const { scheme } = useMobileTheme();
   const { symbol } = AGENTS[agent];
   const tint = agentTint(agent, scheme);
   const path = agentLogoPath[agent];
@@ -74,7 +75,7 @@ export function AgentIcon({
   );
 }
 
-const styles = StyleSheet.create({
+const useStyles = createThemedStyles((color) => StyleSheet.create({
   badge: {
     borderRadius: radius.sm,
     alignItems: "center",
@@ -84,4 +85,4 @@ const styles = StyleSheet.create({
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: color.border,
   },
-});
+}));

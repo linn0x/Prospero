@@ -9,7 +9,6 @@ import {
   RefreshControl,
   StyleSheet,
   Text,
-  TextInput,
   View,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -19,7 +18,7 @@ import * as Sharing from "expo-sharing";
 import * as DocumentPicker from "expo-document-picker";
 import * as Haptics from "expo-haptics";
 import { fromB64, toB64, type FsEntry } from "@prospero/protocol";
-import { DismissKey } from "@/components/DismissKey";
+import { FileContentView } from "@/components/FileContentView";
 import { Icon } from "@/components/Icon";
 import { PromptDialog } from "@/components/PromptDialog";
 import { SwipeRow, type SwipeAction } from "@/components/SwipeRow";
@@ -27,7 +26,7 @@ import { primaryPaneWidth, useAdaptiveLayout } from "@/lib/adaptive-layout";
 import { getEditorExitPlan, resolveEditorExitConfirmation } from "@/lib/editor-exit";
 import { downloadFileChunks, uploadFileChunks } from "@/lib/file-transfer";
 import { validateFileName } from "@/lib/file-names";
-import { color, MONOSPACE_FONT } from "@/lib/theme";
+import { color } from "@/lib/theme";
 import { useHostConnection } from "@/lib/use-host-connection";
 
 /** 一次传 256KB;协议单块上限是 1MB,留足编码膨胀余量 */
@@ -52,7 +51,7 @@ function iconFor(entry: FsEntry): "doc.on.doc" | "terminal" | "desktopcomputer" 
 export default function FilesScreen(): React.ReactElement {
   const navigation = useNavigation();
   const { hostId, sid } = useLocalSearchParams<{ hostId: string; sid: string }>();
-  const { conn } = useHostConnection(hostId);
+  const { conn, runtime } = useHostConnection(hostId);
   const insets = useSafeAreaInsets();
   const adaptiveLayout = useAdaptiveLayout();
   const contentPaneWidth = primaryPaneWidth(adaptiveLayout.width, adaptiveLayout.verticalPanes);
@@ -63,7 +62,6 @@ export default function FilesScreen(): React.ReactElement {
   const [error, setError] = useState<string | null>(null);
 
   // 编辑态:null = 没在编辑
-  const [focused, setFocused] = useState(false);
   const [editing, setEditing] = useState<{
     path: string;
     text: string;
@@ -312,7 +310,7 @@ export default function FilesScreen(): React.ReactElement {
           options={{
             title: editing.path.split("/").pop() ?? editing.path,
             headerRight: () => (
-              <Pressable onPress={() => void save()} disabled={!dirty || saving}>
+              <Pressable onPress={() => void save()} disabled={!dirty || saving || editing.truncated}>
                 {saving ? (
                   <ActivityIndicator size="small" color={color.accent} />
                 ) : (
@@ -336,18 +334,11 @@ export default function FilesScreen(): React.ReactElement {
           {editing.truncated && (
             <Text style={styles.warnBar}>文件超过 1MB,只显示前 1MB —— 只读,保存已禁用</Text>
           )}
-          <DismissKey visible={focused} floating />
-          <TextInput
-            style={[styles.editor, { paddingBottom: insets.bottom + 14 }]}
-            value={editing.text}
+          <FileContentView key={editing.path}
+            filePath={editing.path} text={editing.text}
             onChangeText={(text) => setEditing({ ...editing, text })}
-            onFocus={() => { setFocused(true); }}
-            onBlur={() => { setFocused(false); }}
-            multiline
-            autoCapitalize="none"
-            autoCorrect={false}
-            spellCheck={false}
-            editable={!editing.truncated}
+            editable={!editing.truncated && !saving} bottomInset={insets.bottom}
+            conn={conn} hostId={hostId} sid={sid} projectRoot={runtime.sessions[sid]?.cwd}
           />
         </View>
       </KeyboardAvoidingView>
@@ -547,14 +538,6 @@ const styles = StyleSheet.create({
     fontSize: 11,
     textAlign: "center",
     paddingVertical: 8,
-  },
-  editor: {
-    flex: 1,
-    color: color.text,
-    fontFamily: MONOSPACE_FONT,
-    fontSize: 13,
-    padding: 14,
-    textAlignVertical: "top",
   },
   warnBar: {
     backgroundColor: color.warnBg,

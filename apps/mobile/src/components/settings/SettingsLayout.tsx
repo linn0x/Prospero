@@ -16,7 +16,7 @@ export function SettingsPage({ title, detail, children }: { title: string; detai
   const insets = useSafeAreaInsets();
   return <View style={styles.screen}>
     <Stack.Screen options={{ title, headerBackButtonDisplayMode: "minimal" }} />
-    <ScrollView testID="settings-page" contentContainerStyle={[styles.content, { paddingBottom: insets.bottom + 24 }]}>
+    <ScrollView testID="settings-page" keyboardShouldPersistTaps="handled" contentContainerStyle={[styles.content, { paddingBottom: insets.bottom + 24 }]}>
       {detail && <Text style={styles.intro}>{detail}</Text>}
       {children}
     </ScrollView>

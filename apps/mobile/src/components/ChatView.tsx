@@ -15,7 +15,6 @@ import {
   ScrollView,
   StyleSheet,
   TextInput,
-  useColorScheme,
   View,
   type NativeScrollEvent,
   type NativeSyntheticEvent,
@@ -46,12 +45,14 @@ import {
   resolveProjectFileReference,
   type ProjectFileReference,
 } from "@/lib/file-references";
-import { MONOSPACE_FONT, color, radius } from "@/lib/theme";
+import { MONOSPACE_FONT, radius, createThemedStyles, useMobileTheme } from "@/lib/theme";
+import { resultFiles } from "@/lib/result-files";
 import { textInSelection, type TextSelectionRange } from "@/lib/text-selection";
 import {
   applyEvents,
   applyToolOutput,
   foldChatItems,
+  foldCodexTurns,
   itemsForAgent,
   pendingInteractions,
   type AssistantItem,
@@ -138,6 +139,8 @@ const ChatViewContent = memo(function ChatViewContent({
   onOpenSubagent,
   viewMode = "chat",
 }: Props) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
   const [items, setItems] = useState<ChatItem[]>([]);
   /** 带 id 防止路由切换瞬间把上一个子 Agent 的历史短暂画到新页面。 */
   const [subagentHistory, setSubagentHistory] = useState<{
@@ -150,6 +153,13 @@ const ChatViewContent = memo(function ChatViewContent({
   const evSeqRef = useRef(0);
   const scrollFollow = useRef(new ChatScrollFollow());
   const [hasUnread, setHasUnread] = useState(false);
+  // Kept outside virtualized rows: scrolling a capsule offscreen must not reset it.
+  const [turnExpansion, setTurnExpansion] = useState<Record<string, boolean>>({});
+  const toggleTurn = useCallback((key: string, expanded: boolean) => {
+    scrollFollow.current.beginDrag();
+    scrollFollow.current.endDrag(false);
+    setTurnExpansion((previous) => ({ ...previous, [key]: !expanded }));
+  }, []);
   const [selectionSource, setSelectionSource] = useState<string | null>(null);
   const pendingOutgoingRef = useRef(pendingOutgoing);
   const [acknowledgedPendingToken, setAcknowledgedPendingToken] = useState<string | null>(null);
@@ -335,10 +345,10 @@ const ChatViewContent = memo(function ChatViewContent({
     const q = search?.trim().toLowerCase() ?? "";
     if (q.length > 0) {
       // 搜索结果逐条展开，否则命中项可能藏在活动组里。
-      return source.filter((i) => itemText(i).toLowerCase().includes(q));
+      return source.filter((i) => i.type !== "turn-end" && itemText(i).toLowerCase().includes(q));
     }
-    return viewMode === "trajectory" ? source : foldChatItems(source);
-  }, [scopedItems, search, viewMode]);
+    return viewMode === "trajectory" ? source : agent === "codex" ? foldCodexTurns(source, turnExpansion) : foldChatItems(source);
+  }, [scopedItems, search, viewMode, agent, turnExpansion]);
   // The latest cells mount first at offset zero; no estimated long-history end is needed.
   const newestFirst = useMemo(() => newestChatItemsFirst(visible), [visible]);
 
@@ -353,6 +363,19 @@ const ChatViewContent = memo(function ChatViewContent({
   const renderItem = useCallback(
     ({ item }: { item: ChatDisplayItem }) => {
       switch (item.type) {
+        case "turn-end":
+          return null;
+        case "turn-activity":
+          return <Pressable testID={`codex-${item.key}`} accessibilityRole="button"
+            accessibilityState={{ expanded: item.expanded }}
+            accessibilityLabel={`${item.completed ? "本轮执行过程" : "正在执行"}，${item.count} 项，${item.expanded ? "收起" : "展开"}`}
+            onPress={() => toggleTurn(item.stateKey, item.expanded)}
+            style={({ pressed }) => [styles.turnCapsule, pressed && styles.inlinePressed]}>
+            {!item.completed && <ActivityIndicator size="small" color={color.accent} />}
+            <Icon name={item.expanded ? "chevron.down" : "chevron.right"} size={12} color={color.textDim} />
+            <Text style={styles.turnCapsuleText}>{item.completed ? "执行过程" : "正在执行"} · {item.count} 项</Text>
+            <Text style={styles.turnCapsuleHint}>{item.expanded ? "收起" : "展开"}</Text>
+          </Pressable>;
         case "user":
           return <UserBubble item={item} loadAttachment={loadUserAttachment} />;
         case "assistant":
@@ -363,6 +386,8 @@ const ChatViewContent = memo(function ChatViewContent({
               onOpenFile={onOpenFile}
               loadProjectImage={loadProjectImage}
               onSelectCopy={setSelectionSource}
+              showFiles={agent === "codex" && item.done && item.text.length > 0}
+              reasoningExpanded={agent === "codex"}
             />
           );
         case "tool":
@@ -402,6 +427,10 @@ const ChatViewContent = memo(function ChatViewContent({
       onOpenSubagent,
       onRetry,
       retry,
+      toggleTurn,
+      agent,
+      color,
+      styles,
     ],
   );
 
@@ -422,7 +451,7 @@ const ChatViewContent = memo(function ChatViewContent({
           </Text>
         </View>
       ),
-    [workingStatus, search],
+    [workingStatus, search, color.textFaint, styles],
   );
 
   const listHeader = useMemo(
@@ -448,7 +477,7 @@ const ChatViewContent = memo(function ChatViewContent({
         {listHeader}
       </>
     ),
-    [listHeader, visiblePendingOutgoing],
+    [listHeader, visiblePendingOutgoing, styles],
   );
 
   const handleContentSizeChange = useCallback(() => {
@@ -552,7 +581,8 @@ function AgentWorkingIndicator({
   status: SessionStatus | SubagentStatus;
   onInterrupt?: () => void;
 }) {
-  const scheme = useColorScheme();
+  const styles = useStyles();
+  const { palette: color, scheme } = useMobileTheme();
   const tint = agentTint(agent, scheme);
   const waiting = status === "waiting_approval" || status === "waiting_input";
   const label = waiting
@@ -597,6 +627,8 @@ function AgentWorkingIndicator({
 
 function itemText(i: ChatItem): string {
   switch (i.type) {
+    case "turn-end":
+      return "";
     case "user":
       return i.text;
     case "assistant":
@@ -637,6 +669,8 @@ function SelectionCopySheet({
   source: string;
   onClose: () => void;
 }) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
   const [selection, setSelection] = useState<TextSelectionRange>({ start: 0, end: 0 });
   const readingScale = useConversationFontScale();
   const copy = useCopy();
@@ -709,6 +743,7 @@ const UserBubble = memo(function UserBubble({
   item: UserItem;
   loadAttachment: UserAttachmentLoader;
 }) {
+  const styles = useStyles();
   return (
     <View style={styles.userRow}>
       <View style={styles.userBubble}>
@@ -743,6 +778,8 @@ const UserAttachmentPreview = memo(function UserAttachmentPreview({
   attachment: AgentUserAttachment;
   loadAttachment: UserAttachmentLoader;
 }) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
   const [state, setState] = useState<UserAttachmentPreviewLoadState>({
     status: "loading",
     uri: null,
@@ -811,13 +848,19 @@ const AssistantBubble = memo(function AssistantBubble({
   onOpenFile,
   loadProjectImage,
   onSelectCopy,
+  showFiles = false,
+  reasoningExpanded = false,
 }: {
   item: AssistantItem;
   projectRoot?: string;
   onOpenFile?: (reference: ProjectFileReference) => void;
   loadProjectImage: ProjectImageLoader;
   onSelectCopy: (source: string) => void;
+  showFiles?: boolean;
+  reasoningExpanded?: boolean;
 }) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
   const [showReasoning, setShowReasoning] = useState(false);
   const copy = useCopy();
   const cost = item.finish?.costUsd;
@@ -826,7 +869,7 @@ const AssistantBubble = memo(function AssistantBubble({
   const finish = finishLabel(item.finish?.reason);
   return (
     <View style={styles.assistantRow}>
-      {item.reasoning.length > 0 && (
+      {item.reasoning.length > 0 && !reasoningExpanded && (
         <Pressable
           onPress={() => setShowReasoning((v) => !v)}
           style={({ pressed }) => [styles.reasoningToggle, pressed && styles.inlinePressed]}
@@ -838,7 +881,7 @@ const AssistantBubble = memo(function AssistantBubble({
           </Text>
         </Pressable>
       )}
-      {showReasoning && <Text style={styles.reasoningText} selectable>{item.reasoning}</Text>}
+      {(showReasoning || reasoningExpanded) && item.reasoning.length > 0 && <Text style={styles.reasoningText} selectable>{item.reasoning}</Text>}
       {item.text.length > 0 && (
         <Markdown
           source={item.text}
@@ -847,6 +890,7 @@ const AssistantBubble = memo(function AssistantBubble({
           loadProjectImage={loadProjectImage}
         />
       )}
+      {showFiles && projectRoot && <ResultFiles source={item.text} projectRoot={projectRoot} onOpenFile={onOpenFile} />}
       {!item.done && item.text.length === 0 && item.reasoning.length === 0 && (
         <View style={styles.thinkingRow}>
           <View style={styles.thinkingDot} />
@@ -895,8 +939,25 @@ const AssistantBubble = memo(function AssistantBubble({
   );
 });
 
+const ResultFiles = memo(function ResultFiles({ source, projectRoot, onOpenFile }: {
+  source: string; projectRoot: string; onOpenFile?: (reference: ProjectFileReference) => void;
+}) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
+  const files = useMemo(() => resultFiles(source, projectRoot), [source, projectRoot]);
+  if (!files.length) return null;
+  return <View style={styles.resultFiles}>
+    <Text style={styles.turnCapsuleText}>文件产出 · {files.length}</Text>
+    {files.map((file) => <Pressable key={file.path} accessibilityRole="link" accessibilityLabel={`打开文件产出 ${file.path}`}
+      disabled={!onOpenFile} onPress={() => onOpenFile?.(file)} style={styles.resultFile}>
+      <Icon name="doc.fill" size={15} color={color.accent} />
+      <Text style={styles.resultFileText} numberOfLines={1} ellipsizeMode="middle">{file.path}</Text>
+      <Icon name="chevron.right" size={11} color={color.textFaint} />
+    </Pressable>)}
+  </View>;
+});
+
 const stateLabel = { running: "运行中", success: "完成", failed: "失败" } as const;
-const stateColor = { running: color.warn, success: color.success, failed: color.danger } as const;
 
 function formatTokenCount(value: number): string {
   if (value < 1_000) return `${String(value)} tokens`;
@@ -921,6 +982,8 @@ const ToolCard = memo(function ToolCard({
   item: ToolItem;
   onFetchOutput: (callId: string) => void;
 }) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
   const [expanded, setExpanded] = useState(false);
   const copy = useCopy();
 
@@ -945,7 +1008,7 @@ const ToolCard = memo(function ToolCard({
         accessibilityHint="点按展开，长按复制"
       >
         <View style={styles.toolHeader}>
-          <View style={[styles.toolDot, { backgroundColor: stateColor[item.state] }]} />
+          <View style={[styles.toolDot, { backgroundColor: { running: color.warn, success: color.success, failed: color.danger }[item.state] }]} />
           <Text style={styles.toolName}>{item.tool}</Text>
           {item.diff && (
             <Text style={styles.diffBadge}>
@@ -998,7 +1061,10 @@ const TurnDiffSummaryBar = memo(function TurnDiffSummaryBar({
   projectRoot?: string;
   onOpenFile?: (reference: ProjectFileReference) => void;
 }) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
   const [expanded, setExpanded] = useState(false);
+  const [diffPath, setDiffPath] = useState<string | null>(null);
   const files = useMemo(
     () =>
       item.files.map((file) => ({
@@ -1033,11 +1099,11 @@ const TurnDiffSummaryBar = memo(function TurnDiffSummaryBar({
       </Pressable>
       {expanded && (
         <View style={styles.diffSummaryList}>
-          {files.slice(0, 12).map((file) => {
+          {files.map((file) => {
             const displayPath = file.reference?.path ?? file.path;
             return (
+              <View key={file.path}>
               <Pressable
-                key={file.path}
                 style={({ pressed }) => [
                   styles.diffSummaryRow,
                   pressed && file.reference !== null && styles.inlinePressed,
@@ -1056,11 +1122,15 @@ const TurnDiffSummaryBar = memo(function TurnDiffSummaryBar({
                 <Text style={styles.diffSummaryMiniDelete}>−{String(file.deletions)}</Text>
                 {file.reference && <Icon name="chevron.right" size={10} color={color.textFaint} />}
               </Pressable>
+              {file.diff && <Pressable accessibilityRole="button" accessibilityState={{ expanded: diffPath === file.path }}
+                accessibilityLabel={`查看 ${displayPath} 的改动`} style={styles.diffSummaryRow}
+                onPress={() => setDiffPath((previous) => previous === file.path ? null : file.path)}>
+                <Text style={styles.resultFileText}>{diffPath === file.path ? "收起改动" : "查看改动"}</Text>
+              </Pressable>}
+              {file.diff && diffPath === file.path && <DiffView diff={file.diff} />}
+              </View>
             );
           })}
-          {files.length > 12 && (
-            <Text style={styles.diffSummaryMore}>另有 {String(files.length - 12)} 个文件</Text>
-          )}
         </View>
       )}
     </View>
@@ -1080,6 +1150,8 @@ const PermissionCard = memo(function PermissionCard({
   item: PermissionItem;
   onRespond: (reqId: string, reply: PermissionReply) => void;
 }) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
   const resolved = item.resolved;
   // 自动批准的卡片刻意做得低调但可见:不该抢注意力(它没在等你),
   // 但必须能在回滚聊天时一眼认出"这条没经过我"。
@@ -1162,6 +1234,8 @@ const QuestionCard = memo(function QuestionCard({
   item: QuestionItem;
   onRespond: (reqId: string, answers: AgentQuestionAnswer[], cancelled?: boolean) => void;
 }) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
   const [selected, setSelected] = useState<Record<string, string[]>>({});
   const [other, setOther] = useState<Record<string, string>>({});
   const [visiblePreviews, setVisiblePreviews] = useState<Record<string, boolean>>({});
@@ -1315,6 +1389,7 @@ const QuestionCard = memo(function QuestionCard({
 
 /** Claude 的问题选项可带 Markdown 或 HTML；HTML 在 RN 中转成安全的可读文本。 */
 const QuestionOptionPreview = memo(function QuestionOptionPreview({ source }: { source: string }) {
+  const styles = useStyles();
   const markdown = useMemo(() => questionPreviewMarkdown(source), [source]);
   return (
     <View style={styles.questionPreview}>
@@ -1357,6 +1432,8 @@ const SubagentCard = memo(function SubagentCard({
   item: SubagentItem;
   onOpen?: (subagentId: string) => void;
 }) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
   const subagent = item.subagent;
   const active = subagent.status === "running" || subagent.status === "starting";
   return (
@@ -1403,6 +1480,8 @@ function durationLabel(milliseconds: number): string {
 }
 
 const TrajectoryCard = memo(function TrajectoryCard({ item }: { item: TrajectoryItem }) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
   const [expanded, setExpanded] = useState(false);
   const tint = item.phase === "failed"
     ? color.danger
@@ -1462,6 +1541,7 @@ const ErrorCard = memo(function ErrorCard({
   item: ErrorItem;
   onRetry?: () => void;
 }) {
+  const styles = useStyles();
   return (
     <View style={styles.errorCard}>
       <Text style={styles.errorText} selectable>
@@ -1490,6 +1570,8 @@ const ActivityGroup = memo(function ActivityGroup({
   onFetchOutput: (callId: string) => void;
   onRespond: (reqId: string, reply: PermissionReply) => void;
 }) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
   const [expanded, setExpanded] = useState(false);
   const tools = item.items.filter((entry): entry is ToolItem => entry.type === "tool");
   const approvals = item.items.length - tools.length;
@@ -1538,7 +1620,15 @@ const ActivityGroup = memo(function ActivityGroup({
   );
 });
 
-const styles = StyleSheet.create({
+const useStyles = createThemedStyles((color) => StyleSheet.create({
+  turnCapsule: { alignSelf: "flex-start", flexDirection: "row", alignItems: "center", gap: 7,
+    minHeight: 40, paddingHorizontal: 13, paddingVertical: 8, borderRadius: 22, backgroundColor: color.surfaceRaised },
+  turnCapsuleText: { color: color.textDim, fontSize: 12, fontWeight: "600" },
+  turnCapsuleHint: { color: color.textFaint, fontSize: 11 },
+  resultFiles: { gap: 6, marginTop: 10 },
+  resultFile: { flexDirection: "row", alignItems: "center", gap: 8, minHeight: 42,
+    borderRadius: radius.md, backgroundColor: color.surfaceRaised, paddingHorizontal: 11 },
+  resultFileText: { flex: 1, color: color.accent, fontSize: 12 },
   root: { flex: 1 },
   list: { flex: 1, backgroundColor: color.bg },
   content: {
@@ -2038,4 +2128,4 @@ const styles = StyleSheet.create({
   errorText: { color: color.danger, fontSize: 13, lineHeight: 19 },
   retryBtn: { alignSelf: "flex-start" },
   retryText: { color: color.accent, fontSize: 12, fontWeight: "600" },
-});
+}));

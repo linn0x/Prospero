@@ -4,9 +4,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { MarkdownContent } from "../src/renderer/src/chat/MarkdownContent";
 import { LocaleProvider } from "../src/renderer/src/locale";
 
-function render(value: string): string {
+function render(value: string, projectRoot?: string): string {
   vi.stubGlobal("localStorage", { getItem: () => "zh" });
-  return renderToStaticMarkup(<LocaleProvider><MarkdownContent value={value} onError={() => {}} /></LocaleProvider>);
+  return renderToStaticMarkup(<LocaleProvider><MarkdownContent value={value} projectRoot={projectRoot} onError={() => {}} /></LocaleProvider>);
 }
 afterEach(() => vi.unstubAllGlobals());
 describe("Markdown rendering", () => {
@@ -21,5 +21,12 @@ describe("Markdown rendering", () => {
   it("remains renderable with incomplete code and formulas while streaming", () => {
     expect(render("```python\nprint('中文')")).toContain("中文");
     expect(render("partial $x^{")).toContain("partial");
+  });
+  it("preserves project file links and Windows drive paths without enabling unsafe URLs", () => {
+    const html = render('[source](D:/project/src/app.ts:12) [report](report.md) [outside](D:/private/secret.md) [script](javascript:alert)', 'D:/project');
+    expect(html).toContain('href="D:/project/src/app.ts:12"');
+    expect(html).toContain('href="report.md"');
+    expect(html).not.toContain('href="D:/private/secret.md"');
+    expect(html).not.toContain('javascript:');
   });
 });
