@@ -46,7 +46,7 @@ import type {
   ModelSourceMigration,
   S2CModelSourceResult,
 } from "@prospero/protocol";
-import { AgentApiEngineValidationSchema, AgentApiValidationSchema, AgentModelCapabilitiesSchema, ModelSourceBindingSchema, getAgentAccountCapabilities, getAgentAccountEngine } from "@prospero/protocol";
+import { ApiHeadersSchema, AgentApiEngineValidationSchema, AgentApiValidationSchema, AgentModelCapabilitiesSchema, ModelSourceBindingSchema, getAgentAccountCapabilities, getAgentAccountEngine } from "@prospero/protocol";
 import { programCommandFor } from "./agents.js";
 import { claudeModelCapabilityEnvironment, codexModelCapabilityArgs, getModelCapabilitySupport } from "./api-profile-capabilities.js";
 import { fetchApiModels, type ApiModelCatalogOptions } from "./agent-api-models.js";
@@ -88,6 +88,7 @@ interface StoredApiProfile {
   baseUrl: string;
   model: string;
   modelCapabilities?: AgentModelCapabilities;
+  headers?: Record<string, string>;
 }
 
 interface AccountStore {
@@ -380,7 +381,7 @@ function parseStoredApiProfile(agent: CodeAgentKind, value: unknown): StoredApiP
       : agent === "codex" && /\/chat\/completions\/*$/i.test(raw["baseUrl"])
         ? "openai_chat_completions"
         : apiProtocolFor(agent);
-    return cleanApiProfile(agent, raw["baseUrl"], raw["model"], provider, protocol, raw["modelCapabilities"] as AgentModelCapabilities | undefined);
+    return { ...cleanApiProfile(agent, raw["baseUrl"], raw["model"], provider, protocol, raw["modelCapabilities"] as AgentModelCapabilities | undefined), ...(raw["headers"] !== undefined ? { headers: ApiHeadersSchema.parse(raw["headers"]) } : {}) };
   } catch {
     return undefined;
   }
@@ -403,6 +404,7 @@ function codexProviderArgs(profile: StoredApiProfile): string[] {
     "-c", `model_providers.prospero.env_key=${tomlString("OPENAI_API_KEY")}`,
     "-c", `model_providers.prospero.wire_api=${tomlString("responses")}`,
     "-c", "model_providers.prospero.requires_openai_auth=false",
+    ...Object.keys(profile.headers ?? {}).flatMap((name, index) => ["-c", `model_providers.prospero.env_http_headers.${tomlString(name)}=${tomlString(`PROSPERO_API_HEADER_${index}`)}`]),
     ...codexModelCapabilityArgs(profile),
   ];
 }
@@ -433,6 +435,7 @@ function opencodeProfileEnvironment(
         env: ["OPENAI_API_KEY"],
         options: {
           baseURL: profile.baseUrl,
+          ...(profile.headers ? { headers: profile.headers } : {}),
         },
         models: {
           [profile.model]: {
@@ -872,6 +875,7 @@ export class AgentAccountManager {
           ? {
             // 自定义 provider 只从本 Profile 的 key 取值，不能回退 daemon 的全局环境。
             OPENAI_API_KEY: credential?.kind === "api_key" ? credential.secret : "",
+            ...Object.fromEntries(Object.values(apiProfile.headers ?? {}).map((value, index) => [`PROSPERO_API_HEADER_${index}`, value])),
             OPENAI_BASE_URL: "",
             OPENAI_API_BASE: "",
             OPENAI_ORGANIZATION: "",
@@ -885,6 +889,7 @@ export class AgentAccountManager {
             ANTHROPIC_API_KEY: credential?.kind === "api_key" ? credential.secret : "",
             ANTHROPIC_AUTH_TOKEN: "",
             ANTHROPIC_BASE_URL: apiProfile.baseUrl,
+            ANTHROPIC_CUSTOM_HEADERS: Object.entries(apiProfile.headers ?? {}).map(([name, value]) => `${name}: ${value}`).join("\n"),
             ANTHROPIC_MODEL: apiProfile.model,
             CLAUDE_CODE_API_BASE_URL: "",
             CLAUDE_CODE_OAUTH_TOKEN: "",
@@ -962,15 +967,15 @@ export class AgentAccountManager {
   async apiModels(input: Omit<C2SAgentAccountApiModelsGet, "type" | "requestId">, options: ApiModelCatalogOptions = {}): Promise<AgentApiCatalogModel[]> {
     await this.ready();
     if (input.accountId) {
-      if (input.protocol !== undefined || input.baseUrl !== undefined || input.apiKey !== undefined) throw new AgentAccountFeatureError("invalid_request", "使用保存凭据时不能替换连接地址；请先保存 Profile 或使用独立草稿凭据");
+      if (input.protocol !== undefined || input.baseUrl !== undefined || input.apiKey !== undefined || input.headers !== undefined) throw new AgentAccountFeatureError("invalid_request", "使用保存凭据时不能替换连接地址；请先保存 Profile 或使用独立草稿凭据");
       const account = this.requireManaged(input.accountId);
       if (!account.apiProfile) throw new AgentAccountFeatureError("invalid_request", "此账号不是有效的 API Profile");
       const credential = this.claudeCredential(account.id, this.rootFor(account.agent, account.id));
       if (credential?.kind !== "api_key") throw new AgentAccountFeatureError("authentication", "请先保存此 Profile 的 API Key");
-      return fetchApiModels({ protocol: account.apiProfile.protocol, baseUrl: account.apiProfile.baseUrl, apiKey: credential.secret }, options);
+      return fetchApiModels({ ...account.apiProfile, apiKey: credential.secret }, options);
     }
     if (!input.protocol || !input.baseUrl || !input.apiKey) throw new AgentAccountFeatureError("invalid_request", "请填写协议、API 地址和 API Key 后拉取模型");
-    return fetchApiModels({ protocol: input.protocol, baseUrl: input.baseUrl, apiKey: input.apiKey }, options);
+    return fetchApiModels({ protocol: input.protocol, baseUrl: input.baseUrl, apiKey: input.apiKey, ...(input.headers ? { headers: input.headers } : {}) }, options);
   }
 
   async modelSourceAction(action: ModelSourceAction): Promise<Omit<S2CModelSourceResult, "type" | "requestId" | "ok" | "accounts">> {
@@ -1032,7 +1037,7 @@ export class AgentAccountManager {
       try {
         const credential = this.readCredential(account.id, this.rootFor(account.agent, account.id));
         if (credential?.kind !== "api_key") { skippedAccounts++; continue; }
-        const key = JSON.stringify([account.apiProfile.protocol, account.apiProfile.baseUrl]);
+        const key = JSON.stringify([account.apiProfile.protocol, account.apiProfile.baseUrl, account.apiProfile.headers]);
         const group = groups.get(key) ?? [];
         group.push({ account, secret: credential.secret, revision: this.captureApiValidationRevision(account.id) });
         groups.set(key, group);
@@ -1176,6 +1181,7 @@ export class AgentAccountManager {
       input.modelCapabilities === undefined ? account.apiProfile?.modelCapabilities : input.modelCapabilities,
     );
     const name = input.name === undefined ? account.name : cleanName(input.name);
+    if (account.apiProfile?.headers) profile.headers = account.apiProfile.headers;
     const apiKey = input.apiKey?.trim() ?? "";
     const updatesCredential = apiKey.length > 0;
     const connectionChanged = JSON.stringify(profile) !== JSON.stringify(account.apiProfile);

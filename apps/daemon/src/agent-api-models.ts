@@ -1,10 +1,11 @@
-import { AgentModelCapabilitiesSchema, AgentReasoningEffortSchema, type AgentApiCatalogModel, type AgentApiProtocol, type AgentModelCapabilities } from "@prospero/protocol";
+import { ApiHeadersSchema, AgentModelCapabilitiesSchema, AgentReasoningEffortSchema, type AgentApiCatalogModel, type AgentApiProtocol, type AgentModelCapabilities } from "@prospero/protocol";
 import { AgentAccountFeatureError } from "./agent-account-feature-error.js";
 
 export interface ApiModelCatalogInput {
   protocol: AgentApiProtocol;
   baseUrl: string;
   apiKey: string;
+  headers?: Record<string, string>;
 }
 
 export interface ApiModelCatalogOptions {
@@ -80,6 +81,7 @@ export async function fetchApiModels(input: ApiModelCatalogInput, options: ApiMo
     throw new AgentAccountFeatureError("invalid_request", "请填写有效的 API Key");
   }
   const endpoint = apiModelsUrl(input.baseUrl, input.protocol);
+  const customHeaders = ApiHeadersSchema.parse(input.headers ?? {});
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? 15_000);
   const abort = (): void => controller.abort();
@@ -103,9 +105,9 @@ export async function fetchApiModels(input: ApiModelCatalogInput, options: ApiMo
           method: "GET",
           redirect: "manual",
           signal: controller.signal,
-          headers: input.protocol === "anthropic"
+          headers: { ...customHeaders, ...(input.protocol === "anthropic"
             ? { "x-api-key": input.apiKey, "anthropic-version": "2023-06-01", accept: "application/json" }
-            : { authorization: `Bearer ${input.apiKey}`, accept: "application/json" },
+            : { authorization: `Bearer ${input.apiKey}`, accept: "application/json" }) },
         });
         if (![301, 302, 303, 307, 308].includes(response.status)) break;
         const location = response.headers.get("location");

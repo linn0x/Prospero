@@ -1,11 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import { closeSync, constants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { ModelSourceSchema, type AgentApiCatalogModel, type AgentApiProvider, type AgentApiProtocol, type AgentModelCapabilities, type AgentReasoningEffort, type ModelSource, type ModelSourceAction, type ModelSourceBinding, type ModelSourceRoute } from "@prospero/protocol";
+import { ApiHeadersSchema, ModelSourceSchema, type AgentApiCatalogModel, type AgentApiProvider, type AgentApiProtocol, type AgentModelCapabilities, type AgentReasoningEffort, type ModelSource, type ModelSourceAction, type ModelSourceBinding, type ModelSourceRoute } from "@prospero/protocol";
 import { AgentAccountFeatureError } from "./agent-account-feature-error.js";
 import { fetchApiModels, type ApiModelCatalogInput } from "./agent-api-models.js";
 
-export type SourceProfile = { provider: AgentApiProvider; protocol: AgentApiProtocol; baseUrl: string; model: string; modelCapabilities?: AgentModelCapabilities };
+export type SourceProfile = { provider: AgentApiProvider; protocol: AgentApiProtocol; baseUrl: string; model: string; modelCapabilities?: AgentModelCapabilities; headers?: Record<string, string> };
 type NormalizeProfile = (protocol: AgentApiProtocol, baseUrl: string, model: string, capabilities?: AgentModelCapabilities) => SourceProfile;
 type Credential = { sourceId: string; id: string; revision: number; secret: string };
 export type FrozenSourceBinding = Omit<ModelSourceBinding, "current"> & { accountId: string; credentialId: string; credentialRevision: number; profile: SourceProfile; defaultEffort?: AgentReasoningEffort };
@@ -134,7 +134,7 @@ export class ModelSources {
     if (!source.enabled || !route?.enabled) fail("invalid_request", "模型源或模型已停用 / Model source or route is disabled");
     const endpoint = source.endpoints.find(item => item.protocol === route.protocol);
     if (!endpoint) fail("invalid_config", "模型协议缺少连接地址 / Missing protocol endpoint");
-    return { source, route, profile: this.normalize(route.protocol, endpoint.baseUrl, route.model, route.modelCapabilities) };
+    return { source, route, profile: { ...this.normalize(route.protocol, endpoint.baseUrl, route.model, route.modelCapabilities), ...(endpoint.headers ? { headers: endpoint.headers } : {}) } };
   }
 
   bind(accountId: string, sourceId: string, routeId: string, revision: number, legacy = false): FrozenSourceBinding {
@@ -243,8 +243,8 @@ export class ModelSources {
     for (const entry of entries) {
       if (next.bindings.some(binding => binding.accountId === entry.accountId)) fail("conflict", "Profile 已被迁移，请重新预览 / Profile already migrated; preview again");
       const endpoint = source.endpoints.find(item => item.protocol === entry.profile.protocol);
-      if (endpoint && endpoint.baseUrl !== entry.profile.baseUrl) fail("invalid_request", "同一协议的连接地址不一致 / Protocol endpoint addresses differ");
-      if (!endpoint) source.endpoints.push({ protocol: entry.profile.protocol, baseUrl: entry.profile.baseUrl });
+      if (endpoint && (endpoint.baseUrl !== entry.profile.baseUrl || JSON.stringify(endpoint.headers ?? {}) !== JSON.stringify(entry.profile.headers ?? {}))) fail("invalid_request", "同一协议的连接配置不一致 / Protocol endpoint configurations differ");
+      if (!endpoint) source.endpoints.push({ protocol: entry.profile.protocol, baseUrl: entry.profile.baseUrl, ...(entry.profile.headers ? { headers: entry.profile.headers } : {}) });
       const secret = key(entry.secret);
       let credential = next.credentials.find(item => item.sourceId === sourceId && item.secret === secret && source.credentials.some(current => current.id === item.id && current.revision === item.revision));
       if (!credential) {
@@ -271,13 +271,13 @@ export class ModelSources {
     const endpoint = source.endpoints.find(item => item.protocol === input.protocol);
     const credential = source.credentials.find(item => item.id === input.credentialId);
     if (!endpoint || !credential) fail("not_found", "连接或凭据不存在 / Endpoint or credential not found");
-    const cacheKey = JSON.stringify([source.id, endpoint.protocol, endpoint.baseUrl, credential.id, credential.revision]);
+    const cacheKey = JSON.stringify([source.id, endpoint.protocol, endpoint.baseUrl, endpoint.headers, credential.id, credential.revision]);
     const cached = this.catalogs.get(cacheKey);
     if (!input.refresh && cached && this.now() - cached.at < 300_000) return structuredClone(cached.models);
     const pending = this.requests.get(cacheKey);
     if (pending) return structuredClone(await pending);
     if (this.requests.size >= 4) fail("busy", "模型目录繁忙，请稍后重试 / Model catalog is busy");
-    const request = (this.options.fetchModels ?? fetchApiModels)({ protocol: endpoint.protocol, baseUrl: endpoint.baseUrl, apiKey: this.credential(source.id, credential.id, credential.revision).secret }).then(models => {
+    const request = (this.options.fetchModels ?? fetchApiModels)({ protocol: endpoint.protocol, baseUrl: endpoint.baseUrl, ...(endpoint.headers ? { headers: endpoint.headers } : {}), apiKey: this.credential(source.id, credential.id, credential.revision).secret }).then(models => {
       this.catalogs.delete(cacheKey);
       this.catalogs.set(cacheKey, { at: this.now(), models: structuredClone(models) });
       while (this.catalogs.size > 40) this.catalogs.delete(this.catalogs.keys().next().value!);
@@ -296,7 +296,7 @@ export class ModelSources {
 
   private endpoints(endpoints: ModelSource["endpoints"]): ModelSource["endpoints"] {
     if (new Set(endpoints.map(item => item.protocol)).size !== endpoints.length) fail("invalid_request", "每种协议只能配置一个端点 / Each protocol needs a single endpoint");
-    return endpoints.map(item => ({ protocol: item.protocol, baseUrl: this.normalize(item.protocol, item.baseUrl, "catalog").baseUrl }));
+    return endpoints.map(item => ({ ...item, baseUrl: this.normalize(item.protocol, item.baseUrl, "catalog").baseUrl }));
   }
 
   private now(): number { return (this.options.now ?? Date.now)(); }
@@ -360,7 +360,7 @@ export class ModelSources {
     }
     for (const binding of value.bindings) {
       if (!idPattern.test(binding.accountId) || !sources.some(source => source.id === binding.sourceId) || !idPattern.test(binding.routeId) || !Number.isSafeInteger(binding.revision) || binding.revision < 1 || typeof binding.legacy !== "boolean" || typeof binding.sourceName !== "string" || binding.sourceName.length > 80 || typeof binding.routeName !== "string" || binding.routeName.length > 80 || !hasCredential(binding.sourceId, binding.credentialId, binding.credentialRevision)) fail("invalid_config", "会话模型绑定格式错误 / Invalid session model binding");
-      binding.profile = this.normalize(binding.profile.protocol, binding.profile.baseUrl, binding.profile.model, binding.profile.modelCapabilities);
+      binding.profile = { ...this.normalize(binding.profile.protocol, binding.profile.baseUrl, binding.profile.model, binding.profile.modelCapabilities), ...(binding.profile.headers ? { headers: ApiHeadersSchema.parse(binding.profile.headers) } : {}) };
     }
     return { version: 1, sources, credentials: value.credentials, bindings: value.bindings, creations };
   }
