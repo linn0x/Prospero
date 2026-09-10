@@ -79,6 +79,40 @@ class MemoryCredentialStore implements AgentAccountCredentialStore {
 }
 
 describe("Code Agent 账号隔离", () => {
+  it("initializes only managed Claude API onboarding and preserves existing settings", async () => {
+    const home = tempHome();
+    const accounts = new AgentAccountManager(home, signedInRunner([]), new MemoryCredentialStore());
+    const account = await accounts.createApi("claude", "Gateway", { baseUrl: "https://models.invalid", model: "example-model", apiKey: "fixture-key" });
+    const file = path.join(accounts.resolve(account.id).environment.CLAUDE_CONFIG_DIR!, ".claude.json");
+    writeFileSync(file, JSON.stringify({ theme: "light", projects: { fixture: { hasTrustDialogAccepted: false } } }));
+    expect(accounts.resolveForSession(account.id).environment.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBe("1");
+    expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({ hasCompletedOnboarding: true, theme: "light", projects: { fixture: { hasTrustDialogAccepted: false } } });
+    const before = statSync(file).mtimeMs;
+    accounts.resolveForSession(account.id);
+    expect(statSync(file).mtimeMs).toBe(before);
+    writeFileSync(file, "invalid");
+    expect(() => accounts.resolveForSession(account.id)).toThrow("初始化配置无效");
+    expect(readFileSync(file, "utf8")).toBe("invalid");
+    expect(accounts.resolveForSession("native-claude").environment.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBeUndefined();
+  });
+
+  it("routes third-party Codex sessions through the local transport without rewriting saved endpoints", async () => {
+    const accounts = new AgentAccountManager(tempHome(), signedInRunner([]), new MemoryCredentialStore());
+    const account = await accounts.createApi("codex", "Gateway", { baseUrl: "https://models.invalid/v1", model: "example-model", apiKey: "fixture-key" });
+    const binding = accounts.resolveForSession(account.id, "codex", "http://127.0.0.1:12345/_prospero/model-api");
+    expect(binding.codexAppServerArgs).toContain(`model_providers.prospero.base_url="http://127.0.0.1:12345/_prospero/model-api/${account.id}"`);
+    expect(binding.codexAppServerArgs).toContain("model_providers.prospero.supports_websockets=false");
+    expect(binding.codexAppServerArgs).toContain("features.enable_request_compression=false");
+    expect(binding.apiProfile?.baseUrl).toBe("https://models.invalid/v1");
+    expect(accounts.resolve(account.id).apiProfile?.baseUrl).toBe("https://models.invalid/v1");
+  });
+  it.each(["claude", "codex"] as const)("leaves official %s API accounts unchanged", async agent => {
+    const accounts = new AgentAccountManager(tempHome(), signedInRunner([]), new MemoryCredentialStore());
+    const account = await accounts.createApi(agent, "Official", { baseUrl: agent === "claude" ? "https://api.anthropic.com" : "https://api.openai.com/v1", model: "example-model", apiKey: "fixture-key" });
+    const original = accounts.resolve(account.id);
+    expect(accounts.resolveForSession(account.id, agent, "http://127.0.0.1:12345/_prospero/model-api")).toEqual(original);
+    if (agent === "claude") expect(existsSync(path.join(original.environment.CLAUDE_CONFIG_DIR!, ".claude.json"))).toBe(false);
+  });
   it.each([
     null, "malformed", [], {},
     { provider: "unsupported", baseUrl: "https://gateway.example/v1", model: "coder" },
