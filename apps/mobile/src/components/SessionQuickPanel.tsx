@@ -15,7 +15,7 @@ import { Icon, type IconName } from "@/components/Icon";
 import { toast } from "@/components/Toast";
 import type { HostConnection } from "@/lib/connection";
 import { gitFileBadge, summarizeGitChanges } from "@/lib/session-quick-panel";
-import { color, MONOSPACE_FONT, statusColor } from "@/lib/theme";
+import { MONOSPACE_FONT, createThemedStyles, useMobileTheme, statusColors } from "@/lib/theme";
 
 type GitStatusResult = Extract<S2CMessage, { type: "git.status.result" }>;
 
@@ -38,6 +38,8 @@ interface QuickActionProps {
 }
 
 function QuickAction({ icon, label, detail, onPress }: QuickActionProps): React.ReactElement {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
   return (
     <Pressable
       style={({ pressed }) => [styles.action, pressed && styles.pressed]}
@@ -83,6 +85,9 @@ export function SessionQuickPanel({
   onOpenFiles,
   onOpenCoordinator,
 }: SessionQuickPanelProps): React.ReactElement {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
+  const statusColor = statusColors(color);
   const insets = useSafeAreaInsets();
   const [git, setGit] = useState<GitStatusResult | null>(null);
   const [loading, setLoading] = useState(false);
@@ -315,7 +320,7 @@ export function SessionQuickPanel({
   );
 }
 
-const styles = StyleSheet.create({
+const useStyles = createThemedStyles((color) => StyleSheet.create({
   panel: { flex: 1, backgroundColor: color.surface },
   header: {
     minHeight: 68,
@@ -454,4 +459,4 @@ const styles = StyleSheet.create({
   actionDetail: { color: color.textFaint, fontSize: 9.5 },
   gestureHint: { color: color.textFaint, fontSize: 10, lineHeight: 15, textAlign: "center", paddingTop: 4 },
   pressed: { opacity: 0.62 },
-});
+}));

@@ -45,6 +45,7 @@ import {
   setSessionHidden,
 } from "@/lib/session-preferences";
 import { groupSessionsByProject } from "@/lib/session-projects";
+import { useOrderedWorkspaces } from "@/lib/workspace-order-preferences";
 import { flattenHostSessionProjects } from "@/lib/host-session-list";
 import {
   coordinatorRunsBySession,
@@ -61,6 +62,7 @@ import { useOrchestrationSnapshot } from "@/lib/use-orchestration-snapshot";
 import type { DeliveryResult } from "@/lib/outbound-queue";
 import { SessionCreateError, type HostConnection } from "@/lib/connection";
 import { DismissedModalAction, PendingSessionCreation } from "@/lib/host-screen-flow";
+import { supportsMacTerminal, MAC_TERMINAL_ONLY } from "@/lib/terminal-session";
 import * as theme from "@/lib/theme";
 const { color, font, radius, space } = theme;
 
@@ -143,12 +145,13 @@ export default function HostScreen() {
     cwd?: string;
   }>();
   const { host, conn, runtime } = useHostConnection(hostId);
+  const supportsTerminal = supportsMacTerminal(runtime.hostInfo);
   const isFocused = useIsFocused();
   const supportsDeepseekHarness =
     runtime.status === "connected" && conn?.supportsDeepseekHarness === true;
   const availableAgents = useMemo(
-    () => AGENTS.filter((candidate) => candidate !== "deepseek" || supportsDeepseekHarness),
-    [supportsDeepseekHarness],
+    () => AGENTS.filter((candidate) => (candidate !== "deepseek" || supportsDeepseekHarness) && (candidate !== "shell" || supportsTerminal)),
+    [supportsDeepseekHarness, supportsTerminal],
   );
   const [agent, setAgent] = useState<AgentKind>("claude");
   const [sessionKind, setSessionKind] = useState<SessionKind>("structured");
@@ -608,7 +611,8 @@ export default function HostScreen() {
     ].map((session) => [session.id, session]))),
     [contextualGoalCoordinators, goalVisibility, sessions],
   );
-  const projects = useMemo(() => groupSessionsByProject(topLevelSessions), [topLevelSessions]);
+  const unorderedProjects = useMemo(() => groupSessionsByProject(topLevelSessions), [topLevelSessions]);
+  const projects = useOrderedWorkspaces(hostId, unorderedProjects);
   const sessionListItems = useMemo(
     () => flattenHostSessionProjects(projects, collapsedProjects),
     [projects, collapsedProjects],
@@ -664,6 +668,7 @@ export default function HostScreen() {
 
   const submitCreate = (): void => {
     if (!conn || runtime.status !== "connected" || pendingCreate.pending) return;
+    if (agent === "shell" && !supportsTerminal) { setBanner(MAC_TERMINAL_ONLY); return; }
     if (!accountCanLaunch) { setBanner(selectedAccount?.apiProfileError ?? "当前账号不支持此会话，请检查配置和模型工具能力。"); return; }
     const projectPath = cwd.trim();
     if (projectPath.length === 0) {
@@ -1857,6 +1862,12 @@ export default function HostScreen() {
         onClose={() => { toolsNavigation.cancel(); setToolsOpen(false); }}
         onDismiss={() => toolsNavigation.dismiss()}
       >
+        {supportsTerminal && <SheetAction label="远程终端" detail="新建或返回 Mac 终端，支持 Ctrl、Option 和方向键" symbol="terminal"
+          onPress={() => {
+            resetPendingCreate();
+            toolsNavigation.defer(() => router.push(`/host/${hostId}/terminals`));
+            setToolsOpen(false);
+          }} />}
         {conn?.supportsAgentAccounts && (
           <SheetAction
             label="Agent 账号"

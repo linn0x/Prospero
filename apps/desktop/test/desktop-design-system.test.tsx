@@ -18,10 +18,21 @@ function value(theme: Record<string, string>, key: string): string {
 }
 
 describe("desktop design tokens", () => {
+  it.each([["light", light], ["dark", dark]] as const)("keeps %s text and primary controls readable", (_name, theme) => {
+    const luminance = (color: string): number => {
+      const channels = color.slice(1).match(/../g)!.map(channel => parseInt(channel, 16) / 255)
+        .map(channel => channel <= .04045 ? channel / 12.92 : ((channel + .055) / 1.055) ** 2.4);
+      return channels.reduce((sum, channel, index) => sum + channel * [.2126, .7152, .0722][index]!, 0);
+    };
+    for (const [foreground, background] of [["--foreground", "--background"], ["--muted-foreground", "--background"], ["--secondary-foreground", "--secondary"], ["--primary-foreground", "--primary"], ["--primary-foreground", "--primary-hover"], ["--diff-added", "--diff-added-bg"], ["--diff-removed", "--diff-removed-bg"]]) {
+      const a = luminance(value(theme, foreground!)), b = luminance(value(theme, background!));
+      expect((Math.max(a, b) + .05) / (Math.min(a, b) + .05), `${foreground} on ${background}`).toBeGreaterThanOrEqual(4.5);
+    }
+  });
   it.each([
-    ["light", light, { "--bg": "#f3f6fb", "--surface": "#fbfdff", "--surface-raised": "#ffffff", "--surface-sunken": "#edf2f8", "--text": "#182033", "--border": "#dce3ee", "--primary": "#4c7dff", "--muted": "#66728a", "--success": "#318f73", "--warning": "#a96919", "--danger": "#c7484f" }],
-    ["dark", dark, { "--bg": "#0f1624", "--surface": "#151e2e", "--surface-raised": "#1b2740", "--surface-sunken": "#0d1421", "--text": "#edf2fb", "--border": "#283650", "--primary": "#6d92ff", "--muted": "#9aa8bd", "--success": "#58b99a", "--warning": "#f0b45a", "--danger": "#e16767" }],
-  ] as const)("preserves the established %s desktop palette", (_name, theme, expected) => {
+    ["light", light, { "--bg": "#ffffff", "--surface": "#fafafa", "--surface-raised": "#ffffff", "--surface-sunken": "#f0f0f2", "--text": "#242528", "--border": "#e0e1e5", "--primary": "#315bd6", "--muted": "#62656c", "--success": "#318f73", "--warning": "#a96919", "--danger": "#c7484f" }],
+    ["dark", dark, { "--bg": "#191a1d", "--surface": "#202125", "--surface-raised": "#292b30", "--surface-sunken": "#151619", "--text": "#ececef", "--border": "#35373e", "--primary": "#8ba9ff", "--muted": "#acafb8", "--success": "#58b99a", "--warning": "#f0b45a", "--danger": "#e16767" }],
+  ] as const)("shares the neutral %s desktop palette", (_name, theme, expected) => {
     for (const [key, expectedValue] of Object.entries(expected)) expect(value(theme, key)).toBe(expectedValue);
     expect(value(theme, "--foreground")).toBe(value(theme, "--text"));
     expect(value(theme, "--sidebar-foreground")).toBe(value(theme, "--text"));
@@ -33,8 +44,8 @@ describe("desktop design tokens", () => {
     expect(styles).toContain('@import "./design-system/tokens.css"');
     expect(styles).not.toMatch(/--bg:\s*#/);
     expect(tokens).toContain(':root.dark,\n:root[data-theme="dark"]');
-    expect(value(dark, "--card")).toBe("#151e2e");
-    expect(value(light, "--card")).toBe("#fbfdff");
+    expect(value(dark, "--card")).toBe("#202125");
+    expect(value(light, "--card")).toBe("#fafafa");
     expect(value(dark, "--overlay-glass")).toContain("86%, transparent");
     expect(value(light, "--overlay-glass")).toContain("84%, transparent");
   });

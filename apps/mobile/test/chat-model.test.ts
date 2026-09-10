@@ -111,7 +111,7 @@ describe("chat-model 事件折叠", () => {
       ev({ kind: "text.delta", msgId: "m1", textId: "t1", delta: "改好了" }),
       ev({ kind: "turn.end", msgId: "m1", finish: "stop" }),
     ]);
-    expect(items.at(-1)).toEqual({
+    expect(items.find((item) => item.type === "turn-diff-summary")).toMatchObject({
       type: "turn-diff-summary",
       key: "d:m1",
       msgId: "m1",
@@ -144,12 +144,14 @@ describe("chat-model 事件折叠", () => {
       ev({ kind: "tool.start", msgId: "m1", callId: "a", tool: "edit", summary: "a", diff: {
         path: "a.ts", patch: "+a", additions: 1, deletions: 0,
       } }),
+      ev({ kind: "tool.end", callId: "a", state: "success", summary: "done" }),
       ev({ kind: "text.delta", msgId: "m1", textId: "t1", delta: "第一轮" }),
       ev({ kind: "turn.end", msgId: "m1" }),
       ev({ kind: "user.message", msgId: "u2", text: "继续" }),
       ev({ kind: "tool.start", msgId: "m2", callId: "b", tool: "edit", summary: "b", diff: {
         path: "b.ts", patch: "+b", additions: 2, deletions: 1,
       } }),
+      ev({ kind: "tool.end", callId: "b", state: "success", summary: "done" }),
       ev({ kind: "text.delta", msgId: "m2", textId: "t2", delta: "第二轮" }),
       ev({ kind: "turn.end", msgId: "m2" }),
     ]);
@@ -284,7 +286,7 @@ describe("chat-model 事件折叠", () => {
       ev({ kind: "text.delta", msgId: "m1", textId: "t1", delta: "全部通过" }),
       ev({ kind: "turn.end", msgId: "m1", finish: "stop" }),
     ]);
-    expect(items.map((i) => i.type)).toEqual([
+    expect(foldChatItems(items).map((i) => i.type)).toEqual([
       "user",
       "assistant",
       "tool",

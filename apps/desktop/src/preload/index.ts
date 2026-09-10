@@ -17,6 +17,15 @@ void ipcRenderer.invoke("appearance:get").then(applyAppearance).catch(() => { /*
 document.addEventListener("DOMContentLoaded", () => { if (appearance) applyAppearance(appearance); }, { once: true });
 
 const api: DesktopApi = {
+  listProjectFiles: (root, path) => ipcRenderer.invoke("project-tools:list", root, path),
+  readProjectFile: (root, path) => ipcRenderer.invoke("project-tools:read", root, path),
+  mutateProjectFile: (root, mutation) => ipcRenderer.invoke("project-tools:file", root, mutation),
+  searchProject: (root, query, options) => ipcRenderer.invoke("project-tools:search", root, query, options),
+  cancelProjectSearch: () => ipcRenderer.invoke("project-tools:cancel-search"),
+  getProjectGitStatus: root => ipcRenderer.invoke("project-tools:status", root),
+  getProjectDiff: (root, path, staged) => ipcRenderer.invoke("project-tools:diff", root, path, staged),
+  getProjectGitHistory: root => ipcRenderer.invoke("project-tools:history", root),
+  mutateProjectGit: (root, mutation) => ipcRenderer.invoke("project-tools:git", root, mutation),
   modelSourceAction: action => ipcRenderer.invoke("model-source:action", action),
   subscribeModelSources: listener => {
     const wrapped = (_event: Electron.IpcRendererEvent, sources: Parameters<typeof listener>[0]) => listener(sources);

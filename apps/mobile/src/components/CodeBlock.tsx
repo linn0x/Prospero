@@ -3,7 +3,8 @@ import * as Clipboard from "expo-clipboard";
 import * as Haptics from "expo-haptics";
 import { Pressable, ScrollView, StyleSheet, View } from "react-native";
 import { ConversationText as Text } from "./ConversationTypography";
-import { color, MONOSPACE_FONT } from "@/lib/theme";
+import { CodeHighlight } from "./CodeHighlight";
+import { MONOSPACE_FONT, createThemedStyles } from "@/lib/theme";
 
 /**
  * 代码块。带复制按钮 —— 手机上长按选中再拖两端去选一段命令是最折磨的操作之一,
@@ -16,6 +17,7 @@ export const CodeBlock = memo(function CodeBlock({
   code: string;
   lang?: string;
 }) {
+  const styles = useStyles();
   const [copied, setCopied] = useState(false);
   const copy = (): void => {
     void Clipboard.setStringAsync(code);
@@ -35,14 +37,14 @@ export const CodeBlock = memo(function CodeBlock({
       </View>
       <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.scroll}>
         <Text style={styles.code} selectable>
-          {code}
+          <CodeHighlight code={code} language={lang} />
         </Text>
       </ScrollView>
     </View>
   );
 });
 
-const styles = StyleSheet.create({
+const useStyles = createThemedStyles((color) => StyleSheet.create({
   wrap: {
     backgroundColor: color.surfaceRaised,
     borderRadius: 10,
@@ -69,4 +71,4 @@ const styles = StyleSheet.create({
     lineHeight: 18,
     padding: 10,
   },
-});
+}));

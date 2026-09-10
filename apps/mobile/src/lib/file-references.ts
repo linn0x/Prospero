@@ -5,6 +5,21 @@ export interface ProjectFileReference {
   column?: number;
 }
 
+/** Markdown hrefs are relative to the document, and may traverse upward within the project. */
+export function resolveMarkdownFileReference(
+  target: string, filePath: string, projectRoot: string, explicit = false,
+): ProjectFileReference | null {
+  const raw = target.trim().replace(/^<(.*)>$/, "$1");
+  if (!raw || raw.startsWith("#")) return null;
+  if (/^(?:[A-Za-z][A-Za-z0-9+.-]*:|[\\/])/.test(raw)) {
+    return resolveProjectFileReference(raw, projectRoot, explicit);
+  }
+  const normalized = filePath.replace(/\\/g, "/");
+  const directory = normalized.includes("/") ? normalized.slice(0, normalized.lastIndexOf("/")) : "";
+  const base = projectRoot.replace(/\\/g, "/").replace(/\/$/, "");
+  return resolveProjectFileReference(`${base}/${directory ? `${directory}/` : ""}${raw}`, projectRoot, explicit);
+}
+
 const BARE_FILES = new Set([
   "AGENTS.md",
   "Dockerfile",
@@ -17,6 +32,7 @@ const BARE_FILES = new Set([
 ]);
 
 function normalizeAbsolute(input: string): string | null {
+  if (/^[A-Za-z]:\//.test(input)) input = `/${input}`;
   if (!input.startsWith("/")) return null;
   const parts: string[] = [];
   for (const part of input.split("/")) {
@@ -88,14 +104,18 @@ export function resolveProjectFileReference(
   }
   raw = raw.replace(/\\/g, "/");
   if (raw.endsWith("/")) return null;
-  const normalizedRoot = normalizeAbsolute(projectRoot.replace(/\\/g, "/").replace(/\/$/, ""));
+  if (/^[A-Za-z]:[^/]/.test(raw)) return null;
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(raw) && !/^[A-Za-z]:\//.test(raw)) return null;
+  const normalizedRoot = normalizeAbsolute(projectRoot.replace(/\\/g, "/"));
   if (!normalizedRoot) return null;
 
   let relative: string | null;
-  if (raw.startsWith("/")) {
+  if (raw.startsWith("/") || /^[A-Za-z]:\//.test(raw)) {
     const absolute = normalizeAbsolute(raw);
-    if (!absolute || !absolute.startsWith(`${normalizedRoot}/`)) return null;
-    relative = absolute.slice(normalizedRoot.length + 1);
+    const windowsRoot = /^[A-Za-z]:[\\/]/.test(projectRoot) || /^\\\\/.test(projectRoot);
+    const prefix = normalizedRoot === "/" ? "/" : `${normalizedRoot}/`;
+    if (!absolute || !(windowsRoot ? absolute.toLowerCase().startsWith(prefix.toLowerCase()) : absolute.startsWith(prefix))) return null;
+    relative = absolute.slice(prefix.length);
   } else {
     relative = normalizeRelative(raw);
   }

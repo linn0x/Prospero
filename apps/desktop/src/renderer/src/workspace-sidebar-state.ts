@@ -17,10 +17,13 @@ export function restoredSessionIds(
   activeId: string | undefined,
   limit = 100,
 ): string[] {
-  const ordered = activeId
-    ? [activeId, ...ids.filter((id) => id !== activeId)]
-    : [...ids];
-  return [...new Set(ordered)].slice(0, Math.max(0, limit));
+  const ordered = [...new Set(ids)];
+  if (activeId && !ordered.includes(activeId)) ordered.unshift(activeId);
+  const restored = ordered.slice(0, Math.max(0, limit));
+  // Keep the active session in a bounded restore without moving an already
+  // open tab to the front and overwriting the user's saved tab order.
+  if (activeId && restored.length > 0 && !restored.includes(activeId)) restored[restored.length - 1] = activeId;
+  return restored;
 }
 
 export function upsertHydratedSession(

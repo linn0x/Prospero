@@ -3,17 +3,17 @@
 .topbar-workspace-tabs {
   display: flex;
   flex: none;
-  min-height: 40px;
+  min-height: 44px;
   flex-direction: row;
   align-items: center;
   gap: 4px;
-  overflow-x: auto;
-  padding: 4px 8px;
-  scrollbar-width: none;
+  overflow: hidden;
+  padding: 5px 10px;
   -webkit-app-region: drag;
 }
-.topbar-workspace-tabs .workspace-tab { flex-shrink: 0; height: 32px; max-width: 240px; }
-.topbar-workspace-tabs .workspace-tab-main { min-width: 70px; }
+.topbar-workspace-tabs .workspace-tab { flex: 1 1 220px; height: 34px; min-width: 112px; max-width: 240px; }
+.topbar-workspace-tabs .workspace-tabs { padding: 0; gap: 4px; }
+.topbar-workspace-tabs .workspace-tab-main { min-width: 0; }
 .topbar-workspace-tabs .workspace-tab-main span { color: inherit; }
 .topbar-workspace-tabs button { -webkit-app-region: no-drag; }
 .workspace-session-layout { height: 100%; }
@@ -28,26 +28,44 @@
 .session-model-chip span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .session-model-chip svg { flex: none; width: 12px; }
 .workspace-grid { display: grid; flex: 1; min-width: 0; min-height: 0; grid-template-columns: minmax(0, 1fr); overflow: hidden; }
-.workspace-grid.has-dock { grid-template-columns: minmax(420px, 1fr) 8px var(--context-dock-width, 360px); }
+.workspace-grid.has-dock { grid-template-columns: minmax(420px, 1fr) 1px var(--context-dock-width, 560px); }
 .workspace-primary { display: flex; min-width: 0; min-height: 0; flex-direction: column; overflow: hidden; background: var(--background); }
 .workspace-primary > * { min-height: 0; }
+.workspace-primary > :is(.chat-pane, .terminal-shell) { flex: 1; height: auto; }
+.workspace-primary { container: workspace-primary / inline-size; }
+.workspace-primary > .session-toolbar, .project-workspace-toolbar { min-height: 42px; padding: 5px 12px; }
+.workspace-dock-host, .workspace-dock-slot { display: flex; flex: 1; flex-direction: column; width: 100%; height: 100%; min-width: 0; min-height: 0; }
 .workspace-dock-aside { min-width: 0; min-height: 0; overflow: hidden; background: var(--surface); }
 .context-dock { display: flex; height: 100%; min-width: 0; min-height: 0; flex-direction: column; overflow: hidden; }
-.context-dock-resizer { position: relative; width: 8px; cursor: col-resize; touch-action: none; outline-offset: -2px; background: var(--background); }
-.context-dock-resizer::after { content: ""; position: absolute; width: 1px; inset-block: 0; left: 3px; background: color-mix(in srgb, var(--border) 35%, transparent); }
+.context-dock-resizer { position: relative; width: 1px; cursor: col-resize; touch-action: none; outline-offset: -2px; background: var(--border); z-index: 2; }
+.context-dock-resizer::before { content: ""; position: absolute; inset: 0 -4px; }
+.context-dock-resizer::after { content: ""; position: absolute; width: 1px; inset-block: 0; left: 0; background: var(--border); transition: background-color 120ms ease; pointer-events: none; }
 .context-dock-resizer:hover::after, .context-dock-resizer:focus-visible::after, [data-dock-resizing] .context-dock-resizer::after { width: 2px; background: color-mix(in srgb, var(--primary) 60%, transparent); }
 [data-dock-resizing] { cursor: col-resize; user-select: none; }
-.context-dock-tabbar { display: flex; height: 36px; min-height: 36px; min-width: 0; align-items: center; gap: 2px; padding: 3px; border-bottom: 1px solid var(--border); background: var(--surface-sunken); }
-.context-dock-tabs { display: flex; flex: 1; min-width: 0; overflow-x: auto; scrollbar-width: thin; }
-.context-dock-tab { display: flex; min-width: 67px; align-items: center; border-radius: var(--ui-radius-control); color: var(--muted-foreground); }
-.context-dock-tab[data-active] { background: var(--surface-raised); color: var(--foreground); box-shadow: inset 0 -2px color-mix(in srgb, var(--primary) 65%, transparent); }
+.context-dock-tabbar { display: flex; height: 42px; min-height: 42px; min-width: 0; align-items: center; gap: 4px; padding: 4px 8px; border-bottom: 1px solid var(--border); background: var(--background); }
+.context-tabstrip { flex: 1; min-width: 0; }
+.context-dock-tabs { display: flex; flex: 1; min-width: 0; gap: 2px; overflow-x: auto; scrollbar-width: none; }
+.context-document-tabs, .project-preview-tabs.is-embedded { display: contents; }
+.context-document-tabs:empty { display: none; }
+.context-dock-tabs:has(.project-preview-tab) .context-dock-tab:is([data-tool="files"], [data-tool="search"], [data-tool="diff"]) { flex: 0 0 32px; min-width: 32px; }
+.context-dock-tabs:has(.project-preview-tab) .context-dock-tab:is([data-tool="files"], [data-tool="search"], [data-tool="diff"]) button[role="tab"] { width: 32px; padding: 0; }
+.context-dock-tabs:has(.project-preview-tab) .context-dock-tab:is([data-tool="files"], [data-tool="search"], [data-tool="diff"]) button[role="tab"] span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+.context-dock-tabs:has(.project-preview-tab) .context-dock-tab:is([data-tool="files"], [data-tool="search"], [data-tool="diff"]) .context-tab-close { display: none; }
+.context-dock-tabbar > [data-slot="button"] { flex: none; }
+.context-dock-tab { display: flex; align-items: center; color: var(--muted-foreground); }
+.context-tabstrip .context-dock-tab { flex-basis: 150px; min-width: 86px; max-width: 200px; }
+.context-dock-tab[data-active] { background: var(--surface-sunken); color: var(--foreground); }
 .context-dock-tab:hover { background: var(--surface-raised); }
-.context-dock-tab button { display: flex; height: 28px; min-width: 0; align-items: center; justify-content: center; gap: 4px; padding: 0 5px; border: 0; background: transparent; font-size: var(--ui-text-caption); white-space: nowrap; }
-.context-dock-tab button svg { width: 12px; height: 12px; flex: none; }
+.context-dock-tab button { display: flex; height: 32px; min-width: 0; align-items: center; justify-content: flex-start; gap: 7px; padding: 0 8px; border: 0; background: transparent; font-size: var(--ui-text-small); white-space: nowrap; }
+.context-dock-tab button[role="tab"] span { overflow: hidden; text-overflow: ellipsis; }
+.context-dock-tab button svg { width: 14px; height: 14px; flex: none; }
+.context-dock-tabs:has(.project-preview-tab) .context-dock-tab:is([data-tool="files"], [data-tool="search"], [data-tool="diff"]) button[role="tab"] { justify-content: center; }
 .context-dock-tab .context-tab-close { width: 20px; padding: 0; opacity: .6; }
+.context-dock-tab .context-tab-close { flex: none; justify-content: center; margin-right: 3px; }
 .context-dock-tab .context-tab-close:hover, .context-dock-tab .context-tab-close:focus-visible { opacity: 1; }
 .context-dock-tab button:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; border-radius: var(--ui-radius-control); }
 .context-dock-panel { display: flex; flex: 1; min-width: 0; min-height: 0; overflow: hidden; outline-offset: -2px; }
+.context-dock-panel[hidden] { display: none; }
 .context-dock-content { flex: 1; min-width: 0; overflow: auto; padding: 14px; overflow-wrap: anywhere; }
 .dock-task-title { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: var(--ui-text-body); }
 .dock-task-spec { white-space: pre-wrap; margin-top: 12px; font-size: var(--ui-text-small); line-height: 1.6; color: var(--muted-foreground); }
@@ -55,11 +73,17 @@
 .dock-empty svg { width: 24px; height: 24px; }
 .dock-empty strong { color: var(--foreground); }
 .dock-empty p { max-width: 300px; line-height: 1.6; }
-.workspace-dock-sheet[data-slot="sheet-content"] { width: min(560px, calc(100vw - 32px)); max-width: none; gap: 0; }
+.workspace-dock-sheet[data-slot="sheet-content"] { width: min(680px, calc(100vw - 40px)); max-width: none; gap: 0; transition-property: transform, translate, opacity; }
 .dock-terminal { display: flex; flex: 1; min-width: 0; min-height: 0; flex-direction: column; }
 .dock-terminal > .terminal-shell { flex: 1; min-height: 0; }
 .dock-terminal-toolbar { display: flex; align-items: center; justify-content: space-between; min-height: 28px; gap: 6px; padding: 4px 8px; color: var(--muted-foreground); font-size: var(--ui-text-caption); }
 .dock-terminal-toolbar > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dock-terminal .terminal-toolbar { min-height: 30px; }
+@container workspace-primary (max-width: 640px) { .session-toolbar-identity small { display: none; } }
+@container workspace-primary (max-width: 480px) { .session-toolbar-identity > span:not(.status-mark) { display: none; } }
+@media (prefers-reduced-motion: reduce) {
+  .context-dock-resizer::after, .workspace-dock-sheet[data-slot="sheet-content"] { transition: none; }
+}
 .workspace-action-error { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 8px 12px; overflow-wrap: anywhere; color: var(--destructive); background: color-mix(in srgb, var(--destructive) 8%, var(--background)); font-size: var(--ui-text-small); }
 .session-model-dialog[data-slot="dialog-content"] { width: min(520px, calc(100vw - 32px)); max-width: 520px; }
 .model-search-row { display: flex; align-items: center; gap: 8px; }

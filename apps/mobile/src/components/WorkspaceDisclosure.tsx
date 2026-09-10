@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import MaterialIcons from "@expo/vector-icons/MaterialIcons";
 import { AccessibilityInfo, Animated, Easing, StyleSheet, View, useAnimatedValue } from "react-native";
 import { Icon } from "./Icon";
+import Svg, { Path } from "react-native-svg";
 
 /** Measure intrinsic content while animating its clip height, so following rows move with it. */
 export function WorkspaceDisclosure({ expanded, header, children }: {
@@ -51,16 +51,18 @@ export function WorkspaceDisclosure({ expanded, header, children }: {
   </>;
 }
 
-export function WorkspaceFolderIcon({ progress, expanded = false, size, color }: {
-  progress?: Animated.Value; expanded?: boolean; size: number; color: string;
+export function WorkspaceFolderIcon({ expanded, size, color }: {
+  expanded: boolean; size: number; color: string;
 }) {
-  return <View style={{ width: size, height: size }} pointerEvents="none" accessibilityElementsHidden importantForAccessibility="no-hide-descendants">
-    <Animated.View testID="workspace-folder-closed" style={[styles.iconLayer, { opacity: progress ? progress.interpolate({ inputRange: [0, 1], outputRange: [1, 0] }) : expanded ? 0 : 1 }]}>
-      <Icon name="folder.fill" size={size} color={color} />
-    </Animated.View>
-    <Animated.View testID="workspace-folder-open" style={[styles.iconLayer, { opacity: progress ?? (expanded ? 1 : 0) }]}>
-      <MaterialIcons name="folder-open" size={size} color={color} allowFontScaling={false} />
-    </Animated.View>
+  // Swap the geometry of one opaque path. No crossfade, font loading or animated
+  // completion callback can briefly hide it or restore a stale folder state.
+  return <View testID="workspace-folder" pointerEvents="none" accessibilityElementsHidden
+    importantForAccessibility="no-hide-descendants" style={{ width: size, height: size }}>
+    <Svg width={size} height={size} viewBox="0 0 24 24">
+      <Path fill={color} d={expanded
+        ? "M3 5h6l2 2h9v3H7L3 20V5Zm4.8 6H23l-4.2 9H3.8l4-9Z"
+        : "M3 5h6l2 2h10v13H3V5Z"} />
+    </Svg>
   </View>;
 }
 
@@ -73,5 +75,4 @@ export function WorkspaceChevron({ progress, size, color }: { progress: Animated
 const styles = StyleSheet.create({
   clip: { overflow: "hidden" },
   content: { position: "absolute", top: 0, left: 0, right: 0 },
-  iconLayer: { position: "absolute", top: 0, left: 0, right: 0, bottom: 0, alignItems: "center", justifyContent: "center" },
 });

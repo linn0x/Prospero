@@ -112,7 +112,9 @@ export function compactAgentSnapshotEvents(events: readonly AgentEventBody[]): A
       body.textId === previous.textId &&
       sameOptionalAgent(body, previous)
     ) {
-      compact[compact.length - 1] = { ...previous, delta: previous.delta + body.delta };
+      compact[compact.length - 1] = { ...previous, ...body,
+        ...(previous.replace || body.replace ? { replace: true } : {}),
+        delta: body.replace ? body.delta : previous.delta + body.delta };
       continue;
     }
     if (
@@ -885,7 +887,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
         this.previewMsgId = body.msgId;
         this.previewRaw = "";
       }
-      this.previewRaw = (this.previewRaw + body.delta).slice(0, PREVIEW_RAW_CHARS);
+      this.previewRaw = (body.replace ? body.delta : this.previewRaw + body.delta).slice(0, PREVIEW_RAW_CHARS);
       this.preview = latestReplyPreview(this.previewRaw, PREVIEW_CHARS);
     }
 
@@ -1436,7 +1438,7 @@ function applySubagentHistoryEvent(subagents: Map<string, SubagentInfo>, body: A
       ...previous,
       status: previous.status === "starting" ? "running" : previous.status,
       updatedAt: Date.now(),
-      preview: latestReplyPreview(`${previous.preview ?? ""}${body.delta}`, 220),
+      preview: latestReplyPreview(body.replace ? body.delta : `${previous.preview ?? ""}${body.delta}`, 220),
     });
     return;
   }

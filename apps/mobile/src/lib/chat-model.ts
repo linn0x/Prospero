@@ -31,6 +31,7 @@ export interface AssistantItem {
   msgId: string;
   text: string;
   reasoning: string;
+  phase?: "commentary" | "final_answer";
   /** 本轮结束后的用量信息 */
   finish?: { reason?: string; costUsd?: number; inputTokens?: number; outputTokens?: number };
   done: boolean;
@@ -97,6 +98,7 @@ export interface TurnDiffFile {
   path: string;
   additions: number;
   deletions: number;
+  diff?: FileDiff;
 }
 
 /** turn.end 时从本轮工具/审批事件汇总出的紧凑改动栏。 */
@@ -127,6 +129,15 @@ export interface TrajectoryItem {
   agentId?: string;
 }
 
+/** Retain a real end boundary even when a turn ends without an assistant reply. */
+export interface TurnEndItem {
+  type: "turn-end";
+  key: string;
+  msgId: string;
+  finish?: string;
+  agentId?: string;
+}
+
 export type ChatItem =
   | UserItem
   | AssistantItem
@@ -136,6 +147,7 @@ export type ChatItem =
   | SubagentItem
   | ErrorItem
   | TrajectoryItem
+  | TurnEndItem
   | TurnDiffSummaryItem;
 
 export type FoldableActivityItem = ToolItem | PermissionItem;
@@ -147,7 +159,65 @@ export interface ActivityGroupItem {
   items: FoldableActivityItem[];
 }
 
-export type ChatDisplayItem = ChatItem | ActivityGroupItem;
+export interface TurnActivityItem {
+  type: "turn-activity";
+  key: string;
+  stateKey: string;
+  count: number;
+  completed: boolean;
+  expanded: boolean;
+  finish?: string;
+}
+
+export type ChatDisplayItem = ChatItem | ActivityGroupItem | TurnActivityItem;
+
+/** Each native turn owns one disclosure; steering messages do not prematurely end it. */
+export function foldCodexTurns(items: ChatItem[], expansion: Readonly<Record<string, boolean>> = {}): ChatDisplayItem[] {
+  const result: ChatDisplayItem[] = [];
+  let turn: ChatItem[] = [];
+  const flush = (end?: TurnEndItem) => {
+    if (!turn.length) return;
+    const key = `turn:${turn[0]!.key}`;
+    const completed = end !== undefined;
+    const stateKey = `${key}:${completed ? "completed" : "running"}`;
+    const expanded = expansion[stateKey] ?? !completed;
+    const final = turn.findLast((item): item is AssistantItem => item.type === "assistant" && item.phase === "final_answer")
+      ?? (end ? turn.findLast((item): item is AssistantItem => item.type === "assistant" && item.msgId === end.msgId && item.phase !== "commentary") : undefined);
+    const activity: ChatItem[] = [];
+    const outcomes: ChatItem[] = [];
+    for (const item of turn) {
+      if (item.type === "user") result.push(item);
+      else if (item === final) {
+        if (final.reasoning) activity.push({ ...final, key: `${final.key}:reasoning`, text: "", done: true, finish: undefined });
+        outcomes.push(final.reasoning ? { ...final, reasoning: "" } : final);
+      } else if (item.type === "turn-diff-summary" || item.type === "error"
+        || (item.type === "tool" && item.state === "failed")
+        || (item.type === "permission" && item.auto === undefined && item.resolved === undefined)
+        || (item.type === "question" && !item.answers && !item.cancelled)
+        || (item.type === "subagent" && ["running", "starting", "waiting_input", "failed"].includes(item.subagent.status))) {
+        outcomes.push(item);
+      } else activity.push(item);
+    }
+    if (activity.length) {
+      result.push({ type: "turn-activity", key, stateKey, count: activity.length, completed, expanded,
+        ...(end?.finish ? { finish: end.finish } : {}) });
+      if (expanded) result.push(...activity);
+    }
+    result.push(...outcomes);
+    // A stopped or failed turn without text must still have a visible outcome.
+    if (end && !final && !outcomes.some((item) => item.type === "error")) {
+      result.push({ type: "assistant", key: `${end.key}:status`, msgId: end.msgId,
+        text: "本轮未生成最终答复。", reasoning: "", done: true, finish: { reason: end.finish ?? "completed" } });
+    }
+    turn = [];
+  };
+  for (const item of items) {
+    if (item.type === "turn-end") flush(item);
+    else turn.push(item);
+  }
+  flush();
+  return result;
+}
 
 /**
  * 增量归并:把一条事件应用到条目列表上,返回新列表(引用变化才触发重渲染)。
@@ -185,6 +255,7 @@ export function applyEvent(items: ChatItem[], ev: AgentEventBody): ChatItem[] {
           text: ev.kind === "text.delta" ? delta : "",
           reasoning: ev.kind === "reasoning.delta" ? delta : "",
           done: false,
+          ...(ev.kind === "text.delta" && ev.phase ? { phase: ev.phase } : {}),
           ...agentField,
         };
         return [...items, created];
@@ -192,7 +263,8 @@ export function applyEvent(items: ChatItem[], ev: AgentEventBody): ChatItem[] {
       const prev = items[idx] as AssistantItem;
       const next: AssistantItem = {
         ...prev,
-        text: ev.kind === "text.delta" ? prev.text + delta : prev.text,
+        text: ev.kind === "text.delta" ? (ev.replace ? delta : prev.text + delta) : prev.text,
+        ...(ev.kind === "text.delta" && ev.phase ? { phase: ev.phase } : {}),
         reasoning: ev.kind === "reasoning.delta" ? prev.reasoning + delta : prev.reasoning,
       };
       return replaceAt(items, idx, next);
@@ -393,8 +465,13 @@ export function applyEvent(items: ChatItem[], ev: AgentEventBody): ChatItem[] {
       ) {
         return next;
       }
-      const summary = summarizeTurnDiffs(items, ev.msgId, ev.agentId);
-      return summary ? [...next, summary] : next;
+      const summary = summarizeTurnDiffs(items, ev.msgId, ev.agentId, ev.diffs);
+      const boundary: TurnEndItem = {
+        type: "turn-end", key: scopedKey("end", ev.turnId ?? ev.msgId), msgId: ev.msgId,
+        ...(ev.finish ? { finish: ev.finish } : {}), ...agentField,
+      };
+      if (items.some((item) => item.key === boundary.key)) return next;
+      return [...next, ...(summary ? [summary] : []), boundary];
     }
 
     case "agent.error":
@@ -459,22 +536,30 @@ function summarizeTurnDiffs(
   items: ChatItem[],
   msgId: string,
   agentId?: string,
+  diffs?: FileDiff[],
 ): TurnDiffSummaryItem | null {
   // turn.end 到来前，最后一个 done assistant 是上一轮的可靠边界；steer 可能在本轮
   // 插入多个 user.message，所以不能简单地从最后一条用户消息开始算。
   const previousTurn = findLastIndex(
     items,
-    (item) => item.type === "assistant" && item.done && item.agentId === agentId,
+    (item) => (item.type === "turn-end" || (item.type === "assistant" && item.done)) && item.agentId === agentId,
   );
   const byPath = new Map<string, TurnDiffFile>();
   for (const item of items.slice(previousTurn + 1)) {
     if ((item.type !== "tool" && item.type !== "permission") || !item.diff?.path) continue;
     if (item.agentId !== agentId) continue;
+    if (item.type === "tool" && item.state !== "success") continue;
+    if (item.type === "permission" && (item.resolved === "reject" || (!item.auto && !item.resolved))) continue;
     byPath.set(item.diff.path, {
       path: item.diff.path,
       additions: item.diff.additions,
       deletions: item.diff.deletions,
+      diff: item.diff,
     });
+  }
+  if (diffs !== undefined) {
+    byPath.clear();
+    for (const diff of diffs) byPath.set(diff.path, { path: diff.path, additions: diff.additions, deletions: diff.deletions, diff });
   }
   const files = [...byPath.values()];
   if (files.length === 0) return null;
@@ -506,6 +591,7 @@ export function foldChatItems(items: ChatItem[], minimum = 3): ChatDisplayItem[]
   };
 
   for (const item of items) {
+    if (item.type === "turn-end") { flush(); continue; }
     if (isFoldableActivity(item)) {
       run.push(item);
     } else {

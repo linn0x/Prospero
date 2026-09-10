@@ -75,6 +75,12 @@ describe("workspace sidebar state", () => {
     expect(restored).not.toContain("session-99");
   });
 
+  it("preserves reordered tabs when the active session is already open", () => {
+    expect(restoredSessionIds(["b", "c", "a", "b"], "a")).toEqual(["b", "c", "a"]);
+    expect(restoredSessionIds(["b", "c", "d", "a"], "a", 3)).toEqual(["b", "c", "a"]);
+    expect(restoredSessionIds(["b", "a"], "a", 0)).toEqual([]);
+  });
+
   it("keeps global shortcuts out of shell control keys", () => {
     const event = {
       altKey: false,

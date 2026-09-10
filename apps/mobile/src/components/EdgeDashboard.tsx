@@ -7,6 +7,8 @@ import { Sheet, SheetAction } from "./Sheet";
 import { PromptDialog } from "./PromptDialog";
 import { SwipeRow } from "./SwipeRow";
 import { WorkspaceHeader } from "./WorkspaceHeader";
+import { useWorkspaceOrders } from "@/lib/workspace-order-preferences";
+import { orderEdgeWorkspaces } from "@/lib/workspace-order";
 import { WorkspaceDisclosure, WorkspaceFolderIcon, WorkspaceChevron } from "./WorkspaceDisclosure";
 import { projectName } from "@/lib/session-projects";
 import { buildEdgeDashboard, createEdgeRecentReader, type EdgeProject, type EdgeSession } from "@/lib/edge-dashboard";
@@ -74,6 +76,8 @@ export function EdgeDashboard({ hosts, selectedHosts, runtimes, bottomInset, hom
   const data = useMemo(() => buildEdgeDashboard(selectedHosts, runtimes, homeSettings.recentSessionLimit,
     (id) => usage[selectedHosts.findIndex((host) => host.id === id)] ?? {}, managedPaths),
   [homeSettings.recentSessionLimit, managedPaths, runtimes, selectedHosts, usage]);
+  const workspaceOrders = useWorkspaceOrders();
+  const projects = useMemo(() => orderEdgeWorkspaces(data.projects, workspaceOrders), [data.projects, workspaceOrders]);
   const rows = useMemo<ListRow[]>(() => selectedHosts.length === 0 ? [] : [
     ...(data.approvals.length ? [{ kind: "heading" as const, key: "approvals", title: `待审批 · ${data.approvals.length}` },
       ...data.approvals.map((value) => ({ kind: "session" as const, key: `approval:${value.key}`, value }))] : []),
@@ -81,9 +85,9 @@ export function EdgeDashboard({ hosts, selectedHosts, runtimes, bottomInset, hom
     ...data.recent.map((value) => ({ kind: "session" as const, key: `recent:${value.key}`, value })),
     ...(data.recent.length ? [] : [{ kind: "empty" as const, key: "recent-empty", title: "创建或打开对话后，会显示在这里。" }]),
     { kind: "heading", key: "projects", title: `工作目录 · ${data.projects.length}`, create: "directory" },
-    ...data.projects.map((value) => ({ kind: "project" as const, key: `project:${value.key}`, value })),
+    ...projects.map((value) => ({ kind: "project" as const, key: `project:${value.key}`, value })),
     ...(data.projects.length ? [] : [{ kind: "empty" as const, key: "projects-empty", title: "设备上的工作目录会在连接后同步。" }]),
-  ], [data, selectedHosts.length]);
+  ], [data, projects, selectedHosts.length]);
   const connected = selectedHosts.filter((host) => runtimes[host.id]?.status === "connected").length;
   const loading = selectedHosts.some((host) => ["connecting", "reconnecting"].includes(runtimes[host.id]?.status ?? "idle"));
   const readyHosts = selectedHosts.filter((host) => runtimes[host.id]?.status === "connected");
@@ -129,12 +133,16 @@ export function EdgeDashboard({ hosts, selectedHosts, runtimes, bottomInset, hom
             return next;
           })}
           style={({ pressed }) => [styles.item, pressed && styles.pressed]}>
-          <View style={styles.projectIdentity}><WorkspaceFolderIcon progress={progress} size={18} color={palette.accent} />
+          <View style={styles.projectIdentity}><WorkspaceFolderIcon expanded={expanded} size={18} color={palette.accent} />
             <WorkspaceHeader hostId={host.id} path={project.path} sid={project.sessions[0]?.id}
-              name={title} sessionCount={project.sessions.length} />
+              name={title} sessionCount={project.sessions.length}
+              deviceLabel={host.name} deviceOffline={!online} deviceDetail={`${host.name}${!online ? " · 离线缓存" : ""}${managed ? " · 任务工作区" : ""}`}
+              {...(project.pendingCount > 0 || project.runningCount > 0 ? { activity: {
+                pending: project.pendingCount > 0,
+                label: [project.runningCount > 0 ? `${project.runningCount} 个运行中` : "", project.pendingCount > 0 ? `${project.pendingCount} 项待处理` : ""].filter(Boolean).join(" · "),
+              } } : {})} />
             <WorkspaceChevron progress={progress} size={16} color={palette.textFaint} />
           </View>
-          <Text style={styles.meta} numberOfLines={1}>{host.name}{!online ? " · 离线缓存" : ""}{managed ? " · 任务工作区" : ""}{project.runningCount > 0 ? ` · ${project.runningCount} 个运行中` : ""}{project.pendingCount > 0 ? ` · ${project.pendingCount} 项待处理` : ""}</Text>
         </Pressable>
       </SwipeRow>}>
       <View style={styles.projectSessions}>{project.sessions.map((session) =>

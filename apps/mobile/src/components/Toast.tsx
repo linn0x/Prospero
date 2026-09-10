@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Animated, StyleSheet, Text } from "react-native";
 
-import { color } from "@/lib/theme";
+import { createThemedStyles } from "@/lib/theme";
 
 /**
  * 一句话的短提示。
@@ -18,6 +18,7 @@ export function toast(message: string): void {
 }
 
 export function ToastHost(): React.ReactElement | null {
+  const styles = useStyles();
   const [message, setMessage] = useState<string | null>(null);
   const [opacity] = useState(() => new Animated.Value(0));
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -49,7 +50,7 @@ export function ToastHost(): React.ReactElement | null {
   );
 }
 
-const styles = StyleSheet.create({
+const useStyles = createThemedStyles((color) => StyleSheet.create({
   wrap: {
     position: "absolute",
     bottom: 90,
@@ -64,4 +65,4 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 2 },
   },
   text: { color: color.bg, fontSize: 13 },
-});
+}));

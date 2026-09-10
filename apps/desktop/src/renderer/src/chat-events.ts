@@ -414,9 +414,10 @@ export class ChatEventAccumulator {
         const delta = stringValue(source.delta);
         const index = this.textIndex.get(id);
         if (index !== undefined) {
-          if (delta) {
+          if (delta || source.replace === true || source.phase) {
             const prior = this.items[index]?.event ?? {};
-            this.replace(index, { ...prior, text: `${stringValue(prior.text)}${delta}` });
+            this.replace(index, { ...prior, ...(source.phase ? { phase: source.phase } : {}),
+              text: source.replace === true ? delta : `${stringValue(prior.text)}${delta}` });
             changed = true;
           }
         } else if (delta) {
@@ -642,7 +643,8 @@ export function collapseChatEventHistory(events: readonly JsonObject[]): JsonObj
         });
       } else {
         const prior = output[index] ?? {};
-        output[index] = { ...prior, text: `${stringValue(prior.text)}${stringValue(source.delta)}` };
+        output[index] = { ...prior, ...(source.phase ? { phase: source.phase } : {}),
+          text: source.replace === true ? stringValue(source.delta) : `${stringValue(prior.text)}${stringValue(source.delta)}` };
       }
       continue;
     }

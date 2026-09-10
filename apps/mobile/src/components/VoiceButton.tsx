@@ -22,7 +22,7 @@ import type {
 } from "../../modules/prospero-mixed-speech/src/ProsperoMixedSpeech.types";
 import { Icon } from "@/components/Icon";
 import { toast } from "@/components/Toast";
-import { color } from "@/lib/theme";
+import { createThemedStyles, useMobileTheme } from "@/lib/theme";
 import {
   abortAndroidOfflineSpeech,
   prepareAndroidOfflineSpeech,
@@ -248,6 +248,8 @@ interface Props {
 
 /** 结构化聊天专用的 push-to-talk 按钮。 */
 export function VoiceButton({ onTranscript }: Props) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
   const appleMixedMode = usesAppleMixedSpeech();
   const samsungMixedMode = usesSamsungMixedSpeech();
   const bundledAndroidMixedMode = usesBundledAndroidMixedSpeech();
@@ -997,6 +999,8 @@ export function VoiceButton({ onTranscript }: Props) {
 }
 
 function VolumeBars({ volume, cancel }: { volume: number; cancel: boolean }) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
   const strength = Math.max(0, Math.min(1, (volume + 2) / 12));
   return (
     <View style={styles.bars}>
@@ -1016,7 +1020,7 @@ function VolumeBars({ volume, cancel }: { volume: number; cancel: boolean }) {
   );
 }
 
-const styles = StyleSheet.create({
+const useStyles = createThemedStyles((color) => StyleSheet.create({
   wrapper: { width: 36, height: 36, position: "relative" },
   button: {
     width: 36,
@@ -1086,4 +1090,4 @@ const styles = StyleSheet.create({
     gap: 3,
   },
   bar: { width: 3, minHeight: 4, borderRadius: 2 },
-});
+}));

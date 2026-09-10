@@ -55,7 +55,7 @@ function Button({
   return (
     <ButtonPrimitive
       data-slot="button"
-      data-liquid-glass={variant === "glass" || variant === "glass-primary" ? "control" : undefined}
+      data-liquid-glass={props.role === "tab" ? "tab" : variant === "glass" || variant === "glass-primary" ? "control" : undefined}
       className={cn(buttonVariants({ variant, size, className }))}
       {...props}
     />

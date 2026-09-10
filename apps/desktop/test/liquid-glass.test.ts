@@ -3,10 +3,13 @@ import { describe, expect, it } from 'vitest';
 import { installLiquidGlass } from '../src/renderer/src/liquid-glass.js';
 
 class Surface extends EventTarget {
+  material = 'control';
+  plain = false;
   readonly values = new Map<string, string>();
   readonly style = { setProperty: (key: string, value: string) => this.values.set(key, value) };
   constructor(readonly parent: Surface | null = null) { super(); }
-  closest(): Surface { return this.parent ?? this; }
+  getAttribute(name: string): string | null { return name === 'data-liquid-glass' ? this.material : null; }
+  closest(selector: string): Surface | null { return selector === '[data-liquid-glass-scope="plain"]' ? this.plain ? this : null : this.parent ?? this; }
   getBoundingClientRect() { return { left: 10, top: 20, width: 200, height: 100 }; }
 }
 
@@ -67,6 +70,14 @@ function fixture() {
 }
 
 describe('liquid glass pointer lifecycle', () => {
+  it('excludes conversation sidebar tabs while allowing tabs elsewhere', () => {
+    const f = fixture(); const main = f.addSurface(); main.material = 'tab';
+    const sidebar = f.addSurface(); sidebar.material = 'tab'; sidebar.plain = true;
+    const cleanup = f.install(); f.pointer('pointermove', main); f.flush();
+    expect(main.values.get('--liquid-active')).toBe('1');
+    f.pointer('pointermove', sidebar); f.flush();
+    expect(sidebar.values.size).toBe(0); expect(main.values.get('--liquid-active')).toBe('0'); cleanup();
+  });
   it.each(['win32', 'linux'])('does not animate native glass on %s', (platform) => {
     const f = fixture(); f.root.documentElement.dataset.platform = platform;
     const target = f.addSurface(); const cleanup = f.install();

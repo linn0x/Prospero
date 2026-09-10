@@ -1,5 +1,6 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { DEFAULT_CONVERSATION_FONT_SIZE, normalizeConversationFontSize } from "./conversation-font-size";
+import { DEFAULT_QUICK_REPLIES, normalizeQuickReplies, type QuickReplySettings } from "./quick-replies";
 
 const LAST_HOME_HOST_KEY = "prospero.home.lastHost.v1";
 const HOME_SETTINGS_KEY = "prospero.home.settings.v1";
@@ -17,6 +18,8 @@ export interface HomeSettings {
   overlayProgressEnabled: boolean;
   themeMode: HomeThemeMode;
   conversationFontSize: number;
+  sessionActionsHidden: boolean;
+  quickReplies: QuickReplySettings;
   /** 仅改变本机 UI 的显示名称，不修改远端目录或已有会话 cwd。 */
   workspaceAliases: Record<string, string>;
 }
@@ -28,6 +31,8 @@ export const DEFAULT_HOME_SETTINGS: HomeSettings = {
   overlayProgressEnabled: false,
   themeMode: "system",
   conversationFontSize: DEFAULT_CONVERSATION_FONT_SIZE,
+  sessionActionsHidden: false,
+  quickReplies: DEFAULT_QUICK_REPLIES,
   workspaceAliases: {},
 };
 
@@ -74,6 +79,8 @@ export function normalizeHomeSettings(value: unknown): HomeSettings {
       ? (settings.themeMode as HomeThemeMode)
       : DEFAULT_HOME_SETTINGS.themeMode,
     conversationFontSize: normalizeConversationFontSize(settings.conversationFontSize),
+    sessionActionsHidden: settings.sessionActionsHidden === true,
+    quickReplies: normalizeQuickReplies(settings.quickReplies),
     workspaceAliases: validWorkspaceAliases(settings.workspaceAliases),
   };
 }
@@ -114,10 +121,11 @@ export async function getHomeSettings(): Promise<HomeSettings> {
   }
 }
 
-export function rememberHomeSettings(settings: HomeSettings): Promise<void> {
+export function rememberHomeSettings(settings: HomeSettings, reportErrors = false): Promise<void> {
   const serialized = JSON.stringify(settings);
   // Fast edits across category pages retain their order; returning pages wait for the latest write.
-  settingsWrites = settingsWrites.then(() => AsyncStorage.setItem(HOME_SETTINGS_KEY, serialized))
+  const write = settingsWrites.then(() => AsyncStorage.setItem(HOME_SETTINGS_KEY, serialized));
+  settingsWrites = write
     .catch(() => { /* Live settings remain usable when storage is temporarily unavailable. */ });
-  return settingsWrites;
+  return reportErrors ? write : settingsWrites;
 }

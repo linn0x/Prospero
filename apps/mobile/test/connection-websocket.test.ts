@@ -8,10 +8,11 @@ import {
   CAPABILITY_SESSION_CREATE_RESULT,
   CAPABILITY_WORKSPACE_SUMMARY,
   generateKeyPairB64,
+  type SessionInfo,
 } from "@prospero/protocol";
 import { dropConnection, getConnection, HostConnection, wireAppStateReconnect } from "../src/lib/connection";
 import type { StoredHost } from "../src/lib/hosts";
-import { useApp } from "../src/lib/store";
+import { flushSessionUpdates, useApp } from "../src/lib/store";
 import { randomUUID } from "expo-crypto";
 
 const appState = vi.hoisted(() => ({ callback: null as ((state: string) => void) | null }));
@@ -77,7 +78,139 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+function endedTerminalConnection() {
+  const host = { ...makeHost("direct"), id: "terminal-actions-mac" };
+  const socket = new FakeWebSocket("ws://192.168.1.8:7423/ws");
+  socket.readyState = 1;
+  const connection = new HostConnection(host, generateKeyPairB64());
+  const internals = connection as unknown as {
+    ws: FakeWebSocket; channel: { seal(message: unknown): string; open(message: string): unknown };
+    onMessage(message: string): void;
+  };
+  internals.ws = socket;
+  internals.channel = { seal: JSON.stringify, open: JSON.parse };
+  const session: SessionInfo = { id: "ended-shell", agent: "shell", kind: "pty", cwd: "/Users/test/My Project", title: "Terminal", cols: 96, rows: 32, status: "done", createdAt: 1 };
+  useApp.getState().patchRuntime(host.id, { hostInfo: { name: "Mac", platform: "macOS", daemonVersion: "test", protocolVersion: 13 } });
+  useApp.getState().setSessions(host.id, [session]);
+  return { host, socket, connection, session, internals };
+}
+
+describe("ended terminal actions", () => {
+  it("restarts a fresh shell in its original directory and size without replaying old input", async () => {
+    const { connection, socket, session } = endedTerminalConnection();
+    const task = connection.restartTerminal(session.id);
+    expect(socket.sent.map((message) => JSON.parse(message))).toEqual([{
+      type: "session.create", agent: "shell", kind: "pty", cwd: session.cwd, cols: 96, rows: 32,
+    }]);
+    expect(connection.queuedCount).toBe(0);
+    task.cancel();
+    await expect(task.completion).rejects.toMatchObject({ reason: "cancelled" });
+    connection.stop();
+  });
+
+  it.each(["done", "already-removed", "legacy-already-removed"])("deletes ended terminal metadata after %s and rejects late state resurrection", async (reply) => {
+    const { connection, socket, session, internals, host } = endedTerminalConnection();
+    const serverError = vi.fn();
+    connection.events.on("serverError", serverError);
+    try {
+      const removed = connection.deleteTerminal(session.id);
+      expect(useApp.getState().runtimes[host.id]?.sessions[session.id]).toBeDefined();
+      expect(socket.sent.map((message) => JSON.parse(message))).toEqual([{ type: "session.kill", sid: session.id }]);
+      internals.onMessage(JSON.stringify(reply === "done" ? { type: "session.state", session }
+        : reply === "legacy-already-removed"
+          ? { type: "error", code: "session_not_found", message: `no such session: ${session.id}` }
+          : { type: "error", sid: session.id, code: "session_not_found", message: "no session" }));
+      await removed;
+      internals.onMessage(JSON.stringify({ type: "session.state", session }));
+      flushSessionUpdates();
+      expect(useApp.getState().runtimes[host.id]?.sessions[session.id]).toBeUndefined();
+      expect(serverError).not.toHaveBeenCalled();
+    } finally { connection.stop(); }
+  });
+
+  it("keeps an ended record available if deletion is rejected or offline", async () => {
+    const { connection, socket, session, internals, host } = endedTerminalConnection();
+    const removed = connection.deleteTerminal(session.id);
+    internals.onMessage(JSON.stringify({ type: "error", sid: session.id, code: "forbidden", message: "denied" }));
+    await expect(removed).rejects.toThrow("denied");
+    expect(useApp.getState().runtimes[host.id]?.sessions[session.id]).toBeDefined();
+    socket.readyState = 3;
+    await expect(connection.deleteTerminal(session.id)).rejects.toThrow("主机未连接");
+    const restarted = connection.restartTerminal(session.id);
+    await expect(restarted.completion).rejects.toMatchObject({ reason: "offline" });
+    expect(connection.queuedCount).toBe(0);
+    expect(socket.sent).toHaveLength(1);
+    connection.stop();
+  });
+
+  it("does not restart or delete a live terminal or an unsupported remote host", async () => {
+    const { connection, socket, session, host } = endedTerminalConnection();
+    useApp.getState().upsertSession(host.id, { ...session, status: "running" });
+    expect(() => connection.restartTerminal(session.id)).toThrow("请先关闭终端");
+    await expect(connection.deleteTerminal(session.id)).rejects.toThrow("请先关闭终端");
+    useApp.getState().upsertSession(host.id, session);
+    useApp.getState().patchRuntime(host.id, { hostInfo: { name: "MacBook", platform: "Linux", daemonVersion: "test", protocolVersion: 13 } });
+    expect(() => connection.restartTerminal(session.id)).toThrow("只支持 macOS");
+    await expect(connection.deleteTerminal(session.id)).rejects.toThrow("只支持 macOS");
+    expect(socket.sent).toHaveLength(0);
+    connection.stop();
+  });
+});
+
 describe("HostConnection WebSocket candidates", () => {
+  it("closes a remote Mac shell with session.kill and waits for its ended state", async () => {
+    const host = { ...makeHost("direct"), id: "terminal-close-mac" };
+    const socket = new FakeWebSocket("ws://192.168.1.8:7423/ws");
+    socket.readyState = 1;
+    const connection = new HostConnection(host, generateKeyPairB64());
+    const internals = connection as unknown as {
+      ws: FakeWebSocket; channel: { seal(message: unknown): string; open(message: string): unknown };
+      onMessage(message: string): void;
+    };
+    internals.ws = socket;
+    internals.channel = { seal: JSON.stringify, open: JSON.parse };
+    const shell: SessionInfo = { id: "shell", agent: "shell", kind: "pty", cwd: "/Users/test", title: "Terminal", cols: 80, rows: 24, status: "running", createdAt: 1 };
+    useApp.getState().patchRuntime(host.id, { hostInfo: { name: "Mac", platform: "macOS", daemonVersion: "test", protocolVersion: 13 } });
+    useApp.getState().setSessions(host.id, [shell]);
+    try {
+      let closed = false;
+      const completion = connection.closeTerminal(shell.id);
+      void completion.then(() => { closed = true; });
+      expect(connection.closeTerminal(shell.id)).toBe(completion);
+      expect(socket.sent.map((message) => JSON.parse(message))).toEqual([{ type: "session.kill", sid: shell.id }]);
+      internals.onMessage(JSON.stringify({ type: "session.state", session: shell }));
+      await Promise.resolve();
+      expect(closed).toBe(false);
+      internals.onMessage(JSON.stringify({ type: "session.state", session: { ...shell, status: "done" } }));
+      await completion;
+      flushSessionUpdates();
+      expect(closed).toBe(true);
+      expect(useApp.getState().runtimes[host.id]?.sessions[shell.id]?.status).toBe("done");
+      await connection.closeTerminal(shell.id);
+      expect(socket.sent).toHaveLength(1);
+      expect(connection.queuedCount).toBe(0);
+    } finally { flushSessionUpdates(); connection.stop(); }
+  });
+
+  it("checks the remote platform and never queues a terminal close across a disconnect", async () => {
+    const host = { ...makeHost("direct"), id: "terminal-close-disconnected" };
+    const connection = new HostConnection(host, generateKeyPairB64());
+    const shell: SessionInfo = { id: "shell", agent: "shell", kind: "pty", cwd: "/Users/test", title: "Terminal", cols: 80, rows: 24, status: "running", createdAt: 1 };
+    const hostInfo = { name: "MacBook", platform: "Windows", daemonVersion: "test", protocolVersion: 13 };
+    useApp.getState().patchRuntime(host.id, { hostInfo });
+    useApp.getState().setSessions(host.id, [shell]);
+    await expect(connection.closeTerminal(shell.id)).rejects.toThrow("只支持 macOS");
+    useApp.getState().patchRuntime(host.id, { hostInfo: { ...hostInfo, platform: "macOS" } });
+    await expect(connection.closeTerminal(shell.id)).rejects.toThrow("主机未连接");
+    expect(connection.queuedCount).toBe(0);
+    const send = vi.spyOn(connection, "send").mockReturnValue({ accepted: true, disposition: "sent" });
+    const completion = connection.closeTerminal(shell.id);
+    expect(send).toHaveBeenCalledWith({ type: "session.kill", sid: shell.id }, false);
+    connection.stop();
+    await expect(completion).rejects.toThrow("未能确认");
+    expect(connection.queuedCount).toBe(0);
+  });
+
   it("correlates concurrent workspace summaries independently of git status and response order", async () => {
     vi.mocked(randomUUID).mockReturnValueOnce("11111111-1111-4111-8111-111111111111").mockReturnValueOnce("22222222-2222-4222-8222-222222222222");
     const socket = new FakeWebSocket("ws://192.168.1.8:7423/ws");

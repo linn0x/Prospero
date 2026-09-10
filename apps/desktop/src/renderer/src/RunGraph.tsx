@@ -992,8 +992,8 @@ export function RunGraph({ runId, tasks, dispatches, onActivateTask }: { runId: 
             </span>
           )}
           <div className="run-graph-revision-toggle" role="group" aria-label={t("修订视图", "Revision view")}>
-            <button type="button" aria-pressed={!historyView} onClick={() => changeHistoryView(false)}>{t("当前修订", "Current revision")}</button>
-            <button type="button" aria-pressed={historyView} onClick={() => changeHistoryView(true)}>{t("完整历史", "Full history")}</button>
+            <button type="button" data-liquid-glass="tab" aria-pressed={!historyView} onClick={() => changeHistoryView(false)}>{t("当前修订", "Current revision")}</button>
+            <button type="button" data-liquid-glass="tab" aria-pressed={historyView} onClick={() => changeHistoryView(true)}>{t("完整历史", "Full history")}</button>
           </div>
           <span>{neighborhood.length} {t("个任务", "tasks")} · {layout.nodes.length} {t("个节点", "nodes")}</span>
           <button type="button" disabled={!expandedGroups.size} onClick={() => setExpandedGroups(new Set())}>{t("收起并行分组", "Collapse parallel groups")}</button>

@@ -23,6 +23,7 @@ import { modelSourceRequest, modelSourceResult } from "../shared/model-sources";
 import { RemoteShellManager } from "./remote-shell-manager";
 import { RemoteWorkspaces, RemoteWorkspaceStore } from "./remote-workspaces";
 import { remoteDirectoryRequest } from "../shared/remote-workspaces";
+import { ProjectTools } from "./project-tools";
 
 const SAFE_ID = /^[A-Za-z0-9._:-]{1,160}$/;
 const ORCHESTRATION_METHODS = new Set([
@@ -291,6 +292,11 @@ function createWindow(): BrowserWindow {
   });
 
   window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  window.webContents.on("will-prevent-unload", event => {
+    const choice = dialog.showMessageBoxSync(window, { type: "warning", title: "尚未保存的修改 / Unsaved changes", message: "文件编辑尚未保存，是否丢弃并继续？\nDiscard unsaved file edits and continue?", buttons: ["取消 / Cancel", "丢弃 / Discard"], defaultId: 0, cancelId: 0, noLink: true });
+    if (choice === 1) event.preventDefault();
+    else quitting = false;
+  });
   if (SMOKE_TEST) {
     window.setOpacity(0);
     window.webContents.on("console-message", (details) => process.stderr.write(`[renderer:${details.level}] ${details.message}\n`));
@@ -739,6 +745,27 @@ async function runDesktopSelfCheck(window: BrowserWindow): Promise<void> {
 }
 
 function installIpc(): void {
+  const projectTools = new ProjectTools(() => {
+    const snapshot = store.snapshot();
+    return [...snapshot.projects, ...snapshot.daemon.sessions.map(session => session.cwd)];
+  }, absolutePath => shell.trashItem(absolutePath));
+  const projectHandlers = {
+    "project-tools:list": projectTools.list.bind(projectTools),
+    "project-tools:read": projectTools.read.bind(projectTools),
+    "project-tools:file": projectTools.mutateFile.bind(projectTools),
+    "project-tools:search": projectTools.search.bind(projectTools),
+    "project-tools:cancel-search": projectTools.cancelSearch.bind(projectTools),
+    "project-tools:status": projectTools.gitStatus.bind(projectTools),
+    "project-tools:diff": projectTools.diff.bind(projectTools),
+    "project-tools:history": projectTools.history.bind(projectTools),
+    "project-tools:git": projectTools.mutateGit.bind(projectTools),
+  };
+  for (const [channel, handler] of Object.entries(projectHandlers)) {
+    ipcMain.handle(channel, (event, ...args: unknown[]) => {
+      if (event.sender !== mainWindow?.webContents || event.senderFrame !== event.sender.mainFrame) throw new Error("无效的窗口 / Invalid window");
+      return (handler as (...args: unknown[]) => unknown)(...args);
+    });
+  }
   ipcMain.handle("window:menu", (event, raw: unknown) => {
     const window = BrowserWindow.fromWebContents(event.sender);
     if (!window || window !== mainWindow || event.senderFrame !== event.sender.mainFrame) throw new Error("无效的窗口");

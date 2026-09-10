@@ -3,15 +3,15 @@
  * WS 保持在 RN 侧单连接,WebView 只做渲染与输入采集。
  * attach 流程:page ready → 上报 fit 尺寸 → resize → attach(带 lastSeq 续传)。
  */
-import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useRef } from "react";
+import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useRef, type ReactNode } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import { WebView, type WebViewMessageEvent } from "react-native-webview";
 import type { HostConnection } from "@/lib/connection";
 import { toast } from "@/components/Toast";
-import { deliveryFailureText } from "@/lib/outbound-queue";
+import { deliveryFailureText, type DeliveryResult } from "@/lib/outbound-queue";
 import { subscribeFocusedTerminal } from "@/lib/focused-session-stream";
 import { useFocusedSessionEffect } from "@/lib/use-focused-session-effect";
-import { TERMINAL_HTML } from "./terminal-html";
+import { TERMINAL_HTML, TERMINAL_FONT_FAMILY } from "./terminal-html";
 
 // source 对象保持稳定,避免会话状态刷新时让原生 WebView 误判为需要重新加载。
 const TERMINAL_SOURCE = { html: TERMINAL_HTML } as const;
@@ -27,6 +27,9 @@ interface Props {
   onPerf?: (p: { fps: number; kb: number; renderer: string }) => void;
   /** 断线后的 shell 字节不能安全补发，WebView 必须被冻结。 */
   inputEnabled?: boolean;
+  sessionEnded?: boolean;
+  endedActions?: ReactNode;
+  onInputB64?: (data: string) => DeliveryResult;
   disconnectedMessage?: string;
   onRetryConnection?: () => void;
 }
@@ -56,6 +59,9 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
     onFontSize,
     onPerf,
     inputEnabled = true,
+    sessionEnded = false,
+    endedActions,
+    onInputB64,
     disconnectedMessage = "主机未连接；终端输入已冻结。",
     onRetryConnection,
   },
@@ -114,7 +120,7 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
   // 触发同一条桥接消息，不重建 WebView 或 shell 会话。
   useEffect(() => {
     fontSizeRef.current = fontSize;
-    if (readyRef.current) rx({ kind: "font", size: fontSize });
+    if (readyRef.current) rx({ kind: "font", size: fontSize, family: TERMINAL_FONT_FAMILY });
   }, [fontSize, rx]);
 
   useEffect(() => {
@@ -123,6 +129,11 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
   }, [onPerf, rx]);
 
   useFocusedSessionEffect(useCallback(() => {
+    if (sessionEnded) {
+      activeRef.current = false;
+      if (readyRef.current) { rx({ kind: "blur" }); flush(); }
+      return () => undefined;
+    }
     activeRef.current = true;
     if (readyRef.current) rx({ kind: "activity", active: true, metrics: metricsRef.current });
     const cleanup = subscribeFocusedTerminal({
@@ -142,7 +153,7 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
         flush();
       }
     };
-  }, [conn, sid, flush, rx, tryAttach]));
+  }, [conn, sid, flush, rx, tryAttach, sessionEnded]));
 
   const onMessage = useCallback(
     (e: WebViewMessageEvent) => {
@@ -161,7 +172,7 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
           rx({ kind: "activity", active: activeRef.current, metrics: metricsRef.current });
           // term.html 在收到 font 后才允许首次 fit，因此它产生的 resized/attach
           // 必然反映这一受控字号。字体消息排在重放输出之前，避免初始帧闪回默认值。
-          rx({ kind: "font", size: fontSizeRef.current });
+          rx({ kind: "font", size: fontSizeRef.current, family: TERMINAL_FONT_FAMILY });
           // 之前这里直接清空队列 —— 页面就绪前到达的消息被丢掉了。
           // 现在补发,后续的全量快照会覆盖它们,但丢弃从来不是对的默认。
           if (queueRef.current.length > 0) {
@@ -179,7 +190,7 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
           break;
         case "input":
           if (activeRef.current && typeof msg.data === "string" && inputEnabled) {
-            const result = conn.inputB64(sid, msg.data);
+            const result = onInputB64 ? onInputB64(msg.data) : conn.inputB64(sid, msg.data);
             if (!result.accepted) toast(deliveryFailureText(result));
           }
           break;
@@ -194,7 +205,7 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
           break;
       }
     },
-    [conn, sid, tryAttach, rx, onFontSize, onPerf, inputEnabled],
+    [conn, sid, tryAttach, rx, onFontSize, onPerf, inputEnabled, onInputB64],
   );
 
   useImperativeHandle(ref, () => ({
@@ -225,11 +236,12 @@ const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
         <View style={styles.inputFrozen} pointerEvents="auto">
           <View
             style={styles.inputFrozenCard}
-            accessible
+            accessible={!sessionEnded}
             accessibilityLiveRegion="polite"
             accessibilityLabel={disconnectedMessage}
           >
             <Text style={styles.inputFrozenText}>{disconnectedMessage}</Text>
+            {sessionEnded && endedActions}
             {onRetryConnection && (
               <Pressable
                 style={({ pressed }) => [styles.inputFrozenRetry, pressed && styles.inputFrozenRetryPressed]}

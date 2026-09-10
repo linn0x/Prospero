@@ -289,7 +289,7 @@ export type AgentModel = { id: string; label: string; description?: string; supp
 export type AgentModelCatalog = { models: AgentModel[]; currentModel?: string; currentEffort?: string };
 export type SkillSuggestion = { value: string; label?: string; detail?: string };
 
-export type DesktopApi = {
+export type DesktopApi = import("./project-tools").ProjectToolsApi & {
   modelSourceAction(action: ModelSourceAction): Promise<S2CModelSourceResult>;
   subscribeModelSources(listener: (sources: ModelSource[]) => void): () => void;
   getSnapshot(): Promise<DesktopSnapshot>;
