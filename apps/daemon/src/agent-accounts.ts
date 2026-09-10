@@ -7,6 +7,7 @@ import {
   constants,
   copyFileSync,
   existsSync,
+  lstatSync,
   fsyncSync,
   mkdirSync,
   openSync,
@@ -54,6 +55,7 @@ import { getAccountConfig, readAccountOverrides, saveAccountConfig, supportedAcc
 import { AgentAccountFeatureError } from "./agent-account-feature-error.js";
 import type { AgentModelCatalog } from "./adapters/types.js";
 import { ModelSources, type SourceMigrationEntry } from "./model-sources.js";
+import { externalResponses } from "./api-profile-transport.js";
 
 const execFile = promisify(execFileCallback);
 const LEGACY_MACOS_KEYCHAIN_SERVICE = "com.prospero.code-agent.claude";
@@ -959,9 +961,29 @@ export class AgentAccountManager {
   }
 
   /** Session creation must not race a credential transaction; ordinary snapshots may read its old version. */
-  resolveForSession(accountId: string, expectedAgent?: CodeAgentKind): AccountBinding {
+  resolveForSession(accountId: string, expectedAgent?: CodeAgentKind, modelApiBaseUrl?: string): AccountBinding {
     this.assertSynchronousWrite();
-    return this.resolve(accountId, expectedAgent);
+    const binding = this.resolve(accountId, expectedAgent);
+    if (binding.managed && binding.agent === "claude" && binding.apiProfile?.protocol === "anthropic" && new URL(binding.apiProfile.baseUrl).hostname !== "api.anthropic.com") {
+      const file = path.join(binding.environment.CLAUDE_CONFIG_DIR!, ".claude.json");
+      let config: Record<string, unknown> = {};
+      try {
+        if (existsSync(file)) {
+          const stat = lstatSync(file);
+          if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1024 * 1024) throw new Error();
+          config = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+          if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error();
+        }
+      } catch { throw new AgentAccountError("Claude 初始化配置无效，请修复该账号配置", "account_invalid"); }
+      if (config.hasCompletedOnboarding !== true) writePrivateFile(file, JSON.stringify({ ...config, hasCompletedOnboarding: true }, null, 2));
+      binding.environment.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
+    }
+    if (modelApiBaseUrl && externalResponses(binding)) binding.codexAppServerArgs = [
+      ...(binding.codexAppServerArgs ?? []).map(arg => arg.startsWith("model_providers.prospero.base_url=") ? `model_providers.prospero.base_url=${tomlString(`${modelApiBaseUrl}/${binding.id}`)}` : arg),
+      "-c", "model_providers.prospero.supports_websockets=false",
+      "-c", "features.enable_request_compression=false",
+    ];
+    return binding;
   }
 
   async apiModels(input: Omit<C2SAgentAccountApiModelsGet, "type" | "requestId">, options: ApiModelCatalogOptions = {}): Promise<AgentApiCatalogModel[]> {
