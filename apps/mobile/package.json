@@ -32,6 +32,7 @@
     "expo-status-bar": "~57.0.1",
     "expo-symbols": "~57.0.2",
     "expo-system-ui": "~57.0.2",
+    "highlight.js": "11.11.2",
     "katex": "^0.17.0",
     "react": "19.2.3",
     "react-dom": "19.2.3",
@@ -52,8 +53,10 @@
   "devDependencies": {
     "@types/node": "^22.10.2",
     "@types/react": "~19.2.2",
+    "@types/react-test-renderer": "19.1.0",
     "eslint": "^9.0.0",
     "eslint-config-expo": "~57.0.1",
+    "react-test-renderer": "19.2.3",
     "typescript": "~6.0.3",
     "vitest": "^4.1.10"
   },

@@ -45,6 +45,10 @@ import { ConversationFontControl } from "@/components/ConversationFontControl";
 import { ConversationFontScale } from "@/components/ConversationTypography";
 import { DEFAULT_CONVERSATION_FONT_SIZE } from "@/lib/conversation-font-size";
 import { useSettingsPreferences } from "@/lib/use-settings-preferences";
+import { useTerminalKeyboard } from "@/lib/use-terminal-keyboard";
+import { useTerminalClose } from "@/lib/use-terminal-close";
+import { useTerminalActions } from "@/lib/use-terminal-actions";
+import { isShellTerminal, isTerminalEnded, supportsMacTerminal, MAC_TERMINAL_ONLY } from "@/lib/terminal-session";
 import { DismissKey } from "@/components/DismissKey";
 import { Icon } from "@/components/Icon";
 import { KeyBar } from "@/components/KeyBar";
@@ -64,7 +68,7 @@ import {
 } from "@/lib/attach";
 import { Meter, Row, Sheet, SheetAction } from "@/components/Sheet";
 import { toast } from "@/components/Toast";
-import { color, font, MONOSPACE_FONT, quotaRemainingColor, quotaRemainingPct, radius, statusColor } from "@/lib/theme";
+import { MONOSPACE_FONT, quotaRemainingColor, quotaRemainingPct, radius, createThemedStyles, useMobileTheme, statusColors, fontForPalette } from "@/lib/theme";
 import { matchCommands } from "@/lib/slash-commands";
 import {
   getPerfHudEnabled,
@@ -205,7 +209,12 @@ function SessionHeaderTitle({
   /** 传入时标题可点,展开同一主机的会话切换器。 */
   onSwitch?: () => void;
 }) {
-  const busy = !subagent && (session?.status === "running" || session?.status === "starting");
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
+  const statusColor = statusColors(color);
+  const { width } = useWindowDimensions();
+  const shellTerminal = isShellTerminal(session);
+  const busy = !subagent && !shellTerminal && (session?.status === "running" || session?.status === "starting");
   const elapsed = useElapsed(
     busy || session?.status === "waiting_approval" ? session?.busySince : undefined,
   );
@@ -217,7 +226,7 @@ function SessionHeaderTitle({
       : [
         session.agent,
         session.accountName ?? "",
-        `${statusText[session.status]}${elapsed ? ` ${elapsed}` : ""}`,
+        `${shellTerminal && !isTerminalEnded(session) ? "终端已打开" : statusText[session.status]}${elapsed ? ` ${elapsed}` : ""}`,
         pending > 0 ? `${String(pending)} 项待处理` : "",
         session.messageQueue?.length
           ? `${String(session.messageQueue.length)} 条排队`
@@ -230,7 +239,7 @@ function SessionHeaderTitle({
   const Container = onSwitch ? Pressable : View;
   return (
     <Container
-      style={styles.headerTitle}
+      style={[styles.headerTitle, { maxWidth: Math.max(60, Math.min(238, width - 244)) }]}
       {...(onSwitch
         ? {
             onPress: onSwitch,
@@ -291,6 +300,9 @@ function SessionSwitcherSheet({
   hostId: string;
   onClose: () => void;
 }) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
+  const statusColor = statusColors(color);
   const [navigation] = useState(() => new DismissedModalAction());
   useEffect(() => {
     // A rapid reopen invalidates any action from the previous presentation.
@@ -362,6 +374,9 @@ function FoldableSessionRail({
   hostId: string;
   width: number;
 }) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
+  const statusColor = statusColors(color);
   return (
     <View style={[styles.sessionRail, { width }]}>
       <View style={styles.sessionRailHeader}>
@@ -422,6 +437,9 @@ function FoldableSessionRail({
 }
 
 export default function SessionScreen() {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
+  const font = fontForPalette(color);
   const { settings, updateSettings } = useSettingsPreferences();
   const insets = useSafeAreaInsets();
   const headerHeight = useHeaderHeight();
@@ -501,6 +519,13 @@ export default function SessionScreen() {
   const isSubagent = subagentId !== undefined;
   const isStructured = session?.kind === "structured";
   const isChat = isStructured;
+  const shellTerminal = isShellTerminal(session);
+  const terminalEnded = isTerminalEnded(session);
+  const terminalSupported = !shellTerminal || supportsMacTerminal(runtime.hostInfo);
+  const terminalClose = useTerminalClose(conn, sid);
+  const terminalActions = useTerminalActions(conn, sid);
+  const terminalInputEnabled = runtime.status === "connected" && !terminalEnded && terminalSupported && !terminalClose.closing;
+  const terminalKeyboard = useTerminalKeyboard(conn, sid, terminalInputEnabled && !isChat);
   const busy = isSubagent
     ? subagent?.status === "running" ||
       subagent?.status === "starting" ||
@@ -518,6 +543,9 @@ export default function SessionScreen() {
   const [policyOpen, setPolicyOpen] = useState(false);
   const [yoloConfirmOpen, setYoloConfirmOpen] = useState(false);
   const [killConfirmOpen, setKillConfirmOpen] = useState(false);
+  const [deleteTerminalOpen, setDeleteTerminalOpen] = useState(false);
+  const [terminalDeletion] = useState(() => new DismissedModalAction());
+  useFocusEffect(useCallback(() => () => terminalDeletion.cancel(), [terminalDeletion]));
   const [controlsLoading, setControlsLoading] = useState(false);
   const [controlError, setControlError] = useState<string | null>(null);
   const [models, setModels] = useState<AgentModel[]>([]);
@@ -1145,6 +1173,31 @@ export default function SessionScreen() {
     setKillConfirmOpen(true);
   };
 
+  const closeShellTerminal = (): void => {
+    void terminalClose.close().then((closed) => {
+      if (closed) setKillConfirmOpen(false);
+    });
+  };
+
+  const restartShellTerminal = (): void => {
+    void terminalActions.restart(sid).then((created) => {
+      if (created) router.replace(`/host/${hostId}/session/${created.id}`);
+    });
+  };
+
+  const deleteShellTerminal = (): void => {
+    terminalDeletion.defer(() => {
+      void terminalActions.remove(sid).then((deleted) => { if (deleted) returnToHost(); });
+    });
+    setDeleteTerminalOpen(false);
+  };
+
+  if (!terminalSupported) return <View style={styles.loadState}>
+    <Stack.Screen options={{ title: "远程终端" }} />
+    <Text style={styles.loadTitle}>{runtime.hostInfo ? MAC_TERMINAL_ONLY : "正在确认设备类型…"}</Text>
+    <Pressable onPress={returnToHost} style={styles.loadBack}><Text style={styles.loadBackText}>返回</Text></Pressable>
+  </View>;
+
   if (!conn || !sid || !session) {
     const loading = sessionLoadState(runtime.status, runtime.lastError);
     return (
@@ -1216,7 +1269,6 @@ export default function SessionScreen() {
     isChat && !isSubagent && session && composerToken?.kind === "command"
       ? matchCommands(session.agent, draft.trim())
       : [];
-  const terminalInputEnabled = runtime.status === "connected";
   const canSend =
     Boolean(conn && sid) &&
     draftHydrated &&
@@ -1353,6 +1405,7 @@ export default function SessionScreen() {
       >
         <Stack.Screen
         options={{
+          headerTitleAlign: "left",
           headerBackVisible: false,
           headerLeft: () => (
             <Pressable
@@ -1377,7 +1430,13 @@ export default function SessionScreen() {
           headerRight: () => (
             <View style={styles.headerRight}>
               {/* "停止"分秒必争；文件、改动和分支统一放进右侧快捷面板。 */}
-              {busy && !isSubagent && (
+              <View style={styles.headerAction}>
+              {shellTerminal && !terminalEnded ? (
+                <Pressable onPress={confirmKill} disabled={terminalClose.closing} hitSlop={8}
+                  accessibilityRole="button" accessibilityLabel="关闭终端">
+                  {terminalClose.closing ? <ActivityIndicator color={color.danger} /> : <Icon name="xmark" size={20} color={color.danger} />}
+                </Pressable>
+              ) : busy && !isSubagent && (
                 <Pressable
                   onPress={() => conn.interrupt(sid)}
                   hitSlop={8}
@@ -1387,7 +1446,23 @@ export default function SessionScreen() {
                   <Icon name="stop.circle" size={21} color={color.warn} />
                 </Pressable>
               )}
+              </View>
+              {isChat && <Pressable
+                style={styles.headerAction}
+                onPress={() => {
+                  if (!settings.sessionActionsHidden) setSearch(null);
+                  void updateSettings({ sessionActionsHidden: !settings.sessionActionsHidden });
+                }}
+                accessibilityRole="button"
+                accessibilityLabel={settings.sessionActionsHidden ? "显示会话快捷操作" : "隐藏会话快捷操作"}
+                accessibilityHint="同时展开或收起标题下方工具栏和底部快捷指令栏"
+                accessibilityState={{ expanded: !settings.sessionActionsHidden }}
+              >
+                <Icon name={settings.sessionActionsHidden ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right"}
+                  size={19} color={color.accent} />
+              </Pressable>}
               <Pressable
+                style={styles.headerAction}
                 onPress={openQuickPanel}
                 hitSlop={8}
                 accessibilityRole="button"
@@ -1397,6 +1472,7 @@ export default function SessionScreen() {
                 <Icon name="square.stack.3d.up" size={20} color={color.accent} />
               </Pressable>
               <Pressable
+                style={styles.headerAction}
                 onPress={openMenu}
                 hitSlop={8}
                 accessibilityRole="button"
@@ -1424,7 +1500,7 @@ export default function SessionScreen() {
         </View>
       )}
 
-      {isStructured && (
+      {isStructured && !settings.sessionActionsHidden && (
         <View style={styles.modeBar}>
           {coordinatorRun && !isSubagent ? (
             <Pressable
@@ -1608,23 +1684,46 @@ export default function SessionScreen() {
                 fontSize={fontSize}
                 onFontSize={setCustomTerminalFontSize}
                 inputEnabled={terminalInputEnabled}
-                disconnectedMessage="主机未连接；终端输入已冻结，断线期间的按键不会自动重放。"
-                onRetryConnection={retryTerminalConnection}
+                sessionEnded={terminalEnded}
+                endedActions={shellTerminal ? <>
+                  {terminalActions.error && <Text accessibilityRole="alert" style={styles.terminalActionError}>{terminalActions.error}</Text>}
+                  <View style={styles.terminalEndedActions}>
+                    <Pressable accessibilityRole="button" accessibilityLabel="重启终端" onPress={restartShellTerminal}
+                      disabled={runtime.status !== "connected" || terminalActions.busy !== null}
+                      style={[styles.terminalEndedButton, (runtime.status !== "connected" || terminalActions.busy !== null) && { opacity: 0.5 }]}>
+                      {terminalActions.busy?.kind === "restart" ? <ActivityIndicator color="#fff" /> : <Icon name="arrow.clockwise" size={18} color="#fff" />}
+                      <Text style={styles.terminalEndedButtonText}>{terminalActions.busy?.kind === "restart" ? "正在重启…" : "重启终端"}</Text>
+                    </Pressable>
+                    <Pressable accessibilityRole="button" accessibilityLabel="删除终端" onPress={() => setDeleteTerminalOpen(true)}
+                      disabled={terminalActions.busy !== null} style={styles.terminalEndedButton}>
+                      <Icon name="trash" size={18} color="#fff" /><Text style={styles.terminalEndedButtonText}>删除</Text>
+                    </Pressable>
+                  </View>
+                  {runtime.status !== "connected" && <Pressable accessibilityRole="button" onPress={() => conn.kick()} style={styles.terminalEndedButton}>
+                    <Text style={styles.terminalEndedButtonText}>重连设备</Text>
+                  </Pressable>}
+                </> : undefined}
+                onInputB64={terminalKeyboard.inputB64}
+                disconnectedMessage={terminalEnded ? "终端已结束。" : terminalClose.closing ? "正在关闭终端…" : "主机未连接；终端输入已冻结，断线期间的按键不会自动重放。"}
+                onRetryConnection={terminalEnded || terminalClose.closing ? undefined : retryTerminalConnection}
                 {...(perfHud ? { onPerf: setTerminalPerf } : {})}
               />
               {perfHud && <PerfHud perf={terminalPerf} />}
             </View>
-            <KeyBar
-              onKey={(seq) => conn.inputText(sid, seq)}
+            {!terminalEnded && <View style={{ paddingBottom: insets.bottom, backgroundColor: "#141419" }}><KeyBar
+              onKey={terminalKeyboard.sendKey}
+              onPaste={terminalKeyboard.paste}
+              modifiers={terminalKeyboard.modifiers}
+              onToggleModifier={terminalKeyboard.toggleModifier}
               enabled={terminalInputEnabled}
-              disabledMessage="主机未连接；快捷键和粘贴已冻结，不会自动重放。"
-              onRetry={() => conn.kick()}
+              disabledMessage={terminalEnded ? "终端已结束" : terminalClose.closing ? "正在关闭终端…" : "主机未连接；快捷键和粘贴已冻结，不会自动重放。"}
+              onRetry={terminalEnded || terminalClose.closing ? undefined : () => conn.kick()}
               onFontSize={(delta) => setCustomTerminalFontSize(adjustTerminalFontSize(fontSize, delta))}
               onResetFontSize={followSystemTerminalFontSize}
               fontSizeMode={terminalFontPreference.mode}
               onScrollBottom={() => termRef.current?.scrollToBottom()}
               onDismissKeyboard={Platform.OS === "android" ? undefined : () => termRef.current?.blur()}
-            />
+            /></View>}
           </>
         ) : (
           <View style={styles.terminalPreferenceLoading} accessibilityLabel="正在读取终端字号偏好">
@@ -1687,8 +1786,8 @@ export default function SessionScreen() {
         </View>
       )}
 
-      {isChat && commandHints.length === 0 && completionKind === null && (
-        <QuickReplies busy={busy} onPick={send} />
+      {isChat && !settings.sessionActionsHidden && commandHints.length === 0 && completionKind === null && (
+        <QuickReplies busy={busy} replies={settings.quickReplies} onPick={send} />
       )}
 
       {isChat && !isSubagent && (session.messageQueue?.length ?? 0) > 0 && (
@@ -1885,13 +1984,13 @@ export default function SessionScreen() {
               });
           }}
         />
-        <SheetAction
-          label="结束会话"
+        {!(shellTerminal && terminalEnded) && <SheetAction
+          label={shellTerminal ? "关闭终端" : "结束会话"}
           detail="终止电脑端会话进程"
           symbol="trash"
           destructive
           onPress={confirmKill}
-        />
+        />}
       </Sheet>
 
       <Sheet visible={policyOpen} title="审批策略" onClose={() => setPolicyOpen(false)}>
@@ -1948,11 +2047,18 @@ export default function SessionScreen() {
 
       <Sheet
         visible={killConfirmOpen}
-        title="结束会话"
+        title={shellTerminal ? "关闭终端" : "结束会话"}
         onClose={() => setKillConfirmOpen(false)}
       >
         <Text style={styles.sheetNote}>电脑端会话进程会被终止，未完成的工作可能丢失。</Text>
-        <SheetAction
+        {shellTerminal ? <>
+          {terminalClose.error && <Text accessibilityRole="alert" style={styles.controlError}>{terminalClose.error}</Text>}
+          <Pressable onPress={closeShellTerminal} disabled={terminalClose.closing} accessibilityRole="button"
+            accessibilityLabel="确认关闭终端" style={styles.loadBack}>
+            {terminalClose.closing && <ActivityIndicator color={color.danger} />}
+            <Text style={[styles.loadBackText, { color: color.danger }]}>{terminalClose.closing ? "正在关闭…" : "关闭终端"}</Text>
+          </Pressable>
+        </> : <SheetAction
           label="结束电脑端会话"
           detail="此操作无法撤销"
           symbol="trash"
@@ -1962,7 +2068,17 @@ export default function SessionScreen() {
             conn.kill(sid);
             returnToHost();
           }}
-        />
+        />}
+      </Sheet>
+
+      <Sheet visible={deleteTerminalOpen} title="删除终端" onClose={() => setDeleteTerminalOpen(false)} onDismiss={() => terminalDeletion.dismiss()}>
+        <Text style={styles.sheetNote}>删除这个已结束的终端记录，工作目录中的文件会保留。</Text>
+        {terminalActions.error && <Text accessibilityRole="alert" style={styles.controlError}>{terminalActions.error}</Text>}
+        <Pressable accessibilityRole="button" accessibilityLabel="确认删除终端" onPress={deleteShellTerminal}
+          disabled={terminalActions.busy !== null} style={styles.loadBack}>
+          {terminalActions.busy?.kind === "delete" && <ActivityIndicator color={color.danger} />}
+          <Text style={[styles.loadBackText, { color: color.danger }]}>{terminalActions.busy?.kind === "delete" ? "正在删除…" : "删除终端"}</Text>
+        </Pressable>
       </Sheet>
 
       <Sheet visible={controlsOpen} title="Agent 设置" onClose={() => setControlsOpen(false)}>
@@ -2116,11 +2232,11 @@ export default function SessionScreen() {
                 <View key={w.label} style={styles.window}>
                   <View style={styles.windowHead}>
                     <Text style={font.body}>{w.label}</Text>
-                    <Text style={[styles.windowPct, { color: quotaRemainingColor(remaining) }]}>
+                    <Text style={[styles.windowPct, { color: quotaRemainingColor(remaining, color) }]}>
                       剩余 {String(remaining)}%
                     </Text>
                   </View>
-                  <Meter value={remaining} tint={quotaRemainingColor(remaining)} />
+                  <Meter value={remaining} tint={quotaRemainingColor(remaining, color)} />
                   {w.resetsAt ? (
                     <Text style={font.meta}>{formatReset(w.resetsAt)} 重置</Text>
                   ) : null}
@@ -2157,7 +2273,7 @@ export default function SessionScreen() {
           <Text style={styles.attachmentErrorText}>{attachmentError}</Text>
         </View>
       )}
-      <View style={[styles.composer, { paddingBottom: Math.max(insets.bottom, 8) }]}>
+      {isChat && <View testID="chat-composer" style={[styles.composer, { paddingBottom: Math.max(insets.bottom, 8) }]}>
         <View style={[styles.composerRow, composerExpanded && styles.composerRowExpanded]}>
           {!composerExpanded && <DismissKey visible={focused} />}
           {isChat && !isSubagent && !composerExpanded && (
@@ -2199,7 +2315,11 @@ export default function SessionScreen() {
                       : `给 ${session?.agent ?? "agent"} 发消息 · @文件 · $Skill · /命令`
                   : terminalInputEnabled
                     ? "输入命令，回车执行"
-                    : "主机未连接；终端输入已冻结"
+                    : terminalEnded
+                      ? "终端已结束"
+                      : terminalClose.closing
+                        ? "正在关闭终端…"
+                        : "主机未连接；终端输入已冻结"
               }
               placeholderTextColor={color.textFaint}
               value={draft}
@@ -2221,7 +2341,11 @@ export default function SessionScreen() {
               editable={isChat || terminalInputEnabled}
               accessibilityHint={
                 !isChat && !terminalInputEnabled
-                  ? "连接恢复前不能执行命令；输入内容不会自动发送。"
+                  ? terminalEnded
+                    ? "终端已结束，不能再执行命令。"
+                    : terminalClose.closing
+                      ? "正在等待设备确认终端已结束。"
+                      : "连接恢复前不能执行命令；输入内容不会自动发送。"
                   : undefined
               }
             />
@@ -2291,7 +2415,7 @@ export default function SessionScreen() {
             {composerSendButton}
           </View>
         )}
-      </View>
+      </View>}
       </KeyboardAvoidingView>
     </View>
     </ReanimatedDrawerLayout>
@@ -2301,7 +2425,7 @@ export default function SessionScreen() {
 /** 与协议里的上限一致 */
 const MAX_IMAGES = MAX_COMPOSER_IMAGES;
 
-const styles = StyleSheet.create({
+const useStyles = createThemedStyles((color) => StyleSheet.create({
   adaptiveRoot: { flex: 1, backgroundColor: color.bg },
   adaptiveRootSplit: { flexDirection: "row" },
   container: { flex: 1, backgroundColor: color.bg },
@@ -2360,7 +2484,7 @@ const styles = StyleSheet.create({
   sessionRailAgent: { color: color.textFaint, fontSize: 9.5 },
   sessionRailPath: { color: color.textFaint, fontSize: 9.5, fontFamily: MONOSPACE_FONT },
   sessionRailPreview: { color: color.textDim, fontSize: 10.5, lineHeight: 15 },
-  headerBack: { minWidth: 30, minHeight: 36, alignItems: "flex-start", justifyContent: "center" },
+  headerBack: { width: 36, minHeight: 44, alignItems: "flex-start", justifyContent: "center" },
   loadState: {
     flex: 1,
     alignItems: "center",
@@ -2390,7 +2514,7 @@ const styles = StyleSheet.create({
   loadBackText: { color: color.text, fontSize: 13, fontWeight: "600" },
   loadButtonPressed: { opacity: 0.55 },
 
-  headerTitle: { alignItems: "center", maxWidth: 238 },
+  headerTitle: { alignItems: "center", justifyContent: "center", minWidth: 0 },
   headerNameRow: { flexDirection: "row", alignItems: "center", gap: 4, maxWidth: "100%" },
   headerName: { color: color.text, fontSize: 16, fontWeight: "600", flexShrink: 1 },
   switcherItem: {
@@ -2410,8 +2534,9 @@ const styles = StyleSheet.create({
   headerMetaRow: { flexDirection: "row", alignItems: "center", gap: 5, marginTop: 2 },
   headerDot: { width: 5, height: 5, borderRadius: 3 },
   headerSub: { color: color.textDim, fontSize: 10.5, flexShrink: 1 },
-  // 四个图标(忙时含"停止")挤在右侧,间距收窄才不会把居中标题压没。
-  headerRight: { flexDirection: "row", gap: 12, alignItems: "center" },
+  // Reserve the stop slot so the toolbar width stays stable as a turn starts or finishes.
+  headerRight: { flexDirection: "row", alignItems: "center" },
+  headerAction: { width: 44, minHeight: 44, alignItems: "center", justifyContent: "center" },
 
   modeBar: {
     flexDirection: "row",
@@ -2527,6 +2652,10 @@ const styles = StyleSheet.create({
     backgroundColor: "#09090b",
   },
   terminalStack: { flex: 1 },
+  terminalEndedActions: { flexDirection: "row", flexWrap: "wrap", justifyContent: "center", gap: 10 },
+  terminalEndedButton: { minHeight: 44, paddingHorizontal: 14, paddingVertical: 10, borderRadius: 8, backgroundColor: "#3A5BA8", flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6 },
+  terminalEndedButtonText: { color: "#fff", fontSize: 14, fontWeight: "600" },
+  terminalActionError: { color: "#F0D798", fontSize: 13, lineHeight: 19 },
 
   reconnBar: {
     flexDirection: "row",
@@ -2913,4 +3042,4 @@ const styles = StyleSheet.create({
     borderTopColor: color.danger,
   },
   attachmentErrorText: { color: color.danger, fontSize: 12, lineHeight: 17, textAlign: "center" },
-});
+}));

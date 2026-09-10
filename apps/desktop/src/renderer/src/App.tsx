@@ -1,6 +1,7 @@
 import { WindowsTitlebar } from "./app-shell/WindowsTitlebar";
 import { notify } from "./notifications/notifications";
 import { useNavigationHistory } from "./app-shell/use-navigation-history";
+import { ProjectToolsProvider } from "./project-tools/ProjectToolsHost";
 import {
   Fragment,
   lazy,
@@ -222,6 +223,7 @@ import { SourceSelector } from "./model-sources/SourceSelector";
 import { useModelSources, runModelSourceAction } from "./model-sources/use-model-sources";
 import { rememberSourceSelection, rememberedSourceSelection, selectedSourceRoute, sourceRouteAgent, type SourceSelection } from "./model-sources/source-state";
 import { sessionLabel, SessionAgentIcon, StatusMark } from "./workspace/session-presentation";
+import { useSessionUnread } from "./workspace/use-session-unread";
 
 /** Host platform is static and controls native menu labels and shortcuts. */
 const isMac = window.prospero.platform === "darwin";
@@ -305,6 +307,7 @@ const views = new Set<View>([
 function readStoredView(): View {
   try {
     const value = localStorage.getItem(ACTIVE_VIEW_STORAGE_KEY) as View | null;
+    if (["files", "search", "git"].includes(value ?? "")) return "workspaces";
     return value && views.has(value) ? value : "overview";
   } catch {
     return "overview";
@@ -428,6 +431,7 @@ type PinnedSessionRowProps = Pick<
 > & {
   session: SessionInfo;
   active: boolean;
+  unread: boolean;
 };
 
 /**
@@ -438,32 +442,23 @@ type PinnedSessionRowProps = Pick<
 const PinnedSessionRow = memo(function PinnedSessionRow({
   session,
   active,
+  unread,
   onOpenSession,
   onTogglePin,
 }: PinnedSessionRowProps) {
-  const { language, t, status } = useLocale();
-  const attention =
-    (session.pendingPermissions ?? 0) + (session.pendingQuestions ?? 0);
+  const { t } = useLocale();
   return (
-    <SidebarMenuItem>
+    <SidebarMenuItem className="workspace-session-item workspace-pinned-item">
       <SidebarMenuButton
-        size="lg"
+        className="workspace-session-link"
         isActive={active}
         aria-current={active ? "page" : undefined}
         tooltip={sessionLabel(session)}
         onClick={() => onOpenSession(session.id, session)}
       >
         <SessionAgentIcon agent={session.agent} />
-        <span className="flex min-w-0 flex-col gap-0.5">
-          <span className="truncate text-sm font-medium">
-            {sessionLabel(session)}
-          </span>
-          <span className="truncate text-xs font-normal text-muted-foreground">
-            {session.agent} · {" "}
-            {attention ? t("需要输入", "Needs input") : status(session.status)} · {" "}
-            {relativeTime(session.createdAt, language)}
-          </span>
-        </span>
+        <span className="workspace-session-copy"><strong>{sessionLabel(session)}</strong></span>
+        <StatusMark status={session.status} unread={unread} pendingPermissions={session.pendingPermissions} pendingQuestions={session.pendingQuestions} />
       </SidebarMenuButton>
       <SidebarMenuAction
         showOnHover
@@ -507,7 +502,7 @@ const WorkspaceSessionRow = memo(function WorkspaceSessionRow({
   onSetUnread,
   onToggleArchive,
 }: WorkspaceSessionRowProps) {
-  const { language, t, status } = useLocale();
+  const { t } = useLocale();
   return (
     <SidebarMenuSubItem className="workspace-session-item">
       <ContextMenu>
@@ -523,14 +518,11 @@ const WorkspaceSessionRow = memo(function WorkspaceSessionRow({
             />
           }
         >
-          <SessionAgentIcon agent={session.agent} unread={unread} />
+          <SessionAgentIcon agent={session.agent} />
           <span className="workspace-session-copy">
             <strong>{sessionLabel(session)}</strong>
-            <small>
-              <StatusMark status={session.status} />
-              {status(session.status)} · {relativeTime(session.createdAt, language)}
-            </small>
           </span>
+          <StatusMark status={session.status} unread={unread} pendingPermissions={session.pendingPermissions} pendingQuestions={session.pendingQuestions} />
         </ContextMenuTrigger>
         <ContextMenuContent>
           <ContextMenuGroup>
@@ -636,9 +628,9 @@ function sidebarSessionRowEqual(
   )
     return false;
 
-  if ("unread" in previous && "unread" in next) {
+  if (previous.unread !== next.unread) return false;
+  if ("pinned" in previous && "pinned" in next) {
     if (
-      previous.unread !== next.unread ||
       previous.pinned !== next.pinned ||
       previous.archived !== next.archived
     )
@@ -1549,6 +1541,7 @@ function ShellSidebar({
                     key={session.id}
                     session={session}
                     active={view === "workspaces" && activeId === session.id}
+                    unread={snapshot.unreadSessionIds.includes(session.id)}
                     onOpenSession={selectSession}
                     onTogglePin={onTogglePin}
                   />
@@ -3330,7 +3323,7 @@ function NewSessionDialog({
             </FieldDescription>
           </Field>
           {remoteId ? <p className="workspace-picker-hint">{t("在远程电脑的此目录新建交互式 Shell，可运行远端已安装的 codex、claude 等 CLI。不会使用本机账号或本机模型配置。", "Create an interactive Shell in this folder on the remote computer, where you can run its installed codex, claude or other CLI. Local accounts and model settings are not used.")}</p> : <>
-          <div className="model-source-session-mode" role="group" aria-label={t("模型连接方式", "Model connection")}><Button variant={useSource ? "secondary" : "ghost"} aria-pressed={useSource} disabled={busy || !sourceSupported} onClick={() => setUseSource(true)}>{t("共享模型源", "Shared model source")}</Button><Button variant={!useSource ? "secondary" : "ghost"} aria-pressed={!useSource} disabled={busy} onClick={() => setUseSource(false)}>{t("CLI / 独立 Profile", "CLI / independent profile")}</Button></div>
+          <div className="model-source-session-mode" role="group" aria-label={t("模型连接方式", "Model connection")}><Button data-liquid-glass="tab" variant={useSource ? "secondary" : "ghost"} aria-pressed={useSource} disabled={busy || !sourceSupported} onClick={() => setUseSource(true)}>{t("共享模型源", "Shared model source")}</Button><Button data-liquid-glass="tab" variant={!useSource ? "secondary" : "ghost"} aria-pressed={!useSource} disabled={busy} onClick={() => setUseSource(false)}>{t("CLI / 独立 Profile", "CLI / independent profile")}</Button></div>
           {useSource ? <><SourceSelector sources={sourceState.sources} loading={sourceState.loading} error={sourceState.error} value={sourceSelection} onChange={setSourceSelection} onRefresh={() => void sourceState.refresh()} disabled={busy} /><Field><FieldLabel htmlFor="source-session-kind">{t("会话类型", "Session type")}</FieldLabel><NativeSelect id="source-session-kind" value={selectedKind} disabled={busy || sourceChoice?.route.protocol === "openai_chat_completions"} onChange={event => setInput(current => ({ ...current, kind: event.target.value as SessionCreateInput["kind"] }))}><NativeSelectOption value="structured">{t("对话", "Conversation")}</NativeSelectOption><NativeSelectOption value="pty">{t("终端", "Terminal")}</NativeSelectOption></NativeSelect></Field></> : <>
           <div className="grid gap-4 sm:grid-cols-2">
             <Field>
@@ -3925,6 +3918,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     () => validOpenSessionIds(openIds, sessionSnapshot.daemon.sessions),
     [openIds, sessionSnapshot.daemon.sessions],
   );
+  useSessionUnread(sessionSnapshot.daemon.sessions, snapshot.unreadSessionIds, view === "workspaces" && !activeRemote ? activeId : undefined);
   const accountUsageKey = snapshot.accounts
     .map((account) => `${text(account["id"])}:${text(account["status"])}`)
     .join("|");
@@ -4236,6 +4230,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
   const workspaceFocus = focus && view === "workspaces";
   return (
     <TooltipProvider>
+    <ProjectToolsProvider>
     <SidebarProvider
       open={sidebarOpen}
       onOpenChange={changeSidebarOpen}
@@ -4305,7 +4300,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
               <DevicesPane snapshot={sessionSnapshot} />
             ) : view === "workspaces" ? (
               activeRemote ? <RemoteWorkspacePane key={activeRemote.id} workspace={activeRemote} settings={sessionSnapshot.settings} focus={focus} onToggleFocus={() => setFocus(current => !current)} newSessionRequest={remoteSessionRequest} /> : activeRemoteId && !remote.ready ? <div className="boot-screen"><p role={remote.error ? "alert" : "status"}>{remote.error ?? t("正在恢复远程工作区…", "Restoring remote workspace…")}</p>{remote.error && <Button onClick={() => void remote.refresh()}>{t("重试", "Retry")}</Button>}</div> : <div className="local-workspace-container">
-              {!workspaceFocus && validOpenIds.length > 0 && <WorkspaceTabs snapshot={sessionSnapshot} openIds={openIds} activeId={activeId} onActivate={openSession} onClose={closeSession} onTogglePin={togglePin} />}
+              {!workspaceFocus && validOpenIds.length > 0 && <WorkspaceTabs snapshot={sessionSnapshot} openIds={openIds} activeId={activeId} onActivate={openSession} onClose={closeSession} onTogglePin={togglePin} onReorder={ids => setOpenIds(current => [...ids, ...current.filter(id => !ids.includes(id))])} />}
               <WorkspacePane
                 focus={focus}
                 snapshot={sessionSnapshot}
@@ -4392,6 +4387,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
         />
       )}
     </SidebarProvider>
+    </ProjectToolsProvider>
     </TooltipProvider>
   );
 }

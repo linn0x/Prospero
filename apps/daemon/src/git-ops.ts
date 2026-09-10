@@ -20,6 +20,7 @@ const MAX_OUTPUT = 2 * 1024 * 1024;
 
 export interface GitFile {
   path: string;
+  originalPath?: string;
   /** 暂存区状态(porcelain 的 X 位) */
   index: string;
   /** 工作区状态(porcelain 的 Y 位) */
@@ -55,13 +56,16 @@ async function gitTolerant(cwd: string, args: string[]): Promise<string> {
   }
 }
 
-async function git(cwd: string, args: string[]): Promise<string> {
+export async function git(cwd: string, args: string[]): Promise<string> {
   try {
+    const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
     const { stdout } = await run("git", args, {
       cwd,
       maxBuffer: MAX_OUTPUT,
+      timeout: 30_000,
+      windowsHide: true,
       // 不继承用户的 GIT_* 环境,避免会话间串味;LANG 固定以便解析
-      env: { ...process.env, LC_ALL: "C", GIT_OPTIONAL_LOCKS: "0" },
+      env: { ...env, LC_ALL: "C", GIT_OPTIONAL_LOCKS: "0", GIT_LITERAL_PATHSPECS: "1", GIT_TERMINAL_PROMPT: "0" },
     });
     return stdout;
   } catch (e) {
@@ -89,7 +93,8 @@ export async function status(cwd: string): Promise<GitStatus> {
   let behind = 0;
 
   try {
-    branch = (await git(cwd, ["rev-parse", "--abbrev-ref", "HEAD"])).trim();
+    // symbolic-ref also works before the first commit; detached HEAD has no symbolic ref.
+    branch = await git(cwd, ["symbolic-ref", "--short", "HEAD"]).then(value => value.trim()).catch(async () => (await git(cwd, ["rev-parse", "--abbrev-ref", "HEAD"])).trim());
   } catch (e) {
     if (e instanceof FsError && e.code === "not_found") {
       return { branch: null, ahead: 0, behind: 0, files: [], staged: false };
@@ -117,10 +122,11 @@ export async function status(cwd: string): Promise<GitStatus> {
     const worktree = entry[1] ?? " ";
     let filePath = entry.slice(3);
     // 重命名 / 复制的记录后面紧跟一个"原路径"字段,要多吃一个
-    if (index === "R" || index === "C") i++;
+    const originalPath = index === "R" || index === "C" || worktree === "R" || worktree === "C" ? parts[++i] : undefined;
     if (!filePath) continue;
     files.push({
       path: filePath,
+      ...(originalPath ? { originalPath } : {}),
       index,
       worktree,
       untracked: index === "?" && worktree === "?",

@@ -121,7 +121,7 @@ export function RemoteWorkspacePane({ workspace, settings, focus, onToggleFocus,
         <button type="button" aria-label={t("进入专注模式", "Enter focus mode")} onClick={onToggleFocus}><DesktopIcon name="expand" /></button>
       </header>
       {tabs.length > 0 && <div className="remote-workspace-tabs" role="tablist" aria-label={t("此目录的远程 Shell", "Remote Shells in this directory")}>
-        {tabs.map((tab, index) => <button type="button" role="tab" id={`remote-shell-tab-${tab.id}`} key={tab.id} aria-selected={tab.id === sid} aria-controls="remote-workspace-terminal" tabIndex={tab.id === sid || activeIndex < 0 && index === 0 ? 0 : -1} title={tab.cwd} onClick={() => select(tab.id)} onKeyDown={event => {
+        {tabs.map((tab, index) => <button type="button" role="tab" data-liquid-glass="tab" id={`remote-shell-tab-${tab.id}`} key={tab.id} aria-selected={tab.id === sid} aria-controls="remote-workspace-terminal" tabIndex={tab.id === sid || activeIndex < 0 && index === 0 ? 0 : -1} title={tab.cwd} onClick={() => select(tab.id)} onKeyDown={event => {
           if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
           event.preventDefault();
           const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : (index + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;

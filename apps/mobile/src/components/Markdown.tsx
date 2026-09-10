@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useState } from "react";
+import { createContext, memo, useContext, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Image,
@@ -16,9 +16,11 @@ import {
   type ProjectFileReference,
 } from "@/lib/file-references";
 import { parseMarkdownCached, type InlineSpan, type MdBlock } from "@/lib/markdown";
-import { color, MONOSPACE_FONT } from "@/lib/theme";
+import { MONOSPACE_FONT, createThemedStyles, useMobileTheme } from "@/lib/theme";
 
 export type ProjectImageLoader = (reference: ProjectFileReference) => Promise<string>;
+export type FileReferenceResolver = (target: string, explicit: boolean) => ProjectFileReference | null;
+const FileReferences = createContext<FileReferenceResolver | undefined>(undefined);
 
 /** agent 输出的 Markdown 渲染(标题/列表/引用/行内代码/代码块) */
 export const Markdown = memo(function Markdown({
@@ -26,17 +28,20 @@ export const Markdown = memo(function Markdown({
   projectRoot,
   onOpenFile,
   loadProjectImage,
+  resolveFileReference,
 }: {
   source: string;
   projectRoot?: string;
   onOpenFile?: (reference: ProjectFileReference) => void;
   loadProjectImage?: ProjectImageLoader;
+  resolveFileReference?: FileReferenceResolver;
 }) {
+  const styles = useStyles();
   // 流式期间 source 每帧变长,整段重解析的总开销随长度平方增长。改成只解析仍在
   // 增长的尾部,已定稿的块连同它们的对象引用一起复用。
   const blocks = useMemo(() => parseMarkdownCached(source), [source]);
   return (
-    <View style={styles.root}>
+    <FileReferences.Provider value={resolveFileReference}><View style={styles.root}>
       {blocks.map((b, i) => (
         <Block
           key={i}
@@ -46,7 +51,7 @@ export const Markdown = memo(function Markdown({
           loadProjectImage={loadProjectImage}
         />
       ))}
-    </View>
+    </View></FileReferences.Provider>
   );
 });
 
@@ -63,6 +68,7 @@ const Block = memo(function Block({
   onOpenFile?: (reference: ProjectFileReference) => void;
   loadProjectImage?: ProjectImageLoader;
 }) {
+  const styles = useStyles();
   switch (block.type) {
     case "heading":
       if (hasMath(block.spans)) {
@@ -172,10 +178,13 @@ const MarkdownImage = memo(function MarkdownImage({
   onOpenFile?: (reference: ProjectFileReference) => void;
   loadProjectImage?: ProjectImageLoader;
 }) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
   const direct = useMemo(() => directImageUri(target), [target]);
+  const resolveReference = useContext(FileReferences);
   const reference = useMemo(
-    () => (projectRoot ? resolveProjectFileReference(target, projectRoot, true) : null),
-    [target, projectRoot],
+    () => resolveReference ? resolveReference(target, true) : (projectRoot ? resolveProjectFileReference(target, projectRoot, true) : null),
+    [target, projectRoot, resolveReference],
   );
   const [uri, setUri] = useState<string | null>(direct);
   const [loading, setLoading] = useState(direct === null && reference !== null);
@@ -268,6 +277,7 @@ function TableBlock({
   projectRoot?: string;
   onOpenFile?: (reference: ProjectFileReference) => void;
 }) {
+  const styles = useStyles();
   const renderCell = (spans: InlineSpan[], key: string, header = false) => (
     <View key={key} style={[styles.tableCell, header && styles.tableHeaderCell]}>
       {hasMath(spans) ? (
@@ -318,12 +328,15 @@ function Spans({
   projectRoot?: string;
   onOpenFile?: (reference: ProjectFileReference) => void;
 }) {
+  const styles = useStyles();
+  const resolveReference = useContext(FileReferences);
   return (
     <>
       {spans.map((s, i) => {
         const reference =
-          projectRoot && onOpenFile && (s.href !== undefined || s.code === true)
-            ? resolveProjectFileReference(s.href ?? s.text, projectRoot, s.href !== undefined)
+          (projectRoot || resolveReference) && onOpenFile && (s.href !== undefined || s.code === true)
+            ? resolveReference ? resolveReference(s.href ?? s.text, s.href !== undefined)
+              : resolveProjectFileReference(s.href ?? s.text, projectRoot!, s.href !== undefined)
             : null;
         return (
           <Text
@@ -346,7 +359,7 @@ function Spans({
   );
 }
 
-const styles = StyleSheet.create({
+const useStyles = createThemedStyles((color) => StyleSheet.create({
   root: { gap: 6 },
   body: { color: color.text, fontSize: 15, lineHeight: 22 },
   bold: { fontWeight: "700" },
@@ -424,4 +437,4 @@ const styles = StyleSheet.create({
   tableHeaderCell: { minHeight: 40 },
   tableHeaderText: { color: color.text, fontSize: 12.5, lineHeight: 18, fontWeight: "700" },
   tableText: { color: color.textDim, fontSize: 12.5, lineHeight: 18 },
-});
+}));

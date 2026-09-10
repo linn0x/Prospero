@@ -1447,6 +1447,9 @@ export const AgentTextDeltaSchema = z.object({
   msgId: z.string(),
   textId: z.string(),
   delta: z.string(),
+  /** Codex item/completed is authoritative; replace previously streamed text when set. */
+  replace: z.boolean().optional(),
+  phase: z.enum(["commentary", "final_answer"]).optional(),
   agentId: z.string().min(1).max(500).optional(),
 });
 
@@ -1580,6 +1583,9 @@ export const AgentSubagentUpdatedSchema = z.object({
 export const AgentTurnEndSchema = z.object({
   kind: z.literal("turn.end"),
   msgId: z.string(),
+  /** Native turn identity and aggregate file changes, when supplied by the provider. */
+  turnId: z.string().optional(),
+  diffs: z.array(FileDiffSchema).optional(),
   finish: z.string().optional(),
   costUsd: z.number().optional(),
   inputTokens: z.number().int().nonnegative().optional(),

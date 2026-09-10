@@ -9,9 +9,12 @@ import { getWorkspaceSummary, type WorkspaceSummary } from "@/lib/workspace-summ
 import { useMobileTheme, type ThemePalette } from "@/lib/theme";
 
 /** Only mounted directory rows read metadata. Scans are cached and bounded on the daemon. */
-export function WorkspaceHeader({ hostId, path, sid, name, sessionCount, activity }: {
+export function WorkspaceHeader({ hostId, path, sid, name, sessionCount, activity, deviceLabel, deviceDetail, deviceOffline }: {
   hostId: string; path: string; sid?: string; name: string; sessionCount: number;
   activity?: { label: string; pending: boolean };
+  deviceLabel?: string;
+  deviceDetail?: string;
+  deviceOffline?: boolean;
 }) {
   const { palette } = useMobileTheme();
   const styles = useMemo(() => createStyles(palette), [palette]);
@@ -41,6 +44,8 @@ export function WorkspaceHeader({ hostId, path, sid, name, sessionCount, activit
     <View style={styles.copy}>
       <View style={styles.identity}>
         <Text style={styles.name} numberOfLines={1} testID="workspace-name">{name}</Text>
+        {deviceLabel && <Text style={[styles.device, deviceOffline && { color: palette.warn }]} numberOfLines={1} testID="workspace-device"
+          accessibilityLabel={deviceDetail ?? deviceLabel}>{deviceOffline ? "离线 · " : ""}{deviceLabel}</Text>}
         {summary?.branch && <View style={styles.gitMark} accessible accessibilityRole="image"
           accessibilityLabel={`Git 仓库${status === "connected" ? "" : "，上次读取"}`} testID="workspace-git-repository">
           <FontAwesome6 name="git-alt" size={14} color={palette.textDim} />
@@ -66,6 +71,8 @@ function createStyles(palette: ThemePalette) {
     row: { flexDirection: "row", alignItems: "center", gap: 8 },
     identity: { minWidth: 0, flexDirection: "row", alignItems: "center", gap: 6 },
     name: { color: palette.text, fontSize: 15, fontWeight: "700", flexShrink: 1 },
+    device: { color: palette.textDim, backgroundColor: palette.surfaceRaised, fontSize: 10,
+      maxWidth: "40%", flexShrink: 1, borderRadius: 4, paddingHorizontal: 5, paddingVertical: 2, overflow: "hidden" },
     gitMark: { width: 16, height: 16, alignItems: "center", justifyContent: "center", flexShrink: 0 },
     count: { color: palette.textFaint, fontSize: 10, fontVariant: ["tabular-nums"], flexShrink: 0 },
     countValue: { color: palette.textDim, fontSize: 12, fontWeight: "600" },

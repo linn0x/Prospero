@@ -37,6 +37,7 @@ export function installLiquidGlass(root: Document = document): () => void {
     const element = target as Element | null;
     if (typeof element?.closest !== 'function') return null;
     const match = element.closest<HTMLElement>('[data-liquid-glass]');
+    if (match?.getAttribute('data-liquid-glass') === 'tab' && match.closest('[data-liquid-glass-scope="plain"]')) return null;
     return match && 'style' in match && root.contains(match) ? match : null;
   };
 

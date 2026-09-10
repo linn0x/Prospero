@@ -10,7 +10,7 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Icon, type IconName } from "@/components/Icon";
-import { color, font, radius, space } from "@/lib/theme";
+import { radius, space, createThemedStyles, useMobileTheme, fontForPalette } from "@/lib/theme";
 
 /**
  * 底部弹层。
@@ -32,6 +32,9 @@ export function Sheet({
   onDismiss?: () => void;
   children: React.ReactNode;
 }) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
+  const font = fontForPalette(color);
   const insets = useSafeAreaInsets();
   const wasVisible = useRef(visible);
   const dismissCallback = useRef(onDismiss);
@@ -92,6 +95,7 @@ export function Sheet({
 
 /** 进度条。百分比用长度表达,比一串数字快得多 */
 export function Meter({ value, tint }: { value: number; tint: string }) {
+  const styles = useStyles();
   const pct = Math.max(0, Math.min(100, value));
   return (
     <View style={styles.meterTrack}>
@@ -104,6 +108,9 @@ export function Meter({ value, tint }: { value: number; tint: string }) {
 
 /** 键值行 */
 export function Row({ label, value }: { label: string; value: string }) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
+  const font = fontForPalette(color);
   return (
     <View style={styles.row}>
       <Text style={font.sub}>{label}</Text>
@@ -126,6 +133,8 @@ export function SheetAction({
   destructive?: boolean;
   onPress: () => void;
 }) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
   const tint = destructive ? color.danger : color.accent;
   return (
     <Pressable
@@ -147,7 +156,9 @@ export function SheetAction({
   );
 }
 
-const styles = StyleSheet.create({
+const useStyles = createThemedStyles((color) => {
+  const font = fontForPalette(color);
+  return StyleSheet.create({
   modalRoot: { flex: 1, justifyContent: "flex-end" },
   backdropLayer: { position: "absolute", inset: 0 },
   backdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.5)" },
@@ -210,4 +221,5 @@ const styles = StyleSheet.create({
   sheetActionCopy: { flex: 1, gap: 3 },
   sheetActionLabel: { color: color.text, fontSize: 15, fontWeight: "600" },
   sheetActionDetail: { ...font.meta, color: color.textDim, lineHeight: 16 },
+});
 });

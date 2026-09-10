@@ -1,10 +1,10 @@
 import { memo, useMemo, useState } from "react";
-import { StyleSheet, useColorScheme, View, useWindowDimensions } from "react-native";
+import { StyleSheet, View, useWindowDimensions } from "react-native";
 import { ConversationText as Text, useConversationFontScale } from "./ConversationTypography";
 import { WebView } from "react-native-webview";
 import type { InlineSpan } from "@/lib/markdown";
 import { mathMl } from "@/lib/math";
-import { color, paletteForScheme, type ThemePalette, type ThemeScheme } from "@/lib/theme";
+import { type ThemePalette, type ThemeScheme, createThemedStyles, useMobileTheme } from "@/lib/theme";
 
 type TextVariant = "body" | "heading" | "headingSmall" | "quote" | "table" | "tableHeader";
 
@@ -154,12 +154,12 @@ function AutoHeightMath({
   variant: TextVariant;
   fallback: string;
 }) {
+  const styles = useStyles();
   const readingScale = useConversationFontScale();
   const { fontScale } = useWindowDimensions();
   const scale = readingScale * fontScale;
   const lineHeight = variants[variant].lineHeight * scale;
-  const scheme: ThemeScheme = useColorScheme() === "light" ? "light" : "dark";
-  const palette = paletteForScheme(scheme);
+  const { scheme, palette } = useMobileTheme();
   const [height, setHeight] = useState(display ? 52 : lineHeight + 2);
   const [failed, setFailed] = useState(false);
   const html = useMemo(
@@ -238,7 +238,7 @@ export const MathSpans = memo(function MathSpans({
   );
 });
 
-const styles = StyleSheet.create({
+const useStyles = createThemedStyles((color) => StyleSheet.create({
   container: { width: "100%", overflow: "hidden", backgroundColor: "transparent" },
   webView: { flex: 1, backgroundColor: "transparent" },
   fallback: { color: color.text, fontSize: 15, lineHeight: 22 },
@@ -248,4 +248,4 @@ const styles = StyleSheet.create({
     backgroundColor: color.surfaceRaised,
     padding: 8,
   },
-});
+}));

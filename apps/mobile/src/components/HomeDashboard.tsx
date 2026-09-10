@@ -30,6 +30,7 @@ import { PromptDialog } from "@/components/PromptDialog";
 import { Sheet, SheetAction } from "@/components/Sheet";
 import { SwipeRow } from "@/components/SwipeRow";
 import { WorkspaceHeader } from "@/components/WorkspaceHeader";
+import { useOrderedWorkspaces } from "@/lib/workspace-order-preferences";
 import { WorkspaceDisclosure, WorkspaceFolderIcon, WorkspaceChevron } from "@/components/WorkspaceDisclosure";
 import type { StoredHost } from "@/lib/hosts";
 import { clampDetailPreviewPosition, homeDevicePreviewIndex, showsAddDevicePreview, type AddDeviceSide } from "@/lib/home-device-preview";
@@ -269,10 +270,11 @@ export function HomeDashboard({
   const [reduceMotion, setReduceMotion] = useState(false);
   // Fast Refresh 会保留旧版 Zustand 状态；标准化可补全后续新增的设置字段。
   const effectiveHomeSettings = normalizeHomeSettings(homeSettings ?? DEFAULT_HOME_SETTINGS);
-  const allProjects = useMemo(
+  const unorderedProjects = useMemo(
     () => homeWorkspaceProjects(selectedRuntime?.sessions),
     [selectedRuntime?.sessions],
   );
+  const allProjects = useOrderedWorkspaces(selectedHost?.id, unorderedProjects);
   const { projects, taskProjects } = useMemo(
     () => partitionHomeProjects(allProjects, managedWorkspacePaths),
     [allProjects, managedWorkspacePaths],
@@ -512,7 +514,7 @@ export function HomeDashboard({
           >
             <View style={styles.projectIcon}>
               <Animated.View style={projectHasLocatorMotion ? locatorWiggleStyle : styles.locatorRest}>
-                <WorkspaceFolderIcon progress={disclosureProgress} size={18} color={palette.accent} />
+                <WorkspaceFolderIcon expanded={expanded} size={18} color={palette.accent} />
               </Animated.View>
             </View>
             <WorkspaceHeader hostId={selectedHost.id} path={project.path} sid={project.sessions[0]?.id}

@@ -29,8 +29,9 @@ describe("home preferences", () => {
   });
 
   it("fills theme and alias fields when upgrading an old settings snapshot", async () => {
-    const { normalizeHomeSettings } = await import("../src/lib/home-preferences");
+    const { normalizeHomeSettings, DEFAULT_HOME_SETTINGS } = await import("../src/lib/home-preferences");
     expect(normalizeHomeSettings({ recentSessionLimit: 8 })).toEqual({
+      ...DEFAULT_HOME_SETTINGS,
       recentSessionLimit: 8,
       deviceSwitcherHapticsEnabled: true,
       backgroundProgressEnabled: true,
@@ -39,6 +40,23 @@ describe("home preferences", () => {
       conversationFontSize: 15,
       workspaceAliases: {},
     });
+  });
+
+  it("persists custom replies and compact mode across reloads, including intentionally empty groups", async () => {
+    const { normalizeHomeSettings, rememberHomeSettings, getHomeSettings } = await import("../src/lib/home-preferences");
+    let raw: string | null = null;
+    vi.mocked(AsyncStorage.setItem).mockImplementation(async (_key, value) => { raw = value; });
+    vi.mocked(AsyncStorage.getItem).mockImplementation(async () => raw);
+    const settings = normalizeHomeSettings({ sessionActionsHidden: true, quickReplies: { idle: ["  检查日志  ", "检查日志", "完成后总结"], busy: [] } });
+    await rememberHomeSettings(settings, true);
+    await expect(getHomeSettings()).resolves.toMatchObject({ sessionActionsHidden: true, quickReplies: { idle: ["检查日志", "完成后总结"], busy: [] } });
+  });
+
+  it("reports explicit save failures and allows the next save to succeed", async () => {
+    const { DEFAULT_HOME_SETTINGS, rememberHomeSettings } = await import("../src/lib/home-preferences");
+    vi.mocked(AsyncStorage.setItem).mockRejectedValueOnce(new Error("disk full")).mockResolvedValueOnce();
+    await expect(rememberHomeSettings(DEFAULT_HOME_SETTINGS, true)).rejects.toThrow("disk full");
+    await expect(rememberHomeSettings(DEFAULT_HOME_SETTINGS, true)).resolves.toBeUndefined();
   });
 
   it("normalizes workspace keys and removes unsafe aliases", async () => {

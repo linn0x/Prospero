@@ -64,6 +64,7 @@ interface AppState {
   ): void;
   setSessions(hostId: string, sessions: SessionInfo[]): void;
   upsertSession(hostId: string, session: SessionInfo): void;
+  removeSession(hostId: string, sid: string): void;
   queueSessionUpdate(hostId: string, session: SessionInfo): void;
 }
 
@@ -111,6 +112,16 @@ export const useApp = create<AppState>()((set, get) => ({
           },
         },
       };
+    });
+  },
+  removeSession: (hostId, sid) => {
+    pendingSessionUpdates.delete(`${hostId}\u0000${sid}`);
+    set((s) => {
+      const runtime = s.runtimes[hostId];
+      if (!runtime?.sessions[sid]) return s;
+      const sessions = { ...runtime.sessions };
+      delete sessions[sid];
+      return { runtimes: { ...s.runtimes, [hostId]: { ...runtime, sessions } } };
     });
   },
   queueSessionUpdate: (hostId, session) => {

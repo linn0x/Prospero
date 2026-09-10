@@ -40,6 +40,19 @@ function memoryStorage(initial?: string) {
   };
 }
 
+it("uses authoritative Codex text consistently in live updates and history replay", () => {
+  const events: JsonObject[] = [
+    { kind: "text.delta", msgId: "answer", textId: "answer", delta: "draft" },
+    { kind: "text.delta", msgId: "answer", textId: "answer", delta: "corrected", replace: true, phase: "final_answer" },
+    { kind: "text.delta", msgId: "answer", textId: "answer", delta: " result" },
+  ];
+  const accumulator = new ChatEventAccumulator();
+  accumulator.reset(events.slice(0, 1));
+  const snapshot = accumulator.append(events.slice(1));
+  expect(snapshot?.items[0]?.event).toMatchObject({ text: "corrected result", phase: "final_answer" });
+  expect(collapseChatEventHistory(events)[0]).toMatchObject({ text: "corrected result", phase: "final_answer" });
+});
+
 describe("Electron chat drafts", () => {
   it("normalizes corrupt, duplicate, oversized, and excessive entries", () => {
     const entries = Array.from({ length: MAX_CHAT_DRAFTS + 5 }, (_, index) => ({

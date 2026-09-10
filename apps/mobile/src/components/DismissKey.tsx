@@ -1,6 +1,6 @@
 import { Keyboard, Platform, Pressable, StyleSheet, View } from "react-native";
 import { Icon } from "@/components/Icon";
-import { color, radius, space } from "@/lib/theme";
+import { radius, space, createThemedStyles, useMobileTheme } from "@/lib/theme";
 
 /**
  * 收起键盘。
@@ -13,6 +13,8 @@ import { color, radius, space } from "@/lib/theme";
  * 只在输入框有焦点时给出来:没在打字的时候,它只是个碍眼的按钮。
  */
 export function DismissKey({ visible, floating = false }: { visible: boolean; floating?: boolean }) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
   // Android's system navigation already exposes an IME-dismiss affordance.
   if (!visible || Platform.OS === "android") return null;
   const button = (
@@ -31,7 +33,7 @@ export function DismissKey({ visible, floating = false }: { visible: boolean; fl
   return floating ? <View style={styles.floating}>{button}</View> : button;
 }
 
-const styles = StyleSheet.create({
+const useStyles = createThemedStyles((color) => StyleSheet.create({
   btn: {
     width: 40,
     height: 40,
@@ -53,4 +55,4 @@ const styles = StyleSheet.create({
     shadowRadius: 8,
     shadowOffset: { width: 0, height: 2 },
   },
-});
+}));

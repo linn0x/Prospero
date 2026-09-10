@@ -1,10 +1,9 @@
-import { useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import * as Clipboard from "expo-clipboard";
 import * as Haptics from "expo-haptics";
 import { toast } from "@/components/Toast";
 import { deliveryFailureText, type DeliveryResult } from "@/lib/outbound-queue";
-import { ctrlCode } from "@/lib/keys";
+import type { TerminalModifiers } from "@/lib/keys";
 import { MIN_TOUCH_TARGET, type TerminalFontPreference } from "@/lib/terminal-font-size";
 
 interface KeyDef {
@@ -29,6 +28,8 @@ const KEYS: KeyDef[] = [
   { label: "←", seq: "\x1b[D" },
   { label: "→", seq: "\x1b[C" },
   { label: "⏎", seq: "\r" },
+  { label: "⌫", seq: "\x7f" },
+  { label: "Del", seq: "\x1b[3~" },
   { label: "Home", seq: "\x1b[H" },
   { label: "End", seq: "\x1b[F" },
   { label: "PgUp", seq: "\x1b[5~" },
@@ -55,6 +56,9 @@ const CTRL_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("");
 
 export function KeyBar({
   onKey,
+  onPaste,
+  modifiers,
+  onToggleModifier,
   onFontSize,
   onResetFontSize,
   fontSizeMode = "system",
@@ -65,6 +69,9 @@ export function KeyBar({
   onRetry,
 }: {
   onKey: (seq: string) => DeliveryResult;
+  onPaste: (text: string) => DeliveryResult;
+  modifiers: TerminalModifiers;
+  onToggleModifier: (key: keyof TerminalModifiers) => void;
   onFontSize?: (delta: number) => void;
   /** 清除自定义档位，回到当前系统 Dynamic Type。 */
   onResetFontSize?: () => void;
@@ -76,7 +83,7 @@ export function KeyBar({
   disabledMessage?: string;
   onRetry?: () => void;
 }) {
-  const [ctrl, setCtrl] = useState(false);
+  const { ctrl, option } = modifiers;
 
   const send = (seq: string): void => {
     const result = onKey(seq);
@@ -95,7 +102,7 @@ export function KeyBar({
     }
     // PTY 对大块粘贴有死锁报告,daemon 侧已分片写入;这里只管发。
     // 输入在断线期间绝不排队，重连后执行旧 shell 字节比丢弃更危险。
-    const result = onKey(text);
+    const result = onPaste(text);
     if (!result.accepted) {
       toast(deliveryFailureText(result));
       return;
@@ -125,9 +132,9 @@ export function KeyBar({
           )}
         </View>
       )}
-      {enabled && ctrl && (
+      {enabled && (ctrl || option) && (
         <View style={styles.ctrlTray}>
-          <Text style={styles.ctrlLabel}>Ctrl +</Text>
+          <Text style={styles.ctrlLabel}>{[ctrl && "Ctrl", option && "Opt"].filter(Boolean).join(" + ")} +</Text>
           <ScrollView
             horizontal
             keyboardShouldPersistTaps="always"
@@ -138,12 +145,11 @@ export function KeyBar({
               <Pressable
                 key={letter}
                 onPress={() => {
-                  send(ctrlCode(letter));
-                  setCtrl(false);
+                  send(option ? letter.toLowerCase() : letter);
                 }}
                 style={({ pressed }) => [styles.ctrlKey, pressed && styles.keyPressed]}
                 accessibilityRole="keyboardkey"
-                accessibilityLabel={`Control ${letter}`}
+                accessibilityLabel={`${ctrl ? "Control " : ""}${option ? "Option " : ""}${letter}`}
               >
                 <Text style={styles.ctrlKeyText}>{letter}</Text>
               </Pressable>
@@ -159,7 +165,7 @@ export function KeyBar({
       >
         <Pressable
           onPress={() => {
-            setCtrl((v) => !v);
+            onToggleModifier("ctrl");
             void Haptics.selectionAsync();
           }}
           disabled={!enabled}
@@ -177,21 +183,13 @@ export function KeyBar({
           <Text style={[styles.keyText, ctrl && styles.keyTextOn]}>Ctrl</Text>
         </Pressable>
 
-        {CTRL_SHORTCUTS.map((k) => (
-          <Pressable
-            key={k.label}
-            onPress={() => {
-              send(k.seq);
-              setCtrl(false);
-            }}
-            disabled={!enabled}
-            style={({ pressed }) => [styles.key, !enabled && styles.keyDisabled, pressed && styles.keyPressed]}
-            accessibilityRole="keyboardkey"
-            accessibilityLabel={k.label}
-          >
-            <Text style={styles.keyText}>{k.label}</Text>
-          </Pressable>
-        ))}
+        <Pressable onPress={() => { onToggleModifier("option"); void Haptics.selectionAsync(); }}
+          disabled={!enabled} accessibilityRole="button" accessibilityLabel="Option / Alt 组合键"
+          accessibilityHint="点选后搭配下一个按键；Option 加左右方向键按词移动"
+          accessibilityState={{ selected: option, disabled: !enabled }}
+          style={({ pressed }) => [styles.key, styles.modifier, option && styles.modifierOn, !enabled && styles.keyDisabled, pressed && styles.keyPressed]}>
+          <Text style={[styles.keyText, option && styles.keyTextOn]}>Opt ⌥</Text>
+        </Pressable>
 
         <View style={styles.sep} />
 
@@ -204,6 +202,20 @@ export function KeyBar({
             accessibilityRole="keyboardkey"
             accessibilityLabel={k.label}
           >
+            <Text style={styles.keyText}>{k.label}</Text>
+          </Pressable>
+        ))}
+
+      </ScrollView>
+      <ScrollView horizontal keyboardShouldPersistTaps="always" showsHorizontalScrollIndicator={false}
+        contentContainerStyle={styles.content}>
+        {CTRL_SHORTCUTS.map((k) => (
+          <Pressable key={k.label} onPress={() => {
+            const result = onPaste(k.seq);
+            if (!result.accepted) toast(deliveryFailureText(result));
+            else void Haptics.selectionAsync();
+          }} disabled={!enabled} accessibilityRole="keyboardkey" accessibilityLabel={k.label}
+            style={({ pressed }) => [styles.key, !enabled && styles.keyDisabled, pressed && styles.keyPressed]}>
             <Text style={styles.keyText}>{k.label}</Text>
           </Pressable>
         ))}

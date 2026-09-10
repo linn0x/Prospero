@@ -18,7 +18,7 @@ export function SettingsNav({ active, onChange }: { active: SettingsCategory; on
   return <nav className="settings-nav" aria-label={t("设置分类", "Settings categories")}>
     <div role="tablist" aria-orientation={horizontal ? "horizontal" : "vertical"} aria-label={t("设置分类", "Settings categories")}>
       {settingsCategories.map((category) => {
-        return <button key={category.id} type="button" id={`settings-tab-${category.id}`} role="tab" aria-selected={active === category.id} aria-controls={`settings-panel-${category.id}`} tabIndex={active === category.id ? 0 : -1} onClick={() => onChange(category.id)} onKeyDown={(event) => {
+        return <button key={category.id} type="button" data-liquid-glass="tab" id={`settings-tab-${category.id}`} role="tab" aria-selected={active === category.id} aria-controls={`settings-panel-${category.id}`} tabIndex={active === category.id ? 0 : -1} onClick={() => onChange(category.id)} onKeyDown={(event) => {
           const next = nextSettingsCategory(category.id, event.key);
           if (!next) return;
           event.preventDefault();
