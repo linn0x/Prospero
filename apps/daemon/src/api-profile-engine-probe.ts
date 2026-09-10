@@ -287,7 +287,7 @@ async function gateway(ctx: RunContext): Promise<{ baseUrl: string; token: strin
         ctx.checks.configuration = "passed";
         const result = await (ctx.options.fetch ?? globalThis.fetch)(upstream, {
           method: "POST", body: JSON.stringify(body), redirect: "error", signal: ctx.signal,
-          headers: { "content-type": "application/json", accept: "text/event-stream", ...(ctx.protocol === "anthropic" ? { "x-api-key": key, "anthropic-version": "2023-06-01", ...(typeof request.headers["anthropic-beta"] === "string" ? { "anthropic-beta": request.headers["anthropic-beta"] } : {}) } : { authorization: `Bearer ${key}` }) },
+          headers: { ...profile.headers, "content-type": "application/json", accept: "text/event-stream", ...(ctx.protocol === "anthropic" ? { "x-api-key": key, "anthropic-version": "2023-06-01", ...(typeof request.headers["anthropic-beta"] === "string" ? { "anthropic-beta": request.headers["anthropic-beta"] } : {}) } : { authorization: `Bearer ${key}` }) },
         });
         if (!result.ok) { void result.body?.cancel(); fail(result.status === 401 || result.status === 403 ? "authentication_failed" : result.status === 429 ? "rate_limited" : result.status === 404 ? "endpoint_or_model_not_found" : "upstream_error", "上游拒绝了引擎测试请求；没有自动重试。"); }
         if (!result.body || !result.headers.get("content-type")?.includes("text/event-stream")) fail("invalid_stream", "上游没有返回流式响应。");

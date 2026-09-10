@@ -6,6 +6,17 @@ const input = { protocol: "openai_responses" as const, baseUrl: "https://models.
 const response = (body: unknown): Response => new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } });
 
 describe("API profile model catalogs", () => {
+  it.each(["openai_responses", "openai_chat_completions", "anthropic"] as const)("sends custom headers for %s catalog requests", async protocol => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(response({ data: [{ id: "example-model" }] }));
+    await fetchApiModels({ ...input, protocol, headers: { "x-client-name": "example-client" } }, { fetch: fetcher });
+    expect(fetcher.mock.calls[0]?.[1]?.headers).toMatchObject({ "x-client-name": "example-client" });
+  });
+
+  it.each([{ "x-client-name": "bad\r\nInjected: value" }, { Authorization: "override" }, { Host: "elsewhere.invalid" }])("rejects invalid custom headers before sending a request", async headers => {
+    const fetcher = vi.fn<typeof fetch>();
+    await expect(fetchApiModels({ ...input, headers }, { fetch: fetcher })).rejects.toThrow();
+    expect(fetcher).not.toHaveBeenCalled();
+  });
   it.each([
     ["https://models.example", "openai_responses", "https://models.example/v1/models"],
     ["https://models.example/proxy/v1/responses", "openai_responses", "https://models.example/proxy/v1/models"],

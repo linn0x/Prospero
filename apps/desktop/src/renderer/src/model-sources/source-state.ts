@@ -1,8 +1,21 @@
 import type { AgentApiCatalogModel, ModelSource, ModelSourceRoute, ModelSourceAction } from "../../../shared/types";
+import { ApiHeadersSchema } from "@prospero/protocol";
 import type { AgentModelCapabilities, AgentReasoningEffort } from "@prospero/protocol";
 import { accountReasoningEfforts, modelCapabilityDraft, parseModelCapabilities, type ModelCapabilityDraft } from "../account-profile-form";
 
 export type SourceSelection = { sourceId: string; routeId: string; revision: number };
+
+export function parseSourceHeaders(value: string): Record<string, string> {
+  const entries = value.split(/\r?\n/).filter(line => line.trim()).map(line => {
+    const colon = line.indexOf(":");
+    if (colon < 1) throw new Error("每行使用 Header: Value / Use Header: Value on each line");
+    return [line.slice(0, colon).trim(), line.slice(colon + 1).trim()] as const;
+  });
+  if (new Set(entries.map(([name]) => name.toLowerCase())).size !== entries.length) throw new Error("Header 名称不能重复 / Duplicate header names");
+  const parsed = ApiHeadersSchema.safeParse(Object.fromEntries(entries));
+  if (!parsed.success) throw new Error("Header 格式无效或包含保留字段；认证请使用 API Key / Invalid or reserved headers; use API Key for authentication");
+  return parsed.data;
+}
 
 export function selectedSourceRoute(sources: readonly ModelSource[], selection: SourceSelection | undefined) {
   const source = sources.find(item => item.id === selection?.sourceId);
@@ -42,7 +55,7 @@ export function retainSourceRouteDrafts(previous: ModelSource["endpoints"], next
   return drafts.filter(draft => {
     const before = previous.find(endpoint => endpoint.protocol === draft.protocol);
     const after = next.find(endpoint => endpoint.protocol === draft.protocol);
-    return before && after && normalize(before.baseUrl) === normalize(after.baseUrl);
+    return before && after && normalize(before.baseUrl) === normalize(after.baseUrl) && JSON.stringify(before.headers ?? {}) === JSON.stringify(after.headers ?? {});
   });
 }
 export function sourceDraftRoutes(drafts: readonly SourceRouteDraft[]): NonNullable<Extract<ModelSourceAction, { kind: "create" }>["routes"]> {

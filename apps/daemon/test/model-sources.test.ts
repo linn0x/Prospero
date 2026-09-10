@@ -22,6 +22,46 @@ async function sourceWithRoutes(act: (action: ModelSourceAction) => ReturnType<A
 }
 
 describe("shared model sources", () => {
+  it.each(["anthropic", "openai_chat_completions"] as const)("passes source headers to the %s engine", async protocol => {
+    const { home, accounts, act } = fixture();
+    const headers = { "x-client-name": "example-client" };
+    const source = (await act({ kind: "create", name: "Engine headers", endpoints: [{ protocol, baseUrl: "https://models.invalid", headers }], credential: { name: "Key", apiKey: "fixture-key" }, routes: [{ name: "Model", model: "model", protocol, enabled: true }] })).sources![0]!;
+    const accountId = (await act({ kind: "bind", sourceId: source.id, revision: source.revision, routeId: source.routes[0]!.id })).accountId!;
+    const binding = accounts.resolve(accountId);
+    if (protocol === "anthropic") expect(binding.environment.ANTHROPIC_CUSTOM_HEADERS).toBe("x-client-name: example-client");
+    else {
+      const config = JSON.parse(readFileSync(path.join(home, "agent-accounts", "codex", accountId, "xdg-config", "opencode", "opencode.json"), "utf8"));
+      expect(config.provider.prospero.options.headers).toEqual(headers);
+    }
+  });
+  it("preserves headers across restarts and freezes them in existing session bindings", async () => {
+    const { home, accounts, act } = fixture();
+    let source = await sourceWithRoutes(act);
+    source = (await act({ kind: "update", sourceId: source.id, revision: source.revision, endpoints: source.endpoints.map(endpoint => ({ ...endpoint, headers: { "x-client-name": "first" } })) })).sources![0]!;
+    const accountId = (await act({ kind: "bind", sourceId: source.id, revision: source.revision, routeId: source.routes[0]!.id })).accountId!;
+    await act({ kind: "update", sourceId: source.id, revision: source.revision, endpoints: source.endpoints.map(endpoint => ({ ...endpoint, headers: { "x-client-name": "second" } })) });
+    const restarted = new AgentAccountManager(home, async () => ({ stdout: "", stderr: "", exitCode: 0 }), new LocalFileCredentialStore(null));
+    const binding = restarted.resolve(accountId);
+    expect(binding.apiProfile?.headers).toEqual({ "x-client-name": "first" });
+    expect(binding.environment.PROSPERO_API_HEADER_0).toBe("first");
+    expect(binding.codexAppServerArgs).toContain('model_providers.prospero.env_http_headers."x-client-name"="PROSPERO_API_HEADER_0"');
+    expect((await accounts.modelSourceAction({ kind: "list" })).sources![0]!.endpoints[0]!.headers).toEqual({ "x-client-name": "second" });
+  });
+
+  it("invalidates model catalogs when endpoint headers change", async () => {
+    const { home } = fixture();
+    const fetchModels = vi.fn().mockResolvedValue([{ id: "example-model" }]);
+    const registry = new ModelSources(home, (protocol, baseUrl, model) => ({ provider: "openai_compatible", protocol, baseUrl, model }), { fetchModels });
+    let source = registry.create({ kind: "create", name: "Headers", endpoints: [{ protocol: "openai_responses", baseUrl: "https://catalog.invalid", headers: { "x-client-name": "first" } }], credential: { name: "Key", apiKey: "fixture-key" } });
+    const request = () => registry.models({ kind: "models", sourceId: source.id, revision: source.revision, protocol: "openai_responses", credentialId: source.credentials[0]!.id });
+    await request(); await request();
+    expect(fetchModels).toHaveBeenCalledTimes(1);
+    registry.change({ kind: "update", sourceId: source.id, revision: source.revision, endpoints: source.endpoints.map(endpoint => ({ ...endpoint, headers: { "x-client-name": "second" } })) }, new Set());
+    source = registry.source(source.id);
+    await request();
+    expect(fetchModels).toHaveBeenCalledTimes(2);
+    expect(fetchModels.mock.calls[1]![0].headers).toEqual({ "x-client-name": "second" });
+  });
   it.each(["corrupt", "missing"])("isolates %s registry storage from independent profiles while source bindings fail closed", async damage => {
     const { home, accounts, act } = fixture();
     const independent = await accounts.createApi("codex", "Independent", { baseUrl: "https://independent.invalid/v1", model: "independent", apiKey: "synthetic-independent" });

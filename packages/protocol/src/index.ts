@@ -203,5 +203,5 @@ export type {
   S2COrchestrationSnapshot,
   S2CConnectionPong,
 } from "./schemas.js";
-export { ModelSourceSchema, ModelSourceEndpointSchema, ModelSourceRouteSchema, ModelSourceBindingSchema, ModelSourceActionSchema, ModelSourceMigrationSchema, C2SModelSourceActionSchema, S2CModelSourceResultSchema } from "./schemas.js";
+export { ApiHeadersSchema, ModelSourceSchema, ModelSourceEndpointSchema, ModelSourceRouteSchema, ModelSourceBindingSchema, ModelSourceActionSchema, ModelSourceMigrationSchema, C2SModelSourceActionSchema, S2CModelSourceResultSchema } from "./schemas.js";
 export type { ModelSource, ModelSourceRoute, ModelSourceBinding, ModelSourceAction, ModelSourceMigration, C2SModelSourceAction, S2CModelSourceResult } from "./schemas.js";

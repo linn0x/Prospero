@@ -94,12 +94,18 @@ export const AgentApiValidationSchema = z.object({
   { message: "passed validation requires all checks to pass" });
 
 /** 只同步可展示的连接元数据；API Key 永远不进入协议快照。 */
+export const ApiHeadersSchema = z.record(z.string().regex(/^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,100}$/), z.string().max(8192).regex(/^[\x20-\x7e]*$/))
+  .refine(headers => Object.keys(headers).length <= 32, "最多配置 32 个 Header / At most 32 headers")
+  .refine(headers => new Set(Object.keys(headers).map(name => name.toLowerCase())).size === Object.keys(headers).length, "Header 名称不能重复 / Duplicate header names")
+  .refine(headers => !Object.keys(headers).some(name => ["authorization", "x-api-key", "host", "content-length", "transfer-encoding", "connection", "upgrade", "expect", "trailer", "te", "proxy-authorization", "proxy-connection"].includes(name.toLowerCase())), "认证头请使用 API Key，不能覆盖传输头 / Use API Key for authentication; transport headers cannot be overridden");
+
 export const AgentApiProfileSchema = z.object({
   provider: AgentApiProviderSchema,
   protocol: AgentApiProtocolSchema.optional(),
   baseUrl: z.string().url().max(2000),
   model: z.string().min(1).max(300),
   modelCapabilities: AgentModelCapabilitiesSchema.optional(),
+  headers: ApiHeadersSchema.optional(),
 });
 
 export const AgentAccountStatusSchema = z.enum([
@@ -490,6 +496,7 @@ export const C2SAgentAccountApiModelsGetSchema = z.object({
   protocol: AgentApiProtocolSchema.optional(),
   baseUrl: z.string().trim().url().max(2000).optional(),
   apiKey: z.string().trim().min(1).max(8192).optional(),
+  headers: ApiHeadersSchema.optional(),
 }).strict();
 
 export const C2SAgentAccountConfigGetSchema = z.object({
@@ -561,7 +568,7 @@ export const S2CAgentAccountConfigResultSchema = z.object({
 const modelSourceId = z.string().regex(/^[A-Za-z0-9-]{1,100}$/);
 const modelSourceName = z.string().trim().min(1).max(80).regex(/^[^\u0000-\u001f\u007f]+$/);
 const modelSourceRevision = z.number().int().positive();
-export const ModelSourceEndpointSchema = z.object({ protocol: AgentApiProtocolSchema, baseUrl: z.string().trim().url().max(2000) }).strict();
+export const ModelSourceEndpointSchema = z.object({ protocol: AgentApiProtocolSchema, baseUrl: z.string().trim().url().max(2000), headers: ApiHeadersSchema.optional() }).strict();
 export const ModelSourceRouteSchema = z.object({
   id: modelSourceId,
   name: modelSourceName,

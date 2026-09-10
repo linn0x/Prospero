@@ -137,9 +137,10 @@ function pendingResponse(signal: AbortSignal): Promise<Response> {
 describe("isolated engine probe safety boundaries with fake runtime and upstream", () => {
   it("completes one synthetic tool roundtrip with bounded output and isolates credentials, environment and files", async () => {
     const fixture = harness();
-    const result = await probeApiProfileEngine(binding, fixture.options);
+    const result = await probeApiProfileEngine({ ...binding, apiProfile: { ...binding.apiProfile!, headers: { "x-client-name": "example-client" } } }, fixture.options);
     expect(result).toMatchObject({ status: "passed", cliVersion: "1.2.3", checks: { runtime: "passed", configuration: "passed", streaming: "passed", tools: "passed" } });
     expect(fixture.upstream).toHaveBeenCalledTimes(2);
+    expect(fixture.upstream.mock.calls.every(([, init]) => new Headers(init?.headers).get("x-client-name") === "example-client")).toBe(true);
     expect(fixture.requests.every((body) => body.max_output_tokens === 512)).toBe(true);
     expect(fixture.toolResults).toBe(1);
     expect(fixture.children[1]?.killed).toBe(true);

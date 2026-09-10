@@ -14,8 +14,8 @@ import { catalogRouteDraft, type SourceRouteDraft } from "./source-state";
 
 const routeKey = (route: Pick<SourceRouteDraft, "model" | "protocol">) => JSON.stringify([route.protocol, route.model]);
 
-export function SourceOnboardingModels({ endpoints, apiKey, value, onChange, onBusy }: {
-  endpoints: ModelSource["endpoints"]; apiKey: string; value: SourceRouteDraft[]; onChange: (value: SourceRouteDraft[]) => void; onBusy: (busy: boolean) => void;
+export function SourceOnboardingModels({ endpoints, disabled = false, apiKey, value, onChange, onBusy }: {
+  endpoints: ModelSource["endpoints"]; disabled?: boolean; apiKey: string; value: SourceRouteDraft[]; onChange: (value: SourceRouteDraft[]) => void; onBusy: (busy: boolean) => void;
 }) {
   const { t } = useLocale();
   const [protocol, setProtocol] = useState(endpoints[0]!.protocol);
@@ -29,7 +29,8 @@ export function SourceOnboardingModels({ endpoints, apiKey, value, onChange, onB
   const [manual, setManual] = useState("");
   const [editing, setEditing] = useState("");
   const [requests] = useState(() => new AccountRequestGate());
-  const identity = useMemo(() => ({}), [endpoints, apiKey, selectedProtocol]);
+  const connectionKey = JSON.stringify(endpoints);
+  const identity = useMemo(() => ({}), [connectionKey, apiKey, selectedProtocol, disabled]);
   const current = useRef(identity);
   current.current = identity;
   useLayoutEffect(() => {
@@ -37,12 +38,12 @@ export function SourceOnboardingModels({ endpoints, apiKey, value, onChange, onB
     return () => { requests.invalidate(); };
   }, [identity, requests, onBusy]);
   const load = async () => {
-    if (!endpoint.baseUrl.trim() || !apiKey.trim()) return;
+    if (disabled || !endpoint.baseUrl.trim() || !apiKey.trim()) return;
     const token = requests.begin();
     if (token === undefined) return;
     setBusy(true); onBusy(true); setError("");
     try {
-      const result = await window.prospero.getAccountModels({ protocol: selectedProtocol, baseUrl: endpoint.baseUrl.trim(), apiKey });
+      const result = await window.prospero.getAccountModels({ protocol: selectedProtocol, baseUrl: endpoint.baseUrl.trim(), apiKey, ...(endpoint.headers ? { headers: endpoint.headers } : {}) });
       if (!requests.current(token) || current.current !== identity) return;
       if (!result.ok) { setError(featureErrorText(result.error, t)); return; }
       setModels(result.models); setLoaded(true);
@@ -64,7 +65,7 @@ export function SourceOnboardingModels({ endpoints, apiKey, value, onChange, onB
     <div className="model-source-subheading"><h4>{t("连接并选择模型", "Connect and choose models")}</h4><span className="model-source-hint">{t(`已选 ${value.length} / 100`, `Selected ${value.length} / 100`)}</span></div>
     <div className="model-source-catalog-controls">
       {endpoints.length > 1 && <NativeSelect aria-label={t("读取模型的协议", "Model discovery protocol")} value={selectedProtocol} disabled={busy} onChange={event => setProtocol(event.target.value as typeof protocol)}>{endpoints.map(item => <NativeSelectOption key={item.protocol} value={item.protocol}>{accountApiProtocolLabel(item.protocol)}</NativeSelectOption>)}</NativeSelect>}
-      <Button type="button" variant="outline" disabled={busy || !apiKey.trim() || !endpoint.baseUrl.trim()} onClick={() => void load()}>{busy && <Spinner />}{busy ? t("正在读取模型…", "Loading models…") : loaded ? t("刷新模型目录", "Refresh models") : t("连接并加载模型", "Connect and load models")}</Button>
+      <Button type="button" variant="outline" disabled={disabled || busy || !apiKey.trim() || !endpoint.baseUrl.trim()} onClick={() => void load()}>{busy && <Spinner />}{busy ? t("正在读取模型…", "Loading models…") : loaded ? t("刷新模型目录", "Refresh models") : t("连接并加载模型", "Connect and load models")}</Button>
     </div>
     <p className="model-source-hint">{t("只读取目录，不发送推理请求。自动填入上游明确返回的参数；未知项可手动补充，目录不可用也可手动接入。", "Only reads the catalog, without inference requests. Reported parameters are filled in; unknown values and models can be entered manually.")}</p>
     {error && <p className="model-source-error" role="alert">{error}</p>}

@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import type { ModelSource } from "../src/shared/types";
 import { modelSourceRequest, modelSourceResult } from "../src/shared/model-sources";
-import { catalogRouteDraft, catalogRouteUpdates, defaultSourceSelection, hasPartialCatalogLimits, retainSourceRouteDrafts, selectedSourceRoute, sourceDraftRoutes, sourceRouteAgent } from "../src/renderer/src/model-sources/source-state";
+import { parseSourceHeaders, catalogRouteDraft, catalogRouteUpdates, defaultSourceSelection, hasPartialCatalogLimits, retainSourceRouteDrafts, selectedSourceRoute, sourceDraftRoutes, sourceRouteAgent } from "../src/renderer/src/model-sources/source-state";
 import { SourceSelector } from "../src/renderer/src/model-sources/SourceSelector";
 import { SourceOnboardingModels } from "../src/renderer/src/model-sources/SourceOnboardingModels";
 import { accountApiConnectionLocked } from "../src/renderer/src/account-profile-form";
@@ -13,6 +13,16 @@ vi.mock("../src/renderer/src/locale", () => ({ useLocale: () => ({ t: (_zh: stri
 const source: ModelSource = { id: "source", name: "Shared models", revision: 2, enabled: true, endpoints: [{ protocol: "openai_responses", baseUrl: "https://models.invalid/v1" }], credentials: [{ id: "credential", name: "Shared key", revision: 1 }], routes: [{ id: "route-a", name: "Model A", model: "model-a", protocol: "openai_responses", credentialId: "credential", enabled: true }, { id: "route-b", name: "Model B", model: "model-b", protocol: "openai_responses", credentialId: "credential", enabled: true }], defaultRouteId: "route-b", createdAt: 1, updatedAt: 1 };
 
 describe("model source selection and IPC", () => {
+  it("parses custom header lines and keeps them in source IPC", () => {
+    const headers = parseSourceHeaders("x-client-name: example-client\nX-Route: tenant:one\n");
+    expect(headers).toEqual({ "x-client-name": "example-client", "X-Route": "tenant:one" });
+    expect(parseSourceHeaders("")).toEqual({});
+    expect(modelSourceRequest({ kind: "update", sourceId: source.id, revision: source.revision, endpoints: source.endpoints.map(endpoint => ({ ...endpoint, headers })) }, "headers").action).toMatchObject({ endpoints: [{ headers }] });
+  });
+
+  it.each(["x-client-name: one\nX-Client-Name: two", "x-client-name", "Host: elsewhere.invalid", "Authorization: secret", "x-client-name: bad\0value"])("rejects invalid header input", value => {
+    expect(() => parseSourceHeaders(value)).toThrow();
+  });
   it.each([{ contextWindow: 128000 }, { maxOutputTokens: 16000 }])("omits an incomplete Chat Completions limit pair without blocking the batch or inventing values: %j", limits => {
     const models = [{ id: "partial", modelCapabilities: { ...limits, tools: true } }, { id: "complete", modelCapabilities: { contextWindow: 128000, maxOutputTokens: 16000 } }];
     const updates = catalogRouteUpdates(source, "openai_chat_completions", "credential", models, new Set(models.map(model => model.id)));
