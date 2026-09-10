@@ -3,6 +3,7 @@
  * --dev 模式额外提供浏览器调试页(仅 loopback 可用明文协议)。
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { forwardModelApi } from "./api-profile-transport.js";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync, realpathSync, watch } from "node:fs";
 import { createRequire } from "node:module";
@@ -338,6 +339,7 @@ export async function createDaemonServer(
   // package bin 指向同一文件。每个 agent 的 PATH 都优先找到它。
   const cliBinDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "bin");
   let accountSessionsRestored = false;
+  let modelApiBaseUrl: string | undefined;
   const accounts: AgentAccountManager = new AgentAccountManager(opts.home, opts.accountRunner, undefined, {
     accountInUse: (accountId) => manager.accountInUse(accountId),
   });
@@ -383,7 +385,7 @@ export async function createDaemonServer(
       PROSPERO_CONTROL_TOKEN_PATH: controlTokenPath,
       PATH: [cliBinDir, process.env["PATH"] ?? ""].filter((part) => part !== "").join(path.delimiter),
     }),
-    accountResolver: (accountId, agent) => accounts.resolveForSession(accountId, agent),
+    accountResolver: (accountId, agent) => accounts.resolveForSession(accountId, agent, modelApiBaseUrl),
     accountCapabilitiesResolver: (accountId, agent) => accounts.capabilitiesFor(accountId, agent),
   });
   const orchestrationStore = new OrchestrationStore(opts.home);
@@ -3193,7 +3195,9 @@ export async function createDaemonServer(
   // 会话数据只走鉴权+加密的 WS)。dev-client.html 仅 --dev。
   function handleHttp(req: IncomingMessage, res: ServerResponse): void {
     try {
-      if (req.url?.startsWith("/_prospero/control/")) {
+      if (req.url?.startsWith("/_prospero/model-api/")) {
+        void forwardModelApi(req, res, id => accounts.resolve(id, "codex"));
+      } else if (req.url?.startsWith("/_prospero/control/")) {
         void handleControl(req, res);
       } else if (req.url === "/term.html") {
         res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
@@ -3256,6 +3260,7 @@ export async function createDaemonServer(
   }
   const address = httpServer.address();
   const port = typeof address === "object" && address !== null ? address.port : opts.port;
+  modelApiBaseUrl = `http://127.0.0.1:${port}/_prospero/model-api`;
   /**
    * 撤销要立刻生效,否则"已撤销"的设备还能一直用着当前连接 —— 撤销就没意义了。
    * CLI 是另一个进程,只能靠盯 devices.json 变化来发现。

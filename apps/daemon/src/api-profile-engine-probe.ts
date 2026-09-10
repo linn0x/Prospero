@@ -283,6 +283,7 @@ async function gateway(ctx: RunContext): Promise<{ baseUrl: string; token: strin
         body[outputKey] = Math.min(typeof body[outputKey] === "number" ? Number(body[outputKey]) : maxOutput, maxOutput);
         if (outputKey === "max_completion_tokens") delete body["max_tokens"];
         const key = ctx.binding.environment[ctx.protocol === "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY"]!;
+        if (ctx.protocol === "openai_responses" && upstream.hostname !== "api.openai.com") delete body["client_metadata"];
         ctx.configurationSeen = true;
         ctx.checks.configuration = "passed";
         const result = await (ctx.options.fetch ?? globalThis.fetch)(upstream, {
