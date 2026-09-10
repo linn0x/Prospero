@@ -395,7 +395,7 @@ export async function probeApiProfile(binding: AccountBinding, options: ApiProfi
     }
     checks.runtime = "passed";
     phase = "streaming";
-    const headers = { "content-type": "application/json", accept: "text/event-stream", ...(protocol === "anthropic" ? { "x-api-key": key, "anthropic-version": "2023-06-01" } : { authorization: `Bearer ${key}` }) };
+    const headers = { ...profile.headers, "content-type": "application/json", accept: "text/event-stream", ...(protocol === "anthropic" ? { "x-api-key": key, "anthropic-version": "2023-06-01" } : { authorization: `Bearer ${key}` }) };
     const nonce = randomUUID();
     const prompt = `This is a connection test. Call ${TOOL_NAME} exactly once with nonce ${nonce}. After receiving its result, reply with only the exact receipt string returned by that tool. Do not call any other tools.`;
     const budget = { bytes: 0, events: 0 };

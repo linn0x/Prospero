@@ -5,6 +5,7 @@ import { Button } from "../components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "../components/ui/dialog";
 import { Field, FieldLabel } from "../components/ui/field";
 import { Input } from "../components/ui/input";
+import { Textarea } from "../components/ui/textarea";
 import { NativeSelect, NativeSelectOption } from "../components/ui/native-select";
 import { Spinner } from "../components/ui/spinner";
 import { DesktopIcon } from "../design-system/icons";
@@ -14,7 +15,7 @@ import { useLocale } from "../locale";
 import { reportError } from "../state";
 import { runModelSourceAction } from "./use-model-sources";
 import { SourceOnboardingModels } from "./SourceOnboardingModels";
-import { retainSourceRouteDrafts, sourceDraftRoutes, type SourceRouteDraft } from "./source-state";
+import { parseSourceHeaders, retainSourceRouteDrafts, sourceDraftRoutes, type SourceRouteDraft } from "./source-state";
 
 const protocols: AccountApiProtocol[] = ["openai_responses", "openai_chat_completions", "anthropic"];
 function validEffort(value: string): value is AgentReasoningEffort { return (accountReasoningEfforts as readonly string[]).includes(value); }
@@ -54,13 +55,20 @@ export function SourceConnectionDialog({ source, onClose }: { source?: ModelSour
   const [apiKey, setApiKey] = useState("");
   const [routes, setRoutes] = useState<SourceRouteDraft[]>([]);
   const [discovering, setDiscovering] = useState(false);
+  const [headerDrafts, setHeaderDrafts] = useState<Record<string, string>>({});
+  const headerText = (endpoint: ModelSource["endpoints"][number]) => headerDrafts[endpoint.protocol] ?? Object.entries(endpoint.headers ?? {}).map(([key, value]) => `${key}: ${value}`).join("\n");
+  let headerError = "";
+  const connections = endpoints.map(endpoint => {
+    try { return { ...endpoint, headers: parseSourceHeaders(headerText(endpoint)) }; }
+    catch (error) { headerError = reportError(error); return endpoint; }
+  });
   const setEndpoints = (update: (value: ModelSource["endpoints"]) => ModelSource["endpoints"]) => {
     const next = update(endpoints);
     updateEndpoints(next); setRoutes(current => retainSourceRouteDrafts(endpoints, next, current));
   };
   const operationId = useRef(crypto.randomUUID());
-  const dirty = name !== (source?.name ?? "") || !!apiKey || routes.length > 0 || JSON.stringify(endpoints) !== JSON.stringify(source?.endpoints ?? [{ protocol: "openai_responses", baseUrl: accountApiProtocolDefaults("openai_responses").baseUrl }]);
-  return <EditorFrame title={source ? t("编辑模型源", "Edit model source") : t("添加模型源", "Add model source")} onClose={onClose} dirty={dirty} valid={!discovering && !!name.trim() && routes.every(route => !!route.name.trim()) && endpoints.every(item => !!item.baseUrl.trim()) && (!!source || !!apiKey.trim() && !!credentialName.trim())} action={() => source ? { kind: "update", sourceId: source.id, revision: source.revision, name: name.trim(), endpoints } : { kind: "create", operationId: operationId.current, name: name.trim(), endpoints, credential: { name: credentialName.trim(), apiKey }, routes: sourceDraftRoutes(routes) }}>
+  const dirty = Object.keys(headerDrafts).length > 0 || name !== (source?.name ?? "") || !!apiKey || routes.length > 0 || JSON.stringify(endpoints) !== JSON.stringify(source?.endpoints ?? [{ protocol: "openai_responses", baseUrl: accountApiProtocolDefaults("openai_responses").baseUrl }]);
+  return <EditorFrame title={source ? t("编辑模型源", "Edit model source") : t("添加模型源", "Add model source")} onClose={onClose} dirty={dirty} valid={!headerError && !discovering && !!name.trim() && routes.every(route => !!route.name.trim()) && endpoints.every(item => !!item.baseUrl.trim()) && (!!source || !!apiKey.trim() && !!credentialName.trim())} action={() => source ? { kind: "update", sourceId: source.id, revision: source.revision, name: name.trim(), endpoints: connections } : { kind: "create", operationId: operationId.current, name: name.trim(), endpoints: connections, credential: { name: credentialName.trim(), apiKey }, routes: sourceDraftRoutes(routes) }}>
     <Field><FieldLabel htmlFor="source-name">{t("名称", "Name")}</FieldLabel><Input id="source-name" value={name} onChange={event => setName(event.target.value)} required maxLength={80} autoFocus /></Field>
     {endpoints.map((endpoint, index) => <div className="model-source-endpoint-form" key={index}>
       <Field><FieldLabel htmlFor={`source-protocol-${index}`}>{t("协议", "Protocol")}</FieldLabel><NativeSelect id={`source-protocol-${index}`} value={endpoint.protocol} disabled={!!source?.routes.some(route => route.protocol === endpoint.protocol)} onChange={event => setEndpoints(current => current.map((item, row) => row === index ? { ...item, protocol: event.target.value as AccountApiProtocol } : item))}>
@@ -68,9 +76,11 @@ export function SourceConnectionDialog({ source, onClose }: { source?: ModelSour
       </NativeSelect></Field>
       <Field><FieldLabel htmlFor={`source-url-${index}`}>Base URL</FieldLabel><Input id={`source-url-${index}`} type="url" value={endpoint.baseUrl} maxLength={2000} required spellCheck={false} onChange={event => setEndpoints(current => current.map((item, row) => row === index ? { ...item, baseUrl: event.target.value } : item))} /></Field>
       {endpoints.length > 1 && <Button type="button" variant="ghost" size="icon-sm" disabled={!!source?.routes.some(route => route.protocol === endpoint.protocol)} aria-label={t("移除此协议端点", "Remove protocol endpoint")} onClick={() => setEndpoints(current => current.filter((_, row) => row !== index))}><DesktopIcon name="close" /></Button>}
+      <Field className="col-span-full"><FieldLabel htmlFor={`source-headers-${index}`}>{t("自定义 Header（可选）", "Custom headers (optional)")}</FieldLabel><Textarea id={`source-headers-${index}`} value={headerText(endpoint)} rows={3} maxLength={65536} spellCheck={false} placeholder="x-client-name: example-client" onChange={event => { setHeaderDrafts(current => ({ ...current, [endpoint.protocol]: event.target.value })); setRoutes([]); }} /><p className="model-source-hint">{t("每行一个 Header: Value，用于模型目录和模型请求。认证凭据请填写 API Key。", "One Header: Value per line, used for model discovery and model requests. Enter authentication credentials in API Key.")}</p></Field>
     </div>)}
     {endpoints.length < 3 && <Button type="button" variant="ghost" className="w-fit" onClick={() => { const protocol = protocols.find(item => !endpoints.some(endpoint => endpoint.protocol === item)); if (protocol) setEndpoints(current => [...current, { protocol, baseUrl: current[0]!.baseUrl }]); }}><DesktopIcon name="add" />{t("添加协议端点", "Add protocol endpoint")}</Button>}
-    {!source && <><Field><FieldLabel htmlFor="source-credential-name">{t("凭据名称", "Credential name")}</FieldLabel><Input id="source-credential-name" value={credentialName} onChange={event => setCredentialName(event.target.value)} maxLength={80} required /></Field><Field><FieldLabel htmlFor="source-api-key">API Key</FieldLabel><Input id="source-api-key" type="password" value={apiKey} onChange={event => { setApiKey(event.target.value); setRoutes([]); }} maxLength={8192} required autoComplete="new-password" /></Field><SourceOnboardingModels endpoints={endpoints} apiKey={apiKey} value={routes} onChange={setRoutes} onBusy={setDiscovering} /></>}
+    {headerError && <p className="model-source-error" role="alert">{headerError}</p>}
+    {!source && <><Field><FieldLabel htmlFor="source-credential-name">{t("凭据名称", "Credential name")}</FieldLabel><Input id="source-credential-name" value={credentialName} onChange={event => setCredentialName(event.target.value)} maxLength={80} required /></Field><Field><FieldLabel htmlFor="source-api-key">API Key</FieldLabel><Input id="source-api-key" type="password" value={apiKey} onChange={event => { setApiKey(event.target.value); setRoutes([]); }} maxLength={8192} required autoComplete="new-password" /></Field><SourceOnboardingModels endpoints={connections} disabled={!!headerError} apiKey={apiKey} value={routes} onChange={setRoutes} onBusy={setDiscovering} /></>}
   </EditorFrame>;
 }
 

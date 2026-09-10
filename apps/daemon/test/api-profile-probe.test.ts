@@ -123,6 +123,7 @@ const runtimeCheck = vi.fn(async () => true);
 describe.each(["openai_responses", "openai_chat_completions", "anthropic"] as const)("API Profile protocol probe: %s", (protocol) => {
   it("uses the configured endpoint and credentials, completes streaming and one synthetic tool roundtrip", async () => {
     const { binding, requests } = await fixture(protocol, (body, response, turn) => stream(response, eventsFor(protocol, body, turn)));
+    binding.apiProfile!.headers = { "x-client-name": "example-client" };
     const check = vi.fn(async (_engine: string, _signal: AbortSignal) => true);
     const result = await probeApiProfile(binding, { runtimeCheck: check });
     expect(result).toMatchObject({ status: "passed", checks: { runtime: "passed", streaming: "passed", tools: "passed" } });
@@ -131,6 +132,8 @@ describe.each(["openai_responses", "openai_chat_completions", "anthropic"] as co
     expect(requests).toHaveLength(2);
     const first = requests[0]!;
     const last = requests[1]!;
+    expect(first.headers["x-client-name"]).toBe("example-client");
+    expect(last.headers["x-client-name"]).toBe("example-client");
     expect(first.url).toBe(protocol === "anthropic" ? "/v1/messages" : protocol === "openai_responses" ? "/v1/responses" : "/v1/chat/completions");
     expect(first.headers[protocol === "anthropic" ? "x-api-key" : "authorization"]).toBe(`${protocol === "anthropic" ? "" : "Bearer "}synthetic-test-key-never-real`);
     expect(first.body.model).toBe("synthetic-model");
