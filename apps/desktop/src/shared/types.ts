@@ -70,6 +70,8 @@ export type SessionSummary = {
 
 /** Cursor is opaque and must be returned unchanged to request the next page. */
 export type SessionPageRequest = {
+  workspace?: string;
+  requestId?: string;
   cursor?: string;
   limit?: number;
   query?: string;
@@ -82,6 +84,7 @@ export type SessionPageRequest = {
 export type SessionPage = {
   items: SessionInfo[];
   nextCursor?: string;
+  previousCursor?: string;
   total: number;
   active: number;
   terminal: number;
@@ -111,6 +114,7 @@ export type RemoteShellEvent = {
 };
 
 export type DaemonSnapshot = {
+  workspaceCounts?: Record<string, { revision: number; total: number; active: number; archived: number; attention: number }>;
   metadataRevision?: string;
   running: boolean;
   managed: boolean;
@@ -320,6 +324,7 @@ export type DesktopApi = import("./project-tools").ProjectToolsApi & {
   createSession(input: SessionCreateInput): Promise<SessionInfo>;
   /** Fetch terminal/history records only when a list or search needs them. */
   listSessions(request?: SessionPageRequest): Promise<SessionPage>;
+  cancelSessionPage(requestId: string): Promise<void>;
   getSessionView(sessionId: string, query?: Record<string, number>): Promise<JsonObject | null>;
   cancelSessionView(sessionId: string): Promise<{ ok: boolean }>;
   interact(sessionId: string, message: JsonObject): Promise<JsonObject | null>;

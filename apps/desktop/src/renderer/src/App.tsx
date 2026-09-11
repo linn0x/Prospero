@@ -2,6 +2,7 @@ import { WindowsTitlebar } from "./app-shell/WindowsTitlebar";
 import { notify } from "./notifications/notifications";
 import { useNavigationHistory } from "./app-shell/use-navigation-history";
 import { ProjectToolsProvider } from "./project-tools/ProjectToolsHost";
+import { WorkspaceHistory } from "./WorkspaceHistory";
 import {
   Fragment,
   lazy,
@@ -863,6 +864,11 @@ function ShellSidebar({
   const [sessionLimits, setSessionLimits] = useState<Record<string, number>>(
     {},
   );
+  const workspacePaging = snapshot.daemon.capabilities?.includes("session.workspace.page") === true;
+  const [workspaceTotals, setWorkspaceTotals] = useState<Record<string, number>>({});
+  const updateWorkspaceTotal = useCallback((workspace: string, total: number): void => {
+    setWorkspaceTotals(current => current[workspace] === total ? current : Object.fromEntries([...Object.entries(current).filter(([path]) => path !== workspace).slice(-99), [workspace, total]]));
+  }, []);
   const knownProjects = useRef(new Set(snapshot.projects));
   const normalizedSessionQuery = deferredSessionQuery.toLocaleLowerCase();
   const handleDaemonCardOpen = (open: boolean): void => {
@@ -1264,8 +1270,9 @@ function ShellSidebar({
     const managedWorkspace = managedLayout.byPath.get(project)?.workspace;
     const childGroups = managedLayout.groups.filter((group) => group.project === project);
     const sessions = sessionsByProject.get(project) ?? [];
-    const projectSessionCount = sessions.length + childGroups.reduce((total, group) => total + group.workspaces.reduce(
-      (count, workspace) => count + (sessionsByProject.get(workspace.path)?.length ?? 0), 0,
+    const countFor = (path: string): number => workspacePaging ? snapshot.daemon.workspaceCounts?.[path]?.total ?? workspaceTotals[path] ?? (sessionsByProject.get(path)?.length ?? 0) : sessionsByProject.get(path)?.length ?? 0;
+    const projectSessionCount = countFor(project) + childGroups.reduce((total, group) => total + group.workspaces.reduce(
+      (count, workspace) => count + countFor(workspace.path), 0,
     ), 0);
     // 归档的会话从主列表收起。搜索时不过滤 —— 明确搜某个东西的人
     // 是想找到它,而不是被"你把它归档过"挡回来。
@@ -1302,6 +1309,12 @@ function ShellSidebar({
       hiddenSessionCount,
       24,
     );
+    const renderSession = (session: SessionInfo): ReactNode => <WorkspaceSessionRow
+      key={session.id} session={session} active={view === "workspaces" && activeId === session.id}
+      unread={snapshot.unreadSessionIds.includes(session.id)} archived={snapshot.archivedSessionIds.includes(session.id)}
+      onToggleArchive={onToggleArchive} pinned={snapshot.pinnedSessionIds.includes(session.id)} onOpenSession={selectSession}
+      onTogglePin={onTogglePin} onRenameSession={onRenameSession} onDuplicateSession={onDuplicateSession} onSetUnread={onSetUnread}
+    />;
     return (
       <Collapsible
         key={project}
@@ -1380,30 +1393,11 @@ function ShellSidebar({
           </ContextMenu>
           <CollapsibleContent>
             <SidebarMenuSub>
-              {visibleSessions.map((session) => (
-                <WorkspaceSessionRow
-                  key={session.id}
-                  session={session}
-                  active={
-                    view === "workspaces" && activeId === session.id
-                  }
-                  unread={snapshot.unreadSessionIds.includes(
-                    session.id,
-                  )}
-                  archived={snapshot.archivedSessionIds.includes(
-                    session.id,
-                  )}
-                  onToggleArchive={onToggleArchive}
-                  pinned={snapshot.pinnedSessionIds.includes(
-                    session.id,
-                  )}
-                  onOpenSession={selectSession}
-                  onTogglePin={onTogglePin}
-                  onRenameSession={onRenameSession}
-                  onDuplicateSession={onDuplicateSession}
-                  onSetUnread={onSetUnread}
-                />
-              ))}
+              {workspacePaging ? <WorkspaceHistory workspace={project} name={name} enabled={projectOpen && workspaceOpen && snapshot.daemon.running}
+                revision={snapshot.daemon.workspaceCounts?.[project] ? `${snapshot.daemon.pid}:${snapshot.daemon.workspaceCounts[project].revision}` : snapshot.daemon.metadataRevision} preview={matchingSessions} activeId={activeId} pinned={snapshot.pinnedSessionIds}
+                unread={snapshot.unreadSessionIds} archived={snapshot.archivedSessionIds} onTotal={updateWorkspaceTotal} renderRow={renderSession}
+              /> : <>
+              {visibleSessions.map(renderSession)}
               {matchingSessions.length >
                 SIDEBAR_SESSION_PREVIEW_LIMIT && (
                 <SidebarMenuSubItem className="workspace-session-more-item">
@@ -1445,6 +1439,7 @@ function ShellSidebar({
                   </button>
                 </SidebarMenuSubItem>
               )}
+              </>}
             </SidebarMenuSub>
             {childGroups.map(renderTaskGroup)}
           </CollapsibleContent>

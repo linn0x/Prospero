@@ -155,6 +155,7 @@ async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, Api
             "session.search",
             "session.summary",
             "session.lookup",
+            "session.workspace.page",
             "workspace.page",
             "session.content",
             "events.replay",
