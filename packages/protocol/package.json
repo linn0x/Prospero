@@ -10,6 +10,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./rust-daemon": {
+      "types": "./dist/rust-daemon.d.ts",
+      "default": "./dist/rust-daemon.js"
     }
   },
   "scripts": {

@@ -16,6 +16,7 @@ coverage/
 *.node
 web-build/
 *.tsbuildinfo
+/target/
 *.apk
 *.aab
 *.ipa

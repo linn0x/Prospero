@@ -1,0 +1,12 @@
+export type AgentKind = "codex" | "claude" | "opencode" | "deepseek" | "grok" | "trae" | "shell" | "custom";
+export type SessionLifecycle = "active" | "archived";
+export type SessionStatus = "idle" | "starting" | "running" | "waiting_permission" | "waiting_input" | "completed" | "failed";
+export type SessionHead = { id: string, agent: AgentKind, title: string, workspace: string, lifecycle: SessionLifecycle, status: SessionStatus, createdAt: number, updatedAt: number, revision: number, };
+export type CreateSession = { agent: AgentKind, title: string, workspace: string, };
+export type UpdateSession = { revision: number, title: string | null, lifecycle: SessionLifecycle | null, status: SessionStatus | null, };
+export type SessionQuery = { cursor: string | null, limit: number | null, lifecycle: SessionLifecycle | null, };
+export type SessionPage = { items: Array<SessionHead>, nextCursor: string | null, hasMore: boolean, };
+export type ChangeEvent = { scope: string, seq: number, kind: string, entityId: string, data: unknown, };
+export type EventPage = { items: Array<ChangeEvent>, nextSeq: number, latestSeq: number, floorSeq: number, hasMore: boolean, resyncRequired: boolean, };
+export type Health = { apiVersion: number, backend: string, activeRuntimeSessions: number, databaseQueueCapacity: number, };
+export type ErrorBody = { code: string, message: string, retryable: boolean, };
