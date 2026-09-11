@@ -125,6 +125,16 @@ async fn serve(directory: PathBuf, address: SocketAddr) -> Result<(), Box<dyn st
     }
     let database = Database::open(directory.clone()).await?;
     database.call(|store| store.recover_terminals()).await?;
+    // Orphaned DAG dispatches from a crashed process are reconciled in one
+    // set-based pass before the API accepts traffic (Stage 7 batch recovery).
+    let recovery = database.call(|store| store.recover_dispatches()).await?;
+    if !recovery.settled.is_empty() || !recovery.resumed.is_empty() {
+        eprintln!(
+            "recovered orchestration dispatches: {} settled, {} resumed",
+            recovery.settled.len(),
+            recovery.resumed.len()
+        );
+    }
     let token = Token::load(&directory)?;
     let listener = tokio::net::TcpListener::bind(address).await?;
     let address = listener.local_addr()?;

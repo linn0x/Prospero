@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::protocol::*;
 
 const APPLICATION_ID: i64 = 0x50525253;
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 const MAX_CONTENT_BYTES: i64 = 1024 * 1024 * 1024;
 
@@ -49,7 +49,7 @@ pub(crate) fn validate_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -127,11 +127,17 @@ impl Store {
             }
             let transaction = connection.transaction()?;
             transaction.execute_batch(include_str!("schema.sql"))?;
+            transaction.execute_batch(include_str!("orchestration/schema.sql"))?;
             transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
-        } else if application != APPLICATION_ID || version != SCHEMA_VERSION {
+        } else if application != APPLICATION_ID || (version != 8 && version != SCHEMA_VERSION) {
             return Err(Error::Schema);
+        } else if version == 8 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(include_str!("orchestration/schema.sql"))?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
         }
         let sqlite_version: String =
             connection.query_row("SELECT sqlite_version()", [], |r| r.get(0))?;

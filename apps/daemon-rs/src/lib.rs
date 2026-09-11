@@ -2,6 +2,7 @@ pub mod agent;
 pub mod auth;
 pub mod database;
 pub mod error;
+pub mod orchestration;
 pub mod protocol;
 mod queries;
 pub mod server;

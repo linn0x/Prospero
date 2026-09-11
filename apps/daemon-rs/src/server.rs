@@ -22,6 +22,10 @@ use crate::agent::{AgentSend, CreateAgentSession, PermissionDecision};
 use crate::auth::Token;
 use crate::database::Store;
 use crate::error::{Error, Result};
+use crate::orchestration::{
+    self, AbandonDispatch, AbandonRun, ApplyTaskGraph, CancelTask, CompleteRun, CreateGate,
+    CreateRunGraph, DispatchTask, MarkMessages, PostMessage, ResolveGate, SettleDispatch,
+};
 use crate::protocol::*;
 use crate::terminal::{
     CreateTerminal, TerminalInput, TerminalPage, TerminalQuery, TerminalSize, TerminalSnapshot,
@@ -107,6 +111,31 @@ impl Api {
             )
             .route("/v1/events", get(events))
             .route("/v1/events/stream", get(subscribe))
+            .route("/v1/runs", get(list_runs))
+            .route("/v1/runs/graph", post(create_run_graph))
+            .route("/v1/runs/graph/apply", post(apply_task_graph))
+            .route("/v1/runs/{id}", get(run_snapshot))
+            .route("/v1/runs/{id}/ready", get(ready_tasks))
+            .route("/v1/runs/{id}/complete", post(complete_run))
+            .route("/v1/runs/{id}/abandon", post(abandon_run))
+            .route("/v1/runs/{id}/gates", post(create_gate))
+            .route("/v1/tasks", get(list_tasks))
+            .route("/v1/tasks/{id}", get(task))
+            .route("/v1/tasks/{id}/cancel", post(cancel_task))
+            .route("/v1/tasks/{id}/retry", post(retry_task))
+            .route("/v1/tasks/{id}/dispatch", post(dispatch_task))
+            .route("/v1/dispatches", get(list_dispatches))
+            .route("/v1/dispatches/recover", post(recover_dispatches))
+            .route("/v1/dispatches/{id}", get(dispatch))
+            .route("/v1/dispatches/{id}/running", post(dispatch_running))
+            .route("/v1/dispatches/{id}/settle", post(settle_dispatch))
+            .route("/v1/dispatches/{id}/abandon", post(abandon_dispatch))
+            .route("/v1/gates", get(list_gates))
+            .route("/v1/gates/{id}/resolve", post(resolve_gate))
+            .route("/v1/messages", get(list_messages).post(post_message))
+            .route("/v1/messages/unread", get(unread_messages))
+            .route("/v1/messages/read", post(mark_messages_read))
+            .route("/v1/messages/{id}/answered", post(mark_message_answered))
             .fallback(|| async { ApiError(Error::NotFound) })
             .layer(DefaultBodyLimit::max(96 * 1024))
             .layer(middleware::from_fn_with_state(self.clone(), authorize))
@@ -211,6 +240,7 @@ async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, Api
             "session.content",
             "session.timeline",
             "agent.claude",
+            "orchestration.dag",
             #[cfg(unix)]
             "terminal.unix",
             "terminal.output.page",
@@ -625,4 +655,326 @@ async fn subscribe(
         }
     });
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
+}
+
+// ── Orchestration (Stage 7) ───────────────────────────────────────────────
+
+type JsonResult<T> = std::result::Result<Json<T>, ApiError>;
+
+async fn list_runs(State(api): State<Api>) -> JsonResult<Vec<orchestration::Run>> {
+    Ok(Json(api.call(|store| store.list_runs()).await?))
+}
+
+async fn create_run_graph(
+    State(api): State<Api>,
+    body: std::result::Result<Json<CreateRunGraph>, axum::extract::rejection::JsonRejection>,
+) -> JsonResult<orchestration::GraphMutationResult> {
+    let Json(input) = body.map_err(|_| Error::Invalid("invalid graph request".into()))?;
+    let result = api.call(move |store| store.create_run_graph(input)).await?;
+    api.publish();
+    Ok(Json(result))
+}
+
+async fn apply_task_graph(
+    State(api): State<Api>,
+    body: std::result::Result<Json<ApplyTaskGraph>, axum::extract::rejection::JsonRejection>,
+) -> JsonResult<orchestration::GraphMutationResult> {
+    let Json(input) = body.map_err(|_| Error::Invalid("invalid graph edit".into()))?;
+    let result = api.call(move |store| store.apply_task_graph(input)).await?;
+    api.publish();
+    Ok(Json(result))
+}
+
+async fn run_snapshot(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> JsonResult<orchestration::RunSnapshot> {
+    Ok(Json(api.call(move |store| store.run_snapshot(&id)).await?))
+}
+
+async fn ready_tasks(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> JsonResult<Vec<orchestration::Task>> {
+    Ok(Json(
+        api.call(move |store| store.list_ready_tasks(&id)).await?,
+    ))
+}
+
+async fn complete_run(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<CompleteRun>, axum::extract::rejection::JsonRejection>,
+) -> JsonResult<orchestration::Run> {
+    let Json(request) = body.map_err(|_| Error::Invalid("invalid complete request".into()))?;
+    let run = api
+        .call(move |store| store.complete_run(&id, request.allow_failed_tasks))
+        .await?;
+    api.publish();
+    Ok(Json(run))
+}
+
+async fn abandon_run(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<AbandonRun>, axum::extract::rejection::JsonRejection>,
+) -> JsonResult<orchestration::Run> {
+    let reason = match body {
+        Ok(Json(request)) => request.reason.unwrap_or_else(|| "Run abandoned".into()),
+        Err(_) => "Run abandoned".into(),
+    };
+    let run = api
+        .call(move |store| store.abandon_run(&id, &reason))
+        .await?;
+    api.publish();
+    Ok(Json(run))
+}
+
+async fn create_gate(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<CreateGate>, axum::extract::rejection::JsonRejection>,
+) -> JsonResult<orchestration::Gate> {
+    let Json(request) = body.map_err(|_| Error::Invalid("invalid gate request".into()))?;
+    let gate = api
+        .call(move |store| store.create_gate(&id, request))
+        .await?;
+    api.publish();
+    Ok(Json(gate))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunScope {
+    run_id: Option<String>,
+}
+
+async fn list_tasks(
+    State(api): State<Api>,
+    query: std::result::Result<Query<RunScope>, axum::extract::rejection::QueryRejection>,
+) -> JsonResult<Vec<orchestration::Task>> {
+    let Query(query) = query.map_err(|_| Error::Invalid("invalid task query".into()))?;
+    Ok(Json(
+        api.call(move |store| store.list_tasks(query.run_id.as_deref()))
+            .await?,
+    ))
+}
+
+async fn task(State(api): State<Api>, Path(id): Path<String>) -> JsonResult<orchestration::Task> {
+    Ok(Json(api.call(move |store| store.task(&id)).await?))
+}
+
+async fn cancel_task(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<CancelTask>, axum::extract::rejection::JsonRejection>,
+) -> JsonResult<orchestration::Task> {
+    let reason = match body {
+        Ok(Json(request)) => request.reason.unwrap_or_else(|| "cancelled by user".into()),
+        Err(_) => "cancelled by user".into(),
+    };
+    let task = api
+        .call(move |store| store.cancel_task(&id, &reason))
+        .await?;
+    api.publish();
+    Ok(Json(task))
+}
+
+async fn retry_task(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> JsonResult<orchestration::Task> {
+    let task = api.call(move |store| store.retry_task(&id)).await?;
+    api.publish();
+    Ok(Json(task))
+}
+
+async fn dispatch_task(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<DispatchTask>, axum::extract::rejection::JsonRejection>,
+) -> JsonResult<orchestration::SettleOutcome> {
+    let Json(request) = body.map_err(|_| Error::Invalid("invalid dispatch request".into()))?;
+    let outcome = api
+        .call(move |store| {
+            store.dispatch_task(&id, &request.session_id, request.operation_id.as_deref())
+        })
+        .await?;
+    api.publish();
+    Ok(Json(outcome))
+}
+
+async fn list_dispatches(
+    State(api): State<Api>,
+    query: std::result::Result<Query<RunScope>, axum::extract::rejection::QueryRejection>,
+) -> JsonResult<Vec<orchestration::Dispatch>> {
+    let Query(query) = query.map_err(|_| Error::Invalid("invalid dispatch query".into()))?;
+    Ok(Json(
+        api.call(move |store| store.list_dispatches(query.run_id.as_deref()))
+            .await?,
+    ))
+}
+
+async fn dispatch(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> JsonResult<orchestration::Dispatch> {
+    Ok(Json(api.call(move |store| store.dispatch(&id)).await?))
+}
+
+async fn dispatch_running(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> JsonResult<orchestration::Dispatch> {
+    let dispatch = api
+        .call(move |store| store.set_dispatch_running(&id))
+        .await?;
+    api.publish();
+    Ok(Json(dispatch))
+}
+
+async fn settle_dispatch(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<SettleDispatch>, axum::extract::rejection::JsonRejection>,
+) -> JsonResult<orchestration::SettleOutcome> {
+    let Json(request) = body.map_err(|_| Error::Invalid("invalid settle request".into()))?;
+    let outcome = api
+        .call(move |store| store.settle_dispatch(&id, request.success, &request.outcome))
+        .await?;
+    api.publish();
+    Ok(Json(outcome))
+}
+
+async fn abandon_dispatch(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<AbandonDispatch>, axum::extract::rejection::JsonRejection>,
+) -> JsonResult<orchestration::SettleOutcome> {
+    let request = match body {
+        Ok(Json(request)) => request,
+        Err(_) => AbandonDispatch {
+            reason: None,
+            final_status: None,
+        },
+    };
+    let reason = request.reason.unwrap_or_else(|| "worker stopped".into());
+    let final_status = match request.final_status.as_deref() {
+        Some("cancelled") => orchestration::TaskStatus::Cancelled,
+        None | Some("failed") => orchestration::TaskStatus::Failed,
+        Some(_) => {
+            return Err(Error::Invalid("finalStatus must be failed or cancelled".into()).into());
+        }
+    };
+    let outcome = api
+        .call(move |store| store.abandon_dispatch(&id, &reason, final_status))
+        .await?;
+    api.publish();
+    Ok(Json(outcome))
+}
+
+async fn recover_dispatches(State(api): State<Api>) -> JsonResult<orchestration::RecoveryReport> {
+    let report = api.call(|store| store.recover_dispatches()).await?;
+    if !report.settled.is_empty() || !report.resumed.is_empty() {
+        api.publish();
+    }
+    Ok(Json(report))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GateScope {
+    run_id: Option<String>,
+    status: Option<String>,
+}
+
+async fn list_gates(
+    State(api): State<Api>,
+    query: std::result::Result<Query<GateScope>, axum::extract::rejection::QueryRejection>,
+) -> JsonResult<Vec<orchestration::Gate>> {
+    let Query(query) = query.map_err(|_| Error::Invalid("invalid gate query".into()))?;
+    let status = match query.status.as_deref() {
+        None => None,
+        Some("pending") => Some(orchestration::GateStatus::Pending),
+        Some("resolved") => Some(orchestration::GateStatus::Resolved),
+        Some("cancelled") => Some(orchestration::GateStatus::Cancelled),
+        Some(_) => return Err(Error::Invalid("invalid gate status".into()).into()),
+    };
+    Ok(Json(
+        api.call(move |store| store.list_gates(query.run_id.as_deref(), status))
+            .await?,
+    ))
+}
+
+async fn resolve_gate(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<ResolveGate>, axum::extract::rejection::JsonRejection>,
+) -> JsonResult<orchestration::Gate> {
+    let Json(request) = body.map_err(|_| Error::Invalid("invalid gate decision".into()))?;
+    let gate = api
+        .call(move |store| store.resolve_gate(&id, &request.decision))
+        .await?;
+    api.publish();
+    Ok(Json(gate))
+}
+
+async fn list_messages(
+    State(api): State<Api>,
+    query: std::result::Result<Query<RunScope>, axum::extract::rejection::QueryRejection>,
+) -> JsonResult<Vec<orchestration::OrchMessage>> {
+    let Query(query) = query.map_err(|_| Error::Invalid("invalid message query".into()))?;
+    Ok(Json(
+        api.call(move |store| store.list_messages(query.run_id.as_deref()))
+            .await?,
+    ))
+}
+
+async fn post_message(
+    State(api): State<Api>,
+    body: std::result::Result<Json<PostMessage>, axum::extract::rejection::JsonRejection>,
+) -> JsonResult<orchestration::OrchMessage> {
+    let Json(input) = body.map_err(|_| Error::Invalid("invalid message".into()))?;
+    let message = api.call(move |store| store.post_message(input)).await?;
+    api.publish();
+    Ok(Json(message))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UnreadScope {
+    recipient: String,
+    run_id: Option<String>,
+}
+
+async fn unread_messages(
+    State(api): State<Api>,
+    query: std::result::Result<Query<UnreadScope>, axum::extract::rejection::QueryRejection>,
+) -> JsonResult<Vec<orchestration::OrchMessage>> {
+    let Query(query) = query.map_err(|_| Error::Invalid("invalid unread query".into()))?;
+    Ok(Json(
+        api.call(move |store| store.unread_messages(&query.recipient, query.run_id.as_deref()))
+            .await?,
+    ))
+}
+
+async fn mark_messages_read(
+    State(api): State<Api>,
+    body: std::result::Result<Json<MarkMessages>, axum::extract::rejection::JsonRejection>,
+) -> JsonResult<serde_json::Value> {
+    let Json(request) = body.map_err(|_| Error::Invalid("invalid read request".into()))?;
+    api.call(move |store| store.mark_messages_read(&request.ids))
+        .await?;
+    Ok(Json(serde_json::json!({"ok":true})))
+}
+
+async fn mark_message_answered(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> JsonResult<orchestration::OrchMessage> {
+    let message = api
+        .call(move |store| store.mark_message_answered(&id))
+        .await?;
+    api.publish();
+    Ok(Json(message))
 }
