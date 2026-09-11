@@ -22,7 +22,8 @@ use crate::database::Store;
 use crate::error::{Error, Result};
 use crate::protocol::*;
 use crate::terminal::{
-    CreateTerminal, TerminalInput, TerminalPage, TerminalQuery, TerminalSize, runtime::Terminals,
+    CreateTerminal, TerminalInput, TerminalPage, TerminalQuery, TerminalSize, TerminalSnapshot,
+    runtime::Terminals,
 };
 use crate::worker::Database;
 
@@ -36,6 +37,7 @@ pub struct Api {
     requests: Arc<Semaphore>,
     streams: Arc<Semaphore>,
     terminal_reads: Arc<Semaphore>,
+    terminal_snapshots: Arc<Semaphore>,
 }
 
 impl Api {
@@ -51,6 +53,7 @@ impl Api {
             requests: Arc::new(Semaphore::new(32)),
             streams: Arc::new(Semaphore::new(16)),
             terminal_reads: Arc::new(Semaphore::new(16)),
+            terminal_snapshots: Arc::new(Semaphore::new(2)),
         }
     }
 
@@ -60,6 +63,7 @@ impl Api {
             .route("/v1/shutdown", post(shutdown))
             .route("/v1/terminals", post(create_terminal))
             .route("/v1/terminals/{id}/output", get(terminal_output))
+            .route("/v1/terminals/{id}/snapshot", get(terminal_snapshot))
             .route("/v1/terminals/{id}/input", post(terminal_input))
             .route("/v1/terminals/{id}/resize", post(terminal_resize))
             .route("/v1/terminals/{id}/close", post(terminal_close))
@@ -183,6 +187,7 @@ async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, Api
             #[cfg(unix)]
             "terminal.unix",
             "terminal.output.page",
+            "terminal.snapshot",
             "events.replay",
             "events.stream",
         ]
@@ -223,6 +228,18 @@ async fn terminal_input(
     let Json(input) = body.map_err(|_| Error::Invalid("invalid terminal input".into()))?;
     api.terminals.input(&id, input).await?;
     Ok(Json(serde_json::json!({"ok":true})))
+}
+
+async fn terminal_snapshot(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<Option<TerminalSnapshot>>, ApiError> {
+    let _permit = api
+        .terminal_snapshots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| Error::Busy)?;
+    Ok(Json(api.terminals.snapshot(id).await?))
 }
 
 async fn terminal_resize(

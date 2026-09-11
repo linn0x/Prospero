@@ -176,6 +176,7 @@ impl Terminals {
                         store.finish_terminal(
                             &id,
                             Archive {
+                                snapshot: None,
                                 floor: 0,
                                 seq: 0,
                                 events: Vec::new(),
@@ -248,6 +249,21 @@ impl Terminals {
                 self.0
                     .database
                     .call(move |store| store.terminal_output(&id, query))
+                    .await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn snapshot(&self, id: String) -> Result<Option<TerminalSnapshot>> {
+        match self.terminal(&id) {
+            Ok(terminal) => tokio::task::spawn_blocking(move || terminal.snapshot())
+                .await
+                .map_err(|_| Error::Closed)?,
+            Err(Error::NotFound) => {
+                self.0
+                    .database
+                    .call(move |store| store.terminal_snapshot(&id))
                     .await
             }
             Err(error) => Err(error),

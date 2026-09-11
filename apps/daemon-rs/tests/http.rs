@@ -60,6 +60,7 @@ async fn every_endpoint_requires_auth_and_rejects_browser_origins() {
         "/v1/sessions/example/timeline/entry/body",
         "/v1/terminals",
         "/v1/terminals/example/output",
+        "/v1/terminals/example/snapshot",
         "/v1/terminals/example/input",
         "/v1/terminals/example/resize",
         "/v1/terminals/example/close",

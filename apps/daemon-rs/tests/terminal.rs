@@ -182,13 +182,20 @@ async fn close_wakes_readers_and_cleans_background_and_foreground_jobs() {
     assert_eq!(pids.len(), 2);
     let reader = terminal.clone();
     let reading = tokio::spawn(async move {
-        reader
-            .read(TerminalQuery {
-                after_seq: Some(after),
-                wait_ms: Some(5000),
-            })
-            .await
-            .unwrap()
+        let mut cursor = after;
+        loop {
+            let page = reader
+                .read(TerminalQuery {
+                    after_seq: Some(cursor),
+                    wait_ms: Some(5000),
+                })
+                .await
+                .unwrap();
+            if page.exited {
+                return page;
+            }
+            cursor = page.next_seq;
+        }
     });
     let started = Instant::now();
     terminal.stop();
