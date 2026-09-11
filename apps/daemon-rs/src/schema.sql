@@ -17,9 +17,10 @@ CREATE TABLE session_counts (
     total INTEGER NOT NULL CHECK(total >= 0),
     active INTEGER NOT NULL CHECK(active BETWEEN 0 AND total),
     attention INTEGER NOT NULL CHECK(attention BETWEEN 0 AND active),
+    revision INTEGER NOT NULL DEFAULT 0 CHECK(revision BETWEEN 0 AND 9007199254740991),
     PRIMARY KEY(scope,workspace)
 ) STRICT;
-INSERT INTO session_counts VALUES(0,'',0,0,0);
+INSERT INTO session_counts(scope,workspace,total,active,attention) VALUES(0,'',0,0,0);
 CREATE TABLE stream_heads (
     scope TEXT PRIMARY KEY,
     last_seq INTEGER NOT NULL CHECK(last_seq >= 0),

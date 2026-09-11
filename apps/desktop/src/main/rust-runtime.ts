@@ -113,6 +113,7 @@ export class RustRuntime {
     this.store.setApiState({ running: true, config: {}, devices: {}, orchestration: {}, projects: workspaces.items.map(item => item.workspace), status: {
       pid, port: Number(new URL(baseUrl).port), bind: "127.0.0.1", sessions, capabilities: health.capabilities,
       metadataRevision: `${pid}:${this.sequence}`,
+      workspaceCounts: Object.fromEntries(workspaces.items.map(({ workspace, summary }) => [workspace, { revision: summary.revision, total: summary.total, active: summary.active, archived: summary.archived, attention: summary.attention }])),
       sessionSummary: { total: summary.total, active: summary.active, terminal: summary.archived, attention: summary.attention, activeLimit: 100, attentionLimit: 0, recentTerminalLimit: 20 },
     } });
   }
@@ -134,11 +135,11 @@ export class RustRuntime {
     finally { this.schedule(delay); }
   }
 
-  async listSessions(request: SessionPageRequest): Promise<SessionPage> {
+  async listSessions(request: SessionPageRequest, cancellation?: AbortSignal): Promise<SessionPage> {
     const { client } = this.current();
-    const signal = this.controller.signal;
+    const signal = cancellation ? AbortSignal.any([cancellation, this.controller.signal]) : this.controller.signal;
     if (request.ids) {
-      if (request.query) throw new Error("ID 查询不支持叠加关键词");
+      if (request.query || request.workspace) throw new Error("ID 查询不支持叠加筛选");
       const ids = [...new Set(request.ids)];
       const key = createHash("sha256").update(JSON.stringify([ids, request.terminal === true])).digest("hex");
       let start = 0;
@@ -157,10 +158,10 @@ export class RustRuntime {
       };
     }
     const [page, summary] = await Promise.all([
-      client.sessions({ limit: request.limit ?? 100, cursor: request.cursor ?? null, lifecycle: request.terminal ? "archived" : null, text: request.query ?? null, workspace: null }, signal),
-      client.summary(undefined, signal),
+      client.sessions({ limit: request.limit ?? 100, cursor: request.cursor ?? null, lifecycle: request.terminal ? "archived" : null, text: request.query ?? null, workspace: request.workspace ?? null }, signal),
+      client.summary(request.workspace, signal),
     ]);
-    return { items: page.items.map(rustSessionInfo), total: page.total, active: summary.active, terminal: summary.archived, ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}) };
+    return { items: page.items.map(rustSessionInfo), total: page.total, active: summary.active, terminal: summary.archived, ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}), ...(page.previousCursor ? { previousCursor: page.previousCursor } : {}) };
   }
 
   async rename(id: string, title: string): Promise<DesktopSnapshot> {

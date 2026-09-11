@@ -46,9 +46,16 @@ async function trial(directory, count) {
       query.push(performance.now() - time); assert.equal(page.items.length, 100);
     }
     const indexedQueries = {};
+    const workspaceFirst = await request("/v1/sessions?workspace=%2Fsynthetic&limit=100");
+    const nextWorkspaceRoute = `/v1/sessions?workspace=%2Fsynthetic&limit=100&cursor=${encodeURIComponent(workspaceFirst.nextCursor)}`;
+    const workspaceSecond = await request(nextWorkspaceRoute);
+    const previousWorkspaceRoute = `/v1/sessions?workspace=%2Fsynthetic&limit=100&cursor=${encodeURIComponent(workspaceSecond.previousCursor)}`;
+    assert.ok(workspaceSecond.previousCursor);
     for (const [name, route, expected] of [
       ["summary", "/v1/sessions/summary", count],
       ["workspace", "/v1/sessions?workspace=%2Fsynthetic&limit=100", count],
+      ["workspaceNext", nextWorkspaceRoute, count],
+      ["workspacePrevious", previousWorkspaceRoute, count],
       ["searchSelective", `/v1/sessions?text=Archive%20${count - 1}&limit=100`, 1],
       ["searchBroad", "/v1/sessions?text=Archive&limit=100", count],
       ["searchBroadFiltered", "/v1/sessions?text=Archive&workspace=%2Fsynthetic&lifecycle=archived&limit=100", count],

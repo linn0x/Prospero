@@ -375,7 +375,13 @@ export class StateStore extends EventEmitter {
         relay: relaySnapshot(status["relay"], config["relay"]),
         sessionSummary: summary,
         sessions,
-        ...(this.backend === "api" ? { metadataRevision: stringValue(status["metadataRevision"]) } : {}),
+        ...(this.backend === "api" ? {
+          metadataRevision: stringValue(status["metadataRevision"]),
+          workspaceCounts: Object.fromEntries(Object.entries(objectValue(status["workspaceCounts"])).slice(0, 100).map(([workspace, entry]) => {
+            const counts = objectValue(entry);
+            return [workspace, { revision: nonNegativeInteger(counts["revision"]), total: nonNegativeInteger(counts["total"]), active: nonNegativeInteger(counts["active"]), archived: nonNegativeInteger(counts["archived"]), attention: nonNegativeInteger(counts["attention"]) }];
+          })),
+        } : {}),
         ...(running ? { pid: rawPid } : {}),
         ...(this.lastError ? { lastError: this.lastError } : {}),
       };

@@ -59,6 +59,7 @@ const api: DesktopApi = {
   openWindowsTerminal: (path: string) => ipcRenderer.invoke("path:terminal", path),
   createSession: (input: SessionCreateInput) => ipcRenderer.invoke("session:create", input),
   listSessions: (request?: SessionPageRequest) => ipcRenderer.invoke("sessions:list", request),
+  cancelSessionPage: (requestId: string) => ipcRenderer.invoke("sessions:cancel", requestId),
   getSessionView: (sessionId: string, query?: Record<string, number>) => ipcRenderer.invoke("session:view", sessionId, query),
   cancelSessionView: (sessionId: string) => ipcRenderer.invoke("session:view:cancel", sessionId),
   interact: (sessionId: string, message: JsonObject) => ipcRenderer.invoke("session:interact", sessionId, message),

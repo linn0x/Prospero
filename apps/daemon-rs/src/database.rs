@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::protocol::*;
 
 const APPLICATION_ID: i64 = 0x50525253;
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 const MAX_CONTENT_BYTES: i64 = 1024 * 1024 * 1024;
 
@@ -246,6 +246,13 @@ impl Store {
         if previous.lifecycle != session.lifecycle || previous.status != session.status {
             Self::adjust_counts(&transaction, &previous, -1)?;
             Self::adjust_counts(&transaction, &session, 1)?;
+        } else {
+            for (scope, workspace) in [(0, ""), (1, session.workspace.as_str())] {
+                transaction.execute(
+                    "UPDATE session_counts SET revision=revision+1 WHERE scope=?1 AND workspace=?2",
+                    params![scope, workspace],
+                )?;
+            }
         }
         Self::append_event(
             &transaction,
@@ -271,7 +278,7 @@ impl Store {
             ));
         for (scope, workspace) in [(0, ""), (1, session.workspace.as_str())] {
             transaction.execute("INSERT INTO session_counts(scope,workspace,total,active,attention) VALUES(?1,?2,0,0,0) ON CONFLICT DO NOTHING", params![scope, workspace])?;
-            transaction.execute("UPDATE session_counts SET total=total+?1,active=active+?2,attention=attention+?3 WHERE scope=?4 AND workspace=?5", params![delta, delta * active, delta * attention, scope, workspace])?;
+            transaction.execute("UPDATE session_counts SET total=total+?1,active=active+?2,attention=attention+?3,revision=revision+max(?1,0) WHERE scope=?4 AND workspace=?5", params![delta, delta * active, delta * attention, scope, workspace])?;
         }
         Ok(())
     }
