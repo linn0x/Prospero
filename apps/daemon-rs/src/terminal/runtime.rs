@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tokio::sync::Semaphore;
 
@@ -8,6 +8,7 @@ use crate::protocol::{SessionHead, SessionStatus, UpdateSession};
 use crate::worker::Database;
 
 struct State {
+    guard: Option<PathBuf>,
     database: Database,
     entries: Mutex<HashMap<String, Terminal>>,
     slots: Arc<Semaphore>,
@@ -22,7 +23,12 @@ pub struct Terminals(Arc<State>);
 
 impl Terminals {
     pub fn new(database: Database) -> Self {
+        Self::with_guard(database, None)
+    }
+
+    pub(crate) fn with_guard(database: Database, guard: Option<PathBuf>) -> Self {
         Self(Arc::new(State {
+            guard,
             database,
             entries: Mutex::new(HashMap::new()),
             slots: Arc::new(Semaphore::new(16)),
@@ -137,14 +143,22 @@ impl Terminals {
 
     async fn persist_live(&self, id: &str, terminal: &Terminal) -> Result<()> {
         let mut seq = 0;
+        let mut waiting = false;
         loop {
-            tokio::select! {
-                _ = terminal.wait_exited() => return Ok(()),
-                _ = terminal.wait_output(seq) => {}
-            }
-            tokio::select! {
-                _ = terminal.wait_exited() => return Ok(()),
-                _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+            if waiting {
+                tokio::select! {
+                    _ = terminal.wait_exited() => return Ok(()),
+                    _ = terminal.wait_output(seq) => {
+                        waiting = false;
+                        continue;
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                }
+            } else {
+                tokio::select! {
+                    _ = terminal.wait_exited() => return Ok(()),
+                    _ = terminal.wait_output(seq) => waiting = true,
+                }
             }
             let permit = tokio::select! {
                 _ = terminal.wait_exited() => return Ok(()),
@@ -192,6 +206,7 @@ impl Terminals {
             return Err(Error::Closed);
         }
         let size = input.size;
+        let guard = self.0.guard.clone();
         let head = self
             .0
             .database
@@ -201,8 +216,22 @@ impl Terminals {
             let shell = std::env::var_os("SHELL")
                 .filter(|shell| Path::new(shell).is_absolute())
                 .unwrap_or_else(|| "/bin/sh".into());
-            let mut command = portable_pty::CommandBuilder::new(shell);
-            command.arg("-l");
+            let mut command = if let Some(guard) = guard {
+                let mut command = portable_pty::CommandBuilder::new(guard);
+                command.args([
+                    "terminal-guard",
+                    "--parent",
+                    &std::process::id().to_string(),
+                    "--shell",
+                ]);
+                command.arg(shell);
+                command.args(["--", "-l"]);
+                command
+            } else {
+                let mut command = portable_pty::CommandBuilder::new(shell);
+                command.arg("-l");
+                command
+            };
             command.cwd(directory);
             command.env("TERM", "xterm-256color");
             command.env("COLORTERM", "truecolor");

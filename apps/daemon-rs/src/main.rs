@@ -17,6 +17,16 @@ struct Arguments {
 
 #[derive(Subcommand)]
 enum Command {
+    #[cfg(unix)]
+    #[command(hide = true)]
+    TerminalGuard {
+        #[arg(long)]
+        parent: u32,
+        #[arg(long)]
+        shell: std::ffi::OsString,
+        #[arg(last = true)]
+        args: Vec<std::ffi::OsString>,
+    },
     Serve {
         #[arg(long)]
         data_dir: PathBuf,
@@ -47,6 +57,14 @@ enum Command {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     match Arguments::parse().command {
+        #[cfg(unix)]
+        Command::TerminalGuard {
+            parent,
+            shell,
+            args,
+        } => {
+            std::process::exit(prosperod_rs::terminal::guard::run(parent, shell, args)?);
+        }
         Command::Serve { data_dir, listen } => {
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -112,7 +130,7 @@ async fn serve(directory: PathBuf, address: SocketAddr) -> Result<(), Box<dyn st
     let address = listener.local_addr()?;
     let base_url = format!("http://{address}");
     token.publish(&directory, &base_url)?;
-    let api = Api::new(database.clone(), token);
+    let api = Api::with_guard(database.clone(), token, Some(std::env::current_exe()?));
     let shutdown_api = api.clone();
     let (stopping, mut stopped) = tokio::sync::watch::channel(false);
     let shutdown = async move {

@@ -178,13 +178,7 @@ pub fn spawn(command: CommandBuilder, size: TerminalSize) -> Result<Terminal> {
 }
 
 fn terminate(master: &dyn MasterPty, pid: i32) {
-    for process in processes() {
-        if unsafe { libc::getsid(process) } == pid {
-            unsafe {
-                libc::kill(process, libc::SIGKILL);
-            }
-        }
-    }
+    terminate_session(pid, None);
     if let Some(group) = master.process_group_leader().filter(|group| *group > 0) {
         unsafe {
             libc::kill(-group, libc::SIGKILL);
@@ -192,6 +186,16 @@ fn terminate(master: &dyn MasterPty, pid: i32) {
     }
     unsafe {
         libc::kill(-pid, libc::SIGKILL);
+    }
+}
+
+pub(super) fn terminate_session(session: i32, keep: Option<i32>) {
+    for process in processes() {
+        if process > 0 && Some(process) != keep && unsafe { libc::getsid(process) } == session {
+            unsafe {
+                libc::kill(process, libc::SIGKILL);
+            }
+        }
     }
 }
 
