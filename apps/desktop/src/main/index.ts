@@ -1,6 +1,6 @@
 import { windowMenuRequest } from "../shared/window-menu";
 import { popupWindowMenu } from "./window-menu";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { networkInterfaces } from "node:os";
@@ -15,6 +15,7 @@ import { diffDesktopSnapshot, isEmptyDesktopSnapshotPatch } from "../shared/snap
 import { isSessionLaunchWorkspace } from "../shared/session-launch-options";
 import { loginPath, resolveNodeExecutable } from "./host-environment.js";
 import { DaemonRuntime } from "./daemon-runtime";
+import { RustRuntime } from "./rust-runtime";
 import { LegacyOrchestrationProjection } from "./legacy-orchestration-projection";
 import { sessionInfoFromControl } from "./session-control";
 import { StateStore } from "./state-store";
@@ -47,6 +48,13 @@ const ACCOUNT_METHODS = new Set([
 const SMOKE_TEST = process.argv.includes("--smoke-test");
 const SELF_CHECK = process.argv.includes("--self-check");
 const START_HIDDEN = process.argv.includes("--background") || SMOKE_TEST;
+const RUST_BACKEND = process.env["PROSPERO_BACKEND"] === "rust";
+const rustHome = resolve(process.env["PROSPERO_RUST_HOME"] || resolve(app.getPath("appData"), "Prospero Rust"));
+if (RUST_BACKEND) {
+  const userData = resolve(rustHome, "electron");
+  mkdirSync(userData, { recursive: true });
+  app.setPath("userData", userData);
+}
 if (SMOKE_TEST) app.disableHardwareAcceleration();
 
 let mainWindow: BrowserWindow | undefined;
@@ -58,14 +66,17 @@ let lastBroadcastSnapshot: ReturnType<StateStore["snapshot"]> | undefined;
 let lastBroadcastWindowId: number | undefined;
 let windowStateTimer: ReturnType<typeof setTimeout> | undefined;
 let accountActionTail: Promise<void> = Promise.resolve();
-const store = new StateStore();
+const store = RUST_BACKEND ? new StateStore(resolve(rustHome, "desktop"), "api") : new StateStore();
 const remoteHostStore = new RemoteHostStore(resolve(app.getPath("userData"), "remote-hosts.json"));
 const remoteShellManager = new RemoteShellManager(remoteHostStore, (event) => {
   mainWindow?.webContents.send("remote-shell:event", event);
 });
 const remoteWorkspaces = new RemoteWorkspaces(new RemoteWorkspaceStore(resolve(app.getPath("userData"), "remote-workspaces.json")), remoteHostStore, remoteShellManager);
 const publishRemoteWorkspaces = (): void => { mainWindow?.webContents.send("remote-workspace:changed", remoteWorkspaces.list()); };
-const runtime = new DaemonRuntime(store);
+const runtime = RUST_BACKEND ? new RustRuntime(store,
+  resolve(process.env["PROSPERO_RUST_BINARY"] || resolve(app.isPackaged ? resolve(process.resourcesPath, "runtime") : resolve(app.getAppPath(), "../../target/release"), process.platform === "win32" ? "prosperod-rs.exe" : "prosperod-rs")),
+  resolve(rustHome, "daemon"),
+) : new DaemonRuntime(store);
 const legacyProjection = new LegacyOrchestrationProjection(
   store.home,
   () => broadcastSnapshot(),
@@ -163,7 +174,7 @@ function sessionPageRequest(raw: unknown): SessionPageRequest {
   if (raw === undefined) return {};
   const request = requireObject(raw);
   const result: SessionPageRequest = {};
-  if (request["cursor"] !== undefined) result.cursor = requireSelection(request["cursor"], "游标", 512);
+  if (request["cursor"] !== undefined) result.cursor = requireSelection(request["cursor"], "游标", RUST_BACKEND ? 16384 : 512);
   if (request["query"] !== undefined) result.query = requireSelection(request["query"], "搜索词", 200);
   if (request["limit"] !== undefined) {
     if (!Number.isSafeInteger(request["limit"]) || Number(request["limit"]) < 1 || Number(request["limit"]) > 100) throw new Error("分页数量无效");
@@ -862,6 +873,7 @@ function installIpc(): void {
   ipcMain.handle("session:rename", (_event, rawId: unknown, rawTitle: unknown) => {
     const sessionId = requireId(rawId, "会话");
     if (typeof rawTitle !== "string") throw new Error("会话名称无效");
+    if (runtime instanceof RustRuntime) return runtime.rename(sessionId, rawTitle);
     return store.renameSession(sessionId, rawTitle);
   });
   ipcMain.handle("session:archive", (_event, rawId: unknown, archived: unknown) => {
@@ -970,6 +982,11 @@ function installIpc(): void {
   });
   ipcMain.handle("sessions:list", async (_event, rawRequest: unknown) => {
     const request = sessionPageRequest(rawRequest);
+    if (runtime instanceof RustRuntime) {
+      const page = await runtime.listSessions(request);
+      store.hydrateSessions(page.items);
+      return page;
+    }
     const params = new URLSearchParams();
     if (request.cursor) params.set("cursor", request.cursor);
     if (request.limit !== undefined) params.set("limit", String(request.limit));
@@ -1337,14 +1354,14 @@ void app.whenReady().then(async () => {
   nativeTheme.on("updated", () => applyTheme(store.settingsSnapshot()));
   createTray();
   store.on("changed", broadcastSnapshot);
-  setInterval(() => broadcastSnapshot(store.snapshot()), 1_000).unref();
+  if (!RUST_BACKEND) setInterval(() => broadcastSnapshot(store.snapshot()), 1_000).unref();
   if (process.argv.includes("--background")) mainWindow.hide();
   if (store.settingsSnapshot().startDaemonOnLaunch) {
     const started = await runtime.start();
     // daemon 一就绪就把账号列表灌进 store。以前它只在"账号"页被打开时才填充
     // (setAccounts 的唯一调用点在 account:action 的响应里),于是冷启动后直接去
     // 新建会话,账号下拉框是空的、只有一行"没有可用账号"。
-    if (started.ok) void refreshAccounts();
+    if (started.ok && !RUST_BACKEND) void refreshAccounts();
     // 冒烟测试那一步的名字就是"Start packaged UI and its bundled daemon" ——
     // 跳过启动的话它只验证了一个空壳 UI。daemon 起不来必须让进程非零退出,
     // 由 CI 的退出码来兜;runtime.start() 是等到 /control/health 应答才返回的,
@@ -1354,7 +1371,7 @@ void app.whenReady().then(async () => {
       process.stdout.write("Prospero bundled daemon ready\n");
     }
   }
-  legacyProjection.start();
+  if (!RUST_BACKEND) legacyProjection.start();
   await runDesktopSelfCheck(mainWindow);
 }).catch((error: unknown) => {
   const detail = error instanceof Error ? error.stack ?? error.message : String(error);

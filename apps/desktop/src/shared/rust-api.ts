@@ -14,5 +14,3 @@ export type RustDesktopApi = {
   contents(id: string, cursor?: string): Promise<ContentPage>;
   content(id: string, content: string, offset: number): Promise<RustContent>;
 };
-
-declare global { interface Window { prosperoRust: RustDesktopApi } }
