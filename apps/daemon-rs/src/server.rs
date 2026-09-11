@@ -42,7 +42,11 @@ pub struct Api {
 
 impl Api {
     pub fn new(database: Database, token: Token) -> Self {
-        let terminals = Terminals::new(database.clone());
+        Self::with_guard(database, token, None)
+    }
+
+    pub fn with_guard(database: Database, token: Token, guard: Option<std::path::PathBuf>) -> Self {
+        let terminals = Terminals::with_guard(database.clone(), guard);
         let changes = terminals.changes();
         Self {
             terminals,

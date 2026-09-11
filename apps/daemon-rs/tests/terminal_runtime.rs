@@ -39,6 +39,25 @@ async fn settled(runtime: &Terminals) {
     .unwrap();
 }
 
+async fn stable_checkpoint_count(connection: &rusqlite::Connection) -> i64 {
+    let mut count = -1;
+    let mut stable_since = tokio::time::Instant::now();
+    loop {
+        let latest = connection
+            .query_row("SELECT count(*) FROM checkpoint_writes", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        if latest != count {
+            count = latest;
+            stable_since = tokio::time::Instant::now();
+        } else if stable_since.elapsed() >= Duration::from_millis(700) {
+            return count;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 #[tokio::test]
 async fn completed_terminal_is_archived_and_output_survives_restart() {
     let directory = TempDir::new().unwrap();
@@ -363,12 +382,7 @@ async fn live_checkpoints_stop_writing_when_idle_and_fail_closed_on_storage_erro
     })
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    let count: i64 = connection
-        .query_row("SELECT count(*) FROM checkpoint_writes", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
+    let count = stable_checkpoint_count(&connection).await;
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert_eq!(
         connection

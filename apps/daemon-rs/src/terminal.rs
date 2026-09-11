@@ -342,6 +342,9 @@ impl Terminal {
 mod native;
 
 #[cfg(unix)]
+pub mod guard;
+
+#[cfg(unix)]
 pub use native::spawn;
 
 pub mod runtime;
