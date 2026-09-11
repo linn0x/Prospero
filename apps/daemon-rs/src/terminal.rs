@@ -108,6 +108,7 @@ pub struct Output {
 pub(crate) struct Archive {
     snapshot: Option<TerminalSnapshot>,
     floor: i64,
+    start: i64,
     seq: i64,
     events: Vec<TerminalEvent>,
     exit_code: Option<u32>,
@@ -213,22 +214,51 @@ impl Drop for Inner {
 pub struct Terminal(Arc<Inner>);
 
 impl Terminal {
+    pub(crate) async fn wait_output(&self, after: i64) {
+        let mut changed = self.0.changed.clone();
+        loop {
+            changed.borrow_and_update();
+            if self
+                .0
+                .output
+                .lock()
+                .is_ok_and(|output| output.seq != after || output.exited)
+            {
+                return;
+            }
+            if changed.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     pub(crate) fn archive(&self) -> Result<Archive> {
+        self.checkpoint(None)?.ok_or(Error::Conflict)
+    }
+
+    pub(crate) fn checkpoint(&self, after: Option<i64>) -> Result<Option<Archive>> {
         let output = self.0.output.lock().map_err(|_| Error::Closed)?;
-        if !output.exited {
+        if after.is_none() && !output.exited {
             return Err(Error::Conflict);
         }
-        Ok(Archive {
+        if after == Some(output.seq) {
+            return Ok(None);
+        }
+        let floor = output.seq - output.events.len() as i64;
+        let start = after.unwrap_or(floor).max(floor).min(output.seq);
+        Ok(Some(Archive {
             snapshot: output.screen.snapshot(output.seq).ok(),
-            floor: output.seq - output.events.len() as i64,
+            floor,
+            start,
             seq: output.seq,
             events: output
                 .events
                 .iter()
+                .skip((start - floor) as usize)
                 .map(|(event, _)| event.clone())
                 .collect(),
             exit_code: output.exit_code,
-        })
+        }))
     }
     pub fn snapshot(&self) -> Result<Option<TerminalSnapshot>> {
         let output = self.0.output.lock().map_err(|_| Error::Closed)?;

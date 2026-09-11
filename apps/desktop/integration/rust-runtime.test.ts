@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RustRuntime } from "../src/main/rust-runtime";
 import { RustClient } from "../src/main/rust-client";
@@ -38,6 +39,40 @@ afterEach(async () => {
 });
 
 describe("existing desktop shell with the real Rust runtime", () => {
+  it.skipIf(process.platform === "win32")("preserves committed live output when the daemon is killed and recovers without rerunning the shell", async () => {
+    const { directory, dataDir, runtime, store } = fixture(10000);
+    expect((await runtime.start()).ok).toBe(true);
+    const head = await runtime.request("/_prospero/control/session/create", { method: "POST", body: { agent: "shell", kind: "pty", cwd: directory, cols: 80, rows: 24 } });
+    const id = String(head!["id"]);
+    await runtime.request(`/_prospero/control/session/${id}/interact`, { method: "POST", body: { type: "term.input", dataB64: Buffer.from("printf 'committed-live-marker\\n'; read answer\n").toString("base64") } });
+    const database = new DatabaseSync(resolve(dataDir, "prospero.sqlite"), { readOnly: true });
+    let seq = 0;
+    try {
+      await vi.waitFor(() => {
+        const row = database.prepare("SELECT latest_seq,snapshot FROM terminal_runs WHERE session_id=? AND active=1").get(id)!;
+        const snapshot = JSON.parse(String(row["snapshot"]));
+        expect(Buffer.from(snapshot.dataB64, "base64").toString("utf8")).toContain("committed-live-marker");
+        seq = Number(row["latest_seq"]); expect(snapshot.seq).toBe(seq);
+      }, { timeout: 5000 });
+      process.kill(store.snapshot().daemon.pid!, "SIGKILL");
+      await vi.waitFor(() => expect(runtime.managed).toBe(false));
+      expect((await runtime.start()).ok).toBe(true);
+      const connection = JSON.parse(readFileSync(resolve(dataDir, "connection.json"), "utf8"));
+      const client = new RustClient(connection.baseUrl, connection.token);
+      expect((await client.health()).activeRuntimeSessions).toBe(0);
+      expect((await client.session(id)).status).toBe("failed");
+      const snapshot = await client.terminalSnapshot(id);
+      expect(snapshot?.seq).toBeGreaterThanOrEqual(seq);
+      expect(Buffer.from(snapshot!.dataB64, "base64").toString("utf8")).toContain("committed-live-marker");
+      const output = await client.terminalOutput(id, { afterSeq: 0, waitMs: 0 });
+      expect(output.exited).toBe(true);
+      expect(output.events.length).toBeGreaterThan(0);
+      const ahead = await runtime.request(`/_prospero/control/session/${id}/view?outputAfterSeq=${output.latestSeq + 100}`);
+      expect(ahead?.["mode"]).toBe("snapshot");
+      expect(ahead?.["seq"]).toBe(output.latestSeq);
+    } finally { database.close(); }
+  }, 15000);
+
   it.skipIf(process.platform === "win32")("serializes long Unicode pastes without duplicating or interleaving their chunks", async () => {
     const { directory, runtime } = fixture();
     expect((await runtime.start()).ok).toBe(true);
