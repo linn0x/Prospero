@@ -50,6 +50,9 @@ impl Api {
             .route("/v1/health", get(health))
             .route("/v1/shutdown", post(shutdown))
             .route("/v1/sessions", get(sessions))
+            .route("/v1/sessions/summary", get(summary))
+            .route("/v1/sessions/lookup", post(lookup))
+            .route("/v1/workspaces", get(workspaces))
             .route("/v1/sessions/{id}", get(session).patch(rename))
             .route("/v1/sessions/{id}/contents", get(contents))
             .route("/v1/sessions/{id}/content/{content}", get(content))
@@ -149,6 +152,10 @@ async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, Api
         database_queue_capacity: DATABASE_QUEUE_CAPACITY,
         capabilities: [
             "session.metadata",
+            "session.search",
+            "session.summary",
+            "session.lookup",
+            "workspace.page",
             "session.content",
             "events.replay",
             "events.stream",
@@ -176,6 +183,41 @@ async fn session(
     Path(id): Path<String>,
 ) -> std::result::Result<Json<SessionHead>, ApiError> {
     Ok(Json(api.call(move |store| store.session(&id)).await?))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SummaryQuery {
+    workspace: Option<String>,
+}
+
+async fn summary(
+    State(api): State<Api>,
+    query: std::result::Result<Query<SummaryQuery>, axum::extract::rejection::QueryRejection>,
+) -> std::result::Result<Json<SessionSummary>, ApiError> {
+    let Query(query) = query.map_err(|_| Error::Invalid("invalid summary query".into()))?;
+    Ok(Json(
+        api.call(move |store| store.session_summary(query.workspace.as_deref()))
+            .await?,
+    ))
+}
+
+async fn workspaces(
+    State(api): State<Api>,
+    query: std::result::Result<Query<WorkspaceQuery>, axum::extract::rejection::QueryRejection>,
+) -> std::result::Result<Json<WorkspacePage>, ApiError> {
+    let Query(query) = query.map_err(|_| Error::Invalid("invalid workspace query".into()))?;
+    Ok(Json(api.call(move |store| store.workspaces(query)).await?))
+}
+
+async fn lookup(
+    State(api): State<Api>,
+    body: std::result::Result<Json<SessionLookup>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<SessionLookupResult>, ApiError> {
+    let Json(input) = body.map_err(|_| Error::Invalid("invalid lookup request".into()))?;
+    Ok(Json(
+        api.call(move |store| store.lookup_sessions(input)).await?,
+    ))
 }
 
 async fn rename(

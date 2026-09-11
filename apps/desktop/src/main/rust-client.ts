@@ -1,4 +1,4 @@
-import type { ContentPage, EventPage, EventQuery, Health, RenameSession, SessionHead, SessionPage, SessionQuery } from "@prospero/protocol/rust-daemon";
+import type { ContentPage, EventPage, EventQuery, Health, RenameSession, SessionHead, SessionLookupResult, SessionPage, SessionQuery, SessionSummary, WorkspacePage, WorkspaceQuery } from "@prospero/protocol/rust-daemon";
 import type { RustContent } from "../shared/rust-api";
 
 const MAX_BYTES = 2 * 1024 * 1024;
@@ -57,10 +57,27 @@ export class RustClient {
   async shutdown(): Promise<void> { await this.json("/v1/shutdown", { method: "POST" }); }
   sessions(query: SessionQuery): Promise<SessionPage> {
     const params = new URLSearchParams();
-    if (query.limit !== null) params.set("limit", String(query.limit));
+    if (query.limit != null) params.set("limit", String(query.limit));
     if (query.cursor) params.set("cursor", query.cursor);
     if (query.lifecycle) params.set("lifecycle", query.lifecycle);
+    if (query.workspace != null) params.set("workspace", query.workspace);
+    if (query.text != null) params.set("text", query.text);
     return this.json(`/v1/sessions?${params}`);
+  }
+  summary(workspace?: string): Promise<SessionSummary> {
+    const params = new URLSearchParams();
+    if (workspace != null) params.set("workspace", workspace);
+    return this.json(`/v1/sessions/summary?${params}`);
+  }
+  workspaces(query: WorkspaceQuery): Promise<WorkspacePage> {
+    const params = new URLSearchParams();
+    if (query.limit != null) params.set("limit", String(query.limit));
+    if (query.cursor != null) params.set("cursor", query.cursor);
+    return this.json(`/v1/workspaces?${params}`);
+  }
+  lookup(ids: string[]): Promise<SessionLookupResult> {
+    if (ids.length > 100) throw new Error("Session lookup exceeds limit");
+    return this.json("/v1/sessions/lookup", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ids: ids.map(id) }) });
   }
   session(value: string): Promise<SessionHead> { return this.json(`/v1/sessions/${id(value)}`); }
   rename(value: string, input: RenameSession): Promise<SessionHead> {
@@ -68,8 +85,8 @@ export class RustClient {
   }
   events(query: EventQuery): Promise<EventPage> {
     const params = new URLSearchParams({ scope: query.scope });
-    if (query.afterSeq !== null) params.set("afterSeq", String(query.afterSeq));
-    if (query.limit !== null) params.set("limit", String(query.limit));
+    if (query.afterSeq != null) params.set("afterSeq", String(query.afterSeq));
+    if (query.limit != null) params.set("limit", String(query.limit));
     return this.json(`/v1/events?${params}`);
   }
   contents(value: string, cursor?: string): Promise<ContentPage> {
