@@ -37,6 +37,7 @@ const api: DesktopApi = {
   openWindowMenu: (request) => ipcRenderer.invoke("window:menu", request),
   openExternal: (url: string) => ipcRenderer.invoke("external:open", url),
   readClipboard: () => ipcRenderer.invoke("clipboard:read"),
+  openTerminalContextMenu: options => ipcRenderer.invoke("terminal:context-menu", options),
   writeClipboard: (value: string) => ipcRenderer.invoke("clipboard:write", value),
   getSnapshot: () => ipcRenderer.invoke("snapshot:get"),
   subscribeSnapshot(listener) {
