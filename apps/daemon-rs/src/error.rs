@@ -3,6 +3,12 @@ use ts_rs::TS;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("unauthorized")]
+    Unauthorized,
+    #[error("request origin is not allowed")]
+    Forbidden,
+    #[error("request timed out")]
+    Timeout,
     #[error("invalid request: {0}")]
     Invalid(String),
     #[error("record not found")]
@@ -36,6 +42,9 @@ pub struct ErrorBody {
 impl Error {
     pub fn public(&self) -> ErrorBody {
         let (code, retryable) = match self {
+            Self::Unauthorized => ("unauthorized", false),
+            Self::Forbidden => ("forbidden", false),
+            Self::Timeout => ("timeout", true),
             Self::Invalid(_) => ("invalid_request", false),
             Self::NotFound => ("not_found", false),
             Self::Conflict => ("conflict", false),

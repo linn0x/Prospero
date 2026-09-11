@@ -125,6 +125,50 @@ pub struct Health {
     pub backend: String,
     pub active_runtime_sessions: usize,
     pub database_queue_capacity: usize,
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RenameSession {
+    #[ts(type = "number")]
+    pub revision: i64,
+    pub title: String,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EventQuery {
+    pub scope: String,
+    #[ts(type = "number | null")]
+    pub after_seq: Option<i64>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ResyncRequired {
+    pub scope: String,
+    #[ts(type = "number")]
+    pub latest_seq: i64,
+    #[ts(type = "number")]
+    pub floor_seq: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentHead {
+    pub id: String,
+    #[ts(type = "number")]
+    pub bytes: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentPage {
+    pub items: Vec<ContentHead>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
 }
 
 pub fn typescript() -> String {
@@ -141,6 +185,11 @@ pub fn typescript() -> String {
         ChangeEvent::decl(&config),
         EventPage::decl(&config),
         Health::decl(&config),
+        RenameSession::decl(&config),
+        EventQuery::decl(&config),
+        ResyncRequired::decl(&config),
+        ContentHead::decl(&config),
+        ContentPage::decl(&config),
         crate::error::ErrorBody::decl(&config),
     ];
     declarations
