@@ -50,6 +50,9 @@ async fn every_endpoint_requires_auth_and_rejects_browser_origins() {
     for uri in [
         "/v1/health",
         "/v1/sessions",
+        "/v1/sessions/summary",
+        "/v1/sessions/lookup",
+        "/v1/workspaces",
         "/v1/events?scope=sessions",
         "/unknown",
     ] {
@@ -148,6 +151,10 @@ async fn invalid_queries_and_unknown_mutations_are_rejected() {
     for uri in [
         "/v1/sessions?limit=201",
         "/v1/sessions?unexpected=true",
+        "/v1/sessions?workspace=",
+        "/v1/sessions?text=%2A",
+        "/v1/sessions/summary?unexpected=true",
+        "/v1/workspaces?limit=201",
         "/v1/events?scope=sessions&afterSeq=-1",
         "/v1/events?scope=sessions&afterSeq=100",
         "/v1/events?scope=sessions&limit=0",

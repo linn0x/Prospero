@@ -79,6 +79,7 @@ fn keyset_pages_cover_archives_without_duplicates_and_use_index() {
                 cursor,
                 limit: Some(73),
                 lifecycle: Some(SessionLifecycle::Archived),
+                ..Default::default()
             })
             .unwrap();
         assert!(page.items.len() <= 73);
@@ -115,13 +116,15 @@ fn cursors_cannot_change_filter_or_skip_validation() {
             limit: Some(1),
             lifecycle: Some(SessionLifecycle::Archived),
             cursor: None,
+            ..Default::default()
         })
         .unwrap();
     assert!(matches!(
         store.sessions(SessionQuery {
             limit: Some(1),
             cursor: page.next_cursor,
-            lifecycle: None
+            lifecycle: None,
+            ..Default::default()
         }),
         Err(Error::Invalid(_))
     ));

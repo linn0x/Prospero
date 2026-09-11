@@ -14,7 +14,7 @@ const home = mkdtempSync(path.join(tmpdir(), "prospero-rust-http-perf-"));
 const results = [];
 const summarize = values => ({ valuesMs: values, p50Ms: percentile(values, .5), p95Ms: percentile(values, .95), maxMs: percentile(values, 1) });
 
-async function trial(directory) {
+async function trial(directory, count) {
   const start = performance.now();
   const child = spawn(binary, ["serve", "--data-dir", directory], { stdio: ["ignore", "pipe", "pipe"] });
   child.stderr.resume();
@@ -45,11 +45,35 @@ async function trial(directory) {
       const time = performance.now(); page = await request("/v1/sessions?limit=100&lifecycle=archived");
       query.push(performance.now() - time); assert.equal(page.items.length, 100);
     }
+    const indexedQueries = {};
+    for (const [name, route, expected] of [
+      ["summary", "/v1/sessions/summary", count],
+      ["workspace", "/v1/sessions?workspace=%2Fsynthetic&limit=100", count],
+      ["searchSelective", `/v1/sessions?text=Archive%20${count - 1}&limit=100`, 1],
+      ["searchBroad", "/v1/sessions?text=Archive&limit=100", count],
+      ["searchBroadFiltered", "/v1/sessions?text=Archive&workspace=%2Fsynthetic&lifecycle=archived&limit=100", count],
+    ]) {
+      const times = [];
+      for (let index = 0; index < 31; index++) {
+        const time = performance.now(); const result = await request(route);
+        times.push(performance.now() - time); assert.equal(result.total, expected);
+        if (result.items) assert.ok(result.items.length <= 100);
+      }
+      indexedQueries[name] = summarize(times);
+    }
     for (let index = 0; index < 9; index++) {
       const time = performance.now();
       await request(`/v1/sessions/${page.items[index].id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision: 1, title: `Renamed ${index}` }) });
       rename.push(performance.now() - time);
     }
+    const common = [];
+    for (let index = 0; index < 31; index++) {
+      const time = performance.now(); const result = await request("/v1/sessions?text=Archive&limit=100");
+      common.push(performance.now() - time); assert.equal(result.total, count - 9);
+      assert.equal(result.items.length, 100);
+      assert.ok(result.items.every(item => item.title.startsWith("Archive ")));
+    }
+    indexedQueries.searchCommon = summarize(common);
     for (let index = 0; index < 31; index++) {
       const time = performance.now(); const events = await request("/v1/events?scope=sessions&afterSeq=0&limit=100");
       replay.push(performance.now() - time); assert.equal(events.items.length, 9);
@@ -59,7 +83,7 @@ async function trial(directory) {
     const exited = once(child, "exit"); await request("/v1/shutdown", { method: "POST" });
     const timer = setTimeout(() => child.kill("SIGKILL"), 5000);
     const [code] = await exited; clearTimeout(timer); assert.equal(code, 0);
-    return { startupMs, residentRssMiB: rss, activeRuntimeSessions: health.activeRuntimeSessions, query: summarize(query), rename: summarize(rename), replay: summarize(replay) };
+    return { startupMs, residentRssMiB: rss, activeRuntimeSessions: health.activeRuntimeSessions, query: summarize(query), indexedQueries, rename: summarize(rename), replay: summarize(replay) };
   } finally {
     if (child.exitCode === null && child.signalCode === null) { const exited = once(child, "exit"); child.kill("SIGKILL"); await exited; }
   }
@@ -73,11 +97,11 @@ try {
     const samples = [];
     for (let index = 0; index < 3; index++) {
       const directory = path.join(home, `${count}-${index}`); cpSync(source, directory, { recursive: true });
-      samples.push(await trial(directory)); rmSync(directory, { recursive: true, force: true });
+      samples.push(await trial(directory, count)); rmSync(directory, { recursive: true, force: true });
     }
     results.push({ count, samples });
   }
-  const report = { schemaVersion: 1, backend: "rust-http", scope: "Real Rust process readiness and authenticated HTTP metadata APIs; no Agent, PTY or Electron rendering workload. RSS sampled after requests, not peak RSS.", measuredAt: new Date().toISOString(), fixtureReset: "fresh copy per trial; OS caches are not forcibly evicted", environment: { platform: platform(), arch: arch(), release: release(), cpu: cpus()[0]?.model, logicalCpus: cpus().length, memoryGiB: totalmem() / 1024 ** 3 }, results };
+  const report = { schemaVersion: 2, backend: "rust-http", scope: "Real Rust process readiness, indexed search, summaries and authenticated HTTP metadata APIs; no Agent, PTY or Electron rendering workload. RSS sampled after requests, not peak RSS.", measuredAt: new Date().toISOString(), fixtureReset: "fresh copy per trial; OS caches are not forcibly evicted", environment: { platform: platform(), arch: arch(), release: release(), cpu: cpus()[0]?.model, logicalCpus: cpus().length, memoryGiB: totalmem() / 1024 ** 3 }, results };
   const output = process.argv.indexOf("--output");
   const text = JSON.stringify(report, null, 2) + "\n";
   if (output >= 0) writeFileSync(process.argv[output + 1], text); else process.stdout.write(text);

@@ -3,10 +3,23 @@ CREATE TABLE session_heads (
     created_at INTEGER NOT NULL CHECK(created_at >= 0),
     lifecycle TEXT NOT NULL CHECK(lifecycle IN ('active','archived')),
     revision INTEGER NOT NULL CHECK(revision > 0),
-    payload TEXT NOT NULL CHECK(length(CAST(payload AS BLOB)) <= 8192)
+    payload TEXT NOT NULL CHECK(length(CAST(payload AS BLOB)) <= 8192),
+    workspace TEXT GENERATED ALWAYS AS (json_extract(payload,'$.workspace')) STORED NOT NULL
 ) STRICT;
 CREATE INDEX session_page ON session_heads(created_at DESC,id DESC);
 CREATE INDEX session_lifecycle_page ON session_heads(lifecycle,created_at DESC,id DESC);
+CREATE INDEX session_workspace_page ON session_heads(workspace,created_at DESC,id DESC);
+CREATE INDEX session_workspace_lifecycle_page ON session_heads(workspace,lifecycle,created_at DESC,id DESC);
+CREATE VIRTUAL TABLE session_search USING fts5(id,title,workspace,tokenize='unicode61',prefix='1 2 3');
+CREATE TABLE session_counts (
+    scope INTEGER NOT NULL CHECK(scope IN (0,1)),
+    workspace TEXT NOT NULL,
+    total INTEGER NOT NULL CHECK(total >= 0),
+    active INTEGER NOT NULL CHECK(active BETWEEN 0 AND total),
+    attention INTEGER NOT NULL CHECK(attention BETWEEN 0 AND active),
+    PRIMARY KEY(scope,workspace)
+) STRICT;
+INSERT INTO session_counts VALUES(0,'',0,0,0);
 CREATE TABLE stream_heads (
     scope TEXT PRIMARY KEY,
     last_seq INTEGER NOT NULL CHECK(last_seq >= 0),

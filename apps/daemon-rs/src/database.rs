@@ -2,33 +2,24 @@ use std::fs::{self, File, OpenOptions};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use fs2::FileExt;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::error::{Error, Result};
 use crate::protocol::*;
 
 const APPLICATION_ID: i64 = 0x50525253;
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 const MAX_CONTENT_BYTES: i64 = 1024 * 1024 * 1024;
 
 pub struct Store {
-    connection: Connection,
+    pub(crate) connection: Connection,
     _lock: File,
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Cursor {
-    created_at: i64,
-    id: String,
-    lifecycle: Option<SessionLifecycle>,
-}
-
-fn label<T: Serialize>(value: T) -> Result<String> {
+pub(crate) fn label<T: Serialize>(value: T) -> Result<String> {
     let value = serde_json::to_value(value)?;
     value
         .as_str()
@@ -36,7 +27,7 @@ fn label<T: Serialize>(value: T) -> Result<String> {
         .ok_or_else(|| Error::Invalid("invalid enum".into()))
 }
 
-fn validate_text(value: &str, maximum: usize, empty: bool) -> Result<()> {
+pub(crate) fn validate_text(value: &str, maximum: usize, empty: bool) -> Result<()> {
     if (!empty && value.trim().is_empty())
         || value.len() > maximum
         || value.chars().any(char::is_control)
@@ -46,7 +37,7 @@ fn validate_text(value: &str, maximum: usize, empty: bool) -> Result<()> {
     Ok(())
 }
 
-fn validate_id(id: &str) -> Result<()> {
+pub(crate) fn validate_id(id: &str) -> Result<()> {
     if id.is_empty()
         || id.len() > 128
         || !id
@@ -196,6 +187,16 @@ impl Store {
         }
         transaction.execute("INSERT INTO session_heads(id,created_at,lifecycle,revision,payload) VALUES(?1,?2,?3,?4,?5)",
             params![session.id, session.created_at, label(session.lifecycle)?, session.revision, json])?;
+        transaction.execute(
+            "INSERT INTO session_search(rowid,id,title,workspace) VALUES(?1,?2,?3,?4)",
+            params![
+                transaction.last_insert_rowid(),
+                session.id,
+                session.title,
+                session.workspace
+            ],
+        )?;
+        Self::adjust_counts(transaction, session, 1)?;
         Ok(())
     }
 
@@ -216,6 +217,7 @@ impl Store {
             return Err(Error::Invalid("invalid revision".into()));
         }
         let mut session = self.session(id)?;
+        let previous = session.clone();
         if session.revision != update.revision {
             return Err(Error::Conflict);
         }
@@ -237,6 +239,13 @@ impl Store {
         if changed != 1 {
             return Err(Error::Conflict);
         }
+        if previous.title != session.title {
+            transaction.execute("UPDATE session_search SET title=?1 WHERE rowid=(SELECT rowid FROM session_heads WHERE id=?2)", params![session.title, id])?;
+        }
+        if previous.lifecycle != session.lifecycle || previous.status != session.status {
+            Self::adjust_counts(&transaction, &previous, -1)?;
+            Self::adjust_counts(&transaction, &session, 1)?;
+        }
         Self::append_event(
             &transaction,
             "sessions",
@@ -248,79 +257,22 @@ impl Store {
         Ok(session)
     }
 
-    pub fn sessions(&self, query: SessionQuery) -> Result<SessionPage> {
-        let limit = query.limit.unwrap_or(100);
-        if limit == 0 || limit > MAX_PAGE_ITEMS {
-            return Err(Error::Invalid("page limit must be 1..200".into()));
+    fn adjust_counts(
+        transaction: &Transaction<'_>,
+        session: &SessionHead,
+        delta: i64,
+    ) -> Result<()> {
+        let active = i64::from(session.lifecycle == SessionLifecycle::Active);
+        let attention = active
+            * i64::from(matches!(
+                session.status,
+                SessionStatus::WaitingInput | SessionStatus::WaitingPermission
+            ));
+        for (scope, workspace) in [(0, ""), (1, session.workspace.as_str())] {
+            transaction.execute("INSERT INTO session_counts(scope,workspace,total,active,attention) VALUES(?1,?2,0,0,0) ON CONFLICT DO NOTHING", params![scope, workspace])?;
+            transaction.execute("UPDATE session_counts SET total=total+?1,active=active+?2,attention=attention+?3 WHERE scope=?4 AND workspace=?5", params![delta, delta * active, delta * attention, scope, workspace])?;
         }
-        let cursor = if let Some(raw) = query.cursor {
-            if raw.len() > 512 {
-                return Err(Error::Invalid("invalid cursor".into()));
-            }
-            let decoded = URL_SAFE_NO_PAD
-                .decode(raw)
-                .map_err(|_| Error::Invalid("invalid cursor".into()))?;
-            let cursor: Cursor = serde_json::from_slice(&decoded)
-                .map_err(|_| Error::Invalid("invalid cursor".into()))?;
-            validate_id(&cursor.id)?;
-            if cursor.created_at < 0 || cursor.lifecycle != query.lifecycle {
-                return Err(Error::Invalid("cursor does not match query".into()));
-            }
-            Some(cursor)
-        } else {
-            None
-        };
-        let (time, id) = cursor.as_ref().map_or((i64::MAX, "~"), |cursor| {
-            (cursor.created_at, cursor.id.as_str())
-        });
-        let mut values = if let Some(lifecycle) = query.lifecycle {
-            let mut statement = self.connection.prepare_cached("SELECT payload FROM session_heads WHERE lifecycle=?1 AND (created_at,id)<(?2,?3) ORDER BY created_at DESC,id DESC LIMIT ?4")?;
-            statement
-                .query_map(
-                    params![label(lifecycle)?, time, id, (limit + 1) as i64],
-                    |r| r.get::<_, String>(0),
-                )?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        } else {
-            let mut statement = self.connection.prepare_cached("SELECT payload FROM session_heads WHERE (created_at,id)<(?1,?2) ORDER BY created_at DESC,id DESC LIMIT ?3")?;
-            statement
-                .query_map(params![time, id, (limit + 1) as i64], |r| {
-                    r.get::<_, String>(0)
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        };
-        let mut has_more = values.len() > limit;
-        values.truncate(limit);
-        let mut items: Vec<SessionHead> = Vec::with_capacity(values.len());
-        let mut bytes = 0;
-        for value in values {
-            if bytes + value.len() > MAX_PAGE_BYTES {
-                has_more = true;
-                break;
-            }
-            bytes += value.len();
-            items.push(serde_json::from_str(&value)?);
-        }
-        let next_cursor = if has_more {
-            items
-                .last()
-                .map(|session| {
-                    serde_json::to_vec(&Cursor {
-                        created_at: session.created_at,
-                        id: session.id.clone(),
-                        lifecycle: query.lifecycle,
-                    })
-                    .map(|value| URL_SAFE_NO_PAD.encode(value))
-                })
-                .transpose()?
-        } else {
-            None
-        };
-        Ok(SessionPage {
-            items,
-            next_cursor,
-            has_more,
-        })
+        Ok(())
     }
 
     fn append_event(
