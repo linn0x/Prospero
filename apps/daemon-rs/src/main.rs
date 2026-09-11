@@ -33,6 +33,12 @@ enum Command {
         #[arg(long)]
         sessions: usize,
     },
+    SeedConversation {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long, default_value_t = 100)]
+        turns: usize,
+    },
     Benchmark {
         #[arg(long)]
         data_dir: PathBuf,
@@ -62,6 +68,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "{}",
                 json!({"seeded": sessions, "integrity": store.check()?})
+            );
+        }
+        Command::SeedConversation { data_dir, turns } => {
+            let mut store = Store::open(&data_dir)?;
+            let session = store.seed_conversation(turns)?;
+            println!(
+                "{}",
+                json!({"sessionId":session.id,"turns":turns,"records":turns*4})
             );
         }
         Command::Benchmark { data_dir } => {

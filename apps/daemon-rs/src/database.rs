@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::protocol::*;
 
 const APPLICATION_ID: i64 = 0x50525253;
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 const MAX_CONTENT_BYTES: i64 = 1024 * 1024 * 1024;
 
@@ -283,7 +283,7 @@ impl Store {
         Ok(())
     }
 
-    fn append_event(
+    pub(crate) fn append_event(
         transaction: &Transaction<'_>,
         scope: &str,
         kind: &str,

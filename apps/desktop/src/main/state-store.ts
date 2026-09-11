@@ -329,6 +329,7 @@ export class StateStore extends EventEmitter {
           id,
           agent: stringValue(value["agent"], "shell"),
           kind: stringValue(value["kind"], "pty"),
+          ...(value["historyMode"] === "paged" ? { historyMode: "paged" as const } : {}),
           title: displayTitle || stringValue(value["title"], "未命名会话"),
           ...(displayTitle ? { displayTitle } : {}),
           cwd: stringValue(value["cwd"]),

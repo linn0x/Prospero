@@ -1,5 +1,6 @@
 import type { ContentPage, EventPage, EventQuery, Health, RenameSession, SessionHead, SessionLookupResult, SessionPage, SessionQuery, SessionSummary, WorkspacePage, WorkspaceQuery } from "@prospero/protocol/rust-daemon";
 import type { RustContent } from "../shared/rust-api";
+import type { TimelinePage, TimelineQuery, TimelineLookupResult, TimelineTextQuery, TimelineTextPage } from "@prospero/protocol/rust-daemon";
 
 const MAX_BYTES = 2 * 1024 * 1024;
 function id(value: string): string {
@@ -54,6 +55,23 @@ export class RustClient {
   }
 
   health(signal: AbortSignal | null = null): Promise<Health> { return this.json("/v1/health", { signal }); }
+  timeline(value: string, query: TimelineQuery, signal: AbortSignal | null = null): Promise<TimelinePage> {
+    const params = new URLSearchParams();
+    if (query.before !== null) params.set("before", String(query.before));
+    if (query.after !== null) params.set("after", String(query.after));
+    if (query.limit !== null) params.set("limit", String(query.limit));
+    return this.json(`/v1/sessions/${id(value)}/timeline?${params}`, { signal });
+  }
+  timelineLookup(value: string, ids: string[], signal: AbortSignal | null = null): Promise<TimelineLookupResult> {
+    if (ids.length > 40) throw new Error("Timeline lookup exceeds limit");
+    return this.json(`/v1/sessions/${id(value)}/timeline/lookup`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ ids: ids.map(id) }) });
+  }
+  timelineText(value: string, record: string, query: TimelineTextQuery, signal: AbortSignal | null = null): Promise<TimelineTextPage> {
+    const params = new URLSearchParams();
+    if (query.part !== null) params.set("part", String(query.part));
+    if (query.generation !== null) params.set("generation", String(query.generation));
+    return this.json(`/v1/sessions/${id(value)}/timeline/${id(record)}/body?${params}`, { signal });
+  }
   async shutdown(signal: AbortSignal | null = null): Promise<void> { await this.json("/v1/shutdown", { method: "POST", signal }); }
   sessions(query: SessionQuery, signal: AbortSignal | null = null): Promise<SessionPage> {
     const params = new URLSearchParams();
