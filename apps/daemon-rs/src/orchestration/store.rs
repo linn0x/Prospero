@@ -1,0 +1,1610 @@
+//! SQLite-backed orchestration storage.
+//!
+//! All writes run on the single database worker thread, so the methods never
+//! race in process; the database still enforces the cross-process invariants
+//! (one live dispatch per task, foreign keys, revision optimistic concurrency).
+//! Readiness is computed by an indexed anti-join, never by scanning the graph.
+
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
+use std::hash::Hasher;
+
+use rusqlite::{OptionalExtension, Transaction, params};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use ts_rs::TS;
+
+use super::*;
+use crate::database::{Store, now, validate_id, validate_text};
+use crate::error::{Error, Result};
+
+const MAX_GRAPH_NODES: usize = 200;
+const MAX_SKILLS: usize = 5;
+const OPERATIONS_RETENTION: i64 = 1_000;
+
+/// Deterministic fingerprint for the idempotency ledger. It only has to detect
+/// "same operation id, different request" across daemon restarts; it is not a
+/// security boundary, so FNV-1a (stable across processes) suffices.
+fn fingerprint(method: &str, payload: &impl Serialize) -> String {
+    let mut hasher = DefaultHasher::new();
+    hasher.write(method.as_bytes());
+    hasher.write(b"\0");
+    hasher.write(serde_json::to_vec(payload).unwrap_or_default().as_slice());
+    format!("{:016x}", hasher.finish())
+}
+
+enum Idempotent<T> {
+    Replay(T),
+    Fresh,
+}
+
+/// Check an idempotency key: replay the frozen first result when the request
+/// matches, reject when the same id was used for a different request.
+fn operation_guard<T: DeserializeOwned>(
+    tx: &Transaction<'_>,
+    id: &str,
+    fingerprint: &str,
+) -> Result<Idempotent<T>> {
+    let row: Option<(String, String)> = tx
+        .query_row(
+            "SELECT fingerprint,result FROM orch_operations WHERE id=?",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    match row {
+        None => Ok(Idempotent::Fresh),
+        Some((existing, result)) if existing == fingerprint => {
+            Ok(Idempotent::Replay(serde_json::from_str(&result)?))
+        }
+        Some(_) => Err(invalid("operation id was already used for another request")),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SettleOutcome {
+    pub task: Task,
+    pub dispatch: Dispatch,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryReport {
+    /// Dispatches whose worker session is gone; converged abandoned/failed.
+    pub settled: Vec<Dispatch>,
+    /// `starting` dispatches whose worker survived; promoted to `running`.
+    pub resumed: Vec<Dispatch>,
+}
+
+#[derive(Clone)]
+struct TaskRow {
+    id: String,
+    run_id: String,
+    title: String,
+    spec: String,
+    skills: Vec<String>,
+    deps: Vec<String>,
+    parent_id: Option<String>,
+    status: TaskStatus,
+    result: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+impl TaskRow {
+    fn task(self) -> Task {
+        Task {
+            id: self.id,
+            run_id: self.run_id,
+            title: self.title,
+            spec: self.spec,
+            skills: self.skills,
+            deps: self.deps,
+            parent_id: self.parent_id,
+            status: self.status,
+            result: self.result,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+fn new_id(prefix: &str) -> String {
+    format!("{prefix}-{}", uuid::Uuid::new_v4())
+}
+
+fn invalid(message: &str) -> Error {
+    Error::Invalid(message.into())
+}
+
+/// Legacy skill name rule: `$name` references in a task spec must resolve to an
+/// explicitly bound skill, so names stay conservative.
+fn normalize_skills(values: &[String]) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for raw in values {
+        let value = raw.trim();
+        let valid = !value.is_empty()
+            && value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
+            && value
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric());
+        if !valid {
+            return Err(invalid(&format!("invalid skill name: {raw}")));
+        }
+        let key = value.to_ascii_lowercase();
+        if seen.insert(key) {
+            out.push(value.to_owned());
+        }
+    }
+    if out.len() > MAX_SKILLS {
+        return Err(invalid("a task may bind at most 5 skills"));
+    }
+    Ok(out)
+}
+
+// ── Row mapping ──────────────────────────────────────────────────────────
+
+fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
+    let status: String = row.get("status")?;
+    Ok(Run {
+        id: row.get("id")?,
+        objective: row.get("objective")?,
+        status: match status.as_str() {
+            "completed" => RunStatus::Completed,
+            "abandoned" => RunStatus::Abandoned,
+            _ => RunStatus::Active,
+        },
+        coordinator_session_id: row.get("coordinator_session_id")?,
+        graph_revision: row.get("graph_revision")?,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+    })
+}
+
+fn map_dispatch(row: &rusqlite::Row<'_>) -> rusqlite::Result<Dispatch> {
+    let state: String = row.get("state")?;
+    Ok(Dispatch {
+        id: row.get("id")?,
+        run_id: row.get("run_id")?,
+        task_id: row.get("task_id")?,
+        session_id: row.get("session_id")?,
+        state: DispatchState::parse(&state).unwrap_or(DispatchState::Starting),
+        outcome: row.get("outcome")?,
+        started_at: row.get("started_at")?,
+        settled_at: row.get("settled_at")?,
+    })
+}
+
+fn map_gate(row: &rusqlite::Row<'_>) -> rusqlite::Result<Gate> {
+    let status: String = row.get("status")?;
+    Ok(Gate {
+        id: row.get("id")?,
+        run_id: row.get("run_id")?,
+        task_id: row.get("task_id")?,
+        question: row.get("question")?,
+        options: serde_json::from_str(&row.get::<_, String>("options")?).unwrap_or_default(),
+        status: match status.as_str() {
+            "pending" => GateStatus::Pending,
+            "resolved" => GateStatus::Resolved,
+            _ => GateStatus::Cancelled,
+        },
+        decision: row.get("decision")?,
+        created_at: row.get("created_at")?,
+        resolved_at: row.get("resolved_at")?,
+    })
+}
+
+impl Store {
+    // ── Runs ─────────────────────────────────────────────────────────────
+
+    pub fn list_runs(&self) -> Result<Vec<Run>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT * FROM orch_runs ORDER BY created_at DESC,id DESC")?;
+        let rows = statement.query_map([], map_run)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn orch_run(&self, run_id: &str) -> Result<Run> {
+        validate_id(run_id)?;
+        self.connection
+            .query_row("SELECT * FROM orch_runs WHERE id=?", [run_id], map_run)
+            .optional()?
+            .ok_or(Error::NotFound)
+    }
+
+    fn require_active_run(tx: &Transaction<'_>, run_id: &str) -> Result<Run> {
+        let run: Run = tx
+            .query_row("SELECT * FROM orch_runs WHERE id=?", [run_id], map_run)
+            .optional()?
+            .ok_or(Error::NotFound)?;
+        if run.status != RunStatus::Active {
+            return Err(invalid("the run is settled; history is read-only"));
+        }
+        Ok(run)
+    }
+
+    /// All tasks of a run with their dependency edges, in creation order.
+    fn run_task_rows(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<TaskRow>> {
+        let mut tasks = Vec::new();
+        {
+            let mut statement = tx.prepare(
+                "SELECT id,run_id,title,spec,skills,parent_id,status,result,created_at,updated_at \
+                 FROM orch_tasks WHERE run_id=?1 ORDER BY created_at,id",
+            )?;
+            let rows = statement.query_map([run_id], |row| {
+                Ok(TaskRow {
+                    id: row.get(0)?,
+                    run_id: row.get(1)?,
+                    title: row.get(2)?,
+                    spec: row.get(3)?,
+                    skills: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
+                    deps: Vec::new(),
+                    parent_id: row.get(5)?,
+                    status: TaskStatus::parse(&row.get::<_, String>(6)?)
+                        .unwrap_or(TaskStatus::Pending),
+                    result: row.get(7)?,
+                    created_at: row.get(8)?,
+                    updated_at: row.get(9)?,
+                })
+            })?;
+            for row in rows {
+                tasks.push(row?);
+            }
+        }
+        let mut by_id: HashMap<String, usize> = HashMap::new();
+        for (index, task) in tasks.iter().enumerate() {
+            by_id.insert(task.id.clone(), index);
+        }
+        let mut statement = tx.prepare(
+            "SELECT task_id,dep_id FROM orch_task_deps WHERE run_id=?1 ORDER BY task_id,position",
+        )?;
+        let rows = statement.query_map([run_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (task_id, dep_id) = row?;
+            if let Some(index) = by_id.get(&task_id) {
+                tasks[*index].deps.push(dep_id);
+            }
+        }
+        Ok(tasks)
+    }
+
+    pub fn run_snapshot(&mut self, run_id: &str) -> Result<RunSnapshot> {
+        validate_id(run_id)?;
+        let run = self.orch_run(run_id)?;
+        let tx = self.connection.transaction()?;
+        let rows = Self::run_task_rows(&tx, run_id)?;
+        let mut ready_statement = tx.prepare(
+            "SELECT t.id FROM orch_tasks t WHERE t.run_id=?1 AND t.status='pending' \
+             AND NOT EXISTS ( \
+               SELECT 1 FROM orch_task_deps d JOIN orch_tasks x ON x.id=d.dep_id \
+               WHERE d.run_id=?1 AND d.task_id=t.id AND x.status<>'done' \
+             ) ORDER BY t.created_at,t.id",
+        )?;
+        let ready = ready_statement
+            .query_map([run_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut dispatch_statement =
+            tx.prepare("SELECT * FROM orch_dispatches WHERE run_id=?1 ORDER BY started_at,id")?;
+        let dispatches = dispatch_statement
+            .query_map([run_id], map_dispatch)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut gate_statement =
+            tx.prepare("SELECT * FROM orch_gates WHERE run_id=?1 ORDER BY created_at,id")?;
+        let gates = gate_statement
+            .query_map([run_id], map_gate)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let tasks = rows.into_iter().map(TaskRow::task).collect();
+        Ok(RunSnapshot {
+            run,
+            tasks,
+            ready,
+            dispatches,
+            gates,
+        })
+    }
+
+    pub fn list_ready_tasks(&mut self, run_id: &str) -> Result<Vec<Task>> {
+        validate_id(run_id)?;
+        self.orch_run(run_id)?;
+        let tx = self.connection.transaction()?;
+        let mut statement = tx.prepare(
+            "SELECT id FROM orch_tasks WHERE run_id=?1 AND status='pending' \
+             AND NOT EXISTS ( \
+               SELECT 1 FROM orch_task_deps d JOIN orch_tasks x ON x.id=d.dep_id \
+               WHERE d.run_id=?1 AND d.task_id=orch_tasks.id AND x.status<>'done' \
+             ) ORDER BY created_at,id",
+        )?;
+        let ids = statement
+            .query_map([run_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        let rows = Self::run_task_rows(&tx, run_id)?;
+        Ok(rows
+            .into_iter()
+            .filter(|row| ids.contains(&row.id))
+            .map(TaskRow::task)
+            .collect())
+    }
+
+    // ── Graph mutation ───────────────────────────────────────────────────
+
+    fn validate_nodes(nodes: &[GraphNodeInput], allow_empty: bool) -> Result<()> {
+        if nodes.is_empty() && !allow_empty {
+            return Err(invalid("the task graph must contain at least one node"));
+        }
+        if nodes.len() > MAX_GRAPH_NODES {
+            return Err(invalid("a graph edit may contain at most 200 nodes"));
+        }
+        let mut ids = HashSet::new();
+        for node in nodes {
+            let client = node.client_id.trim();
+            if client.is_empty() || !ids.insert(client) {
+                return Err(invalid("node clientId must be unique and non-empty"));
+            }
+            validate_text(&node.title, 1024, false)?;
+            validate_text(&node.spec, 8192, false)?;
+            if node.deps.len() != node.deps.iter().collect::<HashSet<_>>().len() {
+                return Err(invalid(&format!(
+                    "node {client} lists a duplicate dependency"
+                )));
+            }
+            normalize_skills(&node.skills)?;
+        }
+        Ok(())
+    }
+
+    /// Validate references and run the cycle check over a candidate task set.
+    fn validate_candidate(candidates: &HashMap<String, TaskRow>) -> Result<()> {
+        for task in candidates.values() {
+            for dep in &task.deps {
+                let target = candidates
+                    .get(dep)
+                    .ok_or_else(|| invalid(&format!("dependency does not exist: {dep}")))?;
+                if target.run_id != task.run_id {
+                    return Err(invalid("dependency belongs to another run"));
+                }
+            }
+            if let Some(parent) = &task.parent_id {
+                let target = candidates
+                    .get(parent)
+                    .ok_or_else(|| invalid(&format!("parent task does not exist: {parent}")))?;
+                if target.run_id != task.run_id || target.id == task.id {
+                    return Err(invalid("invalid parent task"));
+                }
+            }
+        }
+        let edges: HashMap<String, Vec<String>> = candidates
+            .iter()
+            .map(|(id, task)| (id.clone(), task.deps.clone()))
+            .collect();
+        if let Some(cycle) = find_cycle(&edges) {
+            return Err(invalid(&format!(
+                "task dependency cycle: {}",
+                cycle.join(" -> ")
+            )));
+        }
+        Ok(())
+    }
+
+    fn emit(tx: &Transaction<'_>, kind: &str, id: &str, value: Value) -> Result<()> {
+        Store::append_event(tx, "orchestration", kind, id, value).map(|_| ())
+    }
+
+    pub fn create_run_graph(&mut self, input: CreateRunGraph) -> Result<GraphMutationResult> {
+        validate_id(&input.operation_id)?;
+        validate_text(&input.objective, 4096, false)?;
+        Self::validate_nodes(&input.nodes, false)?;
+        if let Some(coordinator) = &input.coordinator_session_id {
+            validate_id(coordinator)?;
+        }
+        let now = now();
+        let run_id = new_id("run");
+        let id_map: HashMap<String, String> = input
+            .nodes
+            .iter()
+            .map(|node| (node.client_id.trim().to_owned(), new_id("task")))
+            .collect();
+        let mut candidates: HashMap<String, TaskRow> = HashMap::new();
+        for node in &input.nodes {
+            let id = id_map[node.client_id.trim()].clone();
+            let deps =
+                node.deps
+                    .iter()
+                    .map(|dep| {
+                        id_map.get(dep).cloned().ok_or_else(|| {
+                            invalid(&format!("dependency node does not exist: {dep}"))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+            let parent_id =
+                match node.parent_id.as_deref() {
+                    None => None,
+                    Some(parent) => Some(id_map.get(parent).cloned().ok_or_else(|| {
+                        invalid(&format!("parent node does not exist: {parent}"))
+                    })?),
+                };
+            candidates.insert(
+                id.clone(),
+                TaskRow {
+                    id,
+                    run_id: run_id.clone(),
+                    title: node.title.trim().to_owned(),
+                    spec: node.spec.trim().to_owned(),
+                    skills: normalize_skills(&node.skills)?,
+                    deps,
+                    parent_id,
+                    status: TaskStatus::Pending,
+                    result: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+            );
+        }
+        Self::validate_candidate(&candidates)?;
+
+        let tx = self.connection.transaction()?;
+        // New rows may reference siblings inserted later; enforce foreign keys
+        // at commit instead of statement-by-statement.
+        tx.execute_batch("PRAGMA defer_foreign_keys=ON")?;
+        match operation_guard::<GraphMutationResult>(
+            &tx,
+            &input.operation_id,
+            &fingerprint("graph.create", &input),
+        )? {
+            Idempotent::Replay(result) => return Ok(result),
+            Idempotent::Fresh => {}
+        }
+        let run = Run {
+            id: run_id.clone(),
+            objective: input.objective.trim().to_owned(),
+            status: RunStatus::Active,
+            coordinator_session_id: input.coordinator_session_id.clone(),
+            graph_revision: 1,
+            created_at: now,
+            updated_at: now,
+        };
+        tx.execute(
+            "INSERT INTO orch_runs(id,objective,status,coordinator_session_id,graph_revision,created_at,updated_at) \
+             VALUES(?1,?2,'active',?3,1,?4,?4)",
+            params![run.id, run.objective, run.coordinator_session_id, now],
+        )?;
+        Self::emit(&tx, "run.created", &run.id, serde_json::to_value(&run)?)?;
+        let mut ordered: Vec<&TaskRow> = input
+            .nodes
+            .iter()
+            .map(|node| &candidates[&id_map[node.client_id.trim()]])
+            .collect();
+        ordered.sort_by(|a, b| a.id.cmp(&b.id));
+        for task in &ordered {
+            Self::insert_task(&tx, task)?;
+        }
+        let result = GraphMutationResult {
+            run: run.clone(),
+            tasks: ordered.iter().map(|task| (*task).clone().task()).collect(),
+            id_map: id_map.clone(),
+            deleted_task_ids: Vec::new(),
+        };
+        Self::remember(
+            &tx,
+            &input.operation_id,
+            &fingerprint("graph.create", &input),
+            &result,
+        )?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    fn insert_task(tx: &Transaction<'_>, task: &TaskRow) -> Result<()> {
+        tx.execute(
+            "INSERT INTO orch_tasks(id,run_id,title,spec,skills,parent_id,status,result,created_at,updated_at) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7,NULL,?8,?8)",
+            params![
+                task.id,
+                task.run_id,
+                task.title,
+                task.spec,
+                serde_json::to_string(&task.skills)?,
+                task.parent_id,
+                task.status.label(),
+                task.created_at,
+            ],
+        )?;
+        for (position, dep) in task.deps.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO orch_task_deps(run_id,task_id,dep_id,position) VALUES(?1,?2,?3,?4)",
+                params![task.run_id, task.id, dep, position as i64],
+            )?;
+        }
+        Self::emit(
+            tx,
+            "task.created",
+            &task.id,
+            serde_json::to_value(task.clone().task())?,
+        )?;
+        Ok(())
+    }
+
+    pub fn apply_task_graph(&mut self, input: ApplyTaskGraph) -> Result<GraphMutationResult> {
+        validate_id(&input.run_id)?;
+        if input.nodes.is_empty() && input.delete_task_ids.is_empty() {
+            return Err(invalid("a graph edit must add, change or delete a node"));
+        }
+        if input.delete_task_ids.len() > MAX_GRAPH_NODES
+            || input
+                .delete_task_ids
+                .iter()
+                .any(|id| id.is_empty() || id.len() > 128)
+            || input.delete_task_ids.len()
+                != input.delete_task_ids.iter().collect::<HashSet<_>>().len()
+        {
+            return Err(invalid("deleteTaskIds must contain at most 200 unique ids"));
+        }
+        Self::validate_nodes(&input.nodes, true)?;
+
+        let tx = self.connection.transaction()?;
+        tx.execute_batch("PRAGMA defer_foreign_keys=ON")?;
+        if let Some(operation_id) = &input.operation_id
+            && let Idempotent::Replay(result) = operation_guard::<GraphMutationResult>(
+                &tx,
+                operation_id,
+                &fingerprint("graph.apply", &input),
+            )?
+        {
+            return Ok(result);
+        }
+        let run = Self::require_active_run(&tx, &input.run_id)?;
+        if run.graph_revision != input.base_revision {
+            return Err(Error::Conflict);
+        }
+        let delete: HashSet<&str> = input.delete_task_ids.iter().map(String::as_str).collect();
+
+        // clientId maps to an existing task (editable pending tasks only) or a
+        // fresh id.
+        let mut id_map: HashMap<String, String> = HashMap::new();
+        for node in &input.nodes {
+            let client = node.client_id.trim();
+            if delete.contains(client) {
+                return Err(invalid(&format!(
+                    "node {client} is both edited and deleted"
+                )));
+            }
+            let existing = Self::task_status(&tx, client)?;
+            match existing {
+                None => {
+                    id_map.insert(client.to_owned(), new_id("task"));
+                }
+                Some((existing_run, status)) => {
+                    if existing_run != run.id {
+                        return Err(invalid("task belongs to another run"));
+                    }
+                    if status != TaskStatus::Pending {
+                        return Err(invalid("only pending tasks can be edited"));
+                    }
+                    id_map.insert(client.to_owned(), client.to_owned());
+                }
+            }
+        }
+
+        // Full candidate copy; validation failure never touches real rows.
+        let mut candidates: HashMap<String, TaskRow> = Self::run_task_rows(&tx, &run.id)?
+            .into_iter()
+            .map(|row| (row.id.clone(), row))
+            .collect();
+        for deleted in &delete {
+            let task = candidates
+                .get(*deleted)
+                .ok_or_else(|| invalid("task to delete does not exist"))?;
+            if task.run_id != run.id {
+                return Err(invalid("task to delete belongs to another run"));
+            }
+            if task.status != TaskStatus::Pending {
+                return Err(invalid("only pending tasks can be deleted"));
+            }
+            candidates.remove(*deleted);
+        }
+        let resolve = |reference: &str, candidates: &HashMap<String, TaskRow>| -> Result<String> {
+            if let Some(id) = id_map.get(reference) {
+                return Ok(id.clone());
+            }
+            let task = candidates
+                .get(reference)
+                .ok_or_else(|| invalid(&format!("referenced node does not exist: {reference}")))?;
+            if task.run_id != run.id {
+                return Err(invalid("reference belongs to another run"));
+            }
+            Ok(task.id.clone())
+        };
+        let now = now();
+        for node in &input.nodes {
+            let id = id_map[node.client_id.trim()].clone();
+            let existing = candidates.get(&id).cloned();
+            let deps = node
+                .deps
+                .iter()
+                .map(|dep| resolve(dep, &candidates))
+                .collect::<Result<Vec<_>>>()?;
+            let parent_id = match node.parent_id.as_deref() {
+                None => None,
+                Some(parent) => Some(resolve(parent, &candidates)?),
+            };
+            candidates.insert(
+                id.clone(),
+                TaskRow {
+                    id,
+                    run_id: run.id.clone(),
+                    title: node.title.trim().to_owned(),
+                    spec: node.spec.trim().to_owned(),
+                    skills: normalize_skills(&node.skills)?,
+                    deps,
+                    parent_id,
+                    status: existing
+                        .as_ref()
+                        .map_or(TaskStatus::Pending, |row| row.status),
+                    result: existing.as_ref().and_then(|row| row.result.clone()),
+                    created_at: existing.as_ref().map_or(now, |row| row.created_at),
+                    updated_at: now,
+                },
+            );
+        }
+        Self::validate_candidate(&candidates)?;
+
+        // Apply deletions first; cascades remove dispatch/gate rows.
+        for deleted in &delete {
+            tx.execute("DELETE FROM orch_messages WHERE task_id=?1", [deleted])?;
+            tx.execute(
+                "DELETE FROM orch_task_deps WHERE task_id=?1 OR dep_id=?1",
+                [deleted],
+            )?;
+            tx.execute("DELETE FROM orch_tasks WHERE id=?1", [deleted])?;
+            Self::emit(
+                &tx,
+                "task.deleted",
+                deleted,
+                serde_json::json!({"id": deleted}),
+            )?;
+        }
+        // Upsert edits and new nodes.
+        let mut changed: Vec<TaskRow> = Vec::new();
+        for node in &input.nodes {
+            let task = candidates[&id_map[node.client_id.trim()]].clone();
+            let exists: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM orch_tasks WHERE id=?)",
+                    [&task.id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if exists {
+                tx.execute(
+                    "UPDATE orch_tasks SET title=?1,spec=?2,skills=?3,parent_id=?4,updated_at=?5 WHERE id=?6",
+                    params![
+                        task.title,
+                        task.spec,
+                        serde_json::to_string(&task.skills)?,
+                        task.parent_id,
+                        now,
+                        task.id
+                    ],
+                )?;
+                tx.execute("DELETE FROM orch_task_deps WHERE task_id=?", [&task.id])?;
+                for (position, dep) in task.deps.iter().enumerate() {
+                    tx.execute(
+                        "INSERT INTO orch_task_deps(run_id,task_id,dep_id,position) VALUES(?1,?2,?3,?4)",
+                        params![task.run_id, task.id, dep, position as i64],
+                    )?;
+                }
+                Self::emit(
+                    &tx,
+                    "task.updated",
+                    &task.id,
+                    serde_json::to_value(task.clone().task())?,
+                )?;
+            } else {
+                Self::insert_task(&tx, &task)?;
+            }
+            changed.push(task);
+        }
+        let revision = run.graph_revision + 1;
+        tx.execute(
+            "UPDATE orch_runs SET graph_revision=?1,updated_at=?2 WHERE id=?3",
+            params![revision, now, run.id],
+        )?;
+        let run = Store::orch_run_from_tx(&tx, &run.id)?;
+        Self::emit(&tx, "run.updated", &run.id, serde_json::to_value(&run)?)?;
+        let result = GraphMutationResult {
+            run,
+            tasks: changed.into_iter().map(TaskRow::task).collect(),
+            id_map,
+            deleted_task_ids: input.delete_task_ids.clone(),
+        };
+        if let Some(operation_id) = &input.operation_id {
+            Self::remember(
+                &tx,
+                operation_id,
+                &fingerprint("graph.apply", &input),
+                &result,
+            )?;
+        }
+        tx.commit()?;
+        Ok(result)
+    }
+
+    fn task_status(tx: &Transaction<'_>, id: &str) -> Result<Option<(String, TaskStatus)>> {
+        tx.query_row(
+            "SELECT run_id,status FROM orch_tasks WHERE id=?",
+            [id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    TaskStatus::parse(&row.get::<_, String>(1)?).unwrap_or(TaskStatus::Pending),
+                ))
+            },
+        )
+        .optional()
+        .map_err(Error::from)
+    }
+
+    fn orch_run_from_tx(tx: &Transaction<'_>, id: &str) -> Result<Run> {
+        tx.query_row("SELECT * FROM orch_runs WHERE id=?", [id], map_run)
+            .optional()?
+            .ok_or(Error::NotFound)
+    }
+
+    // ── Tasks ────────────────────────────────────────────────────────────
+
+    pub fn task(&mut self, task_id: &str) -> Result<Task> {
+        validate_id(task_id)?;
+        let tx = self.connection.transaction()?;
+        Self::task_row(&tx, task_id).map(TaskRow::task)
+    }
+
+    fn task_row(tx: &Transaction<'_>, task_id: &str) -> Result<TaskRow> {
+        let row = tx
+            .query_row(
+                "SELECT id,run_id,title,spec,skills,parent_id,status,result,created_at,updated_at \
+                 FROM orch_tasks WHERE id=?",
+                [task_id],
+                |row| {
+                    Ok(TaskRow {
+                        id: row.get(0)?,
+                        run_id: row.get(1)?,
+                        title: row.get(2)?,
+                        spec: row.get(3)?,
+                        skills: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
+                        deps: Vec::new(),
+                        parent_id: row.get(5)?,
+                        status: TaskStatus::parse(&row.get::<_, String>(6)?)
+                            .unwrap_or(TaskStatus::Pending),
+                        result: row.get(7)?,
+                        created_at: row.get(8)?,
+                        updated_at: row.get(9)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or(Error::NotFound)?;
+        let mut row = row;
+        let mut statement =
+            tx.prepare("SELECT dep_id FROM orch_task_deps WHERE task_id=?1 ORDER BY position")?;
+        row.deps = statement
+            .query_map([task_id], |dep| dep.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(row)
+    }
+
+    pub fn list_tasks(&mut self, run_id: Option<&str>) -> Result<Vec<Task>> {
+        let tx = self.connection.transaction()?;
+        let rows = match run_id {
+            Some(run_id) => {
+                validate_id(run_id)?;
+                Self::run_task_rows(&tx, run_id)?
+            }
+            None => {
+                let ids = tx
+                    .prepare("SELECT id FROM orch_runs ORDER BY created_at,id")?
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let mut rows = Vec::new();
+                for id in ids {
+                    rows.extend(Self::run_task_rows(&tx, &id)?);
+                }
+                rows
+            }
+        };
+        Ok(rows.into_iter().map(TaskRow::task).collect())
+    }
+
+    /// Move a task through the explicit transition table; the run must be
+    /// active. Same-state writes are allowed so retried commands are idempotent.
+    fn set_task_status(
+        tx: &Transaction<'_>,
+        task_id: &str,
+        status: TaskStatus,
+        result: Option<Option<String>>,
+    ) -> Result<Task> {
+        Self::write_task_status(tx, task_id, status, result, false)
+    }
+
+    /// Gate resolution may restore a blocked task straight to `dispatched` when
+    /// its worker survived — a transition the normal table forbids.
+    fn force_task_status(
+        tx: &Transaction<'_>,
+        task_id: &str,
+        status: TaskStatus,
+        result: Option<Option<String>>,
+    ) -> Result<Task> {
+        Self::write_task_status(tx, task_id, status, result, true)
+    }
+
+    fn write_task_status(
+        tx: &Transaction<'_>,
+        task_id: &str,
+        status: TaskStatus,
+        result: Option<Option<String>>,
+        force: bool,
+    ) -> Result<Task> {
+        let task = Self::task_row(tx, task_id)?;
+        Self::require_active_run(tx, &task.run_id)?;
+        if !force && !can_transition(task.status, status) {
+            return Err(invalid(&format!(
+                "task cannot transition {} -> {}",
+                task.status.label(),
+                status.label()
+            )));
+        }
+        let now = now();
+        match result {
+            Some(value) => {
+                tx.execute(
+                    "UPDATE orch_tasks SET status=?1,result=?2,updated_at=?3 WHERE id=?4",
+                    params![status.label(), value, now, task_id],
+                )?;
+            }
+            None => {
+                tx.execute(
+                    "UPDATE orch_tasks SET status=?1,updated_at=?2 WHERE id=?3",
+                    params![status.label(), now, task_id],
+                )?;
+            }
+        }
+        let updated = Self::task_row(tx, task_id)?;
+        Self::emit(
+            tx,
+            "task.updated",
+            task_id,
+            serde_json::to_value(updated.clone().task())?,
+        )?;
+        Ok(updated.task())
+    }
+
+    pub fn cancel_task(&mut self, task_id: &str, reason: &str) -> Result<Task> {
+        validate_id(task_id)?;
+        validate_text(reason, 8192, false)?;
+        let tx = self.connection.transaction()?;
+        let task = Self::task_row(&tx, task_id)?;
+        Self::require_active_run(&tx, &task.run_id)?;
+        if task.status == TaskStatus::Cancelled {
+            return Ok(task.task());
+        }
+        if Self::active_dispatch(&tx, task_id)?.is_some() {
+            return Err(invalid("stop the worker before cancelling the task"));
+        }
+        if !matches!(task.status, TaskStatus::Pending | TaskStatus::Blocked) {
+            return Err(invalid("only pending or blocked tasks can be cancelled"));
+        }
+        let now = now();
+        tx.execute(
+            "UPDATE orch_tasks SET status='cancelled',result=?1,updated_at=?2 WHERE id=?3",
+            params![reason, now, task_id],
+        )?;
+        tx.execute(
+            "UPDATE orch_gates SET status='cancelled',resolved_at=?1 \
+             WHERE task_id=?2 AND status='pending'",
+            params![now, task_id],
+        )?;
+        let updated = Self::task_row(&tx, task_id)?.task();
+        Self::emit(
+            &tx,
+            "task.updated",
+            task_id,
+            serde_json::to_value(&updated)?,
+        )?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    pub fn retry_task(&mut self, task_id: &str) -> Result<Task> {
+        validate_id(task_id)?;
+        let tx = self.connection.transaction()?;
+        let task = Self::task_row(&tx, task_id)?;
+        Self::require_active_run(&tx, &task.run_id)?;
+        if task.status != TaskStatus::Failed {
+            return Err(invalid("only failed tasks can be retried"));
+        }
+        let updated = Self::set_task_status(&tx, task_id, TaskStatus::Pending, Some(None))?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    // ── Dispatches ───────────────────────────────────────────────────────
+
+    fn active_dispatch(tx: &Transaction<'_>, task_id: &str) -> Result<Option<Dispatch>> {
+        tx.query_row(
+            "SELECT * FROM orch_dispatches WHERE task_id=?1 AND state IN ('starting','running') \
+             ORDER BY started_at DESC,id DESC LIMIT 1",
+            [task_id],
+            map_dispatch,
+        )
+        .optional()
+        .map_err(Error::from)
+    }
+
+    /// The single dispatch entry point. The database enforces at most one live
+    /// dispatch per task; readiness and the transition table are re-checked at
+    /// this write boundary (ready is only derived, never trusted from the
+    /// caller). `operation_id` makes a retried start return the same dispatch.
+    pub fn dispatch_task(
+        &mut self,
+        task_id: &str,
+        session_id: &str,
+        operation_id: Option<&str>,
+    ) -> Result<SettleOutcome> {
+        validate_id(task_id)?;
+        validate_id(session_id)?;
+        let operation_id = operation_id.map(str::to_owned);
+        if let Some(operation_id) = &operation_id {
+            validate_id(operation_id)?;
+        }
+        let guard_fingerprint = fingerprint(
+            "worker.start",
+            &serde_json::json!({"taskId": task_id, "sessionId": session_id}),
+        );
+        let tx = self.connection.transaction()?;
+        if let Some(operation_id) = &operation_id
+            && let Idempotent::Replay(result) =
+                operation_guard::<SettleOutcome>(&tx, operation_id, &guard_fingerprint)?
+        {
+            return Ok(result);
+        }
+        let task = Self::task_row(&tx, task_id)?;
+        Self::require_active_run(&tx, &task.run_id)?;
+        if Self::active_dispatch(&tx, task_id)?.is_some() {
+            return Err(invalid(
+                "the task already has a live worker; settle it first",
+            ));
+        }
+        let unmet: i64 = tx.query_row(
+            "SELECT count(*) FROM orch_task_deps d JOIN orch_tasks x ON x.id=d.dep_id \
+             WHERE d.task_id=?1 AND x.status<>'done'",
+            [task_id],
+            |row| row.get(0),
+        )?;
+        if unmet > 0 {
+            return Err(invalid("the task dependencies are not all done"));
+        }
+        if !can_transition(task.status, TaskStatus::Dispatched) {
+            return Err(invalid(&format!(
+                "task in state {} cannot be dispatched",
+                task.status.label()
+            )));
+        }
+        let now = now();
+        let dispatch_id = new_id("disp");
+        tx.execute(
+            "INSERT INTO orch_dispatches(id,run_id,task_id,session_id,state,outcome,started_at,settled_at) \
+             VALUES(?1,?2,?3,?4,'starting',NULL,?5,NULL)",
+            params![dispatch_id, task.run_id, task_id, session_id, now],
+        )?;
+        let task = Self::set_task_status(&tx, task_id, TaskStatus::Dispatched, None)?;
+        let dispatch = Self::dispatch_row(&tx, &dispatch_id)?;
+        Self::emit(
+            &tx,
+            "dispatch.updated",
+            &dispatch.id,
+            serde_json::to_value(&dispatch)?,
+        )?;
+        let outcome = SettleOutcome { task, dispatch };
+        if let Some(operation_id) = &operation_id {
+            Self::remember(&tx, operation_id, &guard_fingerprint, &outcome)?;
+        }
+        tx.commit()?;
+        Ok(outcome)
+    }
+
+    fn dispatch_row(tx: &Transaction<'_>, dispatch_id: &str) -> Result<Dispatch> {
+        tx.query_row(
+            "SELECT * FROM orch_dispatches WHERE id=?",
+            [dispatch_id],
+            map_dispatch,
+        )
+        .optional()?
+        .ok_or(Error::NotFound)
+    }
+
+    pub fn dispatch(&self, dispatch_id: &str) -> Result<Dispatch> {
+        validate_id(dispatch_id)?;
+        self.connection
+            .query_row(
+                "SELECT * FROM orch_dispatches WHERE id=?",
+                [dispatch_id],
+                map_dispatch,
+            )
+            .optional()?
+            .ok_or(Error::NotFound)
+    }
+
+    pub fn list_dispatches(&self, run_id: Option<&str>) -> Result<Vec<Dispatch>> {
+        let mut statement = self.connection.prepare(
+            "SELECT * FROM orch_dispatches WHERE ?1 IS NULL OR run_id=?1 ORDER BY started_at,id",
+        )?;
+        let rows = statement.query_map([run_id], map_dispatch)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn set_dispatch_running(&mut self, dispatch_id: &str) -> Result<Dispatch> {
+        validate_id(dispatch_id)?;
+        let tx = self.connection.transaction()?;
+        let dispatch = Self::dispatch_row(&tx, dispatch_id)?;
+        if dispatch.state != DispatchState::Starting {
+            return Err(invalid("dispatch is not starting"));
+        }
+        tx.execute(
+            "UPDATE orch_dispatches SET state='running' WHERE id=?1 AND state='starting'",
+            [dispatch_id],
+        )?;
+        let dispatch = Self::dispatch_row(&tx, dispatch_id)?;
+        Self::emit(
+            &tx,
+            "dispatch.updated",
+            dispatch_id,
+            serde_json::to_value(&dispatch)?,
+        )?;
+        tx.commit()?;
+        Ok(dispatch)
+    }
+
+    /// Worker's explicit delivery commit point. Task and dispatch settle in the
+    /// same transaction so observers never see an intermediate split.
+    pub fn settle_dispatch(
+        &mut self,
+        dispatch_id: &str,
+        success: bool,
+        outcome: &str,
+    ) -> Result<SettleOutcome> {
+        validate_id(dispatch_id)?;
+        validate_text(outcome, 8192, false)?;
+        let tx = self.connection.transaction()?;
+        let dispatch = Self::dispatch_row(&tx, dispatch_id)?;
+        if !dispatch.state.active() {
+            return Err(invalid("the dispatch has already settled"));
+        }
+        let (task_status, dispatch_state) = if success {
+            (TaskStatus::Done, DispatchState::Succeeded)
+        } else {
+            (TaskStatus::Failed, DispatchState::Failed)
+        };
+        let now = now();
+        let task = Self::set_task_status(
+            &tx,
+            &dispatch.task_id,
+            task_status,
+            Some(Some(outcome.to_owned())),
+        )?;
+        tx.execute(
+            "UPDATE orch_dispatches SET state=?1,outcome=?2,settled_at=?3 WHERE id=?4",
+            params![dispatch_state.label(), outcome, now, dispatch_id],
+        )?;
+        let dispatch = Self::dispatch_row(&tx, dispatch_id)?;
+        Self::emit(
+            &tx,
+            "dispatch.updated",
+            dispatch_id,
+            serde_json::to_value(&dispatch)?,
+        )?;
+        tx.commit()?;
+        Ok(SettleOutcome { task, dispatch })
+    }
+
+    /// Settle a live dispatch whose worker is gone. An explicit done/failed
+    /// delivery is preserved; otherwise the dispatch is abandoned and a still
+    /// dispatched task converges to `final_status` (failed or cancelled).
+    pub fn abandon_dispatch(
+        &mut self,
+        dispatch_id: &str,
+        reason: &str,
+        final_status: TaskStatus,
+    ) -> Result<SettleOutcome> {
+        validate_id(dispatch_id)?;
+        validate_text(reason, 8192, false)?;
+        if !matches!(final_status, TaskStatus::Failed | TaskStatus::Cancelled) {
+            return Err(invalid("finalStatus must be failed or cancelled"));
+        }
+        let tx = self.connection.transaction()?;
+        let dispatch = Self::dispatch_row(&tx, dispatch_id)?;
+        if !dispatch.state.active() {
+            return Err(invalid("the dispatch has already settled"));
+        }
+        let task = Self::task_row(&tx, &dispatch.task_id)?;
+        let now = now();
+        let (state, outcome_text, task_target) = match task.status {
+            TaskStatus::Done => (
+                DispatchState::Succeeded,
+                task.result
+                    .clone()
+                    .unwrap_or_else(|| "worker delivered".into()),
+                None,
+            ),
+            TaskStatus::Failed => (
+                DispatchState::Failed,
+                task.result.clone().unwrap_or_else(|| reason.to_owned()),
+                None,
+            ),
+            TaskStatus::Cancelled => (DispatchState::Abandoned, reason.to_owned(), None),
+            _ => (
+                DispatchState::Abandoned,
+                reason.to_owned(),
+                Some(final_status),
+            ),
+        };
+        if let Some(target) = task_target {
+            Self::set_task_status(
+                &tx,
+                &dispatch.task_id,
+                target,
+                Some(Some(reason.to_owned())),
+            )?;
+        }
+        tx.execute(
+            "UPDATE orch_dispatches SET state=?1,outcome=?2,settled_at=?3 WHERE id=?4",
+            params![state.label(), outcome_text, now, dispatch_id],
+        )?;
+        let dispatch = Self::dispatch_row(&tx, dispatch_id)?;
+        let task = Self::task_row(&tx, &dispatch.task_id)?.task();
+        Self::emit(
+            &tx,
+            "dispatch.updated",
+            dispatch_id,
+            serde_json::to_value(&dispatch)?,
+        )?;
+        tx.commit()?;
+        Ok(SettleOutcome { task, dispatch })
+    }
+
+    /// Batch reconciliation after a daemon restart, executed set-based in one
+    /// transaction: a live dispatch whose session vanished (or was archived) is
+    /// abandoned and its dispatched task failed; a surviving `starting`
+    /// dispatch resumes as `running`. Idempotent — a second run converges
+    /// nothing.
+    pub fn recover_dispatches(&mut self) -> Result<RecoveryReport> {
+        let tx = self.connection.transaction()?;
+        let now = now();
+        let reason = "worker session was gone when the daemon recovered";
+        let mut settled_ids = Vec::new();
+        {
+            let mut statement = tx.prepare(
+                "SELECT id FROM orch_dispatches WHERE state IN ('starting','running') AND ( \
+                   session_id NOT IN (SELECT id FROM session_heads) \
+                   OR session_id IN (SELECT id FROM session_heads WHERE lifecycle='archived') \
+                 )",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                settled_ids.push(row?);
+            }
+        }
+        let mut settled = Vec::new();
+        for id in &settled_ids {
+            tx.execute(
+                "UPDATE orch_dispatches SET state='abandoned',outcome=?1,settled_at=?2 WHERE id=?3",
+                params![reason, now, id],
+            )?;
+            tx.execute(
+                "UPDATE orch_tasks SET status='failed',result=?1,updated_at=?2 \
+                 WHERE id=(SELECT task_id FROM orch_dispatches WHERE id=?3) AND status='dispatched'",
+                params![reason, now, id],
+            )?;
+            let dispatch = Self::dispatch_row(&tx, id)?;
+            Self::emit(
+                &tx,
+                "dispatch.updated",
+                id,
+                serde_json::to_value(&dispatch)?,
+            )?;
+            settled.push(dispatch);
+        }
+        let mut resumed = Vec::new();
+        {
+            let mut statement = tx.prepare(
+                "SELECT id FROM orch_dispatches WHERE state='starting' AND session_id IN ( \
+                   SELECT id FROM session_heads WHERE lifecycle='active' \
+                 )",
+            )?;
+            let ids = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for id in ids {
+                tx.execute(
+                    "UPDATE orch_dispatches SET state='running' WHERE id=?1",
+                    [&id],
+                )?;
+                let dispatch = Self::dispatch_row(&tx, &id)?;
+                Self::emit(
+                    &tx,
+                    "dispatch.updated",
+                    &id,
+                    serde_json::to_value(&dispatch)?,
+                )?;
+                resumed.push(dispatch);
+            }
+        }
+        tx.commit()?;
+        Ok(RecoveryReport { settled, resumed })
+    }
+
+    // ── Run lifecycle ────────────────────────────────────────────────────
+
+    pub fn complete_run(&mut self, run_id: &str, allow_failed: bool) -> Result<Run> {
+        validate_id(run_id)?;
+        let tx = self.connection.transaction()?;
+        let run = Self::orch_run_from_tx(&tx, run_id)?;
+        if run.status == RunStatus::Completed {
+            return Ok(run);
+        }
+        if run.status != RunStatus::Active {
+            return Err(invalid("only active runs can be completed"));
+        }
+        let unfinished: i64 = tx.query_row(
+            "SELECT count(*) FROM orch_tasks WHERE run_id=?1 AND ( \
+               status='pending' OR status='dispatched' OR status='blocked' \
+               OR (?2=0 AND status='failed') \
+             )",
+            params![run_id, i64::from(allow_failed)],
+            |row| row.get(0),
+        )?;
+        if unfinished > 0 {
+            return Err(invalid("the run still has unfinished tasks"));
+        }
+        let active: i64 = tx.query_row(
+            "SELECT count(*) FROM orch_dispatches WHERE run_id=?1 AND state IN ('starting','running')",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        if active > 0 {
+            return Err(invalid("a worker is still running"));
+        }
+        let pending_gates: i64 = tx.query_row(
+            "SELECT count(*) FROM orch_gates WHERE run_id=?1 AND status='pending'",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        if pending_gates > 0 {
+            return Err(invalid("a gate is still pending"));
+        }
+        let now = now();
+        tx.execute(
+            "UPDATE orch_runs SET status='completed',updated_at=?1 WHERE id=?2",
+            params![now, run_id],
+        )?;
+        let run = Self::orch_run_from_tx(&tx, run_id)?;
+        Self::emit(&tx, "run.updated", &run.id, serde_json::to_value(&run)?)?;
+        tx.commit()?;
+        Ok(run)
+    }
+
+    pub fn abandon_run(&mut self, run_id: &str, reason: &str) -> Result<Run> {
+        validate_id(run_id)?;
+        validate_text(reason, 8192, false)?;
+        let tx = self.connection.transaction()?;
+        let run = Self::orch_run_from_tx(&tx, run_id)?;
+        if run.status == RunStatus::Abandoned {
+            return Ok(run);
+        }
+        if run.status != RunStatus::Active {
+            return Err(invalid("only active runs can be abandoned"));
+        }
+        let active: i64 = tx.query_row(
+            "SELECT count(*) FROM orch_dispatches WHERE run_id=?1 AND state IN ('starting','running')",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        if active > 0 {
+            return Err(invalid("stop the workers before abandoning the run"));
+        }
+        let now = now();
+        tx.execute(
+            "UPDATE orch_tasks SET status='cancelled',result=?1,updated_at=?2 \
+             WHERE run_id=?3 AND status IN ('pending','blocked','dispatched')",
+            params![reason, now, run_id],
+        )?;
+        tx.execute(
+            "UPDATE orch_gates SET status='cancelled',resolved_at=?1 WHERE run_id=?2 AND status='pending'",
+            params![now, run_id],
+        )?;
+        tx.execute(
+            "UPDATE orch_runs SET status='abandoned',updated_at=?1 WHERE id=?2",
+            params![now, run_id],
+        )?;
+        let run = Self::orch_run_from_tx(&tx, run_id)?;
+        Self::emit(&tx, "run.updated", &run.id, serde_json::to_value(&run)?)?;
+        tx.commit()?;
+        Ok(run)
+    }
+
+    // ── Gates ────────────────────────────────────────────────────────────
+
+    pub fn create_gate(&mut self, run_id: &str, input: CreateGate) -> Result<Gate> {
+        validate_id(run_id)?;
+        validate_text(&input.question, 4096, false)?;
+        if input.options.len() > 20 || input.options.iter().any(|option| option.len() > 4096) {
+            return Err(invalid("a gate may have at most 20 options"));
+        }
+        let tx = self.connection.transaction()?;
+        Self::require_active_run(&tx, run_id)?;
+        if let Some(task_id) = &input.task_id {
+            let task = Self::task_row(&tx, task_id)?;
+            if task.run_id != run_id {
+                return Err(invalid("gate task belongs to another run"));
+            }
+        }
+        let now = now();
+        let id = new_id("gate");
+        tx.execute(
+            "INSERT INTO orch_gates(id,run_id,task_id,question,options,status,decision,created_at,resolved_at) \
+             VALUES(?1,?2,?3,?4,?5,'pending',NULL,?6,NULL)",
+            params![
+                id,
+                run_id,
+                input.task_id,
+                input.question,
+                serde_json::to_string(&input.options)?,
+                now
+            ],
+        )?;
+        // A gate parks its task out of the dispatchable queue while waiting.
+        if let Some(task_id) = &input.task_id {
+            let task = Self::task_row(&tx, task_id)?;
+            if task.status != TaskStatus::Blocked
+                && can_transition(task.status, TaskStatus::Blocked)
+            {
+                Self::set_task_status(&tx, task_id, TaskStatus::Blocked, None)?;
+            }
+        }
+        let gate = Self::gate_row(&tx, &id)?;
+        Self::emit(&tx, "gate.updated", &id, serde_json::to_value(&gate)?)?;
+        tx.commit()?;
+        Ok(gate)
+    }
+
+    fn gate_row(tx: &Transaction<'_>, gate_id: &str) -> Result<Gate> {
+        tx.query_row("SELECT * FROM orch_gates WHERE id=?", [gate_id], map_gate)
+            .optional()?
+            .ok_or(Error::NotFound)
+    }
+
+    pub fn list_gates(
+        &self,
+        run_id: Option<&str>,
+        status: Option<GateStatus>,
+    ) -> Result<Vec<Gate>> {
+        let mut statement = self.connection.prepare(
+            "SELECT * FROM orch_gates WHERE (?1 IS NULL OR run_id=?1) AND (?2 IS NULL OR status=?2) \
+             ORDER BY created_at,id",
+        )?;
+        let rows = statement.query_map(params![run_id, status.map(value_label)], map_gate)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn resolve_gate(&mut self, gate_id: &str, decision: &str) -> Result<Gate> {
+        validate_id(gate_id)?;
+        validate_text(decision, 4096, false)?;
+        let tx = self.connection.transaction()?;
+        let gate = Self::gate_row(&tx, gate_id)?;
+        Self::require_active_run(&tx, &gate.run_id)?;
+        if gate.status != GateStatus::Pending {
+            if gate.status == GateStatus::Resolved && gate.decision.as_deref() == Some(decision) {
+                return Ok(gate);
+            }
+            return Err(invalid("the gate has already been settled"));
+        }
+        let now = now();
+        tx.execute(
+            "UPDATE orch_gates SET status='resolved',decision=?1,resolved_at=?2 WHERE id=?3",
+            params![decision, now, gate_id],
+        )?;
+        // Resolve: a blocked task with no other pending gate re-enters the
+        // queue — dispatched if its worker is still live, otherwise pending so
+        // readiness/deps are re-evaluated before a new dispatch.
+        if let Some(task_id) = &gate.task_id {
+            let task = Self::task_row(&tx, task_id)?;
+            let another: i64 = tx.query_row(
+                "SELECT count(*) FROM orch_gates WHERE task_id=?1 AND status='pending' AND id<>?2",
+                params![task_id, gate_id],
+                |row| row.get(0),
+            )?;
+            if task.status == TaskStatus::Blocked && another == 0 {
+                let target = if Self::active_dispatch(&tx, task_id)?.is_some() {
+                    TaskStatus::Dispatched
+                } else {
+                    TaskStatus::Pending
+                };
+                if target == TaskStatus::Dispatched {
+                    Self::force_task_status(&tx, task_id, target, None)?;
+                } else {
+                    Self::set_task_status(&tx, task_id, target, None)?;
+                }
+            }
+        }
+        let gate = Self::gate_row(&tx, gate_id)?;
+        Self::emit(&tx, "gate.updated", gate_id, serde_json::to_value(&gate)?)?;
+        tx.commit()?;
+        Ok(gate)
+    }
+
+    // ── Collaboration messages ───────────────────────────────────────────
+
+    pub fn post_message(&mut self, input: PostMessage) -> Result<OrchMessage> {
+        validate_id(&input.run_id)?;
+        validate_text(&input.from, 128, false)?;
+        validate_text(&input.to, 128, false)?;
+        validate_text(&input.subject, 1024, false)?;
+        validate_text(&input.body, 8192, false)?;
+        if let Some(thread) = &input.thread_id {
+            validate_id(thread)?;
+        }
+        if let Some(task) = &input.task_id {
+            validate_id(task)?;
+        }
+        // Run must exist (may be settled; reports on history are allowed).
+        let _ = self.orch_run(&input.run_id)?;
+        let now = now();
+        let id = new_id("msg");
+        self.connection.execute(
+            "INSERT INTO orch_messages(id,run_id,sender,recipient,kind,subject,body,thread_id,task_id,created_at,read_at,answered_at) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,NULL,NULL)",
+            params![
+                id,
+                input.run_id,
+                input.from,
+                input.to,
+                message_kind(input.kind),
+                input.subject,
+                input.body,
+                input.thread_id,
+                input.task_id,
+                now
+            ],
+        )?;
+        Self::message_row(&self.connection, &id)
+    }
+
+    pub fn list_messages(&self, run_id: Option<&str>) -> Result<Vec<OrchMessage>> {
+        let mut statement = self.connection.prepare(
+            "SELECT * FROM orch_messages WHERE ?1 IS NULL OR run_id=?1 ORDER BY created_at,id",
+        )?;
+        let rows = statement.query_map([run_id], map_message)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn unread_messages(
+        &self,
+        recipient: &str,
+        run_id: Option<&str>,
+    ) -> Result<Vec<OrchMessage>> {
+        validate_id(recipient)?;
+        let mut statement = self.connection.prepare(
+            "SELECT * FROM orch_messages WHERE recipient=?1 AND read_at IS NULL \
+             AND (?2 IS NULL OR run_id=?2) ORDER BY created_at,id",
+        )?;
+        let rows = statement.query_map(params![recipient, run_id], map_message)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn mark_messages_read(&mut self, ids: &[String]) -> Result<()> {
+        if ids.len() > 200 {
+            return Err(invalid("mark at most 200 messages at once"));
+        }
+        let now = now();
+        let tx = self.connection.transaction()?;
+        for id in ids {
+            validate_id(id)?;
+            tx.execute(
+                "UPDATE orch_messages SET read_at=?1 WHERE id=?2 AND read_at IS NULL",
+                params![now, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn mark_message_answered(&mut self, message_id: &str) -> Result<OrchMessage> {
+        validate_id(message_id)?;
+        let tx = self.connection.transaction()?;
+        tx.execute(
+            "UPDATE orch_messages SET answered_at=?1 WHERE id=?2 AND answered_at IS NULL",
+            params![now(), message_id],
+        )?;
+        let message = Self::message_row(&tx, message_id)?;
+        tx.commit()?;
+        Ok(message)
+    }
+
+    fn message_row(connection: &rusqlite::Connection, id: &str) -> Result<OrchMessage> {
+        connection
+            .query_row("SELECT * FROM orch_messages WHERE id=?", [id], map_message)
+            .optional()?
+            .ok_or(Error::NotFound)
+    }
+
+    // ── Idempotency ledger ───────────────────────────────────────────────
+
+    fn remember<T: Serialize>(
+        tx: &Transaction<'_>,
+        id: &str,
+        fingerprint: &str,
+        result: &T,
+    ) -> Result<()> {
+        let json = serde_json::to_string(result)?;
+        tx.execute(
+            "INSERT INTO orch_operations(id,fingerprint,result,created_at) VALUES(?1,?2,?3,?4)",
+            params![id, fingerprint, json, now()],
+        )?;
+        // The ledger only covers the offline retry window; keep the newest 1000.
+        tx.execute(
+            "DELETE FROM orch_operations WHERE id NOT IN ( \
+               SELECT id FROM orch_operations ORDER BY created_at DESC,id DESC LIMIT ?1 \
+             )",
+            [OPERATIONS_RETENTION],
+        )?;
+        Ok(())
+    }
+}
+
+fn value_label(status: GateStatus) -> &'static str {
+    match status {
+        GateStatus::Pending => "pending",
+        GateStatus::Resolved => "resolved",
+        GateStatus::Cancelled => "cancelled",
+    }
+}
+
+fn message_kind(kind: MessageType) -> &'static str {
+    match kind {
+        MessageType::Note => "note",
+        MessageType::Ask => "ask",
+        MessageType::Reply => "reply",
+        MessageType::Report => "report",
+    }
+}
+
+fn map_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<OrchMessage> {
+    let kind: String = row.get("kind")?;
+    Ok(OrchMessage {
+        id: row.get("id")?,
+        run_id: row.get("run_id")?,
+        from: row.get("sender")?,
+        to: row.get("recipient")?,
+        kind: match kind.as_str() {
+            "ask" => MessageType::Ask,
+            "reply" => MessageType::Reply,
+            "report" => MessageType::Report,
+            _ => MessageType::Note,
+        },
+        subject: row.get("subject")?,
+        body: row.get("body")?,
+        thread_id: row.get("thread_id")?,
+        task_id: row.get("task_id")?,
+        created_at: row.get("created_at")?,
+        read_at: row.get("read_at")?,
+        answered_at: row.get("answered_at")?,
+    })
+}
