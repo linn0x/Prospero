@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "implementationBranch": "exp/rust-re",
   "features": [
-    { "id": "storage", "legacy": ["session-database.ts", "orchestration/store.ts"], "required": ["indexed paging", "chunked bodies", "durable transactions", "crash recovery", "exclusive writer"], "status": "pending" },
+    { "id": "storage", "legacy": ["session-database.ts", "orchestration/store.ts"], "required": ["indexed paging", "chunked bodies", "durable transactions", "crash recovery", "exclusive writer"], "status": "in_progress", "implemented": ["session metadata keyset paging", "64 KiB content chunks", "same-transaction change events", "exclusive data-directory writer", "bounded database worker queue", "cursor retention gap detection"], "remaining": ["DAG and account storage", "process-kill recovery testing", "full daemon startup measurements", "Windows and Linux validation"] },
     { "id": "sessions", "legacy": ["session-manager.ts", "structured-session.ts", "structured-supervisor-client.ts"], "required": ["active-only runtime", "detached hosts", "bounded queue", "cancel", "resume", "archive"], "status": "pending" },
     { "id": "agents", "legacy": ["adapters"], "required": ["codex", "claude", "opencode", "deepseek", "grok", "trae", "custom", "official login", "third-party profiles", "tools", "permissions"], "status": "pending" },
     { "id": "terminal", "legacy": ["pty-session.ts", "pty-supervisor.ts", "windows-session-host-runner.ts"], "required": ["Unix PTY", "Windows ConPTY", "bounded scrollback", "alternate screen", "Unicode", "resize", "snapshot and replay", "process tree cleanup"], "status": "pending" },

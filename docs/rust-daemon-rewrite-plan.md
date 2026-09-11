@@ -174,3 +174,7 @@ SQLite 持久化正确不等于整个运行时性能达标；Rust 编译成功�
 - 已记录 macOS arm64 下 1 万、10 万条归档会话与任务的三轮数据，以及 xterm 解析和快照数据：`tools/perf/legacy-baseline-macos-arm64.json`。
 - 基线测量的是旧版会话恢复、列表查询、编排存储及 headless 终端子系统，不代表整个 Electron 应用的启动或渲染指标。事件吞吐、慢网络、活跃 Agent 和跨平台数据仍需补齐。
 - 功能覆盖清单：`tools/perf/coverage.json`；初始性能目标：`tools/perf/acceptance.json`。其中待完成项目必须通过实际运行验证后才能改变状态。
+- 首批 Rust 核心位于 `apps/daemon-rs`：会话元数据索引分页、正文分块、事务内变更事件、单写入方锁及容量为 128 的数据库工作队列。数据库操作使用独立线程，已取消的排队操作不再执行，队列满时明确返回 busy。
+- Rust 类型生成 `packages/protocol/src/rust-daemon.ts`；运行 `npm run rust:contract:check` 校验双端契约一致。Rust 检查入口为 `npm run rust:check`、`npm run rust:test`。
+- 存储实测入口为 `npm run perf:rust-storage`，记录在 `tools/perf/rust-storage-macos-arm64.json`。这是存储初始化与分页子系统的结果，不是完整 daemon、HTTP 或 Electron 性能结果。
+- HTTP 服务、运行时会话、Agent、PTY、DAG、Electron 接入与跨平台验收尚未完成；不得将首批核心完成视为整个重构完成。
