@@ -1,6 +1,7 @@
 import type { ContentPage, EventPage, EventQuery, Health, RenameSession, SessionHead, SessionLookupResult, SessionPage, SessionQuery, SessionSummary, WorkspacePage, WorkspaceQuery } from "@prospero/protocol/rust-daemon";
 import type { RustContent } from "../shared/rust-api";
 import type { TimelinePage, TimelineQuery, TimelineLookupResult, TimelineTextQuery, TimelineTextPage } from "@prospero/protocol/rust-daemon";
+import type { CreateTerminal, TerminalPage, TerminalQuery, TerminalSize } from "@prospero/protocol/rust-daemon";
 
 const MAX_BYTES = 2 * 1024 * 1024;
 function id(value: string): string {
@@ -55,6 +56,25 @@ export class RustClient {
   }
 
   health(signal: AbortSignal | null = null): Promise<Health> { return this.json("/v1/health", { signal }); }
+  createTerminal(input: CreateTerminal, signal: AbortSignal | null = null): Promise<SessionHead> {
+    return this.json("/v1/terminals", { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
+  }
+  terminalOutput(value: string, query: TerminalQuery, signal: AbortSignal | null = null): Promise<TerminalPage> {
+    const params = new URLSearchParams();
+    if (query.afterSeq != null) params.set("afterSeq", String(query.afterSeq));
+    if (query.waitMs != null) params.set("waitMs", String(query.waitMs));
+    return this.json(`/v1/terminals/${id(value)}/output?${params}`, { signal });
+  }
+  terminalInput(value: string, bytes: Uint8Array, signal: AbortSignal | null = null): Promise<{ ok: boolean }> {
+    if (!bytes.length || bytes.length > 8192) throw new Error("Terminal input exceeds limit");
+    return this.json(`/v1/terminals/${id(value)}/input`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ dataB64: Buffer.from(bytes).toString("base64") }) });
+  }
+  terminalResize(value: string, size: TerminalSize, signal: AbortSignal | null = null): Promise<{ ok: boolean }> {
+    return this.json(`/v1/terminals/${id(value)}/resize`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(size) });
+  }
+  terminalClose(value: string, signal: AbortSignal | null = null): Promise<{ ok: boolean }> {
+    return this.json(`/v1/terminals/${id(value)}/close`, { method: "POST", signal });
+  }
   timeline(value: string, query: TimelineQuery, signal: AbortSignal | null = null): Promise<TimelinePage> {
     const params = new URLSearchParams();
     if (query.before !== null) params.set("before", String(query.before));

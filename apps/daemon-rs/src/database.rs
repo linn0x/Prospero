@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::protocol::*;
 
 const APPLICATION_ID: i64 = 0x50525253;
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 const MAX_CONTENT_BYTES: i64 = 1024 * 1024 * 1024;
 
@@ -153,6 +153,14 @@ impl Store {
     }
 
     pub fn create_session(&mut self, input: CreateSession) -> Result<SessionHead> {
+        self.create_session_with(input, |_, _| Ok(()))
+    }
+
+    pub(crate) fn create_session_with(
+        &mut self,
+        input: CreateSession,
+        extra: impl FnOnce(&Transaction<'_>, &SessionHead) -> Result<()>,
+    ) -> Result<SessionHead> {
         validate_text(&input.title, 512, false)?;
         validate_text(&input.workspace, 4096, false)?;
         let timestamp = now();
@@ -170,6 +178,7 @@ impl Store {
         };
         let transaction = self.connection.transaction()?;
         Self::insert_session(&transaction, &session)?;
+        extra(&transaction, &session)?;
         Self::append_event(
             &transaction,
             "sessions",
@@ -214,6 +223,15 @@ impl Store {
     }
 
     pub fn update_session(&mut self, id: &str, update: UpdateSession) -> Result<SessionHead> {
+        self.update_session_with(id, update, |_| Ok(()))
+    }
+
+    pub(crate) fn update_session_with(
+        &mut self,
+        id: &str,
+        update: UpdateSession,
+        extra: impl FnOnce(&Transaction<'_>) -> Result<()>,
+    ) -> Result<SessionHead> {
         if update.revision <= 0 || update.revision >= MAX_SAFE_INTEGER {
             return Err(Error::Invalid("invalid revision".into()));
         }
@@ -235,6 +253,7 @@ impl Store {
         session.revision += 1;
         session.updated_at = now();
         let transaction = self.connection.transaction()?;
+        extra(&transaction)?;
         let changed = transaction.execute("UPDATE session_heads SET lifecycle=?1,revision=?2,payload=?3 WHERE id=?4 AND revision=?5",
             params![label(session.lifecycle)?, session.revision, serde_json::to_string(&session)?, id, update.revision])?;
         if changed != 1 {

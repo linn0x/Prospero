@@ -21,27 +21,36 @@ use crate::auth::Token;
 use crate::database::Store;
 use crate::error::{Error, Result};
 use crate::protocol::*;
+use crate::terminal::{
+    CreateTerminal, TerminalInput, TerminalPage, TerminalQuery, TerminalSize, runtime::Terminals,
+};
 use crate::worker::Database;
 
 #[derive(Clone)]
 pub struct Api {
     pub database: Database,
+    pub terminals: Terminals,
     token: Token,
     changes: watch::Sender<u64>,
     stopping: watch::Sender<bool>,
     requests: Arc<Semaphore>,
     streams: Arc<Semaphore>,
+    terminal_reads: Arc<Semaphore>,
 }
 
 impl Api {
     pub fn new(database: Database, token: Token) -> Self {
+        let terminals = Terminals::new(database.clone());
+        let changes = terminals.changes();
         Self {
+            terminals,
             database,
             token,
-            changes: watch::channel(0).0,
+            changes,
             stopping: watch::channel(false).0,
             requests: Arc::new(Semaphore::new(32)),
             streams: Arc::new(Semaphore::new(16)),
+            terminal_reads: Arc::new(Semaphore::new(16)),
         }
     }
 
@@ -49,6 +58,11 @@ impl Api {
         Router::new()
             .route("/v1/health", get(health))
             .route("/v1/shutdown", post(shutdown))
+            .route("/v1/terminals", post(create_terminal))
+            .route("/v1/terminals/{id}/output", get(terminal_output))
+            .route("/v1/terminals/{id}/input", post(terminal_input))
+            .route("/v1/terminals/{id}/resize", post(terminal_resize))
+            .route("/v1/terminals/{id}/close", post(terminal_close))
             .route("/v1/sessions", get(sessions))
             .route("/v1/sessions/summary", get(summary))
             .route("/v1/sessions/lookup", post(lookup))
@@ -151,10 +165,11 @@ async fn authorize(State(api): State<Api>, request: Request, next: Next) -> Resp
 
 async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, ApiError> {
     api.call(|_| Ok(())).await?;
+    api.terminals.check()?;
     Ok(Json(Health {
         api_version: API_VERSION,
         backend: "rust".into(),
-        active_runtime_sessions: 0,
+        active_runtime_sessions: api.terminals.count(),
         database_queue_capacity: DATABASE_QUEUE_CAPACITY,
         capabilities: [
             "session.metadata",
@@ -165,12 +180,67 @@ async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, Api
             "workspace.page",
             "session.content",
             "session.timeline",
+            #[cfg(unix)]
+            "terminal.unix",
+            "terminal.output.page",
             "events.replay",
             "events.stream",
         ]
         .map(str::to_owned)
         .to_vec(),
     }))
+}
+
+async fn create_terminal(
+    State(api): State<Api>,
+    body: std::result::Result<Json<CreateTerminal>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<SessionHead>, ApiError> {
+    let Json(input) = body.map_err(|_| Error::Invalid("invalid terminal request".into()))?;
+    let head = api.terminals.create(input).await?;
+    api.publish();
+    Ok(Json(head))
+}
+
+async fn terminal_output(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    query: std::result::Result<Query<TerminalQuery>, axum::extract::rejection::QueryRejection>,
+) -> std::result::Result<Json<TerminalPage>, ApiError> {
+    let Query(query) = query.map_err(|_| Error::Invalid("invalid terminal query".into()))?;
+    let _permit = api
+        .terminal_reads
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| Error::Busy)?;
+    Ok(Json(api.terminals.read(id, query).await?))
+}
+
+async fn terminal_input(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<TerminalInput>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    let Json(input) = body.map_err(|_| Error::Invalid("invalid terminal input".into()))?;
+    api.terminals.input(&id, input).await?;
+    Ok(Json(serde_json::json!({"ok":true})))
+}
+
+async fn terminal_resize(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<TerminalSize>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    let Json(size) = body.map_err(|_| Error::Invalid("invalid terminal size".into()))?;
+    api.terminals.resize(&id, size).await?;
+    Ok(Json(serde_json::json!({"ok":true})))
+}
+
+async fn terminal_close(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    api.terminals.close(&id)?;
+    Ok(Json(serde_json::json!({"ok":true})))
 }
 
 async fn shutdown(State(api): State<Api>) -> impl IntoResponse {

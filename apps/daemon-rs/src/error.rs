@@ -9,6 +9,8 @@ pub enum Error {
     Forbidden,
     #[error("request timed out")]
     Timeout,
+    #[error("terminal input may be incomplete; session stopped")]
+    TerminalInput,
     #[error("invalid request: {0}")]
     Invalid(String),
     #[error("record not found")]
@@ -45,6 +47,7 @@ impl Error {
             Self::Unauthorized => ("unauthorized", false),
             Self::Forbidden => ("forbidden", false),
             Self::Timeout => ("timeout", true),
+            Self::TerminalInput => ("terminal_input_failed", false),
             Self::Invalid(_) => ("invalid_request", false),
             Self::NotFound => ("not_found", false),
             Self::Conflict => ("conflict", false),

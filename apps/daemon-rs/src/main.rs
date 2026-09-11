@@ -106,6 +106,7 @@ async fn serve(directory: PathBuf, address: SocketAddr) -> Result<(), Box<dyn st
         return Err("the local API must bind to loopback".into());
     }
     let database = Database::open(directory.clone()).await?;
+    database.call(|store| store.recover_terminals()).await?;
     let token = Token::load(&directory)?;
     let listener = tokio::net::TcpListener::bind(address).await?;
     let address = listener.local_addr()?;
@@ -117,6 +118,7 @@ async fn serve(directory: PathBuf, address: SocketAddr) -> Result<(), Box<dyn st
     let shutdown = async move {
         tokio::select! { _ = wait_for_shutdown() => {}, _ = shutdown_api.wait_stopped() => {} }
         shutdown_api.stop();
+        let _ = shutdown_api.terminals.shutdown().await;
         stopping.send_replace(true);
     };
     let server = axum::serve(LimitedListener::new(listener), api.router())
@@ -132,8 +134,11 @@ async fn serve(directory: PathBuf, address: SocketAddr) -> Result<(), Box<dyn st
         _ = stopped.changed() => { let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut server).await; }
     }
     api.stop();
+    let terminals_stopped = api.terminals.shutdown().await;
     let _ = std::fs::remove_file(directory.join("connection.json"));
-    database.shutdown().await?;
+    let database_stopped = database.shutdown().await;
+    terminals_stopped?;
+    database_stopped?;
     Ok(())
 }
 
