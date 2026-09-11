@@ -111,6 +111,7 @@ export type RemoteShellEvent = {
 };
 
 export type DaemonSnapshot = {
+  metadataRevision?: string;
   running: boolean;
   managed: boolean;
   fullAccess: boolean;

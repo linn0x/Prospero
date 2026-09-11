@@ -13,7 +13,7 @@
     "preview": "electron-vite preview",
     "pretypecheck": "npm run build -w @prospero/protocol",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "vitest run test",
+    "test": "vitest run --dir test",
     "check:chrome": "npm run build && electron scripts/check-window-chrome.cjs",
     "check:chat": "npm run build && electron scripts/check-chat.cjs",
     "check:project-tools": "npm run build && electron scripts/check-project-tools.cjs",

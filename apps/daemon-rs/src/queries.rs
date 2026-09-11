@@ -291,6 +291,7 @@ mod tests {
         store
             .create_session(CreateSession {
                 agent: AgentKind::Shell,
+                kind: SessionKind::Pty,
                 title: "After timeout".into(),
                 workspace: "/synthetic".into(),
             })

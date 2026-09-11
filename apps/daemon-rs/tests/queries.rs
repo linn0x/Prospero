@@ -8,6 +8,7 @@ fn create(store: &mut Store, title: &str, workspace: &str) -> SessionHead {
     store
         .create_session(CreateSession {
             agent: AgentKind::Claude,
+            kind: SessionKind::Structured,
             title: title.into(),
             workspace: workspace.into(),
         })
@@ -95,6 +96,7 @@ fn summaries_are_transactional_durable_and_include_only_active_attention() {
         store
             .create_session(CreateSession {
                 agent: AgentKind::Shell,
+                kind: SessionKind::Pty,
                 title: "Failed".into(),
                 workspace: "/failed".into()
             })

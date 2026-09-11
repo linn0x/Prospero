@@ -8,6 +8,7 @@ fn create(store: &mut Store) -> SessionHead {
     store
         .create_session(CreateSession {
             agent: AgentKind::Codex,
+            kind: SessionKind::Structured,
             title: "Example".into(),
             workspace: "/synthetic".into(),
         })

@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::protocol::*;
 
 const APPLICATION_ID: i64 = 0x50525253;
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 const MAX_CONTENT_BYTES: i64 = 1024 * 1024 * 1024;
 
@@ -159,6 +159,7 @@ impl Store {
         let session = SessionHead {
             id: uuid::Uuid::new_v4().to_string(),
             agent: input.agent,
+            kind: input.kind,
             title: input.title,
             workspace: input.workspace,
             lifecycle: SessionLifecycle::Active,
@@ -537,6 +538,7 @@ impl Store {
                 &SessionHead {
                     id: format!("session-{index:09}"),
                     agent: AgentKind::Codex,
+                    kind: SessionKind::Structured,
                     title: format!("Archive {index}"),
                     workspace: "/synthetic".into(),
                     lifecycle: SessionLifecycle::Archived,

@@ -31,6 +31,13 @@ pub enum SessionLifecycle {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
+pub enum SessionKind {
+    Structured,
+    Pty,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
     Idle,
     Starting,
@@ -46,6 +53,7 @@ pub enum SessionStatus {
 pub struct SessionHead {
     pub id: String,
     pub agent: AgentKind,
+    pub kind: SessionKind,
     pub title: String,
     pub workspace: String,
     pub lifecycle: SessionLifecycle,
@@ -62,6 +70,7 @@ pub struct SessionHead {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CreateSession {
     pub agent: AgentKind,
+    pub kind: SessionKind,
     pub title: String,
     pub workspace: String,
 }
@@ -235,6 +244,7 @@ pub fn typescript() -> String {
     let config = ts_rs::Config::default();
     let declarations = [
         AgentKind::decl(&config),
+        SessionKind::decl(&config),
         SessionLifecycle::decl(&config),
         SessionStatus::decl(&config),
         SessionHead::decl(&config),

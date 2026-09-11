@@ -21,6 +21,8 @@
     "rust:check": "cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo check --workspace --locked",
     "rust:test": "cargo test --workspace --locked",
     "rust:http:test": "cargo build --workspace --locked && node tools/perf/rust-http-smoke.mjs",
+    "rust:desktop:test": "cargo build --workspace --locked && npm run build -w @prospero/protocol && npm exec -w @prospero/desktop -- vitest run --dir integration",
+    "dev:desktop:rust": "npm run rust:build && node tools/rust-desktop.mjs",
     "rust:build": "cargo build --release --workspace --locked",
     "rust:types": "cargo run --locked -p prosperod-rs -- types --output packages/protocol/src/rust-daemon.ts",
     "rust:contract:check": "cargo build --workspace --locked && node tools/perf/check-rust-contract.mjs",
