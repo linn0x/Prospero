@@ -40,6 +40,14 @@ try {
   const page = await (await request("/v1/sessions?limit=10")).json();
   assert.equal(page.items.length, 10);
   assert.ok(page.hasMore);
+  assert.equal(page.total, 100);
+  assert.equal(page.latestSeq, 0);
+  const summary = await (await request("/v1/sessions/summary")).json();
+  assert.deepEqual(summary, { total: 100, active: 0, archived: 100, attention: 0, latestSeq: 0 });
+  const workspaces = await (await request("/v1/workspaces?limit=1")).json();
+  assert.equal(workspaces.items[0].workspace, "/synthetic");
+  assert.equal(workspaces.items[0].summary.total, 100);
+  assert.equal(workspaces.hasMore, false);
   const second = await (await request(`/v1/sessions?limit=10&cursor=${encodeURIComponent(page.nextCursor)}`)).json();
   assert.equal(new Set([...page.items, ...second.items].map(item => item.id)).size, 20);
   const stream = await request("/v1/events/stream?scope=sessions&afterSeq=0", { signal: controller.signal });
@@ -53,6 +61,14 @@ try {
   assert.ok(new TextDecoder().decode(next.value).includes("session.updated"));
   const replay = await (await request("/v1/events?scope=sessions&afterSeq=0")).json();
   assert.equal(replay.items[0].data.title, "HTTP integration");
+  const search = await (await request("/v1/sessions?text=HTTP%20integ&workspace=%2Fsynthetic")).json();
+  assert.equal(search.total, 1);
+  assert.equal(search.items[0].id, id);
+  assert.equal(search.latestSeq, 1);
+  const lookup = await (await request("/v1/sessions/lookup", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ids: [id, "missing", id] }) })).json();
+  assert.deepEqual(lookup.items.map(item => item.id), [id]);
+  assert.deepEqual(lookup.missingIds, ["missing"]);
+  assert.equal(lookup.latestSeq, 1);
   const content = await request(`/v1/sessions/${id}/content/history?offset=0`);
   assert.equal((await content.arrayBuffer()).byteLength, 1024);
   const contentList = await (await request(`/v1/sessions/${id}/contents?limit=1`)).json();
@@ -64,7 +80,7 @@ try {
   const [code] = await exited; clearTimeout(timeout);
   assert.equal(code, 0);
   assert.ok(!existsSync(path.join(directory, "connection.json")));
-  console.log(JSON.stringify({ ok: true, authentication: true, paging: true, committedReplay: true, liveEvents: true, contentChunks: true, gracefulShutdown: true }));
+  console.log(JSON.stringify({ ok: true, authentication: true, paging: true, summary: true, workspacePaging: true, search: true, lookup: true, committedReplay: true, liveEvents: true, contentChunks: true, gracefulShutdown: true }));
 } finally {
   controller.abort();
   if (child && child.exitCode === null && child.signalCode === null) { const exited = once(child, "exit"); child.kill("SIGKILL"); await exited; }

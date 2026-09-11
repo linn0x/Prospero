@@ -82,6 +82,8 @@ pub struct SessionQuery {
     pub cursor: Option<String>,
     pub limit: Option<usize>,
     pub lifecycle: Option<SessionLifecycle>,
+    pub workspace: Option<String>,
+    pub text: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, TS)]
@@ -90,6 +92,64 @@ pub struct SessionPage {
     pub items: Vec<SessionHead>,
     pub next_cursor: Option<String>,
     pub has_more: bool,
+    #[ts(type = "number")]
+    pub total: i64,
+    #[ts(type = "number")]
+    pub latest_seq: i64,
+}
+
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSummary {
+    #[ts(type = "number")]
+    pub total: i64,
+    #[ts(type = "number")]
+    pub active: i64,
+    #[ts(type = "number")]
+    pub archived: i64,
+    #[ts(type = "number")]
+    pub attention: i64,
+    #[ts(type = "number")]
+    pub latest_seq: i64,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkspaceQuery {
+    pub cursor: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceHead {
+    pub workspace: String,
+    pub summary: SessionSummary,
+}
+
+#[derive(Debug, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspacePage {
+    pub items: Vec<WorkspaceHead>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+    #[ts(type = "number")]
+    pub latest_seq: i64,
+}
+
+#[derive(Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionLookup {
+    pub ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionLookupResult {
+    pub items: Vec<SessionHead>,
+    pub missing_ids: Vec<String>,
+    #[ts(type = "number")]
+    pub latest_seq: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -182,6 +242,12 @@ pub fn typescript() -> String {
         UpdateSession::decl(&config),
         SessionQuery::decl(&config),
         SessionPage::decl(&config),
+        SessionSummary::decl(&config),
+        WorkspaceQuery::decl(&config),
+        WorkspaceHead::decl(&config),
+        WorkspacePage::decl(&config),
+        SessionLookup::decl(&config),
+        SessionLookupResult::decl(&config),
         ChangeEvent::decl(&config),
         EventPage::decl(&config),
         Health::decl(&config),

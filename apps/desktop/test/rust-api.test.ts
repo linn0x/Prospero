@@ -14,7 +14,7 @@ describe("Rust desktop API boundary", () => {
   it("uses bounded typed routes with owner credentials and no redirects", async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({ items: [], hasMore: false, nextCursor: null })));
     const client = new RustClient("http://127.0.0.1:12345", token, fetcher);
-    await client.sessions({ limit: 100, cursor: "cursor+value", lifecycle: "archived" });
+    await client.sessions({ limit: 100, cursor: "cursor+value", lifecycle: "archived", workspace: null, text: null });
     const [url, init] = fetcher.mock.calls[0]!;
     expect(String(url)).toContain("cursor=cursor%2Bvalue");
     expect(init?.headers).toMatchObject({ authorization: `Bearer ${token}` });
@@ -28,6 +28,25 @@ describe("Rust desktop API boundary", () => {
     await expect(client.health()).rejects.toThrow("500");
     fetcher.mockResolvedValue(new Response(JSON.stringify({ code: "conflict", message: token }), { status: 409 }));
     await expect(client.rename("fixture", { revision: 1, title: "Rename" })).rejects.toThrow("记录已变更");
+  });
+
+  it("passes filters and bounded lookups without placing credentials in URLs", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => new Response("{}"));
+    const client = new RustClient("http://127.0.0.1:12345", token, fetcher);
+    await client.sessions({ limit: null, cursor: null, lifecycle: null, workspace: "/example?value", text: "中文 & words" });
+    const url = new URL(String(fetcher.mock.calls[0]![0]));
+    expect(url.searchParams.get("workspace")).toBe("/example?value");
+    expect(url.searchParams.get("text")).toBe("中文 & words");
+    expect(url.searchParams.has("limit")).toBe(false);
+    await client.summary("/example?value");
+    expect(new URL(String(fetcher.mock.calls[1]![0])).searchParams.get("workspace")).toBe("/example?value");
+    await client.workspaces({ limit: 20, cursor: "/path+space" });
+    expect(new URL(String(fetcher.mock.calls[2]![0])).searchParams.get("cursor")).toBe("/path+space");
+    await client.lookup(["fixture", "missing"]);
+    expect(fetcher.mock.calls[3]![1]?.body).toBe(JSON.stringify({ ids: ["fixture", "missing"] }));
+    expect(() => client.lookup(Array(101).fill("fixture"))).toThrow("limit");
+    expect(() => client.lookup(["invalid/id"])).toThrow("Invalid record");
+    expect(fetcher).toHaveBeenCalledTimes(4);
   });
 
   it("rejects oversized responses and invalid content cursors", async () => {
