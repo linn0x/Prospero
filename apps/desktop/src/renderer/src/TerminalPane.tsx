@@ -10,6 +10,7 @@ import "@xterm/xterm/css/xterm.css";
 import type { SessionInfo } from "../../shared/types";
 import { reportError, number, text } from "./state";
 import { useLocale } from "./locale";
+import { allowNativeTerminalPaste, bindTerminalPaste, consumeTerminalKey, terminalClipboardShortcut } from "./terminal-clipboard";
 import {
   deleteTerminalSessionCache,
   loadTerminalSessionCache,
@@ -54,6 +55,8 @@ function persistTerminalSession(
 
 type TerminalShortcutEvent = Pick<KeyboardEvent, "type" | "code" | "metaKey" | "ctrlKey" | "altKey" | "shiftKey"> & {
   key?: string;
+  defaultPrevented?: boolean;
+  isComposing?: boolean;
 };
 
 type TerminalInteraction =
@@ -77,22 +80,21 @@ export function terminalShortcutAction(
   event: TerminalShortcutEvent,
   isMac: boolean,
 ): TerminalShortcutAction | undefined {
-  if (event.type !== "keydown") return undefined;
+  if (event.type !== "keydown" || event.defaultPrevented || event.isComposing) return undefined;
+  const clipboard = terminalClipboardShortcut(event, isMac);
+  if (clipboard) return clipboard;
   const macCommand =
     isMac &&
     event.metaKey &&
     !event.ctrlKey &&
     !event.altKey &&
     !event.shiftKey;
-  const otherClipboard = !isMac && event.ctrlKey && event.shiftKey;
+  const otherClipboard = !isMac && event.ctrlKey && event.shiftKey && !event.altKey && !event.metaKey;
   if (macCommand || otherClipboard) {
-    if (event.code === "KeyC") return "copy";
-    if (event.code === "KeyV") return "paste";
     if (event.code === "KeyF") return "find";
   }
   if (!macCommand) {
-    if (event.shiftKey && !event.metaKey && !event.ctrlKey && !event.altKey && event.code === "Insert") return "paste";
-    if (isMac && event.altKey && !event.metaKey && !event.ctrlKey) {
+    if (isMac && event.altKey && !event.metaKey && !event.ctrlKey && !event.shiftKey) {
       if (event.key === "ArrowLeft") return "backwardWord";
       if (event.key === "ArrowRight") return "forwardWord";
     }
@@ -300,8 +302,23 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
       window.clearTimeout(inputTimer);
       inputTimer = window.setTimeout(() => { void flushInput(); }, 4);
     });
+    const canPaste = (): boolean => connectedRef.current && !readOnlyRef.current && !replayingRef.current && terminalRef.current === terminal && !terminal.options.disableStdin;
+    const pasteBlocked = (): void => showNotice(readOnlyRef.current
+      ? t("会话已结束，终端为只读", "The session has ended; the terminal is read-only")
+      : t("终端尚未就绪，请连接后再粘贴", "The terminal is not ready; paste after connecting"));
+    const disposePaste = bindTerminalPaste(host.current, terminal, canPaste, pasteBlocked, () => {
+      setOperationError(undefined);
+      window.clearTimeout(inputTimer);
+      void flushInput();
+    });
     terminal.attachCustomKeyEventHandler((event) => {
       const action = terminalShortcutAction(event, isMac);
+      if (action === "paste") {
+        const allowed = canPaste();
+        if (!allowed) pasteBlocked();
+        return allowNativeTerminalPaste(event, allowed);
+      }
+      if (action) consumeTerminalKey(event);
       if (readOnlyRef.current && action && action !== "copy" && action !== "selectAll" && action !== "find") {
         showNotice(t("会话已结束，终端为只读", "The session has ended; the terminal is read-only"));
         return false;
@@ -313,34 +330,6 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
             .then(() => showNotice(t("已复制", "Copied")))
             .catch((reason) => setOperationError(reportError(reason)));
         } else showNotice(t("按住 ⌥ 拖动选择文本", "Hold Option while dragging to select text"));
-        return false;
-      }
-      if (action === "paste") {
-        if (!connectedRef.current) {
-          showNotice(t("终端断线，重连后再粘贴", "Terminal is disconnected; paste after reconnecting"));
-          return false;
-        }
-        setOperationError(undefined);
-        void window.prospero.readClipboard()
-          .then((value) => {
-            if (!value) {
-              showNotice(t("剪贴板为空", "Clipboard is empty"));
-              return;
-            }
-            if (!connectedRef.current || readOnlyRef.current) {
-              showNotice(t("终端断线，未粘贴", "Terminal disconnected; nothing was pasted"));
-              return;
-            }
-            terminal.paste(value);
-            window.clearTimeout(inputTimer);
-            const delivered = flushInput();
-            if (!delivered) {
-              showNotice(t("终端断线，未粘贴", "Terminal disconnected; nothing was pasted"));
-              return;
-            }
-            void delivered.then((ok) => showNotice(ok ? t("已粘贴", "Pasted") : t("终端断线，未粘贴", "Terminal disconnected; nothing was pasted")));
-          })
-          .catch((reason) => setOperationError(reportError(reason)));
         return false;
       }
       if (action === "selectAll") {
@@ -415,6 +404,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
       if (connectedRef.current && !readOnlyRef.current) void flushInput(true);
       resize.disconnect();
       inputDisposable.dispose();
+      disposePaste();
       osc52Disposable.dispose();
       bellDisposable.dispose();
       terminal.dispose();
@@ -631,7 +621,11 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
       <button type="button" onClick={() => runFind(false)} aria-label={t("下一个", "Next")}>↓</button>
       <button type="button" onClick={closeFind} aria-label={t("关闭查找", "Close find")}>✕</button>
     </div>}
-    <div ref={host} className="terminal-host" />
+    <div ref={host} className="terminal-host" onContextMenu={event => {
+      event.preventDefault();
+      const terminal = terminalRef.current;
+      if (terminal) void window.prospero.openTerminalContextMenu({ copy: terminal.hasSelection(), paste: connectedRef.current && !readOnlyRef.current && !replayingRef.current && !terminal.options.disableStdin }).catch(reason => setOperationError(reportError(reason)));
+    }} />
     {notice && <div className="terminal-toast" role="status">{notice}</div>}
     {connectionError && <div className="inline-error">{connectionError}</div>}
     {operationError && <div className="inline-error">{operationError}</div>}

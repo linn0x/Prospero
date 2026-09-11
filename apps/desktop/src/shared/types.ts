@@ -322,6 +322,7 @@ export type DesktopApi = import("./project-tools").ProjectToolsApi & {
   /** 终端里的链接交给系统浏览器;主进程只放行 http(s)。 */
   openExternal(url: string): Promise<{ ok: boolean }>;
   readClipboard(): Promise<string>;
+  openTerminalContextMenu(options: { copy: boolean; paste: boolean }): Promise<void>;
   writeClipboard(value: string): Promise<{ ok: boolean }>;
   createSession(input: SessionCreateInput): Promise<SessionInfo>;
   /** Fetch terminal/history records only when a list or search needs them. */

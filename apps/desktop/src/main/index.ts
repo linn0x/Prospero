@@ -435,10 +435,8 @@ function installApplicationMenu(): void {
       submenu: [
         { role: "undo" }, { role: "redo" }, { type: "separator" },
         { role: "cut" },
-        // registerAccelerator:false —— 菜单仍显示 ⌘C/⌘V/⌘A,但不再截获按键。
-        // 否则终端永远收不到这三个组合键(见 TerminalPane 的按键处理器)。
         { role: "copy", registerAccelerator: false },
-        { role: "paste", registerAccelerator: false },
+        { role: "paste" },
         { role: "pasteAndMatchStyle" },
         { role: "delete" },
         { role: "selectAll", registerAccelerator: false },
@@ -943,6 +941,13 @@ function installIpc(): void {
     return { ok: true };
   });
   ipcMain.handle("clipboard:read", () => clipboard.readText());
+  ipcMain.handle("terminal:context-menu", (event, raw: unknown) => {
+    const options = requireObject(raw);
+    if (typeof options["copy"] !== "boolean" || typeof options["paste"] !== "boolean") throw new Error("终端菜单参数无效");
+    const owner = BrowserWindow.fromWebContents(event.sender);
+    if (!owner || owner.isDestroyed()) return;
+    Menu.buildFromTemplate([{ role: "copy", enabled: options["copy"] }, { role: "paste", enabled: options["paste"] }]).popup({ window: owner });
+  });
   ipcMain.handle("clipboard:write", (_event, value: unknown) => {
     if (typeof value !== "string") throw new Error("剪贴板内容无效");
     // 终端可能选中极长的输出,截断避免把几百 MB 塞进系统剪贴板。
