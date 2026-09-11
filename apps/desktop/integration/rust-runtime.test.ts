@@ -44,18 +44,23 @@ describe("existing desktop shell with the real Rust runtime", () => {
     expect((await runtime.start()).ok).toBe(true);
     const head = await runtime.request("/_prospero/control/session/create", { method: "POST", body: { agent: "shell", kind: "pty", cwd: directory, cols: 80, rows: 24 } });
     const id = String(head!["id"]);
-    await runtime.request(`/_prospero/control/session/${id}/interact`, { method: "POST", body: { type: "term.input", dataB64: Buffer.from("printf 'committed-live-marker\\n'; read answer\n").toString("base64") } });
+    await runtime.request(`/_prospero/control/session/${id}/interact`, { method: "POST", body: { type: "term.input", dataB64: Buffer.from("trap '' HUP; sleep 60 & printf 'committed-live-marker GUARD_PIDS:%s:%s\\n' $$ $!; read answer\n").toString("base64") } });
     const database = new DatabaseSync(resolve(dataDir, "prospero.sqlite"), { readOnly: true });
     let seq = 0;
+    let ownedPids: number[] = [];
     try {
       await vi.waitFor(() => {
         const row = database.prepare("SELECT latest_seq,snapshot FROM terminal_runs WHERE session_id=? AND active=1").get(id)!;
         const snapshot = JSON.parse(String(row["snapshot"]));
         expect(Buffer.from(snapshot.dataB64, "base64").toString("utf8")).toContain("committed-live-marker");
+        const match = /GUARD_PIDS:(\d+):(\d+)/.exec(Buffer.from(snapshot.dataB64, "base64").toString("utf8"));
+        expect(match).not.toBeNull();
+        ownedPids = [Number(match![1]), Number(match![2])];
         seq = Number(row["latest_seq"]); expect(snapshot.seq).toBe(seq);
       }, { timeout: 5000 });
       process.kill(store.snapshot().daemon.pid!, "SIGKILL");
       await vi.waitFor(() => expect(runtime.managed).toBe(false));
+      await vi.waitFor(() => { for (const pid of ownedPids) expect(() => process.kill(pid, 0)).toThrow(); }, { timeout: 5000 });
       expect((await runtime.start()).ok).toBe(true);
       const connection = JSON.parse(readFileSync(resolve(dataDir, "connection.json"), "utf8"));
       const client = new RustClient(connection.baseUrl, connection.token);
