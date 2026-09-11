@@ -1008,7 +1008,7 @@ function ShellSidebar({
     return () => {
       cancelled = true;
     };
-  }, [pinnedSessionKey, pinnedSessionRequestIds]);
+  }, [pinnedSessionKey, pinnedSessionRequestIds, snapshot.daemon.metadataRevision]);
   useEffect(() => {
     const generation = ++searchGeneration.current;
     if (!deferredSessionQuery) {
@@ -1044,7 +1044,7 @@ function ShellSidebar({
     return () => {
       cancelled = true;
     };
-  }, [deferredSessionQuery]);
+  }, [deferredSessionQuery, snapshot.daemon.metadataRevision]);
   const pinned = useMemo(() => {
     const byId = new Map(sessionsById);
     for (const session of pinnedPage?.items ?? []) byId.set(session.id, session);
@@ -3918,6 +3918,18 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     () => validOpenSessionIds(openIds, sessionSnapshot.daemon.sessions),
     [openIds, sessionSnapshot.daemon.sessions],
   );
+  const openMetadataKey = validOpenIds.slice(0, 100).join("|");
+  useEffect(() => {
+    if (!snapshot.daemon.metadataRevision || !openMetadataKey || !snapshot.daemon.running) return;
+    let cancelled = false;
+    const ids = openMetadataKey.split("|");
+    void window.prospero.listSessions({ ids, limit: 100 }).then(page => {
+      if (cancelled) return;
+      const requested = new Set(ids);
+      setHydratedSessions(current => [...page.items, ...current.filter(item => !requested.has(item.id))].slice(0, HYDRATED_SESSION_CACHE_LIMIT));
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [openMetadataKey, snapshot.daemon.metadataRevision, snapshot.daemon.running]);
   useSessionUnread(sessionSnapshot.daemon.sessions, snapshot.unreadSessionIds, view === "workspaces" && !activeRemote ? activeId : undefined);
   const accountUsageKey = snapshot.accounts
     .map((account) => `${text(account["id"])}:${text(account["status"])}`)

@@ -41,6 +41,8 @@ type CachedJsonFile = {
   sameSignatureRechecks: number;
 };
 
+export type ApiState = { config: JsonObject; status: JsonObject; devices: JsonObject; orchestration: JsonObject; running: boolean; projects: string[] };
+
 // Some Windows filesystems can report the same size and timestamp for two
 // same-length writes that happen in one clock tick. Recheck each newly
 // observed signature once before trusting metadata alone; stable files still
@@ -261,8 +263,9 @@ export class StateStore extends EventEmitter {
    * user just fetched without trusting an arbitrary renderer-supplied ID.
    */
   private readonly hydratedSessionIds = new Map<string, true>();
+  private apiState: ApiState = { config: {}, status: {}, devices: {}, orchestration: {}, running: false, projects: [] };
 
-  constructor(home = process.env["PROSPERO_HOME"] || resolve(homedir(), ".prospero")) {
+  constructor(home = process.env["PROSPERO_HOME"] || resolve(homedir(), ".prospero"), readonly backend: "files" | "api" = "files") {
     super();
     this.home = resolve(home);
     // 这个客户端现在是跨平台的,文件名不再带 windows-。已经在用的机器上还躺着
@@ -280,13 +283,13 @@ export class StateStore extends EventEmitter {
   }
 
   snapshot(): DesktopSnapshot {
-    const config = this.readExternalJson(resolve(this.home, "config.json"));
-    const status = this.readExternalJson(resolve(this.home, "status.json"));
+    const config = this.backend === "api" ? this.apiState.config : this.readExternalJson(resolve(this.home, "config.json"));
+    const status = this.backend === "api" ? this.apiState.status : this.readExternalJson(resolve(this.home, "status.json"));
     const rawPid = numberValue(status["pid"]);
-    const running = isProcessAlive(rawPid);
-    if (this.discoverSessionProjects(status)) this.internalRevision += 1;
-    const devicesRoot = this.readExternalJson(resolve(this.home, "devices.json"));
-    const orchestration = this.readOrchestrationProjection();
+    const running = this.backend === "api" ? this.apiState.running : isProcessAlive(rawPid);
+    if (this.backend === "files" && this.discoverSessionProjects(status)) this.internalRevision += 1;
+    const devicesRoot = this.backend === "api" ? this.apiState.devices : this.readExternalJson(resolve(this.home, "devices.json"));
+    const orchestration = this.backend === "api" ? this.apiState.orchestration : this.readOrchestrationProjection();
     const previousInputs = this.cachedSnapshotInputs;
     if (
       this.cachedSnapshot
@@ -372,6 +375,7 @@ export class StateStore extends EventEmitter {
         relay: relaySnapshot(status["relay"], config["relay"]),
         sessionSummary: summary,
         sessions,
+        ...(this.backend === "api" ? { metadataRevision: stringValue(status["metadataRevision"]) } : {}),
         ...(running ? { pid: rawPid } : {}),
         ...(this.lastError ? { lastError: this.lastError } : {}),
       };
@@ -402,7 +406,9 @@ export class StateStore extends EventEmitter {
         gates: records(orchestration["gates"]),
         worktreeAssets: records(orchestration["worktreeAssets"]),
       });
-    const projects = previous && previousInputs?.projects === this.projects ? previous.projects : reuseEquivalent(previous?.projects, [...this.projects]);
+    const projects = this.backend === "api"
+      ? reuseEquivalent(previous?.projects, [...new Set([...this.projects, ...this.apiState.projects])])
+      : previous && previousInputs?.projects === this.projects ? previous.projects : reuseEquivalent(previous?.projects, [...this.projects]);
     const projectAliases = previous && previousInputs?.projectAliases === this.projectAliases ? previous.projectAliases : reuseEquivalent(previous?.projectAliases, { ...this.projectAliases });
     const pinnedProjectPaths = previous && previousInputs?.pinnedProjectPaths === this.pinnedProjectPaths ? previous.pinnedProjectPaths : reuseEquivalent(previous?.pinnedProjectPaths, [...this.pinnedProjectPaths]);
     const pinnedSessionIds = previous && previousInputs?.pinnedSessionIds === this.pinnedSessionIds ? previous.pinnedSessionIds : reuseEquivalent(previous?.pinnedSessionIds, [...this.pinnedSessionIds]);
@@ -484,6 +490,21 @@ export class StateStore extends EventEmitter {
       this.startupProgress = pid && !error ? 100 : 0;
       this.startupStage = error ? "启动失败" : pid ? "daemon 已就绪" : "";
     }
+    this.changed();
+  }
+
+  setApiState(state: ApiState): void {
+    if (this.backend !== "api") throw new Error("API data is not enabled");
+    if (arrayValue(state.status["sessions"]).length > 200 || state.projects.length > 100 || Buffer.byteLength(JSON.stringify(state)) > 2 * 1024 * 1024) throw new Error("API projection exceeds page limit");
+    if (isDeepStrictEqual(this.apiState, state)) return;
+    this.apiState = {
+      config: reuseEquivalent(this.apiState.config, state.config),
+      status: reuseEquivalent(this.apiState.status, state.status),
+      devices: reuseEquivalent(this.apiState.devices, state.devices),
+      orchestration: reuseEquivalent(this.apiState.orchestration, state.orchestration),
+      running: state.running,
+      projects: reuseEquivalent(this.apiState.projects, state.projects),
+    };
     this.changed();
   }
 
@@ -606,6 +627,7 @@ export class StateStore extends EventEmitter {
   }
 
   renameSession(sessionId: string, title: string): DesktopSnapshot {
+    if (this.backend === "api") throw new Error("Rename must be committed through the daemon API");
     if (!this.isKnownSession(sessionId)) throw new Error("会话不存在");
     const normalized = title.trim().replace(/\s+/g, " ").slice(0, 120);
     if (!normalized) throw new Error("会话名称不能为空");
@@ -705,6 +727,7 @@ export class StateStore extends EventEmitter {
   }
 
   controlCredentials(): { port: number; token: string } {
+    if (this.backend === "api") throw new Error("Rust credentials are owned by the runtime client");
     const status = this.readExternalJson(resolve(this.home, "status.json"));
     const pid = numberValue(status["pid"]);
     const token = stringValue(status["controlToken"]);
@@ -825,7 +848,7 @@ export class StateStore extends EventEmitter {
       if (typeof path === "string" && isAbsolute(path) && existsSync(path)) this.addProjectInMemory(path);
     }
     const stored = objectValue(raw.settings);
-    this.sessionTitles = Object.fromEntries(
+    this.sessionTitles = this.backend === "api" ? {} : Object.fromEntries(
       Object.entries(objectValue(raw.sessionTitles))
         .filter(([id, title]) => SAFE_PERSISTED_SESSION_ID.test(id) && typeof title === "string" && title.trim())
         .map(([id, title]) => [id, String(title).trim().slice(0, 120)]),

@@ -2,7 +2,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use futures_util::StreamExt;
 use prosperod_rs::auth::Token;
-use prosperod_rs::protocol::{AgentKind, CreateSession};
+use prosperod_rs::protocol::{AgentKind, CreateSession, SessionKind};
 use prosperod_rs::server::Api;
 use prosperod_rs::worker::Database;
 use serde_json::{Value, json};
@@ -21,6 +21,7 @@ async fn fixture() -> (TempDir, Api, String) {
         .call(|store| {
             store.create_session(CreateSession {
                 agent: AgentKind::Codex,
+                kind: SessionKind::Structured,
                 title: "Example".into(),
                 workspace: "/synthetic".into(),
             })

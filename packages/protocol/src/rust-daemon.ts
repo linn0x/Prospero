@@ -1,8 +1,9 @@
 export type AgentKind = "codex" | "claude" | "opencode" | "deepseek" | "grok" | "trae" | "shell" | "custom";
+export type SessionKind = "structured" | "pty";
 export type SessionLifecycle = "active" | "archived";
 export type SessionStatus = "idle" | "starting" | "running" | "waiting_permission" | "waiting_input" | "completed" | "failed";
-export type SessionHead = { id: string, agent: AgentKind, title: string, workspace: string, lifecycle: SessionLifecycle, status: SessionStatus, createdAt: number, updatedAt: number, revision: number, };
-export type CreateSession = { agent: AgentKind, title: string, workspace: string, };
+export type SessionHead = { id: string, agent: AgentKind, kind: SessionKind, title: string, workspace: string, lifecycle: SessionLifecycle, status: SessionStatus, createdAt: number, updatedAt: number, revision: number, };
+export type CreateSession = { agent: AgentKind, kind: SessionKind, title: string, workspace: string, };
 export type UpdateSession = { revision: number, title: string | null, lifecycle: SessionLifecycle | null, status: SessionStatus | null, };
 export type SessionQuery = { cursor: string | null, limit: number | null, lifecycle: SessionLifecycle | null, workspace: string | null, text: string | null, };
 export type SessionPage = { items: Array<SessionHead>, nextCursor: string | null, hasMore: boolean, total: number, latestSeq: number, };

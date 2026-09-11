@@ -4,7 +4,7 @@ import { applySessionChanges, previousCursors, visibleRows } from "../src/render
 import type { ChangeEvent, SessionHead } from "@prospero/protocol/rust-daemon";
 
 const token = "a".repeat(64);
-const head: SessionHead = { id: "fixture", agent: "codex", title: "Example", workspace: "/synthetic", lifecycle: "archived", status: "completed", createdAt: 1, updatedAt: 1, revision: 1 };
+const head: SessionHead = { id: "fixture", agent: "codex", kind: "structured", title: "Example", workspace: "/synthetic", lifecycle: "archived", status: "completed", createdAt: 1, updatedAt: 1, revision: 1 };
 
 describe("Rust desktop API boundary", () => {
   it.each(["https://example.invalid", "http://example.invalid", "http://127.0.0.1/path", "http://user@127.0.0.1", "http://127.0.0.1?token=fixture"])("rejects a non-local or credential-bearing daemon address", value => {
@@ -28,6 +28,19 @@ describe("Rust desktop API boundary", () => {
     await expect(client.health()).rejects.toThrow("500");
     fetcher.mockResolvedValue(new Response(JSON.stringify({ code: "conflict", message: token }), { status: 409 }));
     await expect(client.rename("fixture", { revision: 1, title: "Rename" })).rejects.toThrow("记录已变更");
+  });
+
+  it("propagates cancellation without exposing the caller's abort reason", async () => {
+    const controller = new AbortController();
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (_url, init) => {
+      await new Promise<void>((_done, reject) => init?.signal?.addEventListener("abort", () => reject(new Error(token)), { once: true }));
+      return new Response("{}");
+    });
+    const client = new RustClient("http://127.0.0.1:12345", token, fetcher);
+    const pending = client.events({ scope: "sessions", afterSeq: 0, limit: 100 }, controller.signal);
+    controller.abort(token);
+    await expect(pending).rejects.toMatchObject({ name: "AbortError", message: "Request cancelled" });
+    expect(fetcher.mock.calls[0]?.[1]?.signal?.aborted).toBe(true);
   });
 
   it("passes filters and bounded lookups without placing credentials in URLs", async () => {

@@ -19,8 +19,8 @@ export class RustClient {
 
   private async response(path: string, init: RequestInit = {}): Promise<Response> {
     try {
-      return await this.fetcher(this.base + path, { ...init, redirect: "error", signal: AbortSignal.timeout(7000), headers: { ...init.headers, authorization: `Bearer ${this.token}` } });
-    } catch { throw new Error("无法连接本机 Rust 服务"); }
+      return await this.fetcher(this.base + path, { ...init, redirect: "error", signal: init.signal ? AbortSignal.any([init.signal, AbortSignal.timeout(7000)]) : AbortSignal.timeout(7000), headers: { ...init.headers, authorization: `Bearer ${this.token}` } });
+    } catch { if (init.signal?.aborted) throw new DOMException("Request cancelled", "AbortError"); throw new Error("无法连接本机 Rust 服务"); }
   }
 
   private async bytes(response: Response): Promise<Uint8Array> {
@@ -53,41 +53,41 @@ export class RustClient {
     return result as T;
   }
 
-  health(): Promise<Health> { return this.json("/v1/health"); }
-  async shutdown(): Promise<void> { await this.json("/v1/shutdown", { method: "POST" }); }
-  sessions(query: SessionQuery): Promise<SessionPage> {
+  health(signal: AbortSignal | null = null): Promise<Health> { return this.json("/v1/health", { signal }); }
+  async shutdown(signal: AbortSignal | null = null): Promise<void> { await this.json("/v1/shutdown", { method: "POST", signal }); }
+  sessions(query: SessionQuery, signal: AbortSignal | null = null): Promise<SessionPage> {
     const params = new URLSearchParams();
     if (query.limit != null) params.set("limit", String(query.limit));
     if (query.cursor) params.set("cursor", query.cursor);
     if (query.lifecycle) params.set("lifecycle", query.lifecycle);
     if (query.workspace != null) params.set("workspace", query.workspace);
     if (query.text != null) params.set("text", query.text);
-    return this.json(`/v1/sessions?${params}`);
+    return this.json(`/v1/sessions?${params}`, { signal });
   }
-  summary(workspace?: string): Promise<SessionSummary> {
+  summary(workspace?: string, signal: AbortSignal | null = null): Promise<SessionSummary> {
     const params = new URLSearchParams();
     if (workspace != null) params.set("workspace", workspace);
-    return this.json(`/v1/sessions/summary?${params}`);
+    return this.json(`/v1/sessions/summary?${params}`, { signal });
   }
-  workspaces(query: WorkspaceQuery): Promise<WorkspacePage> {
+  workspaces(query: WorkspaceQuery, signal: AbortSignal | null = null): Promise<WorkspacePage> {
     const params = new URLSearchParams();
     if (query.limit != null) params.set("limit", String(query.limit));
     if (query.cursor != null) params.set("cursor", query.cursor);
-    return this.json(`/v1/workspaces?${params}`);
+    return this.json(`/v1/workspaces?${params}`, { signal });
   }
-  lookup(ids: string[]): Promise<SessionLookupResult> {
+  lookup(ids: string[], signal: AbortSignal | null = null): Promise<SessionLookupResult> {
     if (ids.length > 100) throw new Error("Session lookup exceeds limit");
-    return this.json("/v1/sessions/lookup", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ids: ids.map(id) }) });
+    return this.json("/v1/sessions/lookup", { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ ids: ids.map(id) }) });
   }
-  session(value: string): Promise<SessionHead> { return this.json(`/v1/sessions/${id(value)}`); }
-  rename(value: string, input: RenameSession): Promise<SessionHead> {
-    return this.json(`/v1/sessions/${id(value)}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
+  session(value: string, signal: AbortSignal | null = null): Promise<SessionHead> { return this.json(`/v1/sessions/${id(value)}`, { signal }); }
+  rename(value: string, input: RenameSession, signal: AbortSignal | null = null): Promise<SessionHead> {
+    return this.json(`/v1/sessions/${id(value)}`, { method: "PATCH", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
   }
-  events(query: EventQuery): Promise<EventPage> {
+  events(query: EventQuery, signal: AbortSignal | null = null): Promise<EventPage> {
     const params = new URLSearchParams({ scope: query.scope });
     if (query.afterSeq != null) params.set("afterSeq", String(query.afterSeq));
     if (query.limit != null) params.set("limit", String(query.limit));
-    return this.json(`/v1/events?${params}`);
+    return this.json(`/v1/events?${params}`, { signal });
   }
   contents(value: string, cursor?: string): Promise<ContentPage> {
     const params = new URLSearchParams({ limit: "20" });
