@@ -1,11 +1,11 @@
 import { createHash } from "node:crypto";
-import type { SessionHead } from "@prospero/protocol/rust-daemon";
+import type { SessionHead, TimelineQuery, TimelineTextQuery } from "@prospero/protocol/rust-daemon";
 import type { DesktopSnapshot, JsonObject, SessionInfo, SessionPage, SessionPageRequest } from "../shared/types";
 import { StateStore } from "./state-store";
 import { RustProcess, type RustConnection } from "./rust-process";
 
 export function rustSessionInfo(head: SessionHead): SessionInfo {
-  return { id: head.id, agent: head.agent, kind: head.kind, title: head.title, cwd: head.workspace, status: head.status === "waiting_permission" ? "waiting_approval" : head.status, createdAt: head.createdAt, pendingPermissions: head.status === "waiting_permission" ? 1 : 0, pendingQuestions: head.status === "waiting_input" ? 1 : 0 };
+  return { id: head.id, agent: head.agent, kind: head.kind, historyMode: "paged", title: head.title, cwd: head.workspace, status: head.status === "waiting_permission" ? "waiting_approval" : head.status, createdAt: head.createdAt, pendingPermissions: head.status === "waiting_permission" ? 1 : 0, pendingQuestions: head.status === "waiting_input" ? 1 : 0 };
 }
 
 export class RustRuntime {
@@ -172,6 +172,11 @@ export class RustRuntime {
     await this.refresh(true);
     return this.store.snapshot();
   }
+
+  readTimeline(id: string, query: TimelineQuery, signal: AbortSignal) { return this.current().client.timeline(id, query, AbortSignal.any([signal, this.controller.signal])); }
+  readTimelineChanges(id: string, after: number, signal: AbortSignal) { return this.current().client.events({ scope: `timeline:${id}`, afterSeq: after, limit: 100 }, AbortSignal.any([signal, this.controller.signal])); }
+  lookupTimeline(id: string, ids: string[], signal: AbortSignal) { return this.current().client.timelineLookup(id, ids, AbortSignal.any([signal, this.controller.signal])); }
+  readTimelineText(id: string, record: string, query: TimelineTextQuery, signal: AbortSignal) { return this.current().client.timelineText(id, record, query, AbortSignal.any([signal, this.controller.signal])); }
 
   async request(_path: string, _init?: { method?: "GET" | "POST"; body?: JsonObject; signal?: AbortSignal; timeoutMs?: number; acceptJsonError?: boolean }): Promise<JsonObject | null> {
     throw new Error("此功能尚未接入 Rust daemon");

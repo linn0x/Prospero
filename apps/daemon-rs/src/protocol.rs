@@ -243,6 +243,130 @@ pub struct ContentPage {
     pub has_more: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageRole {
+    User,
+    Assistant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolState {
+    Running,
+    Success,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum TimelineBody {
+    Message {
+        role: MessageRole,
+        final_answer: bool,
+    },
+    Reasoning,
+    Tool {
+        name: String,
+        state: ToolState,
+        summary: String,
+    },
+    TurnEnd {
+        finish: String,
+    },
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineRecord {
+    pub id: String,
+    pub turn_id: String,
+    #[ts(type = "number")]
+    pub position: i64,
+    #[ts(type = "number")]
+    pub revision: i64,
+    pub body: TimelineBody,
+    pub preview: String,
+    #[ts(type = "number")]
+    pub bytes: i64,
+    #[ts(type = "number")]
+    pub generation: i64,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TimelineWrite {
+    pub id: String,
+    pub turn_id: String,
+    #[ts(type = "number")]
+    pub expected_revision: i64,
+    pub body: TimelineBody,
+    pub text: String,
+    pub replace: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TimelineQuery {
+    #[ts(type = "number | null")]
+    pub before: Option<i64>,
+    #[ts(type = "number | null")]
+    pub after: Option<i64>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelinePage {
+    pub items: Vec<TimelineRecord>,
+    #[ts(type = "number | null")]
+    pub older: Option<i64>,
+    #[ts(type = "number | null")]
+    pub newer: Option<i64>,
+    #[ts(type = "number")]
+    pub latest_position: i64,
+    #[ts(type = "number")]
+    pub revision: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineLookupResult {
+    pub items: Vec<TimelineRecord>,
+    #[ts(type = "number")]
+    pub latest_position: i64,
+    #[ts(type = "number")]
+    pub revision: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TimelineTextQuery {
+    pub part: Option<u32>,
+    #[ts(type = "number | null")]
+    pub generation: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineTextPage {
+    pub text: String,
+    pub part: u32,
+    pub next_part: Option<u32>,
+    pub previous_part: Option<u32>,
+    #[ts(type = "number")]
+    pub total_bytes: i64,
+    #[ts(type = "number")]
+    pub generation: i64,
+}
+
 pub fn typescript() -> String {
     let config = ts_rs::Config::default();
     let declarations = [
@@ -269,6 +393,16 @@ pub fn typescript() -> String {
         ResyncRequired::decl(&config),
         ContentHead::decl(&config),
         ContentPage::decl(&config),
+        MessageRole::decl(&config),
+        ToolState::decl(&config),
+        TimelineBody::decl(&config),
+        TimelineRecord::decl(&config),
+        TimelineWrite::decl(&config),
+        TimelineQuery::decl(&config),
+        TimelinePage::decl(&config),
+        TimelineLookupResult::decl(&config),
+        TimelineTextQuery::decl(&config),
+        TimelineTextPage::decl(&config),
         crate::error::ErrorBody::decl(&config),
     ];
     declarations

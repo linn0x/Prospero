@@ -611,6 +611,7 @@ function sidebarSessionRowEqual(
     left.id !== right.id ||
     left.agent !== right.agent ||
     left.kind !== right.kind ||
+    left.historyMode !== right.historyMode ||
     left.title !== right.title ||
     left.displayTitle !== right.displayTitle ||
     left.preview !== right.preview ||

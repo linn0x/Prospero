@@ -48,3 +48,20 @@ CREATE TABLE content_chunks (
     PRIMARY KEY(session_id,content_id,offset),
     FOREIGN KEY(session_id,content_id) REFERENCES content_heads(session_id,id) ON DELETE CASCADE
 ) STRICT;
+CREATE TABLE timeline_heads (
+    session_id TEXT PRIMARY KEY REFERENCES session_heads(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL CHECK(position BETWEEN 0 AND 9007199254740991)
+) STRICT;
+CREATE TABLE timeline_records (
+    session_id TEXT NOT NULL REFERENCES session_heads(id) ON DELETE CASCADE,
+    id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    position INTEGER NOT NULL CHECK(position > 0),
+    revision INTEGER NOT NULL CHECK(revision BETWEEN 1 AND 9007199254740991),
+    generation INTEGER NOT NULL CHECK(generation BETWEEN 1 AND 9007199254740991),
+    body TEXT NOT NULL CHECK(length(CAST(body AS BLOB)) <= 8192),
+    preview TEXT NOT NULL CHECK(length(CAST(preview AS BLOB)) <= 4096),
+    PRIMARY KEY(session_id,id),
+    UNIQUE(session_id,position),
+    FOREIGN KEY(session_id,id) REFERENCES content_heads(session_id,id) ON DELETE CASCADE
+) STRICT;

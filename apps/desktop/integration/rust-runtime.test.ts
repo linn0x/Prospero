@@ -8,11 +8,12 @@ import { RustClient } from "../src/main/rust-client";
 import { StateStore } from "../src/main/state-store";
 import { RequestRegistry } from "../src/main/request-registry";
 import { WorkspaceSessionPager } from "../src/renderer/src/workspace-session-pager";
+import { TimelineController } from "../src/renderer/src/timeline-controller";
 
 const binary = resolve("../../target/debug", process.platform === "win32" ? "prosperod-rs.exe" : "prosperod-rs");
 const fixtures: { directory: string; runtime: RustRuntime }[] = [];
 
-function fixture(count = 0) {
+function fixture(count = 0, turns = 0) {
   const directory = mkdtempSync(resolve(tmpdir(), "prospero-rust-desktop-"));
   const dataDir = resolve(directory, "daemon");
   const store = new StateStore(resolve(directory, "desktop"), "api");
@@ -20,6 +21,10 @@ function fixture(count = 0) {
   fixtures.push({ directory, runtime });
   if (count) {
     const seeded = spawnSync(binary, ["seed-benchmark", "--data-dir", dataDir, "--sessions", String(count)], { encoding: "utf8", timeout: 30000 });
+    expect(seeded.status, seeded.stderr).toBe(0);
+  }
+  if (turns) {
+    const seeded = spawnSync(binary, ["seed-conversation", "--data-dir", dataDir, "--turns", String(turns)], { encoding: "utf8", timeout: 30000 });
     expect(seeded.status, seeded.stderr).toBe(0);
   }
   return { directory, dataDir, store, runtime };
@@ -134,5 +139,44 @@ describe("existing desktop shell with the real Rust runtime", () => {
       await expect(runtime.listSessions({ workspace: "/synthetic" }, cancelled.signal)).rejects.toMatchObject({ name: "AbortError" });
       await expect(runtime.listSessions({ workspace: "/different", cursor: pager.getSnapshot().page?.nextCursor })).rejects.toThrow();
     } finally { pager.setActive(false); registry.cancelAll(); }
+  }, 45000);
+
+  it("reads durable conversation pages and full Unicode bodies through the existing desktop data bridge", async () => {
+    const { runtime, store } = fixture(0, 2600);
+    expect((await runtime.start()).ok).toBe(true);
+    const session = store.snapshot().daemon.sessions[0]!;
+    expect(session.historyMode).toBe("paged");
+    const registry = new RequestRegistry();
+    const controller = new TimelineController({
+      readTimeline: (sid, query, id) => registry.run(id, signal => runtime.readTimeline(sid, query, signal)),
+      readTimelineChanges: (sid, after, id) => registry.run(id, signal => runtime.readTimelineChanges(sid, after, signal)),
+      lookupTimeline: (sid, ids, id) => registry.run(id, signal => runtime.lookupTimeline(sid, ids, signal)),
+      cancelSessionPage: async id => registry.cancel(id),
+    }, session.id);
+    try {
+      controller.start();
+      await vi.waitFor(() => expect(controller.getSnapshot().page?.latestPosition).toBe(10400));
+      expect(controller.getSnapshot().page?.items).toHaveLength(40);
+      expect(controller.getSnapshot().page?.items[0]?.position).toBe(10361);
+      await controller.older();
+      expect(controller.getSnapshot().page?.items[0]?.position).toBe(10321);
+      await controller.latest();
+      const answer = controller.getSnapshot().page!.items.at(-2)!;
+      expect(answer.truncated).toBe(true);
+      const signal = new AbortController().signal;
+      let body = "", part = 0;
+      for (;;) {
+        const page = await runtime.readTimelineText(session.id, answer.id, { part, generation: 1 }, signal);
+        expect(Buffer.byteLength(page.text)).toBeLessThanOrEqual(65539);
+        body += page.text;
+        if (page.nextPart === null) break;
+        part = page.nextPart;
+      }
+      expect(body).toBe("Synthetic response 2599. 中文 🦀\n".repeat(5000));
+      expect(part).toBeGreaterThan(0);
+      const oldest = await runtime.readTimeline(session.id, { before: 5, after: null, limit: 40 }, signal);
+      expect(oldest.items[0]?.position).toBe(1);
+      expect(store.snapshot().daemon.sessions).toHaveLength(1);
+    } finally { controller.stop(); registry.cancelAll(); }
   }, 45000);
 });
