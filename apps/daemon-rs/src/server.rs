@@ -56,6 +56,12 @@ impl Api {
             .route("/v1/sessions/{id}", get(session).patch(rename))
             .route("/v1/sessions/{id}/contents", get(contents))
             .route("/v1/sessions/{id}/content/{content}", get(content))
+            .route("/v1/sessions/{id}/timeline", get(timeline))
+            .route("/v1/sessions/{id}/timeline/lookup", post(timeline_lookup))
+            .route(
+                "/v1/sessions/{id}/timeline/{record}/body",
+                get(timeline_text),
+            )
             .route("/v1/events", get(events))
             .route("/v1/events/stream", get(subscribe))
             .fallback(|| async { ApiError(Error::NotFound) })
@@ -158,6 +164,7 @@ async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, Api
             "session.workspace.page",
             "workspace.page",
             "session.content",
+            "session.timeline",
             "events.replay",
             "events.stream",
         ]
@@ -184,6 +191,41 @@ async fn session(
     Path(id): Path<String>,
 ) -> std::result::Result<Json<SessionHead>, ApiError> {
     Ok(Json(api.call(move |store| store.session(&id)).await?))
+}
+
+async fn timeline(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    query: std::result::Result<Query<TimelineQuery>, axum::extract::rejection::QueryRejection>,
+) -> std::result::Result<Json<TimelinePage>, ApiError> {
+    let Query(query) = query.map_err(|_| Error::Invalid("invalid timeline query".into()))?;
+    Ok(Json(
+        api.call(move |store| store.timeline(&id, query)).await?,
+    ))
+}
+
+async fn timeline_lookup(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<SessionLookup>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<TimelineLookupResult>, ApiError> {
+    let Json(body) = body.map_err(|_| Error::Invalid("invalid timeline lookup".into()))?;
+    Ok(Json(
+        api.call(move |store| store.timeline_lookup(&id, body.ids))
+            .await?,
+    ))
+}
+
+async fn timeline_text(
+    State(api): State<Api>,
+    Path((id, record)): Path<(String, String)>,
+    query: std::result::Result<Query<TimelineTextQuery>, axum::extract::rejection::QueryRejection>,
+) -> std::result::Result<Json<TimelineTextPage>, ApiError> {
+    let Query(query) = query.map_err(|_| Error::Invalid("invalid body query".into()))?;
+    Ok(Json(
+        api.call(move |store| store.timeline_text(&id, &record, query))
+            .await?,
+    ))
 }
 
 #[derive(serde::Deserialize)]

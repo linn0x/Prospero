@@ -172,6 +172,12 @@ function boundedNonNegativeInteger(value: unknown, fallback = 0): number {
     : fallback;
 }
 
+function optionalCursor(value: unknown, maximum = Number.MAX_SAFE_INTEGER): number | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value > maximum) throw new Error("游标或分页数量无效");
+  return value;
+}
+
 function sessionPageRequest(raw: unknown): SessionPageRequest {
   if (raw === undefined) return {};
   const request = requireObject(raw);
@@ -1014,6 +1020,28 @@ function installIpc(): void {
     return page;
   });
   ipcMain.handle("sessions:cancel", (_event, rawId: unknown) => sessionPageRequests.cancel(`${_event.sender.id}:${requireId(rawId, "分页请求")}`));
+  ipcMain.handle("timeline:read", (event, rawId: unknown, rawQuery: unknown, rawRequest: unknown) => {
+    if (!(runtime instanceof RustRuntime)) throw new Error("当前后端不支持时间线分页");
+    const id = requireId(rawId, "会话"); const query = requireObject(rawQuery);
+    return sessionPageRequests.run(`${event.sender.id}:${requireId(rawRequest, "请求")}`, signal => runtime.readTimeline(id, { before: optionalCursor(query["before"]), after: optionalCursor(query["after"]), limit: optionalCursor(query["limit"], 100) }, signal));
+  });
+  ipcMain.handle("timeline:changes", (event, rawId: unknown, after: unknown, rawRequest: unknown) => {
+    if (!(runtime instanceof RustRuntime)) throw new Error("当前后端不支持时间线分页");
+    const id = requireId(rawId, "会话"); const cursor = optionalCursor(after) ?? 0;
+    return sessionPageRequests.run(`${event.sender.id}:${requireId(rawRequest, "请求")}`, signal => runtime.readTimelineChanges(id, cursor, signal));
+  });
+  ipcMain.handle("timeline:lookup", (event, rawId: unknown, rawIds: unknown, rawRequest: unknown) => {
+    if (!(runtime instanceof RustRuntime)) throw new Error("当前后端不支持时间线分页");
+    const id = requireId(rawId, "会话");
+    if (!Array.isArray(rawIds) || rawIds.length > 40) throw new Error("时间线查询数量无效");
+    const ids = rawIds.map(id => requireId(id, "记录"));
+    return sessionPageRequests.run(`${event.sender.id}:${requireId(rawRequest, "请求")}`, signal => runtime.lookupTimeline(id, ids, signal));
+  });
+  ipcMain.handle("timeline:body", (event, rawId: unknown, rawRecord: unknown, rawQuery: unknown, rawRequest: unknown) => {
+    if (!(runtime instanceof RustRuntime)) throw new Error("当前后端不支持正文分页");
+    const id = requireId(rawId, "会话"); const record = requireId(rawRecord, "记录"); const query = requireObject(rawQuery);
+    return sessionPageRequests.run(`${event.sender.id}:${requireId(rawRequest, "请求")}`, signal => runtime.readTimelineText(id, record, { part: optionalCursor(query["part"], 16384), generation: optionalCursor(query["generation"]) }, signal));
+  });
   ipcMain.handle("session:create", async (_event, raw: unknown) => {
     const input = requireObject(raw) as SessionCreateInput;
     const normalized = resolve(String(input.cwd ?? ""));

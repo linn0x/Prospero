@@ -1,9 +1,8 @@
 import type { DesktopApi, SessionPage } from "../../shared/types";
-import { RequestQueue } from "./request-queue";
+import { desktopPageRequests, pageRequest } from "./page-request";
 
 export const WORKSPACE_PAGE_SIZE = 24;
 export const WORKSPACE_PREVIEW_SIZE = 6;
-const requests = new RequestQueue();
 type PageApi = Pick<DesktopApi, "listSessions" | "cancelSessionPage">;
 export type WorkspacePageState = { page: SessionPage | undefined; loading: boolean; expanded: boolean; error: string | undefined };
 
@@ -17,7 +16,7 @@ export class WorkspaceSessionPager {
   private cursor: string | undefined;
   private attemptedCursor: string | undefined;
 
-  constructor(private readonly api: PageApi, readonly workspace: string, private readonly queue = requests) {}
+  constructor(private readonly api: PageApi, readonly workspace: string, private readonly queue = desktopPageRequests) {}
   getSnapshot = (): WorkspacePageState => this.state;
   subscribe = (listener: () => void): (() => void) => { this.listeners.add(listener); return () => this.listeners.delete(listener); };
 
@@ -57,19 +56,11 @@ export class WorkspaceSessionPager {
     this.controller?.abort();
     const controller = new AbortController();
     this.controller = controller;
-    const requestId = crypto.randomUUID();
-    let started = false;
-    const cancel = (): void => { if (started) void this.api.cancelSessionPage(requestId).catch(() => {}); };
-    controller.signal.addEventListener("abort", cancel, { once: true });
     this.attemptedCursor = cursor;
     this.publish({ ...this.state, loading: true, expanded, error: undefined });
     try {
       const limit = expanded ? WORKSPACE_PAGE_SIZE : WORKSPACE_PREVIEW_SIZE;
-      const page = await this.queue.run(controller.signal, () => {
-        controller.signal.throwIfAborted();
-        started = true;
-        return this.api.listSessions({ workspace: this.workspace, limit, requestId, ...(cursor ? { cursor } : {}) });
-      });
+      const page = await pageRequest(this.api, controller.signal, requestId => this.api.listSessions({ workspace: this.workspace, limit, requestId, ...(cursor ? { cursor } : {}) }), this.queue);
       if (controller.signal.aborted || this.generation !== generation) return;
       if (page.items.length > limit || new TextEncoder().encode(JSON.stringify(page)).byteLength > 2 * 1024 * 1024) throw new Error("Page exceeds limit");
       if (!page.items.length && page.total > 0 && cursor) { await this.load(undefined, expanded); return; }
@@ -77,6 +68,6 @@ export class WorkspaceSessionPager {
       this.publish({ page, loading: false, expanded, error: undefined });
     } catch {
       if (!controller.signal.aborted && this.generation === generation) this.publish({ ...this.state, loading: false, error: "加载失败，请重试" });
-    } finally { controller.signal.removeEventListener("abort", cancel); }
+    }
   }
 }

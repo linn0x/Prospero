@@ -2,7 +2,9 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use futures_util::StreamExt;
 use prosperod_rs::auth::Token;
-use prosperod_rs::protocol::{AgentKind, CreateSession, SessionKind};
+use prosperod_rs::protocol::{
+    AgentKind, CreateSession, MessageRole, SessionKind, TimelineBody, TimelineWrite,
+};
 use prosperod_rs::server::Api;
 use prosperod_rs::worker::Database;
 use serde_json::{Value, json};
@@ -54,6 +56,8 @@ async fn every_endpoint_requires_auth_and_rejects_browser_origins() {
         "/v1/sessions/summary",
         "/v1/sessions/lookup",
         "/v1/workspaces",
+        "/v1/sessions/example/timeline",
+        "/v1/sessions/example/timeline/entry/body",
         "/v1/events?scope=sessions",
         "/unknown",
     ] {
@@ -319,5 +323,78 @@ async fn stream_limit_is_released_when_responses_are_dropped() {
     drop(response);
     drop(streams);
     api.stop();
+    api.database.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn timeline_routes_expose_previews_and_generation_checked_body_pages() {
+    let (_directory, api, id) = fixture().await;
+    let saved = id.clone();
+    api.database
+        .call(move |store| {
+            store.write_timeline(
+                &saved,
+                TimelineWrite {
+                    id: "message".into(),
+                    turn_id: "turn".into(),
+                    expected_revision: 0,
+                    body: TimelineBody::Message {
+                        role: MessageRole::Assistant,
+                        final_answer: true,
+                    },
+                    text: "中🦀".repeat(5000),
+                    replace: false,
+                },
+            )
+        })
+        .await
+        .unwrap();
+    let response = api
+        .router()
+        .oneshot(
+            request(&format!("/v1/sessions/{id}/timeline"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = body(response).await;
+    assert_eq!(page["items"][0]["truncated"], true);
+    assert_eq!(page["items"][0]["body"]["finalAnswer"], true);
+    let response = api
+        .router()
+        .oneshot(
+            request(&format!(
+                "/v1/sessions/{id}/timeline/message/body?generation=1"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(body(response).await["text"], "中🦀".repeat(5000));
+    let response = api
+        .router()
+        .oneshot(
+            request(&format!(
+                "/v1/sessions/{id}/timeline/message/body?generation=2"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let response = api
+        .router()
+        .oneshot(
+            request(&format!("/v1/sessions/{id}/timeline?before=2&after=1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     api.database.shutdown().await.unwrap();
 }

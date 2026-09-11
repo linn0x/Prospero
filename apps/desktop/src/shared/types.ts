@@ -1,4 +1,5 @@
 import type { WindowMenuAction, WindowMenuRequest } from "./window-menu";
+import type { EventPage, TimelinePage, TimelineQuery, TimelineLookupResult, TimelineTextQuery, TimelineTextPage } from "@prospero/protocol/rust-daemon";
 import type { AgentAccountConfig, AgentAccountFeatureError, AgentApiCatalogModel, AgentReasoningEffort, C2SAgentAccountApiModelsGet, C2SAgentAccountConfigSet, S2CAgentAccountApiModelsResult, S2CAgentAccountConfigResult } from "@prospero/protocol";
 import type { ModelSource, ModelSourceAction, S2CModelSourceResult } from "@prospero/protocol";
 export type { ModelSource, ModelSourceRoute, ModelSourceAction, ModelSourceMigration, ModelSourceBinding, S2CModelSourceResult } from "@prospero/protocol";
@@ -20,6 +21,7 @@ export type QueuedChatMessage = {
 };
 
 export type SessionInfo = {
+  historyMode?: "paged";
   id: string;
   agent: string;
   kind: "pty" | "structured" | string;
@@ -325,6 +327,10 @@ export type DesktopApi = import("./project-tools").ProjectToolsApi & {
   /** Fetch terminal/history records only when a list or search needs them. */
   listSessions(request?: SessionPageRequest): Promise<SessionPage>;
   cancelSessionPage(requestId: string): Promise<void>;
+  readTimeline(sessionId: string, query: TimelineQuery, requestId: string): Promise<TimelinePage>;
+  readTimelineChanges(sessionId: string, after: number, requestId: string): Promise<EventPage>;
+  lookupTimeline(sessionId: string, ids: string[], requestId: string): Promise<TimelineLookupResult>;
+  readTimelineText(sessionId: string, recordId: string, query: TimelineTextQuery, requestId: string): Promise<TimelineTextPage>;
   getSessionView(sessionId: string, query?: Record<string, number>): Promise<JsonObject | null>;
   cancelSessionView(sessionId: string): Promise<{ ok: boolean }>;
   interact(sessionId: string, message: JsonObject): Promise<JsonObject | null>;
