@@ -175,7 +175,19 @@ impl Store {
         if previous.as_ref().map_or(0, |record| record.revision) != input.expected_revision {
             return Err(Error::Conflict);
         }
-        if let Some(previous) = &previous {
+        Self::check_timeline_identity(previous.as_ref(), &input)?;
+        let transaction = self.connection.transaction()?;
+        let next =
+            Self::write_timeline_transaction(&transaction, session_id, input, body, previous)?;
+        transaction.commit()?;
+        Ok(next)
+    }
+
+    fn check_timeline_identity(
+        previous: Option<&TimelineRecord>,
+        input: &TimelineWrite,
+    ) -> Result<()> {
+        if let Some(previous) = previous {
             if previous.turn_id != input.turn_id
                 || std::mem::discriminant(&previous.body) != std::mem::discriminant(&input.body)
             {
@@ -190,14 +202,60 @@ impl Store {
                 return Err(Error::Invalid("message role is immutable".into()));
             }
         }
-        let transaction = self.connection.transaction()?;
-        let next =
-            Self::write_timeline_transaction(&transaction, session_id, input, body, previous)?;
-        transaction.commit()?;
-        Ok(next)
+        Ok(())
     }
 
-    fn write_timeline_transaction(
+    /// Append several agent records in one transaction. Streaming deltas reuse
+    /// the same record id and carry the revision last seen by the caller.
+    pub(crate) fn append_agent_records(
+        &mut self,
+        session_id: &str,
+        writes: Vec<TimelineWrite>,
+    ) -> Result<()> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        validate_id(session_id)?;
+        self.session(session_id)?;
+        let transaction = self.connection.transaction()?;
+        for input in writes {
+            validate_id(&input.id)?;
+            validate_id(&input.turn_id)?;
+            if input.text.len() > CONTENT_CHUNK_BYTES {
+                return Err(Error::Invalid("invalid timeline write".into()));
+            }
+            if let TimelineBody::Tool { name, summary, .. } = &input.body {
+                validate_text(name, 128, false)?;
+                if summary.len() > 2048 {
+                    return Err(Error::Invalid("tool summary exceeds limit".into()));
+                }
+            }
+            let body = serde_json::to_string(&input.body)?;
+            if body.len() > 8192 {
+                return Err(Error::Invalid("timeline metadata exceeds limit".into()));
+            }
+            let previous = transaction
+                .query_row(
+                    &format!("SELECT {COLUMNS} FROM {SOURCE} WHERE r.session_id=?1 AND r.id=?2"),
+                    params![session_id, input.id],
+                    record,
+                )
+                .optional()?;
+            if previous
+                .as_ref()
+                .map_or(0, |record: &TimelineRecord| record.revision)
+                != input.expected_revision
+            {
+                return Err(Error::Conflict);
+            }
+            Self::check_timeline_identity(previous.as_ref(), &input)?;
+            Self::write_timeline_transaction(&transaction, session_id, input, body, previous)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn write_timeline_transaction(
         transaction: &Transaction<'_>,
         session_id: &str,
         input: TimelineWrite,

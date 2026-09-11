@@ -131,11 +131,18 @@ async fn serve(directory: PathBuf, address: SocketAddr) -> Result<(), Box<dyn st
     let base_url = format!("http://{address}");
     token.publish(&directory, &base_url)?;
     let api = Api::with_guard(database.clone(), token, Some(std::env::current_exe()?));
+    // Stale agent runs belonged to the previous process; archive them
+    // without replaying turns.
+    let recovered_agents = api.agents.recover().await?;
+    if recovered_agents > 0 {
+        api.publish();
+    }
     let shutdown_api = api.clone();
     let (stopping, mut stopped) = tokio::sync::watch::channel(false);
     let shutdown = async move {
         tokio::select! { _ = wait_for_shutdown() => {}, _ = shutdown_api.wait_stopped() => {} }
         shutdown_api.stop();
+        let _ = shutdown_api.agents.shutdown().await;
         let _ = shutdown_api.terminals.shutdown().await;
         stopping.send_replace(true);
     };
@@ -153,9 +160,11 @@ async fn serve(directory: PathBuf, address: SocketAddr) -> Result<(), Box<dyn st
     }
     api.stop();
     let terminals_stopped = api.terminals.shutdown().await;
+    let agents_stopped = api.agents.shutdown().await;
     let _ = std::fs::remove_file(directory.join("connection.json"));
     let database_stopped = database.shutdown().await;
     terminals_stopped?;
+    agents_stopped?;
     database_stopped?;
     Ok(())
 }

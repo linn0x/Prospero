@@ -218,19 +218,54 @@ export class RustRuntime {
     const signal = init?.signal ? AbortSignal.any([init.signal, this.controller.signal]) : this.controller.signal;
     const input = init?.body;
     if (path === "/_prospero/control/session/create" && init?.method === "POST" && input) {
-      if (input["agent"] !== "shell" || input["kind"] !== "pty" || input["command"] || input["accountId"] || input["model"]) throw new Error("Rust 当前支持普通 shell 终端，Agent 和自定义命令尚未接入");
-      const head = await this.current().client.createTerminal({ title: "Terminal", workspace: String(input["cwd"]), size: { cols: Number(input["cols"] ?? 120), rows: Number(input["rows"] ?? 40) } }, signal);
+      if (input["kind"] === "pty") {
+        if (input["agent"] !== "shell" || input["command"] || input["accountId"] || input["model"]) throw new Error("Rust 当前支持普通 shell 终端，自定义命令尚未接入");
+        const head = await this.current().client.createTerminal({ title: "Terminal", workspace: String(input["cwd"]), size: { cols: Number(input["cols"] ?? 120), rows: Number(input["rows"] ?? 40) } }, signal);
+        await this.refresh(true);
+        return rustSessionInfo(head);
+      }
+      if (input["agent"] !== "claude") throw new Error("Rust Agent 当前仅接入 Claude Code");
+      if (input["kind"] !== "structured" || input["command"] || input["accountId"] || input["model"] || input["mode"] || input["effort"]) throw new Error("此 Agent 选项尚未接入 Rust daemon");
+      const policy = input["approvalPolicy"];
+      if (policy !== "strict" && policy !== "standard" && policy !== "yolo") throw new Error("审批策略无效");
+      const head = await this.current().client.createAgentSession({
+        title: "Claude",
+        workspace: String(input["cwd"]),
+        autoApprove: policy === "yolo",
+      }, signal);
       await this.refresh(true);
       return rustSessionInfo(head);
     }
     const route = /^\/_prospero\/control\/session\/([A-Za-z0-9_-]{1,128})\/(view|interact|interrupt|kill)(?:\?(.*))?$/.exec(path);
     if (route) {
       const id = route[1]!; const action = route[2]; const { client } = this.current();
+      const kind = await this.sessionKind(id, signal);
       if (action === "view" && (!init?.method || init.method === "GET")) {
+        if (kind === "structured") return null;
         const params = new URLSearchParams(route[3]);
         return this.terminalView(id, params.has("outputAfterSeq") ? Number(params.get("outputAfterSeq")) : undefined, Number(params.get("waitMs") ?? 0), signal);
       }
       if (init?.method === "POST") {
+        if (kind === "structured") {
+          if (action === "interact" && input?.["type"] === "chat.send") {
+            if (Array.isArray(input["attachments"]) && input["attachments"].length) throw new Error("Rust Agent 暂不支持图片附件");
+            const text = input["text"];
+            if (typeof text !== "string" || !text.trim()) throw new Error("消息内容无效");
+            await client.agentSend(id, { text }, signal);
+            return { ok: true };
+          }
+          if (action === "interact" && input?.["type"] === "permission.respond") {
+            const requestId = input["reqId"];
+            if (typeof requestId !== "string") throw new Error("审批请求无效");
+            const reply = input["reply"];
+            if (reply !== "once" && reply !== "always" && reply !== "reject") throw new Error("审批回复无效");
+            await client.agentPermission(id, { requestId, allow: reply !== "reject" }, signal);
+            return { ok: true };
+          }
+          if (action === "interrupt") { await client.agentInterrupt(id, signal); return { ok: true }; }
+          if (action === "kill") { await client.agentClose(id, signal); await this.refresh(true); return { ok: true }; }
+          throw new Error("此 Agent 操作尚未接入 Rust daemon");
+        }
         if (action === "interact" && input?.["type"] === "term.input" && typeof input["dataB64"] === "string") { await this.terminalWrite(id, input["dataB64"], signal); return { ok: true }; }
         if (action === "interact" && input?.["type"] === "term.resize") return client.terminalResize(id, { cols: Number(input["cols"]), rows: Number(input["rows"]) }, signal);
         if (action === "interrupt") { await this.terminalWrite(id, "Aw==", signal); return { ok: true }; }
@@ -238,6 +273,13 @@ export class RustRuntime {
       }
     }
     throw new Error("此功能尚未接入 Rust daemon");
+  }
+
+  private async sessionKind(id: string, signal: AbortSignal): Promise<"structured" | "pty"> {
+    const known = this.store.snapshot().daemon.sessions.find(session => session.id === id);
+    if (known?.kind === "structured" || known?.kind === "pty") return known.kind;
+    const head = await this.current().client.session(id, signal);
+    return head.kind;
   }
 
   async runCli(_args: string[]): Promise<{ code: number; output: string }> {

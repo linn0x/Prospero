@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -37,6 +37,51 @@ afterEach(async () => {
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+const FAKE_CLAUDE = `#!/usr/bin/env python3
+import json, os, sys
+cwd = os.getcwd()
+scenario = open(os.path.join(cwd, "scenario")).read().strip()
+def emit(payload):
+    sys.stdout.write(json.dumps(payload) + "\\n")
+    sys.stdout.flush()
+emit({"type": "system", "subtype": "init", "session_id": "native-bridge-1"})
+sys.stdin.readline()
+if scenario == "approval":
+    emit({"type": "assistant", "message": {"role": "assistant", "content": [
+        {"type": "tool_use", "id": "call_1", "name": "Bash", "input": {"command": "echo ok"}}]}})
+    emit({"type": "control_request", "request_id": "req-1",
+          "request": {"subtype": "can_use_tool", "tool_name": "Bash",
+                      "input": {"command": "echo ok"}}})
+    answer = sys.stdin.readline()
+    allowed = '"allow"' in answer
+    emit({"type": "stream_event", "event": {"type": "content_block_start", "index": 0,
+          "content_block": {"type": "text", "text": ""}}})
+    emit({"type": "stream_event", "event": {"type": "content_block_delta", "index": 0,
+          "delta": {"type": "text_delta", "text": "bridge says " + ("yes" if allowed else "no")}}})
+    emit({"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}})
+    emit({"type": "user", "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "call_1",
+         "is_error": not allowed,
+         "content": "ran" if allowed else "denied by user"}]}})
+    emit({"type": "result", "subtype": "success", "is_error": False})
+elif scenario == "interrupt":
+    emit({"type": "assistant", "message": {"role": "assistant", "content": [
+        {"type": "tool_use", "id": "call_1", "name": "Bash", "input": {"command": "sleep"}}]}})
+    emit({"type": "control_request", "request_id": "req-9",
+          "request": {"subtype": "can_use_tool", "tool_name": "Bash",
+                      "input": {"command": "sleep"}}})
+    while True:
+        frame = sys.stdin.readline()
+        if not frame:
+            break
+        if '"interrupt"' in frame:
+            emit({"type": "result", "subtype": "success", "is_error": False,
+                  "terminal_reason": "aborted_streaming"})
+            break
+else:
+    emit({"type": "result", "subtype": "success", "is_error": True, "errors": ["unknown scenario"]})
+`;
 
 describe("existing desktop shell with the real Rust runtime", () => {
   it.skipIf(process.platform === "win32")("preserves committed live output when the daemon is killed and recovers without rerunning the shell", async () => {
@@ -300,4 +345,87 @@ describe("existing desktop shell with the real Rust runtime", () => {
       expect(store.snapshot().daemon.sessions).toHaveLength(1);
     } finally { controller.stop(); registry.cancelAll(); }
   }, 45000);
+
+  it.skipIf(process.platform === "win32")("drives a structured Claude agent through the desktop control bridge", async () => {
+    const { directory, dataDir, runtime, store } = fixture();
+    writeFileSync(resolve(directory, "scenario"), "approval");
+    const cli = resolve(directory, "fake-claude");
+    writeFileSync(cli, FAKE_CLAUDE);
+    chmodSync(cli, 0o755);
+    const previousBin = process.env["PROSPERO_CLAUDE_BIN"];
+    process.env["PROSPERO_CLAUDE_BIN"] = cli;
+    try {
+      expect((await runtime.start()).ok).toBe(true);
+      const created = await runtime.request("/_prospero/control/session/create", { method: "POST", body: { agent: "claude", kind: "structured", cwd: directory, approvalPolicy: "standard" } });
+      const id = String(created!["id"]);
+      expect(created?.["kind"]).toBe("structured");
+      expect(created?.["historyMode"]).toBe("paged");
+      await runtime.request(`/_prospero/control/session/${id}/interact`, { method: "POST", body: { type: "chat.send", text: "run it" } });
+      const connection = JSON.parse(readFileSync(resolve(dataDir, "connection.json"), "utf8"));
+      const client = new RustClient(connection.baseUrl, connection.token);
+      let reqId = "";
+      await vi.waitFor(async () => {
+        const page = await client.timeline(id, { before: null, after: null, limit: 50 });
+        const permission = page.items.find(record => record.body.kind === "permission_request");
+        expect(permission?.body.kind).toBe("permission_request");
+        if (permission?.body.kind === "permission_request") {
+          expect(permission.body.resolved).toBe(false);
+          expect(permission.body.tool).toBe("Bash");
+          reqId = permission.body.requestId;
+        }
+      }, { timeout: 8000, interval: 100 });
+      await vi.waitFor(() => {
+        const info = store.snapshot().daemon.sessions.find(session => session.id === id);
+        expect(info?.status).toBe("waiting_approval");
+        expect(info?.pendingPermissions).toBe(1);
+      });
+      await runtime.request(`/_prospero/control/session/${id}/interact`, { method: "POST", body: { type: "permission.respond", reqId, reply: "once" } });
+      await vi.waitFor(async () => {
+        const page = await client.timeline(id, { before: null, after: null, limit: 50 });
+        const end = page.items.find(record => record.body.kind === "turn_end");
+        expect(end?.body.kind === "turn_end" ? end.body.finish : "").toBe("completed");
+        expect(page.items.some(record => record.body.kind === "permission_request" && record.body.resolved)).toBe(true);
+        expect(page.items.some(record => record.body.kind === "tool" && record.body.state === "success")).toBe(true);
+        expect(page.items.some(record => record.body.kind === "message" && record.preview === "bridge says yes")).toBe(true);
+      }, { timeout: 8000, interval: 100 });
+      await runtime.request(`/_prospero/control/session/${id}/kill`, { method: "POST" });
+      await vi.waitFor(async () => expect((await client.session(id)).lifecycle).toBe("archived"));
+    } finally {
+      if (previousBin === undefined) delete process.env["PROSPERO_CLAUDE_BIN"];
+      else process.env["PROSPERO_CLAUDE_BIN"] = previousBin;
+    }
+  }, 20000);
+
+  it.skipIf(process.platform === "win32")("interrupting a structured agent denies the pending approval and ends the turn", async () => {
+    const { directory, dataDir, runtime } = fixture();
+    writeFileSync(resolve(directory, "scenario"), "interrupt");
+    const cli = resolve(directory, "fake-claude");
+    writeFileSync(cli, FAKE_CLAUDE);
+    chmodSync(cli, 0o755);
+    const previousBin = process.env["PROSPERO_CLAUDE_BIN"];
+    process.env["PROSPERO_CLAUDE_BIN"] = cli;
+    try {
+      expect((await runtime.start()).ok).toBe(true);
+      const created = await runtime.request("/_prospero/control/session/create", { method: "POST", body: { agent: "claude", kind: "structured", cwd: directory, approvalPolicy: "standard" } });
+      const id = String(created!["id"]);
+      await runtime.request(`/_prospero/control/session/${id}/interact`, { method: "POST", body: { type: "chat.send", text: "go" } });
+      const connection = JSON.parse(readFileSync(resolve(dataDir, "connection.json"), "utf8"));
+      const client = new RustClient(connection.baseUrl, connection.token);
+      await vi.waitFor(async () => {
+        const page = await client.timeline(id, { before: null, after: null, limit: 50 });
+        expect(page.items.some(record => record.body.kind === "permission_request" && !record.body.resolved)).toBe(true);
+      }, { timeout: 8000, interval: 100 });
+      await runtime.request(`/_prospero/control/session/${id}/interrupt`, { method: "POST" });
+      await vi.waitFor(async () => {
+        const page = await client.timeline(id, { before: null, after: null, limit: 50 });
+        const end = page.items.find(record => record.body.kind === "turn_end");
+        expect(end?.body.kind === "turn_end" ? end.body.finish : "").toBe("interrupted");
+        expect(page.items.some(record => record.body.kind === "permission_request" && record.body.resolved)).toBe(true);
+      }, { timeout: 8000, interval: 100 });
+      expect((await client.session(id)).status).toBe("idle");
+    } finally {
+      if (previousBin === undefined) delete process.env["PROSPERO_CLAUDE_BIN"];
+      else process.env["PROSPERO_CLAUDE_BIN"] = previousBin;
+    }
+  }, 20000);
 });
