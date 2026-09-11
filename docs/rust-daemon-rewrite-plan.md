@@ -18,6 +18,7 @@
 
 - Rust daemon：存储、查询、调度、会话生命周期、事件分发、网络、鉴权和进程管理。
 - Electron：保留现有前端与系统集成，修改主进程启动方式和前后端接口。
+- Electron 外壳的样式、布局和交互以远程最新主线为基准，复用现有侧边栏、工作区、标签栏、主题和设计系统。Rust 重构只调整数据接口及必要的性能实现，不另建一套外壳或独立视觉风格。每次外壳接入前核对主线更新，并进行视觉回归。
 - SQLite：由 daemon 独占管理，前端不得直接访问数据库文件。
 - Claude：适配器、消息队列、流式处理、工具与审批、中断、继续和资源释放。
 - PTY：终端进程、终端状态、滚屏、快照、重连、窗口尺寸和跨平台进程树管理。
@@ -177,4 +178,6 @@ SQLite 持久化正确不等于整个运行时性能达标；Rust 编译成功�
 - 首批 Rust 核心位于 `apps/daemon-rs`：会话元数据索引分页、正文分块、事务内变更事件、单写入方锁及容量为 128 的数据库工作队列。数据库操作使用独立线程，已取消的排队操作不再执行，队列满时明确返回 busy。
 - Rust 类型生成 `packages/protocol/src/rust-daemon.ts`；运行 `npm run rust:contract:check` 校验双端契约一致。Rust 检查入口为 `npm run rust:check`、`npm run rust:test`。
 - 存储实测入口为 `npm run perf:rust-storage`，记录在 `tools/perf/rust-storage-macos-arm64.json`。这是存储初始化与分页子系统的结果，不是完整 daemon、HTTP 或 Electron 性能结果。
-- HTTP 服务、运行时会话、Agent、PTY、DAG、Electron 接入与跨平台验收尚未完成；不得将首批核心完成视为整个重构完成。
+- HTTP 分页、元数据改名、正文分块和增量事件回放/SSE 已接入；真实进程冒烟测试覆盖鉴权、跨源拒绝、翻页、提交后回放、实时事件和正常关闭。
+- 运行时会话、Agent、PTY、DAG、既有 Electron 外壳接入与跨平台验收尚未完成；不得将首批核心完成视为整个重构完成。
+- 已按用户要求撤掉未提交的独立 Rust 预览界面；当前外壳基准为 `origin/master` 的 `2e2d944`，后续通过数据适配接入原有页面。独立预览不作为外壳交付。
