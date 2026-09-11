@@ -28,6 +28,7 @@ const SNAPSHOT_KEYS_ARE_EXHAUSTIVE: MissingSnapshotKey extends never ? true : ne
 void SNAPSHOT_KEYS_ARE_EXHAUSTIVE;
 
 const DAEMON_KEYS = [
+  "workspaceCounts",
   "metadataRevision",
   "running",
   "managed",

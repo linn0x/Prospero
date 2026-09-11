@@ -16,6 +16,7 @@ import { isSessionLaunchWorkspace } from "../shared/session-launch-options";
 import { loginPath, resolveNodeExecutable } from "./host-environment.js";
 import { DaemonRuntime } from "./daemon-runtime";
 import { RustRuntime } from "./rust-runtime";
+import { RequestRegistry } from "./request-registry";
 import { LegacyOrchestrationProjection } from "./legacy-orchestration-projection";
 import { sessionInfoFromControl } from "./session-control";
 import { StateStore } from "./state-store";
@@ -62,6 +63,7 @@ let tray: Tray | undefined;
 let quitting = false;
 let previousPendingInteractions = 0;
 const sessionViewControllers = new Map<string, AbortController>();
+const sessionPageRequests = new RequestRegistry();
 let lastBroadcastSnapshot: ReturnType<StateStore["snapshot"]> | undefined;
 let lastBroadcastWindowId: number | undefined;
 let windowStateTimer: ReturnType<typeof setTimeout> | undefined;
@@ -174,6 +176,11 @@ function sessionPageRequest(raw: unknown): SessionPageRequest {
   if (raw === undefined) return {};
   const request = requireObject(raw);
   const result: SessionPageRequest = {};
+  if (request["requestId"] !== undefined) result.requestId = requireId(request["requestId"], "分页请求");
+  if (request["workspace"] !== undefined) {
+    if (!RUST_BACKEND) throw new Error("当前后端不支持工作区分页");
+    result.workspace = requireSelection(request["workspace"], "工作区", 4096);
+  }
   if (request["cursor"] !== undefined) result.cursor = requireSelection(request["cursor"], "游标", RUST_BACKEND ? 16384 : 512);
   if (request["query"] !== undefined) result.query = requireSelection(request["query"], "搜索词", 200);
   if (request["limit"] !== undefined) {
@@ -313,6 +320,8 @@ function createWindow(): BrowserWindow {
     window.webContents.on("console-message", (details) => process.stderr.write(`[renderer:${details.level}] ${details.message}\n`));
   }
   window.webContents.on("will-navigate", (event) => event.preventDefault());
+  window.webContents.on("render-process-gone", () => sessionPageRequests.cancelAll());
+  window.webContents.once("destroyed", () => sessionPageRequests.cancelAll());
   window.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
   window.webContents.session.setPermissionCheckHandler(() => false);
   window.once("ready-to-show", () => { if (!START_HIDDEN) window.show(); });
@@ -983,7 +992,9 @@ function installIpc(): void {
   ipcMain.handle("sessions:list", async (_event, rawRequest: unknown) => {
     const request = sessionPageRequest(rawRequest);
     if (runtime instanceof RustRuntime) {
-      const page = await runtime.listSessions(request);
+      const page = request.requestId
+        ? await sessionPageRequests.run(`${_event.sender.id}:${request.requestId}`, signal => runtime.listSessions(request, signal))
+        : await runtime.listSessions(request);
       store.hydrateSessions(page.items);
       return page;
     }
@@ -1002,6 +1013,7 @@ function installIpc(): void {
     store.hydrateSessions(page.items);
     return page;
   });
+  ipcMain.handle("sessions:cancel", (_event, rawId: unknown) => sessionPageRequests.cancel(`${_event.sender.id}:${requireId(rawId, "分页请求")}`));
   ipcMain.handle("session:create", async (_event, raw: unknown) => {
     const input = requireObject(raw) as SessionCreateInput;
     const normalized = resolve(String(input.cwd ?? ""));
@@ -1382,6 +1394,7 @@ void app.whenReady().then(async () => {
 });
 
 app.on("will-quit", (event) => {
+  sessionPageRequests.cancelAll();
   legacyProjection.stop();
   if (runtime.managed) {
     event.preventDefault();

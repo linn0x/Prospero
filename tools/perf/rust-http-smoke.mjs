@@ -43,7 +43,7 @@ try {
   assert.equal(page.total, 100);
   assert.equal(page.latestSeq, 0);
   const summary = await (await request("/v1/sessions/summary")).json();
-  assert.deepEqual(summary, { total: 100, active: 0, archived: 100, attention: 0, latestSeq: 0 });
+  assert.deepEqual(summary, { revision: 100, total: 100, active: 0, archived: 100, attention: 0, latestSeq: 0 });
   const workspaces = await (await request("/v1/workspaces?limit=1")).json();
   assert.equal(workspaces.items[0].workspace, "/synthetic");
   assert.equal(workspaces.items[0].summary.total, 100);

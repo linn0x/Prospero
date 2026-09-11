@@ -39,6 +39,7 @@ fn summaries_are_transactional_durable_and_include_only_active_attention() {
     assert_eq!(
         store.session_summary(None).unwrap(),
         SessionSummary {
+            revision: 3,
             total: 2,
             active: 2,
             archived: 0,
@@ -59,6 +60,7 @@ fn summaries_are_transactional_durable_and_include_only_active_attention() {
         )
         .unwrap();
     let expected = SessionSummary {
+        revision: 4,
         total: 2,
         active: 1,
         archived: 1,
@@ -401,4 +403,148 @@ fn session_cursors_round_trip_long_escaped_workspace_filters() {
     assert!(!second.has_more);
     assert_eq!(second.total, 2);
     assert_ne!(first.items[0].id, second.items[0].id);
+}
+
+#[test]
+fn workspace_pages_traverse_both_directions_with_timestamp_ties_and_bound_filters() {
+    let directory = TempDir::new().unwrap();
+    let mut store = Store::open(directory.path()).unwrap();
+    store.seed_archives(103).unwrap();
+    let connection = Connection::open(directory.path().join("prospero.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE session_heads SET created_at=1,payload=json_set(payload,'$.createdAt',1)",
+            [],
+        )
+        .unwrap();
+    let query = SessionQuery {
+        limit: Some(24),
+        workspace: Some("/synthetic".into()),
+        lifecycle: Some(SessionLifecycle::Archived),
+        text: Some("Archive".into()),
+        ..Default::default()
+    };
+    let mut page = store.sessions(query.clone()).unwrap();
+    assert!(page.previous_cursor.is_none());
+    let mut expected = vec![page.items.clone()];
+    while let Some(cursor) = page.next_cursor {
+        page = store
+            .sessions(SessionQuery {
+                cursor: Some(cursor),
+                ..query.clone()
+            })
+            .unwrap();
+        assert!(page.previous_cursor.is_some());
+        expected.push(page.items.clone());
+    }
+    assert_eq!(expected.iter().map(Vec::len).sum::<usize>(), 103);
+    for items in expected.iter().rev().skip(1) {
+        let cursor = page.previous_cursor.unwrap();
+        assert!(
+            store
+                .sessions(SessionQuery {
+                    cursor: Some(cursor.clone()),
+                    workspace: Some("/different".into()),
+                    ..query.clone()
+                })
+                .is_err()
+        );
+        page = store
+            .sessions(SessionQuery {
+                cursor: Some(cursor),
+                ..query.clone()
+            })
+            .unwrap();
+        assert_eq!(&page.items, items);
+        assert!(page.has_more);
+    }
+    assert!(page.previous_cursor.is_none());
+    assert_eq!(page.items[0].id, "session-000000102");
+}
+
+#[test]
+fn backwards_filtered_pages_do_not_include_records_that_stopped_matching() {
+    let directory = TempDir::new().unwrap();
+    let mut store = Store::open(directory.path()).unwrap();
+    store.seed_archives(60).unwrap();
+    let query = SessionQuery {
+        limit: Some(10),
+        text: Some("Archive".into()),
+        workspace: Some("/synthetic".into()),
+        ..Default::default()
+    };
+    let first = store.sessions(query.clone()).unwrap();
+    let second = store
+        .sessions(SessionQuery {
+            cursor: first.next_cursor,
+            ..query.clone()
+        })
+        .unwrap();
+    let removed = first.items[3].id.clone();
+    store
+        .update_session(
+            &removed,
+            UpdateSession {
+                revision: 1,
+                title: Some("Changed".into()),
+                lifecycle: None,
+                status: None,
+            },
+        )
+        .unwrap();
+    let previous = store
+        .sessions(SessionQuery {
+            cursor: second.previous_cursor,
+            ..query
+        })
+        .unwrap();
+    assert_eq!(previous.total, 59);
+    assert_eq!(previous.items.len(), 9);
+    assert!(previous.previous_cursor.is_none());
+    assert!(previous.items.iter().all(|item| item.id != removed));
+    assert!(previous.next_cursor.is_some());
+}
+
+#[test]
+fn workspace_revisions_change_only_for_the_affected_workspace() {
+    let directory = TempDir::new().unwrap();
+    let mut store = Store::open(directory.path()).unwrap();
+    let a = create(&mut store, "First", "/first");
+    let b = create(&mut store, "Second", "/second");
+    store
+        .update_session(
+            &a.id,
+            UpdateSession {
+                revision: 1,
+                title: Some("Renamed".into()),
+                lifecycle: None,
+                status: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(store.session_summary(Some("/first")).unwrap().revision, 2);
+    assert_eq!(store.session_summary(Some("/second")).unwrap().revision, 1);
+    store
+        .update_session(
+            &b.id,
+            UpdateSession {
+                revision: 1,
+                title: None,
+                lifecycle: Some(SessionLifecycle::Archived),
+                status: Some(SessionStatus::Completed),
+            },
+        )
+        .unwrap();
+    assert_eq!(store.session_summary(Some("/first")).unwrap().revision, 2);
+    assert_eq!(store.session_summary(Some("/second")).unwrap().revision, 2);
+    assert_eq!(store.session_summary(None).unwrap().revision, 4);
+    drop(store);
+    assert_eq!(
+        Store::open(directory.path())
+            .unwrap()
+            .session_summary(Some("/first"))
+            .unwrap()
+            .revision,
+        2
+    );
 }

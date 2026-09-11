@@ -6,6 +6,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { RustRuntime } from "../src/main/rust-runtime";
 import { RustClient } from "../src/main/rust-client";
 import { StateStore } from "../src/main/state-store";
+import { RequestRegistry } from "../src/main/request-registry";
+import { WorkspaceSessionPager } from "../src/renderer/src/workspace-session-pager";
 
 const binary = resolve("../../target/debug", process.platform === "win32" ? "prosperod-rs.exe" : "prosperod-rs");
 const fixtures: { directory: string; runtime: RustRuntime }[] = [];
@@ -41,6 +43,7 @@ describe("existing desktop shell with the real Rust runtime", () => {
     expect(snapshot.daemon.sessions).toHaveLength(20);
     expect(snapshot.daemon.sessionSummary).toMatchObject({ total: 10000, terminal: 10000, included: 20, omitted: 9980 });
     expect(snapshot.projects).toEqual(["/synthetic"]);
+    expect(snapshot.daemon.workspaceCounts?.["/synthetic"]?.total).toBe(10000);
     expect(snapshot.daemon.sessions.every(head => head.kind === "structured")).toBe(true);
     expect(JSON.stringify(snapshot)).not.toContain("token");
     const first = await runtime.listSessions({ limit: 7 });
@@ -94,4 +97,42 @@ describe("existing desktop shell with the real Rust runtime", () => {
     expect(store.snapshot().daemon.running).toBe(false);
     expect((await runtime.start()).ok).toBe(true);
   }, 15000);
+
+  it("pages real workspace history forwards and backwards while keeping desktop state bounded", async () => {
+    const { runtime, store } = fixture(10000);
+    expect((await runtime.start()).ok).toBe(true);
+    const registry = new RequestRegistry();
+    const pager = new WorkspaceSessionPager({
+      listSessions: request => registry.run(request!.requestId!, async signal => {
+        const page = await runtime.listSessions(request!, signal);
+        store.hydrateSessions(page.items);
+        return page;
+      }),
+      cancelSessionPage: async id => registry.cancel(id),
+    }, "/synthetic");
+    try {
+      pager.setActive(true);
+      await vi.waitFor(() => expect(pager.getSnapshot().page?.total).toBe(10000));
+      expect(pager.getSnapshot().page?.items).toHaveLength(6);
+      await pager.expand();
+      for (let index = 0; index < 30; index++) {
+        await pager.next();
+        expect(pager.getSnapshot().page?.items).toHaveLength(24);
+      }
+      expect(pager.getSnapshot().page?.items[0]?.id).toBe("session-000009279");
+      await pager.previous();
+      expect(pager.getSnapshot().page?.items[0]?.id).toBe("session-000009303");
+      const id = pager.getSnapshot().page!.items[0]!.id;
+      await runtime.rename(id, "Visible page update");
+      expect(store.snapshot().daemon.workspaceCounts?.["/synthetic"]?.revision).toBe(10001);
+      pager.setRevision(String(store.snapshot().daemon.workspaceCounts?.["/synthetic"]?.revision));
+      await vi.waitFor(() => expect(pager.getSnapshot().page?.items[0]?.title).toBe("Visible page update"));
+      expect(store.snapshot().daemon.sessions).toHaveLength(20);
+      await pager.first();
+      expect(pager.getSnapshot().page?.previousCursor).toBeUndefined();
+      const cancelled = new AbortController(); cancelled.abort();
+      await expect(runtime.listSessions({ workspace: "/synthetic" }, cancelled.signal)).rejects.toMatchObject({ name: "AbortError" });
+      await expect(runtime.listSessions({ workspace: "/different", cursor: pager.getSnapshot().page?.nextCursor })).rejects.toThrow();
+    } finally { pager.setActive(false); registry.cancelAll(); }
+  }, 45000);
 });

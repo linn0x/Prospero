@@ -12,6 +12,7 @@ use crate::protocol::*;
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Cursor {
+    before: bool,
     created_at: i64,
     id: String,
     lifecycle: Option<SessionLifecycle>,
@@ -67,22 +68,24 @@ impl Store {
         if let Some(workspace) = workspace {
             validate_text(workspace, 4096, false)?;
         }
-        let (total, active, attention) = self
+        let (total, active, attention, revision) = self
             .connection
             .query_row(
-                "SELECT total,active,attention FROM session_counts WHERE scope=?1 AND workspace=?2",
+                "SELECT total,active,attention,revision FROM session_counts WHERE scope=?1 AND workspace=?2",
                 params![i64::from(workspace.is_some()), workspace.unwrap_or("")],
                 |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, i64>(1)?,
                         row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
                     ))
                 },
             )
             .optional()?
-            .unwrap_or((0, 0, 0));
+            .unwrap_or((0, 0, 0, 0));
         Ok(SessionSummary {
+            revision,
             total,
             active,
             archived: total - active,
@@ -97,7 +100,7 @@ impl Store {
             validate_text(cursor, 4096, false)?;
         }
         let latest_seq = self.session_seq()?;
-        let mut statement = self.connection.prepare_cached("SELECT workspace,total,active,attention FROM session_counts WHERE scope=1 AND workspace>?1 ORDER BY workspace LIMIT ?2")?;
+        let mut statement = self.connection.prepare_cached("SELECT workspace,total,active,attention,revision FROM session_counts WHERE scope=1 AND workspace>?1 ORDER BY workspace LIMIT ?2")?;
         let rows = statement.query_map(
             params![query.cursor.unwrap_or_default(), (limit + 1) as i64],
             |row| {
@@ -106,6 +109,7 @@ impl Store {
                 Ok(WorkspaceHead {
                     workspace: row.get(0)?,
                     summary: SessionSummary {
+                        revision: row.get(4)?,
                         total,
                         active,
                         archived: total - active,
@@ -242,7 +246,7 @@ impl Store {
             } else {
                 available
             };
-            if total == 0 { return Ok(SessionPage { items: vec![], next_cursor: None, has_more: false, total, latest_seq: summary.latest_seq }); }
+            if total == 0 { return Ok(SessionPage { items: vec![], next_cursor: None, previous_cursor: None, has_more: false, total, latest_seq: summary.latest_seq }); }
             let mut source = "session_heads h".to_owned();
             if query.text.is_some() && total == available {
                 clauses.pop(); values.pop();
@@ -255,10 +259,14 @@ impl Store {
                 };
                 source = format!("session_heads h INDEXED BY {index}");
             }
-            clauses.push("(h.created_at,h.id)<(?,?)");
+            let before = cursor.as_ref().is_some_and(|cursor| cursor.before);
+            let base_clauses = clauses.clone();
+            let base_values = values.clone();
+            clauses.push(if before { "(h.created_at,h.id)>(?,?)" } else { "(h.created_at,h.id)<(?,?)" });
             let (time, id) = cursor.as_ref().map_or((i64::MAX, "~"), |cursor| (cursor.created_at, cursor.id.as_str()));
             values.extend([time.into(), id.to_owned().into(), ((limit + 1) as i64).into()]);
-            let sql = format!("SELECT h.payload FROM {source} WHERE {} ORDER BY h.created_at DESC,h.id DESC LIMIT ?", clauses.join(" AND "));
+            let order = if before { "ASC" } else { "DESC" };
+            let sql = format!("SELECT h.payload FROM {source} WHERE {} ORDER BY h.created_at {order},h.id {order} LIMIT ?", clauses.join(" AND "));
             let mut statement = self.connection.prepare_cached(&sql)?;
             let mut items: Vec<SessionHead> = Vec::new();
             let mut bytes = 0;
@@ -268,10 +276,22 @@ impl Store {
                 if items.len() == limit || bytes + value.len() > MAX_PAGE_BYTES { has_more = true; break; }
                 bytes += value.len(); items.push(serde_json::from_str(&value)?);
             }
-            let next_cursor = if has_more {
-                items.last().map(|head| serde_json::to_vec(&Cursor { created_at: head.created_at, id: head.id.clone(), lifecycle: query.lifecycle, workspace: query.workspace.clone(), text: query.text.clone() }).map(|value| URL_SAFE_NO_PAD.encode(value))).transpose()?
-            } else { None };
-            Ok(SessionPage { items, next_cursor, has_more, total, latest_seq: summary.latest_seq })
+            if before { items.reverse(); }
+            let opposite = if cursor.is_some() {
+                if let Some(head) = if before { items.last() } else { items.first() } {
+                    let mut filters = base_clauses;
+                    let mut parameters = base_values;
+                    filters.push(if before { "(h.created_at,h.id)<(?,?)" } else { "(h.created_at,h.id)>(?,?)" });
+                    parameters.extend([head.created_at.into(), head.id.clone().into()]);
+                    self.connection.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {source} WHERE {} LIMIT 1)", filters.join(" AND ")), params_from_iter(parameters), |row| row.get::<_, bool>(0))?
+                } else { false }
+            } else { false };
+            let encode = |head: &SessionHead, before| serde_json::to_vec(&Cursor { before, created_at: head.created_at, id: head.id.clone(), lifecycle: query.lifecycle, workspace: query.workspace.clone(), text: query.text.clone() }).map(|value| URL_SAFE_NO_PAD.encode(value));
+            let has_next = if before { opposite } else { has_more };
+            let has_previous = if before { has_more } else { opposite };
+            let next_cursor = if has_next { items.last().map(|head| encode(head, false)).transpose()? } else { None };
+            let previous_cursor = if has_previous { items.first().map(|head| encode(head, true)).transpose()? } else { None };
+            Ok(SessionPage { items, next_cursor, previous_cursor, has_more: has_next, total, latest_seq: summary.latest_seq })
         })
     }
 }

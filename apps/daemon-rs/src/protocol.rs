@@ -100,6 +100,7 @@ pub struct SessionQuery {
 pub struct SessionPage {
     pub items: Vec<SessionHead>,
     pub next_cursor: Option<String>,
+    pub previous_cursor: Option<String>,
     pub has_more: bool,
     #[ts(type = "number")]
     pub total: i64,
@@ -110,6 +111,8 @@ pub struct SessionPage {
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionSummary {
+    #[ts(type = "number")]
+    pub revision: i64,
     #[ts(type = "number")]
     pub total: i64,
     #[ts(type = "number")]
