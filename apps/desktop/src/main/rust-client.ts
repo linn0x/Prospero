@@ -1,7 +1,7 @@
 import type { ContentPage, EventPage, EventQuery, Health, RenameSession, SessionHead, SessionLookupResult, SessionPage, SessionQuery, SessionSummary, WorkspacePage, WorkspaceQuery } from "@prospero/protocol/rust-daemon";
 import type { RustContent } from "../shared/rust-api";
 import type { TimelinePage, TimelineQuery, TimelineLookupResult, TimelineTextQuery, TimelineTextPage } from "@prospero/protocol/rust-daemon";
-import type { CreateTerminal, TerminalPage, TerminalQuery, TerminalSize } from "@prospero/protocol/rust-daemon";
+import type { CreateTerminal, TerminalPage, TerminalQuery, TerminalSize, TerminalSnapshot } from "@prospero/protocol/rust-daemon";
 
 const MAX_BYTES = 2 * 1024 * 1024;
 function id(value: string): string {
@@ -58,6 +58,9 @@ export class RustClient {
   health(signal: AbortSignal | null = null): Promise<Health> { return this.json("/v1/health", { signal }); }
   createTerminal(input: CreateTerminal, signal: AbortSignal | null = null): Promise<SessionHead> {
     return this.json("/v1/terminals", { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
+  }
+  terminalSnapshot(value: string, signal: AbortSignal | null = null): Promise<TerminalSnapshot | null> {
+    return this.json(`/v1/terminals/${id(value)}/snapshot`, { signal });
   }
   terminalOutput(value: string, query: TerminalQuery, signal: AbortSignal | null = null): Promise<TerminalPage> {
     const params = new URLSearchParams();

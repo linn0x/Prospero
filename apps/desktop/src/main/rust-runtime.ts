@@ -5,7 +5,7 @@ import { StateStore } from "./state-store";
 import { RustProcess, type RustConnection } from "./rust-process";
 
 export function rustSessionInfo(head: SessionHead): SessionInfo {
-  return { id: head.id, agent: head.agent, kind: head.kind, historyMode: "paged", title: head.title, cwd: head.workspace, status: head.status === "waiting_permission" ? "waiting_approval" : head.status, createdAt: head.createdAt, pendingPermissions: head.status === "waiting_permission" ? 1 : 0, pendingQuestions: head.status === "waiting_input" ? 1 : 0 };
+  return { id: head.id, agent: head.agent, kind: head.kind, ...(head.kind === "pty" ? { terminalMode: "events" as const } : { historyMode: "paged" as const }), title: head.title, cwd: head.workspace, status: head.status === "waiting_permission" ? "waiting_approval" : head.status, createdAt: head.createdAt, pendingPermissions: head.status === "waiting_permission" ? 1 : 0, pendingQuestions: head.status === "waiting_input" ? 1 : 0 };
 }
 
 export class RustRuntime {
@@ -18,6 +18,7 @@ export class RustRuntime {
   private refreshing: Promise<void> | undefined;
   private sequence = 0;
   private ready = false;
+  private terminalWrites = new Map<string, { count: number; bytes: number; failed: boolean; tail: Promise<void> }>();
 
   constructor(private readonly store: StateStore, binary: string, directory: string) {
     if (store.backend !== "api") throw new Error("Rust requires API-only desktop state");
@@ -178,7 +179,64 @@ export class RustRuntime {
   lookupTimeline(id: string, ids: string[], signal: AbortSignal) { return this.current().client.timelineLookup(id, ids, AbortSignal.any([signal, this.controller.signal])); }
   readTimelineText(id: string, record: string, query: TimelineTextQuery, signal: AbortSignal) { return this.current().client.timelineText(id, record, query, AbortSignal.any([signal, this.controller.signal])); }
 
-  async request(_path: string, _init?: { method?: "GET" | "POST"; body?: JsonObject; signal?: AbortSignal; timeoutMs?: number; acceptJsonError?: boolean }): Promise<JsonObject | null> {
+  private async terminalView(id: string, cursor: number | undefined, wait: number, signal: AbortSignal): Promise<JsonObject | null> {
+    const { client } = this.current();
+    if (cursor === undefined) {
+      const snapshot = await client.terminalSnapshot(id, signal);
+      if (snapshot) return { kind: "pty", mode: "snapshot", seq: snapshot.seq, cols: snapshot.size.cols, rows: snapshot.size.rows, dataB64: snapshot.dataB64 };
+    }
+    const page = await client.terminalOutput(id, { afterSeq: cursor ?? 0, waitMs: Math.min(wait, 5000) }, signal);
+    if (page.resyncRequired) {
+      const snapshot = await client.terminalSnapshot(id, signal);
+      if (!snapshot) throw new Error("终端历史已超出保留窗口，当前内容尚不能完整恢复；请保留已打开的窗口");
+      return { kind: "pty", mode: "snapshot", seq: snapshot.seq, cols: snapshot.size.cols, rows: snapshot.size.rows, dataB64: snapshot.dataB64 };
+    }
+    if (!page.events.length && cursor !== undefined && !page.exited) return null;
+    return { kind: "pty", mode: "events", seq: page.nextSeq, baseSeq: page.baseSeq, cols: page.initialSize.cols, rows: page.initialSize.rows, events: page.events, exited: page.exited, caughtUp: page.nextSeq === page.latestSeq };
+  }
+
+  private async terminalWrite(id: string, data: string, signal: AbortSignal): Promise<void> {
+    if (data.length > 1_398_104) throw new Error("终端输入无效或超过 1 MiB");
+    const bytes = Buffer.from(data, "base64");
+    if (!bytes.length || bytes.length > 1024 * 1024 || bytes.toString("base64") !== data) throw new Error("终端输入无效或超过 1 MiB");
+    const { client } = this.current();
+    const queue = this.terminalWrites.get(id) ?? { count: 0, bytes: 0, failed: false, tail: Promise.resolve() };
+    if (queue.count >= 32 || queue.bytes + bytes.length > 1024 * 1024) throw new Error("终端输入队列已满");
+    this.terminalWrites.set(id, queue); queue.count++; queue.bytes += bytes.length;
+    const job = queue.tail.then(async () => {
+      if (queue.failed) throw new Error("之前的终端输入未完成，请检查会话状态");
+      for (let offset = 0; offset < bytes.length; offset += 8192) await client.terminalInput(id, bytes.subarray(offset, offset + 8192), signal);
+    });
+    queue.tail = job.catch(() => { queue.failed = true; });
+    try { await job; } finally {
+      queue.count--; queue.bytes -= bytes.length;
+      if (!queue.count) this.terminalWrites.delete(id);
+    }
+  }
+
+  async request(path: string, init?: { method?: "GET" | "POST"; body?: JsonObject; signal?: AbortSignal; timeoutMs?: number; acceptJsonError?: boolean }): Promise<JsonObject | null> {
+    const signal = init?.signal ? AbortSignal.any([init.signal, this.controller.signal]) : this.controller.signal;
+    const input = init?.body;
+    if (path === "/_prospero/control/session/create" && init?.method === "POST" && input) {
+      if (input["agent"] !== "shell" || input["kind"] !== "pty" || input["command"] || input["accountId"] || input["model"]) throw new Error("Rust 当前支持普通 shell 终端，Agent 和自定义命令尚未接入");
+      const head = await this.current().client.createTerminal({ title: "Terminal", workspace: String(input["cwd"]), size: { cols: Number(input["cols"] ?? 120), rows: Number(input["rows"] ?? 40) } }, signal);
+      await this.refresh(true);
+      return rustSessionInfo(head);
+    }
+    const route = /^\/_prospero\/control\/session\/([A-Za-z0-9_-]{1,128})\/(view|interact|interrupt|kill)(?:\?(.*))?$/.exec(path);
+    if (route) {
+      const id = route[1]!; const action = route[2]; const { client } = this.current();
+      if (action === "view" && (!init?.method || init.method === "GET")) {
+        const params = new URLSearchParams(route[3]);
+        return this.terminalView(id, params.has("outputAfterSeq") ? Number(params.get("outputAfterSeq")) : undefined, Number(params.get("waitMs") ?? 0), signal);
+      }
+      if (init?.method === "POST") {
+        if (action === "interact" && input?.["type"] === "term.input" && typeof input["dataB64"] === "string") { await this.terminalWrite(id, input["dataB64"], signal); return { ok: true }; }
+        if (action === "interact" && input?.["type"] === "term.resize") return client.terminalResize(id, { cols: Number(input["cols"]), rows: Number(input["rows"]) }, signal);
+        if (action === "interrupt") { await this.terminalWrite(id, "Aw==", signal); return { ok: true }; }
+        if (action === "kill") return client.terminalClose(id, signal);
+      }
+    }
     throw new Error("此功能尚未接入 Rust daemon");
   }
 

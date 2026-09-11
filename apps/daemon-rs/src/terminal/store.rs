@@ -27,7 +27,7 @@ impl Store {
     pub(crate) fn finish_terminal(&mut self, id: &str, archive: Archive) -> Result<SessionHead> {
         let head = self.session(id)?;
         self.update_session_with(id, UpdateSession { revision: head.revision, title: None, lifecycle: Some(SessionLifecycle::Archived), status: Some(if archive.exit_code == Some(0) { SessionStatus::Completed } else { SessionStatus::Failed }) }, |tx| {
-            let changed = tx.execute("UPDATE terminal_runs SET active=0,floor_seq=?1,latest_seq=?2,exit_code=?3 WHERE session_id=?4 AND active=1", params![archive.floor, archive.seq, archive.exit_code, id])?;
+            let changed = tx.execute("UPDATE terminal_runs SET active=0,floor_seq=?1,latest_seq=?2,exit_code=?3,snapshot=?5 WHERE session_id=?4 AND active=1", params![archive.floor, archive.seq, archive.exit_code, id, archive.snapshot.map(|snapshot| serde_json::to_string(&snapshot)).transpose()?])?;
             if changed != 1 { return Err(Error::Conflict); }
             for (offset, event) in archive.events.iter().enumerate() {
                 tx.execute("INSERT INTO terminal_output(session_id,seq,payload) VALUES(?1,?2,?3)", params![id, archive.floor + offset as i64 + 1, serde_json::to_string(event)?])?;
@@ -51,6 +51,7 @@ impl Store {
             self.finish_terminal(
                 id,
                 Archive {
+                    snapshot: None,
                     floor: 0,
                     seq: 0,
                     events: Vec::new(),
@@ -99,5 +100,21 @@ impl Store {
             exited: true,
             exit_code: code,
         })
+    }
+
+    pub fn terminal_snapshot(&self, id: &str) -> Result<Option<TerminalSnapshot>> {
+        validate_id(id)?;
+        let value: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT snapshot FROM terminal_runs WHERE session_id=?",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(Error::NotFound)?;
+        Ok(value
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?)
     }
 }

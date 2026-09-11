@@ -72,7 +72,8 @@ CREATE TABLE terminal_runs (
     active INTEGER NOT NULL CHECK(active IN (0,1)),
     floor_seq INTEGER NOT NULL DEFAULT 0 CHECK(floor_seq >= 0),
     latest_seq INTEGER NOT NULL DEFAULT 0 CHECK(latest_seq >= floor_seq),
-    exit_code INTEGER
+    exit_code INTEGER,
+    snapshot TEXT CHECK(length(CAST(snapshot AS BLOB)) <= 2097152)
 ) STRICT;
 CREATE INDEX terminal_active ON terminal_runs(session_id) WHERE active=1;
 CREATE TABLE terminal_output (

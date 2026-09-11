@@ -21,6 +21,7 @@ export type QueuedChatMessage = {
 };
 
 export type SessionInfo = {
+  terminalMode?: "events";
   historyMode?: "paged";
   id: string;
   agent: string;

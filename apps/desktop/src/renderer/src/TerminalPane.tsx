@@ -12,6 +12,8 @@ import { reportError, number, text } from "./state";
 import { useLocale } from "./locale";
 import { allowNativeTerminalPaste, bindTerminalPaste, consumeTerminalKey, terminalClipboardShortcut } from "./terminal-clipboard";
 import { terminalBytes } from "./terminal-bytes";
+import { configureRustTerminalUnicode } from "./terminal-unicode";
+import { writeTerminalEvents } from "./terminal-events";
 import {
   deleteTerminalSessionCache,
   loadTerminalSessionCache,
@@ -156,9 +158,11 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
   const stableBufferRef = useRef(true);
   const replayingRef = useRef(false);
   const connectedRef = useRef(false);
+  const exitedRef = useRef(false);
+  const needsFitRef = useRef(true);
   const readOnly = terminalSessionIsReadOnly(session.status);
   const readOnlyRef = useRef(readOnly);
-  readOnlyRef.current = readOnly;
+  readOnlyRef.current = readOnly || exitedRef.current;
   const [operationError, setOperationError] = useState<string>();
   const [connectionError, setConnectionError] = useState<string>();
   const [connected, setConnected] = useState(false);
@@ -188,6 +192,21 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
     interactionChain.current = result.then(() => undefined);
     return result;
   }, [session.id]);
+  const fitToHost = useCallback((): void => {
+    const terminal = terminalRef.current; const fit = fitRef.current;
+    if (!terminal || !fit) return;
+    if (session.terminalMode === "events") {
+      if (!connectedRef.current || readOnlyRef.current) return;
+      const size = fit.proposeDimensions();
+      if (size) {
+        const cols = Math.max(20, Math.min(500, size.cols)); const rows = Math.max(5, Math.min(300, size.rows));
+        if (cols !== terminal.cols || rows !== terminal.rows) void queueInteraction({ type: "term.resize", cols, rows });
+      }
+    } else {
+      fit.fit();
+      if (connectedRef.current && !readOnlyRef.current) void queueInteraction({ type: "term.resize", cols: terminal.cols, rows: terminal.rows });
+    }
+  }, [queueInteraction, session.terminalMode]);
   /// 提示统一走这里:直接 setNotice 的话没有定时清除,那条提示会一直挂在屏幕上。
   const showNotice = useCallback((message: string): void => {
     setNotice(message);
@@ -197,7 +216,9 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
 
   useEffect(() => {
     if (!host.current) return;
-    const cached = loadTerminalSessionCache(session.id);
+    const cached = session.terminalMode === "events" ? undefined : loadTerminalSessionCache(session.id);
+    exitedRef.current = false;
+    needsFitRef.current = true;
     const terminal = new Terminal({
       ...(cached ? { cols: cached.cols, rows: cached.rows } : {}),
       allowProposedApi: true,
@@ -235,6 +256,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
         cyan: "#7dcfff", brightCyan: "#7dcfff", white: "#a9b1d6", brightWhite: "#c0caf5",
       },
     });
+    if (session.terminalMode === "events") configureRustTerminalUnicode(terminal);
     const fit = new FitAddon();
     terminal.loadAddon(fit);
     const search = new SearchAddon();
@@ -268,7 +290,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
         });
       });
     } else {
-      cursorRef.current = terminalBootstrapCursor();
+      cursorRef.current = session.terminalMode === "events" ? undefined : terminalBootstrapCursor();
       stableBufferRef.current = false;
       setSyncing(true);
       restoreReadyRef.current = Promise.resolve();
@@ -280,7 +302,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
       terminal.loadAddon(webgl);
     } catch { /* Canvas renderer remains available. */ }
     if (!cached) {
-      fit.fit();
+      if (session.terminalMode !== "events") fit.fit();
       if (host.current?.getClientRects().length) terminal.focus();
     }
 
@@ -383,10 +405,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
       resizeTimer = window.setTimeout(() => {
         const element = host.current;
         if (replayingRef.current || !element?.isConnected || element.clientWidth === 0 || element.clientHeight === 0) return;
-        fit.fit();
-        if (connectedRef.current) {
-          void queueInteraction({ type: "term.resize", cols: terminal.cols, rows: terminal.rows });
-        }
+        fitToHost();
       }, 80);
     });
     resize.observe(host.current);
@@ -397,7 +416,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
       window.clearTimeout(noticeTimerRef.current);
       window.clearTimeout(bellTimer);
       const cursor = cursorRef.current;
-      if (stableBufferRef.current && cursor !== undefined) {
+      if (session.terminalMode !== "events" && stableBufferRef.current && cursor !== undefined) {
         try {
           persistTerminalSession(session.id, terminal, serialize, cursor);
         } catch {}
@@ -417,11 +436,11 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
       serializeRef.current = undefined;
       cursorRef.current = undefined;
     };
-  }, [isMac, queueInteraction, showNotice]);
+  }, [isMac, queueInteraction, showNotice, fitToHost]);
 
   useEffect(() => {
     const terminal = terminalRef.current;
-    if (terminal) terminal.options.disableStdin = readOnly || !connectedRef.current;
+    if (terminal) terminal.options.disableStdin = readOnlyRef.current || !connectedRef.current;
   }, [readOnly]);
 
   useEffect(() => {
@@ -432,11 +451,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
     terminal.options.fontSize = fontSize;
     const fit = (): void => {
       if (!active || !host.current?.getClientRects().length) return;
-      fitRef.current?.fit();
-      const current = terminalRef.current;
-      if (current && connectedRef.current) {
-        void queueInteraction({ type: "term.resize", cols: current.cols, rows: current.rows });
-      }
+      fitToHost();
     };
     const requestedFont = fontFamily.trim();
     const fontReady = requestedFont && document.fonts?.load
@@ -446,7 +461,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
     return () => {
       active = false;
     };
-  }, [fontFamily, fontSize, queueInteraction]);
+  }, [fontFamily, fontSize, fitToHost]);
 
   useEffect(() => {
     let active = true;
@@ -456,6 +471,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
     const generation = ++pollGenerationRef.current;
     const isCurrent = (): boolean => active && pollGenerationRef.current === generation;
     const scheduleCache = (): void => {
+      if (session.terminalMode === "events") return;
       if (cacheTimer !== undefined) return;
       cacheTimer = window.setTimeout(() => {
         cacheTimer = undefined;
@@ -500,8 +516,20 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
           if (text(frame["kind"]) !== "pty") throw new Error(tRef.current("daemon 返回了错误的会话类型", "The daemon returned the wrong session type"));
           const mode = text(frame["mode"], "snapshot");
           const seq = number(frame["seq"]);
+          if (frame["exited"] === true) { exitedRef.current = true; readOnlyRef.current = true; }
           const bootstrapDelta = mode === "delta" && cursorRef.current === 0 && number(frame["baseSeq"], -1) === 0;
-          if (mode === "delta") {
+          if (mode === "events") {
+            if (number(frame["baseSeq"], -1) !== (cursorRef.current ?? 0)) { cursorRef.current = undefined; continue; }
+            const target = terminalRef.current;
+            stableBufferRef.current = false;
+            const bootstrap = cursor === undefined;
+            writeChain.current = writeChain.current.then(async () => {
+              if (!isCurrent() || !target || terminalRef.current !== target) return;
+              if (bootstrap) { replayingRef.current = true; target.reset(); target.resize(number(frame["cols"], 120), number(frame["rows"], 40)); }
+              await writeTerminalEvents(target, frame["events"], isCurrent);
+              if (frame["caughtUp"] !== false) replayingRef.current = false;
+            });
+          } else if (mode === "delta") {
             if (number(frame["baseSeq"], -1) !== cursorRef.current) {
               deleteTerminalSessionCache(session.id);
               cursorRef.current = undefined;
@@ -525,7 +553,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
             }));
           } else {
             deleteTerminalSessionCache(session.id);
-            const ansi = text(frame["ansi"]);
+            const ansi = typeof frame["dataB64"] === "string" ? terminalBytes(frame["dataB64"]) : text(frame["ansi"]);
             const target = terminalRef.current;
             stableBufferRef.current = false;
             writeChain.current = writeChain.current.then(() => new Promise<void>((done) => {
@@ -544,18 +572,19 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
           cursorRef.current = seq;
           stableBufferRef.current = true;
           scheduleCache();
-          connectedRef.current = true;
+          connectedRef.current = frame["caughtUp"] !== false;
           const current = terminalRef.current;
           if (current) {
-            current.options.disableStdin = readOnlyRef.current;
-            if ((mode !== "delta" || bootstrapDelta) && host.current?.getClientRects().length) {
-              fitRef.current?.fit();
-              if (!readOnlyRef.current) void queueInteraction({ type: "term.resize", cols: current.cols, rows: current.rows });
+            current.options.disableStdin = readOnlyRef.current || !connectedRef.current;
+            if ((mode === "snapshot" || bootstrapDelta || needsFitRef.current) && connectedRef.current && host.current?.getClientRects().length) {
+              fitToHost();
+              needsFitRef.current = false;
             }
           }
-          setConnected(true);
-          setSyncing(false);
+          setConnected(connectedRef.current);
+          setSyncing(!connectedRef.current);
           setConnectionError(undefined);
+          if (frame["exited"] === true && frame["caughtUp"] !== false) break;
         } catch (reason) {
           if (!isCurrent()) break;
           waitForOutput = false;
@@ -578,7 +607,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
       if (terminalRef.current) terminalRef.current.options.disableStdin = true;
       void window.prospero.cancelSessionView(session.id).catch(() => undefined);
     };
-  }, [queueInteraction, session.id]);
+  }, [queueInteraction, session.id, fitToHost]);
 
   const runFind = (backwards: boolean): void => {
     const value = findText.trim();

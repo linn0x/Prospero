@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -38,6 +38,35 @@ afterEach(async () => {
 });
 
 describe("existing desktop shell with the real Rust runtime", () => {
+  it.skipIf(process.platform === "win32")("serializes long Unicode pastes without duplicating or interleaving their chunks", async () => {
+    const { directory, runtime } = fixture();
+    expect((await runtime.start()).ok).toBe(true);
+    const head = await runtime.request("/_prospero/control/session/create", { method: "POST", body: { agent: "shell", kind: "pty", cwd: directory, cols: 80, rows: 24 } });
+    const id = String(head!["id"]);
+    const first = Buffer.from("\x1b[200~" + "中文🦀\n".repeat(1200) + "\x1b[201~");
+    const second = Buffer.from("second\n".repeat(1300));
+    const interact = (bytes: Buffer) => runtime.request(`/_prospero/control/session/${id}/interact`, { method: "POST", body: { type: "term.input", dataB64: bytes.toString("base64") } });
+    await interact(Buffer.from(`stty raw -echo; : > ready-paste; head -c ${first.length + second.length} > paste.bin; stty sane\n`));
+    await vi.waitFor(() => expect(existsSync(resolve(directory, "ready-paste"))).toBe(true));
+    await Promise.all([interact(first), interact(second)]);
+    await vi.waitFor(() => expect(readFileSync(resolve(directory, "paste.bin"))).toEqual(Buffer.concat([first, second])), { timeout: 5000 });
+  }, 15000);
+
+  it.skipIf(process.platform === "win32")("recovers a cursor older than the output ring using a bounded screen checkpoint", async () => {
+    const { directory, runtime } = fixture();
+    expect((await runtime.start()).ok).toBe(true);
+    const head = await runtime.request("/_prospero/control/session/create", { method: "POST", body: { agent: "shell", kind: "pty", cwd: directory, cols: 80, rows: 24 } });
+    const id = String(head!["id"]);
+    await runtime.request(`/_prospero/control/session/${id}/interact`, { method: "POST", body: { type: "term.input", dataB64: Buffer.from("dd if=/dev/zero bs=65536 count=20 2>/dev/null | tr '\\000' x; printf 'resync-marker\\n'; sleep 60\n").toString("base64") } });
+    await vi.waitFor(async () => {
+      const frame = await runtime.request(`/_prospero/control/session/${id}/view?outputAfterSeq=0`);
+      expect(frame?.["mode"]).toBe("snapshot");
+      const bytes = Buffer.from(String(frame!["dataB64"]), "base64");
+      expect(bytes.length).toBeLessThan(100_000);
+      expect(bytes.toString("utf8")).toContain("resync-marker");
+    }, { timeout: 8000, interval: 100 });
+  }, 15000);
+
   it.skipIf(process.platform === "win32")("owns real terminal processes and archives them before managed shutdown", async () => {
     const { directory, dataDir, runtime, store } = fixture();
     expect((await runtime.start()).ok).toBe(true);
@@ -65,7 +94,29 @@ describe("existing desktop shell with the real Rust runtime", () => {
     const next = new RustClient(restarted.baseUrl, restarted.token);
     expect((await next.health()).activeRuntimeSessions).toBe(0);
     expect((await next.session(head.id)).lifecycle).toBe("archived");
+    expect((await next.terminalSnapshot(head.id))?.seq).toBeGreaterThanOrEqual(cursor);
     expect((await next.terminalOutput(head.id, { afterSeq: cursor, waitMs: 0 })).exited).toBe(true);
+  }, 15000);
+
+  it.skipIf(process.platform === "win32")("opens shell sessions through the existing control bridge and restores live snapshots", async () => {
+    const { directory, runtime, store } = fixture();
+    expect((await runtime.start()).ok).toBe(true);
+    const created = await runtime.request("/_prospero/control/session/create", { method: "POST", body: { agent: "shell", kind: "pty", cwd: directory, cols: 80, rows: 24 } });
+    const id = String(created!["id"]);
+    expect(created?.["terminalMode"]).toBe("events");
+    expect(store.snapshot().daemon.sessions.find(session => session.id === id)?.terminalMode).toBe("events");
+    await runtime.request(`/_prospero/control/session/${id}/interact`, { method: "POST", body: { type: "term.input", dataB64: Buffer.from("printf '\\033[?1049h\\033[2;4Hrestored-marker'; sleep 60\n").toString("base64") } });
+    await vi.waitFor(async () => {
+      const frame = await runtime.request(`/_prospero/control/session/${id}/view`);
+      expect(frame?.["mode"]).toBe("snapshot");
+      expect(Buffer.from(String(frame?.["dataB64"]), "base64").toString("utf8")).toContain("restored-marker");
+    }, { timeout: 5000 });
+    const frame = await runtime.request(`/_prospero/control/session/${id}/view`);
+    const controller = new AbortController();
+    const waiting = runtime.request(`/_prospero/control/session/${id}/view?outputAfterSeq=${String(frame!["seq"])}&waitMs=5000`, { signal: controller.signal });
+    controller.abort(); await expect(waiting).rejects.toThrow();
+    await runtime.request(`/_prospero/control/session/${id}/kill`, { method: "POST" });
+    await vi.waitFor(async () => expect((await runtime.listSessions({ ids: [id], terminal: true })).total).toBe(1));
   }, 15000);
 
   it("loads a bounded window, pages history and applies external commits without legacy projections", async () => {

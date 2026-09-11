@@ -409,10 +409,13 @@ pub fn typescript() -> String {
         crate::terminal::TerminalQuery::decl(&config),
         crate::terminal::TerminalPage::decl(&config),
         crate::terminal::TerminalInput::decl(&config),
+        crate::terminal::TerminalSnapshot::decl(&config),
         crate::error::ErrorBody::decl(&config),
     ];
-    declarations
+    let mut output: String = declarations
         .into_iter()
         .map(|value| format!("export {value}\n"))
-        .collect()
+        .collect();
+    output.push_str(&crate::terminal::screen::width_tables());
+    output
 }

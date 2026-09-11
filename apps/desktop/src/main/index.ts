@@ -1121,7 +1121,7 @@ function installIpc(): void {
   ipcMain.handle("session:kill", async (_event, rawId: unknown) => {
     const sessionId = requireId(rawId, "会话");
     if (!store.isKnownSession(sessionId)) throw new Error("会话不存在");
-    const confirmation = await dialog.showMessageBox(mainWindow!, { type: "warning", title: "结束会话", message: "结束并删除这个会话？", detail: "运行中的 Agent 将被终止。", buttons: ["取消", "结束会话"], defaultId: 0, cancelId: 0 });
+    const confirmation = await dialog.showMessageBox(mainWindow!, { type: "warning", title: "结束会话", message: RUST_BACKEND ? "结束这个会话？" : "结束并删除这个会话？", detail: RUST_BACKEND ? "终端进程将停止，历史记录会保留。" : "运行中的 Agent 将被终止。", buttons: ["取消", "结束会话"], defaultId: 0, cancelId: 0 });
     if (confirmation.response !== 1) return null;
     const result = await runtime.request(`/_prospero/control/session/${encodeURIComponent(sessionId)}/kill`, { method: "POST" });
     store.forgetSessionTitle(sessionId);
