@@ -20,6 +20,7 @@
     "test": "npm run test --workspaces --if-present",
     "rust:check": "cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo check --workspace --locked",
     "rust:test": "cargo test --workspace --locked",
+    "rust:http:test": "cargo build --workspace --locked && node tools/perf/rust-http-smoke.mjs",
     "rust:build": "cargo build --release --workspace --locked",
     "rust:types": "cargo run --locked -p prosperod-rs -- types --output packages/protocol/src/rust-daemon.ts",
     "rust:contract:check": "cargo build --workspace --locked && node tools/perf/check-rust-contract.mjs",

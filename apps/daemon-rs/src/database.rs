@@ -474,6 +474,55 @@ impl Store {
         Ok(next)
     }
 
+    pub fn contents(
+        &self,
+        session_id: &str,
+        cursor: Option<String>,
+        limit: usize,
+    ) -> Result<ContentPage> {
+        validate_id(session_id)?;
+        if let Some(cursor) = &cursor {
+            validate_id(cursor)?;
+        }
+        if !(1..=MAX_PAGE_ITEMS).contains(&limit) {
+            return Err(Error::Invalid("invalid content page limit".into()));
+        }
+        let exists: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_heads WHERE id=?)",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(Error::NotFound);
+        }
+        let mut statement = self.connection.prepare_cached(
+            "SELECT id,bytes FROM content_heads WHERE session_id=?1 AND id>?2 ORDER BY id LIMIT ?3",
+        )?;
+        let mut items = statement
+            .query_map(
+                params![session_id, cursor.unwrap_or_default(), (limit + 1) as i64],
+                |row| {
+                    Ok(ContentHead {
+                        id: row.get(0)?,
+                        bytes: row.get(1)?,
+                    })
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let has_more = items.len() > limit;
+        items.truncate(limit);
+        let next_cursor = if has_more {
+            items.last().map(|item| item.id.clone())
+        } else {
+            None
+        };
+        Ok(ContentPage {
+            items,
+            next_cursor,
+            has_more,
+        })
+    }
+
     pub fn content(&self, session_id: &str, content_id: &str, offset: i64) -> Result<Vec<u8>> {
         validate_id(session_id)?;
         validate_id(content_id)?;
