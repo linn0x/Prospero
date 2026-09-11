@@ -276,6 +276,11 @@ pub enum TimelineBody {
         state: ToolState,
         summary: String,
     },
+    PermissionRequest {
+        request_id: String,
+        tool: String,
+        resolved: bool,
+    },
     TurnEnd {
         finish: String,
     },
@@ -410,6 +415,9 @@ pub fn typescript() -> String {
         crate::terminal::TerminalPage::decl(&config),
         crate::terminal::TerminalInput::decl(&config),
         crate::terminal::TerminalSnapshot::decl(&config),
+        crate::agent::CreateAgentSession::decl(&config),
+        crate::agent::AgentSend::decl(&config),
+        crate::agent::PermissionDecision::decl(&config),
         crate::error::ErrorBody::decl(&config),
     ];
     let mut output: String = declarations

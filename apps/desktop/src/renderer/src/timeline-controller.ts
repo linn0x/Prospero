@@ -103,7 +103,8 @@ export function timelineEvent(record: TimelineRecord): JsonObject {
   switch (record.body.kind) {
     case "message": return { ...shared, kind: record.body.role === "user" ? "user.message" : "assistant.text", text: record.preview, phase: record.body.finalAnswer ? "final_answer" : "commentary" };
     case "reasoning": return { ...shared, kind: "reasoning", text: record.preview };
-    case "tool": return { ...shared, hasMore: record.bytes > 0, kind: record.body.state === "running" ? "tool.start" : "tool.end", tool: record.body.name, state: record.body.state, summary: record.body.summary };
+    case "tool": return { ...shared, hasMore: record.bytes > 0, kind: record.body.state === "running" ? "tool.start" : "tool.end", tool: record.body.name, state: record.body.state, summary: record.body.state === "running" ? record.body.summary : (record.body.summary || record.preview) };
+    case "permission_request": return { ...shared, kind: "permission.request", reqId: record.body.requestId, summary: record.preview || record.body.tool, resources: [record.body.tool] };
     case "turn_end": return { ...shared, kind: "turn.end", finish: record.body.finish };
     case "error": return { ...shared, kind: "agent.error", message: record.preview };
   }
@@ -113,12 +114,14 @@ export class TimelineViewCache {
   private entries = new Map<string, { revision: number; item: ChatTimelineItem }>();
   project(page: TimelinePage | undefined): ChatTimelineSnapshot {
     const next = new Map<string, { revision: number; item: ChatTimelineItem }>();
+    const resolutions = new Set<string>();
     const items = (page?.items ?? []).map(record => {
       const cached = this.entries.get(record.id);
       const item = cached?.revision === record.revision ? cached.item : { key: record.id, ordinal: record.position, event: timelineEvent(record) };
+      if (record.body.kind === "permission_request" && record.body.resolved) resolutions.add(`permission.resolved${String.fromCharCode(0)}${record.body.requestId}`);
       next.set(record.id, { revision: record.revision, item }); return item;
     });
     this.entries = next;
-    return { items, resolutions: new Set(), revision: page?.revision ?? 0, nextOrdinal: (items.at(-1)?.ordinal ?? 0) + 1 };
+    return { items, resolutions, revision: page?.revision ?? 0, nextOrdinal: (items.at(-1)?.ordinal ?? 0) + 1 };
   }
 }

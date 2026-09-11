@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -10,7 +10,10 @@ vi.setConfig({ testTimeout: 20_000 });
 
 const fixtures: string[] = [];
 async function fixture() {
-  const root = await mkdtemp(path.join(tmpdir(), "prospero-project-tools-")); fixtures.push(root);
+  // macOS tmpdir() is under /var, a symlink to /private/var; ProjectTools
+  // canonicalizes paths, so compare against the real path.
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), "prospero-project-tools-")));
+  fixtures.push(root);
   const trash = vi.fn(async () => {});
   return { root, trash, tools: new ProjectTools(() => [root], trash) };
 }
@@ -23,9 +26,10 @@ async function repository(initialCommit = true) {
   return result;
 }
 afterEach(async () => {
+  const tmp = await realpath(tmpdir());
   for (const root of fixtures.splice(0)) {
     const resolved = path.resolve(root);
-    if (path.dirname(resolved) !== path.resolve(tmpdir()) || !path.basename(resolved).startsWith("prospero-project-tools-")) throw new Error("Invalid fixture cleanup path");
+    if (path.dirname(resolved) !== tmp || !path.basename(resolved).startsWith("prospero-project-tools-")) throw new Error("Invalid fixture cleanup path");
     await rm(resolved, { recursive: true, force: true });
   }
 });

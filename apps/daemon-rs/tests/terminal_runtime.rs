@@ -51,7 +51,12 @@ async fn stable_checkpoint_count(connection: &rusqlite::Connection) -> i64 {
         if latest != count {
             count = latest;
             stable_since = tokio::time::Instant::now();
-        } else if stable_since.elapsed() >= Duration::from_millis(700) {
+        // The live loop coalesces output behind a 250ms quiet window, then
+        // goes through a semaphore permit, spawn_blocking and the single DB
+        // worker thread. Under full-suite parallel load that tail write can
+        // land well over a second after the previous one, so require a window
+        // comfortably larger than the debounce plus scheduling slack.
+        } else if stable_since.elapsed() >= Duration::from_millis(1800) {
             return count;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -383,7 +388,6 @@ async fn live_checkpoints_stop_writing_when_idle_and_fail_closed_on_storage_erro
     .await
     .unwrap();
     let count = stable_checkpoint_count(&connection).await;
-    tokio::time::sleep(Duration::from_millis(600)).await;
     assert_eq!(
         connection
             .query_row("SELECT count(*) FROM checkpoint_writes", [], |row| row
