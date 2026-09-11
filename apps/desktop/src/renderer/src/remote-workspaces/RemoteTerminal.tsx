@@ -7,6 +7,7 @@ import type { DesktopSettings } from "../../../shared/types";
 import { DesktopIcon } from "../design-system/icons";
 import { useLocale } from "../locale";
 import { reportError } from "../state";
+import { allowNativeTerminalPaste, bindTerminalPaste, consumeTerminalKey, terminalClipboardShortcut } from "../terminal-clipboard";
 import { RemoteTerminalBuffer, remoteInputBase64, remoteTerminalTheme } from "./remote-terminal-state";
 import "./remote-workspaces.css";
 
@@ -40,6 +41,7 @@ export function RemoteTerminal({ hostId, sid, connected, settings, label, contro
     const term = new Terminal({ cols: 120, rows: 36, scrollback: 3000, disableStdin: true,
       fontSize: settingsRef.current.terminalFontSize, fontFamily: terminalFontFamilyWithFallbacks(settingsRef.current.terminalFontFamily),
       cursorBlink: !motion.matches, cursorStyle: "bar", lineHeight: TERMINAL_LINE_HEIGHT, letterSpacing: 0, fontWeight: "400", fontWeightBold: "700", minimumContrastRatio: 4.5,
+      rightClickSelectsWord: true, macOptionClickForcesSelection: window.prospero.platform === "darwin",
       theme: remoteTerminalTheme(getComputedStyle(document.documentElement)) });
     terminal.current = term;
     const fit = new FitAddon();
@@ -52,7 +54,7 @@ export function RemoteTerminal({ hostId, sid, connected, settings, label, contro
     let resizeTimer: ReturnType<typeof setTimeout> | undefined;
     let snapshotTimer: ReturnType<typeof setTimeout> | undefined;
     let inputQueue = Promise.resolve();
-    const canInput = () => !disposed && attached && connectedRef.current;
+    const canInput = () => !disposed && attached && connectedRef.current && !snapshotRequested;
     const updateInput = () => { term.options.disableStdin = !canInput(); };
     const fail = (reason: unknown) => { if (!disposed) setError(reportError(reason)); };
     const fitTerminal = () => {
@@ -67,6 +69,7 @@ export function RemoteTerminal({ hostId, sid, connected, settings, label, contro
     const requestSnapshot = () => {
       if (snapshotRequested || disposed) return;
       snapshotRequested = true;
+      updateInput();
       setAttaching(true); setError("");
       clearTimeout(snapshotTimer);
       snapshotTimer = setTimeout(() => {
@@ -109,16 +112,15 @@ export function RemoteTerminal({ hostId, sid, connected, settings, label, contro
     };
     sendInputRef.current = sendInput;
     const input = term.onData(sendInput);
+    const disposePaste = bindTerminalPaste(container.current, term, canInput);
     term.attachCustomKeyEventHandler(event => {
       if (event.type !== "keydown") return true;
-      const command = window.prospero.platform === "darwin" ? event.metaKey && !event.ctrlKey : event.ctrlKey && event.shiftKey;
-      if (!command || event.altKey) return true;
-      if (event.code === "KeyC") { const selection = term.getSelection(); if (selection) void window.prospero.writeClipboard(selection).catch(fail); return false; }
-      if (event.code === "KeyV") {
-        if (canInput()) void window.prospero.readClipboard().then(value => { if (value && canInput()) term.paste(value); }).catch(fail);
-        return false;
+      const action = terminalClipboardShortcut(event, window.prospero.platform === "darwin");
+      if (action === "paste") {
+        return allowNativeTerminalPaste(event, canInput());
       }
-      if (event.code === "KeyA" && window.prospero.platform === "darwin") { term.selectAll(); return false; }
+      if (action === "copy") { consumeTerminalKey(event); const selection = term.getSelection(); if (selection) void window.prospero.writeClipboard(selection).catch(fail); return false; }
+      if (event.code === "KeyA" && window.prospero.platform === "darwin" && event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey && !event.isComposing && !event.defaultPrevented) { consumeTerminalKey(event); term.selectAll(); return false; }
       return true;
     });
     const updateTheme = () => {
@@ -136,6 +138,7 @@ export function RemoteTerminal({ hostId, sid, connected, settings, label, contro
     term.focus();
     return () => {
       disposed = true; attached = false; buffer.dispose(); unsubscribe(); input.dispose(); resizeObserver.disconnect(); themeObserver.disconnect();
+      disposePaste();
       motion.removeEventListener("change", updateTheme);
       clearTimeout(resizeTimer); clearTimeout(snapshotTimer);
       refit.current = undefined; retry.current = undefined; updateInputRef.current = undefined; sendInputRef.current = undefined; terminal.current = undefined;
@@ -159,6 +162,10 @@ export function RemoteTerminal({ hostId, sid, connected, settings, label, contro
       <span>{error || t("正在恢复远程终端…", "Restoring remote terminal…")}</span>
       {error && <button type="button" disabled={attaching} onClick={() => retry.current?.()}>{t("重试", "Retry")}</button>}
     </div>}
-    <div className="remote-terminal-canvas" ref={container} aria-label={label ?? t("远程 Shell 终端", "Remote Shell terminal")} />
+    <div className="remote-terminal-canvas" ref={container} aria-label={label ?? t("远程 Shell 终端", "Remote Shell terminal")} onContextMenu={event => {
+      event.preventDefault();
+      const term = terminal.current;
+      if (term) void window.prospero.openTerminalContextMenu({ copy: term.hasSelection(), paste: !term.options.disableStdin }).catch(reason => setError(reportError(reason)));
+    }} />
   </div>;
 }
