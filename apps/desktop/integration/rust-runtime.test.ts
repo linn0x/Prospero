@@ -38,6 +38,36 @@ afterEach(async () => {
 });
 
 describe("existing desktop shell with the real Rust runtime", () => {
+  it.skipIf(process.platform === "win32")("owns real terminal processes and archives them before managed shutdown", async () => {
+    const { directory, dataDir, runtime, store } = fixture();
+    expect((await runtime.start()).ok).toBe(true);
+    const connection = JSON.parse(readFileSync(resolve(dataDir, "connection.json"), "utf8"));
+    const client = new RustClient(connection.baseUrl, connection.token);
+    const head = await client.createTerminal({ title: "Terminal integration", workspace: directory, size: { cols: 80, rows: 24 } });
+    expect(head.kind).toBe("pty");
+    expect((await client.health()).activeRuntimeSessions).toBe(1);
+    await client.terminalResize(head.id, { cols: 100, rows: 30 });
+    await client.terminalInput(head.id, Buffer.from("printf 'PTY_PID:%s\\n' $$; sleep 60\n"));
+    let cursor = 0; let output = ""; let pid: number | undefined;
+    await vi.waitFor(async () => {
+      const page = await client.terminalOutput(head.id, { afterSeq: cursor, waitMs: 100 });
+      expect(page.resyncRequired).toBe(false);
+      cursor = page.nextSeq;
+      for (const event of page.events) if (event.type === "output") output += Buffer.from(event.dataB64, "base64").toString("utf8");
+      pid = Number(/PTY_PID:(\d+)/.exec(output)?.[1]);
+      expect(pid).toBeGreaterThan(0);
+    }, { timeout: 5000 });
+    await vi.waitFor(() => expect(store.snapshot().daemon.sessions.some(session => session.id === head.id)).toBe(true));
+    expect((await runtime.stop()).ok).toBe(true);
+    await vi.waitFor(() => expect(() => process.kill(pid!, 0)).toThrow(), { timeout: 2000 });
+    expect((await runtime.start()).ok).toBe(true);
+    const restarted = JSON.parse(readFileSync(resolve(dataDir, "connection.json"), "utf8"));
+    const next = new RustClient(restarted.baseUrl, restarted.token);
+    expect((await next.health()).activeRuntimeSessions).toBe(0);
+    expect((await next.session(head.id)).lifecycle).toBe("archived");
+    expect((await next.terminalOutput(head.id, { afterSeq: cursor, waitMs: 0 })).exited).toBe(true);
+  }, 15000);
+
   it("loads a bounded window, pages history and applies external commits without legacy projections", async () => {
     const { dataDir, store, runtime } = fixture(10000);
     writeFileSync(resolve(store.home, "status.json"), JSON.stringify({ pid: process.pid, sessions: [{ id: "legacy-must-not-load" }] }));
