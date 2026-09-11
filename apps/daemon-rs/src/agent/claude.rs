@@ -369,11 +369,19 @@ impl Translator {
                         let rid = request_id.clone();
                         tokio::spawn(async move {
                             let allow = receiver.await.unwrap_or(false);
-                            let behavior = if allow { "allow" } else { "deny" };
+                            // The CLI requires a deny response to carry a
+                            // `message`; a bare deny is rejected as an invalid
+                            // callback result and the model retries the tool.
+                            let response = if allow {
+                                serde_json::json!({"behavior":"allow"})
+                            } else {
+                                serde_json::json!({"behavior":"deny",
+                                    "message":"The user denied this action."})
+                            };
                             let frame = serde_json::json!({
                                 "type":"control_response",
                                 "response":{"subtype":"success","request_id":rid,
-                                    "response":{"behavior":behavior}}
+                                    "response":response}
                             })
                             .to_string();
                             let _ = writer.send(frame).await;
