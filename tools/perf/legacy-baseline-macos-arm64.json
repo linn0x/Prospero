@@ -1,0 +1,259 @@
+{
+  "schemaVersion": 1,
+  "backend": "node-legacy",
+  "baseline": "2e2d94479a8496d273ace12dfaf092003cd6a7d7",
+  "measuredAt": "2026-09-11T05:40:14.415Z",
+  "fixtureReset": "fresh copy for every trial; OS disk caches are not forcibly evicted",
+  "environment": {
+    "platform": "darwin",
+    "arch": "arm64",
+    "release": "25.5.0",
+    "cpu": "Apple M3 Pro",
+    "logicalCpus": 12,
+    "memoryGiB": 36,
+    "node": "v22.22.2"
+  },
+  "results": [
+    {
+      "case": "archive",
+      "count": 10000,
+      "samples": [
+        {
+          "status": "ok",
+          "startupMs": 4623.441457999999,
+          "residentSessionObjects": 10000,
+          "adapterObjects": 10000,
+          "query": {
+            "samples": 31,
+            "p50Ms": 5.02,
+            "p95Ms": 6.33,
+            "maxMs": 8.482
+          },
+          "heapMiB": 79.21927642822266,
+          "residentRssMiB": 188,
+          "peakRssMiB": 188.234375
+        },
+        {
+          "status": "ok",
+          "startupMs": 4807.148125,
+          "residentSessionObjects": 10000,
+          "adapterObjects": 10000,
+          "query": {
+            "samples": 31,
+            "p50Ms": 5.071,
+            "p95Ms": 7.941,
+            "maxMs": 8.926
+          },
+          "heapMiB": 79.21533966064453,
+          "residentRssMiB": 195.265625,
+          "peakRssMiB": 195.28125
+        },
+        {
+          "status": "ok",
+          "startupMs": 4760.175125,
+          "residentSessionObjects": 10000,
+          "adapterObjects": 10000,
+          "query": {
+            "samples": 31,
+            "p50Ms": 5.198,
+            "p95Ms": 8.607,
+            "maxMs": 8.744
+          },
+          "heapMiB": 79.21187591552734,
+          "residentRssMiB": 194.71875,
+          "peakRssMiB": 194.734375
+        }
+      ]
+    },
+    {
+      "case": "graph",
+      "count": 10000,
+      "samples": [
+        {
+          "status": "ok",
+          "startupMs": 126.899583,
+          "query": {
+            "samples": 31,
+            "p50Ms": 1.423,
+            "p95Ms": 2.278,
+            "maxMs": 2.708
+          },
+          "update": {
+            "samples": 9,
+            "p50Ms": 110.191,
+            "p95Ms": 129.783,
+            "maxMs": 129.783
+          },
+          "heapMiB": 20.172988891601562,
+          "peakRssMiB": 265.84375
+        },
+        {
+          "status": "ok",
+          "startupMs": 110.77004199999999,
+          "query": {
+            "samples": 31,
+            "p50Ms": 1.413,
+            "p95Ms": 2.194,
+            "maxMs": 3.017
+          },
+          "update": {
+            "samples": 9,
+            "p50Ms": 123.989,
+            "p95Ms": 183.27,
+            "maxMs": 183.27
+          },
+          "heapMiB": 20.172996520996094,
+          "peakRssMiB": 266.015625
+        },
+        {
+          "status": "ok",
+          "startupMs": 141.301708,
+          "query": {
+            "samples": 31,
+            "p50Ms": 1.335,
+            "p95Ms": 2.767,
+            "maxMs": 2.867
+          },
+          "update": {
+            "samples": 9,
+            "p50Ms": 163.764,
+            "p95Ms": 205.873,
+            "maxMs": 205.873
+          },
+          "heapMiB": 20.172996520996094,
+          "peakRssMiB": 264.078125
+        }
+      ]
+    },
+    {
+      "case": "archive",
+      "count": 100000,
+      "samples": [
+        {
+          "status": "ok",
+          "startupMs": 59538.319082999995,
+          "residentSessionObjects": 100000,
+          "adapterObjects": 100000,
+          "query": {
+            "samples": 31,
+            "p50Ms": 70.325,
+            "p95Ms": 116.924,
+            "maxMs": 128.321
+          },
+          "heapMiB": 578.1462631225586,
+          "residentRssMiB": 1220.90625,
+          "peakRssMiB": 1291.15625
+        },
+        {
+          "status": "ok",
+          "startupMs": 55413.759791000004,
+          "residentSessionObjects": 100000,
+          "adapterObjects": 100000,
+          "query": {
+            "samples": 31,
+            "p50Ms": 69.586,
+            "p95Ms": 99.593,
+            "maxMs": 100.637
+          },
+          "heapMiB": 576.4238052368164,
+          "residentRssMiB": 1265.140625,
+          "peakRssMiB": 1328.765625
+        },
+        {
+          "status": "ok",
+          "startupMs": 49709.346625,
+          "residentSessionObjects": 100000,
+          "adapterObjects": 100000,
+          "query": {
+            "samples": 31,
+            "p50Ms": 78.971,
+            "p95Ms": 98.179,
+            "maxMs": 229.14
+          },
+          "heapMiB": 578.108024597168,
+          "residentRssMiB": 1486.8125,
+          "peakRssMiB": 1573.609375
+        }
+      ]
+    },
+    {
+      "case": "graph",
+      "count": 100000,
+      "samples": [
+        {
+          "status": "ok",
+          "startupMs": 975.369958,
+          "query": {
+            "samples": 31,
+            "p50Ms": 31.488,
+            "p95Ms": 36.472,
+            "maxMs": 38.188
+          },
+          "update": {
+            "samples": 9,
+            "p50Ms": 977.148,
+            "p95Ms": 1078.11,
+            "maxMs": 1078.11
+          },
+          "heapMiB": 160.91522979736328,
+          "peakRssMiB": 1988.15625
+        },
+        {
+          "status": "ok",
+          "startupMs": 977.001959,
+          "query": {
+            "samples": 31,
+            "p50Ms": 38.41,
+            "p95Ms": 44.1,
+            "maxMs": 48.62
+          },
+          "update": {
+            "samples": 9,
+            "p50Ms": 1034.939,
+            "p95Ms": 1161.71,
+            "maxMs": 1161.71
+          },
+          "heapMiB": 160.91509246826172,
+          "peakRssMiB": 2000.953125
+        },
+        {
+          "status": "ok",
+          "startupMs": 952.822,
+          "query": {
+            "samples": 31,
+            "p50Ms": 30.9,
+            "p95Ms": 35.854,
+            "maxMs": 37.808
+          },
+          "update": {
+            "samples": 9,
+            "p50Ms": 995.429,
+            "p95Ms": 1095.649,
+            "maxMs": 1095.649
+          },
+          "heapMiB": 160.91503143310547,
+          "peakRssMiB": 1932.296875
+        }
+      ]
+    },
+    {
+      "case": "terminal",
+      "count": 1,
+      "samples": [
+        {
+          "status": "ok",
+          "bytes": 7340032,
+          "parseMs": 178.24879199999998,
+          "snapshot": {
+            "samples": 31,
+            "p50Ms": 0.228,
+            "p95Ms": 2.126,
+            "maxMs": 4.342
+          },
+          "retainedLines": 2040,
+          "peakRssMiB": 75.484375
+        }
+      ]
+    }
+  ]
+}

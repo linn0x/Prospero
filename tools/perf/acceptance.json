@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "branch": "exp/rust-re",
+  "baseline": "2e2d94479a8496d273ace12dfaf092003cd6a7d7",
+  "thresholdStatus": "initial-targets-to-validate-against-recorded-hardware",
+  "workloads": {
+    "archivedSessions": [10000, 100000],
+    "tasks": [10000, 100000],
+    "tasksPerRun": 100,
+    "bodyBytes": 1024,
+    "pageSize": 100,
+    "startupTrials": 3,
+    "querySamples": 31
+  },
+  "rustTargets": {
+    "archiveRuntimeObjects": 0,
+    "queryReadyMs": 2000,
+    "idleDaemonRssMiB": 128,
+    "sessionPageP95Ms": 50,
+    "runGraphPageP95Ms": 50,
+    "singleTaskCommitP95Ms": 30,
+    "subscriberQueueMaxBytes": 1048576,
+    "subscriberQueueMaxEvents": 512,
+    "terminalRetainedBytes": 8388608,
+    "localRequestCancelP95Ms": 200,
+    "childShutdownMaxMs": 2000
+  },
+  "scope": "Daemon and local API measurements; Electron rendering and external Agent process memory require separate measurements. No target is claimed passed by a fixture or source-code check alone."
+}
