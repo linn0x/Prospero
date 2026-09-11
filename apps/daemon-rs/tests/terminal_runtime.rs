@@ -326,3 +326,96 @@ async fn storage_failure_rolls_back_exit_and_keeps_output_available_until_shutdo
     );
     database.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn live_checkpoints_stop_writing_when_idle_and_fail_closed_on_storage_errors() {
+    let directory = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let database = Database::open(directory.path().into()).await.unwrap();
+    let runtime = Terminals::new(database.clone());
+    let head = runtime.create(input(&workspace)).await.unwrap();
+    let connection = rusqlite::Connection::open(directory.path().join("prospero.sqlite")).unwrap();
+    connection.execute_batch("CREATE TABLE checkpoint_writes(seq INTEGER); CREATE TRIGGER count_checkpoint AFTER UPDATE OF latest_seq ON terminal_runs BEGIN INSERT INTO checkpoint_writes VALUES(NEW.latest_seq); END;").unwrap();
+    runtime
+        .input(
+            &head.id,
+            TerminalInput {
+                data_b64: STANDARD.encode("printf 'checkpoint-live'; read answer\n"),
+            },
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let id = head.id.clone();
+            let snapshot = database
+                .call(move |store| store.terminal_snapshot(&id))
+                .await
+                .unwrap();
+            if snapshot.is_some_and(|snapshot| {
+                String::from_utf8_lossy(&STANDARD.decode(snapshot.data_b64).unwrap())
+                    .contains("checkpoint-live")
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let count: i64 = connection
+        .query_row("SELECT count(*) FROM checkpoint_writes", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM checkpoint_writes", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        count
+    );
+    connection.execute_batch("CREATE TRIGGER reject_live_output BEFORE INSERT ON terminal_output BEGIN SELECT RAISE(ABORT,'fixture failure'); END;").unwrap();
+    runtime
+        .input(
+            &head.id,
+            TerminalInput {
+                data_b64: STANDARD.encode("new-uncommitted-input"),
+            },
+        )
+        .await
+        .unwrap();
+    settled(&runtime).await;
+    assert!(runtime.check().is_err());
+    assert!(
+        runtime
+            .read(head.id.clone(), TerminalQuery::default())
+            .await
+            .unwrap()
+            .exited
+    );
+    assert!(runtime.create(input(&workspace)).await.is_err());
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM checkpoint_writes", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        count
+    );
+    let snapshot = database
+        .call(move |store| store.terminal_snapshot(&head.id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&STANDARD.decode(snapshot.data_b64).unwrap())
+            .contains("checkpoint-live")
+    );
+    assert!(runtime.shutdown().await.is_err());
+    connection
+        .execute_batch("DROP TRIGGER reject_live_output")
+        .unwrap();
+    database.shutdown().await.unwrap();
+}

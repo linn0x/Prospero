@@ -14,6 +14,7 @@ struct State {
     closed: AtomicBool,
     failed: AtomicBool,
     changed: watch::Sender<u64>,
+    checkpoints: Arc<Semaphore>,
 }
 
 #[derive(Clone)]
@@ -28,6 +29,7 @@ impl Terminals {
             closed: AtomicBool::new(false),
             failed: AtomicBool::new(false),
             changed: watch::channel(0).0,
+            checkpoints: Arc::new(Semaphore::new(2)),
         }))
     }
 
@@ -78,7 +80,13 @@ impl Terminals {
                     {
                         terminal.stop();
                     }
-                    terminal.wait_exited().await;
+                    if runtime.persist_live(&head.id, &terminal).await.is_err() {
+                        runtime.0.failed.store(true, Ordering::Release);
+                        runtime.0.closed.store(true, Ordering::Release);
+                        terminal.stop();
+                        terminal.wait_exited().await;
+                        eprintln!("terminal checkpoint failed");
+                    }
                     let finalized = match terminal.archive() {
                         Ok(archive) => runtime.finish(&head.id, archive).await,
                         Err(error) => Err(error),
@@ -125,6 +133,46 @@ impl Terminals {
             }
         }
         Err(Error::Busy)
+    }
+
+    async fn persist_live(&self, id: &str, terminal: &Terminal) -> Result<()> {
+        let mut seq = 0;
+        loop {
+            tokio::select! {
+                _ = terminal.wait_exited() => return Ok(()),
+                _ = terminal.wait_output(seq) => {}
+            }
+            tokio::select! {
+                _ = terminal.wait_exited() => return Ok(()),
+                _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+            }
+            let permit = tokio::select! {
+                _ = terminal.wait_exited() => return Ok(()),
+                permit = self.0.checkpoints.clone().acquire_owned() => permit.map_err(|_| Error::Closed)?,
+            };
+            let copy = terminal.clone();
+            let archive = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                copy.checkpoint(Some(seq))
+            })
+            .await
+            .map_err(|_| Error::Closed)??;
+            let Some(archive) = archive else {
+                continue;
+            };
+            let next = archive.seq;
+            let id = id.to_owned();
+            match self
+                .0
+                .database
+                .call(move |store| store.checkpoint_terminal(&id, archive))
+                .await
+            {
+                Ok(()) => seq = next,
+                Err(Error::Busy) => {}
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -178,6 +226,7 @@ impl Terminals {
                             Archive {
                                 snapshot: None,
                                 floor: 0,
+                                start: 0,
                                 seq: 0,
                                 events: Vec::new(),
                                 exit_code: None,
