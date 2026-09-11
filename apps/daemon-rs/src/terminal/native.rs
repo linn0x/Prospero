@@ -86,12 +86,7 @@ pub fn spawn(command: CommandBuilder, size: TerminalSize) -> Result<Terminal> {
                         Ok(count) => {
                             read_any = true;
                             if let Ok(mut output) = output.lock() {
-                                output.push(
-                                    TerminalEvent::Output {
-                                        data_b64: STANDARD.encode(&buffer[..count]),
-                                    },
-                                    count,
-                                );
+                                output.write(&buffer[..count]);
                             }
                             changed.send_modify(|v| *v = v.wrapping_add(1));
                         }

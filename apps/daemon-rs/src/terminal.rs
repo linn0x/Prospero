@@ -83,7 +83,19 @@ pub struct TerminalInput {
     pub data_b64: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalSnapshot {
+    #[ts(type = "number")]
+    pub seq: i64,
+    pub size: TerminalSize,
+    pub data_b64: String,
+}
+
+pub mod screen;
+
 pub struct Output {
+    screen: screen::Screen,
     initial_size: TerminalSize,
     events: VecDeque<(TerminalEvent, usize)>,
     bytes: usize,
@@ -94,6 +106,7 @@ pub struct Output {
 
 #[derive(Clone)]
 pub(crate) struct Archive {
+    snapshot: Option<TerminalSnapshot>,
     floor: i64,
     seq: i64,
     events: Vec<TerminalEvent>,
@@ -103,6 +116,7 @@ pub(crate) struct Archive {
 impl Output {
     fn new(size: TerminalSize) -> Self {
         Self {
+            screen: screen::Screen::new(size),
             initial_size: size,
             events: VecDeque::new(),
             bytes: 0,
@@ -113,12 +127,25 @@ impl Output {
     }
 
     fn push(&mut self, event: TerminalEvent, bytes: usize) {
+        if let TerminalEvent::Resize { size } = &event {
+            self.screen.resize(*size);
+        }
         self.events.push_back((event, bytes));
         self.bytes += bytes;
         self.seq += 1;
         while self.bytes > RETAINED_BYTES || self.events.len() > RETAINED_EVENTS {
             self.bytes -= self.events.pop_front().expect("retained event").1;
         }
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.screen.process(bytes);
+        self.push(
+            TerminalEvent::Output {
+                data_b64: STANDARD.encode(bytes),
+            },
+            bytes.len(),
+        );
     }
 
     fn page(&self, after: i64) -> Result<TerminalPage> {
@@ -192,6 +219,7 @@ impl Terminal {
             return Err(Error::Conflict);
         }
         Ok(Archive {
+            snapshot: output.screen.snapshot(output.seq).ok(),
             floor: output.seq - output.events.len() as i64,
             seq: output.seq,
             events: output
@@ -201,6 +229,10 @@ impl Terminal {
                 .collect(),
             exit_code: output.exit_code,
         })
+    }
+    pub fn snapshot(&self) -> Result<Option<TerminalSnapshot>> {
+        let output = self.0.output.lock().map_err(|_| Error::Closed)?;
+        Ok(output.screen.snapshot(output.seq).ok())
     }
     pub async fn read(&self, query: TerminalQuery) -> Result<TerminalPage> {
         let after = query.after_seq.unwrap_or(0);

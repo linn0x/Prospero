@@ -61,6 +61,7 @@ export function sessionInfoFromControl(value: unknown): SessionInfo {
     })
     : [];
   return {
+    ...(item["terminalMode"] === "events" ? { terminalMode: "events" as const } : {}),
     id: item["id"],
     agent: boundedText(item["agent"], "shell", 80),
     kind: boundedText(item["kind"], "pty", 80),
