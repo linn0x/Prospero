@@ -4,6 +4,7 @@ pub mod error;
 pub mod protocol;
 mod queries;
 pub mod server;
+pub mod terminal;
 mod timeline;
 pub mod transport;
 pub mod worker;

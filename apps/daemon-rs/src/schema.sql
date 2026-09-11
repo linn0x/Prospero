@@ -65,3 +65,19 @@ CREATE TABLE timeline_records (
     UNIQUE(session_id,position),
     FOREIGN KEY(session_id,id) REFERENCES content_heads(session_id,id) ON DELETE CASCADE
 ) STRICT;
+CREATE TABLE terminal_runs (
+    session_id TEXT PRIMARY KEY REFERENCES session_heads(id) ON DELETE CASCADE,
+    cols INTEGER NOT NULL CHECK(cols BETWEEN 20 AND 500),
+    rows INTEGER NOT NULL CHECK(rows BETWEEN 5 AND 300),
+    active INTEGER NOT NULL CHECK(active IN (0,1)),
+    floor_seq INTEGER NOT NULL DEFAULT 0 CHECK(floor_seq >= 0),
+    latest_seq INTEGER NOT NULL DEFAULT 0 CHECK(latest_seq >= floor_seq),
+    exit_code INTEGER
+) STRICT;
+CREATE INDEX terminal_active ON terminal_runs(session_id) WHERE active=1;
+CREATE TABLE terminal_output (
+    session_id TEXT NOT NULL REFERENCES terminal_runs(session_id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL CHECK(seq > 0),
+    payload TEXT NOT NULL CHECK(length(CAST(payload AS BLOB)) <= 32768),
+    PRIMARY KEY(session_id,seq)
+) STRICT;

@@ -11,6 +11,7 @@ import type { SessionInfo } from "../../shared/types";
 import { reportError, number, text } from "./state";
 import { useLocale } from "./locale";
 import { allowNativeTerminalPaste, bindTerminalPaste, consumeTerminalKey, terminalClipboardShortcut } from "./terminal-clipboard";
+import { terminalBytes } from "./terminal-bytes";
 import {
   deleteTerminalSessionCache,
   loadTerminalSessionCache,
@@ -509,7 +510,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
               setConnected(false);
               continue;
             }
-            const output = fromBase64(text(frame["dataB64"]));
+            const output = terminalBytes(text(frame["dataB64"]));
             const target = terminalRef.current;
             stableBufferRef.current = false;
             writeChain.current = writeChain.current.then(() => new Promise<void>((done) => {

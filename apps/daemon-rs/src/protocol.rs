@@ -403,6 +403,12 @@ pub fn typescript() -> String {
         TimelineLookupResult::decl(&config),
         TimelineTextQuery::decl(&config),
         TimelineTextPage::decl(&config),
+        crate::terminal::CreateTerminal::decl(&config),
+        crate::terminal::TerminalSize::decl(&config),
+        crate::terminal::TerminalEvent::decl(&config),
+        crate::terminal::TerminalQuery::decl(&config),
+        crate::terminal::TerminalPage::decl(&config),
+        crate::terminal::TerminalInput::decl(&config),
         crate::error::ErrorBody::decl(&config),
     ];
     declarations
