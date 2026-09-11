@@ -2,6 +2,7 @@ import type { ContentPage, EventPage, EventQuery, Health, RenameSession, Session
 import type { RustContent } from "../shared/rust-api";
 import type { TimelinePage, TimelineQuery, TimelineLookupResult, TimelineTextQuery, TimelineTextPage } from "@prospero/protocol/rust-daemon";
 import type { CreateTerminal, TerminalPage, TerminalQuery, TerminalSize, TerminalSnapshot } from "@prospero/protocol/rust-daemon";
+import type { AgentSend, CreateAgentSession, PermissionDecision } from "@prospero/protocol/rust-daemon";
 
 const MAX_BYTES = 2 * 1024 * 1024;
 function id(value: string): string {
@@ -77,6 +78,21 @@ export class RustClient {
   }
   terminalClose(value: string, signal: AbortSignal | null = null): Promise<{ ok: boolean }> {
     return this.json(`/v1/terminals/${id(value)}/close`, { method: "POST", signal });
+  }
+  createAgentSession(input: CreateAgentSession, signal: AbortSignal | null = null): Promise<SessionHead> {
+    return this.json("/v1/agent-sessions", { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
+  }
+  agentSend(value: string, input: AgentSend, signal: AbortSignal | null = null): Promise<{ ok: boolean }> {
+    return this.json(`/v1/agent-sessions/${id(value)}/send`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
+  }
+  agentInterrupt(value: string, signal: AbortSignal | null = null): Promise<{ ok: boolean }> {
+    return this.json(`/v1/agent-sessions/${id(value)}/interrupt`, { method: "POST", signal });
+  }
+  agentPermission(value: string, decision: PermissionDecision, signal: AbortSignal | null = null): Promise<{ ok: boolean }> {
+    return this.json(`/v1/agent-sessions/${id(value)}/permission`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(decision) });
+  }
+  agentClose(value: string, signal: AbortSignal | null = null): Promise<{ ok: boolean }> {
+    return this.json(`/v1/agent-sessions/${id(value)}`, { method: "DELETE", signal });
   }
   timeline(value: string, query: TimelineQuery, signal: AbortSignal | null = null): Promise<TimelinePage> {
     const params = new URLSearchParams();

@@ -82,3 +82,12 @@ CREATE TABLE terminal_output (
     payload TEXT NOT NULL CHECK(length(CAST(payload AS BLOB)) <= 32768),
     PRIMARY KEY(session_id,seq)
 ) STRICT;
+CREATE TABLE agent_runs (
+    session_id TEXT PRIMARY KEY REFERENCES session_heads(id) ON DELETE CASCADE,
+    agent TEXT NOT NULL CHECK(agent IN ('claude')),
+    active INTEGER NOT NULL CHECK(active IN (0,1)),
+    approval_policy TEXT NOT NULL CHECK(approval_policy IN ('manual','auto')),
+    turn INTEGER NOT NULL DEFAULT 0 CHECK(turn >= 0),
+    native_id TEXT CHECK(native_id IS NULL OR length(native_id) <= 256)
+) STRICT;
+CREATE INDEX agent_active ON agent_runs(session_id) WHERE active=1;

@@ -17,6 +17,8 @@ use axum::{
 use futures_util::{Stream, stream};
 use tokio::sync::{Semaphore, watch};
 
+use crate::agent::Agents;
+use crate::agent::{AgentSend, CreateAgentSession, PermissionDecision};
 use crate::auth::Token;
 use crate::database::Store;
 use crate::error::{Error, Result};
@@ -31,6 +33,7 @@ use crate::worker::Database;
 pub struct Api {
     pub database: Database,
     pub terminals: Terminals,
+    pub agents: Agents,
     token: Token,
     changes: watch::Sender<u64>,
     stopping: watch::Sender<bool>,
@@ -48,8 +51,18 @@ impl Api {
     pub fn with_guard(database: Database, token: Token, guard: Option<std::path::PathBuf>) -> Self {
         let terminals = Terminals::with_guard(database.clone(), guard);
         let changes = terminals.changes();
+        let agents = Agents::new(database.clone());
+        // Forward agent notifications onto the shared change watch.
+        let mut agent_changes = agents.changes().subscribe();
+        let shared_changes = changes.clone();
+        tokio::spawn(async move {
+            while agent_changes.changed().await.is_ok() {
+                shared_changes.send_modify(|seq| *seq = seq.wrapping_add(1));
+            }
+        });
         Self {
             terminals,
+            agents,
             database,
             token,
             changes,
@@ -65,6 +78,14 @@ impl Api {
         Router::new()
             .route("/v1/health", get(health))
             .route("/v1/shutdown", post(shutdown))
+            .route("/v1/agent-sessions", post(create_agent))
+            .route("/v1/agent-sessions/{id}/send", post(agent_send))
+            .route("/v1/agent-sessions/{id}/interrupt", post(agent_interrupt))
+            .route("/v1/agent-sessions/{id}/permission", post(agent_permission))
+            .route(
+                "/v1/agent-sessions/{id}",
+                axum::routing::delete(agent_close),
+            )
             .route("/v1/terminals", post(create_terminal))
             .route("/v1/terminals/{id}/output", get(terminal_output))
             .route("/v1/terminals/{id}/snapshot", get(terminal_snapshot))
@@ -87,7 +108,7 @@ impl Api {
             .route("/v1/events", get(events))
             .route("/v1/events/stream", get(subscribe))
             .fallback(|| async { ApiError(Error::NotFound) })
-            .layer(DefaultBodyLimit::max(16 * 1024))
+            .layer(DefaultBodyLimit::max(96 * 1024))
             .layer(middleware::from_fn_with_state(self.clone(), authorize))
             .with_state(self.clone())
     }
@@ -174,10 +195,11 @@ async fn authorize(State(api): State<Api>, request: Request, next: Next) -> Resp
 async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, ApiError> {
     api.call(|_| Ok(())).await?;
     api.terminals.check()?;
+    api.agents.check()?;
     Ok(Json(Health {
         api_version: API_VERSION,
         backend: "rust".into(),
-        active_runtime_sessions: api.terminals.count(),
+        active_runtime_sessions: api.terminals.count() + api.agents.count(),
         database_queue_capacity: DATABASE_QUEUE_CAPACITY,
         capabilities: [
             "session.metadata",
@@ -188,6 +210,7 @@ async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, Api
             "workspace.page",
             "session.content",
             "session.timeline",
+            "agent.claude",
             #[cfg(unix)]
             "terminal.unix",
             "terminal.output.page",
@@ -198,6 +221,56 @@ async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, Api
         .map(str::to_owned)
         .to_vec(),
     }))
+}
+
+async fn create_agent(
+    State(api): State<Api>,
+    body: std::result::Result<Json<CreateAgentSession>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<SessionHead>, ApiError> {
+    let Json(input) = body.map_err(|_| Error::Invalid("invalid agent request".into()))?;
+    let head = api.agents.create(input).await?;
+    api.publish();
+    Ok(Json(head))
+}
+
+async fn agent_send(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<AgentSend>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    let Json(input) = body.map_err(|_| Error::Invalid("invalid agent message".into()))?;
+    api.agents.send(&id, input.text).await?;
+    api.publish();
+    Ok(Json(serde_json::json!({"ok":true})))
+}
+
+async fn agent_interrupt(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    api.agents.interrupt(&id).await?;
+    Ok(Json(serde_json::json!({"ok":true})))
+}
+
+async fn agent_permission(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<PermissionDecision>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    let Json(decision) = body.map_err(|_| Error::Invalid("invalid permission decision".into()))?;
+    api.agents
+        .respond_permission(&id, &decision.request_id, decision.allow)
+        .await?;
+    Ok(Json(serde_json::json!({"ok":true})))
+}
+
+async fn agent_close(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    api.agents.close(&id).await?;
+    api.publish();
+    Ok(Json(serde_json::json!({"ok":true})))
 }
 
 async fn create_terminal(
