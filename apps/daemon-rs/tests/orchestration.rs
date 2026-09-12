@@ -75,7 +75,7 @@ fn readiness_is_derived_through_the_reverse_dep_index_without_stored_state() {
     // Settling one task reads only its dependents (orch_deps_dep) and flips
     // exactly the next task — no graph-wide rescan, no missed transition.
     let first = store
-        .dispatch_task(&ids["n0"], "sess-root-0001", None)
+        .dispatch_task(&ids["n0"], "sess-root-0001", None, None)
         .unwrap();
     store
         .settle_dispatch(&first.dispatch.id, true, "done")
@@ -83,7 +83,7 @@ fn readiness_is_derived_through_the_reverse_dep_index_without_stored_state() {
     assert_eq!(ready(&mut store, &run_id), vec![ids["n1"].clone()]);
 
     let second = store
-        .dispatch_task(&ids["n1"], "sess-next-0002", None)
+        .dispatch_task(&ids["n1"], "sess-next-0002", None, None)
         .unwrap();
     store
         .settle_dispatch(&second.dispatch.id, true, "done")
@@ -155,7 +155,7 @@ fn wide_graph_makes_every_independent_root_ready_without_a_full_scan() {
     for index in 0..199usize {
         let leaf_id = ids[&format!("leaf{index:03}")].clone();
         let outcome = store
-            .dispatch_task(&leaf_id, &format!("sess-leaf-{index:03}xx"), None)
+            .dispatch_task(&leaf_id, &format!("sess-leaf-{index:03}xx"), None, None)
             .unwrap();
         store
             .settle_dispatch(&outcome.dispatch.id, true, "ok")
@@ -171,13 +171,13 @@ fn live_dispatch_is_unique_even_against_retries_and_raw_races() {
     let (run_id, ids) = make_run(&mut store, "op-graph-dup", chain(2));
 
     let outcome = store
-        .dispatch_task(&ids["n0"], "sess-dup-00001", Some("op-start-1"))
+        .dispatch_task(&ids["n0"], "sess-dup-00001", Some("op-start-1"), None)
         .unwrap();
     assert_eq!(outcome.task.status, TaskStatus::Dispatched);
     assert_eq!(outcome.dispatch.state, DispatchState::Starting);
 
     // A second live dispatch is rejected at the write boundary.
-    let duplicate = store.dispatch_task(&ids["n0"], "sess-dup-00002", None);
+    let duplicate = store.dispatch_task(&ids["n0"], "sess-dup-00002", None, None);
     assert!(matches!(duplicate, Err(Error::Invalid(_))));
 
     // The partial unique index is the hard guarantee even if a future code
@@ -194,13 +194,13 @@ fn live_dispatch_is_unique_even_against_retries_and_raw_races() {
     // Retrying the SAME operation id with the SAME payload replays the frozen
     // first dispatch instead of creating another.
     let replay = store
-        .dispatch_task(&ids["n0"], "sess-dup-00001", Some("op-start-1"))
+        .dispatch_task(&ids["n0"], "sess-dup-00001", Some("op-start-1"), None)
         .unwrap();
     assert_eq!(replay.dispatch.id, outcome.dispatch.id);
     assert_eq!(store.list_dispatches(Some(&run_id)).unwrap().len(), 1);
 
     // Same operation id, different payload is rejected, never a silent redo.
-    let reused = store.dispatch_task(&ids["n0"], "sess-dup-00099", Some("op-start-1"));
+    let reused = store.dispatch_task(&ids["n0"], "sess-dup-00099", Some("op-start-1"), None);
     assert!(matches!(reused, Err(Error::Invalid(_))));
 }
 
@@ -212,18 +212,18 @@ fn dispatch_boundary_rechecks_readiness_and_state_machine() {
 
     // n1 has an unmet dependency.
     assert!(matches!(
-        store.dispatch_task(&ids["n1"], "sess-early-0001", None),
+        store.dispatch_task(&ids["n1"], "sess-early-0001", None, None),
         Err(Error::Invalid(_))
     ));
     // A done task never dispatches again.
     let outcome = store
-        .dispatch_task(&ids["n0"], "sess-done-00001", None)
+        .dispatch_task(&ids["n0"], "sess-done-00001", None, None)
         .unwrap();
     store
         .settle_dispatch(&outcome.dispatch.id, true, "done")
         .unwrap();
     assert!(matches!(
-        store.dispatch_task(&ids["n0"], "sess-again-0001", None),
+        store.dispatch_task(&ids["n0"], "sess-again-0001", None, None),
         Err(Error::Invalid(_))
     ));
 }
@@ -234,7 +234,7 @@ fn task_and_dispatch_settle_atomically_and_failure_can_retry() {
     let mut store = Store::open(directory.path()).unwrap();
     let (run_id, ids) = make_run(&mut store, "op-graph-settle", chain(1));
     let outcome = store
-        .dispatch_task(&ids["n0"], "sess-atom-00001", None)
+        .dispatch_task(&ids["n0"], "sess-atom-00001", None, None)
         .unwrap();
     let settled = store
         .settle_dispatch(&outcome.dispatch.id, false, "boom")
@@ -291,7 +291,7 @@ fn gates_park_tasks_and_resolve_with_or_without_live_worker() {
     // Gate on a dispatched task: resolve keeps it dispatched because its
     // worker is still live; the dispatch must not be duplicated.
     let outcome = store
-        .dispatch_task(&ids["n0"], "sess-gate-0001", None)
+        .dispatch_task(&ids["n0"], "sess-gate-0001", None, None)
         .unwrap();
     let gate2 = store
         .create_gate(
@@ -358,7 +358,9 @@ fn cancel_cascades_pending_gates_but_waits_for_live_workers() {
         })
         .unwrap();
     let m0 = extra.id_map["m0"].clone();
-    let outcome = store.dispatch_task(&m0, "sess-cancel-001", None).unwrap();
+    let outcome = store
+        .dispatch_task(&m0, "sess-cancel-001", None, None)
+        .unwrap();
     assert!(matches!(
         store.cancel_task(&m0, "try"),
         Err(Error::Invalid(_))
@@ -383,7 +385,7 @@ fn abandon_preserves_an_explicit_done_delivery() {
     let mut store = Store::open(directory.path()).unwrap();
     let (_run_id, ids) = make_run(&mut store, "op-graph-preserve", chain(1));
     let outcome = store
-        .dispatch_task(&ids["n0"], "sess-preserve-01", None)
+        .dispatch_task(&ids["n0"], "sess-preserve-01", None, None)
         .unwrap();
 
     // Simulate the crash window: the worker delivered done but the dispatch
@@ -432,14 +434,14 @@ fn recovery_abandons_orphans_promotes_live_starts_and_is_idempotent() {
     // that becomes archived before the daemon crashed.
     let (run_a, a) = make_run(&mut store, "op-graph-recover-a", chain(2));
     let d0 = store
-        .dispatch_task(&a["n0"], &live_session.id, None)
+        .dispatch_task(&a["n0"], &live_session.id, None, None)
         .unwrap();
     store.set_dispatch_running(&d0.dispatch.id).unwrap();
     store
         .settle_dispatch(&d0.dispatch.id, true, "done")
         .unwrap();
     let d1 = store
-        .dispatch_task(&a["n1"], &archived_session.id, None)
+        .dispatch_task(&a["n1"], &archived_session.id, None, None)
         .unwrap();
     store.set_dispatch_running(&d1.dispatch.id).unwrap();
 
@@ -447,7 +449,7 @@ fn recovery_abandons_orphans_promotes_live_starts_and_is_idempotent() {
     // column has no FK; a wiped sessions database is exactly the crash case).
     let (run_b, b) = make_run(&mut store, "op-graph-recover-b", chain(1));
     let d_missing = store
-        .dispatch_task(&b["n0"], "sess-vanished-001", None)
+        .dispatch_task(&b["n0"], "sess-vanished-001", None, None)
         .unwrap();
     assert_eq!(d_missing.dispatch.state, DispatchState::Starting);
 
@@ -455,7 +457,7 @@ fn recovery_abandons_orphans_promotes_live_starts_and_is_idempotent() {
     // promoted to running, not abandoned.
     let (run_c, c) = make_run(&mut store, "op-graph-recover-c", chain(1));
     let d_live_start = store
-        .dispatch_task(&c["n0"], &live_session.id, None)
+        .dispatch_task(&c["n0"], &live_session.id, None, None)
         .unwrap();
 
     // Crash fixtures: archive one session; delete the other's row outright.
@@ -534,7 +536,7 @@ fn run_lifecycle_enforces_settlement_then_completes() {
         Err(Error::Invalid(_))
     ));
     let outcome = store
-        .dispatch_task(&ids["n0"], "sess-life-00001", None)
+        .dispatch_task(&ids["n0"], "sess-life-00001", None, None)
         .unwrap();
     // A live worker blocks both completion and abandonment.
     assert!(matches!(
@@ -563,7 +565,7 @@ fn failed_tasks_block_completion_unless_explicitly_allowed() {
     let mut store = Store::open(directory.path()).unwrap();
     let (run_id, ids) = make_run(&mut store, "op-graph-allow", chain(1));
     let outcome = store
-        .dispatch_task(&ids["n0"], "sess-allow-0001", None)
+        .dispatch_task(&ids["n0"], "sess-allow-0001", None, None)
         .unwrap();
     store
         .settle_dispatch(&outcome.dispatch.id, false, "nope")
@@ -670,7 +672,7 @@ fn graph_edits_use_optimistic_concurrency_and_reject_cycles() {
 
     // n0 is already done; only pending tasks may be deleted.
     let done = store
-        .dispatch_task(&ids["n0"], "sess-occ-00001", None)
+        .dispatch_task(&ids["n0"], "sess-occ-00001", None, None)
         .unwrap();
     store
         .settle_dispatch(&done.dispatch.id, true, "done")
@@ -795,24 +797,33 @@ fn state_machine_and_cycle_finder_match_legacy_model() {
 }
 
 #[test]
-fn schema_v9_is_active_indexed_and_survives_reopen() {
+fn schema_v10_worktree_indexes_survive_reopen() {
     let directory = TempDir::new().unwrap();
     let mut store = Store::open(directory.path()).unwrap();
     let connection = raw(&directory);
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 9);
-    // Reverse-edge index backing local propagation exists.
+    assert_eq!(version, 10);
+    // Stage 7 reverse-edge indexes and Stage 8 worktree indexes all exist.
     let indexed: i64 = connection
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='index' AND name IN \
-             ('orch_deps_dep','orch_dispatch_active')",
+             ('orch_deps_dep','orch_dispatch_active','orch_worktrees_run','orch_worktrees_state','orch_worktrees_path')",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(indexed, 2);
+    assert_eq!(indexed, 5);
+    // The v10 dispatch column and asset table are present and writable.
+    connection
+        .execute(
+            "INSERT INTO orch_worktree_assets \
+             (id,kind,run_id,task_id,dispatch_id,repo,path,branch,state,created_at,updated_at,run_deleted_at,last_inspection,cleanup,last_error) \
+             VALUES('wt-probe','worker','run-absent',NULL,NULL,'/repo','/tree',NULL,'preserved',1,1,1,NULL,NULL,'detached')",
+            [],
+        )
+        .unwrap();
     drop(connection);
 
     let (run_id, ids) = make_run(&mut store, "op-graph-v9", chain(1));
@@ -823,7 +834,7 @@ fn schema_v9_is_active_indexed_and_survives_reopen() {
 }
 
 #[test]
-fn v8_database_is_migrated_forward_to_v9() {
+fn v8_database_is_migrated_forward_to_v10() {
     // Build a v8 database by initialising the pre-orchestration schema with the
     // legacy application id, then prove Store::open upgrades it in place.
     let directory = TempDir::new().unwrap();
@@ -843,9 +854,51 @@ fn v8_database_is_migrated_forward_to_v9() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
     // The migrated store serves orchestration writes.
     let (_run_id, _ids) = make_run(&mut store, "op-graph-migrated", chain(1));
+}
+
+#[test]
+fn v9_database_is_migrated_forward_to_v10() {
+    // A v9 database (Stage 7 current schema) gains the v10 worktree table and
+    // dispatch column without losing rows.
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("prospero.sqlite");
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(include_str!("../src/schema.sql"))
+            .unwrap();
+        connection
+            .execute_batch(include_str!("../src/orchestration/schema.sql"))
+            .unwrap();
+        connection
+            .pragma_update(None, "application_id", 0x50525253i64)
+            .unwrap();
+        connection.pragma_update(None, "user_version", 9).unwrap();
+    }
+    let mut store = Store::open(directory.path()).unwrap();
+    let connection = raw(&directory);
+    assert_eq!(
+        connection
+            .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap(),
+        10
+    );
+    drop(connection);
+    let (run_id, ids) = make_run(&mut store, "op-graph-v9up", chain(1));
+    let outcome = store
+        .dispatch_task(&ids["n0"], "sess-v9up-0001", None, Some("/tmp/tree"))
+        .unwrap();
+    assert_eq!(outcome.dispatch.worktree_path.as_deref(), Some("/tmp/tree"));
+    drop(store);
+    let mut reopened = Store::open(directory.path()).unwrap();
+    let snapshot = reopened.run_snapshot(&run_id).unwrap();
+    assert_eq!(
+        snapshot.dispatches.first().unwrap().worktree_path,
+        Some("/tmp/tree".to_owned())
+    );
 }
 
 #[test]
@@ -863,7 +916,7 @@ fn orchestration_changes_share_the_transactional_event_log() {
     assert!(kinds.contains(&"task.created"));
 
     let outcome = store
-        .dispatch_task(&ids["n0"], "sess-event-0001", None)
+        .dispatch_task(&ids["n0"], "sess-event-0001", None, None)
         .unwrap();
     store
         .settle_dispatch(&outcome.dispatch.id, true, "done")
@@ -878,4 +931,162 @@ fn orchestration_changes_share_the_transactional_event_log() {
         .collect();
     assert!(kinds.contains(&"dispatch.updated"));
     let _ = run_id;
+}
+
+// ── Stage 8: run/task creation, run deletion, asset detach ──────────────────
+
+#[test]
+fn run_create_and_task_create_append_and_bump_revision() {
+    let directory = TempDir::new().unwrap();
+    let mut store = Store::open(directory.path()).unwrap();
+    let run = store
+        .create_run(prosperod_rs::orchestration::CreateRun {
+            objective: "incremental build".into(),
+            coordinator_session_id: None,
+        })
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Active);
+    assert_eq!(run.graph_revision, 0);
+
+    let first = store
+        .create_task(prosperod_rs::orchestration::CreateTask {
+            run_id: run.id.clone(),
+            title: "first".into(),
+            spec: "do first".into(),
+            skills: vec![],
+            deps: vec![],
+            parent_id: None,
+        })
+        .unwrap();
+    let second = store
+        .create_task(prosperod_rs::orchestration::CreateTask {
+            run_id: run.id.clone(),
+            title: "second".into(),
+            spec: "do second".into(),
+            skills: vec![],
+            deps: vec![first.id.clone()],
+            parent_id: None,
+        })
+        .unwrap();
+    // The new task blocks behind `first`; its creation is what bumped rev 2.
+    assert_eq!(second.deps, vec![first.id.clone()]);
+    let snapshot = store.run_snapshot(&run.id).unwrap();
+    assert_eq!(snapshot.run.graph_revision, 2);
+    assert_eq!(snapshot.ready, vec![first.id.clone()]);
+
+    // Appended tasks only validate forward against the full candidate graph;
+    // a dependency on a missing task is rejected like a bad graph edit.
+    // (Cycles that re-enter existing nodes are only possible through
+    // apply_task_graph, which the Stage 7 graph tests cover.)
+    assert!(
+        store
+            .create_task(prosperod_rs::orchestration::CreateTask {
+                run_id: run.id.clone(),
+                title: "ghost dep".into(),
+                spec: "ghost".into(),
+                skills: vec![],
+                deps: vec!["task-does-not-exist".into()],
+                parent_id: None,
+            })
+            .is_err()
+    );
+
+    // Unknown run / unknown dep are rejected.
+    assert!(
+        store
+            .create_task(prosperod_rs::orchestration::CreateTask {
+                run_id: "run-missing".into(),
+                title: "x".into(),
+                spec: "x".into(),
+                skills: vec![],
+                deps: vec![],
+                parent_id: None,
+            })
+            .is_err()
+    );
+
+    // Tasks cannot be appended to a settled run.
+    store.abandon_run(&run.id, "done here").unwrap();
+    assert!(
+        store
+            .create_task(prosperod_rs::orchestration::CreateTask {
+                run_id: run.id.clone(),
+                title: "late".into(),
+                spec: "late".into(),
+                skills: vec![],
+                deps: vec![],
+                parent_id: None,
+            })
+            .is_err()
+    );
+}
+
+#[test]
+fn deleting_a_run_detaches_worktree_assets_but_keeps_them_indexed() {
+    use prosperod_rs::orchestration::{RegisterWorktree, WorktreeAssetKind, WorktreeAssetState};
+
+    let directory = TempDir::new().unwrap();
+    let mut store = Store::open(directory.path()).unwrap();
+    let (run_id, ids) = make_run(&mut store, "op-delete-run", chain(1));
+    let task_id = ids["n0"].clone();
+
+    let asset = store
+        .register_worktree_asset(RegisterWorktree {
+            kind: WorktreeAssetKind::Worker,
+            run_id: run_id.clone(),
+            task_id: Some(task_id.clone()),
+            repo: "/tmp/repo".into(),
+            path: "/tmp/prospero-worker-tree".into(),
+            branch: Some("prospero/branch".into()),
+        })
+        .unwrap();
+    assert_eq!(asset.task_id.as_deref(), Some(task_id.as_str()));
+
+    // While a dispatch is live, deletion is refused unless forced.
+    let outcome = store
+        .dispatch_task(&task_id, "sess-delete-0001", None, Some(&asset.path))
+        .unwrap();
+    assert_eq!(
+        outcome.dispatch.worktree_path.as_deref(),
+        Some(asset.path.as_str())
+    );
+    // While the dispatch is live, run deletion is refused without force.
+    assert!(store.delete_run(&run_id, false).is_err());
+    // The worker service links asset to dispatch in the same start boundary.
+    let linked = store
+        .link_worktree_dispatch(&asset.id, &outcome.dispatch.id)
+        .unwrap();
+    assert_eq!(
+        linked.dispatch_id.as_deref(),
+        Some(outcome.dispatch.id.as_str())
+    );
+
+    // Manual delivery settles the dispatch and preserves the linked asset.
+    store
+        .settle_dispatch(&outcome.dispatch.id, true, "delivered")
+        .unwrap();
+    let linked = store.worktree_asset(&asset.id).unwrap();
+    assert_eq!(linked.state, WorktreeAssetState::Preserved);
+
+    let result = store.delete_run(&run_id, false).unwrap();
+    assert_eq!(result.deleted_task_count, 1);
+    assert_eq!(result.preserved_worktree_asset_ids, vec![asset.id.clone()]);
+
+    // The run and its rows are gone, but the disk resource stays indexed...
+    assert!(store.run_snapshot(&run_id).is_err());
+    let detached = store.worktree_asset(&asset.id).unwrap();
+    assert_eq!(detached.state, WorktreeAssetState::Preserved);
+    assert!(detached.run_deleted_at.is_some());
+    assert_eq!(
+        detached.last_error.as_deref(),
+        Some("所属 Run 已删除；资产与恢复分支仍保留，需显式检查或清理")
+    );
+    // ...and remains visible in the asset list for later cleanup. run_id is
+    // deliberately kept as provenance (no FK), so the detached asset is still
+    // locable by its original run too.
+    assert_eq!(store.list_worktree_assets(None).unwrap().len(), 1);
+    assert_eq!(
+        store.list_worktree_assets(Some(&run_id)).unwrap()[0].state,
+        WorktreeAssetState::Preserved
+    );
 }

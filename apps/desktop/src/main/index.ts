@@ -1228,6 +1228,14 @@ function installIpc(): void {
     if (typeof rawDecision !== "string" || !rawDecision.trim() || rawDecision.length > 20_000) throw new Error("决策无效");
     return runtime.request(`/_prospero/control/orchestration/gate/${encodeURIComponent(id)}/resolve`, { method: "POST", body: { decision: rawDecision.trim() } });
   });
+  ipcMain.handle("orchestration:settle", (_event, rawDispatchId: unknown, rawSuccess: unknown, rawOutcome: unknown) => {
+    const dispatchId = requireId(rawDispatchId, "派发");
+    const dispatch = store.snapshot().orchestration.dispatches.find((candidate) => candidate["id"] === dispatchId);
+    if (!dispatch) throw new Error("派发不存在");
+    if (rawSuccess !== true && rawSuccess !== false) throw new Error("交付结果无效");
+    if (typeof rawOutcome !== "string" || !rawOutcome.trim() || rawOutcome.length > 20_000) throw new Error("请填写交付摘要");
+    return runtime.request(`/_prospero/control/orchestration/dispatch/${encodeURIComponent(dispatchId)}/settle`, { method: "POST", body: { success: rawSuccess, outcome: rawOutcome.trim() } });
+  });
   ipcMain.handle("account:models", async (_event, raw: unknown) => {
     const message = accountModelsRequest(raw, randomUUID());
     const failed = (code: "unsupported" | "network" | "not_found", detail: string) => ({ type: "agent.account.api.models.result", requestId: message.requestId, ok: false, models: [], error: { code, message: detail } });

@@ -3,6 +3,7 @@ import type { SessionHead, TimelineQuery, TimelineTextQuery } from "@prospero/pr
 import type { DesktopSnapshot, JsonObject, SessionInfo, SessionPage, SessionPageRequest } from "../shared/types";
 import { StateStore } from "./state-store";
 import { RustProcess, type RustConnection } from "./rust-process";
+import { orchestrationAction, readOrchestrationWindow, settleDispatchInput } from "./rust-orchestration";
 
 export function rustSessionInfo(head: SessionHead): SessionInfo {
   return { id: head.id, agent: head.agent, kind: head.kind, ...(head.kind === "pty" ? { terminalMode: "events" as const } : { historyMode: "paged" as const }), title: head.title, cwd: head.workspace, status: head.status === "waiting_permission" ? "waiting_approval" : head.status, createdAt: head.createdAt, pendingPermissions: head.status === "waiting_permission" ? 1 : 0, pendingQuestions: head.status === "waiting_input" ? 1 : 0 };
@@ -17,6 +18,7 @@ export class RustRuntime {
   private stopping: Promise<{ ok: boolean; error?: string }> | undefined;
   private refreshing: Promise<void> | undefined;
   private sequence = 0;
+  private orchestrationSequence = 0;
   private ready = false;
   private terminalWrites = new Map<string, { count: number; bytes: number; failed: boolean; tail: Promise<void> }>();
 
@@ -101,17 +103,26 @@ export class RustRuntime {
   private async readWindow(): Promise<void> {
     const { client, pid, baseUrl } = this.current();
     const signal = this.controller.signal;
-    const [summary, active, recent, workspaces, health] = await Promise.all([
+    const orchCursor = await client.events({ scope: "orchestration", afterSeq: this.orchestrationSequence, limit: 1 }, signal).catch(() => null);
+    const [summary, active, recent, workspaces, health, orchestration] = await Promise.all([
       client.summary(undefined, signal),
       client.sessions({ limit: 100, cursor: null, lifecycle: "active", workspace: null, text: null }, signal),
       client.sessions({ limit: 20, cursor: null, lifecycle: "archived", workspace: null, text: null }, signal),
       client.workspaces({ limit: 100, cursor: null }, signal),
       client.health(signal),
+      orchCursor
+        ? readOrchestrationWindow(client, signal, orchCursor.latestSeq).catch((error: unknown) => {
+          // Orchestration is additive; a failure here must not blank the session list.
+          this.store.appendLog(`[rust] orchestration read failed: ${error instanceof Error ? error.message : String(error)}\n`);
+          return null;
+        })
+        : Promise.resolve(null),
     ]);
     signal.throwIfAborted();
+    if (orchCursor) this.orchestrationSequence = orchCursor.latestSeq;
     const sessions = [...active.items, ...recent.items].map(rustSessionInfo);
     this.sequence = Math.min(summary.latestSeq, active.latestSeq, recent.latestSeq, workspaces.latestSeq);
-    this.store.setApiState({ running: true, config: {}, devices: {}, orchestration: {}, projects: workspaces.items.map(item => item.workspace), status: {
+    this.store.setApiState({ running: true, config: {}, devices: {}, orchestration: orchestration ?? {}, projects: workspaces.items.map(item => item.workspace), status: {
       pid, port: Number(new URL(baseUrl).port), bind: "127.0.0.1", sessions, capabilities: health.capabilities,
       metadataRevision: `${pid}:${this.sequence}`,
       workspaceCounts: Object.fromEntries(workspaces.items.map(({ workspace, summary }) => [workspace, { revision: summary.revision, total: summary.total, active: summary.active, archived: summary.archived, attention: summary.attention }])),
@@ -130,8 +141,14 @@ export class RustRuntime {
     let delay = 500;
     try {
       const { client } = this.current();
-      const page = await client.events({ scope: "sessions", afterSeq: this.sequence, limit: 100 }, this.controller.signal);
-      if (page.resyncRequired || page.latestSeq !== this.sequence) await this.refresh();
+      const [sessions, orchestration] = await Promise.all([
+        client.events({ scope: "sessions", afterSeq: this.sequence, limit: 100 }, this.controller.signal),
+        client.events({ scope: "orchestration", afterSeq: this.orchestrationSequence, limit: 100 }, this.controller.signal),
+      ]);
+      if (sessions.resyncRequired || sessions.latestSeq !== this.sequence
+        || orchestration.resyncRequired || orchestration.latestSeq !== this.orchestrationSequence) {
+        await this.refresh();
+      }
     } catch { delay = 2000; }
     finally { this.schedule(delay); }
   }
@@ -217,6 +234,36 @@ export class RustRuntime {
   async request(path: string, init?: { method?: "GET" | "POST"; body?: JsonObject; signal?: AbortSignal; timeoutMs?: number; acceptJsonError?: boolean }): Promise<JsonObject | null> {
     const signal = init?.signal ? AbortSignal.any([init.signal, this.controller.signal]) : this.controller.signal;
     const input = init?.body;
+    if (path === "/_prospero/control/orchestration/action" && init?.method === "POST" && input) {
+      const method = input["method"];
+      if (typeof method !== "string") throw new Error("不支持的编排操作");
+      const result = await orchestrationAction(this.current().client, method, input["params"], signal, init.timeoutMs);
+      await this.refresh(true);
+      return result;
+    }
+    const taskRoute = /^\/_prospero\/control\/orchestration\/task\/([A-Za-z0-9_-]{1,128})$/.exec(path);
+    if (taskRoute && (!init?.method || init.method === "GET")) {
+      return this.current().client.task(taskRoute[1]!, signal) as Promise<JsonObject>;
+    }
+    const runTasksRoute = /^\/_prospero\/control\/orchestration\/run\/([A-Za-z0-9_-]{1,128})\/tasks$/.exec(path);
+    if (runTasksRoute && (!init?.method || init.method === "GET")) {
+      const items = await this.current().client.listTasks(runTasksRoute[1]!, signal);
+      return { items } as JsonObject;
+    }
+    const gateRoute = /^\/_prospero\/control\/orchestration\/gate\/([A-Za-z0-9_-]{1,128})\/resolve$/.exec(path);
+    if (gateRoute && init?.method === "POST" && input) {
+      const decision = input["decision"];
+      if (typeof decision !== "string" || !decision.trim()) throw new Error("决策无效");
+      const gate = await this.current().client.resolveGate(gateRoute[1]!, { decision: decision.trim() }, signal);
+      await this.refresh(true);
+      return gate as unknown as JsonObject;
+    }
+    const settleRoute = /^\/_prospero\/control\/orchestration\/dispatch\/([A-Za-z0-9_-]{1,128})\/settle$/.exec(path);
+    if (settleRoute && init?.method === "POST" && input) {
+      const outcome = await this.current().client.settleDispatch(settleRoute[1]!, settleDispatchInput(input), signal);
+      await this.refresh(true);
+      return outcome as unknown as JsonObject;
+    }
     if (path === "/_prospero/control/session/create" && init?.method === "POST" && input) {
       if (input["kind"] === "pty") {
         if (input["agent"] !== "shell" || input["command"] || input["accountId"] || input["model"]) throw new Error("Rust 当前支持普通 shell 终端，自定义命令尚未接入");

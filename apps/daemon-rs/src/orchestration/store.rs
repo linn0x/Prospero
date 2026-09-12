@@ -26,7 +26,7 @@ const OPERATIONS_RETENTION: i64 = 1_000;
 /// Deterministic fingerprint for the idempotency ledger. It only has to detect
 /// "same operation id, different request" across daemon restarts; it is not a
 /// security boundary, so FNV-1a (stable across processes) suffices.
-fn fingerprint(method: &str, payload: &impl Serialize) -> String {
+pub(super) fn fingerprint(method: &str, payload: &impl Serialize) -> String {
     let mut hasher = DefaultHasher::new();
     hasher.write(method.as_bytes());
     hasher.write(b"\0");
@@ -35,6 +35,13 @@ fn fingerprint(method: &str, payload: &impl Serialize) -> String {
 }
 
 enum Idempotent<T> {
+    Replay(T),
+    Fresh,
+}
+
+/// Public ledger probe result for the worker service, which wraps the raw
+/// dispatch with external side effects (worktree creation, agent session).
+pub enum OperationReplay<T> {
     Replay(T),
     Fresh,
 }
@@ -178,6 +185,51 @@ fn map_dispatch(row: &rusqlite::Row<'_>) -> rusqlite::Result<Dispatch> {
         outcome: row.get("outcome")?,
         started_at: row.get("started_at")?,
         settled_at: row.get("settled_at")?,
+        worktree_path: row.get("worktree_path")?,
+    })
+}
+
+fn map_asset(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorktreeAsset> {
+    let kind: String = row.get("kind")?;
+    let state: String = row.get("state")?;
+    let inspection_raw: Option<String> = row.get("last_inspection")?;
+    let cleanup_raw: Option<String> = row.get("cleanup")?;
+    Ok(WorktreeAsset {
+        id: row.get("id")?,
+        kind: if kind == "run" {
+            WorktreeAssetKind::Run
+        } else {
+            WorktreeAssetKind::Worker
+        },
+        run_id: row.get("run_id")?,
+        task_id: row.get("task_id")?,
+        dispatch_id: row.get("dispatch_id")?,
+        repo: row.get("repo")?,
+        path: row.get("path")?,
+        branch: row.get("branch")?,
+        state: match state.as_str() {
+            "preserved" => WorktreeAssetState::Preserved,
+            "missing" => WorktreeAssetState::Missing,
+            "dirty" => WorktreeAssetState::Dirty,
+            "unmerged" => WorktreeAssetState::Unmerged,
+            "equivalent" => WorktreeAssetState::Equivalent,
+            "safe_to_clean" => WorktreeAssetState::SafeToClean,
+            "cleaned" => WorktreeAssetState::Cleaned,
+            "unknown" => WorktreeAssetState::Unknown,
+            _ => WorktreeAssetState::Active,
+        },
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+        run_deleted_at: row.get("run_deleted_at")?,
+        last_inspection: match inspection_raw {
+            Some(raw) => serde_json::from_str(&raw).unwrap_or(None),
+            None => None,
+        },
+        cleanup: match cleanup_raw {
+            Some(raw) => serde_json::from_str(&raw).unwrap_or(None),
+            None => None,
+        },
+        last_error: row.get("last_error")?,
     })
 }
 
@@ -760,6 +812,172 @@ impl Store {
             .ok_or(Error::NotFound)
     }
 
+    /// Create a bare active run with no tasks (legacy `run.create`); the
+    /// coordinator adds nodes with `task.create` or `graph.apply`.
+    pub fn create_run(&mut self, input: CreateRun) -> Result<Run> {
+        validate_text(&input.objective, 4096, false)?;
+        if let Some(coordinator) = &input.coordinator_session_id {
+            validate_id(coordinator)?;
+        }
+        let now = now();
+        let run = Run {
+            id: new_id("run"),
+            objective: input.objective.trim().to_owned(),
+            status: RunStatus::Active,
+            coordinator_session_id: input.coordinator_session_id,
+            graph_revision: 0,
+            created_at: now,
+            updated_at: now,
+        };
+        let tx = self.connection.transaction()?;
+        tx.execute(
+            "INSERT INTO orch_runs(id,objective,status,coordinator_session_id,graph_revision,created_at,updated_at) \
+             VALUES(?1,?2,'active',?3,0,?4,?4)",
+            params![run.id, run.objective, run.coordinator_session_id, now],
+        )?;
+        Self::emit(&tx, "run.created", &run.id, serde_json::to_value(&run)?)?;
+        tx.commit()?;
+        Ok(run)
+    }
+
+    /// Append a single task to an active run (legacy `task.create`). Edges and
+    /// the cycle are checked over the whole resulting graph.
+    pub fn create_task(&mut self, input: CreateTask) -> Result<Task> {
+        validate_id(&input.run_id)?;
+        validate_text(&input.title, 1024, false)?;
+        validate_text(&input.spec, 8192, false)?;
+        let skills = normalize_skills(&input.skills)?;
+        if input.deps.len() != input.deps.iter().collect::<HashSet<_>>().len() {
+            return Err(invalid("the task lists a duplicate dependency"));
+        }
+        for dep in &input.deps {
+            validate_id(dep)?;
+        }
+        if let Some(parent) = &input.parent_id {
+            validate_id(parent)?;
+        }
+
+        let tx = self.connection.transaction()?;
+        tx.execute_batch("PRAGMA defer_foreign_keys=ON")?;
+        let _run = Self::require_active_run(&tx, &input.run_id)?;
+        let now = now();
+        let id = new_id("task");
+        let candidate = TaskRow {
+            id: id.clone(),
+            run_id: input.run_id.clone(),
+            title: input.title.trim().to_owned(),
+            spec: input.spec.trim().to_owned(),
+            skills,
+            deps: input.deps.clone(),
+            parent_id: input.parent_id.clone(),
+            status: TaskStatus::Pending,
+            result: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut graph: HashMap<String, TaskRow> = Self::run_task_rows(&tx, &input.run_id)?
+            .into_iter()
+            .map(|row| (row.id.clone(), row))
+            .collect();
+        graph.insert(id.clone(), candidate.clone());
+        Self::validate_candidate(&graph)?;
+        Self::insert_task(&tx, &candidate)?;
+        tx.execute(
+            "UPDATE orch_runs SET graph_revision=graph_revision+1,updated_at=?1 WHERE id=?2",
+            params![now, input.run_id],
+        )?;
+        let run = Self::orch_run_from_tx(&tx, &input.run_id)?;
+        Self::emit(&tx, "run.updated", &run.id, serde_json::to_value(&run)?)?;
+        tx.commit()?;
+        Ok(candidate.task())
+    }
+
+    /// Delete a run's history. The directory resource outlives the rows: the
+    /// run's worktree assets are detached (state `preserved`, run_deleted_at
+    /// stamped) rather than deleted; the caller removes disk content only
+    /// through the explicit, freshly re-inspected cleanup path.
+    pub fn delete_run(&mut self, run_id: &str, force: bool) -> Result<RunDeletionResult> {
+        validate_id(run_id)?;
+        let tx = self.connection.transaction()?;
+        let _run = Self::orch_run_from_tx(&tx, run_id)?;
+        let active: i64 = tx.query_row(
+            "SELECT count(*) FROM orch_dispatches WHERE run_id=?1 AND state IN ('starting','running')",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        if active > 0 && !force {
+            return Err(invalid(
+                "the run still has a live worker; stop it or delete with force",
+            ));
+        }
+        if active > 0 {
+            // Forced historical cleanup: converge the dispatch rows but leave
+            // the disk trees indexed for manual recovery.
+            let now = now();
+            let reason =
+                "explicit historical run cleanup; worktree assets preserved for manual recovery";
+            tx.execute(
+                "UPDATE orch_dispatches SET state='abandoned',outcome=?1,settled_at=?2 \
+                 WHERE run_id=?3 AND state IN ('starting','running')",
+                params![reason, now, run_id],
+            )?;
+            tx.execute(
+                "UPDATE orch_tasks SET status='failed',result=?1,updated_at=?2 \
+                 WHERE run_id=?3 AND status='dispatched'",
+                params![reason, now, run_id],
+            )?;
+        }
+        let deleted_task_count: i64 = tx.query_row(
+            "SELECT count(*) FROM orch_tasks WHERE run_id=?",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        let now = now();
+        // Detach assets first so the ids survive the cascade in the result.
+        let mut preserved_ids = Vec::new();
+        {
+            let mut statement = tx.prepare(
+                "SELECT id FROM orch_worktree_assets WHERE run_id=?1 ORDER BY created_at,id",
+            )?;
+            let ids = statement
+                .query_map([run_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            for id in ids {
+                tx.execute(
+                    "UPDATE orch_worktree_assets SET state='preserved',run_deleted_at=COALESCE(run_deleted_at,?1),updated_at=?1,last_error=?2 \
+                     WHERE id=?3 AND cleanup IS NULL AND state<>'missing'",
+                    params![now, "所属 Run 已删除；资产与恢复分支仍保留，需显式检查或清理", id],
+                )?;
+                tx.execute(
+                    "UPDATE orch_worktree_assets SET run_deleted_at=COALESCE(run_deleted_at,?1),updated_at=?1 WHERE id=?2",
+                    params![now, id],
+                )?;
+                let asset = Self::asset_row(&tx, &id)?;
+                Self::emit(
+                    &tx,
+                    "worktree_asset.updated",
+                    &id,
+                    serde_json::to_value(&asset)?,
+                )?;
+                preserved_ids.push(id);
+            }
+        }
+        tx.execute("DELETE FROM orch_runs WHERE id=?", [run_id])?;
+        Self::emit(
+            &tx,
+            "run.deleted",
+            run_id,
+            serde_json::json!({ "id": run_id }),
+        )?;
+        tx.commit()?;
+        Ok(RunDeletionResult {
+            run_id: run_id.to_owned(),
+            deleted_task_count,
+            preserved_worktree_asset_ids: preserved_ids,
+        })
+    }
+
     // ── Tasks ────────────────────────────────────────────────────────────
 
     pub fn task(&mut self, task_id: &str) -> Result<Task> {
@@ -949,6 +1167,53 @@ impl Store {
         .map_err(Error::from)
     }
 
+    /// The live dispatch (starting/running) for a task, if any.
+    pub fn live_dispatch_for_task(&mut self, task_id: &str) -> Result<Option<Dispatch>> {
+        validate_id(task_id)?;
+        let tx = self.connection.transaction()?;
+        Self::active_dispatch(&tx, task_id)
+    }
+
+    /// Probe the idempotency ledger with a caller-owned fingerprint (the worker
+    /// service fingerprints the *request*, since the session id is an output).
+    pub fn probe_operation<T: DeserializeOwned>(
+        &mut self,
+        id: &str,
+        fingerprint: &str,
+    ) -> Result<OperationReplay<T>> {
+        validate_id(id)?;
+        let tx = self.connection.transaction()?;
+        match operation_guard::<T>(&tx, id, fingerprint)? {
+            Idempotent::Replay(value) => Ok(OperationReplay::Replay(value)),
+            Idempotent::Fresh => Ok(OperationReplay::Fresh),
+        }
+    }
+
+    pub fn remember_operation<T: Serialize>(
+        &mut self,
+        id: &str,
+        fingerprint: &str,
+        result: &T,
+    ) -> Result<()> {
+        validate_id(id)?;
+        let tx = self.connection.transaction()?;
+        Self::remember(&tx, id, fingerprint, result)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Active session ids whose workspace is the path or inside it. The cleanup
+    /// path refuses while a live worker may still be writing into the tree.
+    pub fn active_sessions_under(&self, path: &str) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id FROM session_heads WHERE lifecycle='active' \
+             AND (workspace=?1 OR workspace LIKE ?2)",
+        )?;
+        let prefix = format!("{}/%", path.trim_end_matches('/'));
+        let rows = statement.query_map(params![path, prefix], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// The single dispatch entry point. The database enforces at most one live
     /// dispatch per task; readiness and the transition table are re-checked at
     /// this write boundary (ready is only derived, never trusted from the
@@ -958,6 +1223,7 @@ impl Store {
         task_id: &str,
         session_id: &str,
         operation_id: Option<&str>,
+        worktree_path: Option<&str>,
     ) -> Result<SettleOutcome> {
         validate_id(task_id)?;
         validate_id(session_id)?;
@@ -965,9 +1231,12 @@ impl Store {
         if let Some(operation_id) = &operation_id {
             validate_id(operation_id)?;
         }
+        if let Some(path) = worktree_path {
+            validate_text(path, 4096, false)?;
+        }
         let guard_fingerprint = fingerprint(
             "worker.start",
-            &serde_json::json!({"taskId": task_id, "sessionId": session_id}),
+            &serde_json::json!({"taskId": task_id, "sessionId": session_id, "worktreePath": worktree_path}),
         );
         let tx = self.connection.transaction()?;
         if let Some(operation_id) = &operation_id
@@ -1001,9 +1270,9 @@ impl Store {
         let now = now();
         let dispatch_id = new_id("disp");
         tx.execute(
-            "INSERT INTO orch_dispatches(id,run_id,task_id,session_id,state,outcome,started_at,settled_at) \
-             VALUES(?1,?2,?3,?4,'starting',NULL,?5,NULL)",
-            params![dispatch_id, task.run_id, task_id, session_id, now],
+            "INSERT INTO orch_dispatches(id,run_id,task_id,session_id,state,outcome,started_at,settled_at,worktree_path) \
+             VALUES(?1,?2,?3,?4,'starting',NULL,?5,NULL,?6)",
+            params![dispatch_id, task.run_id, task_id, session_id, now, worktree_path],
         )?;
         let task = Self::set_task_status(&tx, task_id, TaskStatus::Dispatched, None)?;
         let dispatch = Self::dispatch_row(&tx, &dispatch_id)?;
@@ -1104,6 +1373,11 @@ impl Store {
             "UPDATE orch_dispatches SET state=?1,outcome=?2,settled_at=?3 WHERE id=?4",
             params![dispatch_state.label(), outcome, now, dispatch_id],
         )?;
+        Self::preserve_dispatch_assets_tx(
+            &tx,
+            dispatch_id,
+            Some("worker 已交付；工作树默认保留，需显式检查或清理"),
+        )?;
         let dispatch = Self::dispatch_row(&tx, dispatch_id)?;
         Self::emit(
             &tx,
@@ -1168,6 +1442,7 @@ impl Store {
             "UPDATE orch_dispatches SET state=?1,outcome=?2,settled_at=?3 WHERE id=?4",
             params![state.label(), outcome_text, now, dispatch_id],
         )?;
+        Self::preserve_dispatch_assets_tx(&tx, dispatch_id, Some(reason))?;
         let dispatch = Self::dispatch_row(&tx, dispatch_id)?;
         let task = Self::task_row(&tx, &dispatch.task_id)?.task();
         Self::emit(
@@ -1213,6 +1488,7 @@ impl Store {
                  WHERE id=(SELECT task_id FROM orch_dispatches WHERE id=?3) AND status='dispatched'",
                 params![reason, now, id],
             )?;
+            Self::preserve_dispatch_assets_tx(&tx, id, Some(reason))?;
             let dispatch = Self::dispatch_row(&tx, id)?;
             Self::emit(
                 &tx,
@@ -1295,6 +1571,7 @@ impl Store {
             "UPDATE orch_runs SET status='completed',updated_at=?1 WHERE id=?2",
             params![now, run_id],
         )?;
+        Self::preserve_run_assets_tx(&tx, run_id, "Run 已完成；工作树默认保留，需显式清理")?;
         let run = Self::orch_run_from_tx(&tx, run_id)?;
         Self::emit(&tx, "run.updated", &run.id, serde_json::to_value(&run)?)?;
         tx.commit()?;
@@ -1334,10 +1611,303 @@ impl Store {
             "UPDATE orch_runs SET status='abandoned',updated_at=?1 WHERE id=?2",
             params![now, run_id],
         )?;
+        Self::preserve_run_assets_tx(&tx, run_id, "Run 已放弃；工作树默认保留，需显式清理")?;
         let run = Self::orch_run_from_tx(&tx, run_id)?;
         Self::emit(&tx, "run.updated", &run.id, serde_json::to_value(&run)?)?;
         tx.commit()?;
         Ok(run)
+    }
+
+    // ── Worktree assets (Stage 8) ────────────────────────────────────────
+
+    /// Persist an external worktree directory immediately after `git worktree
+    /// add` succeeds and *before* the worker session is created, so a crash in
+    /// the narrow launch window can never orphan a directory.
+    pub fn register_worktree_asset(&mut self, input: RegisterWorktree) -> Result<WorktreeAsset> {
+        validate_id(&input.run_id)?;
+        validate_text(&input.repo, 4096, false)?;
+        validate_text(&input.path, 4096, false)?;
+        if let Some(task_id) = &input.task_id {
+            validate_id(task_id)?;
+        }
+        if let Some(branch) = &input.branch {
+            validate_text(branch, 256, false)?;
+        }
+        // The run must exist; the task (for worker assets) must belong to it.
+        let tx = self.connection.transaction()?;
+        let _run = Self::orch_run_from_tx(&tx, &input.run_id)?;
+        if let Some(task_id) = &input.task_id {
+            let task = Self::task_row(&tx, task_id)?;
+            if task.run_id != input.run_id {
+                return Err(invalid("worktree task belongs to another run"));
+            }
+        }
+        let now = now();
+        let id = new_id("wt");
+        tx.execute(
+            "INSERT INTO orch_worktree_assets \
+             (id,kind,run_id,task_id,dispatch_id,repo,path,branch,state,created_at,updated_at,run_deleted_at,last_inspection,cleanup,last_error) \
+             VALUES(?1,?2,?3,?4,NULL,?5,?6,?7,'active',?8,?8,NULL,NULL,NULL,NULL)",
+            params![
+                id,
+                asset_kind_label(input.kind),
+                input.run_id,
+                input.task_id,
+                input.repo.trim(),
+                input.path.trim(),
+                input.branch,
+                now
+            ],
+        )?;
+        let asset = Self::asset_row(&tx, &id)?;
+        Self::emit(
+            &tx,
+            "worktree_asset.updated",
+            &id,
+            serde_json::to_value(&asset)?,
+        )?;
+        tx.commit()?;
+        Ok(asset)
+    }
+
+    pub fn worktree_asset(&self, asset_id: &str) -> Result<WorktreeAsset> {
+        validate_id(asset_id)?;
+        self.connection
+            .query_row(
+                "SELECT * FROM orch_worktree_assets WHERE id=?",
+                [asset_id],
+                map_asset,
+            )
+            .optional()?
+            .ok_or(Error::NotFound)
+    }
+
+    pub fn list_worktree_assets(&self, run_id: Option<&str>) -> Result<Vec<WorktreeAsset>> {
+        let mut statement = self.connection.prepare(
+            "SELECT * FROM orch_worktree_assets WHERE ?1 IS NULL OR run_id=?1 \
+             ORDER BY created_at DESC,id DESC",
+        )?;
+        let rows = statement.query_map([run_id], map_asset)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn link_worktree_dispatch(
+        &mut self,
+        asset_id: &str,
+        dispatch_id: &str,
+    ) -> Result<WorktreeAsset> {
+        validate_id(asset_id)?;
+        validate_id(dispatch_id)?;
+        let tx = self.connection.transaction()?;
+        let asset = Self::asset_row(&tx, asset_id)?;
+        let dispatch = Self::dispatch_row(&tx, dispatch_id)?;
+        if asset.kind != WorktreeAssetKind::Worker
+            || asset.run_id != dispatch.run_id
+            || asset.task_id.as_deref() != Some(dispatch.task_id.as_str())
+        {
+            return Err(invalid("worktree asset does not belong to the dispatch"));
+        }
+        tx.execute(
+            "UPDATE orch_worktree_assets SET dispatch_id=?1,updated_at=?2 WHERE id=?3",
+            params![dispatch_id, now(), asset_id],
+        )?;
+        let asset = Self::asset_row(&tx, asset_id)?;
+        Self::emit(
+            &tx,
+            "worktree_asset.updated",
+            asset_id,
+            serde_json::to_value(&asset)?,
+        )?;
+        tx.commit()?;
+        Ok(asset)
+    }
+
+    pub fn record_worktree_inspection(
+        &mut self,
+        asset_id: &str,
+        inspection: &WorktreeInspection,
+    ) -> Result<WorktreeAsset> {
+        validate_id(asset_id)?;
+        let tx = self.connection.transaction()?;
+        let asset = Self::asset_row(&tx, asset_id)?;
+        // A path that is still missing after an explicit cleanup is expected;
+        // keep the `cleaned` state instead of reporting a user-caused loss.
+        let state = if asset.cleanup.is_some() && inspection.state == WorktreeAssetState::Missing {
+            WorktreeAssetState::Cleaned
+        } else {
+            inspection.state
+        };
+        let last_error = if state == WorktreeAssetState::Unknown {
+            inspection.message.clone()
+        } else {
+            asset.last_error
+        };
+        tx.execute(
+            "UPDATE orch_worktree_assets SET state=?1,last_inspection=?2,updated_at=?3,last_error=?4 WHERE id=?5",
+            params![
+                asset_state_label(state),
+                serde_json::to_string(inspection)?,
+                inspection.checked_at,
+                last_error,
+                asset_id
+            ],
+        )?;
+        let asset = Self::asset_row(&tx, asset_id)?;
+        Self::emit(
+            &tx,
+            "worktree_asset.updated",
+            asset_id,
+            serde_json::to_value(&asset)?,
+        )?;
+        tx.commit()?;
+        Ok(asset)
+    }
+
+    pub fn mark_worktree_cleaned(
+        &mut self,
+        asset_id: &str,
+        cleanup: &WorktreeCleanup,
+    ) -> Result<WorktreeAsset> {
+        validate_id(asset_id)?;
+        let tx = self.connection.transaction()?;
+        tx.execute(
+            "UPDATE orch_worktree_assets SET state='cleaned',cleanup=?1,updated_at=?2,last_error=?3 WHERE id=?4",
+            params![
+                serde_json::to_string(cleanup)?,
+                cleanup.removed_at,
+                cleanup.warning,
+                asset_id
+            ],
+        )?;
+        let asset = Self::asset_row(&tx, asset_id)?;
+        Self::emit(
+            &tx,
+            "worktree_asset.updated",
+            asset_id,
+            serde_json::to_value(&asset)?,
+        )?;
+        tx.commit()?;
+        Ok(asset)
+    }
+
+    /// Mark an asset `preserved` (default lifetime outcome after a dispatch or
+    /// run settles). Already-cleaned or missing assets are left untouched.
+    pub fn preserve_worktree_asset(
+        &mut self,
+        asset_id: &str,
+        reason: Option<&str>,
+    ) -> Result<WorktreeAsset> {
+        validate_id(asset_id)?;
+        if let Some(reason) = reason {
+            validate_text(reason, 8192, false)?;
+        }
+        let tx = self.connection.transaction()?;
+        let asset = Self::asset_row(&tx, asset_id)?;
+        if asset.cleanup.is_some() || asset.state == WorktreeAssetState::Missing {
+            return Ok(asset);
+        }
+        tx.execute(
+            "UPDATE orch_worktree_assets SET state='preserved',updated_at=?1,last_error=?2 WHERE id=?3",
+            params![now(), reason, asset_id],
+        )?;
+        let asset = Self::asset_row(&tx, asset_id)?;
+        Self::emit(
+            &tx,
+            "worktree_asset.updated",
+            asset_id,
+            serde_json::to_value(&asset)?,
+        )?;
+        tx.commit()?;
+        Ok(asset)
+    }
+
+    pub fn preserve_worktrees_for_dispatch(
+        &mut self,
+        dispatch_id: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        validate_id(dispatch_id)?;
+        if let Some(reason) = reason {
+            validate_text(reason, 8192, false)?;
+        }
+        let tx = self.connection.transaction()?;
+        Self::preserve_dispatch_assets_tx(&tx, dispatch_id, reason)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn preserve_worktrees_for_run(&mut self, run_id: &str, reason: &str) -> Result<()> {
+        validate_id(run_id)?;
+        validate_text(reason, 8192, false)?;
+        let tx = self.connection.transaction()?;
+        Self::preserve_run_assets_tx(&tx, run_id, reason)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn asset_row(tx: &Transaction<'_>, asset_id: &str) -> Result<WorktreeAsset> {
+        tx.query_row(
+            "SELECT * FROM orch_worktree_assets WHERE id=?",
+            [asset_id],
+            map_asset,
+        )
+        .optional()?
+        .ok_or(Error::NotFound)
+    }
+
+    /// Transaction-local version of the preserve transitions above; used by the
+    /// dispatch/run state changes so the asset marking commits atomically with
+    /// the settling state. Cleaned and missing assets are never revived.
+    fn preserve_dispatch_assets_tx(
+        tx: &Transaction<'_>,
+        dispatch_id: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let stamp = now();
+        let mut statement = tx.prepare(
+            "UPDATE orch_worktree_assets SET state='preserved',updated_at=?1,last_error=?2 \
+             WHERE dispatch_id=?3 AND cleanup IS NULL AND state<>'missing' RETURNING id",
+        )?;
+        let ids = statement
+            .query_map(params![stamp, reason, dispatch_id], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        for id in ids {
+            let asset = Self::asset_row(tx, &id)?;
+            Self::emit(
+                tx,
+                "worktree_asset.updated",
+                &id,
+                serde_json::to_value(&asset)?,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn preserve_run_assets_tx(tx: &Transaction<'_>, run_id: &str, reason: &str) -> Result<()> {
+        let stamp = now();
+        let mut statement = tx.prepare(
+            "UPDATE orch_worktree_assets SET state='preserved',updated_at=?1,last_error=?2 \
+             WHERE run_id=?3 AND cleanup IS NULL AND state<>'missing' RETURNING id",
+        )?;
+        let ids = statement
+            .query_map(params![stamp, reason, run_id], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        for id in ids {
+            let asset = Self::asset_row(tx, &id)?;
+            Self::emit(
+                tx,
+                "worktree_asset.updated",
+                &id,
+                serde_json::to_value(&asset)?,
+            )?;
+        }
+        Ok(())
     }
 
     // ── Gates ────────────────────────────────────────────────────────────
@@ -1574,6 +2144,27 @@ fn value_label(status: GateStatus) -> &'static str {
         GateStatus::Pending => "pending",
         GateStatus::Resolved => "resolved",
         GateStatus::Cancelled => "cancelled",
+    }
+}
+
+fn asset_kind_label(kind: WorktreeAssetKind) -> &'static str {
+    match kind {
+        WorktreeAssetKind::Run => "run",
+        WorktreeAssetKind::Worker => "worker",
+    }
+}
+
+fn asset_state_label(state: WorktreeAssetState) -> &'static str {
+    match state {
+        WorktreeAssetState::Active => "active",
+        WorktreeAssetState::Preserved => "preserved",
+        WorktreeAssetState::Missing => "missing",
+        WorktreeAssetState::Dirty => "dirty",
+        WorktreeAssetState::Unmerged => "unmerged",
+        WorktreeAssetState::Equivalent => "equivalent",
+        WorktreeAssetState::SafeToClean => "safe_to_clean",
+        WorktreeAssetState::Cleaned => "cleaned",
+        WorktreeAssetState::Unknown => "unknown",
     }
 }
 
