@@ -40,12 +40,31 @@ if argv == catalog_args:
     sys.stdout.flush()
     sys.exit(0)
 
-# Turn process: announce init, capture argv, then idle.
+# Turn process: announce init, capture argv, answer live model switches.
 sys.stdout.write(json.dumps({"type": "system", "subtype": "init", "session_id": "fake-launch"}) + "\\n")
 sys.stdout.flush()
 with open(os.environ["CAPTURE"], "a", encoding="utf-8") as handle:
     handle.write(json.dumps(argv) + "\\n")
-sys.stdin.readline()
+import threading
+def controls():
+    while True:
+        raw = sys.stdin.readline()
+        if not raw:
+            break
+        try:
+            frame = json.loads(raw)
+        except Exception:
+            continue
+        subtype = frame.get("request", {}).get("subtype")
+        if subtype in ("set_model", "apply_flag_settings"):
+            path = os.environ.get("CONTROLS")
+            if path:
+                with open(path, "a", encoding="utf-8") as handle:
+                    handle.write(raw)
+            sys.stdout.write(json.dumps({"type": "control_response", "response": {
+                "subtype": "success", "request_id": frame["request_id"], "response": {}}}) + "\\n")
+            sys.stdout.flush()
+threading.Thread(target=controls, daemon=True).start()
 time.sleep(3600)
 `);
   chmodSync(cli, 0o755);
@@ -58,12 +77,13 @@ function fixture() {
   const store = new StateStore(resolve(directory, "desktop"), "api");
   const runtime = new RustRuntime(store, binary, dataDir);
   fixtures.push({ directory, runtime });
-  return { directory, runtime };
+  return { directory, runtime, store };
 }
 
 describe.skipIf(process.platform === "win32")("Launch model catalog through the Rust bridge", () => {
   let previousBin: string | undefined;
   let previousCapture: string | undefined;
+  let previousControls: string | undefined;
 
   afterEach(async () => {
     for (const { directory, runtime } of fixtures.splice(0)) {
@@ -74,6 +94,11 @@ describe.skipIf(process.platform === "win32")("Launch model catalog through the 
     else process.env["PROSPERO_CLAUDE_BIN"] = previousBin;
     if (previousCapture === undefined) delete process.env["CAPTURE"];
     else process.env["CAPTURE"] = previousCapture;
+    if (previousControls === undefined) delete process.env["CONTROLS"];
+    else process.env["CONTROLS"] = previousControls;
+    previousBin = undefined;
+    previousCapture = undefined;
+    previousControls = undefined;
   });
 
   it("serves the catalog for native claude and rejects other agents", async () => {
@@ -141,14 +166,82 @@ describe.skipIf(process.platform === "win32")("Launch model catalog through the 
     expect(argv[argv.indexOf("--model") + 1]).toBe("opus[1m]");
     expect(argv).toContain("--effort");
     expect(argv[argv.indexOf("--effort") + 1]).toBe("high");
+  }, 60_000);
 
-    // Invalid selections are rejected in the bridge before reaching the daemon.
-    for (const body of [
-      { kind: "structured", agent: "claude", cwd: workspace, approvalPolicy: "standard", accountId: "native-claude", model: "x".repeat(161) },
-      { kind: "structured", agent: "claude", cwd: workspace, approvalPolicy: "standard", accountId: "native-claude", effort: "high\n" },
-    ]) {
-      await expect(runtime.request("/_prospero/control/session/create", { method: "POST", body }))
-        .rejects.toThrow(/无效/);
+  it("switches the live session model and projects agentControls", async () => {
+    const { directory, runtime, store } = fixture();
+    const workspace = resolve(directory, "workspace");
+    mkdirSync(workspace, { recursive: true });
+    const capture = resolve(directory, "argv.jsonl");
+    const controls = resolve(directory, "controls.jsonl");
+    previousBin = process.env["PROSPERO_CLAUDE_BIN"];
+    previousCapture = process.env["CAPTURE"];
+    previousControls = process.env["CONTROLS"];
+    process.env["PROSPERO_CLAUDE_BIN"] = installFakeClaude(directory, capture);
+    process.env["CAPTURE"] = capture;
+    process.env["CONTROLS"] = controls;
+    expect((await runtime.start()).ok).toBe(true);
+
+    const created = await runtime.request("/_prospero/control/session/create", {
+      method: "POST",
+      body: {
+        kind: "structured", agent: "claude", cwd: workspace, approvalPolicy: "standard",
+        accountId: "native-claude",
+      },
+    });
+    const sessionId = String(created!["id"]);
+
+    await runtime.request(`/_prospero/control/session/${sessionId}/interact`, {
+      method: "POST",
+      body: { type: "chat.send", text: "go" },
+    });
+    await waitForFile(capture);
+
+    // GET combines the fresh catalog with the (empty) persisted selection.
+    const catalog = await runtime.request(
+      `/_prospero/control/session/${sessionId}/models`,
+    );
+    expect((catalog!["models"] as unknown[]).length).toBe(2);
+    expect(catalog!["currentModel"]).toBe("default");
+
+    // Switch while the turn process is alive; it answers the native frames.
+    const result = await runtime.request(
+      `/_prospero/control/session/${sessionId}/models`,
+      { method: "POST", body: { model: "opus[1m]", effort: "max" } },
+    );
+    expect(result!["currentModel"]).toBe("opus[1m]");
+    expect(result!["currentEffort"]).toBe("max");
+
+    await waitForFile(controls);
+    const frames = readFileSync(controls, "utf8");
+    expect(frames).toContain('"subtype":"set_model"');
+    expect(frames).toContain('"model":"opus[1m]"');
+    expect(frames).toContain('"subtype":"apply_flag_settings"');
+    expect(frames).toContain('"effortLevel":"max"');
+
+    // The refreshed projection exposes agentControls to the ModelSwitcher.
+    const projected = store.snapshot().daemon.sessions
+      .find((session) => session.id === sessionId);
+    expect(projected?.agentControls).toMatchObject({
+      compact: false, model: true, mode: true,
+      currentModel: "opus[1m]", currentEffort: "max", currentMode: "default",
+    });
+
+    // Unknown model and unsupported effort are rejected by the daemon;
+    // malformed selections are rejected in the bridge first.
+    await expect(runtime.request(
+      `/_prospero/control/session/${sessionId}/models`,
+      { method: "POST", body: { model: "ghost" } },
+    )).rejects.toThrow(/模型不可用/);
+    await expect(runtime.request(
+      `/_prospero/control/session/${sessionId}/models`,
+      { method: "POST", body: { model: "opus[1m]", effort: "high" } },
+    )).rejects.toThrow(/不支持推理强度/);
+    for (const body of [{ model: "x".repeat(161) }, { model: "default", effort: "high\n" }]) {
+      await expect(runtime.request(
+        `/_prospero/control/session/${sessionId}/models`,
+        { method: "POST", body },
+      )).rejects.toThrow(/无效/);
     }
   }, 60_000);
 });

@@ -8,11 +8,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
+use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 use super::store::{ApprovalPolicy, PermissionMode};
 use crate::error::{Error, Result};
@@ -101,6 +103,8 @@ pub(super) enum AdapterEvent {
 
 pub(super) struct ClaudeTurn {
     stdin: mpsc::Sender<(String, Option<oneshot::Sender<()>>)>,
+    /// Live control requests awaiting their correlated `control_response`.
+    controls: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
     events: Option<mpsc::Receiver<AdapterEvent>>,
     child_pid: u32,
     kill: Box<dyn Fn() + Send + Sync>,
@@ -114,6 +118,9 @@ fn binary() -> String {
 const CATALOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Mirrors the status-probe output cap.
 const CATALOG_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Bounds a live-turn control request (model/effort switch).
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Fetches the launch model catalog without running a user turn: a headless
 /// CLI process is started, sent a single `initialize` control request, and
@@ -179,54 +186,7 @@ pub(super) async fn fetch_launch_catalog() -> Result<Vec<crate::agent::LaunchMod
             let payload = envelope
                 .get("response")
                 .ok_or_else(|| Error::Invalid("无法读取 Claude 模型目录".into()))?;
-            let raw_models = payload
-                .get("models")
-                .and_then(Value::as_array)
-                .ok_or_else(|| Error::Invalid("Claude 没有返回可选模型".into()))?;
-            let mut models = Vec::new();
-            for (index, raw) in raw_models.iter().enumerate() {
-                let id = raw
-                    .get("value")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                if id.is_empty() || id.chars().count() > 160 {
-                    continue;
-                }
-                let label = raw
-                    .get("displayName")
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or(&id)
-                    .chars()
-                    .take(160)
-                    .collect::<String>();
-                let description = raw
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .map(|value| value.chars().take(1000).collect::<String>());
-                let supported_efforts = raw
-                    .get("supportedEffortLevels")
-                    .and_then(Value::as_array)
-                    .map(|levels| {
-                        levels
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(|level| level.chars().take(80).collect::<String>())
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                models.push(crate::agent::LaunchModelInfo {
-                    id,
-                    label,
-                    description,
-                    supported_efforts,
-                    is_default: index == 0,
-                });
-            }
-            if models.is_empty() {
-                return Err(Error::Invalid("Claude 没有返回可选模型".into()));
-            }
+            let models = parse_catalog_models(payload)?;
             return Ok(models);
         }
         Err(Error::Invalid("无法读取 Claude 模型目录".into()))
@@ -246,6 +206,61 @@ pub(super) async fn fetch_launch_catalog() -> Result<Vec<crate::agent::LaunchMod
             Err(Error::Invalid("读取 Claude 模型目录超时".into()))
         }
     }
+}
+
+/// Parses the `models` array from an `initialize` control_response payload
+/// into the public catalog shape. Shared by the launch handshake and the
+/// in-session live catalog request.
+fn parse_catalog_models(payload: &Value) -> Result<Vec<crate::agent::LaunchModelInfo>> {
+    let raw_models = payload
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::Invalid("Claude 没有返回可选模型".into()))?;
+    let mut models = Vec::new();
+    for (index, raw) in raw_models.iter().enumerate() {
+        let id = raw
+            .get("value")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if id.is_empty() || id.chars().count() > 160 {
+            continue;
+        }
+        let label = raw
+            .get("displayName")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&id)
+            .chars()
+            .take(160)
+            .collect::<String>();
+        let description = raw
+            .get("description")
+            .and_then(Value::as_str)
+            .map(|value| value.chars().take(1000).collect::<String>());
+        let supported_efforts = raw
+            .get("supportedEffortLevels")
+            .and_then(Value::as_array)
+            .map(|levels| {
+                levels
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|level| level.chars().take(80).collect::<String>())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        models.push(crate::agent::LaunchModelInfo {
+            id,
+            label,
+            description,
+            supported_efforts,
+            is_default: index == 0,
+        });
+    }
+    if models.is_empty() {
+        return Err(Error::Invalid("Claude 没有返回可选模型".into()));
+    }
+    Ok(models)
 }
 
 #[cfg(unix)]
@@ -323,6 +338,9 @@ pub(super) fn spawn_turn(
 
     let (frames_tx, mut frames_rx) = mpsc::channel::<(String, Option<oneshot::Sender<()>>)>(32);
     let (events_tx, events_rx) = mpsc::channel::<AdapterEvent>(64);
+    // request_id -> waiter for the CLI's correlated `control_response`.
+    let controls: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     // Serialize stdin writes (prompts, steers and permission responses). An
     // optional ack lets a steer wait for the actual write so a broken pipe
@@ -353,6 +371,7 @@ pub(super) fn spawn_turn(
     // Read and translate the JSONL stream.
     let auto = options.policy == ApprovalPolicy::Auto;
     let reader_writer = frames_tx.clone();
+    let reader_controls = controls.clone();
     tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         let mut translator = Translator::default();
@@ -360,6 +379,21 @@ pub(super) fn spawn_turn(
             let Ok(message) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
+            // Correlate replies to our own control_requests (set_model /
+            // apply_flag_settings) before the translator ignores them.
+            if message.get("type").and_then(Value::as_str) == Some("control_response")
+                && let Some(request_id) = message
+                    .get("response")
+                    .and_then(|r| r.get("request_id"))
+                    .and_then(Value::as_str)
+                && let Some(waiter) = reader_controls.lock().await.remove(request_id)
+            {
+                let envelope = message
+                    .get("response")
+                    .cloned()
+                    .unwrap_or_else(|| message.clone());
+                let _ = waiter.send(envelope);
+            }
             for outgoing in translator.feed(message, auto, &reader_writer) {
                 if events_tx.send(outgoing).await.is_err() {
                     return;
@@ -391,6 +425,7 @@ pub(super) fn spawn_turn(
 
     Ok(ClaudeTurn {
         stdin: frames_tx,
+        controls,
         events: Some(events_rx),
         child_pid,
         kill: kill_group,
@@ -432,6 +467,65 @@ impl ClaudeTurn {
 
     pub(super) fn kill(&self) {
         (self.kill)();
+    }
+
+    /// Switch the live turn's model/effort via the CLI's control channel.
+    /// Persisted selections already apply to the next turn through argv;
+    /// this forwards the switch to the running process as well, mirroring
+    /// the legacy adapter's `setModel`/`applyFlagSettings`.
+    pub(super) async fn apply_selection(&self, model: &str, effort: Option<&str>) -> Result<()> {
+        self.control_request(serde_json::json!({"subtype": "set_model", "model": model}))
+            .await?;
+        if let Some(effort) = effort {
+            self.control_request(serde_json::json!({
+                "subtype": "apply_flag_settings",
+                "settings": {"effortLevel": effort}
+            }))
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Writes one control request and waits for the correlated success
+    /// `control_response` (the SDK correlates by request_id the same way).
+    async fn control_request(&self, request: Value) -> Result<Value> {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let (reply, reply_rx) = oneshot::channel();
+        self.controls.lock().await.insert(request_id.clone(), reply);
+        let frame = serde_json::json!({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": request,
+        })
+        .to_string();
+        let (ack, ack_rx) = oneshot::channel();
+        if self.stdin.send((frame, Some(ack))).await.is_err() {
+            self.controls.lock().await.remove(&request_id);
+            return Err(Error::Closed);
+        }
+        if ack_rx.await.is_err() {
+            self.controls.lock().await.remove(&request_id);
+            return Err(Error::Closed);
+        }
+        let envelope = match tokio::time::timeout(CONTROL_TIMEOUT, reply_rx).await {
+            Ok(Ok(envelope)) => envelope,
+            Ok(Err(_)) => return Err(Error::Closed),
+            Err(_) => {
+                self.controls.lock().await.remove(&request_id);
+                return Err(Error::Invalid("Claude 模型切换超时".into()));
+            }
+        };
+        if envelope.get("subtype").and_then(Value::as_str) == Some("success") {
+            Ok(envelope.get("response").cloned().unwrap_or(Value::Null))
+        } else {
+            let detail = envelope
+                .get("message")
+                .or_else(|| envelope.get("error"))
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .unwrap_or("Claude 拒绝了模型切换");
+            Err(Error::Invalid(detail.chars().take(500).collect()))
+        }
     }
 
     #[allow(dead_code)]

@@ -188,6 +188,50 @@ impl Store {
         Ok(())
     }
 
+    /// Persist an in-session model/effort switch. The selection applies to
+    /// the next chained turn via argv; the live turn is notified separately.
+    pub(crate) fn set_agent_selection(
+        &mut self,
+        id: &str,
+        model: &str,
+        effort: Option<&str>,
+    ) -> Result<(String, Option<String>)> {
+        crate::database::validate_id(id)?;
+        let model = normalize_selection(Some(model.to_owned()), 160, "模型无效")?.unwrap();
+        let effort = normalize_selection(effort.map(str::to_owned), 80, "思考强度无效")?;
+        let run = self.agent_run(id)?;
+        if !run.active {
+            return Err(Error::Conflict);
+        }
+        self.connection.execute(
+            "UPDATE agent_runs SET model=?1, effort=?2 WHERE session_id=?3",
+            params![model, effort, id],
+        )?;
+        Ok((model, effort))
+    }
+
+    /// Active structured sessions' persisted selections, for the desktop
+    /// `agentControls` projection in the session list.
+    pub(crate) fn agent_controls(&self) -> Result<Vec<crate::agent::SessionAgentControls>> {
+        let mut statement = self.connection.prepare(
+            "SELECT session_id,permission_mode,model,effort FROM agent_runs WHERE active=1",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let mode: String = row.get(1)?;
+            Ok(crate::agent::SessionAgentControls {
+                session_id: row.get(0)?,
+                compact: false,
+                model: true,
+                mode: true,
+                current_model: row.get(2)?,
+                current_effort: row.get(3)?,
+                current_mode: Some(mode),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Error::from)
+    }
+
     pub(crate) fn begin_agent_turn(&mut self, id: &str) -> Result<(i64, Option<String>)> {
         let run = self.agent_run(id)?;
         if !run.active {

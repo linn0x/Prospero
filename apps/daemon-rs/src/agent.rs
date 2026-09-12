@@ -178,6 +178,61 @@ pub struct QuestionDecision {
 
 #[derive(Debug, Deserialize, Serialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentModelSelection {
+    pub model: String,
+    #[serde(default)]
+    pub effort: Option<String>,
+}
+
+/// Result of a successful in-session model switch.
+#[derive(Debug, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct AgentModelSelectionResult {
+    pub current_model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_effort: Option<String>,
+}
+
+/// In-session model catalog (mirrors the legacy `agent.models` payload):
+/// fresh catalog plus the session's persisted current selection.
+#[derive(Debug, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct AgentModelCatalog {
+    pub models: Vec<LaunchModelInfo>,
+    pub current_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_effort: Option<String>,
+}
+
+/// Per-session model/mode control flags projected into the desktop session
+/// list (`agentControls`). Compact is not implemented by the Rust daemon.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct SessionAgentControls {
+    pub session_id: String,
+    pub compact: bool,
+    pub model: bool,
+    pub mode: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_mode: Option<String>,
+}
+
+#[derive(Debug, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct AgentControlsProjection {
+    pub controls: Vec<SessionAgentControls>,
+}
+
+#[derive(Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentModeSelection {
     pub mode: String,
 }
