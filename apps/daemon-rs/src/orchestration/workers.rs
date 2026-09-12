@@ -44,22 +44,41 @@ fn to_base36(mut value: u128) -> String {
 
 /// Adapted worker brief. Without the `prospero` CLI there is no self-delivery;
 /// the operator records the result manually, which the final line makes
-/// explicit so the worker does not invent a command.
-fn worker_prompt(task: &Task, session_id: &str, cwd: &str, coordinator: Option<&str>) -> String {
-    [
-        "你是 Prospero 编排中的 worker。只处理下面这一个任务，不要自行创建或派发其他 worker。",
-        &format!("任务 ID: {}", task.id),
-        &format!("会话 ID: {session_id}"),
-        &format!("协调者会话: {}", coordinator.unwrap_or("未指定")),
-        &format!("工作目录: {cwd}"),
-        &format!("任务: {}", task.title),
-        &format!("要求:\n{}", task.spec),
-        "完成并自行验证后，在最终回复中给出简短交付摘要（改了什么、如何验证）；",
-        "当前 Rust 模式没有 prospero CLI，请勿伪造命令；由操作者在 Prospero 界面对任务做人工交付（完成/失败）。",
-        "如果无法完成，在最终回复中说明原因与下一步，由操作者标记失败。",
-        "仅停止、空闲或退出不会把任务标记为完成。",
-    ]
-    .join("\n")
+/// explicit so the worker does not invent a command. Bound skills are listed
+/// as `$name` mentions; the agent send path expands them against the worker
+/// cwd into full SKILL.md contents (same portable-skill flow as the composer).
+fn worker_prompt(
+    task: &Task,
+    session_id: &str,
+    cwd: &str,
+    coordinator: Option<&str>,
+    skills: &[String],
+) -> String {
+    let mut lines = vec![
+        "你是 Prospero 编排中的 worker。只处理下面这一个任务，不要自行创建或派发其他 worker。"
+            .to_string(),
+        format!("任务 ID: {}", task.id),
+        format!("会话 ID: {session_id}"),
+        format!("协调者会话: {}", coordinator.unwrap_or("未指定")),
+        format!("工作目录: {cwd}"),
+        format!("任务: {}", task.title),
+    ];
+    if !skills.is_empty() {
+        let list = skills
+            .iter()
+            .map(|skill| format!("${skill}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        lines.push(format!("显式 Skills: {list}"));
+    }
+    lines.push(format!("要求:\n{}", task.spec));
+    lines.extend([
+        "完成并自行验证后，在最终回复中给出简短交付摘要（改了什么、如何验证）；".to_string(),
+        "当前 Rust 模式没有 prospero CLI，请勿伪造命令；由操作者在 Prospero 界面对任务做人工交付（完成/失败）。".to_string(),
+        "如果无法完成，在最终回复中说明原因与下一步，由操作者标记失败。".to_string(),
+        "仅停止、空闲或退出不会把任务标记为完成。".to_string(),
+    ]);
+    lines.join("\n")
 }
 
 fn canonical(path: &Path) -> PathBuf {
@@ -179,6 +198,40 @@ pub async fn start_worker(
             .into_owned()
     };
 
+    // ── Explicit skill bindings (strict: every name must resolve) ──────────
+    // Mirrors legacy dispatch: undeclared `$mentions` in the spec are
+    // rejected, and bound skills must exist and be readable in the worker cwd.
+    let skill_names = {
+        let worker_cwd = worker_cwd.clone();
+        let spec = task.spec.clone();
+        let requested = task.skills.clone();
+        match tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+            crate::skills::assert_mentions_bound(&spec, &requested)?;
+            let resolved = crate::skills::resolve_explicit_skills(&worker_cwd, &requested)?;
+            Ok(resolved.into_iter().map(|skill| skill.name).collect())
+        })
+        .await
+        .map_err(|_| Error::Closed)?
+        {
+            Ok(names) => names,
+            Err(error) => {
+                // The worktree already exists on disk and is registered; a
+                // strict skill failure must preserve it rather than orphan it.
+                if let Some(asset) = &asset {
+                    let id = asset.id.clone();
+                    let message = format!(
+                        "worker Skill 解析失败；已保留工作树和分支：{}",
+                        error_message(&error)
+                    );
+                    let _ = database
+                        .call(move |store| store.preserve_worktree_asset(&id, Some(&message)))
+                        .await;
+                }
+                return Err(error);
+            }
+        }
+    };
+
     // ── Agent session ──────────────────────────────────────────────────────
     let title = {
         let raw = format!("worker {}", task.title);
@@ -255,6 +308,7 @@ pub async fn start_worker(
         &head.id,
         &worker_cwd,
         run.coordinator_session_id.as_deref(),
+        &skill_names,
     );
     if let Err(error) = agents.send(&head.id, prompt).await {
         let reason = format!("worker prompt delivery failed: {}", error_message(&error));

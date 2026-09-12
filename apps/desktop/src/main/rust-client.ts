@@ -6,8 +6,9 @@ import type { AgentSend, CreateAgentSession, PermissionDecision } from "@prosper
 import type {
   AbandonRun, ApplyTaskGraph, CancelTask, CleanupWorktree, CompleteRun, CreateGate,
   CreateRun, CreateRunGraph, CreateTask, Dispatch, Gate, GraphMutationResult, ResolveGate,
-  Run, RunDeletionResult, RunSnapshot, SettleDispatch, SettleOutcome, StartWorker, StopWorker,
-  Task, WorktreeAsset, WorktreeCleanupResult, WorktreeInspection, WorkerStartOutcome,
+  Run, RunDeletionResult, RunSnapshot, SettleDispatch, SettleOutcome, Skill, SkillSuggestion,
+  StartWorker, StopWorker, Task, WorktreeAsset, WorktreeCleanupResult, WorktreeInspection,
+  WorkerStartOutcome,
 } from "@prospero/protocol/rust-daemon";
 
 const MAX_BYTES = 2 * 1024 * 1024;
@@ -247,5 +248,14 @@ export class RustClient {
   }
   createGate(runId: string, input: CreateGate, signal: AbortSignal | null = null): Promise<Gate> {
     return this.json(`/v1/runs/${id(runId)}/gates`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
+  }
+
+  // ── Skills ──────────────────────────────────────────────────────────────
+  listSkills(cwd: string, signal: AbortSignal | null = null): Promise<Skill[]> {
+    return this.json(`/v1/skills?cwd=${encodeURIComponent(cwd)}`, { signal }).then(page => (page as { items: Skill[] }).items);
+  }
+  skillSuggestions(sessionId: string, query: string, signal: AbortSignal | null = null): Promise<SkillSuggestion[]> {
+    const params = new URLSearchParams({ kind: "skill", query });
+    return this.json(`/v1/agent-sessions/${id(sessionId)}/suggestions?${params}`, { signal }).then(page => (page as { items: SkillSuggestion[] }).items);
   }
 }

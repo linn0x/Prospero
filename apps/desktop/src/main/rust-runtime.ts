@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isAbsolute } from "node:path";
 import type { SessionHead, TimelineQuery, TimelineTextQuery } from "@prospero/protocol/rust-daemon";
 import type { DesktopSnapshot, JsonObject, SessionInfo, SessionPage, SessionPageRequest } from "../shared/types";
 import { StateStore } from "./state-store";
@@ -263,6 +264,22 @@ export class RustRuntime {
       const outcome = await this.current().client.settleDispatch(settleRoute[1]!, settleDispatchInput(input), signal);
       await this.refresh(true);
       return outcome as unknown as JsonObject;
+    }
+    const skillsRoute = /^\/_prospero\/control\/skills(?:\?(.*))?$/.exec(path);
+    if (skillsRoute && (!init?.method || init.method === "GET")) {
+      const cwd = new URLSearchParams(skillsRoute[1] ?? "").get("cwd") ?? "";
+      if (!cwd || !isAbsolute(cwd)) throw new Error("工作区路径无效");
+      const items = await this.current().client.listSkills(cwd, signal);
+      return { items } as JsonObject;
+    }
+    const suggestionsRoute = /^\/_prospero\/control\/session\/([A-Za-z0-9_-]{1,128})\/suggestions(?:\?(.*))?$/.exec(path);
+    if (suggestionsRoute && (!init?.method || init.method === "GET")) {
+      const params = new URLSearchParams(suggestionsRoute[2] ?? "");
+      if (params.get("kind") !== "skill") throw new Error("Skill 查询无效");
+      const query = params.get("query") ?? "";
+      if (query.length > 200) throw new Error("Skill 查询无效");
+      const items = await this.current().client.skillSuggestions(suggestionsRoute[1]!, query, signal);
+      return { items } as JsonObject;
     }
     if (path === "/_prospero/control/session/create" && init?.method === "POST" && input) {
       if (input["kind"] === "pty") {
