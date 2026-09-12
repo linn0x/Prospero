@@ -3,6 +3,12 @@ import type { RustContent } from "../shared/rust-api";
 import type { TimelinePage, TimelineQuery, TimelineLookupResult, TimelineTextQuery, TimelineTextPage } from "@prospero/protocol/rust-daemon";
 import type { CreateTerminal, TerminalPage, TerminalQuery, TerminalSize, TerminalSnapshot } from "@prospero/protocol/rust-daemon";
 import type { AgentSend, CreateAgentSession, PermissionDecision } from "@prospero/protocol/rust-daemon";
+import type {
+  AbandonRun, ApplyTaskGraph, CancelTask, CleanupWorktree, CompleteRun, CreateGate,
+  CreateRun, CreateRunGraph, CreateTask, Dispatch, Gate, GraphMutationResult, ResolveGate,
+  Run, RunDeletionResult, RunSnapshot, SettleDispatch, SettleOutcome, StartWorker, StopWorker,
+  Task, WorktreeAsset, WorktreeCleanupResult, WorktreeInspection, WorkerStartOutcome,
+} from "@prospero/protocol/rust-daemon";
 
 const MAX_BYTES = 2 * 1024 * 1024;
 function id(value: string): string {
@@ -20,11 +26,12 @@ export class RustClient {
     this.base = url.origin;
   }
 
-  private async response(path: string, init: RequestInit = {}): Promise<Response> {
+  private async response(path: string, init: RequestInit & { timeoutMs?: number } = {}): Promise<Response> {
+    const { timeoutMs = 7000, ...requestInit } = init;
     try {
-      return await this.fetcher(this.base + path, { ...init, redirect: "error", signal: init.signal ? AbortSignal.any([init.signal, AbortSignal.timeout(7000)]) : AbortSignal.timeout(7000), headers: { ...init.headers, authorization: `Bearer ${this.token}` } });
-    } catch { if (init.signal?.aborted) throw new DOMException("Request cancelled", "AbortError"); throw new Error("无法连接本机 Rust 服务"); }
-  }
+      return await this.fetcher(this.base + path, { ...requestInit, redirect: "error", signal: requestInit.signal ? AbortSignal.any([requestInit.signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs), headers: { ...requestInit.headers, authorization: `Bearer ${this.token}` } });
+    } catch { if (requestInit.signal?.aborted) throw new DOMException("Request cancelled", "AbortError"); throw new Error("无法连接本机 Rust 服务"); }
+    }
 
   private async bytes(response: Response): Promise<Uint8Array> {
     const reader = response.body?.getReader();
@@ -44,7 +51,7 @@ export class RustClient {
     return output;
   }
 
-  private async json<T>(path: string, init?: RequestInit): Promise<T> {
+  private async json<T>(path: string, init?: RequestInit & { timeoutMs?: number }): Promise<T> {
     const response = await this.response(path, init);
     const text = new TextDecoder().decode(await this.bytes(response));
     let result: unknown;
@@ -159,5 +166,86 @@ export class RustClient {
     const nextOffset = Number(response.headers.get("x-next-offset"));
     if (!Number.isSafeInteger(nextOffset) || nextOffset !== offset + bytes.byteLength) throw new Error("Invalid content cursor");
     return { bytes, nextOffset };
+  }
+
+  // ── Orchestration (Stage 8) ─────────────────────────────────────────────
+  listRuns(signal: AbortSignal | null = null): Promise<Run[]> { return this.json("/v1/runs", { signal }); }
+  runSnapshot(value: string, signal: AbortSignal | null = null): Promise<RunSnapshot> {
+    return this.json(`/v1/runs/${id(value)}`, { signal });
+  }
+  createRun(input: CreateRun, signal: AbortSignal | null = null): Promise<Run> {
+    return this.json("/v1/runs", { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
+  }
+  createRunGraph(input: CreateRunGraph, signal: AbortSignal | null = null): Promise<GraphMutationResult> {
+    return this.json("/v1/runs/graph", { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
+  }
+  applyTaskGraph(input: ApplyTaskGraph, signal: AbortSignal | null = null): Promise<GraphMutationResult> {
+    return this.json("/v1/runs/graph/apply", { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
+  }
+  completeRun(value: string, input: CompleteRun, signal: AbortSignal | null = null): Promise<Run> {
+    return this.json(`/v1/runs/${id(value)}/complete`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
+  }
+  abandonRun(value: string, input: AbandonRun, signal: AbortSignal | null = null): Promise<Run> {
+    return this.json(`/v1/runs/${id(value)}/abandon`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
+  }
+  deleteRun(value: string, signal: AbortSignal | null = null): Promise<RunDeletionResult> {
+    return this.json(`/v1/runs/${id(value)}`, { method: "DELETE", signal });
+  }
+  listTasks(runId?: string, signal: AbortSignal | null = null): Promise<Task[]> {
+    const params = new URLSearchParams();
+    if (runId != null) params.set("runId", runId);
+    const suffix = params.size ? `?${params}` : "";
+    return this.json(`/v1/tasks${suffix}`, { signal });
+  }
+  task(value: string, signal: AbortSignal | null = null): Promise<Task> {
+    return this.json(`/v1/tasks/${id(value)}`, { signal });
+  }
+  createTask(input: CreateTask, signal: AbortSignal | null = null): Promise<Task> {
+    return this.json("/v1/tasks", { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
+  }
+  cancelTask(value: string, input: CancelTask, signal: AbortSignal | null = null): Promise<Task> {
+    return this.json(`/v1/tasks/${id(value)}/cancel`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
+  }
+  retryTask(value: string, signal: AbortSignal | null = null): Promise<Task> {
+    return this.json(`/v1/tasks/${id(value)}/retry`, { method: "POST", signal });
+  }
+  startWorker(input: StartWorker, signal: AbortSignal | null = null, timeoutMs = 180_000): Promise<WorkerStartOutcome> {
+    return this.json("/v1/workers/start", { method: "POST", signal, timeoutMs, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
+  }
+  stopWorker(input: StopWorker, signal: AbortSignal | null = null): Promise<SettleOutcome> {
+    return this.json("/v1/workers/stop", { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
+  }
+  listWorktreeAssets(runId?: string, signal: AbortSignal | null = null): Promise<WorktreeAsset[]> {
+    const params = new URLSearchParams();
+    if (runId != null) params.set("runId", runId);
+    const suffix = params.size ? `?${params}` : "";
+    return this.json(`/v1/worktrees${suffix}`, { signal });
+  }
+  inspectWorktree(value: string, targetRef: string | null, signal: AbortSignal | null = null, timeoutMs = 180_000): Promise<WorktreeInspection> {
+    return this.json(`/v1/worktrees/${id(value)}/inspect`, { method: "POST", signal, timeoutMs, headers: { "content-type": "application/json" }, body: JSON.stringify({ targetRef }) });
+  }
+  cleanupWorktree(value: string, input: CleanupWorktree, signal: AbortSignal | null = null, timeoutMs = 180_000): Promise<WorktreeCleanupResult> {
+    return this.json(`/v1/worktrees/${id(value)}/cleanup`, { method: "POST", signal, timeoutMs, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
+  }
+  listDispatches(runId?: string, signal: AbortSignal | null = null): Promise<Dispatch[]> {
+    const params = new URLSearchParams();
+    if (runId != null) params.set("runId", runId);
+    const suffix = params.size ? `?${params}` : "";
+    return this.json(`/v1/dispatches${suffix}`, { signal });
+  }
+  settleDispatch(value: string, input: SettleDispatch, signal: AbortSignal | null = null): Promise<SettleOutcome> {
+    return this.json(`/v1/dispatches/${id(value)}/settle`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
+  }
+  listGates(runId?: string, signal: AbortSignal | null = null): Promise<Gate[]> {
+    const params = new URLSearchParams();
+    if (runId != null) params.set("runId", runId);
+    const suffix = params.size ? `?${params}` : "";
+    return this.json(`/v1/gates${suffix}`, { signal });
+  }
+  resolveGate(value: string, input: ResolveGate, signal: AbortSignal | null = null): Promise<Gate> {
+    return this.json(`/v1/gates/${id(value)}/resolve`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
+  }
+  createGate(runId: string, input: CreateGate, signal: AbortSignal | null = null): Promise<Gate> {
+    return this.json(`/v1/runs/${id(runId)}/gates`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
   }
 }

@@ -109,6 +109,9 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
   const gateSubmissionRef = useRef(new Set<string>());
   const [gateSubmissions, setGateSubmissions] = useState<Record<string, string>>({});
   const [abandonRun, setAbandonRun] = useState<{ id: string; objective: string }>();
+  const [delivery, setDelivery] = useState<{ dispatchId: string; success: boolean; taskTitle: string }>();
+  const [deliveryOutcome, setDeliveryOutcome] = useState("");
+  const [deliveryError, setDeliveryError] = useState<string>();
   // SwiftUI 默认并持久化依赖图视图；Electron 保持相同习惯，避免每次进 Run 都先切 Tab。
   const [runView, setRunView] = useState<RunView>(initialRunView);
   const [templateLibraryOpen, setTemplateLibraryOpen] = useState(false);
@@ -194,17 +197,20 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
   const visibleWorktrees = worktreesExpanded
     ? runWorktrees.slice(0, worktreeLimit)
     : attentionWorktrees.slice(0, WORKTREE_ATTENTION_PREVIEW);
+  // Rust mode advertises orchestration.dag and only supports Claude workers.
+  const manualDeliverySupported = snapshot.daemon.capabilities?.includes("orchestration.dag") ?? false;
+  const effectiveWorkerAgent: OrchestrationWorkerAgent = manualDeliverySupported ? "claude" : workerAgent;
   const workerAccounts = useMemo(
-    () => sessionLaunchAccounts(snapshot.accounts, workerAgent),
-    [snapshot.accounts, workerAgent],
+    () => sessionLaunchAccounts(snapshot.accounts, effectiveWorkerAgent),
+    [snapshot.accounts, effectiveWorkerAgent],
   );
   const selectedWorkerAccountId = workerAccounts.some((account) => account.id === workerAccountId)
     ? workerAccountId
-    : defaultSessionLaunchAccountId(snapshot.accounts, workerAgent) ?? "";
+    : defaultSessionLaunchAccountId(snapshot.accounts, effectiveWorkerAgent) ?? "";
   const workerSelection = {
-    agent: workerAgent,
+    agent: effectiveWorkerAgent,
     cwd: workerProject,
-    ...(selectedWorkerAccountId ? { accountId: selectedWorkerAccountId } : {}),
+    ...(!manualDeliverySupported && selectedWorkerAccountId ? { accountId: selectedWorkerAccountId } : {}),
   };
   useEffect(() => {
     const query = window.matchMedia(COMPACT_RUN_LIST_QUERY);
@@ -425,15 +431,41 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
   const detailedTaskId = text(detailedTask?.["id"]);
   const detailedDispatch = dispatchByTaskId.get(detailedTaskId);
   const detailedBoardState = detailedTaskId ? taskBoardStates.get(detailedTaskId) : undefined;
+  const openDelivery = (dispatch: JsonObject | undefined, task: JsonObject | undefined, success: boolean): void => {
+    if (!dispatch || !["starting", "running"].includes(text(dispatch["state"]))) return;
+    setDelivery({ dispatchId: text(dispatch["id"]), success, taskTitle: text(task?.["title"]) });
+    setDeliveryOutcome("");
+    setDeliveryError(undefined);
+  };
+  const submitDelivery = async (): Promise<void> => {
+    if (!delivery || busyRef.current) return;
+    if (!deliveryOutcome.trim()) { setDeliveryError(t("请填写交付摘要", "Provide a delivery summary")); return; }
+    busyRef.current = delivery.dispatchId;
+    setBusy(delivery.dispatchId);
+    try {
+      await window.prospero.settleOrchestrationDispatch(delivery.dispatchId, delivery.success, deliveryOutcome.trim());
+      setDelivery(undefined);
+      setDeliveryError(undefined);
+    } catch (reason) {
+      setDeliveryError(reportError(reason));
+    } finally {
+      busyRef.current = undefined;
+      setBusy(undefined);
+    }
+  };
 
   const taskCard = (task: JsonObject) => {
     const taskId = text(task["id"]); const deps = array(task["deps"]).map(String); const dispatch = dispatchByTaskId.get(taskId);
-    return <Card size="sm" className="run-task-card" key={taskId}><CardHeader><div className="flex items-start justify-between gap-2"><CardTitle>{text(task["title"])}</CardTitle><span className={`status-dot ${text(task["status"])}`} /></div><CardDescription>{text(task["spec"])}</CardDescription></CardHeader><CardContent className="flex flex-col gap-2">{deps.length > 0 && <Badge variant="outline" className="w-fit"><GitPullRequestArrow />{deps.length} {t("个依赖", "dependencies")}</Badge>}{dispatch && <div className="task-assignee"><Bot /><span>{text(dispatch["agent"], workerAgent)}</span><small>{text(dispatch["branch"], t("隔离工作树", "isolated worktree"))}</small></div>}</CardContent><CardFooter className="flex-wrap">
+    return <Card size="sm" className="run-task-card" key={taskId}><CardHeader><div className="flex items-start justify-between gap-2"><CardTitle>{text(task["title"])}</CardTitle><span className={`status-dot ${text(task["status"])}`} /></div><CardDescription>{text(task["spec"])}</CardDescription></CardHeader><CardContent className="flex flex-col gap-2">{deps.length > 0 && <Badge variant="outline" className="w-fit"><GitPullRequestArrow />{deps.length} {t("个依赖", "dependencies")}</Badge>}{dispatch && <div className="task-assignee"><Bot /><span>{text(dispatch["agent"], effectiveWorkerAgent)}</span><small>{text(dispatch["branch"], t("隔离工作树", "isolated worktree"))}</small></div>}</CardContent><CardFooter className="flex-wrap">
       <Button variant="ghost" size="sm" onClick={() => void openTaskDetail(task)}>{t("详情", "Details")}</Button>
       {taskBoardStates.get(taskId) === "ready" && <Button variant="outline" size="sm" disabled={Boolean(busy)} onClick={() => void startWorker(task)}><Bot data-icon="inline-start" />{t("启动", "Start")}</Button>}
       {text(task["status"]) === "failed" && <Button variant="outline" size="sm" disabled={Boolean(busy)} onClick={() => void perform(taskId, "task.retry", { operationId: operationId(), taskId })}><RefreshCw data-icon="inline-start" />{t("重试", "Retry")}</Button>}
       {dispatch && <Button variant="ghost" size="sm" onClick={() => onOpenSession(text(dispatch["sessionId"]))}>{t("打开会话", "Open session")}</Button>}
       {text(task["status"]) === "dispatched" && <Button variant="destructive" size="sm" disabled={Boolean(busy)} onClick={() => void perform(taskId, "worker.stop", { operationId: operationId(), taskId, reason: "Stopped from Prospero desktop" })}><Square data-icon="inline-start" />{t("停止", "Stop")}</Button>}
+      {manualDeliverySupported && dispatch && ["starting", "running"].includes(text(dispatch["state"])) && <>
+        <Button variant="outline" size="sm" disabled={Boolean(busy)} onClick={() => openDelivery(dispatch, task, true)}><CheckCircle2 data-icon="inline-start" />{t("标记完成", "Mark done")}</Button>
+        <Button variant="outline" size="sm" disabled={Boolean(busy)} onClick={() => openDelivery(dispatch, task, false)}><Ban data-icon="inline-start" />{t("标记失败", "Mark failed")}</Button>
+      </>}
     </CardFooter></Card>;
   };
 
@@ -460,7 +492,7 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
   };
 
   return <div className={`page orchestration-page${runView === "dag" ? " dag-active" : ""}`}>
-    <header className="orchestration-header"><div className="orchestration-header-title"><h1>{t("目标与编排中心", "Runs & orchestration")}</h1><div className="orchestration-stats"><span>{t("运行", "Runs")}<b>{runs.length}</b></span><span>{t("运行中任务", "Active")}<b>{activeTasks.filter((task) => ["dispatched", "running", "starting"].includes(text(task["status"]))).length}</b></span><span>{t("等待检查", "Needs review")}<b>{activeTasks.filter((task) => ["blocked", "failed", "waiting_approval"].includes(text(task["status"]))).length + activeGates.filter((gate) => text(gate["status"]) === "pending").length}</b></span><span>{t("模板", "Templates")}<b>{snapshot.workflowTemplates.length}</b></span></div></div><div className="flex flex-wrap items-end gap-2"><label className="flex flex-col gap-1.5 text-xs text-muted-foreground">{t("项目", "Project")}<NativeSelect value={workerProject} onChange={(event) => setWorkerProject(event.target.value)}>{snapshot.projects.map((project) => <NativeSelectOption value={project} key={project}>{project.split(/[\\/]/).at(-1)}</NativeSelectOption>)}</NativeSelect></label><label className="flex flex-col gap-1.5 text-xs text-muted-foreground">Worker<NativeSelect value={workerAgent} onChange={(event) => { const agent = event.target.value as OrchestrationWorkerAgent; setWorkerAgent(agent); setWorkerAccountId(defaultSessionLaunchAccountId(snapshot.accounts, agent) ?? ""); }}><NativeSelectOption value="codex">Codex</NativeSelectOption><NativeSelectOption value="claude">Claude</NativeSelectOption><NativeSelectOption value="deepseek">DeepSeek</NativeSelectOption><NativeSelectOption value="opencode">OpenCode</NativeSelectOption></NativeSelect></label>{(workerAgent === "codex" || workerAgent === "claude") && <label className="flex flex-col gap-1.5 text-xs text-muted-foreground">{t("账号", "Account")}<NativeSelect value={selectedWorkerAccountId} onChange={(event) => setWorkerAccountId(event.target.value)}>{workerAccounts.length === 0 && <NativeSelectOption value="">{t("默认 CLI 环境", "Default CLI environment")}</NativeSelectOption>}{workerAccounts.map((account) => <NativeSelectOption value={account.id} key={account.id}>{account.name}{account.isDefault ? t("（默认）", " (default)") : ""}</NativeSelectOption>)}</NativeSelect></label>}<Button variant="outline" onClick={() => setTemplateLibraryOpen(true)}><LibraryBig data-icon="inline-start" />{t("模板库", "Templates")}</Button><Button onClick={() => setShowCreate(true)}><Plus data-icon="inline-start" />{t("新建目标", "New goal")}</Button></div></header>
+    <header className="orchestration-header"><div className="orchestration-header-title"><h1>{t("目标与编排中心", "Runs & orchestration")}</h1><div className="orchestration-stats"><span>{t("运行", "Runs")}<b>{runs.length}</b></span><span>{t("运行中任务", "Active")}<b>{activeTasks.filter((task) => ["dispatched", "running", "starting"].includes(text(task["status"]))).length}</b></span><span>{t("等待检查", "Needs review")}<b>{activeTasks.filter((task) => ["blocked", "failed", "waiting_approval"].includes(text(task["status"]))).length + activeGates.filter((gate) => text(gate["status"]) === "pending").length}</b></span><span>{t("模板", "Templates")}<b>{snapshot.workflowTemplates.length}</b></span></div></div><div className="flex flex-wrap items-end gap-2"><label className="flex flex-col gap-1.5 text-xs text-muted-foreground">{t("项目", "Project")}<NativeSelect value={workerProject} onChange={(event) => setWorkerProject(event.target.value)}>{snapshot.projects.map((project) => <NativeSelectOption value={project} key={project}>{project.split(/[\\/]/).at(-1)}</NativeSelectOption>)}</NativeSelect></label><label className="flex flex-col gap-1.5 text-xs text-muted-foreground" title={manualDeliverySupported ? t("Rust 模式当前仅支持 Claude worker", "Only Claude workers are available in Rust mode") : undefined}>Worker{manualDeliverySupported ? <NativeSelect value="claude" disabled><NativeSelectOption value="claude">Claude</NativeSelectOption></NativeSelect> : <NativeSelect value={workerAgent} onChange={(event) => { const agent = event.target.value as OrchestrationWorkerAgent; setWorkerAgent(agent); setWorkerAccountId(defaultSessionLaunchAccountId(snapshot.accounts, agent) ?? ""); }}><NativeSelectOption value="codex">Codex</NativeSelectOption><NativeSelectOption value="claude">Claude</NativeSelectOption><NativeSelectOption value="deepseek">DeepSeek</NativeSelectOption><NativeSelectOption value="opencode">OpenCode</NativeSelectOption></NativeSelect>}</label>{!manualDeliverySupported && (workerAgent === "codex" || workerAgent === "claude") && <label className="flex flex-col gap-1.5 text-xs text-muted-foreground">{t("账号", "Account")}<NativeSelect value={selectedWorkerAccountId} onChange={(event) => setWorkerAccountId(event.target.value)}>{workerAccounts.length === 0 && <NativeSelectOption value="">{t("默认 CLI 环境", "Default CLI environment")}</NativeSelectOption>}{workerAccounts.map((account) => <NativeSelectOption value={account.id} key={account.id}>{account.name}{account.isDefault ? t("（默认）", " (default)") : ""}</NativeSelectOption>)}</NativeSelect></label>}<Button variant="outline" onClick={() => setTemplateLibraryOpen(true)}><LibraryBig data-icon="inline-start" />{t("模板库", "Templates")}</Button><Button onClick={() => setShowCreate(true)}><Plus data-icon="inline-start" />{t("新建目标", "New goal")}</Button></div></header>
     {error && <Alert variant="destructive" className="mx-7 mt-5 w-auto"><CircleDot /><AlertTitle>{t("编排操作失败", "Orchestration action failed")}</AlertTitle><AlertDescription>{error}</AlertDescription></Alert>}
     <div className={`orchestration-layout${runListOpen ? "" : " run-list-collapsed"}`}>
       <aside className="run-list"><div className="section-label run-list-heading"><span>{t("运行", "RUNS")} · {runs.length}</span><button type="button" className="run-list-collapse" aria-label={t("收起运行列表", "Collapse runs")} title={t("收起运行列表", "Collapse runs")} onClick={() => setRunListOpen(false)}><PanelLeftClose size={13} /></button></div>{orderedRuns.length === 0 && <Empty><EmptyHeader><EmptyMedia variant="icon"><Workflow /></EmptyMedia><EmptyTitle>{t("还没有编排 Run", "No orchestration runs yet")}</EmptyTitle><EmptyDescription>{t("创建目标后，任务图会显示在这里。", "Create a goal and its task graph will appear here.")}</EmptyDescription></EmptyHeader></Empty>}{orderedRuns.map((run) => { const objective = text(run["objective"]); const taskCount = taskCountsByRun.get(text(run["id"])) ?? 0; return <Button variant={text(run["id"]) === runId ? "secondary" : "ghost"} key={text(run["id"])} className="h-auto w-full justify-start px-3 py-2 text-left" title={objective} onClick={() => setSelectedRunId(text(run["id"]))}><span className={`status-dot ${text(run["status"])}`} /><span className="flex min-w-0 flex-col items-start gap-1"><strong className="max-w-full truncate">{runListLabel(objective)}</strong><small className="text-muted-foreground">{status(text(run["status"]))} · {t(`${String(taskCount)} 个任务`, `${String(taskCount)} tasks`)} · rev {number(run["graphRevision"])}</small></span></Button>; })}</aside>
@@ -469,7 +501,9 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
           {!runListOpen && <button className="run-list-toggle" aria-expanded={runListOpen} onClick={() => setRunListOpen(true)}><PanelLeftOpen size={14} />{t("显示运行列表", "Show runs")}</button>}
           {runTasks.length > 0 && <button onClick={() => { setTemplateName(text(selectedRun["objective"])); setTemplateDescription(""); setSaveTemplateError(undefined); setSaveTemplateOpen(true); }}><Save size={14} />{t("保存为模板", "Save template")}</button>}
           {text(record(selectedRun["automation"])["state"]) !== "running" && text(selectedRun["status"]) === "active" && <button onClick={() => { setTaskCreateError(undefined); setShowTaskCreate(true); }}><Plus size={14} />{t("添加任务", "Add task")}</button>}
-          {text(record(selectedRun["automation"])["state"]) === "running" ? <button disabled={Boolean(busy)} onClick={() => void perform("automation", "automation.pause", { operationId: operationId(), runId })}><Pause size={14} />{t("暂停自动执行", "Pause automation")}</button> : <button onClick={() => void perform("automation", "automation.start", automationStartParams(workerSelection, runId, operationId()))} disabled={!workerProject || Boolean(busy)}><Play size={14} />{t("自动执行 DAG", "Run DAG automatically")}</button>}
+          {manualDeliverySupported
+            ? <button disabled title={t("自动执行 DAG 尚未接入 Rust daemon", "Automatic DAG execution is not available in Rust mode yet")}><Play size={14} />{t("自动执行 DAG", "Run DAG automatically")}</button>
+            : text(record(selectedRun["automation"])["state"]) === "running" ? <button disabled={Boolean(busy)} onClick={() => void perform("automation", "automation.pause", { operationId: operationId(), runId })}><Pause size={14} />{t("暂停自动执行", "Pause automation")}</button> : <button onClick={() => void perform("automation", "automation.start", automationStartParams(workerSelection, runId, operationId()))} disabled={!workerProject || Boolean(busy)}><Play size={14} />{t("自动执行 DAG", "Run DAG automatically")}</button>}
           {text(selectedRun["status"]) === "active" && <button disabled={Boolean(busy)} onClick={() => void perform("complete", "run.complete", { operationId: operationId(), runId })}><CheckCircle2 size={14} />{t("标记完成", "Mark complete")}</button>}
           {text(selectedRun["status"]) === "active" && <button className="danger" disabled={Boolean(busy)} onClick={() => setAbandonRun({ id: runId, objective: text(selectedRun["objective"]) })}><Ban size={14} />{t("放弃", "Abandon")}</button>}
           {text(selectedRun["status"]) !== "active" && <button className="danger" disabled={Boolean(busy)} onClick={() => void perform("delete", "run.delete", { operationId: operationId(), runId })}><Trash2 size={14} />{t("删除记录", "Delete record")}</button>}
@@ -511,6 +545,10 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
           {detailedBoardState === "ready" && detailedTask && <Button variant="outline" disabled={Boolean(busy)} onClick={() => void startWorker(detailedTask)}><Bot data-icon="inline-start" />{t("启动", "Start")}</Button>}
           {text(detailedTask?.["status"]) === "failed" && <Button variant="outline" disabled={Boolean(busy)} onClick={() => void perform(detailedTaskId, "task.retry", { operationId: operationId(), taskId: detailedTaskId })}><RefreshCw data-icon="inline-start" />{t("重试", "Retry")}</Button>}
           {detailedDispatch && <Button variant="outline" onClick={() => onOpenSession(text(detailedDispatch["sessionId"]))}>{t("打开会话", "Open session")}</Button>}
+          {manualDeliverySupported && detailedDispatch && ["starting", "running"].includes(text(detailedDispatch["state"])) && <>
+            <Button variant="outline" disabled={Boolean(busy)} onClick={() => openDelivery(detailedDispatch, detailedTask ?? undefined, true)}>{t("标记完成", "Mark done")}</Button>
+            <Button variant="outline" disabled={Boolean(busy)} onClick={() => openDelivery(detailedDispatch, detailedTask ?? undefined, false)}>{t("标记失败", "Mark failed")}</Button>
+          </>}
           <Button onClick={closeTaskDetail}>{t("关闭", "Close")}</Button>
         </DialogFooter>
       </DialogContent>
@@ -566,6 +604,16 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
         <p className="truncate text-sm font-medium" title={abandonRun?.objective}>{abandonRun?.objective}</p>
         {abandonError && <Alert variant="destructive"><CircleDot /><AlertTitle>{t("无法放弃运行", "Unable to abandon run")}</AlertTitle><AlertDescription>{abandonError}</AlertDescription></Alert>}
         <DialogFooter><Button variant="outline" disabled={busy === "abandon"} onClick={() => { setAbandonRun(undefined); setAbandonError(undefined); }}>{t("取消", "Cancel")}</Button><Button variant="destructive" disabled={busy === "abandon"} onClick={() => { if (!abandonRun) return; void perform("abandon", "run.abandon", { operationId: operationId(), runId: abandonRun.id }, setAbandonError).then((done) => { if (done) setAbandonRun(undefined); }); }}><Ban data-icon="inline-start" />{busy === "abandon" ? t("正在放弃…", "Abandoning…") : t("确认放弃", "Abandon run")}</Button></DialogFooter>
+      </DialogContent>
+    </Dialog>
+
+    <Dialog open={Boolean(delivery)} onOpenChange={(open) => { if (!open) { setDelivery(undefined); setDeliveryError(undefined); } }}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader><DialogTitle>{delivery?.success ? t("人工交付：任务完成", "Manual delivery: task done") : t("人工交付：任务失败", "Manual delivery: task failed")}</DialogTitle><DialogDescription>{t("Rust 模式没有 prospero CLI，worker 无法自行回报；请根据会话中的最终回复记录交付结果。", "In Rust mode there is no prospero CLI, so the worker cannot self-report. Record the result from its final reply.")}</DialogDescription></DialogHeader>
+        {delivery && <p className="truncate text-sm font-medium" title={delivery.taskTitle}>{delivery.taskTitle}</p>}
+        <Textarea value={deliveryOutcome} maxLength={20_000} rows={5} onChange={(event) => setDeliveryOutcome(event.target.value)} placeholder={t("交付摘要：改了什么、如何验证 / 失败原因与下一步", "Delivery summary: what changed and how it was verified / why it failed and next steps")} autoFocus />
+        {deliveryError && <Alert variant="destructive"><CircleDot /><AlertTitle>{t("交付失败", "Delivery failed")}</AlertTitle><AlertDescription>{deliveryError}</AlertDescription></Alert>}
+        <DialogFooter><Button variant="outline" disabled={Boolean(busy)} onClick={() => { setDelivery(undefined); setDeliveryError(undefined); }}>{t("取消", "Cancel")}</Button><Button variant={delivery?.success ? "default" : "destructive"} disabled={Boolean(busy)} onClick={() => void submitDelivery()}>{busy === delivery?.dispatchId ? t("正在交付…", "Delivering…") : delivery?.success ? t("确认完成", "Confirm done") : t("确认失败", "Confirm failed")}</Button></DialogFooter>
       </DialogContent>
     </Dialog>
 

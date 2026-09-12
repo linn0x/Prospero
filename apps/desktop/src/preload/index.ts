@@ -87,6 +87,7 @@ const api: DesktopApi = {
   saveWorkflowTemplate: (template) => ipcRenderer.invoke("workflow-template:save", template),
   deleteWorkflowTemplate: (templateId: string) => ipcRenderer.invoke("workflow-template:delete", templateId),
   resolveGate: (gateId: string, decision: string) => ipcRenderer.invoke("orchestration:gate", gateId, decision),
+  settleOrchestrationDispatch: (dispatchId: string, success: boolean, outcome: string) => ipcRenderer.invoke("orchestration:settle", dispatchId, success, outcome),
   accountAction: (message: JsonObject) => ipcRenderer.invoke("account:action", message),
   getAccountModels: (input) => ipcRenderer.invoke("account:models", input),
   getAccountConfig: (accountId) => ipcRenderer.invoke("account:config:get", accountId),

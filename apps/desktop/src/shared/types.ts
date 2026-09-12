@@ -355,6 +355,7 @@ export type DesktopApi = import("./project-tools").ProjectToolsApi & {
   saveWorkflowTemplate(template: WorkflowTemplate): Promise<DesktopSnapshot>;
   deleteWorkflowTemplate(templateId: string): Promise<DesktopSnapshot>;
   resolveGate(gateId: string, decision: string): Promise<void>;
+  settleOrchestrationDispatch(dispatchId: string, success: boolean, outcome: string): Promise<JsonObject>;
   accountAction(message: JsonObject): Promise<JsonObject>;
   getAccountModels(input: AccountModelsInput): Promise<S2CAgentAccountApiModelsResult>;
   getAccountConfig(accountId: string): Promise<S2CAgentAccountConfigResult>;
