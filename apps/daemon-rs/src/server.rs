@@ -87,6 +87,7 @@ impl Api {
             .route("/v1/health", get(health))
             .route("/v1/shutdown", post(shutdown))
             .route("/v1/agent-sessions", post(create_agent))
+            .route("/v1/agent-sessions/queues", get(agent_queues))
             .route("/v1/agent-sessions/{id}/send", post(agent_send))
             .route(
                 "/v1/agent-sessions/{id}/suggestions",
@@ -103,6 +104,15 @@ impl Api {
             .route("/v1/agent-sessions/{id}/interrupt", post(agent_interrupt))
             .route("/v1/agent-sessions/{id}/permission", post(agent_permission))
             .route("/v1/agent-sessions/{id}/question", post(agent_question))
+            .route("/v1/agent-sessions/{id}/queue", get(agent_queue))
+            .route(
+                "/v1/agent-sessions/{id}/queue/{queue_id}/remove",
+                post(agent_queue_remove),
+            )
+            .route(
+                "/v1/agent-sessions/{id}/queue/{queue_id}/guide",
+                post(agent_queue_guide),
+            )
             .route(
                 "/v1/agent-sessions/{id}",
                 axum::routing::delete(agent_close),
@@ -293,7 +303,46 @@ async fn agent_send(
     body: std::result::Result<Json<AgentSend>, axum::extract::rejection::JsonRejection>,
 ) -> std::result::Result<Json<serde_json::Value>, ApiError> {
     let Json(input) = body.map_err(|_| Error::Invalid("invalid agent message".into()))?;
-    api.agents.send(&id, input.text).await?;
+    api.agents.send(&id, input.text, input.delivery).await?;
+    api.publish();
+    Ok(Json(serde_json::json!({"ok":true})))
+}
+
+async fn agent_queues(
+    State(api): State<Api>,
+) -> std::result::Result<Json<crate::agent::AgentQueues>, ApiError> {
+    Ok(Json(api.agents.queues().await?))
+}
+
+async fn agent_queue(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<crate::agent::AgentQueue>, ApiError> {
+    crate::database::validate_id(&id).map_err(ApiError)?;
+    Ok(Json(crate::agent::AgentQueue {
+        session_id: id.clone(),
+        items: api.agents.queue(&id).await?,
+    }))
+}
+
+async fn agent_queue_remove(
+    State(api): State<Api>,
+    Path((id, queue_id)): Path<(String, String)>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    crate::database::validate_id(&id).map_err(ApiError)?;
+    crate::database::validate_id(&queue_id).map_err(ApiError)?;
+    api.agents.remove_queued(&id, &queue_id).await?;
+    api.publish();
+    Ok(Json(serde_json::json!({"ok":true})))
+}
+
+async fn agent_queue_guide(
+    State(api): State<Api>,
+    Path((id, queue_id)): Path<(String, String)>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    crate::database::validate_id(&id).map_err(ApiError)?;
+    crate::database::validate_id(&queue_id).map_err(ApiError)?;
+    api.agents.guide_queued(&id, &queue_id).await?;
     api.publish();
     Ok(Json(serde_json::json!({"ok":true})))
 }

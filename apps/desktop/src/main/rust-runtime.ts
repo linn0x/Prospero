@@ -1,13 +1,21 @@
 import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 import type { SessionHead, TimelineQuery, TimelineTextQuery } from "@prospero/protocol/rust-daemon";
-import type { DesktopSnapshot, JsonObject, SessionInfo, SessionPage, SessionPageRequest } from "../shared/types";
+import type { QueuedMessage } from "@prospero/protocol/rust-daemon";
+import type { DesktopSnapshot, JsonObject, QueuedChatMessage, SessionInfo, SessionPage, SessionPageRequest } from "../shared/types";
 import { StateStore } from "./state-store";
 import { RustProcess, type RustConnection } from "./rust-process";
 import { orchestrationAction, readOrchestrationWindow, settleDispatchInput } from "./rust-orchestration";
 
-export function rustSessionInfo(head: SessionHead): SessionInfo {
-  return { id: head.id, agent: head.agent, kind: head.kind, ...(head.kind === "pty" ? { terminalMode: "events" as const } : { historyMode: "paged" as const }), title: head.title, cwd: head.workspace, status: head.status === "waiting_permission" ? "waiting_approval" : head.status, createdAt: head.createdAt, pendingPermissions: head.status === "waiting_permission" ? 1 : 0, pendingQuestions: head.status === "waiting_input" ? 1 : 0 };
+function toQueuedChat(item: QueuedMessage): QueuedChatMessage {
+  // Image attachments are not yet supported by the Rust agent, so the queue
+  // never carries an attachment count.
+  return { id: item.id, text: item.text, kind: item.kind === "guide" ? "guide" : "queue", createdAt: item.createdAt, attachmentCount: 0 };
+}
+
+export function rustSessionInfo(head: SessionHead, messageQueue?: QueuedMessage[]): SessionInfo {
+  const queue = messageQueue?.length ? { messageQueue: messageQueue.slice(0, 50).map(toQueuedChat) } : {};
+  return { id: head.id, agent: head.agent, kind: head.kind, ...(head.kind === "pty" ? { terminalMode: "events" as const } : { historyMode: "paged" as const }), title: head.title, cwd: head.workspace, status: head.status === "waiting_permission" ? "waiting_approval" : head.status, createdAt: head.createdAt, pendingPermissions: head.status === "waiting_permission" ? 1 : 0, pendingQuestions: head.status === "waiting_input" ? 1 : 0, ...queue };
 }
 
 export class RustRuntime {
@@ -105,12 +113,18 @@ export class RustRuntime {
     const { client, pid, baseUrl } = this.current();
     const signal = this.controller.signal;
     const orchCursor = await client.events({ scope: "orchestration", afterSeq: this.orchestrationSequence, limit: 1 }, signal).catch(() => null);
-    const [summary, active, recent, workspaces, health, orchestration] = await Promise.all([
+    const [summary, active, recent, workspaces, health, queues, orchestration] = await Promise.all([
       client.summary(undefined, signal),
       client.sessions({ limit: 100, cursor: null, lifecycle: "active", workspace: null, text: null }, signal),
       client.sessions({ limit: 20, cursor: null, lifecycle: "archived", workspace: null, text: null }, signal),
       client.workspaces({ limit: 100, cursor: null }, signal),
       client.health(signal),
+      client.agentQueues(signal).catch((error: unknown) => {
+        // The queue projection is additive UI state; a stale daemon or read
+        // failure must not blank the session list.
+        this.store.appendLog(`[rust] agent queues read failed: ${error instanceof Error ? error.message : String(error)}\n`);
+        return { queues: [] };
+      }),
       orchCursor
         ? readOrchestrationWindow(client, signal, orchCursor.latestSeq).catch((error: unknown) => {
           // Orchestration is additive; a failure here must not blank the session list.
@@ -121,7 +135,8 @@ export class RustRuntime {
     ]);
     signal.throwIfAborted();
     if (orchCursor) this.orchestrationSequence = orchCursor.latestSeq;
-    const sessions = [...active.items, ...recent.items].map(rustSessionInfo);
+    const queueById = new Map(queues.queues.map(queue => [queue.sessionId, queue.items]));
+    const sessions = [...active.items, ...recent.items].map(head => rustSessionInfo(head, queueById.get(head.id)));
     this.sequence = Math.min(summary.latestSeq, active.latestSeq, recent.latestSeq, workspaces.latestSeq);
     this.store.setApiState({ running: true, config: {}, devices: {}, orchestration: orchestration ?? {}, projects: workspaces.items.map(item => item.workspace), status: {
       pid, port: Number(new URL(baseUrl).port), bind: "127.0.0.1", sessions, capabilities: health.capabilities,
@@ -172,7 +187,7 @@ export class RustRuntime {
       const heads = result.items.filter(head => !request.terminal || head.lifecycle === "archived");
       const remaining = heads.filter(head => ids.indexOf(head.id) >= start);
       const items = remaining.slice(0, request.limit ?? 100);
-      return { items: items.map(rustSessionInfo), total: heads.length, active: result.items.filter(head => head.lifecycle === "active").length, terminal: result.items.filter(head => head.lifecycle === "archived").length,
+      return { items: items.map(head => rustSessionInfo(head)), total: heads.length, active: result.items.filter(head => head.lifecycle === "active").length, terminal: result.items.filter(head => head.lifecycle === "archived").length,
         ...(remaining.length > items.length && items.length ? { nextCursor: Buffer.from(JSON.stringify({ key, id: items.at(-1)!.id })).toString("base64url") } : {}),
       };
     }
@@ -180,7 +195,7 @@ export class RustRuntime {
       client.sessions({ limit: request.limit ?? 100, cursor: request.cursor ?? null, lifecycle: request.terminal ? "archived" : null, text: request.query ?? null, workspace: request.workspace ?? null }, signal),
       client.summary(request.workspace, signal),
     ]);
-    return { items: page.items.map(rustSessionInfo), total: page.total, active: summary.active, terminal: summary.archived, ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}), ...(page.previousCursor ? { previousCursor: page.previousCursor } : {}) };
+    return { items: page.items.map(head => rustSessionInfo(head)), total: page.total, active: summary.active, terminal: summary.archived, ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}), ...(page.previousCursor ? { previousCursor: page.previousCursor } : {}) };
   }
 
   async rename(id: string, title: string): Promise<DesktopSnapshot> {
@@ -331,11 +346,22 @@ export class RustRuntime {
       }
       if (init?.method === "POST") {
         if (kind === "structured") {
+          if (action === "interact" && (input?.["type"] === "chat.queue.remove" || input?.["type"] === "chat.queue.guide")) {
+            const queueId = input["queueId"];
+            if (typeof queueId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(queueId)) throw new Error("待发送消息无效");
+            if (input["type"] === "chat.queue.remove") await client.agentQueueRemove(id, queueId, signal);
+            else await client.agentQueueGuide(id, queueId, signal);
+            await this.refresh(true);
+            return { ok: true };
+          }
           if (action === "interact" && input?.["type"] === "chat.send") {
             if (Array.isArray(input["attachments"]) && input["attachments"].length) throw new Error("Rust Agent 暂不支持图片附件");
             const text = input["text"];
             if (typeof text !== "string" || !text.trim()) throw new Error("消息内容无效");
-            await client.agentSend(id, { text }, signal);
+            const delivery = input["delivery"];
+            if (delivery !== undefined && delivery !== "queue" && delivery !== "steer") throw new Error("发送方式无效");
+            await client.agentSend(id, { text, delivery: delivery === "steer" ? "steer" : null }, signal);
+            await this.refresh(true);
             return { ok: true };
           }
           if (action === "interact" && input?.["type"] === "permission.respond") {
