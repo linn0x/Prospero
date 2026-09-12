@@ -259,6 +259,28 @@ pub enum ToolState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct QuestionOption {
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+}
+
+/// One AskUserQuestion entry, normalized from the Claude tool input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentQuestion {
+    pub id: String,
+    pub header: String,
+    pub question: String,
+    pub options: Vec<QuestionOption>,
+    pub multi_select: bool,
+    pub allow_other: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(
     tag = "kind",
     rename_all = "snake_case",
@@ -282,6 +304,15 @@ pub enum TimelineBody {
         resolved: bool,
         /// Set when the approval belongs to a Task-tool subagent; the event
         /// still shows on the main timeline so it can be answered there.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        subagent: Option<String>,
+    },
+    /// Structured AskUserQuestion request. The CLI blocks on the matching
+    /// control_response until `question.respond` (or cancellation/interrupt).
+    Question {
+        request_id: String,
+        questions: Vec<AgentQuestion>,
+        resolved: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         subagent: Option<String>,
     },
@@ -430,6 +461,8 @@ pub fn typescript() -> String {
         ContentPage::decl(&config),
         MessageRole::decl(&config),
         ToolState::decl(&config),
+        QuestionOption::decl(&config),
+        AgentQuestion::decl(&config),
         TimelineBody::decl(&config),
         TimelineRecord::decl(&config),
         TimelineWrite::decl(&config),
@@ -448,6 +481,8 @@ pub fn typescript() -> String {
         crate::agent::CreateAgentSession::decl(&config),
         crate::agent::AgentSend::decl(&config),
         crate::agent::PermissionDecision::decl(&config),
+        crate::agent::QuestionAnswer::decl(&config),
+        crate::agent::QuestionDecision::decl(&config),
         crate::agent::AgentModeSelection::decl(&config),
         crate::agent::AgentModeCatalog::decl(&config),
         crate::agent::AgentModeEntry::decl(&config),

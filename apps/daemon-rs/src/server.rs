@@ -20,7 +20,7 @@ use tokio::sync::{Semaphore, watch};
 use crate::agent::Agents;
 use crate::agent::{
     AgentModeSelection, AgentSend, CreateAgentSession, PermissionDecision, PermissionMode,
-    mode_catalog,
+    QuestionDecision, mode_catalog,
 };
 use crate::auth::Token;
 use crate::database::Store;
@@ -102,6 +102,7 @@ impl Api {
             )
             .route("/v1/agent-sessions/{id}/interrupt", post(agent_interrupt))
             .route("/v1/agent-sessions/{id}/permission", post(agent_permission))
+            .route("/v1/agent-sessions/{id}/question", post(agent_question))
             .route(
                 "/v1/agent-sessions/{id}",
                 axum::routing::delete(agent_close),
@@ -403,6 +404,23 @@ async fn agent_permission(
     let Json(decision) = body.map_err(|_| Error::Invalid("invalid permission decision".into()))?;
     api.agents
         .respond_permission(&id, &decision.request_id, decision.allow)
+        .await?;
+    Ok(Json(serde_json::json!({"ok":true})))
+}
+
+async fn agent_question(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<QuestionDecision>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    let Json(decision) = body.map_err(|_| Error::Invalid("invalid question decision".into()))?;
+    api.agents
+        .respond_question(
+            &id,
+            &decision.request_id,
+            decision.answers,
+            decision.cancelled,
+        )
         .await?;
     Ok(Json(serde_json::json!({"ok":true})))
 }

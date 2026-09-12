@@ -105,6 +105,7 @@ export function timelineEvent(record: TimelineRecord): JsonObject {
     case "reasoning": return { ...shared, kind: "reasoning", text: record.preview };
     case "tool": return { ...shared, hasMore: record.bytes > 0, kind: record.body.state === "running" ? "tool.start" : "tool.end", tool: record.body.name, state: record.body.state, summary: record.body.state === "running" ? record.body.summary : (record.body.summary || record.preview) };
     case "permission_request": return { ...shared, kind: "permission.request", reqId: record.body.requestId, summary: record.preview || record.body.tool, resources: [record.body.tool], ...(record.body.subagent ? { agentId: record.body.subagent } : {}) };
+    case "question": return { ...shared, kind: "question.request", reqId: record.body.requestId, questions: record.body.questions, ...(record.body.subagent ? { agentId: record.body.subagent } : {}) };
     case "subagent": {
       // One collapsing card per subagent; the accumulator folds revisions and
       // re-attaches the full metadata on every poll/reload.
@@ -135,6 +136,7 @@ export class TimelineViewCache {
       const cached = this.entries.get(record.id);
       const item = cached?.revision === record.revision ? cached.item : { key: record.id, ordinal: record.position, event: timelineEvent(record) };
       if (record.body.kind === "permission_request" && record.body.resolved) resolutions.add(`permission.resolved${String.fromCharCode(0)}${record.body.requestId}`);
+      if (record.body.kind === "question" && record.body.resolved) resolutions.add(`question.resolved${String.fromCharCode(0)}${record.body.requestId}`);
       next.set(record.id, { revision: record.revision, item }); return item;
     });
     this.entries = next;

@@ -694,7 +694,8 @@ impl Store {
         let mut statement = self.connection.prepare_cached(&format!(
             "SELECT {COLUMNS} FROM {SOURCE} WHERE r.session_id=?1 AND (\
              r.subagent_id=?2 OR (\
-             r.subagent_id IS NULL AND json_extract(r.body,'$.kind')='permission_request' \
+             r.subagent_id IS NULL AND json_extract(r.body,'$.kind') IN \
+             ('permission_request','question') \
              AND json_extract(r.body,'$.subagent')=?2)) \
              ORDER BY r.position ASC LIMIT 1000"
         ))?;
@@ -763,6 +764,19 @@ fn subagent_chat_event(
             "resolved": resolved,
         }),
         TimelineBody::Error => json!({ "kind": "agent.error", "message": record.preview }),
+        // Questions in a subagent transcript render with the same card shape
+        // as main-timeline questions.
+        TimelineBody::Question {
+            request_id,
+            questions,
+            resolved,
+            ..
+        } => json!({
+            "kind": "question.request",
+            "reqId": request_id,
+            "questions": questions,
+            "resolved": resolved,
+        }),
         // Cards, turn markers and user prompts don't belong in the detail log.
         TimelineBody::Subagent { .. } | TimelineBody::TurnEnd { .. } => return None,
     };

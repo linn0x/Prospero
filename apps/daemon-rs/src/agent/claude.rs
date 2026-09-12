@@ -17,6 +17,33 @@ use tokio::sync::{mpsc, oneshot};
 use super::store::{ApprovalPolicy, PermissionMode};
 use crate::error::{Error, Result};
 
+/// One AskUserQuestion entry, normalized from the tool input.
+#[derive(Debug, Clone)]
+pub(super) struct QuestionSpec {
+    pub(super) id: String,
+    pub(super) header: String,
+    /// The original question text; the native `answers` map is keyed by it.
+    pub(super) native_question: String,
+    pub(super) question: String,
+    pub(super) options: Vec<QuestionOptionSpec>,
+    pub(super) multi_select: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct QuestionOptionSpec {
+    pub(super) label: String,
+    pub(super) description: Option<String>,
+    pub(super) preview: Option<String>,
+}
+
+/// Answer to a structured question. A cancelled question still allows the
+/// tool call with an empty `answers` map (matches the legacy adapter); a
+/// dropped sender (turn interrupt/daemon shutdown) denies it.
+pub(super) struct QuestionReply {
+    pub(super) answers: HashMap<String, String>,
+    pub(super) cancelled: bool,
+}
+
 /// Semantic events normalized from the CLI JSONL stream.
 pub(super) enum AdapterEvent {
     NativeId(String),
@@ -59,6 +86,12 @@ pub(super) enum AdapterEvent {
         tool: String,
         summary: String,
         reply: oneshot::Sender<bool>,
+    },
+    Question {
+        subagent: Option<String>,
+        request_id: String,
+        questions: Vec<QuestionSpec>,
+        reply: oneshot::Sender<QuestionReply>,
     },
     Finish {
         interrupted: bool,
@@ -279,6 +312,16 @@ fn tool_summary(input: &Value) -> String {
     summarize(picked.to_owned(), 2000)
 }
 
+/// Rebuild the tool input with the native `answers` map the CLI expects.
+fn merge_answers(input: &Value, answers: &serde_json::Map<String, Value>) -> Value {
+    let mut merged = match input {
+        Value::Object(map) => map.clone(),
+        _ => serde_json::Map::new(),
+    };
+    merged.insert("answers".into(), Value::Object(answers.clone()));
+    Value::Object(merged)
+}
+
 impl Translator {
     /// Resolve the owning subagent of a frame, mirroring the legacy adapter:
     /// a native task id maps to a public tool-use id, and background tasks
@@ -418,9 +461,13 @@ impl Translator {
                         .and_then(Value::as_str)
                         .unwrap_or("tool")
                         .to_owned();
-                    let summary = request.get("input").map(tool_summary).unwrap_or_default();
-                    if auto {
-                        let input = request.get("input").cloned().unwrap_or(Value::Null);
+                    let input = request.get("input").cloned().unwrap_or(Value::Null);
+                    if tool == "AskUserQuestion" {
+                        // Questions are an interaction, not an approval: they
+                        // surface even under auto-approval policy (mirrors the
+                        // legacy adapter, which intercepts before policy).
+                        self.translate_question(&mut out, writer, agent, request_id, input);
+                    } else if auto {
                         let frame = serde_json::json!({
                             "type":"control_response",
                             "response":{"subtype":"success","request_id":request_id,
@@ -455,7 +502,7 @@ impl Translator {
                             subagent: agent,
                             request_id,
                             tool,
-                            summary,
+                            summary: tool_summary(&input),
                             reply,
                         });
                     }
@@ -494,6 +541,118 @@ impl Translator {
             _ => {}
         }
         out
+    }
+
+    /// Normalize an AskUserQuestion tool request and block the CLI on a
+    /// oneshot until the user answers (mirrors the legacy adapter's
+    /// `requestUserQuestion`).
+    fn translate_question(
+        &mut self,
+        out: &mut Vec<AdapterEvent>,
+        writer: &mpsc::Sender<String>,
+        agent: Option<String>,
+        request_id: String,
+        input: Value,
+    ) {
+        let mut specs = Vec::new();
+        if let Some(native) = input.get("questions").and_then(Value::as_array) {
+            for (index, row) in native.iter().enumerate() {
+                let Some(row) = row.as_object() else {
+                    continue;
+                };
+                let native_question = row
+                    .get("question")
+                    .and_then(Value::as_str)
+                    .unwrap_or("请选择")
+                    .to_owned();
+                let id = format!("q{}", index + 1);
+                let options = row
+                    .get("options")
+                    .and_then(Value::as_array)
+                    .map(|choices| {
+                        choices
+                            .iter()
+                            .filter_map(|choice| {
+                                let choice = choice.as_object()?;
+                                let label = choice.get("label")?.as_str()?;
+                                Some(QuestionOptionSpec {
+                                    label: summarize(label.to_owned(), 500),
+                                    description: choice
+                                        .get("description")
+                                        .and_then(Value::as_str)
+                                        .map(|text| summarize(text.to_owned(), 2000)),
+                                    preview: choice
+                                        .get("preview")
+                                        .and_then(Value::as_str)
+                                        .map(|text| summarize(text.to_owned(), 2000)),
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                specs.push(QuestionSpec {
+                    id,
+                    header: row
+                        .get("header")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Agent 提问")
+                        .to_owned(),
+                    question: summarize(native_question.clone(), 2000),
+                    native_question,
+                    options,
+                    multi_select: row.get("multiSelect").and_then(Value::as_bool) == Some(true),
+                });
+            }
+        }
+        if specs.is_empty() {
+            // Nothing to ask: allow immediately with an empty answers map,
+            // matching the legacy adapter.
+            let frame = serde_json::json!({
+                "type":"control_response",
+                "response":{"subtype":"success","request_id":request_id,
+                    "response":{"behavior":"allow",
+                        "updatedInput": merge_answers(&input, &serde_json::Map::new())}}
+            })
+            .to_string();
+            let _ = writer.try_send(frame);
+            return;
+        }
+        let (reply, receiver) = oneshot::channel();
+        let writer = writer.clone();
+        let rid = request_id.clone();
+        tokio::spawn(async move {
+            let response = match receiver.await {
+                // The user answered, or explicitly cancelled: either way the
+                // tool call is allowed — with answers, or with an empty map.
+                Ok(QuestionReply { answers, cancelled }) => {
+                    let mut map = serde_json::Map::new();
+                    if !cancelled {
+                        for (question, value) in answers {
+                            map.insert(question, Value::String(value));
+                        }
+                    }
+                    serde_json::json!({"behavior":"allow",
+                        "updatedInput": merge_answers(&input, &map)})
+                }
+                // The sender was dropped (interrupt/shutdown): deny so the
+                // CLI does not keep blocking on a callback nobody will send.
+                Err(_) => serde_json::json!({"behavior":"deny",
+                    "message":"The user cancelled the question."}),
+            };
+            let frame = serde_json::json!({
+                "type":"control_response",
+                "response":{"subtype":"success","request_id":rid,
+                    "response":response}
+            })
+            .to_string();
+            let _ = writer.send(frame).await;
+        });
+        out.push(AdapterEvent::Question {
+            subagent: agent,
+            request_id,
+            questions: specs,
+            reply,
+        });
     }
 
     /// `system` frames: native init plus the Task-tool lifecycle.

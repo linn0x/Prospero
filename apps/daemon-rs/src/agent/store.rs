@@ -169,16 +169,33 @@ impl Store {
         session_id: &str,
         record_id: &str,
     ) -> Result<()> {
+        self.resolve_agent_request_record(session_id, record_id, "permission_request")
+    }
+
+    /// Mark a question timeline record as resolved.
+    pub(crate) fn resolve_agent_question(
+        &mut self,
+        session_id: &str,
+        record_id: &str,
+    ) -> Result<()> {
+        self.resolve_agent_request_record(session_id, record_id, "question")
+    }
+
+    fn resolve_agent_request_record(
+        &mut self,
+        session_id: &str,
+        record_id: &str,
+        kind: &str,
+    ) -> Result<()> {
         crate::database::validate_id(session_id)?;
         crate::database::validate_id(record_id)?;
         let transaction = self.connection.transaction()?;
         let updated = transaction.execute(
             "UPDATE timeline_records SET revision=revision+1, \
              body=json_set(body,'$.resolved',json('true')) \
-             WHERE session_id=?1 AND id=?2 \
-             AND json_extract(body,'$.kind')='permission_request' \
+             WHERE session_id=?1 AND id=?2 AND json_extract(body,'$.kind')=?3 \
              AND coalesce(json_extract(body,'$.resolved'),0)=0",
-            params![session_id, record_id],
+            params![session_id, record_id, kind],
         )?;
         if updated != 1 {
             return Err(Error::NotFound);
@@ -194,16 +211,17 @@ impl Store {
         Ok(())
     }
 
-    /// Resolve every still-pending permission record in a session (used by
-    /// interrupt and crash recovery; the CLI answers are denies).
-    pub(crate) fn resolve_all_agent_permissions(&mut self, session_id: &str) -> Result<usize> {
+    /// Resolve every still-pending permission or question record in a
+    /// session (used by interrupt and crash recovery; the CLI answers are
+    /// denies or dropped callbacks).
+    pub(crate) fn resolve_all_agent_requests(&mut self, session_id: &str) -> Result<usize> {
         crate::database::validate_id(session_id)?;
         let transaction = self.connection.transaction()?;
         let mut resolved = Vec::new();
         {
             let mut statement = transaction.prepare(
                 "SELECT id FROM timeline_records WHERE session_id=?1 \
-                 AND json_extract(body,'$.kind')='permission_request' \
+                 AND json_extract(body,'$.kind') IN ('permission_request','question') \
                  AND coalesce(json_extract(body,'$.resolved'),0)=0",
             )?;
             let rows = statement.query_map(params![session_id], |row| row.get::<_, String>(0))?;
@@ -249,12 +267,12 @@ impl Store {
             },
             |tx| {
                 tx.execute("UPDATE agent_runs SET active=0 WHERE session_id=?", [id])?;
-                // Resolve any approvals left pending by a dead process.
+                // Resolve any approvals/questions left pending by a dead process.
                 tx.execute(
                     "UPDATE timeline_records SET revision=revision+1, \
                      body=json_set(body,'$.resolved',json('true')) \
                      WHERE session_id=?1 \
-                     AND json_extract(body,'$.kind')='permission_request' \
+                     AND json_extract(body,'$.kind') IN ('permission_request','question') \
                      AND coalesce(json_extract(body,'$.resolved'),0)=0",
                     [id],
                 )?;
