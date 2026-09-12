@@ -19,8 +19,8 @@ use tokio::sync::{Semaphore, watch};
 
 use crate::agent::Agents;
 use crate::agent::{
-    AgentModeSelection, AgentSend, CreateAgentSession, PermissionDecision, PermissionMode,
-    QuestionDecision, mode_catalog,
+    AgentModeSelection, AgentModelSelection, AgentSend, CreateAgentSession, PermissionDecision,
+    PermissionMode, QuestionDecision, mode_catalog,
 };
 use crate::auth::Token;
 use crate::database::Store;
@@ -97,6 +97,11 @@ impl Api {
                 "/v1/agent-sessions/{id}/modes",
                 get(agent_modes).post(set_agent_mode),
             )
+            .route(
+                "/v1/agent-sessions/{id}/models",
+                get(agent_models).post(set_agent_model),
+            )
+            .route("/v1/agent-sessions/controls", get(agent_controls))
             .route(
                 "/v1/agent-sessions/{id}/subagents/{subagent}/events",
                 get(agent_subagent_events),
@@ -488,6 +493,39 @@ async fn set_agent_mode(
     };
     api.agents.set_mode(&id, mode).await?;
     Ok(Json(serde_json::json!({ "currentMode": selection.mode })))
+}
+
+async fn agent_models(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<crate::agent::AgentModelCatalog>, ApiError> {
+    crate::database::validate_id(&id).map_err(ApiError)?;
+    let _permit = api.requests.acquire().await.map_err(|_| Error::Closed)?;
+    let catalog = api.agents.models(&id).await.map_err(ApiError)?;
+    Ok(Json(catalog))
+}
+
+async fn set_agent_model(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<AgentModelSelection>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<crate::agent::AgentModelSelectionResult>, ApiError> {
+    crate::database::validate_id(&id).map_err(ApiError)?;
+    let Json(selection) = body.map_err(|_| Error::Invalid("invalid model selection".into()))?;
+    let _permit = api.requests.acquire().await.map_err(|_| Error::Closed)?;
+    let result = api
+        .agents
+        .set_model(&id, selection.model, selection.effort)
+        .await
+        .map_err(ApiError)?;
+    Ok(Json(result))
+}
+
+async fn agent_controls(
+    State(api): State<Api>,
+) -> std::result::Result<Json<crate::agent::AgentControlsProjection>, ApiError> {
+    let controls = api.agents.controls().await.map_err(ApiError)?;
+    Ok(Json(controls))
 }
 
 async fn agent_subagent_events(

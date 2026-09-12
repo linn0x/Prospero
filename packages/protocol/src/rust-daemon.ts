@@ -53,6 +53,11 @@ export type CreateAgentSession = { title: string, workspace: string, autoApprove
 model?: string | null, effort?: string | null, };
 export type LaunchModelInfo = { id: string, label: string, description?: string | null, supportedEfforts: Array<string>, isDefault?: boolean, };
 export type LaunchModelCatalog = { models: Array<LaunchModelInfo>, currentModel: string | null, };
+export type AgentModelSelection = { model: string, effort: string | null, };
+export type AgentModelSelectionResult = { currentModel: string, currentEffort: string | null, };
+export type AgentModelCatalog = { models: Array<LaunchModelInfo>, currentModel: string | null, currentEffort: string | null, };
+export type SessionAgentControls = { sessionId: string, compact: boolean, model: boolean, mode: boolean, currentModel: string | null, currentEffort: string | null, currentMode: string | null, };
+export type AgentControlsProjection = { controls: Array<SessionAgentControls>, };
 export type AttachmentInput = { mimeType: string, dataB64: string, name?: string | null, };
 export type AgentSend = { text: string, 
 /**

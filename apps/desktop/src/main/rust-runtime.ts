@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 import type { SessionHead, TimelineQuery, TimelineTextQuery, AttachmentInput } from "@prospero/protocol/rust-daemon";
-import type { QueuedMessage } from "@prospero/protocol/rust-daemon";
+import type { QueuedMessage, SessionAgentControls } from "@prospero/protocol/rust-daemon";
 import type { DesktopSnapshot, JsonObject, QueuedChatMessage, SessionInfo, SessionPage, SessionPageRequest } from "../shared/types";
 import { StateStore } from "./state-store";
 import { RustProcess, type RustConnection } from "./rust-process";
@@ -55,9 +55,17 @@ function normalizeAttachments(raw: unknown): AttachmentInput[] {
   return attachments;
 }
 
-export function rustSessionInfo(head: SessionHead, messageQueue?: QueuedMessage[]): SessionInfo {
+export function rustSessionInfo(head: SessionHead, messageQueue?: QueuedMessage[], controls?: SessionAgentControls): SessionInfo {
   const queue = messageQueue?.length ? { messageQueue: messageQueue.slice(0, 50).map(toQueuedChat) } : {};
-  return { id: head.id, agent: head.agent, kind: head.kind, ...(head.kind === "pty" ? { terminalMode: "events" as const } : { historyMode: "paged" as const }), title: head.title, cwd: head.workspace, status: head.status === "waiting_permission" ? "waiting_approval" : head.status, createdAt: head.createdAt, pendingPermissions: head.status === "waiting_permission" ? 1 : 0, pendingQuestions: head.status === "waiting_input" ? 1 : 0, ...queue };
+  const agentControls = controls ? {
+    compact: controls.compact,
+    model: controls.model,
+    mode: controls.mode,
+    ...(controls.currentModel !== null ? { currentModel: controls.currentModel } : {}),
+    ...(controls.currentEffort !== null ? { currentEffort: controls.currentEffort } : {}),
+    ...(controls.currentMode !== null ? { currentMode: controls.currentMode } : {}),
+  } : undefined;
+  return { id: head.id, agent: head.agent, kind: head.kind, ...(head.kind === "pty" ? { terminalMode: "events" as const } : { historyMode: "paged" as const }), title: head.title, cwd: head.workspace, status: head.status === "waiting_permission" ? "waiting_approval" : head.status, createdAt: head.createdAt, pendingPermissions: head.status === "waiting_permission" ? 1 : 0, pendingQuestions: head.status === "waiting_input" ? 1 : 0, ...queue, ...(agentControls ? { agentControls } : {}) };
 }
 
 export class RustRuntime {
@@ -155,7 +163,7 @@ export class RustRuntime {
     const { client, pid, baseUrl } = this.current();
     const signal = this.controller.signal;
     const orchCursor = await client.events({ scope: "orchestration", afterSeq: this.orchestrationSequence, limit: 1 }, signal).catch(() => null);
-    const [summary, active, recent, workspaces, health, queues, orchestration] = await Promise.all([
+    const [summary, active, recent, workspaces, health, queues, controls, orchestration] = await Promise.all([
       client.summary(undefined, signal),
       client.sessions({ limit: 100, cursor: null, lifecycle: "active", workspace: null, text: null }, signal),
       client.sessions({ limit: 20, cursor: null, lifecycle: "archived", workspace: null, text: null }, signal),
@@ -166,6 +174,11 @@ export class RustRuntime {
         // failure must not blank the session list.
         this.store.appendLog(`[rust] agent queues read failed: ${error instanceof Error ? error.message : String(error)}\n`);
         return { queues: [] };
+      }),
+      client.agentControls(signal).catch((error: unknown) => {
+        // Controls only gate the model/mode widgets; never blank the list.
+        this.store.appendLog(`[rust] agent controls read failed: ${error instanceof Error ? error.message : String(error)}\n`);
+        return { controls: [] };
       }),
       orchCursor
         ? readOrchestrationWindow(client, signal, orchCursor.latestSeq).catch((error: unknown) => {
@@ -178,7 +191,8 @@ export class RustRuntime {
     signal.throwIfAborted();
     if (orchCursor) this.orchestrationSequence = orchCursor.latestSeq;
     const queueById = new Map(queues.queues.map(queue => [queue.sessionId, queue.items]));
-    const sessions = [...active.items, ...recent.items].map(head => rustSessionInfo(head, queueById.get(head.id)));
+    const controlsById = new Map(controls.controls.map(item => [item.sessionId, item]));
+    const sessions = [...active.items, ...recent.items].map(head => rustSessionInfo(head, queueById.get(head.id), controlsById.get(head.id)));
     this.sequence = Math.min(summary.latestSeq, active.latestSeq, recent.latestSeq, workspaces.latestSeq);
     this.store.setApiState({ running: true, config: {}, devices: {}, orchestration: orchestration ?? {}, projects: workspaces.items.map(item => item.workspace), status: {
       pid, port: Number(new URL(baseUrl).port), bind: "127.0.0.1", sessions, capabilities: health.capabilities,
@@ -362,6 +376,22 @@ export class RustRuntime {
       }
       if (!init?.method || init.method === "GET") {
         const catalog = await this.current().client.agentModes(sessionId, signal);
+        return catalog as unknown as JsonObject;
+      }
+    }
+    const modelsRoute = /^\/_prospero\/control\/session\/([A-Za-z0-9_-]{1,128})\/models$/.exec(path);
+    if (modelsRoute) {
+      const sessionId = modelsRoute[1]!;
+      if (init?.method === "POST" && input) {
+        const model = normalizeLaunchSelection(input["model"], 160, "模型无效");
+        if (model === undefined) throw new Error("模型无效");
+        const effort = normalizeLaunchSelection(input["effort"], 80, "推理强度无效");
+        const result = await this.current().client.setAgentModel(sessionId, model, effort, signal, init?.timeoutMs);
+        await this.refresh(true);
+        return result as unknown as JsonObject;
+      }
+      if (!init?.method || init.method === "GET") {
+        const catalog = await this.current().client.agentModels(sessionId, signal, init?.timeoutMs);
         return catalog as unknown as JsonObject;
       }
     }
