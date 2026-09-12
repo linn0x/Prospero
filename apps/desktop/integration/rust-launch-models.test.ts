@@ -126,12 +126,17 @@ describe.skipIf(process.platform === "win32")("Launch model catalog through the 
     await expect(runtime.request(
       "/_prospero/control/launch/models?agent=codex&accountId=native-codex",
     )).rejects.toThrow(/尚未接入/);
-    await expect(runtime.request(
+    // Missing accountId defaults to the native account.
+    const nativeDefault = await runtime.request(
       "/_prospero/control/launch/models?agent=claude",
-    )).rejects.toThrow(/尚未接入/);
+    );
+    expect((nativeDefault!["models"] as Array<Record<string, unknown>>).map((model) => model["id"]))
+      .toEqual(["default", "opus[1m]"]);
+    // An unknown managed id passes bridge validation and is rejected by the
+    // daemon (404) rather than claimed as unsupported.
     await expect(runtime.request(
-      "/_prospero/control/launch/models?agent=claude&accountId=managed-x",
-    )).rejects.toThrow(/此账号尚未接入|尚未接入/);
+      "/_prospero/control/launch/models?agent=claude&accountId=managed-missing",
+    )).rejects.toThrow(/Rust 服务请求失败（404）/);
   }, 60_000);
 
   it("forwards model/effort on session creation to every CLI turn", async () => {

@@ -17,6 +17,7 @@ enum Job {
 }
 
 struct Inner {
+    directory: PathBuf,
     sender: mpsc::Sender<Job>,
     closed: AtomicBool,
     thread: Mutex<Option<thread::JoinHandle<()>>>,
@@ -29,10 +30,11 @@ impl Database {
     pub async fn open(directory: PathBuf) -> Result<Self> {
         let (sender, mut receiver) = mpsc::channel(DATABASE_QUEUE_CAPACITY);
         let (ready, initialized) = oneshot::channel();
+        let worker_directory = directory.clone();
         let thread = thread::Builder::new()
             .name("prospero-database".into())
             .spawn(move || {
-                let mut store = match Store::open(&directory) {
+                let mut store = match Store::open(&worker_directory) {
                     Ok(store) => store,
                     Err(error) => {
                         let _ = ready.send(Err(error));
@@ -51,10 +53,16 @@ impl Database {
             })?;
         initialized.await.map_err(|_| Error::Closed)??;
         Ok(Self(Arc::new(Inner {
+            directory,
             sender,
             closed: AtomicBool::new(false),
             thread: Mutex::new(Some(thread)),
         })))
+    }
+
+    /// Private daemon data directory (never the user's shared CLI home).
+    pub fn directory(&self) -> &std::path::Path {
+        &self.0.directory
     }
 
     pub async fn call<T, F>(&self, operation: F) -> Result<T>

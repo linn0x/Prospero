@@ -47,6 +47,7 @@ impl Harness {
                 auto_approve,
                 model: None,
                 effort: None,
+                account_id: None,
             })
             .await
             .unwrap();

@@ -249,6 +249,7 @@ pub async fn start_worker(
             auto_approve: false,
             model: None,
             effort: None,
+            account_id: None,
         })
         .await
     {

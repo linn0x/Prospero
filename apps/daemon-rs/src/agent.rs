@@ -22,6 +22,9 @@ pub struct CreateAgentSession {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Managed account id; None (or the native id) uses the本机默认环境.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
 }
 
 /// One row in the launch model catalog (legacy AgentModelCatalog contract).

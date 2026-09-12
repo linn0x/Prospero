@@ -130,7 +130,7 @@ impl Api {
             .route("/v1/terminals/{id}/close", post(terminal_close))
             .route("/v1/sessions", get(sessions))
             .route("/v1/skills", get(list_skills_route))
-            .route("/v1/accounts", post(list_accounts_route))
+            .route("/v1/accounts", post(accounts_route))
             .route("/v1/launch/models", get(launch_models))
             .route("/v1/sessions/summary", get(summary))
             .route("/v1/sessions/lookup", post(lookup))
@@ -224,7 +224,7 @@ impl IntoResponse for ApiError {
             Error::Forbidden => StatusCode::FORBIDDEN,
             Error::Invalid(_) => StatusCode::BAD_REQUEST,
             Error::NotFound => StatusCode::NOT_FOUND,
-            Error::Conflict | Error::AlreadyRunning => StatusCode::CONFLICT,
+            Error::Conflict | Error::AlreadyRunning | Error::InUse => StatusCode::CONFLICT,
             Error::Busy | Error::Closed => StatusCode::SERVICE_UNAVAILABLE,
             Error::Timeout => StatusCode::GATEWAY_TIMEOUT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -412,24 +412,93 @@ async fn list_skills_route(
     Ok(Json(serde_json::json!({ "items": items })))
 }
 
-// ── Accounts (Stage 8, read-only discovery) ───────────────────────────────
+// ── Accounts (Stage 8: discovery + managed accounts) ─────────────────────
 
-async fn list_accounts_route(
+/// Tag-dispatched account control. Managed metadata mutations run through the
+/// database queue; login spawns an isolated `claude setup-token` PTY.
+async fn accounts_route(
     State(api): State<Api>,
-    body: std::result::Result<
-        Json<crate::accounts::AccountListRequest>,
-        axum::extract::rejection::JsonRejection,
-    >,
+    body: std::result::Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> JsonResult<crate::accounts::AccountListResult> {
-    let Json(input) = body.map_err(|_| Error::Invalid("invalid account request".into()))?;
-    if input.kind != "agent.accounts.list"
-        || input.request_id.trim().is_empty()
-        || input.request_id.chars().count() > 100
-    {
-        return Err(Error::Invalid("invalid account request".into()).into());
-    }
-    let result = crate::accounts::list_accounts(&api.database, &input.request_id).await?;
+    let Json(value) = body.map_err(|_| Error::Invalid("invalid account request".into()))?;
+    let control = crate::accounts::parse_control(&value)?;
+    let _permit = api.requests.acquire().await.map_err(|_| Error::Closed)?;
+    let (account_id, session_id) = match &control {
+        crate::accounts::AccountControl::List { .. } => (None, None),
+        crate::accounts::AccountControl::Login {
+            account_id,
+            cols,
+            rows,
+            ..
+        } => {
+            if account_id == crate::accounts::NATIVE_CLAUDE_ID {
+                return Err(ApiError(Error::Forbidden));
+            }
+            let size = TerminalSize {
+                cols: *cols,
+                rows: *rows,
+            }
+            .validate()
+            .map_err(ApiError)?;
+            let data = api.database.directory().to_owned();
+            let id = account_id.clone();
+            let record = api
+                .database
+                .call(move |store| store.managed_account(&id))
+                .await?;
+            let id = account_id.clone();
+            let environment = tokio::task::spawn_blocking(move || {
+                crate::accounts::managed::claude_environment(&data, &id, true)
+            })
+            .await
+            .map_err(|_| Error::Closed)??;
+            let head = api
+                .terminals
+                .create_login(
+                    account_id,
+                    format!("{} · 登录", record.name),
+                    size,
+                    environment,
+                )
+                .await?;
+            api.publish();
+            (Some(account_id.clone()), Some(head.id))
+        }
+        other => {
+            if let Some(id) = control_account_id(other)
+                && id == crate::accounts::NATIVE_CLAUDE_ID
+            {
+                // The native environment can never be renamed, logged out or
+                // deleted, matching legacy account_not_managed (403).
+                return Err(ApiError(Error::Forbidden));
+            }
+            if let crate::accounts::AccountControl::Create { agent, .. } = other
+                && agent != "claude"
+            {
+                return Err(ApiError(Error::Invalid(
+                    "Rust 当前仅支持 Claude 托管账号".into(),
+                )));
+            }
+            let account_id = crate::accounts::execute_control(&api.database, &control).await?;
+            api.publish();
+            (account_id, None)
+        }
+    };
+    let result = crate::accounts::respond(&api.database, &control, account_id, session_id).await?;
     Ok(Json(result))
+}
+
+fn control_account_id(control: &crate::accounts::AccountControl) -> Option<&str> {
+    match control {
+        crate::accounts::AccountControl::Rename { account_id, .. }
+        | crate::accounts::AccountControl::SetDefault { account_id, .. }
+        | crate::accounts::AccountControl::Login { account_id, .. }
+        | crate::accounts::AccountControl::SetCredential { account_id, .. }
+        | crate::accounts::AccountControl::Logout { account_id, .. }
+        | crate::accounts::AccountControl::Delete { account_id, .. } => Some(account_id),
+        crate::accounts::AccountControl::List { .. }
+        | crate::accounts::AccountControl::Create { .. } => None,
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -440,25 +509,25 @@ struct LaunchModelsQuery {
     account_id: Option<String>,
 }
 
-/// Launch model catalog for the desktop new-session dialog. Only the native
-/// Claude environment exists in this slice; every other agent/account is a
-/// 400 so the desktop never silently shows a stale or fabricated catalog.
+/// Launch model catalog for the desktop new-session dialog. Serves the native
+/// Claude environment and managed Claude accounts; other agents are a 400 and
+/// unknown accounts a 404, so the desktop never shows a fabricated catalog.
 async fn launch_models(
     State(api): State<Api>,
     Query(query): Query<LaunchModelsQuery>,
 ) -> std::result::Result<Json<crate::agent::LaunchModelCatalog>, ApiError> {
-    if query.agent != "claude"
-        || !matches!(
-            query.account_id.as_deref(),
-            Some(crate::accounts::NATIVE_CLAUDE_ID)
-        )
-    {
+    if query.agent != "claude" {
         return Err(ApiError(Error::Invalid(
             "invalid model catalog agent".into(),
         )));
     }
     let _permit = api.requests.acquire().await.map_err(|_| Error::Closed)?;
-    let catalog = Agents::launch_catalog().await.map_err(ApiError)?;
+    // An absent accountId means the native environment; the runtime
+    // canonicalizes it the same way.
+    let account_id = query
+        .account_id
+        .or_else(|| Some(crate::accounts::NATIVE_CLAUDE_ID.into()));
+    let catalog = api.agents.launch_catalog_for(account_id.as_deref()).await?;
     Ok(Json(catalog))
 }
 
