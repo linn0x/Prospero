@@ -804,7 +804,7 @@ fn schema_v10_worktree_indexes_survive_reopen() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     // Stage 7 reverse-edge indexes and Stage 8 worktree indexes all exist.
     let indexed: i64 = connection
         .query_row(
@@ -834,7 +834,7 @@ fn schema_v10_worktree_indexes_survive_reopen() {
 }
 
 #[test]
-fn v8_database_is_migrated_forward_to_v10() {
+fn v8_database_is_migrated_forward_to_v11() {
     // Build a v8 database by initialising the pre-orchestration schema with the
     // legacy application id, then prove Store::open upgrades it in place.
     let directory = TempDir::new().unwrap();
@@ -854,13 +854,13 @@ fn v8_database_is_migrated_forward_to_v10() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     // The migrated store serves orchestration writes.
     let (_run_id, _ids) = make_run(&mut store, "op-graph-migrated", chain(1));
 }
 
 #[test]
-fn v9_database_is_migrated_forward_to_v10() {
+fn v9_database_is_migrated_forward_to_v11() {
     // A v9 database (Stage 7 current schema) gains the v10 worktree table and
     // dispatch column without losing rows.
     let directory = TempDir::new().unwrap();
@@ -884,7 +884,7 @@ fn v9_database_is_migrated_forward_to_v10() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        10
+        11
     );
     drop(connection);
     let (run_id, ids) = make_run(&mut store, "op-graph-v9up", chain(1));
@@ -899,6 +899,62 @@ fn v9_database_is_migrated_forward_to_v10() {
         snapshot.dispatches.first().unwrap().worktree_path,
         Some("/tmp/tree".to_owned())
     );
+}
+
+#[test]
+fn v10_database_is_migrated_forward_to_v11() {
+    // A v10 database gains agent_runs.permission_mode with the default mode.
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("prospero.sqlite");
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(include_str!("../src/schema.sql"))
+            .unwrap();
+        connection
+            .execute_batch(include_str!("../src/orchestration/schema.sql"))
+            .unwrap();
+        connection
+            .execute_batch(include_str!("../src/orchestration/schema-v10.sql"))
+            .unwrap();
+        connection
+            .pragma_update(None, "application_id", 0x50525253i64)
+            .unwrap();
+        connection.pragma_update(None, "user_version", 10).unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_heads \
+                 (id,created_at,lifecycle,revision,payload) \
+                 VALUES('sess-mode',1,'active',1,json('{\"workspace\":\"/w\",\"agent\":\"claude\",\"kind\":\"structured\",\"title\":\"A\",\"status\":\"idle\"}'))",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO agent_runs(session_id,agent,active,approval_policy,turn,native_id) \
+                 VALUES('sess-mode','claude',1,'manual',0,NULL)",
+                [],
+            )
+            .unwrap();
+    }
+    let store = Store::open(directory.path()).unwrap();
+    let connection = raw(&directory);
+    assert_eq!(
+        connection
+            .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap(),
+        11
+    );
+    let mode: String = connection
+        .query_row(
+            "SELECT permission_mode FROM agent_runs WHERE session_id='sess-mode'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(mode, "default");
+    drop(connection);
+    drop(store);
 }
 
 #[test]
