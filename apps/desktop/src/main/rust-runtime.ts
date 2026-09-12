@@ -10,6 +10,15 @@ import { orchestrationAction, readOrchestrationWindow, settleDispatchInput } fro
 const ATTACHMENT_MIME = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
 const BASE64_RE = /^[A-Za-z0-9+/=]+$/;
 
+/** Account actions beyond read-only discovery are later slices. */
+const NATIVE_CLAUDE_ACCOUNT = "native-claude";
+const UNSUPPORTED_ACCOUNT_TYPES = new Set([
+  "agent.account.create", "agent.account.api.create", "agent.account.api.configure",
+  "agent.account.api.test", "agent.account.rename", "agent.account.default",
+  "agent.account.login", "agent.account.credential.set", "agent.account.logout",
+  "agent.account.delete",
+]);
+
 function toQueuedChat(item: QueuedMessage): QueuedChatMessage {
   return { id: item.id, text: item.text, kind: item.kind === "guide" ? "guide" : "queue", createdAt: item.createdAt, attachmentCount: item.attachmentCount ?? 0 };
 }
@@ -272,6 +281,18 @@ export class RustRuntime {
   async request(path: string, init?: { method?: "GET" | "POST"; body?: JsonObject; signal?: AbortSignal; timeoutMs?: number; acceptJsonError?: boolean }): Promise<JsonObject | null> {
     const signal = init?.signal ? AbortSignal.any([init.signal, this.controller.signal]) : this.controller.signal;
     const input = init?.body;
+    if (path === "/_prospero/control/accounts" && init?.method === "POST" && input) {
+      const type = input["type"];
+      if (type === "agent.accounts.list") {
+        const requestId = input["requestId"];
+        if (typeof requestId !== "string" || !requestId.trim() || requestId.length > 100) throw new Error("请求 ID 无效");
+        const result = await this.current().client.listAccounts(requestId, signal);
+        return result as unknown as JsonObject;
+      }
+      // Managed accounts / API profiles / login flows are later slices.
+      if (typeof type === "string" && UNSUPPORTED_ACCOUNT_TYPES.has(type)) throw new Error("账号管理尚未接入 Rust daemon");
+      throw new Error("不支持的账号操作");
+    }
     if (path === "/_prospero/control/orchestration/action" && init?.method === "POST" && input) {
       const method = input["method"];
       if (typeof method !== "string") throw new Error("不支持的编排操作");
@@ -346,7 +367,8 @@ export class RustRuntime {
         return rustSessionInfo(head);
       }
       if (input["agent"] !== "claude") throw new Error("Rust Agent 当前仅接入 Claude Code");
-      if (input["kind"] !== "structured" || input["command"] || input["accountId"] || input["model"] || input["mode"] || input["effort"]) throw new Error("此 Agent 选项尚未接入 Rust daemon");
+      if (input["accountId"] !== undefined && input["accountId"] !== NATIVE_CLAUDE_ACCOUNT) throw new Error("此账号尚未接入 Rust daemon");
+      if (input["kind"] !== "structured" || input["command"] || input["model"] || input["mode"] || input["effort"]) throw new Error("此 Agent 选项尚未接入 Rust daemon");
       const policy = input["approvalPolicy"];
       if (policy !== "strict" && policy !== "standard" && policy !== "yolo") throw new Error("审批策略无效");
       const head = await this.current().client.createAgentSession({
