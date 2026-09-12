@@ -23,8 +23,9 @@ use crate::auth::Token;
 use crate::database::Store;
 use crate::error::{Error, Result};
 use crate::orchestration::{
-    self, AbandonDispatch, AbandonRun, ApplyTaskGraph, CancelTask, CompleteRun, CreateGate,
-    CreateRunGraph, DispatchTask, MarkMessages, PostMessage, ResolveGate, SettleDispatch,
+    self, AbandonDispatch, AbandonRun, ApplyTaskGraph, CancelTask, CleanupWorktree, CompleteRun,
+    CreateGate, CreateRun, CreateRunGraph, CreateTask, DeleteRun, DispatchTask, InspectWorktree,
+    MarkMessages, PostMessage, ResolveGate, SettleDispatch, StartWorker, StopWorker,
 };
 use crate::protocol::*;
 use crate::terminal::{
@@ -111,19 +112,25 @@ impl Api {
             )
             .route("/v1/events", get(events))
             .route("/v1/events/stream", get(subscribe))
-            .route("/v1/runs", get(list_runs))
+            .route("/v1/runs", get(list_runs).post(create_run))
             .route("/v1/runs/graph", post(create_run_graph))
             .route("/v1/runs/graph/apply", post(apply_task_graph))
-            .route("/v1/runs/{id}", get(run_snapshot))
+            .route("/v1/runs/{id}", get(run_snapshot).delete(delete_run))
             .route("/v1/runs/{id}/ready", get(ready_tasks))
             .route("/v1/runs/{id}/complete", post(complete_run))
             .route("/v1/runs/{id}/abandon", post(abandon_run))
             .route("/v1/runs/{id}/gates", post(create_gate))
-            .route("/v1/tasks", get(list_tasks))
+            .route("/v1/tasks", get(list_tasks).post(create_task))
             .route("/v1/tasks/{id}", get(task))
             .route("/v1/tasks/{id}/cancel", post(cancel_task))
             .route("/v1/tasks/{id}/retry", post(retry_task))
             .route("/v1/tasks/{id}/dispatch", post(dispatch_task))
+            .route("/v1/workers/start", post(start_worker_route))
+            .route("/v1/workers/stop", post(stop_worker_route))
+            .route("/v1/worktrees", get(list_worktrees))
+            .route("/v1/worktrees/{id}", get(worktree_asset_route))
+            .route("/v1/worktrees/{id}/inspect", post(inspect_worktree_route))
+            .route("/v1/worktrees/{id}/cleanup", post(cleanup_worktree_route))
             .route("/v1/dispatches", get(list_dispatches))
             .route("/v1/dispatches/recover", post(recover_dispatches))
             .route("/v1/dispatches/{id}", get(dispatch))
@@ -665,6 +672,30 @@ async fn list_runs(State(api): State<Api>) -> JsonResult<Vec<orchestration::Run>
     Ok(Json(api.call(|store| store.list_runs()).await?))
 }
 
+async fn create_run(
+    State(api): State<Api>,
+    body: std::result::Result<Json<CreateRun>, axum::extract::rejection::JsonRejection>,
+) -> JsonResult<orchestration::Run> {
+    let Json(input) = body.map_err(|_| Error::Invalid("invalid run request".into()))?;
+    let run = api.call(move |store| store.create_run(input)).await?;
+    api.publish();
+    Ok(Json(run))
+}
+
+async fn delete_run(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<DeleteRun>, axum::extract::rejection::JsonRejection>,
+) -> JsonResult<orchestration::RunDeletionResult> {
+    let force = match body {
+        Ok(Json(request)) => request.force,
+        Err(_) => false,
+    };
+    let result = api.call(move |store| store.delete_run(&id, force)).await?;
+    api.publish();
+    Ok(Json(result))
+}
+
 async fn create_run_graph(
     State(api): State<Api>,
     body: std::result::Result<Json<CreateRunGraph>, axum::extract::rejection::JsonRejection>,
@@ -764,6 +795,16 @@ async fn task(State(api): State<Api>, Path(id): Path<String>) -> JsonResult<orch
     Ok(Json(api.call(move |store| store.task(&id)).await?))
 }
 
+async fn create_task(
+    State(api): State<Api>,
+    body: std::result::Result<Json<CreateTask>, axum::extract::rejection::JsonRejection>,
+) -> JsonResult<orchestration::Task> {
+    let Json(input) = body.map_err(|_| Error::Invalid("invalid task request".into()))?;
+    let task = api.call(move |store| store.create_task(input)).await?;
+    api.publish();
+    Ok(Json(task))
+}
+
 async fn cancel_task(
     State(api): State<Api>,
     Path(id): Path<String>,
@@ -797,11 +838,83 @@ async fn dispatch_task(
     let Json(request) = body.map_err(|_| Error::Invalid("invalid dispatch request".into()))?;
     let outcome = api
         .call(move |store| {
-            store.dispatch_task(&id, &request.session_id, request.operation_id.as_deref())
+            store.dispatch_task(
+                &id,
+                &request.session_id,
+                request.operation_id.as_deref(),
+                request.worktree_path.as_deref(),
+            )
         })
         .await?;
     api.publish();
     Ok(Json(outcome))
+}
+
+// ── Workers & worktrees (Stage 8) ─────────────────────────────────────────
+
+async fn start_worker_route(
+    State(api): State<Api>,
+    body: std::result::Result<Json<StartWorker>, axum::extract::rejection::JsonRejection>,
+) -> JsonResult<orchestration::WorkerStartOutcome> {
+    let Json(input) = body.map_err(|_| Error::Invalid("invalid worker start request".into()))?;
+    let outcome = orchestration::start_worker(&api.database, &api.agents, input).await?;
+    api.publish();
+    Ok(Json(outcome))
+}
+
+async fn stop_worker_route(
+    State(api): State<Api>,
+    body: std::result::Result<Json<StopWorker>, axum::extract::rejection::JsonRejection>,
+) -> JsonResult<orchestration::SettleOutcome> {
+    let Json(input) = body.map_err(|_| Error::Invalid("invalid worker stop request".into()))?;
+    let outcome = orchestration::stop_worker(&api.database, &api.agents, input).await?;
+    api.publish();
+    Ok(Json(outcome))
+}
+
+async fn list_worktrees(
+    State(api): State<Api>,
+    query: std::result::Result<Query<RunScope>, axum::extract::rejection::QueryRejection>,
+) -> JsonResult<Vec<orchestration::WorktreeAsset>> {
+    let Query(query) = query.map_err(|_| Error::Invalid("invalid worktree query".into()))?;
+    Ok(Json(
+        api.call(move |store| store.list_worktree_assets(query.run_id.as_deref()))
+            .await?,
+    ))
+}
+
+async fn worktree_asset_route(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> JsonResult<orchestration::WorktreeAsset> {
+    Ok(Json(
+        api.call(move |store| store.worktree_asset(&id)).await?,
+    ))
+}
+
+async fn inspect_worktree_route(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<InspectWorktree>, axum::extract::rejection::JsonRejection>,
+) -> JsonResult<orchestration::WorktreeInspection> {
+    let request = body
+        .map(|Json(value)| value)
+        .unwrap_or(InspectWorktree { target_ref: None });
+    let inspection =
+        orchestration::inspect_worktree(&api.database, &id, request.target_ref).await?;
+    api.publish();
+    Ok(Json(inspection))
+}
+
+async fn cleanup_worktree_route(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<CleanupWorktree>, axum::extract::rejection::JsonRejection>,
+) -> JsonResult<orchestration::WorktreeCleanupResult> {
+    let Json(request) = body.map_err(|_| Error::Invalid("invalid cleanup request".into()))?;
+    let result = orchestration::cleanup_worktree(&api.database, &id, request).await?;
+    api.publish();
+    Ok(Json(result))
 }
 
 async fn list_dispatches(

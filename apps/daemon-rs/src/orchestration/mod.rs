@@ -7,14 +7,21 @@
 //! not satisfy the edge, so a chain whose premise disappeared never silently
 //! starts on a half-built foundation.
 
+mod gitops;
 mod store;
+mod workers;
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+pub use gitops::{
+    WorktreeCreate, create_worktree, inspect_asset, remove_worktree, repo_root,
+    worktree_default_path,
+};
 pub use store::{RecoveryReport, SettleOutcome};
+pub use workers::{cleanup_worktree, inspect_worktree, start_worker, stop_worker};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -160,6 +167,102 @@ pub struct Dispatch {
     pub started_at: i64,
     #[ts(type = "number | null")]
     pub settled_at: Option<i64>,
+    /// Working directory of the worker; for an isolated worker this is the
+    /// registered worktree path.
+    #[ts(type = "string | null")]
+    pub worktree_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeAssetKind {
+    Run,
+    Worker,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeAssetState {
+    Active,
+    Preserved,
+    Missing,
+    Dirty,
+    Unmerged,
+    Equivalent,
+    SafeToClean,
+    Cleaned,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeInspection {
+    pub state: WorktreeAssetState,
+    pub target_ref: String,
+    #[ts(type = "number")]
+    pub checked_at: i64,
+    pub path_exists: bool,
+    #[ts(type = "boolean | null")]
+    pub registered: Option<bool>,
+    #[ts(type = "boolean | null")]
+    pub dirty: Option<bool>,
+    #[ts(type = "string | null")]
+    pub branch: Option<String>,
+    #[ts(type = "number | null")]
+    pub ahead_commit_count: Option<i64>,
+    #[ts(type = "number | null")]
+    pub equivalent_commit_count: Option<i64>,
+    #[ts(type = "string | null")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeCleanup {
+    #[ts(type = "number")]
+    pub removed_at: i64,
+    pub branch_deleted: bool,
+    #[ts(type = "string | null")]
+    pub warning: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeAsset {
+    pub id: String,
+    pub kind: WorktreeAssetKind,
+    pub run_id: String,
+    #[ts(type = "string | null")]
+    pub task_id: Option<String>,
+    #[ts(type = "string | null")]
+    pub dispatch_id: Option<String>,
+    pub repo: String,
+    pub path: String,
+    #[ts(type = "string | null")]
+    pub branch: Option<String>,
+    pub state: WorktreeAssetState,
+    #[ts(type = "number")]
+    pub created_at: i64,
+    #[ts(type = "number")]
+    pub updated_at: i64,
+    #[ts(type = "number | null")]
+    pub run_deleted_at: Option<i64>,
+    #[ts(type = "WorktreeInspection | null")]
+    pub last_inspection: Option<WorktreeInspection>,
+    #[ts(type = "WorktreeCleanup | null")]
+    pub cleanup: Option<WorktreeCleanup>,
+    #[ts(type = "string | null")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeCleanupResult {
+    pub asset: WorktreeAsset,
+    pub inspection: WorktreeInspection,
+    pub branch_deleted: bool,
+    #[ts(type = "string | null")]
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -264,10 +367,119 @@ pub struct GraphMutationResult {
 
 #[derive(Debug, Deserialize, Serialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateRun {
+    pub objective: String,
+    #[serde(default)]
+    pub coordinator_session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateTask {
+    pub run_id: String,
+    pub title: String,
+    pub spec: String,
+    #[serde(default)]
+    pub skills: Vec<String>,
+    #[serde(default)]
+    pub deps: Vec<String>,
+    #[serde(default)]
+    pub parent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeleteRun {
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct RunDeletionResult {
+    pub run_id: String,
+    #[ts(type = "number")]
+    pub deleted_task_count: i64,
+    #[ts(type = "number")]
+    pub preserved_worktree_asset_ids: Vec<String>,
+}
+
+/// Desktop worker launch. `worktree` is `new` (isolated git worktree, matching
+/// the legacy launcher) or `none` (run straight in the provided cwd).
+#[derive(Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StartWorker {
+    pub task_id: String,
+    /// Only structured Claude workers are bridged in Rust mode.
+    pub cwd: String,
+    #[serde(default = "default_worktree_mode")]
+    pub worktree: String,
+    #[serde(default)]
+    pub operation_id: Option<String>,
+}
+
+fn default_worktree_mode() -> String {
+    "new".into()
+}
+
+#[derive(Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StopWorker {
+    pub task_id: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// `failed` (default) or `cancelled`.
+    #[serde(default)]
+    pub final_status: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InspectWorktree {
+    #[serde(default)]
+    pub target_ref: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CleanupWorktree {
+    #[serde(default)]
+    pub target_ref: Option<String>,
+    /// Explicit authorization; without it the directory is never removed.
+    pub confirm: bool,
+    #[serde(default)]
+    pub delete_branch: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisterWorktree {
+    pub kind: WorktreeAssetKind,
+    pub run_id: String,
+    pub task_id: Option<String>,
+    pub repo: String,
+    pub path: String,
+    pub branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerStartOutcome {
+    pub task: Task,
+    pub dispatch: Dispatch,
+    pub session_id: String,
+    #[ts(type = "WorktreeAsset | null")]
+    pub worktree: Option<WorktreeAsset>,
+}
+
+#[derive(Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DispatchTask {
     pub session_id: String,
     #[serde(default)]
     pub operation_id: Option<String>,
+    #[serde(default)]
+    pub worktree_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, TS)]
