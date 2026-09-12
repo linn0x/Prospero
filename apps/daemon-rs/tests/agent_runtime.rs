@@ -15,8 +15,27 @@ use tempfile::TempDir;
 
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+const CATALOG_MODELS: &str = r#"[{"value":"default","displayName":"Default",
+   "supportedEffortLevels":["low","medium","high"]},
+  {"value":"opus[1m]","displayName":"Opus (1M)","description":"long context",
+   "supportedEffortLevels":["low","high","max"]}]"#;
+
 const FAKE_CLI: &str = r#"#!/usr/bin/env python3
 import json, os, sys, time
+
+# Catalog-only handshake: exact five headless args, one initialize frame.
+if sys.argv[1:] == ["-p", "--output-format", "stream-json",
+                    "--input-format", "stream-json", "--verbose"]:
+    line = sys.stdin.readline()
+    frame = json.loads(line)
+    assert frame["type"] == "control_request", frame
+    assert frame["request"]["subtype"] == "initialize", frame
+    sys.stdout.write(json.dumps({
+        "type": "control_response",
+        "response": {"subtype": "success", "request_id": frame["request_id"],
+                     "response": {"models": __MODELS__}}}) + "\n")
+    sys.stdout.flush()
+    sys.exit(0)
 
 cwd = os.getcwd()
 scenario = open(os.path.join(cwd, "scenario")).read().strip()
@@ -127,6 +146,37 @@ elif scenario == "modelflag":
         log.write("\n".join(sys.argv[1:]) + "\n--\n")
     text_block("picked model")
     result()
+elif scenario == "setmodel":
+    if resume is not None:
+        # Chained turn: record argv so the test can prove the persisted
+        # selection is applied via --model/--effort after --resume.
+        with open(os.path.join(cwd, "args.log"), "a") as log:
+            log.write("\n".join(sys.argv[1:]) + "\n--\n")
+        text_block("second turn with switched model")
+        result()
+    else:
+        captured = []
+        def serve_controls():
+            while True:
+                raw = sys.stdin.readline()
+                if not raw:
+                    break
+                frame = json.loads(raw)
+                subtype = frame.get("request", {}).get("subtype")
+                if subtype in ("set_model", "apply_flag_settings"):
+                    captured.append(raw)
+                    emit({"type": "control_response", "response": {
+                        "subtype": "success",
+                        "request_id": frame["request_id"], "response": {}}})
+        import threading
+        thread = threading.Thread(target=serve_controls, daemon=True)
+        thread.start()
+        text_block("working on it")
+        time.sleep(1.5)
+        with open(os.path.join(cwd, "controls.log"), "w") as log:
+            log.write("".join(captured))
+        result()
+        time.sleep(0.5)
 elif scenario == "subagent":
     # Main turn invokes the Task tool; the nested stream is attributed to the
     # task via parent_tool_use_id, exactly like the real headless CLI.
@@ -250,7 +300,7 @@ impl Harness {
         let workspace = TempDir::new().unwrap();
         std::fs::write(workspace.path().join("scenario"), scenario).unwrap();
         let cli = data.path().join("fake-claude.py");
-        std::fs::write(&cli, FAKE_CLI).unwrap();
+        std::fs::write(&cli, FAKE_CLI.replace("__MODELS__", CATALOG_MODELS)).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -991,6 +1041,167 @@ async fn invalid_launch_selection_is_rejected() {
             .await;
         assert!(result.is_err(), "case {index} must be rejected");
     }
+}
+
+#[tokio::test]
+async fn in_session_models_combines_catalog_with_persisted_selection() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("chat").await;
+    let picked = harness
+        .agents
+        .create(CreateAgentSession {
+            title: "Picked".into(),
+            workspace: harness.workspace.path().to_str().unwrap().into(),
+            auto_approve: false,
+            model: Some("opus[1m]".into()),
+            effort: Some("high".into()),
+        })
+        .await
+        .unwrap();
+    let catalog = harness.agents.models(&picked.id).await.unwrap();
+    assert_eq!(catalog.models.len(), 2);
+    assert_eq!(catalog.current_model.as_deref(), Some("opus[1m]"));
+    assert_eq!(catalog.current_effort.as_deref(), Some("high"));
+    assert!(catalog.models[0].is_default);
+
+    // A session without a launch selection defaults the marker to catalog[0].
+    let plain = harness.create().await;
+    let catalog = harness.agents.models(&plain.id).await.unwrap();
+    assert_eq!(catalog.current_model.as_deref(), Some("default"));
+    assert_eq!(catalog.current_effort, None);
+
+    let controls = harness.agents.controls().await.unwrap();
+    let picked_controls = controls
+        .controls
+        .iter()
+        .find(|item| item.session_id == picked.id)
+        .unwrap();
+    assert!(picked_controls.model);
+    assert!(picked_controls.mode);
+    assert!(!picked_controls.compact);
+    assert_eq!(picked_controls.current_model.as_deref(), Some("opus[1m]"));
+    assert_eq!(picked_controls.current_effort.as_deref(), Some("high"));
+    assert_eq!(picked_controls.current_mode.as_deref(), Some("default"));
+}
+
+#[tokio::test]
+async fn set_model_validates_persists_and_forwards_to_live_turn() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("setmodel").await;
+    let head = harness.create().await;
+    harness
+        .agents
+        .send(&head.id, "do the thing".into(), None, Vec::new())
+        .await
+        .unwrap();
+    // Switch while the fake CLI's first turn is still running.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if harness.status(&head.id).await == prosperod_rs::protocol::SessionStatus::Running {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let result = harness
+        .agents
+        .set_model(&head.id, "opus[1m]".into(), Some("high".into()))
+        .await
+        .unwrap();
+    assert_eq!(result.current_model, "opus[1m]");
+    assert_eq!(result.current_effort.as_deref(), Some("high"));
+    harness
+        .wait_for(&head.id, |records| {
+            records.iter().any(|(_, body, _)| {
+                matches!(body, TimelineBody::TurnEnd { finish } if finish == "completed")
+            })
+        })
+        .await;
+    // The live turn received the native control requests verbatim.
+    let controls = std::fs::read_to_string(harness.workspace.path().join("controls.log")).unwrap();
+    assert!(
+        controls.contains("\"subtype\":\"set_model\""),
+        "{controls:?}"
+    );
+    assert!(controls.contains("\"model\":\"opus[1m]\""), "{controls:?}");
+    assert!(
+        controls.contains("\"subtype\":\"apply_flag_settings\"")
+            && controls.contains("\"effortLevel\":\"high\""),
+        "{controls:?}"
+    );
+
+    // The persisted selection applies to the chained resumed turn via argv.
+    harness
+        .agents
+        .send(&head.id, "again".into(), None, Vec::new())
+        .await
+        .unwrap();
+    harness
+        .wait_for(&head.id, |records| {
+            records
+                .iter()
+                .filter(|(_, body, _)| matches!(body, TimelineBody::TurnEnd { .. }))
+                .count()
+                == 2
+        })
+        .await;
+    let args = std::fs::read_to_string(harness.workspace.path().join("args.log")).unwrap();
+    let argv: Vec<&str> = args
+        .lines()
+        .filter(|line| !line.is_empty() && *line != "--")
+        .collect();
+    assert!(
+        argv.windows(2).any(|pair| pair == ["--model", "opus[1m]"]),
+        "{argv:?}"
+    );
+    assert!(
+        argv.windows(2).any(|pair| pair == ["--effort", "high"]),
+        "{argv:?}"
+    );
+}
+
+#[tokio::test]
+async fn set_model_rejects_catalog_mismatches() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("chat").await;
+    let head = harness.create().await;
+
+    let unknown = harness
+        .agents
+        .set_model(&head.id, "ghost-model".into(), None)
+        .await
+        .unwrap_err();
+    assert!(unknown.to_string().contains("模型不可用"), "{unknown}");
+
+    // opus[1m] supports low/high/max but not medium.
+    let unsupported = harness
+        .agents
+        .set_model(&head.id, "opus[1m]".into(), Some("medium".into()))
+        .await
+        .unwrap_err();
+    assert!(
+        unsupported.to_string().contains("不支持推理强度"),
+        "{unsupported}"
+    );
+
+    for bad in ["", " ", "x\n", &"x".repeat(161)] {
+        assert!(
+            harness
+                .agents
+                .set_model(&head.id, bad.to_owned(), None)
+                .await
+                .is_err()
+        );
+    }
+    // The rejected switches did not move the persisted selection.
+    let controls = harness.agents.controls().await.unwrap();
+    let row = controls
+        .controls
+        .iter()
+        .find(|item| item.session_id == head.id)
+        .unwrap();
+    assert_eq!(row.current_model, None);
+    assert_eq!(row.current_effort, None);
 }
 
 #[tokio::test]

@@ -1282,6 +1282,108 @@ impl Agents {
         Ok(())
     }
 
+    /// In-session model catalog. The catalog itself comes fresh from the
+    /// headless `initialize` handshake; currentModel/currentEffort are the
+    /// session's persisted selection.
+    pub async fn models(&self, id: &str) -> Result<AgentModelCatalog> {
+        let id = id.to_owned();
+        let run = self
+            .0
+            .database
+            .call(move |store| store.agent_run(&id))
+            .await?;
+        if !run.active {
+            return Err(Error::Conflict);
+        }
+        let models = super::claude::fetch_launch_catalog().await?;
+        let current_model = run
+            .model
+            .or_else(|| models.first().map(|model| model.id.clone()));
+        Ok(AgentModelCatalog {
+            models,
+            current_model,
+            current_effort: run.effort,
+        })
+    }
+
+    /// Switch the session's model/effort. Validated against the fresh
+    /// catalog, persisted for every later chained turn, and forwarded to a
+    /// live turn through the CLI control channel.
+    pub async fn set_model(
+        &self,
+        id: &str,
+        model: String,
+        effort: Option<String>,
+    ) -> Result<AgentModelSelectionResult> {
+        crate::database::validate_id(id)?;
+        let effort = effort
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        if model.trim().is_empty()
+            || model.chars().count() > 160
+            || model.chars().any(|c| c.is_control())
+        {
+            return Err(Error::Invalid("模型无效".into()));
+        }
+        if let Some(effort) = &effort
+            && (effort.chars().count() > 80 || effort.chars().any(|c| c.is_control()))
+        {
+            return Err(Error::Invalid("思考强度无效".into()));
+        }
+        let catalog = super::claude::fetch_launch_catalog().await?;
+        let selected = catalog
+            .iter()
+            .find(|entry| entry.id == model)
+            .ok_or_else(|| Error::Invalid(format!("Claude 模型不可用:{model}")))?;
+        if let Some(effort) = &effort
+            && !selected
+                .supported_efforts
+                .iter()
+                .any(|level| level == effort)
+        {
+            return Err(Error::Invalid(format!("{model} 不支持推理强度 {effort}")));
+        }
+        let id_owned = id.to_owned();
+        let model_owned = model.clone();
+        let effort_owned = effort.clone();
+        let (model, effort) = self
+            .0
+            .database
+            .call(move |store| {
+                store.set_agent_selection(&id_owned, &model_owned, effort_owned.as_deref())
+            })
+            .await?;
+
+        // Forward to a running turn. A closed pipe means the turn is already
+        // ending; the persisted selection still applies to the next turn.
+        if let Ok(entry) = self.session_entry(id).await {
+            let guard = entry.handle.lock().await;
+            if let Some(handle) = guard.as_ref() {
+                match handle
+                    .driver
+                    .lock()
+                    .await
+                    .apply_selection(&model, effort.as_deref())
+                    .await
+                {
+                    Ok(()) | Err(Error::Closed) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        self.publish();
+        Ok(AgentModelSelectionResult {
+            current_model: model,
+            current_effort: effort,
+        })
+    }
+
+    /// Active sessions' model/mode control flags for the desktop projection.
+    pub async fn controls(&self) -> Result<AgentControlsProjection> {
+        let controls = self.0.database.call(|store| store.agent_controls()).await?;
+        Ok(AgentControlsProjection { controls })
+    }
+
     /// On-demand transcript for a Task-tool subagent's "查看执行详情" pane.
     pub async fn subagent_snapshot(
         &self,

@@ -212,3 +212,133 @@ async fn http_route_serves_only_native_claude() {
         );
     }
 }
+
+#[tokio::test]
+async fn session_models_and_controls_routes_serve_persisted_selection() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use prosperod_rs::agent::CreateAgentSession;
+    use tower::ServiceExt;
+
+    let _guard = SERIAL.lock().await;
+    let _env = EnvGuard;
+    let (directory, database) = open_db().await;
+    let cli = write_cli(directory.path(), "ok");
+    unsafe {
+        std::env::set_var("PROSPERO_CLAUDE_BIN", &cli);
+    }
+    let api = Api::new(
+        database.clone(),
+        Token::parse("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into())
+            .unwrap(),
+    );
+    let app = api.router();
+    let secret = "Bearer 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    let workspace = directory.path().to_str().unwrap();
+    let head = api
+        .agents
+        .create(CreateAgentSession {
+            title: "Pick".into(),
+            workspace: workspace.into(),
+            auto_approve: false,
+            model: Some("opus[1m]".into()),
+            effort: Some("high".into()),
+        })
+        .await
+        .unwrap();
+
+    let request = |method: &str, uri: String, body: Body| {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", secret)
+            .header("content-type", "application/json")
+            .body(body)
+            .unwrap()
+    };
+
+    let response = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            format!("/v1/agent-sessions/{}/models", head.id),
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["models"].as_array().unwrap().len(), 2);
+    assert_eq!(value["currentModel"], "opus[1m]");
+    assert_eq!(value["currentEffort"], "high");
+
+    // Switch to the default model without an effort: validation happens
+    // against the fresh catalog and the result drops currentEffort.
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            format!("/v1/agent-sessions/{}/models", head.id),
+            Body::from(r#"{"model":"default"}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["currentModel"], "default");
+    assert!(value.get("currentEffort").is_none());
+
+    // Unknown model / unsupported effort are rejected with 400.
+    for payload in [
+        r#"{"model":"ghost"}"#,
+        r#"{"model":"opus[1m]","effort":"medium"}"#,
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                format!("/v1/agent-sessions/{}/models", head.id),
+                Body::from(payload),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "payload {payload}"
+        );
+    }
+
+    let response = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            "/v1/agent-sessions/controls".into(),
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let row = value["controls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["sessionId"] == head.id)
+        .unwrap();
+    assert_eq!(row["model"], true);
+    assert_eq!(row["mode"], true);
+    assert_eq!(row["compact"], false);
+    assert_eq!(row["currentModel"], "default");
+    assert_eq!(row["currentMode"], "default");
+}

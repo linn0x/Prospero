@@ -2,7 +2,7 @@ import type { ContentPage, EventPage, EventQuery, Health, RenameSession, Session
 import type { RustContent } from "../shared/rust-api";
 import type { TimelinePage, TimelineQuery, TimelineLookupResult, TimelineTextQuery, TimelineTextPage } from "@prospero/protocol/rust-daemon";
 import type { CreateTerminal, TerminalPage, TerminalQuery, TerminalSize, TerminalSnapshot } from "@prospero/protocol/rust-daemon";
-import type { AgentSend, AgentModeCatalog, CreateAgentSession, PermissionDecision, QuestionDecision, SubagentSnapshot, AgentQueue, AgentQueues } from "@prospero/protocol/rust-daemon";
+import type { AgentSend, AgentModeCatalog, AgentModelCatalog, AgentModelSelectionResult, AgentControlsProjection, CreateAgentSession, PermissionDecision, QuestionDecision, SubagentSnapshot, AgentQueue, AgentQueues } from "@prospero/protocol/rust-daemon";
 import type { AccountListResult, LaunchModelCatalog } from "@prospero/protocol/rust-daemon";
 import type {
   AbandonRun, ApplyTaskGraph, CancelTask, CleanupWorktree, CompleteRun, CreateGate,
@@ -60,7 +60,11 @@ export class RustClient {
     try { result = JSON.parse(text); } catch { throw new Error("Invalid daemon response"); }
     if (!response.ok) {
       const code = result && typeof result === "object" ? (result as { code?: unknown }).code : undefined;
-      throw new Error(code === "conflict" ? "记录已变更，请刷新后重试" : code === "busy" ? "服务繁忙，请稍后重试" : `Rust 服务请求失败（${response.status}）`);
+      if (code === "conflict") throw new Error("记录已变更，请刷新后重试");
+      if (code === "busy") throw new Error("服务繁忙，请稍后重试");
+      const detail = result && typeof result === "object" ? (result as { message?: unknown }).message : undefined;
+      const suffix = typeof detail === "string" && detail.trim() ? `：${detail.trim()}` : "";
+      throw new Error(`Rust 服务请求失败（${response.status}）${suffix}`);
     }
     return result as T;
   }
@@ -108,6 +112,19 @@ export class RustClient {
   }
   setAgentMode(value: string, mode: string, signal: AbortSignal | null = null): Promise<{ currentMode: string }> {
     return this.json(`/v1/agent-sessions/${id(value)}/modes`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ mode }) });
+  }
+  agentModels(value: string, signal: AbortSignal | null = null, timeoutMs = 30_000): Promise<AgentModelCatalog> {
+    return this.json(`/v1/agent-sessions/${id(value)}/models`, { signal, timeoutMs });
+  }
+  setAgentModel(value: string, model: string, effort: string | undefined, signal: AbortSignal | null = null, timeoutMs = 30_000): Promise<AgentModelSelectionResult> {
+    return this.json(`/v1/agent-sessions/${id(value)}/models`, {
+      method: "POST", signal, timeoutMs,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model, ...(effort !== undefined ? { effort } : {}) }),
+    });
+  }
+  agentControls(signal: AbortSignal | null = null): Promise<AgentControlsProjection> {
+    return this.json("/v1/agent-sessions/controls", { signal });
   }
   agentQueue(value: string, signal: AbortSignal | null = null): Promise<AgentQueue> {
     return this.json(`/v1/agent-sessions/${id(value)}/queue`, { signal });
