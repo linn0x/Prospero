@@ -280,9 +280,30 @@ pub enum TimelineBody {
         request_id: String,
         tool: String,
         resolved: bool,
+        /// Set when the approval belongs to a Task-tool subagent; the event
+        /// still shows on the main timeline so it can be answered there.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        subagent: Option<String>,
     },
     TurnEnd {
         finish: String,
+    },
+    /// Claude Task-tool subagent lifecycle card. Subagent-owned messages and
+    /// tool calls stay off the main timeline (they carry `subagent_id` and are
+    /// only readable through the subagent-events endpoint); this record is the
+    /// single card the chat view folds by `subagent_id`.
+    Subagent {
+        subagent_id: String,
+        name: String,
+        role: Option<String>,
+        task: Option<String>,
+        status: String,
+        can_message: bool,
+        summary: String,
+        #[ts(type = "number")]
+        created_at: i64,
+        #[ts(type = "number")]
+        updated_at: i64,
     },
     Error,
 }
@@ -303,6 +324,10 @@ pub struct TimelineRecord {
     #[ts(type = "number")]
     pub generation: i64,
     pub truncated: bool,
+    /// Internal: owner subagent for records hidden from the main timeline.
+    #[serde(skip)]
+    #[ts(skip)]
+    pub subagent_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, TS)]
@@ -315,6 +340,11 @@ pub struct TimelineWrite {
     pub body: TimelineBody,
     pub text: String,
     pub replace: bool,
+    /// Internal routing only: when set, the record belongs to a Task-tool
+    /// subagent transcript and is hidden from the session's main timeline.
+    #[serde(skip)]
+    #[ts(skip)]
+    pub subagent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, TS)]
@@ -421,6 +451,8 @@ pub fn typescript() -> String {
         crate::agent::AgentModeSelection::decl(&config),
         crate::agent::AgentModeCatalog::decl(&config),
         crate::agent::AgentModeEntry::decl(&config),
+        crate::agent::SubagentInfo::decl(&config),
+        crate::agent::SubagentSnapshot::decl(&config),
         crate::orchestration::RunStatus::decl(&config),
         crate::orchestration::TaskStatus::decl(&config),
         crate::orchestration::DispatchState::decl(&config),

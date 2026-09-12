@@ -71,3 +71,37 @@ pub fn mode_catalog(current: &str) -> AgentModeCatalog {
         current_mode: current.into(),
     }
 }
+
+/// One Task-tool subagent's current state (mirrors legacy `SubagentInfo`).
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct SubagentInfo {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    pub status: String,
+    pub can_message: bool,
+    #[ts(type = "number")]
+    pub created_at: i64,
+    #[ts(type = "number")]
+    pub updated_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+}
+
+/// On-demand "查看执行详情" snapshot: the subagent metadata plus the chat
+/// events belonging to its transcript.
+#[derive(Debug, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct SubagentSnapshot {
+    pub subagent: SubagentInfo,
+    #[ts(type = "Array<Record<string, unknown>>")]
+    pub events: Vec<serde_json::Value>,
+    #[ts(type = "number")]
+    pub ev_seq: i64,
+}

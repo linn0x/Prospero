@@ -6,7 +6,7 @@
 //! `control_request` and blocks until we answer on stdin. Multi-turn
 //! conversations resume the native session id with `--resume`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 
 use serde_json::Value;
@@ -20,20 +20,41 @@ use crate::error::{Error, Result};
 /// Semantic events normalized from the CLI JSONL stream.
 pub(super) enum AdapterEvent {
     NativeId(String),
-    Text(String),
-    Thinking(String),
+    SubagentStarted {
+        subagent: String,
+        name: String,
+        role: Option<String>,
+        task: Option<String>,
+    },
+    SubagentUpdate {
+        subagent: String,
+        status: &'static str,
+        can_message: bool,
+        summary: Option<String>,
+    },
+    Text {
+        subagent: Option<String>,
+        text: String,
+    },
+    Thinking {
+        subagent: Option<String>,
+        text: String,
+    },
     ToolCall {
+        subagent: Option<String>,
         call_id: String,
         name: String,
         summary: String,
     },
     ToolResult {
+        subagent: Option<String>,
         call_id: String,
         name: String,
         summary: String,
         error: bool,
     },
     Permission {
+        subagent: Option<String>,
         request_id: String,
         tool: String,
         summary: String,
@@ -214,7 +235,18 @@ impl ClaudeTurn {
 struct Translator {
     native_id: Option<String>,
     blocks: HashMap<u32, String>,
+    /// Content blocks streamed by a Task-tool subagent (`stream_event` frames
+    /// only carry the block index; ownership comes from the parent id).
+    block_owners: HashMap<u32, String>,
     tool_names: HashMap<String, String>,
+    /// Native task/tool-use ids -> public subagent id (mirrors the legacy
+    /// adapter's taskAgents map).
+    task_agents: HashMap<String, String>,
+    /// Background tasks without `subagent_type` (e.g. shell tasks) are not
+    /// subagents; their output stays on the main timeline.
+    non_subagent_tasks: HashSet<String>,
+    /// Subagents whose lifecycle events were already emitted this turn.
+    known: HashSet<String>,
     interrupted: bool,
     aborted: bool,
     error: Option<String>,
@@ -248,6 +280,21 @@ fn tool_summary(input: &Value) -> String {
 }
 
 impl Translator {
+    /// Resolve the owning subagent of a frame, mirroring the legacy adapter:
+    /// a native task id maps to a public tool-use id, and background tasks
+    /// without `subagent_type` stay on the main timeline.
+    fn agent_of(&self, message: &Value) -> Option<String> {
+        let raw = message.get("parent_tool_use_id").and_then(Value::as_str)?;
+        if raw.is_empty() {
+            return None;
+        }
+        let id = self
+            .task_agents
+            .get(raw)
+            .map_or(raw, |public| public.as_str());
+        (!self.non_subagent_tasks.contains(id)).then(|| id.to_owned())
+    }
+
     /// Translate one CLI frame into zero or more normalized events.
     fn feed(
         &mut self,
@@ -256,19 +303,30 @@ impl Translator {
         writer: &mpsc::Sender<String>,
     ) -> Vec<AdapterEvent> {
         let mut out = Vec::new();
-        match message.get("type").and_then(Value::as_str) {
-            Some("system")
-                if message.get("subtype").and_then(Value::as_str) == Some("init")
-                    && self.native_id.is_none() =>
-            {
-                if let Some(id) = message.get("session_id").and_then(Value::as_str) {
-                    self.native_id = Some(id.to_owned());
-                    out.push(AdapterEvent::NativeId(id.to_owned()));
-                }
-            }
+        let frame_type = message.get("type").and_then(Value::as_str);
+        // task_started/progress/notification arrive as system frames before
+        // the subagent's own messages; init carries the native session id.
+        if frame_type == Some("system") {
+            self.translate_system(&message, &mut out);
+            return out;
+        }
+        let agent = self.agent_of(&message);
+        // First frame attributed to a subagent without a preceding task_started
+        // still needs a card; task_started normally supplied name/task already.
+        if let Some(id) = &agent
+            && self.known.insert(id.clone())
+        {
+            out.push(AdapterEvent::SubagentStarted {
+                subagent: id.clone(),
+                name: String::new(),
+                role: None,
+                task: None,
+            });
+        }
+        match frame_type {
             Some("stream_event") => {
                 if let Some(event) = message.get("event") {
-                    self.translate_stream(event, &mut out);
+                    self.translate_stream(event, agent, &mut out);
                 }
             }
             Some("assistant") => {
@@ -290,6 +348,7 @@ impl Translator {
                             self.tool_names.insert(call_id.to_owned(), name.clone());
                             let summary = block.get("input").map(tool_summary).unwrap_or_default();
                             out.push(AdapterEvent::ToolCall {
+                                subagent: agent.clone(),
                                 call_id: call_id.to_owned(),
                                 name,
                                 summary,
@@ -331,6 +390,7 @@ impl Translator {
                                 _ => String::new(),
                             };
                             out.push(AdapterEvent::ToolResult {
+                                subagent: agent.clone(),
                                 name: self
                                     .tool_names
                                     .get(&call_id)
@@ -392,6 +452,7 @@ impl Translator {
                             let _ = writer.send(frame).await;
                         });
                         out.push(AdapterEvent::Permission {
+                            subagent: agent,
                             request_id,
                             tool,
                             summary,
@@ -435,11 +496,151 @@ impl Translator {
         out
     }
 
-    fn translate_stream(&mut self, event: &Value, out: &mut Vec<AdapterEvent>) {
+    /// `system` frames: native init plus the Task-tool lifecycle.
+    fn translate_system(&mut self, message: &Value, out: &mut Vec<AdapterEvent>) {
+        let subtype = message.get("subtype").and_then(Value::as_str);
+        match subtype {
+            Some("init") if self.native_id.is_none() => {
+                if let Some(id) = message.get("session_id").and_then(Value::as_str) {
+                    self.native_id = Some(id.to_owned());
+                    out.push(AdapterEvent::NativeId(id.to_owned()));
+                }
+            }
+            Some("task_started") => {
+                let Some(task_id) = message.get("task_id").and_then(Value::as_str) else {
+                    return;
+                };
+                let public = message
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(task_id)
+                    .to_owned();
+                self.task_agents.insert(task_id.to_owned(), public.clone());
+                if let Some(tool_use_id) = message.get("tool_use_id").and_then(Value::as_str) {
+                    self.task_agents
+                        .insert(tool_use_id.to_owned(), public.clone());
+                }
+                let subagent_type = message.get("subagent_type").and_then(Value::as_str);
+                match subagent_type {
+                    // A background task (e.g. a shell task) is not a subagent.
+                    None => {
+                        self.non_subagent_tasks.insert(public);
+                    }
+                    Some(name) => {
+                        self.non_subagent_tasks.remove(&public);
+                        if self.known.insert(public.clone()) {
+                            let task = message
+                                .get("prompt")
+                                .or_else(|| message.get("description"))
+                                .and_then(Value::as_str)
+                                .map(str::to_owned);
+                            out.push(AdapterEvent::SubagentStarted {
+                                subagent: public.clone(),
+                                name: name.to_owned(),
+                                role: message
+                                    .get("task_type")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned),
+                                task,
+                            });
+                        }
+                        out.push(AdapterEvent::SubagentUpdate {
+                            subagent: public,
+                            status: "running",
+                            can_message: true,
+                            summary: message
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                        });
+                    }
+                }
+            }
+            Some("task_progress") => {
+                let Some(task_id) = message.get("task_id").and_then(Value::as_str) else {
+                    return;
+                };
+                let public = match self.task_agents.get(task_id) {
+                    Some(public) => public.clone(),
+                    None => {
+                        let Some(public) = message
+                            .get("tool_use_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                        else {
+                            return;
+                        };
+                        self.task_agents.insert(task_id.to_owned(), public.clone());
+                        public
+                    }
+                };
+                if !self.non_subagent_tasks.contains(&public) {
+                    out.push(AdapterEvent::SubagentUpdate {
+                        subagent: public,
+                        status: "running",
+                        can_message: true,
+                        summary: message
+                            .get("summary")
+                            .or_else(|| message.get("description"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                    });
+                }
+            }
+            Some("task_notification") => {
+                let Some(task_id) = message.get("task_id").and_then(Value::as_str) else {
+                    return;
+                };
+                let public = self
+                    .task_agents
+                    .get(task_id)
+                    .cloned()
+                    .or_else(|| {
+                        message
+                            .get("tool_use_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_else(|| task_id.to_owned());
+                if !self.non_subagent_tasks.contains(&public) {
+                    let raw_status = message
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("completed");
+                    let status = match raw_status {
+                        "failed" => "failed",
+                        "stopped" => "stopped",
+                        _ => "completed",
+                    };
+                    out.push(AdapterEvent::SubagentUpdate {
+                        subagent: public,
+                        status,
+                        can_message: false,
+                        summary: message
+                            .get("summary")
+                            .or_else(|| message.get("description"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn translate_stream(
+        &mut self,
+        event: &Value,
+        owner: Option<String>,
+        out: &mut Vec<AdapterEvent>,
+    ) {
         let index = event.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
         match event.get("type").and_then(Value::as_str) {
             Some("content_block_start") => {
                 self.blocks.insert(index, String::new());
+                if let Some(owner) = owner {
+                    self.block_owners.insert(index, owner);
+                }
             }
             Some("content_block_delta") => {
                 let Some(delta) = event.get("delta") else {
@@ -465,13 +666,14 @@ impl Translator {
             }
             Some("content_block_stop") => {
                 if let Some(mut text) = self.blocks.remove(&index) {
+                    let subagent = self.block_owners.remove(&index);
                     if text.starts_with("thinking:") {
                         text.drain(.."thinking:".len());
                         if !text.trim().is_empty() {
-                            out.push(AdapterEvent::Thinking(text));
+                            out.push(AdapterEvent::Thinking { subagent, text });
                         }
                     } else if !text.trim().is_empty() {
-                        out.push(AdapterEvent::Text(text));
+                        out.push(AdapterEvent::Text { subagent, text });
                     }
                 }
             }

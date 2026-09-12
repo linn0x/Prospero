@@ -15,6 +15,31 @@ use crate::worker::Database;
 
 const MAX_TURNS: usize = 16;
 
+/// Latest card state carried between card-record rewrites.
+struct CardState {
+    name: String,
+    role: Option<String>,
+    task: Option<String>,
+    created_at: i64,
+    status: String,
+    can_message: bool,
+    summary: String,
+}
+
+/// CLI task ids are only used as opaque keys by the renderer, but timeline
+/// record ids must match `[A-Za-z0-9_-]{1,256}`; normalize defensively.
+fn safe_owner(id: &str) -> String {
+    let mut slug: String = id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if slug.is_empty() {
+        slug.push_str("subagent");
+    }
+    slug.truncate(120);
+    slug
+}
+
 struct Handle {
     driver: Mutex<ClaudeTurn>,
     replies: Mutex<HashMap<String, oneshot::Sender<bool>>>,
@@ -197,6 +222,7 @@ impl Agents {
             },
             text,
             replace: false,
+            subagent_id: None,
         };
         {
             let id = id.to_owned();
@@ -245,6 +271,12 @@ impl Agents {
         };
         // Revision counters for streaming records that get rewritten in place.
         let mut revisions: HashMap<String, i64> = HashMap::new();
+        // The single subagent card per Task-tool subagent is rewritten as
+        // lifecycle frames arrive; keyed by native subagent id.
+        let mut card_revisions: HashMap<String, i64> = HashMap::new();
+        // Card metadata carried across the rewrites (the stored record body is
+        // replaced wholesale on every update).
+        let mut cards: HashMap<String, CardState> = HashMap::new();
         let mut pending: Vec<TimelineWrite> = Vec::new();
         let mut native_persisted = false;
         let mut interrupted = false;
@@ -294,8 +326,117 @@ impl Agents {
                         }
                     }
                 }
-                AdapterEvent::Text(text) => {
-                    let record = format!("turn{turn}-answer");
+                AdapterEvent::SubagentStarted {
+                    subagent,
+                    name,
+                    role,
+                    task,
+                } => {
+                    let slug = safe_owner(&subagent);
+                    let now = crate::database::now();
+                    cards.insert(
+                        slug.clone(),
+                        CardState {
+                            name: name.clone(),
+                            role: role.clone(),
+                            task: task.clone(),
+                            created_at: now,
+                            status: "starting".into(),
+                            can_message: true,
+                            summary: String::new(),
+                        },
+                    );
+                    pending.push(TimelineWrite {
+                        id: format!("card-{slug}"),
+                        turn_id: format!("turn{turn}"),
+                        expected_revision: 0,
+                        body: TimelineBody::Subagent {
+                            subagent_id: slug.clone(),
+                            name,
+                            role,
+                            task,
+                            status: "starting".into(),
+                            can_message: true,
+                            summary: String::new(),
+                            created_at: now,
+                            updated_at: now,
+                        },
+                        text: String::new(),
+                        replace: false,
+                        subagent_id: None,
+                    });
+                    card_revisions.insert(slug, 1);
+                    flush!();
+                }
+                AdapterEvent::SubagentUpdate {
+                    subagent,
+                    status,
+                    can_message,
+                    summary,
+                } => {
+                    let slug = safe_owner(&subagent);
+                    // A late progress/notification without a task_started still
+                    // needs a card (matches legacy registerSubagent-on-message).
+                    if !cards.contains_key(&slug) {
+                        let now = crate::database::now();
+                        cards.insert(
+                            slug.clone(),
+                            CardState {
+                                name: String::new(),
+                                role: None,
+                                task: None,
+                                created_at: now,
+                                status: "starting".into(),
+                                can_message: true,
+                                summary: String::new(),
+                            },
+                        );
+                    }
+                    let card = cards.get_mut(&slug).expect("card state inserted above");
+                    card.status = status.to_owned();
+                    card.can_message = can_message;
+                    if let Some(text) = summary {
+                        card.summary = bounded_text(text);
+                    }
+                    let CardState {
+                        name,
+                        role,
+                        task,
+                        created_at,
+                        status: card_status,
+                        can_message: card_can,
+                        summary: card_summary,
+                    } = &*card;
+                    let created = !card_revisions.contains_key(&slug);
+                    let revision = card_revisions.get(&slug).copied().unwrap_or(0);
+                    pending.push(TimelineWrite {
+                        id: format!("card-{slug}"),
+                        turn_id: format!("turn{turn}"),
+                        expected_revision: if created { 0 } else { revision },
+                        body: TimelineBody::Subagent {
+                            subagent_id: slug.clone(),
+                            name: name.clone(),
+                            role: role.clone(),
+                            task: task.clone(),
+                            status: card_status.clone(),
+                            can_message: *card_can,
+                            summary: card_summary.clone(),
+                            created_at: *created_at,
+                            updated_at: crate::database::now(),
+                        },
+                        text: String::new(),
+                        replace: false,
+                        subagent_id: None,
+                    });
+                    card_revisions.insert(slug.clone(), revision + 1);
+                    flush!();
+                }
+                AdapterEvent::Text { subagent, text } => {
+                    let owner = subagent.map(|value| safe_owner(&value));
+                    let record = match &owner {
+                        Some(slug) => format!("sub-{slug}-turn{turn}-answer"),
+                        None => format!("turn{turn}-answer"),
+                    };
                     let revision = revisions.get(&record).copied().unwrap_or(0);
                     pending.push(TimelineWrite {
                         id: record.clone(),
@@ -307,12 +448,17 @@ impl Agents {
                         },
                         text: bounded_text(text),
                         replace: true,
+                        subagent_id: owner,
                     });
                     revisions.insert(record, revision + 1);
                     flush!();
                 }
-                AdapterEvent::Thinking(text) => {
-                    let record = format!("turn{turn}-reasoning");
+                AdapterEvent::Thinking { subagent, text } => {
+                    let owner = subagent.map(|value| safe_owner(&value));
+                    let record = match &owner {
+                        Some(slug) => format!("sub-{slug}-turn{turn}-reasoning"),
+                        None => format!("turn{turn}-reasoning"),
+                    };
                     let revision = revisions.get(&record).copied().unwrap_or(0);
                     pending.push(TimelineWrite {
                         id: record.clone(),
@@ -321,17 +467,24 @@ impl Agents {
                         body: TimelineBody::Reasoning,
                         text: bounded_text(text),
                         replace: true,
+                        subagent_id: owner,
                     });
                     revisions.insert(record, revision + 1);
                     flush!();
                 }
                 AdapterEvent::ToolCall {
+                    subagent,
                     call_id,
                     name,
                     summary,
                 } => {
+                    let owner = subagent.map(|value| safe_owner(&value));
+                    let record = match &owner {
+                        Some(slug) => format!("sub-{slug}-{call_id}"),
+                        None => call_id.clone(),
+                    };
                     pending.push(TimelineWrite {
-                        id: call_id.clone(),
+                        id: record.clone(),
                         turn_id: format!("turn{turn}"),
                         expected_revision: 0,
                         body: TimelineBody::Tool {
@@ -341,19 +494,26 @@ impl Agents {
                         },
                         text: String::new(),
                         replace: false,
+                        subagent_id: owner,
                     });
-                    revisions.insert(call_id, 1);
+                    revisions.insert(record, 1);
                     flush!();
                 }
                 AdapterEvent::ToolResult {
+                    subagent,
                     call_id,
                     name,
                     summary,
                     error,
                 } => {
-                    let revision = revisions.get(&call_id).copied().unwrap_or(1);
+                    let owner = subagent.map(|value| safe_owner(&value));
+                    let record = match &owner {
+                        Some(slug) => format!("sub-{slug}-{call_id}"),
+                        None => call_id.clone(),
+                    };
+                    let revision = revisions.get(&record).copied().unwrap_or(1);
                     pending.push(TimelineWrite {
-                        id: call_id.clone(),
+                        id: record.clone(),
                         turn_id: format!("turn{turn}"),
                         expected_revision: revision,
                         body: TimelineBody::Tool {
@@ -367,17 +527,22 @@ impl Agents {
                         },
                         text: summary,
                         replace: false,
+                        subagent_id: owner,
                     });
-                    revisions.insert(call_id, revision + 1);
+                    revisions.insert(record, revision + 1);
                     flush!();
                 }
                 AdapterEvent::Permission {
+                    subagent,
                     request_id,
                     tool,
                     summary,
                     reply,
                 } => {
                     flush!();
+                    // Approvals stay on the main timeline so they can be
+                    // answered there; the subagent id rides along as metadata
+                    // and the detail pane picks them up via body.subagent.
                     let record_id = format!("turn{turn}-perm-{request_id}");
                     handle
                         .replies
@@ -397,9 +562,11 @@ impl Agents {
                             request_id,
                             tool,
                             resolved: false,
+                            subagent,
                         },
                         text: summary,
                         replace: false,
+                        subagent_id: None,
                     };
                     let result = self
                         .0
@@ -445,6 +612,7 @@ impl Agents {
                 body: TimelineBody::Error,
                 text: bounded_text(message.clone()),
                 replace: false,
+                subagent_id: None,
             });
         }
         terminal.push(TimelineWrite {
@@ -456,6 +624,7 @@ impl Agents {
             },
             text: String::new(),
             replace: false,
+            subagent_id: None,
         });
         let _ = {
             let id = id.clone();
@@ -550,6 +719,20 @@ impl Agents {
             .await?;
         self.publish();
         Ok(())
+    }
+
+    /// On-demand transcript for a Task-tool subagent's "查看执行详情" pane.
+    pub async fn subagent_snapshot(
+        &self,
+        id: &str,
+        subagent: &str,
+    ) -> Result<crate::agent::SubagentSnapshot> {
+        let id = id.to_owned();
+        let subagent = subagent.to_owned();
+        self.0
+            .database
+            .call(move |store| store.subagent_snapshot(&id, &subagent))
+            .await
     }
 
     pub async fn interrupt(&self, id: &str) -> Result<()> {
