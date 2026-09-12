@@ -20,6 +20,10 @@ use prosperod_rs::{
 };
 use tempfile::TempDir;
 
+/// `PROSPERO_CLAUDE_BIN` is process-global, so every test that points the
+/// daemon at a fake CLI must hold this lock for its whole lifetime.
+static CLI_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Fake `claude` CLI: announce the init frame, swallow the prompt, then stay
 /// alive until the daemon kills the process group (worker stop test). It writes
 /// nothing into its working directory, so the worktree stays clean for the
@@ -416,6 +420,7 @@ async fn externally_deleted_tree_is_reported_missing_not_cleaned() {
 #[tokio::test]
 async fn worker_start_is_idempotent_and_stop_preserves_the_tree() {
     let (directory, repo) = init_repo();
+    let _cli_env = CLI_ENV_LOCK.lock().await;
     let cli = directory.path().join("fake-claude.py");
     std::fs::write(&cli, FAKE_CLI).unwrap();
     #[cfg(unix)]
@@ -555,4 +560,267 @@ async fn worker_start_is_idempotent_and_stop_preserves_the_tree() {
     .unwrap();
     assert_eq!(cleaned.asset.state, WorktreeAssetState::Cleaned);
     assert!(!tree_path.exists());
+}
+
+/// Fake `claude` CLI with a per-test capture path baked into the script (the
+/// daemon environment is process-global, so the capture target must not depend
+/// on another env var racing between parallel tests).
+fn install_capture_cli(directory: &Path, capture: &Path) -> PathBuf {
+    let cli = directory.join("fake-claude-capture.py");
+    std::fs::write(
+        &cli,
+        format!(
+            r#"#!/usr/bin/env python3
+import json, sys, time
+
+sys.stdout.write(json.dumps({{"type": "system", "subtype": "init", "session_id": "fake-worker-skills"}}) + "\n")
+sys.stdout.flush()
+target = {capture:?}
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    with open(target, "a", encoding="utf-8") as handle:
+        handle.write(line)
+    time.sleep(3600)
+"#
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    cli
+}
+
+async fn create_run_task(database: &Database, spec: &str, skills: Vec<&str>) -> (String, String) {
+    database
+        .call({
+            let spec = spec.to_owned();
+            let skills = skills.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            move |store| {
+                let run = store.create_run(CreateRun {
+                    objective: "worker skills".into(),
+                    coordinator_session_id: None,
+                })?;
+                let task = store.create_task(CreateTask {
+                    run_id: run.id.clone(),
+                    title: "skillful".into(),
+                    spec,
+                    skills,
+                    deps: vec![],
+                    parent_id: None,
+                })?;
+                Ok((run.id, task.id))
+            }
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn worker_expands_bound_skill_into_the_delivered_brief() {
+    let (directory, repo) = init_repo();
+    let _cli_env = CLI_ENV_LOCK.lock().await;
+    let capture = directory.path().join("frames.jsonl");
+    let cli = install_capture_cli(directory.path(), &capture);
+    unsafe {
+        std::env::set_var("PROSPERO_CLAUDE_BIN", &cli);
+    }
+
+    // Commit a project skill so it is checked out into the new worktree.
+    let skill_dir = repo.join(".claude/skills/review");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: review\ndescription: Review the change\n---\n# Review checklist\nRun cargo test before shipping.\n",
+    )
+    .unwrap();
+    git(&repo, &["add", ".claude"]);
+    git(&repo, &["commit", "-q", "-m", "skill"]);
+
+    let database = Database::open(directory.path().join("data")).await.unwrap();
+    let agents = Agents::new(database.clone());
+    let (run_id, task_id) =
+        create_run_task(&database, "请按 $review 检查本次改动", vec!["review"]).await;
+
+    let outcome = start_worker(
+        &database,
+        &agents,
+        StartWorker {
+            task_id: task_id.clone(),
+            cwd: repo.to_string_lossy().into_owned(),
+            worktree: "new".into(),
+            operation_id: Some("op-worker-skills-1".into()),
+        },
+    )
+    .await
+    .unwrap();
+    let asset = outcome.worktree.expect("worktree registered");
+
+    // Wait for the brief frame to reach the fake CLI.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut raw = String::new();
+    while deadline > std::time::Instant::now() {
+        if let Ok(contents) = std::fs::read_to_string(&capture)
+            && contents.contains("显式 Skills")
+        {
+            raw = contents;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(!raw.is_empty(), "worker brief never reached the CLI");
+    let line = raw
+        .lines()
+        .find(|line| line.contains("显式 Skills"))
+        .unwrap();
+    let frame: serde_json::Value = serde_json::from_str(line).unwrap();
+    let content = frame["message"]["content"].as_str().unwrap();
+    assert!(content.contains("显式 Skills: $review"), "{content}");
+    // The send path expands the `$review` mention against the worktree cwd.
+    assert!(
+        content.contains("[Prospero selected Agent Skills]"),
+        "{content}"
+    );
+    assert!(
+        content.contains("Run cargo test before shipping."),
+        "{content}"
+    );
+    assert!(content.contains("请按 $review 检查本次改动"), "{content}");
+
+    // Converge the worker and clean the tree like the operator would.
+    stop_worker(
+        &database,
+        &agents,
+        StopWorker {
+            task_id: task_id.clone(),
+            reason: Some("test teardown".into()),
+            final_status: None,
+        },
+    )
+    .await
+    .unwrap();
+    let cleaned = cleanup_worktree(
+        &database,
+        &asset.id,
+        CleanupWorktree {
+            target_ref: None,
+            confirm: true,
+            delete_branch: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(cleaned.asset.state, WorktreeAssetState::Cleaned);
+    let _run_id = run_id;
+}
+
+#[tokio::test]
+async fn worker_rejects_undeclared_skill_mention_and_preserves_the_tree() {
+    let (directory, repo) = init_repo();
+    let _cli_env = CLI_ENV_LOCK.lock().await;
+    let cli = directory.path().join("fake-claude.py");
+    std::fs::write(&cli, FAKE_CLI).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    unsafe {
+        std::env::set_var("PROSPERO_CLAUDE_BIN", &cli);
+    }
+
+    let database = Database::open(directory.path().join("data")).await.unwrap();
+    let agents = Agents::new(database.clone());
+    // One bound skill, but the spec reaches for a different one. The check
+    // only runs when at least one skill is bound — matching legacy dispatch.
+    let (run_id, task_id) =
+        create_run_task(&database, "please use $secret for this", vec!["review"]).await;
+
+    let error = start_worker(
+        &database,
+        &agents,
+        StartWorker {
+            task_id: task_id.clone(),
+            cwd: repo.to_string_lossy().into_owned(),
+            worktree: "new".into(),
+            operation_id: Some("op-worker-skills-undeclared".into()),
+        },
+    )
+    .await
+    .expect_err("spec $mention without an explicit binding must fail");
+    assert!(
+        format!("{error}").contains("未显式绑定的 Skill: secret"),
+        "{error}"
+    );
+
+    let run = run_id.clone();
+    let assets = database
+        .call(move |store| store.list_worktree_assets(Some(&run)))
+        .await
+        .unwrap();
+    assert_eq!(assets.len(), 1);
+    assert_eq!(assets[0].state, WorktreeAssetState::Preserved);
+    assert!(
+        assets[0]
+            .last_error
+            .as_deref()
+            .is_some_and(|note| note.contains("未显式绑定")),
+        "{:?}",
+        assets[0].last_error
+    );
+    assert!(
+        PathBuf::from(&assets[0].path).exists(),
+        "tree must stay on disk"
+    );
+}
+
+#[tokio::test]
+async fn worker_rejects_missing_bound_skill_and_preserves_the_tree() {
+    let (directory, repo) = init_repo();
+    let _cli_env = CLI_ENV_LOCK.lock().await;
+    let cli = directory.path().join("fake-claude.py");
+    std::fs::write(&cli, FAKE_CLI).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    unsafe {
+        std::env::set_var("PROSPERO_CLAUDE_BIN", &cli);
+    }
+
+    let database = Database::open(directory.path().join("data")).await.unwrap();
+    let agents = Agents::new(database.clone());
+    let (run_id, task_id) =
+        create_run_task(&database, "普通任务，没有 mention", vec!["ghost"]).await;
+
+    let error = start_worker(
+        &database,
+        &agents,
+        StartWorker {
+            task_id: task_id.clone(),
+            cwd: repo.to_string_lossy().into_owned(),
+            worktree: "new".into(),
+            operation_id: Some("op-worker-skills-missing".into()),
+        },
+    )
+    .await
+    .expect_err("a bound skill that cannot resolve must fail hard");
+    assert!(
+        format!("{error}").contains("找不到显式指定的 Skill: ghost"),
+        "{error}"
+    );
+
+    let run = run_id.clone();
+    let assets = database
+        .call(move |store| store.list_worktree_assets(Some(&run)))
+        .await
+        .unwrap();
+    assert_eq!(assets.len(), 1);
+    assert_eq!(assets[0].state, WorktreeAssetState::Preserved);
+    assert!(PathBuf::from(&assets[0].path).exists());
 }
