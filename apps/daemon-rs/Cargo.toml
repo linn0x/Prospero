@@ -23,7 +23,10 @@ tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "net", "s
 ts-rs = { version = "12.0.1", features = ["serde-compat", "serde-json-impl"] }
 uuid = { version = "1.20.0", features = ["v4", "serde"] }
 unicode-width = "0.1.14"
+reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls-webpki-roots", "stream", "json", "http2"] }
+sha2 = "0.11.0"
+url = "2.5.8"
+tempfile = "3.24.0"
 
 [dev-dependencies]
-tempfile = "3.24.0"
 tower = { version = "0.5.3", features = ["util"] }

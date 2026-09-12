@@ -319,6 +319,18 @@ export class RustClient {
     });
   }
 
+  /** Same endpoint, dedicated feature envelopes such as
+   * `agent.account.api.models.result` (errors encoded in-body). */
+  accountFeature(body: Record<string, unknown>, signal: AbortSignal | null = null, timeoutMs = 35_000): Promise<Record<string, unknown>> {
+    return this.json("/v1/accounts", {
+      method: "POST",
+      signal,
+      timeoutMs,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+
   // ── Launch model catalog ────────────────────────────────────────────────
   launchModels(accountId = "native-claude", signal: AbortSignal | null = null, timeoutMs = 30_000): Promise<LaunchModelCatalog> {
     const account = encodeURIComponent(accountId);

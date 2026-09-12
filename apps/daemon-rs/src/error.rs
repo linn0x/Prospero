@@ -19,6 +19,10 @@ pub enum Error {
     Conflict,
     #[error("account is still in use by an active session")]
     InUse,
+    #[error("连接测试繁忙，请稍后重试")]
+    ApiTestBusy,
+    #[error("这个 Profile 正在测试连接，请等待测试结束")]
+    ApiTestInFlight,
     #[error("database queue is full")]
     Busy,
     #[error("database worker is unavailable")]
@@ -54,6 +58,7 @@ impl Error {
             Self::NotFound => ("not_found", false),
             Self::Conflict => ("conflict", false),
             Self::InUse => ("in_use", false),
+            Self::ApiTestBusy | Self::ApiTestInFlight => ("busy", false),
             Self::Busy => ("busy", true),
             Self::Closed => ("unavailable", true),
             Self::AlreadyRunning => ("already_running", false),

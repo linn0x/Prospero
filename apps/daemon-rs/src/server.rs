@@ -49,6 +49,9 @@ pub struct Api {
     streams: Arc<Semaphore>,
     terminal_reads: Arc<Semaphore>,
     terminal_snapshots: Arc<Semaphore>,
+    api_tests: Arc<Semaphore>,
+    api_testing: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    api_features: Arc<Semaphore>,
 }
 
 impl Api {
@@ -79,6 +82,9 @@ impl Api {
             streams: Arc::new(Semaphore::new(16)),
             terminal_reads: Arc::new(Semaphore::new(16)),
             terminal_snapshots: Arc::new(Semaphore::new(2)),
+            api_tests: Arc::new(Semaphore::new(4)),
+            api_testing: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            api_features: Arc::new(Semaphore::new(4)),
         }
     }
 
@@ -224,7 +230,11 @@ impl IntoResponse for ApiError {
             Error::Forbidden => StatusCode::FORBIDDEN,
             Error::Invalid(_) => StatusCode::BAD_REQUEST,
             Error::NotFound => StatusCode::NOT_FOUND,
-            Error::Conflict | Error::AlreadyRunning | Error::InUse => StatusCode::CONFLICT,
+            Error::Conflict
+            | Error::AlreadyRunning
+            | Error::InUse
+            | Error::ApiTestBusy
+            | Error::ApiTestInFlight => StatusCode::CONFLICT,
             Error::Busy | Error::Closed => StatusCode::SERVICE_UNAVAILABLE,
             Error::Timeout => StatusCode::GATEWAY_TIMEOUT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -289,6 +299,9 @@ async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, Api
             "terminal.snapshot",
             "events.replay",
             "events.stream",
+            "agent.account.api.models",
+            "agent.api-validation.v1",
+            "agent.api-protocols.v1",
         ]
         .map(str::to_owned)
         .to_vec(),
@@ -415,14 +428,171 @@ async fn list_skills_route(
 // ── Accounts (Stage 8: discovery + managed accounts) ─────────────────────
 
 /// Tag-dispatched account control. Managed metadata mutations run through the
-/// database queue; login spawns an isolated `claude setup-token` PTY.
+/// database queue; login spawns an isolated `claude setup-token` PTY; the
+/// `api.test`/`api.models.get` profile actions return dedicated envelopes.
 async fn accounts_route(
     State(api): State<Api>,
     body: std::result::Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
-) -> JsonResult<crate::accounts::AccountListResult> {
-    let Json(value) = body.map_err(|_| Error::Invalid("invalid account request".into()))?;
-    let control = crate::accounts::parse_control(&value)?;
-    let _permit = api.requests.acquire().await.map_err(|_| Error::Closed)?;
+) -> Response {
+    let value = match body {
+        Ok(Json(value)) => value,
+        Err(_) => {
+            return ApiError(Error::Invalid("invalid account request".into())).into_response();
+        }
+    };
+    let control = match crate::accounts::parse_control(&value) {
+        Ok(control) => control,
+        Err(error) => return ApiError(error).into_response(),
+    };
+    let request_id = control.request_id().to_owned();
+    let _permit = match api.requests.acquire().await {
+        Ok(permit) => permit,
+        Err(_) => return ApiError(Error::Closed).into_response(),
+    };
+
+    // ── Profile connectivity test: revision capture → probe → record ──────
+    let crate::accounts::AccountControl::ApiTest {
+        account_id, scope, ..
+    } = &control
+    else {
+        return account_control_result(State(api.clone()), control).await;
+    };
+    if account_id == crate::accounts::NATIVE_CLAUDE_ID {
+        return ApiError(Error::Forbidden).into_response();
+    }
+    match scope.as_deref() {
+        None | Some("protocol") => {}
+        Some("engine") => {
+            return ApiError(Error::Invalid("引擎验证尚未接入 Rust daemon".into())).into_response();
+        }
+        Some(_) => {
+            return ApiError(Error::Invalid("连接测试范围无效".into())).into_response();
+        }
+    }
+    // One in-flight test per profile, at most four across the daemon.
+    let _test_permit = match api.api_tests.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => return ApiError(Error::ApiTestBusy).into_response(),
+    };
+    {
+        let mut testing = api.api_testing.lock().await;
+        if testing.contains(account_id) {
+            return ApiError(Error::ApiTestInFlight).into_response();
+        }
+        testing.insert(account_id.clone());
+    }
+    let outcome = run_profile_test(&api, &request_id, account_id).await;
+    {
+        let mut testing = api.api_testing.lock().await;
+        testing.remove(account_id);
+    }
+    let validation = match outcome {
+        Ok(validation) => validation,
+        Err(error) => return ApiError(error).into_response(),
+    };
+    let result = match crate::accounts::respond(
+        &api.database,
+        &control,
+        Some(account_id.clone()),
+        None,
+        Some(validation),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => return ApiError(error).into_response(),
+    };
+    match serde_json::to_value(result) {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => ApiError(error.into()).into_response(),
+    }
+}
+
+/// Loads the profile + current key, runs the probe, and records the result
+/// only when the profile revision still matches the one captured beforehand.
+async fn run_profile_test(
+    api: &Api,
+    request_id: &str,
+    account_id: &str,
+) -> Result<crate::accounts::ApiValidation> {
+    let _ = request_id;
+    let data = api.database.directory().to_owned();
+    let id = account_id.to_owned();
+    let (revision, record, secret) = api
+        .database
+        .call({
+            let data = data.clone();
+            move |store| {
+                let revision = store.api_validation_revision(&data, &id)?;
+                let record = store.managed_snapshot_row(&data, &id)?;
+                let secret = crate::accounts::managed::profile_secret(&data, &id)?;
+                Ok((revision, record, secret))
+            }
+        })
+        .await?;
+    let profile = record
+        .api_profile
+        .ok_or_else(|| Error::Invalid("这个账号不是第三方 API Profile".into()))?;
+    let secret = secret.unwrap_or_default();
+    let validation = crate::accounts::probe::probe(&profile, &secret).await;
+    let data = data.clone();
+    let id = account_id.to_owned();
+    let expected = revision.clone();
+    let recorded = api
+        .database
+        .call({
+            let validation = validation.clone();
+            move |store| store.record_api_validation(&data, &id, &expected, &validation)
+        })
+        .await?;
+    if !recorded {
+        return Err(Error::Invalid("Profile 已变更，请重新测试连接".into()));
+    }
+    Ok(validation)
+}
+
+/// Handles every non-`api.test` account control, including the models
+/// feature which returns `agent.account.api.models.result`.
+async fn account_control_result(
+    State(api): State<Api>,
+    control: crate::accounts::AccountControl,
+) -> Response {
+    if let crate::accounts::AccountControl::ApiModelsGet {
+        request_id,
+        account_id,
+        protocol,
+        base_url,
+        api_key,
+        headers,
+    } = &control
+    {
+        // Legacy parity: the 429 busy response still carries the feature
+        // envelope so the renderer's result parser handles it uniformly.
+        let Ok(_permit) = api.api_features.try_acquire() else {
+            let result = crate::accounts::models::ModelsResult::failure(
+                request_id,
+                crate::accounts::models::FeatureError::new("busy", "账号工具繁忙，请稍后重试"),
+            );
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::to_value(result).unwrap_or_else(|_| serde_json::json!({}))),
+            )
+                .into_response();
+        };
+        let result = profile_models(
+            &api,
+            request_id,
+            account_id.as_deref(),
+            protocol.as_deref(),
+            base_url.as_deref(),
+            api_key.as_deref(),
+            headers.clone(),
+        )
+        .await;
+        api.publish();
+        return Json(serde_json::to_value(result).unwrap_or_else(|_| serde_json::json!({})))
+            .into_response();
+    }
     let (account_id, session_id) = match &control {
         crate::accounts::AccountControl::List { .. } => (None, None),
         crate::accounts::AccountControl::Login {
@@ -432,27 +602,38 @@ async fn accounts_route(
             ..
         } => {
             if account_id == crate::accounts::NATIVE_CLAUDE_ID {
-                return Err(ApiError(Error::Forbidden));
+                return ApiError(Error::Forbidden).into_response();
             }
             let size = TerminalSize {
                 cols: *cols,
                 rows: *rows,
-            }
-            .validate()
-            .map_err(ApiError)?;
+            };
+            let size = match size.validate() {
+                Ok(size) => size,
+                Err(error) => return ApiError(error).into_response(),
+            };
             let data = api.database.directory().to_owned();
             let id = account_id.clone();
-            let record = api
+            let record = match api
                 .database
                 .call(move |store| store.managed_account(&id))
-                .await?;
+                .await
+            {
+                Ok(record) => record,
+                Err(error) => return ApiError(error).into_response(),
+            };
             let id = account_id.clone();
-            let environment = tokio::task::spawn_blocking(move || {
+            let environment = match tokio::task::spawn_blocking(move || {
                 crate::accounts::managed::claude_environment(&data, &id, true)
             })
             .await
-            .map_err(|_| Error::Closed)??;
-            let head = api
+            .map_err(|_| ApiError(Error::Closed))
+            .and_then(|result| result.map_err(ApiError))
+            {
+                Ok(environment) => environment,
+                Err(error) => return error.into_response(),
+            };
+            let head = match api
                 .terminals
                 .create_login(
                     account_id,
@@ -460,44 +641,107 @@ async fn accounts_route(
                     size,
                     environment,
                 )
-                .await?;
+                .await
+            {
+                Ok(head) => head,
+                Err(error) => return ApiError(error).into_response(),
+            };
             api.publish();
             (Some(account_id.clone()), Some(head.id))
         }
         other => {
-            if let Some(id) = control_account_id(other)
+            if let Some(id) = other.account_id()
                 && id == crate::accounts::NATIVE_CLAUDE_ID
             {
                 // The native environment can never be renamed, logged out or
                 // deleted, matching legacy account_not_managed (403).
-                return Err(ApiError(Error::Forbidden));
+                return ApiError(Error::Forbidden).into_response();
             }
             if let crate::accounts::AccountControl::Create { agent, .. } = other
                 && agent != "claude"
             {
-                return Err(ApiError(Error::Invalid(
-                    "Rust 当前仅支持 Claude 托管账号".into(),
-                )));
+                return ApiError(Error::Invalid("Rust 当前仅支持 Claude 托管账号".into()))
+                    .into_response();
             }
-            let account_id = crate::accounts::execute_control(&api.database, &control).await?;
+            let account_id = match crate::accounts::execute_control(&api.database, &control).await {
+                Ok(account_id) => account_id,
+                Err(error) => return ApiError(error).into_response(),
+            };
             api.publish();
             (account_id, None)
         }
     };
-    let result = crate::accounts::respond(&api.database, &control, account_id, session_id).await?;
-    Ok(Json(result))
+    let result =
+        match crate::accounts::respond(&api.database, &control, account_id, session_id, None).await
+        {
+            Ok(result) => result,
+            Err(error) => return ApiError(error).into_response(),
+        };
+    match serde_json::to_value(result) {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => ApiError(error.into()).into_response(),
+    }
 }
 
-fn control_account_id(control: &crate::accounts::AccountControl) -> Option<&str> {
-    match control {
-        crate::accounts::AccountControl::Rename { account_id, .. }
-        | crate::accounts::AccountControl::SetDefault { account_id, .. }
-        | crate::accounts::AccountControl::Login { account_id, .. }
-        | crate::accounts::AccountControl::SetCredential { account_id, .. }
-        | crate::accounts::AccountControl::Logout { account_id, .. }
-        | crate::accounts::AccountControl::Delete { account_id, .. } => Some(account_id),
-        crate::accounts::AccountControl::List { .. }
-        | crate::accounts::AccountControl::Create { .. } => None,
+/// Loads the profile catalog either from a stored account or from draft
+/// connection fields (exactly one of the two must be present, matching the
+/// desktop `accountModelsRequest` XOR contract).
+async fn profile_models(
+    api: &Api,
+    request_id: &str,
+    account_id: Option<&str>,
+    protocol: Option<&str>,
+    draft_base_url: Option<&str>,
+    draft_key: Option<&str>,
+    draft_headers: Option<serde_json::Value>,
+) -> crate::accounts::models::ModelsResult {
+    use crate::accounts::models::{FeatureError, ModelsResult, fetch_models};
+    let load = async {
+        match account_id {
+            Some(id) => {
+                if id == crate::accounts::NATIVE_CLAUDE_ID {
+                    return Err(FeatureError::new(
+                        "unsupported",
+                        "本机默认账号不支持模型目录",
+                    ));
+                }
+                let data = api.database.directory().to_owned();
+                let id = id.to_owned();
+                let (record, secret) = api
+                    .database
+                    .call(move |store| {
+                        let record = store.managed_snapshot_row(&data, &id)?;
+                        let secret = crate::accounts::managed::profile_secret(&data, &id)?;
+                        Ok((record, secret))
+                    })
+                    .await
+                    .map_err(|_| FeatureError::new("storage", "账号读取失败，请稍后重试"))?;
+                let profile = record
+                    .api_profile
+                    .ok_or_else(|| FeatureError::new("unsupported", "这个账号不是 API Profile"))?;
+                let headers = profile.headers.clone().unwrap_or_default();
+                let secret = secret
+                    .ok_or_else(|| FeatureError::new("authentication", "请先配置 API Key"))?;
+                fetch_models(&profile.base_url, &secret, &headers).await
+            }
+            None => {
+                let base_url = draft_base_url.unwrap_or("");
+                let key = draft_key.unwrap_or("");
+                if protocol.is_some_and(|protocol| protocol != "anthropic") {
+                    return Err(FeatureError::new(
+                        "unsupported",
+                        "Rust daemon 目前仅支持 Anthropic 协议",
+                    ));
+                }
+                let headers = crate::accounts::profile::clean_headers(draft_headers)
+                    .map_err(|error| FeatureError::new("invalid_request", &error.to_string()))?;
+                fetch_models(base_url, key, &headers.unwrap_or_default()).await
+            }
+        }
+    };
+    match load.await {
+        Ok(models) => ModelsResult::success(request_id, models),
+        Err(error) => ModelsResult::failure(request_id, error),
     }
 }
 

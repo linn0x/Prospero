@@ -560,8 +560,16 @@ pub fn typescript() -> String {
         crate::skills::SkillSuggestion::decl(&config),
         crate::accounts::AccountStatus::decl(&config),
         crate::accounts::AccountCapabilities::decl(&config),
+        crate::accounts::ModelCapabilities::decl(&config),
+        crate::accounts::ApiProfile::decl(&config),
+        crate::accounts::probe::Check::decl(&config),
+        crate::accounts::probe::ValidationChecks::decl(&config),
+        crate::accounts::ApiValidation::decl(&config),
         crate::accounts::NativeAccount::decl(&config),
         crate::accounts::AccountListResult::decl(&config),
+        crate::accounts::models::CatalogModel::decl(&config),
+        crate::accounts::models::FeatureError::decl(&config),
+        crate::accounts::models::ModelsResult::decl(&config),
         crate::error::ErrorBody::decl(&config),
     ];
     let mut output: String = declarations
