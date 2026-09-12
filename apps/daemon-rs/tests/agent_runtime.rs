@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use prosperod_rs::{
-    agent::{Agents, CreateAgentSession},
+    agent::{Agents, CreateAgentSession, PermissionMode},
     protocol::{TimelineBody, TimelineQuery},
     worker::Database,
 };
@@ -83,6 +83,11 @@ elif scenario == "interrupt":
             break
 elif scenario == "failure":
     result(error="boom")
+elif scenario == "planflag":
+    with open(os.path.join(cwd, "args.log"), "w") as log:
+        log.write("\n".join(sys.argv[1:]))
+    text_block("planned")
+    result()
 elif scenario == "hang":
     with open(os.path.join(cwd, "fake.pid"), "w") as pid:
         pid.write(str(os.getpid()))
@@ -453,4 +458,75 @@ async fn recovery_archives_active_run_without_replaying_turn() {
     unsafe {
         std::env::remove_var("PROSPERO_CLAUDE_BIN");
     }
+}
+
+#[tokio::test]
+async fn plan_mode_is_persisted_and_passed_to_the_cli() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("planflag").await;
+    let head = harness.create().await;
+
+    // The catalog starts on default; switching to plan persists immediately.
+    assert_eq!(
+        harness.agents.mode(&head.id).await.unwrap(),
+        PermissionMode::Default
+    );
+    harness
+        .agents
+        .set_mode(&head.id, PermissionMode::Plan)
+        .await
+        .unwrap();
+    assert_eq!(
+        harness.agents.mode(&head.id).await.unwrap(),
+        PermissionMode::Plan
+    );
+    harness
+        .agents
+        .send(&head.id, "plan this".into())
+        .await
+        .unwrap();
+    harness
+        .wait_for(&head.id, |records| {
+            records.iter().any(|(_, body, _)| {
+                matches!(
+                    body,
+                    TimelineBody::TurnEnd { finish } if finish == "completed"
+                )
+            })
+        })
+        .await;
+    let planned_args = std::fs::read_to_string(harness.workspace.path().join("args.log")).unwrap();
+    let planned: Vec<&str> = planned_args.lines().collect();
+    assert!(
+        planned
+            .windows(2)
+            .any(|pair| pair == ["--permission-mode", "plan"]),
+        "plan turn must carry --permission-mode plan: {planned:?}"
+    );
+
+    // Back to default: the next resumed turn must not carry the flag.
+    harness
+        .agents
+        .set_mode(&head.id, PermissionMode::Default)
+        .await
+        .unwrap();
+    harness
+        .agents
+        .send(&head.id, "now do it".into())
+        .await
+        .unwrap();
+    harness
+        .wait_for(&head.id, |records| {
+            records
+                .iter()
+                .filter(|(_, body, _)| matches!(body, TimelineBody::TurnEnd { .. }))
+                .count()
+                == 2
+        })
+        .await;
+    let default_args = std::fs::read_to_string(harness.workspace.path().join("args.log")).unwrap();
+    assert!(
+        !default_args.contains("--permission-mode"),
+        "default turn must not carry a permission-mode flag: {default_args:?}"
+    );
 }

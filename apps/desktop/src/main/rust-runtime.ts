@@ -281,6 +281,21 @@ export class RustRuntime {
       const items = await this.current().client.skillSuggestions(suggestionsRoute[1]!, query, signal);
       return { items } as JsonObject;
     }
+    const modesRoute = /^\/_prospero\/control\/session\/([A-Za-z0-9_-]{1,128})\/modes$/.exec(path);
+    if (modesRoute) {
+      const sessionId = modesRoute[1]!;
+      if (init?.method === "POST" && input) {
+        const mode = input["mode"];
+        if (mode !== "default" && mode !== "plan") throw new Error("会话模式无效");
+        const result = await this.current().client.setAgentMode(sessionId, String(mode), signal);
+        await this.refresh(true);
+        return result as unknown as JsonObject;
+      }
+      if (!init?.method || init.method === "GET") {
+        const catalog = await this.current().client.agentModes(sessionId, signal);
+        return catalog as unknown as JsonObject;
+      }
+    }
     if (path === "/_prospero/control/session/create" && init?.method === "POST" && input) {
       if (input["kind"] === "pty") {
         if (input["agent"] !== "shell" || input["command"] || input["accountId"] || input["model"]) throw new Error("Rust 当前支持普通 shell 终端，自定义命令尚未接入");

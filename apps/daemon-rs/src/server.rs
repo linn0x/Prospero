@@ -18,7 +18,10 @@ use futures_util::{Stream, stream};
 use tokio::sync::{Semaphore, watch};
 
 use crate::agent::Agents;
-use crate::agent::{AgentSend, CreateAgentSession, PermissionDecision};
+use crate::agent::{
+    AgentModeSelection, AgentSend, CreateAgentSession, PermissionDecision, PermissionMode,
+    mode_catalog,
+};
 use crate::auth::Token;
 use crate::database::Store;
 use crate::error::{Error, Result};
@@ -88,6 +91,10 @@ impl Api {
             .route(
                 "/v1/agent-sessions/{id}/suggestions",
                 get(agent_suggestions),
+            )
+            .route(
+                "/v1/agent-sessions/{id}/modes",
+                get(agent_modes).post(set_agent_mode),
             )
             .route("/v1/agent-sessions/{id}/interrupt", post(agent_interrupt))
             .route("/v1/agent-sessions/{id}/permission", post(agent_permission))
@@ -347,6 +354,31 @@ async fn agent_interrupt(
 ) -> std::result::Result<Json<serde_json::Value>, ApiError> {
     api.agents.interrupt(&id).await?;
     Ok(Json(serde_json::json!({"ok":true})))
+}
+
+async fn agent_modes(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<crate::agent::AgentModeCatalog>, ApiError> {
+    crate::database::validate_id(&id).map_err(ApiError)?;
+    let mode = api.agents.mode(&id).await?;
+    Ok(Json(mode_catalog(mode.label())))
+}
+
+async fn set_agent_mode(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<AgentModeSelection>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    crate::database::validate_id(&id).map_err(ApiError)?;
+    let Json(selection) = body.map_err(|_| Error::Invalid("invalid mode selection".into()))?;
+    let mode = match selection.mode.as_str() {
+        "default" => PermissionMode::Default,
+        "plan" => PermissionMode::Plan,
+        _ => return Err(ApiError(Error::Invalid("会话模式无效".into()))),
+    };
+    api.agents.set_mode(&id, mode).await?;
+    Ok(Json(serde_json::json!({ "currentMode": selection.mode })))
 }
 
 async fn agent_permission(

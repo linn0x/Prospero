@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore, oneshot, watch};
 
 use super::claude::{AdapterEvent, ClaudeTurn, spawn_turn};
-use super::store::ApprovalPolicy;
+use super::store::{ApprovalPolicy, PermissionMode};
 use super::*;
 use crate::error::{Error, Result};
 use crate::protocol::*;
@@ -205,7 +205,13 @@ impl Agents {
                 .call(move |store| store.append_agent_records(&id, vec![user_write]))
                 .await?;
         }
-        let driver = spawn_turn(&workspace, &expanded, native_id.as_deref(), run.policy)?;
+        let driver = spawn_turn(
+            &workspace,
+            &expanded,
+            native_id.as_deref(),
+            run.policy,
+            run.mode,
+        )?;
         let handle = Arc::new(Handle {
             driver: Mutex::new(driver),
             replies: Mutex::new(HashMap::new()),
@@ -522,6 +528,27 @@ impl Agents {
             }
         }
         self.set_status(id, SessionStatus::Running).await?;
+        Ok(())
+    }
+
+    /// Current collaboration mode (`default`/`plan`).
+    pub async fn mode(&self, id: &str) -> Result<PermissionMode> {
+        let id = id.to_owned();
+        self.0
+            .database
+            .call(move |store| Ok(store.agent_run(&id)?.mode))
+            .await
+    }
+
+    /// Switch the collaboration mode. The change applies to the next turn;
+    /// a turn already running keeps the mode it started with.
+    pub async fn set_mode(&self, id: &str, mode: PermissionMode) -> Result<()> {
+        let id = id.to_owned();
+        self.0
+            .database
+            .call(move |store| store.set_agent_mode(&id, mode))
+            .await?;
+        self.publish();
         Ok(())
     }
 

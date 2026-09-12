@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 pub use runtime::Agents;
+pub use store::PermissionMode;
 
 #[derive(Debug, Deserialize, Serialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -27,4 +28,46 @@ pub struct AgentSend {
 pub struct PermissionDecision {
     pub request_id: String,
     pub allow: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentModeSelection {
+    pub mode: String,
+}
+
+/// Fixed Claude collaboration-mode catalog (matches the legacy adapter).
+#[derive(Debug, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct AgentModeCatalog {
+    pub modes: Vec<AgentModeEntry>,
+    pub current_mode: String,
+}
+
+#[derive(Debug, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct AgentModeEntry {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+}
+
+pub fn mode_catalog(current: &str) -> AgentModeCatalog {
+    AgentModeCatalog {
+        modes: vec![
+            AgentModeEntry {
+                id: "default".into(),
+                label: "执行".into(),
+                description: "允许 Claude 使用工具、修改文件并完成任务。".into(),
+            },
+            AgentModeEntry {
+                id: "plan".into(),
+                label: "Plan".into(),
+                description: "只调查与规划；需要决策时显示结构化问题卡片。".into(),
+            },
+        ],
+        current_mode: current.into(),
+    }
 }
