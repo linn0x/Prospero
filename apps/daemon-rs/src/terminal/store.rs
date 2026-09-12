@@ -6,6 +6,16 @@ use crate::protocol::*;
 
 impl Store {
     pub fn create_terminal(&mut self, input: CreateTerminal) -> Result<SessionHead> {
+        self.create_terminal_with(input, None)
+    }
+
+    /// `account_id` marks a non-shell terminal (the managed-account login
+    /// PTY) so account deletion can block while it is alive.
+    pub(crate) fn create_terminal_with(
+        &mut self,
+        input: CreateTerminal,
+        account_id: Option<String>,
+    ) -> Result<SessionHead> {
         let size = input.size.validate()?;
         self.create_session_with(
             CreateSession {
@@ -16,8 +26,8 @@ impl Store {
             },
             |tx, head| {
                 tx.execute(
-                    "INSERT INTO terminal_runs(session_id,cols,rows,active) VALUES(?1,?2,?3,1)",
-                    params![head.id, size.cols, size.rows],
+                    "INSERT INTO terminal_runs(session_id,cols,rows,active,account_id) VALUES(?1,?2,?3,1,?4)",
+                    params![head.id, size.cols, size.rows, account_id],
                 )?;
                 Ok(())
             },

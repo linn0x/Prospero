@@ -327,6 +327,7 @@ impl Harness {
                 auto_approve: false,
                 model: None,
                 effort: None,
+                account_id: None,
             })
             .await
             .unwrap()
@@ -842,6 +843,7 @@ async fn recovery_archives_active_run_without_replaying_turn() {
             auto_approve: false,
             model: None,
             effort: None,
+            account_id: None,
         })
         .await
         .unwrap();
@@ -964,6 +966,7 @@ async fn launch_model_and_effort_are_passed_on_every_turn() {
             auto_approve: false,
             model: Some("opus[1m]".into()),
             effort: Some("high".into()),
+            account_id: None,
         })
         .await
         .unwrap();
@@ -1037,6 +1040,7 @@ async fn invalid_launch_selection_is_rejected() {
                 auto_approve: false,
                 model,
                 effort,
+                account_id: None,
             })
             .await;
         assert!(result.is_err(), "case {index} must be rejected");
@@ -1055,6 +1059,7 @@ async fn in_session_models_combines_catalog_with_persisted_selection() {
             auto_approve: false,
             model: Some("opus[1m]".into()),
             effort: Some("high".into()),
+            account_id: None,
         })
         .await
         .unwrap();

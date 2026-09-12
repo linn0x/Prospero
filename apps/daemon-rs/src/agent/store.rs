@@ -48,6 +48,8 @@ pub(crate) struct AgentRun {
     /// Launch-time model/effort selection; applied on every chained turn.
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// Managed account bound to the run; None for the native environment.
+    pub account_id: Option<String>,
 }
 
 /// Maximum number of messages that may wait for the current turn to finish
@@ -97,6 +99,16 @@ impl Store {
     ) -> Result<SessionHead> {
         let model = normalize_selection(input.model, 160, "模型无效")?;
         let effort = normalize_selection(input.effort, 80, "思考强度无效")?;
+        // The native id collapses to NULL; anything else must reference a
+        // surviving managed account so sessions never bind to a deleted row.
+        let account_id = match input.account_id.as_deref() {
+            None | Some(crate::accounts::NATIVE_CLAUDE_ID) => None,
+            Some(id) => {
+                crate::database::validate_id(id)?;
+                let _record = self.managed_account(id)?;
+                Some(id.to_owned())
+            }
+        };
         self.create_session_with(
             CreateSession {
                 agent: AgentKind::Claude,
@@ -106,9 +118,9 @@ impl Store {
             },
             |tx, head| {
                 tx.execute(
-                    "INSERT INTO agent_runs(session_id,agent,active,approval_policy,turn,native_id,model,effort) \
-                     VALUES(?1,'claude',1,?2,0,NULL,?3,?4)",
-                    params![head.id, policy.label(), model, effort],
+                    "INSERT INTO agent_runs(session_id,agent,active,approval_policy,turn,native_id,model,effort,account_id) \
+                     VALUES(?1,'claude',1,?2,0,NULL,?3,?4,?5)",
+                    params![head.id, policy.label(), model, effort, account_id],
                 )?;
                 Ok(())
             },
@@ -126,11 +138,12 @@ impl Store {
             Option<String>,
             Option<String>,
             Option<String>,
+            Option<String>,
         );
         let row: Row = self
             .connection
             .query_row(
-                "SELECT agent,active,approval_policy,permission_mode,turn,native_id,model,effort FROM agent_runs WHERE session_id=?",
+                "SELECT agent,active,approval_policy,permission_mode,turn,native_id,model,effort,account_id FROM agent_runs WHERE session_id=?",
                 [id],
                 |row| {
                     Ok((
@@ -142,6 +155,7 @@ impl Store {
                         row.get(5)?,
                         row.get(6)?,
                         row.get(7)?,
+                        row.get(8)?,
                     ))
                 },
             )
@@ -170,6 +184,7 @@ impl Store {
             native_id: row.5,
             model: row.6,
             effort: row.7,
+            account_id: row.8,
         })
     }
 

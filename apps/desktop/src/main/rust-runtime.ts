@@ -10,17 +10,35 @@ import { orchestrationAction, readOrchestrationWindow, settleDispatchInput } fro
 const ATTACHMENT_MIME = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
 const BASE64_RE = /^[A-Za-z0-9+/=]+$/;
 
-/** Account actions beyond read-only discovery are later slices. */
+/** Account actions backed by the Rust daemon's managed Claude accounts. */
 const NATIVE_CLAUDE_ACCOUNT = "native-claude";
-const UNSUPPORTED_ACCOUNT_TYPES = new Set([
-  "agent.account.create", "agent.account.api.create", "agent.account.api.configure",
-  "agent.account.api.test", "agent.account.rename", "agent.account.default",
+const MANAGED_ACCOUNT_TYPES = new Set([
+  "agent.account.create", "agent.account.rename", "agent.account.default",
   "agent.account.login", "agent.account.credential.set", "agent.account.logout",
   "agent.account.delete",
+]);
+/** Third-party API profiles remain a later slice. */
+const UNSUPPORTED_ACCOUNT_TYPES = new Set([
+  "agent.account.api.create", "agent.account.api.configure",
+  "agent.account.api.test",
 ]);
 
 function toQueuedChat(item: QueuedMessage): QueuedChatMessage {
   return { id: item.id, text: item.text, kind: item.kind === "guide" ? "guide" : "queue", createdAt: item.createdAt, attachmentCount: item.attachmentCount ?? 0 };
+}
+
+/** Mirror of the daemon's managed-account id charset (uuid-safe path segment). */
+function requireManagedAccountId(raw: unknown): string {
+  if (typeof raw !== "string" || raw === NATIVE_CLAUDE_ACCOUNT || !/^[A-Za-z0-9_-]{1,100}$/.test(raw)) throw new Error("账号 ID 无效");
+  return raw;
+}
+
+/** Mirror of the daemon's clean_name: trimmed 1–80 chars, no controls. */
+function requireAccountName(raw: unknown): string {
+  if (typeof raw !== "string") throw new Error("账号名称应为 1–80 个字符");
+  const name = raw.trim();
+  if (!name || [...name].length > 80 || [...name].some((char) => /\p{C}/u.test(char))) throw new Error("账号名称应为 1–80 个字符");
+  return name;
 }
 
 /** Validates the launch dialog's model/effort selection, mirroring the
@@ -308,15 +326,44 @@ export class RustRuntime {
     const input = init?.body;
     if (path === "/_prospero/control/accounts" && init?.method === "POST" && input) {
       const type = input["type"];
+      if (typeof type !== "string" || typeof input["requestId"] !== "string" || !input["requestId"].trim() || input["requestId"].length > 100) {
+        throw new Error("账号请求 ID 无效");
+      }
       if (type === "agent.accounts.list") {
-        const requestId = input["requestId"];
-        if (typeof requestId !== "string" || !requestId.trim() || requestId.length > 100) throw new Error("请求 ID 无效");
-        const result = await this.current().client.listAccounts(requestId, signal);
+        const result = await this.current().client.listAccounts(input["requestId"], signal);
         return result as unknown as JsonObject;
       }
-      // Managed accounts / API profiles / login flows are later slices.
-      if (typeof type === "string" && UNSUPPORTED_ACCOUNT_TYPES.has(type)) throw new Error("账号管理尚未接入 Rust daemon");
-      throw new Error("不支持的账号操作");
+      // Third-party API profiles / model sources are later slices.
+      if (UNSUPPORTED_ACCOUNT_TYPES.has(type)) throw new Error("API Profile 尚未接入 Rust daemon");
+      if (!MANAGED_ACCOUNT_TYPES.has(type)) throw new Error("不支持的账号操作");
+      // Mirror the daemon's field contract; never forward unknown envelopes.
+      const body: Record<string, unknown> = { type, requestId: input["requestId"] };
+      if (type === "agent.account.create") {
+        if (input["agent"] !== "claude") throw new Error("Rust 当前仅支持 Claude 托管账号");
+        body["agent"] = "claude";
+        body["name"] = requireAccountName(input["name"]);
+      } else {
+        const accountId = requireManagedAccountId(input["accountId"]);
+        body["accountId"] = accountId;
+        if (type === "agent.account.rename") body["name"] = requireAccountName(input["name"]);
+        if (type === "agent.account.login") {
+          const cols = Number(input["cols"] ?? 120);
+          const rows = Number(input["rows"] ?? 40);
+          if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 20 || cols > 500 || rows < 5 || rows > 300) throw new Error("终端尺寸无效");
+          body["cols"] = cols; body["rows"] = rows;
+        }
+        if (type === "agent.account.credential.set") {
+          const kind = input["credentialKind"];
+          if (kind !== "oauth_token" && kind !== "api_key") throw new Error("凭据类型无效");
+          const credential = input["credential"];
+          if (typeof credential !== "string" || credential.trim().length < 20 || credential.length > 8192 || /[\r\n ]/.test(credential)) throw new Error("凭据格式无效");
+          body["credentialKind"] = kind;
+          body["credential"] = credential;
+        }
+      }
+      const result = await this.current().client.accountControl(body, signal, init.timeoutMs ?? 30_000);
+      if (type === "agent.account.login" && result.sessionId) await this.refresh(true);
+      return result as unknown as JsonObject;
     }
     if (path === "/_prospero/control/orchestration/action" && init?.method === "POST" && input) {
       const method = input["method"];
@@ -404,11 +451,12 @@ export class RustRuntime {
     if (launchModelsRoute && (!init?.method || init.method === "GET")) {
       const params = new URLSearchParams(launchModelsRoute[1] ?? "");
       const agent = params.get("agent");
-      const accountId = params.get("accountId") ?? undefined;
-      // Only the native Claude account is wired in this slice; the daemon
-      // rejects anything else, but fail here with the local message too.
-      if (agent !== "claude" || accountId !== NATIVE_CLAUDE_ACCOUNT) throw new Error("此 Agent 的模型目录尚未接入 Rust daemon");
-      const catalog = await this.current().client.launchModels(signal, init?.timeoutMs);
+      if (agent !== "claude") throw new Error("此 Agent 的模型目录尚未接入 Rust daemon");
+      // Native and managed Claude accounts are both probed; the daemon
+      // validates the id and 400s on anything else.
+      const accountId = params.get("accountId") ?? NATIVE_CLAUDE_ACCOUNT;
+      if (accountId !== NATIVE_CLAUDE_ACCOUNT && !/^[A-Za-z0-9_-]{1,100}$/.test(accountId)) throw new Error("账号 ID 无效");
+      const catalog = await this.current().client.launchModels(accountId, signal, init?.timeoutMs ?? 30_000);
       return catalog as unknown as JsonObject;
     }
     if (path === "/_prospero/control/session/create" && init?.method === "POST" && input) {
@@ -419,7 +467,9 @@ export class RustRuntime {
         return rustSessionInfo(head);
       }
       if (input["agent"] !== "claude") throw new Error("Rust Agent 当前仅接入 Claude Code");
-      if (input["accountId"] !== undefined && input["accountId"] !== NATIVE_CLAUDE_ACCOUNT) throw new Error("此账号尚未接入 Rust daemon");
+      const accountId = input["accountId"] === undefined || input["accountId"] === NATIVE_CLAUDE_ACCOUNT
+        ? undefined
+        : requireManagedAccountId(input["accountId"]);
       if (input["kind"] !== "structured" || input["command"] || input["mode"]) throw new Error("此 Agent 选项尚未接入 Rust daemon");
       const model = normalizeLaunchSelection(input["model"], 160, "模型无效");
       const effort = normalizeLaunchSelection(input["effort"], 80, "推理强度无效");
@@ -431,6 +481,7 @@ export class RustRuntime {
         autoApprove: policy === "yolo",
         ...(model !== undefined ? { model } : {}),
         ...(effort !== undefined ? { effort } : {}),
+        ...(accountId !== undefined ? { accountId } : {}),
       }, signal);
       await this.refresh(true);
       return rustSessionInfo(head);
