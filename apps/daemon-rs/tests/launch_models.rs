@@ -147,7 +147,7 @@ async fn catalog_failures_are_rejected_not_fabricated() {
 }
 
 #[tokio::test]
-async fn http_route_serves_only_native_claude() {
+async fn http_route_serves_native_and_managed_claude_accounts() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
@@ -187,11 +187,25 @@ async fn http_route_serves_only_native_claude() {
     assert_eq!(value["models"].as_array().unwrap().len(), 2);
     assert_eq!(value["currentModel"], "default");
 
+    // Missing accountId defaults to the native account, so the catalog
+    // resolves. Unknown agents remain 400; an unknown managed id is a 404.
+    let native_default = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/launch/models?agent=claude")
+                .header("authorization", secret)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(native_default.status(), StatusCode::OK);
+
     for uri in [
         "/v1/launch/models?agent=codex&accountId=native-codex",
         "/v1/launch/models?agent=deepseek",
-        "/v1/launch/models?agent=claude",
-        "/v1/launch/models?agent=claude&accountId=managed-x",
     ] {
         let response = app
             .clone()
@@ -211,6 +225,19 @@ async fn http_route_serves_only_native_claude() {
             "uri {uri} must be rejected"
         );
     }
+
+    let missing_managed = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/launch/models?agent=claude&accountId=managed-x")
+                .header("authorization", secret)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_managed.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -244,6 +271,7 @@ async fn session_models_and_controls_routes_serve_persisted_selection() {
             auto_approve: false,
             model: Some("opus[1m]".into()),
             effort: Some("high".into()),
+            account_id: None,
         })
         .await
         .unwrap();

@@ -61,6 +61,7 @@ export class RustClient {
     if (!response.ok) {
       const code = result && typeof result === "object" ? (result as { code?: unknown }).code : undefined;
       if (code === "conflict") throw new Error("记录已变更，请刷新后重试");
+      if (code === "in_use") throw new Error("该账号仍有活跃会话，请先关闭后再删除");
       if (code === "busy") throw new Error("服务繁忙，请稍后重试");
       const detail = result && typeof result === "object" ? (result as { message?: unknown }).message : undefined;
       const suffix = typeof detail === "string" && detail.trim() ? `：${detail.trim()}` : "";
@@ -301,19 +302,26 @@ export class RustClient {
     return this.json(`/v1/agent-sessions/${id(sessionId)}/suggestions?${params}`, { signal }).then(page => (page as { items: SkillSuggestion[] }).items);
   }
 
-  // ── Accounts (read-only native discovery) ───────────────────────────────
+  // ── Accounts (native discovery + managed Claude accounts) ───────────────
   listAccounts(requestId: string, signal: AbortSignal | null = null, timeoutMs = 15_000): Promise<AccountListResult> {
+    return this.accountControl({ type: "agent.accounts.list", requestId }, signal, timeoutMs);
+  }
+
+  /** Tag-dispatched managed-account control; the daemon re-snapshots and
+   * returns the full account list (plus sessionId for login). */
+  accountControl(body: Record<string, unknown>, signal: AbortSignal | null = null, timeoutMs = 30_000): Promise<AccountListResult> {
     return this.json("/v1/accounts", {
       method: "POST",
       signal,
       timeoutMs,
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ type: "agent.accounts.list", requestId }),
+      body: JSON.stringify(body),
     });
   }
 
   // ── Launch model catalog ────────────────────────────────────────────────
-  launchModels(signal: AbortSignal | null = null, timeoutMs = 30_000): Promise<LaunchModelCatalog> {
-    return this.json("/v1/launch/models?agent=claude&accountId=native-claude", { signal, timeoutMs });
+  launchModels(accountId = "native-claude", signal: AbortSignal | null = null, timeoutMs = 30_000): Promise<LaunchModelCatalog> {
+    const account = encodeURIComponent(accountId);
+    return this.json(`/v1/launch/models?agent=claude&accountId=${account}`, { signal, timeoutMs });
   }
 }

@@ -126,8 +126,11 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 /// CLI process is started, sent a single `initialize` control request, and
 /// shut down after reading its `control_response`. This is the same handshake
 /// the official SDK performs before streaming (`supportedModels()`).
-pub(super) async fn fetch_launch_catalog() -> Result<Vec<crate::agent::LaunchModelInfo>> {
-    let mut child = Command::new(binary())
+pub(super) async fn fetch_launch_catalog(
+    environment: &[(String, String)],
+) -> Result<Vec<crate::agent::LaunchModelInfo>> {
+    let mut command = Command::new(binary());
+    command
         .args([
             "-p",
             "--output-format",
@@ -139,7 +142,11 @@ pub(super) async fn fetch_launch_catalog() -> Result<Vec<crate::agent::LaunchMod
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    for (key, value) in environment {
+        command.env(key, value);
+    }
+    let mut child = command
         .spawn()
         .map_err(|_| Error::Invalid("Claude CLI 不可用".into()))?;
     let mut stdin = child.stdin.take().ok_or(Error::Closed)?;
@@ -282,6 +289,8 @@ pub(super) struct TurnOptions {
     pub(super) mode: PermissionMode,
     pub(super) model: Option<String>,
     pub(super) effort: Option<String>,
+    /// Managed-account environment overrides (empty for the native env).
+    pub(super) environment: Vec<(String, String)>,
 }
 
 pub(super) fn spawn_turn(
@@ -309,6 +318,9 @@ pub(super) fn spawn_turn(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(false);
+    for (key, value) in &options.environment {
+        command.env(key, value);
+    }
     if let Some(id) = native_id {
         command.arg(format!("--resume={id}"));
     }

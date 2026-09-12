@@ -165,6 +165,7 @@ impl Agents {
             auto_approve: input.auto_approve,
             model: input.model,
             effort: input.effort,
+            account_id: input.account_id,
         };
         let head = self
             .0
@@ -385,6 +386,11 @@ impl Agents {
             mode: run.mode,
             model: run.model.clone(),
             effort: run.effort.clone(),
+            environment: Self::account_environment(
+                run.account_id.clone(),
+                self.0.database.directory(),
+            )
+            .await?,
         };
         let driver = spawn_turn(
             &workspace,
@@ -1254,11 +1260,52 @@ impl Agents {
     /// `initialize` handshake (no user turn runs). Every request probes the
     /// CLI fresh, matching the legacy node adapter.
     pub async fn launch_catalog() -> Result<LaunchModelCatalog> {
-        let models = super::claude::fetch_launch_catalog().await?;
+        let models = super::claude::fetch_launch_catalog(&[]).await?;
         Ok(LaunchModelCatalog {
             current_model: models.first().map(|model| model.id.clone()),
             models,
         })
+    }
+
+    /// Catalog for a specific account: managed accounts probe through their
+    /// isolated config root, so the directory reflects their own identity.
+    pub async fn launch_catalog_for(&self, account_id: Option<&str>) -> Result<LaunchModelCatalog> {
+        let account_id = match account_id {
+            None | Some(crate::accounts::NATIVE_CLAUDE_ID) => None,
+            Some(id) => {
+                crate::database::validate_id(id)?;
+                let id_owned = id.to_owned();
+                self.0
+                    .database
+                    .call(move |store| Ok(store.managed_account(&id_owned)?.id))
+                    .await?;
+                Some(id.to_owned())
+            }
+        };
+        let environment =
+            Self::account_environment(account_id, self.0.database.directory()).await?;
+        let models = super::claude::fetch_launch_catalog(&environment).await?;
+        Ok(LaunchModelCatalog {
+            current_model: models.first().map(|model| model.id.clone()),
+            models,
+        })
+    }
+
+    /// Private environment overrides for a session's bound account (empty for
+    /// the native environment). Credential files are read off the async pool.
+    async fn account_environment(
+        account_id: Option<String>,
+        data: &std::path::Path,
+    ) -> Result<Vec<(String, String)>> {
+        let Some(id) = account_id else {
+            return Ok(Vec::new());
+        };
+        let data = data.to_owned();
+        tokio::task::spawn_blocking(move || {
+            crate::accounts::managed::claude_environment(&data, &id, false)
+        })
+        .await
+        .map_err(|_| Error::Closed)?
     }
 
     /// Current collaboration mode (`default`/`plan`).
@@ -1295,7 +1342,9 @@ impl Agents {
         if !run.active {
             return Err(Error::Conflict);
         }
-        let models = super::claude::fetch_launch_catalog().await?;
+        let environment =
+            Self::account_environment(run.account_id.clone(), self.0.database.directory()).await?;
+        let models = super::claude::fetch_launch_catalog(&environment).await?;
         let current_model = run
             .model
             .or_else(|| models.first().map(|model| model.id.clone()));
@@ -1330,7 +1379,15 @@ impl Agents {
         {
             return Err(Error::Invalid("思考强度无效".into()));
         }
-        let catalog = super::claude::fetch_launch_catalog().await?;
+        let id_for_env = id.to_owned();
+        let account_id = self
+            .0
+            .database
+            .call(move |store| Ok(store.agent_run(&id_for_env)?.account_id))
+            .await?;
+        let environment =
+            Self::account_environment(account_id, self.0.database.directory()).await?;
+        let catalog = super::claude::fetch_launch_catalog(&environment).await?;
         let selected = catalog
             .iter()
             .find(|entry| entry.id == model)

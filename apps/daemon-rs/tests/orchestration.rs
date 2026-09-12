@@ -804,7 +804,7 @@ fn schema_indexes_survive_reopen() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 15);
+    assert_eq!(version, 16);
     // Stage 7 reverse-edge indexes and Stage 8 worktree indexes all exist.
     let indexed: i64 = connection
         .query_row(
@@ -834,7 +834,7 @@ fn schema_indexes_survive_reopen() {
 }
 
 #[test]
-fn v8_database_is_migrated_forward_to_v15() {
+fn v8_database_is_migrated_forward_to_v16() {
     // Build a v8 database by initialising the pre-orchestration schema with the
     // legacy application id, then prove Store::open upgrades it in place.
     let directory = TempDir::new().unwrap();
@@ -854,13 +854,13 @@ fn v8_database_is_migrated_forward_to_v15() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 15);
+    assert_eq!(version, 16);
     // The migrated store serves orchestration writes.
     let (_run_id, _ids) = make_run(&mut store, "op-graph-migrated", chain(1));
 }
 
 #[test]
-fn v9_database_is_migrated_forward_to_v15() {
+fn v9_database_is_migrated_forward_to_v16() {
     // A v9 database (Stage 7 current schema) gains the v10 worktree table and
     // dispatch column without losing rows.
     let directory = TempDir::new().unwrap();
@@ -884,7 +884,7 @@ fn v9_database_is_migrated_forward_to_v15() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        15
+        16
     );
     drop(connection);
     let (run_id, ids) = make_run(&mut store, "op-graph-v9up", chain(1));
@@ -902,7 +902,7 @@ fn v9_database_is_migrated_forward_to_v15() {
 }
 
 #[test]
-fn v10_database_is_migrated_forward_to_v15() {
+fn v10_database_is_migrated_forward_to_v16() {
     // A v10 database gains agent_runs.permission_mode with the default mode.
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("prospero.sqlite");
@@ -943,7 +943,7 @@ fn v10_database_is_migrated_forward_to_v15() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        15
+        16
     );
     let mode: String = connection
         .query_row(
@@ -958,7 +958,7 @@ fn v10_database_is_migrated_forward_to_v15() {
 }
 
 #[test]
-fn v11_database_is_migrated_forward_to_v15() {
+fn v11_database_is_migrated_forward_to_v16() {
     // A v11 database gains the subagent registry table and the timeline
     // subagent_id column without losing the existing agent run.
     let directory = TempDir::new().unwrap();
@@ -1003,7 +1003,7 @@ fn v11_database_is_migrated_forward_to_v15() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        15
+        16
     );
     // The run row and its v11 fields survived.
     let (mode, turn, native): (String, i64, Option<String>) = connection
@@ -1052,7 +1052,7 @@ fn v11_database_is_migrated_forward_to_v15() {
 }
 
 #[test]
-fn v12_database_is_migrated_forward_to_v15() {
+fn v12_database_is_migrated_forward_to_v16() {
     // A v12 database gains the busy-turn message-queue table without losing
     // the existing agent run.
     let directory = TempDir::new().unwrap();
@@ -1100,7 +1100,7 @@ fn v12_database_is_migrated_forward_to_v15() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        15
+        16
     );
     // The existing run survived.
     let (turn, native): (i64, Option<String>) = connection
@@ -1140,7 +1140,7 @@ fn v12_database_is_migrated_forward_to_v15() {
 }
 
 #[test]
-fn v13_database_is_migrated_forward_to_v15() {
+fn v13_database_is_migrated_forward_to_v16() {
     // A v13 database gains the queue attachments column with an empty JSON
     // default, without losing the existing run or queued row.
     let directory = TempDir::new().unwrap();
@@ -1198,7 +1198,7 @@ fn v13_database_is_migrated_forward_to_v15() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        15
+        16
     );
     // The pre-existing queued row decodes the column default as an empty list.
     let (text, attachments): (String, String) = connection
@@ -1231,7 +1231,7 @@ fn v13_database_is_migrated_forward_to_v15() {
 }
 
 #[test]
-fn v14_database_is_migrated_forward_to_v15() {
+fn v14_database_is_migrated_forward_to_v16() {
     // A v14 database gains the agent_runs.model/effort launch-selection
     // columns (NULL for sessions created before the slice) without losing the
     // existing run.
@@ -1286,7 +1286,7 @@ fn v14_database_is_migrated_forward_to_v15() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        15
+        16
     );
     // Legacy sessions carry no launch selection.
     let (model, effort): (Option<String>, Option<String>) = connection
@@ -1318,6 +1318,135 @@ fn v14_database_is_migrated_forward_to_v15() {
         .unwrap();
     assert_eq!(model, "opus-latest");
     assert_eq!(effort, "high");
+    drop(connection);
+    drop(store);
+}
+
+#[test]
+fn v15_database_is_migrated_forward_to_v16() {
+    // A v15 database gains the managed_accounts registry and the account_id
+    // binding columns on agent/terminal runs without losing existing runs.
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("prospero.sqlite");
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(include_str!("../src/schema.sql"))
+            .unwrap();
+        connection
+            .execute_batch(include_str!("../src/orchestration/schema.sql"))
+            .unwrap();
+        connection
+            .execute_batch(include_str!("../src/orchestration/schema-v10.sql"))
+            .unwrap();
+        connection
+            .execute_batch(include_str!("../src/agent/schema-v11.sql"))
+            .unwrap();
+        connection
+            .execute_batch(include_str!("../src/agent/schema-v12.sql"))
+            .unwrap();
+        connection
+            .execute_batch(include_str!("../src/agent/schema-v13.sql"))
+            .unwrap();
+        connection
+            .execute_batch(include_str!("../src/agent/schema-v14.sql"))
+            .unwrap();
+        connection
+            .execute_batch(include_str!("../src/agent/schema-v15.sql"))
+            .unwrap();
+        connection
+            .pragma_update(None, "application_id", 0x50525253i64)
+            .unwrap();
+        connection.pragma_update(None, "user_version", 15).unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_heads \
+                 (id,created_at,lifecycle,revision,payload) \
+                 VALUES('sess-acct',1,'active',1,json('{\"workspace\":\"/w\",\"agent\":\"claude\",\"kind\":\"structured\",\"title\":\"A\",\"status\":\"idle\"}'))",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO agent_runs(session_id,agent,active,approval_policy,permission_mode,turn,native_id,model,effort) \
+                 VALUES('sess-acct','claude',1,'manual','default',1,'native-a',NULL,NULL)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_heads \
+                 (id,created_at,lifecycle,revision,payload) \
+                 VALUES('term-acct',2,'active',1,json('{\"workspace\":\"/w\",\"agent\":\"shell\",\"kind\":\"pty\",\"title\":\"T\",\"status\":\"running\"}'))",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO terminal_runs(session_id,cols,rows,active) VALUES('term-acct',80,24,1)",
+                [],
+            )
+            .unwrap();
+    }
+    let store = Store::open(directory.path()).unwrap();
+    let connection = raw(&directory);
+    assert_eq!(
+        connection
+            .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap(),
+        16
+    );
+    // Pre-existing runs survive and are unbound (native).
+    let bound: Option<String> = connection
+        .query_row(
+            "SELECT account_id FROM agent_runs WHERE session_id='sess-acct'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(bound, None);
+    let bound: Option<String> = connection
+        .query_row(
+            "SELECT account_id FROM terminal_runs WHERE session_id='term-acct'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(bound, None);
+    // The managed registry is usable with its CHECK constraints.
+    connection
+        .execute(
+            "INSERT INTO managed_accounts(id,name,is_default,created_at,updated_at) \
+             VALUES('acct-1','工作账号',1,10,10)",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE agent_runs SET account_id='acct-1' WHERE session_id='sess-acct'",
+            [],
+        )
+        .unwrap();
+    let (name, active): (String, i64) = connection
+        .query_row(
+            "SELECT a.name,COUNT(r.session_id) FROM managed_accounts a \
+             JOIN agent_runs r ON r.account_id=a.id GROUP BY a.id",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(name, "工作账号");
+    assert_eq!(active, 1);
+    // Empty names are rejected by the table CHECK.
+    assert!(
+        connection
+            .execute(
+                "INSERT INTO managed_accounts(id,name,is_default,created_at,updated_at) \
+             VALUES('acct-bad','',0,10,10)",
+                [],
+            )
+            .is_err()
+    );
     drop(connection);
     drop(store);
 }

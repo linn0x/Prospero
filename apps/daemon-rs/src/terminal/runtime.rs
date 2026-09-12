@@ -21,6 +21,15 @@ struct State {
 #[derive(Clone)]
 pub struct Terminals(Arc<State>);
 
+/// Explicit program for a non-shell PTY (managed-account login flow).
+#[derive(Debug, Clone)]
+pub(crate) struct ProgramSpec {
+    pub program: String,
+    pub args: Vec<String>,
+    pub environment: Vec<(String, String)>,
+    pub account_id: String,
+}
+
 impl Terminals {
     pub fn new(database: Database) -> Self {
         Self::with_guard(database, None)
@@ -43,6 +52,36 @@ impl Terminals {
         16 - self.0.slots.available_permits()
     }
 
+    /// Spawns the managed-Claude login flow (`claude setup-token`) in a PTY
+    /// rooted at the account's isolated config directory. The returned head is
+    /// a normal pty session; its run is bound to the account for accounting.
+    #[cfg(unix)]
+    pub async fn create_login(
+        &self,
+        account_id: &str,
+        title: String,
+        size: TerminalSize,
+        environment: Vec<(String, String)>,
+    ) -> Result<SessionHead> {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .ok_or_else(|| Error::Invalid("无法定位用户目录".into()))?;
+        let program = std::env::var("PROSPERO_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
+        let input = CreateTerminal {
+            title,
+            workspace: home.to_string_lossy().into_owned(),
+            size,
+        };
+        let spec = ProgramSpec {
+            program,
+            args: vec!["setup-token".into()],
+            environment,
+            account_id: account_id.to_owned(),
+        };
+        self.create_with(input, Some(spec)).await
+    }
+
     pub(crate) fn changes(&self) -> watch::Sender<u64> {
         self.0.changed.clone()
     }
@@ -56,6 +95,17 @@ impl Terminals {
     }
 
     pub async fn create(&self, input: CreateTerminal) -> Result<SessionHead> {
+        self.create_with(input, None).await
+    }
+
+    /// A non-shell PTY (the managed-account login flow): runs an explicit
+    /// program with private environment overrides and is bound to the account
+    /// for active-session accounting.
+    pub(crate) async fn create_with(
+        &self,
+        input: CreateTerminal,
+        spec: Option<ProgramSpec>,
+    ) -> Result<SessionHead> {
         input.size.validate()?;
         crate::database::validate_text(&input.title, 512, false)?;
         crate::database::validate_text(&input.workspace, 4096, false)?;
@@ -77,7 +127,7 @@ impl Terminals {
             let created = if reply.is_closed() {
                 Err(Error::Closed)
             } else {
-                runtime.start(input).await
+                runtime.start(input, spec).await
             };
             match created {
                 Ok((head, terminal)) => {
@@ -190,7 +240,11 @@ impl Terminals {
     }
 
     #[cfg(unix)]
-    async fn start(&self, mut input: CreateTerminal) -> Result<(SessionHead, Terminal)> {
+    async fn start(
+        &self,
+        mut input: CreateTerminal,
+        spec: Option<ProgramSpec>,
+    ) -> Result<(SessionHead, Terminal)> {
         let workspace = input.workspace.clone();
         let directory = tokio::task::spawn_blocking(move || std::fs::canonicalize(workspace))
             .await
@@ -207,30 +261,45 @@ impl Terminals {
         }
         let size = input.size;
         let guard = self.0.guard.clone();
+        let account_id = spec.as_ref().map(|spec| spec.account_id.clone());
         let head = self
             .0
             .database
-            .call(move |store| store.create_terminal(input))
+            .call(move |store| store.create_terminal_with(input, account_id))
             .await?;
         let child = tokio::task::spawn_blocking(move || {
-            let shell = std::env::var_os("SHELL")
-                .filter(|shell| Path::new(shell).is_absolute())
-                .unwrap_or_else(|| "/bin/sh".into());
-            let mut command = if let Some(guard) = guard {
-                let mut command = portable_pty::CommandBuilder::new(guard);
-                command.args([
-                    "terminal-guard",
-                    "--parent",
-                    &std::process::id().to_string(),
-                    "--shell",
-                ]);
-                command.arg(shell);
-                command.args(["--", "-l"]);
-                command
-            } else {
-                let mut command = portable_pty::CommandBuilder::new(shell);
-                command.arg("-l");
-                command
+            let mut command = match &spec {
+                Some(spec) => {
+                    // Explicit program (managed-account login): no shell, no
+                    // guard, private env overrides only.
+                    let mut command = portable_pty::CommandBuilder::new(&spec.program);
+                    command.args(&spec.args);
+                    for (key, value) in &spec.environment {
+                        command.env(key, value);
+                    }
+                    command
+                }
+                None => {
+                    let shell = std::env::var_os("SHELL")
+                        .filter(|shell| Path::new(shell).is_absolute())
+                        .unwrap_or_else(|| "/bin/sh".into());
+                    if let Some(guard) = guard {
+                        let mut command = portable_pty::CommandBuilder::new(guard);
+                        command.args([
+                            "terminal-guard",
+                            "--parent",
+                            &std::process::id().to_string(),
+                            "--shell",
+                        ]);
+                        command.arg(shell);
+                        command.args(["--", "-l"]);
+                        command
+                    } else {
+                        let mut command = portable_pty::CommandBuilder::new(shell);
+                        command.arg("-l");
+                        command
+                    }
+                }
             };
             command.cwd(directory);
             command.env("TERM", "xterm-256color");
@@ -303,7 +372,11 @@ impl Terminals {
     }
 
     #[cfg(not(unix))]
-    async fn start(&self, _input: CreateTerminal) -> Result<(SessionHead, Terminal)> {
+    async fn start(
+        &self,
+        _input: CreateTerminal,
+        _spec: Option<ProgramSpec>,
+    ) -> Result<(SessionHead, Terminal)> {
         Err(Error::Invalid(
             "terminal runtime is not available on this platform".into(),
         ))

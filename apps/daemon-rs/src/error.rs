@@ -17,6 +17,8 @@ pub enum Error {
     NotFound,
     #[error("record changed; reload before retrying")]
     Conflict,
+    #[error("account is still in use by an active session")]
+    InUse,
     #[error("database queue is full")]
     Busy,
     #[error("database worker is unavailable")]
@@ -51,6 +53,7 @@ impl Error {
             Self::Invalid(_) => ("invalid_request", false),
             Self::NotFound => ("not_found", false),
             Self::Conflict => ("conflict", false),
+            Self::InUse => ("in_use", false),
             Self::Busy => ("busy", true),
             Self::Closed => ("unavailable", true),
             Self::AlreadyRunning => ("already_running", false),
