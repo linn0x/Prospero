@@ -14,7 +14,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 
-use super::store::ApprovalPolicy;
+use super::store::{ApprovalPolicy, PermissionMode};
 use crate::error::{Error, Result};
 
 /// Semantic events normalized from the CLI JSONL stream.
@@ -74,6 +74,7 @@ pub(super) fn spawn_turn(
     prompt: &str,
     native_id: Option<&str>,
     policy: ApprovalPolicy,
+    mode: PermissionMode,
 ) -> Result<ClaudeTurn> {
     let mut command = Command::new(binary());
     command
@@ -95,6 +96,10 @@ pub(super) fn spawn_turn(
         .kill_on_drop(false);
     if let Some(id) = native_id {
         command.arg(format!("--resume={id}"));
+    }
+    if mode == PermissionMode::Plan {
+        // Plan mode: the CLI investigates and plans but does not apply edits.
+        command.args(["--permission-mode", "plan"]);
     }
     #[cfg(unix)]
     unsafe {

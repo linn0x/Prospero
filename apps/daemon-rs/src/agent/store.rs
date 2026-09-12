@@ -20,11 +20,29 @@ impl ApprovalPolicy {
     }
 }
 
+/// Claude collaboration mode persisted per session; applied as the headless
+/// CLI's `--permission-mode` on each turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionMode {
+    Default,
+    Plan,
+}
+
+impl PermissionMode {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            PermissionMode::Default => "default",
+            PermissionMode::Plan => "plan",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct AgentRun {
     pub agent: AgentKind,
     pub active: bool,
     pub policy: ApprovalPolicy,
+    pub mode: PermissionMode,
     pub turn: i64,
     pub native_id: Option<String>,
 }
@@ -54,18 +72,32 @@ impl Store {
 
     pub(crate) fn agent_run(&self, id: &str) -> Result<AgentRun> {
         crate::database::validate_id(id)?;
-        let row: (String, bool, String, i64, Option<String>) = self
+        let row: (String, bool, String, String, i64, Option<String>) = self
             .connection
             .query_row(
-                "SELECT agent,active,approval_policy,turn,native_id FROM agent_runs WHERE session_id=?",
+                "SELECT agent,active,approval_policy,permission_mode,turn,native_id FROM agent_runs WHERE session_id=?",
                 [id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )
             .optional()?
             .ok_or(Error::NotFound)?;
         let policy = match row.2.as_str() {
             "manual" => ApprovalPolicy::Manual,
             "auto" => ApprovalPolicy::Auto,
+            _ => return Err(Error::Schema),
+        };
+        let mode = match row.3.as_str() {
+            "default" => PermissionMode::Default,
+            "plan" => PermissionMode::Plan,
             _ => return Err(Error::Schema),
         };
         let agent = match row.0.as_str() {
@@ -76,9 +108,25 @@ impl Store {
             agent,
             active: row.1,
             policy,
-            turn: row.3,
-            native_id: row.4,
+            mode,
+            turn: row.4,
+            native_id: row.5,
         })
+    }
+
+    /// Persist the selected collaboration mode. Allowed only while the
+    /// session is active; the running turn keeps its mode until the next send.
+    pub(crate) fn set_agent_mode(&mut self, id: &str, mode: PermissionMode) -> Result<()> {
+        crate::database::validate_id(id)?;
+        let run = self.agent_run(id)?;
+        if !run.active {
+            return Err(Error::Conflict);
+        }
+        self.connection.execute(
+            "UPDATE agent_runs SET permission_mode=?1 WHERE session_id=?2",
+            params![mode.label(), id],
+        )?;
+        Ok(())
     }
 
     pub(crate) fn begin_agent_turn(&mut self, id: &str) -> Result<(i64, Option<String>)> {
