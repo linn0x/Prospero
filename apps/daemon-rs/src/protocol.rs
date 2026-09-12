@@ -280,6 +280,18 @@ pub struct AgentQuestion {
     pub allow_other: bool,
 }
 
+/// Metadata-only reference to an inbound image. The bytes are delivered to
+/// the CLI once and are never stored or re-served (matches desktop legacy).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct MessageAttachment {
+    pub id: String,
+    pub mime_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(
     tag = "kind",
@@ -291,6 +303,8 @@ pub enum TimelineBody {
     Message {
         role: MessageRole,
         final_answer: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<MessageAttachment>,
     },
     Reasoning,
     Tool {
@@ -463,6 +477,7 @@ pub fn typescript() -> String {
         ToolState::decl(&config),
         QuestionOption::decl(&config),
         AgentQuestion::decl(&config),
+        MessageAttachment::decl(&config),
         TimelineBody::decl(&config),
         TimelineRecord::decl(&config),
         TimelineWrite::decl(&config),
@@ -479,6 +494,7 @@ pub fn typescript() -> String {
         crate::terminal::TerminalInput::decl(&config),
         crate::terminal::TerminalSnapshot::decl(&config),
         crate::agent::CreateAgentSession::decl(&config),
+        crate::agent::AttachmentInput::decl(&config),
         crate::agent::AgentSend::decl(&config),
         crate::agent::QueuedMessage::decl(&config),
         crate::agent::AgentQueue::decl(&config),
