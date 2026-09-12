@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use tokio::sync::{Mutex, Semaphore, oneshot, watch};
 
-use super::claude::{AdapterEvent, ClaudeTurn, spawn_turn};
+use super::claude::{AdapterEvent, ClaudeTurn, QuestionReply, spawn_turn};
 use super::store::{ApprovalPolicy, PermissionMode};
 use super::*;
 use crate::error::{Error, Result};
@@ -45,6 +45,14 @@ struct Handle {
     replies: Mutex<HashMap<String, oneshot::Sender<bool>>>,
     /// request id -> timeline record id of pending approvals.
     records: Mutex<HashMap<String, String>>,
+    questions: Mutex<HashMap<String, QuestionPending>>,
+}
+
+/// Pending AskUserQuestion: the blocking CLI reply plus the map from public
+/// question ids (`q1`) back to the native question text used in the answer.
+struct QuestionPending {
+    reply: oneshot::Sender<QuestionReply>,
+    native_by_id: HashMap<String, String>,
 }
 
 struct Session {
@@ -242,6 +250,7 @@ impl Agents {
             driver: Mutex::new(driver),
             replies: Mutex::new(HashMap::new()),
             records: Mutex::new(HashMap::new()),
+            questions: Mutex::new(HashMap::new()),
         });
         *guard = Some(handle.clone());
         drop(guard);
@@ -584,6 +593,79 @@ impl Agents {
                         .await
                         .ok();
                 }
+                AdapterEvent::Question {
+                    subagent,
+                    request_id,
+                    questions,
+                    reply,
+                } => {
+                    flush!();
+                    let record_id = format!("turn{turn}-q-{request_id}");
+                    let native_by_id = questions
+                        .iter()
+                        .map(|spec| (spec.id.clone(), spec.native_question.clone()))
+                        .collect::<HashMap<_, _>>();
+                    let payload = questions
+                        .into_iter()
+                        .map(|spec| AgentQuestion {
+                            id: spec.id,
+                            header: spec.header,
+                            question: spec.question,
+                            options: spec
+                                .options
+                                .into_iter()
+                                .map(|option| QuestionOption {
+                                    label: option.label,
+                                    description: option.description,
+                                    preview: option.preview,
+                                })
+                                .collect(),
+                            multi_select: spec.multi_select,
+                            allow_other: true,
+                        })
+                        .collect::<Vec<_>>();
+                    handle.questions.lock().await.insert(
+                        request_id.clone(),
+                        QuestionPending {
+                            reply,
+                            native_by_id,
+                        },
+                    );
+                    // The records map is shared with approvals; the `q:`
+                    // prefix keeps the two request-id spaces apart.
+                    handle
+                        .records
+                        .lock()
+                        .await
+                        .insert(format!("q:{request_id}"), record_id.clone());
+                    let write = TimelineWrite {
+                        id: record_id,
+                        turn_id: format!("turn{turn}"),
+                        expected_revision: 0,
+                        body: TimelineBody::Question {
+                            request_id,
+                            questions: payload,
+                            resolved: false,
+                            subagent,
+                        },
+                        text: String::new(),
+                        replace: false,
+                        subagent_id: None,
+                    };
+                    let result = self
+                        .0
+                        .database
+                        .call({
+                            let id = id.clone();
+                            move |store| store.append_agent_records(&id, vec![write])
+                        })
+                        .await;
+                    if result.is_err() {
+                        failure = result.err().map(|error| error.to_string());
+                        break;
+                    }
+                    self.set_status(&id, SessionStatus::WaitingInput).await.ok();
+                }
                 AdapterEvent::Finish {
                     interrupted: was_interrupted,
                     error,
@@ -700,6 +782,65 @@ impl Agents {
         Ok(())
     }
 
+    pub async fn respond_question(
+        &self,
+        id: &str,
+        request_id: &str,
+        answers: Vec<QuestionAnswer>,
+        cancelled: bool,
+    ) -> Result<()> {
+        crate::database::validate_id(request_id)?;
+        for answer in &answers {
+            crate::database::validate_id(&answer.question_id)?;
+            if answer.values.iter().any(|value| value.len() > 8192) {
+                return Err(Error::Invalid("answer exceeds limit".into()));
+            }
+        }
+        let entry = self.session_entry(id).await?;
+        let guard = entry.handle.lock().await;
+        let handle = guard.as_ref().ok_or(Error::NotFound)?;
+        let pending = handle
+            .questions
+            .lock()
+            .await
+            .remove(request_id)
+            .ok_or(Error::NotFound)?;
+        let record_id = handle
+            .records
+            .lock()
+            .await
+            .get(&format!("q:{request_id}"))
+            .cloned();
+        let native = answers
+            .into_iter()
+            .filter_map(|answer| {
+                pending
+                    .native_by_id
+                    .get(&answer.question_id)
+                    .map(|native| (native.clone(), answer.values.join(", ")))
+            })
+            .collect::<HashMap<_, _>>();
+        // Dropping would deny; an explicit cancel still allows with {}.
+        let _ = pending.reply.send(QuestionReply {
+            answers: native,
+            cancelled,
+        });
+        drop(guard);
+        if let Some(record_id) = record_id {
+            let id = id.to_owned();
+            let result = self
+                .0
+                .database
+                .call(move |store| store.resolve_agent_question(&id, &record_id))
+                .await;
+            if !matches!(result, Err(Error::NotFound)) {
+                result?;
+            }
+        }
+        self.set_status(id, SessionStatus::Running).await?;
+        Ok(())
+    }
+
     /// Current collaboration mode (`default`/`plan`).
     pub async fn mode(&self, id: &str) -> Result<PermissionMode> {
         let id = id.to_owned();
@@ -739,10 +880,12 @@ impl Agents {
         let entry = self.session_entry(id).await?;
         let guard = entry.handle.lock().await;
         let handle = guard.as_ref().ok_or(Error::NotFound)?;
-        // Any unresolved approvals are rejected when the turn is interrupted.
+        // Any unresolved approvals are rejected and pending questions are
+        // denied when the turn is interrupted.
         let pending: Vec<_> = std::mem::take(&mut *handle.replies.lock().await)
             .into_iter()
             .collect();
+        std::mem::take(&mut *handle.questions.lock().await);
         std::mem::take(&mut *handle.records.lock().await);
         for (_request_id, reply) in pending {
             // The translator's reply task writes the deny frame.
@@ -753,7 +896,7 @@ impl Agents {
             let id = id.to_owned();
             self.0
                 .database
-                .call(move |store| store.resolve_all_agent_permissions(&id))
+                .call(move |store| store.resolve_all_agent_requests(&id))
                 .await?
         };
         if resolved > 0 {
@@ -771,6 +914,9 @@ impl Agents {
         if let Ok(entry) = self.session_entry(id).await {
             if let Some(handle) = entry.handle.lock().await.take() {
                 let pending = std::mem::take(&mut *handle.replies.lock().await);
+                // Dropping pending question senders makes the translator
+                // answer deny; no explicit send needed.
+                std::mem::take(&mut *handle.questions.lock().await);
                 for (_request_id, reply) in pending {
                     // The translator's reply task owns the deny frame; sending
                     // here is enough, calling driver.respond_permission too
@@ -824,6 +970,7 @@ impl Agents {
         for session in &sessions {
             if let Some(handle) = session.handle.lock().await.take() {
                 let pending = std::mem::take(&mut *handle.replies.lock().await);
+                std::mem::take(&mut *handle.questions.lock().await);
                 for (_request_id, reply) in pending {
                     // See close(): the translator task writes the deny frame.
                     let _ = reply.send(false);

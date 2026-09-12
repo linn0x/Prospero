@@ -32,6 +32,23 @@ pub struct PermissionDecision {
 
 #[derive(Debug, Deserialize, Serialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct QuestionAnswer {
+    pub question_id: String,
+    pub values: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct QuestionDecision {
+    pub request_id: String,
+    #[serde(default)]
+    pub answers: Vec<QuestionAnswer>,
+    #[serde(default)]
+    pub cancelled: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentModeSelection {
     pub mode: String,
 }

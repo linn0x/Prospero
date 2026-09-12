@@ -346,6 +346,20 @@ export class RustRuntime {
             await client.agentPermission(id, { requestId, allow: reply !== "reject" }, signal);
             return { ok: true };
           }
+          if (action === "interact" && input?.["type"] === "question.respond") {
+            const requestId = input["reqId"];
+            if (typeof requestId !== "string") throw new Error("提问请求无效");
+            const raw = Array.isArray(input["answers"]) ? input["answers"] : [];
+            const answers = raw.map((entry: unknown) => {
+              const item = entry as Record<string, unknown>;
+              const questionId = item?.["questionId"];
+              const values = Array.isArray(item?.["values"]) ? item!["values"] : [];
+              if (typeof questionId !== "string" || !questionId) throw new Error("提问回答无效");
+              return { questionId, values: values.map((value: unknown) => String(value)) };
+            });
+            await client.agentQuestion(id, { requestId, answers, cancelled: input["cancelled"] === true }, signal);
+            return { ok: true };
+          }
           if (action === "interrupt") { await client.agentInterrupt(id, signal); return { ok: true }; }
           if (action === "kill") { await client.agentClose(id, signal); await this.refresh(true); return { ok: true }; }
           throw new Error("此 Agent 操作尚未接入 Rust daemon");

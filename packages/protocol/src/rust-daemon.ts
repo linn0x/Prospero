@@ -23,12 +23,14 @@ export type ContentHead = { id: string, bytes: number, };
 export type ContentPage = { items: Array<ContentHead>, nextCursor: string | null, hasMore: boolean, };
 export type MessageRole = "user" | "assistant";
 export type ToolState = "running" | "success" | "failed";
+export type QuestionOption = { label: string, description: string | null, preview: string | null, };
+export type AgentQuestion = { id: string, header: string, question: string, options: Array<QuestionOption>, multiSelect: boolean, allowOther: boolean, };
 export type TimelineBody = { "kind": "message", role: MessageRole, finalAnswer: boolean, } | { "kind": "reasoning" } | { "kind": "tool", name: string, state: ToolState, summary: string, } | { "kind": "permission_request", requestId: string, tool: string, resolved: boolean, 
 /**
  * Set when the approval belongs to a Task-tool subagent; the event
  * still shows on the main timeline so it can be answered there.
  */
-subagent: string | null, } | { "kind": "turn_end", finish: string, } | { "kind": "subagent", subagentId: string, name: string, role: string | null, task: string | null, status: string, canMessage: boolean, summary: string, createdAt: number, updatedAt: number, } | { "kind": "error" };
+subagent: string | null, } | { "kind": "question", requestId: string, questions: Array<AgentQuestion>, resolved: boolean, subagent: string | null, } | { "kind": "turn_end", finish: string, } | { "kind": "subagent", subagentId: string, name: string, role: string | null, task: string | null, status: string, canMessage: boolean, summary: string, createdAt: number, updatedAt: number, } | { "kind": "error" };
 export type TimelineRecord = { id: string, turnId: string, position: number, revision: number, body: TimelineBody, preview: string, bytes: number, generation: number, truncated: boolean, };
 export type TimelineWrite = { id: string, turnId: string, expectedRevision: number, body: TimelineBody, text: string, replace: boolean, };
 export type TimelineQuery = { before: number | null, after: number | null, limit: number | null, };
@@ -46,6 +48,8 @@ export type TerminalSnapshot = { seq: number, size: TerminalSize, dataB64: strin
 export type CreateAgentSession = { title: string, workspace: string, autoApprove: boolean, };
 export type AgentSend = { text: string, };
 export type PermissionDecision = { requestId: string, allow: boolean, };
+export type QuestionAnswer = { questionId: string, values: Array<string>, };
+export type QuestionDecision = { requestId: string, answers: Array<QuestionAnswer>, cancelled: boolean, };
 export type AgentModeSelection = { mode: string, };
 export type AgentModeCatalog = { modes: Array<AgentModeEntry>, currentMode: string, };
 export type AgentModeEntry = { id: string, label: string, description: string, };

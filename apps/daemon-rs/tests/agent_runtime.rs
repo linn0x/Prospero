@@ -68,6 +68,28 @@ elif scenario == "approval":
          "is_error": not allowed,
          "content": "removed" if allowed else "denied by user"}]}})
     result()
+elif scenario == "question":
+    emit({"type": "assistant", "message": {"role": "assistant", "content": [
+        {"type": "tool_use", "id": "call_q", "name": "AskUserQuestion",
+         "input": {"questions": []}}]}})
+    emit({"type": "control_request", "request_id": "req-q",
+          "request": {"subtype": "can_use_tool", "tool_name": "AskUserQuestion",
+                      "input": {"questions": [
+                          {"header": "选择方案", "question": "用哪种方案",
+                           "multiSelect": False,
+                           "options": [{"label": "方案 A", "description": "更快"},
+                                       {"label": "方案 B", "description": "更稳"}]},
+                          {"header": "补充", "question": "还要什么",
+                           "multiSelect": True,
+                           "options": [{"label": "测试"}]}]}}})
+    answer = sys.stdin.readline()
+    with open(os.path.join(cwd, "answers.log"), "w") as log:
+        log.write(answer)
+    emit({"type": "user", "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "call_q",
+         "is_error": '"deny"' in answer,
+         "content": "question answered"}]}})
+    result()
 elif scenario == "interrupt":
     emit({"type": "assistant", "message": {"role": "assistant", "content": [
         {"type": "tool_use", "id": "call_1", "name": "Bash", "input": {"command": "sleep"}}]}})
@@ -382,6 +404,179 @@ async fn permission_roundtrip_executes_tool() {
             ..
         }
     ) && preview == "removed"));
+}
+
+#[tokio::test]
+async fn question_roundtrip_sends_native_answers() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("question").await;
+    let head = harness.create().await;
+    harness.agents.send(&head.id, "go".into()).await.unwrap();
+
+    let records = harness
+        .wait_for(&head.id, |records| {
+            records.iter().any(
+                |(_, body, _)| matches!(body, TimelineBody::Question { resolved, .. } if !resolved),
+            )
+        })
+        .await;
+    let (request_id, questions) = records
+        .iter()
+        .find_map(|(_, body, _)| match body {
+            TimelineBody::Question {
+                request_id,
+                questions,
+                resolved: false,
+                ..
+            } => Some((request_id.clone(), questions.clone())),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(questions.len(), 2);
+    assert_eq!(questions[0].id, "q1");
+    assert_eq!(questions[0].question, "用哪种方案");
+    assert_eq!(questions[0].options.len(), 2);
+    assert!(!questions[0].multi_select);
+    assert!(questions[0].allow_other);
+    assert!(questions[1].multi_select);
+    assert_eq!(
+        harness.status(&head.id).await,
+        prosperod_rs::protocol::SessionStatus::WaitingInput
+    );
+
+    harness
+        .agents
+        .respond_question(
+            &head.id,
+            &request_id,
+            vec![
+                prosperod_rs::agent::QuestionAnswer {
+                    question_id: "q1".into(),
+                    values: vec!["方案 A".into()],
+                },
+                prosperod_rs::agent::QuestionAnswer {
+                    question_id: "q2".into(),
+                    values: vec!["测试".into(), "自定义".into()],
+                },
+            ],
+            false,
+        )
+        .await
+        .unwrap();
+
+    let records = harness
+        .wait_for(&head.id, |records| {
+            records.iter().any(|(_, body, _)| {
+                matches!(
+                    body,
+                    TimelineBody::TurnEnd { finish } if finish == "completed"
+                )
+            })
+        })
+        .await;
+    assert!(
+        records.iter().any(
+            |(_, body, _)| matches!(body, TimelineBody::Question { resolved, .. } if *resolved)
+        )
+    );
+
+    // The CLI must receive answers keyed by the native question text, with
+    // multi-select values joined exactly like the legacy adapter.
+    let answers = std::fs::read_to_string(harness.workspace.path().join("answers.log")).unwrap();
+    assert!(answers.contains(r#""用哪种方案":"方案 A""#), "{answers}");
+    assert!(
+        answers.contains(r#""还要什么":"测试, 自定义""#),
+        "{answers}"
+    );
+}
+
+#[tokio::test]
+async fn question_cancel_allows_with_empty_answers() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("question").await;
+    let head = harness.create().await;
+    harness.agents.send(&head.id, "go".into()).await.unwrap();
+    let records = harness
+        .wait_for(&head.id, |records| {
+            records.iter().any(|(_, body, _)| {
+                matches!(
+                    body,
+                    TimelineBody::Question {
+                        resolved: false,
+                        ..
+                    }
+                )
+            })
+        })
+        .await;
+    let request_id = records
+        .iter()
+        .find_map(|(_, body, _)| match body {
+            TimelineBody::Question {
+                request_id,
+                resolved: false,
+                ..
+            } => Some(request_id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    harness
+        .agents
+        .respond_question(&head.id, &request_id, vec![], true)
+        .await
+        .unwrap();
+    harness
+        .wait_for(&head.id, |records| {
+            records.iter().any(|(_, body, _)| {
+                matches!(
+                    body,
+                    TimelineBody::TurnEnd { finish } if finish == "completed"
+                )
+            })
+        })
+        .await;
+    // Cancellation still allows the tool call; the answers map is empty.
+    let answers = std::fs::read_to_string(harness.workspace.path().join("answers.log")).unwrap();
+    assert!(answers.contains(r#""behavior":"allow""#), "{answers}");
+    assert!(answers.contains(r#""answers":{}"#), "{answers}");
+    assert!(!answers.contains(r#""behavior":"deny""#), "{answers}");
+}
+
+#[tokio::test]
+async fn interrupt_resolves_pending_question() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("question").await;
+    let head = harness.create().await;
+    harness.agents.send(&head.id, "go".into()).await.unwrap();
+    harness
+        .wait_for(&head.id, |records| {
+            records.iter().any(|(_, body, _)| {
+                matches!(
+                    body,
+                    TimelineBody::Question {
+                        resolved: false,
+                        ..
+                    }
+                )
+            })
+        })
+        .await;
+    harness.agents.interrupt(&head.id).await.unwrap();
+    let records = harness
+        .wait_for(&head.id, |records| {
+            records.iter().any(
+                |(_, body, _)| matches!(body, TimelineBody::Question { resolved, .. } if *resolved),
+            )
+        })
+        .await;
+    // The dropped callback makes the translator deny the tool call.
+    let answers = std::fs::read_to_string(harness.workspace.path().join("answers.log")).unwrap();
+    assert!(answers.contains(r#""behavior":"deny""#), "{answers}");
+    assert!(
+        records
+            .iter()
+            .any(|(_, body, _)| matches!(body, TimelineBody::Question { resolved: true, .. }))
+    );
 }
 
 #[tokio::test]
