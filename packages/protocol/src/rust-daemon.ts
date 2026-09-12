@@ -46,7 +46,19 @@ export type TerminalPage = { initialSize: TerminalSize, baseSeq: number, nextSeq
 export type TerminalInput = { dataB64: string, };
 export type TerminalSnapshot = { seq: number, size: TerminalSize, dataB64: string, };
 export type CreateAgentSession = { title: string, workspace: string, autoApprove: boolean, };
-export type AgentSend = { text: string, };
+export type AgentSend = { text: string, 
+/**
+ * `steer` tries to guide the running turn live and falls back to the
+ * front of the queue; anything else enqueues normally (FIFO).
+ */
+delivery: string | null, };
+export type QueuedMessage = { id: string, text: string, 
+/**
+ * `guide` rows jump the front of the queue ("现在引导").
+ */
+kind: string, createdAt: number, };
+export type AgentQueue = { sessionId: string, items: Array<QueuedMessage>, };
+export type AgentQueues = { queues: Array<AgentQueue>, };
 export type PermissionDecision = { requestId: string, allow: boolean, };
 export type QuestionAnswer = { questionId: string, values: Array<string>, };
 export type QuestionDecision = { requestId: string, answers: Array<QuestionAnswer>, cancelled: boolean, };

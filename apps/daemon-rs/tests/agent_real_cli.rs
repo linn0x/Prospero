@@ -58,7 +58,7 @@ impl Harness {
     }
 
     async fn send(&self, text: &str) {
-        self.agents.send(&self.id, text.into()).await.unwrap();
+        self.agents.send(&self.id, text.into(), None).await.unwrap();
     }
 
     async fn records(&self) -> Vec<(TimelineBody, String)> {

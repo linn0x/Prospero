@@ -310,7 +310,7 @@ pub async fn start_worker(
         run.coordinator_session_id.as_deref(),
         &skill_names,
     );
-    if let Err(error) = agents.send(&head.id, prompt).await {
+    if let Err(error) = agents.send(&head.id, prompt, None).await {
         let reason = format!("worker prompt delivery failed: {}", error_message(&error));
         let _ = agents.close(&head.id).await;
         let dispatch_id = outcome.dispatch.id.clone();
