@@ -347,6 +347,7 @@ async fn timeline_routes_expose_previews_and_generation_checked_body_pages() {
                     body: TimelineBody::Message {
                         role: MessageRole::Assistant,
                         final_answer: true,
+                        attachments: Vec::new(),
                     },
                     text: "中🦀".repeat(5000),
                     replace: false,

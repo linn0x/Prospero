@@ -804,7 +804,7 @@ fn schema_indexes_survive_reopen() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
     // Stage 7 reverse-edge indexes and Stage 8 worktree indexes all exist.
     let indexed: i64 = connection
         .query_row(
@@ -834,7 +834,7 @@ fn schema_indexes_survive_reopen() {
 }
 
 #[test]
-fn v8_database_is_migrated_forward_to_v13() {
+fn v8_database_is_migrated_forward_to_v14() {
     // Build a v8 database by initialising the pre-orchestration schema with the
     // legacy application id, then prove Store::open upgrades it in place.
     let directory = TempDir::new().unwrap();
@@ -854,13 +854,13 @@ fn v8_database_is_migrated_forward_to_v13() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
     // The migrated store serves orchestration writes.
     let (_run_id, _ids) = make_run(&mut store, "op-graph-migrated", chain(1));
 }
 
 #[test]
-fn v9_database_is_migrated_forward_to_v13() {
+fn v9_database_is_migrated_forward_to_v14() {
     // A v9 database (Stage 7 current schema) gains the v10 worktree table and
     // dispatch column without losing rows.
     let directory = TempDir::new().unwrap();
@@ -884,7 +884,7 @@ fn v9_database_is_migrated_forward_to_v13() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        13
+        14
     );
     drop(connection);
     let (run_id, ids) = make_run(&mut store, "op-graph-v9up", chain(1));
@@ -902,7 +902,7 @@ fn v9_database_is_migrated_forward_to_v13() {
 }
 
 #[test]
-fn v10_database_is_migrated_forward_to_v13() {
+fn v10_database_is_migrated_forward_to_v14() {
     // A v10 database gains agent_runs.permission_mode with the default mode.
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("prospero.sqlite");
@@ -943,7 +943,7 @@ fn v10_database_is_migrated_forward_to_v13() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        13
+        14
     );
     let mode: String = connection
         .query_row(
@@ -958,7 +958,7 @@ fn v10_database_is_migrated_forward_to_v13() {
 }
 
 #[test]
-fn v11_database_is_migrated_forward_to_v13() {
+fn v11_database_is_migrated_forward_to_v14() {
     // A v11 database gains the subagent registry table and the timeline
     // subagent_id column without losing the existing agent run.
     let directory = TempDir::new().unwrap();
@@ -1003,7 +1003,7 @@ fn v11_database_is_migrated_forward_to_v13() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        13
+        14
     );
     // The run row and its v11 fields survived.
     let (mode, turn, native): (String, i64, Option<String>) = connection
@@ -1052,7 +1052,7 @@ fn v11_database_is_migrated_forward_to_v13() {
 }
 
 #[test]
-fn v12_database_is_migrated_forward_to_v13() {
+fn v12_database_is_migrated_forward_to_v14() {
     // A v12 database gains the busy-turn message-queue table without losing
     // the existing agent run.
     let directory = TempDir::new().unwrap();
@@ -1100,7 +1100,7 @@ fn v12_database_is_migrated_forward_to_v13() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        13
+        14
     );
     // The existing run survived.
     let (turn, native): (i64, Option<String>) = connection
@@ -1135,6 +1135,97 @@ fn v12_database_is_migrated_forward_to_v13() {
         )
         .unwrap();
     assert_eq!(first, "q2");
+    drop(connection);
+    drop(store);
+}
+
+#[test]
+fn v13_database_is_migrated_forward_to_v14() {
+    // A v13 database gains the queue attachments column with an empty JSON
+    // default, without losing the existing run or queued row.
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("prospero.sqlite");
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(include_str!("../src/schema.sql"))
+            .unwrap();
+        connection
+            .execute_batch(include_str!("../src/orchestration/schema.sql"))
+            .unwrap();
+        connection
+            .execute_batch(include_str!("../src/orchestration/schema-v10.sql"))
+            .unwrap();
+        connection
+            .execute_batch(include_str!("../src/agent/schema-v11.sql"))
+            .unwrap();
+        connection
+            .execute_batch(include_str!("../src/agent/schema-v12.sql"))
+            .unwrap();
+        connection
+            .execute_batch(include_str!("../src/agent/schema-v13.sql"))
+            .unwrap();
+        connection
+            .pragma_update(None, "application_id", 0x50525253i64)
+            .unwrap();
+        connection.pragma_update(None, "user_version", 13).unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_heads \
+                 (id,created_at,lifecycle,revision,payload) \
+                 VALUES('sess-a',1,'active',1,json('{\"workspace\":\"/w\",\"agent\":\"claude\",\"kind\":\"structured\",\"title\":\"A\",\"status\":\"idle\"}'))",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO agent_runs(session_id,agent,active,approval_policy,permission_mode,turn,native_id) \
+                 VALUES('sess-a','claude',1,'manual','default',1,'native-a')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO agent_message_queue(session_id,queue_id,position,kind,text,created_at) \
+                 VALUES('sess-a','q1',0,'queue','legacy row',10)",
+                [],
+            )
+            .unwrap();
+    }
+    let store = Store::open(directory.path()).unwrap();
+    let connection = raw(&directory);
+    assert_eq!(
+        connection
+            .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap(),
+        14
+    );
+    // The pre-existing queued row decodes the column default as an empty list.
+    let (text, attachments): (String, String) = connection
+        .query_row(
+            "SELECT text,attachments FROM agent_message_queue WHERE queue_id='q1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(text, "legacy row");
+    assert_eq!(attachments, "[]");
+    // New-style rows with attachments are writable.
+    connection
+        .execute(
+            "INSERT INTO agent_message_queue(session_id,queue_id,position,kind,text,created_at,attachments) \
+             VALUES('sess-a','q2',1,'queue','with image',11,'[{\"mimeType\":\"image/png\",\"dataB64\":\"AAAA\"}]')",
+            [],
+        )
+        .unwrap();
+    let count: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM agent_message_queue WHERE json_array_length(attachments)>0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
     drop(connection);
     drop(store);
 }

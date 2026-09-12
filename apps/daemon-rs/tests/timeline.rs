@@ -24,6 +24,7 @@ fn write(id: &str, revision: i64, text: &str) -> TimelineWrite {
         body: TimelineBody::Message {
             role: MessageRole::Assistant,
             final_answer: true,
+            attachments: Vec::new(),
         },
         text: text.into(),
         replace: false,
@@ -295,6 +296,7 @@ fn lookups_and_writes_preserve_session_and_record_identity() {
     changed.body = TimelineBody::Message {
         role: MessageRole::User,
         final_answer: false,
+        attachments: Vec::new(),
     };
     assert!(store.write_timeline(&a, changed).is_err());
     let mut changed = write("message", 1, "Wrong turn");

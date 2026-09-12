@@ -126,6 +126,7 @@ fn kill_process_group(pid: u32) {
 pub(super) fn spawn_turn(
     workspace: &str,
     prompt: &str,
+    attachments: &[crate::agent::AttachmentInput],
     native_id: Option<&str>,
     policy: ApprovalPolicy,
     mode: PermissionMode,
@@ -190,9 +191,9 @@ pub(super) fn spawn_turn(
         }
     });
 
-    // Channel the opening prompt once both tasks are running.
-    let initial =
-        serde_json::json!({"type":"user","message":{"role":"user","content":prompt}}).to_string();
+    // Channel the opening prompt once both tasks are running. Images come
+    // first so the model sees them before the question (legacy order).
+    let initial = user_frame(prompt, attachments);
     let prompt_writer = frames_tx.clone();
     tokio::spawn(async move {
         let _ = prompt_writer.send((initial, None)).await;
@@ -264,9 +265,12 @@ impl ClaudeTurn {
     /// stream-json CLI keeps reading stdin frames after the opening prompt;
     /// a broken pipe (the result frame ended the turn) surfaces as an error
     /// and the caller falls back to the front of the queue.
-    pub(super) async fn steer(&self, text: &str) -> Result<()> {
-        let frame =
-            serde_json::json!({"type":"user","message":{"role":"user","content":text}}).to_string();
+    pub(super) async fn steer(
+        &self,
+        text: &str,
+        attachments: &[crate::agent::AttachmentInput],
+    ) -> Result<()> {
+        let frame = user_frame(text, attachments);
         let (ack, ack_rx) = oneshot::channel();
         self.stdin
             .send((frame, Some(ack)))
@@ -282,6 +286,33 @@ impl ClaudeTurn {
     #[allow(dead_code)]
     pub(super) fn pid(&self) -> u32 {
         self.child_pid
+    }
+}
+
+/// Build a headless stream-json user frame. With attachments the content is
+/// image-blocks-first array content; plain text stays a bare string so simple
+/// turns keep the exact frame shape the CLI has always received.
+fn user_frame(text: &str, attachments: &[crate::agent::AttachmentInput]) -> String {
+    if attachments.is_empty() {
+        serde_json::json!({"type":"user","message":{"role":"user","content":text}}).to_string()
+    } else {
+        let mut blocks: Vec<serde_json::Value> = attachments
+            .iter()
+            .map(|attachment| {
+                serde_json::json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": attachment.mime_type,
+                        "data": attachment.data_b64,
+                    }
+                })
+            })
+            .collect();
+        if !text.is_empty() {
+            blocks.push(serde_json::json!({"type": "text", "text": text}));
+        }
+        serde_json::json!({"type":"user","message":{"role":"user","content":blocks}}).to_string()
     }
 }
 

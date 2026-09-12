@@ -171,7 +171,8 @@ impl Api {
             .route("/v1/messages/read", post(mark_messages_read))
             .route("/v1/messages/{id}/answered", post(mark_message_answered))
             .fallback(|| async { ApiError(Error::NotFound) })
-            .layer(DefaultBodyLimit::max(96 * 1024))
+            // Image sends carry up to ~15 MiB of base64 payload (6 images).
+            .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
             .layer(middleware::from_fn_with_state(self.clone(), authorize))
             .with_state(self.clone())
     }
@@ -303,7 +304,9 @@ async fn agent_send(
     body: std::result::Result<Json<AgentSend>, axum::extract::rejection::JsonRejection>,
 ) -> std::result::Result<Json<serde_json::Value>, ApiError> {
     let Json(input) = body.map_err(|_| Error::Invalid("invalid agent message".into()))?;
-    api.agents.send(&id, input.text, input.delivery).await?;
+    api.agents
+        .send(&id, input.text, input.delivery, input.attachments)
+        .await?;
     api.publish();
     Ok(Json(serde_json::json!({"ok":true})))
 }
