@@ -386,11 +386,8 @@ impl Agents {
             mode: run.mode,
             model: run.model.clone(),
             effort: run.effort.clone(),
-            environment: Self::account_environment(
-                run.account_id.clone(),
-                self.0.database.directory(),
-            )
-            .await?,
+            environment: Self::account_environment(&self.0.database, run.account_id.clone())
+                .await?,
         };
         let driver = spawn_turn(
             &workspace,
@@ -1282,8 +1279,36 @@ impl Agents {
                 Some(id.to_owned())
             }
         };
-        let environment =
-            Self::account_environment(account_id, self.0.database.directory()).await?;
+        let environment = Self::account_environment(&self.0.database, account_id.clone()).await?;
+        // Profile accounts pin exactly one model through the profile itself;
+        // never spawn the headless CLI catalog probe against their gateway.
+        if let Some(id) = account_id.as_deref() {
+            let data = self.0.database.directory().to_owned();
+            let id = id.to_owned();
+            let profile = self
+                .0
+                .database
+                .call(move |store| Ok(store.managed_snapshot_row(&data, &id)?.api_profile))
+                .await?;
+            if let Some(profile) = profile {
+                let efforts = profile
+                    .model_capabilities
+                    .as_ref()
+                    .and_then(|caps| caps.supported_efforts.clone())
+                    .unwrap_or_default();
+                let model = profile.model.clone();
+                return Ok(LaunchModelCatalog {
+                    current_model: Some(model.clone()),
+                    models: vec![LaunchModelInfo {
+                        id: model,
+                        label: profile.model.clone(),
+                        description: None,
+                        supported_efforts: efforts,
+                        is_default: true,
+                    }],
+                });
+            }
+        }
         let models = super::claude::fetch_launch_catalog(&environment).await?;
         Ok(LaunchModelCatalog {
             current_model: models.first().map(|model| model.id.clone()),
@@ -1292,17 +1317,32 @@ impl Agents {
     }
 
     /// Private environment overrides for a session's bound account (empty for
-    /// the native environment). Credential files are read off the async pool.
+    /// the native environment). Profile accounts get the isolated API-key
+    /// profile environment; legacy managed accounts the OAuth/imported-key one.
+    /// Credential files are read off the async pool.
     async fn account_environment(
+        database: &crate::worker::Database,
         account_id: Option<String>,
-        data: &std::path::Path,
     ) -> Result<Vec<(String, String)>> {
         let Some(id) = account_id else {
             return Ok(Vec::new());
         };
-        let data = data.to_owned();
-        tokio::task::spawn_blocking(move || {
-            crate::accounts::managed::claude_environment(&data, &id, false)
+        let data = database.directory().to_owned();
+        let db = database.clone();
+        let profile_id = id.clone();
+        let profile_data = data.clone();
+        let profile = db
+            .call(move |store| {
+                Ok(store
+                    .managed_snapshot_row(&profile_data, &profile_id)?
+                    .api_profile)
+            })
+            .await?;
+        tokio::task::spawn_blocking(move || match profile {
+            Some(profile) => {
+                crate::accounts::managed::profile_account_environment(&data, &id, &profile)
+            }
+            None => crate::accounts::managed::claude_environment(&data, &id, false),
         })
         .await
         .map_err(|_| Error::Closed)?
@@ -1343,7 +1383,35 @@ impl Agents {
             return Err(Error::Conflict);
         }
         let environment =
-            Self::account_environment(run.account_id.clone(), self.0.database.directory()).await?;
+            Self::account_environment(&self.0.database, run.account_id.clone()).await?;
+        // Profile sessions expose the pinned model only.
+        if let Some(id) = run.account_id.as_deref() {
+            let data = self.0.database.directory().to_owned();
+            let id = id.to_owned();
+            let profile = self
+                .0
+                .database
+                .call(move |store| Ok(store.managed_snapshot_row(&data, &id)?.api_profile))
+                .await?;
+            if let Some(profile) = profile {
+                let current = profile.model.clone();
+                return Ok(AgentModelCatalog {
+                    models: vec![super::LaunchModelInfo {
+                        id: profile.model.clone(),
+                        label: profile.model.clone(),
+                        description: None,
+                        supported_efforts: profile
+                            .model_capabilities
+                            .as_ref()
+                            .and_then(|caps| caps.supported_efforts.clone())
+                            .unwrap_or_default(),
+                        is_default: true,
+                    }],
+                    current_model: Some(current),
+                    current_effort: run.effort,
+                });
+            }
+        }
         let models = super::claude::fetch_launch_catalog(&environment).await?;
         let current_model = run
             .model
@@ -1385,8 +1453,21 @@ impl Agents {
             .database
             .call(move |store| Ok(store.agent_run(&id_for_env)?.account_id))
             .await?;
-        let environment =
-            Self::account_environment(account_id, self.0.database.directory()).await?;
+        let environment = Self::account_environment(&self.0.database, account_id.clone()).await?;
+        // Profile sessions expose only the pinned model and never switch.
+        if let Some(id) = account_id {
+            let data = self.0.database.directory().to_owned();
+            let profile = self
+                .0
+                .database
+                .call(move |store| Ok(store.managed_snapshot_row(&data, &id)?.api_profile))
+                .await?;
+            if profile.is_some() {
+                return Err(Error::Invalid(
+                    "第三方 API Profile 的模型由 Profile 固定，无法在会话内切换".into(),
+                ));
+            }
+        }
         let catalog = super::claude::fetch_launch_catalog(&environment).await?;
         let selected = catalog
             .iter()
