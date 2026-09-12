@@ -551,6 +551,10 @@ pub fn typescript() -> String {
         crate::orchestration::CleanupWorktree::decl(&config),
         crate::skills::Skill::decl(&config),
         crate::skills::SkillSuggestion::decl(&config),
+        crate::accounts::AccountStatus::decl(&config),
+        crate::accounts::AccountCapabilities::decl(&config),
+        crate::accounts::NativeAccount::decl(&config),
+        crate::accounts::AccountListResult::decl(&config),
         crate::error::ErrorBody::decl(&config),
     ];
     let mut output: String = declarations
