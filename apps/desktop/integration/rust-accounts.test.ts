@@ -1,4 +1,5 @@
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -77,6 +78,111 @@ if body:
     sys.stdout.write(body)
 `;
 
+// Profile probes run `<claude> --version` with a scrubbed environment; the same
+// script also answers the catalog handshake used by session model discovery.
+const PROFILE_CLAUDE = `#!/usr/bin/env python3
+import json, sys
+argv = sys.argv[1:]
+if argv == ["--version"]:
+    sys.stdout.write("1.2.3-fake\\n")
+    sys.exit(0)
+if argv == ["auth", "status", "--json"]:
+    sys.exit(0)
+if argv == ["-p", "--output-format", "stream-json",
+            "--input-format", "stream-json", "--verbose"]:
+    frame = json.loads(sys.stdin.readline())
+    rid = frame["request_id"]
+    sys.stdout.write(json.dumps({"type": "control_response", "response": {
+        "subtype": "success", "request_id": rid,
+        "response": {"models": [
+            {"value": "fakemodel-1", "displayName": "Fake Model"}]}}}) + "\\n")
+    sys.stdout.flush()
+    sys.exit(0)
+sys.exit(0)
+`;
+
+interface FakeGateway {
+  url: string;
+  close: () => Promise<void>;
+  messagesHits: () => number;
+  modelsHits: () => number;
+}
+
+// Minimal Anthropic-compatible gateway: the two-turn forced-tool SSE handshake
+// for connectivity probes plus a paginated /v1/models catalog.
+function startGateway(options: { authFail?: boolean; pages?: unknown[] } = {}): FakeGateway {
+  let messagesHits = 0;
+  let modelsHits = 0;
+  const pages = options.pages ?? [{ data: [{ id: "fakemodel-1" }] }];
+  const server = createServer((req, res) => {
+    if (req.method === "POST" && req.url === "/v1/messages") {
+      messagesHits += 1;
+      if (options.authFail) {
+        res.writeHead(401, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { type: "authentication_error" } }));
+        return;
+      }
+      let raw = "";
+      req.on("data", (chunk) => { raw += chunk; });
+      req.on("end", () => {
+        const body = JSON.parse(raw || "{}") as Record<string, unknown>;
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        const send = (event: unknown) => res.write(`data: ${JSON.stringify(event)}\n\n`);
+        const messages = Array.isArray(body["messages"]) ? body["messages"] as unknown[] : [];
+        if (messages.length === 1) {
+          const schema = ((body["tools"] as Record<string, unknown>[])[0]!["input_schema"]) as { properties: { nonce: { enum: string[] } } };
+          const value = schema.properties.nonce.enum[0]!;
+          for (const event of [
+            { type: "message_start", message: { type: "message", role: "assistant", id: "msg-1" } },
+            { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "tool-1", name: "prospero_connection_probe", input: {} } },
+            { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: JSON.stringify({ nonce: value }) } },
+            { type: "content_block_stop", index: 0 },
+            { type: "message_delta", delta: { stop_reason: "tool_use" } },
+            { type: "message_stop" },
+          ]) send(event);
+        } else {
+          const toolResult = messages.flatMap((message) => {
+            const content = (message as Record<string, unknown>)["content"];
+            return Array.isArray(content) ? content : [];
+          }).find((block) => (block as Record<string, unknown>)["type"] === "tool_result") as Record<string, unknown> | undefined;
+          const receipt = typeof toolResult?.["content"] === "string" ? toolResult["content"] : "missing";
+          for (const event of [
+            { type: "message_start", message: { type: "message", role: "assistant", id: "msg-2" } },
+            { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+            { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: receipt } },
+            { type: "content_block_stop", index: 0 },
+            { type: "message_delta", delta: { stop_reason: "end_turn" } },
+            { type: "message_stop" },
+          ]) send(event);
+        }
+        res.end();
+      });
+      return;
+    }
+    if (req.method === "GET" && (req.url === "/v1/models" || req.url?.startsWith("/v1/models?"))) {
+      modelsHits += 1;
+      const afterId = new URL(req.url!, "http://gateway").searchParams.get("after_id");
+      const index = afterId ? Math.min(1, pages.length - 1) : 0;
+      const page = pages[index]!;
+      res.writeHead(options.authFail ? 401 : 200, { "content-type": "application/json" });
+      res.end(options.authFail ? JSON.stringify({ error: { type: "authentication_error" } }) : JSON.stringify(page));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  const port = (server.listen(0).address() as { port: number }).port;
+  return {
+    url: `http://127.0.0.1:${port}`,
+    close: () => new Promise((resolveClose) => server.close(() => resolveClose())),
+    messagesHits: () => messagesHits,
+    modelsHits: () => modelsHits,
+  };
+}
+
+const gateways: FakeGateway[] = [];
+
+
 function fixture() {
   const directory = mkdtempSync(resolve(tmpdir(), "rust-accounts-"));
   const dataDir = resolve(directory, "daemon");
@@ -103,6 +209,7 @@ describe.skipIf(process.platform === "win32")("Native account discovery through 
       expect((await runtime.stop()).ok).toBe(true);
       rmSync(directory, { recursive: true, force: true });
     }
+    await Promise.all(gateways.splice(0).map((gateway) => gateway.close()));
     if (previousBin === undefined) delete process.env["PROSPERO_CLAUDE_BIN"];
     else process.env["PROSPERO_CLAUDE_BIN"] = previousBin;
     if (previousStatus === undefined) delete process.env["PROSPERO_FAKE_STATUS"];
@@ -171,20 +278,149 @@ describe.skipIf(process.platform === "win32")("Native account discovery through 
     expect(accounts[0]!["authMethod"]).toBeUndefined();
   }, 30_000);
 
-  it("rejects unsupported API-profile and unknown actions", async () => {
+  it("rejects unknown account actions", async () => {
     const { directory, runtime } = fixture();
     await start(directory, runtime, '{"loggedIn":true}');
-    for (const type of [
-      "agent.account.api.create",
-      "agent.account.api.configure",
-      "agent.account.api.test",
-    ]) {
-      await expect(control(runtime, { type, requestId: "bridge-x", accountId: "native-claude" }))
-        .rejects.toThrow(/API Profile 尚未接入/);
-    }
     await expect(control(runtime, { type: "agent.account.something-else", requestId: "bridge-x" }))
       .rejects.toThrow(/不支持的账号操作/);
   }, 30_000);
+
+  it("validates API profile envelopes in the bridge before forwarding", async () => {
+    const { directory, runtime } = fixture();
+    await start(directory, runtime, '{"loggedIn":true}', PROFILE_CLAUDE);
+    const gateway = startGateway();
+    gateways.push(gateway);
+    const bad: Array<[Record<string, unknown>, RegExp]> = [
+      [{ type: "agent.account.api.create", requestId: "r", agent: "codex", name: "x", baseUrl: gateway.url, model: "m", apiKey: SECRET }, /仅支持 Claude/],
+      [{ type: "agent.account.api.create", requestId: "r", agent: "claude", name: "x", baseUrl: "https://x\n/path", model: "m", apiKey: SECRET }, /API 地址格式无效/],
+      [{ type: "agent.account.api.create", requestId: "r", agent: "claude", name: "x", baseUrl: `https://${"a".repeat(2001)}`, model: "m", apiKey: SECRET }, /API 地址格式无效/],
+      [{ type: "agent.account.api.create", requestId: "r", agent: "claude", name: "x", baseUrl: gateway.url, model: "m", apiKey: "  " }, /API Key 格式无效/],
+      [{ type: "agent.account.api.create", requestId: "r", agent: "claude", name: "x", baseUrl: gateway.url, model: "m", apiKey: SECRET, protocol: "openai_responses" }, /Agent、Provider 与 API 协议/],
+      [{ type: "agent.account.api.create", requestId: "r", agent: "claude", name: "x", baseUrl: gateway.url, model: "m", apiKey: SECRET, modelCapabilities: { maxOutputTokens: 0 } }, /模型能力配置无效/],
+      [{ type: "agent.account.api.create", requestId: "r", agent: "claude", name: "x", baseUrl: gateway.url, model: "m", apiKey: SECRET, modelCapabilities: { tools: "yes" } }, /模型能力配置无效/],
+      [{ type: "agent.account.api.configure", requestId: "r", accountId: "native-claude", name: "x" }, /账号 ID 无效/],
+      [{ type: "agent.account.api.configure", requestId: "r", accountId: "../escape", name: "x" }, /账号 ID 无效/],
+      [{ type: "agent.account.api.test", requestId: "r", accountId: "native-claude" }, /账号 ID 无效/],
+      [{ type: "agent.account.api.test", requestId: "r", accountId: "abc", scope: "engine" }, /引擎验证尚未接入/],
+      [{ type: "agent.account.api.test", requestId: "r", accountId: "abc", scope: "bogus" }, /连接测试范围无效/],
+    ];
+    for (const [body, matcher] of bad) {
+      await expect(control(runtime, body)).rejects.toThrow(matcher);
+    }
+    // Model-catalog draft validation, including the account/draft XOR and the
+    // anthropic-only protocol gate.
+    await expect(control(runtime, {
+      type: "agent.account.api.models.get", requestId: "r",
+      accountId: "abc", baseUrl: gateway.url, apiKey: SECRET,
+    })).rejects.toThrow(/不能同时指定账号与草稿配置/);
+    await expect(control(runtime, {
+      type: "agent.account.api.models.get", requestId: "r",
+      protocol: "openai_responses", baseUrl: gateway.url, apiKey: SECRET,
+    })).rejects.toThrow(/仅支持 Anthropic 协议/);
+  }, 30_000);
+
+  it("runs the API profile create/test/models/configure lifecycle against a fake gateway", async () => {
+    const { directory, runtime, dataDir } = fixture();
+    const gateway = startGateway({
+      pages: [
+        { data: [{ id: "m-002", display_name: "Model Two", max_tokens: 8192 }], has_more: true, last_id: "m-002" },
+        { data: [{ id: "m-001", name: "Model One" }, { id: "m-003" }] },
+      ],
+    });
+    gateways.push(gateway);
+    await start(directory, runtime, '{"loggedIn":true}', PROFILE_CLAUDE);
+
+    // Create: key lands in a 0600 credential file inside the isolated 0700
+    // root, and the snapshot carries profile metadata but never the secret.
+    const created = await control(runtime, {
+      type: "agent.account.api.create", requestId: "p1",
+      agent: "claude", name: "  第三方 Profile  ",
+      baseUrl: gateway.url, model: "fakemodel-1", apiKey: SECRET,
+      modelCapabilities: { contextWindow: 128_000, tools: true, vision: false },
+    });
+    const id = created!["accountId"] as string;
+    expect(id).toMatch(/^[0-9a-f-]{36}$/);
+    const createdRow = (created!["accounts"] as Record<string, unknown>[]).find((row) => row["id"] === id);
+    expect(createdRow).toMatchObject({
+      name: "第三方 Profile", status: "signed_in", authMethod: "API Key", managed: true,
+      apiProfile: { baseUrl: gateway.url, model: "fakemodel-1" },
+      capabilities: { sessionKinds: ["pty", "structured"], plan: true, resume: true, modelSelection: false, reasoningEffort: false },
+    });
+    expect(createdRow!["apiValidation"] ?? null).toBeNull();
+    const root = resolve(dataDir, "agent-accounts", "claude", id);
+    const credentialPath = resolve(root, ".prospero-credential.json");
+    expect(statSync(credentialPath).mode & 0o777).toBe(0o600);
+    expect(statSync(root).mode & 0o777).toBe(0o700);
+    expect(JSON.parse(readFileSync(credentialPath, "utf8"))["kind"]).toBe("api_key");
+    expect(JSON.stringify(created)).not.toContain(SECRET);
+
+    // Connectivity probe: real two-turn SSE handshake through the fake gateway.
+    const tested = await control(runtime, {
+      type: "agent.account.api.test", requestId: "p2", accountId: id,
+    }, 45_000);
+    expect(tested).toMatchObject({
+      accountId: id,
+      validation: { status: "passed", engine: "claude", checks: { runtime: "passed", streaming: "passed", tools: "passed" } },
+    });
+    expect(gateway.messagesHits()).toBe(2);
+    const listed = await list(runtime);
+    const listedRow = (listed!["accounts"] as Record<string, unknown>[]).find((row) => row["id"] === id)!;
+    expect((listedRow!["apiValidation"] as Record<string, unknown>)["status"]).toBe("passed");
+    expect(String(listedRow!["detail"])).toContain("协议测试通过");
+    expect(JSON.stringify(listed)).not.toContain(SECRET);
+
+    // Model catalog for the stored account follows pagination and sorts.
+    const models = await control(runtime, {
+      type: "agent.account.api.models.get", requestId: "p3", accountId: id,
+    }, 35_000);
+    expect(models!["ok"]).toBe(true);
+    expect((models!["models"] as Record<string, unknown>[]).map((row) => row["id"])).toEqual(["m-001", "m-002", "m-003"]);
+    expect(gateway.modelsHits()).toBe(2);
+
+    // Draft catalog uses a pasted endpoint and never touches stored rows.
+    const draft = await control(runtime, {
+      type: "agent.account.api.models.get", requestId: "p4",
+      baseUrl: `${gateway.url}/v1/models`, apiKey: SECRET,
+    }, 35_000);
+    expect(draft!["ok"]).toBe(true);
+    expect((draft!["models"] as Record<string, unknown>[]).length).toBeGreaterThan(0);
+
+    // Rename keeps the recorded validation; a model change clears it.
+    const renamed = await control(runtime, {
+      type: "agent.account.api.configure", requestId: "p5", accountId: id, name: "renamed",
+    });
+    expect(((renamed!["accounts"] as Record<string, unknown>[]).find((row) => row["id"] === id)!)["apiValidation"]).toBeTruthy();
+    const reconfigured = await control(runtime, {
+      type: "agent.account.api.configure", requestId: "p6", accountId: id, model: "fakemodel-2",
+    });
+    const changedRow = (reconfigured!["accounts"] as Record<string, unknown>[]).find((row) => row["id"] === id)!;
+    expect((changedRow!["apiProfile"] as Record<string, unknown>)["model"]).toBe("fakemodel-2");
+    expect(changedRow!["apiValidation"] ?? null).toBeNull();
+
+    // A failing probe keeps a stable in-envelope code and never throws.
+    const authGateway = startGateway({ authFail: true });
+    gateways.push(authGateway);
+    const failed = await control(runtime, {
+      type: "agent.account.api.create", requestId: "p7",
+      agent: "claude", name: "failing",
+      baseUrl: authGateway.url, model: "fakemodel-1", apiKey: SECRET,
+    });
+    const failingId = failed!["accountId"] as string;
+    const failedTest = await control(runtime, {
+      type: "agent.account.api.test", requestId: "p8", accountId: failingId,
+    }, 45_000);
+    expect((failedTest!["validation"] as Record<string, unknown>)["status"]).toBe("failed");
+    expect((failedTest!["validation"] as Record<string, unknown>)["code"]).toBe("authentication_failed");
+
+    // The native row is not a profile: test is a bridge-side id rejection and
+    // its catalog returns an in-body feature error rather than throwing.
+    await expect(control(runtime, { type: "agent.account.api.configure", requestId: "p9", accountId: id, apiKey: "" })).resolves.toBeTruthy();
+    const nativeModels = await control(runtime, {
+      type: "agent.account.api.models.get", requestId: "p10", accountId: "native-claude",
+    });
+    expect(nativeModels!["ok"]).toBe(false);
+    expect((nativeModels!["error"] as Record<string, unknown>)["code"]).toBe("unsupported");
+  }, 90_000);
 
   it("validates managed-action envelopes before forwarding them", async () => {
     const { directory, runtime } = fixture();

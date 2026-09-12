@@ -6,6 +6,12 @@
 //! logout deletes only the private credential file.
 
 pub(crate) mod managed;
+pub(crate) mod models;
+pub(crate) mod probe;
+pub(crate) mod profile;
+
+pub(crate) use probe::ApiValidation;
+pub(crate) use profile::{ApiProfile, ModelCapabilities};
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -58,6 +64,12 @@ pub struct NativeAccount {
     pub status: AccountStatus,
     pub capabilities: AccountCapabilities,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_profile: Option<ApiProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_validation: Option<ApiValidation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_method: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -91,6 +103,8 @@ pub struct AccountListResult {
     pub account_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation: Option<ApiValidation>,
 }
 
 /// Tag dispatch for `/v1/accounts`. API/profile actions remain a later slice.
@@ -111,6 +125,62 @@ pub(crate) enum AccountControl {
         request_id: String,
         agent: String,
         name: String,
+    },
+    #[serde(rename = "agent.account.api.create")]
+    ApiCreate {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        agent: String,
+        name: String,
+        provider: Option<String>,
+        protocol: Option<String>,
+        #[serde(rename = "baseUrl")]
+        base_url: String,
+        model: String,
+        #[serde(rename = "apiKey")]
+        api_key: String,
+        #[serde(rename = "modelCapabilities")]
+        model_capabilities: Option<serde_json::Value>,
+    },
+    #[serde(rename = "agent.account.api.configure")]
+    ApiConfigure {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "accountId")]
+        account_id: String,
+        name: Option<String>,
+        provider: Option<String>,
+        protocol: Option<String>,
+        #[serde(rename = "baseUrl")]
+        base_url: Option<String>,
+        model: Option<String>,
+        #[serde(rename = "apiKey")]
+        api_key: Option<String>,
+        /// Nullable: `null` clears capabilities, omission keeps them. The
+        /// double option encodes missing=None vs explicit-null=Some(None).
+        #[serde(rename = "modelCapabilities", default)]
+        model_capabilities: Option<Option<serde_json::Value>>,
+    },
+    #[serde(rename = "agent.account.api.test")]
+    ApiTest {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "accountId")]
+        account_id: String,
+        scope: Option<String>,
+    },
+    #[serde(rename = "agent.account.api.models.get")]
+    ApiModelsGet {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "accountId")]
+        account_id: Option<String>,
+        protocol: Option<String>,
+        #[serde(rename = "baseUrl")]
+        base_url: Option<String>,
+        #[serde(rename = "apiKey")]
+        api_key: Option<String>,
+        headers: Option<serde_json::Value>,
     },
     #[serde(rename = "agent.account.rename")]
     Rename {
@@ -163,10 +233,14 @@ pub(crate) enum AccountControl {
 }
 
 impl AccountControl {
-    fn request_id(&self) -> &str {
+    pub(crate) fn request_id(&self) -> &str {
         match self {
             AccountControl::List { request_id }
             | AccountControl::Create { request_id, .. }
+            | AccountControl::ApiCreate { request_id, .. }
+            | AccountControl::ApiConfigure { request_id, .. }
+            | AccountControl::ApiTest { request_id, .. }
+            | AccountControl::ApiModelsGet { request_id, .. }
             | AccountControl::Rename { request_id, .. }
             | AccountControl::SetDefault { request_id, .. }
             | AccountControl::Login { request_id, .. }
@@ -180,12 +254,39 @@ impl AccountControl {
         match self {
             AccountControl::List { .. } => "list",
             AccountControl::Create { .. } => "create",
+            AccountControl::ApiCreate { .. } => "api_create",
+            AccountControl::ApiConfigure { .. } => "api_configure",
+            AccountControl::ApiTest { .. } => "api_test",
+            // The models feature returns a dedicated result envelope, not an
+            // account snapshot; the action label is never read for it.
+            AccountControl::ApiModelsGet { .. } => "api_models",
             AccountControl::Rename { .. } => "rename",
             AccountControl::SetDefault { .. } => "default",
             AccountControl::Login { .. } => "login",
             AccountControl::SetCredential { .. } => "credential",
             AccountControl::Logout { .. } => "logout",
             AccountControl::Delete { .. } => "delete",
+        }
+    }
+
+    pub(crate) fn account_id(&self) -> Option<&str> {
+        match self {
+            AccountControl::ApiConfigure { account_id, .. }
+            | AccountControl::ApiTest { account_id, .. }
+            | AccountControl::ApiModelsGet {
+                account_id: Some(account_id),
+                ..
+            }
+            | AccountControl::Rename { account_id, .. }
+            | AccountControl::SetDefault { account_id, .. }
+            | AccountControl::Login { account_id, .. }
+            | AccountControl::SetCredential { account_id, .. }
+            | AccountControl::Logout { account_id, .. }
+            | AccountControl::Delete { account_id, .. } => Some(account_id),
+            AccountControl::List { .. }
+            | AccountControl::Create { .. }
+            | AccountControl::ApiCreate { .. }
+            | AccountControl::ApiModelsGet { .. } => None,
         }
     }
 }
@@ -291,7 +392,21 @@ async fn probe_auth_status(environment: &[(String, String)]) -> AuthProbe {
     }
 }
 
-/// Builds one account row for a managed record.
+fn profile_capabilities() -> AccountCapabilities {
+    AccountCapabilities {
+        session_kinds: vec![
+            crate::protocol::SessionKind::Pty,
+            crate::protocol::SessionKind::Structured,
+        ],
+        plan: true,
+        resume: true,
+        // Profile sessions pin model/reasoning through the profile itself.
+        model_selection: false,
+        reasoning_effort: false,
+    }
+}
+
+/// Builds one account row for a legacy managed (OAuth/imported-key) account.
 async fn managed_row(
     database: &Database,
     record: managed::ManagedRecord,
@@ -312,8 +427,77 @@ async fn managed_row(
         is_default: record.is_default,
         status: probe.status,
         capabilities: claude_capabilities(),
+        api_profile: None,
+        engine: None,
+        api_validation: None,
         auth_method: probe.auth_method,
         detail: probe.detail,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+        active_sessions,
+    })
+}
+
+/// Builds one account row for a third-party API profile account. Profile rows
+/// never run `claude auth status` (the isolated key is not a CLI login);
+/// status derives from runtime availability, key presence and the recorded
+/// revision-checked validation.
+async fn profile_row(
+    database: &Database,
+    record: managed::ManagedRecord,
+    active_sessions: i64,
+    runtime_ok: bool,
+) -> Result<NativeAccount> {
+    let data = database.directory().to_owned();
+    let id = record.id.clone();
+    let secret = tokio::task::spawn_blocking(move || managed::profile_secret(&data, &id))
+        .await
+        .map_err(|_| crate::error::Error::Closed)??;
+    let profile = record
+        .api_profile
+        .as_ref()
+        .expect("profile rows carry a parsed profile");
+    let (status, auth_method, detail) = if !runtime_ok {
+        (
+            AccountStatus::Unavailable,
+            None,
+            Some("claude CLI 不可用".into()),
+        )
+    } else if secret.is_none() {
+        (
+            AccountStatus::SignedOut,
+            None,
+            Some("需要配置该 Profile 的 API Key".into()),
+        )
+    } else {
+        let host = url::Url::parse(&profile.base_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .unwrap_or_else(|| profile.base_url.clone());
+        let state = match record.api_validation.as_ref() {
+            Some(validation) if validation.status == "passed" => "协议测试通过",
+            Some(_) => "连接测试失败",
+            None => "已配置，尚未测试连接",
+        };
+        (
+            AccountStatus::SignedIn,
+            Some("API Key".into()),
+            Some(format!("{state} · {} · {host}", profile.protocol())),
+        )
+    };
+    Ok(NativeAccount {
+        id: record.id,
+        agent: crate::protocol::AgentKind::Claude,
+        name: record.name,
+        managed: true,
+        is_default: record.is_default,
+        status,
+        capabilities: profile_capabilities(),
+        api_profile: record.api_profile,
+        engine: Some("claude".into()),
+        api_validation: record.api_validation,
+        auth_method,
+        detail,
         created_at: record.created_at,
         updated_at: record.updated_at,
         active_sessions,
@@ -326,27 +510,36 @@ pub(crate) async fn snapshot(
     request_id: &str,
     action: &str,
 ) -> Result<AccountListResult> {
-    snapshot_with(database, request_id, action, None, None).await
+    snapshot_with(database, request_id, action, None, None, None).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn snapshot_with(
     database: &Database,
     request_id: &str,
     action: &str,
     account_id: Option<String>,
     session_id: Option<String>,
+    validation: Option<ApiValidation>,
 ) -> Result<AccountListResult> {
     let db = database.clone();
+    let data = database.directory().to_owned();
     let (managed, native_active, mut managed_active) = db
-        .call(|store| {
-            let managed = store.list_managed_accounts()?;
-            let ids: Vec<String> = managed.iter().map(|record| record.id.clone()).collect();
-            let (native_active, managed_active) = store.account_active_counts(&ids)?;
-            Ok((managed, native_active, managed_active))
+        .call({
+            let data = data.clone();
+            move |store| {
+                let managed = store.list_managed_accounts(&data)?;
+                let ids: Vec<String> = managed.iter().map(|record| record.id.clone()).collect();
+                let (native_active, managed_active) = store.account_active_counts(&ids)?;
+                Ok((managed, native_active, managed_active))
+            }
         })
         .await?;
     let any_default = managed.iter().any(|record| record.is_default);
     let probe = probe_auth_status(&[]).await;
+    // The isolated runtime probe feeds both the native row and profile rows;
+    // run it once per snapshot.
+    let runtime_ok = probe::runtime_available().await;
     let now = crate::database::now();
     let mut accounts = vec![NativeAccount {
         id: NATIVE_CLAUDE_ID.into(),
@@ -356,6 +549,9 @@ async fn snapshot_with(
         is_default: !any_default,
         status: probe.status,
         capabilities: claude_capabilities(),
+        api_profile: None,
+        engine: None,
+        api_validation: None,
         auth_method: probe.auth_method,
         detail: probe.detail,
         created_at: 0,
@@ -364,7 +560,11 @@ async fn snapshot_with(
     }];
     for record in managed {
         let active = managed_active.remove(&record.id).unwrap_or(0);
-        accounts.push(managed_row(database, record, active).await?);
+        if record.api_profile.is_some() {
+            accounts.push(profile_row(database, record, active, runtime_ok).await?);
+        } else {
+            accounts.push(managed_row(database, record, active).await?);
+        }
     }
     Ok(AccountListResult {
         kind: "agent.accounts.result".into(),
@@ -374,6 +574,7 @@ async fn snapshot_with(
         accounts,
         account_id,
         session_id,
+        validation,
     })
 }
 
@@ -414,6 +615,80 @@ pub(crate) async fn execute_control(
                 .await?;
             Ok(Some(record))
         }
+        AccountControl::ApiCreate {
+            name,
+            agent,
+            provider,
+            protocol,
+            base_url,
+            model,
+            api_key,
+            model_capabilities,
+            ..
+        } => {
+            let profile = profile::clean_profile_inputs(
+                agent,
+                base_url,
+                model,
+                provider.as_deref(),
+                protocol.as_deref(),
+                model_capabilities.clone(),
+            )?;
+            let data = database.directory().to_owned();
+            let name = name.clone();
+            let secret = api_key.clone();
+            let id = db
+                .call(move |store| {
+                    let record =
+                        store.create_api_profile_account(&data, &name, &profile, &secret)?;
+                    Ok(record.id)
+                })
+                .await?;
+            Ok(Some(id))
+        }
+        AccountControl::ApiConfigure {
+            account_id,
+            name,
+            provider,
+            protocol,
+            base_url,
+            model,
+            api_key,
+            model_capabilities,
+            ..
+        } => {
+            let data = database.directory().to_owned();
+            let id = account_id.clone();
+            let caps = model_capabilities
+                .clone()
+                .map(|inner| inner.unwrap_or(serde_json::Value::Null));
+            let name = name.clone();
+            let base_url = base_url.clone();
+            let model = model.clone();
+            let provider = provider.clone();
+            let protocol = protocol.clone();
+            let api_key = api_key.clone();
+            let record = db
+                .call(move |store| {
+                    let record = store.configure_api_profile_account(
+                        &data,
+                        &id,
+                        name.as_deref(),
+                        base_url.as_deref(),
+                        model.as_deref(),
+                        provider.as_deref(),
+                        protocol.as_deref(),
+                        caps,
+                        api_key.as_deref(),
+                    )?;
+                    Ok(record.id)
+                })
+                .await?;
+            Ok(Some(record))
+        }
+        AccountControl::ApiTest { .. } | AccountControl::ApiModelsGet { .. } => Err(
+            crate::error::Error::Invalid("api test/models require the HTTP runtime".into()),
+        ),
         AccountControl::Rename {
             account_id, name, ..
         } => {
@@ -469,12 +744,14 @@ pub(crate) async fn execute_control(
     }
 }
 
-/// Completes a control request by re-snapshotting accounts.
+/// Completes a control request by re-snapshotting accounts. `validation` is
+/// only populated for an `api.test` result.
 pub(crate) async fn respond(
     database: &Database,
     control: &AccountControl,
     account_id: Option<String>,
     session_id: Option<String>,
+    validation: Option<ApiValidation>,
 ) -> Result<AccountListResult> {
     snapshot_with(
         database,
@@ -482,6 +759,7 @@ pub(crate) async fn respond(
         control.action(),
         account_id,
         session_id,
+        validation,
     )
     .await
 }

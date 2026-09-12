@@ -15,6 +15,9 @@ use uuid::Uuid;
 use crate::database::{now, validate_id};
 use crate::error::{Error, Result};
 
+use super::probe::{ApiValidation, revision};
+use super::profile::{ApiProfile, clean_profile, session_environment};
+
 /// Managed account metadata row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ManagedRecord {
@@ -23,6 +26,8 @@ pub(crate) struct ManagedRecord {
     pub is_default: bool,
     pub created_at: i64,
     pub updated_at: i64,
+    pub api_profile: Option<ApiProfile>,
+    pub api_validation: Option<ApiValidation>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -129,7 +134,7 @@ pub(crate) fn read_credential(root: &Path) -> Result<Option<Credential>> {
 
 fn clean_credential(kind: CredentialKind, raw: &str) -> Result<Credential> {
     let secret = raw.trim();
-    if secret.len() < 20 || secret.len() > 8192 || secret.contains(['\r', '\n', '\0']) {
+    if secret.is_empty() || secret.len() > 8192 || secret.contains(['\r', '\n', '\0']) {
         return Err(Error::Invalid("凭据格式无效".into()));
     }
     Ok(Credential {
@@ -181,38 +186,152 @@ pub(crate) fn claude_environment(
     ])
 }
 
+fn clean_api_key(raw: &str) -> Result<String> {
+    let secret = raw.trim();
+    if secret.is_empty() || secret.len() > 8192 || secret.contains(['\r', '\n', '\0']) {
+        return Err(Error::Invalid("API Key 格式无效".into()));
+    }
+    Ok(secret.to_owned())
+}
+
+/// Reads a profile account's API key; missing or non-key credentials are
+/// reported as `None` so snapshots can show `signed_out`.
+pub(crate) fn profile_secret(data: &Path, id: &str) -> Result<Option<String>> {
+    let root = account_root(data, id)?;
+    match read_credential(&root)? {
+        Some(Credential {
+            kind: CredentialKind::ApiKey,
+            secret,
+        }) => Ok(Some(secret)),
+        _ => Ok(None),
+    }
+}
+
+/// Environment overrides for a session bound to an API profile account.
+pub(crate) fn profile_account_environment(
+    data: &Path,
+    id: &str,
+    profile: &ApiProfile,
+) -> Result<Vec<(String, String)>> {
+    let root = account_root(data, id)?;
+    let secret = profile_secret(data, id)?.unwrap_or_default();
+    Ok(session_environment(&root, profile, &secret))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_record(
+    id: String,
+    name: String,
+    is_default: i64,
+    created_at: i64,
+    updated_at: i64,
+    profile_raw: Option<String>,
+    validation_raw: Option<String>,
+    validation_revision: Option<String>,
+    current_revision: Option<&str>,
+) -> ManagedRecord {
+    let api_profile = profile_raw.and_then(|raw| super::profile::parse_profile_json(&raw));
+    let api_validation = match (api_profile.as_ref(), validation_raw, validation_revision) {
+        (Some(_), Some(raw), Some(stored)) if Some(stored.as_str()) == current_revision => {
+            serde_json::from_str::<ApiValidation>(&raw).ok()
+        }
+        _ => None,
+    };
+    ManagedRecord {
+        id,
+        name,
+        is_default: is_default != 0,
+        created_at,
+        updated_at,
+        api_profile,
+        api_validation,
+    }
+}
+
+/// Revision-sha input for a row: the stored key when it is an API key,
+/// otherwise null (legacy canonicalization includes `credential ?? null`).
+fn row_revision(data: &Path, id: &str, profile: Option<&ApiProfile>) -> Option<String> {
+    let profile = profile?;
+    let root = account_root(data, id).ok()?;
+    let secret = match read_credential(&root) {
+        Ok(Some(Credential {
+            kind: CredentialKind::ApiKey,
+            secret,
+        })) => Some(secret),
+        _ => None,
+    };
+    Some(revision(profile, secret.as_deref()))
+}
+
+const RECORD_COLUMNS: &str =
+    "id,name,is_default,created_at,updated_at,api_profile,api_validation,api_validation_revision";
+
 impl crate::database::Store {
-    pub(crate) fn list_managed_accounts(&self) -> Result<Vec<ManagedRecord>> {
-        let mut statement = self.connection.prepare(
-            "SELECT id,name,is_default,created_at,updated_at FROM managed_accounts \
-             ORDER BY created_at,id",
-        )?;
+    pub(crate) fn list_managed_accounts(&self, data: &Path) -> Result<Vec<ManagedRecord>> {
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT {RECORD_COLUMNS} FROM managed_accounts ORDER BY created_at,id"
+        ))?;
         let rows = statement.query_map([], |row| {
-            Ok(ManagedRecord {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                is_default: row.get::<_, i64>(2)? != 0,
-                created_at: row.get(3)?,
-                updated_at: row.get(4)?,
-            })
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+            ))
         })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let mut records = Vec::new();
+        for row in rows {
+            let (
+                id,
+                name,
+                is_default,
+                created_at,
+                updated_at,
+                profile_raw,
+                validation_raw,
+                validation_revision,
+            ) = row?;
+            let profile = profile_raw
+                .as_deref()
+                .and_then(super::profile::parse_profile_json);
+            let current = row_revision(data, &id, profile.as_ref());
+            records.push(decode_record(
+                id,
+                name,
+                is_default,
+                created_at,
+                updated_at,
+                profile_raw,
+                validation_raw,
+                validation_revision,
+                current.as_deref(),
+            ));
+        }
+        Ok(records)
     }
 
     pub(crate) fn managed_account(&self, id: &str) -> Result<ManagedRecord> {
         validate_account_id(id)?;
         self.connection
             .query_row(
-                "SELECT id,name,is_default,created_at,updated_at FROM managed_accounts WHERE id=?",
+                &format!("SELECT {RECORD_COLUMNS} FROM managed_accounts WHERE id=?"),
                 [id],
                 |row| {
-                    Ok(ManagedRecord {
-                        id: row.get(0)?,
-                        name: row.get(1)?,
-                        is_default: row.get::<_, i64>(2)? != 0,
-                        created_at: row.get(3)?,
-                        updated_at: row.get(4)?,
-                    })
+                    Ok(decode_record(
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        None,
+                        None,
+                        None,
+                    ))
                 },
             )
             .optional()?
@@ -225,7 +344,7 @@ impl crate::database::Store {
         raw_name: &str,
     ) -> Result<ManagedRecord> {
         let name = clean_name(raw_name)?;
-        let existing = self.list_managed_accounts()?;
+        let existing = self.list_managed_accounts(data)?;
         let becomes_default = !existing.iter().any(|account| account.is_default);
         let id = Uuid::new_v4().to_string();
         let timestamp = now();
@@ -240,6 +359,184 @@ impl crate::database::Store {
         // resolve; doing it at create time keeps later turns off the fs path).
         ensure_private_dir(&account_root(data, &id)?)?;
         self.managed_account(&id)
+    }
+
+    /// Row with validation decoded against the current profile+key revision.
+    pub(crate) fn managed_snapshot_row(&self, data: &Path, id: &str) -> Result<ManagedRecord> {
+        validate_account_id(id)?;
+        let (profile_raw, validation_raw, validation_revision): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = self.connection.query_row(
+            "SELECT api_profile,api_validation,api_validation_revision FROM managed_accounts WHERE id=?",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional()?
+        .ok_or(Error::NotFound)?;
+        let profile = profile_raw
+            .as_deref()
+            .and_then(super::profile::parse_profile_json);
+        let current = row_revision(data, id, profile.as_ref());
+        let mut record = self.managed_account(id)?;
+        record.api_profile = profile;
+        record.api_validation = match (validation_raw, validation_revision) {
+            (Some(raw), Some(stored)) if current.as_deref() == Some(stored.as_str()) => {
+                serde_json::from_str::<ApiValidation>(&raw).ok()
+            }
+            _ => None,
+        };
+        Ok(record)
+    }
+
+    /// Creates a managed account holding an Anthropic-compatible API profile
+    /// and writes its API Key into the private credential file.
+    pub(crate) fn create_api_profile_account(
+        &mut self,
+        data: &Path,
+        raw_name: &str,
+        profile: &ApiProfile,
+        secret: &str,
+    ) -> Result<ManagedRecord> {
+        let name = clean_name(raw_name)?;
+        let secret = clean_api_key(secret)?;
+        let existing = self.list_managed_accounts(data)?;
+        let becomes_default = !existing.iter().any(|account| account.is_default);
+        let id = Uuid::new_v4().to_string();
+        let timestamp = now();
+        let profile_json = serde_json::to_string(profile)?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO managed_accounts(id,name,is_default,created_at,updated_at,api_profile) \
+             VALUES(?1,?2,?3,?4,?4,?5)",
+            params![id, name, becomes_default as i64, timestamp, profile_json],
+        )?;
+        transaction.commit()?;
+        let root = account_root(data, &id)?;
+        write_credential(
+            &root,
+            &Credential {
+                kind: CredentialKind::ApiKey,
+                secret,
+            },
+        )?;
+        self.managed_snapshot_row(data, &id)
+    }
+
+    /// Updates a profile account's name/connection/key. Any connection or key
+    /// change invalidates the recorded validation and is blocked while a
+    /// session is active; a name-only rename is always allowed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn configure_api_profile_account(
+        &mut self,
+        data: &Path,
+        id: &str,
+        raw_name: Option<&str>,
+        base_url: Option<&str>,
+        model: Option<&str>,
+        provider: Option<&str>,
+        protocol: Option<&str>,
+        capabilities: Option<serde_json::Value>,
+        new_secret: Option<&str>,
+    ) -> Result<ManagedRecord> {
+        let record = self.managed_snapshot_row(data, id)?;
+        let Some(existing) = record.api_profile else {
+            return Err(Error::Invalid("这个账号不是第三方 API Profile".into()));
+        };
+        let name = match raw_name {
+            Some(raw) => clean_name(raw)?,
+            None => record.name.clone(),
+        };
+        let existing_caps = existing
+            .model_capabilities
+            .as_ref()
+            .map(|caps| serde_json::to_value(caps).unwrap_or(serde_json::Value::Null))
+            .unwrap_or(serde_json::Value::Null);
+        let updates_capabilities = capabilities.is_some();
+        let preserved_headers = existing
+            .headers
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?;
+        let profile = clean_profile(
+            "claude",
+            base_url.unwrap_or(&existing.base_url),
+            model.unwrap_or(&existing.model),
+            provider.or(Some(existing.provider.as_str())),
+            protocol.or(existing.protocol.as_deref()),
+            Some(capabilities.unwrap_or(existing_caps)),
+            preserved_headers,
+        )?;
+        let connection_changed = profile != existing;
+        let trimmed_secret = new_secret.map(str::trim);
+        let updates_credential = trimmed_secret.is_some_and(|secret| !secret.is_empty());
+        if (updates_credential || connection_changed || updates_capabilities)
+            && self.active_session_count(id)? > 0
+        {
+            return Err(Error::InUse);
+        }
+        if let Some(secret) = trimmed_secret.filter(|secret| !secret.is_empty()) {
+            let secret = clean_api_key(secret)?;
+            write_credential(
+                &account_root(data, id)?,
+                &Credential {
+                    kind: CredentialKind::ApiKey,
+                    secret,
+                },
+            )?;
+        }
+        let profile_json = serde_json::to_string(&profile)?;
+        let transaction = self.connection.transaction()?;
+        let validation_invalidated = connection_changed || updates_credential;
+        if validation_invalidated {
+            transaction.execute(
+                "UPDATE managed_accounts SET name=?1,updated_at=?2,api_profile=?3, \
+                 api_validation=NULL,api_validation_revision=NULL WHERE id=?4",
+                params![name, now(), profile_json, id],
+            )?;
+        } else {
+            // A name-only rename preserves the recorded probe validation.
+            transaction.execute(
+                "UPDATE managed_accounts SET name=?1,updated_at=?2,api_profile=?3 WHERE id=?4",
+                params![name, now(), profile_json, id],
+            )?;
+        }
+        transaction.commit()?;
+        self.managed_snapshot_row(data, id)
+    }
+
+    /// Records a probe result only when the profile+key revision still
+    /// matches the revision captured before the probe started.
+    pub(crate) fn record_api_validation(
+        &mut self,
+        data: &Path,
+        id: &str,
+        expected_revision: &str,
+        validation: &ApiValidation,
+    ) -> Result<bool> {
+        let record = self.managed_account(id)?;
+        let Some(profile) = record.api_profile else {
+            return Err(Error::Invalid("此账号没有有效的 API Profile".into()));
+        };
+        let current = revision(&profile, profile_secret(data, id)?.as_deref());
+        if current != expected_revision {
+            return Ok(false);
+        }
+        let json = serde_json::to_string(validation)?;
+        self.connection.execute(
+            "UPDATE managed_accounts SET api_validation=?1,api_validation_revision=?2,updated_at=?3 WHERE id=?4",
+            params![json, expected_revision, now(), id],
+        )?;
+        Ok(true)
+    }
+
+    /// Current validation revision for a profile account (re-reads key).
+    pub(crate) fn api_validation_revision(&self, data: &Path, id: &str) -> Result<String> {
+        let record = self.managed_account(id)?;
+        let Some(profile) = record.api_profile else {
+            return Err(Error::Invalid("此账号没有有效的 API Profile".into()));
+        };
+        Ok(revision(&profile, profile_secret(data, id)?.as_deref()))
     }
 
     pub(crate) fn rename_managed_account(&mut self, id: &str, raw_name: &str) -> Result<()> {
@@ -271,20 +568,40 @@ impl crate::database::Store {
         kind: CredentialKind,
         secret: &str,
     ) -> Result<()> {
-        let _record = self.managed_account(id)?;
+        let record = self.managed_snapshot_row(data, id)?;
+        // The desktop bridge mirrors this same floor; profile key rotation
+        // goes through configure_api_profile_account instead (non-empty only).
+        if secret.trim().len() < 20 {
+            return Err(Error::Invalid("凭据格式无效".into()));
+        }
+        if record.api_profile.is_some() {
+            // Third-party profiles only accept API keys and cannot rotate them
+            // while a session is using the old connection.
+            if !matches!(kind, CredentialKind::ApiKey) {
+                return Err(Error::Invalid("第三方 API Profile 只能使用 API Key".into()));
+            }
+            if self.active_session_count(id)? > 0 {
+                return Err(Error::InUse);
+            }
+        }
         let credential = clean_credential(kind, secret)?;
         write_credential(&account_root(data, id)?, &credential)?;
         self.connection.execute(
-            "UPDATE managed_accounts SET updated_at=?1 WHERE id=?2",
+            "UPDATE managed_accounts SET updated_at=?1,api_validation=NULL, \
+             api_validation_revision=NULL WHERE id=?2",
             params![now(), id],
         )?;
         Ok(())
     }
 
     /// Removes the credential file only; never invokes `claude auth logout`,
-    /// which on macOS would mutate the shared native Keychain identity.
+    /// which on macOS would mutate the shared native Keychain identity. A
+    /// profile account cannot sign out while a session is using its key.
     pub(crate) fn logout_managed_account(&mut self, data: &Path, id: &str) -> Result<()> {
-        let _record = self.managed_account(id)?;
+        let record = self.managed_snapshot_row(data, id)?;
+        if record.api_profile.is_some() && self.active_session_count(id)? > 0 {
+            return Err(Error::InUse);
+        }
         let root = account_root(data, id)?;
         match fs::remove_file(credential_path(&root)) {
             Ok(()) => {}
@@ -294,7 +611,8 @@ impl crate::database::Store {
         // Credentials written by older builds into the config root.
         let _ = fs::remove_file(root.join(".credentials.json"));
         self.connection.execute(
-            "UPDATE managed_accounts SET updated_at=?1 WHERE id=?2",
+            "UPDATE managed_accounts SET updated_at=?1,api_validation=NULL, \
+             api_validation_revision=NULL WHERE id=?2",
             params![now(), id],
         )?;
         Ok(())
