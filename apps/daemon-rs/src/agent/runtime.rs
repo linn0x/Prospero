@@ -176,9 +176,17 @@ impl Agents {
                 .call(move |store| Ok(store.session(&id)?.workspace))
                 .await?
         };
+        // Expand @file/$skill mentions for the CLI while the stored user
+        // record keeps the original text (mirrors legacy structured-session).
+        let expanded = tokio::task::spawn_blocking({
+            let workspace = workspace.clone();
+            let prompt = text.clone();
+            move || crate::skills::expand_prompt(&workspace, &prompt)
+        })
+        .await
+        .map_err(|_| Error::Closed)?;
         self.set_status(id, SessionStatus::Running).await?;
-        // Persist the user's message before invoking the provider.
-        let prompt = text.clone();
+        // Persist the user's original message before invoking the provider.
         let user_write = TimelineWrite {
             id: format!("turn{turn}-user"),
             turn_id: format!("turn{turn}"),
@@ -197,7 +205,7 @@ impl Agents {
                 .call(move |store| store.append_agent_records(&id, vec![user_write]))
                 .await?;
         }
-        let driver = spawn_turn(&workspace, &prompt, native_id.as_deref(), run.policy)?;
+        let driver = spawn_turn(&workspace, &expanded, native_id.as_deref(), run.policy)?;
         let handle = Arc::new(Handle {
             driver: Mutex::new(driver),
             replies: Mutex::new(HashMap::new()),

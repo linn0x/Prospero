@@ -6,6 +6,7 @@ pub mod orchestration;
 pub mod protocol;
 mod queries;
 pub mod server;
+pub mod skills;
 pub mod terminal;
 mod timeline;
 pub mod transport;

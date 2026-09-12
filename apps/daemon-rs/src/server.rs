@@ -85,6 +85,10 @@ impl Api {
             .route("/v1/shutdown", post(shutdown))
             .route("/v1/agent-sessions", post(create_agent))
             .route("/v1/agent-sessions/{id}/send", post(agent_send))
+            .route(
+                "/v1/agent-sessions/{id}/suggestions",
+                get(agent_suggestions),
+            )
             .route("/v1/agent-sessions/{id}/interrupt", post(agent_interrupt))
             .route("/v1/agent-sessions/{id}/permission", post(agent_permission))
             .route(
@@ -98,6 +102,7 @@ impl Api {
             .route("/v1/terminals/{id}/resize", post(terminal_resize))
             .route("/v1/terminals/{id}/close", post(terminal_close))
             .route("/v1/sessions", get(sessions))
+            .route("/v1/skills", get(list_skills_route))
             .route("/v1/sessions/summary", get(summary))
             .route("/v1/sessions/lookup", post(lookup))
             .route("/v1/workspaces", get(workspaces))
@@ -279,6 +284,61 @@ async fn agent_send(
     api.agents.send(&id, input.text).await?;
     api.publish();
     Ok(Json(serde_json::json!({"ok":true})))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SuggestionsQuery {
+    kind: String,
+    #[serde(default)]
+    query: String,
+}
+
+async fn agent_suggestions(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    query: std::result::Result<Query<SuggestionsQuery>, axum::extract::rejection::QueryRejection>,
+) -> JsonResult<serde_json::Value> {
+    crate::database::validate_id(&id)?;
+    let Query(query) = query.map_err(|_| Error::Invalid("invalid suggestion query".into()))?;
+    if query.kind != "skill" || query.query.chars().count() > 200 {
+        return Err(ApiError(Error::Invalid("invalid suggestion query".into())));
+    }
+    let workspace = api
+        .call(move |store| Ok(store.session(&id)?.workspace))
+        .await?;
+    let needle = query.query.clone();
+    let items =
+        tokio::task::spawn_blocking(move || crate::skills::complete_skills(&workspace, &needle))
+            .await
+            .map_err(|_| Error::Closed)?;
+    Ok(Json(serde_json::json!({ "items": items })))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillsQuery {
+    cwd: String,
+}
+
+async fn list_skills_route(
+    State(api): State<Api>,
+    query: std::result::Result<Query<SkillsQuery>, axum::extract::rejection::QueryRejection>,
+) -> JsonResult<serde_json::Value> {
+    let Query(query) = query.map_err(|_| Error::Invalid("invalid skills query".into()))?;
+    if query.cwd.chars().count() > 4096
+        || query.cwd.trim().is_empty()
+        || !std::path::Path::new(&query.cwd).is_absolute()
+    {
+        return Err(ApiError(Error::Invalid("invalid workspace path".into())));
+    }
+    // Cap concurrent filesystem scans independently of the generic API semaphore.
+    let _permit = api.requests.acquire().await.map_err(|_| Error::Closed)?;
+    let cwd = query.cwd.clone();
+    let items = tokio::task::spawn_blocking(move || crate::skills::list_skills(&cwd))
+        .await
+        .map_err(|_| Error::Closed)?;
+    Ok(Json(serde_json::json!({ "items": items })))
 }
 
 async fn agent_interrupt(
