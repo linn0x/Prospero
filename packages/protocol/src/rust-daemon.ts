@@ -46,7 +46,13 @@ export type TerminalQuery = { afterSeq: number | null, waitMs: number | null, };
 export type TerminalPage = { initialSize: TerminalSize, baseSeq: number, nextSeq: number, latestSeq: number, floorSeq: number, events: Array<TerminalEvent>, resyncRequired: boolean, exited: boolean, exitCode: number | null, };
 export type TerminalInput = { dataB64: string, };
 export type TerminalSnapshot = { seq: number, size: TerminalSize, dataB64: string, };
-export type CreateAgentSession = { title: string, workspace: string, autoApprove: boolean, };
+export type CreateAgentSession = { title: string, workspace: string, autoApprove: boolean, 
+/**
+ * Optional launch catalog selection (native CLI aliases / ids).
+ */
+model?: string | null, effort?: string | null, };
+export type LaunchModelInfo = { id: string, label: string, description?: string | null, supportedEfforts: Array<string>, isDefault?: boolean, };
+export type LaunchModelCatalog = { models: Array<LaunchModelInfo>, currentModel: string | null, };
 export type AttachmentInput = { mimeType: string, dataB64: string, name?: string | null, };
 export type AgentSend = { text: string, 
 /**

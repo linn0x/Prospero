@@ -3,7 +3,7 @@ import type { RustContent } from "../shared/rust-api";
 import type { TimelinePage, TimelineQuery, TimelineLookupResult, TimelineTextQuery, TimelineTextPage } from "@prospero/protocol/rust-daemon";
 import type { CreateTerminal, TerminalPage, TerminalQuery, TerminalSize, TerminalSnapshot } from "@prospero/protocol/rust-daemon";
 import type { AgentSend, AgentModeCatalog, CreateAgentSession, PermissionDecision, QuestionDecision, SubagentSnapshot, AgentQueue, AgentQueues } from "@prospero/protocol/rust-daemon";
-import type { AccountListResult } from "@prospero/protocol/rust-daemon";
+import type { AccountListResult, LaunchModelCatalog } from "@prospero/protocol/rust-daemon";
 import type {
   AbandonRun, ApplyTaskGraph, CancelTask, CleanupWorktree, CompleteRun, CreateGate,
   CreateRun, CreateRunGraph, CreateTask, Dispatch, Gate, GraphMutationResult, ResolveGate,
@@ -293,5 +293,10 @@ export class RustClient {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ type: "agent.accounts.list", requestId }),
     });
+  }
+
+  // ── Launch model catalog ────────────────────────────────────────────────
+  launchModels(signal: AbortSignal | null = null, timeoutMs = 30_000): Promise<LaunchModelCatalog> {
+    return this.json("/v1/launch/models?agent=claude&accountId=native-claude", { signal, timeoutMs });
   }
 }

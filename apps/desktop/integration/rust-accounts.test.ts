@@ -88,8 +88,8 @@ describe.skipIf(process.platform === "win32")("Native account discovery through 
         sessionKinds: ["pty", "structured"],
         plan: true,
         resume: true,
-        modelSelection: false,
-        reasoningEffort: false,
+        modelSelection: true,
+        reasoningEffort: true,
       },
     });
   }, 30_000);
