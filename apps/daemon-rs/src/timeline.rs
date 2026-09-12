@@ -78,6 +78,7 @@ impl Store {
                     TimelineBody::Message {
                         role: MessageRole::User,
                         final_answer: false,
+                        attachments: Vec::new(),
                     },
                     format!("Synthetic prompt {index}"),
                 ),
@@ -97,6 +98,7 @@ impl Store {
                     TimelineBody::Message {
                         role: MessageRole::Assistant,
                         final_answer: true,
+                        attachments: Vec::new(),
                     },
                     format!("Synthetic response {index}. 中文 🦀\n")
                         .repeat(if index + 1 == turns { 5000 } else { 1 }),

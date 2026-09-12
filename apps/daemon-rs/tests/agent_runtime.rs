@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use prosperod_rs::{
     agent::{Agents, CreateAgentSession, PermissionMode},
-    protocol::{TimelineBody, TimelineQuery},
+    protocol::{MessageRole, TimelineBody, TimelineQuery},
     worker::Database,
 };
 use tempfile::TempDir;
@@ -221,6 +221,13 @@ elif scenario == "pipeclosed":
         time.sleep(2.0)
         text_block("closed turn")
         result()
+elif scenario == "attach":
+    # Log the initial user frame so the test can assert image blocks are
+    # ordered images-first with the text block trailing.
+    with open(os.path.join(cwd, "frame.log"), "w") as log:
+        log.write(line)
+    text_block("seen your images")
+    result()
 else:
     result(error="unknown scenario")
 "#;
@@ -326,7 +333,7 @@ async fn single_turn_streams_into_timeline() {
     let head = harness.create().await;
     harness
         .agents
-        .send(&head.id, "hi".into(), None)
+        .send(&head.id, "hi".into(), None, Vec::new())
         .await
         .unwrap();
 
@@ -367,7 +374,7 @@ async fn multi_turn_resumes_native_session() {
     let head = harness.create().await;
     harness
         .agents
-        .send(&head.id, "one".into(), None)
+        .send(&head.id, "one".into(), None, Vec::new())
         .await
         .unwrap();
     harness
@@ -382,7 +389,7 @@ async fn multi_turn_resumes_native_session() {
         .await;
     harness
         .agents
-        .send(&head.id, "two".into(), None)
+        .send(&head.id, "two".into(), None, Vec::new())
         .await
         .unwrap();
     harness
@@ -421,7 +428,7 @@ async fn permission_roundtrip_executes_tool() {
     let head = harness.create().await;
     harness
         .agents
-        .send(&head.id, "go".into(), None)
+        .send(&head.id, "go".into(), None, Vec::new())
         .await
         .unwrap();
 
@@ -486,7 +493,7 @@ async fn question_roundtrip_sends_native_answers() {
     let head = harness.create().await;
     harness
         .agents
-        .send(&head.id, "go".into(), None)
+        .send(&head.id, "go".into(), None, Vec::new())
         .await
         .unwrap();
 
@@ -574,7 +581,7 @@ async fn question_cancel_allows_with_empty_answers() {
     let head = harness.create().await;
     harness
         .agents
-        .send(&head.id, "go".into(), None)
+        .send(&head.id, "go".into(), None, Vec::new())
         .await
         .unwrap();
     let records = harness
@@ -630,7 +637,7 @@ async fn interrupt_resolves_pending_question() {
     let head = harness.create().await;
     harness
         .agents
-        .send(&head.id, "go".into(), None)
+        .send(&head.id, "go".into(), None, Vec::new())
         .await
         .unwrap();
     harness
@@ -685,7 +692,7 @@ async fn interrupt_rejects_permission_and_marks_turn_interrupted() {
     let head = harness.create().await;
     harness
         .agents
-        .send(&head.id, "go".into(), None)
+        .send(&head.id, "go".into(), None, Vec::new())
         .await
         .unwrap();
     harness
@@ -729,7 +736,7 @@ async fn provider_failure_marks_turn_and_session_failed() {
     let head = harness.create().await;
     harness
         .agents
-        .send(&head.id, "go".into(), None)
+        .send(&head.id, "go".into(), None, Vec::new())
         .await
         .unwrap();
     let records = harness
@@ -779,7 +786,10 @@ async fn recovery_archives_active_run_without_replaying_turn() {
         })
         .await
         .unwrap();
-    agents.send(&head.id, "go".into(), None).await.unwrap();
+    agents
+        .send(&head.id, "go".into(), None, Vec::new())
+        .await
+        .unwrap();
     let pid_path = workspace.path().join("fake.pid");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while !pid_path.exists() {
@@ -834,7 +844,7 @@ async fn plan_mode_is_persisted_and_passed_to_the_cli() {
     );
     harness
         .agents
-        .send(&head.id, "plan this".into(), None)
+        .send(&head.id, "plan this".into(), None, Vec::new())
         .await
         .unwrap();
     harness
@@ -864,7 +874,7 @@ async fn plan_mode_is_persisted_and_passed_to_the_cli() {
         .unwrap();
     harness
         .agents
-        .send(&head.id, "now do it".into(), None)
+        .send(&head.id, "now do it".into(), None, Vec::new())
         .await
         .unwrap();
     harness
@@ -890,7 +900,7 @@ async fn task_tool_subagent_gets_card_and_detail_transcript() {
     let head = harness.create().await;
     harness
         .agents
-        .send(&head.id, "spawn a worker".into(), None)
+        .send(&head.id, "spawn a worker".into(), None, Vec::new())
         .await
         .unwrap();
 
@@ -1008,7 +1018,7 @@ async fn background_task_without_subagent_type_stays_on_main_timeline() {
     let head = harness.create().await;
     harness
         .agents
-        .send(&head.id, "go".into(), None)
+        .send(&head.id, "go".into(), None, Vec::new())
         .await
         .unwrap();
 
@@ -1059,13 +1069,13 @@ async fn busy_send_enqueues_and_drains_fifo() {
     let head = harness.create().await;
     harness
         .agents
-        .send(&head.id, "first prompt".into(), None)
+        .send(&head.id, "first prompt".into(), None, Vec::new())
         .await
         .unwrap();
     // The second message lands while turn one is still running.
     harness
         .agents
-        .send(&head.id, "second prompt".into(), None)
+        .send(&head.id, "second prompt".into(), None, Vec::new())
         .await
         .unwrap();
     let queued = harness.agents.queue(&head.id).await.unwrap();
@@ -1095,7 +1105,7 @@ async fn busy_steer_writes_into_live_cli_and_is_audited() {
     let head = harness.create().await;
     harness
         .agents
-        .send(&head.id, "do the task".into(), None)
+        .send(&head.id, "do the task".into(), None, Vec::new())
         .await
         .unwrap();
     harness
@@ -1104,6 +1114,7 @@ async fn busy_steer_writes_into_live_cli_and_is_audited() {
             &head.id,
             "also check the tests".into(),
             Some("steer".into()),
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -1139,7 +1150,7 @@ async fn steer_with_closed_pipe_degrades_to_queue_front() {
     let head = harness.create().await;
     harness
         .agents
-        .send(&head.id, "first".into(), None)
+        .send(&head.id, "first".into(), None, Vec::new())
         .await
         .unwrap();
     // Wait until the fake CLI is inside the window where it closes stdin.
@@ -1154,7 +1165,7 @@ async fn steer_with_closed_pipe_degrades_to_queue_front() {
     let payload = format!("recover me {}", "x".repeat(65_520));
     harness
         .agents
-        .send(&head.id, payload, Some("steer".into()))
+        .send(&head.id, payload, Some("steer".into()), Vec::new())
         .await
         .unwrap();
     // The failed steer must land in the queue (flagged guide) before this
@@ -1188,12 +1199,12 @@ async fn remove_queued_cancels_pending_message() {
     let head = harness.create().await;
     harness
         .agents
-        .send(&head.id, "working".into(), None)
+        .send(&head.id, "working".into(), None, Vec::new())
         .await
         .unwrap();
     harness
         .agents
-        .send(&head.id, "cancel me".into(), None)
+        .send(&head.id, "cancel me".into(), None, Vec::new())
         .await
         .unwrap();
     let queued = harness.agents.queue(&head.id).await.unwrap();
@@ -1221,12 +1232,12 @@ async fn guide_queued_upgrades_to_live_steer() {
     let head = harness.create().await;
     harness
         .agents
-        .send(&head.id, "working".into(), None)
+        .send(&head.id, "working".into(), None, Vec::new())
         .await
         .unwrap();
     harness
         .agents
-        .send(&head.id, "urgent note".into(), None)
+        .send(&head.id, "urgent note".into(), None, Vec::new())
         .await
         .unwrap();
     let queued = harness.agents.queue(&head.id).await.unwrap();
@@ -1250,19 +1261,19 @@ async fn queue_is_capped_at_fifty() {
     let head = harness.create().await;
     harness
         .agents
-        .send(&head.id, "working".into(), None)
+        .send(&head.id, "working".into(), None, Vec::new())
         .await
         .unwrap();
     for index in 0..50 {
         harness
             .agents
-            .send(&head.id, format!("queued {index}"), None)
+            .send(&head.id, format!("queued {index}"), None, Vec::new())
             .await
             .unwrap();
     }
     let overflow = harness
         .agents
-        .send(&head.id, "one too many".into(), None)
+        .send(&head.id, "one too many".into(), None, Vec::new())
         .await;
     assert!(overflow.is_err(), "the 51st message must be rejected");
     assert_eq!(harness.agents.queue(&head.id).await.unwrap().len(), 50);
@@ -1272,4 +1283,174 @@ async fn queue_is_capped_at_fifty() {
         harness.status(&head.id).await,
         prosperod_rs::protocol::SessionStatus::Failed
     );
+}
+
+#[tokio::test]
+async fn image_attachments_reach_cli_as_image_first_frame() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("attach").await;
+    let head = harness.create().await;
+    let attachments = vec![
+        prosperod_rs::agent::AttachmentInput {
+            mime_type: "image/png".into(),
+            data_b64: "iVBORw0KGgo=".into(),
+            name: Some("diagram.png".into()),
+        },
+        prosperod_rs::agent::AttachmentInput {
+            mime_type: "image/jpeg".into(),
+            data_b64: "/9j/4AAQ".into(),
+            name: None,
+        },
+    ];
+    harness
+        .agents
+        .send(&head.id, "look at these".into(), None, attachments.clone())
+        .await
+        .unwrap();
+    turn_ends(&harness, &head.id, 1).await;
+
+    // The CLI received one user frame whose content array puts both image
+    // blocks ahead of the trailing text block.
+    let raw = std::fs::read_to_string(harness.workspace.path().join("frame.log")).unwrap();
+    let frame: serde_json::Value = serde_json::from_str(raw.trim()).unwrap();
+    let content = &frame["message"]["content"];
+    assert!(content.is_array());
+    let blocks = content.as_array().unwrap();
+    assert_eq!(blocks.len(), 3);
+    assert_eq!(blocks[0]["type"], "image");
+    assert_eq!(blocks[0]["source"]["media_type"], "image/png");
+    assert_eq!(blocks[0]["source"]["data"], "iVBORw0KGgo=");
+    assert_eq!(blocks[1]["type"], "image");
+    assert_eq!(blocks[1]["source"]["media_type"], "image/jpeg");
+    assert_eq!(blocks[2]["type"], "text");
+    assert_eq!(blocks[2]["text"], "look at these");
+
+    // The persisted user record carries metadata refs only (no bytes).
+    let user = harness
+        .records(&head.id)
+        .await
+        .into_iter()
+        .find_map(|(_, body, _)| match body {
+            TimelineBody::Message {
+                role: MessageRole::User,
+                attachments,
+                ..
+            } => Some(attachments),
+            _ => None,
+        })
+        .expect("user message record");
+    assert_eq!(user.len(), 2);
+    assert_eq!(user[0].mime_type, "image/png");
+    assert_eq!(user[0].name.as_deref(), Some("diagram.png"));
+    assert!(!user[0].id.is_empty());
+    assert!(user[1].name.is_none());
+}
+
+#[tokio::test]
+async fn image_only_message_is_valid_and_rejected_forms_fail() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("attach").await;
+    let head = harness.create().await;
+
+    // Image with no text is a valid message.
+    harness
+        .agents
+        .send(
+            &head.id,
+            String::new(),
+            None,
+            vec![prosperod_rs::agent::AttachmentInput {
+                mime_type: "image/gif".into(),
+                data_b64: "R0lGOD".into(),
+                name: None,
+            }],
+        )
+        .await
+        .unwrap();
+
+    // Unsupported MIME, too many images, and empty message are all refused.
+    let bad_mime = harness
+        .agents
+        .send(
+            &head.id,
+            "x".into(),
+            None,
+            vec![prosperod_rs::agent::AttachmentInput {
+                mime_type: "application/octet-stream".into(),
+                data_b64: "AAAA".into(),
+                name: None,
+            }],
+        )
+        .await;
+    assert!(bad_mime.is_err());
+    let too_many = harness
+        .agents
+        .send(
+            &head.id,
+            "x".into(),
+            None,
+            (0..7)
+                .map(|_| prosperod_rs::agent::AttachmentInput {
+                    mime_type: "image/png".into(),
+                    data_b64: "AAAA".into(),
+                    name: None,
+                })
+                .collect(),
+        )
+        .await;
+    assert!(too_many.is_err());
+    // A truly empty text-only message is rejected.
+    assert!(
+        harness
+            .agents
+            .send(&head.id, String::new(), None, Vec::new())
+            .await
+            .is_err()
+    );
+    harness.agents.close(&head.id).await.unwrap();
+}
+
+#[tokio::test]
+async fn queued_image_message_keeps_attachment_count_then_frame() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("queuedrain").await;
+    let head = harness.create().await;
+    harness
+        .agents
+        .send(&head.id, "first prompt".into(), None, Vec::new())
+        .await
+        .unwrap();
+    // Busy send with an image parks the bytes on the queue row.
+    harness
+        .agents
+        .send(
+            &head.id,
+            "second prompt".into(),
+            None,
+            vec![prosperod_rs::agent::AttachmentInput {
+                mime_type: "image/webp".into(),
+                data_b64: "UklGRh4A".into(),
+                name: Some("shot.webp".into()),
+            }],
+        )
+        .await
+        .unwrap();
+    let queue = harness.agents.queue(&head.id).await.unwrap();
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].attachment_count, 1);
+    // Drain completes via a chained --resume turn.
+    turn_ends(&harness, &head.id, 2).await;
+    let log = std::fs::read_to_string(harness.workspace.path().join("prompts.log")).unwrap();
+    let frames: Vec<serde_json::Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(frames.len(), 2);
+    assert!(frames[1]["message"]["content"].is_array());
+    assert_eq!(
+        frames[1]["message"]["content"][0]["source"]["media_type"],
+        "image/webp"
+    );
+    assert_eq!(frames[1]["message"]["content"][1]["text"], "second prompt");
+    assert!(harness.agents.queue(&head.id).await.unwrap().is_empty());
 }

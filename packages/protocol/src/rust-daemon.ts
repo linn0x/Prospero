@@ -25,7 +25,8 @@ export type MessageRole = "user" | "assistant";
 export type ToolState = "running" | "success" | "failed";
 export type QuestionOption = { label: string, description: string | null, preview: string | null, };
 export type AgentQuestion = { id: string, header: string, question: string, options: Array<QuestionOption>, multiSelect: boolean, allowOther: boolean, };
-export type TimelineBody = { "kind": "message", role: MessageRole, finalAnswer: boolean, } | { "kind": "reasoning" } | { "kind": "tool", name: string, state: ToolState, summary: string, } | { "kind": "permission_request", requestId: string, tool: string, resolved: boolean, 
+export type MessageAttachment = { id: string, mimeType: string, name: string | null, };
+export type TimelineBody = { "kind": "message", role: MessageRole, finalAnswer: boolean, attachments?: Array<MessageAttachment>, } | { "kind": "reasoning" } | { "kind": "tool", name: string, state: ToolState, summary: string, } | { "kind": "permission_request", requestId: string, tool: string, resolved: boolean, 
 /**
  * Set when the approval belongs to a Task-tool subagent; the event
  * still shows on the main timeline so it can be answered there.
@@ -46,17 +47,22 @@ export type TerminalPage = { initialSize: TerminalSize, baseSeq: number, nextSeq
 export type TerminalInput = { dataB64: string, };
 export type TerminalSnapshot = { seq: number, size: TerminalSize, dataB64: string, };
 export type CreateAgentSession = { title: string, workspace: string, autoApprove: boolean, };
+export type AttachmentInput = { mimeType: string, dataB64: string, name?: string | null, };
 export type AgentSend = { text: string, 
 /**
  * `steer` tries to guide the running turn live and falls back to the
  * front of the queue; anything else enqueues normally (FIFO).
  */
-delivery: string | null, };
+delivery: string | null, attachments: Array<AttachmentInput>, };
 export type QueuedMessage = { id: string, text: string, 
 /**
  * `guide` rows jump the front of the queue ("现在引导").
  */
-kind: string, createdAt: number, };
+kind: string, createdAt: number, 
+/**
+ * Number of images parked with the message (bytes are never projected).
+ */
+attachmentCount: number, };
 export type AgentQueue = { sessionId: string, items: Array<QueuedMessage>, };
 export type AgentQueues = { queues: Array<AgentQueue>, };
 export type PermissionDecision = { requestId: string, allow: boolean, };

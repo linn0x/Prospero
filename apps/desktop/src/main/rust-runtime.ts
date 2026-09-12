@@ -1,16 +1,38 @@
 import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
-import type { SessionHead, TimelineQuery, TimelineTextQuery } from "@prospero/protocol/rust-daemon";
+import type { SessionHead, TimelineQuery, TimelineTextQuery, AttachmentInput } from "@prospero/protocol/rust-daemon";
 import type { QueuedMessage } from "@prospero/protocol/rust-daemon";
 import type { DesktopSnapshot, JsonObject, QueuedChatMessage, SessionInfo, SessionPage, SessionPageRequest } from "../shared/types";
 import { StateStore } from "./state-store";
 import { RustProcess, type RustConnection } from "./rust-process";
 import { orchestrationAction, readOrchestrationWindow, settleDispatchInput } from "./rust-orchestration";
 
+const ATTACHMENT_MIME = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+const BASE64_RE = /^[A-Za-z0-9+/=]+$/;
+
 function toQueuedChat(item: QueuedMessage): QueuedChatMessage {
-  // Image attachments are not yet supported by the Rust agent, so the queue
-  // never carries an attachment count.
-  return { id: item.id, text: item.text, kind: item.kind === "guide" ? "guide" : "queue", createdAt: item.createdAt, attachmentCount: 0 };
+  return { id: item.id, text: item.text, kind: item.kind === "guide" ? "guide" : "queue", createdAt: item.createdAt, attachmentCount: item.attachmentCount ?? 0 };
+}
+
+/** Mirror of the Rust daemon's attachment contract (validate_message). */
+function normalizeAttachments(raw: unknown): AttachmentInput[] {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) throw new Error("图片附件无效");
+  if (raw.length > 6) throw new Error("最多附带 6 张图片");
+  let total = 0;
+  const attachments: AttachmentInput[] = raw.map((entry) => {
+    const item = entry as Record<string, unknown>;
+    const mimeType = item?.["mimeType"];
+    const dataB64 = item?.["dataB64"];
+    if (typeof mimeType !== "string" || !ATTACHMENT_MIME.has(mimeType)) throw new Error("不支持的图片类型");
+    if (typeof dataB64 !== "string" || !dataB64 || dataB64.length > 8 * 1024 * 1024 || !BASE64_RE.test(dataB64)) throw new Error("图片数据无效");
+    const name = item?.["name"];
+    if (name !== undefined && name !== null && (typeof name !== "string" || [...name].length > 200)) throw new Error("图片名称过长");
+    total += dataB64.length;
+    return { mimeType, dataB64, ...(typeof name === "string" ? { name } : {}) };
+  });
+  if (total > 15 * 1024 * 1024) throw new Error("图片总大小超出限制");
+  return attachments;
 }
 
 export function rustSessionInfo(head: SessionHead, messageQueue?: QueuedMessage[]): SessionInfo {
@@ -355,12 +377,13 @@ export class RustRuntime {
             return { ok: true };
           }
           if (action === "interact" && input?.["type"] === "chat.send") {
-            if (Array.isArray(input["attachments"]) && input["attachments"].length) throw new Error("Rust Agent 暂不支持图片附件");
             const text = input["text"];
-            if (typeof text !== "string" || !text.trim()) throw new Error("消息内容无效");
+            if (typeof text !== "string") throw new Error("消息内容无效");
+            const attachments = normalizeAttachments(input["attachments"]);
+            if (!text.trim() && attachments.length === 0) throw new Error("消息内容无效");
             const delivery = input["delivery"];
             if (delivery !== undefined && delivery !== "queue" && delivery !== "steer") throw new Error("发送方式无效");
-            await client.agentSend(id, { text, delivery: delivery === "steer" ? "steer" : null }, signal);
+            await client.agentSend(id, { text, delivery: delivery === "steer" ? "steer" : null, attachments }, signal);
             await this.refresh(true);
             return { ok: true };
           }
