@@ -100,7 +100,7 @@ pub(super) enum AdapterEvent {
 }
 
 pub(super) struct ClaudeTurn {
-    stdin: mpsc::Sender<String>,
+    stdin: mpsc::Sender<(String, Option<oneshot::Sender<()>>)>,
     events: Option<mpsc::Receiver<AdapterEvent>>,
     child_pid: u32,
     kill: Box<dyn Fn() + Send + Sync>,
@@ -169,18 +169,24 @@ pub(super) fn spawn_turn(
     let mut stdin = child.stdin.take().ok_or(Error::Closed)?;
     let stdout = child.stdout.take().ok_or(Error::Closed)?;
 
-    let (frames_tx, mut frames_rx) = mpsc::channel::<String>(32);
+    let (frames_tx, mut frames_rx) = mpsc::channel::<(String, Option<oneshot::Sender<()>>)>(32);
     let (events_tx, events_rx) = mpsc::channel::<AdapterEvent>(64);
 
-    // Serialize stdin writes (prompts and permission responses).
+    // Serialize stdin writes (prompts, steers and permission responses). An
+    // optional ack lets a steer wait for the actual write so a broken pipe
+    // (the CLI closed stdin / exited) degrades to the queue instead of
+    // silently dropping the message.
     tokio::spawn(async move {
-        while let Some(frame) = frames_rx.recv().await {
+        while let Some((frame, ack)) = frames_rx.recv().await {
             if stdin.write_all(frame.as_bytes()).await.is_err()
                 || stdin.write_all(b"\n").await.is_err()
+                || stdin.flush().await.is_err()
             {
-                break;
+                break; // dropping `ack` reports the failed write
             }
-            let _ = stdin.flush().await;
+            if let Some(ack) = ack {
+                let _ = ack.send(());
+            }
         }
     });
 
@@ -189,7 +195,7 @@ pub(super) fn spawn_turn(
         serde_json::json!({"type":"user","message":{"role":"user","content":prompt}}).to_string();
     let prompt_writer = frames_tx.clone();
     tokio::spawn(async move {
-        let _ = prompt_writer.send(initial).await;
+        let _ = prompt_writer.send((initial, None)).await;
     });
 
     // Read and translate the JSONL stream.
@@ -251,7 +257,22 @@ impl ClaudeTurn {
             "request": {"subtype": "interrupt"}
         })
         .to_string();
-        let _ = self.stdin.try_send(frame);
+        let _ = self.stdin.try_send((frame, None));
+    }
+
+    /// Send an extra user message into the running turn ("引导"). The
+    /// stream-json CLI keeps reading stdin frames after the opening prompt;
+    /// a broken pipe (the result frame ended the turn) surfaces as an error
+    /// and the caller falls back to the front of the queue.
+    pub(super) async fn steer(&self, text: &str) -> Result<()> {
+        let frame =
+            serde_json::json!({"type":"user","message":{"role":"user","content":text}}).to_string();
+        let (ack, ack_rx) = oneshot::channel();
+        self.stdin
+            .send((frame, Some(ack)))
+            .await
+            .map_err(|_| Error::Closed)?;
+        ack_rx.await.map_err(|_| Error::Closed)
     }
 
     pub(super) fn kill(&self) {
@@ -343,7 +364,7 @@ impl Translator {
         &mut self,
         message: Value,
         auto: bool,
-        writer: &mpsc::Sender<String>,
+        writer: &mpsc::Sender<(String, Option<oneshot::Sender<()>>)>,
     ) -> Vec<AdapterEvent> {
         let mut out = Vec::new();
         let frame_type = message.get("type").and_then(Value::as_str);
@@ -474,7 +495,7 @@ impl Translator {
                                 "response":{"behavior":"allow","updatedInput":input}}
                         })
                         .to_string();
-                        let _ = writer.try_send(frame);
+                        let _ = writer.try_send((frame, None));
                     } else {
                         let (reply, receiver) = oneshot::channel();
                         let writer = writer.clone();
@@ -496,7 +517,7 @@ impl Translator {
                                     "response":response}
                             })
                             .to_string();
-                            let _ = writer.send(frame).await;
+                            let _ = writer.send((frame, None)).await;
                         });
                         out.push(AdapterEvent::Permission {
                             subagent: agent,
@@ -549,7 +570,7 @@ impl Translator {
     fn translate_question(
         &mut self,
         out: &mut Vec<AdapterEvent>,
-        writer: &mpsc::Sender<String>,
+        writer: &mpsc::Sender<(String, Option<oneshot::Sender<()>>)>,
         agent: Option<String>,
         request_id: String,
         input: Value,
@@ -614,7 +635,7 @@ impl Translator {
                         "updatedInput": merge_answers(&input, &serde_json::Map::new())}}
             })
             .to_string();
-            let _ = writer.try_send(frame);
+            let _ = writer.try_send((frame, None));
             return;
         }
         let (reply, receiver) = oneshot::channel();
@@ -645,7 +666,7 @@ impl Translator {
                     "response":response}
             })
             .to_string();
-            let _ = writer.send(frame).await;
+            let _ = writer.send((frame, None)).await;
         });
         out.push(AdapterEvent::Question {
             subagent: agent,

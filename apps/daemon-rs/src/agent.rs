@@ -21,6 +21,39 @@ pub struct CreateAgentSession {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentSend {
     pub text: String,
+    /// `steer` tries to guide the running turn live and falls back to the
+    /// front of the queue; anything else enqueues normally (FIFO).
+    #[serde(default)]
+    pub delivery: Option<String>,
+}
+
+/// One message waiting for the current turn to finish.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct QueuedMessage {
+    pub id: String,
+    pub text: String,
+    /// `guide` rows jump the front of the queue ("现在引导").
+    pub kind: String,
+    #[ts(type = "number")]
+    pub created_at: i64,
+}
+
+/// Per-session queue projection for the desktop session list.
+#[derive(Debug, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct AgentQueue {
+    pub session_id: String,
+    pub items: Vec<QueuedMessage>,
+}
+
+#[derive(Debug, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct AgentQueues {
+    pub queues: Vec<AgentQueue>,
 }
 
 #[derive(Debug, Deserialize, Serialize, TS)]

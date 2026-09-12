@@ -4,10 +4,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use tokio::sync::{Mutex, Semaphore, oneshot, watch};
+use tokio::sync::{Mutex, MutexGuard, Semaphore, oneshot, watch};
 
 use super::claude::{AdapterEvent, ClaudeTurn, QuestionReply, spawn_turn};
-use super::store::{ApprovalPolicy, PermissionMode};
+use super::store::{ApprovalPolicy, PermissionMode, QueuedRow};
 use super::*;
 use crate::error::{Error, Result};
 use crate::protocol::*;
@@ -46,6 +46,11 @@ struct Handle {
     /// request id -> timeline record id of pending approvals.
     records: Mutex<HashMap<String, String>>,
     questions: Mutex<HashMap<String, QuestionPending>>,
+    /// Starts true; flipped once the turn's `result` frame has been observed.
+    /// A steer delivered later cannot reach the CLI (its stdin is about to be
+    /// closed), so busy-send/guide degrade to the front of the queue instead
+    /// of trusting a write that the kernel pipe buffer may absorb silently.
+    steerable: AtomicBool,
 }
 
 /// Pending AskUserQuestion: the blocking CLI reply plus the map from public
@@ -58,6 +63,9 @@ struct QuestionPending {
 struct Session {
     handle: Mutex<Option<Arc<Handle>>>,
     ended: watch::Sender<()>,
+    /// Serializes drain loops so only the turn that just finished chains the
+    /// queued turns (mirrors the legacy `drainingQueue` guard).
+    draining: Mutex<()>,
     /// Concurrency slot; released when the session entry is dropped.
     #[allow(dead_code)]
     permit: Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
@@ -154,6 +162,7 @@ impl Agents {
             Arc::new(Session {
                 handle: Mutex::new(None),
                 ended,
+                draining: Mutex::new(()),
                 permit: Mutex::new(Some(permit)),
             }),
         );
@@ -172,29 +181,131 @@ impl Agents {
             .ok_or(Error::NotFound)
     }
 
-    pub async fn send(&self, id: &str, text: String) -> Result<()> {
+    pub async fn send(&self, id: &str, text: String, delivery: Option<String>) -> Result<()> {
         if text.is_empty() || text.len() > 64 * 1024 {
             return Err(Error::Invalid("invalid message".into()));
         }
         let entry = self.session_entry(id).await?;
         let mut guard = entry.handle.lock().await;
-        if guard.is_some() {
-            return Err(Error::Conflict);
-        }
-        let run = self
-            .0
-            .database
-            .call({
+        let Some(handle) = guard.clone() else {
+            // Idle: start a fresh turn immediately.
+            let (turn, handle) = self.launch_turn(id, text, &mut guard).await?;
+            self.spawn_chain(id.to_owned(), turn, handle);
+            return Ok(());
+        };
+        // Busy turn: either steer the live CLI or park the message in the
+        // persistent queue for the turn-end drain.
+        let row = QueuedRow {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            kind: if delivery.as_deref() == Some("steer") {
+                "guide"
+            } else {
+                "queue"
+            }
+            .to_owned(),
+            text: text.clone(),
+            created_at: crate::database::now(),
+        };
+        let steering = delivery.as_deref() == Some("steer");
+        if steering && handle.steerable.load(Ordering::Acquire) {
+            let workspace = {
                 let id = id.to_owned();
-                move |store| {
+                self.0
+                    .database
+                    .call(move |store| Ok(store.session(&id)?.workspace))
+                    .await?
+            };
+            let expanded = self.expand_prompt(&workspace, &text).await?;
+            if handle.driver.lock().await.steer(&expanded).await.is_ok() {
+                self.record_steer(id, &text).await?;
+                self.publish();
+                return Ok(());
+            }
+            // The current turn can no longer accept a steer (broken pipe /
+            // result already emitted): degrade to the front of the queue. The
+            // message must not be lost.
+        }
+        self.enqueue(id, &row, steering).await?;
+        Ok(())
+    }
+
+    async fn enqueue(&self, id: &str, row: &QueuedRow, front: bool) -> Result<()> {
+        let row = row.clone();
+        let id = id.to_owned();
+        self.0
+            .database
+            .call(move |store| store.enqueue_message(&id, &row, front))
+            .await?;
+        self.publish();
+        Ok(())
+    }
+
+    /// Persist a successfully-delivered steer as a user message immediately:
+    /// it cannot be unsent, and the audit trail must show it even though no
+    /// queued row exists.
+    async fn record_steer(&self, id: &str, text: &str) -> Result<()> {
+        let (turn, _native) = {
+            let id = id.to_owned();
+            self.0
+                .database
+                .call(move |store| {
+                    let run = store.agent_run(&id)?;
+                    Ok((run.turn, run.native_id))
+                })
+                .await?
+        };
+        let write = TimelineWrite {
+            id: format!("turn{turn}-steer-{}", uuid::Uuid::new_v4().simple()),
+            turn_id: format!("turn{turn}"),
+            expected_revision: 0,
+            body: TimelineBody::Message {
+                role: MessageRole::User,
+                final_answer: false,
+            },
+            text: text.to_owned(),
+            replace: false,
+            subagent_id: None,
+        };
+        let id = id.to_owned();
+        self.0
+            .database
+            .call(move |store| store.append_agent_records(&id, vec![write]))
+            .await
+    }
+
+    async fn expand_prompt(&self, workspace: &str, prompt: &str) -> Result<String> {
+        let workspace = workspace.to_owned();
+        let prompt = prompt.to_owned();
+        tokio::task::spawn_blocking(move || crate::skills::expand_prompt(&workspace, &prompt))
+            .await
+            .map_err(|_| Error::Closed)
+    }
+
+    /// Prepare and spawn one CLI turn, install its handle under `guard`, and
+    /// return the turn number plus the handle. The caller owns chaining (it
+    /// either spawns the chain task or continues the drain loop in place).
+    async fn launch_turn(
+        &self,
+        id: &str,
+        text: String,
+        guard: &mut MutexGuard<'_, Option<Arc<Handle>>>,
+    ) -> Result<(i64, Arc<Handle>)> {
+        if self.0.closed.load(Ordering::Acquire) {
+            return Err(Error::Closed);
+        }
+        let run = {
+            let id = id.to_owned();
+            self.0
+                .database
+                .call(move |store| {
                     let run = store.agent_run(&id)?;
                     if !run.active {
                         return Err(Error::Conflict);
                     }
                     Ok(run)
-                }
-            })
-            .await?;
+                })
+                .await?
+        };
         let (turn, native_id) = {
             let id = id.to_owned();
             self.0
@@ -211,13 +322,7 @@ impl Agents {
         };
         // Expand @file/$skill mentions for the CLI while the stored user
         // record keeps the original text (mirrors legacy structured-session).
-        let expanded = tokio::task::spawn_blocking({
-            let workspace = workspace.clone();
-            let prompt = text.clone();
-            move || crate::skills::expand_prompt(&workspace, &prompt)
-        })
-        .await
-        .map_err(|_| Error::Closed)?;
+        let expanded = self.expand_prompt(&workspace, &text).await?;
         self.set_status(id, SessionStatus::Running).await?;
         // Persist the user's original message before invoking the provider.
         let user_write = TimelineWrite {
@@ -251,22 +356,130 @@ impl Agents {
             replies: Mutex::new(HashMap::new()),
             records: Mutex::new(HashMap::new()),
             questions: Mutex::new(HashMap::new()),
+            steerable: AtomicBool::new(true),
         });
-        *guard = Some(handle.clone());
-        drop(guard);
-        self.spawn_turn(id.to_owned(), turn, handle);
-        Ok(())
+        **guard = Some(handle.clone());
+        Ok((turn, handle))
     }
 
-    fn spawn_turn(&self, id: String, turn: i64, handle: Arc<Handle>) {
+    /// Run one turn, then drain queued messages as chained turns, all in a
+    /// single task so only the turn that just finished starts the next one.
+    fn spawn_chain(&self, id: String, first_turn: i64, first_handle: Arc<Handle>) {
         let runtime = self.clone();
         tokio::spawn(async move {
-            runtime.run_turn(id.clone(), turn, handle.clone()).await;
-            if let Ok(entry) = runtime.session_entry(&id).await {
-                *entry.handle.lock().await = None;
+            let mut turn = first_turn;
+            let mut handle = first_handle;
+            loop {
+                runtime.run_turn(id.clone(), turn, handle.clone()).await;
+                let Ok(entry) = runtime.session_entry(&id).await else {
+                    break;
+                };
+                // Hold the drain lock for the whole pop+launch window so a
+                // concurrent steer/guide/send can't start a duplicate turn.
+                let _drain = entry.draining.lock().await;
+                let mut guard = entry.handle.lock().await;
+                if guard
+                    .as_ref()
+                    .is_some_and(|live| Arc::ptr_eq(live, &handle))
+                {
+                    *guard = None;
+                }
                 entry.ended.send_replace(());
+                runtime.publish();
+                let queued = {
+                    let id = id.clone();
+                    runtime
+                        .0
+                        .database
+                        .call(move |store| store.pop_message(&id))
+                        .await
+                };
+                let Some(row) = queued.unwrap_or(None) else {
+                    break;
+                };
+                match runtime.launch_turn(&id, row.text.clone(), &mut guard).await {
+                    Ok((next_turn, next_handle)) => {
+                        turn = next_turn;
+                        handle = next_handle;
+                        // Guard drops here; run_turn runs without it, and the
+                        // next loop iteration takes the drain slot again.
+                    }
+                    // Archive raced the pop: the queue was cleared by design
+                    // (user killed the session); do not replay it.
+                    Err(Error::Conflict) | Err(Error::NotFound) => break,
+                    Err(Error::Closed) => {
+                        // Daemon shutdown: put the popped row back so a future
+                        // daemon can drain it rather than dropping the text.
+                        let _ = runtime.enqueue(&id, &row, true).await;
+                        break;
+                    }
+                    Err(error) => {
+                        // Transient failure: keep the message at the front;
+                        // the next user-sent turn drains it on completion.
+                        let _ = runtime.enqueue(&id, &row, true).await;
+                        runtime.drain_error(&id, turn, &error.to_string()).await;
+                        break;
+                    }
+                }
             }
-            runtime.publish();
+        });
+    }
+
+    async fn drain_error(&self, id: &str, turn: i64, message: &str) {
+        let write = TimelineWrite {
+            id: format!("turn{turn}-drain-error"),
+            turn_id: format!("turn{turn}"),
+            expected_revision: 0,
+            body: TimelineBody::Error,
+            text: bounded_text(message.to_owned()),
+            replace: false,
+            subagent_id: None,
+        };
+        let id = id.to_owned();
+        let _ = self
+            .0
+            .database
+            .call(move |store| store.append_agent_records(&id, vec![write]))
+            .await;
+        self.publish();
+    }
+
+    /// Kick the drain when a queue mutation happens while no turn is running
+    /// (e.g. guideQueued on an idle session dispatches the row immediately).
+    async fn kick_drain(&self, id: &str) {
+        let Ok(entry) = self.session_entry(id).await else {
+            return;
+        };
+        let runtime = self.clone();
+        let id = id.to_owned();
+        tokio::spawn(async move {
+            let _drain = entry.draining.lock().await;
+            let mut guard = entry.handle.lock().await;
+            if guard.is_some() {
+                return;
+            }
+            let row = match runtime
+                .0
+                .database
+                .call({
+                    let id = id.clone();
+                    move |store| store.pop_message(&id)
+                })
+                .await
+            {
+                Ok(Some(row)) => row,
+                _ => return,
+            };
+            match runtime.launch_turn(&id, row.text.clone(), &mut guard).await {
+                Ok((turn, handle)) => {
+                    drop(guard);
+                    runtime.spawn_chain(id, turn, handle);
+                }
+                Err(error) => {
+                    let _ = runtime.enqueue(&id, &row, true).await;
+                    runtime.drain_error(&id, 0, &error.to_string()).await;
+                }
+            }
         });
     }
 
@@ -670,6 +883,7 @@ impl Agents {
                     interrupted: was_interrupted,
                     error,
                 } => {
+                    handle.steerable.store(false, Ordering::Release);
                     interrupted = was_interrupted;
                     failure = error;
                     break;
@@ -720,7 +934,18 @@ impl Agents {
         } else {
             SessionStatus::Idle
         };
-        self.set_status(&id, status).await.ok();
+        // Skip the write (and publish) when the session was archived while the
+        // turn was still running; archival owns the terminal status then.
+        let updated = {
+            let id = id.clone();
+            self.0
+                .database
+                .call(move |store| store.finish_agent_turn_status(&id, status))
+                .await
+        };
+        if updated.unwrap_or(false) {
+            self.publish();
+        }
     }
 
     async fn set_status(&self, id: &str, status: SessionStatus) -> Result<SessionHead> {
@@ -841,6 +1066,132 @@ impl Agents {
         Ok(())
     }
 
+    /// Pending messages for one session (desktop "待发送" list).
+    pub async fn queue(&self, id: &str) -> Result<Vec<QueuedMessage>> {
+        crate::database::validate_id(id)?;
+        let id = id.to_owned();
+        let rows = self
+            .0
+            .database
+            .call(move |store| store.message_queue(&id))
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| QueuedMessage {
+                id: row.id,
+                text: row.text,
+                kind: row.kind,
+                created_at: row.created_at,
+            })
+            .collect())
+    }
+
+    /// Non-empty queues across all active sessions (session-list projection).
+    pub async fn queues(&self) -> Result<AgentQueues> {
+        let rows = self.0.database.call(|store| store.message_queues()).await?;
+        Ok(AgentQueues {
+            queues: rows
+                .into_iter()
+                .map(|(session_id, items)| AgentQueue {
+                    session_id,
+                    items: items
+                        .into_iter()
+                        .map(|row| QueuedMessage {
+                            id: row.id,
+                            text: row.text,
+                            kind: row.kind,
+                            created_at: row.created_at,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        })
+    }
+
+    /// Cancel a message that has not been dispatched yet. A steer that was
+    /// already delivered has no queue row and cannot be withdrawn.
+    pub async fn remove_queued(&self, id: &str, queue_id: &str) -> Result<()> {
+        let id = id.to_owned();
+        let queue_id = queue_id.to_owned();
+        self.0
+            .database
+            .call(move |store| store.remove_message(&id, &queue_id))
+            .await?;
+        self.publish();
+        Ok(())
+    }
+
+    /// Upgrade a queued message into a live steer. When the current turn
+    /// cannot accept it (idle, or the CLI pipe is gone) the row moves to the
+    /// front of the queue and is dispatched first on the next drain; the
+    /// message text is never lost.
+    pub async fn guide_queued(&self, id: &str, queue_id: &str) -> Result<()> {
+        crate::database::validate_id(queue_id)?;
+        let entry = self.session_entry(id).await?;
+        let row = {
+            let id = id.to_owned();
+            let queue_id = queue_id.to_owned();
+            let items = self
+                .0
+                .database
+                .call(move |store| store.message_queue(&id))
+                .await?;
+            items
+                .into_iter()
+                .find(|item| item.id == queue_id)
+                .ok_or(Error::NotFound)?
+        };
+        let mut steered = false;
+        let guard = entry.handle.lock().await;
+        if let Some(handle) = guard.as_ref()
+            && handle.steerable.load(Ordering::Acquire)
+        {
+            let workspace = {
+                let id = id.to_owned();
+                self.0
+                    .database
+                    .call(move |store| Ok(store.session(&id)?.workspace))
+                    .await?
+            };
+            let expanded = self.expand_prompt(&workspace, &row.text).await?;
+            if handle.driver.lock().await.steer(&expanded).await.is_ok() {
+                steered = true;
+            }
+        }
+        drop(guard);
+        if steered {
+            // The steer reached the CLI: delete the row and audit the message.
+            let removed_id = id.to_owned();
+            let removed_qid = queue_id.to_owned();
+            let removed = self
+                .0
+                .database
+                .call(move |store| store.remove_message(&removed_id, &removed_qid))
+                .await;
+            if matches!(removed, Err(Error::NotFound)) {
+                // A concurrent removal (other client) still must record the
+                // text that was already steered into the CLI.
+            } else {
+                removed?;
+            }
+            self.record_steer(id, &row.text).await?;
+            self.publish();
+            return Ok(());
+        }
+        // Not steered: mark guide and move to the front, then kick the drain
+        // in case the turn ended while we were trying.
+        let guided_id = id.to_owned();
+        let guided_qid = queue_id.to_owned();
+        self.0
+            .database
+            .call(move |store| store.guide_message(&guided_id, &guided_qid))
+            .await?;
+        self.publish();
+        drop(entry);
+        self.kick_drain(id).await;
+        Ok(())
+    }
+
     /// Current collaboration mode (`default`/`plan`).
     pub async fn mode(&self, id: &str) -> Result<PermissionMode> {
         let id = id.to_owned();
@@ -911,6 +1262,14 @@ impl Agents {
     }
 
     pub async fn close(&self, id: &str) -> Result<()> {
+        // Archive first: active=0 plus the queue delete closes the window in
+        // which a finishing chain could pop a queued row and relaunch a CLI
+        // for a session the user just killed.
+        let archived = id.to_owned();
+        self.0
+            .database
+            .call(move |store| store.archive_agent_session(&archived, true))
+            .await?;
         if let Ok(entry) = self.session_entry(id).await {
             if let Some(handle) = entry.handle.lock().await.take() {
                 let pending = std::mem::take(&mut *handle.replies.lock().await);
@@ -929,11 +1288,6 @@ impl Agents {
             }
             self.0.entries.lock().await.remove(id);
         }
-        let id = id.to_owned();
-        self.0
-            .database
-            .call(move |store| store.archive_agent_session(&id, true))
-            .await?;
         self.publish();
         Ok(())
     }

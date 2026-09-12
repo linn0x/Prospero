@@ -30,7 +30,19 @@ def emit(payload):
     sys.stdout.flush()
 
 emit({"type": "system", "subtype": "init", "session_id": "native-1"})
-line = sys.stdin.readline()
+
+def read_line_raw():
+    # Read straight from fd 0: a BufferedReader readline can pull coalesced
+    # later frames into userspace, which hides them from a subsequent select.
+    data = bytearray()
+    while True:
+        chunk = os.read(0, 1)
+        if not chunk or chunk == b"\n":
+            break
+        data.extend(chunk)
+    return data.decode("utf-8", "replace")
+
+line = read_line_raw()
 with open(os.path.join(cwd, "turns.log"), "a") as log:
     log.write(("resume=" + str(resume)) + "\n")
 
@@ -164,6 +176,51 @@ elif scenario == "hang":
     with open(os.path.join(cwd, "fake.pid"), "w") as pid:
         pid.write(str(os.getpid()))
     time.sleep(30)
+elif scenario == "queuedrain":
+    # Each chained turn is a fresh process (with --resume); log every prompt
+    # so tests can prove FIFO queue dispatch reached the CLI.
+    with open(os.path.join(cwd, "prompts.log"), "a") as log:
+        log.write(line + "\n")
+    text_block("second turn" if resume else "first turn")
+    result()
+elif scenario == "steer":
+    # After the opening prompt, keep reading stdin for extra user frames
+    # (live steers) for a short window, then answer. Reads hit fd 0 directly so
+    # no userspace buffer can hide coalesced frames from select.
+    import select
+    extras = []
+    while True:
+        ready, _, _ = select.select([sys.stdin], [], [], 2.0)
+        if not ready:
+            break
+        frame = read_line_raw()
+        if not frame:
+            break
+        extras.append(frame)
+    with open(os.path.join(cwd, "steered.log"), "w") as log:
+        log.write("\n".join(extras))
+    text_block("steered turn")
+    result()
+elif scenario == "pipeclosed":
+    if resume:
+        # Chained drain turn: consume the guide prompt normally.
+        with open(os.path.join(cwd, "prompts.log"), "a") as log:
+            log.write(line + "\n")
+        text_block("drained guide")
+        result()
+    else:
+        # Let the test submit an oversized steer: it fills the pipe and blocks
+        # in the writer. Closing the read end then delivers EPIPE to that
+        # blocked write *while this process is still alive*, so the runtime
+        # deterministically falls back to the queue front before this turn
+        # ends. (A small write would just sit in the kernel buffer.)
+        open(os.path.join(cwd, "ready.flag"), "w").close()
+        time.sleep(0.5)
+        os.close(0)
+        open(os.path.join(cwd, "closed.flag"), "w").close()
+        time.sleep(2.0)
+        text_block("closed turn")
+        result()
 else:
     result(error="unknown scenario")
 "#;
@@ -267,7 +324,11 @@ async fn single_turn_streams_into_timeline() {
     let _guard = SERIAL.lock().await;
     let harness = Harness::new("chat").await;
     let head = harness.create().await;
-    harness.agents.send(&head.id, "hi".into()).await.unwrap();
+    harness
+        .agents
+        .send(&head.id, "hi".into(), None)
+        .await
+        .unwrap();
 
     let records = harness
         .wait_for(&head.id, |records| {
@@ -304,7 +365,11 @@ async fn multi_turn_resumes_native_session() {
     let _guard = SERIAL.lock().await;
     let harness = Harness::new("resume").await;
     let head = harness.create().await;
-    harness.agents.send(&head.id, "one".into()).await.unwrap();
+    harness
+        .agents
+        .send(&head.id, "one".into(), None)
+        .await
+        .unwrap();
     harness
         .wait_for(&head.id, |records| {
             records.iter().any(|(_, body, _)| {
@@ -315,7 +380,11 @@ async fn multi_turn_resumes_native_session() {
             })
         })
         .await;
-    harness.agents.send(&head.id, "two".into()).await.unwrap();
+    harness
+        .agents
+        .send(&head.id, "two".into(), None)
+        .await
+        .unwrap();
     harness
         .wait_for(&head.id, |records| {
             records
@@ -350,7 +419,11 @@ async fn permission_roundtrip_executes_tool() {
     let _guard = SERIAL.lock().await;
     let harness = Harness::new("approval").await;
     let head = harness.create().await;
-    harness.agents.send(&head.id, "go".into()).await.unwrap();
+    harness
+        .agents
+        .send(&head.id, "go".into(), None)
+        .await
+        .unwrap();
 
     let records = harness
         .wait_for(&head.id, |records| {
@@ -411,7 +484,11 @@ async fn question_roundtrip_sends_native_answers() {
     let _guard = SERIAL.lock().await;
     let harness = Harness::new("question").await;
     let head = harness.create().await;
-    harness.agents.send(&head.id, "go".into()).await.unwrap();
+    harness
+        .agents
+        .send(&head.id, "go".into(), None)
+        .await
+        .unwrap();
 
     let records = harness
         .wait_for(&head.id, |records| {
@@ -495,7 +572,11 @@ async fn question_cancel_allows_with_empty_answers() {
     let _guard = SERIAL.lock().await;
     let harness = Harness::new("question").await;
     let head = harness.create().await;
-    harness.agents.send(&head.id, "go".into()).await.unwrap();
+    harness
+        .agents
+        .send(&head.id, "go".into(), None)
+        .await
+        .unwrap();
     let records = harness
         .wait_for(&head.id, |records| {
             records.iter().any(|(_, body, _)| {
@@ -547,7 +628,11 @@ async fn interrupt_resolves_pending_question() {
     let _guard = SERIAL.lock().await;
     let harness = Harness::new("question").await;
     let head = harness.create().await;
-    harness.agents.send(&head.id, "go".into()).await.unwrap();
+    harness
+        .agents
+        .send(&head.id, "go".into(), None)
+        .await
+        .unwrap();
     harness
         .wait_for(&head.id, |records| {
             records.iter().any(|(_, body, _)| {
@@ -569,8 +654,22 @@ async fn interrupt_resolves_pending_question() {
             )
         })
         .await;
-    // The dropped callback makes the translator deny the tool call.
-    let answers = std::fs::read_to_string(harness.workspace.path().join("answers.log")).unwrap();
+    // The dropped callback makes the translator deny the tool call. The deny
+    // frame is written to the CLI just after the resolve marker lands, so poll
+    // for its log instead of racing the writer.
+    let answer_path = harness.workspace.path().join("answers.log");
+    let answers = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(answers) = std::fs::read_to_string(&answer_path)
+                && answers.contains(r#""behavior":"deny""#)
+            {
+                break answers;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
     assert!(answers.contains(r#""behavior":"deny""#), "{answers}");
     assert!(
         records
@@ -584,7 +683,11 @@ async fn interrupt_rejects_permission_and_marks_turn_interrupted() {
     let _guard = SERIAL.lock().await;
     let harness = Harness::new("interrupt").await;
     let head = harness.create().await;
-    harness.agents.send(&head.id, "go".into()).await.unwrap();
+    harness
+        .agents
+        .send(&head.id, "go".into(), None)
+        .await
+        .unwrap();
     harness
         .wait_for(&head.id, |records| {
             records.iter().any(|(_, body, _)| {
@@ -624,7 +727,11 @@ async fn provider_failure_marks_turn_and_session_failed() {
     let _guard = SERIAL.lock().await;
     let harness = Harness::new("failure").await;
     let head = harness.create().await;
-    harness.agents.send(&head.id, "go".into()).await.unwrap();
+    harness
+        .agents
+        .send(&head.id, "go".into(), None)
+        .await
+        .unwrap();
     let records = harness
         .wait_for(&head.id, |records| {
             records.iter().any(|(_, body, _)| {
@@ -672,7 +779,7 @@ async fn recovery_archives_active_run_without_replaying_turn() {
         })
         .await
         .unwrap();
-    agents.send(&head.id, "go".into()).await.unwrap();
+    agents.send(&head.id, "go".into(), None).await.unwrap();
     let pid_path = workspace.path().join("fake.pid");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while !pid_path.exists() {
@@ -727,7 +834,7 @@ async fn plan_mode_is_persisted_and_passed_to_the_cli() {
     );
     harness
         .agents
-        .send(&head.id, "plan this".into())
+        .send(&head.id, "plan this".into(), None)
         .await
         .unwrap();
     harness
@@ -757,7 +864,7 @@ async fn plan_mode_is_persisted_and_passed_to_the_cli() {
         .unwrap();
     harness
         .agents
-        .send(&head.id, "now do it".into())
+        .send(&head.id, "now do it".into(), None)
         .await
         .unwrap();
     harness
@@ -783,7 +890,7 @@ async fn task_tool_subagent_gets_card_and_detail_transcript() {
     let head = harness.create().await;
     harness
         .agents
-        .send(&head.id, "spawn a worker".into())
+        .send(&head.id, "spawn a worker".into(), None)
         .await
         .unwrap();
 
@@ -899,7 +1006,11 @@ async fn background_task_without_subagent_type_stays_on_main_timeline() {
     let _guard = SERIAL.lock().await;
     let harness = Harness::new("backgroundtask").await;
     let head = harness.create().await;
-    harness.agents.send(&head.id, "go".into()).await.unwrap();
+    harness
+        .agents
+        .send(&head.id, "go".into(), None)
+        .await
+        .unwrap();
 
     let records = harness
         .wait_for(&head.id, |records| {
@@ -926,5 +1037,239 @@ async fn background_task_without_subagent_type_stays_on_main_timeline() {
             .iter()
             .any(|(_, body, _)| matches!(body, TimelineBody::Subagent { .. })),
         "background tasks must not create subagent cards"
+    );
+}
+
+async fn turn_ends(harness: &Harness, id: &str, count: usize) {
+    harness
+        .wait_for(id, |records| {
+            records
+                .iter()
+                .filter(|(_, body, _)| matches!(body, TimelineBody::TurnEnd { .. }))
+                .count()
+                == count
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn busy_send_enqueues_and_drains_fifo() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("queuedrain").await;
+    let head = harness.create().await;
+    harness
+        .agents
+        .send(&head.id, "first prompt".into(), None)
+        .await
+        .unwrap();
+    // The second message lands while turn one is still running.
+    harness
+        .agents
+        .send(&head.id, "second prompt".into(), None)
+        .await
+        .unwrap();
+    let queued = harness.agents.queue(&head.id).await.unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].text, "second prompt");
+    assert_eq!(queued[0].kind, "queue");
+
+    turn_ends(&harness, &head.id, 2).await;
+    assert!(harness.agents.queue(&head.id).await.unwrap().is_empty());
+    let prompts =
+        std::fs::read_to_string(harness.workspace.path().join("prompts.log")).unwrap_or_default();
+    assert!(prompts.contains("first prompt"));
+    assert!(
+        prompts.contains("second prompt"),
+        "queued text must reach the next CLI turn: {prompts}"
+    );
+    assert_eq!(
+        harness.status(&head.id).await,
+        prosperod_rs::protocol::SessionStatus::Idle
+    );
+}
+
+#[tokio::test]
+async fn busy_steer_writes_into_live_cli_and_is_audited() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("steer").await;
+    let head = harness.create().await;
+    harness
+        .agents
+        .send(&head.id, "do the task".into(), None)
+        .await
+        .unwrap();
+    harness
+        .agents
+        .send(
+            &head.id,
+            "also check the tests".into(),
+            Some("steer".into()),
+        )
+        .await
+        .unwrap();
+    turn_ends(&harness, &head.id, 1).await;
+    // The steer reached the running CLI process (no second turn spawned).
+    let steered =
+        std::fs::read_to_string(harness.workspace.path().join("steered.log")).unwrap_or_default();
+    assert!(steered.contains("also check the tests"));
+    assert!(harness.agents.queue(&head.id).await.unwrap().is_empty());
+    // The steered text is recorded as a user message immediately.
+    let records = harness.records(&head.id).await;
+    let steered_audit: Vec<&str> = records
+        .iter()
+        .filter(|(id, body, _)| {
+            id.contains("steer")
+                && matches!(
+                    body,
+                    TimelineBody::Message {
+                        role: prosperod_rs::protocol::MessageRole::User,
+                        ..
+                    }
+                )
+        })
+        .map(|(_, _, preview)| preview.as_str())
+        .collect();
+    assert!(steered_audit.contains(&"also check the tests"));
+}
+
+#[tokio::test]
+async fn steer_with_closed_pipe_degrades_to_queue_front() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("pipeclosed").await;
+    let head = harness.create().await;
+    harness
+        .agents
+        .send(&head.id, "first".into(), None)
+        .await
+        .unwrap();
+    // Wait until the fake CLI is inside the window where it closes stdin.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !harness.workspace.path().join("ready.flag").exists() {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // A message whose JSON frame exceeds the 64KiB pipe capacity blocks in
+    // the writer and fails with EPIPE once the CLI closes its read end; the
+    // unique marker stays findable despite the padding.
+    let payload = format!("recover me {}", "x".repeat(65_520));
+    harness
+        .agents
+        .send(&head.id, payload, Some("steer".into()))
+        .await
+        .unwrap();
+    // The failed steer must land in the queue (flagged guide) before this
+    // turn ends, proving the writer's error drove the fallback.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let queued = loop {
+        let queued = harness.agents.queue(&head.id).await.unwrap();
+        if queued.len() == 1 {
+            break queued;
+        }
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(queued[0].kind, "guide");
+    assert!(queued[0].text.starts_with("recover me"));
+    // The turn-end drain dispatches the guide row as the next turn.
+    turn_ends(&harness, &head.id, 2).await;
+    let prompts =
+        std::fs::read_to_string(harness.workspace.path().join("prompts.log")).unwrap_or_default();
+    assert!(
+        prompts.contains("recover me"),
+        "steer fallback must not lose the text: {prompts}"
+    );
+    assert!(harness.agents.queue(&head.id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn remove_queued_cancels_pending_message() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("steer").await;
+    let head = harness.create().await;
+    harness
+        .agents
+        .send(&head.id, "working".into(), None)
+        .await
+        .unwrap();
+    harness
+        .agents
+        .send(&head.id, "cancel me".into(), None)
+        .await
+        .unwrap();
+    let queued = harness.agents.queue(&head.id).await.unwrap();
+    assert_eq!(queued.len(), 1);
+    harness
+        .agents
+        .remove_queued(&head.id, &queued[0].id)
+        .await
+        .unwrap();
+    assert!(harness.agents.queue(&head.id).await.unwrap().is_empty());
+    assert!(
+        harness
+            .agents
+            .remove_queued(&head.id, &queued[0].id)
+            .await
+            .is_err()
+    );
+    turn_ends(&harness, &head.id, 1).await;
+}
+
+#[tokio::test]
+async fn guide_queued_upgrades_to_live_steer() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("steer").await;
+    let head = harness.create().await;
+    harness
+        .agents
+        .send(&head.id, "working".into(), None)
+        .await
+        .unwrap();
+    harness
+        .agents
+        .send(&head.id, "urgent note".into(), None)
+        .await
+        .unwrap();
+    let queued = harness.agents.queue(&head.id).await.unwrap();
+    assert_eq!(queued[0].kind, "queue");
+    harness
+        .agents
+        .guide_queued(&head.id, &queued[0].id)
+        .await
+        .unwrap();
+    assert!(harness.agents.queue(&head.id).await.unwrap().is_empty());
+    turn_ends(&harness, &head.id, 1).await;
+    let steered =
+        std::fs::read_to_string(harness.workspace.path().join("steered.log")).unwrap_or_default();
+    assert!(steered.contains("urgent note"));
+}
+
+#[tokio::test]
+async fn queue_is_capped_at_fifty() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("steer").await;
+    let head = harness.create().await;
+    harness
+        .agents
+        .send(&head.id, "working".into(), None)
+        .await
+        .unwrap();
+    for index in 0..50 {
+        harness
+            .agents
+            .send(&head.id, format!("queued {index}"), None)
+            .await
+            .unwrap();
+    }
+    let overflow = harness
+        .agents
+        .send(&head.id, "one too many".into(), None)
+        .await;
+    assert!(overflow.is_err(), "the 51st message must be rejected");
+    assert_eq!(harness.agents.queue(&head.id).await.unwrap().len(), 50);
+    // Kill the session so the queued rows never spawn fifty CLI turns.
+    harness.agents.close(&head.id).await.unwrap();
+    assert_eq!(
+        harness.status(&head.id).await,
+        prosperod_rs::protocol::SessionStatus::Failed
     );
 }
