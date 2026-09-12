@@ -91,9 +91,9 @@ async fn logged_in_native_claude_account_carries_method_and_provider() {
         vec![SessionKind::Pty, SessionKind::Structured]
     );
     assert!(caps.plan && caps.resume);
-    // No launch-model catalog slice yet: switchers must stay hidden.
-    assert!(!caps.model_selection);
-    assert!(!caps.reasoning_effort);
+    // The launch catalog slice serves model/effort selection.
+    assert!(caps.model_selection);
+    assert!(caps.reasoning_effort);
 }
 
 #[tokio::test]

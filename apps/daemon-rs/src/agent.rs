@@ -17,6 +17,33 @@ pub struct CreateAgentSession {
     pub workspace: String,
     #[serde(default)]
     pub auto_approve: bool,
+    /// Optional launch catalog selection (native CLI aliases / ids).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+/// One row in the launch model catalog (legacy AgentModelCatalog contract).
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct LaunchModelInfo {
+    pub id: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub supported_efforts: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_default: bool,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct LaunchModelCatalog {
+    pub models: Vec<LaunchModelInfo>,
+    pub current_model: Option<String>,
 }
 
 /// One inbound image attachment. Desktop validation mirrors the legacy

@@ -45,6 +45,9 @@ pub(crate) struct AgentRun {
     pub mode: PermissionMode,
     pub turn: i64,
     pub native_id: Option<String>,
+    /// Launch-time model/effort selection; applied on every chained turn.
+    pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 /// Maximum number of messages that may wait for the current turn to finish
@@ -64,12 +67,36 @@ fn decode_attachments(raw: &str) -> Vec<crate::agent::AttachmentInput> {
     serde_json::from_str(raw).unwrap_or_default()
 }
 
+/// Validates a launch catalog selection (model alias / effort level):
+/// trims, rejects empty values, control characters and over-long inputs.
+/// Mirrors the desktop launch-dialog validation (model <= 160, effort <= 80).
+fn normalize_selection(
+    value: Option<String>,
+    maximum: usize,
+    message: &'static str,
+) -> Result<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    // Check the raw value: trimming must not launder an embedded newline.
+    if value.chars().count() > maximum || value.chars().any(|c| c.is_control()) {
+        return Err(Error::Invalid(message.into()));
+    }
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(Error::Invalid(message.into()));
+    }
+    Ok(Some(value.to_owned()))
+}
+
 impl Store {
     pub fn create_agent_session(
         &mut self,
         input: CreateAgentSession,
         policy: ApprovalPolicy,
     ) -> Result<SessionHead> {
+        let model = normalize_selection(input.model, 160, "模型无效")?;
+        let effort = normalize_selection(input.effort, 80, "思考强度无效")?;
         self.create_session_with(
             CreateSession {
                 agent: AgentKind::Claude,
@@ -79,8 +106,9 @@ impl Store {
             },
             |tx, head| {
                 tx.execute(
-                    "INSERT INTO agent_runs(session_id,agent,active,approval_policy,turn,native_id) VALUES(?1,'claude',1,?2,0,NULL)",
-                    params![head.id, policy.label()],
+                    "INSERT INTO agent_runs(session_id,agent,active,approval_policy,turn,native_id,model,effort) \
+                     VALUES(?1,'claude',1,?2,0,NULL,?3,?4)",
+                    params![head.id, policy.label(), model, effort],
                 )?;
                 Ok(())
             },
@@ -89,10 +117,20 @@ impl Store {
 
     pub(crate) fn agent_run(&self, id: &str) -> Result<AgentRun> {
         crate::database::validate_id(id)?;
-        let row: (String, bool, String, String, i64, Option<String>) = self
+        type Row = (
+            String,
+            bool,
+            String,
+            String,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let row: Row = self
             .connection
             .query_row(
-                "SELECT agent,active,approval_policy,permission_mode,turn,native_id FROM agent_runs WHERE session_id=?",
+                "SELECT agent,active,approval_policy,permission_mode,turn,native_id,model,effort FROM agent_runs WHERE session_id=?",
                 [id],
                 |row| {
                     Ok((
@@ -102,6 +140,8 @@ impl Store {
                         row.get(3)?,
                         row.get(4)?,
                         row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
                     ))
                 },
             )
@@ -128,6 +168,8 @@ impl Store {
             mode,
             turn: row.4,
             native_id: row.5,
+            model: row.6,
+            effort: row.7,
         })
     }
 

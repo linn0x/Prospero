@@ -494,6 +494,8 @@ pub fn typescript() -> String {
         crate::terminal::TerminalInput::decl(&config),
         crate::terminal::TerminalSnapshot::decl(&config),
         crate::agent::CreateAgentSession::decl(&config),
+        crate::agent::LaunchModelInfo::decl(&config),
+        crate::agent::LaunchModelCatalog::decl(&config),
         crate::agent::AttachmentInput::decl(&config),
         crate::agent::AgentSend::decl(&config),
         crate::agent::QueuedMessage::decl(&config),

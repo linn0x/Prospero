@@ -247,6 +247,8 @@ pub async fn start_worker(
             title,
             workspace: worker_cwd.clone(),
             auto_approve: false,
+            model: None,
+            effort: None,
         })
         .await
     {

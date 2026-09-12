@@ -126,6 +126,7 @@ impl Api {
             .route("/v1/sessions", get(sessions))
             .route("/v1/skills", get(list_skills_route))
             .route("/v1/accounts", post(list_accounts_route))
+            .route("/v1/launch/models", get(launch_models))
             .route("/v1/sessions/summary", get(summary))
             .route("/v1/sessions/lookup", post(lookup))
             .route("/v1/workspaces", get(workspaces))
@@ -424,6 +425,36 @@ async fn list_accounts_route(
     }
     let result = crate::accounts::list_accounts(&api.database, &input.request_id).await?;
     Ok(Json(result))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LaunchModelsQuery {
+    agent: String,
+    #[serde(default)]
+    account_id: Option<String>,
+}
+
+/// Launch model catalog for the desktop new-session dialog. Only the native
+/// Claude environment exists in this slice; every other agent/account is a
+/// 400 so the desktop never silently shows a stale or fabricated catalog.
+async fn launch_models(
+    State(api): State<Api>,
+    Query(query): Query<LaunchModelsQuery>,
+) -> std::result::Result<Json<crate::agent::LaunchModelCatalog>, ApiError> {
+    if query.agent != "claude"
+        || !matches!(
+            query.account_id.as_deref(),
+            Some(crate::accounts::NATIVE_CLAUDE_ID)
+        )
+    {
+        return Err(ApiError(Error::Invalid(
+            "invalid model catalog agent".into(),
+        )));
+    }
+    let _permit = api.requests.acquire().await.map_err(|_| Error::Closed)?;
+    let catalog = Agents::launch_catalog().await.map_err(ApiError)?;
+    Ok(Json(catalog))
 }
 
 async fn agent_interrupt(

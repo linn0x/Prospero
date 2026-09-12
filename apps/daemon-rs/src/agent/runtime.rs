@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use tokio::sync::{Mutex, MutexGuard, Semaphore, oneshot, watch};
 
-use super::claude::{AdapterEvent, ClaudeTurn, QuestionReply, spawn_turn};
+use super::claude::{AdapterEvent, ClaudeTurn, QuestionReply, TurnOptions, spawn_turn};
 use super::store::{ApprovalPolicy, PermissionMode, QueuedRow};
 use super::*;
 use crate::error::{Error, Result};
@@ -163,6 +163,8 @@ impl Agents {
             title: input.title,
             workspace,
             auto_approve: input.auto_approve,
+            model: input.model,
+            effort: input.effort,
         };
         let head = self
             .0
@@ -378,13 +380,18 @@ impl Agents {
                 .call(move |store| store.append_agent_records(&id, vec![user_write]))
                 .await?;
         }
+        let options = TurnOptions {
+            policy: run.policy,
+            mode: run.mode,
+            model: run.model.clone(),
+            effort: run.effort.clone(),
+        };
         let driver = spawn_turn(
             &workspace,
             &expanded,
             &attachments,
             native_id.as_deref(),
-            run.policy,
-            run.mode,
+            &options,
         )?;
         let handle = Arc::new(Handle {
             driver: Mutex::new(driver),
@@ -1241,6 +1248,17 @@ impl Agents {
         drop(entry);
         self.kick_drain(id).await;
         Ok(())
+    }
+
+    /// Fetch the launch model catalog by speaking the CLI's headless
+    /// `initialize` handshake (no user turn runs). Every request probes the
+    /// CLI fresh, matching the legacy node adapter.
+    pub async fn launch_catalog() -> Result<LaunchModelCatalog> {
+        let models = super::claude::fetch_launch_catalog().await?;
+        Ok(LaunchModelCatalog {
+            current_model: models.first().map(|model| model.id.clone()),
+            models,
+        })
     }
 
     /// Current collaboration mode (`default`/`plan`).
