@@ -350,6 +350,7 @@ async fn timeline_routes_expose_previews_and_generation_checked_body_pages() {
                     },
                     text: "中🦀".repeat(5000),
                     replace: false,
+                    subagent_id: None,
                 },
             )
         })

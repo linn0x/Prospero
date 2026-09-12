@@ -296,6 +296,11 @@ export class RustRuntime {
         return catalog as unknown as JsonObject;
       }
     }
+    const subagentEventsRoute = /^\/_prospero\/control\/session\/([A-Za-z0-9_-]{1,128})\/subagent\/([A-Za-z0-9_-]{1,128})\/events$/.exec(path);
+    if (subagentEventsRoute && (!init?.method || init.method === "GET")) {
+      const snapshot = await this.current().client.subagentEvents(subagentEventsRoute[1]!, subagentEventsRoute[2]!, signal);
+      return snapshot as unknown as JsonObject;
+    }
     if (path === "/_prospero/control/session/create" && init?.method === "POST" && input) {
       if (input["kind"] === "pty") {
         if (input["agent"] !== "shell" || input["command"] || input["accountId"] || input["model"]) throw new Error("Rust 当前支持普通 shell 终端，自定义命令尚未接入");

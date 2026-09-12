@@ -9,7 +9,8 @@ use crate::protocol::*;
 const MAX_POSITION: i64 = 9_007_199_254_740_991;
 const MAX_BODY: i64 = 1024 * 1024 * 1024;
 const PREVIEW_BYTES: usize = 4096;
-const COLUMNS: &str = "r.id,r.turn_id,r.position,r.revision,r.generation,r.body,r.preview,c.bytes";
+const COLUMNS: &str =
+    "r.id,r.turn_id,r.position,r.revision,r.generation,r.body,r.preview,c.bytes,r.subagent_id";
 const SOURCE: &str =
     "timeline_records r JOIN content_heads c ON c.session_id=r.session_id AND c.id=r.id";
 
@@ -30,6 +31,7 @@ fn record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineRecord> {
         truncated: bytes > preview.len() as i64,
         preview,
         bytes,
+        subagent_id: row.get(8)?,
     })
 }
 
@@ -40,6 +42,20 @@ fn preview(mut text: String) -> String {
     }
     text.truncate(end);
     text
+}
+
+/// Agent-generated record ids carry prefixes (`sub-{id}-…`, permission uuids)
+/// and may be longer than the generic 128-char id limit.
+fn validate_record_id(id: &str) -> Result<()> {
+    if id.is_empty()
+        || id.len() > 256
+        || !id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+    {
+        return Err(Error::Invalid("invalid record id".into()));
+    }
+    Ok(())
 }
 
 impl Store {
@@ -104,6 +120,7 @@ impl Store {
                         body,
                         text,
                         replace: false,
+                        subagent_id: None,
                     },
                     encoded,
                     None,
@@ -219,8 +236,11 @@ impl Store {
         self.session(session_id)?;
         let transaction = self.connection.transaction()?;
         for input in writes {
-            validate_id(&input.id)?;
+            validate_record_id(&input.id)?;
             validate_id(&input.turn_id)?;
+            if let Some(subagent) = &input.subagent_id {
+                validate_id(subagent)?;
+            }
             if input.text.len() > CONTENT_CHUNK_BYTES {
                 return Err(Error::Invalid("invalid timeline write".into()));
             }
@@ -228,6 +248,33 @@ impl Store {
                 validate_text(name, 128, false)?;
                 if summary.len() > 2048 {
                     return Err(Error::Invalid("tool summary exceeds limit".into()));
+                }
+            }
+            if let TimelineBody::Subagent {
+                subagent_id,
+                name,
+                role,
+                task,
+                status,
+                summary,
+                ..
+            } = &input.body
+            {
+                if subagent_id != input.subagent_id.as_deref().unwrap_or_default()
+                    && input.subagent_id.is_some()
+                {
+                    return Err(Error::Invalid("subagent identity mismatch".into()));
+                }
+                validate_text(name, 300, false)?;
+                if role.as_deref().is_some_and(|role| role.len() > 300)
+                    || task.as_deref().is_some_and(|task| task.len() > 8000)
+                    || summary.len() > 1000
+                    || !matches!(
+                        status.as_str(),
+                        "starting" | "running" | "idle" | "completed" | "failed" | "stopped"
+                    )
+                {
+                    return Err(Error::Invalid("invalid subagent card".into()));
                 }
             }
             let body = serde_json::to_string(&input.body)?;
@@ -317,7 +364,58 @@ impl Store {
             _ => preview(input.text),
         };
         let revision = input.expected_revision + 1;
-        transaction.execute("INSERT INTO timeline_records(session_id,id,turn_id,position,revision,generation,body,preview) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(session_id,id) DO UPDATE SET revision=excluded.revision,generation=excluded.generation,body=excluded.body,preview=excluded.preview", params![session_id, input.id, input.turn_id, position, revision, generation, body, preview])?;
+        transaction.execute("INSERT INTO timeline_records(session_id,id,turn_id,position,revision,generation,body,preview,subagent_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(session_id,id) DO UPDATE SET revision=excluded.revision,generation=excluded.generation,body=excluded.body,preview=excluded.preview", params![session_id, input.id, input.turn_id, position, revision, generation, body, preview, input.subagent_id])?;
+        if let TimelineBody::Subagent {
+            subagent_id,
+            name,
+            role,
+            task,
+            status,
+            can_message,
+            summary,
+            created_at,
+            updated_at,
+        } = &input.body
+        {
+            // The card doubles as the source of truth for the registry; an
+            // empty synthetic name inherits the previous one (or a numbered
+            // fallback), matching the legacy adapter.
+            let existing_name: Option<String> = transaction
+                .query_row(
+                    "SELECT name FROM agent_subagents WHERE session_id=?1 AND subagent_id=?2",
+                    params![session_id, subagent_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let fallback_name = match existing_name {
+                Some(name) if !name.is_empty() => name,
+                _ => {
+                    let count: i64 = transaction.query_row(
+                        "SELECT count(*) FROM agent_subagents WHERE session_id=?1",
+                        [session_id],
+                        |row| row.get(0),
+                    )?;
+                    format!("Claude 子 Agent {}", count + 1)
+                }
+            };
+            let effective_name = if name.is_empty() {
+                fallback_name
+            } else {
+                name.clone()
+            };
+            transaction.execute(
+                "INSERT INTO agent_subagents(session_id,subagent_id,name,role,task,status,can_message,summary,created_at,updated_at) \
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
+                 ON CONFLICT(session_id,subagent_id) DO UPDATE SET \
+                 name=excluded.name, role=COALESCE(excluded.role,agent_subagents.role), \
+                 task=COALESCE(excluded.task,agent_subagents.task), status=excluded.status, \
+                 can_message=excluded.can_message, \
+                 summary=CASE WHEN excluded.summary<>'' THEN excluded.summary ELSE agent_subagents.summary END, \
+                 updated_at=excluded.updated_at",
+                params![session_id, subagent_id, effective_name, role, task, status,
+                    i64::from(*can_message), summary, created_at, updated_at],
+            )?;
+        }
         Self::append_event(
             transaction,
             &format!("timeline:{session_id}"),
@@ -335,6 +433,7 @@ impl Store {
             preview,
             bytes,
             generation,
+            subagent_id: input.subagent_id,
         })
     }
 
@@ -388,7 +487,7 @@ impl Store {
         } else {
             ("<", "DESC", query.before.unwrap_or(i64::MAX))
         };
-        let mut statement = self.connection.prepare_cached(&format!("SELECT {COLUMNS} FROM {SOURCE} WHERE r.session_id=?1 AND r.position {operator} ?2 ORDER BY r.position {order} LIMIT ?3"))?;
+        let mut statement = self.connection.prepare_cached(&format!("SELECT {COLUMNS} FROM {SOURCE} WHERE r.session_id=?1 AND r.position {operator} ?2 AND r.subagent_id IS NULL ORDER BY r.position {order} LIMIT ?3"))?;
         let mut items = Vec::new();
         let mut bytes = 0;
         for row in statement.query_map(params![session_id, cursor, limit as i64], record)? {
@@ -506,4 +605,172 @@ impl Store {
             generation: head.generation,
         })
     }
+
+    /// Full persisted text of a timeline record (used by the on-demand
+    /// subagent transcript, whose preview may be truncated). Bounded to keep
+    /// a single snapshot response small.
+    fn record_full_text(&self, session_id: &str, id: &str) -> Result<String> {
+        validate_id(session_id)?;
+        validate_record_id(id)?;
+        let mut statement = self.connection.prepare_cached(
+            "SELECT body FROM content_chunks WHERE session_id=?1 AND content_id=?2 ORDER BY offset",
+        )?;
+        let chunks: Vec<Vec<u8>> = statement
+            .query_map(params![session_id, id], |row| row.get::<_, Vec<u8>>(0))?
+            .take(32)
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut data = Vec::new();
+        for chunk in chunks {
+            data.extend(chunk);
+        }
+        let text = String::from_utf8_lossy(&data).into_owned();
+        Ok(text)
+    }
+
+    /// List a session's known Task-tool subagents, newest first.
+    pub fn list_subagents(&self, session_id: &str) -> Result<Vec<crate::agent::SubagentInfo>> {
+        validate_id(session_id)?;
+        let mut statement = self.connection.prepare_cached(
+            "SELECT subagent_id,name,role,task,status,can_message,created_at,updated_at,summary \
+             FROM agent_subagents WHERE session_id=?1 ORDER BY created_at DESC, subagent_id",
+        )?;
+        let rows = statement.query_map([session_id], |row| {
+            let can_message: i64 = row.get(5)?;
+            Ok(crate::agent::SubagentInfo {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                role: row.get(2)?,
+                task: row.get(3)?,
+                status: row.get(4)?,
+                can_message: can_message != 0,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+                preview: row.get::<_, String>(8).ok().filter(|text| !text.is_empty()),
+            })
+        })?;
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(row?);
+        }
+        Ok(items)
+    }
+
+    /// The "查看执行详情" snapshot: metadata plus legacy-shaped chat events
+    /// for everything attributed to the subagent (its own transcript and any
+    /// approval cards that rode along in the main timeline).
+    pub fn subagent_snapshot(
+        &self,
+        session_id: &str,
+        subagent: &str,
+    ) -> Result<crate::agent::SubagentSnapshot> {
+        validate_id(session_id)?;
+        validate_id(subagent)?;
+        let info = self
+            .connection
+            .query_row(
+                "SELECT subagent_id,name,role,task,status,can_message,created_at,updated_at,summary \
+                 FROM agent_subagents WHERE session_id=?1 AND subagent_id=?2",
+                params![session_id, subagent],
+                |row| {
+                    let can_message: i64 = row.get(5)?;
+                    Ok(crate::agent::SubagentInfo {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        role: row.get(2)?,
+                        task: row.get(3)?,
+                        status: row.get(4)?,
+                        can_message: can_message != 0,
+                        created_at: row.get(6)?,
+                        updated_at: row.get(7)?,
+                        preview: row
+                            .get::<_, String>(8)
+                            .ok()
+                            .filter(|text| !text.is_empty()),
+                    })
+                },
+            )
+            .optional()?
+            .ok_or(Error::NotFound)?;
+        let mut statement = self.connection.prepare_cached(&format!(
+            "SELECT {COLUMNS} FROM {SOURCE} WHERE r.session_id=?1 AND (\
+             r.subagent_id=?2 OR (\
+             r.subagent_id IS NULL AND json_extract(r.body,'$.kind')='permission_request' \
+             AND json_extract(r.body,'$.subagent')=?2)) \
+             ORDER BY r.position ASC LIMIT 1000"
+        ))?;
+        let records: Vec<TimelineRecord> = statement
+            .query_map(params![session_id, subagent], record)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut events = Vec::with_capacity(records.len());
+        for item in records {
+            if let Some(event) =
+                subagent_chat_event(&item, &|id| self.record_full_text(session_id, id))
+            {
+                events.push(event);
+            }
+        }
+        let (_, ev_seq) = self.timeline_head(session_id)?;
+        Ok(crate::agent::SubagentSnapshot {
+            subagent: info,
+            events,
+            ev_seq,
+        })
+    }
+}
+
+/// Map one persisted timeline record into the legacy chat-event shape the
+/// renderer's subagent detail pane already understands.
+fn subagent_chat_event(
+    record: &TimelineRecord,
+    full_text: &dyn Fn(&str) -> Result<String>,
+) -> Option<serde_json::Value> {
+    use serde_json::json;
+    let shared = json!({"msgId": record.turn_id, "callId": record.id});
+    let text = full_text(&record.id).unwrap_or_else(|_| record.preview.clone());
+    let event = match &record.body {
+        TimelineBody::Message {
+            role: MessageRole::Assistant,
+            ..
+        } => json!({ "kind": "assistant.text", "text": text }),
+        TimelineBody::Message {
+            role: MessageRole::User,
+            ..
+        } => json!({ "kind": "user.message", "text": text }),
+        TimelineBody::Reasoning => json!({ "kind": "reasoning", "text": text }),
+        TimelineBody::Tool { name, state, .. } => {
+            let running = *state == ToolState::Running;
+            json!({
+                "kind": if running { "tool.start" } else { "tool.end" },
+                "tool": name,
+                "state": match state {
+                    ToolState::Running => "running",
+                    ToolState::Success => "success",
+                    ToolState::Failed => "failed",
+                },
+                "summary": text,
+            })
+        }
+        TimelineBody::PermissionRequest {
+            request_id,
+            tool,
+            resolved,
+            ..
+        } => json!({
+            "kind": "permission.request",
+            "reqId": request_id,
+            "tool": tool,
+            "summary": record.preview,
+            "resolved": resolved,
+        }),
+        TimelineBody::Error => json!({ "kind": "agent.error", "message": record.preview }),
+        // Cards, turn markers and user prompts don't belong in the detail log.
+        TimelineBody::Subagent { .. } | TimelineBody::TurnEnd { .. } => return None,
+    };
+    let mut merged = shared;
+    if let (Some(base), Some(extra)) = (merged.as_object_mut(), event.as_object()) {
+        for (key, value) in extra {
+            base.insert(key.clone(), value.clone());
+        }
+    }
+    Some(merged)
 }

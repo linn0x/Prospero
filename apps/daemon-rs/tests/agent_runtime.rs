@@ -88,6 +88,56 @@ elif scenario == "planflag":
         log.write("\n".join(sys.argv[1:]))
     text_block("planned")
     result()
+elif scenario == "subagent":
+    # Main turn invokes the Task tool; the nested stream is attributed to the
+    # task via parent_tool_use_id, exactly like the real headless CLI.
+    emit({"type": "system", "subtype": "task_started", "task_id": "task-1",
+          "tool_use_id": "toolu_1", "subagent_type": "Explore",
+          "task_type": "search", "description": "find things",
+          "prompt": "search the repo"})
+    emit({"type": "assistant", "message": {"role": "assistant", "content": [
+        {"type": "tool_use", "id": "toolu_1", "name": "Task",
+         "input": {"description": "find things", "prompt": "search the repo"}}]}})
+    emit({"type": "stream_event", "parent_tool_use_id": "toolu_1",
+          "event": {"type": "content_block_start", "index": 0,
+                    "content_block": {"type": "text", "text": ""}}})
+    emit({"type": "stream_event", "parent_tool_use_id": "toolu_1",
+          "event": {"type": "content_block_delta", "index": 0,
+                    "delta": {"type": "text_delta", "text": "subagent whispers"}}})
+    emit({"type": "stream_event", "parent_tool_use_id": "toolu_1",
+          "event": {"type": "content_block_stop", "index": 0}})
+    emit({"type": "assistant", "parent_tool_use_id": "toolu_1",
+          "message": {"role": "assistant", "content": [
+        {"type": "tool_use", "id": "call_sub", "name": "Bash",
+         "input": {"command": "ls"}}]}})
+    emit({"type": "user", "parent_tool_use_id": "toolu_1",
+          "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "call_sub",
+         "is_error": False, "content": "done"}]}})
+    emit({"type": "system", "subtype": "task_progress", "task_id": "task-1",
+          "summary": "halfway"})
+    emit({"type": "system", "subtype": "task_notification", "task_id": "task-1",
+          "status": "completed", "summary": "found things"})
+    emit({"type": "user", "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_1",
+         "is_error": False, "content": "task finished"}]}})
+    result()
+elif scenario == "backgroundtask":
+    # A task without subagent_type (background shell task) is not a subagent:
+    # its attributed stream stays on the main timeline and no card appears.
+    emit({"type": "system", "subtype": "task_started", "task_id": "bg-1",
+          "tool_use_id": "bgtool_1"})
+    emit({"type": "stream_event", "parent_tool_use_id": "bgtool_1",
+          "event": {"type": "content_block_start", "index": 0,
+                    "content_block": {"type": "text", "text": ""}}})
+    emit({"type": "stream_event", "parent_tool_use_id": "bgtool_1",
+          "event": {"type": "content_block_delta", "index": 0,
+                    "delta": {"type": "text_delta", "text": "background output"}}})
+    emit({"type": "stream_event", "parent_tool_use_id": "bgtool_1",
+          "event": {"type": "content_block_stop", "index": 0}})
+    emit({"type": "system", "subtype": "task_notification", "task_id": "bg-1",
+          "status": "completed"})
+    result()
 elif scenario == "hang":
     with open(os.path.join(cwd, "fake.pid"), "w") as pid:
         pid.write(str(os.getpid()))
@@ -528,5 +578,158 @@ async fn plan_mode_is_persisted_and_passed_to_the_cli() {
     assert!(
         !default_args.contains("--permission-mode"),
         "default turn must not carry a permission-mode flag: {default_args:?}"
+    );
+}
+
+#[tokio::test]
+async fn task_tool_subagent_gets_card_and_detail_transcript() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("subagent").await;
+    let head = harness.create().await;
+    harness
+        .agents
+        .send(&head.id, "spawn a worker".into())
+        .await
+        .unwrap();
+
+    let records = harness
+        .wait_for(&head.id, |records| {
+            records.iter().any(|(_, body, _)| {
+                matches!(
+                    body,
+                    TimelineBody::Subagent {
+                        status,
+                        ..
+                    } if status == "completed"
+                )
+            }) && records
+                .iter()
+                .any(|(_, body, _)| matches!(body, TimelineBody::TurnEnd { .. }))
+        })
+        .await;
+
+    // Exactly one subagent card on the main timeline; its transcript is not
+    // projected there.
+    let cards: Vec<_> = records
+        .iter()
+        .filter_map(|(_, body, _)| match body {
+            TimelineBody::Subagent {
+                subagent_id,
+                name,
+                role,
+                status,
+                can_message,
+                summary,
+                ..
+            } => Some((subagent_id, name, role, status, can_message, summary)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cards.len(), 1, "expected a single collapsing card");
+    let (subagent_id, name, role, status, can_message, summary) = cards[0];
+    assert_eq!(subagent_id, "toolu_1");
+    assert_eq!(name, "Explore");
+    assert_eq!(role.as_deref(), Some("search"));
+    assert_eq!(status, "completed");
+    assert!(!can_message);
+    assert_eq!(summary, "found things");
+    assert!(
+        !records.iter().any(
+            |(_, body, preview)| matches!(body, TimelineBody::Message { .. })
+                && preview == "subagent whispers"
+        ),
+        "subagent text must stay off the main timeline"
+    );
+    assert!(
+        !records.iter().any(|(_, body, _)| matches!(
+            body,
+            TimelineBody::Tool { name, .. } if name == "Bash"
+        )),
+        "subagent tool calls must stay off the main timeline"
+    );
+
+    // The detail endpoint returns the attributed transcript as legacy events.
+    let snapshot = harness
+        .agents
+        .subagent_snapshot(&head.id, "toolu_1")
+        .await
+        .unwrap();
+    assert_eq!(snapshot.subagent.id, "toolu_1");
+    assert_eq!(snapshot.subagent.name, "Explore");
+    assert_eq!(snapshot.subagent.status, "completed");
+    let kinds: Vec<(String, String)> = snapshot
+        .events
+        .iter()
+        .map(|event| {
+            (
+                event
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned(),
+                event
+                    .get("text")
+                    .or_else(|| event.get("summary"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned(),
+            )
+        })
+        .collect();
+    assert!(
+        kinds
+            .iter()
+            .any(|(kind, text)| kind == "assistant.text" && text == "subagent whispers"),
+        "detail transcript must include the subagent text: {kinds:?}"
+    );
+    assert!(
+        kinds
+            .iter()
+            .any(|(kind, text)| kind == "tool.end" && text == "done"),
+        "detail transcript must include the subagent tool result: {kinds:?}"
+    );
+
+    // Unknown subagent ids are 404s.
+    assert!(
+        harness
+            .agents
+            .subagent_snapshot(&head.id, "ghost")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn background_task_without_subagent_type_stays_on_main_timeline() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("backgroundtask").await;
+    let head = harness.create().await;
+    harness.agents.send(&head.id, "go".into()).await.unwrap();
+
+    let records = harness
+        .wait_for(&head.id, |records| {
+            records.iter().any(|(_, body, _)| {
+                matches!(
+                    body,
+                    TimelineBody::TurnEnd { finish } if finish == "completed"
+                )
+            })
+        })
+        .await;
+    assert!(
+        records.iter().any(|(_, body, preview)| matches!(
+            body,
+            TimelineBody::Message {
+                role: prosperod_rs::protocol::MessageRole::Assistant,
+                ..
+            }
+        ) && preview == "background output"),
+        "background task output belongs on the main timeline"
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|(_, body, _)| matches!(body, TimelineBody::Subagent { .. })),
+        "background tasks must not create subagent cards"
     );
 }

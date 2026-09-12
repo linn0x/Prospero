@@ -27,6 +27,7 @@ fn write(id: &str, revision: i64, text: &str) -> TimelineWrite {
         },
         text: text.into(),
         replace: false,
+        subagent_id: None,
     }
 }
 

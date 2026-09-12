@@ -96,6 +96,10 @@ impl Api {
                 "/v1/agent-sessions/{id}/modes",
                 get(agent_modes).post(set_agent_mode),
             )
+            .route(
+                "/v1/agent-sessions/{id}/subagents/{subagent}/events",
+                get(agent_subagent_events),
+            )
             .route("/v1/agent-sessions/{id}/interrupt", post(agent_interrupt))
             .route("/v1/agent-sessions/{id}/permission", post(agent_permission))
             .route(
@@ -379,6 +383,16 @@ async fn set_agent_mode(
     };
     api.agents.set_mode(&id, mode).await?;
     Ok(Json(serde_json::json!({ "currentMode": selection.mode })))
+}
+
+async fn agent_subagent_events(
+    State(api): State<Api>,
+    Path((id, subagent)): Path<(String, String)>,
+) -> std::result::Result<Json<crate::agent::SubagentSnapshot>, ApiError> {
+    crate::database::validate_id(&id).map_err(ApiError)?;
+    crate::database::validate_id(&subagent).map_err(ApiError)?;
+    let snapshot = api.agents.subagent_snapshot(&id, &subagent).await?;
+    Ok(Json(snapshot))
 }
 
 async fn agent_permission(

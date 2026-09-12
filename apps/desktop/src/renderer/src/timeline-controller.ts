@@ -104,7 +104,23 @@ export function timelineEvent(record: TimelineRecord): JsonObject {
     case "message": return { ...shared, kind: record.body.role === "user" ? "user.message" : "assistant.text", text: record.preview, phase: record.body.finalAnswer ? "final_answer" : "commentary" };
     case "reasoning": return { ...shared, kind: "reasoning", text: record.preview };
     case "tool": return { ...shared, hasMore: record.bytes > 0, kind: record.body.state === "running" ? "tool.start" : "tool.end", tool: record.body.name, state: record.body.state, summary: record.body.state === "running" ? record.body.summary : (record.body.summary || record.preview) };
-    case "permission_request": return { ...shared, kind: "permission.request", reqId: record.body.requestId, summary: record.preview || record.body.tool, resources: [record.body.tool] };
+    case "permission_request": return { ...shared, kind: "permission.request", reqId: record.body.requestId, summary: record.preview || record.body.tool, resources: [record.body.tool], ...(record.body.subagent ? { agentId: record.body.subagent } : {}) };
+    case "subagent": {
+      // One collapsing card per subagent; the accumulator folds revisions and
+      // re-attaches the full metadata on every poll/reload.
+      const subagent = {
+        id: record.body.subagentId,
+        name: record.body.name,
+        ...(record.body.role ? { role: record.body.role } : {}),
+        ...(record.body.task ? { task: record.body.task } : {}),
+        status: record.body.status,
+        canMessage: record.body.canMessage,
+        createdAt: record.body.createdAt,
+        updatedAt: record.body.updatedAt,
+        ...(record.body.summary ? { preview: record.body.summary } : {}),
+      };
+      return { ...shared, kind: "subagent.started", subagent };
+    }
     case "turn_end": return { ...shared, kind: "turn.end", finish: record.body.finish };
     case "error": return { ...shared, kind: "agent.error", message: record.preview };
   }
