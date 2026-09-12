@@ -1414,7 +1414,7 @@ void app.whenReady().then(async () => {
     // daemon 一就绪就把账号列表灌进 store。以前它只在"账号"页被打开时才填充
     // (setAccounts 的唯一调用点在 account:action 的响应里),于是冷启动后直接去
     // 新建会话,账号下拉框是空的、只有一行"没有可用账号"。
-    if (started.ok && !RUST_BACKEND) void refreshAccounts();
+    if (started.ok) void refreshAccounts();
     // 冒烟测试那一步的名字就是"Start packaged UI and its bundled daemon" ——
     // 跳过启动的话它只验证了一个空壳 UI。daemon 起不来必须让进程非零退出,
     // 由 CI 的退出码来兜;runtime.start() 是等到 /control/health 应答才返回的,

@@ -3,6 +3,7 @@ import type { RustContent } from "../shared/rust-api";
 import type { TimelinePage, TimelineQuery, TimelineLookupResult, TimelineTextQuery, TimelineTextPage } from "@prospero/protocol/rust-daemon";
 import type { CreateTerminal, TerminalPage, TerminalQuery, TerminalSize, TerminalSnapshot } from "@prospero/protocol/rust-daemon";
 import type { AgentSend, AgentModeCatalog, CreateAgentSession, PermissionDecision, QuestionDecision, SubagentSnapshot, AgentQueue, AgentQueues } from "@prospero/protocol/rust-daemon";
+import type { AccountListResult } from "@prospero/protocol/rust-daemon";
 import type {
   AbandonRun, ApplyTaskGraph, CancelTask, CleanupWorktree, CompleteRun, CreateGate,
   CreateRun, CreateRunGraph, CreateTask, Dispatch, Gate, GraphMutationResult, ResolveGate,
@@ -281,5 +282,16 @@ export class RustClient {
   skillSuggestions(sessionId: string, query: string, signal: AbortSignal | null = null): Promise<SkillSuggestion[]> {
     const params = new URLSearchParams({ kind: "skill", query });
     return this.json(`/v1/agent-sessions/${id(sessionId)}/suggestions?${params}`, { signal }).then(page => (page as { items: SkillSuggestion[] }).items);
+  }
+
+  // ── Accounts (read-only native discovery) ───────────────────────────────
+  listAccounts(requestId: string, signal: AbortSignal | null = null, timeoutMs = 15_000): Promise<AccountListResult> {
+    return this.json("/v1/accounts", {
+      method: "POST",
+      signal,
+      timeoutMs,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ type: "agent.accounts.list", requestId }),
+    });
   }
 }

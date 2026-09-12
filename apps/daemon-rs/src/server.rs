@@ -125,6 +125,7 @@ impl Api {
             .route("/v1/terminals/{id}/close", post(terminal_close))
             .route("/v1/sessions", get(sessions))
             .route("/v1/skills", get(list_skills_route))
+            .route("/v1/accounts", post(list_accounts_route))
             .route("/v1/sessions/summary", get(summary))
             .route("/v1/sessions/lookup", post(lookup))
             .route("/v1/workspaces", get(workspaces))
@@ -403,6 +404,26 @@ async fn list_skills_route(
         .await
         .map_err(|_| Error::Closed)?;
     Ok(Json(serde_json::json!({ "items": items })))
+}
+
+// ── Accounts (Stage 8, read-only discovery) ───────────────────────────────
+
+async fn list_accounts_route(
+    State(api): State<Api>,
+    body: std::result::Result<
+        Json<crate::accounts::AccountListRequest>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> JsonResult<crate::accounts::AccountListResult> {
+    let Json(input) = body.map_err(|_| Error::Invalid("invalid account request".into()))?;
+    if input.kind != "agent.accounts.list"
+        || input.request_id.trim().is_empty()
+        || input.request_id.chars().count() > 100
+    {
+        return Err(Error::Invalid("invalid account request".into()).into());
+    }
+    let result = crate::accounts::list_accounts(&api.database, &input.request_id).await?;
+    Ok(Json(result))
 }
 
 async fn agent_interrupt(
