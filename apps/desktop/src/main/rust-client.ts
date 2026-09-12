@@ -2,7 +2,7 @@ import type { ContentPage, EventPage, EventQuery, Health, RenameSession, Session
 import type { RustContent } from "../shared/rust-api";
 import type { TimelinePage, TimelineQuery, TimelineLookupResult, TimelineTextQuery, TimelineTextPage } from "@prospero/protocol/rust-daemon";
 import type { CreateTerminal, TerminalPage, TerminalQuery, TerminalSize, TerminalSnapshot } from "@prospero/protocol/rust-daemon";
-import type { AgentSend, AgentModeCatalog, CreateAgentSession, PermissionDecision } from "@prospero/protocol/rust-daemon";
+import type { AgentSend, AgentModeCatalog, CreateAgentSession, PermissionDecision, SubagentSnapshot } from "@prospero/protocol/rust-daemon";
 import type {
   AbandonRun, ApplyTaskGraph, CancelTask, CleanupWorktree, CompleteRun, CreateGate,
   CreateRun, CreateRunGraph, CreateTask, Dispatch, Gate, GraphMutationResult, ResolveGate,
@@ -104,6 +104,9 @@ export class RustClient {
   }
   setAgentMode(value: string, mode: string, signal: AbortSignal | null = null): Promise<{ currentMode: string }> {
     return this.json(`/v1/agent-sessions/${id(value)}/modes`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ mode }) });
+  }
+  subagentEvents(value: string, subagent: string, signal: AbortSignal | null = null): Promise<SubagentSnapshot> {
+    return this.json(`/v1/agent-sessions/${id(value)}/subagents/${id(subagent)}/events`, { signal });
   }
   agentClose(value: string, signal: AbortSignal | null = null): Promise<{ ok: boolean }> {
     return this.json(`/v1/agent-sessions/${id(value)}`, { method: "DELETE", signal });

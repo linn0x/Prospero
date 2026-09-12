@@ -804,7 +804,7 @@ fn schema_v10_worktree_indexes_survive_reopen() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
     // Stage 7 reverse-edge indexes and Stage 8 worktree indexes all exist.
     let indexed: i64 = connection
         .query_row(
@@ -834,7 +834,7 @@ fn schema_v10_worktree_indexes_survive_reopen() {
 }
 
 #[test]
-fn v8_database_is_migrated_forward_to_v11() {
+fn v8_database_is_migrated_forward_to_v12() {
     // Build a v8 database by initialising the pre-orchestration schema with the
     // legacy application id, then prove Store::open upgrades it in place.
     let directory = TempDir::new().unwrap();
@@ -854,13 +854,13 @@ fn v8_database_is_migrated_forward_to_v11() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
     // The migrated store serves orchestration writes.
     let (_run_id, _ids) = make_run(&mut store, "op-graph-migrated", chain(1));
 }
 
 #[test]
-fn v9_database_is_migrated_forward_to_v11() {
+fn v9_database_is_migrated_forward_to_v12() {
     // A v9 database (Stage 7 current schema) gains the v10 worktree table and
     // dispatch column without losing rows.
     let directory = TempDir::new().unwrap();
@@ -884,7 +884,7 @@ fn v9_database_is_migrated_forward_to_v11() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        11
+        12
     );
     drop(connection);
     let (run_id, ids) = make_run(&mut store, "op-graph-v9up", chain(1));
@@ -902,7 +902,7 @@ fn v9_database_is_migrated_forward_to_v11() {
 }
 
 #[test]
-fn v10_database_is_migrated_forward_to_v11() {
+fn v10_database_is_migrated_forward_to_v12() {
     // A v10 database gains agent_runs.permission_mode with the default mode.
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("prospero.sqlite");
@@ -943,7 +943,7 @@ fn v10_database_is_migrated_forward_to_v11() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        11
+        12
     );
     let mode: String = connection
         .query_row(
@@ -953,6 +953,100 @@ fn v10_database_is_migrated_forward_to_v11() {
         )
         .unwrap();
     assert_eq!(mode, "default");
+    drop(connection);
+    drop(store);
+}
+
+#[test]
+fn v11_database_is_migrated_forward_to_v12() {
+    // A v11 database gains the subagent registry table and the timeline
+    // subagent_id column without losing the existing agent run.
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("prospero.sqlite");
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(include_str!("../src/schema.sql"))
+            .unwrap();
+        connection
+            .execute_batch(include_str!("../src/orchestration/schema.sql"))
+            .unwrap();
+        connection
+            .execute_batch(include_str!("../src/orchestration/schema-v10.sql"))
+            .unwrap();
+        connection
+            .execute_batch(include_str!("../src/agent/schema-v11.sql"))
+            .unwrap();
+        connection
+            .pragma_update(None, "application_id", 0x50525253i64)
+            .unwrap();
+        connection.pragma_update(None, "user_version", 11).unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_heads \
+                 (id,created_at,lifecycle,revision,payload) \
+                 VALUES('sess-sub',1,'active',1,json('{\"workspace\":\"/w\",\"agent\":\"claude\",\"kind\":\"structured\",\"title\":\"A\",\"status\":\"idle\"}'))",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO agent_runs(session_id,agent,active,approval_policy,permission_mode,turn,native_id) \
+                 VALUES('sess-sub','claude',1,'manual','plan',2,'native-x')",
+                [],
+            )
+            .unwrap();
+    }
+    let store = Store::open(directory.path()).unwrap();
+    let connection = raw(&directory);
+    assert_eq!(
+        connection
+            .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap(),
+        12
+    );
+    // The run row and its v11 fields survived.
+    let (mode, turn, native): (String, i64, Option<String>) = connection
+        .query_row(
+            "SELECT permission_mode,turn,native_id FROM agent_runs WHERE session_id='sess-sub'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(mode, "plan");
+    assert_eq!(turn, 2);
+    assert_eq!(native.as_deref(), Some("native-x"));
+    // The new column and registry table are usable post-migration.
+    connection
+        .execute(
+            "INSERT INTO content_heads(session_id,id,bytes) VALUES('sess-sub','card-toolu',0)",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO timeline_records \
+             (session_id,id,turn_id,position,revision,generation,body,preview,subagent_id) \
+             VALUES('sess-sub','card-toolu','turn1',1,1,1,'{}','','toolu')",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO agent_subagents \
+             (session_id,subagent_id,name,status,can_message,summary,created_at,updated_at) \
+             VALUES('sess-sub','toolu','Explore','running',1,'looking',3,4)",
+            [],
+        )
+        .unwrap();
+    let count: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM agent_subagents WHERE session_id='sess-sub' AND status='running'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
     drop(connection);
     drop(store);
 }

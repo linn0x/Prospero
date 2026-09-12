@@ -23,7 +23,12 @@ export type ContentHead = { id: string, bytes: number, };
 export type ContentPage = { items: Array<ContentHead>, nextCursor: string | null, hasMore: boolean, };
 export type MessageRole = "user" | "assistant";
 export type ToolState = "running" | "success" | "failed";
-export type TimelineBody = { "kind": "message", role: MessageRole, finalAnswer: boolean, } | { "kind": "reasoning" } | { "kind": "tool", name: string, state: ToolState, summary: string, } | { "kind": "permission_request", requestId: string, tool: string, resolved: boolean, } | { "kind": "turn_end", finish: string, } | { "kind": "error" };
+export type TimelineBody = { "kind": "message", role: MessageRole, finalAnswer: boolean, } | { "kind": "reasoning" } | { "kind": "tool", name: string, state: ToolState, summary: string, } | { "kind": "permission_request", requestId: string, tool: string, resolved: boolean, 
+/**
+ * Set when the approval belongs to a Task-tool subagent; the event
+ * still shows on the main timeline so it can be answered there.
+ */
+subagent: string | null, } | { "kind": "turn_end", finish: string, } | { "kind": "subagent", subagentId: string, name: string, role: string | null, task: string | null, status: string, canMessage: boolean, summary: string, createdAt: number, updatedAt: number, } | { "kind": "error" };
 export type TimelineRecord = { id: string, turnId: string, position: number, revision: number, body: TimelineBody, preview: string, bytes: number, generation: number, truncated: boolean, };
 export type TimelineWrite = { id: string, turnId: string, expectedRevision: number, body: TimelineBody, text: string, replace: boolean, };
 export type TimelineQuery = { before: number | null, after: number | null, limit: number | null, };
@@ -44,6 +49,8 @@ export type PermissionDecision = { requestId: string, allow: boolean, };
 export type AgentModeSelection = { mode: string, };
 export type AgentModeCatalog = { modes: Array<AgentModeEntry>, currentMode: string, };
 export type AgentModeEntry = { id: string, label: string, description: string, };
+export type SubagentInfo = { id: string, name: string, role: string | null, task: string | null, status: string, canMessage: boolean, createdAt: number, updatedAt: number, preview: string | null, };
+export type SubagentSnapshot = { subagent: SubagentInfo, events: Array<Record<string, unknown>>, evSeq: number, };
 export type RunStatus = "active" | "completed" | "abandoned";
 export type TaskStatus = "pending" | "dispatched" | "blocked" | "done" | "failed" | "cancelled";
 export type DispatchState = "starting" | "running" | "succeeded" | "failed" | "abandoned";
