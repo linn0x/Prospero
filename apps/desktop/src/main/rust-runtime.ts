@@ -23,6 +23,17 @@ function toQueuedChat(item: QueuedMessage): QueuedChatMessage {
   return { id: item.id, text: item.text, kind: item.kind === "guide" ? "guide" : "queue", createdAt: item.createdAt, attachmentCount: item.attachmentCount ?? 0 };
 }
 
+/** Validates the launch dialog's model/effort selection, mirroring the
+ * daemon's store-side normalize_selection (model <= 160, effort <= 80). */
+function normalizeLaunchSelection(raw: unknown, maximum: number, message: string): string | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "string") throw new Error(message);
+  if ([...raw].length > maximum || [...raw].some((char) => /\p{C}/u.test(char))) throw new Error(message);
+  const value = raw.trim();
+  if (!value) throw new Error(message);
+  return value;
+}
+
 /** Mirror of the Rust daemon's attachment contract (validate_message). */
 function normalizeAttachments(raw: unknown): AttachmentInput[] {
   if (raw === undefined || raw === null) return [];
@@ -359,6 +370,17 @@ export class RustRuntime {
       const snapshot = await this.current().client.subagentEvents(subagentEventsRoute[1]!, subagentEventsRoute[2]!, signal);
       return snapshot as unknown as JsonObject;
     }
+    const launchModelsRoute = /^\/_prospero\/control\/launch\/models(?:\?(.*))?$/.exec(path);
+    if (launchModelsRoute && (!init?.method || init.method === "GET")) {
+      const params = new URLSearchParams(launchModelsRoute[1] ?? "");
+      const agent = params.get("agent");
+      const accountId = params.get("accountId") ?? undefined;
+      // Only the native Claude account is wired in this slice; the daemon
+      // rejects anything else, but fail here with the local message too.
+      if (agent !== "claude" || accountId !== NATIVE_CLAUDE_ACCOUNT) throw new Error("此 Agent 的模型目录尚未接入 Rust daemon");
+      const catalog = await this.current().client.launchModels(signal, init?.timeoutMs);
+      return catalog as unknown as JsonObject;
+    }
     if (path === "/_prospero/control/session/create" && init?.method === "POST" && input) {
       if (input["kind"] === "pty") {
         if (input["agent"] !== "shell" || input["command"] || input["accountId"] || input["model"]) throw new Error("Rust 当前支持普通 shell 终端，自定义命令尚未接入");
@@ -368,13 +390,17 @@ export class RustRuntime {
       }
       if (input["agent"] !== "claude") throw new Error("Rust Agent 当前仅接入 Claude Code");
       if (input["accountId"] !== undefined && input["accountId"] !== NATIVE_CLAUDE_ACCOUNT) throw new Error("此账号尚未接入 Rust daemon");
-      if (input["kind"] !== "structured" || input["command"] || input["model"] || input["mode"] || input["effort"]) throw new Error("此 Agent 选项尚未接入 Rust daemon");
+      if (input["kind"] !== "structured" || input["command"] || input["mode"]) throw new Error("此 Agent 选项尚未接入 Rust daemon");
+      const model = normalizeLaunchSelection(input["model"], 160, "模型无效");
+      const effort = normalizeLaunchSelection(input["effort"], 80, "推理强度无效");
       const policy = input["approvalPolicy"];
       if (policy !== "strict" && policy !== "standard" && policy !== "yolo") throw new Error("审批策略无效");
       const head = await this.current().client.createAgentSession({
         title: "Claude",
         workspace: String(input["cwd"]),
         autoApprove: policy === "yolo",
+        ...(model !== undefined ? { model } : {}),
+        ...(effort !== undefined ? { effort } : {}),
       }, signal);
       await this.refresh(true);
       return rustSessionInfo(head);

@@ -110,6 +110,144 @@ fn binary() -> String {
     std::env::var("PROSPERO_CLAUDE_BIN").unwrap_or_else(|_| "claude".into())
 }
 
+/// Bounded time for the catalog-only `initialize` handshake.
+const CATALOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Mirrors the status-probe output cap.
+const CATALOG_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Fetches the launch model catalog without running a user turn: a headless
+/// CLI process is started, sent a single `initialize` control request, and
+/// shut down after reading its `control_response`. This is the same handshake
+/// the official SDK performs before streaming (`supportedModels()`).
+pub(super) async fn fetch_launch_catalog() -> Result<Vec<crate::agent::LaunchModelInfo>> {
+    let mut child = Command::new(binary())
+        .args([
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--verbose",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| Error::Invalid("Claude CLI 不可用".into()))?;
+    let mut stdin = child.stdin.take().ok_or(Error::Closed)?;
+    let stdout = child.stdout.take().ok_or(Error::Closed)?;
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let frame = serde_json::json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": {"subtype": "initialize"}
+    })
+    .to_string();
+    stdin
+        .write_all(frame.as_bytes())
+        .await
+        .map_err(|_| Error::Invalid("Claude CLI 不可用".into()))?;
+    stdin.write_all(b"\n").await.ok();
+    stdin.flush().await.ok();
+    drop(stdin);
+
+    let read = async {
+        let mut lines = BufReader::new(stdout).lines();
+        let mut total = 0usize;
+        while let Some(line) = lines.next_line().await.map_err(|_| Error::Closed)? {
+            total += line.len() + 1;
+            if total > CATALOG_MAX_BYTES {
+                return Err(Error::Invalid("Claude 模型目录响应过大".into()));
+            }
+            let Ok(message) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if message.get("type").and_then(Value::as_str) != Some("control_response") {
+                continue;
+            }
+            let envelope = message
+                .get("response")
+                .ok_or_else(|| Error::Invalid("无法读取 Claude 模型目录".into()))?;
+            if envelope.get("subtype").and_then(Value::as_str) != Some("success")
+                || envelope.get("request_id").and_then(Value::as_str) != Some(&request_id)
+            {
+                // An error envelope (or a reply to a different request) cannot
+                // carry the catalog; keep scanning in case frames reordered.
+                continue;
+            }
+            let payload = envelope
+                .get("response")
+                .ok_or_else(|| Error::Invalid("无法读取 Claude 模型目录".into()))?;
+            let raw_models = payload
+                .get("models")
+                .and_then(Value::as_array)
+                .ok_or_else(|| Error::Invalid("Claude 没有返回可选模型".into()))?;
+            let mut models = Vec::new();
+            for (index, raw) in raw_models.iter().enumerate() {
+                let id = raw
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if id.is_empty() || id.chars().count() > 160 {
+                    continue;
+                }
+                let label = raw
+                    .get("displayName")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(&id)
+                    .chars()
+                    .take(160)
+                    .collect::<String>();
+                let description = raw
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(|value| value.chars().take(1000).collect::<String>());
+                let supported_efforts = raw
+                    .get("supportedEffortLevels")
+                    .and_then(Value::as_array)
+                    .map(|levels| {
+                        levels
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(|level| level.chars().take(80).collect::<String>())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                models.push(crate::agent::LaunchModelInfo {
+                    id,
+                    label,
+                    description,
+                    supported_efforts,
+                    is_default: index == 0,
+                });
+            }
+            if models.is_empty() {
+                return Err(Error::Invalid("Claude 没有返回可选模型".into()));
+            }
+            return Ok(models);
+        }
+        Err(Error::Invalid("无法读取 Claude 模型目录".into()))
+    };
+
+    match tokio::time::timeout(CATALOG_TIMEOUT, read).await {
+        Ok(Ok(models)) => {
+            child.kill().await.ok();
+            Ok(models)
+        }
+        Ok(Err(error)) => {
+            child.kill().await.ok();
+            Err(error)
+        }
+        Err(_) => {
+            child.kill().await.ok();
+            Err(Error::Invalid("读取 Claude 模型目录超时".into()))
+        }
+    }
+}
+
 #[cfg(unix)]
 fn kill_process_group(pid: u32) {
     unsafe {
@@ -123,13 +261,20 @@ fn kill_process_group(pid: u32) {
     let _ = pid;
 }
 
+/// Per-turn CLI selections persisted on the session run.
+pub(super) struct TurnOptions {
+    pub(super) policy: ApprovalPolicy,
+    pub(super) mode: PermissionMode,
+    pub(super) model: Option<String>,
+    pub(super) effort: Option<String>,
+}
+
 pub(super) fn spawn_turn(
     workspace: &str,
     prompt: &str,
     attachments: &[crate::agent::AttachmentInput],
     native_id: Option<&str>,
-    policy: ApprovalPolicy,
-    mode: PermissionMode,
+    options: &TurnOptions,
 ) -> Result<ClaudeTurn> {
     let mut command = Command::new(binary());
     command
@@ -152,9 +297,15 @@ pub(super) fn spawn_turn(
     if let Some(id) = native_id {
         command.arg(format!("--resume={id}"));
     }
-    if mode == PermissionMode::Plan {
+    if options.mode == PermissionMode::Plan {
         // Plan mode: the CLI investigates and plans but does not apply edits.
         command.args(["--permission-mode", "plan"]);
+    }
+    if let Some(model) = &options.model {
+        command.args(["--model", model]);
+    }
+    if let Some(effort) = &options.effort {
+        command.args(["--effort", effort]);
     }
     #[cfg(unix)]
     unsafe {
@@ -200,7 +351,7 @@ pub(super) fn spawn_turn(
     });
 
     // Read and translate the JSONL stream.
-    let auto = policy == ApprovalPolicy::Auto;
+    let auto = options.policy == ApprovalPolicy::Auto;
     let reader_writer = frames_tx.clone();
     tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();

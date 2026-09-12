@@ -122,6 +122,11 @@ elif scenario == "planflag":
         log.write("\n".join(sys.argv[1:]))
     text_block("planned")
     result()
+elif scenario == "modelflag":
+    with open(os.path.join(cwd, "args.log"), "a") as log:
+        log.write("\n".join(sys.argv[1:]) + "\n--\n")
+    text_block("picked model")
+    result()
 elif scenario == "subagent":
     # Main turn invokes the Task tool; the nested stream is attributed to the
     # task via parent_tool_use_id, exactly like the real headless CLI.
@@ -270,6 +275,8 @@ impl Harness {
                 title: "Agent test".into(),
                 workspace: self.workspace.path().to_str().unwrap().into(),
                 auto_approve: false,
+                model: None,
+                effort: None,
             })
             .await
             .unwrap()
@@ -783,6 +790,8 @@ async fn recovery_archives_active_run_without_replaying_turn() {
             title: "Recovery".into(),
             workspace: workspace.path().to_str().unwrap().into(),
             auto_approve: false,
+            model: None,
+            effort: None,
         })
         .await
         .unwrap();
@@ -891,6 +900,97 @@ async fn plan_mode_is_persisted_and_passed_to_the_cli() {
         !default_args.contains("--permission-mode"),
         "default turn must not carry a permission-mode flag: {default_args:?}"
     );
+}
+
+#[tokio::test]
+async fn launch_model_and_effort_are_passed_on_every_turn() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("modelflag").await;
+    let head = harness
+        .agents
+        .create(CreateAgentSession {
+            title: "Model pick".into(),
+            workspace: harness.workspace.path().to_str().unwrap().into(),
+            auto_approve: false,
+            model: Some("opus[1m]".into()),
+            effort: Some("high".into()),
+        })
+        .await
+        .unwrap();
+    harness
+        .agents
+        .send(&head.id, "first".into(), None, Vec::new())
+        .await
+        .unwrap();
+    harness
+        .wait_for(&head.id, |records| {
+            records.iter().any(|(_, body, _)| {
+                matches!(
+                    body,
+                    TimelineBody::TurnEnd { finish } if finish == "completed"
+                )
+            })
+        })
+        .await;
+    // The chained, resumed turn must carry the same launch selection.
+    harness
+        .agents
+        .send(&head.id, "second".into(), None, Vec::new())
+        .await
+        .unwrap();
+    harness
+        .wait_for(&head.id, |records| {
+            records
+                .iter()
+                .filter(|(_, body, _)| matches!(body, TimelineBody::TurnEnd { .. }))
+                .count()
+                == 2
+        })
+        .await;
+    let args = std::fs::read_to_string(harness.workspace.path().join("args.log")).unwrap();
+    let invocations: Vec<&str> = args
+        .split("--\n")
+        .filter(|part| !part.trim().is_empty())
+        .collect();
+    assert_eq!(invocations.len(), 2, "expected two logged turns: {args:?}");
+    for invocation in invocations {
+        let argv: Vec<&str> = invocation.lines().collect();
+        assert!(
+            argv.windows(2).any(|pair| pair == ["--model", "opus[1m]"]),
+            "turn must carry --model: {argv:?}"
+        );
+        assert!(
+            argv.windows(2).any(|pair| pair == ["--effort", "high"]),
+            "turn must carry --effort: {argv:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn invalid_launch_selection_is_rejected() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("chat").await;
+    for (index, (model, effort)) in [
+        (Some(" ".into()), None),
+        (Some("x".repeat(161)), None),
+        (None, Some("high\n".into())),
+        (None, Some("x".repeat(81))),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let result = harness
+            .agents
+            .create(CreateAgentSession {
+                title: "Bad selection".into(),
+                workspace: harness.workspace.path().to_str().unwrap().into(),
+                auto_approve: false,
+                model,
+                effort,
+            })
+            .await;
+        assert!(result.is_err(), "case {index} must be rejected");
+    }
 }
 
 #[tokio::test]

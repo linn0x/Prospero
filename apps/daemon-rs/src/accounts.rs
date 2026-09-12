@@ -31,10 +31,7 @@ pub enum AccountStatus {
     Error,
 }
 
-/// Legacy AgentAccountCapabilities contract. modelSelection/reasoningEffort are
-/// false for now: the Rust daemon does not serve a launch-model catalog yet, so
-/// the desktop hides the model/effort switchers instead of hitting an
-/// unimplemented endpoint.
+/// Legacy AgentAccountCapabilities contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[ts(rename_all = "camelCase")]
@@ -103,9 +100,9 @@ fn native_capabilities() -> AccountCapabilities {
         ],
         plan: true,
         resume: true,
-        // Launch-model/effort catalogs are a later slice.
-        model_selection: false,
-        reasoning_effort: false,
+        // GET /v1/launch/models serves the headless CLI catalog.
+        model_selection: true,
+        reasoning_effort: true,
     }
 }
 
