@@ -46,7 +46,7 @@ fn preview(mut text: String) -> String {
 
 /// Agent-generated record ids carry prefixes (`sub-{id}-…`, permission uuids)
 /// and may be longer than the generic 128-char id limit.
-fn validate_record_id(id: &str) -> Result<()> {
+pub(crate) fn validate_record_id(id: &str) -> Result<()> {
     if id.is_empty()
         || id.len() > 256
         || !id

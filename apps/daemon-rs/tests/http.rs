@@ -4,7 +4,7 @@ use futures_util::StreamExt;
 use prosperod_rs::agent::CreateAgentSession as CreateAgentRun;
 use prosperod_rs::auth::Token;
 use prosperod_rs::protocol::{
-    AgentKind, CreateSession, MessageRole, SessionKind, TimelineBody, TimelineWrite,
+    AgentKind, CreateSession, MessageRole, SessionKind, TimelineBody, TimelineWrite, ToolState,
 };
 use prosperod_rs::server::Api;
 use prosperod_rs::worker::Database;
@@ -65,6 +65,7 @@ async fn every_endpoint_requires_auth_and_rejects_browser_origins() {
         "/v1/terminals/example/input",
         "/v1/terminals/example/resize",
         "/v1/terminals/example/close",
+        "/v1/agent-sessions/example/tool-output?callId=call_1",
         "/v1/events?scope=sessions",
         "/unknown",
     ] {
@@ -98,6 +99,50 @@ async fn every_endpoint_requires_auth_and_rejects_browser_origins() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    api.database.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn tool_output_route_returns_persisted_tool_text() {
+    let (_directory, api, id) = fixture().await;
+    let session_id = id.clone();
+    api.database
+        .call(move |store| {
+            store.write_timeline(
+                &session_id,
+                TimelineWrite {
+                    id: "call_1".into(),
+                    turn_id: "turn1".into(),
+                    expected_revision: 0,
+                    body: TimelineBody::Tool {
+                        name: "Bash".into(),
+                        state: ToolState::Success,
+                        summary: "preview".into(),
+                    },
+                    text: "full tool output".into(),
+                    replace: false,
+                    subagent_id: None,
+                },
+            )
+        })
+        .await
+        .unwrap();
+    let response = api
+        .router()
+        .oneshot(
+            request(&format!(
+                "/v1/agent-sessions/{id}/tool-output?callId=call_1"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        body(response).await,
+        json!({"output":"full tool output","truncated":false})
+    );
     api.database.shutdown().await.unwrap();
 }
 
