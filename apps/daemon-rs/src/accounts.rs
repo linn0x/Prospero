@@ -395,6 +395,19 @@ async fn probe_auth_status(environment: &[(String, String)]) -> AuthProbe {
     }
 }
 
+#[allow(dead_code)]
+pub(crate) fn source_bound_launch_error(
+    database: &Database,
+    account_id: &str,
+) -> Result<Option<String>> {
+    let sources = sources::ModelSources::open(database.directory())?;
+    Ok(if sources.allows_new_sessions(account_id) {
+        None
+    } else {
+        Some("模型源或模型已停用，无法创建新会话".into())
+    })
+}
+
 fn profile_capabilities() -> AccountCapabilities {
     AccountCapabilities {
         session_kinds: vec![
