@@ -5,6 +5,7 @@
 //! Nothing here touches the user's shared CLI home or native Keychain:
 //! logout deletes only the private credential file.
 
+pub(crate) mod config;
 pub(crate) mod managed;
 pub(crate) mod models;
 pub(crate) mod probe;
@@ -185,6 +186,26 @@ pub(crate) enum AccountControl {
         api_key: Option<String>,
         headers: Option<serde_json::Value>,
     },
+    #[serde(rename = "agent.account.config.get")]
+    ConfigGet {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "accountId")]
+        account_id: String,
+    },
+    #[serde(rename = "agent.account.config.set")]
+    ConfigSet {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "accountId")]
+        account_id: String,
+        #[serde(rename = "documentId")]
+        document_id: String,
+        revision: String,
+        content: Option<String>,
+        #[serde(rename = "defaultEffort", default)]
+        default_effort: Option<Option<String>>,
+    },
     #[serde(rename = "agent.account.rename")]
     Rename {
         #[serde(rename = "requestId")]
@@ -244,6 +265,8 @@ impl AccountControl {
             | AccountControl::ApiConfigure { request_id, .. }
             | AccountControl::ApiTest { request_id, .. }
             | AccountControl::ApiModelsGet { request_id, .. }
+            | AccountControl::ConfigGet { request_id, .. }
+            | AccountControl::ConfigSet { request_id, .. }
             | AccountControl::Rename { request_id, .. }
             | AccountControl::SetDefault { request_id, .. }
             | AccountControl::Login { request_id, .. }
@@ -260,9 +283,8 @@ impl AccountControl {
             AccountControl::ApiCreate { .. } => "api_create",
             AccountControl::ApiConfigure { .. } => "api_configure",
             AccountControl::ApiTest { .. } => "api_test",
-            // The models feature returns a dedicated result envelope, not an
-            // account snapshot; the action label is never read for it.
             AccountControl::ApiModelsGet { .. } => "api_models",
+            AccountControl::ConfigGet { .. } | AccountControl::ConfigSet { .. } => "config",
             AccountControl::Rename { .. } => "rename",
             AccountControl::SetDefault { .. } => "default",
             AccountControl::Login { .. } => "login",
@@ -280,6 +302,8 @@ impl AccountControl {
                 account_id: Some(account_id),
                 ..
             }
+            | AccountControl::ConfigGet { account_id, .. }
+            | AccountControl::ConfigSet { account_id, .. }
             | AccountControl::Rename { account_id, .. }
             | AccountControl::SetDefault { account_id, .. }
             | AccountControl::Login { account_id, .. }
@@ -712,9 +736,12 @@ pub(crate) async fn execute_control(
                 .await?;
             Ok(Some(record))
         }
-        AccountControl::ApiTest { .. } | AccountControl::ApiModelsGet { .. } => Err(
-            crate::error::Error::Invalid("api test/models require the HTTP runtime".into()),
-        ),
+        AccountControl::ApiTest { .. }
+        | AccountControl::ApiModelsGet { .. }
+        | AccountControl::ConfigGet { .. }
+        | AccountControl::ConfigSet { .. } => Err(crate::error::Error::Invalid(
+            "api features require the HTTP runtime".into(),
+        )),
         AccountControl::Rename {
             account_id, name, ..
         } => {
