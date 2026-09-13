@@ -125,6 +125,10 @@ impl Api {
                 "/v1/agent-sessions/{id}/subagents/{subagent}/events",
                 get(agent_subagent_events),
             )
+            .route(
+                "/v1/agent-sessions/{id}/subagents/{subagent}/send",
+                post(agent_subagent_send),
+            )
             .route("/v1/agent-sessions/{id}/interrupt", post(agent_interrupt))
             .route("/v1/agent-sessions/{id}/compact", post(agent_compact))
             .route(
@@ -1666,6 +1670,26 @@ async fn agent_subagent_events(
     crate::database::validate_id(&subagent).map_err(ApiError)?;
     let snapshot = api.agents.subagent_snapshot(&id, &subagent).await?;
     Ok(Json(snapshot))
+}
+
+async fn agent_subagent_send(
+    State(api): State<Api>,
+    Path((id, subagent)): Path<(String, String)>,
+    body: std::result::Result<Json<AgentSend>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    crate::database::validate_id(&id).map_err(ApiError)?;
+    crate::database::validate_id(&subagent).map_err(ApiError)?;
+    let Json(input) = body.map_err(|_| Error::Invalid("invalid agent message".into()))?;
+    if !input.attachments.is_empty() || input.delivery.is_some() {
+        return Err(ApiError(Error::Invalid(
+            "子 Agent 定向消息暂不支持附件或 delivery".into(),
+        )));
+    }
+    api.agents
+        .send_to_subagent(&id, &subagent, input.text)
+        .await?;
+    api.publish();
+    Ok(Json(serde_json::json!({"ok":true})))
 }
 
 async fn session_workspace(api: &Api, id: &str) -> Result<std::path::PathBuf> {

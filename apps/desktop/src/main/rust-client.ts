@@ -169,6 +169,9 @@ export class RustClient {
   subagentEvents(value: string, subagent: string, signal: AbortSignal | null = null): Promise<SubagentSnapshot> {
     return this.json(`/v1/agent-sessions/${id(value)}/subagents/${id(subagent)}/events`, { signal });
   }
+  agentSubagentSend(value: string, subagent: string, input: AgentSend, signal: AbortSignal | null = null): Promise<{ ok: boolean }> {
+    return this.json(`/v1/agent-sessions/${id(value)}/subagents/${id(subagent)}/send`, { method: "POST", body: JSON.stringify(input), signal });
+  }
   agentClose(value: string, signal: AbortSignal | null = null): Promise<{ ok: boolean }> {
     return this.json(`/v1/agent-sessions/${id(value)}`, { method: "DELETE", signal });
   }
