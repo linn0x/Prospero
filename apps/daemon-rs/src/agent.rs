@@ -9,7 +9,7 @@ use ts_rs::TS;
 use crate::error::{Error, Result};
 
 pub use runtime::Agents;
-pub use store::PermissionMode;
+pub use store::{ApprovalPolicy, PermissionMode};
 
 #[derive(Debug, Deserialize, Serialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -303,6 +303,13 @@ pub struct AgentControlResult {
 #[ts(rename_all = "camelCase")]
 pub struct AgentCompactRequest {
     pub request_id: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct ApprovalPolicySelection {
+    pub policy: String,
 }
 
 /// In-session model catalog (mirrors the legacy `agent.models` payload):
