@@ -70,6 +70,8 @@ async fn health_capabilities_are_explicitly_local_http_not_mobile_ws() {
         "agent.api-validation.v1",
         "agent.account.api.models",
         "agent.account.config",
+        "conversation.search.v1",
+        "chat.attachment-previews.v1",
         "model.sources.v1",
     ] {
         assert!(

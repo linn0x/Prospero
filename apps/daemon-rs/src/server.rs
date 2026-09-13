@@ -350,6 +350,8 @@ async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, Api
             "agent.account.config",
             "agent.api-validation.v1",
             "agent.api-protocols.v1",
+            "conversation.search.v1",
+            "chat.attachment-previews.v1",
             "model.sources.v1",
             "session.workspace.summary",
             "session.fs",
