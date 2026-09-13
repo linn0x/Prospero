@@ -358,6 +358,11 @@ for line in sys.stdin:
             reply = json.loads(sys.stdin.readline())
             with open(os.path.join(os.getcwd(), "question-response.json"), "w") as log:
                 log.write(json.dumps(reply))
+        if scenario == "codexsubagent":
+            emit({"jsonrpc": "2.0", "method": "item/started", "params": {"threadId": params.get("threadId"), "item": {"id": "collab-1", "type": "collabAgentToolCall", "receiverThreadId": "sub-thread-1", "prompt": "inspect repo"}}})
+            emit({"jsonrpc": "2.0", "method": "thread/started", "params": {"threadId": "sub-thread-1", "thread": {"id": "sub-thread-1", "parentThreadId": params.get("threadId"), "agentNickname": "Scout", "agentRole": "Explore", "preview": "inspect repo", "status": "running"}}})
+            emit({"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": {"threadId": "sub-thread-1", "itemId": "sub-msg-1", "delta": "subagent says hi"}})
+            emit({"jsonrpc": "2.0", "method": "item/completed", "params": {"threadId": params.get("threadId"), "item": {"id": "collab-1", "type": "collabAgentToolCall", "status": "completed", "receiverThreadId": "sub-thread-1"}}})
         emit({"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": {"threadId": params.get("threadId"), "itemId": "msg-1", "delta": "hello "}})
         emit({"jsonrpc": "2.0", "method": "item/reasoning/textDelta", "params": {"threadId": params.get("threadId"), "itemId": "think-1", "delta": "thinking"}})
         emit({"jsonrpc": "2.0", "method": "item/completed", "params": {"threadId": params.get("threadId"), "item": {"id": "msg-1", "type": "agentMessage", "text": "hello from fake codex"}}})
@@ -751,6 +756,66 @@ async fn codex_question_roundtrip_responds_to_app_server() {
     assert_eq!(response["id"], "question-req");
     assert_eq!(response["result"]["answers"]["q1"]["answers"][0], "A");
     assert_eq!(response["result"]["answers"]["q1"]["answers"][1], "custom");
+}
+
+#[tokio::test]
+async fn codex_collab_agent_events_create_subagent_timeline() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("codexsubagent").await;
+    let cli = harness.workspace.path().join("fake-codex.py");
+    std::fs::write(&cli, FAKE_CODEX).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    unsafe {
+        std::env::set_var("PROSPERO_CODEX_BIN", &cli);
+    }
+    let head = harness.create_codex().await;
+    harness
+        .agents
+        .send(&head.id, "spawn codex subagent".into(), None, Vec::new())
+        .await
+        .unwrap();
+
+    let records = harness
+        .wait_for(&head.id, |records| {
+            records.iter().any(|(_, body, _)| {
+                matches!(body, TimelineBody::TurnEnd { finish } if finish == "completed")
+            })
+        })
+        .await;
+    assert!(records.iter().any(|(_, body, _)| matches!(
+        body,
+        TimelineBody::Subagent {
+            subagent_id,
+            name,
+            status,
+            ..
+        } if subagent_id == "sub-thread-1" && name == "Scout" && status == "completed"
+    )));
+    assert!(
+        !records.iter().any(|(_, body, preview)| matches!(
+            body,
+            TimelineBody::Message {
+                role: prosperod_rs::protocol::MessageRole::Assistant,
+                ..
+            }
+        ) && preview == "subagent says hi"),
+        "subagent transcript stays collapsed behind the card"
+    );
+    let detail = harness
+        .agents
+        .subagent_snapshot(&head.id, "sub-thread-1")
+        .await
+        .unwrap();
+    assert!(
+        detail
+            .events
+            .iter()
+            .any(|event| event.to_string().contains("subagent says hi"))
+    );
 }
 
 #[tokio::test]
