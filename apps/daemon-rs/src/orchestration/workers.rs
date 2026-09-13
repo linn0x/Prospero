@@ -104,6 +104,26 @@ pub async fn start_worker(
         "none" => "none",
         _ => return Err(Error::Invalid("worktree must be new or none".into())),
     };
+    if input.agent != crate::protocol::AgentKind::Claude {
+        return Err(Error::Invalid("Rust worker 当前仅支持 Claude".into()));
+    }
+    let policy = match input.approval_policy.as_deref().unwrap_or("standard") {
+        "strict" | "standard" => false,
+        "yolo" => true,
+        _ => return Err(Error::Invalid("approvalPolicy is invalid".into())),
+    };
+    let account_id = match input.account_id.as_deref() {
+        None | Some("") | Some(crate::accounts::NATIVE_CLAUDE_ID) => None,
+        Some(id) => {
+            crate::database::validate_id(id)?;
+            let data = database.directory().to_owned();
+            let id = id.to_owned();
+            let record = database
+                .call(move |store| store.managed_snapshot_row(&data, &id))
+                .await?;
+            Some(record.id)
+        }
+    };
     let operation_id = match &input.operation_id {
         Some(id) => {
             crate::database::validate_id(id)?;
@@ -244,12 +264,13 @@ pub async fn start_worker(
     };
     let head = match agents
         .create(CreateAgentSession {
+            agent: input.agent,
             title,
             workspace: worker_cwd.clone(),
-            auto_approve: false,
+            auto_approve: policy,
             model: None,
             effort: None,
-            account_id: None,
+            account_id,
         })
         .await
     {

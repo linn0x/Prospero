@@ -869,6 +869,7 @@ async fn usage_endpoint_matches_legacy_control_envelope() {
     let head = api
         .agents
         .create(CreateAgentRun {
+            agent: prosperod_rs::protocol::AgentKind::Claude,
             title: "Claude".into(),
             workspace: workspace.path().to_str().unwrap().into(),
             auto_approve: false,

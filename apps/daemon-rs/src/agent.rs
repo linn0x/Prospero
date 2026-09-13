@@ -14,6 +14,8 @@ pub use store::{ApprovalPolicy, PermissionMode};
 #[derive(Debug, Deserialize, Serialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CreateAgentSession {
+    #[serde(default = "default_agent_kind")]
+    pub agent: crate::protocol::AgentKind,
     pub title: String,
     pub workspace: String,
     #[serde(default)]
@@ -26,6 +28,10 @@ pub struct CreateAgentSession {
     /// Managed account id; None (or the native id) uses the本机默认环境.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
+}
+
+fn default_agent_kind() -> crate::protocol::AgentKind {
+    crate::protocol::AgentKind::Claude
 }
 
 /// One row in the launch model catalog (legacy AgentModelCatalog contract).
