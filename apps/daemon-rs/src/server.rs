@@ -117,6 +117,10 @@ impl Api {
             .route("/v1/agent-sessions/{id}/interrupt", post(agent_interrupt))
             .route("/v1/agent-sessions/{id}/compact", post(agent_compact))
             .route(
+                "/v1/agent-sessions/{id}/tool-output",
+                get(agent_tool_output),
+            )
+            .route(
                 "/v1/agent-sessions/{id}/approval-policy",
                 post(agent_approval_policy),
             )
@@ -1479,6 +1483,38 @@ async fn agent_subagent_events(
     crate::database::validate_id(&subagent).map_err(ApiError)?;
     let snapshot = api.agents.subagent_snapshot(&id, &subagent).await?;
     Ok(Json(snapshot))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ToolOutputQuery {
+    call_id: String,
+}
+
+async fn agent_tool_output(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    query: std::result::Result<Query<ToolOutputQuery>, axum::extract::rejection::QueryRejection>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    crate::database::validate_id(&id).map_err(ApiError)?;
+    let Query(query) = query.map_err(|_| Error::Invalid("missing callId".into()))?;
+    crate::timeline::validate_record_id(&query.call_id).map_err(ApiError)?;
+    let output = api
+        .database
+        .call(move |store| {
+            let record = store.timeline_record(&id, &query.call_id)?;
+            if !matches!(record.body, TimelineBody::Tool { .. }) {
+                return Err(Error::NotFound);
+            }
+            let page = store.timeline_text(&id, &query.call_id, TimelineTextQuery::default())?;
+            Ok(serde_json::json!({
+                "output": page.text,
+                "truncated": page.next_part.is_some(),
+            }))
+        })
+        .await
+        .map_err(ApiError)?;
+    Ok(Json(output))
 }
 
 async fn agent_compact(
