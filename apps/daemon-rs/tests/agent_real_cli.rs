@@ -124,7 +124,7 @@ impl Harness {
             records.iter().any(|(body, _)| {
                 matches!(
                     body,
-                    TimelineBody::TurnEnd { finish: actual } if actual == finish
+                    TimelineBody::TurnEnd { finish: actual, .. } if actual == finish
                 )
             })
         })
@@ -215,7 +215,7 @@ async fn real_claude_manual_approval_runs_tool() {
             records.iter().any(|(body, _)| {
                 matches!(
                     body,
-                    TimelineBody::TurnEnd { finish } if finish == "completed"
+                    TimelineBody::TurnEnd { finish, .. } if finish == "completed"
                 )
             })
         })
@@ -262,7 +262,7 @@ async fn real_claude_denied_approval_fails_tool() {
         if records.iter().any(|(body, _)| {
             matches!(
                 body,
-                TimelineBody::TurnEnd { finish } if finish == "completed"
+                TimelineBody::TurnEnd { finish, .. } if finish == "completed"
             )
         }) {
             break;
