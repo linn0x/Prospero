@@ -1,6 +1,7 @@
 mod claude;
 mod runtime;
 mod store;
+mod usage;
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
