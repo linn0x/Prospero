@@ -4,6 +4,7 @@ import type { TimelinePage, TimelineQuery, TimelineLookupResult, TimelineTextQue
 import type { CreateTerminal, TerminalPage, TerminalQuery, TerminalSize, TerminalSnapshot } from "@prospero/protocol/rust-daemon";
 import type { AgentSend, AgentControlResult, AgentModeCatalog, AgentModelCatalog, AgentModelSelectionResult, AgentControlsProjection, CreateAgentSession, PermissionDecision, QuestionDecision, SubagentSnapshot, AgentQueue, AgentQueues } from "@prospero/protocol/rust-daemon";
 import type { AccountListResult, LaunchModelCatalog, SourceResult, UsageResult } from "@prospero/protocol/rust-daemon";
+import type { FsChunk, FsContent, FsDone, FsListing, FsWritten, GitDiffResult, GitDone, GitStatusResult, WorkspaceSummaryResult } from "@prospero/protocol/rust-daemon";
 import type {
   AbandonRun, ApplyTaskGraph, CancelTask, CleanupWorktree, CompleteRun, CreateGate,
   CreateRun, CreateRunGraph, CreateTask, Dispatch, Gate, GraphMutationResult, ResolveGate,
@@ -177,6 +178,52 @@ export class RustClient {
     if (query.generation !== null) params.set("generation", String(query.generation));
     return this.json(`/v1/sessions/${id(value)}/timeline/${id(record)}/body?${params}`, { signal });
   }
+
+  workspaceSummary(value: string, requestId: string, signal: AbortSignal | null = null, timeoutMs = 15_000): Promise<WorkspaceSummaryResult> {
+    return this.json(`/v1/sessions/${id(value)}/workspace-summary?requestId=${encodeURIComponent(requestId)}`, { signal, timeoutMs });
+  }
+  fsList(value: string, path: string, signal: AbortSignal | null = null): Promise<FsListing> {
+    return this.json(`/v1/sessions/${id(value)}/fs/list?path=${encodeURIComponent(path)}`, { signal });
+  }
+  fsRead(value: string, path: string, signal: AbortSignal | null = null): Promise<FsContent> {
+    return this.json(`/v1/sessions/${id(value)}/fs/read?path=${encodeURIComponent(path)}`, { signal });
+  }
+  fsWrite(value: string, input: { path: string; contentB64: string }, signal: AbortSignal | null = null): Promise<FsWritten> {
+    return this.json(`/v1/sessions/${id(value)}/fs/write`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
+  }
+  fsGet(value: string, path: string, offset: number, length: number, signal: AbortSignal | null = null): Promise<FsChunk> {
+    const params = new URLSearchParams({ path, offset: String(offset), length: String(length) });
+    return this.json(`/v1/sessions/${id(value)}/fs/get?${params}`, { signal });
+  }
+  fsPut(value: string, input: { path: string; offset: number; dataB64: string; final: boolean }, signal: AbortSignal | null = null): Promise<FsWritten> {
+    return this.json(`/v1/sessions/${id(value)}/fs/put`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
+  }
+  fsMkdir(value: string, path: string, signal: AbortSignal | null = null): Promise<FsDone> {
+    return this.json(`/v1/sessions/${id(value)}/fs/mkdir`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ path }) });
+  }
+  fsRemove(value: string, path: string, signal: AbortSignal | null = null): Promise<FsDone> {
+    return this.json(`/v1/sessions/${id(value)}/fs/remove`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ path }) });
+  }
+  fsRename(value: string, path: string, to: string, signal: AbortSignal | null = null): Promise<FsDone> {
+    return this.json(`/v1/sessions/${id(value)}/fs/rename`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ path, to }) });
+  }
+  gitStatus(value: string, signal: AbortSignal | null = null): Promise<GitStatusResult> {
+    return this.json(`/v1/sessions/${id(value)}/git/status`, { signal });
+  }
+  gitDiff(value: string, path: string, staged: boolean, signal: AbortSignal | null = null): Promise<GitDiffResult> {
+    const params = new URLSearchParams({ path, staged: String(staged) });
+    return this.json(`/v1/sessions/${id(value)}/git/diff?${params}`, { signal });
+  }
+  gitStage(value: string, paths: string[], unstage: boolean, signal: AbortSignal | null = null): Promise<GitDone> {
+    return this.json(`/v1/sessions/${id(value)}/git/stage`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ paths, unstage }) });
+  }
+  gitDiscard(value: string, path: string, signal: AbortSignal | null = null): Promise<GitDone> {
+    return this.json(`/v1/sessions/${id(value)}/git/discard`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ path }) });
+  }
+  gitCommit(value: string, message: string, signal: AbortSignal | null = null, timeoutMs = 30_000): Promise<GitDone> {
+    return this.json(`/v1/sessions/${id(value)}/git/commit`, { method: "POST", signal, timeoutMs, headers: { "content-type": "application/json" }, body: JSON.stringify({ message }) });
+  }
+
   async shutdown(signal: AbortSignal | null = null): Promise<void> { await this.json("/v1/shutdown", { method: "POST", signal }); }
   sessions(query: SessionQuery, signal: AbortSignal | null = null): Promise<SessionPage> {
     const params = new URLSearchParams();

@@ -9,6 +9,8 @@ use prosperod_rs::protocol::{
 use prosperod_rs::server::Api;
 use prosperod_rs::worker::Database;
 use serde_json::{Value, json};
+use std::path::Path;
+use std::process::Command;
 use std::time::Duration;
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -16,17 +18,22 @@ use tower::ServiceExt;
 const SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 async fn fixture() -> (TempDir, Api, String) {
+    fixture_workspace("/synthetic").await
+}
+
+async fn fixture_workspace(workspace: impl AsRef<Path>) -> (TempDir, Api, String) {
     let directory = TempDir::new().unwrap();
     let database = Database::open(directory.path().to_path_buf())
         .await
         .unwrap();
+    let workspace = workspace.as_ref().to_string_lossy().to_string();
     let head = database
-        .call(|store| {
+        .call(move |store| {
             store.create_session(CreateSession {
                 agent: AgentKind::Codex,
                 kind: SessionKind::Structured,
                 title: "Example".into(),
-                workspace: "/synthetic".into(),
+                workspace,
             })
         })
         .await
@@ -66,6 +73,12 @@ async fn every_endpoint_requires_auth_and_rejects_browser_origins() {
         "/v1/terminals/example/resize",
         "/v1/terminals/example/close",
         "/v1/agent-sessions/example/tool-output?callId=call_1",
+        "/v1/sessions/example/workspace-summary?requestId=req1",
+        "/v1/sessions/example/fs/list?path=",
+        "/v1/sessions/example/fs/read?path=file.txt",
+        "/v1/sessions/example/fs/get?path=file.txt&offset=0&length=1",
+        "/v1/sessions/example/git/status",
+        "/v1/sessions/example/git/diff?path=file.txt&staged=false",
         "/v1/events?scope=sessions",
         "/unknown",
     ] {
@@ -143,6 +156,269 @@ async fn tool_output_route_returns_persisted_tool_text() {
         body(response).await,
         json!({"output":"full tool output","truncated":false})
     );
+    api.database.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn project_fs_routes_are_session_scoped_and_bounded() {
+    let workspace = TempDir::new().unwrap();
+    std::fs::create_dir(workspace.path().join("src")).unwrap();
+    std::fs::write(workspace.path().join("src/main.txt"), b"hello").unwrap();
+    std::fs::write(workspace.path().join("image.bin"), b"a\0b").unwrap();
+    let outside = TempDir::new().unwrap();
+    std::fs::write(outside.path().join("secret.txt"), b"secret").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        outside.path().join("secret.txt"),
+        workspace.path().join("link-out"),
+    )
+    .unwrap();
+
+    let (_directory, api, id) = fixture_workspace(workspace.path()).await;
+    let response = api
+        .router()
+        .oneshot(
+            request(&format!("/v1/sessions/{id}/fs/list?path="))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let listing = body(response).await;
+    assert_eq!(listing["type"], "fs.listing");
+    assert_eq!(listing["entries"][0]["name"], "src");
+
+    let response = api
+        .router()
+        .oneshot(
+            request(&format!("/v1/sessions/{id}/fs/read?path=src%2Fmain.txt"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body(response).await["contentB64"], "aGVsbG8=");
+
+    let response = api
+        .router()
+        .oneshot(
+            request(&format!("/v1/sessions/{id}/fs/read?path=image.bin"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body(response).await["binary"], true);
+
+    let response = api
+        .router()
+        .oneshot(
+            request(&format!("/v1/sessions/{id}/fs/write"))
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"path":"new.txt","contentB64":"cnVzdA=="}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body(response).await["size"], 4);
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("new.txt")).unwrap(),
+        "rust"
+    );
+
+    let response = api
+        .router()
+        .oneshot(
+            request(&format!(
+                "/v1/sessions/{id}/fs/get?path=new.txt&offset=1&length=2"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body(response).await["dataB64"], "dXM=");
+
+    let response = api
+        .router()
+        .oneshot(
+            request(&format!("/v1/sessions/{id}/fs/mkdir"))
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"path":"tmp"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(workspace.path().join("tmp").is_dir());
+
+    let response = api
+        .router()
+        .oneshot(
+            request(&format!("/v1/sessions/{id}/fs/rename"))
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"path":"new.txt","to":"tmp/renamed.txt"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(workspace.path().join("tmp/renamed.txt").is_file());
+
+    let response = api
+        .router()
+        .oneshot(
+            request(&format!("/v1/sessions/{id}/fs/remove"))
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"path":"tmp/renamed.txt"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!workspace.path().join("tmp/renamed.txt").exists());
+
+    #[cfg(unix)]
+    {
+        let response = api
+            .router()
+            .oneshot(
+                request(&format!("/v1/sessions/{id}/fs/read?path=link-out"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    api.database.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn project_git_routes_report_diff_and_mutate_index() {
+    let workspace = TempDir::new().unwrap();
+    Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(workspace.path())
+        .output()
+        .unwrap();
+    std::fs::write(workspace.path().join("file.txt"), "one\n").unwrap();
+    Command::new("git")
+        .args(["add", "file.txt"])
+        .current_dir(workspace.path())
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args([
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "initial",
+        ])
+        .current_dir(workspace.path())
+        .output()
+        .unwrap();
+    std::fs::write(workspace.path().join("file.txt"), "two\n").unwrap();
+    std::fs::write(workspace.path().join("new.txt"), "new\n").unwrap();
+
+    let (_directory, api, id) = fixture_workspace(workspace.path()).await;
+    let response = api
+        .router()
+        .oneshot(
+            request(&format!("/v1/sessions/{id}/git/status"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let status = body(response).await;
+    assert_eq!(status["branch"], "main");
+    assert!(
+        status["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["path"] == "file.txt")
+    );
+    assert!(
+        status["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["path"] == "new.txt" && file["untracked"] == true)
+    );
+
+    let response = api
+        .router()
+        .oneshot(
+            request(&format!(
+                "/v1/sessions/{id}/git/diff?path=new.txt&staged=false"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        body(response).await["patch"]
+            .as_str()
+            .unwrap()
+            .contains("+new")
+    );
+
+    let response = api
+        .router()
+        .oneshot(
+            request(&format!("/v1/sessions/{id}/git/stage"))
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"paths":["file.txt"],"unstage":false}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body(response).await["op"], "stage");
+
+    let response = api
+        .router()
+        .oneshot(
+            request(&format!(
+                "/v1/sessions/{id}/workspace-summary?requestId=req1"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let summary = body(response).await;
+    assert_eq!(summary["type"], "workspace.summary.result");
+    assert_eq!(summary["requestId"], "req1");
+    assert_eq!(summary["branch"], "main");
+    assert!(summary["sizeBytes"].as_u64().unwrap() >= 8);
+
     api.database.shutdown().await.unwrap();
 }
 
