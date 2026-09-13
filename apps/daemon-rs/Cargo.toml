@@ -10,6 +10,7 @@ avt = "0.18.0"
 axum = { version = "0.8.8", features = ["json", "query", "tokio", "http1", "ws"] }
 base64 = "0.22.1"
 clap = { version = "4.5.58", features = ["derive"] }
+crypto_box = "0.9.1"
 fs2 = "0.4.3"
 futures-util = "0.3.32"
 libc = "0.2"
