@@ -255,6 +255,28 @@ pub(crate) fn search_claude_config_dir(
     Ok(results)
 }
 
+pub(crate) async fn search_codex_conversations(
+    database: &crate::worker::Database,
+    account_id: Option<String>,
+    query: String,
+    limit: Option<usize>,
+) -> Result<Vec<ResumableConversation>> {
+    if query.chars().count() > MAX_QUERY_CHARS || query.chars().any(char::is_control) {
+        return Err(Error::Invalid("对话搜索词无效".into()));
+    }
+    let limit = limit.unwrap_or(20).clamp(1, MAX_RESULTS);
+    match account_id.as_deref() {
+        None | Some(crate::agent::usage::NATIVE_CODEX_ID) => {}
+        Some(_) => {
+            return Err(Error::Invalid(
+                "Rust daemon 当前仅支持本机 Codex 对话搜索".into(),
+            ));
+        }
+    }
+    let data = database.directory().to_owned();
+    crate::agent::usage::search_native_codex_conversations(&data, &query, limit).await
+}
+
 pub(crate) async fn search_claude_conversations(
     database: &crate::worker::Database,
     account_id: Option<String>,
