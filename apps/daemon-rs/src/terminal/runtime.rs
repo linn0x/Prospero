@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use tokio::sync::Semaphore;
@@ -280,9 +281,7 @@ impl Terminals {
                     command
                 }
                 None => {
-                    let shell = std::env::var_os("SHELL")
-                        .filter(|shell| Path::new(shell).is_absolute())
-                        .unwrap_or_else(|| "/bin/sh".into());
+                    let shell = login_shell(std::env::var_os("SHELL"));
                     if let Some(guard) = guard {
                         let mut command = portable_pty::CommandBuilder::new(guard);
                         command.args([
@@ -452,5 +451,56 @@ impl Terminals {
         .await
         .map_err(|_| Error::Timeout)?;
         self.check()
+    }
+}
+
+#[cfg(unix)]
+fn login_shell(shell: Option<OsString>) -> OsString {
+    let Some(shell) = shell else {
+        return "/bin/sh".into();
+    };
+    let path = Path::new(&shell);
+    if !path.is_absolute() {
+        return "/bin/sh".into();
+    }
+    let allowed = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            matches!(
+                name,
+                "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish" | "csh" | "tcsh"
+            )
+        });
+    if allowed { shell } else { "/bin/sh".into() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::login_shell;
+    use std::ffi::OsString;
+
+    #[test]
+    fn login_shell_rejects_non_shell() {
+        assert_eq!(
+            login_shell(Some(OsString::from("/bin/cat"))),
+            OsString::from("/bin/sh")
+        );
+    }
+
+    #[test]
+    fn login_shell_rejects_relative_path() {
+        assert_eq!(
+            login_shell(Some(OsString::from("zsh"))),
+            OsString::from("/bin/sh")
+        );
+    }
+
+    #[test]
+    fn login_shell_accepts_known_shell() {
+        assert_eq!(
+            login_shell(Some(OsString::from("/bin/zsh"))),
+            OsString::from("/bin/zsh")
+        );
     }
 }
