@@ -415,6 +415,146 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (year, m, d)
 }
 
+fn timestamp_ms(value: Option<&Value>) -> Option<i64> {
+    let raw = value?.as_f64()?;
+    if !raw.is_finite() || raw < 0.0 {
+        return None;
+    }
+    Some(
+        (if raw < 1_000_000_000_000.0 {
+            raw * 1000.0
+        } else {
+            raw
+        })
+        .round() as i64,
+    )
+}
+
+fn trim_codex(value: &str, maximum: usize) -> String {
+    let value = value.trim();
+    let end = value
+        .char_indices()
+        .nth(maximum)
+        .map_or(value.len(), |(index, _)| index);
+    value[..end].to_owned()
+}
+
+fn codex_threads_from_response(
+    value: &Value,
+    limit: usize,
+    fallback_cwd: &Path,
+) -> Vec<crate::agent::ResumableConversation> {
+    let Some(data) = value.get("data").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let fallback_cwd = fallback_cwd.to_string_lossy().into_owned();
+    let mut conversations = Vec::new();
+    for value in data {
+        let Some(result) = value.as_object() else {
+            continue;
+        };
+        let thread = result
+            .get("thread")
+            .and_then(Value::as_object)
+            .unwrap_or(result);
+        let id = thread.get("id").and_then(Value::as_str).unwrap_or_default();
+        if id.is_empty()
+            || thread.get("ephemeral").and_then(Value::as_bool) == Some(true)
+            || thread
+                .get("parentThreadId")
+                .and_then(Value::as_str)
+                .is_some()
+        {
+            continue;
+        }
+        let cwd = thread
+            .get("cwd")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&fallback_cwd);
+        if !Path::new(cwd).exists() {
+            continue;
+        }
+        let preview = thread
+            .get("preview")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        let snippet = result
+            .get("snippet")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        let title = thread
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                preview
+                    .lines()
+                    .next()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            })
+            .unwrap_or("Codex 对话");
+        let created_at = timestamp_ms(thread.get("createdAt"));
+        conversations.push(crate::agent::ResumableConversation {
+            id: trim_codex(id, 256),
+            agent: crate::protocol::AgentKind::Codex,
+            title: trim_codex(title, 500),
+            preview: (!snippet.is_empty() || !preview.is_empty()).then(|| {
+                trim_codex(
+                    if !snippet.is_empty() {
+                        snippet
+                    } else {
+                        preview
+                    },
+                    4_000,
+                )
+            }),
+            cwd: trim_codex(cwd, 4096),
+            created_at,
+            updated_at: timestamp_ms(thread.get("updatedAt"))
+                .or(created_at)
+                .unwrap_or_else(crate::database::now),
+        });
+        if conversations.len() >= limit {
+            break;
+        }
+    }
+    conversations
+}
+
+pub(crate) async fn search_native_codex_conversations(
+    data: &Path,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<crate::agent::ResumableConversation>> {
+    let (cwd, env) = prepare_native_codex_usage_env(data)?;
+    let mut rpc = CodexRpc::start(cwd.clone(), &env).await?;
+    let trimmed = query.trim();
+    let params = if trimmed.is_empty() {
+        json!({ "limit": limit, "sortKey": "updated_at", "sortDirection": "desc", "archived": false })
+    } else {
+        json!({ "searchTerm": trimmed, "limit": limit, "sortKey": "updated_at", "sortDirection": "desc", "archived": false })
+    };
+    let result = async {
+        let raw = if trimmed.is_empty() {
+            rpc.request("thread/list", params).await?
+        } else {
+            match rpc.request("thread/search", params.clone()).await {
+                Ok(value) => value,
+                Err(_) => rpc.request("thread/list", params).await?,
+            }
+        };
+        Ok(codex_threads_from_response(&raw, limit, &cwd))
+    }
+    .await;
+    rpc.shutdown().await;
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

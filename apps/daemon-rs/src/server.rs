@@ -405,9 +405,9 @@ async fn conversation_search(
     State(api): State<Api>,
     Query(query): Query<ConversationSearchQuery>,
 ) -> std::result::Result<Json<crate::agent::ConversationSearchResult>, ApiError> {
-    if query.agent != "claude" {
+    if query.agent != "claude" && query.agent != "codex" {
         return Err(ApiError(Error::Invalid(
-            "Rust daemon 当前仅支持搜索 Claude 本机对话".into(),
+            "Rust daemon 当前仅支持搜索 Claude/Codex 本机对话".into(),
         )));
     }
     if query.query.chars().count() > 300 || query.query.chars().any(char::is_control) {
@@ -417,15 +417,31 @@ async fn conversation_search(
         return Err(ApiError(Error::Invalid("对话搜索数量无效".into())));
     }
     let _permit = api.requests.acquire().await.map_err(|_| Error::Closed)?;
-    let conversations = crate::agent::conversations::search_claude_conversations(
-        &api.database,
-        query.account_id,
-        query.query,
-        query.limit,
-    )
-    .await?;
+    let (agent, conversations) = if query.agent == "codex" {
+        (
+            crate::protocol::AgentKind::Codex,
+            crate::agent::conversations::search_codex_conversations(
+                &api.database,
+                query.account_id,
+                query.query,
+                query.limit,
+            )
+            .await?,
+        )
+    } else {
+        (
+            crate::protocol::AgentKind::Claude,
+            crate::agent::conversations::search_claude_conversations(
+                &api.database,
+                query.account_id,
+                query.query,
+                query.limit,
+            )
+            .await?,
+        )
+    };
     Ok(Json(crate::agent::ConversationSearchResult {
-        agent: crate::protocol::AgentKind::Claude,
+        agent,
         conversations,
     }))
 }
