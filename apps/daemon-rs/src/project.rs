@@ -131,6 +131,23 @@ pub struct GitDiffResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+pub struct GitHistoryEntry {
+    pub hash: String,
+    pub subject: String,
+    pub author: String,
+    pub date: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHistoryResult {
+    pub r#type: String,
+    pub sid: String,
+    pub entries: Vec<GitHistoryEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
 pub struct GitDone {
     pub r#type: String,
     pub sid: String,
@@ -167,6 +184,10 @@ pub struct GitDiffQuery {
 pub struct FsWriteRequest {
     pub path: String,
     pub content_b64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_new: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_version: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, TS)]
@@ -259,6 +280,55 @@ fn validate_rel_path(rel: &str, allow_root: bool) -> Result<()> {
 
 fn contains(base: &Path, target: &Path) -> bool {
     target == base || target.starts_with(base)
+}
+
+fn normalize_relative_path(rel: &str) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in Path::new(rel).components() {
+        if let Component::Normal(part) = component {
+            normalized.push(part);
+        }
+    }
+    normalized
+}
+
+fn validate_desktop_rel_path(rel: &str, allow_root: bool) -> Result<()> {
+    validate_rel_path(rel, allow_root)?;
+    if rel.contains(':') {
+        return Err(Error::Invalid("invalid path".into()));
+    }
+    if rel
+        .split(['/', '\\'])
+        .any(|part| part.eq_ignore_ascii_case(".git"))
+    {
+        return Err(Error::Invalid("invalid path".into()));
+    }
+    Ok(())
+}
+
+fn resolve_desktop_mutation_target(root: &Path, rel: &str) -> Result<PathBuf> {
+    validate_desktop_rel_path(rel, false)?;
+    let real_root = std::fs::canonicalize(root).map_err(|_| Error::NotFound)?;
+    let lexical = real_root.join(normalize_relative_path(rel));
+    if !contains(&real_root, &lexical) || lexical == real_root {
+        return Err(Error::Forbidden);
+    }
+    match std::fs::canonicalize(&lexical) {
+        Ok(real) => {
+            if real != lexical || !contains(&real_root, &real) {
+                return Err(Error::Forbidden);
+            }
+            Ok(real)
+        }
+        Err(_) => {
+            let parent = lexical.parent().ok_or(Error::NotFound)?;
+            let real_parent = std::fs::canonicalize(parent).map_err(|_| Error::NotFound)?;
+            if real_parent != parent || !contains(&real_root, &real_parent) {
+                return Err(Error::Forbidden);
+            }
+            Ok(lexical)
+        }
+    }
 }
 
 fn resolve_within(root: &Path, rel: &str, allow_root: bool) -> Result<PathBuf> {
@@ -359,17 +429,67 @@ pub fn read_for_edit(root: &Path, rel: &str) -> Result<(Vec<u8>, u64, bool, bool
     ))
 }
 
-pub fn write_file_at(root: &Path, rel: &str, content: Vec<u8>) -> Result<u64> {
+pub fn write_file_at(
+    root: &Path,
+    rel: &str,
+    content: Vec<u8>,
+    create_new: bool,
+    expected_version: Option<String>,
+) -> Result<u64> {
     if content.len() as u64 > MAX_EDIT_BYTES {
         return Err(Error::Invalid("content too large".into()));
     }
-    let file = resolve_within(root, rel, false)?;
-    if let Ok(metadata) = std::fs::symlink_metadata(&file)
-        && (metadata.file_type().is_symlink() || !metadata.is_file())
-    {
+    if expected_version.is_some() && content.contains(&0) {
+        return Err(Error::Invalid("invalid text content".into()));
+    }
+    let file = if create_new || expected_version.is_some() {
+        resolve_desktop_mutation_target(root, rel)?
+    } else {
+        resolve_within(root, rel, false)?
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).read(expected_version.is_some());
+    if create_new {
+        if expected_version.is_some() {
+            return Err(Error::Invalid("invalid write precondition".into()));
+        }
+        options.create_new(true);
+    } else if expected_version.is_none() {
+        options.create(true);
+    }
+    if expected_version.is_some() {
+        let metadata = std::fs::symlink_metadata(&file).map_err(|_| Error::NotFound)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(Error::Forbidden);
+        }
+    }
+    let mut handle = options.open(&file).map_err(|_| Error::Forbidden)?;
+    let metadata = handle.metadata().map_err(|_| Error::Forbidden)?;
+    if !metadata.is_file() {
         return Err(Error::Forbidden);
     }
-    std::fs::write(&file, &content).map_err(|_| Error::Forbidden)?;
+    if let Some(version) = expected_version {
+        if version.len() != 64 || !version.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(Error::Invalid("invalid version".into()));
+        }
+        if metadata.len() > MAX_EDIT_BYTES {
+            return Err(Error::Invalid("file too large".into()));
+        }
+        use sha2::{Digest, Sha256};
+        let mut existing = Vec::new();
+        std::io::Read::by_ref(&mut handle).read_to_end(&mut existing)?;
+        let actual = Sha256::digest(&existing)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if actual != version.to_ascii_lowercase() {
+            return Err(Error::Conflict);
+        }
+    }
+    use std::io::{Seek, Write};
+    handle.seek(std::io::SeekFrom::Start(0))?;
+    handle.write_all(&content)?;
+    handle.set_len(content.len() as u64)?;
     Ok(content.len() as u64)
 }
 
@@ -854,7 +974,18 @@ pub async fn git_stage(root: PathBuf, rels: Vec<String>, unstage: bool) -> Resul
         let _ = resolve_within(&root, rel, false)?;
     }
     let mut args = if unstage {
-        vec!["restore".into(), "--staged".into(), "--".into()]
+        let has_head = git(
+            root.clone(),
+            vec!["rev-parse".into(), "--verify".into(), "HEAD".into()],
+            false,
+        )
+        .await
+        .is_ok();
+        if has_head {
+            vec!["restore".into(), "--staged".into(), "--".into()]
+        } else {
+            vec!["rm".into(), "--cached".into(), "--".into()]
+        }
     } else {
         vec!["add".into(), "--".into()]
     };
@@ -871,6 +1002,56 @@ pub async fn git_discard(root: PathBuf, rel: String) -> Result<()> {
     )
     .await
     .map(|_| ())
+}
+
+pub async fn git_history(sid: String, root: PathBuf) -> Result<GitHistoryResult> {
+    if git(
+        root.clone(),
+        vec!["rev-parse".into(), "--verify".into(), "HEAD".into()],
+        false,
+    )
+    .await
+    .is_err()
+    {
+        return Ok(GitHistoryResult {
+            r#type: "git.history.result".into(),
+            sid,
+            entries: Vec::new(),
+        });
+    }
+    let output = git(
+        root,
+        vec![
+            "log".into(),
+            "-30".into(),
+            "--format=%h%x00%s%x00%an%x00%aI%x00".into(),
+        ],
+        false,
+    )
+    .await?;
+    let fields = output.split('\0').collect::<Vec<_>>();
+    let mut entries = Vec::new();
+    let mut index = 0;
+    while index + 3 < fields.len() {
+        let hash = fields[index].trim();
+        let subject = fields[index + 1];
+        let author = fields[index + 2];
+        let date = fields[index + 3];
+        if !hash.is_empty() {
+            entries.push(GitHistoryEntry {
+                hash: hash.into(),
+                subject: subject.into(),
+                author: author.into(),
+                date: date.into(),
+            });
+        }
+        index += 4;
+    }
+    Ok(GitHistoryResult {
+        r#type: "git.history.result".into(),
+        sid,
+        entries,
+    })
 }
 
 pub async fn git_commit(root: PathBuf, message: String) -> Result<String> {

@@ -599,6 +599,8 @@ pub fn typescript() -> String {
         crate::project::GitFile::decl(&config),
         crate::project::GitStatusResult::decl(&config),
         crate::project::GitDiffResult::decl(&config),
+        crate::project::GitHistoryEntry::decl(&config),
+        crate::project::GitHistoryResult::decl(&config),
         crate::project::GitDone::decl(&config),
         crate::project::FsPathQuery::decl(&config),
         crate::project::FsChunkQuery::decl(&config),
