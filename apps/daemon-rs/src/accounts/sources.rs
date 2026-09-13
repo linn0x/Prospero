@@ -418,9 +418,9 @@ pub(crate) enum SourceAction {
     #[serde(rename = "migration.apply")]
     MigrationApply {
         #[serde(rename = "migrationId")]
-        _migration_id: String,
-        _name: String,
-        _target: Option<TargetInput>,
+        migration_id: String,
+        name: String,
+        target: Option<TargetInput>,
     },
     #[serde(rename = "migration.rollback")]
     MigrationRollback {
@@ -480,6 +480,7 @@ pub(crate) struct RouteInputWithId {
 pub(crate) struct TargetInput {
     #[serde(rename = "sourceId")]
     _source_id: String,
+    #[serde(rename = "revision")]
     _revision: i64,
 }
 

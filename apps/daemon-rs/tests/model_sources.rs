@@ -106,13 +106,17 @@ impl Harness {
     }
 
     async fn post(&self, payload: Value) -> (StatusCode, Value) {
+        self.post_path("/v1/model-sources", payload).await
+    }
+
+    async fn post_path(&self, path: &str, payload: Value) -> (StatusCode, Value) {
         let response = self
             .app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1/model-sources")
+                    .uri(path)
                     .header("authorization", BEARER)
                     .header("content-type", "application/json")
                     .body(Body::from(payload.to_string()))
@@ -209,4 +213,159 @@ async fn source_create_list_models_bind_and_delete_flow() {
         .await;
     assert_eq!(status, StatusCode::CONFLICT, "{blocked}");
     assert_eq!(blocked["code"], "in_use");
+}
+
+fn account_envelope(request_id: &str, extra: Value) -> Value {
+    let mut value = extra.as_object().unwrap().clone();
+    value.insert("requestId".into(), Value::String(request_id.into()));
+    Value::Object(value)
+}
+
+async fn create_api_profile(
+    harness: &Harness,
+    request_id: &str,
+    name: &str,
+    base_url: &str,
+    model: &str,
+    key: &str,
+) -> String {
+    let (status, result) = harness
+        .post_path(
+            "/v1/accounts",
+            account_envelope(
+                request_id,
+                json!({
+                    "type":"agent.account.api.create",
+                    "agent":"claude",
+                    "name":name,
+                    "provider":"anthropic_compatible",
+                    "protocol":"anthropic",
+                    "baseUrl":base_url,
+                    "model":model,
+                    "apiKey":key,
+                    "modelCapabilities":{"tools":true}
+                }),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    result["accountId"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn migration_preview_apply_and_rollback_profiles() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new().await;
+    let server = spawn_server();
+    let first =
+        create_api_profile(&harness, "a1", "One", &server.base_url, "claude-a", SECRET).await;
+    let second_key = "sk-second-source-secret-0123456789";
+    let second = create_api_profile(
+        &harness,
+        "a2",
+        "Two",
+        &server.base_url,
+        "claude-b",
+        second_key,
+    )
+    .await;
+
+    let (status, preview) = harness
+        .post(envelope(json!({"kind":"migration.preview"})))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    let migrations = preview["migrations"].as_array().unwrap();
+    assert_eq!(migrations.len(), 1, "{preview}");
+    assert_eq!(migrations[0]["credentialCount"], 2);
+    assert_eq!(migrations[0]["accounts"].as_array().unwrap().len(), 2);
+    let migration_id = migrations[0]["id"].as_str().unwrap();
+
+    let (status, applied) = harness
+        .post(envelope(
+            json!({"kind":"migration.apply","migrationId":migration_id,"name":"Migrated"}),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{applied}");
+    assert_eq!(applied["sources"].as_array().unwrap().len(), 1);
+    let routes = applied["sources"][0]["routes"].as_array().unwrap();
+    assert_eq!(routes.len(), 2);
+    let accounts = applied["accounts"].as_array().unwrap();
+    for id in [&first, &second] {
+        let account = accounts.iter().find(|row| row["id"] == *id).unwrap();
+        assert_eq!(account["modelSource"]["legacy"], true);
+        assert_eq!(account["modelSource"]["sourceName"], "Migrated");
+    }
+
+    let (status, second_preview) = harness
+        .post(envelope(json!({"kind":"migration.preview"})))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{second_preview}");
+    assert_eq!(second_preview["migrations"].as_array().unwrap().len(), 0);
+
+    let (status, rollback) = harness
+        .post(envelope(
+            json!({"kind":"migration.rollback","accountIds":[first, second]}),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{rollback}");
+    assert!(
+        rollback["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row.get("modelSource").is_none())
+    );
+}
+
+#[tokio::test]
+async fn migration_apply_rejects_active_profile_sessions() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new().await;
+    let workspace = TempDir::new().unwrap();
+    let server = spawn_server();
+    let account_id = create_api_profile(
+        &harness,
+        "active",
+        "Active",
+        &server.base_url,
+        "claude-active",
+        SECRET,
+    )
+    .await;
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/agent-sessions")
+                .header("authorization", BEARER)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "title":"Active",
+                        "workspace":workspace.path().to_str().unwrap(),
+                        "autoApprove":false,
+                        "accountId":account_id
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let (status, preview) = harness
+        .post(envelope(json!({"kind":"migration.preview"})))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    let migration_id = preview["migrations"][0]["id"].as_str().unwrap();
+    let (status, applied) = harness
+        .post(envelope(
+            json!({"kind":"migration.apply","migrationId":migration_id,"name":"Blocked"}),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{applied}");
+    assert_eq!(applied["code"], "in_use");
 }
