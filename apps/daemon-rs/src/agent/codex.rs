@@ -47,6 +47,11 @@ pub(super) struct CodexTurn {
     events: Option<mpsc::Receiver<AdapterEvent>>,
     thread_id: String,
     current_turn: Arc<Mutex<Option<String>>>,
+    approval_policy: Value,
+    sandbox_policy: Value,
+    model: Option<String>,
+    effort: Option<String>,
+    mode: PermissionMode,
     child_pid: u32,
 }
 
@@ -261,8 +266,11 @@ pub(super) async fn spawn_turn(
         "input".into(),
         json!([{ "type": "text", "text": prompt, "text_elements": [] }]),
     );
-    turn_params.insert("approvalPolicy".into(), policy.approval_policy_for_turn);
-    turn_params.insert("sandboxPolicy".into(), policy.sandbox_policy);
+    turn_params.insert(
+        "approvalPolicy".into(),
+        policy.approval_policy_for_turn.clone(),
+    );
+    turn_params.insert("sandboxPolicy".into(), policy.sandbox_policy.clone());
     if let Some(model) = options.model.as_ref() {
         turn_params.insert("model".into(), json!(model));
         turn_params.insert("collaborationMode".into(), collaboration_mode(options));
@@ -282,6 +290,11 @@ pub(super) async fn spawn_turn(
         events: Some(events_rx),
         thread_id,
         current_turn,
+        approval_policy: policy.approval_policy_for_turn,
+        sandbox_policy: policy.sandbox_policy,
+        model: options.model.clone(),
+        effort: options.effort.clone(),
+        mode: options.mode,
         child_pid,
     })
 }
@@ -1288,6 +1301,35 @@ impl CodexTurn {
             }),
         )
         .await
+    }
+
+    pub(super) async fn send_to_subagent(&self, subagent_id: &str, text: &str) -> Result<()> {
+        let mut params = serde_json::Map::new();
+        params.insert("threadId".into(), json!(subagent_id));
+        params.insert(
+            "input".into(),
+            json!([{ "type": "text", "text": text, "text_elements": [] }]),
+        );
+        params.insert("approvalPolicy".into(), self.approval_policy.clone());
+        params.insert("sandboxPolicy".into(), self.sandbox_policy.clone());
+        if let Some(model) = self.model.as_ref() {
+            params.insert("model".into(), json!(model));
+            params.insert(
+                "collaborationMode".into(),
+                json!({
+                    "mode": if self.mode == PermissionMode::Plan { "plan" } else { "default" },
+                    "settings": {
+                        "model": model,
+                        "reasoning_effort": self.effort,
+                        "developer_instructions": null,
+                    }
+                }),
+            );
+        }
+        if let Some(effort) = self.effort.as_ref() {
+            params.insert("effort".into(), json!(effort));
+        }
+        self.send_request("turn/start", Value::Object(params)).await
     }
 
     pub(super) async fn compact(&self) -> Result<()> {

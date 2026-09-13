@@ -143,6 +143,13 @@ impl Driver {
         }
     }
 
+    async fn send_to_subagent(&self, subagent: &str, text: &str) -> Result<()> {
+        match self {
+            Driver::Codex(driver) => driver.send_to_subagent(subagent, text).await,
+            Driver::Claude(_) => Err(Error::Invalid("Claude 不支持子 Agent 定向消息".into())),
+        }
+    }
+
     async fn apply_selection(&self, model: &str, effort: Option<&str>) -> Result<()> {
         match self {
             Driver::Claude(driver) => driver.apply_selection(model, effort).await,
@@ -2069,6 +2076,34 @@ impl Agents {
     pub async fn controls(&self) -> Result<AgentControlsProjection> {
         let controls = self.0.database.call(|store| store.agent_controls()).await?;
         Ok(AgentControlsProjection { controls })
+    }
+
+    /// Send a direct follow-up prompt to a live Codex subagent thread.
+    pub async fn send_to_subagent(&self, id: &str, subagent: &str, text: String) -> Result<()> {
+        crate::database::validate_id(id)?;
+        crate::database::validate_id(subagent)?;
+        crate::database::validate_text(&text, 65_536, false)?;
+        let subagent_id = subagent.to_owned();
+        let snapshot = {
+            let id = id.to_owned();
+            let subagent = subagent_id.clone();
+            self.0
+                .database
+                .call(move |store| store.subagent_snapshot(&id, &subagent))
+                .await?
+        };
+        if !snapshot.subagent.can_message {
+            return Err(Error::Conflict);
+        }
+        let entry = self.session_entry(id).await?;
+        let guard = entry.handle.lock().await;
+        let handle = guard.as_ref().ok_or(Error::Conflict)?;
+        handle
+            .driver
+            .lock()
+            .await
+            .send_to_subagent(&subagent_id, &text)
+            .await
     }
 
     /// On-demand transcript for a Task-tool subagent's "查看执行详情" pane.

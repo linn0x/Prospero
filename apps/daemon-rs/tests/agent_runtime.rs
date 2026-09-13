@@ -368,6 +368,17 @@ for line in sys.stdin:
             emit({"jsonrpc": "2.0", "method": "thread/started", "params": {"threadId": "sub-thread-1", "thread": {"id": "sub-thread-1", "parentThreadId": params.get("threadId"), "agentNickname": "Scout", "agentRole": "Explore", "preview": "inspect repo", "status": "running"}}})
             emit({"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": {"threadId": "sub-thread-1", "itemId": "sub-msg-1", "delta": "subagent says hi"}})
             emit({"jsonrpc": "2.0", "method": "item/completed", "params": {"threadId": params.get("threadId"), "item": {"id": "collab-1", "type": "collabAgentToolCall", "status": "completed", "receiverThreadId": "sub-thread-1"}}})
+        if scenario == "codexsubsend" and params.get("threadId") == next_thread:
+            emit({"jsonrpc": "2.0", "method": "item/started", "params": {"threadId": params.get("threadId"), "item": {"id": "collab-1", "type": "collabAgentToolCall", "receiverThreadId": "sub-thread-1", "prompt": "inspect repo"}}})
+            emit({"jsonrpc": "2.0", "method": "thread/started", "params": {"threadId": "sub-thread-1", "thread": {"id": "sub-thread-1", "parentThreadId": params.get("threadId"), "agentNickname": "Scout", "agentRole": "Explore", "preview": "inspect repo", "status": "idle"}}})
+            respond(rpc_id, {"turn": {"id": turn_id}})
+            continue
+        if scenario == "codexsubsend" and params.get("threadId") == "sub-thread-1":
+            with open(os.path.join(os.getcwd(), "subagent-turn.json"), "w") as log:
+                log.write(json.dumps(params))
+            emit({"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": {"threadId": "sub-thread-1", "itemId": "sub-msg-2", "delta": "direct reply"}})
+            respond(rpc_id, {"turn": {"id": "sub-turn-2"}})
+            continue
         if scenario == "codexdiff":
             patch = "diff --git a/src/lib.rs b/src/lib.rs\nindex 000..111\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1,2 @@\n-old\n+new\n+line\n"
             emit({"jsonrpc": "2.0", "method": "item/started", "params": {"threadId": params.get("threadId"), "item": {"id": "edit-1", "type": "fileChange", "changes": [{"path": "src/lib.rs", "diff": patch}]}}})
@@ -953,6 +964,64 @@ async fn codex_file_changes_attach_diffs_to_tool_and_turn_end() {
         .unwrap();
     assert_eq!(turn_diffs.len(), 1);
     assert_eq!(turn_diffs[0].path, "src/lib.rs");
+}
+
+#[tokio::test]
+async fn codex_send_to_subagent_posts_turn_start_to_child_thread() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("codexsubsend").await;
+    let cli = harness.workspace.path().join("fake-codex.py");
+    std::fs::write(&cli, FAKE_CODEX).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    unsafe {
+        std::env::set_var("PROSPERO_CODEX_BIN", &cli);
+    }
+    let head = harness.create_codex().await;
+    harness
+        .agents
+        .send(&head.id, "spawn child".into(), None, Vec::new())
+        .await
+        .unwrap();
+    harness
+        .wait_for(&head.id, |records| {
+            records.iter().any(|(_, body, _)| {
+                matches!(
+                    body,
+                    TimelineBody::Subagent {
+                        subagent_id,
+                        can_message: true,
+                        ..
+                    } if subagent_id == "sub-thread-1"
+                )
+            })
+        })
+        .await;
+    harness
+        .agents
+        .send_to_subagent(&head.id, "sub-thread-1", "hello child".into())
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(raw) =
+            std::fs::read_to_string(harness.workspace.path().join("subagent-turn.json"))
+        {
+            let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(value["threadId"], "sub-thread-1");
+            assert_eq!(value["input"][0]["text"], "hello child");
+            assert_eq!(value["model"], "gpt-test");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "subagent turn not sent"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 #[tokio::test]
