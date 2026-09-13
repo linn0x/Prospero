@@ -190,6 +190,13 @@ async fn project_fs_routes_are_session_scoped_and_bounded() {
     let listing = body(response).await;
     assert_eq!(listing["type"], "fs.listing");
     assert_eq!(listing["entries"][0]["name"], "src");
+    assert!(
+        !listing["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == ".git")
+    );
 
     let response = api
         .router()
@@ -214,6 +221,17 @@ async fn project_fs_routes_are_session_scoped_and_bounded() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(body(response).await["binary"], true);
+
+    let response = api
+        .router()
+        .oneshot(
+            request(&format!("/v1/sessions/{id}/fs/read?path=.git%2Fconfig"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
     let response = api
         .router()
@@ -417,6 +435,41 @@ async fn project_fs_routes_are_session_scoped_and_bounded() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        std::os::unix::fs::symlink("src/main.txt", workspace.path().join("link-in")).unwrap();
+        let response = api
+            .router()
+            .oneshot(
+                request(&format!("/v1/sessions/{id}/fs/write"))
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"path":"link-in","contentB64":"bXV0YXRlZA=="}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("src/main.txt")).unwrap(),
+            "hello"
+        );
+        let response = api
+            .router()
+            .oneshot(
+                request(&format!("/v1/sessions/{id}/fs/rename"))
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"path":"link-in","to":"link-renamed"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(workspace.path().join("link-in").exists());
     }
 
     api.database.shutdown().await.unwrap();
@@ -547,6 +600,114 @@ async fn project_git_routes_report_diff_and_mutate_index() {
     assert_eq!(summary["requestId"], "req1");
     assert_eq!(summary["branch"], "main");
     assert!(summary["sizeBytes"].as_u64().unwrap() >= 8);
+
+    std::fs::create_dir(workspace.path().join("removed")).unwrap();
+    std::fs::write(
+        workspace.path().join("removed/file.txt"),
+        "old
+",
+    )
+    .unwrap();
+    Command::new("git")
+        .args(["add", "removed/file.txt"])
+        .current_dir(workspace.path())
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args([
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "add removed",
+        ])
+        .current_dir(workspace.path())
+        .output()
+        .unwrap();
+    std::fs::remove_dir_all(workspace.path().join("removed")).unwrap();
+    let response = api
+        .router()
+        .oneshot(
+            request(&format!("/v1/sessions/{id}/git/stage"))
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"paths":["removed/file.txt"],"unstage":false}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = api
+        .router()
+        .oneshot(
+            request(&format!(
+                "/v1/sessions/{id}/git/diff?path=removed%2Ffile.txt&staged=true"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        body(response).await["patch"]
+            .as_str()
+            .unwrap()
+            .contains("-old")
+    );
+
+    Command::new("git")
+        .args(["reset", "--hard", "HEAD"])
+        .current_dir(workspace.path())
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["mv", "file.txt", "renamed.txt"])
+        .current_dir(workspace.path())
+        .output()
+        .unwrap();
+    std::fs::write(
+        workspace.path().join("renamed.txt"),
+        "three
+",
+    )
+    .unwrap();
+    let response = api
+        .router()
+        .oneshot(
+            request(&format!(
+                "/v1/sessions/{id}/git/diff?path=renamed.txt&staged=true"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let patch = body(response).await["patch"].as_str().unwrap().to_owned();
+    assert_eq!(patch, "");
+    let response = api
+        .router()
+        .oneshot(
+            request(&format!("/v1/sessions/{id}/git/status"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let status = body(response).await;
+    assert!(
+        status["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| { file["path"] == "renamed.txt" && file["originalPath"] == "file.txt" })
+    );
 
     api.database.shutdown().await.unwrap();
 }

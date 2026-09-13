@@ -215,6 +215,9 @@ mod tests {
                 size: TerminalSize { cols: 80, rows: 24 },
                 agent: None,
                 command: None,
+                account_id: None,
+                model: None,
+                effort: None,
             })
             .unwrap();
         store.connection.execute_batch("CREATE TABLE inserted(seq INTEGER); CREATE TRIGGER record_insert AFTER INSERT ON terminal_output BEGIN INSERT INTO inserted VALUES(NEW.seq); END;").unwrap();
@@ -285,6 +288,9 @@ mod tests {
                 size: TerminalSize { cols: 80, rows: 24 },
                 agent: None,
                 command: None,
+                account_id: None,
+                model: None,
+                effort: None,
             })
             .unwrap();
         store.checkpoint_terminal(&head.id, archive(0, 2)).unwrap();

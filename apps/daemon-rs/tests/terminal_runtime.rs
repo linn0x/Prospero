@@ -21,6 +21,48 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct EnvGuard {
+    keys: Vec<&'static str>,
+}
+
+impl EnvGuard {
+    fn new(keys: Vec<&'static str>) -> Self {
+        Self { keys }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            for key in &self.keys {
+                std::env::remove_var(key);
+            }
+        }
+    }
+}
+
+fn executable_script(path: &std::path::Path, body: &str) {
+    std::fs::write(path, body).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+async fn wait_for_json(path: &std::path::Path) -> Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(body) = std::fs::read_to_string(path) {
+            return serde_json::from_str(&body).unwrap();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "capture never appeared"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 fn input(directory: &TempDir) -> CreateTerminal {
     CreateTerminal {
         title: "Test terminal".into(),
@@ -28,6 +70,9 @@ fn input(directory: &TempDir) -> CreateTerminal {
         size: TerminalSize { cols: 80, rows: 24 },
         agent: None,
         command: None,
+        account_id: None,
+        model: None,
+        effort: None,
     }
 }
 
@@ -143,6 +188,174 @@ async fn custom_terminal_command_runs_and_archives() {
         .flatten()
         .collect();
     assert!(String::from_utf8_lossy(&bytes).contains("custom-marker"));
+    runtime.shutdown().await.unwrap();
+    database.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn claude_pty_uses_managed_account_environment_and_defaults() {
+    let _lock = ENV_LOCK.lock().await;
+    let directory = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let database = Database::open(directory.path().into()).await.unwrap();
+    let api = Api::new(database.clone(), Token::parse("1".repeat(64)).unwrap());
+    let cli = directory.path().join("fake-claude-pty.py");
+    let capture = directory.path().join("claude-pty.json");
+    executable_script(
+        &cli,
+        r#"#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ["CAPTURE"], "w", encoding="utf-8") as handle:
+    json.dump({"argv": sys.argv[1:], "env": dict(os.environ)}, handle)
+sys.stdout.write("claude-pty-done\n")
+sys.stdout.flush()
+"#,
+    );
+    let _env = EnvGuard::new(vec!["PROSPERO_CLAUDE_BIN", "CAPTURE"]);
+    unsafe {
+        std::env::set_var("PROSPERO_CLAUDE_BIN", &cli);
+        std::env::set_var("CAPTURE", &capture);
+    }
+    let (status, created) = request(
+        &api,
+        &"1".repeat(64),
+        "POST",
+        "/v1/accounts",
+        json!({"type":"agent.account.create","requestId":"create","agent":"claude","name":"pty"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let account_id = created["accountId"].as_str().unwrap().to_owned();
+    let (status, body) = request(
+        &api,
+        &"1".repeat(64),
+        "POST",
+        "/v1/accounts",
+        json!({"type":"agent.account.credential.set","requestId":"cred","accountId":account_id,"credentialKind":"api_key","credential":"sk-prospero-terminal-secret-012345"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let account_root = directory
+        .path()
+        .join("agent-accounts")
+        .join("claude")
+        .join(&account_id);
+    std::fs::write(
+        account_root.join("prospero-overrides.yaml"),
+        "default_model: claude-default\ndefault_effort: high\n",
+    )
+    .unwrap();
+
+    let mut launch = input(&workspace);
+    launch.agent = Some(prosperod_rs::protocol::AgentKind::Claude);
+    launch.account_id = Some(account_id.clone());
+    let head = api.terminals.create(launch).await.unwrap();
+    settled(&api.terminals).await;
+    let dumped = wait_for_json(&capture).await;
+    assert_eq!(dumped["argv"], json!(["--dangerously-skip-permissions"]));
+    let env = &dumped["env"];
+    assert_eq!(
+        env["ANTHROPIC_API_KEY"],
+        "sk-prospero-terminal-secret-012345"
+    );
+    assert_eq!(env["CLAUDE_CODE_OAUTH_TOKEN"], "");
+    assert_eq!(env["CLAUDE_CONFIG_DIR"], account_root.to_str().unwrap());
+    assert_eq!(env["ANTHROPIC_MODEL"], "claude-default");
+    assert_eq!(env["CLAUDE_CODE_EFFORT_LEVEL"], "high");
+    let stored: Option<String> =
+        rusqlite::Connection::open(directory.path().join("prospero.sqlite"))
+            .unwrap()
+            .query_row(
+                "SELECT account_id FROM terminal_runs WHERE session_id=?1",
+                [head.id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+    assert_eq!(stored.as_deref(), Some(account_id.as_str()));
+    api.terminals.shutdown().await.unwrap();
+    database.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn codex_pty_uses_native_isolation_and_model_arguments() {
+    let _lock = ENV_LOCK.lock().await;
+    let directory = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let database = Database::open(directory.path().into()).await.unwrap();
+    let runtime = Terminals::new(database.clone());
+    let cli = directory.path().join("fake-codex-pty.py");
+    let capture = directory.path().join("codex-pty.json");
+    executable_script(
+        &cli,
+        r#"#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ["CAPTURE"], "w", encoding="utf-8") as handle:
+    json.dump({"argv": sys.argv[1:], "env": dict(os.environ)}, handle)
+sys.stdout.write("codex-pty-done\n")
+sys.stdout.flush()
+"#,
+    );
+    let _env = EnvGuard::new(vec![
+        "PROSPERO_CODEX_BIN",
+        "CAPTURE",
+        "OPENAI_API_KEY",
+        "CODEX_API_KEY",
+        "CODEX_ACCESS_TOKEN",
+        "CODEX_REFRESH_TOKEN",
+    ]);
+    unsafe {
+        std::env::set_var("PROSPERO_CODEX_BIN", &cli);
+        std::env::set_var("CAPTURE", &capture);
+        std::env::set_var("OPENAI_API_KEY", "parent-openai");
+        std::env::set_var("CODEX_API_KEY", "parent-codex");
+        std::env::set_var("CODEX_ACCESS_TOKEN", "parent-access");
+        std::env::set_var("CODEX_REFRESH_TOKEN", "parent-refresh");
+    }
+    let mut launch = input(&workspace);
+    launch.agent = Some(prosperod_rs::protocol::AgentKind::Codex);
+    launch.account_id = Some("native-codex".into());
+    launch.model = Some("gpt-6-test".into());
+    launch.effort = Some("high".into());
+    let head = runtime.create(launch).await.unwrap();
+    settled(&runtime).await;
+    let dumped = wait_for_json(&capture).await;
+    assert_eq!(
+        dumped["argv"],
+        json!([
+            "--dangerously-bypass-approvals-and-sandbox",
+            "-c",
+            "model=\"gpt-6-test\"",
+            "-c",
+            "model_reasoning_effort=\"high\""
+        ])
+    );
+    let env = &dumped["env"];
+    let native_root = directory
+        .path()
+        .join("agent-accounts")
+        .join("codex")
+        .join("native-codex");
+    assert_eq!(env["CODEX_HOME"], native_root.to_str().unwrap());
+    assert_eq!(env["CODEX_SQLITE_HOME"], native_root.to_str().unwrap());
+    assert_eq!(env["OPENAI_API_KEY"], "");
+    assert_eq!(env["CODEX_API_KEY"], "");
+    assert_eq!(env["CODEX_ACCESS_TOKEN"], "");
+    assert_eq!(env["CODEX_REFRESH_TOKEN"], "");
+    let stored: Option<String> =
+        rusqlite::Connection::open(directory.path().join("prospero.sqlite"))
+            .unwrap()
+            .query_row(
+                "SELECT account_id FROM terminal_runs WHERE session_id=?1",
+                [head.id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+    assert_eq!(stored.as_deref(), Some("native-codex"));
+
+    let mut rejected = input(&workspace);
+    rejected.agent = Some(prosperod_rs::protocol::AgentKind::Codex);
+    rejected.account_id = Some("00000000-0000-0000-0000-000000000000".into());
+    assert!(runtime.create(rejected).await.is_err());
     runtime.shutdown().await.unwrap();
     database.shutdown().await.unwrap();
 }
