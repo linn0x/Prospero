@@ -46,9 +46,11 @@ impl Harness {
                 title: "Real CLI acceptance".into(),
                 workspace: workspace.path().to_str().unwrap().into(),
                 auto_approve,
+                mode: None,
                 model: None,
                 effort: None,
                 account_id: None,
+                resume: None,
             })
             .await
             .unwrap();

@@ -11,6 +11,19 @@ use crate::error::{Error, Result};
 pub use runtime::Agents;
 pub use store::{ApprovalPolicy, PermissionMode};
 
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct ResumeInput {
+    /// Agent-native conversation/session id to attach on the first turn.
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Kept for protocol parity; Rust/Claude rejects forked resume like TS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork: Option<bool>,
+}
+
 #[derive(Debug, Deserialize, Serialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CreateAgentSession {
@@ -20,6 +33,9 @@ pub struct CreateAgentSession {
     pub workspace: String,
     #[serde(default)]
     pub auto_approve: bool,
+    /// Optional initial collaboration mode for structured Claude sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     /// Optional launch catalog selection (native CLI aliases / ids).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -28,6 +44,9 @@ pub struct CreateAgentSession {
     /// Managed account id; None (or the native id) uses the本机默认环境.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
+    /// Agent-native local conversation to resume at launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<ResumeInput>,
 }
 
 fn default_agent_kind() -> crate::protocol::AgentKind {

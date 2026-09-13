@@ -268,9 +268,11 @@ pub async fn start_worker(
             title,
             workspace: worker_cwd.clone(),
             auto_approve: policy,
+            mode: None,
             model: None,
             effort: None,
             account_id,
+            resume: None,
         })
         .await
     {

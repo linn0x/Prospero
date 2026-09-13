@@ -1463,11 +1463,7 @@ async fn set_agent_mode(
 ) -> std::result::Result<Json<serde_json::Value>, ApiError> {
     crate::database::validate_id(&id).map_err(ApiError)?;
     let Json(selection) = body.map_err(|_| Error::Invalid("invalid mode selection".into()))?;
-    let mode = match selection.mode.as_str() {
-        "default" => PermissionMode::Default,
-        "plan" => PermissionMode::Plan,
-        _ => return Err(ApiError(Error::Invalid("会话模式无效".into()))),
-    };
+    let mode = PermissionMode::from_wire(&selection.mode).map_err(ApiError)?;
     api.agents.set_mode(&id, mode).await?;
     Ok(Json(serde_json::json!({ "currentMode": selection.mode })))
 }

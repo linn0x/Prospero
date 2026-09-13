@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use prosperod_rs::{
-    agent::{Agents, ApprovalPolicy, CreateAgentSession, PermissionMode},
+    agent::{Agents, ApprovalPolicy, CreateAgentSession, PermissionMode, ResumeInput},
     protocol::{MessageRole, TimelineBody, TimelineQuery},
     worker::Database,
 };
@@ -349,9 +349,11 @@ impl Harness {
                 title: "Agent test".into(),
                 workspace: self.workspace.path().to_str().unwrap().into(),
                 auto_approve: false,
+                mode: None,
                 model: None,
                 effort: None,
                 account_id: None,
+                resume: None,
             })
             .await
             .unwrap()
@@ -501,6 +503,91 @@ async fn multi_turn_resumes_native_session() {
     assert_eq!(turns.len(), 2);
     assert_eq!(turns[0], "resume=None");
     assert_eq!(turns[1], "resume=native-1");
+}
+
+#[tokio::test]
+async fn launch_resume_uses_native_session_id() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("resume").await;
+    let head = harness
+        .agents
+        .create(CreateAgentSession {
+            agent: prosperod_rs::protocol::AgentKind::Claude,
+            title: "Fallback title".into(),
+            workspace: harness.workspace.path().to_str().unwrap().into(),
+            auto_approve: false,
+            mode: None,
+            model: None,
+            effort: None,
+            account_id: None,
+            resume: Some(ResumeInput {
+                id: "existing-native".into(),
+                title: Some("Resumed title".into()),
+                fork: None,
+            }),
+        })
+        .await
+        .unwrap();
+    assert_eq!(head.title, "Resumed title");
+    harness
+        .agents
+        .send(&head.id, "continue".into(), None, Vec::new())
+        .await
+        .unwrap();
+    harness
+        .wait_for(&head.id, |records| {
+            records.iter().any(|(_, body, _)| {
+                matches!(
+                    body,
+                    TimelineBody::TurnEnd { finish } if finish == "completed"
+                )
+            })
+        })
+        .await;
+    let log = std::fs::read_to_string(harness.workspace.path().join("turns.log")).unwrap();
+    assert_eq!(
+        log.lines().collect::<Vec<_>>(),
+        vec!["resume=existing-native"]
+    );
+    assert!(
+        harness
+            .records(&head.id)
+            .await
+            .iter()
+            .any(|(_, body, preview)| matches!(
+                body,
+                TimelineBody::Message {
+                    role: prosperod_rs::protocol::MessageRole::Assistant,
+                    ..
+                }
+            ) && preview == "second turn")
+    );
+}
+
+#[tokio::test]
+async fn launch_resume_rejects_fork() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("resume").await;
+    let err = harness
+        .agents
+        .create(CreateAgentSession {
+            agent: prosperod_rs::protocol::AgentKind::Claude,
+            title: "Fork".into(),
+            workspace: harness.workspace.path().to_str().unwrap().into(),
+            auto_approve: false,
+            mode: None,
+            model: None,
+            effort: None,
+            account_id: None,
+            resume: Some(ResumeInput {
+                id: "existing-native".into(),
+                title: None,
+                fork: Some(true),
+            }),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, prosperod_rs::error::Error::Conflict));
 }
 
 #[tokio::test]
@@ -905,9 +992,11 @@ async fn recovery_archives_active_run_without_replaying_turn() {
             title: "Recovery".into(),
             workspace: workspace.path().to_str().unwrap().into(),
             auto_approve: false,
+            mode: None,
             model: None,
             effort: None,
             account_id: None,
+            resume: None,
         })
         .await
         .unwrap();
@@ -1029,9 +1118,11 @@ async fn launch_model_and_effort_are_passed_on_every_turn() {
             title: "Model pick".into(),
             workspace: harness.workspace.path().to_str().unwrap().into(),
             auto_approve: false,
+            mode: None,
             model: Some("opus[1m]".into()),
             effort: Some("high".into()),
             account_id: None,
+            resume: None,
         })
         .await
         .unwrap();
@@ -1085,6 +1176,53 @@ async fn launch_model_and_effort_are_passed_on_every_turn() {
 }
 
 #[tokio::test]
+async fn launch_plan_mode_is_applied_on_first_turn() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("planflag").await;
+    let head = harness
+        .agents
+        .create(CreateAgentSession {
+            agent: prosperod_rs::protocol::AgentKind::Claude,
+            title: "Plan launch".into(),
+            workspace: harness.workspace.path().to_str().unwrap().into(),
+            auto_approve: false,
+            mode: Some("plan".into()),
+            model: None,
+            effort: None,
+            account_id: None,
+            resume: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        harness.agents.mode(&head.id).await.unwrap(),
+        PermissionMode::Plan
+    );
+    harness
+        .agents
+        .send(&head.id, "plan first".into(), None, Vec::new())
+        .await
+        .unwrap();
+    harness
+        .wait_for(&head.id, |records| {
+            records.iter().any(|(_, body, _)| {
+                matches!(
+                    body,
+                    TimelineBody::TurnEnd { finish } if finish == "completed"
+                )
+            })
+        })
+        .await;
+    let args = std::fs::read_to_string(harness.workspace.path().join("args.log")).unwrap();
+    let argv: Vec<&str> = args.lines().collect();
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair == ["--permission-mode", "plan"]),
+        "launch-time plan mode must carry --permission-mode plan: {argv:?}"
+    );
+}
+
+#[tokio::test]
 async fn invalid_launch_selection_is_rejected() {
     let _guard = SERIAL.lock().await;
     let harness = Harness::new("chat").await;
@@ -1104,13 +1242,36 @@ async fn invalid_launch_selection_is_rejected() {
                 title: "Bad selection".into(),
                 workspace: harness.workspace.path().to_str().unwrap().into(),
                 auto_approve: false,
+                mode: None,
                 model,
                 effort,
                 account_id: None,
+                resume: None,
             })
             .await;
         assert!(result.is_err(), "case {index} must be rejected");
     }
+}
+
+#[tokio::test]
+async fn invalid_launch_mode_is_rejected() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("chat").await;
+    let result = harness
+        .agents
+        .create(CreateAgentSession {
+            agent: prosperod_rs::protocol::AgentKind::Claude,
+            title: "Bad mode".into(),
+            workspace: harness.workspace.path().to_str().unwrap().into(),
+            auto_approve: false,
+            mode: Some("apply".into()),
+            model: None,
+            effort: None,
+            account_id: None,
+            resume: None,
+        })
+        .await;
+    assert!(result.is_err());
 }
 
 #[tokio::test]
@@ -1124,9 +1285,11 @@ async fn in_session_models_combines_catalog_with_persisted_selection() {
             title: "Picked".into(),
             workspace: harness.workspace.path().to_str().unwrap().into(),
             auto_approve: false,
+            mode: None,
             model: Some("opus[1m]".into()),
             effort: Some("high".into()),
             account_id: None,
+            resume: None,
         })
         .await
         .unwrap();

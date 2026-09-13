@@ -270,9 +270,11 @@ async fn session_models_and_controls_routes_serve_persisted_selection() {
             title: "Pick".into(),
             workspace: workspace.into(),
             auto_approve: false,
+            mode: None,
             model: Some("opus[1m]".into()),
             effort: Some("high".into()),
             account_id: None,
+            resume: None,
         })
         .await
         .unwrap();

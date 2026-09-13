@@ -48,13 +48,30 @@ export type TerminalInput = { dataB64: string, };
 export type TerminalSnapshot = { seq: number, size: TerminalSize, dataB64: string, };
 export type CreateAgentSession = { agent: AgentKind, title: string, workspace: string, autoApprove: boolean, 
 /**
+ * Optional initial collaboration mode for structured Claude sessions.
+ */
+mode?: string | null, 
+/**
  * Optional launch catalog selection (native CLI aliases / ids).
  */
 model?: string | null, effort?: string | null, 
 /**
  * Managed account id; None (or the native id) uses the本机默认环境.
  */
-accountId?: string | null, };
+accountId?: string | null, 
+/**
+ * Agent-native local conversation to resume at launch.
+ */
+resume?: ResumeInput | null, };
+export type ResumeInput = { 
+/**
+ * Agent-native conversation/session id to attach on the first turn.
+ */
+id: string, title?: string | null, 
+/**
+ * Kept for protocol parity; Rust/Claude rejects forked resume like TS.
+ */
+fork?: boolean | null, };
 export type LaunchModelInfo = { id: string, label: string, description?: string | null, supportedEfforts: Array<string>, isDefault?: boolean, };
 export type LaunchModelCatalog = { models: Array<LaunchModelInfo>, currentModel: string | null, };
 export type AgentModelSelection = { model: string, effort: string | null, };
