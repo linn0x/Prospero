@@ -1911,16 +1911,16 @@ async fn image_attachments_reach_cli_as_image_first_frame() {
     assert_eq!(blocks[2]["text"], "look at these");
 
     // The persisted user record carries metadata refs only (no bytes).
-    let user = harness
+    let (message_id, user) = harness
         .records(&head.id)
         .await
         .into_iter()
-        .find_map(|(_, body, _)| match body {
+        .find_map(|(id, body, _)| match body {
             TimelineBody::Message {
                 role: MessageRole::User,
                 attachments,
                 ..
-            } => Some(attachments),
+            } => Some((id, attachments)),
             _ => None,
         })
         .expect("user message record");
@@ -1929,6 +1929,25 @@ async fn image_attachments_reach_cli_as_image_first_frame() {
     assert_eq!(user[0].name.as_deref(), Some("diagram.png"));
     assert!(!user[0].id.is_empty());
     assert!(user[1].name.is_none());
+
+    let chunk = harness
+        .agents
+        .attachment_chunk(&head.id, &message_id, &user[0].id, 0, 4)
+        .await
+        .unwrap()
+        .expect("stored attachment chunk");
+    assert_eq!(chunk.mime_type, "image/png");
+    assert_eq!(chunk.total, 8);
+    assert!(!chunk.eof);
+    assert_eq!(chunk.data_b64, "iVBORw==");
+    let tail = harness
+        .agents
+        .attachment_chunk(&head.id, &message_id, &user[0].id, 4, 1024)
+        .await
+        .unwrap()
+        .expect("stored attachment tail");
+    assert!(tail.eof);
+    assert_eq!(tail.data_b64, "DQoaCg==");
 }
 
 #[tokio::test]
@@ -1946,7 +1965,7 @@ async fn image_only_message_is_valid_and_rejected_forms_fail() {
             None,
             vec![prosperod_rs::agent::AttachmentInput {
                 mime_type: "image/gif".into(),
-                data_b64: "R0lGOD".into(),
+                data_b64: "R0lGODlh".into(),
                 name: None,
             }],
         )
