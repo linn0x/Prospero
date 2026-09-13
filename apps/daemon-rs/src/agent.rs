@@ -284,6 +284,27 @@ pub struct AgentModelSelectionResult {
     pub current_effort: Option<String>,
 }
 
+#[derive(Debug, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct AgentControlResult {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub sid: String,
+    pub request_id: String,
+    pub action: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct AgentCompactRequest {
+    pub request_id: String,
+}
+
 /// In-session model catalog (mirrors the legacy `agent.models` payload):
 /// fresh catalog plus the session's persisted current selection.
 #[derive(Debug, Serialize, TS)]
@@ -297,7 +318,7 @@ pub struct AgentModelCatalog {
 }
 
 /// Per-session model/mode control flags projected into the desktop session
-/// list (`agentControls`). Compact is not implemented by the Rust daemon.
+/// list (`agentControls`).
 #[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(rename_all = "camelCase")]

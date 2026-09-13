@@ -157,6 +157,18 @@ elif scenario == "modelflag":
         log.write("\n".join(sys.argv[1:]) + "\n--\n")
     text_block("picked model")
     result()
+elif scenario == "compact":
+    frame = line
+    if "/compact" not in frame:
+        frame = read_line_raw()
+    with open(os.path.join(cwd, "compact.log"), "w") as log:
+        log.write(frame)
+    if "/compact" in frame:
+        emit({"type": "system", "subtype": "status", "compact_result": "success"})
+    else:
+        emit({"type": "system", "subtype": "status", "compact_result": "failed",
+              "compact_error": "missing compact command"})
+    result()
 elif scenario == "setmodel":
     if resume is not None:
         # Chained turn: record argv so the test can prove the persisted
@@ -1094,10 +1106,49 @@ async fn in_session_models_combines_catalog_with_persisted_selection() {
         .unwrap();
     assert!(picked_controls.model);
     assert!(picked_controls.mode);
-    assert!(!picked_controls.compact);
+    assert!(picked_controls.compact);
     assert_eq!(picked_controls.current_model.as_deref(), Some("opus[1m]"));
     assert_eq!(picked_controls.current_effort.as_deref(), Some("high"));
     assert_eq!(picked_controls.current_mode.as_deref(), Some("default"));
+}
+
+#[tokio::test]
+async fn compact_sends_slash_command_and_records_compact_finish() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("compact").await;
+    let head = harness.create().await;
+    harness
+        .agents
+        .send(&head.id, "start".into(), None, Vec::new())
+        .await
+        .unwrap();
+
+    let result = harness
+        .agents
+        .compact(&head.id, "compact-req")
+        .await
+        .unwrap();
+    let raw = std::fs::read_to_string(harness.workspace.path().join("compact.log")).unwrap();
+    assert!(result.ok, "{result:?}; raw={raw:?}");
+    assert_eq!(result.kind, "agent.control.result");
+    assert_eq!(result.action, "compact");
+    assert_eq!(result.request_id, "compact-req");
+    assert!(raw.contains("/compact"), "compact command not sent: {raw}");
+
+    let records = harness
+        .wait_for(&head.id, |records| {
+            let compact = records.iter().any(|(_, body, _)| {
+                matches!(body, TimelineBody::TurnEnd { finish } if finish == "compact")
+            });
+            let completed = records.iter().any(|(_, body, _)| {
+                matches!(body, TimelineBody::TurnEnd { finish } if finish == "completed")
+            });
+            compact && completed
+        })
+        .await;
+    assert!(records.iter().any(|(_, body, _)| {
+        matches!(body, TimelineBody::TurnEnd { finish } if finish == "compact")
+    }));
 }
 
 #[tokio::test]

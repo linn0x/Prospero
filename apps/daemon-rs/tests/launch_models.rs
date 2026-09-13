@@ -366,7 +366,7 @@ async fn session_models_and_controls_routes_serve_persisted_selection() {
         .unwrap();
     assert_eq!(row["model"], true);
     assert_eq!(row["mode"], true);
-    assert_eq!(row["compact"], false);
+    assert_eq!(row["compact"], true);
     assert_eq!(row["currentModel"], "default");
     assert_eq!(row["currentMode"], "default");
 }

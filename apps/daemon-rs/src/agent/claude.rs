@@ -95,6 +95,10 @@ pub(super) enum AdapterEvent {
         questions: Vec<QuestionSpec>,
         reply: oneshot::Sender<QuestionReply>,
     },
+    Compact {
+        ok: bool,
+        message: String,
+    },
     Finish {
         interrupted: bool,
         error: Option<String>,
@@ -470,6 +474,18 @@ impl ClaudeTurn {
     /// a broken pipe (the result frame ended the turn) surfaces as an error
     /// and the caller falls back to the front of the queue.
     pub(super) async fn steer(
+        &self,
+        text: &str,
+        attachments: &[crate::agent::AttachmentInput],
+    ) -> Result<()> {
+        self.send_user(text, attachments).await
+    }
+
+    pub(super) async fn compact(&self) -> Result<()> {
+        self.send_user("/compact", &[]).await
+    }
+
+    async fn send_user(
         &self,
         text: &str,
         attachments: &[crate::agent::AttachmentInput],
@@ -990,6 +1006,18 @@ impl Translator {
     fn translate_system(&mut self, message: &Value, out: &mut Vec<AdapterEvent>) {
         let subtype = message.get("subtype").and_then(Value::as_str);
         match subtype {
+            Some("status") => {
+                if let Some(value) = message.get("compact_result").and_then(Value::as_str) {
+                    out.push(AdapterEvent::Compact {
+                        ok: value == "success",
+                        message: message
+                            .get("compact_error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Claude 上下文压缩失败")
+                            .to_owned(),
+                    });
+                }
+            }
             Some("init") if self.native_id.is_none() => {
                 if let Some(id) = message.get("session_id").and_then(Value::as_str) {
                     self.native_id = Some(id.to_owned());

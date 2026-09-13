@@ -59,6 +59,7 @@ struct Handle {
     /// request id -> timeline record id of pending approvals.
     records: Mutex<HashMap<String, String>>,
     questions: Mutex<HashMap<String, QuestionPending>>,
+    compact: Mutex<Option<oneshot::Sender<std::result::Result<(), String>>>>,
     /// Starts true; flipped once the turn's `result` frame has been observed.
     /// A steer delivered later cannot reach the CLI (its stdin is about to be
     /// closed), so busy-send/guide degrade to the front of the queue instead
@@ -447,6 +448,7 @@ impl Agents {
             replies: Mutex::new(HashMap::new()),
             records: Mutex::new(HashMap::new()),
             questions: Mutex::new(HashMap::new()),
+            compact: Mutex::new(None),
             steerable: AtomicBool::new(true),
         });
         **guard = Some(handle.clone());
@@ -578,6 +580,49 @@ impl Agents {
                 }
             }
         });
+    }
+
+    pub async fn compact(&self, id: &str, request_id: &str) -> Result<AgentControlResult> {
+        crate::database::validate_id(id)?;
+        let entry = self.session_entry(id).await?;
+        let handle = entry.handle.lock().await.clone().ok_or(Error::Conflict)?;
+        {
+            let mut waiter = handle.compact.lock().await;
+            if waiter.is_some() {
+                return Err(Error::Busy);
+            }
+            let (sender, receiver) = oneshot::channel();
+            *waiter = Some(sender);
+            drop(waiter);
+            let send_result = handle.driver.lock().await.compact().await;
+            if let Err(error) = send_result {
+                let _ = handle.compact.lock().await.take();
+                return Err(error);
+            }
+            match tokio::time::timeout(Duration::from_secs(180), receiver).await {
+                Ok(Ok(Ok(()))) => Ok(AgentControlResult {
+                    kind: "agent.control.result".into(),
+                    sid: id.to_owned(),
+                    request_id: request_id.chars().take(100).collect(),
+                    action: "compact".into(),
+                    ok: true,
+                    message: None,
+                }),
+                Ok(Ok(Err(message))) => Ok(AgentControlResult {
+                    kind: "agent.control.result".into(),
+                    sid: id.to_owned(),
+                    request_id: request_id.chars().take(100).collect(),
+                    action: "compact".into(),
+                    ok: false,
+                    message: Some(message),
+                }),
+                Ok(Err(_)) => Err(Error::Closed),
+                Err(_) => {
+                    let _ = handle.compact.lock().await.take();
+                    Err(Error::Timeout)
+                }
+            }
+        }
     }
 
     async fn run_turn(&self, id: String, turn: i64, handle: Arc<Handle>) {
@@ -977,6 +1022,36 @@ impl Agents {
                     }
                     self.set_status(&id, SessionStatus::WaitingInput).await.ok();
                 }
+                AdapterEvent::Compact { ok, message } => {
+                    if let Some(waiter) = handle.compact.lock().await.take() {
+                        let _ = waiter.send(if ok { Ok(()) } else { Err(message.clone()) });
+                    }
+                    if ok {
+                        pending.push(TimelineWrite {
+                            id: format!("turn{turn}-compact-{}", uuid::Uuid::new_v4().simple()),
+                            turn_id: format!("turn{turn}"),
+                            expected_revision: 0,
+                            body: TimelineBody::TurnEnd {
+                                finish: "compact".into(),
+                            },
+                            text: String::new(),
+                            replace: false,
+                            subagent_id: None,
+                        });
+                        flush!();
+                    } else {
+                        pending.push(TimelineWrite {
+                            id: format!("turn{turn}-compact-error"),
+                            turn_id: format!("turn{turn}"),
+                            expected_revision: 0,
+                            body: TimelineBody::Error,
+                            text: bounded_text(message),
+                            replace: false,
+                            subagent_id: None,
+                        });
+                        flush!();
+                    }
+                }
                 AdapterEvent::Finish {
                     interrupted: was_interrupted,
                     error,
@@ -1002,6 +1077,12 @@ impl Agents {
                     break;
                 }
             }
+        }
+
+        if let Some(waiter) = handle.compact.lock().await.take() {
+            let _ = waiter.send(Err(failure
+                .clone()
+                .unwrap_or_else(|| "Claude 上下文压缩未完成".into())));
         }
 
         // Terminal records: error (if any) and the turn end marker.
