@@ -3,7 +3,7 @@ import type { RustContent } from "../shared/rust-api";
 import type { TimelinePage, TimelineQuery, TimelineLookupResult, TimelineTextQuery, TimelineTextPage } from "@prospero/protocol/rust-daemon";
 import type { CreateTerminal, TerminalPage, TerminalQuery, TerminalSize, TerminalSnapshot } from "@prospero/protocol/rust-daemon";
 import type { AgentSend, AgentControlResult, AgentModeCatalog, AgentModelCatalog, AgentModelSelectionResult, AgentControlsProjection, CreateAgentSession, PermissionDecision, QuestionDecision, SubagentSnapshot, AgentQueue, AgentQueues } from "@prospero/protocol/rust-daemon";
-import type { AccountListResult, LaunchModelCatalog, SourceResult, UsageResult } from "@prospero/protocol/rust-daemon";
+import type { AccountListResult, ConversationSearchResult, LaunchModelCatalog, ResumableConversation, SourceResult, UsageResult } from "@prospero/protocol/rust-daemon";
 import type { FsChunk, FsContent, FsDone, FsListing, FsWritten, GitDiffResult, GitDone, GitHistoryResult, GitStatusResult, SearchResult as RustProjectSearchResult, WorkspaceSummaryResult } from "@prospero/protocol/rust-daemon";
 import type {
   AbandonRun, ApplyTaskGraph, CancelTask, CleanupWorktree, CompleteRun, CreateGate,
@@ -97,6 +97,12 @@ export class RustClient {
   createAgentSession(input: CreateAgentSession, signal: AbortSignal | null = null): Promise<SessionHead> {
     return this.json("/v1/agent-sessions", { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
   }
+  localConversations(agent: "claude" | "codex" | "deepseek", query: string, limit = 20, accountId?: string, signal: AbortSignal | null = null): Promise<ResumableConversation[]> {
+    const params = new URLSearchParams({ agent, query, limit: String(limit) });
+    if (accountId) params.set("accountId", accountId);
+    return this.json<ConversationSearchResult>(`/v1/conversations?${params}`, { signal, timeoutMs: 30_000 }).then(result => result.conversations);
+  }
+
   agentSend(value: string, input: AgentSend, signal: AbortSignal | null = null): Promise<{ ok: boolean }> {
     return this.json(`/v1/agent-sessions/${id(value)}/send`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
   }

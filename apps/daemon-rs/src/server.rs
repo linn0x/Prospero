@@ -102,6 +102,7 @@ impl Api {
             .route("/v1/health", get(health))
             .route("/v1/shutdown", post(shutdown))
             .route("/v1/agent-sessions", post(create_agent))
+            .route("/v1/conversations", get(conversation_search))
             .route("/v1/agent-sessions/queues", get(agent_queues))
             .route("/v1/usage", get(usage_route))
             .route("/v1/agent-sessions/{id}/send", post(agent_send))
@@ -355,6 +356,47 @@ async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, Api
         ]
         .map(str::to_owned)
         .to_vec(),
+    }))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConversationSearchQuery {
+    agent: String,
+    #[serde(default)]
+    account_id: Option<String>,
+    #[serde(default)]
+    query: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+async fn conversation_search(
+    State(api): State<Api>,
+    Query(query): Query<ConversationSearchQuery>,
+) -> std::result::Result<Json<crate::agent::ConversationSearchResult>, ApiError> {
+    if query.agent != "claude" {
+        return Err(ApiError(Error::Invalid(
+            "Rust daemon 当前仅支持搜索 Claude 本机对话".into(),
+        )));
+    }
+    if query.query.chars().count() > 300 || query.query.chars().any(char::is_control) {
+        return Err(ApiError(Error::Invalid("对话搜索词无效".into())));
+    }
+    if query.limit.is_some_and(|limit| !(1..=50).contains(&limit)) {
+        return Err(ApiError(Error::Invalid("对话搜索数量无效".into())));
+    }
+    let _permit = api.requests.acquire().await.map_err(|_| Error::Closed)?;
+    let conversations = crate::agent::conversations::search_claude_conversations(
+        &api.database,
+        query.account_id,
+        query.query,
+        query.limit,
+    )
+    .await?;
+    Ok(Json(crate::agent::ConversationSearchResult {
+        agent: crate::protocol::AgentKind::Claude,
+        conversations,
     }))
 }
 
