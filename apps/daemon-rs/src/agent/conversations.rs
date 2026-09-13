@@ -266,7 +266,7 @@ pub(crate) async fn search_codex_conversations(
     }
     let limit = limit.unwrap_or(20).clamp(1, MAX_RESULTS);
     match account_id.as_deref() {
-        None | Some(crate::agent::usage::NATIVE_CODEX_ID) => {}
+        None | Some(crate::agent::NATIVE_CODEX_ID) => {}
         Some(_) => {
             return Err(Error::Invalid(
                 "Rust daemon 当前仅支持本机 Codex 对话搜索".into(),
