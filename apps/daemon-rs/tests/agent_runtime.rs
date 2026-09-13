@@ -353,6 +353,11 @@ for line in sys.stdin:
             with open(os.path.join(os.getcwd(), "approval-response.json"), "w") as log:
                 log.write(json.dumps(reply))
             emit({"jsonrpc": "2.0", "method": "item/completed", "params": {"threadId": params.get("threadId"), "item": {"id": "tool-1", "type": "commandExecution", "status": "completed", "aggregatedOutput": "ok"}}})
+        if scenario == "codexquestion":
+            emit({"jsonrpc": "2.0", "id": "question-req", "method": "item/tool/requestUserInput", "params": {"threadId": params.get("threadId"), "approvalId": "ask-1", "questions": [{"id": "q1", "header": "Pick", "question": "Choose", "options": [{"label": "A", "description": "Alpha"}], "multiSelect": True}]}})
+            reply = json.loads(sys.stdin.readline())
+            with open(os.path.join(os.getcwd(), "question-response.json"), "w") as log:
+                log.write(json.dumps(reply))
         emit({"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": {"threadId": params.get("threadId"), "itemId": "msg-1", "delta": "hello "}})
         emit({"jsonrpc": "2.0", "method": "item/reasoning/textDelta", "params": {"threadId": params.get("threadId"), "itemId": "think-1", "delta": "thinking"}})
         emit({"jsonrpc": "2.0", "method": "item/completed", "params": {"threadId": params.get("threadId"), "item": {"id": "msg-1", "type": "agentMessage", "text": "hello from fake codex"}}})
@@ -665,6 +670,87 @@ async fn codex_permission_roundtrip_responds_to_app_server() {
     .unwrap();
     assert_eq!(response["id"], "approval-1");
     assert_eq!(response["result"]["decision"], "accept");
+}
+
+#[tokio::test]
+async fn codex_question_roundtrip_responds_to_app_server() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("codexquestion").await;
+    let cli = harness.workspace.path().join("fake-codex.py");
+    std::fs::write(&cli, FAKE_CODEX).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    unsafe {
+        std::env::set_var("PROSPERO_CODEX_BIN", &cli);
+    }
+    let head = harness.create_codex().await;
+    harness
+        .agents
+        .send(&head.id, "needs input".into(), None, Vec::new())
+        .await
+        .unwrap();
+
+    let records = harness
+        .wait_for(&head.id, |records| {
+            records.iter().any(|(_, body, _)| {
+                matches!(
+                    body,
+                    TimelineBody::Question {
+                        resolved: false,
+                        ..
+                    }
+                )
+            })
+        })
+        .await;
+    let request_id = records
+        .iter()
+        .find_map(|(_, body, _)| match body {
+            TimelineBody::Question {
+                request_id,
+                questions,
+                resolved: false,
+                ..
+            } => {
+                assert_eq!(questions[0].id, "q1");
+                assert_eq!(questions[0].question, "Choose");
+                Some(request_id.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(request_id, "ask-1");
+    harness
+        .agents
+        .respond_question(
+            &head.id,
+            &request_id,
+            vec![prosperod_rs::agent::QuestionAnswer {
+                question_id: "q1".into(),
+                values: vec!["A".into(), "custom".into()],
+            }],
+            false,
+        )
+        .await
+        .unwrap();
+
+    harness
+        .wait_for(&head.id, |records| {
+            records.iter().any(|(_, body, _)| {
+                matches!(body, TimelineBody::TurnEnd { finish } if finish == "completed")
+            })
+        })
+        .await;
+    let response: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(harness.workspace.path().join("question-response.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(response["id"], "question-req");
+    assert_eq!(response["result"]["answers"]["q1"]["answers"][0], "A");
+    assert_eq!(response["result"]["answers"]["q1"]["answers"][1], "custom");
 }
 
 #[tokio::test]
