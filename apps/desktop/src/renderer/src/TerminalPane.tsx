@@ -176,6 +176,25 @@ export function terminalBootstrapCursor(cachedCursor?: number): number {
   return typeof cachedCursor === "number" && Number.isSafeInteger(cachedCursor) && cachedCursor >= 0 ? cachedCursor : 0;
 }
 
+export function terminalNormalizeProposedSize(
+  size: { cols: number; rows: number } | undefined,
+): { cols: number; rows: number } | undefined {
+  if (!size) return undefined;
+  return {
+    cols: Math.max(20, Math.min(500, size.cols)),
+    rows: Math.max(5, Math.min(300, size.rows)),
+  };
+}
+
+export function terminalProposedSizeDiffers(
+  cols: number,
+  rows: number,
+  size: { cols: number; rows: number } | undefined,
+): boolean {
+  const next = terminalNormalizeProposedSize(size);
+  return Boolean(next && (next.cols !== cols || next.rows !== rows));
+}
+
 export function TerminalPane({ session, fontFamily, fontSize }: { session: SessionInfo; fontFamily: string; fontSize: number }) {
   const { t } = useLocale();
   const tRef = useRef(t);
@@ -237,9 +256,9 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
     if (session.terminalMode === "events") {
       if (!connectedRef.current || readOnlyRef.current) return;
       const size = fit.proposeDimensions();
-      if (size) {
-        const cols = Math.max(20, Math.min(500, size.cols)); const rows = Math.max(5, Math.min(300, size.rows));
-        if (cols !== terminal.cols || rows !== terminal.rows) void queueInteraction({ type: "term.resize", cols, rows });
+      const next = terminalNormalizeProposedSize(size);
+      if (next && terminalProposedSizeDiffers(terminal.cols, terminal.rows, next)) {
+        void queueInteraction({ type: "term.resize", cols: next.cols, rows: next.rows });
       }
     } else {
       fit.fit();
@@ -437,6 +456,22 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
       setBell(true);
       window.clearTimeout(bellTimer);
       bellTimer = window.setTimeout(() => setBell(false), 170);
+    });
+    let lastWheelRefit = 0;
+    terminal.attachCustomWheelEventHandler(() => {
+      // tmux mouse scroll depends on the browser terminal dimensions matching
+      // the attached tmux pane. Some Electron layouts can settle without a
+      // ResizeObserver tick; users noticed wheel scroll returning only after
+      // Cmd+Shift+F changed the dock size. Probe on wheel and perform the same
+      // fit path opportunistically before xterm translates the wheel event.
+      if (session.terminalMode !== "events" && !replayingRef.current && host.current?.getClientRects().length) {
+        const now = performance.now();
+        if (now - lastWheelRefit > 250 && terminalProposedSizeDiffers(terminal.cols, terminal.rows, fit.proposeDimensions())) {
+          lastWheelRefit = now;
+          fitToHost();
+        }
+      }
+      return true;
     });
 
     let resizeTimer: number | undefined;
