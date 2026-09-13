@@ -75,6 +75,7 @@ struct QuestionPending {
 
 struct Session {
     handle: Mutex<Option<Arc<Handle>>>,
+    usage: Mutex<UsageReport>,
     ended: watch::Sender<()>,
     /// Serializes drain loops so only the turn that just finished chains the
     /// queued turns (mirrors the legacy `drainingQueue` guard).
@@ -167,16 +168,29 @@ impl Agents {
             effort: input.effort,
             account_id: input.account_id,
         };
+        let database = self.0.database.clone();
         let head = self
             .0
             .database
-            .call(move |store| store.create_agent_session(create, policy))
+            .call(move |store| {
+                if let Some(account_id) = create.account_id.as_deref()
+                    && let Some(message) =
+                        crate::accounts::source_bound_launch_error(&database, account_id)?
+                {
+                    return Err(Error::Invalid(message));
+                }
+                store.create_agent_session(create, policy)
+            })
             .await?;
         let (ended, _) = watch::channel(());
         self.0.entries.lock().await.insert(
             head.id.clone(),
             Arc::new(Session {
                 handle: Mutex::new(None),
+                usage: Mutex::new(UsageReport {
+                    windows: Vec::new(),
+                    ..Default::default()
+                }),
                 ended,
                 draining: Mutex::new(()),
                 permit: Mutex::new(Some(permit)),
@@ -934,8 +948,23 @@ impl Agents {
                 AdapterEvent::Finish {
                     interrupted: was_interrupted,
                     error,
+                    cost_usd,
+                    input_tokens,
+                    output_tokens,
                 } => {
                     handle.steerable.store(false, Ordering::Release);
+                    let has_usage = cost_usd.unwrap_or(0.0) > 0.0
+                        || input_tokens.unwrap_or(0) > 0
+                        || output_tokens.unwrap_or(0) > 0;
+                    if has_usage && let Ok(session) = self.session_entry(&id).await {
+                        let mut usage = session.usage.lock().await;
+                        usage.cost_usd =
+                            Some(usage.cost_usd.unwrap_or(0.0) + cost_usd.unwrap_or(0.0));
+                        usage.input_tokens =
+                            Some(usage.input_tokens.unwrap_or(0) + input_tokens.unwrap_or(0));
+                        usage.output_tokens =
+                            Some(usage.output_tokens.unwrap_or(0) + output_tokens.unwrap_or(0));
+                    }
                     interrupted = was_interrupted;
                     failure = error;
                     break;
@@ -1346,6 +1375,109 @@ impl Agents {
         })
         .await
         .map_err(|_| Error::Closed)?
+    }
+
+    pub async fn usage(&self, id: &str) -> Result<Option<UsageReport>> {
+        let entry = self.session_entry(id).await?;
+        let report = entry.usage.lock().await.clone();
+        if report.cost_usd.unwrap_or(0.0) == 0.0
+            && report.input_tokens.unwrap_or(0) == 0
+            && report.output_tokens.unwrap_or(0) == 0
+            && report.windows.is_empty()
+            && report.subscription.is_none()
+        {
+            Ok(None)
+        } else {
+            Ok(Some(report))
+        }
+    }
+
+    pub async fn account_usage(&self) -> Result<Vec<UsageAccount>> {
+        let snapshot = crate::accounts::list_accounts(&self.0.database, "usage").await?;
+        let mut sessions = Vec::new();
+        for (id, entry) in self.0.entries.lock().await.iter() {
+            let run = self
+                .0
+                .database
+                .call({
+                    let id = id.clone();
+                    move |store| store.agent_run(&id)
+                })
+                .await?;
+            sessions.push((run.account_id, run.agent, entry.clone()));
+        }
+        let mut accounts = Vec::new();
+        for account in snapshot
+            .accounts
+            .into_iter()
+            .filter(|row| row.status != crate::accounts::AccountStatus::Unavailable)
+        {
+            let live = sessions.iter().find(|(account_id, agent, _)| {
+                *agent == account.agent
+                    && (account_id.as_deref() == Some(account.id.as_str())
+                        || (account_id.is_none() && !account.managed))
+            });
+            let report = if let Some((_, _, entry)) = live {
+                let report = entry.usage.lock().await.clone();
+                (report.cost_usd.unwrap_or(0.0) > 0.0
+                    || report.input_tokens.unwrap_or(0) > 0
+                    || report.output_tokens.unwrap_or(0) > 0
+                    || !report.windows.is_empty()
+                    || report.subscription.is_some())
+                .then_some(report)
+            } else {
+                None
+            };
+            let source = if account.api_profile.is_some()
+                || account
+                    .auth_method
+                    .as_deref()
+                    .is_some_and(|value| value.to_ascii_lowercase().contains("api"))
+            {
+                "api"
+            } else if report
+                .as_ref()
+                .and_then(|value| value.subscription.as_ref())
+                .is_some()
+                || account.status == crate::accounts::AccountStatus::SignedIn
+            {
+                "subscription"
+            } else {
+                "unknown"
+            }
+            .to_owned();
+            let available = report.is_some() || source == "api";
+            let reason = if report.is_none() {
+                Some(
+                    if source == "api" {
+                        "API 模型由服务商按 API 用量计费，不提供订阅窗口。"
+                    } else {
+                        "暂时读不到账号额度，请确认 CLI 已登录并刷新。"
+                    }
+                    .into(),
+                )
+            } else if report
+                .as_ref()
+                .is_some_and(|value| value.windows.is_empty())
+            {
+                Some("这个后端不提供套餐限流窗口。".into())
+            } else {
+                None
+            };
+            accounts.push(UsageAccount {
+                agent: account.agent,
+                account_id: Some(account.id),
+                account_name: Some(account.name),
+                source: Some(source),
+                available,
+                report: report.unwrap_or_else(|| UsageReport {
+                    windows: Vec::new(),
+                    ..Default::default()
+                }),
+                reason,
+            });
+        }
+        Ok(accounts)
     }
 
     /// Current collaboration mode (`default`/`plan`).
