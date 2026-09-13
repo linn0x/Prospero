@@ -338,10 +338,18 @@ fn validate_desktop_rel_path(rel: &str, allow_root: bool) -> Result<()> {
 }
 
 fn resolve_desktop_mutation_target(root: &Path, rel: &str) -> Result<PathBuf> {
-    validate_desktop_rel_path(rel, false)?;
+    resolve_desktop_mutation_target_with_root(root, rel, false)
+}
+
+fn resolve_desktop_mutation_target_with_root(
+    root: &Path,
+    rel: &str,
+    allow_root: bool,
+) -> Result<PathBuf> {
+    validate_desktop_rel_path(rel, allow_root)?;
     let real_root = std::fs::canonicalize(root).map_err(|_| Error::NotFound)?;
     let lexical = real_root.join(normalize_relative_path(rel));
-    if !contains(&real_root, &lexical) || lexical == real_root {
+    if !contains(&real_root, &lexical) || (!allow_root && lexical == real_root) {
         return Err(Error::Forbidden);
     }
     match std::fs::canonicalize(&lexical) {
@@ -352,6 +360,12 @@ fn resolve_desktop_mutation_target(root: &Path, rel: &str) -> Result<PathBuf> {
             Ok(real)
         }
         Err(_) => {
+            if std::fs::symlink_metadata(&lexical)
+                .map(|meta| meta.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                return Err(Error::Forbidden);
+            }
             let parent = lexical.parent().ok_or(Error::NotFound)?;
             let real_parent = std::fs::canonicalize(parent).map_err(|_| Error::NotFound)?;
             if real_parent != parent || !contains(&real_root, &real_parent) {
@@ -395,6 +409,7 @@ fn mtime_ms(metadata: &std::fs::Metadata) -> u64 {
 }
 
 pub fn list_dir(root: &Path, rel: &str) -> Result<Vec<FsEntry>> {
+    validate_desktop_rel_path(rel, true)?;
     let dir = resolve_within(root, rel, true)?;
     if !std::fs::metadata(&dir)
         .map_err(|_| Error::NotFound)?
@@ -410,8 +425,12 @@ pub fn list_dir(root: &Path, rel: &str) -> Result<Vec<FsEntry>> {
         let entry = entry.map_err(|_| Error::Forbidden)?;
         let file_type = entry.file_type().map_err(|_| Error::Forbidden)?;
         let info = std::fs::metadata(entry.path()).ok();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.eq_ignore_ascii_case(".git") {
+            continue;
+        }
         entries.push(FsEntry {
-            name: entry.file_name().to_string_lossy().to_string(),
+            name,
             kind: if file_type.is_dir() {
                 "dir"
             } else if file_type.is_symlink() {
@@ -440,6 +459,7 @@ pub fn list_dir(root: &Path, rel: &str) -> Result<Vec<FsEntry>> {
 }
 
 pub fn read_for_edit(root: &Path, rel: &str) -> Result<(Vec<u8>, u64, bool, bool)> {
+    validate_desktop_rel_path(rel, false)?;
     let file = resolve_within(root, rel, false)?;
     let metadata = std::fs::metadata(&file).map_err(|_| Error::NotFound)?;
     if !metadata.is_file() {
@@ -473,11 +493,7 @@ pub fn write_file_at(
     if expected_version.is_some() && content.contains(&0) {
         return Err(Error::Invalid("invalid text content".into()));
     }
-    let file = if create_new || expected_version.is_some() {
-        resolve_desktop_mutation_target(root, rel)?
-    } else {
-        resolve_within(root, rel, false)?
-    };
+    let file = resolve_desktop_mutation_target(root, rel)?;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).read(expected_version.is_some());
     if create_new {
@@ -533,6 +549,7 @@ pub fn read_chunk(
     if length == 0 || length > MAX_CHUNK_BYTES {
         return Err(Error::Invalid("invalid chunk length".into()));
     }
+    validate_desktop_rel_path(rel, false)?;
     let file = resolve_within(root, rel, false)?;
     let metadata = std::fs::metadata(&file).map_err(|_| Error::NotFound)?;
     if !metadata.is_file() {
@@ -555,7 +572,7 @@ pub fn write_chunk(root: &Path, rel: &str, offset: u64, data: Vec<u8>) -> Result
     if data.len() as u64 > MAX_CHUNK_BYTES {
         return Err(Error::Invalid("chunk too large".into()));
     }
-    let file = resolve_within(root, rel, false)?;
+    let file = resolve_desktop_mutation_target(root, rel)?;
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent).map_err(|_| Error::Forbidden)?;
     }
@@ -572,7 +589,7 @@ pub fn write_chunk(root: &Path, rel: &str, offset: u64, data: Vec<u8>) -> Result
 }
 
 pub fn make_dir(root: &Path, rel: &str) -> Result<()> {
-    let dir = resolve_within(root, rel, false)?;
+    let dir = resolve_desktop_mutation_target(root, rel)?;
     if dir.exists() {
         return Err(Error::Forbidden);
     }
@@ -583,8 +600,8 @@ pub fn remove_entry(root: &Path, rel: &str) -> Result<()> {
     if rel.is_empty() {
         return Err(Error::Forbidden);
     }
-    let target = resolve_within(root, rel, false)?;
-    let metadata = std::fs::metadata(&target).map_err(|_| Error::NotFound)?;
+    let target = resolve_desktop_mutation_target(root, rel)?;
+    let metadata = std::fs::symlink_metadata(&target).map_err(|_| Error::NotFound)?;
     if metadata.is_dir() {
         if std::fs::read_dir(&target)
             .map_err(|_| Error::Forbidden)?
@@ -603,9 +620,9 @@ pub fn rename_entry(root: &Path, rel: &str, to: &str) -> Result<()> {
     if rel.is_empty() || to.is_empty() {
         return Err(Error::Forbidden);
     }
-    let from = resolve_within(root, rel, false)?;
-    let dest = resolve_within(root, to, false)?;
-    std::fs::metadata(&from).map_err(|_| Error::NotFound)?;
+    let from = resolve_desktop_mutation_target(root, rel)?;
+    let dest = resolve_desktop_mutation_target(root, to)?;
+    std::fs::symlink_metadata(&from).map_err(|_| Error::NotFound)?;
     if dest.exists() {
         return Err(Error::Forbidden);
     }
@@ -976,14 +993,18 @@ fn search_files(
             {
                 continue;
             }
-            let _ = inspect_search_file(
+            if inspect_search_file(
                 &root,
                 &file,
                 &needle,
                 request.case_sensitive,
                 request.whole_word,
                 &mut result,
-            );
+            )
+            .is_err()
+            {
+                result.skipped += 1;
+            }
         }
     } else {
         let mut visited = 0;
@@ -1210,12 +1231,26 @@ pub async fn git_diff(
     rel: String,
     staged: bool,
 ) -> Result<GitDiffResult> {
-    let _ = resolve_within(&root, &rel, false)?;
+    validate_desktop_rel_path(&rel, false)?;
+    let status = git_status(sid.clone(), root.clone()).await?;
+    let Some(entry) = status.files.iter().find(|entry| entry.path == rel) else {
+        return Ok(GitDiffResult {
+            r#type: "git.diff.result".into(),
+            sid,
+            path: rel,
+            patch: String::new(),
+        });
+    };
     let mut args = vec!["diff".into(), "--no-color".into(), "--no-ext-diff".into()];
     if staged {
         args.push("--cached".into());
     }
-    args.extend(["--".into(), rel.clone()]);
+    args.push("--".into());
+    args.push(rel.clone());
+    if let Some(original) = entry.original_path.as_ref() {
+        validate_desktop_rel_path(original, false)?;
+        args.push(original.clone());
+    }
     let output = git(root.clone(), args, false).await?;
     let patch = if output.trim().is_empty() && !staged {
         let untracked = git(
@@ -1266,7 +1301,16 @@ pub async fn git_stage(root: PathBuf, rels: Vec<String>, unstage: bool) -> Resul
         return Err(Error::Invalid("invalid path".into()));
     }
     for rel in &rels {
-        let _ = resolve_within(&root, rel, false)?;
+        validate_desktop_rel_path(rel, false)?;
+    }
+    let status = git_status(String::new(), root.clone()).await?;
+    let allowed = status
+        .files
+        .iter()
+        .flat_map(|file| std::iter::once(&file.path).chain(file.original_path.iter()))
+        .collect::<HashSet<_>>();
+    if rels.iter().any(|rel| !allowed.contains(rel)) {
+        return Err(Error::Conflict);
     }
     let mut args = if unstage {
         let has_head = git(
@@ -1289,7 +1333,16 @@ pub async fn git_stage(root: PathBuf, rels: Vec<String>, unstage: bool) -> Resul
 }
 
 pub async fn git_discard(root: PathBuf, rel: String) -> Result<()> {
-    let _ = resolve_within(&root, &rel, false)?;
+    validate_desktop_rel_path(&rel, false)?;
+    let status = git_status(String::new(), root.clone()).await?;
+    let allowed = status
+        .files
+        .iter()
+        .flat_map(|file| std::iter::once(&file.path).chain(file.original_path.iter()))
+        .collect::<HashSet<_>>();
+    if !allowed.contains(&rel) {
+        return Err(Error::Conflict);
+    }
     git(
         root,
         vec!["restore".into(), "--worktree".into(), "--".into(), rel],

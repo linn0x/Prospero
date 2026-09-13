@@ -8,6 +8,8 @@ use super::*;
 use crate::protocol::{SessionHead, SessionStatus, UpdateSession};
 use crate::worker::Database;
 
+const NATIVE_CODEX_ID: &str = "native-codex";
+
 struct State {
     guard: Option<PathBuf>,
     database: Database,
@@ -75,6 +77,9 @@ impl Terminals {
             size,
             agent: Some(crate::protocol::AgentKind::Claude),
             command: None,
+            account_id: None,
+            model: None,
+            effort: None,
         };
         let spec = ProgramSpec {
             program,
@@ -98,7 +103,7 @@ impl Terminals {
     }
 
     pub async fn create(&self, input: CreateTerminal) -> Result<SessionHead> {
-        let spec = pty_program_for(&input)?;
+        let spec = self.pty_program_for(&input).await?;
         self.create_with(input, spec).await
     }
 
@@ -473,52 +478,285 @@ fn shell_command(command: &str) -> Result<ProgramSpec> {
     })
 }
 
-fn pty_program_for(input: &CreateTerminal) -> Result<Option<ProgramSpec>> {
-    let Some(agent) = input.agent else {
+fn normalize_selection(
+    value: Option<&String>,
+    maximum: usize,
+    message: &'static str,
+) -> Result<Option<String>> {
+    let Some(value) = value else {
         return Ok(None);
     };
-    match (agent, input.command.as_deref()) {
-        (crate::protocol::AgentKind::Shell, None) => Ok(None),
-        (crate::protocol::AgentKind::Shell | crate::protocol::AgentKind::Custom, Some(command)) => {
-            Ok(Some(shell_command(command)?))
+    if value.chars().count() > maximum || value.chars().any(|c| c.is_control()) {
+        return Err(Error::Invalid(message.into()));
+    }
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(Error::Invalid(message.into()));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn push_env(env: &mut Vec<(String, String)>, key: &str, value: impl Into<String>) {
+    env.retain(|(existing, _)| existing != key);
+    env.push((key.into(), value.into()));
+}
+
+#[cfg(unix)]
+fn private_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn private_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)
+}
+
+fn native_codex_environment(data: &Path) -> Result<Vec<(String, String)>> {
+    let root = data
+        .join("agent-accounts")
+        .join("codex")
+        .join(NATIVE_CODEX_ID);
+    private_dir(&root)?;
+    Ok(vec![
+        ("OPENAI_API_KEY".into(), String::new()),
+        ("CODEX_API_KEY".into(), String::new()),
+        ("CODEX_ACCESS_TOKEN".into(), String::new()),
+        ("CODEX_REFRESH_TOKEN".into(), String::new()),
+        ("CODEX_HOME".into(), root.to_string_lossy().into_owned()),
+        (
+            "CODEX_SQLITE_HOME".into(),
+            root.to_string_lossy().into_owned(),
+        ),
+    ])
+}
+
+fn claude_binary() -> String {
+    std::env::var("PROSPERO_CLAUDE_BIN").unwrap_or_else(|_| "claude".into())
+}
+
+fn codex_binary() -> String {
+    std::env::var("PROSPERO_CODEX_BIN").unwrap_or_else(|_| "codex".into())
+}
+
+impl Terminals {
+    async fn pty_program_for(&self, input: &CreateTerminal) -> Result<Option<ProgramSpec>> {
+        let Some(agent) = input.agent else {
+            if input.account_id.is_some() || input.model.is_some() || input.effort.is_some() {
+                return Err(Error::Invalid(
+                    "terminal launch selection is invalid".into(),
+                ));
+            }
+            return Ok(None);
+        };
+        let model = normalize_selection(input.model.as_ref(), 160, "模型无效")?;
+        let effort = normalize_selection(input.effort.as_ref(), 80, "思考强度无效")?;
+        if effort.is_some() && model.is_none() {
+            return Err(Error::Invalid("推理强度必须和启动模型一起指定".into()));
         }
-        (crate::protocol::AgentKind::Custom, None) => {
-            Err(Error::Invalid("custom agent requires a command".into()))
+        match (agent, input.command.as_deref()) {
+            (crate::protocol::AgentKind::Shell, None) => {
+                if input.account_id.is_some() || model.is_some() || effort.is_some() {
+                    return Err(Error::Invalid(
+                        "terminal launch selection is invalid".into(),
+                    ));
+                }
+                Ok(None)
+            }
+            (
+                crate::protocol::AgentKind::Shell | crate::protocol::AgentKind::Custom,
+                Some(command),
+            ) => {
+                if input.account_id.is_some() || model.is_some() || effort.is_some() {
+                    return Err(Error::Invalid(
+                        "custom terminal launch selection is invalid".into(),
+                    ));
+                }
+                Ok(Some(shell_command(command)?))
+            }
+            (crate::protocol::AgentKind::Custom, None) => {
+                Err(Error::Invalid("custom agent requires a command".into()))
+            }
+            (_, Some(command)) => {
+                if input.account_id.is_some() || model.is_some() || effort.is_some() {
+                    return Err(Error::Invalid(
+                        "custom terminal launch selection is invalid".into(),
+                    ));
+                }
+                Ok(Some(shell_command(command)?))
+            }
+            (crate::protocol::AgentKind::Claude, None) => {
+                let (mut environment, account_id, default_model, default_effort) = self
+                    .resolve_claude_terminal_account(input.account_id.clone())
+                    .await?;
+                let effective_model = model.or(default_model);
+                let effective_effort = if input.effort.is_some() {
+                    effort
+                } else {
+                    default_effort
+                };
+                if let Some(model) = effective_model {
+                    push_env(&mut environment, "ANTHROPIC_MODEL", model);
+                }
+                if let Some(effort) = effective_effort {
+                    push_env(&mut environment, "CLAUDE_CODE_EFFORT_LEVEL", effort);
+                }
+                Ok(Some(ProgramSpec {
+                    program: claude_binary(),
+                    args: vec!["--dangerously-skip-permissions".into()],
+                    environment,
+                    account_id,
+                }))
+            }
+            (crate::protocol::AgentKind::Codex, None) => {
+                let (environment, account_id) = self
+                    .resolve_codex_terminal_account(input.account_id.clone())
+                    .await?;
+                let mut args = vec!["--dangerously-bypass-approvals-and-sandbox".into()];
+                if let Some(model) = model {
+                    args.extend([
+                        "-c".into(),
+                        format!("model={}", serde_json::to_string(&model)?),
+                    ]);
+                }
+                if let Some(effort) = effort {
+                    args.extend([
+                        "-c".into(),
+                        format!("model_reasoning_effort={}", serde_json::to_string(&effort)?),
+                    ]);
+                }
+                Ok(Some(ProgramSpec {
+                    program: codex_binary(),
+                    args,
+                    environment,
+                    account_id,
+                }))
+            }
+            (crate::protocol::AgentKind::Opencode, None) => {
+                if input.account_id.is_some() || model.is_some() || effort.is_some() {
+                    return Err(Error::Invalid(
+                        "terminal launch selection is invalid".into(),
+                    ));
+                }
+                Ok(Some(ProgramSpec {
+                    program: "opencode".into(),
+                    args: Vec::new(),
+                    environment: Vec::new(),
+                    account_id: None,
+                }))
+            }
+            (crate::protocol::AgentKind::Grok, None) => {
+                if input.account_id.is_some() || model.is_some() || effort.is_some() {
+                    return Err(Error::Invalid(
+                        "terminal launch selection is invalid".into(),
+                    ));
+                }
+                Ok(Some(ProgramSpec {
+                    program: "grok".into(),
+                    args: Vec::new(),
+                    environment: Vec::new(),
+                    account_id: None,
+                }))
+            }
+            (crate::protocol::AgentKind::Trae, None) => {
+                if input.account_id.is_some() || model.is_some() || effort.is_some() {
+                    return Err(Error::Invalid(
+                        "terminal launch selection is invalid".into(),
+                    ));
+                }
+                Ok(Some(ProgramSpec {
+                    program: "trae-cli".into(),
+                    args: vec!["interactive".into()],
+                    environment: Vec::new(),
+                    account_id: None,
+                }))
+            }
+            (crate::protocol::AgentKind::Deepseek, None) => Err(Error::Invalid(
+                "DeepSeek Harness only supports structured sessions".into(),
+            )),
         }
-        (_, Some(command)) => Ok(Some(shell_command(command)?)),
-        (crate::protocol::AgentKind::Claude, None) => Ok(Some(ProgramSpec {
-            program: "claude".into(),
-            args: vec!["--dangerously-skip-permissions".into()],
-            environment: Vec::new(),
-            account_id: None,
-        })),
-        (crate::protocol::AgentKind::Codex, None) => Ok(Some(ProgramSpec {
-            program: "codex".into(),
-            args: vec!["--dangerously-bypass-approvals-and-sandbox".into()],
-            environment: Vec::new(),
-            account_id: None,
-        })),
-        (crate::protocol::AgentKind::Opencode, None) => Ok(Some(ProgramSpec {
-            program: "opencode".into(),
-            args: Vec::new(),
-            environment: Vec::new(),
-            account_id: None,
-        })),
-        (crate::protocol::AgentKind::Grok, None) => Ok(Some(ProgramSpec {
-            program: "grok".into(),
-            args: Vec::new(),
-            environment: Vec::new(),
-            account_id: None,
-        })),
-        (crate::protocol::AgentKind::Trae, None) => Ok(Some(ProgramSpec {
-            program: "trae-cli".into(),
-            args: vec!["interactive".into()],
-            environment: Vec::new(),
-            account_id: None,
-        })),
-        (crate::protocol::AgentKind::Deepseek, None) => Err(Error::Invalid(
-            "DeepSeek Harness only supports structured sessions".into(),
-        )),
+    }
+
+    async fn resolve_claude_terminal_account(
+        &self,
+        account_id: Option<String>,
+    ) -> Result<(
+        Vec<(String, String)>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> {
+        let Some(id) = account_id else {
+            return Ok((Vec::new(), None, None, None));
+        };
+        if id == crate::accounts::NATIVE_CLAUDE_ID {
+            return Ok((Vec::new(), None, None, None));
+        }
+        crate::database::validate_id(&id)?;
+        let data = self.0.database.directory().to_owned();
+        let record = self
+            .0
+            .database
+            .call({
+                let database = self.0.database.clone();
+                let data = data.clone();
+                let id = id.clone();
+                move |store| {
+                    if let Some(message) =
+                        crate::accounts::source_bound_launch_error(&database, &id)?
+                    {
+                        return Err(Error::Invalid(message));
+                    }
+                    let record = store.managed_snapshot_row(&data, &id)?;
+                    let target = crate::accounts::config::ConfigTarget {
+                        account_id: record.id.clone(),
+                        model: record
+                            .api_profile
+                            .as_ref()
+                            .map(|profile| profile.model.clone()),
+                        model_capabilities: record
+                            .api_profile
+                            .as_ref()
+                            .and_then(|profile| profile.model_capabilities.clone()),
+                        active_sessions: 0,
+                    };
+                    let defaults = crate::accounts::config::read_defaults(&data, &target)?;
+                    Ok((record, defaults))
+                }
+            })
+            .await?;
+        let (record, (default_model, default_effort)) = record;
+        let account_id = record.id.clone();
+        let env_id = account_id.clone();
+        let env = tokio::task::spawn_blocking(move || match record.api_profile {
+            Some(profile) => {
+                crate::accounts::managed::profile_account_environment(&data, &env_id, &profile)
+            }
+            None => crate::accounts::managed::claude_environment(&data, &env_id, false),
+        })
+        .await
+        .map_err(|_| Error::Closed)??;
+        Ok((env, Some(account_id), default_model, default_effort))
+    }
+
+    async fn resolve_codex_terminal_account(
+        &self,
+        account_id: Option<String>,
+    ) -> Result<(Vec<(String, String)>, Option<String>)> {
+        match account_id.as_deref() {
+            None => Ok((Vec::new(), None)),
+            Some(NATIVE_CODEX_ID) => {
+                let data = self.0.database.directory().to_owned();
+                let env = tokio::task::spawn_blocking(move || native_codex_environment(&data))
+                    .await
+                    .map_err(|_| Error::Closed)??;
+                Ok((env, Some(NATIVE_CODEX_ID.into())))
+            }
+            Some(_) => Err(Error::Invalid(
+                "Rust Codex PTY 当前仅支持本机默认账号".into(),
+            )),
+        }
     }
 }
 
