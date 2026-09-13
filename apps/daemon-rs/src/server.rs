@@ -36,7 +36,8 @@ use crate::orchestration::{
 use crate::project::{
     FsChunk, FsChunkQuery, FsContent, FsDone, FsListing, FsPathQuery, FsPathRequest, FsPutRequest,
     FsRenameRequest, FsWriteRequest, FsWritten, GitCommitRequest, GitDiffQuery, GitDiffResult,
-    GitDone, GitHistoryResult, GitStageRequest, GitStatusResult, WorkspaceSummaryResult,
+    GitDone, GitHistoryResult, GitStageRequest, GitStatusResult, ProjectSearchRequest,
+    SearchResult, WorkspaceSummaryResult,
 };
 use crate::protocol::*;
 use crate::terminal::{
@@ -139,6 +140,7 @@ impl Api {
             .route("/v1/sessions/{id}/fs/mkdir", post(fs_mkdir))
             .route("/v1/sessions/{id}/fs/remove", post(fs_remove))
             .route("/v1/sessions/{id}/fs/rename", post(fs_rename))
+            .route("/v1/sessions/{id}/search", post(project_search))
             .route("/v1/sessions/{id}/git/status", get(git_status))
             .route("/v1/sessions/{id}/git/diff", get(git_diff))
             .route("/v1/sessions/{id}/git/history", get(git_history))
@@ -1729,6 +1731,16 @@ async fn fs_rename(
         path: response_path,
         op: "rename".into(),
     }))
+}
+
+async fn project_search(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<ProjectSearchRequest>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<SearchResult>, ApiError> {
+    let Json(input) = body.map_err(|_| Error::Invalid("invalid search request".into()))?;
+    let root = session_workspace(&api, &id).await?;
+    Ok(Json(crate::project::project_search(root, input).await?))
 }
 
 async fn git_status(
