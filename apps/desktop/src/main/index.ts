@@ -1073,6 +1073,7 @@ function installIpc(): void {
         ...(input.model ? { model: requireSelection(input.model, "模型", 160) } : {}),
         ...(input.effort ? { effort: requireSelection(input.effort, "推理强度", 80) } : {}),
         ...(input.command ? { command: String(input.command).slice(0, 2_000) } : {}),
+        ...(input.resume ? { resume: input.resume } : {}),
         ...(input.accountId ? { accountId: requireId(input.accountId, "账号") } : {}),
         cols: Math.max(20, Math.min(500, Number(input.cols) || 120)),
         rows: Math.max(5, Math.min(300, Number(input.rows) || 40)),
