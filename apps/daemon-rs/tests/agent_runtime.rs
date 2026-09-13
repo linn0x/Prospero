@@ -342,6 +342,20 @@ for line in sys.stdin:
         respond(rpc_id, {"thread": {"id": next_thread}})
     elif method == "thread/resume":
         respond(rpc_id, {"thread": {"id": params.get("threadId", "thread-resumed")}})
+    elif method == "thread/read":
+        with open(os.path.join(os.getcwd(), "thread-read.json"), "w") as log:
+            log.write(json.dumps(params))
+        if scenario != "codexhistory":
+            respond(rpc_id, {})
+            continue
+        patch = "diff --git a/src/history.rs b/src/history.rs\nindex 000..111\n--- a/src/history.rs\n+++ b/src/history.rs\n@@ -1 +1,2 @@\n-old\n+new\n+line\n"
+        respond(rpc_id, {"thread": {"id": params.get("threadId"), "parentThreadId": next_thread, "turns": [{"id": "sub-turn-history", "status": "completed", "items": [
+            {"id": "u1", "type": "userMessage", "content": [{"type": "text", "text": "history prompt"}, {"type": "skill", "name": "audit"}]},
+            {"id": "r1", "type": "reasoning", "summary": ["history thinking"]},
+            {"id": "t1", "type": "commandExecution", "command": "pwd", "aggregatedOutput": "/tmp", "status": "completed"},
+            {"id": "f1", "type": "fileChange", "status": "completed", "changes": [{"path": "src/history.rs", "diff": patch}]},
+            {"id": "a1", "type": "agentMessage", "text": "history answer", "phase": "final_answer"}
+        ]}]}})
     elif method == "turn/start":
         with open(os.path.join(os.getcwd(), "turn-start.json"), "w") as log:
             log.write(json.dumps(params))
@@ -363,11 +377,19 @@ for line in sys.stdin:
             reply = json.loads(sys.stdin.readline())
             with open(os.path.join(os.getcwd(), "legacy-approval-response.json"), "w") as log:
                 log.write(json.dumps(reply))
-        if scenario == "codexsubagent":
+        if scenario == "codexsubagent" or scenario == "codexhistory" or scenario == "codexsubsteer":
             emit({"jsonrpc": "2.0", "method": "item/started", "params": {"threadId": params.get("threadId"), "item": {"id": "collab-1", "type": "collabAgentToolCall", "receiverThreadId": "sub-thread-1", "prompt": "inspect repo"}}})
             emit({"jsonrpc": "2.0", "method": "thread/started", "params": {"threadId": "sub-thread-1", "thread": {"id": "sub-thread-1", "parentThreadId": params.get("threadId"), "agentNickname": "Scout", "agentRole": "Explore", "preview": "inspect repo", "status": "running"}}})
+            if scenario == "codexsubsteer":
+                emit({"jsonrpc": "2.0", "method": "turn/started", "params": {"threadId": "sub-thread-1", "turn": {"id": "sub-turn-live"}}})
             emit({"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": {"threadId": "sub-thread-1", "itemId": "sub-msg-1", "delta": "subagent says hi"}})
             emit({"jsonrpc": "2.0", "method": "item/completed", "params": {"threadId": params.get("threadId"), "item": {"id": "collab-1", "type": "collabAgentToolCall", "status": "completed", "receiverThreadId": "sub-thread-1"}}})
+            if scenario == "codexsubsteer":
+                emit({"jsonrpc": "2.0", "method": "thread/status/changed", "params": {"threadId": "sub-thread-1", "status": "idle"}})
+                steer = json.loads(sys.stdin.readline())
+                with open(os.path.join(os.getcwd(), "subagent-steer.json"), "w") as log:
+                    log.write(json.dumps(steer.get("params") or {}))
+                respond(steer.get("id"), {})
         if scenario == "codexsubsend" and params.get("threadId") == next_thread:
             emit({"jsonrpc": "2.0", "method": "item/started", "params": {"threadId": params.get("threadId"), "item": {"id": "collab-1", "type": "collabAgentToolCall", "receiverThreadId": "sub-thread-1", "prompt": "inspect repo"}}})
             emit({"jsonrpc": "2.0", "method": "thread/started", "params": {"threadId": "sub-thread-1", "thread": {"id": "sub-thread-1", "parentThreadId": params.get("threadId"), "agentNickname": "Scout", "agentRole": "Explore", "preview": "inspect repo", "status": "idle"}}})
@@ -393,6 +415,10 @@ for line in sys.stdin:
         respond(rpc_id, {"turn": {"id": turn_id}})
         time.sleep(0.1)
         break
+    elif method == "turn/steer":
+        with open(os.path.join(os.getcwd(), "subagent-steer.json"), "w") as log:
+            log.write(json.dumps(params))
+        respond(rpc_id, {})
     elif method == "model/list":
         respond(rpc_id, {"data": [{"model": "gpt-test", "displayName": "GPT Test", "supportedReasoningEfforts": ["low", "high"], "isDefault": True}]})
     else:
@@ -841,6 +867,58 @@ async fn codex_collab_agent_events_create_subagent_timeline() {
 }
 
 #[tokio::test]
+async fn codex_subagent_snapshot_uses_thread_read_history() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("codexhistory").await;
+    let cli = harness.workspace.path().join("fake-codex.py");
+    std::fs::write(&cli, FAKE_CODEX).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    unsafe {
+        std::env::set_var("PROSPERO_CODEX_BIN", &cli);
+    }
+    let head = harness.create_codex().await;
+    harness
+        .agents
+        .send(&head.id, "spawn codex subagent".into(), None, Vec::new())
+        .await
+        .unwrap();
+    harness
+        .wait_for(&head.id, |records| {
+            records.iter().any(|(_, body, _)| {
+                matches!(body, TimelineBody::TurnEnd { finish, .. } if finish == "completed")
+            })
+        })
+        .await;
+
+    let detail = harness
+        .agents
+        .subagent_snapshot(&head.id, "sub-thread-1")
+        .await
+        .unwrap();
+    let raw = detail
+        .events
+        .iter()
+        .map(|event| event.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(raw.contains("history prompt"));
+    assert!(raw.contains("history thinking"));
+    assert!(raw.contains("history answer"));
+    assert!(raw.contains("src/history.rs"));
+    assert!(raw.contains("turn.end"));
+    let request: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(harness.workspace.path().join("thread-read.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(request["threadId"], "sub-thread-1");
+    assert_eq!(request["includeTurns"], true);
+}
+
+#[tokio::test]
 async fn codex_legacy_approval_uses_call_id_and_review_decision_shape() {
     let _guard = SERIAL.lock().await;
     let harness = Harness::new("codexlegacyapproval").await;
@@ -1022,6 +1100,47 @@ async fn codex_send_to_subagent_posts_turn_start_to_child_thread() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+#[tokio::test]
+async fn codex_send_to_subagent_steers_live_child_turn() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("codexsubsteer").await;
+    let cli = harness.workspace.path().join("fake-codex.py");
+    std::fs::write(&cli, FAKE_CODEX).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    unsafe {
+        std::env::set_var("PROSPERO_CODEX_BIN", &cli);
+    }
+    let head = harness.create_codex().await;
+    harness
+        .agents
+        .send(&head.id, "spawn live child".into(), None, Vec::new())
+        .await
+        .unwrap();
+    harness
+        .wait_for(&head.id, |records| {
+            records.iter().any(|(_, body, _)| {
+                matches!(body, TimelineBody::Subagent { subagent_id, can_message: true, .. } if subagent_id == "sub-thread-1")
+            })
+        })
+        .await;
+    harness
+        .agents
+        .send_to_subagent(&head.id, "sub-thread-1", "steer child".into())
+        .await
+        .unwrap();
+    let raw =
+        std::fs::read_to_string(harness.workspace.path().join("subagent-steer.json")).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(value["threadId"], "sub-thread-1");
+    assert_eq!(value["expectedTurnId"], "sub-turn-live");
+    assert_eq!(value["input"][0]["text"], "steer child");
+    assert!(!harness.workspace.path().join("subagent-turn.json").exists());
 }
 
 #[tokio::test]

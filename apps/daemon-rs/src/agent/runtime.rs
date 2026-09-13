@@ -150,6 +150,16 @@ impl Driver {
         }
     }
 
+    async fn read_subagent_history(
+        &self,
+        subagent: &str,
+    ) -> Result<Option<Vec<serde_json::Value>>> {
+        match self {
+            Driver::Codex(driver) => driver.read_subagent_history(subagent).await,
+            Driver::Claude(_) => Ok(None),
+        }
+    }
+
     async fn apply_selection(&self, model: &str, effort: Option<&str>) -> Result<()> {
         match self {
             Driver::Claude(driver) => driver.apply_selection(model, effort).await,
@@ -2112,12 +2122,95 @@ impl Agents {
         id: &str,
         subagent: &str,
     ) -> Result<crate::agent::SubagentSnapshot> {
-        let id = id.to_owned();
-        let subagent = subagent.to_owned();
-        self.0
-            .database
-            .call(move |store| store.subagent_snapshot(&id, &subagent))
-            .await
+        crate::database::validate_id(id)?;
+        crate::database::validate_id(subagent)?;
+        let mut snapshot = {
+            let id = id.to_owned();
+            let subagent = subagent.to_owned();
+            self.0
+                .database
+                .call(move |store| store.subagent_snapshot(&id, &subagent))
+                .await?
+        };
+
+        let native = match self.session_entry(id).await {
+            Ok(entry) => {
+                let handle = entry.handle.lock().await.clone();
+                if let Some(handle) = handle {
+                    handle
+                        .driver
+                        .lock()
+                        .await
+                        .read_subagent_history(subagent)
+                        .await
+                        .ok()
+                        .flatten()
+                } else {
+                    self.read_codex_subagent_history_once(id, subagent).await
+                }
+            }
+            Err(_) => None,
+        };
+        if let Some(native) = native
+            && !native.is_empty()
+        {
+            let mut events = native;
+            events.extend(
+                snapshot
+                    .events
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            event.get("kind").and_then(serde_json::Value::as_str),
+                            Some(
+                                "permission.request"
+                                    | "permission.resolved"
+                                    | "permission.auto"
+                                    | "question.request"
+                                    | "question.resolved"
+                            )
+                        )
+                    })
+                    .cloned(),
+            );
+            snapshot.events = events;
+        }
+        Ok(snapshot)
+    }
+
+    async fn read_codex_subagent_history_once(
+        &self,
+        id: &str,
+        subagent: &str,
+    ) -> Option<Vec<serde_json::Value>> {
+        let (workspace, parent) = {
+            let id = id.to_owned();
+            self.0
+                .database
+                .call(move |store| {
+                    let run = store.agent_run(&id)?;
+                    if run.agent != AgentKind::Codex {
+                        return Ok(None);
+                    }
+                    let Some(parent) = run.native_id else {
+                        return Ok(None);
+                    };
+                    let workspace = store.session(&id)?.workspace;
+                    Ok(Some((workspace, parent)))
+                })
+                .await
+                .ok()
+                .flatten()?
+        };
+        super::codex::read_subagent_history_once(
+            self.0.database.directory(),
+            &workspace,
+            &parent,
+            subagent,
+        )
+        .await
+        .ok()
+        .flatten()
     }
 
     pub async fn interrupt(&self, id: &str) -> Result<()> {
