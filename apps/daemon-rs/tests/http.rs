@@ -60,6 +60,7 @@ async fn every_endpoint_requires_auth_and_rejects_browser_origins() {
     let (_directory, api, _) = fixture().await;
     for uri in [
         "/v1/health",
+        "/ws",
         "/v1/sessions",
         "/v1/sessions/summary",
         "/v1/sessions/lookup",
