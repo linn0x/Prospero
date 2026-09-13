@@ -2,7 +2,7 @@ import type { ContentPage, EventPage, EventQuery, Health, RenameSession, Session
 import type { RustContent } from "../shared/rust-api";
 import type { TimelinePage, TimelineQuery, TimelineLookupResult, TimelineTextQuery, TimelineTextPage } from "@prospero/protocol/rust-daemon";
 import type { CreateTerminal, TerminalPage, TerminalQuery, TerminalSize, TerminalSnapshot } from "@prospero/protocol/rust-daemon";
-import type { AgentSend, AgentModeCatalog, AgentModelCatalog, AgentModelSelectionResult, AgentControlsProjection, CreateAgentSession, PermissionDecision, QuestionDecision, SubagentSnapshot, AgentQueue, AgentQueues } from "@prospero/protocol/rust-daemon";
+import type { AgentSend, AgentControlResult, AgentModeCatalog, AgentModelCatalog, AgentModelSelectionResult, AgentControlsProjection, CreateAgentSession, PermissionDecision, QuestionDecision, SubagentSnapshot, AgentQueue, AgentQueues } from "@prospero/protocol/rust-daemon";
 import type { AccountListResult, LaunchModelCatalog, SourceResult, UsageResult } from "@prospero/protocol/rust-daemon";
 import type {
   AbandonRun, ApplyTaskGraph, CancelTask, CleanupWorktree, CompleteRun, CreateGate,
@@ -101,6 +101,9 @@ export class RustClient {
   }
   agentInterrupt(value: string, signal: AbortSignal | null = null): Promise<{ ok: boolean }> {
     return this.json(`/v1/agent-sessions/${id(value)}/interrupt`, { method: "POST", signal });
+  }
+  agentCompact(value: string, requestId: string, signal: AbortSignal | null = null, timeoutMs = 180_000): Promise<AgentControlResult> {
+    return this.json(`/v1/agent-sessions/${id(value)}/compact`, { method: "POST", signal, timeoutMs, headers: { "content-type": "application/json" }, body: JSON.stringify({ requestId }) });
   }
   agentPermission(value: string, decision: PermissionDecision, signal: AbortSignal | null = null): Promise<{ ok: boolean }> {
     return this.json(`/v1/agent-sessions/${id(value)}/permission`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(decision) });

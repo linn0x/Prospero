@@ -19,8 +19,8 @@ use tokio::sync::{Semaphore, watch};
 
 use crate::agent::Agents;
 use crate::agent::{
-    AgentModeSelection, AgentModelSelection, AgentSend, CreateAgentSession, PermissionDecision,
-    PermissionMode, QuestionDecision, UsageReport, UsageResult, mode_catalog,
+    AgentCompactRequest, AgentModeSelection, AgentModelSelection, AgentSend, CreateAgentSession,
+    PermissionDecision, PermissionMode, QuestionDecision, UsageReport, UsageResult, mode_catalog,
 };
 use crate::auth::Token;
 use crate::database::Store;
@@ -114,6 +114,7 @@ impl Api {
                 get(agent_subagent_events),
             )
             .route("/v1/agent-sessions/{id}/interrupt", post(agent_interrupt))
+            .route("/v1/agent-sessions/{id}/compact", post(agent_compact))
             .route("/v1/agent-sessions/{id}/permission", post(agent_permission))
             .route("/v1/agent-sessions/{id}/question", post(agent_question))
             .route("/v1/agent-sessions/{id}/queue", get(agent_queue))
@@ -1473,6 +1474,20 @@ async fn agent_subagent_events(
     crate::database::validate_id(&subagent).map_err(ApiError)?;
     let snapshot = api.agents.subagent_snapshot(&id, &subagent).await?;
     Ok(Json(snapshot))
+}
+
+async fn agent_compact(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<AgentCompactRequest>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<crate::agent::AgentControlResult>, ApiError> {
+    let Json(input) = body.map_err(|_| Error::Invalid("invalid compact request".into()))?;
+    let result = api
+        .agents
+        .compact(&id, &input.request_id)
+        .await
+        .map_err(ApiError)?;
+    Ok(Json(result))
 }
 
 async fn agent_permission(
