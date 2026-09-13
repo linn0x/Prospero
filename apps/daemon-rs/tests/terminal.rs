@@ -62,6 +62,23 @@ async fn real_pty_preserves_split_unicode_ansi_and_exit_code() {
 }
 
 #[tokio::test]
+async fn answers_terminal_queries_after_screen_consumes_split_output() {
+    let terminal = start(
+        r#"python3 -c 'exec("import os, select, termios, time\nattrs = termios.tcgetattr(0)\nattrs[3] &= ~(termios.ECHO | termios.ICANON)\ntermios.tcsetattr(0, termios.TCSANOW, attrs)\nos.write(1, b\"ab\\x1b[6\")\ntime.sleep(0.03)\nos.write(1, b\"n\\x1b[c\\x1b[0c\\x1b]10;?\\x1b]11;?\")\ndeadline = time.time() + 2\nresponse = b\"\"\nwhile time.time() < deadline and len(response) < 80:\n    ready, _, _ = select.select([0], [], [], max(0, deadline - time.time()))\n    if not ready:\n        break\n    chunk = os.read(0, 1024)\n    if not chunk:\n        break\n    response += chunk\nos.write(1, b\"\\nRESP:\" + response + b\"\\n\")")'"#,
+    );
+    wait(&terminal).await;
+    let bytes = output(&terminal).await;
+    let expected = b"\x1b[1;3R\x1b[?6c\x1b[?6c\x1b]10;rgb:c0c0/caca/f5f5\x1b\\\x1b]11;rgb:1a1a/1b1b/2626\x1b\\";
+    assert!(
+        bytes
+            .windows(expected.len())
+            .any(|window| window == expected),
+        "missing terminal query response in {:?}",
+        String::from_utf8_lossy(&bytes)
+    );
+}
+
+#[tokio::test]
 async fn input_is_not_duplicated_and_resize_is_ordered() {
     let terminal =
         start("stty -echo; printf READY; read value; stty size; printf '<%s>' \"$value\"");
