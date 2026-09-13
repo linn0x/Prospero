@@ -19,7 +19,7 @@ impl Store {
         let size = input.size.validate()?;
         self.create_session_with(
             CreateSession {
-                agent: AgentKind::Shell,
+                agent: input.agent.unwrap_or(AgentKind::Shell),
                 kind: SessionKind::Pty,
                 title: input.title,
                 workspace: input.workspace,
@@ -213,6 +213,8 @@ mod tests {
                 title: "Checkpoint".into(),
                 workspace: "/synthetic".into(),
                 size: TerminalSize { cols: 80, rows: 24 },
+                agent: None,
+                command: None,
             })
             .unwrap();
         store.connection.execute_batch("CREATE TABLE inserted(seq INTEGER); CREATE TRIGGER record_insert AFTER INSERT ON terminal_output BEGIN INSERT INTO inserted VALUES(NEW.seq); END;").unwrap();
@@ -281,6 +283,8 @@ mod tests {
                 title: "Rollback".into(),
                 workspace: "/synthetic".into(),
                 size: TerminalSize { cols: 80, rows: 24 },
+                agent: None,
+                command: None,
             })
             .unwrap();
         store.checkpoint_terminal(&head.id, archive(0, 2)).unwrap();
