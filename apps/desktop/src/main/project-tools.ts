@@ -14,6 +14,7 @@ export type RustProjectBackend = {
   renameProjectEntry(sessionId: string, path: string, to: string): Promise<void>;
   getProjectGitStatus(sessionId: string): Promise<ProjectGitStatus>;
   getProjectDiff(sessionId: string, path: string, staged: boolean): Promise<string>;
+  searchProject(sessionId: string, query: string, options: { caseSensitive: boolean; wholeWord: boolean; pathFilter: string }, signal: AbortSignal): Promise<SearchResult>;
   getProjectGitHistory(sessionId: string): Promise<GitHistoryEntry[]>;
   mutateProjectGit(sessionId: string, input: GitMutation): Promise<void>;
 };
@@ -113,6 +114,8 @@ export class ProjectTools {
     const filter = string(options.pathFilter, 256).toLowerCase();
     const result: SearchResult = { matches: [], scanned: 0, skipped: 0, truncated: false };
     if (!query.trim()) return result;
+    const sid = this.rustSession(root);
+    if (sid) return this.rust!.searchProject(sid, query, { caseSensitive: options.caseSensitive, wholeWord: options.wholeWord, pathFilter: filter }, controller.signal);
     const needle = options.caseSensitive ? query : query.toLowerCase();
     const deadline = Date.now() + 12_000;
     const stopped = (): boolean => {
