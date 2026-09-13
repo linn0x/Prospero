@@ -87,6 +87,8 @@ impl Store {
                         name: "Example tool".into(),
                         state: ToolState::Success,
                         summary: format!("Synthetic tool result {index}"),
+                        diff: None,
+                        has_more: false,
                     },
                     "Synthetic tool output. 中文 🦀\n".repeat(if index + 1 == turns {
                         5000
@@ -106,6 +108,7 @@ impl Store {
                 (
                     TimelineBody::TurnEnd {
                         finish: "completed".into(),
+                        diffs: Vec::new(),
                     },
                     String::new(),
                 ),
@@ -174,7 +177,7 @@ impl Store {
                     return Err(Error::Invalid("tool summary exceeds limit".into()));
                 }
             }
-            TimelineBody::TurnEnd { finish }
+            TimelineBody::TurnEnd { finish, .. }
                 if !["completed", "failed", "interrupted"].contains(&finish.as_str())
                     || !input.text.is_empty() =>
             {

@@ -136,6 +136,8 @@ async fn tool_output_route_returns_persisted_tool_text() {
                         name: "Bash".into(),
                         state: ToolState::Success,
                         summary: "preview".into(),
+                        diff: None,
+                        has_more: false,
                     },
                     text: "full tool output".into(),
                     replace: false,

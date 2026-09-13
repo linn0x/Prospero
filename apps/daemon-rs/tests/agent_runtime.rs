@@ -368,6 +368,12 @@ for line in sys.stdin:
             emit({"jsonrpc": "2.0", "method": "thread/started", "params": {"threadId": "sub-thread-1", "thread": {"id": "sub-thread-1", "parentThreadId": params.get("threadId"), "agentNickname": "Scout", "agentRole": "Explore", "preview": "inspect repo", "status": "running"}}})
             emit({"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": {"threadId": "sub-thread-1", "itemId": "sub-msg-1", "delta": "subagent says hi"}})
             emit({"jsonrpc": "2.0", "method": "item/completed", "params": {"threadId": params.get("threadId"), "item": {"id": "collab-1", "type": "collabAgentToolCall", "status": "completed", "receiverThreadId": "sub-thread-1"}}})
+        if scenario == "codexdiff":
+            patch = "diff --git a/src/lib.rs b/src/lib.rs\nindex 000..111\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1,2 @@\n-old\n+new\n+line\n"
+            emit({"jsonrpc": "2.0", "method": "item/started", "params": {"threadId": params.get("threadId"), "item": {"id": "edit-1", "type": "fileChange", "changes": [{"path": "src/lib.rs", "diff": patch}]}}})
+            emit({"jsonrpc": "2.0", "method": "item/fileChange/patchUpdated", "params": {"threadId": params.get("threadId"), "itemId": "edit-1", "path": "src/lib.rs", "patch": patch}})
+            emit({"jsonrpc": "2.0", "method": "item/completed", "params": {"threadId": params.get("threadId"), "item": {"id": "edit-1", "type": "fileChange", "status": "completed", "changes": [{"path": "src/lib.rs", "diff": patch}]}}})
+            emit({"jsonrpc": "2.0", "method": "turn/diff/updated", "params": {"threadId": params.get("threadId"), "turnId": turn_id, "diff": patch}})
         emit({"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": {"threadId": params.get("threadId"), "itemId": "msg-1", "delta": "hello "}})
         emit({"jsonrpc": "2.0", "method": "item/reasoning/textDelta", "params": {"threadId": params.get("threadId"), "itemId": "think-1", "delta": "thinking"}})
         emit({"jsonrpc": "2.0", "method": "item/completed", "params": {"threadId": params.get("threadId"), "item": {"id": "msg-1", "type": "agentMessage", "text": "hello from fake codex"}}})
@@ -516,7 +522,7 @@ async fn single_turn_streams_into_timeline() {
             records.iter().any(|(_, body, _)| {
                 matches!(
                     body,
-                    TimelineBody::TurnEnd { finish } if finish == "completed"
+                    TimelineBody::TurnEnd { finish, .. } if finish == "completed"
                 )
             })
         })
@@ -565,7 +571,7 @@ async fn codex_structured_turn_streams_into_timeline() {
     let records = harness
         .wait_for(&head.id, |records| {
             records.iter().any(|(_, body, _)| {
-                matches!(body, TimelineBody::TurnEnd { finish } if finish == "completed")
+                matches!(body, TimelineBody::TurnEnd { finish, .. } if finish == "completed")
             })
         })
         .await;
@@ -655,7 +661,7 @@ async fn codex_permission_roundtrip_responds_to_app_server() {
     let records = harness
         .wait_for(&head.id, |records| {
             records.iter().any(|(_, body, _)| {
-                matches!(body, TimelineBody::TurnEnd { finish } if finish == "completed")
+                matches!(body, TimelineBody::TurnEnd { finish, .. } if finish == "completed")
             })
         })
         .await;
@@ -750,7 +756,7 @@ async fn codex_question_roundtrip_responds_to_app_server() {
     harness
         .wait_for(&head.id, |records| {
             records.iter().any(|(_, body, _)| {
-                matches!(body, TimelineBody::TurnEnd { finish } if finish == "completed")
+                matches!(body, TimelineBody::TurnEnd { finish, .. } if finish == "completed")
             })
         })
         .await;
@@ -787,7 +793,7 @@ async fn codex_collab_agent_events_create_subagent_timeline() {
     let records = harness
         .wait_for(&head.id, |records| {
             records.iter().any(|(_, body, _)| {
-                matches!(body, TimelineBody::TurnEnd { finish } if finish == "completed")
+                matches!(body, TimelineBody::TurnEnd { finish, .. } if finish == "completed")
             })
         })
         .await;
@@ -877,7 +883,7 @@ async fn codex_legacy_approval_uses_call_id_and_review_decision_shape() {
     harness
         .wait_for(&head.id, |records| {
             records.iter().any(|(_, body, _)| {
-                matches!(body, TimelineBody::TurnEnd { finish } if finish == "completed")
+                matches!(body, TimelineBody::TurnEnd { finish, .. } if finish == "completed")
             })
         })
         .await;
@@ -896,6 +902,60 @@ async fn codex_legacy_approval_uses_call_id_and_review_decision_shape() {
 }
 
 #[tokio::test]
+async fn codex_file_changes_attach_diffs_to_tool_and_turn_end() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("codexdiff").await;
+    let cli = harness.workspace.path().join("fake-codex.py");
+    std::fs::write(&cli, FAKE_CODEX).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    unsafe {
+        std::env::set_var("PROSPERO_CODEX_BIN", &cli);
+    }
+    let head = harness.create_codex().await;
+    harness
+        .agents
+        .send(&head.id, "edit file".into(), None, Vec::new())
+        .await
+        .unwrap();
+
+    let records = harness
+        .wait_for(&head.id, |records| {
+            records.iter().any(|(_, body, _)| {
+                matches!(body, TimelineBody::TurnEnd { finish, .. } if finish == "completed")
+            })
+        })
+        .await;
+    let tool_diff = records
+        .iter()
+        .find_map(|(_, body, _)| match body {
+            TimelineBody::Tool {
+                state: prosperod_rs::protocol::ToolState::Success,
+                diff: Some(diff),
+                ..
+            } => Some(diff),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(tool_diff.path, "src/lib.rs");
+    assert_eq!(tool_diff.additions, 2);
+    assert_eq!(tool_diff.deletions, 1);
+    assert!(tool_diff.patch.contains("+new"));
+    let turn_diffs = records
+        .iter()
+        .find_map(|(_, body, _)| match body {
+            TimelineBody::TurnEnd { diffs, .. } => Some(diffs),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(turn_diffs.len(), 1);
+    assert_eq!(turn_diffs[0].path, "src/lib.rs");
+}
+
+#[tokio::test]
 async fn multi_turn_resumes_native_session() {
     let _guard = SERIAL.lock().await;
     let harness = Harness::new("resume").await;
@@ -910,7 +970,7 @@ async fn multi_turn_resumes_native_session() {
             records.iter().any(|(_, body, _)| {
                 matches!(
                     body,
-                    TimelineBody::TurnEnd { finish } if finish == "completed"
+                    TimelineBody::TurnEnd { finish, .. } if finish == "completed"
                 )
             })
         })
@@ -983,7 +1043,7 @@ async fn launch_resume_uses_native_session_id() {
             records.iter().any(|(_, body, _)| {
                 matches!(
                     body,
-                    TimelineBody::TurnEnd { finish } if finish == "completed"
+                    TimelineBody::TurnEnd { finish, .. } if finish == "completed"
                 )
             })
         })
@@ -1081,7 +1141,7 @@ async fn permission_roundtrip_executes_tool() {
             records.iter().any(|(_, body, _)| {
                 matches!(
                     body,
-                    TimelineBody::TurnEnd { finish } if finish == "completed"
+                    TimelineBody::TurnEnd { finish, .. } if finish == "completed"
                 )
             })
         })
@@ -1118,7 +1178,7 @@ async fn approval_policy_set_auto_allows_future_turns() {
     let records = harness
         .wait_for(&head.id, |records| {
             records.iter().any(|(_, body, _)| {
-                matches!(body, TimelineBody::TurnEnd { finish } if finish == "completed")
+                matches!(body, TimelineBody::TurnEnd { finish, .. } if finish == "completed")
             })
         })
         .await;
@@ -1205,7 +1265,7 @@ async fn question_roundtrip_sends_native_answers() {
             records.iter().any(|(_, body, _)| {
                 matches!(
                     body,
-                    TimelineBody::TurnEnd { finish } if finish == "completed"
+                    TimelineBody::TurnEnd { finish, .. } if finish == "completed"
                 )
             })
         })
@@ -1270,7 +1330,7 @@ async fn question_cancel_allows_with_empty_answers() {
             records.iter().any(|(_, body, _)| {
                 matches!(
                     body,
-                    TimelineBody::TurnEnd { finish } if finish == "completed"
+                    TimelineBody::TurnEnd { finish, .. } if finish == "completed"
                 )
             })
         })
@@ -1366,7 +1426,7 @@ async fn interrupt_rejects_permission_and_marks_turn_interrupted() {
             records.iter().any(|(_, body, _)| {
                 matches!(
                     body,
-                    TimelineBody::TurnEnd { finish } if finish == "interrupted"
+                    TimelineBody::TurnEnd { finish, .. } if finish == "interrupted"
                 )
             })
         })
@@ -1396,7 +1456,7 @@ async fn provider_failure_marks_turn_and_session_failed() {
             records.iter().any(|(_, body, _)| {
                 matches!(
                     body,
-                    TimelineBody::TurnEnd { finish } if finish == "failed"
+                    TimelineBody::TurnEnd { finish, .. } if finish == "failed"
                 )
             })
         })
@@ -1510,7 +1570,7 @@ async fn plan_mode_is_persisted_and_passed_to_the_cli() {
             records.iter().any(|(_, body, _)| {
                 matches!(
                     body,
-                    TimelineBody::TurnEnd { finish } if finish == "completed"
+                    TimelineBody::TurnEnd { finish, .. } if finish == "completed"
                 )
             })
         })
@@ -1580,7 +1640,7 @@ async fn launch_model_and_effort_are_passed_on_every_turn() {
             records.iter().any(|(_, body, _)| {
                 matches!(
                     body,
-                    TimelineBody::TurnEnd { finish } if finish == "completed"
+                    TimelineBody::TurnEnd { finish, .. } if finish == "completed"
                 )
             })
         })
@@ -1652,7 +1712,7 @@ async fn launch_plan_mode_is_applied_on_first_turn() {
             records.iter().any(|(_, body, _)| {
                 matches!(
                     body,
-                    TimelineBody::TurnEnd { finish } if finish == "completed"
+                    TimelineBody::TurnEnd { finish, .. } if finish == "completed"
                 )
             })
         })
@@ -1789,16 +1849,16 @@ async fn compact_sends_slash_command_and_records_compact_finish() {
     let records = harness
         .wait_for(&head.id, |records| {
             let compact = records.iter().any(|(_, body, _)| {
-                matches!(body, TimelineBody::TurnEnd { finish } if finish == "compact")
+                matches!(body, TimelineBody::TurnEnd { finish, .. } if finish == "compact")
             });
             let completed = records.iter().any(|(_, body, _)| {
-                matches!(body, TimelineBody::TurnEnd { finish } if finish == "completed")
+                matches!(body, TimelineBody::TurnEnd { finish, .. } if finish == "completed")
             });
             compact && completed
         })
         .await;
     assert!(records.iter().any(|(_, body, _)| {
-        matches!(body, TimelineBody::TurnEnd { finish } if finish == "compact")
+        matches!(body, TimelineBody::TurnEnd { finish, .. } if finish == "compact")
     }));
 }
 
@@ -1831,7 +1891,7 @@ async fn set_model_validates_persists_and_forwards_to_live_turn() {
     harness
         .wait_for(&head.id, |records| {
             records.iter().any(|(_, body, _)| {
-                matches!(body, TimelineBody::TurnEnd { finish } if finish == "completed")
+                matches!(body, TimelineBody::TurnEnd { finish, .. } if finish == "completed")
             })
         })
         .await;
@@ -2056,7 +2116,7 @@ async fn background_task_without_subagent_type_stays_on_main_timeline() {
             records.iter().any(|(_, body, _)| {
                 matches!(
                     body,
-                    TimelineBody::TurnEnd { finish } if finish == "completed"
+                    TimelineBody::TurnEnd { finish, .. } if finish == "completed"
                 )
             })
         })
@@ -2514,7 +2574,7 @@ async fn usage_accumulates_tokens_from_result_frames() {
         .send(&head.id, "count".into(), None, Vec::new())
         .await
         .unwrap();
-    harness.wait_for(&head.id, |records| records.iter().any(|(_, body, _)| matches!(body, TimelineBody::TurnEnd { finish } if finish == "completed"))).await;
+    harness.wait_for(&head.id, |records| records.iter().any(|(_, body, _)| matches!(body, TimelineBody::TurnEnd { finish, .. } if finish == "completed"))).await;
     let usage = harness.agents.usage(&head.id).await.unwrap().unwrap();
     assert_eq!(usage.input_tokens, Some(12));
     assert_eq!(usage.output_tokens, Some(7));

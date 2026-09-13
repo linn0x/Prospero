@@ -260,6 +260,20 @@ pub enum ToolState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct FileDiff {
+    pub path: String,
+    pub patch: String,
+    #[ts(type = "number")]
+    pub additions: i64,
+    #[ts(type = "number")]
+    pub deletions: i64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
 pub struct QuestionOption {
     pub label: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -311,6 +325,10 @@ pub enum TimelineBody {
         name: String,
         state: ToolState,
         summary: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diff: Option<FileDiff>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        has_more: bool,
     },
     PermissionRequest {
         request_id: String,
@@ -332,6 +350,8 @@ pub enum TimelineBody {
     },
     TurnEnd {
         finish: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        diffs: Vec<FileDiff>,
     },
     /// Claude Task-tool subagent lifecycle card. Subagent-owned messages and
     /// tool calls stay off the main timeline (they carry `subagent_id` and are
@@ -475,6 +495,7 @@ pub fn typescript() -> String {
         ContentPage::decl(&config),
         MessageRole::decl(&config),
         ToolState::decl(&config),
+        FileDiff::decl(&config),
         QuestionOption::decl(&config),
         AgentQuestion::decl(&config),
         MessageAttachment::decl(&config),
