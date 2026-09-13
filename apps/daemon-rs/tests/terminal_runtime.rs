@@ -26,6 +26,8 @@ fn input(directory: &TempDir) -> CreateTerminal {
         title: "Test terminal".into(),
         workspace: directory.path().to_str().unwrap().into(),
         size: TerminalSize { cols: 80, rows: 24 },
+        agent: None,
+        command: None,
     }
 }
 
@@ -109,6 +111,54 @@ async fn completed_terminal_is_archived_and_output_survives_restart() {
         .flatten()
         .collect();
     assert!(String::from_utf8_lossy(&bytes).contains("runtime-marker"));
+    runtime.shutdown().await.unwrap();
+    database.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn custom_terminal_command_runs_and_archives() {
+    let directory = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let database = Database::open(directory.path().into()).await.unwrap();
+    let runtime = Terminals::new(database.clone());
+    let mut input = input(&workspace);
+    input.agent = Some(prosperod_rs::protocol::AgentKind::Custom);
+    input.command = Some("printf 'custom-marker\\n'".into());
+    let head = runtime.create(input).await.unwrap();
+    assert_eq!(head.agent, prosperod_rs::protocol::AgentKind::Custom);
+    settled(&runtime).await;
+    let page = runtime
+        .read(head.id, TerminalQuery::default())
+        .await
+        .unwrap();
+    assert!(page.exited);
+    assert_eq!(page.exit_code, Some(0));
+    let bytes: Vec<u8> = page
+        .events
+        .into_iter()
+        .filter_map(|event| match event {
+            TerminalEvent::Output { data_b64 } => Some(STANDARD.decode(data_b64).unwrap()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert!(String::from_utf8_lossy(&bytes).contains("custom-marker"));
+    runtime.shutdown().await.unwrap();
+    database.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn pty_agent_commands_validate_like_legacy() {
+    let directory = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let database = Database::open(directory.path().into()).await.unwrap();
+    let runtime = Terminals::new(database.clone());
+    let mut deepseek = input(&workspace);
+    deepseek.agent = Some(prosperod_rs::protocol::AgentKind::Deepseek);
+    assert!(runtime.create(deepseek).await.is_err());
+    let mut custom = input(&workspace);
+    custom.agent = Some(prosperod_rs::protocol::AgentKind::Custom);
+    assert!(runtime.create(custom).await.is_err());
     runtime.shutdown().await.unwrap();
     database.shutdown().await.unwrap();
 }
