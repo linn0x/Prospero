@@ -1004,3 +1004,119 @@ async fn models_catalog_feature_errors_stay_in_body_with_stable_codes() {
         .await;
     assert_eq!(result["error"]["code"], "unsupported");
 }
+
+#[tokio::test]
+async fn account_config_get_set_and_rejects_unsafe_writes() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new().await;
+    let server = FakeServer::new(
+        ProbeMode::Success,
+        vec![json!({"data":[{"id":"fakemodel-1"}]})],
+    );
+    let (status, created) = harness
+        .post(control(
+            "agent.account.api.create",
+            obj(json!({
+                "agent": "claude",
+                "name": "Config Profile",
+                "baseUrl": server.base_url,
+                "model": "fakemodel-1",
+                "apiKey": SECRET,
+                "modelCapabilities": {"reasoning": true, "supportedEfforts": ["low", "high"]}
+            })),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let id = created["accountId"].as_str().unwrap().to_owned();
+
+    let (status, current) = harness
+        .post(control(
+            "agent.account.config.get",
+            obj(json!({"accountId": id})),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{current}");
+    assert_eq!(current["type"], "agent.account.config.result");
+    assert_eq!(current["ok"], true);
+    assert_eq!(current["config"]["accountId"], id);
+    assert_eq!(current["config"]["appliesTo"], "new_sessions");
+    assert_eq!(current["config"]["activeSessions"], 0);
+    assert_eq!(
+        current["config"]["supportedEfforts"],
+        json!(["low", "high"])
+    );
+    let document = current["config"]["documents"][0].clone();
+    assert_eq!(document["id"], "claude-overrides");
+    assert_eq!(document["format"], "yaml");
+    assert_eq!(document["editableKeys"], json!(["default_effort"]));
+
+    let (status, saved) = harness
+        .post(control(
+            "agent.account.config.set",
+            obj(json!({
+                "accountId": id,
+                "documentId": document["id"],
+                "revision": document["revision"],
+                "defaultEffort": "high"
+            })),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["ok"], true);
+    assert_eq!(saved["config"]["defaultEffort"], "high");
+    assert!(
+        saved["config"]["documents"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("high")
+    );
+
+    let (status, stale) = harness
+        .post(control(
+            "agent.account.config.set",
+            obj(json!({
+                "accountId": id,
+                "documentId": document["id"],
+                "revision": document["revision"],
+                "defaultEffort": "low"
+            })),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{stale}");
+    assert_eq!(stale["ok"], false);
+    assert_eq!(stale["error"]["code"], "conflict");
+
+    let revision = saved["config"]["documents"][0]["revision"]
+        .as_str()
+        .unwrap();
+    let (status, denied) = harness
+        .post(control(
+            "agent.account.config.set",
+            obj(json!({
+                "accountId": id,
+                "documentId": "auth",
+                "revision": revision,
+                "content": ""
+            })),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{denied}");
+    assert_eq!(denied["ok"], false);
+    assert_eq!(denied["error"]["code"], "forbidden");
+
+    let (status, invalid) = harness
+        .post(control(
+            "agent.account.config.set",
+            obj(json!({
+                "accountId": id,
+                "documentId": "claude-overrides",
+                "revision": revision,
+                "content": "ANTHROPIC_API_KEY: private-secret\n"
+            })),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{invalid}");
+    assert_eq!(invalid["ok"], false);
+    assert_eq!(invalid["error"]["code"], "invalid_config");
+    assert!(!invalid.to_string().contains("private-secret"));
+}

@@ -160,7 +160,7 @@ impl Agents {
         } else {
             ApprovalPolicy::Manual
         };
-        let create = CreateAgentSession {
+        let mut create = CreateAgentSession {
             title: input.title,
             workspace,
             auto_approve: input.auto_approve,
@@ -169,15 +169,47 @@ impl Agents {
             account_id: input.account_id,
         };
         let database = self.0.database.clone();
+        let data = self.0.database.directory().to_owned();
         let head = self
             .0
             .database
             .call(move |store| {
-                if let Some(account_id) = create.account_id.as_deref()
-                    && let Some(message) =
+                if let Some(account_id) = create.account_id.as_deref() {
+                    if let Some(message) =
                         crate::accounts::source_bound_launch_error(&database, account_id)?
-                {
-                    return Err(Error::Invalid(message));
+                    {
+                        return Err(Error::Invalid(message));
+                    }
+                    if account_id != crate::accounts::NATIVE_CLAUDE_ID {
+                        let record = store.managed_snapshot_row(&data, account_id)?;
+                        let target = crate::accounts::config::ConfigTarget {
+                            account_id: record.id.clone(),
+                            model: record
+                                .api_profile
+                                .as_ref()
+                                .map(|profile| profile.model.clone()),
+                            model_capabilities: record
+                                .api_profile
+                                .as_ref()
+                                .and_then(|profile| profile.model_capabilities.clone()),
+                            active_sessions: 0,
+                        };
+                        let (default_model, default_effort) =
+                            crate::accounts::config::read_defaults(&data, &target)?;
+                        let effective_default_model = target.model.clone().or(default_model);
+                        let apply_default_effort = create.effort.is_none()
+                            && create
+                                .model
+                                .as_deref()
+                                .map(|model| Some(model) == effective_default_model.as_deref())
+                                .unwrap_or(true);
+                        if create.model.is_none() {
+                            create.model = effective_default_model;
+                        }
+                        if apply_default_effort {
+                            create.effort = default_effort;
+                        }
+                    }
                 }
                 store.create_agent_session(create, policy)
             })
