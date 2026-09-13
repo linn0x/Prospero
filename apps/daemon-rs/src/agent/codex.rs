@@ -332,6 +332,9 @@ async fn read_notifications(
 ) {
     let mut streamed: HashMap<String, String> = HashMap::new();
     let mut subagents: HashMap<String, bool> = HashMap::new();
+    let mut pending_diffs: HashMap<String, crate::protocol::FileDiff> = HashMap::new();
+    let mut turn_diffs: HashMap<String, crate::protocol::FileDiff> = HashMap::new();
+    let mut aggregate_diffs: Option<Vec<crate::protocol::FileDiff>> = None;
     let mut last_text: Option<String> = None;
     let mut last_input_tokens: Option<i64> = None;
     let mut last_output_tokens: Option<i64> = None;
@@ -352,6 +355,7 @@ async fn read_notifications(
                     cost_usd: None,
                     input_tokens: last_input_tokens,
                     output_tokens: last_output_tokens,
+                    diffs: Vec::new(),
                 })
                 .await;
             sent_finish = true;
@@ -375,6 +379,7 @@ async fn read_notifications(
                     cost_usd: None,
                     input_tokens: last_input_tokens,
                     output_tokens: last_output_tokens,
+                    diffs: Vec::new(),
                 })
                 .await;
             sent_finish = true;
@@ -513,14 +518,35 @@ async fn read_notifications(
                     continue;
                 }
                 if let Some((tool, summary)) = tool_start_summary(&item_type, &item) {
+                    let diff = codex_file_changes(&item).into_iter().next();
                     let _ = events
                         .send(AdapterEvent::ToolCall {
                             subagent: agent_id.clone(),
                             call_id: item_id,
                             name: tool,
                             summary,
+                            diff,
                         })
                         .await;
+                }
+            }
+            "item/fileChange/patchUpdated" => {
+                let item_id = params
+                    .get("itemId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                if !item_id.is_empty()
+                    && let Some(diff) = extract_diff(&params)
+                {
+                    pending_diffs.insert(item_id, diff);
+                }
+            }
+            "turn/diff/updated" => {
+                if let Some(patch) = params.get("diff").and_then(Value::as_str)
+                    && !patch.is_empty()
+                {
+                    aggregate_diffs = Some(codex_turn_diffs(patch));
                 }
             }
             "item/completed" => {
@@ -569,11 +595,22 @@ async fn read_notifications(
                                 .await;
                         }
                     }
-                } else if let Some((tool, summary, error)) = tool_result_summary(&item_type, &item)
+                } else if let Some((tool, summary, error, has_more)) =
+                    tool_result_summary(&item_type, &item)
                 {
                     let item_id = codex_item_id_from_item(&params, &item).unwrap_or_else(|| {
                         futures_current_turn(&current_turn).unwrap_or_else(|| "codex-tool".into())
                     });
+                    let changes = codex_file_changes(&item);
+                    let diff = changes
+                        .first()
+                        .cloned()
+                        .or_else(|| pending_diffs.remove(&item_id));
+                    if item_type == "fileChange" && !error {
+                        for change in changes.into_iter().chain(diff.clone()) {
+                            turn_diffs.insert(change.path.clone(), change);
+                        }
+                    }
                     let _ = events
                         .send(AdapterEvent::ToolResult {
                             subagent: agent_id.clone(),
@@ -581,6 +618,8 @@ async fn read_notifications(
                             name: tool,
                             summary,
                             error,
+                            diff,
+                            has_more,
                         })
                         .await;
                 }
@@ -603,6 +642,9 @@ async fn read_notifications(
                     .unwrap_or("completed");
                 let failed = matches!(status, "failed" | "error");
                 let interrupted = matches!(status, "cancelled" | "canceled" | "interrupted");
+                let diffs = aggregate_diffs
+                    .take()
+                    .unwrap_or_else(|| turn_diffs.values().cloned().collect());
                 let _ = events
                     .send(AdapterEvent::Finish {
                         interrupted,
@@ -610,6 +652,7 @@ async fn read_notifications(
                         cost_usd: None,
                         input_tokens: last_input_tokens,
                         output_tokens: last_output_tokens,
+                        diffs,
                     })
                     .await;
                 sent_finish = true;
@@ -626,6 +669,7 @@ async fn read_notifications(
                 cost_usd: None,
                 input_tokens: last_input_tokens,
                 output_tokens: last_output_tokens,
+                diffs: Vec::new(),
             })
             .await;
     }
@@ -945,7 +989,7 @@ fn tool_start_summary(item_type: &str, item: &Value) -> Option<(String, String)>
     }
 }
 
-fn tool_result_summary(item_type: &str, item: &Value) -> Option<(String, String, bool)> {
+fn tool_result_summary(item_type: &str, item: &Value) -> Option<(String, String, bool, bool)> {
     match item_type {
         "commandExecution" => Some((
             "bash".into(),
@@ -955,11 +999,13 @@ fn tool_result_summary(item_type: &str, item: &Value) -> Option<(String, String,
                     .or_else(|| item.get("status")),
             ),
             item_failed(item),
+            full_text_len(item) > 400,
         )),
         "fileChange" => Some((
             "edit".into(),
             summarize(item.get("status")),
             item_failed(item),
+            false,
         )),
         "mcpToolCall" => Some((
             item.get("server")
@@ -972,6 +1018,7 @@ fn tool_result_summary(item_type: &str, item: &Value) -> Option<(String, String,
                     .or_else(|| item.get("status")),
             ),
             item_failed(item),
+            full_text_len(item) > 400,
         )),
         _ => None,
     }
@@ -1027,6 +1074,160 @@ fn subagent_status(value: Option<&Value>) -> (&'static str, bool) {
         "interrupted" | "shutdown" | "notLoaded" => ("stopped", false),
         _ => ("starting", true),
     }
+}
+
+fn codex_file_changes(item: &Value) -> Vec<crate::protocol::FileDiff> {
+    item.get("changes")
+        .and_then(Value::as_array)
+        .map(|changes| {
+            changes
+                .iter()
+                .filter_map(|change| {
+                    let path = change.get("path")?.as_str()?;
+                    let patch = change
+                        .get("patch")
+                        .or_else(|| change.get("unifiedDiff"))
+                        .or_else(|| change.get("diff"))
+                        .and_then(Value::as_str)?;
+                    Some(from_unified_patch(path, patch))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn extract_diff(params: &Value) -> Option<crate::protocol::FileDiff> {
+    let path = params
+        .get("path")
+        .or_else(|| params.get("file"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if let Some(patch) = params
+        .get("patch")
+        .or_else(|| params.get("unifiedDiff"))
+        .or_else(|| params.get("diff"))
+        .and_then(Value::as_str)
+        && !patch.is_empty()
+    {
+        return Some(from_unified_patch(path, patch));
+    }
+    let changes = params.get("changes")?.as_object()?;
+    for (path, inner) in changes {
+        let patch = inner
+            .get("patch")
+            .or_else(|| inner.get("unifiedDiff"))
+            .or_else(|| inner.get("diff"))
+            .and_then(Value::as_str);
+        if let Some(patch) = patch
+            && !patch.is_empty()
+        {
+            return Some(from_unified_patch(path, patch));
+        }
+    }
+    None
+}
+
+fn codex_turn_diffs(patch: &str) -> Vec<crate::protocol::FileDiff> {
+    let mut diffs = Vec::new();
+    let mut current = String::new();
+    for line in patch.lines() {
+        if line.starts_with("diff --git ") && !current.is_empty() {
+            if let Some(diff) = diff_from_section(&current) {
+                diffs.push(diff);
+            }
+            current.clear();
+        }
+        current.push_str(line);
+        current.push('\n');
+    }
+    if !current.is_empty()
+        && let Some(diff) = diff_from_section(&current)
+    {
+        diffs.push(diff);
+    }
+    diffs
+}
+
+fn diff_from_section(section: &str) -> Option<crate::protocol::FileDiff> {
+    let mut target = None;
+    let mut binary_target = None;
+    for line in section.lines() {
+        if let Some(rest) = line.strip_prefix("+++ ")
+            && rest != "/dev/null"
+        {
+            target = Some(diff_path(rest));
+        } else if let Some(rest) = line.strip_prefix("--- ")
+            && rest != "/dev/null"
+            && target.is_none()
+        {
+            target = Some(diff_path(rest));
+        } else if let Some(rest) = line.strip_prefix("diff --git ") {
+            binary_target = rest.split_whitespace().last().map(diff_path);
+        }
+    }
+    let path = target.or(binary_target)?.trim().to_owned();
+    if path.is_empty() || path == "/dev/null" {
+        None
+    } else {
+        Some(from_unified_patch(&path, section))
+    }
+}
+
+fn diff_path(value: &str) -> String {
+    value
+        .split('\t')
+        .next()
+        .unwrap_or(value)
+        .trim()
+        .trim_matches('"')
+        .trim_start_matches("a/")
+        .trim_start_matches("b/")
+        .to_owned()
+}
+
+fn from_unified_patch(path: &str, patch_text: &str) -> crate::protocol::FileDiff {
+    const MAX_PATCH_CHARS: usize = 8000;
+    let mut additions = 0_i64;
+    let mut deletions = 0_i64;
+    let mut lines = Vec::new();
+    for line in patch_text.lines() {
+        if line.starts_with("---")
+            || line.starts_with("+++")
+            || line.starts_with("diff ")
+            || line.starts_with("index ")
+        {
+            continue;
+        }
+        if line.starts_with('+') {
+            additions += 1;
+        } else if line.starts_with('-') {
+            deletions += 1;
+        }
+        lines.push(line);
+    }
+    let mut patch = lines.join("\n");
+    let truncated = patch.len() > MAX_PATCH_CHARS;
+    if truncated {
+        patch.truncate(MAX_PATCH_CHARS);
+    }
+    crate::protocol::FileDiff {
+        path: path.chars().take(4096).collect(),
+        patch,
+        additions,
+        deletions,
+        truncated,
+    }
+}
+
+fn full_text_len(item: &Value) -> usize {
+    item.get("output")
+        .or_else(|| item.get("aggregatedOutput"))
+        .or_else(|| item.get("result"))
+        .map(|value| match value {
+            Value::String(text) => text.len(),
+            value => serde_json::to_string(value).unwrap_or_default().len(),
+        })
+        .unwrap_or(0)
 }
 
 fn item_failed(item: &Value) -> bool {

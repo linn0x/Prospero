@@ -74,6 +74,7 @@ pub(super) enum AdapterEvent {
         call_id: String,
         name: String,
         summary: String,
+        diff: Option<crate::protocol::FileDiff>,
     },
     ToolResult {
         subagent: Option<String>,
@@ -81,6 +82,8 @@ pub(super) enum AdapterEvent {
         name: String,
         summary: String,
         error: bool,
+        diff: Option<crate::protocol::FileDiff>,
+        has_more: bool,
     },
     Permission {
         subagent: Option<String>,
@@ -105,6 +108,7 @@ pub(super) enum AdapterEvent {
         cost_usd: Option<f64>,
         input_tokens: Option<i64>,
         output_tokens: Option<i64>,
+        diffs: Vec<crate::protocol::FileDiff>,
     },
 }
 
@@ -438,6 +442,7 @@ pub(super) fn spawn_turn(
                 cost_usd: translator.cost_usd,
                 input_tokens: translator.input_tokens,
                 output_tokens: translator.output_tokens,
+                diffs: Vec::new(),
             })
             .await
             .ok();
@@ -729,6 +734,7 @@ impl Translator {
                                 call_id: call_id.to_owned(),
                                 name,
                                 summary,
+                                diff: None,
                             });
                         }
                     }
@@ -776,6 +782,8 @@ impl Translator {
                                 call_id,
                                 summary,
                                 error,
+                                diff: None,
+                                has_more: false,
                             });
                         }
                     }

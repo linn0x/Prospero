@@ -833,6 +833,7 @@ impl Agents {
         let mut native_persisted = false;
         let mut interrupted = false;
         let mut failure: Option<String> = None;
+        let mut turn_diffs: Vec<FileDiff> = Vec::new();
 
         macro_rules! flush {
             () => {{
@@ -1030,6 +1031,7 @@ impl Agents {
                     call_id,
                     name,
                     summary,
+                    diff,
                 } => {
                     let owner = subagent.map(|value| safe_owner(&value));
                     let record = match &owner {
@@ -1044,6 +1046,8 @@ impl Agents {
                             name,
                             state: ToolState::Running,
                             summary,
+                            diff,
+                            has_more: false,
                         },
                         text: String::new(),
                         replace: false,
@@ -1058,6 +1062,8 @@ impl Agents {
                     name,
                     summary,
                     error,
+                    diff,
+                    has_more,
                 } => {
                     let owner = subagent.map(|value| safe_owner(&value));
                     let record = match &owner {
@@ -1077,6 +1083,8 @@ impl Agents {
                                 ToolState::Success
                             },
                             summary: String::new(),
+                            diff,
+                            has_more,
                         },
                         text: summary,
                         replace: false,
@@ -1221,6 +1229,7 @@ impl Agents {
                             expected_revision: 0,
                             body: TimelineBody::TurnEnd {
                                 finish: "compact".into(),
+                                diffs: Vec::new(),
                             },
                             text: String::new(),
                             replace: false,
@@ -1246,6 +1255,7 @@ impl Agents {
                     cost_usd,
                     input_tokens,
                     output_tokens,
+                    diffs,
                 } => {
                     handle.steerable.store(false, Ordering::Release);
                     let has_usage = cost_usd.unwrap_or(0.0) > 0.0
@@ -1261,6 +1271,7 @@ impl Agents {
                             Some(usage.output_tokens.unwrap_or(0) + output_tokens.unwrap_or(0));
                     }
                     interrupted = was_interrupted;
+                    turn_diffs = diffs;
                     failure = error;
                     break;
                 }
@@ -1299,6 +1310,7 @@ impl Agents {
             expected_revision: 0,
             body: TimelineBody::TurnEnd {
                 finish: finish.into(),
+                diffs: turn_diffs,
             },
             text: String::new(),
             replace: false,
