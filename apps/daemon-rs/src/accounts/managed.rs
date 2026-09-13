@@ -762,6 +762,16 @@ impl crate::database::Store {
         Ok(agents + terminals)
     }
 
+    pub(crate) fn native_account_active_count(&self, agent: &str, native_id: &str) -> Result<i64> {
+        crate::database::validate_text(agent, 32, false)?;
+        crate::database::validate_id(native_id)?;
+        self.connection.query_row(
+            "SELECT COUNT(*) FROM session_heads sh              LEFT JOIN agent_runs ar ON ar.session_id = sh.id              LEFT JOIN terminal_runs tr ON tr.session_id = sh.id              WHERE sh.lifecycle = 'active'                AND json_extract(sh.payload, '$.agent') = ?1                AND (COALESCE(ar.account_id, tr.account_id) IS NULL                     OR COALESCE(ar.account_id, tr.account_id) = ?2)",
+            params![agent, native_id],
+            |row| row.get(0),
+        ).map_err(Error::from)
+    }
+
     /// Snapshot counts anchored on active Claude session heads, matching the
     /// legacy native counter. A session belongs to the account named by its
     /// run row (structured or PTY); a missing/NULL binding is the native
