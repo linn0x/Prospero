@@ -68,6 +68,7 @@ async fn health_capabilities_are_explicitly_local_http_not_mobile_ws() {
         "events.stream",
         "agent.api-protocols.v1",
         "agent.api-validation.v1",
+        "agent.api-engine-validation.v1",
         "agent.account.api.models",
         "agent.account.config",
         "conversation.search.v1",
