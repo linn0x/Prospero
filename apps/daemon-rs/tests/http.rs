@@ -1034,9 +1034,11 @@ async fn usage_endpoint_matches_legacy_control_envelope() {
             title: "Claude".into(),
             workspace: workspace.path().to_str().unwrap().into(),
             auto_approve: false,
+            mode: None,
             model: None,
             effort: None,
             account_id: None,
+            resume: None,
         })
         .await
         .unwrap();

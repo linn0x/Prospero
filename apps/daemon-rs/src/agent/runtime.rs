@@ -166,14 +166,26 @@ impl Agents {
                 "Agent 暂未接入 Rust structured runtime".into(),
             ));
         }
+        if let Some(fork) = input.resume.as_ref().and_then(|resume| resume.fork) {
+            if fork {
+                return Err(Error::Conflict);
+            }
+            return Err(Error::Invalid("接回选项无效".into()));
+        }
         let mut create = CreateAgentSession {
             agent: input.agent,
-            title: input.title,
+            title: input
+                .resume
+                .as_ref()
+                .and_then(|resume| resume.title.clone())
+                .unwrap_or(input.title),
             workspace,
             auto_approve: input.auto_approve,
+            mode: input.mode,
             model: input.model,
             effort: input.effort,
             account_id: input.account_id,
+            resume: input.resume,
         };
         let database = self.0.database.clone();
         let data = self.0.database.directory().to_owned();
@@ -203,8 +215,13 @@ impl Agents {
                         };
                         let (default_model, default_effort) =
                             crate::accounts::config::read_defaults(&data, &target)?;
-                        let effective_default_model = target.model.clone().or(default_model);
-                        let apply_default_effort = create.effort.is_none()
+                        let resuming = create.resume.is_some();
+                        let effective_default_model = target
+                            .model
+                            .clone()
+                            .or_else(|| (!resuming).then_some(default_model).flatten());
+                        let apply_default_effort = !resuming
+                            && create.effort.is_none()
                             && create
                                 .model
                                 .as_deref()

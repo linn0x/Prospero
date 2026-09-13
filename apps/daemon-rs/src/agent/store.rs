@@ -43,6 +43,14 @@ impl PermissionMode {
             PermissionMode::Plan => "plan",
         }
     }
+
+    pub(crate) fn from_wire(value: &str) -> Result<Self> {
+        match value {
+            "default" => Ok(PermissionMode::Default),
+            "plan" => Ok(PermissionMode::Plan),
+            _ => Err(Error::Invalid("会话模式无效".into())),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -105,8 +113,18 @@ impl Store {
         input: CreateAgentSession,
         policy: ApprovalPolicy,
     ) -> Result<SessionHead> {
+        let mode = match input.mode.as_deref() {
+            Some(value) => PermissionMode::from_wire(value)?,
+            None => PermissionMode::Default,
+        };
         let model = normalize_selection(input.model, 160, "模型无效")?;
         let effort = normalize_selection(input.effort, 80, "思考强度无效")?;
+        let native_id = input
+            .resume
+            .map(|resume| resume.id)
+            .map(|id| normalize_selection(Some(id), 256, "原生会话 ID 无效"))
+            .transpose()?
+            .flatten();
         // The native id collapses to NULL; anything else must reference a
         // surviving managed account so sessions never bind to a deleted row.
         let account_id = match input.account_id.as_deref() {
@@ -127,9 +145,9 @@ impl Store {
             },
             |tx, head| {
                 tx.execute(
-                    "INSERT INTO agent_runs(session_id,agent,active,approval_policy,turn,native_id,model,effort,account_id) \
-                     VALUES(?1,?2,1,?3,0,NULL,?4,?5,?6)",
-                    params![head.id, crate::database::label(agent)?, policy.label(), model, effort, account_id],
+                    "INSERT INTO agent_runs(session_id,agent,active,approval_policy,permission_mode,turn,native_id,model,effort,account_id) \
+                     VALUES(?1,?2,1,?3,?4,0,?5,?6,?7,?8)",
+                    params![head.id, crate::database::label(agent)?, policy.label(), mode.label(), native_id, model, effort, account_id],
                 )?;
                 Ok(())
             },
