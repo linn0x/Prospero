@@ -502,6 +502,123 @@ async fn list_skills_route(
 
 // ── Accounts (Stage 8: discovery + managed accounts) ─────────────────────
 
+#[derive(Debug, Clone)]
+struct MigrationPlan {
+    migration: crate::accounts::sources::SourceMigration,
+    entries: Vec<crate::accounts::sources::MigrationEntry>,
+}
+
+fn migration_id(entries: &[crate::accounts::sources::MigrationEntry]) -> String {
+    use sha2::{Digest, Sha256};
+    let key = entries
+        .iter()
+        .map(|entry| {
+            let secret = Sha256::digest(entry.secret.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            (
+                entry.profile.protocol().to_owned(),
+                entry.profile.base_url.clone(),
+                entry.profile.headers.clone(),
+                entry.account_id.clone(),
+                entry.name.clone(),
+                entry.profile.model.clone(),
+                entry.profile.model_capabilities.clone(),
+                secret,
+            )
+        })
+        .collect::<Vec<_>>();
+    let digest = Sha256::digest(serde_json::to_vec(&key).unwrap_or_default());
+    digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn migration_name(base_url: &str) -> String {
+    url::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .filter(|host| !host.trim().is_empty())
+        .unwrap_or_else(|| "Migrated Profiles".into())
+        .chars()
+        .take(80)
+        .collect()
+}
+
+fn source_migration_plans(
+    store: &Store,
+    data: &std::path::Path,
+    sources: &crate::accounts::sources::ModelSources,
+) -> Result<(Vec<MigrationPlan>, i64)> {
+    let mut skipped = 0_i64;
+    let mut groups: BTreeMap<String, Vec<crate::accounts::sources::MigrationEntry>> =
+        BTreeMap::new();
+    for account in store.list_managed_accounts(data)? {
+        let Some(profile) = account.api_profile.clone() else {
+            continue;
+        };
+        if sources.is_bound(&account.id) {
+            continue;
+        }
+        let Some(secret) = crate::accounts::managed::profile_secret(data, &account.id)? else {
+            skipped += 1;
+            continue;
+        };
+        let key =
+            serde_json::to_string(&(profile.protocol(), &profile.base_url, &profile.headers))?;
+        groups
+            .entry(key)
+            .or_default()
+            .push(crate::accounts::sources::MigrationEntry {
+                account_id: account.id,
+                name: account.name,
+                profile,
+                secret,
+                default_effort: None,
+            });
+    }
+    let mut plans = Vec::new();
+    for entries in groups.into_values() {
+        if entries.len() > 500 || plans.len() >= 100 {
+            skipped += entries.len() as i64;
+            continue;
+        }
+        let Some(first) = entries.first() else {
+            continue;
+        };
+        let protocol = first.profile.protocol().to_owned();
+        let base_url = first.profile.base_url.clone();
+        let id = migration_id(&entries);
+        let accounts = entries
+            .iter()
+            .map(|entry| crate::accounts::sources::SourceMigrationAccount {
+                id: entry.account_id.clone(),
+                name: entry.name.clone(),
+                model: entry.profile.model.clone(),
+            })
+            .collect();
+        let credential_count = entries
+            .iter()
+            .map(|entry| entry.secret.as_str())
+            .collect::<HashSet<_>>()
+            .len() as i64;
+        plans.push(MigrationPlan {
+            migration: crate::accounts::sources::SourceMigration {
+                id,
+                name: migration_name(&base_url),
+                protocol,
+                base_url,
+                credential_count,
+                accounts,
+            },
+            entries,
+        });
+    }
+    Ok((plans, skipped))
+}
+
 async fn model_sources_route(
     State(api): State<Api>,
     body: std::result::Result<
@@ -682,17 +799,55 @@ async fn model_sources_route(
             Json(result).into_response()
         }
         SourceAction::MigrationPreview => {
+            let data = api.database.directory().to_owned();
+            let (migrations, skipped) = match api
+                .database
+                .call(move |store| {
+                    let sources = crate::accounts::sources::ModelSources::open(&data)?;
+                    let (plans, skipped) = source_migration_plans(store, &data, &sources)?;
+                    Ok((
+                        plans
+                            .into_iter()
+                            .map(|plan| plan.migration)
+                            .collect::<Vec<_>>(),
+                        skipped,
+                    ))
+                })
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => return ApiError(error).into_response(),
+            };
             let mut result = SourceResult::success(&request_id);
-            result.migrations = Some(Vec::new());
-            result.skipped_accounts = Some(0);
+            result.migrations = Some(migrations);
+            result.skipped_accounts = Some(skipped);
             Json(result).into_response()
         }
         SourceAction::MigrationRollback { account_ids } => {
             let data = api.database.directory().to_owned();
             let sources = match api
                 .database
-                .call(move |_| {
+                .call(move |store| {
+                    if account_ids.is_empty() || account_ids.len() > 500 {
+                        return Err(Error::Invalid("账号列表无效".into()));
+                    }
                     let mut sources = crate::accounts::sources::ModelSources::open(&data)?;
+                    for id in &account_ids {
+                        if store.active_session_count(id)? > 0 {
+                            return Err(Error::InUse);
+                        }
+                        let record = store.managed_snapshot_row(&data, id)?;
+                        let Some(profile) = record.api_profile else {
+                            return Err(Error::Invalid("只能还原迁移前的独立 Profile".into()));
+                        };
+                        let Some(secret) = crate::accounts::managed::profile_secret(&data, id)?
+                        else {
+                            return Err(Error::Conflict);
+                        };
+                        if sources.binding_secret(id, &profile)? != secret {
+                            return Err(Error::Conflict);
+                        }
+                    }
                     sources.unbind(&account_ids)?;
                     Ok(sources.list())
                 })
@@ -718,14 +873,46 @@ async fn model_sources_route(
             Json(result).into_response()
         }
         SourceAction::MigrationApply {
-            _migration_id,
-            _name,
-            _target,
-        } => Json(SourceResult::failure(
-            &request_id,
-            FeatureError::new("unsupported", "Profile 迁移尚未接入 Rust daemon"),
-        ))
-        .into_response(),
+            migration_id,
+            name,
+            target,
+        } => {
+            let data = api.database.directory().to_owned();
+            let sources = match api
+                .database
+                .call(move |store| {
+                    let mut sources = crate::accounts::sources::ModelSources::open(&data)?;
+                    let (plans, _skipped) = source_migration_plans(store, &data, &sources)?;
+                    let plan = plans
+                        .into_iter()
+                        .find(|plan| plan.migration.id == migration_id)
+                        .ok_or(Error::Conflict)?;
+                    for entry in &plan.entries {
+                        if store.active_session_count(&entry.account_id)? > 0 {
+                            return Err(Error::InUse);
+                        }
+                    }
+                    sources.migrate(&name, plan.entries, target)?;
+                    Ok(sources.list())
+                })
+                .await
+            {
+                Ok(sources) => sources,
+                Err(error) => return ApiError(error).into_response(),
+            };
+            api.publish();
+            let accounts =
+                match crate::accounts::snapshot(&api.database, &request_id, "model_source_migrate")
+                    .await
+                {
+                    Ok(result) => result.accounts,
+                    Err(error) => return ApiError(error).into_response(),
+                };
+            let mut result = SourceResult::success(&request_id);
+            result.sources = Some(sources);
+            result.accounts = Some(accounts);
+            Json(result).into_response()
+        }
     }
 }
 
