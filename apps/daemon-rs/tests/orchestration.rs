@@ -1323,7 +1323,7 @@ fn v14_database_is_migrated_forward_to_v17() {
 }
 
 #[test]
-fn v15_database_is_migrated_forward_to_v17() {
+fn v15_database_is_migrated_forward_to_v18() {
     // A v15 database gains the managed_accounts registry and the account_id
     // binding columns on agent/terminal runs without losing existing runs.
     let directory = TempDir::new().unwrap();
@@ -1394,8 +1394,16 @@ fn v15_database_is_migrated_forward_to_v17() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        17
+        18
     );
+    let has_engine_validation_column: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('managed_accounts') WHERE name='api_engine_validation'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(has_engine_validation_column, 1);
     // Pre-existing runs survive and are unbound (native).
     let bound: Option<String> = connection
         .query_row(

@@ -12,7 +12,7 @@ pub(crate) mod probe;
 pub(crate) mod profile;
 pub(crate) mod sources;
 
-pub(crate) use probe::ApiValidation;
+pub(crate) use probe::{ApiEngineValidation, ApiValidation};
 pub(crate) use profile::{ApiProfile, ModelCapabilities};
 
 use std::process::Stdio;
@@ -74,6 +74,8 @@ pub struct NativeAccount {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_validation: Option<ApiValidation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_engine_validation: Option<ApiEngineValidation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_method: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -109,6 +111,8 @@ pub struct AccountListResult {
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validation: Option<ApiValidation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_validation: Option<ApiEngineValidation>,
 }
 
 /// Tag dispatch for `/v1/accounts`. API/profile actions remain a later slice.
@@ -471,6 +475,7 @@ async fn managed_row(
         model_source: None,
         engine: None,
         api_validation: None,
+        api_engine_validation: None,
         auth_method: probe.auth_method,
         detail: probe.detail,
         created_at: record.created_at,
@@ -539,6 +544,7 @@ async fn profile_row(
         model_source,
         engine: Some("claude".into()),
         api_validation: record.api_validation,
+        api_engine_validation: record.api_engine_validation,
         auth_method,
         detail,
         created_at: record.created_at,
@@ -553,7 +559,7 @@ pub(crate) async fn snapshot(
     request_id: &str,
     action: &str,
 ) -> Result<AccountListResult> {
-    snapshot_with(database, request_id, action, None, None, None).await
+    snapshot_with(database, request_id, action, None, None, None, None).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -564,6 +570,7 @@ async fn snapshot_with(
     account_id: Option<String>,
     session_id: Option<String>,
     validation: Option<ApiValidation>,
+    engine_validation: Option<ApiEngineValidation>,
 ) -> Result<AccountListResult> {
     let db = database.clone();
     let data = database.directory().to_owned();
@@ -601,6 +608,7 @@ async fn snapshot_with(
         model_source: None,
         engine: None,
         api_validation: None,
+        api_engine_validation: None,
         auth_method: probe.auth_method,
         detail: probe.detail,
         created_at: 0,
@@ -625,6 +633,7 @@ async fn snapshot_with(
         account_id,
         session_id,
         validation,
+        engine_validation,
     })
 }
 
@@ -805,6 +814,7 @@ pub(crate) async fn respond(
     account_id: Option<String>,
     session_id: Option<String>,
     validation: Option<ApiValidation>,
+    engine_validation: Option<ApiEngineValidation>,
 ) -> Result<AccountListResult> {
     snapshot_with(
         database,
@@ -813,6 +823,7 @@ pub(crate) async fn respond(
         account_id,
         session_id,
         validation,
+        engine_validation,
     )
     .await
 }

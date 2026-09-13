@@ -523,6 +523,43 @@ async fn protocol_probe_records_pass_and_renders_in_the_snapshot() {
 }
 
 #[tokio::test]
+async fn engine_probe_records_pass_and_renders_separately() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new().await;
+    let server = FakeServer::new(ProbeMode::Success, vec![]);
+    let id = create_profile(&harness, &server).await;
+
+    let (status, result) = harness
+        .post(control(
+            "agent.account.api.test",
+            obj(json!({"accountId": id, "scope": "engine"})),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["accountId"], id);
+    assert!(result["validation"].is_null());
+    assert_eq!(result["engineValidation"]["status"], "passed");
+    assert_eq!(result["engineValidation"]["engine"], "claude");
+    assert_eq!(result["engineValidation"]["cliVersion"], "1.2.3-fake");
+    assert_eq!(result["engineValidation"]["checks"]["runtime"], "passed");
+    assert_eq!(
+        result["engineValidation"]["checks"]["configuration"],
+        "passed"
+    );
+    assert_eq!(result["engineValidation"]["checks"]["streaming"], "passed");
+    assert_eq!(result["engineValidation"]["checks"]["tools"], "passed");
+    assert_eq!(server.state.messages_seen.load(Ordering::SeqCst), 2);
+
+    let (_, listed) = harness
+        .post(control("agent.accounts.list", serde_json::Map::new()))
+        .await;
+    let row = account(&listed, &id).unwrap();
+    assert_eq!(row["apiValidation"], Value::Null);
+    assert_eq!(row["apiEngineValidation"]["status"], "passed");
+    assert!(!listed.to_string().contains(SECRET));
+}
+
+#[tokio::test]
 async fn protocol_probe_failures_keep_stable_codes() {
     let _guard = SERIAL.lock().await;
 
@@ -588,7 +625,7 @@ async fn protocol_probe_failures_keep_stable_codes() {
 }
 
 #[tokio::test]
-async fn duplicate_in_flight_test_is_409_busy_and_engine_scope_is_rejected() {
+async fn duplicate_in_flight_test_is_409_busy_and_invalid_scopes_are_rejected() {
     let _guard = SERIAL.lock().await;
     let harness = Harness::new().await;
     let server = FakeServer::new(ProbeMode::Success, vec![]);
@@ -621,14 +658,14 @@ async fn duplicate_in_flight_test_is_409_busy_and_engine_scope_is_rejected() {
     assert_eq!(body["code"], "busy");
     assert!(body["message"].as_str().unwrap().contains("正在测试连接"));
 
-    // Engine scope is explicitly out of scope for the Rust daemon.
+    // Engine scope shares the same per-profile in-flight guard.
     let (status, _) = harness
         .post(control(
             "agent.account.api.test",
             obj(json!({"accountId": id, "scope": "engine"})),
         ))
         .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::CONFLICT);
     let (status, _) = harness
         .post(control(
             "agent.account.api.test",
