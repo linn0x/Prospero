@@ -25,6 +25,15 @@ const START_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
 
+type PendingResponses =
+    Arc<Mutex<HashMap<String, oneshot::Sender<std::result::Result<Value, String>>>>>;
+
+struct NotificationState {
+    current_turn: Arc<Mutex<Option<String>>>,
+    current_turns: Arc<Mutex<HashMap<String, String>>>,
+    responses: PendingResponses,
+}
+
 fn binary() -> String {
     std::env::var("PROSPERO_CODEX_BIN").unwrap_or_else(|_| "codex".into())
 }
@@ -47,12 +56,14 @@ pub(super) struct CodexTurn {
     events: Option<mpsc::Receiver<AdapterEvent>>,
     thread_id: String,
     current_turn: Arc<Mutex<Option<String>>>,
+    current_turns: Arc<Mutex<HashMap<String, String>>>,
     approval_policy: Value,
     sandbox_policy: Value,
     model: Option<String>,
     effort: Option<String>,
     mode: PermissionMode,
     child_pid: u32,
+    responses: PendingResponses,
 }
 
 struct StartingRpc {
@@ -226,8 +237,10 @@ pub(super) async fn spawn_turn(
 
     let (frames_tx, mut frames_rx) = mpsc::channel::<(Value, Option<oneshot::Sender<()>>)>(32);
     let (events_tx, events_rx) = mpsc::channel::<AdapterEvent>(64);
+    let responses: PendingResponses = Arc::new(Mutex::new(HashMap::new()));
     let _ = events_tx.try_send(AdapterEvent::NativeId(thread_id.clone()));
     let current_turn = Arc::new(Mutex::new(None));
+    let current_turns = Arc::new(Mutex::new(HashMap::new()));
 
     let mut stdin = rpc.stdin;
     tokio::spawn(async move {
@@ -242,17 +255,23 @@ pub(super) async fn spawn_turn(
     });
 
     let reader_current_turn = current_turn.clone();
+    let reader_current_turns = current_turns.clone();
     let reader_frames = frames_tx.clone();
     let reader_thread_id = thread_id.clone();
+    let reader_responses = responses.clone();
     let auto_approve = options.policy == ApprovalPolicy::Auto;
     tokio::spawn(async move {
         read_notifications(
             rpc.stdout,
             events_tx,
-            reader_current_turn,
             reader_frames,
             auto_approve,
             reader_thread_id,
+            NotificationState {
+                current_turn: reader_current_turn,
+                current_turns: reader_current_turns,
+                responses: reader_responses,
+            },
         )
         .await;
         let _ = rpc.child.start_kill();
@@ -290,13 +309,66 @@ pub(super) async fn spawn_turn(
         events: Some(events_rx),
         thread_id,
         current_turn,
+        current_turns,
         approval_policy: policy.approval_policy_for_turn,
         sandbox_policy: policy.sandbox_policy,
         model: options.model.clone(),
         effort: options.effort.clone(),
         mode: options.mode,
         child_pid,
+        responses,
     })
+}
+
+pub(super) async fn read_subagent_history_once(
+    data: &Path,
+    workspace: &str,
+    parent_thread_id: &str,
+    subagent_id: &str,
+) -> Result<Option<Vec<Value>>> {
+    let (_home, environment) = super::usage::native_codex_environment(data)?;
+    let mut rpc = StartingRpc::start(workspace, &environment).await?;
+    let result = async {
+        rpc.request(
+            "initialize",
+            json!({
+                "clientInfo": { "name": "prospero", "title": "Prospero", "version": env!("CARGO_PKG_VERSION") },
+                "capabilities": { "experimentalApi": true, "requestAttestation": false },
+            }),
+        )
+        .await?;
+        rpc.notify("initialized", json!({})).await?;
+        let _ = rpc
+            .request(
+                "thread/resume",
+                json!({
+                    "threadId": parent_thread_id,
+                    "cwd": workspace,
+                    "approvalPolicy": "untrusted",
+                    "sandbox": "workspace-write",
+                }),
+            )
+            .await?;
+        let raw = rpc
+            .request(
+                "thread/read",
+                json!({ "threadId": subagent_id, "includeTurns": true }),
+            )
+            .await?;
+        let Some(thread) = raw.get("thread").and_then(Value::as_object) else {
+            return Ok(None);
+        };
+        if thread.get("id").and_then(Value::as_str) != Some(subagent_id)
+            || thread.get("parentThreadId").and_then(Value::as_str) != Some(parent_thread_id)
+        {
+            return Err(Error::Invalid("Codex 返回的线程不属于当前父会话".into()));
+        }
+        Ok(Some(history_events(thread, subagent_id)))
+    }
+    .await;
+    let _ = rpc.child.start_kill();
+    let _ = tokio::time::timeout(Duration::from_secs(2), rpc.child.wait()).await;
+    result
 }
 
 struct ExecutionPolicy {
@@ -338,10 +410,10 @@ fn collaboration_mode(options: &TurnOptions) -> Value {
 async fn read_notifications(
     mut stdout: BufReader<tokio::process::ChildStdout>,
     events: mpsc::Sender<AdapterEvent>,
-    current_turn: Arc<Mutex<Option<String>>>,
     writer: mpsc::Sender<(Value, Option<oneshot::Sender<()>>)>,
     auto_approve: bool,
     root_thread_id: String,
+    state: NotificationState,
 ) {
     let mut streamed: HashMap<String, String> = HashMap::new();
     let mut subagents: HashMap<String, bool> = HashMap::new();
@@ -377,6 +449,25 @@ async fn read_notifications(
         let Ok(message) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+        if message.get("method").is_none() {
+            if let Some(id) = rpc_id_key(message.get("id"))
+                && let Some(tx) = state.responses.lock().await.remove(&id)
+            {
+                let result = if let Some(error) = message.get("error") {
+                    Err(error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("codex RPC failed")
+                        .chars()
+                        .take(1000)
+                        .collect::<String>())
+                } else {
+                    Ok(message.get("result").cloned().unwrap_or_else(|| json!({})))
+                };
+                let _ = tx.send(result);
+            }
+            continue;
+        }
         if let Some(error) = message.get("error") {
             let text = error
                 .get("message")
@@ -481,15 +572,23 @@ async fn read_notifications(
                     .or_else(|| params.get("turnId"))
                     .and_then(Value::as_str)
                     .map(str::to_owned);
-                *current_turn.lock().await = turn_id;
-                last_text = None;
-                streamed.clear();
+                if notification_thread == root_thread_id {
+                    *state.current_turn.lock().await = turn_id;
+                    last_text = None;
+                    streamed.clear();
+                } else if let Some(turn_id) = turn_id {
+                    state
+                        .current_turns
+                        .lock()
+                        .await
+                        .insert(notification_thread.to_owned(), turn_id);
+                }
             }
             "item/agentMessage/delta" | "item/plan/delta" => {
                 if let Some(delta) = params.get("delta").and_then(Value::as_str)
                     && !delta.is_empty()
                 {
-                    let msg_id = codex_item_id(&params, &current_turn).await;
+                    let msg_id = codex_item_id(&params, &state.current_turn).await;
                     last_text = Some(msg_id.clone());
                     let full = streamed.entry(msg_id.clone()).or_default();
                     full.push_str(delta);
@@ -517,7 +616,7 @@ async fn read_notifications(
                 let item = params.get("item").cloned().unwrap_or_else(|| json!({}));
                 let item_type = item_type(&item);
                 let item_id = codex_item_id_from_item(&params, &item).unwrap_or_else(|| {
-                    futures_current_turn(&current_turn).unwrap_or_else(|| "codex-tool".into())
+                    futures_current_turn(&state.current_turn).unwrap_or_else(|| "codex-tool".into())
                 });
                 if item_type == "collabAgentToolCall" {
                     // The item names the child thread before thread/started
@@ -612,7 +711,8 @@ async fn read_notifications(
                     tool_result_summary(&item_type, &item)
                 {
                     let item_id = codex_item_id_from_item(&params, &item).unwrap_or_else(|| {
-                        futures_current_turn(&current_turn).unwrap_or_else(|| "codex-tool".into())
+                        futures_current_turn(&state.current_turn)
+                            .unwrap_or_else(|| "codex-tool".into())
                     });
                     let changes = codex_file_changes(&item);
                     let diff = changes
@@ -647,6 +747,10 @@ async fn read_notifications(
                 last_output_tokens = last.get("outputTokens").and_then(Value::as_i64);
             }
             "turn/completed" => {
+                if notification_thread != root_thread_id {
+                    state.current_turns.lock().await.remove(notification_thread);
+                    continue;
+                }
                 let turn = params.get("turn").cloned().unwrap_or_else(|| json!({}));
                 let status = turn
                     .get("status")
@@ -685,6 +789,14 @@ async fn read_notifications(
                 diffs: Vec::new(),
             })
             .await;
+    }
+}
+
+fn rpc_id_key(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(text) if !text.is_empty() => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        _ => None,
     }
 }
 
@@ -1283,6 +1395,395 @@ fn futures_current_turn(current_turn: &Arc<Mutex<Option<String>>>) -> Option<Str
     current_turn.try_lock().ok().and_then(|guard| guard.clone())
 }
 
+fn history_events(thread: &serde_json::Map<String, Value>, subagent_id: &str) -> Vec<Value> {
+    let mut events = Vec::new();
+    let turns = thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for turn_value in turns {
+        let Some(turn) = turn_value.as_object() else {
+            continue;
+        };
+        let turn_id = turn
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("turn-{}", events.len()));
+        let mut last_message_id = turn_id.clone();
+        let mut final_message_id = None;
+        let mut diffs: HashMap<String, crate::protocol::FileDiff> = HashMap::new();
+        let items = turn
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for item_value in items {
+            let Some(item) = item_value.as_object() else {
+                continue;
+            };
+            let item_id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{}-{}", turn_id, events.len()));
+            events.extend(history_item_events(item, &item_id, &turn_id, subagent_id));
+            let typ = item.get("type").and_then(Value::as_str).unwrap_or_default();
+            if typ == "agentMessage" || typ == "plan" {
+                last_message_id = item_id.clone();
+                if item.get("phase").and_then(Value::as_str) == Some("final_answer")
+                    || typ == "plan"
+                {
+                    final_message_id = Some(item_id.clone());
+                }
+            }
+            if typ == "fileChange"
+                && item.get("status").and_then(Value::as_str) == Some("completed")
+            {
+                for diff in codex_file_changes(&Value::Object(item.clone())) {
+                    diffs.insert(diff.path.clone(), diff);
+                }
+            }
+        }
+        let status = turn
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("completed");
+        if status == "failed" && turn.get("error").is_some_and(|error| !error.is_null()) {
+            events.push(json!({
+                "kind": "agent.error",
+                "message": summarize(turn.get("error")),
+                "agentId": subagent_id,
+            }));
+        }
+        if status != "inProgress" {
+            let mut end = serde_json::Map::new();
+            end.insert("kind".into(), json!("turn.end"));
+            end.insert(
+                "msgId".into(),
+                json!(final_message_id.unwrap_or(last_message_id)),
+            );
+            end.insert("turnId".into(), json!(turn_id));
+            end.insert("finish".into(), json!(status));
+            end.insert("agentId".into(), json!(subagent_id));
+            if !diffs.is_empty() {
+                end.insert(
+                    "diffs".into(),
+                    serde_json::to_value(diffs.into_values().collect::<Vec<_>>())
+                        .unwrap_or_else(|_| json!([])),
+                );
+            }
+            events.push(Value::Object(end));
+        }
+    }
+    events
+}
+
+fn history_item_events(
+    item: &serde_json::Map<String, Value>,
+    item_id: &str,
+    turn_id: &str,
+    subagent_id: &str,
+) -> Vec<Value> {
+    let typ = item.get("type").and_then(Value::as_str).unwrap_or_default();
+    match typ {
+        "userMessage" => {
+            let text = history_user_content(item.get("content"));
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![
+                    json!({ "kind": "user.message", "msgId": item_id, "text": text, "agentId": subagent_id }),
+                ]
+            }
+        }
+        "agentMessage" | "plan" => item
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(|text| {
+                let mut event = serde_json::Map::new();
+                event.insert("kind".into(), json!("assistant.text"));
+                event.insert("msgId".into(), json!(item_id));
+                event.insert("text".into(), json!(text));
+                event.insert("agentId".into(), json!(subagent_id));
+                if let Some(phase) = item.get("phase").and_then(Value::as_str) {
+                    if phase == "commentary" || phase == "final_answer" {
+                        event.insert("phase".into(), json!(phase));
+                    }
+                } else if typ == "plan" {
+                    event.insert("phase".into(), json!("final_answer"));
+                }
+                vec![Value::Object(event)]
+            })
+            .unwrap_or_default(),
+        "reasoning" => {
+            let text = [item.get("summary"), item.get("content")]
+                .into_iter()
+                .flatten()
+                .flat_map(|value| value.as_array().into_iter().flatten())
+                .filter_map(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if text.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![
+                    json!({ "kind": "reasoning", "msgId": item_id, "text": text, "agentId": subagent_id }),
+                ]
+            }
+        }
+        "commandExecution" => history_tool_events(HistoryTool {
+            item,
+            item_id,
+            turn_id,
+            subagent_id,
+            tool: "bash".into(),
+            input: summarize(item.get("command")),
+            output: summarize(
+                item.get("aggregatedOutput")
+                    .or_else(|| item.get("exitCode"))
+                    .or_else(|| item.get("status")),
+            ),
+            diff: None,
+        }),
+        "fileChange" => {
+            let changes = item
+                .get("changes")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let paths = changes
+                .iter()
+                .filter_map(|change| change.get("path").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let diff = codex_file_changes(&Value::Object(item.clone()))
+                .into_iter()
+                .next();
+            history_tool_events(HistoryTool {
+                item,
+                item_id,
+                turn_id,
+                subagent_id,
+                tool: "edit".into(),
+                input: if paths.is_empty() {
+                    summarize(item.get("changes"))
+                } else {
+                    paths
+                },
+                output: summarize(item.get("status")),
+                diff,
+            })
+        }
+        "mcpToolCall" => {
+            let server = item.get("server").and_then(Value::as_str).unwrap_or("mcp");
+            let tool = item.get("tool").and_then(Value::as_str).unwrap_or("tool");
+            history_tool_events(HistoryTool {
+                item,
+                item_id,
+                turn_id,
+                subagent_id,
+                tool: format!("{server}.{tool}"),
+                input: summarize(item.get("arguments")),
+                output: summarize(
+                    item.get("error")
+                        .or_else(|| item.get("result"))
+                        .or_else(|| item.get("status")),
+                ),
+                diff: None,
+            })
+        }
+        "dynamicToolCall" => {
+            let namespace = item
+                .get("namespace")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(|value| format!("{value}."))
+                .unwrap_or_default();
+            let tool = item.get("tool").and_then(Value::as_str).unwrap_or("tool");
+            history_tool_events(HistoryTool {
+                item,
+                item_id,
+                turn_id,
+                subagent_id,
+                tool: format!("{namespace}{tool}"),
+                input: summarize(item.get("arguments")),
+                output: summarize(
+                    item.get("contentItems")
+                        .or_else(|| item.get("success"))
+                        .or_else(|| item.get("status")),
+                ),
+                diff: None,
+            })
+        }
+        "collabAgentToolCall" => history_tool_events(HistoryTool {
+            item,
+            item_id,
+            turn_id,
+            subagent_id,
+            tool: format!(
+                "agent.{}",
+                item.get("tool")
+                    .and_then(Value::as_str)
+                    .unwrap_or("collaborate")
+            ),
+            input: summarize(item.get("prompt").or_else(|| item.get("receiverThreadIds"))),
+            output: summarize(item.get("agentsStates").or_else(|| item.get("status"))),
+            diff: None,
+        }),
+        "webSearch" => history_tool_events(HistoryTool {
+            item,
+            item_id,
+            turn_id,
+            subagent_id,
+            tool: "web.search".into(),
+            input: summarize(item.get("query").or_else(|| item.get("action"))),
+            output: {
+                let action = summarize(item.get("action"));
+                if action.trim().is_empty() {
+                    "completed".into()
+                } else {
+                    action
+                }
+            },
+            diff: None,
+        }),
+        "subAgentActivity" | "imageView" | "imageGeneration" => history_tool_events(HistoryTool {
+            item,
+            item_id,
+            turn_id,
+            subagent_id,
+            tool: if typ == "subAgentActivity" {
+                "agent.activity".into()
+            } else {
+                typ.into()
+            },
+            input: item
+                .get("agentThreadId")
+                .or_else(|| item.get("path"))
+                .map(|value| summarize(Some(value)))
+                .unwrap_or_else(|| serde_json::to_string(item).unwrap_or_default()),
+            output: {
+                let kind = summarize(item.get("kind"));
+                if kind.trim().is_empty() {
+                    "completed".into()
+                } else {
+                    kind
+                }
+            },
+            diff: None,
+        }),
+        _ => Vec::new(),
+    }
+}
+
+struct HistoryTool<'a> {
+    item: &'a serde_json::Map<String, Value>,
+    item_id: &'a str,
+    turn_id: &'a str,
+    subagent_id: &'a str,
+    tool: String,
+    input: String,
+    output: String,
+    diff: Option<crate::protocol::FileDiff>,
+}
+
+fn history_tool_events(input: HistoryTool<'_>) -> Vec<Value> {
+    let summary = input.input;
+    let mut start = serde_json::Map::new();
+    start.insert("kind".into(), json!("tool.start"));
+    start.insert("msgId".into(), json!(input.turn_id));
+    start.insert("callId".into(), json!(input.item_id));
+    start.insert("tool".into(), json!(input.tool));
+    start.insert(
+        "summary".into(),
+        json!(if summary.is_empty() {
+            input.tool.clone()
+        } else {
+            summary
+        }),
+    );
+    start.insert("agentId".into(), json!(input.subagent_id));
+    if let Some(diff) = input.diff.clone() {
+        start.insert(
+            "diff".into(),
+            serde_json::to_value(diff).unwrap_or_else(|_| json!({})),
+        );
+    }
+    let mut events = vec![Value::Object(start)];
+    let status = input
+        .item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
+    if status == "inProgress" || status == "running" {
+        return events;
+    }
+    let failed = matches!(status, "failed" | "declined" | "error");
+    let mut end = serde_json::Map::new();
+    end.insert("kind".into(), json!("tool.end"));
+    end.insert("callId".into(), json!(input.item_id));
+    end.insert(
+        "state".into(),
+        json!(if failed { "failed" } else { "success" }),
+    );
+    let output = input.output;
+    end.insert(
+        "summary".into(),
+        json!(if output.is_empty() {
+            status.into()
+        } else {
+            output
+        }),
+    );
+    end.insert("agentId".into(), json!(input.subagent_id));
+    if let Some(diff) = input.diff {
+        end.insert(
+            "diff".into(),
+            serde_json::to_value(diff).unwrap_or_else(|_| json!({})),
+        );
+    }
+    events.push(Value::Object(end));
+    events
+}
+
+fn history_user_content(value: Option<&Value>) -> String {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|input| {
+                    let typ = input.get("type").and_then(Value::as_str)?;
+                    match typ {
+                        "text" => input.get("text").and_then(Value::as_str).map(str::to_owned),
+                        "skill" => input
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(|name| format!("${name}")),
+                        "mention" => input
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(|name| format!("@{name}")),
+                        "image" | "localImage" => input
+                            .get("url")
+                            .or_else(|| input.get("path"))
+                            .and_then(Value::as_str)
+                            .map(|path| format!("[图片] {path}")),
+                        _ => None,
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+        .trim()
+        .to_owned()
+}
+
 impl CodexTurn {
     pub(super) fn take_events(&mut self) -> Option<mpsc::Receiver<AdapterEvent>> {
         self.events.take()
@@ -1304,12 +1805,26 @@ impl CodexTurn {
     }
 
     pub(super) async fn send_to_subagent(&self, subagent_id: &str, text: &str) -> Result<()> {
+        let input = json!([{ "type": "text", "text": text, "text_elements": [] }]);
+        if let Some(turn_id) = self.current_turns.lock().await.get(subagent_id).cloned() {
+            let steer = self
+                .send_request_value(
+                    "turn/steer",
+                    json!({
+                        "threadId": subagent_id,
+                        "expectedTurnId": turn_id,
+                        "input": input.clone(),
+                    }),
+                )
+                .await;
+            if steer.is_ok() {
+                return Ok(());
+            }
+            self.current_turns.lock().await.remove(subagent_id);
+        }
         let mut params = serde_json::Map::new();
         params.insert("threadId".into(), json!(subagent_id));
-        params.insert(
-            "input".into(),
-            json!([{ "type": "text", "text": text, "text_elements": [] }]),
-        );
+        params.insert("input".into(), input);
         params.insert("approvalPolicy".into(), self.approval_policy.clone());
         params.insert("sandboxPolicy".into(), self.sandbox_policy.clone());
         if let Some(model) = self.model.as_ref() {
@@ -1330,6 +1845,27 @@ impl CodexTurn {
             params.insert("effort".into(), json!(effort));
         }
         self.send_request("turn/start", Value::Object(params)).await
+    }
+
+    pub(super) async fn read_subagent_history(
+        &self,
+        subagent_id: &str,
+    ) -> Result<Option<Vec<Value>>> {
+        let raw = self
+            .send_request_value(
+                "thread/read",
+                json!({ "threadId": subagent_id, "includeTurns": true }),
+            )
+            .await?;
+        let Some(thread) = raw.get("thread").and_then(Value::as_object) else {
+            return Ok(None);
+        };
+        if thread.get("id").and_then(Value::as_str) != Some(subagent_id)
+            || thread.get("parentThreadId").and_then(Value::as_str) != Some(self.thread_id.as_str())
+        {
+            return Err(Error::Invalid("Codex 返回的线程不属于当前父会话".into()));
+        }
+        Ok(Some(history_events(thread, subagent_id)))
     }
 
     pub(super) async fn compact(&self) -> Result<()> {
@@ -1376,6 +1912,49 @@ impl CodexTurn {
             .await
             .map_err(|_| Error::Timeout)?
             .map_err(|_| Error::Closed)
+    }
+
+    async fn send_request_value(&self, method: &str, params: Value) -> Result<Value> {
+        let id = uuid::Uuid::new_v4().as_u128().to_string();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.responses.lock().await.insert(id.clone(), reply_tx);
+        let (ack, ack_rx) = oneshot::channel();
+        let send_result = self
+            .stdin
+            .send((
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": method,
+                    "params": params,
+                }),
+                Some(ack),
+            ))
+            .await;
+        if send_result.is_err() {
+            self.responses.lock().await.remove(&id);
+            return Err(Error::Closed);
+        }
+        match tokio::time::timeout(CONTROL_TIMEOUT, ack_rx).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                self.responses.lock().await.remove(&id);
+                return Err(Error::Closed);
+            }
+            Err(_) => {
+                self.responses.lock().await.remove(&id);
+                return Err(Error::Timeout);
+            }
+        }
+        let result = match tokio::time::timeout(CONTROL_TIMEOUT, reply_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => return Err(Error::Closed),
+            Err(_) => {
+                self.responses.lock().await.remove(&id);
+                return Err(Error::Timeout);
+            }
+        };
+        result.map_err(Error::Invalid)
     }
 
     pub(super) fn kill(&self) {
