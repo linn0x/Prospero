@@ -79,6 +79,7 @@ async fn every_endpoint_requires_auth_and_rejects_browser_origins() {
         "/v1/sessions/example/fs/get?path=file.txt&offset=0&length=1",
         "/v1/sessions/example/git/status",
         "/v1/sessions/example/git/diff?path=file.txt&staged=false",
+        "/v1/sessions/example/git/history",
         "/v1/events?scope=sessions",
         "/unknown",
     ] {
@@ -231,6 +232,82 @@ async fn project_fs_routes_are_session_scoped_and_bounded() {
     assert_eq!(
         std::fs::read_to_string(workspace.path().join("new.txt")).unwrap(),
         "rust"
+    );
+
+    let response = api
+        .router()
+        .oneshot(
+            request(&format!("/v1/sessions/{id}/fs/write"))
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"path":"created.txt","contentB64":"","createNew":true}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        std::fs::read(workspace.path().join("created.txt")).unwrap(),
+        b""
+    );
+    let response = api
+        .router()
+        .oneshot(
+            request(&format!("/v1/sessions/{id}/fs/write"))
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"path":"created.txt","contentB64":"b29wcw==","createNew":true})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        std::fs::read(workspace.path().join("created.txt")).unwrap(),
+        b""
+    );
+
+    let empty_sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    let response = api
+        .router()
+        .oneshot(
+            request(&format!("/v1/sessions/{id}/fs/write"))
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"path":"created.txt","contentB64":"5L2g5aW9DQrkuJbnlYwK","expectedVersion":empty_sha}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("created.txt")).unwrap(),
+        "你好\r\n世界\n"
+    );
+    let response = api
+        .router()
+        .oneshot(
+            request(&format!("/v1/sessions/{id}/fs/write"))
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"path":"created.txt","contentB64":"c3RhbGU=","expectedVersion":empty_sha}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("created.txt")).unwrap(),
+        "你好\r\n世界\n"
     );
 
     let response = api
@@ -400,6 +477,21 @@ async fn project_git_routes_report_diff_and_mutate_index() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(body(response).await["op"], "stage");
+
+    let response = api
+        .router()
+        .oneshot(
+            request(&format!("/v1/sessions/{id}/git/history"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let history = body(response).await;
+    assert_eq!(history["type"], "git.history.result");
+    assert_eq!(history["entries"][0]["subject"], "initial");
+    assert_eq!(history["entries"][0]["author"], "test");
 
     let response = api
         .router()

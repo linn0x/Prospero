@@ -3,7 +3,21 @@ import { lstat, mkdir, open, readdir, realpath, rename } from "node:fs/promises"
 import path from "node:path";
 import { listDir, readForEdit, resolveWithin, MAX_EDIT_BYTES } from "../../../daemon/src/fs-ops";
 import { git, status } from "../../../daemon/src/git-ops";
-import type { FileMutation, FilePreview, GitMutation, SearchResult } from "../shared/project-tools";
+import type { FileMutation, FilePreview, GitHistoryEntry, GitMutation, ProjectFile, ProjectGitStatus, SearchResult } from "../shared/project-tools";
+
+export type RustProjectBackend = {
+  sessionIdForRoot(root: string): string | undefined;
+  listProjectFiles(sessionId: string, path: string): Promise<ProjectFile[]>;
+  readProjectFile(sessionId: string, path: string): Promise<FilePreview>;
+  writeProjectFile(sessionId: string, input: { path: string; content: string; version?: string; createNew?: boolean }): Promise<void>;
+  makeProjectDirectory(sessionId: string, path: string): Promise<void>;
+  renameProjectEntry(sessionId: string, path: string, to: string): Promise<void>;
+  getProjectGitStatus(sessionId: string): Promise<ProjectGitStatus>;
+  getProjectDiff(sessionId: string, path: string, staged: boolean): Promise<string>;
+  getProjectGitHistory(sessionId: string): Promise<GitHistoryEntry[]>;
+  mutateProjectGit(sessionId: string, input: GitMutation): Promise<void>;
+};
+
 
 const ignored = new Set([".git", "node_modules", ".runtime", "dist", "out", "build", "target", ".next", ".venv", "venv", "__pycache__"]);
 const imageTypes: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".ico": "image/x-icon", ".bmp": "image/bmp", ".svg": "image/svg+xml" };
@@ -24,7 +38,7 @@ const equalPath = (a: string, b: string): boolean => process.platform === "win32
 export class ProjectTools {
   private searchController?: AbortController;
   private mutations = new Map<string, Promise<unknown>>();
-  constructor(private roots: () => string[], private trash: (absolutePath: string) => Promise<void>) {}
+  constructor(private roots: () => string[], private trash: (absolutePath: string) => Promise<void>, private rust?: RustProjectBackend) {}
   async root(raw: unknown): Promise<string> {
     const requested = path.resolve(string(raw));
     if (!this.roots().some(root => equalPath(path.resolve(root), requested))) throw new Error("请先添加此项目 / Add this project first");
@@ -32,9 +46,15 @@ export class ProjectTools {
     if (!(await lstat(resolved)).isDirectory()) throw new Error("项目目录不可用 / Project directory unavailable");
     return resolved;
   }
-  async list(raw: unknown, rel: unknown) { return (await listDir(await this.root(raw), relative(rel, true))).filter(entry => entry.name.toLowerCase() !== ".git"); }
+  private rustSession(root: string): string | undefined { return this.rust?.sessionIdForRoot(root); }
+  async list(raw: unknown, rel: unknown) {
+    const root = await this.root(raw), file = relative(rel, true), sid = this.rustSession(root);
+    if (sid) return (await this.rust!.listProjectFiles(sid, file)).filter(entry => entry.name.toLowerCase() !== ".git");
+    return (await listDir(root, file)).filter(entry => entry.name.toLowerCase() !== ".git");
+  }
   async read(raw: unknown, rel: unknown): Promise<FilePreview> {
-    const root = await this.root(raw), file = relative(rel);
+    const root = await this.root(raw), file = relative(rel), sid = this.rustSession(root);
+    if (sid) return this.rust!.readProjectFile(sid, file);
     const result = await readForEdit(root, file);
     const mime = imageTypes[path.extname(file).toLowerCase()];
     return { path: file, size: result.size, version: digest(result.content), truncated: result.truncated, kind: mime && !result.truncated ? "image" : result.binary ? "binary" : "text", content: mime && !result.truncated ? `data:${mime};base64,${result.content.toString("base64")}` : result.binary ? "" : result.content.toString("utf8") };
@@ -49,31 +69,38 @@ export class ProjectTools {
     const root = await this.root(raw);
     await this.exclusive(root, async () => {
       if (!input || typeof input !== "object") throw new Error("Invalid file operation");
-      const rel = relative(input.path), target = await resolveWithin(root, rel);
+      const rel = relative(input.path), target = await resolveWithin(root, rel), sid = this.rustSession(root);
       if (equalPath(target, root)) throw new Error("Cannot modify project root");
       // Mutations must never follow a symlink to a different file.
       if (!equalPath(path.resolve(root, rel), target) || (await lstat(target).catch(() => null))?.isSymbolicLink()) throw new Error("不能修改符号链接 / Cannot modify symbolic links");
-      if (input.kind === "create-directory") await mkdir(target);
-      else if (input.kind === "create-file") { const handle = await open(target, "wx"); await handle.close(); }
+      if (input.kind === "create-directory") {
+        if (sid) await this.rust!.makeProjectDirectory(sid, rel); else await mkdir(target);
+      } else if (input.kind === "create-file") {
+        if (sid) await this.rust!.writeProjectFile(sid, { path: rel, content: "", createNew: true });
+        else { const handle = await open(target, "wx"); await handle.close(); }
+      }
       else if (input.kind === "trash") await this.trash(target);
       else if (input.kind === "rename") {
         const destinationPath = relative(input.destination);
         const destination = await resolveWithin(root, destinationPath);
         if (!equalPath(path.resolve(root, destinationPath), destination)) throw new Error("不能移入符号链接目录 / Cannot move into a symbolic link");
         if (await lstat(destination).catch(() => null)) throw new Error("目标已存在 / Destination already exists");
-        await rename(target, destination);
+        if (sid) await this.rust!.renameProjectEntry(sid, rel, destinationPath); else await rename(target, destination);
       } else if (input.kind === "save") {
         const content = Buffer.from(string(input.content, MAX_EDIT_BYTES), "utf8");
         if (content.length > MAX_EDIT_BYTES) throw new Error("文件超过 1 MB / File exceeds 1 MB");
-        const handle = await open(target, "r+");
-        try {
-          if ((await handle.stat()).size > MAX_EDIT_BYTES) throw new Error("文件超过 1 MB / File exceeds 1 MB");
-          const current = await handle.readFile();
-          if (digest(current) !== string(input.version, 64)) throw new Error("文件已被外部修改，请重新打开后再编辑 / File changed on disk. Reopen it before editing.");
-          let offset = 0;
-          while (offset < content.length) { const { bytesWritten } = await handle.write(content, offset, content.length - offset, offset); if (!bytesWritten) throw new Error("Unable to save file"); offset += bytesWritten; }
-          await handle.truncate(content.length);
-        } finally { await handle.close(); }
+        if (sid) await this.rust!.writeProjectFile(sid, { path: rel, content: input.content, version: string(input.version, 64) });
+        else {
+          const handle = await open(target, "r+");
+          try {
+            if ((await handle.stat()).size > MAX_EDIT_BYTES) throw new Error("文件超过 1 MB / File exceeds 1 MB");
+            const current = await handle.readFile();
+            if (digest(current) !== string(input.version, 64)) throw new Error("文件已被外部修改，请重新打开后再编辑 / File changed on disk. Reopen it before editing.");
+            let offset = 0;
+            while (offset < content.length) { const { bytesWritten } = await handle.write(content, offset, content.length - offset, offset); if (!bytesWritten) throw new Error("Unable to save file"); offset += bytesWritten; }
+            await handle.truncate(content.length);
+          } finally { await handle.close(); }
+        }
       } else throw new Error("Invalid file operation");
     });
   }
@@ -139,15 +166,20 @@ export class ProjectTools {
     }
     return result;
   }
-  private async gitRoot(raw: unknown): Promise<string> {
+  private async gitRoot(raw: unknown): Promise<{ root: string; sid?: string }> {
     const root = await this.root(raw);
     const repository = await git(root, ["rev-parse", "--show-toplevel"]).catch(() => "");
     if (repository && !equalPath(await realpath(repository.trim()), root)) throw new Error(`请打开 Git 仓库根目录 / Open repository root: ${repository.trim()}`);
-    return root;
+    const sid = this.rustSession(root);
+    return sid ? { root, sid } : { root };
   }
-  async gitStatus(raw: unknown) { return status(await this.gitRoot(raw)); }
+  async gitStatus(raw: unknown) {
+    const { root, sid } = await this.gitRoot(raw);
+    return sid ? this.rust!.getProjectGitStatus(sid) : status(root);
+  }
   async history(raw: unknown) {
-    const root = await this.gitRoot(raw);
+    const { root, sid } = await this.gitRoot(raw);
+    if (sid) return this.rust!.getProjectGitHistory(sid);
     if (!(await git(root, ["rev-parse", "--verify", "HEAD"]).catch(() => ""))) return [];
     const output = await git(root, ["log", "-30", "--format=%h%x00%s%x00%an%x00%aI%x00"]);
     const fields = output.split("\0"), entries = [];
@@ -155,8 +187,9 @@ export class ProjectTools {
     return entries;
   }
   async diff(raw: unknown, input: unknown, staged: unknown): Promise<string> {
-    const root = await this.gitRoot(raw), file = relative(input);
+    const { root, sid } = await this.gitRoot(raw), file = relative(input);
     if (typeof staged !== "boolean") throw new Error("Invalid diff mode");
+    if (sid) return this.rust!.getProjectDiff(sid, file, staged);
     const current = await status(root);
     const entry = current.files.find(entry => entry.path === file);
     if (!entry) return "";
@@ -168,20 +201,21 @@ export class ProjectTools {
     return git(root, ["diff", "--no-color", "--no-ext-diff", "--no-textconv", ...(staged ? ["--cached"] : []), "--", file, ...(entry.originalPath ? [entry.originalPath] : [])]);
   }
   async mutateGit(raw: unknown, input: GitMutation): Promise<void> {
-    const root = await this.gitRoot(raw);
+    const { root, sid } = await this.gitRoot(raw);
     await this.exclusive(root, async () => {
       if (!input || typeof input !== "object") throw new Error("Invalid Git operation");
       if (input.kind === "commit") {
         const message = string(input.message, 4000).trim();
         if (!message) throw new Error("请输入提交说明 / Enter a commit message");
-        await git(root, ["commit", "-m", message]);
+        if (sid) await this.rust!.mutateProjectGit(sid, { kind: "commit", message }); else await git(root, ["commit", "-m", message]);
       } else if (input.kind === "stage" || input.kind === "unstage") {
         if (!Array.isArray(input.paths) || !input.paths.length || input.paths.length > 500) throw new Error("Invalid Git paths");
         const paths = input.paths.map(file => relative(file));
-        const current = await status(root);
+        const current = sid ? await this.rust!.getProjectGitStatus(sid) : await status(root);
         const allowed = new Set(current.files.flatMap(file => [file.path, ...(file.originalPath ? [file.originalPath] : [])]));
         if (paths.some(file => !allowed.has(file))) throw new Error("文件状态已更新，请刷新 / File status changed. Refresh first.");
-        if (input.kind === "stage") await git(root, ["add", "--", ...paths]);
+        if (sid) await this.rust!.mutateProjectGit(sid, { kind: input.kind, paths });
+        else if (input.kind === "stage") await git(root, ["add", "--", ...paths]);
         else {
           const head = await git(root, ["rev-parse", "--verify", "HEAD"]).catch(() => "");
           await git(root, head ? ["restore", "--staged", "--", ...paths] : ["rm", "--cached", "--", ...paths]);

@@ -772,7 +772,7 @@ function installIpc(): void {
   const projectTools = new ProjectTools(() => {
     const snapshot = store.snapshot();
     return [...snapshot.projects, ...snapshot.daemon.sessions.map(session => session.cwd)];
-  }, absolutePath => shell.trashItem(absolutePath));
+  }, absolutePath => shell.trashItem(absolutePath), runtime instanceof RustRuntime ? runtime : undefined);
   const projectHandlers = {
     "project-tools:list": projectTools.list.bind(projectTools),
     "project-tools:read": projectTools.read.bind(projectTools),

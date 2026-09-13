@@ -4,7 +4,7 @@ import type { TimelinePage, TimelineQuery, TimelineLookupResult, TimelineTextQue
 import type { CreateTerminal, TerminalPage, TerminalQuery, TerminalSize, TerminalSnapshot } from "@prospero/protocol/rust-daemon";
 import type { AgentSend, AgentControlResult, AgentModeCatalog, AgentModelCatalog, AgentModelSelectionResult, AgentControlsProjection, CreateAgentSession, PermissionDecision, QuestionDecision, SubagentSnapshot, AgentQueue, AgentQueues } from "@prospero/protocol/rust-daemon";
 import type { AccountListResult, LaunchModelCatalog, SourceResult, UsageResult } from "@prospero/protocol/rust-daemon";
-import type { FsChunk, FsContent, FsDone, FsListing, FsWritten, GitDiffResult, GitDone, GitStatusResult, WorkspaceSummaryResult } from "@prospero/protocol/rust-daemon";
+import type { FsChunk, FsContent, FsDone, FsListing, FsWritten, GitDiffResult, GitDone, GitHistoryResult, GitStatusResult, WorkspaceSummaryResult } from "@prospero/protocol/rust-daemon";
 import type {
   AbandonRun, ApplyTaskGraph, CancelTask, CleanupWorktree, CompleteRun, CreateGate,
   CreateRun, CreateRunGraph, CreateTask, Dispatch, Gate, GraphMutationResult, ResolveGate,
@@ -188,7 +188,7 @@ export class RustClient {
   fsRead(value: string, path: string, signal: AbortSignal | null = null): Promise<FsContent> {
     return this.json(`/v1/sessions/${id(value)}/fs/read?path=${encodeURIComponent(path)}`, { signal });
   }
-  fsWrite(value: string, input: { path: string; contentB64: string }, signal: AbortSignal | null = null): Promise<FsWritten> {
+  fsWrite(value: string, input: { path: string; contentB64: string; createNew?: boolean; expectedVersion?: string }, signal: AbortSignal | null = null): Promise<FsWritten> {
     return this.json(`/v1/sessions/${id(value)}/fs/write`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
   }
   fsGet(value: string, path: string, offset: number, length: number, signal: AbortSignal | null = null): Promise<FsChunk> {
@@ -213,6 +213,9 @@ export class RustClient {
   gitDiff(value: string, path: string, staged: boolean, signal: AbortSignal | null = null): Promise<GitDiffResult> {
     const params = new URLSearchParams({ path, staged: String(staged) });
     return this.json(`/v1/sessions/${id(value)}/git/diff?${params}`, { signal });
+  }
+  gitHistory(value: string, signal: AbortSignal | null = null): Promise<GitHistoryResult> {
+    return this.json(`/v1/sessions/${id(value)}/git/history`, { signal });
   }
   gitStage(value: string, paths: string[], unstage: boolean, signal: AbortSignal | null = null): Promise<GitDone> {
     return this.json(`/v1/sessions/${id(value)}/git/stage`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ paths, unstage }) });
