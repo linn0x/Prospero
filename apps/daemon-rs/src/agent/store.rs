@@ -235,7 +235,7 @@ impl Store {
             let mode: String = row.get(1)?;
             Ok(crate::agent::SessionAgentControls {
                 session_id: row.get(0)?,
-                compact: false,
+                compact: true,
                 model: true,
                 mode: true,
                 current_model: row.get(2)?,

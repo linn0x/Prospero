@@ -498,6 +498,8 @@ pub fn typescript() -> String {
         crate::agent::LaunchModelCatalog::decl(&config),
         crate::agent::AgentModelSelection::decl(&config),
         crate::agent::AgentModelSelectionResult::decl(&config),
+        crate::agent::AgentControlResult::decl(&config),
+        crate::agent::AgentCompactRequest::decl(&config),
         crate::agent::AgentModelCatalog::decl(&config),
         crate::agent::SessionAgentControls::decl(&config),
         crate::agent::AgentControlsProjection::decl(&config),
