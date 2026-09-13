@@ -133,6 +133,45 @@ export function canDeliverTerminalInteraction(
   return !readOnly && (connected || accepted);
 }
 
+function isTerminalMouseSequence(value: string, index: number): number {
+  if (value.startsWith("\x1b[<", index)) {
+    let cursor = index + 3;
+    let separators = 0;
+    while (cursor < value.length) {
+      const char = value[cursor]!;
+      if (char >= "0" && char <= "9") {
+        cursor += 1;
+        continue;
+      }
+      if (char === ";") {
+        separators += 1;
+        cursor += 1;
+        continue;
+      }
+      if ((char === "M" || char === "m") && separators === 2) return cursor + 1;
+      return -1;
+    }
+    return -1;
+  }
+  if (value.startsWith("\x1b[M", index) && index + 6 <= value.length) return index + 6;
+  return -1;
+}
+
+function isOnlyTerminalMouseInput(value: string): boolean {
+  if (!value) return false;
+  let index = 0;
+  while (index < value.length) {
+    const next = isTerminalMouseSequence(value, index);
+    if (next < 0) return false;
+    index = next;
+  }
+  return true;
+}
+
+export function terminalInputShouldScrollToBottom(value: string): boolean {
+  return !isOnlyTerminalMouseInput(value);
+}
+
 export function terminalBootstrapCursor(cachedCursor?: number): number {
   return typeof cachedCursor === "number" && Number.isSafeInteger(cachedCursor) && cachedCursor >= 0 ? cachedCursor : 0;
 }
@@ -244,7 +283,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
       macOptionClickForcesSelection: isMac,
       altClickMovesCursor: false,
       rightClickSelectsWord: true,
-      scrollOnUserInput: true,
+      scrollOnUserInput: false,
       theme: {
         background: "#1a1b26", foreground: "#c0caf5", cursor: "#c0caf5",
         cursorAccent: "#1a1b26", selectionBackground: "#283457",
@@ -321,6 +360,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
     };
     const inputDisposable = terminal.onData((value) => {
       if (replayingRef.current || !connectedRef.current) return;
+      if (terminalInputShouldScrollToBottom(value)) terminal.scrollToBottom();
       input += value;
       window.clearTimeout(inputTimer);
       inputTimer = window.setTimeout(() => { void flushInput(); }, 4);
