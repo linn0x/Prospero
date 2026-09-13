@@ -41,6 +41,16 @@ pub struct ValidationChecks {
     pub tools: Check,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct EngineValidationChecks {
+    pub runtime: Check,
+    pub configuration: Check,
+    pub streaming: Check,
+    pub tools: Check,
+}
+
 /// Legacy `AgentApiValidation` contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +61,26 @@ pub struct ApiValidation {
     pub checked_at: i64,
     pub engine: String,
     pub checks: ValidationChecks,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number")]
+    pub latency_ms: Option<i64>,
+}
+
+/// Legacy `AgentApiEngineValidation` contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct ApiEngineValidation {
+    pub status: String,
+    #[ts(type = "number")]
+    pub checked_at: i64,
+    pub engine: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_version: Option<String>,
+    pub checks: EngineValidationChecks,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
     pub detail: String,
@@ -75,6 +105,45 @@ pub(crate) fn revision(profile: &ApiProfile, secret: Option<&str>) -> String {
 
 fn binary() -> String {
     std::env::var("PROSPERO_CLAUDE_BIN").unwrap_or_else(|_| "claude".into())
+}
+
+async fn runtime_version() -> std::result::Result<Option<String>, ProbeFailure> {
+    let root =
+        tempfile::tempdir().map_err(|_| fail("runtime_unavailable", "无法创建隔离运行目录。"))?;
+    let config = root.path().join("config");
+    std::fs::create_dir_all(&config)
+        .map_err(|_| fail("runtime_unavailable", "无法创建隔离运行目录。"))?;
+    let mut command = tokio::process::Command::new(binary());
+    command
+        .arg("--version")
+        .current_dir(root.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command.env_clear();
+    for (key, value) in std::env::vars() {
+        if ["PATH", "TMPDIR", "TMP", "TEMP"].contains(&key.as_str()) {
+            command.env(key, value);
+        }
+    }
+    command
+        .env("HOME", root.path())
+        .env("CLAUDE_CONFIG_DIR", &config)
+        .env("CODEX_HOME", &config)
+        .env("CODEX_SQLITE_HOME", &config);
+    let output = tokio::time::timeout(Duration::from_secs(5), command.output())
+        .await
+        .map_err(|_| fail("runtime_unavailable", "Claude CLI 启动超时。"))?
+        .map_err(|_| fail("runtime_unavailable", "无法启动 Claude CLI。"))?;
+    if !output.status.success() {
+        return Err(fail("runtime_unavailable", "Claude CLI 不可用。"));
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let version = raw
+        .split_whitespace()
+        .find(|part| part.chars().any(|c| c.is_ascii_digit()))
+        .map(|value| value.chars().take(100).collect::<String>());
+    Ok(version)
 }
 
 /// Runs `<claude> --version` with a scrubbed environment and isolated HOME.
@@ -647,5 +716,84 @@ pub(crate) async fn probe(profile: &ApiProfile, secret: &str) -> ApiValidation {
         code: Some(failure.code.into()),
         detail: format!("{} {}", failure.message, SCOPE),
         latency_ms: Some(latency_ms),
+    }
+}
+
+/// Conservative Rust slice of the legacy isolated engine validation.
+///
+/// This currently covers Claude API profiles: it verifies the native CLI can
+/// start in a scrubbed directory, then reuses the side-effect-free protocol
+/// gateway probe to validate the profile's configured model, streaming SSE and
+/// synthetic tool round trip. It is persisted separately from the direct
+/// protocol probe so future native engine adapters can strengthen the
+/// configuration step without changing the wire contract.
+pub(crate) async fn probe_engine(profile: &ApiProfile, secret: &str) -> ApiEngineValidation {
+    let started = crate::database::now();
+    let mut checks = EngineValidationChecks {
+        runtime: Check::NotTested,
+        configuration: Check::NotTested,
+        streaming: Check::NotTested,
+        tools: Check::NotTested,
+    };
+    match runtime_version().await {
+        Ok(cli_version) => {
+            checks.runtime = Check::Passed;
+            if secret.trim().is_empty() {
+                checks.configuration = Check::Failed;
+                return ApiEngineValidation {
+                    status: "failed".into(),
+                    checked_at: crate::database::now(),
+                    engine: "claude".into(),
+                    cli_version,
+                    checks,
+                    code: Some("credential_missing".into()),
+                    detail: "API Profile 尚未配置 Key。".into(),
+                    latency_ms: Some(crate::database::now() - started),
+                };
+            }
+            let validation = probe(profile, secret).await;
+            checks.configuration = if validation.status == "passed" {
+                Check::Passed
+            } else {
+                Check::Failed
+            };
+            checks.streaming = validation.checks.streaming;
+            checks.tools = validation.checks.tools;
+            if validation.status == "passed" {
+                return ApiEngineValidation {
+                    status: "passed".into(),
+                    checked_at: crate::database::now(),
+                    engine: "claude".into(),
+                    cli_version,
+                    checks,
+                    code: None,
+                    detail: "Claude CLI 可在隔离环境启动；Profile 的受控 API 连接完成流式响应与合成工具往返。".into(),
+                    latency_ms: Some(crate::database::now() - started),
+                };
+            }
+            ApiEngineValidation {
+                status: "failed".into(),
+                checked_at: crate::database::now(),
+                engine: "claude".into(),
+                cli_version,
+                checks,
+                code: validation.code,
+                detail: format!("Agent 引擎验证未通过：{}", validation.detail),
+                latency_ms: Some(crate::database::now() - started),
+            }
+        }
+        Err(error) => {
+            checks.runtime = Check::Failed;
+            ApiEngineValidation {
+                status: "failed".into(),
+                checked_at: crate::database::now(),
+                engine: "claude".into(),
+                cli_version: None,
+                checks,
+                code: Some(error.code.into()),
+                detail: error.message.into(),
+                latency_ms: Some(crate::database::now() - started),
+            }
+        }
     }
 }

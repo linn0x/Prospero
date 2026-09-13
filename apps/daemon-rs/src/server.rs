@@ -349,6 +349,7 @@ async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, Api
             "agent.account.api.models",
             "agent.account.config",
             "agent.api-validation.v1",
+            "agent.api-engine-validation.v1",
             "agent.api-protocols.v1",
             "conversation.search.v1",
             "chat.attachment-previews.v1",
@@ -1049,15 +1050,13 @@ async fn accounts_route(
     if account_id == crate::accounts::NATIVE_CLAUDE_ID {
         return ApiError(Error::Forbidden).into_response();
     }
-    match scope.as_deref() {
-        None | Some("protocol") => {}
-        Some("engine") => {
-            return ApiError(Error::Invalid("引擎验证尚未接入 Rust daemon".into())).into_response();
-        }
+    let engine_scope = match scope.as_deref() {
+        None | Some("protocol") => false,
+        Some("engine") => true,
         Some(_) => {
             return ApiError(Error::Invalid("连接测试范围无效".into())).into_response();
         }
-    }
+    };
     // One in-flight test per profile, at most four across the daemon.
     let _test_permit = match api.api_tests.try_acquire() {
         Ok(permit) => permit,
@@ -1070,13 +1069,22 @@ async fn accounts_route(
         }
         testing.insert(account_id.clone());
     }
-    let outcome = run_profile_test(&api, &request_id, account_id).await;
+    let outcome = if engine_scope {
+        run_profile_engine_test(&api, &request_id, account_id)
+            .await
+            .map(EitherValidation::Engine)
+    } else {
+        run_profile_test(&api, &request_id, account_id)
+            .await
+            .map(EitherValidation::Protocol)
+    };
     {
         let mut testing = api.api_testing.lock().await;
         testing.remove(account_id);
     }
-    let validation = match outcome {
-        Ok(validation) => validation,
+    let (validation, engine_validation) = match outcome {
+        Ok(EitherValidation::Protocol(validation)) => (Some(validation), None),
+        Ok(EitherValidation::Engine(validation)) => (None, Some(validation)),
         Err(error) => return ApiError(error).into_response(),
     };
     let result = match crate::accounts::respond(
@@ -1084,7 +1092,8 @@ async fn accounts_route(
         &control,
         Some(account_id.clone()),
         None,
-        Some(validation),
+        validation,
+        engine_validation,
     )
     .await
     {
@@ -1099,6 +1108,11 @@ async fn accounts_route(
 
 /// Loads the profile + current key, runs the probe, and records the result
 /// only when the profile revision still matches the one captured beforehand.
+enum EitherValidation {
+    Protocol(crate::accounts::ApiValidation),
+    Engine(crate::accounts::ApiEngineValidation),
+}
+
 async fn run_profile_test(
     api: &Api,
     request_id: &str,
@@ -1132,6 +1146,49 @@ async fn run_profile_test(
         .call({
             let validation = validation.clone();
             move |store| store.record_api_validation(&data, &id, &expected, &validation)
+        })
+        .await?;
+    if !recorded {
+        return Err(Error::Invalid("Profile 已变更，请重新测试连接".into()));
+    }
+    Ok(validation)
+}
+
+/// Loads the profile + current key, runs the Rust engine probe, and records
+/// the result only when the profile revision still matches the captured one.
+async fn run_profile_engine_test(
+    api: &Api,
+    request_id: &str,
+    account_id: &str,
+) -> Result<crate::accounts::ApiEngineValidation> {
+    let _ = request_id;
+    let data = api.database.directory().to_owned();
+    let id = account_id.to_owned();
+    let (revision, record, secret) = api
+        .database
+        .call({
+            let data = data.clone();
+            move |store| {
+                let revision = store.api_validation_revision(&data, &id)?;
+                let record = store.managed_snapshot_row(&data, &id)?;
+                let secret = crate::accounts::managed::profile_secret(&data, &id)?;
+                Ok((revision, record, secret))
+            }
+        })
+        .await?;
+    let profile = record
+        .api_profile
+        .ok_or_else(|| Error::Invalid("这个账号不是第三方 API Profile".into()))?;
+    let secret = secret.unwrap_or_default();
+    let validation = crate::accounts::probe::probe_engine(&profile, &secret).await;
+    let data = data.clone();
+    let id = account_id.to_owned();
+    let expected = revision.clone();
+    let recorded = api
+        .database
+        .call({
+            let validation = validation.clone();
+            move |store| store.record_api_engine_validation(&data, &id, &expected, &validation)
         })
         .await?;
     if !recorded {
@@ -1281,7 +1338,8 @@ async fn account_control_result(
         }
     };
     let result =
-        match crate::accounts::respond(&api.database, &control, account_id, session_id, None).await
+        match crate::accounts::respond(&api.database, &control, account_id, session_id, None, None)
+            .await
         {
             Ok(result) => result,
             Err(error) => return ApiError(error).into_response(),

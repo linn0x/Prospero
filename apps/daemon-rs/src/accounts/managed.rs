@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::database::{now, validate_id};
 use crate::error::{Error, Result};
 
-use super::probe::{ApiValidation, revision};
+use super::probe::{ApiEngineValidation, ApiValidation, revision};
 use super::profile::{ApiProfile, clean_profile, session_environment};
 
 /// Managed account metadata row.
@@ -28,6 +28,7 @@ pub(crate) struct ManagedRecord {
     pub updated_at: i64,
     pub api_profile: Option<ApiProfile>,
     pub api_validation: Option<ApiValidation>,
+    pub api_engine_validation: Option<ApiEngineValidation>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -228,12 +229,24 @@ fn decode_record(
     profile_raw: Option<String>,
     validation_raw: Option<String>,
     validation_revision: Option<String>,
+    engine_validation_raw: Option<String>,
+    engine_validation_revision: Option<String>,
     current_revision: Option<&str>,
 ) -> ManagedRecord {
     let api_profile = profile_raw.and_then(|raw| super::profile::parse_profile_json(&raw));
     let api_validation = match (api_profile.as_ref(), validation_raw, validation_revision) {
         (Some(_), Some(raw), Some(stored)) if Some(stored.as_str()) == current_revision => {
             serde_json::from_str::<ApiValidation>(&raw).ok()
+        }
+        _ => None,
+    };
+    let api_engine_validation = match (
+        api_profile.as_ref(),
+        engine_validation_raw,
+        engine_validation_revision,
+    ) {
+        (Some(_), Some(raw), Some(stored)) if Some(stored.as_str()) == current_revision => {
+            serde_json::from_str::<ApiEngineValidation>(&raw).ok()
         }
         _ => None,
     };
@@ -245,6 +258,7 @@ fn decode_record(
         updated_at,
         api_profile,
         api_validation,
+        api_engine_validation,
     }
 }
 
@@ -263,8 +277,14 @@ fn row_revision(data: &Path, id: &str, profile: Option<&ApiProfile>) -> Option<S
     Some(revision(profile, secret.as_deref()))
 }
 
-const RECORD_COLUMNS: &str =
-    "id,name,is_default,created_at,updated_at,api_profile,api_validation,api_validation_revision";
+const RECORD_COLUMNS: &str = "id,name,is_default,created_at,updated_at,api_profile,api_validation,api_validation_revision,api_engine_validation,api_engine_validation_revision";
+type ValidationColumns = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 impl crate::database::Store {
     pub(crate) fn list_managed_accounts(&self, data: &Path) -> Result<Vec<ManagedRecord>> {
@@ -281,6 +301,8 @@ impl crate::database::Store {
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<String>>(6)?,
                 row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
             ))
         })?;
         let mut records = Vec::new();
@@ -294,6 +316,8 @@ impl crate::database::Store {
                 profile_raw,
                 validation_raw,
                 validation_revision,
+                engine_validation_raw,
+                engine_validation_revision,
             ) = row?;
             let profile = profile_raw
                 .as_deref()
@@ -308,6 +332,8 @@ impl crate::database::Store {
                 profile_raw,
                 validation_raw,
                 validation_revision,
+                engine_validation_raw,
+                engine_validation_revision,
                 current.as_deref(),
             ));
         }
@@ -328,6 +354,8 @@ impl crate::database::Store {
                         row.get(3)?,
                         row.get(4)?,
                         row.get(5)?,
+                        None,
+                        None,
                         None,
                         None,
                         None,
@@ -364,14 +392,16 @@ impl crate::database::Store {
     /// Row with validation decoded against the current profile+key revision.
     pub(crate) fn managed_snapshot_row(&self, data: &Path, id: &str) -> Result<ManagedRecord> {
         validate_account_id(id)?;
-        let (profile_raw, validation_raw, validation_revision): (
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ) = self.connection.query_row(
-            "SELECT api_profile,api_validation,api_validation_revision FROM managed_accounts WHERE id=?",
+        let (
+            profile_raw,
+            validation_raw,
+            validation_revision,
+            engine_validation_raw,
+            engine_validation_revision,
+        ): ValidationColumns = self.connection.query_row(
+            "SELECT api_profile,api_validation,api_validation_revision,api_engine_validation,api_engine_validation_revision FROM managed_accounts WHERE id=?",
             [id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         ).optional()?
         .ok_or(Error::NotFound)?;
         let profile = profile_raw
@@ -383,6 +413,12 @@ impl crate::database::Store {
         record.api_validation = match (validation_raw, validation_revision) {
             (Some(raw), Some(stored)) if current.as_deref() == Some(stored.as_str()) => {
                 serde_json::from_str::<ApiValidation>(&raw).ok()
+            }
+            _ => None,
+        };
+        record.api_engine_validation = match (engine_validation_raw, engine_validation_revision) {
+            (Some(raw), Some(stored)) if current.as_deref() == Some(stored.as_str()) => {
+                serde_json::from_str::<ApiEngineValidation>(&raw).ok()
             }
             _ => None,
         };
@@ -527,7 +563,7 @@ impl crate::database::Store {
         if validation_invalidated {
             transaction.execute(
                 "UPDATE managed_accounts SET name=?1,updated_at=?2,api_profile=?3, \
-                 api_validation=NULL,api_validation_revision=NULL WHERE id=?4",
+                 api_validation=NULL,api_validation_revision=NULL,api_engine_validation=NULL,api_engine_validation_revision=NULL WHERE id=?4",
                 params![name, now(), profile_json, id],
             )?;
         } else {
@@ -561,6 +597,31 @@ impl crate::database::Store {
         let json = serde_json::to_string(validation)?;
         self.connection.execute(
             "UPDATE managed_accounts SET api_validation=?1,api_validation_revision=?2,updated_at=?3 WHERE id=?4",
+            params![json, expected_revision, now(), id],
+        )?;
+        Ok(true)
+    }
+
+    /// Records an engine probe result only when the profile+key revision still
+    /// matches the revision captured before the probe started.
+    pub(crate) fn record_api_engine_validation(
+        &mut self,
+        data: &Path,
+        id: &str,
+        expected_revision: &str,
+        validation: &ApiEngineValidation,
+    ) -> Result<bool> {
+        let record = self.managed_account(id)?;
+        let Some(profile) = record.api_profile else {
+            return Err(Error::Invalid("此账号没有有效的 API Profile".into()));
+        };
+        let current = revision(&profile, profile_secret(data, id)?.as_deref());
+        if current != expected_revision {
+            return Ok(false);
+        }
+        let json = serde_json::to_string(validation)?;
+        self.connection.execute(
+            "UPDATE managed_accounts SET api_engine_validation=?1,api_engine_validation_revision=?2,updated_at=?3 WHERE id=?4",
             params![json, expected_revision, now(), id],
         )?;
         Ok(true)
@@ -627,7 +688,8 @@ impl crate::database::Store {
         write_credential(&account_root(data, id)?, &credential)?;
         self.connection.execute(
             "UPDATE managed_accounts SET updated_at=?1,api_validation=NULL, \
-             api_validation_revision=NULL WHERE id=?2",
+             api_validation_revision=NULL,api_engine_validation=NULL, \
+             api_engine_validation_revision=NULL WHERE id=?2",
             params![now(), id],
         )?;
         Ok(())
@@ -654,7 +716,8 @@ impl crate::database::Store {
         let _ = fs::remove_file(root.join(".credentials.json"));
         self.connection.execute(
             "UPDATE managed_accounts SET updated_at=?1,api_validation=NULL, \
-             api_validation_revision=NULL WHERE id=?2",
+             api_validation_revision=NULL,api_engine_validation=NULL, \
+             api_engine_validation_revision=NULL WHERE id=?2",
             params![now(), id],
         )?;
         Ok(())
