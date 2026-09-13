@@ -36,7 +36,7 @@ use crate::orchestration::{
 use crate::project::{
     FsChunk, FsChunkQuery, FsContent, FsDone, FsListing, FsPathQuery, FsPathRequest, FsPutRequest,
     FsRenameRequest, FsWriteRequest, FsWritten, GitCommitRequest, GitDiffQuery, GitDiffResult,
-    GitDone, GitStageRequest, GitStatusResult, WorkspaceSummaryResult,
+    GitDone, GitHistoryResult, GitStageRequest, GitStatusResult, WorkspaceSummaryResult,
 };
 use crate::protocol::*;
 use crate::terminal::{
@@ -141,6 +141,7 @@ impl Api {
             .route("/v1/sessions/{id}/fs/rename", post(fs_rename))
             .route("/v1/sessions/{id}/git/status", get(git_status))
             .route("/v1/sessions/{id}/git/diff", get(git_diff))
+            .route("/v1/sessions/{id}/git/history", get(git_history))
             .route("/v1/sessions/{id}/git/stage", post(git_stage))
             .route("/v1/sessions/{id}/git/discard", post(git_discard))
             .route("/v1/sessions/{id}/git/commit", post(git_commit))
@@ -1601,10 +1602,13 @@ async fn fs_write(
         .map_err(|_| Error::Invalid("invalid base64".into()))?;
     let path = input.path;
     let response_path = path.clone();
-    let size =
-        tokio::task::spawn_blocking(move || crate::project::write_file_at(&root, &path, content))
-            .await
-            .map_err(|_| Error::Closed)??;
+    let create_new = input.create_new.unwrap_or(false);
+    let expected_version = input.expected_version;
+    let size = tokio::task::spawn_blocking(move || {
+        crate::project::write_file_at(&root, &path, content, create_new, expected_version)
+    })
+    .await
+    .map_err(|_| Error::Closed)??;
     Ok(Json(FsWritten {
         r#type: "fs.written".into(),
         sid: id,
@@ -1745,6 +1749,14 @@ async fn git_diff(
     Ok(Json(
         crate::project::git_diff(id, root, query.path, query.staged).await?,
     ))
+}
+
+async fn git_history(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<GitHistoryResult>, ApiError> {
+    let root = session_workspace(&api, &id).await?;
+    Ok(Json(crate::project::git_history(id, root).await?))
 }
 
 async fn git_stage(
