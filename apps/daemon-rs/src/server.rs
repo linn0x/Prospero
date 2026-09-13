@@ -3,6 +3,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
@@ -100,6 +101,7 @@ impl Api {
     pub fn router(&self) -> Router {
         Router::new()
             .route("/v1/health", get(health))
+            .route("/ws", get(remote_ws))
             .route("/v1/shutdown", post(shutdown))
             .route("/v1/agent-sessions", post(create_agent))
             .route("/v1/conversations", get(conversation_search))
@@ -318,6 +320,30 @@ async fn authorize(State(api): State<Api>, request: Request, next: Next) -> Resp
         .headers_mut()
         .insert("x-content-type-options", "nosniff".parse().unwrap());
     response
+}
+
+const WS_MAX_PAYLOAD: usize = 16 * 1024 * 1024;
+
+async fn remote_ws(ws: WebSocketUpgrade) -> Response {
+    ws.max_message_size(WS_MAX_PAYLOAD)
+        .max_frame_size(WS_MAX_PAYLOAD)
+        .on_upgrade(handle_remote_ws)
+}
+
+async fn handle_remote_ws(mut socket: WebSocket) {
+    // The TypeScript daemon's /ws surface is an encrypted mobile/relay
+    // boundary. Until the Rust daemon owns the pairing keys and SecureChannel
+    // dispatcher, fail closed after the upgrade rather than accepting plaintext
+    // control messages or advertising remote capabilities.
+    if let Some(Ok(Message::Ping(bytes))) = socket.recv().await {
+        let _ = socket.send(Message::Pong(bytes)).await;
+    }
+    let _ = socket
+        .send(Message::Close(Some(CloseFrame {
+            code: 4003,
+            reason: "Rust encrypted remote WebSocket is not implemented".into(),
+        })))
+        .await;
 }
 
 async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, ApiError> {

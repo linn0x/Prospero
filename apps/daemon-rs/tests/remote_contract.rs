@@ -97,3 +97,35 @@ async fn health_capabilities_are_explicitly_local_http_not_mobile_ws() {
     }
     api.database.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn direct_ws_boundary_requires_bearer_auth_and_websocket_upgrade() {
+    let (_directory, api) = fixture().await;
+    let response = api
+        .router()
+        .oneshot(Request::builder().uri("/ws").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let response = api
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/ws")
+                .header("authorization", format!("Bearer {SECRET}"))
+                .header("connection", "upgrade")
+                .header("upgrade", "websocket")
+                .header("sec-websocket-version", "13")
+                .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // `tower::ServiceExt::oneshot` cannot provide hyper's upgrade extension;
+    // reaching 426 proves auth accepted the request and the route is a real
+    // WebSocket boundary rather than the JSON fallback.
+    assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+    api.database.shutdown().await.unwrap();
+}
