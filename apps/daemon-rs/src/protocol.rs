@@ -570,6 +570,14 @@ pub fn typescript() -> String {
         crate::accounts::models::CatalogModel::decl(&config),
         crate::accounts::models::FeatureError::decl(&config),
         crate::accounts::models::ModelsResult::decl(&config),
+        crate::accounts::sources::SourceEndpoint::decl(&config),
+        crate::accounts::sources::SourceCredentialInfo::decl(&config),
+        crate::accounts::sources::SourceRoute::decl(&config),
+        crate::accounts::sources::ModelSource::decl(&config),
+        crate::accounts::sources::SourceBindingView::decl(&config),
+        crate::accounts::sources::SourceMigrationAccount::decl(&config),
+        crate::accounts::sources::SourceMigration::decl(&config),
+        crate::accounts::sources::SourceResult::decl(&config),
         crate::error::ErrorBody::decl(&config),
     ];
     let mut output: String = declarations

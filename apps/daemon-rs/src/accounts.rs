@@ -9,6 +9,7 @@ pub(crate) mod managed;
 pub(crate) mod models;
 pub(crate) mod probe;
 pub(crate) mod profile;
+pub(crate) mod sources;
 
 pub(crate) use probe::ApiValidation;
 pub(crate) use profile::{ApiProfile, ModelCapabilities};
@@ -65,6 +66,8 @@ pub struct NativeAccount {
     pub capabilities: AccountCapabilities,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_profile: Option<ApiProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_source: Option<sources::SourceBindingView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -428,6 +431,7 @@ async fn managed_row(
         status: probe.status,
         capabilities: claude_capabilities(),
         api_profile: None,
+        model_source: None,
         engine: None,
         api_validation: None,
         auth_method: probe.auth_method,
@@ -447,6 +451,7 @@ async fn profile_row(
     record: managed::ManagedRecord,
     active_sessions: i64,
     runtime_ok: bool,
+    model_source: Option<sources::SourceBindingView>,
 ) -> Result<NativeAccount> {
     let data = database.directory().to_owned();
     let id = record.id.clone();
@@ -494,6 +499,7 @@ async fn profile_row(
         status,
         capabilities: profile_capabilities(),
         api_profile: record.api_profile,
+        model_source,
         engine: Some("claude".into()),
         api_validation: record.api_validation,
         auth_method,
@@ -524,14 +530,19 @@ async fn snapshot_with(
 ) -> Result<AccountListResult> {
     let db = database.clone();
     let data = database.directory().to_owned();
-    let (managed, native_active, mut managed_active) = db
+    let (managed, native_active, mut managed_active, bindings) = db
         .call({
             let data = data.clone();
             move |store| {
                 let managed = store.list_managed_accounts(&data)?;
                 let ids: Vec<String> = managed.iter().map(|record| record.id.clone()).collect();
                 let (native_active, managed_active) = store.account_active_counts(&ids)?;
-                Ok((managed, native_active, managed_active))
+                let sources = sources::ModelSources::open(&data)?;
+                let bindings = ids
+                    .iter()
+                    .filter_map(|id| sources.binding_view(id).map(|view| (id.clone(), view)))
+                    .collect::<std::collections::HashMap<_, _>>();
+                Ok((managed, native_active, managed_active, bindings))
             }
         })
         .await?;
@@ -550,6 +561,7 @@ async fn snapshot_with(
         status: probe.status,
         capabilities: claude_capabilities(),
         api_profile: None,
+        model_source: None,
         engine: None,
         api_validation: None,
         auth_method: probe.auth_method,
@@ -561,7 +573,8 @@ async fn snapshot_with(
     for record in managed {
         let active = managed_active.remove(&record.id).unwrap_or(0);
         if record.api_profile.is_some() {
-            accounts.push(profile_row(database, record, active, runtime_ok).await?);
+            let binding = bindings.get(&record.id).cloned();
+            accounts.push(profile_row(database, record, active, runtime_ok, binding).await?);
         } else {
             accounts.push(managed_row(database, record, active).await?);
         }

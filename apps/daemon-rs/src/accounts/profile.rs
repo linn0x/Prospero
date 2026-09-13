@@ -59,7 +59,7 @@ pub struct ModelCapabilities {
 }
 
 impl ModelCapabilities {
-    fn clean(value: serde_json::Value) -> Result<Option<Self>> {
+    pub(crate) fn clean(value: serde_json::Value) -> Result<Option<Self>> {
         if value.is_null() {
             return Ok(None);
         }

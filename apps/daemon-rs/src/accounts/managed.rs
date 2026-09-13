@@ -101,7 +101,7 @@ fn ensure_private_dir(path: &Path) -> Result<()> {
 
 /// Writes the credential through a temp file in the same directory, then
 /// renames over the target with mode 0600.
-fn write_credential(root: &Path, credential: &Credential) -> Result<()> {
+pub(crate) fn write_credential(root: &Path, credential: &Credential) -> Result<()> {
     ensure_private_dir(root)?;
     let body = serde_json::json!({ "kind": credential.kind.label(), "secret": credential.secret });
     let temporary = root.join(format!(".credential.{}.tmp", Uuid::new_v4()));
@@ -186,7 +186,7 @@ pub(crate) fn claude_environment(
     ])
 }
 
-fn clean_api_key(raw: &str) -> Result<String> {
+pub(crate) fn clean_api_key(raw: &str) -> Result<String> {
     let secret = raw.trim();
     if secret.is_empty() || secret.len() > 8192 || secret.contains(['\r', '\n', '\0']) {
         return Err(Error::Invalid("API Key 格式无效".into()));
@@ -421,6 +421,38 @@ impl crate::database::Store {
             },
         )?;
         self.managed_snapshot_row(data, &id)
+    }
+
+    pub(crate) fn insert_api_profile_account_with_id(
+        &mut self,
+        data: &Path,
+        id: &str,
+        raw_name: &str,
+        profile: &ApiProfile,
+        secret: &str,
+    ) -> Result<ManagedRecord> {
+        validate_account_id(id)?;
+        let name = clean_name(raw_name)?;
+        let secret = clean_api_key(secret)?;
+        let existing = self.list_managed_accounts(data)?;
+        let becomes_default = !existing.iter().any(|account| account.is_default);
+        let timestamp = now();
+        let profile_json = serde_json::to_string(profile)?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO managed_accounts(id,name,is_default,created_at,updated_at,api_profile) \
+             VALUES(?1,?2,?3,?4,?4,?5)",
+            params![id, name, becomes_default as i64, timestamp, profile_json],
+        )?;
+        transaction.commit()?;
+        write_credential(
+            &account_root(data, id)?,
+            &Credential {
+                kind: CredentialKind::ApiKey,
+                secret,
+            },
+        )?;
+        self.managed_snapshot_row(data, id)
     }
 
     /// Updates a profile account's name/connection/key. Any connection or key

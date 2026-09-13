@@ -3,7 +3,7 @@ import type { RustContent } from "../shared/rust-api";
 import type { TimelinePage, TimelineQuery, TimelineLookupResult, TimelineTextQuery, TimelineTextPage } from "@prospero/protocol/rust-daemon";
 import type { CreateTerminal, TerminalPage, TerminalQuery, TerminalSize, TerminalSnapshot } from "@prospero/protocol/rust-daemon";
 import type { AgentSend, AgentModeCatalog, AgentModelCatalog, AgentModelSelectionResult, AgentControlsProjection, CreateAgentSession, PermissionDecision, QuestionDecision, SubagentSnapshot, AgentQueue, AgentQueues } from "@prospero/protocol/rust-daemon";
-import type { AccountListResult, LaunchModelCatalog } from "@prospero/protocol/rust-daemon";
+import type { AccountListResult, LaunchModelCatalog, SourceResult } from "@prospero/protocol/rust-daemon";
 import type {
   AbandonRun, ApplyTaskGraph, CancelTask, CleanupWorktree, CompleteRun, CreateGate,
   CreateRun, CreateRunGraph, CreateTask, Dispatch, Gate, GraphMutationResult, ResolveGate,
@@ -323,6 +323,16 @@ export class RustClient {
    * `agent.account.api.models.result` (errors encoded in-body). */
   accountFeature(body: Record<string, unknown>, signal: AbortSignal | null = null, timeoutMs = 35_000): Promise<Record<string, unknown>> {
     return this.json("/v1/accounts", {
+      method: "POST",
+      signal,
+      timeoutMs,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+
+  modelSource(body: Record<string, unknown>, signal: AbortSignal | null = null, timeoutMs = 45_000): Promise<SourceResult> {
+    return this.json("/v1/model-sources", {
       method: "POST",
       signal,
       timeoutMs,
