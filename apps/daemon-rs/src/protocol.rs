@@ -573,6 +573,8 @@ pub fn typescript() -> String {
         crate::accounts::AccountStatus::decl(&config),
         crate::accounts::AccountCapabilities::decl(&config),
         crate::accounts::ModelCapabilities::decl(&config),
+        crate::accounts::profile::ModelCapabilitySupportValue::decl(&config),
+        crate::accounts::ModelCapabilitySupport::decl(&config),
         crate::accounts::ApiProfile::decl(&config),
         crate::accounts::probe::Check::decl(&config),
         crate::accounts::probe::ValidationChecks::decl(&config),

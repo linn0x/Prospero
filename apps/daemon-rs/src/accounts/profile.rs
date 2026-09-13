@@ -104,6 +104,66 @@ impl ModelCapabilities {
 
 const ALLOWED_EFFORTS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum ModelCapabilitySupportValue {
+    Enforced,
+    Unsupported,
+}
+
+/// Reports only explicitly declared capabilities; enforcement is engine-specific.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct ModelCapabilitySupport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<ModelCapabilitySupportValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<ModelCapabilitySupportValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<ModelCapabilitySupportValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<ModelCapabilitySupportValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ModelCapabilitySupportValue>,
+}
+
+pub(crate) fn capability_support(profile: &ApiProfile) -> Option<ModelCapabilitySupport> {
+    let caps = profile.model_capabilities.as_ref()?;
+    let lower_model = profile.model.to_lowercase();
+    let claude_native_window = ["claude-", "opus", "sonnet", "haiku", "fable", "[1m]"]
+        .iter()
+        .any(|needle| lower_model.contains(needle));
+    Some(ModelCapabilitySupport {
+        context_window: caps.context_window.map(|_| {
+            if claude_native_window {
+                ModelCapabilitySupportValue::Unsupported
+            } else {
+                ModelCapabilitySupportValue::Enforced
+            }
+        }),
+        max_output_tokens: caps
+            .max_output_tokens
+            .map(|_| ModelCapabilitySupportValue::Enforced),
+        tools: caps.tools.map(|_| ModelCapabilitySupportValue::Enforced),
+        vision: caps.vision.map(|vision| {
+            if !vision || profile.protocol() == "anthropic" {
+                ModelCapabilitySupportValue::Enforced
+            } else {
+                ModelCapabilitySupportValue::Unsupported
+            }
+        }),
+        reasoning: caps.reasoning.map(|reasoning| {
+            if profile.protocol() == "anthropic" && reasoning {
+                ModelCapabilitySupportValue::Unsupported
+            } else {
+                ModelCapabilitySupportValue::Enforced
+            }
+        }),
+    })
+}
+
 /// Public, non-secret API profile carried in account snapshots.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
