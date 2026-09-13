@@ -458,6 +458,9 @@ async fn worker_start_is_idempotent_and_stop_preserves_the_tree() {
         &database,
         &agents,
         StartWorker {
+            agent: AgentKind::Claude,
+            approval_policy: None,
+            account_id: None,
             task_id: task_id.clone(),
             cwd: repo.to_string_lossy().into_owned(),
             worktree: "new".into(),
@@ -491,6 +494,9 @@ async fn worker_start_is_idempotent_and_stop_preserves_the_tree() {
         &database,
         &agents,
         StartWorker {
+            agent: AgentKind::Claude,
+            approval_policy: None,
+            account_id: None,
             task_id: task_id.clone(),
             cwd: repo.to_string_lossy().into_owned(),
             worktree: "new".into(),
@@ -650,6 +656,9 @@ async fn worker_expands_bound_skill_into_the_delivered_brief() {
         &database,
         &agents,
         StartWorker {
+            agent: AgentKind::Claude,
+            approval_policy: None,
+            account_id: None,
             task_id: task_id.clone(),
             cwd: repo.to_string_lossy().into_owned(),
             worktree: "new".into(),
@@ -744,6 +753,9 @@ async fn worker_rejects_undeclared_skill_mention_and_preserves_the_tree() {
         &database,
         &agents,
         StartWorker {
+            agent: AgentKind::Claude,
+            approval_policy: None,
+            account_id: None,
             task_id: task_id.clone(),
             cwd: repo.to_string_lossy().into_owned(),
             worktree: "new".into(),
@@ -802,6 +814,9 @@ async fn worker_rejects_missing_bound_skill_and_preserves_the_tree() {
         &database,
         &agents,
         StartWorker {
+            agent: AgentKind::Claude,
+            approval_policy: None,
+            account_id: None,
             task_id: task_id.clone(),
             cwd: repo.to_string_lossy().into_owned(),
             worktree: "new".into(),

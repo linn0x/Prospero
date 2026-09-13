@@ -117,9 +117,10 @@ impl Store {
                 Some(id.to_owned())
             }
         };
+        let agent = input.agent;
         self.create_session_with(
             CreateSession {
-                agent: AgentKind::Claude,
+                agent,
                 kind: SessionKind::Structured,
                 title: input.title,
                 workspace: input.workspace,
@@ -127,8 +128,8 @@ impl Store {
             |tx, head| {
                 tx.execute(
                     "INSERT INTO agent_runs(session_id,agent,active,approval_policy,turn,native_id,model,effort,account_id) \
-                     VALUES(?1,'claude',1,?2,0,NULL,?3,?4,?5)",
-                    params![head.id, policy.label(), model, effort, account_id],
+                     VALUES(?1,?2,1,?3,0,NULL,?4,?5,?6)",
+                    params![head.id, crate::database::label(agent)?, policy.label(), model, effort, account_id],
                 )?;
                 Ok(())
             },
@@ -181,7 +182,11 @@ impl Store {
         };
         let agent = match row.0.as_str() {
             "claude" => AgentKind::Claude,
-            _ => return Err(Error::Schema),
+            _ => {
+                return Err(Error::Invalid(
+                    "Agent 暂未接入 Rust structured runtime".into(),
+                ));
+            }
         };
         Ok(AgentRun {
             agent,
@@ -250,17 +255,23 @@ impl Store {
     /// `agentControls` projection in the session list.
     pub(crate) fn agent_controls(&self) -> Result<Vec<crate::agent::SessionAgentControls>> {
         let mut statement = self.connection.prepare(
-            "SELECT session_id,permission_mode,model,effort FROM agent_runs WHERE active=1",
+            "SELECT ar.session_id,ar.agent,ar.permission_mode,ar.model,ar.effort,
+                    ma.api_profile IS NOT NULL
+             FROM agent_runs ar
+             LEFT JOIN managed_accounts ma ON ma.id = ar.account_id
+             WHERE ar.active=1",
         )?;
         let rows = statement.query_map([], |row| {
-            let mode: String = row.get(1)?;
+            let agent: String = row.get(1)?;
+            let mode: String = row.get(2)?;
+            let profile_bound: bool = row.get(5)?;
             Ok(crate::agent::SessionAgentControls {
                 session_id: row.get(0)?,
-                compact: true,
-                model: true,
-                mode: true,
-                current_model: row.get(2)?,
-                current_effort: row.get(3)?,
+                compact: agent == "claude",
+                model: agent == "claude" && !profile_bound,
+                mode: agent == "claude" && !profile_bound,
+                current_model: row.get(3)?,
+                current_effort: row.get(4)?,
                 current_mode: Some(mode),
             })
         })?;
@@ -274,7 +285,9 @@ impl Store {
             return Err(Error::Conflict);
         }
         if run.agent != AgentKind::Claude {
-            return Err(Error::Schema);
+            return Err(Error::Invalid(
+                "Agent 暂未接入 Rust structured runtime".into(),
+            ));
         }
         let turn = run.turn + 1;
         self.connection.execute(

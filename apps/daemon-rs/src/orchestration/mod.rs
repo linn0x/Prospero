@@ -410,12 +410,24 @@ pub struct RunDeletionResult {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StartWorker {
     pub task_id: String,
-    /// Only structured Claude workers are bridged in Rust mode.
+    #[serde(default = "default_worker_agent")]
+    pub agent: crate::protocol::AgentKind,
+    /// Only structured Claude workers are launched today; the wire contract
+    /// carries the requested agent so unsupported choices fail in Rust instead
+    /// of being rejected by the desktop bridge.
     pub cwd: String,
     #[serde(default = "default_worktree_mode")]
     pub worktree: String,
     #[serde(default)]
+    pub approval_policy: Option<String>,
+    #[serde(default)]
+    pub account_id: Option<String>,
+    #[serde(default)]
     pub operation_id: Option<String>,
+}
+
+fn default_worker_agent() -> crate::protocol::AgentKind {
+    crate::protocol::AgentKind::Claude
 }
 
 fn default_worktree_mode() -> String {

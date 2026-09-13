@@ -26,7 +26,7 @@ export type ToolState = "running" | "success" | "failed";
 export type QuestionOption = { label: string, description: string | null, preview: string | null, };
 export type AgentQuestion = { id: string, header: string, question: string, options: Array<QuestionOption>, multiSelect: boolean, allowOther: boolean, };
 export type MessageAttachment = { id: string, mimeType: string, name: string | null, };
-export type TimelineBody = { "kind": "message", role: MessageRole, finalAnswer: boolean, attachments?: Array<MessageAttachment>, } | { "kind": "reasoning" } | { "kind": "tool", name: string, state: ToolState, summary: string, } | { "kind": "permission_request", requestId: string, tool: string, resolved: boolean, 
+export type TimelineBody = { "kind": "message", role: MessageRole, finalAnswer: boolean, attachments?: Array<MessageAttachment>, } | { "kind": "reasoning" } | { "kind": "tool", name: string, state: ToolState, summary: string, } | { "kind": "permission_request", requestId: string, tool: string, resolved: boolean,
 /**
  * Set when the approval belongs to a Task-tool subagent; the event
  * still shows on the main timeline so it can be answered there.
@@ -46,11 +46,11 @@ export type TerminalQuery = { afterSeq: number | null, waitMs: number | null, };
 export type TerminalPage = { initialSize: TerminalSize, baseSeq: number, nextSeq: number, latestSeq: number, floorSeq: number, events: Array<TerminalEvent>, resyncRequired: boolean, exited: boolean, exitCode: number | null, };
 export type TerminalInput = { dataB64: string, };
 export type TerminalSnapshot = { seq: number, size: TerminalSize, dataB64: string, };
-export type CreateAgentSession = { title: string, workspace: string, autoApprove: boolean, 
+export type CreateAgentSession = { agent: AgentKind, title: string, workspace: string, autoApprove: boolean,
 /**
  * Optional launch catalog selection (native CLI aliases / ids).
  */
-model?: string | null, effort?: string | null, 
+model?: string | null, effort?: string | null,
 /**
  * Managed account id; None (or the native id) uses the本机默认环境.
  */
@@ -66,17 +66,17 @@ export type AgentModelCatalog = { models: Array<LaunchModelInfo>, currentModel: 
 export type SessionAgentControls = { sessionId: string, compact: boolean, model: boolean, mode: boolean, currentModel: string | null, currentEffort: string | null, currentMode: string | null, };
 export type AgentControlsProjection = { controls: Array<SessionAgentControls>, };
 export type AttachmentInput = { mimeType: string, dataB64: string, name?: string | null, };
-export type AgentSend = { text: string, 
+export type AgentSend = { text: string,
 /**
  * `steer` tries to guide the running turn live and falls back to the
  * front of the queue; anything else enqueues normally (FIFO).
  */
 delivery: string | null, attachments: Array<AttachmentInput>, };
-export type QueuedMessage = { id: string, text: string, 
+export type QueuedMessage = { id: string, text: string,
 /**
  * `guide` rows jump the front of the queue ("现在引导").
  */
-kind: string, createdAt: number, 
+kind: string, createdAt: number,
 /**
  * Number of images parked with the message (bytes are never projected).
  */
@@ -103,7 +103,7 @@ export type GateStatus = "pending" | "resolved" | "cancelled";
 export type MessageType = "note" | "ask" | "reply" | "report";
 export type Run = { id: string, objective: string, status: RunStatus, coordinatorSessionId: string | null, graphRevision: number, createdAt: number, updatedAt: number, };
 export type Task = { id: string, runId: string, title: string, spec: string, skills: Array<string>, deps: Array<string>, parentId: string | null, status: TaskStatus, result: string | null, createdAt: number, updatedAt: number, };
-export type Dispatch = { id: string, runId: string, taskId: string, sessionId: string, state: DispatchState, outcome: string | null, startedAt: number, settledAt: number | null, 
+export type Dispatch = { id: string, runId: string, taskId: string, sessionId: string, state: DispatchState, outcome: string | null, startedAt: number, settledAt: number | null,
 /**
  * Working directory of the worker; for an isolated worker this is the
  * registered worktree path.
@@ -113,20 +113,20 @@ export type Gate = { id: string, runId: string, taskId: string | null, question:
 export type OrchMessage = { id: string, runId: string, from: string, to: string, type: MessageType, subject: string, body: string, threadId: string | null, taskId: string | null, createdAt: number, readAt: number | null, answeredAt: number | null, };
 export type RunSnapshot = { run: Run, tasks: Array<Task>, ready: Array<string>, dispatches: Array<Dispatch>, gates: Array<Gate>, };
 export type GraphNodeInput = { clientId: string, title: string, spec: string, skills: Array<string>, deps: Array<string>, parentId: string | null, };
-export type CreateRunGraph = { objective: string, nodes: Array<GraphNodeInput>, coordinatorSessionId: string | null, 
+export type CreateRunGraph = { objective: string, nodes: Array<GraphNodeInput>, coordinatorSessionId: string | null,
 /**
  * Required so a retried graph creation never makes two runs.
  */
 operationId: string, };
 export type ApplyTaskGraph = { runId: string, baseRevision: number, nodes: Array<GraphNodeInput>, deleteTaskIds: Array<string>, operationId: string | null, };
-export type GraphMutationResult = { run: Run, tasks: Array<Task>, 
+export type GraphMutationResult = { run: Run, tasks: Array<Task>,
 /**
  * Maps submitted `clientId` to the durable task id.
  */
 idMap: { [key in string]: string }, deletedTaskIds: Array<string>, };
 export type DispatchTask = { sessionId: string, operationId: string | null, worktreePath: string | null, };
 export type SettleDispatch = { success: boolean, outcome: string, };
-export type AbandonDispatch = { reason: string | null, 
+export type AbandonDispatch = { reason: string | null,
 /**
  * `failed` (default) or `cancelled`; only used when the task is still
  * dispatched.
@@ -140,11 +140,11 @@ export type ResolveGate = { decision: string, };
 export type PostMessage = { runId: string, from: string, to: string, type: MessageType, subject: string, body: string, threadId: string | null, taskId: string | null, };
 export type MarkMessages = { ids: Array<string>, };
 export type SettleOutcome = { task: Task, dispatch: Dispatch, };
-export type RecoveryReport = { 
+export type RecoveryReport = {
 /**
  * Dispatches whose worker session is gone; converged abandoned/failed.
  */
-settled: Array<Dispatch>, 
+settled: Array<Dispatch>,
 /**
  * `starting` dispatches whose worker survived; promoted to `running`.
  */
@@ -159,19 +159,21 @@ export type CreateRun = { objective: string, coordinatorSessionId: string | null
 export type CreateTask = { runId: string, title: string, spec: string, skills: Array<string>, deps: Array<string>, parentId: string | null, };
 export type DeleteRun = { force: boolean, };
 export type RunDeletionResult = { runId: string, deletedTaskCount: number, preservedWorktreeAssetIds: number, };
-export type StartWorker = { taskId: string, 
+export type StartWorker = { taskId: string, agent: AgentKind,
 /**
- * Only structured Claude workers are bridged in Rust mode.
+ * Only structured Claude workers are launched today; the wire contract
+ * carries the requested agent so unsupported choices fail in Rust instead
+ * of being rejected by the desktop bridge.
  */
-cwd: string, worktree: string, operationId: string | null, };
-export type StopWorker = { taskId: string, reason: string | null, 
+cwd: string, worktree: string, approvalPolicy: string | null, accountId: string | null, operationId: string | null, };
+export type StopWorker = { taskId: string, reason: string | null,
 /**
  * `failed` (default) or `cancelled`.
  */
 finalStatus: string | null, };
 export type WorkerStartOutcome = { task: Task, dispatch: Dispatch, sessionId: string, worktree: WorktreeAsset | null, };
 export type InspectWorktree = { targetRef: string | null, };
-export type CleanupWorktree = { targetRef: string | null, 
+export type CleanupWorktree = { targetRef: string | null,
 /**
  * Explicit authorization; without it the directory is never removed.
  */

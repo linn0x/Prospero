@@ -124,8 +124,11 @@ export async function orchestrationAction(
       if (worktree !== "new" && worktree !== "none") throw new Error("worktree 必须是 new 或 none");
       const input: StartWorker = {
         taskId: required(params, "taskId"),
+        agent: workerAgent(params),
         cwd: required(params, "cwd"),
         worktree,
+        approvalPolicy: workerApprovalPolicy(params),
+        accountId: workerAccountId(params),
         operationId: optionalText(params["operationId"]),
       };
       return client.startWorker(input, signal, timeoutMs) as Promise<JsonObject>;
@@ -176,18 +179,29 @@ export function settleDispatchInput(rawParams: unknown): SettleDispatch {
 }
 
 function assertStructuredClaudeWorker(params: JsonObject): void {
-  if (params["agent"] !== undefined && params["agent"] !== "claude") {
-    throw new Error("Rust 模式当前只接入 Claude worker");
-  }
   if (params["kind"] !== undefined && params["kind"] !== "structured") {
     throw new Error("Rust 模式只支持结构化 worker");
   }
-  if (params["accountId"] !== undefined && params["accountId"] !== null && `${params["accountId"]}`.trim()) {
-    throw new Error("Rust worker 暂不支持账号选择");
-  }
-  if (params["approvalPolicy"] === "yolo") {
-    throw new Error("Rust worker 暂不支持 yolo 审批策略");
-  }
+}
+
+function workerAgent(params: JsonObject): "claude" {
+  const agent = params["agent"] ?? "claude";
+  if (agent !== "claude") throw new Error("Rust 模式当前只接入 Claude worker");
+  return "claude";
+}
+
+function workerApprovalPolicy(params: JsonObject): "strict" | "standard" | "yolo" | null {
+  const policy = params["approvalPolicy"];
+  if (policy === undefined || policy === null || policy === "") return null;
+  if (policy !== "strict" && policy !== "standard" && policy !== "yolo") throw new Error("审批策略无效");
+  return policy;
+}
+
+function workerAccountId(params: JsonObject): string | null {
+  const accountId = params["accountId"];
+  if (accountId === undefined || accountId === null || !`${accountId}`.trim()) return null;
+  if (typeof accountId !== "string" || !/^[A-Za-z0-9_-]{1,100}$/.test(accountId)) throw new Error("账号 ID 无效");
+  return accountId;
 }
 
 function required(params: JsonObject, key: string): string {

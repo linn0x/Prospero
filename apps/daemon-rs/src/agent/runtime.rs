@@ -161,7 +161,13 @@ impl Agents {
         } else {
             ApprovalPolicy::Manual
         };
+        if input.agent != crate::protocol::AgentKind::Claude {
+            return Err(Error::Invalid(
+                "Agent 暂未接入 Rust structured runtime".into(),
+            ));
+        }
         let mut create = CreateAgentSession {
+            agent: input.agent,
             title: input.title,
             workspace,
             auto_approve: input.auto_approve,
