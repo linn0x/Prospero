@@ -472,6 +472,7 @@ impl crate::database::Store {
         new_secret: Option<&str>,
     ) -> Result<ManagedRecord> {
         let record = self.managed_snapshot_row(data, id)?;
+        let source_bound = super::sources::ModelSources::open(data)?.is_bound(id);
         let Some(existing) = record.api_profile else {
             return Err(Error::Invalid("这个账号不是第三方 API Profile".into()));
         };
@@ -502,6 +503,9 @@ impl crate::database::Store {
         let connection_changed = profile != existing;
         let trimmed_secret = new_secret.map(str::trim);
         let updates_credential = trimmed_secret.is_some_and(|secret| !secret.is_empty());
+        if source_bound && (updates_credential || connection_changed || updates_capabilities) {
+            return Err(Error::InUse);
+        }
         if (updates_credential || connection_changed || updates_capabilities)
             && self.active_session_count(id)? > 0
         {
@@ -606,6 +610,9 @@ impl crate::database::Store {
         if secret.trim().len() < 20 {
             return Err(Error::Invalid("凭据格式无效".into()));
         }
+        if super::sources::ModelSources::open(data)?.is_bound(id) {
+            return Err(Error::InUse);
+        }
         if record.api_profile.is_some() {
             // Third-party profiles only accept API keys and cannot rotate them
             // while a session is using the old connection.
@@ -631,6 +638,9 @@ impl crate::database::Store {
     /// profile account cannot sign out while a session is using its key.
     pub(crate) fn logout_managed_account(&mut self, data: &Path, id: &str) -> Result<()> {
         let record = self.managed_snapshot_row(data, id)?;
+        if super::sources::ModelSources::open(data)?.is_bound(id) {
+            return Err(Error::InUse);
+        }
         if record.api_profile.is_some() && self.active_session_count(id)? > 0 {
             return Err(Error::InUse);
         }
@@ -654,6 +664,9 @@ impl crate::database::Store {
     /// running session (structured turn or live login PTY) blocks deletion.
     pub(crate) fn delete_managed_account(&mut self, data: &Path, id: &str) -> Result<()> {
         let _record = self.managed_account(id)?;
+        if super::sources::ModelSources::open(data)?.is_bound(id) {
+            return Err(Error::InUse);
+        }
         if self.active_session_count(id)? > 0 {
             return Err(Error::InUse);
         }

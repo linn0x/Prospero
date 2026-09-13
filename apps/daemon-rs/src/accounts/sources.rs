@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,70 @@ const MAX_ROUTES: usize = 500;
 const MAX_ENDPOINTS: usize = 3;
 const MAX_NAME: usize = 80;
 const MAX_CREATIONS: usize = 10_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileSignature {
+    Absent,
+    Present {
+        dev: u64,
+        ino: u64,
+        len: u64,
+        mtime_nsec: i128,
+        ctime_nsec: i128,
+        sha256: String,
+    },
+}
+
+fn file_signature(path: &Path) -> Result<FileSignature> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(FileSignature::Absent);
+        }
+        Err(_) => return Err(Error::Invalid("模型源存储无法读取，原文件已保留".into())),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(Error::Invalid("模型源存储文件不安全".into()));
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(Error::Invalid("模型源存储文件不安全".into()));
+    }
+    if metadata.len() as usize > MAX_REGISTRY_BYTES {
+        return Err(Error::Invalid("模型源文件过大".into()));
+    }
+    let body =
+        fs::read(path).map_err(|_| Error::Invalid("模型源存储无法读取，原文件已保留".into()))?;
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(&body);
+    Ok(FileSignature::Present {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        len: metadata.len(),
+        mtime_nsec: metadata.mtime() as i128 * 1_000_000_000 + metadata.mtime_nsec() as i128,
+        ctime_nsec: metadata.ctime() as i128 * 1_000_000_000 + metadata.ctime_nsec() as i128,
+        sha256: hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    })
+}
+
+fn ensure_private_root(root: &Path) -> Result<()> {
+    fs::create_dir_all(root)?;
+    fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
+    let metadata = fs::symlink_metadata(root)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(Error::Invalid("模型源目录不安全".into()));
+    }
+    Ok(())
+}
+
+fn sync_directory(root: &Path) -> Result<()> {
+    fs::File::open(root)?.sync_all()?;
+    Ok(())
+}
 
 pub(crate) fn validate_source_id(id: &str) -> Result<()> {
     if id.is_empty()
@@ -441,35 +506,28 @@ pub struct ModelSources {
     root: PathBuf,
     file: PathBuf,
     registry: Registry,
+    disk_signature: FileSignature,
 }
 
 impl ModelSources {
     pub(crate) fn open(data: &Path) -> Result<Self> {
         let root = data.join("model-sources");
         let file = root.join(".registry.json");
-        let registry = match fs::read_to_string(&file) {
-            Ok(raw) => {
-                let metadata = fs::symlink_metadata(&file)?;
-                if !metadata.is_file() || metadata.file_type().is_symlink() {
-                    return Err(Error::Invalid("模型源存储文件不安全".into()));
-                }
-                #[cfg(unix)]
-                if metadata.permissions().mode() & 0o077 != 0 {
-                    return Err(Error::Invalid("模型源存储文件不安全".into()));
-                }
-                if metadata.len() as usize > MAX_REGISTRY_BYTES {
-                    return Err(Error::Invalid("模型源文件过大".into()));
-                }
+        let disk_signature = file_signature(&file)?;
+        let registry = match &disk_signature {
+            FileSignature::Present { .. } => {
+                let raw = fs::read_to_string(&file)
+                    .map_err(|_| Error::Invalid("模型源存储无法读取，原文件已保留".into()))?;
                 serde_json::from_str::<Registry>(&raw)
                     .map_err(|_| Error::Invalid("模型源存储无法读取，原文件已保留".into()))?
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Registry::empty(),
-            Err(_) => return Err(Error::Invalid("模型源存储无法读取，原文件已保留".into())),
+            FileSignature::Absent => Registry::empty(),
         };
         let sources = Self {
             root,
             file,
             registry,
+            disk_signature,
         };
         sources.validate()?;
         Ok(sources)
@@ -551,16 +609,33 @@ impl ModelSources {
         if body.len() > MAX_REGISTRY_BYTES {
             return Err(Error::Invalid("模型源存储空间已达上限".into()));
         }
-        fs::create_dir_all(&self.root)?;
-        fs::set_permissions(&self.root, fs::Permissions::from_mode(0o700))?;
-        let metadata = fs::symlink_metadata(&self.root)?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            return Err(Error::Invalid("模型源目录不安全".into()));
+        ensure_private_root(&self.root)?;
+        if file_signature(&self.file)? != self.disk_signature {
+            return Err(Error::Conflict);
         }
         let temporary = self.root.join(format!(".registry.{}.tmp", Uuid::new_v4()));
-        fs::write(&temporary, &body)?;
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
-        fs::rename(&temporary, &self.file)?;
+        let write_result = (|| -> Result<()> {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)?;
+            file.write_all(&body)?;
+            file.sync_all()?;
+            drop(file);
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
+            if file_signature(&self.file)? != self.disk_signature {
+                return Err(Error::Conflict);
+            }
+            fs::rename(&temporary, &self.file)?;
+            sync_directory(&self.root)?;
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        write_result?;
+        self.disk_signature = file_signature(&self.file)?;
         Ok(())
     }
 
@@ -1547,4 +1622,70 @@ fn create_fingerprint(
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_save_rejects_stale_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path();
+        let endpoint = SourceEndpointInput {
+            protocol: "anthropic".into(),
+            base_url: "https://example.invalid".into(),
+            headers: None,
+        };
+        let create = || SourceAction::Create {
+            operation_id: None,
+            name: "Atomic".into(),
+            endpoints: vec![endpoint.clone()],
+            credential: CredentialInput {
+                name: "Key".into(),
+                api_key: "sk-prospero-source-secret-0123456789".into(),
+            },
+            routes: Some(vec![RouteInput {
+                name: "A".into(),
+                model: "a".into(),
+                protocol: "anthropic".into(),
+                enabled: true,
+                model_capabilities: None,
+                default_effort: None,
+            }]),
+        };
+        let mut initial = ModelSources::open(data).unwrap();
+        initial.create(create()).unwrap();
+
+        let mut stale = ModelSources::open(data).unwrap();
+        let mut fresh = ModelSources::open(data).unwrap();
+        let source = fresh.list()[0].clone();
+        fresh
+            .change(
+                SourceAction::Update {
+                    source_id: source.id.clone(),
+                    revision: source.revision,
+                    name: Some("Fresh".into()),
+                    enabled: None,
+                    endpoints: None,
+                    default_route_id: None,
+                },
+                &std::collections::HashSet::new(),
+            )
+            .unwrap();
+        let stale_result = stale.change(
+            SourceAction::Update {
+                source_id: source.id,
+                revision: source.revision,
+                name: Some("Stale".into()),
+                enabled: None,
+                endpoints: None,
+                default_route_id: None,
+            },
+            &std::collections::HashSet::new(),
+        );
+        assert!(matches!(stale_result, Err(Error::Conflict)));
+        let after = ModelSources::open(data).unwrap().list()[0].name.clone();
+        assert_eq!(after, "Fresh");
+    }
 }
