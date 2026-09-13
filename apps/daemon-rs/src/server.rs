@@ -308,6 +308,7 @@ async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, Api
             "events.replay",
             "events.stream",
             "agent.account.api.models",
+            "agent.account.config",
             "agent.api-validation.v1",
             "agent.api-protocols.v1",
             "model.sources.v1",
@@ -923,6 +924,7 @@ fn feature_error(error: Error) -> crate::accounts::models::FeatureError {
         Error::Conflict => FeatureError::new("conflict", "模型源已变更，请刷新后重试"),
         Error::InUse => FeatureError::new("in_use", "模型源仍被账号或会话使用"),
         Error::Busy => FeatureError::new("busy", "服务繁忙，请稍后重试"),
+        Error::Forbidden => FeatureError::new("forbidden", "本机默认账号不支持此操作"),
         Error::Feature(code, message) => FeatureError { code, message },
         Error::Invalid(message) => FeatureError::new("invalid_request", &message),
         other => FeatureError::new("network", &other.to_string()),
@@ -1059,6 +1061,26 @@ async fn account_control_result(
     State(api): State<Api>,
     control: crate::accounts::AccountControl,
 ) -> Response {
+    if let crate::accounts::AccountControl::ConfigGet { .. }
+    | crate::accounts::AccountControl::ConfigSet { .. } = &control
+    {
+        let Ok(_permit) = api.api_features.try_acquire() else {
+            let result = crate::accounts::config::AccountConfigResult::failure(
+                control.request_id(),
+                crate::accounts::models::FeatureError::new("busy", "账号工具繁忙，请稍后重试"),
+            );
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::to_value(result).unwrap_or_else(|_| serde_json::json!({}))),
+            )
+                .into_response();
+        };
+        let result = account_config(&api, &control).await;
+        api.publish();
+        return Json(serde_json::to_value(result).unwrap_or_else(|_| serde_json::json!({})))
+            .into_response();
+    }
+
     if let crate::accounts::AccountControl::ApiModelsGet {
         request_id,
         account_id,
@@ -1182,6 +1204,106 @@ async fn account_control_result(
     match serde_json::to_value(result) {
         Ok(value) => Json(value).into_response(),
         Err(error) => ApiError(error.into()).into_response(),
+    }
+}
+
+async fn account_config(
+    api: &Api,
+    control: &crate::accounts::AccountControl,
+) -> crate::accounts::config::AccountConfigResult {
+    use crate::accounts::config::{self, AccountConfigResult, ConfigTarget};
+    let request_id = control.request_id().to_owned();
+    let account_id = match control.account_id() {
+        Some(id) => id.to_owned(),
+        None => {
+            return AccountConfigResult::failure(
+                &request_id,
+                crate::accounts::models::FeatureError::new("invalid_request", "账号 ID 无效"),
+            );
+        }
+    };
+    let load = async {
+        if account_id == crate::accounts::NATIVE_CLAUDE_ID {
+            return Err(Error::Forbidden);
+        }
+        let data = api.database.directory().to_owned();
+        let id = account_id.clone();
+        let (target, source_bound) = api
+            .database
+            .call(move |store| {
+                let record = store.managed_snapshot_row(&data, &id)?;
+                let active_sessions = store.active_session_count(&id)?;
+                let source_bound =
+                    crate::accounts::sources::ModelSources::open(&data)?.is_bound(&id);
+                Ok((
+                    ConfigTarget {
+                        account_id: record.id,
+                        model: record
+                            .api_profile
+                            .as_ref()
+                            .map(|profile| profile.model.clone()),
+                        model_capabilities: record
+                            .api_profile
+                            .as_ref()
+                            .and_then(|profile| profile.model_capabilities.clone()),
+                        active_sessions,
+                    },
+                    source_bound,
+                ))
+            })
+            .await?;
+        if source_bound && matches!(control, crate::accounts::AccountControl::ConfigSet { .. }) {
+            return Err(Error::Feature(
+                "forbidden".into(),
+                "请在模型源中编辑模型默认参数".into(),
+            ));
+        }
+        let catalog = if target.model.is_none() {
+            api.agents
+                .launch_catalog_for(Some(&target.account_id))
+                .await
+                .ok()
+        } else {
+            None
+        };
+        let data = api.database.directory().to_owned();
+        match control {
+            crate::accounts::AccountControl::ConfigGet { .. } => {
+                api.database
+                    .call(move |_| config::get_config(&data, target, catalog.as_ref()))
+                    .await
+            }
+            crate::accounts::AccountControl::ConfigSet {
+                document_id,
+                revision,
+                content,
+                default_effort,
+                ..
+            } => {
+                let document_id = document_id.clone();
+                let revision = revision.clone();
+                let content = content.clone();
+                let default_effort = default_effort.clone();
+                api.database
+                    .call(move |_| {
+                        config::save_config(
+                            &data,
+                            target,
+                            &document_id,
+                            &revision,
+                            content.as_deref(),
+                            default_effort,
+                            catalog.as_ref(),
+                        )
+                    })
+                    .await
+            }
+            _ => Err(Error::Invalid("unsupported account config action".into())),
+        }
+    };
+    match load.await {
+        Ok(config) => AccountConfigResult::success(&request_id, config),
+        Err(error) => AccountConfigResult::failure(&request_id, feature_error(error)),
     }
 }
 
