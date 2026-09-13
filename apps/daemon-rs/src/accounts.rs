@@ -13,7 +13,7 @@ pub(crate) mod profile;
 pub(crate) mod sources;
 
 pub(crate) use probe::{ApiEngineValidation, ApiValidation};
-pub(crate) use profile::{ApiProfile, ModelCapabilities};
+pub(crate) use profile::{ApiProfile, ModelCapabilities, ModelCapabilitySupport};
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -76,6 +76,8 @@ pub struct NativeAccount {
     pub api_validation: Option<ApiValidation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_engine_validation: Option<ApiEngineValidation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_capability_support: Option<ModelCapabilitySupport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_method: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -557,6 +559,7 @@ async fn managed_row(
         engine: None,
         api_validation: None,
         api_engine_validation: None,
+        model_capability_support: None,
         auth_method: probe.auth_method,
         detail: probe.detail,
         created_at: record.created_at,
@@ -602,10 +605,15 @@ async fn profile_row(
             .ok()
             .and_then(|url| url.host_str().map(str::to_owned))
             .unwrap_or_else(|| profile.base_url.clone());
-        let state = match record.api_validation.as_ref() {
-            Some(validation) if validation.status == "passed" => "协议测试通过",
-            Some(_) => "连接测试失败",
-            None => "已配置，尚未测试连接",
+        let state = match (
+            record.api_engine_validation.as_ref(),
+            record.api_validation.as_ref(),
+        ) {
+            (Some(validation), _) if validation.status == "passed" => "引擎验证通过",
+            (Some(_), _) => "引擎验证失败",
+            (None, Some(validation)) if validation.status == "passed" => "协议测试通过",
+            (None, Some(_)) => "连接测试失败",
+            (None, None) => "已配置，尚未测试连接",
         };
         (
             AccountStatus::SignedIn,
@@ -613,6 +621,10 @@ async fn profile_row(
             Some(format!("{state} · {} · {host}", profile.protocol())),
         )
     };
+    let model_capability_support = record
+        .api_profile
+        .as_ref()
+        .and_then(profile::capability_support);
     Ok(NativeAccount {
         id: record.id,
         agent: crate::protocol::AgentKind::Claude,
@@ -626,6 +638,7 @@ async fn profile_row(
         engine: Some("claude".into()),
         api_validation: record.api_validation,
         api_engine_validation: record.api_engine_validation,
+        model_capability_support,
         auth_method,
         detail,
         created_at: record.created_at,
@@ -700,6 +713,7 @@ async fn snapshot_with(
             engine: None,
             api_validation: None,
             api_engine_validation: None,
+            model_capability_support: None,
             auth_method: probe.auth_method,
             detail: probe.detail,
             created_at: 0,
@@ -719,6 +733,7 @@ async fn snapshot_with(
             engine: None,
             api_validation: None,
             api_engine_validation: None,
+            model_capability_support: None,
             auth_method: codex_probe.auth_method,
             detail: codex_probe.detail,
             created_at: 0,
