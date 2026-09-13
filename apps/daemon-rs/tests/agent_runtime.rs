@@ -310,6 +310,55 @@ else:
     result(error="unknown scenario")
 "#;
 
+const FAKE_CODEX: &str = r#"#!/usr/bin/env python3
+import json, os, sys, time
+
+next_thread = "thread-created"
+turn_id = "turn-native-1"
+seen = []
+
+def emit(payload):
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+def respond(rpc_id, result):
+    emit({"jsonrpc": "2.0", "id": rpc_id, "result": result})
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    rpc_id = msg.get("id")
+    params = msg.get("params") or {}
+    if method == "initialize":
+        respond(rpc_id, {"protocolVersion": 1})
+    elif method == "initialized":
+        pass
+    elif method == "thread/start":
+        with open(os.path.join(os.getcwd(), "thread-start.json"), "w") as log:
+            log.write(json.dumps(params))
+        respond(rpc_id, {"thread": {"id": next_thread}})
+    elif method == "thread/resume":
+        respond(rpc_id, {"thread": {"id": params.get("threadId", "thread-resumed")}})
+    elif method == "turn/start":
+        with open(os.path.join(os.getcwd(), "turn-start.json"), "w") as log:
+            log.write(json.dumps(params))
+        emit({"jsonrpc": "2.0", "method": "turn/started", "params": {"threadId": params.get("threadId"), "turn": {"id": turn_id}}})
+        emit({"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": {"threadId": params.get("threadId"), "itemId": "msg-1", "delta": "hello "}})
+        emit({"jsonrpc": "2.0", "method": "item/reasoning/textDelta", "params": {"threadId": params.get("threadId"), "itemId": "think-1", "delta": "thinking"}})
+        emit({"jsonrpc": "2.0", "method": "item/completed", "params": {"threadId": params.get("threadId"), "item": {"id": "msg-1", "type": "agentMessage", "text": "hello from fake codex"}}})
+        emit({"jsonrpc": "2.0", "method": "thread/tokenUsage/updated", "params": {"threadId": params.get("threadId"), "tokenUsage": {"last": {"inputTokens": 3, "outputTokens": 5}}}})
+        emit({"jsonrpc": "2.0", "method": "turn/completed", "params": {"threadId": params.get("threadId"), "turn": {"id": turn_id, "status": "completed"}}})
+        respond(rpc_id, {"turn": {"id": turn_id}})
+        time.sleep(0.1)
+        break
+    elif method == "model/list":
+        respond(rpc_id, {"data": [{"model": "gpt-test", "displayName": "GPT Test", "supportedReasoningEfforts": ["low", "high"], "isDefault": True}]})
+    else:
+        respond(rpc_id, {})
+"#;
+
 struct Harness {
     _data: TempDir,
     workspace: TempDir,
@@ -353,6 +402,23 @@ impl Harness {
                 model: None,
                 effort: None,
                 account_id: None,
+                resume: None,
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn create_codex(&self) -> prosperod_rs::protocol::SessionHead {
+        self.agents
+            .create(CreateAgentSession {
+                agent: prosperod_rs::protocol::AgentKind::Codex,
+                title: "Codex test".into(),
+                workspace: self.workspace.path().to_str().unwrap().into(),
+                auto_approve: false,
+                mode: Some("plan".into()),
+                model: Some("gpt-test".into()),
+                effort: Some("high".into()),
+                account_id: Some("native-codex".into()),
                 resume: None,
             })
             .await
@@ -406,6 +472,7 @@ impl Drop for Harness {
     fn drop(&mut self) {
         unsafe {
             std::env::remove_var("PROSPERO_CLAUDE_BIN");
+            std::env::remove_var("PROSPERO_CODEX_BIN");
         }
     }
 }
@@ -449,6 +516,65 @@ async fn single_turn_streams_into_timeline() {
         harness.status(&head.id).await,
         prosperod_rs::protocol::SessionStatus::Idle
     );
+}
+
+#[tokio::test]
+async fn codex_structured_turn_streams_into_timeline() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("chat").await;
+    let cli = harness.workspace.path().join("fake-codex.py");
+    std::fs::write(&cli, FAKE_CODEX).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    unsafe {
+        std::env::set_var("PROSPERO_CODEX_BIN", &cli);
+    }
+    let head = harness.create_codex().await;
+    harness
+        .agents
+        .send(&head.id, "hi codex".into(), None, Vec::new())
+        .await
+        .unwrap();
+
+    let records = harness
+        .wait_for(&head.id, |records| {
+            records.iter().any(|(_, body, _)| {
+                matches!(body, TimelineBody::TurnEnd { finish } if finish == "completed")
+            })
+        })
+        .await;
+    assert!(records.iter().any(|(id, body, preview)| matches!(
+        body,
+        TimelineBody::Message {
+            role: prosperod_rs::protocol::MessageRole::User,
+            ..
+        }
+    ) && id.ends_with("-user")
+        && preview == "hi codex"));
+    assert!(records.iter().any(|(_, body, preview)| matches!(
+        body,
+        TimelineBody::Message {
+            role: prosperod_rs::protocol::MessageRole::Assistant,
+            ..
+        }
+    ) && preview == "hello from fake codex"));
+    assert!(records.iter().any(|(_, body, preview)| {
+        matches!(body, TimelineBody::Reasoning) && preview == "thinking"
+    }));
+    assert_eq!(
+        harness.status(&head.id).await,
+        prosperod_rs::protocol::SessionStatus::Idle
+    );
+    let turn_start: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(harness.workspace.path().join("turn-start.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(turn_start["model"], "gpt-test");
+    assert_eq!(turn_start["effort"], "high");
+    assert_eq!(turn_start["collaborationMode"]["mode"], "plan");
 }
 
 #[tokio::test]

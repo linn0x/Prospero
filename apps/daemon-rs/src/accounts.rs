@@ -345,11 +345,13 @@ fn claude_capabilities() -> AccountCapabilities {
 
 fn codex_capabilities() -> AccountCapabilities {
     AccountCapabilities {
-        // Rust has PTY support and native conversation discovery for Codex;
-        // structured Codex is still tracked separately and must not be claimed
-        // here until the app-server adapter lands.
-        session_kinds: vec![crate::protocol::SessionKind::Pty],
-        plan: false,
+        // Rust supports PTY plus the native app-server structured runtime for
+        // Codex's core thread/turn lifecycle.
+        session_kinds: vec![
+            crate::protocol::SessionKind::Pty,
+            crate::protocol::SessionKind::Structured,
+        ],
+        plan: true,
         resume: true,
         model_selection: true,
         reasoning_effort: true,
