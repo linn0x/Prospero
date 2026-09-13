@@ -2,7 +2,7 @@ import type { ContentPage, EventPage, EventQuery, Health, RenameSession, Session
 import type { RustContent } from "../shared/rust-api";
 import type { TimelinePage, TimelineQuery, TimelineLookupResult, TimelineTextQuery, TimelineTextPage } from "@prospero/protocol/rust-daemon";
 import type { CreateTerminal, TerminalPage, TerminalQuery, TerminalSize, TerminalSnapshot } from "@prospero/protocol/rust-daemon";
-import type { AgentSend, AgentControlResult, AgentModeCatalog, AgentModelCatalog, AgentModelSelectionResult, AgentControlsProjection, CreateAgentSession, PermissionDecision, QuestionDecision, SubagentSnapshot, AgentQueue, AgentQueues } from "@prospero/protocol/rust-daemon";
+import type { AgentSend, AgentControlResult, AgentModeCatalog, AgentModelCatalog, AgentModelSelectionResult, AgentControlsProjection, AttachmentChunk, CreateAgentSession, PermissionDecision, QuestionDecision, SubagentSnapshot, AgentQueue, AgentQueues } from "@prospero/protocol/rust-daemon";
 import type { AccountListResult, ConversationSearchResult, LaunchModelCatalog, ResumableConversation, SourceResult, UsageResult } from "@prospero/protocol/rust-daemon";
 import type { FsChunk, FsContent, FsDone, FsListing, FsWritten, GitDiffResult, GitDone, GitHistoryResult, GitStatusResult, SearchResult as RustProjectSearchResult, WorkspaceSummaryResult } from "@prospero/protocol/rust-daemon";
 import type {
@@ -115,6 +115,11 @@ export class RustClient {
   toolOutput(value: string, callId: string, signal: AbortSignal | null = null): Promise<{ output: string, truncated?: boolean }> {
     return this.json(`/v1/agent-sessions/${id(value)}/tool-output?callId=${encodeURIComponent(id(callId))}`, { signal });
   }
+  chatAttachmentChunk(value: string, msgId: string, attachmentId: string, offset: number, length: number, signal: AbortSignal | null = null): Promise<AttachmentChunk> {
+    const params = new URLSearchParams({ msgId: id(msgId), attachmentId: id(attachmentId), offset: String(offset), length: String(length) });
+    return this.json(`/v1/agent-sessions/${id(value)}/attachment?${params}`, { signal, timeoutMs: 30_000 });
+  }
+
   setApprovalPolicy(value: string, policy: string, signal: AbortSignal | null = null): Promise<{ ok: boolean }> {
     return this.json(`/v1/agent-sessions/${id(value)}/approval-policy`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ policy }) });
   }

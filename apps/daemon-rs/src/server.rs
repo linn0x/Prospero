@@ -129,6 +129,7 @@ impl Api {
                 "/v1/agent-sessions/{id}/tool-output",
                 get(agent_tool_output),
             )
+            .route("/v1/agent-sessions/{id}/attachment", get(agent_attachment))
             .route(
                 "/v1/sessions/{id}/workspace-summary",
                 get(workspace_summary),
@@ -1855,6 +1856,36 @@ async fn git_commit(
         op: "commit".into(),
         detail: Some(detail),
     }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AttachmentQuery {
+    msg_id: String,
+    attachment_id: String,
+    offset: u64,
+    length: usize,
+}
+
+async fn agent_attachment(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    query: std::result::Result<Query<AttachmentQuery>, axum::extract::rejection::QueryRejection>,
+) -> std::result::Result<Json<crate::agent::AttachmentChunk>, ApiError> {
+    crate::database::validate_id(&id).map_err(ApiError)?;
+    let Query(query) = query.map_err(|_| Error::Invalid("invalid attachment request".into()))?;
+    let chunk = api
+        .agents
+        .attachment_chunk(
+            &id,
+            &query.msg_id,
+            &query.attachment_id,
+            query.offset,
+            query.length,
+        )
+        .await?
+        .ok_or(Error::NotFound)?;
+    Ok(Json(chunk))
 }
 
 #[derive(Debug, serde::Deserialize)]
