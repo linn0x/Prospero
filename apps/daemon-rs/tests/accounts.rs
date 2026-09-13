@@ -79,8 +79,11 @@ async fn logged_in_native_claude_account_carries_method_and_provider() {
     assert_eq!(codex.agent, AgentKind::Codex);
     assert!(!codex.managed);
     assert!(codex.is_default);
-    assert_eq!(codex.capabilities.session_kinds, vec![SessionKind::Pty]);
-    assert!(codex.capabilities.resume);
+    assert_eq!(
+        codex.capabilities.session_kinds,
+        vec![SessionKind::Pty, SessionKind::Structured]
+    );
+    assert!(codex.capabilities.plan && codex.capabilities.resume);
     let account = result
         .accounts
         .iter()

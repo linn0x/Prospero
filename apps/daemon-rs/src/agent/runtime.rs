@@ -10,6 +10,7 @@ use base64::prelude::BASE64_STANDARD;
 use tokio::sync::{Mutex, MutexGuard, Semaphore, oneshot, watch};
 
 use super::claude::{AdapterEvent, ClaudeTurn, QuestionReply, TurnOptions, spawn_turn};
+use super::codex::CodexTurn;
 use super::store::{ApprovalPolicy, PermissionMode, QueuedRow};
 use super::*;
 use crate::error::{Error, Result};
@@ -103,8 +104,62 @@ fn attachment_refs(attachments: &[AttachmentInput]) -> Vec<MessageAttachment> {
         .collect()
 }
 
+enum Driver {
+    Claude(ClaudeTurn),
+    Codex(CodexTurn),
+}
+
+impl Driver {
+    fn take_events(&mut self) -> Option<tokio::sync::mpsc::Receiver<AdapterEvent>> {
+        match self {
+            Driver::Claude(driver) => driver.take_events(),
+            Driver::Codex(driver) => driver.take_events(),
+        }
+    }
+
+    fn interrupt(&self) {
+        match self {
+            Driver::Claude(driver) => driver.interrupt(),
+            Driver::Codex(driver) => driver.kill(),
+        }
+    }
+
+    async fn steer(&self, text: &str, attachments: &[AttachmentInput]) -> Result<()> {
+        match self {
+            Driver::Claude(driver) => driver.steer(text, attachments).await,
+            Driver::Codex(driver) => {
+                if !attachments.is_empty() {
+                    return Err(Error::Invalid("Codex 同轮引导暂不支持附件".into()));
+                }
+                driver.steer(text).await
+            }
+        }
+    }
+
+    async fn compact(&self) -> Result<()> {
+        match self {
+            Driver::Claude(driver) => driver.compact().await,
+            Driver::Codex(driver) => driver.compact().await,
+        }
+    }
+
+    async fn apply_selection(&self, model: &str, effort: Option<&str>) -> Result<()> {
+        match self {
+            Driver::Claude(driver) => driver.apply_selection(model, effort).await,
+            Driver::Codex(driver) => driver.apply_selection(model, effort).await,
+        }
+    }
+
+    fn kill(&self) {
+        match self {
+            Driver::Claude(driver) => driver.kill(),
+            Driver::Codex(driver) => driver.kill(),
+        }
+    }
+}
+
 struct Handle {
-    driver: Mutex<ClaudeTurn>,
+    driver: Mutex<Driver>,
     replies: Mutex<HashMap<String, oneshot::Sender<bool>>>,
     /// request id -> timeline record id of pending approvals.
     records: Mutex<HashMap<String, String>>,
@@ -211,10 +266,23 @@ impl Agents {
         } else {
             ApprovalPolicy::Manual
         };
-        if input.agent != crate::protocol::AgentKind::Claude {
+        if !matches!(
+            input.agent,
+            crate::protocol::AgentKind::Claude | crate::protocol::AgentKind::Codex
+        ) {
             return Err(Error::Invalid(
                 "Agent 暂未接入 Rust structured runtime".into(),
             ));
+        }
+        if input.agent == crate::protocol::AgentKind::Codex {
+            match input.account_id.as_deref() {
+                None | Some(crate::agent::NATIVE_CODEX_ID) => {}
+                _ => {
+                    return Err(Error::Invalid(
+                        "Rust Codex structured runtime 当前仅支持本机 Codex 账号".into(),
+                    ));
+                }
+            }
         }
         if let Some(fork) = input.resume.as_ref().and_then(|resume| resume.fork) {
             if fork {
@@ -237,6 +305,11 @@ impl Agents {
             account_id: input.account_id,
             resume: input.resume,
         };
+        if create.agent == crate::protocol::AgentKind::Codex
+            && create.account_id.as_deref() == Some(crate::agent::NATIVE_CODEX_ID)
+        {
+            create.account_id = None;
+        }
         let database = self.0.database.clone();
         let data = self.0.database.directory().to_owned();
         let head = self
@@ -527,13 +600,37 @@ impl Agents {
             environment: Self::account_environment(&self.0.database, run.account_id.clone())
                 .await?,
         };
-        let driver = spawn_turn(
-            &workspace,
-            &expanded,
-            &attachments,
-            native_id.as_deref(),
-            &options,
-        )?;
+        let driver = match run.agent {
+            AgentKind::Claude => Driver::Claude(spawn_turn(
+                &workspace,
+                &expanded,
+                &attachments,
+                native_id.as_deref(),
+                &options,
+            )?),
+            AgentKind::Codex => {
+                if !attachments.is_empty() {
+                    return Err(Error::Invalid(
+                        "Codex structured runtime 暂不支持图片附件".into(),
+                    ));
+                }
+                Driver::Codex(
+                    super::codex::spawn_turn(
+                        self.0.database.directory(),
+                        &workspace,
+                        &expanded,
+                        native_id.as_deref(),
+                        &options,
+                    )
+                    .await?,
+                )
+            }
+            _ => {
+                return Err(Error::Invalid(
+                    "Agent 暂未接入 Rust structured runtime".into(),
+                ));
+            }
+        };
         let handle = Arc::new(Handle {
             driver: Mutex::new(driver),
             replies: Mutex::new(HashMap::new()),
@@ -1820,7 +1917,18 @@ impl Agents {
                 });
             }
         }
-        let models = super::claude::fetch_launch_catalog(&environment).await?;
+        let models = if run.agent == AgentKind::Codex {
+            if !environment.is_empty() {
+                return Err(Error::Invalid(
+                    "Rust Codex structured runtime 当前仅支持本机 Codex 账号".into(),
+                ));
+            }
+            super::usage::read_native_codex_models(self.0.database.directory())
+                .await?
+                .models
+        } else {
+            super::claude::fetch_launch_catalog(&environment).await?
+        };
         let current_model = run
             .model
             .or_else(|| models.first().map(|model| model.id.clone()));
@@ -1856,11 +1964,12 @@ impl Agents {
             return Err(Error::Invalid("思考强度无效".into()));
         }
         let id_for_env = id.to_owned();
-        let account_id = self
+        let run = self
             .0
             .database
-            .call(move |store| Ok(store.agent_run(&id_for_env)?.account_id))
+            .call(move |store| store.agent_run(&id_for_env))
             .await?;
+        let account_id = run.account_id.clone();
         let environment = Self::account_environment(&self.0.database, account_id.clone()).await?;
         // Profile sessions expose only the pinned model and never switch.
         if let Some(id) = account_id {
@@ -1876,11 +1985,31 @@ impl Agents {
                 ));
             }
         }
-        let catalog = super::claude::fetch_launch_catalog(&environment).await?;
+        let catalog = if run.agent == AgentKind::Codex {
+            if !environment.is_empty() {
+                return Err(Error::Invalid(
+                    "Rust Codex structured runtime 当前仅支持本机 Codex 账号".into(),
+                ));
+            }
+            super::usage::read_native_codex_models(self.0.database.directory())
+                .await?
+                .models
+        } else {
+            super::claude::fetch_launch_catalog(&environment).await?
+        };
         let selected = catalog
             .iter()
             .find(|entry| entry.id == model)
-            .ok_or_else(|| Error::Invalid(format!("Claude 模型不可用:{model}")))?;
+            .ok_or_else(|| {
+                Error::Invalid(format!(
+                    "{} 模型不可用:{model}",
+                    if run.agent == AgentKind::Codex {
+                        "Codex"
+                    } else {
+                        "Claude"
+                    }
+                ))
+            })?;
         if let Some(effort) = &effort
             && !selected
                 .supported_efforts

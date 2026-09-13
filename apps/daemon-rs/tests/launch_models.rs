@@ -15,6 +15,7 @@ impl Drop for EnvGuard {
     fn drop(&mut self) {
         unsafe {
             std::env::remove_var("PROSPERO_CLAUDE_BIN");
+            std::env::remove_var("PROSPERO_CODEX_BIN");
         }
     }
 }
@@ -89,6 +90,33 @@ sys.exit(0)
     cli
 }
 
+fn write_codex(directory: &std::path::Path) -> std::path::PathBuf {
+    let cli = directory.join("fake-codex-models.py");
+    std::fs::write(
+        &cli,
+        r#"#!/usr/bin/env python3
+import json, sys
+if sys.argv[1:] != ["app-server"]:
+    sys.exit(3)
+for line in sys.stdin:
+    msg = json.loads(line)
+    if "id" not in msg:
+        continue
+    rid = msg["id"]
+    method = msg.get("method")
+    if method == "model/list":
+        result = {"data": [{"model": "gpt-test", "displayName": "GPT Test", "supportedReasoningEfforts": ["low", "high"], "isDefault": True}]}
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({"id": rid, "result": result}) + "\n")
+    sys.stdout.flush()
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    cli
+}
+
 async fn open_db() -> (TempDir, Database) {
     let directory = TempDir::new().unwrap();
     let database = Database::open(directory.path().to_path_buf())
@@ -103,8 +131,10 @@ async fn initialize_handshake_returns_the_model_catalog() {
     let _env = EnvGuard;
     let (directory, _database) = open_db().await;
     let cli = write_cli(directory.path(), "ok");
+    let codex = write_codex(directory.path());
     unsafe {
         std::env::set_var("PROSPERO_CLAUDE_BIN", &cli);
+        std::env::set_var("PROSPERO_CODEX_BIN", &codex);
     }
 
     let catalog = Agents::launch_catalog().await.unwrap();
@@ -156,8 +186,10 @@ async fn http_route_serves_native_and_managed_claude_accounts() {
     let _env = EnvGuard;
     let (directory, database) = open_db().await;
     let cli = write_cli(directory.path(), "ok");
+    let codex = write_codex(directory.path());
     unsafe {
         std::env::set_var("PROSPERO_CLAUDE_BIN", &cli);
+        std::env::set_var("PROSPERO_CODEX_BIN", &codex);
     }
     let api = Api::new(
         database,
@@ -203,10 +235,27 @@ async fn http_route_serves_native_and_managed_claude_accounts() {
         .unwrap();
     assert_eq!(native_default.status(), StatusCode::OK);
 
-    for uri in [
-        "/v1/launch/models?agent=codex&accountId=native-codex",
-        "/v1/launch/models?agent=deepseek",
-    ] {
+    let codex_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/launch/models?agent=codex&accountId=native-codex")
+                .header("authorization", secret)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(codex_response.status(), StatusCode::OK);
+    let codex_body = axum::body::to_bytes(codex_response.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    let codex_value: serde_json::Value = serde_json::from_slice(&codex_body).unwrap();
+    assert_eq!(codex_value["models"][0]["id"], "gpt-test");
+    assert_eq!(codex_value["currentModel"], "gpt-test");
+
+    for uri in ["/v1/launch/models?agent=deepseek"] {
         let response = app
             .clone()
             .oneshot(

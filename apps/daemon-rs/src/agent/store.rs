@@ -200,6 +200,7 @@ impl Store {
         };
         let agent = match row.0.as_str() {
             "claude" => AgentKind::Claude,
+            "codex" => AgentKind::Codex,
             _ => {
                 return Err(Error::Invalid(
                     "Agent 暂未接入 Rust structured runtime".into(),
@@ -285,9 +286,9 @@ impl Store {
             let profile_bound: bool = row.get(5)?;
             Ok(crate::agent::SessionAgentControls {
                 session_id: row.get(0)?,
-                compact: agent == "claude",
-                model: agent == "claude" && !profile_bound,
-                mode: agent == "claude" && !profile_bound,
+                compact: agent == "claude" || agent == "codex",
+                model: (agent == "claude" || agent == "codex") && !profile_bound,
+                mode: (agent == "claude" || agent == "codex") && !profile_bound,
                 current_model: row.get(3)?,
                 current_effort: row.get(4)?,
                 current_mode: Some(mode),
@@ -301,11 +302,6 @@ impl Store {
         let run = self.agent_run(id)?;
         if !run.active {
             return Err(Error::Conflict);
-        }
-        if run.agent != AgentKind::Claude {
-            return Err(Error::Invalid(
-                "Agent 暂未接入 Rust structured runtime".into(),
-            ));
         }
         let turn = run.turn + 1;
         self.connection.execute(
