@@ -17,7 +17,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-use super::claude::{AdapterEvent, TurnOptions};
+use super::claude::{AdapterEvent, QuestionOptionSpec, QuestionReply, QuestionSpec, TurnOptions};
 use super::store::{ApprovalPolicy, PermissionMode};
 use crate::error::{Error, Result};
 
@@ -543,6 +543,10 @@ async fn handle_request(
     writer: &mpsc::Sender<(Value, Option<oneshot::Sender<()>>)>,
     auto_approve: bool,
 ) {
+    if method == "item/tool/requestUserInput" {
+        handle_question_request(rpc_id, params, events, writer).await;
+        return;
+    }
     let Some(kind) = approval_kind(method) else {
         respond_error(writer, rpc_id, -32601, format!("prospero 不支持 {method}")).await;
         return;
@@ -586,6 +590,126 @@ async fn handle_request(
         let allow = reply_rx.await.unwrap_or(false);
         respond_result(&writer, rpc_id, approval_response(kind, allow, &params)).await;
     });
+}
+
+async fn handle_question_request(
+    rpc_id: Value,
+    params: &Value,
+    events: &mpsc::Sender<AdapterEvent>,
+    writer: &mpsc::Sender<(Value, Option<oneshot::Sender<()>>)>,
+) {
+    let item_id = params
+        .get("approvalId")
+        .and_then(Value::as_str)
+        .or_else(|| params.get("itemId").and_then(Value::as_str))
+        .unwrap_or("codex-question")
+        .chars()
+        .take(120)
+        .collect::<String>();
+    let questions = params
+        .get("questions")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .enumerate()
+                .filter_map(|(index, row)| codex_question(row, index))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if questions.is_empty() {
+        respond_result(writer, rpc_id, json!({ "answers": {} })).await;
+        return;
+    }
+    let (reply, reply_rx) = oneshot::channel();
+    if events
+        .send(AdapterEvent::Question {
+            subagent: None,
+            request_id: item_id,
+            questions,
+            reply,
+        })
+        .await
+        .is_err()
+    {
+        respond_result(writer, rpc_id, json!({ "answers": {} })).await;
+        return;
+    }
+    let writer = writer.clone();
+    tokio::spawn(async move {
+        let mut answers = serde_json::Map::new();
+        if let Ok(QuestionReply {
+            answers: native,
+            cancelled: false,
+        }) = reply_rx.await
+        {
+            for (question_id, answer) in native {
+                let values = answer
+                    .split(", ")
+                    .filter(|value| !value.is_empty())
+                    .map(|value| Value::String(value.to_owned()))
+                    .collect::<Vec<_>>();
+                answers.insert(question_id, json!({ "answers": values }));
+            }
+        }
+        respond_result(&writer, rpc_id, json!({ "answers": answers })).await;
+    });
+}
+
+fn codex_question(row: &Value, index: usize) -> Option<QuestionSpec> {
+    let row = row.as_object()?;
+    let id = row
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("question-{}", index + 1));
+    let question = row
+        .get("question")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("请选择")
+        .chars()
+        .take(1000)
+        .collect::<String>();
+    let header = row
+        .get("header")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Agent 提问")
+        .chars()
+        .take(120)
+        .collect::<String>();
+    let options = row
+        .get("options")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|option| {
+                    let option = option.as_object()?;
+                    let label = option.get("label")?.as_str()?.chars().take(200).collect();
+                    let description = option
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .map(|value| value.chars().take(1000).collect());
+                    Some(QuestionOptionSpec {
+                        label,
+                        description,
+                        preview: None,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(QuestionSpec {
+        native_question: id.clone(),
+        id,
+        header,
+        question,
+        options,
+        multi_select: row.get("multiSelect").and_then(Value::as_bool) == Some(true),
+    })
 }
 
 #[derive(Clone, Copy)]
