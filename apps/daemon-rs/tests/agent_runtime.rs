@@ -358,6 +358,11 @@ for line in sys.stdin:
             reply = json.loads(sys.stdin.readline())
             with open(os.path.join(os.getcwd(), "question-response.json"), "w") as log:
                 log.write(json.dumps(reply))
+        if scenario == "codexlegacyapproval":
+            emit({"jsonrpc": "2.0", "id": 42, "method": "execCommandApproval", "params": {"threadId": params.get("threadId"), "callId": "legacy-call", "command": "pwd"}})
+            reply = json.loads(sys.stdin.readline())
+            with open(os.path.join(os.getcwd(), "legacy-approval-response.json"), "w") as log:
+                log.write(json.dumps(reply))
         if scenario == "codexsubagent":
             emit({"jsonrpc": "2.0", "method": "item/started", "params": {"threadId": params.get("threadId"), "item": {"id": "collab-1", "type": "collabAgentToolCall", "receiverThreadId": "sub-thread-1", "prompt": "inspect repo"}}})
             emit({"jsonrpc": "2.0", "method": "thread/started", "params": {"threadId": "sub-thread-1", "thread": {"id": "sub-thread-1", "parentThreadId": params.get("threadId"), "agentNickname": "Scout", "agentRole": "Explore", "preview": "inspect repo", "status": "running"}}})
@@ -816,6 +821,78 @@ async fn codex_collab_agent_events_create_subagent_timeline() {
             .iter()
             .any(|event| event.to_string().contains("subagent says hi"))
     );
+}
+
+#[tokio::test]
+async fn codex_legacy_approval_uses_call_id_and_review_decision_shape() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("codexlegacyapproval").await;
+    let cli = harness.workspace.path().join("fake-codex.py");
+    std::fs::write(&cli, FAKE_CODEX).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    unsafe {
+        std::env::set_var("PROSPERO_CODEX_BIN", &cli);
+    }
+    let head = harness.create_codex().await;
+    harness
+        .agents
+        .send(&head.id, "legacy approval".into(), None, Vec::new())
+        .await
+        .unwrap();
+
+    let records = harness
+        .wait_for(&head.id, |records| {
+            records.iter().any(|(_, body, _)| {
+                matches!(
+                    body,
+                    TimelineBody::PermissionRequest {
+                        resolved: false,
+                        ..
+                    }
+                )
+            })
+        })
+        .await;
+    let request_id = records
+        .iter()
+        .find_map(|(_, body, _)| match body {
+            TimelineBody::PermissionRequest {
+                request_id,
+                resolved: false,
+                ..
+            } => Some(request_id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(request_id, "legacy-call");
+    harness
+        .agents
+        .respond_permission(&head.id, &request_id, true)
+        .await
+        .unwrap();
+    harness
+        .wait_for(&head.id, |records| {
+            records.iter().any(|(_, body, _)| {
+                matches!(body, TimelineBody::TurnEnd { finish } if finish == "completed")
+            })
+        })
+        .await;
+    let response: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            harness
+                .workspace
+                .path()
+                .join("legacy-approval-response.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(response["id"], 42);
+    assert_eq!(response["result"]["decision"], "approved");
 }
 
 #[tokio::test]
