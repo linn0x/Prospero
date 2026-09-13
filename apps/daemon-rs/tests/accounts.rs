@@ -70,8 +70,22 @@ async fn logged_in_native_claude_account_carries_method_and_provider() {
     assert_eq!(result.action, "list");
     assert_eq!(result.request_id, "req-1");
     assert!(result.ok);
-    assert_eq!(result.accounts.len(), 1);
-    let account = &result.accounts[0];
+    assert_eq!(result.accounts.len(), 2);
+    let codex = result
+        .accounts
+        .iter()
+        .find(|account| account.id == "native-codex")
+        .expect("native codex account");
+    assert_eq!(codex.agent, AgentKind::Codex);
+    assert!(!codex.managed);
+    assert!(codex.is_default);
+    assert_eq!(codex.capabilities.session_kinds, vec![SessionKind::Pty]);
+    assert!(codex.capabilities.resume);
+    let account = result
+        .accounts
+        .iter()
+        .find(|account| account.id == NATIVE_CLAUDE_ID)
+        .unwrap();
     assert_eq!(account.id, NATIVE_CLAUDE_ID);
     assert_eq!(account.agent, AgentKind::Claude);
     assert_eq!(account.name, "本机默认");

@@ -27,6 +27,7 @@ use crate::worker::Database;
 
 pub const NATIVE_CLAUDE_ID: &str = "native-claude";
 const NATIVE_NAME: &str = "本机默认";
+const CODEX_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const STATUS_TIMEOUT: Duration = Duration::from_secs(12);
 /// Mirrors the legacy agent-accounts runner output cap.
 const MAX_STATUS_BYTES: usize = 256 * 1024;
@@ -340,6 +341,54 @@ fn claude_capabilities() -> AccountCapabilities {
     }
 }
 
+fn codex_capabilities() -> AccountCapabilities {
+    AccountCapabilities {
+        // Rust has PTY support and native conversation discovery for Codex;
+        // structured Codex is still tracked separately and must not be claimed
+        // here until the app-server adapter lands.
+        session_kinds: vec![crate::protocol::SessionKind::Pty],
+        plan: false,
+        resume: true,
+        model_selection: true,
+        reasoning_effort: true,
+    }
+}
+
+async fn probe_codex_status() -> AuthProbe {
+    let binary = std::env::var("PROSPERO_CODEX_BIN").unwrap_or_else(|_| "codex".into());
+    let mut command = Command::new(binary);
+    command
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = command.output();
+    match tokio::time::timeout(CODEX_STATUS_TIMEOUT, output).await {
+        Ok(Ok(output)) if output.status.success() => {
+            let raw = String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .chars()
+                .take(1000)
+                .collect::<String>();
+            AuthProbe {
+                status: AccountStatus::SignedIn,
+                auth_method: None,
+                detail: (!raw.is_empty()).then_some(raw),
+            }
+        }
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => AuthProbe {
+            status: AccountStatus::Unavailable,
+            detail: Some("未安装 codex".into()),
+            ..Default::default()
+        },
+        _ => AuthProbe {
+            status: AccountStatus::Unavailable,
+            detail: Some("codex CLI 不可用".into()),
+            ..Default::default()
+        },
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct AuthProbe {
     status: AccountStatus,
@@ -574,19 +623,27 @@ async fn snapshot_with(
 ) -> Result<AccountListResult> {
     let db = database.clone();
     let data = database.directory().to_owned();
-    let (managed, native_active, mut managed_active, bindings) = db
+    let (managed, native_active, native_codex_active, mut managed_active, bindings) = db
         .call({
             let data = data.clone();
             move |store| {
                 let managed = store.list_managed_accounts(&data)?;
                 let ids: Vec<String> = managed.iter().map(|record| record.id.clone()).collect();
                 let (native_active, managed_active) = store.account_active_counts(&ids)?;
+                let native_codex_active =
+                    store.native_account_active_count("codex", crate::agent::NATIVE_CODEX_ID)?;
                 let sources = sources::ModelSources::open(&data)?;
                 let bindings = ids
                     .iter()
                     .filter_map(|id| sources.binding_view(id).map(|view| (id.clone(), view)))
                     .collect::<std::collections::HashMap<_, _>>();
-                Ok((managed, native_active, managed_active, bindings))
+                Ok((
+                    managed,
+                    native_active,
+                    native_codex_active,
+                    managed_active,
+                    bindings,
+                ))
             }
         })
         .await?;
@@ -595,26 +652,48 @@ async fn snapshot_with(
     // The isolated runtime probe feeds both the native row and profile rows;
     // run it once per snapshot.
     let runtime_ok = probe::runtime_available().await;
+    let codex_probe = probe_codex_status().await;
     let now = crate::database::now();
-    let mut accounts = vec![NativeAccount {
-        id: NATIVE_CLAUDE_ID.into(),
-        agent: crate::protocol::AgentKind::Claude,
-        name: NATIVE_NAME.into(),
-        managed: false,
-        is_default: !any_default,
-        status: probe.status,
-        capabilities: claude_capabilities(),
-        api_profile: None,
-        model_source: None,
-        engine: None,
-        api_validation: None,
-        api_engine_validation: None,
-        auth_method: probe.auth_method,
-        detail: probe.detail,
-        created_at: 0,
-        updated_at: now,
-        active_sessions: native_active,
-    }];
+    let mut accounts = vec![
+        NativeAccount {
+            id: NATIVE_CLAUDE_ID.into(),
+            agent: crate::protocol::AgentKind::Claude,
+            name: NATIVE_NAME.into(),
+            managed: false,
+            is_default: !any_default,
+            status: probe.status,
+            capabilities: claude_capabilities(),
+            api_profile: None,
+            model_source: None,
+            engine: None,
+            api_validation: None,
+            api_engine_validation: None,
+            auth_method: probe.auth_method,
+            detail: probe.detail,
+            created_at: 0,
+            updated_at: now,
+            active_sessions: native_active,
+        },
+        NativeAccount {
+            id: crate::agent::NATIVE_CODEX_ID.into(),
+            agent: crate::protocol::AgentKind::Codex,
+            name: NATIVE_NAME.into(),
+            managed: false,
+            is_default: true,
+            status: codex_probe.status,
+            capabilities: codex_capabilities(),
+            api_profile: None,
+            model_source: None,
+            engine: None,
+            api_validation: None,
+            api_engine_validation: None,
+            auth_method: codex_probe.auth_method,
+            detail: codex_probe.detail,
+            created_at: 0,
+            updated_at: now,
+            active_sessions: native_codex_active,
+        },
+    ];
     for record in managed {
         let active = managed_active.remove(&record.id).unwrap_or(0);
         if record.api_profile.is_some() {
