@@ -1020,6 +1020,98 @@ async fn timeline_routes_expose_previews_and_generation_checked_body_pages() {
 }
 
 #[tokio::test]
+async fn conversation_search_route_reads_managed_claude_history() {
+    let directory = TempDir::new().unwrap();
+    let database = Database::open(directory.path().to_path_buf())
+        .await
+        .unwrap();
+    let api = Api::new(database.clone(), Token::parse(SECRET.into()).unwrap());
+    let app = api.router();
+    let auth = format!("Bearer {SECRET}");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/accounts")
+                .header("authorization", &auth)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"type":"agent.account.create","requestId":"r1","agent":"claude","name":"Managed"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    let account_id = body["accountId"].as_str().unwrap();
+    let account_root = directory
+        .path()
+        .join("agent-accounts/claude")
+        .join(account_id);
+    let project = account_root.join("projects/repo");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("native-1.jsonl"),
+        r#"{"sessionId":"native-1","cwd":"/repo","timestamp":"2026-09-13T20:00:00Z","type":"user","message":{"content":"Rust daemon resume"}}
+{"customTitle":"Resume parity"}
+"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(project.join("subagents")).unwrap();
+    std::fs::write(
+        project.join("subagents/hidden.jsonl"),
+        r#"{"sessionId":"hidden","type":"user","message":{"content":"Rust daemon resume"}}
+"#,
+    )
+    .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/v1/conversations?agent=claude&accountId={account_id}&query=resume&limit=5"
+                ))
+                .header("authorization", &auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(body["agent"], "claude");
+    let conversations = body["conversations"].as_array().unwrap();
+    assert_eq!(conversations.len(), 1);
+    assert_eq!(conversations[0]["id"], "native-1");
+    assert_eq!(conversations[0]["title"], "Resume parity");
+    assert_eq!(conversations[0]["preview"], "Rust daemon resume");
+    assert_eq!(conversations[0]["cwd"], "/repo");
+
+    let unsupported = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/conversations?agent=codex&query=&limit=5")
+                .header("authorization", &auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unsupported.status(), StatusCode::BAD_REQUEST);
+    database.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn usage_endpoint_matches_legacy_control_envelope() {
     let directory = TempDir::new().unwrap();
     let workspace = TempDir::new().unwrap();
