@@ -354,26 +354,58 @@ fn codex_capabilities() -> AccountCapabilities {
     }
 }
 
-async fn probe_codex_status() -> AuthProbe {
+async fn probe_codex_status(data: &std::path::Path) -> AuthProbe {
+    let (cwd, environment) = match crate::agent::native_codex_environment(data) {
+        Ok(value) => value,
+        Err(_) => {
+            return AuthProbe {
+                status: AccountStatus::Error,
+                detail: Some("无法准备 Codex 账号目录".into()),
+                ..Default::default()
+            };
+        }
+    };
     let binary = std::env::var("PROSPERO_CODEX_BIN").unwrap_or_else(|_| "codex".into());
     let mut command = Command::new(binary);
     command
-        .arg("--version")
+        .args(["login", "status"])
+        .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for (key, value) in environment {
+        command.env(key, value);
+    }
     let output = command.output();
     match tokio::time::timeout(CODEX_STATUS_TIMEOUT, output).await {
-        Ok(Ok(output)) if output.status.success() => {
-            let raw = String::from_utf8_lossy(&output.stdout)
-                .trim()
-                .chars()
-                .take(1000)
-                .collect::<String>();
+        Ok(Ok(output)) => {
+            let raw = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let raw = raw.trim();
+            if raw.is_empty() || raw.to_ascii_lowercase().contains("not logged in") {
+                return AuthProbe::default();
+            }
+            if !output.status.success() {
+                return AuthProbe {
+                    status: AccountStatus::Error,
+                    detail: Some("Codex CLI 无法读取登录状态".into()),
+                    ..Default::default()
+                };
+            }
+            let auth_method = raw
+                .to_ascii_lowercase()
+                .split("logged in")
+                .nth(1)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.chars().take(200).collect::<String>());
             AuthProbe {
                 status: AccountStatus::SignedIn,
-                auth_method: None,
-                detail: (!raw.is_empty()).then_some(raw),
+                auth_method,
+                detail: None,
             }
         }
         Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => AuthProbe {
@@ -382,8 +414,8 @@ async fn probe_codex_status() -> AuthProbe {
             ..Default::default()
         },
         _ => AuthProbe {
-            status: AccountStatus::Unavailable,
-            detail: Some("codex CLI 不可用".into()),
+            status: AccountStatus::Error,
+            detail: Some("Codex CLI 无法读取登录状态".into()),
             ..Default::default()
         },
     }
@@ -652,7 +684,7 @@ async fn snapshot_with(
     // The isolated runtime probe feeds both the native row and profile rows;
     // run it once per snapshot.
     let runtime_ok = probe::runtime_available().await;
-    let codex_probe = probe_codex_status().await;
+    let codex_probe = probe_codex_status(&data).await;
     let now = crate::database::now();
     let mut accounts = vec![
         NativeAccount {

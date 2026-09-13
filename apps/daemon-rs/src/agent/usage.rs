@@ -77,7 +77,7 @@ fn set_private_file_permissions(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn prepare_native_codex_usage_env(data: &Path) -> Result<(PathBuf, Vec<(String, String)>)> {
+pub(crate) fn native_codex_environment(data: &Path) -> Result<(PathBuf, Vec<(String, String)>)> {
     let usage_root = data
         .join("agent-accounts")
         .join("codex-usage")
@@ -228,7 +228,7 @@ impl CodexRpc {
 }
 
 pub(crate) async fn read_native_codex_usage(data: &Path) -> Result<Option<UsageReport>> {
-    let (cwd, env) = prepare_native_codex_usage_env(data)?;
+    let (cwd, env) = native_codex_environment(data)?;
     let mut rpc = CodexRpc::start(cwd, &env).await?;
     let result = async {
         let identity = rpc
@@ -531,7 +531,7 @@ pub(crate) async fn search_native_codex_conversations(
     query: &str,
     limit: usize,
 ) -> Result<Vec<crate::agent::ResumableConversation>> {
-    let (cwd, env) = prepare_native_codex_usage_env(data)?;
+    let (cwd, env) = native_codex_environment(data)?;
     let mut rpc = CodexRpc::start(cwd.clone(), &env).await?;
     let trimmed = query.trim();
     let params = if trimmed.is_empty() {
