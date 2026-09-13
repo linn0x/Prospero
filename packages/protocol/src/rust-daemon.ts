@@ -74,6 +74,7 @@ id: string, title?: string | null,
 fork?: boolean | null, };
 export type ResumableConversation = { id: string, agent: AgentKind, title: string, preview?: string | null, cwd: string, createdAt?: number | null, updatedAt: number, };
 export type ConversationSearchResult = { agent: AgentKind, conversations: Array<ResumableConversation>, };
+export type AttachmentChunk = { mimeType: string, dataB64: string, total: number, eof: boolean, };
 export type LaunchModelInfo = { id: string, label: string, description?: string | null, supportedEfforts: Array<string>, isDefault?: boolean, };
 export type LaunchModelCatalog = { models: Array<LaunchModelInfo>, currentModel: string | null, };
 export type AgentModelSelection = { model: string, effort: string | null, };

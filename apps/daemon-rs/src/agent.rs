@@ -115,6 +115,17 @@ pub struct ConversationSearchResult {
     pub conversations: Vec<ResumableConversation>,
 }
 
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct AttachmentChunk {
+    pub mime_type: String,
+    pub data_b64: String,
+    #[ts(type = "number")]
+    pub total: i64,
+    pub eof: bool,
+}
+
 #[derive(Debug, Deserialize, Serialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentSend {
