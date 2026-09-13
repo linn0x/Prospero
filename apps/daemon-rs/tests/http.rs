@@ -16,6 +16,8 @@ use tempfile::TempDir;
 use tower::ServiceExt;
 
 const SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+#[cfg(unix)]
+static CODEX_ENV_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn fixture() -> (TempDir, Api, String) {
     fixture_workspace("/synthetic").await
@@ -1101,7 +1103,7 @@ async fn conversation_search_route_reads_managed_claude_history() {
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/v1/conversations?agent=codex&query=&limit=5")
+                .uri("/v1/conversations?agent=deepseek&query=&limit=5")
                 .header("authorization", &auth)
                 .body(Body::empty())
                 .unwrap(),
@@ -1167,6 +1169,7 @@ async fn usage_endpoint_matches_legacy_control_envelope() {
 #[cfg(unix)]
 #[tokio::test]
 async fn usage_without_sid_reads_codex_account_limits_from_app_server() {
+    let _guard = CODEX_ENV_SERIAL.lock().await;
     use std::os::unix::fs::PermissionsExt;
 
     struct EnvGuard;
@@ -1174,6 +1177,7 @@ async fn usage_without_sid_reads_codex_account_limits_from_app_server() {
         fn drop(&mut self) {
             unsafe {
                 std::env::remove_var("PROSPERO_CODEX_BIN");
+                std::env::remove_var("CODEX_FAKE_CWD");
             }
         }
     }
@@ -1246,5 +1250,80 @@ for line in sys.stdin:
     assert_eq!(codex["windows"][0]["resetsAt"], "2023-11-14T22:13:20.000Z");
     assert_eq!(codex["windows"][1]["label"], "7 天");
     assert_eq!(codex["dailyUsage"][1]["tokens"], 22);
+    api.database.shutdown().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conversation_search_route_reads_native_codex_threads() {
+    let _guard = CODEX_ENV_SERIAL.lock().await;
+    use std::os::unix::fs::PermissionsExt;
+
+    struct EnvGuard;
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var("PROSPERO_CODEX_BIN");
+                std::env::remove_var("CODEX_FAKE_CWD");
+            }
+        }
+    }
+
+    let (directory, api, _) = fixture().await;
+    let codex = directory.path().join("fake-codex-conversations.py");
+    std::fs::write(
+        &codex,
+        r#"#!/usr/bin/env python3
+import json, sys, tempfile, os
+if sys.argv[1:] != ["app-server"]:
+    sys.exit(3)
+for line in sys.stdin:
+    msg = json.loads(line)
+    if "id" not in msg:
+        continue
+    rid = msg["id"]
+    method = msg.get("method")
+    if method == "initialize":
+        result = {}
+    elif method in ("thread/search", "thread/list"):
+        cwd = os.environ.get("CODEX_FAKE_CWD", tempfile.gettempdir())
+        result = {"data": [
+            {"thread": {"id": "thread-1", "name": "Rust Codex", "preview": "migrate daemon", "cwd": cwd, "createdAt": 1700000000, "updatedAt": 1700000010000}, "snippet": "daemon match"},
+            {"thread": {"id": "ephemeral", "ephemeral": True, "preview": "skip", "cwd": cwd, "updatedAt": 1700000020000}},
+            {"thread": {"id": "child", "parentThreadId": "thread-1", "preview": "skip", "cwd": cwd, "updatedAt": 1700000030000}}
+        ]}
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({"id": rid, "result": result}) + "\n")
+    sys.stdout.flush()
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _env = EnvGuard;
+    unsafe {
+        std::env::set_var("PROSPERO_CODEX_BIN", &codex);
+        std::env::set_var("CODEX_FAKE_CWD", directory.path());
+    }
+
+    let response = api
+        .router()
+        .oneshot(
+            request("/v1/conversations?agent=codex&query=daemon&limit=10")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let result = body(response).await;
+    assert_eq!(result["agent"], "codex");
+    let conversations = result["conversations"].as_array().unwrap();
+    assert_eq!(conversations.len(), 1);
+    assert_eq!(conversations[0]["id"], "thread-1");
+    assert_eq!(conversations[0]["title"], "Rust Codex");
+    assert_eq!(conversations[0]["preview"], "daemon match");
+    assert_eq!(conversations[0]["createdAt"], 1_700_000_000_000i64);
+    assert_eq!(conversations[0]["updatedAt"], 1_700_000_010_000i64);
     api.database.shutdown().await.unwrap();
 }
