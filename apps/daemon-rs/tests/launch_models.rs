@@ -266,6 +266,7 @@ async fn session_models_and_controls_routes_serve_persisted_selection() {
     let head = api
         .agents
         .create(CreateAgentSession {
+            agent: prosperod_rs::protocol::AgentKind::Claude,
             title: "Pick".into(),
             workspace: workspace.into(),
             auto_approve: false,

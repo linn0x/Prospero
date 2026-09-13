@@ -345,6 +345,7 @@ impl Harness {
     async fn create(&self) -> prosperod_rs::protocol::SessionHead {
         self.agents
             .create(CreateAgentSession {
+                agent: prosperod_rs::protocol::AgentKind::Claude,
                 title: "Agent test".into(),
                 workspace: self.workspace.path().to_str().unwrap().into(),
                 auto_approve: false,
@@ -900,6 +901,7 @@ async fn recovery_archives_active_run_without_replaying_turn() {
     let agents = Agents::new(database.clone());
     let head = agents
         .create(CreateAgentSession {
+            agent: prosperod_rs::protocol::AgentKind::Claude,
             title: "Recovery".into(),
             workspace: workspace.path().to_str().unwrap().into(),
             auto_approve: false,
@@ -1023,6 +1025,7 @@ async fn launch_model_and_effort_are_passed_on_every_turn() {
     let head = harness
         .agents
         .create(CreateAgentSession {
+            agent: prosperod_rs::protocol::AgentKind::Claude,
             title: "Model pick".into(),
             workspace: harness.workspace.path().to_str().unwrap().into(),
             auto_approve: false,
@@ -1097,6 +1100,7 @@ async fn invalid_launch_selection_is_rejected() {
         let result = harness
             .agents
             .create(CreateAgentSession {
+                agent: prosperod_rs::protocol::AgentKind::Claude,
                 title: "Bad selection".into(),
                 workspace: harness.workspace.path().to_str().unwrap().into(),
                 auto_approve: false,
@@ -1116,6 +1120,7 @@ async fn in_session_models_combines_catalog_with_persisted_selection() {
     let picked = harness
         .agents
         .create(CreateAgentSession {
+            agent: prosperod_rs::protocol::AgentKind::Claude,
             title: "Picked".into(),
             workspace: harness.workspace.path().to_str().unwrap().into(),
             auto_approve: false,

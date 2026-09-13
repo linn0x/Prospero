@@ -42,6 +42,7 @@ impl Harness {
         let agents = Agents::new(database.clone());
         let head = agents
             .create(CreateAgentSession {
+                agent: prosperod_rs::protocol::AgentKind::Claude,
                 title: "Real CLI acceptance".into(),
                 workspace: workspace.path().to_str().unwrap().into(),
                 auto_approve,
