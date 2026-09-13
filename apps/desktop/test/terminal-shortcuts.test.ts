@@ -4,6 +4,7 @@ import {
   getTerminalEmptyFrameDelay,
   terminalBootstrapCursor,
   terminalClipboardAction,
+  terminalInputShouldScrollToBottom,
   terminalSessionIsReadOnly,
   terminalShortcutAction,
 } from "../src/renderer/src/TerminalPane";
@@ -30,6 +31,14 @@ describe("terminal clipboard shortcuts", () => {
     expect(terminalBootstrapCursor()).toBe(0);
     expect(terminalBootstrapCursor(42)).toBe(42);
     expect(terminalBootstrapCursor(-1)).toBe(0);
+  });
+
+
+  it("does not snap tmux mouse wheel input back to the bottom", () => {
+    expect(terminalInputShouldScrollToBottom("\x1b[<64;10;20M")).toBe(false);
+    expect(terminalInputShouldScrollToBottom("\x1b[M`12")).toBe(false);
+    expect(terminalInputShouldScrollToBottom("a")).toBe(true);
+    expect(terminalInputShouldScrollToBottom("\x1b[<64;10;20Ma")).toBe(true);
   });
 
   it("keeps ended terminals read-only while draining accepted input", () => {
