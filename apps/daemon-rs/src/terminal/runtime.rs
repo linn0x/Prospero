@@ -28,7 +28,7 @@ pub(crate) struct ProgramSpec {
     pub program: String,
     pub args: Vec<String>,
     pub environment: Vec<(String, String)>,
-    pub account_id: String,
+    pub account_id: Option<String>,
 }
 
 impl Terminals {
@@ -73,12 +73,14 @@ impl Terminals {
             title,
             workspace: home.to_string_lossy().into_owned(),
             size,
+            agent: Some(crate::protocol::AgentKind::Claude),
+            command: None,
         };
         let spec = ProgramSpec {
             program,
             args: vec!["setup-token".into()],
             environment,
-            account_id: account_id.to_owned(),
+            account_id: Some(account_id.to_owned()),
         };
         self.create_with(input, Some(spec)).await
     }
@@ -96,7 +98,8 @@ impl Terminals {
     }
 
     pub async fn create(&self, input: CreateTerminal) -> Result<SessionHead> {
-        self.create_with(input, None).await
+        let spec = pty_program_for(&input)?;
+        self.create_with(input, spec).await
     }
 
     /// A non-shell PTY (the managed-account login flow): runs an explicit
@@ -262,7 +265,7 @@ impl Terminals {
         }
         let size = input.size;
         let guard = self.0.guard.clone();
-        let account_id = spec.as_ref().map(|spec| spec.account_id.clone());
+        let account_id = spec.as_ref().and_then(|spec| spec.account_id.clone());
         let head = self
             .0
             .database
@@ -455,6 +458,70 @@ impl Terminals {
 }
 
 #[cfg(unix)]
+fn shell_command(command: &str) -> Result<ProgramSpec> {
+    if command.len() > 2000 || command.contains('\0') || command.trim().is_empty() {
+        return Err(Error::Invalid("invalid terminal command".into()));
+    }
+    let shell = login_shell(std::env::var_os("SHELL"))
+        .into_string()
+        .map_err(|_| Error::Invalid("shell path must be Unicode".into()))?;
+    Ok(ProgramSpec {
+        program: shell,
+        args: vec!["-c".into(), command.to_owned()],
+        environment: Vec::new(),
+        account_id: None,
+    })
+}
+
+fn pty_program_for(input: &CreateTerminal) -> Result<Option<ProgramSpec>> {
+    let Some(agent) = input.agent else {
+        return Ok(None);
+    };
+    match (agent, input.command.as_deref()) {
+        (crate::protocol::AgentKind::Shell, None) => Ok(None),
+        (crate::protocol::AgentKind::Shell | crate::protocol::AgentKind::Custom, Some(command)) => {
+            Ok(Some(shell_command(command)?))
+        }
+        (crate::protocol::AgentKind::Custom, None) => {
+            Err(Error::Invalid("custom agent requires a command".into()))
+        }
+        (_, Some(command)) => Ok(Some(shell_command(command)?)),
+        (crate::protocol::AgentKind::Claude, None) => Ok(Some(ProgramSpec {
+            program: "claude".into(),
+            args: vec!["--dangerously-skip-permissions".into()],
+            environment: Vec::new(),
+            account_id: None,
+        })),
+        (crate::protocol::AgentKind::Codex, None) => Ok(Some(ProgramSpec {
+            program: "codex".into(),
+            args: vec!["--dangerously-bypass-approvals-and-sandbox".into()],
+            environment: Vec::new(),
+            account_id: None,
+        })),
+        (crate::protocol::AgentKind::Opencode, None) => Ok(Some(ProgramSpec {
+            program: "opencode".into(),
+            args: Vec::new(),
+            environment: Vec::new(),
+            account_id: None,
+        })),
+        (crate::protocol::AgentKind::Grok, None) => Ok(Some(ProgramSpec {
+            program: "grok".into(),
+            args: Vec::new(),
+            environment: Vec::new(),
+            account_id: None,
+        })),
+        (crate::protocol::AgentKind::Trae, None) => Ok(Some(ProgramSpec {
+            program: "trae-cli".into(),
+            args: vec!["interactive".into()],
+            environment: Vec::new(),
+            account_id: None,
+        })),
+        (crate::protocol::AgentKind::Deepseek, None) => Err(Error::Invalid(
+            "DeepSeek Harness only supports structured sessions".into(),
+        )),
+    }
+}
+
 fn login_shell(shell: Option<OsString>) -> OsString {
     let Some(shell) = shell else {
         return "/bin/sh".into();

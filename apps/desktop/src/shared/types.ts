@@ -231,7 +231,7 @@ export type DesktopSnapshotPatch = Omit<Partial<DesktopSnapshot>, "daemon" | "or
 
 export type SessionCreateInput = {
   cwd: string;
-  agent: "codex" | "claude" | "deepseek" | "opencode" | "grok" | "trae" | "shell";
+  agent: "codex" | "claude" | "deepseek" | "opencode" | "grok" | "trae" | "shell" | "custom";
   kind: "structured" | "pty";
   approvalPolicy: "strict" | "standard" | "yolo";
   mode?: "default" | "plan";

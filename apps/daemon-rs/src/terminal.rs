@@ -37,6 +37,10 @@ pub struct CreateTerminal {
     pub title: String,
     pub workspace: String,
     pub size: TerminalSize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<crate::protocol::AgentKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
