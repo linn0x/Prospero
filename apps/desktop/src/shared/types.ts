@@ -1,7 +1,7 @@
 import type { WindowMenuAction, WindowMenuRequest } from "./window-menu";
 import type { EventPage, TimelinePage, TimelineQuery, TimelineLookupResult, TimelineTextQuery, TimelineTextPage } from "@prospero/protocol/rust-daemon";
 import type { AgentAccountConfig, AgentAccountFeatureError, AgentApiCatalogModel, AgentReasoningEffort, C2SAgentAccountApiModelsGet, C2SAgentAccountConfigSet, S2CAgentAccountApiModelsResult, S2CAgentAccountConfigResult } from "@prospero/protocol";
-import type { ModelSource, ModelSourceAction, S2CModelSourceResult } from "@prospero/protocol";
+import type { ModelSource, ModelSourceAction, ResumableConversation, S2CModelSourceResult } from "@prospero/protocol";
 export type { ModelSource, ModelSourceRoute, ModelSourceAction, ModelSourceMigration, ModelSourceBinding, S2CModelSourceResult } from "@prospero/protocol";
 
 export type { AgentAccountConfig, AgentAccountFeatureError, AgentApiCatalogModel, AgentReasoningEffort };
@@ -239,6 +239,7 @@ export type SessionCreateInput = {
   effort?: string | undefined;
   command?: string;
   accountId?: string | undefined;
+  resume?: Pick<ResumableConversation, "id" | "title"> | { id: string; title?: string; fork?: true } | undefined;
   cols?: number;
   rows?: number;
 };
