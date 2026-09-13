@@ -5,6 +5,8 @@ import {
   terminalBootstrapCursor,
   terminalClipboardAction,
   terminalInputShouldScrollToBottom,
+  terminalNormalizeProposedSize,
+  terminalProposedSizeDiffers,
   terminalSessionIsReadOnly,
   terminalShortcutAction,
 } from "../src/renderer/src/TerminalPane";
@@ -33,6 +35,14 @@ describe("terminal clipboard shortcuts", () => {
     expect(terminalBootstrapCursor(-1)).toBe(0);
   });
 
+  it("detects stale terminal geometry before tmux wheel handling", () => {
+    expect(terminalNormalizeProposedSize(undefined)).toBeUndefined();
+    expect(terminalNormalizeProposedSize({ cols: 1, rows: 1 })).toEqual({ cols: 20, rows: 5 });
+    expect(terminalProposedSizeDiffers(120, 40, undefined)).toBe(false);
+    expect(terminalProposedSizeDiffers(120, 40, { cols: 120, rows: 40 })).toBe(false);
+    expect(terminalProposedSizeDiffers(120, 40, { cols: 121, rows: 40 })).toBe(true);
+    expect(terminalProposedSizeDiffers(20, 5, { cols: 1, rows: 1 })).toBe(false);
+  });
 
   it("does not snap tmux mouse wheel input back to the bottom", () => {
     expect(terminalInputShouldScrollToBottom("\x1b[<64;10;20M")).toBe(false);
