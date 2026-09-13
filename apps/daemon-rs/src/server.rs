@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -137,6 +137,7 @@ impl Api {
             .route("/v1/sessions", get(sessions))
             .route("/v1/skills", get(list_skills_route))
             .route("/v1/accounts", post(accounts_route))
+            .route("/v1/model-sources", post(model_sources_route))
             .route("/v1/launch/models", get(launch_models))
             .route("/v1/sessions/summary", get(summary))
             .route("/v1/sessions/lookup", post(lookup))
@@ -229,6 +230,12 @@ impl IntoResponse for ApiError {
             Error::Unauthorized => StatusCode::UNAUTHORIZED,
             Error::Forbidden => StatusCode::FORBIDDEN,
             Error::Invalid(_) => StatusCode::BAD_REQUEST,
+            Error::Feature(code, _) if matches!(code.as_str(), "busy" | "conflict" | "in_use") => {
+                StatusCode::CONFLICT
+            }
+            Error::Feature(code, _) if code == "not_found" => StatusCode::NOT_FOUND,
+            Error::Feature(code, _) if code == "unauthorized" => StatusCode::UNAUTHORIZED,
+            Error::Feature(_, _) => StatusCode::BAD_REQUEST,
             Error::NotFound => StatusCode::NOT_FOUND,
             Error::Conflict
             | Error::AlreadyRunning
@@ -302,6 +309,7 @@ async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, Api
             "agent.account.api.models",
             "agent.api-validation.v1",
             "agent.api-protocols.v1",
+            "model.sources.v1",
         ]
         .map(str::to_owned)
         .to_vec(),
@@ -426,6 +434,246 @@ async fn list_skills_route(
 }
 
 // ── Accounts (Stage 8: discovery + managed accounts) ─────────────────────
+
+async fn model_sources_route(
+    State(api): State<Api>,
+    body: std::result::Result<
+        Json<crate::accounts::sources::SourceControl>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> Response {
+    use crate::accounts::models::{FeatureError, fetch_models};
+    use crate::accounts::sources::{BindOutcome, SourceAction, SourceResult};
+
+    let Json(control) = match body {
+        Ok(body) => body,
+        Err(_) => {
+            return ApiError(Error::Invalid("invalid model source request".into())).into_response();
+        }
+    };
+    if control.kind != "model.source.action"
+        || control.request_id.trim().is_empty()
+        || control.request_id.len() > 100
+    {
+        return ApiError(Error::Invalid("invalid model source request".into())).into_response();
+    }
+    let request_id = control.request_id.clone();
+    match control.action {
+        SourceAction::List => {
+            let data = api.database.directory().to_owned();
+            let sources = match api
+                .call(move |_| {
+                    crate::accounts::sources::ModelSources::open(&data)
+                        .map(|sources| sources.list())
+                })
+                .await
+            {
+                Ok(sources) => sources,
+                Err(error) => return ApiError(error).into_response(),
+            };
+            let mut result = SourceResult::success(&request_id);
+            result.sources = Some(sources);
+            Json(result).into_response()
+        }
+        SourceAction::Models {
+            source_id,
+            revision,
+            protocol,
+            credential_id,
+            ..
+        } => {
+            let Ok(_permit) = api.api_features.try_acquire() else {
+                return Json(SourceResult::failure(
+                    &request_id,
+                    FeatureError::new("busy", "账号工具繁忙，请稍后重试"),
+                ))
+                .into_response();
+            };
+            let data = api.database.directory().to_owned();
+            let target = match api
+                .call(move |_| {
+                    let sources = crate::accounts::sources::ModelSources::open(&data)?;
+                    sources.models_target(&source_id, revision, &protocol, &credential_id)
+                })
+                .await
+            {
+                Ok(target) => target,
+                Err(error) => {
+                    return Json(SourceResult::failure(&request_id, feature_error(error)))
+                        .into_response();
+                }
+            };
+            let headers = target.0.headers.clone().unwrap_or_else(BTreeMap::new);
+            let models = fetch_models(&target.0.base_url, &target.1, &headers).await;
+            match models {
+                Ok(models) => {
+                    let mut result = SourceResult::success(&request_id);
+                    result.models = Some(models);
+                    Json(result).into_response()
+                }
+                Err(error) => Json(SourceResult::failure(&request_id, error)).into_response(),
+            }
+        }
+        SourceAction::Bind {
+            source_id,
+            route_id,
+            revision,
+        } => {
+            let data = api.database.directory().to_owned();
+            let outcome = match api
+                .database
+                .call(move |store| {
+                    let accounts = store.list_managed_accounts(&data)?;
+                    let known = accounts
+                        .into_iter()
+                        .map(|account| account.id)
+                        .collect::<HashSet<_>>();
+                    let mut sources = crate::accounts::sources::ModelSources::open(&data)?;
+                    let outcome = sources.bind(&source_id, &route_id, revision, &known)?;
+                    if let BindOutcome::Created {
+                        account_id,
+                        profile,
+                        name,
+                        secret,
+                    } = &outcome
+                    {
+                        store.insert_api_profile_account_with_id(
+                            &data, account_id, name, profile, secret,
+                        )?;
+                    }
+                    Ok(outcome)
+                })
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => return ApiError(error).into_response(),
+            };
+            let account_id = match outcome {
+                BindOutcome::Existing(id) => id,
+                BindOutcome::Created { account_id, .. } => account_id,
+            };
+            api.publish();
+            let accounts =
+                match crate::accounts::snapshot(&api.database, &request_id, "model_source_bind")
+                    .await
+                {
+                    Ok(result) => result.accounts,
+                    Err(error) => return ApiError(error).into_response(),
+                };
+            let data = api.database.directory().to_owned();
+            let sources = match api
+                .call(move |_| {
+                    crate::accounts::sources::ModelSources::open(&data)
+                        .map(|sources| sources.list())
+                })
+                .await
+            {
+                Ok(sources) => sources,
+                Err(error) => return ApiError(error).into_response(),
+            };
+            let mut result = SourceResult::success(&request_id);
+            result.account_id = Some(account_id);
+            result.accounts = Some(accounts);
+            result.sources = Some(sources);
+            Json(result).into_response()
+        }
+        action @ (SourceAction::Create { .. }
+        | SourceAction::Update { .. }
+        | SourceAction::CredentialSet { .. }
+        | SourceAction::CredentialRemove { .. }
+        | SourceAction::RoutesSet { .. }
+        | SourceAction::RouteRemove { .. }
+        | SourceAction::Delete { .. }) => {
+            let data = api.database.directory().to_owned();
+            let sources = match api
+                .database
+                .call(move |store| {
+                    let accounts = store.list_managed_accounts(&data)?;
+                    let known = accounts
+                        .into_iter()
+                        .map(|account| account.id)
+                        .collect::<HashSet<_>>();
+                    let mut sources = crate::accounts::sources::ModelSources::open(&data)?;
+                    match action {
+                        SourceAction::Create { .. } => {
+                            sources.create(action)?;
+                        }
+                        _ => {
+                            let _ = sources.change(action, &known)?;
+                        }
+                    }
+                    Ok(sources.list())
+                })
+                .await
+            {
+                Ok(sources) => sources,
+                Err(error) => return ApiError(error).into_response(),
+            };
+            api.publish();
+            let mut result = SourceResult::success(&request_id);
+            result.sources = Some(sources);
+            Json(result).into_response()
+        }
+        SourceAction::MigrationPreview => {
+            let mut result = SourceResult::success(&request_id);
+            result.migrations = Some(Vec::new());
+            result.skipped_accounts = Some(0);
+            Json(result).into_response()
+        }
+        SourceAction::MigrationRollback { account_ids } => {
+            let data = api.database.directory().to_owned();
+            let sources = match api
+                .database
+                .call(move |_| {
+                    let mut sources = crate::accounts::sources::ModelSources::open(&data)?;
+                    sources.unbind(&account_ids)?;
+                    Ok(sources.list())
+                })
+                .await
+            {
+                Ok(sources) => sources,
+                Err(error) => return ApiError(error).into_response(),
+            };
+            api.publish();
+            let accounts = match crate::accounts::snapshot(
+                &api.database,
+                &request_id,
+                "model_source_rollback",
+            )
+            .await
+            {
+                Ok(result) => result.accounts,
+                Err(error) => return ApiError(error).into_response(),
+            };
+            let mut result = SourceResult::success(&request_id);
+            result.sources = Some(sources);
+            result.accounts = Some(accounts);
+            Json(result).into_response()
+        }
+        SourceAction::MigrationApply {
+            _migration_id,
+            _name,
+            _target,
+        } => Json(SourceResult::failure(
+            &request_id,
+            FeatureError::new("unsupported", "Profile 迁移尚未接入 Rust daemon"),
+        ))
+        .into_response(),
+    }
+}
+
+fn feature_error(error: Error) -> crate::accounts::models::FeatureError {
+    use crate::accounts::models::FeatureError;
+    match error {
+        Error::NotFound => FeatureError::new("not_found", "模型源不存在"),
+        Error::Conflict => FeatureError::new("conflict", "模型源已变更，请刷新后重试"),
+        Error::InUse => FeatureError::new("in_use", "模型源仍被账号或会话使用"),
+        Error::Busy => FeatureError::new("busy", "服务繁忙，请稍后重试"),
+        Error::Feature(code, message) => FeatureError { code, message },
+        Error::Invalid(message) => FeatureError::new("invalid_request", &message),
+        other => FeatureError::new("network", &other.to_string()),
+    }
+}
 
 /// Tag-dispatched account control. Managed metadata mutations run through the
 /// database queue; login spawns an isolated `claude setup-token` PTY; the

@@ -37,6 +37,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("stored data is invalid")]
     Json(#[from] serde_json::Error),
+    #[error("{1}")]
+    Feature(String, String),
 }
 
 #[derive(Debug, Serialize, TS)]
@@ -63,6 +65,7 @@ impl Error {
             Self::Closed => ("unavailable", true),
             Self::AlreadyRunning => ("already_running", false),
             Self::Schema => ("unsupported_schema", false),
+            Self::Feature(code, _) => (code.as_str(), false),
             Self::Storage(_) | Self::Io(_) | Self::Json(_) => ("storage", false),
         };
         ErrorBody {
