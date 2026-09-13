@@ -456,3 +456,88 @@ async fn usage_endpoint_matches_legacy_control_envelope() {
     assert!(usage["accounts"].is_array());
     database.shutdown().await.unwrap();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn usage_without_sid_reads_codex_account_limits_from_app_server() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct EnvGuard;
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var("PROSPERO_CODEX_BIN");
+            }
+        }
+    }
+
+    let (directory, api, _) = fixture().await;
+    let codex = directory.path().join("fake-codex.py");
+    std::fs::write(
+        &codex,
+        r#"#!/usr/bin/env python3
+import json, sys
+if sys.argv[1:] != ["app-server"]:
+    sys.exit(3)
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    if "id" not in msg:
+        continue
+    rid = msg["id"]
+    if method == "initialize":
+        result = {}
+    elif method == "account/read":
+        result = {"account": {"id": "acct"}}
+    elif method == "account/rateLimits/read":
+        result = {"rateLimitsByLimitId": {"codex": {
+            "planType": "pro",
+            "primary": {"usedPercent": 42.5, "windowDurationMins": 300, "resetsAt": 1700000000},
+            "secondary": {"usedPercent": 9, "windowDurationMins": 10080},
+            "credits": {"unlimited": False, "balance": "12.34"},
+            "individualLimit": {"limit": "20", "used": "5", "remainingPercent": 75}
+        }}}
+    elif method == "account/usage/read":
+        result = {"summary": {"lifetimeTokens": "1234"}, "dailyUsageBuckets": [
+            {"startDate": "2026-09-12", "tokens": 10},
+            {"startDate": "2026-09-13", "tokens": "22"}
+        ]}
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({"id": rid, "result": result}) + "\n")
+    sys.stdout.flush()
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _env = EnvGuard;
+    unsafe {
+        std::env::set_var("PROSPERO_CODEX_BIN", &codex);
+    }
+
+    let response = api
+        .router()
+        .oneshot(request("/v1/usage").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let usage = body(response).await;
+    let accounts = usage["accounts"].as_array().unwrap();
+    let codex = accounts
+        .iter()
+        .find(|account| account["accountId"] == "native-codex")
+        .expect("native codex usage account");
+    assert_eq!(codex["agent"], "codex");
+    assert_eq!(codex["source"], "subscription");
+    assert_eq!(codex["available"], true);
+    assert_eq!(codex["subscription"], "pro");
+    assert_eq!(codex["lifetimeTokens"], 1234);
+    assert_eq!(codex["creditsBalance"], "12.34");
+    assert_eq!(codex["spendRemainingPercent"], 75.0);
+    assert_eq!(codex["windows"][0]["label"], "5 小时");
+    assert_eq!(codex["windows"][0]["utilization"], 42.5);
+    assert_eq!(codex["windows"][0]["resetsAt"], "2023-11-14T22:13:20.000Z");
+    assert_eq!(codex["windows"][1]["label"], "7 天");
+    assert_eq!(codex["dailyUsage"][1]["tokens"], 22);
+    api.database.shutdown().await.unwrap();
+}

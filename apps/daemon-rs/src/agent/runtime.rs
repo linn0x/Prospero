@@ -1477,6 +1477,68 @@ impl Agents {
                 reason,
             });
         }
+        match super::usage::read_native_codex_usage(self.0.database.directory()).await {
+            Ok(Some(report)) => {
+                accounts.push(UsageAccount {
+                    agent: crate::protocol::AgentKind::Codex,
+                    account_id: Some(super::usage::NATIVE_CODEX_ID.into()),
+                    account_name: Some("本机默认".into()),
+                    source: Some("subscription".into()),
+                    available: true,
+                    reason: if report.windows.is_empty() {
+                        Some("这个后端不提供套餐限流窗口。".into())
+                    } else {
+                        None
+                    },
+                    report,
+                });
+            }
+            Ok(None) => {
+                accounts.push(UsageAccount {
+                    agent: crate::protocol::AgentKind::Codex,
+                    account_id: Some(super::usage::NATIVE_CODEX_ID.into()),
+                    account_name: Some("本机默认".into()),
+                    source: Some("unknown".into()),
+                    available: false,
+                    report: UsageReport {
+                        windows: Vec::new(),
+                        ..Default::default()
+                    },
+                    reason: Some("暂时读不到账号额度，请确认 Codex CLI 已登录并刷新。".into()),
+                });
+            }
+            Err(Error::Feature(code, _)) if code == "agent_unavailable" => {}
+            Err(_) => {
+                accounts.push(UsageAccount {
+                    agent: crate::protocol::AgentKind::Codex,
+                    account_id: Some(super::usage::NATIVE_CODEX_ID.into()),
+                    account_name: Some("本机默认".into()),
+                    source: Some("unknown".into()),
+                    available: false,
+                    report: UsageReport {
+                        windows: Vec::new(),
+                        ..Default::default()
+                    },
+                    reason: Some("暂时读不到账号额度，请确认 Codex CLI 已登录并刷新。".into()),
+                });
+            }
+        }
+        accounts.sort_by(|a, b| {
+            let score = |account: &UsageAccount| -> f64 {
+                if !account.available {
+                    return -1.0;
+                }
+                account
+                    .report
+                    .windows
+                    .iter()
+                    .map(|window| window.utilization)
+                    .fold(0.0, f64::max)
+            };
+            score(b)
+                .partial_cmp(&score(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         Ok(accounts)
     }
 
