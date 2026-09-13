@@ -1,4 +1,4 @@
-import type { ContentPage, EventPage, EventQuery, Health, RenameSession, SessionHead, SessionLookupResult, SessionPage, SessionQuery, SessionSummary, WorkspacePage, WorkspaceQuery } from "@prospero/protocol/rust-daemon";
+import type { ContentPage, EventPage, EventQuery, Health, RenameSession, SessionHead, SessionLookupResult, SessionPage, SessionQuery, SessionSummary, WorkspacePage, WorkspaceQuery, UsageResult } from "@prospero/protocol/rust-daemon";
 
 export type RustContent = { bytes: Uint8Array; nextOffset: number };
 export type RustDesktopApi = {
@@ -13,4 +13,5 @@ export type RustDesktopApi = {
   events(query: EventQuery): Promise<EventPage>;
   contents(id: string, cursor?: string): Promise<ContentPage>;
   content(id: string, content: string, offset: number): Promise<RustContent>;
+  usage(sid?: string): Promise<UsageResult>;
 };

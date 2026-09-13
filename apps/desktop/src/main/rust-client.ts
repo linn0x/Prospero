@@ -3,7 +3,7 @@ import type { RustContent } from "../shared/rust-api";
 import type { TimelinePage, TimelineQuery, TimelineLookupResult, TimelineTextQuery, TimelineTextPage } from "@prospero/protocol/rust-daemon";
 import type { CreateTerminal, TerminalPage, TerminalQuery, TerminalSize, TerminalSnapshot } from "@prospero/protocol/rust-daemon";
 import type { AgentSend, AgentModeCatalog, AgentModelCatalog, AgentModelSelectionResult, AgentControlsProjection, CreateAgentSession, PermissionDecision, QuestionDecision, SubagentSnapshot, AgentQueue, AgentQueues } from "@prospero/protocol/rust-daemon";
-import type { AccountListResult, LaunchModelCatalog, SourceResult } from "@prospero/protocol/rust-daemon";
+import type { AccountListResult, LaunchModelCatalog, SourceResult, UsageResult } from "@prospero/protocol/rust-daemon";
 import type {
   AbandonRun, ApplyTaskGraph, CancelTask, CleanupWorktree, CompleteRun, CreateGate,
   CreateRun, CreateRunGraph, CreateTask, Dispatch, Gate, GraphMutationResult, ResolveGate,
@@ -132,6 +132,12 @@ export class RustClient {
   }
   agentQueues(signal: AbortSignal | null = null): Promise<AgentQueues> {
     return this.json("/v1/agent-sessions/queues", { signal });
+  }
+  usage(sid?: string, signal: AbortSignal | null = null): Promise<UsageResult> {
+    const params = new URLSearchParams();
+    if (sid !== undefined) params.set("sid", id(sid));
+    const suffix = params.size ? `?${params}` : "";
+    return this.json(`/v1/usage${suffix}`, { signal });
   }
   agentQueueRemove(value: string, queueId: string, signal: AbortSignal | null = null): Promise<{ ok: boolean }> {
     return this.json(`/v1/agent-sessions/${id(value)}/queue/${id(queueId)}/remove`, { method: "POST", signal });

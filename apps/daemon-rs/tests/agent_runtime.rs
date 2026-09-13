@@ -70,12 +70,20 @@ def text_block(text):
     emit({"type": "stream_event", "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}}})
     emit({"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}})
 
-def result(error=None, reason=None):
+def result(error=None, reason=None, input_tokens=None, output_tokens=None, cost_usd=None):
     payload = {"type": "result", "subtype": "success", "is_error": bool(error)}
     if error:
         payload["errors"] = [error]
     if reason:
         payload["terminal_reason"] = reason
+    if cost_usd is not None:
+        payload["total_cost_usd"] = cost_usd
+    if input_tokens is not None or output_tokens is not None:
+        payload["usage"] = {}
+        if input_tokens is not None:
+            payload["usage"]["input_tokens"] = input_tokens
+        if output_tokens is not None:
+            payload["usage"]["output_tokens"] = output_tokens
     emit(payload)
     sys.stdout.flush()
     time.sleep(0.2)
@@ -83,6 +91,9 @@ def result(error=None, reason=None):
 if scenario == "chat":
     text_block("hello from fake claude")
     result()
+elif scenario == "usage":
+    text_block("usage counted")
+    result(input_tokens=12, output_tokens=7, cost_usd=0.25)
 elif scenario == "resume":
     text_block("second turn" if resume else "first turn")
     result()
@@ -1769,4 +1780,23 @@ async fn queued_image_message_keeps_attachment_count_then_frame() {
     );
     assert_eq!(frames[1]["message"]["content"][1]["text"], "second prompt");
     assert!(harness.agents.queue(&head.id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn usage_accumulates_tokens_from_result_frames() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("usage").await;
+    let head = harness.create().await;
+    assert!(harness.agents.usage(&head.id).await.unwrap().is_none());
+    harness
+        .agents
+        .send(&head.id, "count".into(), None, Vec::new())
+        .await
+        .unwrap();
+    harness.wait_for(&head.id, |records| records.iter().any(|(_, body, _)| matches!(body, TimelineBody::TurnEnd { finish } if finish == "completed"))).await;
+    let usage = harness.agents.usage(&head.id).await.unwrap().unwrap();
+    assert_eq!(usage.input_tokens, Some(12));
+    assert_eq!(usage.output_tokens, Some(7));
+    assert_eq!(usage.cost_usd, Some(0.25));
+    assert!(usage.windows.is_empty());
 }

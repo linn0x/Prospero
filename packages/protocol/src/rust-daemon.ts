@@ -80,6 +80,11 @@ kind: string, createdAt: number,
 attachmentCount: number, };
 export type AgentQueue = { sessionId: string, items: Array<QueuedMessage>, };
 export type AgentQueues = { queues: Array<AgentQueue>, };
+export type UsageWindow = { label: string, utilization: number, resetsAt?: string | null, };
+export type UsageDailyBucket = { date: string, tokens: number, };
+export type UsageReport = { subscription?: string | null, costUsd?: number | null, inputTokens?: number | null, outputTokens?: number | null, lifetimeTokens?: number | null, creditsUnlimited?: boolean | null, creditsBalance?: string | null, spendLimit?: string | null, spendUsed?: string | null, spendRemainingPercent?: number | null, dailyUsage?: Array<UsageDailyBucket> | null, windows: Array<UsageWindow>, };
+export type UsageAccount = { agent: AgentKind, accountId?: string | null, accountName?: string | null, source?: string | null, available: boolean, reason?: string | null, subscription?: string | null, costUsd?: number | null, inputTokens?: number | null, outputTokens?: number | null, lifetimeTokens?: number | null, creditsUnlimited?: boolean | null, creditsBalance?: string | null, spendLimit?: string | null, spendUsed?: string | null, spendRemainingPercent?: number | null, dailyUsage?: Array<UsageDailyBucket> | null, windows: Array<UsageWindow>, };
+export type UsageResult = { type: string, sid?: string | null, available: boolean, reason?: string | null, accounts?: Array<UsageAccount> | null, subscription?: string | null, costUsd?: number | null, inputTokens?: number | null, outputTokens?: number | null, lifetimeTokens?: number | null, creditsUnlimited?: boolean | null, creditsBalance?: string | null, spendLimit?: string | null, spendUsed?: string | null, spendRemainingPercent?: number | null, dailyUsage?: Array<UsageDailyBucket> | null, windows: Array<UsageWindow>, };
 export type PermissionDecision = { requestId: string, allow: boolean, };
 export type QuestionAnswer = { questionId: string, values: Array<string>, };
 export type QuestionDecision = { requestId: string, answers: Array<QuestionAnswer>, cancelled: boolean, };
