@@ -555,6 +555,103 @@ pub(crate) async fn search_native_codex_conversations(
     result
 }
 
+fn codex_models_from_response(value: &Value, models: &mut Vec<crate::agent::LaunchModelInfo>) {
+    let Some(data) = value.get("data").and_then(Value::as_array) else {
+        return;
+    };
+    for item in data {
+        let Some(row) = item.as_object() else {
+            continue;
+        };
+        let id = row
+            .get("model")
+            .or_else(|| row.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if id.is_empty() || id.chars().count() > 160 {
+            continue;
+        }
+        let label = row
+            .get("displayName")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(id);
+        let supported_efforts = row
+            .get("supportedReasoningEfforts")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|entry| {
+                        entry.as_str().or_else(|| {
+                            entry
+                                .as_object()
+                                .and_then(|item| item.get("reasoningEffort"))
+                                .and_then(Value::as_str)
+                        })
+                    })
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.chars().take(80).collect::<String>())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        models.push(crate::agent::LaunchModelInfo {
+            id: id.to_owned(),
+            label: trim_codex(label, 160),
+            description: row
+                .get("description")
+                .and_then(Value::as_str)
+                .map(|value| trim_codex(value, 1000)),
+            supported_efforts,
+            is_default: row.get("isDefault").and_then(Value::as_bool) == Some(true),
+        });
+    }
+}
+
+pub(crate) async fn read_native_codex_models(
+    data: &Path,
+) -> Result<crate::agent::LaunchModelCatalog> {
+    let (cwd, env) = native_codex_environment(data)?;
+    let mut rpc = CodexRpc::start(cwd, &env).await?;
+    let result = async {
+        let mut models = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..5 {
+            let mut params = serde_json::Map::new();
+            params.insert("limit".into(), json!(50));
+            params.insert("includeHidden".into(), json!(false));
+            if let Some(cursor) = cursor.as_ref() {
+                params.insert("cursor".into(), json!(cursor));
+            }
+            let raw = rpc.request("model/list", Value::Object(params)).await?;
+            codex_models_from_response(&raw, &mut models);
+            cursor = raw
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        if models.is_empty() {
+            return Err(Error::Invalid("Codex 没有返回可选模型".into()));
+        }
+        let current_model = models
+            .iter()
+            .find(|model| model.is_default)
+            .or_else(|| models.first())
+            .map(|model| model.id.clone());
+        Ok(crate::agent::LaunchModelCatalog {
+            models,
+            current_model,
+        })
+    }
+    .await;
+    rpc.shutdown().await;
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1327,3 +1327,70 @@ for line in sys.stdin:
     assert_eq!(conversations[0]["updatedAt"], 1_700_000_010_000i64);
     api.database.shutdown().await.unwrap();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn launch_models_route_reads_native_codex_catalog() {
+    let _guard = CODEX_ENV_SERIAL.lock().await;
+    use std::os::unix::fs::PermissionsExt;
+
+    struct EnvGuard;
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var("PROSPERO_CODEX_BIN");
+            }
+        }
+    }
+
+    let (directory, api, _) = fixture().await;
+    let codex = directory.path().join("fake-codex-models.py");
+    std::fs::write(
+        &codex,
+        r#"#!/usr/bin/env python3
+import json, sys
+if sys.argv[1:] != ["app-server"]:
+    sys.exit(3)
+for line in sys.stdin:
+    msg = json.loads(line)
+    if "id" not in msg:
+        continue
+    rid = msg["id"]
+    method = msg.get("method")
+    if method == "model/list":
+        result = {"data": [{"model": "gpt-5.1-codex", "displayName": "GPT Codex", "description": "fast", "supportedReasoningEfforts": [{"reasoningEffort": "medium"}, "high"], "isDefault": True}]}
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({"id": rid, "result": result}) + "\n")
+    sys.stdout.flush()
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _env = EnvGuard;
+    unsafe {
+        std::env::set_var("PROSPERO_CODEX_BIN", &codex);
+    }
+
+    let response = api
+        .router()
+        .oneshot(
+            request("/v1/launch/models?agent=codex&accountId=native-codex")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let result = body(response).await;
+    assert_eq!(result["currentModel"], "gpt-5.1-codex");
+    assert_eq!(result["models"][0]["id"], "gpt-5.1-codex");
+    assert_eq!(result["models"][0]["label"], "GPT Codex");
+    assert_eq!(result["models"][0]["description"], "fast");
+    assert_eq!(
+        result["models"][0]["supportedEfforts"],
+        json!(["medium", "high"])
+    );
+    assert_eq!(result["models"][0]["isDefault"], true);
+    api.database.shutdown().await.unwrap();
+}
