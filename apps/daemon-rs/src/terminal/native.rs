@@ -85,10 +85,18 @@ pub fn spawn(command: CommandBuilder, size: TerminalSize) -> Result<Terminal> {
                         Ok(0) => break,
                         Ok(count) => {
                             read_any = true;
-                            if let Ok(mut output) = output.lock() {
-                                output.write(&buffer[..count]);
-                            }
+                            let responses = if let Ok(mut output) = output.lock() {
+                                output.write(&buffer[..count])
+                            } else {
+                                Vec::new()
+                            };
                             changed.send_modify(|v| *v = v.wrapping_add(1));
+                            for response in responses {
+                                if write_input(writer.as_mut(), &response, &stop).is_err() {
+                                    stop.store(true, Ordering::Release);
+                                    break;
+                                }
+                            }
                         }
                         Err(error)
                             if matches!(

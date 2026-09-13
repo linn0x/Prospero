@@ -77,6 +77,16 @@ impl Screen {
         }
     }
 
+    pub fn cursor_position(&self) -> (usize, usize) {
+        self.terminal
+            .as_ref()
+            .map(|terminal| {
+                let cursor = terminal.cursor();
+                (cursor.row, cursor.col)
+            })
+            .unwrap_or((0, 0))
+    }
+
     pub fn process(&mut self, bytes: &[u8]) {
         let bytes = [std::mem::take(&mut self.utf8), bytes.to_vec()].concat();
         let mut offset = 0;

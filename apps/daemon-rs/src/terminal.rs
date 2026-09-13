@@ -100,6 +100,7 @@ pub struct Output {
     events: VecDeque<(TerminalEvent, usize)>,
     bytes: usize,
     seq: i64,
+    query_carry: Vec<u8>,
     exited: bool,
     exit_code: Option<u32>,
 }
@@ -122,6 +123,7 @@ impl Output {
             events: VecDeque::new(),
             bytes: 0,
             seq: 0,
+            query_carry: Vec::new(),
             exited: false,
             exit_code: None,
         }
@@ -139,7 +141,7 @@ impl Output {
         }
     }
 
-    fn write(&mut self, bytes: &[u8]) {
+    fn write(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
         self.screen.process(bytes);
         self.push(
             TerminalEvent::Output {
@@ -147,6 +149,55 @@ impl Output {
             },
             bytes.len(),
         );
+        self.terminal_query_responses(bytes)
+    }
+
+    fn terminal_query_responses(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
+        let carry_len = self.query_carry.len();
+        let mut text = std::mem::take(&mut self.query_carry);
+        text.extend_from_slice(bytes);
+        self.query_carry = text[text.len().saturating_sub(8)..].to_vec();
+
+        let mut responses = Vec::new();
+        scan_terminal_query(
+            &text,
+            carry_len,
+            b"\x1b[6n",
+            || {
+                let (row, col) = self.screen.cursor_position();
+                format!("\x1b[{};{}R", row + 1, col + 1).into_bytes()
+            },
+            &mut responses,
+        );
+        scan_terminal_query(
+            &text,
+            carry_len,
+            b"\x1b[c",
+            || b"\x1b[?6c".to_vec(),
+            &mut responses,
+        );
+        scan_terminal_query(
+            &text,
+            carry_len,
+            b"\x1b[0c",
+            || b"\x1b[?6c".to_vec(),
+            &mut responses,
+        );
+        scan_terminal_query(
+            &text,
+            carry_len,
+            b"\x1b]10;?",
+            || b"\x1b]10;rgb:c0c0/caca/f5f5\x1b\\".to_vec(),
+            &mut responses,
+        );
+        scan_terminal_query(
+            &text,
+            carry_len,
+            b"\x1b]11;?",
+            || b"\x1b]11;rgb:1a1a/1b1b/2626\x1b\\".to_vec(),
+            &mut responses,
+        );
+        responses
     }
 
     fn page(&self, after: i64) -> Result<TerminalPage> {
@@ -176,6 +227,24 @@ impl Output {
             exited: self.exited,
             exit_code: self.exit_code,
         })
+    }
+}
+
+fn scan_terminal_query(
+    text: &[u8],
+    carry_len: usize,
+    pattern: &[u8],
+    response: impl Fn() -> Vec<u8>,
+    responses: &mut Vec<Vec<u8>>,
+) {
+    for index in text
+        .windows(pattern.len())
+        .enumerate()
+        .filter_map(|(index, window)| (window == pattern).then_some(index))
+    {
+        if index + pattern.len() > carry_len {
+            responses.push(response());
+        }
     }
 }
 
