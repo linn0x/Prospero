@@ -1562,19 +1562,31 @@ struct LaunchModelsQuery {
     account_id: Option<String>,
 }
 
-/// Launch model catalog for the desktop new-session dialog. Serves the native
-/// Claude environment and managed Claude accounts; other agents are a 400 and
-/// unknown accounts a 404, so the desktop never shows a fabricated catalog.
+/// Launch model catalog for the desktop new-session dialog. Serves Claude
+/// through its headless CLI handshake and native Codex through app-server.
 async fn launch_models(
     State(api): State<Api>,
     Query(query): Query<LaunchModelsQuery>,
 ) -> std::result::Result<Json<crate::agent::LaunchModelCatalog>, ApiError> {
+    let _permit = api.requests.acquire().await.map_err(|_| Error::Closed)?;
+    if query.agent == "codex" {
+        match query.account_id.as_deref() {
+            None | Some(crate::agent::NATIVE_CODEX_ID) => {}
+            Some(_) => {
+                return Err(ApiError(Error::Invalid(
+                    "Rust daemon 当前仅支持本机 Codex 模型目录".into(),
+                )));
+            }
+        }
+        return Ok(Json(
+            crate::agent::read_native_codex_models(api.database.directory()).await?,
+        ));
+    }
     if query.agent != "claude" {
         return Err(ApiError(Error::Invalid(
             "invalid model catalog agent".into(),
         )));
     }
-    let _permit = api.requests.acquire().await.map_err(|_| Error::Closed)?;
     // An absent accountId means the native environment; the runtime
     // canonicalizes it the same way.
     let account_id = query
