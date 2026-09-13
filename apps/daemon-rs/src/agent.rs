@@ -1,4 +1,5 @@
 mod claude;
+pub(crate) mod conversations;
 mod runtime;
 mod store;
 mod usage;
@@ -86,6 +87,32 @@ pub struct AttachmentInput {
     pub data_b64: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+}
+
+/// Resumable native conversation metadata discovered from provider-owned local history.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct ResumableConversation {
+    pub id: String,
+    pub agent: crate::protocol::AgentKind,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null")]
+    pub created_at: Option<i64>,
+    #[ts(type = "number")]
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct ConversationSearchResult {
+    pub agent: crate::protocol::AgentKind,
+    pub conversations: Vec<ResumableConversation>,
 }
 
 #[derive(Debug, Deserialize, Serialize, TS)]
