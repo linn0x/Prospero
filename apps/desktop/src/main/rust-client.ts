@@ -105,6 +105,9 @@ export class RustClient {
   agentCompact(value: string, requestId: string, signal: AbortSignal | null = null, timeoutMs = 180_000): Promise<AgentControlResult> {
     return this.json(`/v1/agent-sessions/${id(value)}/compact`, { method: "POST", signal, timeoutMs, headers: { "content-type": "application/json" }, body: JSON.stringify({ requestId }) });
   }
+  setApprovalPolicy(value: string, policy: string, signal: AbortSignal | null = null): Promise<{ ok: boolean }> {
+    return this.json(`/v1/agent-sessions/${id(value)}/approval-policy`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ policy }) });
+  }
   agentPermission(value: string, decision: PermissionDecision, signal: AbortSignal | null = null): Promise<{ ok: boolean }> {
     return this.json(`/v1/agent-sessions/${id(value)}/permission`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(decision) });
   }

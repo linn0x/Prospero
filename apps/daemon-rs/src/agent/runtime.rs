@@ -1664,6 +1664,16 @@ impl Agents {
             .await
     }
 
+    pub async fn set_approval_policy(&self, id: &str, policy: ApprovalPolicy) -> Result<()> {
+        let id = id.to_owned();
+        self.0
+            .database
+            .call(move |store| store.set_approval_policy(&id, policy))
+            .await?;
+        self.publish();
+        Ok(())
+    }
+
     /// Switch the collaboration mode. The change applies to the next turn;
     /// a turn already running keeps the mode it started with.
     pub async fn set_mode(&self, id: &str, mode: PermissionMode) -> Result<()> {
