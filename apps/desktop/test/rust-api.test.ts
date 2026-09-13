@@ -22,6 +22,16 @@ describe("Rust desktop API boundary", () => {
     expect(() => client.session("../accounts")).toThrow();
   });
 
+  it("requests usage with optional session id", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => new Response(JSON.stringify({ type: "usage.result", available: false, windows: [], accounts: [] })));
+    const client = new RustClient("http://127.0.0.1:12345", token, fetcher);
+    await client.usage("fixture");
+    expect(String(fetcher.mock.calls[0]![0])).toBe("http://127.0.0.1:12345/v1/usage?sid=fixture");
+    await client.usage();
+    expect(String(fetcher.mock.calls[1]![0])).toBe("http://127.0.0.1:12345/v1/usage");
+    expect(() => client.usage("../bad")).toThrow("Invalid record");
+  });
+
   it("does not expose server error payloads or secrets", async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({ code: "storage", message: token }), { status: 500 }));
     const client = new RustClient("http://127.0.0.1:12345", token, fetcher);

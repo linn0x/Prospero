@@ -20,7 +20,7 @@ use tokio::sync::{Semaphore, watch};
 use crate::agent::Agents;
 use crate::agent::{
     AgentModeSelection, AgentModelSelection, AgentSend, CreateAgentSession, PermissionDecision,
-    PermissionMode, QuestionDecision, mode_catalog,
+    PermissionMode, QuestionDecision, UsageReport, UsageResult, mode_catalog,
 };
 use crate::auth::Token;
 use crate::database::Store;
@@ -94,6 +94,7 @@ impl Api {
             .route("/v1/shutdown", post(shutdown))
             .route("/v1/agent-sessions", post(create_agent))
             .route("/v1/agent-sessions/queues", get(agent_queues))
+            .route("/v1/usage", get(usage_route))
             .route("/v1/agent-sessions/{id}/send", post(agent_send))
             .route(
                 "/v1/agent-sessions/{id}/suggestions",
@@ -343,6 +344,72 @@ async fn agent_queues(
     State(api): State<Api>,
 ) -> std::result::Result<Json<crate::agent::AgentQueues>, ApiError> {
     Ok(Json(api.agents.queues().await?))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UsageQuery {
+    sid: Option<String>,
+}
+
+fn empty_usage(sid: Option<String>, available: bool, reason: Option<String>) -> UsageResult {
+    UsageResult {
+        kind: "usage.result".into(),
+        sid,
+        available,
+        report: UsageReport {
+            windows: Vec::new(),
+            ..Default::default()
+        },
+        reason,
+        accounts: None,
+    }
+}
+
+async fn usage_route(
+    State(api): State<Api>,
+    query: std::result::Result<Query<UsageQuery>, axum::extract::rejection::QueryRejection>,
+) -> std::result::Result<Json<UsageResult>, ApiError> {
+    let Query(query) = query.map_err(|_| Error::Invalid("invalid usage query".into()))?;
+    if let Some(sid) = query.sid {
+        crate::database::validate_id(&sid).map_err(ApiError)?;
+        let Some(report) = api.agents.usage(&sid).await? else {
+            return Ok(Json(empty_usage(
+                Some(sid),
+                false,
+                Some("这个会话还没产生用量，发一条消息后再看。".into()),
+            )));
+        };
+        let reason = if report.windows.is_empty() {
+            Some("这个后端不提供套餐限流窗口。".into())
+        } else {
+            None
+        };
+        return Ok(Json(UsageResult {
+            kind: "usage.result".into(),
+            sid: Some(sid),
+            available: true,
+            report,
+            reason,
+            accounts: None,
+        }));
+    }
+    let accounts = api.agents.account_usage().await?;
+    let lead = accounts.first();
+    let mut result = if let Some(lead) = lead {
+        UsageResult {
+            kind: "usage.result".into(),
+            sid: None,
+            available: accounts.iter().any(|account| account.available),
+            report: lead.report.clone(),
+            reason: lead.reason.clone(),
+            accounts: None,
+        }
+    } else {
+        empty_usage(None, false, None)
+    };
+    result.accounts = Some(accounts);
+    Ok(Json(result))
 }
 
 async fn agent_queue(

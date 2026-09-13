@@ -77,6 +77,92 @@ pub struct AgentSend {
 pub(crate) const MAX_ATTACHMENTS: usize = 6;
 pub(crate) const MAX_ATTACHMENT_CHARS: usize = 8 * 1024 * 1024;
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct UsageWindow {
+    pub label: String,
+    pub utilization: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct UsageDailyBucket {
+    pub date: String,
+    #[ts(type = "number")]
+    pub tokens: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct UsageReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null")]
+    pub input_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null")]
+    pub output_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null")]
+    pub lifetime_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits_unlimited: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits_balance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend_limit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend_used: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend_remaining_percent: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_usage: Option<Vec<UsageDailyBucket>>,
+    pub windows: Vec<UsageWindow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct UsageAccount {
+    pub agent: crate::protocol::AgentKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    pub available: bool,
+    #[serde(flatten)]
+    pub report: UsageReport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct UsageResult {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
+    pub available: bool,
+    #[serde(flatten)]
+    pub report: UsageReport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounts: Option<Vec<UsageAccount>>,
+}
+
 /// Validate the legacy attachment contract: <= 6 images, known image MIME,
 /// canonical base64 <= 8 MiB per payload, name <= 200 chars. Text may be
 /// empty only when at least one image travels with the message.

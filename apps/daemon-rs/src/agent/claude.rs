@@ -98,6 +98,9 @@ pub(super) enum AdapterEvent {
     Finish {
         interrupted: bool,
         error: Option<String>,
+        cost_usd: Option<f64>,
+        input_tokens: Option<i64>,
+        output_tokens: Option<i64>,
     },
 }
 
@@ -428,6 +431,9 @@ pub(super) fn spawn_turn(
                 } else {
                     translator.error
                 },
+                cost_usd: translator.cost_usd,
+                input_tokens: translator.input_tokens,
+                output_tokens: translator.output_tokens,
             })
             .await
             .ok();
@@ -592,6 +598,9 @@ struct Translator {
     interrupted: bool,
     aborted: bool,
     error: Option<String>,
+    cost_usd: Option<f64>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
     /// A `result` frame marks the end of this turn. The real CLI keeps the
     /// stream-json process alive afterwards waiting for another prompt, so the
     /// reader must terminate the process rather than wait for exit.
@@ -819,6 +828,19 @@ impl Translator {
             }
             Some("result") => {
                 self.finished = true;
+                self.cost_usd = message
+                    .get("total_cost_usd")
+                    .and_then(Value::as_f64)
+                    .filter(|value| *value >= 0.0);
+                let usage = message.get("usage");
+                self.input_tokens = usage
+                    .and_then(|value| value.get("input_tokens"))
+                    .and_then(Value::as_i64)
+                    .filter(|value| *value >= 0);
+                self.output_tokens = usage
+                    .and_then(|value| value.get("output_tokens"))
+                    .and_then(Value::as_i64)
+                    .filter(|value| *value >= 0);
                 let interrupted = message
                     .get("terminal_reason")
                     .and_then(Value::as_str)

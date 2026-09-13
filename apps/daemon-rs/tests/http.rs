@@ -1,6 +1,7 @@
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use futures_util::StreamExt;
+use prosperod_rs::agent::CreateAgentSession as CreateAgentRun;
 use prosperod_rs::auth::Token;
 use prosperod_rs::protocol::{
     AgentKind, CreateSession, MessageRole, SessionKind, TimelineBody, TimelineWrite,
@@ -405,4 +406,53 @@ async fn timeline_routes_expose_previews_and_generation_checked_body_pages() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     api.database.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn usage_endpoint_matches_legacy_control_envelope() {
+    let directory = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let database = Database::open(directory.path().to_path_buf())
+        .await
+        .unwrap();
+    let api = Api::new(database.clone(), Token::parse(SECRET.into()).unwrap());
+    let head = api
+        .agents
+        .create(CreateAgentRun {
+            title: "Claude".into(),
+            workspace: workspace.path().to_str().unwrap().into(),
+            auto_approve: false,
+            model: None,
+            effort: None,
+            account_id: None,
+        })
+        .await
+        .unwrap();
+    let response = api
+        .router()
+        .oneshot(
+            request(&format!("/v1/usage?sid={}", head.id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let usage = body(response).await;
+    assert_eq!(usage["type"], "usage.result");
+    assert_eq!(usage["sid"], head.id);
+    assert_eq!(usage["available"], false);
+    assert_eq!(usage["windows"].as_array().unwrap().len(), 0);
+    assert!(usage["reason"].as_str().unwrap().contains("还没产生用量"));
+    let response = api
+        .router()
+        .oneshot(request("/v1/usage").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let usage = body(response).await;
+    assert_eq!(usage["type"], "usage.result");
+    assert!(usage.get("sid").is_none());
+    assert!(usage["accounts"].is_array());
+    database.shutdown().await.unwrap();
 }
