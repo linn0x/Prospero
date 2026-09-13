@@ -421,8 +421,8 @@ export class RustClient {
   }
 
   // ── Launch model catalog ────────────────────────────────────────────────
-  launchModels(accountId = "native-claude", signal: AbortSignal | null = null, timeoutMs = 30_000): Promise<LaunchModelCatalog> {
+  launchModels(agent: "claude" | "codex" = "claude", accountId = "native-claude", signal: AbortSignal | null = null, timeoutMs = 30_000): Promise<LaunchModelCatalog> {
     const account = encodeURIComponent(accountId);
-    return this.json(`/v1/launch/models?agent=claude&accountId=${account}`, { signal, timeoutMs });
+    return this.json(`/v1/launch/models?agent=${encodeURIComponent(agent)}&accountId=${account}`, { signal, timeoutMs });
   }
 }
