@@ -237,8 +237,17 @@ pub(super) async fn spawn_turn(
     });
 
     let reader_current_turn = current_turn.clone();
+    let reader_frames = frames_tx.clone();
+    let auto_approve = options.policy == ApprovalPolicy::Auto;
     tokio::spawn(async move {
-        read_notifications(rpc.stdout, events_tx, reader_current_turn).await;
+        read_notifications(
+            rpc.stdout,
+            events_tx,
+            reader_current_turn,
+            reader_frames,
+            auto_approve,
+        )
+        .await;
         let _ = rpc.child.start_kill();
         let _ = tokio::time::timeout(Duration::from_secs(2), rpc.child.wait()).await;
     });
@@ -315,6 +324,8 @@ async fn read_notifications(
     mut stdout: BufReader<tokio::process::ChildStdout>,
     events: mpsc::Sender<AdapterEvent>,
     current_turn: Arc<Mutex<Option<String>>>,
+    writer: mpsc::Sender<(Value, Option<oneshot::Sender<()>>)>,
+    auto_approve: bool,
 ) {
     let mut streamed: HashMap<String, String> = HashMap::new();
     let mut last_text: Option<String> = None;
@@ -369,6 +380,18 @@ async fn read_notifications(
             continue;
         };
         let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
+        if message.get("id").is_some() {
+            handle_request(
+                message.get("id").cloned().unwrap_or(Value::Null),
+                method,
+                &params,
+                &events,
+                &writer,
+                auto_approve,
+            )
+            .await;
+            continue;
+        }
         match method {
             "turn/started" => {
                 let turn_id = params
@@ -409,13 +432,26 @@ async fn read_notifications(
                         .await;
                 }
             }
+            "item/started" => {
+                let item = params.get("item").cloned().unwrap_or_else(|| json!({}));
+                let item_type = item_type(&item);
+                let item_id = codex_item_id_from_item(&params, &item).unwrap_or_else(|| {
+                    futures_current_turn(&current_turn).unwrap_or_else(|| "codex-tool".into())
+                });
+                if let Some((tool, summary)) = tool_start_summary(&item_type, &item) {
+                    let _ = events
+                        .send(AdapterEvent::ToolCall {
+                            subagent: None,
+                            call_id: item_id,
+                            name: tool,
+                            summary,
+                        })
+                        .await;
+                }
+            }
             "item/completed" => {
                 let item = params.get("item").cloned().unwrap_or_else(|| json!({}));
-                let item_type = item
-                    .get("type")
-                    .or_else(|| item.get("item_type"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
+                let item_type = item_type(&item);
                 if item_type == "agentMessage" || item_type == "plan" {
                     let msg_id = item
                         .get("id")
@@ -437,6 +473,20 @@ async fn read_notifications(
                                 .await;
                         }
                     }
+                } else if let Some((tool, summary, error)) = tool_result_summary(&item_type, &item)
+                {
+                    let item_id = codex_item_id_from_item(&params, &item).unwrap_or_else(|| {
+                        futures_current_turn(&current_turn).unwrap_or_else(|| "codex-tool".into())
+                    });
+                    let _ = events
+                        .send(AdapterEvent::ToolResult {
+                            subagent: None,
+                            call_id: item_id,
+                            name: tool,
+                            summary,
+                            error,
+                        })
+                        .await;
                 }
             }
             "thread/tokenUsage/updated" => {
@@ -482,6 +532,253 @@ async fn read_notifications(
                 output_tokens: last_output_tokens,
             })
             .await;
+    }
+}
+
+async fn handle_request(
+    rpc_id: Value,
+    method: &str,
+    params: &Value,
+    events: &mpsc::Sender<AdapterEvent>,
+    writer: &mpsc::Sender<(Value, Option<oneshot::Sender<()>>)>,
+    auto_approve: bool,
+) {
+    let Some(kind) = approval_kind(method) else {
+        respond_error(writer, rpc_id, -32601, format!("prospero 不支持 {method}")).await;
+        return;
+    };
+    let item_id = params
+        .get("itemId")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            params
+                .get("item")
+                .and_then(|item| item.get("id"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("codex-approval")
+        .chars()
+        .take(120)
+        .collect::<String>();
+    let (tool, action, subject) = approval_summary(method, params);
+    if auto_approve {
+        respond_result(writer, rpc_id, approval_response(kind, true, params)).await;
+        return;
+    }
+    let (reply, reply_rx) = oneshot::channel();
+    if events
+        .send(AdapterEvent::Permission {
+            subagent: None,
+            request_id: item_id,
+            tool,
+            summary: format!("{action}:{subject}"),
+            reply,
+        })
+        .await
+        .is_err()
+    {
+        respond_result(writer, rpc_id, approval_response(kind, false, params)).await;
+        return;
+    }
+    let writer = writer.clone();
+    let params = params.clone();
+    tokio::spawn(async move {
+        let allow = reply_rx.await.unwrap_or(false);
+        respond_result(&writer, rpc_id, approval_response(kind, allow, &params)).await;
+    });
+}
+
+#[derive(Clone, Copy)]
+enum ApprovalKind {
+    V2CommandOrFile,
+    V2Permissions,
+    Legacy,
+}
+
+fn approval_kind(method: &str) -> Option<ApprovalKind> {
+    match method {
+        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+            Some(ApprovalKind::V2CommandOrFile)
+        }
+        "item/permissions/requestApproval" => Some(ApprovalKind::V2Permissions),
+        "execCommandApproval" | "applyPatchApproval" => Some(ApprovalKind::Legacy),
+        _ => None,
+    }
+}
+
+fn approval_summary(method: &str, params: &Value) -> (String, &'static str, String) {
+    match method {
+        "item/commandExecution/requestApproval" | "execCommandApproval" => {
+            let command = params
+                .get("command")
+                .or_else(|| params.get("parsedCommand"))
+                .or_else(|| params.get("argv"));
+            ("commandExecution".into(), "运行命令", summarize(command))
+        }
+        "item/fileChange/requestApproval" | "applyPatchApproval" => {
+            let reason = params
+                .get("reason")
+                .or_else(|| params.get("grantRoot"))
+                .or_else(|| params.get("changes"))
+                .or_else(|| params.get("fileChanges"));
+            ("fileChange".into(), "修改文件", summarize(reason))
+        }
+        "item/permissions/requestApproval" => {
+            let reason = params.get("reason");
+            ("permissions".into(), "请求额外权限", summarize(reason))
+        }
+        _ => ("tool".into(), "执行操作", summarize(Some(params))),
+    }
+}
+
+fn approval_response(kind: ApprovalKind, allow: bool, params: &Value) -> Value {
+    match kind {
+        ApprovalKind::V2CommandOrFile => {
+            json!({ "decision": if allow { "accept" } else { "decline" } })
+        }
+        ApprovalKind::V2Permissions => {
+            if !allow {
+                json!({ "permissions": {}, "scope": "turn" })
+            } else {
+                let mut permissions = serde_json::Map::new();
+                if let Some(network) = params.get("permissions").and_then(|p| p.get("network"))
+                    && !network.is_null()
+                {
+                    permissions.insert("network".into(), network.clone());
+                }
+                if let Some(file_system) =
+                    params.get("permissions").and_then(|p| p.get("fileSystem"))
+                    && !file_system.is_null()
+                {
+                    permissions.insert("fileSystem".into(), file_system.clone());
+                }
+                json!({ "permissions": permissions, "scope": "turn" })
+            }
+        }
+        ApprovalKind::Legacy => {
+            if allow {
+                json!({ "decision": "approved" })
+            } else {
+                json!({ "decision": { "denied": { "rejection": "用户拒绝了此操作" } } })
+            }
+        }
+    }
+}
+
+async fn respond_result(
+    writer: &mpsc::Sender<(Value, Option<oneshot::Sender<()>>)>,
+    id: Value,
+    result: Value,
+) {
+    let _ = writer
+        .send((
+            json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+            None,
+        ))
+        .await;
+}
+
+async fn respond_error(
+    writer: &mpsc::Sender<(Value, Option<oneshot::Sender<()>>)>,
+    id: Value,
+    code: i64,
+    message: String,
+) {
+    let _ = writer
+        .send((
+            json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }),
+            None,
+        ))
+        .await;
+}
+
+fn item_type(item: &Value) -> String {
+    item.get("type")
+        .or_else(|| item.get("item_type"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn codex_item_id_from_item(params: &Value, item: &Value) -> Option<String> {
+    item.get("id")
+        .or_else(|| params.get("itemId"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(120).collect())
+}
+
+fn tool_start_summary(item_type: &str, item: &Value) -> Option<(String, String)> {
+    match item_type {
+        "commandExecution" => Some(("bash".into(), summarize(item.get("command")))),
+        "fileChange" => Some(("edit".into(), summarize(item.get("changes")))),
+        "mcpToolCall" => Some((
+            item.get("server")
+                .and_then(Value::as_str)
+                .unwrap_or("mcp")
+                .to_owned(),
+            summarize(Some(item)),
+        )),
+        _ => None,
+    }
+}
+
+fn tool_result_summary(item_type: &str, item: &Value) -> Option<(String, String, bool)> {
+    match item_type {
+        "commandExecution" => Some((
+            "bash".into(),
+            summarize(
+                item.get("aggregatedOutput")
+                    .or_else(|| item.get("exitCode"))
+                    .or_else(|| item.get("status")),
+            ),
+            item_failed(item),
+        )),
+        "fileChange" => Some((
+            "edit".into(),
+            summarize(item.get("status")),
+            item_failed(item),
+        )),
+        "mcpToolCall" => Some((
+            item.get("server")
+                .and_then(Value::as_str)
+                .unwrap_or("mcp")
+                .to_owned(),
+            summarize(
+                item.get("error")
+                    .or_else(|| item.get("result"))
+                    .or_else(|| item.get("status")),
+            ),
+            item_failed(item),
+        )),
+        _ => None,
+    }
+}
+
+fn item_failed(item: &Value) -> bool {
+    matches!(
+        item.get("status").and_then(Value::as_str),
+        Some("failed" | "error" | "declined" | "cancelled" | "canceled")
+    ) || item.get("error").is_some_and(|error| !error.is_null())
+}
+
+fn summarize(value: Option<&Value>) -> String {
+    let text = match value {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| summarize(Some(item)))
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join(" "),
+        Some(Value::Null) | None => String::new(),
+        Some(value) => serde_json::to_string(value).unwrap_or_default(),
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        "操作".into()
+    } else {
+        text.chars().take(400).collect()
     }
 }
 

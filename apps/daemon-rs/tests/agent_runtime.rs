@@ -315,6 +315,7 @@ import json, os, sys, time
 
 next_thread = "thread-created"
 turn_id = "turn-native-1"
+scenario = open(os.path.join(os.getcwd(), "scenario")).read().strip()
 seen = []
 
 def emit(payload):
@@ -345,6 +346,13 @@ for line in sys.stdin:
         with open(os.path.join(os.getcwd(), "turn-start.json"), "w") as log:
             log.write(json.dumps(params))
         emit({"jsonrpc": "2.0", "method": "turn/started", "params": {"threadId": params.get("threadId"), "turn": {"id": turn_id}}})
+        if scenario == "codexapproval":
+            emit({"jsonrpc": "2.0", "method": "item/started", "params": {"threadId": params.get("threadId"), "item": {"id": "tool-1", "type": "commandExecution", "command": "echo ok"}}})
+            emit({"jsonrpc": "2.0", "id": "approval-1", "method": "item/commandExecution/requestApproval", "params": {"threadId": params.get("threadId"), "itemId": "tool-1", "command": "echo ok"}})
+            reply = json.loads(sys.stdin.readline())
+            with open(os.path.join(os.getcwd(), "approval-response.json"), "w") as log:
+                log.write(json.dumps(reply))
+            emit({"jsonrpc": "2.0", "method": "item/completed", "params": {"threadId": params.get("threadId"), "item": {"id": "tool-1", "type": "commandExecution", "status": "completed", "aggregatedOutput": "ok"}}})
         emit({"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": {"threadId": params.get("threadId"), "itemId": "msg-1", "delta": "hello "}})
         emit({"jsonrpc": "2.0", "method": "item/reasoning/textDelta", "params": {"threadId": params.get("threadId"), "itemId": "think-1", "delta": "thinking"}})
         emit({"jsonrpc": "2.0", "method": "item/completed", "params": {"threadId": params.get("threadId"), "item": {"id": "msg-1", "type": "agentMessage", "text": "hello from fake codex"}}})
@@ -575,6 +583,88 @@ async fn codex_structured_turn_streams_into_timeline() {
     assert_eq!(turn_start["model"], "gpt-test");
     assert_eq!(turn_start["effort"], "high");
     assert_eq!(turn_start["collaborationMode"]["mode"], "plan");
+}
+
+#[tokio::test]
+async fn codex_permission_roundtrip_responds_to_app_server() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("codexapproval").await;
+    let cli = harness.workspace.path().join("fake-codex.py");
+    std::fs::write(&cli, FAKE_CODEX).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    unsafe {
+        std::env::set_var("PROSPERO_CODEX_BIN", &cli);
+    }
+    let head = harness.create_codex().await;
+    harness
+        .agents
+        .send(&head.id, "needs approval".into(), None, Vec::new())
+        .await
+        .unwrap();
+
+    let records = harness
+        .wait_for(&head.id, |records| {
+            records.iter().any(|(_, body, _)| {
+                matches!(
+                    body,
+                    TimelineBody::PermissionRequest {
+                        resolved: false,
+                        ..
+                    }
+                )
+            })
+        })
+        .await;
+    let request_id = records
+        .iter()
+        .find_map(|(_, body, _)| match body {
+            TimelineBody::PermissionRequest {
+                request_id,
+                resolved: false,
+                ..
+            } => Some(request_id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(request_id, "tool-1");
+    harness
+        .agents
+        .respond_permission(&head.id, &request_id, true)
+        .await
+        .unwrap();
+
+    let records = harness
+        .wait_for(&head.id, |records| {
+            records.iter().any(|(_, body, _)| {
+                matches!(body, TimelineBody::TurnEnd { finish } if finish == "completed")
+            })
+        })
+        .await;
+    assert!(records.iter().any(|(_, body, preview)| matches!(
+        body,
+        TimelineBody::PermissionRequest {
+            tool,
+            resolved: true,
+            ..
+        } if tool == "commandExecution"
+    ) && preview.contains("运行命令:echo ok")));
+    assert!(records.iter().any(|(_, body, preview)| matches!(
+        body,
+        TimelineBody::Tool {
+            state: prosperod_rs::protocol::ToolState::Success,
+            ..
+        }
+    ) && preview == "ok"));
+    let response: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(harness.workspace.path().join("approval-response.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(response["id"], "approval-1");
+    assert_eq!(response["result"]["decision"], "accept");
 }
 
 #[tokio::test]
