@@ -238,6 +238,7 @@ pub(super) async fn spawn_turn(
 
     let reader_current_turn = current_turn.clone();
     let reader_frames = frames_tx.clone();
+    let reader_thread_id = thread_id.clone();
     let auto_approve = options.policy == ApprovalPolicy::Auto;
     tokio::spawn(async move {
         read_notifications(
@@ -246,6 +247,7 @@ pub(super) async fn spawn_turn(
             reader_current_turn,
             reader_frames,
             auto_approve,
+            reader_thread_id,
         )
         .await;
         let _ = rpc.child.start_kill();
@@ -326,8 +328,10 @@ async fn read_notifications(
     current_turn: Arc<Mutex<Option<String>>>,
     writer: mpsc::Sender<(Value, Option<oneshot::Sender<()>>)>,
     auto_approve: bool,
+    root_thread_id: String,
 ) {
     let mut streamed: HashMap<String, String> = HashMap::new();
+    let mut subagents: HashMap<String, bool> = HashMap::new();
     let mut last_text: Option<String> = None;
     let mut last_input_tokens: Option<i64> = None;
     let mut last_output_tokens: Option<i64> = None;
@@ -380,6 +384,13 @@ async fn read_notifications(
             continue;
         };
         let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
+        let notification_thread = params
+            .get("threadId")
+            .and_then(Value::as_str)
+            .unwrap_or(&root_thread_id);
+        let agent_id = (notification_thread != root_thread_id
+            && subagents.contains_key(notification_thread))
+        .then(|| notification_thread.to_owned());
         if message.get("id").is_some() {
             handle_request(
                 message.get("id").cloned().unwrap_or(Value::Null),
@@ -393,6 +404,58 @@ async fn read_notifications(
             continue;
         }
         match method {
+            "thread/started" => {
+                let thread = params.get("thread").cloned().unwrap_or_else(|| json!({}));
+                let id = thread.get("id").and_then(Value::as_str).unwrap_or_default();
+                let parent = thread
+                    .get("parentThreadId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !id.is_empty() && parent == root_thread_id {
+                    subagents.insert(id.to_owned(), true);
+                    let name = thread
+                        .get("agentNickname")
+                        .or_else(|| thread.get("name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("Codex subagent")
+                        .chars()
+                        .take(120)
+                        .collect::<String>();
+                    let role = thread
+                        .get("agentRole")
+                        .and_then(Value::as_str)
+                        .map(|value| value.chars().take(200).collect::<String>());
+                    let task = thread
+                        .get("preview")
+                        .and_then(Value::as_str)
+                        .map(|value| value.chars().take(1000).collect::<String>());
+                    let _ = events
+                        .send(AdapterEvent::SubagentStarted {
+                            subagent: id.to_owned(),
+                            name,
+                            role,
+                            task,
+                        })
+                        .await;
+                }
+            }
+            "thread/status/changed" => {
+                let id = params
+                    .get("threadId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !id.is_empty() && subagents.contains_key(id) {
+                    let (status, can_message) = subagent_status(params.get("status"));
+                    let _ = events
+                        .send(AdapterEvent::SubagentUpdate {
+                            subagent: id.to_owned(),
+                            status,
+                            can_message,
+                            summary: None,
+                        })
+                        .await;
+                }
+            }
             "turn/started" => {
                 let turn_id = params
                     .get("turn")
@@ -414,7 +477,7 @@ async fn read_notifications(
                     full.push_str(delta);
                     let _ = events
                         .send(AdapterEvent::Text {
-                            subagent: None,
+                            subagent: agent_id.clone(),
                             text: full.clone(),
                         })
                         .await;
@@ -426,7 +489,7 @@ async fn read_notifications(
                 {
                     let _ = events
                         .send(AdapterEvent::Thinking {
-                            subagent: None,
+                            subagent: agent_id.clone(),
                             text: delta.to_owned(),
                         })
                         .await;
@@ -438,10 +501,21 @@ async fn read_notifications(
                 let item_id = codex_item_id_from_item(&params, &item).unwrap_or_else(|| {
                     futures_current_turn(&current_turn).unwrap_or_else(|| "codex-tool".into())
                 });
+                if item_type == "collabAgentToolCall" {
+                    // The item names the child thread before thread/started
+                    // carries richer metadata. Remember it now so attributed
+                    // deltas route to the subagent; a later status/completion
+                    // update will create a minimal card if thread/started does
+                    // not arrive on this app-server version.
+                    for receiver in receiver_thread_ids(&item) {
+                        subagents.insert(receiver, true);
+                    }
+                    continue;
+                }
                 if let Some((tool, summary)) = tool_start_summary(&item_type, &item) {
                     let _ = events
                         .send(AdapterEvent::ToolCall {
-                            subagent: None,
+                            subagent: agent_id.clone(),
                             call_id: item_id,
                             name: tool,
                             summary,
@@ -467,8 +541,30 @@ async fn read_notifications(
                         if text != seen {
                             let _ = events
                                 .send(AdapterEvent::Text {
-                                    subagent: None,
+                                    subagent: agent_id.clone(),
                                     text: text.to_owned(),
+                                })
+                                .await;
+                        }
+                    }
+                } else if item_type == "collabAgentToolCall" {
+                    let raw = item
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("completed");
+                    let status = if raw == "failed" {
+                        "failed"
+                    } else {
+                        "completed"
+                    };
+                    for receiver in receiver_thread_ids(&item) {
+                        if subagents.contains_key(&receiver) {
+                            let _ = events
+                                .send(AdapterEvent::SubagentUpdate {
+                                    subagent: receiver,
+                                    status,
+                                    can_message: false,
+                                    summary: None,
                                 })
                                 .await;
                         }
@@ -480,7 +576,7 @@ async fn read_notifications(
                     });
                     let _ = events
                         .send(AdapterEvent::ToolResult {
-                            subagent: None,
+                            subagent: agent_id.clone(),
                             call_id: item_id,
                             name: tool,
                             summary,
@@ -876,6 +972,58 @@ fn tool_result_summary(item_type: &str, item: &Value) -> Option<(String, String,
             item_failed(item),
         )),
         _ => None,
+    }
+}
+
+fn receiver_thread_ids(item: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for key in ["receiverThreadId", "agentThreadId", "threadId"] {
+        if let Some(value) = item.get(key).and_then(Value::as_str)
+            && !value.is_empty()
+        {
+            out.push(value.chars().take(120).collect());
+        }
+    }
+    for key in ["receiverThreadIds", "agentThreadIds"] {
+        if let Some(items) = item.get(key).and_then(Value::as_array) {
+            out.extend(items.iter().filter_map(|value| {
+                value
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .map(|id| id.chars().take(120).collect::<String>())
+            }));
+        }
+    }
+    if let Some(states) = item.get("agentsStates").and_then(Value::as_object) {
+        out.extend(
+            states
+                .keys()
+                .map(|key| key.chars().take(120).collect::<String>()),
+        );
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn subagent_status(value: Option<&Value>) -> (&'static str, bool) {
+    let status = value
+        .and_then(|value| {
+            value.as_str().or_else(|| {
+                value
+                    .as_object()
+                    .and_then(|map| map.get("type"))
+                    .and_then(Value::as_str)
+            })
+        })
+        .unwrap_or_default();
+    match status {
+        "active" | "running" | "pendingInit" => ("running", true),
+        "idle" => ("idle", true),
+        "completed" => ("completed", false),
+        "systemError" | "errored" | "notFound" => ("failed", false),
+        "interrupted" | "shutdown" | "notLoaded" => ("stopped", false),
+        _ => ("starting", true),
     }
 }
 
