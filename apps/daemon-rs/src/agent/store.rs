@@ -18,6 +18,14 @@ impl ApprovalPolicy {
             ApprovalPolicy::Auto => "auto",
         }
     }
+
+    pub(crate) fn from_wire(value: &str) -> Result<Self> {
+        match value {
+            "strict" | "standard" | "manual" => Ok(ApprovalPolicy::Manual),
+            "yolo" | "auto" => Ok(ApprovalPolicy::Auto),
+            _ => Err(Error::Invalid("审批策略无效".into())),
+        }
+    }
 }
 
 /// Claude collaboration mode persisted per session; applied as the headless
@@ -186,6 +194,19 @@ impl Store {
             effort: row.7,
             account_id: row.8,
         })
+    }
+
+    pub(crate) fn set_approval_policy(&mut self, id: &str, policy: ApprovalPolicy) -> Result<()> {
+        crate::database::validate_id(id)?;
+        let run = self.agent_run(id)?;
+        if !run.active {
+            return Err(Error::Conflict);
+        }
+        self.connection.execute(
+            "UPDATE agent_runs SET approval_policy=?1 WHERE session_id=?2",
+            params![policy.label(), id],
+        )?;
+        Ok(())
     }
 
     /// Persist the selected collaboration mode. Allowed only while the

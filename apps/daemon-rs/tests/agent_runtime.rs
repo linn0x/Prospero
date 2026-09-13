@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use prosperod_rs::{
-    agent::{Agents, CreateAgentSession, PermissionMode},
+    agent::{Agents, ApprovalPolicy, CreateAgentSession, PermissionMode},
     protocol::{MessageRole, TimelineBody, TimelineQuery},
     worker::Database,
 };
@@ -565,6 +565,45 @@ async fn permission_roundtrip_executes_tool() {
             ..
         }
     ) && preview == "removed"));
+}
+
+#[tokio::test]
+async fn approval_policy_set_auto_allows_future_turns() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("approval").await;
+    let head = harness.create().await;
+    harness
+        .agents
+        .set_approval_policy(&head.id, ApprovalPolicy::Auto)
+        .await
+        .unwrap();
+    harness
+        .agents
+        .send(&head.id, "go".into(), None, Vec::new())
+        .await
+        .unwrap();
+
+    let records = harness
+        .wait_for(&head.id, |records| {
+            records.iter().any(|(_, body, _)| {
+                matches!(body, TimelineBody::TurnEnd { finish } if finish == "completed")
+            })
+        })
+        .await;
+    assert!(records.iter().any(|(_, body, preview)| {
+        matches!(
+            body,
+            TimelineBody::Tool {
+                state: prosperod_rs::protocol::ToolState::Success,
+                ..
+            }
+        ) && preview == "removed"
+    }));
+    assert!(
+        !records
+            .iter()
+            .any(|(_, body, _)| { matches!(body, TimelineBody::PermissionRequest { .. }) })
+    );
 }
 
 #[tokio::test]
