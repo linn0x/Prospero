@@ -14,6 +14,8 @@ use axum::{
     Json, Router,
     routing::{get, post},
 };
+use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
 use futures_util::{Stream, stream};
 use tokio::sync::{Semaphore, watch};
 
@@ -30,6 +32,11 @@ use crate::orchestration::{
     self, AbandonDispatch, AbandonRun, ApplyTaskGraph, CancelTask, CleanupWorktree, CompleteRun,
     CreateGate, CreateRun, CreateRunGraph, CreateTask, DeleteRun, DispatchTask, InspectWorktree,
     MarkMessages, PostMessage, ResolveGate, SettleDispatch, StartWorker, StopWorker,
+};
+use crate::project::{
+    FsChunk, FsChunkQuery, FsContent, FsDone, FsListing, FsPathQuery, FsPathRequest, FsPutRequest,
+    FsRenameRequest, FsWriteRequest, FsWritten, GitCommitRequest, GitDiffQuery, GitDiffResult,
+    GitDone, GitStageRequest, GitStatusResult, WorkspaceSummaryResult,
 };
 use crate::protocol::*;
 use crate::terminal::{
@@ -120,6 +127,23 @@ impl Api {
                 "/v1/agent-sessions/{id}/tool-output",
                 get(agent_tool_output),
             )
+            .route(
+                "/v1/sessions/{id}/workspace-summary",
+                get(workspace_summary),
+            )
+            .route("/v1/sessions/{id}/fs/list", get(fs_list))
+            .route("/v1/sessions/{id}/fs/read", get(fs_read))
+            .route("/v1/sessions/{id}/fs/write", post(fs_write))
+            .route("/v1/sessions/{id}/fs/get", get(fs_get))
+            .route("/v1/sessions/{id}/fs/put", post(fs_put))
+            .route("/v1/sessions/{id}/fs/mkdir", post(fs_mkdir))
+            .route("/v1/sessions/{id}/fs/remove", post(fs_remove))
+            .route("/v1/sessions/{id}/fs/rename", post(fs_rename))
+            .route("/v1/sessions/{id}/git/status", get(git_status))
+            .route("/v1/sessions/{id}/git/diff", get(git_diff))
+            .route("/v1/sessions/{id}/git/stage", post(git_stage))
+            .route("/v1/sessions/{id}/git/discard", post(git_discard))
+            .route("/v1/sessions/{id}/git/commit", post(git_commit))
             .route(
                 "/v1/agent-sessions/{id}/approval-policy",
                 post(agent_approval_policy),
@@ -322,6 +346,9 @@ async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, Api
             "agent.api-validation.v1",
             "agent.api-protocols.v1",
             "model.sources.v1",
+            "session.workspace.summary",
+            "session.fs",
+            "session.git",
         ]
         .map(str::to_owned)
         .to_vec(),
@@ -1483,6 +1510,289 @@ async fn agent_subagent_events(
     crate::database::validate_id(&subagent).map_err(ApiError)?;
     let snapshot = api.agents.subagent_snapshot(&id, &subagent).await?;
     Ok(Json(snapshot))
+}
+
+async fn session_workspace(api: &Api, id: &str) -> Result<std::path::PathBuf> {
+    crate::database::validate_id(id)?;
+    let id = id.to_owned();
+    api.call(move |store| {
+        store
+            .session(&id)
+            .map(|session| std::path::PathBuf::from(session.workspace))
+    })
+    .await
+}
+
+async fn workspace_summary(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    query: std::result::Result<Query<RequestIdQuery>, axum::extract::rejection::QueryRejection>,
+) -> std::result::Result<Json<WorkspaceSummaryResult>, ApiError> {
+    let Query(query) =
+        query.map_err(|_| Error::Invalid("invalid workspace summary query".into()))?;
+    if query.request_id.trim().is_empty() || query.request_id.len() > 100 {
+        return Err(ApiError(Error::Invalid("invalid request id".into())));
+    }
+    let root = session_workspace(&api, &id).await?;
+    Ok(Json(
+        crate::project::workspace_summary(id, root, query.request_id).await?,
+    ))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RequestIdQuery {
+    request_id: String,
+}
+
+async fn fs_list(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    query: std::result::Result<Query<FsPathQuery>, axum::extract::rejection::QueryRejection>,
+) -> std::result::Result<Json<FsListing>, ApiError> {
+    let Query(query) = query.map_err(|_| Error::Invalid("invalid fs query".into()))?;
+    let root = session_workspace(&api, &id).await?;
+    let path = query.path;
+    let response_path = path.clone();
+    let entries = tokio::task::spawn_blocking(move || crate::project::list_dir(&root, &path))
+        .await
+        .map_err(|_| Error::Closed)??;
+    Ok(Json(FsListing {
+        r#type: "fs.listing".into(),
+        sid: id,
+        path: response_path,
+        entries,
+    }))
+}
+
+async fn fs_read(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    query: std::result::Result<Query<FsPathQuery>, axum::extract::rejection::QueryRejection>,
+) -> std::result::Result<Json<FsContent>, ApiError> {
+    let Query(query) = query.map_err(|_| Error::Invalid("invalid fs query".into()))?;
+    let root = session_workspace(&api, &id).await?;
+    let path = query.path;
+    let response_path = path.clone();
+    let (content, size, truncated, binary) =
+        tokio::task::spawn_blocking(move || crate::project::read_for_edit(&root, &path))
+            .await
+            .map_err(|_| Error::Closed)??;
+    Ok(Json(FsContent {
+        r#type: "fs.content".into(),
+        sid: id,
+        path: response_path,
+        content_b64: BASE64_STANDARD.encode(content),
+        size,
+        truncated,
+        binary,
+    }))
+}
+
+async fn fs_write(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<FsWriteRequest>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<FsWritten>, ApiError> {
+    let Json(input) = body.map_err(|_| Error::Invalid("invalid fs write".into()))?;
+    let root = session_workspace(&api, &id).await?;
+    let content = BASE64_STANDARD
+        .decode(&input.content_b64)
+        .map_err(|_| Error::Invalid("invalid base64".into()))?;
+    let path = input.path;
+    let response_path = path.clone();
+    let size =
+        tokio::task::spawn_blocking(move || crate::project::write_file_at(&root, &path, content))
+            .await
+            .map_err(|_| Error::Closed)??;
+    Ok(Json(FsWritten {
+        r#type: "fs.written".into(),
+        sid: id,
+        path: response_path,
+        size,
+    }))
+}
+
+async fn fs_get(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    query: std::result::Result<Query<FsChunkQuery>, axum::extract::rejection::QueryRejection>,
+) -> std::result::Result<Json<FsChunk>, ApiError> {
+    let Query(query) = query.map_err(|_| Error::Invalid("invalid fs chunk query".into()))?;
+    let root = session_workspace(&api, &id).await?;
+    let path = query.path;
+    let response_path = path.clone();
+    let offset = query.offset;
+    let length = query.length;
+    let (data, total, eof) = tokio::task::spawn_blocking(move || {
+        crate::project::read_chunk(&root, &path, offset, length)
+    })
+    .await
+    .map_err(|_| Error::Closed)??;
+    Ok(Json(FsChunk {
+        r#type: "fs.chunk".into(),
+        sid: id,
+        path: response_path,
+        offset,
+        data_b64: BASE64_STANDARD.encode(data),
+        total,
+        eof,
+    }))
+}
+
+async fn fs_put(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<FsPutRequest>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<FsWritten>, ApiError> {
+    let Json(input) = body.map_err(|_| Error::Invalid("invalid fs put".into()))?;
+    let root = session_workspace(&api, &id).await?;
+    let data = BASE64_STANDARD
+        .decode(&input.data_b64)
+        .map_err(|_| Error::Invalid("invalid base64".into()))?;
+    let path = input.path;
+    let response_path = path.clone();
+    let offset = input.offset;
+    let size = tokio::task::spawn_blocking(move || {
+        crate::project::write_chunk(&root, &path, offset, data)
+    })
+    .await
+    .map_err(|_| Error::Closed)??;
+    Ok(Json(FsWritten {
+        r#type: "fs.written".into(),
+        sid: id,
+        path: response_path,
+        size,
+    }))
+}
+
+async fn fs_mkdir(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<FsPathRequest>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<FsDone>, ApiError> {
+    let Json(input) = body.map_err(|_| Error::Invalid("invalid fs mkdir".into()))?;
+    let root = session_workspace(&api, &id).await?;
+    let path = input.path;
+    let response_path = path.clone();
+    tokio::task::spawn_blocking(move || crate::project::make_dir(&root, &path))
+        .await
+        .map_err(|_| Error::Closed)??;
+    Ok(Json(FsDone {
+        r#type: "fs.done".into(),
+        sid: id,
+        path: response_path,
+        op: "mkdir".into(),
+    }))
+}
+
+async fn fs_remove(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<FsPathRequest>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<FsDone>, ApiError> {
+    let Json(input) = body.map_err(|_| Error::Invalid("invalid fs remove".into()))?;
+    let root = session_workspace(&api, &id).await?;
+    let path = input.path;
+    let response_path = path.clone();
+    tokio::task::spawn_blocking(move || crate::project::remove_entry(&root, &path))
+        .await
+        .map_err(|_| Error::Closed)??;
+    Ok(Json(FsDone {
+        r#type: "fs.done".into(),
+        sid: id,
+        path: response_path,
+        op: "remove".into(),
+    }))
+}
+
+async fn fs_rename(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<FsRenameRequest>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<FsDone>, ApiError> {
+    let Json(input) = body.map_err(|_| Error::Invalid("invalid fs rename".into()))?;
+    let root = session_workspace(&api, &id).await?;
+    let from = input.path;
+    let response_path = from.clone();
+    let to = input.to;
+    tokio::task::spawn_blocking(move || crate::project::rename_entry(&root, &from, &to))
+        .await
+        .map_err(|_| Error::Closed)??;
+    Ok(Json(FsDone {
+        r#type: "fs.done".into(),
+        sid: id,
+        path: response_path,
+        op: "rename".into(),
+    }))
+}
+
+async fn git_status(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<GitStatusResult>, ApiError> {
+    let root = session_workspace(&api, &id).await?;
+    Ok(Json(crate::project::git_status(id, root).await?))
+}
+
+async fn git_diff(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    query: std::result::Result<Query<GitDiffQuery>, axum::extract::rejection::QueryRejection>,
+) -> std::result::Result<Json<GitDiffResult>, ApiError> {
+    let Query(query) = query.map_err(|_| Error::Invalid("invalid git diff query".into()))?;
+    let root = session_workspace(&api, &id).await?;
+    Ok(Json(
+        crate::project::git_diff(id, root, query.path, query.staged).await?,
+    ))
+}
+
+async fn git_stage(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<GitStageRequest>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<GitDone>, ApiError> {
+    let Json(input) = body.map_err(|_| Error::Invalid("invalid git stage".into()))?;
+    let root = session_workspace(&api, &id).await?;
+    crate::project::git_stage(root, input.paths, input.unstage).await?;
+    Ok(Json(GitDone {
+        r#type: "git.done".into(),
+        sid: id,
+        op: if input.unstage { "unstage" } else { "stage" }.into(),
+        detail: None,
+    }))
+}
+
+async fn git_discard(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<FsPathRequest>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<GitDone>, ApiError> {
+    let Json(input) = body.map_err(|_| Error::Invalid("invalid git discard".into()))?;
+    let root = session_workspace(&api, &id).await?;
+    crate::project::git_discard(root, input.path).await?;
+    Ok(Json(GitDone {
+        r#type: "git.done".into(),
+        sid: id,
+        op: "discard".into(),
+        detail: None,
+    }))
+}
+
+async fn git_commit(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<GitCommitRequest>, axum::extract::rejection::JsonRejection>,
+) -> std::result::Result<Json<GitDone>, ApiError> {
+    let Json(input) = body.map_err(|_| Error::Invalid("invalid git commit".into()))?;
+    let root = session_workspace(&api, &id).await?;
+    let detail = crate::project::git_commit(root, input.message).await?;
+    Ok(Json(GitDone {
+        r#type: "git.done".into(),
+        sid: id,
+        op: "commit".into(),
+        detail: Some(detail),
+    }))
 }
 
 #[derive(Debug, serde::Deserialize)]
