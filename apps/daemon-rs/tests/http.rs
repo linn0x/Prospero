@@ -77,6 +77,7 @@ async fn every_endpoint_requires_auth_and_rejects_browser_origins() {
         "/v1/sessions/example/fs/list?path=",
         "/v1/sessions/example/fs/read?path=file.txt",
         "/v1/sessions/example/fs/get?path=file.txt&offset=0&length=1",
+        "/v1/sessions/example/search",
         "/v1/sessions/example/git/status",
         "/v1/sessions/example/git/diff?path=file.txt&staged=false",
         "/v1/sessions/example/git/history",
@@ -313,6 +314,21 @@ async fn project_fs_routes_are_session_scoped_and_bounded() {
     let response = api
         .router()
         .oneshot(
+            request(&format!("/v1/sessions/{id}/fs/write"))
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"path":".git/config","contentB64":"","createNew":true}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = api
+        .router()
+        .oneshot(
             request(&format!(
                 "/v1/sessions/{id}/fs/get?path=new.txt&offset=1&length=2"
             ))
@@ -337,6 +353,27 @@ async fn project_fs_routes_are_session_scoped_and_bounded() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert!(workspace.path().join("tmp").is_dir());
+
+    let response = api
+        .router()
+        .oneshot(
+            request(&format!("/v1/sessions/{id}/search"))
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"query":"rust","caseSensitive":false,"wholeWord":true,"pathFilter":""})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let search = body(response).await;
+    assert_eq!(search["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(search["matches"][0]["path"], "new.txt");
+    assert_eq!(search["matches"][0]["line"], 1);
+    assert_eq!(search["matches"][0]["column"], 1);
 
     let response = api
         .router()

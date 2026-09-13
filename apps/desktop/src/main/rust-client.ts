@@ -4,7 +4,7 @@ import type { TimelinePage, TimelineQuery, TimelineLookupResult, TimelineTextQue
 import type { CreateTerminal, TerminalPage, TerminalQuery, TerminalSize, TerminalSnapshot } from "@prospero/protocol/rust-daemon";
 import type { AgentSend, AgentControlResult, AgentModeCatalog, AgentModelCatalog, AgentModelSelectionResult, AgentControlsProjection, CreateAgentSession, PermissionDecision, QuestionDecision, SubagentSnapshot, AgentQueue, AgentQueues } from "@prospero/protocol/rust-daemon";
 import type { AccountListResult, LaunchModelCatalog, SourceResult, UsageResult } from "@prospero/protocol/rust-daemon";
-import type { FsChunk, FsContent, FsDone, FsListing, FsWritten, GitDiffResult, GitDone, GitHistoryResult, GitStatusResult, WorkspaceSummaryResult } from "@prospero/protocol/rust-daemon";
+import type { FsChunk, FsContent, FsDone, FsListing, FsWritten, GitDiffResult, GitDone, GitHistoryResult, GitStatusResult, SearchResult as RustProjectSearchResult, WorkspaceSummaryResult } from "@prospero/protocol/rust-daemon";
 import type {
   AbandonRun, ApplyTaskGraph, CancelTask, CleanupWorktree, CompleteRun, CreateGate,
   CreateRun, CreateRunGraph, CreateTask, Dispatch, Gate, GraphMutationResult, ResolveGate,
@@ -206,6 +206,9 @@ export class RustClient {
   }
   fsRename(value: string, path: string, to: string, signal: AbortSignal | null = null): Promise<FsDone> {
     return this.json(`/v1/sessions/${id(value)}/fs/rename`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ path, to }) });
+  }
+  projectSearch(value: string, input: { query: string; caseSensitive: boolean; wholeWord: boolean; pathFilter: string }, signal: AbortSignal | null = null, timeoutMs = 15_000): Promise<RustProjectSearchResult> {
+    return this.json(`/v1/sessions/${id(value)}/search`, { method: "POST", signal, timeoutMs, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
   }
   gitStatus(value: string, signal: AbortSignal | null = null): Promise<GitStatusResult> {
     return this.json(`/v1/sessions/${id(value)}/git/status`, { signal });

@@ -179,6 +179,37 @@ pub struct GitDiffQuery {
     pub staged: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchMatch {
+    pub path: String,
+    #[ts(type = "number")]
+    pub line: usize,
+    #[ts(type = "number")]
+    pub column: usize,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchResult {
+    pub matches: Vec<SearchMatch>,
+    #[ts(type = "number")]
+    pub scanned: usize,
+    #[ts(type = "number")]
+    pub skipped: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProjectSearchRequest {
+    pub query: String,
+    pub case_sensitive: bool,
+    pub whole_word: bool,
+    pub path_filter: String,
+}
+
 #[derive(Debug, Deserialize, Serialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FsWriteRequest {
@@ -730,6 +761,270 @@ async fn git(cwd: PathBuf, args: Vec<String>, tolerant: bool) -> Result<String> 
         &output.stdout
     };
     Ok(String::from_utf8_lossy(bytes).to_string())
+}
+
+fn search_ignored(part: &str) -> bool {
+    matches!(
+        part,
+        ".git"
+            | "node_modules"
+            | ".runtime"
+            | "dist"
+            | "out"
+            | "build"
+            | "target"
+            | ".next"
+            | ".venv"
+            | "venv"
+            | "__pycache__"
+    )
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch == '_' || ch.is_alphanumeric()
+}
+
+fn line_match(line: &str, needle: &str, case_sensitive: bool, whole_word: bool) -> Option<usize> {
+    let haystack = if case_sensitive {
+        line.to_owned()
+    } else {
+        line.to_lowercase()
+    };
+    let mut from = 0;
+    while from <= haystack.len() {
+        let Some(byte_column) = haystack[from..].find(needle).map(|value| from + value) else {
+            break;
+        };
+        let before = haystack[..byte_column].chars().next_back();
+        let after = haystack[byte_column + needle.len()..].chars().next();
+        if !whole_word || (!before.is_some_and(is_word_char) && !after.is_some_and(is_word_char)) {
+            return Some(haystack[..byte_column].encode_utf16().count() + 1);
+        }
+        from = byte_column + needle.len();
+    }
+    None
+}
+
+fn line_snippet(line: &str, column: usize) -> String {
+    let chars = line.chars().collect::<Vec<_>>();
+    let start = column.saturating_sub(101).min(chars.len());
+    let end = (start + 400).min(chars.len());
+    let prefix = if start > 0 { "…" } else { "" };
+    format!("{prefix}{}", chars[start..end].iter().collect::<String>())
+}
+
+struct SearchContext<'a> {
+    deadline: Instant,
+    request: &'a ProjectSearchRequest,
+    needle: &'a str,
+}
+
+fn inspect_search_file(
+    root: &Path,
+    rel: &str,
+    needle: &str,
+    case_sensitive: bool,
+    whole_word: bool,
+    result: &mut SearchResult,
+) -> Result<()> {
+    validate_desktop_rel_path(rel, false)?;
+    let resolved = resolve_within(root, rel, false)?;
+    let metadata = std::fs::symlink_metadata(&resolved).map_err(|_| Error::NotFound)?;
+    if !metadata.is_file() || metadata.len() > MAX_EDIT_BYTES {
+        result.skipped += 1;
+        return Ok(());
+    }
+    let (content, _size, truncated, binary) = read_for_edit(root, rel)?;
+    result.scanned += 1;
+    if binary || truncated {
+        result.skipped += 1;
+        return Ok(());
+    }
+    let text = String::from_utf8_lossy(&content);
+    for (index, line) in text.split('\n').enumerate() {
+        if result.matches.len() >= 500 {
+            result.truncated = true;
+            return Ok(());
+        }
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if let Some(column) = line_match(line, needle, case_sensitive, whole_word) {
+            result.matches.push(SearchMatch {
+                path: rel.to_owned(),
+                line: index + 1,
+                column,
+                text: line_snippet(line, column),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn fallback_search_walk(
+    root: &Path,
+    dir: &str,
+    depth: usize,
+    visited: &mut usize,
+    context: &SearchContext<'_>,
+    result: &mut SearchResult,
+) -> Result<()> {
+    if depth > 30
+        || *visited > 20_000
+        || Instant::now() > context.deadline
+        || result.scanned >= 10_000
+        || result.matches.len() >= 500
+    {
+        result.truncated = true;
+        return Ok(());
+    }
+    let full_dir = root.join(dir);
+    let Ok(entries) = std::fs::read_dir(full_dir) else {
+        result.skipped += 1;
+        return Ok(());
+    };
+    for entry in entries {
+        if Instant::now() > context.deadline
+            || result.scanned >= 10_000
+            || result.matches.len() >= 500
+        {
+            result.truncated = true;
+            return Ok(());
+        }
+        *visited += 1;
+        if *visited > 20_000 {
+            result.truncated = true;
+            return Ok(());
+        }
+        let Ok(entry) = entry else {
+            result.skipped += 1;
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        if search_ignored(&name) {
+            continue;
+        }
+        let Ok(kind) = entry.file_type() else {
+            result.skipped += 1;
+            continue;
+        };
+        if kind.is_symlink() {
+            continue;
+        }
+        let rel = if dir.is_empty() {
+            name
+        } else {
+            format!("{dir}/{name}")
+        };
+        if kind.is_dir() {
+            fallback_search_walk(root, &rel, depth + 1, visited, context, result)?;
+        } else if kind.is_file()
+            && !(!context.request.path_filter.is_empty()
+                && !rel.to_lowercase().contains(&context.request.path_filter))
+        {
+            let _ = inspect_search_file(
+                root,
+                &rel,
+                context.needle,
+                context.request.case_sensitive,
+                context.request.whole_word,
+                result,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn search_files(
+    root: &Path,
+    files: Option<Vec<String>>,
+    request: ProjectSearchRequest,
+) -> Result<SearchResult> {
+    if request.query.len() > 256
+        || request.path_filter.len() > 256
+        || request.query.contains('\0')
+        || request.path_filter.contains('\0')
+    {
+        return Err(Error::Invalid("invalid search request".into()));
+    }
+    let mut result = SearchResult {
+        matches: Vec::new(),
+        scanned: 0,
+        skipped: 0,
+        truncated: false,
+    };
+    if request.query.trim().is_empty() {
+        return Ok(result);
+    }
+    let root = std::fs::canonicalize(root).map_err(|_| Error::NotFound)?;
+    let needle = if request.case_sensitive {
+        request.query.clone()
+    } else {
+        request.query.to_lowercase()
+    };
+    let deadline = Instant::now() + Duration::from_millis(12_000);
+    if let Some(files) = files {
+        let mut seen = HashSet::new();
+        for file in files {
+            if Instant::now() > deadline || result.scanned >= 10_000 || result.matches.len() >= 500
+            {
+                result.truncated = true;
+                break;
+            }
+            if !seen.insert(file.clone())
+                || file.split('/').any(search_ignored)
+                || (!request.path_filter.is_empty()
+                    && !file.to_lowercase().contains(&request.path_filter))
+            {
+                continue;
+            }
+            let _ = inspect_search_file(
+                &root,
+                &file,
+                &needle,
+                request.case_sensitive,
+                request.whole_word,
+                &mut result,
+            );
+        }
+    } else {
+        let mut visited = 0;
+        let context = SearchContext {
+            deadline,
+            request: &request,
+            needle: &needle,
+        };
+        fallback_search_walk(&root, "", 0, &mut visited, &context, &mut result)?;
+    }
+    Ok(result)
+}
+
+pub async fn project_search(
+    root: PathBuf,
+    mut request: ProjectSearchRequest,
+) -> Result<SearchResult> {
+    request.path_filter = request.path_filter.to_lowercase();
+    let files = git(
+        root.clone(),
+        vec![
+            "ls-files".into(),
+            "--cached".into(),
+            "--others".into(),
+            "--exclude-standard".into(),
+            "-z".into(),
+        ],
+        false,
+    )
+    .await
+    .ok()
+    .map(|output| {
+        output
+            .split('\0')
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    });
+    tokio::task::spawn_blocking(move || search_files(&root, files, request))
+        .await
+        .map_err(|_| Error::Closed)?
 }
 
 pub async fn workspace_branch(root: PathBuf) -> Result<Option<String>> {
