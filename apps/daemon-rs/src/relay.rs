@@ -793,6 +793,55 @@ impl RelayHostSession {
         }
     }
 
+    /// Send one `host.heartbeat` and wait for the matching acknowledgement.
+    /// The long-lived supervisor uses this as the bounded liveness primitive
+    /// before reconnecting a silent relay control socket.
+    pub async fn heartbeat_roundtrip(&mut self) -> Result<()> {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        self.control
+            .send(Message::Text(
+                serde_json::json!({
+                    "type":"host.heartbeat",
+                    "v":RELAY_PROTOCOL_VERSION,
+                    "generation":self.generation
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .map_err(|error| Error::Invalid(format!("relay heartbeat send failed: {error}")))?;
+
+        let Some(frame) = tokio::time::timeout(
+            Duration::from_millis(HEARTBEAT_ACK_TIMEOUT_MS),
+            self.control.next(),
+        )
+        .await
+        .map_err(|_| Error::Timeout)?
+        else {
+            return Err(Error::Invalid(
+                "relay host control closed before heartbeat ack".into(),
+            ));
+        };
+        let frame =
+            frame.map_err(|error| Error::Invalid(format!("relay heartbeat failed: {error}")))?;
+        let Message::Text(text) = frame else {
+            return Err(Error::Invalid("relay heartbeat ack must be text".into()));
+        };
+        let ack: serde_json::Value = serde_json::from_str(&text)?;
+        if ack["type"].as_str() == Some("host.heartbeat.ack")
+            && ack["v"] == RELAY_PROTOCOL_VERSION
+            && ack["generation"].as_u64() == Some(self.generation)
+        {
+            Ok(())
+        } else if ack["type"].as_str() == Some("error") {
+            Err(Error::Invalid("relay heartbeat returned error".into()))
+        } else {
+            Err(Error::Invalid("relay heartbeat ack is invalid".into()))
+        }
+    }
+
     /// Wait for one `stream.offer`, open `/v1/stream`, send `stream.accept`,
     /// and return after the relay answers `stream.ready`. The returned stream
     /// is ready to be handed to the E2E SecureChannel forwarding layer.
@@ -1017,6 +1066,66 @@ mod runtime_tests {
             });
         }
         assert!(device_sync_frame(&devices, 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn host_session_sends_bounded_heartbeat_roundtrip() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::accept_async;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (host_tcp, _) = listener.accept().await.unwrap();
+            let mut host = accept_async(host_tcp).await.unwrap();
+            let _auth = host.next().await.unwrap().unwrap();
+            let _sync = host.next().await.unwrap().unwrap();
+            host.send(Message::Text(
+                json!({"type":"host.device-sync.ack","v":RELAY_PROTOCOL_VERSION,"generation":3})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            host.send(Message::Text(
+                json!({
+                    "type":"host.ready",
+                    "v":RELAY_PROTOCOL_VERSION,
+                    "routeId":"CG1dTxTscx5Vm84XPQRwkXjI61ziPLQNbj7La6EVEyk",
+                    "generation":3
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            let heartbeat = match host.next().await.unwrap().unwrap() {
+                Message::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+                other => panic!("unexpected heartbeat frame: {other:?}"),
+            };
+            assert_eq!(
+                heartbeat,
+                json!({"type":"host.heartbeat","v":RELAY_PROTOCOL_VERSION,"generation":3})
+            );
+            host.send(Message::Text(
+                json!({"type":"host.heartbeat.ack","v":RELAY_PROTOCOL_VERSION,"generation":3})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        });
+
+        let client = RelayHostClient::new(
+            format!("ws://127.0.0.1:{addr_port}", addr_port = addr.port()),
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            Vec::new(),
+            3,
+        );
+        let mut session = client.connect_once().await.unwrap();
+        session.heartbeat_roundtrip().await.unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]
