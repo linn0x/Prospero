@@ -590,6 +590,7 @@ async fn route_remote_ws_message(
         "subagent.history.get" => remote_subagent_history(api, socket, channel, message).await,
         "usage.get" => remote_usage(api, socket, channel, message).await,
         "conversation.search" => remote_conversation_search(api, socket, channel, message).await,
+        "workspace.list" => remote_workspace_list(socket, channel, message).await,
         "workspace.summary" => remote_workspace_summary(api, socket, channel, message).await,
         "fs.list" => remote_fs_list(api, socket, channel, message).await,
         "fs.read" => remote_fs_read(api, socket, channel, message).await,
@@ -1066,6 +1067,75 @@ async fn remote_conversation_search(
     };
     match conversations {
         Ok(conversations) => out["conversations"] = serde_json::to_value(conversations)?,
+        Err(error) => out["error"] = json!(error.to_string()),
+    }
+    send_remote_json(socket, channel, &out).await
+}
+
+fn home_dir() -> Result<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| Error::Invalid("home directory is unavailable".into()))
+}
+
+async fn remote_workspace_list(
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let requested_root = message
+        .get("root")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("home")
+        .to_owned();
+    let path = message
+        .get("path")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let mkdir = message
+        .get("mkdir")
+        .and_then(JsonValue::as_str)
+        .map(str::to_owned);
+    let mut out = json!({
+        "type":"workspace.listing",
+        "root":requested_root,
+        "path":path,
+        "cwd":"",
+        "entries":[],
+    });
+    let root = match requested_root.as_str() {
+        "home" => home_dir()?,
+        "computer" => {
+            out["error"] = json!("computer root is not supported by this daemon build");
+            return send_remote_json(socket, channel, &out).await;
+        }
+        other if cfg!(windows) && other.len() == 2 && other.ends_with(':') => {
+            std::path::PathBuf::from(format!("{other}\\"))
+        }
+        _ => {
+            out["error"] = json!("invalid workspace root");
+            return send_remote_json(socket, channel, &out).await;
+        }
+    };
+    let cwd = root.join(&path);
+    out["cwd"] = json!(cwd.to_string_lossy());
+    let result = tokio::task::spawn_blocking(move || {
+        if let Some(name) = mkdir {
+            let target = if path.is_empty() {
+                name
+            } else {
+                format!("{path}/{name}")
+            };
+            crate::project::make_dir(&root, &target)?;
+        }
+        crate::project::list_dir(&root, &path)
+    })
+    .await
+    .map_err(|_| Error::Closed)?;
+    match result {
+        Ok(entries) => out["entries"] = serde_json::to_value(entries)?,
         Err(error) => out["error"] = json!(error.to_string()),
     }
     send_remote_json(socket, channel, &out).await
