@@ -19,6 +19,42 @@ use crate::worker::Database;
 
 const MAX_TURNS: usize = 16;
 
+fn decode_base64_lenient(input: &str) -> Result<Vec<u8>> {
+    fn value(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes = input.trim_end_matches('=').as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    for chunk in bytes.chunks(4) {
+        let mut sextets = [0u8; 4];
+        for (index, byte) in chunk.iter().enumerate() {
+            sextets[index] = value(*byte).ok_or_else(|| Error::Invalid("图片数据无效".into()))?;
+        }
+        match chunk.len() {
+            4 => {
+                out.push((sextets[0] << 2) | (sextets[1] >> 4));
+                out.push((sextets[1] << 4) | (sextets[2] >> 2));
+                out.push((sextets[2] << 6) | sextets[3]);
+            }
+            3 => {
+                out.push((sextets[0] << 2) | (sextets[1] >> 4));
+                out.push((sextets[1] << 4) | (sextets[2] >> 2));
+            }
+            2 => out.push((sextets[0] << 2) | (sextets[1] >> 4)),
+            0 => {}
+            _ => return Err(Error::Invalid("图片数据无效".into())),
+        }
+    }
+    Ok(out)
+}
+
 /// Latest card state carried between card-record rewrites.
 struct CardState {
     name: String,
@@ -80,9 +116,7 @@ async fn persist_attachment_bytes(
         }
         for (reference, attachment) in refs.into_iter().zip(attachments) {
             let path = attachment_path(&data, &session_id, &message_id, &reference.id)?;
-            let bytes = BASE64_STANDARD
-                .decode(attachment.data_b64.as_bytes())
-                .map_err(|_| Error::Invalid("图片数据无效".into()))?;
+            let bytes = decode_base64_lenient(&attachment.data_b64)?;
             std::fs::write(path, bytes)?;
         }
         Ok(())
