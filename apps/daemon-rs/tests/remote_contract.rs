@@ -186,6 +186,11 @@ async fn encrypted_ws_handshake_authenticates_and_routes_ping() {
         json!({"devices":[{"name":"phone","token":"paired-token-123456","allowShell":true,"createdAt":1}]}).to_string(),
     )
     .unwrap();
+    let seeded = api
+        .database
+        .call(|store| store.seed_conversation(1))
+        .await
+        .unwrap();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -323,6 +328,29 @@ async fn encrypted_ws_handshake_authenticates_and_routes_ping() {
     assert_eq!(accounts["requestId"], "accounts-1");
     assert_eq!(accounts["action"], "list");
     assert!(accounts["accounts"].is_array());
+
+    ws.send(Message::Text(
+        seal(
+            &cipher,
+            &mut send_count,
+            &json!({"type":"session.attach","sid":seeded.id}),
+        )
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let chat = match ws.next().await.unwrap().unwrap() {
+        Message::Text(text) => open(&cipher, &mut recv_count, &text),
+        other => panic!("unexpected chat snapshot frame: {other:?}"),
+    };
+    assert_eq!(chat["type"], "chat.snapshot");
+    assert_eq!(chat["sid"], seeded.id);
+    let events = chat["events"].as_array().unwrap();
+    assert!(events.iter().any(|event| event["kind"] == "user.message"));
+    assert!(events.iter().any(|event| event["kind"] == "text.delta"));
+    assert!(events.iter().any(|event| event["kind"] == "tool.start"));
+    assert!(events.iter().any(|event| event["kind"] == "tool.end"));
+    assert!(events.iter().any(|event| event["kind"] == "turn.end"));
 
     server.abort();
 }
