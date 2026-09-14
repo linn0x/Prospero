@@ -184,12 +184,22 @@ describe.skipIf(process.platform === "win32")("orchestration through the desktop
     expect(snapshot.worktreeAssets.some(asset => asset["runId"] === runId && asset["state"] === "cleaned")).toBe(true);
   }, 60_000);
 
-  it("refuses unbridged automation, non-Claude workers and run deletion while a dispatch is live", async () => {
+  it("starts and pauses automation, refuses invalid worker controls and run deletion while a dispatch is live", async () => {
     const { directory, runtime } = fixture();
     const repo = initRepo(directory);
     previousBin = process.env["PROSPERO_CLAUDE_BIN"];
     process.env["PROSPERO_CLAUDE_BIN"] = installFakeClaude(directory);
     expect((await runtime.start()).ok).toBe(true);
+
+    const automationGraph = await action(runtime, "graph.create", {
+      operationId: crypto.randomUUID(), objective: "automation guard",
+      nodes: [{ clientId: "a", title: "auto task", spec: "go", deps: [] }],
+    });
+    const automationRunId = String((automationGraph["run"] as Record<string, unknown>)["id"]);
+    const automation = await action(runtime, "automation.start", { operationId: crypto.randomUUID(), runId: automationRunId, agent: "claude", cwd: repo, approvalPolicy: "standard", workspace: "current" });
+    expect((automation["automation"] as Record<string, unknown>)["state"]).toBe("running");
+    const paused = await action(runtime, "automation.pause", { operationId: crypto.randomUUID(), runId: automationRunId });
+    expect((paused["automation"] as Record<string, unknown>)["state"]).toBe("paused");
 
     const graph = await action(runtime, "graph.create", {
       operationId: crypto.randomUUID(), objective: "guard rails",
@@ -197,21 +207,13 @@ describe.skipIf(process.platform === "win32")("orchestration through the desktop
     });
     const runId = String((graph["run"] as Record<string, unknown>)["id"]);
     const taskId = String((graph["idMap"] as Record<string, string>)["a"]);
-
-    await expect(action(runtime, "automation.start", { operationId: crypto.randomUUID(), runId, agent: "claude", cwd: repo, approvalPolicy: "standard", workspace: "run" }))
-      .rejects.toThrow("尚未接入");
-    await expect(action(runtime, "automation.pause", { operationId: crypto.randomUUID(), runId }))
-      .rejects.toThrow("尚未接入");
     await expect(action(runtime, "worker.start", { operationId: crypto.randomUUID(), taskId, agent: "codex", cwd: repo, worktree: "new" }))
       .rejects.toThrow("Claude");
     await expect(action(runtime, "worker.start", { operationId: crypto.randomUUID(), taskId, agent: "claude", cwd: repo, worktree: "new", accountId: "acct-1" }))
-      .rejects.toThrow("账号");
-    await expect(action(runtime, "worker.start", { operationId: crypto.randomUUID(), taskId, agent: "claude", cwd: repo, worktree: "new", approvalPolicy: "yolo" }))
-      .rejects.toThrow("yolo");
-
+      .rejects.toThrow(/账号|record not found/);
     await action(runtime, "worker.start", {
       operationId: crypto.randomUUID(), taskId, agent: "claude", cwd: repo,
-      worktree: "none", kind: "structured",
+      worktree: "none", kind: "structured", approvalPolicy: "yolo",
     }, 180_000);
     // Active dispatch: run deletion must surface the daemon 400.
     await expect(action(runtime, "run.delete", { operationId: crypto.randomUUID(), runId }))

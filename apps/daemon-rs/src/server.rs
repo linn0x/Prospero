@@ -33,7 +33,8 @@ use crate::error::{Error, Result};
 use crate::orchestration::{
     self, AbandonDispatch, AbandonRun, ApplyTaskGraph, CancelTask, CleanupWorktree, CompleteRun,
     CreateGate, CreateRun, CreateRunGraph, CreateTask, DeleteRun, DispatchTask, InspectWorktree,
-    MarkMessages, PostMessage, ResolveGate, SettleDispatch, StartWorker, StopWorker,
+    MarkMessages, PostMessage, ResolveGate, SettleDispatch, StartAutomation, StartWorker,
+    StopWorker,
 };
 use crate::pairing::{self, AuthFailure, DeviceRecord};
 use crate::project::{
@@ -209,6 +210,14 @@ impl Api {
             .route("/v1/runs/{id}/ready", get(ready_tasks))
             .route("/v1/runs/{id}/complete", post(complete_run))
             .route("/v1/runs/{id}/abandon", post(abandon_run))
+            .route(
+                "/v1/runs/{id}/automation/start",
+                post(start_automation_route),
+            )
+            .route(
+                "/v1/runs/{id}/automation/pause",
+                post(pause_automation_route),
+            )
             .route("/v1/runs/{id}/gates", post(create_gate))
             .route("/v1/tasks", get(list_tasks).post(create_task))
             .route("/v1/tasks/{id}", get(task))
@@ -584,6 +593,7 @@ fn remote_host_info(protocol_version: u8) -> JsonValue {
             "conversation.search.v1",
             "chat.attachment-previews.v1",
             "model.sources.v1",
+            "orchestration.automation.v1",
         ],
         "platform": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
@@ -685,15 +695,14 @@ async fn route_remote_ws_message(
         | "orchestration.task.retry"
         | "orchestration.graph.create"
         | "orchestration.graph.apply"
+        | "orchestration.automation.start"
+        | "orchestration.automation.pause"
         | "orchestration.worktree.inspect"
         | "orchestration.worktree.cleanup" => {
             remote_orchestration_control(api, socket, channel, device, message).await
         }
         "orchestration.worker.start" | "orchestration.worker.stop" => {
             remote_orchestration_control(api, socket, channel, device, message).await
-        }
-        "orchestration.automation.start" | "orchestration.automation.pause" => {
-            send_remote_json(socket, channel, &json!({"type":"error","code":"bad_message","message":format!("unsupported message type: {kind}")})).await
         }
         "conversation.search" => remote_conversation_search(api, socket, channel, message).await,
         "workspace.list" => remote_workspace_list(socket, channel, message).await,
@@ -1395,6 +1404,38 @@ async fn remote_orchestration_control(
             };
             api.call(move |store| store.apply_task_graph(input).map(|_| ()))
                 .await
+        }
+        "orchestration.automation.start" => {
+            let input = StartAutomation {
+                run_id: require_str(&message, "runId")?.to_owned(),
+                agent: message
+                    .get("agent")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()?
+                    .unwrap_or(AgentKind::Claude),
+                account_id: message
+                    .get("accountId")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_owned),
+                approval_policy: require_str(&message, "approvalPolicy")?.to_owned(),
+                workspace: message
+                    .get("workspace")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()?
+                    .ok_or_else(|| Error::Invalid("missing workspace".into()))?,
+                cwd: require_str(&message, "cwd")?.to_owned(),
+            };
+            orchestration::start_automation(&api.database, &api.agents, input)
+                .await
+                .map(|_| ())
+        }
+        "orchestration.automation.pause" => {
+            let run_id = require_str(&message, "runId")?.to_owned();
+            orchestration::pause_automation(&api.database, &run_id)
+                .await
+                .map(|_| ())
         }
         "orchestration.worktree.inspect" => {
             let asset_id = require_str(&message, "assetId")?.to_owned();
@@ -2678,6 +2719,7 @@ async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, Api
             "conversation.search.v1",
             "chat.attachment-previews.v1",
             "model.sources.v1",
+            "orchestration.automation.v1",
             "session.workspace.summary",
             "session.fs",
             "session.git",
@@ -4925,6 +4967,30 @@ async fn abandon_run(
     Ok(Json(run))
 }
 
+async fn start_automation_route(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<StartAutomation>, axum::extract::rejection::JsonRejection>,
+) -> JsonResult<orchestration::Run> {
+    let Json(input) =
+        body.map_err(|_| Error::Invalid("invalid automation start request".into()))?;
+    if input.run_id != id {
+        return Err(Error::Invalid("runId does not match route".into()).into());
+    }
+    let run = orchestration::start_automation(&api.database, &api.agents, input).await?;
+    api.publish();
+    Ok(Json(run))
+}
+
+async fn pause_automation_route(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> JsonResult<orchestration::Run> {
+    let run = orchestration::pause_automation(&api.database, &id).await?;
+    api.publish();
+    Ok(Json(run))
+}
+
 async fn create_gate(
     State(api): State<Api>,
     Path(id): Path<String>,
@@ -5119,6 +5185,7 @@ async fn settle_dispatch(
     let outcome = api
         .call(move |store| store.settle_dispatch(&id, request.success, &request.outcome))
         .await?;
+    orchestration::kick_automation(&api.database, &api.agents, &outcome.task.run_id).await;
     api.publish();
     Ok(Json(outcome))
 }
@@ -5192,6 +5259,7 @@ async fn resolve_gate(
     let gate = api
         .call(move |store| store.resolve_gate(&id, &request.decision))
         .await?;
+    orchestration::kick_automation(&api.database, &api.agents, &gate.run_id).await;
     api.publish();
     Ok(Json(gate))
 }

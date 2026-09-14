@@ -1,0 +1,1 @@
+-- Stage 20 migration is applied conditionally by Store::open because tests build historical fixtures from bundled schemas.

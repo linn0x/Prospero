@@ -104,8 +104,11 @@ pub async fn start_worker(
         "none" => "none",
         _ => return Err(Error::Invalid("worktree must be new or none".into())),
     };
-    if input.agent != crate::protocol::AgentKind::Claude {
-        return Err(Error::Invalid("Rust worker 当前仅支持 Claude".into()));
+    if !matches!(
+        input.agent,
+        crate::protocol::AgentKind::Claude | crate::protocol::AgentKind::Codex
+    ) {
+        return Err(Error::Invalid("Rust worker 当前仅支持 Claude/Codex".into()));
     }
     let policy = match input.approval_policy.as_deref().unwrap_or("standard") {
         "strict" | "standard" => false,
@@ -164,6 +167,17 @@ pub async fn start_worker(
     if run.status != RunStatus::Active {
         return Err(Error::Invalid(
             "the run is settled; history is read-only".into(),
+        ));
+    }
+    if matches!(
+        run.automation.as_ref().map(|automation| automation.state),
+        Some(AutomationState::Running)
+    ) && !operation_id
+        .as_deref()
+        .is_some_and(|id| id.starts_with("automation-"))
+    {
+        return Err(Error::Invalid(
+            "任务图正在自动执行；请先暂停，再编辑或手工派发".into(),
         ));
     }
 
