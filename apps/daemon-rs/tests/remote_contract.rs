@@ -193,6 +193,31 @@ async fn encrypted_ws_handshake_authenticates_and_routes_ping() {
         .call(|store| store.seed_conversation(1))
         .await
         .unwrap();
+    let seeded_for_history = seeded.id.clone();
+    api.database
+        .call(move |store| {
+            for index in 0..120 {
+                store.write_timeline(
+                    &seeded_for_history,
+                    TimelineWrite {
+                        id: format!("remote-history-{index}"),
+                        turn_id: format!("remote-history-turn-{index}"),
+                        expected_revision: 0,
+                        body: TimelineBody::Message {
+                            role: MessageRole::User,
+                            final_answer: false,
+                            attachments: Vec::new(),
+                        },
+                        text: format!("history event {index}"),
+                        replace: false,
+                        subagent_id: None,
+                    },
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -349,7 +374,16 @@ async fn encrypted_ws_handshake_authenticates_and_routes_ping() {
     assert_eq!(chat["type"], "chat.snapshot");
     assert_eq!(chat["sid"], seeded.id);
     let events = chat["events"].as_array().unwrap();
+    assert!(
+        events.len() > 100,
+        "chat snapshot should page through full timeline history"
+    );
     assert!(events.iter().any(|event| event["kind"] == "user.message"));
+    assert!(
+        events
+            .iter()
+            .any(|event| event["text"] == "history event 119")
+    );
     assert!(events.iter().any(|event| event["kind"] == "text.delta"));
     assert!(events.iter().any(|event| event["kind"] == "tool.start"));
     assert!(events.iter().any(|event| event["kind"] == "tool.end"));
