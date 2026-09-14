@@ -450,3 +450,152 @@ async fn automation_pause_prevents_next_dispatch() {
     let (_, dispatches) = send(&api, "GET", &format!("/v1/dispatches?runId={run_id}"), None).await;
     assert_eq!(dispatches.as_array().unwrap().len(), 1, "{dispatches}");
 }
+
+fn git(cwd: &std::path::Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn init_repo(root: &std::path::Path) -> std::path::PathBuf {
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["symbolic-ref", "HEAD", "refs/heads/master"]);
+    git(&repo, &["config", "user.email", "test@prospero.local"]);
+    git(&repo, &["config", "user.name", "Prospero Test"]);
+    git(&repo, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.join("README.md"), "# base\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-q", "-m", "base"]);
+    repo
+}
+
+#[tokio::test]
+async fn automation_run_workspace_registers_shared_worktree_asset() {
+    let (directory, api) = fixture().await;
+    let repo = init_repo(directory.path());
+    let subdir = repo.join("crates/app");
+    std::fs::create_dir_all(&subdir).unwrap();
+    let (_, created) = send(&api, "POST", "/v1/runs/graph", Some(graph_body())).await;
+    let run_id = created["run"]["id"].as_str().unwrap().to_owned();
+
+    let (status, run) = send(
+        &api,
+        "POST",
+        &format!("/v1/runs/{run_id}/automation/start"),
+        Some(json!({
+            "runId": run_id,
+            "agent": "claude",
+            "approvalPolicy": "standard",
+            "workspace": "run",
+            "cwd": subdir,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{run}");
+    assert_eq!(run["automation"]["workspace"], "run");
+    let canonical_subdir = std::fs::canonicalize(&subdir).unwrap();
+    assert_eq!(
+        run["automation"]["cwd"].as_str().unwrap(),
+        canonical_subdir.to_string_lossy()
+    );
+    let workspace_path = run["automation"]["workspacePath"].as_str().unwrap();
+    assert!(workspace_path.ends_with("crates/app"), "{workspace_path}");
+    assert_ne!(workspace_path, canonical_subdir.to_string_lossy());
+    assert!(
+        run["automation"]["branch"]
+            .as_str()
+            .unwrap()
+            .starts_with("prospero/")
+    );
+
+    let (status, assets) = send(&api, "GET", &format!("/v1/worktrees?runId={run_id}"), None).await;
+    assert_eq!(status, StatusCode::OK, "{assets}");
+    let assets = assets.as_array().unwrap();
+    assert_eq!(assets.len(), 1, "{assets:?}");
+    assert_eq!(assets[0]["kind"], "run");
+    assert!(std::path::Path::new(assets[0]["path"].as_str().unwrap()).is_dir());
+}
+
+#[tokio::test]
+async fn running_automation_rejects_graph_edits_and_manual_dispatch() {
+    let (directory, api) = fixture().await;
+    let workspace = directory.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let (_, created) = send(&api, "POST", "/v1/runs/graph", Some(graph_body())).await;
+    let run_id = created["run"]["id"].as_str().unwrap().to_owned();
+    let task_a = created["idMap"]["a"].as_str().unwrap().to_owned();
+
+    let (status, run) = send(
+        &api,
+        "POST",
+        &format!("/v1/runs/{run_id}/automation/start"),
+        Some(json!({
+            "runId": run_id,
+            "agent": "claude",
+            "approvalPolicy": "standard",
+            "workspace": "current",
+            "cwd": workspace,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{run}");
+
+    let (status, _) = send(
+        &api,
+        "POST",
+        "/v1/tasks",
+        Some(json!({"runId": run_id, "title": "late", "spec": "edit"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, _) = send(
+        &api,
+        "POST",
+        "/v1/runs/graph/apply",
+        Some(json!({
+            "runId": run_id,
+            "baseRevision": 1,
+            "operationId": "edit-during-automation",
+            "nodes": [{"clientId": task_a, "title": "A2", "spec": "edit"}]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, _) = send(
+        &api,
+        "POST",
+        "/v1/workers/start",
+        Some(json!({
+            "taskId": task_a,
+            "agent": "claude",
+            "cwd": workspace,
+            "worktree": "none",
+            "approvalPolicy": "standard",
+            "operationId": "manual-during-automation"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, _) = send(
+        &api,
+        "POST",
+        &format!("/v1/runs/{run_id}/complete"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
