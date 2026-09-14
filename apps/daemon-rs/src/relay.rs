@@ -9,6 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine;
@@ -1008,6 +1009,90 @@ pub struct RustDaemonPersistence {
     pub structured: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct RelayStatusHandle {
+    home: PathBuf,
+    status: Arc<Mutex<Option<RelayRuntimeStatus>>>,
+}
+
+impl RelayStatusHandle {
+    pub fn new(home: impl Into<PathBuf>) -> Self {
+        Self {
+            home: home.into(),
+            status: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn set(&self, status: RelayRuntimeStatus) {
+        if let Ok(mut current) = self.status.lock() {
+            *current = Some(status);
+        }
+    }
+
+    pub fn get(&self) -> Option<RelayRuntimeStatus> {
+        self.status.lock().ok().and_then(|status| status.clone())
+    }
+
+    pub fn write_minimal_status(
+        &self,
+        port: u16,
+        bind: Option<String>,
+        control_token: String,
+        capabilities: Vec<String>,
+        session_summary: crate::protocol::SessionSummary,
+        sessions: Vec<crate::protocol::SessionHead>,
+    ) -> Result<()> {
+        write_status_file(
+            &self.home,
+            &RustDaemonStatusSnapshot {
+                pid: std::process::id(),
+                full_access: false,
+                started_at: crate::database::now(),
+                built_at: crate::database::now(),
+                port,
+                bind,
+                control_token,
+                persistence: RustDaemonPersistence {
+                    pty: true,
+                    structured: true,
+                },
+                capabilities,
+                relay: self.get(),
+                session_summary,
+                sessions,
+            },
+        )
+    }
+}
+
+pub async fn serve_configured_relay_once<F, Fut>(
+    home: PathBuf,
+    dev_mode: bool,
+    status: RelayStatusHandle,
+    on_stream: F,
+) -> Result<()>
+where
+    F: FnOnce(
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+        ) -> Fut
+        + Send,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    let config = load_daemon_relay_config(&home)?;
+    let devices = crate::pairing::load_devices(&home)?;
+    status.set(relay_status_from_config(&config, &devices, dev_mode));
+    let Some(client) = relay_client_from_config(&home, &config, dev_mode)? else {
+        return Ok(());
+    };
+    let mut session = client.connect_once().await?;
+    status.set(session.status());
+    let stream = session.accept_one_stream().await?;
+    on_stream(stream).await;
+    Ok(())
+}
+
 pub fn write_status_file(home: &Path, snapshot: &RustDaemonStatusSnapshot) -> Result<()> {
     fs::create_dir_all(home)?;
     let destination = home.join("status.json");
@@ -1134,6 +1219,37 @@ mod runtime_tests {
             });
         }
         assert!(device_sync_frame(&devices, 1).is_err());
+    }
+
+    #[test]
+    fn relay_status_handle_writes_status_snapshot_with_relay() {
+        let home = tempfile::TempDir::new().unwrap();
+        let handle = RelayStatusHandle::new(home.path());
+        handle.set(publish_status(
+            RelayConnectionState::Offline,
+            Some("wss://relay.example.com".into()),
+            Some("CG1dTxTscx5Vm84XPQRwkXjI61ziPLQNbj7La6EVEyk".into()),
+            Some("relay network".into()),
+            &[],
+            0,
+            5,
+        ));
+        handle
+            .write_minimal_status(
+                7423,
+                Some("127.0.0.1".into()),
+                "local-control-token".into(),
+                vec!["relay.host.v1".into()],
+                crate::protocol::SessionSummary::default(),
+                Vec::new(),
+            )
+            .unwrap();
+        let status: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(home.path().join("status.json")).unwrap())
+                .unwrap();
+        assert_eq!(status["relay"]["state"], "offline");
+        assert_eq!(status["relay"]["lastError"], "relay network");
+        assert_eq!(status["capabilities"][0], "relay.host.v1");
     }
 
     #[test]
