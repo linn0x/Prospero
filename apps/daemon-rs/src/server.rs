@@ -2689,6 +2689,7 @@ async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, Api
     api.call(|_| Ok(())).await?;
     api.terminals.check()?;
     api.agents.check()?;
+    let relay = crate::relay::relay_status_from_home(api.database.directory(), false);
     Ok(Json(Health {
         api_version: API_VERSION,
         backend: "rust".into(),
@@ -2723,9 +2724,11 @@ async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, Api
             "session.workspace.summary",
             "session.fs",
             "session.git",
+            "relay.host.v1",
         ]
         .map(str::to_owned)
         .to_vec(),
+        relay,
     }))
 }
 

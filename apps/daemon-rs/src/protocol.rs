@@ -198,6 +198,8 @@ pub struct Health {
     pub active_runtime_sessions: usize,
     pub database_queue_capacity: usize,
     pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<crate::relay::RelayRuntimeStatus>,
 }
 
 #[derive(Debug, Deserialize, Serialize, TS)]
@@ -487,6 +489,9 @@ pub fn typescript() -> String {
         SessionLookupResult::decl(&config),
         ChangeEvent::decl(&config),
         EventPage::decl(&config),
+        crate::relay::RelayConnectionState::decl(&config),
+        crate::relay::RelayRuntimeDeviceStatus::decl(&config),
+        crate::relay::RelayRuntimeStatus::decl(&config),
         Health::decl(&config),
         RenameSession::decl(&config),
         EventQuery::decl(&config),
