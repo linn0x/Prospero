@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -424,23 +424,83 @@ async fn handle_remote_ws(api: Api, mut socket: WebSocket) {
     {
         return;
     }
-    while let Ok(Some(text)) = recv_text_frame(&mut socket).await {
-        let message = match channel.open(&text) {
-            Ok(message) => message,
-            Err(_) => {
-                close_ws(&mut socket, CLOSE_PROTOCOL, "crypto").await;
-                return;
-            }
-        };
-        if let Err(error) =
-            route_remote_ws_message(&api, &mut socket, &mut channel, &device, message).await
-            && send_remote_error(&mut socket, &mut channel, &error, None)
+    let mut state = RemoteWsState::default();
+    let mut changes = api.changes.subscribe();
+    loop {
+        tokio::select! {
+            frame = socket.recv() => {
+                let text = match frame {
+                    Some(Ok(Message::Text(text))) => text.to_string(),
+                    Some(Ok(Message::Binary(bytes))) => match String::from_utf8(bytes.to_vec()) {
+                        Ok(text) => text,
+                        Err(_) => {
+                            close_ws(&mut socket, CLOSE_PROTOCOL, "binary WebSocket frame is not UTF-8").await;
+                            return;
+                        }
+                    },
+                    Some(Ok(Message::Ping(bytes))) => {
+                        if socket.send(Message::Pong(bytes)).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    Some(Ok(Message::Pong(_))) => continue,
+                    Some(Ok(Message::Close(_))) | None => return,
+                    Some(Err(_)) => return,
+                };
+                let message = match channel.open(&text) {
+                    Ok(message) => message,
+                    Err(_) => {
+                        close_ws(&mut socket, CLOSE_PROTOCOL, "crypto").await;
+                        return;
+                    }
+                };
+                if let Err(error) = route_remote_ws_message(
+                    &api,
+                    &mut socket,
+                    &mut channel,
+                    &mut state,
+                    &device,
+                    message,
+                )
                 .await
-                .is_err()
-        {
-            return;
+                    && send_remote_error(&mut socket, &mut channel, &error, None)
+                        .await
+                        .is_err()
+                {
+                    return;
+                }
+            }
+            changed = changes.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                if flush_remote_ws_changes(&api, &mut socket, &mut channel, &mut state).await.is_err() {
+                    return;
+                }
+            }
         }
     }
+}
+
+#[derive(Debug, Default)]
+struct RemoteWsState {
+    pty_attachments: HashMap<String, RemotePtyAttachment>,
+    chat_attachments: HashMap<String, RemoteChatAttachment>,
+    session_revisions: HashMap<String, i64>,
+    orchestration_snapshot: Option<String>,
+}
+
+#[derive(Debug)]
+struct RemotePtyAttachment {
+    last_sent_seq: i64,
+    last_ack_seq: i64,
+}
+
+#[derive(Debug)]
+struct RemoteChatAttachment {
+    cursor_position: i64,
+    last_event_seq: i64,
 }
 
 async fn recv_text_frame(socket: &mut WebSocket) -> Result<Option<String>> {
@@ -553,6 +613,7 @@ async fn route_remote_ws_message(
     api: &Api,
     socket: &mut WebSocket,
     channel: &mut SecureChannel,
+    state: &mut RemoteWsState,
     device: &DeviceRecord,
     message: JsonValue,
 ) -> Result<()> {
@@ -566,7 +627,7 @@ async fn route_remote_ws_message(
             send_remote_json(socket, channel, &json!({"type":"connection.pong","id":id})).await
         }
         "session.create" => remote_session_create(api, socket, channel, device, message).await,
-        "session.attach" => remote_session_attach(api, socket, channel, message).await,
+        "session.attach" => remote_session_attach(api, socket, channel, state, message).await,
         "agent.accounts.list"
         | "agent.account.create"
         | "agent.account.api.create"
@@ -604,7 +665,16 @@ async fn route_remote_ws_message(
         "subagent.send" => remote_subagent_send(api, message).await,
         "subagent.history.get" => remote_subagent_history(api, socket, channel, message).await,
         "usage.get" => remote_usage(api, socket, channel, message).await,
-        "orchestration.snapshot" => send_orchestration_snapshot(api, socket, channel).await,
+        "orchestration.snapshot" => {
+            let snapshot = load_orchestration_snapshot(api).await?;
+            state.orchestration_snapshot = Some(serde_json::to_string(&snapshot)?);
+            send_remote_json(
+                socket,
+                channel,
+                &json!({"type":"orchestration.snapshot","snapshot":snapshot}),
+            )
+            .await
+        }
         "orchestration.gate.resolve"
         | "orchestration.run.create"
         | "orchestration.run.complete"
@@ -619,10 +689,10 @@ async fn route_remote_ws_message(
         | "orchestration.worktree.cleanup" => {
             remote_orchestration_control(api, socket, channel, device, message).await
         }
-        "orchestration.worker.start"
-        | "orchestration.worker.stop"
-        | "orchestration.automation.start"
-        | "orchestration.automation.pause" => {
+        "orchestration.worker.start" | "orchestration.worker.stop" => {
+            remote_orchestration_control(api, socket, channel, device, message).await
+        }
+        "orchestration.automation.start" | "orchestration.automation.pause" => {
             send_remote_json(socket, channel, &json!({"type":"error","code":"bad_message","message":format!("unsupported message type: {kind}")})).await
         }
         "conversation.search" => remote_conversation_search(api, socket, channel, message).await,
@@ -705,6 +775,14 @@ async fn route_remote_ws_message(
             api.terminals
                 .resize(sid, TerminalSize { cols, rows }.validate()?)
                 .await
+        }
+        "term.ack" => {
+            let sid = require_str(&message, "sid")?;
+            let seq = message.get("seq").and_then(JsonValue::as_i64).unwrap_or(0);
+            if let Some(att) = state.pty_attachments.get_mut(sid) {
+                att.last_ack_seq = seq;
+            }
+            Ok(())
         }
         _ => {
             send_remote_json(
@@ -1107,22 +1185,25 @@ async fn remote_usage(
     send_remote_json(socket, channel, &serde_json::to_value(result)?).await
 }
 
+async fn load_orchestration_snapshot(api: &Api) -> Result<JsonValue> {
+    api.call(|store| {
+        Ok(json!({
+            "runs": store.list_runs()?,
+            "tasks": store.list_tasks(None)?,
+            "dispatches": store.list_dispatches(None)?,
+            "gates": store.list_gates(None, None)?,
+            "worktreeAssets": store.list_worktree_assets(None)?,
+        }))
+    })
+    .await
+}
+
 async fn send_orchestration_snapshot(
     api: &Api,
     socket: &mut WebSocket,
     channel: &mut SecureChannel,
 ) -> Result<()> {
-    let snapshot = api
-        .call(|store| {
-            Ok(json!({
-                "runs": store.list_runs()?,
-                "tasks": store.list_tasks(None)?,
-                "dispatches": store.list_dispatches(None)?,
-                "gates": store.list_gates(None, None)?,
-                "worktreeAssets": store.list_worktree_assets(None)?,
-            }))
-        })
-        .await?;
+    let snapshot = load_orchestration_snapshot(api).await?;
     send_remote_json(
         socket,
         channel,
@@ -1228,6 +1309,55 @@ async fn remote_orchestration_control(
             let task_id = require_str(&message, "taskId")?.to_owned();
             api.call(move |store| store.retry_task(&task_id).map(|_| ()))
                 .await
+        }
+        "orchestration.worker.start" => {
+            let agent = message
+                .get("agent")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or(AgentKind::Claude);
+            let input = StartWorker {
+                task_id: require_str(&message, "taskId")?.to_owned(),
+                agent,
+                cwd: require_str(&message, "cwd")?.to_owned(),
+                worktree: message
+                    .get("worktree")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("new")
+                    .to_owned(),
+                approval_policy: message
+                    .get("approvalPolicy")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_owned),
+                account_id: message
+                    .get("accountId")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_owned),
+                operation_id: message
+                    .get("operationId")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_owned),
+            };
+            orchestration::start_worker(&api.database, &api.agents, input)
+                .await
+                .map(|_| ())
+        }
+        "orchestration.worker.stop" => {
+            let input = StopWorker {
+                task_id: require_str(&message, "taskId")?.to_owned(),
+                reason: message
+                    .get("reason")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_owned),
+                final_status: message
+                    .get("finalStatus")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_owned),
+            };
+            orchestration::stop_worker(&api.database, &api.agents, input)
+                .await
+                .map(|_| ())
         }
         "orchestration.graph.create" => {
             let input = CreateRunGraph {
@@ -1961,23 +2091,107 @@ async fn remote_session_attach(
     api: &Api,
     socket: &mut WebSocket,
     channel: &mut SecureChannel,
+    state: &mut RemoteWsState,
     message: JsonValue,
 ) -> Result<()> {
-    let sid = require_str(&message, "sid")?;
-    if let Ok(page) = api
+    let sid = require_str(&message, "sid")?.to_owned();
+    let last_seq = message.get("lastSeq").and_then(JsonValue::as_i64);
+    if remote_try_pty_attach(api, socket, channel, state, &sid, last_seq).await? {
+        return Ok(());
+    }
+    remote_chat_attach(api, socket, channel, state, message).await
+}
+
+async fn remote_try_pty_attach(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    state: &mut RemoteWsState,
+    sid: &str,
+    last_seq: Option<i64>,
+) -> Result<bool> {
+    let page = match api
         .terminals
-        .read(sid.to_owned(), TerminalQuery::default())
+        .read(
+            sid.to_owned(),
+            TerminalQuery {
+                after_seq: Some(last_seq.unwrap_or(0)),
+                wait_ms: None,
+            },
+        )
         .await
     {
-        let data_b64 = page
-            .events
-            .iter()
-            .filter_map(|event| match event {
-                TerminalEvent::Output { data_b64 } => Some(data_b64.as_str()),
-                TerminalEvent::Resize { .. } => None,
-            })
-            .collect::<String>();
-        return send_remote_json(
+        Ok(page) => page,
+        Err(Error::NotFound) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    state.pty_attachments.insert(
+        sid.to_owned(),
+        RemotePtyAttachment {
+            last_sent_seq: last_seq.unwrap_or(0),
+            last_ack_seq: last_seq.unwrap_or(0),
+        },
+    );
+    if last_seq.is_some() && !page.resync_required {
+        send_terminal_page(socket, channel, sid, &page).await?;
+        if let Some(att) = state.pty_attachments.get_mut(sid) {
+            att.last_sent_seq = page.next_seq.max(page.latest_seq);
+        }
+        return Ok(true);
+    }
+    send_terminal_snapshot(api, socket, channel, state, sid).await?;
+    Ok(true)
+}
+
+async fn send_terminal_snapshot(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    state: &mut RemoteWsState,
+    sid: &str,
+) -> Result<()> {
+    if let Some(snapshot) = api.terminals.snapshot(sid.to_owned()).await? {
+        send_remote_json(
+            socket,
+            channel,
+            &json!({
+                "type":"term.snapshot",
+                "sid":sid,
+                "ansi":"",
+                "dataB64": snapshot.data_b64,
+                "seq":snapshot.seq,
+                "cols":snapshot.size.cols,
+                "rows":snapshot.size.rows,
+            }),
+        )
+        .await?;
+        if let Some(att) = state.pty_attachments.get_mut(sid) {
+            att.last_sent_seq = snapshot.seq;
+        }
+        if let Ok(page) = api
+            .terminals
+            .read(
+                sid.to_owned(),
+                TerminalQuery {
+                    after_seq: Some(snapshot.seq),
+                    wait_ms: None,
+                },
+            )
+            .await
+            && !page.resync_required
+        {
+            send_terminal_page(socket, channel, sid, &page).await?;
+            if let Some(att) = state.pty_attachments.get_mut(sid) {
+                att.last_sent_seq = page.next_seq.max(page.latest_seq);
+            }
+        }
+    } else {
+        let page = api
+            .terminals
+            .read(sid.to_owned(), TerminalQuery::default())
+            .await?;
+        let data_b64 = terminal_page_output_b64(&page);
+        send_remote_json(
             socket,
             channel,
             &json!({
@@ -1990,9 +2204,40 @@ async fn remote_session_attach(
                 "rows":page.initial_size.rows,
             }),
         )
-        .await;
+        .await?;
+        if let Some(att) = state.pty_attachments.get_mut(sid) {
+            att.last_sent_seq = page.latest_seq;
+        }
     }
-    remote_chat_attach(api, socket, channel, message).await
+    Ok(())
+}
+
+async fn send_terminal_page(
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    sid: &str,
+    page: &TerminalPage,
+) -> Result<()> {
+    let data_b64 = terminal_page_output_b64(page);
+    if !data_b64.is_empty() {
+        send_remote_json(
+            socket,
+            channel,
+            &json!({"type":"term.output","sid":sid,"dataB64":data_b64,"seq":page.next_seq}),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn terminal_page_output_b64(page: &TerminalPage) -> String {
+    page.events
+        .iter()
+        .filter_map(|event| match event {
+            TerminalEvent::Output { data_b64 } => Some(data_b64.as_str()),
+            TerminalEvent::Resize { .. } => None,
+        })
+        .collect::<String>()
 }
 
 fn timeline_text_or_preview(store: &mut Store, sid: &str, record: &TimelineRecord) -> String {
@@ -2139,6 +2384,7 @@ async fn remote_chat_attach(
     api: &Api,
     socket: &mut WebSocket,
     channel: &mut SecureChannel,
+    state: &mut RemoteWsState,
     message: JsonValue,
 ) -> Result<()> {
     let sid = require_str(&message, "sid")?.to_owned();
@@ -2159,9 +2405,9 @@ async fn remote_chat_attach(
             Ok((page.latest_position, events))
         })
         .await?;
+    let mut ev_seq = last_seq.unwrap_or(latest);
     if last_seq.is_some() {
-        let mut ev_seq = last_seq.unwrap_or(0);
-        for body in events {
+        for body in &events {
             ev_seq += 1;
             send_remote_json(
                 socket,
@@ -2170,15 +2416,210 @@ async fn remote_chat_attach(
             )
             .await?;
         }
-        Ok(())
     } else {
         send_remote_json(
             socket,
             channel,
             &json!({"type":"chat.snapshot","sid":sid,"evSeq":latest,"events":events}),
         )
-        .await
+        .await?;
     }
+    state.chat_attachments.insert(
+        sid,
+        RemoteChatAttachment {
+            cursor_position: latest,
+            last_event_seq: ev_seq.max(latest),
+        },
+    );
+    Ok(())
+}
+
+async fn flush_remote_ws_changes(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    state: &mut RemoteWsState,
+) -> Result<()> {
+    flush_remote_session_states(api, socket, channel, state).await?;
+    flush_remote_orchestration_snapshot(api, socket, channel, state).await?;
+    flush_remote_chat_events(api, socket, channel, state).await?;
+    flush_remote_terminal_events(api, socket, channel, state).await
+}
+
+async fn flush_remote_session_states(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    state: &mut RemoteWsState,
+) -> Result<()> {
+    let page = api
+        .call(|store| {
+            store.sessions(SessionQuery {
+                limit: Some(100),
+                lifecycle: Some(SessionLifecycle::Active),
+                ..SessionQuery::default()
+            })
+        })
+        .await?;
+    let mut seen = HashSet::new();
+    for head in page.items {
+        seen.insert(head.id.clone());
+        let revision = head.revision;
+        if state
+            .session_revisions
+            .get(&head.id)
+            .is_none_or(|previous| *previous != revision)
+        {
+            state.session_revisions.insert(head.id.clone(), revision);
+            send_remote_json(
+                socket,
+                channel,
+                &json!({"type":"session.state","session":remote_session_info(head)}),
+            )
+            .await?;
+        }
+    }
+    state.session_revisions.retain(|sid, _| {
+        seen.contains(sid)
+            || state.pty_attachments.contains_key(sid)
+            || state.chat_attachments.contains_key(sid)
+    });
+    Ok(())
+}
+
+async fn flush_remote_orchestration_snapshot(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    state: &mut RemoteWsState,
+) -> Result<()> {
+    let Some(previous) = state.orchestration_snapshot.clone() else {
+        return Ok(());
+    };
+    let snapshot = load_orchestration_snapshot(api).await?;
+    let serialized = serde_json::to_string(&snapshot)?;
+    if serialized != previous {
+        send_remote_json(
+            socket,
+            channel,
+            &json!({"type":"orchestration.snapshot","snapshot":snapshot}),
+        )
+        .await?;
+        state.orchestration_snapshot = Some(serialized);
+    }
+    Ok(())
+}
+
+async fn flush_remote_chat_events(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    state: &mut RemoteWsState,
+) -> Result<()> {
+    let attached: Vec<(String, i64, i64)> = state
+        .chat_attachments
+        .iter()
+        .map(|(sid, att)| (sid.clone(), att.cursor_position, att.last_event_seq))
+        .collect();
+    for (sid, cursor_position, last_event_seq) in attached {
+        let sid_for_query = sid.clone();
+        let page = match api
+            .call(move |store| {
+                let page = store.timeline(
+                    &sid_for_query,
+                    TimelineQuery {
+                        after: Some(cursor_position),
+                        limit: Some(100),
+                        ..TimelineQuery::default()
+                    },
+                )?;
+                let mut bodies = Vec::new();
+                for record in &page.items {
+                    bodies.extend(timeline_record_events(store, &sid_for_query, record));
+                }
+                Ok((page.latest_position, bodies))
+            })
+            .await
+        {
+            Ok(page) => page,
+            Err(Error::NotFound) => {
+                state.chat_attachments.remove(&sid);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let (latest, bodies) = page;
+        if bodies.is_empty() {
+            state.chat_attachments.insert(
+                sid,
+                RemoteChatAttachment {
+                    cursor_position: latest,
+                    last_event_seq: last_event_seq.max(latest),
+                },
+            );
+            continue;
+        }
+        let mut ev_seq = last_event_seq;
+        for body in bodies {
+            ev_seq += 1;
+            send_remote_json(
+                socket,
+                channel,
+                &json!({"type":"agent.event","sid":sid,"evSeq":ev_seq,"body":body}),
+            )
+            .await?;
+        }
+        state.chat_attachments.insert(
+            sid,
+            RemoteChatAttachment {
+                cursor_position: latest,
+                last_event_seq: ev_seq.max(latest),
+            },
+        );
+    }
+    Ok(())
+}
+
+async fn flush_remote_terminal_events(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    state: &mut RemoteWsState,
+) -> Result<()> {
+    let attached: Vec<(String, i64)> = state
+        .pty_attachments
+        .iter()
+        .map(|(sid, att)| (sid.clone(), att.last_sent_seq))
+        .collect();
+    for (sid, last_seq) in attached {
+        let page = match api
+            .terminals
+            .read(
+                sid.clone(),
+                TerminalQuery {
+                    after_seq: Some(last_seq),
+                    wait_ms: None,
+                },
+            )
+            .await
+        {
+            Ok(page) => page,
+            Err(Error::NotFound) => {
+                state.pty_attachments.remove(&sid);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if page.resync_required {
+            send_terminal_snapshot(api, socket, channel, state, &sid).await?;
+            continue;
+        }
+        send_terminal_page(socket, channel, &sid, &page).await?;
+        if let Some(att) = state.pty_attachments.get_mut(&sid) {
+            att.last_sent_seq = page.next_seq.max(page.latest_seq);
+        }
+    }
+    Ok(())
 }
 
 fn require_str<'a>(value: &'a JsonValue, key: &str) -> Result<&'a str> {
