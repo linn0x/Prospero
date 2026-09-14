@@ -127,9 +127,18 @@ struct CodexRpc {
 
 impl CodexRpc {
     async fn start(cwd: PathBuf, env: &[(String, String)]) -> Result<Self> {
+        Self::start_with_args(cwd, env, &[]).await
+    }
+
+    async fn start_with_args(
+        cwd: PathBuf,
+        env: &[(String, String)],
+        app_server_args: &[String],
+    ) -> Result<Self> {
         let mut command = Command::new(codex_binary());
         command
             .arg("app-server")
+            .args(app_server_args)
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -612,7 +621,15 @@ pub(crate) async fn read_native_codex_models(
     data: &Path,
 ) -> Result<crate::agent::LaunchModelCatalog> {
     let (cwd, env) = native_codex_environment(data)?;
-    let mut rpc = CodexRpc::start(cwd, &env).await?;
+    read_codex_models(cwd, &env, &[]).await
+}
+
+async fn read_codex_models(
+    cwd: PathBuf,
+    env: &[(String, String)],
+    app_server_args: &[String],
+) -> Result<crate::agent::LaunchModelCatalog> {
+    let mut rpc = CodexRpc::start_with_args(cwd, env, app_server_args).await?;
     let result = async {
         let mut models = Vec::new();
         let mut cursor: Option<String> = None;

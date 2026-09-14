@@ -80,10 +80,34 @@ pub(crate) fn roots_dir(data: &Path) -> PathBuf {
     data.join("agent-accounts")
 }
 
+/// `<data>/agent-accounts/<agent>/<id>`. Legacy non-profile managed
+/// accounts are Claude-only; API profile roots follow the profile agent so
+/// Codex/OpenAI profiles get isolated CODEX_HOME directories compatible with
+/// the TypeScript daemon layout.
+fn account_root_for_agent(data: &Path, agent: &str, id: &str) -> Result<PathBuf> {
+    validate_account_id(id)?;
+    Ok(roots_dir(data).join(agent).join(id))
+}
+
 /// `<data>/agent-accounts/claude/<id>`.
 pub(crate) fn account_root(data: &Path, id: &str) -> Result<PathBuf> {
-    validate_account_id(id)?;
-    Ok(roots_dir(data).join("claude").join(id))
+    account_root_for_agent(data, "claude", id)
+}
+
+fn profile_account_root(data: &Path, id: &str, profile: &ApiProfile) -> Result<PathBuf> {
+    let agent = if super::profile::agent_kind(profile) == crate::protocol::AgentKind::Codex {
+        "codex"
+    } else {
+        "claude"
+    };
+    let root = account_root_for_agent(data, agent, id)?;
+    if agent == "codex" {
+        let legacy = account_root(data, id)?;
+        if !root.exists() && legacy.exists() {
+            return Ok(legacy);
+        }
+    }
+    Ok(root)
 }
 
 fn credential_path(root: &Path) -> PathBuf {
@@ -197,8 +221,12 @@ pub(crate) fn clean_api_key(raw: &str) -> Result<String> {
 
 /// Reads a profile account's API key; missing or non-key credentials are
 /// reported as `None` so snapshots can show `signed_out`.
-pub(crate) fn profile_secret(data: &Path, id: &str) -> Result<Option<String>> {
-    let root = account_root(data, id)?;
+pub(crate) fn profile_secret(
+    data: &Path,
+    id: &str,
+    profile: &ApiProfile,
+) -> Result<Option<String>> {
+    let root = profile_account_root(data, id, profile)?;
     match read_credential(&root)? {
         Some(Credential {
             kind: CredentialKind::ApiKey,
@@ -214,8 +242,8 @@ pub(crate) fn profile_account_environment(
     id: &str,
     profile: &ApiProfile,
 ) -> Result<Vec<(String, String)>> {
-    let root = account_root(data, id)?;
-    let secret = profile_secret(data, id)?.unwrap_or_default();
+    let root = profile_account_root(data, id, profile)?;
+    let secret = profile_secret(data, id, profile)?.unwrap_or_default();
     Ok(session_environment(&root, profile, &secret))
 }
 
@@ -448,7 +476,7 @@ impl crate::database::Store {
             params![id, name, becomes_default as i64, timestamp, profile_json],
         )?;
         transaction.commit()?;
-        let root = account_root(data, &id)?;
+        let root = profile_account_root(data, &id, profile)?;
         write_credential(
             &root,
             &Credential {
@@ -482,7 +510,7 @@ impl crate::database::Store {
         )?;
         transaction.commit()?;
         write_credential(
-            &account_root(data, id)?,
+            &profile_account_root(data, id, profile)?,
             &Credential {
                 kind: CredentialKind::ApiKey,
                 secret,
@@ -550,7 +578,7 @@ impl crate::database::Store {
         if let Some(secret) = trimmed_secret.filter(|secret| !secret.is_empty()) {
             let secret = clean_api_key(secret)?;
             write_credential(
-                &account_root(data, id)?,
+                &profile_account_root(data, id, &profile)?,
                 &Credential {
                     kind: CredentialKind::ApiKey,
                     secret,
@@ -590,7 +618,7 @@ impl crate::database::Store {
         let Some(profile) = record.api_profile else {
             return Err(Error::Invalid("此账号没有有效的 API Profile".into()));
         };
-        let current = revision(&profile, profile_secret(data, id)?.as_deref());
+        let current = revision(&profile, profile_secret(data, id, &profile)?.as_deref());
         if current != expected_revision {
             return Ok(false);
         }
@@ -615,7 +643,7 @@ impl crate::database::Store {
         let Some(profile) = record.api_profile else {
             return Err(Error::Invalid("此账号没有有效的 API Profile".into()));
         };
-        let current = revision(&profile, profile_secret(data, id)?.as_deref());
+        let current = revision(&profile, profile_secret(data, id, &profile)?.as_deref());
         if current != expected_revision {
             return Ok(false);
         }
@@ -633,7 +661,10 @@ impl crate::database::Store {
         let Some(profile) = record.api_profile else {
             return Err(Error::Invalid("此账号没有有效的 API Profile".into()));
         };
-        Ok(revision(&profile, profile_secret(data, id)?.as_deref()))
+        Ok(revision(
+            &profile,
+            profile_secret(data, id, &profile)?.as_deref(),
+        ))
     }
 
     pub(crate) fn rename_managed_account(&mut self, id: &str, raw_name: &str) -> Result<()> {
@@ -685,7 +716,11 @@ impl crate::database::Store {
             }
         }
         let credential = clean_credential(kind, secret)?;
-        write_credential(&account_root(data, id)?, &credential)?;
+        let root = match record.api_profile.as_ref() {
+            Some(profile) => profile_account_root(data, id, profile)?,
+            None => account_root(data, id)?,
+        };
+        write_credential(&root, &credential)?;
         self.connection.execute(
             "UPDATE managed_accounts SET updated_at=?1,api_validation=NULL, \
              api_validation_revision=NULL,api_engine_validation=NULL, \
@@ -706,7 +741,10 @@ impl crate::database::Store {
         if record.api_profile.is_some() && self.active_session_count(id)? > 0 {
             return Err(Error::InUse);
         }
-        let root = account_root(data, id)?;
+        let root = match record.api_profile.as_ref() {
+            Some(profile) => profile_account_root(data, id, profile)?,
+            None => account_root(data, id)?,
+        };
         match fs::remove_file(credential_path(&root)) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -726,7 +764,7 @@ impl crate::database::Store {
     /// Deletes metadata, the isolated config root, and any credential. A
     /// running session (structured turn or live login PTY) blocks deletion.
     pub(crate) fn delete_managed_account(&mut self, data: &Path, id: &str) -> Result<()> {
-        let _record = self.managed_account(id)?;
+        let record = self.managed_account(id)?;
         if super::sources::ModelSources::open(data)?.is_bound(id) {
             return Err(Error::InUse);
         }
@@ -735,7 +773,10 @@ impl crate::database::Store {
         }
         self.connection
             .execute("DELETE FROM managed_accounts WHERE id=?", [id])?;
-        let root = account_root(data, id)?;
+        let root = match record.api_profile.as_ref() {
+            Some(profile) => profile_account_root(data, id, profile)?,
+            None => account_root(data, id)?,
+        };
         match fs::remove_dir_all(&root) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

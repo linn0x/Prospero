@@ -805,7 +805,7 @@ async fn catalog_route_serves_managed_accounts_and_rejects_others() {
         "/v1/launch/models?agent=codex&accountId=x",
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, _) = get(
         &harness.app,
         harness.secret,

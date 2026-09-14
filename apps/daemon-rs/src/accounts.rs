@@ -581,15 +581,17 @@ async fn profile_row(
     runtime_ok: bool,
     model_source: Option<sources::SourceBindingView>,
 ) -> Result<NativeAccount> {
-    let data = database.directory().to_owned();
-    let id = record.id.clone();
-    let secret = tokio::task::spawn_blocking(move || managed::profile_secret(&data, &id))
-        .await
-        .map_err(|_| crate::error::Error::Closed)??;
     let profile = record
         .api_profile
         .as_ref()
         .expect("profile rows carry a parsed profile");
+    let data = database.directory().to_owned();
+    let id = record.id.clone();
+    let secret_profile = profile.clone();
+    let secret =
+        tokio::task::spawn_blocking(move || managed::profile_secret(&data, &id, &secret_profile))
+            .await
+            .map_err(|_| crate::error::Error::Closed)??;
     let (status, auth_method, detail) = if !runtime_ok {
         (
             AccountStatus::Unavailable,
