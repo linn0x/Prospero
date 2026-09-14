@@ -305,5 +305,24 @@ async fn encrypted_ws_handshake_authenticates_and_routes_ping() {
     assert!(orchestration["snapshot"]["gates"].is_array());
     assert!(orchestration["snapshot"]["worktreeAssets"].is_array());
 
+    ws.send(Message::Text(
+        seal(
+            &cipher,
+            &mut send_count,
+            &json!({"type":"agent.accounts.list","requestId":"accounts-1"}),
+        )
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let accounts = match ws.next().await.unwrap().unwrap() {
+        Message::Text(text) => open(&cipher, &mut recv_count, &text),
+        other => panic!("unexpected accounts frame: {other:?}"),
+    };
+    assert_eq!(accounts["type"], "agent.accounts.result");
+    assert_eq!(accounts["requestId"], "accounts-1");
+    assert_eq!(accounts["action"], "list");
+    assert!(accounts["accounts"].is_array());
+
     server.abort();
 }

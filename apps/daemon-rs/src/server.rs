@@ -567,6 +567,21 @@ async fn route_remote_ws_message(
         }
         "session.create" => remote_session_create(api, socket, channel, device, message).await,
         "session.attach" => remote_session_attach(api, socket, channel, message).await,
+        "agent.accounts.list"
+        | "agent.account.create"
+        | "agent.account.api.create"
+        | "agent.account.api.configure"
+        | "agent.account.api.test"
+        | "agent.account.api.models.get"
+        | "agent.account.config.get"
+        | "agent.account.config.set"
+        | "agent.account.rename"
+        | "agent.account.default"
+        | "agent.account.login"
+        | "agent.account.credential.set"
+        | "agent.account.logout"
+        | "agent.account.delete" => remote_accounts_control(api, socket, channel, message).await,
+        "model.source.action" => remote_model_sources_control(api, socket, channel, message).await,
         "launch.models.get" => remote_launch_models(api, socket, channel, message).await,
         "agent.models.get" => remote_agent_models(api, socket, channel, message).await,
         "agent.modes.get" => remote_agent_modes(api, socket, channel, message).await,
@@ -717,6 +732,57 @@ async fn send_remote_error(
         body["sid"] = json!(sid);
     }
     send_remote_json(socket, channel, &body).await
+}
+
+async fn send_http_json_response(
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    response: Response,
+) -> Result<()> {
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024 * 1024)
+        .await
+        .map_err(|_| Error::Closed)?;
+    let value: JsonValue = serde_json::from_slice(&bytes)?;
+    if status.is_success() || value.get("type").and_then(JsonValue::as_str).is_some() {
+        send_remote_json(socket, channel, &value).await
+    } else {
+        let code = value
+            .get("code")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("bad_message");
+        let message = value
+            .get("message")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("request failed");
+        send_remote_json(
+            socket,
+            channel,
+            &json!({"type":"error","code":code,"message":message}),
+        )
+        .await
+    }
+}
+
+async fn remote_accounts_control(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let response = accounts_route(State(api.clone()), Ok(Json(message))).await;
+    send_http_json_response(socket, channel, response).await
+}
+
+async fn remote_model_sources_control(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let control: crate::accounts::sources::SourceControl = serde_json::from_value(message)?;
+    let response = model_sources_route(State(api.clone()), Ok(Json(control))).await;
+    send_http_json_response(socket, channel, response).await
 }
 
 async fn remote_launch_models(
