@@ -1,7 +1,9 @@
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use prosperod_rs::auth::Token;
-use prosperod_rs::protocol::{API_VERSION, DATABASE_QUEUE_CAPACITY};
+use prosperod_rs::protocol::{
+    API_VERSION, DATABASE_QUEUE_CAPACITY, MessageRole, TimelineBody, TimelineWrite,
+};
 use prosperod_rs::server::Api;
 use prosperod_rs::worker::Database;
 use serde_json::{Value, json};
@@ -194,8 +196,9 @@ async fn encrypted_ws_handshake_authenticates_and_routes_ping() {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let server_api = api.clone();
     let server = tokio::spawn(async move {
-        axum::serve(listener, api.router()).await.unwrap();
+        axum::serve(listener, server_api.router()).await.unwrap();
     });
 
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
@@ -351,6 +354,45 @@ async fn encrypted_ws_handshake_authenticates_and_routes_ping() {
     assert!(events.iter().any(|event| event["kind"] == "tool.start"));
     assert!(events.iter().any(|event| event["kind"] == "tool.end"));
     assert!(events.iter().any(|event| event["kind"] == "turn.end"));
+    let ev_seq = chat["evSeq"].as_i64().unwrap();
+
+    let live_sid = seeded.id.clone();
+    api.database
+        .call(move |store| {
+            store.write_timeline(
+                &live_sid,
+                TimelineWrite {
+                    id: "remote-live-message".into(),
+                    turn_id: "remote-live-turn".into(),
+                    expected_revision: 0,
+                    body: TimelineBody::Message {
+                        role: MessageRole::Assistant,
+                        final_answer: true,
+                        attachments: Vec::new(),
+                    },
+                    text: "live update from rust".into(),
+                    replace: false,
+                    subagent_id: None,
+                },
+            )
+        })
+        .await
+        .unwrap();
+    api.publish();
+    let live = match tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+    {
+        Message::Text(text) => open(&cipher, &mut recv_count, &text),
+        other => panic!("unexpected live chat frame: {other:?}"),
+    };
+    assert_eq!(live["type"], "agent.event");
+    assert_eq!(live["sid"], seeded.id);
+    assert!(live["evSeq"].as_i64().unwrap() > ev_seq);
+    assert_eq!(live["body"]["kind"], "text.delta");
+    assert_eq!(live["body"]["delta"], "live update from rust");
 
     server.abort();
 }
