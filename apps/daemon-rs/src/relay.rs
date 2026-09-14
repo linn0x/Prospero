@@ -6,6 +6,11 @@
 //! layered on top of these primitives so tests can compare exact contract
 //! vectors before sockets are introduced.
 
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
 use base64::Engine;
 use base64::prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
@@ -32,6 +37,15 @@ pub const MAX_RELAY_DEVICE_CREDENTIALS: usize = 1024;
 pub const MAX_RELAY_GENERATION: u64 = 4_294_967_295;
 pub const RELAY_ROUTE_ID_DOMAIN: &str = "prospero.relay.v1.route-id\\0";
 pub const RELAY_DEVICE_CREDENTIAL_DOMAIN: &str = "prospero.relay.v1.device-credential\\0";
+pub const RELAY_SYNC_STATE_FILE: &str = "relay-sync-state.json";
+pub const MIN_RECONNECT_MS: u64 = 500;
+pub const MAX_RECONNECT_MS: u64 = 30_000;
+pub const HEARTBEAT_MS: u64 = 15_000;
+pub const AUTH_TIMEOUT_MS: u64 = 10_000;
+pub const DEVICE_SYNC_TIMEOUT_MS: u64 = 10_000;
+pub const READY_TIMEOUT_MS: u64 = 10_000;
+pub const HEARTBEAT_ACK_TIMEOUT_MS: u64 = 10_000;
+pub const MAX_RELAY_EXPIRES_AT_MS: u64 = 8_640_000_000_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -155,11 +169,15 @@ pub fn device_sync_frame(devices: &[DeviceRecord], generation: u64) -> Result<Re
         return Err(Error::Invalid("relay generation is invalid".into()));
     }
     let mut credentials = Vec::new();
+    let mut device_ids = HashSet::new();
     for device in devices.iter().take(MAX_RELAY_DEVICE_CREDENTIALS + 1) {
         let Some((device_id, token)) = device_relay_credentials(device) else {
             continue;
         };
         validate_opaque_id(device_id, MAX_RELAY_DEVICE_ID_CHARS, "deviceId")?;
+        if !device_ids.insert(device_id.to_owned()) {
+            return Err(Error::Invalid("duplicate relay deviceId".into()));
+        }
         credentials.push(RelayDeviceCredential {
             device_id: device_id.to_owned(),
             credential_digest: Some(derive_relay_device_credential_digest(token)?),
@@ -307,20 +325,325 @@ mod tests {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum RelayConnectionState {
+    Disabled,
+    Offline,
     Connecting,
     Syncing,
     Online,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayRuntimeDeviceStatus {
+    pub total: usize,
+    pub ready: usize,
+    pub needs_re_pair: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayRuntimeStatus {
+    pub enabled: bool,
+    pub state: RelayConnectionState,
+    pub url: Option<String>,
+    pub route_id: Option<String>,
+    pub updated_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_connected_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub devices: RelayRuntimeDeviceStatus,
+}
+
+pub type RelayHostSessionStatus = RelayRuntimeStatus;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_secret: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonRelayConfig {
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<RelayConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RelayHostSessionStatus {
-    pub state: RelayConnectionState,
-    pub url: String,
-    pub route_id: String,
-    pub generation: u64,
-    pub ready_devices: usize,
+struct RelayTarget {
+    url: String,
+    route_id: String,
+    host_secret: String,
+    devices: Vec<DeviceRecord>,
+    credential_fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RelaySyncState {
+    version: u8,
+    #[serde(default)]
+    routes: HashMap<String, u64>,
+}
+
+pub fn load_daemon_relay_config(home: &Path) -> Result<DaemonRelayConfig> {
+    let path = home.join("config.json");
+    if !path.exists() {
+        return Ok(DaemonRelayConfig {
+            port: Some(7423),
+            bind: None,
+            relay: None,
+        });
+    }
+    let raw = fs::read_to_string(path)?;
+    serde_json::from_str(&raw).map_err(|_| Error::Invalid("invalid daemon config".into()))
+}
+
+pub fn effective_relay_url(config: &DaemonRelayConfig) -> Option<String> {
+    config
+        .relay
+        .as_ref()
+        .and_then(|relay| relay.url.clone())
+        .filter(|url| !url.is_empty())
+        .or_else(|| {
+            std::env::var("PROSPERO_DEFAULT_RELAY_URL")
+                .ok()
+                .filter(|url| !url.is_empty())
+        })
+}
+
+fn relay_target_from_config(
+    config: &DaemonRelayConfig,
+    devices: Vec<DeviceRecord>,
+    dev_mode: bool,
+) -> Result<Option<RelayTarget>> {
+    let Some(relay) = config.relay.as_ref().filter(|relay| relay.enabled) else {
+        return Ok(None);
+    };
+    let Some(url) = effective_relay_url(config) else {
+        return Err(Error::Invalid("relay configuration incomplete".into()));
+    };
+    let Some(host_secret) = relay
+        .host_secret
+        .clone()
+        .filter(|secret| !secret.is_empty())
+    else {
+        return Err(Error::Invalid("relay configuration incomplete".into()));
+    };
+    validate_relay_url(&url, dev_mode)?;
+    let route_id = derive_relay_route_id(&host_secret)?;
+    let credential_fingerprint = device_snapshot_fingerprint(&devices);
+    Ok(Some(RelayTarget {
+        url,
+        route_id,
+        host_secret,
+        devices,
+        credential_fingerprint,
+    }))
+}
+
+pub fn relay_status_from_config(
+    config: &DaemonRelayConfig,
+    devices: &[DeviceRecord],
+    dev_mode: bool,
+) -> RelayRuntimeStatus {
+    let now = crate::database::now();
+    let Some(relay) = config.relay.as_ref().filter(|relay| relay.enabled) else {
+        return publish_status(
+            RelayConnectionState::Disabled,
+            None,
+            None,
+            None,
+            devices,
+            0,
+            now,
+        );
+    };
+    let requested_url = effective_relay_url(config);
+    let host_secret = relay.host_secret.clone();
+    let target = match (requested_url.clone(), host_secret) {
+        (Some(_), Some(_)) => relay_target_from_config(config, devices.to_vec(), dev_mode),
+        _ => Err(Error::Invalid("relay configuration incomplete".into())),
+    };
+    match target {
+        Ok(Some(target)) => publish_status(
+            RelayConnectionState::Connecting,
+            Some(target.url),
+            Some(target.route_id),
+            None,
+            devices,
+            0,
+            now,
+        ),
+        Ok(None) => publish_status(
+            RelayConnectionState::Disabled,
+            None,
+            None,
+            None,
+            devices,
+            0,
+            now,
+        ),
+        Err(error) => publish_status(
+            RelayConnectionState::Error,
+            requested_url,
+            None,
+            Some(error.to_string()),
+            devices,
+            0,
+            now,
+        ),
+    }
+}
+
+fn publish_status(
+    state: RelayConnectionState,
+    url: Option<String>,
+    route_id: Option<String>,
+    last_error: Option<String>,
+    devices: &[DeviceRecord],
+    ready: usize,
+    updated_at: i64,
+) -> RelayRuntimeStatus {
+    RelayRuntimeStatus {
+        enabled: state != RelayConnectionState::Disabled,
+        state,
+        url,
+        route_id,
+        updated_at,
+        last_connected_at: None,
+        last_error,
+        devices: RelayRuntimeDeviceStatus {
+            total: devices.len(),
+            ready,
+            needs_re_pair: devices
+                .iter()
+                .filter(|device| device_relay_credentials(device).is_none())
+                .count(),
+        },
+    }
+}
+
+fn device_snapshot_fingerprint(devices: &[DeviceRecord]) -> String {
+    let mut entries = devices
+        .iter()
+        .filter_map(|device| {
+            let (device_id, token) = device_relay_credentials(device)?;
+            Some(format!("{device_id}:{token}"))
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries.join("\n")
+}
+
+#[derive(Debug, Clone)]
+pub struct RelayGenerationJournal {
+    path: PathBuf,
+    routes: HashMap<String, u64>,
+}
+
+impl RelayGenerationJournal {
+    pub fn load(state_dir: impl AsRef<Path>) -> Self {
+        let path = state_dir.as_ref().join(RELAY_SYNC_STATE_FILE);
+        let routes = fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<RelaySyncState>(&raw).ok())
+            .filter(|state| state.version == 1)
+            .map(|state| {
+                state
+                    .routes
+                    .into_iter()
+                    .filter(|(route_id, generation)| {
+                        validate_sha256_b64url(route_id, "routeId").is_ok()
+                            && *generation <= MAX_RELAY_GENERATION
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self { path, routes }
+    }
+
+    pub fn generation_for(&self, route_id: &str) -> Option<u64> {
+        self.routes.get(route_id).copied()
+    }
+
+    pub fn next_generation(&mut self, route_id: &str) -> Result<u64> {
+        validate_sha256_b64url(route_id, "routeId")?;
+        let previous = self.routes.get(route_id).copied().unwrap_or(0);
+        if previous >= MAX_RELAY_GENERATION {
+            return Err(Error::Invalid("relay generation exhausted".into()));
+        }
+        let generation = previous + 1;
+        let mut routes = self.routes.clone();
+        routes.insert(route_id.to_owned(), generation);
+        let state = RelaySyncState { version: 1, routes };
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| Error::Invalid("invalid relay generation path".into()))?;
+        fs::create_dir_all(parent)?;
+        let tmp = self.path.with_file_name(format!(
+            ".{}.{}.tmp",
+            RELAY_SYNC_STATE_FILE,
+            uuid::Uuid::new_v4().simple()
+        ));
+        let bytes = serde_json::to_vec(&state)?;
+        fs::write(&tmp, [bytes, b"\n".to_vec()].concat())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+        }
+        if let Err(error) = fs::rename(&tmp, &self.path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(error.into());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600))?;
+        }
+        self.routes = state.routes;
+        Ok(generation)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayTimeouts {
+    pub auth: Duration,
+    pub device_sync: Duration,
+    pub ready: Duration,
+    pub heartbeat: Duration,
+    pub heartbeat_ack: Duration,
+    pub min_reconnect: Duration,
+    pub max_reconnect: Duration,
+}
+
+impl Default for RelayTimeouts {
+    fn default() -> Self {
+        Self {
+            auth: Duration::from_millis(AUTH_TIMEOUT_MS),
+            device_sync: Duration::from_millis(DEVICE_SYNC_TIMEOUT_MS),
+            ready: Duration::from_millis(READY_TIMEOUT_MS),
+            heartbeat: Duration::from_millis(HEARTBEAT_MS),
+            heartbeat_ack: Duration::from_millis(HEARTBEAT_ACK_TIMEOUT_MS),
+            min_reconnect: Duration::from_millis(MIN_RECONNECT_MS),
+            max_reconnect: Duration::from_millis(MAX_RECONNECT_MS),
+        }
+    }
 }
 
 pub struct RelayHostClient {
@@ -338,6 +661,8 @@ pub struct RelayHostSession {
     route_id: String,
     generation: u64,
     ready_devices: usize,
+    ready_device_ids: HashSet<String>,
+    active_stream_ids: HashSet<String>,
 }
 
 impl RelayHostClient {
@@ -366,9 +691,13 @@ impl RelayHostClient {
         validate_relay_url(&self.url, true)?;
         let route_id = derive_relay_route_id(&self.host_secret)?;
         let endpoint = relay_endpoint(&self.url, RELAY_HOST_PATH)?;
-        let (mut control, _) = tokio_tungstenite::connect_async(endpoint)
-            .await
-            .map_err(|error| Error::Invalid(format!("relay host connect failed: {error}")))?;
+        let (mut control, _) = tokio::time::timeout(
+            Duration::from_millis(AUTH_TIMEOUT_MS),
+            tokio_tungstenite::connect_async(endpoint),
+        )
+        .await
+        .map_err(|_| Error::Timeout)?
+        .map_err(|error| Error::Invalid(format!("relay host connect failed: {error}")))?;
         control
             .send(Message::Text(
                 serde_json::to_string(&host_auth_frame(&self.host_secret)?)?.into(),
@@ -376,7 +705,12 @@ impl RelayHostClient {
             .await
             .map_err(|error| Error::Invalid(format!("relay host auth send failed: {error}")))?;
         let sync = device_sync_frame(&self.devices, self.generation)?;
-        let ready_devices = sync.credentials.len();
+        let ready_device_ids = sync
+            .credentials
+            .iter()
+            .map(|credential| credential.device_id.clone())
+            .collect::<HashSet<_>>();
+        let ready_devices = ready_device_ids.len();
         control
             .send(Message::Text(serde_json::to_string(&sync)?.into()))
             .await
@@ -385,7 +719,13 @@ impl RelayHostClient {
         let mut acked = false;
         let mut ready = false;
         for _ in 0..8 {
-            let Some(frame) = control.next().await else {
+            let Some(frame) = tokio::time::timeout(
+                Duration::from_millis(DEVICE_SYNC_TIMEOUT_MS + READY_TIMEOUT_MS),
+                control.next(),
+            )
+            .await
+            .map_err(|_| Error::Timeout)?
+            else {
                 return Err(Error::Invalid(
                     "relay host control closed before ready".into(),
                 ));
@@ -422,6 +762,8 @@ impl RelayHostClient {
                     route_id,
                     generation: self.generation,
                     ready_devices,
+                    ready_device_ids,
+                    active_stream_ids: HashSet::new(),
                 });
             }
         }
@@ -430,13 +772,24 @@ impl RelayHostClient {
 }
 
 impl RelayHostSession {
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub fn status(&self) -> RelayHostSessionStatus {
-        RelayHostSessionStatus {
+        RelayRuntimeStatus {
+            enabled: true,
             state: RelayConnectionState::Online,
-            url: self.url.clone(),
-            route_id: self.route_id.clone(),
-            generation: self.generation,
-            ready_devices: self.ready_devices,
+            url: Some(self.url.clone()),
+            route_id: Some(self.route_id.clone()),
+            updated_at: crate::database::now(),
+            last_connected_at: Some(crate::database::now()),
+            last_error: None,
+            devices: RelayRuntimeDeviceStatus {
+                total: self.ready_devices,
+                ready: self.ready_devices,
+                needs_re_pair: 0,
+            },
         }
     }
 
@@ -468,22 +821,62 @@ impl RelayHostSession {
             if value["type"].as_str() != Some("stream.offer") {
                 continue;
             }
+            if value["v"] != RELAY_PROTOCOL_VERSION {
+                return Err(Error::Invalid(
+                    "relay stream.offer version is invalid".into(),
+                ));
+            }
             let stream_id = value["streamId"]
                 .as_str()
-                .ok_or_else(|| Error::Invalid("stream.offer missing streamId".into()))?;
+                .ok_or_else(|| Error::Invalid("stream.offer missing streamId".into()))?
+                .to_owned();
             let ticket = value["ticket"]
                 .as_str()
-                .ok_or_else(|| Error::Invalid("stream.offer missing ticket".into()))?;
-            let accept = stream_accept_frame(stream_id, ticket)?;
+                .ok_or_else(|| Error::Invalid("stream.offer missing ticket".into()))?
+                .to_owned();
+            let device_id = value["deviceId"]
+                .as_str()
+                .ok_or_else(|| Error::Invalid("stream.offer missing deviceId".into()))?
+                .to_owned();
+            let expires_at = value["expiresAt"]
+                .as_u64()
+                .ok_or_else(|| Error::Invalid("stream.offer missing expiresAt".into()))?;
+            validate_opaque_id(&stream_id, MAX_RELAY_STREAM_ID_CHARS, "streamId")?;
+            validate_opaque_id(&ticket, MAX_RELAY_TICKET_CHARS, "stream ticket")?;
+            validate_opaque_id(&device_id, MAX_RELAY_DEVICE_ID_CHARS, "deviceId")?;
+            if !self.ready_device_ids.contains(&device_id) {
+                self.revoke_stream(&stream_id, "revoked").await?;
+                continue;
+            }
+            if expires_at == 0
+                || expires_at > MAX_RELAY_EXPIRES_AT_MS
+                || expires_at <= crate::database::now() as u64
+            {
+                self.revoke_stream(&stream_id, "expired").await?;
+                continue;
+            }
+            if !self.active_stream_ids.insert(stream_id.clone()) {
+                self.revoke_stream(&stream_id, "normal").await?;
+                continue;
+            }
+            let accept = stream_accept_frame(&stream_id, &ticket)?;
             let endpoint = relay_endpoint(&self.url, RELAY_STREAM_PATH)?;
-            let (mut stream, _) = tokio_tungstenite::connect_async(endpoint)
-                .await
-                .map_err(|error| Error::Invalid(format!("relay stream connect failed: {error}")))?;
+            let (mut stream, _) = tokio::time::timeout(
+                Duration::from_millis(AUTH_TIMEOUT_MS),
+                tokio_tungstenite::connect_async(endpoint),
+            )
+            .await
+            .map_err(|_| Error::Timeout)?
+            .map_err(|error| Error::Invalid(format!("relay stream connect failed: {error}")))?;
             stream
                 .send(Message::Text(serde_json::to_string(&accept)?.into()))
                 .await
                 .map_err(|error| Error::Invalid(format!("relay stream accept failed: {error}")))?;
-            let Some(frame) = stream.next().await else {
+            let Some(frame) =
+                tokio::time::timeout(Duration::from_millis(READY_TIMEOUT_MS), stream.next())
+                    .await
+                    .map_err(|_| Error::Timeout)?
+            else {
                 return Err(Error::Invalid("relay stream closed before ready".into()));
             };
             let frame =
@@ -494,12 +887,31 @@ impl RelayHostSession {
             let ready: serde_json::Value = serde_json::from_str(&text)?;
             if ready["type"].as_str() == Some("stream.ready")
                 && ready["v"] == RELAY_PROTOCOL_VERSION
-                && ready["streamId"].as_str() == Some(stream_id)
+                && ready["streamId"].as_str() == Some(stream_id.as_str())
             {
                 return Ok(stream);
             }
             return Err(Error::Invalid("relay stream did not become ready".into()));
         }
+    }
+
+    async fn revoke_stream(&mut self, stream_id: &str, code: &str) -> Result<()> {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+
+        self.control
+            .send(Message::Text(
+                serde_json::json!({
+                    "type":"stream.revoke",
+                    "v":RELAY_PROTOCOL_VERSION,
+                    "streamId":stream_id,
+                    "code":code
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .map_err(|error| Error::Invalid(format!("relay stream revoke failed: {error}")))
     }
 }
 
@@ -507,6 +919,105 @@ impl RelayHostSession {
 mod runtime_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn config_status_and_generation_journal_match_ts_relay_contract() {
+        let home = tempfile::TempDir::new().unwrap();
+        let config = serde_json::json!({
+            "port": 7423,
+            "relay": {
+                "enabled": true,
+                "url": "wss://relay.example.com/root",
+                "hostSecret": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            }
+        });
+        fs::write(home.path().join("config.json"), config.to_string()).unwrap();
+        let loaded = load_daemon_relay_config(home.path()).unwrap();
+        assert_eq!(
+            effective_relay_url(&loaded).as_deref(),
+            Some("wss://relay.example.com/root")
+        );
+
+        let devices = vec![
+            DeviceRecord {
+                name: "ready".into(),
+                token: "pairing-token".into(),
+                client_pub_key: None,
+                allow_shell: true,
+                allow_orchestration: None,
+                relay_device_id: Some("device-id-abcdefgh".into()),
+                relay_token: Some("relay-token-abcdefghijkl".into()),
+                relay_credential_issued: Some(true),
+                created_at: 1,
+                last_seen_at: None,
+            },
+            DeviceRecord {
+                name: "legacy".into(),
+                token: "pairing-token-2".into(),
+                client_pub_key: None,
+                allow_shell: true,
+                allow_orchestration: None,
+                relay_device_id: None,
+                relay_token: None,
+                relay_credential_issued: None,
+                created_at: 1,
+                last_seen_at: None,
+            },
+        ];
+        let status = relay_status_from_config(&loaded, &devices, false);
+        assert!(status.enabled);
+        assert_eq!(status.state, RelayConnectionState::Connecting);
+        assert_eq!(
+            status.route_id.as_deref(),
+            Some("CG1dTxTscx5Vm84XPQRwkXjI61ziPLQNbj7La6EVEyk")
+        );
+        assert_eq!(status.devices.total, 2);
+        assert_eq!(status.devices.ready, 0);
+        assert_eq!(status.devices.needs_re_pair, 1);
+
+        let mut journal = RelayGenerationJournal::load(home.path());
+        assert_eq!(
+            journal.generation_for(status.route_id.as_ref().unwrap()),
+            None
+        );
+        assert_eq!(
+            journal
+                .next_generation(status.route_id.as_ref().unwrap())
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            journal
+                .next_generation(status.route_id.as_ref().unwrap())
+                .unwrap(),
+            2
+        );
+        let reloaded = RelayGenerationJournal::load(home.path());
+        assert_eq!(
+            reloaded.generation_for(status.route_id.as_ref().unwrap()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn device_sync_rejects_duplicate_relay_device_ids() {
+        let mut devices = Vec::new();
+        for name in ["one", "two"] {
+            devices.push(DeviceRecord {
+                name: name.into(),
+                token: format!("relay-token-{name}-abcdefghijkl"),
+                client_pub_key: None,
+                allow_shell: true,
+                allow_orchestration: None,
+                relay_device_id: Some("device-id-abcdefgh".into()),
+                relay_token: Some(format!("relay-token-{name}-abcdefghijkl")),
+                relay_credential_issued: Some(true),
+                created_at: 1,
+                last_seen_at: None,
+            });
+        }
+        assert!(device_sync_frame(&devices, 1).is_err());
+    }
 
     #[tokio::test]
     async fn host_client_connects_syncs_and_accepts_stream_offer() {
@@ -626,7 +1137,7 @@ mod runtime_tests {
         );
         let mut session = client.connect_once().await.unwrap();
         assert_eq!(session.status().state, RelayConnectionState::Online);
-        assert_eq!(session.status().ready_devices, 1);
+        assert_eq!(session.status().devices.ready, 1);
         let _stream = session.accept_one_stream().await.unwrap();
         server.await.unwrap();
     }
