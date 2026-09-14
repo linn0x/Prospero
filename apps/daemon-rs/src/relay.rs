@@ -646,6 +646,25 @@ impl Default for RelayTimeouts {
     }
 }
 
+pub fn relay_client_from_config(
+    home: &Path,
+    config: &DaemonRelayConfig,
+    dev_mode: bool,
+) -> Result<Option<RelayHostClient>> {
+    let devices = crate::pairing::load_devices(home)?;
+    let Some(target) = relay_target_from_config(config, devices, dev_mode)? else {
+        return Ok(None);
+    };
+    let mut journal = RelayGenerationJournal::load(home);
+    let generation = journal.next_generation(&target.route_id)?;
+    Ok(Some(RelayHostClient::new(
+        target.url,
+        target.host_secret,
+        target.devices,
+        generation,
+    )))
+}
+
 pub struct RelayHostClient {
     url: String,
     host_secret: String,
@@ -964,6 +983,55 @@ impl RelayHostSession {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RustDaemonStatusSnapshot {
+    pub pid: u32,
+    pub full_access: bool,
+    pub started_at: i64,
+    pub built_at: i64,
+    pub port: u16,
+    pub bind: Option<String>,
+    pub control_token: String,
+    pub persistence: RustDaemonPersistence,
+    pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<RelayRuntimeStatus>,
+    pub session_summary: crate::protocol::SessionSummary,
+    pub sessions: Vec<crate::protocol::SessionHead>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RustDaemonPersistence {
+    pub pty: bool,
+    pub structured: bool,
+}
+
+pub fn write_status_file(home: &Path, snapshot: &RustDaemonStatusSnapshot) -> Result<()> {
+    fs::create_dir_all(home)?;
+    let destination = home.join("status.json");
+    let temporary = home.join(format!(
+        ".status.json.{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let bytes = serde_json::to_vec_pretty(snapshot)?;
+    let result = (|| -> Result<()> {
+        fs::write(&temporary, [bytes, b"\n".to_vec()].concat())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
+        }
+        fs::rename(&temporary, destination)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
+
 #[cfg(test)]
 mod runtime_tests {
     use super::*;
@@ -1066,6 +1134,83 @@ mod runtime_tests {
             });
         }
         assert!(device_sync_frame(&devices, 1).is_err());
+    }
+
+    #[test]
+    fn relay_client_from_config_advances_generation_and_status_file_is_safe() {
+        let home = tempfile::TempDir::new().unwrap();
+        fs::write(
+            home.path().join("config.json"),
+            serde_json::json!({
+                "relay": {
+                    "enabled": true,
+                    "url": "wss://relay.example.com/root",
+                    "hostSecret": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            home.path().join("devices.json"),
+            serde_json::json!({"devices":[{
+                "name":"ready",
+                "token":"pairing-token",
+                "allowShell":true,
+                "relayDeviceId":"device-id-abcdefgh",
+                "relayToken":"relay-token-abcdefghijkl",
+                "relayCredentialIssued":true,
+                "createdAt":1
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+        let config = load_daemon_relay_config(home.path()).unwrap();
+        let client = relay_client_from_config(home.path(), &config, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(client.generation, 1);
+        let second = relay_client_from_config(home.path(), &config, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.generation, 2);
+
+        let relay = relay_status_from_config(&config, &second.devices, false);
+        let snapshot = RustDaemonStatusSnapshot {
+            pid: 7,
+            full_access: false,
+            started_at: 1,
+            built_at: 2,
+            port: 7423,
+            bind: Some("127.0.0.1".into()),
+            control_token: "local-control-token".into(),
+            persistence: RustDaemonPersistence {
+                pty: true,
+                structured: true,
+            },
+            capabilities: vec!["relay.host.v1".into()],
+            relay: Some(relay),
+            session_summary: crate::protocol::SessionSummary::default(),
+            sessions: Vec::new(),
+        };
+        write_status_file(home.path(), &snapshot).unwrap();
+        let status = fs::read_to_string(home.path().join("status.json")).unwrap();
+        assert!(status.contains("relay.host.v1"));
+        assert!(!status.contains("hostSecret"));
+        assert!(!status.contains("relay-token-abcdefghijkl"));
+        assert!(!status.contains("ticket"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(home.path().join("status.json"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
     }
 
     #[tokio::test]
