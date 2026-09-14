@@ -1992,12 +1992,193 @@ async fn remote_session_attach(
         )
         .await;
     }
-    send_remote_json(
-        socket,
-        channel,
-        &json!({"type":"error","code":"session_not_found","message":format!("no such session: {sid}"),"sid":sid}),
-    )
-    .await
+    remote_chat_attach(api, socket, channel, message).await
+}
+
+fn timeline_text_or_preview(store: &mut Store, sid: &str, record: &TimelineRecord) -> String {
+    store
+        .timeline_text(sid, &record.id, TimelineTextQuery::default())
+        .map(|page| page.text)
+        .unwrap_or_else(|_| record.preview.clone())
+}
+
+fn timeline_record_events(store: &mut Store, sid: &str, record: &TimelineRecord) -> Vec<JsonValue> {
+    match &record.body {
+        TimelineBody::Message {
+            role,
+            final_answer,
+            attachments,
+        } => {
+            let text = timeline_text_or_preview(store, sid, record);
+            if *role == MessageRole::User {
+                vec![json!({
+                    "kind":"user.message",
+                    "msgId":record.id,
+                    "text":text,
+                    "attachments":attachments,
+                })]
+            } else {
+                vec![json!({
+                    "kind":"text.delta",
+                    "msgId":record.id,
+                    "textId":record.id,
+                    "delta":text,
+                    "replace":true,
+                    "phase": if *final_answer { "final_answer" } else { "commentary" },
+                })]
+            }
+        }
+        TimelineBody::Reasoning => vec![json!({
+            "kind":"reasoning.delta",
+            "msgId":record.id,
+            "delta":timeline_text_or_preview(store, sid, record),
+        })],
+        TimelineBody::Tool {
+            name,
+            state,
+            summary,
+            diff,
+            has_more,
+        } => {
+            let state_wire = match state {
+                ToolState::Running => "running",
+                ToolState::Success => "success",
+                ToolState::Failed => "failed",
+            };
+            let mut events = vec![json!({
+                "kind":"tool.start",
+                "msgId":record.turn_id,
+                "callId":record.id,
+                "tool":name,
+                "summary":summary,
+                "diff":diff,
+            })];
+            if *state != ToolState::Running {
+                events.push(json!({
+                    "kind":"tool.end",
+                    "callId":record.id,
+                    "state":state_wire,
+                    "summary":summary,
+                    "hasMore":has_more,
+                    "diff":diff,
+                }));
+            }
+            events
+        }
+        TimelineBody::PermissionRequest {
+            request_id,
+            tool,
+            resolved,
+            ..
+        } => {
+            if *resolved {
+                vec![json!({"kind":"permission.resolved","reqId":request_id,"reply":"once"})]
+            } else {
+                vec![json!({
+                    "kind":"permission.request",
+                    "reqId":request_id,
+                    "action":tool,
+                    "resources":[],
+                    "summary":record.preview,
+                })]
+            }
+        }
+        TimelineBody::Question {
+            request_id,
+            questions,
+            resolved,
+            ..
+        } => {
+            if *resolved {
+                vec![
+                    json!({"kind":"question.resolved","reqId":request_id,"answers":[],"cancelled":true}),
+                ]
+            } else {
+                vec![json!({"kind":"question.request","reqId":request_id,"questions":questions})]
+            }
+        }
+        TimelineBody::TurnEnd { finish, diffs } => vec![json!({
+            "kind":"turn.end",
+            "msgId":record.id,
+            "turnId":record.turn_id,
+            "finish":finish,
+            "diffs":diffs,
+        })],
+        TimelineBody::Subagent {
+            subagent_id,
+            name,
+            role,
+            task,
+            status,
+            can_message,
+            summary,
+            created_at,
+            updated_at,
+        } => vec![json!({
+            "kind":"subagent.started",
+            "subagent":{
+                "id":subagent_id,
+                "name":name,
+                "role":role,
+                "task":task,
+                "status":status,
+                "canMessage":can_message,
+                "createdAt":created_at,
+                "updatedAt":updated_at,
+                "preview":summary,
+            }
+        })],
+        TimelineBody::Error => vec![json!({
+            "kind":"agent.error",
+            "message":timeline_text_or_preview(store, sid, record),
+        })],
+    }
+}
+
+async fn remote_chat_attach(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let sid = require_str(&message, "sid")?.to_owned();
+    let last_seq = message.get("lastSeq").and_then(JsonValue::as_i64);
+    let sid_for_query = sid.clone();
+    let (latest, events) = api
+        .call(move |store| {
+            let query = TimelineQuery {
+                after: last_seq,
+                limit: Some(100),
+                ..TimelineQuery::default()
+            };
+            let page = store.timeline(&sid_for_query, query)?;
+            let mut events = Vec::new();
+            for record in &page.items {
+                events.extend(timeline_record_events(store, &sid_for_query, record));
+            }
+            Ok((page.latest_position, events))
+        })
+        .await?;
+    if last_seq.is_some() {
+        let mut ev_seq = last_seq.unwrap_or(0);
+        for body in events {
+            ev_seq += 1;
+            send_remote_json(
+                socket,
+                channel,
+                &json!({"type":"agent.event","sid":sid,"evSeq":ev_seq,"body":body}),
+            )
+            .await?;
+        }
+        Ok(())
+    } else {
+        send_remote_json(
+            socket,
+            channel,
+            &json!({"type":"chat.snapshot","sid":sid,"evSeq":latest,"events":events}),
+        )
+        .await
+    }
 }
 
 fn require_str<'a>(value: &'a JsonValue, key: &str) -> Result<&'a str> {
