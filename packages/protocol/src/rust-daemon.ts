@@ -122,7 +122,10 @@ export type TaskStatus = "pending" | "dispatched" | "blocked" | "done" | "failed
 export type DispatchState = "starting" | "running" | "succeeded" | "failed" | "abandoned";
 export type GateStatus = "pending" | "resolved" | "cancelled";
 export type MessageType = "note" | "ask" | "reply" | "report";
-export type Run = { id: string, objective: string, status: RunStatus, coordinatorSessionId: string | null, graphRevision: number, createdAt: number, updatedAt: number, };
+export type AutomationState = "running" | "paused" | "completed";
+export type AutomationWorkspace = "run" | "current";
+export type RunAutomation = { state: AutomationState, agent: AgentKind, accountId?: string | undefined, approvalPolicy: string, workspace: AutomationWorkspace, cwd: string, workspacePath: string, branch: string | null, startedAt: number, updatedAt: number, lastError: string | null, };
+export type Run = { id: string, objective: string, status: RunStatus, coordinatorSessionId: string | null, automation: RunAutomation | null, graphRevision: number, createdAt: number, updatedAt: number, };
 export type Task = { id: string, runId: string, title: string, spec: string, skills: Array<string>, deps: Array<string>, parentId: string | null, status: TaskStatus, result: string | null, createdAt: number, updatedAt: number, };
 export type Dispatch = { id: string, runId: string, taskId: string, sessionId: string, state: DispatchState, outcome: string | null, startedAt: number, settledAt: number | null, 
 /**
@@ -180,6 +183,7 @@ export type CreateRun = { objective: string, coordinatorSessionId: string | null
 export type CreateTask = { runId: string, title: string, spec: string, skills: Array<string>, deps: Array<string>, parentId: string | null, };
 export type DeleteRun = { force: boolean, };
 export type RunDeletionResult = { runId: string, deletedTaskCount: number, preservedWorktreeAssetIds: number, };
+export type StartAutomation = { runId: string, agent: AgentKind, accountId: string | null, approvalPolicy: string, workspace: AutomationWorkspace, cwd: string, };
 export type StartWorker = { taskId: string, agent: AgentKind, 
 /**
  * Only structured Claude workers are launched today; the wire contract

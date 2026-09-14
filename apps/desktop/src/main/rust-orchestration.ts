@@ -1,6 +1,6 @@
 import type {
   AbandonRun, ApplyTaskGraph, CancelTask, CleanupWorktree, CompleteRun, CreateRun,
-  CreateRunGraph, CreateTask, SettleDispatch, StartWorker, StopWorker,
+  CreateRunGraph, CreateTask, SettleDispatch, StartAutomation, StartWorker, StopWorker,
 } from "@prospero/protocol/rust-daemon";
 import type { RustClient } from "./rust-client";
 import { createLegacyDesktopProjection } from "./orchestration-projection";
@@ -158,9 +158,19 @@ export async function orchestrationAction(
       };
       return client.cleanupWorktree(required(params, "assetId"), input, signal, timeoutMs) as Promise<JsonObject>;
     }
-    case "automation.start":
+    case "automation.start": {
+      const input: StartAutomation = {
+        runId: required(params, "runId"),
+        agent: automationAgent(params),
+        accountId: workerAccountId(params),
+        approvalPolicy: requiredApprovalPolicy(params),
+        workspace: params["workspace"] === "run" ? "run" : "current",
+        cwd: required(params, "cwd"),
+      };
+      return client.startAutomation(input, signal, timeoutMs) as Promise<JsonObject>;
+    }
     case "automation.pause":
-      throw new Error("自动执行 DAG 尚未接入 Rust daemon");
+      return client.pauseAutomation(required(params, "runId"), signal) as Promise<JsonObject>;
     default:
       throw new Error("此功能尚未接入 Rust daemon");
   }
@@ -190,10 +200,22 @@ function workerAgent(params: JsonObject): "claude" {
   return "claude";
 }
 
+function automationAgent(params: JsonObject): "claude" | "codex" {
+  const agent = params["agent"] ?? "claude";
+  if (agent !== "claude" && agent !== "codex") throw new Error("Rust 自动执行当前只接入 Claude/Codex worker");
+  return agent;
+}
+
 function workerApprovalPolicy(params: JsonObject): "strict" | "standard" | "yolo" | null {
   const policy = params["approvalPolicy"];
   if (policy === undefined || policy === null || policy === "") return null;
   if (policy !== "strict" && policy !== "standard" && policy !== "yolo") throw new Error("审批策略无效");
+  return policy;
+}
+
+function requiredApprovalPolicy(params: JsonObject): "strict" | "standard" | "yolo" {
+  const policy = workerApprovalPolicy(params);
+  if (policy === null) throw new Error("审批策略无效");
   return policy;
 }
 

@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::protocol::*;
 
 const APPLICATION_ID: i64 = 0x50525253;
-const SCHEMA_VERSION: i64 = 19;
+const SCHEMA_VERSION: i64 = 20;
 const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 const MAX_CONTENT_BYTES: i64 = 1024 * 1024 * 1024;
 
@@ -177,6 +177,18 @@ impl Store {
             }
             if version <= 18 {
                 transaction.execute_batch(include_str!("agent/schema-v19.sql"))?;
+            }
+            if version <= 19 {
+                let has_automation: i64 = transaction.query_row(
+                    "SELECT count(*) FROM pragma_table_info('orch_runs') WHERE name='automation'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if has_automation == 0 {
+                    transaction.execute_batch(
+                        "ALTER TABLE orch_runs ADD COLUMN automation TEXT CHECK(automation IS NULL OR length(CAST(automation AS BLOB)) <= 32768);",
+                    )?;
+                }
             }
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;

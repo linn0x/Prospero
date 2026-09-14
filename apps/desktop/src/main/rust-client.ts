@@ -9,7 +9,7 @@ import type {
   AbandonRun, ApplyTaskGraph, CancelTask, CleanupWorktree, CompleteRun, CreateGate,
   CreateRun, CreateRunGraph, CreateTask, Dispatch, Gate, GraphMutationResult, ResolveGate,
   Run, RunDeletionResult, RunSnapshot, SettleDispatch, SettleOutcome, Skill, SkillSuggestion,
-  StartWorker, StopWorker, Task, WorktreeAsset, WorktreeCleanupResult, WorktreeInspection,
+  StartAutomation, StartWorker, StopWorker, Task, WorktreeAsset, WorktreeCleanupResult, WorktreeInspection,
   WorkerStartOutcome,
 } from "@prospero/protocol/rust-daemon";
 
@@ -316,6 +316,12 @@ export class RustClient {
   }
   deleteRun(value: string, signal: AbortSignal | null = null): Promise<RunDeletionResult> {
     return this.json(`/v1/runs/${id(value)}`, { method: "DELETE", signal });
+  }
+  startAutomation(input: StartAutomation, signal: AbortSignal | null = null, timeoutMs = 180_000): Promise<Run> {
+    return this.json(`/v1/runs/${id(input.runId)}/automation/start`, { method: "POST", signal, timeoutMs, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
+  }
+  pauseAutomation(runId: string, signal: AbortSignal | null = null): Promise<Run> {
+    return this.json(`/v1/runs/${id(runId)}/automation/pause`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify({}) });
   }
   listTasks(runId?: string, signal: AbortSignal | null = null): Promise<Task[]> {
     const params = new URLSearchParams();

@@ -7,6 +7,7 @@ CREATE TABLE orch_runs (
     objective TEXT NOT NULL CHECK(length(CAST(objective AS BLOB)) BETWEEN 1 AND 4096),
     status TEXT NOT NULL CHECK(status IN ('active','completed','abandoned')),
     coordinator_session_id TEXT CHECK(coordinator_session_id IS NULL OR length(coordinator_session_id) <= 128),
+    automation TEXT CHECK(automation IS NULL OR length(CAST(automation AS BLOB)) <= 32768),
     graph_revision INTEGER NOT NULL CHECK(graph_revision >= 0),
     created_at INTEGER NOT NULL CHECK(created_at >= 0),
     updated_at INTEGER NOT NULL CHECK(updated_at >= 0)

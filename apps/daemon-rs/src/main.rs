@@ -147,6 +147,30 @@ async fn serve(directory: PathBuf, address: SocketAddr) -> Result<(), Box<dyn st
     if recovered_agents > 0 {
         api.publish();
     }
+    let running_automations = database
+        .call(|store| {
+            Ok(store
+                .list_runs()?
+                .into_iter()
+                .filter(|run| {
+                    matches!(
+                        run.automation.as_ref().map(|automation| automation.state),
+                        Some(prosperod_rs::orchestration::AutomationState::Running)
+                    )
+                })
+                .map(|run| run.id)
+                .collect::<Vec<_>>())
+        })
+        .await?;
+    for run_id in running_automations {
+        let database = api.database.clone();
+        let agents = api.agents.clone();
+        let changes = api.clone();
+        tokio::spawn(async move {
+            prosperod_rs::orchestration::kick_automation(&database, &agents, &run_id).await;
+            changes.publish();
+        });
+    }
     let shutdown_api = api.clone();
     let (stopping, mut stopped) = tokio::sync::watch::channel(false);
     let shutdown = async move {

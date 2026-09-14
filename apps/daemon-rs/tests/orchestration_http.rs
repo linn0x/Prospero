@@ -343,3 +343,110 @@ async fn recovery_route_reports_settled_and_resumed_dispatches() {
     assert_eq!(report["settled"], json!([]));
     assert_eq!(report["resumed"], json!([]));
 }
+
+#[tokio::test]
+async fn automation_current_dispatches_and_advances_chain() {
+    let (directory, api) = fixture().await;
+    let workspace = directory.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let (_, created) = send(&api, "POST", "/v1/runs/graph", Some(graph_body())).await;
+    let run_id = created["run"]["id"].as_str().unwrap().to_owned();
+    let task_a = created["idMap"]["a"].as_str().unwrap().to_owned();
+    let task_b = created["idMap"]["b"].as_str().unwrap().to_owned();
+
+    let (status, run) = send(
+        &api,
+        "POST",
+        &format!("/v1/runs/{run_id}/automation/start"),
+        Some(json!({
+            "runId": run_id,
+            "agent": "claude",
+            "approvalPolicy": "standard",
+            "workspace": "current",
+            "cwd": workspace,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{run}");
+    assert_eq!(run["automation"]["state"], "running");
+    assert_eq!(run["automation"]["workspace"], "current");
+
+    let (_, dispatches) = send(&api, "GET", &format!("/v1/dispatches?runId={run_id}"), None).await;
+    assert_eq!(dispatches.as_array().unwrap().len(), 1, "{dispatches}");
+    let dispatch_a = dispatches[0]["id"].as_str().unwrap().to_owned();
+    assert_eq!(dispatches[0]["taskId"], task_a);
+
+    let (status, settled) = send(
+        &api,
+        "POST",
+        &format!("/v1/dispatches/{dispatch_a}/settle"),
+        Some(json!({"success": true, "outcome": "a done"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{settled}");
+
+    let (_, dispatches) = send(&api, "GET", &format!("/v1/dispatches?runId={run_id}"), None).await;
+    assert_eq!(dispatches.as_array().unwrap().len(), 2, "{dispatches}");
+    let dispatch_b = dispatches[1]["id"].as_str().unwrap().to_owned();
+    assert_eq!(dispatches[1]["taskId"], task_b);
+
+    let (status, _) = send(
+        &api,
+        "POST",
+        &format!("/v1/dispatches/{dispatch_b}/settle"),
+        Some(json!({"success": true, "outcome": "b done"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, snapshot) = send(&api, "GET", &format!("/v1/runs/{run_id}"), None).await;
+    assert_eq!(snapshot["run"]["status"], "completed");
+    assert_eq!(snapshot["run"]["automation"]["state"], "completed");
+}
+
+#[tokio::test]
+async fn automation_pause_prevents_next_dispatch() {
+    let (directory, api) = fixture().await;
+    let workspace = directory.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let (_, created) = send(&api, "POST", "/v1/runs/graph", Some(graph_body())).await;
+    let run_id = created["run"]["id"].as_str().unwrap().to_owned();
+
+    let (status, _) = send(
+        &api,
+        "POST",
+        &format!("/v1/runs/{run_id}/automation/start"),
+        Some(json!({
+            "runId": run_id,
+            "agent": "claude",
+            "approvalPolicy": "standard",
+            "workspace": "current",
+            "cwd": workspace,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, dispatches) = send(&api, "GET", &format!("/v1/dispatches?runId={run_id}"), None).await;
+    let dispatch_a = dispatches[0]["id"].as_str().unwrap().to_owned();
+
+    let (status, paused) = send(
+        &api,
+        "POST",
+        &format!("/v1/runs/{run_id}/automation/pause"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{paused}");
+    assert_eq!(paused["automation"]["state"], "paused");
+
+    let (status, _) = send(
+        &api,
+        "POST",
+        &format!("/v1/dispatches/{dispatch_a}/settle"),
+        Some(json!({"success": true, "outcome": "a done"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, dispatches) = send(&api, "GET", &format!("/v1/dispatches?runId={run_id}"), None).await;
+    assert_eq!(dispatches.as_array().unwrap().len(), 1, "{dispatches}");
+}
