@@ -589,6 +589,27 @@ async fn route_remote_ws_message(
         "subagent.send" => remote_subagent_send(api, message).await,
         "subagent.history.get" => remote_subagent_history(api, socket, channel, message).await,
         "usage.get" => remote_usage(api, socket, channel, message).await,
+        "orchestration.snapshot" => send_orchestration_snapshot(api, socket, channel).await,
+        "orchestration.gate.resolve"
+        | "orchestration.run.create"
+        | "orchestration.run.complete"
+        | "orchestration.run.abandon"
+        | "orchestration.run.delete"
+        | "orchestration.task.create"
+        | "orchestration.task.cancel"
+        | "orchestration.task.retry"
+        | "orchestration.graph.create"
+        | "orchestration.graph.apply"
+        | "orchestration.worktree.inspect"
+        | "orchestration.worktree.cleanup" => {
+            remote_orchestration_control(api, socket, channel, device, message).await
+        }
+        "orchestration.worker.start"
+        | "orchestration.worker.stop"
+        | "orchestration.automation.start"
+        | "orchestration.automation.pause" => {
+            send_remote_json(socket, channel, &json!({"type":"error","code":"bad_message","message":format!("unsupported message type: {kind}")})).await
+        }
         "conversation.search" => remote_conversation_search(api, socket, channel, message).await,
         "workspace.list" => remote_workspace_list(socket, channel, message).await,
         "workspace.summary" => remote_workspace_summary(api, socket, channel, message).await,
@@ -1018,6 +1039,213 @@ async fn remote_usage(
         result
     };
     send_remote_json(socket, channel, &serde_json::to_value(result)?).await
+}
+
+async fn send_orchestration_snapshot(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+) -> Result<()> {
+    let snapshot = api
+        .call(|store| {
+            Ok(json!({
+                "runs": store.list_runs()?,
+                "tasks": store.list_tasks(None)?,
+                "dispatches": store.list_dispatches(None)?,
+                "gates": store.list_gates(None, None)?,
+                "worktreeAssets": store.list_worktree_assets(None)?,
+            }))
+        })
+        .await?;
+    send_remote_json(
+        socket,
+        channel,
+        &json!({"type":"orchestration.snapshot","snapshot":snapshot}),
+    )
+    .await
+}
+
+async fn remote_orchestration_control(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    device: &DeviceRecord,
+    message: JsonValue,
+) -> Result<()> {
+    if !device.can_orchestrate() {
+        return send_remote_json(
+            socket,
+            channel,
+            &json!({"type":"error","code":"forbidden","message":"这台设备没有人工编排权限"}),
+        )
+        .await;
+    }
+    let kind = require_str(&message, "type")?.to_owned();
+    let result = match kind.as_str() {
+        "orchestration.gate.resolve" => {
+            let gate_id = require_str(&message, "gateId")?.to_owned();
+            let decision = require_str(&message, "decision")?.to_owned();
+            api.call(move |store| store.resolve_gate(&gate_id, &decision).map(|_| ()))
+                .await
+        }
+        "orchestration.run.create" => {
+            let objective = require_str(&message, "objective")?.to_owned();
+            api.call(move |store| {
+                store
+                    .create_run(CreateRun {
+                        objective,
+                        coordinator_session_id: None,
+                    })
+                    .map(|_| ())
+            })
+            .await
+        }
+        "orchestration.run.complete" => {
+            let run_id = require_str(&message, "runId")?.to_owned();
+            let allow_failed = message
+                .get("allowFailedTasks")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false);
+            api.call(move |store| store.complete_run(&run_id, allow_failed).map(|_| ()))
+                .await
+        }
+        "orchestration.run.abandon" => {
+            let run_id = require_str(&message, "runId")?.to_owned();
+            api.call(move |store| store.abandon_run(&run_id, "Run abandoned").map(|_| ()))
+                .await
+        }
+        "orchestration.run.delete" => {
+            let run_id = require_str(&message, "runId")?.to_owned();
+            let force = message
+                .get("force")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false);
+            api.call(move |store| store.delete_run(&run_id, force).map(|_| ()))
+                .await
+        }
+        "orchestration.task.create" => {
+            let input = CreateTask {
+                run_id: require_str(&message, "runId")?.to_owned(),
+                title: require_str(&message, "title")?.to_owned(),
+                spec: require_str(&message, "spec")?.to_owned(),
+                skills: message
+                    .get("skills")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()?
+                    .unwrap_or_default(),
+                deps: message
+                    .get("deps")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()?
+                    .unwrap_or_default(),
+                parent_id: message
+                    .get("parentId")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_owned),
+            };
+            api.call(move |store| store.create_task(input).map(|_| ()))
+                .await
+        }
+        "orchestration.task.cancel" => {
+            let task_id = require_str(&message, "taskId")?.to_owned();
+            let reason = message
+                .get("reason")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("cancelled by user")
+                .to_owned();
+            api.call(move |store| store.cancel_task(&task_id, &reason).map(|_| ()))
+                .await
+        }
+        "orchestration.task.retry" => {
+            let task_id = require_str(&message, "taskId")?.to_owned();
+            api.call(move |store| store.retry_task(&task_id).map(|_| ()))
+                .await
+        }
+        "orchestration.graph.create" => {
+            let input = CreateRunGraph {
+                objective: require_str(&message, "objective")?.to_owned(),
+                nodes: message
+                    .get("nodes")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()?
+                    .unwrap_or_default(),
+                coordinator_session_id: None,
+                operation_id: require_str(&message, "operationId")?.to_owned(),
+            };
+            api.call(move |store| store.create_run_graph(input).map(|_| ()))
+                .await
+        }
+        "orchestration.graph.apply" => {
+            let input = ApplyTaskGraph {
+                run_id: require_str(&message, "runId")?.to_owned(),
+                base_revision: message
+                    .get("baseRevision")
+                    .and_then(JsonValue::as_i64)
+                    .ok_or_else(|| Error::Invalid("missing baseRevision".into()))?,
+                nodes: message
+                    .get("nodes")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()?
+                    .unwrap_or_default(),
+                delete_task_ids: message
+                    .get("deleteTaskIds")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()?
+                    .unwrap_or_default(),
+                operation_id: Some(require_str(&message, "operationId")?.to_owned()),
+            };
+            api.call(move |store| store.apply_task_graph(input).map(|_| ()))
+                .await
+        }
+        "orchestration.worktree.inspect" => {
+            let asset_id = require_str(&message, "assetId")?.to_owned();
+            let target_ref = message
+                .get("targetRef")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned);
+            orchestration::inspect_worktree(&api.database, &asset_id, target_ref)
+                .await
+                .map(|_| ())
+        }
+        "orchestration.worktree.cleanup" => {
+            let asset_id = require_str(&message, "assetId")?.to_owned();
+            let request = CleanupWorktree {
+                target_ref: message
+                    .get("targetRef")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_owned),
+                confirm: message
+                    .get("confirm")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false),
+                delete_branch: message
+                    .get("deleteBranch")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false),
+            };
+            orchestration::cleanup_worktree(&api.database, &asset_id, request)
+                .await
+                .map(|_| ())
+        }
+        _ => Ok(()),
+    };
+    match result {
+        Ok(()) => {
+            api.publish();
+            send_orchestration_snapshot(api, socket, channel).await
+        }
+        Err(error) => send_remote_json(
+            socket,
+            channel,
+            &json!({"type":"error","code":remote_error_code(&error),"message":error.to_string()}),
+        )
+        .await,
+    }
 }
 
 async fn remote_conversation_search(
