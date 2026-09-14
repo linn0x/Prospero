@@ -1,10 +1,9 @@
 //! Third-party API profile validation and session environment.
 //!
-//! Only Anthropic-compatible profiles (Claude agent, `anthropic` wire
-//! protocol) are supported in the Rust daemon so far. The profile itself is
-//! non-secret metadata stored in SQLite; the API Key lives in the account's
-//! mode-0600 credential file. Port of the legacy `cleanApiProfile`,
-//! `ApiHeadersSchema` and profile environment rules.
+//! Third-party API profiles are non-secret metadata stored in SQLite; the API
+//! Key lives in the account's mode-0600 credential file. This module mirrors
+//! the legacy `cleanApiProfile`, `ApiHeadersSchema` and per-agent environment
+//! rules for Claude/Anthropic and Codex/OpenAI-compatible profiles.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -186,6 +185,14 @@ impl ApiProfile {
     }
 }
 
+pub(crate) fn agent_kind(profile: &ApiProfile) -> crate::protocol::AgentKind {
+    if profile.protocol() == "anthropic" {
+        crate::protocol::AgentKind::Claude
+    } else {
+        crate::protocol::AgentKind::Codex
+    }
+}
+
 /// Wire input uses a JSON object for headers; SQLite stores the same shape.
 pub(crate) fn parse_profile_json(raw: &str) -> Option<ApiProfile> {
     serde_json::from_str::<ApiProfile>(raw).ok()
@@ -238,7 +245,6 @@ pub(crate) fn clean_headers(
 }
 
 /// Normalizes and validates a profile the way legacy `cleanApiProfile` does.
-/// Only `claude` + `anthropic_compatible` + `anthropic` are accepted.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn clean_profile(
     agent: &str,
@@ -249,11 +255,11 @@ pub(crate) fn clean_profile(
     capabilities: Option<serde_json::Value>,
     headers: Option<serde_json::Value>,
 ) -> Result<ApiProfile> {
-    if agent != "claude" {
-        return Err(Error::Invalid(
-            "Rust 当前仅支持 Claude 的 Anthropic 兼容 Profile".into(),
-        ));
-    }
+    let (default_provider, default_protocol) = match agent {
+        "claude" => ("anthropic_compatible", "anthropic"),
+        "codex" => ("openai_compatible", "openai_responses"),
+        _ => return Err(Error::Invalid("Agent 不支持 API Profile".into())),
+    };
     let base_url = raw_base_url.trim();
     let model = raw_model.trim();
     if base_url.is_empty() || base_url.len() > MAX_BASE_URL || base_url.contains(['\r', '\n', '\0'])
@@ -263,14 +269,20 @@ pub(crate) fn clean_profile(
     if model.is_empty() || model.len() > MAX_MODEL || model.contains(['\r', '\n', '\0']) {
         return Err(Error::Invalid("模型名称格式无效".into()));
     }
-    let parsed_provider = provider.unwrap_or("anthropic_compatible");
-    if parsed_provider != "anthropic_compatible" {
-        return Err(Error::Invalid(
-            "所选 Agent、Provider 与 API 协议不兼容".into(),
-        ));
-    }
-    let parsed_protocol = protocol.unwrap_or("anthropic");
-    if parsed_protocol != "anthropic" {
+    let parsed_provider = provider.unwrap_or(default_provider);
+    let parsed_protocol = protocol.unwrap_or(default_protocol);
+    let valid = match agent {
+        "codex" => {
+            parsed_provider == "openai_compatible"
+                && matches!(
+                    parsed_protocol,
+                    "openai_responses" | "openai_chat_completions"
+                )
+        }
+        "claude" => parsed_provider == "anthropic_compatible" && parsed_protocol == "anthropic",
+        _ => false,
+    };
+    if !valid {
         return Err(Error::Invalid(
             "所选 Agent、Provider 与 API 协议不兼容".into(),
         ));
@@ -291,12 +303,17 @@ pub(crate) fn clean_profile(
         ));
     }
     // Strip recognized API suffixes so callers may paste the endpoint URL.
-    let path = url.path().to_string();
-    let trimmed = path.trim_end_matches('/');
-    let stripped = trimmed
-        .strip_suffix("/v1/messages")
-        .or_else(|| trimmed.strip_suffix("/v1"))
-        .unwrap_or(trimmed);
+    let path = url.path().trim_end_matches('/').to_string();
+    let suffixes: &[&str] = match parsed_protocol {
+        "openai_responses" => &["/responses"],
+        "openai_chat_completions" => &["/chat/completions"],
+        _ => &["/v1/messages", "/v1"],
+    };
+    let stripped = suffixes
+        .iter()
+        .find_map(|suffix| path.strip_suffix(suffix))
+        .unwrap_or(&path)
+        .trim_end_matches('/');
     let normalized_path = if stripped.is_empty() { "/" } else { stripped };
     url.set_path(normalized_path);
     url.set_query(None);
@@ -306,10 +323,18 @@ pub(crate) fn clean_profile(
         normalized.truncate(normalized.len() - 1);
     }
     let caps = ModelCapabilities::clean(capabilities.unwrap_or(serde_json::Value::Null))?;
+    if parsed_protocol == "openai_chat_completions"
+        && let Some(caps) = &caps
+        && (caps.context_window.is_some() != caps.max_output_tokens.is_some())
+    {
+        return Err(Error::Invalid(
+            "Chat Completions Profile 的上下文窗口与最大输出必须同时填写或同时留空".into(),
+        ));
+    }
     let headers = clean_headers(headers)?;
     Ok(ApiProfile {
         provider: parsed_provider.into(),
-        protocol: None, // canonical anthropic default; serializes as omitted
+        protocol: (parsed_protocol != "anthropic").then(|| parsed_protocol.into()),
         base_url: normalized,
         model: model.into(),
         model_capabilities: caps,

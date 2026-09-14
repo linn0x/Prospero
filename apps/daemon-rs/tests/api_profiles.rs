@@ -421,8 +421,6 @@ async fn profile_create_validates_connection_fields_and_persists_an_isolated_key
         assert_eq!(status, StatusCode::BAD_REQUEST, "baseUrl {bad}");
     }
     for payload in [
-        json!({"type":"agent.account.api.create","requestId":"r","agent":"codex",
-            "name":"x","baseUrl":server.base_url,"model":"m","apiKey":SECRET}),
         json!({"type":"agent.account.api.create","requestId":"r","agent":"claude",
             "name":"x","provider":"openai","baseUrl":server.base_url,"model":"m","apiKey":SECRET}),
         json!({"type":"agent.account.api.create","requestId":"r","agent":"claude",
@@ -441,6 +439,22 @@ async fn profile_create_validates_connection_fields_and_persists_an_isolated_key
         let (status, _) = harness.post(payload).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
+
+    let (status, codex_created) = harness
+        .post(control(
+            "agent.account.api.create",
+            obj(json!({"agent":"codex",
+                "name":"Codex Profile","baseUrl":format!("{}/responses", server.base_url),
+                "model":"gpt-test","apiKey":SECRET})),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{codex_created}");
+    let codex_id = codex_created["accountId"].as_str().unwrap();
+    let codex_row = account(&codex_created, codex_id).unwrap();
+    assert_eq!(codex_row["agent"], "codex");
+    assert_eq!(codex_row["apiProfile"]["provider"], "openai_compatible");
+    assert_eq!(codex_row["apiProfile"]["protocol"], "openai_responses");
+    assert_eq!(codex_row["apiProfile"]["baseUrl"], server.base_url);
 
     // Successful create: trimmed name, profile metadata on the row, pinned
     // capabilities, key only inside the 0600 credential file.

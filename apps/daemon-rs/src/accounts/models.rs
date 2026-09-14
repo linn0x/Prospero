@@ -1,6 +1,6 @@
-//! `GET <baseUrl>/v1/models` catalog fetch for Anthropic-compatible profiles.
+//! `GET <baseUrl>/v1/models` catalog fetch for API profiles.
 //!
-//! Port of the legacy `fetchApiModels`, narrowed to the `anthropic` protocol:
+//! Port of the legacy `fetchApiModels`:
 //! bounded redirects, a 2 MiB / 1000-model / 10-page budget, and stable
 //! feature-error codes the desktop renders without a daemon restart.
 
