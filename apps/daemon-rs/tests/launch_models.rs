@@ -6,6 +6,7 @@
 use std::os::unix::fs::PermissionsExt;
 
 use prosperod_rs::{agent::Agents, auth::Token, server::Api, worker::Database};
+use serde_json::json;
 use tempfile::TempDir;
 
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -287,6 +288,81 @@ async fn http_route_serves_native_and_managed_claude_accounts() {
         .await
         .unwrap();
     assert_eq!(missing_managed.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn http_route_serves_codex_api_profile_pinned_model() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let _guard = SERIAL.lock().await;
+    let _env = EnvGuard;
+    let (_directory, database) = open_db().await;
+    let api = Api::new(
+        database,
+        Token::parse("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into())
+            .unwrap(),
+    );
+    let app = api.router();
+    let secret = "Bearer 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    let created = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/accounts")
+                .header("authorization", secret)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "type":"agent.account.api.create",
+                        "requestId":"create-codex-profile",
+                        "agent":"codex",
+                        "name":"Codex API",
+                        "baseUrl":"http://localhost:12345/responses",
+                        "model":"gpt-profile",
+                        "apiKey":"sk-profile-secret",
+                        "modelCapabilities":{"supportedEfforts":["low","high"]}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created_body = axum::body::to_bytes(created.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    let created_value: serde_json::Value = serde_json::from_slice(&created_body).unwrap();
+    let account_id = created_value["accountId"].as_str().unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/v1/launch/models?agent=codex&accountId={account_id}"
+                ))
+                .header("authorization", secret)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["currentModel"], "gpt-profile");
+    assert_eq!(value["models"][0]["id"], "gpt-profile");
+    assert_eq!(
+        value["models"][0]["supportedEfforts"],
+        json!(["low", "high"])
+    );
 }
 
 #[tokio::test]

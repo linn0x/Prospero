@@ -877,15 +877,13 @@ async fn remote_launch_models(
         .map(str::to_owned);
     let mut out = json!({"type":"launch.models","requestId":request_id,"agent":agent,"models":[]});
     match agent {
-        "codex" => match account_id.as_deref() {
-            None | Some(crate::agent::NATIVE_CODEX_ID) => {
-                let catalog =
-                    crate::agent::read_native_codex_models(api.database.directory()).await?;
+        "codex" => match codex_launch_catalog(api, account_id.as_deref()).await {
+            Ok(catalog) => {
                 let catalog = serde_json::to_value(catalog)?;
                 out["models"] = catalog["models"].clone();
                 out["currentModel"] = catalog["currentModel"].clone();
             }
-            Some(_) => out["error"] = json!("Rust daemon 当前仅支持本机 Codex 模型目录"),
+            Err(error) => out["error"] = json!(error.to_string()),
         },
         "claude" => {
             let account_id = account_id.or_else(|| Some(crate::accounts::NATIVE_CLAUDE_ID.into()));
@@ -2991,7 +2989,8 @@ fn source_migration_plans(
         if sources.is_bound(&account.id) {
             continue;
         }
-        let Some(secret) = crate::accounts::managed::profile_secret(data, &account.id)? else {
+        let Some(secret) = crate::accounts::managed::profile_secret(data, &account.id, &profile)?
+        else {
             skipped += 1;
             continue;
         };
@@ -3269,7 +3268,8 @@ async fn model_sources_route(
                         let Some(profile) = record.api_profile else {
                             return Err(Error::Invalid("只能还原迁移前的独立 Profile".into()));
                         };
-                        let Some(secret) = crate::accounts::managed::profile_secret(&data, id)?
+                        let Some(secret) =
+                            crate::accounts::managed::profile_secret(&data, id, &profile)?
                         else {
                             return Err(Error::Conflict);
                         };
@@ -3470,7 +3470,10 @@ async fn run_profile_test(
             move |store| {
                 let revision = store.api_validation_revision(&data, &id)?;
                 let record = store.managed_snapshot_row(&data, &id)?;
-                let secret = crate::accounts::managed::profile_secret(&data, &id)?;
+                let secret = match record.api_profile.as_ref() {
+                    Some(profile) => crate::accounts::managed::profile_secret(&data, &id, profile)?,
+                    None => None,
+                };
                 Ok((revision, record, secret))
             }
         })
@@ -3513,7 +3516,10 @@ async fn run_profile_engine_test(
             move |store| {
                 let revision = store.api_validation_revision(&data, &id)?;
                 let record = store.managed_snapshot_row(&data, &id)?;
-                let secret = crate::accounts::managed::profile_secret(&data, &id)?;
+                let secret = match record.api_profile.as_ref() {
+                    Some(profile) => crate::accounts::managed::profile_secret(&data, &id, profile)?,
+                    None => None,
+                };
                 Ok((revision, record, secret))
             }
         })
@@ -3804,7 +3810,7 @@ async fn profile_models(
     draft_key: Option<&str>,
     draft_headers: Option<serde_json::Value>,
 ) -> crate::accounts::models::ModelsResult {
-    use crate::accounts::models::{FeatureError, ModelsResult, fetch_models};
+    use crate::accounts::models::{FeatureError, ModelsResult, fetch_models_with_protocol};
     let load = async {
         match account_id {
             Some(id) => {
@@ -3820,7 +3826,12 @@ async fn profile_models(
                     .database
                     .call(move |store| {
                         let record = store.managed_snapshot_row(&data, &id)?;
-                        let secret = crate::accounts::managed::profile_secret(&data, &id)?;
+                        let secret = match record.api_profile.as_ref() {
+                            Some(profile) => {
+                                crate::accounts::managed::profile_secret(&data, &id, profile)?
+                            }
+                            None => None,
+                        };
                         Ok((record, secret))
                     })
                     .await
@@ -3831,26 +3842,74 @@ async fn profile_models(
                 let headers = profile.headers.clone().unwrap_or_default();
                 let secret = secret
                     .ok_or_else(|| FeatureError::new("authentication", "请先配置 API Key"))?;
-                fetch_models(&profile.base_url, &secret, &headers).await
+                fetch_models_with_protocol(profile.protocol(), &profile.base_url, &secret, &headers)
+                    .await
             }
             None => {
                 let base_url = draft_base_url.unwrap_or("");
                 let key = draft_key.unwrap_or("");
-                if protocol.is_some_and(|protocol| protocol != "anthropic") {
-                    return Err(FeatureError::new(
-                        "unsupported",
-                        "Rust daemon 目前仅支持 Anthropic 协议",
-                    ));
+                let protocol = protocol.unwrap_or("anthropic");
+                if !matches!(
+                    protocol,
+                    "anthropic" | "openai_responses" | "openai_chat_completions"
+                ) {
+                    return Err(FeatureError::new("unsupported", "模型协议不支持"));
                 }
                 let headers = crate::accounts::profile::clean_headers(draft_headers)
                     .map_err(|error| FeatureError::new("invalid_request", &error.to_string()))?;
-                fetch_models(base_url, key, &headers.unwrap_or_default()).await
+                fetch_models_with_protocol(protocol, base_url, key, &headers.unwrap_or_default())
+                    .await
             }
         }
     };
     match load.await {
         Ok(models) => ModelsResult::success(request_id, models),
         Err(error) => ModelsResult::failure(request_id, error),
+    }
+}
+
+async fn codex_launch_catalog(
+    api: &Api,
+    account_id: Option<&str>,
+) -> Result<crate::agent::LaunchModelCatalog> {
+    match account_id {
+        None | Some(crate::agent::NATIVE_CODEX_ID) => {
+            crate::agent::read_native_codex_models(api.database.directory()).await
+        }
+        Some(id) => {
+            crate::database::validate_id(id)?;
+            let data = api.database.directory().to_owned();
+            let id = id.to_owned();
+            let profile_id = id.clone();
+            let profile_data = data.clone();
+            let profile = api
+                .database
+                .call(move |store| {
+                    Ok(store
+                        .managed_snapshot_row(&profile_data, &profile_id)?
+                        .api_profile)
+                })
+                .await?
+                .ok_or_else(|| Error::Invalid("所选账号不是 Codex API Profile".into()))?;
+            if crate::accounts::profile::agent_kind(&profile) != crate::protocol::AgentKind::Codex {
+                return Err(Error::Invalid("所选账号不是 Codex API Profile".into()));
+            }
+            let model = profile.model.clone();
+            Ok(crate::agent::LaunchModelCatalog {
+                current_model: Some(model.clone()),
+                models: vec![crate::agent::LaunchModelInfo {
+                    id: model,
+                    label: profile.model,
+                    description: None,
+                    supported_efforts: profile
+                        .model_capabilities
+                        .as_ref()
+                        .and_then(|caps| caps.supported_efforts.clone())
+                        .unwrap_or_default(),
+                    is_default: true,
+                }],
+            })
+        }
     }
 }
 
@@ -3870,16 +3929,8 @@ async fn launch_models(
 ) -> std::result::Result<Json<crate::agent::LaunchModelCatalog>, ApiError> {
     let _permit = api.requests.acquire().await.map_err(|_| Error::Closed)?;
     if query.agent == "codex" {
-        match query.account_id.as_deref() {
-            None | Some(crate::agent::NATIVE_CODEX_ID) => {}
-            Some(_) => {
-                return Err(ApiError(Error::Invalid(
-                    "Rust daemon 当前仅支持本机 Codex 模型目录".into(),
-                )));
-            }
-        }
         return Ok(Json(
-            crate::agent::read_native_codex_models(api.database.directory()).await?,
+            codex_launch_catalog(&api, query.account_id.as_deref()).await?,
         ));
     }
     if query.agent != "claude" {

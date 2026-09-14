@@ -257,6 +257,15 @@ pub(crate) async fn fetch_models(
     api_key: &str,
     headers: &std::collections::BTreeMap<String, String>,
 ) -> std::result::Result<Vec<CatalogModel>, FeatureError> {
+    fetch_models_with_protocol("anthropic", base_url, api_key, headers).await
+}
+
+pub(crate) async fn fetch_models_with_protocol(
+    protocol: &str,
+    base_url: &str,
+    api_key: &str,
+    headers: &std::collections::BTreeMap<String, String>,
+) -> std::result::Result<Vec<CatalogModel>, FeatureError> {
     let key = api_key.trim();
     if key.is_empty() || key.len() > 8192 || key.contains(['\r', '\n', '\0']) {
         return Err(FeatureError::new("invalid_request", "请填写有效的 API Key"));
@@ -280,9 +289,14 @@ pub(crate) async fn fetch_models(
             for redirect in 0..=3u8 {
                 let mut request = http
                     .get(next_url.clone())
-                    .header("accept", "application/json")
-                    .header("x-api-key", key)
-                    .header("anthropic-version", "2023-06-01");
+                    .header("accept", "application/json");
+                if protocol == "anthropic" {
+                    request = request
+                        .header("x-api-key", key)
+                        .header("anthropic-version", "2023-06-01");
+                } else {
+                    request = request.header("authorization", format!("Bearer {key}"));
+                }
                 for (name, value) in headers {
                     request = request.header(name, value);
                 }

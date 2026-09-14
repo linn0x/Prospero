@@ -302,6 +302,9 @@ pub(super) struct TurnOptions {
     pub(super) effort: Option<String>,
     /// Managed-account environment overrides (empty for the native env).
     pub(super) environment: Vec<(String, String)>,
+    /// Non-secret API profile metadata for runtimes that need launch-time
+    /// configuration in addition to environment variables.
+    pub(super) api_profile: Option<crate::accounts::ApiProfile>,
 }
 
 pub(super) fn spawn_turn(
