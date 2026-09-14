@@ -123,9 +123,10 @@ describe.skipIf(process.platform === "win32")("Launch model catalog through the 
     expect(models[1]!["description"]).toBe("long context");
     expect(catalog!["currentModel"]).toBe("default");
 
-    await expect(runtime.request(
+    const codexCatalog = await runtime.request(
       "/_prospero/control/launch/models?agent=codex&accountId=native-codex",
-    )).rejects.toThrow(/尚未接入/);
+    );
+    expect((codexCatalog!["models"] as Array<Record<string, unknown>>).length).toBeGreaterThan(0);
     // Missing accountId defaults to the native account.
     const nativeDefault = await runtime.request(
       "/_prospero/control/launch/models?agent=claude",
@@ -228,7 +229,7 @@ describe.skipIf(process.platform === "win32")("Launch model catalog through the 
     const projected = store.snapshot().daemon.sessions
       .find((session) => session.id === sessionId);
     expect(projected?.agentControls).toMatchObject({
-      compact: false, model: true, mode: true,
+      compact: true, model: true, mode: true,
       currentModel: "opus[1m]", currentEffort: "max", currentMode: "default",
     });
 
