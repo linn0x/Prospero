@@ -16,6 +16,7 @@ use base64::Engine;
 use base64::prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use ts_rs::TS;
 use url::Url;
 
 use crate::error::{Error, Result};
@@ -326,7 +327,7 @@ mod tests {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub enum RelayConnectionState {
     Disabled,
@@ -337,23 +338,28 @@ pub enum RelayConnectionState {
     Error,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct RelayRuntimeDeviceStatus {
+    #[ts(type = "number")]
     pub total: usize,
+    #[ts(type = "number")]
     pub ready: usize,
+    #[ts(type = "number")]
     pub needs_re_pair: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct RelayRuntimeStatus {
     pub enabled: bool,
     pub state: RelayConnectionState,
     pub url: Option<String>,
     pub route_id: Option<String>,
+    #[ts(type = "number")]
     pub updated_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | undefined")]
     pub last_connected_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
@@ -507,6 +513,43 @@ pub fn relay_status_from_config(
             0,
             now,
         ),
+    }
+}
+
+pub fn relay_status_from_home(home: &Path, dev_mode: bool) -> Option<RelayRuntimeStatus> {
+    let config = match load_daemon_relay_config(home) {
+        Ok(config) => config,
+        Err(error) => {
+            return Some(publish_status(
+                RelayConnectionState::Error,
+                None,
+                None,
+                Some(error.to_string()),
+                &[],
+                0,
+                crate::database::now(),
+            ));
+        }
+    };
+    let devices = match crate::pairing::load_devices(home) {
+        Ok(devices) => devices,
+        Err(error) => {
+            return Some(publish_status(
+                RelayConnectionState::Error,
+                effective_relay_url(&config),
+                None,
+                Some(error.to_string()),
+                &[],
+                0,
+                crate::database::now(),
+            ));
+        }
+    };
+    let status = relay_status_from_config(&config, &devices, dev_mode);
+    if status.state == RelayConnectionState::Disabled {
+        None
+    } else {
+        Some(status)
     }
 }
 
