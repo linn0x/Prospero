@@ -215,6 +215,53 @@ async fn source_create_list_models_bind_and_delete_flow() {
     assert_eq!(blocked["code"], "in_use");
 }
 
+#[tokio::test]
+async fn source_supports_openai_compatible_routes() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new().await;
+    let server = spawn_server();
+
+    let (status, result) = harness
+        .post(envelope(json!({
+            "kind":"create",
+            "operationId":"op-openai-create",
+            "name":"Shared OpenAI",
+            "endpoints":[
+                {"protocol":"openai_responses","baseUrl":format!("{}/responses", server.base_url)},
+                {"protocol":"openai_chat_completions","baseUrl":format!("{}/chat/completions", server.base_url)}
+            ],
+            "credential":{"name":"OpenAI Key","apiKey":SECRET},
+            "routes":[{"name":"GPT Test","model":"gpt-test","protocol":"openai_responses","enabled":true,"modelCapabilities":{"tools":true,"reasoning":false}}]
+        })))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let source = &result["sources"][0];
+    assert_eq!(source["endpoints"][0]["baseUrl"], server.base_url);
+    assert_eq!(source["routes"][0]["protocol"], "openai_responses");
+    let source_id = source["id"].as_str().unwrap();
+    let route_id = source["routes"][0]["id"].as_str().unwrap();
+    let revision = source["revision"].as_i64().unwrap();
+
+    let (status, bound) = harness
+        .post(envelope(
+            json!({"kind":"bind","sourceId":source_id,"routeId":route_id,"revision":revision}),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{bound}");
+    let account_id = bound["accountId"].as_str().unwrap();
+    let account = bound["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == account_id)
+        .unwrap();
+    assert_eq!(account["agent"], "codex");
+    assert_eq!(account["engine"], "codex");
+    assert_eq!(account["apiProfile"]["provider"], "openai_compatible");
+    assert_eq!(account["apiProfile"]["protocol"], "openai_responses");
+    assert_eq!(account["apiProfile"]["baseUrl"], server.base_url);
+}
+
 fn account_envelope(request_id: &str, extra: Value) -> Value {
     let mut value = extra.as_object().unwrap().clone();
     value.insert("requestId".into(), Value::String(request_id.into()));
