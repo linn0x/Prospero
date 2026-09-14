@@ -306,3 +306,328 @@ mod tests {
         );
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayConnectionState {
+    Connecting,
+    Syncing,
+    Online,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayHostSessionStatus {
+    pub state: RelayConnectionState,
+    pub url: String,
+    pub route_id: String,
+    pub generation: u64,
+    pub ready_devices: usize,
+}
+
+pub struct RelayHostClient {
+    url: String,
+    host_secret: String,
+    devices: Vec<DeviceRecord>,
+    generation: u64,
+}
+
+pub struct RelayHostSession {
+    control: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    url: String,
+    route_id: String,
+    generation: u64,
+    ready_devices: usize,
+}
+
+impl RelayHostClient {
+    pub fn new(
+        url: String,
+        host_secret: String,
+        devices: Vec<DeviceRecord>,
+        generation: u64,
+    ) -> Self {
+        Self {
+            url,
+            host_secret,
+            devices,
+            generation,
+        }
+    }
+
+    /// Connect one `/v1/host` control socket through auth, full device sync,
+    /// sync ack, and host.ready. Reconnect/backoff/status-file wiring lives in
+    /// the daemon supervisor; this bounded primitive keeps the relay T1 control
+    /// sequence testable and reusable.
+    pub async fn connect_once(&self) -> Result<RelayHostSession> {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        validate_relay_url(&self.url, true)?;
+        let route_id = derive_relay_route_id(&self.host_secret)?;
+        let endpoint = relay_endpoint(&self.url, RELAY_HOST_PATH)?;
+        let (mut control, _) = tokio_tungstenite::connect_async(endpoint)
+            .await
+            .map_err(|error| Error::Invalid(format!("relay host connect failed: {error}")))?;
+        control
+            .send(Message::Text(
+                serde_json::to_string(&host_auth_frame(&self.host_secret)?)?.into(),
+            ))
+            .await
+            .map_err(|error| Error::Invalid(format!("relay host auth send failed: {error}")))?;
+        let sync = device_sync_frame(&self.devices, self.generation)?;
+        let ready_devices = sync.credentials.len();
+        control
+            .send(Message::Text(serde_json::to_string(&sync)?.into()))
+            .await
+            .map_err(|error| Error::Invalid(format!("relay device sync send failed: {error}")))?;
+
+        let mut acked = false;
+        let mut ready = false;
+        for _ in 0..8 {
+            let Some(frame) = control.next().await else {
+                return Err(Error::Invalid(
+                    "relay host control closed before ready".into(),
+                ));
+            };
+            let frame = frame
+                .map_err(|error| Error::Invalid(format!("relay host control failed: {error}")))?;
+            let Message::Text(text) = frame else {
+                return Err(Error::Invalid("relay host control must be text".into()));
+            };
+            let value: serde_json::Value = serde_json::from_str(&text)?;
+            match value["type"].as_str() {
+                Some("host.device-sync.ack")
+                    if value["v"] == RELAY_PROTOCOL_VERSION
+                        && value["generation"].as_u64() == Some(self.generation) =>
+                {
+                    acked = true;
+                }
+                Some("host.ready")
+                    if value["v"] == RELAY_PROTOCOL_VERSION
+                        && value["generation"].as_u64() == Some(self.generation)
+                        && value["routeId"].as_str() == Some(route_id.as_str()) =>
+                {
+                    ready = true;
+                }
+                Some("error") => {
+                    return Err(Error::Invalid("relay host returned error".into()));
+                }
+                _ => {}
+            }
+            if acked && ready {
+                return Ok(RelayHostSession {
+                    control,
+                    url: self.url.clone(),
+                    route_id,
+                    generation: self.generation,
+                    ready_devices,
+                });
+            }
+        }
+        Err(Error::Invalid("relay host did not become ready".into()))
+    }
+}
+
+impl RelayHostSession {
+    pub fn status(&self) -> RelayHostSessionStatus {
+        RelayHostSessionStatus {
+            state: RelayConnectionState::Online,
+            url: self.url.clone(),
+            route_id: self.route_id.clone(),
+            generation: self.generation,
+            ready_devices: self.ready_devices,
+        }
+    }
+
+    /// Wait for one `stream.offer`, open `/v1/stream`, send `stream.accept`,
+    /// and return after the relay answers `stream.ready`. The returned stream
+    /// is ready to be handed to the E2E SecureChannel forwarding layer.
+    pub async fn accept_one_stream(
+        &mut self,
+    ) -> Result<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    > {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        loop {
+            let Some(frame) = self.control.next().await else {
+                return Err(Error::Invalid(
+                    "relay host control closed before stream offer".into(),
+                ));
+            };
+            let frame = frame
+                .map_err(|error| Error::Invalid(format!("relay host control failed: {error}")))?;
+            let Message::Text(text) = frame else {
+                return Err(Error::Invalid("relay host control must be text".into()));
+            };
+            let value: serde_json::Value = serde_json::from_str(&text)?;
+            if value["type"].as_str() != Some("stream.offer") {
+                continue;
+            }
+            let stream_id = value["streamId"]
+                .as_str()
+                .ok_or_else(|| Error::Invalid("stream.offer missing streamId".into()))?;
+            let ticket = value["ticket"]
+                .as_str()
+                .ok_or_else(|| Error::Invalid("stream.offer missing ticket".into()))?;
+            let accept = stream_accept_frame(stream_id, ticket)?;
+            let endpoint = relay_endpoint(&self.url, RELAY_STREAM_PATH)?;
+            let (mut stream, _) = tokio_tungstenite::connect_async(endpoint)
+                .await
+                .map_err(|error| Error::Invalid(format!("relay stream connect failed: {error}")))?;
+            stream
+                .send(Message::Text(serde_json::to_string(&accept)?.into()))
+                .await
+                .map_err(|error| Error::Invalid(format!("relay stream accept failed: {error}")))?;
+            let Some(frame) = stream.next().await else {
+                return Err(Error::Invalid("relay stream closed before ready".into()));
+            };
+            let frame =
+                frame.map_err(|error| Error::Invalid(format!("relay stream failed: {error}")))?;
+            let Message::Text(text) = frame else {
+                return Err(Error::Invalid("relay stream control must be text".into()));
+            };
+            let ready: serde_json::Value = serde_json::from_str(&text)?;
+            if ready["type"].as_str() == Some("stream.ready")
+                && ready["v"] == RELAY_PROTOCOL_VERSION
+                && ready["streamId"].as_str() == Some(stream_id)
+            {
+                return Ok(stream);
+            }
+            return Err(Error::Invalid("relay stream did not become ready".into()));
+        }
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn host_client_connects_syncs_and_accepts_stream_offer() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::accept_async;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (host_tcp, _) = listener.accept().await.unwrap();
+            let mut host = accept_async(host_tcp).await.unwrap();
+            let auth = match host.next().await.unwrap().unwrap() {
+                Message::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+                other => panic!("unexpected host auth frame: {other:?}"),
+            };
+            assert_eq!(auth["v"], RELAY_PROTOCOL_VERSION);
+            assert_eq!(
+                auth["routeId"],
+                "CG1dTxTscx5Vm84XPQRwkXjI61ziPLQNbj7La6EVEyk"
+            );
+            assert_eq!(
+                auth["hostSecret"],
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            );
+            let sync = match host.next().await.unwrap().unwrap() {
+                Message::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+                other => panic!("unexpected host sync frame: {other:?}"),
+            };
+            assert_eq!(sync["type"], "host.device-sync");
+            assert_eq!(sync["generation"], 11);
+            assert_eq!(sync["credentials"].as_array().unwrap().len(), 1);
+            host.send(Message::Text(
+                json!({
+                    "type":"host.device-sync.ack",
+                    "v":RELAY_PROTOCOL_VERSION,
+                    "generation":11
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            host.send(Message::Text(
+                json!({
+                    "type":"host.ready",
+                    "v":RELAY_PROTOCOL_VERSION,
+                    "routeId":"CG1dTxTscx5Vm84XPQRwkXjI61ziPLQNbj7La6EVEyk",
+                    "generation":11
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            host.send(Message::Text(
+                json!({
+                    "type":"stream.offer",
+                    "v":RELAY_PROTOCOL_VERSION,
+                    "streamId":"stream-abcdefghij",
+                    "ticket":"ticket-abcdefghijkl",
+                    "deviceId":"device-id-abcdefgh",
+                    "expiresAt": 8_640_000_000_000_000u64
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            let (stream_tcp, _) = listener.accept().await.unwrap();
+            let mut stream = accept_async(stream_tcp).await.unwrap();
+            let accept = match stream.next().await.unwrap().unwrap() {
+                Message::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+                other => panic!("unexpected stream accept frame: {other:?}"),
+            };
+            assert_eq!(
+                accept,
+                json!({
+                    "type":"stream.accept",
+                    "v":RELAY_PROTOCOL_VERSION,
+                    "streamId":"stream-abcdefghij",
+                    "ticket":"ticket-abcdefghijkl"
+                })
+            );
+            stream
+                .send(Message::Text(
+                    json!({
+                        "type":"stream.ready",
+                        "v":RELAY_PROTOCOL_VERSION,
+                        "streamId":"stream-abcdefghij"
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let devices = vec![DeviceRecord {
+            name: "ready".into(),
+            token: "pairing-token".into(),
+            client_pub_key: None,
+            allow_shell: true,
+            allow_orchestration: None,
+            relay_device_id: Some("device-id-abcdefgh".into()),
+            relay_token: Some("relay-token-abcdefghijkl".into()),
+            relay_credential_issued: Some(true),
+            created_at: 1,
+            last_seen_at: None,
+        }];
+        let client = RelayHostClient::new(
+            format!("ws://127.0.0.1:{addr_port}", addr_port = addr.port()),
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            devices,
+            11,
+        );
+        let mut session = client.connect_once().await.unwrap();
+        assert_eq!(session.status().state, RelayConnectionState::Online);
+        assert_eq!(session.status().ready_devices, 1);
+        let _stream = session.accept_one_stream().await.unwrap();
+        server.await.unwrap();
+    }
+}
