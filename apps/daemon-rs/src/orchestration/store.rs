@@ -159,6 +159,7 @@ fn normalize_skills(values: &[String]) -> Result<Vec<String>> {
 
 fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
     let status: String = row.get("status")?;
+    let automation_raw: Option<String> = row.get("automation")?;
     Ok(Run {
         id: row.get("id")?,
         objective: row.get("objective")?,
@@ -168,6 +169,7 @@ fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
             _ => RunStatus::Active,
         },
         coordinator_session_id: row.get("coordinator_session_id")?,
+        automation: automation_raw.and_then(|raw| serde_json::from_str(&raw).ok()),
         graph_revision: row.get("graph_revision")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
@@ -520,13 +522,14 @@ impl Store {
             objective: input.objective.trim().to_owned(),
             status: RunStatus::Active,
             coordinator_session_id: input.coordinator_session_id.clone(),
+            automation: None,
             graph_revision: 1,
             created_at: now,
             updated_at: now,
         };
         tx.execute(
-            "INSERT INTO orch_runs(id,objective,status,coordinator_session_id,graph_revision,created_at,updated_at) \
-             VALUES(?1,?2,'active',?3,1,?4,?4)",
+            "INSERT INTO orch_runs(id,objective,status,coordinator_session_id,automation,graph_revision,created_at,updated_at) \
+             VALUES(?1,?2,'active',?3,NULL,1,?4,?4)",
             params![run.id, run.objective, run.coordinator_session_id, now],
         )?;
         Self::emit(&tx, "run.created", &run.id, serde_json::to_value(&run)?)?;
@@ -614,6 +617,12 @@ impl Store {
             return Ok(result);
         }
         let run = Self::require_active_run(&tx, &input.run_id)?;
+        if matches!(
+            run.automation.as_ref().map(|automation| automation.state),
+            Some(AutomationState::Running)
+        ) {
+            return Err(invalid("任务图正在自动执行；请先暂停，再编辑或手工派发"));
+        }
         if run.graph_revision != input.base_revision {
             return Err(Error::Conflict);
         }
@@ -825,14 +834,15 @@ impl Store {
             objective: input.objective.trim().to_owned(),
             status: RunStatus::Active,
             coordinator_session_id: input.coordinator_session_id,
+            automation: None,
             graph_revision: 0,
             created_at: now,
             updated_at: now,
         };
         let tx = self.connection.transaction()?;
         tx.execute(
-            "INSERT INTO orch_runs(id,objective,status,coordinator_session_id,graph_revision,created_at,updated_at) \
-             VALUES(?1,?2,'active',?3,0,?4,?4)",
+            "INSERT INTO orch_runs(id,objective,status,coordinator_session_id,automation,graph_revision,created_at,updated_at) \
+             VALUES(?1,?2,'active',?3,NULL,0,?4,?4)",
             params![run.id, run.objective, run.coordinator_session_id, now],
         )?;
         Self::emit(&tx, "run.created", &run.id, serde_json::to_value(&run)?)?;
@@ -859,7 +869,13 @@ impl Store {
 
         let tx = self.connection.transaction()?;
         tx.execute_batch("PRAGMA defer_foreign_keys=ON")?;
-        let _run = Self::require_active_run(&tx, &input.run_id)?;
+        let run = Self::require_active_run(&tx, &input.run_id)?;
+        if matches!(
+            run.automation.as_ref().map(|automation| automation.state),
+            Some(AutomationState::Running)
+        ) {
+            return Err(invalid("任务图正在自动执行；请先暂停，再编辑或手工派发"));
+        }
         let now = now();
         let id = new_id("task");
         let candidate = TaskRow {
@@ -899,7 +915,9 @@ impl Store {
     pub fn delete_run(&mut self, run_id: &str, force: bool) -> Result<RunDeletionResult> {
         validate_id(run_id)?;
         let tx = self.connection.transaction()?;
-        let _run = Self::orch_run_from_tx(&tx, run_id)?;
+        let run = Self::orch_run_from_tx(&tx, run_id)?;
+        let now = now();
+        Self::pause_running_automation_tx(&tx, &run, now, None)?;
         let active: i64 = tx.query_row(
             "SELECT count(*) FROM orch_dispatches WHERE run_id=?1 AND state IN ('starting','running')",
             [run_id],
@@ -913,7 +931,6 @@ impl Store {
         if active > 0 {
             // Forced historical cleanup: converge the dispatch rows but leave
             // the disk trees indexed for manual recovery.
-            let now = now();
             let reason =
                 "explicit historical run cleanup; worktree assets preserved for manual recovery";
             tx.execute(
@@ -932,7 +949,6 @@ impl Store {
             [run_id],
             |row| row.get(0),
         )?;
-        let now = now();
         // Detach assets first so the ids survive the cascade in the result.
         let mut preserved_ids = Vec::new();
         {
@@ -1110,7 +1126,9 @@ impl Store {
         validate_text(reason, 8192, false)?;
         let tx = self.connection.transaction()?;
         let task = Self::task_row(&tx, task_id)?;
-        Self::require_active_run(&tx, &task.run_id)?;
+        let run = Self::require_active_run(&tx, &task.run_id)?;
+        let now = now();
+        Self::pause_running_automation_tx(&tx, &run, now, None)?;
         if task.status == TaskStatus::Cancelled {
             return Ok(task.task());
         }
@@ -1120,7 +1138,6 @@ impl Store {
         if !matches!(task.status, TaskStatus::Pending | TaskStatus::Blocked) {
             return Err(invalid("only pending or blocked tasks can be cancelled"));
         }
-        let now = now();
         tx.execute(
             "UPDATE orch_tasks SET status='cancelled',result=?1,updated_at=?2 WHERE id=?3",
             params![reason, now, task_id],
@@ -1145,7 +1162,8 @@ impl Store {
         validate_id(task_id)?;
         let tx = self.connection.transaction()?;
         let task = Self::task_row(&tx, task_id)?;
-        Self::require_active_run(&tx, &task.run_id)?;
+        let run = Self::require_active_run(&tx, &task.run_id)?;
+        Self::pause_running_automation_tx(&tx, &run, now(), None)?;
         if task.status != TaskStatus::Failed {
             return Err(invalid("only failed tasks can be retried"));
         }
@@ -1527,6 +1545,30 @@ impl Store {
         Ok(RecoveryReport { settled, resumed })
     }
 
+    fn pause_running_automation_tx(
+        tx: &Transaction<'_>,
+        run: &Run,
+        timestamp: i64,
+        error: Option<String>,
+    ) -> Result<()> {
+        let Some(mut automation) = run.automation.clone() else {
+            return Ok(());
+        };
+        if automation.state != AutomationState::Running {
+            return Ok(());
+        }
+        automation.state = AutomationState::Paused;
+        automation.updated_at = timestamp;
+        automation.last_error = error;
+        tx.execute(
+            "UPDATE orch_runs SET automation=?1,updated_at=?2 WHERE id=?3",
+            params![serde_json::to_string(&automation)?, timestamp, run.id],
+        )?;
+        let run = Self::orch_run_from_tx(tx, &run.id)?;
+        Self::emit(tx, "run.updated", &run.id, serde_json::to_value(&run)?)?;
+        Ok(())
+    }
+
     // ── Run lifecycle ────────────────────────────────────────────────────
 
     pub fn complete_run(&mut self, run_id: &str, allow_failed: bool) -> Result<Run> {
@@ -1538,6 +1580,14 @@ impl Store {
         }
         if run.status != RunStatus::Active {
             return Err(invalid("only active runs can be completed"));
+        }
+        if matches!(
+            run.automation.as_ref().map(|a| a.state),
+            Some(AutomationState::Running)
+        ) {
+            return Err(invalid(
+                "automation is still running; pause it before completing the run",
+            ));
         }
         let unfinished: i64 = tx.query_row(
             "SELECT count(*) FROM orch_tasks WHERE run_id=?1 AND ( \
@@ -1578,6 +1628,129 @@ impl Store {
         Ok(run)
     }
 
+    pub fn complete_run_from_automation(&mut self, run_id: &str) -> Result<Run> {
+        validate_id(run_id)?;
+        let tx = self.connection.transaction()?;
+        let run = Self::orch_run_from_tx(&tx, run_id)?;
+        if run.status == RunStatus::Completed {
+            return Ok(run);
+        }
+        if run.status != RunStatus::Active {
+            return Err(invalid("only active runs can be completed"));
+        }
+        if !matches!(
+            run.automation.as_ref().map(|a| a.state),
+            Some(AutomationState::Running)
+        ) {
+            return Err(invalid("automation is not running"));
+        }
+        let unfinished: i64 = tx.query_row(
+            "SELECT count(*) FROM orch_tasks WHERE run_id=?1 AND status<>'done'",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        if unfinished > 0 {
+            return Err(invalid("the run still has unfinished tasks"));
+        }
+        let active: i64 = tx.query_row(
+            "SELECT count(*) FROM orch_dispatches WHERE run_id=?1 AND state IN ('starting','running')",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        if active > 0 {
+            return Err(invalid("a worker is still running"));
+        }
+        let pending_gates: i64 = tx.query_row(
+            "SELECT count(*) FROM orch_gates WHERE run_id=?1 AND status='pending'",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        if pending_gates > 0 {
+            return Err(invalid("a gate is still pending"));
+        }
+        let now = now();
+        let mut automation = run
+            .automation
+            .ok_or_else(|| invalid("automation is not running"))?;
+        automation.state = AutomationState::Completed;
+        automation.updated_at = now;
+        automation.last_error = None;
+        tx.execute(
+            "UPDATE orch_runs SET status='completed',automation=?1,updated_at=?2 WHERE id=?3",
+            params![serde_json::to_string(&automation)?, now, run_id],
+        )?;
+        Self::preserve_run_assets_tx(&tx, run_id, "Run 已完成；工作树默认保留，需显式清理")?;
+        let run = Self::orch_run_from_tx(&tx, run_id)?;
+        Self::emit(&tx, "run.updated", &run.id, serde_json::to_value(&run)?)?;
+        tx.commit()?;
+        Ok(run)
+    }
+
+    pub fn set_run_automation(
+        &mut self,
+        run_id: &str,
+        automation: Option<RunAutomation>,
+    ) -> Result<Run> {
+        validate_id(run_id)?;
+        if let Some(automation) = &automation {
+            validate_text(&automation.approval_policy, 64, false)?;
+            validate_text(&automation.cwd, 4096, false)?;
+            validate_text(&automation.workspace_path, 4096, false)?;
+            if let Some(account_id) = &automation.account_id {
+                validate_id(account_id)?;
+            }
+            if let Some(branch) = &automation.branch {
+                validate_text(branch, 256, false)?;
+            }
+        }
+        let tx = self.connection.transaction()?;
+        let run = Self::require_active_run(&tx, run_id)?;
+        let raw = automation
+            .map(|value| serde_json::to_string(&value))
+            .transpose()?;
+        let timestamp = now();
+        tx.execute(
+            "UPDATE orch_runs SET automation=?1,updated_at=?2 WHERE id=?3",
+            params![raw, timestamp, run.id],
+        )?;
+        let run = Self::orch_run_from_tx(&tx, run_id)?;
+        Self::emit(&tx, "run.updated", &run.id, serde_json::to_value(&run)?)?;
+        tx.commit()?;
+        Ok(run)
+    }
+
+    pub fn pause_automation_with_error(
+        &mut self,
+        run_id: &str,
+        error: Option<String>,
+    ) -> Result<Run> {
+        validate_id(run_id)?;
+        if let Some(error) = &error {
+            validate_text(error, 4096, false)?;
+        }
+        let tx = self.connection.transaction()?;
+        let run = Self::require_active_run(&tx, run_id)?;
+        let mut automation = run
+            .automation
+            .clone()
+            .ok_or_else(|| invalid("this run has no automation"))?;
+        if automation.state == AutomationState::Completed {
+            return Ok(run);
+        }
+        let timestamp = now();
+        automation.state = AutomationState::Paused;
+        automation.updated_at = timestamp;
+        automation.last_error = error;
+        tx.execute(
+            "UPDATE orch_runs SET automation=?1,updated_at=?2 WHERE id=?3",
+            params![serde_json::to_string(&automation)?, timestamp, run_id],
+        )?;
+        let run = Self::orch_run_from_tx(&tx, run_id)?;
+        Self::emit(&tx, "run.updated", &run.id, serde_json::to_value(&run)?)?;
+        tx.commit()?;
+        Ok(run)
+    }
+
     pub fn abandon_run(&mut self, run_id: &str, reason: &str) -> Result<Run> {
         validate_id(run_id)?;
         validate_text(reason, 8192, false)?;
@@ -1598,6 +1771,7 @@ impl Store {
             return Err(invalid("stop the workers before abandoning the run"));
         }
         let now = now();
+        Self::pause_running_automation_tx(&tx, &run, now, None)?;
         tx.execute(
             "UPDATE orch_tasks SET status='cancelled',result=?1,updated_at=?2 \
              WHERE run_id=?3 AND status IN ('pending','blocked','dispatched')",

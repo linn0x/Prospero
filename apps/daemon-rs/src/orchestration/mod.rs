@@ -7,6 +7,7 @@
 //! not satisfy the edge, so a chain whose premise disappeared never silently
 //! starts on a half-built foundation.
 
+mod automation;
 mod gitops;
 mod store;
 mod workers;
@@ -16,6 +17,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+pub use automation::{kick_automation, pause_automation, start_automation, tick_automation};
 pub use gitops::{
     WorktreeCreate, create_worktree, inspect_asset, remove_worktree, repo_root,
     worktree_default_path,
@@ -121,6 +123,43 @@ pub enum MessageType {
     Report,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationState {
+    Running,
+    Paused,
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationWorkspace {
+    Run,
+    Current,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct RunAutomation {
+    pub state: AutomationState,
+    pub agent: crate::protocol::AgentKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined")]
+    pub account_id: Option<String>,
+    pub approval_policy: String,
+    pub workspace: AutomationWorkspace,
+    pub cwd: String,
+    pub workspace_path: String,
+    #[ts(type = "string | null")]
+    pub branch: Option<String>,
+    #[ts(type = "number")]
+    pub started_at: i64,
+    #[ts(type = "number")]
+    pub updated_at: i64,
+    #[ts(type = "string | null")]
+    pub last_error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct Run {
@@ -128,6 +167,8 @@ pub struct Run {
     pub objective: String,
     pub status: RunStatus,
     pub coordinator_session_id: Option<String>,
+    #[ts(type = "RunAutomation | null")]
+    pub automation: Option<RunAutomation>,
     #[ts(type = "number")]
     pub graph_revision: i64,
     #[ts(type = "number")]
@@ -406,6 +447,19 @@ pub struct RunDeletionResult {
 
 /// Desktop worker launch. `worktree` is `new` (isolated git worktree, matching
 /// the legacy launcher) or `none` (run straight in the provided cwd).
+#[derive(Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StartAutomation {
+    pub run_id: String,
+    #[serde(default = "default_worker_agent")]
+    pub agent: crate::protocol::AgentKind,
+    #[serde(default)]
+    pub account_id: Option<String>,
+    pub approval_policy: String,
+    pub workspace: AutomationWorkspace,
+    pub cwd: String,
+}
+
 #[derive(Debug, Deserialize, Serialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StartWorker {
