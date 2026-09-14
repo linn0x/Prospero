@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
@@ -18,6 +18,7 @@ use axum::{
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use futures_util::{Stream, stream};
+use serde_json::{Value as JsonValue, json};
 use tokio::sync::{Semaphore, watch};
 
 use crate::agent::Agents;
@@ -34,6 +35,7 @@ use crate::orchestration::{
     CreateGate, CreateRun, CreateRunGraph, CreateTask, DeleteRun, DispatchTask, InspectWorktree,
     MarkMessages, PostMessage, ResolveGate, SettleDispatch, StartWorker, StopWorker,
 };
+use crate::pairing::{self, AuthFailure, DeviceRecord};
 use crate::project::{
     FsChunk, FsChunkQuery, FsContent, FsDone, FsListing, FsPathQuery, FsPathRequest, FsPutRequest,
     FsRenameRequest, FsWriteRequest, FsWritten, GitCommitRequest, GitDiffQuery, GitDiffResult,
@@ -41,9 +43,10 @@ use crate::project::{
     SearchResult, WorkspaceSummaryResult,
 };
 use crate::protocol::*;
+use crate::remote_crypto::{self, SecureChannel};
 use crate::terminal::{
-    CreateTerminal, TerminalInput, TerminalPage, TerminalQuery, TerminalSize, TerminalSnapshot,
-    runtime::Terminals,
+    CreateTerminal, TerminalEvent, TerminalInput, TerminalPage, TerminalQuery, TerminalSize,
+    TerminalSnapshot, runtime::Terminals,
 };
 use crate::worker::Database;
 
@@ -300,12 +303,14 @@ async fn authorize(State(api): State<Api>, request: Request, next: Next) -> Resp
     if request.headers().contains_key("origin") {
         return ApiError(Error::Forbidden).into_response();
     }
-    if request.headers().get_all("authorization").iter().count() != 1
-        || !request
-            .headers()
-            .get("authorization")
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| api.token.accepts(value))
+    let is_remote_ws = request.uri().path() == "/ws";
+    if !is_remote_ws
+        && (request.headers().get_all("authorization").iter().count() != 1
+            || !request
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| api.token.accepts(value)))
     {
         return ApiError(Error::Unauthorized).into_response();
     }
@@ -328,26 +333,1330 @@ async fn authorize(State(api): State<Api>, request: Request, next: Next) -> Resp
 
 const WS_MAX_PAYLOAD: usize = 16 * 1024 * 1024;
 
-async fn remote_ws(ws: WebSocketUpgrade) -> Response {
+async fn remote_ws(State(api): State<Api>, ws: WebSocketUpgrade) -> Response {
     ws.max_message_size(WS_MAX_PAYLOAD)
         .max_frame_size(WS_MAX_PAYLOAD)
-        .on_upgrade(handle_remote_ws)
+        .on_upgrade(move |socket| handle_remote_ws(api, socket))
 }
 
-async fn handle_remote_ws(mut socket: WebSocket) {
-    // The TypeScript daemon's /ws surface is an encrypted mobile/relay
-    // boundary. Until the Rust daemon owns the pairing keys and SecureChannel
-    // dispatcher, fail closed after the upgrade rather than accepting plaintext
-    // control messages or advertising remote capabilities.
-    if let Some(Ok(Message::Ping(bytes))) = socket.recv().await {
-        let _ = socket.send(Message::Pong(bytes)).await;
+const CLOSE_AUTH_FAILED: u16 = 4001;
+const CLOSE_PROTOCOL: u16 = 4003;
+const CLOSE_REVOKED: u16 = 4004;
+
+async fn handle_remote_ws(api: Api, mut socket: WebSocket) {
+    let first = match recv_text_frame(&mut socket).await {
+        Ok(Some(text)) => text,
+        Ok(None) => return,
+        Err(_) => {
+            close_ws(&mut socket, CLOSE_PROTOCOL, "handshake error").await;
+            return;
+        }
+    };
+    let home = api.database.directory().to_path_buf();
+    let identity = match pairing::load_identity(&home) {
+        Ok(identity) => identity,
+        Err(_) => {
+            close_ws(&mut socket, CLOSE_REVOKED, "not paired").await;
+            return;
+        }
+    };
+    let responded = match remote_crypto::server_handshake_respond(&first, &identity.secret_key) {
+        Ok(responded) => responded,
+        Err(_) => {
+            close_ws(&mut socket, CLOSE_PROTOCOL, "handshake error").await;
+            return;
+        }
+    };
+    if socket
+        .send(Message::Text(responded.frame.into()))
+        .await
+        .is_err()
+    {
+        return;
     }
+    let hello_frame = match recv_text_frame(&mut socket).await {
+        Ok(Some(text)) => text,
+        Ok(None) => return,
+        Err(_) => {
+            close_ws(&mut socket, CLOSE_PROTOCOL, "handshake error").await;
+            return;
+        }
+    };
+    let accepted = match remote_crypto::server_handshake_accept(responded.state, &hello_frame) {
+        Ok(accepted) => accepted,
+        Err(_) => {
+            close_ws(&mut socket, CLOSE_PROTOCOL, "handshake error").await;
+            return;
+        }
+    };
+    let token = accepted
+        .hello
+        .get("token")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+    let client_pub_key = accepted
+        .hello
+        .get("clientPubKey")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+    let device = match pairing::authenticate(&home, token, client_pub_key) {
+        Ok(Ok(device)) => device,
+        Ok(Err(AuthFailure::UnknownToken | AuthFailure::KeyMismatch)) => {
+            let mut channel = accepted.channel;
+            let _ = send_remote_json(
+                &mut socket,
+                &mut channel,
+                &json!({"type":"error","code":"auth_failed","message":"invalid token, or device key changed"}),
+            )
+            .await;
+            close_ws(&mut socket, CLOSE_AUTH_FAILED, "auth failed").await;
+            return;
+        }
+        Err(_) => {
+            close_ws(&mut socket, CLOSE_AUTH_FAILED, "auth failed").await;
+            return;
+        }
+    };
+    let mut channel = accepted.channel;
+    if send_hello_ok(&api, &mut socket, &mut channel, accepted.protocol_version)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    while let Ok(Some(text)) = recv_text_frame(&mut socket).await {
+        let message = match channel.open(&text) {
+            Ok(message) => message,
+            Err(_) => {
+                close_ws(&mut socket, CLOSE_PROTOCOL, "crypto").await;
+                return;
+            }
+        };
+        if let Err(error) =
+            route_remote_ws_message(&api, &mut socket, &mut channel, &device, message).await
+            && send_remote_error(&mut socket, &mut channel, &error, None)
+                .await
+                .is_err()
+        {
+            return;
+        }
+    }
+}
+
+async fn recv_text_frame(socket: &mut WebSocket) -> Result<Option<String>> {
+    loop {
+        match socket.recv().await {
+            Some(Ok(Message::Text(text))) => return Ok(Some(text.to_string())),
+            Some(Ok(Message::Binary(bytes))) => {
+                return String::from_utf8(bytes.to_vec())
+                    .map(Some)
+                    .map_err(|_| Error::Invalid("binary WebSocket frame is not UTF-8".into()));
+            }
+            Some(Ok(Message::Ping(bytes))) => {
+                if socket.send(Message::Pong(bytes)).await.is_err() {
+                    return Ok(None);
+                }
+            }
+            Some(Ok(Message::Pong(_))) => {}
+            Some(Ok(Message::Close(_))) | None => return Ok(None),
+            Some(Err(_)) => return Err(Error::Closed),
+        }
+    }
+}
+
+async fn close_ws(socket: &mut WebSocket, code: u16, reason: &str) {
     let _ = socket
         .send(Message::Close(Some(CloseFrame {
-            code: 4003,
-            reason: "Rust encrypted remote WebSocket is not implemented".into(),
+            code,
+            reason: reason.to_owned().into(),
         })))
         .await;
+}
+
+async fn send_remote_json(
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    value: &JsonValue,
+) -> Result<()> {
+    let frame = channel.seal(value)?;
+    socket
+        .send(Message::Text(frame.into()))
+        .await
+        .map_err(|_| Error::Closed)
+}
+
+async fn send_hello_ok(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    protocol_version: u8,
+) -> Result<()> {
+    let page = api
+        .call(|store| {
+            store.sessions(SessionQuery {
+                limit: Some(100),
+                lifecycle: Some(SessionLifecycle::Active),
+                ..SessionQuery::default()
+            })
+        })
+        .await?;
+    send_remote_json(
+        socket,
+        channel,
+        &json!({
+            "type": "hello.ok",
+            "host": remote_host_info(protocol_version),
+            "sessions": page.items.into_iter().map(remote_session_info).collect::<Vec<_>>(),
+        }),
+    )
+    .await
+}
+
+fn remote_host_info(protocol_version: u8) -> JsonValue {
+    json!({
+        "name": std::env::var("HOSTNAME").unwrap_or_else(|_| "localhost".into()),
+        "daemonVersion": env!("CARGO_PKG_VERSION"),
+        "protocolVersion": remote_crypto::PROTOCOL_VERSION,
+        "minimumProtocolVersion": remote_crypto::MIN_PROTOCOL_VERSION,
+        "negotiatedProtocolVersion": protocol_version,
+        "capabilities": [
+            "session.create-result.v1",
+            "conversation.search.v1",
+            "chat.attachment-previews.v1",
+            "model.sources.v1",
+        ],
+        "platform": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "daemonStartedAt": SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0),
+        "tmuxManaged": false,
+    })
+}
+
+fn remote_session_info(head: SessionHead) -> JsonValue {
+    json!({
+        "id": head.id,
+        "agent": head.agent,
+        "kind": head.kind,
+        "title": head.title,
+        "cwd": head.workspace,
+        "status": head.status,
+        "createdAt": head.created_at,
+        "cols": 80,
+        "rows": 24,
+    })
+}
+
+async fn route_remote_ws_message(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    device: &DeviceRecord,
+    message: JsonValue,
+) -> Result<()> {
+    let kind = message
+        .get("type")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("");
+    match kind {
+        "connection.ping" => {
+            let id = message.get("id").and_then(JsonValue::as_str).unwrap_or("");
+            send_remote_json(socket, channel, &json!({"type":"connection.pong","id":id})).await
+        }
+        "session.create" => remote_session_create(api, socket, channel, device, message).await,
+        "session.attach" => remote_session_attach(api, socket, channel, message).await,
+        "launch.models.get" => remote_launch_models(api, socket, channel, message).await,
+        "agent.models.get" => remote_agent_models(api, socket, channel, message).await,
+        "agent.modes.get" => remote_agent_modes(api, socket, channel, message).await,
+        "agent.model.set" => remote_agent_model_set(api, socket, channel, message).await,
+        "agent.mode.set" => remote_agent_mode_set(api, socket, channel, message).await,
+        "agent.compact" => remote_agent_compact(api, socket, channel, message).await,
+        "tool.output.get" => remote_tool_output(api, socket, channel, message).await,
+        "chat.attachment.get" => remote_chat_attachment(api, socket, channel, message).await,
+        "approval.policy.set" => remote_approval_policy_set(api, message).await,
+        "session.interrupt" => {
+            let sid = require_str(&message, "sid")?;
+            api.agents.interrupt(sid).await
+        }
+        "session.kill" => {
+            let sid = require_str(&message, "sid")?;
+            api.agents.close(sid).await.or_else(|_| api.terminals.close(sid))
+        }
+        "permission.respond" => remote_permission_respond(api, message).await,
+        "question.respond" => remote_question_respond(api, message).await,
+        "subagent.send" => remote_subagent_send(api, message).await,
+        "subagent.history.get" => remote_subagent_history(api, socket, channel, message).await,
+        "usage.get" => remote_usage(api, socket, channel, message).await,
+        "conversation.search" => remote_conversation_search(api, socket, channel, message).await,
+        "workspace.summary" => remote_workspace_summary(api, socket, channel, message).await,
+        "fs.list" => remote_fs_list(api, socket, channel, message).await,
+        "fs.read" => remote_fs_read(api, socket, channel, message).await,
+        "fs.get" => remote_fs_get(api, socket, channel, message).await,
+        "fs.write" => remote_fs_write(api, socket, channel, message).await,
+        "fs.put" => remote_fs_put(api, socket, channel, message).await,
+        "fs.mkdir" => remote_fs_mkdir(api, socket, channel, message).await,
+        "fs.remove" => remote_fs_remove(api, socket, channel, message).await,
+        "fs.rename" => remote_fs_rename(api, socket, channel, message).await,
+        "git.status" => remote_git_status(api, socket, channel, message).await,
+        "git.diff" => remote_git_diff(api, socket, channel, message).await,
+        "git.history" => remote_git_history(api, socket, channel, message).await,
+        "git.stage" => remote_git_stage(api, socket, channel, message).await,
+        "git.discard" => remote_git_discard(api, socket, channel, message).await,
+        "git.commit" => remote_git_commit(api, socket, channel, message).await,
+        "chat.send" => {
+            let sid = require_str(&message, "sid")?;
+            let text = message
+                .get("text")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let delivery = message
+                .get("delivery")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned);
+            let attachments = message
+                .get("attachments")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or_default();
+            api.agents.send(sid, text, delivery, attachments).await?;
+            api.publish();
+            Ok(())
+        }
+        "chat.queue.remove" => {
+            let sid = require_str(&message, "sid")?;
+            let queue_id = require_str(&message, "queueId")?;
+            api.agents.remove_queued(sid, queue_id).await?;
+            api.publish();
+            Ok(())
+        }
+        "chat.queue.guide" => {
+            let sid = require_str(&message, "sid")?;
+            let queue_id = require_str(&message, "queueId")?;
+            api.agents.guide_queued(sid, queue_id).await?;
+            api.publish();
+            Ok(())
+        }
+        "term.input" => {
+            if !device.allow_shell {
+                return send_remote_json(
+                    socket,
+                    channel,
+                    &json!({"type":"error","code":"shell_not_allowed","message":"shell access is not allowed"}),
+                )
+                .await;
+            }
+            let sid = require_str(&message, "sid")?;
+            let data_b64 = require_str(&message, "dataB64")?.to_owned();
+            api.terminals.input(sid, TerminalInput { data_b64 }).await
+        }
+        "term.resize" => {
+            if !device.allow_shell {
+                return send_remote_json(
+                    socket,
+                    channel,
+                    &json!({"type":"error","code":"shell_not_allowed","message":"shell access is not allowed"}),
+                )
+                .await;
+            }
+            let sid = require_str(&message, "sid")?;
+            let cols = require_u16(&message, "cols")?;
+            let rows = require_u16(&message, "rows")?;
+            api.terminals
+                .resize(sid, TerminalSize { cols, rows }.validate()?)
+                .await
+        }
+        _ => {
+            send_remote_json(
+                socket,
+                channel,
+                &json!({"type":"error","code":"bad_message","message":format!("unsupported message type: {kind}")}),
+            )
+            .await
+        }
+    }
+}
+
+async fn send_remote_error(
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    error: &Error,
+    sid: Option<&str>,
+) -> Result<()> {
+    let mut body = json!({
+        "type": "error",
+        "code": remote_error_code(error),
+        "message": error.to_string(),
+    });
+    if let Some(sid) = sid {
+        body["sid"] = json!(sid);
+    }
+    send_remote_json(socket, channel, &body).await
+}
+
+async fn remote_launch_models(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let request_id = require_str(&message, "requestId")?.to_owned();
+    let agent = require_str(&message, "agent")?;
+    let account_id = message
+        .get("accountId")
+        .and_then(JsonValue::as_str)
+        .map(str::to_owned);
+    let mut out = json!({"type":"launch.models","requestId":request_id,"agent":agent,"models":[]});
+    match agent {
+        "codex" => match account_id.as_deref() {
+            None | Some(crate::agent::NATIVE_CODEX_ID) => {
+                let catalog =
+                    crate::agent::read_native_codex_models(api.database.directory()).await?;
+                let catalog = serde_json::to_value(catalog)?;
+                out["models"] = catalog["models"].clone();
+                out["currentModel"] = catalog["currentModel"].clone();
+            }
+            Some(_) => out["error"] = json!("Rust daemon 当前仅支持本机 Codex 模型目录"),
+        },
+        "claude" => {
+            let account_id = account_id.or_else(|| Some(crate::accounts::NATIVE_CLAUDE_ID.into()));
+            match api.agents.launch_catalog_for(account_id.as_deref()).await {
+                Ok(catalog) => {
+                    let catalog = serde_json::to_value(catalog)?;
+                    out["models"] = catalog["models"].clone();
+                    out["currentModel"] = catalog["currentModel"].clone();
+                }
+                Err(error) => out["error"] = json!(error.to_string()),
+            }
+        }
+        _ => out["error"] = json!("invalid model catalog agent"),
+    }
+    send_remote_json(socket, channel, &out).await
+}
+
+async fn remote_agent_models(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let sid = require_str(&message, "sid")?;
+    let request_id = require_str(&message, "requestId")?;
+    let catalog = api.agents.models(sid).await?;
+    let value = serde_json::to_value(catalog)?;
+    send_remote_json(
+        socket,
+        channel,
+        &json!({"type":"agent.models","sid":sid,"requestId":request_id,"models":value["models"],"currentModel":value["currentModel"],"currentEffort":value["currentEffort"]}),
+    )
+    .await
+}
+
+async fn remote_agent_modes(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let sid = require_str(&message, "sid")?;
+    let request_id = require_str(&message, "requestId")?;
+    let mode = api.agents.mode(sid).await?;
+    let catalog = serde_json::to_value(mode_catalog(mode.label()))?;
+    send_remote_json(
+        socket,
+        channel,
+        &json!({"type":"agent.modes","sid":sid,"requestId":request_id,"modes":catalog["modes"],"currentMode":catalog["currentMode"]}),
+    )
+    .await
+}
+
+async fn remote_agent_model_set(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let sid = require_str(&message, "sid")?;
+    let request_id = require_str(&message, "requestId")?;
+    let model = require_str(&message, "model")?.to_owned();
+    let effort = message
+        .get("effort")
+        .and_then(JsonValue::as_str)
+        .map(str::to_owned);
+    let result = api.agents.set_model(sid, model, effort).await?;
+    let result = serde_json::to_value(result)?;
+    send_remote_json(
+        socket,
+        channel,
+        &json!({"type":"agent.control.result","sid":sid,"requestId":request_id,"action":"model.set","ok":true,"currentModel":result["currentModel"],"currentEffort":result["currentEffort"]}),
+    )
+    .await
+}
+
+async fn remote_agent_mode_set(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let sid = require_str(&message, "sid")?;
+    let request_id = require_str(&message, "requestId")?;
+    let mode = PermissionMode::from_wire(require_str(&message, "mode")?)?;
+    api.agents.set_mode(sid, mode).await?;
+    send_remote_json(
+        socket,
+        channel,
+        &json!({"type":"agent.control.result","sid":sid,"requestId":request_id,"action":"mode.set","ok":true,"currentMode":mode.label()}),
+    )
+    .await
+}
+
+async fn remote_agent_compact(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let sid = require_str(&message, "sid")?;
+    let request_id = require_str(&message, "requestId")?;
+    let result = api.agents.compact(sid, request_id).await?;
+    send_remote_json(socket, channel, &serde_json::to_value(result)?).await
+}
+
+async fn remote_tool_output(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let sid = require_str(&message, "sid")?.to_owned();
+    let call_id = require_str(&message, "callId")?.to_owned();
+    crate::timeline::validate_record_id(&call_id)?;
+    let lookup_sid = sid.clone();
+    let lookup_call_id = call_id.clone();
+    let output = api
+        .database
+        .call(move |store| {
+            let record = store.timeline_record(&lookup_sid, &lookup_call_id)?;
+            if !matches!(record.body, TimelineBody::Tool { .. }) {
+                return Err(Error::NotFound);
+            }
+            let page =
+                store.timeline_text(&lookup_sid, &lookup_call_id, TimelineTextQuery::default())?;
+            Ok(json!({
+                "type":"tool.output",
+                "sid": sid,
+                "callId": call_id,
+                "output": page.text,
+                "truncated": page.next_part.is_some(),
+            }))
+        })
+        .await?;
+    send_remote_json(socket, channel, &output).await
+}
+
+async fn remote_chat_attachment(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let sid = require_str(&message, "sid")?;
+    let msg_id = require_str(&message, "msgId")?;
+    let attachment_id = require_str(&message, "attachmentId")?;
+    let request_id = require_str(&message, "requestId")?;
+    let offset = message
+        .get("offset")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(0);
+    let length = message
+        .get("length")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(1024 * 1024)
+        .try_into()
+        .map_err(|_| Error::Invalid("invalid length".into()))?;
+    let Some(chunk) = api
+        .agents
+        .attachment_chunk(sid, msg_id, attachment_id, offset, length)
+        .await?
+    else {
+        return send_remote_json(
+            socket,
+            channel,
+            &json!({"type":"error","code":"fs_error","message":"图片附件已不可用","sid":sid}),
+        )
+        .await;
+    };
+    let chunk = serde_json::to_value(chunk)?;
+    send_remote_json(
+        socket,
+        channel,
+        &json!({
+            "type":"chat.attachment.chunk",
+            "sid":sid,
+            "msgId":msg_id,
+            "attachmentId":attachment_id,
+            "mimeType":chunk["mimeType"],
+            "dataB64":chunk["dataB64"],
+            "total":chunk["total"],
+            "eof":chunk["eof"],
+            "requestId":request_id,
+        }),
+    )
+    .await
+}
+
+async fn remote_approval_policy_set(api: &Api, message: JsonValue) -> Result<()> {
+    let sid = require_str(&message, "sid")?;
+    let policy = crate::agent::ApprovalPolicy::from_wire(require_str(&message, "policy")?)?;
+    api.agents.set_approval_policy(sid, policy).await
+}
+
+async fn remote_permission_respond(api: &Api, message: JsonValue) -> Result<()> {
+    let sid = require_str(&message, "sid")?;
+    let request_id = require_str(&message, "reqId")?.to_owned();
+    let allow = matches!(
+        message.get("reply").and_then(JsonValue::as_str),
+        Some("once") | Some("always")
+    );
+    api.agents.respond_permission(sid, &request_id, allow).await
+}
+
+async fn remote_question_respond(api: &Api, message: JsonValue) -> Result<()> {
+    let sid = require_str(&message, "sid")?;
+    let request_id = require_str(&message, "reqId")?;
+    let answers = message
+        .get("answers")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()?
+        .unwrap_or_default();
+    let cancelled = message
+        .get("cancelled")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    api.agents
+        .respond_question(sid, request_id, answers, cancelled)
+        .await
+}
+
+async fn remote_subagent_send(api: &Api, message: JsonValue) -> Result<()> {
+    let sid = require_str(&message, "sid")?;
+    let subagent = require_str(&message, "subagentId")?;
+    let text = require_str(&message, "text")?.to_owned();
+    api.agents.send_to_subagent(sid, subagent, text).await
+}
+
+async fn remote_subagent_history(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let sid = require_str(&message, "sid")?;
+    let subagent = require_str(&message, "subagentId")?;
+    let request_id = require_str(&message, "requestId")?;
+    let snapshot = api.agents.subagent_snapshot(sid, subagent).await?;
+    let mut value = serde_json::to_value(snapshot)?;
+    value["type"] = json!("subagent.history.result");
+    value["sid"] = json!(sid);
+    value["requestId"] = json!(request_id);
+    send_remote_json(socket, channel, &value).await
+}
+
+async fn remote_usage(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let sid = message
+        .get("sid")
+        .and_then(JsonValue::as_str)
+        .map(str::to_owned);
+    let result = if let Some(sid) = sid {
+        if let Some(report) = api.agents.usage(&sid).await? {
+            UsageResult {
+                kind: "usage.result".into(),
+                sid: Some(sid),
+                available: true,
+                reason: if report.windows.is_empty() {
+                    Some("这个后端不提供套餐限流窗口。".into())
+                } else {
+                    None
+                },
+                report,
+                accounts: None,
+            }
+        } else {
+            empty_usage(
+                Some(sid),
+                false,
+                Some("这个会话还没产生用量，发一条消息后再看。".into()),
+            )
+        }
+    } else {
+        let accounts = api.agents.account_usage().await?;
+        let lead = accounts.first();
+        let mut result = if let Some(lead) = lead {
+            UsageResult {
+                kind: "usage.result".into(),
+                sid: None,
+                available: accounts.iter().any(|account| account.available),
+                report: lead.report.clone(),
+                reason: lead.reason.clone(),
+                accounts: None,
+            }
+        } else {
+            empty_usage(None, false, None)
+        };
+        result.accounts = Some(accounts);
+        result
+    };
+    send_remote_json(socket, channel, &serde_json::to_value(result)?).await
+}
+
+async fn remote_conversation_search(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let request_id = require_str(&message, "requestId")?;
+    let agent = require_str(&message, "agent")?;
+    let query = message
+        .get("query")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let limit = message
+        .get("limit")
+        .and_then(JsonValue::as_u64)
+        .map(|v| v as usize);
+    let account_id = message
+        .get("accountId")
+        .and_then(JsonValue::as_str)
+        .map(str::to_owned);
+    let mut out = json!({"type":"conversation.results","requestId":request_id,"agent":agent,"conversations":[]});
+    let conversations = match agent {
+        "codex" => {
+            crate::agent::conversations::search_codex_conversations(
+                &api.database,
+                account_id,
+                query,
+                limit,
+            )
+            .await
+        }
+        "claude" => {
+            crate::agent::conversations::search_claude_conversations(
+                &api.database,
+                account_id,
+                query,
+                limit,
+            )
+            .await
+        }
+        _ => Err(Error::Invalid(
+            "Rust daemon 当前仅支持搜索 Claude/Codex 本机对话".into(),
+        )),
+    };
+    match conversations {
+        Ok(conversations) => out["conversations"] = serde_json::to_value(conversations)?,
+        Err(error) => out["error"] = json!(error.to_string()),
+    }
+    send_remote_json(socket, channel, &out).await
+}
+
+async fn remote_workspace_summary(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let sid = require_str(&message, "sid")?.to_owned();
+    let request_id = require_str(&message, "requestId")?.to_owned();
+    let root = session_workspace(api, &sid).await?;
+    let value = crate::project::workspace_summary(sid, root, request_id).await?;
+    send_remote_json(socket, channel, &serde_json::to_value(value)?).await
+}
+
+async fn remote_fs_list(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let sid = require_str(&message, "sid")?.to_owned();
+    let path = require_str(&message, "path")?.to_owned();
+    let root = session_workspace(api, &sid).await?;
+    let response_path = path.clone();
+    let entries = tokio::task::spawn_blocking(move || crate::project::list_dir(&root, &path))
+        .await
+        .map_err(|_| Error::Closed)??;
+    send_remote_json(
+        socket,
+        channel,
+        &serde_json::to_value(FsListing {
+            r#type: "fs.listing".into(),
+            sid,
+            path: response_path,
+            entries,
+        })?,
+    )
+    .await
+}
+
+async fn remote_fs_read(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let sid = require_str(&message, "sid")?.to_owned();
+    let path = require_str(&message, "path")?.to_owned();
+    let root = session_workspace(api, &sid).await?;
+    let response_path = path.clone();
+    let (content, size, truncated, binary) =
+        tokio::task::spawn_blocking(move || crate::project::read_for_edit(&root, &path))
+            .await
+            .map_err(|_| Error::Closed)??;
+    send_remote_json(
+        socket,
+        channel,
+        &serde_json::to_value(FsContent {
+            r#type: "fs.content".into(),
+            sid,
+            path: response_path,
+            content_b64: BASE64_STANDARD.encode(content),
+            size,
+            truncated,
+            binary,
+        })?,
+    )
+    .await
+}
+
+async fn remote_fs_get(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let sid = require_str(&message, "sid")?.to_owned();
+    let path = require_str(&message, "path")?.to_owned();
+    let offset = message
+        .get("offset")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(0);
+    let length = message
+        .get("length")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| Error::Invalid("missing length".into()))?;
+    let root = session_workspace(api, &sid).await?;
+    let response_path = path.clone();
+    let (data, total, eof) = tokio::task::spawn_blocking(move || {
+        crate::project::read_chunk(&root, &path, offset, length)
+    })
+    .await
+    .map_err(|_| Error::Closed)??;
+    send_remote_json(
+        socket,
+        channel,
+        &serde_json::to_value(FsChunk {
+            r#type: "fs.chunk".into(),
+            sid,
+            path: response_path,
+            offset,
+            data_b64: BASE64_STANDARD.encode(data),
+            total,
+            eof,
+        })?,
+    )
+    .await
+}
+
+async fn remote_fs_write(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let sid = require_str(&message, "sid")?.to_owned();
+    let path = require_str(&message, "path")?.to_owned();
+    let content_b64 = require_str(&message, "contentB64")?;
+    let content = BASE64_STANDARD
+        .decode(content_b64)
+        .map_err(|_| Error::Invalid("invalid base64".into()))?;
+    let create_new = message
+        .get("createNew")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    let expected_version = message
+        .get("expectedVersion")
+        .and_then(JsonValue::as_str)
+        .map(str::to_owned);
+    let root = session_workspace(api, &sid).await?;
+    let response_path = path.clone();
+    let size = tokio::task::spawn_blocking(move || {
+        crate::project::write_file_at(&root, &path, content, create_new, expected_version)
+    })
+    .await
+    .map_err(|_| Error::Closed)??;
+    send_remote_json(
+        socket,
+        channel,
+        &serde_json::to_value(FsWritten {
+            r#type: "fs.written".into(),
+            sid,
+            path: response_path,
+            size,
+        })?,
+    )
+    .await
+}
+
+async fn remote_fs_put(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let sid = require_str(&message, "sid")?.to_owned();
+    let path = require_str(&message, "path")?.to_owned();
+    let offset = message
+        .get("offset")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(0);
+    let data = BASE64_STANDARD
+        .decode(require_str(&message, "dataB64")?)
+        .map_err(|_| Error::Invalid("invalid base64".into()))?;
+    let root = session_workspace(api, &sid).await?;
+    let response_path = path.clone();
+    let size = tokio::task::spawn_blocking(move || {
+        crate::project::write_chunk(&root, &path, offset, data)
+    })
+    .await
+    .map_err(|_| Error::Closed)??;
+    send_remote_json(
+        socket,
+        channel,
+        &serde_json::to_value(FsWritten {
+            r#type: "fs.written".into(),
+            sid,
+            path: response_path,
+            size,
+        })?,
+    )
+    .await
+}
+
+async fn remote_fs_mkdir(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let sid = require_str(&message, "sid")?.to_owned();
+    let path = require_str(&message, "path")?.to_owned();
+    let root = session_workspace(api, &sid).await?;
+    let response_path = path.clone();
+    tokio::task::spawn_blocking(move || crate::project::make_dir(&root, &path))
+        .await
+        .map_err(|_| Error::Closed)??;
+    send_remote_json(
+        socket,
+        channel,
+        &serde_json::to_value(FsDone {
+            r#type: "fs.done".into(),
+            sid,
+            path: response_path,
+            op: "mkdir".into(),
+        })?,
+    )
+    .await
+}
+
+async fn remote_fs_remove(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let sid = require_str(&message, "sid")?.to_owned();
+    let path = require_str(&message, "path")?.to_owned();
+    let root = session_workspace(api, &sid).await?;
+    let response_path = path.clone();
+    tokio::task::spawn_blocking(move || crate::project::remove_entry(&root, &path))
+        .await
+        .map_err(|_| Error::Closed)??;
+    send_remote_json(
+        socket,
+        channel,
+        &serde_json::to_value(FsDone {
+            r#type: "fs.done".into(),
+            sid,
+            path: response_path,
+            op: "remove".into(),
+        })?,
+    )
+    .await
+}
+
+async fn remote_fs_rename(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let sid = require_str(&message, "sid")?.to_owned();
+    let path = require_str(&message, "path")?.to_owned();
+    let to = require_str(&message, "to")?.to_owned();
+    let root = session_workspace(api, &sid).await?;
+    let response_path = path.clone();
+    tokio::task::spawn_blocking(move || crate::project::rename_entry(&root, &path, &to))
+        .await
+        .map_err(|_| Error::Closed)??;
+    send_remote_json(
+        socket,
+        channel,
+        &serde_json::to_value(FsDone {
+            r#type: "fs.done".into(),
+            sid,
+            path: response_path,
+            op: "rename".into(),
+        })?,
+    )
+    .await
+}
+
+async fn remote_git_status(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let sid = require_str(&message, "sid")?.to_owned();
+    let root = session_workspace(api, &sid).await?;
+    let value = crate::project::git_status(sid, root).await?;
+    send_remote_json(socket, channel, &serde_json::to_value(value)?).await
+}
+
+async fn remote_git_diff(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let sid = require_str(&message, "sid")?.to_owned();
+    let path = require_str(&message, "path")?.to_owned();
+    let staged = message
+        .get("staged")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    let root = session_workspace(api, &sid).await?;
+    let value = crate::project::git_diff(sid, root, path, staged).await?;
+    send_remote_json(socket, channel, &serde_json::to_value(value)?).await
+}
+
+async fn remote_git_history(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let sid = require_str(&message, "sid")?.to_owned();
+    let root = session_workspace(api, &sid).await?;
+    let value = crate::project::git_history(sid, root).await?;
+    send_remote_json(socket, channel, &serde_json::to_value(value)?).await
+}
+
+async fn remote_git_stage(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let sid = require_str(&message, "sid")?.to_owned();
+    let paths: Vec<String> = serde_json::from_value(
+        message
+            .get("paths")
+            .cloned()
+            .ok_or_else(|| Error::Invalid("missing paths".into()))?,
+    )?;
+    let unstage = message
+        .get("unstage")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    let root = session_workspace(api, &sid).await?;
+    crate::project::git_stage(root, paths, unstage).await?;
+    send_remote_json(
+        socket,
+        channel,
+        &serde_json::to_value(GitDone {
+            r#type: "git.done".into(),
+            sid,
+            op: if unstage { "unstage" } else { "stage" }.into(),
+            detail: None,
+        })?,
+    )
+    .await
+}
+
+async fn remote_git_discard(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let sid = require_str(&message, "sid")?.to_owned();
+    let path = require_str(&message, "path")?.to_owned();
+    let root = session_workspace(api, &sid).await?;
+    crate::project::git_discard(root, path).await?;
+    send_remote_json(
+        socket,
+        channel,
+        &serde_json::to_value(GitDone {
+            r#type: "git.done".into(),
+            sid,
+            op: "discard".into(),
+            detail: None,
+        })?,
+    )
+    .await
+}
+
+async fn remote_git_commit(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let sid = require_str(&message, "sid")?.to_owned();
+    let commit_message = require_str(&message, "message")?.to_owned();
+    let root = session_workspace(api, &sid).await?;
+    let detail = crate::project::git_commit(root, commit_message).await?;
+    send_remote_json(
+        socket,
+        channel,
+        &serde_json::to_value(GitDone {
+            r#type: "git.done".into(),
+            sid,
+            op: "commit".into(),
+            detail: Some(detail),
+        })?,
+    )
+    .await
+}
+
+async fn remote_session_create(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    device: &DeviceRecord,
+    message: JsonValue,
+) -> Result<()> {
+    let request_id = message
+        .get("requestId")
+        .and_then(JsonValue::as_str)
+        .map(str::to_owned);
+    let created = async {
+        let agent: AgentKind = serde_json::from_value(
+            message
+                .get("agent")
+                .cloned()
+                .ok_or_else(|| Error::Invalid("missing agent".into()))?,
+        )?;
+        let kind = message
+            .get("kind")
+            .cloned()
+            .map(serde_json::from_value::<SessionKind>)
+            .transpose()?;
+        let cwd = message
+            .get("cwd")
+            .and_then(JsonValue::as_str)
+            .unwrap_or(".")
+            .to_owned();
+        let title = std::path::Path::new(&cwd)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("Prospero")
+            .to_owned();
+        if kind == Some(SessionKind::Pty) || matches!(agent, AgentKind::Shell | AgentKind::Custom) {
+            if !device.allow_shell {
+                return Err(Error::Feature(
+                    "shell_not_allowed".into(),
+                    "shell access is not allowed".into(),
+                ));
+            }
+            let cols = message
+                .get("cols")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(80) as u16;
+            let rows = message
+                .get("rows")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(24) as u16;
+            let head = api
+                .terminals
+                .create(CreateTerminal {
+                    title,
+                    workspace: cwd,
+                    size: TerminalSize { cols, rows }.validate()?,
+                    agent: Some(agent),
+                    command: message
+                        .get("command")
+                        .and_then(JsonValue::as_str)
+                        .map(str::to_owned),
+                    account_id: message
+                        .get("accountId")
+                        .and_then(JsonValue::as_str)
+                        .map(str::to_owned),
+                    model: message
+                        .get("model")
+                        .and_then(JsonValue::as_str)
+                        .map(str::to_owned),
+                    effort: message
+                        .get("effort")
+                        .and_then(JsonValue::as_str)
+                        .map(str::to_owned),
+                })
+                .await?;
+            Ok(head)
+        } else {
+            api.agents
+                .create(CreateAgentSession {
+                    agent,
+                    title,
+                    workspace: cwd,
+                    auto_approve: matches!(
+                        message.get("approvalPolicy").and_then(JsonValue::as_str),
+                        Some("always")
+                    ),
+                    mode: message
+                        .get("mode")
+                        .and_then(JsonValue::as_str)
+                        .map(str::to_owned),
+                    model: message
+                        .get("model")
+                        .and_then(JsonValue::as_str)
+                        .map(str::to_owned),
+                    effort: message
+                        .get("effort")
+                        .and_then(JsonValue::as_str)
+                        .map(str::to_owned),
+                    account_id: message
+                        .get("accountId")
+                        .and_then(JsonValue::as_str)
+                        .map(str::to_owned),
+                    resume: message
+                        .get("resume")
+                        .cloned()
+                        .map(serde_json::from_value)
+                        .transpose()?,
+                })
+                .await
+        }
+    }
+    .await;
+    match (request_id, created) {
+        (Some(request_id), Ok(head)) => {
+            let session = remote_session_info(head);
+            send_remote_json(
+                socket,
+                channel,
+                &json!({"type":"session.create.result","requestId":request_id,"ok":true,"session":session}),
+            )
+            .await
+        }
+        (Some(request_id), Err(error)) => {
+            send_remote_json(
+                socket,
+                channel,
+                &json!({"type":"session.create.result","requestId":request_id,"ok":false,"error":error.to_string(),"code":remote_error_code(&error)}),
+            )
+            .await
+        }
+        (None, Ok(head)) => {
+            send_remote_json(
+                socket,
+                channel,
+                &json!({"type":"session.state","session":remote_session_info(head)}),
+            )
+            .await
+        }
+        (None, Err(error)) => Err(error),
+    }
+}
+
+async fn remote_session_attach(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    message: JsonValue,
+) -> Result<()> {
+    let sid = require_str(&message, "sid")?;
+    if let Ok(page) = api
+        .terminals
+        .read(sid.to_owned(), TerminalQuery::default())
+        .await
+    {
+        let data_b64 = page
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                TerminalEvent::Output { data_b64 } => Some(data_b64.as_str()),
+                TerminalEvent::Resize { .. } => None,
+            })
+            .collect::<String>();
+        return send_remote_json(
+            socket,
+            channel,
+            &json!({
+                "type":"term.snapshot",
+                "sid":sid,
+                "ansi":"",
+                "dataB64": data_b64,
+                "seq":page.latest_seq,
+                "cols":page.initial_size.cols,
+                "rows":page.initial_size.rows,
+            }),
+        )
+        .await;
+    }
+    send_remote_json(
+        socket,
+        channel,
+        &json!({"type":"error","code":"session_not_found","message":format!("no such session: {sid}"),"sid":sid}),
+    )
+    .await
+}
+
+fn require_str<'a>(value: &'a JsonValue, key: &str) -> Result<&'a str> {
+    value
+        .get(key)
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| Error::Invalid(format!("missing {key}")))
+}
+
+fn require_u16(value: &JsonValue, key: &str) -> Result<u16> {
+    let raw = value
+        .get(key)
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| Error::Invalid(format!("missing {key}")))?;
+    u16::try_from(raw).map_err(|_| Error::Invalid(format!("invalid {key}")))
+}
+
+fn remote_error_code(error: &Error) -> &'static str {
+    match error {
+        Error::NotFound => "session_not_found",
+        Error::Feature(code, _) if code == "shell_not_allowed" => "shell_not_allowed",
+        _ => "bad_message",
+    }
 }
 
 async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, ApiError> {
