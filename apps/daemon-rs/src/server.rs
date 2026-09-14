@@ -2380,6 +2380,40 @@ fn timeline_record_events(store: &mut Store, sid: &str, record: &TimelineRecord)
     }
 }
 
+async fn load_remote_timeline_events(
+    api: &Api,
+    sid: &str,
+    after: Option<i64>,
+) -> Result<(i64, Vec<JsonValue>)> {
+    let sid = sid.to_owned();
+    api.call(move |store| {
+        let mut cursor = Some(after.unwrap_or(0));
+        let mut events = Vec::new();
+        loop {
+            let page = store.timeline(
+                &sid,
+                TimelineQuery {
+                    after: cursor,
+                    limit: Some(100),
+                    ..TimelineQuery::default()
+                },
+            )?;
+            let latest = page.latest_position;
+            if page.items.is_empty() {
+                return Ok((latest, events));
+            }
+            cursor = page.items.last().map(|record| record.position);
+            for record in &page.items {
+                events.extend(timeline_record_events(store, &sid, record));
+            }
+            if page.newer.is_none() {
+                return Ok((latest, events));
+            }
+        }
+    })
+    .await
+}
+
 async fn remote_chat_attach(
     api: &Api,
     socket: &mut WebSocket,
@@ -2389,22 +2423,7 @@ async fn remote_chat_attach(
 ) -> Result<()> {
     let sid = require_str(&message, "sid")?.to_owned();
     let last_seq = message.get("lastSeq").and_then(JsonValue::as_i64);
-    let sid_for_query = sid.clone();
-    let (latest, events) = api
-        .call(move |store| {
-            let query = TimelineQuery {
-                after: last_seq,
-                limit: Some(100),
-                ..TimelineQuery::default()
-            };
-            let page = store.timeline(&sid_for_query, query)?;
-            let mut events = Vec::new();
-            for record in &page.items {
-                events.extend(timeline_record_events(store, &sid_for_query, record));
-            }
-            Ok((page.latest_position, events))
-        })
-        .await?;
+    let (latest, events) = load_remote_timeline_events(api, &sid, last_seq).await?;
     let mut ev_seq = last_seq.unwrap_or(latest);
     if last_seq.is_some() {
         for body in &events {
@@ -2522,25 +2541,7 @@ async fn flush_remote_chat_events(
         .map(|(sid, att)| (sid.clone(), att.cursor_position, att.last_event_seq))
         .collect();
     for (sid, cursor_position, last_event_seq) in attached {
-        let sid_for_query = sid.clone();
-        let page = match api
-            .call(move |store| {
-                let page = store.timeline(
-                    &sid_for_query,
-                    TimelineQuery {
-                        after: Some(cursor_position),
-                        limit: Some(100),
-                        ..TimelineQuery::default()
-                    },
-                )?;
-                let mut bodies = Vec::new();
-                for record in &page.items {
-                    bodies.extend(timeline_record_events(store, &sid_for_query, record));
-                }
-                Ok((page.latest_position, bodies))
-            })
-            .await
-        {
+        let page = match load_remote_timeline_events(api, &sid, Some(cursor_position)).await {
             Ok(page) => page,
             Err(Error::NotFound) => {
                 state.chat_attachments.remove(&sid);
