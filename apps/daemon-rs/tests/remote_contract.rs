@@ -282,5 +282,28 @@ async fn encrypted_ws_handshake_authenticates_and_routes_ping() {
     assert!(listing["cwd"].as_str().unwrap().starts_with('/'));
     assert!(listing["entries"].is_array());
 
+    ws.send(Message::Text(
+        seal(
+            &cipher,
+            &mut send_count,
+            &json!({"type":"orchestration.run.create","objective":"remote ws run"}),
+        )
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let orchestration = match ws.next().await.unwrap().unwrap() {
+        Message::Text(text) => open(&cipher, &mut recv_count, &text),
+        other => panic!("unexpected orchestration frame: {other:?}"),
+    };
+    assert_eq!(orchestration["type"], "orchestration.snapshot");
+    let runs = orchestration["snapshot"]["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["objective"], "remote ws run");
+    assert!(orchestration["snapshot"]["tasks"].is_array());
+    assert!(orchestration["snapshot"]["dispatches"].is_array());
+    assert!(orchestration["snapshot"]["gates"].is_array());
+    assert!(orchestration["snapshot"]["worktreeAssets"].is_array());
+
     server.abort();
 }
