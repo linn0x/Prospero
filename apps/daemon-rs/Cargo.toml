@@ -30,4 +30,5 @@ url = "2.5.8"
 tempfile = "3.24.0"
 
 [dev-dependencies]
+tokio-tungstenite = "0.29.0"
 tower = { version = "0.5.3", features = ["util"] }
