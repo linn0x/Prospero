@@ -627,9 +627,14 @@ async fn profile_row(
         .api_profile
         .as_ref()
         .and_then(profile::capability_support);
+    let profile_agent = profile::agent_kind(profile);
+    let engine = match profile_agent {
+        crate::protocol::AgentKind::Codex => "codex",
+        _ => "claude",
+    };
     Ok(NativeAccount {
         id: record.id,
-        agent: crate::protocol::AgentKind::Claude,
+        agent: profile_agent,
         name: record.name,
         managed: true,
         is_default: record.is_default,
@@ -637,7 +642,7 @@ async fn profile_row(
         capabilities: profile_capabilities(),
         api_profile: record.api_profile,
         model_source,
-        engine: Some("claude".into()),
+        engine: Some(engine.into()),
         api_validation: record.api_validation,
         api_engine_validation: record.api_engine_validation,
         model_capability_support,

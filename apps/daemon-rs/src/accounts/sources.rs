@@ -118,6 +118,28 @@ fn clean_model(value: &str) -> Result<String> {
     }
     Ok(model.to_owned())
 }
+fn supported_protocol(protocol: &str) -> bool {
+    matches!(
+        protocol,
+        "anthropic" | "openai_responses" | "openai_chat_completions"
+    )
+}
+
+fn agent_for_protocol(protocol: &str) -> &'static str {
+    if protocol == "anthropic" {
+        "claude"
+    } else {
+        "codex"
+    }
+}
+
+fn provider_for_protocol(protocol: &str) -> &'static str {
+    if protocol == "anthropic" {
+        "anthropic_compatible"
+    } else {
+        "openai_compatible"
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1297,12 +1319,12 @@ impl ModelSources {
             }
             let mut protocols = std::collections::BTreeSet::new();
             for endpoint in &source.endpoints {
-                if endpoint.protocol != "anthropic" || !protocols.insert(endpoint.protocol.clone())
+                if !supported_protocol(&endpoint.protocol)
+                    || !protocols.insert(endpoint.protocol.clone())
                 {
-                    return Err(Error::Invalid(
-                        "Rust 当前仅支持 Anthropic 协议的单一端点".into(),
-                    ));
+                    return Err(Error::Invalid("模型源协议重复或不支持".into()));
                 }
+                normalize_base_url(&endpoint.base_url, &endpoint.protocol)?;
             }
             let credential_ids: std::collections::BTreeSet<&str> = source
                 .credentials
@@ -1329,10 +1351,8 @@ impl ModelSources {
             }
             for route in &source.routes {
                 validate_source_id(&route.id)?;
-                if route.protocol != "anthropic" {
-                    return Err(Error::Invalid(
-                        "Rust 当前仅支持 Claude 的 Anthropic 模型".into(),
-                    ));
+                if !supported_protocol(&route.protocol) {
+                    return Err(Error::Invalid("模型协议不支持".into()));
                 }
                 if !source
                     .endpoints
@@ -1474,15 +1494,13 @@ fn clean_endpoints(input: Vec<SourceEndpointInput>) -> Result<Vec<SourceEndpoint
     let mut endpoints = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     for endpoint in input {
-        if endpoint.protocol != "anthropic" || !seen.insert("anthropic") {
-            return Err(Error::Invalid(
-                "Rust 当前仅支持 Claude 的 Anthropic 兼容端点".into(),
-            ));
+        if !supported_protocol(&endpoint.protocol) || !seen.insert(endpoint.protocol.clone()) {
+            return Err(Error::Invalid("模型源协议重复或不支持".into()));
         }
         let headers = clean_headers(endpoint.headers)?;
-        let base_url = normalize_base_url(&endpoint.base_url)?;
+        let base_url = normalize_base_url(&endpoint.base_url, &endpoint.protocol)?;
         endpoints.push(SourceEndpoint {
-            protocol: "anthropic".into(),
+            protocol: endpoint.protocol,
             base_url,
             headers,
         });
@@ -1490,13 +1508,13 @@ fn clean_endpoints(input: Vec<SourceEndpointInput>) -> Result<Vec<SourceEndpoint
     Ok(endpoints)
 }
 
-fn normalize_base_url(raw: &str) -> Result<String> {
+fn normalize_base_url(raw: &str, protocol: &str) -> Result<String> {
     let profile = super::profile::clean_profile_inputs(
-        "claude",
+        agent_for_protocol(protocol),
         raw,
         "catalog",
-        Some("anthropic_compatible"),
-        Some("anthropic"),
+        Some(provider_for_protocol(protocol)),
+        Some(protocol),
         Some(serde_json::Value::Null),
     )?;
     Ok(profile.base_url)
@@ -1519,11 +1537,7 @@ fn clean_capabilities(
 ) -> Result<Option<super::ModelCapabilities>> {
     match value {
         None => Ok(None),
-        Some(value) => {
-            let caps: super::ModelCapabilities = serde_json::from_value(value)
-                .map_err(|_| Error::Invalid("模型能力配置无效".into()))?;
-            Ok(Some(caps))
-        }
+        Some(value) => super::ModelCapabilities::clean(value),
     }
 }
 
@@ -1538,7 +1552,7 @@ fn build_initial_routes(input: Vec<RouteInput>, credential_id: &str) -> Result<V
                 id: Uuid::new_v4().to_string(),
                 name: clean_name(&route.name)?,
                 model: clean_model(&route.model)?,
-                protocol: require_anthropic(&route.protocol)?,
+                protocol: require_supported_route_protocol(&route.protocol)?,
                 credential_id: credential_id.to_owned(),
                 enabled: route.enabled,
                 model_capabilities: clean_capabilities(route.model_capabilities)?,
@@ -1559,7 +1573,7 @@ fn build_route(input: &RouteInputWithId) -> Result<SourceRoute> {
         },
         name: clean_name(&input.name)?,
         model: clean_model(&input.model)?,
-        protocol: require_anthropic(&input.protocol)?,
+        protocol: require_supported_route_protocol(&input.protocol)?,
         credential_id: {
             validate_source_id(&input.credential_id)?;
             input.credential_id.clone()
@@ -1570,22 +1584,20 @@ fn build_route(input: &RouteInputWithId) -> Result<SourceRoute> {
     })
 }
 
-fn require_anthropic(protocol: &str) -> Result<String> {
-    if protocol != "anthropic" {
-        return Err(Error::Invalid(
-            "Rust 当前仅支持 Claude 的 Anthropic 模型".into(),
-        ));
+fn require_supported_route_protocol(protocol: &str) -> Result<String> {
+    if !supported_protocol(protocol) {
+        return Err(Error::Invalid("模型协议不支持".into()));
     }
-    Ok("anthropic".into())
+    Ok(protocol.into())
 }
 
 fn route_profile(endpoint: &SourceEndpoint, route: &SourceRoute) -> Result<ApiProfile> {
     super::profile::clean_profile(
-        "claude",
+        agent_for_protocol(&route.protocol),
         &endpoint.base_url,
         &route.model,
-        Some("anthropic_compatible"),
-        Some("anthropic"),
+        Some(provider_for_protocol(&route.protocol)),
+        Some(&route.protocol),
         route
             .model_capabilities
             .clone()
