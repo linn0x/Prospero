@@ -12,6 +12,17 @@ use tower::ServiceExt;
 
 const SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+static CLI_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+const FAKE_CLAUDE: &str = r#"#!/usr/bin/env python3
+import json, sys, time
+sys.stdout.write(json.dumps({"type": "system", "subtype": "init", "session_id": "fake-remote-worker"}) + "\n")
+sys.stdout.flush()
+sys.stdin.readline()
+while True:
+    time.sleep(1)
+"#;
+
 async fn fixture() -> (TempDir, Api) {
     let directory = TempDir::new().unwrap();
     let database = Database::open(directory.path().to_path_buf())
@@ -177,6 +188,18 @@ async fn encrypted_ws_handshake_authenticates_and_routes_ping() {
     }
 
     let (directory, api) = fixture().await;
+    let _cli_env = CLI_ENV_LOCK.lock().await;
+    let fake_claude = directory.path().join("fake-claude.py");
+    std::fs::write(&fake_claude, FAKE_CLAUDE).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let previous_claude_bin = std::env::var_os("PROSPERO_CLAUDE_BIN");
+    unsafe {
+        std::env::set_var("PROSPERO_CLAUDE_BIN", &fake_claude);
+    }
     let daemon_secret = SecretKey::from([9u8; 32]);
     std::fs::write(
         directory.path().join("identity.json"),
@@ -337,6 +360,108 @@ async fn encrypted_ws_handshake_authenticates_and_routes_ping() {
     assert!(orchestration["snapshot"]["dispatches"].is_array());
     assert!(orchestration["snapshot"]["gates"].is_array());
     assert!(orchestration["snapshot"]["worktreeAssets"].is_array());
+    let remote_run_id = runs[0]["id"].as_str().unwrap().to_owned();
+
+    ws.send(Message::Text(
+        seal(
+            &cipher,
+            &mut send_count,
+            &json!({
+                "type":"orchestration.task.create",
+                "runId":remote_run_id,
+                "title":"remote worker",
+                "spec":"do it",
+                "operationId":"remote-task-op-1"
+            }),
+        )
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let task_snapshot = match ws.next().await.unwrap().unwrap() {
+        Message::Text(text) => open(&cipher, &mut recv_count, &text),
+        other => panic!("unexpected task snapshot frame: {other:?}"),
+    };
+    assert_eq!(task_snapshot["type"], "orchestration.snapshot");
+    assert_eq!(
+        task_snapshot["snapshot"]["tasks"].as_array().unwrap().len(),
+        1
+    );
+
+    ws.send(Message::Text(
+        seal(
+            &cipher,
+            &mut send_count,
+            &json!({
+                "type":"orchestration.automation.start",
+                "runId":remote_run_id,
+                "agent":"claude",
+                "approvalPolicy":"standard",
+                "workspace":"current",
+                "cwd":directory.path(),
+                "operationId":"remote-auto-start-1"
+            }),
+        )
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let auto_snapshot = match ws.next().await.unwrap().unwrap() {
+        Message::Text(text) => open(&cipher, &mut recv_count, &text),
+        other => panic!("unexpected automation snapshot frame: {other:?}"),
+    };
+    assert_eq!(auto_snapshot["type"], "orchestration.snapshot");
+    let auto_run = auto_snapshot["snapshot"]["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|run| run["id"] == remote_run_id)
+        .unwrap();
+    assert_eq!(auto_run["automation"]["state"], "running");
+    assert_eq!(
+        auto_snapshot["snapshot"]["dispatches"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    ws.send(Message::Text(
+        seal(
+            &cipher,
+            &mut send_count,
+            &json!({
+                "type":"orchestration.automation.pause",
+                "runId":remote_run_id,
+                "operationId":"remote-auto-pause-1"
+            }),
+        )
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let mut paused_snapshot = Value::Null;
+    for _ in 0..5 {
+        let frame = match ws.next().await.unwrap().unwrap() {
+            Message::Text(text) => open(&cipher, &mut recv_count, &text),
+            other => panic!("unexpected automation pause frame: {other:?}"),
+        };
+        if frame["type"] == "orchestration.snapshot" {
+            paused_snapshot = frame;
+            break;
+        }
+    }
+    assert_eq!(
+        paused_snapshot["type"], "orchestration.snapshot",
+        "{paused_snapshot}"
+    );
+    let paused_run = paused_snapshot["snapshot"]["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|run| run["id"] == remote_run_id)
+        .unwrap();
+    assert_eq!(paused_run["automation"]["state"], "paused");
 
     ws.send(Message::Text(
         seal(
@@ -429,4 +554,11 @@ async fn encrypted_ws_handshake_authenticates_and_routes_ping() {
     assert_eq!(live["body"]["delta"], "live update from rust");
 
     server.abort();
+    unsafe {
+        if let Some(previous) = previous_claude_bin {
+            std::env::set_var("PROSPERO_CLAUDE_BIN", previous);
+        } else {
+            std::env::remove_var("PROSPERO_CLAUDE_BIN");
+        }
+    }
 }
