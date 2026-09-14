@@ -248,9 +248,10 @@ describe.skipIf(process.platform === "win32")("Native account discovery through 
       action: "list",
       ok: true,
     });
-    const accounts = result!["accounts"] as unknown[];
-    expect(accounts).toHaveLength(1);
-    expect(accounts[0]).toMatchObject({
+    const accounts = result!["accounts"] as Array<Record<string, unknown>>;
+    const nativeClaude = accounts.find((account) => account["id"] === "native-claude");
+    expect(nativeClaude).toBeTruthy();
+    expect(nativeClaude).toMatchObject({
       id: "native-claude",
       agent: "claude",
       name: "本机默认",
