@@ -74,10 +74,15 @@ struct StartingRpc {
 }
 
 impl StartingRpc {
-    async fn start(workspace: &str, environment: &[(String, String)]) -> Result<Self> {
+    async fn start(
+        workspace: &str,
+        environment: &[(String, String)],
+        app_server_args: &[String],
+    ) -> Result<Self> {
         let mut command = Command::new(binary());
         command
             .arg("app-server")
+            .args(app_server_args)
             .current_dir(workspace)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -185,13 +190,21 @@ pub(super) async fn spawn_turn(
     native_id: Option<&str>,
     options: &TurnOptions,
 ) -> Result<CodexTurn> {
-    if !options.environment.is_empty() {
-        return Err(Error::Invalid(
-            "Rust Codex structured runtime 当前仅支持本机 Codex 账号".into(),
-        ));
-    }
-    let (_home, environment) = super::usage::native_codex_environment(data)?;
-    let mut rpc = StartingRpc::start(workspace, &environment).await?;
+    let (environment, app_server_args) = if let Some(profile) = options.api_profile.as_ref() {
+        if profile.protocol() != "openai_responses" {
+            return Err(Error::Invalid(
+                "Codex structured runtime 仅支持 OpenAI Responses Profile".into(),
+            ));
+        }
+        (
+            options.environment.clone(),
+            crate::accounts::profile::codex_app_server_args(profile),
+        )
+    } else {
+        let (_home, environment) = super::usage::native_codex_environment(data)?;
+        (environment, Vec::new())
+    };
+    let mut rpc = StartingRpc::start(workspace, &environment, &app_server_args).await?;
     let child_pid = rpc.child.id().ok_or(Error::Closed)?;
     rpc.request(
         "initialize",
@@ -327,7 +340,7 @@ pub(super) async fn read_subagent_history_once(
     subagent_id: &str,
 ) -> Result<Option<Vec<Value>>> {
     let (_home, environment) = super::usage::native_codex_environment(data)?;
-    let mut rpc = StartingRpc::start(workspace, &environment).await?;
+    let mut rpc = StartingRpc::start(workspace, &environment, &[]).await?;
     let result = async {
         rpc.request(
             "initialize",

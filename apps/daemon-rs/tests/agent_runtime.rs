@@ -6,12 +6,20 @@
 
 use std::time::Duration;
 
+use axum::{
+    body::{Body, to_bytes},
+    http::{Request, StatusCode},
+};
 use prosperod_rs::{
     agent::{Agents, ApprovalPolicy, CreateAgentSession, PermissionMode, ResumeInput},
+    auth::Token,
     protocol::{MessageRole, TimelineBody, TimelineQuery},
+    server::Api,
     worker::Database,
 };
+use serde_json::json;
 use tempfile::TempDir;
+use tower::ServiceExt;
 
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -317,6 +325,9 @@ next_thread = "thread-created"
 turn_id = "turn-native-1"
 scenario = open(os.path.join(os.getcwd(), "scenario")).read().strip()
 seen = []
+if scenario == "codexprofile":
+    with open(os.path.join(os.getcwd(), "codex-start.json"), "w", encoding="utf-8") as log:
+        json.dump({"argv": sys.argv[1:], "env": dict(os.environ)}, log)
 
 def emit(payload):
     sys.stdout.write(json.dumps(payload) + "\n")
@@ -641,6 +652,127 @@ async fn codex_structured_turn_streams_into_timeline() {
     assert_eq!(turn_start["model"], "gpt-test");
     assert_eq!(turn_start["effort"], "high");
     assert_eq!(turn_start["collaborationMode"]["mode"], "plan");
+}
+
+#[tokio::test]
+async fn codex_api_profile_passes_provider_args_and_secret_environment() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("codexprofile").await;
+    let cli = harness._data.path().join("fake-codex.py");
+    std::fs::write(&cli, FAKE_CODEX).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    unsafe {
+        std::env::set_var("PROSPERO_CODEX_BIN", &cli);
+        std::env::set_var("OPENAI_API_KEY", "parent-openai");
+        std::env::set_var("CODEX_API_KEY", "parent-codex");
+    }
+    let api = Api::new(
+        harness.database.clone(),
+        Token::parse("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into())
+            .unwrap(),
+    );
+    let app = api.router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/accounts")
+                .header(
+                    "authorization",
+                    "Bearer 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "type":"agent.account.api.create",
+                        "requestId":"codex-profile",
+                        "agent":"codex",
+                        "name":"Codex API",
+                        "baseUrl":"http://localhost:12345/responses",
+                        "model":"gpt-profile",
+                        "apiKey":"sk-profile-secret",
+                        "modelCapabilities":{"contextWindow":12345,"reasoning":false},
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let account_id = value["accountId"].as_str().unwrap().to_owned();
+
+    let head = harness
+        .agents
+        .create(CreateAgentSession {
+            agent: prosperod_rs::protocol::AgentKind::Codex,
+            title: "Codex profile".into(),
+            workspace: harness.workspace.path().to_str().unwrap().into(),
+            auto_approve: false,
+            mode: None,
+            model: None,
+            effort: None,
+            account_id: Some(account_id),
+            resume: None,
+        })
+        .await
+        .unwrap();
+    harness
+        .agents
+        .send(&head.id, "use profile".into(), None, Vec::new())
+        .await
+        .unwrap();
+    let _records = harness
+        .wait_for(&head.id, |records| {
+            records.iter().any(|(_, body, _)| {
+                matches!(body, TimelineBody::TurnEnd { finish, .. } if finish == "completed")
+            })
+        })
+        .await;
+
+    let capture: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(harness.workspace.path().join("codex-start.json")).unwrap(),
+    )
+    .unwrap();
+    let argv = capture["argv"].as_array().unwrap();
+    assert_eq!(argv[0], "app-server");
+    assert!(argv.iter().any(|arg| arg == "model_provider=\"prospero\""));
+    assert!(argv.iter().any(|arg| arg == "model=\"gpt-profile\""));
+    assert!(
+        argv.iter()
+            .any(|arg| arg == "model_providers.prospero.base_url=\"http://localhost:12345\"")
+    );
+    assert!(
+        argv.iter()
+            .any(|arg| arg == "model_providers.prospero.env_key=\"OPENAI_API_KEY\"")
+    );
+    assert!(
+        argv.iter()
+            .any(|arg| arg == "model_providers.prospero.wire_api=\"responses\"")
+    );
+    assert!(
+        argv.iter()
+            .any(|arg| arg == "model_providers.prospero.requires_openai_auth=false")
+    );
+    assert!(argv.iter().any(|arg| arg == "model_context_window=12345"));
+    assert!(
+        argv.iter()
+            .any(|arg| arg == "model_supports_reasoning_summaries=false")
+    );
+    assert!(
+        argv.iter()
+            .any(|arg| arg == "model_reasoning_summary=\"none\"")
+    );
+    assert_eq!(capture["env"]["OPENAI_API_KEY"], "sk-profile-secret");
+    assert_eq!(capture["env"]["CODEX_API_KEY"], "");
 }
 
 #[tokio::test]

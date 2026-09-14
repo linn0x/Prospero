@@ -208,7 +208,18 @@ async fn messages(
     }
 }
 
-async fn models(State(state): State<FakeState>) -> axum::response::Response {
+async fn models(
+    State(state): State<FakeState>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    if headers.get("authorization").is_some() && headers.get("x-api-key").is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            [("content-type", "application/json")],
+            json!({"error":{"type":"invalid_request","message":"mixed auth"}}).to_string(),
+        )
+            .into_response();
+    }
     if *state.mode.lock().unwrap() == ProbeMode::AuthFail {
         return (
             StatusCode::UNAUTHORIZED,
@@ -316,6 +327,13 @@ impl Harness {
         self.directory
             .path()
             .join("daemon/agent-accounts/claude")
+            .join(id)
+    }
+
+    fn codex_account_root(&self, id: &str) -> std::path::PathBuf {
+        self.directory
+            .path()
+            .join("daemon/agent-accounts/codex")
             .join(id)
     }
 }
@@ -455,6 +473,18 @@ async fn profile_create_validates_connection_fields_and_persists_an_isolated_key
     assert_eq!(codex_row["apiProfile"]["provider"], "openai_compatible");
     assert_eq!(codex_row["apiProfile"]["protocol"], "openai_responses");
     assert_eq!(codex_row["apiProfile"]["baseUrl"], server.base_url);
+    assert!(
+        harness
+            .codex_account_root(codex_id)
+            .join(".prospero-credential.json")
+            .is_file()
+    );
+    assert!(
+        !harness
+            .account_root(codex_id)
+            .join(".prospero-credential.json")
+            .exists()
+    );
 
     // Successful create: trimmed name, profile metadata on the row, pinned
     // capabilities, key only inside the 0600 credential file.
@@ -948,7 +978,7 @@ async fn models_catalog_follows_pagination_and_maps_rows() {
     assert!(!draft["models"].as_array().unwrap().is_empty());
 
     // Extra draft fields alongside an accountId are ignored (stored row wins),
-    // but a non-anthropic draft protocol is refused in-body.
+    // and OpenAI-compatible draft protocols use Bearer authentication.
     let (status, result) = harness
         .post(control(
             "agent.account.api.models.get",
@@ -967,8 +997,36 @@ async fn models_catalog_follows_pagination_and_maps_rows() {
             })),
         ))
         .await;
-    assert_eq!(result["ok"], false);
-    assert_eq!(result["error"]["code"], "unsupported");
+    assert_eq!(result["ok"], true);
+    assert!(!result["models"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn models_catalog_uses_bearer_auth_for_openai_profiles() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new().await;
+    let server = FakeServer::new(ProbeMode::Success, vec![json!({"data":[{"id":"m1"}]})]);
+
+    let (status, result) = harness
+        .post(control(
+            "agent.account.api.create",
+            obj(json!({"agent":"codex",
+                "name":"Codex Profile","baseUrl":format!("{}/responses", server.base_url),
+                "model":"gpt-test","apiKey":SECRET})),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let account_id = result["accountId"].as_str().unwrap();
+
+    let (status, models) = harness
+        .post(control(
+            "agent.account.api.models.get",
+            obj(json!({"accountId":account_id})),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{models}");
+    assert_eq!(models["ok"], true);
+    assert_eq!(models["models"][0]["id"], "m1");
 }
 
 #[tokio::test]

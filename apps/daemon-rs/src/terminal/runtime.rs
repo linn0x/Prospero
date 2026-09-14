@@ -610,10 +610,18 @@ impl Terminals {
                 }))
             }
             (crate::protocol::AgentKind::Codex, None) => {
-                let (environment, account_id) = self
+                let (environment, account_id, profile) = self
                     .resolve_codex_terminal_account(input.account_id.clone())
                     .await?;
                 let mut args = vec!["--dangerously-bypass-approvals-and-sandbox".into()];
+                if let Some(profile) = profile.as_ref() {
+                    if profile.protocol() != "openai_responses" {
+                        return Err(Error::Invalid(
+                            "Codex PTY 仅支持 OpenAI Responses Profile".into(),
+                        ));
+                    }
+                    args.extend(crate::accounts::profile::codex_app_server_args(profile));
+                }
                 if let Some(model) = model {
                     args.extend([
                         "-c".into(),
@@ -743,19 +751,53 @@ impl Terminals {
     async fn resolve_codex_terminal_account(
         &self,
         account_id: Option<String>,
-    ) -> Result<(Vec<(String, String)>, Option<String>)> {
+    ) -> Result<(
+        Vec<(String, String)>,
+        Option<String>,
+        Option<crate::accounts::ApiProfile>,
+    )> {
         match account_id.as_deref() {
-            None => Ok((Vec::new(), None)),
+            None => Ok((Vec::new(), None, None)),
             Some(NATIVE_CODEX_ID) => {
                 let data = self.0.database.directory().to_owned();
                 let env = tokio::task::spawn_blocking(move || native_codex_environment(&data))
                     .await
                     .map_err(|_| Error::Closed)??;
-                Ok((env, Some(NATIVE_CODEX_ID.into())))
+                Ok((env, Some(NATIVE_CODEX_ID.into()), None))
             }
-            Some(_) => Err(Error::Invalid(
-                "Rust Codex PTY 当前仅支持本机默认账号".into(),
-            )),
+            Some(account_id) => {
+                let data = self.0.database.directory().to_owned();
+                let id = account_id.to_owned();
+                let record = self
+                    .0
+                    .database
+                    .call({
+                        let data = data.clone();
+                        let id = id.clone();
+                        move |store| store.managed_snapshot_row(&data, &id)
+                    })
+                    .await?;
+                let profile = record
+                    .api_profile
+                    .ok_or_else(|| Error::Invalid("所选账号不支持 Codex PTY".into()))?;
+                if profile.protocol() != "openai_responses" {
+                    return Err(Error::Invalid(
+                        "Codex PTY 仅支持 OpenAI Responses Profile".into(),
+                    ));
+                }
+                let env_id = record.id.clone();
+                let env_profile = profile.clone();
+                let env = tokio::task::spawn_blocking(move || {
+                    crate::accounts::managed::profile_account_environment(
+                        &data,
+                        &env_id,
+                        &env_profile,
+                    )
+                })
+                .await
+                .map_err(|_| Error::Closed)??;
+                Ok((env, Some(record.id), Some(profile)))
+            }
         }
     }
 }

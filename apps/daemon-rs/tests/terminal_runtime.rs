@@ -361,6 +361,113 @@ sys.stdout.flush()
 }
 
 #[tokio::test]
+async fn codex_pty_uses_api_profile_environment_and_provider_arguments() {
+    let _lock = ENV_LOCK.lock().await;
+    let directory = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let database = Database::open(directory.path().into()).await.unwrap();
+    let api = Api::new(
+        database.clone(),
+        Token::parse("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into())
+            .unwrap(),
+    );
+    let response = api
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/accounts")
+                .header(
+                    "authorization",
+                    "Bearer 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "type":"agent.account.api.create",
+                        "requestId":"codex-profile",
+                        "agent":"codex",
+                        "name":"Codex API",
+                        "baseUrl":"http://localhost:12345/responses",
+                        "model":"gpt-profile",
+                        "apiKey":"sk-profile-secret",
+                        "modelCapabilities":{"contextWindow":12345,"reasoning":false}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let account_id = value["accountId"].as_str().unwrap().to_owned();
+    let runtime = Terminals::new(database.clone());
+    let cli = directory.path().join("fake-codex-profile-pty.py");
+    let capture = directory.path().join("codex-profile-pty.json");
+    executable_script(
+        &cli,
+        r#"#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ["CAPTURE"], "w", encoding="utf-8") as handle:
+    json.dump({"argv": sys.argv[1:], "env": dict(os.environ)}, handle)
+sys.stdout.write("codex-profile-pty-done\n")
+sys.stdout.flush()
+"#,
+    );
+    let _env = EnvGuard::new(vec![
+        "PROSPERO_CODEX_BIN",
+        "CAPTURE",
+        "OPENAI_API_KEY",
+        "CODEX_API_KEY",
+        "CODEX_ACCESS_TOKEN",
+        "CODEX_REFRESH_TOKEN",
+    ]);
+    unsafe {
+        std::env::set_var("PROSPERO_CODEX_BIN", &cli);
+        std::env::set_var("CAPTURE", &capture);
+        std::env::set_var("OPENAI_API_KEY", "parent-openai");
+        std::env::set_var("CODEX_API_KEY", "parent-codex");
+    }
+    let mut launch = input(&workspace);
+    launch.agent = Some(prosperod_rs::protocol::AgentKind::Codex);
+    launch.account_id = Some(account_id.clone());
+    let head = runtime.create(launch).await.unwrap();
+    settled(&runtime).await;
+    let dumped = wait_for_json(&capture).await;
+    let argv = dumped["argv"].as_array().unwrap();
+    assert!(argv.iter().any(|arg| arg == "model_provider=\"prospero\""));
+    assert!(argv.iter().any(|arg| arg == "model=\"gpt-profile\""));
+    assert!(
+        argv.iter()
+            .any(|arg| arg == "model_providers.prospero.base_url=\"http://localhost:12345\"")
+    );
+    assert!(
+        argv.iter()
+            .any(|arg| arg == "model_providers.prospero.env_key=\"OPENAI_API_KEY\"")
+    );
+    assert!(argv.iter().any(|arg| arg == "model_context_window=12345"));
+    assert_eq!(dumped["env"]["OPENAI_API_KEY"], "sk-profile-secret");
+    assert_eq!(dumped["env"]["CODEX_API_KEY"], "");
+
+    let stored: Option<String> =
+        rusqlite::Connection::open(directory.path().join("prospero.sqlite"))
+            .unwrap()
+            .query_row(
+                "SELECT account_id FROM terminal_runs WHERE session_id=?1",
+                [head.id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+    assert_eq!(stored.as_deref(), Some(account_id.as_str()));
+    runtime.shutdown().await.unwrap();
+    database.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn pty_agent_commands_validate_like_legacy() {
     let directory = TempDir::new().unwrap();
     let workspace = TempDir::new().unwrap();

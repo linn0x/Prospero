@@ -131,9 +131,11 @@ pub struct ModelCapabilitySupport {
 pub(crate) fn capability_support(profile: &ApiProfile) -> Option<ModelCapabilitySupport> {
     let caps = profile.model_capabilities.as_ref()?;
     let lower_model = profile.model.to_lowercase();
-    let claude_native_window = ["claude-", "opus", "sonnet", "haiku", "fable", "[1m]"]
-        .iter()
-        .any(|needle| lower_model.contains(needle));
+    let protocol = profile.protocol();
+    let claude_native_window = protocol == "anthropic"
+        && ["claude-", "opus", "sonnet", "haiku", "fable", "[1m]"]
+            .iter()
+            .any(|needle| lower_model.contains(needle));
     Some(ModelCapabilitySupport {
         context_window: caps.context_window.map(|_| {
             if claude_native_window {
@@ -142,19 +144,25 @@ pub(crate) fn capability_support(profile: &ApiProfile) -> Option<ModelCapability
                 ModelCapabilitySupportValue::Enforced
             }
         }),
-        max_output_tokens: caps
-            .max_output_tokens
-            .map(|_| ModelCapabilitySupportValue::Enforced),
+        max_output_tokens: caps.max_output_tokens.map(|_| {
+            if protocol == "anthropic" {
+                ModelCapabilitySupportValue::Enforced
+            } else {
+                ModelCapabilitySupportValue::Unsupported
+            }
+        }),
         tools: caps.tools.map(|_| ModelCapabilitySupportValue::Enforced),
         vision: caps.vision.map(|vision| {
-            if !vision || profile.protocol() == "anthropic" {
+            if !vision || protocol == "anthropic" {
                 ModelCapabilitySupportValue::Enforced
             } else {
                 ModelCapabilitySupportValue::Unsupported
             }
         }),
         reasoning: caps.reasoning.map(|reasoning| {
-            if profile.protocol() == "anthropic" && reasoning {
+            if (protocol == "anthropic" && reasoning)
+                || (protocol == "openai_responses" && !reasoning)
+            {
                 ModelCapabilitySupportValue::Unsupported
             } else {
                 ModelCapabilitySupportValue::Enforced
@@ -393,10 +401,21 @@ pub(crate) fn endpoint(profile: &ApiProfile, suffix: &str) -> Result<String> {
 }
 
 /// Environment overrides for a structured/PTY session bound to an
-/// Anthropic-compatible profile. Mirrors the legacy profile environment: the
-/// profile's key is the only credential, every inherited Anthropic/OAuth
-/// override is cleared, and model-capability envs are pinned per profile.
+/// API profile. The profile key is the only credential, inherited native
+/// credentials are cleared, and model-capability overrides are pinned per
+/// runtime.
 pub(crate) fn session_environment(
+    root: &std::path::Path,
+    profile: &ApiProfile,
+    secret: &str,
+) -> Vec<(String, String)> {
+    if profile.protocol() == "anthropic" {
+        return claude_session_environment(root, profile, secret);
+    }
+    codex_session_environment(root, profile, secret)
+}
+
+fn claude_session_environment(
     root: &std::path::Path,
     profile: &ApiProfile,
     secret: &str,
@@ -449,10 +468,11 @@ pub(crate) fn session_environment(
         (
             "PROSPERO_API_PROFILE_VISION".into(),
             if caps.and_then(|c| c.vision) == Some(false) {
-                "0".into()
+                "0"
             } else {
-                "1".into()
-            },
+                "1"
+            }
+            .into(),
         ),
     ];
     // Non-Anthropic-host gateways need nonessential telemetry traffic off and
@@ -469,6 +489,107 @@ pub(crate) fn session_environment(
         ));
     }
     environment
+}
+
+fn codex_session_environment(
+    root: &std::path::Path,
+    profile: &ApiProfile,
+    secret: &str,
+) -> Vec<(String, String)> {
+    let mut environment = vec![
+        ("OPENAI_API_KEY".into(), secret.to_owned()),
+        ("CODEX_API_KEY".into(), String::new()),
+        ("CODEX_ACCESS_TOKEN".into(), String::new()),
+        ("CODEX_REFRESH_TOKEN".into(), String::new()),
+        ("CODEX_HOME".into(), root.to_string_lossy().into_owned()),
+        (
+            "CODEX_SQLITE_HOME".into(),
+            root.to_string_lossy().into_owned(),
+        ),
+        (
+            "PROSPERO_API_PROFILE_VISION".into(),
+            if profile.model_capabilities.as_ref().and_then(|c| c.vision) == Some(false) {
+                "0"
+            } else {
+                "1"
+            }
+            .into(),
+        ),
+    ];
+    for (index, (_, value)) in profile
+        .headers
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+    {
+        environment.push((format!("PROSPERO_API_HEADER_{index}"), value));
+    }
+    environment
+}
+
+pub(crate) fn codex_app_server_args(profile: &ApiProfile) -> Vec<String> {
+    let mut args = vec![
+        "-c".into(),
+        format!("model_provider={}", toml_string("prospero")),
+        "-c".into(),
+        format!("model={}", toml_string(&profile.model)),
+        "-c".into(),
+        format!(
+            "model_providers.prospero.name={}",
+            toml_string("Prospero external API")
+        ),
+        "-c".into(),
+        format!(
+            "model_providers.prospero.base_url={}",
+            toml_string(&profile.base_url)
+        ),
+        "-c".into(),
+        format!(
+            "model_providers.prospero.env_key={}",
+            toml_string("OPENAI_API_KEY")
+        ),
+        "-c".into(),
+        format!(
+            "model_providers.prospero.wire_api={}",
+            toml_string("responses")
+        ),
+        "-c".into(),
+        "model_providers.prospero.requires_openai_auth=false".into(),
+    ];
+    for (index, (name, _)) in profile
+        .headers
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+    {
+        args.push("-c".into());
+        args.push(format!(
+            "model_providers.prospero.env_http_headers.{}={}",
+            toml_string(&name),
+            toml_string(&format!("PROSPERO_API_HEADER_{index}"))
+        ));
+    }
+    if let Some(caps) = profile.model_capabilities.as_ref() {
+        if let Some(context) = caps.context_window {
+            args.push("-c".into());
+            args.push(format!("model_context_window={context}"));
+        }
+        if let Some(reasoning) = caps.reasoning {
+            args.push("-c".into());
+            args.push(format!("model_supports_reasoning_summaries={reasoning}"));
+            if !reasoning {
+                args.push("-c".into());
+                args.push("model_reasoning_summary=\"none\"".into());
+            }
+        }
+    }
+    args
+}
+
+fn toml_string(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into())
 }
 
 /// Ensures `<root>/.claude.json` records completed onboarding so a profile

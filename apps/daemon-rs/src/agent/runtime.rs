@@ -294,10 +294,29 @@ impl Agents {
         if input.agent == crate::protocol::AgentKind::Codex {
             match input.account_id.as_deref() {
                 None | Some(crate::agent::NATIVE_CODEX_ID) => {}
-                _ => {
-                    return Err(Error::Invalid(
-                        "Rust Codex structured runtime 当前仅支持本机 Codex 账号".into(),
-                    ));
+                Some(account_id) => {
+                    let data = self.0.database.directory().to_owned();
+                    let account_id = account_id.to_owned();
+                    let profile = self
+                        .0
+                        .database
+                        .call(move |store| {
+                            Ok(store.managed_snapshot_row(&data, &account_id)?.api_profile)
+                        })
+                        .await?;
+                    match profile.as_ref().map(|profile| profile.protocol()) {
+                        Some("openai_responses") => {}
+                        Some("openai_chat_completions") => {
+                            return Err(Error::Invalid(
+                                "Codex structured runtime 仅支持 OpenAI Responses Profile".into(),
+                            ));
+                        }
+                        _ => {
+                            return Err(Error::Invalid(
+                                "所选账号不支持 Codex structured runtime".into(),
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -341,6 +360,23 @@ impl Agents {
                     }
                     if account_id != crate::accounts::NATIVE_CLAUDE_ID {
                         let record = store.managed_snapshot_row(&data, account_id)?;
+                        if let Some(profile) = record.api_profile.as_ref() {
+                            if crate::accounts::profile::agent_kind(profile) != create.agent {
+                                return Err(Error::Invalid("所选账号与 Agent 不匹配".into()));
+                            }
+                            if profile
+                                .model_capabilities
+                                .as_ref()
+                                .and_then(|caps| caps.tools)
+                                == Some(false)
+                            {
+                                return Err(Error::Invalid(
+                                    "模型 Profile 禁用了工具，无法启动 Code Agent".into(),
+                                ));
+                            }
+                        } else if create.agent != crate::protocol::AgentKind::Claude {
+                            return Err(Error::Invalid("所选账号与 Agent 不匹配".into()));
+                        }
                         let target = crate::accounts::config::ConfigTarget {
                             account_id: record.id.clone(),
                             model: record
@@ -609,13 +645,20 @@ impl Agents {
                 .call(move |store| store.append_agent_records(&id, vec![user_write]))
                 .await?;
         }
+        let api_profile =
+            Self::account_api_profile(&self.0.database, run.account_id.clone()).await?;
         let options = TurnOptions {
             policy: run.policy,
             mode: run.mode,
             model: run.model.clone(),
             effort: run.effort.clone(),
-            environment: Self::account_environment(&self.0.database, run.account_id.clone())
-                .await?,
+            environment: Self::account_environment_with_profile(
+                &self.0.database,
+                run.account_id.clone(),
+                api_profile.clone(),
+            )
+            .await?,
+            api_profile,
         };
         let driver = match run.agent {
             AgentKind::Claude => Driver::Claude(spawn_turn(
@@ -1675,28 +1718,28 @@ impl Agents {
         })
     }
 
-    /// Private environment overrides for a session's bound account (empty for
-    /// the native environment). Profile accounts get the isolated API-key
-    /// profile environment; legacy managed accounts the OAuth/imported-key one.
-    /// Credential files are read off the async pool.
-    async fn account_environment(
+    async fn account_api_profile(
         database: &crate::worker::Database,
         account_id: Option<String>,
+    ) -> Result<Option<crate::accounts::ApiProfile>> {
+        let Some(id) = account_id else {
+            return Ok(None);
+        };
+        let data = database.directory().to_owned();
+        database
+            .call(move |store| Ok(store.managed_snapshot_row(&data, &id)?.api_profile))
+            .await
+    }
+
+    async fn account_environment_with_profile(
+        database: &crate::worker::Database,
+        account_id: Option<String>,
+        profile: Option<crate::accounts::ApiProfile>,
     ) -> Result<Vec<(String, String)>> {
         let Some(id) = account_id else {
             return Ok(Vec::new());
         };
         let data = database.directory().to_owned();
-        let db = database.clone();
-        let profile_id = id.clone();
-        let profile_data = data.clone();
-        let profile = db
-            .call(move |store| {
-                Ok(store
-                    .managed_snapshot_row(&profile_data, &profile_id)?
-                    .api_profile)
-            })
-            .await?;
         tokio::task::spawn_blocking(move || match profile {
             Some(profile) => {
                 crate::accounts::managed::profile_account_environment(&data, &id, &profile)
@@ -1705,6 +1748,17 @@ impl Agents {
         })
         .await
         .map_err(|_| Error::Closed)?
+    }
+    /// Private environment overrides for a session's bound account (empty for
+    /// the native environment). Profile accounts get the isolated API-key
+    /// profile environment; legacy managed accounts the OAuth/imported-key one.
+    /// Credential files are read off the async pool.
+    async fn account_environment(
+        database: &crate::worker::Database,
+        account_id: Option<String>,
+    ) -> Result<Vec<(String, String)>> {
+        let profile = Self::account_api_profile(database, account_id.clone()).await?;
+        Self::account_environment_with_profile(database, account_id, profile).await
     }
 
     pub async fn usage(&self, id: &str) -> Result<Option<UsageReport>> {
@@ -1947,11 +2001,6 @@ impl Agents {
             }
         }
         let models = if run.agent == AgentKind::Codex {
-            if !environment.is_empty() {
-                return Err(Error::Invalid(
-                    "Rust Codex structured runtime 当前仅支持本机 Codex 账号".into(),
-                ));
-            }
             super::usage::read_native_codex_models(self.0.database.directory())
                 .await?
                 .models
@@ -2015,11 +2064,6 @@ impl Agents {
             }
         }
         let catalog = if run.agent == AgentKind::Codex {
-            if !environment.is_empty() {
-                return Err(Error::Invalid(
-                    "Rust Codex structured runtime 当前仅支持本机 Codex 账号".into(),
-                ));
-            }
             super::usage::read_native_codex_models(self.0.database.directory())
                 .await?
                 .models
