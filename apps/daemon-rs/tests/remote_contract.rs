@@ -263,5 +263,24 @@ async fn encrypted_ws_handshake_authenticates_and_routes_ping() {
     };
     assert_eq!(pong, json!({"type":"connection.pong","id":"ping-1"}));
 
+    ws.send(Message::Text(
+        seal(
+            &cipher,
+            &mut send_count,
+            &json!({"type":"workspace.list","path":"","root":"home"}),
+        )
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let listing = match ws.next().await.unwrap().unwrap() {
+        Message::Text(text) => open(&cipher, &mut recv_count, &text),
+        other => panic!("unexpected workspace listing frame: {other:?}"),
+    };
+    assert_eq!(listing["type"], "workspace.listing");
+    assert_eq!(listing["root"], "home");
+    assert!(listing["cwd"].as_str().unwrap().starts_with('/'));
+    assert!(listing["entries"].is_array());
+
     server.abort();
 }
