@@ -8,6 +8,7 @@ pub mod pairing;
 pub mod project;
 pub mod protocol;
 mod queries;
+pub mod relay;
 pub mod remote_crypto;
 pub mod server;
 pub mod skills;
