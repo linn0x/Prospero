@@ -328,4 +328,22 @@ describe("Claude 原生提问、Plan 与子 Agent(桩数据)", () => {
       canMessage: false,
     });
   });
+
+  it("removes Task model overrides under an API Profile before approval", async () => {
+    const { adapter, events, internals } = harness();
+    const controller = new AbortController();
+    (internals.ctx as { env?: Record<string, string> }).env = { PROSPERO_API_PROFILE_MODEL: "deepseek-v4" };
+    const pending = internals.canUseTool(
+      "Task",
+      { description: "review", prompt: "check", model: "opus" },
+      { signal: controller.signal, suggestions: [], displayName: "Task" },
+    );
+    const request = events.find((event): event is Extract<AgentEventBody, { kind: "permission.request" }> => event.kind === "permission.request")!;
+    expect(request).toBeDefined();
+    await adapter.respondPermission?.(
+      request.reqId,
+      "once",
+    );
+    await expect(pending).resolves.toMatchObject({ behavior: "allow", updatedInput: { description: "review", prompt: "check" } });
+  });
 });

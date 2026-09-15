@@ -18,6 +18,7 @@ import type {
   PermissionResult,
   PermissionUpdate,
   Query,
+  Settings,
   SDKMessage,
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -179,6 +180,8 @@ export class ClaudeAdapter implements AgentAdapter {
         ? this.opts.resumeState["effort"]
         : null;
     this.selectedMode = this.opts.resumeState?.["mode"] === "plan" ? "plan" : "default";
+    const profileModel = this.profileModel();
+    if (profileModel) this.selectedModel = profileModel;
     try {
       this.q = query({
         prompt: this.input,
@@ -193,6 +196,7 @@ export class ClaudeAdapter implements AgentAdapter {
           agentProgressSummaries: true,
           ...(this.sessionId ? { resume: this.sessionId } : {}),
           ...(this.selectedModel ? { model: this.selectedModel } : {}),
+          ...(profileModel ? { fallbackModel: profileModel, managedSettings: this.profileManagedSettings(profileModel) } : {}),
           ...(this.selectedEffort ? { effort: this.selectedEffort as EffortLevel } : {}),
           ...(ctx.env?.["MAX_THINKING_TOKENS"] === "0" ? { thinking: { type: "disabled" as const } } : {}),
           ...(this.opts.disallowedTools
@@ -206,6 +210,38 @@ export class ClaudeAdapter implements AgentAdapter {
     this.pumping = this.pump();
   }
 
+  private profileModel(): string | null {
+    const value = this.ctx?.env?.["PROSPERO_API_PROFILE_MODEL"]?.trim();
+    return value ? value : null;
+  }
+
+  private profileManagedSettings(model: string): Settings {
+    return {
+      model,
+      fallbackModel: [model],
+      availableModels: [model],
+      enforceAvailableModels: true,
+      modelOverrides: {
+        opus: model,
+        sonnet: model,
+        haiku: model,
+        fable: model,
+        "claude-opus-5": model,
+        "claude-sonnet-5": model,
+        "claude-haiku-5": model,
+        "claude-fable-5": model,
+      },
+    };
+  }
+
+  private taskInput(toolName: string, input: Record<string, unknown>): Record<string, unknown> {
+    const model = this.profileModel();
+    if (!model || toolName !== "Task" && toolName !== "Agent") return input;
+    const next = { ...input };
+    delete next["model"];
+    return next;
+  }
+
   private persistNativeState(): void {
     const state: AdapterResumeState = {};
     if (this.sessionId) state["sessionId"] = this.sessionId;
@@ -217,6 +253,7 @@ export class ClaudeAdapter implements AgentAdapter {
 
   private readonly canUseTool: CanUseTool = (toolName, input, options) => {
     const agentId = this.resolveAgentId((options as { agentID?: unknown }).agentID);
+    input = this.taskInput(toolName, input);
     if (toolName === "AskUserQuestion") {
       return this.requestUserQuestion(input, options, agentId);
     }

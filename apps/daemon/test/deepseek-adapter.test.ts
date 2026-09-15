@@ -156,6 +156,39 @@ describe("DeepseekAdapter", () => {
     expect(outputs).toEqual([["call-1", "D:/work/project"]]);
   });
 
+  it("accepts alternate assistant message and delta shapes", async () => {
+    const transport = new FakeTransport();
+    const events: AgentEventBody[] = [];
+    const adapter = new DeepseekAdapter({ transport });
+    await adapter.start(context(events, []));
+
+    const sessionId = "dsh-session-1";
+    const sessionEvent = (type: string, data: Record<string, unknown>) =>
+      transport.emit(crypto.randomUUID(), { type: "session/event", sessionId, event: { type, data } });
+    sessionEvent("turn/start", { turn: 4 });
+    sessionEvent("assistant/delta", { turn: 4, step: 0, chunk: { type: "text_delta", content: "流式" } });
+    sessionEvent("assistant/message", { turn: 4, step: 0, message: { id: "assistant-alt", content: "完整" } });
+    sessionEvent("turn/end", { turn: 4, reason: { kind: "completed" } });
+
+    expect(events).toContainEqual({
+      kind: "text.delta",
+      msgId: "deepseek_4_0",
+      textId: "deepseek_4_0",
+      delta: "流式",
+    });
+    expect(events).toContainEqual({
+      kind: "text.delta",
+      msgId: "assistant-alt",
+      textId: "assistant-alt",
+      delta: "完整",
+    });
+    expect(events.at(-1)).toMatchObject({
+      kind: "turn.end",
+      msgId: "assistant-alt",
+      finish: "completed",
+    });
+  });
+
   it("catches up missed history and deduplicates the following live replay", async () => {
     const transport = new FakeTransport();
     transport.historyEvents = [

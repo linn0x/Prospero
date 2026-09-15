@@ -289,11 +289,10 @@ const activeStatuses = new Set([
 
 function sessionPriority(
   session: SessionInfo,
-  activeId: string | undefined,
+  _activeId: string | undefined,
   pinnedSessionIds: Set<string>,
   unreadSessionIds: Set<string>,
 ): number {
-  if (session.id === activeId) return 5;
   if (
     (session.pendingPermissions ?? 0) + (session.pendingQuestions ?? 0) > 0 ||
     session.status === "waiting_approval" ||

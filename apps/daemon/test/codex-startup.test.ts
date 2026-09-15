@@ -57,6 +57,24 @@ describe("Codex startup without waiting for optional history", () => {
     expect(f.requests.at(-1)?.method).toBe("turn/start");
   });
 
+  it("keeps API profile model provider on thread and turn starts", async () => {
+    const f = fixture();
+    await f.adapter.start({ ...f.context, env: { PROSPERO_API_PROFILE_MODEL: "gateway-model", PROSPERO_API_PROFILE_MODEL_PROVIDER: "prospero" } });
+    expect(f.requests.find((request) => request.method === "thread/start")?.params).toMatchObject({
+      model: "gateway-model",
+      modelProvider: "prospero",
+    });
+    await f.adapter.send("synthetic first message");
+    expect(f.requests.at(-1)).toMatchObject({
+      method: "turn/start",
+      params: {
+        model: "gateway-model",
+        modelProvider: "prospero",
+        collaborationMode: { settings: { model: "gateway-model" } },
+      },
+    });
+  });
+
   it("a resumed thread accepts messages while its child index has not answered", async () => {
     const f = fixture({ threadId: "main-thread" });
     await f.adapter.start(f.context);

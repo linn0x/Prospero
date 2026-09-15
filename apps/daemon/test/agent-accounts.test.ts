@@ -596,6 +596,7 @@ describe("Code Agent 账号隔离", () => {
     expect(codex.codexAppServerArgs).toEqual(expect.arrayContaining([
       'model_provider="prospero"',
       'model="acme-coder"',
+      'default_subagent_model="acme-coder"',
       'model_providers.prospero.base_url="https://openai-gateway.example.com/v1"',
       'model_providers.prospero.wire_api="responses"',
     ]));
@@ -629,6 +630,7 @@ describe("Code Agent 账号隔离", () => {
     expect(configured.environment["OPENAI_API_KEY"]).toBe("replacement-key");
     expect(configured.codexAppServerArgs).toEqual(expect.arrayContaining([
       'model="replacement-coder"',
+      'default_subagent_model="replacement-coder"',
       'model_providers.prospero.base_url="https://replacement.example.com/v1"',
     ]));
 

@@ -40,7 +40,13 @@ describe("API profile model declarations in runtime configuration", () => {
     sdk.query.mockReturnValue({ [Symbol.asyncIterator]: async function* () {}, interrupt: async () => {} });
     const adapter = new ClaudeAdapter();
     await adapter.start({ cwd: os.tmpdir(), env: binding.environment, emit: () => {} });
-    expect(sdk.query.mock.lastCall?.[0]).toMatchObject({ options: { thinking: { type: "disabled" }, env: {
+    expect(sdk.query.mock.lastCall?.[0]).toMatchObject({ options: { model: "gateway-model", fallbackModel: "gateway-model", managedSettings: {
+      model: "gateway-model",
+      fallbackModel: ["gateway-model"],
+      availableModels: ["gateway-model"],
+      enforceAvailableModels: true,
+      modelOverrides: expect.objectContaining({ opus: "gateway-model", "claude-opus-5": "gateway-model" }),
+    }, thinking: { type: "disabled" }, env: {
       CLAUDE_CODE_MAX_CONTEXT_TOKENS: "32000", CLAUDE_CODE_MAX_OUTPUT_TOKENS: "2048", MAX_THINKING_TOKENS: "0",
     } } });
     expect(adapter.acceptsImages).toBe(false);

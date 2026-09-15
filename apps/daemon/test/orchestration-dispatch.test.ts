@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import type { SessionInfo } from "@prospero/protocol";
 import { describe, expect, it, vi } from "vitest";
+import { OrchestrationDatabase } from "../src/orchestration/database.js";
 import {
   DispatchError,
   DispatchService,
@@ -604,13 +605,17 @@ describe("DispatchService", () => {
 
   it("在发送前导词前持久化 starting，并在返回 worker.start 前持久化 running", async () => {
     const home = mkdtempSync(path.join(os.tmpdir(), "prospero-dispatch-start-persist-"));
+    const readPersisted = () => {
+      const database = new OrchestrationDatabase(path.join(home, "orchestration.sqlite"));
+      try { return database.load(); } finally { database.close(); }
+    };
     try {
       const store = new OrchestrationStore(home);
       const run = store.createRun({ objective: "派发持久化边界" });
       const task = store.createTask({ runId: run.id, title: "快速 worker", spec: "" });
       const sessions = new FakeSessions();
       sessions.chatHook = async () => {
-        const persisted = JSON.parse(readFileSync(path.join(home, "orchestration.json"), "utf8")) as {
+        const persisted = readPersisted() as {
           tasks: Record<string, { status: string }>;
           dispatches: Record<string, { state: string }>;
         };
@@ -627,7 +632,7 @@ describe("DispatchService", () => {
         worktree: "none",
         cwd: "/tmp/project",
       });
-      const persisted = JSON.parse(readFileSync(path.join(home, "orchestration.json"), "utf8")) as {
+      const persisted = readPersisted() as {
         tasks: Record<string, { status: string }>;
         dispatches: Record<string, { state: string }>;
       };

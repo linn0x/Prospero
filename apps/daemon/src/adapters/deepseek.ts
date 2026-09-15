@@ -291,12 +291,14 @@ function finite(value: unknown): number | undefined {
 }
 
 function contentText(value: unknown): string {
+  if (typeof value === "string") return value;
   if (!Array.isArray(value)) return summarize(value);
   const parts: string[] = [];
   for (const item of value) {
     const block = record(item);
-    if ((block["type"] === "text" || block["type"] === "reasoning") && typeof block["text"] === "string") {
-      parts.push(block["text"]);
+    const text = typeof block["text"] === "string" ? block["text"] : typeof block["content"] === "string" ? block["content"] : "";
+    if (block["type"] === "text" || block["type"] === "output_text" || block["type"] === "reasoning") {
+      if (text) parts.push(text);
     } else if (block["type"] === "tool-result") {
       parts.push(contentText(block["content"]));
     }
@@ -305,12 +307,14 @@ function contentText(value: unknown): string {
 }
 
 function assistantContent(value: unknown): { text: string; reasoning: string } {
+  if (typeof value === "string") return { text: value, reasoning: "" };
   const text: string[] = [];
   const reasoning: string[] = [];
   for (const item of Array.isArray(value) ? value : []) {
     const block = record(item);
-    if (block["type"] === "text" && typeof block["text"] === "string") text.push(block["text"]);
-    if (block["type"] === "reasoning" && typeof block["text"] === "string") reasoning.push(block["text"]);
+    const value = typeof block["text"] === "string" ? block["text"] : typeof block["content"] === "string" ? block["content"] : "";
+    if ((block["type"] === "text" || block["type"] === "output_text") && value) text.push(value);
+    if (block["type"] === "reasoning" && value) reasoning.push(value);
   }
   return { text: text.join("\n"), reasoning: reasoning.join("\n") };
 }
@@ -625,29 +629,32 @@ export class DeepseekAdapter implements AgentAdapter {
       }
       return;
     }
-    if (type === "assistant/chunk") {
+    if (type === "assistant/chunk" || type === "assistant/delta" || type === "message/delta") {
       const chunk = record(data["chunk"]);
       const msgId = this.messageId(data);
       const turn = finite(data["turn"]) ?? this.currentTurn;
       this.messageByTurn.set(turn, msgId);
       const streamed = this.streamedText.get(msgId) ?? { text: "", reasoning: "" };
-      if (chunk["type"] === "text-delta" && typeof chunk["text"] === "string" && chunk["text"].length > 0) {
-        streamed.text += chunk["text"];
-        this.emit({ kind: "text.delta", msgId, textId: msgId, delta: chunk["text"] });
-      } else if (chunk["type"] === "reasoning-delta" && typeof chunk["text"] === "string" && chunk["text"].length > 0) {
-        streamed.reasoning += chunk["text"];
-        this.emit({ kind: "reasoning.delta", msgId, delta: chunk["text"] });
+      const chunkType = String(chunk["type"] ?? data["deltaType"] ?? data["kind"] ?? "");
+      const delta = typeof chunk["text"] === "string" ? chunk["text"] : typeof chunk["content"] === "string" ? chunk["content"] : typeof data["text"] === "string" ? data["text"] : typeof data["delta"] === "string" ? data["delta"] : "";
+      if ((chunkType === "text-delta" || chunkType === "text_delta" || chunkType === "output_text_delta" || chunkType === "content_delta" || !chunkType) && delta.length > 0) {
+        streamed.text += delta;
+        this.emit({ kind: "text.delta", msgId, textId: msgId, delta });
+      } else if ((chunkType === "reasoning-delta" || chunkType === "reasoning_delta") && delta.length > 0) {
+        streamed.reasoning += delta;
+        this.emit({ kind: "reasoning.delta", msgId, delta });
       }
       this.streamedText.set(msgId, streamed);
       return;
     }
-    if (type === "assistant/message") {
+    if (type === "assistant/message" || type === "assistant/final" || type === "message") {
       const usage = record(data["usage"]);
       const turn = finite(data["turn"]) ?? this.currentTurn;
       const step = finite(data["step"]) ?? 0;
       const msgId = this.messageId(data);
       this.messageByTurn.set(turn, msgId);
-      const assembled = assistantContent(record(data["message"])["content"]);
+      const message = record(data["message"]);
+      const assembled = assistantContent(message["content"] ?? data["content"] ?? data["text"]);
       const streamed = this.streamedText.get(msgId) ?? { text: "", reasoning: "" };
       if (assembled.reasoning && assembled.reasoning !== streamed.reasoning) {
         const delta = assembled.reasoning.startsWith(streamed.reasoning)

@@ -6,6 +6,7 @@ describe("model source protocol", () => {
     const message = { type: "model.source.action", requestId: "request", action: { kind: "models", sourceId: "source", revision: 1, protocol: "openai_responses", credentialId: "credential" } };
     expect(parseC2S(message).type).toBe("model.source.action");
     expect(parseC2S({ ...message, action: { ...message.action, refresh: true } }).action.refresh).toBe(true);
+    expect(C2SModelSourceActionSchema.safeParse({ ...message, action: { kind: "bind", sourceId: "source", revision: 1, routeId: "route", agent: "claude" } }).success).toBe(true);
     expect(C2SModelSourceActionSchema.safeParse({ ...message, action: { ...message.action, baseUrl: "https://unexpected.invalid" } }).success).toBe(false);
     expect(C2SModelSourceActionSchema.safeParse({ ...message, action: { kind: "migration.apply", migrationId: "preview", name: "source", accountIds: ["unexpected"] } }).success).toBe(false);
   });

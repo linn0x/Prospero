@@ -1,4 +1,4 @@
-import { closeSync, openSync, readSync, statSync } from "node:fs";
+import { closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import type { Worker } from "node:worker_threads";
 import createProjectionWorker from "./orchestration-projection-worker?nodeWorker";
@@ -67,6 +67,7 @@ export class LegacyOrchestrationProjection {
   }
 
   private refresh(): void {
+    if (existsSync(resolve(this.home, "orchestration.sqlite"))) return;
     if (this.worker || Date.now() < this.nextAttemptAt) return;
     const sourcePath = resolve(this.home, "orchestration.json");
     const targetPath = resolve(this.home, "orchestration-desktop.json");

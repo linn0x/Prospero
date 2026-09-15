@@ -11,6 +11,7 @@ import {
 import { GoalInitializationService } from "../src/orchestration/goal-initialization.js";
 import { OrchestrationStore } from "../src/orchestration/store.js";
 import type { CreateSessionInput } from "../src/session-manager.js";
+import { SessionManager } from "../src/session-manager.js";
 import { createDaemonServer } from "../src/ws-server.js";
 
 const homes: string[] = [];
@@ -77,6 +78,21 @@ class RecoverySessions implements WorkerSessionManager {
 }
 
 describe("daemon 启动时的 Dispatch 对账", () => {
+  it("batches restored terminal events but reconciles new live events immediately", async () => {
+    const settle = vi.spyOn(DispatchService.prototype, "settleTerminatedSession");
+    const reconcile = vi.spyOn(DispatchService.prototype, "reconcilePersistedSessions");
+    vi.spyOn(SessionManager.prototype, "restoreStructured").mockImplementation(async function () {
+      for (let index = 0; index < 1000; index++) this.emit("state", session(`archive-${index}`, "done"));
+      return [];
+    });
+    const server = await createDaemonServer({ home: temporaryHome(), port: 0 });
+    try {
+      expect(settle).not.toHaveBeenCalled();
+      expect(reconcile).toHaveBeenCalledTimes(1);
+      server.manager.emit("state", session("live", "done"));
+      expect(settle).toHaveBeenCalledTimes(1);
+    } finally { await server.close(); }
+  });
   it("WS 状态监听把 completed 当作 live：只检查 coordinator Run，不失败 active Dispatch", async () => {
     const home = temporaryHome();
     const server = await createDaemonServer({ home, port: 0 });

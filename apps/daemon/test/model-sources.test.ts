@@ -34,6 +34,16 @@ describe("shared model sources", () => {
       expect(config.provider.prospero.options.headers).toEqual(headers);
     }
   });
+
+  it("binds a source route to the selected compatible code agent", async () => {
+    const { accounts, act } = fixture();
+    const source = (await act({ kind: "create", name: "Anthropic gateway", endpoints: [{ protocol: "anthropic", baseUrl: "https://models.invalid" }], credential: { name: "Key", apiKey: "fixture-key" }, routes: [{ name: "DeepSeek", model: "deepseek-v4", protocol: "anthropic", enabled: true }] })).sources![0]!;
+    const routeId = source.routes[0]!.id;
+    const first = (await act({ kind: "bind", sourceId: source.id, revision: source.revision, routeId, agent: "claude" })).accountId!;
+    expect(accounts.resolve(first).agent).toBe("claude");
+    expect((await act({ kind: "bind", sourceId: source.id, revision: source.revision, routeId, agent: "claude" })).accountId).toBe(first);
+    await expect(act({ kind: "bind", sourceId: source.id, revision: source.revision, routeId, agent: "codex" })).rejects.toThrow("Codex");
+  });
   it("preserves headers across restarts and freezes them in existing session bindings", async () => {
     const { home, accounts, act } = fixture();
     let source = await sourceWithRoutes(act);

@@ -610,7 +610,7 @@ export const ModelSourceActionSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("route.remove"), ...modelSourceWrite, routeId: modelSourceId }).strict(),
   z.object({ kind: z.literal("delete"), ...modelSourceWrite }).strict(),
   z.object({ kind: z.literal("models"), ...modelSourceWrite, protocol: AgentApiProtocolSchema, credentialId: modelSourceId, refresh: z.boolean().optional() }).strict(),
-  z.object({ kind: z.literal("bind"), ...modelSourceWrite, routeId: modelSourceId }).strict(),
+  z.object({ kind: z.literal("bind"), ...modelSourceWrite, routeId: modelSourceId, agent: CodeAgentKindSchema.optional() }).strict(),
   z.object({ kind: z.literal("migration.preview") }).strict(),
   z.object({ kind: z.literal("migration.apply"), migrationId: modelSourceId, name: modelSourceName, target: z.object(modelSourceWrite).strict().optional() }).strict(),
   z.object({ kind: z.literal("migration.rollback"), accountIds: z.array(modelSourceId).min(1).max(500) }).strict(),

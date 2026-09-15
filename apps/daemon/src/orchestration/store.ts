@@ -1,14 +1,5 @@
-/**
- * 编排状态的落盘。
- *
- * 当前使用单个 JSON 文件 + 原子写 + 防抖。会话历史已独立迁入 SQLite；
- * 此处保存编排任务状态，暂不改变其存储和恢复契约。
- *
- * 内存里是真相,盘上是快照 —— 每次变更同步改内存、异步落盘,
- * 读操作永远不碰磁盘。
- */
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, renameSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import {
   type Dispatch,
@@ -31,7 +22,8 @@ import {
   findCycle,
   isReady,
 } from "./model.js";
-import { writePrivateFileAtomic } from "../filesystem-store.js";
+import { isDeepStrictEqual } from "node:util";
+import { OrchestrationDatabase } from "./database.js";
 
 const PERSIST_DEBOUNCE_MS = 200;
 const MAX_ORCHESTRATION_EVENTS = 2_048;
@@ -133,28 +125,17 @@ function limitedText(value: string, limit: number): string {
   return value.length <= limit ? value : `${value.slice(0, limit - 1)}…`;
 }
 
-function desktopProjection(state: OrchestrationState, revision: number): Record<string, unknown> {
-  return {
-    version: 1,
-    revision,
-    runs: Object.values(state.runs).map((run) => ({
-      ...compactRun(run),
-      automation: run.automation ?? null,
-    })),
-    tasks: Object.values(state.tasks).map((task) => ({
-      ...compactTask(task),
-      spec: limitedText(task.spec, DESKTOP_TASK_SPEC_LIMIT),
-      specTruncated: task.spec.length > DESKTOP_TASK_SPEC_LIMIT,
-      result: task.result === null ? null : limitedText(task.result, DESKTOP_TASK_RESULT_LIMIT),
-      resultTruncated: task.result !== null && task.result.length > DESKTOP_TASK_RESULT_LIMIT,
-    })),
-    dispatches: Object.values(state.dispatches).map((dispatch) => ({
-      ...compactDispatch(dispatch),
-      worktreePath: dispatch.worktreePath,
-    })),
-    gates: Object.values(state.gates).map(compactGate),
-    worktreeAssets: Object.values(state.worktreeAssets),
-  };
+function desktopEntity(table: string, row: Record<string, unknown>): Record<string, unknown> | undefined {
+  if (table === "runs") return { ...compactRun(row as unknown as Run), automation: row.automation ?? null };
+  if (table === "tasks") {
+    const task = row as unknown as Task;
+    return { ...compactTask(task), spec: limitedText(task.spec, DESKTOP_TASK_SPEC_LIMIT), specTruncated: task.spec.length > DESKTOP_TASK_SPEC_LIMIT,
+      result: task.result === null ? null : limitedText(task.result, DESKTOP_TASK_RESULT_LIMIT), resultTruncated: task.result !== null && task.result.length > DESKTOP_TASK_RESULT_LIMIT };
+  }
+  if (table === "dispatches") return { ...compactDispatch(row as unknown as Dispatch), worktreePath: row.worktreePath };
+  if (table === "gates") return compactGate(row as unknown as Gate);
+  if (table === "worktreeAssets") return row;
+  return undefined;
 }
 
 export class OrchestrationError extends Error {
@@ -255,6 +236,7 @@ export class OrchestrationStore {
     dispatch: new Map(),
     gate: new Map(),
   };
+  private readonly database: OrchestrationDatabase | undefined;
   private readonly file: string | null;
   private readonly desktopFile: string | null;
   private timer: NodeJS.Timeout | null = null;
@@ -267,48 +249,22 @@ export class OrchestrationStore {
   constructor(home?: string) {
     this.file = home ? path.join(home, "orchestration.json") : null;
     this.desktopFile = home ? path.join(home, "orchestration-desktop.json") : null;
-    this.load();
-    this.resetEventShadow();
-    // Persist the authoritative empty state before publishing its projection.
-    // Windows may terminate the child without running close() on app exit.
-    if (this.file && !existsSync(this.file)) this.persistNow();
-    if (this.file && existsSync(this.file)) {
-      const backup = `${this.file}.bak`;
-      const serialized = this.serializedState();
-      let current = false;
-      try { current = readFileSync(backup, "utf8") === serialized; } catch {}
-      if (!current) writePrivateFileAtomic(backup, serialized);
-    }
-    this.persistDesktopProjection();
-  }
-
-  private load(): void {
-    if (!this.file) return;
-    let primaryError: unknown = null;
-    try {
-      const migrated = this.loadFile(this.file);
-      if (migrated) this.persistNow();
-      return;
-    } catch (error) {
-      primaryError = error;
-    }
-    const backup = `${this.file}.bak`;
-    try {
-      this.loadFile(backup);
-      if (existsSync(this.file)) {
-        renameSync(this.file, `${this.file}.corrupt.${String(Date.now())}.${randomUUID()}`);
+    if (home) {
+      const databaseFile = path.join(home, "orchestration.sqlite");
+      if (!existsSync(databaseFile)) {
+        if (existsSync(this.file!)) {
+          try { this.loadFile(this.file!); }
+          catch (error) {
+            try { this.loadFile(`${this.file}.bak`); }
+            catch { throw new OrchestrationStorageError("Legacy orchestration requires a verified streaming migration", error); }
+          }
+        } else if (!this.hasOnlyInitialProjection()) throw new OrchestrationStorageError("Orchestration state is missing; restore a backup before starting");
       }
-      this.persistNow();
-      return;
-    } catch (backupError) {
-      const primaryMissing = (primaryError as NodeJS.ErrnoException | null)?.code === "ENOENT";
-      const backupMissing = (backupError as NodeJS.ErrnoException).code === "ENOENT";
-      if (primaryMissing && backupMissing && this.hasOnlyInitialProjection()) return;
-      throw new OrchestrationStorageError(
-        "编排状态损坏且没有可恢复备份，已停止加载以保护原文件",
-        primaryMissing ? backupError : primaryError,
-      );
+      this.database = new OrchestrationDatabase(databaseFile);
+      if (this.database.meta("version") !== undefined) this.loadState(this.database.load());
     }
+    this.resetEventShadow();
+    this.persistNow();
   }
 
   private hasOnlyInitialProjection(): boolean {
@@ -327,12 +283,11 @@ export class OrchestrationStore {
   }
 
   private loadFile(file: string): boolean {
-    const parsed = JSON.parse(readFileSync(file, "utf8")) as Omit<Partial<OrchestrationState>, "version"> & {
-      version?: number;
-      eventSeq?: unknown;
-      eventBaseSeq?: unknown;
-      events?: unknown;
-    };
+    return this.loadState(JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>);
+  }
+
+  private loadState(value: Record<string, unknown>): boolean {
+    const parsed = value as Omit<Partial<OrchestrationState>, "version"> & { version?: number; eventSeq?: unknown; eventBaseSeq?: unknown; events?: unknown };
     if (parsed.version !== 1 && parsed.version !== 2) {
       throw new OrchestrationStorageError("编排状态版本无效");
     }
@@ -531,7 +486,7 @@ export class OrchestrationStore {
       const current = new Map(values.map((value) => [String(value["id"]), value]));
       for (const [id, value] of current) {
         const old = previous.get(id);
-        if (old === undefined || JSON.stringify(old) !== JSON.stringify(value)) {
+        if (old === undefined || !isDeepStrictEqual(old, value)) {
           const runId = entity === "run" ? id : String(value["runId"]);
           this.appendEvent(runId, entity, id, "upsert", value);
         }
@@ -571,26 +526,14 @@ export class OrchestrationStore {
     this.timer.unref?.();
   }
 
-  private serializedState(): string {
-    return JSON.stringify({
-      ...this.state,
-      eventSeq: this.eventSeq,
-      eventBaseSeq: this.eventBaseSeq,
-      events: this.events,
-    }, null, 2);
-  }
-
   persistNow(): void {
-    if (!this.file) return;
+    if (!this.database) return;
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
     }
     try {
-      const serialized = this.serializedState();
-      writePrivateFileAtomic(this.file, serialized);
-      writePrivateFileAtomic(`${this.file}.bak`, serialized);
-      this.persistDesktopProjection();
+      this.database.save({ ...this.state, eventSeq: this.eventSeq, eventBaseSeq: this.eventBaseSeq, events: this.events }, desktopEntity);
       this.persistenceFailures = 0;
       this.lastPersistenceError = null;
     } catch (error) {
@@ -599,21 +542,15 @@ export class OrchestrationStore {
     }
   }
 
-  private persistDesktopProjection(): void {
-    if (!this.desktopFile) return;
-    writePrivateFileAtomic(
-      this.desktopFile,
-      JSON.stringify(desktopProjection(this.state, this.eventSeq)),
-    );
-  }
-
   close(): void {
+    if (this.closed) return;
     this.closed = true;
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
     }
-    this.persistNow();
+    try { this.persistNow(); }
+    finally { this.database?.close(); }
   }
 
   persistenceError(): Error | null {
@@ -1907,6 +1844,6 @@ export class OrchestrationStore {
 
   /** 测试用:直接看一眼内部状态 */
   snapshot(): OrchestrationState {
-    return JSON.parse(JSON.stringify(this.state)) as OrchestrationState;
+    return structuredClone(this.state);
   }
 }

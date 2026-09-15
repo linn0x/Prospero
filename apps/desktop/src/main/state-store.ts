@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "no
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, normalize, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import { DatabaseSync } from "node:sqlite";
 import { sessionAgentControls } from "./session-control";
 import { DEFAULT_TERMINAL_FONT_FAMILY, DEFAULT_TERMINAL_FONT_SIZE } from "../shared/terminal-typography";
 import type {
@@ -781,7 +782,28 @@ export class StateStore extends EventEmitter {
     return value;
   }
 
+  private sqliteOrchestration: { revision: number; value: JsonObject } | undefined;
+
   private readOrchestrationProjection(): JsonObject {
+    const databasePath = resolve(this.home, "orchestration.sqlite");
+    if (existsSync(databasePath)) {
+      let db: DatabaseSync | undefined;
+      try {
+        db = new DatabaseSync(databasePath, { readOnly: true, allowExtension: false });
+        db.exec("PRAGMA busy_timeout=100; PRAGMA query_only=ON; BEGIN");
+        if (db.prepare("PRAGMA application_id").get()!["application_id"] !== 0x504f5243 || db.prepare("PRAGMA user_version").get()!["user_version"] !== 1) throw new Error("Unsupported orchestration database");
+        const revision = Number(JSON.parse(String(db.prepare("SELECT value FROM metadata WHERE key='storageRevision'").get()?.value ?? "0")));
+        if (this.sqliteOrchestration?.revision === revision) return this.sqliteOrchestration.value;
+        const value: JsonObject = { version: 1, revision, runs: [], tasks: [], dispatches: [], gates: [], worktreeAssets: [] };
+        for (const row of db.prepare("SELECT entity,data FROM desktop_projection").iterate()) {
+          const group = value[String(row.entity)];
+          if (Array.isArray(group)) group.push(JSON.parse(String(row.data)));
+        }
+        this.sqliteOrchestration = { revision, value };
+        return value;
+      } catch { return this.sqliteOrchestration?.value ?? {}; }
+      finally { db?.close(); }
+    }
     const projectionPath = resolve(this.home, "orchestration-desktop.json");
     const projection = this.readExternalJson(projectionPath);
     return numberValue(projection["version"]) === 1 ? projection : {};

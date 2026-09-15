@@ -318,6 +318,29 @@ export class CodexAdapter implements AgentAdapter {
   private lastTextMsgId = "";
   private compactInFlight = false;
 
+  private profileModel(): string | null {
+    const value = this.ctx?.env?.["PROSPERO_API_PROFILE_MODEL"]?.trim();
+    return value ? value : null;
+  }
+
+  private profileModelProvider(): string | null {
+    const value = this.ctx?.env?.["PROSPERO_API_PROFILE_MODEL_PROVIDER"]?.trim();
+    return value ? value : null;
+  }
+
+  private activeModel(): string | null {
+    return this.profileModel() ?? this.selectedModel;
+  }
+
+  private threadModelOverrides(): Record<string, string> {
+    const model = this.activeModel();
+    const provider = this.profileModelProvider();
+    return {
+      ...(model ? { model } : {}),
+      ...(model && provider ? { modelProvider: provider } : {}),
+    };
+  }
+
   /**
    * YOLO 不只是“不弹审批”，还必须解除 Codex sandbox。否则 Docker socket、
    * 仓库外文件和网络仍会被 workspace-write 拦住，界面看起来就像 YOLO 失效。
@@ -353,9 +376,10 @@ export class CodexAdapter implements AgentAdapter {
   private async startSession(ctx: AdapterContext): Promise<void> {
     this.ctx = ctx;
     this.selectedModel =
-      typeof this.opts.resumeState?.["model"] === "string"
+      this.profileModel() ??
+      (typeof this.opts.resumeState?.["model"] === "string"
         ? this.opts.resumeState["model"]
-        : null;
+        : null);
     this.selectedEffort =
       typeof this.opts.resumeState?.["effort"] === "string"
         ? this.opts.resumeState["effort"]
@@ -377,7 +401,7 @@ export class CodexAdapter implements AgentAdapter {
       cwd: ctx.cwd,
       approvalPolicy: initialPolicy.approvalPolicy,
       sandbox: initialPolicy.sandbox,
-      ...(this.selectedModel ? { model: this.selectedModel } : {}),
+      ...this.threadModelOverrides(),
     };
     let started: { thread?: { id?: string }; threadId?: string };
     let resumed = false;
@@ -1588,7 +1612,7 @@ export class CodexAdapter implements AgentAdapter {
     return {
       mode: this.selectedMode,
       settings: {
-        model: this.selectedModel ?? "",
+        model: this.activeModel() ?? "",
         reasoning_effort: this.selectedEffort,
         developer_instructions: null,
       },
@@ -1625,9 +1649,9 @@ export class CodexAdapter implements AgentAdapter {
         input: this.userInput(text, skills),
         approvalPolicy: policy.approvalPolicy,
         sandboxPolicy: policy.sandboxPolicy,
-        ...(this.selectedModel ? { model: this.selectedModel } : {}),
+        ...this.threadModelOverrides(),
         ...(this.selectedEffort ? { effort: this.selectedEffort } : {}),
-        ...(this.selectedModel ? { collaborationMode: this.collaborationMode() } : {}),
+        ...(this.activeModel() ? { collaborationMode: this.collaborationMode() } : {}),
       },
       0,
     ).catch((e: unknown) => {
@@ -1977,9 +2001,9 @@ export class CodexAdapter implements AgentAdapter {
         input: this.userInput(text),
         approvalPolicy: policy.approvalPolicy,
         sandboxPolicy: policy.sandboxPolicy,
-        ...(this.selectedModel ? { model: this.selectedModel } : {}),
+        ...this.threadModelOverrides(),
         ...(this.selectedEffort ? { effort: this.selectedEffort } : {}),
-        ...(this.selectedModel ? { collaborationMode: this.collaborationMode() } : {}),
+        ...(this.activeModel() ? { collaborationMode: this.collaborationMode() } : {}),
       },
       0,
     ).catch((error: unknown) => {

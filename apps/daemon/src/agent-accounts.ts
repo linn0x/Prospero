@@ -401,6 +401,7 @@ function codexProviderArgs(profile: StoredApiProfile): string[] {
   return [
     "-c", `model_provider=${tomlString("prospero")}`,
     "-c", `model=${tomlString(profile.model)}`,
+    "-c", `default_subagent_model=${tomlString(profile.model)}`,
     "-c", `model_providers.prospero.name=${tomlString("Prospero external API")}`,
     "-c", `model_providers.prospero.base_url=${tomlString(profile.baseUrl)}`,
     "-c", `model_providers.prospero.env_key=${tomlString("OPENAI_API_KEY")}`,
@@ -886,6 +887,7 @@ export class AgentAccountManager {
             CODEX_REFRESH_TOKEN: "",
             CODEX_HOME: root,
             CODEX_SQLITE_HOME: root,
+            PROSPERO_API_PROFILE_MODEL_PROVIDER: "prospero",
           }
           : {
             ANTHROPIC_API_KEY: credential?.kind === "api_key" ? credential.secret : "",
@@ -941,7 +943,7 @@ export class AgentAccountManager {
       agent: account.agent,
       name: account.name,
       managed: true,
-      environment: { ...environment, ...(apiProfile ? { PROSPERO_API_PROFILE_VISION: apiProfile.modelCapabilities?.vision === false ? "0" : "1" } : {}),
+      environment: { ...environment, ...(apiProfile ? { ...(apiProfile.protocol === "openai_chat_completions" ? {} : { PROSPERO_API_PROFILE_MODEL: apiProfile.model }), PROSPERO_API_PROFILE_VISION: apiProfile.modelCapabilities?.vision === false ? "0" : "1" } : {}),
         ...(account.agent === "claude" && defaultModel ? { ANTHROPIC_MODEL: defaultModel } : {}),
         ...(account.agent === "claude" && defaultEffort ? { CLAUDE_CODE_EFFORT_LEVEL: defaultEffort } : {}),
       },
@@ -1033,12 +1035,19 @@ export class AgentAccountManager {
       } else if (action.kind === "bind") {
         const { source, route, profile } = this.modelSources.route(action.sourceId, action.routeId, action.revision);
         if (profile.modelCapabilities?.tools === false) throw new AgentAccountFeatureError("unsupported", "此模型未启用 Agent 所需的工具调用 / This model does not enable agent tool calls");
-        const existing = this.modelSources.currentBinding(action.sourceId, action.routeId, action.revision, knownAccounts);
-        if (existing) return { accountId: existing.accountId };
+        const agent = action.agent ?? (profile.protocol === "anthropic" ? "claude" : "codex");
+        if (agent === "claude" && profile.protocol !== "anthropic") throw new AgentAccountFeatureError("unsupported", "Claude Code 只能绑定 Anthropic 协议模型 / Claude Code can only bind Anthropic protocol models");
+        if (agent === "codex" && profile.protocol === "anthropic") throw new AgentAccountFeatureError("unsupported", "Codex 只能绑定 OpenAI 协议模型 / Codex can only bind OpenAI protocol models");
+        const existing = this.store.accounts.find(account => {
+          if (account.agent !== agent || !knownAccounts.has(account.id)) return false;
+          const binding = this.modelSources.binding(account.id);
+          return binding?.sourceId === action.sourceId && binding.routeId === action.routeId && binding.revision === action.revision;
+        });
+        if (existing) return { accountId: existing.id };
         const id = randomUUID();
         this.modelSources.bind(id, source.id, route.id, source.revision);
         const now = Date.now();
-        const account: StoredAccount = { id, agent: profile.protocol === "anthropic" ? "claude" : "codex", name: `${source.name} / ${route.name}`.slice(0, 80), apiProfile: profile, modelSource: this.modelSources.publicBinding(id)!, createdAt: now, updatedAt: now };
+        const account: StoredAccount = { id, agent, name: `${source.name} / ${route.name}`.slice(0, 80), apiProfile: profile, modelSource: this.modelSources.publicBinding(id)!, createdAt: now, updatedAt: now };
         const next = structuredClone(this.store);
         next.accounts.push(account);
         try { this.commitMetadata(next); }

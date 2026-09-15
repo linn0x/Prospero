@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { DesktopSnapshot, JsonObject } from "../src/shared/types";
 import { StateStore } from "../src/main/state-store";
+import { OrchestrationStore } from "../../daemon/src/orchestration/store";
 
 const homes: string[] = [];
 
@@ -24,6 +25,22 @@ afterEach(() => {
 });
 
 describe("Electron state snapshot caching", () => {
+  it("reads SQLite projections and refreshes only after a committed revision", () => {
+    const home = testHome();
+    const writer = new OrchestrationStore(home);
+    const run = writer.createRun({ objective: "SQLite graph" });
+    writer.createTask({ runId: run.id, title: "Task", spec: "x".repeat(4000) });
+    writer.persistNow();
+    writeJson(home, "orchestration-desktop.json", { version: 1, runs: [{ id: "stale" }] });
+    const reader = new StateStore(home);
+    const first = reader.snapshot();
+    expect(first.orchestration.runs[0]?.id).toBe(run.id);
+    expect(String(first.orchestration.tasks[0]?.spec)).toHaveLength(320);
+    expect(reader.snapshot().orchestration).toBe(first.orchestration);
+    writer.updateRun(run.id, { objective: "Updated" }); writer.persistNow();
+    expect(reader.snapshot().orchestration.runs[0]?.objective).toBe("Updated");
+    writer.close();
+  });
   it("uses the larger terminal default without overwriting saved font preferences", () => {
     const home = testHome();
     expect(new StateStore(home).settingsSnapshot().terminalFontSize).toBe(14);

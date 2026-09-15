@@ -4,6 +4,7 @@
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { forwardModelApi } from "./api-profile-transport.js";
+import { migrateOrchestration } from "./orchestration/database.js";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync, realpathSync, watch } from "node:fs";
 import { createRequire } from "node:module";
@@ -388,6 +389,7 @@ export async function createDaemonServer(
     accountResolver: (accountId, agent) => accounts.resolveForSession(accountId, agent, modelApiBaseUrl),
     accountCapabilitiesResolver: (accountId, agent) => accounts.capabilitiesFor(accountId, agent),
   });
+  await migrateOrchestration(opts.home);
   const orchestrationStore = new OrchestrationStore(opts.home);
   const dispatchService = new DispatchService(orchestrationStore, manager);
   const automationService = new AutomationService(orchestrationStore, dispatchService);
@@ -1028,6 +1030,7 @@ export async function createDaemonServer(
   }
 
   manager.on("state", (session) => {
+    if (!accountSessionsRestored) return;
     // Structured `completed` 只是本轮结束，仍可接受下一轮 chat 并继续持有
     // worktree writer 租约。只有 done/died 才表示会话真正终止；未显式交付的
     // worker 才需要在这里失败收口。

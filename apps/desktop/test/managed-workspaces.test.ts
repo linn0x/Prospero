@@ -60,12 +60,12 @@ describe("authoritative task workspace grouping", () => {
     expect(layout.groups.flatMap(group => group.workspaces).map(value => value.path).sort()).toEqual(["/a", "/b"]);
     expect(layout.groups.every(group => !group.project)).toBe(true);
   });
-  it("retains a parent's preview slot for its active child and preserves session priority", () => {
+  it("retains a parent's preview slot for its active child without moving the selected session", () => {
     const layout = groupManagedWorkspaces(["/other", "/repo", "/worker"], snapshot([asset("/worker")]));
     const active = session("active", "/worker");
     expect(managedWorkspaceParent(layout, projectForSession(["/repo", "/worker"], active)!)).toBe("/repo");
     expect(managedWorkspaceParent(layout, "/other")).toBe("/other");
-    expect(sortSidebarSessions([session("old", "/worker"), active], "active", [], [])[0]?.id).toBe("active");
+    expect(sortSidebarSessions([session("old", "/worker"), active], "active", [], []).map(item => item.id)).toEqual(["old", "active"]);
   });
   it("finds search children whose parent has no matching session", () => {
     const layout = groupManagedWorkspaces(["/repo", "/worker"], snapshot([asset("/worker")]));

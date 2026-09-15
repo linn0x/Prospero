@@ -3,7 +3,8 @@ import { ApiHeadersSchema } from "@prospero/protocol";
 import type { AgentModelCapabilities, AgentReasoningEffort } from "@prospero/protocol";
 import { accountReasoningEfforts, modelCapabilityDraft, parseModelCapabilities, type ModelCapabilityDraft } from "../account-profile-form";
 
-export type SourceSelection = { sourceId: string; routeId: string; revision: number };
+export type SourceSelection = { sourceId: string; routeId: string; revision: number; agent?: SourceRuntimeAgent };
+export type SourceRuntimeAgent = "codex" | "claude";
 
 export function parseSourceHeaders(value: string): Record<string, string> {
   const entries = value.split(/\r?\n/).filter(line => line.trim()).map(line => {
@@ -17,19 +18,25 @@ export function parseSourceHeaders(value: string): Record<string, string> {
   return parsed.data;
 }
 
-export function selectedSourceRoute(sources: readonly ModelSource[], selection: SourceSelection | undefined) {
-  const source = sources.find(item => item.id === selection?.sourceId);
-  const route = source?.routes.find(item => item.id === selection?.routeId);
-  return source && route && source.enabled && route.enabled && route.modelCapabilities?.tools !== false && source.revision === selection?.revision ? { source, route } : undefined;
+export function sourceRouteSupportsAgent(route: ModelSourceRoute, agent?: SourceRuntimeAgent): boolean {
+  if (!agent) return true;
+  if (agent === "claude") return route.protocol === "anthropic";
+  return route.protocol !== "anthropic";
 }
 
-export function defaultSourceSelection(sources: readonly ModelSource[], preferred?: Pick<SourceSelection, "sourceId" | "routeId">): SourceSelection | undefined {
+export function selectedSourceRoute(sources: readonly ModelSource[], selection: SourceSelection | undefined, agent?: SourceRuntimeAgent) {
+  const source = sources.find(item => item.id === selection?.sourceId);
+  const route = source?.routes.find(item => item.id === selection?.routeId);
+  return source && route && source.enabled && route.enabled && route.modelCapabilities?.tools !== false && source.revision === selection?.revision && sourceRouteSupportsAgent(route, agent) ? { source, route } : undefined;
+}
+
+export function defaultSourceSelection(sources: readonly ModelSource[], preferred?: Pick<SourceSelection, "sourceId" | "routeId">, agent?: SourceRuntimeAgent): SourceSelection | undefined {
   const candidates = [...sources].sort((left, right) => Number(right.id === preferred?.sourceId) - Number(left.id === preferred?.sourceId));
   for (const source of candidates) {
     if (!source.enabled) continue;
-    const routes = source.routes.filter(route => route.enabled && route.modelCapabilities?.tools !== false);
+    const routes = source.routes.filter(route => route.enabled && route.modelCapabilities?.tools !== false && sourceRouteSupportsAgent(route, agent));
     const route = routes.find(item => item.id === preferred?.routeId) ?? routes.find(item => item.id === source.defaultRouteId) ?? routes[0];
-    if (route) return { sourceId: source.id, routeId: route.id, revision: source.revision };
+    if (route) return { sourceId: source.id, routeId: route.id, revision: source.revision, ...(agent ? { agent } : {}) };
   }
   return undefined;
 }
@@ -76,15 +83,17 @@ export function catalogRouteUpdates(source: ModelSource, protocol: ModelSourceRo
 }
 
 const PREFERENCE_KEY = "prospero.newSession.modelSource";
-export function rememberedSourceSelection(): Pick<SourceSelection, "sourceId" | "routeId"> | undefined {
+export function rememberedSourceSelection(): Pick<SourceSelection, "sourceId" | "routeId" | "agent"> | undefined {
   try {
     const value: unknown = JSON.parse(localStorage.getItem(PREFERENCE_KEY) ?? "null");
     if (!value || typeof value !== "object") return undefined;
     const row = value as Record<string, unknown>;
-    if (typeof row.sourceId === "string" && typeof row.routeId === "string" && [row.sourceId, row.routeId].every(id => /^[A-Za-z0-9-]{1,100}$/.test(id))) return { sourceId: row.sourceId, routeId: row.routeId };
+    if (typeof row.sourceId === "string" && typeof row.routeId === "string" && [row.sourceId, row.routeId].every(id => /^[A-Za-z0-9-]{1,100}$/.test(id))) {
+      return { sourceId: row.sourceId, routeId: row.routeId, ...(row.agent === "claude" || row.agent === "codex" ? { agent: row.agent } : {}) };
+    }
   } catch {}
   return undefined;
 }
 export function rememberSourceSelection(selection: SourceSelection | undefined): void {
-  try { if (selection) localStorage.setItem(PREFERENCE_KEY, JSON.stringify({ sourceId: selection.sourceId, routeId: selection.routeId })); else localStorage.removeItem(PREFERENCE_KEY); } catch {}
+  try { if (selection) localStorage.setItem(PREFERENCE_KEY, JSON.stringify({ sourceId: selection.sourceId, routeId: selection.routeId, ...(selection.agent ? { agent: selection.agent } : {}) })); else localStorage.removeItem(PREFERENCE_KEY); } catch {}
 }

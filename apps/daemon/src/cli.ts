@@ -35,6 +35,7 @@ import {
 } from "./pairing.js";
 import { createDaemonServer } from "./ws-server.js";
 import { DAEMON_VERSION } from "./version.js";
+import { migrateOrchestration, OrchestrationDatabase } from "./orchestration/database.js";
 
 const require = createRequire(import.meta.url);
 const qrcode = require("qrcode-terminal") as typeof import("qrcode-terminal");
@@ -56,6 +57,17 @@ function hasWindowsAdministratorToken(): boolean {
 
 const program = new Command();
 program.name("prosperod").description("Prospero local agent hub").version(DAEMON_VERSION);
+
+program.command("orchestration-migrate")
+  .description("Import legacy orchestration into SQLite and verify it; keep the original JSON")
+  .option("--home <path>", "Daemon state directory")
+  .action(async (opts: { home?: string }) => {
+    const home = opts.home ? path.resolve(opts.home) : prosperoHome();
+    await migrateOrchestration(home);
+    const database = new OrchestrationDatabase(path.join(home, "orchestration.sqlite"));
+    try { console.log(JSON.stringify({ database: "orchestration.sqlite", counts: database.check(), migration: database.meta("migration") ?? null })); }
+    finally { database.close(); }
+  });
 
 program
   .command("start", { isDefault: true })
