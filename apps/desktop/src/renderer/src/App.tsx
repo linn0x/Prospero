@@ -2894,7 +2894,7 @@ function ProjectRenameDialog({
   };
   return (
     <Dialog open={open} onOpenChange={(next) => { if (next || !busy) onOpenChange(next); }}>
-      <DialogContent className="sm:max-w-md" showCloseButton={!busy} closeLabel={t("关闭", "Close")} aria-busy={busy}>
+      <DialogContent className="rename-dialog sm:max-w-md" showCloseButton={!busy} closeLabel={t("关闭", "Close")} aria-busy={busy}>
         <DialogHeader>
           <DialogTitle>
             {t("编辑工作区名称", "Edit workspace name")}
@@ -2984,7 +2984,7 @@ function SessionRenameDialog({
   };
   return (
     <Dialog open={open} onOpenChange={(next) => { if (next || !busy) onOpenChange(next); }}>
-      <DialogContent className="sm:max-w-md" showCloseButton={!busy} closeLabel={t("关闭", "Close")} aria-busy={busy}>
+      <DialogContent className="rename-dialog sm:max-w-md" showCloseButton={!busy} closeLabel={t("关闭", "Close")} aria-busy={busy}>
         <DialogHeader>
           <DialogTitle>{t("编辑会话名称", "Rename session")}</DialogTitle>
           <DialogDescription>

@@ -737,6 +737,12 @@ kbd {
 .context-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 18px; }
 .workspace-empty { min-height: 0; height: auto; flex: 1; }
 .context-sheet-trigger { display: none; }
+.rename-dialog[data-slot="dialog-content"] { width: min(448px, calc(100vw - 32px)); max-width: min(448px, calc(100vw - 32px)); overflow-x: hidden; }
+.rename-dialog [data-slot="dialog-header"],
+.rename-dialog [data-slot="field"],
+.rename-dialog [data-slot="field-description"] { min-width: 0; }
+.rename-dialog [data-slot="dialog-title"],
+.rename-dialog [data-slot="dialog-description"] { overflow-wrap: anywhere; }
 
 /* Skills catalog */
 .skills-view { display: flex; flex-direction: column; gap: 18px; }
