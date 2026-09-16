@@ -612,6 +612,7 @@ fn codex_models_from_response(value: &Value, models: &mut Vec<crate::agent::Laun
                 .and_then(Value::as_str)
                 .map(|value| trim_codex(value, 1000)),
             supported_efforts,
+            default_effort: None,
             is_default: row.get("isDefault").and_then(Value::as_bool) == Some(true),
         });
     }
@@ -662,6 +663,9 @@ async fn read_codex_models(
         Ok(crate::agent::LaunchModelCatalog {
             models,
             current_model,
+            current_effort: None,
+            presets: Vec::new(),
+            current_preset: None,
         })
     }
     .await;

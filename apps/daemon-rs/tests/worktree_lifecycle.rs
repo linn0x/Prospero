@@ -627,6 +627,34 @@ async fn create_run_task(database: &Database, spec: &str, skills: Vec<&str>) -> 
 }
 
 #[tokio::test]
+async fn opencode_worker_requires_chat_completions_profile() {
+    let (directory, repo) = init_repo();
+    let database = Database::open(directory.path().join("data")).await.unwrap();
+    let agents = Agents::new(database.clone());
+    let (_run_id, task_id) = create_run_task(&database, "use opencode", vec![]).await;
+
+    let error = start_worker(
+        &database,
+        &agents,
+        StartWorker {
+            agent: AgentKind::Opencode,
+            approval_policy: None,
+            account_id: None,
+            task_id: task_id.clone(),
+            cwd: repo.to_string_lossy().into_owned(),
+            worktree: "none".into(),
+            operation_id: Some("opencode-worker-no-account".into()),
+        },
+    )
+    .await
+    .expect_err("OpenCode workers need an API profile account");
+    assert!(
+        format!("{error}").contains("OpenCode worker 需要"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn worker_expands_bound_skill_into_the_delivered_brief() {
     let (directory, repo) = init_repo();
     let _cli_env = CLI_ENV_LOCK.lock().await;

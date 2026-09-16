@@ -84,7 +84,7 @@ CREATE TABLE terminal_output (
 ) STRICT;
 CREATE TABLE agent_runs (
     session_id TEXT PRIMARY KEY REFERENCES session_heads(id) ON DELETE CASCADE,
-    agent TEXT NOT NULL CHECK(agent IN ('claude','codex')),
+    agent TEXT NOT NULL CHECK(agent IN ('claude')),
     active INTEGER NOT NULL CHECK(active IN (0,1)),
     approval_policy TEXT NOT NULL CHECK(approval_policy IN ('manual','auto')),
     turn INTEGER NOT NULL DEFAULT 0 CHECK(turn >= 0),

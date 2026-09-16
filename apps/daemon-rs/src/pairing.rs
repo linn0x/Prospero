@@ -10,7 +10,10 @@ use std::fs;
 use std::path::Path;
 
 use base64::Engine;
+use base64::prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD};
+use crypto_box::SecretKey;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use crate::error::{Error, Result};
@@ -75,6 +78,23 @@ pub fn load_identity(home: &Path) -> Result<KeyPairB64> {
     Ok(identity)
 }
 
+pub fn load_or_create_identity(home: &Path) -> Result<KeyPairB64> {
+    match load_identity(home) {
+        Ok(identity) => Ok(identity),
+        Err(crate::error::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut rng = crypto_box::aead::OsRng;
+            let secret = SecretKey::generate(&mut rng);
+            let identity = KeyPairB64 {
+                public_key: BASE64_STANDARD.encode(secret.public_key().as_bytes()),
+                secret_key: BASE64_STANDARD.encode(secret.to_bytes()),
+            };
+            write_private_json(home, "identity.json", &identity)?;
+            Ok(identity)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub fn load_devices(home: &Path) -> Result<Vec<DeviceRecord>> {
     let path = home.join("devices.json");
     if !path.exists() {
@@ -86,16 +106,21 @@ pub fn load_devices(home: &Path) -> Result<Vec<DeviceRecord>> {
     Ok(file.devices)
 }
 
-fn save_devices(home: &Path, devices: &[DeviceRecord]) -> Result<()> {
+pub fn save_devices(home: &Path, devices: &[DeviceRecord]) -> Result<()> {
+    write_private_json(
+        home,
+        "devices.json",
+        &DevicesFile {
+            devices: devices.to_vec(),
+        },
+    )
+}
+
+pub fn write_private_json<T: Serialize>(home: &Path, name: &str, value: &T) -> Result<()> {
     fs::create_dir_all(home)?;
-    let path = home.join("devices.json");
-    let tmp = home.join(format!(
-        ".devices.json.{}.tmp",
-        uuid::Uuid::new_v4().simple()
-    ));
-    let bytes = serde_json::to_vec_pretty(&DevicesFile {
-        devices: devices.to_vec(),
-    })?;
+    let path = home.join(name);
+    let tmp = home.join(format!(".{}.{}.tmp", name, uuid::Uuid::new_v4().simple()));
+    let bytes = serde_json::to_vec_pretty(value)?;
     fs::write(&tmp, [bytes, b"\n".to_vec()].concat())?;
     #[cfg(unix)]
     {
@@ -104,6 +129,107 @@ fn save_devices(home: &Path, devices: &[DeviceRecord]) -> Result<()> {
     }
     fs::rename(tmp, path)?;
     Ok(())
+}
+
+pub fn random_b64url(bytes: usize) -> String {
+    let mut out = Vec::with_capacity(bytes);
+    while out.len() < bytes {
+        out.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+    }
+    out.truncate(bytes);
+    BASE64_URL_SAFE_NO_PAD.encode(out)
+}
+
+pub fn mint_device(
+    home: &Path,
+    name: String,
+    allow_shell: bool,
+    allow_orchestration: bool,
+) -> Result<DeviceRecord> {
+    let device = DeviceRecord {
+        name,
+        token: random_b64url(24),
+        client_pub_key: None,
+        allow_shell,
+        allow_orchestration: Some(allow_orchestration),
+        relay_device_id: None,
+        relay_token: None,
+        relay_credential_issued: None,
+        created_at: crate::database::now(),
+        last_seen_at: None,
+    };
+    let mut devices = load_devices(home)?;
+    devices.push(device.clone());
+    save_devices(home, &devices)?;
+    Ok(device)
+}
+
+pub fn issue_relay_credentials(device: &DeviceRecord) -> DeviceRecord {
+    let mut issued = device.clone();
+    issued.relay_device_id = Some(random_b64url(24));
+    issued.relay_token = Some(random_b64url(32));
+    issued.relay_credential_issued = Some(true);
+    issued
+}
+
+pub fn persist_relay_credentials(home: &Path, issued: &DeviceRecord) -> Result<()> {
+    if issued.relay_device_id.is_none()
+        || issued.relay_token.is_none()
+        || issued.relay_credential_issued != Some(true)
+    {
+        return Err(Error::Invalid(
+            "cannot persist relay credentials that were not issued in a pairing QR".into(),
+        ));
+    }
+    let mut devices = load_devices(home)?;
+    let Some(index) = devices
+        .iter()
+        .position(|device| token_equal(&device.token, &issued.token))
+    else {
+        return Err(Error::Invalid(
+            "paired device disappeared before relay credentials could be saved".into(),
+        ));
+    };
+    devices[index] = issued.clone();
+    save_devices(home, &devices)
+}
+
+pub fn device_id(device: &DeviceRecord) -> String {
+    BASE64_URL_SAFE_NO_PAD.encode(Sha256::digest(device.token.as_bytes()))
+}
+
+pub fn revoke_device(home: &Path, id: &str) -> Result<Option<DeviceRecord>> {
+    let mut devices = load_devices(home)?;
+    let Some(index) = devices.iter().position(|device| device_id(device) == id) else {
+        return Ok(None);
+    };
+    let removed = devices.remove(index);
+    save_devices(home, &devices)?;
+    Ok(Some(removed))
+}
+
+pub fn rotate_identity(home: &Path) -> Result<KeyPairB64> {
+    let mut rng = crypto_box::aead::OsRng;
+    let secret = SecretKey::generate(&mut rng);
+    let identity = KeyPairB64 {
+        public_key: BASE64_STANDARD.encode(secret.public_key().as_bytes()),
+        secret_key: BASE64_STANDARD.encode(secret.to_bytes()),
+    };
+    write_private_json(home, "identity.json", &identity)?;
+    save_devices(home, &[])?;
+    Ok(identity)
+}
+
+pub fn clear_relay_credentials(home: &Path) -> Result<usize> {
+    let mut devices = load_devices(home)?;
+    let count = devices.len();
+    for device in &mut devices {
+        device.relay_device_id = None;
+        device.relay_token = None;
+        device.relay_credential_issued = None;
+    }
+    save_devices(home, &devices)?;
+    Ok(count)
 }
 
 pub fn authenticate(

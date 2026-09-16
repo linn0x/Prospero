@@ -64,6 +64,7 @@ pub(crate) struct AgentRun {
     /// Launch-time model/effort selection; applied on every chained turn.
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub agent_preset: Option<String>,
     /// Managed account bound to the run; None for the native environment.
     pub account_id: Option<String>,
 }
@@ -117,8 +118,9 @@ impl Store {
             Some(value) => PermissionMode::from_wire(value)?,
             None => PermissionMode::Default,
         };
-        let model = normalize_selection(input.model, 160, "模型无效")?;
+        let model = normalize_selection(input.model, 300, "模型无效")?;
         let effort = normalize_selection(input.effort, 80, "思考强度无效")?;
+        let agent_preset = normalize_selection(input.agent_preset, 300, "Agent 预设无效")?;
         let native_id = input
             .resume
             .map(|resume| resume.id)
@@ -145,9 +147,9 @@ impl Store {
             },
             |tx, head| {
                 tx.execute(
-                    "INSERT INTO agent_runs(session_id,agent,active,approval_policy,permission_mode,turn,native_id,model,effort,account_id) \
-                     VALUES(?1,?2,1,?3,?4,0,?5,?6,?7,?8)",
-                    params![head.id, crate::database::label(agent)?, policy.label(), mode.label(), native_id, model, effort, account_id],
+                    "INSERT INTO agent_runs(session_id,agent,active,approval_policy,permission_mode,turn,native_id,model,effort,account_id,agent_preset) \
+                     VALUES(?1,?2,1,?3,?4,0,?5,?6,?7,?8,?9)",
+                    params![head.id, crate::database::label(agent)?, policy.label(), mode.label(), native_id, model, effort, account_id, agent_preset],
                 )?;
                 Ok(())
             },
@@ -166,11 +168,12 @@ impl Store {
             Option<String>,
             Option<String>,
             Option<String>,
+            Option<String>,
         );
         let row: Row = self
             .connection
             .query_row(
-                "SELECT agent,active,approval_policy,permission_mode,turn,native_id,model,effort,account_id FROM agent_runs WHERE session_id=?",
+                "SELECT agent,active,approval_policy,permission_mode,turn,native_id,model,effort,account_id,agent_preset FROM agent_runs WHERE session_id=?",
                 [id],
                 |row| {
                     Ok((
@@ -183,6 +186,7 @@ impl Store {
                         row.get(6)?,
                         row.get(7)?,
                         row.get(8)?,
+                        row.get(9)?,
                     ))
                 },
             )
@@ -201,6 +205,8 @@ impl Store {
         let agent = match row.0.as_str() {
             "claude" => AgentKind::Claude,
             "codex" => AgentKind::Codex,
+            "deepseek" => AgentKind::Deepseek,
+            "opencode" => AgentKind::Opencode,
             _ => {
                 return Err(Error::Invalid(
                     "Agent 暂未接入 Rust structured runtime".into(),
@@ -217,6 +223,7 @@ impl Store {
             model: row.6,
             effort: row.7,
             account_id: row.8,
+            agent_preset: row.9,
         })
     }
 
@@ -286,8 +293,15 @@ impl Store {
             let profile_bound: bool = row.get(5)?;
             Ok(crate::agent::SessionAgentControls {
                 session_id: row.get(0)?,
-                compact: agent == "claude" || agent == "codex",
-                model: (agent == "claude" || agent == "codex") && !profile_bound,
+                compact: agent == "claude"
+                    || agent == "codex"
+                    || agent == "deepseek"
+                    || agent == "opencode",
+                model: (agent == "claude"
+                    || agent == "codex"
+                    || agent == "deepseek"
+                    || agent == "opencode")
+                    && !profile_bound,
                 mode: (agent == "claude" || agent == "codex") && !profile_bound,
                 current_model: row.get(3)?,
                 current_effort: row.get(4)?,
@@ -317,7 +331,8 @@ impl Store {
         turn: i64,
         native_id: &str,
     ) -> Result<()> {
-        crate::database::validate_id(native_id)?;
+        let native_id = normalize_selection(Some(native_id.to_owned()), 256, "原生会话 ID 无效")?
+            .ok_or_else(|| Error::Invalid("原生会话 ID 无效".into()))?;
         let updated = self.connection.execute(
             "UPDATE agent_runs SET native_id=?1 WHERE session_id=?2 AND turn>=?3",
             params![native_id, id, turn],

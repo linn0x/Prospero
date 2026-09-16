@@ -71,6 +71,10 @@ impl Token {
             .is_some_and(|supplied| bool::from(self.0.as_bytes().ct_eq(supplied.as_bytes())))
     }
 
+    pub fn value(&self) -> &str {
+        &self.0
+    }
+
     pub fn publish(&self, directory: &Path, base_url: &str) -> Result<()> {
         let destination = directory.join("connection.json");
         let temporary = directory.join(format!(".connection-{}.tmp", uuid::Uuid::new_v4()));

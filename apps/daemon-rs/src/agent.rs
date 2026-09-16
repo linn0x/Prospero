@@ -1,6 +1,8 @@
 mod claude;
 mod codex;
 pub(crate) mod conversations;
+mod deepseek;
+mod opencode;
 mod runtime;
 mod store;
 mod usage;
@@ -44,6 +46,8 @@ pub struct CreateAgentSession {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_preset: Option<String>,
     /// Managed account id; None (or the native id) uses the本机默认环境.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
@@ -66,6 +70,8 @@ pub struct LaunchModelInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub supported_efforts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_default: bool,
 }
@@ -76,6 +82,26 @@ pub struct LaunchModelInfo {
 pub struct LaunchModelCatalog {
     pub models: Vec<LaunchModelInfo>,
     pub current_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub presets: Vec<AgentPresetInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_preset: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct AgentPresetInfo {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_default: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub custom: bool,
 }
 
 /// One inbound image attachment. Desktop validation mirrors the legacy

@@ -57,11 +57,39 @@ pub async fn start_automation(
     }
     if !matches!(
         input.agent,
-        crate::protocol::AgentKind::Claude | crate::protocol::AgentKind::Codex
+        crate::protocol::AgentKind::Claude
+            | crate::protocol::AgentKind::Codex
+            | crate::protocol::AgentKind::Deepseek
+            | crate::protocol::AgentKind::Opencode
     ) {
         return Err(Error::Invalid(
-            "automation currently supports Claude/Codex workers".into(),
+            "automation currently supports Claude/Codex/DeepSeek/OpenCode workers".into(),
         ));
+    }
+    if input.agent == crate::protocol::AgentKind::Deepseek && input.account_id.is_some() {
+        return Err(Error::Invalid(
+            "DeepSeek automation uses the native dsh account".into(),
+        ));
+    }
+    if input.agent == crate::protocol::AgentKind::Opencode {
+        let Some(account_id) = input.account_id.as_deref() else {
+            return Err(Error::Invalid(
+                "OpenCode automation requires an OpenAI Chat Completions API Profile".into(),
+            ));
+        };
+        let data = database.directory().to_owned();
+        let account_id = account_id.to_owned();
+        let profile = database
+            .call(move |store| Ok(store.managed_snapshot_row(&data, &account_id)?.api_profile))
+            .await?;
+        match profile.as_ref().map(|profile| profile.protocol()) {
+            Some("openai_chat_completions") => {}
+            _ => {
+                return Err(Error::Invalid(
+                    "OpenCode automation requires an OpenAI Chat Completions API Profile".into(),
+                ));
+            }
+        }
     }
     let cwd = canonical_directory(&input.cwd)?;
     let (run, tasks) = database

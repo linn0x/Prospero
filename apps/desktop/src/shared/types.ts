@@ -237,6 +237,7 @@ export type SessionCreateInput = {
   mode?: "default" | "plan";
   model?: string | undefined;
   effort?: string | undefined;
+  agentPreset?: string | undefined;
   command?: string;
   accountId?: string | undefined;
   resume?: Pick<ResumableConversation, "id" | "title"> | { id: string; title?: string; fork?: true } | undefined;
@@ -295,7 +296,8 @@ export type UsageReport = {
 export type AgentMode = { id: string; label: string; description?: string };
 export type AgentModeCatalog = { modes: AgentMode[]; currentMode?: string };
 export type AgentModel = { id: string; label: string; description?: string; supportedEfforts: string[]; defaultEffort?: string; isDefault?: boolean };
-export type AgentModelCatalog = { models: AgentModel[]; currentModel?: string; currentEffort?: string };
+export type AgentPreset = { id: string; name: string; description?: string; isDefault?: boolean; custom?: boolean };
+export type AgentModelCatalog = { models: AgentModel[]; currentModel?: string; currentEffort?: string; presets?: AgentPreset[]; currentPreset?: string };
 export type SkillSuggestion = { value: string; label?: string; detail?: string };
 
 export type DesktopApi = import("./project-tools").ProjectToolsApi & {
@@ -347,7 +349,7 @@ export type DesktopApi = import("./project-tools").ProjectToolsApi & {
   revealSkill(path: string, cwd: string): Promise<{ ok: boolean; error?: string }>;
   getAgentModes(sessionId: string): Promise<AgentModeCatalog>;
   setAgentMode(sessionId: string, mode: string): Promise<{ currentMode: string }>;
-  getLaunchModels(agent: "codex" | "claude" | "deepseek", accountId?: string): Promise<AgentModelCatalog>;
+  getLaunchModels(agent: "codex" | "claude" | "deepseek" | "opencode", accountId?: string): Promise<AgentModelCatalog>;
   getAgentModels(sessionId: string): Promise<AgentModelCatalog>;
   setAgentModel(sessionId: string, model: string, effort?: string): Promise<{ currentModel: string; currentEffort?: string }>;
   orchestrationAction(method: string, params: JsonObject): Promise<JsonObject>;

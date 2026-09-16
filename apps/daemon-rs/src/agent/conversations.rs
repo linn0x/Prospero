@@ -277,6 +277,19 @@ pub(crate) async fn search_codex_conversations(
     crate::agent::usage::search_native_codex_conversations(&data, &query, limit).await
 }
 
+pub(crate) async fn search_deepseek_conversations(
+    account_id: Option<String>,
+    query: String,
+    limit: Option<usize>,
+) -> Result<Vec<ResumableConversation>> {
+    if account_id.is_some() {
+        return Err(Error::Invalid(
+            "Rust daemon 当前仅支持本机 DeepSeek 对话搜索".into(),
+        ));
+    }
+    crate::agent::deepseek::search_conversations(query, limit).await
+}
+
 pub(crate) async fn search_claude_conversations(
     database: &crate::worker::Database,
     account_id: Option<String>,

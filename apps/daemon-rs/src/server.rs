@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::path::Path as FsPath;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
@@ -18,6 +19,8 @@ use axum::{
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use futures_util::{Stream, stream};
+use reqwest::Client;
+use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 use tokio::sync::{Semaphore, watch};
 
@@ -56,7 +59,9 @@ pub struct Api {
     pub database: Database,
     pub terminals: Terminals,
     pub agents: Agents,
+    pub relay_status: crate::relay::RelayStatusHandle,
     token: Token,
+    projection: Arc<Mutex<ProjectionState>>,
     changes: watch::Sender<u64>,
     stopping: watch::Sender<bool>,
     requests: Arc<Semaphore>,
@@ -66,6 +71,25 @@ pub struct Api {
     api_tests: Arc<Semaphore>,
     api_testing: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
     api_features: Arc<Semaphore>,
+    remote_ws_handshake_timeout: Duration,
+}
+
+#[derive(Default)]
+struct ProjectionState {
+    initialized: bool,
+    attention: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NotifyConfig {
+    url: String,
+    deep_link: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RuntimeConfig {
+    notify: Option<NotifyConfig>,
 }
 
 impl Api {
@@ -74,23 +98,19 @@ impl Api {
     }
 
     pub fn with_guard(database: Database, token: Token, guard: Option<std::path::PathBuf>) -> Self {
+        let relay_status = crate::relay::RelayStatusHandle::new(database.directory());
         let terminals = Terminals::with_guard(database.clone(), guard);
         let changes = terminals.changes();
         let agents = Agents::new(database.clone());
-        // Forward agent notifications onto the shared change watch.
         let mut agent_changes = agents.changes().subscribe();
-        let shared_changes = changes.clone();
-        tokio::spawn(async move {
-            while agent_changes.changed().await.is_ok() {
-                shared_changes.send_modify(|seq| *seq = seq.wrapping_add(1));
-            }
-        });
-        Self {
-            terminals,
-            agents,
-            database,
-            token,
-            changes,
+        let shared_api = Self {
+            terminals: terminals.clone(),
+            agents: agents.clone(),
+            relay_status: relay_status.clone(),
+            database: database.clone(),
+            token: token.clone(),
+            projection: Arc::new(Mutex::new(ProjectionState::default())),
+            changes: changes.clone(),
             stopping: watch::channel(false).0,
             requests: Arc::new(Semaphore::new(32)),
             streams: Arc::new(Semaphore::new(16)),
@@ -99,7 +119,20 @@ impl Api {
             api_tests: Arc::new(Semaphore::new(4)),
             api_testing: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             api_features: Arc::new(Semaphore::new(4)),
-        }
+            remote_ws_handshake_timeout: REMOTE_WS_HANDSHAKE_TIMEOUT,
+        };
+        let agent_api = shared_api.clone();
+        tokio::spawn(async move {
+            while agent_changes.changed().await.is_ok() {
+                agent_api.publish();
+            }
+        });
+        shared_api
+    }
+
+    pub fn with_remote_ws_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.remote_ws_handshake_timeout = timeout;
+        self
     }
 
     pub fn router(&self) -> Router {
@@ -253,6 +286,132 @@ impl Api {
         self.changes
             .send_modify(|version| *version = version.wrapping_add(1));
     }
+
+    pub async fn run_status_projection(
+        &self,
+        port: u16,
+        bind: Option<String>,
+        control_token: String,
+        mut stopping: watch::Receiver<bool>,
+    ) {
+        let mut changes = self.changes.subscribe();
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        if let Err(error) = self
+            .write_status_projection(port, bind.clone(), control_token.clone())
+            .await
+        {
+            eprintln!("status projection failed: {error}");
+        }
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {},
+                changed = changes.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                },
+                changed = stopping.changed() => {
+                    if changed.is_err() || *stopping.borrow() {
+                        return;
+                    }
+                }
+            }
+            if let Err(error) = self
+                .write_status_projection(port, bind.clone(), control_token.clone())
+                .await
+            {
+                eprintln!("status projection failed: {error}");
+            }
+        }
+    }
+
+    pub async fn write_status_projection(
+        &self,
+        port: u16,
+        bind: Option<String>,
+        control_token: String,
+    ) -> Result<()> {
+        let (summary, sessions) = self
+            .database
+            .call(|store| {
+                let summary = store.session_summary(None)?;
+                let active = store.sessions(SessionQuery {
+                    cursor: None,
+                    limit: Some(100),
+                    lifecycle: Some(SessionLifecycle::Active),
+                    workspace: None,
+                    text: None,
+                })?;
+                let archived = store.sessions(SessionQuery {
+                    cursor: None,
+                    limit: Some(20),
+                    lifecycle: Some(SessionLifecycle::Archived),
+                    workspace: None,
+                    text: None,
+                })?;
+                let mut sessions = active.items;
+                sessions.extend(archived.items);
+                Ok((summary, sessions))
+            })
+            .await?;
+        let attention = summary.attention;
+        self.relay_status.write_minimal_status(
+            port,
+            bind,
+            control_token,
+            health_capabilities(),
+            summary,
+            sessions,
+        )?;
+        self.notify_attention(attention).await;
+        Ok(())
+    }
+
+    async fn notify_attention(&self, attention: i64) {
+        let should_notify = {
+            let Ok(mut state) = self.projection.lock() else {
+                return;
+            };
+            let notify = state.initialized && attention > state.attention;
+            state.initialized = true;
+            state.attention = attention;
+            notify
+        };
+        if !should_notify {
+            return;
+        }
+        let Some(config) = load_notify_config(self.database.directory()) else {
+            return;
+        };
+        if config.url.trim().is_empty() {
+            return;
+        }
+        let url = config.deep_link.unwrap_or_else(|| "prospero://".into());
+        let body = json!({
+            "title": "Prospero 等待你的处理",
+            "body": format!("{attention} 个审批或问题需要处理"),
+            "message": format!("{attention} 个审批或问题需要处理"),
+            "group": "Prospero",
+            "tags": ["warning"],
+            "level": "timeSensitive",
+            "url": url,
+            "click": url
+        });
+        let client = match Client::builder().timeout(Duration::from_secs(10)).build() {
+            Ok(client) => client,
+            Err(_) => return,
+        };
+        if !client
+            .post(config.url)
+            .json(&body)
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success())
+        {
+            eprintln!("notification delivery failed");
+        }
+    }
     pub fn stop(&self) {
         self.stopping.send_replace(true);
     }
@@ -341,22 +500,35 @@ async fn authorize(State(api): State<Api>, request: Request, next: Next) -> Resp
 }
 
 const WS_MAX_PAYLOAD: usize = 16 * 1024 * 1024;
+const REMOTE_WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 async fn remote_ws(State(api): State<Api>, ws: WebSocketUpgrade) -> Response {
+    let Ok(permit) = api.streams.clone().try_acquire_owned() else {
+        return ApiError(Error::Busy).into_response();
+    };
     ws.max_message_size(WS_MAX_PAYLOAD)
         .max_frame_size(WS_MAX_PAYLOAD)
-        .on_upgrade(move |socket| handle_remote_ws(api, socket))
+        .on_upgrade(move |socket| handle_remote_ws(api, socket, permit))
 }
 
 const CLOSE_AUTH_FAILED: u16 = 4001;
 const CLOSE_PROTOCOL: u16 = 4003;
 const CLOSE_REVOKED: u16 = 4004;
 
-async fn handle_remote_ws(api: Api, mut socket: WebSocket) {
-    let first = match recv_text_frame(&mut socket).await {
-        Ok(Some(text)) => text,
-        Ok(None) => return,
-        Err(_) => {
+async fn handle_remote_ws(
+    api: Api,
+    mut socket: WebSocket,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+) {
+    let first = match tokio::time::timeout(
+        api.remote_ws_handshake_timeout,
+        recv_text_frame(&mut socket),
+    )
+    .await
+    {
+        Ok(Ok(Some(text))) => text,
+        Ok(Ok(None)) => return,
+        Ok(Err(_)) | Err(_) => {
             close_ws(&mut socket, CLOSE_PROTOCOL, "handshake error").await;
             return;
         }
@@ -383,10 +555,15 @@ async fn handle_remote_ws(api: Api, mut socket: WebSocket) {
     {
         return;
     }
-    let hello_frame = match recv_text_frame(&mut socket).await {
-        Ok(Some(text)) => text,
-        Ok(None) => return,
-        Err(_) => {
+    let hello_frame = match tokio::time::timeout(
+        api.remote_ws_handshake_timeout,
+        recv_text_frame(&mut socket),
+    )
+    .await
+    {
+        Ok(Ok(Some(text))) => text,
+        Ok(Ok(None)) => return,
+        Ok(Err(_)) | Err(_) => {
             close_ws(&mut socket, CLOSE_PROTOCOL, "handshake error").await;
             return;
         }
@@ -435,6 +612,8 @@ async fn handle_remote_ws(api: Api, mut socket: WebSocket) {
     }
     let mut state = RemoteWsState::default();
     let mut changes = api.changes.subscribe();
+    let mut revoke_check = tokio::time::interval(Duration::from_millis(500));
+    revoke_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             frame = socket.recv() => {
@@ -464,6 +643,10 @@ async fn handle_remote_ws(api: Api, mut socket: WebSocket) {
                         return;
                     }
                 };
+                if remote_device_revoked(&home, &device.token) {
+                    close_ws(&mut socket, CLOSE_REVOKED, "revoked").await;
+                    return;
+                }
                 if let Err(error) = route_remote_ws_message(
                     &api,
                     &mut socket,
@@ -485,6 +668,12 @@ async fn handle_remote_ws(api: Api, mut socket: WebSocket) {
                     return;
                 }
                 if flush_remote_ws_changes(&api, &mut socket, &mut channel, &mut state).await.is_err() {
+                    return;
+                }
+            }
+            _ = revoke_check.tick() => {
+                if remote_device_revoked(&home, &device.token) {
+                    close_ws(&mut socket, CLOSE_REVOKED, "revoked").await;
                     return;
                 }
             }
@@ -542,6 +731,12 @@ async fn close_ws(socket: &mut WebSocket, code: u16, reason: &str) {
         .await;
 }
 
+fn remote_device_revoked(home: &FsPath, token: &str) -> bool {
+    pairing::load_devices(home).map_or(true, |devices| {
+        !devices.iter().any(|device| device.token == token)
+    })
+}
+
 async fn send_remote_json(
     socket: &mut WebSocket,
     channel: &mut SecureChannel,
@@ -592,6 +787,7 @@ fn remote_host_info(protocol_version: u8) -> JsonValue {
             "session.create-result.v1",
             "conversation.search.v1",
             "chat.attachment-previews.v1",
+        "agent.deepseek-harness.v1",
             "model.sources.v1",
             "orchestration.automation.v1",
         ],
@@ -886,11 +1082,46 @@ async fn remote_launch_models(
         .map(str::to_owned);
     let mut out = json!({"type":"launch.models","requestId":request_id,"agent":agent,"models":[]});
     match agent {
+        "deepseek" => match crate::agent::Agents::deepseek_launch_catalog().await {
+            Ok(catalog) => {
+                let catalog = serde_json::to_value(catalog)?;
+                out["models"] = catalog["models"].clone();
+                out["presets"] = catalog["presets"].clone();
+                out["currentModel"] = catalog["currentModel"].clone();
+                out["currentEffort"] = catalog["currentEffort"].clone();
+                out["currentPreset"] = catalog["currentPreset"].clone();
+            }
+            Err(error) => out["error"] = json!(error.to_string()),
+        },
+        "opencode" => {
+            let result = match account_id.as_deref() {
+                Some(id) => {
+                    profile_launch_catalog(
+                        api,
+                        id,
+                        crate::protocol::AgentKind::Opencode,
+                        "OpenCode",
+                    )
+                    .await
+                }
+                None => crate::agent::Agents::opencode_launch_catalog().await,
+            };
+            match result {
+                Ok(catalog) => {
+                    let catalog = serde_json::to_value(catalog)?;
+                    out["models"] = catalog["models"].clone();
+                    out["currentModel"] = catalog["currentModel"].clone();
+                    out["currentEffort"] = catalog["currentEffort"].clone();
+                }
+                Err(error) => out["error"] = json!(error.to_string()),
+            }
+        }
         "codex" => match codex_launch_catalog(api, account_id.as_deref()).await {
             Ok(catalog) => {
                 let catalog = serde_json::to_value(catalog)?;
                 out["models"] = catalog["models"].clone();
                 out["currentModel"] = catalog["currentModel"].clone();
+                out["currentEffort"] = catalog["currentEffort"].clone();
             }
             Err(error) => out["error"] = json!(error.to_string()),
         },
@@ -901,6 +1132,7 @@ async fn remote_launch_models(
                     let catalog = serde_json::to_value(catalog)?;
                     out["models"] = catalog["models"].clone();
                     out["currentModel"] = catalog["currentModel"].clone();
+                    out["currentEffort"] = catalog["currentEffort"].clone();
                 }
                 Err(error) => out["error"] = json!(error.to_string()),
             }
@@ -1524,8 +1756,12 @@ async fn remote_conversation_search(
             )
             .await
         }
+        "deepseek" => {
+            crate::agent::conversations::search_deepseek_conversations(account_id, query, limit)
+                .await
+        }
         _ => Err(Error::Invalid(
-            "Rust daemon 当前仅支持搜索 Claude/Codex 本机对话".into(),
+            "Rust daemon 当前仅支持搜索 Claude/Codex/DeepSeek 本机对话".into(),
         )),
     };
     match conversations {
@@ -2068,7 +2304,7 @@ async fn remote_session_create(
                     workspace: cwd,
                     auto_approve: matches!(
                         message.get("approvalPolicy").and_then(JsonValue::as_str),
-                        Some("always")
+                        Some("always" | "yolo" | "auto")
                     ),
                     mode: message
                         .get("mode")
@@ -2080,6 +2316,10 @@ async fn remote_session_create(
                         .map(str::to_owned),
                     effort: message
                         .get("effort")
+                        .and_then(JsonValue::as_str)
+                        .map(str::to_owned),
+                    agent_preset: message
+                        .get("agentPreset")
                         .and_then(JsonValue::as_str)
                         .map(str::to_owned),
                     account_id: message
@@ -2689,47 +2929,63 @@ async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, Api
     api.call(|_| Ok(())).await?;
     api.terminals.check()?;
     api.agents.check()?;
-    let relay = crate::relay::relay_status_from_home(api.database.directory(), false);
+    let relay = api
+        .relay_status
+        .get()
+        .filter(|status| status.state != crate::relay::RelayConnectionState::Disabled)
+        .or_else(|| crate::relay::relay_status_from_home(api.database.directory(), false));
     Ok(Json(Health {
         api_version: API_VERSION,
         backend: "rust".into(),
         active_runtime_sessions: api.terminals.count() + api.agents.count(),
         database_queue_capacity: DATABASE_QUEUE_CAPACITY,
-        capabilities: [
-            "session.metadata",
-            "session.search",
-            "session.summary",
-            "session.lookup",
-            "session.workspace.page",
-            "workspace.page",
-            "session.content",
-            "session.timeline",
-            "agent.claude",
-            "orchestration.dag",
-            #[cfg(unix)]
-            "terminal.unix",
-            "terminal.output.page",
-            "terminal.snapshot",
-            "events.replay",
-            "events.stream",
-            "agent.account.api.models",
-            "agent.account.config",
-            "agent.api-validation.v1",
-            "agent.api-engine-validation.v1",
-            "agent.api-protocols.v1",
-            "conversation.search.v1",
-            "chat.attachment-previews.v1",
-            "model.sources.v1",
-            "orchestration.automation.v1",
-            "session.workspace.summary",
-            "session.fs",
-            "session.git",
-            "relay.host.v1",
-        ]
-        .map(str::to_owned)
-        .to_vec(),
+        capabilities: health_capabilities(),
         relay,
     }))
+}
+
+fn health_capabilities() -> Vec<String> {
+    [
+        "session.metadata",
+        "session.search",
+        "session.summary",
+        "session.lookup",
+        "session.workspace.page",
+        "workspace.page",
+        "session.content",
+        "session.timeline",
+        "agent.claude",
+        "orchestration.dag",
+        #[cfg(unix)]
+        "terminal.unix",
+        "terminal.output.page",
+        "terminal.snapshot",
+        "events.replay",
+        "events.stream",
+        "agent.account.api.models",
+        "agent.account.config",
+        "agent.api-validation.v1",
+        "agent.api-engine-validation.v1",
+        "agent.api-protocols.v1",
+        "conversation.search.v1",
+        "chat.attachment-previews.v1",
+        "agent.deepseek-harness.v1",
+        "model.sources.v1",
+        "orchestration.automation.v1",
+        "session.workspace.summary",
+        "session.fs",
+        "session.git",
+        "relay.host.v1",
+    ]
+    .map(str::to_owned)
+    .to_vec()
+}
+
+fn load_notify_config(home: &FsPath) -> Option<NotifyConfig> {
+    let raw = std::fs::read_to_string(home.join("config.json")).ok()?;
+    serde_json::from_str::<RuntimeConfig>(&raw)
+        .ok()
+        .and_then(|config| config.notify)
 }
 
 #[derive(serde::Deserialize)]
@@ -2748,9 +3004,9 @@ async fn conversation_search(
     State(api): State<Api>,
     Query(query): Query<ConversationSearchQuery>,
 ) -> std::result::Result<Json<crate::agent::ConversationSearchResult>, ApiError> {
-    if query.agent != "claude" && query.agent != "codex" {
+    if query.agent != "claude" && query.agent != "codex" && query.agent != "deepseek" {
         return Err(ApiError(Error::Invalid(
-            "Rust daemon 当前仅支持搜索 Claude/Codex 本机对话".into(),
+            "Rust daemon 当前仅支持搜索 Claude/Codex/DeepSeek 本机对话".into(),
         )));
     }
     if query.query.chars().count() > 300 || query.query.chars().any(char::is_control) {
@@ -2760,8 +3016,8 @@ async fn conversation_search(
         return Err(ApiError(Error::Invalid("对话搜索数量无效".into())));
     }
     let _permit = api.requests.acquire().await.map_err(|_| Error::Closed)?;
-    let (agent, conversations) = if query.agent == "codex" {
-        (
+    let (agent, conversations) = match query.agent.as_str() {
+        "codex" => (
             crate::protocol::AgentKind::Codex,
             crate::agent::conversations::search_codex_conversations(
                 &api.database,
@@ -2770,9 +3026,17 @@ async fn conversation_search(
                 query.limit,
             )
             .await?,
-        )
-    } else {
-        (
+        ),
+        "deepseek" => (
+            crate::protocol::AgentKind::Deepseek,
+            crate::agent::conversations::search_deepseek_conversations(
+                query.account_id,
+                query.query,
+                query.limit,
+            )
+            .await?,
+        ),
+        _ => (
             crate::protocol::AgentKind::Claude,
             crate::agent::conversations::search_claude_conversations(
                 &api.database,
@@ -2781,7 +3045,7 @@ async fn conversation_search(
                 query.limit,
             )
             .await?,
-        )
+        ),
     };
     Ok(Json(crate::agent::ConversationSearchResult {
         agent,
@@ -3922,40 +4186,47 @@ async fn codex_launch_catalog(
             crate::agent::read_native_codex_models(api.database.directory()).await
         }
         Some(id) => {
-            crate::database::validate_id(id)?;
-            let data = api.database.directory().to_owned();
-            let id = id.to_owned();
-            let profile_id = id.clone();
-            let profile_data = data.clone();
-            let profile = api
-                .database
-                .call(move |store| {
-                    Ok(store
-                        .managed_snapshot_row(&profile_data, &profile_id)?
-                        .api_profile)
-                })
-                .await?
-                .ok_or_else(|| Error::Invalid("所选账号不是 Codex API Profile".into()))?;
-            if crate::accounts::profile::agent_kind(&profile) != crate::protocol::AgentKind::Codex {
-                return Err(Error::Invalid("所选账号不是 Codex API Profile".into()));
-            }
-            let model = profile.model.clone();
-            Ok(crate::agent::LaunchModelCatalog {
-                current_model: Some(model.clone()),
-                models: vec![crate::agent::LaunchModelInfo {
-                    id: model,
-                    label: profile.model,
-                    description: None,
-                    supported_efforts: profile
-                        .model_capabilities
-                        .as_ref()
-                        .and_then(|caps| caps.supported_efforts.clone())
-                        .unwrap_or_default(),
-                    is_default: true,
-                }],
-            })
+            profile_launch_catalog(api, id, crate::protocol::AgentKind::Codex, "Codex").await
         }
     }
+}
+
+async fn profile_launch_catalog(
+    api: &Api,
+    account_id: &str,
+    expected_agent: crate::protocol::AgentKind,
+    label: &str,
+) -> Result<crate::agent::LaunchModelCatalog> {
+    crate::database::validate_id(account_id)?;
+    let data = api.database.directory().to_owned();
+    let account_id = account_id.to_owned();
+    let profile = api
+        .database
+        .call(move |store| Ok(store.managed_snapshot_row(&data, &account_id)?.api_profile))
+        .await?
+        .ok_or_else(|| Error::Invalid(format!("所选账号不是 {label} API Profile")))?;
+    if crate::accounts::profile::agent_kind(&profile) != expected_agent {
+        return Err(Error::Invalid(format!("所选账号不是 {label} API Profile")));
+    }
+    let model = profile.model.clone();
+    Ok(crate::agent::LaunchModelCatalog {
+        current_model: Some(model.clone()),
+        current_effort: None,
+        presets: Vec::new(),
+        current_preset: None,
+        models: vec![crate::agent::LaunchModelInfo {
+            id: model,
+            label: profile.model,
+            description: None,
+            supported_efforts: profile
+                .model_capabilities
+                .as_ref()
+                .and_then(|caps| caps.supported_efforts.clone())
+                .unwrap_or_default(),
+            default_effort: None,
+            is_default: true,
+        }],
+    })
 }
 
 #[derive(serde::Deserialize)]
@@ -3973,6 +4244,18 @@ async fn launch_models(
     Query(query): Query<LaunchModelsQuery>,
 ) -> std::result::Result<Json<crate::agent::LaunchModelCatalog>, ApiError> {
     let _permit = api.requests.acquire().await.map_err(|_| Error::Closed)?;
+    if query.agent == "deepseek" {
+        return Ok(Json(crate::agent::Agents::deepseek_launch_catalog().await?));
+    }
+    if query.agent == "opencode" {
+        return Ok(Json(match query.account_id.as_deref() {
+            Some(id) => {
+                profile_launch_catalog(&api, id, crate::protocol::AgentKind::Opencode, "OpenCode")
+                    .await?
+            }
+            None => crate::agent::Agents::opencode_launch_catalog().await?,
+        }));
+    }
     if query.agent == "codex" {
         return Ok(Json(
             codex_launch_catalog(&api, query.account_id.as_deref()).await?,
