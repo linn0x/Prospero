@@ -499,7 +499,7 @@ kbd {
 .workspace-symbol { grid-row: 1 / span 2; display: grid; width: 34px; height: 34px; place-items: center; color: var(--primary); border-radius: var(--ui-radius-panel); background: var(--primary-soft); }
 .workspace-symbol svg { width: 16px; height: 16px; }
 .status-mark { display: inline-block; flex: none; width: 7px; height: 7px; border-radius: 999px; background: var(--muted-foreground); transform-origin: center; }
-.status-mark[data-state="completed"], .status-mark[data-state="running"] { background: var(--success); }
+.status-mark[data-state="completed"], .status-mark[data-state="idle"], .status-mark[data-state="running"] { background: var(--success); }
 .status-mark[data-state="terminated"] { background: var(--danger); }
 .status-mark[data-state="approval"], .status-mark[data-state="input"] { background: var(--primary); }
 .status-mark[data-motion="breathe"] { animation: session-status-breathe 2s ease-in-out infinite; }

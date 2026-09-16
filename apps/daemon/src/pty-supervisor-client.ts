@@ -300,6 +300,7 @@ export function readPtySupervisorManifest(file: string): PtySupervisorManifest |
       manifest.tokenFile !== "token" || typeof manifest.lifecycleEpoch !== "string" || manifest.lifecycleEpoch.length === 0 ||
       (manifest.ownerState !== "active" && manifest.ownerState !== "killed" && manifest.ownerState !== "failed") ||
       (manifest.status !== undefined && (typeof manifest.status !== "string" || !SESSION_STATUSES.has(manifest.status))) ||
+      (manifest.busySince !== undefined && (!Number.isSafeInteger(manifest.busySince) || manifest.busySince < 0)) ||
       (manifest.sessionDir !== undefined && (typeof manifest.sessionDir !== "string" || !path.isAbsolute(manifest.sessionDir))) ||
       (manifest.supervisorPid !== undefined && (!Number.isSafeInteger(manifest.supervisorPid) || manifest.supervisorPid <= 1)) ||
       (manifest.updatedAt !== undefined && !Number.isSafeInteger(manifest.updatedAt))
@@ -321,6 +322,7 @@ function initialInfo(manifest: PtySupervisorManifest, available: boolean): Sessi
     rows: manifest.rows,
     ...(manifest.accountId ? { accountId: manifest.accountId } : {}),
     ...(manifest.accountName ? { accountName: manifest.accountName } : {}),
+    ...(manifest.busySince !== undefined ? { busySince: manifest.busySince } : {}),
   };
 }
 

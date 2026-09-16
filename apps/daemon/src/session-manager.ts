@@ -164,6 +164,20 @@ interface PtyMeta {
   accountName?: string;
 }
 
+function basenameOrPath(value: string): string {
+  return path.basename(value) || value;
+}
+
+function ptyAgentFromCommand(command: string): AgentKind {
+  const value = command.toLowerCase();
+  if (/(^|[\s/])claude(\s|$)/.test(value)) return "claude";
+  if (/(^|[\s/])codex(\s|$)/.test(value)) return "codex";
+  if (/(^|[\s/])opencode(\s|$)/.test(value)) return "opencode";
+  if (/(^|[\s/])grok(\s|$)/.test(value)) return "grok";
+  if (/(^|[\s/])trae(\s|$)/.test(value)) return "trae";
+  return "custom";
+}
+
 export interface SessionManagerOptions {
   /** 结构化会话事件与原生恢复 ID 的持久化目录。 */
   home?: string | undefined;
@@ -322,7 +336,22 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       return [];
     }
     const restored: SessionInfo[] = [];
-    for (const meta of this.loadMeta()) {
+    const metaById = new Map(this.loadMeta().map((meta) => [meta.id, meta]));
+    const controlSock = path.join(path.dirname(this.metaFile), "control.sock");
+    for (const live of tmux.listLiveSessions()) {
+      if (alive.has(live.id) && !metaById.has(live.id) && live.controlSock === controlSock) {
+        const agent = ptyAgentFromCommand(`${live.startCommand} ${live.command}`);
+        metaById.set(live.id, {
+          id: live.id,
+          agent,
+          title: `${agent} · ${basenameOrPath(live.cwd)}`,
+          cwd: live.cwd,
+          cols: 120,
+          rows: 40,
+        });
+      }
+    }
+    for (const meta of metaById.values()) {
       if (this.deletedSessionIds.has(meta.id) || !alive.has(meta.id) || this.ptySessions.has(meta.id)) continue;
       try {
         // `new-session -A` 存在即 attach,所以恢复和新建走同一条命令

@@ -586,6 +586,7 @@ export class StateStore extends EventEmitter {
     this.archivedSessionIds = archived
       ? [...new Set([...this.archivedSessionIds, sessionId])]
       : this.archivedSessionIds.filter((id) => id !== sessionId);
+    if (archived) this.pinnedSessionIds = this.pinnedSessionIds.filter((id) => id !== sessionId);
     this.saveDesktopState();
     this.changed();
     return this.snapshot();

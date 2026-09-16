@@ -36,6 +36,8 @@ const INPUT_CHUNK = 1024; // >1KB 粘贴经 PTY 有死锁报告,分片写入
 const KILL_ESCALATION_MS = 500;
 // 要盖过 SIGKILL 升级,否则 dispose 会在升级生效前就放弃等待。
 const DISPOSE_EXIT_TIMEOUT_MS = 2_000;
+const ACTIVITY_IDLE_MS = 30_000;
+const ACTIVITY_TAIL_LINES = 10;
 
 export interface PtySessionOptions {
   id: string;
@@ -80,6 +82,7 @@ export class PtySession extends EventEmitter<PtySessionEvents> {
   private rows: number;
   private status: SessionStatus = "starting";
   private exited = false;
+  private disposed = false;
   /** onExit 落地时 resolve;dispose() 借它等子进程真正退出而不是只发完信号。 */
   private resolveExit!: () => void;
   private readonly exitPromise = new Promise<void>((resolve) => { this.resolveExit = resolve; });
@@ -92,6 +95,8 @@ export class PtySession extends EventEmitter<PtySessionEvents> {
   private pendingBytes = 0;
   private flushTimer: NodeJS.Timeout | null = null;
   private killEscalationTimer: NodeJS.Timeout | null = null;
+  private activityTimer: NodeJS.Timeout | null = null;
+  private busySince: number | undefined;
   /** 终端查询序列可能跨 chunk 断裂,保留尾部少量字节做拼接匹配 */
   private queryCarry = "";
 
@@ -129,6 +134,7 @@ export class PtySession extends EventEmitter<PtySessionEvents> {
     this.proc.onExit(({ exitCode }) => {
       this.flushNow();
       this.exited = true;
+      this.clearActivity(false);
       this.setStatus(exitCode === 0 ? "done" : "died");
       this.resolveExit();
     });
@@ -151,6 +157,7 @@ export class PtySession extends EventEmitter<PtySessionEvents> {
       rows: this.rows,
       ...(this.accountId ? { accountId: this.accountId } : {}),
       ...(this.accountName ? { accountName: this.accountName } : {}),
+      ...(this.busySince !== undefined ? { busySince: this.busySince } : {}),
     };
   }
 
@@ -163,7 +170,11 @@ export class PtySession extends EventEmitter<PtySessionEvents> {
   private onProcData(data: string): void {
     if (this.status === "starting") this.setStatus("running");
     // 查询应答放在 term.write 回调里:此时 headless 终端已消化该块,光标位置准确
-    this.term.write(data, () => this.answerTerminalQueries(data));
+    this.term.write(data, () => {
+      if (this.disposed) return;
+      this.answerTerminalQueries(data);
+      this.updateOutputActivity();
+    });
     this.pending.push(data);
     this.pendingBytes += data.length;
     if (this.flushTimer === null) {
@@ -204,6 +215,7 @@ export class PtySession extends EventEmitter<PtySessionEvents> {
   /** 客户端键盘输入(base64 的 utf8 字节) */
   writeInput(text: string): void {
     if (this.exited) return;
+    this.markActivity();
     for (let i = 0; i < text.length; i += INPUT_CHUNK) {
       this.proc.write(text.slice(i, i + INPUT_CHUNK));
     }
@@ -219,7 +231,10 @@ export class PtySession extends EventEmitter<PtySessionEvents> {
   }
 
   interrupt(): void {
-    if (!this.exited) this.proc.write("\x03");
+    if (!this.exited) {
+      this.markActivity();
+      this.proc.write("\x03");
+    }
   }
 
   kill(): void {
@@ -259,10 +274,59 @@ export class PtySession extends EventEmitter<PtySessionEvents> {
    * 不该因为一个赖着不走的子进程而永久挂住。
    */
   async dispose(): Promise<void> {
+    this.disposed = true;
     this.kill();
     await this.waitForExit();
+    this.clearActivity(false);
     this.term.dispose();
     this.removeAllListeners();
+  }
+
+  private markActivity(): void {
+    if (this.exited || this.disposed) return;
+    const wasIdle = this.busySince === undefined;
+    this.busySince ??= Date.now();
+    if (this.activityTimer) clearTimeout(this.activityTimer);
+    this.activityTimer = setTimeout(() => this.clearActivity(), ACTIVITY_IDLE_MS);
+    this.activityTimer.unref?.();
+    if (wasIdle) this.emit("state", this.info());
+  }
+
+  private clearActivity(emit = true): void {
+    if (this.activityTimer) {
+      clearTimeout(this.activityTimer);
+      this.activityTimer = null;
+    }
+    if (this.busySince === undefined) return;
+    this.busySince = undefined;
+    if (emit) this.emit("state", this.info());
+  }
+
+  private updateOutputActivity(): void {
+    if (this.exited || this.disposed) return;
+    if (this.screenLooksIdle()) this.clearActivity();
+    else this.markActivity();
+  }
+
+  private screenLooksIdle(): boolean {
+    const text = this.visibleTailText();
+    if (text.trim() === "") return true;
+    if (/\b(?:esc to interrupt|ctrl-c to quit|background terminal running)\b/i.test(text)) return false;
+    return /\bAsk Codex to do anything\b/i.test(text) ||
+      /\bnew task\? \/clear\b/i.test(text) ||
+      /(?:^|\n)\s*(?:\u276f|\u203a)\s*(?:\n|$)/.test(text);
+  }
+
+  private visibleTailText(): string {
+    const buffer = this.term.buffer.active;
+    const end = Math.min(buffer.length, buffer.baseY + this.rows);
+    const start = Math.max(0, end - ACTIVITY_TAIL_LINES);
+    const lines: string[] = [];
+    for (let y = start; y < end; y++) {
+      const line = buffer.getLine(y);
+      if (line) lines.push(line.translateToString(true));
+    }
+    return lines.join("\n");
   }
 
   private async waitForExit(): Promise<void> {

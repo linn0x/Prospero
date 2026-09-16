@@ -90,6 +90,7 @@ import {
   parseExpandedProjects,
   projectForSession,
   restoredSessionIds,
+  sidebarProjectSessions,
   sessionRestoreRetryDelay,
   sortProjectsByRecentActivity,
   sortSidebarSessions,
@@ -458,7 +459,7 @@ const PinnedSessionRow = memo(function PinnedSessionRow({
       >
         <SessionAgentIcon agent={session.agent} />
         <span className="workspace-session-copy"><strong>{sessionLabel(session)}</strong></span>
-        <StatusMark status={session.status} unread={unread} pendingPermissions={session.pendingPermissions} pendingQuestions={session.pendingQuestions} />
+        <StatusMark status={session.status} unread={unread} pendingPermissions={session.pendingPermissions} pendingQuestions={session.pendingQuestions} busySince={session.busySince} />
       </SidebarMenuButton>
       <SidebarMenuAction
         showOnHover
@@ -522,7 +523,7 @@ const WorkspaceSessionRow = memo(function WorkspaceSessionRow({
           <span className="workspace-session-copy">
             <strong>{sessionLabel(session)}</strong>
           </span>
-          <StatusMark status={session.status} unread={unread} pendingPermissions={session.pendingPermissions} pendingQuestions={session.pendingQuestions} />
+          <StatusMark status={session.status} unread={unread} pendingPermissions={session.pendingPermissions} pendingQuestions={session.pendingQuestions} busySince={session.busySince} />
         </ContextMenuTrigger>
         <ContextMenuContent>
           <ContextMenuGroup>
@@ -1050,8 +1051,9 @@ function ShellSidebar({
     for (const session of pinnedPage?.items ?? []) byId.set(session.id, session);
     return snapshot.pinnedSessionIds
       .map((id) => byId.get(id))
-      .filter((session): session is SessionInfo => Boolean(session));
-  }, [pinnedPage?.items, sessionsById, snapshot.pinnedSessionIds]);
+      .filter((session): session is SessionInfo => Boolean(session))
+      .filter((session) => !snapshot.archivedSessionIds.includes(session.id));
+  }, [pinnedPage?.items, sessionsById, snapshot.archivedSessionIds, snapshot.pinnedSessionIds]);
   const searchSessions = useMemo(() => {
     if (!normalizedSessionQuery) return [];
     const byId = new Map<string, SessionInfo>();
@@ -1264,19 +1266,12 @@ function ShellSidebar({
     const managedWorkspace = managedLayout.byPath.get(project)?.workspace;
     const childGroups = managedLayout.groups.filter((group) => group.project === project);
     const sessions = sessionsByProject.get(project) ?? [];
-    const projectSessionCount = sessions.length + childGroups.reduce((total, group) => total + group.workspaces.reduce(
-      (count, workspace) => count + (sessionsByProject.get(workspace.path)?.length ?? 0), 0,
-    ), 0);
     // 归档的会话从主列表收起。搜索时不过滤 —— 明确搜某个东西的人
     // 是想找到它,而不是被"你把它归档过"挡回来。
-    const matchingSessions = filterSessionsByQuery(
-      normalizedSessionQuery
-        ? sessions
-        : sessions.filter(
-            (item) => item.id === activeId || !snapshot.archivedSessionIds.includes(item.id),
-          ),
-      normalizedSessionQuery,
-    );
+    const matchingSessions = sidebarProjectSessions(sessions, snapshot.archivedSessionIds, normalizedSessionQuery);
+    const projectSessionCount = matchingSessions.length + childGroups.reduce((total, group) => total + group.workspaces.reduce(
+      (count, workspace) => count + sidebarProjectSessions(sessionsByProject.get(workspace.path) ?? [], snapshot.archivedSessionIds, normalizedSessionQuery).length, 0,
+    ), 0);
     if (normalizedSessionQuery && matchingSessions.length === 0)
       return null;
     const fallback =
@@ -2222,7 +2217,7 @@ function OverviewPane({
                       {sessionLabel(session)}
                     </strong>
                     <small>
-                      <StatusMark status={session.status} />
+                      <StatusMark status={session.status} busySince={session.busySince} />
                       {session.agent} · {status(session.status)} ·{" "}
                       {shortPath(session.cwd)}
                     </small>
@@ -2824,7 +2819,7 @@ function AgentsPane({
                       key={session.id}
                       onClick={() => onOpenSession(session.id)}
                     >
-                      <StatusMark status={session.status} />
+                      <StatusMark status={session.status} busySince={session.busySince} />
                       <span className="truncate">{sessionLabel(session)}</span>
                       <ChevronRight />
                     </button>

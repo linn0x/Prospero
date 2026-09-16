@@ -213,6 +213,41 @@ export function listSessions(): string[] {
     .map((line) => line.slice(PREFIX.length));
 }
 
+export interface LiveSession {
+  id: string;
+  command: string;
+  startCommand: string;
+  controlSock: string;
+  cwd: string;
+}
+
+export function listLiveSessions(): LiveSession[] {
+  const tmux = tmuxPath();
+  if (!tmux) return [];
+  const result = spawnSync(tmux, [
+    "list-panes",
+    "-a",
+    "-F",
+    "#{session_name}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_dead}\t#{PROSPERO_CONTROL_SOCK}\t#{pane_start_command}",
+  ], { encoding: "utf8" });
+  if (result.status !== 0 || !result.stdout) return [];
+  return result.stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .flatMap((line) => {
+      const [name, command, cwd, dead, controlSock, ...start] = line.split("\t");
+      if (!name?.startsWith(PREFIX) || dead !== "0") return [];
+      return [{
+        id: name.slice(PREFIX.length),
+        command: command ?? "",
+        cwd: cwd || process.cwd(),
+        controlSock: controlSock ?? "",
+        startCommand: start.join("\t"),
+      }];
+    });
+}
+
 /** 真正结束一个会话 —— 关 PTY 只是断开 client,进程还在 tmux 里活着。 */
 export function killSession(id: string): void {
   const tmux = tmuxPath();

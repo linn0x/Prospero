@@ -440,8 +440,43 @@ describe("结构化会话持久化", () => {
       firstClosed = true;
 
       second = await createDaemonServer({ home, port: 0, useTmux: true });
-      expect(second.restoredSessions).toBe(1);
+      expect(second.restoredSessions).toBeGreaterThanOrEqual(1);
       expect(second.manager.infoOf(sid).kind).toBe("pty");
+      await second.manager.kill(sid);
+      sid = "";
+    } finally {
+      if (!firstClosed) await first?.close();
+      await second?.close();
+      if (sid) killSession(sid);
+    }
+  });
+
+  it("PTY tmux 元数据缺失时仍从 live tmux 会话兜底恢复", async () => {
+    if (!tmuxPath()) return;
+    const home = tempHome();
+    let first: DaemonServer | null = null;
+    let second: DaemonServer | null = null;
+    let firstClosed = false;
+    let sid = "";
+    try {
+      first = await createDaemonServer({ home, port: 0, useTmux: true });
+      const created = await first.manager.create({
+        agent: "custom",
+        command: "printf 'LIVE_TMUX\\n'; sleep 30",
+        cwd: home,
+        cols: 80,
+        rows: 24,
+        allowShell: true,
+      });
+      sid = created.id;
+      await waitFor(() => readFileSync(path.join(home, "pty-sessions.json"), "utf8").includes(sid), "pty metadata");
+      writeFileSync(path.join(home, "pty-sessions.json"), "[]");
+      await first.close();
+      firstClosed = true;
+
+      second = await createDaemonServer({ home, port: 0, useTmux: true });
+      expect(second.restoredSessions).toBeGreaterThanOrEqual(1);
+      expect(second.manager.infoOf(sid)).toMatchObject({ id: sid, kind: "pty" });
       await second.manager.kill(sid);
       sid = "";
     } finally {

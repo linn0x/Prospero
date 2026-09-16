@@ -160,6 +160,17 @@ export function filterSessionsByQuery(
   return matches.slice(0, Math.max(0, limit));
 }
 
+export function sidebarProjectSessions(
+  sessions: SessionInfo[],
+  archivedSessionIds: string[],
+  query: string,
+): SessionInfo[] {
+  return filterSessionsByQuery(
+    query ? sessions : sessions.filter((session) => !archivedSessionIds.includes(session.id)),
+    query,
+  );
+}
+
 export function nextSidebarSessionLimit(
   currentLimit: number,
   total: number,

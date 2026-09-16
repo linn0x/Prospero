@@ -5,6 +5,7 @@ const sessions: PtySession[] = [];
 
 afterEach(async () => {
   await Promise.all(sessions.splice(0).map((session) => session.dispose()));
+  vi.restoreAllMocks();
 });
 
 describe("PtySession snapshot", () => {
@@ -69,5 +70,66 @@ describe("PtySession snapshot", () => {
 
     expect(snapshot.ansi).toContain("line-01");
     expect(snapshot.ansi).toContain("line-20");
+  });
+
+  it("marks recent PTY activity and clears it after idle", () => {
+    const session = new PtySession({
+      id: "activity",
+      agent: "custom",
+      title: "activity",
+      cwd: process.cwd(),
+      cols: 80,
+      rows: 24,
+      file: process.execPath,
+      args: ["-e", "setInterval(() => {}, 1000)"],
+      env: { PATH: process.env.PATH ?? "" },
+    });
+    sessions.push(session);
+    const internals = session as unknown as {
+      onProcData(data: string): void;
+      clearActivity(): void;
+      visibleTailText(): string;
+      term: { write(data: string, callback?: () => void): void };
+    };
+    vi.spyOn(internals.term, "write").mockImplementation((_data, callback) => callback?.());
+    vi.spyOn(internals, "visibleTailText").mockReturnValue("Inspecting files (2s · esc to interrupt)");
+
+    expect(session.info().busySince).toBeUndefined();
+    internals.onProcData("output");
+    expect(session.info().busySince).toBeTypeOf("number");
+    internals.clearActivity();
+    expect(session.info().busySince).toBeUndefined();
+  });
+
+  it("clears PTY activity after an idle prompt repaint", () => {
+    const session = new PtySession({
+      id: "idle-prompt",
+      agent: "custom",
+      title: "idle-prompt",
+      cwd: process.cwd(),
+      cols: 80,
+      rows: 24,
+      file: process.execPath,
+      args: ["-e", "setInterval(() => {}, 1000)"],
+      env: { PATH: process.env.PATH ?? "" },
+    });
+    sessions.push(session);
+    const internals = session as unknown as {
+      onProcData(data: string): void;
+      visibleTailText(): string;
+      term: { write(data: string, callback?: () => void): void };
+    };
+    vi.spyOn(internals.term, "write").mockImplementation((_data, callback) => callback?.());
+    const tail = vi.spyOn(internals, "visibleTailText");
+
+    tail.mockReturnValue("Inspecting files (2s · esc to interrupt)");
+    internals.onProcData("work");
+    expect(session.info().busySince).toBeTypeOf("number");
+    tail.mockReturnValue("new task? /clear to save 1k tokens\n>");
+    internals.onProcData("idle");
+    expect(session.info().busySince).toBeUndefined();
+    tail.mockReturnValue("");
+    internals.onProcData("blank");
+    expect(session.info().busySince).toBeUndefined();
   });
 });

@@ -73,11 +73,11 @@ function manifestFile(config: RunnerConfig): string {
   return path.join(config.sessionDir, "manifest.json");
 }
 
-function updateManifest(config: RunnerConfig, patch: Partial<PtySupervisorManifest>): void {
+function updateManifest(config: RunnerConfig, patch: Omit<Partial<PtySupervisorManifest>, "busySince"> & { busySince?: number | undefined }): void {
   const file = manifestFile(config);
   let current: PtySupervisorManifest | null = null;
   try { current = JSON.parse(readFileSync(file, "utf8")) as PtySupervisorManifest; } catch { /* launcher owns immutable seed */ }
-  privateWrite(file, {
+  const next: Record<string, unknown> = {
     ...(current ?? {
       version: PTY_SUPERVISOR_MANIFEST_VERSION,
       protocolVersion: PTY_SUPERVISOR_PROTOCOL_VERSION,
@@ -97,7 +97,11 @@ function updateManifest(config: RunnerConfig, patch: Partial<PtySupervisorManife
     }),
     ...patch,
     updatedAt: Date.now(),
-  });
+  };
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === undefined) delete next[key];
+  }
+  privateWrite(file, next);
 }
 
 function delay(ms: number): Promise<void> {
@@ -194,7 +198,7 @@ export async function runPtySupervisor(): Promise<void> {
     void closePromise.finally(() => process.exit(0));
     return closePromise;
   };
-  session.on("state", (info) => updateManifest(config, { status: info.status }));
+  session.on("state", (info) => updateManifest(config, { status: info.status, busySince: info.busySince }));
   supervisor = await startPtySupervisor({
     socketPath: config.socketPath,
     token,
