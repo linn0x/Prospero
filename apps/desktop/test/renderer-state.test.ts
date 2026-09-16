@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { DesktopSnapshot, DesktopSnapshotPatch } from "../src/shared/types";
 import {
   desktopSnapshotFromPatch,
+  isMissingSessionError,
   shortPath,
 } from "../src/renderer/src/state";
 
@@ -69,5 +70,11 @@ describe("renderer snapshot state", () => {
   it("preserves the source path separator", () => {
     expect(shortPath("/Users/name/project")).toBe("name/project");
     expect(shortPath("C:\\code\\project")).toBe("code\\project");
+  });
+
+  it("recognizes daemon missing-session errors", () => {
+    expect(isMissingSessionError(new Error("no such session: stale"))).toBe(true);
+    expect(isMissingSessionError("session_not_found")).toBe(true);
+    expect(isMissingSessionError(new Error("daemon offline"))).toBe(false);
   });
 });

@@ -8,7 +8,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import type { SessionInfo } from "../../shared/types";
-import { reportError, number, text } from "./state";
+import { isMissingSessionError, reportError, number, text } from "./state";
 import { useLocale } from "./locale";
 import {
   deleteTerminalSessionCache,
@@ -132,7 +132,7 @@ export function terminalBootstrapCursor(cachedCursor?: number): number {
   return typeof cachedCursor === "number" && Number.isSafeInteger(cachedCursor) && cachedCursor >= 0 ? cachedCursor : 0;
 }
 
-export function TerminalPane({ session, fontFamily, fontSize, active = true }: { session: SessionInfo; fontFamily: string; fontSize: number; active?: boolean }) {
+export function TerminalPane({ session, fontFamily, fontSize, active = true, onMissingSession }: { session: SessionInfo; fontFamily: string; fontSize: number; active?: boolean; onMissingSession?: (id: string) => void }) {
   const { t } = useLocale();
   const tRef = useRef(t);
   tRef.current = t;
@@ -177,6 +177,10 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true }: {
         return true;
       })
       .catch((reason): false => {
+        if (isMissingSessionError(reason)) {
+          onMissingSession?.(session.id);
+          return false;
+        }
         connectedRef.current = false;
         if (terminalRef.current) terminalRef.current.options.disableStdin = true;
         setConnected(false);
@@ -186,7 +190,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true }: {
       });
     interactionChain.current = result.then(() => undefined);
     return result;
-  }, [session.id]);
+  }, [onMissingSession, session.id]);
   /// 提示统一走这里:直接 setNotice 的话没有定时清除,那条提示会一直挂在屏幕上。
   const showNotice = useCallback((message: string): void => {
     setNotice(message);
@@ -600,6 +604,10 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true }: {
           setConnectionError(undefined);
         } catch (reason) {
           if (!isCurrent()) break;
+          if (isMissingSessionError(reason)) {
+            onMissingSession?.(session.id);
+            break;
+          }
           waitForOutput = false;
           connectedRef.current = false;
           if (terminalRef.current) terminalRef.current.options.disableStdin = true;
@@ -620,7 +628,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true }: {
       if (terminalRef.current) terminalRef.current.options.disableStdin = true;
       void window.prospero.cancelSessionView(session.id).catch(() => undefined);
     };
-  }, [queueInteraction, session.id]);
+  }, [onMissingSession, queueInteraction, session.id]);
 
   const runFind = (backwards: boolean): void => {
     const value = findText.trim();

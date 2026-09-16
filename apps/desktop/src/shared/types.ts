@@ -305,6 +305,7 @@ export type DesktopApi = import("./project-tools").ProjectToolsApi & {
   setSessionPinned(sessionId: string, pinned: boolean): Promise<DesktopSnapshot>;
   setSessionArchived(sessionId: string, archived: boolean): Promise<DesktopSnapshot>;
   setSessionUnread(sessionId: string, unread: boolean): Promise<DesktopSnapshot>;
+  forgetMissingSession(sessionId: string): Promise<DesktopSnapshot>;
   renameSession(sessionId: string, title: string): Promise<DesktopSnapshot>;
   revealPath(path: string): Promise<{ ok: boolean; error?: string }>;
   openWindowsTerminal(path: string): Promise<{ ok: boolean; error?: string }>;

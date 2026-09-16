@@ -21,7 +21,7 @@ import { sessionLabel } from "./session-presentation";
 const ChatPane = lazy(() => import("../ChatPane").then((module) => ({ default: module.ChatPane })));
 const TerminalPane = lazy(() => import("../TerminalPane").then((module) => ({ default: module.TerminalPane })));
 
-function WorkspaceSession({ session, openSessions, snapshot, focus, onOpenRun, onToggleFocus, empty }: { session: SessionInfo | undefined; openSessions: SessionInfo[]; empty?: ReactNode; snapshot: DesktopSnapshot; focus: boolean; onOpenRun: (id?: string) => void; onToggleFocus: () => void }) {
+function WorkspaceSession({ session, openSessions, snapshot, focus, onOpenRun, onToggleFocus, onMissingSession, empty }: { session: SessionInfo | undefined; openSessions: SessionInfo[]; empty?: ReactNode; snapshot: DesktopSnapshot; focus: boolean; onOpenRun: (id?: string) => void; onToggleFocus: () => void; onMissingSession: (id: string) => void }) {
   const { t } = useLocale();
   const host = useRef<HTMLDivElement>(null);
   const [available, setAvailable] = useState(0);
@@ -122,8 +122,8 @@ function WorkspaceSession({ session, openSessions, snapshot, focus, onOpenRun, o
       <main id="workspace-session-panel" role="tabpanel" aria-labelledby={chromeVisible && session ? `workspace-tab-${session.id}` : undefined} aria-label={focus && session ? sessionLabel(session) : undefined} className="workspace-primary">
         {toolbar}
         <Suspense fallback={<div className="dock-empty" role="status">{t("正在加载会话…", "Loading session…")}</div>}>
-          {terminalSessions.map((item) => <TerminalPane key={item.id} session={item} fontFamily={snapshot.settings.terminalFontFamily} fontSize={snapshot.settings.terminalFontSize} active={item.id === session?.id} />)}
-          {!session ? empty : session.kind === "structured" ? <ChatPane key={session.id} session={session} account={account} trajectoryHost={trajectory ? trajectoryHost : null} onOpenGoal={() => onOpenRun(text(dispatch?.["runId"]) || undefined)} /> : null}
+          {terminalSessions.map((item) => <TerminalPane key={item.id} session={item} fontFamily={snapshot.settings.terminalFontFamily} fontSize={snapshot.settings.terminalFontSize} active={item.id === session?.id} onMissingSession={onMissingSession} />)}
+          {!session ? empty : session.kind === "structured" ? <ChatPane key={session.id} session={session} account={account} trajectoryHost={trajectory ? trajectoryHost : null} onOpenGoal={() => onOpenRun(text(dispatch?.["runId"]) || undefined)} onMissingSession={onMissingSession} /> : null}
         </Suspense>
       </main>
       {visible && !overlay && <>
@@ -162,7 +162,7 @@ function WorkspaceSession({ session, openSessions, snapshot, focus, onOpenRun, o
   </div>;
 }
 
-export function WorkspacePane({ snapshot, activeId, openIds, onNewSession, onOpenRun, onToggleFocus, onAddWorkspace, focus }: { snapshot: DesktopSnapshot; activeId: string | undefined; openIds: string[]; onActivate: (id: string) => void; onClose: (id: string) => void; onNewSession: (project?: string) => void; onOpenRun: (id?: string) => void; onTogglePin: (id: string) => void; onToggleFocus: () => void; onAddWorkspace: () => void; focus: boolean }) {
+export function WorkspacePane({ snapshot, activeId, openIds, onNewSession, onOpenRun, onToggleFocus, onAddWorkspace, onMissingSession, focus }: { snapshot: DesktopSnapshot; activeId: string | undefined; openIds: string[]; onActivate: (id: string) => void; onClose: (id: string) => void; onNewSession: (project?: string) => void; onOpenRun: (id?: string) => void; onTogglePin: (id: string) => void; onToggleFocus: () => void; onAddWorkspace: () => void; onMissingSession: (id: string) => void; focus: boolean }) {
   const { t } = useLocale();
   const session = snapshot.daemon.sessions.find((item) => item.id === activeId);
   const openSessions = [
@@ -170,6 +170,6 @@ export function WorkspacePane({ snapshot, activeId, openIds, onNewSession, onOpe
     ...(session && !openIds.includes(session.id) ? [session] : []),
   ];
   return <div className="workspace-view workspace-view-single">
-    {<WorkspaceSession session={session} openSessions={openSessions} snapshot={snapshot} focus={focus} onOpenRun={onOpenRun} onToggleFocus={onToggleFocus} empty={<Empty className="workspace-empty"><EmptyHeader><EmptyMedia variant="icon"><FolderKanban /></EmptyMedia><EmptyTitle>{t("选择工作上下文", "Choose a work context")}</EmptyTitle><EmptyDescription>{t("打开已有会话，或在项目中创建新的 Agent 会话。", "Open an existing session or create a new agent session in a project.")}</EmptyDescription></EmptyHeader><EmptyContent><Button onClick={() => onNewSession()}><Plus />{t("新建会话", "New session")}</Button><Button variant="outline" onClick={onAddWorkspace}><FolderPlus />{t("添加工作区", "Add workspace")}</Button></EmptyContent></Empty>} />}
+    {<WorkspaceSession session={session} openSessions={openSessions} snapshot={snapshot} focus={focus} onOpenRun={onOpenRun} onToggleFocus={onToggleFocus} onMissingSession={onMissingSession} empty={<Empty className="workspace-empty"><EmptyHeader><EmptyMedia variant="icon"><FolderKanban /></EmptyMedia><EmptyTitle>{t("选择工作上下文", "Choose a work context")}</EmptyTitle><EmptyDescription>{t("打开已有会话，或在项目中创建新的 Agent 会话。", "Open an existing session or create a new agent session in a project.")}</EmptyDescription></EmptyHeader><EmptyContent><Button onClick={() => onNewSession()}><Plus />{t("新建会话", "New session")}</Button><Button variant="outline" onClick={onAddWorkspace}><FolderPlus />{t("添加工作区", "Add workspace")}</Button></EmptyContent></Empty>} />}
   </div>;
 }

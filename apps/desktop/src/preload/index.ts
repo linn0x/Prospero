@@ -54,6 +54,7 @@ const api: DesktopApi = {
   setSessionPinned: (sessionId: string, pinned: boolean) => ipcRenderer.invoke("session:pin", sessionId, pinned),
   setSessionArchived: (sessionId: string, archived: boolean) => ipcRenderer.invoke("session:archive", sessionId, archived),
   setSessionUnread: (sessionId: string, unread: boolean) => ipcRenderer.invoke("session:unread", sessionId, unread),
+  forgetMissingSession: (sessionId: string) => ipcRenderer.invoke("session:missing", sessionId),
   renameSession: (sessionId: string, title: string) => ipcRenderer.invoke("session:rename", sessionId, title),
   revealPath: (path: string) => ipcRenderer.invoke("path:reveal", path),
   openWindowsTerminal: (path: string) => ipcRenderer.invoke("path:terminal", path),

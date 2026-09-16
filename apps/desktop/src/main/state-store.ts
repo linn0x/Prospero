@@ -582,7 +582,10 @@ export class StateStore extends EventEmitter {
   /// 归档只是桌面端的一个本地标记 —— 会话本身照常在 daemon 里活着,
   /// 只是从侧栏主列表里收进"已归档"分组。想真正结束会话请用"结束会话"。
   setSessionArchived(sessionId: string, archived: boolean): DesktopSnapshot {
-    if (!this.isKnownSession(sessionId)) throw new Error("会话不存在");
+    if (!this.isKnownSession(sessionId)) {
+      if (!archived && this.archivedSessionIds.includes(sessionId)) return this.forgetMissingSession(sessionId);
+      throw new Error("会话不存在");
+    }
     this.archivedSessionIds = archived
       ? [...new Set([...this.archivedSessionIds, sessionId])]
       : this.archivedSessionIds.filter((id) => id !== sessionId);
@@ -593,7 +596,10 @@ export class StateStore extends EventEmitter {
   }
 
   setSessionPinned(sessionId: string, pinned: boolean): DesktopSnapshot {
-    if (!this.isKnownSession(sessionId)) throw new Error("会话不存在");
+    if (!this.isKnownSession(sessionId)) {
+      if (!pinned && this.pinnedSessionIds.includes(sessionId)) return this.forgetMissingSession(sessionId);
+      throw new Error("会话不存在");
+    }
     this.pinnedSessionIds = pinned
       ? [...new Set([...this.pinnedSessionIds, sessionId])]
       : this.pinnedSessionIds.filter((id) => id !== sessionId);
@@ -603,7 +609,10 @@ export class StateStore extends EventEmitter {
   }
 
   setSessionUnread(sessionId: string, unread: boolean): DesktopSnapshot {
-    if (!this.isKnownSession(sessionId)) throw new Error("会话不存在");
+    if (!this.isKnownSession(sessionId)) {
+      if (!unread && this.unreadSessionIds.includes(sessionId)) return this.forgetMissingSession(sessionId);
+      throw new Error("会话不存在");
+    }
     this.unreadSessionIds = unread
       ? [...new Set([...this.unreadSessionIds, sessionId])]
       : this.unreadSessionIds.filter((id) => id !== sessionId);
@@ -664,6 +673,40 @@ export class StateStore extends EventEmitter {
     this.sessionTitles = sessionTitles;
     this.saveDesktopState();
     this.changed();
+  }
+
+  forgetMissingSession(sessionId: string): DesktopSnapshot {
+    if (!SAFE_PERSISTED_SESSION_ID.test(sessionId)) throw new Error("会话无效");
+    let changed = this.hydratedSessionIds.delete(sessionId);
+    let persisted = false;
+    const pinnedSessionIds = this.pinnedSessionIds.filter((id) => id !== sessionId);
+    const archivedSessionIds = this.archivedSessionIds.filter((id) => id !== sessionId);
+    const unreadSessionIds = this.unreadSessionIds.filter((id) => id !== sessionId);
+    if (pinnedSessionIds.length !== this.pinnedSessionIds.length) {
+      this.pinnedSessionIds = pinnedSessionIds;
+      changed = true;
+      persisted = true;
+    }
+    if (archivedSessionIds.length !== this.archivedSessionIds.length) {
+      this.archivedSessionIds = archivedSessionIds;
+      changed = true;
+      persisted = true;
+    }
+    if (unreadSessionIds.length !== this.unreadSessionIds.length) {
+      this.unreadSessionIds = unreadSessionIds;
+      changed = true;
+      persisted = true;
+    }
+    if (sessionId in this.sessionTitles) {
+      const sessionTitles = { ...this.sessionTitles };
+      delete sessionTitles[sessionId];
+      this.sessionTitles = sessionTitles;
+      changed = true;
+      persisted = true;
+    }
+    if (persisted) this.saveDesktopState();
+    if (changed) this.changed();
+    return this.snapshot();
   }
 
   /** Registers paged historical session rows without widening the live snapshot. */

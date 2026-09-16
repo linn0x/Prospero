@@ -73,7 +73,7 @@ import {
   loadAccountUsage,
   prefetchAccountUsage,
 } from "./account-usage-cache";
-import { reportError, shortPath, text } from "./state";
+import { isMissingSessionError, reportError, shortPath, text } from "./state";
 import { installLiquidGlass } from "./liquid-glass";
 import { useLocale, type Language } from "./locale";
 import {
@@ -3962,6 +3962,9 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
           ...snapshotRef.current.daemon.sessions.map((session) => session.id),
           ...page.items.map((session) => session.id),
         ]);
+        for (const id of missingIds) {
+          if (!available.has(id)) void window.prospero.forgetMissingSession(id).catch(() => undefined);
+        }
         const restored = new Set(ids);
         setOpenIds((current) =>
           current.filter((id) => !restored.has(id) || available.has(id)),
@@ -4119,6 +4122,13 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     setOpenIds(next);
     if (activeId === id) setActiveId(next[Math.max(0, index - 1)]);
   };
+  const forgetMissingSession = useCallback((id: string): void => {
+    setHydratedSessions((current) => current.filter((session) => session.id !== id));
+    setOpenIds((current) => current.filter((item) => item !== id));
+    setActiveId((current) => current === id ? undefined : current);
+    setEditingSession((current) => current === id ? undefined : current);
+    void window.prospero.forgetMissingSession(id).catch(() => undefined);
+  }, []);
   const openNewSession = useCallback((project?: string): void => {
     if (!project && view === "workspaces" && activeRemote) { setRemoteSessionRequest(request => request + 1); return; }
     setNewSessionProject(project);
@@ -4126,20 +4136,20 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
     setCreateTab("session"); setNewSessionOpen(true);
   }, [activeRemote, view]);
   const toggleArchive = useCallback((id: string): void => {
-    void window.prospero.setSessionArchived(
-      id,
-      !snapshotRef.current.archivedSessionIds.includes(id),
-    );
-  }, []);
+    void window.prospero
+      .setSessionArchived(id, !snapshotRef.current.archivedSessionIds.includes(id))
+      .catch((reason) => isMissingSessionError(reason) ? forgetMissingSession(id) : reportError(reason));
+  }, [forgetMissingSession]);
   const togglePin = useCallback((id: string): void => {
-    void window.prospero.setSessionPinned(
-      id,
-      !snapshotRef.current.pinnedSessionIds.includes(id),
-    );
-  }, []);
+    void window.prospero
+      .setSessionPinned(id, !snapshotRef.current.pinnedSessionIds.includes(id))
+      .catch((reason) => isMissingSessionError(reason) ? forgetMissingSession(id) : reportError(reason));
+  }, [forgetMissingSession]);
   const setUnread = useCallback((id: string, unread: boolean): void => {
-    void window.prospero.setSessionUnread(id, unread);
-  }, []);
+    void window.prospero
+      .setSessionUnread(id, unread)
+      .catch((reason) => isMissingSessionError(reason) ? forgetMissingSession(id) : reportError(reason));
+  }, [forgetMissingSession]);
   const [focus, setFocus] = useState(() => {
     try {
       return localStorage.getItem(FOCUS_STORAGE_KEY) === "true";
@@ -4326,6 +4336,7 @@ export function App({ snapshot }: { snapshot: DesktopSnapshot }) {
                 onTogglePin={togglePin}
                 onToggleFocus={() => setFocus((current) => !current)}
                 onAddWorkspace={openAddWorkspace}
+                onMissingSession={forgetMissingSession}
               /></div>
             ) : view === "runs" ? (
               <OrchestrationPane

@@ -395,6 +395,27 @@ describe("Electron state snapshot caching", () => {
     expect(new StateStore(home).sessionTitle("historical")).toBe("Renamed history");
   });
 
+  it("forgets stale local session references", () => {
+    const home = testHome();
+    const store = new StateStore(home);
+    store.hydrateSessions([{ id: "stale" }]);
+    store.setSessionArchived("stale", true);
+    store.setSessionPinned("stale", true);
+    store.setSessionUnread("stale", true);
+    store.renameSession("stale", "Old session");
+
+    const snapshot = store.forgetMissingSession("stale");
+
+    expect(snapshot.pinnedSessionIds).toEqual([]);
+    expect(snapshot.archivedSessionIds).toEqual([]);
+    expect(snapshot.unreadSessionIds).toEqual([]);
+    expect(store.sessionTitle("stale")).toBeUndefined();
+    expect(store.isKnownSession("stale")).toBe(false);
+    const reloaded = new StateStore(home);
+    expect(reloaded.snapshot().archivedSessionIds).toEqual([]);
+    expect(reloaded.sessionTitle("stale")).toBeUndefined();
+  });
+
   it("archives a session locally without touching the daemon session list", () => {
     // 归档只是桌面端的一个标记:会话仍在 daemon 里活着,只是从侧栏主列表收起。
     // 它必须能持久化,否则重启一次归档就白做了。

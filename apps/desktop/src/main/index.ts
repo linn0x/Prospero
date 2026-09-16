@@ -209,6 +209,12 @@ function sessionPageFromControl(
   };
 }
 
+function isMissingSessionError(error: unknown): boolean {
+  return /(?:^|\b)(?:session_not_found|no such session)\b/i.test(
+    error instanceof Error ? error.message : String(error),
+  );
+}
+
 function applyTheme(settings: DesktopSettings): void {
   nativeTheme.themeSource = settings.theme;
   const dark = nativeTheme.shouldUseDarkColors;
@@ -874,14 +880,15 @@ function installIpc(): void {
   ipcMain.handle("session:pin", (_event, rawId: unknown, pinned: unknown) => {
     const sessionId = requireId(rawId, "会话");
     if (typeof pinned !== "boolean") throw new Error("置顶状态无效");
-    if (!store.isKnownSession(sessionId)) throw new Error("会话不存在");
     return store.setSessionPinned(sessionId, pinned);
   });
   ipcMain.handle("session:unread", (_event, rawId: unknown, unread: unknown) => {
     const sessionId = requireId(rawId, "会话");
     if (typeof unread !== "boolean") throw new Error("会话未读状态无效");
-    if (!store.isKnownSession(sessionId)) throw new Error("会话不存在");
     return store.setSessionUnread(sessionId, unread);
+  });
+  ipcMain.handle("session:missing", (_event, rawId: unknown) => {
+    return store.forgetMissingSession(requireId(rawId, "会话"));
   });
   ipcMain.handle("skills:list", async (_event, rawCwd: unknown) => {
     if (typeof rawCwd !== "string") throw new Error("工作区路径无效");
@@ -1040,6 +1047,7 @@ function installIpc(): void {
       return await runtime.request(`/_prospero/control/session/${encodeURIComponent(sessionId)}/view${params.size ? `?${params}` : ""}`, { signal: controller.signal });
     } catch (error) {
       if (controller.signal.aborted) return null;
+      if (isMissingSessionError(error)) store.forgetMissingSession(sessionId);
       throw error;
     } finally {
       if (sessionViewControllers.get(key) === controller) sessionViewControllers.delete(key);
