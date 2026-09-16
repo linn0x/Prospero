@@ -466,7 +466,7 @@ pub struct StartWorker {
     pub task_id: String,
     #[serde(default = "default_worker_agent")]
     pub agent: crate::protocol::AgentKind,
-    /// Only structured Claude workers are launched today; the wire contract
+    /// Only structured Claude/Codex/DeepSeek workers are launched today; the wire contract
     /// carries the requested agent so unsupported choices fail in Rust instead
     /// of being rejected by the desktop bridge.
     pub cwd: String,

@@ -4,6 +4,7 @@
 //! `CLAUDE_CONFIG_DIR` root under the daemon data directory, so managed
 //! sessions can never silently use the machine's shared Claude identity.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -95,10 +96,10 @@ pub(crate) fn account_root(data: &Path, id: &str) -> Result<PathBuf> {
 }
 
 fn profile_account_root(data: &Path, id: &str, profile: &ApiProfile) -> Result<PathBuf> {
-    let agent = if super::profile::agent_kind(profile) == crate::protocol::AgentKind::Codex {
-        "codex"
-    } else {
-        "claude"
+    let agent = match super::profile::agent_kind(profile) {
+        crate::protocol::AgentKind::Codex => "codex",
+        crate::protocol::AgentKind::Opencode => "opencode",
+        _ => "claude",
     };
     let root = account_root_for_agent(data, agent, id)?;
     if agent == "codex" {
@@ -244,7 +245,132 @@ pub(crate) fn profile_account_environment(
 ) -> Result<Vec<(String, String)>> {
     let root = profile_account_root(data, id, profile)?;
     let secret = profile_secret(data, id, profile)?.unwrap_or_default();
+    if profile.protocol() == "openai_chat_completions" {
+        return opencode_environment(&root, profile, &secret);
+    }
     Ok(session_environment(&root, profile, &secret))
+}
+
+fn opencode_environment(
+    root: &Path,
+    profile: &ApiProfile,
+    secret: &str,
+) -> Result<Vec<(String, String)>> {
+    let data = root.join("xdg-data");
+    let cache = root.join("xdg-cache");
+    let state = root.join("xdg-state");
+    let config = root.join("xdg-config");
+    let opencode = config.join("opencode");
+    for directory in [&data, &cache, &state, &config, &opencode] {
+        ensure_private_dir(directory)?;
+    }
+    let mut headers = BTreeMap::new();
+    if let Some(profile_headers) = &profile.headers {
+        for (name, value) in profile_headers {
+            headers.insert(name.clone(), value.clone());
+        }
+    }
+    let mut model = serde_json::Map::new();
+    model.insert("name".into(), serde_json::json!(profile.model));
+    model.insert(
+        "tool_call".into(),
+        serde_json::json!(
+            profile
+                .model_capabilities
+                .as_ref()
+                .and_then(|caps| caps.tools)
+                .unwrap_or(true)
+        ),
+    );
+    if let Some(caps) = profile.model_capabilities.as_ref() {
+        if let Some(reasoning) = caps.reasoning {
+            model.insert("reasoning".into(), serde_json::json!(reasoning));
+        }
+        if let Some(vision) = caps.vision {
+            model.insert(
+                "modalities".into(),
+                serde_json::json!({"input": if vision { vec!["text", "image"] } else { vec!["text"] }, "output": ["text"]}),
+            );
+        }
+        if caps.context_window.is_some() || caps.max_output_tokens.is_some() {
+            let mut limit = serde_json::Map::new();
+            if let Some(context) = caps.context_window {
+                limit.insert("context".into(), serde_json::json!(context));
+            }
+            if let Some(output) = caps.max_output_tokens {
+                limit.insert("output".into(), serde_json::json!(output));
+            }
+            model.insert("limit".into(), serde_json::Value::Object(limit));
+        }
+    }
+    let config_file = opencode.join("opencode.json");
+    let body = serde_json::to_vec(&serde_json::json!({
+        "$schema": "https://opencode.ai/config.json",
+        "model": format!("prospero/{}", profile.model),
+        "small_model": format!("prospero/{}", profile.model),
+        "provider": {
+            "prospero": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "Prospero API Profile",
+                "env": ["OPENAI_API_KEY"],
+                "options": {
+                    "baseURL": profile.base_url,
+                    "headers": headers,
+                },
+                "models": {
+                    profile.model.clone(): serde_json::Value::Object(model),
+                },
+            },
+        },
+    }))?;
+    fs::write(&config_file, body)?;
+    fs::set_permissions(&config_file, fs::Permissions::from_mode(0o600))?;
+    Ok(vec![
+        ("XDG_DATA_HOME".into(), data.to_string_lossy().into_owned()),
+        (
+            "XDG_CACHE_HOME".into(),
+            cache.to_string_lossy().into_owned(),
+        ),
+        (
+            "XDG_STATE_HOME".into(),
+            state.to_string_lossy().into_owned(),
+        ),
+        (
+            "XDG_CONFIG_HOME".into(),
+            config.to_string_lossy().into_owned(),
+        ),
+        ("OPENCODE_DISABLE_PROJECT_CONFIG".into(), "1".into()),
+        (
+            "PROSPERO_API_PROFILE_CONFIG".into(),
+            config_file.to_string_lossy().into_owned(),
+        ),
+        ("PROSPERO_API_PROFILE_FINGERPRINT".into(), {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(profile.base_url.as_bytes());
+            hasher.update(profile.model.as_bytes());
+            hasher.update(secret.as_bytes());
+            hasher
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        }),
+        (
+            "PROSPERO_API_PROFILE_MODEL".into(),
+            format!("prospero/{}", profile.model),
+        ),
+        (
+            "PROSPERO_API_PROFILE_VISION".into(),
+            if profile.model_capabilities.as_ref().and_then(|c| c.vision) == Some(false) {
+                "0"
+            } else {
+                "1"
+            }
+            .into(),
+        ),
+        ("OPENAI_API_KEY".into(), secret.to_owned()),
+    ])
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -294,7 +420,7 @@ fn decode_record(
 /// otherwise null (legacy canonicalization includes `credential ?? null`).
 fn row_revision(data: &Path, id: &str, profile: Option<&ApiProfile>) -> Option<String> {
     let profile = profile?;
-    let root = account_root(data, id).ok()?;
+    let root = profile_account_root(data, id, profile).ok()?;
     let secret = match read_credential(&root) {
         Ok(Some(Credential {
             kind: CredentialKind::ApiKey,
@@ -555,12 +681,18 @@ impl crate::database::Store {
             .as_ref()
             .map(serde_json::to_value)
             .transpose()?;
+        let next_protocol = protocol.unwrap_or_else(|| existing.protocol());
+        let agent = match next_protocol {
+            "anthropic" => "claude",
+            "openai_chat_completions" => "opencode",
+            _ => "codex",
+        };
         let profile = clean_profile(
-            "claude",
+            agent,
             base_url.unwrap_or(&existing.base_url),
             model.unwrap_or(&existing.model),
             provider.or(Some(existing.provider.as_str())),
-            protocol.or(existing.protocol.as_deref()),
+            Some(next_protocol),
             Some(capabilities.unwrap_or(existing_caps)),
             preserved_headers,
         )?;

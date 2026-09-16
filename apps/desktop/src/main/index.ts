@@ -1070,8 +1070,9 @@ function installIpc(): void {
         kind: input.kind,
         approvalPolicy: input.approvalPolicy,
         ...(input.mode ? { mode: input.mode } : {}),
-        ...(input.model ? { model: requireSelection(input.model, "模型", 160) } : {}),
+        ...(input.model ? { model: requireSelection(input.model, "模型", 300) } : {}),
         ...(input.effort ? { effort: requireSelection(input.effort, "推理强度", 80) } : {}),
+        ...(input.agentPreset ? { agentPreset: requireSelection(input.agentPreset, "Agent 预设", 300) } : {}),
         ...(input.command ? { command: String(input.command).slice(0, 2_000) } : {}),
         ...(input.resume ? { resume: input.resume } : {}),
         ...(input.accountId ? { accountId: requireId(input.accountId, "账号") } : {}),
@@ -1174,7 +1175,7 @@ function installIpc(): void {
   });
   ipcMain.handle("session:model:set", (_event, rawId: unknown, rawModel: unknown, rawEffort: unknown) => {
     const sessionId = requireId(rawId, "会话");
-    const model = requireSelection(rawModel, "模型", 160);
+    const model = requireSelection(rawModel, "模型", 300);
     const effort = rawEffort === undefined ? undefined : requireSelection(rawEffort, "推理强度", 80);
     return runtime.request(`/_prospero/control/session/${encodeURIComponent(sessionId)}/models`, {
       method: "POST",

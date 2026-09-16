@@ -2,7 +2,8 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use prosperod_rs::auth::Token;
 use prosperod_rs::protocol::{
-    API_VERSION, DATABASE_QUEUE_CAPACITY, MessageRole, TimelineBody, TimelineWrite,
+    API_VERSION, AgentKind, CreateSession, DATABASE_QUEUE_CAPACITY, MessageRole, SessionKind,
+    SessionStatus, TimelineBody, TimelineWrite, UpdateSession,
 };
 use prosperod_rs::server::Api;
 use prosperod_rs::worker::Database;
@@ -53,6 +54,48 @@ async fn health(api: &Api) -> (StatusCode, Value) {
     (status, body)
 }
 
+fn key_b64(key: &[u8; 32]) -> String {
+    use base64::Engine;
+    use base64::prelude::BASE64_STANDARD;
+    BASE64_STANDARD.encode(key)
+}
+
+fn nonce(dir: u8, count: u64) -> [u8; 24] {
+    let mut n = [0; 24];
+    n[0] = dir;
+    n[1..9].copy_from_slice(&count.to_be_bytes());
+    n
+}
+
+fn seal(cipher: &crypto_box::SalsaBox, send_count: &mut u64, value: &Value) -> String {
+    use base64::Engine;
+    use base64::prelude::BASE64_STANDARD;
+    use crypto_box::Nonce;
+    use crypto_box::aead::Aead;
+    let bytes = serde_json::to_vec(value).unwrap();
+    let encrypted = cipher
+        .encrypt(&Nonce::from(nonce(1, *send_count)), bytes.as_slice())
+        .unwrap();
+    *send_count += 1;
+    json!({"c": BASE64_STANDARD.encode(encrypted)}).to_string()
+}
+
+fn open(cipher: &crypto_box::SalsaBox, recv_count: &mut u64, frame: &str) -> Value {
+    use base64::Engine;
+    use base64::prelude::BASE64_STANDARD;
+    use crypto_box::Nonce;
+    use crypto_box::aead::Aead;
+    let value: Value = serde_json::from_str(frame).unwrap();
+    let encrypted = BASE64_STANDARD
+        .decode(value["c"].as_str().unwrap())
+        .unwrap();
+    let plain = cipher
+        .decrypt(&Nonce::from(nonce(2, *recv_count)), encrypted.as_slice())
+        .unwrap();
+    *recv_count += 1;
+    serde_json::from_slice(&plain).unwrap()
+}
+
 #[tokio::test]
 async fn health_dto_reports_rust_http_contract() {
     let (_directory, api) = fixture().await;
@@ -86,7 +129,9 @@ async fn health_capabilities_are_explicitly_local_http_not_mobile_ws() {
         "agent.account.config",
         "conversation.search.v1",
         "chat.attachment-previews.v1",
+        "agent.deepseek-harness.v1",
         "model.sources.v1",
+        "relay.host.v1",
     ] {
         assert!(
             capabilities.iter().any(|capability| capability == expected),
@@ -108,6 +153,172 @@ async fn health_capabilities_are_explicitly_local_http_not_mobile_ws() {
             "Rust local health must not imply unimplemented mobile/remote WS capability {remote_only}"
         );
     }
+    api.database.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn health_prefers_live_relay_supervisor_status() {
+    let (_directory, api) = fixture().await;
+    api.relay_status
+        .set(prosperod_rs::relay::RelayRuntimeStatus {
+            enabled: true,
+            state: prosperod_rs::relay::RelayConnectionState::Online,
+            url: Some("wss://relay.example.com".into()),
+            route_id: Some("CG1dTxTscx5Vm84XPQRwkXjI61ziPLQNbj7La6EVEyk".into()),
+            updated_at: 2,
+            last_connected_at: Some(1),
+            last_error: None,
+            devices: prosperod_rs::relay::RelayRuntimeDeviceStatus {
+                total: 2,
+                ready: 1,
+                needs_re_pair: 1,
+            },
+            active_streams: 0,
+            stream_failures: 0,
+            last_stream_error: None,
+        });
+    let (status, body) = health(&api).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["relay"]["state"], "online");
+    assert_eq!(body["relay"]["devices"]["ready"], 1);
+    api.database.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn status_projection_writes_legacy_desktop_snapshot_shape() {
+    let (directory, api) = fixture().await;
+    let session = api
+        .database
+        .call(|store| {
+            let session = store.create_session(CreateSession {
+                agent: AgentKind::Claude,
+                kind: SessionKind::Structured,
+                title: "Needs approval".into(),
+                workspace: "/tmp/project".into(),
+            })?;
+            store.update_session(
+                &session.id,
+                UpdateSession {
+                    revision: session.revision,
+                    title: None,
+                    lifecycle: None,
+                    status: Some(SessionStatus::WaitingPermission),
+                },
+            )
+        })
+        .await
+        .unwrap();
+    api.write_status_projection(7423, Some("127.0.0.1".into()), SECRET.into())
+        .await
+        .unwrap();
+    let status: Value = serde_json::from_str(
+        &std::fs::read_to_string(directory.path().join("status.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(status["controlToken"], SECRET);
+    assert_eq!(status["sessionSummary"]["attention"], 1);
+    assert_eq!(status["sessionSummary"]["terminal"], 0);
+    assert_eq!(status["sessions"][0]["id"], session.id);
+    assert_eq!(status["sessions"][0]["status"], "waiting_approval");
+    assert_eq!(status["sessions"][0]["pendingPermissions"], 1);
+    assert_eq!(status["sessions"][0]["pendingQuestions"], 0);
+    api.database.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn status_projection_sends_notify_when_attention_increases() {
+    let (directory, api) = fixture().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<Value>();
+    let notify_server = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 1024];
+        loop {
+            let read = stream.read(&mut buffer).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .or_else(|| {
+                    headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("Content-Length:"))
+                })
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            let body_start = header_end + 4;
+            while request.len() < body_start + length {
+                let read = stream.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            seen_tx
+                .send(serde_json::from_slice(&request[body_start..body_start + length]).unwrap())
+                .unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            break;
+        }
+    });
+    std::fs::write(
+        directory.path().join("config.json"),
+        json!({"notify":{"url":format!("http://{addr}/notify")}}).to_string(),
+    )
+    .unwrap();
+    api.write_status_projection(7423, None, SECRET.into())
+        .await
+        .unwrap();
+    api.database
+        .call(|store| {
+            let session = store.create_session(CreateSession {
+                agent: AgentKind::Claude,
+                kind: SessionKind::Structured,
+                title: "Needs input".into(),
+                workspace: "/tmp/project".into(),
+            })?;
+            store.update_session(
+                &session.id,
+                UpdateSession {
+                    revision: session.revision,
+                    title: None,
+                    lifecycle: None,
+                    status: Some(SessionStatus::WaitingInput),
+                },
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    api.write_status_projection(7423, None, SECRET.into())
+        .await
+        .unwrap();
+    let body = tokio::time::timeout(std::time::Duration::from_secs(2), seen_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(body["title"], "Prospero 等待你的处理");
+    assert!(
+        body["body"]
+            .as_str()
+            .unwrap()
+            .contains("1 个审批或问题需要处理")
+    );
+    notify_server.await.unwrap();
     api.database.shutdown().await.unwrap();
 }
 
@@ -150,42 +361,182 @@ async fn direct_ws_boundary_uses_encrypted_pairing_not_http_bearer() {
 }
 
 #[tokio::test]
+async fn remote_ws_connections_are_bounded_and_release_on_drop() {
+    use tokio_tungstenite::tungstenite::http::StatusCode as WsStatusCode;
+
+    let (_directory, api) = fixture().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_api = api.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, server_api.router()).await.unwrap();
+    });
+    let url = format!("ws://{addr}/ws");
+    let mut sockets = Vec::new();
+    for _ in 0..16 {
+        let (socket, _) = tokio_tungstenite::connect_async(url.as_str())
+            .await
+            .unwrap();
+        sockets.push(socket);
+    }
+    match tokio_tungstenite::connect_async(url.as_str()).await {
+        Ok(_) => panic!("remote websocket limit should reject the 17th connection"),
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            assert_eq!(response.status(), WsStatusCode::SERVICE_UNAVAILABLE);
+        }
+        Err(other) => panic!("unexpected websocket failure: {other:?}"),
+    }
+    drop(sockets.pop());
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let (socket, _) = tokio_tungstenite::connect_async(url.as_str())
+        .await
+        .unwrap();
+    drop(socket);
+    drop(sockets);
+    server.abort();
+    api.database.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn remote_ws_idle_handshake_times_out() {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+    let directory = TempDir::new().unwrap();
+    let database = Database::open(directory.path().to_path_buf())
+        .await
+        .unwrap();
+    let api = Api::new(database, Token::parse(SECRET.into()).unwrap())
+        .with_remote_ws_handshake_timeout(std::time::Duration::from_millis(50));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_api = api.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, server_api.router()).await.unwrap();
+    });
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(1), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    match frame {
+        Message::Close(Some(close)) => assert_eq!(close.code, CloseCode::Library(4003)),
+        other => panic!("unexpected idle handshake close frame: {other:?}"),
+    }
+    server.abort();
+    api.database.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn remote_ws_live_connection_closes_after_device_revoke() {
+    use base64::Engine;
+    use base64::prelude::BASE64_STANDARD;
+    use crypto_box::{PublicKey, SalsaBox, SecretKey};
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+    let (directory, api) = fixture().await;
+    let daemon_secret = SecretKey::from([9u8; 32]);
+    std::fs::write(
+        directory.path().join("identity.json"),
+        json!({"publicKey": key_b64(daemon_secret.public_key().as_bytes()), "secretKey": key_b64(&[9u8; 32])}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("devices.json"),
+        json!({"devices":[{"name":"phone","token":"paired-token-123456","allowShell":true,"createdAt":1}]}).to_string(),
+    )
+    .unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_api = api.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, server_api.router()).await.unwrap();
+    });
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+    let client_eph = SecretKey::from([3u8; 32]);
+    ws.send(Message::Text(
+        json!({
+            "v": prosperod_rs::remote_crypto::PROTOCOL_VERSION,
+            "eph": key_b64(client_eph.public_key().as_bytes()),
+            "cv": prosperod_rs::remote_crypto::CRYPTO_VERSION,
+            "minV": prosperod_rs::remote_crypto::MIN_PROTOCOL_VERSION,
+            "maxV": prosperod_rs::remote_crypto::PROTOCOL_VERSION,
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let proof = match ws.next().await.unwrap().unwrap() {
+        Message::Text(text) => serde_json::from_str::<Value>(&text).unwrap(),
+        other => panic!("unexpected proof frame: {other:?}"),
+    };
+    let server_eph_bytes: [u8; 32] = BASE64_STANDARD
+        .decode(proof["seph"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let cipher = SalsaBox::new(&PublicKey::from(server_eph_bytes), &client_eph);
+    let mut send_count = 0;
+    let mut recv_count = 0;
+    let client_identity = SecretKey::from([4u8; 32]);
+    ws.send(Message::Text(
+        seal(
+            &cipher,
+            &mut send_count,
+            &json!({
+                "type":"hello",
+                "token":"paired-token-123456",
+                "clientPubKey":key_b64(client_identity.public_key().as_bytes()),
+                "clientInfo":{"platform":"desktop","appVersion":"test"},
+            }),
+        )
+        .into(),
+    ))
+    .await
+    .unwrap();
+    match ws.next().await.unwrap().unwrap() {
+        Message::Text(text) => {
+            assert_eq!(open(&cipher, &mut recv_count, &text)["type"], "hello.ok");
+        }
+        other => panic!("unexpected hello frame: {other:?}"),
+    }
+
+    std::fs::write(
+        directory.path().join("devices.json"),
+        json!({"devices":[]}).to_string(),
+    )
+    .unwrap();
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    match frame {
+        Message::Close(Some(close)) => assert_eq!(close.code, CloseCode::Library(4004)),
+        other => panic!("unexpected revoke close frame: {other:?}"),
+    }
+    server.abort();
+    api.database.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn encrypted_ws_handshake_authenticates_and_routes_ping() {
     use base64::Engine;
     use base64::prelude::BASE64_STANDARD;
-    use crypto_box::aead::Aead;
-    use crypto_box::{Nonce, PublicKey, SalsaBox, SecretKey};
+    use crypto_box::{PublicKey, SalsaBox, SecretKey};
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
-
-    fn key_b64(key: &[u8; 32]) -> String {
-        BASE64_STANDARD.encode(key)
-    }
-    fn nonce(dir: u8, count: u64) -> [u8; 24] {
-        let mut n = [0; 24];
-        n[0] = dir;
-        n[1..9].copy_from_slice(&count.to_be_bytes());
-        n
-    }
-    fn seal(cipher: &SalsaBox, send_count: &mut u64, value: &Value) -> String {
-        let bytes = serde_json::to_vec(value).unwrap();
-        let encrypted = cipher
-            .encrypt(&Nonce::from(nonce(1, *send_count)), bytes.as_slice())
-            .unwrap();
-        *send_count += 1;
-        json!({"c": BASE64_STANDARD.encode(encrypted)}).to_string()
-    }
-    fn open(cipher: &SalsaBox, recv_count: &mut u64, frame: &str) -> Value {
-        let value: Value = serde_json::from_str(frame).unwrap();
-        let encrypted = BASE64_STANDARD
-            .decode(value["c"].as_str().unwrap())
-            .unwrap();
-        let plain = cipher
-            .decrypt(&Nonce::from(nonce(2, *recv_count)), encrypted.as_slice())
-            .unwrap();
-        *recv_count += 1;
-        serde_json::from_slice(&plain).unwrap()
-    }
 
     let (directory, api) = fixture().await;
     let _cli_env = CLI_ENV_LOCK.lock().await;
@@ -301,6 +652,13 @@ async fn encrypted_ws_handshake_authenticates_and_routes_ping() {
     };
     assert_eq!(hello_ok["type"], "hello.ok");
     assert_eq!(hello_ok["host"]["negotiatedProtocolVersion"], json!(16));
+    assert!(
+        hello_ok["host"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| capability == "agent.deepseek-harness.v1")
+    );
     assert!(hello_ok["sessions"].as_array().unwrap().is_empty());
 
     ws.send(Message::Text(

@@ -32,7 +32,7 @@ export function accountApiProtocolDefaults(protocol: AgentApiProtocol): AccountA
 }
 
 export function accountApiProtocolForAgent(agent: CodeAgentKind): AgentApiProtocol {
-  return agent === "claude" ? "anthropic" : "openai_responses";
+  return agent === "claude" ? "anthropic" : agent === "opencode" ? "openai_chat_completions" : "openai_responses";
 }
 
 export function accountApiProtocolsForAgent(
@@ -40,9 +40,9 @@ export function accountApiProtocolsForAgent(
   supportsProtocols: boolean,
 ): AgentApiProtocol[] {
   if (!supportsProtocols) return [accountApiProtocolForAgent(agent)];
-  return agent === "claude"
-    ? ["anthropic"]
-    : ["openai_responses", "openai_chat_completions"];
+  if (agent === "claude") return ["anthropic"];
+  if (agent === "opencode") return ["openai_chat_completions"];
+  return ["openai_responses", "openai_chat_completions"];
 }
 
 export function accountApiProtocolFromProfile(

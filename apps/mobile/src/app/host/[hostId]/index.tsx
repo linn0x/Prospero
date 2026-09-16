@@ -225,10 +225,10 @@ export default function HostScreen() {
     end: width - balancedPaneWidth,
   };
 
-  const codeAgent = agent === "claude" || agent === "codex" ? agent : null;
+  const codeAgent = agent === "claude" || agent === "codex" || agent === "opencode" ? agent : null;
   const launchCatalogAgent = codeAgent ?? (agent === "deepseek" ? "deepseek" : null);
   const matchingAccounts = codeAgent
-    ? agentAccounts.filter((account) => account.agent === codeAgent)
+    ? agentAccounts.filter((account) => getAgentAccountEngine(account) === codeAgent)
     : [];
   const selectedAccount = codeAgent
     ? matchingAccounts.find((account) => account.id === selectedAccountIds[codeAgent]) ??
@@ -242,7 +242,7 @@ export default function HostScreen() {
   const accountCanResume = selectedAccountCapabilities?.resume ?? true;
   const accountCanSelectModel = selectedAccountCapabilities?.modelSelection ?? true;
   const accountCanSelectEffort = selectedAccountCapabilities?.reasoningEffort ?? true;
-  const accountCanLaunch = selectedAccountCapabilities?.sessionKinds.includes(effectiveSessionKind) ?? true;
+  const accountCanLaunch = selectedAccountCapabilities?.sessionKinds.includes(effectiveSessionKind) ?? agent !== "opencode";
   const canSearchResume =
     composing &&
     launchIntent === "conversation" &&
@@ -275,8 +275,8 @@ export default function HostScreen() {
           setAgentAccounts(next);
           setSelectedAccountIds((current) => {
             const updated = { ...current };
-            for (const kind of ["claude", "codex"] as const) {
-              const available = next.filter((account) => account.agent === kind);
+            for (const kind of ["claude", "codex", "opencode"] as const) {
+              const available = next.filter((account) => getAgentAccountEngine(account) === kind);
               if (!available.some((account) => account.id === updated[kind])) {
                 updated[kind] = available.find((account) => account.isDefault)?.id ?? available[0]?.id;
               }

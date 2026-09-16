@@ -1,12 +1,12 @@
 //! Worker launch/stop and worktree lifecycle service (Stage 8).
 //!
 //! This is the Rust-mode counterpart of the legacy `DispatchService` +
-//! `WorktreeAssetService`: it wires the DAG store to the structured Claude
+//! `WorktreeAssetService`: it wires the DAG store to the structured agent
 //! agent runtime and to `git worktree`. Two deliberate scope reductions versus
 //! legacy:
 //!
-//! * only structured Claude workers are launched (other agents/PTYs stay
-//!   explicitly unbridged and the desktop rejects them with "尚未接入");
+//! * only structured Claude/Codex/DeepSeek/OpenCode workers are launched (other agents/PTYs
+//!   stay explicitly unbridged and the desktop rejects them with "尚未接入");
 //! * there is no `prospero` CLI in Rust mode, so the worker cannot self-deliver
 //!   `task done/fail`. Delivery is a manual desktop action against the
 //!   `/dispatches/:id/settle` route; the worker prompt says so.
@@ -85,7 +85,7 @@ fn canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Launch a structured Claude worker for one task. The ordering mirrors legacy
+/// Launch a structured worker for one task. The ordering mirrors legacy
 /// persistence boundaries: worktree directory → asset registration (so the
 /// disk resource is indexed even if the next step crashes) → agent session →
 /// dispatch row + task `dispatched` in one transaction → worker brief →
@@ -106,9 +106,14 @@ pub async fn start_worker(
     };
     if !matches!(
         input.agent,
-        crate::protocol::AgentKind::Claude | crate::protocol::AgentKind::Codex
+        crate::protocol::AgentKind::Claude
+            | crate::protocol::AgentKind::Codex
+            | crate::protocol::AgentKind::Deepseek
+            | crate::protocol::AgentKind::Opencode
     ) {
-        return Err(Error::Invalid("Rust worker 当前仅支持 Claude/Codex".into()));
+        return Err(Error::Invalid(
+            "Rust worker 当前仅支持 Claude/Codex/DeepSeek/OpenCode".into(),
+        ));
     }
     let policy = match input.approval_policy.as_deref().unwrap_or("standard") {
         "strict" | "standard" => false,
@@ -116,7 +121,17 @@ pub async fn start_worker(
         _ => return Err(Error::Invalid("approvalPolicy is invalid".into())),
     };
     let account_id = match input.account_id.as_deref() {
+        None | Some("") if input.agent == crate::protocol::AgentKind::Opencode => {
+            return Err(Error::Invalid(
+                "OpenCode worker 需要 OpenAI Chat Completions API Profile".into(),
+            ));
+        }
         None | Some("") | Some(crate::accounts::NATIVE_CLAUDE_ID) => None,
+        Some(_) if input.agent == crate::protocol::AgentKind::Deepseek => {
+            return Err(Error::Invalid(
+                "DeepSeek worker 使用本机 dsh 账号，不支持绑定 Prospero 账号".into(),
+            ));
+        }
         Some(id) => {
             crate::database::validate_id(id)?;
             let data = database.directory().to_owned();
@@ -124,6 +139,20 @@ pub async fn start_worker(
             let record = database
                 .call(move |store| store.managed_snapshot_row(&data, &id))
                 .await?;
+            if input.agent == crate::protocol::AgentKind::Opencode {
+                match record
+                    .api_profile
+                    .as_ref()
+                    .map(|profile| profile.protocol())
+                {
+                    Some("openai_chat_completions") => {}
+                    _ => {
+                        return Err(Error::Invalid(
+                            "OpenCode worker 需要 OpenAI Chat Completions API Profile".into(),
+                        ));
+                    }
+                }
+            }
             Some(record.id)
         }
     };
@@ -285,6 +314,7 @@ pub async fn start_worker(
             mode: None,
             model: None,
             effort: None,
+            agent_preset: None,
             account_id,
             resume: None,
         })

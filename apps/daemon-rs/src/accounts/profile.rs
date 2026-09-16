@@ -194,10 +194,10 @@ impl ApiProfile {
 }
 
 pub(crate) fn agent_kind(profile: &ApiProfile) -> crate::protocol::AgentKind {
-    if profile.protocol() == "anthropic" {
-        crate::protocol::AgentKind::Claude
-    } else {
-        crate::protocol::AgentKind::Codex
+    match profile.protocol() {
+        "anthropic" => crate::protocol::AgentKind::Claude,
+        "openai_chat_completions" => crate::protocol::AgentKind::Opencode,
+        _ => crate::protocol::AgentKind::Codex,
     }
 }
 
@@ -266,6 +266,7 @@ pub(crate) fn clean_profile(
     let (default_provider, default_protocol) = match agent {
         "claude" => ("anthropic_compatible", "anthropic"),
         "codex" => ("openai_compatible", "openai_responses"),
+        "opencode" => ("openai_compatible", "openai_chat_completions"),
         _ => return Err(Error::Invalid("Agent 不支持 API Profile".into())),
     };
     let base_url = raw_base_url.trim();
@@ -286,6 +287,9 @@ pub(crate) fn clean_profile(
                     parsed_protocol,
                     "openai_responses" | "openai_chat_completions"
                 )
+        }
+        "opencode" => {
+            parsed_provider == "openai_compatible" && parsed_protocol == "openai_chat_completions"
         }
         "claude" => parsed_provider == "anthropic_compatible" && parsed_protocol == "anthropic",
         _ => false,

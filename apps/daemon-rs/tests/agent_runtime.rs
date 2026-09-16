@@ -478,6 +478,7 @@ impl Harness {
                 mode: None,
                 model: None,
                 effort: None,
+                agent_preset: None,
                 account_id: None,
                 resume: None,
             })
@@ -495,6 +496,7 @@ impl Harness {
                 mode: Some("plan".into()),
                 model: Some("gpt-test".into()),
                 effort: Some("high".into()),
+                agent_preset: None,
                 account_id: Some("native-codex".into()),
                 resume: None,
             })
@@ -720,6 +722,7 @@ async fn codex_api_profile_passes_provider_args_and_secret_environment() {
             mode: None,
             model: None,
             effort: None,
+            agent_preset: None,
             account_id: Some(account_id),
             resume: None,
         })
@@ -1343,6 +1346,7 @@ async fn launch_resume_uses_native_session_id() {
             mode: None,
             model: None,
             effort: None,
+            agent_preset: None,
             account_id: None,
             resume: Some(ResumeInput {
                 id: "existing-native".into(),
@@ -1402,6 +1406,7 @@ async fn launch_resume_rejects_fork() {
             mode: None,
             model: None,
             effort: None,
+            agent_preset: None,
             account_id: None,
             resume: Some(ResumeInput {
                 id: "existing-native".into(),
@@ -1819,6 +1824,7 @@ async fn recovery_archives_active_run_without_replaying_turn() {
             mode: None,
             model: None,
             effort: None,
+            agent_preset: None,
             account_id: None,
             resume: None,
         })
@@ -1945,6 +1951,7 @@ async fn launch_model_and_effort_are_passed_on_every_turn() {
             mode: None,
             model: Some("opus[1m]".into()),
             effort: Some("high".into()),
+            agent_preset: None,
             account_id: None,
             resume: None,
         })
@@ -2013,6 +2020,7 @@ async fn launch_plan_mode_is_applied_on_first_turn() {
             mode: Some("plan".into()),
             model: None,
             effort: None,
+            agent_preset: None,
             account_id: None,
             resume: None,
         })
@@ -2052,7 +2060,7 @@ async fn invalid_launch_selection_is_rejected() {
     let harness = Harness::new("chat").await;
     for (index, (model, effort)) in [
         (Some(" ".into()), None),
-        (Some("x".repeat(161)), None),
+        (Some("x".repeat(301)), None),
         (None, Some("high\n".into())),
         (None, Some("x".repeat(81))),
     ]
@@ -2069,6 +2077,7 @@ async fn invalid_launch_selection_is_rejected() {
                 mode: None,
                 model,
                 effort,
+                agent_preset: None,
                 account_id: None,
                 resume: None,
             })
@@ -2091,6 +2100,7 @@ async fn invalid_launch_mode_is_rejected() {
             mode: Some("apply".into()),
             model: None,
             effort: None,
+            agent_preset: None,
             account_id: None,
             resume: None,
         })
@@ -2112,6 +2122,7 @@ async fn in_session_models_combines_catalog_with_persisted_selection() {
             mode: None,
             model: Some("opus[1m]".into()),
             effort: Some("high".into()),
+            agent_preset: None,
             account_id: None,
             resume: None,
         })
@@ -2141,6 +2152,43 @@ async fn in_session_models_combines_catalog_with_persisted_selection() {
     assert_eq!(picked_controls.current_model.as_deref(), Some("opus[1m]"));
     assert_eq!(picked_controls.current_effort.as_deref(), Some("high"));
     assert_eq!(picked_controls.current_mode.as_deref(), Some("default"));
+}
+
+#[tokio::test]
+async fn deepseek_sessions_persist_agent_preset_and_expose_controls() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new("chat").await;
+    let head = harness
+        .agents
+        .create(CreateAgentSession {
+            agent: prosperod_rs::protocol::AgentKind::Deepseek,
+            title: "DeepSeek pick".into(),
+            workspace: harness.workspace.path().to_str().unwrap().into(),
+            auto_approve: false,
+            mode: None,
+            model: Some("deepseek-official/deepseek-v4-flash".into()),
+            effort: Some("high".into()),
+            agent_preset: Some("reviewer".into()),
+            account_id: None,
+            resume: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(head.agent, prosperod_rs::protocol::AgentKind::Deepseek);
+    let controls = harness.agents.controls().await.unwrap();
+    let row = controls
+        .controls
+        .iter()
+        .find(|item| item.session_id == head.id)
+        .unwrap();
+    assert!(row.compact);
+    assert!(row.model);
+    assert!(!row.mode);
+    assert_eq!(
+        row.current_model.as_deref(),
+        Some("deepseek-official/deepseek-v4-flash")
+    );
+    assert_eq!(row.current_effort.as_deref(), Some("high"));
 }
 
 #[tokio::test]
@@ -2282,7 +2330,7 @@ async fn set_model_rejects_catalog_mismatches() {
         "{unsupported}"
     );
 
-    for bad in ["", " ", "x\n", &"x".repeat(161)] {
+    for bad in ["", " ", "x\n", &"x".repeat(301)] {
         assert!(
             harness
                 .agents

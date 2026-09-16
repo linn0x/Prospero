@@ -430,8 +430,9 @@ export class RustClient {
   }
 
   // ── Launch model catalog ────────────────────────────────────────────────
-  launchModels(agent: "claude" | "codex" = "claude", accountId = "native-claude", signal: AbortSignal | null = null, timeoutMs = 30_000): Promise<LaunchModelCatalog> {
-    const account = encodeURIComponent(accountId);
-    return this.json(`/v1/launch/models?agent=${encodeURIComponent(agent)}&accountId=${account}`, { signal, timeoutMs });
+  launchModels(agent: "claude" | "codex" | "deepseek" | "opencode" = "claude", accountId?: string, signal: AbortSignal | null = null, timeoutMs = 30_000): Promise<LaunchModelCatalog> {
+    const params = new URLSearchParams({ agent });
+    if (accountId) params.set("accountId", accountId);
+    return this.json(`/v1/launch/models?${params.toString()}`, { signal, timeoutMs });
   }
 }

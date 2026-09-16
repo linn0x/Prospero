@@ -107,6 +107,14 @@ fn binary() -> String {
     std::env::var("PROSPERO_CLAUDE_BIN").unwrap_or_else(|_| "claude".into())
 }
 
+fn opencode_binary() -> String {
+    std::env::var("PROSPERO_OPENCODE_BIN").unwrap_or_else(|_| "opencode".into())
+}
+
+fn codex_binary() -> String {
+    std::env::var("PROSPERO_CODEX_BIN").unwrap_or_else(|_| "codex".into())
+}
+
 async fn runtime_version() -> std::result::Result<Option<String>, ProbeFailure> {
     let root =
         tempfile::tempdir().map_err(|_| fail("runtime_unavailable", "无法创建隔离运行目录。"))?;
@@ -149,13 +157,37 @@ async fn runtime_version() -> std::result::Result<Option<String>, ProbeFailure> 
 /// Runs `<claude> --version` with a scrubbed environment and isolated HOME.
 /// Never inherits API credentials or the user's shell/agent configuration.
 pub(crate) async fn runtime_available() -> bool {
+    command_available(
+        binary(),
+        &[
+            ("CLAUDE_CONFIG_DIR", "config"),
+            ("CODEX_HOME", "config"),
+            ("CODEX_SQLITE_HOME", "config"),
+        ],
+    )
+    .await
+}
+
+pub(crate) async fn opencode_runtime_available() -> bool {
+    command_available(opencode_binary(), &[]).await
+}
+
+pub(crate) async fn codex_runtime_available() -> bool {
+    command_available(
+        codex_binary(),
+        &[("CODEX_HOME", "config"), ("CODEX_SQLITE_HOME", "config")],
+    )
+    .await
+}
+
+async fn command_available(binary: String, directory_env: &[(&str, &str)]) -> bool {
     let root = match tempfile::tempdir() {
         Ok(dir) => dir,
         Err(_) => return false,
     };
     let config = root.path().join("config");
     let _ = std::fs::create_dir_all(&config);
-    let mut command = tokio::process::Command::new(binary());
+    let mut command = tokio::process::Command::new(binary);
     command
         .arg("--version")
         .current_dir(root.path())
@@ -168,11 +200,10 @@ pub(crate) async fn runtime_available() -> bool {
             command.env(key, value);
         }
     }
-    command
-        .env("HOME", root.path())
-        .env("CLAUDE_CONFIG_DIR", &config)
-        .env("CODEX_HOME", &config)
-        .env("CODEX_SQLITE_HOME", &config);
+    command.env("HOME", root.path());
+    for (key, directory) in directory_env {
+        command.env(key, root.path().join(directory));
+    }
     let spawned = tokio::time::timeout(Duration::from_secs(5), command.output()).await;
     matches!(spawned, Ok(Ok(output)) if output.status.success())
 }

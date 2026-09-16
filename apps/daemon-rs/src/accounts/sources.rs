@@ -126,10 +126,10 @@ fn supported_protocol(protocol: &str) -> bool {
 }
 
 fn agent_for_protocol(protocol: &str) -> &'static str {
-    if protocol == "anthropic" {
-        "claude"
-    } else {
-        "codex"
+    match protocol {
+        "anthropic" => "claude",
+        "openai_chat_completions" => "opencode",
+        _ => "codex",
     }
 }
 

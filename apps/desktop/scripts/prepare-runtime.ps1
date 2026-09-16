@@ -49,6 +49,12 @@ if (Test-Path -LiteralPath $nodeLicense) {
   Copy-Item -LiteralPath $nodeLicense -Destination (Join-Path $nodeRoot "LICENSE")
 }
 
+$rustBinary = Join-Path $repoRoot "target\release\prosperod-rs.exe"
+if (-not (Test-Path -LiteralPath $rustBinary)) {
+  throw "Missing Rust daemon release binary: $rustBinary"
+}
+Copy-Item -LiteralPath $rustBinary -Destination (Join-Path $runtimeFull "prosperod-rs.exe")
+
 $packRoot = Join-Path $runtimeFull "packs"
 $npmCache = Join-Path $repoRoot ".npm-cache"
 New-Item -ItemType Directory -Path $packRoot | Out-Null

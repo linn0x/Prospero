@@ -1783,7 +1783,7 @@ export class HostConnection {
   }
 
   launchModels(
-    agent: "claude" | "codex" | "deepseek",
+    agent: "claude" | "codex" | "deepseek" | "opencode",
     accountId?: string,
   ): Promise<Extract<S2CMessage, { type: "launch.models" }>> {
     if (!this.supportsSessionCreateModel) {

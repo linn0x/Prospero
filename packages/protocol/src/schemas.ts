@@ -19,7 +19,7 @@ export const AgentKindSchema = z.enum([
 ]);
 
 /** 第一批支持独立账号环境的 Code Agent。 */
-export const CodeAgentKindSchema = z.enum(["claude", "codex"]);
+export const CodeAgentKindSchema = z.enum(["claude", "codex", "opencode"]);
 
 /** Claude managed accounts support either a subscription token or a Console API key. */
 export const AgentCredentialKindSchema = z.enum(["oauth_token", "api_key"]);
@@ -748,7 +748,7 @@ export const C2SAgentModelsGetSchema = z.object({
 export const C2SLaunchModelsGetSchema = z.object({
   type: z.literal("launch.models.get"),
   requestId: z.string().min(1).max(100),
-  agent: z.enum(["claude", "codex", "deepseek"]),
+  agent: z.enum(["claude", "codex", "deepseek", "opencode"]),
   accountId: z.string().min(1).max(100).optional(),
 });
 
@@ -1709,7 +1709,7 @@ export const S2CAgentModelsSchema = z.object({
 export const S2CLaunchModelsSchema = z.object({
   type: z.literal("launch.models"),
   requestId: z.string().min(1).max(100),
-  agent: z.enum(["claude", "codex", "deepseek"]),
+  agent: z.enum(["claude", "codex", "deepseek", "opencode"]),
   models: z.array(AgentModelSchema).max(100),
   presets: z.array(AgentPresetSchema).max(100).optional(),
   currentPreset: z.string().min(1).max(300).optional(),

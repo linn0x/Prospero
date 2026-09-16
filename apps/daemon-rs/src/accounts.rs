@@ -535,6 +535,16 @@ fn profile_capabilities() -> AccountCapabilities {
     }
 }
 
+fn opencode_profile_capabilities() -> AccountCapabilities {
+    AccountCapabilities {
+        session_kinds: vec![crate::protocol::SessionKind::Structured],
+        plan: false,
+        resume: false,
+        model_selection: false,
+        reasoning_effort: false,
+    }
+}
+
 /// Builds one account row for a legacy managed (OAuth/imported-key) account.
 async fn managed_row(
     database: &Database,
@@ -578,7 +588,9 @@ async fn profile_row(
     database: &Database,
     record: managed::ManagedRecord,
     active_sessions: i64,
-    runtime_ok: bool,
+    claude_runtime_ok: bool,
+    codex_runtime_ok: bool,
+    opencode_runtime_ok: bool,
     model_source: Option<sources::SourceBindingView>,
 ) -> Result<NativeAccount> {
     let profile = record
@@ -592,11 +604,26 @@ async fn profile_row(
         tokio::task::spawn_blocking(move || managed::profile_secret(&data, &id, &secret_profile))
             .await
             .map_err(|_| crate::error::Error::Closed)??;
+    let profile_agent = profile::agent_kind(profile);
+    let runtime_ok = match profile_agent {
+        crate::protocol::AgentKind::Opencode => opencode_runtime_ok,
+        crate::protocol::AgentKind::Codex => codex_runtime_ok,
+        _ => claude_runtime_ok,
+    };
     let (status, auth_method, detail) = if !runtime_ok {
         (
             AccountStatus::Unavailable,
             None,
-            Some("claude CLI 不可用".into()),
+            Some(format!(
+                "{} CLI 不可用",
+                if profile_agent == crate::protocol::AgentKind::Opencode {
+                    "opencode"
+                } else if profile_agent == crate::protocol::AgentKind::Codex {
+                    "codex"
+                } else {
+                    "claude"
+                }
+            )),
         )
     } else if secret.is_none() {
         (
@@ -629,10 +656,15 @@ async fn profile_row(
         .api_profile
         .as_ref()
         .and_then(profile::capability_support);
-    let profile_agent = profile::agent_kind(profile);
     let engine = match profile_agent {
         crate::protocol::AgentKind::Codex => "codex",
+        crate::protocol::AgentKind::Opencode => "opencode",
         _ => "claude",
+    };
+    let capabilities = if profile_agent == crate::protocol::AgentKind::Opencode {
+        opencode_profile_capabilities()
+    } else {
+        profile_capabilities()
     };
     Ok(NativeAccount {
         id: record.id,
@@ -641,7 +673,7 @@ async fn profile_row(
         managed: true,
         is_default: record.is_default,
         status,
-        capabilities: profile_capabilities(),
+        capabilities,
         api_profile: record.api_profile,
         model_source,
         engine: Some(engine.into()),
@@ -705,7 +737,9 @@ async fn snapshot_with(
     let probe = probe_auth_status(&[]).await;
     // The isolated runtime probe feeds both the native row and profile rows;
     // run it once per snapshot.
-    let runtime_ok = probe::runtime_available().await;
+    let claude_runtime_ok = probe::runtime_available().await;
+    let codex_runtime_ok = probe::codex_runtime_available().await;
+    let opencode_runtime_ok = probe::opencode_runtime_available().await;
     let codex_probe = probe_codex_status(&data).await;
     let now = crate::database::now();
     let mut accounts = vec![
@@ -754,7 +788,18 @@ async fn snapshot_with(
         let active = managed_active.remove(&record.id).unwrap_or(0);
         if record.api_profile.is_some() {
             let binding = bindings.get(&record.id).cloned();
-            accounts.push(profile_row(database, record, active, runtime_ok, binding).await?);
+            accounts.push(
+                profile_row(
+                    database,
+                    record,
+                    active,
+                    claude_runtime_ok,
+                    codex_runtime_ok,
+                    opencode_runtime_ok,
+                    binding,
+                )
+                .await?,
+            );
         } else {
             accounts.push(managed_row(database, record, active).await?);
         }
@@ -798,7 +843,12 @@ pub(crate) async fn execute_control(
     let db = database.clone();
     match control {
         AccountControl::List { .. } => Ok(None),
-        AccountControl::Create { name, .. } => {
+        AccountControl::Create { agent, name, .. } => {
+            if agent != "claude" {
+                return Err(crate::error::Error::Invalid(
+                    "Rust 当前仅支持 Claude 托管账号".into(),
+                ));
+            }
             let data = database.directory().to_owned();
             let name = name.clone();
             let record = db

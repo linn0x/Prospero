@@ -115,10 +115,29 @@ describe("Electron state snapshot caching", () => {
     writeJson(home, "config.json", {
       relay: { enabled: true, url: "wss://relay.example", hostSecret: "relay-host-secret" },
     });
+    writeJson(home, "status.json", {
+      relay: {
+        enabled: true,
+        state: "online",
+        url: "wss://relay.example",
+        routeId: "route-id",
+        updatedAt: 7,
+        activeStreams: 2,
+        streamFailures: 3,
+        lastStreamError: "stream failed",
+      },
+    });
 
     const relay = new StateStore(home).snapshot().daemon.relay;
 
-    expect(relay).toMatchObject({ enabled: true, state: "offline", url: "wss://relay.example" });
+    expect(relay).toMatchObject({
+      enabled: true,
+      state: "online",
+      url: "wss://relay.example",
+      activeStreams: 2,
+      streamFailures: 3,
+      lastStreamError: "stream failed",
+    });
     expect(JSON.stringify(relay)).not.toContain("relay-host-secret");
   });
 

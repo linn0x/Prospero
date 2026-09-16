@@ -86,6 +86,33 @@ time.sleep(600)
     cli
 }
 
+fn write_opencode_cli(directory: &std::path::Path) -> std::path::PathBuf {
+    write_version_cli(directory, "fake-opencode-profile.py", "opencode 0.0.0-test")
+}
+
+fn write_codex_cli(directory: &std::path::Path) -> std::path::PathBuf {
+    write_version_cli(directory, "fake-codex-profile.py", "codex 0.0.0-test")
+}
+
+fn write_version_cli(
+    directory: &std::path::Path,
+    filename: &str,
+    version: &str,
+) -> std::path::PathBuf {
+    let script = r#"#!/usr/bin/env python3
+import sys
+if sys.argv[1:] == ["--version"]:
+    sys.stdout.write(__VERSION__ + "\n")
+    sys.exit(0)
+sys.exit(3)
+"#
+    .replace("__VERSION__", &format!("{version:?}"));
+    let cli = directory.join(filename);
+    std::fs::write(&cli, script).unwrap();
+    std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    cli
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ProbeMode {
     Success,
@@ -297,8 +324,12 @@ impl Harness {
     async fn new() -> Self {
         let directory = TempDir::new().unwrap();
         let cli = write_cli(directory.path());
+        let codex = write_codex_cli(directory.path());
+        let opencode = write_opencode_cli(directory.path());
         unsafe {
             std::env::set_var("PROSPERO_CLAUDE_BIN", &cli);
+            std::env::set_var("PROSPERO_CODEX_BIN", &codex);
+            std::env::set_var("PROSPERO_OPENCODE_BIN", &opencode);
         }
         let data_dir = directory.path().join("daemon");
         let database = Database::open(data_dir).await.unwrap();
@@ -336,6 +367,13 @@ impl Harness {
             .join("daemon/agent-accounts/codex")
             .join(id)
     }
+
+    fn opencode_account_root(&self, id: &str) -> std::path::PathBuf {
+        self.directory
+            .path()
+            .join("daemon/agent-accounts/opencode")
+            .join(id)
+    }
 }
 
 async fn post_on(
@@ -371,6 +409,8 @@ impl Drop for Harness {
     fn drop(&mut self) {
         unsafe {
             std::env::remove_var("PROSPERO_CLAUDE_BIN");
+            std::env::remove_var("PROSPERO_CODEX_BIN");
+            std::env::remove_var("PROSPERO_OPENCODE_BIN");
             std::env::remove_var("CAPTURE");
         }
     }
@@ -484,6 +524,39 @@ async fn profile_create_validates_connection_fields_and_persists_an_isolated_key
             .account_root(codex_id)
             .join(".prospero-credential.json")
             .exists()
+    );
+
+    let (status, opencode_created) = harness
+        .post(control(
+            "agent.account.api.create",
+            obj(json!({"agent":"opencode",
+                "name":"OpenCode Profile","provider":"openai_compatible",
+                "protocol":"openai_chat_completions",
+                "baseUrl":format!("{}/chat/completions", server.base_url),
+                "model":"chat-test","apiKey":SECRET,
+                "modelCapabilities":{"tools":true,"contextWindow":32000,"maxOutputTokens":2048}})),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{opencode_created}");
+    let opencode_id = opencode_created["accountId"].as_str().unwrap();
+    let opencode_row = account(&opencode_created, opencode_id).unwrap();
+    assert_eq!(opencode_row["agent"], "opencode");
+    assert_eq!(opencode_row["engine"], "opencode");
+    assert_eq!(
+        opencode_row["apiProfile"]["protocol"],
+        "openai_chat_completions"
+    );
+    assert_eq!(opencode_row["apiProfile"]["baseUrl"], server.base_url);
+    assert_eq!(
+        opencode_row["capabilities"],
+        json!({"sessionKinds":["structured"],"plan":false,"resume":false,
+               "modelSelection":false,"reasoningEffort":false})
+    );
+    assert!(
+        harness
+            .opencode_account_root(opencode_id)
+            .join(".prospero-credential.json")
+            .is_file()
     );
 
     // Successful create: trimmed name, profile metadata on the row, pinned

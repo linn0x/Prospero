@@ -65,6 +65,7 @@ const MISSING_CLAUDE_CREDENTIAL = "prospero-managed-account-not-authenticated";
 const NATIVE_IDS: Record<CodeAgentKind, string> = {
   codex: "native-codex",
   claude: "native-claude",
+  opencode: "native-opencode",
 };
 
 interface StoredAccount {
@@ -169,7 +170,7 @@ function validAccountIdentities(accounts: StoredAccount[]): boolean {
 }
 
 function validAccountDefaults(store: AccountStore): boolean {
-  return (["claude", "codex"] as const).every((agent) => {
+  return (["claude", "codex", "opencode"] as const).every((agent) => {
     const id = store.defaults[agent];
     return id === undefined || id === NATIVE_IDS[agent] || store.accounts.some((account) => account.id === id && account.agent === agent);
   });
@@ -214,7 +215,7 @@ export class AgentAccountError extends Error {
 }
 
 function isCodeAgent(value: unknown): value is CodeAgentKind {
-  return value === "codex" || value === "claude";
+  return value === "codex" || value === "claude" || value === "opencode";
 }
 
 function parseStore(value: unknown): AccountStore {
@@ -264,7 +265,7 @@ function parseStore(value: unknown): AccountStore {
       ? (raw["defaults"] as Record<string, unknown>)
       : {};
   const defaults: Partial<Record<CodeAgentKind, string>> = {};
-  for (const agent of ["claude", "codex"] as const) {
+  for (const agent of ["claude", "codex", "opencode"] as const) {
     const accountId = rawDefaults[agent];
     if (typeof accountId === "string" && accountId.length <= 100) defaults[agent] = accountId;
   }
@@ -306,11 +307,11 @@ function cleanApiKey(rawSecret: string): AgentAccountCredential {
 }
 
 function apiProviderFor(agent: CodeAgentKind): AgentApiProvider {
-  return agent === "codex" ? "openai_compatible" : "anthropic_compatible";
+  return agent === "claude" ? "anthropic_compatible" : "openai_compatible";
 }
 
 function apiProtocolFor(agent: CodeAgentKind): AgentApiProtocol {
-  return agent === "codex" ? "openai_responses" : "anthropic";
+  return agent === "claude" ? "anthropic" : agent === "opencode" ? "openai_chat_completions" : "openai_responses";
 }
 
 function cleanApiProfile(
@@ -351,9 +352,11 @@ function cleanApiProfile(
     url.pathname = url.pathname.slice(0, -suffix.length) || "/";
   }
   const normalized = url.toString().replace(/\/$/, "");
-  const valid = agent === "codex"
-    ? provider === "openai_compatible" && (protocol === "openai_responses" || protocol === "openai_chat_completions")
-    : provider === "anthropic_compatible" && protocol === "anthropic";
+  const valid = agent === "claude"
+    ? provider === "anthropic_compatible" && protocol === "anthropic"
+    : agent === "opencode"
+      ? provider === "openai_compatible" && protocol === "openai_chat_completions"
+      : provider === "openai_compatible" && (protocol === "openai_responses" || protocol === "openai_chat_completions");
   if (!valid) throw new AgentAccountError("所选 Agent、Provider 与 API 协议不兼容", "account_invalid");
   const capabilities = modelCapabilities == null ? undefined : AgentModelCapabilitiesSchema.safeParse(modelCapabilities);
   if (capabilities && !capabilities.success) {
@@ -750,7 +753,7 @@ export class AgentAccountManager {
     this.storeFile = path.join(home, "agent-accounts.json");
     this.journalFile = path.join(home, ".agent-accounts-transaction.json");
     this.rootsDir = path.join(home, "agent-accounts");
-    this.modelSources = new ModelSources(home, (protocol, baseUrl, model, capabilities) => cleanApiProfile(protocol === "anthropic" ? "claude" : "codex", baseUrl, model, protocol === "anthropic" ? "anthropic_compatible" : "openai_compatible", protocol, capabilities));
+    this.modelSources = new ModelSources(home, (protocol, baseUrl, model, capabilities) => cleanApiProfile(protocol === "anthropic" ? "claude" : protocol === "openai_chat_completions" ? "opencode" : "codex", baseUrl, model, protocol === "anthropic" ? "anthropic_compatible" : "openai_compatible", protocol, capabilities));
     mkdirSync(this.rootsDir, { recursive: true, mode: 0o700 });
     chmodSync(this.rootsDir, 0o700);
     this.store = this.load();
@@ -796,10 +799,11 @@ export class AgentAccountManager {
   defaultId(agent: CodeAgentKind): string {
     this.assertHealthy();
     const selected = this.store.defaults[agent];
-    if (selected === NATIVE_IDS[agent]) return selected;
+    if (agent !== "opencode" && selected === NATIVE_IDS[agent]) return selected;
     if (selected && this.store.accounts.some((account) => account.id === selected && account.agent === agent)) {
       return selected;
     }
+    if (agent === "opencode") return this.store.accounts.find((account) => account.agent === "opencode")?.id ?? NATIVE_IDS[agent];
     return NATIVE_IDS[agent];
   }
 
@@ -844,7 +848,8 @@ export class AgentAccountManager {
     }
     const account = this.store.accounts.find((candidate) => candidate.id === accountId);
     if (!account) throw new AgentAccountError("账号不存在或已删除", "account_not_found");
-    if (expectedAgent && expectedAgent !== account.agent) {
+    const engine = getAgentAccountEngine(account);
+    if (expectedAgent && expectedAgent !== account.agent && expectedAgent !== engine) {
       throw new AgentAccountError("账号与所选 Agent 不匹配", "account_invalid");
     }
     if (account.invalidApiProfile) {
@@ -1038,7 +1043,7 @@ export class AgentAccountManager {
         const id = randomUUID();
         this.modelSources.bind(id, source.id, route.id, source.revision);
         const now = Date.now();
-        const account: StoredAccount = { id, agent: profile.protocol === "anthropic" ? "claude" : "codex", name: `${source.name} / ${route.name}`.slice(0, 80), apiProfile: profile, modelSource: this.modelSources.publicBinding(id)!, createdAt: now, updatedAt: now };
+        const account: StoredAccount = { id, agent: profile.protocol === "anthropic" ? "claude" : profile.protocol === "openai_chat_completions" ? "opencode" : "codex", name: `${source.name} / ${route.name}`.slice(0, 80), apiProfile: profile, modelSource: this.modelSources.publicBinding(id)!, createdAt: now, updatedAt: now };
         const next = structuredClone(this.store);
         next.accounts.push(account);
         try { this.commitMetadata(next); }
@@ -1124,6 +1129,9 @@ export class AgentAccountManager {
   }
 
   create(agent: CodeAgentKind, rawName: string): AccountBinding {
+    if (agent === "opencode") {
+      throw new AgentAccountError("OpenCode 仅支持 API Profile 账号", "account_invalid");
+    }
     this.assertSynchronousWrite();
     const now = Date.now();
     const account: StoredAccount = {
@@ -1664,7 +1672,7 @@ export class AgentAccountManager {
       const store = parseStore(raw);
       const rawDefaults = (metadata["defaults"] ?? {}) as Record<string, unknown>;
       if (store.accounts.length !== metadata["accounts"].length || !validAccountIdentities(store.accounts) || !validAccountDefaults(store) ||
-          (["claude", "codex"] as const).some((agent) => rawDefaults[agent] !== undefined && rawDefaults[agent] !== store.defaults[agent])) {
+          (["claude", "codex", "opencode"] as const).some((agent) => rawDefaults[agent] !== undefined && rawDefaults[agent] !== store.defaults[agent])) {
         throw new Error("invalid account metadata entries");
       }
       return store;

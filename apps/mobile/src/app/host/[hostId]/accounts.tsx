@@ -83,6 +83,7 @@ type Editor =
 const agentTitle: Record<CodeAgentKind, string> = {
   claude: "Claude Code",
   codex: "Codex",
+  opencode: "OpenCode",
 };
 
 const statusText: Record<AgentAccount["status"], string> = {
@@ -176,8 +177,9 @@ export default function AgentAccountsScreen() {
 
   const grouped = useMemo(
     () => ({
-      claude: accounts.filter((account) => account.agent === "claude"),
-      codex: accounts.filter((account) => account.agent === "codex"),
+      claude: accounts.filter((account) => getAgentAccountEngine(account) === "claude"),
+      codex: accounts.filter((account) => getAgentAccountEngine(account) === "codex"),
+      opencode: accounts.filter((account) => getAgentAccountEngine(account) === "opencode"),
     }),
     [accounts],
   );
@@ -442,7 +444,7 @@ export default function AgentAccountsScreen() {
         {error && <Text style={styles.error}>{error}</Text>}
         {loading && accounts.length === 0 && <ActivityIndicator color={color.accent} style={styles.loader} />}
 
-        {(["claude", "codex"] as const).map((agent) => (
+        {(["claude", "codex", "opencode"] as const).map((agent) => (
           <View key={agent} style={styles.section}>
             <View style={styles.sectionHeader}>
               <View style={styles.sectionIdentity}>
@@ -450,14 +452,14 @@ export default function AgentAccountsScreen() {
                 <Text style={styles.sectionTitle}>{agentTitle[agent]}</Text>
               </View>
               <View style={styles.addActions}>
-                <Pressable
-                  style={({ pressed }) => [styles.addButton, pressed && styles.pressed]}
-                  onPress={() => openCreate(agent)}
-                  disabled={!conn?.supportsAgentAccounts}
-                >
-                  <Icon name="plus" size={14} color={color.accent} />
-                  <Text style={styles.addButtonText}>新账号</Text>
-                </Pressable>
+                {agent !== "opencode" && <Pressable
+                    style={({ pressed }) => [styles.addButton, pressed && styles.pressed]}
+                    onPress={() => openCreate(agent)}
+                    disabled={!conn?.supportsAgentAccounts}
+                  >
+                    <Icon name="plus" size={14} color={color.accent} />
+                    <Text style={styles.addButtonText}>新账号</Text>
+                  </Pressable>}
                 <Pressable
                   style={({ pressed }) => [styles.addButton, pressed && styles.pressed]}
                   onPress={() => openCreateApi(agent)}

@@ -1133,6 +1133,7 @@ async fn usage_endpoint_matches_legacy_control_envelope() {
             mode: None,
             model: None,
             effort: None,
+            agent_preset: None,
             account_id: None,
             resume: None,
         })

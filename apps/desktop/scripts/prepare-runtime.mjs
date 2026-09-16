@@ -43,6 +43,14 @@ for (const dir of [runtimeRoot, nodeRoot, packRoot]) mkdirSync(dir, { recursive:
 // 打包机上正在跑这个脚本的解释器就是要随包分发的那个 —— 版本必然与构建一致。
 copyFileSync(process.execPath, path.join(nodeRoot, "node"));
 
+const rustBinary = path.join(repoRoot, "target", "release", "prosperod-rs");
+const stagedRustBinary = path.join(runtimeRoot, "prosperod-rs");
+if (!existsSync(rustBinary)) {
+  throw new Error(`缺少 Rust daemon release binary: ${rustBinary}`);
+}
+copyFileSync(rustBinary, stagedRustBinary);
+chmodSync(stagedRustBinary, 0o755);
+
 const npmCache = path.join(repoRoot, ".npm-cache");
 // windows-native 是 daemon 的硬依赖,即使在 macOS 上用不到也要能解析,
 // 否则下面的 npm install 会因为找不到它而失败。

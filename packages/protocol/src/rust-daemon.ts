@@ -17,7 +17,7 @@ export type ChangeEvent = { scope: string, seq: number, kind: string, entityId: 
 export type EventPage = { items: Array<ChangeEvent>, nextSeq: number, latestSeq: number, floorSeq: number, hasMore: boolean, resyncRequired: boolean, };
 export type RelayConnectionState = "disabled" | "offline" | "connecting" | "syncing" | "online" | "error";
 export type RelayRuntimeDeviceStatus = { total: number, ready: number, needsRePair: number, };
-export type RelayRuntimeStatus = { enabled: boolean, state: RelayConnectionState, url: string | null, routeId: string | null, updatedAt: number, lastConnectedAt?: number | undefined, lastError?: string | null, devices: RelayRuntimeDeviceStatus, };
+export type RelayRuntimeStatus = { enabled: boolean, state: RelayConnectionState, url: string | null, routeId: string | null, updatedAt: number, lastConnectedAt?: number | undefined, lastError?: string | null, devices: RelayRuntimeDeviceStatus, activeStreams?: number | undefined, streamFailures?: number | undefined, lastStreamError?: string | null, };
 export type Health = { apiVersion: number, backend: string, activeRuntimeSessions: number, databaseQueueCapacity: number, capabilities: Array<string>, relay?: RelayRuntimeStatus | null, };
 export type RenameSession = { revision: number, title: string, };
 export type EventQuery = { scope: string, afterSeq: number | null, limit: number | null, };
@@ -58,7 +58,7 @@ mode?: string | null,
 /**
  * Optional launch catalog selection (native CLI aliases / ids).
  */
-model?: string | null, effort?: string | null, 
+model?: string | null, effort?: string | null, agentPreset?: string | null,
 /**
  * Managed account id; None (or the native id) uses the本机默认环境.
  */
@@ -79,8 +79,9 @@ fork?: boolean | null, };
 export type ResumableConversation = { id: string, agent: AgentKind, title: string, preview?: string | null, cwd: string, createdAt?: number | null, updatedAt: number, };
 export type ConversationSearchResult = { agent: AgentKind, conversations: Array<ResumableConversation>, };
 export type AttachmentChunk = { mimeType: string, dataB64: string, total: number, eof: boolean, };
-export type LaunchModelInfo = { id: string, label: string, description?: string | null, supportedEfforts: Array<string>, isDefault?: boolean, };
-export type LaunchModelCatalog = { models: Array<LaunchModelInfo>, currentModel: string | null, };
+export type LaunchModelInfo = { id: string, label: string, description?: string | null, supportedEfforts: Array<string>, defaultEffort?: string | null, isDefault?: boolean, };
+export type AgentPresetInfo = { id: string, name: string, description?: string | null, isDefault?: boolean, custom?: boolean, };
+export type LaunchModelCatalog = { models: Array<LaunchModelInfo>, currentModel: string | null, currentEffort?: string | null, presets?: Array<AgentPresetInfo>, currentPreset?: string | null, };
 export type AgentModelSelection = { model: string, effort: string | null, };
 export type AgentModelSelectionResult = { currentModel: string, currentEffort: string | null, };
 export type AgentControlResult = { type: string, sid: string, requestId: string, action: string, ok: boolean, message: string | null, };
