@@ -73,6 +73,7 @@ describe("model source selection and IPC", () => {
     expect(defaultSourceSelection([noTools])).toBeUndefined();
     expect(sourceRouteAgent(source.routes[0]!)).toBe("codex");
     expect(sourceRouteAgent({ ...source.routes[0]!, protocol: "anthropic" })).toBe("claude");
+    expect(sourceRouteAgent({ ...source.routes[0]!, protocol: "openai_chat_completions" })).toBe("codex");
   });
 
   it("preserves configured model capabilities when enabling an existing catalog model", () => {

@@ -272,6 +272,7 @@ fn parse_catalog_models(payload: &Value) -> Result<Vec<crate::agent::LaunchModel
             label,
             description,
             supported_efforts,
+            default_effort: None,
             is_default: index == 0,
         });
     }
@@ -300,6 +301,7 @@ pub(super) struct TurnOptions {
     pub(super) mode: PermissionMode,
     pub(super) model: Option<String>,
     pub(super) effort: Option<String>,
+    pub(super) agent_preset: Option<String>,
     /// Managed-account environment overrides (empty for the native env).
     pub(super) environment: Vec<(String, String)>,
     /// Non-secret API profile metadata for runtimes that need launch-time

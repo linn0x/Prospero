@@ -3098,7 +3098,7 @@ function NewSessionDialog({
   );
   const requiresStructured = sessionLaunchRequiresStructured(selectedAccount);
   const selectedKind: SessionCreateInput["kind"] = useSource ? sourceChoice?.route.protocol === "openai_chat_completions" ? "structured" : input.kind : requiresStructured ? "structured" : input.kind;
-  const accountCanLaunch = useSource ? sourceSupported && Boolean(sourceChoice) : !selectedAccount?.apiProfileError && (selectedAccount?.capabilities?.sessionKinds.includes(selectedKind) ?? true);
+  const accountCanLaunch = useSource ? sourceSupported && Boolean(sourceChoice) : !selectedAccount?.apiProfileError && (selectedAccount?.capabilities?.sessionKinds.includes(selectedKind) ?? input.agent !== "opencode");
   const selectedWorkspace = launchWorkspaces.find(
     (workspace) => workspace.path === input.cwd,
   );
@@ -3162,7 +3162,7 @@ function NewSessionDialog({
     const catalogKey = JSON.stringify([input.agent, input.accountId, input.kind]);
     if (launchCatalogKey.current === catalogKey) return;
     let cancelled = false;
-    const agent = input.agent as "codex" | "claude" | "deepseek";
+    const agent = input.agent as "codex" | "claude" | "deepseek" | "opencode";
     const accountId = input.accountId;
     setLaunchModels([]);
     setLaunchModelsLoading(true);
@@ -3223,7 +3223,10 @@ function NewSessionDialog({
         if (!sourceChoice || !sourceSelection) throw new Error(t("请选择有效的模型源和模型。", "Choose a valid model source and model."));
         const bound = await runModelSourceAction({ kind: "bind", sourceId: sourceSelection.sourceId, routeId: sourceSelection.routeId, revision: sourceSelection.revision });
         if (!bound.accountId) throw new Error(t("模型源没有返回会话绑定。", "The source did not return an account binding."));
-        onCreated(await window.prospero.createSession({ cwd: input.cwd, agent: sourceRouteAgent(sourceChoice.route), accountId: bound.accountId, kind: selectedKind, approvalPolicy: input.approvalPolicy }));
+        const accounts = Array.isArray(bound.accounts) ? bound.accounts : snapshot.accounts;
+        const account = accounts.find(candidate => candidate.id === bound.accountId);
+        const agent = account?.agent === "opencode" || account?.agent === "claude" || account?.agent === "codex" ? account.agent : sourceRouteAgent(sourceChoice.route);
+        onCreated(await window.prospero.createSession({ cwd: input.cwd, agent, accountId: bound.accountId, kind: selectedKind, approvalPolicy: input.approvalPolicy }));
         rememberSourceSelection(sourceSelection);
       } else {
         onCreated(await window.prospero.createSession({ ...input, kind: selectedKind, model: selectedAccount?.capabilities?.modelSelection === false ? undefined : input.model, effort: selectedAccount?.capabilities?.reasoningEffort === false ? undefined : input.effort }));
@@ -3391,7 +3394,7 @@ function NewSessionDialog({
               {requiresStructured && <FieldDescription>{t("当前账号仅支持对话会话。", "This account supports conversation sessions only.")}</FieldDescription>}
             </Field>
           </div>
-          {(input.agent === "codex" || input.agent === "claude") && (
+          {(input.agent === "codex" || input.agent === "claude" || input.agent === "opencode") && (
             <Field>
               <FieldLabel htmlFor="session-account">
                 {t("账号环境", "Account")}

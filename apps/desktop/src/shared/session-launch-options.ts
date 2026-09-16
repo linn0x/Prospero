@@ -94,10 +94,11 @@ export function sessionLaunchAccounts(
   accounts: JsonObject[],
   agent: SessionCreateInput["agent"],
 ): SessionLaunchAccount[] {
-  if (agent !== "codex" && agent !== "claude") return [];
+  if (agent !== "codex" && agent !== "claude" && agent !== "opencode") return [];
   return accounts.flatMap((account): SessionLaunchAccount[] => {
     const id = stringValue(account["id"]);
-    if (!id || stringValue(account["agent"]) !== agent) return [];
+    const engine = accountEngine(account);
+    if (!id || engine !== agent) return [];
     const profile = recordValue(account["apiProfile"]);
     return [{
       id,
@@ -105,7 +106,7 @@ export function sessionLaunchAccounts(
       status: stringValue(account["status"]),
       isDefault: account["isDefault"] === true,
       apiProfile: Object.keys(profile).length > 0 ? profile : undefined,
-      engine: accountEngine(account),
+      engine,
       capabilities: accountCapabilities(account),
       ...(typeof account["apiProfileError"] === "string" ? { apiProfileError: account["apiProfileError"] } : {}),
     }];

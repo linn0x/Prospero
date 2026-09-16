@@ -14,7 +14,7 @@ export type OrchestrationLaunchSelection = {
 
 function accountParams(selection: OrchestrationLaunchSelection): JsonObject {
   if (
-    (selection.agent === "codex" || selection.agent === "claude") &&
+    (selection.agent === "codex" || selection.agent === "claude" || selection.agent === "opencode") &&
     selection.accountId?.trim()
   ) {
     return { accountId: selection.accountId.trim() };

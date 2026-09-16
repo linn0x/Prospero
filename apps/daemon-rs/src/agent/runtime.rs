@@ -11,6 +11,8 @@ use tokio::sync::{Mutex, MutexGuard, Semaphore, oneshot, watch};
 
 use super::claude::{AdapterEvent, ClaudeTurn, QuestionReply, TurnOptions, spawn_turn};
 use super::codex::CodexTurn;
+use super::deepseek::DeepseekTurn;
+use super::opencode::OpencodeTurn;
 use super::store::{ApprovalPolicy, PermissionMode, QueuedRow};
 use super::*;
 use crate::error::{Error, Result};
@@ -141,6 +143,8 @@ fn attachment_refs(attachments: &[AttachmentInput]) -> Vec<MessageAttachment> {
 enum Driver {
     Claude(ClaudeTurn),
     Codex(CodexTurn),
+    Deepseek(DeepseekTurn),
+    Opencode(OpencodeTurn),
 }
 
 impl Driver {
@@ -148,6 +152,8 @@ impl Driver {
         match self {
             Driver::Claude(driver) => driver.take_events(),
             Driver::Codex(driver) => driver.take_events(),
+            Driver::Deepseek(driver) => driver.take_events(),
+            Driver::Opencode(driver) => driver.take_events(),
         }
     }
 
@@ -155,6 +161,8 @@ impl Driver {
         match self {
             Driver::Claude(driver) => driver.interrupt(),
             Driver::Codex(driver) => driver.kill(),
+            Driver::Deepseek(driver) => driver.interrupt(),
+            Driver::Opencode(driver) => driver.interrupt(),
         }
     }
 
@@ -167,6 +175,15 @@ impl Driver {
                 }
                 driver.steer(text).await
             }
+            Driver::Deepseek(driver) => driver.steer(text, attachments).await,
+            Driver::Opencode(driver) => {
+                if !attachments.is_empty() {
+                    return Err(Error::Invalid(
+                        "OpenCode structured runtime 暂不支持图片附件".into(),
+                    ));
+                }
+                driver.steer(text).await
+            }
         }
     }
 
@@ -174,13 +191,17 @@ impl Driver {
         match self {
             Driver::Claude(driver) => driver.compact().await,
             Driver::Codex(driver) => driver.compact().await,
+            Driver::Deepseek(driver) => driver.compact().await,
+            Driver::Opencode(driver) => driver.compact().await,
         }
     }
 
     async fn send_to_subagent(&self, subagent: &str, text: &str) -> Result<()> {
         match self {
             Driver::Codex(driver) => driver.send_to_subagent(subagent, text).await,
-            Driver::Claude(_) => Err(Error::Invalid("Claude 不支持子 Agent 定向消息".into())),
+            Driver::Claude(_) | Driver::Deepseek(_) | Driver::Opencode(_) => {
+                Err(Error::Invalid("这个 Agent 不支持子 Agent 定向消息".into()))
+            }
         }
     }
 
@@ -190,14 +211,24 @@ impl Driver {
     ) -> Result<Option<Vec<serde_json::Value>>> {
         match self {
             Driver::Codex(driver) => driver.read_subagent_history(subagent).await,
-            Driver::Claude(_) => Ok(None),
+            Driver::Claude(_) | Driver::Deepseek(_) | Driver::Opencode(_) => Ok(None),
         }
     }
 
-    async fn apply_selection(&self, model: &str, effort: Option<&str>) -> Result<()> {
+    async fn apply_selection(&mut self, model: &str, effort: Option<&str>) -> Result<()> {
         match self {
             Driver::Claude(driver) => driver.apply_selection(model, effort).await,
             Driver::Codex(driver) => driver.apply_selection(model, effort).await,
+            Driver::Deepseek(driver) => driver.apply_selection(model, effort).await,
+            Driver::Opencode(driver) => driver.apply_selection(model).await,
+        }
+    }
+
+    async fn models(&self, workspace: &str) -> Option<Result<AgentModelCatalog>> {
+        match self {
+            Driver::Deepseek(driver) => Some(driver.models().await),
+            Driver::Opencode(driver) => Some(driver.models(workspace).await),
+            Driver::Claude(_) | Driver::Codex(_) => None,
         }
     }
 
@@ -205,6 +236,8 @@ impl Driver {
         match self {
             Driver::Claude(driver) => driver.kill(),
             Driver::Codex(driver) => driver.kill(),
+            Driver::Deepseek(driver) => driver.kill(),
+            Driver::Opencode(driver) => driver.kill(),
         }
     }
 }
@@ -249,6 +282,29 @@ struct State {
     closed: AtomicBool,
     failed: AtomicBool,
     changed: watch::Sender<u64>,
+}
+
+fn profile_model_catalog(
+    profile: crate::accounts::ApiProfile,
+    current_effort: Option<String>,
+) -> AgentModelCatalog {
+    let current = profile.model.clone();
+    AgentModelCatalog {
+        models: vec![super::LaunchModelInfo {
+            id: profile.model.clone(),
+            label: profile.model,
+            description: None,
+            supported_efforts: profile
+                .model_capabilities
+                .as_ref()
+                .and_then(|caps| caps.supported_efforts.clone())
+                .unwrap_or_default(),
+            default_effort: None,
+            is_default: true,
+        }],
+        current_model: Some(current),
+        current_effort,
+    }
 }
 
 #[derive(Clone)]
@@ -319,10 +375,23 @@ impl Agents {
         };
         if !matches!(
             input.agent,
-            crate::protocol::AgentKind::Claude | crate::protocol::AgentKind::Codex
+            crate::protocol::AgentKind::Claude
+                | crate::protocol::AgentKind::Codex
+                | crate::protocol::AgentKind::Deepseek
+                | crate::protocol::AgentKind::Opencode
         ) {
             return Err(Error::Invalid(
                 "Agent 暂未接入 Rust structured runtime".into(),
+            ));
+        }
+        if input.agent == crate::protocol::AgentKind::Deepseek && input.account_id.is_some() {
+            return Err(Error::Invalid(
+                "DeepSeek Harness 使用本机 dsh 账号，不支持绑定 Prospero 账号".into(),
+            ));
+        }
+        if input.agent == crate::protocol::AgentKind::Opencode && input.account_id.is_none() {
+            return Err(Error::Invalid(
+                "OpenCode structured runtime 需要 OpenAI Chat Completions API Profile".into(),
             ));
         }
         if input.agent == crate::protocol::AgentKind::Codex {
@@ -354,6 +423,28 @@ impl Agents {
                 }
             }
         }
+        if input.agent == crate::protocol::AgentKind::Opencode {
+            let Some(account_id) = input.account_id.as_deref() else {
+                return Err(Error::Invalid(
+                    "OpenCode structured runtime 需要 OpenAI Chat Completions API Profile".into(),
+                ));
+            };
+            let data = self.0.database.directory().to_owned();
+            let account_id = account_id.to_owned();
+            let profile = self
+                .0
+                .database
+                .call(move |store| Ok(store.managed_snapshot_row(&data, &account_id)?.api_profile))
+                .await?;
+            match profile.as_ref().map(|profile| profile.protocol()) {
+                Some("openai_chat_completions") => {}
+                _ => {
+                    return Err(Error::Invalid(
+                        "所选账号不支持 OpenCode structured runtime".into(),
+                    ));
+                }
+            }
+        }
         if let Some(fork) = input.resume.as_ref().and_then(|resume| resume.fork) {
             if fork {
                 return Err(Error::Conflict);
@@ -372,6 +463,7 @@ impl Agents {
             mode: input.mode,
             model: input.model,
             effort: input.effort,
+            agent_preset: input.agent_preset,
             account_id: input.account_id,
             resume: input.resume,
         };
@@ -693,6 +785,7 @@ impl Agents {
             )
             .await?,
             api_profile,
+            agent_preset: run.agent_preset.clone(),
         };
         let driver = match run.agent {
             AgentKind::Claude => Driver::Claude(spawn_turn(
@@ -719,6 +812,26 @@ impl Agents {
                     .await?,
                 )
             }
+            AgentKind::Deepseek => Driver::Deepseek(
+                super::deepseek::spawn_turn(
+                    &workspace,
+                    &expanded,
+                    &attachments,
+                    native_id.as_deref(),
+                    &options,
+                )
+                .await?,
+            ),
+            AgentKind::Opencode => Driver::Opencode(
+                super::opencode::spawn_turn(
+                    &workspace,
+                    &expanded,
+                    &attachments,
+                    native_id.as_deref(),
+                    &options,
+                )
+                .await?,
+            ),
             _ => {
                 return Err(Error::Invalid(
                     "Agent 暂未接入 Rust structured runtime".into(),
@@ -1694,10 +1807,23 @@ impl Agents {
     /// CLI fresh, matching the legacy node adapter.
     pub async fn launch_catalog() -> Result<LaunchModelCatalog> {
         let models = super::claude::fetch_launch_catalog(&[]).await?;
+        let current_model = models.first().map(|model| model.id.clone());
         Ok(LaunchModelCatalog {
-            current_model: models.first().map(|model| model.id.clone()),
             models,
+            current_model,
+            current_effort: None,
+            presets: Vec::new(),
+            current_preset: None,
         })
+    }
+
+    pub async fn deepseek_launch_catalog() -> Result<LaunchModelCatalog> {
+        super::deepseek::launch_catalog().await
+    }
+
+    pub async fn opencode_launch_catalog() -> Result<LaunchModelCatalog> {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+        super::opencode::launch_catalog(Path::new(&home)).await
     }
 
     /// Catalog for a specific account: managed accounts probe through their
@@ -1734,21 +1860,29 @@ impl Agents {
                     .unwrap_or_default();
                 let model = profile.model.clone();
                 return Ok(LaunchModelCatalog {
-                    current_model: Some(model.clone()),
                     models: vec![LaunchModelInfo {
                         id: model,
                         label: profile.model.clone(),
                         description: None,
                         supported_efforts: efforts,
+                        default_effort: None,
                         is_default: true,
                     }],
+                    current_model: Some(profile.model),
+                    current_effort: None,
+                    presets: Vec::new(),
+                    current_preset: None,
                 });
             }
         }
         let models = super::claude::fetch_launch_catalog(&environment).await?;
+        let current_model = models.first().map(|model| model.id.clone());
         Ok(LaunchModelCatalog {
-            current_model: models.first().map(|model| model.id.clone()),
             models,
+            current_model,
+            current_effort: None,
+            presets: Vec::new(),
+            current_preset: None,
         })
     }
 
@@ -1973,8 +2107,65 @@ impl Agents {
         let id = id.to_owned();
         self.0
             .database
-            .call(move |store| store.set_approval_policy(&id, policy))
+            .call({
+                let id = id.clone();
+                move |store| store.set_approval_policy(&id, policy)
+            })
             .await?;
+        if policy == ApprovalPolicy::Auto
+            && let Ok(entry) = self.session_entry(&id).await
+        {
+            let pending = {
+                let guard = entry.handle.lock().await;
+                if let Some(handle) = guard.as_ref() {
+                    let replies = std::mem::take(&mut *handle.replies.lock().await);
+                    let mut records = handle.records.lock().await;
+                    let has_questions = !handle.questions.lock().await.is_empty();
+                    replies
+                        .into_iter()
+                        .map(|(request_id, reply)| (reply, records.remove(&request_id)))
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .map(|pending| (pending, has_questions))
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                }
+            };
+            let resolved_any = !pending.is_empty();
+            let has_questions = pending
+                .first()
+                .map(|(_, has_questions)| *has_questions)
+                .unwrap_or(false);
+            for ((reply, record_id), _) in pending {
+                let _ = reply.send(true);
+                if let Some(record_id) = record_id {
+                    let result = self
+                        .0
+                        .database
+                        .call({
+                            let id = id.clone();
+                            move |store| store.resolve_agent_permission(&id, &record_id)
+                        })
+                        .await;
+                    if !matches!(result, Err(Error::NotFound)) {
+                        result?;
+                    }
+                }
+            }
+            if resolved_any {
+                self.set_status(
+                    &id,
+                    if has_questions {
+                        SessionStatus::WaitingInput
+                    } else {
+                        SessionStatus::Running
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+        }
         self.publish();
         Ok(())
     }
@@ -1996,13 +2187,40 @@ impl Agents {
     /// session's persisted selection.
     pub async fn models(&self, id: &str) -> Result<AgentModelCatalog> {
         let id = id.to_owned();
+        let id_for_run = id.clone();
         let run = self
             .0
             .database
-            .call(move |store| store.agent_run(&id))
+            .call(move |store| store.agent_run(&id_for_run))
             .await?;
         if !run.active {
             return Err(Error::Conflict);
+        }
+        if run.agent == AgentKind::Deepseek {
+            let workspace = {
+                let id = id.clone();
+                self.0
+                    .database
+                    .call(move |store| Ok(store.session(&id)?.workspace))
+                    .await?
+            };
+            if let Ok(entry) = self.session_entry(&id).await {
+                let guard = entry.handle.lock().await;
+                if let Some(handle) = guard.as_ref()
+                    && let Some(catalog) = handle.driver.lock().await.models(&workspace).await
+                {
+                    return catalog;
+                }
+            }
+            if run.agent == AgentKind::Deepseek {
+                return super::deepseek::session_catalog(
+                    &workspace,
+                    run.native_id.as_deref(),
+                    run.model.as_deref(),
+                    run.effort.as_deref(),
+                )
+                .await;
+            }
         }
         let environment =
             Self::account_environment(&self.0.database, run.account_id.clone()).await?;
@@ -2016,22 +2234,24 @@ impl Agents {
                 .call(move |store| Ok(store.managed_snapshot_row(&data, &id)?.api_profile))
                 .await?;
             if let Some(profile) = profile {
-                let current = profile.model.clone();
-                return Ok(AgentModelCatalog {
-                    models: vec![super::LaunchModelInfo {
-                        id: profile.model.clone(),
-                        label: profile.model.clone(),
-                        description: None,
-                        supported_efforts: profile
-                            .model_capabilities
-                            .as_ref()
-                            .and_then(|caps| caps.supported_efforts.clone())
-                            .unwrap_or_default(),
-                        is_default: true,
-                    }],
-                    current_model: Some(current),
-                    current_effort: run.effort,
-                });
+                return Ok(profile_model_catalog(profile, run.effort));
+            }
+        }
+        if run.agent == AgentKind::Opencode {
+            let workspace = {
+                let id = id.clone();
+                self.0
+                    .database
+                    .call(move |store| Ok(store.session(&id)?.workspace))
+                    .await?
+            };
+            if let Ok(entry) = self.session_entry(&id).await {
+                let guard = entry.handle.lock().await;
+                if let Some(handle) = guard.as_ref()
+                    && let Some(catalog) = handle.driver.lock().await.models(&workspace).await
+                {
+                    return catalog;
+                }
             }
         }
         let models = if run.agent == AgentKind::Codex {
@@ -2065,7 +2285,7 @@ impl Agents {
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty());
         if model.trim().is_empty()
-            || model.chars().count() > 160
+            || model.chars().count() > 300
             || model.chars().any(|c| c.is_control())
         {
             return Err(Error::Invalid("模型无效".into()));
@@ -2082,6 +2302,57 @@ impl Agents {
             .call(move |store| store.agent_run(&id_for_env))
             .await?;
         let account_id = run.account_id.clone();
+        if run.agent == AgentKind::Deepseek {
+            if account_id.is_some() {
+                return Err(Error::Invalid(
+                    "DeepSeek Harness 使用本机 dsh 账号，不支持绑定 Prospero 账号".into(),
+                ));
+            }
+            let catalog = self.models(id).await?;
+            let selected = catalog
+                .models
+                .iter()
+                .find(|entry| entry.id == model)
+                .ok_or_else(|| Error::Invalid(format!("DeepSeek 模型不可用:{model}")))?;
+            if let Some(effort) = &effort
+                && !selected
+                    .supported_efforts
+                    .iter()
+                    .any(|level| level == effort)
+            {
+                return Err(Error::Invalid(format!("{model} 不支持推理强度 {effort}")));
+            }
+            let id_owned = id.to_owned();
+            let model_owned = model.clone();
+            let effort_owned = effort.clone();
+            let (model, effort) = self
+                .0
+                .database
+                .call(move |store| {
+                    store.set_agent_selection(&id_owned, &model_owned, effort_owned.as_deref())
+                })
+                .await?;
+            if let Ok(entry) = self.session_entry(id).await {
+                let guard = entry.handle.lock().await;
+                if let Some(handle) = guard.as_ref() {
+                    match handle
+                        .driver
+                        .lock()
+                        .await
+                        .apply_selection(&model, effort.as_deref())
+                        .await
+                    {
+                        Ok(()) | Err(Error::Closed) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            self.publish();
+            return Ok(AgentModelSelectionResult {
+                current_model: model,
+                current_effort: effort,
+            });
+        }
         let environment = Self::account_environment(&self.0.database, account_id.clone()).await?;
         // Profile sessions expose only the pinned model and never switch.
         if let Some(id) = account_id {

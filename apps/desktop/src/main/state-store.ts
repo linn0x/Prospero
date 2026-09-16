@@ -181,6 +181,9 @@ function relaySnapshot(statusValue: unknown, configValue: unknown): JsonObject {
     updatedAt: nonNegativeInteger(runtime["updatedAt"]),
     ...(typeof runtime["lastConnectedAt"] === "number" ? { lastConnectedAt: nonNegativeInteger(runtime["lastConnectedAt"]) } : {}),
     ...(typeof runtime["lastError"] === "string" ? { lastError: runtime["lastError"].slice(0, 2_000) } : {}),
+    activeStreams: nonNegativeInteger(runtime["activeStreams"]),
+    streamFailures: nonNegativeInteger(runtime["streamFailures"]),
+    ...(typeof runtime["lastStreamError"] === "string" ? { lastStreamError: runtime["lastStreamError"].slice(0, 2_000) } : {}),
     devices: {
       total: nonNegativeInteger(devices["total"]),
       ready: nonNegativeInteger(devices["ready"]),

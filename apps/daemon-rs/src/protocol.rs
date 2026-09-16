@@ -525,6 +525,7 @@ pub fn typescript() -> String {
         crate::agent::ConversationSearchResult::decl(&config),
         crate::agent::AttachmentChunk::decl(&config),
         crate::agent::LaunchModelInfo::decl(&config),
+        crate::agent::AgentPresetInfo::decl(&config),
         crate::agent::LaunchModelCatalog::decl(&config),
         crate::agent::AgentModelSelection::decl(&config),
         crate::agent::AgentModelSelectionResult::decl(&config),

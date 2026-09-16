@@ -174,9 +174,9 @@ export interface SessionManagerOptions {
   /** 每个会话各自注入的本地环境（编排 CLI 的身份和控制 socket 在这里进入）。 */
   sessionEnv?: ((sessionId: string) => Record<string, string>) | undefined;
   /** 账号目录由 daemon 的元数据层解析；SessionManager 只负责注入会话。 */
-  accountResolver?: ((accountId: string, agent: "claude" | "codex") => AccountBinding) | undefined;
+  accountResolver?: ((accountId: string, agent: "claude" | "codex" | "opencode") => AccountBinding) | undefined;
   /** Metadata-only account lookup for state projection; does not touch keys or runtime config. */
-  accountCapabilitiesResolver?: ((accountId: string, agent: "claude" | "codex") => AgentAccountCapabilities) | undefined;
+  accountCapabilitiesResolver?: ((accountId: string, agent: "claude" | "codex" | "opencode") => AgentAccountCapabilities) | undefined;
   /**
    * Production Unix defaults to detached per-session supervisors when a home
    * exists. Tests that inject adapters and unsupported platforms stay safely
@@ -226,7 +226,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   private readonly adapterFactory: (agent: AgentKind, state?: AdapterResumeState) => AgentAdapter;
   private readonly sessionEnv: (sessionId: string) => Record<string, string>;
   private readonly accountResolver:
-    | ((accountId: string, agent: "claude" | "codex") => AccountBinding)
+    | ((accountId: string, agent: "claude" | "codex" | "opencode") => AccountBinding)
     | undefined;
   private readonly accountCapabilitiesResolver: SessionManagerOptions["accountCapabilitiesResolver"];
   private readonly resolvedAccountCapabilities = new Map<string, AgentAccountCapabilities>();
@@ -1120,7 +1120,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
    * Codex 通过 catalogOnly 跳过 thread/start，Claude SDK 则在读取后立即释放。
    */
   async launchModels(
-    agent: "claude" | "codex" | "deepseek",
+    agent: "claude" | "codex" | "deepseek" | "opencode",
     accountId?: string,
   ): Promise<AgentModelCatalog> {
     const account = accountId && agent !== "deepseek" ? this.resolveAccount(agent, accountId) : undefined;
@@ -1275,7 +1275,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   }
 
   private resolveAccount(agent: AgentKind, accountId: string): AccountBinding {
-    if (agent !== "claude" && agent !== "codex") {
+    if (agent !== "claude" && agent !== "codex" && agent !== "opencode") {
       throw new SessionError(`agent "${agent}" 不支持账号隔离`, "agent_unavailable");
     }
     if (!this.accountResolver) {

@@ -14,9 +14,10 @@ describe("account launch metadata", () => {
   });
 
   it("preserves older daemon restrictions without treating an omitted tool flag as unsupported", () => {
-    const account = { agent: "codex", apiProfile: { protocol: "openai_chat_completions" } };
+    const account = { id: "chat", name: "Chat", status: "signed_in", isDefault: false, agent: "codex", apiProfile: { protocol: "openai_chat_completions" } };
     expect(accountEngine(account)).toBe("opencode");
     expect(accountCapabilities(account)).toEqual({ sessionKinds: ["structured"], plan: false, resume: false, modelSelection: false, reasoningEffort: false });
+    expect(sessionLaunchAccounts([account], "opencode")[0]?.id).toBe("chat");
     expect(accountCapabilities({ agent: "codex" }).modelSelection).toBe(true);
   });
 

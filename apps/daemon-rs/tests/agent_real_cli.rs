@@ -49,6 +49,7 @@ impl Harness {
                 mode: None,
                 model: None,
                 effort: None,
+                agent_preset: None,
                 account_id: None,
                 resume: None,
             })

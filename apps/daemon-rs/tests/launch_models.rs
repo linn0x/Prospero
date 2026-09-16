@@ -340,6 +340,7 @@ async fn http_route_serves_codex_api_profile_pinned_model() {
     let account_id = created_value["accountId"].as_str().unwrap();
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("GET")
@@ -363,6 +364,61 @@ async fn http_route_serves_codex_api_profile_pinned_model() {
         value["models"][0]["supportedEfforts"],
         json!(["low", "high"])
     );
+
+    let created = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/accounts")
+                .header("authorization", secret)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "type":"agent.account.api.create",
+                        "requestId":"create-opencode-profile",
+                        "agent":"opencode",
+                        "provider":"openai_compatible",
+                        "protocol":"openai_chat_completions",
+                        "name":"OpenCode API",
+                        "baseUrl":"http://localhost:12345/chat/completions",
+                        "model":"chat-profile",
+                        "apiKey":"sk-profile-secret",
+                        "modelCapabilities":{"contextWindow":32000,"maxOutputTokens":2048}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created_body = axum::body::to_bytes(created.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    let created_value: serde_json::Value = serde_json::from_slice(&created_body).unwrap();
+    let account_id = created_value["accountId"].as_str().unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/v1/launch/models?agent=opencode&accountId={account_id}"
+                ))
+                .header("authorization", secret)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["currentModel"], "chat-profile");
+    assert_eq!(value["models"][0]["id"], "chat-profile");
 }
 
 #[tokio::test]
@@ -398,6 +454,7 @@ async fn session_models_and_controls_routes_serve_persisted_selection() {
             mode: None,
             model: Some("opus[1m]".into()),
             effort: Some("high".into()),
+            agent_preset: None,
             account_id: None,
             resume: None,
         })
