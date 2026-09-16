@@ -46,4 +46,28 @@ describe("PtySession snapshot", () => {
     await expect(pending).resolves.toMatchObject({ ansi: "first", seq: 1 });
     expect(session.ring.lastSeq).toBe(2);
   });
+
+  it("includes scrollback in full snapshots", async () => {
+    const session = new PtySession({
+      id: "snapshot-scrollback",
+      agent: "custom",
+      title: "snapshot-scrollback",
+      cwd: process.cwd(),
+      cols: 80,
+      rows: 5,
+      file: process.execPath,
+      args: ["-e", "setInterval(() => {}, 1000)"],
+      env: { PATH: process.env.PATH ?? "" },
+    });
+    sessions.push(session);
+    const internals = session as unknown as {
+      onProcData(data: string): void;
+    };
+    internals.onProcData(Array.from({ length: 20 }, (_, index) => `line-${String(index + 1).padStart(2, "0")}\r\n`).join(""));
+
+    const snapshot = await session.snapshot();
+
+    expect(snapshot.ansi).toContain("line-01");
+    expect(snapshot.ansi).toContain("line-20");
+  });
 });

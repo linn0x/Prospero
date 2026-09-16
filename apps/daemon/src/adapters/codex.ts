@@ -40,6 +40,7 @@ import { DAEMON_VERSION } from "../version.js";
 import { fromUnifiedPatch } from "./diff.js";
 import { codexFileChanges, codexTurnDiffs } from "./codex-turn-diff.js";
 import { stopWindowsCodexProcess, windowsCodexCommand } from "./codex-windows-process.js";
+import { PROSPERO_AGENT_INSTRUCTIONS } from "../prospero-agent-instructions.js";
 import {
   AdapterError,
   summarize,
@@ -401,6 +402,7 @@ export class CodexAdapter implements AgentAdapter {
       cwd: ctx.cwd,
       approvalPolicy: initialPolicy.approvalPolicy,
       sandbox: initialPolicy.sandbox,
+      developerInstructions: PROSPERO_AGENT_INSTRUCTIONS,
       ...this.threadModelOverrides(),
     };
     let started: { thread?: { id?: string }; threadId?: string };

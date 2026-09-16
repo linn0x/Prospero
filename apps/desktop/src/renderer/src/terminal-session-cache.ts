@@ -14,9 +14,9 @@ export type TerminalSessionCacheLimits = {
 
 export const TERMINAL_SESSION_CACHE_SCROLLBACK = 1_000;
 export const TERMINAL_SESSION_CACHE_LIMITS: TerminalSessionCacheLimits = {
-  maxEntries: 6,
-  maxEntryChars: 750_000,
-  maxTotalChars: 2_000_000,
+  maxEntries: 8,
+  maxEntryChars: 3_000_000,
+  maxTotalChars: 12_000_000,
 };
 
 function validEntry(entry: TerminalSessionCacheEntry, limits: TerminalSessionCacheLimits): boolean {

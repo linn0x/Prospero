@@ -8,10 +8,11 @@
 import { chmodSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { CAPABILITY_AGENT_API_PROTOCOLS, CAPABILITY_AGENT_API_VALIDATION, CAPABILITY_AGENT_API_ENGINE_VALIDATION, CAPABILITY_AGENT_API_MODELS, CAPABILITY_AGENT_ACCOUNT_CONFIG, CAPABILITY_MODEL_SOURCES, type SessionInfo } from "@prospero/protocol";
+import { CAPABILITY_AGENT_API_PROTOCOLS, CAPABILITY_AGENT_API_VALIDATION, CAPABILITY_AGENT_API_ENGINE_VALIDATION, CAPABILITY_AGENT_API_MODELS, CAPABILITY_AGENT_ACCOUNT_CONFIG, CAPABILITY_MODEL_SOURCES, CAPABILITY_SCHEDULED_AGENTS, type SessionInfo } from "@prospero/protocol";
 import type { SessionManager } from "./session-manager.js";
 import type { RelayRuntimeStatus } from "./relay-host-client.js";
 import { selectStatusSessions, type SessionStatusSummary } from "./session-list.js";
+import type { ScheduledAgentService, ScheduledAgentTask } from "./agent-schedules.js";
 
 /** 壳只需要这些字段;完整 SessionInfo 里的 seq/totals 之类没必要外泄。 */
 export interface StatusSession {
@@ -70,7 +71,10 @@ export interface StatusSnapshot {
    */
   sessionSummary: SessionStatusSummary;
   sessions: StatusSession[];
+  schedules?: StatusScheduledAgentTask[];
 }
+
+export type StatusScheduledAgentTask = Omit<ScheduledAgentTask, "path">;
 
 const FILE = "status.json";
 
@@ -107,6 +111,7 @@ export class StatusFile {
       persistence: { pty: boolean; structured: boolean };
       startedAt?: number;
     },
+    private readonly schedules?: ScheduledAgentService,
   ) {
     this.filePath = path.join(home, FILE);
   }
@@ -116,7 +121,11 @@ export class StatusFile {
     if (actualPort) this.meta.port = actualPort;
     const onState = (): void => this.schedule();
     this.manager.on("state", onState);
-    this.detach = () => this.manager.off("state", onState);
+    this.schedules?.on("change", onState);
+    this.detach = () => {
+      this.manager.off("state", onState);
+      this.schedules?.off("change", onState);
+    };
     this.write();
   }
 
@@ -149,10 +158,11 @@ export class StatusFile {
       bind: this.meta.bind,
       controlToken: this.meta.controlToken,
       persistence: this.meta.persistence,
-      capabilities: [CAPABILITY_AGENT_API_PROTOCOLS, CAPABILITY_AGENT_API_VALIDATION, CAPABILITY_AGENT_API_ENGINE_VALIDATION, CAPABILITY_AGENT_API_MODELS, CAPABILITY_AGENT_ACCOUNT_CONFIG, CAPABILITY_MODEL_SOURCES],
+      capabilities: [CAPABILITY_AGENT_API_PROTOCOLS, CAPABILITY_AGENT_API_VALIDATION, CAPABILITY_AGENT_API_ENGINE_VALIDATION, CAPABILITY_AGENT_API_MODELS, CAPABILITY_AGENT_ACCOUNT_CONFIG, CAPABILITY_MODEL_SOURCES, CAPABILITY_SCHEDULED_AGENTS],
       ...(this.relay ? { relay: this.relay } : {}),
       sessionSummary: selected.summary,
       sessions: selected.sessions.map(toStatusSession),
+      ...(this.schedules ? { schedules: this.schedules.list().map(toStatusSchedule) } : {}),
     };
     try {
       writeFileSync(this.filePath, JSON.stringify(snapshot, null, 2));
@@ -214,4 +224,9 @@ export function toStatusSession(info: SessionInfo): StatusSession {
     }));
   }
   return session;
+}
+
+function toStatusSchedule(task: ScheduledAgentTask): StatusScheduledAgentTask {
+  const { path: _path, ...rest } = task;
+  return rest;
 }

@@ -6,6 +6,7 @@ import { AutomationError, AutomationService } from "./automation.js";
 import { CollaborationError, CollaborationService } from "./collaboration.js";
 import { DispatchError, DispatchService, type WorktreeMode } from "./dispatch.js";
 import { WorktreeAssetError, WorktreeAssetService } from "./worktree-assets.js";
+import { ScheduleError, ScheduledAgentService, type ScheduledAgentTaskKind, type ScheduledAgentTaskStatus } from "../agent-schedules.js";
 import {
   OrchestrationError,
   OrchestrationStore,
@@ -24,6 +25,8 @@ type MailType = "note" | "ask" | "reply" | "report";
 type SendMailType = Extract<MailType, "note" | "report">;
 const SEND_MESSAGE_TYPES = new Set<SendMailType>(["note", "report"]);
 const GATE_STATUSES = new Set(["pending", "resolved", "cancelled"]);
+const SCHEDULE_STATUSES = new Set<ScheduledAgentTaskStatus>(["ENABLED", "PAUSED"]);
+const SCHEDULE_KINDS = new Set<ScheduledAgentTaskKind>(["cron", "heartbeat"]);
 
 type Params = Record<string, unknown>;
 
@@ -137,6 +140,59 @@ function requiredBoolean(params: Params, name: string): boolean {
   return value;
 }
 
+function optionalAgent(params: Params, name: string): AgentKind | undefined {
+  const value = params[name];
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string" || !AUTOMATION_AGENTS.has(value as AgentKind)) {
+    throw new ControlSocketError(`无效参数: ${name}`, "bad_params");
+  }
+  return value as AgentKind;
+}
+
+function optionalPolicy(params: Params, name: string): ApprovalPolicy | undefined {
+  const value = params[name];
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string" || !POLICIES.has(value as ApprovalPolicy)) {
+    throw new ControlSocketError(`无效参数: ${name}`, "bad_params");
+  }
+  return value as ApprovalPolicy;
+}
+
+function optionalScheduleStatus(params: Params, name: string): ScheduledAgentTaskStatus | undefined {
+  const value = params[name];
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string") throw new ControlSocketError(`无效参数: ${name}`, "bad_params");
+  const status = value.trim().toUpperCase();
+  if (!SCHEDULE_STATUSES.has(status as ScheduledAgentTaskStatus)) {
+    throw new ControlSocketError(`${name} 必须是 ENABLED 或 PAUSED`, "bad_params");
+  }
+  return status as ScheduledAgentTaskStatus;
+}
+
+function optionalScheduleKind(params: Params, name: string): ScheduledAgentTaskKind | undefined {
+  const value = params[name];
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string" || !SCHEDULE_KINDS.has(value as ScheduledAgentTaskKind)) {
+    throw new ControlSocketError(`${name} 必须是 cron 或 heartbeat`, "bad_params");
+  }
+  return value as ScheduledAgentTaskKind;
+}
+
+function optionalMode(params: Params, name: string): "default" | "plan" | undefined {
+  const value = params[name];
+  if (value === undefined || value === null) return undefined;
+  if (value !== "default" && value !== "plan") throw new ControlSocketError(`${name} 必须是 default 或 plan`, "bad_params");
+  return value;
+}
+
+function nullableUpdateText(params: Params, name: string): string | null | undefined {
+  if (!(name in params)) return undefined;
+  const value = params[name];
+  if (value === null) return null;
+  if (typeof value !== "string" || value.trim() === "") throw new ControlSocketError(`无效参数: ${name}`, "bad_params");
+  return value;
+}
+
 function coordinatorOnly(
   store: OrchestrationStore,
   runId: string,
@@ -189,6 +245,7 @@ export function orchestrationControlApi(
   collaboration: CollaborationService,
   automation?: AutomationService,
   worktrees = new WorktreeAssetService(store, undefined, dispatch.sessionInspector()),
+  schedules?: ScheduledAgentService,
 ): (method: string, params: unknown, signal: AbortSignal) => Promise<unknown> {
   const inflight = new Map<string, { fingerprint: string; promise: Promise<unknown> }>();
 
@@ -570,6 +627,102 @@ export function orchestrationControlApi(
             () => worktrees.cleanup({ assetId, targetRef, confirm, deleteBranch }),
           );
         }
+        case "schedule.list": {
+          if (!schedules) throw new ControlSocketError("daemon 尚未启用定时任务", "method_not_found");
+          return schedules.list();
+        }
+        case "schedule.get": {
+          if (!schedules) throw new ControlSocketError("daemon 尚未启用定时任务", "method_not_found");
+          return schedules.get(text(params, "id"));
+        }
+        case "schedule.create": {
+          if (!schedules) throw new ControlSocketError("daemon 尚未启用定时任务", "method_not_found");
+          const id = optionalText(params, "id");
+          const kind = optionalScheduleKind(params, "kind");
+          const status = optionalScheduleStatus(params, "status");
+          const agent = optionalAgent(params, "agent");
+          const approvalPolicy = optionalPolicy(params, "approvalPolicy");
+          const cwd = optionalText(params, "cwd");
+          const cwds = optionalTextList(params, "cwds");
+          const accountId = optionalText(params, "accountId");
+          const model = optionalText(params, "model");
+          const reasoningEffort = optionalText(params, "reasoningEffort");
+          const mode = optionalMode(params, "mode");
+          const targetThreadId = optionalText(params, "targetThreadId");
+          const input = {
+            ...(id !== null ? { id } : {}),
+            ...(kind ? { kind } : {}),
+            name: text(params, "name"),
+            prompt: text(params, "prompt"),
+            rrule: text(params, "rrule"),
+            ...(status ? { status } : {}),
+            ...(agent ? { agent } : {}),
+            ...(approvalPolicy ? { approvalPolicy } : {}),
+            ...(cwd !== null ? { cwd } : {}),
+            ...(cwds ? { cwds } : {}),
+            ...(accountId !== null ? { accountId } : {}),
+            ...(model !== null ? { model } : {}),
+            ...(reasoningEffort !== null ? { reasoningEffort } : {}),
+            ...(mode ? { mode } : {}),
+            ...(targetThreadId !== null ? { targetThreadId } : {}),
+          };
+          return idempotent(method, operationId(params), input, () => schedules.create(input));
+        }
+        case "schedule.update": {
+          if (!schedules) throw new ControlSocketError("daemon 尚未启用定时任务", "method_not_found");
+          const id = text(params, "id");
+          const input: import("../agent-schedules.js").ScheduledAgentUpdateInput = { id };
+          const kind = optionalScheduleKind(params, "kind");
+          const name = optionalText(params, "name");
+          const prompt = optionalText(params, "prompt");
+          const rrule = optionalText(params, "rrule");
+          const status = optionalScheduleStatus(params, "status");
+          const agent = optionalAgent(params, "agent");
+          const approvalPolicy = optionalPolicy(params, "approvalPolicy");
+          const cwd = optionalText(params, "cwd");
+          const cwds = optionalTextList(params, "cwds");
+          const accountId = nullableUpdateText(params, "accountId");
+          const model = nullableUpdateText(params, "model");
+          const reasoningEffort = nullableUpdateText(params, "reasoningEffort");
+          const mode = params["mode"] === null ? null : optionalMode(params, "mode");
+          const targetThreadId = nullableUpdateText(params, "targetThreadId");
+          if (kind) input.kind = kind;
+          if (name !== null) input.name = name;
+          if (prompt !== null) input.prompt = prompt;
+          if (rrule !== null) input.rrule = rrule;
+          if (status) input.status = status;
+          if (agent) input.agent = agent;
+          if (approvalPolicy) input.approvalPolicy = approvalPolicy;
+          if (cwd !== null) input.cwd = cwd;
+          if (cwds) input.cwds = cwds;
+          if (accountId !== undefined) input.accountId = accountId;
+          if (model !== undefined) input.model = model;
+          if (reasoningEffort !== undefined) input.reasoningEffort = reasoningEffort;
+          if (params["mode"] === null) input.mode = null;
+          else if (mode !== undefined) input.mode = mode;
+          if (targetThreadId !== undefined) input.targetThreadId = targetThreadId;
+          return idempotent(method, operationId(params), input, () => schedules.update(input));
+        }
+        case "schedule.pause": {
+          if (!schedules) throw new ControlSocketError("daemon 尚未启用定时任务", "method_not_found");
+          const id = text(params, "id");
+          return idempotent(method, operationId(params), { id }, () => schedules.pause(id));
+        }
+        case "schedule.resume": {
+          if (!schedules) throw new ControlSocketError("daemon 尚未启用定时任务", "method_not_found");
+          const id = text(params, "id");
+          return idempotent(method, operationId(params), { id }, () => schedules.resume(id));
+        }
+        case "schedule.delete": {
+          if (!schedules) throw new ControlSocketError("daemon 尚未启用定时任务", "method_not_found");
+          const id = text(params, "id");
+          return idempotent(method, operationId(params), { id }, () => schedules.delete(id));
+        }
+        case "schedule.run": {
+          if (!schedules) throw new ControlSocketError("daemon 尚未启用定时任务", "method_not_found");
+          const id = text(params, "id");
+          return idempotent(method, operationId(params), { id }, () => schedules.runNow(id));
+        }
         case "mail.send": {
           const type = text(params, "type");
           if (!SEND_MESSAGE_TYPES.has(type as SendMailType)) {
@@ -664,7 +817,8 @@ export function orchestrationControlApi(
         error instanceof DispatchError ||
         error instanceof AutomationError ||
         error instanceof CollaborationError ||
-        error instanceof WorktreeAssetError
+        error instanceof WorktreeAssetError ||
+        error instanceof ScheduleError
       ) {
         throw new ControlSocketError(error.message, error.code);
       }

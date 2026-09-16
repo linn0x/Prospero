@@ -205,6 +205,7 @@ export interface StructuredSessionOptions {
   attachmentRoot?: string;
   /** Native Session Host-only provider Job registration callback. */
   registerProviderProcess?: ((process: { pid?: number | undefined }) => Promise<void>) | undefined;
+  controlRequest?: ((method: string, params?: unknown) => Promise<unknown>) | undefined;
   /** SQLite owner callbacks; history and tool bodies stay off the startup heap. */
   storage?: StructuredSessionStorage;
 }
@@ -294,6 +295,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
   private readonly codexAppServerArgs: string[] | undefined;
   private readonly attachmentRoot: string;
   private readonly registerProviderProcess: ((process: { pid?: number | undefined }) => Promise<void>) | undefined;
+  private readonly controlRequest: ((method: string, params?: unknown) => Promise<unknown>) | undefined;
   private readonly storage: StructuredSessionStorage | undefined;
   private historyLoaded = true;
   private readonly pendingEvents: AgentEventBody[] = [];
@@ -339,6 +341,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
     this.codexAppServerArgs = opts.codexAppServerArgs;
     this.attachmentRoot = opts.attachmentRoot ?? path.join(prosperoHome(), "attachments", this.id);
     this.registerProviderProcess = opts.registerProviderProcess;
+    this.controlRequest = opts.controlRequest;
     this.storage = opts.storage;
     this.historyLoaded = !opts.storage || !opts.restored || opts.restored.events.length > 0;
     const restored = opts.restored;
@@ -465,6 +468,7 @@ export class StructuredSession extends EventEmitter<StructuredSessionEvents> {
       },
       // 取函数而非取值:策略可在会话进行中改,适配器每次调用都要读到当下的值
       approvalPolicy: () => this.policy,
+      ...(this.controlRequest ? { controlRequest: this.controlRequest } : {}),
       ...(this.registerProviderProcess ? { registerProviderProcess: this.registerProviderProcess } : {}),
     });
     await beforeDrain?.();

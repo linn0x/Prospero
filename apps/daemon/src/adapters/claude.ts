@@ -31,6 +31,7 @@ import type {
   SubagentStatus,
 } from "@prospero/protocol";
 import { needsApproval } from "../approval-policy.js";
+import { PROSPERO_AGENT_INSTRUCTIONS } from "../prospero-agent-instructions.js";
 import { diffFromToolInput } from "./diff.js";
 import {
   AdapterError,
@@ -190,6 +191,7 @@ export class ClaudeAdapter implements AgentAdapter {
           env: { ...process.env, ...ctx.env },
           // 全部工具调用都过 canUseTool → 手机审批
           permissionMode: this.selectedMode,
+          systemPrompt: { type: "preset", preset: "claude_code", append: PROSPERO_AGENT_INSTRUCTIONS },
           canUseTool: this.canUseTool,
           includePartialMessages: true,
           forwardSubagentText: true,

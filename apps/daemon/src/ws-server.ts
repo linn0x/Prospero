@@ -36,6 +36,7 @@ import {
   CAPABILITY_ORCHESTRATION_RUN_LIFECYCLE,
   CAPABILITY_ORCHESTRATION_SNAPSHOT,
   CAPABILITY_ORCHESTRATION_WORKTREES,
+  CAPABILITY_SCHEDULED_AGENTS,
   CAPABILITY_SESSION_CREATE_MODEL,
   CAPABILITY_SUBAGENT_HISTORY,
   CAPABILITY_WORKSPACE_ROOTS,
@@ -124,6 +125,7 @@ import {
 import { AgentAccountFeatureError } from "./agent-account-feature-error.js";
 import { CodexAdapter } from "./adapters/codex.js";
 import { listDiscoveredSkills } from "./composer-context.js";
+import { ScheduledAgentService } from "./agent-schedules.js";
 
 const HIGH_WATER = 512 * 1024; // 超过则暂停向该客户端流式发送
 const LOW_WATER = 64 * 1024; //   低于则通过 ring/快照追平
@@ -168,6 +170,14 @@ const MANUAL_ORCHESTRATION_METHODS = new Set([
   "automation.pause",
   "worktree.inspect",
   "worktree.cleanup",
+  "schedule.list",
+  "schedule.get",
+  "schedule.create",
+  "schedule.update",
+  "schedule.pause",
+  "schedule.resume",
+  "schedule.delete",
+  "schedule.run",
 ]);
 
 interface AttachState {
@@ -285,6 +295,7 @@ export interface DaemonServer {
     dispatch: DispatchService;
     automation: AutomationService;
   };
+  schedules: ScheduledAgentService;
   collaboration: CollaborationService;
   controlSocket: ControlSocketServer;
   close(): Promise<void>;
@@ -347,6 +358,11 @@ export async function createDaemonServer(
   await accounts.ready();
   const apiTests = new Map<string, AbortController>();
   const structuredSupervisorEnabled = opts.structuredSupervisor ?? process.env["VITEST"] !== "true";
+  let orchestrationApi: ReturnType<typeof orchestrationControlApi> | undefined;
+  const requireOrchestrationApi = (): ReturnType<typeof orchestrationControlApi> => {
+    if (!orchestrationApi) throw new ControlSocketError("daemon 控制 API 尚未就绪", "busy");
+    return orchestrationApi;
+  };
   // Freeze the POSIX executable boundary before any Unix session launcher is
   // created. Falling back to mutable dist after a snapshot error would
   // recreate the exact build-version split this boundary prevents, so fail
@@ -386,6 +402,9 @@ export async function createDaemonServer(
       PROSPERO_CONTROL_TOKEN_PATH: controlTokenPath,
       PATH: [cliBinDir, process.env["PATH"] ?? ""].filter((part) => part !== "").join(path.delimiter),
     }),
+    controlRequest: async (method, params) => {
+      return await requireOrchestrationApi()(method, params ?? {}, new AbortController().signal);
+    },
     accountResolver: (accountId, agent) => accounts.resolveForSession(accountId, agent, modelApiBaseUrl),
     accountCapabilitiesResolver: (accountId, agent) => accounts.capabilitiesFor(accountId, agent),
   });
@@ -393,17 +412,23 @@ export async function createDaemonServer(
   const orchestrationStore = new OrchestrationStore(opts.home);
   const dispatchService = new DispatchService(orchestrationStore, manager);
   const automationService = new AutomationService(orchestrationStore, dispatchService);
+  const schedules = new ScheduledAgentService({
+    root: path.join(process.env["CODEX_HOME"] ?? path.join(os.homedir(), ".codex"), "automations"),
+    manager,
+  });
   const goalInitialization = new GoalInitializationService(
     orchestrationStore,
     manager,
     goalCoordinatorPrompt,
   );
   const collaboration = new CollaborationService(orchestrationStore);
-  const orchestrationApi = orchestrationControlApi(
+  orchestrationApi = orchestrationControlApi(
     orchestrationStore,
     dispatchService,
     collaboration,
     automationService,
+    undefined,
+    schedules,
   );
   const controlSocket = await startControlSocket({
     home: opts.home,
@@ -417,7 +442,7 @@ export async function createDaemonServer(
     controlToken,
     fullAccess: opts.fullAccess ?? false,
     persistence: { pty: manager.tmuxEnabled || manager.ptySupervisorEnabled, structured: true },
-  });
+  }, schedules);
   const conns = new Set<Conn>();
   const fsPutChains = new Map<string, Promise<void>>();
   let accountFeatureRequests = 0;
@@ -873,6 +898,7 @@ export async function createDaemonServer(
     if (process.platform === "win32") capabilities.push(CAPABILITY_WORKSPACE_ROOTS);
     capabilities.push(CAPABILITY_WORKSPACE_SUMMARY);
     if (conn.protocolVersion >= 9) capabilities.push(CAPABILITY_SUBAGENT_HISTORY);
+    if (conn.protocolVersion >= 16 && conn.device?.allowShell) capabilities.push(CAPABILITY_SCHEDULED_AGENTS);
     if (conn.protocolVersion >= 7) capabilities.push(CAPABILITY_ORCHESTRATION_SNAPSHOT);
     if (
       conn.protocolVersion >= 8 &&
@@ -1806,6 +1832,41 @@ export async function createDaemonServer(
         sendOrchestrationSnapshot(conn);
         return;
 
+      case "schedule.list":
+      case "schedule.get":
+      case "schedule.create":
+      case "schedule.update":
+      case "schedule.pause":
+      case "schedule.resume":
+      case "schedule.delete":
+      case "schedule.run": {
+        if (!canDeviceOrchestrate(device) || conn.protocolVersion < 16 || !device.allowShell) {
+          send(conn, {
+            type: "error",
+            code: "forbidden",
+            message: "这台设备没有定时任务权限，或 daemon 版本过旧",
+          });
+          return;
+        }
+        const { type, requestId, ...params } = msg;
+        const result = await requireOrchestrationApi()(type, params, new AbortController().signal);
+        const response: Extract<S2CMessage, { type: "schedule.result" }> = {
+          type: "schedule.result",
+          ...(requestId ? { requestId } : {}),
+          ok: true,
+        };
+        if (type === "schedule.list") response.schedules = result as typeof response.schedules;
+        else if (type === "schedule.delete") response.deleted = (result as { deleted?: boolean }).deleted === true;
+        else {
+          const run = result as { task?: unknown; session?: SessionInfo; queued?: boolean };
+          response.task = (run.task ?? result) as typeof response.task;
+          if (run.session) response.session = clampSessionInfo(run.session);
+          if (run.queued !== undefined) response.queued = run.queued;
+        }
+        send(conn, response);
+        return;
+      }
+
       case "orchestration.run.create":
       case "orchestration.run.complete":
       case "orchestration.run.abandon":
@@ -1830,31 +1891,31 @@ export async function createDaemonServer(
           return;
         }
         if (msg.type === "orchestration.run.create") {
-          await orchestrationApi("run.create", {
+          await requireOrchestrationApi()("run.create", {
             objective: msg.objective,
             coordinatorSessionId: null,
             ...(msg.operationId ? { operationId: msg.operationId } : {}),
           }, new AbortController().signal);
         } else if (msg.type === "orchestration.run.complete") {
-          await orchestrationApi("run.complete", {
+          await requireOrchestrationApi()("run.complete", {
             runId: msg.runId,
             operationId: msg.operationId,
             actorSessionId: null,
           }, new AbortController().signal);
         } else if (msg.type === "orchestration.run.abandon") {
-          await orchestrationApi("run.abandon", {
+          await requireOrchestrationApi()("run.abandon", {
             runId: msg.runId,
             operationId: msg.operationId,
             actorSessionId: null,
           }, new AbortController().signal);
         } else if (msg.type === "orchestration.run.delete") {
-          await orchestrationApi("run.delete", {
+          await requireOrchestrationApi()("run.delete", {
             runId: msg.runId,
             operationId: msg.operationId,
             actorSessionId: null,
           }, new AbortController().signal);
         } else if (msg.type === "orchestration.task.create") {
-          await orchestrationApi("task.create", {
+          await requireOrchestrationApi()("task.create", {
             runId: msg.runId,
             title: msg.title,
             spec: msg.spec,
@@ -1865,20 +1926,20 @@ export async function createDaemonServer(
             actorSessionId: null,
           }, new AbortController().signal);
         } else if (msg.type === "orchestration.task.cancel") {
-          await orchestrationApi("task.cancel", {
+          await requireOrchestrationApi()("task.cancel", {
             taskId: msg.taskId,
             operationId: msg.operationId,
             ...(msg.reason ? { reason: msg.reason } : {}),
             actorSessionId: null,
           }, new AbortController().signal);
         } else if (msg.type === "orchestration.task.retry") {
-          await orchestrationApi("task.retry", {
+          await requireOrchestrationApi()("task.retry", {
             taskId: msg.taskId,
             operationId: msg.operationId,
             actorSessionId: null,
           }, new AbortController().signal);
         } else if (msg.type === "orchestration.worker.start") {
-          await orchestrationApi("worker.start", {
+          await requireOrchestrationApi()("worker.start", {
             taskId: msg.taskId,
             agent: msg.agent,
             ...(msg.accountId ? { accountId: msg.accountId } : {}),
@@ -1891,21 +1952,21 @@ export async function createDaemonServer(
             actorSessionId: null,
           }, new AbortController().signal);
         } else if (msg.type === "orchestration.worker.stop") {
-          await orchestrationApi("worker.stop", {
+          await requireOrchestrationApi()("worker.stop", {
             taskId: msg.taskId,
             operationId: msg.operationId,
             ...(msg.reason ? { reason: msg.reason } : {}),
             actorSessionId: null,
           }, new AbortController().signal);
         } else if (msg.type === "orchestration.graph.create") {
-          await orchestrationApi("graph.create", {
+          await requireOrchestrationApi()("graph.create", {
             operationId: msg.operationId,
             objective: msg.objective,
             nodes: msg.nodes,
             coordinatorSessionId: null,
           }, new AbortController().signal);
         } else if (msg.type === "orchestration.graph.apply") {
-          await orchestrationApi("graph.apply", {
+          await requireOrchestrationApi()("graph.apply", {
             operationId: msg.operationId,
             runId: msg.runId,
             baseRevision: msg.baseRevision,
@@ -1914,7 +1975,7 @@ export async function createDaemonServer(
             actorSessionId: null,
           }, new AbortController().signal);
         } else if (msg.type === "orchestration.automation.start") {
-          await orchestrationApi("automation.start", {
+          await requireOrchestrationApi()("automation.start", {
             operationId: msg.operationId,
             runId: msg.runId,
             agent: msg.agent,
@@ -1925,19 +1986,19 @@ export async function createDaemonServer(
             actorSessionId: null,
           }, new AbortController().signal);
         } else if (msg.type === "orchestration.automation.pause") {
-          await orchestrationApi("automation.pause", {
+          await requireOrchestrationApi()("automation.pause", {
             operationId: msg.operationId,
             runId: msg.runId,
             actorSessionId: null,
           }, new AbortController().signal);
         } else if (msg.type === "orchestration.worktree.inspect") {
-          await orchestrationApi("worktree.inspect", {
+          await requireOrchestrationApi()("worktree.inspect", {
             assetId: msg.assetId,
             ...(msg.targetRef ? { targetRef: msg.targetRef } : {}),
             actorSessionId: null,
           }, new AbortController().signal);
         } else {
-          await orchestrationApi("worktree.cleanup", {
+          await requireOrchestrationApi()("worktree.cleanup", {
             operationId: msg.operationId,
             assetId: msg.assetId,
             ...(msg.targetRef ? { targetRef: msg.targetRef } : {}),
@@ -3104,7 +3165,7 @@ export async function createDaemonServer(
         res.once("close", abort);
         let result;
         try {
-          result = await orchestrationApi(method, params, controller.signal);
+          result = await requireOrchestrationApi()(method, params, controller.signal);
         } finally {
           req.off("aborted", abort);
           res.off("close", abort);
@@ -3355,6 +3416,7 @@ export async function createDaemonServer(
   statusFile.start(port);
   relayClient.update(loadConfig(opts.home), loadDevices(opts.home));
   automationService.resumePersisted();
+  schedules.start();
   await goalInitialization.retryPending();
 
   // 周期性 worktree GC:复用 worktree-assets 的只读核验与保守清理,只回收
@@ -3424,6 +3486,7 @@ export async function createDaemonServer(
       dispatch: dispatchService,
       automation: automationService,
     },
+    schedules,
     collaboration,
     controlSocket,
     close: async () => {
@@ -3438,6 +3501,7 @@ export async function createDaemonServer(
       for (const conn of conns) conn.ws.terminate();
       statusFile.stop();
       await controlSocket.close();
+      schedules.close();
       goalInitialization.close();
       if (revokeTimer) clearTimeout(revokeTimer);
       revokeWatcher?.close();

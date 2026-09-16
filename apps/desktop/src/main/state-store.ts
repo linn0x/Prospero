@@ -223,6 +223,41 @@ function sessionSummary(value: unknown, sessions: SessionInfo[]): SessionSummary
   };
 }
 
+function scheduleSnapshot(value: unknown): JsonObject[] {
+  return arrayValue(value).flatMap((entry) => {
+    const record = objectValue(entry);
+    const id = stringValue(record["id"]);
+    const name = stringValue(record["name"]);
+    const prompt = stringValue(record["prompt"]);
+    const rrule = stringValue(record["rrule"]);
+    const cwd = stringValue(record["cwd"]);
+    if (!id || !name || !prompt || !rrule || !cwd) return [];
+    return [{
+      id,
+      kind: stringValue(record["kind"], "heartbeat"),
+      name,
+      prompt,
+      status: stringValue(record["status"], "PAUSED"),
+      rrule,
+      agent: stringValue(record["agent"], "codex"),
+      approvalPolicy: stringValue(record["approvalPolicy"], "standard"),
+      cwd,
+      cwds: arrayValue(record["cwds"]).filter((item): item is string => typeof item === "string"),
+      ...(typeof record["accountId"] === "string" ? { accountId: record["accountId"] } : {}),
+      ...(typeof record["model"] === "string" ? { model: record["model"] } : {}),
+      ...(typeof record["reasoningEffort"] === "string" ? { reasoningEffort: record["reasoningEffort"] } : {}),
+      ...(typeof record["mode"] === "string" ? { mode: record["mode"] } : {}),
+      ...(typeof record["targetThreadId"] === "string" ? { targetThreadId: record["targetThreadId"] } : {}),
+      ...(typeof record["lastSessionId"] === "string" ? { lastSessionId: record["lastSessionId"] } : {}),
+      ...(typeof record["lastRunAt"] === "number" ? { lastRunAt: nonNegativeInteger(record["lastRunAt"]) } : {}),
+      nextRunAt: nonNegativeInteger(record["nextRunAt"]),
+      ...(typeof record["lastError"] === "string" ? { lastError: record["lastError"].slice(0, 2_000) } : {}),
+      createdAt: nonNegativeInteger(record["createdAt"]),
+      updatedAt: nonNegativeInteger(record["updatedAt"]),
+    }];
+  });
+}
+
 function normalizeProject(path: string): string {
   const normalized = normalize(resolve(path.trim()));
   return normalized.length > 3 ? normalized.replace(/[\\/]+$/, "") : normalized;
@@ -373,6 +408,7 @@ export class StateStore extends EventEmitter {
         relay: relaySnapshot(status["relay"], config["relay"]),
         sessionSummary: summary,
         sessions,
+        schedules: scheduleSnapshot(status["schedules"]),
         ...(running ? { pid: rawPid } : {}),
         ...(this.lastError ? { lastError: this.lastError } : {}),
       };

@@ -423,6 +423,59 @@ describe("结构化轨协议", () => {
     })).toThrowError(ProtocolError);
   });
 
+  it("Agent 定时任务协议可创建、修改和触发", () => {
+    expect(parseC2S({
+      type: "schedule.create",
+      requestId: "schedule-create",
+      operationId: "op-schedule-create",
+      id: "hourly-monitor",
+      kind: "heartbeat",
+      name: "Hourly monitor",
+      prompt: "check status",
+      rrule: "FREQ=HOURLY",
+      agent: "claude",
+      approvalPolicy: "standard",
+      cwd: "/tmp/project",
+      model: "claude-sonnet-5",
+      reasoningEffort: "high",
+      mode: "default",
+    })).toMatchObject({ type: "schedule.create", id: "hourly-monitor", agent: "claude" });
+    expect(parseC2S({
+      type: "schedule.update",
+      id: "hourly-monitor",
+      accountId: null,
+      targetThreadId: null,
+    })).toMatchObject({ type: "schedule.update", accountId: null });
+    expect(parseC2S({
+      type: "schedule.run",
+      requestId: "schedule-run",
+      operationId: "op-schedule-run",
+      id: "hourly-monitor",
+    })).toMatchObject({ type: "schedule.run", id: "hourly-monitor" });
+    expect(parseS2C({
+      type: "schedule.result",
+      requestId: "schedule-run",
+      ok: true,
+      queued: false,
+      task: {
+        version: 1,
+        id: "hourly-monitor",
+        kind: "heartbeat",
+        name: "Hourly monitor",
+        prompt: "check status",
+        status: "ENABLED",
+        rrule: "FREQ=HOURLY",
+        agent: "claude",
+        approvalPolicy: "standard",
+        cwd: "/tmp/project",
+        cwds: ["/tmp/project"],
+        nextRunAt: 1,
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    })).toMatchObject({ type: "schedule.result", ok: true });
+  });
+
   it("工作树资产检查协议是只读的，清理必须明确 confirm", () => {
     expect(parseC2S({
       type: "orchestration.worktree.inspect",

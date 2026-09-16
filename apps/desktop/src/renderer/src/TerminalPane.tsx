@@ -132,7 +132,7 @@ export function terminalBootstrapCursor(cachedCursor?: number): number {
   return typeof cachedCursor === "number" && Number.isSafeInteger(cachedCursor) && cachedCursor >= 0 ? cachedCursor : 0;
 }
 
-export function TerminalPane({ session, fontFamily, fontSize }: { session: SessionInfo; fontFamily: string; fontSize: number }) {
+export function TerminalPane({ session, fontFamily, fontSize, active = true }: { session: SessionInfo; fontFamily: string; fontSize: number; active?: boolean }) {
   const { t } = useLocale();
   const tRef = useRef(t);
   tRef.current = t;
@@ -156,6 +156,8 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
   const readOnly = terminalSessionIsReadOnly(session.status);
   const readOnlyRef = useRef(readOnly);
   readOnlyRef.current = readOnly;
+  const activeRef = useRef(active);
+  activeRef.current = active;
   const [operationError, setOperationError] = useState<string>();
   const [connectionError, setConnectionError] = useState<string>();
   const [connected, setConnected] = useState(false);
@@ -248,6 +250,19 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
     terminalRef.current = terminal;
     fitRef.current = fit;
     searchRef.current = search;
+    terminal.open(host.current);
+    const fitVisible = (): boolean => {
+      const element = host.current;
+      if (!element?.isConnected || element.clientWidth === 0 || element.clientHeight === 0) return false;
+      fit.fit();
+      return true;
+    };
+    const fitVisibleSoon = (): void => {
+      window.requestAnimationFrame(() => {
+        if (terminalRef.current !== terminal) return;
+        if (fitVisible() && host.current?.getClientRects().length) terminal.focus();
+      });
+    };
     if (cached) {
       cursorRef.current = terminalBootstrapCursor(cached.cursor);
       replayingRef.current = true;
@@ -258,7 +273,8 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
             replayingRef.current = false;
             stableBufferRef.current = true;
             setSyncing(true);
-            fit.fit();
+            fitVisible();
+            fitVisibleSoon();
             if (host.current?.getClientRects().length) terminal.focus();
           }
           done();
@@ -270,14 +286,14 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
       setSyncing(true);
       restoreReadyRef.current = Promise.resolve();
     }
-    terminal.open(host.current);
     try {
       const webgl = new WebglAddon();
       webgl.onContextLoss(() => webgl.dispose());
       terminal.loadAddon(webgl);
     } catch { /* Canvas renderer remains available. */ }
     if (!cached) {
-      fit.fit();
+      fitVisible();
+      fitVisibleSoon();
       if (host.current?.getClientRects().length) terminal.focus();
     }
 
@@ -295,7 +311,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
       return queueInputText(payload, accepted);
     };
     const inputDisposable = terminal.onData((value) => {
-      if (replayingRef.current || !connectedRef.current) return;
+      if (replayingRef.current || !activeRef.current || !connectedRef.current) return;
       input += value;
       window.clearTimeout(inputTimer);
       inputTimer = window.setTimeout(() => { void flushInput(); }, 4);
@@ -303,10 +319,14 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
     terminal.attachCustomKeyEventHandler((event) => {
       const action = terminalShortcutAction(event, isMac);
       if (readOnlyRef.current && action && action !== "copy" && action !== "selectAll" && action !== "find") {
+        event.preventDefault();
+        event.stopPropagation();
         showNotice(t("会话已结束，终端为只读", "The session has ended; the terminal is read-only"));
         return false;
       }
       if (action === "copy") {
+        event.preventDefault();
+        event.stopPropagation();
         const selection = terminal.getSelection();
         if (selection) {
           void window.prospero.writeClipboard(selection)
@@ -317,55 +337,42 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
       }
       if (action === "paste") {
         if (!connectedRef.current) {
+          event.preventDefault();
+          event.stopPropagation();
           showNotice(t("终端断线，重连后再粘贴", "Terminal is disconnected; paste after reconnecting"));
           return false;
         }
-        setOperationError(undefined);
-        void window.prospero.readClipboard()
-          .then((value) => {
-            if (!value) {
-              showNotice(t("剪贴板为空", "Clipboard is empty"));
-              return;
-            }
-            if (!connectedRef.current || readOnlyRef.current) {
-              showNotice(t("终端断线，未粘贴", "Terminal disconnected; nothing was pasted"));
-              return;
-            }
-            terminal.paste(value);
-            window.clearTimeout(inputTimer);
-            const delivered = flushInput();
-            if (!delivered) {
-              showNotice(t("终端断线，未粘贴", "Terminal disconnected; nothing was pasted"));
-              return;
-            }
-            void delivered.then((ok) => showNotice(ok ? t("已粘贴", "Pasted") : t("终端断线，未粘贴", "Terminal disconnected; nothing was pasted")));
-          })
-          .catch((reason) => setOperationError(reportError(reason)));
-        return false;
+        return true;
       }
       if (action === "selectAll") {
+        event.preventDefault();
+        event.stopPropagation();
         terminal.selectAll();
         showNotice(t("已选择终端内容", "Terminal contents selected"));
         return false;
       }
       if (action === "find") {
+        event.preventDefault();
+        event.stopPropagation();
         setFindOpen(true);
         // autoFocus 只在挂载那次生效;条已经开着时再按 ⌘F 得把焦点收回来。
         window.setTimeout(() => findInputRef.current?.select(), 0);
         return false;
       }
       if (action === "clear") {
+        event.preventDefault();
+        event.stopPropagation();
         terminal.clear();
         void queueInputText("\x0c");
         showNotice(t("已清屏", "Terminal cleared"));
         return false;
       }
-      if (action === "beginningOfLine") { void queueInputText("\x01"); return false; }
-      if (action === "endOfLine") { void queueInputText("\x05"); return false; }
-      if (action === "deleteToBeginning") { void queueInputText("\x15"); return false; }
-      if (action === "deleteToEnd") { void queueInputText("\x0b"); return false; }
-      if (action === "backwardWord") { void queueInputText("\x1bb"); return false; }
-      if (action === "forwardWord") { void queueInputText("\x1bf"); return false; }
+      if (action === "beginningOfLine") { event.preventDefault(); event.stopPropagation(); void queueInputText("\x01"); return false; }
+      if (action === "endOfLine") { event.preventDefault(); event.stopPropagation(); void queueInputText("\x05"); return false; }
+      if (action === "deleteToBeginning") { event.preventDefault(); event.stopPropagation(); void queueInputText("\x15"); return false; }
+      if (action === "deleteToEnd") { event.preventDefault(); event.stopPropagation(); void queueInputText("\x0b"); return false; }
+      if (action === "backwardWord") { event.preventDefault(); event.stopPropagation(); void queueInputText("\x1bb"); return false; }
+      if (action === "forwardWord") { event.preventDefault(); event.stopPropagation(); void queueInputText("\x1bf"); return false; }
       return true;
     });
     const osc52Disposable = terminal.parser.registerOscHandler(52, (data) => {
@@ -393,13 +400,22 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
       resizeTimer = window.setTimeout(() => {
         const element = host.current;
         if (replayingRef.current || !element?.isConnected || element.clientWidth === 0 || element.clientHeight === 0) return;
-        fit.fit();
+        fitVisible();
         if (connectedRef.current) {
           void queueInteraction({ type: "term.resize", cols: terminal.cols, rows: terminal.rows });
         }
       }, 80);
     });
     resize.observe(host.current);
+    const refitOnFocus = (): void => {
+      window.clearTimeout(resizeTimer);
+      resizeTimer = window.setTimeout(() => {
+        if (terminalRef.current !== terminal || replayingRef.current) return;
+        fitVisible();
+      }, 80);
+    };
+    window.addEventListener("focus", refitOnFocus);
+    document.addEventListener("visibilitychange", refitOnFocus);
 
     return () => {
       window.clearTimeout(inputTimer);
@@ -414,6 +430,8 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
       }
       if (connectedRef.current && !readOnlyRef.current) void flushInput(true);
       resize.disconnect();
+      window.removeEventListener("focus", refitOnFocus);
+      document.removeEventListener("visibilitychange", refitOnFocus);
       inputDisposable.dispose();
       osc52Disposable.dispose();
       bellDisposable.dispose();
@@ -430,8 +448,23 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
 
   useEffect(() => {
     const terminal = terminalRef.current;
-    if (terminal) terminal.options.disableStdin = readOnly || !connectedRef.current;
+    if (terminal) terminal.options.disableStdin = !activeRef.current || readOnly || !connectedRef.current;
   }, [readOnly]);
+
+  useEffect(() => {
+    const terminal = terminalRef.current;
+    if (terminal) terminal.options.disableStdin = !active || readOnlyRef.current || !connectedRef.current;
+    if (!active) return;
+    const frame = window.requestAnimationFrame(() => {
+      const element = host.current;
+      const terminal = terminalRef.current;
+      if (!element?.getClientRects().length || element.clientWidth === 0 || element.clientHeight === 0 || !terminal) return;
+      fitRef.current?.fit();
+      if (connectedRef.current) void queueInteraction({ type: "term.resize", cols: terminal.cols, rows: terminal.rows });
+      terminal.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [active, queueInteraction]);
 
   useEffect(() => {
     const terminal = terminalRef.current;
@@ -497,7 +530,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
             if (cursor !== undefined) {
               connectedRef.current = true;
               stableBufferRef.current = true;
-              if (terminalRef.current) terminalRef.current.options.disableStdin = readOnlyRef.current;
+              if (terminalRef.current) terminalRef.current.options.disableStdin = !activeRef.current || readOnlyRef.current;
               setConnected(true);
               setSyncing(false);
               setConnectionError(undefined);
@@ -556,7 +589,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
           connectedRef.current = true;
           const current = terminalRef.current;
           if (current) {
-            current.options.disableStdin = readOnlyRef.current;
+            current.options.disableStdin = !activeRef.current || readOnlyRef.current;
             if ((mode !== "delta" || bootstrapDelta) && host.current?.getClientRects().length) {
               fitRef.current?.fit();
               if (!readOnlyRef.current) void queueInteraction({ type: "term.resize", cols: current.cols, rows: current.rows });
@@ -612,7 +645,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
     terminalRef.current?.focus();
   };
 
-  return <div className={bell ? "terminal-shell terminal-bell" : "terminal-shell"}>
+  return <div className={bell ? "terminal-shell terminal-bell" : "terminal-shell"} hidden={!active}>
     <div className="terminal-status" role="status" aria-live="polite"><span className={readOnly ? "live-dot offline" : connected ? "live-dot" : syncing ? "live-dot syncing" : "live-dot offline"} />{readOnly ? t("会话已结束 · 只读", "Session ended · Read only") : connected ? t("实时终端", "Live terminal") : syncing ? t("正在同步", "Syncing") : t("正在重连", "Reconnecting")}<span className="terminal-shortcut" title={shortcutHint}>{isMac ? "⌘C / ⌘V" : "Ctrl+Shift+C / V"}</span></div>
     {findOpen && <div className="terminal-find">
       <input

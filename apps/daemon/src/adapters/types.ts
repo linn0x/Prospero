@@ -59,6 +59,7 @@ export interface AdapterContext {
   codexAppServerArgs?: string[];
   /** 当前审批策略;适配器据此决定是否绕过人工确认 */
   approvalPolicy?: () => ApprovalPolicy;
+  controlRequest?(method: string, params?: unknown): Promise<unknown>;
   /** 适配器产出一条归一化事件 */
   emit(body: AgentEventBody): void;
   /**

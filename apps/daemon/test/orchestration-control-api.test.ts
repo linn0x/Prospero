@@ -4,6 +4,7 @@ import { CollaborationService } from "../src/orchestration/collaboration.js";
 import { orchestrationControlApi } from "../src/orchestration/control-api.js";
 import { DispatchService, type WorkerSessionManager } from "../src/orchestration/dispatch.js";
 import { OrchestrationStore } from "../src/orchestration/store.js";
+import { ScheduleError } from "../src/agent-schedules.js";
 
 const unusedSessions: WorkerSessionManager = {
   async create() { throw new Error("not used"); },
@@ -43,6 +44,80 @@ describe("控制 API 的紧凑 Run 协议", () => {
       id: task.id,
       spec: "完整指令",
     });
+  });
+});
+
+describe("控制 API 的定时任务协议", () => {
+  it("转发 schedule create/list/run 并保留当前会话身份", async () => {
+    const store = new OrchestrationStore();
+    const calls: Array<{ method: string; input?: Record<string, unknown> }> = [];
+    const schedules = {
+      list: () => [{ id: "watch", status: "ENABLED" }],
+      get: (id: string) => ({ id, status: "ENABLED" }),
+      create: (input: Record<string, unknown>) => { calls.push({ method: "create", input }); return { id: input["id"] ?? "watch", ...input }; },
+      update: (input: Record<string, unknown>) => { calls.push({ method: "update", input }); return { id: input["id"], ...input }; },
+      pause: (id: string) => ({ id, status: "PAUSED" }),
+      resume: (id: string) => ({ id, status: "ENABLED" }),
+      delete: (id: string) => ({ id, deleted: true }),
+      runNow: async (id: string) => ({ task: { id }, session: { id: "session-1" }, queued: false }),
+    };
+    const api = orchestrationControlApi(
+      store,
+      new DispatchService(store, unusedSessions),
+      new CollaborationService(store),
+      undefined,
+      undefined,
+      schedules as never,
+    );
+
+    expect(await api("schedule.list", {}, new AbortController().signal)).toEqual([{ id: "watch", status: "ENABLED" }]);
+    await api("schedule.create", {
+      id: "watch",
+      name: "Watch",
+      prompt: "check",
+      rrule: "FREQ=HOURLY",
+      agent: "claude",
+      actorSessionId: "coord",
+    }, new AbortController().signal);
+    expect(calls.at(-1)).toEqual({ method: "create", input: {
+      id: "watch",
+      name: "Watch",
+      prompt: "check",
+      rrule: "FREQ=HOURLY",
+      agent: "claude",
+    } });
+
+    await expect(api("schedule.create", {
+      name: "Bad",
+      prompt: "check",
+      rrule: "FREQ=HOURLY",
+      agent: "shell",
+    }, new AbortController().signal)).rejects.toMatchObject({ code: "bad_params" });
+  });
+
+  it("maps scheduler errors to control socket errors", async () => {
+    const store = new OrchestrationStore();
+    const schedules = {
+      list: () => [],
+      get: () => { throw new ScheduleError("missing", "not_found"); },
+      create: () => { throw new ScheduleError("bad", "bad_params"); },
+      update: () => { throw new ScheduleError("bad", "bad_params"); },
+      pause: () => { throw new ScheduleError("missing", "not_found"); },
+      resume: () => { throw new ScheduleError("missing", "not_found"); },
+      delete: () => { throw new ScheduleError("missing", "not_found"); },
+      runNow: async () => { throw new ScheduleError("missing", "not_found"); },
+    };
+    const api = orchestrationControlApi(
+      store,
+      new DispatchService(store, unusedSessions),
+      new CollaborationService(store),
+      undefined,
+      undefined,
+      schedules as never,
+    );
+
+    await expect(api("schedule.get", { id: "missing" }, new AbortController().signal))
+      .rejects.toMatchObject({ code: "not_found" });
   });
 });
 

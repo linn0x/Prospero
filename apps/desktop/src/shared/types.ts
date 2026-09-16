@@ -128,6 +128,7 @@ export type DaemonSnapshot = {
   /** Global counts; `sessions` below is intentionally a bounded live slice. */
   sessionSummary?: SessionSummary;
   sessions: SessionInfo[];
+  schedules?: JsonObject[];
 };
 
 export type DesktopSettings = {

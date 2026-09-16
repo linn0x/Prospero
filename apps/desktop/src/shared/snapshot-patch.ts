@@ -43,6 +43,7 @@ const DAEMON_KEYS = [
   "capabilities",
   "relay",
   "sessionSummary",
+  "schedules",
 ] as const satisfies readonly Exclude<keyof DaemonSnapshot, "sessions">[];
 type MissingDaemonKey = Exclude<keyof DaemonSnapshot, "sessions" | (typeof DAEMON_KEYS)[number]>;
 const DAEMON_KEYS_ARE_EXHAUSTIVE: MissingDaemonKey extends never ? true : never = true;

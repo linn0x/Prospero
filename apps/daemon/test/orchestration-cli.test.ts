@@ -178,6 +178,55 @@ describe("会话内 prospero CLI", () => {
     });
   });
 
+  it("schedule create/run 命令转发定时任务参数", async () => {
+    const control = await startControlSocket({
+      home: tempHome(),
+      token: "secret",
+      handle: (method, params) => ({ method, params }),
+    });
+    servers.push(control);
+
+    const created = await cli(control.path, control.tokenPath, [
+      "schedule", "create",
+      "--id", "daily-check",
+      "--name", "Daily check",
+      "--prompt", "check status",
+      "--rrule", "FREQ=HOURLY",
+      "--agent", "claude",
+      "--account", "account-1",
+      "--cwd", "/tmp",
+      "--model", "claude-sonnet-5",
+      "--effort", "high",
+      "--mode", "plan",
+      "--operation-id", "schedule-create-1",
+    ], "coord") as { method: string; params: Record<string, unknown> };
+    expect(created).toMatchObject({
+      method: "schedule.create",
+      params: {
+        id: "daily-check",
+        name: "Daily check",
+        prompt: "check status",
+        rrule: "FREQ=HOURLY",
+        agent: "claude",
+        accountId: "account-1",
+        cwd: "/tmp",
+        model: "claude-sonnet-5",
+        reasoningEffort: "high",
+        mode: "plan",
+        operationId: "schedule-create-1",
+        actorSessionId: "coord",
+      },
+    });
+
+    const run = await cli(control.path, control.tokenPath, [
+      "schedule", "run", "--id", "daily-check", "--operation-id", "schedule-run-1",
+    ]) as { method: string; params: Record<string, unknown> };
+    expect(run).toMatchObject({
+      method: "schedule.run",
+      params: { id: "daily-check", operationId: "schedule-run-1" },
+    });
+  });
+
   it("status 按当前会话优先选择 active Run，并支持 --all 与空态提示", async () => {
     const home = tempHome();
     const server = await createDaemonServer({ home, port: 0 });

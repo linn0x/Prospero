@@ -113,12 +113,21 @@ export function RemoteTerminal({ hostId, sid, connected, settings, label, contro
       if (event.type !== "keydown") return true;
       const command = window.prospero.platform === "darwin" ? event.metaKey && !event.ctrlKey : event.ctrlKey && event.shiftKey;
       if (!command || event.altKey) return true;
-      if (event.code === "KeyC") { const selection = term.getSelection(); if (selection) void window.prospero.writeClipboard(selection).catch(fail); return false; }
-      if (event.code === "KeyV") {
-        if (canInput()) void window.prospero.readClipboard().then(value => { if (value && canInput()) term.paste(value); }).catch(fail);
+      if (event.code === "KeyC") {
+        event.preventDefault(); event.stopPropagation();
+        const selection = term.getSelection();
+        if (selection) void window.prospero.writeClipboard(selection).catch(fail);
         return false;
       }
-      if (event.code === "KeyA" && window.prospero.platform === "darwin") { term.selectAll(); return false; }
+      if (event.code === "KeyV") {
+        if (!canInput()) { event.preventDefault(); event.stopPropagation(); }
+        return true;
+      }
+      if (event.code === "KeyA" && window.prospero.platform === "darwin") {
+        event.preventDefault(); event.stopPropagation();
+        term.selectAll();
+        return false;
+      }
       return true;
     });
     const updateTheme = () => {

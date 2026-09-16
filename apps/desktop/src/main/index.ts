@@ -33,6 +33,8 @@ const ORCHESTRATION_METHODS = new Set([
   "graph.create", "graph.apply",
   "automation.start", "automation.pause",
   "worktree.inspect", "worktree.cleanup",
+  "schedule.list", "schedule.get", "schedule.create", "schedule.update",
+  "schedule.pause", "schedule.resume", "schedule.delete", "schedule.run",
 ]);
 const INTERACTION_TYPES = new Set([
   "chat.send", "term.input", "term.resize", "permission.respond",
@@ -1123,6 +1125,7 @@ function installIpc(): void {
     const params = requireObject(rawParams);
     const snapshot = store.snapshot();
     if ((rawMethod === "worker.start" || rawMethod === "automation.start") && (typeof params["cwd"] !== "string" || !snapshot.projects.some((path) => path.toLocaleLowerCase() === resolve(params["cwd"] as string).toLocaleLowerCase()))) throw new Error("编排只能从已添加的项目启动");
+    if ((rawMethod === "schedule.create" || rawMethod === "schedule.update") && typeof params["cwd"] === "string" && !isSessionLaunchWorkspace(snapshot, resolve(params["cwd"]))) throw new Error("定时任务只能从已添加的项目或可用 worktree 启动");
     if (["task.cancel", "task.retry", "worker.start", "worker.stop"].includes(rawMethod)) {
       if (typeof params["taskId"] !== "string" || !snapshot.orchestration.tasks.some((task) => task["id"] === params["taskId"])) throw new Error("任务不存在");
     }
@@ -1143,7 +1146,7 @@ function installIpc(): void {
     return runtime.request("/_prospero/control/orchestration/action", {
       method: "POST",
       body: { method: rawMethod, params },
-      timeoutMs: ["worker.start", "automation.start", "worktree.inspect", "worktree.cleanup"].includes(rawMethod) ? 180_000 : 60_000,
+      timeoutMs: ["worker.start", "automation.start", "worktree.inspect", "worktree.cleanup", "schedule.run"].includes(rawMethod) ? 180_000 : 60_000,
     });
   });
   ipcMain.handle("orchestration:task", async (_event, rawId: unknown) => {

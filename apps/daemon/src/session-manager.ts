@@ -173,6 +173,7 @@ export interface SessionManagerOptions {
   adapterFactory?: ((agent: AgentKind, state?: AdapterResumeState) => AgentAdapter) | undefined;
   /** 每个会话各自注入的本地环境（编排 CLI 的身份和控制 socket 在这里进入）。 */
   sessionEnv?: ((sessionId: string) => Record<string, string>) | undefined;
+  controlRequest?: ((method: string, params?: unknown) => Promise<unknown>) | undefined;
   /** 账号目录由 daemon 的元数据层解析；SessionManager 只负责注入会话。 */
   accountResolver?: ((accountId: string, agent: "claude" | "codex") => AccountBinding) | undefined;
   /** Metadata-only account lookup for state projection; does not touch keys or runtime config. */
@@ -225,6 +226,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
   private readonly deletedSessionIds: Set<string>;
   private readonly adapterFactory: (agent: AgentKind, state?: AdapterResumeState) => AgentAdapter;
   private readonly sessionEnv: (sessionId: string) => Record<string, string>;
+  private readonly controlRequest: SessionManagerOptions["controlRequest"];
   private readonly accountResolver:
     | ((accountId: string, agent: "claude" | "codex") => AccountBinding)
     | undefined;
@@ -273,6 +275,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
     this.windowsPtySessionHostRoot = home ? path.join(home, "windows-session-host") : null;
     this.adapterFactory = opts.adapterFactory ?? makeAdapter;
     this.sessionEnv = opts.sessionEnv ?? (() => ({}));
+    this.controlRequest = opts.controlRequest;
     this.accountResolver = opts.accountResolver;
     this.accountCapabilitiesResolver = opts.accountCapabilitiesResolver;
     this.supervisorLauncher = opts.supervisorLauncher ?? launchStructuredSupervisor;
@@ -1197,6 +1200,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       ...(approvalPolicy !== undefined ? { approvalPolicy } : {}),
       ...(restored ? { restored } : {}),
       ...(initialAdapterState ? { initialAdapterState } : {}),
+      ...(this.controlRequest ? { controlRequest: this.controlRequest } : {}),
       ...(this.sessionDatabase ? { storage: {
         historyPage: (options) => this.sessionDatabase!.readEventsPage(id, options),
         readEvents: () => {

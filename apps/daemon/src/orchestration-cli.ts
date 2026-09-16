@@ -202,6 +202,93 @@ worker
     actorSessionId: optionalSession(),
   })));
 
+const schedule = program.command("schedule").description("Agent 定时任务");
+schedule.command("list").action(action("schedule.list", () => ({})));
+schedule
+  .command("get")
+  .requiredOption("--id <id>", "定时任务 ID")
+  .action(action("schedule.get", (opts) => ({ id: requireText(opts["id"], "--id") })));
+schedule
+  .command("create")
+  .requiredOption("--name <text>", "任务名称")
+  .requiredOption("--prompt <text>", "触发时发送给 Agent 的提示")
+  .requiredOption("--rrule <text>", "RRULE，如 FREQ=MINUTELY;INTERVAL=10 或 FREQ=HOURLY")
+  .option("--id <id>", "定时任务 ID")
+  .option("--kind <kind>", "cron 或 heartbeat")
+  .option("--agent <kind>", "claude/codex/deepseek/opencode/grok")
+  .option("--account <id>", "Code Agent 账号 ID")
+  .option("--cwd <path>", "工作目录")
+  .option("--model <model>", "模型")
+  .option("--effort <effort>", "推理强度")
+  .option("--mode <mode>", "default 或 plan")
+  .option("--target-thread <id>", "原生会话 ID")
+  .option("--paused", "创建后保持暂停", false)
+  .option("--operation-id <id>", "幂等操作 ID")
+  .action(action("schedule.create", (opts) => ({
+    name: requireText(opts["name"], "--name"),
+    prompt: requireText(opts["prompt"], "--prompt"),
+    rrule: requireText(opts["rrule"], "--rrule"),
+    ...(typeof opts["id"] === "string" ? { id: opts["id"] } : {}),
+    ...(typeof opts["kind"] === "string" ? { kind: opts["kind"] } : {}),
+    ...(typeof opts["agent"] === "string" ? { agent: opts["agent"] } : {}),
+    ...(typeof opts["account"] === "string" ? { accountId: opts["account"] } : {}),
+    ...(typeof opts["cwd"] === "string" ? { cwd: opts["cwd"] } : {}),
+    ...(typeof opts["model"] === "string" ? { model: opts["model"] } : {}),
+    ...(typeof opts["effort"] === "string" ? { reasoningEffort: opts["effort"] } : {}),
+    ...(typeof opts["mode"] === "string" ? { mode: opts["mode"] } : {}),
+    ...(typeof opts["targetThread"] === "string" ? { targetThreadId: opts["targetThread"] } : {}),
+    ...(opts["paused"] === true ? { status: "PAUSED" } : {}),
+    ...(typeof opts["operationId"] === "string" ? { operationId: opts["operationId"] } : {}),
+    actorSessionId: optionalSession(),
+  })));
+schedule
+  .command("update")
+  .requiredOption("--id <id>", "定时任务 ID")
+  .option("--name <text>", "任务名称")
+  .option("--prompt <text>", "触发时发送给 Agent 的提示")
+  .option("--rrule <text>", "RRULE")
+  .option("--kind <kind>", "cron 或 heartbeat")
+  .option("--agent <kind>", "claude/codex/deepseek/opencode/grok")
+  .option("--approval-policy <policy>", "strict/standard/yolo")
+  .option("--account <id>", "Code Agent 账号 ID")
+  .option("--clear-account", "清除账号绑定", false)
+  .option("--cwd <path>", "工作目录")
+  .option("--model <model>", "模型")
+  .option("--clear-model", "清除模型覆盖", false)
+  .option("--effort <effort>", "推理强度")
+  .option("--clear-effort", "清除推理强度覆盖", false)
+  .option("--mode <mode>", "default 或 plan")
+  .option("--clear-mode", "清除模式覆盖", false)
+  .option("--target-thread <id>", "原生会话 ID")
+  .option("--clear-target-thread", "清除原生会话 ID", false)
+  .option("--operation-id <id>", "幂等操作 ID")
+  .action(action("schedule.update", (opts) => ({
+    id: requireText(opts["id"], "--id"),
+    ...(typeof opts["name"] === "string" ? { name: opts["name"] } : {}),
+    ...(typeof opts["prompt"] === "string" ? { prompt: opts["prompt"] } : {}),
+    ...(typeof opts["rrule"] === "string" ? { rrule: opts["rrule"] } : {}),
+    ...(typeof opts["kind"] === "string" ? { kind: opts["kind"] } : {}),
+    ...(typeof opts["agent"] === "string" ? { agent: opts["agent"] } : {}),
+    ...(typeof opts["approvalPolicy"] === "string" ? { approvalPolicy: opts["approvalPolicy"] } : {}),
+    ...(opts["clearAccount"] === true ? { accountId: null } : typeof opts["account"] === "string" ? { accountId: opts["account"] } : {}),
+    ...(typeof opts["cwd"] === "string" ? { cwd: opts["cwd"] } : {}),
+    ...(opts["clearModel"] === true ? { model: null } : typeof opts["model"] === "string" ? { model: opts["model"] } : {}),
+    ...(opts["clearEffort"] === true ? { reasoningEffort: null } : typeof opts["effort"] === "string" ? { reasoningEffort: opts["effort"] } : {}),
+    ...(opts["clearMode"] === true ? { mode: null } : typeof opts["mode"] === "string" ? { mode: opts["mode"] } : {}),
+    ...(opts["clearTargetThread"] === true ? { targetThreadId: null } : typeof opts["targetThread"] === "string" ? { targetThreadId: opts["targetThread"] } : {}),
+    ...(typeof opts["operationId"] === "string" ? { operationId: opts["operationId"] } : {}),
+  })));
+for (const [name, method] of [["pause", "schedule.pause"], ["resume", "schedule.resume"], ["delete", "schedule.delete"], ["run", "schedule.run"]] as const) {
+  schedule
+    .command(name)
+    .requiredOption("--id <id>", "定时任务 ID")
+    .option("--operation-id <id>", "幂等操作 ID")
+    .action(action(method, (opts) => ({
+      id: requireText(opts["id"], "--id"),
+      ...(typeof opts["operationId"] === "string" ? { operationId: opts["operationId"] } : {}),
+    })));
+}
+
 const worktree = program
   .command("worktree")
   .description("已登记编排工作树的只读检查与显式安全清理");
