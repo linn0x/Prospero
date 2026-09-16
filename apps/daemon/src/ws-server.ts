@@ -126,6 +126,8 @@ import { AgentAccountFeatureError } from "./agent-account-feature-error.js";
 import { CodexAdapter } from "./adapters/codex.js";
 import { listDiscoveredSkills } from "./composer-context.js";
 import { ScheduledAgentService } from "./agent-schedules.js";
+import { publicPluginDiscovery } from "./plugins/discovery.js";
+import { PluginServiceSupervisor } from "./plugins/service-supervisor.js";
 
 const HIGH_WATER = 512 * 1024; // 超过则暂停向该客户端流式发送
 const LOW_WATER = 64 * 1024; //   低于则通过 ring/快照追平
@@ -297,6 +299,7 @@ export interface DaemonServer {
   };
   schedules: ScheduledAgentService;
   collaboration: CollaborationService;
+  pluginServices: PluginServiceSupervisor;
   controlSocket: ControlSocketServer;
   close(): Promise<void>;
 }
@@ -416,6 +419,7 @@ export async function createDaemonServer(
     root: path.join(process.env["CODEX_HOME"] ?? path.join(os.homedir(), ".codex"), "automations"),
     manager,
   });
+  let pluginServices: PluginServiceSupervisor | undefined;
   const goalInitialization = new GoalInitializationService(
     orchestrationStore,
     manager,
@@ -433,7 +437,40 @@ export async function createDaemonServer(
   const controlSocket = await startControlSocket({
     home: opts.home,
     token: controlToken,
-    handle: orchestrationApi,
+    handle: async (method, params, signal) => {
+      const raw = params && typeof params === "object" && !Array.isArray(params)
+        ? params as Record<string, unknown>
+        : {};
+      const id = (name: string): string => {
+        const value = raw[name];
+        if (typeof value !== "string" || !/^[a-z][a-z0-9._-]{0,63}$/.test(value)) {
+          throw new ControlSocketError(`invalid ${name}`, "bad_request");
+        }
+        return value;
+      };
+      if (method === "plugin.list") return publicPluginDiscovery(opts.home);
+      if (method === "plugin.service.status") {
+        if (!pluginServices) throw new ControlSocketError("plugin services are not ready", "busy");
+        return pluginServices.list();
+      }
+      if (method === "plugin.service.start") {
+        if (!pluginServices) throw new ControlSocketError("plugin services are not ready", "busy");
+        return await pluginServices.start(id("pluginId"), id("serviceId"));
+      }
+      if (method === "plugin.service.stop") {
+        if (!pluginServices) throw new ControlSocketError("plugin services are not ready", "busy");
+        return await pluginServices.stop(id("pluginId"), id("serviceId"));
+      }
+      if (method === "plugin.service.restart") {
+        if (!pluginServices) throw new ControlSocketError("plugin services are not ready", "busy");
+        return await pluginServices.restart(id("pluginId"), id("serviceId"));
+      }
+      if (method === "plugin.service.health") {
+        if (!pluginServices) throw new ControlSocketError("plugin services are not ready", "busy");
+        return await pluginServices.checkHealth(id("pluginId"), id("serviceId"));
+      }
+      return await orchestrationApi(method, params, signal);
+    },
   });
   // Mac GUI 靠这个文件看会话列表(WS 协议要过 E2E 握手,壳没必要实现一遍)
   const statusFile = new StatusFile(opts.home, manager, {
@@ -2578,6 +2615,59 @@ export async function createDaemonServer(
       }
       return;
     }
+    if (req.method === "GET" && url.pathname === "/_prospero/control/plugins") {
+      try {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(publicPluginDiscovery(opts.home)));
+      } catch (error) {
+        res.writeHead(400).end(error instanceof Error ? error.message : String(error));
+      }
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/_prospero/control/plugin-services") {
+      try {
+        if (!pluginServices) throw new ControlRequestError("plugin services are not ready", 503);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(pluginServices.list()));
+      } catch (error) {
+        const status = error instanceof ControlRequestError ? error.status : 400;
+        res.writeHead(status).end(error instanceof Error ? error.message : String(error));
+      }
+      return;
+    }
+    const pluginServiceMatch = url.pathname.match(
+      /^\/_prospero\/control\/plugin\/([^/]+)\/service\/([^/]+)\/(start|stop|restart|health)$/,
+    );
+    if (pluginServiceMatch && (req.method === "POST" || (pluginServiceMatch[3] === "health" && req.method === "GET"))) {
+      try {
+        if (!pluginServices) throw new ControlRequestError("plugin services are not ready", 503);
+        const pluginId = decodeURIComponent(pluginServiceMatch[1]!);
+        const serviceId = decodeURIComponent(pluginServiceMatch[2]!);
+        if (!/^[a-z][a-z0-9._-]{0,63}$/.test(pluginId) || !/^[a-z][a-z0-9._-]{0,63}$/.test(serviceId)) {
+          throw new ControlRequestError("invalid plugin service id", 400);
+        }
+        const action = pluginServiceMatch[3]!;
+        const result = action === "start"
+          ? await pluginServices.start(pluginId, serviceId)
+          : action === "stop"
+            ? await pluginServices.stop(pluginId, serviceId)
+            : action === "restart"
+              ? await pluginServices.restart(pluginId, serviceId)
+              : await pluginServices.checkHealth(pluginId, serviceId);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(result));
+      } catch (error) {
+        const status = error instanceof ControlRequestError
+          ? error.status
+          : error instanceof ControlSocketError && error.code.endsWith("_not_found")
+            ? 404
+            : error instanceof ControlSocketError
+              ? 400
+              : 500;
+        res.writeHead(status).end(error instanceof Error ? error.message : String(error));
+      }
+      return;
+    }
     const sessionSuggestionsMatch = url.pathname.match(
       /^\/_prospero\/control\/session\/([^/]+)\/suggestions$/,
     );
@@ -3313,6 +3403,7 @@ export async function createDaemonServer(
     if (worktreeGCInterval) clearInterval(worktreeGCInterval);
     if (structuredRuntimeHeartbeat) clearInterval(structuredRuntimeHeartbeat);
     structuredRuntime?.release();
+    await pluginServices?.stopAll();
     relayClient.close();
     wss.close();
     await controlSocket.close();
@@ -3325,6 +3416,12 @@ export async function createDaemonServer(
   const address = httpServer.address();
   const port = typeof address === "object" && address !== null ? address.port : opts.port;
   modelApiBaseUrl = `http://127.0.0.1:${port}/_prospero/model-api`;
+  pluginServices = new PluginServiceSupervisor({
+    home: opts.home,
+    daemonPort: port,
+    controlTokenPath,
+    controlSocketPath,
+  });
   /**
    * 撤销要立刻生效,否则"已撤销"的设备还能一直用着当前连接 —— 撤销就没意义了。
    * CLI 是另一个进程,只能靠盯 devices.json 变化来发现。
@@ -3417,6 +3514,7 @@ export async function createDaemonServer(
   relayClient.update(loadConfig(opts.home), loadDevices(opts.home));
   automationService.resumePersisted();
   schedules.start();
+  await pluginServices.startAuto();
   await goalInitialization.retryPending();
 
   // 周期性 worktree GC:复用 worktree-assets 的只读核验与保守清理,只回收
@@ -3488,6 +3586,7 @@ export async function createDaemonServer(
     },
     schedules,
     collaboration,
+    pluginServices,
     controlSocket,
     close: async () => {
       for (const controller of apiTests.values()) controller.abort();
@@ -3500,6 +3599,7 @@ export async function createDaemonServer(
       relayClient.close();
       for (const conn of conns) conn.ws.terminate();
       statusFile.stop();
+      await pluginServices?.stopAll();
       await controlSocket.close();
       schedules.close();
       goalInitialization.close();

@@ -9,6 +9,7 @@ import { readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Command } from "commander";
+import { controlRequest, controlSocketPath } from "./control-socket.js";
 import { encodePairingQR, validateRelayUrl } from "@prospero/protocol";
 import { advertise, candidateAddrs, resolveBindAddr } from "./discovery.js";
 import { Notifier } from "./notify.js";
@@ -39,6 +40,16 @@ import { migrateOrchestration, OrchestrationDatabase } from "./orchestration/dat
 
 const require = createRequire(import.meta.url);
 const qrcode = require("qrcode-terminal") as typeof import("qrcode-terminal");
+
+function printJson(value: unknown): void {
+  process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+}
+
+async function daemonControl<T>(home: string, method: string, params?: Record<string, unknown>): Promise<T> {
+  const tokenPath = path.join(home, "control.token");
+  const token = readFileSync(tokenPath, "utf8").trim();
+  return await controlRequest<T>({ socketPath: controlSocketPath(home), token }, method, params);
+}
 
 function hasWindowsAdministratorToken(): boolean {
   if (process.platform !== "win32") return false;
@@ -346,6 +357,54 @@ relay
     }
     rotateRelayKey(home, config);
     console.log(`已轮换 relay key；${devices.length} 台设备需要重新配对后才能使用 relay。`);
+  });
+
+const plugin = program
+  .command("plugin")
+  .description("管理本地 Prospero plugins");
+
+function pluginHome(opts: { home?: string }): string {
+  return opts.home ? path.resolve(opts.home) : prosperoHome();
+}
+
+plugin
+  .command("list")
+  .description("列出已安装插件 manifest")
+  .option("--home <path>", "daemon 状态目录")
+  .action(async (opts: { home?: string }) => {
+    printJson(await daemonControl(pluginHome(opts), "plugin.list"));
+  });
+
+const pluginService = plugin.command("service").description("管理插件 service");
+
+pluginService
+  .command("status")
+  .description("查看插件 service 状态")
+  .option("--home <path>", "daemon 状态目录")
+  .action(async (opts: { home?: string }) => {
+    printJson(await daemonControl(pluginHome(opts), "plugin.service.status"));
+  });
+
+for (const method of ["start", "stop", "restart"] as const) {
+  pluginService
+    .command(method)
+    .argument("<pluginId>", "插件 ID")
+    .argument("<serviceId>", "service ID")
+    .description(`${method} 插件 service`)
+    .option("--home <path>", "daemon 状态目录")
+    .action(async (pluginId: string, serviceId: string, opts: { home?: string }) => {
+      printJson(await daemonControl(pluginHome(opts), `plugin.service.${method}`, { pluginId, serviceId }));
+    });
+}
+
+pluginService
+  .command("health")
+  .argument("<pluginId>", "插件 ID")
+  .argument("<serviceId>", "service ID")
+  .description("检查插件 service health")
+  .option("--home <path>", "daemon 状态目录")
+  .action(async (pluginId: string, serviceId: string, opts: { home?: string }) => {
+    printJson(await daemonControl(pluginHome(opts), "plugin.service.health", { pluginId, serviceId }));
   });
 
 program
