@@ -215,7 +215,7 @@ export function TerminalPane({ session, fontFamily, fontSize, active = true, onM
       fontWeightBold: "700",
       lineHeight: TERMINAL_LINE_HEIGHT,
       letterSpacing: 0,
-      scrollback: 3_000,
+      scrollback: 10_000,
       minimumContrastRatio: 4.5,
       customGlyphs: true,
       drawBoldTextInBrightColors: true,

@@ -16,6 +16,7 @@ import type { SpawnSpec } from "./agents.js";
 
 /** tmux 会话名前缀。带上前缀,避免误伤用户自己的 tmux 会话。 */
 const PREFIX = "prospero-";
+const HISTORY_LIMIT = "10000";
 const CLEAN_TERMINAL_ENV = [
   "/usr/bin/env",
   "-u", "NO_COLOR",
@@ -148,7 +149,6 @@ export function configureSession(id: string, tmux: string): boolean {
     // 不会自动进系统剪贴板。复制只应由 ⌘C 触发,别改成 on。
     ["set-option", "-t", target, "destroy-unattached", "off"],
     ["set-option", "-t", target, "xterm-keys", "on"],
-    ["set-window-option", "-t", target, "history-limit", "10000"],
     ["set-window-option", "-t", target, "window-size", "latest"],
   ];
   return commands.every((args) => spawnSync(tmux, args, { stdio: "ignore" }).status === 0);
@@ -197,6 +197,53 @@ export function wrapSpawn(
       ...spec.args,
     ],
   };
+}
+
+export function prepareSession(
+  spec: SpawnSpec,
+  opts: {
+    id: string;
+    cwd: string;
+    cols: number;
+    rows: number;
+    configFile: string;
+    tmux: string;
+    environment?: Record<string, string>;
+  },
+): boolean {
+  const target = sessionName(opts.id);
+  if (spawnSync(opts.tmux, ["has-session", "-t", target], { stdio: "ignore" }).status === 0) return true;
+  const environmentArgs = Object.entries(opts.environment ?? {}).flatMap(([name, value]) => [
+    "-e",
+    `${name}=${value}`,
+  ]);
+  const historyResult = spawnSync(opts.tmux, ["-f", opts.configFile, "show-window-options", "-gv", "history-limit"], {
+    encoding: "utf8",
+  });
+  const previousHistoryLimit = typeof historyResult.stdout === "string" && historyResult.stdout.trim()
+    ? historyResult.stdout.trim()
+    : "2000";
+  spawnSync(opts.tmux, ["-f", opts.configFile, "set-window-option", "-g", "history-limit", HISTORY_LIMIT], { stdio: "ignore" });
+  let created: ReturnType<typeof spawnSync>;
+  try {
+    created = spawnSync(opts.tmux, [
+      "-f", opts.configFile,
+      "new-session",
+      "-d",
+      ...environmentArgs,
+      "-s", target,
+      "-c", opts.cwd,
+      "-x", String(opts.cols),
+      "-y", String(opts.rows),
+      "--",
+      ...CLEAN_TERMINAL_ENV,
+      spec.file,
+      ...spec.args,
+    ], { stdio: "ignore" });
+  } finally {
+    spawnSync(opts.tmux, ["-f", opts.configFile, "set-window-option", "-g", "history-limit", previousHistoryLimit], { stdio: "ignore" });
+  }
+  return created.status === 0 && spawnSync(opts.tmux, ["has-session", "-t", target], { stdio: "ignore" }).status === 0;
 }
 
 /** 当前存在的 Prospero tmux 会话 id(去掉前缀)。 */

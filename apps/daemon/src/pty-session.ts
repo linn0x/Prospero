@@ -30,7 +30,7 @@ const { SerializeAddon } = require("@xterm/addon-serialize") as {
 };
 
 const FLUSH_MS = 16;
-const SCROLLBACK_LINES = 2000;
+const SCROLLBACK_LINES = 10000;
 const RING_BYTES = 1024 * 1024;
 const INPUT_CHUNK = 1024; // >1KB 粘贴经 PTY 有死锁报告,分片写入
 const KILL_ESCALATION_MS = 500;

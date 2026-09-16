@@ -6,6 +6,7 @@ import { spawnSync } from "node:child_process";
 import {
   configureSession,
   defaultTerminal,
+  prepareSession,
   resetTmuxPathCache,
   sessionName,
   tmuxPath,
@@ -162,10 +163,35 @@ describe("tmux 托管", () => {
       expect(option("session", "mouse")).toBe("on");
       expect(option("session", "destroy-unattached")).toBe("off");
       expect(option("session", "xterm-keys")).toBe("on");
-      expect(option("window", "history-limit")).toBe("10000");
       expect(option("window", "window-size")).toBe("latest");
     } finally {
       spawnSync(tmux, ["kill-session", "-t", name], { stdio: "ignore" });
+    }
+  });
+
+  it("creates new Prospero panes with expanded history without keeping the global default changed", () => {
+    const tmux = tmuxPath();
+    if (!tmux) return;
+    const id = `history-${String(Date.now())}`;
+    const previous = spawnSync(tmux, ["show-window-options", "-gv", "history-limit"], {
+      encoding: "utf8",
+    }).stdout.trim() || "2000";
+    const prepared = prepareSession(
+      { file: "sleep", args: ["10"] },
+      { id, cwd: "/tmp", cols: 80, rows: 24, configFile: "/dev/null", tmux, environment: {} },
+    );
+    try {
+      expect(prepared).toBe(true);
+      const history = spawnSync(tmux, ["list-panes", "-t", sessionName(id), "-F", "#{history_limit}"], {
+        encoding: "utf8",
+      }).stdout.trim();
+      const global = spawnSync(tmux, ["show-window-options", "-gv", "history-limit"], {
+        encoding: "utf8",
+      }).stdout.trim();
+      expect(history).toBe("10000");
+      expect(global).toBe(previous);
+    } finally {
+      spawnSync(tmux, ["kill-session", "-t", sessionName(id)], { stdio: "ignore" });
     }
   });
 });

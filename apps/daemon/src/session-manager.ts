@@ -947,6 +947,22 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
         : base;
     let session: PtySession | RemotePtySession | RemoteWindowsPtySession;
     try {
+      if (this.tmuxBin && this.tmuxConfigFile) {
+        tmux.prepareSession(base, {
+          id,
+          cwd,
+          cols,
+          rows,
+          configFile: this.tmuxConfigFile,
+          tmux: this.tmuxBin,
+          environment: {
+            ...tmuxSessionEnv,
+            COLORTERM: ptyEnv["COLORTERM"]!,
+            CLICOLOR: ptyEnv["CLICOLOR"]!,
+            TERM_PROGRAM: ptyEnv["TERM_PROGRAM"]!,
+          },
+        });
+      }
       const ptyOptions = {
         id, agent, title, cwd, cols, rows,
         file: launch.file,
