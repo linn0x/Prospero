@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -312,21 +312,75 @@ describe.runIf(process.platform !== "win32")("POSIX structured supervisor immuta
     }],
   ];
 
-  it.each(invalidSnapshotMutations)("does not reuse a snapshot with %s", (_description, mutate) => {
+  it.each(invalidSnapshotMutations)("quarantines and rebuilds an unleased snapshot with %s", (_description, mutate) => {
     const fixture = runtimeFixture("prospero-runtime-inventory");
     writePrivate(fixture.runner, "console.log('immutable');\n");
     const first = createStructuredSupervisorRuntimeSnapshot({ runtimeRoot: fixture.runtimeRoot, runnerPath: fixture.runner });
     first.release();
     mutate(first.directory);
 
-    // Existing finals are never removed based on a failed inspection. The
-    // creator either publishes a separately valid replacement or fails closed
-    // when this content-addressed name is already occupied.
+    const rebuilt = createStructuredSupervisorRuntimeSnapshot({
+      runtimeRoot: fixture.runtimeRoot,
+      runnerPath: fixture.runner,
+    });
+    rebuilt.release();
+    expect(existsSync(first.directory)).toBe(true);
+    expect(readdirSync(fixture.runtimeRoot).some((entry) =>
+      entry.startsWith(`${path.basename(first.directory)}.quarantine-`),
+    )).toBe(true);
+    expect(execFileSync(process.execPath, [rebuilt.runnerPath], { encoding: "utf8" }).trim()).toBe("immutable");
+  });
+
+  it("does not replace an invalid snapshot while a live lease still references it", () => {
+    const fixture = runtimeFixture("prospero-runtime-leased-invalid");
+    writePrivate(fixture.runner, "console.log('leased');\n");
+    const first = createStructuredSupervisorRuntimeSnapshot({ runtimeRoot: fixture.runtimeRoot, runnerPath: fixture.runner });
+    writePrivate(path.join(first.directory, "extra"), "leased invalid\n");
+
     expect(() => createStructuredSupervisorRuntimeSnapshot({
       runtimeRoot: fixture.runtimeRoot,
       runnerPath: fixture.runner,
     })).toThrow();
     expect(existsSync(first.directory)).toBe(true);
+    first.release();
+  });
+
+  it("ignores stale lease write temporaries while rebuilding an invalid snapshot", () => {
+    const fixture = runtimeFixture("prospero-runtime-lease-temp");
+    writePrivate(fixture.runner, "console.log('temp');\n");
+    const first = createStructuredSupervisorRuntimeSnapshot({ runtimeRoot: fixture.runtimeRoot, runnerPath: fixture.runner });
+    first.release();
+    const digest = path.basename(first.directory).replace("structured-supervisor-", "");
+    const leases = path.join(fixture.runtimeRoot, "leases");
+    const temporary = `${digest}-1234-abcdef.json.1234.abcdef123456.tmp`;
+    writePrivate(path.join(leases, temporary), "partial");
+    writePrivate(path.join(first.directory, "extra"), "invalid\n");
+
+    const rebuilt = createStructuredSupervisorRuntimeSnapshot({ runtimeRoot: fixture.runtimeRoot, runnerPath: fixture.runner });
+    try {
+      expect(execFileSync(process.execPath, [rebuilt.runnerPath], { encoding: "utf8" }).trim()).toBe("temp");
+      expect(existsSync(path.join(leases, temporary))).toBe(false);
+    } finally {
+      rebuilt.release();
+    }
+  });
+
+  it("removes Finder metadata from an otherwise valid snapshot", () => {
+    const fixture = runtimeFixture("prospero-runtime-finder-metadata");
+    writePrivate(fixture.runner, "console.log('metadata');\n");
+    const first = createStructuredSupervisorRuntimeSnapshot({ runtimeRoot: fixture.runtimeRoot, runnerPath: fixture.runner });
+    first.release();
+    writePrivate(path.join(first.directory, ".DS_Store"), "finder\n");
+    writePrivate(path.join(first.directory, "dist", "._runner.mjs"), "appledouble\n");
+
+    const reused = createStructuredSupervisorRuntimeSnapshot({ runtimeRoot: fixture.runtimeRoot, runnerPath: fixture.runner });
+    try {
+      expect(reused.directory).toBe(first.directory);
+      expect(existsSync(path.join(first.directory, ".DS_Store"))).toBe(false);
+      expect(existsSync(path.join(first.directory, "dist", "._runner.mjs"))).toBe(false);
+    } finally {
+      reused.release();
+    }
   });
 });
 

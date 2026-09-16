@@ -178,6 +178,10 @@ function imagePath(...parts: string[]): string {
   return result;
 }
 
+function ignoredRuntimeMetadata(name: string): boolean {
+  return name === ".DS_Store" || name.startsWith("._");
+}
+
 function moduleSpecifiers(file: string): string[] {
   const source = readFileSync(file, "utf8");
   const imports = new Set<string>();
@@ -278,6 +282,7 @@ function collectRuntimeImage(runner: string): RuntimeImage {
   const copyPackageTree = (packageRoot: string, packageTarget: string): void => {
     const visitDirectory = (directory: string): void => {
       for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+        if (ignoredRuntimeMetadata(entry.name)) continue;
         // Dependencies are explicitly copied below; following this directory
         // could retain a linked/mutable nested node_modules tree.
         if (entry.name === "node_modules") continue;
@@ -491,6 +496,34 @@ function removePrivateSnapshot(directory: string): void {
   if (privateTree(directory)) rmSync(directory, { recursive: true, force: true });
 }
 
+function removeIgnoredRuntimeMetadata(directory: string): boolean {
+  if (!isPrivateDirectory(directory)) return false;
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const child = path.join(directory, entry.name);
+    const metadata = lstatSync(child);
+    if (metadata.isSymbolicLink()) return false;
+    if (metadata.isDirectory()) {
+      if (!removeIgnoredRuntimeMetadata(child)) return false;
+      continue;
+    }
+    if (metadata.isFile() && ignoredRuntimeMetadata(entry.name)) rmSync(child, { force: true });
+  }
+  return true;
+}
+
+function quarantineInvalidSnapshot(runtimeRoot: string, directory: string, digest: string): boolean {
+  const active = hasActiveLeaseForDigest(runtimeRoot, digest, Date.now());
+  if (active !== false) return false;
+  try {
+    const metadata = lstatSync(directory);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) return false;
+    renameSync(directory, path.join(runtimeRoot, `${path.basename(directory)}.quarantine-${Date.now().toString(36)}-${randomBytes(6).toString("hex")}`));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function privateWrite(file: string, value: string): void {
   writeFileSync(file, value, { mode: 0o600 });
   chmodSync(file, 0o600);
@@ -524,13 +557,26 @@ function validDigest(value: unknown): value is string {
   return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 }
 
+function leaseNameDigest(name: string): string | null {
+  return /^([a-f0-9]{64})-[0-9]+-[a-f0-9]+\.json(?:\.[0-9]+\.[a-f0-9]{12}\.tmp)?$/.exec(name)?.[1] ?? null;
+}
+
 function readActiveLeases(runtimeRoot: string, now: number): Set<string> | null {
   const directory = path.join(runtimeRoot, LEASE_DIR);
   try {
     if (!isPrivateDirectory(directory)) return null;
     const active = new Set<string>();
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
-      if (!entry.isFile() || !entry.name.endsWith(".json")) return null;
+      if (!entry.isFile()) return null;
+      if (!entry.name.endsWith(".json")) {
+        if (/\.json\.[0-9]+\.[a-f0-9]{12}\.tmp$/.test(entry.name)) {
+          const temporary = path.join(directory, entry.name);
+          if (!isPrivateFile(temporary)) return null;
+          try { rmSync(temporary, { force: true }); } catch { return null; }
+          continue;
+        }
+        return null;
+      }
       const file = path.join(directory, entry.name);
       if (!isPrivateFile(file)) return null;
       let parsed: unknown;
@@ -557,6 +603,39 @@ function readActiveLeases(runtimeRoot: string, now: number): Set<string> | null 
       try { rmSync(file, { force: true }); } catch { return null; }
     }
     return active;
+  } catch {
+    return null;
+  }
+}
+
+function hasActiveLeaseForDigest(runtimeRoot: string, digest: string, now: number): boolean | null {
+  const directory = path.join(runtimeRoot, LEASE_DIR);
+  try {
+    if (!isPrivateDirectory(directory)) return null;
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      if (!entry.isFile()) return null;
+      if (leaseNameDigest(entry.name) !== digest) continue;
+      const file = path.join(directory, entry.name);
+      if (!isPrivateFile(file)) return null;
+      if (!entry.name.endsWith(".json")) {
+        try { rmSync(file, { force: true }); } catch { return null; }
+        continue;
+      }
+      let parsed: unknown;
+      try { parsed = JSON.parse(readFileSync(file, "utf8")); } catch { return null; }
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+      const lease = parsed as Partial<RuntimeLeaseFile>;
+      const pid = lease.pid;
+      const heartbeatAt = lease.heartbeatAt;
+      if (
+        lease.version !== LEASE_VERSION || lease.digest !== digest ||
+        typeof pid !== "number" || !Number.isSafeInteger(pid) ||
+        typeof heartbeatAt !== "number" || !Number.isFinite(heartbeatAt)
+      ) return null;
+      if (processAlive(pid) || now - heartbeatAt <= LEASE_STALE_MS) return true;
+      try { rmSync(file, { force: true }); } catch { return null; }
+    }
+    return false;
   } catch {
     return null;
   }
@@ -706,6 +785,7 @@ function validExistingSnapshot(
   contentDigest: string,
   image: RuntimeImage,
 ): boolean {
+  if (!removeIgnoredRuntimeMetadata(directory)) return false;
   if (!privateTree(directory)) return false;
   const recordFile = path.join(directory, "snapshot.json");
   if (!isPrivateFile(recordFile)) return false;
@@ -795,8 +875,14 @@ export function createStructuredSupervisorRuntimeSnapshot(
       try {
         renameSync(staging, published);
       } catch (error) {
-        // A concurrent daemon may have won publication of this same content.
-        if (!validExistingSnapshot(published, digest, contentDigest, image)) throw error;
+        if (!validExistingSnapshot(published, digest, contentDigest, image)) {
+          if (!quarantineInvalidSnapshot(options.runtimeRoot, published, digest)) throw error;
+          try {
+            renameSync(staging, published);
+          } catch (retryError) {
+            if (!validExistingSnapshot(published, digest, contentDigest, image)) throw retryError;
+          }
+        }
       }
       if (!validExistingSnapshot(published, digest, contentDigest, image)) {
         throw new Error("structured supervisor runtime snapshot is incomplete");

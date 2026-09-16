@@ -68,6 +68,7 @@ const remoteShellManager = new RemoteShellManager(remoteHostStore, (event) => {
 const remoteWorkspaces = new RemoteWorkspaces(new RemoteWorkspaceStore(resolve(app.getPath("userData"), "remote-workspaces.json")), remoteHostStore, remoteShellManager);
 const publishRemoteWorkspaces = (): void => { mainWindow?.webContents.send("remote-workspace:changed", remoteWorkspaces.list()); };
 const runtime = new DaemonRuntime(store);
+let daemonStartRequest: Promise<{ ok: boolean; error?: string }> | undefined;
 const legacyProjection = new LegacyOrchestrationProjection(
   store.home,
   () => broadcastSnapshot(),
@@ -350,6 +351,19 @@ function showMainWindow(): void {
   };
   if (window.webContents.isLoading()) window.once("ready-to-show", reveal);
   else reveal();
+  void ensureDaemonStarted();
+}
+
+async function ensureDaemonStarted(): Promise<{ ok: boolean; error?: string }> {
+  if (!store.settingsSnapshot().startDaemonOnLaunch) return { ok: true };
+  if (store.snapshot().daemon.running || runtime.managed) return { ok: true };
+  daemonStartRequest ??= runtime.start().then((result) => {
+    if (result.ok) void refreshAccounts();
+    return result;
+  }).finally(() => {
+    daemonStartRequest = undefined;
+  });
+  return daemonStartRequest;
 }
 
 function createTray(): void {
@@ -1350,20 +1364,10 @@ void app.whenReady().then(async () => {
   store.on("changed", broadcastSnapshot);
   setInterval(() => broadcastSnapshot(store.snapshot()), 1_000).unref();
   if (process.argv.includes("--background")) mainWindow.hide();
-  if (store.settingsSnapshot().startDaemonOnLaunch) {
-    const started = await runtime.start();
-    // daemon 一就绪就把账号列表灌进 store。以前它只在"账号"页被打开时才填充
-    // (setAccounts 的唯一调用点在 account:action 的响应里),于是冷启动后直接去
-    // 新建会话,账号下拉框是空的、只有一行"没有可用账号"。
-    if (started.ok) void refreshAccounts();
-    // 冒烟测试那一步的名字就是"Start packaged UI and its bundled daemon" ——
-    // 跳过启动的话它只验证了一个空壳 UI。daemon 起不来必须让进程非零退出,
-    // 由 CI 的退出码来兜;runtime.start() 是等到 /control/health 应答才返回的,
-    // 所以"返回 ok"本身就是打包产物里 daemon 可用的证据。
-    if (SMOKE_TEST) {
-      if (!started.ok) throw new Error(`bundled daemon failed to start: ${started.error ?? "unknown error"}`);
-      process.stdout.write("Prospero bundled daemon ready\n");
-    }
+  const started = await ensureDaemonStarted();
+  if (SMOKE_TEST) {
+    if (!started.ok) throw new Error(`bundled daemon failed to start: ${started.error ?? "unknown error"}`);
+    process.stdout.write("Prospero bundled daemon ready\n");
   }
   legacyProjection.start();
   await runDesktopSelfCheck(mainWindow);
