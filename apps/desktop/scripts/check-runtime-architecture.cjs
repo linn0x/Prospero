@@ -41,6 +41,10 @@ function checkRuntimeArchitecture(context) {
     if (!existsSync(rust)) throw new Error('Rust daemon binary is missing from .runtime. Run scripts/prepare-runtime.mjs after cargo build --release -p prosperod-rs.');
     const actual = machoArchitecture(rust);
     if (actual !== expected) throw new Error(`macOS ${expected} package requires matching prosperod-rs. Build target/release/prosperod-rs for ${expected} first.`);
+    const cli = join(root, 'prospero');
+    if (!existsSync(cli)) throw new Error('Rust worker CLI binary is missing from .runtime. Run scripts/prepare-runtime.mjs after cargo build --release -p prosperod-rs.');
+    const cliArch = machoArchitecture(cli);
+    if (cliArch !== expected) throw new Error(`macOS ${expected} package requires matching prospero. Build target/release/prospero for ${expected} first.`);
     if (!existsSync(join(root, 'install-rust-daemon-launchagent.sh'))) throw new Error('macOS runtime is missing the Rust daemon LaunchAgent installer.');
     return;
   }
@@ -54,6 +58,10 @@ function checkRuntimeArchitecture(context) {
   if (!existsSync(rust)) throw new Error('Rust daemon binary is missing from .runtime. Run scripts/package.ps1 after cargo build --release -p prosperod-rs.');
   const rustArch = windowsExecutableArchitecture(rust);
   if (rustArch !== expected) throw new Error(`Windows ${expected} package requires matching prosperod-rs.exe. Build target/release/prosperod-rs.exe for ${expected} first.`);
+  const cli = join(root, 'prospero.exe');
+  if (!existsSync(cli)) throw new Error('Rust worker CLI binary is missing from .runtime. Run scripts/package.ps1 after cargo build --release -p prosperod-rs.');
+  const cliArch = windowsExecutableArchitecture(cli);
+  if (cliArch !== expected) throw new Error(`Windows ${expected} package requires matching prospero.exe. Build target/release/prospero.exe for ${expected} first.`);
 }
 
 module.exports = checkRuntimeArchitecture;

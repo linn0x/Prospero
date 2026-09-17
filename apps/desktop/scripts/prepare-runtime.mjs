@@ -45,11 +45,18 @@ copyFileSync(process.execPath, path.join(nodeRoot, "node"));
 
 const rustBinary = path.join(repoRoot, "target", "release", "prosperod-rs");
 const stagedRustBinary = path.join(runtimeRoot, "prosperod-rs");
+const rustCli = path.join(repoRoot, "target", "release", "prospero");
+const stagedRustCli = path.join(runtimeRoot, "prospero");
 if (!existsSync(rustBinary)) {
   throw new Error(`缺少 Rust daemon release binary: ${rustBinary}`);
 }
+if (!existsSync(rustCli)) {
+  throw new Error(`缺少 Rust worker CLI release binary: ${rustCli}`);
+}
 copyFileSync(rustBinary, stagedRustBinary);
 chmodSync(stagedRustBinary, 0o755);
+copyFileSync(rustCli, stagedRustCli);
+chmodSync(stagedRustCli, 0o755);
 const launchAgentInstaller = path.join(appRoot, "scripts", "install-rust-daemon-launchagent.mjs");
 const stagedLaunchAgentInstaller = path.join(runtimeRoot, "install-rust-daemon-launchagent.mjs");
 copyFileSync(launchAgentInstaller, stagedLaunchAgentInstaller);
