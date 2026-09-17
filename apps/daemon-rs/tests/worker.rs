@@ -184,3 +184,61 @@ async fn database_worker_imports_legacy_orchestration_when_configured() {
     );
     database.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn database_worker_imports_missing_legacy_files_after_marker_exists() {
+    let legacy = TempDir::new().unwrap();
+    std::fs::write(
+        legacy.path().join("config.json"),
+        serde_json::json!({
+            "port": 7424,
+            "relay": {
+                "enabled": true,
+                "url": "wss://relay.example.com",
+                "hostSecret": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        legacy.path().join("devices.json"),
+        serde_json::json!({
+            "devices": [{
+                "name": "phone",
+                "token": "pairing-token",
+                "allowShell": true,
+                "allowOrchestration": true,
+                "relayDeviceId": "device-id",
+                "relayToken": "relay-token",
+                "relayCredentialIssued": true,
+                "createdAt": 1
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let directory = TempDir::new().unwrap();
+    std::fs::write(
+        directory.path().join("config.json"),
+        serde_json::json!({ "port": 7424 }).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("legacy-orchestration-import.json"),
+        "{}",
+    )
+    .unwrap();
+    let database = Database::open_with_legacy_home(
+        directory.path().to_path_buf(),
+        Some(legacy.path().to_path_buf()),
+    )
+    .await
+    .unwrap();
+    database.shutdown().await.unwrap();
+    let config = std::fs::read_to_string(directory.path().join("config.json")).unwrap();
+    let devices = std::fs::read_to_string(directory.path().join("devices.json")).unwrap();
+    assert!(config.contains("relay.example.com"));
+    assert!(config.contains("\"port\": 7424"));
+    assert!(devices.contains("relay-token"));
+}
