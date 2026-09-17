@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -28,9 +28,22 @@ pub struct Database(Arc<Inner>);
 
 impl Database {
     pub async fn open(directory: PathBuf) -> Result<Self> {
+        Self::open_with_legacy_home(
+            directory,
+            std::env::var_os("PROSPERO_LEGACY_HOME").map(PathBuf::from),
+        )
+        .await
+    }
+
+    pub async fn open_with_legacy_home(
+        directory: PathBuf,
+        legacy_home: Option<PathBuf>,
+    ) -> Result<Self> {
         let (sender, mut receiver) = mpsc::channel(DATABASE_QUEUE_CAPACITY);
         let (ready, initialized) = oneshot::channel();
         let worker_directory = directory.clone();
+        let legacy_marker = worker_directory.join("legacy-orchestration-import.json");
+        let import_legacy = !legacy_marker.exists();
         let thread = thread::Builder::new()
             .name("prospero-database".into())
             .spawn(move || {
@@ -41,6 +54,28 @@ impl Database {
                         return;
                     }
                 };
+                if import_legacy && let Some(legacy_home) = legacy_home {
+                    match import_legacy_state(&mut store, &worker_directory, &legacy_home) {
+                        Ok(imported) => {
+                            if let Err(error) = crate::pairing::write_private_json(
+                                &worker_directory,
+                                "legacy-orchestration-import.json",
+                                &serde_json::json!({
+                                    "source": legacy_home.to_string_lossy(),
+                                    "imported": imported,
+                                    "createdAt": crate::database::now(),
+                                }),
+                            ) {
+                                let _ = ready.send(Err(error));
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = ready.send(Err(error));
+                            return;
+                        }
+                    }
+                }
                 if ready.send(Ok(())).is_err() {
                     return;
                 }
@@ -101,4 +136,41 @@ impl Database {
         }
         Ok(())
     }
+}
+
+fn import_legacy_state(store: &mut Store, directory: &Path, legacy_home: &Path) -> Result<usize> {
+    copy_legacy_file(directory, legacy_home, "identity.json")?;
+    copy_legacy_file(directory, legacy_home, "devices.json")?;
+    copy_legacy_file(directory, legacy_home, "config.json")?;
+    copy_legacy_model_sources(directory, legacy_home)?;
+    let accounts = store.import_legacy_accounts(directory, legacy_home)?;
+    let orchestration = store.import_legacy_orchestration(legacy_home)?;
+    Ok(accounts + orchestration)
+}
+
+fn copy_legacy_file(directory: &Path, legacy_home: &Path, name: &str) -> Result<()> {
+    let source = legacy_home.join(name);
+    let target = directory.join(name);
+    if !source.exists() || target.exists() {
+        return Ok(());
+    }
+    let bytes = std::fs::read(source)?;
+    crate::pairing::write_private_json(
+        directory,
+        name,
+        &serde_json::from_slice::<serde_json::Value>(&bytes)?,
+    )?;
+    Ok(())
+}
+
+fn copy_legacy_model_sources(directory: &Path, legacy_home: &Path) -> Result<()> {
+    let source = legacy_home.join("model-sources").join(".registry.json");
+    let target_root = directory.join("model-sources");
+    let target = target_root.join(".registry.json");
+    if !source.exists() || target.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&target_root)?;
+    let value = serde_json::from_slice::<serde_json::Value>(&std::fs::read(source)?)?;
+    crate::pairing::write_private_json(&target_root, ".registry.json", &value)
 }

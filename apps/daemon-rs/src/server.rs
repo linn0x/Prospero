@@ -40,6 +40,9 @@ use crate::orchestration::{
     StopWorker,
 };
 use crate::pairing::{self, AuthFailure, DeviceRecord};
+use crate::plugins::{
+    PluginServiceList, PluginServiceSupervisor, PluginServiceView, PublicPluginDiscoveryResult,
+};
 use crate::project::{
     FsChunk, FsChunkQuery, FsContent, FsDone, FsListing, FsPathQuery, FsPathRequest, FsPutRequest,
     FsRenameRequest, FsWriteRequest, FsWritten, GitCommitRequest, GitDiffQuery, GitDiffResult,
@@ -48,6 +51,9 @@ use crate::project::{
 };
 use crate::protocol::*;
 use crate::remote_crypto::{self, SecureChannel};
+use crate::schedules::{
+    ScheduleCreate, ScheduleRunResult, ScheduleUpdate, ScheduledAgentTask, Schedules,
+};
 use crate::terminal::{
     CreateTerminal, TerminalEvent, TerminalInput, TerminalPage, TerminalQuery, TerminalSize,
     TerminalSnapshot, runtime::Terminals,
@@ -60,6 +66,8 @@ pub struct Api {
     pub terminals: Terminals,
     pub agents: Agents,
     pub relay_status: crate::relay::RelayStatusHandle,
+    pub schedules: Schedules,
+    pub plugin_services: PluginServiceSupervisor,
     token: Token,
     projection: Arc<Mutex<ProjectionState>>,
     changes: watch::Sender<u64>,
@@ -103,10 +111,15 @@ impl Api {
         let changes = terminals.changes();
         let agents = Agents::new(database.clone());
         let mut agent_changes = agents.changes().subscribe();
+        let schedules = Schedules::new(database.directory(), agents.clone());
+        let mut schedule_changes = schedules.changes();
+        let plugin_services = PluginServiceSupervisor::new(database.directory());
         let shared_api = Self {
             terminals: terminals.clone(),
             agents: agents.clone(),
             relay_status: relay_status.clone(),
+            schedules: schedules.clone(),
+            plugin_services,
             database: database.clone(),
             token: token.clone(),
             projection: Arc::new(Mutex::new(ProjectionState::default())),
@@ -125,6 +138,12 @@ impl Api {
         tokio::spawn(async move {
             while agent_changes.changed().await.is_ok() {
                 agent_api.publish();
+            }
+        });
+        let schedule_api = shared_api.clone();
+        tokio::spawn(async move {
+            while schedule_changes.changed().await.is_ok() {
+                schedule_api.publish();
             }
         });
         shared_api
@@ -219,6 +238,34 @@ impl Api {
             .route("/v1/terminals/{id}/close", post(terminal_close))
             .route("/v1/sessions", get(sessions))
             .route("/v1/skills", get(list_skills_route))
+            .route("/v1/plugins", get(plugin_list))
+            .route("/v1/plugin-services", get(plugin_service_status))
+            .route(
+                "/v1/plugin/{plugin}/service/{service}/start",
+                post(plugin_service_start),
+            )
+            .route(
+                "/v1/plugin/{plugin}/service/{service}/stop",
+                post(plugin_service_stop),
+            )
+            .route(
+                "/v1/plugin/{plugin}/service/{service}/restart",
+                post(plugin_service_restart),
+            )
+            .route(
+                "/v1/plugin/{plugin}/service/{service}/health",
+                get(plugin_service_health),
+            )
+            .route("/v1/schedules", get(schedule_list).post(schedule_create))
+            .route(
+                "/v1/schedules/{id}",
+                get(schedule_get)
+                    .patch(schedule_update)
+                    .delete(schedule_delete),
+            )
+            .route("/v1/schedules/{id}/pause", post(schedule_pause))
+            .route("/v1/schedules/{id}/resume", post(schedule_resume))
+            .route("/v1/schedules/{id}/run", post(schedule_run))
             .route("/v1/accounts", post(accounts_route))
             .route("/v1/model-sources", post(model_sources_route))
             .route("/v1/launch/models", get(launch_models))
@@ -256,6 +303,8 @@ impl Api {
             .route("/v1/tasks/{id}", get(task))
             .route("/v1/tasks/{id}/cancel", post(cancel_task))
             .route("/v1/tasks/{id}/retry", post(retry_task))
+            .route("/v1/tasks/{id}/complete", post(complete_task))
+            .route("/v1/tasks/{id}/fail", post(fail_task))
             .route("/v1/tasks/{id}/dispatch", post(dispatch_task))
             .route("/v1/workers/start", post(start_worker_route))
             .route("/v1/workers/stop", post(stop_worker_route))
@@ -356,14 +405,17 @@ impl Api {
             })
             .await?;
         let attention = summary.attention;
-        self.relay_status.write_minimal_status(
-            port,
-            bind,
-            control_token,
-            health_capabilities(),
-            summary,
-            sessions,
-        )?;
+        let schedules = self.schedules.status_list().unwrap_or_default();
+        self.relay_status
+            .write_minimal_status(crate::relay::RustDaemonStatusInput {
+                port,
+                bind,
+                control_token,
+                capabilities: health_capabilities(),
+                session_summary: summary,
+                sessions,
+                schedules,
+            })?;
         self.notify_attention(attention).await;
         Ok(())
     }
@@ -653,6 +705,7 @@ async fn handle_remote_ws(
                     &mut channel,
                     &mut state,
                     &device,
+                    accepted.protocol_version,
                     message,
                 )
                 .await
@@ -787,9 +840,10 @@ fn remote_host_info(protocol_version: u8) -> JsonValue {
             "session.create-result.v1",
             "conversation.search.v1",
             "chat.attachment-previews.v1",
-        "agent.deepseek-harness.v1",
+            "agent.deepseek-harness.v1",
             "model.sources.v1",
             "orchestration.automation.v1",
+            "scheduled-agents.v1",
         ],
         "platform": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
@@ -802,7 +856,7 @@ fn remote_host_info(protocol_version: u8) -> JsonValue {
 }
 
 fn remote_session_info(head: SessionHead) -> JsonValue {
-    json!({
+    let mut value = json!({
         "id": head.id,
         "agent": head.agent,
         "kind": head.kind,
@@ -812,7 +866,11 @@ fn remote_session_info(head: SessionHead) -> JsonValue {
         "createdAt": head.created_at,
         "cols": 80,
         "rows": 24,
-    })
+    });
+    if let Some(busy_since) = head.busy_since {
+        value["busySince"] = busy_since.into();
+    }
+    value
 }
 
 async fn route_remote_ws_message(
@@ -821,6 +879,7 @@ async fn route_remote_ws_message(
     channel: &mut SecureChannel,
     state: &mut RemoteWsState,
     device: &DeviceRecord,
+    protocol_version: u8,
     message: JsonValue,
 ) -> Result<()> {
     let kind = message
@@ -871,6 +930,16 @@ async fn route_remote_ws_message(
         "subagent.send" => remote_subagent_send(api, message).await,
         "subagent.history.get" => remote_subagent_history(api, socket, channel, message).await,
         "usage.get" => remote_usage(api, socket, channel, message).await,
+        "schedule.list"
+        | "schedule.get"
+        | "schedule.create"
+        | "schedule.update"
+        | "schedule.pause"
+        | "schedule.resume"
+        | "schedule.delete"
+        | "schedule.run" => {
+            remote_schedule_control(api, socket, channel, device, protocol_version, message).await
+        }
         "orchestration.snapshot" => {
             let snapshot = load_orchestration_snapshot(api).await?;
             state.orchestration_snapshot = Some(serde_json::to_string(&snapshot)?);
@@ -1425,13 +1494,15 @@ async fn remote_usage(
 }
 
 async fn load_orchestration_snapshot(api: &Api) -> Result<JsonValue> {
-    api.call(|store| {
+    let schedules = api.schedules.status_list()?;
+    api.call(move |store| {
         Ok(json!({
             "runs": store.list_runs()?,
             "tasks": store.list_tasks(None)?,
             "dispatches": store.list_dispatches(None)?,
             "gates": store.list_gates(None, None)?,
             "worktreeAssets": store.list_worktree_assets(None)?,
+            "schedules": schedules,
         }))
     })
     .await
@@ -1449,6 +1520,91 @@ async fn send_orchestration_snapshot(
         &json!({"type":"orchestration.snapshot","snapshot":snapshot}),
     )
     .await
+}
+
+async fn remote_schedule_control(
+    api: &Api,
+    socket: &mut WebSocket,
+    channel: &mut SecureChannel,
+    device: &DeviceRecord,
+    protocol_version: u8,
+    message: JsonValue,
+) -> Result<()> {
+    let request_id = message
+        .get("requestId")
+        .and_then(JsonValue::as_str)
+        .map(str::to_owned);
+    if protocol_version < 16 || !device.can_orchestrate() || !device.allow_shell {
+        let mut body = json!({
+            "type":"error",
+            "code":"forbidden",
+            "message":"这台设备没有定时任务权限，或 daemon 版本过旧",
+        });
+        add_request_id(&mut body, request_id.as_deref());
+        return send_remote_json(socket, channel, &body).await;
+    }
+    let kind = require_str(&message, "type")?.to_owned();
+    let mut result = match kind.as_str() {
+        "schedule.list" => {
+            let schedules = api.schedules.status_list()?;
+            json!({"type":"schedule.result","ok":true,"schedules":schedules})
+        }
+        "schedule.get" => {
+            let task = api.schedules.get(require_str(&message, "id")?)?;
+            json!({"type":"schedule.result","ok":true,"task":task})
+        }
+        "schedule.create" => {
+            let input: ScheduleCreate = serde_json::from_value(schedule_payload(message))?;
+            let task = api.schedules.create(input).await?;
+            api.publish();
+            json!({"type":"schedule.result","ok":true,"task":task})
+        }
+        "schedule.update" => {
+            let input: ScheduleUpdate = serde_json::from_value(schedule_payload(message))?;
+            let task = api.schedules.update(input)?;
+            api.publish();
+            json!({"type":"schedule.result","ok":true,"task":task})
+        }
+        "schedule.pause" => {
+            let task = api.schedules.pause(require_str(&message, "id")?)?;
+            api.publish();
+            json!({"type":"schedule.result","ok":true,"task":task})
+        }
+        "schedule.resume" => {
+            let task = api.schedules.resume(require_str(&message, "id")?)?;
+            api.publish();
+            json!({"type":"schedule.result","ok":true,"task":task})
+        }
+        "schedule.delete" => {
+            let result = api.schedules.delete(require_str(&message, "id")?)?;
+            api.publish();
+            json!({"type":"schedule.result","ok":true,"deleted":result["deleted"] == true})
+        }
+        "schedule.run" => {
+            let result = api.schedules.run_now(require_str(&message, "id")?).await?;
+            api.publish();
+            json!({"type":"schedule.result","ok":true,"task":result.task,"session":remote_session_info(result.session),"queued":result.queued})
+        }
+        _ => {
+            json!({"type":"schedule.result","ok":false,"error":"unknown schedule operation"})
+        }
+    };
+    add_request_id(&mut result, request_id.as_deref());
+    send_remote_json(socket, channel, &result).await
+}
+
+fn add_request_id(value: &mut JsonValue, request_id: Option<&str>) {
+    if let (Some(object), Some(request_id)) = (value.as_object_mut(), request_id) {
+        object.insert("requestId".into(), json!(request_id));
+    }
+}
+
+fn schedule_payload(mut message: JsonValue) -> JsonValue {
+    if let Some(object) = message.as_object_mut() {
+        object.remove("type");
+        object.remove("requestId");
+    }
+    message
 }
 
 async fn remote_orchestration_control(
@@ -1565,6 +1721,16 @@ async fn remote_orchestration_control(
                     .and_then(JsonValue::as_str)
                     .unwrap_or("new")
                     .to_owned(),
+                kind: message
+                    .get("kind")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_owned),
+                skills: message
+                    .get("skills")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()?
+                    .unwrap_or_default(),
                 approval_policy: message
                     .get("approvalPolicy")
                     .and_then(JsonValue::as_str)
@@ -2940,6 +3106,10 @@ async fn health(State(api): State<Api>) -> std::result::Result<Json<Health>, Api
         active_runtime_sessions: api.terminals.count() + api.agents.count(),
         database_queue_capacity: DATABASE_QUEUE_CAPACITY,
         capabilities: health_capabilities(),
+        persistence: HealthPersistence {
+            pty: cfg!(unix),
+            structured: true,
+        },
         relay,
     }))
 }
@@ -2956,8 +3126,13 @@ fn health_capabilities() -> Vec<String> {
         "session.timeline",
         "agent.claude",
         "orchestration.dag",
+        "terminal.pty",
         #[cfg(unix)]
         "terminal.unix",
+        #[cfg(windows)]
+        "terminal.windows.conpty",
+        #[cfg(windows)]
+        "terminal.windows.direct",
         "terminal.output.page",
         "terminal.snapshot",
         "events.replay",
@@ -2972,6 +3147,7 @@ fn health_capabilities() -> Vec<String> {
         "agent.deepseek-harness.v1",
         "model.sources.v1",
         "orchestration.automation.v1",
+        "scheduled-agents.v1",
         "session.workspace.summary",
         "session.fs",
         "session.git",
@@ -3298,7 +3474,12 @@ fn source_migration_plans(
         if sources.is_bound(&account.id) {
             continue;
         }
-        let Some(secret) = crate::accounts::managed::profile_secret(data, &account.id, &profile)?
+        let Some(secret) = crate::accounts::managed::profile_secret_for_agent(
+            data,
+            &account.id,
+            account.agent,
+            &profile,
+        )?
         else {
             skipped += 1;
             continue;
@@ -3439,6 +3620,7 @@ async fn model_sources_route(
             source_id,
             route_id,
             revision,
+            agent,
         } => {
             let data = api.database.directory().to_owned();
             let outcome = match api
@@ -3446,20 +3628,32 @@ async fn model_sources_route(
                 .call(move |store| {
                     let accounts = store.list_managed_accounts(&data)?;
                     let known = accounts
-                        .into_iter()
-                        .map(|account| account.id)
+                        .iter()
+                        .map(|account| account.id.clone())
                         .collect::<HashSet<_>>();
+                    let account_agents = accounts
+                        .into_iter()
+                        .map(|account| (account.id, account.agent))
+                        .collect::<HashMap<_, _>>();
                     let mut sources = crate::accounts::sources::ModelSources::open(&data)?;
-                    let outcome = sources.bind(&source_id, &route_id, revision, &known)?;
+                    let outcome = sources.bind(
+                        &source_id,
+                        &route_id,
+                        revision,
+                        agent,
+                        &known,
+                        &account_agents,
+                    )?;
                     if let BindOutcome::Created {
                         account_id,
+                        agent,
                         profile,
                         name,
                         secret,
                     } = &outcome
                     {
                         store.insert_api_profile_account_with_id(
-                            &data, account_id, name, profile, secret,
+                            &data, account_id, name, *agent, profile, secret,
                         )?;
                     }
                     Ok(outcome)
@@ -3577,8 +3771,12 @@ async fn model_sources_route(
                         let Some(profile) = record.api_profile else {
                             return Err(Error::Invalid("只能还原迁移前的独立 Profile".into()));
                         };
-                        let Some(secret) =
-                            crate::accounts::managed::profile_secret(&data, id, &profile)?
+                        let Some(secret) = crate::accounts::managed::profile_secret_for_agent(
+                            &data,
+                            id,
+                            record.agent,
+                            &profile,
+                        )?
                         else {
                             return Err(Error::Conflict);
                         };
@@ -3780,7 +3978,12 @@ async fn run_profile_test(
                 let revision = store.api_validation_revision(&data, &id)?;
                 let record = store.managed_snapshot_row(&data, &id)?;
                 let secret = match record.api_profile.as_ref() {
-                    Some(profile) => crate::accounts::managed::profile_secret(&data, &id, profile)?,
+                    Some(profile) => crate::accounts::managed::profile_secret_for_agent(
+                        &data,
+                        &id,
+                        record.agent,
+                        profile,
+                    )?,
                     None => None,
                 };
                 Ok((revision, record, secret))
@@ -3826,7 +4029,12 @@ async fn run_profile_engine_test(
                 let revision = store.api_validation_revision(&data, &id)?;
                 let record = store.managed_snapshot_row(&data, &id)?;
                 let secret = match record.api_profile.as_ref() {
-                    Some(profile) => crate::accounts::managed::profile_secret(&data, &id, profile)?,
+                    Some(profile) => crate::accounts::managed::profile_secret_for_agent(
+                        &data,
+                        &id,
+                        record.agent,
+                        profile,
+                    )?,
                     None => None,
                 };
                 Ok((revision, record, secret))
@@ -4136,9 +4344,12 @@ async fn profile_models(
                     .call(move |store| {
                         let record = store.managed_snapshot_row(&data, &id)?;
                         let secret = match record.api_profile.as_ref() {
-                            Some(profile) => {
-                                crate::accounts::managed::profile_secret(&data, &id, profile)?
-                            }
+                            Some(profile) => crate::accounts::managed::profile_secret_for_agent(
+                                &data,
+                                &id,
+                                record.agent,
+                                profile,
+                            )?,
                             None => None,
                         };
                         Ok((record, secret))
@@ -5164,6 +5375,122 @@ async fn list_runs(State(api): State<Api>) -> JsonResult<Vec<orchestration::Run>
     Ok(Json(api.call(|store| store.list_runs()).await?))
 }
 
+async fn schedule_list(State(api): State<Api>) -> JsonResult<Vec<ScheduledAgentTask>> {
+    Ok(Json(api.schedules.list()?))
+}
+
+async fn schedule_get(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> JsonResult<ScheduledAgentTask> {
+    Ok(Json(api.schedules.get(&id)?))
+}
+
+async fn schedule_create(
+    State(api): State<Api>,
+    body: std::result::Result<Json<ScheduleCreate>, axum::extract::rejection::JsonRejection>,
+) -> JsonResult<ScheduledAgentTask> {
+    let Json(input) = body.map_err(|_| Error::Invalid("invalid schedule request".into()))?;
+    let task = api.schedules.create(input).await?;
+    api.publish();
+    Ok(Json(task))
+}
+
+async fn schedule_update(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<ScheduleUpdate>, axum::extract::rejection::JsonRejection>,
+) -> JsonResult<ScheduledAgentTask> {
+    let Json(mut input) = body.map_err(|_| Error::Invalid("invalid schedule update".into()))?;
+    if input.id != id {
+        return Err(Error::Invalid("schedule id does not match route".into()).into());
+    }
+    input.id = id;
+    let task = api.schedules.update(input)?;
+    api.publish();
+    Ok(Json(task))
+}
+
+async fn schedule_pause(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> JsonResult<ScheduledAgentTask> {
+    let task = api.schedules.pause(&id)?;
+    api.publish();
+    Ok(Json(task))
+}
+
+async fn schedule_resume(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> JsonResult<ScheduledAgentTask> {
+    let task = api.schedules.resume(&id)?;
+    api.publish();
+    Ok(Json(task))
+}
+
+async fn schedule_delete(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> JsonResult<serde_json::Value> {
+    let result = api.schedules.delete(&id)?;
+    api.publish();
+    Ok(Json(result))
+}
+
+async fn schedule_run(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> JsonResult<ScheduleRunResult> {
+    let result = api.schedules.run_now(&id).await?;
+    api.publish();
+    Ok(Json(result))
+}
+
+async fn plugin_list(State(api): State<Api>) -> JsonResult<PublicPluginDiscoveryResult> {
+    Ok(Json(api.plugin_services.plugins()))
+}
+
+async fn plugin_service_status(State(api): State<Api>) -> JsonResult<PluginServiceList> {
+    Ok(Json(api.plugin_services.list().await?))
+}
+
+async fn plugin_service_start(
+    State(api): State<Api>,
+    Path((plugin, service)): Path<(String, String)>,
+) -> JsonResult<PluginServiceView> {
+    let result = api.plugin_services.start(&plugin, &service).await?;
+    api.publish();
+    Ok(Json(result))
+}
+
+async fn plugin_service_stop(
+    State(api): State<Api>,
+    Path((plugin, service)): Path<(String, String)>,
+) -> JsonResult<PluginServiceView> {
+    let result = api.plugin_services.stop(&plugin, &service).await?;
+    api.publish();
+    Ok(Json(result))
+}
+
+async fn plugin_service_restart(
+    State(api): State<Api>,
+    Path((plugin, service)): Path<(String, String)>,
+) -> JsonResult<PluginServiceView> {
+    let result = api.plugin_services.restart(&plugin, &service).await?;
+    api.publish();
+    Ok(Json(result))
+}
+
+async fn plugin_service_health(
+    State(api): State<Api>,
+    Path((plugin, service)): Path<(String, String)>,
+) -> JsonResult<PluginServiceView> {
+    let result = api.plugin_services.check_health(&plugin, &service).await?;
+    api.publish();
+    Ok(Json(result))
+}
+
 async fn create_run(
     State(api): State<Api>,
     body: std::result::Result<Json<CreateRun>, axum::extract::rejection::JsonRejection>,
@@ -5344,6 +5671,110 @@ async fn retry_task(
     let task = api.call(move |store| store.retry_task(&id)).await?;
     api.publish();
     Ok(Json(task))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TaskDelivery {
+    body: String,
+    #[serde(default)]
+    actor_session_id: Option<String>,
+}
+
+async fn complete_task(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<TaskDelivery>, axum::extract::rejection::JsonRejection>,
+) -> JsonResult<orchestration::Task> {
+    let Json(input) = body.map_err(|_| Error::Invalid("invalid task delivery".into()))?;
+    let task = settle_task_delivery(&api, &id, input, true).await?;
+    api.publish();
+    Ok(Json(task))
+}
+
+async fn fail_task(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<TaskDelivery>, axum::extract::rejection::JsonRejection>,
+) -> JsonResult<orchestration::Task> {
+    let Json(input) = body.map_err(|_| Error::Invalid("invalid task delivery".into()))?;
+    let task = settle_task_delivery(&api, &id, input, false).await?;
+    api.publish();
+    Ok(Json(task))
+}
+
+async fn settle_task_delivery(
+    api: &Api,
+    task_id: &str,
+    input: TaskDelivery,
+    success: bool,
+) -> Result<orchestration::Task> {
+    crate::database::validate_id(task_id)?;
+    crate::database::validate_text(&input.body, 8192, false)?;
+    if let Some(actor) = input.actor_session_id.as_deref() {
+        crate::database::validate_id(actor)?;
+    }
+    let actor = input.actor_session_id.clone();
+    let body = input.body;
+    let task_id_owned = task_id.to_owned();
+    let (task, session_id, kick_run) = api
+        .call(move |store| {
+            let current = store.task(&task_id_owned)?;
+            let target = if success {
+                orchestration::TaskStatus::Done
+            } else {
+                orchestration::TaskStatus::Failed
+            };
+            if current.status == target {
+                return Ok((current, None, None));
+            }
+            let dispatch = store
+                .live_dispatch_for_task(&task_id_owned)?
+                .ok_or_else(|| {
+                    Error::Feature(
+                        "worker_dispatch_not_found".into(),
+                        "the task has no live worker dispatch".into(),
+                    )
+                })?;
+            if actor
+                .as_deref()
+                .is_some_and(|actor| actor != dispatch.session_id)
+            {
+                return Err(Error::Forbidden);
+            }
+            let outcome = store.settle_dispatch(&dispatch.id, success, &body)?;
+            if let Some(coordinator) = store.orch_run(&outcome.task.run_id)?.coordinator_session_id
+                && actor.as_deref().is_some_and(|actor| actor != coordinator)
+            {
+                let label = if success { "完成" } else { "失败" };
+                let _ = store.post_message(orchestration::PostMessage {
+                    run_id: outcome.task.run_id.clone(),
+                    from: actor.clone().unwrap_or_default(),
+                    to: coordinator,
+                    kind: orchestration::MessageType::Report,
+                    subject: format!("任务{label}: {}", outcome.task.title),
+                    body: outcome.task.result.clone().unwrap_or_default(),
+                    thread_id: None,
+                    task_id: Some(outcome.task.id.clone()),
+                })?;
+            }
+            Ok((
+                outcome.task,
+                Some(dispatch.session_id),
+                Some(outcome.dispatch.run_id),
+            ))
+        })
+        .await?;
+    if let Some(session_id) = session_id {
+        let agents = api.agents.clone();
+        tokio::spawn(async move {
+            let _ = agents.close(&session_id).await;
+        });
+    }
+    if let Some(run_id) = kick_run {
+        orchestration::kick_automation(&api.database, &api.agents, &run_id).await;
+    }
+    Ok(task)
 }
 
 async fn dispatch_task(

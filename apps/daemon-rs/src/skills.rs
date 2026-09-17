@@ -405,10 +405,8 @@ pub fn complete_skills(cwd: &str, query: &str) -> Vec<SkillSuggestion> {
                 10
             } else if let Some(position) = name.find(&needle) {
                 20 + position as i64
-            } else if let Some(position) = description.find(&needle) {
-                100 + position as i64
             } else {
-                return None;
+                100 + description.find(&needle)? as i64
             };
             Some((score, skill.name.clone(), skill))
         })

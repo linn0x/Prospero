@@ -441,7 +441,6 @@ pub struct RunDeletionResult {
     pub run_id: String,
     #[ts(type = "number")]
     pub deleted_task_count: i64,
-    #[ts(type = "number")]
     pub preserved_worktree_asset_ids: Vec<String>,
 }
 
@@ -466,12 +465,13 @@ pub struct StartWorker {
     pub task_id: String,
     #[serde(default = "default_worker_agent")]
     pub agent: crate::protocol::AgentKind,
-    /// Only structured Claude/Codex/DeepSeek workers are launched today; the wire contract
-    /// carries the requested agent so unsupported choices fail in Rust instead
-    /// of being rejected by the desktop bridge.
     pub cwd: String,
     #[serde(default = "default_worktree_mode")]
     pub worktree: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
     #[serde(default)]
     pub approval_policy: Option<String>,
     #[serde(default)]

@@ -18,11 +18,13 @@ use crate::error::{Error, Result};
 
 use super::probe::{ApiEngineValidation, ApiValidation, revision};
 use super::profile::{ApiProfile, clean_profile, session_environment};
+use crate::protocol::AgentKind;
 
 /// Managed account metadata row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ManagedRecord {
     pub id: String,
+    pub agent: AgentKind,
     pub name: String,
     pub is_default: bool,
     pub created_at: i64,
@@ -30,6 +32,25 @@ pub(crate) struct ManagedRecord {
     pub api_profile: Option<ApiProfile>,
     pub api_validation: Option<ApiValidation>,
     pub api_engine_validation: Option<ApiEngineValidation>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyAccountsFile {
+    #[serde(default)]
+    accounts: Vec<LegacyAccount>,
+    #[serde(default)]
+    defaults: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyAccount {
+    id: String,
+    agent: String,
+    name: String,
+    #[serde(default)]
+    api_profile: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -95,20 +116,13 @@ pub(crate) fn account_root(data: &Path, id: &str) -> Result<PathBuf> {
     account_root_for_agent(data, "claude", id)
 }
 
-fn profile_account_root(data: &Path, id: &str, profile: &ApiProfile) -> Result<PathBuf> {
-    let agent = match super::profile::agent_kind(profile) {
-        crate::protocol::AgentKind::Codex => "codex",
-        crate::protocol::AgentKind::Opencode => "opencode",
+fn profile_account_root_for_agent(data: &Path, id: &str, agent: AgentKind) -> Result<PathBuf> {
+    let agent = match agent {
+        AgentKind::Codex => "codex",
+        AgentKind::Opencode => "opencode",
         _ => "claude",
     };
-    let root = account_root_for_agent(data, agent, id)?;
-    if agent == "codex" {
-        let legacy = account_root(data, id)?;
-        if !root.exists() && legacy.exists() {
-            return Ok(legacy);
-        }
-    }
-    Ok(root)
+    account_root_for_agent(data, agent, id)
 }
 
 fn credential_path(root: &Path) -> PathBuf {
@@ -220,15 +234,19 @@ pub(crate) fn clean_api_key(raw: &str) -> Result<String> {
     Ok(secret.to_owned())
 }
 
-/// Reads a profile account's API key; missing or non-key credentials are
-/// reported as `None` so snapshots can show `signed_out`.
-pub(crate) fn profile_secret(
+pub(crate) fn profile_secret_for_agent(
     data: &Path,
     id: &str,
+    agent: AgentKind,
     profile: &ApiProfile,
 ) -> Result<Option<String>> {
-    let root = profile_account_root(data, id, profile)?;
-    match read_credential(&root)? {
+    validate_profile_agent(agent, profile)?;
+    let root = profile_account_root_for_agent(data, id, agent)?;
+    profile_secret_from_root(&root)
+}
+
+fn profile_secret_from_root(root: &Path) -> Result<Option<String>> {
+    match read_credential(root)? {
         Some(Credential {
             kind: CredentialKind::ApiKey,
             secret,
@@ -241,10 +259,11 @@ pub(crate) fn profile_secret(
 pub(crate) fn profile_account_environment(
     data: &Path,
     id: &str,
+    agent: AgentKind,
     profile: &ApiProfile,
 ) -> Result<Vec<(String, String)>> {
-    let root = profile_account_root(data, id, profile)?;
-    let secret = profile_secret(data, id, profile)?.unwrap_or_default();
+    let root = profile_account_root_for_agent(data, id, agent)?;
+    let secret = profile_secret_for_agent(data, id, agent, profile)?.unwrap_or_default();
     if profile.protocol() == "openai_chat_completions" {
         return opencode_environment(&root, profile, &secret);
     }
@@ -376,6 +395,7 @@ fn opencode_environment(
 #[allow(clippy::too_many_arguments)]
 fn decode_record(
     id: String,
+    agent_raw: Option<String>,
     name: String,
     is_default: i64,
     created_at: i64,
@@ -388,6 +408,7 @@ fn decode_record(
     current_revision: Option<&str>,
 ) -> ManagedRecord {
     let api_profile = profile_raw.and_then(|raw| super::profile::parse_profile_json(&raw));
+    let agent = agent_from_storage(agent_raw.as_deref(), api_profile.as_ref());
     let api_validation = match (api_profile.as_ref(), validation_raw, validation_revision) {
         (Some(_), Some(raw), Some(stored)) if Some(stored.as_str()) == current_revision => {
             serde_json::from_str::<ApiValidation>(&raw).ok()
@@ -406,6 +427,7 @@ fn decode_record(
     };
     ManagedRecord {
         id,
+        agent,
         name,
         is_default: is_default != 0,
         created_at,
@@ -416,23 +438,60 @@ fn decode_record(
     }
 }
 
+fn agent_from_storage(raw: Option<&str>, profile: Option<&ApiProfile>) -> AgentKind {
+    match raw {
+        Some("codex") => AgentKind::Codex,
+        Some("opencode") => AgentKind::Opencode,
+        Some("claude") => AgentKind::Claude,
+        _ => profile
+            .map(super::profile::agent_kind)
+            .unwrap_or(AgentKind::Claude),
+    }
+}
+
+fn agent_label(agent: AgentKind) -> Result<&'static str> {
+    match agent {
+        AgentKind::Claude => Ok("claude"),
+        AgentKind::Codex => Ok("codex"),
+        AgentKind::Opencode => Ok("opencode"),
+        _ => Err(Error::Invalid("Agent 不支持 API Profile".into())),
+    }
+}
+
+pub(crate) fn validate_profile_agent(agent: AgentKind, profile: &ApiProfile) -> Result<()> {
+    let ok = match agent {
+        AgentKind::Claude => profile.protocol() == "anthropic",
+        AgentKind::Codex => matches!(
+            profile.protocol(),
+            "openai_responses" | "openai_chat_completions"
+        ),
+        AgentKind::Opencode => profile.protocol() == "openai_chat_completions",
+        _ => false,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::Invalid(
+            "所选 Agent、Provider 与 API 协议不兼容".into(),
+        ))
+    }
+}
+
 /// Revision-sha input for a row: the stored key when it is an API key,
 /// otherwise null (legacy canonicalization includes `credential ?? null`).
-fn row_revision(data: &Path, id: &str, profile: Option<&ApiProfile>) -> Option<String> {
+fn row_revision_for_agent(
+    data: &Path,
+    id: &str,
+    agent: AgentKind,
+    profile: Option<&ApiProfile>,
+) -> Option<String> {
     let profile = profile?;
-    let root = profile_account_root(data, id, profile).ok()?;
-    let secret = match read_credential(&root) {
-        Ok(Some(Credential {
-            kind: CredentialKind::ApiKey,
-            secret,
-        })) => Some(secret),
-        _ => None,
-    };
+    let secret = profile_secret_for_agent(data, id, agent, profile).unwrap_or_default();
     Some(revision(profile, secret.as_deref()))
 }
 
-const RECORD_COLUMNS: &str = "id,name,is_default,created_at,updated_at,api_profile,api_validation,api_validation_revision,api_engine_validation,api_engine_validation_revision";
 type ValidationColumns = (
+    Option<String>,
     Option<String>,
     Option<String>,
     Option<String>,
@@ -440,7 +499,105 @@ type ValidationColumns = (
     Option<String>,
 );
 
+const RECORD_COLUMNS: &str = "id,agent,name,is_default,created_at,updated_at,api_profile,api_validation,api_validation_revision,api_engine_validation,api_engine_validation_revision";
+
 impl crate::database::Store {
+    pub(crate) fn import_legacy_accounts(
+        &mut self,
+        data: &Path,
+        legacy_home: &Path,
+    ) -> Result<usize> {
+        let path = legacy_home.join("agent-accounts.json");
+        if !path.exists() {
+            return Ok(0);
+        }
+        let raw = fs::read_to_string(&path)?;
+        let legacy: LegacyAccountsFile = serde_json::from_str(&raw)
+            .map_err(|_| Error::Invalid("旧账号配置无法读取，原文件已保留".into()))?;
+        let mut imported = 0;
+        let mut default_ids = Vec::new();
+        for account in legacy.accounts {
+            if validate_account_id(&account.id).is_err() {
+                continue;
+            }
+            if self.managed_account(&account.id).is_ok() {
+                continue;
+            }
+            let Some(profile_raw) = account.api_profile else {
+                continue;
+            };
+            let profile = match (
+                profile_raw
+                    .get("baseUrl")
+                    .and_then(serde_json::Value::as_str),
+                profile_raw.get("model").and_then(serde_json::Value::as_str),
+            ) {
+                (Some(base_url), Some(model)) => match super::profile::clean_profile(
+                    &account.agent,
+                    base_url,
+                    model,
+                    profile_raw
+                        .get("provider")
+                        .and_then(serde_json::Value::as_str),
+                    profile_raw
+                        .get("protocol")
+                        .and_then(serde_json::Value::as_str),
+                    profile_raw.get("modelCapabilities").cloned(),
+                    profile_raw.get("headers").cloned(),
+                ) {
+                    Ok(profile) => profile,
+                    Err(_) => continue,
+                },
+                _ => continue,
+            };
+            let agent = match account.agent.as_str() {
+                "claude" => AgentKind::Claude,
+                "codex" => AgentKind::Codex,
+                "opencode" => AgentKind::Opencode,
+                _ => continue,
+            };
+            if validate_profile_agent(agent, &profile).is_err() {
+                continue;
+            };
+            let source_root = legacy_home
+                .join("agent-accounts")
+                .join(&account.agent)
+                .join(&account.id);
+            let credential = match read_credential(&source_root) {
+                Ok(Some(Credential {
+                    kind: CredentialKind::ApiKey,
+                    secret,
+                })) => secret,
+                _ => continue,
+            };
+            if self
+                .insert_api_profile_account_with_id(
+                    data,
+                    &account.id,
+                    &account.name,
+                    agent,
+                    &profile,
+                    &credential,
+                )
+                .is_err()
+            {
+                continue;
+            };
+            if legacy
+                .defaults
+                .get(&account.agent)
+                .is_some_and(|id| id == &account.id)
+            {
+                default_ids.push(account.id.clone());
+            }
+            imported += 1;
+        }
+        for id in default_ids {
+            self.set_default_managed_account(&id)?;
+        }
+        Ok(imported)
+    }
+
     pub(crate) fn list_managed_accounts(&self, data: &Path) -> Result<Vec<ManagedRecord>> {
         let mut statement = self.connection.prepare(&format!(
             "SELECT {RECORD_COLUMNS} FROM managed_accounts ORDER BY created_at,id"
@@ -448,21 +605,23 @@ impl crate::database::Store {
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)?,
                 row.get::<_, i64>(4)?,
-                row.get::<_, Option<String>>(5)?,
+                row.get::<_, i64>(5)?,
                 row.get::<_, Option<String>>(6)?,
                 row.get::<_, Option<String>>(7)?,
                 row.get::<_, Option<String>>(8)?,
                 row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
             ))
         })?;
         let mut records = Vec::new();
         for row in rows {
             let (
                 id,
+                agent,
                 name,
                 is_default,
                 created_at,
@@ -476,9 +635,11 @@ impl crate::database::Store {
             let profile = profile_raw
                 .as_deref()
                 .and_then(super::profile::parse_profile_json);
-            let current = row_revision(data, &id, profile.as_ref());
+            let agent_kind = agent_from_storage(agent.as_deref(), profile.as_ref());
+            let current = row_revision_for_agent(data, &id, agent_kind, profile.as_ref());
             records.push(decode_record(
                 id,
+                agent,
                 name,
                 is_default,
                 created_at,
@@ -508,6 +669,7 @@ impl crate::database::Store {
                         row.get(3)?,
                         row.get(4)?,
                         row.get(5)?,
+                        row.get(6)?,
                         None,
                         None,
                         None,
@@ -532,8 +694,8 @@ impl crate::database::Store {
         let timestamp = now();
         let transaction = self.connection.transaction()?;
         transaction.execute(
-            "INSERT INTO managed_accounts(id,name,is_default,created_at,updated_at) \
-             VALUES(?1,?2,?3,?4,?4)",
+            "INSERT INTO managed_accounts(id,agent,name,is_default,created_at,updated_at) \
+             VALUES(?1,'claude',?2,?3,?4,?4)",
             params![id, name, becomes_default as i64, timestamp],
         )?;
         transaction.commit()?;
@@ -547,22 +709,25 @@ impl crate::database::Store {
     pub(crate) fn managed_snapshot_row(&self, data: &Path, id: &str) -> Result<ManagedRecord> {
         validate_account_id(id)?;
         let (
+            agent_raw,
             profile_raw,
             validation_raw,
             validation_revision,
             engine_validation_raw,
             engine_validation_revision,
         ): ValidationColumns = self.connection.query_row(
-            "SELECT api_profile,api_validation,api_validation_revision,api_engine_validation,api_engine_validation_revision FROM managed_accounts WHERE id=?",
+            "SELECT agent,api_profile,api_validation,api_validation_revision,api_engine_validation,api_engine_validation_revision FROM managed_accounts WHERE id=?",
             [id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
         ).optional()?
         .ok_or(Error::NotFound)?;
         let profile = profile_raw
             .as_deref()
             .and_then(super::profile::parse_profile_json);
-        let current = row_revision(data, id, profile.as_ref());
+        let agent = agent_from_storage(agent_raw.as_deref(), profile.as_ref());
+        let current = row_revision_for_agent(data, id, agent, profile.as_ref());
         let mut record = self.managed_account(id)?;
+        record.agent = agent;
         record.api_profile = profile;
         record.api_validation = match (validation_raw, validation_revision) {
             (Some(raw), Some(stored)) if current.as_deref() == Some(stored.as_str()) => {
@@ -585,9 +750,11 @@ impl crate::database::Store {
         &mut self,
         data: &Path,
         raw_name: &str,
+        agent: AgentKind,
         profile: &ApiProfile,
         secret: &str,
     ) -> Result<ManagedRecord> {
+        validate_profile_agent(agent, profile)?;
         let name = clean_name(raw_name)?;
         let secret = clean_api_key(secret)?;
         let existing = self.list_managed_accounts(data)?;
@@ -597,12 +764,12 @@ impl crate::database::Store {
         let profile_json = serde_json::to_string(profile)?;
         let transaction = self.connection.transaction()?;
         transaction.execute(
-            "INSERT INTO managed_accounts(id,name,is_default,created_at,updated_at,api_profile) \
-             VALUES(?1,?2,?3,?4,?4,?5)",
-            params![id, name, becomes_default as i64, timestamp, profile_json],
+            "INSERT INTO managed_accounts(id,agent,name,is_default,created_at,updated_at,api_profile) \
+             VALUES(?1,?2,?3,?4,?5,?5,?6)",
+            params![id, agent_label(agent)?, name, becomes_default as i64, timestamp, profile_json],
         )?;
         transaction.commit()?;
-        let root = profile_account_root(data, &id, profile)?;
+        let root = profile_account_root_for_agent(data, &id, agent)?;
         write_credential(
             &root,
             &Credential {
@@ -618,9 +785,11 @@ impl crate::database::Store {
         data: &Path,
         id: &str,
         raw_name: &str,
+        agent: AgentKind,
         profile: &ApiProfile,
         secret: &str,
     ) -> Result<ManagedRecord> {
+        validate_profile_agent(agent, profile)?;
         validate_account_id(id)?;
         let name = clean_name(raw_name)?;
         let secret = clean_api_key(secret)?;
@@ -630,13 +799,13 @@ impl crate::database::Store {
         let profile_json = serde_json::to_string(profile)?;
         let transaction = self.connection.transaction()?;
         transaction.execute(
-            "INSERT INTO managed_accounts(id,name,is_default,created_at,updated_at,api_profile) \
-             VALUES(?1,?2,?3,?4,?4,?5)",
-            params![id, name, becomes_default as i64, timestamp, profile_json],
+            "INSERT INTO managed_accounts(id,agent,name,is_default,created_at,updated_at,api_profile) \
+             VALUES(?1,?2,?3,?4,?5,?5,?6)",
+            params![id, agent_label(agent)?, name, becomes_default as i64, timestamp, profile_json],
         )?;
         transaction.commit()?;
         write_credential(
-            &profile_account_root(data, id, profile)?,
+            &profile_account_root_for_agent(data, id, agent)?,
             &Credential {
                 kind: CredentialKind::ApiKey,
                 secret,
@@ -682,11 +851,7 @@ impl crate::database::Store {
             .map(serde_json::to_value)
             .transpose()?;
         let next_protocol = protocol.unwrap_or_else(|| existing.protocol());
-        let agent = match next_protocol {
-            "anthropic" => "claude",
-            "openai_chat_completions" => "opencode",
-            _ => "codex",
-        };
+        let agent = agent_label(record.agent)?;
         let profile = clean_profile(
             agent,
             base_url.unwrap_or(&existing.base_url),
@@ -697,6 +862,9 @@ impl crate::database::Store {
             preserved_headers,
         )?;
         let connection_changed = profile != existing;
+        if connection_changed {
+            validate_profile_agent(record.agent, &profile)?;
+        }
         let trimmed_secret = new_secret.map(str::trim);
         let updates_credential = trimmed_secret.is_some_and(|secret| !secret.is_empty());
         if source_bound && (updates_credential || connection_changed || updates_capabilities) {
@@ -710,7 +878,7 @@ impl crate::database::Store {
         if let Some(secret) = trimmed_secret.filter(|secret| !secret.is_empty()) {
             let secret = clean_api_key(secret)?;
             write_credential(
-                &profile_account_root(data, id, &profile)?,
+                &profile_account_root_for_agent(data, id, record.agent)?,
                 &Credential {
                     kind: CredentialKind::ApiKey,
                     secret,
@@ -750,7 +918,10 @@ impl crate::database::Store {
         let Some(profile) = record.api_profile else {
             return Err(Error::Invalid("此账号没有有效的 API Profile".into()));
         };
-        let current = revision(&profile, profile_secret(data, id, &profile)?.as_deref());
+        let current = revision(
+            &profile,
+            profile_secret_for_agent(data, id, record.agent, &profile)?.as_deref(),
+        );
         if current != expected_revision {
             return Ok(false);
         }
@@ -775,7 +946,10 @@ impl crate::database::Store {
         let Some(profile) = record.api_profile else {
             return Err(Error::Invalid("此账号没有有效的 API Profile".into()));
         };
-        let current = revision(&profile, profile_secret(data, id, &profile)?.as_deref());
+        let current = revision(
+            &profile,
+            profile_secret_for_agent(data, id, record.agent, &profile)?.as_deref(),
+        );
         if current != expected_revision {
             return Ok(false);
         }
@@ -795,7 +969,7 @@ impl crate::database::Store {
         };
         Ok(revision(
             &profile,
-            profile_secret(data, id, &profile)?.as_deref(),
+            profile_secret_for_agent(data, id, record.agent, &profile)?.as_deref(),
         ))
     }
 
@@ -849,7 +1023,7 @@ impl crate::database::Store {
         }
         let credential = clean_credential(kind, secret)?;
         let root = match record.api_profile.as_ref() {
-            Some(profile) => profile_account_root(data, id, profile)?,
+            Some(_) => profile_account_root_for_agent(data, id, record.agent)?,
             None => account_root(data, id)?,
         };
         write_credential(&root, &credential)?;
@@ -874,7 +1048,7 @@ impl crate::database::Store {
             return Err(Error::InUse);
         }
         let root = match record.api_profile.as_ref() {
-            Some(profile) => profile_account_root(data, id, profile)?,
+            Some(_) => profile_account_root_for_agent(data, id, record.agent)?,
             None => account_root(data, id)?,
         };
         match fs::remove_file(credential_path(&root)) {
@@ -906,7 +1080,7 @@ impl crate::database::Store {
         self.connection
             .execute("DELETE FROM managed_accounts WHERE id=?", [id])?;
         let root = match record.api_profile.as_ref() {
-            Some(profile) => profile_account_root(data, id, profile)?,
+            Some(_) => profile_account_root_for_agent(data, id, record.agent)?,
             None => account_root(data, id)?,
         };
         match fs::remove_dir_all(&root) {
@@ -972,5 +1146,82 @@ impl crate::database::Store {
             }
         }
         Ok((native, counts))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::Store;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    #[test]
+    fn imports_legacy_api_profile_accounts_with_credentials() {
+        let legacy = TempDir::new().unwrap();
+        std::fs::create_dir_all(legacy.path().join("agent-accounts/codex/acct")).unwrap();
+        std::fs::write(
+            legacy.path().join("agent-accounts.json"),
+            serde_json::to_string(&json!({
+                "version": 1,
+                "accounts": [{
+                    "id": "acct",
+                    "agent": "codex",
+                    "name": "Legacy",
+                    "apiProfile": {
+                        "baseUrl": "https://gateway.example/v1/responses",
+                        "model": "model-a"
+                    },
+                    "createdAt": 1,
+                    "updatedAt": 2
+                }],
+                "defaults": { "codex": "acct" }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        write_credential(
+            &legacy.path().join("agent-accounts/codex/acct"),
+            &Credential {
+                kind: CredentialKind::ApiKey,
+                secret: "legacy-secret".into(),
+            },
+        )
+        .unwrap();
+        let directory = TempDir::new().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        assert_eq!(
+            store
+                .import_legacy_accounts(directory.path(), legacy.path())
+                .unwrap(),
+            1
+        );
+        let record = store
+            .managed_snapshot_row(directory.path(), "acct")
+            .unwrap();
+        assert_eq!(record.agent, AgentKind::Codex);
+        assert!(record.is_default);
+        assert_eq!(
+            record.api_profile.unwrap().base_url,
+            "https://gateway.example/v1"
+        );
+        assert_eq!(
+            profile_secret_for_agent(
+                directory.path(),
+                "acct",
+                AgentKind::Codex,
+                &ApiProfile {
+                    provider: "openai_compatible".into(),
+                    protocol: Some("openai_responses".into()),
+                    base_url: "https://gateway.example/v1".into(),
+                    model: "model-a".into(),
+                    model_capabilities: None,
+                    headers: None,
+                }
+            )
+            .unwrap()
+            .as_deref(),
+            Some("legacy-secret")
+        );
     }
 }

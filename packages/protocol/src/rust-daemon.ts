@@ -2,7 +2,7 @@ export type AgentKind = "codex" | "claude" | "opencode" | "deepseek" | "grok" | 
 export type SessionKind = "structured" | "pty";
 export type SessionLifecycle = "active" | "archived";
 export type SessionStatus = "idle" | "starting" | "running" | "waiting_permission" | "waiting_input" | "completed" | "failed";
-export type SessionHead = { id: string, agent: AgentKind, kind: SessionKind, title: string, workspace: string, lifecycle: SessionLifecycle, status: SessionStatus, createdAt: number, updatedAt: number, revision: number, };
+export type SessionHead = { id: string, agent: AgentKind, kind: SessionKind, title: string, workspace: string, lifecycle: SessionLifecycle, status: SessionStatus, busySince?: number | null, createdAt: number, updatedAt: number, revision: number, };
 export type CreateSession = { agent: AgentKind, kind: SessionKind, title: string, workspace: string, };
 export type UpdateSession = { revision: number, title: string | null, lifecycle: SessionLifecycle | null, status: SessionStatus | null, };
 export type SessionQuery = { cursor: string | null, limit: number | null, lifecycle: SessionLifecycle | null, workspace: string | null, text: string | null, };
@@ -18,7 +18,8 @@ export type EventPage = { items: Array<ChangeEvent>, nextSeq: number, latestSeq:
 export type RelayConnectionState = "disabled" | "offline" | "connecting" | "syncing" | "online" | "error";
 export type RelayRuntimeDeviceStatus = { total: number, ready: number, needsRePair: number, };
 export type RelayRuntimeStatus = { enabled: boolean, state: RelayConnectionState, url: string | null, routeId: string | null, updatedAt: number, lastConnectedAt?: number | undefined, lastError?: string | null, devices: RelayRuntimeDeviceStatus, activeStreams?: number | undefined, streamFailures?: number | undefined, lastStreamError?: string | null, };
-export type Health = { apiVersion: number, backend: string, activeRuntimeSessions: number, databaseQueueCapacity: number, capabilities: Array<string>, relay?: RelayRuntimeStatus | null, };
+export type HealthPersistence = { pty: boolean, structured: boolean, };
+export type Health = { apiVersion: number, backend: string, activeRuntimeSessions: number, databaseQueueCapacity: number, capabilities: Array<string>, persistence: HealthPersistence, relay?: RelayRuntimeStatus | null, };
 export type RenameSession = { revision: number, title: string, };
 export type EventQuery = { scope: string, afterSeq: number | null, limit: number | null, };
 export type ResyncRequired = { scope: string, latestSeq: number, floorSeq: number, };
@@ -30,7 +31,7 @@ export type FileDiff = { path: string, patch: string, additions: number, deletio
 export type QuestionOption = { label: string, description: string | null, preview: string | null, };
 export type AgentQuestion = { id: string, header: string, question: string, options: Array<QuestionOption>, multiSelect: boolean, allowOther: boolean, };
 export type MessageAttachment = { id: string, mimeType: string, name: string | null, };
-export type TimelineBody = { "kind": "message", role: MessageRole, finalAnswer: boolean, attachments?: Array<MessageAttachment>, } | { "kind": "reasoning" } | { "kind": "tool", name: string, state: ToolState, summary: string, diff?: FileDiff | null, hasMore?: boolean, } | { "kind": "permission_request", requestId: string, tool: string, resolved: boolean, 
+export type TimelineBody = { "kind": "message", role: MessageRole, finalAnswer: boolean, attachments?: Array<MessageAttachment>, } | { "kind": "reasoning" } | { "kind": "tool", name: string, state: ToolState, summary: string, diff?: FileDiff | null, hasMore?: boolean, } | { "kind": "permission_request", requestId: string, tool: string, resolved: boolean,
 /**
  * Set when the approval belongs to a Task-tool subagent; the event
  * still shows on the main timeline so it can be answered there.
@@ -50,11 +51,11 @@ export type TerminalQuery = { afterSeq: number | null, waitMs: number | null, };
 export type TerminalPage = { initialSize: TerminalSize, baseSeq: number, nextSeq: number, latestSeq: number, floorSeq: number, events: Array<TerminalEvent>, resyncRequired: boolean, exited: boolean, exitCode: number | null, };
 export type TerminalInput = { dataB64: string, };
 export type TerminalSnapshot = { seq: number, size: TerminalSize, dataB64: string, };
-export type CreateAgentSession = { agent: AgentKind, title: string, workspace: string, autoApprove: boolean, 
+export type CreateAgentSession = { agent: AgentKind, title: string, workspace: string, autoApprove: boolean,
 /**
  * Optional initial collaboration mode for structured Claude sessions.
  */
-mode?: string | null, 
+mode?: string | null,
 /**
  * Optional launch catalog selection (native CLI aliases / ids).
  */
@@ -62,16 +63,16 @@ model?: string | null, effort?: string | null, agentPreset?: string | null,
 /**
  * Managed account id; None (or the native id) uses the本机默认环境.
  */
-accountId?: string | null, 
+accountId?: string | null,
 /**
  * Agent-native local conversation to resume at launch.
  */
 resume?: ResumeInput | null, };
-export type ResumeInput = { 
+export type ResumeInput = {
 /**
  * Agent-native conversation/session id to attach on the first turn.
  */
-id: string, title?: string | null, 
+id: string, title?: string | null,
 /**
  * Kept for protocol parity; Rust/Claude rejects forked resume like TS.
  */
@@ -91,17 +92,17 @@ export type AgentModelCatalog = { models: Array<LaunchModelInfo>, currentModel: 
 export type SessionAgentControls = { sessionId: string, compact: boolean, model: boolean, mode: boolean, currentModel: string | null, currentEffort: string | null, currentMode: string | null, };
 export type AgentControlsProjection = { controls: Array<SessionAgentControls>, };
 export type AttachmentInput = { mimeType: string, dataB64: string, name?: string | null, };
-export type AgentSend = { text: string, 
+export type AgentSend = { text: string,
 /**
  * `steer` tries to guide the running turn live and falls back to the
  * front of the queue; anything else enqueues normally (FIFO).
  */
 delivery: string | null, attachments: Array<AttachmentInput>, };
-export type QueuedMessage = { id: string, text: string, 
+export type QueuedMessage = { id: string, text: string,
 /**
  * `guide` rows jump the front of the queue ("现在引导").
  */
-kind: string, createdAt: number, 
+kind: string, createdAt: number,
 /**
  * Number of images parked with the message (bytes are never projected).
  */
@@ -131,7 +132,7 @@ export type AutomationWorkspace = "run" | "current";
 export type RunAutomation = { state: AutomationState, agent: AgentKind, accountId?: string | undefined, approvalPolicy: string, workspace: AutomationWorkspace, cwd: string, workspacePath: string, branch: string | null, startedAt: number, updatedAt: number, lastError: string | null, };
 export type Run = { id: string, objective: string, status: RunStatus, coordinatorSessionId: string | null, automation: RunAutomation | null, graphRevision: number, createdAt: number, updatedAt: number, };
 export type Task = { id: string, runId: string, title: string, spec: string, skills: Array<string>, deps: Array<string>, parentId: string | null, status: TaskStatus, result: string | null, createdAt: number, updatedAt: number, };
-export type Dispatch = { id: string, runId: string, taskId: string, sessionId: string, state: DispatchState, outcome: string | null, startedAt: number, settledAt: number | null, 
+export type Dispatch = { id: string, runId: string, taskId: string, sessionId: string, state: DispatchState, outcome: string | null, startedAt: number, settledAt: number | null,
 /**
  * Working directory of the worker; for an isolated worker this is the
  * registered worktree path.
@@ -141,20 +142,20 @@ export type Gate = { id: string, runId: string, taskId: string | null, question:
 export type OrchMessage = { id: string, runId: string, from: string, to: string, type: MessageType, subject: string, body: string, threadId: string | null, taskId: string | null, createdAt: number, readAt: number | null, answeredAt: number | null, };
 export type RunSnapshot = { run: Run, tasks: Array<Task>, ready: Array<string>, dispatches: Array<Dispatch>, gates: Array<Gate>, };
 export type GraphNodeInput = { clientId: string, title: string, spec: string, skills: Array<string>, deps: Array<string>, parentId: string | null, };
-export type CreateRunGraph = { objective: string, nodes: Array<GraphNodeInput>, coordinatorSessionId: string | null, 
+export type CreateRunGraph = { objective: string, nodes: Array<GraphNodeInput>, coordinatorSessionId: string | null,
 /**
  * Required so a retried graph creation never makes two runs.
  */
 operationId: string, };
 export type ApplyTaskGraph = { runId: string, baseRevision: number, nodes: Array<GraphNodeInput>, deleteTaskIds: Array<string>, operationId: string | null, };
-export type GraphMutationResult = { run: Run, tasks: Array<Task>, 
+export type GraphMutationResult = { run: Run, tasks: Array<Task>,
 /**
  * Maps submitted `clientId` to the durable task id.
  */
 idMap: { [key in string]: string }, deletedTaskIds: Array<string>, };
 export type DispatchTask = { sessionId: string, operationId: string | null, worktreePath: string | null, };
 export type SettleDispatch = { success: boolean, outcome: string, };
-export type AbandonDispatch = { reason: string | null, 
+export type AbandonDispatch = { reason: string | null,
 /**
  * `failed` (default) or `cancelled`; only used when the task is still
  * dispatched.
@@ -168,11 +169,11 @@ export type ResolveGate = { decision: string, };
 export type PostMessage = { runId: string, from: string, to: string, type: MessageType, subject: string, body: string, threadId: string | null, taskId: string | null, };
 export type MarkMessages = { ids: Array<string>, };
 export type SettleOutcome = { task: Task, dispatch: Dispatch, };
-export type RecoveryReport = { 
+export type RecoveryReport = {
 /**
  * Dispatches whose worker session is gone; converged abandoned/failed.
  */
-settled: Array<Dispatch>, 
+settled: Array<Dispatch>,
 /**
  * `starting` dispatches whose worker survived; promoted to `running`.
  */
@@ -186,29 +187,45 @@ export type WorktreeCleanupResult = { asset: WorktreeAsset, inspection: Worktree
 export type CreateRun = { objective: string, coordinatorSessionId: string | null, };
 export type CreateTask = { runId: string, title: string, spec: string, skills: Array<string>, deps: Array<string>, parentId: string | null, };
 export type DeleteRun = { force: boolean, };
-export type RunDeletionResult = { runId: string, deletedTaskCount: number, preservedWorktreeAssetIds: number, };
+export type RunDeletionResult = { runId: string, deletedTaskCount: number, preservedWorktreeAssetIds: Array<string>, };
 export type StartAutomation = { runId: string, agent: AgentKind, accountId: string | null, approvalPolicy: string, workspace: AutomationWorkspace, cwd: string, };
-export type StartWorker = { taskId: string, agent: AgentKind, 
-/**
- * Only structured Claude workers are launched today; the wire contract
- * carries the requested agent so unsupported choices fail in Rust instead
- * of being rejected by the desktop bridge.
- */
-cwd: string, worktree: string, approvalPolicy: string | null, accountId: string | null, operationId: string | null, };
-export type StopWorker = { taskId: string, reason: string | null, 
+export type StartWorker = { taskId: string, agent: AgentKind, cwd: string, worktree: string, kind?: string | null, skills?: Array<string>, approvalPolicy: string | null, accountId: string | null, operationId: string | null, };
+export type StopWorker = { taskId: string, reason: string | null,
 /**
  * `failed` (default) or `cancelled`.
  */
 finalStatus: string | null, };
 export type WorkerStartOutcome = { task: Task, dispatch: Dispatch, sessionId: string, worktree: WorktreeAsset | null, };
 export type InspectWorktree = { targetRef: string | null, };
-export type CleanupWorktree = { targetRef: string | null, 
+export type CleanupWorktree = { targetRef: string | null,
 /**
  * Explicit authorization; without it the directory is never removed.
  */
 confirm: boolean, deleteBranch: boolean, };
 export type Skill = { name: string, description: string, path: string, scope: string, };
 export type SkillSuggestion = { kind: string, value: string, label: string, detail: string, };
+export type ScheduledAgentTaskKind = "cron" | "heartbeat";
+export type ScheduledAgentTaskStatus = "ENABLED" | "PAUSED";
+export type ScheduledAgentTask = { version: number, id: string, kind: ScheduledAgentTaskKind, name: string, prompt: string, status: ScheduledAgentTaskStatus, rrule: string, agent: AgentKind, approvalPolicy: string, cwd: string, cwds: Array<string>, accountId?: string | null, model?: string | null, reasoningEffort?: string | null, mode?: string | null, targetThreadId?: string | null, lastSessionId?: string | null, lastRunAt?: number | null, nextRunAt: number, lastError?: string | null, createdAt: number, updatedAt: number, };
+export type StatusScheduledAgentTask = { version: number, id: string, kind: ScheduledAgentTaskKind, name: string, prompt: string, status: ScheduledAgentTaskStatus, rrule: string, agent: AgentKind, approvalPolicy: string, cwd: string, cwds: Array<string>, accountId?: string | null, model?: string | null, reasoningEffort?: string | null, mode?: string | null, targetThreadId?: string | null, lastSessionId?: string | null, lastRunAt?: number | null, nextRunAt: number, lastError?: string | null, createdAt: number, updatedAt: number, };
+export type ScheduleCreate = { operationId?: string | null, id?: string | null, kind?: ScheduledAgentTaskKind | null, name: string, prompt: string, rrule: string, status?: ScheduledAgentTaskStatus | null, agent?: AgentKind | null, approvalPolicy?: string | null, cwd?: string | null, cwds?: Array<string> | null, accountId?: string | null, model?: string | null, reasoningEffort?: string | null, mode?: string | null, targetThreadId?: string | null, actorSessionId?: string | null, };
+export type ScheduleUpdate = { operationId?: string | null, id: string, kind?: ScheduledAgentTaskKind | null, name?: string | null, prompt?: string | null, rrule?: string | null, status?: ScheduledAgentTaskStatus | null, agent?: AgentKind | null, approvalPolicy?: string | null, cwd?: string | null, cwds?: Array<string> | null, accountId?: string | null | null, model?: string | null | null, reasoningEffort?: string | null | null, mode?: string | null | null, targetThreadId?: string | null | null, };
+export type ScheduleId = { operationId?: string | null, id: string, };
+export type ScheduleRunResult = { task: ScheduledAgentTask, session: SessionHead, queued: boolean, };
+export type PluginServiceMode = "manual" | "auto";
+export type PluginServiceHealth = "unknown" | "healthy" | "unhealthy";
+export type PluginServiceStatus = "stopped" | "starting" | "running" | "exited" | "failed";
+export type PluginServiceManifest = { id: string, mode: PluginServiceMode, command: Array<string>, cwd: string, env: { [key in string]: string }, portEnv: string, healthPath: string | null, configKey: string, };
+export type ProsperoPluginManifest = { schemaVersion: string, name: string, version: string | null, root: string, manifestPath: string, skillsRoot: string | null, agentsRoot: string | null, runtimeRoot: string | null, bootstrap: string | null, services: Array<PluginServiceManifest>, };
+export type PublicPluginService = { id: string, mode: PluginServiceMode, command: Array<string>, cwd: string, envKeys: Array<string>, portEnv: string, healthPath: string | null, };
+export type PublicProsperoPlugin = { name: string, version: string | null, root: string, skillsRoot: string | null, agentsRoot: string | null, runtimeRoot: string | null, bootstrap: string | null, services: Array<PublicPluginService>, };
+export type PluginDiscoveryError = { root: string, manifestPath: string | null, message: string, };
+export type PublicPluginDiscoveryResult = { items: Array<PublicProsperoPlugin>, errors: Array<PluginDiscoveryError>, };
+export type PluginServiceExit = { code: number | null, signal: string | null, at: number, };
+export type PluginServiceState = { pluginId: string, serviceId: string, mode: PluginServiceMode, status: PluginServiceStatus, pid: number | null, port: number | null, startedAt: number | null, updatedAt: number, lastExit: PluginServiceExit | null, lastError: string | null, health: PluginServiceHealth, healthCheckedAt: number | null, healthError: string | null, configKey: string, };
+export type PluginServiceLogFiles = { stdout: string, stderr: string, };
+export type PluginServiceView = { pluginId: string, serviceId: string, mode: PluginServiceMode, status: PluginServiceStatus, pid: number | null, port: number | null, startedAt: number | null, updatedAt: number, lastExit: PluginServiceExit | null, lastError: string | null, health: PluginServiceHealth, healthCheckedAt: number | null, healthError: string | null, configKey: string, configured: boolean, pluginRoot: string | null, command: Array<string> | null, cwd: string | null, logFiles: PluginServiceLogFiles, };
+export type PluginServiceList = { items: Array<PluginServiceView>, errors: Array<PluginDiscoveryError>, };
 export type AccountStatus = "signed_in" | "signed_out" | "unavailable" | "error";
 export type AccountCapabilities = { sessionKinds: Array<SessionKind>, plan: boolean, resume: boolean, modelSelection: boolean, reasoningEffort: boolean, };
 export type ModelCapabilities = { contextWindow?: number, maxOutputTokens?: number, tools?: boolean | null, vision?: boolean | null, reasoning?: boolean | null, supportedEfforts?: Array<string> | null, };

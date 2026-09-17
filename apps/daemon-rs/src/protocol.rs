@@ -58,6 +58,9 @@ pub struct SessionHead {
     pub workspace: String,
     pub lifecycle: SessionLifecycle,
     pub status: SessionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null")]
+    pub busy_since: Option<i64>,
     #[ts(type = "number")]
     pub created_at: i64,
     #[ts(type = "number")]
@@ -198,8 +201,16 @@ pub struct Health {
     pub active_runtime_sessions: usize,
     pub database_queue_capacity: usize,
     pub capabilities: Vec<String>,
+    pub persistence: HealthPersistence,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay: Option<crate::relay::RelayRuntimeStatus>,
+}
+
+#[derive(Debug, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthPersistence {
+    pub pty: bool,
+    pub structured: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, TS)]
@@ -492,6 +503,7 @@ pub fn typescript() -> String {
         crate::relay::RelayConnectionState::decl(&config),
         crate::relay::RelayRuntimeDeviceStatus::decl(&config),
         crate::relay::RelayRuntimeStatus::decl(&config),
+        HealthPersistence::decl(&config),
         Health::decl(&config),
         RenameSession::decl(&config),
         EventQuery::decl(&config),
@@ -601,6 +613,28 @@ pub fn typescript() -> String {
         crate::orchestration::CleanupWorktree::decl(&config),
         crate::skills::Skill::decl(&config),
         crate::skills::SkillSuggestion::decl(&config),
+        crate::schedules::ScheduledAgentTaskKind::decl(&config),
+        crate::schedules::ScheduledAgentTaskStatus::decl(&config),
+        crate::schedules::ScheduledAgentTask::decl(&config),
+        crate::schedules::StatusScheduledAgentTask::decl(&config),
+        crate::schedules::ScheduleCreate::decl(&config),
+        crate::schedules::ScheduleUpdate::decl(&config),
+        crate::schedules::ScheduleId::decl(&config),
+        crate::schedules::ScheduleRunResult::decl(&config),
+        crate::plugins::PluginServiceMode::decl(&config),
+        crate::plugins::PluginServiceHealth::decl(&config),
+        crate::plugins::PluginServiceStatus::decl(&config),
+        crate::plugins::PluginServiceManifest::decl(&config),
+        crate::plugins::ProsperoPluginManifest::decl(&config),
+        crate::plugins::PublicPluginService::decl(&config),
+        crate::plugins::PublicProsperoPlugin::decl(&config),
+        crate::plugins::PluginDiscoveryError::decl(&config),
+        crate::plugins::PublicPluginDiscoveryResult::decl(&config),
+        crate::plugins::PluginServiceExit::decl(&config),
+        crate::plugins::PluginServiceState::decl(&config),
+        crate::plugins::PluginServiceLogFiles::decl(&config),
+        crate::plugins::PluginServiceView::decl(&config),
+        crate::plugins::PluginServiceList::decl(&config),
         crate::accounts::AccountStatus::decl(&config),
         crate::accounts::AccountCapabilities::decl(&config),
         crate::accounts::ModelCapabilities::decl(&config),
@@ -657,7 +691,14 @@ pub fn typescript() -> String {
     ];
     let mut output: String = declarations
         .into_iter()
-        .map(|value| format!("export {value}\n"))
+        .map(|value| {
+            let value = value
+                .lines()
+                .map(str::trim_end)
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("export {value}\n")
+        })
         .collect();
     output.push_str(&crate::terminal::screen::width_tables());
     output

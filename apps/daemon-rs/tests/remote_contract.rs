@@ -108,6 +108,8 @@ async fn health_dto_reports_rust_http_contract() {
         body["databaseQueueCapacity"],
         json!(DATABASE_QUEUE_CAPACITY)
     );
+    assert_eq!(body["persistence"]["structured"], true);
+    assert_eq!(body["persistence"]["pty"], cfg!(unix));
     assert!(body["capabilities"].as_array().unwrap().len() > 5);
     api.database.shutdown().await.unwrap();
 }
@@ -122,6 +124,11 @@ async fn health_capabilities_are_explicitly_local_http_not_mobile_ws() {
         "session.search",
         "session.timeline",
         "events.stream",
+        "terminal.pty",
+        #[cfg(unix)]
+        "terminal.unix",
+        #[cfg(windows)]
+        "terminal.windows.conpty",
         "agent.api-protocols.v1",
         "agent.api-validation.v1",
         "agent.api-engine-validation.v1",
@@ -222,6 +229,11 @@ async fn status_projection_writes_legacy_desktop_snapshot_shape() {
     assert_eq!(status["sessions"][0]["status"], "waiting_approval");
     assert_eq!(status["sessions"][0]["pendingPermissions"], 1);
     assert_eq!(status["sessions"][0]["pendingQuestions"], 0);
+    assert!(
+        status["sessions"][0]["busySince"]
+            .as_i64()
+            .is_some_and(|value| value >= session.created_at)
+    );
     api.database.shutdown().await.unwrap();
 }
 

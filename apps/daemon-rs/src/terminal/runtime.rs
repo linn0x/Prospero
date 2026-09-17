@@ -19,6 +19,7 @@ struct State {
     failed: AtomicBool,
     changed: watch::Sender<u64>,
     checkpoints: Arc<Semaphore>,
+    control_environment: std::sync::Mutex<Option<crate::control_cli::ControlEnvironment>>,
 }
 
 #[derive(Clone)]
@@ -48,6 +49,7 @@ impl Terminals {
             failed: AtomicBool::new(false),
             changed: watch::channel(0).0,
             checkpoints: Arc::new(Semaphore::new(2)),
+            control_environment: std::sync::Mutex::new(None),
         }))
     }
 
@@ -58,7 +60,6 @@ impl Terminals {
     /// Spawns the managed-Claude login flow (`claude setup-token`) in a PTY
     /// rooted at the account's isolated config directory. The returned head is
     /// a normal pty session; its run is bound to the account for accounting.
-    #[cfg(unix)]
     pub async fn create_login(
         &self,
         account_id: &str,
@@ -92,6 +93,24 @@ impl Terminals {
 
     pub(crate) fn changes(&self) -> watch::Sender<u64> {
         self.0.changed.clone()
+    }
+
+    pub fn configure_control_environment(
+        &self,
+        base_url: String,
+        token_path: PathBuf,
+        socket_path: String,
+        cli_dir: Option<PathBuf>,
+    ) {
+        if let Ok(mut environment) = self.0.control_environment.lock() {
+            *environment = Some(crate::control_cli::ControlEnvironment {
+                home: self.0.database.directory().to_owned(),
+                base_url,
+                token_path,
+                socket_path,
+                cli_dir,
+            });
+        }
     }
 
     pub fn check(&self) -> Result<()> {
@@ -145,6 +164,17 @@ impl Terminals {
                     {
                         terminal.stop();
                     }
+                    let activity_runtime = runtime.clone();
+                    let activity_id = head.id.clone();
+                    let activity_terminal = terminal.clone();
+                    let _activity_task = tokio::spawn(async move {
+                        if let Err(error) = activity_runtime
+                            .persist_activity(&activity_id, &activity_terminal)
+                            .await
+                        {
+                            eprintln!("terminal activity sync failed: {error}");
+                        }
+                    });
                     if runtime.persist_live(&head.id, &terminal).await.is_err() {
                         runtime.0.failed.store(true, Ordering::Release);
                         runtime.0.closed.store(true, Ordering::Release);
@@ -200,6 +230,44 @@ impl Terminals {
         Err(Error::Busy)
     }
 
+    async fn persist_activity(&self, id: &str, terminal: &Terminal) -> Result<()> {
+        let mut published: Option<Option<i64>> = None;
+        loop {
+            let activity = terminal.activity()?;
+            if published != Some(activity.busy_since) {
+                let id = id.to_owned();
+                let busy_since = activity.busy_since;
+                match self
+                    .0
+                    .database
+                    .call(move |store| store.set_session_busy_since(&id, busy_since))
+                    .await
+                {
+                    Ok(true) => self.0.changed.send_modify(|seq| *seq = seq.wrapping_add(1)),
+                    Ok(false) => {}
+                    Err(Error::NotFound) if activity.exited => return Ok(()),
+                    Err(error) => return Err(error),
+                }
+                published = Some(activity.busy_since);
+            }
+            if activity.exited {
+                return Ok(());
+            }
+            let timeout = activity
+                .last_activity_at
+                .map(|last| {
+                    let now = crate::database::now();
+                    Duration::from_millis(
+                        last.saturating_add(super::ACTIVITY_IDLE_MS)
+                            .saturating_sub(now)
+                            .max(1) as u64,
+                    )
+                })
+                .unwrap_or_else(|| Duration::from_secs(60));
+            terminal.wait_activity(activity.version, timeout).await;
+        }
+    }
+
     async fn persist_live(&self, id: &str, terminal: &Terminal) -> Result<()> {
         let mut seq = 0;
         let mut waiting = false;
@@ -248,7 +316,6 @@ impl Terminals {
         }
     }
 
-    #[cfg(unix)]
     async fn start(
         &self,
         mut input: CreateTerminal,
@@ -269,13 +336,21 @@ impl Terminals {
             return Err(Error::Closed);
         }
         let size = input.size;
+        #[cfg(unix)]
         let guard = self.0.guard.clone();
         let account_id = spec.as_ref().and_then(|spec| spec.account_id.clone());
+        let control_environment = self
+            .0
+            .control_environment
+            .lock()
+            .ok()
+            .and_then(|environment| environment.clone());
         let head = self
             .0
             .database
             .call(move |store| store.create_terminal_with(input, account_id))
             .await?;
+        let session_id = head.id.clone();
         let child = tokio::task::spawn_blocking(move || {
             let mut command = match &spec {
                 Some(spec) => {
@@ -289,7 +364,8 @@ impl Terminals {
                     command
                 }
                 None => {
-                    let shell = login_shell(std::env::var_os("SHELL"));
+                    let shell = login_shell(default_shell());
+                    #[cfg(unix)]
                     if let Some(guard) = guard {
                         let mut command = portable_pty::CommandBuilder::new(guard);
                         command.args([
@@ -302,15 +378,20 @@ impl Terminals {
                         command.args(["--", "-l"]);
                         command
                     } else {
-                        let mut command = portable_pty::CommandBuilder::new(shell);
-                        command.arg("-l");
-                        command
+                        login_shell_command(shell)
                     }
+                    #[cfg(not(unix))]
+                    login_shell_command(shell)
                 }
             };
             command.cwd(directory);
             command.env("TERM", "xterm-256color");
             command.env("COLORTERM", "truecolor");
+            if let Some(control) = control_environment {
+                for (key, value) in control.vars(Some(&session_id)) {
+                    command.env(key, value);
+                }
+            }
             for key in ["TMUX", "TMUX_PANE", "STY"] {
                 command.env_remove(key);
             }
@@ -376,17 +457,6 @@ impl Terminals {
             .map_err(|_| Error::Closed)?
             .insert(head.id.clone(), terminal.clone());
         Ok((running?, terminal))
-    }
-
-    #[cfg(not(unix))]
-    async fn start(
-        &self,
-        _input: CreateTerminal,
-        _spec: Option<ProgramSpec>,
-    ) -> Result<(SessionHead, Terminal)> {
-        Err(Error::Invalid(
-            "terminal runtime is not available on this platform".into(),
-        ))
     }
 
     fn terminal(&self, id: &str) -> Result<Terminal> {
@@ -462,17 +532,30 @@ impl Terminals {
     }
 }
 
-#[cfg(unix)]
 fn shell_command(command: &str) -> Result<ProgramSpec> {
     if command.len() > 2000 || command.contains('\0') || command.trim().is_empty() {
         return Err(Error::Invalid("invalid terminal command".into()));
     }
-    let shell = login_shell(std::env::var_os("SHELL"))
+    let shell = login_shell(default_shell());
+    let shell = shell
         .into_string()
         .map_err(|_| Error::Invalid("shell path must be Unicode".into()))?;
+    #[cfg(windows)]
+    let args = if is_windows_powershell(&shell) {
+        vec![
+            "-NoLogo".into(),
+            "-NoProfile".into(),
+            "-Command".into(),
+            command.to_owned(),
+        ]
+    } else {
+        vec!["/d".into(), "/s".into(), "/c".into(), command.to_owned()]
+    };
+    #[cfg(not(windows))]
+    let args = vec!["-c".into(), command.to_owned()];
     Ok(ProgramSpec {
         program: shell,
-        args: vec!["-c".into(), command.to_owned()],
+        args,
         environment: Vec::new(),
         account_id: None,
     })
@@ -737,10 +820,11 @@ impl Terminals {
         let (record, (default_model, default_effort)) = record;
         let account_id = record.id.clone();
         let env_id = account_id.clone();
+        let agent = record.agent;
         let env = tokio::task::spawn_blocking(move || match record.api_profile {
-            Some(profile) => {
-                crate::accounts::managed::profile_account_environment(&data, &env_id, &profile)
-            }
+            Some(profile) => crate::accounts::managed::profile_account_environment(
+                &data, &env_id, agent, &profile,
+            ),
             None => crate::accounts::managed::claude_environment(&data, &env_id, false),
         })
         .await
@@ -785,12 +869,17 @@ impl Terminals {
                         "Codex PTY 仅支持 OpenAI Responses Profile".into(),
                     ));
                 }
+                if record.agent != crate::protocol::AgentKind::Codex {
+                    return Err(Error::Invalid("所选账号与 Agent 不匹配".into()));
+                }
                 let env_id = record.id.clone();
                 let env_profile = profile.clone();
+                let agent = record.agent;
                 let env = tokio::task::spawn_blocking(move || {
                     crate::accounts::managed::profile_account_environment(
                         &data,
                         &env_id,
+                        agent,
                         &env_profile,
                     )
                 })
@@ -803,28 +892,87 @@ impl Terminals {
 }
 
 fn login_shell(shell: Option<OsString>) -> OsString {
-    let Some(shell) = shell else {
-        return "/bin/sh".into();
-    };
-    let path = Path::new(&shell);
-    if !path.is_absolute() {
-        return "/bin/sh".into();
+    #[cfg(windows)]
+    {
+        let shell = shell
+            .or_else(|| std::env::var_os("COMSPEC"))
+            .or_else(|| std::env::var_os("ComSpec"));
+        let Some(shell) = shell else {
+            return "cmd.exe".into();
+        };
+        let value = shell.to_string_lossy();
+        if value.contains('\0') || value.trim().is_empty() {
+            return "cmd.exe".into();
+        }
+        return shell;
     }
-    let allowed = path
+    #[cfg(not(windows))]
+    {
+        let Some(shell) = shell else {
+            return "/bin/sh".into();
+        };
+        let path = Path::new(&shell);
+        if !path.is_absolute() {
+            return "/bin/sh".into();
+        }
+        let allowed = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                matches!(
+                    name,
+                    "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish" | "csh" | "tcsh"
+                )
+            });
+        if allowed { shell } else { "/bin/sh".into() }
+    }
+}
+
+fn default_shell() -> Option<OsString> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("COMSPEC")
+            .or_else(|| std::env::var_os("ComSpec"))
+            .or_else(|| std::env::var_os("SHELL"))
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("SHELL")
+    }
+}
+
+fn login_shell_command(shell: OsString) -> portable_pty::CommandBuilder {
+    let mut command = portable_pty::CommandBuilder::new(shell.clone());
+    #[cfg(windows)]
+    {
+        let shell = shell.to_string_lossy();
+        if is_windows_powershell(&shell) {
+            command.arg("-NoLogo");
+        } else {
+            command.arg("/d");
+        }
+    }
+    #[cfg(not(windows))]
+    command.arg("-l");
+    command
+}
+
+#[cfg(windows)]
+fn is_windows_powershell(shell: &str) -> bool {
+    let name = Path::new(shell)
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            matches!(
-                name,
-                "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish" | "csh" | "tcsh"
-            )
-        });
-    if allowed { shell } else { "/bin/sh".into() }
+        .unwrap_or(shell)
+        .to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "powershell.exe" | "pwsh.exe" | "powershell" | "pwsh"
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::login_shell;
+    use super::{default_shell, login_shell};
     use std::ffi::OsString;
 
     #[test]
@@ -849,5 +997,19 @@ mod tests {
             login_shell(Some(OsString::from("/bin/zsh"))),
             OsString::from("/bin/zsh")
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn login_shell_accepts_windows_command_processor() {
+        assert_eq!(
+            login_shell(Some(OsString::from("cmd.exe"))),
+            OsString::from("cmd.exe")
+        );
+    }
+
+    #[test]
+    fn default_shell_is_available() {
+        assert!(!default_shell().unwrap_or_default().is_empty());
     }
 }

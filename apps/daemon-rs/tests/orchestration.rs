@@ -804,7 +804,7 @@ fn schema_indexes_survive_reopen() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 22);
+    assert_eq!(version, 23);
     // Stage 7 reverse-edge indexes and Stage 8 worktree indexes all exist.
     let indexed: i64 = connection
         .query_row(
@@ -842,7 +842,187 @@ fn schema_indexes_survive_reopen() {
 }
 
 #[test]
-fn v8_database_is_migrated_forward_to_v22() {
+fn imports_legacy_orchestration_sqlite_and_recovers_paused_work() {
+    let legacy = TempDir::new().unwrap();
+    let legacy_db = rusqlite::Connection::open(legacy.path().join("orchestration.sqlite")).unwrap();
+    legacy_db
+        .execute_batch(
+            "CREATE TABLE runs(id TEXT PRIMARY KEY, data TEXT NOT NULL);
+             CREATE TABLE tasks(id TEXT PRIMARY KEY, run_id TEXT, data TEXT NOT NULL);
+             CREATE TABLE dispatches(id TEXT PRIMARY KEY, run_id TEXT, data TEXT NOT NULL);
+             CREATE TABLE gates(id TEXT PRIMARY KEY, run_id TEXT, data TEXT NOT NULL);
+             CREATE TABLE messages(id TEXT PRIMARY KEY, run_id TEXT, data TEXT NOT NULL);
+             CREATE TABLE worktreeAssets(id TEXT PRIMARY KEY, run_id TEXT, data TEXT NOT NULL);
+             CREATE TABLE task_dependencies(task_id TEXT NOT NULL, dependency_id TEXT NOT NULL);",
+        )
+        .unwrap();
+    legacy_db
+        .execute(
+            "INSERT INTO runs(id,data) VALUES('run_legacy',?1)",
+            [serde_json::json!({
+                "id": "run_legacy",
+                "objective": "legacy paused run",
+                "status": "active",
+                "coordinatorSessionId": "coord_legacy",
+                "graphRevision": 4,
+                "automation": {
+                    "state": "running",
+                    "agent": "codex",
+                    "approvalPolicy": "standard",
+                    "workspace": "current",
+                    "cwd": "/tmp",
+                    "workspacePath": "/tmp",
+                    "branch": null,
+                    "startedAt": 10,
+                    "updatedAt": 11,
+                    "lastError": null
+                },
+                "createdAt": 1,
+                "updatedAt": 2
+            })
+            .to_string()],
+        )
+        .unwrap();
+    legacy_db
+        .execute(
+            "INSERT INTO tasks(id,run_id,data) VALUES('task_a','run_legacy',?1)",
+            [serde_json::json!({
+                "id": "task_a",
+                "runId": "run_legacy",
+                "title": "Done",
+                "spec": "done task",
+                "skills": ["api-search"],
+                "deps": [],
+                "parentId": null,
+                "status": "done",
+                "result": "ok",
+                "createdAt": 3,
+                "updatedAt": 4
+            })
+            .to_string()],
+        )
+        .unwrap();
+    legacy_db
+        .execute(
+            "INSERT INTO tasks(id,run_id,data) VALUES('task_b','run_legacy',?1)",
+            [serde_json::json!({
+                "id": "task_b",
+                "runId": "run_legacy",
+                "title": "Running",
+                "spec": "running task",
+                "skills": [],
+                "deps": ["task_a"],
+                "parentId": "task_a",
+                "status": "dispatched",
+                "result": null,
+                "createdAt": 5,
+                "updatedAt": 6
+            })
+            .to_string()],
+        )
+        .unwrap();
+    legacy_db
+        .execute(
+            "INSERT INTO task_dependencies(task_id,dependency_id) VALUES('task_b','task_a')",
+            [],
+        )
+        .unwrap();
+    legacy_db
+        .execute(
+            "INSERT INTO dispatches(id,run_id,data) VALUES('disp_legacy','run_legacy',?1)",
+            [serde_json::json!({
+                "id": "disp_legacy",
+                "runId": "run_legacy",
+                "taskId": "task_b",
+                "sessionId": "sess_legacy",
+                "worktreePath": "/tmp/worktree",
+                "state": "running",
+                "startedAt": 7,
+                "settledAt": null,
+                "outcome": null
+            })
+            .to_string()],
+        )
+        .unwrap();
+    legacy_db
+        .execute(
+            "INSERT INTO gates(id,run_id,data) VALUES('gate_legacy','run_legacy',?1)",
+            [serde_json::json!({
+                "id": "gate_legacy",
+                "runId": "run_legacy",
+                "taskId": null,
+                "question": "review?",
+                "options": ["keep-blocked"],
+                "status": "pending",
+                "decision": null,
+                "createdAt": 8,
+                "resolvedAt": null
+            })
+            .to_string()],
+        )
+        .unwrap();
+    legacy_db
+        .execute(
+            "INSERT INTO worktreeAssets(id,run_id,data) VALUES('wt_legacy','run_legacy',?1)",
+            [serde_json::json!({
+                "id": "wt_legacy",
+                "kind": "worker",
+                "runId": "run_legacy",
+                "taskId": "task_b",
+                "dispatchId": "disp_legacy",
+                "repo": "/tmp/repo",
+                "path": "/tmp/worktree",
+                "branch": "worker",
+                "state": "active",
+                "createdAt": 9,
+                "updatedAt": 10,
+                "runDeletedAt": null,
+                "lastInspection": null,
+                "cleanup": null,
+                "lastError": null
+            })
+            .to_string()],
+        )
+        .unwrap();
+    drop(legacy_db);
+
+    let directory = TempDir::new().unwrap();
+    let mut store = Store::open(directory.path()).unwrap();
+    assert!(store.import_legacy_orchestration(legacy.path()).unwrap() > 0);
+    assert_eq!(store.import_legacy_orchestration(legacy.path()).unwrap(), 0);
+    let run = store.orch_run("run_legacy").unwrap();
+    assert!(matches!(run.status, RunStatus::Active));
+    assert_eq!(
+        run.automation.as_ref().unwrap().state,
+        prosperod_rs::orchestration::AutomationState::Paused
+    );
+    assert_eq!(
+        store.run_snapshot("run_legacy").unwrap().ready,
+        Vec::<String>::new()
+    );
+    let recovery = store.recover_dispatches().unwrap();
+    assert_eq!(recovery.settled.len(), 1);
+    assert_eq!(store.task("task_b").unwrap().status, TaskStatus::Failed);
+    assert_eq!(
+        store
+            .list_gates(Some("run_legacy"), Some(GateStatus::Pending))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .list_worktree_assets(Some("run_legacy"))
+            .unwrap()
+            .first()
+            .unwrap()
+            .state,
+        prosperod_rs::orchestration::WorktreeAssetState::Preserved
+    );
+}
+
+#[test]
+fn v8_database_is_migrated_forward_to_v23() {
     // Build a v8 database by initialising the pre-orchestration schema with the
     // legacy application id, then prove Store::open upgrades it in place.
     let directory = TempDir::new().unwrap();
@@ -862,13 +1042,13 @@ fn v8_database_is_migrated_forward_to_v22() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 22);
+    assert_eq!(version, 23);
     // The migrated store serves orchestration writes.
     let (_run_id, _ids) = make_run(&mut store, "op-graph-migrated", chain(1));
 }
 
 #[test]
-fn v9_database_is_migrated_forward_to_v22() {
+fn v9_database_is_migrated_forward_to_v23() {
     // A v9 database (Stage 7 current schema) gains the v10 worktree table and
     // dispatch column without losing rows.
     let directory = TempDir::new().unwrap();
@@ -892,7 +1072,7 @@ fn v9_database_is_migrated_forward_to_v22() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        22
+        23
     );
     drop(connection);
     let (run_id, ids) = make_run(&mut store, "op-graph-v9up", chain(1));
@@ -910,7 +1090,7 @@ fn v9_database_is_migrated_forward_to_v22() {
 }
 
 #[test]
-fn v10_database_is_migrated_forward_to_v22() {
+fn v10_database_is_migrated_forward_to_v23() {
     // A v10 database gains agent_runs.permission_mode with the default mode.
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("prospero.sqlite");
@@ -951,7 +1131,7 @@ fn v10_database_is_migrated_forward_to_v22() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        22
+        23
     );
     let mode: String = connection
         .query_row(
@@ -966,7 +1146,7 @@ fn v10_database_is_migrated_forward_to_v22() {
 }
 
 #[test]
-fn v11_database_is_migrated_forward_to_v22() {
+fn v11_database_is_migrated_forward_to_v23() {
     // A v11 database gains the subagent registry table and the timeline
     // subagent_id column without losing the existing agent run.
     let directory = TempDir::new().unwrap();
@@ -1011,7 +1191,7 @@ fn v11_database_is_migrated_forward_to_v22() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        22
+        23
     );
     // The run row and its v11 fields survived.
     let (mode, turn, native): (String, i64, Option<String>) = connection
@@ -1060,7 +1240,7 @@ fn v11_database_is_migrated_forward_to_v22() {
 }
 
 #[test]
-fn v12_database_is_migrated_forward_to_v22() {
+fn v12_database_is_migrated_forward_to_v23() {
     // A v12 database gains the busy-turn message-queue table without losing
     // the existing agent run.
     let directory = TempDir::new().unwrap();
@@ -1108,7 +1288,7 @@ fn v12_database_is_migrated_forward_to_v22() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        22
+        23
     );
     // The existing run survived.
     let (turn, native): (i64, Option<String>) = connection
@@ -1148,7 +1328,7 @@ fn v12_database_is_migrated_forward_to_v22() {
 }
 
 #[test]
-fn v13_database_is_migrated_forward_to_v22() {
+fn v13_database_is_migrated_forward_to_v23() {
     // A v13 database gains the queue attachments column with an empty JSON
     // default, without losing the existing run or queued row.
     let directory = TempDir::new().unwrap();
@@ -1206,7 +1386,7 @@ fn v13_database_is_migrated_forward_to_v22() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        22
+        23
     );
     // The pre-existing queued row decodes the column default as an empty list.
     let (text, attachments): (String, String) = connection
@@ -1239,7 +1419,7 @@ fn v13_database_is_migrated_forward_to_v22() {
 }
 
 #[test]
-fn v14_database_is_migrated_forward_to_v22() {
+fn v14_database_is_migrated_forward_to_v23() {
     // A v14 database gains the agent_runs.model/effort launch-selection
     // columns (NULL for sessions created before the slice) without losing the
     // existing run.
@@ -1294,7 +1474,7 @@ fn v14_database_is_migrated_forward_to_v22() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        22
+        23
     );
     // Legacy sessions carry no launch selection.
     let (model, effort): (Option<String>, Option<String>) = connection
@@ -1331,7 +1511,7 @@ fn v14_database_is_migrated_forward_to_v22() {
 }
 
 #[test]
-fn v15_database_is_migrated_forward_to_v22() {
+fn v15_database_is_migrated_forward_to_v23() {
     // A v15 database gains the managed_accounts registry and the account_id
     // binding columns on agent/terminal runs without losing existing runs.
     let directory = TempDir::new().unwrap();
@@ -1402,7 +1582,7 @@ fn v15_database_is_migrated_forward_to_v22() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        22
+        23
     );
     let has_engine_validation_column: i64 = connection
         .query_row(

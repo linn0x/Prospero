@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -147,6 +147,25 @@ enum Driver {
     Opencode(OpencodeTurn),
 }
 
+fn engine_agent(agent: AgentKind, profile: Option<&crate::accounts::ApiProfile>) -> AgentKind {
+    if profile.is_some_and(|profile| profile.protocol() == "openai_chat_completions") {
+        AgentKind::Opencode
+    } else {
+        agent
+    }
+}
+
+fn account_agent_matches(
+    requested: AgentKind,
+    record: &crate::accounts::managed::ManagedRecord,
+) -> bool {
+    record.agent == requested
+        || record
+            .api_profile
+            .as_ref()
+            .is_some_and(|profile| engine_agent(record.agent, Some(profile)) == requested)
+}
+
 impl Driver {
     fn take_events(&mut self) -> Option<tokio::sync::mpsc::Receiver<AdapterEvent>> {
         match self {
@@ -282,6 +301,7 @@ struct State {
     closed: AtomicBool,
     failed: AtomicBool,
     changed: watch::Sender<u64>,
+    control_environment: std::sync::Mutex<Option<crate::control_cli::ControlEnvironment>>,
 }
 
 fn profile_model_catalog(
@@ -319,6 +339,7 @@ impl Agents {
             closed: AtomicBool::new(false),
             failed: AtomicBool::new(false),
             changed: watch::channel(0).0,
+            control_environment: std::sync::Mutex::new(None),
         }))
     }
 
@@ -328,6 +349,28 @@ impl Agents {
 
     pub(crate) fn changes(&self) -> watch::Sender<u64> {
         self.0.changed.clone()
+    }
+
+    pub(crate) fn database(&self) -> Database {
+        self.0.database.clone()
+    }
+
+    pub fn configure_control_environment(
+        &self,
+        base_url: String,
+        token_path: PathBuf,
+        socket_path: String,
+        cli_dir: Option<PathBuf>,
+    ) {
+        if let Ok(mut environment) = self.0.control_environment.lock() {
+            *environment = Some(crate::control_cli::ControlEnvironment {
+                home: self.0.database.directory().to_owned(),
+                base_url,
+                token_path,
+                socket_path,
+                cli_dir,
+            });
+        }
     }
 
     pub fn check(&self) -> Result<()> {
@@ -394,6 +437,12 @@ impl Agents {
                 "OpenCode structured runtime 需要 OpenAI Chat Completions API Profile".into(),
             ));
         }
+        let mut input = input;
+        if input.agent == crate::protocol::AgentKind::Codex
+            && input.account_id.as_deref() == Some(crate::agent::NATIVE_CODEX_ID)
+        {
+            input.account_id = None;
+        }
         if input.agent == crate::protocol::AgentKind::Codex {
             match input.account_id.as_deref() {
                 None | Some(crate::agent::NATIVE_CODEX_ID) => {}
@@ -408,12 +457,7 @@ impl Agents {
                         })
                         .await?;
                     match profile.as_ref().map(|profile| profile.protocol()) {
-                        Some("openai_responses") => {}
-                        Some("openai_chat_completions") => {
-                            return Err(Error::Invalid(
-                                "Codex structured runtime 仅支持 OpenAI Responses Profile".into(),
-                            ));
-                        }
+                        Some("openai_responses" | "openai_chat_completions") => {}
                         _ => {
                             return Err(Error::Invalid(
                                 "所选账号不支持 Codex structured runtime".into(),
@@ -467,11 +511,6 @@ impl Agents {
             account_id: input.account_id,
             resume: input.resume,
         };
-        if create.agent == crate::protocol::AgentKind::Codex
-            && create.account_id.as_deref() == Some(crate::agent::NATIVE_CODEX_ID)
-        {
-            create.account_id = None;
-        }
         let database = self.0.database.clone();
         let data = self.0.database.directory().to_owned();
         let head = self
@@ -487,7 +526,7 @@ impl Agents {
                     if account_id != crate::accounts::NATIVE_CLAUDE_ID {
                         let record = store.managed_snapshot_row(&data, account_id)?;
                         if let Some(profile) = record.api_profile.as_ref() {
-                            if crate::accounts::profile::agent_kind(profile) != create.agent {
+                            if !account_agent_matches(create.agent, &record) {
                                 return Err(Error::Invalid("所选账号与 Agent 不匹配".into()));
                             }
                             if profile
@@ -773,21 +812,24 @@ impl Agents {
         }
         let api_profile =
             Self::account_api_profile(&self.0.database, run.account_id.clone()).await?;
+        let mut environment =
+            Self::account_environment(&self.0.database, run.account_id.clone()).await?;
+        if let Ok(control) = self.0.control_environment.lock()
+            && let Some(control) = control.as_ref()
+        {
+            environment.extend(control.vars(Some(id)));
+        }
         let options = TurnOptions {
             policy: run.policy,
             mode: run.mode,
             model: run.model.clone(),
             effort: run.effort.clone(),
-            environment: Self::account_environment_with_profile(
-                &self.0.database,
-                run.account_id.clone(),
-                api_profile.clone(),
-            )
-            .await?,
+            environment,
             api_profile,
             agent_preset: run.agent_preset.clone(),
         };
-        let driver = match run.agent {
+        let engine = engine_agent(run.agent, options.api_profile.as_ref());
+        let driver = match engine {
             AgentKind::Claude => Driver::Claude(spawn_turn(
                 &workspace,
                 &expanded,
@@ -1899,24 +1941,6 @@ impl Agents {
             .await
     }
 
-    async fn account_environment_with_profile(
-        database: &crate::worker::Database,
-        account_id: Option<String>,
-        profile: Option<crate::accounts::ApiProfile>,
-    ) -> Result<Vec<(String, String)>> {
-        let Some(id) = account_id else {
-            return Ok(Vec::new());
-        };
-        let data = database.directory().to_owned();
-        tokio::task::spawn_blocking(move || match profile {
-            Some(profile) => {
-                crate::accounts::managed::profile_account_environment(&data, &id, &profile)
-            }
-            None => crate::accounts::managed::claude_environment(&data, &id, false),
-        })
-        .await
-        .map_err(|_| Error::Closed)?
-    }
     /// Private environment overrides for a session's bound account (empty for
     /// the native environment). Profile accounts get the isolated API-key
     /// profile environment; legacy managed accounts the OAuth/imported-key one.
@@ -1925,8 +1949,28 @@ impl Agents {
         database: &crate::worker::Database,
         account_id: Option<String>,
     ) -> Result<Vec<(String, String)>> {
-        let profile = Self::account_api_profile(database, account_id.clone()).await?;
-        Self::account_environment_with_profile(database, account_id, profile).await
+        let Some(id) = account_id else {
+            return Ok(Vec::new());
+        };
+        let data = database.directory().to_owned();
+        let record = database
+            .call({
+                let data = data.clone();
+                let id = id.clone();
+                move |store| store.managed_snapshot_row(&data, &id)
+            })
+            .await?;
+        tokio::task::spawn_blocking(move || match record.api_profile {
+            Some(profile) => crate::accounts::managed::profile_account_environment(
+                &data,
+                &record.id,
+                record.agent,
+                &profile,
+            ),
+            None => crate::accounts::managed::claude_environment(&data, &record.id, false),
+        })
+        .await
+        .map_err(|_| Error::Closed)?
     }
 
     pub async fn usage(&self, id: &str) -> Result<Option<UsageReport>> {

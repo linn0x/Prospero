@@ -165,6 +165,12 @@ describe("结构化轨协议", () => {
       name: "工作账号",
     })).toMatchObject({ agent: "claude", name: "工作账号" });
     expect(parseC2S({
+      type: "agent.account.create",
+      requestId: "account-create-opencode",
+      agent: "opencode",
+      name: "OpenCode",
+    })).toMatchObject({ agent: "opencode", name: "OpenCode" });
+    expect(parseC2S({
       type: "agent.account.login",
       requestId: "account-login-1",
       accountId: "account-1",
@@ -188,7 +194,7 @@ describe("结构化轨协议", () => {
     expect(() => parseC2S({
       type: "agent.account.create",
       requestId: "account-create-2",
-      agent: "opencode",
+      agent: "grok",
       name: "不支持",
     })).toThrowError(ProtocolError);
     expect(parseC2S({
@@ -716,6 +722,7 @@ describe("结构化轨协议", () => {
         cwd: "/tmp",
         status: "waiting_approval",
         createdAt: 1,
+        busySince: 1,
         cols: 80,
         rows: 24,
         pendingPermissions: 1,
