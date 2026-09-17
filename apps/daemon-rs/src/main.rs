@@ -71,6 +71,14 @@ enum Command {
         #[command(subcommand)]
         command: RelayCommand,
     },
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
+    },
+    Schedule {
+        #[command(subcommand)]
+        command: Box<ScheduleCommand>,
+    },
     Notify {
         #[arg(long)]
         url: Option<String>,
@@ -148,6 +156,179 @@ enum RelayCommand {
     },
 }
 
+#[derive(Subcommand)]
+#[command(rename_all = "kebab-case")]
+enum PluginCommand {
+    List {
+        #[arg(long = "home")]
+        home: Option<PathBuf>,
+    },
+    Service {
+        #[command(subcommand)]
+        command: PluginServiceCommand,
+    },
+}
+
+#[derive(Subcommand)]
+#[command(rename_all = "kebab-case")]
+enum PluginServiceCommand {
+    Status {
+        #[arg(long = "home")]
+        home: Option<PathBuf>,
+    },
+    Start {
+        plugin_id: String,
+        service_id: String,
+        #[arg(long = "home")]
+        home: Option<PathBuf>,
+    },
+    Stop {
+        plugin_id: String,
+        service_id: String,
+        #[arg(long = "home")]
+        home: Option<PathBuf>,
+    },
+    Restart {
+        plugin_id: String,
+        service_id: String,
+        #[arg(long = "home")]
+        home: Option<PathBuf>,
+    },
+    Health {
+        plugin_id: String,
+        service_id: String,
+        #[arg(long = "home")]
+        home: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+#[command(rename_all = "kebab-case")]
+enum ScheduleCommand {
+    List {
+        #[arg(long = "home")]
+        home: Option<PathBuf>,
+    },
+    Get {
+        #[arg(long)]
+        id: String,
+        #[arg(long = "home")]
+        home: Option<PathBuf>,
+    },
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long)]
+        rrule: String,
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long = "approval-policy")]
+        approval_policy: Option<String>,
+        #[arg(long = "account")]
+        account_id: Option<String>,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long = "effort")]
+        reasoning_effort: Option<String>,
+        #[arg(long)]
+        mode: Option<String>,
+        #[arg(long = "target-thread")]
+        target_thread_id: Option<String>,
+        #[arg(long)]
+        paused: bool,
+        #[arg(long = "operation-id")]
+        operation_id: Option<String>,
+        #[arg(long = "home")]
+        home: Option<PathBuf>,
+    },
+    Update {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long)]
+        rrule: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long = "approval-policy")]
+        approval_policy: Option<String>,
+        #[arg(long = "account")]
+        account_id: Option<String>,
+        #[arg(long = "clear-account")]
+        clear_account: bool,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long = "clear-model")]
+        clear_model: bool,
+        #[arg(long = "effort")]
+        reasoning_effort: Option<String>,
+        #[arg(long = "clear-effort")]
+        clear_effort: bool,
+        #[arg(long)]
+        mode: Option<String>,
+        #[arg(long = "clear-mode")]
+        clear_mode: bool,
+        #[arg(long = "target-thread")]
+        target_thread_id: Option<String>,
+        #[arg(long = "clear-target-thread")]
+        clear_target_thread: bool,
+        #[arg(long)]
+        paused: bool,
+        #[arg(long)]
+        enabled: bool,
+        #[arg(long = "operation-id")]
+        operation_id: Option<String>,
+        #[arg(long = "home")]
+        home: Option<PathBuf>,
+    },
+    Pause {
+        #[arg(long)]
+        id: String,
+        #[arg(long = "operation-id")]
+        operation_id: Option<String>,
+        #[arg(long = "home")]
+        home: Option<PathBuf>,
+    },
+    Resume {
+        #[arg(long)]
+        id: String,
+        #[arg(long = "operation-id")]
+        operation_id: Option<String>,
+        #[arg(long = "home")]
+        home: Option<PathBuf>,
+    },
+    Delete {
+        #[arg(long)]
+        id: String,
+        #[arg(long = "operation-id")]
+        operation_id: Option<String>,
+        #[arg(long = "home")]
+        home: Option<PathBuf>,
+    },
+    Run {
+        #[arg(long)]
+        id: String,
+        #[arg(long = "operation-id")]
+        operation_id: Option<String>,
+        #[arg(long = "home")]
+        home: Option<PathBuf>,
+    },
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let command = Arguments::parse().command.unwrap_or(Command::Start {
         port: None,
@@ -193,6 +374,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             data_dir,
         } => run_pair(data_dir, name, shell, shell && orchestration, dev)?,
         Command::Relay { command } => run_relay(command)?,
+        Command::Plugin { command } => {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(run_plugin(command))?;
+        }
+        Command::Schedule { command } => {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(run_schedule(*command))?;
+        }
         Command::Notify {
             url,
             off,
@@ -478,6 +671,196 @@ fn run_relay(command: RelayCommand) -> DaemonResult<()> {
     Ok(())
 }
 
+async fn run_plugin(command: PluginCommand) -> DaemonResult<()> {
+    let (home, method, params) = match command {
+        PluginCommand::List { home } => (home, "plugin.list", json!({})),
+        PluginCommand::Service { command } => match command {
+            PluginServiceCommand::Status { home } => (home, "plugin.service.status", json!({})),
+            PluginServiceCommand::Start {
+                plugin_id,
+                service_id,
+                home,
+            } => (
+                home,
+                "plugin.service.start",
+                json!({"pluginId": plugin_id, "serviceId": service_id}),
+            ),
+            PluginServiceCommand::Stop {
+                plugin_id,
+                service_id,
+                home,
+            } => (
+                home,
+                "plugin.service.stop",
+                json!({"pluginId": plugin_id, "serviceId": service_id}),
+            ),
+            PluginServiceCommand::Restart {
+                plugin_id,
+                service_id,
+                home,
+            } => (
+                home,
+                "plugin.service.restart",
+                json!({"pluginId": plugin_id, "serviceId": service_id}),
+            ),
+            PluginServiceCommand::Health {
+                plugin_id,
+                service_id,
+                home,
+            } => (
+                home,
+                "plugin.service.health",
+                json!({"pluginId": plugin_id, "serviceId": service_id}),
+            ),
+        },
+    };
+    let home = prosperod_rs::control_cli::prospero_home(home);
+    let result = prosperod_rs::control_cli::control_method(&home, method, params).await?;
+    print_json(&result)?;
+    Ok(())
+}
+
+async fn run_schedule(command: ScheduleCommand) -> DaemonResult<()> {
+    let (home, method, params) = match command {
+        ScheduleCommand::List { home } => (home, "schedule.list", json!({})),
+        ScheduleCommand::Get { id, home } => (home, "schedule.get", json!({"id": id})),
+        ScheduleCommand::Create {
+            name,
+            prompt,
+            rrule,
+            id,
+            kind,
+            agent,
+            approval_policy,
+            account_id,
+            cwd,
+            model,
+            reasoning_effort,
+            mode,
+            target_thread_id,
+            paused,
+            operation_id,
+            home,
+        } => (
+            home,
+            "schedule.create",
+            strip_empty(json!({
+                "id": id,
+                "kind": kind,
+                "name": name,
+                "prompt": prompt,
+                "rrule": rrule,
+                "status": paused.then_some("PAUSED"),
+                "agent": agent,
+                "approvalPolicy": approval_policy,
+                "accountId": account_id,
+                "cwd": optional_absolute(cwd)?,
+                "model": model,
+                "reasoningEffort": reasoning_effort,
+                "mode": mode,
+                "targetThreadId": target_thread_id,
+                "operationId": operation_id,
+            })),
+        ),
+        ScheduleCommand::Update {
+            id,
+            name,
+            prompt,
+            rrule,
+            kind,
+            agent,
+            approval_policy,
+            account_id,
+            clear_account,
+            cwd,
+            model,
+            clear_model,
+            reasoning_effort,
+            clear_effort,
+            mode,
+            clear_mode,
+            target_thread_id,
+            clear_target_thread,
+            paused,
+            enabled,
+            operation_id,
+            home,
+        } => {
+            if paused && enabled {
+                return Err(DaemonError::Invalid(
+                    "--paused 与 --enabled 不能同时使用".into(),
+                ));
+            }
+            let mut body = serde_json::Map::new();
+            body.insert("id".into(), json!(id));
+            insert_optional(&mut body, "name", name);
+            insert_optional(&mut body, "prompt", prompt);
+            insert_optional(&mut body, "rrule", rrule);
+            insert_optional(&mut body, "kind", kind);
+            insert_optional(&mut body, "agent", agent);
+            insert_optional(&mut body, "approvalPolicy", approval_policy);
+            insert_clearable(&mut body, "accountId", account_id, clear_account);
+            insert_optional(&mut body, "cwd", optional_absolute(cwd)?);
+            insert_clearable(&mut body, "model", model, clear_model);
+            insert_clearable(&mut body, "reasoningEffort", reasoning_effort, clear_effort);
+            insert_clearable(&mut body, "mode", mode, clear_mode);
+            insert_clearable(
+                &mut body,
+                "targetThreadId",
+                target_thread_id,
+                clear_target_thread,
+            );
+            if paused {
+                body.insert("status".into(), json!("PAUSED"));
+            } else if enabled {
+                body.insert("status".into(), json!("ENABLED"));
+            }
+            insert_optional(&mut body, "operationId", operation_id);
+            (home, "schedule.update", Value::Object(body))
+        }
+        ScheduleCommand::Pause {
+            id,
+            operation_id,
+            home,
+        } => (
+            home,
+            "schedule.pause",
+            json!({"id": id, "operationId": operation_id}),
+        ),
+        ScheduleCommand::Resume {
+            id,
+            operation_id,
+            home,
+        } => (
+            home,
+            "schedule.resume",
+            json!({"id": id, "operationId": operation_id}),
+        ),
+        ScheduleCommand::Delete {
+            id,
+            operation_id,
+            home,
+        } => (
+            home,
+            "schedule.delete",
+            json!({"id": id, "operationId": operation_id}),
+        ),
+        ScheduleCommand::Run {
+            id,
+            operation_id,
+            home,
+        } => (
+            home,
+            "schedule.run",
+            json!({"id": id, "operationId": operation_id}),
+        ),
+    };
+    let home = prosperod_rs::control_cli::prospero_home(home);
+    let result = prosperod_rs::control_cli::control_method(&home, method, params).await?;
+    print_json(&result)?;
+    Ok(())
+}
+
 fn run_notify(
     data_dir: Option<PathBuf>,
     url: Option<String>,
@@ -629,6 +1012,49 @@ fn run_status(data_dir: Option<PathBuf>) -> DaemonResult<()> {
         );
     }
     Ok(())
+}
+
+fn print_json(value: &Value) -> DaemonResult<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
+fn optional_absolute(path: Option<PathBuf>) -> DaemonResult<Option<String>> {
+    path.map(|path| {
+        let path = if path.is_absolute() {
+            path
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        Ok(path.to_string_lossy().into_owned())
+    })
+    .transpose()
+}
+
+fn insert_optional(map: &mut serde_json::Map<String, Value>, key: &str, value: Option<String>) {
+    if let Some(value) = value {
+        map.insert(key.into(), json!(value));
+    }
+}
+
+fn insert_clearable(
+    map: &mut serde_json::Map<String, Value>,
+    key: &str,
+    value: Option<String>,
+    clear: bool,
+) {
+    if clear {
+        map.insert(key.into(), Value::Null);
+    } else {
+        insert_optional(map, key, value);
+    }
+}
+
+fn strip_empty(mut value: Value) -> Value {
+    if let Some(object) = value.as_object_mut() {
+        object.retain(|_, value| !value.is_null());
+    }
+    value
 }
 
 async fn send_test_notification(url: &str) -> bool {
@@ -805,13 +1231,7 @@ impl EmptyText for String {
 }
 
 fn prospero_home(data_dir: Option<PathBuf>) -> PathBuf {
-    data_dir
-        .or_else(|| std::env::var_os("PROSPERO_HOME").map(PathBuf::from))
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".prospero")))
-        .or_else(|| {
-            std::env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".prospero"))
-        })
-        .unwrap_or_else(|| PathBuf::from(".prospero"))
+    prosperod_rs::control_cli::prospero_home(data_dir)
 }
 
 fn load_config_value(home: &Path) -> DaemonResult<Value> {
@@ -1005,13 +1425,42 @@ async fn serve(
     let base_url = format!("http://{local_address}");
     let control_token = token.value().to_owned();
     token.publish(&directory, &base_url)?;
-    let api = Api::with_guard(database.clone(), token, Some(std::env::current_exe()?));
+    let current_exe = std::env::current_exe()?;
+    let cli_dir = current_exe.parent().map(Path::to_path_buf);
+    let api = Api::with_guard(database.clone(), token, Some(current_exe));
+    let control_token_path = directory.join("control.token");
+    std::fs::write(&control_token_path, &control_token)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&control_token_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    api.plugin_services.configure(
+        address.port(),
+        control_token_path.clone(),
+        prosperod_rs::plugins::control_socket_path(&directory),
+    );
+    let control_socket_path = prosperod_rs::plugins::control_socket_path(&directory);
+    api.agents.configure_control_environment(
+        base_url.clone(),
+        control_token_path.clone(),
+        control_socket_path.clone(),
+        cli_dir.clone(),
+    );
+    api.terminals.configure_control_environment(
+        base_url.clone(),
+        control_token_path,
+        control_socket_path,
+        cli_dir,
+    );
     // Stale agent runs belonged to the previous process; archive them
     // without replaying turns.
     let recovered_agents = api.agents.recover().await?;
     if recovered_agents > 0 {
         api.publish();
     }
+    api.schedules.start().await;
+    api.plugin_services.start_auto().await;
     let running_automations = database
         .call(|store| {
             Ok(store
@@ -1066,6 +1515,8 @@ async fn serve(
     let shutdown = async move {
         tokio::select! { _ = wait_for_shutdown() => {}, _ = shutdown_api.wait_stopped() => {} }
         shutdown_api.stop();
+        shutdown_api.schedules.close();
+        shutdown_api.plugin_services.stop_all().await;
         let _ = shutdown_api.agents.shutdown().await;
         let _ = shutdown_api.terminals.shutdown().await;
         stopping.send_replace(true);
@@ -1083,11 +1534,13 @@ async fn serve(
         _ = stopped.changed() => { let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut server).await; }
     }
     api.stop();
+    api.plugin_services.stop_all().await;
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), relay_task).await;
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), projection_task).await;
     let terminals_stopped = api.terminals.shutdown().await;
     let agents_stopped = api.agents.shutdown().await;
     let _ = std::fs::remove_file(directory.join("connection.json"));
+    let _ = std::fs::remove_file(directory.join("control.token"));
     let _ = std::fs::remove_file(directory.join("status.json"));
     let database_stopped = database.shutdown().await;
     terminals_stopped?;

@@ -431,6 +431,7 @@ fn claude_session_environment(
         ("ANTHROPIC_BASE_URL".into(), profile.base_url.clone()),
         ("ANTHROPIC_CUSTOM_HEADERS".into(), custom_headers(profile)),
         ("ANTHROPIC_MODEL".into(), profile.model.clone()),
+        ("PROSPERO_API_PROFILE_MODEL".into(), profile.model.clone()),
         ("CLAUDE_CODE_API_BASE_URL".into(), String::new()),
         ("CLAUDE_CODE_OAUTH_TOKEN".into(), String::new()),
         ("CLAUDE_CODE_OAUTH_REFRESH_TOKEN".into(), String::new()),
@@ -510,6 +511,11 @@ fn codex_session_environment(
             "CODEX_SQLITE_HOME".into(),
             root.to_string_lossy().into_owned(),
         ),
+        ("PROSPERO_API_PROFILE_MODEL".into(), profile.model.clone()),
+        (
+            "PROSPERO_API_PROFILE_MODEL_PROVIDER".into(),
+            "prospero".into(),
+        ),
         (
             "PROSPERO_API_PROFILE_VISION".into(),
             if profile.model_capabilities.as_ref().and_then(|c| c.vision) == Some(false) {
@@ -538,6 +544,8 @@ pub(crate) fn codex_app_server_args(profile: &ApiProfile) -> Vec<String> {
         format!("model_provider={}", toml_string("prospero")),
         "-c".into(),
         format!("model={}", toml_string(&profile.model)),
+        "-c".into(),
+        format!("default_subagent_model={}", toml_string(&profile.model)),
         "-c".into(),
         format!(
             "model_providers.prospero.name={}",

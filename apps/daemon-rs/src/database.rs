@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::protocol::*;
 
 const APPLICATION_ID: i64 = 0x50525253;
-const SCHEMA_VERSION: i64 = 22;
+const SCHEMA_VERSION: i64 = 23;
 const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 const MAX_CONTENT_BYTES: i64 = 1024 * 1024 * 1024;
 
@@ -140,6 +140,7 @@ impl Store {
             transaction.execute_batch(include_str!("agent/schema-v19.sql"))?;
             transaction.execute_batch(include_str!("agent/schema-v21.sql"))?;
             transaction.execute_batch(include_str!("agent/schema-v22.sql"))?;
+            transaction.execute_batch(include_str!("agent/schema-v23.sql"))?;
             transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
@@ -198,6 +199,9 @@ impl Store {
             if version <= 21 {
                 transaction.execute_batch(include_str!("agent/schema-v22.sql"))?;
             }
+            if version <= 22 {
+                transaction.execute_batch(include_str!("agent/schema-v23.sql"))?;
+            }
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -243,6 +247,7 @@ impl Store {
             created_at: timestamp,
             updated_at: timestamp,
             revision: 1,
+            busy_since: None,
         };
         let transaction = self.connection.transaction()?;
         Self::insert_session(&transaction, &session)?;
@@ -294,6 +299,59 @@ impl Store {
         self.update_session_with(id, update, |_| Ok(()))
     }
 
+    pub(crate) fn set_session_busy_since(
+        &mut self,
+        id: &str,
+        busy_since: Option<i64>,
+    ) -> Result<bool> {
+        crate::database::validate_id(id)?;
+        if busy_since.is_some_and(|value| !(0..MAX_SAFE_INTEGER).contains(&value)) {
+            return Err(Error::Invalid("invalid busy timestamp".into()));
+        }
+        let mut session = self.session(id)?;
+        if session.busy_since == busy_since {
+            return Ok(false);
+        }
+        if session.kind != SessionKind::Pty
+            || session.lifecycle != SessionLifecycle::Active
+            || session.status != SessionStatus::Running
+        {
+            return Ok(false);
+        }
+        let revision = session.revision;
+        session.busy_since = busy_since;
+        session.revision += 1;
+        session.updated_at = now();
+        let transaction = self.connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE session_heads SET revision=?1,payload=?2 WHERE id=?3 AND revision=?4",
+            params![
+                session.revision,
+                serde_json::to_string(&session)?,
+                id,
+                revision
+            ],
+        )?;
+        if changed != 1 {
+            return Err(Error::Conflict);
+        }
+        for (scope, workspace) in [(0, ""), (1, session.workspace.as_str())] {
+            transaction.execute(
+                "UPDATE session_counts SET revision=revision+1 WHERE scope=?1 AND workspace=?2",
+                params![scope, workspace],
+            )?;
+        }
+        Self::append_event(
+            &transaction,
+            "sessions",
+            "session.updated",
+            id,
+            serde_json::to_value(&session)?,
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
     pub(crate) fn update_session_with(
         &mut self,
         id: &str,
@@ -308,18 +366,36 @@ impl Store {
         if session.revision != update.revision {
             return Err(Error::Conflict);
         }
+        let timestamp = now();
         if let Some(title) = update.title {
             validate_text(&title, 512, false)?;
             session.title = title;
         }
         if let Some(lifecycle) = update.lifecycle {
             session.lifecycle = lifecycle;
+            if lifecycle == SessionLifecycle::Archived {
+                session.busy_since = None;
+            }
         }
         if let Some(status) = update.status {
             session.status = status;
+            session.busy_since = match status {
+                SessionStatus::Running if session.kind == SessionKind::Structured => {
+                    Some(session.busy_since.unwrap_or(timestamp))
+                }
+                SessionStatus::WaitingPermission | SessionStatus::WaitingInput => {
+                    Some(session.busy_since.unwrap_or(timestamp))
+                }
+                SessionStatus::Running if session.kind == SessionKind::Pty => session.busy_since,
+                SessionStatus::Idle
+                | SessionStatus::Starting
+                | SessionStatus::Completed
+                | SessionStatus::Failed => None,
+                SessionStatus::Running => session.busy_since,
+            };
         }
         session.revision += 1;
-        session.updated_at = now();
+        session.updated_at = timestamp;
         let transaction = self.connection.transaction()?;
         extra(&transaction)?;
         let changed = transaction.execute("UPDATE session_heads SET lifecycle=?1,revision=?2,payload=?3 WHERE id=?4 AND revision=?5",
@@ -640,6 +716,7 @@ impl Store {
                     created_at: index as i64 + 1,
                     updated_at: index as i64 + 1,
                     revision: 1,
+                    busy_since: None,
                 },
             )?;
             let id = format!("session-{index:09}");

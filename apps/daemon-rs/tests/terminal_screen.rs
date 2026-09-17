@@ -8,7 +8,7 @@ fn bounded_scrollback_and_pending_controls_do_not_grow_with_stream_length() {
         screen.process(b"line\r\nline\r\nline\r\n");
     }
     let snapshot = screen.snapshot(3000).unwrap();
-    assert!(snapshot.data_b64.len() < 100_000);
+    assert!(snapshot.data_b64.len() < 1_000_000);
     screen.process(b"\x1b]0;");
     screen.process(&vec![b'x'; 65536]);
     assert!(screen.snapshot(3001).is_err());

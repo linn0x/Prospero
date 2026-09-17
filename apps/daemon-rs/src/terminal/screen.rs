@@ -4,7 +4,7 @@ use unicode_width::UnicodeWidthChar;
 
 use super::*;
 
-const MAX_CELLS: usize = 160_000;
+const MAX_CELLS: usize = 2_048_000;
 const MAX_PENDING: usize = 8192;
 const MAX_SNAPSHOT: usize = 1024 * 1024;
 
@@ -50,7 +50,7 @@ impl Screen {
         let terminal = (cells <= MAX_CELLS).then(|| {
             avt::Vt::builder()
                 .size(size.cols.into(), size.rows.into())
-                .scrollback_limit(((MAX_CELLS - cells) / usize::from(size.cols)).min(200))
+                .scrollback_limit(((MAX_CELLS - cells) / usize::from(size.cols)).min(10_000))
                 .build()
         });
         Self {
@@ -69,7 +69,7 @@ impl Screen {
 
     pub fn resize(&mut self, size: TerminalSize) {
         self.size = size;
-        if usize::from(size.cols) * (usize::from(size.rows) * 2 + 200) > MAX_CELLS {
+        if usize::from(size.cols) * (usize::from(size.rows) * 2 + 10_000) > MAX_CELLS {
             self.terminal = None;
         }
         if let Some(terminal) = &mut self.terminal {
@@ -85,6 +85,14 @@ impl Screen {
                 (cursor.row, cursor.col)
             })
             .unwrap_or((0, 0))
+    }
+
+    pub fn visible_tail_text(&self, limit: usize) -> String {
+        let Some(terminal) = &self.terminal else {
+            return String::new();
+        };
+        let lines = terminal.view().map(|line| line.text()).collect::<Vec<_>>();
+        lines[lines.len().saturating_sub(limit)..].join("\n")
     }
 
     pub fn process(&mut self, bytes: &[u8]) {
