@@ -218,10 +218,32 @@ async fn database_worker_imports_missing_legacy_files_after_marker_exists() {
         .to_string(),
     )
     .unwrap();
+    std::fs::write(
+        legacy.path().join("relay-sync-state.json"),
+        serde_json::json!({
+            "version": 1,
+            "routes": {
+                "CG1dTxTscx5Vm84XPQRwkXjI61ziPLQNbj7La6EVEyk": 42
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
     let directory = TempDir::new().unwrap();
     std::fs::write(
         directory.path().join("config.json"),
         serde_json::json!({ "port": 7424 }).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("relay-sync-state.json"),
+        serde_json::json!({
+            "version": 1,
+            "routes": {
+                "CG1dTxTscx5Vm84XPQRwkXjI61ziPLQNbj7La6EVEyk": 7
+            }
+        })
+        .to_string(),
     )
     .unwrap();
     std::fs::write(
@@ -238,7 +260,15 @@ async fn database_worker_imports_missing_legacy_files_after_marker_exists() {
     database.shutdown().await.unwrap();
     let config = std::fs::read_to_string(directory.path().join("config.json")).unwrap();
     let devices = std::fs::read_to_string(directory.path().join("devices.json")).unwrap();
+    let sync: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(directory.path().join("relay-sync-state.json")).unwrap(),
+    )
+    .unwrap();
     assert!(config.contains("relay.example.com"));
     assert!(config.contains("\"port\": 7424"));
     assert!(devices.contains("relay-token"));
+    assert_eq!(
+        sync["routes"]["CG1dTxTscx5Vm84XPQRwkXjI61ziPLQNbj7La6EVEyk"].as_u64(),
+        Some(42)
+    );
 }

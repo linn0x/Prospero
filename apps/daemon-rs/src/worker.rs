@@ -155,6 +155,7 @@ fn import_legacy_files(directory: &Path, legacy_home: &Path) -> Result<()> {
     copy_legacy_file(directory, legacy_home, "identity.json")?;
     copy_legacy_file(directory, legacy_home, "devices.json")?;
     copy_legacy_config(directory, legacy_home)?;
+    merge_legacy_relay_sync_state(directory, legacy_home)?;
     copy_legacy_model_sources(directory, legacy_home)?;
     Ok(())
 }
@@ -197,6 +198,59 @@ fn copy_legacy_config(directory: &Path, legacy_home: &Path) -> Result<()> {
     };
     object.insert("relay".into(), source_relay);
     crate::pairing::write_private_json(directory, "config.json", &target_value)
+}
+
+fn merge_legacy_relay_sync_state(directory: &Path, legacy_home: &Path) -> Result<()> {
+    let source = legacy_home.join(crate::relay::RELAY_SYNC_STATE_FILE);
+    if !source.exists() {
+        return Ok(());
+    }
+    let source_value = serde_json::from_slice::<serde_json::Value>(&std::fs::read(source)?)?;
+    let Some(source_routes) = source_value
+        .get("routes")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Ok(());
+    };
+    let target_path = directory.join(crate::relay::RELAY_SYNC_STATE_FILE);
+    let mut target_value = if target_path.exists() {
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(&target_path)?)?
+    } else {
+        serde_json::json!({ "version": 1, "routes": {} })
+    };
+    if !target_value.is_object() {
+        return Ok(());
+    }
+    target_value["version"] = serde_json::json!(1);
+    if !target_value
+        .get("routes")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        target_value["routes"] = serde_json::json!({});
+    }
+    let Some(target_routes) = target_value
+        .get_mut("routes")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return Ok(());
+    };
+    for (route_id, source_generation) in source_routes {
+        let Some(source_generation) = source_generation.as_u64() else {
+            continue;
+        };
+        let target_generation = target_routes
+            .get(route_id)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if source_generation > target_generation {
+            target_routes.insert(route_id.clone(), serde_json::json!(source_generation));
+        }
+    }
+    crate::pairing::write_private_json(
+        directory,
+        crate::relay::RELAY_SYNC_STATE_FILE,
+        &target_value,
+    )
 }
 
 fn copy_legacy_model_sources(directory: &Path, legacy_home: &Path) -> Result<()> {
