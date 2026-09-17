@@ -54,25 +54,31 @@ impl Database {
                         return;
                     }
                 };
-                if import_legacy && let Some(legacy_home) = legacy_home {
-                    match import_legacy_state(&mut store, &worker_directory, &legacy_home) {
-                        Ok(imported) => {
-                            if let Err(error) = crate::pairing::write_private_json(
-                                &worker_directory,
-                                "legacy-orchestration-import.json",
-                                &serde_json::json!({
-                                    "source": legacy_home.to_string_lossy(),
-                                    "imported": imported,
-                                    "createdAt": crate::database::now(),
-                                }),
-                            ) {
+                if let Some(legacy_home) = legacy_home {
+                    if let Err(error) = import_legacy_files(&worker_directory, &legacy_home) {
+                        let _ = ready.send(Err(error));
+                        return;
+                    }
+                    if import_legacy {
+                        match import_legacy_state(&mut store, &worker_directory, &legacy_home) {
+                            Ok(imported) => {
+                                if let Err(error) = crate::pairing::write_private_json(
+                                    &worker_directory,
+                                    "legacy-orchestration-import.json",
+                                    &serde_json::json!({
+                                        "source": legacy_home.to_string_lossy(),
+                                        "imported": imported,
+                                        "createdAt": crate::database::now(),
+                                    }),
+                                ) {
+                                    let _ = ready.send(Err(error));
+                                    return;
+                                }
+                            }
+                            Err(error) => {
                                 let _ = ready.send(Err(error));
                                 return;
                             }
-                        }
-                        Err(error) => {
-                            let _ = ready.send(Err(error));
-                            return;
                         }
                     }
                 }
@@ -139,13 +145,18 @@ impl Database {
 }
 
 fn import_legacy_state(store: &mut Store, directory: &Path, legacy_home: &Path) -> Result<usize> {
-    copy_legacy_file(directory, legacy_home, "identity.json")?;
-    copy_legacy_file(directory, legacy_home, "devices.json")?;
-    copy_legacy_file(directory, legacy_home, "config.json")?;
-    copy_legacy_model_sources(directory, legacy_home)?;
+    import_legacy_files(directory, legacy_home)?;
     let accounts = store.import_legacy_accounts(directory, legacy_home)?;
     let orchestration = store.import_legacy_orchestration(legacy_home)?;
     Ok(accounts + orchestration)
+}
+
+fn import_legacy_files(directory: &Path, legacy_home: &Path) -> Result<()> {
+    copy_legacy_file(directory, legacy_home, "identity.json")?;
+    copy_legacy_file(directory, legacy_home, "devices.json")?;
+    copy_legacy_config(directory, legacy_home)?;
+    copy_legacy_model_sources(directory, legacy_home)?;
+    Ok(())
 }
 
 fn copy_legacy_file(directory: &Path, legacy_home: &Path, name: &str) -> Result<()> {
@@ -161,6 +172,31 @@ fn copy_legacy_file(directory: &Path, legacy_home: &Path, name: &str) -> Result<
         &serde_json::from_slice::<serde_json::Value>(&bytes)?,
     )?;
     Ok(())
+}
+
+fn copy_legacy_config(directory: &Path, legacy_home: &Path) -> Result<()> {
+    let source = legacy_home.join("config.json");
+    let target = directory.join("config.json");
+    if !source.exists() {
+        return Ok(());
+    }
+    let source_value = serde_json::from_slice::<serde_json::Value>(&std::fs::read(source)?)?;
+    if !target.exists() {
+        crate::pairing::write_private_json(directory, "config.json", &source_value)?;
+        return Ok(());
+    }
+    let mut target_value = serde_json::from_slice::<serde_json::Value>(&std::fs::read(&target)?)?;
+    let Some(source_relay) = source_value.get("relay").cloned() else {
+        return Ok(());
+    };
+    if target_value.get("relay").is_some() {
+        return Ok(());
+    }
+    let Some(object) = target_value.as_object_mut() else {
+        return Ok(());
+    };
+    object.insert("relay".into(), source_relay);
+    crate::pairing::write_private_json(directory, "config.json", &target_value)
 }
 
 fn copy_legacy_model_sources(directory: &Path, legacy_home: &Path) -> Result<()> {
