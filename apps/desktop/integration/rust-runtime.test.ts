@@ -84,6 +84,36 @@ else:
 `;
 
 describe("existing desktop shell with the real Rust runtime", () => {
+  it("runs an interactive terminal command through the Rust desktop bridge", async () => {
+    const { directory, runtime } = fixture();
+    expect((await runtime.start()).ok).toBe(true);
+    const command = process.platform === "win32"
+      ? "echo RUST_TERMINAL_READY & set /p answer= & echo RUST_TERMINAL_INPUT:%answer% & ping -n 60 127.0.0.1 > nul"
+      : "printf 'RUST_TERMINAL_READY\\n'; read answer; printf 'RUST_TERMINAL_INPUT:%s\\n' \"$answer\"; sleep 60";
+    const created = await runtime.request("/_prospero/control/session/create", {
+      method: "POST",
+      body: { agent: "custom", kind: "pty", cwd: directory, command, cols: 80, rows: 24 },
+    });
+    const id = String(created!["id"]);
+    await runtime.request(`/_prospero/control/session/${id}/interact`, {
+      method: "POST",
+      body: { type: "term.input", dataB64: Buffer.from(process.platform === "win32" ? "typed-from-test\r\n" : "typed-from-test\n").toString("base64") },
+    });
+    await runtime.request(`/_prospero/control/session/${id}/interact`, {
+      method: "POST",
+      body: { type: "term.resize", cols: 100, rows: 30 },
+    });
+    await vi.waitFor(async () => {
+      const frame = await runtime.request(`/_prospero/control/session/${id}/view?outputAfterSeq=0&waitMs=250`);
+      const bytes = Buffer.from(String(frame?.["dataB64"] ?? ""), "base64").toString("utf8");
+      const events = Array.isArray(frame?.["events"]) ? frame["events"] as Array<Record<string, unknown>> : [];
+      const delta = events.map(event => event["type"] === "output" ? Buffer.from(String(event["dataB64"] ?? ""), "base64").toString("utf8") : "").join("");
+      expect(`${bytes}${delta}`).toContain("RUST_TERMINAL_INPUT:typed-from-test");
+    }, { timeout: 10000, interval: 100 });
+    await runtime.request(`/_prospero/control/session/${id}/kill`, { method: "POST" });
+    await vi.waitFor(async () => expect((await runtime.listSessions({ ids: [id], terminal: true })).total).toBe(1), { timeout: 5000 });
+  }, 15000);
+
   it.skipIf(process.platform === "win32")("preserves committed live output when the daemon is killed and recovers without rerunning the shell", async () => {
     const { directory, dataDir, runtime, store } = fixture(10000);
     expect((await runtime.start()).ok).toBe(true);

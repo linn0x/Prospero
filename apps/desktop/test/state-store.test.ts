@@ -154,6 +154,28 @@ describe("Electron state snapshot caching", () => {
     expect(store.settingsSnapshot().theme).toBe("dark");
   });
 
+  it("projects runtime switch state and refreshes cached snapshots", () => {
+    const home = testHome();
+    const store = new StateStore(home, "files", { daemonBackend: "rust" });
+    const first = store.snapshot();
+    store.setRuntimeSwitch({
+      backend: "rust",
+      selected: "rust",
+      selectionReason: "packaged-default",
+      forced: false,
+      rustAvailable: true,
+      rustBinary: "/opt/prosperod-rs",
+      legacyAvailable: true,
+      defaultBackend: "rust",
+      fallbackAvailable: true,
+    });
+
+    const next = store.snapshot();
+    expect(first).not.toBe(next);
+    expect(next.settings.daemonBackend).toBe("rust");
+    expect(next.daemon.runtime).toMatchObject({ backend: "rust", fallbackAvailable: true });
+  });
+
   it("reuses the snapshot while external inputs are unchanged", () => {
     const home = testHome();
     writeJson(home, "config.json", { port: 7423 });
@@ -397,6 +419,27 @@ describe("Electron state snapshot caching", () => {
     expect(new StateStore(home).sessionTitle("historical")).toBe("Renamed history");
   });
 
+  it("forgets stale local session references", () => {
+    const home = testHome();
+    const store = new StateStore(home);
+    store.hydrateSessions([{ id: "stale" }]);
+    store.setSessionArchived("stale", true);
+    store.setSessionPinned("stale", true);
+    store.setSessionUnread("stale", true);
+    store.renameSession("stale", "Old session");
+
+    const snapshot = store.forgetMissingSession("stale");
+
+    expect(snapshot.pinnedSessionIds).toEqual([]);
+    expect(snapshot.archivedSessionIds).toEqual([]);
+    expect(snapshot.unreadSessionIds).toEqual([]);
+    expect(store.sessionTitle("stale")).toBeUndefined();
+    expect(store.isKnownSession("stale")).toBe(false);
+    const reloaded = new StateStore(home);
+    expect(reloaded.snapshot().archivedSessionIds).toEqual([]);
+    expect(reloaded.sessionTitle("stale")).toBeUndefined();
+  });
+
   it("archives a session locally without touching the daemon session list", () => {
     // 归档只是桌面端的一个标记:会话仍在 daemon 里活着,只是从侧栏主列表收起。
     // 它必须能持久化,否则重启一次归档就白做了。
@@ -406,9 +449,12 @@ describe("Electron state snapshot caching", () => {
     });
     const store = new StateStore(home);
     store.snapshot();
+    store.setSessionPinned("live", true);
+    expect(store.snapshot().pinnedSessionIds).toEqual(["live"]);
 
     store.setSessionArchived("live", true);
     expect(store.snapshot().archivedSessionIds).toEqual(["live"]);
+    expect(store.snapshot().pinnedSessionIds).toEqual([]);
     expect(store.snapshot().daemon.sessions.map((session) => session.id)).toEqual(["live"]);
 
     expect(new StateStore(home).snapshot().archivedSessionIds).toEqual(["live"]);

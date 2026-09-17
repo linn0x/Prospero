@@ -2,12 +2,23 @@ import { describe, expect, it } from "vitest";
 import { sessionIndicator, unreadCompletions } from "../src/renderer/src/workspace/session-status";
 
 describe("session status indicators", () => {
-  it.each(["idle", "completed", "done", "succeeded"])("shows %s as completed and only bounces when unread", status => {
+  it.each(["completed", "done", "succeeded"])("shows %s as completed and only bounces when unread", status => {
     expect(sessionIndicator({ status })).toMatchObject({ state: "completed", motion: "none" });
     expect(sessionIndicator({ status }, true)).toMatchObject({ state: "completed", motion: "bounce" });
   });
-  it.each(["running", "starting", "active", "dispatched"])("breathes for %s even if an older answer is unread", status => {
+  it.each(["starting", "dispatched"])("breathes for %s even if an older answer is unread", status => {
     expect(sessionIndicator({ status }, true)).toMatchObject({ state: "running", motion: "breathe" });
+  });
+  it("only breathes for running sessions with an active turn", () => {
+    expect(sessionIndicator({ status: "running" })).toMatchObject({ state: "running", motion: "none" });
+    expect(sessionIndicator({ status: "running", busySince: 123 })).toMatchObject({ state: "running", motion: "breathe" });
+  });
+  it("keeps raw running statuses static for non-session uses unless activity is supplied", () => {
+    expect(sessionIndicator({ status: "running" }, true)).toMatchObject({ state: "running", motion: "none" });
+  });
+  it.each(["active", "idle"])("keeps %s sessions static because they are alive but not currently running", status => {
+    expect(sessionIndicator({ status })).toMatchObject({ state: "idle", motion: "none" });
+    expect(sessionIndicator({ status }, true)).toMatchObject({ state: "idle", motion: "bounce" });
   });
   it.each(["died", "failed", "cancelled", "killed", "exited", "interrupted"])("keeps %s stopped despite stale permission counters", status => {
     expect(sessionIndicator({ status, pendingPermissions: 1 }, true)).toMatchObject({ state: "terminated", motion: "none" });

@@ -48,11 +48,6 @@ export async function readOrchestrationWindow(
   );
 }
 
-/**
- * Map one desktop `orchestration:action` RPC onto Rust `/v1` routes. The
- * supported method set mirrors `ORCHESTRATION_METHODS` in index.ts; automation
- * and non-Claude workers stay explicitly unbridged in Rust mode.
- */
 export async function orchestrationAction(
   client: RustClient,
   method: string,
@@ -96,11 +91,8 @@ export async function orchestrationAction(
       const input: AbandonRun = { reason: optionalText(params["reason"]) };
       return client.abandonRun(required(params, "runId"), input, signal) as Promise<JsonObject>;
     }
-    case "run.delete": {
-      // Never force: active dispatches must be settled/stopped first so the
-      // daemon's 400 surfaces in the desktop instead of silently deleting work.
-      return client.deleteRun(required(params, "runId"), signal) as Promise<JsonObject>;
-    }
+    case "run.delete":
+      return client.deleteRun(required(params, "runId"), { force: params["force"] === true }, signal) as Promise<JsonObject>;
     case "task.create": {
       const input: CreateTask = {
         runId: required(params, "runId"),
@@ -127,6 +119,8 @@ export async function orchestrationAction(
         agent: workerAgent(params),
         cwd: required(params, "cwd"),
         worktree,
+        kind: "structured",
+        skills: stringList(params["skills"]),
         approvalPolicy: workerApprovalPolicy(params),
         accountId: workerAccountId(params),
         operationId: optionalText(params["operationId"]),
@@ -176,8 +170,6 @@ export async function orchestrationAction(
   }
 }
 
-/** Manual worker delivery: Rust mode has no prospero CLI, so the operator
- * records the worker result through the desktop. */
 export function settleDispatchInput(rawParams: unknown): SettleDispatch {
   const params = record(rawParams);
   const success = params["success"];
@@ -194,15 +186,15 @@ function assertStructuredClaudeWorker(params: JsonObject): void {
   }
 }
 
-function workerAgent(params: JsonObject): "claude" {
+function workerAgent(params: JsonObject): "claude" | "codex" | "deepseek" | "opencode" {
   const agent = params["agent"] ?? "claude";
-  if (agent !== "claude") throw new Error("Rust 模式当前只接入 Claude worker");
-  return "claude";
+  if (agent !== "claude" && agent !== "codex" && agent !== "deepseek" && agent !== "opencode") throw new Error("Rust worker 当前仅支持 Claude/Codex/DeepSeek/OpenCode");
+  return agent;
 }
 
-function automationAgent(params: JsonObject): "claude" | "codex" {
+function automationAgent(params: JsonObject): "claude" | "codex" | "deepseek" | "opencode" {
   const agent = params["agent"] ?? "claude";
-  if (agent !== "claude" && agent !== "codex") throw new Error("Rust 自动执行当前只接入 Claude/Codex worker");
+  if (agent !== "claude" && agent !== "codex" && agent !== "deepseek" && agent !== "opencode") throw new Error("Rust 自动执行当前仅支持 Claude/Codex/DeepSeek/OpenCode worker");
   return agent;
 }
 

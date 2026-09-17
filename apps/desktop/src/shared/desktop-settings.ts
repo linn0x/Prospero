@@ -2,6 +2,7 @@ import type { DesktopSettings, JsonObject } from "./types";
 
 const SETTING_KEYS = new Set<keyof DesktopSettings>([
   "startDaemonOnLaunch",
+  "daemonBackend",
   "fullAccessPermission",
   "minimizeToTray",
   "launchAtLogin",
@@ -24,6 +25,10 @@ export function desktopSettingsPatch(input: JsonObject, platform: NodeJS.Platfor
   if (Object.hasOwn(input, "startDaemonOnLaunch")) {
     if (typeof input["startDaemonOnLaunch"] !== "boolean") throw new Error("启动设置无效");
     patch.startDaemonOnLaunch = input["startDaemonOnLaunch"];
+  }
+  if (Object.hasOwn(input, "daemonBackend")) {
+    if (input["daemonBackend"] !== "rust" && input["daemonBackend"] !== "legacy") throw new Error("运行时后端设置无效");
+    patch.daemonBackend = input["daemonBackend"];
   }
   if (Object.hasOwn(input, "fullAccessPermission")) {
     if (platform !== "win32") throw new Error("完整访问权限仅在 Windows 上可用");

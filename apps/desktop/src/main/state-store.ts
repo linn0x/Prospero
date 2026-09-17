@@ -12,6 +12,7 @@ import type {
   DesktopSnapshot,
   DeviceInfo,
   JsonObject,
+  RuntimeSwitchState,
   SessionInfo,
   SessionSummary,
   WorkflowTemplate,
@@ -72,10 +73,12 @@ type SnapshotInputs = {
   startupProgress: number;
   startupStage: string;
   lastError: string | undefined;
+  runtimeSwitch: RuntimeSwitchState | undefined;
 };
 
 const DEFAULT_SETTINGS: DesktopSettings = {
   startDaemonOnLaunch: true,
+  daemonBackend: "legacy",
   fullAccessPermission: false,
   minimizeToTray: true,
   launchAtLogin: false,
@@ -250,6 +253,7 @@ export class StateStore extends EventEmitter {
   private startupProgress = 0;
   private startupStage = "";
   private lastError: string | undefined;
+  private runtimeSwitch: RuntimeSwitchState | undefined;
   private logs = "";
   private logFlushTimer: ReturnType<typeof setTimeout> | undefined;
   private readonly legacyDesktopStatePath: string;
@@ -268,7 +272,7 @@ export class StateStore extends EventEmitter {
   private readonly hydratedSessionIds = new Map<string, true>();
   private apiState: ApiState = { config: {}, status: {}, devices: {}, orchestration: {}, running: false, projects: [] };
 
-  constructor(home = process.env["PROSPERO_HOME"] || resolve(homedir(), ".prospero"), readonly backend: "files" | "api" = "files") {
+  constructor(home = process.env["PROSPERO_HOME"] || resolve(homedir(), ".prospero"), readonly backend: "files" | "api" = "files", private readonly defaultSettings: Partial<DesktopSettings> = {}) {
     super();
     this.home = resolve(home);
     // 这个客户端现在是跨平台的,文件名不再带 windows-。已经在用的机器上还躺着
@@ -283,6 +287,12 @@ export class StateStore extends EventEmitter {
 
   settingsSnapshot(): DesktopSettings {
     return { ...this.settings };
+  }
+
+  setRuntimeSwitch(runtimeSwitch: RuntimeSwitchState): void {
+    if (isDeepStrictEqual(this.runtimeSwitch, runtimeSwitch)) return;
+    this.runtimeSwitch = runtimeSwitch;
+    this.changed();
   }
 
   snapshot(): DesktopSnapshot {
@@ -302,6 +312,8 @@ export class StateStore extends EventEmitter {
       && previousInputs.orchestration === orchestration
       && previousInputs.running === running
       && previousInputs.internalRevision === this.internalRevision
+      && previousInputs.settings === this.settings
+      && previousInputs.runtimeSwitch === this.runtimeSwitch
     ) {
       return this.cachedSnapshot;
     }
@@ -316,7 +328,8 @@ export class StateStore extends EventEmitter {
       && previousInputs.starting === this.starting
       && previousInputs.startupProgress === this.startupProgress
       && previousInputs.startupStage === this.startupStage
-      && previousInputs.lastError === this.lastError;
+      && previousInputs.lastError === this.lastError
+      && previousInputs.runtimeSwitch === this.runtimeSwitch;
     const daemon = canReuseDaemon ? previous.daemon : (() => {
       const port = numberValue(status["port"], numberValue(config["port"], 7423));
       const bind = stringValue(status["bind"], stringValue(config["bind"], "0.0.0.0"));
@@ -378,8 +391,10 @@ export class StateStore extends EventEmitter {
         },
         ...(capabilities.length > 0 ? { capabilities } : {}),
         relay: relaySnapshot(status["relay"], config["relay"]),
+        ...(this.runtimeSwitch ? { runtime: this.runtimeSwitch } : {}),
         sessionSummary: summary,
         sessions,
+        schedules: records(status["schedules"]),
         ...(this.backend === "api" ? {
           metadataRevision: stringValue(status["metadataRevision"]),
           workspaceCounts: Object.fromEntries(Object.entries(objectValue(status["workspaceCounts"])).slice(0, 100).map(([workspace, entry]) => {
@@ -484,6 +499,7 @@ export class StateStore extends EventEmitter {
       startupProgress: this.startupProgress,
       startupStage: this.startupStage,
       lastError: this.lastError,
+      runtimeSwitch: this.runtimeSwitch,
     };
     this.cachedSnapshot = snapshot;
     return snapshot;
@@ -577,17 +593,24 @@ export class StateStore extends EventEmitter {
   /// 归档只是桌面端的一个本地标记 —— 会话本身照常在 daemon 里活着,
   /// 只是从侧栏主列表里收进"已归档"分组。想真正结束会话请用"结束会话"。
   setSessionArchived(sessionId: string, archived: boolean): DesktopSnapshot {
-    if (!this.isKnownSession(sessionId)) throw new Error("会话不存在");
+    if (!this.isKnownSession(sessionId)) {
+      if (!archived && this.archivedSessionIds.includes(sessionId)) return this.forgetMissingSession(sessionId);
+      throw new Error("会话不存在");
+    }
     this.archivedSessionIds = archived
       ? [...new Set([...this.archivedSessionIds, sessionId])]
       : this.archivedSessionIds.filter((id) => id !== sessionId);
+    if (archived) this.pinnedSessionIds = this.pinnedSessionIds.filter((id) => id !== sessionId);
     this.saveDesktopState();
     this.changed();
     return this.snapshot();
   }
 
   setSessionPinned(sessionId: string, pinned: boolean): DesktopSnapshot {
-    if (!this.isKnownSession(sessionId)) throw new Error("会话不存在");
+    if (!this.isKnownSession(sessionId)) {
+      if (!pinned && this.pinnedSessionIds.includes(sessionId)) return this.forgetMissingSession(sessionId);
+      throw new Error("会话不存在");
+    }
     this.pinnedSessionIds = pinned
       ? [...new Set([...this.pinnedSessionIds, sessionId])]
       : this.pinnedSessionIds.filter((id) => id !== sessionId);
@@ -597,7 +620,10 @@ export class StateStore extends EventEmitter {
   }
 
   setSessionUnread(sessionId: string, unread: boolean): DesktopSnapshot {
-    if (!this.isKnownSession(sessionId)) throw new Error("会话不存在");
+    if (!this.isKnownSession(sessionId)) {
+      if (!unread && this.unreadSessionIds.includes(sessionId)) return this.forgetMissingSession(sessionId);
+      throw new Error("会话不存在");
+    }
     this.unreadSessionIds = unread
       ? [...new Set([...this.unreadSessionIds, sessionId])]
       : this.unreadSessionIds.filter((id) => id !== sessionId);
@@ -661,6 +687,40 @@ export class StateStore extends EventEmitter {
     this.changed();
   }
 
+  forgetMissingSession(sessionId: string): DesktopSnapshot {
+    if (!SAFE_PERSISTED_SESSION_ID.test(sessionId)) throw new Error("会话无效");
+    let changed = this.hydratedSessionIds.delete(sessionId);
+    let persisted = false;
+    const pinnedSessionIds = this.pinnedSessionIds.filter((id) => id !== sessionId);
+    const archivedSessionIds = this.archivedSessionIds.filter((id) => id !== sessionId);
+    const unreadSessionIds = this.unreadSessionIds.filter((id) => id !== sessionId);
+    if (pinnedSessionIds.length !== this.pinnedSessionIds.length) {
+      this.pinnedSessionIds = pinnedSessionIds;
+      changed = true;
+      persisted = true;
+    }
+    if (archivedSessionIds.length !== this.archivedSessionIds.length) {
+      this.archivedSessionIds = archivedSessionIds;
+      changed = true;
+      persisted = true;
+    }
+    if (unreadSessionIds.length !== this.unreadSessionIds.length) {
+      this.unreadSessionIds = unreadSessionIds;
+      changed = true;
+      persisted = true;
+    }
+    if (sessionId in this.sessionTitles) {
+      const sessionTitles = { ...this.sessionTitles };
+      delete sessionTitles[sessionId];
+      this.sessionTitles = sessionTitles;
+      changed = true;
+      persisted = true;
+    }
+    if (persisted) this.saveDesktopState();
+    if (changed) this.changed();
+    return this.snapshot();
+  }
+
   /** Registers paged historical session rows without widening the live snapshot. */
   hydrateSessions(sessions: readonly Pick<SessionInfo, "id">[]): void {
     for (const session of sessions) {
@@ -684,6 +744,7 @@ export class StateStore extends EventEmitter {
   updateSettings(patch: Partial<DesktopSettings>): DesktopSnapshot {
     const next = { ...this.settings };
     if (typeof patch.startDaemonOnLaunch === "boolean") next.startDaemonOnLaunch = patch.startDaemonOnLaunch;
+    if (patch.daemonBackend === "rust" || patch.daemonBackend === "legacy") next.daemonBackend = patch.daemonBackend;
     if (typeof patch.fullAccessPermission === "boolean") next.fullAccessPermission = patch.fullAccessPermission;
     if (typeof patch.minimizeToTray === "boolean") next.minimizeToTray = patch.minimizeToTray;
     if (typeof patch.launchAtLogin === "boolean") next.launchAtLogin = patch.launchAtLogin;
@@ -893,6 +954,8 @@ export class StateStore extends EventEmitter {
     this.settings = {
       ...DEFAULT_SETTINGS,
       ...stored,
+      ...this.defaultSettings,
+      daemonBackend: this.defaultSettings.daemonBackend ?? (stored["daemonBackend"] === "rust" || stored["daemonBackend"] === "legacy" ? stored["daemonBackend"] : DEFAULT_SETTINGS.daemonBackend),
       theme: stored["theme"] === "dark" || stored["theme"] === "light" ? stored["theme"] : "system",
       workspaceSort: stored["workspaceSort"] === "name" ? "name" : "recent",
     } as DesktopSettings;

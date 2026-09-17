@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import type { ModelSource } from "../src/shared/types";
 import { modelSourceRequest, modelSourceResult } from "../src/shared/model-sources";
-import { parseSourceHeaders, catalogRouteDraft, catalogRouteUpdates, defaultSourceSelection, hasPartialCatalogLimits, retainSourceRouteDrafts, selectedSourceRoute, sourceDraftRoutes, sourceRouteAgent } from "../src/renderer/src/model-sources/source-state";
+import { parseSourceHeaders, catalogRouteDraft, catalogRouteUpdates, defaultSourceSelection, hasPartialCatalogLimits, retainSourceRouteDrafts, selectedSourceRoute, sourceDraftRoutes, sourceRouteAgent, sourceRouteSupportsAgent } from "../src/renderer/src/model-sources/source-state";
 import { SourceSelector } from "../src/renderer/src/model-sources/SourceSelector";
 import { SourceOnboardingModels } from "../src/renderer/src/model-sources/SourceOnboardingModels";
 import { accountApiConnectionLocked } from "../src/renderer/src/account-profile-form";
@@ -76,6 +76,19 @@ describe("model source selection and IPC", () => {
     expect(sourceRouteAgent({ ...source.routes[0]!, protocol: "openai_chat_completions" })).toBe("codex");
   });
 
+  it("filters model routes by the selected code agent runtime", () => {
+    const mixed: ModelSource = { ...source, endpoints: [...source.endpoints, { protocol: "anthropic", baseUrl: "https://anthropic.invalid" }, { protocol: "openai_chat_completions", baseUrl: "https://chat.invalid" }], routes: [...source.routes, { id: "route-c", name: "Claude route", model: "deepseek-anthropic", protocol: "anthropic", credentialId: "credential", enabled: true }, { id: "route-d", name: "OpenCode route", model: "chat-model", protocol: "openai_chat_completions", credentialId: "credential", enabled: true }] };
+    expect(sourceRouteSupportsAgent(mixed.routes[0]!, "codex")).toBe(true);
+    expect(sourceRouteSupportsAgent(mixed.routes[0]!, "claude")).toBe(false);
+    expect(sourceRouteSupportsAgent(mixed.routes[2]!, "claude")).toBe(true);
+    expect(sourceRouteSupportsAgent(mixed.routes[0]!, "opencode")).toBe(false);
+    expect(sourceRouteSupportsAgent(mixed.routes[3]!, "opencode")).toBe(true);
+    expect(defaultSourceSelection([mixed], undefined, "claude")).toMatchObject({ routeId: "route-c", agent: "claude" });
+    expect(defaultSourceSelection([mixed], undefined, "opencode")).toMatchObject({ routeId: "route-d", agent: "opencode" });
+    expect(selectedSourceRoute([mixed], { sourceId: mixed.id, routeId: "route-c", revision: mixed.revision }, "codex")).toBeUndefined();
+    expect(selectedSourceRoute([mixed], { sourceId: mixed.id, routeId: "route-a", revision: mixed.revision }, "opencode")).toBeUndefined();
+  });
+
   it("preserves configured model capabilities when enabling an existing catalog model", () => {
     const configured = { ...source, routes: [{ ...source.routes[0]!, enabled: false, modelCapabilities: { tools: true, contextWindow: 64000 } }] };
     const updates = catalogRouteUpdates(configured, "openai_responses", "credential", [{ id: "model-a", label: "New label" }, { id: "new", label: " " }], new Set(["model-a", "new"]));
@@ -122,12 +135,18 @@ describe("model source selection and IPC", () => {
   });
 
   it("displays source and model controls without requiring the user to pick a duplicated account", () => {
-    const html = renderToStaticMarkup(<SourceSelector sources={[source]} loading={false} error={undefined} value={defaultSourceSelection([source])} disabled={false} onChange={() => {}} onRefresh={() => {}} />);
+    const html = renderToStaticMarkup(<SourceSelector sources={[source]} loading={false} error={undefined} value={defaultSourceSelection([source], undefined, "codex")} agent="codex" disabled={false} onChange={() => {}} onRefresh={() => {}} />);
     expect(html).toContain('id="session-model-source"');
     expect(html).toContain('id="session-source-route"');
     expect(html).toContain("Shared key");
     expect(html).toContain("stays on this version");
     expect(html).not.toContain('type="password"');
+  });
+
+  it("keeps OpenCode available in the shared model source session runtime selector", () => {
+    const app = readFileSync(new URL("../src/renderer/src/App.tsx", import.meta.url), "utf8");
+    expect(app).toContain('<NativeSelectOption value="opencode">OpenCode</NativeSelectOption>');
+    expect(app).toContain('input.agent === "claude" || input.agent === "opencode" ? input.agent : "codex"');
   });
 
   it("keeps sources and native accounts on the same page, without a new navigation tab", () => {

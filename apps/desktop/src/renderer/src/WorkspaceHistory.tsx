@@ -5,11 +5,11 @@ import { SidebarMenuSubItem } from "./components/ui/sidebar";
 import { Spinner } from "./components/ui/spinner";
 import { useLocale } from "./locale";
 import { WORKSPACE_PREVIEW_SIZE, WorkspaceSessionPager } from "./workspace-session-pager";
-import { sortSidebarSessions } from "./workspace-sidebar-state";
+import { sidebarProjectSessions, sortSidebarSessions } from "./workspace-sidebar-state";
 
-export function WorkspaceHistory({ workspace, name, enabled, revision, preview, activeId, pinned, unread, archived, onTotal, renderRow }: {
+export function WorkspaceHistory({ workspace, name, enabled, revision, preview, activeId, pinned, unread, archived, query, onTotal, renderRow }: {
   workspace: string; name: string; enabled: boolean; revision: string | undefined; preview: SessionInfo[]; activeId: string | undefined;
-  pinned: string[]; unread: string[]; archived: string[]; onTotal: (workspace: string, total: number) => void; renderRow: (session: SessionInfo) => ReactNode;
+  pinned: string[]; unread: string[]; archived: string[]; query: string; onTotal: (workspace: string, total: number) => void; renderRow: (session: SessionInfo) => ReactNode;
 }) {
   const { t } = useLocale();
   const pager = useMemo(() => new WorkspaceSessionPager(window.prospero, workspace), [workspace]);
@@ -19,7 +19,7 @@ export function WorkspaceHistory({ workspace, name, enabled, revision, preview, 
   const total = state.page?.total;
   useEffect(() => { if (total !== undefined) onTotal(workspace, total); }, [onTotal, total, workspace]);
   const items = state.expanded ? state.page?.items ?? [] : [...new Map([...preview, ...(state.page?.items ?? [])].map(item => [item.id, item])).values()];
-  const visible = sortSidebarSessions(items.filter(item => item.id === activeId || !archived.includes(item.id)), activeId, pinned, unread).slice(0, state.expanded ? 24 : WORKSPACE_PREVIEW_SIZE);
+  const visible = sortSidebarSessions(sidebarProjectSessions(items, archived, query), activeId, pinned, unread).slice(0, state.expanded ? 24 : WORKSPACE_PREVIEW_SIZE);
   return <>
     {visible.map(renderRow)}
     {state.loading && <SidebarMenuSubItem className="workspace-search-summary" aria-live="polite"><Spinner /><span>{t("正在载入会话…", "Loading sessions…")}</span></SidebarMenuSubItem>}

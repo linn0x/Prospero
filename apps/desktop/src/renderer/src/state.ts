@@ -88,13 +88,21 @@ export function useDesktopSnapshot(): DesktopSnapshotState {
 
 export function reportError(error: unknown): string {
   const message = displayError(error);
-  notify({ kind: "error", message });
+  if (!isMissingSessionMessage(message)) notify({ kind: "error", message });
   return message;
+}
+
+export function isMissingSessionError(error: unknown): boolean {
+  return isMissingSessionMessage(displayError(error));
 }
 
 export function displayError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   return message.replace(/^Error invoking remote method '[^']+':\s*/, "");
+}
+
+function isMissingSessionMessage(message: string): boolean {
+  return /(?:^|\b)(?:session_not_found|no such session)\b/i.test(message);
 }
 
 export function text(value: unknown, fallback = ""): string {

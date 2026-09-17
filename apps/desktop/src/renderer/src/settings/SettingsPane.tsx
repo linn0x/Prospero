@@ -44,6 +44,8 @@ export function SettingsPane({ snapshot, onOpenAccounts }: { snapshot: DesktopSn
   const relayBusy = busy("relay-control") || busy("relay-key") || busy("relay-status");
   const rowFeedback = (id: string) => ({ feedback: feedback[id], onRetry: () => { void actions.retry(id); } });
   const description = (id: string) => `${id}-description${feedback[id] ? ` ${id}-feedback` : ""}`;
+  const runtimeSwitch = snapshot.daemon.runtime;
+  const backendLabel = (value: "rust" | "legacy" | undefined) => value === "rust" ? "Rust" : "Legacy";
 
   useEffect(() => {
     mounted.current = true;
@@ -170,6 +172,19 @@ export function SettingsPane({ snapshot, onOpenAccounts }: { snapshot: DesktopSn
         <div className="settings-terminal-preview" aria-label={t("终端预览", "Terminal preview")} style={{ fontFamily: terminalFontFamilyWithFallbacks(fontFamily || settings.terminalFontFamily), lineHeight: TERMINAL_LINE_HEIGHT, fontSize: terminalFontSize(fontSize) ?? settings.terminalFontSize }}>{window.prospero.platform === "darwin" ? "zsh % codex" : isWindows ? "PS C:\\Prospero> codex" : "$ codex"}{"\n"}{t("中文预览：工作区 · 会话记录 · 正在运行", "Font preview: Workspace · Session history · Running")}{"\nAa Bb 0123456789  {} [] () =>"}</div>
       </SettingsSection>}
       {category.id === "runtime" && <SettingsSection id="runtime" title={t("运行时与网络", "Runtime and network")} description={t("本地服务、直连网卡与运行权限。", "Local service, direct connection interface, and runtime permissions.")}>
+        {runtimeSwitch && <SettingRow id="daemon-backend" title={t("Daemon 后端", "Daemon backend")} description={runtimeSwitch.forced ? t("当前由环境变量 PROSPERO_BACKEND 强制指定。", "Currently forced by the PROSPERO_BACKEND environment variable.") : t(`当前运行 ${backendLabel(runtimeSwitch.backend)}；切换会重启应用。`, `Currently running ${backendLabel(runtimeSwitch.backend)}. Switching relaunches the app.`)} {...rowFeedback("daemon-backend")}>
+          <select id="daemon-backend" value={settings.daemonBackend} disabled={busy("daemon-backend") || runtimeSwitch.forced} aria-describedby={description("daemon-backend")} onChange={(event) => { void update("daemon-backend", { daemonBackend: event.target.value as DesktopSettings["daemonBackend"] }, "runtime"); }}>
+            <option value="rust" disabled={!runtimeSwitch.rustAvailable}>Rust</option>
+            <option value="legacy">Legacy</option>
+          </select>
+        </SettingRow>}
+        {runtimeSwitch && <div className="settings-runtime-summary" aria-label={t("运行时状态", "Runtime status")}>
+          <span>{t("选择", "Selected")}: {backendLabel(runtimeSwitch.selected)}</span>
+          <span>{t("默认", "Default")}: {backendLabel(runtimeSwitch.defaultBackend)}</span>
+          <span>{t("Rust 二进制", "Rust binary")}: {runtimeSwitch.rustAvailable ? t("已找到", "Found") : t("缺失", "Missing")}</span>
+          {snapshot.daemon.capabilities?.includes("terminal.windows.conpty") && <span>Windows ConPTY</span>}
+          {runtimeSwitch.lastRollbackReason && <span>{t("最近回滚", "Last rollback")}: {runtimeSwitch.lastRollbackReason}</span>}
+        </div>}
         <SettingRow id="daemon-control" title="Daemon" description={snapshot.daemon.pid ? `PID ${snapshot.daemon.pid} · 127.0.0.1:${snapshot.daemon.port}` : t("尚未运行", "Not running")} {...rowFeedback("daemon-control")} stacked group>
           <div className="settings-status" role="status"><span className={`status-dot ${snapshot.daemon.state}`} aria-hidden="true" />{snapshot.daemon.state === "stopped" ? t("已停止", "Stopped") : status(snapshot.daemon.state)}</div>
           <div className="settings-action-row">

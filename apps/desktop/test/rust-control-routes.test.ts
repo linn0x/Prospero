@@ -1,0 +1,71 @@
+import { describe, expect, it } from "vitest";
+import { RustRuntime } from "../src/main/rust-runtime";
+import { orchestrationAction } from "../src/main/rust-orchestration";
+import type { StateStore } from "../src/main/state-store";
+
+describe("Rust desktop control routes", () => {
+  it("passes non-Claude worker agents through to the Rust daemon", async () => {
+    const calls: unknown[] = [];
+    const client = {
+      startWorker: async (input: unknown) => {
+        calls.push(input);
+        return { ok: true };
+      },
+    };
+    await expect(orchestrationAction(client as never, "worker.start", {
+      taskId: "task-1",
+      agent: "deepseek",
+      cwd: "/repo",
+      worktree: "none",
+      kind: "structured",
+      skills: ["audit"],
+      operationId: "op-1",
+    }, AbortSignal.timeout(1000))).resolves.toMatchObject({ ok: true });
+    expect(calls[0]).toMatchObject({
+      taskId: "task-1",
+      agent: "deepseek",
+      kind: "structured",
+      skills: ["audit"],
+    });
+  });
+
+  it("maps plugin and schedule control paths to Rust HTTP client methods", async () => {
+    const calls: unknown[] = [];
+    const client = {
+      plugins: async () => ({ items: [], errors: [] }),
+      pluginServices: async () => ({ items: [{ pluginId: "prospero-demo", serviceId: "bridge", status: "stopped" }], errors: [] }),
+      pluginServiceAction: async (plugin: string, service: string, action: string) => {
+        calls.push({ plugin, service, action });
+        return { pluginId: plugin, serviceId: service, status: action === "stop" ? "stopped" : "running" };
+      },
+      schedules: async () => [{ id: "daily-check", status: "ENABLED" }],
+      createSchedule: async (input: unknown) => {
+        calls.push({ createSchedule: input });
+        return { id: "daily-check", status: "PAUSED" };
+      },
+      updateSchedule: async (id: string, input: unknown) => {
+        calls.push({ updateSchedule: id, input });
+        return { id, status: "ENABLED" };
+      },
+      pauseSchedule: async (id: string) => ({ id, status: "PAUSED" }),
+      resumeSchedule: async (id: string) => ({ id, status: "ENABLED" }),
+      deleteSchedule: async (id: string) => ({ id, deleted: true }),
+      runSchedule: async (id: string) => ({ task: { id }, session: { id: "session-1" }, queued: false }),
+    };
+    const store = { backend: "api", setManagedState: () => undefined, setApiState: () => undefined } as unknown as StateStore;
+    const runtime = new RustRuntime(store, "/opt/prosperod-rs", "/tmp/prospero-rust/daemon");
+    (runtime as unknown as { connection: unknown }).connection = { client, pid: 10, baseUrl: "http://127.0.0.1:7423" };
+    (runtime as unknown as { refresh: () => Promise<void> }).refresh = async () => undefined;
+
+    await expect(runtime.request("/_prospero/control/plugins")).resolves.toMatchObject({ items: [], errors: [] });
+    await expect(runtime.request("/_prospero/control/plugin/prospero-demo/service/bridge/start", { method: "POST" })).resolves.toMatchObject({ status: "running" });
+    await expect(runtime.request("/_prospero/control/schedules")).resolves.toMatchObject({ items: [{ id: "daily-check" }] });
+    await expect(runtime.request("/_prospero/control/schedules", { method: "POST", body: { id: "daily-check", name: "Daily", prompt: "Check", rrule: "FREQ=DAILY", cwd: process.cwd(), status: "PAUSED" } })).resolves.toMatchObject({ status: "PAUSED" });
+    await expect(runtime.request("/_prospero/control/schedule/daily-check/update", { method: "POST", body: { clearModel: true } })).resolves.toMatchObject({ status: "ENABLED" });
+    expect(calls).toEqual([
+      { plugin: "prospero-demo", service: "bridge", action: "start" },
+      { createSchedule: expect.objectContaining({ id: "daily-check", cwd: process.cwd(), status: "PAUSED" }) },
+      { updateSchedule: "daily-check", input: expect.objectContaining({ id: "daily-check", model: null }) },
+    ]);
+  });
+});

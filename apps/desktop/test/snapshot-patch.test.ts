@@ -30,6 +30,7 @@ function snapshot(): DesktopSnapshot {
     logs: "",
     settings: {
       startDaemonOnLaunch: true,
+      daemonBackend: "legacy",
       fullAccessPermission: false,
       minimizeToTray: true,
       launchAtLogin: false,
@@ -45,10 +46,10 @@ function snapshot(): DesktopSnapshot {
 describe("desktop snapshot patches", () => {
   it("sends a full initial payload and only changed top-level slices afterward", () => {
     const previous = snapshot();
-    const next = { ...previous, daemon: { ...previous.daemon, starting: true, state: "starting" } };
+    const next = { ...previous, daemon: { ...previous.daemon, starting: true, state: "starting", runtime: { backend: "rust" as const, selected: "rust" as const, selectionReason: "preference" as const, forced: false, rustAvailable: true, rustBinary: "/opt/prosperod-rs", legacyAvailable: true, defaultBackend: "rust" as const, fallbackAvailable: true } } };
 
     expect(diffDesktopSnapshot(undefined, previous)).toBe(previous);
-    expect(diffDesktopSnapshot(previous, next)).toEqual({ daemon: { starting: true, state: "starting" } });
+    expect(diffDesktopSnapshot(previous, next)).toEqual({ daemon: { starting: true, state: "starting", runtime: next.daemon.runtime } });
   });
 
   it("merges a patch without replacing unchanged slice identities", () => {
