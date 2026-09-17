@@ -30,7 +30,8 @@ describe("shared model sources", () => {
     const binding = accounts.resolve(accountId);
     if (protocol === "anthropic") expect(binding.environment.ANTHROPIC_CUSTOM_HEADERS).toBe("x-client-name: example-client");
     else {
-      const config = JSON.parse(readFileSync(path.join(home, "agent-accounts", "codex", accountId, "xdg-config", "opencode", "opencode.json"), "utf8"));
+      expect(binding.agent).toBe("opencode");
+      const config = JSON.parse(readFileSync(path.join(home, "agent-accounts", "opencode", accountId, "xdg-config", "opencode", "opencode.json"), "utf8"));
       expect(config.provider.prospero.options.headers).toEqual(headers);
     }
   });

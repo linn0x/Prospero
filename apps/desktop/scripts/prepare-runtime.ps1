@@ -54,6 +54,11 @@ if (-not (Test-Path -LiteralPath $rustBinary)) {
   throw "Missing Rust daemon release binary: $rustBinary"
 }
 Copy-Item -LiteralPath $rustBinary -Destination (Join-Path $runtimeFull "prosperod-rs.exe")
+$rustCli = Join-Path $repoRoot "target\release\prospero.exe"
+if (-not (Test-Path -LiteralPath $rustCli)) {
+  throw "Missing Rust worker CLI release binary: $rustCli"
+}
+Copy-Item -LiteralPath $rustCli -Destination (Join-Path $runtimeFull "prospero.exe")
 
 $packRoot = Join-Path $runtimeFull "packs"
 $npmCache = Join-Path $repoRoot ".npm-cache"
