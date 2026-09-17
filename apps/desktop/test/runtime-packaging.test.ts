@@ -52,6 +52,7 @@ describe("runtime packaging guard", () => {
     expect(() => runtimeCheck(context(root, "win32", 1))).toThrow(/matching prosperod-rs.exe/);
 
     writeFileSync(join(root, ".runtime", "prosperod-rs"), macho(0x0100000c));
+    writeFileSync(join(root, ".runtime", "install-rust-daemon-launchagent.sh"), "");
     expect(runtimeCheck.machoArchitecture(join(root, ".runtime", "prosperod-rs"))).toBe("arm64");
     expect(() => runtimeCheck(context(root, "darwin", 3))).not.toThrow();
     expect(() => runtimeCheck(context(root, "darwin", 1))).toThrow(/matching prosperod-rs/);
