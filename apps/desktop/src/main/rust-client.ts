@@ -8,7 +8,9 @@ import type { FsChunk, FsContent, FsDone, FsListing, FsWritten, GitDiffResult, G
 import type {
   AbandonRun, ApplyTaskGraph, CancelTask, CleanupWorktree, CompleteRun, CreateGate,
   CreateRun, CreateRunGraph, CreateTask, Dispatch, Gate, GraphMutationResult, ResolveGate,
-  Run, RunDeletionResult, RunSnapshot, SettleDispatch, SettleOutcome, Skill, SkillSuggestion,
+  PluginServiceList, PluginServiceView, PublicPluginDiscoveryResult,
+  Run, DeleteRun, RunDeletionResult, RunSnapshot, SettleDispatch, SettleOutcome, Skill, SkillSuggestion,
+  ScheduleCreate, ScheduleRunResult, ScheduleUpdate, ScheduledAgentTask,
   StartAutomation, StartWorker, StopWorker, Task, WorktreeAsset, WorktreeCleanupResult, WorktreeInspection,
   WorkerStartOutcome,
 } from "@prospero/protocol/rust-daemon";
@@ -16,6 +18,11 @@ import type {
 const MAX_BYTES = 2 * 1024 * 1024;
 function id(value: string): string {
   if (typeof value !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(value)) throw new Error("Invalid record id");
+  return value;
+}
+
+function scheduleId(value: string): string {
+  if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/.test(value)) throw new Error("Invalid schedule id");
   return value;
 }
 
@@ -314,8 +321,8 @@ export class RustClient {
   abandonRun(value: string, input: AbandonRun, signal: AbortSignal | null = null): Promise<Run> {
     return this.json(`/v1/runs/${id(value)}/abandon`, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
   }
-  deleteRun(value: string, signal: AbortSignal | null = null): Promise<RunDeletionResult> {
-    return this.json(`/v1/runs/${id(value)}`, { method: "DELETE", signal });
+  deleteRun(value: string, input: Partial<DeleteRun> = {}, signal: AbortSignal | null = null): Promise<RunDeletionResult> {
+    return this.json(`/v1/runs/${id(value)}`, { method: "DELETE", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
   }
   startAutomation(input: StartAutomation, signal: AbortSignal | null = null, timeoutMs = 180_000): Promise<Run> {
     return this.json(`/v1/runs/${id(input.runId)}/automation/start`, { method: "POST", signal, timeoutMs, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
@@ -388,6 +395,36 @@ export class RustClient {
   skillSuggestions(sessionId: string, query: string, signal: AbortSignal | null = null): Promise<SkillSuggestion[]> {
     const params = new URLSearchParams({ kind: "skill", query });
     return this.json(`/v1/agent-sessions/${id(sessionId)}/suggestions?${params}`, { signal }).then(page => (page as { items: SkillSuggestion[] }).items);
+  }
+
+  schedules(signal: AbortSignal | null = null): Promise<ScheduledAgentTask[]> { return this.json("/v1/schedules", { signal }); }
+  schedule(value: string, signal: AbortSignal | null = null): Promise<ScheduledAgentTask> {
+    return this.json(`/v1/schedules/${encodeURIComponent(scheduleId(value))}`, { signal });
+  }
+  createSchedule(input: ScheduleCreate, signal: AbortSignal | null = null): Promise<ScheduledAgentTask> {
+    return this.json("/v1/schedules", { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
+  }
+  updateSchedule(value: string, input: ScheduleUpdate, signal: AbortSignal | null = null): Promise<ScheduledAgentTask> {
+    return this.json(`/v1/schedules/${encodeURIComponent(scheduleId(value))}`, { method: "PATCH", signal, headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
+  }
+  pauseSchedule(value: string, signal: AbortSignal | null = null): Promise<ScheduledAgentTask> {
+    return this.json(`/v1/schedules/${encodeURIComponent(scheduleId(value))}/pause`, { method: "POST", signal });
+  }
+  resumeSchedule(value: string, signal: AbortSignal | null = null): Promise<ScheduledAgentTask> {
+    return this.json(`/v1/schedules/${encodeURIComponent(scheduleId(value))}/resume`, { method: "POST", signal });
+  }
+  deleteSchedule(value: string, signal: AbortSignal | null = null): Promise<{ id: string; deleted: boolean }> {
+    return this.json(`/v1/schedules/${encodeURIComponent(scheduleId(value))}`, { method: "DELETE", signal });
+  }
+  runSchedule(value: string, signal: AbortSignal | null = null, timeoutMs = 180_000): Promise<ScheduleRunResult> {
+    return this.json(`/v1/schedules/${encodeURIComponent(scheduleId(value))}/run`, { method: "POST", signal, timeoutMs });
+  }
+
+  plugins(signal: AbortSignal | null = null): Promise<PublicPluginDiscoveryResult> { return this.json("/v1/plugins", { signal }); }
+  pluginServices(signal: AbortSignal | null = null): Promise<PluginServiceList> { return this.json("/v1/plugin-services", { signal }); }
+  pluginServiceAction(plugin: string, service: string, action: "start" | "stop" | "restart" | "health", signal: AbortSignal | null = null, timeoutMs = 30_000): Promise<PluginServiceView> {
+    const method = action === "health" ? "GET" : "POST";
+    return this.json(`/v1/plugin/${encodeURIComponent(plugin)}/service/${encodeURIComponent(service)}/${action}`, { method, signal, timeoutMs });
   }
 
   // ── Accounts (native discovery + managed Claude accounts) ───────────────

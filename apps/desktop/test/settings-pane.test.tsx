@@ -12,7 +12,7 @@ afterEach(() => vi.unstubAllGlobals());
 const snapshot = {
   daemon: { state: "idle", running: false, managed: false, starting: false, port: 7424, relay: {} },
   accounts: [{ id: "account" }],
-  settings: { startDaemonOnLaunch: true, minimizeToTray: true, launchAtLogin: false, fullAccessPermission: false, theme: "system", terminalFontFamily: "monospace", terminalFontSize: 13, daemonBind: "127.0.0.1", workspaceSort: "recent" },
+  settings: { startDaemonOnLaunch: true, daemonBackend: "rust", minimizeToTray: true, launchAtLogin: false, fullAccessPermission: false, theme: "system", terminalFontFamily: "monospace", terminalFontSize: 13, daemonBind: "127.0.0.1", workspaceSort: "recent" },
 } as DesktopSnapshot;
 
 describe("settings pane", () => {
@@ -30,10 +30,21 @@ describe("settings pane", () => {
     expect(html).toContain("zsh % codex");
   });
 
+  it("shows Rust backend selection and rollback state when available", () => {
+    vi.stubGlobal("window", { prospero: { platform: "darwin" } });
+    const html = renderToStaticMarkup(<SettingsPane snapshot={{ ...snapshot, daemon: { ...snapshot.daemon, runtime: { backend: "legacy", selected: "legacy", selectionReason: "preference", forced: false, rustAvailable: true, rustBinary: "/opt/prosperod-rs", legacyAvailable: true, defaultBackend: "rust", lastRollbackReason: "startup failed" } }, settings: { ...snapshot.settings, daemonBackend: "legacy" } }} onOpenAccounts={() => {}} />);
+    expect(html).toContain('id="daemon-backend"');
+    expect(html).toContain('value="legacy" selected=""');
+    expect(html).toContain("Default");
+    expect(html).toContain("startup failed");
+  });
+
   it("keeps Windows permissions and platform terminal preview", () => {
     vi.stubGlobal("window", { prospero: { platform: "win32" } });
-    const html = renderToStaticMarkup(<SettingsPane snapshot={snapshot} onOpenAccounts={() => {}} />);
+    const html = renderToStaticMarkup(<SettingsPane snapshot={{ ...snapshot, daemon: { ...snapshot.daemon, runtime: { backend: "rust", selected: "rust", selectionReason: "packaged-default", forced: false, rustAvailable: true, rustBinary: "C:\\Prospero\\prosperod-rs.exe", legacyAvailable: true, defaultBackend: "rust" }, capabilities: ["terminal.windows.conpty"] } }} onOpenAccounts={() => {}} />);
     expect(html).toContain('id="full-access-permission"');
+    expect(html).toContain('id="daemon-backend"');
+    expect(html).toContain("Windows ConPTY");
     expect(html).toContain("Windows UAC");
     expect(html).toContain("PS C:\\Prospero&gt; codex");
   });

@@ -37,6 +37,7 @@ function snapshot(worktreeAssets: JsonObject[]): DesktopSnapshot {
     logs: "",
     settings: {
       startDaemonOnLaunch: true,
+      daemonBackend: "legacy",
       fullAccessPermission: false,
       minimizeToTray: true,
       launchAtLogin: false,
@@ -85,7 +86,7 @@ describe("session launch options", () => {
     const [chat, responses] = sessionLaunchAccounts([
       { id: "chat", agent: "codex", name: "Chat", status: "signed_in", apiProfile: { protocol: "openai_chat_completions" } },
       { id: "responses", agent: "codex", name: "Responses", status: "signed_in", apiProfile: { protocol: "openai_responses" } },
-    ], "codex");
+    ], "opencode");
 
     expect(sessionLaunchRequiresStructured(chat)).toBe(true);
     expect(sessionLaunchRequiresStructured(responses)).toBe(false);

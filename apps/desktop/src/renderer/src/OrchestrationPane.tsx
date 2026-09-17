@@ -612,7 +612,7 @@ export function OrchestrationPane({ snapshot, onOpenSession, onNewSession, coord
 
     <Dialog open={Boolean(delivery)} onOpenChange={(open) => { if (!open) { setDelivery(undefined); setDeliveryError(undefined); } }}>
       <DialogContent className="sm:max-w-md">
-        <DialogHeader><DialogTitle>{delivery?.success ? t("人工交付：任务完成", "Manual delivery: task done") : t("人工交付：任务失败", "Manual delivery: task failed")}</DialogTitle><DialogDescription>{t("Rust 模式没有 prospero CLI，worker 无法自行回报；请根据会话中的最终回复记录交付结果。", "In Rust mode there is no prospero CLI, so the worker cannot self-report. Record the result from its final reply.")}</DialogDescription></DialogHeader>
+        <DialogHeader><DialogTitle>{delivery?.success ? t("人工交付：任务完成", "Manual delivery: task done") : t("人工交付：任务失败", "Manual delivery: task failed")}</DialogTitle><DialogDescription>{t("如果 worker 没有自行回报，请根据会话中的最终回复记录交付结果。", "If the worker did not self-report, record the result from its final reply.")}</DialogDescription></DialogHeader>
         {delivery && <p className="truncate text-sm font-medium" title={delivery.taskTitle}>{delivery.taskTitle}</p>}
         <Textarea value={deliveryOutcome} maxLength={20_000} rows={5} onChange={(event) => setDeliveryOutcome(event.target.value)} placeholder={t("交付摘要：改了什么、如何验证 / 失败原因与下一步", "Delivery summary: what changed and how it was verified / why it failed and next steps")} autoFocus />
         {deliveryError && <Alert variant="destructive"><CircleDot /><AlertTitle>{t("交付失败", "Delivery failed")}</AlertTitle><AlertDescription>{deliveryError}</AlertDescription></Alert>}

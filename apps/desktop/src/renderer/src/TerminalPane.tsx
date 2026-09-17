@@ -8,7 +8,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import type { SessionInfo } from "../../shared/types";
-import { reportError, number, text } from "./state";
+import { isMissingSessionError, reportError, number, text } from "./state";
 import { useLocale } from "./locale";
 import { allowNativeTerminalPaste, bindTerminalPaste, consumeTerminalKey, terminalClipboardShortcut } from "./terminal-clipboard";
 import { terminalBytes } from "./terminal-bytes";
@@ -195,7 +195,7 @@ export function terminalProposedSizeDiffers(
   return Boolean(next && (next.cols !== cols || next.rows !== rows));
 }
 
-export function TerminalPane({ session, fontFamily, fontSize }: { session: SessionInfo; fontFamily: string; fontSize: number }) {
+export function TerminalPane({ session, fontFamily, fontSize, active = true, onMissingSession }: { session: SessionInfo; fontFamily: string; fontSize: number; active?: boolean; onMissingSession?: (id: string) => void }) {
   const { t } = useLocale();
   const tRef = useRef(t);
   tRef.current = t;
@@ -240,6 +240,10 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
         return true;
       })
       .catch((reason): false => {
+        if (isMissingSessionError(reason)) {
+          onMissingSession?.(session.id);
+          return false;
+        }
         connectedRef.current = false;
         if (terminalRef.current) terminalRef.current.options.disableStdin = true;
         setConnected(false);
@@ -249,7 +253,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
       });
     interactionChain.current = result.then(() => undefined);
     return result;
-  }, [session.id]);
+  }, [onMissingSession, session.id]);
   const fitToHost = useCallback((): void => {
     const terminal = terminalRef.current; const fit = fitRef.current;
     if (!terminal || !fit) return;
@@ -291,7 +295,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
       fontWeightBold: "700",
       lineHeight: TERMINAL_LINE_HEIGHT,
       letterSpacing: 0,
-      scrollback: 3_000,
+      scrollback: 10_000,
       minimumContrastRatio: 4.5,
       customGlyphs: true,
       drawBoldTextInBrightColors: true,
@@ -662,6 +666,10 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
           if (frame["exited"] === true && frame["caughtUp"] !== false) break;
         } catch (reason) {
           if (!isCurrent()) break;
+          if (isMissingSessionError(reason)) {
+            onMissingSession?.(session.id);
+            break;
+          }
           waitForOutput = false;
           connectedRef.current = false;
           if (terminalRef.current) terminalRef.current.options.disableStdin = true;
@@ -682,7 +690,7 @@ export function TerminalPane({ session, fontFamily, fontSize }: { session: Sessi
       if (terminalRef.current) terminalRef.current.options.disableStdin = true;
       void window.prospero.cancelSessionView(session.id).catch(() => undefined);
     };
-  }, [queueInteraction, session.id, fitToHost]);
+  }, [onMissingSession, queueInteraction, session.id, fitToHost]);
 
   const runFind = (backwards: boolean): void => {
     const value = findText.trim();

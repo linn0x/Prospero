@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { basename, extname, isAbsolute, resolve as resolvePath } from "node:path";
-import type { SessionHead, TimelineQuery, TimelineTextQuery, AttachmentInput } from "@prospero/protocol/rust-daemon";
+import type { SessionHead, TimelineQuery, TimelineTextQuery, AttachmentInput, ScheduleCreate, ScheduleUpdate } from "@prospero/protocol/rust-daemon";
 import type { QueuedMessage, SessionAgentControls } from "@prospero/protocol/rust-daemon";
 import type { DesktopSnapshot, JsonObject, QueuedChatMessage, SessionInfo, SessionPage, SessionPageRequest } from "../shared/types";
 import type { FilePreview, GitHistoryEntry, GitMutation, ProjectFile, ProjectGitStatus } from "../shared/project-tools";
@@ -32,6 +32,91 @@ function requireNonNegativeInteger(raw: unknown, label: string): number {
   const value = Number(raw);
   if (!Number.isSafeInteger(value) || value < 0) throw new Error(`${label} 无效`);
   return value;
+}
+
+function requirePluginId(raw: unknown): string {
+  if (typeof raw !== "string" || !/^[a-z][a-z0-9._-]{0,63}$/.test(raw)) throw new Error("插件 service ID 无效");
+  return raw;
+}
+
+function requireScheduleId(raw: unknown): string {
+  if (typeof raw !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/.test(raw)) throw new Error("定时任务 ID 无效");
+  return raw;
+}
+
+function optionalScheduleText(raw: unknown, max: number, message: string): string | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "string") throw new Error(message);
+  const value = raw.trim();
+  if (!value || value.length > max || /[\0]/.test(value)) throw new Error(message);
+  return value;
+}
+
+function optionalSchedulePath(raw: unknown): string | undefined {
+  const value = optionalScheduleText(raw, 20_000, "工作区路径无效");
+  if (value === undefined) return undefined;
+  if (!isAbsolute(value)) throw new Error("工作区路径无效");
+  return value;
+}
+
+function optionalScheduleEnum<T extends string>(raw: unknown, allowed: readonly T[], message: string): T | undefined {
+  if (raw === undefined || raw === null || raw === "") return undefined;
+  if (typeof raw !== "string" || !allowed.includes(raw as T)) throw new Error(message);
+  return raw as T;
+}
+
+function optionalClearableText(raw: unknown, clear: unknown, max: number, message: string): string | null | undefined {
+  if (clear === true) return null;
+  return optionalScheduleText(raw, max, message);
+}
+
+function scheduleCreateInput(input: JsonObject): ScheduleCreate {
+  const name = optionalScheduleText(input["name"], 500, "任务名称无效");
+  const prompt = optionalScheduleText(input["prompt"], 200_000, "提示无效");
+  const rrule = optionalScheduleText(input["rrule"], 500, "RRULE 无效");
+  if (!name || !prompt || !rrule) throw new Error("定时任务参数无效");
+  const out: ScheduleCreate = { name, prompt, rrule };
+  const fields: Array<[keyof ScheduleCreate, unknown]> = [
+    ["operationId", optionalScheduleText(input["operationId"], 200, "操作 ID 无效")],
+    ["id", input["id"] === undefined ? undefined : requireScheduleId(input["id"])],
+    ["kind", optionalScheduleEnum(input["kind"], ["cron", "heartbeat"], "定时任务类型无效")],
+    ["status", optionalScheduleEnum(input["status"], ["ENABLED", "PAUSED"], "定时任务状态无效")],
+    ["agent", optionalScheduleEnum(input["agent"], ["claude", "codex", "deepseek", "opencode", "grok"], "Agent 无效")],
+    ["approvalPolicy", optionalScheduleEnum(input["approvalPolicy"], ["strict", "standard", "yolo"], "审批策略无效")],
+    ["cwd", optionalSchedulePath(input["cwd"])],
+    ["cwds", Array.isArray(input["cwds"]) ? input["cwds"].map(optionalSchedulePath).filter((value): value is string => typeof value === "string").slice(0, 20) : undefined],
+    ["accountId", optionalScheduleText(input["accountId"], 100, "账号 ID 无效")],
+    ["model", optionalScheduleText(input["model"], 300, "模型无效")],
+    ["reasoningEffort", optionalScheduleText(input["reasoningEffort"], 100, "推理强度无效")],
+    ["mode", optionalScheduleEnum(input["mode"], ["default", "plan"], "会话模式无效")],
+    ["targetThreadId", optionalScheduleText(input["targetThreadId"], 500, "原生会话 ID 无效")],
+    ["actorSessionId", optionalScheduleText(input["actorSessionId"], 100, "会话 ID 无效")],
+  ];
+  for (const [key, value] of fields) if (value !== undefined) (out as Record<string, unknown>)[key] = value;
+  return out;
+}
+
+function scheduleUpdateInput(id: string, input: JsonObject): ScheduleUpdate {
+  const out: ScheduleUpdate = { id: requireScheduleId(input["id"] ?? id) };
+  const fields: Array<[keyof ScheduleUpdate, unknown]> = [
+    ["operationId", optionalScheduleText(input["operationId"], 200, "操作 ID 无效")],
+    ["kind", optionalScheduleEnum(input["kind"], ["cron", "heartbeat"], "定时任务类型无效")],
+    ["name", optionalScheduleText(input["name"], 500, "任务名称无效")],
+    ["prompt", optionalScheduleText(input["prompt"], 200_000, "提示无效")],
+    ["rrule", optionalScheduleText(input["rrule"], 500, "RRULE 无效")],
+    ["status", optionalScheduleEnum(input["status"], ["ENABLED", "PAUSED"], "定时任务状态无效")],
+    ["agent", optionalScheduleEnum(input["agent"], ["claude", "codex", "deepseek", "opencode", "grok"], "Agent 无效")],
+    ["approvalPolicy", optionalScheduleEnum(input["approvalPolicy"], ["strict", "standard", "yolo"], "审批策略无效")],
+    ["cwd", optionalSchedulePath(input["cwd"])],
+    ["cwds", Array.isArray(input["cwds"]) ? input["cwds"].map(optionalSchedulePath).filter((value): value is string => typeof value === "string").slice(0, 20) : undefined],
+    ["accountId", optionalClearableText(input["accountId"], input["clearAccount"], 100, "账号 ID 无效")],
+    ["model", optionalClearableText(input["model"], input["clearModel"], 300, "模型无效")],
+    ["reasoningEffort", optionalClearableText(input["reasoningEffort"], input["clearEffort"], 100, "推理强度无效")],
+    ["mode", input["clearMode"] === true ? null : optionalScheduleEnum(input["mode"], ["default", "plan"], "会话模式无效")],
+    ["targetThreadId", optionalClearableText(input["targetThreadId"], input["clearTargetThread"], 500, "原生会话 ID 无效")],
+  ];
+  for (const [key, value] of fields) if (value !== undefined) (out as Record<string, unknown>)[key] = value;
+  return out;
 }
 
 /** Account actions backed by the Rust daemon's managed Claude accounts. */
@@ -196,7 +281,7 @@ export function rustSessionInfo(head: SessionHead, messageQueue?: QueuedMessage[
     ...(controls.currentEffort !== null ? { currentEffort: controls.currentEffort } : {}),
     ...(controls.currentMode !== null ? { currentMode: controls.currentMode } : {}),
   } : undefined;
-  return { id: head.id, agent: head.agent, kind: head.kind, ...(head.kind === "pty" ? { terminalMode: "events" as const } : { historyMode: "paged" as const }), title: head.title, cwd: head.workspace, status: head.status === "waiting_permission" ? "waiting_approval" : head.status, createdAt: head.createdAt, pendingPermissions: head.status === "waiting_permission" ? 1 : 0, pendingQuestions: head.status === "waiting_input" ? 1 : 0, ...queue, ...(agentControls ? { agentControls } : {}) };
+  return { id: head.id, agent: head.agent, kind: head.kind, ...(head.kind === "pty" ? { terminalMode: "events" as const } : { historyMode: "paged" as const }), title: head.title, cwd: head.workspace, status: head.status === "waiting_permission" ? "waiting_approval" : head.status, createdAt: head.createdAt, ...(typeof head.busySince === "number" ? { busySince: head.busySince } : {}), pendingPermissions: head.status === "waiting_permission" ? 1 : 0, pendingQuestions: head.status === "waiting_input" ? 1 : 0, ...queue, ...(agentControls ? { agentControls } : {}) };
 }
 
 export class RustRuntime {
@@ -212,13 +297,13 @@ export class RustRuntime {
   private ready = false;
   private terminalWrites = new Map<string, { count: number; bytes: number; failed: boolean; tail: Promise<void> }>();
 
-  constructor(private readonly store: StateStore, binary: string, directory: string) {
+  constructor(private readonly store: StateStore, binary: string, directory: string, env?: Record<string, string>) {
     if (store.backend !== "api") throw new Error("Rust requires API-only desktop state");
     this.process = new RustProcess(binary, directory, () => {
       this.controller.abort(); clearTimeout(this.timer); this.ready = false; this.connection = undefined;
       this.clearState();
       this.store.setManagedState(undefined, false, this.stopping ? undefined : "Rust 服务已退出");
-    });
+    }, env);
   }
 
   get managed(): boolean { return this.process.managed; }
@@ -298,12 +383,16 @@ export class RustRuntime {
     const { client, pid, baseUrl } = this.current();
     const signal = this.controller.signal;
     const orchCursor = await client.events({ scope: "orchestration", afterSeq: this.orchestrationSequence, limit: 1 }, signal).catch(() => null);
-    const [summary, active, recent, workspaces, health, queues, controls, orchestration] = await Promise.all([
+    const [summary, active, recent, workspaces, health, schedules, queues, controls, orchestration] = await Promise.all([
       client.summary(undefined, signal),
       client.sessions({ limit: 100, cursor: null, lifecycle: "active", workspace: null, text: null }, signal),
       client.sessions({ limit: 20, cursor: null, lifecycle: "archived", workspace: null, text: null }, signal),
       client.workspaces({ limit: 100, cursor: null }, signal),
       client.health(signal),
+      client.schedules(signal).catch((error: unknown) => {
+        this.store.appendLog(`[rust] schedules read failed: ${error instanceof Error ? error.message : String(error)}\n`);
+        return [];
+      }),
       client.agentQueues(signal).catch((error: unknown) => {
         // The queue projection is additive UI state; a stale daemon or read
         // failure must not blank the session list.
@@ -331,10 +420,12 @@ export class RustRuntime {
     this.sequence = Math.min(summary.latestSeq, active.latestSeq, recent.latestSeq, workspaces.latestSeq);
     this.store.setApiState({ running: true, config: {}, devices: {}, orchestration: orchestration ?? {}, projects: workspaces.items.map(item => item.workspace), status: {
       pid, port: Number(new URL(baseUrl).port), bind: "127.0.0.1", sessions, capabilities: health.capabilities,
+      persistence: health.persistence,
       ...(health.relay ? { relay: health.relay as unknown as JsonObject } : {}),
       metadataRevision: `${pid}:${this.sequence}`,
       workspaceCounts: Object.fromEntries(workspaces.items.map(({ workspace, summary }) => [workspace, { revision: summary.revision, total: summary.total, active: summary.active, archived: summary.archived, attention: summary.attention }])),
       sessionSummary: { total: summary.total, active: summary.active, terminal: summary.archived, attention: summary.attention, activeLimit: 100, attentionLimit: 0, recentTerminalLimit: 20 },
+      schedules: schedules as unknown as JsonObject[],
     } });
   }
 
@@ -667,6 +758,66 @@ export class RustRuntime {
       if (result.ok && result.accounts) this.store.setAccounts(result.accounts as unknown as DesktopSnapshot["accounts"]);
       if (result.ok && action["kind"] !== "list" && action["kind"] !== "models") await this.refresh(true);
       return result as unknown as JsonObject;
+    }
+    if (path === "/_prospero/control/plugins" && (!init?.method || init.method === "GET")) {
+      return await this.current().client.plugins(signal) as unknown as JsonObject;
+    }
+    if (path === "/_prospero/control/plugin-services" && (!init?.method || init.method === "GET")) {
+      return await this.current().client.pluginServices(signal) as unknown as JsonObject;
+    }
+    const pluginServiceRoute = /^\/_prospero\/control\/plugin\/([^/]+)\/service\/([^/]+)\/(start|stop|restart|health)$/.exec(path);
+    if (pluginServiceRoute && ((pluginServiceRoute[3] === "health" && (!init?.method || init.method === "GET")) || (pluginServiceRoute[3] !== "health" && init?.method === "POST"))) {
+      const action = pluginServiceRoute[3] as "start" | "stop" | "restart" | "health";
+      const result = await this.current().client.pluginServiceAction(
+        requirePluginId(decodeURIComponent(pluginServiceRoute[1]!)),
+        requirePluginId(decodeURIComponent(pluginServiceRoute[2]!)),
+        action,
+        signal,
+        init?.timeoutMs ?? 30_000,
+      );
+      await this.refresh(true);
+      return result as unknown as JsonObject;
+    }
+    const schedulesRoute = /^\/_prospero\/control\/schedules(?:\?(.*))?$/.exec(path);
+    if (schedulesRoute && (!init?.method || init.method === "GET")) {
+      const schedules = await this.current().client.schedules(signal);
+      return { items: schedules } as JsonObject;
+    }
+    if (schedulesRoute && init?.method === "POST" && input) {
+      const result = await this.current().client.createSchedule(scheduleCreateInput(input), signal);
+      await this.refresh(true);
+      return result as unknown as JsonObject;
+    }
+    const scheduleRoute = /^\/_prospero\/control\/schedules?\/([A-Za-z0-9._-]{1,100})\/(get|update|pause|resume|delete|run)$/.exec(path);
+    if (scheduleRoute) {
+      const scheduleId = scheduleRoute[1]!;
+      const action = scheduleRoute[2]!;
+      if (action === "get" && (!init?.method || init.method === "GET")) return await this.current().client.schedule(scheduleId, signal) as unknown as JsonObject;
+      if (action === "update" && init?.method === "POST" && input) {
+        const result = await this.current().client.updateSchedule(scheduleId, scheduleUpdateInput(scheduleId, input), signal);
+        await this.refresh(true);
+        return result as unknown as JsonObject;
+      }
+      if (action === "pause" && init?.method === "POST") {
+        const result = await this.current().client.pauseSchedule(scheduleId, signal);
+        await this.refresh(true);
+        return result as unknown as JsonObject;
+      }
+      if (action === "resume" && init?.method === "POST") {
+        const result = await this.current().client.resumeSchedule(scheduleId, signal);
+        await this.refresh(true);
+        return result as unknown as JsonObject;
+      }
+      if (action === "delete" && init?.method === "POST") {
+        const result = await this.current().client.deleteSchedule(scheduleId, signal);
+        await this.refresh(true);
+        return result as unknown as JsonObject;
+      }
+      if (action === "run" && init?.method === "POST") {
+        const result = await this.current().client.runSchedule(scheduleId, signal, init?.timeoutMs ?? 180_000);
+        await this.refresh(true);
+        return result as unknown as JsonObject;
+      }
     }
     if (path === "/_prospero/control/orchestration/action" && init?.method === "POST" && input) {
       const method = input["method"];

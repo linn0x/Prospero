@@ -30,7 +30,7 @@ import { Message, MessageAvatar, MessageContent, MessageHeader } from "@/compone
 import { MessageScroller, MessageScrollerButton, MessageScrollerContent, MessageScrollerItem, MessageScrollerProvider, MessageScrollerViewport } from "@/components/ui/message-scroller";
 import { Spinner } from "@/components/ui/spinner";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
-import { array, displayError, reportError, number, record, text } from "./state";
+import { array, displayError, isMissingSessionError, reportError, number, record, text } from "./state";
 import { useLocale } from "./locale";
 import {
   CHAT_TIMELINE_WINDOW_SIZE,
@@ -185,7 +185,7 @@ async function fileToAttachment(file: File): Promise<PendingAttachment> {
   return { id: crypto.randomUUID(), name: file.name, mimeType: file.type, size: file.size, dataB64: btoa(binary) };
 }
 
-export function ChatPane({ session, account, onOpenGoal, trajectoryHost }: { session: SessionInfo; account?: JsonObject | undefined; onOpenGoal?: () => void; trajectoryHost?: HTMLDivElement | null }) {
+export function ChatPane({ session, account, onOpenGoal, trajectoryHost, onMissingSession }: { session: SessionInfo; account?: JsonObject | undefined; onOpenGoal?: () => void; trajectoryHost?: HTMLDivElement | null; onMissingSession?: (id: string) => void }) {
   const { t } = useLocale();
   const paged = usePagedTimeline(session.id, session.historyMode === "paged");
   const [bodyDetail, setBodyDetail] = useState<{ id: string; title: string; sessionId: string }>();
@@ -343,9 +343,9 @@ export function ChatPane({ session, account, onOpenGoal, trajectoryHost }: { ses
   useEffect(() => {
     let active = true; let timer: number | undefined; let errorDelay = 1_000; let pollFailed = false;
     if (paged.enabled) return;
-    const poll = async (): Promise<void> => { let nextDelay = 25; const startedAt = performance.now(); try { const frame = await window.prospero.getSessionView(session.id, cursor.current === undefined ? {} : { afterSeq: cursor.current, waitMs: 20_000 }); if (!active) return; nextDelay = getChatPollReconnectDelay(Boolean(frame), performance.now() - startedAt); if (frame) { const incoming = array(frame.events).map(record); if (text(frame.mode) === "delta") { const next = accumulator.current!.append(incoming); if (next) setTimeline(next); } else { setTimeline(accumulator.current!.reset(incoming)); jumpToLatestRef.current = false; selectHistoryCursor(null); } cursor.current = number(frame.evSeq, number(frame.seq)); setConnectionError(undefined); } else if (pollFailed) setConnectionError(undefined); pollFailed = false; errorDelay = 1_000; } catch (reason) { if (active) setConnectionError(displayError(reason)); pollFailed = true; nextDelay = errorDelay; errorDelay = Math.min(8_000, errorDelay * 2); } if (active) timer = window.setTimeout(() => void poll(), nextDelay); };
+    const poll = async (): Promise<void> => { let nextDelay = 25; const startedAt = performance.now(); try { const frame = await window.prospero.getSessionView(session.id, cursor.current === undefined ? {} : { afterSeq: cursor.current, waitMs: 20_000 }); if (!active) return; nextDelay = getChatPollReconnectDelay(Boolean(frame), performance.now() - startedAt); if (frame) { const incoming = array(frame.events).map(record); if (text(frame.mode) === "delta") { const next = accumulator.current!.append(incoming); if (next) setTimeline(next); } else { setTimeline(accumulator.current!.reset(incoming)); jumpToLatestRef.current = false; selectHistoryCursor(null); } cursor.current = number(frame.evSeq, number(frame.seq)); setConnectionError(undefined); } else if (pollFailed) setConnectionError(undefined); pollFailed = false; errorDelay = 1_000; } catch (reason) { if (active && isMissingSessionError(reason)) { onMissingSession?.(session.id); active = false; return; } if (active) setConnectionError(displayError(reason)); pollFailed = true; nextDelay = errorDelay; errorDelay = Math.min(8_000, errorDelay * 2); } if (active) timer = window.setTimeout(() => void poll(), nextDelay); };
     void poll(); return () => { active = false; if (timer !== undefined) window.clearTimeout(timer); void window.prospero.cancelSessionView(session.id).catch(() => undefined); };
-  }, [paged.enabled, selectHistoryCursor, session.id]);
+  }, [onMissingSession, paged.enabled, selectHistoryCursor, session.id]);
   const send = async (): Promise<void> => {
     const value = draft.trim();
     if ((!value && !attachments.length) || sending || attachingRef.current) return;

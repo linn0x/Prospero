@@ -116,6 +116,20 @@ export type RemoteShellEvent = {
   message: JsonObject;
 };
 
+export type RuntimeSwitchState = {
+  backend: "rust" | "legacy";
+  selected: "rust" | "legacy";
+  selectionReason: "env" | "preference" | "packaged-default" | "development-default";
+  forced: boolean;
+  rustAvailable: boolean;
+  rustBinary: string;
+  fallbackAvailable: boolean;
+  legacyAvailable: boolean;
+  defaultBackend: "rust" | "legacy";
+  lastRollbackAt?: number;
+  lastRollbackReason?: string;
+};
+
 export type DaemonSnapshot = {
   workspaceCounts?: Record<string, { revision: number; total: number; active: number; archived: number; attention: number }>;
   metadataRevision?: string;
@@ -133,13 +147,16 @@ export type DaemonSnapshot = {
   persistence: { pty: boolean; structured: boolean };
   capabilities?: string[];
   relay: JsonObject;
+  runtime?: RuntimeSwitchState;
   /** Global counts; `sessions` below is intentionally a bounded live slice. */
   sessionSummary?: SessionSummary;
   sessions: SessionInfo[];
+  schedules?: JsonObject[];
 };
 
 export type DesktopSettings = {
   startDaemonOnLaunch: boolean;
+  daemonBackend: "rust" | "legacy";
   fullAccessPermission: boolean;
   minimizeToTray: boolean;
   launchAtLogin: boolean;
@@ -315,6 +332,7 @@ export type DesktopApi = import("./project-tools").ProjectToolsApi & {
   setSessionPinned(sessionId: string, pinned: boolean): Promise<DesktopSnapshot>;
   setSessionArchived(sessionId: string, archived: boolean): Promise<DesktopSnapshot>;
   setSessionUnread(sessionId: string, unread: boolean): Promise<DesktopSnapshot>;
+  forgetMissingSession(sessionId: string): Promise<DesktopSnapshot>;
   renameSession(sessionId: string, title: string): Promise<DesktopSnapshot>;
   revealPath(path: string): Promise<{ ok: boolean; error?: string }>;
   openWindowsTerminal(path: string): Promise<{ ok: boolean; error?: string }>;
