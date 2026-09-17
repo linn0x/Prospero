@@ -1364,6 +1364,19 @@ pub struct RustDaemonStatusSnapshot {
     pub relay: Option<RelayRuntimeStatus>,
     pub session_summary: RustDaemonStatusSummary,
     pub sessions: Vec<RustDaemonStatusSession>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schedules: Vec<crate::schedules::StatusScheduledAgentTask>,
+}
+
+#[derive(Debug)]
+pub struct RustDaemonStatusInput {
+    pub port: u16,
+    pub bind: Option<String>,
+    pub control_token: String,
+    pub capabilities: Vec<String>,
+    pub session_summary: crate::protocol::SessionSummary,
+    pub sessions: Vec<crate::protocol::SessionHead>,
+    pub schedules: Vec<crate::schedules::StatusScheduledAgentTask>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1393,6 +1406,8 @@ pub struct RustDaemonStatusSession {
     pub pending_permissions: usize,
     pub pending_questions: usize,
     pub created_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busy_since: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -1443,15 +1458,16 @@ impl RelayStatusHandle {
         self.status.lock().ok().and_then(|status| status.clone())
     }
 
-    pub fn write_minimal_status(
-        &self,
-        port: u16,
-        bind: Option<String>,
-        control_token: String,
-        capabilities: Vec<String>,
-        session_summary: crate::protocol::SessionSummary,
-        sessions: Vec<crate::protocol::SessionHead>,
-    ) -> Result<()> {
+    pub fn write_minimal_status(&self, input: RustDaemonStatusInput) -> Result<()> {
+        let RustDaemonStatusInput {
+            port,
+            bind,
+            control_token,
+            capabilities,
+            session_summary,
+            sessions,
+            schedules,
+        } = input;
         let included = sessions.len();
         let terminal = session_summary.archived;
         let omitted = session_summary.total.saturating_sub(included as i64);
@@ -1487,6 +1503,7 @@ impl RelayStatusHandle {
                     .into_iter()
                     .map(RustDaemonStatusSession::from)
                     .collect(),
+                schedules,
             },
         )
     }
@@ -1523,6 +1540,7 @@ impl From<crate::protocol::SessionHead> for RustDaemonStatusSession {
                 head.status == crate::protocol::SessionStatus::WaitingInput,
             ),
             created_at: head.created_at,
+            busy_since: head.busy_since,
         }
     }
 }
@@ -1951,14 +1969,15 @@ mod runtime_tests {
             5,
         ));
         handle
-            .write_minimal_status(
-                7423,
-                Some("127.0.0.1".into()),
-                "local-control-token".into(),
-                vec!["relay.host.v1".into()],
-                crate::protocol::SessionSummary::default(),
-                Vec::new(),
-            )
+            .write_minimal_status(RustDaemonStatusInput {
+                port: 7423,
+                bind: Some("127.0.0.1".into()),
+                control_token: "local-control-token".into(),
+                capabilities: vec!["relay.host.v1".into()],
+                session_summary: crate::protocol::SessionSummary::default(),
+                sessions: Vec::new(),
+                schedules: Vec::new(),
+            })
             .unwrap();
         let status: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(home.path().join("status.json")).unwrap())
@@ -2035,6 +2054,7 @@ mod runtime_tests {
                 truncated: false,
             },
             sessions: Vec::new(),
+            schedules: Vec::new(),
         };
         write_status_file(home.path(), &snapshot).unwrap();
         let status = fs::read_to_string(home.path().join("status.json")).unwrap();

@@ -226,6 +226,30 @@ pub(super) async fn fetch_launch_catalog(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_tool_input_removes_task_model_override() {
+        let input = serde_json::json!({"description":"review","prompt":"check","model":"opus"});
+        assert_eq!(
+            profile_tool_input(true, "Task", input),
+            serde_json::json!({"description":"review","prompt":"check"})
+        );
+    }
+
+    #[test]
+    fn profile_tool_input_leaves_non_profile_or_non_task_input() {
+        let input = serde_json::json!({"description":"review","prompt":"check","model":"opus"});
+        assert_eq!(profile_tool_input(false, "Task", input.clone()), input);
+        assert_eq!(
+            profile_tool_input(true, "Bash", serde_json::json!({"command":"pwd"})),
+            serde_json::json!({"command":"pwd"})
+        );
+    }
+}
+
 /// Parses the `models` array from an `initialize` control_response payload
 /// into the public catalog shape. Shared by the launch handshake and the
 /// in-session live catalog request.
@@ -398,6 +422,10 @@ pub(super) fn spawn_turn(
 
     // Read and translate the JSONL stream.
     let auto = options.policy == ApprovalPolicy::Auto;
+    let profile_model = options
+        .environment
+        .iter()
+        .any(|(key, value)| key == "PROSPERO_API_PROFILE_MODEL" && !value.trim().is_empty());
     let reader_writer = frames_tx.clone();
     let reader_controls = controls.clone();
     tokio::spawn(async move {
@@ -422,7 +450,7 @@ pub(super) fn spawn_turn(
                     .unwrap_or_else(|| message.clone());
                 let _ = waiter.send(envelope);
             }
-            for outgoing in translator.feed(message, auto, &reader_writer) {
+            for outgoing in translator.feed(message, auto, profile_model, &reader_writer) {
                 if events_tx.send(outgoing).await.is_err() {
                     return;
                 }
@@ -656,6 +684,17 @@ fn tool_summary(input: &Value) -> String {
     summarize(picked.to_owned(), 2000)
 }
 
+fn profile_tool_input(profile_model: bool, tool: &str, input: Value) -> Value {
+    if !profile_model || !matches!(tool, "Task" | "Agent") {
+        return input;
+    }
+    let Value::Object(mut object) = input else {
+        return input;
+    };
+    object.remove("model");
+    Value::Object(object)
+}
+
 /// Rebuild the tool input with the native `answers` map the CLI expects.
 fn merge_answers(input: &Value, answers: &serde_json::Map<String, Value>) -> Value {
     let mut merged = match input {
@@ -687,6 +726,7 @@ impl Translator {
         &mut self,
         message: Value,
         auto: bool,
+        profile_model: bool,
         writer: &mpsc::Sender<(String, Option<oneshot::Sender<()>>)>,
     ) -> Vec<AdapterEvent> {
         let mut out = Vec::new();
@@ -808,7 +848,11 @@ impl Translator {
                         .and_then(Value::as_str)
                         .unwrap_or("tool")
                         .to_owned();
-                    let input = request.get("input").cloned().unwrap_or(Value::Null);
+                    let input = profile_tool_input(
+                        profile_model,
+                        &tool,
+                        request.get("input").cloned().unwrap_or(Value::Null),
+                    );
                     if tool == "AskUserQuestion" {
                         // Questions are an interaction, not an approval: they
                         // surface even under auto-approval policy (mirrors the
@@ -826,13 +870,14 @@ impl Translator {
                         let (reply, receiver) = oneshot::channel();
                         let writer = writer.clone();
                         let rid = request_id.clone();
+                        let response_input = input.clone();
                         tokio::spawn(async move {
                             let allow = receiver.await.unwrap_or(false);
                             // The CLI requires a deny response to carry a
                             // `message`; a bare deny is rejected as an invalid
                             // callback result and the model retries the tool.
                             let response = if allow {
-                                serde_json::json!({"behavior":"allow"})
+                                serde_json::json!({"behavior":"allow","updatedInput":response_input})
                             } else {
                                 serde_json::json!({"behavior":"deny",
                                     "message":"The user denied this action."})

@@ -262,6 +262,78 @@ async fn source_supports_openai_compatible_routes() {
     assert_eq!(account["apiProfile"]["baseUrl"], server.base_url);
 }
 
+#[tokio::test]
+async fn source_bind_accepts_explicit_runtime_agent() {
+    let _guard = SERIAL.lock().await;
+    let harness = Harness::new().await;
+    let server = spawn_server();
+
+    let (status, result) = harness
+        .post(envelope(json!({
+            "kind":"create",
+            "operationId":"op-chat-create",
+            "name":"Shared Chat",
+            "endpoints":[{"protocol":"openai_chat_completions","baseUrl":format!("{}/chat/completions", server.base_url)}],
+            "credential":{"name":"OpenAI Key","apiKey":SECRET},
+            "routes":[{"name":"Chat Test","model":"chat-test","protocol":"openai_chat_completions","enabled":true,"modelCapabilities":{"tools":true,"contextWindow":32000,"maxOutputTokens":2048}}]
+        })))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let source = &result["sources"][0];
+    let source_id = source["id"].as_str().unwrap();
+    let route_id = source["routes"][0]["id"].as_str().unwrap();
+    let revision = source["revision"].as_i64().unwrap();
+
+    let (status, first) = harness
+        .post(envelope(
+            json!({"kind":"bind","sourceId":source_id,"routeId":route_id,"revision":revision}),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let codex_id = first["accountId"].as_str().unwrap().to_owned();
+    let codex = first["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == codex_id)
+        .unwrap();
+    assert_eq!(codex["agent"], "codex");
+    assert_eq!(codex["engine"], "opencode");
+
+    let (status, reused) = harness
+        .post(envelope(
+            json!({"kind":"bind","sourceId":source_id,"routeId":route_id,"revision":revision,"agent":"codex"}),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reused}");
+    assert_eq!(reused["accountId"], codex_id);
+
+    let (status, opencode) = harness
+        .post(envelope(
+            json!({"kind":"bind","sourceId":source_id,"routeId":route_id,"revision":revision,"agent":"opencode"}),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{opencode}");
+    let opencode_id = opencode["accountId"].as_str().unwrap().to_owned();
+    assert_ne!(opencode_id, codex_id);
+    let opencode_account = opencode["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == opencode_id)
+        .unwrap();
+    assert_eq!(opencode_account["agent"], "opencode");
+    assert_eq!(opencode_account["engine"], "opencode");
+
+    let (status, invalid) = harness
+        .post(envelope(
+            json!({"kind":"bind","sourceId":source_id,"routeId":route_id,"revision":revision,"agent":"claude"}),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{invalid}");
+    assert_eq!(invalid["code"], "invalid_request");
+}
+
 fn account_envelope(request_id: &str, extra: Value) -> Value {
     let mut value = extra.as_object().unwrap().clone();
     value.insert("requestId".into(), Value::String(request_id.into()));

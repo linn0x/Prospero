@@ -610,7 +610,7 @@ export const ModelSourceActionSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("route.remove"), ...modelSourceWrite, routeId: modelSourceId }).strict(),
   z.object({ kind: z.literal("delete"), ...modelSourceWrite }).strict(),
   z.object({ kind: z.literal("models"), ...modelSourceWrite, protocol: AgentApiProtocolSchema, credentialId: modelSourceId, refresh: z.boolean().optional() }).strict(),
-  z.object({ kind: z.literal("bind"), ...modelSourceWrite, routeId: modelSourceId }).strict(),
+  z.object({ kind: z.literal("bind"), ...modelSourceWrite, routeId: modelSourceId, agent: CodeAgentKindSchema.optional() }).strict(),
   z.object({ kind: z.literal("migration.preview") }).strict(),
   z.object({ kind: z.literal("migration.apply"), migrationId: modelSourceId, name: modelSourceName, target: z.object(modelSourceWrite).strict().optional() }).strict(),
   z.object({ kind: z.literal("migration.rollback"), accountIds: z.array(modelSourceId).min(1).max(500) }).strict(),
@@ -1317,6 +1317,97 @@ export const C2SOrchestrationWorktreeCleanupSchema = z.object({
   deleteBranch: z.boolean().optional(),
 });
 
+export const ScheduledAgentTaskSchema = z.object({
+  version: z.literal(1),
+  id: z.string().min(1).max(100),
+  kind: z.enum(["cron", "heartbeat"]),
+  name: z.string().min(1).max(500),
+  prompt: z.string().min(1).max(200_000),
+  status: z.enum(["ENABLED", "PAUSED"]),
+  rrule: z.string().min(1).max(500),
+  agent: AgentKindSchema,
+  approvalPolicy: ApprovalPolicySchema,
+  cwd: z.string().min(1).max(20_000),
+  cwds: z.array(z.string().min(1).max(20_000)).max(20),
+  accountId: z.string().min(1).max(100).optional(),
+  model: z.string().min(1).max(300).optional(),
+  reasoningEffort: z.string().min(1).max(100).optional(),
+  mode: z.enum(["default", "plan"]).optional(),
+  targetThreadId: z.string().min(1).max(500).optional(),
+  lastSessionId: z.string().min(1).max(200).optional(),
+  lastRunAt: z.number().int().nonnegative().optional(),
+  nextRunAt: z.number().int().nonnegative(),
+  lastError: z.string().max(2_000).optional(),
+  createdAt: z.number().int().nonnegative(),
+  updatedAt: z.number().int().nonnegative(),
+});
+
+export const C2SScheduleListSchema = z.object({
+  type: z.literal("schedule.list"),
+  requestId: z.string().min(1).max(100).optional(),
+});
+
+export const C2SScheduleCreateSchema = z.object({
+  type: z.literal("schedule.create"),
+  requestId: z.string().min(1).max(100).optional(),
+  operationId: z.string().min(1).max(200).optional(),
+  id: z.string().min(1).max(100).optional(),
+  kind: z.enum(["cron", "heartbeat"]).optional(),
+  name: z.string().trim().min(1).max(500),
+  prompt: z.string().trim().min(1).max(200_000),
+  rrule: z.string().trim().min(1).max(500),
+  status: z.enum(["ENABLED", "PAUSED"]).optional(),
+  agent: AgentKindSchema.optional(),
+  approvalPolicy: ApprovalPolicySchema.optional(),
+  cwd: z.string().trim().min(1).max(20_000).optional(),
+  cwds: z.array(z.string().trim().min(1).max(20_000)).max(20).optional(),
+  accountId: z.string().min(1).max(100).optional(),
+  model: z.string().min(1).max(300).optional(),
+  reasoningEffort: z.string().min(1).max(100).optional(),
+  mode: z.enum(["default", "plan"]).optional(),
+  targetThreadId: z.string().min(1).max(500).optional(),
+});
+
+export const C2SScheduleUpdateSchema = z.object({
+  type: z.literal("schedule.update"),
+  requestId: z.string().min(1).max(100).optional(),
+  operationId: z.string().min(1).max(200).optional(),
+  id: z.string().min(1).max(100),
+  kind: z.enum(["cron", "heartbeat"]).optional(),
+  name: z.string().trim().min(1).max(500).optional(),
+  prompt: z.string().trim().min(1).max(200_000).optional(),
+  rrule: z.string().trim().min(1).max(500).optional(),
+  status: z.enum(["ENABLED", "PAUSED"]).optional(),
+  agent: AgentKindSchema.optional(),
+  approvalPolicy: ApprovalPolicySchema.optional(),
+  cwd: z.string().trim().min(1).max(20_000).optional(),
+  cwds: z.array(z.string().trim().min(1).max(20_000)).max(20).optional(),
+  accountId: z.string().min(1).max(100).nullable().optional(),
+  model: z.string().min(1).max(300).nullable().optional(),
+  reasoningEffort: z.string().min(1).max(100).nullable().optional(),
+  mode: z.enum(["default", "plan"]).nullable().optional(),
+  targetThreadId: z.string().min(1).max(500).nullable().optional(),
+});
+
+export const C2SScheduleIdSchema = z.object({
+  type: z.enum(["schedule.get", "schedule.pause", "schedule.resume", "schedule.delete", "schedule.run"]),
+  requestId: z.string().min(1).max(100).optional(),
+  operationId: z.string().min(1).max(200).optional(),
+  id: z.string().min(1).max(100),
+});
+
+export const S2CScheduleResultSchema = z.object({
+  type: z.literal("schedule.result"),
+  requestId: z.string().min(1).max(100).optional(),
+  ok: z.boolean(),
+  schedules: z.array(ScheduledAgentTaskSchema).max(500).optional(),
+  task: ScheduledAgentTaskSchema.optional(),
+  session: SessionInfoSchema.optional(),
+  queued: z.boolean().optional(),
+  deleted: z.boolean().optional(),
+  error: z.string().max(2_000).optional(),
+});
+
 export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SHelloSchema,
   C2SConnectionPingSchema,
@@ -1391,6 +1482,10 @@ export const C2SMessageSchema = z.discriminatedUnion("type", [
   C2SOrchestrationGraphApplySchema,
   C2SOrchestrationAutomationStartSchema,
   C2SOrchestrationAutomationPauseSchema,
+  C2SScheduleListSchema,
+  C2SScheduleCreateSchema,
+  C2SScheduleUpdateSchema,
+  C2SScheduleIdSchema,
   C2SOrchestrationWorktreeInspectSchema,
   C2SOrchestrationWorktreeCleanupSchema,
 ]);
@@ -2041,6 +2136,7 @@ export const S2CMessageSchema = z.discriminatedUnion("type", [
   S2CAgentAccountApiModelsResultSchema,
   S2CAgentAccountConfigResultSchema,
   S2CModelSourceResultSchema,
+  S2CScheduleResultSchema,
   S2CFsListingSchema,
   S2CFsContentSchema,
   S2CFsWrittenSchema,
@@ -2135,6 +2231,12 @@ export type C2SOrchestrationGraphCreate = z.infer<typeof C2SOrchestrationGraphCr
 export type C2SOrchestrationGraphApply = z.infer<typeof C2SOrchestrationGraphApplySchema>;
 export type C2SOrchestrationAutomationStart = z.infer<typeof C2SOrchestrationAutomationStartSchema>;
 export type C2SOrchestrationAutomationPause = z.infer<typeof C2SOrchestrationAutomationPauseSchema>;
+export type ScheduledAgentTask = z.infer<typeof ScheduledAgentTaskSchema>;
+export type C2SScheduleList = z.infer<typeof C2SScheduleListSchema>;
+export type C2SScheduleCreate = z.infer<typeof C2SScheduleCreateSchema>;
+export type C2SScheduleUpdate = z.infer<typeof C2SScheduleUpdateSchema>;
+export type C2SScheduleId = z.infer<typeof C2SScheduleIdSchema>;
+export type S2CScheduleResult = z.infer<typeof S2CScheduleResultSchema>;
 export type C2SOrchestrationWorktreeInspect = z.infer<typeof C2SOrchestrationWorktreeInspectSchema>;
 export type C2SOrchestrationWorktreeCleanup = z.infer<typeof C2SOrchestrationWorktreeCleanupSchema>;
 export type ResumableConversation = z.infer<typeof ResumableConversationSchema>;

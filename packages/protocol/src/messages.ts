@@ -43,6 +43,7 @@ export const CAPABILITY_ORCHESTRATION_LIFECYCLE = "orchestration.lifecycle.v1";
 export const CAPABILITY_ORCHESTRATION_RUN_LIFECYCLE = "orchestration.run-lifecycle.v1";
 /** 已登记工作树的只读安全检查与显式清理。 */
 export const CAPABILITY_ORCHESTRATION_WORKTREES = "orchestration.worktrees.v1";
+export const CAPABILITY_SCHEDULED_AGENTS = "scheduled-agents.v1";
 export const CAPABILITY_SUBAGENT_HISTORY = "subagent.history.v1";
 /** Codex / Claude Code 多账号与隔离配置目录。 */
 export const CAPABILITY_AGENT_ACCOUNTS = "agent.accounts.v1";

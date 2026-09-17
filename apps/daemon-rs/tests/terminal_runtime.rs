@@ -161,6 +161,45 @@ async fn completed_terminal_is_archived_and_output_survives_restart() {
 }
 
 #[tokio::test]
+async fn terminal_busy_since_tracks_live_activity() {
+    let directory = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let database = Database::open(directory.path().into()).await.unwrap();
+    let runtime = Terminals::new(database.clone());
+    let mut launch = input(&workspace);
+    launch.agent = Some(prosperod_rs::protocol::AgentKind::Custom);
+    launch.command = Some("printf 'working\\n'; sleep 60".into());
+    let head = runtime.create(launch).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let busy = loop {
+        let id = head.id.clone();
+        let busy = database
+            .call(move |store| Ok(store.session(&id)?.busy_since))
+            .await
+            .unwrap();
+        if busy.is_some() {
+            break busy;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "terminal busySince was not persisted",
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert!(busy.unwrap() >= head.created_at);
+    runtime.close(&head.id).unwrap();
+    settled(&runtime).await;
+    let id = head.id.clone();
+    let finished = database
+        .call(move |store| store.session(&id))
+        .await
+        .unwrap();
+    assert_eq!(finished.busy_since, None);
+    runtime.shutdown().await.unwrap();
+    database.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn custom_terminal_command_runs_and_archives() {
     let directory = TempDir::new().unwrap();
     let workspace = TempDir::new().unwrap();

@@ -4,6 +4,7 @@
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use prosperod_rs::auth::Token;
+use prosperod_rs::protocol::{AgentKind, CreateSession, SessionKind};
 use prosperod_rs::server::Api;
 use prosperod_rs::worker::Database;
 use serde_json::{Value, json};
@@ -11,6 +12,7 @@ use tempfile::TempDir;
 use tower::ServiceExt;
 
 const SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+static CODEX_HOME_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn fixture() -> (TempDir, Api) {
     let directory = TempDir::new().unwrap();
@@ -170,6 +172,186 @@ async fn dag_lifecycle_runs_through_the_http_routes() {
     .await;
     assert_eq!(status, StatusCode::OK, "{completed}");
     assert_eq!(completed["status"], "completed");
+}
+
+#[tokio::test]
+async fn scheduled_agents_are_exposed_over_http() {
+    let _guard = CODEX_HOME_SERIAL.lock().await;
+    let directory = TempDir::new().unwrap();
+    let codex_home = directory.path().join("codex-home");
+    let previous_codex_home = std::env::var_os("CODEX_HOME");
+    unsafe {
+        std::env::set_var("CODEX_HOME", &codex_home);
+    }
+    struct EnvGuard(Option<std::ffi::OsString>);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.0 {
+                    Some(value) => std::env::set_var("CODEX_HOME", value),
+                    None => std::env::remove_var("CODEX_HOME"),
+                }
+            }
+        }
+    }
+    let _env = EnvGuard(previous_codex_home);
+    let database = Database::open(directory.path().join("isolated"))
+        .await
+        .unwrap();
+    let api = Api::new(database, Token::parse(SECRET.into()).unwrap());
+    let workspace = directory.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let (status, created) = send(
+        &api,
+        "POST",
+        "/v1/schedules",
+        Some(json!({
+            "id": "daily-check",
+            "name": "Daily check",
+            "prompt": "Check the repo",
+            "rrule": "FREQ=DAILY;INTERVAL=1",
+            "agent": "codex",
+            "approvalPolicy": "standard",
+            "cwd": workspace,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    assert_eq!(created["id"], "daily-check");
+    assert_eq!(created["status"], "ENABLED");
+    assert!(created.get("path").is_none());
+
+    let schedule_file = codex_home
+        .join("automations")
+        .join("daily-check")
+        .join("automation.toml");
+    assert!(schedule_file.is_file());
+
+    let (status, list) = send(&api, "GET", "/v1/schedules", None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(list.as_array().unwrap().len(), 1);
+
+    let (status, paused) = send(&api, "POST", "/v1/schedules/daily-check/pause", None).await;
+    assert_eq!(status, StatusCode::OK, "{paused}");
+    assert_eq!(paused["status"], "PAUSED");
+
+    let (status, resumed) = send(&api, "POST", "/v1/schedules/daily-check/resume", None).await;
+    assert_eq!(status, StatusCode::OK, "{resumed}");
+    assert_eq!(resumed["status"], "ENABLED");
+
+    let (status, deleted) = send(&api, "DELETE", "/v1/schedules/daily-check", None).await;
+    assert_eq!(status, StatusCode::OK, "{deleted}");
+    assert_eq!(deleted["deleted"], true);
+}
+
+#[tokio::test]
+async fn plugin_services_are_exposed_over_http() {
+    let (directory, api) = fixture().await;
+    let plugin_root = directory.path().join("plugins/prospero-demo/runtime");
+    std::fs::create_dir_all(&plugin_root).unwrap();
+    std::fs::write(
+        plugin_root.join("service.mjs"),
+        "setInterval(() => {}, 1000);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        directory
+            .path()
+            .join("plugins/prospero-demo/prospero-plugin.json"),
+        serde_json::json!({
+            "schema_version": "prospero-plugin/v1",
+            "name": "prospero-demo",
+            "version": "0.1.0",
+            "runtime_root": "runtime",
+            "services": [{
+                "id": "bridge",
+                "mode": "manual",
+                "command": ["node", "service.mjs"],
+                "cwd": "runtime",
+                "env": {"FEATURE_FLAG": "1"},
+                "port_env": "PORT",
+                "health_path": "/health"
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let (status, plugins) = send(&api, "GET", "/v1/plugins", None).await;
+    assert_eq!(status, StatusCode::OK, "{plugins}");
+    assert_eq!(plugins["items"][0]["name"], "prospero-demo");
+    assert_eq!(
+        plugins["items"][0]["services"][0]["envKeys"][0],
+        "FEATURE_FLAG"
+    );
+
+    let (status, services) = send(&api, "GET", "/v1/plugin-services", None).await;
+    assert_eq!(status, StatusCode::OK, "{services}");
+    assert_eq!(services["items"][0]["pluginId"], "prospero-demo");
+    assert_eq!(services["items"][0]["serviceId"], "bridge");
+    assert_eq!(services["items"][0]["configured"], true);
+    assert_eq!(services["items"][0]["status"], "stopped");
+}
+
+#[tokio::test]
+async fn task_delivery_routes_settle_live_dispatches() {
+    let (_directory, api) = fixture().await;
+    let (status, created) = send(&api, "POST", "/v1/runs/graph", Some(graph_body())).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let task_id = created["idMap"]["a"].as_str().unwrap().to_owned();
+    let worker = api
+        .database
+        .call(|store| {
+            store.create_session(CreateSession {
+                agent: AgentKind::Claude,
+                kind: SessionKind::Structured,
+                title: "worker".into(),
+                workspace: "/synthetic".into(),
+            })
+        })
+        .await
+        .unwrap();
+    let dispatch = {
+        let task_id = task_id.clone();
+        let session_id = worker.id.clone();
+        api.database
+            .call(move |store| {
+                let outcome = store.dispatch_task(&task_id, &session_id, None, None)?;
+                store.set_dispatch_running(&outcome.dispatch.id)
+            })
+            .await
+            .unwrap()
+    };
+
+    let (status, rejected) = send(
+        &api,
+        "POST",
+        &format!("/v1/tasks/{task_id}/complete"),
+        Some(json!({"body":"done","actorSessionId":"other-worker"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{rejected}");
+
+    let (status, delivered) = send(
+        &api,
+        "POST",
+        &format!("/v1/tasks/{task_id}/complete"),
+        Some(json!({"body":"done","actorSessionId":worker.id})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{delivered}");
+    assert_eq!(delivered["status"], "done");
+    let dispatch_id = dispatch.id;
+    let settled = api
+        .database
+        .call(move |store| store.dispatch(&dispatch_id))
+        .await
+        .unwrap();
+    assert_eq!(
+        settled.state,
+        prosperod_rs::orchestration::DispatchState::Succeeded
+    );
 }
 
 #[tokio::test]

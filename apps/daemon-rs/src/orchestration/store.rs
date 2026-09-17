@@ -8,8 +8,9 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hasher;
+use std::path::Path;
 
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -22,6 +23,14 @@ use crate::error::{Error, Result};
 const MAX_GRAPH_NODES: usize = 200;
 const MAX_SKILLS: usize = 5;
 const OPERATIONS_RETENTION: i64 = 1_000;
+const MAX_RUN_OBJECTIVE_BYTES: usize = 4096;
+const MAX_TASK_TITLE_BYTES: usize = 1024;
+const MAX_TASK_SPEC_BYTES: usize = 8192;
+const MAX_TASK_RESULT_BYTES: usize = 8192;
+const MAX_AUTOMATION_BYTES: usize = 32768;
+const MAX_WORKTREE_PATH_BYTES: usize = 4096;
+const MAX_BRANCH_BYTES: usize = 256;
+const MAX_MESSAGE_PART_BYTES: usize = 8192;
 
 /// Deterministic fingerprint for the idempotency ledger. It only has to detect
 /// "same operation id, different request" across daemon restarts; it is not a
@@ -124,6 +133,223 @@ fn new_id(prefix: &str) -> String {
 
 fn invalid(message: &str) -> Error {
     Error::Invalid(message.into())
+}
+
+fn legacy_table(table: &str) -> Option<&'static str> {
+    match table {
+        "runs" => Some("runs"),
+        "tasks" => Some("tasks"),
+        "dispatches" => Some("dispatches"),
+        "gates" => Some("gates"),
+        "messages" => Some("messages"),
+        "worktreeAssets" => Some("worktreeAssets"),
+        "task_dependencies" => Some("task_dependencies"),
+        _ => None,
+    }
+}
+
+fn legacy_active_query(table: &str) -> Option<&'static str> {
+    match table {
+        "runs" => {
+            Some("SELECT data FROM runs WHERE json_extract(data,'$.status')='active' ORDER BY id")
+        }
+        "tasks" => Some(
+            "SELECT t.data FROM tasks t JOIN runs r ON r.id=t.run_id WHERE json_extract(r.data,'$.status')='active' ORDER BY t.id",
+        ),
+        "dispatches" => Some(
+            "SELECT d.data FROM dispatches d JOIN runs r ON r.id=d.run_id WHERE json_extract(r.data,'$.status')='active' ORDER BY d.id",
+        ),
+        "gates" => Some(
+            "SELECT g.data FROM gates g JOIN runs r ON r.id=g.run_id WHERE json_extract(r.data,'$.status')='active' ORDER BY g.id",
+        ),
+        "messages" => Some(
+            "SELECT m.data FROM messages m JOIN runs r ON r.id=m.run_id WHERE json_extract(r.data,'$.status')='active' ORDER BY m.id",
+        ),
+        "worktreeAssets" => Some(
+            "SELECT w.data FROM worktreeAssets w JOIN runs r ON r.id=w.run_id WHERE json_extract(r.data,'$.status')='active' ORDER BY w.id",
+        ),
+        _ => None,
+    }
+}
+
+fn legacy_has_table(connection: &Connection, table: &str) -> Result<bool> {
+    let Some(table) = legacy_table(table) else {
+        return Ok(false);
+    };
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+            [table],
+            |row| row.get(0),
+        )
+        .map_err(Error::from)
+}
+
+fn legacy_has_tables(connection: &Connection, tables: &[&str]) -> Result<bool> {
+    for table in tables {
+        if !legacy_has_table(connection, table)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn visit_legacy_values(
+    connection: &Connection,
+    table: &str,
+    mut visitor: impl FnMut(Value) -> Result<()>,
+) -> Result<()> {
+    let Some(sql) = legacy_active_query(table) else {
+        return Ok(());
+    };
+    if !legacy_has_table(connection, table)? {
+        return Ok(());
+    }
+    let mut statement = connection.prepare(sql)?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        if let Ok(value) = serde_json::from_str::<Value>(&row.get::<_, String>(0)?) {
+            visitor(value)?;
+        }
+    }
+    Ok(())
+}
+
+fn truncate_text(value: &str, maximum: usize, fallback: &str) -> String {
+    let value = if value.is_empty() { fallback } else { value };
+    if value.len() <= maximum {
+        return value.to_owned();
+    }
+    let mut out = String::new();
+    for character in value.chars() {
+        if out.len() + character.len_utf8() > maximum {
+            break;
+        }
+        out.push(character);
+    }
+    if out.is_empty() {
+        fallback.to_owned()
+    } else {
+        out
+    }
+}
+
+fn legacy_text(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(|text| text.to_owned())
+}
+
+fn legacy_optional_text(value: &Value, key: &str, maximum: usize) -> Option<String> {
+    legacy_text(value, key).map(|text| truncate_text(&text, maximum, ""))
+}
+
+fn legacy_required_text(value: &Value, key: &str, maximum: usize, fallback: &str) -> String {
+    let text = legacy_text(value, key).unwrap_or_default();
+    truncate_text(&text, maximum, fallback)
+}
+
+fn legacy_id(value: &Value, key: &str) -> Option<String> {
+    let id = value.get(key)?.as_str()?.trim();
+    validate_id(id).ok()?;
+    Some(id.to_owned())
+}
+
+fn legacy_ids(value: &Value, key: &str) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|id| validate_id(id).is_ok())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn legacy_nonnegative(value: &Value, key: &str, fallback: i64) -> i64 {
+    value
+        .get(key)
+        .and_then(Value::as_i64)
+        .filter(|value| *value >= 0)
+        .unwrap_or(fallback)
+}
+
+fn legacy_optional_nonnegative(value: &Value, key: &str) -> Option<i64> {
+    value
+        .get(key)
+        .and_then(Value::as_i64)
+        .filter(|value| *value >= 0)
+}
+
+fn legacy_string_array(value: &Value, key: &str, maximum: usize, item_limit: usize) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|text| truncate_text(text, maximum, ""))
+                .filter(|text| !text.is_empty())
+                .take(item_limit)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn legacy_skills(value: &Value) -> Vec<String> {
+    normalize_skills(&legacy_string_array(value, "skills", 256, MAX_SKILLS)).unwrap_or_default()
+}
+
+fn legacy_optional_json(value: &Value, key: &str, maximum: usize) -> Option<String> {
+    let raw = value.get(key)?;
+    if raw.is_null() {
+        return None;
+    }
+    let text = serde_json::to_string(raw).ok()?;
+    (text.len() <= maximum).then_some(text)
+}
+
+fn legacy_automation(value: &Value, timestamp: i64) -> Option<String> {
+    let mut raw = value.get("automation")?.as_object()?.clone();
+    if raw.get("state").and_then(Value::as_str) == Some("running") {
+        raw.insert("state".into(), Value::String("paused".into()));
+        raw.insert("updatedAt".into(), Value::from(timestamp));
+        raw.insert(
+            "lastError".into(),
+            Value::String("Paused during Rust daemon migration".into()),
+        );
+    }
+    let parsed: RunAutomation = serde_json::from_value(Value::Object(raw)).ok()?;
+    let text = serde_json::to_string(&parsed).ok()?;
+    (text.len() <= MAX_AUTOMATION_BYTES).then_some(text)
+}
+
+fn legacy_task_dependencies(connection: &Connection) -> Result<Vec<(String, String)>> {
+    if !legacy_has_table(connection, "task_dependencies")? {
+        return Ok(Vec::new());
+    }
+    let mut statement = connection.prepare(
+        "SELECT d.task_id,d.dependency_id FROM task_dependencies d \
+         JOIN tasks t ON t.id=d.task_id JOIN runs r ON r.id=t.run_id \
+         WHERE json_extract(r.data,'$.status')='active' ORDER BY d.task_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut deps = Vec::new();
+    for row in rows {
+        let (task_id, dep_id) = row?;
+        if validate_id(&task_id).is_ok() && validate_id(&dep_id).is_ok() {
+            deps.push((task_id, dep_id));
+        }
+    }
+    Ok(deps)
 }
 
 /// Legacy skill name rule: `$name` references in a task spec must resolve to an
@@ -255,6 +481,287 @@ fn map_gate(row: &rusqlite::Row<'_>) -> rusqlite::Result<Gate> {
 }
 
 impl Store {
+    pub fn import_legacy_orchestration(&mut self, legacy_home: &Path) -> Result<usize> {
+        let existing: i64 =
+            self.connection
+                .query_row("SELECT count(*) FROM orch_runs", [], |row| row.get(0))?;
+        if existing != 0 {
+            return Ok(0);
+        }
+        let path = legacy_home.join("orchestration.sqlite");
+        if !path.exists() {
+            return Ok(0);
+        }
+        let legacy = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        legacy.execute_batch(
+            "PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; PRAGMA busy_timeout=1000; PRAGMA mmap_size=0;",
+        )?;
+        if !legacy_has_tables(&legacy, &["runs", "tasks", "dispatches", "gates"])? {
+            return Ok(0);
+        }
+        let now = now();
+        let legacy_deps = legacy_task_dependencies(&legacy)?;
+        let tx = self.connection.transaction()?;
+        tx.execute_batch("PRAGMA defer_foreign_keys=ON")?;
+        let mut imported = 0;
+        let mut runs = HashSet::new();
+        visit_legacy_values(&legacy, "runs", |value| {
+            let Some(id) = legacy_id(&value, "id") else {
+                return Ok(());
+            };
+            let status = match legacy_text(&value, "status").as_deref() {
+                Some("completed") => "completed",
+                Some("abandoned") => "abandoned",
+                _ => "active",
+            };
+            let objective =
+                legacy_required_text(&value, "objective", MAX_RUN_OBJECTIVE_BYTES, "Imported run");
+            let coordinator = legacy_id(&value, "coordinatorSessionId");
+            let automation = legacy_automation(&value, now);
+            let graph_revision = legacy_nonnegative(&value, "graphRevision", 0);
+            let created_at = legacy_nonnegative(&value, "createdAt", now);
+            let updated_at = legacy_nonnegative(&value, "updatedAt", created_at);
+            if tx.execute(
+                "INSERT OR IGNORE INTO orch_runs(id,objective,status,coordinator_session_id,automation,graph_revision,created_at,updated_at) \
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![id, objective, status, coordinator, automation, graph_revision, created_at, updated_at],
+            )? > 0 {
+                runs.insert(id);
+                imported += 1;
+            }
+            Ok(())
+        })?;
+        let mut tasks: HashMap<String, String> = HashMap::new();
+        let mut task_deps: HashMap<String, Vec<String>> = HashMap::new();
+        let mut task_candidates: HashMap<String, String> = HashMap::new();
+        visit_legacy_values(&legacy, "tasks", |value| {
+            if let (Some(id), Some(run_id)) = (legacy_id(&value, "id"), legacy_id(&value, "runId"))
+                && runs.contains(&run_id)
+            {
+                task_candidates.insert(id, run_id);
+            }
+            Ok(())
+        })?;
+        visit_legacy_values(&legacy, "tasks", |value| {
+            let Some(id) = legacy_id(&value, "id") else {
+                return Ok(());
+            };
+            let Some(run_id) = legacy_id(&value, "runId") else {
+                return Ok(());
+            };
+            if !runs.contains(&run_id) {
+                return Ok(());
+            }
+            let status = match legacy_text(&value, "status").as_deref() {
+                Some("dispatched") => "dispatched",
+                Some("blocked") => "blocked",
+                Some("done") => "done",
+                Some("failed") => "failed",
+                Some("cancelled") => "cancelled",
+                _ => "pending",
+            };
+            let title =
+                legacy_required_text(&value, "title", MAX_TASK_TITLE_BYTES, "Imported task");
+            let spec = legacy_required_text(&value, "spec", MAX_TASK_SPEC_BYTES, " ");
+            let skills = serde_json::to_string(&legacy_skills(&value))?;
+            let parent_id =
+                legacy_id(&value, "parentId").filter(|id| task_candidates.get(id) == Some(&run_id));
+            let result = legacy_optional_text(&value, "result", MAX_TASK_RESULT_BYTES);
+            let created_at = legacy_nonnegative(&value, "createdAt", now);
+            let updated_at = legacy_nonnegative(&value, "updatedAt", created_at);
+            if tx.execute(
+                "INSERT OR IGNORE INTO orch_tasks(id,run_id,title,spec,skills,parent_id,status,result,created_at,updated_at) \
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                params![id, run_id, title, spec, skills, parent_id, status, result, created_at, updated_at],
+            )? > 0 {
+                tasks.insert(id.clone(), run_id);
+                task_deps.insert(id, legacy_ids(&value, "deps"));
+                imported += 1;
+            }
+            Ok(())
+        })?;
+        for (task_id, dep_id) in legacy_deps {
+            if let Some(list) = task_deps.get_mut(&task_id)
+                && !list.iter().any(|existing| existing == &dep_id)
+            {
+                list.push(dep_id);
+            }
+        }
+        for (task_id, deps) in task_deps {
+            let Some(run_id) = tasks.get(&task_id) else {
+                continue;
+            };
+            let mut seen = HashSet::new();
+            for (position, dep_id) in deps
+                .into_iter()
+                .filter(|dep| tasks.get(dep) == Some(run_id))
+                .enumerate()
+            {
+                if !seen.insert(dep_id.clone()) {
+                    continue;
+                }
+                tx.execute(
+                    "INSERT OR IGNORE INTO orch_task_deps(run_id,task_id,dep_id,position) VALUES(?1,?2,?3,?4)",
+                    params![run_id, task_id, dep_id, position as i64],
+                )?;
+            }
+        }
+        visit_legacy_values(&legacy, "dispatches", |value| {
+            let Some(id) = legacy_id(&value, "id") else {
+                return Ok(());
+            };
+            let Some(run_id) = legacy_id(&value, "runId") else {
+                return Ok(());
+            };
+            let Some(task_id) = legacy_id(&value, "taskId") else {
+                return Ok(());
+            };
+            let Some(session_id) = legacy_id(&value, "sessionId") else {
+                return Ok(());
+            };
+            if !runs.contains(&run_id) || tasks.get(&task_id) != Some(&run_id) {
+                return Ok(());
+            }
+            let state = match legacy_text(&value, "state").as_deref() {
+                Some("running") => "running",
+                Some("succeeded") => "succeeded",
+                Some("failed") => "failed",
+                Some("abandoned") => "abandoned",
+                _ => "starting",
+            };
+            let outcome = legacy_optional_text(&value, "outcome", MAX_TASK_RESULT_BYTES);
+            let started_at = legacy_nonnegative(&value, "startedAt", now);
+            let settled_at = legacy_optional_nonnegative(&value, "settledAt");
+            let worktree_path =
+                legacy_optional_text(&value, "worktreePath", MAX_WORKTREE_PATH_BYTES);
+            if tx.execute(
+                "INSERT OR IGNORE INTO orch_dispatches(id,run_id,task_id,session_id,state,outcome,started_at,settled_at,worktree_path) \
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![id, run_id, task_id, session_id, state, outcome, started_at, settled_at, worktree_path],
+            )? > 0 {
+                imported += 1;
+            }
+            Ok(())
+        })?;
+        visit_legacy_values(&legacy, "gates", |value| {
+            let Some(id) = legacy_id(&value, "id") else {
+                return Ok(());
+            };
+            let Some(run_id) = legacy_id(&value, "runId") else {
+                return Ok(());
+            };
+            if !runs.contains(&run_id) {
+                return Ok(());
+            }
+            let task_id = legacy_id(&value, "taskId").filter(|id| tasks.get(id) == Some(&run_id));
+            let status = match legacy_text(&value, "status").as_deref() {
+                Some("resolved") => "resolved",
+                Some("cancelled") => "cancelled",
+                _ => "pending",
+            };
+            let question =
+                legacy_required_text(&value, "question", MAX_RUN_OBJECTIVE_BYTES, "Imported gate");
+            let options =
+                serde_json::to_string(&legacy_string_array(&value, "options", 1000, 100))?;
+            let decision = legacy_optional_text(&value, "decision", MAX_RUN_OBJECTIVE_BYTES);
+            let created_at = legacy_nonnegative(&value, "createdAt", now);
+            let resolved_at = legacy_optional_nonnegative(&value, "resolvedAt");
+            if tx.execute(
+                "INSERT OR IGNORE INTO orch_gates(id,run_id,task_id,question,options,status,decision,created_at,resolved_at) \
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![id, run_id, task_id, question, options, status, decision, created_at, resolved_at],
+            )? > 0 {
+                imported += 1;
+            }
+            Ok(())
+        })?;
+        visit_legacy_values(&legacy, "messages", |value| {
+            let Some(id) = legacy_id(&value, "id") else {
+                return Ok(());
+            };
+            let Some(run_id) = legacy_id(&value, "runId") else {
+                return Ok(());
+            };
+            if !runs.contains(&run_id) {
+                return Ok(());
+            }
+            let sender = legacy_required_text(&value, "from", 128, "legacy");
+            let recipient = legacy_required_text(&value, "to", 128, "human");
+            let kind = match legacy_text(&value, "type").as_deref() {
+                Some("ask") => "ask",
+                Some("reply") => "reply",
+                Some("report") => "report",
+                _ => "note",
+            };
+            let subject = legacy_required_text(&value, "subject", 1024, "Imported message");
+            let body = legacy_required_text(&value, "body", MAX_MESSAGE_PART_BYTES, " ");
+            let thread_id = legacy_id(&value, "threadId");
+            let task_id = legacy_id(&value, "taskId").filter(|id| tasks.get(id) == Some(&run_id));
+            let created_at = legacy_nonnegative(&value, "createdAt", now);
+            let read_at = legacy_optional_nonnegative(&value, "readAt");
+            let answered_at = legacy_optional_nonnegative(&value, "answeredAt");
+            if tx.execute(
+                "INSERT OR IGNORE INTO orch_messages(id,run_id,sender,recipient,kind,subject,body,thread_id,task_id,created_at,read_at,answered_at) \
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                params![id, run_id, sender, recipient, kind, subject, body, thread_id, task_id, created_at, read_at, answered_at],
+            )? > 0 {
+                imported += 1;
+            }
+            Ok(())
+        })?;
+        visit_legacy_values(&legacy, "worktreeAssets", |value| {
+            let Some(id) = legacy_id(&value, "id") else {
+                return Ok(());
+            };
+            let Some(run_id) = legacy_id(&value, "runId") else {
+                return Ok(());
+            };
+            let Some(path) = legacy_text(&value, "path") else {
+                return Ok(());
+            };
+            let kind = match legacy_text(&value, "kind").as_deref() {
+                Some("run") => "run",
+                _ => "worker",
+            };
+            let state = match legacy_text(&value, "state").as_deref() {
+                Some("active") => "active",
+                Some("missing") => "missing",
+                Some("dirty") => "dirty",
+                Some("unmerged") => "unmerged",
+                Some("equivalent") => "equivalent",
+                Some("safe_to_clean") => "safe_to_clean",
+                Some("cleaned") => "cleaned",
+                Some("unknown") => "unknown",
+                _ => "preserved",
+            };
+            let repo = legacy_optional_text(&value, "repo", MAX_WORKTREE_PATH_BYTES)
+                .unwrap_or_else(|| truncate_text(&path, MAX_WORKTREE_PATH_BYTES, " "));
+            let task_id = legacy_id(&value, "taskId");
+            let dispatch_id = legacy_id(&value, "dispatchId");
+            let branch = legacy_optional_text(&value, "branch", MAX_BRANCH_BYTES);
+            let created_at = legacy_nonnegative(&value, "createdAt", now);
+            let updated_at = legacy_nonnegative(&value, "updatedAt", created_at);
+            let run_deleted_at = legacy_optional_nonnegative(&value, "runDeletedAt");
+            let inspection = legacy_optional_json(&value, "lastInspection", 32768);
+            let cleanup = legacy_optional_json(&value, "cleanup", 32768);
+            let last_error = legacy_optional_text(&value, "lastError", MAX_TASK_RESULT_BYTES);
+            if tx.execute(
+                "INSERT OR IGNORE INTO orch_worktree_assets \
+                 (id,kind,run_id,task_id,dispatch_id,repo,path,branch,state,created_at,updated_at,run_deleted_at,last_inspection,cleanup,last_error) \
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                params![id, kind, run_id, task_id, dispatch_id, repo, truncate_text(&path, MAX_WORKTREE_PATH_BYTES, " "), branch, state, created_at, updated_at, run_deleted_at, inspection, cleanup, last_error],
+            )? > 0 {
+                imported += 1;
+            }
+            Ok(())
+        })?;
+        tx.commit()?;
+        Ok(imported)
+    }
+
     // ── Runs ─────────────────────────────────────────────────────────────
 
     pub fn list_runs(&self) -> Result<Vec<Run>> {

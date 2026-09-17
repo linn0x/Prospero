@@ -604,58 +604,69 @@ async fn consume_event(
                 finite(data.get("turn").unwrap_or(&Value::Null)).unwrap_or(*current_turn + 1);
             text_by_message.clear();
         }
-        "assistant/chunk" => {
+        "assistant/chunk" | "assistant/delta" | "message/delta" => {
             let chunk = data.get("chunk").cloned().unwrap_or_else(|| json!({}));
             let message_id = message_id(&data, *current_turn);
             let entry = text_by_message.entry(message_id).or_default();
-            match chunk.get("type").and_then(Value::as_str) {
-                Some("text-delta") => {
-                    if let Some(text) = chunk.get("text").and_then(Value::as_str)
-                        && !text.is_empty()
-                    {
-                        entry.0.push_str(text);
-                        let _ = events
-                            .send(AdapterEvent::Text {
-                                subagent: None,
-                                text: entry.0.clone(),
-                            })
-                            .await;
-                    }
-                }
-                Some("reasoning-delta") => {
-                    if let Some(text) = chunk.get("text").and_then(Value::as_str)
-                        && !text.is_empty()
-                    {
-                        entry.1.push_str(text);
-                        let _ = events
-                            .send(AdapterEvent::Thinking {
-                                subagent: None,
-                                text: entry.1.clone(),
-                            })
-                            .await;
-                    }
-                }
-                _ => {}
+            let chunk_type = chunk
+                .get("type")
+                .or_else(|| data.get("deltaType"))
+                .or_else(|| data.get("kind"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let delta = chunk
+                .get("text")
+                .or_else(|| chunk.get("content"))
+                .or_else(|| data.get("text"))
+                .or_else(|| data.get("delta"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if matches!(
+                chunk_type,
+                "" | "text-delta" | "text_delta" | "output_text_delta" | "content_delta"
+            ) && !delta.is_empty()
+            {
+                entry.0.push_str(delta);
+                let _ = events
+                    .send(AdapterEvent::Text {
+                        subagent: None,
+                        text: entry.0.clone(),
+                    })
+                    .await;
+            } else if matches!(chunk_type, "reasoning-delta" | "reasoning_delta")
+                && !delta.is_empty()
+            {
+                entry.1.push_str(delta);
+                let _ = events
+                    .send(AdapterEvent::Thinking {
+                        subagent: None,
+                        text: entry.1.clone(),
+                    })
+                    .await;
             }
         }
-        "assistant/message" => {
+        "assistant/message" | "assistant/final" | "message" => {
             let turn = finite(data.get("turn").unwrap_or(&Value::Null)).unwrap_or(*current_turn);
             let message_id = message_id(&data, *current_turn);
+            let message = data.get("message").cloned().unwrap_or_else(|| json!({}));
             let assembled = assistant_content(
-                data.get("message")
-                    .and_then(|message| message.get("content"))
+                record(&message)
+                    .get("content")
+                    .or_else(|| record(&message).get("text"))
+                    .or_else(|| record(&message).get("output_text"))
+                    .or_else(|| data.get("content"))
+                    .or_else(|| data.get("text"))
+                    .or_else(|| data.get("output_text"))
                     .unwrap_or(&Value::Null),
             );
             let streamed = text_by_message.entry(message_id).or_default();
             if !assembled.1.is_empty() && assembled.1 != streamed.1 {
-                if !assembled.1.is_empty() {
-                    let _ = events
-                        .send(AdapterEvent::Thinking {
-                            subagent: None,
-                            text: assembled.1.clone(),
-                        })
-                        .await;
-                }
+                let _ = events
+                    .send(AdapterEvent::Thinking {
+                        subagent: None,
+                        text: assembled.1.clone(),
+                    })
+                    .await;
                 streamed.1 = assembled.1;
             }
             if !assembled.0.is_empty() && assembled.0 != streamed.0 {
@@ -850,6 +861,7 @@ fn message_id(data: &Value, current_turn: i64) -> String {
         .get("message")
         .and_then(|message| message.get("id"))
         .and_then(Value::as_str)
+        .or_else(|| data.get("id").and_then(Value::as_str))
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(|| {
@@ -872,9 +884,11 @@ fn content_text(value: &Value) -> String {
         .filter_map(|item| {
             let item = record(item);
             match item.get("type").and_then(Value::as_str) {
-                Some("text") | Some("reasoning") => {
-                    item.get("text").and_then(Value::as_str).map(str::to_owned)
-                }
+                Some("text") | Some("output_text") | Some("reasoning") => item
+                    .get("text")
+                    .or_else(|| item.get("content"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 Some("tool-result") => {
                     Some(content_text(item.get("content").unwrap_or(&Value::Null)))
                 }
@@ -887,6 +901,9 @@ fn content_text(value: &Value) -> String {
 }
 
 fn assistant_content(value: &Value) -> (String, String) {
+    if let Some(text) = value.as_str() {
+        return (text.to_owned(), String::new());
+    }
     let Some(items) = value.as_array() else {
         return (String::new(), String::new());
     };
@@ -894,14 +911,18 @@ fn assistant_content(value: &Value) -> (String, String) {
     let mut reasoning = Vec::new();
     for item in items {
         let item = record(item);
+        let value = item
+            .get("text")
+            .or_else(|| item.get("content"))
+            .and_then(Value::as_str);
         match item.get("type").and_then(Value::as_str) {
-            Some("text") => {
-                if let Some(value) = item.get("text").and_then(Value::as_str) {
+            Some("text") | Some("output_text") => {
+                if let Some(value) = value {
                     text.push(value.to_owned());
                 }
             }
             Some("reasoning") => {
-                if let Some(value) = item.get("text").and_then(Value::as_str) {
+                if let Some(value) = value {
                     reasoning.push(value.to_owned());
                 }
             }
@@ -1557,6 +1578,108 @@ mod tests {
             AdapterEvent::Finish {
                 input_tokens: Some(3),
                 output_tokens: Some(5),
+                error: None,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn accepts_alternate_assistant_message_and_delta_shapes() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut current_turn = 0;
+        let mut text_by_message = HashMap::new();
+        let mut usage_by_turn = HashMap::new();
+        let mut tool_names = HashMap::new();
+
+        assert!(
+            !consume_event(
+                &tx,
+                &mut current_turn,
+                &mut text_by_message,
+                &mut usage_by_turn,
+                &mut tool_names,
+                json!({"type":"turn/start","data":{"turn":4}})
+            )
+            .await
+        );
+        assert!(
+            !consume_event(
+                &tx,
+                &mut current_turn,
+                &mut text_by_message,
+                &mut usage_by_turn,
+                &mut tool_names,
+                json!({"type":"assistant/delta","data":{"turn":4,"step":0,"chunk":{"type":"text_delta","content":"stream"}}})
+            )
+            .await
+        );
+        assert!(
+            !consume_event(
+                &tx,
+                &mut current_turn,
+                &mut text_by_message,
+                &mut usage_by_turn,
+                &mut tool_names,
+                json!({"type":"message/delta","data":{"turn":4,"step":0,"deltaType":"reasoning_delta","delta":"think"}})
+            )
+            .await
+        );
+        assert!(
+            !consume_event(
+                &tx,
+                &mut current_turn,
+                &mut text_by_message,
+                &mut usage_by_turn,
+                &mut tool_names,
+                json!({"type":"assistant/final","data":{"turn":4,"step":0,"message":{"id":"assistant-alt","content":[{"type":"reasoning","content":"final thought"},{"type":"output_text","content":"final answer"}]},"usage":{"inputTokens":11,"outputTokens":7}}})
+            )
+            .await
+        );
+        assert!(
+            !consume_event(
+                &tx,
+                &mut current_turn,
+                &mut text_by_message,
+                &mut usage_by_turn,
+                &mut tool_names,
+                json!({"type":"message","data":{"turn":4,"step":0,"id":"plain-id","output_text":"plain answer","usage":{"inputTokens":1,"outputTokens":2}}})
+            )
+            .await
+        );
+        assert!(
+            consume_event(
+                &tx,
+                &mut current_turn,
+                &mut text_by_message,
+                &mut usage_by_turn,
+                &mut tool_names,
+                json!({"type":"turn/end","data":{"turn":4,"reason":{"kind":"completed"}}})
+            )
+            .await
+        );
+        drop(tx);
+
+        assert!(
+            matches!(rx.recv().await.unwrap(), AdapterEvent::Text { text, .. } if text == "stream")
+        );
+        assert!(
+            matches!(rx.recv().await.unwrap(), AdapterEvent::Thinking { text, .. } if text == "think")
+        );
+        assert!(
+            matches!(rx.recv().await.unwrap(), AdapterEvent::Thinking { text, .. } if text == "final thought")
+        );
+        assert!(
+            matches!(rx.recv().await.unwrap(), AdapterEvent::Text { text, .. } if text == "final answer")
+        );
+        assert!(
+            matches!(rx.recv().await.unwrap(), AdapterEvent::Text { text, .. } if text == "plain answer")
+        );
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            AdapterEvent::Finish {
+                input_tokens: Some(12),
+                output_tokens: Some(9),
                 error: None,
                 ..
             }

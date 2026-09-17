@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use super::profile::{ApiProfile, clean_headers};
 use crate::error::{Error, Result};
+use crate::protocol::AgentKind;
 
 const MAX_REGISTRY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SOURCES: usize = 100;
@@ -128,7 +129,6 @@ fn supported_protocol(protocol: &str) -> bool {
 fn agent_for_protocol(protocol: &str) -> &'static str {
     match protocol {
         "anthropic" => "claude",
-        "openai_chat_completions" => "opencode",
         _ => "codex",
     }
 }
@@ -434,6 +434,7 @@ pub(crate) enum SourceAction {
         #[serde(rename = "routeId")]
         route_id: String,
         revision: i64,
+        agent: Option<AgentKind>,
     },
     #[serde(rename = "migration.preview")]
     MigrationPreview,
@@ -1052,18 +1053,28 @@ impl ModelSources {
         source_id: &str,
         route_id: &str,
         revision: i64,
+        agent: Option<AgentKind>,
         known_accounts: &std::collections::HashSet<String>,
+        account_agents: &std::collections::HashMap<String, AgentKind>,
     ) -> Result<BindOutcome> {
         let bound = self.require_source(source_id, revision)?;
+        let route = bound
+            .routes
+            .iter()
+            .find(|route| route.id == route_id)
+            .ok_or(Error::NotFound)?;
+        let agent = agent.unwrap_or_else(|| agent_for_route(route));
+        let resolved = self.resolve_route(source_id, route_id, revision)?;
+        super::managed::validate_profile_agent(agent, &resolved.profile)?;
         if let Some(binding) = self.registry.bindings.iter().find(|binding| {
             binding.source_id == source_id
                 && binding.route_id == route_id
                 && binding.revision == revision
                 && known_accounts.contains(&binding.account_id)
+                && account_agents.get(&binding.account_id) == Some(&agent)
         }) {
             return Ok(BindOutcome::Existing(binding.account_id.clone()));
         }
-        let resolved = self.resolve_route(source_id, route_id, revision)?;
         if resolved
             .profile
             .model_capabilities
@@ -1097,6 +1108,7 @@ impl ModelSources {
         self.save()?;
         Ok(BindOutcome::Created {
             account_id,
+            agent,
             profile: resolved.profile,
             name: resolved.account_name.chars().take(80).collect(),
             secret: resolved.secret,
@@ -1422,11 +1434,19 @@ impl ModelSources {
     }
 }
 
+fn agent_for_route(route: &SourceRoute) -> AgentKind {
+    match route.protocol.as_str() {
+        "anthropic" => AgentKind::Claude,
+        _ => AgentKind::Codex,
+    }
+}
+
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum BindOutcome {
     Existing(String),
     Created {
         account_id: String,
+        agent: AgentKind,
         profile: ApiProfile,
         name: String,
         secret: String,

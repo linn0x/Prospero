@@ -459,6 +459,8 @@ async fn worker_start_is_idempotent_and_stop_preserves_the_tree() {
         &agents,
         StartWorker {
             agent: AgentKind::Claude,
+            kind: None,
+            skills: vec![],
             approval_policy: None,
             account_id: None,
             task_id: task_id.clone(),
@@ -495,6 +497,8 @@ async fn worker_start_is_idempotent_and_stop_preserves_the_tree() {
         &agents,
         StartWorker {
             agent: AgentKind::Claude,
+            kind: None,
+            skills: vec![],
             approval_policy: None,
             account_id: None,
             task_id: task_id.clone(),
@@ -638,6 +642,8 @@ async fn opencode_worker_requires_chat_completions_profile() {
         &agents,
         StartWorker {
             agent: AgentKind::Opencode,
+            kind: None,
+            skills: vec![],
             approval_policy: None,
             account_id: None,
             task_id: task_id.clone(),
@@ -685,6 +691,8 @@ async fn worker_expands_bound_skill_into_the_delivered_brief() {
         &agents,
         StartWorker {
             agent: AgentKind::Claude,
+            kind: None,
+            skills: vec![],
             approval_policy: None,
             account_id: None,
             task_id: task_id.clone(),
@@ -782,6 +790,8 @@ async fn worker_rejects_undeclared_skill_mention_and_preserves_the_tree() {
         &agents,
         StartWorker {
             agent: AgentKind::Claude,
+            kind: None,
+            skills: vec![],
             approval_policy: None,
             account_id: None,
             task_id: task_id.clone(),
@@ -843,6 +853,8 @@ async fn worker_rejects_missing_bound_skill_and_preserves_the_tree() {
         &agents,
         StartWorker {
             agent: AgentKind::Claude,
+            kind: None,
+            skills: vec![],
             approval_policy: None,
             account_id: None,
             task_id: task_id.clone(),

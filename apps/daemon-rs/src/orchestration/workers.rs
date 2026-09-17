@@ -7,9 +7,6 @@
 //!
 //! * only structured Claude/Codex/DeepSeek/OpenCode workers are launched (other agents/PTYs
 //!   stay explicitly unbridged and the desktop rejects them with "尚未接入");
-//! * there is no `prospero` CLI in Rust mode, so the worker cannot self-deliver
-//!   `task done/fail`. Delivery is a manual desktop action against the
-//!   `/dispatches/:id/settle` route; the worker prompt says so.
 //!
 //! Worktree safety is unchanged: directories are registered before the worker
 //! session exists, preserved on every settle/stop/run outcome, and only removed
@@ -42,11 +39,6 @@ fn to_base36(mut value: u128) -> String {
     String::from_utf8(out).unwrap_or_default()
 }
 
-/// Adapted worker brief. Without the `prospero` CLI there is no self-delivery;
-/// the operator records the result manually, which the final line makes
-/// explicit so the worker does not invent a command. Bound skills are listed
-/// as `$name` mentions; the agent send path expands them against the worker
-/// cwd into full SKILL.md contents (same portable-skill flow as the composer).
 fn worker_prompt(
     task: &Task,
     session_id: &str,
@@ -73,9 +65,14 @@ fn worker_prompt(
     }
     lines.push(format!("要求:\n{}", task.spec));
     lines.extend([
-        "完成并自行验证后，在最终回复中给出简短交付摘要（改了什么、如何验证）；".to_string(),
-        "当前 Rust 模式没有 prospero CLI，请勿伪造命令；由操作者在 Prospero 界面对任务做人工交付（完成/失败）。".to_string(),
-        "如果无法完成，在最终回复中说明原因与下一步，由操作者标记失败。".to_string(),
+        format!(
+            "完成并自行验证后，运行 `prospero task done --id {} --body <交付摘要>`。",
+            task.id
+        ),
+        format!(
+            "如果无法完成，运行 `prospero task fail --id {} --body <原因>`。",
+            task.id
+        ),
         "仅停止、空闲或退出不会把任务标记为完成。".to_string(),
     ]);
     lines.join("\n")
@@ -104,6 +101,11 @@ pub async fn start_worker(
         "none" => "none",
         _ => return Err(Error::Invalid("worktree must be new or none".into())),
     };
+    if let Some(kind) = input.kind.as_deref()
+        && kind != "structured"
+    {
+        return Err(Error::Invalid("Rust worker 当前仅支持 structured".into()));
+    }
     if !matches!(
         input.agent,
         crate::protocol::AgentKind::Claude
@@ -267,7 +269,11 @@ pub async fn start_worker(
     let skill_names = {
         let worker_cwd = worker_cwd.clone();
         let spec = task.spec.clone();
-        let requested = task.skills.clone();
+        let requested = if input.skills.is_empty() {
+            task.skills.clone()
+        } else {
+            input.skills.clone()
+        };
         match tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
             crate::skills::assert_mentions_bound(&spec, &requested)?;
             let resolved = crate::skills::resolve_explicit_skills(&worker_cwd, &requested)?;

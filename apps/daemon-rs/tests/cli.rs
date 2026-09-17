@@ -1,4 +1,6 @@
-use std::process::Command;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
+use std::process::{Child, ChildStdout, Command, Stdio};
 
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
@@ -12,12 +14,52 @@ fn run(home: &tempfile::TempDir, args: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
+fn run_at(binary: &str, home: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(binary)
+        .args(args)
+        .env("PROSPERO_HOME", home)
+        .output()
+        .unwrap()
+}
+
 fn text(output: &std::process::Output) -> String {
     format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )
+}
+
+struct DaemonGuard {
+    child: Child,
+    _stdout: BufReader<ChildStdout>,
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn serve(home: &Path, codex_home: &Path) -> DaemonGuard {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_prosperod-rs"))
+        .args(["serve", "--data-dir", home.to_str().unwrap()])
+        .env("CODEX_HOME", codex_home)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let ready: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(ready["event"], "ready");
+    DaemonGuard {
+        child,
+        _stdout: reader,
+    }
 }
 
 fn pair_payload(output: &str) -> Value {
@@ -135,4 +177,99 @@ fn cli_notify_configures_and_clears_endpoint() {
         serde_json::from_str(&std::fs::read_to_string(home.path().join("config.json")).unwrap())
             .unwrap();
     assert!(config.get("notify").is_none());
+}
+
+#[test]
+fn cli_plugin_and_schedule_commands_use_running_rust_daemon() {
+    let home = tempfile::TempDir::new().unwrap();
+    let codex_home = home.path().join("codex-home");
+    let workspace = home.path().join("workspace");
+    let plugin_root = home.path().join("plugins/prospero-demo/runtime");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&plugin_root).unwrap();
+    std::fs::write(
+        plugin_root.join("service.mjs"),
+        "setInterval(() => {}, 1000);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        home.path()
+            .join("plugins/prospero-demo/prospero-plugin.json"),
+        serde_json::json!({
+            "schema_version": "prospero-plugin/v1",
+            "name": "prospero-demo",
+            "services": [{
+                "id": "bridge",
+                "mode": "manual",
+                "command": ["node", "service.mjs"],
+                "cwd": "runtime",
+                "env": {"FEATURE_FLAG": "1"},
+                "port_env": "PORT",
+                "health_path": "/health"
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let _daemon = serve(home.path(), &codex_home);
+
+    let plugins = run_at(
+        env!("CARGO_BIN_EXE_prosperod-rs"),
+        home.path(),
+        &["plugin", "list", "--home", home.path().to_str().unwrap()],
+    );
+    assert!(plugins.status.success(), "{}", text(&plugins));
+    let body: Value = serde_json::from_slice(&plugins.stdout).unwrap();
+    assert_eq!(body["items"][0]["name"], "prospero-demo");
+
+    let created = run_at(
+        env!("CARGO_BIN_EXE_prospero"),
+        home.path(),
+        &[
+            "--home",
+            home.path().to_str().unwrap(),
+            "schedule",
+            "create",
+            "--id",
+            "daily-check",
+            "--name",
+            "Daily check",
+            "--prompt",
+            "Check the repo",
+            "--rrule",
+            "FREQ=DAILY",
+            "--cwd",
+            workspace.to_str().unwrap(),
+            "--paused",
+        ],
+    );
+    assert!(created.status.success(), "{}", text(&created));
+    let body: Value = serde_json::from_slice(&created.stdout).unwrap();
+    assert_eq!(body["id"], "daily-check");
+    assert_eq!(body["status"], "PAUSED");
+
+    let list = run_at(
+        env!("CARGO_BIN_EXE_prospero"),
+        home.path(),
+        &["--home", home.path().to_str().unwrap(), "schedule", "list"],
+    );
+    assert!(list.status.success(), "{}", text(&list));
+    let body: Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(body.as_array().unwrap().len(), 1);
+
+    let deleted = run_at(
+        env!("CARGO_BIN_EXE_prospero"),
+        home.path(),
+        &[
+            "--home",
+            home.path().to_str().unwrap(),
+            "schedule",
+            "delete",
+            "--id",
+            "daily-check",
+        ],
+    );
+    assert!(deleted.status.success(), "{}", text(&deleted));
+    let body: Value = serde_json::from_slice(&deleted.stdout).unwrap();
+    assert_eq!(body["deleted"], true);
 }

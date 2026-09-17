@@ -291,6 +291,8 @@ pub async fn tick_automation(database: &Database, agents: &Agents, run_id: &str)
         agent: automation.agent,
         cwd: automation.workspace_path.clone(),
         worktree: "none".into(),
+        kind: Some("structured".into()),
+        skills: Vec::new(),
         approval_policy: Some(automation.approval_policy.clone()),
         account_id: automation.account_id.clone(),
         operation_id: Some(format!("automation-{run_id}-{}", next.id)),

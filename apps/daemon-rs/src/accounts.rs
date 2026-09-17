@@ -358,6 +358,15 @@ fn codex_capabilities() -> AccountCapabilities {
     }
 }
 
+pub(crate) fn parse_code_agent(value: &str) -> Result<crate::protocol::AgentKind> {
+    match value {
+        "claude" => Ok(crate::protocol::AgentKind::Claude),
+        "codex" => Ok(crate::protocol::AgentKind::Codex),
+        "opencode" => Ok(crate::protocol::AgentKind::Opencode),
+        _ => Err(crate::error::Error::Invalid("Agent 不支持账号隔离".into())),
+    }
+}
+
 async fn probe_codex_status(data: &std::path::Path) -> AuthProbe {
     let (cwd, environment) = match crate::agent::native_codex_environment(data) {
         Ok(value) => value,
@@ -600,12 +609,14 @@ async fn profile_row(
     let data = database.directory().to_owned();
     let id = record.id.clone();
     let secret_profile = profile.clone();
-    let secret =
-        tokio::task::spawn_blocking(move || managed::profile_secret(&data, &id, &secret_profile))
-            .await
-            .map_err(|_| crate::error::Error::Closed)??;
-    let profile_agent = profile::agent_kind(profile);
-    let runtime_ok = match profile_agent {
+    let account_agent = record.agent;
+    let secret = tokio::task::spawn_blocking(move || {
+        managed::profile_secret_for_agent(&data, &id, account_agent, &secret_profile)
+    })
+    .await
+    .map_err(|_| crate::error::Error::Closed)??;
+    let engine_agent = engine_agent(record.agent, profile);
+    let runtime_ok = match engine_agent {
         crate::protocol::AgentKind::Opencode => opencode_runtime_ok,
         crate::protocol::AgentKind::Codex => codex_runtime_ok,
         _ => claude_runtime_ok,
@@ -616,9 +627,9 @@ async fn profile_row(
             None,
             Some(format!(
                 "{} CLI 不可用",
-                if profile_agent == crate::protocol::AgentKind::Opencode {
+                if engine_agent == crate::protocol::AgentKind::Opencode {
                     "opencode"
-                } else if profile_agent == crate::protocol::AgentKind::Codex {
+                } else if engine_agent == crate::protocol::AgentKind::Codex {
                     "codex"
                 } else {
                     "claude"
@@ -656,19 +667,19 @@ async fn profile_row(
         .api_profile
         .as_ref()
         .and_then(profile::capability_support);
-    let engine = match profile_agent {
+    let engine = match engine_agent {
         crate::protocol::AgentKind::Codex => "codex",
         crate::protocol::AgentKind::Opencode => "opencode",
         _ => "claude",
     };
-    let capabilities = if profile_agent == crate::protocol::AgentKind::Opencode {
+    let capabilities = if engine_agent == crate::protocol::AgentKind::Opencode {
         opencode_profile_capabilities()
     } else {
         profile_capabilities()
     };
     Ok(NativeAccount {
         id: record.id,
-        agent: profile_agent,
+        agent: record.agent,
         name: record.name,
         managed: true,
         is_default: record.is_default,
@@ -686,6 +697,17 @@ async fn profile_row(
         updated_at: record.updated_at,
         active_sessions,
     })
+}
+
+fn engine_agent(
+    agent: crate::protocol::AgentKind,
+    profile: &ApiProfile,
+) -> crate::protocol::AgentKind {
+    if profile.protocol() == "openai_chat_completions" {
+        crate::protocol::AgentKind::Opencode
+    } else {
+        agent
+    }
 }
 
 /// The native row plus every managed row, status freshly probed.
@@ -870,6 +892,7 @@ pub(crate) async fn execute_control(
             model_capabilities,
             ..
         } => {
+            let agent_kind = parse_code_agent(agent)?;
             let profile = profile::clean_profile_inputs(
                 agent,
                 base_url,
@@ -883,8 +906,8 @@ pub(crate) async fn execute_control(
             let secret = api_key.clone();
             let id = db
                 .call(move |store| {
-                    let record =
-                        store.create_api_profile_account(&data, &name, &profile, &secret)?;
+                    let record = store
+                        .create_api_profile_account(&data, &name, agent_kind, &profile, &secret)?;
                     Ok(record.id)
                 })
                 .await?;
