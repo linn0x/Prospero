@@ -50,6 +50,14 @@ if (!existsSync(rustBinary)) {
 }
 copyFileSync(rustBinary, stagedRustBinary);
 chmodSync(stagedRustBinary, 0o755);
+const launchAgentInstaller = path.join(appRoot, "scripts", "install-rust-daemon-launchagent.mjs");
+const stagedLaunchAgentInstaller = path.join(runtimeRoot, "install-rust-daemon-launchagent.mjs");
+copyFileSync(launchAgentInstaller, stagedLaunchAgentInstaller);
+chmodSync(stagedLaunchAgentInstaller, 0o755);
+const launchAgentShellInstaller = path.join(appRoot, "scripts", "install-rust-daemon-launchagent.sh");
+const stagedLaunchAgentShellInstaller = path.join(runtimeRoot, "install-rust-daemon-launchagent.sh");
+copyFileSync(launchAgentShellInstaller, stagedLaunchAgentShellInstaller);
+chmodSync(stagedLaunchAgentShellInstaller, 0o755);
 
 const npmCache = path.join(repoRoot, ".npm-cache");
 // windows-native 是 daemon 的硬依赖,即使在 macOS 上用不到也要能解析,

@@ -41,6 +41,7 @@ function checkRuntimeArchitecture(context) {
     if (!existsSync(rust)) throw new Error('Rust daemon binary is missing from .runtime. Run scripts/prepare-runtime.mjs after cargo build --release -p prosperod-rs.');
     const actual = machoArchitecture(rust);
     if (actual !== expected) throw new Error(`macOS ${expected} package requires matching prosperod-rs. Build target/release/prosperod-rs for ${expected} first.`);
+    if (!existsSync(join(root, 'install-rust-daemon-launchagent.sh'))) throw new Error('macOS runtime is missing the Rust daemon LaunchAgent installer.');
     return;
   }
   if (context.electronPlatformName !== 'win32') return;

@@ -226,21 +226,25 @@ export class RustRuntime {
 
   start(): Promise<{ ok: boolean; error?: string }> {
     if (this.stopping) return this.stopping.then(() => this.start());
-    if (this.ready && this.managed) return Promise.resolve({ ok: true });
+    if (this.ready) return Promise.resolve({ ok: true });
     if (!this.starting) this.starting = this.launch().finally(() => { this.starting = undefined; });
     return this.starting;
   }
 
   private async launch(): Promise<{ ok: boolean; error?: string }> {
     this.controller = new AbortController();
-    this.store.setStartupProgress(10, "启动 Rust 服务");
+    this.store.setStartupProgress(8, "连接 Rust 服务");
     try {
-      this.connection = await this.process.start();
+      this.connection = await this.process.attach();
+      if (!this.connection) {
+        this.store.setStartupProgress(18, "启动 Rust 服务");
+        this.connection = await this.process.start();
+      }
       if (this.controller.signal.aborted) throw new Error("启动已取消");
       this.store.setStartupProgress(70, "读取会话摘要", this.connection.pid);
       await this.refresh();
       this.ready = true;
-      this.store.setManagedState(this.connection.pid, false);
+      this.store.setManagedState(this.managed ? this.connection.pid : undefined, false);
       this.schedule();
       return { ok: true };
     } catch {

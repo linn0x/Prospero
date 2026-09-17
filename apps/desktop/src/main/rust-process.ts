@@ -25,6 +25,19 @@ export class RustProcess {
 
   get managed(): boolean { return Boolean(this.child && this.child.exitCode === null && this.child.signalCode === null); }
 
+  async attach(timeoutMs = 2500): Promise<RustConnection | undefined> {
+    if (this.connection && this.managed) return this.connection;
+    try {
+      const connection = this.readConnectionFile();
+      const health = await connection.client.health(AbortSignal.timeout(timeoutMs));
+      if (health.apiVersion !== 1 || health.backend !== "rust") return undefined;
+      this.connection = connection;
+      return connection;
+    } catch {
+      return undefined;
+    }
+  }
+
   start(): Promise<RustConnection> {
     if (this.stopping) return this.stopping.then(() => this.start());
     if (this.connection && this.managed) return Promise.resolve(this.connection);
@@ -67,23 +80,33 @@ export class RustProcess {
         child.once("error", error); child.once("exit", exit);
         startup.signal.addEventListener("abort", abort, { once: true });
       });
-      const descriptor = openSync(resolve(this.directory, "connection.json"), constants.O_RDONLY | (process.platform === "win32" ? 0 : constants.O_NOFOLLOW));
-      let value: Record<string, unknown>;
-      try {
-        const stat = fstatSync(descriptor);
-        if (!stat.isFile() || stat.size > 4096 || stat.nlink !== 1 || (process.platform !== "win32" && ((stat.mode & 0o077) !== 0 || stat.uid !== process.getuid?.()))) throw new Error("Invalid Rust connection file");
-        value = JSON.parse(readFileSync(descriptor, "utf8")) as Record<string, unknown>;
-      } finally { closeSync(descriptor); }
-      if (value["apiVersion"] !== 1 || value["pid"] !== ready.pid || value["baseUrl"] !== ready.baseUrl || typeof value["token"] !== "string") throw new Error("Rust connection does not match the owned process");
-      const client = new RustClient(ready.baseUrl, value["token"]);
+      const connection = this.readConnectionFile(ready);
+      const client = connection.client;
       const health = await client.health(startup.signal);
       if (health.apiVersion !== 1 || health.backend !== "rust" || startup.signal.aborted || !this.managed) throw new Error("Rust health check failed");
-      this.connection = { client, ...ready };
+      this.connection = connection;
       return this.connection;
     } catch (error) {
       await this.stop();
       throw error;
     } finally { clearTimeout(timer); if (this.startup === startup) this.startup = undefined; }
+  }
+
+  private readConnectionFile(expected?: { pid: number; baseUrl: string }): RustConnection {
+    const descriptor = openSync(resolve(this.directory, "connection.json"), constants.O_RDONLY | (process.platform === "win32" ? 0 : constants.O_NOFOLLOW));
+    let value: Record<string, unknown>;
+    try {
+      const stat = fstatSync(descriptor);
+      if (!stat.isFile() || stat.size > 4096 || stat.nlink !== 1 || (process.platform !== "win32" && ((stat.mode & 0o077) !== 0 || stat.uid !== process.getuid?.()))) throw new Error("Invalid Rust connection file");
+      value = JSON.parse(readFileSync(descriptor, "utf8")) as Record<string, unknown>;
+    } finally { closeSync(descriptor); }
+    const pid = value["pid"];
+    const baseUrl = value["baseUrl"];
+    const token = value["token"];
+    if (value["apiVersion"] !== 1 || !Number.isInteger(pid) || typeof baseUrl !== "string" || typeof token !== "string") throw new Error("Invalid Rust connection file");
+    if (expected && (pid !== expected.pid || baseUrl !== expected.baseUrl)) throw new Error("Rust connection does not match the owned process");
+    try { process.kill(Number(pid), 0); } catch { throw new Error("Rust daemon is not running"); }
+    return { client: new RustClient(baseUrl, token), pid: Number(pid), baseUrl };
   }
 
   stop(): Promise<void> {
