@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import type { ChildProcess } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -17,6 +17,9 @@ function file(name: string, value = "") {
   mkdirSync(path.dirname(name), { recursive: true });
   writeFileSync(name, value);
   return name;
+}
+function real(file: string): string {
+  return realpathSync(file);
 }
 function install(base: string, arch = "x64", layout = "modern") {
   const root = path.join(base, "node_modules", "@openai", "codex");
@@ -43,8 +46,8 @@ describe("Windows Codex executable selection", () => {
     const pkg = install(base, arch);
     const env = { Path: `"${base}"`, CODEX_HOME: "selected-account" };
     const result = windowsCodexCommand(env, base, arch as NodeJS.Architecture);
-    expect(result.file).toBe(pkg.exe);
-    expect(result.env).toMatchObject({ CODEX_HOME: "selected-account", CODEX_MANAGED_PACKAGE_ROOT: pkg.root });
+    expect(result.file).toBe(real(pkg.exe));
+    expect(result.env).toMatchObject({ CODEX_HOME: "selected-account", CODEX_MANAGED_PACKAGE_ROOT: real(pkg.root) });
     expect(env).not.toHaveProperty("CODEX_MANAGED_PACKAGE_ROOT");
   });
 
@@ -55,8 +58,8 @@ describe("Windows Codex executable selection", () => {
     file(path.join(helpers, "rg.exe"));
     const env = { Path: base };
     const result = windowsCodexCommand(env, base, "x64");
-    expect(result.file).toBe(pkg.exe);
-    expect(result.env.Path).toBe(`${helpers};${base}`);
+    expect(result.file).toBe(real(pkg.exe));
+    expect(result.env.Path).toBe(`${real(helpers)};${base}`);
     expect(env.Path).toBe(base);
   });
 
@@ -65,7 +68,7 @@ describe("Windows Codex executable selection", () => {
     const pkg = install(base);
     const bin = path.join(base, "node_modules", ".bin");
     file(path.join(bin, "codex.cmd"), '@ECHO off\n"%~dp0\\..\\@openai\\codex\\bin\\codex.js" %*\n');
-    expect(windowsCodexCommand({ PATH: bin }, bin, "x64").file).toBe(pkg.exe);
+    expect(windowsCodexCommand({ PATH: bin }, bin, "x64").file).toBe(real(pkg.exe));
   });
 
   it("honors the first PATH shim instead of choosing an unrelated native installation", () => {

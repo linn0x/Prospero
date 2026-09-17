@@ -47,11 +47,16 @@ describe("runtime packaging guard", () => {
     writeFileSync(join(root, ".runtime", "package.json"), JSON.stringify({ prosperoRuntime: { architecture: "x64" } }));
     writeFileSync(join(root, ".runtime", "node", "node.exe"), pe(0x8664));
     writeFileSync(join(root, ".runtime", "prosperod-rs.exe"), pe(0x8664));
+    writeFileSync(join(root, ".runtime", "prospero.exe"), pe(0x8664));
     expect(() => runtimeCheck(context(root, "win32", 1))).not.toThrow();
     writeFileSync(join(root, ".runtime", "prosperod-rs.exe"), pe(0xaa64));
     expect(() => runtimeCheck(context(root, "win32", 1))).toThrow(/matching prosperod-rs.exe/);
+    writeFileSync(join(root, ".runtime", "prosperod-rs.exe"), pe(0x8664));
+    writeFileSync(join(root, ".runtime", "prospero.exe"), pe(0xaa64));
+    expect(() => runtimeCheck(context(root, "win32", 1))).toThrow(/matching prospero.exe/);
 
     writeFileSync(join(root, ".runtime", "prosperod-rs"), macho(0x0100000c));
+    writeFileSync(join(root, ".runtime", "prospero"), macho(0x0100000c));
     writeFileSync(join(root, ".runtime", "install-rust-daemon-launchagent.sh"), "");
     expect(runtimeCheck.machoArchitecture(join(root, ".runtime", "prosperod-rs"))).toBe("arm64");
     expect(() => runtimeCheck(context(root, "darwin", 3))).not.toThrow();

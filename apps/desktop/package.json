@@ -17,6 +17,7 @@
     "check:chrome": "npm run build && electron scripts/check-window-chrome.cjs",
     "check:chat": "npm run build && electron scripts/check-chat.cjs",
     "check:project-tools": "npm run build && electron scripts/check-project-tools.cjs",
+    "check:packaged-rust": "node scripts/smoke-packaged-runtime.cjs",
     "pack": "npm run build && electron-builder --dir",
     "prepare:runtime": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-runtime.ps1",
     "dist": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package.ps1",
